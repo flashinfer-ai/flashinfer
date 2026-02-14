@@ -5,6 +5,8 @@ import inspect
 import itertools
 import json
 import os
+import tempfile
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -301,15 +303,19 @@ def autotune(tune_mode: bool = True, cache: Optional[str] = None):
         if os.path.isfile(cache):
             tuner.load_configs(cache)
 
-    old_mode = tuner.is_tuning_mode
-    tuner.is_tuning_mode = tune_mode
-    autotune_enabled = tune_mode and not old_mode
+    # Protect mode flag save/restore so concurrent autotune() contexts
+    # on different threads cannot corrupt each other's saved state.
+    with tuner._lock:
+        old_mode = tuner.is_tuning_mode
+        tuner.is_tuning_mode = tune_mode
+        autotune_enabled = tune_mode and not old_mode
     if autotune_enabled:
         logger.info("[Autotuner]: Autotuning process starts ...")
     try:
         yield
     finally:
-        tuner.is_tuning_mode = old_mode
+        with tuner._lock:
+            tuner.is_tuning_mode = old_mode
         if autotune_enabled:
             logger.info("[Autotuner]: Autotuning process ends")
 
@@ -401,6 +407,7 @@ class AutoTuner:
     """
 
     _instance = None
+    _class_lock = threading.Lock()
 
     def __init__(self, warmup=3, repeat=10, stream_delay_micro_secs=1000):
         self.repeat = repeat
@@ -408,6 +415,10 @@ class AutoTuner:
         self.stream_delay_micro_secs = stream_delay_micro_secs
         self.profiling_cache = {}
         self.is_tuning_mode = False
+
+        # Reentrant lock protecting all mutable state on this instance.
+        # RLock is used because choose_one() calls search_cache() internally.
+        self._lock = threading.RLock()
 
         # Add statistics tracking
         self.stats = AutoTunerStatistics()
@@ -421,8 +432,11 @@ class AutoTuner:
 
     @classmethod
     def get(cls):
+        # Double-checked locking for thread-safe singleton creation
         if cls._instance is None:
-            cls._instance = AutoTuner()
+            with cls._class_lock:
+                if cls._instance is None:
+                    cls._instance = AutoTuner()
         return cls._instance
 
     def search_cache(
@@ -450,51 +464,52 @@ class AutoTuner:
             A tuple containing:
             [is_cache_hit, runner_id, tactic, stored_profile]
         """
-        for r in runners:
-            cache_key = AutoTuner._get_cache_key(
-                custom_op, r, input_shapes, tuning_config
-            )
-
-            # 1. In-memory cache (from live tuning)
-            if cache_key in self.profiling_cache:
-                return True, *self.profiling_cache[cache_key]
-
-            # Build the hash-free file key used by both user configs and bundled configs
-            file_key = str((cache_key[0], cache_key[1], cache_key[3]))
-
-            # 2. User-loaded configs (from load_configs or autotune(cache=...))
-            #    Always consulted, even during tuning mode — loaded configs take priority
-            #    so that already-tuned shapes are never re-profiled.
-            if file_key in self._file_configs:
-                runner_name, tactic = self._file_configs[file_key]
-                runner_id = next(
-                    (
-                        i
-                        for i, runner in enumerate(runners)
-                        if runner.__class__.__name__ == runner_name
-                    ),
-                    0,  # fallback to first runner if name not found
+        with self._lock:
+            for r in runners:
+                cache_key = AutoTuner._get_cache_key(
+                    custom_op, r, input_shapes, tuning_config
                 )
-                log_key = (custom_op, runner_name)
-                if log_key not in self._logged_file_hits:
-                    self._logged_file_hits.add(log_key)
-                    logger.info(
-                        f"[Autotuner]: Config cache hit for {custom_op} "
-                        f"(runner={runner_name}, source=config file)"
+
+                # 1. In-memory cache (from live tuning)
+                if cache_key in self.profiling_cache:
+                    return True, *self.profiling_cache[cache_key]
+
+                # Build the hash-free file key used by both user configs and bundled configs
+                file_key = str((cache_key[0], cache_key[1], cache_key[3]))
+
+                # 2. User-loaded configs (from load_configs or autotune(cache=...))
+                #    Always consulted, even during tuning mode — loaded configs take priority
+                #    so that already-tuned shapes are never re-profiled.
+                if file_key in self._file_configs:
+                    runner_name, tactic = self._file_configs[file_key]
+                    runner_id = next(
+                        (
+                            i
+                            for i, runner in enumerate(runners)
+                            if runner.__class__.__name__ == runner_name
+                        ),
+                        0,  # fallback to first runner if name not found
                     )
-                return True, runner_id, tactic, None
+                    log_key = (custom_op, runner_name)
+                    if log_key not in self._logged_file_hits:
+                        self._logged_file_hits.add(log_key)
+                        logger.info(
+                            f"[Autotuner]: Config cache hit for {custom_op} "
+                            f"(runner={runner_name}, source=config file)"
+                        )
+                    return True, runner_id, tactic, None
 
-            # 3. Bundled package configs (legacy .py files)
-            if (
-                os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0") == "1"
-                and not self.is_tuning_mode
-            ):
-                output = load_from_file(cache_key)
-                if output[0]:  # is_cache_hit
-                    return output
+                # 3. Bundled package configs (legacy .py files)
+                if (
+                    os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0") == "1"
+                    and not self.is_tuning_mode
+                ):
+                    output = load_from_file(cache_key)
+                    if output[0]:  # is_cache_hit
+                        return output
 
-        # 4. Fallback
-        return False, 0, -1, None
+            # 4. Fallback
+            return False, 0, -1, None
 
     def choose_one(
         self,
@@ -525,129 +540,142 @@ class AutoTuner:
             Although runners[0] with tactic=-1 is always treated as the fallback runner.
             Runner authors are suggested to provide a fallback implementation for each runner to avoid potential issues.
         """
+        # Hold the lock for the entire method.  In non-tuning mode this is a
+        # fast cache lookup; in tuning mode it serializes GPU profiling which
+        # must not run concurrently (measurements would interfere).
+        with self._lock:
+            input_shapes = tuple(self._get_input_sizes(inputs))
 
-        input_shapes = tuple(self._get_input_sizes(inputs))
+            # Early return if it's not tuning, use cache found one or fallback one
+            if not self.is_tuning_mode:
+                is_cache_hit, runner_id, tactic, stored_profile = self.search_cache(
+                    custom_op, runners, input_shapes, tuning_config
+                )
+                runner = runners[runner_id]
+                # TODO: check the stored runner and tactic can implement this shape here
+                # Should not directly try (runner, tactic) here, or it will hurt a lot of inference perf.
 
-        # Early return if it's not tuning, use cache found one or fallback one
-        if not self.is_tuning_mode:
-            is_cache_hit, runner_id, tactic, stored_profile = self.search_cache(
+                # Record the cache miss config.
+                # Expect no cache miss in inference. Thus, any cache miss should be recorded.
+                if not is_cache_hit:
+                    logger.debug(
+                        f"[AutoTunner]: Using fallback tactic for {custom_op} with input shapes {input_shapes}"
+                    )
+                    logger.debug(
+                        f"[AutoTunner]: Generated key{AutoTuner._get_cache_key(custom_op, runners[0], input_shapes, tuning_config)}"
+                    )
+                return runner, tactic
+
+            assert len(runners) > 0, "At least one runner is required"
+            assert all([isinstance(r, TunableRunner) for r in runners]), (
+                "All Given runners must be subclass of TunableRunner"
+            )
+
+            profiles = self._generate_optimization_profiles(tuning_config, inputs)
+            # Record the total configs to try
+            self.stats.tuned_op_total_configs[custom_op] = len(profiles)
+
+            # Pre-compute runner arg names to avoid calling inspect.signature in the loop
+            runner_arg_names_map = {}
+            for r in runners:
+                runner_arg_names_map[r] = {
+                    param.name
+                    for param in inspect.signature(r.forward).parameters.values()
+                }
+
+            for p in profiles:
+                try:
+                    tensors = self._prepare_input_tensors(p, inputs)
+                    is_cache_hit, runner_id, tactic, _ = self.search_cache(
+                        custom_op, runners, p.get_opt_shapes(), tuning_config
+                    )
+                    if not is_cache_hit:
+                        min_time = float("inf")
+                        # Initialize runner and tactic as None in case of no valid tactic or runners are found
+                        runner_id, tactic = None, None
+                        for r_id, r in enumerate(runners):
+                            # TODO: use FakeTensor here.
+                            valid_tactics = r.get_valid_tactics(tensors, p)
+                            runner_arg_names = runner_arg_names_map[r]
+                            if (
+                                "do_preparation" in runner_arg_names
+                                and len(valid_tactics) > 0
+                            ):
+                                r(tensors, tactic=-1, do_preparation=True, **kwargs)
+                            for tac in valid_tactics:
+                                try:
+                                    time_measured = self._profile_single_kernel(
+                                        r, tensors, tac, **kwargs
+                                    )
+                                except torch.cuda.OutOfMemoryError:
+                                    raise
+                                except Exception as e:
+                                    shapes = self._get_input_sizes(tensors)
+                                    logger.warning(
+                                        f"[Autotuner]: Skipping tactic {r} {tac}, due to failure while profiling: {e}"
+                                    )
+
+                                    # Log stacktrace as debug to not spam log
+                                    logger.debug(
+                                        f"[Autotuner]: Failed when profiling {r} {tac}, shapes={shapes}. Error occurred: {e}"
+                                    )
+
+                                    # Record the failed profiling combinations
+                                    if (
+                                        custom_op
+                                        not in self.stats.failed_profiling_count
+                                    ):
+                                        self.stats.failed_profiling_count[custom_op] = (
+                                            set()
+                                        )
+                                    self.stats.failed_profiling_count[custom_op].add(
+                                        AutoTuner._get_cache_key(
+                                            custom_op,
+                                            r,
+                                            p.get_opt_shapes(),
+                                            tuning_config,
+                                        )
+                                    )
+
+                                    # Set time_measured to inf to notify the failure of the tactic. This can happen when `get_valid_tactics` mistakenly return wrong tactics
+                                    # or some runtime error occurs during profiling.
+                                    time_measured = float("inf")
+                                if time_measured < min_time:
+                                    min_time = time_measured
+                                    runner_id, tactic = r_id, tac
+
+                        if runner_id is not None:
+                            # At least one valid (runner, tactic) pair is found
+                            cache_key = AutoTuner._get_cache_key(
+                                custom_op,
+                                runners[runner_id],
+                                p.get_opt_shapes(),
+                                tuning_config,
+                            )
+                            # inspect call stack
+                            self.profiling_cache[cache_key] = (runner_id, tactic, p)
+                            self.stats.tuned_op_successful_configs[custom_op] = (
+                                self.stats.tuned_op_successful_configs.get(custom_op, 0)
+                                + 1
+                            )
+                            logger.debug(
+                                f"[Autotuner]: profiling chosen runner: {runners[runner_id]} {tactic} for {cache_key}"
+                            )
+
+                except torch.cuda.OutOfMemoryError:
+                    torch.cuda.empty_cache()
+                    logger.warning(
+                        "[Autotuner]: OOM detected, falling back to default tactic"
+                    )
+                    return runners[0], -1
+
+            # Get the best runner and tactic from cache
+            # If no valid tactic is found, the fallback runner and tactic will be used
+            _, runner_id, tactic, _ = self.search_cache(
                 custom_op, runners, input_shapes, tuning_config
             )
-            runner = runners[runner_id]
-            # TODO: check the stored runner and tactic can implement this shape here
-            # Should not directly try (runner, tactic) here, or it will hurt a lot of inference perf.
 
-            # Record the cache miss config.
-            # Expect no cache miss in inference. Thus, any cache miss should be recorded.
-            if not is_cache_hit:
-                logger.debug(
-                    f"[AutoTunner]: Using fallback tactic for {custom_op} with input shapes {input_shapes}"
-                )
-                logger.debug(
-                    f"[AutoTunner]: Generated key{AutoTuner._get_cache_key(custom_op, runners[0], input_shapes, tuning_config)}"
-                )
-            return runner, tactic
-
-        assert len(runners) > 0, "At least one runner is required"
-        assert all([isinstance(r, TunableRunner) for r in runners]), (
-            "All Given runners must be subclass of TunableRunner"
-        )
-
-        profiles = self._generate_optimization_profiles(tuning_config, inputs)
-        # Record the total configs to try
-        self.stats.tuned_op_total_configs[custom_op] = len(profiles)
-
-        # Pre-compute runner arg names to avoid calling inspect.signature in the loop
-        runner_arg_names_map = {}
-        for r in runners:
-            runner_arg_names_map[r] = {
-                param.name for param in inspect.signature(r.forward).parameters.values()
-            }
-
-        for p in profiles:
-            try:
-                tensors = self._prepare_input_tensors(p, inputs)
-                is_cache_hit, runner_id, tactic, _ = self.search_cache(
-                    custom_op, runners, p.get_opt_shapes(), tuning_config
-                )
-                if not is_cache_hit:
-                    min_time = float("inf")
-                    # Initialize runner and tactic as None in case of no valid tactic or runners are found
-                    runner_id, tactic = None, None
-                    for r_id, r in enumerate(runners):
-                        # TODO: use FakeTensor here.
-                        valid_tactics = r.get_valid_tactics(tensors, p)
-                        runner_arg_names = runner_arg_names_map[r]
-                        if (
-                            "do_preparation" in runner_arg_names
-                            and len(valid_tactics) > 0
-                        ):
-                            r(tensors, tactic=-1, do_preparation=True, **kwargs)
-                        for tac in valid_tactics:
-                            try:
-                                time_measured = self._profile_single_kernel(
-                                    r, tensors, tac, **kwargs
-                                )
-                            except torch.cuda.OutOfMemoryError:
-                                raise
-                            except Exception as e:
-                                shapes = self._get_input_sizes(tensors)
-                                logger.warning(
-                                    f"[Autotuner]: Skipping tactic {r} {tac}, due to failure while profiling: {e}"
-                                )
-
-                                # Log stacktrace as debug to not spam log
-                                logger.debug(
-                                    f"[Autotuner]: Failed when profiling {r} {tac}, shapes={shapes}. Error occurred: {e}"
-                                )
-
-                                # Record the failed profiling combinations
-                                if custom_op not in self.stats.failed_profiling_count:
-                                    self.stats.failed_profiling_count[custom_op] = set()
-                                self.stats.failed_profiling_count[custom_op].add(
-                                    AutoTuner._get_cache_key(
-                                        custom_op, r, p.get_opt_shapes(), tuning_config
-                                    )
-                                )
-
-                                # Set time_measured to inf to notify the failure of the tactic. This can happen when `get_valid_tactics` mistakenly return wrong tactics
-                                # or some runtime error occurs during profiling.
-                                time_measured = float("inf")
-                            if time_measured < min_time:
-                                min_time = time_measured
-                                runner_id, tactic = r_id, tac
-
-                    if runner_id is not None:
-                        # At least one valid (runner, tactic) pair is found
-                        cache_key = AutoTuner._get_cache_key(
-                            custom_op,
-                            runners[runner_id],
-                            p.get_opt_shapes(),
-                            tuning_config,
-                        )
-                        # inspect call stack
-                        self.profiling_cache[cache_key] = (runner_id, tactic, p)
-                        self.stats.tuned_op_successful_configs[custom_op] = (
-                            self.stats.tuned_op_successful_configs.get(custom_op, 0) + 1
-                        )
-                        logger.debug(
-                            f"[Autotuner]: profiling chosen runner: {runners[runner_id]} {tactic} for {cache_key}"
-                        )
-
-            except torch.cuda.OutOfMemoryError:
-                torch.cuda.empty_cache()
-                logger.warning(
-                    "[Autotuner]: OOM detected, falling back to default tactic"
-                )
-                return runners[0], -1
-
-        # Get the best runner and tactic from cache
-        # If no valid tactic is found, the fallback runner and tactic will be used
-        _, runner_id, tactic, _ = self.search_cache(
-            custom_op, runners, input_shapes, tuning_config
-        )
-
-        return runners[runner_id], tactic
+            return runners[runner_id], tactic
 
     def _get_input_sizes(self, inputs: List[torch.Tensor]) -> List[torch.Size]:
         # Handle None tensors for optional inputs and non-Tensor scalar values
@@ -929,33 +957,47 @@ class AutoTuner:
                 model(inputs)
             AutoTuner.get().save_configs("/path/to/config.json")
         """
-        configs = {}
+        with self._lock:
+            configs = {}
 
-        # Include previously loaded file configs as a base
-        for file_key, (runner_name, tactic) in self._file_configs.items():
-            configs[file_key] = [runner_name, _tactic_to_json(tactic)]
+            # Include previously loaded file configs as a base
+            for file_key, (runner_name, tactic) in self._file_configs.items():
+                configs[file_key] = [runner_name, _tactic_to_json(tactic)]
 
-        num_previous = len(configs)
+            num_previous = len(configs)
 
-        # Overlay in-memory profiling results (take priority over loaded configs)
-        for cache_key, cache_value in self.profiling_cache.items():
-            custom_op, runner_class_name, _runner_hash, profile = cache_key
-            runner_id, tactic, _opt_profile = cache_value
+            # Overlay in-memory profiling results (take priority over loaded configs)
+            for cache_key, cache_value in self.profiling_cache.items():
+                custom_op, runner_class_name, _runner_hash, profile = cache_key
+                runner_id, tactic, _opt_profile = cache_value
 
-            # Use hash-free key: (custom_op, runner_class_name, profile)
-            file_key = str((custom_op, runner_class_name, profile))
+                # Use hash-free key: (custom_op, runner_class_name, profile)
+                file_key = str((custom_op, runner_class_name, profile))
 
-            # Store runner class name (not positional index) for robustness
-            tactic_json = _tactic_to_json(tactic)
-            configs[file_key] = [runner_class_name, tactic_json]
+                # Store runner class name (not positional index) for robustness
+                tactic_json = _tactic_to_json(tactic)
+                configs[file_key] = [runner_class_name, tactic_json]
 
         num_new = len(configs) - num_previous
 
-        dir_name = os.path.dirname(os.path.abspath(path))
+        # Atomic write: write to a temp file then replace the target.
+        # This prevents readers from seeing a partially-written file and
+        # guards against data loss if the process is killed mid-write.
+        abs_path = os.path.abspath(path)
+        dir_name = os.path.dirname(abs_path)
         if dir_name:
             os.makedirs(dir_name, exist_ok=True)
-        with open(path, "w") as f:
-            json.dump(configs, f, indent=2, sort_keys=True)
+        fd, tmp_path = tempfile.mkstemp(
+            dir=dir_name, suffix=".tmp", prefix=".autotuner_"
+        )
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(configs, f, indent=2, sort_keys=True)
+            os.replace(tmp_path, abs_path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)
+            raise
 
         logger.info(
             f"[Autotuner]: Saved {len(configs)} configs to {path} "
@@ -993,18 +1035,20 @@ class AutoTuner:
         with open(path, "r") as f:
             configs = json.load(f)
 
-        for key, value in configs.items():
-            runner_name = value[0]
-            tactic = _json_to_tactic(value[1])
-            self._file_configs[key] = (runner_name, tactic)
+        with self._lock:
+            for key, value in configs.items():
+                runner_name = value[0]
+                tactic = _json_to_tactic(value[1])
+                self._file_configs[key] = (runner_name, tactic)
 
         logger.info(f"[Autotuner]: Loaded {len(configs)} configs from {path}")
 
     def clear_cache(self) -> None:
         """Clear the profiling cache and user-loaded file configs."""
-        self.profiling_cache.clear()
-        self._file_configs.clear()
-        self._logged_file_hits.clear()
+        with self._lock:
+            self.profiling_cache.clear()
+            self._file_configs.clear()
+            self._logged_file_hits.clear()
 
     def reset_statistics(self) -> None:
         """Reset all statistics counters."""

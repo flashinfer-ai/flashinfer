@@ -281,11 +281,31 @@ Clear the in-memory profiling cache **and** any user-loaded file configs.
 Multi-Thread / Multi-Process Considerations
 --------------------------------------------
 
-.. warning::
-    Autotuner behavior in multi-threaded and multi-process environments is
-    **undefined** as of now.  The ``AutoTuner`` singleton is not thread-safe,
-    and concurrent writes to the same cache file from multiple processes are
-    not coordinated.
+Thread Safety
+^^^^^^^^^^^^^
+
+The ``AutoTuner`` singleton is protected by a reentrant lock
+(``threading.RLock``).  All state-mutating operations -- ``search_cache``,
+``choose_one``, ``save_configs``, ``load_configs``, ``clear_cache``, and the
+mode-flag save/restore in ``autotune()`` -- acquire this lock, so multiple
+threads can safely share the same autotuner instance.
+
+During tuning mode, the lock also serializes GPU profiling, which is the
+correct behavior since concurrent kernel measurements would interfere with each
+other.
+
+Multi-Process
+^^^^^^^^^^^^^
+
+Each process has its own ``AutoTuner`` singleton (separate address space), so
+in-memory state is fully isolated.  The concerns are around the shared cache
+**file**:
+
+- **Reads are safe.**  ``save_configs`` uses atomic writes (write to a temp
+  file, then ``os.replace``), so a concurrent reader will never see a
+  partially-written file.
+- **Concurrent writes are not coordinated.**  If two processes both save to the
+  same file, the last writer wins and the other's results are lost.
 
 If you are tuning with multiple processes (e.g. multi-GPU with ``torchrun``),
 use separate output files per rank and merge them afterwards:

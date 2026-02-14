@@ -470,8 +470,8 @@ class TestAutotuneCache:
 
     def test_autotune_cache_saves_on_exit_when_tuning(self):
         """autotune(True, cache=path) should save configs on exit."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            tmp_path = f.name
+        tmp_dir = tempfile.mkdtemp()
+        tmp_path = os.path.join(tmp_dir, "cache.json")
 
         try:
             tuner = AutoTuner.get()
@@ -488,13 +488,18 @@ class TestAutotuneCache:
             entry = list(data.values())[0]
             assert entry == ["FakeRunnerA", 5]
         finally:
-            os.unlink(tmp_path)
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            os.rmdir(tmp_dir)
 
     def test_autotune_cache_no_save_when_not_tuning(self):
         """autotune(False, cache=path) should NOT save on exit."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            f.write("original content")
-            tmp_path = f.name
+        # Write a valid JSON file with a known marker config
+        tmp_dir = tempfile.mkdtemp()
+        tmp_path = os.path.join(tmp_dir, "cache.json")
+        marker_data = {"marker_key": ["MarkerRunner", 99]}
+        with open(tmp_path, "w") as f:
+            json.dump(marker_data, f)
 
         try:
             tuner = AutoTuner.get()
@@ -505,11 +510,14 @@ class TestAutotuneCache:
                 pass
 
             # File should NOT have been overwritten (tune_mode=False)
+            # It should still contain only the original marker data
             with open(tmp_path, "r") as f:
-                content = f.read()
-            assert content == "original content"
+                data = json.load(f)
+            assert data == marker_data
         finally:
-            os.unlink(tmp_path)
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            os.rmdir(tmp_dir)
 
     def test_autotune_cache_nonexistent_file_creates_on_exit(self):
         """First run: cache file doesn't exist yet, should be created on exit."""
@@ -549,8 +557,8 @@ class TestAutotuneCache:
 
     def test_full_workflow_tune_then_inference(self):
         """End-to-end: autotune(True, cache=) then autotune(False, cache=)."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            tmp_path = f.name
+        tmp_dir = tempfile.mkdtemp()
+        tmp_path = os.path.join(tmp_dir, "cache.json")
 
         try:
             # Phase 1: Tune and save
@@ -573,12 +581,14 @@ class TestAutotuneCache:
                 assert is_hit
                 assert tactic == 13
         finally:
-            os.unlink(tmp_path)
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            os.rmdir(tmp_dir)
 
     def test_incremental_cache_across_blocks(self):
         """Multiple autotune(True, cache=) blocks should accumulate configs."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            tmp_path = f.name
+        tmp_dir = tempfile.mkdtemp()
+        tmp_path = os.path.join(tmp_dir, "cache.json")
 
         try:
             runner_a = FakeRunnerA(value=1)
@@ -604,7 +614,9 @@ class TestAutotuneCache:
             # Should have both op1 (from loaded file) and op2 (from profiling)
             assert len(data) == 2
         finally:
-            os.unlink(tmp_path)
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            os.rmdir(tmp_dir)
 
     def test_cache_hit_skips_profiling_during_tune(self):
         """Loaded configs should be used even during autotune(True), skipping profiling."""
@@ -635,3 +647,234 @@ class TestAutotuneCache:
                 assert len(tuner2._file_configs) == 1
         finally:
             os.unlink(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Atomic write tests
+# ---------------------------------------------------------------------------
+
+
+class TestAtomicWrite:
+    """Tests that save_configs uses atomic writes (tempfile + rename)."""
+
+    def setup_method(self):
+        AutoTuner._instance = None
+
+    def teardown_method(self):
+        AutoTuner._instance = None
+
+    def test_save_does_not_leave_partial_file_on_success(self):
+        """After a successful save, only the target file should exist (no temp files)."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            target = os.path.join(tmp_dir, "configs.json")
+            tuner = AutoTuner.get()
+            runner = FakeRunnerA(value=1)
+            profile = ((4, 8),)
+            _populate_cache(tuner, runner, "op1", profile, tactic=5)
+            tuner.save_configs(target)
+
+            # Target file should exist and be valid JSON
+            assert os.path.isfile(target)
+            with open(target, "r") as f:
+                data = json.load(f)
+            assert len(data) == 1
+
+            # No temp files should remain in the directory
+            files = os.listdir(tmp_dir)
+            assert files == ["configs.json"], f"Unexpected files: {files}"
+
+    def test_save_creates_parent_directories(self):
+        """save_configs should create intermediate directories."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            target = os.path.join(tmp_dir, "sub", "dir", "configs.json")
+            tuner = AutoTuner.get()
+            runner = FakeRunnerA(value=1)
+            profile = ((4, 8),)
+            _populate_cache(tuner, runner, "op1", profile, tactic=5)
+            tuner.save_configs(target)
+            assert os.path.isfile(target)
+
+    def test_save_is_atomic_for_concurrent_readers(self):
+        """A reader should never see a partially-written file.
+
+        We verify this by checking that the file is always valid JSON,
+        even when re-saved multiple times.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            target = os.path.join(tmp_dir, "configs.json")
+            tuner = AutoTuner.get()
+
+            # First save
+            runner = FakeRunnerA(value=1)
+            _populate_cache(tuner, runner, "op1", ((4, 8),), tactic=5)
+            tuner.save_configs(target)
+
+            # Second save (overwrites atomically)
+            _populate_cache(tuner, runner, "op2", ((16, 32),), tactic=7)
+            tuner.save_configs(target)
+
+            # File should be valid JSON with 2 entries
+            with open(target, "r") as f:
+                data = json.load(f)
+            assert len(data) == 2
+
+    def test_save_replaces_existing_file(self):
+        """os.replace should overwrite the previous file atomically."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            target = os.path.join(tmp_dir, "configs.json")
+
+            # Write initial content
+            with open(target, "w") as f:
+                json.dump({"old": "data"}, f)
+
+            tuner = AutoTuner.get()
+            runner = FakeRunnerA(value=1)
+            _populate_cache(tuner, runner, "op1", ((4, 8),), tactic=5)
+            tuner.save_configs(target)
+
+            with open(target, "r") as f:
+                data = json.load(f)
+            # Should only contain the new config, not "old"
+            assert "old" not in data
+            assert len(data) == 1
+
+
+# ---------------------------------------------------------------------------
+# Thread safety tests
+# ---------------------------------------------------------------------------
+
+
+class TestThreadSafety:
+    """Tests for thread-safe AutoTuner operations."""
+
+    def setup_method(self):
+        AutoTuner._instance = None
+
+    def teardown_method(self):
+        AutoTuner._instance = None
+
+    def test_singleton_is_thread_safe(self):
+        """Multiple threads calling AutoTuner.get() should get the same instance."""
+        import threading
+
+        results = []
+        barrier = threading.Barrier(10)
+
+        def get_instance():
+            barrier.wait()
+            results.append(id(AutoTuner.get()))
+
+        threads = [threading.Thread(target=get_instance) for _ in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # All threads should get the same singleton instance
+        assert len(set(results)) == 1
+
+    def test_concurrent_search_cache(self):
+        """Multiple threads reading from search_cache should not crash."""
+        import threading
+
+        tuner = AutoTuner.get()
+        runner = FakeRunnerA(value=1)
+        profile = ((4, 8),)
+        _populate_cache(tuner, runner, "op1", profile, tactic=5)
+
+        errors = []
+        barrier = threading.Barrier(10)
+
+        def do_search():
+            try:
+                barrier.wait()
+                for _ in range(100):
+                    is_hit, _, tactic, _ = tuner.search_cache(
+                        "op1", [runner], profile, _TUNING_CONFIG
+                    )
+                    assert is_hit
+                    assert tactic == 5
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=do_search) for _ in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(errors) == 0, f"Errors in threads: {errors}"
+
+    def test_concurrent_load_and_search(self):
+        """One thread loading configs while others search should not crash."""
+        import threading
+
+        tuner = AutoTuner.get()
+        runner = FakeRunnerA(value=1)
+        profile = ((4, 8),)
+
+        # Create a cache file
+        _populate_cache(tuner, runner, "op1", profile, tactic=5)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            tmp_path = f.name
+        try:
+            tuner.save_configs(tmp_path)
+
+            errors = []
+            barrier = threading.Barrier(6)
+
+            def do_load():
+                try:
+                    barrier.wait()
+                    for _ in range(20):
+                        tuner.load_configs(tmp_path)
+                except Exception as e:
+                    errors.append(e)
+
+            def do_search():
+                try:
+                    barrier.wait()
+                    for _ in range(100):
+                        tuner.search_cache("op1", [runner], profile, _TUNING_CONFIG)
+                except Exception as e:
+                    errors.append(e)
+
+            threads = [threading.Thread(target=do_load)] + [
+                threading.Thread(target=do_search) for _ in range(5)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            assert len(errors) == 0, f"Errors in threads: {errors}"
+        finally:
+            os.unlink(tmp_path)
+
+    def test_autotune_mode_flag_thread_safety(self):
+        """Concurrent autotune() contexts should not corrupt is_tuning_mode."""
+        import threading
+
+        tuner = AutoTuner.get()
+        errors = []
+        barrier = threading.Barrier(5)
+
+        def run_autotune():
+            try:
+                barrier.wait()
+                for _ in range(50):
+                    with autotune(True):
+                        # Brief work inside tuning mode
+                        pass
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=run_autotune) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # After all threads complete, tuning mode should be restored to False
+        assert not tuner.is_tuning_mode, "is_tuning_mode was not properly restored"
+        assert len(errors) == 0, f"Errors in threads: {errors}"
