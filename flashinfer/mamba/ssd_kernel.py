@@ -547,7 +547,9 @@ class SSDKernel:
         )
 
         # Compute grid size
-        tile_sched_params, grid = self._compute_grid(y, b, max_active_clusters, num_seqs)
+        tile_sched_params, grid = self._compute_grid(
+            y, b, max_active_clusters, num_seqs
+        )
 
         # Plan shared memory storage
         swizzle_buffer_align_bytes = 1024
@@ -930,455 +932,1561 @@ class SSDKernel:
 
         # Specialized TMA load Delta/CumsumDelta/X/States warp
         if warp_idx == self.tma_deltas_x_d_states_warp_id:
-            # Dealloc regs for pre-inter/pre-intra warps
             cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
-
-            # ((ATOM_V, REST_V), INPUT_STAGE)
-            # ((ATOM_V, REST_V), 1, 1, C, EH, B)
-            tXsX, tXgX_pre_slice = self.tma_partition_for_mma_b_operand(
+            self._warp_tma_x_deltas(
                 tma_atom_x,
                 tma_tensor_x,
+                tma_atom_delta,
+                tma_tensor_delta,
+                tma_atom_cumsum_delta,
+                tma_tensor_cumsum_delta,
+                tma_atom_d,
+                tma_tensor_d,
+                tma_atom_initial_states,
+                tma_tensor_initial_states,
                 smem_x,
+                smem_delta,
+                smem_cumsum_delta,
+                smem_d,
+                smem_p_load,
                 tiled_mma_intra2,
                 cluster_layout_vmnk,
                 mma_tile_coord_v,
                 block_in_cluster_coord_vmnk,
+                x_pipeline,
+                deltas_pipeline,
+                d_pipeline,
+                init_states_pipeline,
+                tile_sched,
+                work_tile,
+                L,
+                C,
+                seq_idx,
+                chunk_indices,
+                chunk_offsets,
+                seq_chunk_cumsum,
             )
-
-            # ((ATOM_V, REST_V), INPUT_STAGE)
-            # ((ATOM_V, REST_V), 1, C, EH, B)
-            tDeltasDelta, tDeltagDelta_pre_slice = self.tma_partition_with_shape(
-                tma_atom_delta,
-                tma_tensor_delta,
-                smem_delta,
-                (self.tile_shape_mnk_inter1[2],),
-            )
-            # ((ATOM_V, REST_V), INPUT_STAGE)
-            # ((ATOM_V, REST_V), 1, C, EH, B)
-            (
-                tDeltasCumsumDelta,
-                tDeltagCumsumDelta_pre_slice,
-            ) = self.tma_partition_with_shape(
-                tma_atom_cumsum_delta,
-                tma_tensor_cumsum_delta,
-                smem_cumsum_delta,
-                (self.tile_shape_mnk_inter1[2],),
-            )
-
-            tIstatesIstate = None
-            tIstategIstate_pre_slice = None
-            if cutlass.const_expr(self.has_init_states):
-                tIstatesIstate, tIstategIstate_pre_slice = (
-                    self.tma_partition_with_shape(
-                        tma_atom_initial_states,
-                        tma_tensor_initial_states,
-                        smem_p_load,  # Must match TMA atom's smem layout (p_smem_layout_load)
-                        (
-                            self.tile_shape_mnk_inter2[2],
-                            self.tile_shape_mnk_inter2[1],
-                        ),  # (N, D) shape to match gmem
-                    )
-                )
-
-            tDsD = None
-            tDgD_pre_slice = None
-            if cutlass.const_expr(self.d_has_hdim):
-                # Partition global/shared tensor for D
-                # ((ATOM_V, REST_V), INPUT_STAGE)
-                # ((ATOM_V, REST_V), 1, EH)
-                tDsD, tDgD_pre_slice = self.tma_partition_with_shape(
-                    tma_atom_d, tma_tensor_d, smem_d, (self.tile_shape_mnk_inter2[1],)
-                )
-
-            # Pipeline X/Delta/CumsumDelta/D producer state
-            x_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.input_stages
-            )
-            deltas_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.input_stages
-            )
-            d_producer_state = None
-            if cutlass.const_expr(self.d_has_hdim):
-                # D is loaded by TMA only when d_has_hdim is True
-                d_producer_state = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Producer, self.input_stages
-                )
-            if cutlass.const_expr(self.has_init_states):
-                istate_producer_state = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Producer, self.initial_state_load_stages
-                )
-
-            while work_tile.is_valid_tile:
-                b_idx, eh_idx, g_idx = work_tile.tile_idx
-
-                # Varlen: b_idx from scheduler is seq_idx
-                if cutlass.const_expr(self.has_varlen):
-                    seq_id = b_idx
-                    b_idx = cutlass.Int32(0)
-                    first_chunk = seq_chunk_cumsum[seq_id]
-                    C = seq_chunk_cumsum[seq_id + 1] - first_chunk
-
-                # Slice global tensor to current tile idx
-                # ((ATOM_V, REST_V), C)
-                tXgX = tXgX_pre_slice[None, 0, 0, None, eh_idx, b_idx]
-                tDeltagDelta = tDeltagDelta_pre_slice[None, 0, None, eh_idx, b_idx]
-                tDeltagCumsumDelta = tDeltagCumsumDelta_pre_slice[
-                    None, 0, None, eh_idx, b_idx
-                ]
-                tDgD = None
-                if cutlass.const_expr(self.d_has_hdim):
-                    # ((ATOM_V, REST_V))
-                    tDgD = tDgD_pre_slice[None, 0, eh_idx]
-
-                if cutlass.const_expr(self.has_init_states):
-                    istate_producer_state.reset_count()
-
-                # Reset count for pipeline state
-                x_producer_state.reset_count()
-                deltas_producer_state.reset_count()
-                if cutlass.const_expr(self.d_has_hdim):
-                    d_producer_state.reset_count()
-
-                # Peek (try_wait) X/deltas buffer empty status
-                peek_x_empty_status = self.conditional_producer_try_acquire(
-                    x_producer_state, x_pipeline, C
-                )
-                peek_deltas_empty_status = self.conditional_producer_try_acquire(
-                    deltas_producer_state, deltas_pipeline, C
-                )
-
-                if cutlass.const_expr(self.has_init_states):
-                    # Load first sequence's init_states before the chunk loop
-                    if cutlass.const_expr(self.has_varlen):
-                        first_seq_id = seq_id
-                    else:
-                        first_seq_id = b_idx
-                    tIstategIstate = tIstategIstate_pre_slice[
-                        None, 0, 0, eh_idx, first_seq_id
-                    ]
-
-                    # Wait for initial states buffer empty
-                    init_states_pipeline.producer_acquire(istate_producer_state)
-                    # TMA load initial states
-                    cute.copy(
-                        tma_atom_initial_states,
-                        tIstategIstate,
-                        tIstatesIstate[None, istate_producer_state.index],
-                        tma_bar_ptr=init_states_pipeline.producer_get_barrier(
-                            istate_producer_state
-                        ),
-                    )
-                    # Advance initial states producer state
-                    istate_producer_state.advance()
-                    prev_seq_id = first_seq_id
-
-                if cutlass.const_expr(self.d_has_hdim):
-                    # Wait for D buffer empty
-                    d_pipeline.producer_acquire(d_producer_state)
-                    # TMA load D
-                    cute.copy(
-                        tma_atom_d,
-                        tDgD,
-                        tDsD[None, d_producer_state.index],
-                        tma_bar_ptr=d_pipeline.producer_get_barrier(d_producer_state),
-                    )
-                    # Advance D producer state
-                    d_producer_state.advance()
-
-                # Batched load over C dimension
-                for chunk_idx in cutlass.range(C, unroll=1):
-                    # Index into global chunk_indices/chunk_offsets arrays
-                    physical_chunk = first_chunk + x_producer_state.count
-                    # Map to physical chunk (chunk)
-                    chunk = physical_chunk
-                    if cutlass.const_expr(self.has_varlen):
-                        chunk = chunk_indices[physical_chunk]
-
-                    # Load init_states on sequence transitions
-                    if cutlass.const_expr(self.has_init_states and self.has_varlen):
-                        chunk_offset = chunk_offsets[physical_chunk]
-                        seq_id = seq_idx[0, chunk * L + chunk_offset]
-                        if seq_id != prev_seq_id:
-                            tIstategIstate = tIstategIstate_pre_slice[
-                                None, 0, 0, eh_idx, seq_id
-                            ]
-                            init_states_pipeline.producer_acquire(istate_producer_state)
-                            cute.copy(
-                                tma_atom_initial_states,
-                                tIstategIstate,
-                                tIstatesIstate[None, istate_producer_state.index],
-                                tma_bar_ptr=init_states_pipeline.producer_get_barrier(
-                                    istate_producer_state
-                                ),
-                            )
-                            istate_producer_state.advance()
-                            prev_seq_id = seq_id
-
-                    # Conditionally wait for X buffer empty
-                    x_pipeline.producer_acquire(x_producer_state, peek_x_empty_status)
-
-                    # TMA load X
-                    cute.copy(
-                        tma_atom_x,
-                        tXgX[None, chunk],
-                        tXsX[None, x_producer_state.index],
-                        tma_bar_ptr=x_pipeline.producer_get_barrier(x_producer_state),
-                    )
-
-                    # Conditionally wait for deltas buffer empty
-                    deltas_pipeline.producer_acquire(
-                        deltas_producer_state, peek_deltas_empty_status
-                    )
-
-                    # TMA load Delta/CumsumDelta
-                    cute.copy(
-                        tma_atom_delta,
-                        tDeltagDelta[None, chunk],
-                        tDeltasDelta[None, deltas_producer_state.index],
-                        tma_bar_ptr=deltas_pipeline.producer_get_barrier(
-                            deltas_producer_state
-                        ),
-                    )
-                    cute.copy(
-                        tma_atom_cumsum_delta,
-                        tDeltagCumsumDelta[None, chunk],
-                        tDeltasCumsumDelta[None, deltas_producer_state.index],
-                        tma_bar_ptr=deltas_pipeline.producer_get_barrier(
-                            deltas_producer_state
-                        ),
-                    )
-
-                    # Advance X/deltas producer state
-                    x_producer_state.advance()
-                    deltas_producer_state.advance()
-
-                    # Peek (try_wait) X/deltas buffer empty status
-                    peek_x_empty_status = self.conditional_producer_try_acquire(
-                        x_producer_state, x_pipeline, C
-                    )
-                    peek_deltas_empty_status = self.conditional_producer_try_acquire(
-                        deltas_producer_state, deltas_pipeline, C
-                    )
-                # END of for chunk_idx in cutlass.range(C, unroll=1)
-
-                # Advance to next tile
-                tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
-            # END of while work_tile.is_valid_tile
-
-            # Producer tail for X/Deltas/D
-            x_pipeline.producer_tail(x_producer_state)
-            deltas_pipeline.producer_tail(deltas_producer_state)
-            if cutlass.const_expr(self.has_init_states):
-                init_states_pipeline.producer_tail(istate_producer_state)
-            if cutlass.const_expr(self.d_has_hdim):
-                d_pipeline.producer_tail(d_producer_state)
-        # END of specialized tma load X/Deltas/D warp
 
         # Specialized TMA load B/C warp
         elif warp_idx == self.tma_b_c_warp_id:
-            # Dealloc regs for pre-inter/pre-intra warps
             cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
-
-            # ((ATOM_V, REST_V), INPUT_STAGE)
-            # ((ATOM_V, REST_V), 1, 1, C, G, B)
-            tBsB, tBgB_pre_slice = self.tma_partition_for_mma_b_operand(
+            self._warp_tma_b_c(
                 tma_atom_b,
                 tma_tensor_b,
-                smem_b,
-                tiled_mma_intra1,
-                cluster_layout_vmnk,
-                mma_tile_coord_v,
-                block_in_cluster_coord_vmnk,
-            )
-
-            # ((ATOM_V, REST_V), INPUT_STAGE)
-            # ((ATOM_V, REST_V), 1, 1, C, G, B)
-            tCsC, tCgC_pre_slice = self.tma_partition_for_mma_a_operand(
                 tma_atom_c,
                 tma_tensor_c,
+                smem_b,
                 smem_c,
                 tiled_mma_intra1,
                 cluster_layout_vmnk,
                 mma_tile_coord_v,
                 block_in_cluster_coord_vmnk,
+                b_pipeline,
+                c_pipeline,
+                tile_sched,
+                work_tile,
+                C,
+                chunk_indices,
+                chunk_offsets,
+                seq_chunk_cumsum,
             )
-
-            # Pipeline B/C producer state
-            b_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.input_stages
-            )
-            c_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.input_stages
-            )
-
-            while work_tile.is_valid_tile:
-                b_idx, eh_idx, g_idx = work_tile.tile_idx
-
-                # Varlen: b_idx from scheduler is seq_idx
-                if cutlass.const_expr(self.has_varlen):
-                    seq_id = b_idx
-                    b_idx = cutlass.Int32(0)
-                    first_chunk = seq_chunk_cumsum[seq_id]
-                    C = seq_chunk_cumsum[seq_id + 1] - first_chunk
-
-                # Slice global tensor to current tile idx
-                # ((ATOM_V, REST_V), C)
-                tBgB = tBgB_pre_slice[None, 0, 0, None, g_idx, b_idx]
-                tCgC = tCgC_pre_slice[None, 0, 0, None, g_idx, b_idx]
-
-                # Reset count for pipeline state
-                b_producer_state.reset_count()
-                c_producer_state.reset_count()
-
-                # Peek (try_wait) B/C buffer empty status
-                peek_b_empty_status = self.conditional_producer_try_acquire(
-                    b_producer_state, b_pipeline, C
-                )
-                peek_c_empty_status = self.conditional_producer_try_acquire(
-                    c_producer_state, c_pipeline, C
-                )
-
-                # Batched load over C dimension
-                for chunk_idx in cutlass.range(C, unroll=1):
-                    # Index into global chunk_indices/chunk_offsets arrays
-                    physical_chunk = first_chunk + b_producer_state.count
-                    # Map to physical chunk (chunk)
-                    if cutlass.const_expr(self.has_varlen):
-                        chunk = chunk_indices[physical_chunk]
-                    else:
-                        chunk = physical_chunk
-
-                    # Conditionally wait for B buffer empty
-                    b_pipeline.producer_acquire(b_producer_state, peek_b_empty_status)
-
-                    # TMA load B
-                    cute.copy(
-                        tma_atom_b,
-                        tBgB[None, chunk],
-                        tBsB[None, b_producer_state.index],
-                        tma_bar_ptr=b_pipeline.producer_get_barrier(b_producer_state),
-                    )
-
-                    # Conditionally wait for C buffer empty
-                    c_pipeline.producer_acquire(c_producer_state, peek_c_empty_status)
-
-                    # TMA load C
-                    cute.copy(
-                        tma_atom_c,
-                        tCgC[None, chunk],
-                        tCsC[None, c_producer_state.index],
-                        tma_bar_ptr=c_pipeline.producer_get_barrier(c_producer_state),
-                    )
-
-                    # Advance B/C producer state
-                    b_producer_state.advance()
-                    c_producer_state.advance()
-
-                    # Peek (try_wait) B/C buffer empty status
-                    peek_b_empty_status = self.conditional_producer_try_acquire(
-                        b_producer_state, b_pipeline, C
-                    )
-                    peek_c_empty_status = self.conditional_producer_try_acquire(
-                        c_producer_state, c_pipeline, C
-                    )
-                # END of for chunk_idx in cutlass.range(C, unroll=1)
-
-                # Advance to next tile
-                tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
-            # END of while work_tile.is_valid_tile
-
-            # Producer tail for B/C
-            b_pipeline.producer_tail(b_producer_state)
-            c_pipeline.producer_tail(c_producer_state)
-        # END of specialized tma load B/C warp
 
         # Specialized MMA Intra warp
         elif warp_idx == self.mma_intra_warp_id:
-            # Dealloc regs for pre-inter/pre-intra warps
             cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
-
-            # Make shared/tmem fragments for INTRA_MMA1 B/C/ACC
-            # (MMA, MMA_N, MMA_K, INPUT_STAGE)
-            # (MMA, MMA_M, MMA_K, INPUT_STAGE)
-            # (MMA, MMA_M, MMA_N, INTRA1_ACC_STAGE)
-            tCrC, tCrB, tCtAccIntra1 = self.mma_partition_ss(
-                tiled_mma_intra1,
-                self.tile_shape_mnk_intra1,
+            self._warp_mma_intra(
                 smem_c,
                 smem_b,
-                tmem_ptr_base + self.tmem_intra1_acc_offset,
-                self.intra1_acc_stages,
-            )
-
-            # Make shared/tmem fragments for INTRA_MMA2 X/Q/ACC
-            # (MMA, MMA_M, MMA_K, INTERNAL_STAGE)
-            # (MMA, MMA_N, MMA_K, INPUT_STAGE)
-            # (MMA, MMA_M, MMA_N, INTERNAL_STAGE)
-            tCrQ, tCrX, tCtAccIntra2 = self.mma_partition_ts(
-                tiled_mma_intra2,
-                self.tile_shape_mnk_intra2,
-                q_tmem_layout,
                 smem_x,
-                tmem_ptr_base + self.tmem_intra2_q_offset,
-                tmem_ptr_base + self.tmem_intra2_acc_offset,
-                self.internal_stages,
+                q_tmem_layout,
+                tmem_ptr_base,
+                tiled_mma_intra1,
+                tiled_mma_intra2,
+                b_pipeline,
+                c_pipeline,
+                x_pipeline,
+                intra1_acc_pipeline,
+                intra2_q_pipeline,
+                intra2_acc_pipeline,
+                tile_sched,
+                work_tile,
+                C,
+                seq_chunk_cumsum,
             )
 
-            # Pipeline B/C/X/INTRA2_Q consumer state
-            b_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.input_stages
-            )
-            c_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.input_stages
-            )
-            x_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.input_stages
-            )
-            intra2_q_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.internal_stages
+        # Specialized MMA Inter warp
+        elif warp_idx == self.mma_inter_warp_id:
+            cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
+            self._warp_mma_inter(
+                smem_bt_internal,
+                smem_x,
+                smem_c,
+                smem_p,
+                tmem_ptr_base,
+                tiled_mma_inter1,
+                tiled_mma_inter2,
+                x_pipeline,
+                c_pipeline,
+                inter1_b_pipeline,
+                inter1_acc_pipeline,
+                inter2_p_pipeline,
+                inter2_acc_pipeline,
+                tile_sched,
+                work_tile,
+                C,
+                seq_chunk_cumsum,
             )
 
-            # Pipeline INTRA1_ACC/INTRA2_ACC producer state
-            intra1_acc_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.intra1_acc_stages
-            )
-            intra2_acc_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.internal_stages
+        # Specialized Pre-Inter warp
+        elif (
+            warp_idx == self.pre_inter_warp_id[0]
+            or warp_idx == self.pre_inter_warp_id[1]
+            or warp_idx == self.pre_inter_warp_id[2]
+            or warp_idx == self.pre_inter_warp_id[3]
+        ):
+            cute.arch.warpgroup_reg_alloc(self.num_regs_pre_inter_warps)
+            self._warp_pre_inter(
+                local_tidx,
+                local_warp_idx,
+                smem_bt,
+                smem_bt_internal,
+                smem_delta,
+                smem_cumsum_delta,
+                smem_pt,
+                smem_p_store,
+                smem_p_load,
+                tmem_ptr_base,
+                tiled_mma_inter1,
+                tiled_mma_inter2,
+                tma_atom_p,
+                tma_tensor_p,
+                b_pipeline,
+                deltas_pipeline,
+                inter1_b_pipeline,
+                inter1_acc_pipeline,
+                inter2_p_pipeline,
+                init_states_pipeline,
+                tile_sched,
+                work_tile,
+                L,
+                C,
+                seq_idx,
+                chunk_indices,
+                chunk_offsets,
+                seq_chunk_cumsum,
+                num_logical_chunks,
             )
 
-            while work_tile.is_valid_tile:
-                # Varlen: compute per-CTA chunk range
+        # Specialized Pre-Intra warp
+        elif (
+            warp_idx == self.pre_intra_warp_id[0]
+            or warp_idx == self.pre_intra_warp_id[1]
+            or warp_idx == self.pre_intra_warp_id[2]
+            or warp_idx == self.pre_intra_warp_id[3]
+        ):
+            cute.arch.warpgroup_reg_alloc(self.num_regs_pre_intra_warps)
+            self._warp_pre_intra(
+                local_tidx,
+                smem_cumsum_delta,
+                smem_delta,
+                tmem_ptr_base,
+                tiled_mma_intra1,
+                tiled_mma_intra2,
+                q_tmem_layout,
+                deltas_pipeline,
+                intra1_acc_pipeline,
+                intra2_q_pipeline,
+                tile_sched,
+                work_tile,
+                L,
+                C,
+                chunk_indices,
+                chunk_offsets,
+                seq_chunk_cumsum,
+                num_logical_chunks,
+            )
+
+        # Specialized Epilogue warp
+        else:
+            cute.arch.warpgroup_reg_dealloc(self.num_regs_epilogue_warps)
+            self._warp_epilog(
+                local_tidx,
+                local_warp_idx,
+                smem_cumsum_delta,
+                smem_d,
+                smem_xt,
+                smem_y,
+                tmem_ptr_base,
+                tiled_mma_intra2,
+                tiled_mma_inter2,
+                tma_atom_y,
+                tma_tensor_y,
+                y_gmem,
+                z_gmem,
+                tma_tensor_d,
+                deltas_pipeline,
+                intra2_acc_pipeline,
+                inter2_acc_pipeline,
+                x_pipeline,
+                d_pipeline,
+                tile_sched,
+                work_tile,
+                epi_tile,
+                L,
+                C,
+                chunk_indices,
+                chunk_offsets,
+                seq_chunk_cumsum,
+                num_logical_chunks,
+            )
+
+        # Dealloc tmem buffer
+        if warp_idx == self.epilog_warp_id[0]:
+            cute.arch.barrier(
+                barrier_id=self.tmem_dealloc_sync_bar_id,
+                number_of_threads=self.threads_per_cta,
+            )
+            cute.arch.dealloc_tmem(
+                tmem_ptr_base,
+                self.num_tmem_cols_total,
+                is_two_cta=self.use_2cta_instrs,
+            )
+        else:
+            cute.arch.barrier_arrive(
+                barrier_id=self.tmem_dealloc_sync_bar_id,
+                number_of_threads=self.threads_per_cta,
+            )
+
+        return
+
+    # ------------------------------------------------------------------ #
+    #  Warp-specialized device functions
+    # ------------------------------------------------------------------ #
+
+    @cute.jit
+    def _warp_pre_inter(
+        self,
+        local_tidx,
+        local_warp_idx,
+        smem_bt,
+        smem_bt_internal,
+        smem_delta,
+        smem_cumsum_delta,
+        smem_pt,
+        smem_p_store,
+        smem_p_load,
+        tmem_ptr_base,
+        tiled_mma_inter1,
+        tiled_mma_inter2,
+        tma_atom_p,
+        tma_tensor_p,
+        b_pipeline,
+        deltas_pipeline,
+        inter1_b_pipeline,
+        inter1_acc_pipeline,
+        inter2_p_pipeline,
+        init_states_pipeline,
+        tile_sched,
+        work_tile,
+        L,
+        C,
+        seq_idx,
+        chunk_indices,
+        chunk_offsets,
+        seq_chunk_cumsum,
+        num_logical_chunks,
+    ):
+        # Make tiledCopy and partition smem/register tensor for smem load Bt
+        # ((S2R_ATOM_V, S2R_REST_V), S2R_M, S2R_N, INPUT_STAGE)
+        # ((S2R_ATOM_V, S2R_REST_V), S2R_M, S2R_N)
+        tiled_s2r_b, tBsB_s2r, tBrB_s2r = self.pre_inter_smem_load_and_partition_b(
+            local_tidx, smem_bt
+        )
+
+        # Partition shared tensor for smem store Bt
+        smem_bt_internal_ = cute.make_tensor(smem_bt_internal.iterator, smem_bt.layout)
+        # Make tiledCopy and partition register/smem tensor for smem store Bt
+        # ((R2S_ATOM_V, R2S_REST_V), R2S_M, R2S_N)
+        # ((R2S_ATOM_V, R2S_REST_V), R2S_M, R2S_N, INTERNAL_STAGE)
+        tiled_r2s_b, tBrB_r2s, tBsB_r2s = self.pre_inter_smem_store_and_partition_b(
+            local_tidx,
+            smem_bt_internal_,
+            tiled_s2r_b,
+            tBrB_s2r,
+        )
+
+        # (MMA, MMA_M, MMA_K, INPUT_STAGE)
+        sDelta = self.pre_inter_make_delta(smem_delta, smem_bt.layout)
+        sDeltaA = self.pre_inter_make_delta(smem_cumsum_delta, smem_bt.layout)
+
+        # Make copy_atom and partition register/smem tensor for smem load/store of Delta/DeltaA
+        # ((S2R_ATOM_V, S2R_REST_V), S2R_M, S2R_N, INPUT_STAGE)
+        # ((S2R_ATOM_V, S2R_REST_V), S2R_M, S2R_N)
+        (
+            s2r_atom_delta,
+            tBsDelta_s2r,
+            tBrDelta_s2r,
+        ) = self.smem_load_and_partition_delta_d(
+            tiled_s2r_b, local_tidx, sDelta, (None, None, None, 0)
+        )
+        (
+            s2r_atom_cumsum,
+            tBsDeltaA_s2r,
+            tBrDeltaA_s2r,
+        ) = self.smem_load_and_partition_delta_d(
+            tiled_s2r_b, local_tidx, sDeltaA, (None, None, None, 0)
+        )
+
+        # Coordinate tensor for chunk_size_limit masking (step 4.2)
+        # tile_shape_mnk_inter1 = (N, D, L); dice to (N, L)
+        if cutlass.const_expr(self.has_varlen):
+            bt_coord_shape = cute.dice(self.tile_shape_mnk_inter1, (1, None, 1))
+            bt_coord_tensor = cute.make_identity_tensor(bt_coord_shape)
+            thr_s2r_b_ = tiled_s2r_b.get_slice(local_tidx)
+            # ((S2R_ATOM_V, S2R_REST_V), S2R_M, S2R_N)
+            tBCoord = thr_s2r_b_.partition_D(bt_coord_tensor)
+
+        # ((R2S_ATOM_V, R2S_REST_V), R2S_M, R2S_N)
+        thr_r2s_b = tiled_r2s_b.get_slice(local_tidx)
+        tBrDelta_r2s = thr_r2s_b.retile(tBrDelta_s2r)
+        tBrDeltaA_r2s = thr_r2s_b.retile(tBrDeltaA_s2r)
+
+        # Make tmem fragment for INTER1_ACC
+        # (MMA, MMA_M, MMA_N, INTERNAL_STAGE)
+        tCtAccInter1 = self.mma_partition_c(
+            tiled_mma_inter1,
+            self.tile_shape_mnk_inter1,
+            tmem_ptr_base + self.tmem_inter1_acc_offset,
+            self.internal_stages,
+        )
+        # (M_PER_MMA, N_PER_MMA, INTERNAL_STAGE)
+        tInter1 = tCtAccInter1[((None, None), 0, 0, None)]
+
+        # Make tiledCopy and partition tmem/register tensor for tmem load INTER1_ACC
+        # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N, INTERNAL_STAGE)
+        # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N)
+        (
+            tiled_t2r_inter1,
+            tTR_tP,
+            tTR_rP,
+        ) = self.pre_inter_tmem_load_and_partition_p(local_tidx, tInter1, smem_pt)
+
+        # Make fragment for register to hold P after post-processing (in acc dtype)
+        tState = cute.make_fragment(tTR_rP.shape, self.acc_dtype)
+
+        # Make tiledCopy and partition smem/register tensor for:
+        # - Loading initial_states from SMEM to registers (S2R, reuses tRS_rP)
+        # - Storing INTER2_P from registers to SMEM (R2S)
+        # ((R2S_ATOM_V, R2S_REST_V), R2S_M, R2S_N)
+        # ((R2S_ATOM_V, R2S_REST_V), R2S_M, R2S_N, INTERNAL_STAGE)
+        tiled_r2s_p, tRS_rP, tRS_sP = self.smem_store_and_partition_p_y(
+            local_tidx, smem_pt, tiled_t2r_inter1
+        )
+
+        tiled_s2r_p = None
+        tS2R_sP = None
+        if cutlass.const_expr(self.has_init_states):
+            tiled_s2r_p, tS2R_sP = self.smem_load_and_partition_istate(
+                local_tidx, smem_pt, tiled_t2r_inter1
+            )
+
+        # Partition global/shared tensor for P (State)
+        # ((ATOM_V, REST_V), INTERNAL_STAGE)
+        # ((ATOM_V, REST_V), 1, 1, EH, B)
+        bSG_sP, bSG_gP_pre_slice = self.tma_partition_with_shape(
+            tma_atom_p,
+            tma_tensor_p,
+            smem_p_store,
+            (
+                self.tile_shape_mnk_inter2[2],
+                self.tile_shape_mnk_inter2[1],
+            ),  # (N, D) to match gmem
+        )
+
+        # Pipeline B/Delta/INTER1_ACC consumer state
+        b_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.input_stages
+        )
+        deltas_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.input_stages
+        )
+        inter1_acc_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.internal_stages
+        )
+
+        # Pipeline INTER1_B/INTER2_P producer state
+        inter1_b_producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, self.internal_stages
+        )
+        inter2_p_producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, self.internal_stages
+        )
+        istate_consumer_state = None
+        if cutlass.const_expr(self.has_init_states):
+            istate_consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.initial_state_load_stages
+            )
+
+        # Pipeline TMA store P
+        tma_p_pipeline = pipeline.PipelineTmaStore.create(
+            num_stages=self.internal_stages,
+            producer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, 32 * len(self.pre_inter_warp_id)
+            ),
+        )
+
+        while work_tile.is_valid_tile:
+            b_idx, eh_idx, g_idx, seq_id, first_chunk, C = (
+                self.resolve_varlen_tile_info(work_tile, seq_chunk_cumsum, C)
+            )
+
+            # Slice global tensor to current tile idx
+            # ((ATOM_V, REST_V))
+            bSG_gP = bSG_gP_pre_slice[(None, 0, 0, eh_idx, b_idx)]
+
+            # Reset count for pipeline state
+            b_consumer_state.reset_count()
+            deltas_consumer_state.reset_count()
+            inter1_b_producer_state.reset_count()
+            inter1_acc_consumer_state.reset_count()
+            inter2_p_producer_state.reset_count()
+            if cutlass.const_expr(self.has_init_states):
+                istate_consumer_state.reset_count()
+
+            # State (P) init
+            if cutlass.const_expr(self.has_init_states):
+                init_states_pipeline.consumer_wait(istate_consumer_state)
+
+                istate_coord = (None, None, None, istate_consumer_state.index)
+                cute.copy(tiled_s2r_p, tS2R_sP[istate_coord], tRS_rP)
+
+                for reg_idx in range(cute.size(tRS_rP)):
+                    tState[reg_idx] = tRS_rP[reg_idx].to(self.acc_dtype)
+            else:
+                tState.fill(0.0)
+
+            # Peek (try_wait) B/Delta/INTER1_B buffer full/full/empty status
+            peek_b_full_status = self.conditional_consumer_try_wait(
+                b_consumer_state, b_pipeline, C
+            )
+            peek_deltas_full_status = self.conditional_consumer_try_wait(
+                deltas_consumer_state, deltas_pipeline, C
+            )
+            peek_wr_inter1_b_empty_status = self.conditional_producer_try_acquire(
+                inter1_b_producer_state, inter1_b_pipeline, C
+            )
+
+            # Prefill INTER2_P with 0
+            # Wait for INTER2_P buffer empty
+            inter2_p_pipeline.producer_acquire(inter2_p_producer_state)
+
+            tRS_rP.fill(0.0)
+            # Copy INTER2_P from register to smem
+            inter2_p_coord = (None, None, None, inter2_p_producer_state.index)
+            # Don't overwrite smem_p if we already have init states there
+            if cutlass.const_expr(self.has_init_states):
+                # Convert tState to tRS_rP (same as done in chunk loop at line 1876-1878)
+                for reg_idx in range(cute.size(tState)):
+                    tRS_rP[reg_idx] = tState[reg_idx].to(self.io_dtype)
+            cute.copy(tiled_r2s_p, tRS_rP, tRS_sP[inter2_p_coord])
+
+            # Fence for shared memory
+            cute.arch.fence_proxy(
+                cute.arch.ProxyKind.async_shared,
+                space=cute.arch.SharedSpace.shared_cta,
+            )
+            # Async arrive INTER2_P buffer full
+            inter2_p_pipeline.producer_commit(inter2_p_producer_state)
+            # Advance INTER2_P producer state
+            inter2_p_producer_state.advance()
+
+            # Batched processing over C dimension
+            for chunk_idx in cutlass.range(C, unroll=1):
+                # Index into global chunk_indices/chunk_offsets arrays
+                physical_chunk, chunk, chunk_offset = self.resolve_physical_chunk(
+                    first_chunk,
+                    chunk_idx,
+                    chunk_indices,
+                    chunk_offsets,
+                )
+
+                # Conditionally wait for B/Delta/B_TMEM buffer full/full/empty
+                b_pipeline.consumer_wait(b_consumer_state, peek_b_full_status)
+                deltas_pipeline.consumer_wait(
+                    deltas_consumer_state, peek_deltas_full_status
+                )
+                inter1_b_pipeline.producer_acquire(
+                    inter1_b_producer_state, peek_wr_inter1_b_empty_status
+                )
+
+                # Load B/Delta/DeltaA/last_column
+                b_coord = (None, None, None, b_consumer_state.index)
+                delta_coord = (None, None, None, deltas_consumer_state.index)
+                cute.copy(tiled_s2r_b, tBsB_s2r[b_coord], tBrB_s2r)
+                cute.copy(s2r_atom_delta, tBsDelta_s2r[delta_coord], tBrDelta_s2r)
+                cute.copy(s2r_atom_cumsum, tBsDeltaA_s2r[delta_coord], tBrDeltaA_s2r)
+                last_column = smem_cumsum_delta[
+                    smem_cumsum_delta.shape[0] - 1, deltas_consumer_state.index
+                ]
+
+                # Step 4.2: compute chunk_size_limit and adjust
+                # last_column for shared physical chunks.
+                chunk_size_limit = self.compute_chunk_size_limit(
+                    physical_chunk,
+                    chunk,
+                    num_logical_chunks,
+                    chunk_indices,
+                    chunk_offsets,
+                    L,
+                )
                 if cutlass.const_expr(self.has_varlen):
-                    b_idx, eh_idx, g_idx = work_tile.tile_idx
-                    seq_id = b_idx
-                    first_chunk = seq_chunk_cumsum[seq_id]
-                    C = seq_chunk_cumsum[seq_id + 1] - first_chunk
+                    if chunk_size_limit < L:
+                        last_column = smem_cumsum_delta[
+                            chunk_size_limit - 1,
+                            deltas_consumer_state.index,
+                        ]
 
-                # Reset count for pipeline state
-                b_consumer_state.reset_count()
-                c_consumer_state.reset_count()
-                intra1_acc_producer_state.reset_count()
-                x_consumer_state.reset_count()
-                intra2_q_consumer_state.reset_count()
-                intra2_acc_producer_state.reset_count()
+                # Fence for shared memory
+                cute.arch.fence_proxy(
+                    cute.arch.ProxyKind.async_shared,
+                    space=cute.arch.SharedSpace.shared_cta,
+                )
 
-                # Peek (try_wait) B/C/X/INTRA1_ACC buffer full/full/full/empty status
+                # Combine B/Delta/DeltaA/last_column
+                tScaledB = self.pre_inter_scale_bt_with_delta(
+                    tBrB_s2r, tBrDelta_r2s, tBrDeltaA_r2s, last_column
+                )
+
+                # Adjust last_column for chunk offset boundary AFTER B scaling.
+                if chunk_offset > 0:
+                    dA_cs_boundary = smem_cumsum_delta[
+                        chunk_offset - 1, deltas_consumer_state.index
+                    ]
+                    last_column = last_column - dA_cs_boundary
+
+                # Step 4.2: mask scaled B outside [chunk_offset, chunk_size_limit).
+                if cutlass.const_expr(self.has_varlen):
+                    if chunk_size_limit < L or chunk_offset > 0:
+                        for reg_idx in cutlass.range(
+                            cute.size(tScaledB), unroll_full=True
+                        ):
+                            coord = tBCoord[reg_idx]
+                            l_coord = coord[1]
+                            if l_coord >= chunk_size_limit or l_coord < chunk_offset:
+                                tScaledB[reg_idx] = 0.0
+
+                # Store scaled B to tBrB_r2s
+                for reg_idx in range(cute.size(tBrB_r2s)):
+                    tBrB_r2s[reg_idx] = tScaledB[reg_idx].to(self.io_dtype)
+
+                # Store tBrB_r2s to bt_smem_internal
+                inter1_b_coord = (None, None, None, inter1_b_producer_state.index)
+                cute.copy(tiled_r2s_b, tBrB_r2s, tBsB_r2s[inter1_b_coord])
+
+                # Fence for shared memory
+                cute.arch.fence_proxy(
+                    cute.arch.ProxyKind.async_shared,
+                    space=cute.arch.SharedSpace.shared_cta,
+                )
+
+                # Async arrive B/Delta/B_TMEM buffer empty/empty/full
+                b_pipeline.consumer_release(
+                    b_consumer_state, pipeline.PipelineOp.AsyncThread
+                )
+                deltas_pipeline.consumer_release(deltas_consumer_state)
+                inter1_b_pipeline.producer_commit(inter1_b_producer_state)
+
+                # Wait for INTER1_ACC/INTER2_P buffer full/empty
+                inter1_acc_pipeline.consumer_wait(inter1_acc_consumer_state)
+                inter2_p_pipeline.producer_acquire(inter2_p_producer_state)
+
+                # Load INTER1_ACC
+                inter1_acc_coord = (
+                    None,
+                    None,
+                    None,
+                    inter1_acc_consumer_state.index,
+                )
+                cute.copy(tiled_t2r_inter1, tTR_tP[inter1_acc_coord], tTR_rP)
+
+                # Fence for TMEM load
+                cute.arch.fence_view_async_tmem_load()
+
+                # Combine INTER1_ACC/last_column/State
+                exp_last_column = cute.math.exp(last_column, fastmath=True)
+                for reg_idx in range(0, cute.size(tTR_rP), 2):
+                    (
+                        tTR_rP[reg_idx],
+                        tTR_rP[reg_idx + 1],
+                    ) = cute.arch.fma_packed_f32x2(
+                        (exp_last_column, exp_last_column),
+                        (tState[reg_idx], tState[reg_idx + 1]),
+                        (tTR_rP[reg_idx], tTR_rP[reg_idx + 1]),
+                    )
+
+                # Store scaled P to tRS_rP
+                for reg_idx in range(cute.size(tTR_rP)):
+                    tRS_rP[reg_idx] = tTR_rP[reg_idx].to(self.io_dtype)
+
+                # Update old state
+                tState.store(tTR_rP.load())
+
+                # Store INTER2_P
+                inter2_p_coord = (None, None, None, inter2_p_producer_state.index)
+                cute.copy(tiled_r2s_p, tRS_rP, tRS_sP[inter2_p_coord])
+
+                # Fence for shared memory
+                cute.arch.fence_proxy(
+                    cute.arch.ProxyKind.async_shared,
+                    space=cute.arch.SharedSpace.shared_cta,
+                )
+
+                # Async arrive INTER1_ACC buffer empty
+                inter1_acc_pipeline.consumer_release(inter1_acc_consumer_state)
+
+                # --- Varlen look-ahead: store fstate / reload init_state ---
+                if cutlass.const_expr(self.has_init_states and self.has_varlen):
+                    is_last_chunk = chunk_idx == C - 1
+                    seq_id = seq_idx[0, chunk * L + chunk_offset]
+                    seq_ends_here = is_last_chunk
+                    if not is_last_chunk:
+                        next_chunk = chunk_indices[physical_chunk + 1]
+                        chunk_offset_next = chunk_offsets[physical_chunk + 1]
+                        next_seq = seq_idx[0, next_chunk * L + chunk_offset_next]
+                        seq_ends_here = next_seq != seq_id
+
+                    # A. Store final state of ending sequence to gmem
+                    if seq_ends_here:
+                        if local_warp_idx == 0:
+                            bSG_gP_seq = bSG_gP_pre_slice[(None, 0, 0, eh_idx, seq_id)]
+                            cute.copy(
+                                tma_atom_p,
+                                bSG_sP[(None, inter2_p_producer_state.index)],
+                                bSG_gP_seq,
+                            )
+                        # All pre_inter warps must participate in pipeline ops
+                        tma_p_pipeline.producer_commit()
+                        tma_p_pipeline.producer_acquire()
+
+                    # B. Reload init_state for new sequence
+                    if seq_ends_here and not is_last_chunk:
+                        # Release old IS buffer, wait for new one from TMA warp
+                        init_states_pipeline.consumer_release(istate_consumer_state)
+                        istate_consumer_state.advance()
+                        init_states_pipeline.consumer_wait(istate_consumer_state)
+
+                        # Load new init_state: smem → tRS_rP → tState
+                        istate_coord = (
+                            None,
+                            None,
+                            None,
+                            istate_consumer_state.index,
+                        )
+                        cute.copy(tiled_s2r_p, tS2R_sP[istate_coord], tRS_rP)
+                        for reg_idx in range(cute.size(tRS_rP)):
+                            tState[reg_idx] = tRS_rP[reg_idx].to(self.acc_dtype)
+
+                        # Overwrite same inter2_p smem slot with new init_state
+                        for reg_idx in range(cute.size(tState)):
+                            tRS_rP[reg_idx] = tState[reg_idx].to(self.io_dtype)
+                        cute.copy(tiled_r2s_p, tRS_rP, tRS_sP[inter2_p_coord])
+
+                # Commit INTER2_P buffer full
+                # Last iteration consumer is PRE_INTER warp itself, not MMA_INTER warp
+                if inter2_p_producer_state.count < C:
+                    inter2_p_pipeline.producer_commit(inter2_p_producer_state)
+
+                # Advance B/Delta/INTER1_B/INTER1_ACC state
+                b_consumer_state.advance()
+                deltas_consumer_state.advance()
+                inter1_b_producer_state.advance()
+                inter1_acc_consumer_state.advance()
+                # Peek (try_wait) B/Delta/INTER1_B buffer full/full./empty for chunk_idx = chunk_idx + 1
                 peek_b_full_status = self.conditional_consumer_try_wait(
                     b_consumer_state, b_pipeline, C
                 )
-                peek_c_full_status = self.conditional_consumer_try_wait(
-                    c_consumer_state, c_pipeline, C
+                peek_deltas_full_status = self.conditional_consumer_try_wait(
+                    deltas_consumer_state, deltas_pipeline, C
                 )
-                peek_wr_intra1_acc_empty_status = self.conditional_producer_try_acquire(
-                    intra1_acc_producer_state, intra1_acc_pipeline, C
+                peek_wr_inter1_b_empty_status = self.conditional_producer_try_acquire(
+                    inter1_b_producer_state, inter1_b_pipeline, C
                 )
-                peek_x_full_status = self.conditional_consumer_try_wait(
+
+                # Last iteration producer is PRE_INTER warp itself, not MMA_INTER warp
+                if inter2_p_producer_state.count < C:
+                    # Advance INTER2_P producer state
+                    inter2_p_producer_state.advance()
+
+            # Store last INTER2_P (State) from smem to gmem
+            cute.arch.fence_proxy(
+                cute.arch.ProxyKind.async_shared,
+                space=cute.arch.SharedSpace.shared_cta,
+            )
+            cute.arch.barrier(
+                barrier_id=self.pre_inter_sync_bar_id,
+                number_of_threads=len(self.pre_inter_warp_id) * 32,
+            )
+
+            if local_warp_idx == 0:
+                # TMA store P
+                if cutlass.const_expr(self.has_init_states and self.has_varlen):
+                    bSG_gP_final = bSG_gP_pre_slice[(None, 0, 0, eh_idx, seq_id)]
+                else:
+                    bSG_gP_final = bSG_gP
+                cute.copy(
+                    tma_atom_p,
+                    bSG_sP[(None, inter2_p_producer_state.index)],
+                    bSG_gP_final,
+                )
+                tma_p_pipeline.producer_commit()
+                tma_p_pipeline.producer_acquire()
+
+            cute.arch.barrier(
+                barrier_id=self.pre_inter_sync_bar_id,
+                number_of_threads=len(self.pre_inter_warp_id) * 32,
+            )
+            tma_p_pipeline.producer_tail()
+
+            # release init_state_pipeline for the next tile
+            if cutlass.const_expr(self.has_init_states):
+                init_states_pipeline.consumer_release(istate_consumer_state)
+                istate_consumer_state.advance()
+
+            # Advance to next tile
+            tile_sched.advance_to_next_work()
+            work_tile = tile_sched.get_current_work()
+
+        # Producer tail for INTER1_B/INTER2_P/TMA store P
+        inter1_b_pipeline.producer_tail(inter1_b_producer_state)
+        inter2_p_pipeline.producer_tail(inter2_p_producer_state)
+
+    @cute.jit
+    def _warp_epilog(
+        self,
+        local_tidx,
+        local_warp_idx,
+        smem_cumsum_delta,
+        smem_d,
+        smem_xt,
+        smem_y,
+        tmem_ptr_base,
+        tiled_mma_intra2,
+        tiled_mma_inter2,
+        tma_atom_y,
+        tma_tensor_y,
+        y_gmem,
+        z_gmem,
+        tma_tensor_d,
+        deltas_pipeline,
+        intra2_acc_pipeline,
+        inter2_acc_pipeline,
+        x_pipeline,
+        d_pipeline,
+        tile_sched,
+        work_tile,
+        epi_tile,
+        L,
+        C,
+        chunk_indices,
+        chunk_offsets,
+        seq_chunk_cumsum,
+        num_logical_chunks,
+    ):
+        # (L, D, INPUT_STAGE)
+        sDeltaA = self.epilog_make_delta(smem_cumsum_delta)
+
+        # Make tmem tensor for INTRA2_ACC/INTER2_ACC
+        # (MMA, MMA_M, MMA_K, INTERNAL_STAGE)
+        tCtAccIntra2 = self.mma_partition_c(
+            tiled_mma_intra2,
+            self.tile_shape_mnk_intra2,
+            tmem_ptr_base + self.tmem_intra2_acc_offset,
+            self.internal_stages,
+        )
+        # (M_PER_MMA, N_PER_MMA, INTERNAL_STAGE)
+        tIntra2 = tCtAccIntra2[((None, None), 0, 0, None)]
+        # (MMA, MMA_M, MMA_K, INTERNAL_STAGE)
+        tCtAccInter2 = self.mma_partition_c(
+            tiled_mma_inter2,
+            self.tile_shape_mnk_inter2,
+            tmem_ptr_base + self.tmem_inter2_acc_offset,
+            self.internal_stages,
+        )
+        # (M_PER_MMA, N_PER_MMA, INTERNAL_STAGE)
+        tInter2 = tCtAccInter2[((None, None), 0, 0, None)]
+
+        # Subtiling INTRA2_ACC/INTER2_ACC/Delta/Y
+        # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N, INTERNAL_STAGE)
+        tIntra_epi = cute.flat_divide(tIntra2, epi_tile)
+        tInter_epi = cute.flat_divide(tInter2, epi_tile)
+        # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N, INPUT_STAGE)
+        sDeltaA_epi = cute.flat_divide(sDeltaA, epi_tile)
+
+        # Make tiled copy and partition tmem/reg tensor w.r.t tensor memory load
+        (
+            tiled_t2r_intra2,
+            tTR_tIntra,
+            tTR_rIntra,
+        ) = self.epilog_tmem_load_and_partition_acc(local_tidx, tIntra_epi, smem_y)
+        (
+            tiled_t2r_inter2,
+            tTR_tInter2,
+            tTR_rInter,
+        ) = self.epilog_tmem_load_and_partition_acc(local_tidx, tInter_epi, smem_y)
+
+        # Make tiled copy and partition smem/reg tensor w.r.t smem load Delta
+        (
+            s2r_atom_delta,
+            tTR_sDeltaA,
+            tTR_rDeltaA,
+        ) = self.smem_load_and_partition_delta_d(
+            tiled_t2r_inter2, local_tidx, sDeltaA_epi, (None, None, None, 0, 0, 0)
+        )
+
+        # Partition smem/register tensor w.r.t smem store Y
+        tiled_r2s_y, tRS_rY, tRS_sY = self.smem_store_and_partition_p_y(
+            local_tidx, smem_y, tiled_t2r_inter2
+        )
+
+        tRS_rCompute = cute.make_fragment(tRS_rY.shape, self.acc_dtype)
+
+        # Register fragment for z gating (loaded from gmem per subtile)
+        tRS_rZ = None
+        if cutlass.const_expr(self.has_z):
+            tRS_rZ = cute.make_fragment(tRS_rY.shape, self.acc_dtype)
+
+        # Coordinate tensor for per-register (l, d) within epi_tile
+        epi_coord_tensor = cute.make_identity_tensor(epi_tile)
+        thr_t2r_inter2 = tiled_t2r_inter2.get_slice(local_tidx)
+        tYCoord = thr_t2r_inter2.partition_D(epi_coord_tensor)
+
+        tiled_s2r_x = None
+        tSR_sX = None
+        tSR_rX = None
+        if cutlass.const_expr(self.has_d):
+            tiled_s2r_x, tSR_sX, tSR_rX = self.epilog_smem_load_and_partition_x(
+                tiled_t2r_inter2, local_tidx, smem_xt, epi_tile
+            )
+
+        tRS_sD = None
+        tRS_rD = None
+        s2r_atom_d = None
+        if cutlass.const_expr(self.d_has_hdim):
+            sD = self.epilog_make_d(smem_d)
+            tD_sepi = cute.flat_divide(sD, epi_tile)
+            s2r_atom_d, tRS_sD, tRS_rD = self.smem_load_and_partition_delta_d(
+                tiled_t2r_inter2, local_tidx, tD_sepi, (None, None, None, 0, 0, 0)
+            )
+        elif cutlass.const_expr(self.has_d):
+            tRS_rD = cutlass.Float32(0.0).to(self.io_dtype)
+
+        # Partition global/shared tensor for TMA store Y
+        bSG_sY, bSG_gY_pre_slice = self.epilog_tma_partition_y(
+            tma_tensor_y, tma_atom_y, smem_y, epi_tile
+        )
+
+        # Make TMA store pipeline Y
+        tma_y_pipeline = pipeline.PipelineTmaStore.create(
+            num_stages=self.output_stages,
+            producer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, 32 * len(self.epilog_warp_id)
+            ),
+        )
+
+        # Make consumer pipeline states
+        deltas_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.input_stages
+        )
+        intra2_acc_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.internal_stages
+        )
+        inter2_acc_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.internal_stages
+        )
+        x_consumer_state = None
+        if cutlass.const_expr(self.has_d):
+            x_consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.input_stages
+            )
+        d_consumer_state = None
+        if cutlass.const_expr(self.d_has_hdim):
+            d_consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.input_stages
+            )
+
+        while work_tile.is_valid_tile:
+            b_idx, eh_idx, g_idx, seq_id, first_chunk, C = (
+                self.resolve_varlen_tile_info(work_tile, seq_chunk_cumsum, C)
+            )
+
+            # Slice global tensor to current tile idx
+            bSG_gY = bSG_gY_pre_slice[(None, None, None, 0, 0, None, eh_idx, b_idx)]
+            if cutlass.const_expr(self.has_d and not self.d_has_hdim):
+                tRS_rD = tma_tensor_d[0, eh_idx]
+
+            # Reset count for pipeline state
+            deltas_consumer_state.reset_count()
+            intra2_acc_consumer_state.reset_count()
+            inter2_acc_consumer_state.reset_count()
+            if cutlass.const_expr(self.has_d):
+                x_consumer_state.reset_count()
+            if cutlass.const_expr(self.d_has_hdim):
+                d_consumer_state.reset_count()
+
+            # Peek Delta/INTRA2_ACC/INTER2_ACC buffer status
+            peek_deltas_full_status = self.conditional_consumer_try_wait(
+                deltas_consumer_state, deltas_pipeline, C
+            )
+            peek_rd_intra2_acc_full_status = self.conditional_consumer_try_wait(
+                intra2_acc_consumer_state, intra2_acc_pipeline, C
+            )
+            peek_rd_inter2_acc_full_status = self.conditional_consumer_try_wait(
+                inter2_acc_consumer_state, inter2_acc_pipeline, C
+            )
+            peek_rd_x_full_status = None
+            if cutlass.const_expr(self.has_d):
+                peek_rd_x_full_status = self.conditional_consumer_try_wait(
                     x_consumer_state, x_pipeline, C
                 )
 
-                # Manual pipeline: unrolled INTRA_MMA1 chunk_idx = 0 loop
+            if cutlass.const_expr(self.d_has_hdim):
+                d_pipeline.consumer_wait(d_consumer_state)
+
+            # Batched processing over C dimension
+            for chunk_idx in cutlass.range(C, unroll=1):
+                physical_chunk, chunk, chunk_offset = self.resolve_physical_chunk(
+                    first_chunk,
+                    chunk_idx,
+                    chunk_indices,
+                    chunk_offsets,
+                )
+                chunk_size_limit = self.compute_chunk_size_limit(
+                    physical_chunk,
+                    chunk,
+                    num_logical_chunks,
+                    chunk_indices,
+                    chunk_offsets,
+                    L,
+                )
+
+                # Conditionally wait for Delta/INTRA2_ACC/INTER2_ACC/X buffer full
+                deltas_pipeline.consumer_wait(
+                    deltas_consumer_state, peek_deltas_full_status
+                )
+                intra2_acc_pipeline.consumer_wait(
+                    intra2_acc_consumer_state, peek_rd_intra2_acc_full_status
+                )
+                inter2_acc_pipeline.consumer_wait(
+                    inter2_acc_consumer_state, peek_rd_inter2_acc_full_status
+                )
+                if cutlass.const_expr(self.has_d):
+                    x_pipeline.consumer_wait(x_consumer_state, peek_rd_x_full_status)
+                # Loop over EPI_M and EPI_N subtiles
+                for epi_n in range(cute.size(tTR_tIntra, mode=[4])):
+                    for epi_m in range(cute.size(tTR_tIntra, mode=[3])):
+                        epi_iter_cnt = epi_n * cute.size(tTR_tIntra, mode=[3]) + epi_m
+                        epi_buffer_idx = epi_iter_cnt % self.output_stages
+
+                        # Load INTRA2_ACC/INTER2_ACC from tmem
+                        subtile_coord = (None, None, None, epi_m, epi_n)
+                        intra2_coord = subtile_coord + (
+                            intra2_acc_consumer_state.index,
+                        )
+                        cute.copy(
+                            tiled_t2r_intra2,
+                            tTR_tIntra[intra2_coord],
+                            tTR_rIntra,
+                        )
+                        inter2_coord = subtile_coord + (
+                            inter2_acc_consumer_state.index,
+                        )
+                        cute.copy(
+                            tiled_t2r_inter2,
+                            tTR_tInter2[inter2_coord],
+                            tTR_rInter,
+                        )
+                        cute.arch.fence_view_async_tmem_load()
+
+                        # Load Delta from smem
+                        delta_coord = subtile_coord + (deltas_consumer_state.index,)
+                        cute.copy(s2r_atom_delta, tTR_sDeltaA[delta_coord], tTR_rDeltaA)
+
+                        # Load X from smem
+                        if cutlass.const_expr(self.has_d):
+                            x_coord = subtile_coord + (x_consumer_state.index,)
+                            cute.copy(tiled_s2r_x, tSR_sX[x_coord], tSR_rX)
+
+                        # Load D from smem
+                        if cutlass.const_expr(self.d_has_hdim):
+                            d_coord = subtile_coord + (d_consumer_state.index,)
+                            cute.copy(s2r_atom_d, tRS_sD[d_coord], tRS_rD)
+
+                        # Adjust dA_cumsum for chunk offset boundary
+                        if chunk_offset > 0:
+                            dA_cs_boundary = smem_cumsum_delta[
+                                chunk_offset - 1, deltas_consumer_state.index
+                            ]
+                            for reg_idx in range(cute.size(tTR_rDeltaA)):
+                                tTR_rDeltaA[reg_idx] = (
+                                    tTR_rDeltaA[reg_idx] - dA_cs_boundary
+                                )
+
+                        # Combine INTRA2_ACC/INTER2_ACC/Delta/X/D
+                        for reg_idx in range(0, cute.size(tRS_rCompute), 2):
+                            (
+                                tRS_rCompute[reg_idx],
+                                tRS_rCompute[reg_idx + 1],
+                            ) = cute.arch.fma_packed_f32x2(
+                                (tTR_rInter[reg_idx], tTR_rInter[reg_idx + 1]),
+                                (
+                                    cute.math.exp(tTR_rDeltaA[reg_idx], fastmath=True),
+                                    cute.math.exp(
+                                        tTR_rDeltaA[reg_idx + 1], fastmath=True
+                                    ),
+                                ),
+                                (tTR_rIntra[reg_idx], tTR_rIntra[reg_idx + 1]),
+                            )
+                            # Fuse Y += X * D
+                            if cutlass.const_expr(self.d_has_hdim):
+                                (
+                                    tRS_rCompute[reg_idx],
+                                    tRS_rCompute[reg_idx + 1],
+                                ) = cute.arch.fma_packed_f32x2(
+                                    (
+                                        tRS_rD[reg_idx].to(self.acc_dtype),
+                                        tRS_rD[reg_idx + 1].to(self.acc_dtype),
+                                    ),
+                                    (
+                                        tSR_rX[reg_idx].to(self.acc_dtype),
+                                        tSR_rX[reg_idx + 1].to(self.acc_dtype),
+                                    ),
+                                    (
+                                        tRS_rCompute[reg_idx],
+                                        tRS_rCompute[reg_idx + 1],
+                                    ),
+                                )
+                            elif cutlass.const_expr(self.has_d):
+                                (
+                                    tRS_rCompute[reg_idx],
+                                    tRS_rCompute[reg_idx + 1],
+                                ) = cute.arch.fma_packed_f32x2(
+                                    (
+                                        tRS_rD.to(self.acc_dtype),
+                                        tRS_rD.to(self.acc_dtype),
+                                    ),
+                                    (
+                                        tSR_rX[reg_idx].to(self.acc_dtype),
+                                        tSR_rX[reg_idx + 1].to(self.acc_dtype),
+                                    ),
+                                    (
+                                        tRS_rCompute[reg_idx],
+                                        tRS_rCompute[reg_idx + 1],
+                                    ),
+                                )
+
+                        # Z gating: y *= z * sigmoid(z) = y *= silu(z)
+                        if cutlass.const_expr(self.has_z):
+                            z_d_off = epi_n * epi_tile[1]
+                            for reg_idx in cutlass.range(
+                                cute.size(tRS_rZ), unroll_full=True
+                            ):
+                                coord = tYCoord[reg_idx]
+                                z_l = coord[0]
+                                z_d = coord[1]
+                                tRS_rZ[reg_idx] = z_gmem[
+                                    z_d_off + z_d, z_l, chunk, eh_idx, b_idx
+                                ].to(self.acc_dtype)
+                            for reg_idx in range(0, cute.size(tRS_rCompute), 2):
+                                z0 = tRS_rZ[reg_idx]
+                                z1 = tRS_rZ[reg_idx + 1]
+                                s0 = z0 / (
+                                    cutlass.Float32(1.0)
+                                    + cute.math.exp(-z0, fastmath=True)
+                                )
+                                s1 = z1 / (
+                                    cutlass.Float32(1.0)
+                                    + cute.math.exp(-z1, fastmath=True)
+                                )
+                                tRS_rCompute[reg_idx] = tRS_rCompute[reg_idx] * s0
+                                tRS_rCompute[reg_idx + 1] = (
+                                    tRS_rCompute[reg_idx + 1] * s1
+                                )
+
+                        tRS_rY.store(tRS_rCompute.load().to(self.io_dtype))
+
+                        # Store Y to smem
+                        cute.copy(
+                            tiled_r2s_y,
+                            tRS_rY,
+                            tRS_sY[None, None, None, epi_buffer_idx],
+                        )
+
+                        # Fence for R2S store
+                        cute.arch.fence_proxy(
+                            cute.arch.ProxyKind.async_shared,
+                            space=cute.arch.SharedSpace.shared_cta,
+                        )
+                        cute.arch.barrier(
+                            barrier_id=self.epilog_sync_bar_id,
+                            number_of_threads=len(self.epilog_warp_id) * 32,
+                        )
+
+                        # Release pipelines on last subtile
+                        if (
+                            epi_iter_cnt
+                            == cute.size(tTR_tIntra, mode=[4])
+                            * cute.size(tTR_tIntra, mode=[3])
+                            - 1
+                        ):
+                            deltas_pipeline.consumer_release(deltas_consumer_state)
+                            intra2_acc_pipeline.consumer_release(
+                                intra2_acc_consumer_state
+                            )
+                            inter2_acc_pipeline.consumer_release(
+                                inter2_acc_consumer_state
+                            )
+                            if cutlass.const_expr(self.has_d):
+                                x_pipeline.consumer_release(
+                                    x_consumer_state,
+                                    pipeline.PipelineOp.AsyncThread,
+                                )
+
+                        # Store Y to global memory
+                        l_coord = 0
+                        d_coord = 0
+                        d_off = epi_n * epi_tile[1]
+                        if chunk_size_limit < L or chunk_offset > 0:
+                            for reg_idx in cutlass.range(
+                                cute.size(tRS_rY), unroll_full=True
+                            ):
+                                coord = tYCoord[reg_idx]
+                                l_coord = coord[0]
+                                d_coord = coord[1]
+                                if (
+                                    l_coord >= chunk_offset
+                                    and l_coord < chunk_size_limit
+                                ):
+                                    y_gmem[
+                                        l_coord,
+                                        d_off + d_coord,
+                                        chunk,
+                                        eh_idx,
+                                        b_idx,
+                                    ] = tRS_rY[reg_idx]
+                        else:
+                            if local_warp_idx == 0:
+                                cute.copy(
+                                    tma_atom_y,
+                                    bSG_sY[None, epi_buffer_idx],
+                                    bSG_gY[None, epi_m, epi_n, chunk],
+                                )
+
+                        if local_warp_idx == 0:
+                            tma_y_pipeline.producer_commit()
+                            tma_y_pipeline.producer_acquire()
+                        cute.arch.barrier(
+                            barrier_id=self.epilog_sync_bar_id,
+                            number_of_threads=len(self.epilog_warp_id) * 32,
+                        )
+
+                # Advance deltas/intra2_acc/inter2_acc consumer states
+                deltas_consumer_state.advance()
+                intra2_acc_consumer_state.advance()
+                inter2_acc_consumer_state.advance()
+
+                peek_deltas_full_status = self.conditional_consumer_try_wait(
+                    deltas_consumer_state, deltas_pipeline, C
+                )
+                peek_rd_intra2_acc_full_status = self.conditional_consumer_try_wait(
+                    intra2_acc_consumer_state, intra2_acc_pipeline, C
+                )
+                peek_rd_inter2_acc_full_status = self.conditional_consumer_try_wait(
+                    inter2_acc_consumer_state, inter2_acc_pipeline, C
+                )
+
+                if cutlass.const_expr(self.has_d):
+                    x_consumer_state.advance()
+                    peek_rd_x_full_status = self.conditional_consumer_try_wait(
+                        x_consumer_state, x_pipeline, C
+                    )
+
+            if cutlass.const_expr(self.d_has_hdim):
+                d_pipeline.consumer_release(d_consumer_state)
+                d_consumer_state.advance()
+
+            # Advance to next tile
+            tile_sched.advance_to_next_work()
+            work_tile = tile_sched.get_current_work()
+
+        # Producer tail for TMA store Y
+        tma_y_pipeline.producer_tail()
+
+    @cute.jit
+    def _warp_pre_intra(
+        self,
+        local_tidx,
+        smem_cumsum_delta,
+        smem_delta,
+        tmem_ptr_base,
+        tiled_mma_intra1,
+        tiled_mma_intra2,
+        q_tmem_layout,
+        deltas_pipeline,
+        intra1_acc_pipeline,
+        intra2_q_pipeline,
+        tile_sched,
+        work_tile,
+        L,
+        C,
+        chunk_indices,
+        chunk_offsets,
+        seq_chunk_cumsum,
+        num_logical_chunks,
+    ):
+        # Make tmem fragment for INTRA1_ACC
+        # (MMA, MMA_M, MMA_N, INTRA1_ACC_STAGE)
+        tCtAccIntra1 = self.mma_partition_c(
+            tiled_mma_intra1,
+            self.tile_shape_mnk_intra1,
+            tmem_ptr_base + self.tmem_intra1_acc_offset,
+            self.intra1_acc_stages,
+        )
+        # (M_PER_MMA, N_PER_MMA, INTRA1_ACC_STAGE)
+        tIntra1 = tCtAccIntra1[((None, None), 0, 0, None)]
+
+        # Make tiledCopy and partition tmem/register tensor for tensor memory load INTRA1_ACC
+        # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N, INTERNAL_STAGE)
+        # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N)
+        tiled_t2r_intra1, tTR_tQ, tTR_rQ = self.pre_intra_tmem_load_and_partition_q(
+            tIntra1, local_tidx
+        )
+
+        # Broadcast delta/delta_cumsum smem tensor from LxINPUT_STAGE to LxLxINPUT_STAGE
+        sDeltaA_Row = self.pre_intra_make_delta(smem_cumsum_delta, 0)
+        sDeltaA_Col = self.pre_intra_make_delta(smem_cumsum_delta, 1)
+        sDelta = self.pre_intra_make_delta(smem_delta, 0)
+
+        # Make tiledCopy and partition smem/register tensor for smem memory load delta/delta_cumsum
+        # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N, INPUT_STAGE)
+        # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N)
+        (
+            s2r_atom_cumsum,
+            tQsDeltaA_Row,
+            tQrDeltaA_Row,
+        ) = self.smem_load_and_partition_delta_d(
+            tiled_t2r_intra1, local_tidx, sDeltaA_Row, (None, None, None, 0)
+        )
+        (
+            s2r_atom_cumsum,
+            tQsDeltaA_Col,
+            tQrDeltaA_Col,
+        ) = self.smem_load_and_partition_delta_d(
+            tiled_t2r_intra1, local_tidx, sDeltaA_Col, (None, None, None, 0)
+        )
+        (
+            s2r_atom_delta,
+            tQsDelta,
+            tQrDelta,
+        ) = self.smem_load_and_partition_delta_d(
+            tiled_t2r_intra1, local_tidx, sDelta, (None, None, None, 0)
+        )
+
+        # Make and partition coord tensor for delta_cumsum load
+        # (L, L)
+        coord_tensor = cute.make_identity_tensor(
+            cute.dice(self.tile_shape_mnk_intra1, (1, 1, None))
+        )
+        thr_t2r_intra1 = tiled_t2r_intra1.get_slice(local_tidx)
+        # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N)
+        tCoord = thr_t2r_intra1.partition_D(coord_tensor)
+
+        # Make tmem tensor for INTRA2_Q
+        # (MMA, MMA_M, MMA_K, INTERNAL_STAGE)
+        tCrQ = self.mma_partition_a_tmem(
+            tiled_mma_intra2,
+            q_tmem_layout,
+            tmem_ptr_base + self.tmem_intra2_q_offset,
+        )
+
+        # Make tiledCopy and partition tmem/register tensor for tensor memory store INTRA2_Q
+        # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N, ...)
+        # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N, ..., INTERNAL_STAGE)
+        tiled_r2t_q, tRT_rQ, tRT_tQ = self.pre_intra_tmem_store_and_partition_q(
+            local_tidx, tCrQ
+        )
+
+        # Pipeline DELTA/INTRA1_ACC consumer state
+        deltas_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.input_stages
+        )
+        intra1_acc_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.intra1_acc_stages
+        )
+        # Pipeline INTRA2_Q producer state
+        intra2_q_producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, self.internal_stages
+        )
+
+        while work_tile.is_valid_tile:
+            _, _, _, _, first_chunk, C = self.resolve_varlen_tile_info(
+                work_tile, seq_chunk_cumsum, C
+            )
+
+            # Reset count for pipeline state
+            deltas_consumer_state.reset_count()
+            intra1_acc_consumer_state.reset_count()
+            intra2_q_producer_state.reset_count()
+
+            # Peek (try_wait) DELTA/INTRA1_ACC buffer full
+            peek_deltas_full_status = self.conditional_consumer_try_wait(
+                deltas_consumer_state, deltas_pipeline, C
+            )
+            peek_rd_intra1_acc_full_status = self.conditional_consumer_try_wait(
+                intra1_acc_consumer_state, intra1_acc_pipeline, C
+            )
+
+            # Batched processing over C dimension
+            for chunk_idx in cutlass.range(C, unroll=1):
+                # Index into global chunk_indices/chunk_offsets arrays
+                physical_chunk, chunk, chunk_offset = self.resolve_physical_chunk(
+                    first_chunk,
+                    chunk_idx,
+                    chunk_indices,
+                    chunk_offsets,
+                )
+
+                # Conditionally wait for Delta/INTRA1_ACC buffer full
+                deltas_pipeline.consumer_wait(
+                    deltas_consumer_state, peek_deltas_full_status
+                )
+                intra1_acc_pipeline.consumer_wait(
+                    intra1_acc_consumer_state, peek_rd_intra1_acc_full_status
+                )
+
+                # Step 4.3a: compute chunk_offset/chunk_size_limit for
+                # cross-sequence CB masking in the INTRA path.
+                chunk_size_limit = self.compute_chunk_size_limit(
+                    physical_chunk,
+                    chunk,
+                    num_logical_chunks,
+                    chunk_indices,
+                    chunk_offsets,
+                    L,
+                )
+
+                # Load Q from tmem
+                intra1_coord = (None, None, None, intra1_acc_consumer_state.index)
+                cute.copy(tiled_t2r_intra1, tTR_tQ[intra1_coord], tTR_rQ)
+                cute.arch.fence_view_async_tmem_load()
+
+                # Step 4.3b: zero cross-sequence CB entries.
+                # CB = C @ B^T is computed by INTRA1_MMA on the full
+                # physical chunk. Zero entries where m or n falls
+                # outside [chunk_offset, chunk_size_limit) so data from
+                # other sequences doesn't leak through segsum.
+                if cutlass.const_expr(self.has_varlen):
+                    if chunk_size_limit < L or chunk_offset > 0:
+                        for subtile_idx in cutlass.range(
+                            cute.size(tTR_rQ), unroll_full=True
+                        ):
+                            m, n = tCoord[subtile_idx]
+                            if (
+                                m >= chunk_size_limit
+                                or m < chunk_offset
+                                or n >= chunk_size_limit
+                                or n < chunk_offset
+                            ):
+                                tTR_rQ[subtile_idx] = 0.0
+
+                # Load tQsDeltaA_Row/tQsDeltaA_Col/tQsDelta from smem
+                delta_coord = (None, None, None, deltas_consumer_state.index)
+                cute.copy(s2r_atom_cumsum, tQsDeltaA_Row[delta_coord], tQrDeltaA_Row)
+                cute.copy(s2r_atom_cumsum, tQsDeltaA_Col[delta_coord], tQrDeltaA_Col)
+                cute.copy(s2r_atom_delta, tQsDelta[delta_coord], tQrDelta)
+
+                # SegSum
+                tRT_rQ = self.pre_intra_segsum(
+                    tTR_rQ, tQrDeltaA_Row, tQrDeltaA_Col, tQrDelta, tCoord, tRT_rQ
+                )
+
+                # Wait for INTRA2_Q buffer empty
+                # Delay producer_acquire to right before data store
+                intra2_q_pipeline.producer_acquire(intra2_q_producer_state)
+
+                # Store Q from reg to tmem
+                q_coord = (None, None, None, None, intra2_q_producer_state.index)
+                cute.copy(tiled_r2t_q, tRT_rQ, tRT_tQ[q_coord])
+
+                # Async arrive Delta/INTRA1_ACC buffer empty
+                intra1_acc_pipeline.consumer_release(intra1_acc_consumer_state)
+                deltas_pipeline.consumer_release(deltas_consumer_state)
+
+                cute.arch.fence_view_async_tmem_store()
+
+                # Async arrive INTRA2_Q buffer full
+                intra2_q_pipeline.producer_commit(intra2_q_producer_state)
+
+                # Advance deltas/intra1_acc/intra2_q states
+                deltas_consumer_state.advance()
+                intra1_acc_consumer_state.advance()
+                intra2_q_producer_state.advance()
+
+                # Peek (try_wait) Delta/INTRA1_ACC buffer full for chunk_idx = chunk_idx + 1
+                peek_deltas_full_status = self.conditional_consumer_try_wait(
+                    deltas_consumer_state, deltas_pipeline, C
+                )
+                peek_rd_intra1_acc_full_status = self.conditional_consumer_try_wait(
+                    intra1_acc_consumer_state, intra1_acc_pipeline, C
+                )
+
+            # Advance to next tile
+            tile_sched.advance_to_next_work()
+            work_tile = tile_sched.get_current_work()
+
+        # Producer tail for INTRA2_Q
+        intra2_q_pipeline.producer_tail(intra2_q_producer_state)
+
+    @cute.jit
+    def _warp_mma_intra(
+        self,
+        smem_c,
+        smem_b,
+        smem_x,
+        q_tmem_layout,
+        tmem_ptr_base,
+        tiled_mma_intra1,
+        tiled_mma_intra2,
+        b_pipeline,
+        c_pipeline,
+        x_pipeline,
+        intra1_acc_pipeline,
+        intra2_q_pipeline,
+        intra2_acc_pipeline,
+        tile_sched,
+        work_tile,
+        C,
+        seq_chunk_cumsum,
+    ):
+        # Make shared/tmem fragments for INTRA_MMA1 B/C/ACC
+        # (MMA, MMA_N, MMA_K, INPUT_STAGE)
+        # (MMA, MMA_M, MMA_K, INPUT_STAGE)
+        # (MMA, MMA_M, MMA_N, INTRA1_ACC_STAGE)
+        tCrC, tCrB, tCtAccIntra1 = self.mma_partition_ss(
+            tiled_mma_intra1,
+            self.tile_shape_mnk_intra1,
+            smem_c,
+            smem_b,
+            tmem_ptr_base + self.tmem_intra1_acc_offset,
+            self.intra1_acc_stages,
+        )
+
+        # Make shared/tmem fragments for INTRA_MMA2 X/Q/ACC
+        # (MMA, MMA_M, MMA_K, INTERNAL_STAGE)
+        # (MMA, MMA_N, MMA_K, INPUT_STAGE)
+        # (MMA, MMA_M, MMA_N, INTERNAL_STAGE)
+        tCrQ, tCrX, tCtAccIntra2 = self.mma_partition_ts(
+            tiled_mma_intra2,
+            self.tile_shape_mnk_intra2,
+            q_tmem_layout,
+            smem_x,
+            tmem_ptr_base + self.tmem_intra2_q_offset,
+            tmem_ptr_base + self.tmem_intra2_acc_offset,
+            self.internal_stages,
+        )
+
+        # Pipeline B/C/X/INTRA2_Q consumer state
+        b_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.input_stages
+        )
+        c_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.input_stages
+        )
+        x_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.input_stages
+        )
+        intra2_q_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.internal_stages
+        )
+
+        # Pipeline INTRA1_ACC/INTRA2_ACC producer state
+        intra1_acc_producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, self.intra1_acc_stages
+        )
+        intra2_acc_producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, self.internal_stages
+        )
+
+        while work_tile.is_valid_tile:
+            _, _, _, _, first_chunk, C = self.resolve_varlen_tile_info(
+                work_tile, seq_chunk_cumsum, C
+            )
+
+            # Reset count for pipeline state
+            b_consumer_state.reset_count()
+            c_consumer_state.reset_count()
+            intra1_acc_producer_state.reset_count()
+            x_consumer_state.reset_count()
+            intra2_q_consumer_state.reset_count()
+            intra2_acc_producer_state.reset_count()
+
+            # Peek (try_wait) B/C/X/INTRA1_ACC buffer full/full/full/empty status
+            peek_b_full_status = self.conditional_consumer_try_wait(
+                b_consumer_state, b_pipeline, C
+            )
+            peek_c_full_status = self.conditional_consumer_try_wait(
+                c_consumer_state, c_pipeline, C
+            )
+            peek_wr_intra1_acc_empty_status = self.conditional_producer_try_acquire(
+                intra1_acc_producer_state, intra1_acc_pipeline, C
+            )
+            peek_x_full_status = self.conditional_consumer_try_wait(
+                x_consumer_state, x_pipeline, C
+            )
+
+            # Manual pipeline: unrolled INTRA_MMA1 chunk_idx = 0 loop
+            # Conditionally wait for B/C/INTRA1_ACC buffer full/full/empty
+            b_pipeline.consumer_wait(b_consumer_state, peek_b_full_status)
+            c_pipeline.consumer_wait(c_consumer_state, peek_c_full_status)
+            intra1_acc_pipeline.producer_acquire(
+                intra1_acc_producer_state, peek_wr_intra1_acc_empty_status
+            )
+
+            # INTRA_MMA1
+            tiled_mma_intra1 = self.exec_mma(
+                tiled_mma_intra1,
+                tCtAccIntra1,
+                tCrC,
+                tCrB,
+                intra1_acc_producer_state,
+                c_consumer_state,
+                b_consumer_state,
+            )
+
+            # Async arrive B/C/INTRA1_ACC buffer empty/empty/full
+            b_pipeline.consumer_release(
+                b_consumer_state, pipeline.PipelineOp.TCGen05Mma
+            )
+            c_pipeline.consumer_release(c_consumer_state)
+            intra1_acc_pipeline.producer_commit(intra1_acc_producer_state)
+
+            # Advance B/C/INTRA1_ACC state
+            b_consumer_state.advance()
+            c_consumer_state.advance()
+            intra1_acc_producer_state.advance()
+
+            # Peek (try_wait) B/C/INTRA1_ACC buffer full/full/empty for chunk_idx = chunk_idx + 1
+            peek_b_full_status = self.conditional_consumer_try_wait(
+                b_consumer_state, b_pipeline, C
+            )
+            peek_c_full_status = self.conditional_consumer_try_wait(
+                c_consumer_state, c_pipeline, C
+            )
+            peek_wr_intra1_acc_empty_status = self.conditional_producer_try_acquire(
+                intra1_acc_producer_state, intra1_acc_pipeline, C
+            )
+
+            # Manual pipeline: batched gemm over C-1 dimension
+            for chunk_idx in cutlass.range(C - 1, unroll=1):
                 # Conditionally wait for B/C/INTRA1_ACC buffer full/full/empty
                 b_pipeline.consumer_wait(b_consumer_state, peek_b_full_status)
                 c_pipeline.consumer_wait(c_consumer_state, peek_c_full_status)
@@ -1404,105 +2512,6 @@ class SSDKernel:
                 c_pipeline.consumer_release(c_consumer_state)
                 intra1_acc_pipeline.producer_commit(intra1_acc_producer_state)
 
-                # Advance B/C/INTRA1_ACC state
-                b_consumer_state.advance()
-                c_consumer_state.advance()
-                intra1_acc_producer_state.advance()
-
-                # Peek (try_wait) B/C/INTRA1_ACC buffer full/full/empty for chunk_idx = chunk_idx + 1
-                peek_b_full_status = self.conditional_consumer_try_wait(
-                    b_consumer_state, b_pipeline, C
-                )
-                peek_c_full_status = self.conditional_consumer_try_wait(
-                    c_consumer_state, c_pipeline, C
-                )
-                peek_wr_intra1_acc_empty_status = self.conditional_producer_try_acquire(
-                    intra1_acc_producer_state, intra1_acc_pipeline, C
-                )
-
-                # Manual pipeline: batched gemm over C-1 dimension
-                for chunk_idx in cutlass.range(C - 1, unroll=1):
-                    # Conditionally wait for B/C/INTRA1_ACC buffer full/full/empty
-                    b_pipeline.consumer_wait(b_consumer_state, peek_b_full_status)
-                    c_pipeline.consumer_wait(c_consumer_state, peek_c_full_status)
-                    intra1_acc_pipeline.producer_acquire(
-                        intra1_acc_producer_state, peek_wr_intra1_acc_empty_status
-                    )
-
-                    # INTRA_MMA1
-                    tiled_mma_intra1 = self.exec_mma(
-                        tiled_mma_intra1,
-                        tCtAccIntra1,
-                        tCrC,
-                        tCrB,
-                        intra1_acc_producer_state,
-                        c_consumer_state,
-                        b_consumer_state,
-                    )
-
-                    # Async arrive B/C/INTRA1_ACC buffer empty/empty/full
-                    b_pipeline.consumer_release(
-                        b_consumer_state, pipeline.PipelineOp.TCGen05Mma
-                    )
-                    c_pipeline.consumer_release(c_consumer_state)
-                    intra1_acc_pipeline.producer_commit(intra1_acc_producer_state)
-
-                    # Conditionally wait for X/INTRA2_Q/INTRA2_ACC buffer full/full/empty
-                    x_pipeline.consumer_wait(x_consumer_state, peek_x_full_status)
-                    intra2_q_pipeline.consumer_wait(intra2_q_consumer_state)
-                    intra2_acc_pipeline.producer_acquire(intra2_acc_producer_state)
-
-                    # INTRA_MMA2
-                    tiled_mma_intra2 = self.exec_mma(
-                        tiled_mma_intra2,
-                        tCtAccIntra2,
-                        tCrQ,
-                        tCrX,
-                        intra2_acc_producer_state,
-                        intra2_q_consumer_state,
-                        x_consumer_state,
-                    )
-
-                    # Async arrive X/INTRA2_Q/INTRA2_ACC buffer empty/empty/full
-                    if cutlass.const_expr(self.has_d):
-                        x_pipeline.consumer_release(
-                            x_consumer_state, pipeline.PipelineOp.TCGen05Mma
-                        )
-                    else:
-                        x_pipeline.consumer_release(x_consumer_state)
-                    intra2_q_pipeline.consumer_release(intra2_q_consumer_state)
-                    intra2_acc_pipeline.producer_commit(intra2_acc_producer_state)
-
-                    # Advance B/C/INTRA1_ACC cstate
-                    b_consumer_state.advance()
-                    c_consumer_state.advance()
-                    intra1_acc_producer_state.advance()
-
-                    # Peek (try_wait) B/C/INTRA1_ACC buffer full/full/empty for chunk_idx = chunk_idx + 1
-                    peek_b_full_status = self.conditional_consumer_try_wait(
-                        b_consumer_state, b_pipeline, C
-                    )
-                    peek_c_full_status = self.conditional_consumer_try_wait(
-                        c_consumer_state, c_pipeline, C
-                    )
-                    peek_wr_intra1_acc_empty_status = (
-                        self.conditional_producer_try_acquire(
-                            intra1_acc_producer_state, intra1_acc_pipeline, C
-                        )
-                    )
-
-                    # Advance X/INTRA2_Q/INTRA2_ACC state
-                    x_consumer_state.advance()
-                    intra2_q_consumer_state.advance()
-                    intra2_acc_producer_state.advance()
-
-                    # Peek (try_wait) X buffer full for chunk_idx = chunk_idx + 1
-                    peek_x_full_status = self.conditional_consumer_try_wait(
-                        x_consumer_state, x_pipeline, C
-                    )
-                # END of for chunk_idx in cutlass.range(C-1, unroll=1)
-
-                # Manual pipeline: unrolled INTRA_MMA2 chunk_idx = C-1 loop
                 # Conditionally wait for X/INTRA2_Q/INTRA2_ACC buffer full/full/empty
                 x_pipeline.consumer_wait(x_consumer_state, peek_x_full_status)
                 intra2_q_pipeline.consumer_wait(intra2_q_consumer_state)
@@ -1529,6 +2538,22 @@ class SSDKernel:
                 intra2_q_pipeline.consumer_release(intra2_q_consumer_state)
                 intra2_acc_pipeline.producer_commit(intra2_acc_producer_state)
 
+                # Advance B/C/INTRA1_ACC cstate
+                b_consumer_state.advance()
+                c_consumer_state.advance()
+                intra1_acc_producer_state.advance()
+
+                # Peek (try_wait) B/C/INTRA1_ACC buffer full/full/empty for chunk_idx = chunk_idx + 1
+                peek_b_full_status = self.conditional_consumer_try_wait(
+                    b_consumer_state, b_pipeline, C
+                )
+                peek_c_full_status = self.conditional_consumer_try_wait(
+                    c_consumer_state, c_pipeline, C
+                )
+                peek_wr_intra1_acc_empty_status = self.conditional_producer_try_acquire(
+                    intra1_acc_producer_state, intra1_acc_pipeline, C
+                )
+
                 # Advance X/INTRA2_Q/INTRA2_ACC state
                 x_consumer_state.advance()
                 intra2_q_consumer_state.advance()
@@ -1538,88 +2563,606 @@ class SSDKernel:
                 peek_x_full_status = self.conditional_consumer_try_wait(
                     x_consumer_state, x_pipeline, C
                 )
+            # END of for chunk_idx in cutlass.range(C-1, unroll=1)
 
-                # Advance to next tile
-                tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
-            # END of while work_tile.is_valid_tile
+            # Manual pipeline: unrolled INTRA_MMA2 chunk_idx = C-1 loop
+            # Conditionally wait for X/INTRA2_Q/INTRA2_ACC buffer full/full/empty
+            x_pipeline.consumer_wait(x_consumer_state, peek_x_full_status)
+            intra2_q_pipeline.consumer_wait(intra2_q_consumer_state)
+            intra2_acc_pipeline.producer_acquire(intra2_acc_producer_state)
 
-            # Producer tail for INTRA1_ACC/INTRA2_ACC
-            intra1_acc_pipeline.producer_tail(intra1_acc_producer_state)
-            intra2_acc_pipeline.producer_tail(intra2_acc_producer_state)
-        # END of specialized mma-intra warp
-
-        # Specialized MMA Inter warp
-        elif warp_idx == self.mma_inter_warp_id:
-            # Dealloc regs for pre-inter/pre-intra warps
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
-
-            # Make shared/tmem fragments for INTER_MMA1 X/B/ACC
-            # (MMA, MMA_N, MMA_K, INPUT_STAGE)
-            # (MMA, MMA_M, MMA_K, INTERNAL_STAGE)
-            # (MMA, MMA_M, MMA_N, INTERNAL_STAGE)
-            tCrB, tCrX, tCtAccInter1 = self.mma_partition_ss(
-                tiled_mma_inter1,
-                self.tile_shape_mnk_inter1,
-                smem_bt_internal,
-                smem_x,
-                tmem_ptr_base + self.tmem_inter1_acc_offset,
-                self.internal_stages,
+            # INTRA_MMA2
+            tiled_mma_intra2 = self.exec_mma(
+                tiled_mma_intra2,
+                tCtAccIntra2,
+                tCrQ,
+                tCrX,
+                intra2_acc_producer_state,
+                intra2_q_consumer_state,
+                x_consumer_state,
             )
 
-            # Make shared/tmem fragments for INTER_MMA2 C/P/ACC
-            # (MMA, MMA_M, MMA_K, INPUT_STAGE)
-            # (MMA, MMA_N, MMA_K, INTERNAL_STAGE)
-            # (MMA, MMA_M, MMA_N, INTERNAL_STAGE)
-            tCrC, tCrP, tCtAccInter2 = self.mma_partition_ss(
-                tiled_mma_inter2,
-                self.tile_shape_mnk_inter2,
-                smem_c,
-                smem_p,
-                tmem_ptr_base + self.tmem_inter2_acc_offset,
-                self.internal_stages,
+            # Async arrive X/INTRA2_Q/INTRA2_ACC buffer empty/empty/full
+            if cutlass.const_expr(self.has_d):
+                x_pipeline.consumer_release(
+                    x_consumer_state, pipeline.PipelineOp.TCGen05Mma
+                )
+            else:
+                x_pipeline.consumer_release(x_consumer_state)
+            intra2_q_pipeline.consumer_release(intra2_q_consumer_state)
+            intra2_acc_pipeline.producer_commit(intra2_acc_producer_state)
+
+            # Advance X/INTRA2_Q/INTRA2_ACC state
+            x_consumer_state.advance()
+            intra2_q_consumer_state.advance()
+            intra2_acc_producer_state.advance()
+
+            # Peek (try_wait) X buffer full for chunk_idx = chunk_idx + 1
+            peek_x_full_status = self.conditional_consumer_try_wait(
+                x_consumer_state, x_pipeline, C
             )
 
-            # Pipeline X/C/INTER1_B/INTER2_P consumer state
-            x_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.input_stages
-            )
-            c_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.input_stages
-            )
-            inter1_b_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.internal_stages
-            )
-            inter2_p_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.internal_stages
+            # Advance to next tile
+            tile_sched.advance_to_next_work()
+            work_tile = tile_sched.get_current_work()
+
+        # Producer tail for INTRA1_ACC/INTRA2_ACC
+        intra1_acc_pipeline.producer_tail(intra1_acc_producer_state)
+        intra2_acc_pipeline.producer_tail(intra2_acc_producer_state)
+
+    @cute.jit
+    def _warp_tma_x_deltas(
+        self,
+        tma_atom_x,
+        tma_tensor_x,
+        tma_atom_delta,
+        tma_tensor_delta,
+        tma_atom_cumsum_delta,
+        tma_tensor_cumsum_delta,
+        tma_atom_d,
+        tma_tensor_d,
+        tma_atom_initial_states,
+        tma_tensor_initial_states,
+        smem_x,
+        smem_delta,
+        smem_cumsum_delta,
+        smem_d,
+        smem_p_load,
+        tiled_mma_intra2,
+        cluster_layout_vmnk,
+        mma_tile_coord_v,
+        block_in_cluster_coord_vmnk,
+        x_pipeline,
+        deltas_pipeline,
+        d_pipeline,
+        init_states_pipeline,
+        tile_sched,
+        work_tile,
+        L,
+        C,
+        seq_idx,
+        chunk_indices,
+        chunk_offsets,
+        seq_chunk_cumsum,
+    ):
+        # ((ATOM_V, REST_V), INPUT_STAGE)
+        # ((ATOM_V, REST_V), 1, 1, C, EH, B)
+        tXsX, tXgX_pre_slice = self.tma_partition_for_mma_b_operand(
+            tma_atom_x,
+            tma_tensor_x,
+            smem_x,
+            tiled_mma_intra2,
+            cluster_layout_vmnk,
+            mma_tile_coord_v,
+            block_in_cluster_coord_vmnk,
+        )
+
+        # ((ATOM_V, REST_V), INPUT_STAGE)
+        # ((ATOM_V, REST_V), 1, C, EH, B)
+        tDeltasDelta, tDeltagDelta_pre_slice = self.tma_partition_with_shape(
+            tma_atom_delta,
+            tma_tensor_delta,
+            smem_delta,
+            (self.tile_shape_mnk_inter1[2],),
+        )
+        # ((ATOM_V, REST_V), INPUT_STAGE)
+        # ((ATOM_V, REST_V), 1, C, EH, B)
+        (
+            tDeltasCumsumDelta,
+            tDeltagCumsumDelta_pre_slice,
+        ) = self.tma_partition_with_shape(
+            tma_atom_cumsum_delta,
+            tma_tensor_cumsum_delta,
+            smem_cumsum_delta,
+            (self.tile_shape_mnk_inter1[2],),
+        )
+
+        tIstatesIstate = None
+        tIstategIstate_pre_slice = None
+        if cutlass.const_expr(self.has_init_states):
+            tIstatesIstate, tIstategIstate_pre_slice = self.tma_partition_with_shape(
+                tma_atom_initial_states,
+                tma_tensor_initial_states,
+                smem_p_load,  # Must match TMA atom's smem layout (p_smem_layout_load)
+                (
+                    self.tile_shape_mnk_inter2[2],
+                    self.tile_shape_mnk_inter2[1],
+                ),  # (N, D) shape to match gmem
             )
 
-            # Pipeline INTER1_ACC/INTER2_ACC producer state
-            inter1_acc_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.internal_stages
-            )
-            inter2_acc_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.internal_stages
+        tDsD = None
+        tDgD_pre_slice = None
+        if cutlass.const_expr(self.d_has_hdim):
+            # Partition global/shared tensor for D
+            # ((ATOM_V, REST_V), INPUT_STAGE)
+            # ((ATOM_V, REST_V), 1, EH)
+            tDsD, tDgD_pre_slice = self.tma_partition_with_shape(
+                tma_atom_d, tma_tensor_d, smem_d, (self.tile_shape_mnk_inter2[1],)
             )
 
-            while work_tile.is_valid_tile:
-                # Varlen: compute per-CTA chunk range
+        # Pipeline X/Delta/CumsumDelta/D producer state
+        x_producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, self.input_stages
+        )
+        deltas_producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, self.input_stages
+        )
+        d_producer_state = None
+        if cutlass.const_expr(self.d_has_hdim):
+            # D is loaded by TMA only when d_has_hdim is True
+            d_producer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.input_stages
+            )
+        if cutlass.const_expr(self.has_init_states):
+            istate_producer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.initial_state_load_stages
+            )
+
+        while work_tile.is_valid_tile:
+            b_idx, eh_idx, g_idx, seq_id, first_chunk, C = (
+                self.resolve_varlen_tile_info(work_tile, seq_chunk_cumsum, C)
+            )
+
+            # Slice global tensor to current tile idx
+            # ((ATOM_V, REST_V), C)
+            tXgX = tXgX_pre_slice[None, 0, 0, None, eh_idx, b_idx]
+            tDeltagDelta = tDeltagDelta_pre_slice[None, 0, None, eh_idx, b_idx]
+            tDeltagCumsumDelta = tDeltagCumsumDelta_pre_slice[
+                None, 0, None, eh_idx, b_idx
+            ]
+            tDgD = None
+            if cutlass.const_expr(self.d_has_hdim):
+                # ((ATOM_V, REST_V))
+                tDgD = tDgD_pre_slice[None, 0, eh_idx]
+
+            if cutlass.const_expr(self.has_init_states):
+                istate_producer_state.reset_count()
+
+            # Reset count for pipeline state
+            x_producer_state.reset_count()
+            deltas_producer_state.reset_count()
+            if cutlass.const_expr(self.d_has_hdim):
+                d_producer_state.reset_count()
+
+            # Peek (try_wait) X/deltas buffer empty status
+            peek_x_empty_status = self.conditional_producer_try_acquire(
+                x_producer_state, x_pipeline, C
+            )
+            peek_deltas_empty_status = self.conditional_producer_try_acquire(
+                deltas_producer_state, deltas_pipeline, C
+            )
+
+            if cutlass.const_expr(self.has_init_states):
+                # Load first sequence's init_states before the chunk loop
                 if cutlass.const_expr(self.has_varlen):
-                    b_idx, eh_idx, g_idx = work_tile.tile_idx
-                    seq_id = b_idx
-                    first_chunk = seq_chunk_cumsum[seq_id]
-                    C = seq_chunk_cumsum[seq_id + 1] - first_chunk
+                    first_seq_id = seq_id
+                else:
+                    first_seq_id = b_idx
+                tIstategIstate = tIstategIstate_pre_slice[
+                    None, 0, 0, eh_idx, first_seq_id
+                ]
 
-                # Reset count for pipeline state
-                x_consumer_state.reset_count()
-                c_consumer_state.reset_count()
-                inter1_acc_producer_state.reset_count()
-                inter1_b_consumer_state.reset_count()
-                inter2_p_consumer_state.reset_count()
-                inter2_acc_producer_state.reset_count()
+                # Wait for initial states buffer empty
+                init_states_pipeline.producer_acquire(istate_producer_state)
+                # TMA load initial states
+                cute.copy(
+                    tma_atom_initial_states,
+                    tIstategIstate,
+                    tIstatesIstate[None, istate_producer_state.index],
+                    tma_bar_ptr=init_states_pipeline.producer_get_barrier(
+                        istate_producer_state
+                    ),
+                )
+                # Advance initial states producer state
+                istate_producer_state.advance()
+                prev_seq_id = first_seq_id
 
-                # Peek (try_wait) X/INTER1_B/INTER1_ACC buffer full/full/empty status
-                # MMA1 runs first so we peek its inputs at loop entry
+            if cutlass.const_expr(self.d_has_hdim):
+                # Wait for D buffer empty
+                d_pipeline.producer_acquire(d_producer_state)
+                # TMA load D
+                cute.copy(
+                    tma_atom_d,
+                    tDgD,
+                    tDsD[None, d_producer_state.index],
+                    tma_bar_ptr=d_pipeline.producer_get_barrier(d_producer_state),
+                )
+                # Advance D producer state
+                d_producer_state.advance()
+
+            # Batched load over C dimension
+            for chunk_idx in cutlass.range(C, unroll=1):
+                # Index into global chunk_indices/chunk_offsets arrays
+                physical_chunk, chunk, chunk_offset = self.resolve_physical_chunk(
+                    first_chunk,
+                    x_producer_state.count,
+                    chunk_indices,
+                    chunk_offsets,
+                )
+
+                # Load init_states on sequence transitions
+                if cutlass.const_expr(self.has_init_states and self.has_varlen):
+                    seq_id = seq_idx[0, chunk * L + chunk_offset]
+                    if seq_id != prev_seq_id:
+                        tIstategIstate = tIstategIstate_pre_slice[
+                            None, 0, 0, eh_idx, seq_id
+                        ]
+                        init_states_pipeline.producer_acquire(istate_producer_state)
+                        cute.copy(
+                            tma_atom_initial_states,
+                            tIstategIstate,
+                            tIstatesIstate[None, istate_producer_state.index],
+                            tma_bar_ptr=init_states_pipeline.producer_get_barrier(
+                                istate_producer_state
+                            ),
+                        )
+                        istate_producer_state.advance()
+                        prev_seq_id = seq_id
+
+                # Conditionally wait for X buffer empty
+                x_pipeline.producer_acquire(x_producer_state, peek_x_empty_status)
+
+                # TMA load X
+                cute.copy(
+                    tma_atom_x,
+                    tXgX[None, chunk],
+                    tXsX[None, x_producer_state.index],
+                    tma_bar_ptr=x_pipeline.producer_get_barrier(x_producer_state),
+                )
+
+                # Conditionally wait for deltas buffer empty
+                deltas_pipeline.producer_acquire(
+                    deltas_producer_state, peek_deltas_empty_status
+                )
+
+                # TMA load Delta/CumsumDelta
+                cute.copy(
+                    tma_atom_delta,
+                    tDeltagDelta[None, chunk],
+                    tDeltasDelta[None, deltas_producer_state.index],
+                    tma_bar_ptr=deltas_pipeline.producer_get_barrier(
+                        deltas_producer_state
+                    ),
+                )
+                cute.copy(
+                    tma_atom_cumsum_delta,
+                    tDeltagCumsumDelta[None, chunk],
+                    tDeltasCumsumDelta[None, deltas_producer_state.index],
+                    tma_bar_ptr=deltas_pipeline.producer_get_barrier(
+                        deltas_producer_state
+                    ),
+                )
+
+                # Advance X/deltas producer state
+                x_producer_state.advance()
+                deltas_producer_state.advance()
+
+                # Peek (try_wait) X/deltas buffer empty status
+                peek_x_empty_status = self.conditional_producer_try_acquire(
+                    x_producer_state, x_pipeline, C
+                )
+                peek_deltas_empty_status = self.conditional_producer_try_acquire(
+                    deltas_producer_state, deltas_pipeline, C
+                )
+
+            # Advance to next tile
+            tile_sched.advance_to_next_work()
+            work_tile = tile_sched.get_current_work()
+
+        # Producer tail for X/Deltas/D
+        x_pipeline.producer_tail(x_producer_state)
+        deltas_pipeline.producer_tail(deltas_producer_state)
+        if cutlass.const_expr(self.has_init_states):
+            init_states_pipeline.producer_tail(istate_producer_state)
+        if cutlass.const_expr(self.d_has_hdim):
+            d_pipeline.producer_tail(d_producer_state)
+
+    @cute.jit
+    def _warp_tma_b_c(
+        self,
+        tma_atom_b,
+        tma_tensor_b,
+        tma_atom_c,
+        tma_tensor_c,
+        smem_b,
+        smem_c,
+        tiled_mma_intra1,
+        cluster_layout_vmnk,
+        mma_tile_coord_v,
+        block_in_cluster_coord_vmnk,
+        b_pipeline,
+        c_pipeline,
+        tile_sched,
+        work_tile,
+        C,
+        chunk_indices,
+        chunk_offsets,
+        seq_chunk_cumsum,
+    ):
+        # ((ATOM_V, REST_V), INPUT_STAGE)
+        # ((ATOM_V, REST_V), 1, 1, C, G, B)
+        tBsB, tBgB_pre_slice = self.tma_partition_for_mma_b_operand(
+            tma_atom_b,
+            tma_tensor_b,
+            smem_b,
+            tiled_mma_intra1,
+            cluster_layout_vmnk,
+            mma_tile_coord_v,
+            block_in_cluster_coord_vmnk,
+        )
+
+        # ((ATOM_V, REST_V), INPUT_STAGE)
+        # ((ATOM_V, REST_V), 1, 1, C, G, B)
+        tCsC, tCgC_pre_slice = self.tma_partition_for_mma_a_operand(
+            tma_atom_c,
+            tma_tensor_c,
+            smem_c,
+            tiled_mma_intra1,
+            cluster_layout_vmnk,
+            mma_tile_coord_v,
+            block_in_cluster_coord_vmnk,
+        )
+
+        # Pipeline B/C producer state
+        b_producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, self.input_stages
+        )
+        c_producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, self.input_stages
+        )
+
+        while work_tile.is_valid_tile:
+            b_idx, eh_idx, g_idx, seq_id, first_chunk, C = (
+                self.resolve_varlen_tile_info(work_tile, seq_chunk_cumsum, C)
+            )
+
+            # Slice global tensor to current tile idx
+            # ((ATOM_V, REST_V), C)
+            tBgB = tBgB_pre_slice[None, 0, 0, None, g_idx, b_idx]
+            tCgC = tCgC_pre_slice[None, 0, 0, None, g_idx, b_idx]
+
+            # Reset count for pipeline state
+            b_producer_state.reset_count()
+            c_producer_state.reset_count()
+
+            # Peek (try_wait) B/C buffer empty status
+            peek_b_empty_status = self.conditional_producer_try_acquire(
+                b_producer_state, b_pipeline, C
+            )
+            peek_c_empty_status = self.conditional_producer_try_acquire(
+                c_producer_state, c_pipeline, C
+            )
+
+            # Batched load over C dimension
+            for chunk_idx in cutlass.range(C, unroll=1):
+                # Index into global chunk_indices/chunk_offsets arrays
+                physical_chunk, chunk, _ = self.resolve_physical_chunk(
+                    first_chunk,
+                    b_producer_state.count,
+                    chunk_indices,
+                    chunk_offsets,
+                )
+
+                # Conditionally wait for B buffer empty
+                b_pipeline.producer_acquire(b_producer_state, peek_b_empty_status)
+
+                # TMA load B
+                cute.copy(
+                    tma_atom_b,
+                    tBgB[None, chunk],
+                    tBsB[None, b_producer_state.index],
+                    tma_bar_ptr=b_pipeline.producer_get_barrier(b_producer_state),
+                )
+
+                # Conditionally wait for C buffer empty
+                c_pipeline.producer_acquire(c_producer_state, peek_c_empty_status)
+
+                # TMA load C
+                cute.copy(
+                    tma_atom_c,
+                    tCgC[None, chunk],
+                    tCsC[None, c_producer_state.index],
+                    tma_bar_ptr=c_pipeline.producer_get_barrier(c_producer_state),
+                )
+
+                # Advance B/C producer state
+                b_producer_state.advance()
+                c_producer_state.advance()
+
+                # Peek (try_wait) B/C buffer empty status
+                peek_b_empty_status = self.conditional_producer_try_acquire(
+                    b_producer_state, b_pipeline, C
+                )
+                peek_c_empty_status = self.conditional_producer_try_acquire(
+                    c_producer_state, c_pipeline, C
+                )
+
+            # Advance to next tile
+            tile_sched.advance_to_next_work()
+            work_tile = tile_sched.get_current_work()
+
+        # Producer tail for B/C
+        b_pipeline.producer_tail(b_producer_state)
+        c_pipeline.producer_tail(c_producer_state)
+
+    @cute.jit
+    def _warp_mma_inter(
+        self,
+        smem_bt_internal,
+        smem_x,
+        smem_c,
+        smem_p,
+        tmem_ptr_base,
+        tiled_mma_inter1,
+        tiled_mma_inter2,
+        x_pipeline,
+        c_pipeline,
+        inter1_b_pipeline,
+        inter1_acc_pipeline,
+        inter2_p_pipeline,
+        inter2_acc_pipeline,
+        tile_sched,
+        work_tile,
+        C,
+        seq_chunk_cumsum,
+    ):
+        # Make shared/tmem fragments for INTER_MMA1 X/B/ACC
+        # (MMA, MMA_N, MMA_K, INPUT_STAGE)
+        # (MMA, MMA_M, MMA_K, INTERNAL_STAGE)
+        # (MMA, MMA_M, MMA_N, INTERNAL_STAGE)
+        tCrB, tCrX, tCtAccInter1 = self.mma_partition_ss(
+            tiled_mma_inter1,
+            self.tile_shape_mnk_inter1,
+            smem_bt_internal,
+            smem_x,
+            tmem_ptr_base + self.tmem_inter1_acc_offset,
+            self.internal_stages,
+        )
+
+        # Make shared/tmem fragments for INTER_MMA2 C/P/ACC
+        # (MMA, MMA_M, MMA_K, INPUT_STAGE)
+        # (MMA, MMA_N, MMA_K, INTERNAL_STAGE)
+        # (MMA, MMA_M, MMA_N, INTERNAL_STAGE)
+        tCrC, tCrP, tCtAccInter2 = self.mma_partition_ss(
+            tiled_mma_inter2,
+            self.tile_shape_mnk_inter2,
+            smem_c,
+            smem_p,
+            tmem_ptr_base + self.tmem_inter2_acc_offset,
+            self.internal_stages,
+        )
+
+        # Pipeline X/C/INTER1_B/INTER2_P consumer state
+        x_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.input_stages
+        )
+        c_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.input_stages
+        )
+        inter1_b_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.internal_stages
+        )
+        inter2_p_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.internal_stages
+        )
+
+        # Pipeline INTER1_ACC/INTER2_ACC producer state
+        inter1_acc_producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, self.internal_stages
+        )
+        inter2_acc_producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, self.internal_stages
+        )
+
+        while work_tile.is_valid_tile:
+            _, _, _, _, first_chunk, C = self.resolve_varlen_tile_info(
+                work_tile, seq_chunk_cumsum, C
+            )
+
+            # Reset count for pipeline state
+            x_consumer_state.reset_count()
+            c_consumer_state.reset_count()
+            inter1_acc_producer_state.reset_count()
+            inter1_b_consumer_state.reset_count()
+            inter2_p_consumer_state.reset_count()
+            inter2_acc_producer_state.reset_count()
+
+            # Peek (try_wait) X/INTER1_B/INTER1_ACC buffer full/full/empty status
+            # MMA1 runs first so we peek its inputs at loop entry
+            peek_x_full_status = self.conditional_consumer_try_wait(
+                x_consumer_state, x_pipeline, C
+            )
+            peek_inter1_b_full_status = self.conditional_consumer_try_wait(
+                inter1_b_consumer_state, inter1_b_pipeline, C
+            )
+            peek_inter1_acc_empty_status = self.conditional_producer_try_acquire(
+                inter1_acc_producer_state, inter1_acc_pipeline, C
+            )
+
+            # Batched gemm over C dimension
+            # MMA1 (B_scaled^T @ X) runs before MMA2 (C @ P) so that
+            # the pre-inter warp has more time to prepare inter2_p.
+            for chunk_idx in cutlass.range(C, unroll=1):
+                # Conditionally wait for X/INTER1_B/INTER1_ACC buffer full/full/empty
+                x_pipeline.consumer_wait(x_consumer_state, peek_x_full_status)
+                inter1_b_pipeline.consumer_wait(
+                    inter1_b_consumer_state, peek_inter1_b_full_status
+                )
+                inter1_acc_pipeline.producer_acquire(
+                    inter1_acc_producer_state, peek_inter1_acc_empty_status
+                )
+
+                # INTER MMA1
+                tiled_mma_inter1 = self.exec_mma(
+                    tiled_mma_inter1,
+                    tCtAccInter1,
+                    tCrB,
+                    tCrX,
+                    inter1_acc_producer_state,
+                    inter1_b_consumer_state,
+                    x_consumer_state,
+                )
+
+                # Async arrive X/INTER1_B/INTER1_ACC buffer empty/empty/full
+                if cutlass.const_expr(self.has_d):
+                    x_pipeline.consumer_release(
+                        x_consumer_state, pipeline.PipelineOp.TCGen05Mma
+                    )
+                else:
+                    x_pipeline.consumer_release(x_consumer_state)
+                inter1_b_pipeline.consumer_release(inter1_b_consumer_state)
+                inter1_acc_pipeline.producer_commit(inter1_acc_producer_state)
+
+                # Wait for C/INTER2_P/INTER2_ACC buffer full/full/empty
+                c_pipeline.consumer_wait(c_consumer_state)
+                inter2_p_pipeline.consumer_wait(inter2_p_consumer_state)
+                inter2_acc_pipeline.producer_acquire(inter2_acc_producer_state)
+
+                # INTER MMA2
+                tiled_mma_inter2 = self.exec_mma(
+                    tiled_mma_inter2,
+                    tCtAccInter2,
+                    tCrC,
+                    tCrP,
+                    inter2_acc_producer_state,
+                    c_consumer_state,
+                    inter2_p_consumer_state,
+                )
+
+                # Async arrive C/INTER2_P/INTER2_ACC buffer empty/empty/full
+                c_pipeline.consumer_release(c_consumer_state)
+                inter2_p_pipeline.consumer_release(inter2_p_consumer_state)
+                inter2_acc_pipeline.producer_commit(inter2_acc_producer_state)
+
+                # Advance X/C/INTER1_B/INTER1_ACC/INTER2_P/INTER2_ACC state
+                x_consumer_state.advance()
+                c_consumer_state.advance()
+                inter1_b_consumer_state.advance()
+                inter1_acc_producer_state.advance()
+                inter2_p_consumer_state.advance()
+                inter2_acc_producer_state.advance()
+
+                # Peek (try_wait) X/INTER1_B/INTER1_ACC buffer full/full/empty for chunk_idx + 1
                 peek_x_full_status = self.conditional_consumer_try_wait(
                     x_consumer_state, x_pipeline, C
                 )
@@ -1630,1325 +3173,13 @@ class SSDKernel:
                     inter1_acc_producer_state, inter1_acc_pipeline, C
                 )
 
-                # Batched gemm over C dimension
-                # MMA1 (B_scaled^T @ X) runs before MMA2 (C @ P) so that
-                # the pre-inter warp has more time to prepare inter2_p.
-                for chunk_idx in cutlass.range(C, unroll=1):
-                    # Conditionally wait for X/INTER1_B/INTER1_ACC buffer full/full/empty
-                    x_pipeline.consumer_wait(x_consumer_state, peek_x_full_status)
-                    inter1_b_pipeline.consumer_wait(
-                        inter1_b_consumer_state, peek_inter1_b_full_status
-                    )
-                    inter1_acc_pipeline.producer_acquire(
-                        inter1_acc_producer_state, peek_inter1_acc_empty_status
-                    )
-
-                    # INTER MMA1
-                    tiled_mma_inter1 = self.exec_mma(
-                        tiled_mma_inter1,
-                        tCtAccInter1,
-                        tCrB,
-                        tCrX,
-                        inter1_acc_producer_state,
-                        inter1_b_consumer_state,
-                        x_consumer_state,
-                    )
-
-                    # Async arrive X/INTER1_B/INTER1_ACC buffer empty/empty/full
-                    if cutlass.const_expr(self.has_d):
-                        x_pipeline.consumer_release(
-                            x_consumer_state, pipeline.PipelineOp.TCGen05Mma
-                        )
-                    else:
-                        x_pipeline.consumer_release(x_consumer_state)
-                    inter1_b_pipeline.consumer_release(inter1_b_consumer_state)
-                    inter1_acc_pipeline.producer_commit(inter1_acc_producer_state)
-
-                    # Wait for C/INTER2_P/INTER2_ACC buffer full/full/empty
-                    c_pipeline.consumer_wait(c_consumer_state)
-                    inter2_p_pipeline.consumer_wait(inter2_p_consumer_state)
-                    inter2_acc_pipeline.producer_acquire(inter2_acc_producer_state)
-
-                    # INTER MMA2
-                    tiled_mma_inter2 = self.exec_mma(
-                        tiled_mma_inter2,
-                        tCtAccInter2,
-                        tCrC,
-                        tCrP,
-                        inter2_acc_producer_state,
-                        c_consumer_state,
-                        inter2_p_consumer_state,
-                    )
-
-                    # Async arrive C/INTER2_P/INTER2_ACC buffer empty/empty/full
-                    c_pipeline.consumer_release(c_consumer_state)
-                    inter2_p_pipeline.consumer_release(inter2_p_consumer_state)
-                    inter2_acc_pipeline.producer_commit(inter2_acc_producer_state)
-
-                    # Advance X/C/INTER1_B/INTER1_ACC/INTER2_P/INTER2_ACC state
-                    x_consumer_state.advance()
-                    c_consumer_state.advance()
-                    inter1_b_consumer_state.advance()
-                    inter1_acc_producer_state.advance()
-                    inter2_p_consumer_state.advance()
-                    inter2_acc_producer_state.advance()
-
-                    # Peek (try_wait) X/INTER1_B/INTER1_ACC buffer full/full/empty for chunk_idx + 1
-                    peek_x_full_status = self.conditional_consumer_try_wait(
-                        x_consumer_state, x_pipeline, C
-                    )
-                    peek_inter1_b_full_status = self.conditional_consumer_try_wait(
-                        inter1_b_consumer_state, inter1_b_pipeline, C
-                    )
-                    peek_inter1_acc_empty_status = (
-                        self.conditional_producer_try_acquire(
-                            inter1_acc_producer_state, inter1_acc_pipeline, C
-                        )
-                    )
-
-                # Advance to next tile
-                tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
-
-            # Producer tail for INTER1_ACC/INTER2_ACC
-            inter1_acc_pipeline.producer_tail(inter1_acc_producer_state)
-            inter2_acc_pipeline.producer_tail(inter2_acc_producer_state)
-
-        # Specialized Pre-Inter warp
-        elif (
-            warp_idx == self.pre_inter_warp_id[0]
-            or warp_idx == self.pre_inter_warp_id[1]
-            or warp_idx == self.pre_inter_warp_id[2]
-            or warp_idx == self.pre_inter_warp_id[3]
-        ):
-            # Alloc regs in pre_inter warps
-            cute.arch.warpgroup_reg_alloc(self.num_regs_pre_inter_warps)
-
-            # Make tiledCopy and partition smem/register tensor for smem load Bt
-            # ((S2R_ATOM_V, S2R_REST_V), S2R_M, S2R_N, INPUT_STAGE)
-            # ((S2R_ATOM_V, S2R_REST_V), S2R_M, S2R_N)
-            tiled_s2r_b, tBsB_s2r, tBrB_s2r = self.pre_inter_smem_load_and_partition_b(
-                local_tidx, smem_bt
-            )
-
-            # Partition shared tensor for smem store Bt
-            smem_bt_internal_ = cute.make_tensor(
-                smem_bt_internal.iterator, smem_bt.layout
-            )
-            # Make tiledCopy and partition register/smem tensor for smem store Bt
-            # ((R2S_ATOM_V, R2S_REST_V), R2S_M, R2S_N)
-            # ((R2S_ATOM_V, R2S_REST_V), R2S_M, R2S_N, INTERNAL_STAGE)
-            tiled_r2s_b, tBrB_r2s, tBsB_r2s = self.pre_inter_smem_store_and_partition_b(
-                local_tidx,
-                smem_bt_internal_,
-                tiled_s2r_b,
-                tBrB_s2r,
-            )
-
-            # (MMA, MMA_M, MMA_K, INPUT_STAGE)
-            sDelta = self.pre_inter_make_delta(smem_delta, smem_bt.layout)
-            sDeltaA = self.pre_inter_make_delta(smem_cumsum_delta, smem_bt.layout)
-
-            # Make copy_atom and partition register/smem tensor for smem load/store of Delta/DeltaA
-            # ((S2R_ATOM_V, S2R_REST_V), S2R_M, S2R_N, INPUT_STAGE)
-            # ((S2R_ATOM_V, S2R_REST_V), S2R_M, S2R_N)
-            (
-                s2r_atom_delta,
-                tBsDelta_s2r,
-                tBrDelta_s2r,
-            ) = self.smem_load_and_partition_delta_d(
-                tiled_s2r_b, local_tidx, sDelta, (None, None, None, 0)
-            )
-            (
-                s2r_atom_cumsum,
-                tBsDeltaA_s2r,
-                tBrDeltaA_s2r,
-            ) = self.smem_load_and_partition_delta_d(
-                tiled_s2r_b, local_tidx, sDeltaA, (None, None, None, 0)
-            )
-
-            # Coordinate tensor for chunk_size_limit masking (step 4.2)
-            # tile_shape_mnk_inter1 = (N, D, L); dice to (N, L)
-            if cutlass.const_expr(self.has_varlen):
-                bt_coord_shape = cute.dice(self.tile_shape_mnk_inter1, (1, None, 1))
-                bt_coord_tensor = cute.make_identity_tensor(bt_coord_shape)
-                thr_s2r_b_ = tiled_s2r_b.get_slice(local_tidx)
-                # ((S2R_ATOM_V, S2R_REST_V), S2R_M, S2R_N)
-                tBCoord = thr_s2r_b_.partition_D(bt_coord_tensor)
-
-            # ((R2S_ATOM_V, R2S_REST_V), R2S_M, R2S_N)
-            thr_r2s_b = tiled_r2s_b.get_slice(local_tidx)
-            tBrDelta_r2s = thr_r2s_b.retile(tBrDelta_s2r)
-            tBrDeltaA_r2s = thr_r2s_b.retile(tBrDeltaA_s2r)
-
-            # Make tmem fragment for INTER1_ACC
-            # (MMA, MMA_M, MMA_N, INTERNAL_STAGE)
-            tCtAccInter1 = self.mma_partition_c(
-                tiled_mma_inter1,
-                self.tile_shape_mnk_inter1,
-                tmem_ptr_base + self.tmem_inter1_acc_offset,
-                self.internal_stages,
-            )
-            # (M_PER_MMA, N_PER_MMA, INTERNAL_STAGE)
-            tInter1 = tCtAccInter1[((None, None), 0, 0, None)]
-
-            # Make tiledCopy and partition tmem/register tensor for tmem load INTER1_ACC
-            # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N, INTERNAL_STAGE)
-            # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N)
-            (
-                tiled_t2r_inter1,
-                tTR_tP,
-                tTR_rP,
-            ) = self.pre_inter_tmem_load_and_partition_p(local_tidx, tInter1, smem_pt)
-
-            # Make fragment for register to hold P after post-processing (in acc dtype)
-            tState = cute.make_fragment(tTR_rP.shape, self.acc_dtype)
-
-            # Make tiledCopy and partition smem/register tensor for:
-            # - Loading initial_states from SMEM to registers (S2R, reuses tRS_rP)
-            # - Storing INTER2_P from registers to SMEM (R2S)
-            # ((R2S_ATOM_V, R2S_REST_V), R2S_M, R2S_N)
-            # ((R2S_ATOM_V, R2S_REST_V), R2S_M, R2S_N, INTERNAL_STAGE)
-            tiled_r2s_p, tRS_rP, tRS_sP = self.smem_store_and_partition_p_y(
-                local_tidx, smem_pt, tiled_t2r_inter1
-            )
-
-            tiled_s2r_p = None
-            tS2R_sP = None
-            if cutlass.const_expr(self.has_init_states):
-                tiled_s2r_p, tS2R_sP = self.smem_load_and_partition_istate(
-                    local_tidx, smem_pt, tiled_t2r_inter1
-                )
-
-            # Partition global/shared tensor for P (State)
-            # ((ATOM_V, REST_V), INTERNAL_STAGE)
-            # ((ATOM_V, REST_V), 1, 1, EH, B)
-            bSG_sP, bSG_gP_pre_slice = self.tma_partition_with_shape(
-                tma_atom_p,
-                tma_tensor_p,
-                smem_p_store,
-                (
-                    self.tile_shape_mnk_inter2[2],
-                    self.tile_shape_mnk_inter2[1],
-                ),  # (N, D) to match gmem
-            )
-
-            # Pipeline B/Delta/INTER1_ACC consumer state
-            b_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.input_stages
-            )
-            deltas_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.input_stages
-            )
-            inter1_acc_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.internal_stages
-            )
-
-            # Pipeline INTER1_B/INTER2_P producer state
-            inter1_b_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.internal_stages
-            )
-            inter2_p_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.internal_stages
-            )
-            istate_consumer_state = None
-            if cutlass.const_expr(self.has_init_states):
-                istate_consumer_state = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Consumer, self.initial_state_load_stages
-                )
-
-            # Pipeline TMA store P
-            tma_p_pipeline = pipeline.PipelineTmaStore.create(
-                num_stages=self.internal_stages,
-                producer_group=pipeline.CooperativeGroup(
-                    pipeline.Agent.Thread, 32 * len(self.pre_inter_warp_id)
-                ),
-            )
-
-            while work_tile.is_valid_tile:
-                b_idx, eh_idx, g_idx = work_tile.tile_idx
-
-                # Varlen: b_idx from scheduler is seq_idx
-                if cutlass.const_expr(self.has_varlen):
-                    seq_id = b_idx
-                    b_idx = cutlass.Int32(0)
-                    first_chunk = seq_chunk_cumsum[seq_id]
-                    C = seq_chunk_cumsum[seq_id + 1] - first_chunk
-
-                # Slice global tensor to current tile idx
-                # ((ATOM_V, REST_V))
-                bSG_gP = bSG_gP_pre_slice[(None, 0, 0, eh_idx, b_idx)]
-
-                # Reset count for pipeline state
-                b_consumer_state.reset_count()
-                deltas_consumer_state.reset_count()
-                inter1_b_producer_state.reset_count()
-                inter1_acc_consumer_state.reset_count()
-                inter2_p_producer_state.reset_count()
-                if cutlass.const_expr(self.has_init_states):
-                    istate_consumer_state.reset_count()
-
-                # State (P) init
-                if cutlass.const_expr(self.has_init_states):
-                    init_states_pipeline.consumer_wait(istate_consumer_state)
-
-                    istate_coord = (None, None, None, istate_consumer_state.index)
-                    cute.copy(tiled_s2r_p, tS2R_sP[istate_coord], tRS_rP)
-
-                    for reg_idx in range(cute.size(tRS_rP)):
-                        tState[reg_idx] = tRS_rP[reg_idx].to(self.acc_dtype)
-                else:
-                    tState.fill(0.0)
-
-                # Peek (try_wait) B/Delta/INTER1_B buffer full/full/empty status
-                peek_b_full_status = self.conditional_consumer_try_wait(
-                    b_consumer_state, b_pipeline, C
-                )
-                peek_deltas_full_status = self.conditional_consumer_try_wait(
-                    deltas_consumer_state, deltas_pipeline, C
-                )
-                peek_wr_inter1_b_empty_status = self.conditional_producer_try_acquire(
-                    inter1_b_producer_state, inter1_b_pipeline, C
-                )
-
-                # Prefill INTER2_P with 0
-                # Wait for INTER2_P buffer empty
-                inter2_p_pipeline.producer_acquire(inter2_p_producer_state)
-
-                tRS_rP.fill(0.0)
-                # Copy INTER2_P from register to smem
-                inter2_p_coord = (None, None, None, inter2_p_producer_state.index)
-                # Don't overwrite smem_p if we already have init states there
-                if cutlass.const_expr(self.has_init_states):
-                    # Convert tState to tRS_rP (same as done in chunk loop at line 1876-1878)
-                    for reg_idx in range(cute.size(tState)):
-                        tRS_rP[reg_idx] = tState[reg_idx].to(self.io_dtype)
-                cute.copy(tiled_r2s_p, tRS_rP, tRS_sP[inter2_p_coord])
-
-                # Fence for shared memory
-                cute.arch.fence_proxy(
-                    cute.arch.ProxyKind.async_shared,
-                    space=cute.arch.SharedSpace.shared_cta,
-                )
-                # Async arrive INTER2_P buffer full
-                inter2_p_pipeline.producer_commit(inter2_p_producer_state)
-                # Advance INTER2_P producer state
-                inter2_p_producer_state.advance()
-
-                # Batched processing over C dimension
-                for chunk_idx in cutlass.range(C, unroll=1):
-                    # Index into global chunk_indices/chunk_offsets arrays
-                    physical_chunk = first_chunk + chunk_idx
-                    chunk = physical_chunk
-                    chunk_offset = 0
-                    # Map to physical chunk index and offset
-                    if cutlass.const_expr(self.has_varlen):
-                        chunk = chunk_indices[physical_chunk]
-                        chunk_offset = chunk_offsets[physical_chunk]
-
-                    # Conditionally wait for B/Delta/B_TMEM buffer full/full/empty
-                    b_pipeline.consumer_wait(b_consumer_state, peek_b_full_status)
-                    deltas_pipeline.consumer_wait(
-                        deltas_consumer_state, peek_deltas_full_status
-                    )
-                    inter1_b_pipeline.producer_acquire(
-                        inter1_b_producer_state, peek_wr_inter1_b_empty_status
-                    )
-
-                    # Load B/Delta/DeltaA/last_column
-                    b_coord = (None, None, None, b_consumer_state.index)
-                    delta_coord = (None, None, None, deltas_consumer_state.index)
-                    cute.copy(tiled_s2r_b, tBsB_s2r[b_coord], tBrB_s2r)
-                    cute.copy(s2r_atom_delta, tBsDelta_s2r[delta_coord], tBrDelta_s2r)
-                    cute.copy(
-                        s2r_atom_cumsum, tBsDeltaA_s2r[delta_coord], tBrDeltaA_s2r
-                    )
-                    last_column = smem_cumsum_delta[
-                        smem_cumsum_delta.shape[0] - 1, deltas_consumer_state.index
-                    ]
-
-                    # Step 4.2: compute chunk_size_limit and adjust
-                    # last_column for shared physical chunks.
-                    # When two logical chunks share a physical chunk,
-                    # last_column must point to the end of the current
-                    # sequence's range, not the full physical chunk.
-                    # Check against global num_logical_chunks (not per-CTA C)
-                    # because the next logical chunk may belong to the next CTA.
-                    if cutlass.const_expr(self.has_varlen):
-                        chunk_size_limit = L
-                        if physical_chunk + 1 < num_logical_chunks:
-                            next_chunk = chunk_indices[physical_chunk + 1]
-                            if next_chunk == chunk:
-                                chunk_size_limit = chunk_offsets[physical_chunk + 1]
-                        if chunk_size_limit < L:
-                            last_column = smem_cumsum_delta[
-                                chunk_size_limit - 1,
-                                deltas_consumer_state.index,
-                            ]
-
-                    # Fence for shared memory
-                    cute.arch.fence_proxy(
-                        cute.arch.ProxyKind.async_shared,
-                        space=cute.arch.SharedSpace.shared_cta,
-                    )
-
-                    # Combine B/Delta/DeltaA/last_column
-                    # Note: B scaling uses last_column BEFORE the chunk_offset
-                    # adjustment, so exp(last_column - dA_cs[i]) uses the
-                    # raw cumsum range. The chunk_offset adjustment is only for
-                    # the state recurrence (exp(last_column) * old_state).
-                    tScaledB = self.pre_inter_scale_bt_with_delta(
-                        tBrB_s2r, tBrDelta_r2s, tBrDeltaA_r2s, last_column
-                    )
-
-                    # Adjust last_column for chunk offset boundary AFTER
-                    # B scaling. The state recurrence needs last_column
-                    # relative to the sequence start within the chunk.
-                    if chunk_offset > 0:
-                        dA_cs_boundary = smem_cumsum_delta[
-                            chunk_offset - 1, deltas_consumer_state.index
-                        ]
-                        last_column = last_column - dA_cs_boundary
-
-                    # Step 4.2: mask scaled B outside [chunk_offset, chunk_size_limit).
-                    # Zero out positions belonging to other sequences
-                    # so they don't contaminate INTER1's chunk state.
-                    if cutlass.const_expr(self.has_varlen):
-                        if chunk_size_limit < L or chunk_offset > 0:
-                            for reg_idx in cutlass.range(
-                                cute.size(tScaledB), unroll_full=True
-                            ):
-                                coord = tBCoord[reg_idx]
-                                l_coord = coord[1]
-                                if l_coord >= chunk_size_limit or l_coord < chunk_offset:
-                                    tScaledB[reg_idx] = 0.0
-
-                    # Store scaled B to tBrB_r2s
-                    for reg_idx in range(cute.size(tBrB_r2s)):
-                        tBrB_r2s[reg_idx] = tScaledB[reg_idx].to(self.io_dtype)
-
-                    # Store tBrB_r2s to bt_smem_internal
-                    inter1_b_coord = (None, None, None, inter1_b_producer_state.index)
-                    cute.copy(tiled_r2s_b, tBrB_r2s, tBsB_r2s[inter1_b_coord])
-
-                    # Fence for shared memory
-                    cute.arch.fence_proxy(
-                        cute.arch.ProxyKind.async_shared,
-                        space=cute.arch.SharedSpace.shared_cta,
-                    )
-
-                    # Async arrive B/Delta/B_TMEM buffer empty/empty/full
-                    b_pipeline.consumer_release(
-                        b_consumer_state, pipeline.PipelineOp.AsyncThread
-                    )
-                    deltas_pipeline.consumer_release(deltas_consumer_state)
-                    inter1_b_pipeline.producer_commit(inter1_b_producer_state)
-
-                    # Wait for INTER1_ACC/INTER2_P buffer full/empty
-                    inter1_acc_pipeline.consumer_wait(inter1_acc_consumer_state)
-                    inter2_p_pipeline.producer_acquire(inter2_p_producer_state)
-
-                    # Load INTER1_ACC
-                    inter1_acc_coord = (
-                        None,
-                        None,
-                        None,
-                        inter1_acc_consumer_state.index,
-                    )
-                    cute.copy(tiled_t2r_inter1, tTR_tP[inter1_acc_coord], tTR_rP)
-
-                    # Fence for TMEM load
-                    cute.arch.fence_view_async_tmem_load()
-
-                    # Combine INTER1_ACC/last_column/State
-                    exp_last_column = cute.math.exp(last_column, fastmath=True)
-                    for reg_idx in range(0, cute.size(tTR_rP), 2):
-                        (
-                            tTR_rP[reg_idx],
-                            tTR_rP[reg_idx + 1],
-                        ) = cute.arch.fma_packed_f32x2(
-                            (exp_last_column, exp_last_column),
-                            (tState[reg_idx], tState[reg_idx + 1]),
-                            (tTR_rP[reg_idx], tTR_rP[reg_idx + 1]),
-                        )
-
-                    # Store scaled P to tRS_rP
-                    for reg_idx in range(cute.size(tTR_rP)):
-                        tRS_rP[reg_idx] = tTR_rP[reg_idx].to(self.io_dtype)
-
-                    # Update old state
-                    tState.store(tTR_rP.load())
-
-                    # Store INTER2_P
-                    inter2_p_coord = (None, None, None, inter2_p_producer_state.index)
-                    cute.copy(tiled_r2s_p, tRS_rP, tRS_sP[inter2_p_coord])
-
-                    # Fence for shared memory
-                    cute.arch.fence_proxy(
-                        cute.arch.ProxyKind.async_shared,
-                        space=cute.arch.SharedSpace.shared_cta,
-                    )
-
-                    # Async arrive INTER1_ACC buffer empty
-                    inter1_acc_pipeline.consumer_release(inter1_acc_consumer_state)
-
-                    # --- Varlen look-ahead: store fstate / reload init_state ---
-                    if cutlass.const_expr(self.has_init_states and self.has_varlen):
-                        is_last_chunk = chunk_idx == C - 1
-                        seq_id = seq_idx[0, chunk * L + chunk_offset]
-                        seq_ends_here = is_last_chunk
-                        if not is_last_chunk:
-                            next_chunk = chunk_indices[physical_chunk + 1]
-                            chunk_offset_next = chunk_offsets[physical_chunk + 1]
-                            next_seq = seq_idx[0, next_chunk * L + chunk_offset_next]
-                            seq_ends_here = next_seq != seq_id
-
-                        # A. Store final state of ending sequence to gmem
-                        if seq_ends_here:
-                            if local_warp_idx == 0:
-                                bSG_gP_seq = bSG_gP_pre_slice[
-                                    (None, 0, 0, eh_idx, seq_id)
-                                ]
-                                cute.copy(
-                                    tma_atom_p,
-                                    bSG_sP[(None, inter2_p_producer_state.index)],
-                                    bSG_gP_seq,
-                                )
-                            # All pre_inter warps must participate in pipeline ops
-                            tma_p_pipeline.producer_commit()
-                            tma_p_pipeline.producer_acquire()
-
-                        # B. Reload init_state for new sequence
-                        if seq_ends_here and not is_last_chunk:
-                            # Release old IS buffer, wait for new one from TMA warp
-                            init_states_pipeline.consumer_release(istate_consumer_state)
-                            istate_consumer_state.advance()
-                            init_states_pipeline.consumer_wait(istate_consumer_state)
-
-                            # Load new init_state: smem → tRS_rP → tState
-                            istate_coord = (
-                                None,
-                                None,
-                                None,
-                                istate_consumer_state.index,
-                            )
-                            cute.copy(tiled_s2r_p, tS2R_sP[istate_coord], tRS_rP)
-                            for reg_idx in range(cute.size(tRS_rP)):
-                                tState[reg_idx] = tRS_rP[reg_idx].to(self.acc_dtype)
-
-                            # Overwrite same inter2_p smem slot with new init_state
-                            for reg_idx in range(cute.size(tState)):
-                                tRS_rP[reg_idx] = tState[reg_idx].to(self.io_dtype)
-                            cute.copy(tiled_r2s_p, tRS_rP, tRS_sP[inter2_p_coord])
-
-                    # Commit INTER2_P buffer full
-                    # Last iteration consumer is PRE_INTER warp itself, not MMA_INTER warp
-                    if inter2_p_producer_state.count < C:
-                        inter2_p_pipeline.producer_commit(inter2_p_producer_state)
-
-                    # Advance B/Delta/INTER1_B/INTER1_ACC state
-                    b_consumer_state.advance()
-                    deltas_consumer_state.advance()
-                    inter1_b_producer_state.advance()
-                    inter1_acc_consumer_state.advance()
-                    # Peek (try_wait) B/Delta/INTER1_B buffer full/full./empty for chunk_idx = chunk_idx + 1
-                    peek_b_full_status = self.conditional_consumer_try_wait(
-                        b_consumer_state, b_pipeline, C
-                    )
-                    peek_deltas_full_status = self.conditional_consumer_try_wait(
-                        deltas_consumer_state, deltas_pipeline, C
-                    )
-                    peek_wr_inter1_b_empty_status = (
-                        self.conditional_producer_try_acquire(
-                            inter1_b_producer_state, inter1_b_pipeline, C
-                        )
-                    )
-
-                    # Last iteration producer is PRE_INTER warp itself, not MMA_INTER warp
-                    if inter2_p_producer_state.count < C:
-                        # Advance INTER2_P producer state
-                        inter2_p_producer_state.advance()
-                # END of for chunk_idx in cutlass.range(C, unroll=1)
-
-                # Store last INTER2_P (State) from smem to gmem
-                # Wait for all previous stores to smem to be done
-                cute.arch.fence_proxy(
-                    cute.arch.ProxyKind.async_shared,
-                    space=cute.arch.SharedSpace.shared_cta,
-                )
-                cute.arch.barrier(
-                    barrier_id=self.pre_inter_sync_bar_id,
-                    number_of_threads=len(self.pre_inter_warp_id) * 32,
-                )
-
-                if local_warp_idx == 0:
-                    # TMA store P
-                    # For varlen, use seq_id from tile scheduler; for non-varlen, use b_idx
-                    if cutlass.const_expr(self.has_init_states and self.has_varlen):
-                        bSG_gP_final = bSG_gP_pre_slice[(None, 0, 0, eh_idx, seq_id)]
-                    else:
-                        bSG_gP_final = bSG_gP
-                    cute.copy(
-                        tma_atom_p,
-                        bSG_sP[(None, inter2_p_producer_state.index)],
-                        bSG_gP_final,
-                    )
-                    # Wait for TMA store done
-                    tma_p_pipeline.producer_commit()
-                    tma_p_pipeline.producer_acquire()
-
-                cute.arch.barrier(
-                    barrier_id=self.pre_inter_sync_bar_id,
-                    number_of_threads=len(self.pre_inter_warp_id) * 32,
-                )
-                tma_p_pipeline.producer_tail()
-
-                # release init_state_pipeline for the next tile
-                if cutlass.const_expr(self.has_init_states):
-                    init_states_pipeline.consumer_release(istate_consumer_state)
-                    istate_consumer_state.advance()
-
-                # Advance to next tile
-                tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
-            # END of while work_tile.is_valid_tile
-
-            # Producer tail for INTER1_B/INTER2_P/TMA store P
-            inter1_b_pipeline.producer_tail(inter1_b_producer_state)
-            inter2_p_pipeline.producer_tail(inter2_p_producer_state)
-        # END of specialized pre-inter warp
-
-        # Specialized Pre-Intra warp
-        elif (
-            warp_idx == self.pre_intra_warp_id[0]
-            or warp_idx == self.pre_intra_warp_id[1]
-            or warp_idx == self.pre_intra_warp_id[2]
-            or warp_idx == self.pre_intra_warp_id[3]
-        ):
-            # Alloc regs in pre_inter warps
-            cute.arch.warpgroup_reg_alloc(self.num_regs_pre_intra_warps)
-
-            # Make tmem fragment for INTRA1_ACC
-            # (MMA, MMA_M, MMA_N, INTRA1_ACC_STAGE)
-            tCtAccIntra1 = self.mma_partition_c(
-                tiled_mma_intra1,
-                self.tile_shape_mnk_intra1,
-                tmem_ptr_base + self.tmem_intra1_acc_offset,
-                self.intra1_acc_stages,
-            )
-            # (M_PER_MMA, N_PER_MMA, INTRA1_ACC_STAGE)
-            tIntra1 = tCtAccIntra1[((None, None), 0, 0, None)]
-
-            # Make tiledCopy and partition tmem/register tensor for tensor memory load INTRA1_ACC
-            # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N, INTERNAL_STAGE)
-            # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N)
-            tiled_t2r_intra1, tTR_tQ, tTR_rQ = self.pre_intra_tmem_load_and_partition_q(
-                tIntra1, local_tidx
-            )
-
-            # Broadcast delta/delta_cumsum smem tensor from LxINPUT_STAGE to LxLxINPUT_STAGE
-            sDeltaA_Row = self.pre_intra_make_delta(smem_cumsum_delta, 0)
-            sDeltaA_Col = self.pre_intra_make_delta(smem_cumsum_delta, 1)
-            sDelta = self.pre_intra_make_delta(smem_delta, 0)
-
-            # Make tiledCopy and partition smem/register tensor for smem memory load delta/delta_cumsum
-            # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N, INPUT_STAGE)
-            # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N)
-            (
-                s2r_atom_cumsum,
-                tQsDeltaA_Row,
-                tQrDeltaA_Row,
-            ) = self.smem_load_and_partition_delta_d(
-                tiled_t2r_intra1, local_tidx, sDeltaA_Row, (None, None, None, 0)
-            )
-            (
-                s2r_atom_cumsum,
-                tQsDeltaA_Col,
-                tQrDeltaA_Col,
-            ) = self.smem_load_and_partition_delta_d(
-                tiled_t2r_intra1, local_tidx, sDeltaA_Col, (None, None, None, 0)
-            )
-            (
-                s2r_atom_delta,
-                tQsDelta,
-                tQrDelta,
-            ) = self.smem_load_and_partition_delta_d(
-                tiled_t2r_intra1, local_tidx, sDelta, (None, None, None, 0)
-            )
-
-            # Make and partition coord tensor for delta_cumsum load
-            # (L, L)
-            coord_tensor = cute.make_identity_tensor(
-                cute.dice(self.tile_shape_mnk_intra1, (1, 1, None))
-            )
-            thr_t2r_intra1 = tiled_t2r_intra1.get_slice(local_tidx)
-            # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N)
-            tCoord = thr_t2r_intra1.partition_D(coord_tensor)
-
-            # Make tmem tensor for INTRA2_Q
-            # (MMA, MMA_M, MMA_K, INTERNAL_STAGE)
-            tCrQ = self.mma_partition_a_tmem(
-                tiled_mma_intra2,
-                q_tmem_layout,
-                tmem_ptr_base + self.tmem_intra2_q_offset,
-            )
-
-            # Make tiledCopy and partition tmem/register tensor for tensor memory store INTRA2_Q
-            # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N, ...)
-            # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N, ..., INTERNAL_STAGE)
-            tiled_r2t_q, tRT_rQ, tRT_tQ = self.pre_intra_tmem_store_and_partition_q(
-                local_tidx, tCrQ
-            )
-
-            # Pipeline DELTA/INTRA1_ACC consumer state
-            deltas_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.input_stages
-            )
-            intra1_acc_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.intra1_acc_stages
-            )
-            # Pipeline INTRA2_Q producer state
-            intra2_q_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.internal_stages
-            )
-
-            while work_tile.is_valid_tile:
-                # Varlen: compute per-CTA chunk range
-                if cutlass.const_expr(self.has_varlen):
-                    b_idx, eh_idx, g_idx = work_tile.tile_idx
-                    seq_id = b_idx
-                    first_chunk = seq_chunk_cumsum[seq_id]
-                    C = seq_chunk_cumsum[seq_id + 1] - first_chunk
-
-                # Reset count for pipeline state
-                deltas_consumer_state.reset_count()
-                intra1_acc_consumer_state.reset_count()
-                intra2_q_producer_state.reset_count()
-
-                # Peek (try_wait) DELTA/INTRA1_ACC buffer full
-                peek_deltas_full_status = self.conditional_consumer_try_wait(
-                    deltas_consumer_state, deltas_pipeline, C
-                )
-                peek_rd_intra1_acc_full_status = self.conditional_consumer_try_wait(
-                    intra1_acc_consumer_state, intra1_acc_pipeline, C
-                )
-
-                # Batched processing over C dimension
-                for chunk_idx in cutlass.range(C, unroll=1):
-                    # Index into global chunk_indices/chunk_offsets arrays
-                    physical_chunk = first_chunk + chunk_idx
-
-                    # Conditionally wait for Delta/INTRA1_ACC buffer full
-                    deltas_pipeline.consumer_wait(
-                        deltas_consumer_state, peek_deltas_full_status
-                    )
-                    intra1_acc_pipeline.consumer_wait(
-                        intra1_acc_consumer_state, peek_rd_intra1_acc_full_status
-                    )
-
-                    # Step 4.3a: compute chunk_offset/chunk_size_limit for
-                    # cross-sequence CB masking in the INTRA path.
-                    if cutlass.const_expr(self.has_varlen):
-                        chunk = chunk_indices[physical_chunk]
-                        chunk_offset = chunk_offsets[physical_chunk]
-                        chunk_size_limit = L
-                        if physical_chunk + 1 < num_logical_chunks:
-                            next_chunk = chunk_indices[physical_chunk + 1]
-                            if next_chunk == chunk:
-                                chunk_size_limit = chunk_offsets[physical_chunk + 1]
-                    else:
-                        chunk_offset = 0
-                        chunk_size_limit = L
-
-                    # Load Q from tmem
-                    intra1_coord = (None, None, None, intra1_acc_consumer_state.index)
-                    cute.copy(tiled_t2r_intra1, tTR_tQ[intra1_coord], tTR_rQ)
-                    cute.arch.fence_view_async_tmem_load()
-
-                    # Step 4.3b: zero cross-sequence CB entries.
-                    # CB = C @ B^T is computed by INTRA1_MMA on the full
-                    # physical chunk. Zero entries where m or n falls
-                    # outside [chunk_offset, chunk_size_limit) so data from
-                    # other sequences doesn't leak through segsum.
-                    if cutlass.const_expr(self.has_varlen):
-                        if chunk_size_limit < L or chunk_offset > 0:
-                            for subtile_idx in cutlass.range(
-                                cute.size(tTR_rQ), unroll_full=True
-                            ):
-                                m, n = tCoord[subtile_idx]
-                                if (
-                                    m >= chunk_size_limit
-                                    or m < chunk_offset
-                                    or n >= chunk_size_limit
-                                    or n < chunk_offset
-                                ):
-                                    tTR_rQ[subtile_idx] = 0.0
-
-                    # Load tQsDeltaA_Row/tQsDeltaA_Col/tQsDelta from smem
-                    delta_coord = (None, None, None, deltas_consumer_state.index)
-                    cute.copy(
-                        s2r_atom_cumsum, tQsDeltaA_Row[delta_coord], tQrDeltaA_Row
-                    )
-                    cute.copy(
-                        s2r_atom_cumsum, tQsDeltaA_Col[delta_coord], tQrDeltaA_Col
-                    )
-                    cute.copy(s2r_atom_delta, tQsDelta[delta_coord], tQrDelta)
-
-                    # SegSum
-                    tRT_rQ = self.pre_intra_segsum(
-                        tTR_rQ, tQrDeltaA_Row, tQrDeltaA_Col, tQrDelta, tCoord, tRT_rQ
-                    )
-
-                    # Wait for INTRA2_Q buffer empty
-                    # Delay producer_acquire to right before data store
-                    intra2_q_pipeline.producer_acquire(intra2_q_producer_state)
-
-                    # Store Q from reg to tmem
-                    q_coord = (None, None, None, None, intra2_q_producer_state.index)
-                    cute.copy(tiled_r2t_q, tRT_rQ, tRT_tQ[q_coord])
-
-                    # Async arrive Delta/INTRA1_ACC buffer empty
-                    intra1_acc_pipeline.consumer_release(intra1_acc_consumer_state)
-                    deltas_pipeline.consumer_release(deltas_consumer_state)
-
-                    cute.arch.fence_view_async_tmem_store()
-
-                    # Async arrive INTRA2_Q buffer full
-                    intra2_q_pipeline.producer_commit(intra2_q_producer_state)
-
-                    # Advance deltas/intra1_acc/intra2_q states
-                    deltas_consumer_state.advance()
-                    intra1_acc_consumer_state.advance()
-                    intra2_q_producer_state.advance()
-
-                    # Peek (try_wait) Delta/INTRA1_ACC buffer full for chunk_idx = chunk_idx + 1
-                    peek_deltas_full_status = self.conditional_consumer_try_wait(
-                        deltas_consumer_state, deltas_pipeline, C
-                    )
-                    peek_rd_intra1_acc_full_status = self.conditional_consumer_try_wait(
-                        intra1_acc_consumer_state, intra1_acc_pipeline, C
-                    )
-                # END of for chunk_idx in cutlass.range(C, unroll=1)
-
-                # Advance to next tile
-                tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
-            # END of while work_tile.is_valid_tile
-
-            # Producer tail for INTRA2_Q
-            intra2_q_pipeline.producer_tail(intra2_q_producer_state)
-        # END of specialized pre-intra warp
-
-        # Specialized Epilogue warp
-        else:
-            # Dealloc regs for pre-inter/pre-intra warps
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_epilogue_warps)
-
-            # (L, D, INPUT_STAGE)
-            sDeltaA = self.epilog_make_delta(smem_cumsum_delta)
-
-            # Make tmem tensor for INTRA2_ACC/INTER2_ACC
-            # (MMA, MMA_M, MMA_K, INTERNAL_STAGE)
-            tCtAccIntra2 = self.mma_partition_c(
-                tiled_mma_intra2,
-                self.tile_shape_mnk_intra2,
-                tmem_ptr_base + self.tmem_intra2_acc_offset,
-                self.internal_stages,
-            )
-            # (M_PER_MMA, N_PER_MMA, INTERNAL_STAGE)
-            tIntra2 = tCtAccIntra2[((None, None), 0, 0, None)]
-            # (MMA, MMA_M, MMA_K, INTERNAL_STAGE)
-            tCtAccInter2 = self.mma_partition_c(
-                tiled_mma_inter2,
-                self.tile_shape_mnk_inter2,
-                tmem_ptr_base + self.tmem_inter2_acc_offset,
-                self.internal_stages,
-            )
-            # (M_PER_MMA, N_PER_MMA, INTERNAL_STAGE)
-            tInter2 = tCtAccInter2[((None, None), 0, 0, None)]
-
-            # Subtiling INTRA2_ACC/INTER2_ACC/Delta/Y
-            # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N, INTERNAL_STAGE)
-            tIntra_epi = cute.flat_divide(tIntra2, epi_tile)
-            tInter_epi = cute.flat_divide(tInter2, epi_tile)
-            # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N, INPUT_STAGE)
-            sDeltaA_epi = cute.flat_divide(sDeltaA, epi_tile)
-
-            # Make tiled copy and partition tmem/reg tensor w.r.t tensor memory load
-            # ((T2R_ATOM_V, T2R_REST_V), REST_M, REST_N, EPI_M, EPI_N, INTERNAL_STAGE)
-            # ((T2R_ATOM_V, T2R_REST_V), REST_M, REST_N)
-            (
-                tiled_t2r_intra2,
-                tTR_tIntra,
-                tTR_rIntra,
-            ) = self.epilog_tmem_load_and_partition_acc(local_tidx, tIntra_epi, smem_y)
-            (
-                tiled_t2r_inter2,
-                tTR_tInter2,
-                tTR_rInter,
-            ) = self.epilog_tmem_load_and_partition_acc(local_tidx, tInter_epi, smem_y)
-
-            # Make tiled copy and partition smem/reg tensor w.r.t smem load Delta
-            # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N, EPI_M, EPI_N, INPUT_STAGE)
-            # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N)
-            (
-                s2r_atom_delta,
-                tTR_sDeltaA,
-                tTR_rDeltaA,
-            ) = self.smem_load_and_partition_delta_d(
-                tiled_t2r_inter2, local_tidx, sDeltaA_epi, (None, None, None, 0, 0, 0)
-            )
-
-            # Make tiled copy and Partition smem/register tensor w.r.t smem store Y
-            # ((R2S_ATOM_V, R2S_REST_V), REST_M, REST_N, OUTPUT_STAGE)
-            # ((R2S_ATOM_V, R2S_REST_V), REST_M, REST_N)
-            tiled_r2s_y, tRS_rY, tRS_sY = self.smem_store_and_partition_p_y(
-                local_tidx, smem_y, tiled_t2r_inter2
-            )
-
-            tRS_rCompute = cute.make_fragment(tRS_rY.shape, self.acc_dtype)
-
-            # Register fragment for z gating (loaded from gmem per subtile)
-            tRS_rZ = None
-            if cutlass.const_expr(self.has_z):
-                tRS_rZ = cute.make_fragment(tRS_rY.shape, self.acc_dtype)
-
-            # Partition an identity tensor with the same tiled copy used for
-            # tmem load (tiled_t2r_inter2) to get per-register (l, d)
-            # coordinates within epi_tile. The R2S copy derives its thread
-            # layout from tiled_t2r_inter2, so registers align.
-            epi_coord_tensor = cute.make_identity_tensor(epi_tile)
-            thr_t2r_inter2 = tiled_t2r_inter2.get_slice(local_tidx)
-            # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N)
-            tYCoord = thr_t2r_inter2.partition_D(epi_coord_tensor)
-
-            tiled_s2r_x = None
-            tSR_sX = None
-            tSR_rX = None
-            if cutlass.const_expr(self.has_d):
-                # Make TiledCopy/smem/register tensor for smem load X
-                # (R2S_ATOM, R2S_M, R2S_N, EPI_M, EPI_N, INPUT_STAGES)
-                # (R2S_ATOM, R2S_M, R2S_N)
-                tiled_s2r_x, tSR_sX, tSR_rX = self.epilog_smem_load_and_partition_x(
-                    tiled_t2r_inter2, local_tidx, smem_xt, epi_tile
-                )
-
-            tRS_sD = None
-            tRS_rD = None
-            s2r_atom_d = None
-            if cutlass.const_expr(self.d_has_hdim):
-                # (L, D, INPUT_STAGE)
-                sD = self.epilog_make_d(smem_d)
-                # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N, INPUT_STAGE)
-                tD_sepi = cute.flat_divide(sD, epi_tile)
-
-                # Make tiled copy and partition smem/reg tensor w.r.t smem load D
-                # ((T2R_ATOM_V, T2R_REST_V), REST_M, REST_N, EPI_M, EPI_N, INPUT_STAGE)
-                # ((T2R_ATOM_V, T2R_REST_V), REST_M, REST_N)
-                s2r_atom_d, tRS_sD, tRS_rD = self.smem_load_and_partition_delta_d(
-                    tiled_t2r_inter2, local_tidx, tD_sepi, (None, None, None, 0, 0, 0)
-                )
-
-            elif cutlass.const_expr(self.has_d):
-                tRS_rD = cutlass.Float32(0.0).to(self.io_dtype)
-
-            # Partition global/shared tensor for TMA store Y
-            # ((ATOM_V, REST_V), INPUT_STAGE)
-            # ((ATOM_V, REST_V), EPI_M, EPI_N, 1, 1, C, EH, B)
-            bSG_sY, bSG_gY_pre_slice = self.epilog_tma_partition_y(
-                tma_tensor_y, tma_atom_y, smem_y, epi_tile
-            )
-
-            # Make TMA store pipeline Y
-            tma_y_pipeline = pipeline.PipelineTmaStore.create(
-                num_stages=self.output_stages,
-                producer_group=pipeline.CooperativeGroup(
-                    pipeline.Agent.Thread, 32 * len(self.epilog_warp_id)
-                ),
-            )
-
-            # Make consumer pipeline states for Delta/INTRA2_ACC/INTER2_ACC/X/D buffer
-            deltas_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.input_stages
-            )
-            intra2_acc_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.internal_stages
-            )
-            inter2_acc_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.internal_stages
-            )
-            x_consumer_state = None
-            if cutlass.const_expr(self.has_d):
-                x_consumer_state = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Consumer, self.input_stages
-                )
-            d_consumer_state = None
-            if cutlass.const_expr(self.d_has_hdim):
-                d_consumer_state = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Consumer, self.input_stages
-                )
-
-            while work_tile.is_valid_tile:
-                b_idx, eh_idx, g_idx = work_tile.tile_idx
-
-                # Varlen: b_idx from scheduler is seq_idx
-                if cutlass.const_expr(self.has_varlen):
-                    seq_id = b_idx
-                    b_idx = cutlass.Int32(0)
-                    first_chunk = seq_chunk_cumsum[seq_id]
-                    C = seq_chunk_cumsum[seq_id + 1] - first_chunk
-
-                # Slice global tensor to current tile idx
-                # ((ATOM_V, REST_V), EPI_M, EPI_N, C)
-                bSG_gY = bSG_gY_pre_slice[(None, None, None, 0, 0, None, eh_idx, b_idx)]
-                if cutlass.const_expr(self.has_d and not self.d_has_hdim):
-                    tRS_rD = tma_tensor_d[0, eh_idx]
-
-                # Reset count for pipeline state
-                deltas_consumer_state.reset_count()
-                intra2_acc_consumer_state.reset_count()
-                inter2_acc_consumer_state.reset_count()
-                if cutlass.const_expr(self.has_d):
-                    x_consumer_state.reset_count()
-                if cutlass.const_expr(self.d_has_hdim):
-                    d_consumer_state.reset_count()
-
-                # Peek Delta/INTRA2_ACC/INTER2_ACC buffer status
-                peek_deltas_full_status = self.conditional_consumer_try_wait(
-                    deltas_consumer_state, deltas_pipeline, C
-                )
-                peek_rd_intra2_acc_full_status = self.conditional_consumer_try_wait(
-                    intra2_acc_consumer_state, intra2_acc_pipeline, C
-                )
-                peek_rd_inter2_acc_full_status = self.conditional_consumer_try_wait(
-                    inter2_acc_consumer_state, inter2_acc_pipeline, C
-                )
-                peek_rd_x_full_status = None
-                if cutlass.const_expr(self.has_d):
-                    peek_rd_x_full_status = self.conditional_consumer_try_wait(
-                        x_consumer_state, x_pipeline, C
-                    )
-
-                if cutlass.const_expr(self.d_has_hdim):
-                    d_pipeline.consumer_wait(d_consumer_state)
-
-                # Batched processing over C dimension
-                for chunk_idx in cutlass.range(C, unroll=1):
-                    # Index into global chunk_indices/chunk_offsets arrays
-                    physical_chunk = first_chunk + chunk_idx
-                    # Map to physical chunk (chunk) and offset (chunk_offset)
-                    if cutlass.const_expr(self.has_varlen):
-                        chunk = chunk_indices[physical_chunk]
-                        chunk_offset = chunk_offsets[physical_chunk]
-                        chunk_size_limit = L
-                        if physical_chunk + 1 < num_logical_chunks:
-                            next_chunk = chunk_indices[physical_chunk + 1]
-                            if next_chunk == chunk:
-                                chunk_size_limit = chunk_offsets[physical_chunk + 1]
-                    else:
-                        chunk = physical_chunk
-                        chunk_offset = 0
-                        chunk_size_limit = L
-
-                    # Conditionally wait for Delta/INTRA2_ACC/INTER2_ACC/X buffer full
-                    deltas_pipeline.consumer_wait(
-                        deltas_consumer_state, peek_deltas_full_status
-                    )
-                    intra2_acc_pipeline.consumer_wait(
-                        intra2_acc_consumer_state, peek_rd_intra2_acc_full_status
-                    )
-                    inter2_acc_pipeline.consumer_wait(
-                        inter2_acc_consumer_state, peek_rd_inter2_acc_full_status
-                    )
-                    if cutlass.const_expr(self.has_d):
-                        x_pipeline.consumer_wait(
-                            x_consumer_state, peek_rd_x_full_status
-                        )
-                    # Loop over EPI_M and EPI_N subtiles
-                    for epi_n in range(cute.size(tTR_tIntra, mode=[4])):
-                        for epi_m in range(cute.size(tTR_tIntra, mode=[3])):
-                            epi_iter_cnt = (
-                                epi_n * cute.size(tTR_tIntra, mode=[3]) + epi_m
-                            )
-                            epi_buffer_idx = epi_iter_cnt % self.output_stages
-
-                            # Load INTRA2_ACC/INTER2_ACC from tmem
-                            subtile_coord = (
-                                None,
-                                None,
-                                None,
-                                epi_m,
-                                epi_n,
-                            )
-                            intra2_coord = subtile_coord + (
-                                intra2_acc_consumer_state.index,
-                            )
-                            cute.copy(
-                                tiled_t2r_intra2,
-                                tTR_tIntra[intra2_coord],
-                                tTR_rIntra,
-                            )
-                            inter2_coord = subtile_coord + (
-                                inter2_acc_consumer_state.index,
-                            )
-                            cute.copy(
-                                tiled_t2r_inter2,
-                                tTR_tInter2[inter2_coord],
-                                tTR_rInter,
-                            )
-                            # Fence for T2R load
-                            cute.arch.fence_view_async_tmem_load()
-
-                            # Load Delta from smem
-                            delta_coord = subtile_coord + (deltas_consumer_state.index,)
-                            cute.copy(
-                                s2r_atom_delta, tTR_sDeltaA[delta_coord], tTR_rDeltaA
-                            )
-
-                            # Load X from smem
-                            if cutlass.const_expr(self.has_d):
-                                x_coord = subtile_coord + (x_consumer_state.index,)
-                                cute.copy(tiled_s2r_x, tSR_sX[x_coord], tSR_rX)
-
-                            # Load D from smem
-                            if cutlass.const_expr(self.d_has_hdim):
-                                # Load vector D from smem (d_has_hdim = True)
-                                d_coord = subtile_coord + (d_consumer_state.index,)
-                                cute.copy(s2r_atom_d, tRS_sD[d_coord], tRS_rD)
-
-                            # Adjust dA_cumsum for chunk offset boundary
-                            # When chunk_offset > 0, shift all dA values so they're
-                            # relative to the sequence start within the chunk.
-                            if chunk_offset > 0:
-                                dA_cs_boundary = smem_cumsum_delta[
-                                    chunk_offset - 1, deltas_consumer_state.index
-                                ]
-                                for reg_idx in range(cute.size(tTR_rDeltaA)):
-                                    tTR_rDeltaA[reg_idx] = (
-                                        tTR_rDeltaA[reg_idx] - dA_cs_boundary
-                                    )
-
-                            # Combine INTRA2_ACC/INTER2_ACC/Delta/X/D
-                            for reg_idx in range(0, cute.size(tRS_rCompute), 2):
-                                (
-                                    tRS_rCompute[reg_idx],
-                                    tRS_rCompute[reg_idx + 1],
-                                ) = cute.arch.fma_packed_f32x2(
-                                    (tTR_rInter[reg_idx], tTR_rInter[reg_idx + 1]),
-                                    (
-                                        cute.math.exp(
-                                            tTR_rDeltaA[reg_idx], fastmath=True
-                                        ),
-                                        cute.math.exp(
-                                            tTR_rDeltaA[reg_idx + 1], fastmath=True
-                                        ),
-                                    ),
-                                    (tTR_rIntra[reg_idx], tTR_rIntra[reg_idx + 1]),
-                                )
-                                # Fuse Y += X * D
-                                if cutlass.const_expr(self.d_has_hdim):
-                                    (
-                                        tRS_rCompute[reg_idx],
-                                        tRS_rCompute[reg_idx + 1],
-                                    ) = cute.arch.fma_packed_f32x2(
-                                        (
-                                            tRS_rD[reg_idx].to(self.acc_dtype),
-                                            tRS_rD[reg_idx + 1].to(self.acc_dtype),
-                                        ),
-                                        (
-                                            tSR_rX[reg_idx].to(self.acc_dtype),
-                                            tSR_rX[reg_idx + 1].to(self.acc_dtype),
-                                        ),
-                                        (
-                                            tRS_rCompute[reg_idx],
-                                            tRS_rCompute[reg_idx + 1],
-                                        ),
-                                    )
-                                elif cutlass.const_expr(self.has_d):
-                                    (
-                                        tRS_rCompute[reg_idx],
-                                        tRS_rCompute[reg_idx + 1],
-                                    ) = cute.arch.fma_packed_f32x2(
-                                        (
-                                            tRS_rD.to(self.acc_dtype),
-                                            tRS_rD.to(self.acc_dtype),
-                                        ),
-                                        (
-                                            tSR_rX[reg_idx].to(self.acc_dtype),
-                                            tSR_rX[reg_idx + 1].to(self.acc_dtype),
-                                        ),
-                                        (
-                                            tRS_rCompute[reg_idx],
-                                            tRS_rCompute[reg_idx + 1],
-                                        ),
-                                    )
-
-                            # Z gating: y *= z * sigmoid(z) = y *= silu(z)
-                            if cutlass.const_expr(self.has_z):
-                                z_d_off = epi_n * epi_tile[1]
-                                for reg_idx in cutlass.range(
-                                    cute.size(tRS_rZ), unroll_full=True
-                                ):
-                                    coord = tYCoord[reg_idx]
-                                    z_l = coord[0]
-                                    z_d = coord[1]
-                                    tRS_rZ[reg_idx] = z_gmem[
-                                        z_d_off + z_d, z_l, chunk, eh_idx, b_idx
-                                    ].to(self.acc_dtype)
-                                for reg_idx in range(0, cute.size(tRS_rCompute), 2):
-                                    z0 = tRS_rZ[reg_idx]
-                                    z1 = tRS_rZ[reg_idx + 1]
-                                    # silu(z) = z / (1 + exp(-z))
-                                    s0 = z0 / (
-                                        cutlass.Float32(1.0)
-                                        + cute.math.exp(-z0, fastmath=True)
-                                    )
-                                    s1 = z1 / (
-                                        cutlass.Float32(1.0)
-                                        + cute.math.exp(-z1, fastmath=True)
-                                    )
-                                    tRS_rCompute[reg_idx] = tRS_rCompute[reg_idx] * s0
-                                    tRS_rCompute[reg_idx + 1] = (
-                                        tRS_rCompute[reg_idx + 1] * s1
-                                    )
-
-                            tRS_rY.store(tRS_rCompute.load().to(self.io_dtype))
-
-                            # Store Y to smem
-                            cute.copy(
-                                tiled_r2s_y,
-                                tRS_rY,
-                                tRS_sY[None, None, None, epi_buffer_idx],
-                            )
-
-                            # Fence for R2S store
-                            cute.arch.fence_proxy(
-                                cute.arch.ProxyKind.async_shared,
-                                space=cute.arch.SharedSpace.shared_cta,
-                            )
-                            # Sync before TMA store
-                            cute.arch.barrier(
-                                barrier_id=self.epilog_sync_bar_id,
-                                number_of_threads=len(self.epilog_warp_id) * 32,
-                            )
-
-                            # Async arrive Delta/INTRA2_ACC/INTER2_ACC buffer empty
-                            if (
-                                epi_iter_cnt
-                                == cute.size(tTR_tIntra, mode=[4])
-                                * cute.size(tTR_tIntra, mode=[3])
-                                - 1
-                            ):
-                                deltas_pipeline.consumer_release(deltas_consumer_state)
-                                intra2_acc_pipeline.consumer_release(
-                                    intra2_acc_consumer_state
-                                )
-                                inter2_acc_pipeline.consumer_release(
-                                    inter2_acc_consumer_state
-                                )
-                                if cutlass.const_expr(self.has_d):
-                                    x_pipeline.consumer_release(
-                                        x_consumer_state,
-                                        pipeline.PipelineOp.AsyncThread,
-                                    )
-
-                            # Step 4.4b: store Y to global memory.
-                            # For non-aligned boundaries, use masked
-                            # register-to-global store instead of TMA.
-                            l_coord = 0
-                            d_coord = 0
-                            d_off = epi_n * epi_tile[1]
-                            if chunk_size_limit < L or chunk_offset > 0:
-                                # Masked warp-level store: each thread
-                                # stores its registers directly to gmem,
-                                # only for L positions in [chunk_offset, chunk_size_limit).
-                                for reg_idx in cutlass.range(
-                                    cute.size(tRS_rY), unroll_full=True
-                                ):
-                                    coord = tYCoord[reg_idx]
-                                    l_coord = coord[0]
-                                    d_coord = coord[1]
-                                    if l_coord >= chunk_offset and l_coord < chunk_size_limit:
-                                        y_gmem[
-                                            l_coord,
-                                            d_off + d_coord,
-                                            chunk,
-                                            eh_idx,
-                                            b_idx,
-                                        ] = tRS_rY[reg_idx]
-                            else:
-                                # Normal TMA store (full tile)
-                                if local_warp_idx == 0:
-                                    cute.copy(
-                                        tma_atom_y,
-                                        bSG_sY[None, epi_buffer_idx],
-                                        bSG_gY[None, epi_m, epi_n, chunk],
-                                    )
-
-                            # Commit + wait TMA pipeline (keeps pipeline
-                            # in sync even when no TMA copy was issued).
-                            if local_warp_idx == 0:
-                                tma_y_pipeline.producer_commit()
-                                tma_y_pipeline.producer_acquire()
-                            # Sync before smem store
-                            cute.arch.barrier(
-                                barrier_id=self.epilog_sync_bar_id,
-                                number_of_threads=len(self.epilog_warp_id) * 32,
-                            )
-
-                    # Advance deltas/intra2_acc/inter2_acc consumer states
-                    deltas_consumer_state.advance()
-                    intra2_acc_consumer_state.advance()
-                    inter2_acc_consumer_state.advance()
-
-                    # Peek (try_wait) Delta/INTRA2_ACC/INTER2_ACC buffer full for chunk_idx = chunk_idx + 1
-                    peek_deltas_full_status = self.conditional_consumer_try_wait(
-                        deltas_consumer_state, deltas_pipeline, C
-                    )
-                    peek_rd_intra2_acc_full_status = self.conditional_consumer_try_wait(
-                        intra2_acc_consumer_state, intra2_acc_pipeline, C
-                    )
-                    peek_rd_inter2_acc_full_status = self.conditional_consumer_try_wait(
-                        inter2_acc_consumer_state, inter2_acc_pipeline, C
-                    )
-
-                    if cutlass.const_expr(self.has_d):
-                        # Advance x consumer states
-                        x_consumer_state.advance()
-                        # Peek (try_wait) X buffer full for chunk_idx = chunk_idx + 1
-                        peek_rd_x_full_status = self.conditional_consumer_try_wait(
-                            x_consumer_state, x_pipeline, C
-                        )
-
-                if cutlass.const_expr(self.d_has_hdim):
-                    d_pipeline.consumer_release(d_consumer_state)
-                    d_consumer_state.advance()
-
-                # Advance to next tile
-                tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
-
-            # Producer tail for TMA store Y
-            tma_y_pipeline.producer_tail()
-
-        # Dealloc tmem buffer
-        if warp_idx == self.epilog_warp_id[0]:
-            cute.arch.barrier(
-                barrier_id=self.tmem_dealloc_sync_bar_id,
-                number_of_threads=self.threads_per_cta,
-            )
-            cute.arch.dealloc_tmem(
-                tmem_ptr_base,
-                self.num_tmem_cols_total,
-                is_two_cta=self.use_2cta_instrs,
-            )
-        else:
-            cute.arch.barrier_arrive(
-                barrier_id=self.tmem_dealloc_sync_bar_id,
-                number_of_threads=self.threads_per_cta,
-            )
-
-        return
+            # Advance to next tile
+            tile_sched.advance_to_next_work()
+            work_tile = tile_sched.get_current_work()
+
+        # Producer tail for INTER1_ACC/INTER2_ACC
+        inter1_acc_pipeline.producer_tail(inter1_acc_producer_state)
+        inter2_acc_pipeline.producer_tail(inter2_acc_producer_state)
 
     @staticmethod
     def _compute_stages(smem_capacity):
@@ -3526,6 +3757,56 @@ class SSDKernel:
                 intra1_acc_producer_state
             )
         return peek_wr_intra1_acc_empty_status
+
+    @cute.jit
+    def resolve_varlen_tile_info(self, work_tile, seq_chunk_cumsum, C):
+        """Resolve tile info, handling varlen seq_id → b_idx remapping.
+
+        Returns (b_idx, eh_idx, g_idx, seq_id, first_chunk, C).
+        In non-varlen mode, seq_id=0, first_chunk=0, C unchanged.
+        """
+        b_idx, eh_idx, g_idx = work_tile.tile_idx
+        seq_id = cutlass.Int32(0)
+        first_chunk = cutlass.Int32(0)
+        if cutlass.const_expr(self.has_varlen):
+            seq_id = b_idx
+            b_idx = cutlass.Int32(0)
+            first_chunk = seq_chunk_cumsum[seq_id]
+            C = seq_chunk_cumsum[seq_id + 1] - first_chunk
+        return b_idx, eh_idx, g_idx, seq_id, first_chunk, C
+
+    @cute.jit
+    def resolve_physical_chunk(self, first_chunk, count, chunk_indices, chunk_offsets):
+        """Map logical chunk counter to physical chunk index and offset.
+
+        Returns (physical_chunk, chunk, chunk_offset).
+        In non-varlen mode, chunk = physical_chunk and chunk_offset = 0.
+        """
+        physical_chunk = first_chunk + count
+        chunk = physical_chunk
+        chunk_offset = 0
+        if cutlass.const_expr(self.has_varlen):
+            chunk = chunk_indices[physical_chunk]
+            chunk_offset = chunk_offsets[physical_chunk]
+        return physical_chunk, chunk, chunk_offset
+
+    @cute.jit
+    def compute_chunk_size_limit(
+        self, physical_chunk, chunk, num_logical_chunks, chunk_indices, chunk_offsets, L
+    ):
+        """Compute how far into the physical chunk this logical chunk extends.
+
+        Returns chunk_size_limit (= L when the logical chunk owns the full
+        physical chunk, < L when the next logical chunk shares the same
+        physical chunk).
+        """
+        chunk_size_limit = L
+        if cutlass.const_expr(self.has_varlen):
+            if physical_chunk + 1 < num_logical_chunks:
+                next_chunk = chunk_indices[physical_chunk + 1]
+                if next_chunk == chunk:
+                    chunk_size_limit = chunk_offsets[physical_chunk + 1]
+        return chunk_size_limit
 
     def pre_intra_tmem_load_and_partition_q(self, tIntra1, local_tidx):
         copy_atom_t2r_intra1 = cute.make_copy_atom(
