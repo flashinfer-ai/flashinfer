@@ -21,6 +21,9 @@ from .core import (
     current_compilation_context,
 )
 
+from .cubin_loader import download_trtllm_headers, get_cubin
+from ..artifacts import ArtifactPath, CheckSumHash
+
 
 def gen_moe_utils_module() -> JitSpec:
     """
@@ -33,7 +36,22 @@ def gen_moe_utils_module() -> JitSpec:
     - moeActivation: Apply activation functions with optional FP4 quantization
     - moeSort: Sort tokens by expert assignment (DeepSeekV3 routing)
     """
+
+    download_trtllm_headers(
+        "bmm",
+        jit_env.FLASHINFER_CUBIN_DIR
+        / "flashinfer"
+        / "trtllm"
+        / "batched_gemm"
+        / "trtllmGen_bmm_export",
+        f"{ArtifactPath.TRTLLM_GEN_BMM}/include/trtllmGen_bmm_export",
+        ArtifactPath.TRTLLM_GEN_BMM,
+        get_cubin(
+            f"{ArtifactPath.TRTLLM_GEN_BMM}/checksums.txt", CheckSumHash.TRTLLM_GEN_BMM
+        ),
+    )
     nvcc_flags = [
+        "-DTLLM_GEN_EXPORT_INTERFACE",  # Use relative includes in downloaded headers
         "-DENABLE_BF16",
         "-DENABLE_FP8",
         "-DENABLE_FP4",
@@ -78,13 +96,7 @@ def gen_moe_utils_module() -> JitSpec:
             / "tensorrt_llm"
             / "kernels"
             / "cutlass_kernels",
-            # Include paths for routing kernels
-            jit_env.FLASHINFER_INCLUDE_DIR,
-            # Include path for trtllm/gen/MmaDecl.h (used by DtypeDecl.h)
-            jit_env.FLASHINFER_INCLUDE_DIR
-            / "flashinfer"
-            / "trtllm"
-            / "batched_gemm"
-            / "trtllmGen_bmm_export",
+            # Include paths for routing kernels and downloaded headers
+            jit_env.FLASHINFER_CUBIN_DIR,
         ],
     )

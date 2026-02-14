@@ -26,7 +26,7 @@ from .core import (
     sm89_nvcc_flags,
 )
 from .cpp_ext import is_cuda_version_at_least
-from .cubin_loader import get_cubin, get_meta_hash
+from .cubin_loader import get_cubin, get_meta_hash, download_trtllm_headers
 from .gemm.cutlass.generate_kernels import generate_gemm_operations
 
 
@@ -233,6 +233,19 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
     # make sure "flashinferMetaInfo.h" is downloaded or cached
     assert metainfo, f"{header_name}.h not found"
 
+    header_path = f"{include_path}/trtllmGen_bmm_export"
+    header_dest_dir = (
+        jit_env.FLASHINFER_CUBIN_DIR
+        / "flashinfer"
+        / "trtllm"
+        / "batched_gemm"
+        / "trtllmGen_bmm_export"
+    )
+
+    download_trtllm_headers(
+        "bmm", header_dest_dir, header_path, ArtifactPath.TRTLLM_GEN_BMM, checksum
+    )
+
     # currently only support Blackwell
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
         supported_major_versions=[10]
@@ -265,7 +278,7 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
         ]
         + nvcc_flags,
         extra_include_paths=[
-            # link "include" sub-directory in cache
+            jit_env.FLASHINFER_CUBIN_DIR,
             jit_env.FLASHINFER_CUBIN_DIR / include_path,
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/include",
