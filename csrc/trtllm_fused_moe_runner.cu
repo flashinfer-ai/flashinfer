@@ -54,10 +54,10 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
                  int32_t localNumExperts, float routedScalingFactor, int32_t* routingExpertIndexes,
                  int32_t* expertCountHistogram, int32_t* permutedIdxSize,
                  int32_t* expandedIdxToPermutedIdx, int32_t* permutedIdxToExpandedIdx,
-                 int32_t* permutedIdxToTokenIdx, void* expertWeights, int32_t* numTokensPerExpert,
-                 int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit,
-                 int32_t* numNonExitingCtas, btg::Dtype dtypeElt, btg::Dtype dtypeBias,
-                 bool useRoutingScalesOnInput, bool useDeepSeekFp8,
+                 int32_t* permutedIdxToTokenIdx, int32_t* expertIds, void* expertWeights,
+                 int32_t* numTokensPerExpert, int32_t* ctaIdxXyToBatchIdx,
+                 int32_t* ctaIdxXyToMnLimit, int32_t* numNonExitingCtas, btg::Dtype dtypeElt,
+                 btg::Dtype dtypeBias, bool useRoutingScalesOnInput, bool useDeepSeekFp8,
                  RoutingMethodType routingMethodType, cudaStream_t stream) {
   if (routingMethodType == RoutingMethodType::DeepSeekV3) {
     FLASHINFER_CHECK(topK <= 22, "For DeepSeek routing method, must have topK <= 22");
@@ -84,7 +84,10 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
 
     // input:
     routingData.mPtrRoutingBias = routingBias;
-    routingData.mPtrScores = reinterpret_cast<float*>(routingLogits);
+    // Pre-computed routing support: when expertIds is provided, use it directly
+    routingData.mPtrScores =
+        expertIds == nullptr ? reinterpret_cast<float*>(routingLogits) : nullptr;
+    routingData.mPtrTopKIds = expertIds;
     routingData.mNumTokens = numTokens;
     routingData.mNumExperts = numExperts;
     routingData.mNumExpertGroups = nGroup;
@@ -121,7 +124,9 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mPtrNumNonExitingCtas = numNonExitingCtas;
 
     // input:
-    routingData.mPtrScores = routingLogits;
+    // Pre-computed routing support: when expertIds is provided, use it directly
+    routingData.mPtrScores = expertIds == nullptr ? routingLogits : nullptr;
+    routingData.mPtrTopKIds = expertIds;
     routingData.mNumTokens = numTokens;
     routingData.mNumExperts = numExperts;
     routingData.mTopK = topK;
@@ -147,7 +152,9 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mNormTopkProb = routingMethodType == RoutingMethodType::RenormalizeNaive;
     routingData.mApplySoftmaxAfterTopK = routingMethodType == RoutingMethodType::Renormalize;
 
-    routingData.mPtrScores = routingLogits;
+    // Pre-computed routing support: when expertIds is provided, use it directly
+    routingData.mPtrScores = expertIds == nullptr ? routingLogits : nullptr;
+    routingData.mPtrTopKIds = expertIds;
 
     //
     // Outputs

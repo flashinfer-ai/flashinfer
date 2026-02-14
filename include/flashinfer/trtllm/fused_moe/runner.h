@@ -124,11 +124,11 @@ class Runner {
            int32_t localNumExperts, float routedScalingFactor, int32_t* routingExpertIndexes,
            int32_t* expertCountHistogram, int32_t* permutedIdxSize,
            int32_t* expandedIdxToPermutedIdx, int32_t* permutedIdxToExpandedIdx,
-           int32_t* permutedIdxToTokenIdx, void* expertWeights, int32_t* numTokensPerExpert,
-           int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit, int32_t* numNonExitingCtas,
-           batchedGemm::trtllm::gen::Dtype dtypeElt, batchedGemm::trtllm::gen::Dtype dtypeBias,
-           bool useRoutingScalesOnInput, bool useDeepSeekFp8, RoutingMethodType routingMethodType,
-           cudaStream_t stream);
+           int32_t* permutedIdxToTokenIdx, int32_t* expertIds, void* expertWeights,
+           int32_t* numTokensPerExpert, int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit,
+           int32_t* numNonExitingCtas, batchedGemm::trtllm::gen::Dtype dtypeElt,
+           batchedGemm::trtllm::gen::Dtype dtypeBias, bool useRoutingScalesOnInput,
+           bool useDeepSeekFp8, RoutingMethodType routingMethodType, cudaStream_t stream);
 
  private:
   int32_t mTileTokensDim{8};
