@@ -1,0 +1,99 @@
+/*
+ * Copyright (c) 2023-2025 by FlashInfer team.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+#include <fused_multihead_attention.h>
+#include <stdexcept>
+#include <string>
+
+// Include JIT-generated config with dispatch macros
+#include "fmha_v2_config.inc"
+
+//===----------------------------------------------------------------------===//
+// Extern declarations for all JIT-generated kernel launchers
+//===----------------------------------------------------------------------===//
+
+{% for launcher in launchers %}
+extern void {{ launcher.name }}(
+    bert::Fused_multihead_attention_params_v2 &params,
+    const bert::Fused_multihead_attention_launch_params &launch_params,
+    cudaStream_t stream);
+{% endfor %}
+
+//===----------------------------------------------------------------------===//
+// Kernel launcher type definition
+//===----------------------------------------------------------------------===//
+
+using FMHAv2KernelLauncher = void (*)(
+    bert::Fused_multihead_attention_params_v2 &,
+    const bert::Fused_multihead_attention_launch_params &,
+    cudaStream_t);
+
+//===----------------------------------------------------------------------===//
+// get_fmha_v2_kernel - Runtime kernel selection
+//===----------------------------------------------------------------------===//
+
+inline FMHAv2KernelLauncher get_fmha_v2_kernel(
+    Data_type dtype,
+    int head_dim_qk,
+    int head_dim_vo) {
+{% for launcher in launchers %}
+{% if loop.first %}
+    if (dtype == {{ launcher.dtype_enum }} &&
+        head_dim_qk == {{ launcher.head_dim_qk }} &&
+        head_dim_vo == {{ launcher.head_dim_vo }}) {
+        return {{ launcher.name }};
+{% else %}
+    } else if (dtype == {{ launcher.dtype_enum }} &&
+               head_dim_qk == {{ launcher.head_dim_qk }} &&
+               head_dim_vo == {{ launcher.head_dim_vo }}) {
+        return {{ launcher.name }};
+{% endif %}
+{% endfor %}
+{% if launchers %}
+    }
+{% endif %}
+    return nullptr;
+}
+
+//===----------------------------------------------------------------------===//
+// fmha_v2_run_kernel - Main entry point with runtime dispatch
+//===----------------------------------------------------------------------===//
+
+inline void fmha_v2_run_kernel(
+    bert::Fused_multihead_attention_params_v2 &params,
+    const bert::Fused_multihead_attention_launch_params &launch_params,
+    cudaStream_t stream,
+    Data_type dtype,
+    int head_dim_qk,
+    int head_dim_vo) {
+
+    FMHAv2KernelLauncher launcher = get_fmha_v2_kernel(dtype, head_dim_qk, head_dim_vo);
+
+    if (launcher == nullptr) {
+        throw std::runtime_error(
+            "No FMHAv2 kernel available for dtype=" + std::to_string(static_cast<int>(dtype)) +
+            ", head_dim_qk=" + std::to_string(head_dim_qk) +
+            ", head_dim_vo=" + std::to_string(head_dim_vo));
+    }
+
+    launcher(params, launch_params, stream);
+}

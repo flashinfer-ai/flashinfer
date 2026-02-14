@@ -1,0 +1,354 @@
+{{ copyright }}
+
+//We can disable the FADD trick for archs with F2IP
+{% if disable_fadd_trick %} // disable_fadd_trick
+#ifdef USE_I2F_EMULATION_TRICK
+#undef USE_I2F_EMULATION_TRICK
+#endif // USE_I2F_EMULATION_TRICK
+
+#ifdef USE_F2I_EMULATION_TRICK
+#undef USE_F2I_EMULATION_TRICK
+#endif // USE_F2I_EMULATION_TRICK
+{% endif %} // disable_fadd_trick
+
+#include <cuda.h>
+#include <stdexcept>
+
+#if CUDA_VERSION >= {{ min_cuda_version }}
+
+
+{% if not use_multi_cta %} // !use_multi_cta
+#include <fused_multihead_attention_kernel_{{ kernel_variant }}.h>
+{% endif %} // !use_multi_cta
+
+{% if not use_multi_cta and has_noloop %} // !use_multi_cta && has_noloop
+#include <fused_multihead_attention_kernel_1xN_noloop.h>
+{% endif %} // !use_multi_cta && has_noloop
+
+{% if cross_mha %} // cross_mha
+{% if has_noloop %} // has_noloop
+#include <fused_multihead_cross_attention_kernel_1xN_noloop.h>
+{% endif %}  // has_noloop
+#include <fused_multihead_cross_attention_kernel_1xN.h>
+{% endif %} // cross_mha
+
+{% if use_multi_cta %} // use_multi_cta
+#include <fused_multihead_attention_kernel_1xN_multi_cta.h>
+{% endif %}
+
+using Attention_mask_type = fmha::Attention_mask_type;
+using Launch_params = bert::Fused_multihead_attention_launch_params;
+
+{% if not cross_mha %} // !cross_mha
+using Kernel_traits = fmha::{{ kernel_traits }}<
+    fmha::{{ instruction_traits }},
+    {{ seq_len }},
+    {{ head_size }},
+    {{ loop_step }},
+    {{ warps_m }},
+    {{ warps_n }},
+    {{ ctas_per_head }},
+    {{ kernel_flags }}>;
+
+using Kernel_traits_causal = fmha::{{ kernel_traits }}<
+    fmha::{{ instruction_traits }},
+    {{ seq_len }},
+    {{ head_size }},
+    {{ loop_step }},
+    {{ warps_m }},
+    {{ warps_n }},
+    {{ ctas_per_head }},
+    {{ kernel_flags }},
+    /*causal mask*/ 3>;
+{% endif %} // Not cross attention
+
+{% if not use_multi_cta and not cross_mha %} // !use_multi_cta && !cross_mha
+
+extern "C"
+__global__
+void {{ kernel_name }}({{ params_type }} params){
+  fused_multihead_attention::device_{{ kernel_variant }}<Kernel_traits>(params);
+}
+
+extern "C"
+__global__
+void {{ causal_kernel_name }}({{ params_type }} params){
+  fused_multihead_attention::device_{{ kernel_variant }}<Kernel_traits_causal>(params);
+}
+
+void {{ launcher_name }}(
+    const {{ params_type }} &params,
+    const Launch_params &launch_params,
+    cudaStream_t stream){
+
+  constexpr int smem_size = Kernel_traits::BYTES_PER_SMEM;
+  if( launch_params.attention_mask_type == Attention_mask_type::CAUSAL ) {
+    if( smem_size >= 48*1024 ) {
+        FMHA_CHECK_CUDA(cudaFuncSetAttribute({{ causal_kernel_name }},
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            smem_size));
+    }
+    dim3 grid(params.h, params.b);
+    {{ causal_kernel_name }}<<<grid, Kernel_traits_causal::THREADS, Kernel_traits_causal::BYTES_PER_SMEM, stream>>>(params);
+  } else {
+    if( smem_size >= 48*1024 ) {
+        FMHA_CHECK_CUDA(cudaFuncSetAttribute({{ kernel_name }},
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            smem_size));
+    }
+    dim3 grid(params.h, params.b);
+    {{ kernel_name }}<<<grid, Kernel_traits::THREADS, Kernel_traits::BYTES_PER_SMEM, stream>>>(params);
+  }
+}
+
+{% endif %} // !use_multi_cta && !cross_mha
+
+{% if not use_multi_cta and has_noloop and not cross_mha %} // !use_multi_cta && has_noloop && !cross_mha
+
+using Kernel_traits_nl = fmha::{{ kernel_traits }}<
+    fmha::{{ instruction_traits }},
+    {{ seq_len }},
+    {{ head_size }},
+    {{ noloop_step }},
+    1,
+    {{ warps_m }} * {{ warps_n }},
+    {{ ctas_per_head }},
+    {{ kernel_flags }} | 0x200 /* no_loop flag */ >;
+
+static_assert(Kernel_traits_nl::CTAS_PER_HEAD == 1, "");
+
+using Kernel_traits_nl_causal = fmha::{{ kernel_traits }}<
+    fmha::{{ instruction_traits }},
+    {{ seq_len }},
+    {{ head_size }},
+    {{ noloop_step }},
+    1,
+    {{ warps_m }} * {{ warps_n }},
+    {{ ctas_per_head }},
+    {{ kernel_flags }} | 0x200 /* no_loop flag */,
+    /*causal mask*/ 3>;
+
+static_assert(Kernel_traits_nl_causal::CTAS_PER_HEAD == 1, "");
+static_assert(Kernel_traits_nl_causal::MASK_VERSION == 3, "");
+
+extern "C"
+__global__
+void {{ kernel_name }}_nl({{ params_type }} params){
+  fused_multihead_attention::device_1xN_nl<Kernel_traits_nl>(params);
+}
+
+extern "C"
+__global__
+void {{ causal_kernel_name }}_nl({{ params_type }} params){
+  fused_multihead_attention::device_1xN_nl<Kernel_traits_nl_causal>(params);
+}
+
+void {{ launcher_name }}_nl(
+    const {{ params_type }} &params,
+    const Launch_params &launch_params,
+    cudaStream_t stream){
+
+
+  constexpr int loop_iters = ({{ seq_len }} + {{ noloop_step }}-1) / {{ noloop_step }};
+  static_assert(loop_iters * {{ noloop_step }} >= {{ seq_len }}, "");
+  dim3 grid(params.h, params.b, loop_iters);
+  if( launch_params.attention_mask_type == Attention_mask_type::CAUSAL ) {
+    constexpr int smem_size = Kernel_traits_nl_causal::BYTES_PER_SMEM;
+    if( smem_size >= 48*1024 ) {
+        FMHA_CHECK_CUDA(cudaFuncSetAttribute({{ causal_kernel_name }}_nl,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            smem_size));
+    }
+    {{ causal_kernel_name }}_nl<<<grid, Kernel_traits_nl_causal::THREADS, Kernel_traits_nl_causal::BYTES_PER_SMEM, stream>>>(params);
+  } else {
+    constexpr int smem_size = Kernel_traits_nl::BYTES_PER_SMEM;
+    if( smem_size >= 48*1024 ) {
+        FMHA_CHECK_CUDA(cudaFuncSetAttribute({{ kernel_name }}_nl,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            smem_size));
+    }
+    {{ kernel_name }}_nl<<<grid, Kernel_traits_nl::THREADS, Kernel_traits_nl::BYTES_PER_SMEM, stream>>>(params);
+  }
+}
+
+{% endif %} // !use_multi_cta && has_noloop && !cross_mha
+
+{% if cross_mha %} // cross_mha
+{% if not use_multi_cta and has_noloop %} // !use_multi_cta && has_noloop
+
+using Kernel_traits_nl = fmha::{{ kernel_traits }}<
+    fmha::{{ instruction_traits }},
+    {{ seq_len }},
+    {{ head_size }},
+    {{ noloop_step }},
+    1,
+    {{ warps_m }} * {{ warps_n }},
+    {{ ctas_per_head }},
+    {{ kernel_flags }}>;
+
+static_assert(Kernel_traits_nl::CTAS_PER_HEAD == 1, "");
+
+extern "C"
+__global__
+void {{ kernel_name }}_nl({{ params_type }} params){
+  fused_multihead_attention::device_mhca_1xN_nl<Kernel_traits_nl>(params);
+}
+
+void {{ launcher_name }}_nl(
+    const {{ params_type }} &params,
+    // const Launch_params &launch_params, // TODO
+    cudaStream_t stream){
+
+  constexpr int smem_size = Kernel_traits_nl::BYTES_PER_SMEM;
+  if( smem_size >= 48*1024 ) {
+    FMHA_CHECK_CUDA(cudaFuncSetAttribute({{ kernel_name }}_nl,
+                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         smem_size));
+  }
+  const int loop_iters = (params.s_q + {{ noloop_step }}-1) / {{ noloop_step }};
+  // if (loop_iters * {{ noloop_step }} != params.s_q) {
+  //   throw std::runtime_error("Incorrect seq len -- loop_iters * noloop_step != params.s_q");
+  // }
+  assert(loop_iters * {{ noloop_step }} >= params.s_q);
+  dim3 grid(params.h, params.b, loop_iters);
+  {{ kernel_name }}_nl<<<grid, Kernel_traits_nl::THREADS, Kernel_traits_nl::BYTES_PER_SMEM, stream>>>(params);
+}
+
+{% endif %} // !use_multi_cta && has_noloop
+
+{% if not use_multi_cta %} // !use_multi_cta
+
+using Kernel_traits = fmha::{{ kernel_traits }}<
+    fmha::{{ instruction_traits }},
+    {{ seq_len }},
+    {{ head_size }},
+    {{ loop_step }},
+    {{ warps_m }},
+    {{ warps_n }},
+    {{ ctas_per_head }},
+    {{ kernel_flags }}>;
+
+extern "C"
+__global__
+void {{ kernel_name }}({{ params_type }} params){
+  fused_multihead_attention::device_mhca_1xN<Kernel_traits>(params);
+}
+
+void {{ launcher_name }}(
+    const {{ params_type }} &params,
+    // const Launch_params &launch_params, // TODO
+    cudaStream_t stream){
+
+  constexpr int smem_size = Kernel_traits::BYTES_PER_SMEM;
+  if( smem_size >= 48*1024 ) {
+    FMHA_CHECK_CUDA(cudaFuncSetAttribute({{ kernel_name }},
+                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         smem_size));
+  }
+  dim3 grid(params.h, params.b);
+  {{ kernel_name }}<<<grid, Kernel_traits::THREADS, Kernel_traits::BYTES_PER_SMEM, stream>>>(params);
+}
+
+{% endif %} // !use_multi_cta
+
+{% endif %} // cross_mha
+
+{% if use_multi_cta %} // use_multi_cta
+
+// If that assert gets triggered - increase the value of MAX_STGS_PER_LOOP in "setup.py".
+static_assert(Kernel_traits::Gmem_tile_o::STGS_PER_LOOP <= {{ MAX_STGS_PER_LOOP }}, "");
+
+extern "C"
+__global__
+void {{ kernel_name }}({{ params_type }} params){
+  fused_multihead_attention::device_{{ kernel_variant }}_multi_cta<Kernel_traits>(params);
+}
+
+extern "C"
+__global__
+void {{ causal_kernel_name }}({{ params_type }} params){
+  fused_multihead_attention::device_{{ kernel_variant }}_multi_cta<Kernel_traits_causal>(params);
+}
+
+void {{ launcher_name }}(
+    const {{ params_type }} &params,
+    const Launch_params &launch_params,
+    cudaStream_t stream){
+
+  assert(params.heads_per_wave != 0 && "Heads per wave is not set, but multi cta is requested");
+
+  // Clear the barriers and locks.
+  cudaMemsetAsync(params.counters, 0, 3*params.heads_per_wave*sizeof(int), stream);
+
+  // We may use more than 48kB of shared memory.
+  if( launch_params.attention_mask_type == Attention_mask_type::CAUSAL ) {
+    constexpr int smem_size = Kernel_traits_causal::BYTES_PER_SMEM;
+    if( smem_size >= 48*1024 ) {
+      FMHA_CHECK_CUDA(cudaFuncSetAttribute({{ causal_kernel_name }},
+                                          cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                          smem_size));
+    }
+    // Launch one wave.
+    dim3 grid(Kernel_traits_causal::CTAS_PER_HEAD, params.heads_per_wave), block(Kernel_traits_causal::THREADS);
+    void *params_ = (void*) &params;
+    FMHA_CHECK_CUDA(cudaLaunchCooperativeKernel((void*) &{{ causal_kernel_name }}, grid, block, (void**) &params_, smem_size, stream));
+  } else {
+    constexpr size_t smem_size = Kernel_traits::BYTES_PER_SMEM;
+    if( smem_size >= 48*1024 ) {
+      FMHA_CHECK_CUDA(cudaFuncSetAttribute({{ kernel_name }},
+                                          cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                          smem_size));
+    }
+    // Launch one wave.
+    dim3 grid(Kernel_traits::CTAS_PER_HEAD, params.heads_per_wave), block(Kernel_traits::THREADS);
+    void *params_ = (void*) &params;
+    FMHA_CHECK_CUDA(cudaLaunchCooperativeKernel((void*) &{{ kernel_name }}, grid, block, (void**) &params_, smem_size, stream));
+  }
+}
+
+{% endif %} // use_multi_cta
+
+void {{ launcher_name }}_get_max_heads_per_wave(int *heads_per_wave) {
+{% if use_multi_cta %} // use_multi_cta
+    // Determine the number of SMs and CTAs.
+    int dev;
+    cudaGetDevice(&dev);
+    cudaDeviceProp props;
+    FMHA_CHECK_CUDA(cudaGetDeviceProperties(&props, dev));
+
+    // The number of CTAs per SM.
+    constexpr size_t smem_size = Kernel_traits::BYTES_PER_SMEM;
+    int ctas_per_sm;
+    FMHA_CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&ctas_per_sm,
+                                                            &{{ kernel_name }},
+                                                            Kernel_traits::THREADS,
+                                                            smem_size));
+
+    // The number of heads per wave.
+    *heads_per_wave = props.multiProcessorCount * ctas_per_sm / Kernel_traits::CTAS_PER_HEAD;
+{% else %} // use_multi_cta
+    *heads_per_wave = 0;
+{% endif %} // use_multi_cta
+}
+
+#else // CUDA_VERSION >= {{ min_cuda_version }}
+
+void {{ launcher_name }}(
+    const {{ params_type }} &params,
+    const Launch_params &launch_params,
+    cudaStream_t stream){
+    assert(false && "Unsupported CUDA version");
+}
+
+{% if has_noloop %} // has_noloop
+
+void {{ launcher_name }}_nl(
+    const {{ params_type }} &params,
+    const Launch_params &launch_params,
+    cudaStream_t stream){
+    assert(false && "Unsupported CUDA version");
+}
+
+{% endif %} // has_noloop
+
+#endif // CUDA_VERSION >= {{ min_cuda_version }}
