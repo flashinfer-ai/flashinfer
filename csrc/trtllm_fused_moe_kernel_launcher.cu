@@ -432,6 +432,7 @@ void FusedMoeLauncher::init_common(
       << "the value of weight_layout is not recognized";
   this->weight_layout = static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout);
   this->activation_type = activation_type;
+  this->intermediate_size_factor = isGatedActivation(activation_type) ? 2 : 1;
 }
 
 class Bf16MoeLauncher : public FusedMoeLauncher {
