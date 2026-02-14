@@ -10,6 +10,7 @@ from flashinfer import (
     mxfp8_quantize,
 )
 from flashinfer.fused_moe import (
+    Fp8QuantizationType,
     trtllm_fp4_block_scale_moe,
     trtllm_mxint4_block_scale_moe,
     trtllm_fp8_per_tensor_scale_moe,
@@ -53,7 +54,7 @@ def mxint4_quantize(
 
 def bench_trtllm_gen_fused_moe_autotuner_fp8(
     tune_max_num_tokens: Optional[int],
-    quant_mode: Literal["Fp8-Per-Tensor", "Fp8-Block"],
+    quant_mode: Literal["Fp8-Per-Tensor", "Fp8-Block", "MxFP8xMxFP8"],
     num_tokens: int,
     num_experts: int,
     hidden_size: int,
@@ -79,29 +80,54 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
         torch.bfloat16
     )
 
-    is_block_scale = quant_mode == "Fp8-Block"
-    if not is_block_scale:
+    is_block_scale = quant_mode != "Fp8-Per-Tensor"
+    if quant_mode == "Fp8-Per-Tensor":
         hidden_states, hidden_states_scale = fp8_quantize(hidden_states)
         w13, w13_scale = fp8_quantize(w13)
         w2, w2_scale = fp8_quantize(w2)
     else:
-        # block scale quantization is too slow, so we use per-tensor quantization for now
-        hidden_states, hidden_states_scale = fp8_quantize(hidden_states)
-        w13, w13_scale = fp8_quantize(w13)
-        w2, w2_scale = fp8_quantize(w2)
-        hidden_states_scale = torch.full(
-            (hidden_size // 128, num_tokens), hidden_states_scale.item(), device=device
-        )
-        w13_scale = torch.full(
-            (num_experts, intermediate_size * 2 // 128, hidden_size // 128),
-            w13_scale.item(),
-            device=device,
-        )
-        w2_scale = torch.full(
-            (num_experts, hidden_size // 128, intermediate_size // 128),
-            w2_scale.item(),
-            device=device,
-        )
+        scale_vec_size = 128 if quant_mode == "Fp8-Block" else 32
+        if quant_mode == "Fp8-Block":
+            # block scale quantization is too slow, so we use per-tensor quantization for now
+            hidden_states, hidden_states_scale = fp8_quantize(
+                hidden_states
+            )  # scalar quantization
+            w13, w13_scale = fp8_quantize(w13)  # scalar quantization
+            w2, w2_scale = fp8_quantize(w2)  # scalar quantization
+            hidden_states_scale = torch.full(
+                (hidden_size // scale_vec_size, num_tokens),
+                hidden_states_scale.item(),
+                device=device,
+            )
+            w13_scale = torch.full(
+                (
+                    num_experts,
+                    intermediate_size * 2 // scale_vec_size,
+                    hidden_size // scale_vec_size,
+                ),
+                w13_scale.item(),
+                device=device,
+            )
+            w2_scale = torch.full(
+                (
+                    num_experts,
+                    hidden_size // scale_vec_size,
+                    intermediate_size // scale_vec_size,
+                ),
+                w2_scale.item(),
+                device=device,
+            )
+        else:  # MxFP8xMxFP8
+            hidden_states, hidden_states_scale = mxfp8_quantize(hidden_states, False)
+            w13, w13_scale = mxfp8_quantize(w13, True)
+            w2, w2_scale = mxfp8_quantize(w2, True)
+            hidden_states_scale = hidden_states_scale.view(torch.uint8).reshape(
+                num_tokens, -1
+            )
+            w13_scale = w13_scale.view(torch.uint8).reshape(
+                num_experts, intermediate_size * 2, -1
+            )
+            w2_scale = w2_scale.view(torch.uint8).reshape(num_experts, hidden_size, -1)
 
     output1_scale_scalar = (
         torch.tensor([hidden_states_scale * w13_scale] * num_experts, device=device)
@@ -136,12 +162,15 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
             local_num_experts=num_experts,
             routed_scaling_factor=2.5,
             routing_method_type=RoutingMethodType.DeepSeekV3.value,
-            use_shuffled_weight=False,
-            weight_layout=WeightLayout.MajorK.value,  # weight_layout
+            use_shuffled_weight=quant_mode == "MxFP8xMxFP8",
+            weight_layout=WeightLayout.MajorK.value,
             enable_pdl=enable_pdl,
             tune_max_num_tokens=num_tokens
             if tune_max_num_tokens is None
             else tune_max_num_tokens,
+            fp8_quantization_type=Fp8QuantizationType.DeepSeekFp8
+            if quant_mode == "Fp8-Block"
+            else Fp8QuantizationType.MxFp8,
         )
     else:
         fn = partial(
@@ -468,6 +497,7 @@ if __name__ == "__main__":
             "MxFP4xMxFP8",
             "MxFP4xBf16",
             "MxInt4xBf16",
+            "MxFP8xMxFP8",
             "Fp8-Per-Tensor",
             "Fp8-Block",
         ],
@@ -505,7 +535,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     fn = (
         bench_trtllm_gen_fused_moe_autotuner_fp8
-        if args.quant_mode in ["Fp8-Per-Tensor", "Fp8-Block"]
+        if args.quant_mode in ["Fp8-Per-Tensor", "Fp8-Block", "MxFP8xMxFP8"]
         else bench_trtllm_gen_fused_moe_autotuner_mxint4
         if args.quant_mode == "MxInt4xBf16"
         else bench_trtllm_gen_fused_moe_autotuner_fp4

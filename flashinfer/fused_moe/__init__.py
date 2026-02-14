@@ -16,6 +16,7 @@ limitations under the License.
 
 from .core import (
     ActivationType,
+    Fp8QuantizationType,
     RoutingMethodType,
     WeightLayout,
     convert_to_block_layout,
@@ -52,6 +53,7 @@ except ImportError:
 
 __all__ = [
     "ActivationType",
+    "Fp8QuantizationType",
     "RoutingMethodType",
     "WeightLayout",
     "convert_to_block_layout",
