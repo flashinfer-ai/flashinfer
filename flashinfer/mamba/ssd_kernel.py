@@ -60,10 +60,12 @@ class SSDKernel:
         has_init_states: bool,
         has_varlen: bool = False,
         has_z: bool = False,
+        seq_idx_dtype: Type[cutlass.Numeric] = cutlass.Int32,
     ):
         self.io_dtype: Type[cutlass.Numeric] = io_dtype
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.cumsum_delta_dtype: Type[cutlass.Numeric] = cumsum_delta_dtype
+        self.seq_idx_dtype: Type[cutlass.Numeric] = seq_idx_dtype
         # has_d means epilog warp performs Y += X*D fusion
         self.has_d: bool = has_d
         self.has_init_states: bool = has_init_states
@@ -1547,12 +1549,12 @@ class SSDKernel:
                 # --- Varlen look-ahead: store fstate / reload init_state ---
                 if cutlass.const_expr(self.has_init_states and self.has_varlen):
                     is_last_chunk = chunk_idx == C - 1
-                    seq_id = seq_idx[0, chunk * L + chunk_offset]
+                    seq_id = cutlass.Int32(seq_idx[0, chunk * L + chunk_offset])
                     seq_ends_here = is_last_chunk
                     if not is_last_chunk:
                         next_chunk = chunk_indices[physical_chunk + 1]
                         chunk_offset_next = chunk_offsets[physical_chunk + 1]
-                        next_seq = seq_idx[0, next_chunk * L + chunk_offset_next]
+                        next_seq = cutlass.Int32(seq_idx[0, next_chunk * L + chunk_offset_next])
                         seq_ends_here = next_seq != seq_id
 
                     # A. Store final state of ending sequence to gmem
@@ -2802,7 +2804,7 @@ class SSDKernel:
 
                 # Load init_states on sequence transitions
                 if cutlass.const_expr(self.has_init_states and self.has_varlen):
-                    seq_id = seq_idx[0, chunk * L + chunk_offset]
+                    seq_id = cutlass.Int32(seq_idx[0, chunk * L + chunk_offset])
                     if seq_id != prev_seq_id:
                         tIstategIstate = tIstategIstate_pre_slice[
                             None, 0, 0, eh_idx, seq_id

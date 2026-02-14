@@ -104,6 +104,7 @@ class _SSDKernel:
         has_init_states: bool = False,
         has_varlen: bool = False,
         has_z: bool = False,
+        seq_idx_dtype=None,
         io_dtype=None,
         cumsum_dtype=None,
         acc_dtype=None,
@@ -119,6 +120,7 @@ class _SSDKernel:
             d_has_hdim: If True, D is (headdim, nheads), else (1, nheads)
             has_init_states: Whether initial states are provided
             has_z: Whether to apply z gating (y *= z * sigmoid(z))
+            seq_idx_dtype: Element type of seq_idx tensor (default: cutlass.Int32)
             io_dtype: Input/output dtype (default: cutlass.BFloat16)
             cumsum_dtype: Cumsum intermediate dtype (default: cutlass.Float32)
             acc_dtype: Accumulator dtype (default: cutlass.Float32)
@@ -136,6 +138,7 @@ class _SSDKernel:
         self.io_dtype = io_dtype or cutlass.BFloat16
         self.cumsum_dtype = cumsum_dtype or cutlass.Float32
         self.acc_dtype = acc_dtype or cutlass.Float32
+        seq_idx_cutlass_dtype = cutlass.Int64 if seq_idx_dtype == "int64" else cutlass.Int32
 
         # Create the kernel
         SSDKernel = self.modules["SSDKernel"]
@@ -151,6 +154,7 @@ class _SSDKernel:
             has_init_states,
             has_varlen,
             has_z,
+            seq_idx_cutlass_dtype,
         )
 
         self._compiled_kernel = None
@@ -371,11 +375,17 @@ class _SSDKernel:
             chunk_offsets_tensor = from_dlpack(chunk_offsets, assumed_align=4)
 
         # Compute per-sequence logical chunk ranges for varlen parallelization
-        if seq_idx is not None and chunk_indices is not None and chunk_offsets is not None:
+        if (
+            seq_idx is not None
+            and chunk_indices is not None
+            and chunk_offsets is not None
+        ):
             # num_seqs from init_states batch dim (already on host, no sync)
             num_seqs = init_states.shape[0] if init_states is not None else 1
             # seq_id for each logical chunk (device ops, no host sync)
-            seq_ids = seq_idx[0, chunk_indices.long() * chunk_size + chunk_offsets.long()]
+            seq_ids = seq_idx[
+                0, chunk_indices.long() * chunk_size + chunk_offsets.long()
+            ]
             counts = torch.bincount(seq_ids, minlength=num_seqs)
             seq_chunk_cumsum = torch.zeros(
                 num_seqs + 1, dtype=torch.int32, device=seq_idx.device
@@ -465,6 +475,7 @@ def _get_ssd_kernel(
     has_init_states: bool = False,
     has_varlen: bool = False,
     has_z: bool = False,
+    seq_idx_dtype=None,
 ) -> _SSDKernel:
     """Get cached SSD kernel."""
     return _SSDKernel(
@@ -476,6 +487,7 @@ def _get_ssd_kernel(
         has_init_states=has_init_states,
         has_varlen=has_varlen,
         has_z=has_z,
+        seq_idx_dtype=seq_idx_dtype,
     )
 
 
@@ -598,6 +610,9 @@ def ssd_combined_fwd(
         assert seq_idx.shape == (batch, seqlen), (
             f"seq_idx shape {seq_idx.shape} doesn't match (batch={batch}, seqlen={seqlen})"
         )
+        assert seq_idx.dtype in (torch.int32, torch.int64), (
+            f"seq_idx must be int32 or int64, got {seq_idx.dtype}"
+        )
     if chunk_indices is not None:
         assert chunk_indices.dim() == 1, (
             f"chunk_indices must be 1D, got {chunk_indices.dim()}D"
@@ -652,6 +667,9 @@ def ssd_combined_fwd(
 
     has_varlen = seq_idx is not None
     has_z = z is not None
+    # Map torch seq_idx dtype to cutlass type for kernel compilation
+    _seq_idx_dtype_map = {torch.int32: "int32", torch.int64: "int64"}
+    seq_idx_dtype_key = _seq_idx_dtype_map.get(seq_idx.dtype) if seq_idx is not None else None
     torch.cuda.nvtx.range_push("get_ssd_kernel")
     kernel = _get_ssd_kernel(
         chunk_size=chunk_size,
@@ -662,6 +680,7 @@ def ssd_combined_fwd(
         has_init_states=has_init_state,
         has_varlen=has_varlen,
         has_z=has_z,
+        seq_idx_dtype=seq_idx_dtype_key,
     )
     torch.cuda.nvtx.range_pop()
 

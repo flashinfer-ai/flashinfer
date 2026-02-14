@@ -1485,3 +1485,44 @@ class TestVarlenEndToEnd:
     def test_non_chunk_aligned(self):
         """Non-chunk-aligned sequences: [80, 176]."""
         self._run_and_check([80, 176], "e2e non-aligned")
+
+
+def test_seq_idx_int64():
+    """Test that seq_idx as int64 works (Python-side cast to int32)."""
+    nheads, headdim, dstate, chunk_size, ngroups = 8, 64, 128, 128, 8
+    seq_lengths = [1 * chunk_size, 2 * chunk_size, 1 * chunk_size]
+    inputs = TestChunkScanCombinedVarlen._make_inputs(
+        nheads, headdim, dstate, chunk_size, ngroups, seq_lengths
+    )
+    ref = TestChunkScanCombinedVarlen._compute_per_sequence_reference(inputs)
+    out_ref, final_states_ref = ref
+
+    # Cast seq_idx to int64 before calling the kernel
+    seq_idx_int64 = inputs["seq_idx"].to(torch.int64)
+    assert seq_idx_int64.dtype == torch.int64
+
+    out_test, final_states_test = ssd_combined_fwd(
+        inputs["x"],
+        inputs["dt"],
+        inputs["A"],
+        inputs["B"],
+        inputs["C"],
+        inputs["chunk_size"],
+        D=inputs["D"],
+        dt_bias=inputs["dt_bias"],
+        dt_softplus=True,
+        initial_states=inputs["initial_states"],
+        seq_idx=seq_idx_int64,
+        chunk_indices=inputs["chunk_indices"],
+        chunk_offsets=inputs["chunk_offsets"],
+    )
+
+    ATOL, RTOL = 7e-2, 7e-2
+    out_ref_cmp = out_ref.to(out_test.dtype)
+    assert torch.allclose(out_ref_cmp, out_test, atol=ATOL, rtol=RTOL), (
+        "Output mismatch with int64 seq_idx"
+    )
+    fs_ref_cmp = final_states_ref.to(final_states_test.dtype)
+    assert torch.allclose(fs_ref_cmp, final_states_test, atol=ATOL, rtol=RTOL), (
+        "Final states mismatch with int64 seq_idx"
+    )
