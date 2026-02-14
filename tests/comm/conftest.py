@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import pytest
 import torch.distributed as dist
 
 
@@ -73,3 +74,24 @@ def _check_pidfd_permissions() -> bool:
 def mnnvl_available() -> bool:
     """Check if MNNVL is fully available (hardware + container permissions)."""
     return MnnvlMemory.supports_mnnvl() and _check_pidfd_permissions()
+
+
+def pytest_addoption(parser):
+    parser.addoption("--num_nodes", type=int, default=1)
+    parser.addoption("--node_id", type=int, default=0)
+    parser.addoption("--dist_init_method", type=str, default="tcp://localhost:29501")
+
+
+@pytest.fixture
+def num_nodes(request):
+    return request.config.getoption("--num_nodes")
+
+
+@pytest.fixture
+def node_id(request):
+    return request.config.getoption("--node_id")
+
+
+@pytest.fixture
+def dist_init_method(request):
+    return request.config.getoption("--dist_init_method")

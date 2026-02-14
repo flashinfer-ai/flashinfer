@@ -56,6 +56,28 @@ def gen_nvshmem_module() -> JitSpec:
     )
 
 
+def gen_mixed_comm_module() -> JitSpec:
+    nvcc_flags = ["-rdc=true"]
+    lib_dirs = jit_env.get_nvshmem_lib_dirs()
+    ldflags = (
+        [f"-L{lib_dir}" for lib_dir in lib_dirs]
+        + ["-lnvshmem_device"]
+        + shlex.split(os.environ.get("NVSHMEM_LDFLAGS", ""))
+    )
+
+    return gen_jit_spec(
+        "mixed_comm",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "nvshmem_binding.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "mixed_comm.cu",
+        ],
+        extra_include_paths=[str(p) for p in jit_env.get_nvshmem_include_dirs()],
+        extra_cuda_cflags=nvcc_flags,
+        extra_ldflags=ldflags,
+        needs_device_linking=True,
+    )
+
+
 def gen_trtllm_comm_module() -> JitSpec:
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
         supported_major_versions=[9, 10]
