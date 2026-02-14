@@ -1,5 +1,5 @@
 import itertools
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 from ... import env as jit_env
 from dataclasses import dataclass, asdict
 from .utils import (
@@ -146,7 +146,7 @@ def generate_kernel_spec(
     """
     # Initialize spec with required fields (no class defaults)
     # and user-provided optional fields
-    spec = {
+    spec: dict[str, Any] = {
         # Required fields
         "sm": sm,
         "dtype": dtype,
