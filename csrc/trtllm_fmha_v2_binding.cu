@@ -36,6 +36,7 @@ using Attention_mask_type = fmha::Attention_mask_type;
 using Attention_input_layout = fmha::Attention_input_layout;
 using Kv_block_array = fmha::Kv_block_array;
 
+// DeepSeek MLA kernels (192/128 separate-q-k-v)
 extern void run_fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_output_bf16_sm120_nl_tiled(
     const bert::Fused_multihead_attention_params_v2& params,
     const bert::Fused_multihead_attention_launch_params& launch_params, cudaStream_t stream);
@@ -45,6 +46,25 @@ extern void run_fmha_v2_flash_attention_bf16_64_128_S_q_k_v_192x128_sm120_nl_til
     const bert::Fused_multihead_attention_launch_params& launch_params, cudaStream_t stream);
 
 extern void run_fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_sm120_nl_tiled(
+    const bert::Fused_multihead_attention_params_v2& params,
+    const bert::Fused_multihead_attention_launch_params& launch_params, cudaStream_t stream);
+
+// Standard attention kernels with SEPARATE_Q_K_V layout (head_dim=64, 128)
+// BF16 (FP32 accumulator)
+extern void run_fmha_v2_flash_attention_bf16_64_128_S_q_k_v_128_sm120_nl_tiled(
+    const bert::Fused_multihead_attention_params_v2& params,
+    const bert::Fused_multihead_attention_launch_params& launch_params, cudaStream_t stream);
+
+extern void run_fmha_v2_flash_attention_bf16_128_128_S_q_k_v_64_sm120_nl_tiled(
+    const bert::Fused_multihead_attention_params_v2& params,
+    const bert::Fused_multihead_attention_launch_params& launch_params, cudaStream_t stream);
+
+// FP16 with FP32 accumulator
+extern void run_fmha_v2_flash_attention_fp16_fp32_64_128_S_q_k_v_128_sm120_nl_tiled(
+    const bert::Fused_multihead_attention_params_v2& params,
+    const bert::Fused_multihead_attention_launch_params& launch_params, cudaStream_t stream);
+
+extern void run_fmha_v2_flash_attention_fp16_fp32_128_128_S_q_k_v_64_sm120_nl_tiled(
     const bert::Fused_multihead_attention_params_v2& params,
     const bert::Fused_multihead_attention_launch_params& launch_params, cudaStream_t stream);
 
@@ -426,5 +446,178 @@ void TRTLLMFMHAv2Run(TensorView q, TensorView k, TensorView v, TensorView o,
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, flashinfer::TRTLLMFMHAv2Run);
+
+/**
+ * @brief TVM FFI binding for standard attention on SM120
+ *
+ * This function dispatches to HMMA-based fmha_v2 kernels for standard
+ * (non-MLA) attention on SM120 GPUs (RTX 5090, DGX Spark GB10).
+ * Supports BF16 and FP16 with head_dim 64 or 128.
+ *
+ * @param q Query tensor [batch, q_seqlen, num_heads, head_dim]
+ * @param k Key tensor [batch, kv_seqlen, num_kv_heads, head_dim]
+ * @param v Value tensor [batch, kv_seqlen, num_kv_heads, head_dim]
+ * @param o Output tensor [batch, q_seqlen, num_heads, head_dim]
+ * @param maybe_lse Optional log-sum-exp tensor for softmax statistics
+ * @param causal Whether to use causal masking
+ * @param sm_scale Softmax scale (typically 1/sqrt(head_dim))
+ */
+void TRTLLMFMHAv2StandardRun(TensorView q, TensorView k, TensorView v, TensorView o,
+                             Optional<TensorView> maybe_lse, bool causal, double sm_scale) {
+  const int batch_size = q.shape()[0];
+  const int q_seqlen = q.shape()[1];
+  const int kv_seqlen = k.shape()[1];
+  const int num_heads = q.shape()[2];
+  const int num_kv_heads = k.shape()[2];
+  const int head_dim = q.shape()[3];
+
+  // Determine data type from tensor dtype
+  auto q_dtype = q.dtype();
+  Data_type data_type;
+  if (q_dtype.code == kDLBfloat && q_dtype.bits == 16) {
+    data_type = DATA_TYPE_BF16;
+  } else if (q_dtype.code == kDLFloat && q_dtype.bits == 16) {
+    data_type = DATA_TYPE_FP16;
+  } else {
+    throw std::runtime_error("Unsupported dtype for standard attention. Expected BF16 or FP16.");
+  }
+  Data_type acc_type = DATA_TYPE_FP32;
+  Data_type output_dtype = data_type;  // output matches input dtype
+  Attention_mask_type attention_mask_type =
+      causal ? Attention_mask_type::CAUSAL : Attention_mask_type::PADDING;
+  Attention_input_layout input_layout = Attention_input_layout::SEPARATE_Q_K_V;
+
+  CudaDevice device;
+  int sm = device.sm;
+  cudaDeviceProp props = device.props;
+
+  cudaStream_t stream = static_cast<cudaStream_t>(get_stream(q.device()));
+
+  Launch_params launch_params;
+  determine_launch_params(launch_params, data_type, sm, q_seqlen, head_dim, attention_mask_type,
+                          input_layout,
+                          false,  // interleaved
+                          false,  // ignore_b1opt
+                          false,  // force_unroll
+                          false,  // use_tma
+                          false,  // force_non_flash_attention
+                          true,   // force_non_warp_specialization (SM120)
+                          false,  // force_non_granular_tiling
+                          true,   // force_fp32_acc
+                          props);
+
+  launch_params.total_q_seqlen = q_seqlen;
+  launch_params.total_kv_seqlen = kv_seqlen;
+
+  // Validate head_dim before any CUDA allocations to avoid leaks on bad input
+  if (data_type == DATA_TYPE_BF16 || data_type == DATA_TYPE_FP16) {
+    if (head_dim != 64 && head_dim != 128) {
+      throw std::runtime_error(
+          "Unsupported head_dim for standard attention on SM120. Supported: 64, 128.");
+    }
+  }
+
+  void* scale_bmm2_d;
+  FMHA_CHECK_CUDA(cudaMalloc(&scale_bmm2_d, sizeof(uint32_t)));
+
+  std::vector<uint32_t> cu_q_seqlens(batch_size + 1);
+  std::vector<uint32_t> cu_kv_seqlens(batch_size + 1);
+  for (int i = 0; i <= batch_size; i++) {
+    cu_q_seqlens[i] = i * q_seqlen;
+    cu_kv_seqlens[i] = i * kv_seqlen;
+  }
+  void* cu_q_seqlens_d;
+  void* cu_kv_seqlens_d;
+  FMHA_CHECK_CUDA(cudaMalloc(&cu_q_seqlens_d, sizeof(uint32_t) * cu_q_seqlens.size()));
+  FMHA_CHECK_CUDA(cudaMemcpy(cu_q_seqlens_d, cu_q_seqlens.data(),
+                             sizeof(uint32_t) * cu_q_seqlens.size(), cudaMemcpyHostToDevice));
+  FMHA_CHECK_CUDA(cudaMalloc(&cu_kv_seqlens_d, sizeof(uint32_t) * cu_kv_seqlens.size()));
+  FMHA_CHECK_CUDA(cudaMemcpy(cu_kv_seqlens_d, cu_kv_seqlens.data(),
+                             sizeof(uint32_t) * cu_kv_seqlens.size(), cudaMemcpyHostToDevice));
+
+  if (maybe_lse.has_value()) {
+    FMHA_CHECK_CUDA(cudaMemset(maybe_lse.value().data_ptr(), 0,
+                               sizeof(float) * batch_size * q_seqlen * num_heads * 2));
+  }
+
+  float scale_bmm1 = static_cast<float>(sm_scale);
+  float scale_softmax = 1.0f;
+  float scale_bmm2 = 1.0f;
+
+  bert::Fused_multihead_attention_params_v2 params;
+
+  set_params(params, launch_params, data_type, acc_type, output_dtype, input_layout,
+             batch_size,           // b
+             q_seqlen,             // s_q
+             kv_seqlen,            // s_kv
+             num_heads,            // h
+             num_kv_heads,         // h_kv
+             head_dim,             // d
+             head_dim,             // dv (same as d for standard attention)
+             cu_q_seqlens.back(),  // total tokens
+             1,                    // num_grouped_heads
+             INT_MAX,              // sliding_window_size (disabled)
+             0,                    // chunked_attention_size (disabled)
+             64,                   // tokens_per_block (not used with SEPARATE_Q_K_V)
+             nullptr,              // qkv_packed_d (not used)
+             q.data_ptr(),         // q_d
+             k.data_ptr(),         // k_d
+             v.data_ptr(),         // v_d
+             nullptr,              // kv_d (not used)
+             nullptr,              // paged_kv_pool_ptr (not used)
+             nullptr,              // paged_block_offsets (not used)
+             nullptr,              // packed_mask_d
+             nullptr,              // cu_mask_rows_d
+             nullptr,              // attention_sinks_d
+             cu_kv_seqlens_d,      // cu_kv_seqlens_d
+             cu_q_seqlens_d,       // cu_q_seqlens_d
+             o.data_ptr(),         // o_packed_d
+             nullptr,              // p_d
+             nullptr,              // s_d
+             maybe_lse.has_value() ? maybe_lse.value().data_ptr() : nullptr, scale_bmm2_d,
+             scale_bmm1,     // scale_bmm1
+             scale_softmax,  // scale_softmax
+             scale_bmm2,     // scale_bmm2
+             0.0f,           // softcapping_scale_bmm1 (disabled)
+             false,          // use_int8_scale_max
+             false,          // interleaved
+             false,          // is_s_padded
+             false);         // has_alibi
+
+  if (data_type == DATA_TYPE_BF16) {
+    if (head_dim == 128) {
+      run_fmha_v2_flash_attention_bf16_64_128_S_q_k_v_128_sm120_nl_tiled(params, launch_params,
+                                                                         stream);
+    } else if (head_dim == 64) {
+      run_fmha_v2_flash_attention_bf16_128_128_S_q_k_v_64_sm120_nl_tiled(params, launch_params,
+                                                                         stream);
+    } else {
+      throw std::runtime_error(
+          "Unsupported head_dim for BF16 standard attention on SM120. "
+          "Supported: 64, 128.");
+    }
+  } else if (data_type == DATA_TYPE_FP16) {
+    // FP16 data uses FP32 accumulator kernels (fp16_fp32) for better accuracy
+    if (head_dim == 128) {
+      run_fmha_v2_flash_attention_fp16_fp32_64_128_S_q_k_v_128_sm120_nl_tiled(params, launch_params,
+                                                                              stream);
+    } else if (head_dim == 64) {
+      run_fmha_v2_flash_attention_fp16_fp32_128_128_S_q_k_v_64_sm120_nl_tiled(params, launch_params,
+                                                                              stream);
+    } else {
+      throw std::runtime_error(
+          "Unsupported head_dim for FP16 standard attention on SM120. "
+          "Supported: 64, 128.");
+    }
+  } else {
+    throw std::runtime_error("Unsupported data type for standard attention on SM120.");
+  }
+
+  FMHA_CHECK_CUDA(cudaFree(scale_bmm2_d));
+  FMHA_CHECK_CUDA(cudaFree(cu_q_seqlens_d));
+  FMHA_CHECK_CUDA(cudaFree(cu_kv_seqlens_d));
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_standard, flashinfer::TRTLLMFMHAv2StandardRun);
 
 }  // namespace flashinfer

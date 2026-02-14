@@ -1750,8 +1750,9 @@ def gen_fmha_cutlass_sm100a_module(
         jit_env.FLASHINFER_CSRC_DIR / "blackwell_fmha_plan.cu",
     ]
 
+    # SM12x cannot use CUTLASS FMHA SM100 (requires tcgen05 instructions)
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10, 11, 12]
+        supported_major_versions=[10, 11]
     )
     return gen_jit_spec(
         uri,
@@ -1915,9 +1916,15 @@ def gen_trtllm_fmha_v2_module() -> JitSpec:
     enumerate_kernels(fmha_v2_src_dir, cached_ops)
 
     kernels = [
+        # DeepSeek MLA kernels (192/128 separate-q-k-v)
         "fmha_v2_flash_attention_bf16_64_128_S_q_k_v_192x128_sm120.cu",
         "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_output_bf16_sm120.cu",
         "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_sm120.cu",
+        # Standard attention kernels (head_dim=64, 128)
+        "fmha_v2_flash_attention_bf16_64_128_S_q_k_v_128_sm120.cu",
+        "fmha_v2_flash_attention_bf16_128_128_S_q_k_v_64_sm120.cu",
+        "fmha_v2_flash_attention_fp16_fp32_64_128_S_q_k_v_128_sm120.cu",
+        "fmha_v2_flash_attention_fp16_fp32_128_128_S_q_k_v_64_sm120.cu",
     ]
 
     kernel_paths = [
