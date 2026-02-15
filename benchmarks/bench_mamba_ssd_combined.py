@@ -158,25 +158,35 @@ def bench_configs(
     chunk_size,
     dtype,
     enable_cupti,
+    use_cuda_graph,
     warmup_iters,
     repeat_iters,
+    title=None,
 ):
     """Benchmark a list of configs.
 
     Each config is a dict with keys for make_inputs / make_varlen_inputs.
-    Required: 'batch', 'seqlen' (or 'num_seqs' + 'chunks_per_seq' for varlen).
+    Required: 'batch', 'nchunks' (or 'num_seqs' + 'chunks_per_seq' for varlen).
     """
+    if title:
+        print()
+        print("=" * 100)
+        print(title)
+        print("=" * 100)
     print()
     print(
         f"  chunk_size={chunk_size}, nheads={nheads}, headdim={headdim}, "
         f"dstate={dstate}, ngroups={ngroups}"
     )
+    # Detect if all configs are varlen or batched for header
+    is_varlen = any("num_seqs" in c for c in configs)
+    col0 = "num_seqs" if is_varlen else "batch"
     print()
     print(
-        f"  {'batch':<8} {'nchunks':<10} {'seqlen':<10} "
+        f"  {col0:<10} {'nchunks':<10} {'seqlen':<10} "
         f"{'FlashInfer (ms)':<18} {'Triton (ms)':<18} {'Speedup':<10}"
     )
-    print("  " + "-" * 74)
+    print("  " + "-" * 76)
 
     for cfg in configs:
         is_varlen = "num_seqs" in cfg
@@ -192,7 +202,7 @@ def bench_configs(
                 chunk_size,
                 dtype,
             )
-            batch = 1
+            batch = cfg["num_seqs"]
             seqlen = inp["total_seqlen"]
             nchunks = seqlen // chunk_size
             fi_kwargs = dict(
@@ -234,28 +244,43 @@ def bench_configs(
                 D=D, dt_bias=dt_bias, dt_softplus=True,
             )
 
-        # FlashInfer — bench_kineto measures only GPU kernel time
-        fi_kernel_time = bench_kineto(
-            lambda: ssd_combined_fwd(**fi_kwargs),
-            "SSDKernel",
-            num_tests=repeat_iters or 30,
-            suppress_kineto_output=True,
-        )
+        # FlashInfer timing
+        # Note: CUDA graphs can't capture ssd_combined_fwd because it does
+        # host-side tensor prep (bincount, cumsum, etc.) inside the call.
+        # Use CUDA events for FlashInfer when --cuda-graph is requested.
+        if use_cuda_graph or enable_cupti:
+            fi_times = bench_gpu_time(
+                lambda: ssd_combined_fwd(**fi_kwargs),
+                enable_cupti=enable_cupti,
+                use_cuda_graph=use_cuda_graph,
+                dry_run_iters=warmup_iters,
+                repeat_iters=repeat_iters,
+            )
+            fi_med = np.median(fi_times)
+        else:
+            # bench_kineto measures only GPU kernel time via torch profiler
+            fi_kernel_time = bench_kineto(
+                lambda: ssd_combined_fwd(**fi_kwargs),
+                "SSDKernel",
+                num_tests=repeat_iters or 30,
+                suppress_kineto_output=True,
+            )
+            fi_med = fi_kernel_time * 1e3  # bench_kineto returns seconds
 
         # Triton reference
         triton_times = bench_gpu_time(
             lambda: _mamba_chunk_scan_combined_fwd(**tr_kwargs),
             enable_cupti=enable_cupti,
+            use_cuda_graph=use_cuda_graph,
             dry_run_iters=warmup_iters,
             repeat_iters=repeat_iters,
         )
 
-        fi_med = fi_kernel_time * 1e3  # bench_kineto returns seconds
         tr_med = np.median(triton_times)
         speedup = tr_med / fi_med
 
         print(
-            f"  {batch:<8} {nchunks:<10} {seqlen:<10} "
+            f"  {batch:<10} {nchunks:<10} {seqlen:<10} "
             f"{fi_med:<18.4f} {tr_med:<18.4f} {speedup:<10.2f}x"
         )
 
@@ -269,6 +294,11 @@ def main():
     parser = argparse.ArgumentParser(description="Benchmark Mamba2 SSD combined kernel")
     parser.add_argument(
         "--cupti", action="store_true", help="Use CUPTI timing (most accurate)"
+    )
+    parser.add_argument(
+        "--cuda-graph",
+        action="store_true",
+        help="Use CUDA graph timing (amortizes launch overhead)",
     )
     parser.add_argument("--nheads", type=int, default=8)
     parser.add_argument("--headdim", type=int, default=64)
@@ -315,7 +345,8 @@ def main():
     print("Mamba2 SSD Combined Kernel Benchmark")
     print("=" * 100)
     print(f"  Device:     {torch.cuda.get_device_name()}")
-    print(f"  Timing:     {'CUPTI' if args.cupti else 'CUDA Events'}")
+    timing_method = "CUPTI" if args.cupti else "CUDA Graphs" if args.cuda_graph else "Kineto (FlashInfer) + CUDA Events (Triton)"
+    print(f"  Timing:     {timing_method}")
     print(f"  Dtype:      {args.dtype}")
     print(f"  Warmup:     {args.warmup or 'auto'}")
     print(f"  Reps:       {args.repetitions or 'auto'}")
@@ -440,6 +471,7 @@ def main():
             chunk_size=args.chunk_size,
             dtype=dtype,
             enable_cupti=args.cupti,
+            use_cuda_graph=args.cuda_graph,
             warmup_iters=args.warmup,
             repeat_iters=args.repetitions,
         )
@@ -449,21 +481,31 @@ def main():
         print("=" * 100)
         return
 
-    # -- Build config list --
-    all_configs = []
+    bench_kwargs = dict(
+        nheads=args.nheads,
+        headdim=args.headdim,
+        dstate=args.dstate,
+        ngroups=args.ngroups,
+        chunk_size=args.chunk_size,
+        dtype=dtype,
+        enable_cupti=args.cupti,
+        use_cuda_graph=args.cuda_graph,
+        warmup_iters=args.warmup,
+        repeat_iters=args.repetitions,
+    )
 
     # Varlen: simulate serving with packed user sequences
     if not args.skip_varlen:
-        # (num_seqs, chunks_per_seq) — total tokens = num_seqs * chunks_per_seq * chunk_size
         varlen_configs = [
             (1, 1), (4, 1), (8, 1),
             (32, 1), (64, 1), (128, 1), (256, 1),
             (4, 8), (8, 8), (16, 8), (32, 8), (64, 8),
             (32, 32), (64, 32), (128, 32),
         ]
-        all_configs.extend(
-            {"num_seqs": ns, "chunks_per_seq": cps}
-            for ns, cps in varlen_configs
+        bench_configs(
+            [{"num_seqs": ns, "chunks_per_seq": cps} for ns, cps in varlen_configs],
+            title="VARLEN: serving scenario — packed user sequences (batch=1)",
+            **bench_kwargs,
         )
 
     # Batched: uniform sequence lengths
@@ -473,23 +515,11 @@ def main():
             (4, 1), (4, 4), (4, 16), (4, 64),
             (16, 1), (16, 4), (16, 16),
         ]
-        all_configs.extend(
-            {"batch": b, "nchunks": nc}
-            for b, nc in batched_configs
+        bench_configs(
+            [{"batch": b, "nchunks": nc} for b, nc in batched_configs],
+            title="BATCHED: uniform sequence lengths (no varlen metadata)",
+            **bench_kwargs,
         )
-
-    bench_configs(
-        all_configs,
-        nheads=args.nheads,
-        headdim=args.headdim,
-        dstate=args.dstate,
-        ngroups=args.ngroups,
-        chunk_size=args.chunk_size,
-        dtype=dtype,
-        enable_cupti=args.cupti,
-        warmup_iters=args.warmup,
-        repeat_iters=args.repetitions,
-    )
 
     print()
     print("=" * 100)

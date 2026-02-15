@@ -69,13 +69,12 @@ def _create_cutlass_tensor(
     Returns:
         (cute_tensor, torch_tensor): The CuTe tensor wrapper and the underlying PyTorch tensor on GPU
     """
-    # Create a dummy CPU tensor with the base layout to establish the permutation pattern
-    base_tensor = torch.empty(*shape, dtype=torch.float32)
-    permuted_tensor = base_tensor.permute(permute_order)
-
-    # Move to GPU with target dtype - this creates the specific layout CUTLASS expects
+    # Allocate directly on GPU with the target dtype and apply permutation to
+    # establish the stride pattern CUTLASS expects.
     torch_dtype = cutlass_torch.dtype(dtype)
-    dst_tensor = permuted_tensor.to(torch_dtype).cuda()
+    dst_tensor = torch.empty(*shape, dtype=torch_dtype, device="cuda").permute(
+        permute_order
+    )
 
     # Create CuTe tensor
     cute_tensor = from_dlpack(dst_tensor, assumed_align=16)
@@ -386,7 +385,8 @@ class _SSDKernel:
             seq_ids = seq_idx[
                 0, chunk_indices.long() * chunk_size + chunk_offsets.long()
             ]
-            counts = torch.bincount(seq_ids, minlength=num_seqs)
+            counts = torch.zeros(num_seqs, dtype=torch.int32, device=seq_idx.device)
+            counts.scatter_add_(0, seq_ids.int(), torch.ones_like(seq_ids, dtype=torch.int32))
             seq_chunk_cumsum = torch.zeros(
                 num_seqs + 1, dtype=torch.int32, device=seq_idx.device
             )
