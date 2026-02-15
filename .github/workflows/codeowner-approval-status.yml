@@ -1,0 +1,90 @@
+name: Code-owner Approval Status
+on:
+  pull_request_review:
+    types: [submitted]
+  pull_request:
+    types: [opened, synchronize]
+
+permissions:
+  pull-requests: read
+  statuses: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+      - run: npm install minimatch@9
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner, repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+            });
+            const reviews = await github.paginate(github.rest.pulls.listReviews, {
+              owner: context.repo.owner, repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+            });
+
+            // Parse CODEOWNERS (reuse your existing file)
+            const fs = require('fs');
+            let codeowners = [];
+            try {
+              codeowners = fs.readFileSync('.github/CODEOWNERS', 'utf8')
+                .split('\n').filter(l => l.trim() && !l.startsWith('#'))
+                .map(l => { const [pattern, ...owners] = l.split(/\s+/); return { pattern, owners }; });
+            } catch (e) {
+              // Do nothing, but let the same logic handle the error later.
+            }
+
+            const { minimatch } = require('minimatch');
+            const allOwners = new Set();
+            for (const f of files) {
+              // Each file's code owner is determined by the last matched rule
+              // This a native CODEOWNERS file behavior
+              let lastMatch = null;
+              for (const rule of codeowners) {
+                if (minimatch(f.filename, rule.pattern)) lastMatch = rule;
+              }
+              if (lastMatch) lastMatch.owners.forEach(o => allOwners.add(o.replace('@', '')));
+            }
+
+            // Note allOwners can be an empty set and is accepted by the following logic.
+            // If empty, "failure" will be issued for this check, blocking the merge.
+
+            const prAuthor = context.payload.pull_request.user.login;
+            const hasQualifiedApprover = !(allOwners.size === 0 || (allOwners.size === 1 && allOwners.has(prAuthor)));
+            
+            const latestReviews = new Map();
+            for (const r of reviews) {
+              latestReviews.set(r.user.login, r);
+            }
+            
+            const approved = hasQualifiedApprover && [...latestReviews.values()].some(r =>
+              r.state === 'APPROVED' && allOwners.has(r.user.login)
+            );
+            
+            const owners_array = Array.from(allOwners);
+            const display = hasQualifiedApprover
+              ? (owners_array.length <= 3
+                  ? owners_array.map(o => `@${o}`).join(', ')
+                  : `@${owners_array.slice(0, 3).join(', @')} +${owners_array.length - 3} more`)
+              : "❌ no qualified approver. update CODEOWNERS!";
+
+            const approver = approved
+              ? [...latestReviews.values()].find(r => r.state === 'APPROVED' && allOwners.has(r.user.login)).user.login
+              : null;
+
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner, repo: context.repo.repo,
+              sha: context.payload.pull_request.head.sha,
+              state: approved ? 'success' : 'failure',
+              context: 'codeowner-approval',
+              description: approved
+                ? `Approved by ${approver}`
+                : `❌ need approval: ${display}`,
+            });
+            
