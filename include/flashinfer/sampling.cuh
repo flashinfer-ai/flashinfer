@@ -621,7 +621,7 @@ __device__ __forceinline__ void DeviceSamplingFromProb(
   int max_valid_index =
       BlockReduce<int, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage->block_prim.reduce_int)
           .Reduce(valid_index, MaxReduceOp{});
-  if (tx == 0 && max_valid_index != -1) {
+  if (tx == 0 && max_valid_index != -1 && max_valid_index < (int)d) {
     temp_storage->last_valid_id = max_valid_index;
   }
   __syncthreads();
@@ -773,6 +773,7 @@ __global__ void SamplingFromProbKernel(DType* probs, IdType* output, IdType* ind
       reinterpret_cast<SamplingTempStorage<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>&>(
           smem_sampling);
   temp_storage.sampled_id = d;
+  temp_storage.last_valid_id = -1;
   __syncthreads();
 
   vec_t<float, VEC_SIZE> probs_vec;
@@ -798,6 +799,12 @@ __global__ void SamplingFromProbKernel(DType* probs, IdType* output, IdType* ind
     // NOTE(Zihao): this would happen when u is very close to 1
     // and the sum of probabilities is smaller than u
     // In this case, we use the last valid index as the sampled id
+    if (temp_storage.last_valid_id == -1) {
+      if (tx == 0) {
+        output[bx] = 0;
+      }
+      return;
+    }
     sampled_id = temp_storage.last_valid_id;
   }
   output[bx] = sampled_id;
@@ -838,6 +845,7 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, IdType*
   do {
     round += 1;
     temp_storage.sampled_id = d;
+    temp_storage.last_valid_id = -1;
     __syncthreads();
     float u = curand_uniform(&state) * q;
     aggregate = 0;
@@ -861,6 +869,12 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, IdType*
       // NOTE(Zihao): this would happen when u is very close to 1
       // and the sum of probabilities is smaller than u
       // In this case, we use the last valid index as the sampled id
+      if (temp_storage.last_valid_id == -1) {
+        if (tx == 0) {
+          output[bx] = 0;
+        }
+        return;
+      }
       sampled_id = temp_storage.last_valid_id;
     }
     double pivot_0 = probs[row_idx * d + sampled_id];
@@ -959,6 +973,7 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, IdType*
   int sampled_id;
   do {
     temp_storage.sampled_id = d;
+    temp_storage.last_valid_id = -1;
     __syncthreads();
     float u = curand_uniform(&state) * q;
     aggregate = 0;
@@ -982,6 +997,12 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, IdType*
       // NOTE(Zihao): this would happen when u is very close to 1
       // and the sum of probabilities is smaller than u
       // In this case, we use the last valid index as the sampled id
+      if (temp_storage.last_valid_id == -1) {
+        if (tx == 0) {
+          output[bx] = 0;
+        }
+        return;
+      }
       sampled_id = temp_storage.last_valid_id;
     }
     double pivot_0 = probs[row_idx * d + sampled_id];
