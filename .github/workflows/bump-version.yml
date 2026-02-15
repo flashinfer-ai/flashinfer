@@ -1,0 +1,243 @@
+name: Bump Version
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_bump_type:
+        description: 'Force a specific bump type (leave empty for AI auto-detection)'
+        required: false
+        type: choice
+        options:
+          - ''
+          - major
+          - minor
+          - patch
+      ai_provider:
+        description: 'AI provider to use for analysis (default: gemini)'
+        required: false
+        type: choice
+        default: 'gemini'
+        options:
+          - gemini
+          - openai
+          - anthropic
+  schedule:
+    # Run weekly on Monday at 9:00 AM UTC
+    - cron: '0 9 * * 1'
+
+jobs:
+  analyze-and-bump:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Need full history to analyze commits
+          submodules: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install google-generativeai openai anthropic
+
+      - name: Get current version
+        id: current-version
+        run: |
+          CURRENT_VERSION=$(cat version.txt | tr -d '[:space:]')
+          echo "version=${CURRENT_VERSION}" >> $GITHUB_OUTPUT
+          echo "Current version: ${CURRENT_VERSION}"
+
+      - name: Check for existing bump PR
+        id: check-existing-pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Check if there's already an open PR for version bump
+          EXISTING_PR=$(gh pr list --state open --label "version-bump" --json number --jq '.[0].number' || echo "")
+          if [ -n "$EXISTING_PR" ]; then
+            echo "has_existing_pr=true" >> $GITHUB_OUTPUT
+            echo "existing_pr_number=${EXISTING_PR}" >> $GITHUB_OUTPUT
+            echo "⚠️  Existing version bump PR found: #${EXISTING_PR}"
+          else
+            echo "has_existing_pr=false" >> $GITHUB_OUTPUT
+            echo "✓ No existing version bump PR found"
+          fi
+
+      - name: Analyze commits with AI
+        id: analyze
+        if: steps.check-existing-pr.outputs.has_existing_pr == 'false'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          # Determine which AI provider to use
+          # Priority: manual input > default (gemini)
+          if [ -n "${{ inputs.ai_provider }}" ]; then
+            AI_PROVIDER="${{ inputs.ai_provider }}"
+          else
+            AI_PROVIDER="gemini"
+          fi
+
+          echo "Using AI provider: ${AI_PROVIDER}"
+          echo "Analyzing commits to determine version bump..."
+
+          # Run AI analysis with specified provider
+          python scripts/ai_determine_version_bump.py \
+            --provider ${AI_PROVIDER} \
+            --output-format json \
+            --verbose > /tmp/analysis.json 2>&1
+
+          # Extract results
+          BUMP_TYPE=$(jq -r '.bump_type' /tmp/analysis.json)
+          NEW_VERSION=$(jq -r '.new_version' /tmp/analysis.json)
+          REASONING=$(jq -r '.reasoning' /tmp/analysis.json)
+
+          echo "bump_type=${BUMP_TYPE}" >> $GITHUB_OUTPUT
+          echo "new_version=${NEW_VERSION}" >> $GITHUB_OUTPUT
+          echo "ai_provider=${AI_PROVIDER}" >> $GITHUB_OUTPUT
+
+          # Save reasoning and key changes for PR body
+          jq -r '.reasoning' /tmp/analysis.json > /tmp/reasoning.txt
+          jq -r '.key_changes[]' /tmp/analysis.json > /tmp/key_changes.txt || echo "" > /tmp/key_changes.txt
+
+          echo "AI Analysis Result (${AI_PROVIDER}):"
+          echo "  Bump type: ${BUMP_TYPE}"
+          echo "  New version: ${NEW_VERSION}"
+          echo "  Reasoning: ${REASONING}"
+
+      - name: Override with manual input
+        id: final-decision
+        if: steps.check-existing-pr.outputs.has_existing_pr == 'false'
+        run: |
+          # Use manual input if provided, otherwise use AI result
+          if [ -n "${{ inputs.force_bump_type }}" ]; then
+            BUMP_TYPE="${{ inputs.force_bump_type }}"
+            echo "Using manual bump type: ${BUMP_TYPE}"
+
+            # Calculate new version
+            CURRENT_VERSION="${{ steps.current-version.outputs.version }}"
+            if [ "$BUMP_TYPE" = "major" ]; then
+              MAJOR=$(echo $CURRENT_VERSION | cut -d'.' -f1)
+              NEW_VERSION="$((MAJOR + 1)).0.0"
+            elif [ "$BUMP_TYPE" = "minor" ]; then
+              MAJOR=$(echo $CURRENT_VERSION | cut -d'.' -f1)
+              MINOR=$(echo $CURRENT_VERSION | cut -d'.' -f2)
+              NEW_VERSION="${MAJOR}.$((MINOR + 1)).0"
+            elif [ "$BUMP_TYPE" = "patch" ]; then
+              MAJOR=$(echo $CURRENT_VERSION | cut -d'.' -f1)
+              MINOR=$(echo $CURRENT_VERSION | cut -d'.' -f2)
+              PATCH=$(echo $CURRENT_VERSION | cut -d'.' -f3 | sed 's/[^0-9].*//')
+              NEW_VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))"
+            fi
+
+            echo "Manual override - reasoning" > /tmp/reasoning.txt
+          else
+            BUMP_TYPE="${{ steps.analyze.outputs.bump_type }}"
+            NEW_VERSION="${{ steps.analyze.outputs.new_version }}"
+            echo "Using AI-determined bump type: ${BUMP_TYPE}"
+          fi
+
+          echo "bump_type=${BUMP_TYPE}" >> $GITHUB_OUTPUT
+          echo "new_version=${NEW_VERSION}" >> $GITHUB_OUTPUT
+
+          echo "Final decision:"
+          echo "  Bump type: ${BUMP_TYPE}"
+          echo "  New version: ${NEW_VERSION}"
+
+      - name: Check if bump needed
+        id: check-bump
+        if: steps.check-existing-pr.outputs.has_existing_pr == 'false'
+        run: |
+          BUMP_TYPE="${{ steps.final-decision.outputs.bump_type }}"
+
+          if [ "$BUMP_TYPE" = "none" ]; then
+            echo "needs_bump=false" >> $GITHUB_OUTPUT
+            echo "ℹ️  No version bump needed"
+          else
+            echo "needs_bump=true" >> $GITHUB_OUTPUT
+            echo "✓ Version bump needed: ${BUMP_TYPE}"
+          fi
+
+      - name: Update version.txt
+        if: steps.check-existing-pr.outputs.has_existing_pr == 'false' && steps.check-bump.outputs.needs_bump == 'true'
+        run: |
+          NEW_VERSION="${{ steps.final-decision.outputs.new_version }}"
+          echo "${NEW_VERSION}" > version.txt
+          echo "✓ Updated version.txt to ${NEW_VERSION}"
+
+      - name: Generate PR body
+        id: pr-body
+        if: steps.check-existing-pr.outputs.has_existing_pr == 'false' && steps.check-bump.outputs.needs_bump == 'true'
+        run: |
+          python scripts/generate_bump_pr_body.py \
+            --current-version "${{ steps.current-version.outputs.version }}" \
+            --new-version "${{ steps.final-decision.outputs.new_version }}" \
+            --bump-type "${{ steps.final-decision.outputs.bump_type }}" \
+            --ai-provider "${{ steps.analyze.outputs.ai_provider }}" \
+            --reasoning-file /tmp/reasoning.txt \
+            --key-changes-file /tmp/key_changes.txt \
+            --run-id "${{ github.run_id }}" \
+            --output /tmp/pr_body.md
+
+          echo "Generated PR body:"
+          cat /tmp/pr_body.md
+
+      - name: Create Pull Request
+        if: steps.check-existing-pr.outputs.has_existing_pr == 'false' && steps.check-bump.outputs.needs_bump == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.FLASHINFER_BOT_TOKEN }}
+          commit-message: "release: bump version to ${{ steps.final-decision.outputs.new_version }}"
+          title: "Release: Bump version to v${{ steps.final-decision.outputs.new_version }}"
+          body-path: /tmp/pr_body.md
+          branch: bump-version-${{ steps.final-decision.outputs.new_version }}
+          delete-branch: true
+          labels: |
+            version-bump
+            automated
+            release
+          committer: flashinfer-bot <flashinfer-bot@users.noreply.github.com>
+          author: flashinfer-bot <flashinfer-bot@users.noreply.github.com>
+
+      - name: Summary
+        if: steps.check-existing-pr.outputs.has_existing_pr == 'false'
+        run: |
+          echo "## Version Bump Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.check-bump.outputs.needs_bump }}" = "true" ]; then
+            echo "✅ Version bump PR created" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "- **Current version**: ${{ steps.current-version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **New version**: ${{ steps.final-decision.outputs.new_version }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Bump type**: ${{ steps.final-decision.outputs.bump_type }}" >> $GITHUB_STEP_SUMMARY
+
+            # Add AI provider info if available
+            if [ -n "${{ steps.analyze.outputs.ai_provider }}" ]; then
+              echo "- **AI provider**: ${{ steps.analyze.outputs.ai_provider }}" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "ℹ️ No version bump needed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "No significant changes detected since the last release." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Already has open PR
+        if: steps.check-existing-pr.outputs.has_existing_pr == 'true'
+        run: |
+          echo "## Version Bump Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "⚠️ A version bump PR already exists: #${{ steps.check-existing-pr.outputs.existing_pr_number }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Please review and merge the existing PR before creating a new one." >> $GITHUB_STEP_SUMMARY
+
+          exit 0
