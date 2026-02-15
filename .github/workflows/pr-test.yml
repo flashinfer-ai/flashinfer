@@ -157,7 +157,7 @@ jobs:
           HEAD_SHA="${{ github.event.pull_request.head.sha }}"
           CHANGED=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
           # TODO (yongwww): Add back ^\.github/ before merging to main
-          SKIP_PATTERNS="README.md|^docs/|^docker/|^licenses/|^LICENSE$|^NOTICE$|^version\.txt$"
+          SKIP_PATTERNS="\.md$|\.txt$|^docs/|^docker/|^licenses/|^LICENSE$|^NOTICE$|^benchmarks/"
 
           SKIP=true
           while IFS= read -r file; do
@@ -184,7 +184,7 @@ jobs:
       github.event.inputs.skip_aot != 'true'
     runs-on:
       - self-hosted
-      - Linux
+      - linux
       - ${{ matrix.arch }}
       - cpu
       - spot
@@ -192,7 +192,7 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        arch: [X64, ARM64]
+        arch: [x64, arm64]
         cuda: [cu126, cu128, cu129, cu130]
     env:
       DOCKER_IMAGE: flashinfer/flashinfer-ci-${{ matrix.cuda }}:${{ needs.setup.outputs.docker_tag }}
@@ -206,7 +206,8 @@ jobs:
           sudo rm -rf ${{ github.workspace }}/* || true
           sudo rm -rf ${{ github.workspace }}/.[!.]* || true
           rm -rf ~/.cache/flashinfer_jit || true
-          docker system prune -f || true
+          docker image prune -f || true
+          docker builder prune -f --filter "until=24h" || true
 
       - uses: actions/checkout@v4
         with:
@@ -215,12 +216,6 @@ jobs:
       - name: Start spot termination monitor
         run: ./scripts/task_monitor_spot.sh &
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: flashinfer
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-        continue-on-error: true
 
       - name: Show Node Info
         run: ./scripts/task_show_node_info.sh
@@ -241,51 +236,24 @@ jobs:
       is_spot_termination: ${{ steps.analyze.outputs.is_spot_termination }}
       rerun_matrix: ${{ steps.matrix.outputs.rerun_matrix }}
     steps:
+      - name: Checkout scripts
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts
+          sparse-checkout-cone-mode: false
+
       - name: Analyze failure from job logs
         id: analyze
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          RUN_ID="${{ github.run_id }}"
-          SPOT_TERMINATION=false
-          # Include both failed and cancelled jobs (spot termination can cause either)
-          FAILED_JOBS=$(gh api "/repos/${{ github.repository }}/actions/runs/${RUN_ID}/jobs?per_page=100" \
-            --jq '.jobs[] | select(.name | startswith("AOT")) | select(.conclusion == "failure" or .conclusion == "cancelled") | .id')
-          if [ -z "$FAILED_JOBS" ]; then
-            echo "is_spot_termination=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          for JOB_ID in $FAILED_JOBS; do
-            # Download logs (may be ZIP or plain text depending on GitHub API)
-            if ! gh api "/repos/${{ github.repository }}/actions/jobs/${JOB_ID}/logs" > job_log.zip 2>/dev/null; then
-              continue
-            fi
-            # Try to unzip if it's a ZIP file, otherwise use as-is
-            if file job_log.zip | grep -q "Zip archive"; then
-              unzip -p job_log.zip > job_log.txt 2>/dev/null || mv job_log.zip job_log.txt
-            else
-              mv job_log.zip job_log.txt
-            fi
-            if grep -q "FLASHINFER_SPOT_TERMINATION_DETECTED" job_log.txt; then
-              echo "Detected: AWS spot termination marker (job $JOB_ID)"
-              SPOT_TERMINATION=true
-              break
-            fi
-            if grep -qiE "connection reset by peer|context canceled|grpc.*closing|The self-hosted runner.*lost" job_log.txt; then
-              echo "Detected: infrastructure error pattern (job $JOB_ID)"
-              SPOT_TERMINATION=true
-              break
-            fi
-          done
-          echo "is_spot_termination=$SPOT_TERMINATION"
-          echo "is_spot_termination=$SPOT_TERMINATION" >> $GITHUB_OUTPUT
+        run: ./scripts/task_analyze_spot.sh 'startswith("AOT")' '${{ github.repository }}' '${{ github.run_id }}'
 
       - name: Build rerun matrix
         id: matrix
         if: steps.analyze.outputs.is_spot_termination == 'true'
         run: |
           MATRIX='{"include":['
-          for arch in X64 ARM64; do
+          for arch in x64 arm64; do
             for cuda in cu126 cu128 cu129 cu130; do
               MATRIX+='{"arch":"'$arch'","cuda":"'$cuda'"},'
             done
@@ -302,7 +270,7 @@ jobs:
       needs.analyze-aot-failure.outputs.rerun_matrix != ''
     runs-on:
       - self-hosted
-      - Linux
+      - linux
       - ${{ matrix.arch }}
       - cpu
       - on-demand
@@ -322,18 +290,13 @@ jobs:
           sudo rm -rf ${{ github.workspace }}/* || true
           sudo rm -rf ${{ github.workspace }}/.[!.]* || true
           rm -rf ~/.cache/flashinfer_jit || true
-          docker system prune -f || true
+          docker image prune -f || true
+          docker builder prune -f --filter "until=24h" || true
 
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: flashinfer
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-        continue-on-error: true
 
       - name: Show Node Info
         run: ./scripts/task_show_node_info.sh
@@ -355,7 +318,7 @@ jobs:
       needs.gate.outputs.authorized == 'true' &&
       needs.setup.outputs.skip_build != 'true' &&
       github.event.inputs.skip_gpu != 'true'
-    runs-on: [self-hosted, Linux, X64, gpu, sm86, spot]
+    runs-on: [self-hosted, linux, x64, gpu, sm86, spot]
     timeout-minutes: 360
     strategy:
       fail-fast: true
@@ -373,7 +336,8 @@ jobs:
           sudo rm -rf ${{ github.workspace }}/* || true
           sudo rm -rf ${{ github.workspace }}/.[!.]* || true
           rm -rf ~/.cache/flashinfer_jit || true
-          docker system prune -f || true
+          docker image prune -f || true
+          docker builder prune -f --filter "until=24h" || true
           nvidia-smi || true
 
       - uses: actions/checkout@v4
@@ -383,12 +347,6 @@ jobs:
       - name: Start spot termination monitor
         run: ./scripts/task_monitor_spot.sh &
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: flashinfer
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-        continue-on-error: true
 
       - name: Show Node Info
         run: ./scripts/task_show_node_info.sh
@@ -409,44 +367,17 @@ jobs:
       is_spot_termination: ${{ steps.analyze.outputs.is_spot_termination }}
       rerun_matrix: ${{ steps.matrix.outputs.rerun_matrix }}
     steps:
+      - name: Checkout scripts
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts
+          sparse-checkout-cone-mode: false
+
       - name: Analyze failure from job logs
         id: analyze
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          RUN_ID="${{ github.run_id }}"
-          SPOT_TERMINATION=false
-          # Include both failed and cancelled jobs (spot termination can cause either)
-          FAILED_JOBS=$(gh api "/repos/${{ github.repository }}/actions/runs/${RUN_ID}/jobs?per_page=100" \
-            --jq '.jobs[] | select(.name | contains("A10G")) | select(.conclusion == "failure" or .conclusion == "cancelled") | .id')
-          if [ -z "$FAILED_JOBS" ]; then
-            echo "is_spot_termination=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          for JOB_ID in $FAILED_JOBS; do
-            # Download logs (may be ZIP or plain text depending on GitHub API)
-            if ! gh api "/repos/${{ github.repository }}/actions/jobs/${JOB_ID}/logs" > job_log.zip 2>/dev/null; then
-              continue
-            fi
-            # Try to unzip if it's a ZIP file, otherwise use as-is
-            if file job_log.zip | grep -q "Zip archive"; then
-              unzip -p job_log.zip > job_log.txt 2>/dev/null || mv job_log.zip job_log.txt
-            else
-              mv job_log.zip job_log.txt
-            fi
-            if grep -q "FLASHINFER_SPOT_TERMINATION_DETECTED" job_log.txt; then
-              echo "Detected: AWS spot termination marker (job $JOB_ID)"
-              SPOT_TERMINATION=true
-              break
-            fi
-            if grep -qiE "connection reset by peer|context canceled|grpc.*closing|The self-hosted runner.*lost" job_log.txt; then
-              echo "Detected: infrastructure error pattern (job $JOB_ID)"
-              SPOT_TERMINATION=true
-              break
-            fi
-          done
-          echo "is_spot_termination=$SPOT_TERMINATION"
-          echo "is_spot_termination=$SPOT_TERMINATION" >> $GITHUB_OUTPUT
+        run: ./scripts/task_analyze_spot.sh 'contains("A10G")' '${{ github.repository }}' '${{ github.run_id }}'
 
       - name: Build rerun matrix
         id: matrix
@@ -461,7 +392,7 @@ jobs:
       !cancelled() &&
       needs.analyze-gpu-a10g-failure.outputs.is_spot_termination == 'true' &&
       needs.analyze-gpu-a10g-failure.outputs.rerun_matrix != ''
-    runs-on: [self-hosted, Linux, X64, gpu, sm86, on-demand]
+    runs-on: [self-hosted, linux, x64, gpu, sm86, on-demand]
     timeout-minutes: 360
     strategy:
       fail-fast: true
@@ -478,19 +409,14 @@ jobs:
           sudo rm -rf ${{ github.workspace }}/* || true
           sudo rm -rf ${{ github.workspace }}/.[!.]* || true
           rm -rf ~/.cache/flashinfer_jit || true
-          docker system prune -f || true
+          docker image prune -f || true
+          docker builder prune -f --filter "until=24h" || true
           nvidia-smi || true
 
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: flashinfer
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-        continue-on-error: true
 
       - name: Show Node Info
         run: ./scripts/task_show_node_info.sh
@@ -512,7 +438,7 @@ jobs:
       needs.gate.outputs.authorized == 'true' &&
       needs.setup.outputs.skip_build != 'true' &&
       github.event.inputs.skip_gpu != 'true'
-    runs-on: [self-hosted, Linux, X64, gpu, sm75, spot]
+    runs-on: [self-hosted, linux, x64, gpu, sm75, spot]
     timeout-minutes: 360
     env:
       DOCKER_IMAGE: flashinfer/flashinfer-ci-cu129:${{ needs.setup.outputs.docker_tag }}
@@ -526,7 +452,8 @@ jobs:
           sudo rm -rf ${{ github.workspace }}/* || true
           sudo rm -rf ${{ github.workspace }}/.[!.]* || true
           rm -rf ~/.cache/flashinfer_jit || true
-          docker system prune -f || true
+          docker image prune -f || true
+          docker builder prune -f --filter "until=24h" || true
           nvidia-smi || true
 
       - uses: actions/checkout@v4
@@ -536,12 +463,6 @@ jobs:
       - name: Start spot termination monitor
         run: ./scripts/task_monitor_spot.sh &
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: flashinfer
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-        continue-on-error: true
 
       - name: Show Node Info
         run: ./scripts/task_show_node_info.sh
@@ -561,44 +482,17 @@ jobs:
     outputs:
       is_spot_termination: ${{ steps.analyze.outputs.is_spot_termination }}
     steps:
+      - name: Checkout scripts
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts
+          sparse-checkout-cone-mode: false
+
       - name: Analyze failure from job logs
         id: analyze
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          RUN_ID="${{ github.run_id }}"
-          SPOT_TERMINATION=false
-          # Include both failed and cancelled jobs (spot termination can cause either)
-          FAILED_JOBS=$(gh api "/repos/${{ github.repository }}/actions/runs/${RUN_ID}/jobs?per_page=100" \
-            --jq '.jobs[] | select(.name | contains("T4")) | select(.conclusion == "failure" or .conclusion == "cancelled") | .id')
-          if [ -z "$FAILED_JOBS" ]; then
-            echo "is_spot_termination=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          for JOB_ID in $FAILED_JOBS; do
-            # Download logs (may be ZIP or plain text depending on GitHub API)
-            if ! gh api "/repos/${{ github.repository }}/actions/jobs/${JOB_ID}/logs" > job_log.zip 2>/dev/null; then
-              continue
-            fi
-            # Try to unzip if it's a ZIP file, otherwise use as-is
-            if file job_log.zip | grep -q "Zip archive"; then
-              unzip -p job_log.zip > job_log.txt 2>/dev/null || mv job_log.zip job_log.txt
-            else
-              mv job_log.zip job_log.txt
-            fi
-            if grep -q "FLASHINFER_SPOT_TERMINATION_DETECTED" job_log.txt; then
-              echo "Detected: AWS spot termination marker (job $JOB_ID)"
-              SPOT_TERMINATION=true
-              break
-            fi
-            if grep -qiE "connection reset by peer|context canceled|grpc.*closing|The self-hosted runner.*lost" job_log.txt; then
-              echo "Detected: infrastructure error pattern (job $JOB_ID)"
-              SPOT_TERMINATION=true
-              break
-            fi
-          done
-          echo "is_spot_termination=$SPOT_TERMINATION"
-          echo "is_spot_termination=$SPOT_TERMINATION" >> $GITHUB_OUTPUT
+        run: ./scripts/task_analyze_spot.sh 'contains("T4")' '${{ github.repository }}' '${{ github.run_id }}'
 
   gpu-tests-t4-rerun:
     name: JIT Rerun (T4)
@@ -606,7 +500,7 @@ jobs:
     if: |
       !cancelled() &&
       needs.analyze-gpu-t4-failure.outputs.is_spot_termination == 'true'
-    runs-on: [self-hosted, Linux, X64, gpu, sm75, on-demand]
+    runs-on: [self-hosted, linux, x64, gpu, sm75, on-demand]
     timeout-minutes: 360
     env:
       DOCKER_IMAGE: flashinfer/flashinfer-ci-cu129:${{ needs.setup.outputs.docker_tag }}
@@ -620,19 +514,14 @@ jobs:
           sudo rm -rf ${{ github.workspace }}/* || true
           sudo rm -rf ${{ github.workspace }}/.[!.]* || true
           rm -rf ~/.cache/flashinfer_jit || true
-          docker system prune -f || true
+          docker image prune -f || true
+          docker builder prune -f --filter "until=24h" || true
           nvidia-smi || true
 
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: flashinfer
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-        continue-on-error: true
 
       - name: Show Node Info
         run: ./scripts/task_show_node_info.sh
@@ -643,6 +532,53 @@ jobs:
 
       - name: Run JIT Unittest Part 3 (T4)
         run: bash ci/bash.sh ${DOCKER_IMAGE} ./scripts/task_jit_run_tests_part3.sh
+
+  # ---------------------------------------------------------------------------
+  # GPU JIT Tests - H100 (Hopper) - Capacity Block
+  # Requires manually purchased CB via AWS Console
+  # ---------------------------------------------------------------------------
+  gpu-tests-h100:
+    name: JIT Unittest (H100)
+    needs: [gate, setup]
+    if: |
+      needs.gate.outputs.authorized == 'true' &&
+      needs.setup.outputs.skip_build != 'true' &&
+      github.event.inputs.skip_gpu != 'true'
+    runs-on: [self-hosted, linux, x64, gpu, h100, 1gpu]
+    timeout-minutes: 360
+    env:
+      DOCKER_IMAGE: flashinfer/flashinfer-ci-cu129:${{ needs.setup.outputs.docker_tag }}
+    steps:
+      - name: Cleanup
+        run: |
+          # Stop all Docker containers to free GPU memory
+          docker stop $(docker ps -q) 2>/dev/null || true
+          docker rm $(docker ps -aq) 2>/dev/null || true
+          # Clean workspace and caches
+          sudo rm -rf ${{ github.workspace }}/* || true
+          sudo rm -rf ${{ github.workspace }}/.[!.]* || true
+          rm -rf ~/.cache/flashinfer_jit || true
+          docker image prune -f || true
+          docker builder prune -f --filter "until=24h" || true
+          # Show GPU info (should show 1 GPU due to CUDA_VISIBLE_DEVICES)
+          echo "=== GPU Info ==="
+          nvidia-smi || true
+          echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+
+      - name: Show Node Info
+        run: ./scripts/task_show_node_info.sh
+        env:
+          NODE_NAME: ${{ runner.name }}
+          WORKSPACE: ${{ github.workspace }}
+          BUILD_NUMBER: ${{ github.run_number }}
+
+      - name: Run H100 Kernel Tests
+        run: bash ci/bash.sh ${DOCKER_IMAGE} ./scripts/task_run_unit_tests.sh
 
   # ---------------------------------------------------------------------------
   # Test Results Summary
@@ -662,6 +598,7 @@ jobs:
       - gpu-tests-t4
       - analyze-gpu-t4-failure
       - gpu-tests-t4-rerun
+      - gpu-tests-h100
     runs-on: ubuntu-latest
     steps:
       - name: Check Results
@@ -720,6 +657,14 @@ jobs:
             "${{ needs.gpu-tests-t4.result }}" \
             "${{ needs.analyze-gpu-t4-failure.outputs.is_spot_termination }}" \
             "${{ needs.gpu-tests-t4-rerun.result }}" || FAILED=true
+
+          # H100 tests (no rerun logic yet - CB instances don't get spot terminated)
+          echo "" >> $GITHUB_STEP_SUMMARY
+          H100="${{ needs.gpu-tests-h100.result }}"
+          echo "GPU Tests (H100): $H100" >> $GITHUB_STEP_SUMMARY
+          if [ "$H100" != "success" ] && [ "$H100" != "skipped" ] && [ "${{ github.event.inputs.skip_gpu }}" != "true" ]; then
+            FAILED=true
+          fi
 
           echo "" >> $GITHUB_STEP_SUMMARY
           if [ "$FAILED" == "true" ]; then
