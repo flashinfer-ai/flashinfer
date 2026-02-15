@@ -55,6 +55,7 @@ def skip_checks(
     num_tokens,
     hidden_size,
     intermediate_size,
+    logits_dtype,
     zero_hidden_states=False,
 ):
     """Common skip logic for all tests."""
@@ -141,4 +142,21 @@ def skip_checks(
     ):
         pytest.xfail(
             "Note(jimmzhou): Make MxFP4xBf16 nonfunctional on SM103 to avoid B200 regression"
+        )
+
+    if (
+        routing_config["routing_method_type"] == RoutingMethodType.DeepSeekV3
+        and logits_dtype != torch.float32
+    ):
+        pytest.skip(
+            f"Incompatible: logits_dtype={logits_dtype} with DeepSeekV3 routing"
+        )
+
+    if logits_dtype == torch.float32 and type(moe_impl) not in [
+        QuantMode.FP8_PER_TENSOR,
+        QuantMode.FP8_BLOCK_SCALE,
+        QuantMode.BF16,
+    ]:
+        pytest.skip(
+            f"Incompatible: logits_dtype={logits_dtype} with {type(moe_impl).__name__} + {moe_impl.quant_mode}"
         )

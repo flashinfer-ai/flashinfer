@@ -56,8 +56,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
                  int32_t* expandedIdxToPermutedIdx, int32_t* permutedIdxToExpandedIdx,
                  int32_t* permutedIdxToTokenIdx, void* expertWeights, int32_t* numTokensPerExpert,
                  int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit,
-                 int32_t* numNonExitingCtas, btg::Dtype dtypeElt, btg::Dtype dtypeBias,
-                 bool useRoutingScalesOnInput, bool useDeepSeekFp8,
+                 int32_t* numNonExitingCtas, btg::Dtype dtypeScore, btg::Dtype dtypeElt,
+                 btg::Dtype dtypeBias, bool useRoutingScalesOnInput, bool useDeepSeekFp8,
                  RoutingMethodType routingMethodType, cudaStream_t stream) {
   if (routingMethodType == RoutingMethodType::DeepSeekV3) {
     FLASHINFER_CHECK(topK <= 22, "For DeepSeek routing method, must have topK <= 22");
@@ -141,6 +141,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     //
 
     routingData.mDtypeExpW = btg::Dtype::Bfloat16;
+    routingData.mDtypeScore = dtypeScore;
+
     // routingData.mDtypeElt = dtypeElt; // no-op for now as hidden_state is not input
     routingData.mUsePdl = true;
     routingData.mDoSoftmaxBeforeTopK = routingMethodType == RoutingMethodType::RenormalizeNaive;
