@@ -62,38 +62,9 @@ class AllReduceFusionOp:
     MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM = 9
 
 
-class AllReduceFusionPattern:
-    # NOTE: for trtllm_allreduce_fusion
-    # Basic all-reduce pattern
-    kAllReduce = 0
-    # All-reduce followed by residual add and RMS norm
-    kARResidualRMSNorm = 1
-    # All-reduce followed by residual add, RMS norm and FP8 quantization
-    kARResidualRMSNormFP8Quant = 2
-    # All-reduce followed by residual add, RMS norm and FP4 quantization
-    kARResidualRMSNormFP4Quant = 3
-    # All-reduce followed by residual add, RMS norm and FP8 quantization, with norm output
-    kARResidualRMSNormOutFP8Quant = 4
-    # All-reduce followed by residual add, RMS norm and FP4 quantization, with norm output
-    kARResidualRMSNormOutFP4Quant = 5
-
-
-class QuantizationSFLayout:
-    # Block scale factors are stored in swizzled layout for cutlass FP4 kernel. Scale factor
-    # blocks are organized in 512-byte blocks in global memory, with each block having 128x4 FP8
-    # values. The SF matrix dimensions are therefore padded - rows to the nearest multiple of 128 and
-    # columns to the nearest multiple of 4.
-    #
-    # The scale factor block rows map to data block rows in an interleaved pattern:
-    # For a scale factor row 'i', it maps to data block row: (i % 4) * 32 + (i / 4)
-    # Column 'j' in the scale factor block corresponds to scaling the j-th block in the data tensor.
-    #
-    # Please refer to https://nvbugs/4165523 for more details about the swizzled layout.
-    SWIZZLED_128x4 = 0
-    SWIZZLED_8x4 = 1
-    # Block scale factors are stored in linear layout (row-major). This is used in some trtllm-gen
-    # kernels standard.
-    LINEAR = 2
+# Import shared types from canonical location (_types.py) and re-export for backwards compatibility
+from ._types import AllReduceFusionPattern
+from ._types import QuantizationSFLayout
 
 
 @functools.cache

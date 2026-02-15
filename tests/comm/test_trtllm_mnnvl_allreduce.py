@@ -7,18 +7,28 @@ import torch
 import torch.distributed as dist
 
 import flashinfer.comm.trtllm_mnnvl_ar as trtllm_mnnvl_ar
+from flashinfer.comm import AllReduceFusionPattern, QuantFusionType, get_pattern_traits
 from flashinfer.comm.mapping import Mapping
 from flashinfer.comm.mnnvl import TorchDistBackend
 
 # Use flashinfer.norm.rmsnorm as reference implementation.
 from flashinfer.norm import rmsnorm
 
-# Test helpers
-from tests.test_helpers.comm import (
-    init_torch_distributed_from_mpi,
-)
-
+from tests.test_helpers.comm import init_torch_distributed_from_mpi
 # Note: torch.distributed cleanup is handled by tests/comm/conftest.py
+
+
+# Helper function
+def fp8_quant(input, scale):
+    finfo = torch.finfo(torch.float8_e4m3fn)
+    inv_scale = scale.reciprocal()
+    qinput = (input.float() * inv_scale).clamp(min=finfo.min, max=finfo.max)
+    return qinput.to(torch.float8_e4m3fn)
+
+
+def dequant(input, scale, dtype):
+    dqinput = input.to(torch.float32) * scale
+    return dqinput.to(dtype)
 
 
 @torch.inference_mode()
@@ -28,11 +38,14 @@ def row_linear_residual_norm_fusion_forward(
     norm_weight: torch.Tensor,
     eps: float,
     mapping: Mapping,
-    fusion: bool,
+    pattern: AllReduceFusionPattern,
     reference_output: tuple[torch.Tensor, ...],
     workspace: trtllm_mnnvl_ar.MNNVLAllReduceFusionWorkspace,
 ):
     tensor_parallel_rank = mapping.tp_rank
+    dummy_global_scale = torch.ones(
+        1, dtype=torch.float32, device=reference_output[0].device
+    )
     dist.barrier()
 
     def func(
@@ -40,7 +53,7 @@ def row_linear_residual_norm_fusion_forward(
         residual,
         norm_weight,
         eps,
-        enable_fusion,
+        pattern,
         workspace,
     ):
         # For both fused and unfused cases:
@@ -48,7 +61,7 @@ def row_linear_residual_norm_fusion_forward(
         input = input.view(-1, shape[-1])
         use_pdl = True
 
-        if enable_fusion:
+        if pattern == AllReduceFusionPattern.kARResidualRMSNorm:
             dist.barrier()
 
             output, residual_out = (
@@ -64,8 +77,7 @@ def row_linear_residual_norm_fusion_forward(
             )
 
             return output.view(shape), residual_out.view(shape)
-
-        else:
+        elif pattern == AllReduceFusionPattern.kAllReduce:
             output = torch.empty_like(input)
 
             output = trtllm_mnnvl_ar.trtllm_mnnvl_allreduce(
@@ -75,10 +87,44 @@ def row_linear_residual_norm_fusion_forward(
                 strategy=trtllm_mnnvl_ar.MNNVLAllreduceFusionStrategy.AUTO,
             )
             return (output.view(shape),)
+        else:
+            traits = get_pattern_traits(pattern)
+            if traits.has_norm_out:
+                output = torch.empty_like(input)
+            else:
+                output = None
 
-    output = func(x.clone(), residual.clone(), norm_weight, eps, fusion, workspace)
+            quant_out, sf_out, residual_out, output = (
+                trtllm_mnnvl_ar.trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
+                    input,
+                    residual,
+                    norm_weight,
+                    workspace,
+                    eps,
+                    output=output,
+                    quant_type=traits.quant_type,
+                    launch_with_pdl=use_pdl,
+                    strategy=trtllm_mnnvl_ar.MNNVLAllreduceFusionStrategy.AUTO,
+                )
+            )
+            if output is not None:
+                output = output.view(shape)
 
-    assert output[0].shape == reference_output[0].shape
+            # We alter the order here to be compatible with the non-quant case
+            return (
+                quant_out.view(*shape[:-1], quant_out.shape[-1]),
+                residual_out.view(shape),
+                sf_out,
+                output,
+            )
+
+    output = func(x.clone(), residual.clone(), norm_weight, eps, pattern, workspace)
+
+    traits = get_pattern_traits(pattern)
+
+    # The output shape of FP4 quant could be different.
+    if traits.quant_type != QuantFusionType.NVFP4:
+        assert output[0].shape == reference_output[0].shape
 
     if tensor_parallel_rank == 0:
         print("output[0] (first 10 values):", output[0].flatten()[:10])
@@ -87,21 +133,85 @@ def row_linear_residual_norm_fusion_forward(
             reference_output[0].flatten()[:10],
         )
 
-        if fusion:
+        if traits.has_rmsnorm:
             print("output[1] (first 10 values):", output[1].flatten()[:10])
             print(
                 "reference_output[1] (first 10 values):",
                 reference_output[1].flatten()[:10],
             )
 
-    torch.testing.assert_close(
-        output[0],
-        reference_output[0],
-        rtol=0.05,
-        atol=0.15,
-    )
+    # Check output
+    if traits.has_quant:
+        # First check the norm output if any
+        if traits.has_norm_out:
+            assert output[3] is not None
+            torch.testing.assert_close(
+                output[3],
+                reference_output[0],
+                rtol=0.05,
+                atol=0.15,
+            )
+        else:
+            assert output[3] is None
 
-    if fusion:
+        # Then compare the quant fusion output with the quantized reference output
+        if traits.quant_type == QuantFusionType.FP8:
+            ref_dequant = dequant(
+                fp8_quant(reference_output[0], dummy_global_scale),
+                dummy_global_scale,
+                torch.float32,
+            )
+            output_dequant = dequant(output[0], dummy_global_scale, torch.float32)
+            pct_tol = 0.002  # Allow up to 0.2% difference
+            assert output[2] is None
+
+        elif traits.quant_type == QuantFusionType.NVFP4:
+            # TODO: Check if this accuracy check is correct, we allow up to 1% difference following trtllm_ar fusion's test case
+            # Default to 128x4 swizzled layout and nvfp4 (e4m3 sf, vec 16) only
+            from flashinfer.fp4_quantization import (
+                nvfp4_quantize,
+                e2m1_and_ufp8sf_scale_to_float,
+            )
+
+            ref_quantized, ref_sf = nvfp4_quantize(
+                reference_output[0], dummy_global_scale
+            )
+            # FIXME: (Not in this PR, report it somewhere) the global scale is documented as optional, but providing None will lead to error.
+            ref_dequant = e2m1_and_ufp8sf_scale_to_float(
+                ref_quantized.view(torch.uint8).cpu(),
+                ref_sf.view(torch.uint8).cpu(),
+                dummy_global_scale,
+            ).cuda()
+            output_dequant = e2m1_and_ufp8sf_scale_to_float(
+                output[0].view(torch.uint8).cpu(),
+                output[2].view(torch.uint8).cpu(),
+                dummy_global_scale,
+            ).cuda()
+            pct_tol = 0.01  # Allow up to 1% difference
+
+        # Allow up to 1% of elements to differ beyond tolerance
+        rtol, atol = 0.05, 0.15
+        diff = torch.abs(output_dequant - ref_dequant)
+        max_diff = torch.maximum(
+            torch.abs(ref_dequant) * rtol, torch.tensor(atol, device=ref_dequant.device)
+        )
+        mismatched = (diff > max_diff).sum().item()
+        total_elements = output_dequant.numel()
+        mismatch_ratio = mismatched / total_elements
+
+        assert mismatch_ratio <= pct_tol, (
+            f"Mismatch ratio {mismatch_ratio:.4%} exceeds {pct_tol:.4%} threshold"
+        )
+    else:
+        torch.testing.assert_close(
+            output[0],
+            reference_output[0],
+            rtol=0.05,
+            atol=0.15,
+        )
+
+    # Check residual output
+    if traits.has_rmsnorm:
         torch.testing.assert_close(
             output[1],
             reference_output[1],
@@ -110,6 +220,7 @@ def row_linear_residual_norm_fusion_forward(
         )
 
 
+# TODO: Remove this legacy test when the deprecated API is removed.
 @torch.inference_mode()
 def row_linear_residual_norm_fusion_forward_legacy(
     x: torch.Tensor,
@@ -238,7 +349,9 @@ def row_linear_residual_norm_fusion_forward_legacy(
 """Helper function to run the core MNNVL AllReduce test logic"""
 
 
-def prepare_test_data(seq_len: int, hidden_size: int, dtype: torch.dtype, fusion: bool):
+def prepare_test_data(
+    seq_len: int, hidden_size: int, dtype: torch.dtype, pattern: AllReduceFusionPattern
+):
     # Use torch.distributed for communication between ranks
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -263,7 +376,7 @@ def prepare_test_data(seq_len: int, hidden_size: int, dtype: torch.dtype, fusion
 
     x_local = x_full[rank, :, :]
     reference_output: Tuple[torch.Tensor, ...] = None
-    if fusion:
+    if pattern != AllReduceFusionPattern.kAllReduce:
         # Fused case: AllReduce + Residual Add + RMS Norm
         allreduce_result = torch.sum(x_full, dim=0)  # AllReduce result
         residual_out = allreduce_result + residual  # Add residual
@@ -282,7 +395,7 @@ def prepare_test_data(seq_len: int, hidden_size: int, dtype: torch.dtype, fusion
 def run_mnnvl_ar_full(
     monkeypatch,
     seq_lens: list[int],
-    fusion: bool,
+    pattern: AllReduceFusionPattern,
     dtype: torch.dtype,
     hidden_size: int,
     legacy_explicit_workspace_bytes: Optional[int] = None,
@@ -300,9 +413,6 @@ def run_mnnvl_ar_full(
     """
 
     gpus_per_node = torch.cuda.device_count()
-
-    if gpus_per_node == 0:
-        pytest.skip("MNNVL allreduce test requires at least one CUDA device per node")
 
     # Initialize torch.distributed (safe to call if already initialized)
     init_torch_distributed_from_mpi()
@@ -370,7 +480,7 @@ def run_mnnvl_ar_full(
         test_data = []
         for seq_len in seq_lens:
             (x_local, residual, norm_weight), reference_output = prepare_test_data(
-                seq_len, hidden_size, dtype, fusion
+                seq_len, hidden_size, dtype, pattern
             )
             test_data.append(
                 (seq_len, x_local, residual, norm_weight, reference_output)
@@ -380,7 +490,7 @@ def run_mnnvl_ar_full(
         for seq_len, x, residual, norm_weight, reference_output in test_data:
             if rank == 0:
                 print(
-                    f"Testing seq_len={seq_len}, hidden_size={hidden_size}, fusion={fusion}, dtype={dtype}"
+                    f"Testing seq_len={seq_len}, hidden_size={hidden_size}, pattern={pattern}, dtype={dtype}"
                 )
             if legacy_api:
                 row_linear_residual_norm_fusion_forward_legacy(
@@ -391,7 +501,7 @@ def run_mnnvl_ar_full(
                     hidden_size,
                     dtype,
                     mapping,
-                    fusion,
+                    pattern == AllReduceFusionPattern.kARResidualRMSNorm,
                     reference_output,
                     multicast_ptr,
                     buffer_ptrs_dev,
@@ -406,7 +516,7 @@ def run_mnnvl_ar_full(
                     norm_weight,
                     eps,
                     mapping,
-                    fusion,
+                    pattern,
                     reference_output,
                     workspace,
                 )
@@ -415,12 +525,12 @@ def run_mnnvl_ar_full(
             dist.barrier()
 
             print(
-                f"PASSED[rank={rank}]: seq_len={seq_len}, fusion={fusion}, dtype={dtype}"
+                f"PASSED[rank={rank}]: seq_len={seq_len}, pattern={pattern}, dtype={dtype}"
             )
 
     except Exception as e:
         rank_failed = True
-        failure_message = f"FAILED[rank={rank}]: seq_lens={seq_lens}, fusion={fusion}, dtype={dtype} failed: {e}"
+        failure_message = f"FAILED[rank={rank}]: seq_lens={seq_lens}, pattern={pattern}, dtype={dtype} failed: {e}"
         print(failure_message)
         print(traceback.format_exc())
 
@@ -453,30 +563,70 @@ def run_mnnvl_ar_full(
 # Multi-node test:srun -A coreai_libraries_cudnn -N4 --container-image=<flashinfer_image> -J --mpi=pmix -- bash -c 'hostname && cd <path_to_flashinfer> && pip install -e . && python -m pytest tests/comm/test_trtllm_mnnvl_allreduce.py'
 
 
+@pytest.mark.skipif(
+    torch.cuda.device_count() < 2,
+    reason="MNNVL allreduce test requires at least 2 CUDA devices",
+)
 @pytest.mark.parametrize(
     "seq_lens",
     [[1], [4], [15], [27, 11, 24, 256], [127], [998, 2048]],
 )
-@pytest.mark.parametrize("fusion", [False, True])
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        AllReduceFusionPattern.kAllReduce,
+        AllReduceFusionPattern.kARResidualRMSNorm,
+        AllReduceFusionPattern.kARResidualRMSNormFP8Quant,
+        AllReduceFusionPattern.kARResidualRMSNormFP4Quant,
+        AllReduceFusionPattern.kARResidualRMSNormOutFP8Quant,
+        AllReduceFusionPattern.kARResidualRMSNormOutFP4Quant,
+    ],
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("hidden_size", [2880, 5120, 7168, 8192, 16384])
 def test_mnnvl_allreduce_refactored(
-    monkeypatch, seq_lens: list[int], fusion: bool, dtype: torch.dtype, hidden_size: int
+    monkeypatch,
+    seq_lens: list[int],
+    pattern: AllReduceFusionPattern,
+    dtype: torch.dtype,
+    hidden_size: int,
 ):
     """Test MNNVL AllReduce with refactored API."""
     run_mnnvl_ar_full(
-        monkeypatch, seq_lens, fusion, dtype, hidden_size, legacy_api=False
+        monkeypatch, seq_lens, pattern, dtype, hidden_size, legacy_api=False
     )
 
 
+# TODO: Remove this legacy test when the deprecated API is removed.
+@pytest.mark.skipif(
+    torch.cuda.device_count() < 2,
+    reason="MNNVL allreduce test requires at least 2 CUDA devices",
+)
 @pytest.mark.parametrize("seq_lens", [[1], [4], [15], [27, 11, 24], [127]])
-@pytest.mark.parametrize("fusion", [False, True])
+@pytest.mark.parametrize(
+    "pattern",
+    [AllReduceFusionPattern.kAllReduce, AllReduceFusionPattern.kARResidualRMSNorm],
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("hidden_size", [2048, 4096, 5120, 7168, 8192, 16384])
 def test_mnnvl_allreduce_legacy(
-    monkeypatch, seq_lens: list[int], fusion: bool, dtype: torch.dtype, hidden_size: int
+    monkeypatch,
+    seq_lens: list[int],
+    pattern: AllReduceFusionPattern,
+    dtype: torch.dtype,
+    hidden_size: int,
 ):
     """Test MNNVL AllReduce with legacy API."""
     run_mnnvl_ar_full(
-        monkeypatch, seq_lens, fusion, dtype, hidden_size, legacy_api=True
+        monkeypatch, seq_lens, pattern, dtype, hidden_size, legacy_api=True
+    )
+
+
+if __name__ == "__main__":
+    test_mnnvl_allreduce_refactored(
+        None,
+        seq_lens=[998],
+        pattern=AllReduceFusionPattern.kAllReduce,
+        dtype=torch.float16,
+        hidden_size=16384,
     )
