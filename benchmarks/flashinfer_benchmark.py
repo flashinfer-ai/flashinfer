@@ -163,6 +163,19 @@ def parse_args(line=sys.argv[1:]):
         help="Number of dry runs.",
     )
     parser.add_argument(
+        "--autotune_cache",
+        type=str,
+        required=False,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Path to a JSON file for autotuner config caching. "
+            "When used with --autotune, loads cached configs on entry and "
+            "saves newly tuned configs on exit. Without --autotune, loads "
+            "cached configs for inference without profiling."
+        ),
+    )
+    parser.add_argument(
         "--case_tag",
         type=str,
         required=False,
