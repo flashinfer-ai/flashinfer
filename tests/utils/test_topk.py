@@ -592,7 +592,7 @@ def test_page_table_transform_with_row_to_batch(num_rows, max_len, k):
 
 
 @pytest.mark.parametrize("num_rows", [4, 16])
-@pytest.mark.parametrize("max_len", [4096])
+@pytest.mark.parametrize("max_len", [4096, 131072])
 @pytest.mark.parametrize("k", [256])
 def test_page_table_transform_variable_lengths(num_rows, max_len, k):
     """Test page table transform with variable sequence lengths."""
