@@ -1,0 +1,97 @@
+Scanning for test files in /home/runner/work/flashinfer/flashinfer/tests...
+Found 108 test files
+Collecting xfail markers...
+====================================================================================================
+XFAILS REPORT
+====================================================================================================
+
+Total xfails: 10
+Unique reasons: 8
+
+
+----------------------------------------------------------------------------------------------------
+Reason                                                            Count            Type
+----------------------------------------------------------------------------------------------------
+Expected failure for SM120/121 for now since the tile s...            2       decorator
+NOTE(Zihao): temporarily disable cuda graph until we fu...            2         runtime
+NOTE(Zihao): attention sink with sliding window and non...            1         runtime
+seq_len=514 is known to fail in full test suite occasio...            1       parameter
+nvidia-cutlass-dsl has issue when l=1                                 1         runtime
+str(e)                                                                1         runtime
+Note(jimmzhou): Make MxFP4xBf16 nonfunctional on SM103 ...            1         runtime
+Numerical accuracy issue on SM 121 (Spark)                            1       decorator
+----------------------------------------------------------------------------------------------------
+
+
+====================================================================================================
+DETAILED BREAKDOWN BY REASON
+====================================================================================================
+
+[2 xfails] Expected failure for SM120/121 for now since the tile size/number of stages is too large.
+----------------------------------------------------------------------------------------------------
+  • tests/attention/test_batch_attention.py:211
+    Test: test_batch_attention_with_noncontiguous_q
+    Type: decorator
+    Condition: get_compute_capability(torch.device(device='cuda'))[0] == 12
+
+  • tests/attention/test_batch_attention.py:260
+    Test: test_batch_attention_correctness
+    Type: decorator
+    Condition: get_compute_capability(torch.device(device='cuda'))[0] == 12
+
+
+[2 xfails] NOTE(Zihao): temporarily disable cuda graph until we fully fix the workspace buffer overflow issue for prefill + cudagraph
+----------------------------------------------------------------------------------------------------
+  • tests/attention/test_batch_prefill_kernels.py:81
+    Test: test_batch_prefill_with_paged_kv_cache
+    Type: runtime
+
+  • tests/attention/test_batch_prefill_kernels.py:321
+    Test: test_batch_prefill_with_tuple_paged_kv_cache
+    Type: runtime
+
+
+[1 xfails] NOTE(Zihao): attention sink with sliding window and non-causal will fail after https://github.com/flashinfer-ai/flashinfer/pull/1661, temporarily xfail the test.
+----------------------------------------------------------------------------------------------------
+  • tests/attention/test_attention_sink.py:643
+    Test: test_attention_sink_chunk_prefill
+    Type: runtime
+
+
+[1 xfails] seq_len=514 is known to fail in full test suite occasionally
+----------------------------------------------------------------------------------------------------
+  • tests/attention/test_xqa.py:138
+    Test: test_xqa
+    Type: parameter
+    Strict: False
+
+
+[1 xfails] nvidia-cutlass-dsl has issue when l=1
+----------------------------------------------------------------------------------------------------
+  • tests/gemm/test_cute_dsl_blockscaled_gemm.py:93
+    Test: test_blockscaled_gemm_python_interface
+    Type: runtime
+
+
+[1 xfails] str(e)
+----------------------------------------------------------------------------------------------------
+  • tests/gemm/test_mm_fp4.py:92
+    Test: _test_mm_fp4
+    Type: runtime
+
+
+[1 xfails] Note(jimmzhou): Make MxFP4xBf16 nonfunctional on SM103 to avoid B200 regression
+----------------------------------------------------------------------------------------------------
+  • tests/moe/utils.py:142
+    Test: skip_checks
+    Type: runtime
+
+
+[1 xfails] Numerical accuracy issue on SM 121 (Spark)
+----------------------------------------------------------------------------------------------------
+  • tests/utils/test_jit_example.py:173
+    Test: test_dump_logits
+    Type: decorator
+    Condition: get_compute_capability(torch.device('cuda:0')) == (12, 1)
+
+====================================================================================================
