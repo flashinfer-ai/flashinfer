@@ -102,6 +102,17 @@ output_column_dict = {
         "interleave",
         "kv_layout",
     ],
+    "mamba": [
+        "nheads",
+        "dim",
+        "dstate",
+        "ngroups",
+        "cache_steps",
+        "state_dtype",
+        "weight_dtype",
+        "has_z",
+        "dt_softplus",
+    ],
     "general": [
         "batch_size",
         "hidden_size",
@@ -136,6 +147,7 @@ full_output_columns = (
     + output_column_dict["quantization"]
     + output_column_dict["sampling"]
     + output_column_dict["rope"]
+    + output_column_dict["mamba"]
     + output_column_dict["general"]
 )
 
@@ -202,6 +214,9 @@ benchmark_apis = {
         "mla_rope_quantize_fp8",
         "rope_quantize_fp8",
         "rope_quantize_fp8_append_paged_kv_cache",
+    ],
+    "mamba": [
+        "selective_state_update",
     ],
 }
 
@@ -719,6 +734,18 @@ routine_cc_to_supported_backends = {
         "10.0": ["cuda"],
         "10.3": ["cuda"],
         "12.0": ["cuda"],
+    },
+    # MAMBA
+    "selective_state_update": {
+        "7.5": ["flashinfer", "triton"],
+        "8.0": ["flashinfer", "triton"],
+        "8.6": ["flashinfer", "triton"],
+        "8.9": ["flashinfer", "triton"],
+        "9.0": ["flashinfer", "triton"],
+        "10.0": ["flashinfer", "triton"],
+        "10.3": ["flashinfer", "triton"],
+        "11.0": ["flashinfer", "triton"],
+        "12.0": ["flashinfer", "triton"],
     },
 }
 
