@@ -195,8 +195,11 @@ def _cutlass_mm_bf16_requirement(
     backend: Literal["cudnn", "cutlass", "tgv", "auto"] = "tgv",
 ):
     if bias is not None:
+        # TODO(flashinfer): CUTLASS bias support is currently incomplete
+        # The API accepts bias but the kernel epilogue does not yet apply it
+        # See include/flashinfer/gemm/bf16_gemm_template_sm100.h for details
         raise ValueError(
-            "You cannot use the CUTLASS backend with a bias. Use the TGV backend instead."
+            "CUTLASS backend bias support is not yet implemented. Use the TGV backend instead."
         )
     if pdl:
         raise ValueError(
@@ -840,10 +843,11 @@ def get_gemm_sm100_module_cutlass_bf16():
                 do_preparation: bool = False,
                 **kwargs,
             ) -> torch.Tensor:
-                a, b, _, _, out, workspace_buffer = inputs
+                a, b, bias, _, out, workspace_buffer = inputs
                 module.bf16_gemm(
                     a,
                     b.transpose(-2, -1),
+                    bias,
                     out,
                     workspace_buffer,
                     tactic,
@@ -1090,19 +1094,19 @@ def get_tgv_gemm_sm10x_module(
 def tgv_gemm_sm100(
     a: torch.Tensor,
     b: torch.Tensor,
-    bias: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
     pdl: bool = False,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Perform TGV GEMM on SM100 architecture with automatic dtype detection.
 
-    Computes: A @ B + bias
+    Computes: A @ B + bias (if bias is provided) or A @ B (if bias is None)
 
     Args:
         a: First input tensor of shape (M, K) in row-major layout
         b: Second input tensor of shape (K, N) in column-major layout
-        bias: Bias tensor of shape (N,)
+        bias: Optional bias tensor of shape (N,). If None, no bias is added.
         pdl: Whether to use PDL (persistent data loader), defaults to False
         out: Optional output tensor, shape (M, N), defaults to None.
 
@@ -1117,6 +1121,7 @@ def tgv_gemm_sm100(
         - Requires SM100, SM103, or SM110 architecture
         - Input tensors a and b must have the same dtype
         - Tensor b is expected to be in column-major layout (transposed from typical PyTorch row-major)
+        - If bias is provided, it must have the same dtype as a and b
     """
     # Verify SM100 architecture support
     if not _match_sm_version(a.device, ["100", "103"]):
@@ -1132,6 +1137,20 @@ def tgv_gemm_sm100(
         raise ValueError(
             f"Input tensors must have the same dtype. Got {a.dtype} and {b.dtype}."
         )
+
+    if bias is not None:
+        if bias.dtype != a.dtype:
+            raise ValueError(
+                f"Bias tensor must have the same dtype as input tensors. Got {bias.dtype}, expected {a.dtype}."
+            )
+        if bias.ndim != 1:
+            raise ValueError(
+                f"Bias tensor must be 1D. Got {bias.ndim}D tensor."
+            )
+        if bias.shape[0] != b.shape[1]:
+            raise ValueError(
+                f"Bias tensor shape mismatch. Expected ({b.shape[1]},), got {bias.shape}."
+            )
 
     if out is None:
         out = torch.empty(
