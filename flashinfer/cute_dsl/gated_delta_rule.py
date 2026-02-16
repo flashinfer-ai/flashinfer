@@ -1964,6 +1964,18 @@ def gated_delta_rule(
     """
     global _compiled_kernels
 
+    # Validate required Optional parameters
+    if q is None:
+        raise ValueError("q (query tensor) is required")
+    if k is None:
+        raise ValueError("k (key tensor) is required")
+    if v is None:
+        raise ValueError("v (value tensor) is required")
+    if b is None:
+        raise ValueError("b (beta gate tensor) is required")
+    if initial_state_source is None:
+        raise ValueError("initial_state_source (H state tensor) is required")
+
     B, T, H, K = q.shape
     assert T in [1, 2, 3, 4], f"Supported T=1,2,3,4, got T={T}"
     HV = v.shape[2]
@@ -1991,8 +2003,8 @@ def gated_delta_rule(
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-    # Check cache
-    cache_key = (T, B)
+    # Check cache - include all shape dimensions to avoid incorrect reuse
+    cache_key = (T, B, H, HV, K, V)
     if cache_key not in _compiled_kernels:
         # Select and compile the appropriate kernel
         if T == 1 and B <= 4:
