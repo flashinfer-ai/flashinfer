@@ -13,8 +13,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Gated Delta Rule Kernel (Unified Modular) using CuTe-DSL
-========================================================
+Gated Delta Rule Decode Kernel (BF16 Hidden State) - CuTe-DSL Implementation
+============================================================================
+
+RELOCATED: This file was previously located at flashinfer/cute_dsl/gated_delta_rule.py
+           and has been moved to flashinfer/gdn_decode/gdn_decode_bf16_state.py
+           to better reflect its domain-specific purpose (GDN decode with BF16 state).
 
 High-performance CUDA kernel implementing the Gated Delta Rule linear attention
 mechanism for decode-phase inference, supporting sequence lengths T=1, T=2, T=3, T=4.

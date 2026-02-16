@@ -64,7 +64,7 @@ from flashinfer.testing import bench_gpu_time
 
 # Import the gdn_decode_klast_bf16_state kernel for benchmarking (T=1..4, bf16 state, K-last)
 try:
-    from flashinfer.cute_dsl.gated_delta_rule import (
+    from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
         gated_delta_rule as gdn_decode_klast_bf16_state,
     )
 

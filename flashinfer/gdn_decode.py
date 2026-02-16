@@ -62,7 +62,7 @@ except ImportError:
 
 # GDN decode K-last bf16 state kernel (T=1..4, bf16 state, K-last layout) - optional backend
 try:
-    from .cute_dsl.gated_delta_rule import (
+    from .gdn_kernels.gdn_decode_bf16_state import (
         gated_delta_rule as _gated_delta_rule_gdn_decode_klast_bf16_state,
     )
 

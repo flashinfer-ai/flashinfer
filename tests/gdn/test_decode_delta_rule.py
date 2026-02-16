@@ -43,7 +43,7 @@ from flashinfer.utils import get_compute_capability
 
 # Import the gdn_decode_klast_bf16_state kernel (T=1..4, bf16 state, K-last layout)
 try:
-    from flashinfer.cute_dsl.gated_delta_rule import (
+    from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
         gated_delta_rule as gdn_decode_klast_bf16_state,
     )
 
