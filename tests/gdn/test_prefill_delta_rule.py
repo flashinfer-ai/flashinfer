@@ -117,7 +117,7 @@ def _test_prefill_kernel(
         scale_factor=scale,
         alpha=alpha,
         beta=beta,
-        kv_dtype=torch.float32,
+        state_dtype=torch.float32,
     )
     ref_o = ref_o.to(q.dtype)
     ref_state = ref_state.to(kv_dtype)
@@ -364,7 +364,7 @@ def _test_chunked_prefill(
         scale_factor=scale,
         alpha=alpha,
         beta=beta,
-        kv_dtype=torch.float32,
+        state_dtype=torch.float32,
     )
     ref_o = ref_o.to(q.dtype)
     ref_state = ref_state.to(kv_dtype)

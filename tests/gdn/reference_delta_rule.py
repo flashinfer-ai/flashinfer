@@ -136,7 +136,6 @@ def blockwise_linear_attention(
     decay_factor: float
     | torch.Tensor = 1.0,  # float or tensor with num_elems == num_qo_heads
     decay_exponent_offset=0,
-    kv_dtype: torch.dtype = torch.float32,
     state_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     num_qo_heads = q.size(1)
@@ -262,7 +261,6 @@ def delta_rule(
     alpha: torch.Tensor | None = None,  # [total_seq_len, num_qo_heads]
     beta: torch.Tensor | None = None,  # [total_seq_len, num_qo_heads]
     scale_factor=1.0,
-    kv_dtype: torch.dtype = torch.float32,
     state_dtype: torch.dtype = torch.float32,
 ):
     o = []
@@ -364,7 +362,6 @@ def blockwise_delta_rule(
     beta: torch.Tensor | None = None,  # [total_seq_len, num_qo_heads]
     block_size: int = 32,
     scale_factor=1.0,
-    kv_dtype: torch.dtype = torch.float32,
     state_dtype: torch.dtype = torch.float32,
     # intermediate_outputs = None,  # debug output
 ) -> torch.Tensor:
