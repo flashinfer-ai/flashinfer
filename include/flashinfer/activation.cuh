@@ -17,6 +17,8 @@
 #ifndef FLASHINFER_ACTIVATION_CUH_
 #define FLASHINFER_ACTIVATION_CUH_
 
+#include <cuda.h>
+
 #include "math.cuh"
 #include "utils.cuh"
 #include "vec_dtypes.cuh"
@@ -34,7 +36,7 @@ __global__ void act_and_mul_kernel(T* __restrict__ out, const T* __restrict__ in
   const int64_t offset = token_idx * 2 * d;
 
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  cudaGridDependencySynchronize();
 #endif
 
 #pragma unroll 1
@@ -59,7 +61,7 @@ __global__ void act_and_mul_kernel(T* __restrict__ out, const T* __restrict__ in
   }
 
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 

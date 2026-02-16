@@ -16,6 +16,8 @@
 #ifndef FLASHINFER_GROUP_GEMM_FP8_GROUPWISE_SM100_CUH_
 #define FLASHINFER_GROUP_GEMM_FP8_GROUPWISE_SM100_CUH_
 
+#include <cuda.h>
+
 #include <cassert>
 #include <iterator>
 
@@ -46,8 +48,8 @@ __global__ void compute_sm100_cutlass_group_gemm_args(
   int sf_n = n / scale_granularity_n;
   int sf_k = k / scale_granularity_k;
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaGridDependencySynchronize();
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
   int m_offset = m_indptr[i];
   int m_offset_next = m_indptr[i + 1];
