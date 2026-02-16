@@ -1836,7 +1836,7 @@ def gdn_decode_klast_bf16_state_wrapper(
     q: torch.Tensor,  # [B, T, H_Q, K] where T=1,2,3,4
     k: torch.Tensor,  # [B, T, H_K, K]
     v: torch.Tensor,  # [B, T, HV, V]
-    state: torch.Tensor,  # [B, HV, V, K] - K-fast layout (pretranspose)
+    state: torch.Tensor,  # [B, HV, V, K] - K-last layout (pretranspose)
     A_log: torch.Tensor,  # [HV]
     a: torch.Tensor,  # [B, T, HV]
     dt_bias: torch.Tensor,  # [HV]
