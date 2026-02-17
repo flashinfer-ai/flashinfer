@@ -1867,7 +1867,7 @@ def build_plans_cudnn_fp4_gemm_graph(
         o_type,
         block_size,
         device,
-        alpha,
+        alpha is not None,
         use_nvfp4,
     )
 
