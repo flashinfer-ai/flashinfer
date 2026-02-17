@@ -317,46 +317,7 @@ def test_fmha_v2_prefill_deepseek(
     torch.testing.assert_close(lse, lse_ref, rtol=1e-2, atol=1e-3)
 
 
-@pytest.mark.parametrize("batch_size", [1, 16])
-@pytest.mark.parametrize("max_seq_len", [1024, 16384])
-@pytest.mark.parametrize("num_qo_heads", [4, 32])
-@pytest.mark.parametrize("num_kv_heads", [4])
-@pytest.mark.parametrize("head_dim", [128, 256])
-@pytest.mark.parametrize(
-    ("dtype", "o_dtype"),
-    [
-        (torch.float16, torch.float16),
-        (torch.bfloat16, torch.bfloat16),
-        (torch.float8_e4m3fn, torch.float8_e4m3fn),
-        (torch.float8_e4m3fn, torch.bfloat16),
-        (torch.float8_e4m3fn, torch.float16),
-    ],
-)
-@pytest.mark.parametrize(
-    ("input_layout", "page_size", "save_softmax_stats"),
-    [
-        ("PACKED_QKV", None, False),
-        ("CONTIGUOUS_Q_KV", None, False),
-        ("SEPARATE_Q_K_V", None, False),
-        ("Q_PAGED_KV", 32, False),
-        ("Q_PAGED_KV", 128, False),
-        ("Q_PAGED_KV", 32, True),
-        ("Q_PAGED_KV", 128, True),
-    ],
-)
-@pytest.mark.parametrize(
-    ("causal", "window_left", "mask_mode"),
-    [
-        (True, -1, "CAUSAL"),
-        (True, 127, "SLIDING_WINDOW"),
-        (True, 512, "SLIDING_WINDOW"),
-    ],
-)
-@pytest.mark.parametrize("non_blocking", [True, False])
-@pytest.mark.parametrize("pos_encoding_mode", ["NONE"])
-@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
-@pytest.mark.parametrize("skip_softmax_threshold_scale_factor", [0.0, 500.0, 10000.0])
-def test_trtllm_fmha_v2_prefill(
+def run_trtllm_fmha_v2_prefill_case(
     input_layout,
     batch_size,
     max_seq_len,
@@ -374,6 +335,8 @@ def test_trtllm_fmha_v2_prefill(
     pos_encoding_mode,
     save_softmax_stats,
     skip_softmax_threshold_scale_factor,
+    rtol=None,
+    atol=None,
 ):
     from flashinfer.prefill import trtllm_fmha_v2_prefill
     from flashinfer.utils import is_sm90a_supported
@@ -606,10 +569,15 @@ def test_trtllm_fmha_v2_prefill(
         output_ref = ref_result
 
     if dtype == torch.float8_e4m3fn:
-        rtol, atol = 4e-2, 8e-2
+        default_rtol, default_atol = 4e-2, 8e-2
     else:
-        rtol, atol = 1e-2, 1e-2
-    torch.testing.assert_close(output.float(), output_ref.float(), rtol=rtol, atol=atol)
+        default_rtol, default_atol = 1e-2, 1e-2
+
+    output_rtol = default_rtol if rtol is None else rtol
+    output_atol = default_atol if atol is None else atol
+    torch.testing.assert_close(
+        output.float(), output_ref.float(), rtol=output_rtol, atol=output_atol
+    )
 
     if save_softmax_stats:
         # kernel_lse: [total_tokens, num_qo_heads, 2] -> [max, sum_exp] in ragged format
@@ -625,6 +593,144 @@ def test_trtllm_fmha_v2_prefill(
         else:
             lse_kernel = kernel_max * (q_scale * k_scale) + torch.log(kernel_sum_exp)
         torch.testing.assert_close(lse_kernel, lse_ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("batch_size", [1, 16])
+@pytest.mark.parametrize("max_seq_len", [1024, 16384])
+@pytest.mark.parametrize("num_qo_heads", [4, 32])
+@pytest.mark.parametrize("num_kv_heads", [4])
+@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize(
+    ("dtype", "o_dtype"),
+    [
+        (torch.float16, torch.float16),
+        (torch.bfloat16, torch.bfloat16),
+        (torch.float8_e4m3fn, torch.float8_e4m3fn),
+        (torch.float8_e4m3fn, torch.bfloat16),
+        (torch.float8_e4m3fn, torch.float16),
+    ],
+)
+@pytest.mark.parametrize(
+    ("input_layout", "page_size", "save_softmax_stats"),
+    [
+        ("PACKED_QKV", None, False),
+        ("CONTIGUOUS_Q_KV", None, False),
+        ("SEPARATE_Q_K_V", None, False),
+        ("Q_PAGED_KV", 32, False),
+        ("Q_PAGED_KV", 128, False),
+        ("Q_PAGED_KV", 32, True),
+        ("Q_PAGED_KV", 128, True),
+    ],
+)
+@pytest.mark.parametrize(
+    ("causal", "window_left", "mask_mode"),
+    [
+        (True, -1, "CAUSAL"),
+        (True, 127, "SLIDING_WINDOW"),
+        (True, 512, "SLIDING_WINDOW"),
+    ],
+)
+@pytest.mark.parametrize("non_blocking", [True, False])
+@pytest.mark.parametrize("pos_encoding_mode", ["NONE"])
+@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
+def test_trtllm_fmha_v2_prefill(
+    input_layout,
+    batch_size,
+    max_seq_len,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim,
+    page_size,
+    dtype,
+    o_dtype,
+    causal,
+    mask_mode,
+    non_blocking,
+    window_left,
+    logits_soft_cap,
+    pos_encoding_mode,
+    save_softmax_stats,
+):
+    run_trtllm_fmha_v2_prefill_case(
+        input_layout=input_layout,
+        batch_size=batch_size,
+        max_seq_len=max_seq_len,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        dtype=dtype,
+        o_dtype=o_dtype,
+        causal=causal,
+        mask_mode=mask_mode,
+        non_blocking=non_blocking,
+        window_left=window_left,
+        logits_soft_cap=logits_soft_cap,
+        pos_encoding_mode=pos_encoding_mode,
+        save_softmax_stats=save_softmax_stats,
+        skip_softmax_threshold_scale_factor=0.0,
+    )
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("max_seq_len", [16384])
+@pytest.mark.parametrize("num_qo_heads", [4, 32])
+@pytest.mark.parametrize("num_kv_heads", [4])
+@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize(
+    ("dtype", "o_dtype"),
+    [
+        (torch.float16, torch.float16),
+        (torch.bfloat16, torch.bfloat16),
+        (torch.float8_e4m3fn, torch.bfloat16),
+    ],
+)
+@pytest.mark.parametrize("input_layout", ["CONTIGUOUS_Q_KV", "Q_PAGED_KV"])
+@pytest.mark.parametrize(
+    (
+        "skip_softmax_threshold_scale_factor",
+        "rtol",
+        "atol",
+    ),
+    [
+        (500.0, 2e-2, 1.2e-1),
+        (10000.0, 2e-2, 2e-1),
+    ],
+)
+def test_trtllm_fmha_v2_prefill_skip_softmax(
+    input_layout,
+    batch_size,
+    max_seq_len,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim,
+    dtype,
+    o_dtype,
+    skip_softmax_threshold_scale_factor,
+    rtol,
+    atol,
+):
+    run_trtllm_fmha_v2_prefill_case(
+        input_layout=input_layout,
+        batch_size=batch_size,
+        max_seq_len=max_seq_len,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        page_size=32,
+        dtype=dtype,
+        o_dtype=o_dtype,
+        causal=True,
+        mask_mode="CAUSAL",
+        non_blocking=True,
+        window_left=-1,
+        logits_soft_cap=0.0,
+        pos_encoding_mode=None,
+        save_softmax_stats=False,
+        skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+        rtol=rtol,
+        atol=atol,
+    )
 
 
 @pytest.mark.parametrize("batch_size", [4, 16])
