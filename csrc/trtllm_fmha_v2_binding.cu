@@ -529,15 +529,17 @@ void TRTLLMFMHAv2StandardRun(TensorView q, TensorView k, TensorView v, TensorVie
   void* cu_q_seqlens_d;
   void* cu_kv_seqlens_d;
   FMHA_CHECK_CUDA(cudaMalloc(&cu_q_seqlens_d, sizeof(uint32_t) * cu_q_seqlens.size()));
-  FMHA_CHECK_CUDA(cudaMemcpy(cu_q_seqlens_d, cu_q_seqlens.data(),
-                             sizeof(uint32_t) * cu_q_seqlens.size(), cudaMemcpyHostToDevice));
+  FMHA_CHECK_CUDA(cudaMemcpyAsync(cu_q_seqlens_d, cu_q_seqlens.data(),
+                                  sizeof(uint32_t) * cu_q_seqlens.size(), cudaMemcpyHostToDevice,
+                                  stream));
   FMHA_CHECK_CUDA(cudaMalloc(&cu_kv_seqlens_d, sizeof(uint32_t) * cu_kv_seqlens.size()));
-  FMHA_CHECK_CUDA(cudaMemcpy(cu_kv_seqlens_d, cu_kv_seqlens.data(),
-                             sizeof(uint32_t) * cu_kv_seqlens.size(), cudaMemcpyHostToDevice));
+  FMHA_CHECK_CUDA(cudaMemcpyAsync(cu_kv_seqlens_d, cu_kv_seqlens.data(),
+                                  sizeof(uint32_t) * cu_kv_seqlens.size(), cudaMemcpyHostToDevice,
+                                  stream));
 
   if (maybe_lse.has_value()) {
-    FMHA_CHECK_CUDA(cudaMemset(maybe_lse.value().data_ptr(), 0,
-                               sizeof(float) * batch_size * q_seqlen * num_heads * 2));
+    FMHA_CHECK_CUDA(cudaMemsetAsync(maybe_lse.value().data_ptr(), 0,
+                                    sizeof(float) * batch_size * q_seqlen * num_heads * 2, stream));
   }
 
   float scale_bmm1 = static_cast<float>(sm_scale);
