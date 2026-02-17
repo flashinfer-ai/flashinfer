@@ -564,6 +564,17 @@ def is_sm121a_supported(device: torch.device) -> bool:
     return major == 12 and minor == 1 and version_at_least(torch.version.cuda, "12.9")
 
 
+def is_sm12x_supported(device: torch.device) -> bool:
+    """Check if the device is any SM12x GPU (SM120a, SM121a, or future variants).
+
+    Uses a major-version check (``major == 12``) so that future SM12x minor
+    variants are automatically covered without code changes, matching the
+    pattern used by ``is_sm100a_supported`` (``major == 10``).
+    """
+    major, _ = get_compute_capability(device)
+    return major == 12 and version_at_least(torch.version.cuda, "12.8")
+
+
 def determine_mla_backend(device: torch.device) -> str:
     return "fa3" if is_sm90a_supported(device) else "fa2"
 
