@@ -540,7 +540,7 @@ class AddRMSNormFP4QuantKernel:
         # including slices written by other CTAs.  We must ensure all CTAs' global
         # memory writes are visible before any CTA proceeds to Phase 3.
         if cutlass.const_expr(cluster_n > 1):
-            cute.arch.fence_acq_rel_gpu()
+            cute.arch.fence_acq_rel_cluster()
             cute.arch.cluster_arrive_relaxed()
             cute.arch.cluster_wait()
 
