@@ -1,14 +1,10 @@
 ## Attention Prefill
-# Paged prefill for Llama 3.1 70B
 --routine BatchPrefillWithPagedKVCacheWrapper --backends fa2 fa3 cudnn trtllm-gen --page_size 16 --batch_size 1 --s_qo 1024 --s_kv 1024 --num_qo_heads 64 --num_kv_heads 8 --head_dim_qk 128 --head_dim_vo 128 --random_actual_seq_len -vv --refcheck --causal --q_dtype bfloat16 --kv_dtype bfloat16 --allow_output_mismatch --generate_repro_command --case_tag "Llama-3.1-70B"
---routine BatchPrefillWithPagedKVCacheWrapper --backends fa2 fa3 cudnn trtllm-gen --page_size 16 --batch_size 32 --s_qo 1024 --s_kv 1024 --num_qo_heads 64 --num_kv_heads 8 --head_dim_qk 128 --head_dim_vo 128 --random_actual_seq_len -vv --refcheck --causal --q_dtype bfloat16 --kv_dtype bfloat16 --allow_output_mismatch --generate_repro_command --case_tag "Llama-3.1-70B"
 
 # Ragged prefill for DeepSeep-R1
---routine BatchPrefillWithRaggedKVCacheWrapper --backends fa2 fa3 cutlass cudnn --batch_size 1 --s_qo 1024 --s_kv 1024 --num_qo_heads 128 --num_kv_heads 128 --head_dim_qk 192 --head_dim_vo 128 --random_actual_seq_len -vv --refcheck --causal --q_dtype bfloat16 --kv_dtype bfloat16 --allow_output_mismatch --generate_repro_command --case_tag "DeepSeek-R1"
 --routine BatchPrefillWithRaggedKVCacheWrapper --backends fa2 fa3 cutlass cudnn --batch_size 16 --s_qo 1024 --s_kv 1024 --num_qo_heads 128 --num_kv_heads 128 --head_dim_qk 192 --head_dim_vo 128 --random_actual_seq_len -vv --refcheck --causal --q_dtype bfloat16 --kv_dtype bfloat16 --allow_output_mismatch --generate_repro_command --case_tag "DeepSeek-R1"
 
 ## Attention Decode
---routine BatchDecodeWithPagedKVCacheWrapper --backends fa2 fa2_tc cudnn trtllm-gen trtllm-gen-native --page_size 16 --batch_size 1 --s_qo 1 --s_kv 1024 --num_qo_heads 64 --num_kv_heads 8 --head_dim_qk 128 --head_dim_vo 128 --random_actual_seq_len -vv --refcheck --q_dtype bfloat16 --kv_dtype bfloat16 --allow_output_mismatch --generate_repro_command --case_tag "Llama-3.1-70B"
 --routine BatchDecodeWithPagedKVCacheWrapper --backends fa2 fa2_tc cudnn trtllm-gen trtllm-gen-native --page_size 16 --batch_size 16 --s_qo 1 --s_kv 1024 --num_qo_heads 64 --num_kv_heads 8 --head_dim_qk 128 --head_dim_vo 128 --random_actual_seq_len -vv --refcheck --q_dtype bfloat16 --kv_dtype bfloat16 --allow_output_mismatch --generate_repro_command --case_tag "Llama-3.1-70B"
 
 ## Attention MLA
@@ -16,24 +12,20 @@
 --routine BatchMLAPagedAttentionWrapper --backends trtllm-gen-native fa2 fa3 --page_size 32 --batch_size 16 --s_qo 1 --s_kv 1024 --num_qo_heads 128 --num_kv_heads 128 --head_dim_ckv 512 --head_dim_kpe 64 --random_actual_seq_len -vv --refcheck --q_dtype bfloat16 --kv_dtype bfloat16 --generate_repro_command --case_tag "DeepSeek-R1"
 
 ## FP8 bmm
---routine bmm_fp8 --batch_size 256 --m 1 --n 1024 --k 7168 --input_dtype fp8_e4m3 --mat2_dtype fp8_e4m3 --out_dtype bfloat16 --backends cudnn cublas cutlass --refcheck -vv --generate_repro_command
 --routine bmm_fp8 --batch_size 64 --m 4 --n 1024 --k 7168 --input_dtype fp8_e4m3 --mat2_dtype fp8_e4m3 --out_dtype bfloat16 --backends cudnn cublas cutlass --refcheck -vv --generate_repro_command
 
 ## FP8 GEMM with groupwise scaling
---routine gemm_fp8_nt_groupwise --m 4 --n 1024 --k 7168 --mma_sm 1 --scale_major_mode MN --backends cutlass --refcheck -vv --generate_repro_command
 --routine gemm_fp8_nt_groupwise --m 16 --n 1024 --k 7168 --mma_sm 1 --scale_major_mode MN --backends cutlass --refcheck -vv --generate_repro_command
 
 ## FP8 group GEMM with groupwise scaling
---routine group_gemm_fp8_nt_groupwise --m 4 --n 1024 --k 7168 --mma_sm 1 --group_size 2 --scale_major_mode MN --refcheck -vv --generate_repro_command
 --routine group_gemm_fp8_nt_groupwise --m 16 --n 1024 --k 7168 --mma_sm 1 --group_size 2 --scale_major_mode MN --refcheck -vv --generate_repro_command
 
 ## FP4 GEMM
 # non-autotuned
---routine mm_fp4 --m 1 --n 1024 --k 7168 --out_dtype bfloat16 --backends cudnn cutlass trtllm --use_128x4_sf_layout --use_nvfp4 --refcheck -vv --generate_repro_command
---routine mm_fp4 --m 4 --n 1024 --k 7168 --out_dtype bfloat16 --backends cudnn cutlass trtllm --use_128x4_sf_layout --use_nvfp4 --refcheck -vv --generate_repro_command
+--routine mm_fp4 --m 512 --n 1024 --k 7168 --out_dtype bfloat16 --backends cudnn cutlass trtllm --use_128x4_sf_layout --use_nvfp4 --refcheck -vv --generate_repro_command
 
 # autotuned
---routine mm_fp4 --m 4 --n 1024 --k 7168 --out_dtype bfloat16 --backends cudnn cutlass trtllm --use_128x4_sf_layout --use_nvfp4 --autotune --refcheck -vv --generate_repro_command
+--routine mm_fp4 --m 512 --n 1024 --k 7168 --out_dtype bfloat16 --backends cudnn cutlass trtllm --use_128x4_sf_layout --use_nvfp4 --autotune --refcheck -vv --generate_repro_command
 
 ## MoE
 --routine trtllm_fp4_block_scale_moe --num_tokens 1024 --hidden_size 1024 --intermediate_size 1024 --num_experts 256 --top_k 8 --n_group 8 --topk_group 4 --routed_scaling_factor 2.5 --use_routing_bias --routing_method deepseek_v3 --use_shuffled_weight -vv --generate_repro_command --case_tag "trtllm_moe_sample"
@@ -175,3 +167,117 @@
 --routine nvfp4_batched_quantize --batch_size 4 --m 1024 --k 4096 --input_dtype bfloat16 --global_scale 1.0 -vv --generate_repro_command --case_tag "nvfp4_batched_basic"
 --routine nvfp4_batched_quantize --batch_size 8 --m 2048 --k 8192 --input_dtype bfloat16 --global_scale 1.0 -vv --generate_repro_command --case_tag "nvfp4_batched_large"
 --routine nvfp4_batched_quantize --batch_size 4 --m 1024 --k 4096 --input_dtype float16 --global_scale 1.0 -vv --generate_repro_command --case_tag "nvfp4_batched_fp16"
+
+## Sampling
+# Basic softmax with temperature
+--routine softmax --batch_size 32 --vocab_size 32000 --temperature 1.0 --input_dtype float32 -vv --generate_repro_command --case_tag "softmax_llama"
+--routine softmax --batch_size 64 --vocab_size 128256 --temperature 0.8 --input_dtype float32 -vv --generate_repro_command --case_tag "softmax_llama3_temp"
+
+# Sampling from probabilities
+--routine sampling_from_probs --batch_size 32 --vocab_size 32000 -vv --generate_repro_command --case_tag "sampling_from_probs_llama"
+--routine sampling_from_probs --batch_size 64 --vocab_size 128256 -vv --generate_repro_command --case_tag "sampling_from_probs_llama3"
+
+# Sampling from logits (fused softmax + sampling)
+--routine sampling_from_logits --batch_size 32 --vocab_size 32000 --input_dtype float32 -vv --generate_repro_command --case_tag "sampling_from_logits_llama"
+--routine sampling_from_logits --batch_size 64 --vocab_size 128256 --input_dtype bfloat16 -vv --generate_repro_command --case_tag "sampling_from_logits_llama3"
+
+# Top-K sampling
+--routine top_k_sampling_from_probs --batch_size 32 --vocab_size 32000 --top_k 50 -vv --generate_repro_command --case_tag "top_k_sampling_k50"
+--routine top_k_sampling_from_probs --batch_size 32 --vocab_size 128256 --top_k 100 -vv --generate_repro_command --case_tag "top_k_sampling_k100"
+
+# Top-P (nucleus) sampling
+--routine top_p_sampling_from_probs --batch_size 32 --vocab_size 32000 --top_p 0.9 -vv --generate_repro_command --case_tag "top_p_sampling_p09"
+--routine top_p_sampling_from_probs --batch_size 32 --vocab_size 128256 --top_p 0.95 -vv --generate_repro_command --case_tag "top_p_sampling_p095"
+
+# Combined Top-K + Top-P sampling
+--routine top_k_top_p_sampling_from_probs --batch_size 32 --vocab_size 32000 --top_k 50 --top_p 0.9 --filter_apply_order top_k_first -vv --generate_repro_command --case_tag "top_k_top_p_probs"
+--routine top_k_top_p_sampling_from_logits --batch_size 32 --vocab_size 32000 --top_k 50 --top_p 0.9 --filter_apply_order top_k_first --input_dtype float32 -vv --generate_repro_command --case_tag "top_k_top_p_logits"
+
+# Min-P sampling
+--routine min_p_sampling_from_probs --batch_size 32 --vocab_size 32000 --min_p 0.1 -vv --generate_repro_command --case_tag "min_p_sampling_p01"
+--routine min_p_sampling_from_probs --batch_size 32 --vocab_size 128256 --min_p 0.05 -vv --generate_repro_command --case_tag "min_p_sampling_p005"
+
+# Top-K renormalization
+--routine top_k_renorm_probs --batch_size 32 --vocab_size 32000 --top_k 50 --input_dtype float32 -vv --generate_repro_command --case_tag "top_k_renorm"
+
+# Top-P renormalization
+--routine top_p_renorm_probs --batch_size 32 --vocab_size 32000 --top_p 0.9 -vv --generate_repro_command --case_tag "top_p_renorm"
+
+# Top-K mask logits
+--routine top_k_mask_logits --batch_size 32 --vocab_size 32000 --top_k 50 --input_dtype float32 -vv --generate_repro_command --case_tag "top_k_mask"
+
+# Chain speculative sampling (for speculative decoding)
+--routine chain_speculative_sampling --batch_size 16 --vocab_size 32000 --num_speculate_tokens 5 -vv --generate_repro_command --case_tag "chain_spec_sampling_5"
+--routine chain_speculative_sampling --batch_size 32 --vocab_size 128256 --num_speculate_tokens 8 -vv --generate_repro_command --case_tag "chain_spec_sampling_8"
+
+# Top-K selection (radix-based)
+--routine top_k --batch_size 32 --vocab_size 32000 --top_k 50 --input_dtype float32 -vv --generate_repro_command --case_tag "top_k_radix"
+--routine top_k --batch_size 64 --vocab_size 128256 --top_k 100 --input_dtype bfloat16 -vv --generate_repro_command --case_tag "top_k_radix_large"
+
+# Top-K with page table transform
+--routine top_k_page_table_transform --batch_size 16 --num_rows 16 --max_len 4096 --top_k 64 --input_dtype float32 -vv --generate_repro_command --case_tag "top_k_page_table"
+
+# Top-K with ragged transform
+--routine top_k_ragged_transform --batch_size 16 --num_rows 16 --max_len 4096 --top_k 64 --input_dtype float32 -vv --generate_repro_command --case_tag "top_k_ragged"
+
+## RoPE (Rotary Positional Embeddings)
+# Basic RoPE with indptr/offsets
+--routine apply_rope --batch_size 16 --seq_len 1024 --num_qo_heads 32 --num_kv_heads 8 --head_dim 128 --input_dtype float16 -vv --generate_repro_command --case_tag "apply_rope_llama"
+--routine apply_rope --batch_size 32 --seq_len 2048 --num_qo_heads 64 --num_kv_heads 8 --head_dim 128 --input_dtype bfloat16 -vv --generate_repro_command --case_tag "apply_rope_llama70b"
+
+# RoPE with position IDs
+--routine apply_rope_pos_ids --batch_size 16 --seq_len 1024 --num_qo_heads 32 --num_kv_heads 8 --head_dim 128 --input_dtype float16 -vv --generate_repro_command --case_tag "apply_rope_pos_ids"
+--routine apply_rope_pos_ids --batch_size 32 --seq_len 2048 --num_qo_heads 64 --num_kv_heads 8 --head_dim 128 --input_dtype bfloat16 --interleave -vv --generate_repro_command --case_tag "apply_rope_pos_ids_interleave"
+
+# Llama 3.1 style RoPE
+--routine apply_llama31_rope --batch_size 16 --seq_len 1024 --num_qo_heads 32 --num_kv_heads 8 --head_dim 128 --rope_theta 500000.0 --rope_scale 1.0 --low_freq_factor 1.0 --high_freq_factor 4.0 --old_context_len 8192 --input_dtype bfloat16 -vv --generate_repro_command --case_tag "apply_llama31_rope"
+--routine apply_llama31_rope_pos_ids --batch_size 16 --seq_len 1024 --num_qo_heads 32 --num_kv_heads 8 --head_dim 128 --rope_theta 500000.0 --rope_scale 1.0 --low_freq_factor 1.0 --high_freq_factor 4.0 --old_context_len 8192 --input_dtype bfloat16 -vv --generate_repro_command --case_tag "apply_llama31_rope_pos_ids"
+
+# RoPE with cos/sin cache
+--routine apply_rope_with_cos_sin_cache --batch_size 16 --seq_len 1024 --num_qo_heads 32 --num_kv_heads 8 --head_dim 128 --input_dtype float16 -vv --generate_repro_command --case_tag "apply_rope_cos_sin_cache"
+--routine apply_rope_with_cos_sin_cache --batch_size 32 --seq_len 2048 --num_qo_heads 64 --num_kv_heads 8 --head_dim 128 --input_dtype bfloat16 --interleave -vv --generate_repro_command --case_tag "apply_rope_cos_sin_cache_interleave"
+
+# MLA RoPE with FP8 quantization (SM8.9+ required)
+--routine mla_rope_quantize_fp8 --batch_size 16 --seq_len 1024 --num_qo_heads 128 --num_kv_heads 128 --head_dim 192 --no_rope_dim 64 --input_dtype bfloat16 --quant_dtype fp8_e4m3 -vv --generate_repro_command --case_tag "mla_rope_fp8_deepseek"
+
+# RoPE with FP8 quantization (SM8.9+ required)
+--routine rope_quantize_fp8 --batch_size 16 --seq_len 1024 --num_qo_heads 32 --num_kv_heads 8 --head_dim 128 --input_dtype bfloat16 --quant_dtype fp8_e4m3 -vv --generate_repro_command --case_tag "rope_fp8_llama"
+--routine rope_quantize_fp8 --batch_size 32 --seq_len 2048 --num_qo_heads 64 --num_kv_heads 8 --head_dim 128 --input_dtype bfloat16 --quant_dtype fp8_e4m3 -vv --generate_repro_command --case_tag "rope_fp8_llama70b"
+
+# RoPE with FP8 quantization and paged KV cache append (SM8.9+ required)
+--routine rope_quantize_fp8_append_paged_kv_cache --batch_size 16 --seq_len 64 --num_qo_heads 32 --num_kv_heads 8 --head_dim 128 --page_size 16 --kv_layout NHD --input_dtype bfloat16 --quant_dtype fp8_e4m3 -vv --generate_repro_command --case_tag "rope_fp8_paged_kv"
+--routine rope_quantize_fp8_append_paged_kv_cache --batch_size 32 --seq_len 64 --num_qo_heads 64 --num_kv_heads 8 --head_dim 128 --page_size 16 --kv_layout HND --input_dtype bfloat16 --quant_dtype fp8_e4m3 -vv --generate_repro_command --case_tag "rope_fp8_paged_kv_hnd"
+
+## Mamba (Selective State Space Models)
+# Single-token prediction (STP), Mamba-2 style (nheads/ngroups=8)
+--routine selective_state_update --batch_size 64 --nheads 64 --dim 128 --dstate 128 --ngroups 8 --input_dtype bfloat16 --backends flashinfer triton --refcheck -vv --generate_repro_command --case_tag "mamba2_stp_bf16"
+
+# STP with float32 state
+--routine selective_state_update --batch_size 64 --nheads 64 --dim 128 --dstate 128 --ngroups 8 --state_dtype float32 --backends flashinfer triton --refcheck -vv --generate_repro_command --case_tag "mamba2_stp_state_fp32"
+
+# STP with z gating enabled
+--routine selective_state_update --batch_size 64 --nheads 64 --dim 128 --dstate 128 --ngroups 8 --has_z --backends flashinfer triton --refcheck -vv --generate_repro_command --case_tag "mamba2_stp_with_z"
+
+# STP with dt_softplus enabled
+--routine selective_state_update --batch_size 64 --nheads 64 --dim 128 --dstate 128 --ngroups 8 --dt_softplus --backends flashinfer triton --refcheck -vv --generate_repro_command --case_tag "mamba2_stp_softplus"
+
+# STP with z gating and dt_softplus
+--routine selective_state_update --batch_size 64 --nheads 64 --dim 128 --dstate 128 --ngroups 8 --has_z --dt_softplus --backends flashinfer triton --refcheck -vv --generate_repro_command --case_tag "mamba2_stp_z_softplus"
+
+# STP with nheads/ngroups=1 (all heads in one group)
+--routine selective_state_update --batch_size 32 --nheads 16 --dim 128 --dstate 128 --ngroups 16 --backends flashinfer triton --refcheck -vv --generate_repro_command --case_tag "mamba2_stp_ratio1"
+
+# STP with nheads/ngroups=16
+--routine selective_state_update --batch_size 32 --nheads 128 --dim 128 --dstate 128 --ngroups 8 --backends flashinfer triton --refcheck -vv --generate_repro_command --case_tag "mamba2_stp_ratio16"
+
+# Multi-token prediction (MTP), cache_steps=1
+--routine selective_state_update --batch_size 64 --nheads 64 --dim 128 --dstate 128 --ngroups 8 --cache_steps 1 --backends flashinfer triton --refcheck -vv --generate_repro_command --case_tag "mamba2_mtp1"
+
+# MTP with cache_steps=2
+--routine selective_state_update --batch_size 64 --nheads 64 --dim 128 --dstate 128 --ngroups 8 --cache_steps 2 --backends flashinfer triton --refcheck -vv --generate_repro_command --case_tag "mamba2_mtp2"
+
+# Large batch size STP
+--routine selective_state_update --batch_size 256 --nheads 64 --dim 128 --dstate 128 --ngroups 8 --backends flashinfer triton -vv --generate_repro_command --case_tag "mamba2_stp_large_batch"
+
+# FlashInfer-only (no refcheck, perf focus)
+--routine selective_state_update --batch_size 128 --nheads 64 --dim 128 --dstate 128 --ngroups 8 --backends flashinfer -vv --generate_repro_command --case_tag "mamba2_stp_perf"

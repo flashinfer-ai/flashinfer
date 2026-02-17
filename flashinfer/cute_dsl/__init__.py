@@ -16,15 +16,33 @@ FlashInfer CuTe-DSL Kernels
 ===========================
 
 This module provides high-performance GPU kernels implemented using NVIDIA CuTe-DSL.
+
+.. deprecated::
+    Importing GEMM kernels (``grouped_gemm_nt_masked``,
+    ``Sm100BlockScaledPersistentDenseGemmKernel``, ``create_scale_factor_tensor``)
+    from ``flashinfer.cute_dsl`` is deprecated.
+    Use ``flashinfer.gemm`` instead. The old import paths will be
+    removed in a future release.
 """
 
-from .utils import is_cute_dsl_available, make_ptr, get_cutlass_dtype, get_num_sm
+from .utils import (
+    is_cute_dsl_available,
+    make_ptr,
+    get_cutlass_dtype,
+    get_num_sm,
+    convert_sf_to_mma_layout,
+    convert_sf_from_mma_layout,
+    get_mma_sf_shape,
+)
 
 # Conditionally import CuTe-DSL kernels
 if is_cute_dsl_available():
+    # Deprecated GEMM symbols: re-exported for backwards compatibility.
+    # Use flashinfer.gemm instead.
     from .blockscaled_gemm import (
         grouped_gemm_nt_masked,
         Sm100BlockScaledPersistentDenseGemmKernel,
+        create_scale_factor_tensor,
     )
     from .rmsnorm_fp4quant import (
         rmsnorm_fp4quant,
@@ -35,6 +53,10 @@ if is_cute_dsl_available():
         add_rmsnorm_fp4quant,
         AddRMSNormFP4QuantKernel,
     )
+    from .gated_delta_rule import (
+        gated_delta_rule,
+        GatedDeltaRuleKernel,
+    )
 
 __all__ = [
     # Utils (always available)
@@ -42,13 +64,18 @@ __all__ = [
     "make_ptr",
     "get_cutlass_dtype",
     "get_num_sm",
+    # Scale factor layout conversion utilities
+    "convert_sf_to_mma_layout",
+    "convert_sf_from_mma_layout",
+    "get_mma_sf_shape",
 ]
 
 if is_cute_dsl_available():
     __all__ += [
-        # Blockscaled GEMM
+        # Blockscaled GEMM (deprecated, use flashinfer.gemm instead)
         "grouped_gemm_nt_masked",
         "Sm100BlockScaledPersistentDenseGemmKernel",
+        "create_scale_factor_tensor",
         # RMSNorm + FP4 Quantization
         "rmsnorm_fp4quant",
         "RMSNormFP4QuantKernel",
@@ -56,4 +83,7 @@ if is_cute_dsl_available():
         # Add + RMSNorm + FP4 Quantization
         "add_rmsnorm_fp4quant",
         "AddRMSNormFP4QuantKernel",
+        # Gated Delta Rule
+        "gated_delta_rule",
+        "GatedDeltaRuleKernel",
     ]

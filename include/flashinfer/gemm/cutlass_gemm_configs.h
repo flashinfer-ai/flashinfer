@@ -133,6 +133,11 @@ enum class CutlassTileConfigSM100 {
   CtaShape256x64x128B,
   CtaShape256x128x128B,
   CtaShape256x256x128B,
+
+  // SM103
+  CtaShape128x128x768B,
+  CtaShape128x192x768B,
+  CtaShape128x256x768B,
 };
 
 enum class CutlassTileConfigSM120 {
@@ -188,7 +193,11 @@ enum class TileShape {
   TileShape_128x32x128,
   TileShape_128x64x128,
   TileShape_128x128x128,
-  TileShape_128x256x128
+  TileShape_128x256x128,
+  // SM103
+  TileShape_128x128x768,
+  TileShape_128x192x768,
+  TileShape_128x256x768
 };
 
 template <TileShape Shape_MNK>
@@ -216,6 +225,12 @@ constexpr auto get_tile_shape() {
     return cute::Shape<_128, _128, _128>{};
   } else if constexpr (Shape_MNK == TileShape::TileShape_128x256x128) {
     return cute::Shape<_128, _256, _128>{};
+  } else if constexpr (Shape_MNK == TileShape::TileShape_128x128x768) {  // SM103
+    return cute::Shape<_128, _128, _768>{};
+  } else if constexpr (Shape_MNK == TileShape::TileShape_128x192x768) {  // SM103
+    return cute::Shape<_128, _192, _768>{};
+  } else if constexpr (Shape_MNK == TileShape::TileShape_128x256x768) {  // SM103
+    return cute::Shape<_128, _256, _768>{};
   }
 }
 
@@ -242,6 +257,12 @@ static auto get_tile_shape_name(TileShape Shape_MNK) {
     return "128x128x128";
   } else if (Shape_MNK == TileShape::TileShape_128x256x128) {
     return "128x256x128";
+  } else if (Shape_MNK == TileShape::TileShape_128x128x768) {  // SM103
+    return "128x128x768";
+  } else if (Shape_MNK == TileShape::TileShape_128x192x768) {  // SM103
+    return "128x192x768";
+  } else if (Shape_MNK == TileShape::TileShape_128x256x768) {  // SM103
+    return "128x256x768";
   }
   return "Unknown shape";
 }
@@ -256,7 +277,8 @@ enum class ClusterShape {
   ClusterShape_2x4x1,
   ClusterShape_4x4x1,
   ClusterShape_1x8x1,
-  ClusterShape_8x1x1
+  ClusterShape_8x1x1,
+  ClusterShape_4x1x1
 };
 
 static auto get_cluster_shape_name(ClusterShape Shape_MNK) {
@@ -272,6 +294,8 @@ static auto get_cluster_shape_name(ClusterShape Shape_MNK) {
     return "1x8x1";
   } else if (Shape_MNK == ClusterShape::ClusterShape_8x1x1) {
     return "8x1x1";
+  } else if (Shape_MNK == ClusterShape::ClusterShape_4x1x1) {
+    return "4x1x1";
   }
   return "Unknown shape";
 }
@@ -291,6 +315,8 @@ constexpr auto get_cluster_shape() {
     return cute::Shape<_1, _8, _1>{};
   } else if constexpr (Shape_MNK == ClusterShape::ClusterShape_8x1x1) {
     return cute::Shape<_8, _1, _1>{};
+  } else if constexpr (Shape_MNK == ClusterShape::ClusterShape_4x1x1) {
+    return cute::Shape<_4, _1, _1>{};
   }
 }
 
@@ -322,6 +348,7 @@ struct CutlassGemmConfig {
   bool enableCudaKernel = false;
   int sm_version = 80;  // Use 80 as a catch all for <90
   bool is_tma_warp_specialized = false;
+  bool use_stream_k = false;  // SM120: false = DP scheduler (default), true = StreamK scheduler
 
   CutlassGemmConfig() = default;
 
@@ -352,15 +379,18 @@ struct CutlassGemmConfig {
         sm_version(100),
         is_tma_warp_specialized(true) {}
 
+  // SM120 constructor with optional StreamK scheduler
+  // use_stream_k: false = DP scheduler (default), true = StreamK scheduler (auto heuristic)
   CutlassGemmConfig(CutlassTileConfigSM120 tile_config_sm120,
                     MainloopScheduleType mainloop_schedule, EpilogueScheduleType epilogue_schedule,
-                    ClusterShape cluster_shape)
+                    ClusterShape cluster_shape, bool use_stream_k = false)
       : tile_config_sm120(tile_config_sm120),
         mainloop_schedule(mainloop_schedule),
         epilogue_schedule(epilogue_schedule),
         cluster_shape(cluster_shape),
         sm_version(120),
-        is_tma_warp_specialized(true) {}
+        is_tma_warp_specialized(true),
+        use_stream_k(use_stream_k) {}
 
   int getTileConfigAsInt() const {
     if (sm_version == 120) return (int)tile_config_sm120;
@@ -383,6 +413,10 @@ struct CutlassGemmConfig {
              << "\n\tmainloop sched: " << (int)mainloop_schedule
              << "\n\tepi sched: " << (int)epilogue_schedule
              << "\n\tenable cuda kernel: " << (enableCudaKernel ? "true" : "false");
+      // SM120 specific: StreamK scheduler option
+      if (sm_version == 120) {
+        tactic << "\n\tscheduler: " << (use_stream_k ? "StreamK (auto heuristic)" : "DP (default)");
+      }
     } else if (tile_config_sm80 != flashinfer::gemm::CutlassTileConfig::ChooseWithHeuristic) {
       assert(sm_version < 90 && "Invalid cutlass GEMM config");
       tactic << "\n\tstyle=compatible"

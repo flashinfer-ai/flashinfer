@@ -292,6 +292,10 @@ struct TllmGenFmhaRunnerParams {
   float mScaleSfKv;
   // The SF scale for output.
   float mScaleSfO;
+  // Do we skip softmax when possible?
+  bool mSkipsSoftmaxWhenPossible;
+  // Skip softmax threshold scale factor.
+  float mSkipSoftmaxThresholdScaleFactor;
   // Whether to use sparse MLA.
   bool mSparseMla;
   // The top k value for sparse MLA.
@@ -354,6 +358,8 @@ struct TllmGenSelectKernelParams {
   bool mReuseSmemKForV;
   // Do we need to select a new kernel as the parameters have been updated.
   bool mSelectNewKernel;
+  // Do we enable skip softmax?
+  bool mSkipsSoftmaxWhenPossible;
   // The tile scheduler.
   TileScheduler mTileScheduler;
   // The tile size for Q.
@@ -376,6 +382,7 @@ struct TllmGenSelectKernelParams {
         mNumTokensPerPage(params.mNumTokensPerPage),
         mReuseSmemKForV(false),
         mSelectNewKernel(false),
+        mSkipsSoftmaxWhenPossible(params.mSkipsSoftmaxWhenPossible),
         mTileScheduler(params.mTileScheduler),
         mTileSizeQ(128),
         mTileSizeKv(128),
