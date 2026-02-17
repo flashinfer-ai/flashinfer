@@ -20,8 +20,8 @@ limitations under the License.
 # duplication. See that file for the canonical Triton kernel source.
 # ==============================================================================
 
-import importlib
 import os
+import sys
 from collections import defaultdict
 
 import numpy as np
@@ -53,22 +53,25 @@ def _import_triton_reference():
     _this_dir = os.path.dirname(os.path.abspath(__file__))
     _repo_root = os.path.normpath(os.path.join(_this_dir, "..", ".."))
     _triton_ref_path = os.path.join(
-        _repo_root, "tests", "mamba", "selective_state_update_triton.py"
+        _repo_root, "tests", "mamba", "triton_reference", "selective_state_update.py"
     )
 
     if not os.path.isfile(_triton_ref_path):
         raise ImportError(
             f"Cannot find Triton reference kernel at: {_triton_ref_path}\n"
-            f"Expected location: <repo>/tests/mamba/selective_state_update_triton.py\n"
+            f"Expected location: <repo>/tests/mamba/triton_reference/selective_state_update.py\n"
             f"Make sure you are running from within the FlashInfer repository."
         )
 
-    spec = importlib.util.spec_from_file_location(
-        "selective_state_update_triton", _triton_ref_path
-    )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.selective_state_update_triton
+    # Add the tests/mamba directory to sys.path so that the relative imports
+    # inside the triton_reference package resolve correctly.
+    _tests_mamba_dir = os.path.join(_repo_root, "tests", "mamba")
+    if _tests_mamba_dir not in sys.path:
+        sys.path.insert(0, _tests_mamba_dir)
+
+    from triton_reference.selective_state_update import selective_state_update_triton
+
+    return selective_state_update_triton
 
 
 selective_state_update_triton_reference = _import_triton_reference()
