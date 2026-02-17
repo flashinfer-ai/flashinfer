@@ -99,13 +99,17 @@ def _mamba_chunk_scan_combined_fwd(
 
     # 1. Compute chunked cumsum of A * dt
     # - here dt may go through a softplus activation
+    torch.cuda.nvtx.range_push("triton:chunk_cumsum")
     dA_cumsum, dt = _chunk_cumsum_fwd(
         dt, A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit
     )
+    torch.cuda.nvtx.range_pop()
 
     # 2. Compute the state for each intra-chunk
     # (right term of low-rank factorization of off-diagonal blocks; B terms)
+    torch.cuda.nvtx.range_push("triton:chunk_state")
     states = _chunk_state_fwd(B, x, dt, dA_cumsum, seq_idx=seq_idx, states_in_fp32=True)
+    torch.cuda.nvtx.range_pop()
 
     # 3. Compute the inter-chunk SSM recurrence; produces correct SSM states at chunk boundaries
     # (middle term of factorization of off-diag blocks; A terms)
@@ -118,6 +122,7 @@ def _mamba_chunk_scan_combined_fwd(
     # - this will ensure that states will be updated with the rightmost flushed seq_idx
     #   of the previous chunk. This implies that the first chunk of states is either 0
     #   or equal to init_states of the first example.
+    torch.cuda.nvtx.range_push("triton:state_passing")
     states, final_states = _state_passing_fwd(
         rearrange(states, "... p n -> ... (p n)"),
         dA_cumsum,
@@ -135,9 +140,12 @@ def _mamba_chunk_scan_combined_fwd(
     states, final_states = (
         rearrange(t, "... (p n) -> ... p n", n=dstate) for t in [states, final_states]
     )
+    torch.cuda.nvtx.range_pop()
 
     # 4. Compute batched matrix multiply for C_j^T B_i terms
+    torch.cuda.nvtx.range_push("triton:bmm_chunk")
     CB = _bmm_chunk_fwd(C, B, chunk_size, seq_idx=seq_idx, output_dtype=torch.float32)
+    torch.cuda.nvtx.range_pop()
 
     # 5. Scan and compute the diagonal blocks, taking into
     #    account past causal states.
@@ -149,6 +157,7 @@ def _mamba_chunk_scan_combined_fwd(
     # - in each (pseudo) chunk, we detect if the previous (pseudo) chunk had
     #   a seq_idx change, in which case we take states information from
     #   init_states.
+    torch.cuda.nvtx.range_push("triton:chunk_scan")
     out_x = _chunk_scan_fwd(
         CB,
         x,
@@ -164,12 +173,14 @@ def _mamba_chunk_scan_combined_fwd(
         initial_states=initial_states,
         out=out,
     )
+    torch.cuda.nvtx.range_pop()
     if cu_seqlens is None:
         return out_x, dt, dA_cumsum, states, final_states
     else:
         assert batch == 1, (
             "passing cu_seqlens to get the varlen states is only supported if batch dimension is 1"
         )
+        torch.cuda.nvtx.range_push("triton:chunk_state_varlen")
         varlen_states = chunk_state_varlen(
             B.squeeze(0),
             x.squeeze(0),
@@ -179,6 +190,7 @@ def _mamba_chunk_scan_combined_fwd(
             states.squeeze(0),
             initial_states=initial_states,
         )
+        torch.cuda.nvtx.range_pop()
         return out_x, dt, dA_cumsum, states, final_states, varlen_states
 
 

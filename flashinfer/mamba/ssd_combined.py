@@ -165,13 +165,14 @@ class _SSDKernel:
         dt_processed: torch.Tensor,
         B: torch.Tensor,
         C: torch.Tensor,
+        out: torch.Tensor,
         D: Optional[torch.Tensor] = None,
         z: Optional[torch.Tensor] = None,
         init_states: Optional[torch.Tensor] = None,
         seq_idx: Optional[torch.Tensor] = None,
         chunk_indices: Optional[torch.Tensor] = None,
         chunk_offsets: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """
         Run the SSD kernel with preprocessed inputs.
 
@@ -181,11 +182,12 @@ class _SSDKernel:
             dt_processed: (batch, nheads, nchunks, chunk_size)
             B: (batch, seqlen, ngroups, dstate)
             C: (batch, seqlen, ngroups, dstate)
+            out: (batch, nheads, headdim, nchunks, chunk_size) contiguous —
+                 kernel writes via permuted (L, D, C, EH, B) view, zero-copy
             D: Optional (nheads, headdim) or (nheads,)
             init_states: Optional (batch, nheads, headdim, dstate)
 
         Returns:
-            out: (batch, seqlen, nheads, headdim)
             final_states: (batch, nheads, headdim, dstate)
         """
         cutlass = self.modules["cutlass"]
@@ -331,16 +333,17 @@ class _SSDKernel:
         else:
             init_states_tensor = None
 
-        # Output tensors
-        # y: (chunk_size, headdim, nchunks, nheads, batch)
-        y_tensor, y_cutlass = _create_cutlass_tensor(
-            [batch, nheads, headdim, nchunks, chunk_size],
-            [4, 2, 3, 1, 0],
-            self.io_dtype,
-            [2, 3, 4],
-            cutlass_torch,
-            from_dlpack,
+        # Output tensor y: zero-copy from pre-allocated out
+        # out is contiguous (B, EH, D, C, L), permute to (L, D, C, EH, B) for kernel
+        assert out.dtype == io_torch_dtype, (
+            f"out dtype {out.dtype} doesn't match {io_torch_dtype}"
         )
+        out_permuted = out.permute(4, 2, 3, 1, 0)  # (L, D, C, EH, B)
+        y_tensor = from_dlpack(out_permuted, assumed_align=16)
+        for mode in [2, 3, 4]:
+            y_tensor = y_tensor.mark_compact_shape_dynamic(
+                mode=mode, stride_order=out_permuted.dim_order()
+            )
 
         # fstate: (headdim, dstate, nheads, batch_or_num_seqs)
         # For varlen, kernel indexes by seq_id so dim 0 must be num_seqs
@@ -451,18 +454,11 @@ class _SSDKernel:
         torch.cuda.nvtx.range_pop()  # run:launch
 
         torch.cuda.nvtx.range_push("run:output_convert")
-        # Convert outputs back to Triton layout
-        # y_cutlass is (L, D, C, EH, B)
-        # We need to map it back to (batch, seqlen, nheads, headdim)
-        # Permute (L, D, C, EH, B) -> (B, C, L, EH, D)
-        y_permuted = y_cutlass.permute(4, 2, 0, 3, 1)
-        y_out = y_permuted.reshape(batch, seqlen, nheads, headdim)
-
-        # return to torch indexing
+        # y was written directly into out (zero-copy)
         fstate_out = fstate_cutlass.permute(3, 2, 1, 0)
         torch.cuda.nvtx.range_pop()  # run:output_convert
 
-        return y_out, fstate_out
+        return fstate_out
 
 
 @functools.cache
@@ -633,15 +629,17 @@ def ssd_combined_fwd(
             f"got {chunk_indices.shape} vs {chunk_offsets.shape}"
         )
     # Validate pre-allocated output tensor
+    # Kernel's native layout: (B, EH, D, C, L) contiguous
+    nchunks = seqlen // chunk_size
     if out is not None:
-        assert out.shape == (batch, seqlen, nheads, headdim), (
+        assert out.shape == (batch, nheads, headdim, nchunks, chunk_size), (
             f"out shape {out.shape} doesn't match "
-            f"expected ({batch}, {seqlen}, {nheads}, {headdim})"
+            f"expected ({batch}, {nheads}, {headdim}, {nchunks}, {chunk_size})"
         )
         assert out.dtype == x.dtype, (
             f"out dtype {out.dtype} doesn't match x dtype {x.dtype}"
         )
-        assert out.is_contiguous(), "out must be contiguous"
+        assert out.is_contiguous(), "out must be contiguous in (B, EH, D, C, L) layout"
         assert out.device == x.device, (
             f"out device {out.device} doesn't match x device {x.device}"
         )
@@ -684,13 +682,21 @@ def ssd_combined_fwd(
     )
     torch.cuda.nvtx.range_pop()
 
+    # Allocate output in kernel's native layout if not provided
+    if out is None:
+        out = torch.empty(
+            batch, nheads, headdim, nchunks, chunk_size,
+            dtype=x.dtype, device=x.device,
+        )
+
     torch.cuda.nvtx.range_push("kernel.run")
-    y_out, final_states = kernel.run(
+    final_states = kernel.run(
         x=x,
         dA_cumsum=dA_cumsum,
         dt_processed=dt_processed,
         B=B,
         C=C,
+        out=out,
         D=D,
         z=z,
         init_states=initial_states,
@@ -700,14 +706,10 @@ def ssd_combined_fwd(
     )
     torch.cuda.nvtx.range_pop()
 
-    torch.cuda.nvtx.range_push("output_copy")
-    if out is not None:
-        out.copy_(y_out)
-    else:
-        out = y_out.contiguous()
-    torch.cuda.nvtx.range_pop()
+    # Zero-copy view: (B, EH, D, C, L) -> (B, C, L, EH, D) -> (B, seqlen, EH, D)
+    out_view = out.permute(0, 3, 4, 1, 2).reshape(batch, seqlen, nheads, headdim)
 
     if return_final_states:
-        return out, final_states
+        return out_view, final_states
     else:
-        return out, None
+        return out_view, None

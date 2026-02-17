@@ -1291,8 +1291,9 @@ def test_preallocated_output():
         dt_softplus=True,
     )
 
-    # Run with pre-allocated output
-    out = torch.empty(batch, seqlen, nheads, headdim, dtype=dtype, device="cuda")
+    # Run with pre-allocated output in kernel's native layout (B, EH, D, C, L)
+    nchunks = seqlen // chunk_size
+    out = torch.empty(batch, nheads, headdim, nchunks, chunk_size, dtype=dtype, device="cuda")
     out_test, _ = ssd_combined_fwd(
         x,
         dt,
@@ -1306,8 +1307,8 @@ def test_preallocated_output():
         out=out,
     )
 
-    assert out_test.data_ptr() == out.data_ptr(), (
-        "Returned tensor should be the same object as the pre-allocated output"
+    assert out_test.untyped_storage().data_ptr() == out.untyped_storage().data_ptr(), (
+        "Returned tensor should share storage with the pre-allocated output"
     )
     assert torch.allclose(out_ref, out_test, atol=7e-2, rtol=7e-2), (
         "Pre-allocated output values don't match non-pre-allocated run"
