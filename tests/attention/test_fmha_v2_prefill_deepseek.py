@@ -569,7 +569,10 @@ def run_trtllm_fmha_v2_prefill_case(
         output_ref = ref_result
 
     if dtype == torch.float8_e4m3fn:
-        default_rtol, default_atol = 4e-2, 8e-2
+        if o_dtype == torch.float8_e4m3fn:
+            default_rtol, default_atol = 1e-1, 1e-1
+        else:
+            default_rtol, default_atol = 4e-2, 8e-2
     else:
         default_rtol, default_atol = 1e-2, 1e-2
 

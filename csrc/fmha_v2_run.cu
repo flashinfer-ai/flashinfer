@@ -476,14 +476,6 @@ void fmha_v2_run(
   size_t warps_m, warps_n, warps_k;
   std::tie(warps_m, warps_n, warps_k) = get_warps(launch_params, sm, data_type, s, b, d, 2);
 
-  // Debug output for warps
-  printf("DEBUG: get_warps returned warps_m=%zu, warps_n=%zu, warps_k=%zu\n", warps_m, warps_n,
-         warps_k);
-  printf("DEBUG: launch_params: flash_attention=%d, warp_specialization=%d, use_tma=%d\n",
-         launch_params.flash_attention, launch_params.warp_specialization, launch_params.use_tma);
-  printf("DEBUG: data_type=%d, sm=%d, s=%zu, d=%zu\n", int(data_type), sm, s, d);
-  fflush(stdout);
-
   // For multi-CTA cases, determine the size of the CTA wave.
   int heads_per_wave, ctas_per_head;
   get_grid_size(heads_per_wave, ctas_per_head, sm, data_type, b, s, h, d,
@@ -627,15 +619,6 @@ void fmha_v2_run(
   // Allocate tile id for dynamic scheduling
   void* tile_id_counter_d =
       allocator.aligned_alloc<void>(sizeof(uint32_t), 16, "tile_id_counter_d");
-
-  // Zero synchronization counters to avoid race conditions from stale workspace data.
-  // The workspace buffer may contain non-zero values from previous kernel executions.
-  if (tile_id_counter_d) {
-    cudaMemsetAsync(tile_id_counter_d, 0, sizeof(uint32_t), stream);
-  }
-  if (counters_d) {
-    cudaMemsetAsync(counters_d, 0, 3 * counters_sz, stream);
-  }
 
   // The number of heads computed per wave.
   params_v2.heads_per_wave = heads_per_wave;
