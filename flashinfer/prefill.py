@@ -116,7 +116,9 @@ def get_fmha_module(
             use_logits_soft_cap,
         ).build_and_load()
     else:
-        raise ValueError("SM100A is not supported on this device")
+        raise ValueError(
+            "This device is not supported; requires SM100a, SM110a, or SM12x."
+        )
 
 
 def make_hashable_cache(func):
