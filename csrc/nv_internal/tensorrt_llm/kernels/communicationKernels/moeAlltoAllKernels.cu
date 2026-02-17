@@ -762,7 +762,11 @@ __global__ void moeA2ACombineKernel(
         return;
       }
     }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     asm volatile("fence.acquire.sys;");
+#else
+    __threadfence_system();
+#endif
   }
   __syncthreads();
 #endif
