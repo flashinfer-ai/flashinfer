@@ -98,18 +98,17 @@ def check_cuda_arch():
     MIN_COMPUTE_VERSION = 75
 
     def _archs_eligible(archs):
-        eligible = False
         for major, minor in archs:
-            if major >= 9:
-                eligible = True
-            elif major == 8:
-                minor_int = int(minor) if minor.isdigit() else 0
-                if major * 10 + minor_int >= MIN_COMPUTE_VERSION:
-                    eligible = True
-            elif major == 7 and minor.isdigit():
-                if major * 10 + int(minor) >= MIN_COMPUTE_VERSION:
-                    eligible = True
-        return eligible
+            if major >= 8:
+                return True
+            if major == 7:
+                try:
+                    if int(minor) >= 5:
+                        return True
+                except (ValueError, TypeError):
+                    # For sm7x, we only consider integer minor versions.
+                    pass
+        return False
 
     # Use compilation context (from FLASHINFER_CUDA_ARCH_LIST or auto-detect at import time)
     archs = current_compilation_context.TARGET_CUDA_ARCHS
@@ -125,9 +124,11 @@ def check_cuda_arch():
             logger.debug("Re-query of CUDA archs failed: %s", e)
 
     # If still not eligible, check actual GPU capability at runtime
+
     if not eligible:
         try:
             import torch
+
             if torch.cuda.is_available():
                 for device in range(torch.cuda.device_count()):
                     major, minor = torch.cuda.get_device_capability(device)
@@ -136,10 +137,13 @@ def check_cuda_arch():
                         eligible = True
                         logger.info(
                             "GPU %s supports sm%s%s (compute %s), enabling FlashInfer",
-                            device, major, minor, compute_version,
+                            device,
+                            major,
+                            minor,
+                            compute_version,
                         )
                         break
-        except Exception as e:
+        except (ImportError, ModuleNotFoundError, RuntimeError, AttributeError) as e:
             logger.warning("Failed to check GPU capability: %s", e)
 
     if not eligible:
