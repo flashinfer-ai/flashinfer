@@ -125,7 +125,7 @@ def check_cuda_arch():
 
     # If still not eligible, check actual GPU capability at runtime
 
-    if not eligible:
+    if not eligible and len(archs) == 0:
         try:
             import torch
 
