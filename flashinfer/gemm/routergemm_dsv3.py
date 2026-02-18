@@ -5,8 +5,6 @@ from types import SimpleNamespace
 import torch
 from flashinfer.utils import (
     register_custom_op,
-    supported_compute_capability,
-    backend_requirement,
 )
 
 
@@ -64,8 +62,6 @@ def _mm_M1_16_K7168_shape_checks(
     return True
 
 
-# TODO: other compute capabilities may be supported but are untested
-@supported_compute_capability([100])
 def _mm_M1_16_K7168_N256_shape_checks(mat_a, mat_b, out, launch_with_pdl):
     return _mm_M1_16_K7168_shape_checks(
         mat_a,
@@ -77,8 +73,6 @@ def _mm_M1_16_K7168_N256_shape_checks(mat_a, mat_b, out, launch_with_pdl):
     )
 
 
-# TODO: other compute capabilities may be supported but are untested
-@supported_compute_capability([100])
 def _mm_M1_16_K7168_N128_shape_checks(mat_a, mat_b, out, launch_with_pdl):
     return _mm_M1_16_K7168_shape_checks(
         mat_a,
@@ -124,7 +118,6 @@ def get_dsv3_router_gemm_module():
     )
 
 
-@backend_requirement({}, common_check=_mm_M1_16_K7168_N128_shape_checks)
 @flashinfer_api
 def mm_M1_16_K7168_N128(
     mat_a: torch.Tensor,
@@ -155,7 +148,7 @@ def mm_M1_16_K7168_N128(
             routing scores. Must be bfloat16, row-major (contiguous). This tensor is
             mutated in-place.
         launch_with_pdl (bool, optional): Whether to launch the kernel using Persistent
-            Device-side Launch. Defaults to False.
+            Device-side Launch (SM90+ only). Defaults to False.
 
     Returns:
         None: The result is written directly to the `out` tensor.
@@ -165,16 +158,16 @@ def mm_M1_16_K7168_N128(
             expected Mistral Large 3 router configuration.
 
     Note:
-        This kernel is specialized for compute capability 10.0 (Blackwell architecture).
         The specific problem size optimization makes this significantly faster than
         general-purpose GEMM implementations for the router operation.
+        Persistent Device-side Launch (PDL) is supported on SM90+ architectures.
     """
+    _mm_M1_16_K7168_N128_shape_checks(mat_a, mat_b, out, launch_with_pdl)
     get_dsv3_router_gemm_module().mm_M1_16_K7168_N128(
         mat_a, mat_b, out, launch_with_pdl
     )
 
 
-@backend_requirement({}, common_check=_mm_M1_16_K7168_N256_shape_checks)
 @flashinfer_api
 def mm_M1_16_K7168_N256(
     mat_a: torch.Tensor,
@@ -205,7 +198,7 @@ def mm_M1_16_K7168_N256(
             routing scores. Must be float32, row-major (contiguous). This tensor is
             mutated in-place.
         launch_with_pdl (bool, optional): Whether to launch the kernel using Persistent
-            Device-side Launch. Defaults to False.
+            Device-side Launch (SM90+ only). Defaults to False.
 
     Returns:
         None: The result is written directly to the `out` tensor.
@@ -215,10 +208,11 @@ def mm_M1_16_K7168_N256(
             expected DeepSeek-V3 router configuration.
 
     Note:
-        This kernel is specialized for compute capability 10.0 (Blackwell architecture).
         The specific problem size optimization makes this significantly faster than
         general-purpose GEMM implementations for the router operation.
+        Persistent Device-side Launch (PDL) is supported on SM90+ architectures.
     """
+    _mm_M1_16_K7168_N256_shape_checks(mat_a, mat_b, out, launch_with_pdl)
     get_dsv3_router_gemm_module().mm_M1_16_K7168_N256(
         mat_a, mat_b, out, launch_with_pdl
     )
