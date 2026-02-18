@@ -22,6 +22,7 @@ This benchmark supports:
 2. Single layout comparison: FlashInfer (CuTe DSL) vs Triton kernel (--compare)
 3. MTP benchmark (--version mtp)
 4. gdn_decode_klast_bf16_state benchmark (--version gdn_decode_klast_bf16_state) for T=1,2,3,4
+5. gdn_decode_hfp32_state benchmark (--version gdn_decode_hfp32_state) for T=1 with FP32 state
 
 Kernels benchmarked:
 - FlashInfer Pretranspose [B, HV, V, K] (V-major layout)
@@ -29,7 +30,9 @@ Kernels benchmarked:
 - Triton Pretranspose [B, HV, V, K]
 - Triton Nontranspose [B, HV, K, V]
 - gdn_decode_klast_bf16_state [B, HV, V, K] (K-fast layout, T=1..4, bf16 state)
-  from flashinfer.cute_dsl.gated_delta_rule
+  from flashinfer.gdn_kernels.gdn_decode_bf16_state
+- gdn_decode_hfp32_state [B, HV, V, K] (pretranspose layout, T=1 only, fp32 state)
+  from flashinfer.gdn_kernels.gdn_decode_hfp32_state
 
 Usage:
     # Default: All layouts comparison (FlashInfer/Triton x pretranspose/nontranspose + gdn_decode_klast_bf16_state)
@@ -46,6 +49,9 @@ Usage:
 
     # gdn_decode_klast_bf16_state benchmark (T=1,2,3,4)
     python benchmarks/bench_gdn_decode.py --version gdn_decode_klast_bf16_state --batch-size 1 32 128 512
+
+    # gdn_decode_hfp32_state benchmark (T=1, FP32 state) - compares vs FlashInfer pretranspose
+    python benchmarks/bench_gdn_decode.py --version gdn_decode_hfp32_state --batch-size 1 2 4 8 16 32 64 128 256 512
 
     # Use Qwen3-Next preset (q=k=16, v=32, d=128)
     python benchmarks/bench_gdn_decode.py --preset qwen3-next --batch-size 1 32 128 512
@@ -71,6 +77,16 @@ try:
     GDN_DECODE_KLAST_BF16_STATE_AVAILABLE = True
 except ImportError:
     GDN_DECODE_KLAST_BF16_STATE_AVAILABLE = False
+
+# Import the gdn_decode_hfp32_state kernel for benchmarking (T=1, fp32 state, pretranspose)
+try:
+    from flashinfer.gdn_kernels.gdn_decode_hfp32_state import (
+        gated_delta_rule_hfp32 as gdn_decode_hfp32_state,
+    )
+
+    GDN_DECODE_HFP32_STATE_AVAILABLE = True
+except ImportError:
+    GDN_DECODE_HFP32_STATE_AVAILABLE = False
 
 
 # ============================================================================
@@ -2380,6 +2396,273 @@ def run_gdn_decode_klast_bf16_state_benchmark(args, dtype, use_qk_l2norm):
 
 
 # ============================================================================
+# gdn_decode_hfp32_state Benchmark (T=1, FP32 state, pretranspose)
+# ============================================================================
+
+
+def gdn_decode_hfp32_state_wrapper(
+    q, k, v, state, A_log, a, dt_bias, b, scale, output, use_qk_l2norm
+):
+    """Wrapper for gdn_decode_hfp32_state kernel."""
+    out = gdn_decode_hfp32_state(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        softplus_beta=1.0,
+        softplus_threshold=20.0,
+        q=q,
+        k=k,
+        v=v,
+        b=b,
+        initial_state_source=state,
+        use_qk_l2norm_in_kernel=use_qk_l2norm,
+        scale=scale,
+    )
+    output.copy_(out)
+
+
+def bench_gdn_decode_hfp32_state_vs_pretranspose(
+    batch_size: int,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_size: int,
+    dtype: torch.dtype,
+    use_qk_l2norm: bool = True,
+    warmup_iters: int = 10,
+    bench_iters: int = 100,
+):
+    """
+    Benchmark comparing gdn_decode_hfp32_state (CuTe-DSL) vs gated_delta_rule_decode_pretranspose.
+    Both use FP32 hidden state with pretranspose layout [B, HV, V, K].
+    """
+    num_o_heads = max(num_q_heads, num_v_heads)
+    num_sab_heads = num_o_heads
+    seq_len = 1  # T=1 only
+
+    # Create input tensors
+    q = torch.randn(
+        batch_size, seq_len, num_q_heads, head_size, dtype=dtype, device="cuda"
+    )
+    k = torch.randn(
+        batch_size, seq_len, num_k_heads, head_size, dtype=dtype, device="cuda"
+    )
+    v = torch.randn(
+        batch_size, seq_len, num_v_heads, head_size, dtype=dtype, device="cuda"
+    )
+
+    # GDN parameters
+    A_log = torch.randn(num_sab_heads, dtype=torch.float32, device="cuda") * 0.1
+    a = (
+        torch.randn(batch_size, seq_len, num_sab_heads, dtype=dtype, device="cuda")
+        * 0.1
+    )
+    dt_bias = torch.randn(num_sab_heads, dtype=torch.float32, device="cuda") * 0.1
+    b = torch.randn(batch_size, seq_len, num_sab_heads, dtype=dtype, device="cuda")
+
+    # FP32 state in pretranspose layout [B, HV, V, K]
+    state_pretranspose = torch.randn(
+        batch_size,
+        num_sab_heads,
+        head_size,
+        head_size,
+        dtype=torch.float32,
+        device="cuda",
+    )
+
+    scale = 1.0 / (head_size**0.5)
+
+    results = {"batch_size": batch_size}
+
+    # Pre-allocate output tensor for FlashInfer (avoids allocation overhead in timing)
+    output_fi = torch.empty(
+        batch_size, seq_len, num_o_heads, head_size, dtype=dtype, device="cuda"
+    )
+
+    # Benchmark FlashInfer pretranspose (reference FP32 kernel)
+    state_copy = state_pretranspose.clone()
+    try:
+        times_fi = bench_gpu_time(
+            lambda: gated_delta_rule_decode_pretranspose(
+                q,
+                k,
+                v,
+                state_copy,
+                A_log,
+                a,
+                dt_bias,
+                b,
+                scale,
+                output_fi,
+                use_qk_l2norm,
+            ),
+            enable_cupti=True,
+            dry_run_iters=warmup_iters,
+            repeat_iters=bench_iters,
+        )
+        results["fi_pretranspose_us"] = np.median(times_fi) * 1000
+    except Exception as e:
+        results["fi_pretranspose_us"] = None
+        print(f"  FlashInfer pretranspose failed: {type(e).__name__}: {e}")
+
+    # Benchmark new CuTe-DSL hfp32 kernel
+    if GDN_DECODE_HFP32_STATE_AVAILABLE:
+        state_copy = state_pretranspose.clone()
+        try:
+            # Pre-compilation warmup: run once to trigger JIT compilation before timing
+            # This ensures compilation overhead is not included in the benchmark
+            _ = gdn_decode_hfp32_state(
+                A_log=A_log,
+                a=a,
+                dt_bias=dt_bias,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+                q=q,
+                k=k,
+                v=v,
+                b=b,
+                initial_state_source=state_copy,
+                use_qk_l2norm_in_kernel=use_qk_l2norm,
+                scale=scale,
+            )
+            torch.cuda.synchronize()
+
+            # Reset state for actual benchmark - call kernel directly without wrapper
+            state_copy = state_pretranspose.clone()
+            times_hfp32 = bench_gpu_time(
+                lambda: gdn_decode_hfp32_state(
+                    A_log=A_log,
+                    a=a,
+                    dt_bias=dt_bias,
+                    softplus_beta=1.0,
+                    softplus_threshold=20.0,
+                    q=q,
+                    k=k,
+                    v=v,
+                    b=b,
+                    initial_state_source=state_copy,
+                    use_qk_l2norm_in_kernel=use_qk_l2norm,
+                    scale=scale,
+                ),
+                enable_cupti=True,
+                dry_run_iters=warmup_iters,
+                repeat_iters=bench_iters,
+            )
+            results["hfp32_cute_us"] = np.median(times_hfp32) * 1000
+        except Exception as e:
+            results["hfp32_cute_us"] = None
+            print(f"  CuTe-DSL hfp32 kernel failed: {type(e).__name__}: {e}")
+    else:
+        results["hfp32_cute_us"] = None
+
+    # Calculate speedup (FI time / CuTe time, >1 means CuTe is faster)
+    if results["fi_pretranspose_us"] and results["hfp32_cute_us"]:
+        results["speedup"] = results["fi_pretranspose_us"] / results["hfp32_cute_us"]
+    else:
+        results["speedup"] = None
+
+    # Calculate TFLOPS
+    flops = gdn_decode_flops(
+        batch_size, num_q_heads, num_k_heads, num_v_heads, head_size, seq_len
+    )
+    if results["fi_pretranspose_us"]:
+        results["fi_tflops"] = flops / (results["fi_pretranspose_us"] / 1e6) / 1e12
+    else:
+        results["fi_tflops"] = None
+    if results["hfp32_cute_us"]:
+        results["hfp32_tflops"] = flops / (results["hfp32_cute_us"] / 1e6) / 1e12
+    else:
+        results["hfp32_tflops"] = None
+
+    return results
+
+
+def run_gdn_decode_hfp32_state_benchmark(args, dtype, use_qk_l2norm):
+    """Run gdn_decode_hfp32_state vs FlashInfer pretranspose benchmark."""
+    if not GDN_DECODE_HFP32_STATE_AVAILABLE:
+        print("Error: gdn_decode_hfp32_state kernel is not available.")
+        print("Make sure flashinfer.gdn_kernels.gdn_decode_hfp32_state is importable.")
+        return
+
+    # Batch sizes: powers of 2 from 1 to 512
+    all_batch_sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+    # Filter to requested batch sizes if specified, otherwise use all
+    if args.batch_size:
+        batch_sizes = [bs for bs in args.batch_size if bs in all_batch_sizes]
+        if not batch_sizes:
+            batch_sizes = all_batch_sizes
+    else:
+        batch_sizes = all_batch_sizes
+
+    print("\n" + "=" * 110)
+    print(
+        "GDN Decode FP32 H State Benchmark: CuTe-DSL (hfp32) vs FlashInfer Pretranspose"
+    )
+    print(
+        f"Config: q_heads={args.num_q_heads}, k_heads={args.num_k_heads}, "
+        f"v_heads={args.num_v_heads}, head_size={args.head_size}, "
+        f"dtype={args.dtype}, qk_l2norm={'ON' if use_qk_l2norm else 'OFF'}"
+    )
+    print("=" * 110)
+    print()
+    print(
+        f"{'batch':>6} {'FI_pretrans(us)':>16} {'CuTe_hfp32(us)':>16} {'FI_TFLOPS':>12} {'CuTe_TFLOPS':>12} {'Speedup':>10}"
+    )
+    print("-" * 110)
+
+    all_results = []
+    for batch_size in batch_sizes:
+        try:
+            result = bench_gdn_decode_hfp32_state_vs_pretranspose(
+                batch_size=batch_size,
+                num_q_heads=args.num_q_heads,
+                num_k_heads=args.num_k_heads,
+                num_v_heads=args.num_v_heads,
+                head_size=args.head_size,
+                dtype=dtype,
+                use_qk_l2norm=use_qk_l2norm,
+                warmup_iters=args.warmup,
+                bench_iters=args.iters,
+            )
+            all_results.append(result)
+
+            fi_us = (
+                f"{result['fi_pretranspose_us']:.2f}"
+                if result["fi_pretranspose_us"]
+                else "N/A"
+            )
+            cute_us = (
+                f"{result['hfp32_cute_us']:.2f}" if result["hfp32_cute_us"] else "N/A"
+            )
+            fi_tflops = f"{result['fi_tflops']:.2f}" if result["fi_tflops"] else "N/A"
+            cute_tflops = (
+                f"{result['hfp32_tflops']:.2f}" if result["hfp32_tflops"] else "N/A"
+            )
+            speedup = f"{result['speedup']:.2f}x" if result["speedup"] else "N/A"
+
+            print(
+                f"{result['batch_size']:>6} {fi_us:>16} {cute_us:>16} {fi_tflops:>12} {cute_tflops:>12} {speedup:>10}"
+            )
+        except Exception as e:
+            print(f"{batch_size:>6} ERROR: {type(e).__name__}: {e}")
+
+    print("-" * 110)
+
+    # Summary
+    valid_results = [r for r in all_results if r.get("speedup") is not None]
+    if valid_results:
+        speedups = [r["speedup"] for r in valid_results]
+        print("\nSummary:")
+        print(f"  Average speedup: {np.mean(speedups):.2f}x")
+        print(
+            f"  Min speedup: {min(speedups):.2f}x (batch={valid_results[speedups.index(min(speedups))]['batch_size']})"
+        )
+        print(
+            f"  Max speedup: {max(speedups):.2f}x (batch={valid_results[speedups.index(max(speedups))]['batch_size']})"
+        )
+
+
+# ============================================================================
 # Main Entry Points
 # ============================================================================
 
@@ -2719,10 +3002,11 @@ Examples:
             "nontranspose",
             "mtp",
             "gdn_decode_klast_bf16_state",
+            "gdn_decode_hfp32_state",
             "all",
         ],
         default="nontranspose",
-        help="Kernel version: pretranspose (V-major state), nontranspose (K-major state), mtp (Multiple Token Processing), gdn_decode_klast_bf16_state (T=1..4, bf16 state, K-last), or all",
+        help="Kernel version: pretranspose (V-major state), nontranspose (K-major state), mtp (Multiple Token Processing), gdn_decode_klast_bf16_state (T=1..4, bf16 state, K-last), gdn_decode_hfp32_state (T=1, fp32 state, pretranspose), or all",
     )
     parser.add_argument(
         "--seq-len",
@@ -2787,6 +3071,9 @@ Examples:
     elif args.version == "gdn_decode_klast_bf16_state":
         # gdn_decode_klast_bf16_state benchmark for T=1,2,3,4
         run_gdn_decode_klast_bf16_state_benchmark(args, dtype, use_qk_l2norm)
+    elif args.version == "gdn_decode_hfp32_state":
+        # gdn_decode_hfp32_state benchmark for T=1 (FP32 state, pretranspose)
+        run_gdn_decode_hfp32_state_benchmark(args, dtype, use_qk_l2norm)
     else:
         # Non-MTP: always run all layouts comparison (FlashInfer/Triton x pretranspose/nontranspose + gdn_decode_klast_bf16_state)
         run_all_layouts_benchmark(args, dtype, use_qk_l2norm)

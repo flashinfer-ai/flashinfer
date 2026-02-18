@@ -11,6 +11,7 @@ CuTe DSL variants optimized for specific use cases.
 Exported Kernels:
 - gated_delta_rule: BF16 hidden state decode kernel (T=1,2,3,4)
 - GatedDeltaRuleKernel: Kernel class for advanced usage
+- gated_delta_rule_hfp32: FP32 hidden state decode kernel (T=1 only)
 """
 
 from typing import Optional, Type
@@ -27,7 +28,17 @@ except ImportError:
     gated_delta_rule = None  # type: ignore
     GatedDeltaRuleKernel: Optional[Type] = None  # type: ignore
 
+# FP32 H state kernel (T=1 only, pretranspose layout)
+try:
+    from .gdn_decode_hfp32_state import gated_delta_rule_hfp32
+
+    _has_hfp32_kernel = True
+except ImportError:
+    _has_hfp32_kernel = False
+    gated_delta_rule_hfp32 = None  # type: ignore
+
 __all__ = [
     "gated_delta_rule",
     "GatedDeltaRuleKernel",
+    "gated_delta_rule_hfp32",
 ]

@@ -51,6 +51,16 @@ try:
 except ImportError:
     GDN_DECODE_KLAST_BF16_STATE_AVAILABLE = False
 
+# Import the gdn_decode_hfp32_state kernel (T=1 only, fp32 state, pretranspose layout)
+try:
+    from flashinfer.gdn_kernels.gdn_decode_hfp32_state import (
+        gated_delta_rule_hfp32 as gdn_decode_hfp32_state,
+    )
+
+    GDN_DECODE_HFP32_STATE_AVAILABLE = True
+except ImportError:
+    GDN_DECODE_HFP32_STATE_AVAILABLE = False
+
 
 def _skip_if_not_sm90_or_later():
     """Skip test if not Hopper (SM90+) or Blackwell (SM100+) architecture."""
@@ -919,6 +929,180 @@ def test_pretranspose_api_uses_gdn_decode_klast_bf16_state(
     )
 
 
+# ============================================================================
+# Test gdn_decode_hfp32_state kernel (T=1 only, fp32 state, pretranspose layout)
+# Reference: fp32 h state. Compares CuTe-DSL kernel against fp32 reference.
+# ============================================================================
+
+
+def _test_gdn_decode_hfp32_state_kernel(
+    dtype: str,
+    batch_size: int,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_size: int,
+    scale: float,
+    alpha: bool,
+    beta: bool,
+    seed: int | None = None,
+):
+    """Test gdn_decode_hfp32_state kernel for T=1 with fp32 h state.
+
+    Both kernel and reference use fp32 h state for higher numerical precision.
+    The kernel uses pretranspose layout [B, HV, V, K].
+    """
+    _skip_if_not_sm90_or_later()
+
+    if not GDN_DECODE_HFP32_STATE_AVAILABLE:
+        pytest.skip("gdn_decode_hfp32_state kernel not available")
+
+    random.seed(seed)
+    torch.random.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+    # State and GDN parameters are based on num_v_heads (HV in kernel API)
+    num_sab_heads = num_v_heads
+
+    dtype_torch = getattr(torch, dtype)
+    device = torch.device("cuda")
+
+    with device:
+        # Generate inputs with T=1 dimension
+        q = torch.randn(batch_size, 1, num_q_heads, head_size, dtype=dtype_torch)
+        k = torch.randn(batch_size, 1, num_k_heads, head_size, dtype=dtype_torch)
+        v = torch.randn(batch_size, 1, num_v_heads, head_size, dtype=dtype_torch)
+
+        # NOTE: Do NOT pre-normalize K here. Both the kernel (use_qk_l2norm_in_kernel=True)
+        # and reference will apply L2 normalization internally after GQA expansion.
+
+        # gdn_decode_hfp32_state kernel expects [B, HV, V, K] (pretranspose layout) in FP32.
+        input_state_kernel = torch.randn(
+            batch_size, num_sab_heads, head_size, head_size, dtype=torch.float32
+        )
+
+        # Reference uses [B, HV, K, V] layout; transpose for comparison.
+        input_state_ref = input_state_kernel.transpose(-2, -1).contiguous()
+
+        # Create GDN-specific parameters
+        # A_log: log decay parameter [HV] - must be float32
+        A_log = torch.randn(num_sab_heads, dtype=torch.float32, device=device) * 0.1
+
+        # dt_bias: decay bias [HV] - must be float32
+        dt_bias = torch.randn(num_sab_heads, dtype=torch.float32, device=device) * 0.1
+
+        # a: input-dependent decay [B, T, HV]
+        a = (
+            torch.randn(batch_size, 1, num_sab_heads, dtype=dtype_torch, device=device)
+            * 0.1
+        )
+
+        # b: update gate input [B, T, HV]
+        if beta:
+            b_tensor = torch.randn(
+                batch_size, 1, num_sab_heads, dtype=dtype_torch, device=device
+            )
+        else:
+            b_tensor = (
+                torch.ones(
+                    batch_size, 1, num_sab_heads, dtype=dtype_torch, device=device
+                )
+                * 10.0
+            )
+
+    # Call gdn_decode_hfp32_state kernel
+    our_state = input_state_kernel.clone()
+    our_o = gdn_decode_hfp32_state(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        softplus_beta=1.0,
+        softplus_threshold=20.0,
+        q=q,
+        k=k,
+        v=v,
+        b=b_tensor,
+        initial_state_source=our_state,
+        use_qk_l2norm_in_kernel=True,
+        scale=scale,
+    )
+
+    torch.cuda.synchronize()
+    our_o = our_o.squeeze(1)  # Remove T dimension for comparison
+
+    # Reference implementation (uses K-major layout [B, HV, K, V])
+    ref_o, ref_state = decode_delta_rule(
+        q.squeeze(1).float(),
+        k.squeeze(1).float(),
+        v.squeeze(1).float(),
+        input_state_ref,
+        A_log=A_log,
+        a=a.squeeze(1),
+        dt_bias=dt_bias,
+        b=b_tensor.squeeze(1),
+        scale_factor=scale,
+        softplus_beta=1.0,
+        softplus_threshold=20.0,
+        use_l2_norm=True,
+        state_dtype=torch.float32,  # fp32 state for this kernel
+    )
+
+    ref_o = ref_o.to(dtype_torch)
+    # Transpose ref_state back to [B, HV, V, K] for comparison
+    ref_state_pretrans = ref_state.transpose(-2, -1).contiguous()
+
+    atol_o = 5e-3
+    rtol_o = 5e-3
+    atol_kv = 5e-3
+    rtol_kv = 5e-3
+
+    torch.testing.assert_close(our_o, ref_o, atol=atol_o, rtol=rtol_o)
+    torch.testing.assert_close(
+        our_state, ref_state_pretrans.float(), atol=atol_kv, rtol=rtol_kv
+    )
+
+    print(
+        f"✓ gdn_decode_hfp32_state kernel test passed (batch={batch_size}, dtype={dtype}, h_state=fp32)"
+    )
+
+
+@pytest.mark.parametrize("beta", [True])
+@pytest.mark.parametrize("alpha", [True])
+@pytest.mark.parametrize("scale", ["auto"])
+@pytest.mark.parametrize("head_size", [128])
+@pytest.mark.parametrize(
+    "num_q_heads, num_k_heads, num_v_heads",
+    [(16, 16, 32)],
+)
+@pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64, 128, 256, 512])
+@pytest.mark.parametrize("dtype", ["bfloat16"])
+def test_gdn_decode_hfp32_state_kernel(
+    dtype: str,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_size: int,
+    batch_size: int,
+    scale: float | str,
+    alpha: bool,
+    beta: bool,
+    seed: int = int(os.environ.get("SEED", "0")),
+):
+    scale_val = 1.0 / math.sqrt(head_size) if scale == "auto" else scale
+    _test_gdn_decode_hfp32_state_kernel(
+        dtype,
+        batch_size,
+        num_q_heads,
+        num_k_heads,
+        num_v_heads,
+        head_size,
+        scale_val,
+        alpha,
+        beta,
+        seed,
+    )
+
+
 if __name__ == "__main__":
     print("Running smoke tests...")
     print("\n=== Testing PRETRANSPOSE version ===")
@@ -984,6 +1168,23 @@ if __name__ == "__main__":
     else:
         print("⚠ gdn_decode_klast_bf16_state kernel not available, skipping...")
 
+    print("\n=== Testing FP32 H State CuTe-DSL version (T=1) ===")
+    if GDN_DECODE_HFP32_STATE_AVAILABLE:
+        _test_gdn_decode_hfp32_state_kernel(
+            dtype="bfloat16",
+            batch_size=4,
+            num_q_heads=16,
+            num_k_heads=16,
+            num_v_heads=32,
+            head_size=128,
+            scale=1.0,
+            alpha=True,
+            beta=True,
+            seed=42,
+        )
+    else:
+        print("⚠ gdn_decode_hfp32_state kernel not available, skipping...")
+
     print("\n✅ All smoke tests passed!")
     print("\nTo run full test suite:")
     print(
@@ -997,5 +1198,8 @@ if __name__ == "__main__":
     )
     print(
         "  gdn_decode_klast_bf16_state:  pytest test_decode_delta_rule.py::test_gdn_decode_klast_bf16_state_kernel -v"
+    )
+    print(
+        "  gdn_decode_hfp32_state:       pytest test_decode_delta_rule.py::test_gdn_decode_hfp32_state_kernel -v"
     )
     print("  ALL: pytest test_decode_delta_rule.py -v")
