@@ -41,11 +41,11 @@ Want to work on an issue? Use these commands in the issue comments:
 | Command | Who can use | Description |
 |---------|-------------|-------------|
 | `!claim` | Anyone | Self-assign an unassigned issue |
-| `!assign @user` | Admins/Maintainers | Assign a specific user to an issue |
+| `!assign @username` | Admins/Maintainers | Assign a specific user to an issue |
 
 **`!claim`** — Comment `!claim` on any open, unassigned issue to assign yourself. If the issue is already assigned, you'll be asked to contact a maintainer.
 
-**`!assign @user`** — Maintainers can comment `!assign @username` to assign someone. If the user is not yet a collaborator, a triage invitation is sent automatically and they will be assigned once they accept.
+**`!assign @username`** — Maintainers can comment `!assign @username` to assign someone. If the user is not yet a collaborator, a triage invitation is sent automatically and they will be assigned once they accept.
 
 # Release Versioning
 
