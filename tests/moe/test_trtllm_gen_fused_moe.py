@@ -212,8 +212,6 @@ class CUDAGraphMoE:
             activation_type=self.config["activation_type"],
             do_finalize=True,
             tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
-            gemm1_sparsity_info=None,  # Dense weights (no sparsity metadata)
-            gemm2_sparsity_info=None,  # Dense weights (no sparsity metadata)
         )
         return output  # Extract tensor from tuple
 
@@ -3175,16 +3173,14 @@ def _run_fp4_moe_with_bias(
         do_finalize=True,
         activation_type=activation_type.value,
         tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
-        gemm1_sparsity_info=None,
-        gemm2_sparsity_info=None,
     )
 
     return kernel_output, ref_output
 
 
-@pytest.mark.parametrize("num_tokens", [32])
+@pytest.mark.parametrize("num_tokens", [32, 768, 3072])
 @pytest.mark.parametrize("hidden_size", [1024])
-@pytest.mark.parametrize("intermediate_size", [512])
+@pytest.mark.parametrize("intermediate_size", [2048, 1024, 768, 512])
 def test_nvfp4_moe_gemm2_bias(num_tokens, hidden_size, intermediate_size):
     from flashinfer.utils import get_compute_capability
 
@@ -3220,9 +3216,9 @@ def test_nvfp4_moe_gemm2_bias(num_tokens, hidden_size, intermediate_size):
     )
 
 
-@pytest.mark.parametrize("num_tokens", [32])
+@pytest.mark.parametrize("num_tokens", [32, 768, 3072])
 @pytest.mark.parametrize("hidden_size", [1024])
-@pytest.mark.parametrize("intermediate_size", [512])
+@pytest.mark.parametrize("intermediate_size", [2048, 1024, 768, 512])
 def test_nvfp4_moe_gemm1_bias(num_tokens, hidden_size, intermediate_size):
     from flashinfer.utils import get_compute_capability
 
@@ -3259,9 +3255,9 @@ def test_nvfp4_moe_gemm1_bias(num_tokens, hidden_size, intermediate_size):
     )
 
 
-@pytest.mark.parametrize("num_tokens", [32])
+@pytest.mark.parametrize("num_tokens", [32, 768, 3072])
 @pytest.mark.parametrize("hidden_size", [1024])
-@pytest.mark.parametrize("intermediate_size", [512])
+@pytest.mark.parametrize("intermediate_size", [2048, 1024, 768, 512])
 def test_nvfp4_moe_both_biases(num_tokens, hidden_size, intermediate_size):
     from flashinfer.utils import get_compute_capability
 
