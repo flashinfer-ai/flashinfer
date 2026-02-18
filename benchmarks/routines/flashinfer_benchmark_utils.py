@@ -13,6 +13,7 @@ output_column_dict = {
         "tflops",
         "tb_per_sec",
         "backend",
+        "resolved_backend",
     ],
     "attention": [
         "s_qo",
@@ -102,6 +103,17 @@ output_column_dict = {
         "interleave",
         "kv_layout",
     ],
+    "mamba": [
+        "nheads",
+        "dim",
+        "dstate",
+        "ngroups",
+        "cache_steps",
+        "state_dtype",
+        "weight_dtype",
+        "has_z",
+        "dt_softplus",
+    ],
     "general": [
         "batch_size",
         "hidden_size",
@@ -136,6 +148,7 @@ full_output_columns = (
     + output_column_dict["quantization"]
     + output_column_dict["sampling"]
     + output_column_dict["rope"]
+    + output_column_dict["mamba"]
     + output_column_dict["general"]
 )
 
@@ -152,6 +165,7 @@ benchmark_apis = {
         "bmm_fp8",
         "bmm_mxfp8",
         "mm_fp4",
+        "mm_mxfp8",
     ],
     "moe": [
         "trtllm_fp4_block_scale_moe",
@@ -201,6 +215,9 @@ benchmark_apis = {
         "mla_rope_quantize_fp8",
         "rope_quantize_fp8",
         "rope_quantize_fp8_append_paged_kv_cache",
+    ],
+    "mamba": [
+        "selective_state_update",
     ],
 }
 
@@ -256,26 +273,26 @@ routine_cc_to_supported_backends = {
     # ATTENTION
     "BatchDecodeWithPagedKVCacheWrapper": {
         # NOTE: trtllm-native calls trtllm_batch_decode_with_kv_cache
-        "7.5": ["fa2"],
-        "8.0": ["fa2", "fa2_tc", "cudnn"],
-        "8.6": ["fa2", "fa2_tc", "cudnn"],
-        "8.9": ["fa2", "fa2_tc", "cudnn"],
-        "9.0": ["fa2", "fa2_tc", "cudnn", "trtllm-native"],
-        "10.0": ["fa2", "fa2_tc", "cudnn", "trtllm-gen", "trtllm-native"],
-        "10.3": ["fa2", "fa2_tc", "cudnn", "trtllm-gen", "trtllm-native"],
-        "12.0": ["fa2", "fa2_tc", "cudnn", "trtllm-native"],
+        "7.5": ["fa2", "auto"],
+        "8.0": ["fa2", "fa2_tc", "auto", "cudnn"],
+        "8.6": ["fa2", "fa2_tc", "auto", "cudnn"],
+        "8.9": ["fa2", "fa2_tc", "auto", "cudnn"],
+        "9.0": ["fa2", "fa2_tc", "auto", "cudnn", "trtllm-native"],
+        "10.0": ["fa2", "fa2_tc", "auto", "cudnn", "trtllm-gen", "trtllm-native"],
+        "10.3": ["fa2", "fa2_tc", "auto", "cudnn", "trtllm-gen", "trtllm-native"],
+        "12.0": ["fa2", "fa2_tc", "auto", "cudnn", "trtllm-native"],
     },
     "BatchPrefillWithPagedKVCacheWrapper": {
         # NOTE: trtllm-native calls trtllm_batch_context_with_kv_cache
         # NOTE: cudnn-native calls cudnn_batch_prefill_with_kv_cache
         "7.5": [],
-        "8.0": ["fa2", "cudnn", "cudnn-native"],
-        "8.6": ["fa2", "cudnn", "cudnn-native"],
-        "8.9": ["fa2", "cudnn", "cudnn-native"],
-        "9.0": ["fa2", "fa3", "cudnn", "cudnn-native"],
-        "10.0": ["fa2", "cudnn", "cudnn-native", "trtllm-gen", "trtllm-native"],
-        "10.3": ["fa2", "cudnn", "cudnn-native", "trtllm-gen", "trtllm-native"],
-        "12.0": ["fa2", "cudnn", "cudnn-native"],
+        "8.0": ["fa2", "auto", "cudnn", "cudnn-native"],
+        "8.6": ["fa2", "auto", "cudnn", "cudnn-native"],
+        "8.9": ["fa2", "auto", "cudnn", "cudnn-native"],
+        "9.0": ["fa2", "fa3", "auto", "cudnn", "cudnn-native"],
+        "10.0": ["fa2", "auto", "cudnn", "cudnn-native", "trtllm-gen", "trtllm-native"],
+        "10.3": ["fa2", "auto", "cudnn", "cudnn-native", "trtllm-gen", "trtllm-native"],
+        "12.0": ["fa2", "auto", "cudnn", "cudnn-native"],
     },
     "BatchPrefillWithRaggedKVCacheWrapper": {
         # NOTE: trtllm-native calls trtllm_ragged_attention_deepseek
@@ -339,6 +356,17 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["cudnn"],
         "10.3": ["cudnn"],
+        "12.0": [],
+    },
+    "mm_mxfp8": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["cutlass"],
+        "10.3": ["cutlass"],
+        "11.0": ["cutlass"],
         "12.0": [],
     },
     # Note: mm_fp4 uses support checkers to filter backends, so it is not listed here
@@ -707,6 +735,18 @@ routine_cc_to_supported_backends = {
         "10.0": ["cuda"],
         "10.3": ["cuda"],
         "12.0": ["cuda"],
+    },
+    # MAMBA
+    "selective_state_update": {
+        "7.5": ["flashinfer", "triton"],
+        "8.0": ["flashinfer", "triton"],
+        "8.6": ["flashinfer", "triton"],
+        "8.9": ["flashinfer", "triton"],
+        "9.0": ["flashinfer", "triton"],
+        "10.0": ["flashinfer", "triton"],
+        "10.3": ["flashinfer", "triton"],
+        "11.0": ["flashinfer", "triton"],
+        "12.0": ["flashinfer", "triton"],
     },
 }
 

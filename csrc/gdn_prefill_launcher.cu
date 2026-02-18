@@ -42,11 +42,11 @@ void gdn_prefill_launcher(void* output, void* output_state, void* q, void* k, vo
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(dtype, DType, [&] {
     int dev_id;
     cudaGetDevice(&dev_id);
-    cudaDeviceProp device_properties;
-    cudaGetDeviceProperties(&device_properties, dev_id);
+    int device_major;
+    cudaDeviceGetAttribute(&device_major, cudaDevAttrComputeCapabilityMajor, dev_id);
 
 #if defined(FLAT_SM90A_ENABLED)
-    if (device_properties.major == 9) {
+    if (device_major == 9) {
       flat::launch_delta_rule_prefill_kernel<cutlass::arch::Sm90, DType, DType, float>(
           stream, static_cast<DType*>(output), static_cast<float*>(output_state),
           static_cast<DType const*>(q), static_cast<DType const*>(k), static_cast<DType const*>(v),
@@ -56,8 +56,7 @@ void gdn_prefill_launcher(void* output, void* output_state, void* q, void* k, vo
       return true;
     } else {
       std::ostringstream err_msg;
-      err_msg << "delta rule kernel does not support this device major version: "
-              << device_properties.major;
+      err_msg << "delta rule kernel does not support this device major version: " << device_major;
       FLASHINFER_ERROR(err_msg.str());
       return false;
     }
@@ -157,11 +156,11 @@ void gdn_prefill(TensorView output, TensorView output_state, TensorView q, Tenso
     scale = 1.0 / std::sqrt(head_size);
   }
 
+  // Use cudaDeviceGetAttribute for sm_count (much faster than cudaGetDeviceProperties)
   int dev_id;
   cudaGetDevice(&dev_id);
-  cudaDeviceProp device_properties;
-  cudaGetDeviceProperties(&device_properties, dev_id);
-  int32_t sm_count = device_properties.multiProcessorCount;
+  int sm_count;
+  cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, dev_id);
 
   auto stream = get_stream(q.device());
 

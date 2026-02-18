@@ -135,7 +135,7 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
 size_t TrtllmGenBatchedGemmRunner::getWorkspaceSizeInBytes(
     int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, int32_t numTokens,
     int32_t numBatches, int32_t maxNumCtasInBatchDim, int32_t configIndex) const {
-  BatchedGemmData gemmData;
+  BatchedGemmData gemmData{};
   gemmData.mProblemDimensions.mNumBatches = numBatches;
   gemmData.mProblemDimensions.mNumTokens = numTokens;
   gemmData.mProblemDimensions.mBatchM = !mOptions.transposeMmaOutput;
@@ -174,11 +174,12 @@ void TrtllmGenBatchedGemmRunner::run(
     CUstream stream, int device, int32_t configIndex, bool enable_pdl) {
   auto bmm = BatchedGemmInterface();
 
-  BatchedGemmData gemmData;
+  BatchedGemmData gemmData{};
 
   auto const configs = bmm.getBatchedGemmConfigs();
 
   auto const& config = configs[configIndex];
+  // printf("running config %d: %s\n", configIndex, config.mFunctionName);
 
   FLASHINFER_CHECK(numBatches > 0, "Batched GEMM requires numBatches > 0");
   if (!mOptions.staticBatch) {
@@ -327,7 +328,7 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(
 
   int32_t multiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
 
-  BatchedGemmData gemmData;
+  BatchedGemmData gemmData{};
   // Dims
   gemmData.mProblemDimensions.mNumBatches = numBatches;
   gemmData.mProblemDimensions.mNumTokens = numTokens;
@@ -436,7 +437,7 @@ bool TrtllmGenBatchedGemmRunner::isValidConfigIndex(int32_t configIndex, int32_t
   auto const bmm = BatchedGemmInterface();
   auto const configs = bmm.getBatchedGemmConfigs();
 
-  BatchedGemmData gemmData;
+  BatchedGemmData gemmData{};
   // Dims
   gemmData.mProblemDimensions.mNumBatches = numBatches;
   gemmData.mProblemDimensions.mNumTokens = numTokens;
@@ -451,12 +452,13 @@ bool TrtllmGenBatchedGemmRunner::isValidConfigIndex(int32_t configIndex, int32_t
   gemmData.mProblemDimensions.mRank = 0;
   gemmData.mProblemDimensions.mWorldSize = 1;
   gemmData.mProblemDimensions.mMaxNumCtasInTokenDim = maxNumCtasInBatchDim;
+  gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
+  gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
+  gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
 
   auto const& config = configs[configIndex];
 
-  // FIXME: temporarily disable split-k as renormalize routing plus expert number 256 failed in
-  // trtllm-gen ac83afb
-  return bmm.isValidConfig(config, gemmData) && config.mOptions.mClusterDimZ == 1;
+  return bmm.isValidConfig(config, gemmData);
 }
 
 }  // namespace kernels

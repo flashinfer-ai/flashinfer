@@ -19,6 +19,7 @@ csrc/aot_default_additional_params.h
 
 # Microbenchmark files
 microbenchmark/
+flashinfer/cute_dsl/benchmark_gated_delta_rule.py
 
 # vscode
 .vscode/
