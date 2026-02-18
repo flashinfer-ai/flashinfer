@@ -257,8 +257,9 @@ struct QuantParams {
     GemmInputs fc2;
   } fp8_mxfp4;
 
-  // MXFP8 MXFP4 quantization params
-  // This mode uses block scaled MXFP8 and MXFP4 weights
+  // MXFP8 block-scaled quantization params.
+  // Historical note: this payload shape is also reused by MXFP8xMXFP8 (FP8 weights with MXFPX
+  // block scales), so this field name is legacy.
   struct MXFP8MXFP4Inputs {
     struct GemmInputs {
       TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF const* weight_block_scale =
@@ -355,6 +356,15 @@ struct QuantParams {
     qp.mxfp8_mxfp4.fc1 = {fc1_weight_block_scale, fc1_global_scale};
     qp.mxfp8_mxfp4.fc2 = {fc2_weight_block_scale, fc2_global_scale};
     return qp;
+  }
+
+  static QuantParams MXFP8MXFP8(
+      TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF const* fc1_weight_block_scale,
+      float const* fc1_global_scale,  //
+      TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF const* fc2_weight_block_scale,
+      float const* fc2_global_scale) {
+    return MXFP8MXFP4(fc1_weight_block_scale, fc1_global_scale, fc2_weight_block_scale,
+                      fc2_global_scale);
   }
 
   static QuantParams FP4(
@@ -838,12 +848,14 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   std::map<std::string, std::pair<size_t, size_t>> getWorkspaceDeviceBufferSizes(
       int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size,
       int const num_experts_per_node, int const experts_per_token, ActivationType activation_type,
-      bool use_lora, bool use_deepseek_fp8_block_scale, bool min_latency_mode, bool use_awq);
+      bool use_lora, bool use_deepseek_fp8_block_scale, bool min_latency_mode, bool use_awq,
+      bool use_mxfp8_fp8_block_scaling);
   void configureWsPtrs(char* ws_ptr, int64_t const num_rows, int64_t const hidden_size,
                        int64_t const inter_size, int const num_experts_per_node,
                        int const experts_per_token, ActivationType activation_type,
                        MOEParallelismConfig parallelism_config, bool use_lora,
-                       bool use_deepseek_fp8_block_scale, bool min_latency_mode, bool use_awq);
+                       bool use_deepseek_fp8_block_scale, bool min_latency_mode, bool use_awq,
+                       bool use_mxfp8_fp8_block_scaling);
 
  private:
   bool mayHaveDifferentGEMMOutputType() const {
