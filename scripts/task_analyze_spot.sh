@@ -44,11 +44,17 @@ if [ -z "$FAILED_JOBS" ]; then
 fi
 
 for JOB_ID in $FAILED_JOBS; do
-  # First check job metadata for runner communication errors
-  # This catches "The operation was canceled" which appears in annotations, not logs
   JOB_INFO=$(gh api "/repos/${REPOSITORY}/actions/jobs/${JOB_ID}" 2>/dev/null || true)
-  if echo "$JOB_INFO" | grep -qiE "operation was canceled|runner.*lost|lost communication"; then
-    echo "Detected: Runner lost communication or operation canceled (job $JOB_ID)"
+  JOB_CONCLUSION=$(echo "$JOB_INFO" | jq -r '.conclusion // empty' 2>/dev/null || echo "")
+
+  # Skip jobs cancelled by fail-fast (they're not the root cause)
+  if [ "$JOB_CONCLUSION" == "cancelled" ]; then
+    continue
+  fi
+
+  # Check job metadata for runner communication errors
+  if echo "$JOB_INFO" | grep -qiE "runner.*lost|lost communication"; then
+    echo "Detected: Runner lost communication (job $JOB_ID)"
     SPOT_TERMINATION=true
     break
   fi
@@ -75,7 +81,7 @@ for JOB_ID in $FAILED_JOBS; do
   fi
 
   # Check for infrastructure error patterns
-  if grep -qiE "connection reset by peer|context canceled|grpc.*closing|The self-hosted runner.*lost" "$LOG_FILE"; then
+  if grep -qiE "connection reset by peer|context canceled|The operation was canceled|grpc.*closing|The self-hosted runner.*lost" "$LOG_FILE"; then
     echo "Detected: infrastructure error pattern (job $JOB_ID)"
     SPOT_TERMINATION=true
     break
