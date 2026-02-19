@@ -190,13 +190,13 @@ class CUDAGraphMoE:
             hidden_states_scale=input_quantized["hidden_states_scale"],
             gemm1_weights=self.static_data["gemm1_weights_fp4_shuffled"],
             gemm1_weights_scale=self.static_data["gemm1_scales_fp4_shuffled"],
-            gemm1_bias=self.config.get("gemm1_bias"),
+            gemm1_bias=self.config["gemm1_bias"],
             gemm1_alpha=None,
             gemm1_beta=None,
             gemm1_clamp_limit=None,
             gemm2_weights=self.static_data["gemm2_weights_fp4_shuffled"],
             gemm2_weights_scale=self.static_data["gemm2_scales_fp4_shuffled"],
-            gemm2_bias=self.config.get("gemm2_bias"),
+            gemm2_bias=self.config["gemm2_bias"],
             output1_scale_scalar=self.static_data["scale_c_fc1"],
             output1_scale_gate_scalar=self.static_data["scale_gate_fc1"],
             output2_scale_scalar=self.static_data["scale_c_fc2"],
@@ -568,8 +568,8 @@ class FP4Moe(Moe):
         activation_type = kwargs["activation_type"]
         routing_method_type = kwargs["routing_method_type"]
         enable_autotune = kwargs.get("enable_autotune", True)
-        gemm1_bias = kwargs.get("gemm1_bias")
-        gemm2_bias = kwargs.get("gemm2_bias")
+        gemm1_bias = kwargs["gemm1_bias"]
+        gemm2_bias = kwargs["gemm2_bias"]
 
         # Create CUDA graph configuration
         config = {
@@ -3061,11 +3061,6 @@ def test_llama4_routing(
         activation_type,
         cache_permute_indices,
     )
-
-
-# ====================================================================================
-# Bias Support Tests for NvFP4 MoE
-# ====================================================================================
 
 
 @pytest.mark.parametrize("num_tokens", [32, 768, 3072])
