@@ -35,6 +35,7 @@ from ..autotuner import (
 from ..fused_moe.utils import (
     get_last_power_of_2_num_tokens_buckets,
     last_positive_power_of_2,
+    next_positive_power_of_2,
 )
 from ..utils import (
     get_native_fp4_dtype,
@@ -1929,6 +1930,58 @@ CUDNN_DYNAMIC_SHAPE_MIN_VERSION = 91800
 _dynamic_fp4_graph_cache: dict[tuple, object] = {}
 _dynamic_fp4_graph_cache_lock = threading.Lock()
 
+_MIN_DYNAMIC_FP4_M_BIN = 128  # F8_128x4 descale layout minimum
+
+
+def _use_dynamic_fp4_path():
+    """Check if cuDNN dynamic shape FP4 path is available."""
+    return (
+        CUDNN_AVAILABLE and cudnn.backend_version() >= CUDNN_DYNAMIC_SHAPE_MIN_VERSION
+    )
+
+
+def _bin_m_for_dynamic_fp4(m: int) -> int:
+    """Bin M to next power of 2, minimum 128 (F8_128x4 alignment)."""
+    return max(next_positive_power_of_2(m), _MIN_DYNAMIC_FP4_M_BIN)
+
+
+def _compute_max_fp4_shapes_for_dynamic(
+    binned_m,
+    real_a_shape,
+    expanded_a_descale_shape,
+    real_b_shape,
+    real_b_stride,
+    expanded_b_descale_shape,
+    expanded_b_descale_stride,
+):
+    """Compute max shapes/strides for dynamic graph from binned M.
+
+    Only A and A_descale shapes depend on M. B shapes pass through unchanged.
+    """
+    batch = real_a_shape[0]
+    k = real_a_shape[2]
+
+    # Max A shape (row-major: batch, M, K)
+    max_a_shape = (batch, binned_m, k)
+    max_a_stride = (binned_m * k, k, 1)
+
+    # Max A descale shape — M_scale = ceil_div(binned_m, 128) * 128 = binned_m
+    # (since binned_m >= 128 and is a power of 2)
+    k_scale = expanded_a_descale_shape[2]
+    max_a_descale_shape = (batch, binned_m, k_scale)
+    max_a_descale_stride = (binned_m * k_scale, k_scale, 1)
+
+    return (
+        max_a_shape,
+        max_a_stride,
+        real_b_shape,
+        real_b_stride,
+        max_a_descale_shape,
+        max_a_descale_stride,
+        expanded_b_descale_shape,
+        expanded_b_descale_stride,
+    )
+
 
 def create_cudnn_dynamic_fp4_gemm_graph(
     max_a_shape,
@@ -1987,9 +2040,15 @@ def create_cudnn_dynamic_fp4_gemm_graph(
         if cache_key in _dynamic_fp4_graph_cache:
             return _dynamic_fp4_graph_cache[cache_key]
 
-    stream = torch.cuda.current_stream(device)
-    with cudnn.graph(_get_cudnn_handle(stream)) as (graph, _):
-        graph.is_dynamic_shape_enabled = True
+        stream = torch.cuda.current_stream(device)
+        handle = _get_cudnn_handle(stream)
+        graph = cudnn.pygraph(
+            handle=handle,
+            io_data_type=cudnn.data_type.FLOAT,
+            intermediate_data_type=cudnn.data_type.FLOAT,
+            compute_data_type=cudnn.data_type.FLOAT,
+            is_dynamic_shape_enabled=True,
+        )
 
         scale_type = cudnn.data_type.FP8_E4M3 if use_nvfp4 else cudnn.data_type.FP8_E8M0
 
@@ -2725,23 +2784,113 @@ def _cudnn_gemm_fp4(
     workspace_buffer: torch.Tensor = None,
     tactic: int = -1,
 ):
-    # Graph should have been already cached, when we ran _cudnn_gemm_fp4_requirement
-    graph = _get_cudnn_fp4_gemm_graph(
-        a=a,
-        b=b,
-        a_descale=a_descale,
-        b_descale=b_descale,
-        alpha=alpha,
-        out_dtype=out_dtype,
-        out=out,
-        block_size=block_size,
-        use_nvfp4=use_nvfp4,
-        tactic=tactic,
-    )
-    # execute the fp4 cudnn graph
-    execute_cudnn_gemm_fp4_graph(
-        graph, a, b, a_descale, b_descale, alpha, out, workspace_buffer, tactic=tactic
-    )
+    if _use_dynamic_fp4_path():
+        # Dynamic path: bin M to power of 2, build one graph per bin.
+        real_a_shape, _ = _get_real_fp4_shape_from_packed_uint8(a)
+        actual_m = real_a_shape[1]
+
+        # M < 128 hits an OOB in cuDNN dynamic shape kernels (under investigation).
+        # Fall back to static path for small M.
+        if actual_m < _MIN_DYNAMIC_FP4_M_BIN:
+            graph = _get_cudnn_fp4_gemm_graph(
+                a=a,
+                b=b,
+                a_descale=a_descale,
+                b_descale=b_descale,
+                alpha=alpha,
+                out_dtype=out_dtype,
+                out=out,
+                block_size=block_size,
+                use_nvfp4=use_nvfp4,
+                tactic=tactic,
+            )
+            execute_cudnn_gemm_fp4_graph(
+                graph,
+                a,
+                b,
+                a_descale,
+                b_descale,
+                alpha,
+                out,
+                workspace_buffer,
+                tactic=tactic,
+            )
+            return
+
+        real_b_shape, real_b_stride = _get_real_fp4_shape_from_packed_uint8(b)
+        batch = real_a_shape[0]
+        expanded_a_descale_shape, _ = _expand_block_scale_tensor_shape(a_descale, batch)
+        expanded_b_descale_shape, expanded_b_descale_stride = (
+            _expand_block_scale_tensor_shape(b_descale, batch)
+        )
+
+        binned_m = _bin_m_for_dynamic_fp4(actual_m)
+        max_shapes = _compute_max_fp4_shapes_for_dynamic(
+            binned_m,
+            real_a_shape,
+            expanded_a_descale_shape,
+            real_b_shape,
+            real_b_stride,
+            expanded_b_descale_shape,
+            expanded_b_descale_stride,
+        )
+
+        (
+            max_a_shape,
+            max_a_stride,
+            max_b_shape,
+            max_b_stride,
+            max_a_descale_shape,
+            max_a_descale_stride,
+            max_b_descale_shape,
+            max_b_descale_stride,
+        ) = max_shapes
+
+        graph = create_cudnn_dynamic_fp4_gemm_graph(
+            max_a_shape,
+            max_a_stride,
+            max_b_shape,
+            max_b_stride,
+            max_a_descale_shape,
+            max_a_descale_stride,
+            max_b_descale_shape,
+            max_b_descale_stride,
+            ab_type=cudnn.data_type.FP4_E2M1,
+            o_type=_torch_data_type_to_cudnn_data_type(out_dtype),
+            block_size=block_size,
+            device=a.device,
+            alpha_is_not_none=alpha is not None,
+            use_nvfp4=use_nvfp4,
+        )
+
+        execute_cudnn_dynamic_fp4_graph(
+            graph, a, b, a_descale, b_descale, alpha, out, workspace_buffer, tactic
+        )
+    else:
+        # Fallback: static path (cuDNN < 9.18.0)
+        graph = _get_cudnn_fp4_gemm_graph(
+            a=a,
+            b=b,
+            a_descale=a_descale,
+            b_descale=b_descale,
+            alpha=alpha,
+            out_dtype=out_dtype,
+            out=out,
+            block_size=block_size,
+            use_nvfp4=use_nvfp4,
+            tactic=tactic,
+        )
+        execute_cudnn_gemm_fp4_graph(
+            graph,
+            a,
+            b,
+            a_descale,
+            b_descale,
+            alpha,
+            out,
+            workspace_buffer,
+            tactic=tactic,
+        )
 
 
 def _cudnn_gemm_fp4_runner():
@@ -2765,19 +2914,65 @@ def _cudnn_gemm_fp4_runner():
                 workspace_buffer,
             ) = inputs
 
-            # Graph should have been already cached, when we ran _cudnn_gemm_fp4_requirement
-            graph = _get_cudnn_fp4_gemm_graph(
-                a=a,
-                b=b,
-                a_descale=a_descale,
-                b_descale=b_descale,
-                alpha=alpha,
-                out_dtype=out_dtype,
-                out=out,
-                block_size=block_size,
-                use_nvfp4=use_nvfp4,
-                tactic=-1,
-            )
+            if _use_dynamic_fp4_path():
+                real_a_shape, _ = _get_real_fp4_shape_from_packed_uint8(a)
+                real_b_shape, real_b_stride = _get_real_fp4_shape_from_packed_uint8(b)
+                batch = real_a_shape[0]
+                expanded_a_descale_shape, _ = _expand_block_scale_tensor_shape(
+                    a_descale, batch
+                )
+                expanded_b_descale_shape, expanded_b_descale_stride = (
+                    _expand_block_scale_tensor_shape(b_descale, batch)
+                )
+                binned_m = _bin_m_for_dynamic_fp4(real_a_shape[1])
+                max_shapes = _compute_max_fp4_shapes_for_dynamic(
+                    binned_m,
+                    real_a_shape,
+                    expanded_a_descale_shape,
+                    real_b_shape,
+                    real_b_stride,
+                    expanded_b_descale_shape,
+                    expanded_b_descale_stride,
+                )
+                (
+                    max_a_shape,
+                    max_a_stride,
+                    max_b_shape,
+                    max_b_stride,
+                    max_a_descale_shape,
+                    max_a_descale_stride,
+                    max_b_descale_shape,
+                    max_b_descale_stride,
+                ) = max_shapes
+                graph = create_cudnn_dynamic_fp4_gemm_graph(
+                    max_a_shape,
+                    max_a_stride,
+                    max_b_shape,
+                    max_b_stride,
+                    max_a_descale_shape,
+                    max_a_descale_stride,
+                    max_b_descale_shape,
+                    max_b_descale_stride,
+                    ab_type=cudnn.data_type.FP4_E2M1,
+                    o_type=_torch_data_type_to_cudnn_data_type(out_dtype),
+                    block_size=block_size,
+                    device=a.device,
+                    alpha_is_not_none=alpha is not None,
+                    use_nvfp4=use_nvfp4,
+                )
+            else:
+                graph = _get_cudnn_fp4_gemm_graph(
+                    a=a,
+                    b=b,
+                    a_descale=a_descale,
+                    b_descale=b_descale,
+                    alpha=alpha,
+                    out_dtype=out_dtype,
+                    out=out,
+                    block_size=block_size,
+                    use_nvfp4=use_nvfp4,
+                    tactic=-1,
+                )
 
             num_plans = graph.get_execution_plan_count()
             return list(range(num_plans))
@@ -2912,25 +3107,65 @@ def _cudnn_gemm_fp4_requirement(
         _expand_block_scale_tensor_shape(b_descale, batch)
     )
 
-    # build the fp4 cudnn graph. This graph will be cached & reused in mm_fp4()
-    # because the graph is constructed with @functools.cache decorator
-    graph = create_cudnn_execution_plans_fp4_gemm(
-        real_a_shape,
-        real_a_stride,
-        real_b_shape,
-        real_b_stride,
-        expanded_a_descale_shape,
-        expanded_a_descale_stride,
-        expanded_b_descale_shape,
-        expanded_b_descale_stride,
-        cudnn.data_type.FP4_E2M1,
-        _torch_data_type_to_cudnn_data_type(out_dtype),
-        block_size,
-        a.device,
-        alpha is not None,
-        use_nvfp4,
-    )
-    graph.check_support()
+    if _use_dynamic_fp4_path():
+        # Dynamic path: build graph at binned M, validates + caches
+        binned_m = _bin_m_for_dynamic_fp4(real_a_shape[1])
+        max_shapes = _compute_max_fp4_shapes_for_dynamic(
+            binned_m,
+            real_a_shape,
+            expanded_a_descale_shape,
+            real_b_shape,
+            real_b_stride,
+            expanded_b_descale_shape,
+            expanded_b_descale_stride,
+        )
+        # create_cudnn_dynamic_fp4_gemm_graph validates, builds plans,
+        # checks support, and caches the graph
+        (
+            max_a_shape,
+            max_a_stride,
+            max_b_shape,
+            max_b_stride,
+            max_a_descale_shape,
+            max_a_descale_stride,
+            max_b_descale_shape,
+            max_b_descale_stride,
+        ) = max_shapes
+        create_cudnn_dynamic_fp4_gemm_graph(
+            max_a_shape,
+            max_a_stride,
+            max_b_shape,
+            max_b_stride,
+            max_a_descale_shape,
+            max_a_descale_stride,
+            max_b_descale_shape,
+            max_b_descale_stride,
+            ab_type=cudnn.data_type.FP4_E2M1,
+            o_type=_torch_data_type_to_cudnn_data_type(out_dtype),
+            block_size=block_size,
+            device=a.device,
+            alpha_is_not_none=alpha is not None,
+            use_nvfp4=use_nvfp4,
+        )
+    else:
+        # Static path: build graph for exact shapes
+        graph = create_cudnn_execution_plans_fp4_gemm(
+            real_a_shape,
+            real_a_stride,
+            real_b_shape,
+            real_b_stride,
+            expanded_a_descale_shape,
+            expanded_a_descale_stride,
+            expanded_b_descale_shape,
+            expanded_b_descale_stride,
+            cudnn.data_type.FP4_E2M1,
+            _torch_data_type_to_cudnn_data_type(out_dtype),
+            block_size,
+            a.device,
+            alpha is not None,
+            use_nvfp4,
+        )
+        graph.check_support()
 
     return True
 
