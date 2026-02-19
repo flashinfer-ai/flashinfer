@@ -553,7 +553,7 @@ jobs:
         run: |
           # Shared multi-runner node: only stop containers started by THIS runner (identified by workspace mount)
           for cid in $(docker ps -q); do
-            if docker inspect "$cid" --format '{{json .Mounts}}' 2>/dev/null | grep -q "${{ github.workspace }}"; then
+            if docker inspect "$cid" --format '{{json .Mounts}}' 2>/dev/null | grep -qF "${{ github.workspace }}/"; then
               docker stop "$cid" 2>/dev/null || true
             fi
           done
