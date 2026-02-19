@@ -9,9 +9,13 @@ on:
   issue_comment:
     types: [created]
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '*/30 * * * *'
   workflow_dispatch:
 
+# Note: The collaborator invitation (PUT /repos/.../collaborators/...)
+# requires admin-level access. This workflow uses FLASHINFER_BOT_TOKEN (a PAT
+# with admin scope) for all API calls; the permissions below only apply to the
+# default GITHUB_TOKEN which is not used.
 permissions:
   contents: read
   issues: write
@@ -24,7 +28,7 @@ jobs:
       github.event_name == 'issue_comment' &&
       !github.event.issue.pull_request &&
       github.event.comment.user.type != 'Bot' &&
-      (startsWith(github.event.comment.body, '!claim') || startsWith(github.event.comment.body, '!assign'))
+      (startsWith(toLower(github.event.comment.body), '!claim') || startsWith(toLower(github.event.comment.body), '!assign'))
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
