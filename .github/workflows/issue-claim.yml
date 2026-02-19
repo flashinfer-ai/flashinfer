@@ -120,6 +120,14 @@ jobs:
             gh api -X POST \
               "/repos/${REPO}/issues/${ISSUE_NUMBER}/comments" \
               -f body="Issue assigned to @${TARGET_USER}."
+          else
+            gh api -X POST \
+              "/repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
+              -f content='confused'
+
+            gh api -X POST \
+              "/repos/${REPO}/issues/${ISSUE_NUMBER}/comments" \
+              -f body="Could not assign @${TARGET_USER}. A maintainer can use \`!assign @${TARGET_USER}\` to send an invitation."
           fi
 
       - name: Handle !assign
@@ -253,10 +261,11 @@ jobs:
             exit 1
           fi
 
-          # Search for open issues with !assign comments in this repo
+          # Search for open issues with !assign comments updated in the last 30 days
+          SINCE=$(date -u -d '30 days ago' '+%Y-%m-%d')
           SEARCH_RESULTS=$(gh api \
             -H "Accept: application/vnd.github+json" \
-            "/search/issues?q=repo:${REPO}+is:issue+is:open+no:assignee+%22!assign+%40%22+in:comments&per_page=50" \
+            "/search/issues?q=repo:${REPO}+is:issue+is:open+no:assignee+%22!assign+%40%22+in:comments+updated:>=${SINCE}&per_page=50" \
             --jq '.items[].number') || true
 
           if [ -z "$SEARCH_RESULTS" ]; then
