@@ -557,11 +557,12 @@ jobs:
               docker stop "$cid" 2>/dev/null || true
             fi
           done
-          docker container prune -f 2>/dev/null || true
           sudo rm -rf ${{ github.workspace }}/* || true
           sudo rm -rf ${{ github.workspace }}/.[!.]* || true
           rm -rf ~/.cache/flashinfer_jit || true
-          docker system prune -f || true
+          docker container prune -f 2>/dev/null || true
+          docker image prune -f || true
+          docker builder prune -f --filter "until=24h" || true
           echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
           nvidia-smi -i "$CUDA_VISIBLE_DEVICES" || true
 
