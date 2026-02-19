@@ -28,7 +28,7 @@ jobs:
       github.event_name == 'issue_comment' &&
       !github.event.issue.pull_request &&
       github.event.comment.user.type != 'Bot' &&
-      (startsWith(toLower(github.event.comment.body), '!claim') || startsWith(toLower(github.event.comment.body), '!assign'))
+      (startsWith(github.event.comment.body, '!claim') || startsWith(github.event.comment.body, '!assign'))
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
@@ -41,13 +41,13 @@ jobs:
         run: |
           FIRST_LINE=$(echo "$COMMENT_BODY" | head -1)
 
-          if echo "$FIRST_LINE" | grep -qi '^!claim\b'; then
+          if echo "$FIRST_LINE" | grep -q '^!claim\b'; then
             echo "command=claim" >> "$GITHUB_OUTPUT"
             echo "target_user=${COMMENTER}" >> "$GITHUB_OUTPUT"
 
-          elif echo "$FIRST_LINE" | grep -qi '^!assign[[:space:]]'; then
+          elif echo "$FIRST_LINE" | grep -q '^!assign[[:space:]]'; then
             # Extract username: strip !assign prefix, optional @, take first word
-            TARGET=$(echo "$FIRST_LINE" | sed 's/^![Aa][Ss][Ss][Ii][Gg][Nn][[:space:]]*//')
+            TARGET=$(echo "$FIRST_LINE" | sed 's/^!assign[[:space:]]*//')
             TARGET="${TARGET#@}"
             TARGET="${TARGET%% *}"
 
@@ -60,7 +60,7 @@ jobs:
               echo "target_user=" >> "$GITHUB_OUTPUT"
             fi
 
-          elif echo "$FIRST_LINE" | grep -qi '^!assign$'; then
+          elif echo "$FIRST_LINE" | grep -q '^!assign$'; then
             echo "command=assign-no-user" >> "$GITHUB_OUTPUT"
             echo "target_user=" >> "$GITHUB_OUTPUT"
 
