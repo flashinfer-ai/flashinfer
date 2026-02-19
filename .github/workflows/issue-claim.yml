@@ -116,30 +116,6 @@ jobs:
             gh api -X POST \
               "/repos/${REPO}/issues/${ISSUE_NUMBER}/comments" \
               -f body="Issue assigned to @${TARGET_USER}."
-          else
-            # Assignment failed (user lacks collaborator access); send invitation
-            INVITE_RESPONSE=$(gh api -X PUT \
-              "/repos/${REPO}/collaborators/${TARGET_USER}" \
-              -f permission='triage' 2>&1) && INVITE_OK=true || INVITE_OK=false
-
-            if [ "$INVITE_OK" = "true" ]; then
-              gh api -X POST \
-                "/repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
-                -f content='+1'
-
-              gh api -X POST \
-                "/repos/${REPO}/issues/${ISSUE_NUMBER}/comments" \
-                -f body="@${TARGET_USER} has been sent a repository invitation. You'll be automatically assigned once you [accept the invitation](https://github.com/notifications). A maintainer can also use \`!assign @${TARGET_USER}\` to retry."
-            else
-              echo "::warning::Failed to invite ${TARGET_USER}: ${INVITE_RESPONSE}"
-              gh api -X POST \
-                "/repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
-                -f content='confused'
-
-              gh api -X POST \
-                "/repos/${REPO}/issues/${ISSUE_NUMBER}/comments" \
-                -f body="Failed to send a repository invitation to @${TARGET_USER}. A maintainer can retry with \`!assign @${TARGET_USER}\`."
-            fi
           fi
 
       - name: Handle !assign
@@ -161,7 +137,7 @@ jobs:
           PERMISSION=$(gh api \
             -H "Accept: application/vnd.github+json" \
             "/repos/${REPO}/collaborators/${COMMENTER}/permission" \
-            --jq '.permission')
+            --jq '.permission' 2>&1) || PERMISSION="none"
 
           if [ "$PERMISSION" != "admin" ] && [ "$PERMISSION" != "maintain" ]; then
             gh api -X POST \
@@ -243,6 +219,11 @@ jobs:
           REPO: ${{ github.repository }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
         run: |
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "::error::FLASHINFER_BOT_TOKEN secret is not set"
+            exit 1
+          fi
+
           gh api -X POST \
             "/repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
             -f content='confused'
@@ -312,13 +293,24 @@ jobs:
 
               echo "User $USERNAME is now a collaborator. Assigning to issue #${ISSUE_NUMBER}."
 
-              gh api -X POST \
+              ASSIGN_RESPONSE=$(gh api -X POST \
                 "/repos/${REPO}/issues/${ISSUE_NUMBER}/assignees" \
-                -f "assignees[]=${USERNAME}"
+                -f "assignees[]=${USERNAME}" 2>&1) && ASSIGN_OK=true || ASSIGN_OK=false
 
-              gh api -X POST \
-                "/repos/${REPO}/issues/${ISSUE_NUMBER}/comments" \
-                -f body="@${USERNAME} has accepted the repository invitation and has been automatically assigned to this issue."
+              if [ "$ASSIGN_OK" = "true" ]; then
+                IS_ASSIGNED=$(echo "$ASSIGN_RESPONSE" | jq --arg u "$USERNAME" \
+                  '[.assignees[].login] | map(ascii_downcase) | contains([$u | ascii_downcase])')
+              else
+                IS_ASSIGNED="false"
+              fi
+
+              if [ "$IS_ASSIGNED" = "true" ]; then
+                gh api -X POST \
+                  "/repos/${REPO}/issues/${ISSUE_NUMBER}/comments" \
+                  -f body="@${USERNAME} has accepted the repository invitation and has been automatically assigned to this issue."
+              else
+                echo "::warning::Failed to assign ${USERNAME} to issue #${ISSUE_NUMBER}: ${ASSIGN_RESPONSE}"
+              fi
             else
               echo "User $USERNAME is not yet a collaborator, skipping."
             fi
