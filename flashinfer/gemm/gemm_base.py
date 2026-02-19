@@ -1918,31 +1918,29 @@ def execute_cudnn_gemm_fp4_graph(
 
 
 # ============================================================================
-# Dynamic shape FP4 GEMM support (requires cuDNN >= 9.18.0)
+# Dynamic shape FP4 GEMM support (requires cuDNN >= 9.19.1)
 # Build ONE graph, execute with different shapes via override_uids/shapes/strides.
 # This avoids the ~287ms per-graph JIT compilation overhead for each unique shape.
 # ============================================================================
 
-CUDNN_DYNAMIC_SHAPE_MIN_VERSION = 91800
+CUDNN_DYNAMIC_SHAPE_MIN_VERSION = 91901  # 9.19.1: small-M OOB + heuristic fix
 
 # Cache keyed by (topology + max shapes) to ensure graphs built for different
 # max dimensions are not incorrectly reused.
 _dynamic_fp4_graph_cache: dict[tuple, object] = {}
 _dynamic_fp4_graph_cache_lock = threading.Lock()
 
-_MIN_DYNAMIC_FP4_M_BIN = 128  # F8_128x4 descale layout minimum
-
 
 def _use_dynamic_fp4_path():
-    """Check if cuDNN dynamic shape FP4 path is available."""
+    """Check if cuDNN dynamic shape FP4 path is available (>= 9.19.1)."""
     return (
         CUDNN_AVAILABLE and cudnn.backend_version() >= CUDNN_DYNAMIC_SHAPE_MIN_VERSION
     )
 
 
 def _bin_m_for_dynamic_fp4(m: int) -> int:
-    """Bin M to next power of 2, minimum 128 (F8_128x4 alignment)."""
-    return max(next_positive_power_of_2(m), _MIN_DYNAMIC_FP4_M_BIN)
+    """Bin M to next power of 2 for dynamic shape graph caching."""
+    return next_positive_power_of_2(m)
 
 
 def _compute_max_fp4_shapes_for_dynamic(
@@ -1965,11 +1963,12 @@ def _compute_max_fp4_shapes_for_dynamic(
     max_a_shape = (batch, binned_m, k)
     max_a_stride = (binned_m * k, k, 1)
 
-    # Max A descale shape — M_scale = ceil_div(binned_m, 128) * 128 = binned_m
-    # (since binned_m >= 128 and is a power of 2)
+    # Max A descale shape — F8_128x4 layout pads M to multiples of 128,
+    # so the descale M dim must use the padded value, not binned_m directly.
     k_scale = expanded_a_descale_shape[2]
-    max_a_descale_shape = (batch, binned_m, k_scale)
-    max_a_descale_stride = (binned_m * k_scale, k_scale, 1)
+    bs_m = ((binned_m + 127) // 128) * 128
+    max_a_descale_shape = (batch, bs_m, k_scale)
+    max_a_descale_stride = (bs_m * k_scale, k_scale, 1)
 
     return (
         max_a_shape,
@@ -2004,11 +2003,11 @@ def create_cudnn_dynamic_fp4_gemm_graph(
     The graph is built once with max dimensions and can be executed
     with different (smaller) shapes via override_uids/shapes/strides.
 
-    Requires cuDNN >= 9.18.0 for is_dynamic_shape_enabled support.
+    Requires cuDNN >= 9.19.1 for dynamic shape FP4 support.
     """
     if cudnn.backend_version() < CUDNN_DYNAMIC_SHAPE_MIN_VERSION:
         raise RuntimeError(
-            f"Dynamic shape FP4 GEMM requires cuDNN >= 9.18.0, "
+            f"Dynamic shape FP4 GEMM requires cuDNN >= 9.19.1, "
             f"but got {cudnn.backend_version_string()}"
         )
 
@@ -2789,34 +2788,6 @@ def _cudnn_gemm_fp4(
         real_a_shape, _ = _get_real_fp4_shape_from_packed_uint8(a)
         actual_m = real_a_shape[1]
 
-        # M < 128 hits an OOB in cuDNN dynamic shape kernels (under investigation).
-        # Fall back to static path for small M.
-        if actual_m < _MIN_DYNAMIC_FP4_M_BIN:
-            graph = _get_cudnn_fp4_gemm_graph(
-                a=a,
-                b=b,
-                a_descale=a_descale,
-                b_descale=b_descale,
-                alpha=alpha,
-                out_dtype=out_dtype,
-                out=out,
-                block_size=block_size,
-                use_nvfp4=use_nvfp4,
-                tactic=tactic,
-            )
-            execute_cudnn_gemm_fp4_graph(
-                graph,
-                a,
-                b,
-                a_descale,
-                b_descale,
-                alpha,
-                out,
-                workspace_buffer,
-                tactic=tactic,
-            )
-            return
-
         real_b_shape, real_b_stride = _get_real_fp4_shape_from_packed_uint8(b)
         batch = real_a_shape[0]
         expanded_a_descale_shape, _ = _expand_block_scale_tensor_shape(a_descale, batch)
@@ -2867,7 +2838,7 @@ def _cudnn_gemm_fp4(
             graph, a, b, a_descale, b_descale, alpha, out, workspace_buffer, tactic
         )
     else:
-        # Fallback: static path (cuDNN < 9.18.0)
+        # Fallback: static path (cuDNN < 9.19.1)
         graph = _get_cudnn_fp4_gemm_graph(
             a=a,
             b=b,
