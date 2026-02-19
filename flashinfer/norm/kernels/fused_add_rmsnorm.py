@@ -526,8 +526,9 @@ def fused_add_rmsnorm_cute(
     Last dimension must be contiguous (stride[-1] == 1).
     """
 
-    H = input.shape[-1]
-    M = input.shape[0]
+    shape = input.shape
+    H = shape[-1]
+    M = shape[0]
 
     dtype_str = _torch_dtype_to_str(input.dtype)
     kernel = _get_compiled_fused_add_rmsnorm_kernel(
@@ -552,8 +553,9 @@ def fused_add_rmsnorm_quant_cute(
     Last dimension must be contiguous (stride[-1] == 1).
     """
 
-    H = input.shape[-1]
-    M = input.shape[0]
+    shape = input.shape
+    H = shape[-1]
+    M = shape[0]
 
     dtype_str = _torch_dtype_to_str(input.dtype)
     out_dtype_str = _torch_dtype_to_str(out.dtype)

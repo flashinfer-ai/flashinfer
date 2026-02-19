@@ -295,14 +295,17 @@ def make_tv_layout(threads_per_row: int, vec_size: int, num_vec_blocks: int) -> 
 # =============================================================================
 
 
+# Module-level dict to avoid recreation on each call
+_TORCH_DTYPE_TO_STR_MAP = {
+    torch.float16: "float16",
+    torch.bfloat16: "bfloat16",
+    torch.float32: "float32",
+    torch.float8_e4m3fn: "float8_e4m3fn",
+}
+
+
 def _torch_dtype_to_str(dtype: torch.dtype) -> str:
-    dtype_map = {
-        torch.float16: "float16",
-        torch.bfloat16: "bfloat16",
-        torch.float32: "float32",
-        torch.float8_e4m3fn: "float8_e4m3fn",
-    }
-    return dtype_map[dtype]
+    return _TORCH_DTYPE_TO_STR_MAP[dtype]
 
 
 # Re-export utilities from cute_dsl.utils for convenience

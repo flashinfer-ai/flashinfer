@@ -424,8 +424,9 @@ def layernorm_cute(
     Last dimension must be contiguous (stride[-1] == 1).
     """
 
-    H = input.shape[-1]
-    M = input.shape[0]
+    shape = input.shape
+    H = shape[-1]
+    M = shape[0]
 
     dtype_str = _torch_dtype_to_str(input.dtype)
     gamma_dtype_str = _torch_dtype_to_str(gamma.dtype)

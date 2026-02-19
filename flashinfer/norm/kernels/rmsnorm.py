@@ -783,18 +783,22 @@ def rmsnorm_cute(
     Supports arbitrary stride - no need to call contiguous().
     Last dimension must be contiguous (stride[-1] == 1).
     """
-    H = input.shape[-1]
-    if input.dim() == 3:
-        M = input.shape[0] * input.shape[1]
+
+    shape = input.shape
+    H = shape[-1]
+
+    if len(shape) == 3:
+        M = shape[0] * shape[1]
         input_2d = input.view(M, H)
         out_2d = out.view(M, H)
     else:
-        M = input.shape[0]
+        M = shape[0]
         input_2d = input
         out_2d = out
 
-    dtype_str = _torch_dtype_to_str(input.dtype)
-    kernel = _get_compiled_rmsnorm_kernel(dtype_str, H, weight_bias, enable_pdl)
+    kernel = _get_compiled_rmsnorm_kernel(
+        _torch_dtype_to_str(input.dtype), H, weight_bias, enable_pdl
+    )
     kernel(input_2d, weight, out_2d, M, eps)
 
 
@@ -820,9 +824,10 @@ def qk_rmsnorm_cute(
         weight_bias: Bias added to weight (0 for standard RMSNorm, 1 for Gemma).
         enable_pdl: Enable Programmatic Dependent Launch for SM90+ GPUs.
     """
-    assert input.dim() == 3, "QKRMSNorm expects 3D input [batch, heads, head_dim]"
+    shape = input.shape
+    assert len(shape) == 3, "QKRMSNorm expects 3D input [batch, heads, head_dim]"
 
-    batch_size, num_heads, head_dim = input.shape
+    batch_size, num_heads, head_dim = shape
     M = batch_size * num_heads
 
     # Kernel configuration
@@ -859,8 +864,9 @@ def rmsnorm_quant_cute(
     Last dimension must be contiguous (stride[-1] == 1).
     """
 
-    H = input.shape[-1]
-    M = input.shape[0]
+    shape = input.shape
+    H = shape[-1]
+    M = shape[0]
 
     dtype_str = _torch_dtype_to_str(input.dtype)
     out_dtype_str = _torch_dtype_to_str(out.dtype)
