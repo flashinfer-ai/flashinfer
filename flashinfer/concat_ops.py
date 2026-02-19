@@ -23,7 +23,7 @@ from .api_logging import flashinfer_api
 
 @functools.cache
 def get_concat_mla_module():
-    from .jit.dsv3_optimizations import gen_concat_mla_module
+    from .jit.model_optimizations import gen_concat_mla_module
 
     return gen_concat_mla_module().build_and_load()
 
