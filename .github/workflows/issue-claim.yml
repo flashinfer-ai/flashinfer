@@ -96,19 +96,51 @@ jobs:
             exit 0
           fi
 
-          # Assign the user (commenter has always interacted with the issue,
-          # so GitHub allows assignment without collaborator access)
-          gh api -X POST \
+          # Try to assign the user and verify it succeeded
+          ASSIGN_RESPONSE=$(gh api -X POST \
             "/repos/${REPO}/issues/${ISSUE_NUMBER}/assignees" \
-            -f "assignees[]=${TARGET_USER}"
+            -f "assignees[]=${TARGET_USER}" 2>&1) && ASSIGN_OK=true || ASSIGN_OK=false
 
-          gh api -X POST \
-            "/repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
-            -f content='+1'
+          if [ "$ASSIGN_OK" = "true" ]; then
+            IS_ASSIGNED=$(echo "$ASSIGN_RESPONSE" | jq --arg u "$TARGET_USER" \
+              '[.assignees[].login] | map(ascii_downcase) | contains([$u | ascii_downcase])')
+          else
+            IS_ASSIGNED="false"
+          fi
 
-          gh api -X POST \
-            "/repos/${REPO}/issues/${ISSUE_NUMBER}/comments" \
-            -f body="Issue assigned to @${TARGET_USER}."
+          if [ "$IS_ASSIGNED" = "true" ]; then
+            gh api -X POST \
+              "/repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
+              -f content='+1'
+
+            gh api -X POST \
+              "/repos/${REPO}/issues/${ISSUE_NUMBER}/comments" \
+              -f body="Issue assigned to @${TARGET_USER}."
+          else
+            # Assignment failed (user lacks collaborator access); send invitation
+            INVITE_RESPONSE=$(gh api -X PUT \
+              "/repos/${REPO}/collaborators/${TARGET_USER}" \
+              -f permission='triage' 2>&1) && INVITE_OK=true || INVITE_OK=false
+
+            if [ "$INVITE_OK" = "true" ]; then
+              gh api -X POST \
+                "/repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
+                -f content='+1'
+
+              gh api -X POST \
+                "/repos/${REPO}/issues/${ISSUE_NUMBER}/comments" \
+                -f body="@${TARGET_USER} has been sent a repository invitation. You'll be automatically assigned once you [accept the invitation](https://github.com/notifications). A maintainer can also use \`!assign @${TARGET_USER}\` to retry."
+            else
+              echo "::warning::Failed to invite ${TARGET_USER}: ${INVITE_RESPONSE}"
+              gh api -X POST \
+                "/repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
+                -f content='confused'
+
+              gh api -X POST \
+                "/repos/${REPO}/issues/${ISSUE_NUMBER}/comments" \
+                -f body="Failed to send a repository invitation to @${TARGET_USER}. A maintainer can retry with \`!assign @${TARGET_USER}\`."
+            fi
+          fi
 
       - name: Handle !assign
         if: steps.parse.outputs.command == 'assign'
@@ -175,17 +207,28 @@ jobs:
                 "/repos/${REPO}/issues/${ISSUE_NUMBER}/comments" \
                 -f body="Issue assigned to @${user}."
             else
-              gh api -X PUT \
+              INVITE_RESPONSE=$(gh api -X PUT \
                 "/repos/${REPO}/collaborators/${user}" \
-                -f permission='triage' 2>&1 || true
+                -f permission='triage' 2>&1) && INVITE_OK=true || INVITE_OK=false
 
-              gh api -X POST \
-                "/repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
-                -f content='+1'
+              if [ "$INVITE_OK" = "true" ]; then
+                gh api -X POST \
+                  "/repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
+                  -f content='+1'
 
-              gh api -X POST \
-                "/repos/${REPO}/issues/${ISSUE_NUMBER}/comments" \
-                -f body="$invite_msg"
+                gh api -X POST \
+                  "/repos/${REPO}/issues/${ISSUE_NUMBER}/comments" \
+                  -f body="$invite_msg"
+              else
+                echo "::warning::Failed to invite ${user}: ${INVITE_RESPONSE}"
+                gh api -X POST \
+                  "/repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
+                  -f content='confused'
+
+                gh api -X POST \
+                  "/repos/${REPO}/issues/${ISSUE_NUMBER}/comments" \
+                  -f body="Failed to send a repository invitation to @${user}. A maintainer can retry with \`!assign @${user}\`."
+              fi
             fi
           }
 
