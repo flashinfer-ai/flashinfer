@@ -18,11 +18,22 @@
 
 
 {% if not use_multi_cta %} // !use_multi_cta
+{% if kernel_variant == "flash_attention" %}
+#include <fused_multihead_flash_attention_kernel.h>
+{% else %}
 #include <fused_multihead_attention_kernel_{{ kernel_variant }}.h>
+{% endif %}
 {% endif %} // !use_multi_cta
 
 {% if not use_multi_cta and has_noloop %} // !use_multi_cta && has_noloop
+{% if kernel_variant == "flash_attention" %}
+#include <fused_multihead_flash_attention_kernel_noloop.h>
+{% if reload_q %} // reload_q: D > CTA_P_TILE_K, need tiled noloop kernel
+#include <fused_multihead_flash_attention_kernel_noloop_tiled.h>
+{% endif %} // reload_q
+{% else %}
 #include <fused_multihead_attention_kernel_1xN_noloop.h>
+{% endif %}
 {% endif %} // !use_multi_cta && has_noloop
 
 {% if cross_mha %} // cross_mha
@@ -39,11 +50,12 @@
 using Attention_mask_type = fmha::Attention_mask_type;
 using Launch_params = bert::Fused_multihead_attention_launch_params;
 
-{% if not cross_mha %} // !cross_mha
+{% if not cross_mha and not has_noloop %} // !cross_mha && !has_noloop (looped kernel)
 using Kernel_traits = fmha::{{ kernel_traits }}<
     fmha::{{ instruction_traits }},
-    {{ seq_len }},
+    {{ kv_loop_step }},
     {{ head_size }},
+    {{ head_size_v }},
     {{ loop_step }},
     {{ warps_m }},
     {{ warps_n }},
@@ -52,17 +64,18 @@ using Kernel_traits = fmha::{{ kernel_traits }}<
 
 using Kernel_traits_causal = fmha::{{ kernel_traits }}<
     fmha::{{ instruction_traits }},
-    {{ seq_len }},
+    {{ kv_loop_step }},
     {{ head_size }},
+    {{ head_size_v }},
     {{ loop_step }},
     {{ warps_m }},
     {{ warps_n }},
     {{ ctas_per_head }},
     {{ kernel_flags }},
     /*causal mask*/ 3>;
-{% endif %} // Not cross attention
+{% endif %} // !cross_mha && !has_noloop
 
-{% if not use_multi_cta and not cross_mha %} // !use_multi_cta && !cross_mha
+{% if not use_multi_cta and not cross_mha and not has_noloop %} // !use_multi_cta && !cross_mha && !has_noloop
 
 extern "C"
 __global__
@@ -101,14 +114,26 @@ void {{ launcher_name }}(
   }
 }
 
-{% endif %} // !use_multi_cta && !cross_mha
+{% endif %} // !use_multi_cta && !cross_mha && !has_noloop
+
+{% if has_noloop and not cross_mha %} // has_noloop && !cross_mha (looped launcher stub — flash attention uses noloop only)
+
+void {{ launcher_name }}(
+    const {{ params_type }} &params,
+    const Launch_params &launch_params,
+    cudaStream_t stream){
+    assert(false && "Flash attention uses noloop launchers");
+}
+
+{% endif %} // has_noloop && !cross_mha
 
 {% if not use_multi_cta and has_noloop and not cross_mha %} // !use_multi_cta && has_noloop && !cross_mha
 
 using Kernel_traits_nl = fmha::{{ kernel_traits }}<
     fmha::{{ instruction_traits }},
-    {{ seq_len }},
+    {{ kv_loop_step }},
     {{ head_size }},
+    {{ head_size_v }},
     {{ noloop_step }},
     1,
     {{ warps_m }} * {{ warps_n }},
@@ -119,8 +144,9 @@ static_assert(Kernel_traits_nl::CTAS_PER_HEAD == 1, "");
 
 using Kernel_traits_nl_causal = fmha::{{ kernel_traits }}<
     fmha::{{ instruction_traits }},
-    {{ seq_len }},
+    {{ kv_loop_step }},
     {{ head_size }},
+    {{ head_size_v }},
     {{ noloop_step }},
     1,
     {{ warps_m }} * {{ warps_n }},
@@ -134,13 +160,21 @@ static_assert(Kernel_traits_nl_causal::MASK_VERSION == 3, "");
 extern "C"
 __global__
 void {{ kernel_name }}_nl({{ params_type }} params){
+{% if kernel_variant == "flash_attention" %}
+  fused_multihead_attention::device_flash_attention_nl<Kernel_traits_nl>(params);
+{% else %}
   fused_multihead_attention::device_1xN_nl<Kernel_traits_nl>(params);
+{% endif %}
 }
 
 extern "C"
 __global__
 void {{ causal_kernel_name }}_nl({{ params_type }} params){
+{% if kernel_variant == "flash_attention" %}
+  fused_multihead_attention::device_flash_attention_nl<Kernel_traits_nl_causal>(params);
+{% else %}
   fused_multihead_attention::device_1xN_nl<Kernel_traits_nl_causal>(params);
+{% endif %}
 }
 
 void {{ launcher_name }}_nl(
@@ -148,10 +182,9 @@ void {{ launcher_name }}_nl(
     const Launch_params &launch_params,
     cudaStream_t stream){
 
-
-  constexpr int loop_iters = ({{ seq_len }} + {{ noloop_step }}-1) / {{ noloop_step }};
-  static_assert(loop_iters * {{ noloop_step }} >= {{ seq_len }}, "");
-  dim3 grid(params.h, params.b, loop_iters);
+  // Runtime loop_iters: flash attention supports variable sequence lengths.
+  int loop_iters = ( params.s + {{ noloop_step }} - 1 )  / {{ noloop_step }};
+  dim3 grid(loop_iters, params.h, params.b); // better locality
   if( launch_params.attention_mask_type == Attention_mask_type::CAUSAL ) {
     constexpr int smem_size = Kernel_traits_nl_causal::BYTES_PER_SMEM;
     if( smem_size >= 48*1024 ) {
@@ -173,6 +206,125 @@ void {{ launcher_name }}_nl(
 
 {% endif %} // !use_multi_cta && has_noloop && !cross_mha
 
+{% if not use_multi_cta and tiled and not cross_mha %} // !use_multi_cta && tiled && !cross_mha
+{% if reload_q %} // reload_q
+// When D > CTA_P_TILE_K (RELOAD_Q=true), use the tiled noloop kernel which iterates
+// over the K dimension in BMM1. This kernel requires ldgsts (cp.async) and
+// WARPS_N=1 (no shared memory for softmax), so we define separate Kernel_traits
+// with WARPS_M={{ warps_m }}, WARPS_N={{ warps_n }} instead of the nl layout (1, total).
+
+using Kernel_traits_nl_tiled = fmha::{{ kernel_traits }}<
+    fmha::{{ instruction_traits }},
+    {{ kv_loop_step }},
+    {{ head_size }},
+    {{ head_size_v }},
+    {{ noloop_step }},
+    {{ warps_m }},
+    {{ warps_n }},
+    {{ ctas_per_head }},
+    {{ kernel_flags }} | 0x200 /* no_loop flag */ >;
+
+static_assert(Kernel_traits_nl_tiled::CTAS_PER_HEAD == 1, "");
+
+using Kernel_traits_nl_tiled_causal = fmha::{{ kernel_traits }}<
+    fmha::{{ instruction_traits }},
+    {{ kv_loop_step }},
+    {{ head_size }},
+    {{ head_size_v }},
+    {{ noloop_step }},
+    {{ warps_m }},
+    {{ warps_n }},
+    {{ ctas_per_head }},
+    {{ kernel_flags }} | 0x200 /* no_loop flag */,
+    /*causal mask*/ 3>;
+
+static_assert(Kernel_traits_nl_tiled_causal::CTAS_PER_HEAD == 1, "");
+static_assert(Kernel_traits_nl_tiled_causal::MASK_VERSION == 3, "");
+
+{% else %} // !reload_q
+// Tiled (granular) variant: uses the same Kernel_traits_nl with USE_GRANULAR_TILING
+// in the flags for correct tile decomposition (CTA_O_TILE_K computed from K_PER_MMA
+// instead of S, which is 0 for flash attention). Routes to the regular noloop kernel
+// which supports granular tiling without requiring ldgsts.
+{% endif %}
+
+extern "C"
+__global__
+void {{ kernel_name }}_nl_tiled({{ params_type }} params){
+{% if kernel_variant == "flash_attention" %}
+{% if reload_q %}
+  fused_multihead_attention::device_flash_attention_nl_tiled<Kernel_traits_nl_tiled>(params);
+{% else %}
+  fused_multihead_attention::device_flash_attention_nl<Kernel_traits_nl>(params);
+{% endif %}
+{% else %}
+  fused_multihead_attention::device_1xN_nl<Kernel_traits_nl>(params);
+{% endif %}
+}
+
+extern "C"
+__global__
+void {{ causal_kernel_name }}_nl_tiled({{ params_type }} params){
+{% if kernel_variant == "flash_attention" %}
+{% if reload_q %}
+  fused_multihead_attention::device_flash_attention_nl_tiled<Kernel_traits_nl_tiled_causal>(params);
+{% else %}
+  fused_multihead_attention::device_flash_attention_nl<Kernel_traits_nl_causal>(params);
+{% endif %}
+{% else %}
+  fused_multihead_attention::device_1xN_nl<Kernel_traits_nl_causal>(params);
+{% endif %}
+}
+
+void {{ launcher_name }}_nl_tiled(
+    const {{ params_type }} &params,
+    const Launch_params &launch_params,
+    cudaStream_t stream){
+
+  // Runtime loop_iters: flash attention supports variable sequence lengths.
+  int loop_iters = ( params.s + {{ noloop_step }} - 1 )  / {{ noloop_step }};
+  dim3 grid(loop_iters, params.h, params.b); // better locality
+{% if reload_q %}
+  if( launch_params.attention_mask_type == Attention_mask_type::CAUSAL ) {
+    constexpr int smem_size = Kernel_traits_nl_tiled_causal::BYTES_PER_SMEM;
+    if( smem_size >= 48*1024 ) {
+        FMHA_CHECK_CUDA(cudaFuncSetAttribute({{ causal_kernel_name }}_nl_tiled,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            smem_size));
+    }
+    {{ causal_kernel_name }}_nl_tiled<<<grid, Kernel_traits_nl_tiled_causal::THREADS, Kernel_traits_nl_tiled_causal::BYTES_PER_SMEM, stream>>>(params);
+  } else {
+    constexpr int smem_size = Kernel_traits_nl_tiled::BYTES_PER_SMEM;
+    if( smem_size >= 48*1024 ) {
+        FMHA_CHECK_CUDA(cudaFuncSetAttribute({{ kernel_name }}_nl_tiled,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            smem_size));
+    }
+    {{ kernel_name }}_nl_tiled<<<grid, Kernel_traits_nl_tiled::THREADS, Kernel_traits_nl_tiled::BYTES_PER_SMEM, stream>>>(params);
+  }
+{% else %}
+  if( launch_params.attention_mask_type == Attention_mask_type::CAUSAL ) {
+    constexpr int smem_size = Kernel_traits_nl_causal::BYTES_PER_SMEM;
+    if( smem_size >= 48*1024 ) {
+        FMHA_CHECK_CUDA(cudaFuncSetAttribute({{ causal_kernel_name }}_nl_tiled,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            smem_size));
+    }
+    {{ causal_kernel_name }}_nl_tiled<<<grid, Kernel_traits_nl_causal::THREADS, Kernel_traits_nl_causal::BYTES_PER_SMEM, stream>>>(params);
+  } else {
+    constexpr int smem_size = Kernel_traits_nl::BYTES_PER_SMEM;
+    if( smem_size >= 48*1024 ) {
+        FMHA_CHECK_CUDA(cudaFuncSetAttribute({{ kernel_name }}_nl_tiled,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            smem_size));
+    }
+    {{ kernel_name }}_nl_tiled<<<grid, Kernel_traits_nl::THREADS, Kernel_traits_nl::BYTES_PER_SMEM, stream>>>(params);
+  }
+{% endif %}
+}
+
+{% endif %} // !use_multi_cta && tiled && !cross_mha
+
 {% if cross_mha %} // cross_mha
 {% if not use_multi_cta and has_noloop %} // !use_multi_cta && has_noloop
 
@@ -180,6 +332,7 @@ using Kernel_traits_nl = fmha::{{ kernel_traits }}<
     fmha::{{ instruction_traits }},
     {{ seq_len }},
     {{ head_size }},
+    {{ head_size_v }},
     {{ noloop_step }},
     1,
     {{ warps_m }} * {{ warps_n }},
@@ -222,6 +375,7 @@ using Kernel_traits = fmha::{{ kernel_traits }}<
     fmha::{{ instruction_traits }},
     {{ seq_len }},
     {{ head_size }},
+    {{ head_size_v }},
     {{ loop_step }},
     {{ warps_m }},
     {{ warps_n }},

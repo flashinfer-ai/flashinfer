@@ -195,13 +195,14 @@ struct Kernel_traits_ {
 
   // Compute the total BMM2_MMAS_K (might not the same as Mma_tile_o::MMAS_K if the granular tiling
   // is used).
-  static_assert(S % CTA_O_TILE_K == 0, "");
+  // S=0 for flash attention (variable sequence length): tile counts are determined at runtime.
+  static_assert(S == 0 || S % CTA_O_TILE_K == 0, "");
 
-  enum { TOTAL_BMM2_MMAS_K = Mma_tile_o::MMAS_K * (S / CTA_O_TILE_K) };
+  enum { TOTAL_BMM2_MMAS_K = S == 0 ? 0 : Mma_tile_o::MMAS_K * (S / CTA_O_TILE_K) };
 
   // Constraints on the K dimension.
   static_assert(Mma_tile_p::K_PER_MMA <= static_cast<int>(D));
-  static_assert(Mma_tile_o::K_PER_MMA <= S);
+  static_assert(S == 0 || Mma_tile_o::K_PER_MMA <= S);
 
   // The version.
   enum { VERSION = VERSION_ };
