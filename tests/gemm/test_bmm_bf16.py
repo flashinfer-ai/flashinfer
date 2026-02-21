@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 
 from flashinfer import autotune, bmm_bf16
+from flashinfer.gemm.gemm_base import CUDNN_AVAILABLE
 from flashinfer.utils import get_compute_capability
 
 
@@ -22,6 +23,10 @@ def test_bmm_bf16(b, m, n, k, res_dtype, backend):
         )
     if not bmm_bf16.is_backend_supported(backend, compute_capability_number):
         pytest.skip(f"{backend} backend not supported on current compute capability.")
+
+    if backend == "cudnn" and not CUDNN_AVAILABLE:
+        pytest.skip("cuDNN is not available on this system.")
+
     # cuDNN on SM103 does not support bf16 input -> fp16 output
     if (
         backend == "cudnn"

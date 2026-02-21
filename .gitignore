@@ -21,6 +21,7 @@ flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export
 
 # Microbenchmark files
 microbenchmark/
+flashinfer/cute_dsl/benchmark_gated_delta_rule.py
 
 # vscode
 .vscode/

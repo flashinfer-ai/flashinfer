@@ -4230,10 +4230,11 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
                         mWType == nvinfer1::DataType::kINT64;
   TLLM_CHECK_WITH_INFO(!is_4bit_act || is_4bit_weight,
                        "Cannot have 4-bit activation with non-4-bit weight");
-  float dtype_bytes =
-      is_4bit_act ? 0.5f
-                  : static_cast<float>(mWType == nvinfer1::DataType::kINT4 ? getDTypeSize(mOType)
-                                                                           : getDTypeSize(mDType));
+  float dtype_bytes = is_4bit_act ? 0.5f
+                                  : static_cast<float>((mWType == nvinfer1::DataType::kINT4 ||
+                                                        mWType == nvinfer1::DataType::kUINT8)
+                                                           ? getDTypeSize(mOType)
+                                                           : getDTypeSize(mDType));
   float weight_bytes = is_4bit_weight ? 0.5f : static_cast<float>(getDTypeSize(mWType));
   size_t output_bytes = getDTypeSize(mOType);
   size_t gemm_output_bytes =
@@ -4282,10 +4283,12 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
 
   // TODO Make quant 2 & 4 bigger for FP8 if we ever change to scaling per expert
   bool is_int_w_quant =
-      (mWType == nvinfer1::DataType::kINT8 || mWType == nvinfer1::DataType::kINT4) &&
+      (mWType == nvinfer1::DataType::kINT8 || mWType == nvinfer1::DataType::kINT4 ||
+       mWType == nvinfer1::DataType::kUINT8) &&
       mGroupSize <= 0;
   bool is_int_groupwise_w_quant =
-      (mWType == nvinfer1::DataType::kINT8 || mWType == nvinfer1::DataType::kINT4) &&
+      (mWType == nvinfer1::DataType::kINT8 || mWType == nvinfer1::DataType::kINT4 ||
+       mWType == nvinfer1::DataType::kUINT8) &&
       mGroupSize > 0;
   bool is_fp8_act_quant = mDType == nvinfer1::DataType::kFP8;
   bool is_fp8_w_quant = mWType == nvinfer1::DataType::kFP8;
