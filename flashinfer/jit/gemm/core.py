@@ -661,17 +661,18 @@ def gen_trtllm_low_latency_gemm_module() -> JitSpec:
     # make sure "flashinferMetaInfo.h" is downloaded or cached
     assert metainfo, f"{header_name}.h not found"
 
-    header_path = f"{include_path}/trtllmGen_gemm_export"
-    header_dest_dir = (
-        jit_env.FLASHINFER_CUBIN_DIR
-        / "flashinfer"
-        / "trtllm"
-        / "gemm"
-        / "trtllmGen_gemm_export"
-    )
-    download_trtllm_headers(
-        "gemm", header_dest_dir, header_path, ArtifactPath.TRTLLM_GEN_GEMM, checksum
-    )
+    # TODO(jimmyzho): Re-enable after fixing trtllm-gen cubin generation issues.
+    # header_path = f"{include_path}/trtllmGen_gemm_export"
+    # header_dest_dir = (
+    #     jit_env.FLASHINFER_CUBIN_DIR
+    #     / "flashinfer"
+    #     / "trtllm"
+    #     / "gemm"
+    #     / "trtllmGen_gemm_export"
+    # )
+    # download_trtllm_headers(
+    #     "gemm", header_dest_dir, header_path, ArtifactPath.TRTLLM_GEN_GEMM, checksum
+    # )
 
     return gen_jit_spec(
         "trtllm_low_latency_gemm",
@@ -686,8 +687,9 @@ def gen_trtllm_low_latency_gemm_module() -> JitSpec:
         ]
         + sm100a_nvcc_flags,
         extra_include_paths=[
-            jit_env.FLASHINFER_CUBIN_DIR,
-            jit_env.FLASHINFER_CUBIN_DIR / include_path,
+            jit_env.FLASHINFER_CUBIN_DIR / include_path
+            # jit_env.FLASHINFER_CUBIN_DIR,
+            # jit_env.FLASHINFER_CUBIN_DIR / include_path,
         ],
         extra_ldflags=["-lcuda"],
     )
