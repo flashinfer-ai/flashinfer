@@ -66,6 +66,7 @@ void {{ func_name }}(TensorView out, TensorView input, bool enable_pdl) {
   }
 
     switch (vec_size) {
+      DISPATCH_VEC_SIZE(16)
       DISPATCH_VEC_SIZE(8)
       DISPATCH_VEC_SIZE(4)
       DISPATCH_VEC_SIZE(2)
