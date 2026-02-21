@@ -73,6 +73,11 @@ CUDA_VERSION=$(python3 -c 'import torch; print(torch.version.cuda)' | cut -d'.' 
 echo "Detected CUDA version: cu${CUDA_VERSION}"
 
 echo ""
+echo "Checking TVM-FFI version before verification tests..."
+python -c "import tvm_ffi; print(f'TVM-FFI version: {tvm_ffi.__version__}')" || true
+echo ""
+
+echo ""
 echo "========================================"
 echo "Installing flashinfer package"
 echo "========================================"
@@ -108,6 +113,11 @@ echo "✓ Flashinfer-jit-cache wheel installed successfully"
 cd ..
 
 # Verify installation
+echo ""
+echo "Checking TVM-FFI version before verification tests..."
+python -c "import tvm_ffi; print(f'TVM-FFI version: {tvm_ffi.__version__}')" || true
+echo ""
+
 echo ""
 echo "========================================"
 echo "Running verification tests"
