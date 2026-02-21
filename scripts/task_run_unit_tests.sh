@@ -81,6 +81,9 @@ main() {
     # Install and verify (includes precompiled kernels)
     install_and_verify
 
+    # apply dependency overrides after installation since pip may overwrite
+    source "${SCRIPT_DIR}/setup_test_env.sh"
+
     # Find test files (unique to unit tests - auto-discovery)
     find_test_files
 
