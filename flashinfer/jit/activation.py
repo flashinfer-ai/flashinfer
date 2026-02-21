@@ -42,6 +42,10 @@ void {{ func_name }}(TensorView out, TensorView input, bool enable_pdl) {
   const cudaStream_t stream = get_stream(out.device());
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
     uint32_t vec_size = 16 / sizeof(c_type);
+    while (vec_size > 1 && d % vec_size != 0) {
+      vec_size /= 2;
+    }
+
     cudaLaunchConfig_t config;
     config.gridDim = num_tokens;
     config.blockDim = std::min(d / vec_size, 1024U);
@@ -53,10 +57,24 @@ void {{ func_name }}(TensorView out, TensorView input, bool enable_pdl) {
     config.numAttrs = 1;
     config.attrs = attrs;
 
-    auto kernel = flashinfer::activation::act_and_mul_kernel<c_type, {{ act_func_name }}>;
+#define DISPATCH_VEC_SIZE(VS)                                                                 \
+  case VS: {                                                                                  \
+    auto kernel = flashinfer::activation::act_and_mul_kernel<c_type, {{ act_func_name }}, VS>;\
+    cudaLaunchKernelEx(&config, kernel, static_cast<c_type*>(out.data_ptr()),                 \
+                       static_cast<c_type*>(input.data_ptr()), d);                            \
+    break;                                                                                    \
+  }
 
-    cudaLaunchKernelEx(&config, kernel, static_cast<c_type*>(out.data_ptr()),
-                       static_cast<c_type*>(input.data_ptr()), d);
+    switch (vec_size) {
+      DISPATCH_VEC_SIZE(8)
+      DISPATCH_VEC_SIZE(4)
+      DISPATCH_VEC_SIZE(2)
+      DISPATCH_VEC_SIZE(1)
+      default:
+        TVM_FFI_ICHECK(false) << "Unsupported vec_size: " << vec_size;
+    }
+
+#undef DISPATCH_VEC_SIZE
 
     cudaError_t err = cudaGetLastError();
     TVM_FFI_ICHECK(err == cudaSuccess) << "Failed to launch kernel: " << cudaGetErrorString(err);

@@ -94,8 +94,10 @@ def silu_and_mul(
     """
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
-    if input.shape[-1] * input.dtype.itemsize % 16 != 0:
-        raise ValueError("The pointers must be multiple of 16 bytes.")
+    if input.shape[-1] % 2 != 0:
+        raise ValueError(
+            "The last dimension of the input must be even (2 * hidden_size)."
+        )
     if out is not None:
         _check_shape(input, out)
     else:
@@ -139,8 +141,10 @@ def gelu_tanh_and_mul(
     """
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
-    if input.shape[-1] * input.dtype.itemsize % 16 != 0:
-        raise ValueError("The pointers must be multiple of 16 bytes.")
+    if input.shape[-1] % 2 != 0:
+        raise ValueError(
+            "The last dimension of the input must be even (2 * hidden_size)."
+        )
     if out is not None:
         _check_shape(input, out)
     else:
@@ -180,8 +184,10 @@ def gelu_and_mul(
     """
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
-    if input.shape[-1] * input.dtype.itemsize % 16 != 0:
-        raise ValueError("The pointers must be multiple of 16 bytes.")
+    if input.shape[-1] % 2 != 0:
+        raise ValueError(
+            "The last dimension of the input must be even (2 * hidden_size)."
+        )
     if out is not None:
         _check_shape(input, out)
     else:
