@@ -87,6 +87,11 @@ main() {
     # Find test files (unique to unit tests - auto-discovery)
     find_test_files
 
+    # Print TVM-FFI version just before test execution for traceability
+    echo "Checking TVM-FFI version before tests..."
+    python -c "import tvm_ffi; print(f'TVM-FFI version: {tvm_ffi.__version__}')" || true
+    echo ""
+
     # Execute tests or dry run
     if [ "$DRY_RUN" == "true" ]; then
         execute_dry_run "$TEST_FILES"
