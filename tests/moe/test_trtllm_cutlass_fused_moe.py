@@ -23,6 +23,7 @@ from torch.nn import functional as F
 
 import flashinfer.fused_moe as fused_moe
 from flashinfer import (
+    autotune,
     fp4_quantize,
     mxfp4_dequantize,
     mxfp4_quantize,
@@ -1466,6 +1467,7 @@ def test_moe_bf16_mxfp4(
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("use_autotune", [False, True])
 def test_moe_w4a8(
     batch_size: int,
     hidden_size: int,
@@ -1473,6 +1475,7 @@ def test_moe_w4a8(
     top_k: int,
     intermediate_size: int,
     dtype: torch.dtype,
+    use_autotune: bool,
 ):
     """Test MoE with W4A8 quantization (INT4 weights, FP8 activations)."""
     if torch.cuda.get_device_capability()[0] != 9:
@@ -1575,18 +1578,19 @@ def test_moe_w4a8(
     selected_experts_int32 = selected_experts.to(torch.int32)
 
     flash_output = torch.zeros_like(x)
-    _ = fused_moe.cutlass_fused_moe(
-        x,
-        selected_experts_int32,
-        routing_weights,
-        fc1_weights.view(torch.uint8),
-        fc2_weights.view(torch.uint8),
-        dtype,
-        quant_scales=quant_scales,
-        use_w4_group_scaling=True,
-        output=flash_output,
-        use_packed_weights=True,
-    )
+    with autotune(True) if use_autotune else nullcontext():
+        _ = fused_moe.cutlass_fused_moe(
+            x,
+            selected_experts_int32,
+            routing_weights,
+            fc1_weights.view(torch.uint8),
+            fc2_weights.view(torch.uint8),
+            dtype,
+            quant_scales=quant_scales,
+            use_w4_group_scaling=True,
+            output=flash_output,
+            use_packed_weights=True,
+        )
 
     w31_weight_list = []
     w2_weight_list = []

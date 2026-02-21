@@ -36,6 +36,7 @@ High-Performance GPU Kernels for Inference
 - **POD-Attention**: Fused prefill+decode for mixed batching
 
 ### GEMM & Linear Operations
+- **BF16 GEMM**: BF16 matrix multiplication for SM10.0+ GPUs.
 - **FP8 GEMM**: Per-tensor and groupwise scaling
 - **FP4 GEMM**: NVFP4 and MXFP4 matrix multiplication for Blackwell GPUs
 - **Grouped GEMM**: Efficient batched matrix operations for LoRA and multi-expert routing
@@ -69,6 +70,8 @@ High-Performance GPU Kernels for Inference
 | Hopper | SM 9.0 | H100, H200 |
 | Blackwell | SM 10.0, 10.3 | B200, B300 |
 | Blackwell | SM 12.0, 12.1 | RTX 50 series, DGX Spark, Jetson Thor |
+
+> **Note:** Not all features are supported across all compute capabilities.
 
 ## News
 

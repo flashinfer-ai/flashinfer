@@ -2,6 +2,8 @@
 
 set -eo pipefail
 
+export PARALLEL_TESTS=true  # Enable parallel test execution for unit tests (auto-discovery mode)
+
 # Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Source test environment setup (handles package overrides like TVM-FFI)

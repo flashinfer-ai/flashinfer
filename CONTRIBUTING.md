@@ -34,6 +34,19 @@ Code Contribution Procedure
 * Update (python) documentation index under `docs/`
 * Update `pyproject.toml` if you created new module in flashinfer
 
+# Claiming Issues
+
+Want to work on an issue? Use these commands in the issue comments:
+
+| Command | Who can use | Description |
+|---------|-------------|-------------|
+| `!claim` | Anyone | Self-assign an unassigned issue |
+| `!assign @username` | Admins/Maintainers | Assign a specific user to an issue |
+
+**`!claim`** — Comment `!claim` on any open, unassigned issue to assign yourself. If the issue is already assigned, you'll be asked to contact a maintainer.
+
+**`!assign @username`** — Maintainers can comment `!assign @username` to assign someone. If the user is not yet a collaborator, a triage invitation is sent automatically and they will be assigned once they accept.
+
 # Release Versioning
 
 When incrementing a version and creating a release, follow a "right-shifted" versioning scheme similar to [vLLM Release Versioning](https://github.com/vllm-project/vllm/blob/main/RELEASE.md) (`major.minor.patch[.post1]`) [^1]. In particular:
