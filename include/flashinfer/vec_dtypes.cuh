@@ -1572,7 +1572,7 @@ struct vec_t<nv_bfloat16, vec_size> {
   }
   FLASHINFER_INLINE nv_bfloat16* ptr() { return reinterpret_cast<nv_bfloat16*>(&data); }
   FLASHINFER_INLINE void fill(nv_bfloat16 val) {
-#pragma unoll
+#pragma unroll
     for (size_t i = 0; i < vec_size / 8; ++i) {
       *(nv_bfloat162*)(&(data[i].x)) = make_bfloat162(val, val);
       *(nv_bfloat162*)(&(data[i].y)) = make_bfloat162(val, val);
@@ -1581,37 +1581,37 @@ struct vec_t<nv_bfloat16, vec_size> {
     }
   }
   FLASHINFER_INLINE void load(const nv_bfloat16* ptr) {
-#pragma unoll
+#pragma unroll
     for (size_t i = 0; i < vec_size / 8; ++i) {
       data[i] = ((int4*)ptr)[i];
     }
   }
   FLASHINFER_INLINE void store(nv_bfloat16* ptr) const {
-#pragma unoll
+#pragma unroll
     for (size_t i = 0; i < vec_size / 8; ++i) {
       ((int4*)ptr)[i] = data[i];
     }
   }
   FLASHINFER_INLINE void store_global_release(nv_bfloat16* addr) const {
-#pragma unoll
+#pragma unroll
     for (size_t i = 0; i < vec_size / 8; ++i) {
       st_global_release(data[i], (int4*)(addr + i * 8));
     }
   }
   FLASHINFER_INLINE void load_global_acquire(nv_bfloat16* addr) {
-#pragma unoll
+#pragma unroll
     for (size_t i = 0; i < vec_size / 8; ++i) {
       data[i] = ld_global_acquire((int4*)(addr + i * 8));
     }
   }
   FLASHINFER_INLINE void store_global_volatile(nv_bfloat16* addr) const {
-#pragma unoll
+#pragma unroll
     for (size_t i = 0; i < vec_size / 8; ++i) {
       st_global_volatile(data[i], (int4*)(addr + i * 8));
     }
   }
   FLASHINFER_INLINE void load_global_volatile(nv_bfloat16* addr) {
-#pragma unoll
+#pragma unroll
     for (size_t i = 0; i < vec_size / 8; ++i) {
       data[i] = ld_global_volatile((int4*)(addr + i * 8));
     }
@@ -1629,7 +1629,7 @@ struct vec_t<nv_bfloat16, vec_size> {
     cast_store_impl(ptr, *this);
   }
   FLASHINFER_INLINE static void memcpy(nv_bfloat16* dst, const nv_bfloat16* src) {
-#pragma unoll
+#pragma unroll
     for (size_t i = 0; i < vec_size / 8; ++i) {
       ((int4*)dst)[i] = ((int4*)src)[i];
     }
