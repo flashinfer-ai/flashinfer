@@ -2534,14 +2534,17 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
 
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType,
           class Enable>
-std::map<std::string, std::pair<size_t, size_t>> CutlassMoeFCRunner<
-    T, WeightType, OutputType, InputType, BackBoneType,
-    Enable>::getWorkspaceDeviceBufferSizes(int64_t const num_rows, int64_t const hidden_size,
-                                           int64_t const inter_size, int const num_experts_per_node,
-                                           int const experts_per_token,
-                                           ActivationType activation_type, bool use_lora,
-                                           bool use_deepseek_fp8_block_scale, bool min_latency_mode,
-                                           bool use_awq, bool use_mxfp8_fp8_block_scaling) {
+std::map<std::string, std::pair<size_t, size_t>>
+CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType,
+                   Enable>::getWorkspaceDeviceBufferSizes(int64_t const num_rows,
+                                                          int64_t const hidden_size,
+                                                          int64_t const inter_size,
+                                                          int const num_experts_per_node,
+                                                          int const experts_per_token,
+                                                          ActivationType activation_type,
+                                                          bool use_lora,
+                                                          bool use_deepseek_fp8_block_scale,
+                                                          bool min_latency_mode, bool use_awq) {
   size_t num_moe_inputs =
       min_latency_mode ? num_experts_per_node * num_rows : experts_per_token * num_rows;
   size_t const permuted_elems = num_moe_inputs * hidden_size;
@@ -2595,27 +2598,21 @@ std::map<std::string, std::pair<size_t, size_t>> CutlassMoeFCRunner<
       min_latency_mode
           ? num_moe_inputs
           : std::min(num_moe_inputs, static_cast<size_t>(num_rows * num_experts_per_node));
-  auto fpX_scaling_type = getScalingType();
-  if constexpr (use_fp8) {
-    if (use_mxfp8_fp8_block_scaling) {
-      fpX_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
-    }
-  }
   size_t const sf_size =
-      fpX_scaling_type == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX
+      getScalingType() == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX
           ? sizeof(TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF)
           : sizeof(TmaWarpSpecializedGroupedGemmInput::NVFP4ElementSF);
 
   size_t const fc1_fp4_act_scale_size =
-      getOffsetActivationSF(num_experts_per_node, act_sf_rows, hidden_size, fpX_scaling_type) *
+      getOffsetActivationSF(num_experts_per_node, act_sf_rows, hidden_size, getScalingType()) *
       sf_size;
   size_t const fc2_fp4_act_scale_size =
-      getOffsetActivationSF(num_experts_per_node, act_sf_rows, inter_size, fpX_scaling_type) *
+      getOffsetActivationSF(num_experts_per_node, act_sf_rows, inter_size, getScalingType()) *
       sf_size;
   size_t const fp4_act_scale_size = std::max(fc1_fp4_act_scale_size, fc2_fp4_act_scale_size);
 
   size_t const tma_ws_size = using_tma_ws ? TmaWarpSpecializedGroupedGemmInput::workspaceSize(
-                                                num_experts_per_node, fpX_scaling_type)
+                                                num_experts_per_node, getScalingType())
                                           : 0;
 
   size_t const gemm_workspace_size = moe_gemm_runner_.getMaxWorkspaceSize(num_experts_per_node);
@@ -2725,8 +2722,7 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
                        "Number of experts must be a multiple of ep size");
   auto sizes_map = getWorkspaceDeviceBufferSizes(
       num_rows, hidden_size, inter_size, num_experts / ep_size, experts_per_token, activation_type,
-      use_lora, use_deepseek_fp8_block_scale, min_latency_mode, use_awq,
-      /*use_mxfp8_fp8_block_scaling=*/use_fp8);
+      use_lora, use_deepseek_fp8_block_scale, min_latency_mode, use_awq);
   std::vector<size_t> sizes(sizes_map.size());
   std::transform(sizes_map.begin(), sizes_map.end(), sizes.begin(),
                  [](auto& v) { return v.second.first; });
@@ -2746,18 +2742,10 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType,
                                                  ActivationType activation_type,
                                                  MOEParallelismConfig parallelism_config,
                                                  bool use_lora, bool use_deepseek_fp8_block_scale,
-                                                 bool min_latency_mode, bool use_awq,
-                                                 bool use_mxfp8_fp8_block_scaling) {
+                                                 bool min_latency_mode, bool use_awq) {
   auto workspaces = getWorkspaceDeviceBufferSizes(
       num_rows, hidden_size, inter_size, num_experts_per_node, experts_per_token, activation_type,
-      use_lora, use_deepseek_fp8_block_scale, min_latency_mode, use_awq,
-      use_mxfp8_fp8_block_scaling);
-  auto fpX_scaling_type = getScalingType();
-  if constexpr (use_fp8) {
-    if (use_mxfp8_fp8_block_scaling) {
-      fpX_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
-    }
-  }
+      use_lora, use_deepseek_fp8_block_scale, min_latency_mode, use_awq);
 
   auto getWsPtr = [&](auto type, std::string const& name) {
     return workspaces.at(name).first
@@ -2819,7 +2807,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType,
   // separated
   fc1_fp4_act_scale_ = nullptr;
   fc2_fp4_act_scale_ = nullptr;
-  if (use_block_scaling || use_mxfp8_fp8_block_scaling) {
+  if (use_block_scaling) {
     fc1_fp4_act_scale_ = getWsPtr(TmaWarpSpecializedGroupedGemmInput::ElementSF{}, "fp4_act_scale");
     fc2_fp4_act_scale_ = getWsPtr(TmaWarpSpecializedGroupedGemmInput::ElementSF{}, "fp4_act_scale");
     TLLM_CHECK(fc1_fp4_act_scale_ != nullptr);
@@ -2832,11 +2820,11 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType,
     tma_ws_grouped_gemm1_input_.configureWorkspace(
         getWsPtr(int8_t{}, "tma_ws_gemm1_workspace"), num_experts_per_node,
         getWsPtr(int8_t{}, "gemm_workspace"), workspaces.at("gemm_workspace").first,
-        fpX_scaling_type);
+        getScalingType());
     tma_ws_grouped_gemm2_input_.configureWorkspace(
         getWsPtr(int8_t{}, "tma_ws_gemm2_workspace"), num_experts_per_node,
         getWsPtr(int8_t{}, "gemm_workspace"), workspaces.at("gemm_workspace").first,
-        fpX_scaling_type);
+        getScalingType());
   }
 
   lora_fc1_result_ = {};
@@ -3703,13 +3691,9 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
   bool use_awq = quant_params.groupwise.fc1.act_scales && quant_params.groupwise.fc2.act_scales &&
                  !use_wfp4a16;
   int const num_experts_per_node = full_num_experts / parallelism_config.ep_size;
-  bool const use_mxfp8_fp8_block_scaling =
-      std::is_same_v<WeightType, __nv_fp8_e4m3> && quant_params.mxfp8_mxfp4.fc1.weight_block_scale;
-
   configureWsPtrs(workspace_ptr, num_rows, hidden_size, inter_size, num_experts_per_node,
                   experts_per_token, fc1_activation_type, parallelism_config, use_lora,
-                  use_deepseek_fp8_block_scale, min_latency_mode, use_awq,
-                  use_mxfp8_fp8_block_scaling);
+                  use_deepseek_fp8_block_scale, min_latency_mode, use_awq);
 
   int start_expert = num_experts_per_node * parallelism_config.ep_rank;
   int end_expert = start_expert + num_experts_per_node;
@@ -3931,11 +3915,6 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
   layout_info2.int4_groupwise_params.use_wfp4a16 = use_wfp4a16;
 
   auto fpX_block_scaling_type = getScalingType();
-  if constexpr (std::is_same_v<WeightType, __nv_fp8_e4m3>) {
-    if (quant_params.mxfp8_mxfp4.fc1.weight_block_scale) {
-      fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
-    }
-  }
   layout_info1.fpX_block_scaling_type = fpX_block_scaling_type;
   layout_info2.fpX_block_scaling_type = fpX_block_scaling_type;
 

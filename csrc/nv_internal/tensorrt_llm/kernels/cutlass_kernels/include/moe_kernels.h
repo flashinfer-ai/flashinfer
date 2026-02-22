@@ -848,14 +848,12 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   std::map<std::string, std::pair<size_t, size_t>> getWorkspaceDeviceBufferSizes(
       int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size,
       int const num_experts_per_node, int const experts_per_token, ActivationType activation_type,
-      bool use_lora, bool use_deepseek_fp8_block_scale, bool min_latency_mode, bool use_awq,
-      bool use_mxfp8_fp8_block_scaling);
+      bool use_lora, bool use_deepseek_fp8_block_scale, bool min_latency_mode, bool use_awq);
   void configureWsPtrs(char* ws_ptr, int64_t const num_rows, int64_t const hidden_size,
                        int64_t const inter_size, int const num_experts_per_node,
                        int const experts_per_token, ActivationType activation_type,
                        MOEParallelismConfig parallelism_config, bool use_lora,
-                       bool use_deepseek_fp8_block_scale, bool min_latency_mode, bool use_awq,
-                       bool use_mxfp8_fp8_block_scaling);
+                       bool use_deepseek_fp8_block_scale, bool min_latency_mode, bool use_awq);
 
  private:
   bool mayHaveDifferentGEMMOutputType() const {
