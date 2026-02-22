@@ -247,11 +247,16 @@ def act_and_mul(
         Output tensor, shape (..., d).
     """
     d = input.shape[-1] // 2
+    if d == 0:
+        return
     is_fp16 = input.dtype == torch.float16
     sm_version = get_sm_version(input.device)
 
     input_2d = input.reshape(-1, 2 * d).contiguous()
     out_2d = out.reshape(-1, d)
+    assert out_2d.is_contiguous(), (
+        "Output tensor must be contiguous for CuTe-DSL kernel"
+    )
     M = input_2d.shape[0]
 
     tensor_api = _get_compiled_kernel(act_func_name, d, is_fp16, sm_version)
