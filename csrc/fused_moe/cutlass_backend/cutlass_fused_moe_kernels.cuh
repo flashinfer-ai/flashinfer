@@ -3691,6 +3691,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
   bool use_awq = quant_params.groupwise.fc1.act_scales && quant_params.groupwise.fc2.act_scales &&
                  !use_wfp4a16;
   int const num_experts_per_node = full_num_experts / parallelism_config.ep_size;
+
   configureWsPtrs(workspace_ptr, num_rows, hidden_size, inter_size, num_experts_per_node,
                   experts_per_token, fc1_activation_type, parallelism_config, use_lora,
                   use_deepseek_fp8_block_scale, min_latency_mode, use_awq);
@@ -3914,9 +3915,8 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
   layout_info1.int4_groupwise_params.use_wfp4a16 = use_wfp4a16;
   layout_info2.int4_groupwise_params.use_wfp4a16 = use_wfp4a16;
 
-  auto fpX_block_scaling_type = getScalingType();
-  layout_info1.fpX_block_scaling_type = fpX_block_scaling_type;
-  layout_info2.fpX_block_scaling_type = fpX_block_scaling_type;
+  layout_info1.fpX_block_scaling_type = getScalingType();
+  layout_info2.fpX_block_scaling_type = getScalingType();
 
   int const threads = std::min(1024, num_experts_per_node);
   int const blocks = (num_experts_per_node + threads - 1) / threads;
