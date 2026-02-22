@@ -79,7 +79,7 @@ class ActAndMulKernel:
     and vector size is statically computed based on dtype and d.
     """
 
-    _VALID_ACT_FUNCS = {"silu", "gelu", "gelu_tanh"}
+    _VALID_ACT_FUNCS: frozenset[str] = frozenset({"silu", "gelu", "gelu_tanh"})
 
     def __init__(
         self,
@@ -180,7 +180,7 @@ def _get_compiled_kernel(
     act_func_name: str,
     d: int,
     is_fp16: bool,
-    sm_version: int,  # used as cache key, not in body
+    sm_version: int,  # noqa: ARG001 — used as cache key, not in body
 ) -> Callable:
     """
     Get a compiled kernel closure that takes torch.Tensor directly.
@@ -249,15 +249,22 @@ def act_and_mul(
     d = input.shape[-1] // 2
     if d == 0:
         return
+    if input.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(
+            f"act_and_mul: unsupported dtype {input.dtype}; "
+            f"expected float16 or bfloat16"
+        )
     is_fp16 = input.dtype == torch.float16
     sm_version = get_sm_version(input.device)
 
     input_2d = input.reshape(-1, 2 * d).contiguous()
-    out_2d = out.reshape(-1, d)
-    assert out_2d.is_contiguous(), (
+    assert out.is_contiguous(), (
         "Output tensor must be contiguous for CuTe-DSL kernel"
     )
+    out_2d = out.reshape(-1, d)
     M = input_2d.shape[0]
+    if M == 0:
+        return
 
     tensor_api = _get_compiled_kernel(act_func_name, d, is_fp16, sm_version)
     tensor_api(out_2d, input_2d, M)
