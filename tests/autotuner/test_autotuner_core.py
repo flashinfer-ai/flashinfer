@@ -242,6 +242,60 @@ def test_search_cache_hit_and_miss():
     assert hit == (True, 0, 1, None)
 
 
+def test_search_cache_preserving_leading_dims_hits_while_flattened_misses(monkeypatch):
+    """Shape-preserving reshape keeps cache-hit behavior; full flatten can change bucket/key."""
+    tuner = _reset_autotuner()
+    runner = DummyRunner()
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                # In MoE-style kernels, leading dim represents num_tokens.
+                # Keep one dynamic tensor here so this test isolates layout effects
+                # (and does not depend on known linked-dim mapping bugs).
+                input_idx=(0,),
+                dim_idx=(0,),
+                # Only cache the current bucket; this makes alternative layouts
+                # map to a miss when their nearest bucket differs.
+                gen_tuning_buckets=lambda x: (last_positive_power_of_2(x),),
+                map_to_tuning_buckets=last_positive_power_of_2,
+            ),
+        )
+    )
+
+    # MoE semantic shape: [num_tokens, hidden_size].
+    m, n = 1000, 256
+    preserve_layout_inputs = [torch.empty((m, n), dtype=torch.float32)]
+
+    # Flattening destroys the num_tokens axis and changes autotuner's shape key.
+    flattened_layout_shapes = (torch.Size([m * n]),)
+
+    def fake_profile(self, runner_obj, prof_inputs, tactic, **kwargs):
+        return {0: 5.0, 1: 1.0, 2: 3.0}[tactic]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    with autotune(tune_mode=True):
+        tuner.choose_one("dummy_layout", [runner], config, preserve_layout_inputs)
+
+    # Search with shape that preserves num_tokens as dim0 -> expected cache hit.
+    preserved_hit, _, _, _ = tuner.search_cache(
+        "dummy_layout",
+        [runner],
+        tuple(t.shape for t in preserve_layout_inputs),
+        config,
+    )
+
+    # Search with flattened shape (num_tokens lost) -> expected cache miss.
+    flattened_hit, _, _, _ = tuner.search_cache(
+        "dummy_layout",
+        [runner],
+        flattened_layout_shapes,
+        config,
+    )
+
+    assert preserved_hit is True
+    assert flattened_hit is False
+
+
 def test_choose_one_inference_uses_cache_or_fallback():
     """Inference path should use cached tactic when present, else fallback -1."""
     tuner = _reset_autotuner()
