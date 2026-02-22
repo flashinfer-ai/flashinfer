@@ -66,6 +66,8 @@ void {{ func_name }}(TensorView out, TensorView input, bool enable_pdl) {
   }
 
     switch (vec_size) {
+      // VS=16 is currently unreachable (fp16/bf16 give initial vec_size=8);
+      // retained for future fp8 (sizeof=1) support.
       DISPATCH_VEC_SIZE(16)
       DISPATCH_VEC_SIZE(8)
       DISPATCH_VEC_SIZE(4)
