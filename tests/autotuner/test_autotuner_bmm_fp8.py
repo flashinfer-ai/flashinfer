@@ -107,7 +107,7 @@ def test_autotuner_gemm(tune_mode, pre_tune, expected_cache_hit, m, n, k):
         _FP8_GEMM_SM100_TUNING_CONFIG,
     )
 
-    assert is_cache_hit == expected_cache_hit, f"{expected_cache_hit=}, {is_cache_hit=}"
+    assert is_cache_hit == expected_cache_hit
     if is_cache_hit:
         assert runner_id == 0
         assert tactic == 0
