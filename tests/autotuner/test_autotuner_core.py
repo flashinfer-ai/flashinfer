@@ -283,8 +283,8 @@ def test_choose_one_tuning_selects_best_tactic_and_populates_cache(monkeypatch):
     assert tuner.stats.tuned_op_successful_configs["dummy_tune"] >= 1
 
 
-def test_generate_optimization_profiles_applies_dynamic_and_constraints():
-    """Generated profiles should follow dynamic buckets and inferred constraints."""
+def test_prepare_input_tensors_reuses_static_and_recreates_dynamic():
+    """Profiles apply constraints, dynamic inputs are recreated, static inputs are reused."""
     tuner = _reset_autotuner()
     config = TuningConfig(
         dynamic_tensor_specs=(
@@ -297,43 +297,22 @@ def test_generate_optimization_profiles_applies_dynamic_and_constraints():
         ),
         constraint_specs=(
             ConstraintSpec(
-                input_idx=1,
+                input_idx=0,
                 dim_idx=1,
                 infer_shape=lambda shapes: shapes[0][0] // 2,
             ),
         ),
     )
     inputs = [
-        torch.empty((12, 4), dtype=torch.float32),
-        torch.empty((2, 99, 3), dtype=torch.float32),
+        torch.empty((12, 99), dtype=torch.float32),
+        torch.empty((2, 3), dtype=torch.float32),
     ]
     profiles = tuner._generate_optimization_profiles(config, inputs)
     assert len(profiles) == 2
-    assert profiles[0].get_opt_shapes()[0][0] == 8
-    assert profiles[1].get_opt_shapes()[0][0] == 16
-    assert profiles[0].get_opt_shapes()[1][1] == 4
-    assert profiles[1].get_opt_shapes()[1][1] == 8
+    assert profiles[0].get_opt_shapes()[0] == (8, 4)
+    assert profiles[1].get_opt_shapes()[0] == (16, 8)
 
-
-def test_prepare_input_tensors_reuses_static_and_recreates_dynamic():
-    """Dynamic inputs should be recreated while static inputs are reused."""
-    tuner = _reset_autotuner()
-    config = TuningConfig(
-        dynamic_tensor_specs=(
-            DynamicTensorSpec(
-                input_idx=(0,),
-                dim_idx=(0,),
-                gen_tuning_buckets=(8,),
-                map_to_tuning_buckets=lambda x: x,
-            ),
-        )
-    )
-    inputs = [
-        torch.empty((12, 4), dtype=torch.float32),
-        torch.empty((2, 3), dtype=torch.float32),
-    ]
-    profile = tuner._generate_optimization_profiles(config, inputs)[0]
-    prepared = tuner._prepare_input_tensors(profile, inputs)
+    prepared = tuner._prepare_input_tensors(profiles[0], inputs)
 
     assert tuple(prepared[0].shape) == (8, 4)
     assert prepared[0] is not inputs[0]
