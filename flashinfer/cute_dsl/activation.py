@@ -254,6 +254,11 @@ def act_and_mul(
             f"act_and_mul: unsupported dtype {input.dtype}; "
             f"expected float16 or bfloat16"
         )
+    if out.dtype != input.dtype:
+        raise ValueError(
+            f"act_and_mul: output dtype {out.dtype} must match "
+            f"input dtype {input.dtype}"
+        )
     is_fp16 = input.dtype == torch.float16
     sm_version = get_sm_version(input.device)
 
