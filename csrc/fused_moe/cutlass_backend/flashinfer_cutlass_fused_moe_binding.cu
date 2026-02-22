@@ -145,7 +145,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 #endif
 
 #ifdef ENABLE_FP8
-    if (isFp8Quant() || isWFp8AMxfp8Quant()) {
+    if (isFp8Quant() || isWMxfp8AMxfp8Quant()) {
       mKernelRunner = switch_output_type<__nv_fp8_e4m3, __nv_fp8_e4m3>(mOutputDtype);
     }
 #endif
@@ -864,7 +864,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       int64_t num_experts_on_rank, int64_t hidden_size, int64_t inter_size,
       Optional<Array<Tensor>> quant_scales,
       ActivationType base_activation_type = ActivationType::Swiglu) const {
-    if (isWFp8AMxfp8Quant()) {
+    if (isWMxfp8AMxfp8Quant()) {
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
       TVM_FFI_ICHECK(quant_scales.has_value())
           << "Expecting quant scales for MXFP8xMXFP8 quantization";
@@ -1232,12 +1232,12 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
            mWeightDtype == dl_float8_e4m3fn && !mUseMxfp8ActScaling;
   }
 
-  bool isWFp8AMxfp8Quant() const {
+  bool isWMxfp8AMxfp8Quant() const {
     return !mUseDeepSeekFP8BlockScaling && mActivationDtype == dl_float8_e4m3fn &&
            mWeightDtype == dl_float8_e4m3fn && mUseMxfp8ActScaling;
   }
 
-  bool isMxfp8ActScalingQuant() const { return isWFp8AMxfp8Quant() || isWMxfp4AMxfp8Quant(); }
+  bool isMxfp8ActScalingQuant() const { return isWMxfp8AMxfp8Quant() || isWMxfp4AMxfp8Quant(); }
 
   bool isNvfp4Quant() const {
     return mWeightDtype == dl_int64 &&
