@@ -31,6 +31,7 @@ from .utils import (
 from .fp4_quantization import get_fp4_quantization_module
 
 
+@functools.cache
 def _is_cute_dsl_available():
     import importlib.util
 
@@ -116,6 +117,8 @@ def silu_and_mul(
     if _is_cute_dsl_available():
         from .cute_dsl.activation import act_and_mul
 
+        # CuTe-DSL path does not support PDL (no CuTe-DSL kernel in
+        # FlashInfer uses programmatic dependent launch).
         act_and_mul("silu", input, out)
     else:
         get_act_and_mul_module("silu").silu_and_mul(out, input, enable_pdl)
@@ -162,6 +165,8 @@ def gelu_tanh_and_mul(
     if _is_cute_dsl_available():
         from .cute_dsl.activation import act_and_mul
 
+        # CuTe-DSL path does not support PDL (no CuTe-DSL kernel in
+        # FlashInfer uses programmatic dependent launch).
         act_and_mul("gelu_tanh", input, out)
     else:
         get_act_and_mul_module("gelu_tanh").gelu_tanh_and_mul(out, input, enable_pdl)
@@ -208,6 +213,8 @@ def gelu_and_mul(
     if _is_cute_dsl_available():
         from .cute_dsl.activation import act_and_mul
 
+        # CuTe-DSL path does not support PDL (no CuTe-DSL kernel in
+        # FlashInfer uses programmatic dependent launch).
         act_and_mul("gelu", input, out)
     else:
         get_act_and_mul_module("gelu").gelu_and_mul(out, input, enable_pdl)

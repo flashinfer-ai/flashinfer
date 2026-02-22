@@ -79,12 +79,19 @@ class ActAndMulKernel:
     and vector size is statically computed based on dtype and d.
     """
 
+    _VALID_ACT_FUNCS = {"silu", "gelu", "gelu_tanh"}
+
     def __init__(
         self,
         dtype: cutlass.Numeric,
         d: int,
         act_func_name: str,
     ):
+        if act_func_name not in self._VALID_ACT_FUNCS:
+            raise ValueError(
+                f"Unknown activation: {act_func_name!r}. "
+                f"Expected one of {self._VALID_ACT_FUNCS}"
+            )
         self.dtype = dtype
         self.d = d
         self.act_func_name = act_func_name
@@ -173,7 +180,7 @@ def _get_compiled_kernel(
     act_func_name: str,
     d: int,
     is_fp16: bool,
-    sm_version: int,
+    sm_version: int,  # used as cache key, not in body
 ) -> Callable:
     """
     Get a compiled kernel closure that takes torch.Tensor directly.
