@@ -104,6 +104,33 @@ def test_find_nearest_profile_dynamic_and_constraint(leading_dim, expected_bucke
         (1024, 1024),
         (4096, 4096),
         (8192, 8192),
+    ],
+)
+def test_find_nearest_profile_single_tensor_bucketization_exact_powers(
+    num_tokens, expected_bucket
+):
+    """Exact power-of-two mapping is validated on one tensor (no linked-dim semantics)."""
+    gen_tuning_buckets = (512, 1024, 2048, 4096, 8192)
+    input_shape = (_moe_input_shapes(num_tokens)[0],)
+
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=gen_tuning_buckets,
+                map_to_tuning_buckets=lambda x: min(last_positive_power_of_2(x), 8192),
+            ),
+        )
+    )
+    nearest = AutoTuner._find_nearest_profile(input_shape, config)
+    assert nearest[0][0] == expected_bucket
+    assert nearest[0][1:] == input_shape[0][1:]
+
+
+@pytest.mark.parametrize(
+    "num_tokens,expected_bucket",
+    [
         pytest.param(1000, 512, marks=XFAIL_LINKED_DYNAMIC),
         pytest.param(4000, 2048, marks=XFAIL_LINKED_DYNAMIC),
         pytest.param(8000, 4096, marks=XFAIL_LINKED_DYNAMIC),
@@ -111,13 +138,9 @@ def test_find_nearest_profile_dynamic_and_constraint(leading_dim, expected_bucke
     ],
 )
 def test_find_nearest_profile_moe_shared_num_tokens_axis(num_tokens, expected_bucket):
-    """MoE-style linked tensors should map shared num_tokens axis to one bucket."""
+    """MoE linked tensors should all map num_tokens together to one bucket."""
     gen_tuning_buckets = (512, 1024, 2048, 4096, 8192, 16384)
-
-    # Check that test cases are valid
-    assert expected_bucket in gen_tuning_buckets, (
-        f"Expected bucket {expected_bucket} not in gen_tuning_buckets {gen_tuning_buckets}"
-    )
+    shapes: tuple[torch.Size, ...] = _moe_input_shapes(num_tokens)
 
     config = TuningConfig(
         dynamic_tensor_specs=(
@@ -132,11 +155,7 @@ def test_find_nearest_profile_moe_shared_num_tokens_axis(num_tokens, expected_bu
             ),
         )
     )
-
-    shapes: tuple[torch.Size, ...] = _moe_input_shapes(num_tokens)
-
     nearest = AutoTuner._find_nearest_profile(shapes, config)
-
     assert all(shape[0] == expected_bucket for shape in nearest)
     for nearest_shape, original_shape in zip(nearest, shapes, strict=True):
         assert nearest_shape[1:] == original_shape[1:]
