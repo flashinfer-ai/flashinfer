@@ -949,13 +949,13 @@ size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::calcMaxWorkspace
     auto fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE;
     if constexpr (use_wfp4afp8) {
       fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
-    } else if constexpr (use_fp4) {
-      fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4;
     } else if constexpr (use_fp8) {
       // FP8 runners can be used in MXFP8 mode (UE8M0 block scales), which needs larger TMA WS.
       // Allocate using MXFPX requirements so workspace is sufficient for both regular FP8 and
       // MXFP8.
       fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
+    } else if (use_fp4) {
+      fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4;
     }
     size_t max_size = 0;
     bool has_config = false;
