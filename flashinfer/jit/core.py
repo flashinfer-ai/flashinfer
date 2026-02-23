@@ -120,7 +120,7 @@ def check_cuda_arch():
             fresh = CompilationContext()
             if fresh.TARGET_CUDA_ARCHS:
                 eligible = _archs_eligible(fresh.TARGET_CUDA_ARCHS)
-        except Exception as e:
+        except (ValueError, RuntimeError, OSError) as e:
             logger.debug("Re-query of CUDA archs failed: %s", e)
 
     # If still not eligible, check actual GPU capability at runtime
@@ -135,6 +135,10 @@ def check_cuda_arch():
                     compute_version = major * 10 + minor
                     if compute_version >= MIN_COMPUTE_VERSION:
                         eligible = True
+                        arch_minor = str(minor) + "a" if major >= 9 else str(minor)
+                        current_compilation_context.TARGET_CUDA_ARCHS.add(
+                            (major, arch_minor)
+                        )
                         logger.info(
                             "GPU %s supports sm%s%s (compute %s), enabling FlashInfer",
                             device,
