@@ -2251,7 +2251,7 @@ def trtllm_bf16_moe(
     do_finalize: bool = True,
     enable_pdl: bool = True,
     tune_max_num_tokens: int = 8192,
-) -> List[torch.Tensor]:
+) -> Union[List[torch.Tensor], torch.Tensor]:
     """BF16 MoE operation with autotuning support.
 
     This function implements a bfloat16 Mixture of Experts layer using the TensorRT-LLM backend
@@ -2290,10 +2290,10 @@ def trtllm_bf16_moe(
         tune_max_num_tokens: Maximum number of tokens for autotuning (default: 8192).
 
     Returns:
-        List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
-            Otherwise, returns intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
+        when do_finalize=True, returns the final MoE output.
+        otherwise, returns the intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
     """
-    return get_trtllm_moe_sm100_module().trtllm_bf16_moe(
+    result = get_trtllm_moe_sm100_module().trtllm_bf16_moe(
         routing_logits,
         routing_bias,
         None,
@@ -2316,6 +2316,14 @@ def trtllm_bf16_moe(
         enable_pdl,
         tune_max_num_tokens,
     )
+
+    if do_finalize:
+        logger.warning_once(
+            "the single torch.Tensor return type is deprecated and will be replaced with List[torch.Tensor] in the v0.8.0."
+        )
+        return result[0]
+    else:
+        return result
 
 
 @flashinfer_api
@@ -2376,10 +2384,10 @@ def trtllm_bf16_routed_moe(
         tune_max_num_tokens: Maximum number of tokens for autotuning (default: 8192).
 
     Returns:
-        List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
-            Otherwise, returns intermediate results (gemm2_output, undefined, expanded_idx_to_permuted_idx) that need further processing.
+        when do_finalize=True, returns the final MoE output.
+        otherwise, returns the intermediate results (gemm2_output, undefined, expanded_idx_to_permuted_idx) that need further processing.
     """
-    return get_trtllm_moe_sm100_module().trtllm_bf16_moe(
+    result = get_trtllm_moe_sm100_module().trtllm_bf16_moe(
         None,
         None,
         topk_ids,
@@ -2402,6 +2410,14 @@ def trtllm_bf16_routed_moe(
         enable_pdl,
         tune_max_num_tokens,
     )
+
+    if do_finalize:
+        logger.warning_once(
+            "the single torch.Tensor return type is deprecated and will be replaced with List[torch.Tensor] in the v0.8.0."
+        )
+        return result[0]
+    else:
+        return result
 
 
 @flashinfer_api
@@ -2428,7 +2444,7 @@ def trtllm_fp8_per_tensor_scale_moe(
     enable_pdl: Optional[bool] = None,
     tune_max_num_tokens: int = 8192,
     activation_type: int = ActivationType.Swiglu.value,
-) -> List[torch.Tensor]:
+) -> Union[List[torch.Tensor], torch.Tensor]:
     """FP8 per tensor scale MoE operation.
 
     Args:
@@ -2461,10 +2477,10 @@ def trtllm_fp8_per_tensor_scale_moe(
             - 7: Identity
 
     Returns:
-        List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
-            Otherwise, returns intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
+        when do_finalize=True, returns the final MoE output.
+        otherwise, returns the intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
     """
-    return get_trtllm_moe_sm100_module().trtllm_fp8_per_tensor_scale_moe(
+    result = get_trtllm_moe_sm100_module().trtllm_fp8_per_tensor_scale_moe(
         routing_logits,
         routing_bias,
         hidden_states,
@@ -2488,6 +2504,14 @@ def trtllm_fp8_per_tensor_scale_moe(
         tune_max_num_tokens,
         activation_type,
     )
+
+    if do_finalize:
+        logger.warning_once(
+            "the single torch.Tensor return type is deprecated and will be replaced with List[torch.Tensor] in the v0.8.0."
+        )
+        return result[0]
+    else:
+        return result
 
 
 @flashinfer_api
@@ -2515,7 +2539,7 @@ def trtllm_fp8_block_scale_moe(
     enable_pdl: Optional[bool] = None,
     tune_max_num_tokens: int = 8192,
     fp8_quantization_type: Fp8QuantizationType = Fp8QuantizationType.DeepSeekFp8,
-) -> List[torch.Tensor]:
+) -> Union[List[torch.Tensor], torch.Tensor]:
     """FP8 block scale MoE operation.
 
     Args:
@@ -2548,13 +2572,13 @@ def trtllm_fp8_block_scale_moe(
         tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
         fp8_quantization_type: Type of FP8 quantization to use (default: DeepSeekFp8)
     Returns:
-        List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
-            Otherwise, returns intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
+        when do_finalize=True, returns the final MoE output.
+        otherwise, returns the intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
     """
     output = torch.empty(
         hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
     )
-    return get_trtllm_moe_sm100_module().trtllm_fp8_block_scale_moe(
+    result = get_trtllm_moe_sm100_module().trtllm_fp8_block_scale_moe(
         routing_logits,
         None,  # topk_ids - will be computed from routing_logits
         None,  # expert_weights - will be computed from routing_logits
@@ -2583,6 +2607,14 @@ def trtllm_fp8_block_scale_moe(
         fp8_quantization_type,
     )
 
+    if do_finalize:
+        logger.warning_once(
+            "the single torch.Tensor return type is deprecated and will be replaced with List[torch.Tensor] in the v0.8.0."
+        )
+        return result[0]
+    else:
+        return result
+
 
 @flashinfer_api
 def trtllm_fp8_block_scale_routed_moe(
@@ -2610,7 +2642,7 @@ def trtllm_fp8_block_scale_routed_moe(
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
     fp8_quantization_type: Fp8QuantizationType = Fp8QuantizationType.DeepSeekFp8,
-) -> List[torch.Tensor]:
+) -> Union[List[torch.Tensor], torch.Tensor]:
     """FP8 block scale MoE operation with pre-computed routing (packed format).
 
     This function is used when routing decisions have already been computed
@@ -2647,10 +2679,10 @@ def trtllm_fp8_block_scale_routed_moe(
         tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
         fp8_quantization_type: Type of FP8 quantization to use (default: DeepSeekFp8)
     Returns:
-        List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
-            Otherwise, returns intermediate results (gemm2_output, undefined, expanded_idx_to_permuted_idx) that need further processing.
+        when do_finalize=True, returns the final MoE output.
+        otherwise, returns the intermediate results (gemm2_output, undefined, expanded_idx_to_permuted_idx) that need further processing.
     """
-    return get_trtllm_moe_sm100_module().trtllm_fp8_block_scale_moe(
+    result = get_trtllm_moe_sm100_module().trtllm_fp8_block_scale_moe(
         None,  # routing_logits
         topk_ids,
         None,  # expert_weights
@@ -2678,6 +2710,14 @@ def trtllm_fp8_block_scale_routed_moe(
         tune_max_num_tokens,
         fp8_quantization_type,
     )
+
+    if do_finalize:
+        logger.warning_once(
+            "the single torch.Tensor return type is deprecated and will be replaced with List[torch.Tensor] in the v0.8.0."
+        )
+        return result[0]
+    else:
+        return result
 
 
 @flashinfer_api
