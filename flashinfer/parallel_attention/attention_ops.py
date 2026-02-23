@@ -150,6 +150,9 @@ class FlashAttn3:
         if tensor_layout == "HND":
             output = convert_output_layout(output, src_layout="NHD", dst_layout="HND")
 
+        if tensor_layout == "NHD" and lse is not None:
+            lse = lse.permute(1, 0)
+
         if output.dtype != origin_dtype:
             output = output.to(origin_dtype)
  
