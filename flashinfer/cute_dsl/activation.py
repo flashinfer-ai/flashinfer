@@ -263,9 +263,8 @@ def act_and_mul(
     sm_version = get_sm_version(input.device)
 
     input_2d = input.reshape(-1, 2 * d).contiguous()
-    assert out.is_contiguous(), (
-        "Output tensor must be contiguous for CuTe-DSL kernel"
-    )
+    if not out.is_contiguous():
+        raise ValueError("Output tensor must be contiguous for CuTe-DSL kernel")
     out_2d = out.reshape(-1, d)
     M = input_2d.shape[0]
     if M == 0:
