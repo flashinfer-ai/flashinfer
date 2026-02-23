@@ -5,12 +5,9 @@ from types import SimpleNamespace
 import torch
 from flashinfer.utils import (
     register_custom_op,
-    supported_compute_capability,
-    backend_requirement,
 )
 
 
-@supported_compute_capability([89, 90, 100, 103, 120, 121])
 def _check_dsv3_fused_routing_supported(
     scores,
     bias,
@@ -116,7 +113,6 @@ def get_dsv3_fused_routing_module():
     )
 
 
-@backend_requirement({}, common_check=_check_dsv3_fused_routing_supported)
 @flashinfer_api
 def fused_topk_deepseek(
     scores: torch.Tensor,
@@ -167,7 +163,7 @@ def fused_topk_deepseek(
             (num_tokens, topk) for the selected expert indices. Must be int32 or int64.
             This tensor is mutated in-place.
         launch_with_pdl (bool, optional): Whether to launch the kernel using Persistent
-            Device-side Launch. Defaults to True.
+            Device-side Launch (SM90+ only). Defaults to True.
 
     Returns:
         None: Results are written directly to `topk_values` and `topk_indices` tensors.
@@ -175,14 +171,23 @@ def fused_topk_deepseek(
     Note:
         - The kernel uses float32 internally for all computations to ensure numerical
           precision, even when inputs are float16 or bfloat16.
-        - This implementation is optimized for Hopper (compute capability 90, 100),
-          Ada (compute capability 89), and Blackwell (compute capability 120, 121)
-          architectures.
+        - Persistent Device-side Launch (PDL) is supported on SM90+ architectures.
         - The "NoAux" prefix indicates this variant does not compute auxiliary losses
           (e.g., load balancing loss) during routing.
         - The "Tc" suffix indicates the use of Tensor Core optimizations in the
           underlying CUDA kernel.
     """
+    _check_dsv3_fused_routing_supported(
+        scores,
+        bias,
+        n_group,
+        topk_group,
+        topk,
+        routed_scaling_factor,
+        topk_values,
+        topk_indices,
+        launch_with_pdl,
+    )
     get_dsv3_fused_routing_module().NoAuxTc(
         scores,
         bias,
