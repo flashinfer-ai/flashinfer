@@ -283,10 +283,10 @@ def ulysses_wrapper(func):
         if ring_size == 1 and varlen_cp_config.cu_seqlens_q_cur_ulysses_group is not None:
             cu_seqlens_q = varlen_cp_config.cu_seqlens_q_cur_ulysses_group
             cu_seqlens_kv = varlen_cp_config.cu_seqlens_kv_cur_ulysses_group
-            kwargs["cu_seqlens_q"] = cu_seqlens_q
-            kwargs["cu_seqlens_k"] = cu_seqlens_kv
-            kwargs["max_seqlen_q"] = varlen_cp_config.max_seq_len_q_cur_ulysses_group
-            kwargs["max_seqlen_k"] = varlen_cp_config.max_seq_len_kv_cur_ulysses_group
+            kwargs["cur_rank_cu_seqlens_q"] = cu_seqlens_q
+            kwargs["cur_rank_cu_seqlens_k"] = cu_seqlens_kv
+            kwargs["cur_rank_max_seqlen_q"] = varlen_cp_config.max_seq_len_q_cur_ulysses_group
+            kwargs["cur_rank_max_seqlen_k"] = varlen_cp_config.max_seq_len_kv_cur_ulysses_group
 
             if key.shape[seq_dim] != cu_seqlens_kv[-1]:
                 # Truncate kv_inputs using torch.narrow
@@ -334,9 +334,6 @@ def ring_wrapper(func):
         if ring_size == 1:
             return func(self, query, key, value, tensor_layout, attn_mask, **kwargs)
 
-        cu_seqlens_q = kwargs.get("cu_seqlens_q", None)
-        if cu_seqlens_q is not None:
-            raise NotImplementedError("var_len_attention is not supported by ring wrapper")
 
         rank = attn_parallel_config.ring_rank()
         send_dst = (rank + 1) % ring_size
@@ -382,8 +379,8 @@ def ring_wrapper(func):
             if varlen_cp_config.cu_seqlens_q_cur_ring_group is not None:
                 cu_seqlens_q = varlen_cp_config.cu_seqlens_q_cur_ring_group[rank]
                 cu_seqlens_kv = varlen_cp_config.cu_seqlens_kv_cur_ring_group[kv_rank]
-                kwargs["cu_seqlens_q"] = cu_seqlens_q
-                kwargs["cu_seqlens_k"] = cu_seqlens_kv
+                kwargs["cur_rank_cu_seqlens_q"] = cu_seqlens_q
+                kwargs["cur_rank_cu_seqlens_k"] = cu_seqlens_kv
 
                 if kv_inputs.shape[seq_dim + 1] != cu_seqlens_kv[-1]:
                     # Truncate kv_inputs using torch.narrow
@@ -391,8 +388,8 @@ def ring_wrapper(func):
                         kv_inputs, seq_dim + 1, 0, cu_seqlens_kv[-1]
                     )
 
-                kwargs["max_seqlen_q"] = varlen_cp_config.max_seq_len_q_cur_ring_group
-                kwargs["max_seqlen_k"] = varlen_cp_config.max_seq_len_kv_cur_ring_group
+                kwargs["cur_rank_max_seqlen_q"] = varlen_cp_config.max_seq_len_q_cur_ring_group
+                kwargs["cur_rank_max_seqlen_k"] = varlen_cp_config.max_seq_len_kv_cur_ring_group
 
             kwargs["return_lse"] = True
             with torch.cuda.device(

@@ -10,7 +10,6 @@ try:
     import flash_attn_interface
 except ImportError:
     flash_attn_interface = None
-    logger.warning("FlashAttn3 is not installed.")
 
 
 class AttentionOpManager:
@@ -61,26 +60,19 @@ class FlashAttn3:
         key,
         value,
         attn_mask=None,
-        dropout_p=0.0,
         is_causal=False,
-        scale=None,
-        enable_gqa=False,
         return_lse=False,
         tensor_layout="HND",
-        cu_seqlens_q=None,
-        cu_seqlens_k=None,
-        max_seqlen_q=0,
-        max_seqlen_k=0,
+        cur_rank_cu_seqlens_q=None,
+        cur_rank_cu_seqlens_k=None,
+        cur_rank_max_seqlen_q=0,
+        cur_rank_max_seqlen_k=0,
+        **kwargs,
     ):
 
         if flash_attn_interface is None:
             raise ImportError("FlashAttn3 is not installed")
-
-        logger.debug("Using FlashAttn3")
-        if attn_mask is not None:
-            raise NotImplementedError("Attn mask not supported for FlashAttn3")
-        if dropout_p != 0.0:
-            raise NotImplementedError("Dropout is not supported for FlashAttn3")
+       
         if tensor_layout not in ["HND", "NHD"]:
             raise NotImplementedError("Tensor layout not supported for FlashAttn3")
 
@@ -94,7 +86,7 @@ class FlashAttn3:
             key = key.to(torch.float16)
             value = value.to(torch.float16)
 
-        if cu_seqlens_q is None:
+        if cur_rank_cu_seqlens_q is None:
             query = torch.unsqueeze(query, dim=0)
             key = torch.unsqueeze(key, dim=0)
             value = torch.unsqueeze(value, dim=0)
@@ -102,7 +94,7 @@ class FlashAttn3:
                 q=query,
                 k=key,
                 v=value,
-                softmax_scale=scale,
+                softmax_scale=None,
                 causal=is_causal,
                 qv=None,
                 q_descale=None,
@@ -130,13 +122,13 @@ class FlashAttn3:
                 q=query,
                 k=key,
                 v=value,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_k,
+                cu_seqlens_q=cur_rank_cu_seqlens_q,
+                cu_seqlens_k=cur_rank_cu_seqlens_k,
+                max_seqlen_q=cur_rank_max_seqlen_q,
+                max_seqlen_k=cur_rank_max_seqlen_k,
                 seqused_q=None,
                 seqused_k=None,
-                softmax_scale=scale,
+                softmax_scale=None,
                 causal=is_causal,
                 qv=None,
                 q_descale=None, k_descale=None, v_descale=None,

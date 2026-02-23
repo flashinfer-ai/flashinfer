@@ -25,34 +25,29 @@ class ParallelAttention:
         value,
         tensor_layout,
         attn_mask=None,
-        dropout_p=0.0,
         is_causal=False,
-        scale=None,
-        enable_gqa=False,
         return_lse=False,
-        joint_seq_length=0,
-        valid_joint_seq_length=None,
-        joint_strategy="none",
-        cu_seqlens_q=None,
-        cu_seqlens_k=None,
-        max_seqlen_q=0,
-        max_seqlen_k=0,
+        cur_rank_cu_seqlens_q=None,
+        cur_rank_cu_seqlens_k=None,
+        cur_rank_max_seqlen_q=0,
+        cur_rank_max_seqlen_k=0,
+        **kwargs,
     ):
+        if is_causal:
+            raise NotImplementedError("parallel attention does not support causal attention right now")
+
         attn_inputs = {
             "query": query,
             "key": key,
             "value": value,
             "tensor_layout": tensor_layout,
             "attn_mask": attn_mask,
-            "dropout_p": dropout_p,
             "is_causal": is_causal,
-            "scale": scale,
-            "enable_gqa": enable_gqa,
             "return_lse": return_lse,
-            "cu_seqlens_q": cu_seqlens_q,
-            "cu_seqlens_k": cu_seqlens_k,
-            "max_seqlen_q": max_seqlen_q,
-            "max_seqlen_k": max_seqlen_k,
+            "cur_rank_cu_seqlens_q": cur_rank_cu_seqlens_q,
+            "cur_rank_cu_seqlens_k": cur_rank_cu_seqlens_k,
+            "cur_rank_max_seqlen_q": cur_rank_max_seqlen_q,
+            "cur_rank_max_seqlen_k": cur_rank_max_seqlen_k,
         }
 
-        return self.attn_impl(**attn_inputs)
+        return self.attn_impl(**attn_inputs, **kwargs)

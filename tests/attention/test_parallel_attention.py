@@ -9,8 +9,6 @@ from flashinfer.parallel_attention.parallel_config import UnevenCPConfig
 from flashinfer.parallel_attention.parallel_config import VarlenCPConfig
 from flashinfer.parallel_attention.utils import split_varlen_input
 
-import nvtx
-
 
 def sample_tensors(num_heads, seq_len, head_dim, world_size):
     """Create sample tensors for attention testing."""
