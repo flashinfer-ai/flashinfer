@@ -1155,7 +1155,7 @@ class FP8BlockScaleMoe(Moe):
                 tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
                 fp8_quantization_type=quantization_mode,
             )
-        return output[0].to(torch.float)
+        return output.to(torch.float)
 
     def compute_reference(self, args):
         """FP8 block-scale reference implementation."""
@@ -1356,7 +1356,7 @@ class FP8PerTensorMoe(Moe):
                 activation_type=activation_type,
             )
 
-        return output[0].to(torch.float)
+        return output.to(torch.float)
 
     def compute_reference(self, args):
         """FP8 per-tensor reference implementation."""
@@ -1513,7 +1513,7 @@ class BF16Moe(Moe):
                 routing_method_type=routing_method_type,
                 tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
             )
-        return output[0].to(torch.float)
+        return output.to(torch.float)
 
     def compute_reference(self, args):
         """BF16 reference implementation."""

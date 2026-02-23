@@ -343,7 +343,7 @@ def test_trtllm_gen_fp8_routed_fused_moe(
         False,  # use_shuffled_weight
         0,  # weight_layout
         enable_pdl,
-    )[0].to(torch.float)
+    ).to(torch.float)
 
     # Compute routing using reference implementation
     if routing_method_type == RoutingMethodType.Renormalize:
@@ -391,7 +391,7 @@ def test_trtllm_gen_fp8_routed_fused_moe(
         use_shuffled_weight=False,
         weight_layout=0,
         enable_pdl=enable_pdl,
-    )[0].to(torch.float)
+    ).to(torch.float)
 
     mask = torch.isclose(output, reference_output, rtol=1e-2, atol=1e-2)
 
@@ -476,7 +476,7 @@ def test_trtllm_gen_bf16_routed_fused_moe(
         weight_layout=WeightLayout.BlockMajorK,
         do_finalize=True,
         enable_pdl=enable_pdl,
-    )[0].to(torch.float)
+    ).to(torch.float)
 
     # Compute routing using reference implementation
     if routing_method_type == RoutingMethodType.Renormalize:
@@ -521,7 +521,7 @@ def test_trtllm_gen_bf16_routed_fused_moe(
         weight_layout=WeightLayout.BlockMajorK,
         do_finalize=True,
         enable_pdl=enable_pdl,
-    )[0].to(torch.float)
+    ).to(torch.float)
 
     mask = torch.isclose(output, reference_output, rtol=1e-2, atol=1e-2)
 
