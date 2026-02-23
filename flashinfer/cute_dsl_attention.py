@@ -22,8 +22,10 @@ efficient memory movement.
 
 import functools
 import importlib
+import importlib.util
 import math
 import os
+import threading
 from typing import Optional
 
 import torch
@@ -92,8 +94,9 @@ def _get_compiled_kernel(head_dim, m_block, n_block, num_threads, is_causal, dty
 
 # Bounded cache for cute.compile() results keyed by
 # (shape, dtype, causal, sm_scale, block sizes, num_threads).
-# Using an ordered dict with manual eviction to bound memory.
+# Thread-safe with lock to prevent double-compilation under concurrency.
 _compile_cache: dict = {}
+_compile_cache_lock = threading.Lock()
 _COMPILE_CACHE_MAX_SIZE = 64
 
 
@@ -105,14 +108,22 @@ def _get_or_compile(
     if compiled is not None:
         return compiled
 
-    compiled = cute.compile(fa2_fwd, q_cute, k_cute, v_cute, o_cute, sm_scale, stream)
+    with _compile_cache_lock:
+        # Double-check after acquiring lock
+        compiled = _compile_cache.get(cache_key)
+        if compiled is not None:
+            return compiled
 
-    # Evict oldest entries if cache is full
-    if len(_compile_cache) >= _COMPILE_CACHE_MAX_SIZE:
-        oldest_key = next(iter(_compile_cache))
-        del _compile_cache[oldest_key]
+        compiled = cute.compile(
+            fa2_fwd, q_cute, k_cute, v_cute, o_cute, sm_scale, stream
+        )
 
-    _compile_cache[cache_key] = compiled
+        # Evict oldest entries if cache is full
+        if len(_compile_cache) >= _COMPILE_CACHE_MAX_SIZE:
+            oldest_key = next(iter(_compile_cache))
+            del _compile_cache[oldest_key]
+
+        _compile_cache[cache_key] = compiled
     return compiled
 
 
