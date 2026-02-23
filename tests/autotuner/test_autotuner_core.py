@@ -12,12 +12,6 @@ from flashinfer.autotuner import (
 from flashinfer.fused_moe.utils import last_positive_power_of_2
 
 
-XFAIL_LINKED_DYNAMIC = pytest.mark.xfail(
-    reason="Known bug in AutoTuner._find_nearest_profile: only the first linked dynamic dim is mapped.",
-    raises=AssertionError,
-)
-
-
 def _moe_input_shapes(
     num_tokens: int,
     hidden_size: int = 4096,
@@ -131,10 +125,10 @@ def test_find_nearest_profile_single_tensor_bucketization_exact_powers(
 @pytest.mark.parametrize(
     "num_tokens,expected_bucket",
     [
-        pytest.param(1000, 512, marks=XFAIL_LINKED_DYNAMIC),
-        pytest.param(4000, 2048, marks=XFAIL_LINKED_DYNAMIC),
-        pytest.param(8000, 4096, marks=XFAIL_LINKED_DYNAMIC),
-        pytest.param(12000, 8192, marks=XFAIL_LINKED_DYNAMIC),
+        (1000, 512),
+        (4000, 2048),
+        (8000, 4096),
+        (12000, 8192),
     ],
 )
 def test_find_nearest_profile_moe_shared_num_tokens_axis(num_tokens, expected_bucket):
@@ -161,7 +155,6 @@ def test_find_nearest_profile_moe_shared_num_tokens_axis(num_tokens, expected_bu
         assert nearest_shape[1:] == original_shape[1:]
 
 
-@XFAIL_LINKED_DYNAMIC
 def test_find_nearest_profile_moe_same_bucket_same_profile():
     """MoE inputs mapping to the same bucket should share an identical profile."""
     config = TuningConfig(
@@ -180,7 +173,6 @@ def test_find_nearest_profile_moe_same_bucket_same_profile():
     assert p1 == p2
 
 
-@XFAIL_LINKED_DYNAMIC
 def test_find_nearest_profile_maps_all_linked_dims():
     """One logical dynamic axis should update every linked tensor/dimension."""
     tuning_config = TuningConfig(
