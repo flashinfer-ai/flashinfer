@@ -221,10 +221,13 @@ def ring_attn_p2p_communicate(rank, send_tensor, send_dst, recv_tensor, recv_src
 
 def ulysses_wrapper(func):
 
-    def wrapper(self, query, key, value, tensor_layout, attn_parallel_config, uneven_cp_config, varlen_cp_config, attn_mask=None, **kwargs):
-        # if ulysses_size == 1, no need to do ulysses_a2a_in and ulysses_a2a_out
+    def wrapper(self, query, key, value, tensor_layout, attn_mask=None, **kwargs):
+        attn_parallel_config = self.attn_parallel_config
+        uneven_cp_config = self.uneven_cp_config
+        varlen_cp_config = self.varlen_cp_config
+
         if attn_parallel_config.ulysses_size() == 1:
-            return func(self, query, key, value, tensor_layout, attn_parallel_config, uneven_cp_config, varlen_cp_config, attn_mask, **kwargs)
+            return func(self, query, key, value, tensor_layout, attn_mask, **kwargs)
 
         ulysses_size = attn_parallel_config.ulysses_size()
         ulysses_rank = attn_parallel_config.ulysses_rank()
@@ -253,8 +256,6 @@ def ulysses_wrapper(func):
             )
 
         # Apply ulysses_a2a_in before the function call
-        # fuse_qkv = PipelineConfig.fuse_qkv_in_ulysses
-        fuse_qkv = False
         query, key, value, attn_mask = ulysses_a2a_in(
             query,
             key,
@@ -264,7 +265,7 @@ def ulysses_wrapper(func):
             ulysses_size=ulysses_size,
             ulysses_rank=ulysses_rank,
             ulysses_group=ulysses_group,
-            fuse_qkv=fuse_qkv,
+            fuse_qkv=self.fuse_qkv,
         )
 
         # truncate and pad if cp is uneven
@@ -294,7 +295,7 @@ def ulysses_wrapper(func):
 
         
         # Call the original function
-        result = func(self, query, key, value, tensor_layout, attn_parallel_config, uneven_cp_config, varlen_cp_config, attn_mask, **kwargs)
+        result = func(self, query, key, value, tensor_layout, attn_mask, **kwargs)
 
         # if ring size is 1, return_lse is false, result only has output.
         if ring_size == 1 and truncate_and_pad and result.shape[seq_dim] > seq_len:
@@ -312,7 +313,6 @@ def ulysses_wrapper(func):
         )
 
         return result
-       
 
     return wrapper
 
@@ -323,19 +323,20 @@ def get_kv_rank(ring_size, ring_rank, cur_iter):
 
 
 def ring_wrapper(func):
-    def wrapper(self, query, key, value, tensor_layout, attn_parallel_config, uneven_cp_config, varlen_cp_config, attn_mask=None, **kwargs):
+    def wrapper(self, query, key, value, tensor_layout, attn_mask=None, **kwargs):
+        attn_parallel_config = self.attn_parallel_config
+        uneven_cp_config = self.uneven_cp_config
+        varlen_cp_config = self.varlen_cp_config
 
         ring_size = attn_parallel_config.ring_size()
         ring_group = attn_parallel_config.ring_group()
-        ulysses_size = attn_parallel_config.ulysses_size()
 
         if ring_size == 1:
-            return func(self, query, key, value, tensor_layout, attn_parallel_config, uneven_cp_config, varlen_cp_config, attn_mask, **kwargs)
+            return func(self, query, key, value, tensor_layout, attn_mask, **kwargs)
 
         cu_seqlens_q = kwargs.get("cu_seqlens_q", None)
         if cu_seqlens_q is not None:
             raise NotImplementedError("var_len_attention is not supported by ring wrapper")
-
 
         rank = attn_parallel_config.ring_rank()
         send_dst = (rank + 1) % ring_size
@@ -392,13 +393,12 @@ def ring_wrapper(func):
 
                 kwargs["max_seqlen_q"] = varlen_cp_config.max_seq_len_q_cur_ring_group
                 kwargs["max_seqlen_k"] = varlen_cp_config.max_seq_len_kv_cur_ring_group
-                
 
             kwargs["return_lse"] = True
             with torch.cuda.device(
                 query.device.index
             ):  # we need this line because a bug in flash-attn4 https://github.com/Dao-AILab/flash-attention/pull/1793
-                block_out = func(self, query, kv_inputs[0], kv_inputs[1], tensor_layout, attn_parallel_config, uneven_cp_config, varlen_cp_config,attn_mask, **kwargs)
+                block_out = func(self, query, kv_inputs[0], kv_inputs[1], tensor_layout, attn_mask, **kwargs)
 
             out_per_step = block_out[0]
             softmax_lse_per_step = block_out[1]
@@ -420,7 +420,6 @@ def ring_wrapper(func):
             # Default to dimension 1 for backward compatibility
             out_seq_dim = 1
 
-        
         start_pos = out.shape[out_seq_dim]
 
         if uneven_cp_config.seq_len_cur_ring_group is not None and out.shape[out_seq_dim] > uneven_cp_config.seq_len_cur_ring_group[rank]:
