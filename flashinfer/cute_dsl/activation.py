@@ -92,6 +92,8 @@ class ActAndMulKernel:
                 f"Unknown activation: {act_func_name!r}. "
                 f"Expected one of {self._VALID_ACT_FUNCS}"
             )
+        if d <= 0:
+            raise ValueError(f"d must be positive, got {d}")
         self.dtype = dtype
         self.d = d
         self.act_func_name = act_func_name
@@ -175,7 +177,7 @@ class ActAndMulKernel:
 # =============================================================================
 
 
-@functools.cache
+@functools.lru_cache(maxsize=None)
 def _get_compiled_kernel(
     act_func_name: str,
     d: int,
