@@ -1,5 +1,4 @@
 import logging
-from dataclasses import dataclass
 from typing import ClassVar, Dict, List, Optional, Type
 
 import torch
@@ -31,7 +30,9 @@ class AttnParallelConfig:
         if not self._initialized[self.__class__]:
             super().__init__(*args, **kwargs)
             self._initialized[self.__class__] = True
-            logger.debug(f"[{self.__class__.__name__}] Initialized {self.__class__.__name__}")
+            logger.debug(
+                f"[{self.__class__.__name__}] Initialized {self.__class__.__name__}"
+            )
             self._ulysses_size = 1
             self._ring_size = 1
             self._device_mesh = None
@@ -42,10 +43,14 @@ class AttnParallelConfig:
         """Cleanup distributed process group when the config is destroyed."""
         if hasattr(self, "_device_mesh") and self._device_mesh is not None:
             if dist.is_initialized():
-                logger.info(f"[{self.__class__.__name__}] Cleaning up distributed process group")
+                logger.info(
+                    f"[{self.__class__.__name__}] Cleaning up distributed process group"
+                )
                 dist.destroy_process_group()
 
-    def set_device_mesh(self, device_type: str = "cuda") -> torch.distributed.DeviceMesh:
+    def set_device_mesh(
+        self, device_type: str = "cuda"
+    ) -> torch.distributed.DeviceMesh:
         """Initialize the device mesh for distributed training.
 
         Args:
@@ -58,22 +63,29 @@ class AttnParallelConfig:
             The device mesh is created in the order: ring -> ulysses
         """
         if self._device_mesh is not None:
-            logger.debug(f"[{self.__class__.__name__}] Device mesh already initialized")
+            logger.debug(
+                f"[{self.__class__.__name__}] Device mesh already initialized"
+            )
             return self._device_mesh
 
         total_parallel_size = self.get_total_parallel_size()
         world_size = self.get_world_size()
         if world_size % total_parallel_size != 0:
             raise ValueError(
-                f"World size ({world_size}) is not divisible by total parallel size ({total_parallel_size})"
+                f"World size ({world_size}) is not divisible by "
+                f"total parallel size ({total_parallel_size})"
             )
 
         logger.debug(
-            f"[{self.__class__.__name__}] Setting up device mesh with total parallel size: {total_parallel_size}"
+            f"[{self.__class__.__name__}] Setting up device mesh with "
+            f"total parallel size: {total_parallel_size}"
         )
 
         if total_parallel_size == 1:
-            logger.debug(f"[{self.__class__.__name__}] No parallelism needed, skipping device mesh setup")
+            logger.debug(
+                f"[{self.__class__.__name__}] No parallelism needed, "
+                f"skipping device mesh setup"
+            )
             self._device_mesh = None
             return self._device_mesh
 
@@ -84,7 +96,10 @@ class AttnParallelConfig:
             mesh_dims.append("redundant")
             mesh_sizes.append(world_size // total_parallel_size)
             logger.debug(
-                f"[{self.__class__.__name__}] Added redundant dimension: {world_size // total_parallel_size}, world_size={world_size}, total_parallel_size={total_parallel_size}"
+                f"[{self.__class__.__name__}] Added redundant dimension: "
+                f"{world_size // total_parallel_size}, "
+                f"world_size={world_size}, "
+                f"total_parallel_size={total_parallel_size}"
             )
 
         if str(self) in self._cached_device_mesh:
@@ -94,19 +109,35 @@ class AttnParallelConfig:
         if self._ring_size > 1:
             mesh_dims.append("ring")
             mesh_sizes.append(self._ring_size)
-            logger.debug(f"[{self.__class__.__name__}] Added Ring dimension: {self._ring_size}")
+            logger.debug(
+                f"[{self.__class__.__name__}] Added Ring dimension: {self._ring_size}"
+            )
         if self._ulysses_size > 1:
             mesh_dims.append("ulysses")
             mesh_sizes.append(self._ulysses_size)
-            logger.debug(f"[{self.__class__.__name__}] Added Ulysses dimension: {self._ulysses_size}")
+            logger.debug(
+                f"[{self.__class__.__name__}] Added Ulysses dimension: "
+                f"{self._ulysses_size}"
+            )
 
         if not mesh_dims:
-            logger.debug(f"[{self.__class__.__name__}] No mesh dimensions needed")
+            logger.debug(
+                f"[{self.__class__.__name__}] No mesh dimensions needed"
+            )
             self._device_mesh = None
         else:
-            logger.info(f"[{self.__class__.__name__}] Creating device mesh: dims={mesh_dims}, sizes={mesh_sizes}")
-            self._device_mesh = init_device_mesh(device_type, tuple(mesh_sizes), mesh_dim_names=tuple(mesh_dims))
-            logger.info(f"[{self.__class__.__name__}] Device mesh created successfully")
+            logger.info(
+                f"[{self.__class__.__name__}] Creating device mesh: "
+                f"dims={mesh_dims}, sizes={mesh_sizes}"
+            )
+            self._device_mesh = init_device_mesh(
+                device_type,
+                tuple(mesh_sizes),
+                mesh_dim_names=tuple(mesh_dims),
+            )
+            logger.info(
+                f"[{self.__class__.__name__}] Device mesh created successfully"
+            )
 
         if str(self) not in self._cached_device_mesh:
             self._cached_device_mesh[str(self)] = self._device_mesh
@@ -118,7 +149,8 @@ class AttnParallelConfig:
         """Get the current device mesh.
 
         Returns:
-            Optional[torch.distributed.DeviceMesh]: The current device mesh, or None if not initialized
+            Optional[torch.distributed.DeviceMesh]: The current device mesh,
+                or None if not initialized
         """
         instance = cls.get_instance()
         return instance._device_mesh
@@ -140,7 +172,8 @@ class AttnParallelConfig:
         """Get the ring attention process group.
 
         Returns:
-            Optional[torch.distributed.ProcessGroup]: The ring attention process group, or None if ring_size=1
+            Optional[torch.distributed.ProcessGroup]: The ring attention process group,
+                or None if ring_size=1
         """
         instance = cls.get_instance()
         if instance._ring_size <= 1 or instance._device_mesh is None:
@@ -154,7 +187,8 @@ class AttnParallelConfig:
         """Get the Ulysses process group.
 
         Returns:
-            Optional[torch.distributed.ProcessGroup]: The Ulysses process group, or None if ulysses_size=1
+            Optional[torch.distributed.ProcessGroup]: The Ulysses process group,
+                or None if ulysses_size=1
         """
         instance = cls.get_instance()
         if instance._ulysses_size <= 1 or instance._device_mesh is None:
@@ -238,8 +272,8 @@ class AttnParallelConfig:
 
         Note:
             This method ensures that each subclass has its own singleton instance.
-            For example, VAEParallelConfig.get_instance() and DiTParallelConfig.get_instance()
-            will return different instances.
+            For example, VAEParallelConfig.get_instance() and
+            DiTParallelConfig.get_instance() will return different instances.
         """
         if cls not in cls._instances:
             cls._instances[cls] = super().__new__(cls)
@@ -271,18 +305,24 @@ class AttnParallelConfig:
         Args:
             ulysses_size: Ulysses parallel degree, defaults to 1
             ring_size: Ring attention parallel degree, defaults to 1
+
         Raises:
             ValueError: If parallel configuration is invalid
         """
         if not isinstance(ulysses_size, int) or ulysses_size < 1:
-            raise ValueError(f"ulysses_size must be a positive integer, got {ulysses_size}")
+            raise ValueError(
+                f"ulysses_size must be a positive integer, got {ulysses_size}"
+            )
         if not isinstance(ring_size, int) or ring_size < 1:
-            raise ValueError(f"ring_size must be a positive integer, got {ring_size}")
+            raise ValueError(
+                f"ring_size must be a positive integer, got {ring_size}"
+            )
 
         total_size = ulysses_size * ring_size
         if total_size > torch.cuda.device_count():
             raise ValueError(
-                f"Total parallel size ({total_size}) exceeds available GPU count ({torch.cuda.device_count()})"
+                f"Total parallel size ({total_size}) exceeds available "
+                f"GPU count ({torch.cuda.device_count()})"
             )
 
         instance = cls.get_instance()
@@ -313,11 +353,19 @@ class AttnParallelConfig:
         """
         total_parallel_size = self.get_total_parallel_size()
         if total_parallel_size == 1:
-            logger.debug(f"[{self.__class__.__name__}] Total parallel size is 1, skipping check")
+            logger.debug(
+                f"[{self.__class__.__name__}] Total parallel size is 1, "
+                f"skipping check"
+            )
             return True
         if self.get_world_size() % total_parallel_size != 0:
-            par_size = f"ULYSSES: {self._ulysses_size}, RING: {self._ring_size}"
-            raise ValueError(f"Parallel size {par_size} does not match world size ({self.get_world_size()})")
+            par_size = (
+                f"ULYSSES: {self._ulysses_size}, RING: {self._ring_size}"
+            )
+            raise ValueError(
+                f"Parallel size {par_size} does not match "
+                f"world size ({self.get_world_size()})"
+            )
         return True
 
     def to_dict(self) -> dict:
@@ -366,7 +414,8 @@ class AttnParallelConfig:
         """Check if all necessary process groups are properly initialized.
 
         Returns:
-            bool: True if all necessary process groups are initialized, False otherwise
+            bool: True if all necessary process groups are initialized,
+                False otherwise
         """
         instance = cls.get_instance()
         if instance._device_mesh is None:
@@ -405,29 +454,49 @@ class UnevenCPConfig:
         self.seq_len_all_ranks = None
         self.seq_len_cur_ring_group = None
 
-    def set_uneven_cp_config(self, seq_len, seq_len_padded, seq_len_cur_rank, attn_parallel_config):
+    def set_uneven_cp_config(
+        self, seq_len, seq_len_padded, seq_len_cur_rank, attn_parallel_config
+    ):
         self.seq_len = seq_len
         self.seq_len_padded = seq_len_padded
 
         rank = torch.distributed.get_rank()
         device = torch.device(f"cuda:{rank}")
-        
-        seq_len_cur_rank = torch.tensor([seq_len_cur_rank], dtype=torch.int32, device=device)
-        gather_list = [torch.empty_like(seq_len_cur_rank) for _ in range(torch.distributed.get_world_size())]
+
+        seq_len_cur_rank = torch.tensor(
+            [seq_len_cur_rank], dtype=torch.int32, device=device
+        )
+        gather_list = [
+            torch.empty_like(seq_len_cur_rank)
+            for _ in range(torch.distributed.get_world_size())
+        ]
         torch.distributed.all_gather(gather_list, seq_len_cur_rank)
         self.seq_len_all_ranks = torch.cat(gather_list, dim=0).cpu()
 
         if attn_parallel_config.ring_size() == 1:
             return
         if attn_parallel_config.ulysses_size() == 1:
-            self.seq_len_cur_ring_group = self.seq_len_all_ranks[torch.tensor(attn_parallel_config.ring_ranks())]
+            self.seq_len_cur_ring_group = self.seq_len_all_ranks[
+                torch.tensor(attn_parallel_config.ring_ranks())
+            ]
             return
 
-        seq_len_cur_ulysses_group = self.seq_len_all_ranks[torch.tensor(attn_parallel_config.ulysses_ranks())]
-        ring_seq_cur_ring_rank = torch.sum(seq_len_cur_ulysses_group, dtype=torch.int32).to(device)
-        gather_list = [torch.empty(1, dtype=torch.int32, device=device) for _ in range(attn_parallel_config.ring_size())]
+        seq_len_cur_ulysses_group = self.seq_len_all_ranks[
+            torch.tensor(attn_parallel_config.ulysses_ranks())
+        ]
+        ring_seq_cur_ring_rank = torch.sum(
+            seq_len_cur_ulysses_group, dtype=torch.int32
+        ).to(device)
+        gather_list = [
+            torch.empty(1, dtype=torch.int32, device=device)
+            for _ in range(attn_parallel_config.ring_size())
+        ]
 
-        torch.distributed.all_gather(gather_list, ring_seq_cur_ring_rank, group=attn_parallel_config.ring_group())
+        torch.distributed.all_gather(
+            gather_list,
+            ring_seq_cur_ring_rank,
+            group=attn_parallel_config.ring_group(),
+        )
         self.seq_len_cur_ring_group = torch.cat(gather_list, dim=0)
 
     def reset(self):
@@ -448,7 +517,14 @@ class VarlenCPConfig:
         self.max_seq_len_q_cur_ring_group = None
         self.max_seq_len_kv_cur_ring_group = None
 
-    def set_varlen_cp_config(self, cu_seqlens_q_all_ranks, cu_seqlens_kv_all_ranks, max_seq_len_q, max_seq_len_kv, attn_parallel_config):
+    def set_varlen_cp_config(
+        self,
+        cu_seqlens_q_all_ranks,
+        cu_seqlens_kv_all_ranks,
+        max_seq_len_q,
+        max_seq_len_kv,
+        attn_parallel_config,
+    ):
         if attn_parallel_config.ring_size() == 1:
             self.cu_seqlens_q_cur_ulysses_group = cu_seqlens_q_all_ranks
             self.cu_seqlens_kv_cur_ulysses_group = cu_seqlens_kv_all_ranks
@@ -464,74 +540,92 @@ class VarlenCPConfig:
             return
 
         raise NotImplementedError(
-                "Varlen CP only supported when ulysses_size == 1 or ring_size == 1"
-            )
+            "Varlen CP only supported when ulysses_size == 1 or ring_size == 1"
+        )
 
-    def set_ulysses_varlen_config(self, seq_lens_q, seq_lens_kv, attn_parallel_config):
-
+    def set_ulysses_varlen_config(
+        self, seq_lens_q, seq_lens_kv, attn_parallel_config
+    ):
         rank = torch.distributed.get_rank()
         device = torch.device(f"cuda:{rank}")
 
-        cu_seqlens_q = [0]
-        for seq_len in seq_lens_q:
-            cu_seqlens_q.append(cu_seqlens_q[-1] + seq_len)
-        cu_seqlens_q = torch.tensor(cu_seqlens_q, device=device).to(torch.int32)
+        cu_seqlens_q = torch.cat([
+            torch.zeros(1, dtype=torch.int32),
+            torch.cumsum(torch.tensor(seq_lens_q, dtype=torch.int32), dim=0),
+        ]).to(device).to(torch.int32)
 
-        cu_seqlens_kv = [0]
-        for seq_len in seq_lens_kv:
-            cu_seqlens_kv.append(cu_seqlens_kv[-1] + seq_len)
-        cu_seqlens_kv = torch.tensor(cu_seqlens_kv, device=device).to(torch.int32)
+        cu_seqlens_kv = torch.cat([
+            torch.zeros(1, dtype=torch.int32),
+            torch.cumsum(torch.tensor(seq_lens_kv, dtype=torch.int32), dim=0),
+        ]).to(device).to(torch.int32)
 
         max_seqlen_q = max(seq_lens_q)
         max_seqlen_k = max(seq_lens_kv)
 
-        self.set_varlen_cp_config(cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_k, attn_parallel_config)
+        self.set_varlen_cp_config(
+            cu_seqlens_q,
+            cu_seqlens_kv,
+            max_seqlen_q,
+            max_seqlen_k,
+            attn_parallel_config,
+        )
 
-    def set_ring_varlen_config(self, seq_lens_q, seq_lens_kv, attn_parallel_config):
-
+    def set_ring_varlen_config(
+        self, seq_lens_q, seq_lens_kv, attn_parallel_config
+    ):
         world_size = torch.distributed.get_world_size()
         rank = torch.distributed.get_rank()
         device = torch.device(f"cuda:{rank}")
-        # print(f"rank: {rank}, actual_seq_lens_q: {actual_seq_lens_q}, actual_seq_lens_kv: {actual_seq_lens_kv}")
 
-        padded_seq_lens_q = torch.ceil(seq_lens_q / world_size) * world_size
-        padded_seq_lens_kv = torch.ceil(seq_lens_kv / world_size) * world_size
-
-        # print(f"rank: {rank}, padded_seq_lens_q: {padded_seq_lens_q}, padded_seq_lens_kv: {padded_seq_lens_kv}")
+        padded_seq_lens_q = (
+            torch.ceil(seq_lens_q / world_size) * world_size
+        )
+        padded_seq_lens_kv = (
+            torch.ceil(seq_lens_kv / world_size) * world_size
+        )
 
         padded_seq_len_q_cur_rank = torch.floor(padded_seq_lens_q / world_size)
-        padded_seq_len_kv_cur_rank = torch.floor(padded_seq_lens_kv / world_size)
+        padded_seq_len_kv_cur_rank = torch.floor(
+            padded_seq_lens_kv / world_size
+        )
 
         max_seq_len_q = padded_seq_len_q_cur_rank.max()
         max_seq_len_kv = padded_seq_len_kv_cur_rank.max()
-
-        # print(f"max_seq_len_q: {max_seq_len_q}, max_seq_len_kv: {max_seq_len_kv}")
 
         cu_seqlens_q_all_ranks = []
         cu_seqlens_kv_all_ranks = []
 
         for i in range(world_size):
-            
             if i == world_size - 1:
-                seq_len_q_cur_rank = padded_seq_len_q_cur_rank - (padded_seq_lens_q - seq_lens_q)
-                seq_len_kv_cur_rank = padded_seq_len_kv_cur_rank - (padded_seq_lens_kv - seq_lens_kv)
+                seq_len_q_cur_rank = padded_seq_len_q_cur_rank - (
+                    padded_seq_lens_q - seq_lens_q
+                )
+                seq_len_kv_cur_rank = padded_seq_len_kv_cur_rank - (
+                    padded_seq_lens_kv - seq_lens_kv
+                )
             else:
                 seq_len_q_cur_rank = padded_seq_len_q_cur_rank
                 seq_len_kv_cur_rank = padded_seq_len_kv_cur_rank
 
-            cu_seqlens_q = [0]
-            for seq_len in seq_len_q_cur_rank:
-                cu_seqlens_q.append(cu_seqlens_q[-1] + seq_len)
-            cu_seqlens_q_all_ranks.append(torch.tensor(cu_seqlens_q).to(device).to(torch.int32))
+            cu_seqlens_q = torch.cat([
+                torch.zeros(1),
+                torch.cumsum(seq_len_q_cur_rank, dim=0),
+            ]).to(device).to(torch.int32)
+            cu_seqlens_q_all_ranks.append(cu_seqlens_q)
 
-            cu_seqlens_kv = [0]
-            for seq_len in seq_len_kv_cur_rank:
-                cu_seqlens_kv.append(cu_seqlens_kv[-1] + seq_len)
-            cu_seqlens_kv_all_ranks.append(torch.tensor(cu_seqlens_kv).to(device).to(torch.int32))
-            
-        # print(f"cu_seqlens_q_all_ranks: {cu_seqlens_q_all_ranks}, cu_seqlens_kv_all_ranks: {cu_seqlens_kv_all_ranks}")
-        self.set_varlen_cp_config(torch.stack(cu_seqlens_q_all_ranks), torch.stack(cu_seqlens_kv_all_ranks), max_seq_len_q, max_seq_len_kv, attn_parallel_config)
+            cu_seqlens_kv = torch.cat([
+                torch.zeros(1),
+                torch.cumsum(seq_len_kv_cur_rank, dim=0),
+            ]).to(device).to(torch.int32)
+            cu_seqlens_kv_all_ranks.append(cu_seqlens_kv)
 
+        self.set_varlen_cp_config(
+            torch.stack(cu_seqlens_q_all_ranks),
+            torch.stack(cu_seqlens_kv_all_ranks),
+            max_seq_len_q,
+            max_seq_len_kv,
+            attn_parallel_config,
+        )
 
     def reset(self):
         self.cu_seqlens_q_cur_ulysses_group = None

@@ -1,21 +1,30 @@
 import logging
-from typing import Callable, Tuple, Union
-from .attention_ops import AttentionOpManager
-from .parallel_wrapper import ulysses_wrapper, ring_wrapper
-from .parallel_config import AttnParallelConfig, UnevenCPConfig, VarlenCPConfig
+
 import torch
+
+from .attention_ops import AttentionOpManager
+from .parallel_config import AttnParallelConfig, UnevenCPConfig, VarlenCPConfig
+from .parallel_wrapper import ring_wrapper, ulysses_wrapper
 
 logger = logging.getLogger(__name__)
 
+
 class ParallelAttention:
-    def __init__(self, attn_type: str, attn_parallel_config: AttnParallelConfig, uneven_cp_config: UnevenCPConfig, varlen_cp_config: VarlenCPConfig, fuse_qkv: bool = False):
+    def __init__(
+        self,
+        attn_type: str,
+        attn_parallel_config: AttnParallelConfig,
+        uneven_cp_config: UnevenCPConfig,
+        varlen_cp_config: VarlenCPConfig,
+        fuse_qkv: bool = False,
+    ):
         self.attn_type = attn_type
         self.attn_impl = AttentionOpManager.get_impl(attn_type)
         self.attn_parallel_config = attn_parallel_config
         self.uneven_cp_config = uneven_cp_config
         self.varlen_cp_config = varlen_cp_config
         self.fuse_qkv = fuse_qkv
-   
+
     @ulysses_wrapper
     @ring_wrapper
     def run(
@@ -34,7 +43,9 @@ class ParallelAttention:
         **kwargs,
     ):
         if is_causal:
-            raise NotImplementedError("parallel attention does not support causal attention right now")
+            raise NotImplementedError(
+                "parallel attention does not support causal attention right now"
+            )
 
         attn_inputs = {
             "query": query,

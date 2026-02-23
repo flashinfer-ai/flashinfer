@@ -1,8 +1,11 @@
 import logging
-from typing import Callable, Tuple, Union
 
 import torch
-from flashinfer.parallel_attention.utils import convert_qkv_layout, convert_output_layout
+
+from .utils import (
+    convert_output_layout,
+    convert_qkv_layout,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +28,9 @@ class AttentionOpManager:
             if hasattr(cls, key):
                 setattr(cls, key, value)
             else:
-                raise AttributeError(f"'{cls.__name__}' has no attribute '{key}'")
+                raise AttributeError(
+                    f"'{cls.__name__}' has no attribute '{key}'"
+                )
 
     @classmethod
     def register_attn(cls, attn_type):
@@ -42,14 +47,14 @@ class AttentionOpManager:
             name = cls.attn_type
         attn_class = cls._attn_registry.get(name)
         if attn_class is None:
-            raise ValueError(f"Attention function {name} not found in registry")
+            raise ValueError(
+                f"Attention function {name} not found in registry"
+            )
         return attn_class()  # Create and return an instance
 
     @classmethod
     def get_registered_types(cls):
         return list(cls._attn_registry.keys())
-
-
 
 
 @AttentionOpManager.register_attn("flash-attn3")
@@ -69,15 +74,18 @@ class FlashAttn3:
         cur_rank_max_seqlen_k=0,
         **kwargs,
     ):
-
         if flash_attn_interface is None:
             raise ImportError("FlashAttn3 is not installed")
-       
+
         if tensor_layout not in ["HND", "NHD"]:
-            raise NotImplementedError("Tensor layout not supported for FlashAttn3")
+            raise NotImplementedError(
+                "Tensor layout not supported for FlashAttn3"
+            )
 
         if tensor_layout == "HND":
-            query, key, value = convert_qkv_layout(query, key, value, src_layout="HND", dst_layout="NHD")
+            query, key, value = convert_qkv_layout(
+                query, key, value, src_layout="HND", dst_layout="NHD"
+            )
 
         # FA3 only supports float16 and bfloat16
         origin_dtype = query.dtype
@@ -131,7 +139,9 @@ class FlashAttn3:
                 softmax_scale=None,
                 causal=is_causal,
                 qv=None,
-                q_descale=None, k_descale=None, v_descale=None,
+                q_descale=None,
+                k_descale=None,
+                v_descale=None,
                 window_size=(-1, -1),
                 attention_chunk=0,
                 softcap=0.0,
@@ -148,14 +158,16 @@ class FlashAttn3:
             output = output[0]
 
         if tensor_layout == "HND":
-            output = convert_output_layout(output, src_layout="NHD", dst_layout="HND")
+            output = convert_output_layout(
+                output, src_layout="NHD", dst_layout="HND"
+            )
 
         if tensor_layout == "NHD" and lse is not None:
             lse = lse.permute(1, 0)
 
         if output.dtype != origin_dtype:
             output = output.to(origin_dtype)
- 
+
         if return_lse:
             assert lse is not None, "lse is not returned by FlashAttn3"
             return output, lse

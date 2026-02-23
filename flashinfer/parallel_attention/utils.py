@@ -1,20 +1,25 @@
-import torch
 import math
 
+import torch
+
+
 def convert_qkv_layout(q, k, v, src_layout, dst_layout):
-        if src_layout == "HND" and dst_layout == "NHD":
-            # [H, S, D] -> [S, H, D]
-            q = q.permute(1, 0, 2).contiguous()
-            k = k.permute(1, 0, 2).contiguous()
-            v = v.permute(1, 0, 2).contiguous()
-        elif src_layout == "NHD" and dst_layout == "HND":
-            # [S, H, D] -> [H, S, D]
-            q = q.permute(1, 0, 2).contiguous()
-            k = k.permute(1, 0, 2).contiguous()
-            v = v.permute(1, 0, 2).contiguous()
-        else:
-            raise NotImplementedError(f"Unsupported tensor layout conversion: {src_layout} -> {dst_layout}")
-        return q, k, v
+    if src_layout == "HND" and dst_layout == "NHD":
+        # [H, S, D] -> [S, H, D]
+        q = q.permute(1, 0, 2).contiguous()
+        k = k.permute(1, 0, 2).contiguous()
+        v = v.permute(1, 0, 2).contiguous()
+    elif src_layout == "NHD" and dst_layout == "HND":
+        # [S, H, D] -> [H, S, D]
+        q = q.permute(1, 0, 2).contiguous()
+        k = k.permute(1, 0, 2).contiguous()
+        v = v.permute(1, 0, 2).contiguous()
+    else:
+        raise NotImplementedError(
+            f"Unsupported tensor layout conversion: {src_layout} -> {dst_layout}"
+        )
+    return q, k, v
+
 
 def convert_output_layout(out, src_layout, dst_layout):
     if src_layout == "HND" and dst_layout == "NHD":
@@ -24,12 +29,16 @@ def convert_output_layout(out, src_layout, dst_layout):
         # [H, S, D] -> [S, H, D]
         out = out.permute(1, 0, 2).contiguous()
     else:
-        raise NotImplementedError(f"Unsupported tensor layout conversion: {src_layout} -> {dst_layout}")
+        raise NotImplementedError(
+            f"Unsupported tensor layout conversion: "
+            f"{src_layout} -> {dst_layout}"
+        )
     return out
 
 
-def split_varlen_input(tensor, seq_len_list, world_size, rank, tensor_layout="HND"): 
-
+def split_varlen_input(
+    tensor, seq_len_list, world_size, rank, tensor_layout="HND"
+):
     """Split a concatenated variable-length tensor into equal chunks across ranks.
 
     Given a tensor of shape [total_seq_len, head_num, head_dim] where total_seq_len
@@ -57,9 +66,13 @@ def split_varlen_input(tensor, seq_len_list, world_size, rank, tensor_layout="HN
     else:
         raise ValueError(f"Invalid tensor layout: {tensor_layout}")
 
-    seq_len_padded = torch.ceil(seq_len_list / world_size).to(torch.int32) * world_size
+    seq_len_padded = (
+        torch.ceil(seq_len_list / world_size).to(torch.int32) * world_size
+    )
     total_seq_len_padded = sum(seq_len_padded)
-    seq_len_padded_cur_rank = torch.ceil(total_seq_len_padded / world_size).to(torch.int32)
+    seq_len_padded_cur_rank = torch.ceil(
+        total_seq_len_padded / world_size
+    ).to(torch.int32)
 
     chunks = []
     offset = 0
@@ -76,7 +89,6 @@ def split_varlen_input(tensor, seq_len_list, world_size, rank, tensor_layout="HN
             start = offset + base * (world_size - 1)
             chunk_len = seq_len - base * (world_size - 1)
 
-        end = start + chunk_len
         chunks.append(tensor.narrow(chunk_dim, start, chunk_len))
         offset += seq_len
 
@@ -86,6 +98,9 @@ def split_varlen_input(tensor, seq_len_list, world_size, rank, tensor_layout="HN
         pad_len = seq_len_padded_cur_rank - res.shape[chunk_dim]
         pad_shape = list(res.shape)
         pad_shape[chunk_dim] = pad_len
-        res = torch.cat([res, torch.zeros(pad_shape, device=res.device, dtype=res.dtype)], dim=chunk_dim)
-    
+        res = torch.cat(
+            [res, torch.zeros(pad_shape, device=res.device, dtype=res.dtype)],
+            dim=chunk_dim,
+        )
+
     return res
