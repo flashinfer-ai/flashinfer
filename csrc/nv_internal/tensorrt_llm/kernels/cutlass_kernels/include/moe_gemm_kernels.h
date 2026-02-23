@@ -239,11 +239,10 @@ constexpr bool isGatedActivation(ActivationType activation_type) {
          activation_type == ActivationType::SwigluBias;
 }
 
-template <typename T,                         /*The type used for activations/scales/compute*/
-          typename WeightType,                /* The type for the MoE weights */
-          typename OutputType,                /* The output type for the GEMM */
-          typename ScaleBiasType = OutputType /* The type for the scales/bias */
-          >
+template <typename T,          /*The type used for activations/scales/compute*/
+          typename WeightType, /* The type for the MoE weights */
+          typename OutputType, /* The output type for the GEMM */
+          typename ScaleBiasType = OutputType /* The type for the scales/bias */>
 class MoeGemmRunner {
  public:
   MoeGemmRunner();
@@ -309,7 +308,7 @@ class MoeGemmRunner {
   [[nodiscard]] bool supportsFusedGatedActivation(ActivationType activation_type, int gemm_n,
                                                   int gemm_k) const;
 
-  size_t getMaxWorkspaceSize(int num_experts) const;
+  size_t getMaxWorkspaceSize(int num_experts, bool use_mxfp8_act_scaling = false) const;
 
   [[nodiscard]] int getSM() const;
 
@@ -326,8 +325,9 @@ class MoeGemmRunner {
   int sm_{};
   int multi_processor_count_{};
   mutable int num_experts_ = 0;
+  mutable bool use_mxfp8_act_scaling_ = false;
   mutable size_t gemm_workspace_size_ = 0;
-  size_t calcMaxWorkspaceSize(int num_experts) const;
+  size_t calcMaxWorkspaceSize(int num_experts, bool use_mxfp8_act_scaling) const;
 };
 
 }  // namespace tensorrt_llm::kernels::cutlass_kernels

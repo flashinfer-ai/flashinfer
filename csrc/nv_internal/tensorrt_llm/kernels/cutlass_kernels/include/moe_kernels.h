@@ -436,8 +436,8 @@ class CutlassMoeFCRunnerInterface {
                                   int64_t const inter_size, int const num_experts,
                                   int const experts_per_token, ActivationType activation_type,
                                   MOEParallelismConfig parallelism_config, bool use_lora,
-                                  bool use_deepseek_fp8_block_scale, bool min_latency_mode,
-                                  bool use_awq) = 0;
+                                  bool use_deepseek_fp8_block_scale, bool use_mxfp8_act_scaling,
+                                  bool min_latency_mode, bool use_awq) = 0;
   virtual void setTactic(std::optional<cutlass_extensions::CutlassGemmConfig> gemm1_config,
                          std::optional<cutlass_extensions::CutlassGemmConfig> gemm2_config) = 0;
   virtual std::vector<cutlass_extensions::CutlassGemmConfig> getTactics(MoeGemmId gemm_id) = 0;
@@ -453,8 +453,9 @@ class CutlassMoeFCRunnerInterface {
                       void* final_output, int* unpermuted_row_to_permuted_row,
                       MOEParallelismConfig parallelism_config, bool const enable_alltoall,
                       bool use_lora, LoraParams& lora_params, bool use_deepseek_fp8_block_scale,
-                      bool min_latency_mode, MoeMinLatencyParams& min_latency_params,
-                      bool enable_pdl, cudaStream_t stream) = 0;
+                      bool use_mxfp8_act_scaling, bool min_latency_mode,
+                      MoeMinLatencyParams& min_latency_params, bool enable_pdl,
+                      cudaStream_t stream) = 0;
 
   // Aliases for profiling the gemms
   virtual void gemm1(void const* const input, void* const output, void* const intermediate_result,
@@ -534,12 +535,12 @@ template <typename T,                         /* The type used for activations *
           typename OutputType = T,            /* The type for the MoE final output */
           typename InputType = T,             /* The type for the MoE input */
           typename BackBoneType = OutputType, /* The unquantized backbone data type of the model */
-          typename Enable = void>
+          bool IsMXFPX = false, typename Enable = void>
 class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   using DeepSeekBlockScaleGemmRunner =
       tensorrt_llm::kernels::fp8_blockscale_gemm::CutlassFp8BlockScaleGemmRunnerInterface;
   using ScaleBiasType = BackBoneType;
-  using Self = CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType>;
+  using Self = CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX>;
 
 #if defined(ENABLE_FP4)
 #if defined(ENABLE_BF16)
@@ -584,7 +585,15 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   static constexpr bool use_fp4 = false;
 #endif
 
-  static constexpr bool use_block_scaling = use_fp4 || use_wfp4afp8;
+  static constexpr bool use_mxfp8 = use_fp8 && IsMXFPX;
+  static constexpr bool use_block_scaling = use_fp4 || use_wfp4afp8 || use_mxfp8;
+#if defined(ENABLE_FP8)
+  static_assert(!IsMXFPX ||
+                    (std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp8_e4m3>),
+                "IsMXFPX requires FP8xFP8 (E4M3) runner types");
+#else
+  static_assert(!IsMXFPX, "IsMXFPX requires FP8 support");
+#endif
 
   // This should leave the variable unchanged in any currently supported configuration
   using UnfusedGemmOutputType = BackBoneType;
@@ -606,8 +615,8 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
                           int64_t const fc1_output_size, int const num_experts,
                           int const experts_per_token, ActivationType activation_type,
                           MOEParallelismConfig parallelism_config, bool use_lora,
-                          bool use_deepseek_fp8_block_scale, bool min_latency_mode,
-                          bool use_awq) override;
+                          bool use_deepseek_fp8_block_scale, bool use_mxfp8_act_scaling,
+                          bool min_latency_mode, bool use_awq) override;
 
   void setTactic(std::optional<cutlass_extensions::CutlassGemmConfig> gemm1_config,
                  std::optional<cutlass_extensions::CutlassGemmConfig> gemm2_config) override {
@@ -634,7 +643,8 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
               int64_t const inter_size, int const num_experts, int const experts_per_token,
               char* workspace_ptr, void* final_output, int* unpermuted_row_to_permuted_row,
               MOEParallelismConfig parallelism_config, bool const enable_alltoall, bool use_lora,
-              LoraParams& lora_params, bool use_deepseek_fp8_block_scale, bool min_latency_mode,
+              LoraParams& lora_params, bool use_deepseek_fp8_block_scale,
+              bool use_mxfp8_act_scaling, bool min_latency_mode,
               MoeMinLatencyParams& min_latency_params, bool enable_pdl,
               cudaStream_t stream) override;
 
@@ -848,12 +858,14 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   std::map<std::string, std::pair<size_t, size_t>> getWorkspaceDeviceBufferSizes(
       int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size,
       int const num_experts_per_node, int const experts_per_token, ActivationType activation_type,
-      bool use_lora, bool use_deepseek_fp8_block_scale, bool min_latency_mode, bool use_awq);
+      bool use_lora, bool use_deepseek_fp8_block_scale, bool use_mxfp8_act_scaling,
+      bool min_latency_mode, bool use_awq);
   void configureWsPtrs(char* ws_ptr, int64_t const num_rows, int64_t const hidden_size,
                        int64_t const inter_size, int const num_experts_per_node,
                        int const experts_per_token, ActivationType activation_type,
                        MOEParallelismConfig parallelism_config, bool use_lora,
-                       bool use_deepseek_fp8_block_scale, bool min_latency_mode, bool use_awq);
+                       bool use_deepseek_fp8_block_scale, bool use_mxfp8_act_scaling,
+                       bool min_latency_mode, bool use_awq);
 
  private:
   bool mayHaveDifferentGEMMOutputType() const {
@@ -875,9 +887,10 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
 
   // TODO: This should eventually take the quant params to give more flexibility
   static auto getScalingType() {
-    return use_wfp4afp8 ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX
-           : use_fp4    ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4
-                        : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE;
+    return (use_wfp4afp8 || use_mxfp8)
+               ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX
+           : use_fp4 ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4
+                     : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE;
   }
 
   bool setupLoraWorkspace(int64_t expanded_num_rows, int64_t num_rows, int64_t inter_size,

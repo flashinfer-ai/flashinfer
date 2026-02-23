@@ -397,8 +397,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         static_cast<int>(experts_per_token),
         static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
         static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, enable_alltoall,
-        use_lora, lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params,
-        enable_pdl, stream);
+        use_lora, lora_params, mUseDeepSeekFP8BlockScaling, mUseMxfp8ActScaling, min_latency_mode,
+        min_latency_params, enable_pdl, stream);
 #else
     mKernelRunner->runMoe(
         input.data_ptr(), input_sf.has_value() ? input_sf.value().data_ptr() : nullptr,
@@ -414,7 +414,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         static_cast<int>(experts_per_token),
         static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
         static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, false, lora_params,
-        mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, enable_pdl, stream);
+        mUseDeepSeekFP8BlockScaling, mUseMxfp8ActScaling, min_latency_mode, min_latency_params,
+        enable_pdl, stream);
 #endif
   }
 
@@ -583,8 +584,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         static_cast<int>(experts_per_token),
         static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
         static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, enable_alltoall,
-        use_lora_ml, lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params,
-        enable_pdl, stream);
+        use_lora_ml, lora_params, mUseDeepSeekFP8BlockScaling, mUseMxfp8ActScaling,
+        min_latency_mode, min_latency_params, enable_pdl, stream);
 #else
     mKernelRunner->runMoe(
         input.data_ptr(), input_sf.has_value() ? input_sf.value().data_ptr() : nullptr,
@@ -600,8 +601,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         static_cast<int>(experts_per_token),
         static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
         static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, false, use_lora_ml,
-        lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, enable_pdl,
-        stream);
+        lora_params, mUseDeepSeekFP8BlockScaling, mUseMxfp8ActScaling, min_latency_mode,
+        min_latency_params, enable_pdl, stream);
 #endif
   }
 
@@ -840,8 +841,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                                  bool min_latency_mode) {
     size_t moe_workspace_size = mKernelRunner->getWorkspaceSize(
         num_rows, hidden_size, inter_size, num_experts, experts_per_token, activation_type,
-        parallelismConfig, /* use_lora */ false, mUseDeepSeekFP8BlockScaling, min_latency_mode,
-        mUseW4GroupScaling);
+        parallelismConfig, /* use_lora */ false, mUseDeepSeekFP8BlockScaling, mUseMxfp8ActScaling,
+        min_latency_mode, mUseW4GroupScaling);
     size_t src_to_dest_map_size = experts_per_token * num_rows * sizeof(int);
 
     std::vector<size_t> workspaces{moe_workspace_size, src_to_dest_map_size};

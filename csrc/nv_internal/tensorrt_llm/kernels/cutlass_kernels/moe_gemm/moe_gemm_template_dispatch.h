@@ -919,19 +919,20 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
 size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getMaxWorkspaceSize(
-    int num_experts) const {
-  if (num_experts != num_experts_) {
+    int num_experts, bool use_mxfp8_act_scaling) const {
+  if (num_experts != num_experts_ || use_mxfp8_act_scaling != use_mxfp8_act_scaling_) {
     TLLM_LOG_TRACE("Calling getMaxWorkspaceSize() with a new expert count %d vs %d", num_experts,
                    num_experts_);
     num_experts_ = num_experts;
-    gemm_workspace_size_ = calcMaxWorkspaceSize(num_experts);
+    use_mxfp8_act_scaling_ = use_mxfp8_act_scaling;
+    gemm_workspace_size_ = calcMaxWorkspaceSize(num_experts, use_mxfp8_act_scaling);
   }
   return gemm_workspace_size_;
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
 size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::calcMaxWorkspaceSize(
-    int num_experts) const {
+    int num_experts, bool use_mxfp8_act_scaling) const {
   if constexpr (use_w4_groupwise) {
     return cutlass_kernels_oss::calcMaxWorkspaceSizeTmaWarpSpecializedMixedInput<T, WeightType,
                                                                                  OutputType>(
@@ -949,12 +950,10 @@ size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::calcMaxWorkspace
     auto fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE;
     if constexpr (use_wfp4afp8) {
       fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
-    } else if constexpr (use_fp8) {
-      // FP8 runners can be used in MXFP8 mode (UE8M0 block scales), which needs larger TMA WS.
-      // Allocate using MXFPX requirements so workspace is sufficient for both regular FP8 and
-      // MXFP8.
+    } else if (use_mxfp8_act_scaling) {
+      // Runtime MXFP8 act scaling reserves MXFPX workspace requirements.
       fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
-    } else if (use_fp4) {
+    } else if constexpr (use_fp4) {
       fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4;
     }
     size_t max_size = 0;
