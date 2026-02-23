@@ -33,7 +33,7 @@ from tests.utils_fp8 import to_float8
         (200, 2048, 200),
     ],
 )
-def test_autotuner_gemm(tune_mode, pre_tune, expected_cache_hit, m, n, k):
+def test_autotuner_gemm(pre_tune, tune_mode, expected_cache_hit, m, n, k):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     compute_capability_number = compute_capability[0] * 10 + compute_capability[1]
     if not bmm_fp8.is_compute_capability_supported(compute_capability_number):
