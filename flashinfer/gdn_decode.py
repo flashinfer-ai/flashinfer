@@ -2575,29 +2575,10 @@ def gdn_verify_kernel_mtp(
     r_k = cute.make_rmem_tensor(
         cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
     )
+    # 2D register tensor for 8 V-rows processed in parallel (ILP)
+    # Row-major layout: stride (vec_size, 1) so each row is contiguous
     r_h = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
-    )
-    r_h2 = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
-    )
-    r_h3 = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
-    )
-    r_h4 = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
-    )
-    r_h5 = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
-    )
-    r_h6 = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
-    )
-    r_h7 = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
-    )
-    r_h8 = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
+        cute.make_layout((8, vec_size), stride=(vec_size, 1)), cutlass.Float32
     )
     # BF16 register tensors for vectorized q, k loading
     r_q_bf16 = cute.make_rmem_tensor(
@@ -2753,14 +2734,14 @@ def gdn_verify_kernel_mtp(
                     ht7 = cute.local_tile(
                         h0_source, (1, 1, vec_size), (flat_state_idx, v7, lane_in_group)
                     )
-                    cute.autovec_copy(ht0, r_h)
-                    cute.autovec_copy(ht1, r_h2)
-                    cute.autovec_copy(ht2, r_h3)
-                    cute.autovec_copy(ht3, r_h4)
-                    cute.autovec_copy(ht4, r_h5)
-                    cute.autovec_copy(ht5, r_h6)
-                    cute.autovec_copy(ht6, r_h7)
-                    cute.autovec_copy(ht7, r_h8)
+                    cute.autovec_copy(ht0, cute.slice_(r_h, (0, None)))
+                    cute.autovec_copy(ht1, cute.slice_(r_h, (1, None)))
+                    cute.autovec_copy(ht2, cute.slice_(r_h, (2, None)))
+                    cute.autovec_copy(ht3, cute.slice_(r_h, (3, None)))
+                    cute.autovec_copy(ht4, cute.slice_(r_h, (4, None)))
+                    cute.autovec_copy(ht5, cute.slice_(r_h, (5, None)))
+                    cute.autovec_copy(ht6, cute.slice_(r_h, (6, None)))
+                    cute.autovec_copy(ht7, cute.slice_(r_h, (7, None)))
 
                     for i_t in cutlass.range_constexpr(T):
                         sQ_tile = cute.local_tile(
@@ -2777,14 +2758,14 @@ def gdn_verify_kernel_mtp(
 
                         # Step 1: Decay all 8 h vectors
                         for i in cutlass.range_constexpr(vec_size):
-                            r_h[i] = r_h[i] * r_g
-                            r_h2[i] = r_h2[i] * r_g
-                            r_h3[i] = r_h3[i] * r_g
-                            r_h4[i] = r_h4[i] * r_g
-                            r_h5[i] = r_h5[i] * r_g
-                            r_h6[i] = r_h6[i] * r_g
-                            r_h7[i] = r_h7[i] * r_g
-                            r_h8[i] = r_h8[i] * r_g
+                            r_h[0, i] = r_h[0, i] * r_g
+                            r_h[1, i] = r_h[1, i] * r_g
+                            r_h[2, i] = r_h[2, i] * r_g
+                            r_h[3, i] = r_h[3, i] * r_g
+                            r_h[4, i] = r_h[4, i] * r_g
+                            r_h[5, i] = r_h[5, i] * r_g
+                            r_h[6, i] = r_h[6, i] * r_g
+                            r_h[7, i] = r_h[7, i] * r_g
 
                         # Step 2: Dot products h@k for all 8 rows
                         s0 = 0.0
@@ -2796,14 +2777,14 @@ def gdn_verify_kernel_mtp(
                         s6 = 0.0
                         s7 = 0.0
                         for i in cutlass.range_constexpr(vec_size):
-                            s0 += r_h[i] * r_k[i]
-                            s1 += r_h2[i] * r_k[i]
-                            s2 += r_h3[i] * r_k[i]
-                            s3 += r_h4[i] * r_k[i]
-                            s4 += r_h5[i] * r_k[i]
-                            s5 += r_h6[i] * r_k[i]
-                            s6 += r_h7[i] * r_k[i]
-                            s7 += r_h8[i] * r_k[i]
+                            s0 += r_h[0, i] * r_k[i]
+                            s1 += r_h[1, i] * r_k[i]
+                            s2 += r_h[2, i] * r_k[i]
+                            s3 += r_h[3, i] * r_k[i]
+                            s4 += r_h[4, i] * r_k[i]
+                            s5 += r_h[5, i] * r_k[i]
+                            s6 += r_h[6, i] * r_k[i]
+                            s7 += r_h[7, i] * r_k[i]
 
                         for offset in [16, 8, 4, 2, 1]:
                             s0 += cute.arch.shuffle_sync_bfly(
@@ -2862,14 +2843,14 @@ def gdn_verify_kernel_mtp(
 
                         # Step 4: Rank-1 update all 8 h vectors
                         for i in cutlass.range_constexpr(vec_size):
-                            r_h[i] += r_k[i] * vn0
-                            r_h2[i] += r_k[i] * vn1
-                            r_h3[i] += r_k[i] * vn2
-                            r_h4[i] += r_k[i] * vn3
-                            r_h5[i] += r_k[i] * vn4
-                            r_h6[i] += r_k[i] * vn5
-                            r_h7[i] += r_k[i] * vn6
-                            r_h8[i] += r_k[i] * vn7
+                            r_h[0, i] += r_k[i] * vn0
+                            r_h[1, i] += r_k[i] * vn1
+                            r_h[2, i] += r_k[i] * vn2
+                            r_h[3, i] += r_k[i] * vn3
+                            r_h[4, i] += r_k[i] * vn4
+                            r_h[5, i] += r_k[i] * vn5
+                            r_h[6, i] += r_k[i] * vn6
+                            r_h[7, i] += r_k[i] * vn7
 
                         # Cache intermediate state if needed
                         if cutlass.const_expr(cache_intermediate_states):
@@ -2879,49 +2860,49 @@ def gdn_verify_kernel_mtp(
                                 (1, 1, vec_size),
                                 (flat_idx, v0, lane_in_group),
                             )
-                            cute.autovec_copy(r_h, it0)
+                            cute.autovec_copy(cute.slice_(r_h, (0, None)), it0)
                             it1 = cute.local_tile(
                                 intermediate_states,
                                 (1, 1, vec_size),
                                 (flat_idx, v1, lane_in_group),
                             )
-                            cute.autovec_copy(r_h2, it1)
+                            cute.autovec_copy(cute.slice_(r_h, (1, None)), it1)
                             it2 = cute.local_tile(
                                 intermediate_states,
                                 (1, 1, vec_size),
                                 (flat_idx, v2, lane_in_group),
                             )
-                            cute.autovec_copy(r_h3, it2)
+                            cute.autovec_copy(cute.slice_(r_h, (2, None)), it2)
                             it3 = cute.local_tile(
                                 intermediate_states,
                                 (1, 1, vec_size),
                                 (flat_idx, v3, lane_in_group),
                             )
-                            cute.autovec_copy(r_h4, it3)
+                            cute.autovec_copy(cute.slice_(r_h, (3, None)), it3)
                             it4 = cute.local_tile(
                                 intermediate_states,
                                 (1, 1, vec_size),
                                 (flat_idx, v4, lane_in_group),
                             )
-                            cute.autovec_copy(r_h5, it4)
+                            cute.autovec_copy(cute.slice_(r_h, (4, None)), it4)
                             it5 = cute.local_tile(
                                 intermediate_states,
                                 (1, 1, vec_size),
                                 (flat_idx, v5, lane_in_group),
                             )
-                            cute.autovec_copy(r_h6, it5)
+                            cute.autovec_copy(cute.slice_(r_h, (5, None)), it5)
                             it6 = cute.local_tile(
                                 intermediate_states,
                                 (1, 1, vec_size),
                                 (flat_idx, v6, lane_in_group),
                             )
-                            cute.autovec_copy(r_h7, it6)
+                            cute.autovec_copy(cute.slice_(r_h, (6, None)), it6)
                             it7 = cute.local_tile(
                                 intermediate_states,
                                 (1, 1, vec_size),
                                 (flat_idx, v7, lane_in_group),
                             )
-                            cute.autovec_copy(r_h8, it7)
+                            cute.autovec_copy(cute.slice_(r_h, (7, None)), it7)
 
                         # Step 5: Output dot products h@q for all 8 rows
                         o0 = 0.0
@@ -2933,14 +2914,14 @@ def gdn_verify_kernel_mtp(
                         o6 = 0.0
                         o7 = 0.0
                         for i in cutlass.range_constexpr(vec_size):
-                            o0 += r_h[i] * r_q[i]
-                            o1 += r_h2[i] * r_q[i]
-                            o2 += r_h3[i] * r_q[i]
-                            o3 += r_h4[i] * r_q[i]
-                            o4 += r_h5[i] * r_q[i]
-                            o5 += r_h6[i] * r_q[i]
-                            o6 += r_h7[i] * r_q[i]
-                            o7 += r_h8[i] * r_q[i]
+                            o0 += r_h[0, i] * r_q[i]
+                            o1 += r_h[1, i] * r_q[i]
+                            o2 += r_h[2, i] * r_q[i]
+                            o3 += r_h[3, i] * r_q[i]
+                            o4 += r_h[4, i] * r_q[i]
+                            o5 += r_h[5, i] * r_q[i]
+                            o6 += r_h[6, i] * r_q[i]
+                            o7 += r_h[7, i] * r_q[i]
 
                         for offset in [16, 8, 4, 2, 1]:
                             o0 += cute.arch.shuffle_sync_bfly(
@@ -2996,49 +2977,49 @@ def gdn_verify_kernel_mtp(
                             (1, 1, vec_size),
                             (flat_state_idx, v0, lane_in_group),
                         )
-                        cute.autovec_copy(r_h, ht_o0)
+                        cute.autovec_copy(cute.slice_(r_h, (0, None)), ht_o0)
                         ht_o1 = cute.local_tile(
                             h0_source,
                             (1, 1, vec_size),
                             (flat_state_idx, v1, lane_in_group),
                         )
-                        cute.autovec_copy(r_h2, ht_o1)
+                        cute.autovec_copy(cute.slice_(r_h, (1, None)), ht_o1)
                         ht_o2 = cute.local_tile(
                             h0_source,
                             (1, 1, vec_size),
                             (flat_state_idx, v2, lane_in_group),
                         )
-                        cute.autovec_copy(r_h3, ht_o2)
+                        cute.autovec_copy(cute.slice_(r_h, (2, None)), ht_o2)
                         ht_o3 = cute.local_tile(
                             h0_source,
                             (1, 1, vec_size),
                             (flat_state_idx, v3, lane_in_group),
                         )
-                        cute.autovec_copy(r_h4, ht_o3)
+                        cute.autovec_copy(cute.slice_(r_h, (3, None)), ht_o3)
                         ht_o4 = cute.local_tile(
                             h0_source,
                             (1, 1, vec_size),
                             (flat_state_idx, v4, lane_in_group),
                         )
-                        cute.autovec_copy(r_h5, ht_o4)
+                        cute.autovec_copy(cute.slice_(r_h, (4, None)), ht_o4)
                         ht_o5 = cute.local_tile(
                             h0_source,
                             (1, 1, vec_size),
                             (flat_state_idx, v5, lane_in_group),
                         )
-                        cute.autovec_copy(r_h6, ht_o5)
+                        cute.autovec_copy(cute.slice_(r_h, (5, None)), ht_o5)
                         ht_o6 = cute.local_tile(
                             h0_source,
                             (1, 1, vec_size),
                             (flat_state_idx, v6, lane_in_group),
                         )
-                        cute.autovec_copy(r_h7, ht_o6)
+                        cute.autovec_copy(cute.slice_(r_h, (6, None)), ht_o6)
                         ht_o7 = cute.local_tile(
                             h0_source,
                             (1, 1, vec_size),
                             (flat_state_idx, v7, lane_in_group),
                         )
-                        cute.autovec_copy(r_h8, ht_o7)
+                        cute.autovec_copy(cute.slice_(r_h, (7, None)), ht_o7)
         elif cutlass.const_expr(ilp_rows == 4):
             # === 4-ROW ILP PATH: Process 4 V-rows simultaneously ===
             quarter_rows: cutlass.Constexpr[int] = rows_per_group // 4
@@ -3071,10 +3052,10 @@ def gdn_verify_kernel_mtp(
                         (1, 1, vec_size),
                         (flat_state_idx, v_idx_d, lane_in_group),
                     )
-                    cute.autovec_copy(h_tile_a, r_h)
-                    cute.autovec_copy(h_tile_b, r_h2)
-                    cute.autovec_copy(h_tile_c, r_h3)
-                    cute.autovec_copy(h_tile_d, r_h4)
+                    cute.autovec_copy(h_tile_a, cute.slice_(r_h, (0, None)))
+                    cute.autovec_copy(h_tile_b, cute.slice_(r_h, (1, None)))
+                    cute.autovec_copy(h_tile_c, cute.slice_(r_h, (2, None)))
+                    cute.autovec_copy(h_tile_d, cute.slice_(r_h, (3, None)))
 
                     # Process all T time steps with all 4 h vectors in registers
                     for i_t in cutlass.range_constexpr(T):
@@ -3093,10 +3074,10 @@ def gdn_verify_kernel_mtp(
 
                         # Step 1: Apply decay to ALL 4 h vectors (ILP)
                         for i in cutlass.range_constexpr(vec_size):
-                            r_h[i] = r_h[i] * r_g
-                            r_h2[i] = r_h2[i] * r_g
-                            r_h3[i] = r_h3[i] * r_g
-                            r_h4[i] = r_h4[i] * r_g
+                            r_h[0, i] = r_h[0, i] * r_g
+                            r_h[1, i] = r_h[1, i] * r_g
+                            r_h[2, i] = r_h[2, i] * r_g
+                            r_h[3, i] = r_h[3, i] * r_g
 
                         # Step 2: Compute dot products for ALL 4 rows (ILP)
                         sum_hk_a = 0.0
@@ -3104,10 +3085,10 @@ def gdn_verify_kernel_mtp(
                         sum_hk_c = 0.0
                         sum_hk_d = 0.0
                         for i in cutlass.range_constexpr(vec_size):
-                            sum_hk_a += r_h[i] * r_k[i]
-                            sum_hk_b += r_h2[i] * r_k[i]
-                            sum_hk_c += r_h3[i] * r_k[i]
-                            sum_hk_d += r_h4[i] * r_k[i]
+                            sum_hk_a += r_h[0, i] * r_k[i]
+                            sum_hk_b += r_h[1, i] * r_k[i]
+                            sum_hk_c += r_h[2, i] * r_k[i]
+                            sum_hk_d += r_h[3, i] * r_k[i]
 
                         # Warp-level reduction for ALL 4 (interleaved shuffles)
                         for offset in [16, 8, 4, 2, 1]:
@@ -3143,10 +3124,10 @@ def gdn_verify_kernel_mtp(
 
                         # Step 4: Update ALL 4 h vectors (ILP)
                         for i in cutlass.range_constexpr(vec_size):
-                            r_h[i] += r_k[i] * v_new_a
-                            r_h2[i] += r_k[i] * v_new_b
-                            r_h3[i] += r_k[i] * v_new_c
-                            r_h4[i] += r_k[i] * v_new_d
+                            r_h[0, i] += r_k[i] * v_new_a
+                            r_h[1, i] += r_k[i] * v_new_b
+                            r_h[2, i] += r_k[i] * v_new_c
+                            r_h[3, i] += r_k[i] * v_new_d
 
                         # Cache intermediate state if needed
                         if cutlass.const_expr(cache_intermediate_states):
@@ -3156,25 +3137,25 @@ def gdn_verify_kernel_mtp(
                                 (1, 1, vec_size),
                                 (flat_idx, v_idx_a, lane_in_group),
                             )
-                            cute.autovec_copy(r_h, inter_tile_a)
+                            cute.autovec_copy(cute.slice_(r_h, (0, None)), inter_tile_a)
                             inter_tile_b = cute.local_tile(
                                 intermediate_states,
                                 (1, 1, vec_size),
                                 (flat_idx, v_idx_b, lane_in_group),
                             )
-                            cute.autovec_copy(r_h2, inter_tile_b)
+                            cute.autovec_copy(cute.slice_(r_h, (1, None)), inter_tile_b)
                             inter_tile_c = cute.local_tile(
                                 intermediate_states,
                                 (1, 1, vec_size),
                                 (flat_idx, v_idx_c, lane_in_group),
                             )
-                            cute.autovec_copy(r_h3, inter_tile_c)
+                            cute.autovec_copy(cute.slice_(r_h, (2, None)), inter_tile_c)
                             inter_tile_d = cute.local_tile(
                                 intermediate_states,
                                 (1, 1, vec_size),
                                 (flat_idx, v_idx_d, lane_in_group),
                             )
-                            cute.autovec_copy(r_h4, inter_tile_d)
+                            cute.autovec_copy(cute.slice_(r_h, (3, None)), inter_tile_d)
 
                         # Step 5: Compute output for ALL 4 rows (ILP)
                         sum_hq_a = 0.0
@@ -3182,10 +3163,10 @@ def gdn_verify_kernel_mtp(
                         sum_hq_c = 0.0
                         sum_hq_d = 0.0
                         for i in cutlass.range_constexpr(vec_size):
-                            sum_hq_a += r_h[i] * r_q[i]
-                            sum_hq_b += r_h2[i] * r_q[i]
-                            sum_hq_c += r_h3[i] * r_q[i]
-                            sum_hq_d += r_h4[i] * r_q[i]
+                            sum_hq_a += r_h[0, i] * r_q[i]
+                            sum_hq_b += r_h[1, i] * r_q[i]
+                            sum_hq_c += r_h[2, i] * r_q[i]
+                            sum_hq_d += r_h[3, i] * r_q[i]
 
                         # Warp-level reduction for ALL 4 (interleaved)
                         for offset in [16, 8, 4, 2, 1]:
@@ -3231,25 +3212,25 @@ def gdn_verify_kernel_mtp(
                             (1, 1, vec_size),
                             (flat_state_idx, v_idx_a, lane_in_group),
                         )
-                        cute.autovec_copy(r_h, h_tile_out_a)
+                        cute.autovec_copy(cute.slice_(r_h, (0, None)), h_tile_out_a)
                         h_tile_out_b = cute.local_tile(
                             h0_source,
                             (1, 1, vec_size),
                             (flat_state_idx, v_idx_b, lane_in_group),
                         )
-                        cute.autovec_copy(r_h2, h_tile_out_b)
+                        cute.autovec_copy(cute.slice_(r_h, (1, None)), h_tile_out_b)
                         h_tile_out_c = cute.local_tile(
                             h0_source,
                             (1, 1, vec_size),
                             (flat_state_idx, v_idx_c, lane_in_group),
                         )
-                        cute.autovec_copy(r_h3, h_tile_out_c)
+                        cute.autovec_copy(cute.slice_(r_h, (2, None)), h_tile_out_c)
                         h_tile_out_d = cute.local_tile(
                             h0_source,
                             (1, 1, vec_size),
                             (flat_state_idx, v_idx_d, lane_in_group),
                         )
-                        cute.autovec_copy(r_h4, h_tile_out_d)
+                        cute.autovec_copy(cute.slice_(r_h, (3, None)), h_tile_out_d)
         elif cutlass.const_expr(ilp_rows == 2):
             # === 2-ROW ILP PATH: Process 2 V-rows simultaneously ===
             half_rows: cutlass.Constexpr[int] = rows_per_group // 2
@@ -3270,8 +3251,8 @@ def gdn_verify_kernel_mtp(
                         (1, 1, vec_size),
                         (flat_state_idx, v_idx_b, lane_in_group),
                     )
-                    cute.autovec_copy(h_tile_a, r_h)
-                    cute.autovec_copy(h_tile_b, r_h2)
+                    cute.autovec_copy(h_tile_a, cute.slice_(r_h, (0, None)))
+                    cute.autovec_copy(h_tile_b, cute.slice_(r_h, (1, None)))
 
                     # Process all T time steps with both h vectors in registers
                     for i_t in cutlass.range_constexpr(T):
@@ -3290,15 +3271,15 @@ def gdn_verify_kernel_mtp(
 
                         # Step 1: Apply decay to BOTH h vectors (ILP)
                         for i in cutlass.range_constexpr(vec_size):
-                            r_h[i] = r_h[i] * r_g
-                            r_h2[i] = r_h2[i] * r_g
+                            r_h[0, i] = r_h[0, i] * r_g
+                            r_h[1, i] = r_h[1, i] * r_g
 
                         # Step 2: Compute dot products for BOTH rows (ILP)
                         sum_hk_a = 0.0
                         sum_hk_b = 0.0
                         for i in cutlass.range_constexpr(vec_size):
-                            sum_hk_a += r_h[i] * r_k[i]
-                            sum_hk_b += r_h2[i] * r_k[i]
+                            sum_hk_a += r_h[0, i] * r_k[i]
+                            sum_hk_b += r_h[1, i] * r_k[i]
 
                         # Warp-level reduction for BOTH (interleaved shuffles)
                         for offset in [16, 8, 4, 2, 1]:
@@ -3322,8 +3303,8 @@ def gdn_verify_kernel_mtp(
 
                         # Step 4: Update BOTH h vectors (ILP)
                         for i in cutlass.range_constexpr(vec_size):
-                            r_h[i] += r_k[i] * v_new_a
-                            r_h2[i] += r_k[i] * v_new_b
+                            r_h[0, i] += r_k[i] * v_new_a
+                            r_h[1, i] += r_k[i] * v_new_b
 
                         # Cache intermediate state if needed
                         if cutlass.const_expr(cache_intermediate_states):
@@ -3333,20 +3314,20 @@ def gdn_verify_kernel_mtp(
                                 (1, 1, vec_size),
                                 (flat_idx, v_idx_a, lane_in_group),
                             )
-                            cute.autovec_copy(r_h, inter_tile_a)
+                            cute.autovec_copy(cute.slice_(r_h, (0, None)), inter_tile_a)
                             inter_tile_b = cute.local_tile(
                                 intermediate_states,
                                 (1, 1, vec_size),
                                 (flat_idx, v_idx_b, lane_in_group),
                             )
-                            cute.autovec_copy(r_h2, inter_tile_b)
+                            cute.autovec_copy(cute.slice_(r_h, (1, None)), inter_tile_b)
 
                         # Step 5: Compute output for BOTH rows (ILP)
                         sum_hq_a = 0.0
                         sum_hq_b = 0.0
                         for i in cutlass.range_constexpr(vec_size):
-                            sum_hq_a += r_h[i] * r_q[i]
-                            sum_hq_b += r_h2[i] * r_q[i]
+                            sum_hq_a += r_h[0, i] * r_q[i]
+                            sum_hq_b += r_h[1, i] * r_q[i]
 
                         # Warp-level reduction for BOTH (interleaved)
                         for offset in [16, 8, 4, 2, 1]:
@@ -3378,13 +3359,13 @@ def gdn_verify_kernel_mtp(
                             (1, 1, vec_size),
                             (flat_state_idx, v_idx_a, lane_in_group),
                         )
-                        cute.autovec_copy(r_h, h_tile_out_a)
+                        cute.autovec_copy(cute.slice_(r_h, (0, None)), h_tile_out_a)
                         h_tile_out_b = cute.local_tile(
                             h0_source,
                             (1, 1, vec_size),
                             (flat_state_idx, v_idx_b, lane_in_group),
                         )
-                        cute.autovec_copy(r_h2, h_tile_out_b)
+                        cute.autovec_copy(cute.slice_(r_h, (1, None)), h_tile_out_b)
         else:
             # === 1-ROW PATH: Process 1 V-row at a time (lower register pressure) ===
             for row_idx in cutlass.range_constexpr(rows_per_group):
@@ -3397,7 +3378,7 @@ def gdn_verify_kernel_mtp(
                         (1, 1, vec_size),
                         (flat_state_idx, v_idx, lane_in_group),
                     )
-                    cute.autovec_copy(h_tile, r_h)
+                    cute.autovec_copy(h_tile, cute.slice_(r_h, (0, None)))
 
                     # Process all T time steps with h in registers
                     for i_t in cutlass.range_constexpr(T):
@@ -3415,12 +3396,12 @@ def gdn_verify_kernel_mtp(
 
                         # Step 1: Apply decay
                         for i in cutlass.range_constexpr(vec_size):
-                            r_h[i] = r_h[i] * r_g
+                            r_h[0, i] = r_h[0, i] * r_g
 
                         # Step 2: Dot product h @ k
                         sum_hk = 0.0
                         for i in cutlass.range_constexpr(vec_size):
-                            sum_hk += r_h[i] * r_k[i]
+                            sum_hk += r_h[0, i] * r_k[i]
 
                         for offset in [16, 8, 4, 2, 1]:
                             sum_hk += cute.arch.shuffle_sync_bfly(
@@ -3437,7 +3418,7 @@ def gdn_verify_kernel_mtp(
 
                         # Step 4: Rank-1 update
                         for i in cutlass.range_constexpr(vec_size):
-                            r_h[i] += r_k[i] * v_new
+                            r_h[0, i] += r_k[i] * v_new
 
                         # Cache intermediate state if needed
                         if cutlass.const_expr(cache_intermediate_states):
@@ -3447,12 +3428,12 @@ def gdn_verify_kernel_mtp(
                                 (1, 1, vec_size),
                                 (flat_idx, v_idx, lane_in_group),
                             )
-                            cute.autovec_copy(r_h, inter_tile)
+                            cute.autovec_copy(cute.slice_(r_h, (0, None)), inter_tile)
 
                         # Step 5: Output dot product h @ q
                         sum_hq = 0.0
                         for i in cutlass.range_constexpr(vec_size):
-                            sum_hq += r_h[i] * r_q[i]
+                            sum_hq += r_h[0, i] * r_q[i]
 
                         for offset in [16, 8, 4, 2, 1]:
                             sum_hq += cute.arch.shuffle_sync_bfly(
@@ -3474,7 +3455,7 @@ def gdn_verify_kernel_mtp(
                             (1, 1, vec_size),
                             (flat_state_idx, v_idx, lane_in_group),
                         )
-                        cute.autovec_copy(r_h, h_tile_out)
+                        cute.autovec_copy(cute.slice_(r_h, (0, None)), h_tile_out)
 
         # === Cooperative output writeback from SMEM to GMEM (only if use_smem_v) ===
         if cutlass.const_expr(use_smem_v):
