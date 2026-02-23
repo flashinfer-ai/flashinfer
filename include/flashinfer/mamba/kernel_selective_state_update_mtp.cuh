@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cuda/barrier>
 #include <iostream>
+#include <type_traits>
 
 #include "../utils.cuh"
 #include "../vec_dtypes.cuh"
@@ -16,21 +17,25 @@ namespace flashinfer::mamba::mtp {
 
 using namespace conversion;
 
-template <typename input_t, typename state_t, int TOKENS_MTP, int DIM, int DSTATE, int STATE_ROWS,
-          bool scaleState = false>
+template <typename input_t, typename state_t, typename state_scale_t, int TOKENS_MTP, int DIM,
+          int DSTATE, int STATE_ROWS>
 struct SharedStorageSimple {
+  static constexpr bool scaleState = !std::is_same_v<state_scale_t, void>;
   alignas(alignof(PackedAligned<input_t>)) input_t x[TOKENS_MTP][DIM];
   alignas(alignof(PackedAligned<float>)) float out[TOKENS_MTP][DIM];
   alignas(alignof(PackedAligned<input_t>)) input_t z[TOKENS_MTP][DIM];
   alignas(alignof(PackedAligned<input_t>)) input_t B[TOKENS_MTP][DSTATE];
   alignas(alignof(PackedAligned<input_t>)) input_t C[TOKENS_MTP][DSTATE];
   alignas(alignof(PackedAligned<state_t>)) state_t state[STATE_ROWS][DSTATE];
-  alignas(alignof(PackedAligned<float>)) float state_scale[STATE_ROWS * scaleState];
+  alignas(alignof(PackedAligned<float>))
+      std::conditional_t<scaleState, state_scale_t, char> state_scale[STATE_ROWS * scaleState];
 };
 
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t,
-          typename stateIndex_t, int TOKENS_MTP, int DIM, int DSTATE, int numWarps>
+          typename stateIndex_t, typename state_scale_t, int TOKENS_MTP, int DIM, int DSTATE,
+          int numWarps>
 __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams params) {
+  constexpr bool scaleState = !std::is_same_v<state_scale_t, void>;
   auto* __restrict__ output = reinterpret_cast<input_t*>(params.output);
   auto* __restrict__ state = reinterpret_cast<state_t*>(params.state);
   auto* __restrict__ intermediate_states = reinterpret_cast<state_t*>(params.intermediate_states);
@@ -58,14 +63,15 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
   auto lane = threadIdx.x % warpSize;
   auto warp = threadIdx.y;
 
-  // State scale pointer (only used when SCALE_STATE == true)
-  [[maybe_unused]] auto* __restrict__ state_scale = reinterpret_cast<float*>(params.state_scale);
+  // State scale pointer (only used when scaleState == true)
+  [[maybe_unused]] auto* __restrict__ state_scale =
+      reinterpret_cast<state_scale_t*>(params.state_scale);
 
   auto const state_batch = (state_batch_indices) ? state_batch_indices[batch] : batch;
   auto const intermediate_cache_idx =
       intermediate_state_indices ? intermediate_state_indices[batch] : state_batch;
   state += state_batch * params.state_stride_batch + head * DIM * DSTATE;
-  if constexpr (SCALE_STATE) {
+  if constexpr (scaleState) {
     state_scale += state_batch * params.state_scale_stride_batch + head * DIM;
   }
 
@@ -74,7 +80,7 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
 
   extern __shared__ __align__(128) char smem[];
   auto& sram = *reinterpret_cast<
-      SharedStorageSimple<input_t, state_t, TOKENS_MTP, DIM, DSTATE, stageRows, SCALE_STATE>*>(
+      SharedStorageSimple<input_t, state_t, state_scale_t, TOKENS_MTP, DIM, DSTATE, stageRows>*>(
       smem);
 
   static constexpr auto stateLoadSize = getVectorLoadSizeForFullUtilization<state_t, DSTATE>();
@@ -152,7 +158,7 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
             auto* dst = reinterpret_cast<load_state_t*>(&sram.state[dd][i]);
             *dst = *reinterpret_cast<load_state_t*>(&state[d * DSTATE + i]);
           }
-          if constexpr (SCALE_STATE) {
+          if constexpr (scaleState) {
             if (lane == 0) sram.state_scale[dd] = state_scale[d];
           }
         }
@@ -183,8 +189,8 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
       // There is a bank conflict here, but we are not in a hot loop and we must align the state
       // indices with the input indices
       float state_decode_scale = 1.f;
-      if constexpr (SCALE_STATE) {
-        if (state_batch != params.pad_slot_id) state_decode_scale = sram.state_scale[dd];
+      if constexpr (scaleState) {
+        if (state_batch != params.pad_slot_id) state_decode_scale = toFloat(sram.state_scale[dd]);
       }
       for (int ii = 0; ii < stateValuesPerThread; ii++) {
         int i = lane * packed_input_t::count +
@@ -266,7 +272,7 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
 
       // Update state if enabled and not padded
       if (params.update_state && state_batch != params.pad_slot_id) {
-        if constexpr (SCALE_STATE) {
+        if constexpr (scaleState) {
           // 2-pass quantization: compute max, then re-encode
           float new_state_max = std::numeric_limits<float>::lowest();
           for (int ii = 0; ii < stateValuesPerThread; ii++) {
@@ -287,7 +293,7 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
               convertAndStore(&sram.state[dd][i], rState[ii] * new_encode_scale);
             }
           }
-          if (lane == 0) sram.state_scale[dd] = new_decode_scale;
+          if (lane == 0) convertAndStore(&sram.state_scale[dd], new_decode_scale);
         } else {
           // Store to rmem -> smem
           for (int ii = 0; ii < stateValuesPerThread; ii++) {
@@ -304,7 +310,7 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
           auto* src = reinterpret_cast<load_state_t*>(&sram.state[dd][i]);
           *reinterpret_cast<load_state_t*>(&state[d * DSTATE + i]) = *src;
         }
-        if constexpr (SCALE_STATE) {
+        if constexpr (scaleState) {
           if (lane == 0) state_scale[d] = sram.state_scale[dd];
         }
       }
@@ -333,6 +339,7 @@ template <typename input_t, typename weight_t, typename matrixA_t, typename stat
           typename stateIndex_t>
 void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm algorithm,
                                    cudaStream_t stream) {
+  constexpr bool scaleState = !std::is_same_v<state_scale_t, void>;
   // MTP only supports the simple kernel
   FLASHINFER_CHECK(algorithm == SSUAlgorithm::kAuto || algorithm == SSUAlgorithm::kSimple,
                    "MTP selective_state_update only supports 'auto' or 'simple' algorithm, got ",
@@ -347,7 +354,7 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
   FLASHINFER_CHECK((params.dim * params.dstate * sizeof(state_t)) % sizeof(load_state_t) == 0,
                    "state head stride must be aligned to ", sizeof(load_state_t), " bytes");
 
-  if constexpr (SCALE_STATE) {
+  if constexpr (scaleState) {
     FLASHINFER_CHECK(!params.intermediate_states,
                      "int16 scaled state does not support intermediate_states buffer "
                      "— requires separate intermediate_state_scales tensor");
@@ -362,9 +369,9 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
 
   auto func =
       selective_state_update_kernel_simple_mtp<input_t, weight_t, matrixA_t, state_t, stateIndex_t,
-                                               NTOKENS_MTP, DIM, DSTATE, numWarps>;
+                                               state_scale_t, NTOKENS_MTP, DIM, DSTATE, numWarps>;
   using sram_t =
-      SharedStorageSimple<input_t, state_t, NTOKENS_MTP, DIM, DSTATE, stageRows, SCALE_STATE>;
+      SharedStorageSimple<input_t, state_t, state_scale_t, NTOKENS_MTP, DIM, DSTATE, stageRows>;
   constexpr size_t smem_size = sizeof(sram_t);
 
   FLASHINFER_CUDA_CHECK(

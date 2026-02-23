@@ -38,7 +38,7 @@ def _get_module(
     dstate: int,
     ntokens_mtp: int,
     sm_major: int,
-    scale_state: bool = False,
+    state_scale_dtype: Optional[torch.dtype] = None,
 ):
     args = (
         state_dtype,
@@ -49,7 +49,7 @@ def _get_module(
         dim,
         dstate,
         ntokens_mtp,
-        scale_state,
+        state_scale_dtype,
     )
     if sm_major >= 9:
         return gen_selective_state_update_sm90_module(*args).build_and_load()
@@ -67,7 +67,7 @@ def get_selective_state_update_module(
     dim: int,
     dstate: int,
     ntokens_mtp: int,
-    scale_state: bool = False,
+    state_scale_dtype: Optional[torch.dtype] = None,
 ):
     major, _ = get_compute_capability(device)
     return _get_module(
@@ -80,7 +80,7 @@ def get_selective_state_update_module(
         dstate,
         ntokens_mtp,
         major,
-        scale_state,
+        state_scale_dtype,
     )
 
 
@@ -316,7 +316,7 @@ def _selective_state_update(
         dim,
         dstate,
         ntokens_mtp,
-        scale_state=state_scale is not None,
+        state_scale_dtype=state_scale.dtype if state_scale is not None else None,
     ).selective_state_update(
         state,
         x,

@@ -548,23 +548,23 @@ def gen_all_modules(
         ]
         # selective_state_update: one module per dtype combo per GPU arch
         _ssu_dtype_combos = [
-            # (state,        input,          weight,         matrixA,      stateIndex, scale_state)
+            # (state,        input,          weight,         matrixA,      stateIndex, state_scale_dtype)
             (
                 torch.bfloat16,
                 torch.bfloat16,
                 torch.bfloat16,
                 torch.float32,
                 torch.int64,
-                False,
+                None,
             ),
-            # int16 state (block-scaled quantization)
+            # int16 state (block-scaled quantization, scale stored as float32)
             (
                 torch.int16,
                 torch.bfloat16,
                 torch.bfloat16,
                 torch.float32,
                 torch.int64,
-                True,
+                torch.float32,
             ),
             (
                 torch.float32,
@@ -572,7 +572,7 @@ def gen_all_modules(
                 torch.bfloat16,
                 torch.float32,
                 torch.int64,
-                False,
+                None,
             ),
         ]
         _ssu_dims = [64]

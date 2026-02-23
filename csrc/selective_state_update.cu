@@ -105,8 +105,6 @@ inline void validate_state_scale(Optional<TensorView> const& state_scale, int64_
   auto const& scale = state_scale.value();
   CHECK_CUDA(scale);
   CHECK_DIM(3, scale);  // state_scale: {state_cache_size, nheads, dim}
-  FLASHINFER_CHECK(scale.dtype().code == kDLFloat && scale.dtype().bits == 32,
-                   "state_scale must be float32");
   FLASHINFER_CHECK(scale.size(0) == state_cache_size,
                    "state_scale.size(0) must equal state_cache_size");
   FLASHINFER_CHECK(scale.size(1) == nheads, "state_scale.size(1) must equal nheads");

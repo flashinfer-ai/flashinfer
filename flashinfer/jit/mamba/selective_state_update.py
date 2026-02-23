@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import os
+from typing import Optional
 
 import jinja2
 import torch
@@ -54,7 +55,7 @@ def get_selective_state_update_uri(
     dim: int,
     dstate: int,
     ntokens_mtp: int,
-    scale_state: bool = False,
+    state_scale_dtype: Optional[torch.dtype] = None,
 ) -> str:
     s = _filename_safe_dtype_map
     uri = (
@@ -63,8 +64,8 @@ def get_selective_state_update_uri(
         f"a_{s[matrixA_dtype]}_si_{s[stateIndex_dtype]}_"
         f"d_{dim}_ds_{dstate}_nt_{ntokens_mtp}"
     )
-    if scale_state:
-        uri += "_scaled"
+    if state_scale_dtype is not None:
+        uri += f"_sc_{s[state_scale_dtype]}"
     return uri
 
 
@@ -78,7 +79,7 @@ def _gen_module(
     dim: int,
     dstate: int,
     ntokens_mtp: int,
-    scale_state: bool = False,
+    state_scale_dtype: Optional[torch.dtype] = None,
     extra_cuda_cflags: list = None,
 ) -> JitSpec:
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
@@ -90,6 +91,9 @@ def _gen_module(
     ) as f:
         config_templ = jinja2.Template(f.read())
 
+    state_scale_type = (
+        _dtype_map[state_scale_dtype] if state_scale_dtype is not None else "void"
+    )
     config_str = config_templ.render(
         state_dtype=_dtype_map[state_dtype],
         input_dtype=_dtype_map[input_dtype],
@@ -99,7 +103,7 @@ def _gen_module(
         dim=dim,
         dstate=dstate,
         ntokens_mtp=ntokens_mtp,
-        scale_state="true" if scale_state else "false",
+        state_scale_type=state_scale_type,
     )
     write_if_different(gen_directory / "selective_state_update_config.inc", config_str)
 
@@ -133,7 +137,7 @@ def gen_selective_state_update_module(
     dim: int,
     dstate: int,
     ntokens_mtp: int,
-    scale_state: bool = False,
+    state_scale_dtype: Optional[torch.dtype] = None,
 ) -> JitSpec:
     uri = get_selective_state_update_uri(
         state_dtype,
@@ -144,7 +148,7 @@ def gen_selective_state_update_module(
         dim,
         dstate,
         ntokens_mtp,
-        scale_state,
+        state_scale_dtype,
     )
     return _gen_module(
         uri,
@@ -156,7 +160,7 @@ def gen_selective_state_update_module(
         dim,
         dstate,
         ntokens_mtp,
-        scale_state=scale_state,
+        state_scale_dtype=state_scale_dtype,
         extra_cuda_cflags=["-lineinfo"],
     )
 
@@ -170,7 +174,7 @@ def gen_selective_state_update_sm90_module(
     dim: int,
     dstate: int,
     ntokens_mtp: int,
-    scale_state: bool = False,
+    state_scale_dtype: Optional[torch.dtype] = None,
 ) -> JitSpec:
     uri = (
         get_selective_state_update_uri(
@@ -182,7 +186,7 @@ def gen_selective_state_update_sm90_module(
             dim,
             dstate,
             ntokens_mtp,
-            scale_state,
+            state_scale_dtype,
         )
         + "_sm90"
     )
@@ -201,6 +205,6 @@ def gen_selective_state_update_sm90_module(
         dim,
         dstate,
         ntokens_mtp,
-        scale_state=scale_state,
+        state_scale_dtype=state_scale_dtype,
         extra_cuda_cflags=nvcc_flags,
     )

@@ -13,5 +13,6 @@ constexpr int DIM = {{ dim }};
 constexpr int DSTATE = {{ dstate }};
 constexpr int NTOKENS_MTP = {{ ntokens_mtp }};
 
-// True when e.g. state_t is a quantized integer type that requires block scaling
-constexpr bool SCALE_STATE = {{ scale_state }};
+// Type for block-scale decode factors (e.g. float, __half).
+// void = no scaling (state_t is used as-is).
+using state_scale_t = {{ state_scale_type }};
