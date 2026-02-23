@@ -1113,6 +1113,9 @@ class FP8BlockScaleMoe(Moe):
         enable_pdl = kwargs.get("enable_pdl")
         hidden_states_scale = kwargs["hidden_states_scale"]
         hidden_states_quant = kwargs["hidden_states_quant"]
+        num_fused_shared_experts = kwargs.get("num_fused_shared_experts", 0)
+
+        num_routed_experts = num_experts - num_fused_shared_experts
 
         # Generate block scales and quantize hidden states at runtime
         hidden_states_fp8 = hidden_states_quant.to(torch.float8_e4m3fn)
@@ -1140,13 +1143,13 @@ class FP8BlockScaleMoe(Moe):
                 static_data["gemm1_scales"],
                 static_data["gemm2_weights"],
                 static_data["gemm2_scales"],
-                num_experts,
-                top_k,
+                num_routed_experts,
+                top_k - num_fused_shared_experts,
                 n_groups,
                 top_k_groups,
                 intermediate_size,
                 0,
-                num_experts,
+                num_routed_experts,
                 routed_scaling,
                 routing_method_type,
                 use_shuffled_weight=static_data["use_shuffled_weight"],
@@ -1154,6 +1157,9 @@ class FP8BlockScaleMoe(Moe):
                 enable_pdl=enable_pdl,
                 tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
                 fp8_quantization_type=quantization_mode,
+                num_fused_shared_experts=num_fused_shared_experts
+                if num_fused_shared_experts > 0
+                else None,
             )
         return output.to(torch.float)
 
@@ -1631,28 +1637,51 @@ class moe_args_dequant:
         self.gemm2_bias = gemm2_bias
 
 
-def routing_reference(expertLogits, topK, padding):
+def routing_reference(expertLogits, topK, padding, num_fused_shared_experts=0):
     """Reference routing implementation for permutation calculation."""
     originalDevice = expertLogits.device
     expertLogits = expertLogits.cpu()
     numTokens, numExperts = expertLogits.shape
     assert topK <= numExperts
 
-    numTokensPerExpert = torch.zeros(numExperts, dtype=torch.int64)
-    expandedTokenIdxToExpert = -torch.ones(numTokens * topK, dtype=torch.int64)
-    expandedTokenIdxToIdxInExpert = -torch.ones(numTokens * topK, dtype=torch.int64)
+    numTotalExperts = numExperts + num_fused_shared_experts
+    totalExpertsPerToken = topK + num_fused_shared_experts
+
+    numTokensPerExpert = torch.zeros(numTotalExperts, dtype=torch.int64)
+    expandedTokenIdxToExpert = -torch.ones(
+        numTokens * totalExpertsPerToken, dtype=torch.int64
+    )
+    expandedTokenIdxToIdxInExpert = -torch.ones(
+        numTokens * totalExpertsPerToken, dtype=torch.int64
+    )
 
     topKLogits, topKIndices = torch.topk(expertLogits, topK, dim=1)
+    if num_fused_shared_experts > 0:
+        sharedLogits = torch.ones(
+            numTokens, num_fused_shared_experts, dtype=topKLogits.dtype
+        )
+        topKLogits = torch.cat((topKLogits, sharedLogits), dim=1)
+        sharedIndices = (
+            torch.arange(
+                numExperts,
+                numExperts + num_fused_shared_experts,
+                dtype=topKIndices.dtype,
+            )
+            .unsqueeze(0)
+            .expand(numTokens, -1)
+        )
+        topKIndices = torch.cat((topKIndices, sharedIndices), dim=1)
+
     for tokenIdx in range(numTokens):
-        for k in range(topK):
-            expandedIdx = tokenIdx * topK + k
+        for k in range(totalExpertsPerToken):
+            expandedIdx = tokenIdx * totalExpertsPerToken + k
             expertIndex = topKIndices[tokenIdx, k]
             expandedTokenIdxToExpert[expandedIdx] = expertIndex
             expandedTokenIdxToIdxInExpert[expandedIdx] = numTokensPerExpert[expertIndex]
             numTokensPerExpert[expertIndex] += 1
 
-    paddedTokensPerExpertPrefixSum = torch.zeros(numExperts + 1, dtype=torch.int64)
-    for ii in range(numExperts):
+    paddedTokensPerExpertPrefixSum = torch.zeros(numTotalExperts + 1, dtype=torch.int64)
+    for ii in range(numTotalExperts):
 
         def divUpMul(a, b):
             return (a + b - 1) // b * b
@@ -1660,14 +1689,16 @@ def routing_reference(expertLogits, topK, padding):
         paddedTokensPerExpertPrefixSum[ii + 1] = paddedTokensPerExpertPrefixSum[
             ii
         ] + divUpMul(numTokensPerExpert[ii], padding)
-    permutedBufferSize = paddedTokensPerExpertPrefixSum[numExperts]
+    permutedBufferSize = paddedTokensPerExpertPrefixSum[numTotalExperts]
 
-    expandedTokenIdxToPermutedIdx = -torch.ones(numTokens * topK, dtype=torch.int64)
+    expandedTokenIdxToPermutedIdx = -torch.ones(
+        numTokens * totalExpertsPerToken, dtype=torch.int64
+    )
     permutedIdxToExpandedIdx = -torch.ones(permutedBufferSize, dtype=torch.int64)
     permutedIdxToTokenIdx = -torch.ones(permutedBufferSize, dtype=torch.int64)
     for tokenIdx in range(numTokens):
-        for k in range(topK):
-            expandedIdx = tokenIdx * topK + k
+        for k in range(totalExpertsPerToken):
+            expandedIdx = tokenIdx * totalExpertsPerToken + k
             expert = expandedTokenIdxToExpert[expandedIdx]
             offsetWithinExpert = expandedTokenIdxToIdxInExpert[expandedIdx]
             offsetForExpert = paddedTokensPerExpertPrefixSum[expert]
@@ -1743,17 +1774,17 @@ def routing_reference_no_aux(
     routed_scaling,
     padding,
     use_routing_scales_on_input=False,
+    num_fused_shared_experts=0,
 ):
     """Tiered TopK routing used by DeepSeek."""
     routing_logits = expert_logits.to(dtype=torch.float, device="cuda")
     if use_routing_scales_on_input:
-        # if using routing scales on input, topK == 1 and the score is a plain sigmoid
         scores = F.sigmoid(routing_logits)
     else:
         scores = noaux_tc_ref(
             routing_logits, routing_bias, n_groups, top_k_groups, top_k, routed_scaling
         )
-    permute_info = routing_reference(scores, top_k, padding)
+    permute_info = routing_reference(scores, top_k, padding, num_fused_shared_experts)
     return permute_info, scores
 
 
@@ -2531,6 +2562,8 @@ def _compute_moe_actual_unified(moe_impl, args_dequant, args, **kwargs):
         kwargs["weight_processing"],
     )
 
+    num_fused_shared_experts = kwargs.get("num_fused_shared_experts", 0)
+
     # 2. Call MoE with runtime input quantization + kernel execution
     kernel_kwargs = {
         "expert_logits": kwargs["expert_logits"],
@@ -2551,6 +2584,7 @@ def _compute_moe_actual_unified(moe_impl, args_dequant, args, **kwargs):
         "enable_autotune": kwargs.get("enable_autotune", True),
         "gemm1_bias": args.gemm1_bias,
         "gemm2_bias": args.gemm2_bias,
+        "num_fused_shared_experts": num_fused_shared_experts,
     }
 
     return moe_impl.call_moe(
@@ -2608,6 +2642,8 @@ def run_moe_test(
     routed_scaling = routing_config["routed_scaling"]
     num_experts = routing_config["num_experts"]
     routing_method_type = routing_config["routing_method_type"]
+    num_fused_shared_experts = routing_config.get("num_fused_shared_experts", 0)
+    total_experts = num_experts + num_fused_shared_experts
 
     # Validation checks
     assert top_k <= num_experts
@@ -2640,7 +2676,7 @@ def run_moe_test(
     )
     gemm1_weights = torch.randn(
         (
-            num_experts,
+            total_experts,
             (2 if is_gated_activation(activation_type) else 1) * intermediate_size,
             hidden_size,
         ),
@@ -2648,7 +2684,7 @@ def run_moe_test(
         dtype=torch.bfloat16,
     )
     gemm2_weights = torch.randn(
-        (num_experts, hidden_size, intermediate_size),
+        (total_experts, hidden_size, intermediate_size),
         device="cuda",
         dtype=torch.bfloat16,
     )
@@ -2666,6 +2702,7 @@ def run_moe_test(
             routed_scaling,
             padding,
             use_routing_scales_on_input,
+            num_fused_shared_experts=num_fused_shared_experts,
         )
     elif routing_method_type == RoutingMethodType.Renormalize:
         permute_info, scores = routing_reference_renormalize(
@@ -2711,10 +2748,10 @@ def run_moe_test(
     # Create arguments for reference computation
     args = moe_args(
         num_tokens,
-        num_experts,
+        total_experts,
         hidden_size,
         intermediate_size,
-        top_k,
+        top_k + num_fused_shared_experts,
         padding,
         quant_data["hidden_states"],
         quant_data["hidden_states_scale"],
@@ -2758,6 +2795,7 @@ def run_moe_test(
         enable_pdl=True,
         hidden_states_quant=inputs_data["hidden_states"],
         enable_autotune=enable_autotune,
+        num_fused_shared_experts=num_fused_shared_experts,
     )
 
     # Compare outputs
@@ -3024,6 +3062,42 @@ def test_renormalize_routing(
                 "enable_autotune": True,
             },
             id="DSv3",
+        ),
+        pytest.param(
+            {
+                "num_experts": 256,
+                "top_k": 8,
+                "padding": 8,
+                "n_groups": 8,
+                "top_k_groups": 4,
+                "routed_scaling": 2.5,
+                "has_routing_bias": True,
+                "routing_method_type": RoutingMethodType.DeepSeekV3,
+                "num_fused_shared_experts": 1,
+                "compatible_moe_impls": [FP8BlockScaleMoe],
+                "compatible_intermediate_size": [512],
+                "compatible_activation_types": [ActivationType.Swiglu],
+                "enable_autotune": False,
+            },
+            id="DSv3_fused_shared_1",
+        ),
+        pytest.param(
+            {
+                "num_experts": 256,
+                "top_k": 8,
+                "padding": 8,
+                "n_groups": 8,
+                "top_k_groups": 4,
+                "routed_scaling": 2.5,
+                "has_routing_bias": True,
+                "routing_method_type": RoutingMethodType.DeepSeekV3,
+                "num_fused_shared_experts": 2,
+                "compatible_moe_impls": [FP8BlockScaleMoe],
+                "compatible_intermediate_size": [512],
+                "compatible_activation_types": [ActivationType.Swiglu],
+                "enable_autotune": False,
+            },
+            id="DSv3_fused_shared_2",
         ),
         pytest.param(
             {
