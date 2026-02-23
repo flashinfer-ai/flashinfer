@@ -551,19 +551,20 @@ jobs:
     steps:
       - name: Cleanup
         run: |
-          # Stop all Docker containers to free GPU memory
-          docker stop $(docker ps -q) 2>/dev/null || true
-          docker rm $(docker ps -aq) 2>/dev/null || true
-          # Clean workspace and caches
+          # Shared multi-runner node: only stop containers started by THIS runner (identified by workspace mount)
+          for cid in $(docker ps -q); do
+            if docker inspect "$cid" --format '{{json .Mounts}}' 2>/dev/null | grep -qF "${{ github.workspace }}/"; then
+              docker stop "$cid" 2>/dev/null || true
+            fi
+          done
           sudo rm -rf ${{ github.workspace }}/* || true
           sudo rm -rf ${{ github.workspace }}/.[!.]* || true
           rm -rf ~/.cache/flashinfer_jit || true
+          docker container prune -f 2>/dev/null || true
           docker image prune -f || true
           docker builder prune -f --filter "until=24h" || true
-          # Show GPU info (should show 1 GPU due to CUDA_VISIBLE_DEVICES)
-          echo "=== GPU Info ==="
-          nvidia-smi || true
           echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+          nvidia-smi -i "$CUDA_VISIBLE_DEVICES" || true
 
       - uses: actions/checkout@v4
         with:

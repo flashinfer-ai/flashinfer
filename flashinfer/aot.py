@@ -25,59 +25,15 @@ import os
 import shutil
 from itertools import product
 from pathlib import Path
-from typing import List, Tuple, Iterator, Optional
+from typing import Iterator, List, Optional, Tuple
 
 import torch
-
 from packaging.version import Version
+
+from .compilation_context import CompilationContext
+from .jit import JitSpec, build_jit_specs
+from .jit import env as jit_env
 from .jit.activation import act_func_def_str, gen_act_and_mul_module
-from .jit.cascade import gen_cascade_module
-from .jit.fp4_quantization import (
-    gen_fp4_quantization_sm90_module,
-    gen_fp4_quantization_sm100_module,
-    gen_fp4_quantization_sm103_module,
-    gen_fp4_quantization_sm110_module,
-    gen_fp4_quantization_sm120_module,
-    gen_fp4_quantization_sm121_module,
-)
-from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
-from .jit.gdn import gen_gdn_prefill_sm90_module
-from .jit.fused_moe import (
-    gen_cutlass_fused_moe_sm120_module,
-    gen_cutlass_fused_moe_sm103_module,
-    gen_cutlass_fused_moe_sm100_module,
-    gen_cutlass_fused_moe_sm90_module,
-    gen_trtllm_gen_fused_moe_sm100_module,
-)
-from .jit.gemm import (
-    gen_gemm_module,
-    gen_gemm_sm90_module,
-    gen_fp8_blockscale_gemm_sm90_module,
-    gen_gemm_sm100_module,
-    gen_gemm_sm100_module_cutlass_fp4,
-    gen_gemm_sm100_module_cutlass_fp8,
-    gen_gemm_sm100_module_cutlass_mxfp8,
-    gen_tgv_gemm_sm10x_module,
-    gen_gemm_sm120_module,
-    gen_gemm_sm120_module_cutlass_fp4,
-    gen_trtllm_gen_gemm_module,
-    gen_trtllm_low_latency_gemm_module,
-)
-from .jit.spdlog import gen_spdlog_module
-from .jit.mla import gen_mla_module
-from .jit.mamba import (
-    gen_selective_state_update_module,
-    gen_selective_state_update_sm90_module,
-    gen_selective_state_update_sm100_module,
-)
-from .jit.norm import gen_norm_module
-from .jit.page import gen_page_module
-from .jit.quantization import gen_quantization_module
-from .jit.rope import gen_rope_module
-from .jit.sampling import gen_sampling_module
-from .jit.topk import gen_topk_module
-from .jit.tllm_utils import gen_trtllm_utils_module
-from .jit.xqa import gen_xqa_module, gen_xqa_module_mla
 from .jit.attention import (
     gen_batch_attention_module,
     gen_batch_decode_module,
@@ -89,10 +45,53 @@ from .jit.attention import (
     gen_single_prefill_module,
     gen_trtllm_gen_fmha_module,
 )
-from .jit import JitSpec, build_jit_specs
-from .jit import env as jit_env
+from .jit.cascade import gen_cascade_module
 from .jit.cpp_ext import get_cuda_version
-from .compilation_context import CompilationContext
+from .jit.fp4_quantization import (
+    gen_fp4_quantization_sm90_module,
+    gen_fp4_quantization_sm100_module,
+    gen_fp4_quantization_sm103_module,
+    gen_fp4_quantization_sm110_module,
+    gen_fp4_quantization_sm120_module,
+    gen_fp4_quantization_sm121_module,
+)
+from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
+from .jit.fused_moe import (
+    gen_cutlass_fused_moe_sm90_module,
+    gen_cutlass_fused_moe_sm100_module,
+    gen_cutlass_fused_moe_sm103_module,
+    gen_cutlass_fused_moe_sm120_module,
+    gen_trtllm_gen_fused_moe_sm100_module,
+)
+from .jit.gdn import gen_gdn_prefill_sm90_module
+from .jit.gemm import (
+    gen_fp8_blockscale_gemm_sm90_module,
+    gen_gemm_module,
+    gen_gemm_sm90_module,
+    gen_gemm_sm100_module,
+    gen_gemm_sm100_module_cutlass_fp4,
+    gen_gemm_sm100_module_cutlass_fp8,
+    gen_gemm_sm100_module_cutlass_mxfp8,
+    gen_gemm_sm120_module,
+    gen_gemm_sm120_module_cutlass_fp4,
+    gen_tgv_gemm_sm10x_module,
+    gen_trtllm_gen_gemm_module,
+    gen_trtllm_low_latency_gemm_module,
+)
+from .jit.mamba import (
+    gen_selective_state_update_module,
+    gen_selective_state_update_sm90_module,
+)
+from .jit.mla import gen_mla_module
+from .jit.norm import gen_norm_module
+from .jit.page import gen_page_module
+from .jit.quantization import gen_quantization_module
+from .jit.rope import gen_rope_module
+from .jit.sampling import gen_sampling_module
+from .jit.spdlog import gen_spdlog_module
+from .jit.tllm_utils import gen_trtllm_utils_module
+from .jit.topk import gen_topk_module
+from .jit.xqa import gen_xqa_module, gen_xqa_module_mla
 
 
 def gen_fa2(
@@ -520,11 +519,14 @@ def gen_all_modules(
             jit_specs.append(gen_fp4_quantization_sm121_module())
 
     if add_comm:
-        from .jit.comm import gen_trtllm_comm_module, gen_vllm_comm_module
-        from .jit.comm import gen_nvshmem_module
-        from .jit.comm import gen_comm_alltoall_module
-        from .jit.comm import gen_trtllm_mnnvl_comm_module
-        from .jit.comm import gen_moe_alltoall_module
+        from .jit.comm import (
+            gen_comm_alltoall_module,
+            gen_moe_alltoall_module,
+            gen_nvshmem_module,
+            gen_trtllm_comm_module,
+            gen_trtllm_mnnvl_comm_module,
+            gen_vllm_comm_module,
+        )
 
         jit_specs.append(gen_nvshmem_module())
         jit_specs.append(gen_comm_alltoall_module())
@@ -543,14 +545,43 @@ def gen_all_modules(
             gen_rope_module(),
             gen_sampling_module(),
             gen_topk_module(),
-            gen_selective_state_update_module(),
         ]
-        if has_sm90:
-            jit_specs.append(gen_selective_state_update_sm90_module())
+        # selective_state_update: one module per dtype combo per GPU arch
+        _ssu_dtype_combos = [
+            # (state,        input,          weight,         matrixA,      stateIndex)
+            (
+                torch.bfloat16,
+                torch.bfloat16,
+                torch.bfloat16,
+                torch.float32,
+                torch.int64,
+            ),
+            (torch.float32, torch.bfloat16, torch.bfloat16, torch.float32, torch.int64),
+        ]
+        _ssu_dims = [64]
+        _ssu_dstates = [128]
+        _ssu_ntokens = [1, 4, 6, 8]
+        for dtype_combo, dim, dstate, ntokens in product(
+            _ssu_dtype_combos, _ssu_dims, _ssu_dstates, _ssu_ntokens
+        ):
+            jit_specs.append(
+                # false positive: mypy can't resolve the signature because flashinfer.jit deps (filelock etc.)
+                # are absent in mypy's isolated env, causing it to infer an incorrect function signature
+                gen_selective_state_update_module(*dtype_combo, dim, dstate, ntokens)  # type: ignore[call-arg]
+            )
+        if has_sm90 or has_sm100:
+            for dtype_combo, dim, dstate, ntokens in product(
+                _ssu_dtype_combos, _ssu_dims, _ssu_dstates, _ssu_ntokens
+            ):
+                jit_specs.append(
+                    # same false positive as above
+                    gen_selective_state_update_sm90_module(  # type: ignore[call-arg]
+                        *dtype_combo, dim, dstate, ntokens
+                    )
+                )
             jit_specs.append(gen_trtllm_utils_module())
+        if has_sm90:
             jit_specs.append(gen_gdn_prefill_sm90_module())
-        if has_sm100:
-            jit_specs.append(gen_selective_state_update_sm100_module())
 
     if (
         add_xqa and get_cuda_version() > Version("12.8")

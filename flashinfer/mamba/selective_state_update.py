@@ -23,40 +23,61 @@ from ..api_logging import flashinfer_api
 from ..jit.mamba import (
     gen_selective_state_update_module,
     gen_selective_state_update_sm90_module,
-    gen_selective_state_update_sm100_module,
 )
 from ..utils import get_compute_capability, register_custom_op, register_fake_op
 
 
 @functools.cache
-def get_selective_state_update_module_base():
-    """Get cached JIT-compiled selective_state_update module (base version)."""
-    return gen_selective_state_update_module().build_and_load()
-
-
-@functools.cache
-def get_selective_state_update_module_sm90():
-    """Get cached JIT-compiled selective_state_update module (SM90/Hopper version)."""
-    return gen_selective_state_update_sm90_module().build_and_load()
-
-
-@functools.cache
-def get_selective_state_update_module_sm100():
-    """Get cached JIT-compiled selective_state_update module (SM100+/Blackwell version)."""
-    return gen_selective_state_update_sm100_module().build_and_load()
-
-
-def get_selective_state_update_module(device: torch.device):
-    major, _ = get_compute_capability(device)
-    if major >= 10:
-        # SM100+ (Blackwell and newer) uses horizontal producer-consumer kernel
-        return get_selective_state_update_module_sm100()
-    elif major == 9:
-        # SM90 (Hopper) uses vertical producer-consumer kernel
-        return get_selective_state_update_module_sm90()
+def _get_module(
+    state_dtype: torch.dtype,
+    input_dtype: torch.dtype,
+    weight_dtype: torch.dtype,
+    matrixA_dtype: torch.dtype,
+    stateIndex_dtype: torch.dtype,
+    dim: int,
+    dstate: int,
+    ntokens_mtp: int,
+    sm_major: int,
+):
+    args = (
+        state_dtype,
+        input_dtype,
+        weight_dtype,
+        matrixA_dtype,
+        stateIndex_dtype,
+        dim,
+        dstate,
+        ntokens_mtp,
+    )
+    if sm_major >= 9:
+        return gen_selective_state_update_sm90_module(*args).build_and_load()
     else:
-        # Pre-Hopper uses simple kernel
-        return get_selective_state_update_module_base()
+        return gen_selective_state_update_module(*args).build_and_load()
+
+
+def get_selective_state_update_module(
+    device: torch.device,
+    state_dtype: torch.dtype,
+    input_dtype: torch.dtype,
+    weight_dtype: torch.dtype,
+    matrixA_dtype: torch.dtype,
+    stateIndex_dtype: torch.dtype,
+    dim: int,
+    dstate: int,
+    ntokens_mtp: int,
+):
+    major, _ = get_compute_capability(device)
+    return _get_module(
+        state_dtype,
+        input_dtype,
+        weight_dtype,
+        matrixA_dtype,
+        stateIndex_dtype,
+        dim,
+        dstate,
+        ntokens_mtp,
+        major,
+    )
 
 
 @flashinfer_api
@@ -78,6 +99,7 @@ def selective_state_update(
     intermediate_states_buffer: Optional[torch.Tensor] = None,
     intermediate_state_indices: Optional[torch.Tensor] = None,
     cache_steps: int = 0,
+    algorithm: str = "auto",
 ) -> torch.Tensor:
     r"""Selective state update operation for Mamba layers (the generation phase).
 
@@ -126,6 +148,10 @@ def selective_state_update(
         with shape (batch,)
     cache_steps : int
         Number of steps/tokens to cache for speculative decoding
+    algorithm : str
+        Algorithm to use: "auto" (default, picks the best kernel based on GPU arch,
+        data types, and problem size), "simple" (all GPUs), "vertical" and "horizontal"
+        (SM90+ only). MTP mode only supports "auto" or "simple".
 
     Returns
     -------
@@ -178,6 +204,30 @@ def selective_state_update(
         output = torch.empty_like(x)
     else:
         output = out
+
+    # Determine stateIndex dtype from index tensors, default to int32
+    stateIndex_dtype = torch.int32
+    if state_batch_indices is not None:
+        stateIndex_dtype = state_batch_indices.dtype
+    elif intermediate_state_indices is not None:
+        stateIndex_dtype = intermediate_state_indices.dtype
+
+    # Extract dim/dstate/ntokens for JIT specialization
+    dim = state.size(2)
+    dstate = state.size(3)
+    ntokens_mtp = x.size(1) if x.dim() == 4 else 1
+
+    if algorithm == "auto":
+        algorithm_int = 0
+    elif algorithm == "simple":
+        algorithm_int = 1
+    elif algorithm == "vertical":
+        algorithm_int = 2
+    elif algorithm == "horizontal":
+        algorithm_int = 3
+    else:
+        raise ValueError(f"Unknown algorithm: {algorithm}")
+
     _selective_state_update(
         state,
         x,
@@ -196,6 +246,15 @@ def selective_state_update(
         intermediate_states_buffer,
         intermediate_state_indices,
         cache_steps,
+        algorithm_int,
+        state.dtype,
+        x.dtype,
+        dt.dtype,
+        A.dtype,
+        stateIndex_dtype,
+        dim,
+        dstate,
+        ntokens_mtp,
     )
     return output
 
@@ -222,9 +281,28 @@ def _selective_state_update(
     intermediate_states_buffer: Optional[torch.Tensor],
     intermediate_state_indices: Optional[torch.Tensor],
     cache_steps: int,
+    algorithm: int,
+    state_dtype: torch.dtype,
+    input_dtype: torch.dtype,
+    weight_dtype: torch.dtype,
+    matrixA_dtype: torch.dtype,
+    stateIndex_dtype: torch.dtype,
+    dim: int,
+    dstate: int,
+    ntokens_mtp: int,
 ) -> None:
     """Internal function registered with torch.library for torch.compile() support."""
-    get_selective_state_update_module(state.device).selective_state_update(
+    get_selective_state_update_module(
+        state.device,
+        state_dtype,
+        input_dtype,
+        weight_dtype,
+        matrixA_dtype,
+        stateIndex_dtype,
+        dim,
+        dstate,
+        ntokens_mtp,
+    ).selective_state_update(
         state,
         x,
         dt,
@@ -242,6 +320,7 @@ def _selective_state_update(
         intermediate_states_buffer,
         intermediate_state_indices,
         cache_steps,
+        algorithm,
     )
 
 
@@ -264,6 +343,15 @@ def _selective_state_update_fake(
     intermediate_states_buffer: Optional[torch.Tensor],
     intermediate_state_indices: Optional[torch.Tensor],
     cache_steps: int,
+    algorithm: int,
+    state_dtype: torch.dtype,
+    input_dtype: torch.dtype,
+    weight_dtype: torch.dtype,
+    matrixA_dtype: torch.dtype,
+    stateIndex_dtype: torch.dtype,
+    dim: int,
+    dstate: int,
+    ntokens_mtp: int,
 ) -> None:
     """Fake implementation for torch.compile() meta tensor propagation."""
     pass

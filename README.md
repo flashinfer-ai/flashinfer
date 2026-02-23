@@ -36,6 +36,7 @@ High-Performance GPU Kernels for Inference
 - **POD-Attention**: Fused prefill+decode for mixed batching
 
 ### GEMM & Linear Operations
+- **BF16 GEMM**: BF16 matrix multiplication for SM10.0+ GPUs.
 - **FP8 GEMM**: Per-tensor and groupwise scaling
 - **FP4 GEMM**: NVFP4 and MXFP4 matrix multiplication for Blackwell GPUs
 - **Grouped GEMM**: Efficient batched matrix operations for LoRA and multi-expert routing
@@ -139,6 +140,11 @@ python -m pip install -v .
 ```bash
 python -m pip install --no-build-isolation -e . -v
 ```
+
+> **Note:** When using `--no-build-isolation`, pip does not automatically install build dependencies. FlashInfer requires `setuptools>=77`. If you encounter an error like `AttributeError: module 'setuptools.build_meta' has no attribute 'prepare_metadata_for_build_editable'`, upgrade pip and setuptools first:
+> ```bash
+> python -m pip install --upgrade pip setuptools
+> ```
 
 Build optional packages:
 
