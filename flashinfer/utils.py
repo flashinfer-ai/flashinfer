@@ -514,10 +514,7 @@ def determine_attention_backend(
         dtype_kv,
     ):
         return "fa3"
-    if (
-        kv_layout == "NHD"
-        and _is_cudnn_available_for_attention()
-    ):
+    if kv_layout == "NHD" and _is_cudnn_available_for_attention():
         return "cudnn"
     return "fa2"
 
