@@ -337,6 +337,12 @@ void fmha_v2_run(
   // Get device properties
   CudaDevice device;
   int sm = device.sm;
+  // Map SM12x variants (e.g. SM121 on DGX Spark) to base SM120 for kernel dispatch.
+  // CudaDevice computes sm = major*10 + minor, but all SM12x share the same Ampere-era
+  // MMA instructions and dispatch entries are generated for sm==120.
+  if (sm > 120 && sm < 130) {
+    sm = 120;
+  }
   cudaDeviceProp props = device.props;
 
   cudaStream_t stream = static_cast<cudaStream_t>(get_stream(q.device()));

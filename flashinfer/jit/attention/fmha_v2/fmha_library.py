@@ -91,28 +91,26 @@ class FMHAv2KernelSpec:
 
 
 def select_ldgsts(sm: int, warp_specialization: bool, head_size: int, dtype: str):
-    # TODO(jimmyzho): Implement this
+    if warp_specialization:
+        return (False, False, False)
+    elif sm == 120:
+        if dtype in ["fp16", "bf16"]:
+            # Need ldgsts (cp.async) for head_size > 64 to enable the tiled noloop
+            # kernel which handles RELOAD_Q (D > CTA_P_TILE_K=64).
+            if head_size <= 64:
+                return (False, False, False)
+            ldgsts_q = True
+            ldgsts_k = True
+            ldgsts_v = True
+            if head_size >= 256:
+                ldgsts_k = False
+                ldgsts_v = False
+            if head_size > 256:
+                ldgsts_q = False
+            return (ldgsts_q, ldgsts_k, ldgsts_v)
+        elif dtype == "e4m3":
+            return (False, False, False)
     return (False, False, False)
-    # if warp_specialization:
-    #     return (False, False, False)
-    # elif sm == 120:)
-    #     if dtype == "fp16":
-    #         # tune ldgsts
-    #         ldgsts_q = True
-    #         ldgsts_k = True
-    #         ldgsts_v = True
-    #         if head_size >= 256:
-    #             ldgsts_k = False
-    #             ldgsts_v = False
-    #         if head_size > 256:
-    #             ldgsts_q = False
-    #             ldgsts_k = False
-    #             ldgsts_v = False
-    #     elif dtype == "e4m3":
-    #         pass
-    #     return (ldgsts_q, ldgsts_k, ldgsts_v)
-    # else:
-    #     raise ValueError(f"Unsupported SM version: {sm}")
 
 
 def generate_kernel_spec(
@@ -215,15 +213,15 @@ def generate_kernel_spec(
         spec["sm_mma"] = 80
         spec["has_noloop"] = 1
         spec["noloop_step"] = 64
-        spec["loop_step"] = 128 if head_size <= 64 else 64
+        spec["loop_step"] = 64
 
         if dtype in ["fp16", "bf16"]:
             if head_size <= 64:
-                q_loop_step = 128
-                spec["kv_loop_step"] = 128
+                q_loop_step = 64
+                spec["kv_loop_step"] = 64
             elif head_size <= 256:
                 q_loop_step = 64
-                spec["kv_loop_step"] = 128
+                spec["kv_loop_step"] = 64
             elif head_size <= 512:
                 q_loop_step = 64
                 # kv_loop_step uses class default 64
@@ -231,15 +229,17 @@ def generate_kernel_spec(
                 raise ValueError(f"Unsupported head size: {head_size}")
             spec["noloop_step"] = q_loop_step
             spec["loop_step"] = q_loop_step
-            spec["tiled"] = 1  # Class default is 0
+            # Granular tiling: runtime sets use_granular_tiling=true for SM>=80
+            # flash attention, so we must generate _nl_tiled dispatch entries.
+            spec["tiled"] = 1
         elif dtype == "e4m3":
             if is_mla:
                 # MLA kernels (TODO)
                 pass
             else:
                 if head_size <= 64:
-                    q_loop_step = 128
-                    spec["kv_loop_step"] = 128
+                    q_loop_step = 64
+                    spec["kv_loop_step"] = 64
                 elif head_size <= 256:
                     q_loop_step = 64
                     spec["kv_loop_step"] = 32
@@ -588,6 +588,10 @@ def get_kernel_code(kspec, kname, lname):
 
             tmp["MAX_STGS_PER_LOOP"] = MAX_STGS_PER_LOOP
             tmp["use_multi_cta"] = False
+            # RELOAD_Q is needed when D > CTA_P_TILE_K (64 for D >= 64 with
+            # granular tiling). The tiled noloop kernel handles this correctly
+            # but requires ldgsts (cp.async).
+            tmp["reload_q"] = kspec.tiled and kspec.head_size > 64
             code = template.render(tmp)
         else:
             with open(template_dir / "kernel.jinja", "r") as f:
@@ -1187,6 +1191,25 @@ def generate_jit_sources(
         output_dtype_values,
     )
 
+    # SM120 uses Ampere-era mma.sync (sm_mma=80) with flash attention.
+    # No warp specialization (no WGMMA), no skip-softmax.
+    # Head sizes restricted to 64-256 (kernel_traits CTA tile decomposition
+    # requires d >= 64 for flash attention on SM80 instruction set).
+    head_size_qk_sm120_values = [64, 128, 256]
+    sm120_configs: itertools.product = itertools.product(
+        [120],
+        dtype_values,
+        head_size_qk_sm120_values,
+        head_size_v_values,
+        enable_attn_logit_softcapping_values,
+        return_softmax_values,
+        [False],  # no skip-softmax without warp specialization
+        alibi_values,
+        is_mla_values,
+        input_layout_values,
+        output_dtype_values,
+    )
+
     other_configs: itertools.product = itertools.product(
         [],
         dtype_values,
@@ -1201,7 +1224,7 @@ def generate_jit_sources(
         output_dtype_values,
     )
 
-    for config_list in [warp_spec_configs, other_configs]:
+    for config_list in [warp_spec_configs, sm120_configs, other_configs]:
         for (
             sm_iter,
             dtype_iter,
