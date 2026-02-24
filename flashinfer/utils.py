@@ -464,6 +464,17 @@ def is_cutlass_backend_supported(
     return True
 
 
+@functools.lru_cache(maxsize=1)
+def _is_cute_dsl_available() -> bool:
+    """Check if nvidia-cutlass-dsl is available for CuTe DSL backends."""
+    try:
+        import cutlass.cute  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
 def determine_attention_backend(
     device: torch.device,
     pos_encoding_mode: int,
@@ -505,6 +516,15 @@ def determine_attention_backend(
         dtype_kv,
     ):
         return "fa3"
+    elif (
+        (is_sm120a_supported(device) or is_sm121a_supported(device))
+        and not use_custom_mask
+        and pos_encoding_mode == PosEncodingMode.NONE.value
+        and dtype_q in {torch.float16, torch.bfloat16}
+        and dtype_kv in {torch.float16, torch.bfloat16}
+        and _is_cute_dsl_available()
+    ):
+        return "cute_dsl"
     else:
         return "fa2"
 
