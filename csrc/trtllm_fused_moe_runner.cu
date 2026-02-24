@@ -517,6 +517,9 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
 
 std::tuple<int32_t, int32_t> Runner::getWorkspaceSizeInBytes(MoERunnerArgs const& args,
                                                              int64_t configIndex) const {
+  FLASHINFER_CHECK(configIndex >= 0 && configIndex < static_cast<int64_t>(mPassingConfigs.size()),
+                   "Invalid MoE config index ", configIndex, ", valid range is [0, ",
+                   static_cast<int64_t>(mPassingConfigs.size()) - 1, "].");
   auto const& config = mPassingConfigs[configIndex];
 
   auto workspace_size_fc1 = static_cast<int32_t>(mPermuteGemm1.getWorkspaceSizeInBytes(
@@ -567,6 +570,9 @@ int64_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize,
 
 void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int device,
                  cudaStream_t stream, int64_t configIndex, bool enable_pdl) {
+  FLASHINFER_CHECK(configIndex >= 0 && configIndex < static_cast<int64_t>(mPassingConfigs.size()),
+                   "Invalid MoE config index ", configIndex, ", valid range is [0, ",
+                   static_cast<int64_t>(mPassingConfigs.size()) - 1, "].");
   // Setup all operation data
   moe::dev::activation::Data activationData;
   moe::dev::finalize::Data finalizeData;

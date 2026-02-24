@@ -42,7 +42,8 @@ void selective_state_update(
     bool disable_state_update,
     Optional<TensorView> intermediate_states_buffer,  // (batch, cache_steps, nheads, dim, dstate)
     Optional<TensorView> intermediate_state_indices,  // (batch,)
-    int64_t cache_steps);
+    int64_t cache_steps,
+    int64_t algorithm);  // SSUAlgorithm: 0=auto, 1=simple, 2=vertical, 3=horizontal
 
 }  // namespace flashinfer::mamba
 
