@@ -325,10 +325,13 @@ def tinygemm_bf16(
 ) -> None:
     """SM90+ optimized small GEMM: out = input @ weight.T + bias (equivalent to F.linear).
 
-    Uses TMA (CUtensorMap) for async bulk data loads and mma.sync.aligned.m16n8k16
-    tensor core instructions with BF16 input/weight/bias/output and FP32 internal
-    accumulation. Optimized for small batch sizes with 384 threads (4 compute + 8 DMA
-    warps), 16 pipeline stages, and 4x stage unroll.
+    A latency-optimized, warp-specialized GEMM designed for tiny batch sizes (ideally
+    1-8 rows, where a single TILE_N=8 tile covers the entire batch dimension) using
+    Ampere-style HMMA instructions. Uses TMA for async bulk data loads and
+    mma.sync.aligned.m16n8k16 tensor core instructions with BF16 input/weight/bias/output
+    and FP32 internal accumulation. The warp-specialized design (384 threads: 4 compute +
+    8 DMA warps) with 16 pipeline stages and 4x stage unroll trades off peak throughput
+    in favor of minimal latency.
 
     From TensorRT-LLM tinygemm2 kernel.
 
