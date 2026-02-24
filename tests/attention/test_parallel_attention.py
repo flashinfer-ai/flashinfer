@@ -11,13 +11,14 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from flashinfer.parallel_attention.parallel_attention import ParallelAttention
-from flashinfer.parallel_attention.parallel_config import (
+from flashinfer.utils import get_compute_capability, is_sm90a_supported
+from flashinfer.parallel_attention import (
     AttnParallelConfig,
     UnevenCPConfig,
     VarlenCPConfig,
+    ParallelAttention,
+    split_varlen_input,
 )
-from flashinfer.parallel_attention.utils import split_varlen_input
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────
@@ -45,6 +46,15 @@ def rank():
 @pytest.fixture
 def device(rank):
     return torch.device(f"cuda:{rank}")
+
+
+@pytest.fixture(autouse=True)
+def skip_if_unsupported(request):
+    """Skip test if the attention backend requires unsupported hardware."""
+    attn_type = request.node.callspec.params.get("attn_type", None)
+    if attn_type == "flash-attn3" and not is_sm90a_supported(torch.device("cuda")):
+        cc = get_compute_capability(torch.device("cuda"))
+        pytest.skip(f"flash-attn3 requires SM90a+, got {cc}")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────

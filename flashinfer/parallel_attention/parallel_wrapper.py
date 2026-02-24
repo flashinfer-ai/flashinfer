@@ -260,6 +260,11 @@ def ulysses_wrapper(func):
         uneven_cp_config = self.uneven_cp_config
         varlen_cp_config = self.varlen_cp_config
 
+        if kwargs.get("return_lse", False):
+            raise ValueError(
+                "return_lse=True is not supported in parallel attention"
+            )
+
         if attn_parallel_config.ulysses_size() == 1:
             return func(
                 self, query, key, value, tensor_layout, attn_mask, **kwargs
@@ -410,12 +415,11 @@ def ring_wrapper(func):
 
         # Determine sequence dimension based on tensor layout
         if tensor_layout == "HND":
-            seq_dim = 1  # kv_inputs is [2, H, S, D], so seq_dim is 2
+            seq_dim = 1  # query, key, value shape are: [H, S, D], so seq_dim is 1
         elif tensor_layout == "NHD":
-            seq_dim = 0  # kv_inputs is [2, S, H, D], so seq_dim is 1
+            seq_dim = 0  # query, key, value shape are: [S, H, D], so seq_dim is 0
         else:
-            # Default to dimension 2 for backward compatibility
-            seq_dim = 1
+            raise ValueError(f"Invalid tensor layout: {tensor_layout}")
 
         p2p_comm_buffers = [None, None]
         p2p_comm_buffers[0] = torch.cat(
@@ -519,8 +523,7 @@ def ring_wrapper(func):
         elif tensor_layout == "NHD":
             out_seq_dim = 0  # out is [S, H, D], so seq_dim is 0
         else:
-            # Default to dimension 1 for backward compatibility
-            out_seq_dim = 1
+            raise ValueError(f"Invalid tensor layout: {tensor_layout}")
 
         start_pos = out.shape[out_seq_dim]
 

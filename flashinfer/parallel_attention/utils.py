@@ -39,26 +39,30 @@ def convert_output_layout(out, src_layout, dst_layout):
 def split_varlen_input(
     tensor, seq_len_list, world_size, rank, tensor_layout="HND"
 ):
-    """Split a concatenated variable-length tensor into equal chunks across ranks.
+    """Split a packed variable-length tensor across ranks for context parallelism.
 
-    Given a tensor of shape [total_seq_len, head_num, head_dim] where total_seq_len
-    is the sum of multiple sub-sequences, split each sub-sequence into `world_size`
-    parts and return the `rank`-th chunk concatenated together.
-    For each sub-sequence, the first (world_size - 1) ranks each get
-    ceil(seq_len / world_size) elements, and the last rank gets whatever
-    remains.
+    Given a tensor whose sequence dimension is the concatenation of multiple
+    sub-sequences, split each sub-sequence into ``world_size`` chunks and return
+    the ``rank``-th chunk concatenated together. The first ``world_size - 1``
+    ranks each get ``ceil(seq_len / world_size)`` tokens per sub-sequence;
+    the last rank gets the remainder. The result is zero-padded so that all
+    ranks have the same total sequence length.
 
     Args:
-        tensor: Tensor of shape [total_seq_len, head_num, head_dim].
-        seq_len_list: List of individual sequence lengths that sum to
-                  total_seq_len, e.g. [1021, 1024, 1027].
-        world_size: Number of ranks to split into.
-        rank: Which chunk to return (0-indexed).
+        tensor: Input tensor of shape ``[H, total_seq_len, D]`` (HND) or
+            ``[total_seq_len, H, D]`` (NHD).
+        seq_len_list: Individual sequence lengths that sum to ``total_seq_len``,
+            e.g. ``[1021, 1024, 1027]``. Can be a list, tuple, or torch.Tensor.
+        world_size: Number of ranks to split across.
+        rank: Which rank's chunk to return (0-indexed).
+        tensor_layout: ``"HND"`` or ``"NHD"``.
 
     Returns:
-        A tensor of shape [chunk_seq_len, head_num, head_dim] where chunk_seq_len
-        is the sum of the rank-th chunk of every sub-sequence.
+        torch.Tensor: The rank's chunk, zero-padded to uniform length across ranks.
     """
+    if not isinstance(seq_len_list, torch.Tensor):
+        seq_len_list = torch.tensor(seq_len_list, dtype=torch.int32)
+
     if tensor_layout == "NHD":
         chunk_dim = 0
     elif tensor_layout == "HND":
@@ -66,12 +70,10 @@ def split_varlen_input(
     else:
         raise ValueError(f"Invalid tensor layout: {tensor_layout}")
 
-    seq_len_padded = (
-        torch.ceil(seq_len_list / world_size).to(torch.int32) * world_size
-    )
+    seq_len_padded = (seq_len_list + world_size - 1) // world_size * world_size
     total_seq_len_padded = sum(seq_len_padded)
-    seq_len_padded_cur_rank = torch.ceil(
-        total_seq_len_padded / world_size
+    seq_len_padded_cur_rank = (
+        (total_seq_len_padded + world_size - 1) // world_size
     ).to(torch.int32)
 
     chunks = []
@@ -80,7 +82,7 @@ def split_varlen_input(
         seq_len = int(seq_len)
         # First (world_size - 1) ranks get ceil(seq_len / world_size),
         # last rank gets whatever is left.
-        base = math.ceil(seq_len / world_size)
+        base = (seq_len + world_size - 1) // world_size
         if rank < world_size - 1:
             chunk_len = base
             start = offset + base * rank

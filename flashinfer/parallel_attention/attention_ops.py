@@ -87,6 +87,9 @@ class FlashAttn3:
                 query, key, value, src_layout="HND", dst_layout="NHD"
             )
 
+        if attn_mask is not None:
+            raise NotImplementedError("FlashAttn3 does not support attn_mask yet")
+
         # FA3 only supports float16 and bfloat16
         origin_dtype = query.dtype
         if query.dtype not in [torch.float16, torch.bfloat16]:

@@ -39,14 +39,6 @@ class AttnParallelConfig:
             self._cached_device_mesh = {}
             self.set_device_mesh()
 
-    def __del__(self):
-        """Cleanup distributed process group when the config is destroyed."""
-        if hasattr(self, "_device_mesh") and self._device_mesh is not None:
-            if dist.is_initialized():
-                logger.info(
-                    f"[{self.__class__.__name__}] Cleaning up distributed process group"
-                )
-                dist.destroy_process_group()
 
     def set_device_mesh(
         self, device_type: str = "cuda"
@@ -144,16 +136,7 @@ class AttnParallelConfig:
 
         return self._device_mesh
 
-    @classmethod
-    def device_mesh(cls) -> Optional[torch.distributed.DeviceMesh]:
-        """Get the current device mesh.
 
-        Returns:
-            Optional[torch.distributed.DeviceMesh]: The current device mesh,
-                or None if not initialized
-        """
-        instance = cls.get_instance()
-        return instance._device_mesh
 
     @classmethod
     def get_group(cls, group_name: str) -> Optional[torch.distributed.ProcessGroup]:
@@ -196,18 +179,6 @@ class AttnParallelConfig:
         group = cls.get_group("ulysses")
         logger.debug(f"[{cls.__name__}] Retrieved Ulysses group: {group}")
         return group
-
-    @classmethod
-    def global_rank(cls) -> int:
-        """Get the global rank.
-
-        Returns:
-            int: global rank (0 to world_size-1)
-        """
-        if dist.is_initialized():
-            return dist.get_rank()
-        else:
-            return 0
 
     @classmethod
     def get_local_rank(cls, group_name: str) -> int:
@@ -283,18 +254,6 @@ class AttnParallelConfig:
         return cls._instances[cls]
 
     @classmethod
-    def clear_instance(cls) -> None:
-        """Clear the singleton instance of the configuration.
-
-        This method is mainly used for testing purposes.
-        """
-        if cls in cls._instances:
-            del cls._instances[cls]
-        if cls in cls._initialized:
-            del cls._initialized[cls]
-
-    @classmethod
-    @torch.compiler.disable
     def set_config(
         cls,
         ulysses_size: int = 1,
@@ -368,29 +327,6 @@ class AttnParallelConfig:
             )
         return True
 
-    def to_dict(self) -> dict:
-        """Convert the configuration to a dictionary.
-
-        Returns:
-            dict: Dictionary containing all parallel configurations
-        """
-        return {
-            "ulysses_size": self._ulysses_size,
-            "ring_size": self._ring_size,
-        }
-
-    @classmethod
-    def from_dict(cls, config_dict: dict) -> "AttnParallelConfig":
-        """Create a AttnParallelConfig instance from a dictionary.
-
-        Args:
-            config_dict (dict): Dictionary containing parallel configurations
-
-        Returns:
-            AttnParallelConfig: New instance with values from the dictionary
-        """
-        return cls(**config_dict)
-
     @classmethod
     def get_total_parallel_size(cls) -> int:
         """Calculate the total parallel size by multiplying all parallel degrees.
@@ -408,25 +344,6 @@ class AttnParallelConfig:
             f"  ring_size={self._ring_size}\n"
             f")"
         )
-
-    @classmethod
-    def check_process_groups(cls) -> bool:
-        """Check if all necessary process groups are properly initialized.
-
-        Returns:
-            bool: True if all necessary process groups are initialized,
-                False otherwise
-        """
-        instance = cls.get_instance()
-        if instance._device_mesh is None:
-            return False
-
-        if instance._ring_size > 1 and cls.ring_group() is None:
-            return False
-        if instance._ulysses_size > 1 and cls.ulysses_group() is None:
-            return False
-
-        return True
 
     @classmethod
     def ulysses_size(cls) -> int:
@@ -448,6 +365,24 @@ class AttnParallelConfig:
 
 
 class UnevenCPConfig:
+    """Configuration for uneven context parallelism.
+
+    Handles the case where the total sequence length is not evenly divisible
+    by the number of ranks. Each rank may hold a different number of tokens,
+    and the last rank typically gets fewer tokens (the remainder).
+
+    This config gathers per-rank sequence lengths via ``all_gather`` so that
+    the parallel wrappers know how to truncate padding and zero out extra
+    output positions.
+
+    Attributes:
+        seq_len: Actual (unpadded) total sequence length.
+        seq_len_padded: Padded total sequence length (divisible by world_size).
+        seq_len_all_ranks: Tensor of per-rank sequence lengths for all ranks.
+        seq_len_cur_ring_group: Tensor of per-rank sequence lengths within
+            the current ring group.
+    """
+
     def __init__(self):
         self.seq_len = None
         self.seq_len_padded = None
@@ -457,6 +392,15 @@ class UnevenCPConfig:
     def set_uneven_cp_config(
         self, seq_len, seq_len_padded, seq_len_cur_rank, attn_parallel_config
     ):
+        """Gather per-rank sequence lengths and compute the current ring group sequence length.
+
+        Args:
+            seq_len: Actual (unpadded) total sequence length.
+            seq_len_padded: Padded total sequence length (divisible by world_size).
+            seq_len_cur_rank: Number of real (non-padding) tokens on this rank. for example, if the total sequence 
+            length is 1023 and the world size is 8, and the rank is 0, then seq_len_cur_rank is 128. If the rank is 7, then seq_len_cur_rank is 127.
+            attn_parallel_config: The :class:`AttnParallelConfig` instance that provides ring/ulysses group information.
+        """
         self.seq_len = seq_len
         self.seq_len_padded = seq_len_padded
 
@@ -507,6 +451,43 @@ class UnevenCPConfig:
 
 
 class VarlenCPConfig:
+    """Configuration for variable-length context parallelism.
+
+    Handles the case where multiple sequences of different lengths are packed
+    together (varlen). Cumulative sequence length arrays
+    (``cu_seqlens``) are computed so that the attention kernel can correctly
+    identify sequence boundaries.
+
+    Supports two modes (mutually exclusive):
+
+    - **Ulysses-only** (``ring_size == 1``): The packed sequences are treated
+      as a whole and split across heads via all-to-all. No per-sequence
+      splitting is needed — only the overall ``cu_seqlens`` are stored so the
+      attention kernel knows where each sequence starts and ends.
+    - **Ring-only** (``ulysses_size == 1``): Each individual sequence is split
+      across ranks along the sequence dimension. ``cu_seqlens`` are stored as
+      a 2D tensor of shape ``[ring_size, num_seqs + 1]``, one row per rank,
+      because each rank holds a different slice of every sequence.
+
+    Attributes:
+        cu_seqlens_q_cur_ulysses_group: Cumulative query sequence lengths for
+            the current ulysses group (shared across all ulysses ranks).
+        cu_seqlens_kv_cur_ulysses_group: Cumulative key/value sequence lengths
+            for the current ulysses group.
+        max_seq_len_q_cur_ulysses_group: Max query sequence length in the
+            current ulysses group.
+        max_seq_len_kv_cur_ulysses_group: Max key/value sequence length in the
+            current ulysses group.
+        cu_seqlens_q_cur_ring_group: Cumulative query sequence lengths for all
+            ranks in the current ring group, shape ``[ring_size, num_seqs + 1]``.
+        cu_seqlens_kv_cur_ring_group: Cumulative key/value sequence lengths for
+            all ranks in the current ring group.
+        max_seq_len_q_cur_ring_group: Max query sequence length across all
+            ranks in the ring group (per-rank padded length).
+        max_seq_len_kv_cur_ring_group: Max key/value sequence length across all
+            ranks in the ring group (per-rank padded length).
+    """
+
     def __init__(self):
         self.cu_seqlens_q_cur_ulysses_group = None
         self.cu_seqlens_kv_cur_ulysses_group = None
@@ -573,21 +554,24 @@ class VarlenCPConfig:
     def set_ring_varlen_config(
         self, seq_lens_q, seq_lens_kv, attn_parallel_config
     ):
+        if not isinstance(seq_lens_q, torch.Tensor):
+            seq_lens_q = torch.tensor(seq_lens_q, dtype=torch.int32)
+        if not isinstance(seq_lens_kv, torch.Tensor):
+            seq_lens_kv = torch.tensor(seq_lens_kv, dtype=torch.int32)
+
         world_size = torch.distributed.get_world_size()
         rank = torch.distributed.get_rank()
         device = torch.device(f"cuda:{rank}")
 
         padded_seq_lens_q = (
-            torch.ceil(seq_lens_q / world_size) * world_size
+            (seq_lens_q + world_size - 1) // world_size * world_size
         )
         padded_seq_lens_kv = (
-            torch.ceil(seq_lens_kv / world_size) * world_size
+            (seq_lens_kv + world_size - 1) // world_size * world_size
         )
 
-        padded_seq_len_q_cur_rank = torch.floor(padded_seq_lens_q / world_size)
-        padded_seq_len_kv_cur_rank = torch.floor(
-            padded_seq_lens_kv / world_size
-        )
+        padded_seq_len_q_cur_rank = padded_seq_lens_q // world_size
+        padded_seq_len_kv_cur_rank = padded_seq_lens_kv // world_size
 
         max_seq_len_q = padded_seq_len_q_cur_rank.max()
         max_seq_len_kv = padded_seq_len_kv_cur_rank.max()
