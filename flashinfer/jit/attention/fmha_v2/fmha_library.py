@@ -760,8 +760,10 @@ if( data_type == {data_type} && output_data_type == {output_data_type} && s == {
     {il_check}) {{
 
     {unroll_check} {{
+        if (fmha_v2_verbose) printf("[FMHAv2] kernel: {lname}\\n");
         {lname}(params, launch_params, stream);
     }} else {{
+        if (fmha_v2_verbose) printf("[FMHAv2] kernel: {lname}_nl\\n");
         {lname}_nl(params, launch_params, stream);
     }}
 
@@ -783,6 +785,7 @@ if( data_type == {data_type} && output_data_type == {output_data_type} && s == {
 if( data_type == {data_type} && output_data_type == {output_data_type} && d == {head_size} && dv == {dv} && sm == {sm}
     {il_check} && use_tiled) {{
 
+    if (fmha_v2_verbose) printf("[FMHAv2] kernel: {lname}_nl_tiled\\n");
     {lname}_nl_tiled(params, launch_params, stream);
 }} """.format(  # type: ignore[str-format]
                     **asdict(kspec),
@@ -799,6 +802,7 @@ if( data_type == {data_type} && output_data_type == {output_data_type} && d == {
 if( data_type == {data_type} && output_data_type == {output_data_type} && d == {head_size} && dv == {dv} && sm == {sm}
     {il_check}) {{
 
+    if (fmha_v2_verbose) printf("[FMHAv2] kernel: {lname}\\n");
     {lname}(params, launch_params, stream);
 }} """.format(  # type: ignore[str-format]
                     **asdict(kspec),
@@ -814,6 +818,7 @@ if( data_type == {data_type} && output_data_type == {output_data_type} && d == {
 if( data_type == {data_type} && output_data_type == {output_data_type} && d == {head_size} && dv == {dv} && sm == {sm}
     && !use_tiled {il_check}) {{
 
+    if (fmha_v2_verbose) printf("[FMHAv2] kernel: {lname}_nl\\n");
     {lname}_nl(params, launch_params, stream);
 }} """.format(  # type: ignore[str-format]
                     **asdict(kspec),
@@ -829,6 +834,7 @@ if( data_type == {data_type} && output_data_type == {output_data_type} && d == {
 if( data_type == {data_type} && output_data_type == {output_data_type} && s == {slen} && d == {head_size} && sm == {sm}
     {il_check}) {{
 
+    if (fmha_v2_verbose) printf("[FMHAv2] kernel: {lname}\\n");
     {lname}(params, launch_params, stream);
 }} """.format(
                 **asdict(kspec),
@@ -988,6 +994,8 @@ if( data_type == {data_type} && s == {slen} && d == {head_size} && use_multi_cta
 
 
 #include <cuda.h>
+#include <cstdlib>
+#include <cstdio>
 #include <fused_multihead_attention.h>
 #include <fused_multihead_cross_attention.h>
 #include <tuple>
@@ -1050,6 +1058,8 @@ const bool enable_skip_softmax               = launch_params.enable_skip_softmax
 const int  attention_input_layout            = static_cast<int>(launch_params.attention_input_layout);
 // tiled variant uses ldgsts
 const bool  use_tiled            = launch_params.use_granular_tiling;
+
+static const bool fmha_v2_verbose = (std::getenv("FLASHINFER_FMHA_V2_VERBOSE") != nullptr);
 
 {calls_v2}
 else {{

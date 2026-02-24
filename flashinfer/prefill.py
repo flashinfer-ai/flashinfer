@@ -3905,7 +3905,6 @@ def trtllm_fmha_v2_prefill(
     mask_mode: Optional[str] = "causal",
     window_left: Optional[int] = -1,
     chunked_attention_size: Optional[int] = 0,
-    non_blocking: Optional[bool] = True,
     save_softmax_stats: Optional[bool] = False,
     skip_softmax_threshold_scale_factor: Optional[float] = 0,
 ) -> torch.Tensor:
@@ -3973,8 +3972,6 @@ def trtllm_fmha_v2_prefill(
     chunked_attention_size : Optional[int]
         The chunked attention size. Defaults to ``0``, which means no chunked attention.
         Only effective when :attr:`mask_mode` is ``chunked``. Must be a power of 2.
-    non_blocking : Optional[bool]
-        Whether to copy the input tensors to the device asynchronously. Defaults to ``True``.
     save_softmax_stats : Optional[bool]
         Whether to save the softmax statistics. Defaults to ``False``.
     skip_softmax_threshold_scale_factor: Optional[float]
@@ -4115,15 +4112,14 @@ def trtllm_fmha_v2_prefill(
         query.dtype,
         o_dtype if query.dtype == torch.float8_e4m3fn else None,
     )
-    total_q_tokens = int(cum_seq_lens_q[-1].item())
-    total_kv_tokens = int(cum_seq_lens_kv[-1].item())
 
     # Allocate LSE tensor if saving softmax stats
     # Kernel writes in ragged (flat) format: [total_q_tokens, num_qo_heads, 2]
+    # total_q_tokens == query.shape[0] for all ragged layouts
     lse = None
     if save_softmax_stats:
         lse = torch.empty(
-            (total_q_tokens, num_qo_heads, 2),
+            (query.shape[0], num_qo_heads, 2),
             dtype=torch.float32,
             device=query.device,
         )
@@ -4154,12 +4150,10 @@ def trtllm_fmha_v2_prefill(
         seq_lens,  # Sequence length for kv_cache
         cum_seq_lens_q,  # Cumulative sequence length for query
         cum_seq_lens_kv,  # Cumulative sequence length for kv_cache
-        input_layout.lower(),  # Input layout (int)
+        input_layout.lower(),  # Input layout
         max_q_len,  # Max sequence length for query
         max_kv_len,  # Max sequence length for kv_cache
         batch_size,  # Batch size
-        total_q_tokens,  # Total Q tokens (cum_seq_lens_q[-1])
-        total_kv_tokens,  # Total KV tokens (cum_seq_lens_kv[-1])
         mask_mode.lower(),  # Attention mask type
         scale_softmax,  # Softmax scale
         scale_bmm1,  # BMM1 scale

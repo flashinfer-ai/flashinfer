@@ -325,8 +325,6 @@ void fmha_v2_run(
     ffi::TensorView cum_seq_lens_q,   // [batch + 1]
     ffi::TensorView cum_seq_lens_kv,  // [batch + 1]
     const std::string& input_layout_str, int max_q_len, int max_kv_len, int batch_size,
-    int total_q_tokens,
-    int total_kv_tokens,  // Totals from cum_seq_lens (computed in Python)
     const std::string& mask_mode_str, float scale_softmax, float scale_bmm1, float scale_bmm2,
     int window_left, int chunked_attention_size, bool has_alibi, float softcapping_scale,
     float skip_softmax_threshold_scale_factor,
@@ -417,8 +415,10 @@ void fmha_v2_run(
     }
   }
 
-  uint32_t total =
-      static_cast<uint32_t>(total_q_tokens);  // Used for stride calculations in interleaved mode
+  // total_q_tokens is inferred from q.shape()[0], which is always the total Q token count
+  // across all ragged layouts (PACKED_QKV, CONTIGUOUS_Q_KV, SEPARATE_Q_K_V, Q_PAGED_KV).
+  uint32_t total_q_tokens = static_cast<uint32_t>(q.shape()[0]);
+  uint32_t total = total_q_tokens;  // Used for stride calculations in interleaved mode
 
   AlignedAllocator allocator(workspace_buffer.data_ptr(), workspace_buffer_size_in_bytes);
 
@@ -587,9 +587,8 @@ void fmha_v2_run(
     params_v2.paged_kv_cache.mMaxBlocksPerSeq = block_table_max_blocks;
   }
 
-  // Total number of tokens is needed to set TMA desc on the host.
-  launch_params.total_q_seqlen = static_cast<uint32_t>(total_q_tokens);
-  launch_params.total_kv_seqlen = static_cast<uint32_t>(total_kv_tokens);
+  // Total number of Q tokens is needed to set TMA desc on the host.
+  launch_params.total_q_seqlen = total_q_tokens;
   // set enable_attn_logit_softcapping to select the right kernel.
   launch_params.enable_attn_logit_softcapping = softcapping_scale_bmm1 != 0.f;
 

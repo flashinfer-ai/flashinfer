@@ -329,7 +329,6 @@ def run_trtllm_fmha_v2_prefill_case(
     o_dtype,
     causal,
     mask_mode,
-    non_blocking,
     window_left,
     logits_soft_cap,
     pos_encoding_mode,
@@ -535,7 +534,6 @@ def run_trtllm_fmha_v2_prefill_case(
         kv_layout="NHD",
         mask_mode=mask_mode,
         window_left=window_left,
-        non_blocking=non_blocking,
         logits_soft_cap_scale=logits_soft_cap if logits_soft_cap > 0 else None,
         skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         pos_encoding_mode=pos_encoding_mode,
@@ -633,7 +631,6 @@ def run_trtllm_fmha_v2_prefill_case(
         (True, 512, "SLIDING_WINDOW"),
     ],
 )
-@pytest.mark.parametrize("non_blocking", [True, False])
 @pytest.mark.parametrize("pos_encoding_mode", ["NONE"])
 @pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
 def test_trtllm_fmha_v2_prefill(
@@ -648,7 +645,6 @@ def test_trtllm_fmha_v2_prefill(
     o_dtype,
     causal,
     mask_mode,
-    non_blocking,
     window_left,
     logits_soft_cap,
     pos_encoding_mode,
@@ -666,7 +662,6 @@ def test_trtllm_fmha_v2_prefill(
         o_dtype=o_dtype,
         causal=causal,
         mask_mode=mask_mode,
-        non_blocking=non_blocking,
         window_left=window_left,
         logits_soft_cap=logits_soft_cap,
         pos_encoding_mode=pos_encoding_mode,
@@ -725,7 +720,6 @@ def test_trtllm_fmha_v2_prefill_skip_softmax(
         o_dtype=o_dtype,
         causal=True,
         mask_mode="CAUSAL",
-        non_blocking=True,
         window_left=-1,
         logits_soft_cap=0.0,
         pos_encoding_mode=None,
@@ -742,7 +736,6 @@ def test_trtllm_fmha_v2_prefill_skip_softmax(
 @pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("non_blocking", [True, False])
 @pytest.mark.parametrize(
     ("causal", "window_left", "mask_mode"),
     [
@@ -759,7 +752,6 @@ def test_trtllm_fmha_v2_prefill_attention_sinks(
     num_kv_heads,
     head_dim,
     dtype,
-    non_blocking,
     causal,
     window_left,
     mask_mode,
@@ -821,7 +813,6 @@ def test_trtllm_fmha_v2_prefill_attention_sinks(
         sinks=sink,
         mask_mode=mask_mode,
         window_left=window_left,
-        non_blocking=non_blocking,
         pos_encoding_mode=pos_encoding_mode,
     )
 
@@ -867,7 +858,6 @@ def test_trtllm_fmha_v2_prefill_attention_sinks(
         window_left=window_left,
         q_data_type=dtype,
         kv_data_type=dtype,
-        non_blocking=non_blocking,
     )
     output_ref = wrapper_ref.run(q, (k, v), sink, sm_scale)
 
