@@ -506,6 +506,8 @@ def determine_attention_backend(
     str
         The name of the attention backend to be used.
     """
+    if kv_layout == "NHD" and _is_cudnn_available_for_attention():
+        return "cudnn"
     if is_sm90a_supported(device) and is_fa3_backend_supported(
         pos_encoding_mode,
         use_fp16_qk_reductions,
@@ -514,8 +516,6 @@ def determine_attention_backend(
         dtype_kv,
     ):
         return "fa3"
-    if kv_layout == "NHD" and _is_cudnn_available_for_attention():
-        return "cudnn"
     return "fa2"
 
 
