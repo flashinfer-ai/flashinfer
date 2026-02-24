@@ -303,15 +303,19 @@ def create_moe_tensors(
 
 
 def check_accuracy(
-    actual: torch.Tensor, expected: torch.Tensor, percent_threshold: float = 0.925
+    actual: torch.Tensor, expected: torch.Tensor, percent_threshold: float = 0.97
 ):
-    """Check numerical accuracy with percentage-based tolerance."""
+    """Check numerical accuracy with percentage-based tolerance.
+
+    Tolerances are scaled by output magnitude to account for FP4 quantization
+    noise growing with larger hidden dimensions.
+    """
     actual = actual.float()
     expected = expected.float()
 
     output_scale = max(expected.std().item(), 0.01)
-    atol = max(0.1, 3.0 * output_scale)
-    rtol = 0.85
+    atol = max(0.05, 1.5 * output_scale)
+    rtol = 0.5
 
     abs_diff = torch.abs(actual - expected)
     rel_diff = abs_diff / (torch.abs(expected) + 1e-8)

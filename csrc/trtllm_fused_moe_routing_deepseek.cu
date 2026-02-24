@@ -488,6 +488,9 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
     if (params.mPtrExpandedIdxToPermutedIdx != nullptr) {
       params.mPtrExpandedIdxToPermutedIdx[expandedIdx] = permutedIdx;
     }
+    if (params.mPtrPermutedIdxToExpandedIdx != nullptr && isLocalExpert) {
+      params.mPtrPermutedIdxToExpandedIdx[permutedIdx] = expandedIdx;
+    }
     if (params.mPtrPermutedIdxToTokenIdx != nullptr && isLocalExpert) {
       params.mPtrPermutedIdxToTokenIdx[permutedIdx] = tokenIdx;
     }
@@ -549,7 +552,8 @@ void runImpl(Data& data, void* stream) {
                      "When mPtrTopKIds is provided, mPtrTopKWeights must also be provided for "
                      "DeepSeek routing.");
   }
-  if (data.mPtrExpandedIdxToPermutedIdx != nullptr || data.mPtrPermutedIdxToTokenIdx != nullptr)
+  if (data.mPtrExpandedIdxToPermutedIdx != nullptr ||
+      data.mPtrPermutedIdxToExpandedIdx != nullptr || data.mPtrPermutedIdxToTokenIdx != nullptr)
     FLASHINFER_CHECK(
         (data.mPtrTopKPacked != nullptr || data.mPtrTopKIds != nullptr) && data.mPtrPermutedIdxSize,
         "If permuted index is required, `mPtrTopKPacked` or `mPtrTopKIds` is also required");

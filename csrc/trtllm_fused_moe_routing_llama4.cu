@@ -302,6 +302,10 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
       if (params.mPtrExpandedIdxToPermutedIdx != nullptr && isTokenRouted) {
         params.mPtrExpandedIdxToPermutedIdx[tokenIdx] = permutedIdx;
       }
+      // write out `mPtrPermutedIdxToExpandedIdx` if required
+      if (params.mPtrPermutedIdxToExpandedIdx != nullptr && isLocalExpert && isTokenRouted) {
+        params.mPtrPermutedIdxToExpandedIdx[permutedIdx] = tokenIdx;
+      }
       // write out `mPtrPermutedIdxToTokenIdx` if required
       if (params.mPtrPermutedIdxToTokenIdx != nullptr && isLocalExpert && isTokenRouted) {
         params.mPtrPermutedIdxToTokenIdx[permutedIdx] = tokenIdx;
