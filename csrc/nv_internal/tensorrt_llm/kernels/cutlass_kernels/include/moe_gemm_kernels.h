@@ -274,13 +274,7 @@ class MoeGemmRunner {
   static constexpr bool use_w4afp8 = false;
 #endif
   static constexpr bool use_mxfp8 = use_fp8 && IsMXFPX;
-#if defined(ENABLE_FP8)
-  static_assert(!IsMXFPX ||
-                    (std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp8_e4m3>),
-                "IsMXFPX requires FP8xFP8 (E4M3) runner types");
-#else
-  static_assert(!IsMXFPX, "IsMXFPX requires FP8 support");
-#endif
+
   static constexpr bool use_w4_groupwise = use_w4afp8 || use_wfp4a16;
 
 #if defined(ENABLE_FP4)

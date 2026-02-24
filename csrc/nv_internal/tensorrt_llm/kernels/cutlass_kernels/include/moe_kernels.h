@@ -257,9 +257,8 @@ struct QuantParams {
     GemmInputs fc2;
   } fp8_mxfp4;
 
-  // MXFP8 block-scaled quantization params.
-  // Historical note: this payload shape is also reused by MXFP8xMXFP8 (FP8 weights with MXFPX
-  // block scales), so this field name is legacy.
+  // MXFP8 MXFP4 quantization params
+  // This mode uses block scaled MXFP8 and MXFP4 weights
   struct MXFP8MXFP4Inputs {
     struct GemmInputs {
       TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF const* weight_block_scale =
@@ -587,13 +586,6 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
 
   static constexpr bool use_mxfp8 = use_fp8 && IsMXFPX;
   static constexpr bool use_block_scaling = use_fp4 || use_wfp4afp8 || use_mxfp8;
-#if defined(ENABLE_FP8)
-  static_assert(!IsMXFPX ||
-                    (std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp8_e4m3>),
-                "IsMXFPX requires FP8xFP8 (E4M3) runner types");
-#else
-  static_assert(!IsMXFPX, "IsMXFPX requires FP8 support");
-#endif
 
   // This should leave the variable unchanged in any currently supported configuration
   using UnfusedGemmOutputType = BackBoneType;
