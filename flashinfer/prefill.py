@@ -3080,13 +3080,25 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 logits_soft_cap > 0,  # use_logits_soft_cap
                 use_fp16_qk_reduction,
             )
+            # cute_dsl limitations: no GQA, no CUDA graphs, and seqlen_q must equal
+            # seqlen_k per sequence (full prefill only, not append/chunked).
+            if self._backend == "cute_dsl" and (
+                num_qo_heads != num_kv_heads
+                or self.is_cuda_graph_enabled
+                or not torch.equal(
+                    qo_indptr_host[1:] - qo_indptr_host[:-1],
+                    kv_indptr_host[1:] - kv_indptr_host[:-1],
+                )
+            ):
+                self._backend = "fa2"
+
             if self._backend == "cutlass":
                 # insert qo_indptr.device to 9th position (0-indexed) of get_module_args
                 new_get_module_args = (
                     get_module_args[:9] + (qo_indptr.device,) + get_module_args[9:]
                 )
                 self._cached_module = get_fmha_module(*new_get_module_args)
-            elif self._backend != "cudnn":
+            elif self._backend not in ("cudnn", "cute_dsl"):
                 self._cached_module = get_batch_prefill_module(
                     self._backend, *get_module_args
                 )
@@ -3096,7 +3108,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._cached_module, qo_indptr, kv_indptr, num_qo_heads, causal
             )
             self._max_qo_len = torch.max(qo_indptr[1:] - qo_indptr[:-1]).item()
-        elif self._backend not in ("cudnn", "cute-dsl"):
+        elif self._backend not in ("cudnn", "cute_dsl"):
             assert self._cached_module is not None, "cached module is not initialized"
             args = [
                 self._float_workspace_buffer,
@@ -3300,6 +3312,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 q.device,
                 "out",
             )
+<<<<<<< HEAD
         if self._backend == "cute-dsl":
             # These checks live here (not in plan()) because return_lse and
             # scale parameters are run()-time arguments that can vary between
