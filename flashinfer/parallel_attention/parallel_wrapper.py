@@ -261,14 +261,10 @@ def ulysses_wrapper(func):
         varlen_cp_config = self.varlen_cp_config
 
         if kwargs.get("return_lse", False):
-            raise ValueError(
-                "return_lse=True is not supported in parallel attention"
-            )
+            raise ValueError("return_lse=True is not supported in parallel attention")
 
         if attn_parallel_config.ulysses_size() == 1:
-            return func(
-                self, query, key, value, tensor_layout, attn_mask, **kwargs
-            )
+            return func(self, query, key, value, tensor_layout, attn_mask, **kwargs)
 
         ulysses_size = attn_parallel_config.ulysses_size()
         ulysses_rank = attn_parallel_config.ulysses_rank()
@@ -349,16 +345,10 @@ def ulysses_wrapper(func):
                 value = torch.narrow(value, seq_dim, 0, cu_seqlens_kv[-1])
 
         # Call the original function
-        result = func(
-            self, query, key, value, tensor_layout, attn_mask, **kwargs
-        )
+        result = func(self, query, key, value, tensor_layout, attn_mask, **kwargs)
 
         # if ring size is 1, return_lse is false, result only has output.
-        if (
-            ring_size == 1
-            and truncate_and_pad
-            and result.shape[seq_dim] > seq_len
-        ):
+        if ring_size == 1 and truncate_and_pad and result.shape[seq_dim] > seq_len:
             # Zero out padding using torch.narrow
             padding_part = torch.narrow(
                 result, seq_dim, seq_len, result.shape[seq_dim] - seq_len
@@ -405,9 +395,7 @@ def ring_wrapper(func):
         ring_group = attn_parallel_config.ring_group()
 
         if ring_size == 1:
-            return func(
-                self, query, key, value, tensor_layout, attn_mask, **kwargs
-            )
+            return func(self, query, key, value, tensor_layout, attn_mask, **kwargs)
 
         rank = attn_parallel_config.ring_rank()
         send_dst = (rank + 1) % ring_size
@@ -422,9 +410,7 @@ def ring_wrapper(func):
             raise ValueError(f"Invalid tensor layout: {tensor_layout}")
 
         p2p_comm_buffers = [None, None]
-        p2p_comm_buffers[0] = torch.cat(
-            (key.unsqueeze(0), value.unsqueeze(0)), dim=0
-        )
+        p2p_comm_buffers[0] = torch.cat((key.unsqueeze(0), value.unsqueeze(0)), dim=0)
         send_recv_reqs = [[], []]
 
         out = None
@@ -466,12 +452,8 @@ def ring_wrapper(func):
                     )
 
             if varlen_cp_config.cu_seqlens_q_cur_ring_group is not None:
-                cu_seqlens_q = (
-                    varlen_cp_config.cu_seqlens_q_cur_ring_group[rank]
-                )
-                cu_seqlens_kv = (
-                    varlen_cp_config.cu_seqlens_kv_cur_ring_group[kv_rank]
-                )
+                cu_seqlens_q = varlen_cp_config.cu_seqlens_q_cur_ring_group[rank]
+                cu_seqlens_kv = varlen_cp_config.cu_seqlens_kv_cur_ring_group[kv_rank]
                 kwargs["cur_rank_cu_seqlens_q"] = cu_seqlens_q
                 kwargs["cur_rank_cu_seqlens_k"] = cu_seqlens_kv
 
@@ -512,9 +494,7 @@ def ring_wrapper(func):
                 ring_fwd_out_correction(
                     out, out_per_step, softmax_lse, softmax_lse_per_step
                 )
-                ring_fwd_softmax_lse_correction(
-                    softmax_lse, softmax_lse_per_step
-                )
+                ring_fwd_softmax_lse_correction(softmax_lse, softmax_lse_per_step)
 
         # Determine output sequence dimension based on tensor layout
         # (for output tensor)
@@ -529,8 +509,7 @@ def ring_wrapper(func):
 
         if (
             uneven_cp_config.seq_len_cur_ring_group is not None
-            and out.shape[out_seq_dim]
-            > uneven_cp_config.seq_len_cur_ring_group[rank]
+            and out.shape[out_seq_dim] > uneven_cp_config.seq_len_cur_ring_group[rank]
         ):
             start_pos = uneven_cp_config.seq_len_cur_ring_group[rank]
 
@@ -543,9 +522,7 @@ def ring_wrapper(func):
 
         if start_pos < out.shape[out_seq_dim]:
             padding_length = out.shape[out_seq_dim] - start_pos
-            padding_part = torch.narrow(
-                out, out_seq_dim, start_pos, padding_length
-            )
+            padding_part = torch.narrow(out, out_seq_dim, start_pos, padding_length)
             padding_part.zero_()
 
         return out

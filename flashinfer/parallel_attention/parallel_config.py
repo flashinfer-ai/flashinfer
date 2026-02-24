@@ -39,7 +39,6 @@ class AttnParallelConfig:
             self._cached_device_mesh = {}
             self.set_device_mesh()
 
-
     def set_device_mesh(
         self, device_type: str = "cuda"
     ) -> torch.distributed.DeviceMesh:
@@ -55,9 +54,7 @@ class AttnParallelConfig:
             The device mesh is created in the order: ring -> ulysses
         """
         if self._device_mesh is not None:
-            logger.debug(
-                f"[{self.__class__.__name__}] Device mesh already initialized"
-            )
+            logger.debug(f"[{self.__class__.__name__}] Device mesh already initialized")
             return self._device_mesh
 
         total_parallel_size = self.get_total_parallel_size()
@@ -113,9 +110,7 @@ class AttnParallelConfig:
             )
 
         if not mesh_dims:
-            logger.debug(
-                f"[{self.__class__.__name__}] No mesh dimensions needed"
-            )
+            logger.debug(f"[{self.__class__.__name__}] No mesh dimensions needed")
             self._device_mesh = None
         else:
             logger.info(
@@ -127,16 +122,12 @@ class AttnParallelConfig:
                 tuple(mesh_sizes),
                 mesh_dim_names=tuple(mesh_dims),
             )
-            logger.info(
-                f"[{self.__class__.__name__}] Device mesh created successfully"
-            )
+            logger.info(f"[{self.__class__.__name__}] Device mesh created successfully")
 
         if str(self) not in self._cached_device_mesh:
             self._cached_device_mesh[str(self)] = self._device_mesh
 
         return self._device_mesh
-
-
 
     @classmethod
     def get_group(cls, group_name: str) -> Optional[torch.distributed.ProcessGroup]:
@@ -240,17 +231,9 @@ class AttnParallelConfig:
 
         Returns:
             AttnParallelConfig: The singleton instance of the configuration
-
-        Note:
-            This method ensures that each subclass has its own singleton instance.
-            For example, VAEParallelConfig.get_instance() and
-            DiTParallelConfig.get_instance() will return different instances.
         """
         if cls not in cls._instances:
-            cls._instances[cls] = super().__new__(cls)
-            cls._initialized[cls] = False
-            instance = cls._instances[cls]
-            instance.__init__()
+            cls()  # triggers __new__ (stores instance) + __init__
         return cls._instances[cls]
 
     @classmethod
@@ -273,9 +256,7 @@ class AttnParallelConfig:
                 f"ulysses_size must be a positive integer, got {ulysses_size}"
             )
         if not isinstance(ring_size, int) or ring_size < 1:
-            raise ValueError(
-                f"ring_size must be a positive integer, got {ring_size}"
-            )
+            raise ValueError(f"ring_size must be a positive integer, got {ring_size}")
 
         total_size = ulysses_size * ring_size
         if total_size > torch.cuda.device_count():
@@ -313,14 +294,11 @@ class AttnParallelConfig:
         total_parallel_size = self.get_total_parallel_size()
         if total_parallel_size == 1:
             logger.debug(
-                f"[{self.__class__.__name__}] Total parallel size is 1, "
-                f"skipping check"
+                f"[{self.__class__.__name__}] Total parallel size is 1, skipping check"
             )
             return True
         if self.get_world_size() % total_parallel_size != 0:
-            par_size = (
-                f"ULYSSES: {self._ulysses_size}, RING: {self._ring_size}"
-            )
+            par_size = f"ULYSSES: {self._ulysses_size}, RING: {self._ring_size}"
             raise ValueError(
                 f"Parallel size {par_size} does not match "
                 f"world size ({self.get_world_size()})"
@@ -397,7 +375,7 @@ class UnevenCPConfig:
         Args:
             seq_len: Actual (unpadded) total sequence length.
             seq_len_padded: Padded total sequence length (divisible by world_size).
-            seq_len_cur_rank: Number of real (non-padding) tokens on this rank. for example, if the total sequence 
+            seq_len_cur_rank: Number of real (non-padding) tokens on this rank. for example, if the total sequence
             length is 1023 and the world size is 8, and the rank is 0, then seq_len_cur_rank is 128. If the rank is 7, then seq_len_cur_rank is 127.
             attn_parallel_config: The :class:`AttnParallelConfig` instance that provides ring/ulysses group information.
         """
@@ -524,21 +502,31 @@ class VarlenCPConfig:
             "Varlen CP only supported when ulysses_size == 1 or ring_size == 1"
         )
 
-    def set_ulysses_varlen_config(
-        self, seq_lens_q, seq_lens_kv, attn_parallel_config
-    ):
+    def set_ulysses_varlen_config(self, seq_lens_q, seq_lens_kv, attn_parallel_config):
         rank = torch.distributed.get_rank()
         device = torch.device(f"cuda:{rank}")
 
-        cu_seqlens_q = torch.cat([
-            torch.zeros(1, dtype=torch.int32),
-            torch.cumsum(torch.tensor(seq_lens_q, dtype=torch.int32), dim=0),
-        ]).to(device).to(torch.int32)
+        cu_seqlens_q = (
+            torch.cat(
+                [
+                    torch.zeros(1, dtype=torch.int32),
+                    torch.cumsum(torch.tensor(seq_lens_q, dtype=torch.int32), dim=0),
+                ]
+            )
+            .to(device)
+            .to(torch.int32)
+        )
 
-        cu_seqlens_kv = torch.cat([
-            torch.zeros(1, dtype=torch.int32),
-            torch.cumsum(torch.tensor(seq_lens_kv, dtype=torch.int32), dim=0),
-        ]).to(device).to(torch.int32)
+        cu_seqlens_kv = (
+            torch.cat(
+                [
+                    torch.zeros(1, dtype=torch.int32),
+                    torch.cumsum(torch.tensor(seq_lens_kv, dtype=torch.int32), dim=0),
+                ]
+            )
+            .to(device)
+            .to(torch.int32)
+        )
 
         max_seqlen_q = max(seq_lens_q)
         max_seqlen_k = max(seq_lens_kv)
@@ -551,9 +539,7 @@ class VarlenCPConfig:
             attn_parallel_config,
         )
 
-    def set_ring_varlen_config(
-        self, seq_lens_q, seq_lens_kv, attn_parallel_config
-    ):
+    def set_ring_varlen_config(self, seq_lens_q, seq_lens_kv, attn_parallel_config):
         if not isinstance(seq_lens_q, torch.Tensor):
             seq_lens_q = torch.tensor(seq_lens_q, dtype=torch.int32)
         if not isinstance(seq_lens_kv, torch.Tensor):
@@ -563,12 +549,8 @@ class VarlenCPConfig:
         rank = torch.distributed.get_rank()
         device = torch.device(f"cuda:{rank}")
 
-        padded_seq_lens_q = (
-            (seq_lens_q + world_size - 1) // world_size * world_size
-        )
-        padded_seq_lens_kv = (
-            (seq_lens_kv + world_size - 1) // world_size * world_size
-        )
+        padded_seq_lens_q = (seq_lens_q + world_size - 1) // world_size * world_size
+        padded_seq_lens_kv = (seq_lens_kv + world_size - 1) // world_size * world_size
 
         padded_seq_len_q_cur_rank = padded_seq_lens_q // world_size
         padded_seq_len_kv_cur_rank = padded_seq_lens_kv // world_size
@@ -591,16 +573,28 @@ class VarlenCPConfig:
                 seq_len_q_cur_rank = padded_seq_len_q_cur_rank
                 seq_len_kv_cur_rank = padded_seq_len_kv_cur_rank
 
-            cu_seqlens_q = torch.cat([
-                torch.zeros(1),
-                torch.cumsum(seq_len_q_cur_rank, dim=0),
-            ]).to(device).to(torch.int32)
+            cu_seqlens_q = (
+                torch.cat(
+                    [
+                        torch.zeros(1),
+                        torch.cumsum(seq_len_q_cur_rank, dim=0),
+                    ]
+                )
+                .to(device)
+                .to(torch.int32)
+            )
             cu_seqlens_q_all_ranks.append(cu_seqlens_q)
 
-            cu_seqlens_kv = torch.cat([
-                torch.zeros(1),
-                torch.cumsum(seq_len_kv_cur_rank, dim=0),
-            ]).to(device).to(torch.int32)
+            cu_seqlens_kv = (
+                torch.cat(
+                    [
+                        torch.zeros(1),
+                        torch.cumsum(seq_len_kv_cur_rank, dim=0),
+                    ]
+                )
+                .to(device)
+                .to(torch.int32)
+            )
             cu_seqlens_kv_all_ranks.append(cu_seqlens_kv)
 
         self.set_varlen_cp_config(

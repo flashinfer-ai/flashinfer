@@ -1,5 +1,3 @@
-import math
-
 import torch
 
 
@@ -30,15 +28,12 @@ def convert_output_layout(out, src_layout, dst_layout):
         out = out.permute(1, 0, 2).contiguous()
     else:
         raise NotImplementedError(
-            f"Unsupported tensor layout conversion: "
-            f"{src_layout} -> {dst_layout}"
+            f"Unsupported tensor layout conversion: {src_layout} -> {dst_layout}"
         )
     return out
 
 
-def split_varlen_input(
-    tensor, seq_len_list, world_size, rank, tensor_layout="HND"
-):
+def split_varlen_input(tensor, seq_len_list, world_size, rank, tensor_layout="HND"):
     """Split a packed variable-length tensor across ranks for context parallelism.
 
     Given a tensor whose sequence dimension is the concatenation of multiple

@@ -1,7 +1,5 @@
 import logging
 
-import torch
-
 from .attention_ops import AttentionOpManager
 from .parallel_config import AttnParallelConfig, UnevenCPConfig, VarlenCPConfig
 from .parallel_wrapper import ring_wrapper, ulysses_wrapper
@@ -84,9 +82,9 @@ class ParallelAttention:
             attn_mask: Optional attention mask (not yet supported).
             is_causal: Whether to apply causal masking (not yet supported).
             return_lse: Must be ``False``; internally managed by ring wrapper.
-            cur_rank_cu_seqlens_q/ cur_rank_cu_seqlens_k/ 
-            cur_rank_max_seqlen_q/ cur_rank_max_seqlen_k: 
-            please do not set this manually. This will be set by the parallel wrapper. 
+            cur_rank_cu_seqlens_q/ cur_rank_cu_seqlens_k/
+            cur_rank_max_seqlen_q/ cur_rank_max_seqlen_k:
+            please do not set this manually. This will be set by the parallel wrapper.
             The sequence lengths should be set in the uneven_cp_config or varlen_cp_config.
             **kwargs: Additional arguments forwarded to the attention backend.
 

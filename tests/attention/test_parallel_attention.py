@@ -121,7 +121,14 @@ def _assert_cos_similarity(output, ref_output, threshold=0.99):
 @pytest.mark.parametrize("attn_type", ["flash-attn3"])
 @pytest.mark.parametrize("tensor_layout", ["HND", "NHD"])
 def test_attn_parallel(
-    num_heads, seq_len, head_dim, ulysses_size, ring_size, attn_type, tensor_layout, world_size
+    num_heads,
+    seq_len,
+    head_dim,
+    ulysses_size,
+    ring_size,
+    attn_type,
+    tensor_layout,
+    world_size,
 ):
     query, key, value, local_query, local_key, local_value = _sample_tensors(
         num_heads, seq_len, head_dim, world_size
@@ -161,7 +168,16 @@ def test_attn_parallel(
 @pytest.mark.parametrize("attn_type", ["flash-attn3"])
 @pytest.mark.parametrize("tensor_layout", ["HND", "NHD"])
 def test_uneven_attn_parallel(
-    num_heads, seq_len_padded, head_dim, ulysses_size, ring_size, attn_type, tensor_layout, world_size, rank, device
+    num_heads,
+    seq_len_padded,
+    head_dim,
+    ulysses_size,
+    ring_size,
+    attn_type,
+    tensor_layout,
+    world_size,
+    rank,
+    device,
 ):
     # _sample_tensors returns HND layout
     query, key, value, local_query, local_key, local_value = _sample_tensors(
@@ -169,7 +185,9 @@ def test_uneven_attn_parallel(
     )
 
     uneven_number = world_size - 1
-    seq_len_cur_rank = torch.tensor([local_query.shape[1]], dtype=torch.int32, device=device)
+    seq_len_cur_rank = torch.tensor(
+        [local_query.shape[1]], dtype=torch.int32, device=device
+    )
     if rank == world_size - 1:
         seq_len_cur_rank = seq_len_cur_rank - uneven_number
 
@@ -182,7 +200,10 @@ def test_uneven_attn_parallel(
     attn_parallel_config.set_config(ulysses_size=ulysses_size, ring_size=ring_size)
     uneven_cp_config = UnevenCPConfig()
     uneven_cp_config.set_uneven_cp_config(
-        seq_len_padded - uneven_number, seq_len_padded, seq_len_cur_rank, attn_parallel_config
+        seq_len_padded - uneven_number,
+        seq_len_padded,
+        seq_len_cur_rank,
+        attn_parallel_config,
     )
     varlen_cp_config = VarlenCPConfig()
     attn = ParallelAttention(
@@ -192,7 +213,9 @@ def test_uneven_attn_parallel(
         varlen_cp_config=varlen_cp_config,
     )
 
-    local_output = attn.run(local_query, local_key, local_value, tensor_layout=tensor_layout)
+    local_output = attn.run(
+        local_query, local_key, local_value, tensor_layout=tensor_layout
+    )
 
     if tensor_layout == "NHD":
         local_output = local_output.permute(1, 0, 2)
@@ -213,9 +236,7 @@ def test_uneven_attn_parallel(
 
 
 @pytest.mark.parametrize("num_heads", [24])
-@pytest.mark.parametrize(
-    "seq_len_list", [[1 * 8 * 1024 - 1, 3 * 8 * 1024]]
-)
+@pytest.mark.parametrize("seq_len_list", [[1 * 8 * 1024 - 1, 3 * 8 * 1024]])
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("attn_type", ["flash-attn3"])
 @pytest.mark.parametrize("tensor_layout", ["HND", "NHD"])
@@ -242,7 +263,9 @@ def test_ulysses_varlen_attn_parallel(
     attn_parallel_config = AttnParallelConfig()
     attn_parallel_config.set_config(ulysses_size=ulysses_size, ring_size=ring_size)
     varlen_cp_config = VarlenCPConfig()
-    varlen_cp_config.set_ulysses_varlen_config(seq_len_list, seq_len_list, attn_parallel_config)
+    varlen_cp_config.set_ulysses_varlen_config(
+        seq_len_list, seq_len_list, attn_parallel_config
+    )
     uneven_cp_config = UnevenCPConfig()
     attn = ParallelAttention(
         attn_type=attn_type,
@@ -251,7 +274,9 @@ def test_ulysses_varlen_attn_parallel(
         varlen_cp_config=varlen_cp_config,
     )
 
-    local_output = attn.run(local_query, local_key, local_value, tensor_layout=tensor_layout)
+    local_output = attn.run(
+        local_query, local_key, local_value, tensor_layout=tensor_layout
+    )
 
     if tensor_layout == "NHD":
         local_output = local_output.permute(1, 0, 2)
@@ -295,8 +320,8 @@ def test_ring_varlen_attn_parallel(
         full_cu_seqlens.append(full_cu_seqlens[-1] + seq_len)
 
     # _sample_ring_varlen_tensors returns HND layout
-    query, key, value, local_query, local_key, local_value = _sample_ring_varlen_tensors(
-        num_heads, head_dim, world_size, seq_len_list
+    query, key, value, local_query, local_key, local_value = (
+        _sample_ring_varlen_tensors(num_heads, head_dim, world_size, seq_len_list)
     )
 
     if tensor_layout == "NHD":
@@ -308,7 +333,9 @@ def test_ring_varlen_attn_parallel(
     attn_parallel_config.set_config(ulysses_size=1, ring_size=ring_size)
 
     varlen_cp_config = VarlenCPConfig()
-    varlen_cp_config.set_ring_varlen_config(seq_len_list, seq_len_list, attn_parallel_config)
+    varlen_cp_config.set_ring_varlen_config(
+        seq_len_list, seq_len_list, attn_parallel_config
+    )
     uneven_cp_config = UnevenCPConfig()
 
     attn = ParallelAttention(
@@ -317,7 +344,9 @@ def test_ring_varlen_attn_parallel(
         uneven_cp_config=uneven_cp_config,
         varlen_cp_config=varlen_cp_config,
     )
-    local_output = attn.run(local_query, local_key, local_value, tensor_layout=tensor_layout)
+    local_output = attn.run(
+        local_query, local_key, local_value, tensor_layout=tensor_layout
+    )
 
     if tensor_layout == "NHD":
         local_output = local_output.permute(1, 0, 2)
