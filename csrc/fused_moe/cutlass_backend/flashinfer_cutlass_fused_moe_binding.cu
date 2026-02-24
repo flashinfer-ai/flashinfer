@@ -82,7 +82,7 @@ class DtypeUtils {
 
 class FusedMoeRunner : public tvm::ffi::ModuleObj {
  public:
-  template <typename TypeAct, typename TypeWeight, bool NeedQuant = false>
+  template <typename TypeAct, typename TypeWeight, bool NeedQuant = false, bool IsMXFPX = false>
   std::unique_ptr<kernels::CutlassMoeFCRunnerInterface> switch_output_type(DLDataType output_type) {
     switch (encode_dlpack_dtype(output_type)) {
       case int64_code:  // INT64 == FP4
@@ -94,19 +94,20 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         // return std::make_unique<kernels::CutlassMoeFCRunner<Type, Type>>();
       case float16_code:
         if constexpr (NeedQuant) {
-          return std::make_unique<kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, half, half>>();
+          return std::make_unique<
+              kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, half, half, half, IsMXFPX>>();
         } else {
           return std::make_unique<
-              kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, half, TypeAct>>();
+              kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, half, TypeAct, half, IsMXFPX>>();
         }
 #ifdef ENABLE_BF16
       case bfloat16_code:
         if constexpr (NeedQuant) {
-          return std::make_unique<
-              kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, __nv_bfloat16, __nv_bfloat16>>();
+          return std::make_unique<kernels::CutlassMoeFCRunner<
+              TypeAct, TypeWeight, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, IsMXFPX>>();
         } else {
-          return std::make_unique<
-              kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, __nv_bfloat16, TypeAct>>();
+          return std::make_unique<kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, __nv_bfloat16,
+                                                              TypeAct, __nv_bfloat16, IsMXFPX>>();
         }
 #endif
       default:
@@ -145,7 +146,9 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 #endif
 
 #ifdef ENABLE_FP8
-    if (isFp8Quant() || isWMxfp8AMxfp8Quant()) {
+    if (isWMxfp8AMxfp8Quant()) {
+      mKernelRunner = switch_output_type<__nv_fp8_e4m3, __nv_fp8_e4m3, false, true>(mOutputDtype);
+    } else if (isFp8Quant()) {
       mKernelRunner = switch_output_type<__nv_fp8_e4m3, __nv_fp8_e4m3>(mOutputDtype);
     }
 #endif

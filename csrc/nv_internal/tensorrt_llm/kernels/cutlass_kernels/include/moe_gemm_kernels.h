@@ -239,10 +239,11 @@ constexpr bool isGatedActivation(ActivationType activation_type) {
          activation_type == ActivationType::SwigluBias;
 }
 
-template <typename T,          /*The type used for activations/scales/compute*/
-          typename WeightType, /* The type for the MoE weights */
-          typename OutputType, /* The output type for the GEMM */
-          typename ScaleBiasType = OutputType /* The type for the scales/bias */>
+template <typename T,                          /*The type used for activations/scales/compute*/
+          typename WeightType,                 /* The type for the MoE weights */
+          typename OutputType,                 /* The output type for the GEMM */
+          typename ScaleBiasType = OutputType, /* The type for the scales/bias */
+          bool IsMXFPX = false>
 class MoeGemmRunner {
  public:
   MoeGemmRunner();
@@ -271,6 +272,14 @@ class MoeGemmRunner {
 #else
   static constexpr bool use_fp8 = false;
   static constexpr bool use_w4afp8 = false;
+#endif
+  static constexpr bool use_mxfp8 = use_fp8 && IsMXFPX;
+#if defined(ENABLE_FP8)
+  static_assert(!IsMXFPX ||
+                    (std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp8_e4m3>),
+                "IsMXFPX requires FP8xFP8 (E4M3) runner types");
+#else
+  static_assert(!IsMXFPX, "IsMXFPX requires FP8 support");
 #endif
   static constexpr bool use_w4_groupwise = use_w4afp8 || use_wfp4a16;
 
@@ -308,7 +317,7 @@ class MoeGemmRunner {
   [[nodiscard]] bool supportsFusedGatedActivation(ActivationType activation_type, int gemm_n,
                                                   int gemm_k) const;
 
-  size_t getMaxWorkspaceSize(int num_experts, bool use_mxfp8_act_scaling = false) const;
+  size_t getMaxWorkspaceSize(int num_experts) const;
 
   [[nodiscard]] int getSM() const;
 
@@ -325,9 +334,8 @@ class MoeGemmRunner {
   int sm_{};
   int multi_processor_count_{};
   mutable int num_experts_ = 0;
-  mutable bool use_mxfp8_act_scaling_ = false;
   mutable size_t gemm_workspace_size_ = 0;
-  size_t calcMaxWorkspaceSize(int num_experts, bool use_mxfp8_act_scaling) const;
+  size_t calcMaxWorkspaceSize(int num_experts) const;
 };
 
 }  // namespace tensorrt_llm::kernels::cutlass_kernels

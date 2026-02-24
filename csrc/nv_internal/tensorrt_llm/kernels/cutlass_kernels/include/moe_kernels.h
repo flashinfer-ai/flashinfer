@@ -649,7 +649,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
               cudaStream_t stream) override;
 
   // We make these GEMM1 & GEMM2 static because they need to be stateless for the profiler to work
-  static void gemm1(MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>& gemm_runner,
+  static void gemm1(MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>& gemm_runner,
                     // This argument must not be null if fp8 block scaling is being used.
                     // The gemm_runner will be ignored in that case. NOTE: it would
                     // be great if we could consolidate gemm_runner and fp8_blockscale_gemm_runner.
@@ -675,7 +675,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
                     int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl);
 
   static void gemm2(
-      MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>& gemm_runner,
+      MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>& gemm_runner,
       DeepSeekBlockScaleGemmRunner* fp8_blockscale_gemm_runner, T const* const input,
       void* const gemm_output, OutputType* const final_output,
       int64_t const* const expert_first_token_offset,
@@ -939,7 +939,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
                               int64_t const expanded_num_rows, int64_t const seq_len,
                               bool const use_awq, cudaStream_t stream);
 
-  MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType> moe_gemm_runner_;
+  MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX> moe_gemm_runner_;
   std::unique_ptr<DeepSeekBlockScaleGemmRunner> blockscale_gemm_runner_;
 
   std::optional<cutlass_extensions::CutlassGemmConfig> gemm1_config_;

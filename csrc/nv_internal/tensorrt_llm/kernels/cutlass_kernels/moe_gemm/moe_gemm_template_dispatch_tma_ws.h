@@ -489,7 +489,7 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(
         TLLM_THROW("Unsupported SM100 configuration requested");
       }
     } else if (gemm_config.sm_version == 120 || gemm_config.sm_version == 121) {
-      TLLM_LOG_TRACE("SM120 config=%d", (int)gemm_config.tile_config_sm120);
+      TLLM_LOG_TRACE("At %s, SM120 config=%d", (int)gemm_config.tile_config_sm120);
       if constexpr (kernels::cutlass_kernels::isValidSM120MOESpecialisation<
                         T, WeightType, EpilogueTag, FUSION>()) {
         switch (gemm_config.tile_config_sm120) {

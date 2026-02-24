@@ -2620,8 +2620,7 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX,
                                                 num_experts_per_node, workspace_scaling_type)
                                           : 0;
 
-  size_t const gemm_workspace_size =
-      moe_gemm_runner_.getMaxWorkspaceSize(num_experts_per_node, use_mxfp8_act_scaling);
+  size_t const gemm_workspace_size = moe_gemm_runner_.getMaxWorkspaceSize(num_experts_per_node);
 
   // lora related
   size_t const lora_input_size =
@@ -2981,7 +2980,7 @@ T const* CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType,
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType,
           bool IsMXFPX, class Enable>
 void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, Enable>::gemm1(
-    MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>& gemm_runner,
+    MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>& gemm_runner,
     DeepSeekBlockScaleGemmRunner* fp8_blockscale_gemm_runner, T const* const input, T* const output,
     void* const intermediate_result, int64_t const* const expert_first_token_offset,
     TmaWarpSpecializedGroupedGemmInput const tma_ws_input_template,
@@ -3211,7 +3210,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType,
           bool IsMXFPX, class Enable>
 void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, Enable>::gemm2(
-    MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>& gemm_runner,
+    MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>& gemm_runner,
     DeepSeekBlockScaleGemmRunner* fp8_blockscale_gemm_runner, T const* const input,
     void* const gemm_output, OutputType* const final_output,
     int64_t const* const expert_first_token_offset,
