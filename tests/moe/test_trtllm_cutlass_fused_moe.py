@@ -1387,8 +1387,8 @@ def test_moe_mxfp8_mxfp4(
     ("alpha", "beta", "limit"), [(None, None, None), (0.5, 0.0, 7.0), (1.702, 1.0, 7.0)]
 )
 @pytest.mark.skipif(
-    torch.cuda.get_device_capability()[0] not in [10, 11, 12],
-    reason="MXFP8xMXFP8 is only supported on SM100, SM110 and SM120",
+    torch.cuda.get_device_capability()[0] not in [10],
+    reason="MXFP8xMXFP8 is only supported on SM100 for now",
 )
 def test_moe_mxfp8_mxfp8(
     batch_size,
