@@ -348,7 +348,8 @@ struct CutlassGemmConfig {
   bool enableCudaKernel = false;
   int sm_version = 80;  // Use 80 as a catch all for <90
   bool is_tma_warp_specialized = false;
-  bool use_stream_k = false;  // SM120: false = DP scheduler (default), true = StreamK scheduler
+  bool use_stream_k =
+      false;  // SM120/SM121: false = DP scheduler (default), true = StreamK scheduler
 
   CutlassGemmConfig() = default;
 
@@ -379,7 +380,7 @@ struct CutlassGemmConfig {
         sm_version(100),
         is_tma_warp_specialized(true) {}
 
-  // SM120 constructor with optional StreamK scheduler
+  // SM120/SM121 constructor with optional StreamK scheduler
   // use_stream_k: false = DP scheduler (default), true = StreamK scheduler (auto heuristic)
   CutlassGemmConfig(CutlassTileConfigSM120 tile_config_sm120,
                     MainloopScheduleType mainloop_schedule, EpilogueScheduleType epilogue_schedule,
@@ -413,7 +414,7 @@ struct CutlassGemmConfig {
              << "\n\tmainloop sched: " << (int)mainloop_schedule
              << "\n\tepi sched: " << (int)epilogue_schedule
              << "\n\tenable cuda kernel: " << (enableCudaKernel ? "true" : "false");
-      // SM120 specific: StreamK scheduler option
+      // SM120/SM121 specific: StreamK scheduler option
       if (sm_version == 120 || sm_version == 121) {
         tactic << "\n\tscheduler: " << (use_stream_k ? "StreamK (auto heuristic)" : "DP (default)");
       }

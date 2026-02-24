@@ -224,7 +224,7 @@ def trtllm_batch_decode_mla(
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if backend == "xqa":
         if compute_capability[0] != 12:
-            pytest.skip("XQA MLA only supports SM120 GPUs")
+            pytest.skip("XQA MLA only supports SM120/SM121 GPUs")
         if q_len_per_request != 1 or dtype != torch.float8_e4m3fn:
             pytest.skip(
                 "XQA MLA only supports q_len_per_request == 1 and dtype == torch.float8_e4m3fn"

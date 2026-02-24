@@ -603,7 +603,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
             or kv_cache.dtype != torch.float8_e4m3fn
         ):
             raise ValueError(
-                f"XQA MLA only supports fp8 operation on SM120 GPUs, got {query.dtype} and {kv_cache.dtype}"
+                f"XQA MLA only supports fp8 operation on SM120/SM121 GPUs, got {query.dtype} and {kv_cache.dtype}"
             )
         if sinks is not None:
             raise ValueError("XQA MLA does not support sinks")
