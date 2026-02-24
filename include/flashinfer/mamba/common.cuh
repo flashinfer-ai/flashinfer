@@ -74,6 +74,35 @@ __device__ __forceinline__ float warpReduceMax(float val) {
   return val;
 }
 
+// =============================================================================
+// Philox-4x32 PRNG (matches Triton's tl.randint)
+// =============================================================================
+
+// Generates a pseudorandom uint32 from (seed, offset) using the Philox-4x32 algorithm.
+// Produces bit-identical output to Triton's tl.randint(seed, offset, n_rounds).
+__device__ __forceinline__ uint32_t philox_randint(int64_t seed, uint32_t offset,
+                                                   int n_rounds = 10) {
+  constexpr uint32_t PHILOX_KEY_A = 0x9E3779B9u;
+  constexpr uint32_t PHILOX_KEY_B = 0xBB67AE85u;
+  constexpr uint32_t PHILOX_ROUND_A = 0xD2511F53u;
+  constexpr uint32_t PHILOX_ROUND_B = 0xCD9E8D57u;
+
+  uint32_t k0 = static_cast<uint32_t>(static_cast<uint64_t>(seed));
+  uint32_t k1 = static_cast<uint32_t>(static_cast<uint64_t>(seed) >> 32);
+  uint32_t c0 = offset, c1 = 0, c2 = 0, c3 = 0;
+
+  for (int i = 0; i < n_rounds; i++) {
+    uint32_t _c0 = c0, _c2 = c2;
+    c0 = __umulhi(PHILOX_ROUND_B, _c2) ^ c1 ^ k0;
+    c2 = __umulhi(PHILOX_ROUND_A, _c0) ^ c3 ^ k1;
+    c1 = PHILOX_ROUND_B * _c2;
+    c3 = PHILOX_ROUND_A * _c0;
+    k0 += PHILOX_KEY_A;
+    k1 += PHILOX_KEY_B;
+  }
+  return c0;
+}
+
 __forceinline__ __device__ float softplus(float x) { return __logf(1.f + __expf(x)); }
 
 __device__ __forceinline__ float thresholded_softplus(float dt_value) {
