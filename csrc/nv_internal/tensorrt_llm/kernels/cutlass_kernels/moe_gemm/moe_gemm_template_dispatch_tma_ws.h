@@ -491,7 +491,7 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(
     } else if (gemm_config.sm_version == 120 || gemm_config.sm_version == 121) {
       char const* const pretty_function = __PRETTY_FUNCTION__;
       TLLM_LOG_TRACE("At %s, SM120 config=%d", pretty_function,
-                     static_cast<int>(gemm_config.tile_config_sm120));
+                     (int)(gemm_config.tile_config_sm120));
       if constexpr (kernels::cutlass_kernels::isValidSM120MOESpecialisation<
                         T, WeightType, EpilogueTag, FUSION>()) {
         switch (gemm_config.tile_config_sm120) {

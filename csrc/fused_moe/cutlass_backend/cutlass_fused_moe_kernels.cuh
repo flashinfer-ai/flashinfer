@@ -1297,6 +1297,8 @@ __global__ void computeStridesTmaWarpSpecializedKernel(
                   quant_params.fp8_mxfp4);
   setupIfSelected(TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaledConfig{},
                   quant_params.mxfp8_mxfp4);
+  setupIfSelected(TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaledConfig{},
+                  quant_params.mxfp8_mxfp8);
 
   assert(gemm_m <= INT32_MAX);
   assert(gemm1_n > 0 && gemm1_n <= INT32_MAX);
@@ -1585,9 +1587,9 @@ void expandInputRowsKernelLauncher(
     // Always MXFP8
     if constexpr (std::is_same_v<ExpandedActivationsType, __nv_fp8_e4m3> &&
                   !std::is_same_v<InputActivationsType, __nv_fp8_e4m3>) {
-      TLLM_CHECK_WITH_INFO(quant_params.mxfp8_mxfp4.fc1.weight_block_scale || prequant_scales,
-                           "MXFP8xMXFP4 block scaling or prequant_scales or prequant_scales "
-                           "parameters not provided");
+      TLLM_CHECK_WITH_INFO(quant_params.mxfp8_mxfp4.fc1.weight_block_scale ||
+                               quant_params.mxfp8_mxfp8.fc1.weight_block_scale || prequant_scales,
+                           "MXFP8 block scaling or prequant_scales parameters not provided");
       return prequant_scales
                  ? &expandInputRowsKernel<
                        InputActivationsType, ExpandedActivationsType,
@@ -1600,7 +1602,8 @@ void expandInputRowsKernelLauncher(
     else if constexpr (std::is_same_v<ExpandedActivationsType, __nv_fp8_e4m3> &&
                        std::is_same_v<InputActivationsType, __nv_fp8_e4m3>) {
       TLLM_CHECK_WITH_INFO(!prequant_scales, "FP8 is not supported for AWQ");
-      return quant_params.mxfp8_mxfp4.fc1.weight_block_scale
+      return (quant_params.mxfp8_mxfp4.fc1.weight_block_scale ||
+              quant_params.mxfp8_mxfp8.fc1.weight_block_scale)
                  ? &expandInputRowsKernel<
                        InputActivationsType, ExpandedActivationsType,
                        TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX, false>
@@ -2329,7 +2332,10 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
                            "NVFP4 block scaling is expected for FP4xFP4");
       return fn(NVFP4);
     } else if constexpr (std::is_same_v<T, __nv_fp8_e4m3>) {
-      return quant_params.mxfp8_mxfp4.fc2.weight_block_scale ? fn(MXFPX) : fn(NONE);
+      return (quant_params.mxfp8_mxfp4.fc2.weight_block_scale ||
+              quant_params.mxfp8_mxfp8.fc2.weight_block_scale)
+                 ? fn(MXFPX)
+                 : fn(NONE);
     } else
 #endif
     {
@@ -2815,7 +2821,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
   // separated
   fc1_fp4_act_scale_ = nullptr;
   fc2_fp4_act_scale_ = nullptr;
-  if (getScalingType() != TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE) {
+  if (use_block_scaling) {
     fc1_fp4_act_scale_ = getWsPtr(TmaWarpSpecializedGroupedGemmInput::ElementSF{}, "fp4_act_scale");
     fc2_fp4_act_scale_ = getWsPtr(TmaWarpSpecializedGroupedGemmInput::ElementSF{}, "fp4_act_scale");
     TLLM_CHECK(fc1_fp4_act_scale_ != nullptr);
@@ -3586,12 +3592,13 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
   auto const* fc1_fp8_dequant = quant_params.fp8.dequant_fc1;
   auto const* fc2_fp8_quant = quant_params.fp8.quant_fc2;
   auto const* fc2_fp8_dequant = quant_params.fp8.dequant_fc2;
+  // WMXFP8AMXFP8 keeps dequant scales in mxfp8_mxfp8; remap these shared FP8 pointers so
+  // downstream GEMM/TMA setup can reuse the common FP8 code path.
   if (fp8_scales_required && use_mxfp8_act_scaling) {
-    // TODO: zianglih: check if this is correct
-    TLLM_CHECK_WITH_INFO(quant_params.mxfp8_mxfp4.fc1.weight_block_scale != nullptr,
-                         "WMXFP8AMXFP8 requires FC2 weight_block_scale to be non-null");
-    fc1_fp8_dequant = quant_params.mxfp8_mxfp4.fc1.global_scale;
-    fc2_fp8_dequant = quant_params.mxfp8_mxfp4.fc2.global_scale;
+    TLLM_CHECK_WITH_INFO(quant_params.mxfp8_mxfp8.fc1.weight_block_scale != nullptr,
+                         "WMXFP8AMXFP8 requires FC1 weight_block_scale to be non-null");
+    fc1_fp8_dequant = quant_params.mxfp8_mxfp8.fc1.global_scale;
+    fc2_fp8_dequant = quant_params.mxfp8_mxfp8.fc2.global_scale;
   }
   auto const* input_fp8_dequant = quant_params.fp8.dequant_input;
 
@@ -3614,7 +3621,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
   TLLM_CHECK(full_num_experts % parallelism_config.ep_size == 0);
   TLLM_CHECK(full_num_experts % parallelism_config.cluster_size == 0);
 
-  if (quant_params.mxfp8_mxfp4.fc1.weight_block_scale) {
+  if (quant_params.mxfp8_mxfp4.fc1.weight_block_scale ||
+      quant_params.mxfp8_mxfp8.fc1.weight_block_scale) {
     TLLM_CHECK_WITH_INFO(
         hidden_size % (64 * 8 / sizeof_bits<WeightType>::value) == 0,
         "Hidden size %d does not meet minimum alignment requirements for MXFP8 MOE GEMM %d",

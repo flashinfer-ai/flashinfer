@@ -965,7 +965,7 @@ size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::calcMax
       fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
     } else if constexpr (use_mxfp8) {
       fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
-    } else if constexpr (use_fp4) {
+    } else if (use_fp4) {
       fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4;
     }
     size_t max_size = 0;
