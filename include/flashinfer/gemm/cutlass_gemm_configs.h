@@ -393,7 +393,7 @@ struct CutlassGemmConfig {
         use_stream_k(use_stream_k) {}
 
   int getTileConfigAsInt() const {
-    if (sm_version == 120) return (int)tile_config_sm120;
+    if (sm_version == 120 || sm_version == 121) return (int)tile_config_sm120;
     if (sm_version == 110) return (int)tile_config_sm100;
     if (sm_version >= 100) return (int)tile_config_sm100;
     if (sm_version == 90) return (int)tile_config_sm90;
@@ -414,7 +414,7 @@ struct CutlassGemmConfig {
              << "\n\tepi sched: " << (int)epilogue_schedule
              << "\n\tenable cuda kernel: " << (enableCudaKernel ? "true" : "false");
       // SM120 specific: StreamK scheduler option
-      if (sm_version == 120) {
+      if (sm_version == 120 || sm_version == 121) {
         tactic << "\n\tscheduler: " << (use_stream_k ? "StreamK (auto heuristic)" : "DP (default)");
       }
     } else if (tile_config_sm80 != flashinfer::gemm::CutlassTileConfig::ChooseWithHeuristic) {

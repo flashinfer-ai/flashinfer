@@ -3038,7 +3038,7 @@ def _cudnn_gemm_fp4_requirement(
         raise ValueError("Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
     if (
         not use_nvfp4
-        and _match_sm_version(a.device, ["120"])
+        and _match_sm_version(a.device, ["120", "121"])
         and cudnn.backend_version() < 91400
     ):
         raise LibraryError(CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR)
