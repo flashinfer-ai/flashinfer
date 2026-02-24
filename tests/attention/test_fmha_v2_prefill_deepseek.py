@@ -5,7 +5,7 @@ import math
 
 from flashinfer.prefill import fmha_v2_prefill_deepseek
 from tests.utils_fp8 import to_float8
-from flashinfer.utils import is_sm120a_supported
+from flashinfer.utils import is_sm120a_supported, is_sm121a_supported
 
 
 def attention_ref(
@@ -57,8 +57,11 @@ def attention_ref(
 def test_fmha_v2_prefill_deepseek(
     batch_size, num_heads, head_dim_qk, head_dim_v, seq_len, qkv_dtype, o_dtype
 ):
-    if not is_sm120a_supported(torch.device("cuda")):
-        pytest.skip("fmha_v2_prefill_deepseek is only supported on SM120 GPUs.")
+    if not (
+        is_sm120a_supported(torch.device("cuda"))
+        or is_sm121a_supported(torch.device("cuda"))
+    ):
+        pytest.skip("fmha_v2_prefill_deepseek is only supported on SM12x GPUs.")
     torch.manual_seed(42)
 
     def initialize_tensors(batch_size, num_heads, head_dim_qk, head_dim_v, seq_len):

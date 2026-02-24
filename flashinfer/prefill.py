@@ -3434,6 +3434,7 @@ def trtllm_ragged_attention_deepseek(
     is_causal: bool,
     return_lse: bool,
     attention_sinks: Optional[torch.Tensor] = None,
+    skip_softmax_threshold_scale_factor: Optional[float] = None,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -3476,6 +3477,12 @@ def trtllm_ragged_attention_deepseek(
         is causal
     attention_sinks : Optional[torch.Tensor]
         attention sinks
+    skip_softmax_threshold_scale_factor : Optional[float]
+        threshold scale factor for skipping softmax operations.
+        Providing a value for this parameter enables skip-softmax sparsity as described in: https://arxiv.org/abs/2512.12087
+        If no value is provided, then standard attention is used.
+        Setting the threshold to a higher value generally increases kernel performance at the cost of accuracy degradation.
+        The actual threshold value equals the provided threshold_scale_factor divided by the context length.
     out : Optional[torch.Tensor]
         output tensor, if not provided, will be allocated with shape [query.shape[0], query.shape[1], value.shape[2]]
     lse : Optional[torch.Tensor]
@@ -3541,6 +3548,7 @@ def trtllm_ragged_attention_deepseek(
         is_causal,
         workspace_size,
         attention_sinks,
+        skip_softmax_threshold_scale_factor,
         lse,
     )
     if return_lse:
@@ -3821,8 +3829,8 @@ def fmha_v2_prefill_deepseek(
         If return_lse is True, the output will be a tuple of two tensors, the first is the output tensor, the second is the lse tensor.
         If return_lse is False, the output will be a single tensor.
     """
-    if not is_sm120a_supported(query.device):
-        raise ValueError("fmha_v2_prefill_deepseek is only supported on SM120 GPUs.")
+    if not (is_sm120a_supported(query.device) or is_sm121a_supported(query.device)):
+        raise ValueError("fmha_v2_prefill_deepseek is only supported on SM12x GPUs.")
     assert query.shape[3] == 192 and key.shape[3] == 192 and value.shape[3] == 128, (
         "currently only support deepseek r1 192 query and 128 value"
     )

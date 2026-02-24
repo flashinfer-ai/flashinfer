@@ -33,6 +33,8 @@ Key Features:
 - Async H memory loading with aggressive pipelining
 - BF16 tensors with FP32 compute for numerical stability
 - GQA (grouped-query attention) support with configurable H (query) and HV (value) heads
+- Uses scalar FP32 FMA operations for SM90+ (Hopper, Blackwell) compatibility
+- Can be optimized with packed F32x2 FMA for SM100+ in future releases
 """
 
 import math
@@ -123,6 +125,37 @@ def load_h_chunk_async(h_sh_chunk, h_global, tidx, row_offset):
             cute.copy(atom_async_copy, tS, tD)
 
 
+# ==============================================================================
+# FMA WRAPPER FUNCTIONS (SM90 Compatibility)
+# ==============================================================================
+# Note: cute.arch.fma_packed_f32x2() generates F32x2 intrinsics that are NOT
+# supported on SM90 (Hopper). These wrappers use scalar FMA operations that
+# work on all SM90+ architectures. Future optimization: add architecture-
+# specific variants for SM100+ (Blackwell) using packed intrinsics.
+
+
+@cute.jit
+def fma_pair_mul(a1, a2, b1, b2):
+    """Multiply two pairs: (a1, a2) * (b1, b2).
+
+    Equivalent to fma_packed_f32x2 with c=(0,0), but compatible with SM90+.
+    """
+    result1 = a1 * b1
+    result2 = a2 * b2
+    return result1, result2
+
+
+@cute.jit
+def fma_pair(a1, a2, b1, b2, c1, c2):
+    """FMA two pairs: (a1, a2) * (b1, b2) + (c1, c2).
+
+    Equivalent to fma_packed_f32x2, but compatible with SM90+.
+    """
+    result1 = a1 * b1 + c1
+    result2 = a2 * b2 + c2
+    return result1, result2
+
+
 @cute.jit
 def compute_single_gate(
     alpha, beta_raw, dt_bias_val, A_log_val, softplus_beta, softplus_threshold
@@ -161,15 +194,11 @@ def normalize_and_store_qk_to_smem(q_head, k_head, q_sh, k_sh, lane_idx, scale, 
     k_sum_sq2 = cutlass.Float32(0.0)
 
     for i in cutlass.range_constexpr(0, 4, 2):
-        q_sum_sq, q_sum_sq2 = cute.arch.fma_packed_f32x2(
-            src_a=(q_reg[i], q_reg[i + 1]),
-            src_b=(q_reg[i], q_reg[i + 1]),
-            src_c=(q_sum_sq, q_sum_sq2),
+        q_sum_sq, q_sum_sq2 = fma_pair(
+            q_reg[i], q_reg[i + 1], q_reg[i], q_reg[i + 1], q_sum_sq, q_sum_sq2
         )
-        k_sum_sq, k_sum_sq2 = cute.arch.fma_packed_f32x2(
-            src_a=(k_reg[i], k_reg[i + 1]),
-            src_b=(k_reg[i], k_reg[i + 1]),
-            src_c=(k_sum_sq, k_sum_sq2),
+        k_sum_sq, k_sum_sq2 = fma_pair(
+            k_reg[i], k_reg[i + 1], k_reg[i], k_reg[i + 1], k_sum_sq, k_sum_sq2
         )
 
     q_sum_sq = q_sum_sq + q_sum_sq2
@@ -214,20 +243,16 @@ def decay_h_from_smem_and_compute_pred(
     pred2 = cutlass.Float32(0.0)
 
     for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = cute.arch.fma_packed_f32x2(
-            src_a=(
-                h_sh_chunk[lane_idx, k_base + i].to(cutlass.Float32),
-                h_sh_chunk[lane_idx, k_base + i + 1].to(cutlass.Float32),
-            ),
-            src_b=(g_exp, g_exp),
-            src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
+        h_chunk[i], h_chunk[i + 1] = fma_pair_mul(
+            h_sh_chunk[lane_idx, k_base + i].to(cutlass.Float32),
+            h_sh_chunk[lane_idx, k_base + i + 1].to(cutlass.Float32),
+            g_exp,
+            g_exp,
         )
 
     for i in cutlass.range_constexpr(0, 32, 2):
-        pred, pred2 = cute.arch.fma_packed_f32x2(
-            src_a=(h_chunk[i], h_chunk[i + 1]),
-            src_b=(kq_chunk[i], kq_chunk[i + 1]),
-            src_c=(pred, pred2),
+        pred, pred2 = fma_pair(
+            h_chunk[i], h_chunk[i + 1], kq_chunk[i], kq_chunk[i + 1], pred, pred2
         )
 
     pred = pred + pred2
@@ -238,10 +263,8 @@ def decay_h_from_smem_and_compute_pred(
 def update_h_with_delta(h_chunk, kq_chunk, v_delta):
     """Update H with delta: h = h + k * v_delta."""
     for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = cute.arch.fma_packed_f32x2(
-            src_a=(kq_chunk[i], kq_chunk[i + 1]),
-            src_b=(v_delta, v_delta),
-            src_c=(h_chunk[i], h_chunk[i + 1]),
+        h_chunk[i], h_chunk[i + 1] = fma_pair(
+            kq_chunk[i], kq_chunk[i + 1], v_delta, v_delta, h_chunk[i], h_chunk[i + 1]
         )
 
 
@@ -251,10 +274,8 @@ def compute_output(h_chunk, kq_chunk):
     out = cutlass.Float32(0.0)
     out2 = cutlass.Float32(0.0)
     for i in cutlass.range_constexpr(0, 32, 2):
-        out, out2 = cute.arch.fma_packed_f32x2(
-            src_a=(h_chunk[i], h_chunk[i + 1]),
-            src_b=(kq_chunk[i], kq_chunk[i + 1]),
-            src_c=(out, out2),
+        out, out2 = fma_pair(
+            h_chunk[i], h_chunk[i + 1], kq_chunk[i], kq_chunk[i + 1], out, out2
         )
     out = out + out2
     return out
@@ -264,10 +285,8 @@ def compute_output(h_chunk, kq_chunk):
 def decay_h_in_place(h_chunk, g_exp):
     """Apply decay to H in place: h = h * g_exp."""
     for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = cute.arch.fma_packed_f32x2(
-            src_a=(h_chunk[i], h_chunk[i + 1]),
-            src_b=(g_exp, g_exp),
-            src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
+        h_chunk[i], h_chunk[i + 1] = fma_pair_mul(
+            h_chunk[i], h_chunk[i + 1], g_exp, g_exp
         )
 
 
@@ -817,19 +836,15 @@ def gated_delta_rule_decode_kernel_seqlen1(
     pred = cutlass.Float32(0.0)
     pred2 = cutlass.Float32(0.0)
     for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = cute.arch.fma_packed_f32x2(
-            src_a=(
-                h_sh_chunk0[lane_idx, k_base + i].to(cutlass.Float32),
-                h_sh_chunk0[lane_idx, k_base + i + 1].to(cutlass.Float32),
-            ),
-            src_b=(g_exp, g_exp),
-            src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
+        h_chunk[i], h_chunk[i + 1] = fma_pair_mul(
+            h_sh_chunk0[lane_idx, k_base + i].to(cutlass.Float32),
+            h_sh_chunk0[lane_idx, k_base + i + 1].to(cutlass.Float32),
+            g_exp,
+            g_exp,
         )
     for i in cutlass.range_constexpr(0, 32, 2):
-        pred, pred2 = cute.arch.fma_packed_f32x2(
-            src_a=(h_chunk[i], h_chunk[i + 1]),
-            src_b=(k_chunk[i], k_chunk[i + 1]),
-            src_c=(pred, pred2),
+        pred, pred2 = fma_pair(
+            h_chunk[i], h_chunk[i + 1], k_chunk[i], k_chunk[i + 1], pred, pred2
         )
     pred = pred + pred2
 
@@ -845,10 +860,8 @@ def gated_delta_rule_decode_kernel_seqlen1(
     v_val = (v_sh[lane_idx] - pred_final) * beta
 
     for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = cute.arch.fma_packed_f32x2(
-            src_a=(k_chunk[i], k_chunk[i + 1]),
-            src_b=(v_val, v_val),
-            src_c=(h_chunk[i], h_chunk[i + 1]),
+        h_chunk[i], h_chunk[i + 1] = fma_pair(
+            k_chunk[i], k_chunk[i + 1], v_val, v_val, h_chunk[i], h_chunk[i + 1]
         )
 
     # Load Q for output computation
@@ -858,10 +871,8 @@ def gated_delta_rule_decode_kernel_seqlen1(
     out = cutlass.Float32(0.0)
     out2 = cutlass.Float32(0.0)
     for i in cutlass.range_constexpr(0, 32, 2):
-        out, out2 = cute.arch.fma_packed_f32x2(
-            src_a=(h_chunk[i], h_chunk[i + 1]),
-            src_b=(qk_temp[i], qk_temp[i + 1]),
-            src_c=(out, out2),
+        out, out2 = fma_pair(
+            h_chunk[i], h_chunk[i + 1], qk_temp[i], qk_temp[i + 1], out, out2
         )
     out = out + out2
 
@@ -894,19 +905,15 @@ def gated_delta_rule_decode_kernel_seqlen1(
     pred = cutlass.Float32(0.0)
     pred2 = cutlass.Float32(0.0)
     for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = cute.arch.fma_packed_f32x2(
-            src_a=(
-                h_sh_chunk1[lane_idx, k_base + i].to(cutlass.Float32),
-                h_sh_chunk1[lane_idx, k_base + i + 1].to(cutlass.Float32),
-            ),
-            src_b=(g_exp, g_exp),
-            src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
+        h_chunk[i], h_chunk[i + 1] = fma_pair_mul(
+            h_sh_chunk1[lane_idx, k_base + i].to(cutlass.Float32),
+            h_sh_chunk1[lane_idx, k_base + i + 1].to(cutlass.Float32),
+            g_exp,
+            g_exp,
         )
     for i in cutlass.range_constexpr(0, 32, 2):
-        pred, pred2 = cute.arch.fma_packed_f32x2(
-            src_a=(h_chunk[i], h_chunk[i + 1]),
-            src_b=(k_chunk[i], k_chunk[i + 1]),
-            src_c=(pred, pred2),
+        pred, pred2 = fma_pair(
+            h_chunk[i], h_chunk[i + 1], k_chunk[i], k_chunk[i + 1], pred, pred2
         )
     pred = pred + pred2
 
@@ -922,10 +929,8 @@ def gated_delta_rule_decode_kernel_seqlen1(
     v_val = (v_sh[32 + lane_idx] - pred_final) * beta
 
     for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = cute.arch.fma_packed_f32x2(
-            src_a=(k_chunk[i], k_chunk[i + 1]),
-            src_b=(v_val, v_val),
-            src_c=(h_chunk[i], h_chunk[i + 1]),
+        h_chunk[i], h_chunk[i + 1] = fma_pair(
+            k_chunk[i], k_chunk[i + 1], v_val, v_val, h_chunk[i], h_chunk[i + 1]
         )
 
     for i in cutlass.range_constexpr(32):
@@ -934,10 +939,8 @@ def gated_delta_rule_decode_kernel_seqlen1(
     out = cutlass.Float32(0.0)
     out2 = cutlass.Float32(0.0)
     for i in cutlass.range_constexpr(0, 32, 2):
-        out, out2 = cute.arch.fma_packed_f32x2(
-            src_a=(h_chunk[i], h_chunk[i + 1]),
-            src_b=(qk_temp[i], qk_temp[i + 1]),
-            src_c=(out, out2),
+        out, out2 = fma_pair(
+            h_chunk[i], h_chunk[i + 1], qk_temp[i], qk_temp[i + 1], out, out2
         )
     out = out + out2
 
@@ -965,19 +968,15 @@ def gated_delta_rule_decode_kernel_seqlen1(
     pred = cutlass.Float32(0.0)
     pred2 = cutlass.Float32(0.0)
     for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = cute.arch.fma_packed_f32x2(
-            src_a=(
-                h_sh_chunk2[lane_idx, k_base + i].to(cutlass.Float32),
-                h_sh_chunk2[lane_idx, k_base + i + 1].to(cutlass.Float32),
-            ),
-            src_b=(g_exp, g_exp),
-            src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
+        h_chunk[i], h_chunk[i + 1] = fma_pair_mul(
+            h_sh_chunk2[lane_idx, k_base + i].to(cutlass.Float32),
+            h_sh_chunk2[lane_idx, k_base + i + 1].to(cutlass.Float32),
+            g_exp,
+            g_exp,
         )
     for i in cutlass.range_constexpr(0, 32, 2):
-        pred, pred2 = cute.arch.fma_packed_f32x2(
-            src_a=(h_chunk[i], h_chunk[i + 1]),
-            src_b=(k_chunk[i], k_chunk[i + 1]),
-            src_c=(pred, pred2),
+        pred, pred2 = fma_pair(
+            h_chunk[i], h_chunk[i + 1], k_chunk[i], k_chunk[i + 1], pred, pred2
         )
     pred = pred + pred2
 
@@ -993,10 +992,8 @@ def gated_delta_rule_decode_kernel_seqlen1(
     v_val = (v_sh[64 + lane_idx] - pred_final) * beta
 
     for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = cute.arch.fma_packed_f32x2(
-            src_a=(k_chunk[i], k_chunk[i + 1]),
-            src_b=(v_val, v_val),
-            src_c=(h_chunk[i], h_chunk[i + 1]),
+        h_chunk[i], h_chunk[i + 1] = fma_pair(
+            k_chunk[i], k_chunk[i + 1], v_val, v_val, h_chunk[i], h_chunk[i + 1]
         )
 
     for i in cutlass.range_constexpr(32):
@@ -1005,10 +1002,8 @@ def gated_delta_rule_decode_kernel_seqlen1(
     out = cutlass.Float32(0.0)
     out2 = cutlass.Float32(0.0)
     for i in cutlass.range_constexpr(0, 32, 2):
-        out, out2 = cute.arch.fma_packed_f32x2(
-            src_a=(h_chunk[i], h_chunk[i + 1]),
-            src_b=(qk_temp[i], qk_temp[i + 1]),
-            src_c=(out, out2),
+        out, out2 = fma_pair(
+            h_chunk[i], h_chunk[i + 1], qk_temp[i], qk_temp[i + 1], out, out2
         )
     out = out + out2
 
@@ -1036,19 +1031,15 @@ def gated_delta_rule_decode_kernel_seqlen1(
     pred = cutlass.Float32(0.0)
     pred2 = cutlass.Float32(0.0)
     for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = cute.arch.fma_packed_f32x2(
-            src_a=(
-                h_sh_chunk3[lane_idx, k_base + i].to(cutlass.Float32),
-                h_sh_chunk3[lane_idx, k_base + i + 1].to(cutlass.Float32),
-            ),
-            src_b=(g_exp, g_exp),
-            src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
+        h_chunk[i], h_chunk[i + 1] = fma_pair_mul(
+            h_sh_chunk3[lane_idx, k_base + i].to(cutlass.Float32),
+            h_sh_chunk3[lane_idx, k_base + i + 1].to(cutlass.Float32),
+            g_exp,
+            g_exp,
         )
     for i in cutlass.range_constexpr(0, 32, 2):
-        pred, pred2 = cute.arch.fma_packed_f32x2(
-            src_a=(h_chunk[i], h_chunk[i + 1]),
-            src_b=(k_chunk[i], k_chunk[i + 1]),
-            src_c=(pred, pred2),
+        pred, pred2 = fma_pair(
+            h_chunk[i], h_chunk[i + 1], k_chunk[i], k_chunk[i + 1], pred, pred2
         )
     pred = pred + pred2
 
@@ -1064,10 +1055,8 @@ def gated_delta_rule_decode_kernel_seqlen1(
     v_val = (v_sh[96 + lane_idx] - pred_final) * beta
 
     for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = cute.arch.fma_packed_f32x2(
-            src_a=(k_chunk[i], k_chunk[i + 1]),
-            src_b=(v_val, v_val),
-            src_c=(h_chunk[i], h_chunk[i + 1]),
+        h_chunk[i], h_chunk[i + 1] = fma_pair(
+            k_chunk[i], k_chunk[i + 1], v_val, v_val, h_chunk[i], h_chunk[i + 1]
         )
 
     for i in cutlass.range_constexpr(32):
@@ -1076,10 +1065,8 @@ def gated_delta_rule_decode_kernel_seqlen1(
     out = cutlass.Float32(0.0)
     out2 = cutlass.Float32(0.0)
     for i in cutlass.range_constexpr(0, 32, 2):
-        out, out2 = cute.arch.fma_packed_f32x2(
-            src_a=(h_chunk[i], h_chunk[i + 1]),
-            src_b=(qk_temp[i], qk_temp[i + 1]),
-            src_c=(out, out2),
+        out, out2 = fma_pair(
+            h_chunk[i], h_chunk[i + 1], qk_temp[i], qk_temp[i + 1], out, out2
         )
     out = out + out2
 
@@ -1632,19 +1619,15 @@ def gated_delta_rule_decode_kernel_seqlen1_lowBS_1chunk(
     pred = cutlass.Float32(0.0)
     pred2 = cutlass.Float32(0.0)
     for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = cute.arch.fma_packed_f32x2(
-            src_a=(
-                h_sh_chunk[lane_idx, k_base + i].to(cutlass.Float32),
-                h_sh_chunk[lane_idx, k_base + i + 1].to(cutlass.Float32),
-            ),
-            src_b=(g_exp, g_exp),
-            src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
+        h_chunk[i], h_chunk[i + 1] = fma_pair_mul(
+            h_sh_chunk[lane_idx, k_base + i].to(cutlass.Float32),
+            h_sh_chunk[lane_idx, k_base + i + 1].to(cutlass.Float32),
+            g_exp,
+            g_exp,
         )
     for i in cutlass.range_constexpr(0, 32, 2):
-        pred, pred2 = cute.arch.fma_packed_f32x2(
-            src_a=(h_chunk[i], h_chunk[i + 1]),
-            src_b=(k_chunk[i], k_chunk[i + 1]),
-            src_c=(pred, pred2),
+        pred, pred2 = fma_pair(
+            h_chunk[i], h_chunk[i + 1], k_chunk[i], k_chunk[i + 1], pred, pred2
         )
     pred = pred + pred2
 
@@ -1660,10 +1643,8 @@ def gated_delta_rule_decode_kernel_seqlen1_lowBS_1chunk(
     v_val = (v_sh[lane_idx] - pred_final) * beta
 
     for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = cute.arch.fma_packed_f32x2(
-            src_a=(k_chunk[i], k_chunk[i + 1]),
-            src_b=(v_val, v_val),
-            src_c=(h_chunk[i], h_chunk[i + 1]),
+        h_chunk[i], h_chunk[i + 1] = fma_pair(
+            k_chunk[i], k_chunk[i + 1], v_val, v_val, h_chunk[i], h_chunk[i + 1]
         )
 
     for i in cutlass.range_constexpr(32):
@@ -1672,10 +1653,8 @@ def gated_delta_rule_decode_kernel_seqlen1_lowBS_1chunk(
     out = cutlass.Float32(0.0)
     out2 = cutlass.Float32(0.0)
     for i in cutlass.range_constexpr(0, 32, 2):
-        out, out2 = cute.arch.fma_packed_f32x2(
-            src_a=(h_chunk[i], h_chunk[i + 1]),
-            src_b=(qk_temp[i], qk_temp[i + 1]),
-            src_c=(out, out2),
+        out, out2 = fma_pair(
+            h_chunk[i], h_chunk[i + 1], qk_temp[i], qk_temp[i + 1], out, out2
         )
     out = out + out2
 

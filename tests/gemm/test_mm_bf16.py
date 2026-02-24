@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 
 from flashinfer import autotune, mm_bf16
+from flashinfer.gemm.gemm_base import CUDNN_AVAILABLE
 from flashinfer.utils import get_compute_capability
 
 
@@ -31,6 +32,9 @@ def test_mm_bf16(
         )
     if not mm_bf16.is_backend_supported(backend, compute_capability_number):
         pytest.skip(f"{backend} backend not supported on current compute capability.")
+
+    if backend == "cudnn" and not CUDNN_AVAILABLE:
+        pytest.skip("cuDNN is not available on this system.")
 
     if backend == "cudnn" and (enable_bias or pdl):
         pytest.skip(

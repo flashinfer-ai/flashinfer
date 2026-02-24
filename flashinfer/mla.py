@@ -534,6 +534,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     bmm1_scale: Union[float, torch.Tensor] = 1.0,
     bmm2_scale: Union[float, torch.Tensor] = 1.0,
     sinks: Optional[List[torch.Tensor]] = None,
+    skip_softmax_threshold_scale_factor: Optional[float] = None,
     enable_pdl: bool = None,
     backend: str = "auto",
 ) -> torch.Tensor:
@@ -556,6 +557,11 @@ def trtllm_batch_decode_with_kv_cache_mla(
     bmm2_scale: fused scale for mla bmm2 input.
         when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32.
     sinks: additional value per head in the denominator of the softmax.
+    skip_softmax_threshold_scale_factor: threshold scale factor for skipping softmax operations.
+        Providing a value for this parameter enables skip-softmax sparsity as described in: https://arxiv.org/abs/2512.12087
+        If no value is provided, then standard attention is used.
+        Setting the threshold to a higher value generally increases kernel performance at the cost of accuracy degradation.
+        The actual threshold value equals the provided threshold_scale_factor divided by the context length.
     backend : str = "auto"
         The implementation backend, could be ``auto``/``xqa`` or ``trtllm-gen``. Defaults to ``auto``.
         When set to ``auto``, the backend will be chosen based on the device architecture and kernel availability.
@@ -605,6 +611,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
             raise ValueError(
                 f"XQA MLA only supports q_len_per_request == 1, got {query.size(1)}"
             )
+        if skip_softmax_threshold_scale_factor is not None:
+            raise ValueError("skip_softmax is not supported for XQA backend")
         return xqa_batch_decode_with_kv_cache_mla(
             query,
             kv_cache,
@@ -634,6 +642,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
             block_size != 32 and block_size != 64
         ):  # todo(Yingyi): add support for more block sizes?
             raise ValueError(f"Supported block_size are 32 and 64, got {block_size}")
+
+        if skip_softmax_threshold_scale_factor is not None and sparse_mla_top_k != 0:
+            raise ValueError("skip_softmax is not supported for sparse MLA")
 
         # Validate and normalize to 4D
         kv_cache = _check_trtllm_gen_mla_shape(
@@ -688,7 +699,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
             workspace_buffer.numel() * workspace_buffer.element_size(),
             sinks,
             None,  # cum_seq_lens_q
-            None,  # skip_softmax_threshold_scale_factor
+            skip_softmax_threshold_scale_factor,
         )
 
         return out

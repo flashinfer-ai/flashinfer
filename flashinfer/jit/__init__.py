@@ -85,6 +85,7 @@ from .dsv3_optimizations import (
 from .dsv3_optimizations import (
     gen_dsv3_fused_routing_module as gen_dsv3_fused_routing_module,
 )
+from .tinygemm2 import gen_tinygemm2_module as gen_tinygemm2_module
 from .moe_utils import gen_moe_utils_module as gen_moe_utils_module
 
 
