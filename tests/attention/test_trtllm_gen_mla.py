@@ -3,6 +3,10 @@ import torch
 import random
 
 import flashinfer
+from flashinfer.mla import (
+    MLALayerDimensions,
+    supported_mla_layer_dimensions,
+)
 from flashinfer.utils import get_compute_capability
 
 global_workspace_buffer = None  # can.be empty initialized
@@ -210,6 +214,7 @@ def sparse_mla_reference_torch(
 
 
 def trtllm_batch_decode_mla(
+    layer_dimensions: MLALayerDimensions,
     batch_size: int,
     scale: float,
     dtype: torch.dtype,
@@ -241,18 +246,13 @@ def trtllm_batch_decode_mla(
     torch.manual_seed(42)
     device = "cuda:0"
 
-    # Deepseek attention config (decode-MLA)
-    num_q_heads = 128
-    qk_nope_head_dim = 128
-    qk_rope_head_dim = 64
-    kv_lora_rank = 512
-
     # Initialize tensors
     query = torch.randn(
         batch_size,
         q_len_per_request,
-        num_q_heads,
-        kv_lora_rank + qk_rope_head_dim,
+        layer_dimensions.num_heads,
+        layer_dimensions.head_dimensions.kv_lora_rank
+        + layer_dimensions.head_dimensions.qk_rope_head_dim,
         device=device,
     ).to(dtype)
 
@@ -292,7 +292,13 @@ def trtllm_batch_decode_mla(
     # Create interleaved KV cache
     # Allocate more than needed blocks, block_id is just enough, to mimick real-world cases
     kv_cache = torch.randn(
-        size=(num_blocks, page_size, kv_lora_rank + qk_rope_head_dim), device=device
+        size=(
+            num_blocks,
+            page_size,
+            layer_dimensions.head_dimensions.kv_lora_rank
+            + layer_dimensions.head_dimensions.qk_rope_head_dim,
+        ),
+        device=device,
     ).to(dtype)
     # (num_blocks, 1, page_size, kv_lora_rank + qk_rope_head_dim)
 
@@ -318,9 +324,9 @@ def trtllm_batch_decode_mla(
         query=query,
         kv_cache=kv_cache.unsqueeze(1),
         workspace_buffer=workspace_buffer,
-        qk_nope_head_dim=qk_nope_head_dim,
-        kv_lora_rank=kv_lora_rank,
-        qk_rope_head_dim=qk_rope_head_dim,
+        qk_nope_head_dim=layer_dimensions.head_dimensions.qk_nope_head_dim,
+        kv_lora_rank=layer_dimensions.head_dimensions.kv_lora_rank,
+        qk_rope_head_dim=layer_dimensions.head_dimensions.qk_rope_head_dim,
         block_tables=block_tables,
         seq_lens=seq_lens_tensor,
         max_seq_len=max_seq_len,
@@ -361,25 +367,29 @@ def trtllm_batch_decode_mla(
         kv_indptr,
         kv_indices,
         seq_lens_tensor,
-        num_q_heads,
-        kv_lora_rank,
-        qk_rope_head_dim,
+        layer_dimensions.num_heads,
+        layer_dimensions.head_dimensions.kv_lora_rank,
+        layer_dimensions.head_dimensions.qk_rope_head_dim,
         page_size,
         True,
         sm_scale,
         query.dtype,
         kv_cache.dtype,
     )
-    q_nope = query[..., :kv_lora_rank].view(
-        batch_size * q_len_per_request, num_q_heads, kv_lora_rank
+    q_nope = query[..., : layer_dimensions.head_dimensions.kv_lora_rank].view(
+        batch_size * q_len_per_request,
+        layer_dimensions.num_heads,
+        layer_dimensions.head_dimensions.kv_lora_rank,
     )
-    q_pe = query[..., kv_lora_rank:].view(
-        batch_size * q_len_per_request, num_q_heads, qk_rope_head_dim
+    q_pe = query[..., layer_dimensions.head_dimensions.kv_lora_rank :].view(
+        batch_size * q_len_per_request,
+        layer_dimensions.num_heads,
+        layer_dimensions.head_dimensions.qk_rope_head_dim,
     )
 
     # todo: fix kv_cache
-    ckv = kv_cache[..., :kv_lora_rank]
-    kpe = kv_cache[..., kv_lora_rank:]
+    ckv = kv_cache[..., : layer_dimensions.head_dimensions.kv_lora_rank]
+    kpe = kv_cache[..., layer_dimensions.head_dimensions.kv_lora_rank :]
 
     o_ref = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=False)
 
@@ -392,7 +402,9 @@ def trtllm_batch_decode_mla(
             try:
                 torch.testing.assert_close(
                     output,
-                    o_ref.view(batch_size, q_len_per_request, num_q_heads, -1),
+                    o_ref.view(
+                        batch_size, q_len_per_request, layer_dimensions.num_heads, -1
+                    ),
                     rtol=1e-1,
                     atol=1e-1,
                 )  # todo: do reference with normal attention?
@@ -404,7 +416,9 @@ def trtllm_batch_decode_mla(
             try:
                 torch.testing.assert_close(
                     output,
-                    o_ref.view(batch_size, q_len_per_request, num_q_heads, -1),
+                    o_ref.view(
+                        batch_size, q_len_per_request, layer_dimensions.num_heads, -1
+                    ),
                     rtol=1e-2,
                     atol=1e-2,
                 )
@@ -417,10 +431,16 @@ def trtllm_batch_decode_mla(
         rtol = 0.05
 
         diff_abs = torch.abs(
-            o_ref.view(batch_size, q_len_per_request, num_q_heads, -1) - output
+            o_ref.view(batch_size, q_len_per_request, layer_dimensions.num_heads, -1)
+            - output
         )
         diff_rel = diff_abs / (
-            torch.abs(o_ref.view(batch_size, q_len_per_request, num_q_heads, -1)) + 1e-8
+            torch.abs(
+                o_ref.view(
+                    batch_size, q_len_per_request, layer_dimensions.num_heads, -1
+                )
+            )
+            + 1e-8
         )
 
         within_tolerance = (diff_abs <= atol) | (diff_rel <= rtol)
@@ -434,6 +454,10 @@ def trtllm_batch_decode_mla(
         )
 
 
+@pytest.mark.parametrize(
+    "layer_dimensions",
+    supported_mla_layer_dimensions,
+)
 @pytest.mark.parametrize(
     "batch_size",
     [1, 2, 4, 16, 32, 64, 128, 256, 512, 768, 1024],
@@ -449,6 +473,7 @@ def trtllm_batch_decode_mla(
 @pytest.mark.parametrize("backend", ["trtllm-gen", "xqa"])
 @pytest.mark.parametrize("skips_softmax", [False, True])
 def test_trtllm_batch_decode_mla(
+    layer_dimensions: MLALayerDimensions,
     batch_size: int,
     scale: float,
     dtype: torch.dtype,
@@ -460,6 +485,7 @@ def test_trtllm_batch_decode_mla(
     skips_softmax: bool,
 ):
     trtllm_batch_decode_mla(
+        layer_dimensions,
         batch_size,
         scale,
         dtype,
@@ -474,6 +500,10 @@ def test_trtllm_batch_decode_mla(
 
 
 @pytest.mark.parametrize(
+    "layer_dimensions",
+    supported_mla_layer_dimensions,
+)
+@pytest.mark.parametrize(
     "batch_size",
     [2, 4, 8],
 )
@@ -487,6 +517,7 @@ def test_trtllm_batch_decode_mla(
 @pytest.mark.parametrize("MAX_SEQ_LEN", [1024, 8960])
 @pytest.mark.parametrize("skips_softmax", [False, True])
 def test_dsr1_trtllm_mla(
+    layer_dimensions: MLALayerDimensions,
     batch_size: int,
     scale: float,
     dtype: torch.dtype,
@@ -499,6 +530,7 @@ def test_dsr1_trtllm_mla(
     skips_softmax: bool,
 ):
     trtllm_batch_decode_mla(
+        layer_dimensions,
         batch_size,
         scale,
         dtype,
@@ -706,7 +738,7 @@ def test_trtllm_batch_decode_mla_sparse(
 
     sm_scale = scale / ((qk_nope_head_dim + qk_rope_head_dim) ** 0.5)
 
-    out_ref, lse_ref = sparse_mla_reference_torch(
+    out_ref, _ = sparse_mla_reference_torch(
         cache_seqlens=seq_lens_tensor,
         block_table=block_tables,
         q=query_ref,

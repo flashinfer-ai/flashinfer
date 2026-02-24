@@ -146,7 +146,7 @@ void trtllm_paged_attention_launcher(
   // The sparse MLA parameters.
   runner_params.mSparseMla = sparse_mla_top_k > 0;
   runner_params.mSparseMlaTopK = sparse_mla_top_k;
-  TVM_FFI_ICHECK((head_dim_qk == 576 && head_dim_vo == 512) || sparse_mla_top_k <= 0)
+  TVM_FFI_ICHECK((head_dim_qk == 576 && head_dim_vo == 512) || (head_dim_qk == 320 && head_dim_vo == 256) || sparse_mla_top_k <= 0)
       << "Only decode MLA supports sparse MLA";
 
   AlignedAllocator float_allocator(workspace_buffer, workspace_size);
@@ -251,7 +251,7 @@ void trtllm_paged_attention_decode(
   TVM_FFI_ICHECK_EQ(head_dim_k, head_dim_q)
       << "head_dim_k and head_dim_q must be the same, got " << std::to_string(head_dim_k) << " and "
       << std::to_string(head_dim_q);
-  TVM_FFI_ICHECK((head_dim_v == 576 && head_dim_o == 512) || head_dim_v == head_dim_o)
+  TVM_FFI_ICHECK((head_dim_v == 576 && head_dim_o == 512) || (head_dim_v == 320 && head_dim_o == 256) || head_dim_v == head_dim_o)
       << "head_dim_v and head_dim_o must be the same for non-MLA attention, got "
       << std::to_string(head_dim_v) << " and " << std::to_string(head_dim_o);
   int max_num_blocks_per_seq = block_tables.size(-1);

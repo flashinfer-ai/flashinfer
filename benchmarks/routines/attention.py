@@ -1352,7 +1352,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
 def testBatchPrefillWithRaggedKVCacheWrapper(args):
     """
     Test BatchPrefillWithRaggedKVCacheWrapper API and equivalent cuDNN API.
-    Supports fa2, fa3, cutlass, and cudnn backends.
+    Supports fa2, fa3, cutlass, cudnn and trtllm-gen backends.
 
     This test:
     1. Creates ragged KV cache and query tensors for prefill
@@ -1460,15 +1460,11 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             backends.remove("trtllm-gen")
     if "trtllm-native" in backends:
         remove_trtllm_native = False
-        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] or kv_dtype in [
-            torch.float8_e4m3fn,
-            torch.float8_e5m2,
-        ]:
-            print("[INFO] trtllm-native backend does not support FP8. Skipping.")
-            remove_trtllm_native = True
-        if not (head_dim_qk == 192 and head_dim_vo == 128):
+        if not (head_dim_qk == 192 and head_dim_vo == 128) and not (
+            head_dim_qk == 128 and head_dim_vo == 128
+        ):
             print(
-                "[INFO] trtllm-native backend requires head_dim_qk == 192 and head_dim_vo == 128"
+                "[INFO] trtllm-native backend requires head_dim_qk == 192 and head_dim_vo == 128 or head_dim_qk == 128 and head_dim_vo == 128. Skipping."
             )
             remove_trtllm_native = True
         if remove_trtllm_native:
@@ -1733,6 +1729,12 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 is_cuda_graph_compatible=True,
             )[0]
         elif backend == "trtllm-native":
+            # For FP8: bmm1_scale = q_scale * k_scale * sm_scale,
+            #          bmm2_scale = v_scale
+            _k_scale = k_scale if k_scale is not None else 1.0
+            _v_scale = v_scale if v_scale is not None else 1.0
+            _bmm1_scale = scale * _k_scale
+            _bmm2_scale = _v_scale
             return flashinfer.prefill.trtllm_ragged_attention_deepseek(
                 query=q,
                 key=k,
@@ -1741,8 +1743,8 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 seq_lens=actual_seq_lens_kv_device,
                 max_q_len=s_qo,
                 max_kv_len=s_kv,
-                bmm1_scale=scale,
-                bmm2_scale=1.0,
+                bmm1_scale=_bmm1_scale,
+                bmm2_scale=_bmm2_scale,
                 o_sf_scale=-1,
                 batch_size=batch_size,
                 window_left=-1,
