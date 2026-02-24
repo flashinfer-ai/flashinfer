@@ -15,7 +15,7 @@ from flashinfer.fused_moe import (
     fused_topk_deepseek,
 )
 from flashinfer.fused_moe.core import RoutingMethodType
-from flashinfer import fp4_quantize
+from flashinfer import fp4_quantize, mxfp8_quantize
 from flashinfer.testing.utils import (
     bench_gpu_time,
 )
@@ -185,6 +185,20 @@ def parse_moe_args(line, parser):
         default=False,
         help=(
             "Enable autotuner warmup for supported routines (trtllm_fp4_block_scale_moe and cutlass_fused_moe)."
+        ),
+    )
+    parser.add_argument(
+        "--fp4_mode",
+        type=str,
+        required=False,
+        default="nvfp4",
+        choices=["nvfp4", "mxfp4_mxfp8", "mxfp4_bf16"],
+        help=(
+            "FP4 quantization mode for trtllm_fp4_block_scale_moe: "
+            "nvfp4 (NvFP4 weights + NvFP4 hidden states, block_size=16), "
+            "mxfp4_mxfp8 (MXFP4 weights + MXFP8 hidden states, block_size=32), "
+            "mxfp4_bf16 (MXFP4 weights + BF16 hidden states, block_size=32). "
+            "Default: nvfp4"
         ),
     )
 
@@ -482,11 +496,14 @@ def testTrtllmFp4BlockScaleMoe(args):
         routed_scaling_factor=routed_scaling_factor,
     )
 
-    # For FP4, we need to properly quantize weights and create scales
-    use_ue8m0 = False
+    # Determine FP4 quantization mode
+    fp4_mode = getattr(args, "fp4_mode", "nvfp4")
+    is_mxfp4 = fp4_mode in ("mxfp4_mxfp8", "mxfp4_bf16")
+    use_ue8m0 = is_mxfp4
+    sf_vec_size = 32 if is_mxfp4 else 16
 
-    # Calculate global scale factor for hidden states
-    hidden_states_scale_global = calculate_fp4_global_scale(hidden_states)
+    if args.verbose >= 1:
+        print(f"[INFO] FP4 mode: {fp4_mode} (use_ue8m0={use_ue8m0}, sf_vec_size={sf_vec_size})")
 
     # Quantize weights using proper FP4 quantization
     gemm1_weights_fp4_bytes, gemm1_scales_fp4_bytes, gemm1_scales_global = (
@@ -496,52 +513,56 @@ def testTrtllmFp4BlockScaleMoe(args):
         quantize_fp4_batched(gemm2_weights, num_experts, use_ue8m0, True)
     )
 
-    # Quantize hidden states
-    hidden_states_fp4_bytes, hidden_states_scale_fp4_bytes, _ = quantize_fp4(
-        hidden_states, hidden_states_scale_global, use_ue8m0, True
-    )
-
-    # Reshape hidden states for the kernel (pack 2 FP4 values into 1 byte)
-    # Keep as uint8 format for FP4 packed data
-    hidden_states_fp4 = hidden_states_fp4_bytes.view(torch.uint8).reshape(
-        hidden_states.shape[0], hidden_states.shape[1] // 2
-    )
-    # Hidden-states scale for FP4 must be 2D: [num_tokens, hidden_size // 16]
-    hidden_states_scale_linear_fp4 = hidden_states_scale_fp4_bytes.view(
-        torch.float8_e4m3fn
-    )
-    # Ensure expected shape (16 elements per hidden value for NvFP4)
-    expected_scale_elems = (num_tokens * hidden_size) // 16
-    if hidden_states_scale_linear_fp4.numel() != expected_scale_elems:
-        if args.verbose >= 1:
-            print(
-                f"[INFO] Adjusting FP4 hidden_states_scale from {hidden_states_scale_linear_fp4.numel()} to {expected_scale_elems} elements"
-            )
-        hidden_states_scale_linear_fp4 = torch.ones(
-            expected_scale_elems, device=device, dtype=torch.float8_e4m3fn
+    # Prepare hidden states and scale based on fp4_mode
+    if fp4_mode == "mxfp4_bf16":
+        hidden_states_fp4 = hidden_states.to(torch.bfloat16)
+        hidden_states_scale_linear_fp4 = None
+    elif fp4_mode == "mxfp4_mxfp8":
+        hs_quant, hs_scale = mxfp8_quantize(hidden_states, True)
+        hidden_states_fp4 = hs_quant
+        hidden_states_scale_linear_fp4 = hs_scale.view(torch.float8_e4m3fn).reshape(
+            num_tokens, -1
         )
-    hidden_states_scale_linear_fp4 = hidden_states_scale_linear_fp4.reshape(
-        num_tokens, hidden_size // 16
-    )
+    else:
+        hidden_states_scale_global = calculate_fp4_global_scale(hidden_states)
+        hidden_states_fp4_bytes, hidden_states_scale_fp4_bytes, _ = quantize_fp4(
+            hidden_states, hidden_states_scale_global, use_ue8m0, True
+        )
+        hidden_states_fp4 = hidden_states_fp4_bytes.view(torch.uint8).reshape(
+            num_tokens, hidden_size // 2
+        )
+        hidden_states_scale_linear_fp4 = hidden_states_scale_fp4_bytes.view(
+            torch.float8_e4m3fn
+        )
+        expected_scale_elems = (num_tokens * hidden_size) // sf_vec_size
+        if hidden_states_scale_linear_fp4.numel() != expected_scale_elems:
+            if args.verbose >= 1:
+                print(
+                    f"[INFO] Adjusting FP4 hidden_states_scale from "
+                    f"{hidden_states_scale_linear_fp4.numel()} to {expected_scale_elems} elements"
+                )
+            hidden_states_scale_linear_fp4 = torch.ones(
+                expected_scale_elems, device=device, dtype=torch.float8_e4m3fn
+            )
+        hidden_states_scale_linear_fp4 = hidden_states_scale_linear_fp4.reshape(
+            num_tokens, hidden_size // sf_vec_size
+        )
 
-    # Prepare weights for kernel
-    # For FP4 weights, keep them as uint8 (packed format) - don't convert to float8_e4m3fn
+    # Prepare weights for kernel (packed uint8 format, scale as float8_e4m3fn)
     gemm1_weights_fp4 = gemm1_weights_fp4_bytes.view(torch.uint8).reshape(
         num_experts, 2 * intermediate_size, hidden_size // 2
     )
-    # Scale factors should be viewed as float8_e4m3fn
     gemm1_weights_scale = gemm1_scales_fp4_bytes.view(torch.float8_e4m3fn).reshape(
-        num_experts, 2 * intermediate_size, hidden_size // 16
+        num_experts, 2 * intermediate_size, hidden_size // sf_vec_size
     )
 
     gemm2_weights_fp4 = gemm2_weights_fp4_bytes.view(torch.uint8).reshape(
         num_experts, hidden_size, intermediate_size // 2
     )
     gemm2_weights_scale = gemm2_scales_fp4_bytes.view(torch.float8_e4m3fn).reshape(
-        num_experts, hidden_size, intermediate_size // 16
+        num_experts, hidden_size, intermediate_size // sf_vec_size
     )
 
-    # Optional parameters for FP4 (using None for simplicity in benchmarking)
     gemm1_bias = None
     gemm1_alpha = None
     gemm1_beta = None
@@ -660,6 +681,8 @@ def testTrtllmFp4BlockScaleMoe(args):
     tflops = calculate_moe_tflops(
         num_tokens, hidden_size, intermediate_size, num_experts, top_k, median_time
     )
+    input_format_str = {"nvfp4": "nvfp4", "mxfp4_mxfp8": "mxfp8", "mxfp4_bf16": "bf16"}[fp4_mode]
+    weight_format_str = "mxfp4" if is_mxfp4 else "nvfp4"
     tb_per_sec = calculate_moe_kernel_bandwidth(
         num_tokens,
         hidden_size,
@@ -669,8 +692,8 @@ def testTrtllmFp4BlockScaleMoe(args):
         median_time,
         input_dtype,
         weight_dtype,
-        input_format="nvfp4",
-        weight_format="nvfp4",
+        input_format=input_format_str,
+        weight_format=weight_format_str,
         routing_logits_dtype=routing_logits.dtype,
         active_experts=int(selected_experts.unique().numel()),
         verbose=args.verbose,
@@ -704,6 +727,7 @@ def testTrtllmFp4BlockScaleMoe(args):
         cur_res["input_dtype"] = input_dtype
         cur_res["weight_dtype"] = weight_dtype
         cur_res["activation_type"] = args.activation_type.name
+        cur_res["fp4_mode"] = fp4_mode
         res.append(cur_res)
 
     return res

@@ -113,7 +113,7 @@ def quantize_fp4(
         - block_scale_factors: float8_e4m3fn tensor
         - global_scale_factor: float32 scalar tensor
     """
-    sf_vec_size = 16
+    sf_vec_size = 32 if use_ue8m0 else 16
 
     if global_scale is None:
         global_scale = calculate_fp4_global_scale(tensor)
@@ -542,6 +542,9 @@ def calculate_moe_kernel_bandwidth(
         elif fmt == "mxfp4":
             # 1 e2m1 + 1 ue8m0 scale per 32-element block
             return 0.5 + 1 / 32
+        elif fmt == "mxfp8":
+            # 1 e4m3 + 1 ue8m0 scale per 32-element block
+            return 1.0 + 1 / 32
         elif fmt == "fp8":
             # 1 e4m3
             return 1.0
