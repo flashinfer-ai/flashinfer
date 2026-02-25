@@ -48,6 +48,7 @@ from .moe_utils import (
     create_moe_output_scale_scalars,
     FLOAT8_E4M3_MAX,
     FLOAT4_E2M1_MAX,
+    SF_VEC_SIZE,
 )
 
 # Before 0.6.3, MoE APIs used "gated_act_type" (SwiGlu=0, GeGlu=1) instead of
@@ -530,7 +531,7 @@ def testTrtllmFp4BlockScaleMoe(args):
     fp4_mode = getattr(args, "fp4_mode", "nvfp4")
     is_mxfp4 = fp4_mode in ("mxfp4_mxfp8", "mxfp4_bf16")
     use_ue8m0 = is_mxfp4
-    sf_vec_size = 32 if is_mxfp4 else 16
+    sf_vec_size = SF_VEC_SIZE["mxfp4" if is_mxfp4 else "nvfp4"]
 
     if args.verbose >= 1:
         print(
