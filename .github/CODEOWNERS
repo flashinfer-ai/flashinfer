@@ -45,7 +45,7 @@ include/flashinfer/flat/ @yzh119
 include/flashinfer/gemm/ @flashinfer-ai/gemm-owners @yongwww @yzh119 @nvmbreughe @aleozlx
 include/flashinfer/mamba/ @yzh119
 include/flashinfer/trtllm/ @yzh119 @nv-yunzheq @jiahanc @IwakuraRein @aleozlx
-scripts/ @yzh119 @yongwww @yongwww @dierksen @sricketts
+scripts/ @yzh119 @yongwww @dierksen @sricketts
 tests/ @bkryu @yzh119 @nvmbreughe @nv-yunzheq @jimmyzho
 tests/attention/ @flashinfer-ai/attention-owners @nvmbreughe @yzh119 @bkryu @Anerudhan
 tests/cli/ @sricketts
