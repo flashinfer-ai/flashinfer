@@ -10,6 +10,7 @@ import flashinfer
 try:
     from flashinfer import ActivationType
 except ImportError:
+    # ActivationType was not exported from the top-level package until 0.6.3
     from flashinfer.fused_moe.core import ActivationType
 
 from flashinfer.autotuner import autotune
@@ -49,6 +50,8 @@ from .moe_utils import (
     FLOAT4_E2M1_MAX,
 )
 
+# Before 0.6.3, MoE APIs used "gated_act_type" (SwiGlu=0, GeGlu=1) instead of
+# "activation_type" (Swiglu=3, Geglu=4). Some 0.6.0 APIs omit the parameter entirely.
 _ACTIVATION_TO_GATED_ACT = {
     ActivationType.Swiglu: 0,
     ActivationType.Geglu: 1,
