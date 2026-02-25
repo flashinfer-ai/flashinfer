@@ -51,7 +51,7 @@ from .moe_utils import (
 )
 
 # Before 0.6.3, MoE APIs used "gated_act_type" (SwiGlu=0, GeGlu=1) instead of
-# "activation_type" (Swiglu=3, Geglu=4). Some 0.6.0 APIs omit the parameter entirely.
+# "activation_type" (Swiglu=3, Geglu=4). Some prior APIs omit the parameter entirely.
 _ACTIVATION_TO_GATED_ACT = {
     ActivationType.Swiglu: 0,
     ActivationType.Geglu: 1,
@@ -64,7 +64,13 @@ def _activation_kwarg(fn, activation_type: ActivationType) -> dict:
     if "activation_type" in sig.parameters:
         return {"activation_type": activation_type.value}
     if "gated_act_type" in sig.parameters:
-        return {"gated_act_type": _ACTIVATION_TO_GATED_ACT.get(activation_type, 0)}
+        if activation_type not in _ACTIVATION_TO_GATED_ACT:
+            raise ValueError(
+                f"Activation type {activation_type.name} is not supported by the "
+                f"installed flashinfer version (pre-0.6.3 only supports "
+                f"{[k.name for k in _ACTIVATION_TO_GATED_ACT]})"
+            )
+        return {"gated_act_type": _ACTIVATION_TO_GATED_ACT[activation_type]}
     return {}
 
 
@@ -544,6 +550,12 @@ def testTrtllmFp4BlockScaleMoe(args):
         hidden_states_fp4 = hidden_states.to(torch.bfloat16)
         hidden_states_scale_linear_fp4 = None
     elif fp4_mode == "mxfp4_mxfp8":
+        if num_tokens % 128 != 0:
+            raise ValueError(
+                f"mxfp4_mxfp8 mode requires num_tokens to be a multiple of 128 "
+                f"(got {num_tokens}) because mxfp8_quantize with swizzled scale "
+                f"layout pads rows to 128-element boundaries."
+            )
         hs_quant, hs_scale = mxfp8_quantize(hidden_states, True)
         hidden_states_fp4 = hs_quant
         hidden_states_scale_linear_fp4 = hs_scale.view(torch.float8_e4m3fn).reshape(
@@ -562,11 +574,12 @@ def testTrtllmFp4BlockScaleMoe(args):
         )
         expected_scale_elems = (num_tokens * hidden_size) // sf_vec_size
         if hidden_states_scale_linear_fp4.numel() != expected_scale_elems:
-            if args.verbose >= 1:
-                print(
-                    f"[INFO] Adjusting FP4 hidden_states_scale from "
-                    f"{hidden_states_scale_linear_fp4.numel()} to {expected_scale_elems} elements"
-                )
+            print(
+                f"[WARNING] FP4 hidden_states_scale element count mismatch "
+                f"({hidden_states_scale_linear_fp4.numel()} vs expected {expected_scale_elems}), "
+                f"substituting all-ones scale tensor. This is likely caused by swizzled "
+                f"layout padding when num_tokens ({num_tokens}) is not a multiple of 128."
+            )
             hidden_states_scale_linear_fp4 = torch.ones(
                 expected_scale_elems, device=device, dtype=torch.float8_e4m3fn
             )
