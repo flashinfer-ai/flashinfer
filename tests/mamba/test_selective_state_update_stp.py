@@ -630,6 +630,140 @@ class TestSelectiveStateUpdateInt16(TestSelectiveStateUpdate):
         )
 
 
+def _get_algorithms_no_horizontal():
+    """Return algorithms that support stochastic rounding (no horizontal)."""
+    major, _ = get_compute_capability(torch.device("cuda"))
+    algos = ["simple"]
+    if major >= 9:
+        algos.append("vertical")
+    return algos
+
+
+@pytest.mark.xfail(
+    reason="Phase 3: stochastic rounding not yet implemented in CUDA kernel"
+)
+class TestSelectiveStateUpdateStochasticRounding(TestSelectiveStateUpdate):
+    """Test fp16 state with stochastic rounding (bitwise match vs Triton reference)."""
+
+    ATOL = 0  # bitwise exact
+    RTOL = 0
+
+    RAND_SEED = 42
+
+    def make_inputs(self, batch, nheads, dim, dstate, state_dtype, weight_dtype):
+        """Create test inputs with fp16 state."""
+        return create_test_inputs(
+            batch,
+            nheads,
+            dim,
+            dstate,
+            self.NGROUPS,
+            self.INPUT_DTYPE,
+            weight_dtype=weight_dtype,
+            matrixA_dtype=self.MATRIX_A_DTYPE,
+            state_dtype=torch.float16,
+            generate_z=False,
+            seed=0,
+        )
+
+    def make_reference_output(self, inputs):
+        """Compute reference output using Triton with stochastic rounding."""
+        state_ref = inputs["state_cache"].clone()
+        rand_seed = torch.tensor(self.RAND_SEED, dtype=torch.int64, device="cuda")
+        y_ref = selective_state_update_triton(
+            state_ref,
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            D=inputs["D"],
+            z=inputs.get("z"),
+            dt_bias=inputs["dt_bias"],
+            dt_softplus=True,
+            state_batch_indices=inputs["slot_idx"],
+            pad_slot_id=-1,
+            rand_seed=rand_seed,
+        )
+        return y_ref, state_ref
+
+    def run_kernel(self, inputs, out=None, algorithm="auto"):
+        """Run the flashinfer kernel with stochastic rounding."""
+        return flashinfer.mamba.selective_state_update(
+            inputs["state_cache"],
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            D=inputs["D"],
+            z=inputs.get("z"),
+            dt_bias=inputs["dt_bias"],
+            dt_softplus=True,
+            state_batch_indices=inputs["slot_idx"],
+            pad_slot_id=-1,
+            out=out,
+            algorithm=algorithm,
+            rand_seed=self.RAND_SEED,
+        )
+
+    def assert_states_match(
+        self, state_ref, state_test, slot_idx, msg_prefix="", **kwargs
+    ):
+        """Assert states match bitwise (exact)."""
+        state_ref_batch = state_ref[slot_idx]
+        state_test_batch = state_test[slot_idx]
+        states_match = torch.equal(state_ref_batch, state_test_batch)
+
+        if states_match:
+            print(f"✓ {msg_prefix}States match bitwise (exact)")
+        else:
+            max_diff = (
+                (state_ref_batch.float() - state_test_batch.float()).abs().max().item()
+            )
+            print(
+                f"✗ {msg_prefix}States do NOT match bitwise (max_diff={max_diff:.6e})"
+            )
+            self._print_mismatch_details(state_ref_batch, state_test_batch, "state")
+
+        assert states_match
+
+    # fmt: off
+    _SR_PARAMS = [
+        # (batch, nheads, dim, dstate,  state_dtype,    weight_dtype,   use_out_tensor)
+        (  64,    64,     64,  128,     torch.float16,  torch.float32,  True ),  # base
+        (  64,    64,     64,   64,     torch.float16,  torch.float32,  True ),  # dstate=64
+    ]
+    # fmt: on
+
+    @pytest.mark.parametrize("algorithm", _get_algorithms_no_horizontal())
+    @pytest.mark.parametrize(
+        "batch,nheads,dim,dstate,state_dtype,weight_dtype,use_out_tensor",
+        _SR_PARAMS,
+    )
+    def test_output_correctness(
+        self,
+        batch,
+        nheads,
+        dim,
+        dstate,
+        state_dtype,
+        weight_dtype,
+        use_out_tensor,
+        algorithm,
+    ):
+        super().test_output_correctness(
+            batch,
+            nheads,
+            dim,
+            dstate,
+            state_dtype,
+            weight_dtype,
+            use_out_tensor,
+            algorithm,
+        )
+
+
 class TestSelectiveStateUpdateDtypeMismatch:
     """Test that selective_state_update fails with dtype mismatch between D and dt."""
 

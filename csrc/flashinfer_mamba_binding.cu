@@ -43,7 +43,8 @@ void selective_state_update(
     bool disable_state_update,
     Optional<TensorView> intermediate_states_buffer,  // (batch, cache_steps, nheads, dim, dstate)
     Optional<TensorView> intermediate_state_indices,  // (batch,)
-    int64_t cache_steps, int64_t algorithm);
+    Optional<TensorView> intermediate_state_scales,   // float32: (batch, cache_steps, nheads, dim)
+    int64_t rand_seed, int64_t cache_steps, int64_t algorithm);
 
 }  // namespace flashinfer::mamba
 

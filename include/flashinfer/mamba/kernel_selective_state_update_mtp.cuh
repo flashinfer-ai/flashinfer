@@ -28,7 +28,7 @@ struct SharedStorageSimple {
   alignas(alignof(PackedAligned<input_t>)) input_t C[TOKENS_MTP][DSTATE];
   alignas(alignof(PackedAligned<state_t>)) state_t state[STATE_ROWS][DSTATE];
   alignas(alignof(PackedAligned<float>))
-      std::conditional_t<scaleState, state_scale_t, char> state_scale[STATE_ROWS * scaleState];
+      std::conditional_t<scaleState, state_scale_t, char> state_scale[STATE_ROWS];
 };
 
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t,
@@ -158,9 +158,16 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
             auto* dst = reinterpret_cast<load_state_t*>(&sram.state[dd][i]);
             *dst = *reinterpret_cast<load_state_t*>(&state[d * DSTATE + i]);
           }
-          if constexpr (scaleState) {
-            if (lane == 0) sram.state_scale[dd] = state_scale[d];
-          }
+        }
+      }
+    }
+    // Load state_scale gmem -> smem (contiguous across warpRows)
+    if constexpr (scaleState) {
+      for (int warpRow = lane; warpRow < stateRowsPerWarpPerStage; warpRow += warpSize) {
+        auto dd = warp * stateRowsPerWarpPerStage + warpRow;
+        auto d = dBegin + dd;
+        if (d < DIM && state_batch != params.pad_slot_id) {
+          sram.state_scale[dd] = state_scale[d];
         }
       }
     }
@@ -231,23 +238,54 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
             out_value += new_state * C_value;
           }
 
-          if constexpr (sizeof(state_t) == sizeof(input_t)) {
-            if (intermediate_states) {
-              using packed_state_t = PackedAligned<state_t, packed_input_t::count>;
-              packed_state_t rStateOut;
+          // Store intermediate state to smem (non-scaleState path: naive cast)
+          if constexpr (!scaleState) {
+            if constexpr (sizeof(state_t) == sizeof(input_t)) {
+              if (intermediate_states) {
+                using packed_state_t = PackedAligned<state_t, packed_input_t::count>;
+                packed_state_t rStateOut;
 #pragma unroll
-              for (int k = 0; k < packed_input_t::count; k++) {
-                convertAndStore(&rStateOut.val[k], rState[ii + k]);
+                for (int k = 0; k < packed_input_t::count; k++) {
+                  convertAndStore(&rStateOut.val[k], rState[ii + k]);
+                }
+                *reinterpret_cast<packed_state_t*>(&sram.state[dd][base_i]) = rStateOut;
               }
-              *reinterpret_cast<packed_state_t*>(&sram.state[dd][base_i]) = rStateOut;
-            }
-          } else {
-            if (intermediate_states) {
+            } else {
+              if (intermediate_states) {
 #pragma unroll
-              for (int k = 0; k < packed_input_t::count; k++) {
-                convertAndStore(&sram.state[dd][base_i + k], rState[ii + k]);
+                for (int k = 0; k < packed_input_t::count; k++) {
+                  convertAndStore(&sram.state[dd][base_i + k], rState[ii + k]);
+                }
               }
             }
+          }
+        }
+
+        // For scaleState + intermediate_states: quantize rState → sram.state with block scaling
+        if constexpr (scaleState) {
+          if (intermediate_states && state_batch != params.pad_slot_id) {
+            // 2-pass: compute max, then encode
+            float istate_max = std::numeric_limits<float>::lowest();
+            for (int ii = 0; ii < stateValuesPerThread; ii++) {
+              istate_max = fmaxf(istate_max, fabsf(rState[ii]));
+            }
+            istate_max = warpReduceMax(istate_max);
+            istate_max = __shfl_sync(UINT32_MAX, istate_max, 0);
+            float const ie_scale =
+                static_cast<float>(std::numeric_limits<state_t>::max()) / istate_max;
+            float const id_scale = 1.f / ie_scale;
+
+            // Encode rState → sram.state
+            for (int ii = 0; ii < stateValuesPerThread; ii++) {
+              int i = lane * packed_input_t::count +
+                      (ii / packed_input_t::count) * warpSize * packed_input_t::count +
+                      (ii % packed_input_t::count);
+              if (i < DSTATE) {
+                convertAndStore(&sram.state[dd][i], rState[ii] * ie_scale);
+              }
+            }
+            // Store decode scale to smem for later gmem write
+            if (lane == 0) sram.state_scale[dd] = id_scale;
           }
         }
 
@@ -257,6 +295,7 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
         }
 
         if (intermediate_states && state_batch != params.pad_slot_id) {
+          // Write intermediate state smem → gmem
           for (int i = lane * load_state_t::count; i < DSTATE;
                i += warpSize * load_state_t::count) {
             auto* src = reinterpret_cast<load_state_t*>(&sram.state[dd][i]);
@@ -266,6 +305,14 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
                                      step * nheads * DIM * DSTATE + head * DIM * DSTATE +
                                      d * DSTATE + i]);
             *dst = *src;
+          }
+          // Write intermediate state decode scale → gmem
+          if constexpr (scaleState) {
+            if (lane == 0) {
+              auto* iscales = reinterpret_cast<float*>(params.intermediate_state_scales);
+              iscales[intermediate_cache_idx * params.intermediate_state_scales_stride_batch +
+                      step * nheads * DIM + head * DIM + d] = sram.state_scale[dd];
+            }
           }
         }
       }
@@ -310,8 +357,17 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
           auto* src = reinterpret_cast<load_state_t*>(&sram.state[dd][i]);
           *reinterpret_cast<load_state_t*>(&state[d * DSTATE + i]) = *src;
         }
-        if constexpr (scaleState) {
-          if (lane == 0) state_scale[d] = sram.state_scale[dd];
+      }
+    }
+    // Store state_scale smem -> gmem (contiguous across warpRows)
+    if constexpr (scaleState) {
+      if (params.update_state && state_batch != params.pad_slot_id) {
+        for (int warpRow = lane; warpRow < stateRowsPerWarpPerStage; warpRow += warpSize) {
+          auto dd = warp * stateRowsPerWarpPerStage + warpRow;
+          auto d = dBegin + dd;
+          if (d < DIM) {
+            state_scale[d] = sram.state_scale[dd];
+          }
         }
       }
     }
@@ -336,7 +392,7 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
 }
 
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t,
-          typename stateIndex_t>
+          typename stateIndex_t, typename state_scale_t>
 void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm algorithm,
                                    cudaStream_t stream) {
   constexpr bool scaleState = !std::is_same_v<state_scale_t, void>;
@@ -353,12 +409,6 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
   FLASHINFER_CHECK_ALIGNMENT(params.state, sizeof(load_state_t));
   FLASHINFER_CHECK((params.dim * params.dstate * sizeof(state_t)) % sizeof(load_state_t) == 0,
                    "state head stride must be aligned to ", sizeof(load_state_t), " bytes");
-
-  if constexpr (scaleState) {
-    FLASHINFER_CHECK(!params.intermediate_states,
-                     "int16 scaled state does not support intermediate_states buffer "
-                     "— requires separate intermediate_state_scales tensor");
-  }
 
   constexpr int numWarps = 4;
   constexpr int stateRowsPerWarpPerStage = 4;

@@ -16,3 +16,7 @@ constexpr int NTOKENS_MTP = {{ ntokens_mtp }};
 // Type for block-scale decode factors (e.g. float, __half).
 // void = no scaling (state_t is used as-is).
 using state_scale_t = {{ state_scale_type }};
+
+// Philox PRNG rounds for stochastic rounding of fp16 state stores.
+// 0 = no stochastic rounding; typical value = 10.
+constexpr int PHILOX_ROUNDS = {{ philox_rounds }};

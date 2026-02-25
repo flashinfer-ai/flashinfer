@@ -56,6 +56,7 @@ def get_selective_state_update_uri(
     dstate: int,
     ntokens_mtp: int,
     state_scale_dtype: Optional[torch.dtype] = None,
+    philox_rounds: int = 0,
 ) -> str:
     s = _filename_safe_dtype_map
     uri = (
@@ -66,6 +67,8 @@ def get_selective_state_update_uri(
     )
     if state_scale_dtype is not None:
         uri += f"_sc_{s[state_scale_dtype]}"
+    if philox_rounds > 0:
+        uri += f"_pr_{philox_rounds}"
     return uri
 
 
@@ -80,6 +83,7 @@ def _gen_module(
     dstate: int,
     ntokens_mtp: int,
     state_scale_dtype: Optional[torch.dtype] = None,
+    philox_rounds: int = 0,
     extra_cuda_cflags: list = None,
 ) -> JitSpec:
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
@@ -104,6 +108,7 @@ def _gen_module(
         dstate=dstate,
         ntokens_mtp=ntokens_mtp,
         state_scale_type=state_scale_type,
+        philox_rounds=philox_rounds,
     )
     write_if_different(gen_directory / "selective_state_update_config.inc", config_str)
 
@@ -138,6 +143,7 @@ def gen_selective_state_update_module(
     dstate: int,
     ntokens_mtp: int,
     state_scale_dtype: Optional[torch.dtype] = None,
+    philox_rounds: int = 0,
 ) -> JitSpec:
     uri = get_selective_state_update_uri(
         state_dtype,
@@ -149,6 +155,7 @@ def gen_selective_state_update_module(
         dstate,
         ntokens_mtp,
         state_scale_dtype,
+        philox_rounds,
     )
     return _gen_module(
         uri,
@@ -161,6 +168,7 @@ def gen_selective_state_update_module(
         dstate,
         ntokens_mtp,
         state_scale_dtype=state_scale_dtype,
+        philox_rounds=philox_rounds,
         extra_cuda_cflags=["-lineinfo"],
     )
 
@@ -175,6 +183,7 @@ def gen_selective_state_update_sm90_module(
     dstate: int,
     ntokens_mtp: int,
     state_scale_dtype: Optional[torch.dtype] = None,
+    philox_rounds: int = 0,
 ) -> JitSpec:
     uri = (
         get_selective_state_update_uri(
@@ -187,6 +196,7 @@ def gen_selective_state_update_sm90_module(
             dstate,
             ntokens_mtp,
             state_scale_dtype,
+            philox_rounds,
         )
         + "_sm90"
     )
@@ -206,5 +216,6 @@ def gen_selective_state_update_sm90_module(
         dstate,
         ntokens_mtp,
         state_scale_dtype=state_scale_dtype,
+        philox_rounds=philox_rounds,
         extra_cuda_cflags=nvcc_flags,
     )

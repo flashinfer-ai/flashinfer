@@ -68,6 +68,10 @@ struct SelectiveStateUpdateParams {
 
   bool dt_softplus{false};
   bool update_state{true};
+
+  // Philox PRNG seed for stochastic rounding of fp16 state stores.
+  // Only used when the kernel is compiled with NUM_PHILOX_ROUNDS > 0.
+  int64_t rand_seed{0};
 };
 
 namespace mtp {
@@ -79,10 +83,12 @@ struct SelectiveStateMTPParams : public SelectiveStateUpdateParams {
   // MTP-specific strides for the token dimension
   int64_t x_stride_mtp{}, dt_stride_mtp{}, B_stride_mtp{}, C_stride_mtp{}, out_stride_mtp{},
       z_stride_mtp{};
+  int64_t intermediate_state_stride_batch{}, intermediate_state_scales_stride_batch{};
   void* __restrict__ intermediate_states{
       nullptr};  // state_t: (ntokens_mtp, state_cache_size, nheads, dim, dstate)
   void* __restrict__ intermediate_state_indices{nullptr};  // (batch,)
-  int64_t intermediate_state_stride_batch{};  // stride for batch dimension of intermediate_states
+  void* __restrict__ intermediate_state_scales{
+      nullptr};  // float: (batch, cache_steps, nheads, dim)
 };
 }  // namespace mtp
 

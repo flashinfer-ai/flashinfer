@@ -99,7 +99,7 @@ _FLASHINFER_INCLUDE = str(pathlib.Path(__file__).resolve().parents[2] / "include
 
 _PHILOX_CUDA_SOURCE = r"""
 #include <torch/extension.h>
-#include <flashinfer/mamba/common.cuh>
+#include <flashinfer/mamba/conversion.cuh>
 
 template <int N_ROUNDS>
 __global__ void philox_kernel(int32_t* out, int64_t seed, int n_elements) {
@@ -130,7 +130,7 @@ torch::Tensor cuda_philox(int64_t seed, int n_elements, int n_rounds);
 _STOCHASTIC_ROUND_CUDA_SOURCE = r"""
 #include <torch/extension.h>
 #include <cuda_fp16.h>
-#include <flashinfer/mamba/common.cuh>
+#include <flashinfer/mamba/conversion.cuh>
 
 __global__ void stochastic_round_kernel(half* out, const float* fp32_in,
                                         const int32_t* rand_in, int n_elements) {
@@ -164,6 +164,41 @@ torch::Tensor cuda_stochastic_round(torch::Tensor fp32_values, torch::Tensor ran
 
 _STOCHASTIC_ROUND_CPP_SOURCE = r"""
 torch::Tensor cuda_stochastic_round(torch::Tensor fp32_values, torch::Tensor rand_bits);
+"""
+
+_STOCHASTIC_ROUND_SINGLE_CUDA_SOURCE = r"""
+#include <torch/extension.h>
+#include <cuda_fp16.h>
+#include <flashinfer/mamba/conversion.cuh>
+
+// Each thread converts one fp32 value to fp16 using cvt_rs_f16_f32 (single-value).
+// rand13_in contains 13-bit random values (one per element, stored as int32).
+__global__ void stochastic_round_single_kernel(half* out, const float* fp32_in,
+                                                const int32_t* rand13_in, int n_elements) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_elements) return;
+
+    float x = fp32_in[idx];
+    uint32_t rand13 = static_cast<uint32_t>(rand13_in[idx]) & 0x1FFFu;
+    out[idx] = flashinfer::mamba::cvt_rs_f16_f32(x, rand13);
+}
+
+torch::Tensor cuda_stochastic_round_single(torch::Tensor fp32_values, torch::Tensor rand13_bits) {
+    int n = fp32_values.numel();
+    auto out = torch::empty({n}, torch::dtype(torch::kFloat16).device(torch::kCUDA));
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    stochastic_round_single_kernel<<<blocks, threads>>>(
+        reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+        fp32_values.data_ptr<float>(),
+        rand13_bits.data_ptr<int32_t>(),
+        n);
+    return out;
+}
+"""
+
+_STOCHASTIC_ROUND_SINGLE_CPP_SOURCE = r"""
+torch::Tensor cuda_stochastic_round_single(torch::Tensor fp32_values, torch::Tensor rand13_bits);
 """
 
 
@@ -209,6 +244,19 @@ def stochastic_round_sw_module():
         cuda_sources=[_STOCHASTIC_ROUND_CUDA_SOURCE],
         extra_include_paths=[_FLASHINFER_INCLUDE],
         functions=["cuda_stochastic_round"],
+        verbose=False,
+    )
+
+
+@pytest.fixture(scope="module")
+def stochastic_round_single_module():
+    """Compile cvt_rs_f16_f32 single-value test kernel (software path, any GPU)."""
+    return load_inline(
+        name="test_stochastic_round_single",
+        cpp_sources=[_STOCHASTIC_ROUND_SINGLE_CPP_SOURCE],
+        cuda_sources=[_STOCHASTIC_ROUND_SINGLE_CUDA_SOURCE],
+        extra_include_paths=[_FLASHINFER_INCLUDE],
+        functions=["cuda_stochastic_round_single"],
         verbose=False,
     )
 
@@ -322,3 +370,60 @@ def test_stochastic_rounding_sw(
 
     assert mismatches == 0, f"seed={seed}: {mismatches}/{n_elements} mismatches"
     print(f"  seed={seed}: all {n_elements} fp16 values match bitwise (sw vs hw)")
+
+
+# ---------------------------------------------------------------------------
+# Test 4: Single-value stochastic rounding matches pair-wise (any GPU)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("seed", [0, 42, 99999])
+def test_stochastic_rounding_single_vs_pair(
+    stochastic_round_single_module, stochastic_round_sw_module, seed
+):
+    """cvt_rs_f16_f32 (single) matches the corresponding element from cvt_rs_f16x2_f32 (pair)."""
+    n_elements = 1024  # must be even
+    torch.manual_seed(seed)
+
+    fp32_values = torch.randn(n_elements, dtype=torch.float32, device="cuda")
+    # Generate 13-bit random values per element
+    rand13 = torch.randint(0, 8192, (n_elements,), dtype=torch.int32, device="cuda")
+
+    # Single-value path: cvt_rs_f16_f32(x, rand13) for each element
+    single_out = stochastic_round_single_module.cuda_stochastic_round_single(
+        fp32_values, rand13
+    )
+
+    # Pair-wise path: cvt_rs_f16x2_f32(a, b, rbits) where rbits packs rand13 for both
+    # rbits layout: bits[12:0] = rand for C++ a (low half), bits[28:16] = rand for C++ b (high half)
+    rand_a = rand13[0::2]  # even elements
+    rand_b = rand13[1::2]  # odd elements
+    rbits = (rand_a & 0x1FFF) | ((rand_b & 0x1FFF) << 16)
+    # Expand rbits back to n_elements (pair-wise kernel reads from pair_idx)
+    rbits_expanded = torch.zeros(n_elements, dtype=torch.int32, device="cuda")
+    rbits_expanded[0::2] = rbits
+    rbits_expanded[1::2] = rbits  # pair kernel reads from pair_idx = even index
+
+    pair_out = stochastic_round_sw_module.cuda_stochastic_round(
+        fp32_values, rbits_expanded
+    )
+
+    # Compare as raw bit patterns
+    single_bits = single_out.view(torch.int16)
+    pair_bits = pair_out.view(torch.int16)
+
+    mismatches = (single_bits != pair_bits).sum().item()
+    if mismatches > 0:
+        diff_idx = torch.where(single_bits != pair_bits)[0][:10]
+        for idx in diff_idx:
+            i = idx.item()
+            sb = single_bits[i].item() & 0xFFFF
+            pb = pair_bits[i].item() & 0xFFFF
+            sf = single_out[i].item()
+            pf = pair_out[i].item()
+            r13 = rand13[i].item() & 0x1FFF
+            print(
+                f"  elem={i}: fp32={fp32_values[i].item():.6f}, "
+                f"rand13=0x{r13:04X}, single=0x{sb:04X}({sf}), pair=0x{pb:04X}({pf})"
+            )
+
+    assert mismatches == 0, f"seed={seed}: {mismatches}/{n_elements} mismatches"
+    print(f"  seed={seed}: all {n_elements} fp16 values match bitwise (single vs pair)")

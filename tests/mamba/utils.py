@@ -245,6 +245,17 @@ def create_test_inputs(
             batch_size, dtype=torch.int64, device=device
         )
         result["intermediate_slot_idx"] = intermediate_slot_idx
+        # For int16 state + intermediate states, generate per-step decode scales
+        if state_dtype == torch.int16:
+            intermediate_state_scales = torch.zeros(
+                batch_size,
+                cache_steps,
+                nheads,
+                dim,
+                dtype=torch.float32,
+                device=device,
+            )
+            result["intermediate_state_scales"] = intermediate_state_scales
 
     # Optional: retrieve_parent_token for EAGLE tree attention
     if generate_retrieve_parent_token:

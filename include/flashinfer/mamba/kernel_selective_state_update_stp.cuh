@@ -65,9 +65,9 @@ struct SharedStorageSimple {
   alignas(alignof(PackedAligned<input_t>)) input_t z[rows_per_block];
   alignas(alignof(PackedAligned<input_t>)) input_t B[dstate];
   alignas(alignof(PackedAligned<input_t>)) input_t C[dstate];
-  alignas(alignof(PackedAligned<float>))
-      std::conditional_t<scaleState, state_scale_t, char> state_scale[rows_per_block * scaleState];
   float out[rows_per_block];
+  alignas(alignof(PackedAligned<float>))
+      std::conditional_t<scaleState, state_scale_t, char> state_scale[rows_per_block];
 };
 
 // Grid: (batch, nheads, cdiv(DIM, ROWS_PER_BLOCK))
@@ -76,7 +76,7 @@ struct SharedStorageSimple {
 // split dim across blocks for better occupancy.
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t,
           typename stateIndex_t, typename state_scale_t, int DIM, int DSTATE, int ROWS_PER_BLOCK,
-          int numWarps>
+          int numWarps, int PHILOX_ROUNDS_ = 0>
 __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams params) {
   constexpr bool scaleState = !std::is_same_v<state_scale_t, void>;
   auto* __restrict__ output = reinterpret_cast<input_t*>(params.output);
@@ -573,7 +573,7 @@ __device__ __forceinline__ void consumer_func_vertical(
 
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t,
           typename stateIndex_t, typename state_scale_t, int DIM, int DSTATE, int consumerWarps = 1,
-          int rowsPerStage = 4, int numStages = 1>
+          int rowsPerStage = 4, int numStages = 1, int PHILOX_ROUNDS_ = 0>
 __global__ void selective_state_update_kernel_producer_consumer_vertical(
     SelectiveStateUpdateParams params, __grid_constant__ CUtensorMap const tensorState) {
   constexpr bool scaleState = !std::is_same_v<state_scale_t, void>;
@@ -919,7 +919,7 @@ __device__ __forceinline__ void consumer_func_horizontal(
 
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t,
           typename stateIndex_t, int DIM, int DSTATE, int consumerWarps, int colsPerStage,
-          int headsGroupsRatio, int numStages = 1>
+          int headsGroupsRatio, int numStages = 1, int PHILOX_ROUNDS_ = 0>
 __global__ void selective_state_update_kernel_producer_consumer_horizontal(
     SelectiveStateUpdateParams params, __grid_constant__ CUtensorMap const tensorState) {
   auto* __restrict__ output = reinterpret_cast<input_t*>(params.output);
@@ -1064,10 +1064,15 @@ __global__ void selective_state_update_kernel_producer_consumer_horizontal(
 #endif  // FLASHINFER_MAMBA_ENABLE_SM90 (horizontal kernel)
 
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t,
-          typename stateIndex_t>
+          typename stateIndex_t, typename state_scale_t>
 void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, SSUAlgorithm algorithm,
                                 cudaStream_t stream) {
   constexpr bool scaleState = !std::is_same_v<state_scale_t, void>;
+  // Stochastic rounding is only implemented for fp16 state
+  if constexpr (PHILOX_ROUNDS > 0) {
+    static_assert(std::is_same_v<state_t, half>,
+                  "Stochastic rounding (PHILOX_ROUNDS > 0) only supports fp16 state");
+  }
   auto [sm_major, sm_minor] = GetCudaComputeCapability();
 
   // Common alignment checks for all kernels
@@ -1122,14 +1127,14 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, SSUAlgorithm
       int const dim_tiles = (DIM + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
       dim3 grid(params.batch, params.nheads, dim_tiles);
       selective_state_update_kernel_simple<input_t, weight_t, matrixA_t, state_t, stateIndex_t,
-                                           state_scale_t, DIM, DSTATE, ROWS_PER_BLOCK, numWarps>
-          <<<grid, block, 0, stream>>>(params);
+                                           state_scale_t, DIM, DSTATE, ROWS_PER_BLOCK, numWarps,
+                                           PHILOX_ROUNDS><<<grid, block, 0, stream>>>(params);
     } else {
       // Non-tiled: enough blocks already for full occupancy; ROWS_PER_BLOCK == DIM so blockIdx.z ==
       // 0
       dim3 grid(params.batch, params.nheads);
       selective_state_update_kernel_simple<input_t, weight_t, matrixA_t, state_t, stateIndex_t,
-                                           state_scale_t, DIM, DSTATE, DIM, numWarps>
+                                           state_scale_t, DIM, DSTATE, DIM, numWarps, PHILOX_ROUNDS>
           <<<grid, block, 0, stream>>>(params);
     }
   }
@@ -1151,7 +1156,7 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, SSUAlgorithm
 
     auto scan_func = selective_state_update_kernel_producer_consumer_vertical<
         input_t, weight_t, matrixA_t, state_t, stateIndex_t, state_scale_t, DIM, DSTATE,
-        numConsumers, rowsPerStage, numStages>;
+        numConsumers, rowsPerStage, numStages, PHILOX_ROUNDS>;
 
     dim3 block(warpSize, numWarps);
     dim3 grid(params.batch, params.nheads);
@@ -1187,7 +1192,7 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, SSUAlgorithm
     auto ratio_launcher = [&]<int RATIO>() {
       auto scan_func = selective_state_update_kernel_producer_consumer_horizontal<
           input_t, weight_t, matrixA_t, state_t, stateIndex_t, DIM, DSTATE, numConsumers, stageCols,
-          RATIO, numStages>;
+          RATIO, numStages, PHILOX_ROUNDS>;
 
       dim3 block(warpSize, numWarps);
       dim3 grid(params.batch, params.nheads);
