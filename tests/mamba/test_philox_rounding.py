@@ -105,7 +105,7 @@ template <int N_ROUNDS>
 __global__ void philox_kernel(int32_t* out, int64_t seed, int n_elements) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n_elements) return;
-    uint32_t result = flashinfer::mamba::philox_randint<N_ROUNDS>(seed, (uint32_t)idx);
+    uint32_t result = flashinfer::mamba::conversion::philox_randint<N_ROUNDS>(seed, (uint32_t)idx);
     out[idx] = static_cast<int32_t>(result);
 }
 
@@ -143,7 +143,7 @@ __global__ void stochastic_round_kernel(half* out, const float* fp32_in,
     // Triton pack=2 uses rand from the first element of the pair
     uint32_t rand = *reinterpret_cast<const uint32_t*>(&rand_in[pair_idx]);
 
-    uint32_t packed = flashinfer::mamba::cvt_rs_f16x2_f32(a, b, rand);
+    uint32_t packed = flashinfer::mamba::conversion::cvt_rs_f16x2_f32(a, b, rand);
     *reinterpret_cast<uint32_t*>(&out[pair_idx]) = packed;
 }
 
@@ -180,7 +180,7 @@ __global__ void stochastic_round_single_kernel(half* out, const float* fp32_in,
 
     float x = fp32_in[idx];
     uint32_t rand13 = static_cast<uint32_t>(rand13_in[idx]) & 0x1FFFu;
-    out[idx] = flashinfer::mamba::cvt_rs_f16_f32(x, rand13);
+    out[idx] = flashinfer::mamba::conversion::cvt_rs_f16_f32(x, rand13);
 }
 
 torch::Tensor cuda_stochastic_round_single(torch::Tensor fp32_values, torch::Tensor rand13_bits) {

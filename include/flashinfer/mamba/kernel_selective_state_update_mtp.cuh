@@ -33,7 +33,7 @@ struct SharedStorageSimple {
 
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t,
           typename stateIndex_t, typename state_scale_t, int TOKENS_MTP, int DIM, int DSTATE,
-          int numWarps>
+          int PHILOX_ROUNDS, int numWarps>
 __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams params) {
   constexpr bool scaleState = !std::is_same_v<state_scale_t, void>;
   auto* __restrict__ output = reinterpret_cast<input_t*>(params.output);
@@ -238,7 +238,7 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
             out_value += new_state * C_value;
           }
 
-          // Store intermediate state to smem (non-scaleState path: naive cast)
+          // Store intermediate state to smem (non-scaleState path)
           if constexpr (!scaleState) {
             if constexpr (sizeof(state_t) == sizeof(input_t)) {
               if (intermediate_states) {
@@ -246,7 +246,12 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
                 packed_state_t rStateOut;
 #pragma unroll
                 for (int k = 0; k < packed_input_t::count; k++) {
-                  convertAndStore(&rStateOut.val[k], rState[ii + k]);
+                  if constexpr (PHILOX_ROUNDS > 0) {
+                    convertSRAndStore<PHILOX_ROUNDS>(&rStateOut.val[k], rState[ii + k],
+                                                     params.rand_seed, d * DSTATE + base_i + k);
+                  } else {
+                    convertAndStore(&rStateOut.val[k], rState[ii + k]);
+                  }
                 }
                 *reinterpret_cast<packed_state_t*>(&sram.state[dd][base_i]) = rStateOut;
               }
@@ -254,7 +259,12 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
               if (intermediate_states) {
 #pragma unroll
                 for (int k = 0; k < packed_input_t::count; k++) {
-                  convertAndStore(&sram.state[dd][base_i + k], rState[ii + k]);
+                  if constexpr (PHILOX_ROUNDS > 0) {
+                    convertSRAndStore<PHILOX_ROUNDS>(&sram.state[dd][base_i + k], rState[ii + k],
+                                                     params.rand_seed, d * DSTATE + base_i + k);
+                  } else {
+                    convertAndStore(&sram.state[dd][base_i + k], rState[ii + k]);
+                  }
                 }
               }
             }
@@ -348,7 +358,12 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
                     (ii / packed_input_t::count) * warpSize * packed_input_t::count +
                     (ii % packed_input_t::count);
             if (i < DSTATE) {
-              convertAndStore(&sram.state[dd][i], rState[ii]);
+              if constexpr (PHILOX_ROUNDS > 0) {
+                convertSRAndStore<PHILOX_ROUNDS>(&sram.state[dd][i], rState[ii], params.rand_seed,
+                                                 d * DSTATE + i);
+              } else {
+                convertAndStore(&sram.state[dd][i], rState[ii]);
+              }
             }
           }
         }
@@ -396,6 +411,11 @@ template <typename input_t, typename weight_t, typename matrixA_t, typename stat
 void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm algorithm,
                                    cudaStream_t stream) {
   constexpr bool scaleState = !std::is_same_v<state_scale_t, void>;
+  // Stochastic rounding is only implemented for fp16 state
+  if constexpr (PHILOX_ROUNDS > 0) {
+    static_assert(std::is_same_v<state_t, half>,
+                  "Stochastic rounding (PHILOX_ROUNDS > 0) only supports fp16 state");
+  }
   // MTP only supports the simple kernel
   FLASHINFER_CHECK(algorithm == SSUAlgorithm::kAuto || algorithm == SSUAlgorithm::kSimple,
                    "MTP selective_state_update only supports 'auto' or 'simple' algorithm, got ",
@@ -417,9 +437,9 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
   dim3 block(warpSize, numWarps);
   dim3 grid(params.batch, params.nheads);
 
-  auto func =
-      selective_state_update_kernel_simple_mtp<input_t, weight_t, matrixA_t, state_t, stateIndex_t,
-                                               state_scale_t, NTOKENS_MTP, DIM, DSTATE, numWarps>;
+  auto func = selective_state_update_kernel_simple_mtp<input_t, weight_t, matrixA_t, state_t,
+                                                       stateIndex_t, state_scale_t, NTOKENS_MTP,
+                                                       DIM, DSTATE, PHILOX_ROUNDS, numWarps>;
   using sram_t =
       SharedStorageSimple<input_t, state_t, state_scale_t, NTOKENS_MTP, DIM, DSTATE, stageRows>;
   constexpr size_t smem_size = sizeof(sram_t);

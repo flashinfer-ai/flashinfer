@@ -42,10 +42,6 @@ inline __device__ void convertAndStore(int16_t* output, float input) {
   *output = static_cast<int16_t>(__float2int_rn(input));
 }
 
-}  // namespace flashinfer::mamba::conversion
-
-namespace flashinfer::mamba {
-
 // =============================================================================
 // Philox-4x32 PRNG (matches Triton's tl.randint)
 // =============================================================================
@@ -158,4 +154,15 @@ __device__ __forceinline__ uint32_t cvt_rs_f16x2_f32(float a, float b, uint32_t 
 #endif
 }
 
-}  // namespace flashinfer::mamba
+// Stochastic rounding store: generates Philox random bits and converts fp32 → fp16 in one call.
+// PHILOX_ROUNDS: number of Philox rounds (compile-time), must be > 0.
+// seed: Philox seed (from params.rand_seed).
+// offset: unique per-element offset (e.g. d * DSTATE + i) for deterministic randomness.
+template <int PHILOX_ROUNDS>
+inline __device__ void convertSRAndStore(__half* output, float input, int64_t seed,
+                                         uint32_t offset) {
+  uint32_t rand = philox_randint<PHILOX_ROUNDS>(seed, offset);
+  *output = cvt_rs_f16_f32(input, rand & 0x1FFFu);
+}
+
+}  // namespace flashinfer::mamba::conversion
