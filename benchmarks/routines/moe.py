@@ -1,3 +1,4 @@
+import inspect
 from collections import defaultdict
 from typing import Optional
 
@@ -5,7 +6,12 @@ import numpy as np
 import torch
 
 import flashinfer
-from flashinfer import ActivationType
+
+try:
+    from flashinfer import ActivationType
+except ImportError:
+    from flashinfer.fused_moe.core import ActivationType
+
 from flashinfer.autotuner import autotune
 from flashinfer.fused_moe import (
     trtllm_fp4_block_scale_moe,
@@ -42,6 +48,21 @@ from .moe_utils import (
     FLOAT8_E4M3_MAX,
     FLOAT4_E2M1_MAX,
 )
+
+_ACTIVATION_TO_GATED_ACT = {
+    ActivationType.Swiglu: 0,
+    ActivationType.Geglu: 1,
+}
+
+
+def _activation_kwarg(fn, activation_type: ActivationType) -> dict:
+    """Return the correct activation keyword argument for *fn* in the installed version."""
+    sig = inspect.signature(fn)
+    if "activation_type" in sig.parameters:
+        return {"activation_type": activation_type.value}
+    if "gated_act_type" in sig.parameters:
+        return {"gated_act_type": _ACTIVATION_TO_GATED_ACT.get(activation_type, 0)}
+    return {}
 
 
 def run_moe_test(args):
@@ -503,7 +524,9 @@ def testTrtllmFp4BlockScaleMoe(args):
     sf_vec_size = 32 if is_mxfp4 else 16
 
     if args.verbose >= 1:
-        print(f"[INFO] FP4 mode: {fp4_mode} (use_ue8m0={use_ue8m0}, sf_vec_size={sf_vec_size})")
+        print(
+            f"[INFO] FP4 mode: {fp4_mode} (use_ue8m0={use_ue8m0}, sf_vec_size={sf_vec_size})"
+        )
 
     # Quantize weights using proper FP4 quantization
     gemm1_weights_fp4_bytes, gemm1_scales_fp4_bytes, gemm1_scales_global = (
@@ -619,8 +642,8 @@ def testTrtllmFp4BlockScaleMoe(args):
             local_num_experts=local_num_experts,
             routed_scaling_factor=routed_scaling_factor,
             routing_method_type=routing_method_type,
-            activation_type=activation_type.value,
             do_finalize=True,
+            **_activation_kwarg(trtllm_fp4_block_scale_moe, activation_type),
         )
 
     backend = "trtllm"
@@ -681,7 +704,9 @@ def testTrtllmFp4BlockScaleMoe(args):
     tflops = calculate_moe_tflops(
         num_tokens, hidden_size, intermediate_size, num_experts, top_k, median_time
     )
-    input_format_str = {"nvfp4": "nvfp4", "mxfp4_mxfp8": "mxfp8", "mxfp4_bf16": "bf16"}[fp4_mode]
+    input_format_str = {"nvfp4": "nvfp4", "mxfp4_mxfp8": "mxfp8", "mxfp4_bf16": "bf16"}[
+        fp4_mode
+    ]
     weight_format_str = "mxfp4" if is_mxfp4 else "nvfp4"
     tb_per_sec = calculate_moe_kernel_bandwidth(
         num_tokens,
@@ -1506,7 +1531,7 @@ def testTrtllmFp8PerTensorScaleMoe(args):
             routed_scaling_factor=routed_scaling_factor,
             use_routing_scales_on_input=use_routing_scales_on_input,
             routing_method_type=routing_method_type,
-            activation_type=activation_type.value,
+            **_activation_kwarg(trtllm_fp8_per_tensor_scale_moe, activation_type),
         )
 
     # Benchmark timing
