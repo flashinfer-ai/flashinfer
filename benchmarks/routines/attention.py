@@ -375,6 +375,10 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         if remove_cudnn:
             backends.remove("cudnn")
 
+    if "auto" in backends and speculative_decode:
+        print("[INFO] auto backend is disabled for speculative decode. Skipping.")
+        backends.remove("auto")
+
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
         return res
