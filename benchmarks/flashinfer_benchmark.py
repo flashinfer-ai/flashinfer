@@ -44,6 +44,18 @@ def run_test(args):
         from routines.quantization import run_quantization_test
 
         res = run_quantization_test(args)
+    elif args.routine in benchmark_apis["sampling"]:
+        from routines.sampling import run_sampling_test
+
+        res = run_sampling_test(args)
+    elif args.routine in benchmark_apis["rope"]:
+        from routines.rope import run_rope_test
+
+        res = run_rope_test(args)
+    elif args.routine in benchmark_apis["mamba"]:
+        from routines.mamba import run_mamba_test
+
+        res = run_mamba_test(args)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 
@@ -89,7 +101,10 @@ def parse_args(line=sys.argv[1:]):
         + list(benchmark_apis["moe"])
         + list(benchmark_apis["moe_comm"])
         + list(benchmark_apis["norm"])
-        + list(benchmark_apis["quantization"]),
+        + list(benchmark_apis["quantization"])
+        + list(benchmark_apis["sampling"])
+        + list(benchmark_apis["rope"])
+        + list(benchmark_apis["mamba"]),
     )
     args, _ = parser.parse_known_args(line[:])
 
@@ -199,6 +214,18 @@ def parse_args(line=sys.argv[1:]):
         from routines.quantization import parse_quantization_args
 
         args = parse_quantization_args(line, parser)
+    elif args.routine in benchmark_apis["sampling"]:
+        from routines.sampling import parse_sampling_args
+
+        args = parse_sampling_args(line, parser)
+    elif args.routine in benchmark_apis["rope"]:
+        from routines.rope import parse_rope_args
+
+        args = parse_rope_args(line, parser)
+    elif args.routine in benchmark_apis["mamba"]:
+        from routines.mamba import parse_mamba_args
+
+        args = parse_mamba_args(line, parser)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 

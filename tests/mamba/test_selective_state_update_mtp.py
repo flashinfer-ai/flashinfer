@@ -11,8 +11,28 @@ import torch
 
 import flashinfer
 
-from .selective_state_update_triton import selective_state_update_triton
+from .triton_reference.selective_state_update import selective_state_update_triton
 from .utils import create_test_inputs, clone_preserving_strides
+
+
+# Base combination: batch=64, nheads=64, dim=64, dstate=128, cache_steps=4,
+#                   state_dtype=bf16, weight_dtype=f32, use_out_tensor=True
+# Each additional row varies exactly one parameter from the base.
+# fmt: off
+_BASE_PARAMS = [
+    # (batch, nheads, dim, dstate, cache_steps, state_dtype,        weight_dtype,   use_out_tensor)
+    (  64,    64,     64,  128,    4,           torch.bfloat16,     torch.float32,  True ),  # base
+    (   1,    64,     64,  128,    4,           torch.bfloat16,     torch.float32,  True ),  # batch=1
+    (   4,    64,     64,  128,    4,           torch.bfloat16,     torch.float32,  True ),  # batch=4
+    (  64,     8,     64,  128,    4,           torch.bfloat16,     torch.float32,  True ),  # nheads=8
+    (  64,    64,    128,  128,    4,           torch.bfloat16,     torch.float32,  True ),  # dim=128
+    (  64,    64,     64,   64,    4,           torch.bfloat16,     torch.float32,  True ),  # dstate=64
+    (  64,    64,     64,  128,    1,           torch.bfloat16,     torch.float32,  True ),  # cache_steps=1
+    (  64,    64,     64,  128,    8,           torch.bfloat16,     torch.float32,  True ),  # cache_steps=8
+    (  64,    64,     64,  128,    4,           torch.float32,      torch.float32,  True ),  # state_dtype=f32
+    (  64,    64,     64,  128,    4,           torch.bfloat16,     torch.float32,  False),  # use_out_tensor=False
+]
+# fmt: on
 
 
 class TestSelectiveStateUpdateMTP:
@@ -25,41 +45,7 @@ class TestSelectiveStateUpdateMTP:
     INPUT_DTYPE = torch.bfloat16
     MATRIX_A_DTYPE = torch.float32
 
-    @pytest.fixture(params=[1, 4])
-    def batch(self, request):
-        return request.param
-
-    @pytest.fixture(params=[8, 32])
-    def nheads(self, request):
-        return request.param
-
-    @pytest.fixture(params=[64, 128])
-    def dim(self, request):
-        return request.param
-
-    @pytest.fixture(params=[64, 128])
-    def dstate(self, request):
-        return request.param
-
-    @pytest.fixture(params=[1, 4, 8])
-    def cache_steps(self, request):
-        """Number of tokens in multi-token mode (T dimension)."""
-        return request.param
-
-    @pytest.fixture(params=[torch.float32, torch.bfloat16])
-    def state_dtype(self, request):
-        return request.param
-
-    @pytest.fixture(params=[torch.float32])
-    def weight_dtype(self, request):
-        return request.param
-
-    @pytest.fixture(params=[False, True])
-    def use_out_tensor(self, request):
-        return request.param
-
-    @pytest.fixture
-    def inputs(
+    def make_inputs(
         self, batch, nheads, dim, dstate, cache_steps, state_dtype, weight_dtype
     ):
         """Create test inputs for given parameters."""
@@ -79,8 +65,7 @@ class TestSelectiveStateUpdateMTP:
             seed=0,
         )
 
-    @pytest.fixture
-    def reference_output(self, inputs):
+    def make_reference_output(self, inputs):
         """Compute reference output using triton implementation."""
         state_ref = clone_preserving_strides(inputs["state_cache"])
         y_ref = selective_state_update_triton(
@@ -182,9 +167,26 @@ class TestSelectiveStateUpdateMTP:
                 f"diff={diff:.6e}, rel_diff={rel_diff:.6e}"
             )
 
-    def test_output_correctness(self, inputs, reference_output, use_out_tensor):
+    @pytest.mark.parametrize(
+        "batch,nheads,dim,dstate,cache_steps,state_dtype,weight_dtype,use_out_tensor",
+        _BASE_PARAMS,
+    )
+    def test_output_correctness(
+        self,
+        batch,
+        nheads,
+        dim,
+        dstate,
+        cache_steps,
+        state_dtype,
+        weight_dtype,
+        use_out_tensor,
+    ):
         """Test that kernel output matches reference within tolerance."""
-        y_ref, state_ref = reference_output
+        inputs = self.make_inputs(
+            batch, nheads, dim, dstate, cache_steps, state_dtype, weight_dtype
+        )
+        y_ref, state_ref = self.make_reference_output(inputs)
 
         # Prepare output tensor if requested
         if use_out_tensor:
@@ -207,36 +209,7 @@ class TestSelectiveStateUpdateMTP:
 class TestSelectiveStateUpdateMTPWithZ(TestSelectiveStateUpdateMTP):
     """Test multi-token selective_state_update with z tensor (gating)."""
 
-    @pytest.fixture(params=[4])
-    def batch(self, request):
-        return request.param
-
-    @pytest.fixture(params=[8])
-    def nheads(self, request):
-        return request.param
-
-    @pytest.fixture(params=[64])
-    def dim(self, request):
-        return request.param
-
-    @pytest.fixture(params=[64])
-    def dstate(self, request):
-        return request.param
-
-    @pytest.fixture(params=[4])
-    def cache_steps(self, request):
-        return request.param
-
-    @pytest.fixture(params=[torch.bfloat16])
-    def state_dtype(self, request):
-        return request.param
-
-    @pytest.fixture(params=[torch.float32])
-    def weight_dtype(self, request):
-        return request.param
-
-    @pytest.fixture
-    def inputs(
+    def make_inputs(
         self, batch, nheads, dim, dstate, cache_steps, state_dtype, weight_dtype
     ):
         """Create test inputs with z tensor."""
@@ -256,41 +229,56 @@ class TestSelectiveStateUpdateMTPWithZ(TestSelectiveStateUpdateMTP):
             seed=0,
         )
 
+    @pytest.mark.parametrize(
+        "batch,nheads,dim,dstate,cache_steps,state_dtype,weight_dtype,use_out_tensor",
+        [(64, 64, 64, 128, 4, torch.bfloat16, torch.float32, True)],
+    )
+    def test_output_correctness(
+        self,
+        batch,
+        nheads,
+        dim,
+        dstate,
+        cache_steps,
+        state_dtype,
+        weight_dtype,
+        use_out_tensor,
+    ):
+        super().test_output_correctness(
+            batch,
+            nheads,
+            dim,
+            dstate,
+            cache_steps,
+            state_dtype,
+            weight_dtype,
+            use_out_tensor,
+        )
+
 
 class TestSelectiveStateUpdateMTPDisableStateUpdate(TestSelectiveStateUpdateMTP):
     """Test multi-token selective_state_update with disable_state_update=True."""
 
-    @pytest.fixture(params=[4])
-    def batch(self, request):
-        return request.param
-
-    @pytest.fixture(params=[32])
-    def nheads(self, request):
-        return request.param
-
-    @pytest.fixture(params=[64])
-    def dim(self, request):
-        return request.param
-
-    @pytest.fixture(params=[64, 128])
-    def dstate(self, request):
-        return request.param
-
-    @pytest.fixture(params=[4, 8])
-    def cache_steps(self, request):
-        return request.param
-
-    @pytest.fixture(params=[torch.bfloat16])
-    def state_dtype(self, request):
-        return request.param
-
-    @pytest.fixture(params=[torch.float32])
-    def weight_dtype(self, request):
-        return request.param
-
-    def test_output_correctness(self, inputs, reference_output, use_out_tensor):
+    @pytest.mark.parametrize(
+        "batch,nheads,dim,dstate,cache_steps,state_dtype,weight_dtype,use_out_tensor",
+        [(64, 64, 64, 128, 4, torch.bfloat16, torch.float32, True)],
+    )
+    def test_output_correctness(
+        self,
+        batch,
+        nheads,
+        dim,
+        dstate,
+        cache_steps,
+        state_dtype,
+        weight_dtype,
+        use_out_tensor,
+    ):
         """Test that kernel output matches reference but state is not updated."""
-        y_ref, state_ref = reference_output
+        inputs = self.make_inputs(
+            batch, nheads, dim, dstate, cache_steps, state_dtype, weight_dtype
+        )
+        y_ref, _ = self.make_reference_output(inputs)
 
         # Save the initial state before running the kernel
         state_initial = inputs["state_cache"].clone()
@@ -343,36 +331,7 @@ class TestSelectiveStateUpdateMTPDisableStateUpdate(TestSelectiveStateUpdateMTP)
 class TestSelectiveStateUpdateMTPWithIntermediateStates(TestSelectiveStateUpdateMTP):
     """Test multi-token selective_state_update with intermediate states buffer."""
 
-    @pytest.fixture(params=[4])
-    def batch(self, request):
-        return request.param
-
-    @pytest.fixture(params=[32])
-    def nheads(self, request):
-        return request.param
-
-    @pytest.fixture(params=[64])
-    def dim(self, request):
-        return request.param
-
-    @pytest.fixture(params=[64, 128])
-    def dstate(self, request):
-        return request.param
-
-    @pytest.fixture(params=[2, 4, 8])
-    def cache_steps(self, request):
-        return request.param
-
-    @pytest.fixture(params=[torch.bfloat16])
-    def state_dtype(self, request):
-        return request.param
-
-    @pytest.fixture(params=[torch.float32])
-    def weight_dtype(self, request):
-        return request.param
-
-    @pytest.fixture
-    def inputs(
+    def make_inputs(
         self, batch, nheads, dim, dstate, cache_steps, state_dtype, weight_dtype
     ):
         """Create test inputs with intermediate states buffer."""
@@ -392,8 +351,7 @@ class TestSelectiveStateUpdateMTPWithIntermediateStates(TestSelectiveStateUpdate
             seed=0,
         )
 
-    @pytest.fixture
-    def reference_output(self, inputs):
+    def make_reference_output(self, inputs):
         """Compute reference output using triton implementation with intermediate states."""
         state_ref = clone_preserving_strides(inputs["state_cache"])
         intermediate_states_ref = inputs["intermediate_states_buffer"].clone()
@@ -440,9 +398,37 @@ class TestSelectiveStateUpdateMTPWithIntermediateStates(TestSelectiveStateUpdate
             cache_steps=inputs["cache_steps"],
         )
 
-    def test_output_correctness(self, inputs, reference_output, use_out_tensor):
+    # fmt: off
+    _INTERMEDIATE_PARAMS = [
+        # (batch, nheads, dim, dstate, cache_steps, state_dtype,    weight_dtype,   use_out_tensor)
+        (  64,    64,     64,  128,    4,           torch.bfloat16, torch.float32,  True ),  # base
+        (  64,    64,     64,   64,    4,           torch.bfloat16, torch.float32,  True ),  # dstate=64
+        (  64,    64,     64,  128,    2,           torch.bfloat16, torch.float32,  True ),  # cache_steps=2
+        (  64,    64,     64,  128,    8,           torch.bfloat16, torch.float32,  True ),  # cache_steps=8
+        (  64,    64,     64,  128,    4,           torch.bfloat16, torch.float32,  False),  # use_out_tensor=False
+    ]
+    # fmt: on
+
+    @pytest.mark.parametrize(
+        "batch,nheads,dim,dstate,cache_steps,state_dtype,weight_dtype,use_out_tensor",
+        _INTERMEDIATE_PARAMS,
+    )
+    def test_output_correctness(
+        self,
+        batch,
+        nheads,
+        dim,
+        dstate,
+        cache_steps,
+        state_dtype,
+        weight_dtype,
+        use_out_tensor,
+    ):
         """Test that kernel output matches and intermediate states are cached correctly."""
-        y_ref, state_ref, intermediate_states_ref = reference_output
+        inputs = self.make_inputs(
+            batch, nheads, dim, dstate, cache_steps, state_dtype, weight_dtype
+        )
+        y_ref, _state_ref, intermediate_states_ref = self.make_reference_output(inputs)
 
         # Prepare output tensor if requested
         if use_out_tensor:
@@ -488,36 +474,7 @@ class TestSelectiveStateUpdateMTPWithIntermediateStates(TestSelectiveStateUpdate
 class TestSelectiveStateUpdateMTPNonContiguous(TestSelectiveStateUpdateMTP):
     """Test multi-token selective_state_update with non-contiguous state cache."""
 
-    @pytest.fixture(params=[4])
-    def batch(self, request):
-        return request.param
-
-    @pytest.fixture(params=[8])
-    def nheads(self, request):
-        return request.param
-
-    @pytest.fixture(params=[64])
-    def dim(self, request):
-        return request.param
-
-    @pytest.fixture(params=[64])
-    def dstate(self, request):
-        return request.param
-
-    @pytest.fixture(params=[4])
-    def cache_steps(self, request):
-        return request.param
-
-    @pytest.fixture(params=[torch.bfloat16])
-    def state_dtype(self, request):
-        return request.param
-
-    @pytest.fixture(params=[torch.float32])
-    def weight_dtype(self, request):
-        return request.param
-
-    @pytest.fixture
-    def inputs(
+    def make_inputs(
         self, batch, nheads, dim, dstate, cache_steps, state_dtype, weight_dtype
     ):
         """Create test inputs with non-contiguous state cache (2x batch stride)."""
@@ -540,8 +497,7 @@ class TestSelectiveStateUpdateMTPNonContiguous(TestSelectiveStateUpdateMTP):
             seed=0,
         )
 
-    @pytest.fixture
-    def reference_output(self, inputs):
+    def make_reference_output(self, inputs):
         """Compute reference output, preserving non-contiguous strides."""
         state_ref = clone_preserving_strides(inputs["state_cache"])
         y_ref = selective_state_update_triton(
@@ -560,37 +516,35 @@ class TestSelectiveStateUpdateMTPNonContiguous(TestSelectiveStateUpdateMTP):
         )
         return y_ref, state_ref
 
+    @pytest.mark.parametrize(
+        "batch,nheads,dim,dstate,cache_steps,state_dtype,weight_dtype,use_out_tensor",
+        [(64, 64, 64, 128, 4, torch.bfloat16, torch.float32, True)],
+    )
+    def test_output_correctness(
+        self,
+        batch,
+        nheads,
+        dim,
+        dstate,
+        cache_steps,
+        state_dtype,
+        weight_dtype,
+        use_out_tensor,
+    ):
+        super().test_output_correctness(
+            batch,
+            nheads,
+            dim,
+            dstate,
+            cache_steps,
+            state_dtype,
+            weight_dtype,
+            use_out_tensor,
+        )
+
 
 class TestSelectiveStateUpdateMTPInt32Indices(TestSelectiveStateUpdateMTP):
     """Test multi-token selective_state_update with int32 state_batch_indices."""
-
-    @pytest.fixture(params=[4])
-    def batch(self, request):
-        return request.param
-
-    @pytest.fixture(params=[8])
-    def nheads(self, request):
-        return request.param
-
-    @pytest.fixture(params=[64])
-    def dim(self, request):
-        return request.param
-
-    @pytest.fixture(params=[64])
-    def dstate(self, request):
-        return request.param
-
-    @pytest.fixture(params=[4])
-    def cache_steps(self, request):
-        return request.param
-
-    @pytest.fixture(params=[torch.bfloat16])
-    def state_dtype(self, request):
-        return request.param
-
-    @pytest.fixture(params=[torch.float32])
-    def weight_dtype(self, request):
-        return request.param
 
     def run_kernel(self, inputs, out=None, disable_state_update=False):
         """Run the flashinfer kernel with int32 state_batch_indices."""
@@ -614,46 +568,11 @@ class TestSelectiveStateUpdateMTPInt32Indices(TestSelectiveStateUpdateMTP):
             disable_state_update=disable_state_update,
         )
 
-
-class TestSelectiveStateUpdateMTPVariousNgroups(TestSelectiveStateUpdateMTP):
-    """Test multi-token selective_state_update with various ngroups values."""
-
-    NGROUPS = None  # Will be set by fixture
-
-    @pytest.fixture(params=[1, 2, 4, 8])
-    def ngroups(self, request):
-        return request.param
-
-    @pytest.fixture(params=[4])
-    def batch(self, request):
-        return request.param
-
-    @pytest.fixture(params=[32])
-    def nheads(self, request):
-        return request.param
-
-    @pytest.fixture(params=[64])
-    def dim(self, request):
-        return request.param
-
-    @pytest.fixture(params=[64])
-    def dstate(self, request):
-        return request.param
-
-    @pytest.fixture(params=[4])
-    def cache_steps(self, request):
-        return request.param
-
-    @pytest.fixture(params=[torch.bfloat16])
-    def state_dtype(self, request):
-        return request.param
-
-    @pytest.fixture(params=[torch.float32])
-    def weight_dtype(self, request):
-        return request.param
-
-    @pytest.fixture
-    def inputs(
+    @pytest.mark.parametrize(
+        "batch,nheads,dim,dstate,cache_steps,state_dtype,weight_dtype,use_out_tensor",
+        [(64, 64, 64, 128, 4, torch.bfloat16, torch.float32, True)],
+    )
+    def test_output_correctness(
         self,
         batch,
         nheads,
@@ -662,10 +581,51 @@ class TestSelectiveStateUpdateMTPVariousNgroups(TestSelectiveStateUpdateMTP):
         cache_steps,
         state_dtype,
         weight_dtype,
+        use_out_tensor,
+    ):
+        super().test_output_correctness(
+            batch,
+            nheads,
+            dim,
+            dstate,
+            cache_steps,
+            state_dtype,
+            weight_dtype,
+            use_out_tensor,
+        )
+
+
+class TestSelectiveStateUpdateMTPVariousNgroups(TestSelectiveStateUpdateMTP):
+    """Test multi-token selective_state_update with various ngroups values."""
+
+    # fmt: off
+    _NGROUPS_PARAMS = [
+        # (batch, nheads, dim, dstate, cache_steps, state_dtype,    weight_dtype,   use_out_tensor, ngroups)
+        (  64,    64,     64,  128,    4,           torch.bfloat16, torch.float32,  True,           1),
+        (  64,    64,     64,  128,    4,           torch.bfloat16, torch.float32,  True,           2),
+        (  64,    64,     64,  128,    4,           torch.bfloat16, torch.float32,  True,           4),
+        (  64,    64,     64,  128,    4,           torch.bfloat16, torch.float32,  True,           8),
+    ]
+    # fmt: on
+
+    @pytest.mark.parametrize(
+        "batch,nheads,dim,dstate,cache_steps,state_dtype,weight_dtype,use_out_tensor,ngroups",
+        _NGROUPS_PARAMS,
+    )
+    def test_output_correctness(
+        self,
+        batch,
+        nheads,
+        dim,
+        dstate,
+        cache_steps,
+        state_dtype,
+        weight_dtype,
+        use_out_tensor,
         ngroups,
     ):
-        """Create test inputs with specified ngroups."""
-        return create_test_inputs(
+        """Test that kernel output matches reference within tolerance."""
+        inputs = create_test_inputs(
             batch,
             nheads,
             dim,
@@ -680,38 +640,60 @@ class TestSelectiveStateUpdateMTPVariousNgroups(TestSelectiveStateUpdateMTP):
             cache_steps=cache_steps,
             seed=0,
         )
+        y_ref, state_ref = self.make_reference_output(inputs)
+
+        if use_out_tensor:
+            out = torch.empty_like(inputs["x"])
+        else:
+            out = None
+
+        y_test = self.run_kernel(inputs, out=out)
+
+        if use_out_tensor:
+            assert y_test.data_ptr() == out.data_ptr(), (
+                "Returned tensor should be the same object as the provided output tensor"
+            )
+
+        self.assert_outputs_match(y_ref, y_test)
+        self.assert_states_match(state_ref, inputs["state_cache"], inputs["slot_idx"])
 
 
 class TestSelectiveStateUpdateMTPLargeBatch(TestSelectiveStateUpdateMTP):
     """Test multi-token selective_state_update with larger batch sizes."""
 
-    @pytest.fixture(params=[16, 64])
-    def batch(self, request):
-        return request.param
+    # fmt: off
+    _LARGE_BATCH_PARAMS = [
+        # (batch, nheads, dim, dstate, cache_steps, state_dtype,    weight_dtype,   use_out_tensor)
+        (  16,    64,     64,  128,    4,           torch.bfloat16, torch.float32,  True ),  # batch=16
+        ( 256,    64,     64,  128,    4,           torch.bfloat16, torch.float32,  True ),  # batch=256
+    ]
+    # fmt: on
 
-    @pytest.fixture(params=[32])
-    def nheads(self, request):
-        return request.param
-
-    @pytest.fixture(params=[64])
-    def dim(self, request):
-        return request.param
-
-    @pytest.fixture(params=[64])
-    def dstate(self, request):
-        return request.param
-
-    @pytest.fixture(params=[4, 8])
-    def cache_steps(self, request):
-        return request.param
-
-    @pytest.fixture(params=[torch.bfloat16])
-    def state_dtype(self, request):
-        return request.param
-
-    @pytest.fixture(params=[torch.float32])
-    def weight_dtype(self, request):
-        return request.param
+    @pytest.mark.parametrize(
+        "batch,nheads,dim,dstate,cache_steps,state_dtype,weight_dtype,use_out_tensor",
+        _LARGE_BATCH_PARAMS,
+    )
+    def test_output_correctness(
+        self,
+        batch,
+        nheads,
+        dim,
+        dstate,
+        cache_steps,
+        state_dtype,
+        weight_dtype,
+        use_out_tensor,
+    ):
+        super().test_output_correctness(
+            batch,
+            nheads,
+            dim,
+            dstate,
+            cache_steps,
+            state_dtype,
+            weight_dtype,
+            use_out_tensor,
+        )
 
 
 class TestSelectiveStateUpdateMTPIndicesDtypeMismatch:

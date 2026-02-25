@@ -12,7 +12,7 @@ import pytest
 import torch
 from cutlass.cute.runtime import from_dlpack
 
-from flashinfer.cute_dsl.blockscaled_gemm import (
+from flashinfer.gemm import (
     Sm100BlockScaledPersistentDenseGemmKernel,  # not used in python interface
     grouped_gemm_nt_masked,  # deepgemm-like python interface for DLFW integration
     create_scale_factor_tensor,

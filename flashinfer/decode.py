@@ -1040,14 +1040,20 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self._cached_module = self._jit_module
             else:
                 if self._backend == "auto":
-                    self._backend = determine_attention_backend(
-                        self.device,
-                        PosEncodingMode[pos_encoding_mode].value,
-                        False,  # use_fp16_qk_reduction
-                        False,  # use_custom_mask
-                        q_data_type,
-                        kv_data_type,
-                    )
+                    if {
+                        torch.float8_e4m3fn,
+                        torch.float8_e5m2,
+                    } & {q_data_type, kv_data_type}:
+                        self._backend = determine_attention_backend(
+                            self.device,
+                            PosEncodingMode[pos_encoding_mode].value,
+                            False,  # use_fp16_qk_reductions
+                            False,  # use_custom_mask
+                            q_data_type,
+                            kv_data_type,
+                        )
+                    else:
+                        self._backend = "fa2"
                 self._cached_module = get_batch_prefill_module(
                     self._backend,
                     q_data_type,
@@ -1168,6 +1174,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         return_lse: Literal[False] = False,
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
+        sinks: Optional[torch.Tensor] = None,
+        q_len_per_req: Optional[int] = 1,
+        skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> torch.Tensor: ...
 
     @overload
@@ -1184,6 +1193,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         return_lse: Literal[True] = True,
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
+        sinks: Optional[torch.Tensor] = None,
+        q_len_per_req: Optional[int] = 1,
+        skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     @flashinfer_api
@@ -1202,6 +1214,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         window_left: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
         q_len_per_req: Optional[int] = 1,
+        skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch decode attention between query and paged kv cache.
 
@@ -1241,6 +1254,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
             Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
         q_len_per_req : int
             The number of query tokens per request, if not provided, will be set to ``1``.
+        skip_softmax_threshold_scale_factor: Optional[float] = None
+            threshold scale factor for skipping softmax operations.
+            Providing a value for this parameter enables skip-softmax sparsity as described in: https://arxiv.org/abs/2512.12087
+            If no value is provided, then standard attention is used.
+            Setting the threshold to a higher value generally increases kernel performance at the cost of accuracy degradation.
+            The actual threshold value equals the provided threshold_scale_factor divided by the context length.
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -1370,6 +1389,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     page_size,
                     self._max_kv_len,
                     sinks,
+                    skip_softmax_threshold_scale_factor,
                 ]
 
             self._cached_module.paged_run(*run_args)
@@ -1920,6 +1940,7 @@ class TrtllmGenDecodeModule:
         enable_pdl: bool = None,
         out: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> torch.Tensor:
         if out is None:
             out = torch.empty_like(query)
@@ -1961,6 +1982,7 @@ class TrtllmGenDecodeModule:
             workspace_size,
             sinks,
             None,  # cum_seq_lens_q
+            skip_softmax_threshold_scale_factor,
         )
         return out
 
@@ -2022,6 +2044,7 @@ def get_trtllm_gen_decode_module(*args):
         page_size: Optional[int] = None,
         max_kv_len: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
+        skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> None:
         assert maybe_lse is None
         assert paged_kv_cache is not None
@@ -2048,6 +2071,7 @@ def get_trtllm_gen_decode_module(*args):
             enable_pdl,
             out=o,
             sinks=sinks,
+            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         )
 
     @register_fake_op(f"flashinfer::{uri}_paged_run")
@@ -2087,6 +2111,7 @@ def get_trtllm_gen_decode_module(*args):
         page_size: Optional[int] = None,
         max_kv_len: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
+        skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> None:
         pass
 
@@ -2124,6 +2149,7 @@ def trtllm_batch_decode_with_kv_cache(
     mask: Optional[torch.Tensor] = None,
     max_q_len: Optional[int] = None,
     cum_seq_lens_q: Optional[torch.Tensor] = None,
+    skip_softmax_threshold_scale_factor: Optional[float] = None,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
     Parameters
@@ -2206,6 +2232,13 @@ def trtllm_batch_decode_with_kv_cache(
         Cumulative query sequence lengths for variable-length query support, shape: ``[batch_size + 1]``, dtype: ``torch.int32``.
         Only supported by trtllm-gen backend. Must be provided together with ``max_q_len``.
         When None, all requests use uniform query length specified by ``q_len_per_req``.
+
+    skip_softmax_threshold_scale_factor: Optional[float] = None
+        threshold scale factor for skipping softmax operations.
+        Providing a value for this parameter enables skip-softmax sparsity as described in: https://arxiv.org/abs/2512.12087
+        If no value is provided, then standard attention is used.
+        Setting the threshold to a higher value generally increases kernel performance at the cost of accuracy degradation.
+        The actual threshold value equals the provided threshold_scale_factor divided by the context length.
 
     Returns
     -------
@@ -2387,6 +2420,7 @@ def trtllm_batch_decode_with_kv_cache(
             workspace_buffer.numel() * workspace_buffer.element_size(),
             sinks,
             cum_seq_lens_q,
+            skip_softmax_threshold_scale_factor,
         )
 
         return (

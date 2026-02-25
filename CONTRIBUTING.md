@@ -9,6 +9,11 @@ pip install --no-build-isolation -e . -v
 
 We recommend using the `--no-build-isolation` flag to ensure compatibility with your existing environment. Without it, `pip` may attempt to resolve dependencies (e.g., `torch`) from PyPI, which could pull in packages built with older CUDA versions and lead to incompatibility issues.
 
+> **Note:** When using `--no-build-isolation`, pip does not automatically install build dependencies. FlashInfer requires `setuptools>=77`. If you encounter an error like `AttributeError: module 'setuptools.build_meta' has no attribute 'prepare_metadata_for_build_editable'`, upgrade pip and setuptools first:
+> ```bash
+> python -m pip install --upgrade pip setuptools
+> ```
+
 # Code Structure
 
 ```
@@ -33,6 +38,19 @@ Code Contribution Procedure
 * (Optional) Add benchmark suites under `benchmark/`
 * Update (python) documentation index under `docs/`
 * Update `pyproject.toml` if you created new module in flashinfer
+
+# Claiming Issues
+
+Want to work on an issue? Use these commands in the issue comments:
+
+| Command | Who can use | Description |
+|---------|-------------|-------------|
+| `!claim` | Anyone | Self-assign an unassigned issue |
+| `!assign @username` | Admins/Maintainers | Assign a specific user to an issue |
+
+**`!claim`** — Comment `!claim` on any open, unassigned issue to assign yourself. If the issue is already assigned, you'll be asked to contact a maintainer.
+
+**`!assign @username`** — Maintainers can comment `!assign @username` to assign someone. If the user is not yet a collaborator, a triage invitation is sent automatically and they will be assigned once they accept.
 
 # Release Versioning
 

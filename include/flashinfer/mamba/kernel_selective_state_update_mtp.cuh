@@ -288,48 +288,40 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
 
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t,
           typename stateIndex_t>
-void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, cudaStream_t stream) {
+void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm algorithm,
+                                   cudaStream_t stream) {
+  // MTP only supports the simple kernel
+  FLASHINFER_CHECK(algorithm == SSUAlgorithm::kAuto || algorithm == SSUAlgorithm::kSimple,
+                   "MTP selective_state_update only supports 'auto' or 'simple' algorithm, got ",
+                   static_cast<int32_t>(algorithm));
   // Common alignment checks for all kernels
   check_ptr_alignment_input_vars<input_t>(params);
 
-  auto kernel_launcher = [&]<int DIM, int DSTATE, int TOKENS_MTP>() {
-    // Additional alignment checks specific to simple kernel
-    constexpr auto stateLoadSize = getVectorLoadSizeForFullUtilization<state_t, DSTATE>();
-    using load_state_t = PackedAligned<state_t, stateLoadSize>;
+  constexpr auto stateLoadSize = getVectorLoadSizeForFullUtilization<state_t, DSTATE>();
+  using load_state_t = PackedAligned<state_t, stateLoadSize>;
 
-    FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.state) % sizeof(load_state_t) == 0,
-                     "state pointer must be aligned to ", sizeof(load_state_t), " bytes");
-    FLASHINFER_CHECK((params.dim * params.dstate * sizeof(state_t)) % sizeof(load_state_t) == 0,
-                     "state head stride must be aligned to ", sizeof(load_state_t), " bytes");
+  FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.state) % sizeof(load_state_t) == 0,
+                   "state pointer must be aligned to ", sizeof(load_state_t), " bytes");
+  FLASHINFER_CHECK((params.dim * params.dstate * sizeof(state_t)) % sizeof(load_state_t) == 0,
+                   "state head stride must be aligned to ", sizeof(load_state_t), " bytes");
 
-    constexpr int numWarps = 4;
-    constexpr int stateRowsPerWarpPerStage = 4;
-    constexpr int stageRows = stateRowsPerWarpPerStage * numWarps;
+  constexpr int numWarps = 4;
+  constexpr int stateRowsPerWarpPerStage = 4;
+  constexpr int stageRows = stateRowsPerWarpPerStage * numWarps;
 
-    dim3 block(warpSize, numWarps);
-    dim3 grid(params.batch, params.nheads);
+  dim3 block(warpSize, numWarps);
+  dim3 grid(params.batch, params.nheads);
 
-    auto func =
-        selective_state_update_kernel_simple_mtp<input_t, weight_t, matrixA_t, state_t,
-                                                 stateIndex_t, TOKENS_MTP, DIM, DSTATE, numWarps>;
-    using sram_t = SharedStorageSimple<input_t, state_t, TOKENS_MTP, DIM, DSTATE, stageRows>;
-    constexpr size_t smem_size = sizeof(sram_t);
+  auto func =
+      selective_state_update_kernel_simple_mtp<input_t, weight_t, matrixA_t, state_t, stateIndex_t,
+                                               NTOKENS_MTP, DIM, DSTATE, numWarps>;
+  using sram_t = SharedStorageSimple<input_t, state_t, NTOKENS_MTP, DIM, DSTATE, stageRows>;
+  constexpr size_t smem_size = sizeof(sram_t);
 
-    // Use FLASHINFER_CHECK instead of FLASHINFER_CUDA_CALL since we're in a void lambda
-    // (FLASHINFER_CUDA_CALL uses "return e;" which is invalid in void context)
-    // {
-    //   cudaError_t e = cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize,
-    //   smem_size); FLASHINFER_CHECK(e == cudaSuccess, "CUDA Error in cudaFuncSetAttribute: ",
-    //                    cudaGetErrorString(e), " (", int(e), ")");
-    // }
-    FLASHINFER_CUDA_CHECK(
-        cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+  FLASHINFER_CUDA_CHECK(
+      cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
-    func<<<grid, block, smem_size, stream>>>(params);
-  };
-
-  dispatchDimDstateTokens(params, AllowedDims{}, AllowedDstates{}, AllowedNtokens{},
-                          kernel_launcher);
+  func<<<grid, block, smem_size, stream>>>(params);
 }
 
 }  // namespace flashinfer::mamba::mtp
