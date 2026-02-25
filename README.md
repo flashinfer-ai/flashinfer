@@ -141,6 +141,11 @@ python -m pip install -v .
 python -m pip install --no-build-isolation -e . -v
 ```
 
+> **Note:** When using `--no-build-isolation`, pip does not automatically install build dependencies. FlashInfer requires `setuptools>=77`. If you encounter an error like `AttributeError: module 'setuptools.build_meta' has no attribute 'prepare_metadata_for_build_editable'`, upgrade pip and setuptools first:
+> ```bash
+> python -m pip install --upgrade pip setuptools
+> ```
+
 Build optional packages:
 
 ```bash
