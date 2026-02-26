@@ -46,10 +46,12 @@ inline __device__ void convertAndStore(int16_t* output, float input) {
 // Philox-4x32 PRNG (matches Triton's tl.randint)
 // =============================================================================
 
-// Generates a pseudorandom uint32 from (seed, offset) using the Philox-4x32 algorithm.
-// Produces bit-identical output to Triton's tl.randint(seed, offset, n_rounds).
+// Generates four pseudorandom uint32s from (seed, offset) using the Philox-4x32 algorithm.
+// Produces bit-identical output to Triton's tl.randint4x(seed, offset, n_rounds).
+// All four outputs (c0..c3) are independent and uniformly distributed.
 template <int n_rounds = 10>
-__device__ __forceinline__ uint32_t philox_randint(int64_t seed, uint32_t offset) {
+__device__ __forceinline__ void philox_randint4x(int64_t seed, uint32_t offset, uint32_t& r0,
+                                                 uint32_t& r1, uint32_t& r2, uint32_t& r3) {
   constexpr uint32_t PHILOX_KEY_A = 0x9E3779B9u;
   constexpr uint32_t PHILOX_KEY_B = 0xBB67AE85u;
   constexpr uint32_t PHILOX_ROUND_A = 0xD2511F53u;
@@ -69,7 +71,21 @@ __device__ __forceinline__ uint32_t philox_randint(int64_t seed, uint32_t offset
     k0 += PHILOX_KEY_A;
     k1 += PHILOX_KEY_B;
   }
-  return c0;
+  r0 = c0;
+  r1 = c1;
+  r2 = c2;
+  r3 = c3;
+}
+
+// Generates a pseudorandom uint32 from (seed, offset) using the Philox-4x32 algorithm.
+// Produces bit-identical output to Triton's tl.randint(seed, offset, n_rounds).
+// NOTE: This discards 3 of the 4 Philox outputs. For better throughput, use
+// philox_randint4x to get all 4 outputs from a single Philox invocation.
+template <int n_rounds = 10>
+__device__ __forceinline__ uint32_t philox_randint(int64_t seed, uint32_t offset) {
+  uint32_t r0, r1, r2, r3;
+  philox_randint4x<n_rounds>(seed, offset, r0, r1, r2, r3);
+  return r0;
 }
 
 // =============================================================================

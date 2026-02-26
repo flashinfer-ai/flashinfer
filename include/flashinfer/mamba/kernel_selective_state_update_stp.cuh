@@ -187,12 +187,24 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
     [[maybe_unused]] float rNewState[scaleState ? DSTATE / warpSize : 1];
 
     // update the out value and compute the max state and state sum.
+    // Philox-4x32 produces 4 random ints per call; reuse across up to 4 consecutive elements.
+    // Refresh every time the ii-within-outer-loop crosses a multiple-of-4 boundary.
+    // Works for any count (1, 2, 4, 8, ...): count<=4 refreshes once per outer iter (or less),
+    // count>4 (e.g. count=8 for bf16+DSTATE=256) refreshes count/4 times per outer iter.
+    [[maybe_unused]] uint32_t rand_ints[4];
     for (int iter = 0, i = lane * load_state_t::count; i < DSTATE;
          iter++, i += warpSize * load_state_t::count) {
       auto rState = make_zeros<load_state_t>();
       if (state_batch != params.pad_slot_id)
         rState = *reinterpret_cast<load_state_t*>(&state[d * DSTATE + i]);
+
       for (int ii = 0; ii < load_state_t::count; ii++) {
+        if constexpr (PHILOX_ROUNDS > 0 && !scaleState) {
+          if (ii % 4 == 0)
+            philox_randint4x<PHILOX_ROUNDS>(params.rand_seed, d * DSTATE + i + ii, rand_ints[0],
+                                            rand_ints[1], rand_ints[2], rand_ints[3]);
+        }
+
         auto state_value = toFloat(rState.val[ii]) * state_decode_scale;
         auto B_value = toFloat(sram.B[i + ii]);
         auto C_value = toFloat(sram.C[i + ii]);
@@ -203,8 +215,7 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
           new_state_max = fmaxf(new_state_max, fabsf(new_state));
           rNewState[iter * load_state_t::count + ii] = new_state;
         } else if constexpr (PHILOX_ROUNDS > 0) {
-          convertSRAndStore<PHILOX_ROUNDS>(&rState.val[ii], new_state, params.rand_seed,
-                                           d * DSTATE + i + ii);
+          rState.val[ii] = cvt_rs_f16_f32(new_state, rand_ints[ii % 4] & 0x1FFFu);
         } else {
           convertAndStore(&rState.val[ii], new_state);
         }
@@ -460,6 +471,9 @@ __device__ __forceinline__ void consumer_func_vertical(
       // code)
       [[maybe_unused]] float rNewState[scaleState ? DSTATE / warpSize : 1];
 
+      // Philox-4x32 produces 4 random ints per call; reuse across up to 4 consecutive elements.
+      // Refresh when e % 4 == 0. stateValuesPerBank is constexpr so all branches compile away.
+      [[maybe_unused]] uint32_t rand_ints[4];
       if constexpr (sizeof(state_t) == sizeof(input_t)) {
         for (int iter = 0, i = lane * stateValuesPerBank; i < DSTATE;
              iter++, i += warpSize * stateValuesPerBank) {
@@ -475,6 +489,12 @@ __device__ __forceinline__ void consumer_func_vertical(
           auto* rC_ptr = reinterpret_cast<input_t const*>(&rC);
 
           for (int e = 0; e < stateValuesPerBank; e++) {
+            if constexpr (PHILOX_ROUNDS > 0 && !scaleState) {
+              if (e % 4 == 0)
+                philox_randint4x<PHILOX_ROUNDS>(rand_seed, d * DSTATE + i + e, rand_ints[0],
+                                                rand_ints[1], rand_ints[2], rand_ints[3]);
+            }
+
             float state_value;
             if constexpr (!useStateCache) {
               state_value = 0.f;
@@ -494,8 +514,7 @@ __device__ __forceinline__ void consumer_func_vertical(
               new_state_max = fmaxf(new_state_max, fabsf(new_state));
               rNewState[iter * stateValuesPerBank + e] = new_state;
             } else if constexpr (PHILOX_ROUNDS > 0) {
-              convertSRAndStore<PHILOX_ROUNDS>(&rState_ptr[e], new_state, rand_seed,
-                                               d * DSTATE + i + e);
+              rState_ptr[e] = cvt_rs_f16_f32(new_state, rand_ints[e % 4] & 0x1FFFu);
             } else {
               convertAndStore(&rState_ptr[e], new_state);
             }
@@ -513,6 +532,12 @@ __device__ __forceinline__ void consumer_func_vertical(
           auto* rState_ptr = reinterpret_cast<state_t*>(&rState);
 
           for (int e = 0; e < stateValuesPerBank; e++) {
+            if constexpr (PHILOX_ROUNDS > 0 && !scaleState) {
+              if (e % 4 == 0)
+                philox_randint4x<PHILOX_ROUNDS>(rand_seed, d * DSTATE + i + e, rand_ints[0],
+                                                rand_ints[1], rand_ints[2], rand_ints[3]);
+            }
+
             float state_value;
             if constexpr (!useStateCache) {
               state_value = 0.f;
@@ -531,8 +556,7 @@ __device__ __forceinline__ void consumer_func_vertical(
               new_state_max = fmaxf(new_state_max, fabsf(new_state));
               rNewState[iter * stateValuesPerBank + e] = new_state;
             } else if constexpr (PHILOX_ROUNDS > 0) {
-              convertSRAndStore<PHILOX_ROUNDS>(&rState_ptr[e], new_state, rand_seed,
-                                               d * DSTATE + i + e);
+              rState_ptr[e] = cvt_rs_f16_f32(new_state, rand_ints[e % 4] & 0x1FFFu);
             } else {
               convertAndStore(&rState_ptr[e], new_state);
             }
@@ -851,6 +875,10 @@ __device__ __forceinline__ void consumer_func_horizontal(
     constexpr auto bankSize = sizeof(uint32_t);
     constexpr auto stateValuesPerBank = bankSize / sizeof(state_t);
     constexpr auto numBanks = 32;
+    // Philox-4x32 produces 4 random ints per call; reuse across up to 4 consecutive elements.
+    // flat_e tracks position across outer+inner loops; refresh every 4 elements.
+    // Loop is fully unrolled (#pragma unroll), so the modulo and branch compile away.
+    [[maybe_unused]] uint32_t rand_ints[4];
     if constexpr (sizeof(state_t) == sizeof(input_t)) {
 #pragma unroll
       for (int item = 0; item < itemsPerThread; item += stateValuesPerBank) {
@@ -872,6 +900,13 @@ __device__ __forceinline__ void consumer_func_horizontal(
         auto* rC_ptr = reinterpret_cast<input_t const*>(&rC);
 
         for (int e = 0; e < stateValuesPerBank; e++) {
+          int flat_e = item + e;
+          if constexpr (PHILOX_ROUNDS > 0) {
+            if (flat_e % 4 == 0)
+              philox_randint4x<PHILOX_ROUNDS>(rand_seed, d * DSTATE + i + e, rand_ints[0],
+                                              rand_ints[1], rand_ints[2], rand_ints[3]);
+          }
+
           float state_value;
           if constexpr (!useStateCache) {
             state_value = 0.f;
@@ -888,8 +923,7 @@ __device__ __forceinline__ void consumer_func_horizontal(
 
           // TODO: when stateValuesPerBank == 2, could use cvt_rs_f16x2_f32 for both at once
           if constexpr (PHILOX_ROUNDS > 0) {
-            convertSRAndStore<PHILOX_ROUNDS>(&rState_ptr[e], new_state, rand_seed,
-                                             d * DSTATE + i + e);
+            rState_ptr[e] = cvt_rs_f16_f32(new_state, rand_ints[flat_e % 4] & 0x1FFFu);
           } else {
             convertAndStore(&rState_ptr[e], new_state);
           }
@@ -898,6 +932,7 @@ __device__ __forceinline__ void consumer_func_horizontal(
         *sState_ptr = rState;
       }
     } else {
+#pragma unroll
       for (int item = 0; item < itemsPerThread; item += stateValuesPerBank) {
         auto const baseCol = item + member * itemsPerThread;
         auto const ii =
@@ -909,6 +944,13 @@ __device__ __forceinline__ void consumer_func_horizontal(
         auto* rState_ptr = reinterpret_cast<state_t*>(&rState);
 
         for (int e = 0; e < stateValuesPerBank; e++) {
+          int flat_e = item + e;
+          if constexpr (PHILOX_ROUNDS > 0) {
+            if (flat_e % 4 == 0)
+              philox_randint4x<PHILOX_ROUNDS>(rand_seed, d * DSTATE + i + e, rand_ints[0],
+                                              rand_ints[1], rand_ints[2], rand_ints[3]);
+          }
+
           float state_value;
           if constexpr (!useStateCache) {
             state_value = 0.f;
@@ -925,8 +967,7 @@ __device__ __forceinline__ void consumer_func_horizontal(
 
           // TODO: when stateValuesPerBank == 2, could use cvt_rs_f16x2_f32 for both at once
           if constexpr (PHILOX_ROUNDS > 0) {
-            convertSRAndStore<PHILOX_ROUNDS>(&rState_ptr[e], new_state, rand_seed,
-                                             d * DSTATE + i + e);
+            rState_ptr[e] = cvt_rs_f16_f32(new_state, rand_ints[flat_e % 4] & 0x1FFFu);
           } else {
             convertAndStore(&rState_ptr[e], new_state);
           }
