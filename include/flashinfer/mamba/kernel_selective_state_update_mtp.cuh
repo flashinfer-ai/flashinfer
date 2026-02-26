@@ -17,13 +17,13 @@ namespace flashinfer::mamba::mtp {
 
 using namespace conversion;
 
-template <typename input_t, typename state_t, typename state_scale_t, int TOKENS_MTP, int DIM,
-          int DSTATE, int STATE_ROWS>
+template <typename input_t, typename state_t, typename state_scale_t, int TOKENS_MTP,
+          int ROWS_PER_BLOCK, int DSTATE, int STATE_ROWS>
 struct SharedStorageSimple {
   static constexpr bool scaleState = !std::is_same_v<state_scale_t, void>;
-  alignas(alignof(PackedAligned<input_t>)) input_t x[TOKENS_MTP][DIM];
-  alignas(alignof(PackedAligned<float>)) float out[TOKENS_MTP][DIM];
-  alignas(alignof(PackedAligned<input_t>)) input_t z[TOKENS_MTP][DIM];
+  alignas(alignof(PackedAligned<input_t>)) input_t x[TOKENS_MTP][ROWS_PER_BLOCK];
+  alignas(alignof(PackedAligned<float>)) float out[TOKENS_MTP][ROWS_PER_BLOCK];
+  alignas(alignof(PackedAligned<input_t>)) input_t z[TOKENS_MTP][ROWS_PER_BLOCK];
   alignas(alignof(PackedAligned<input_t>)) input_t B[TOKENS_MTP][DSTATE];
   alignas(alignof(PackedAligned<input_t>)) input_t C[TOKENS_MTP][DSTATE];
   alignas(alignof(PackedAligned<state_t>)) state_t state[STATE_ROWS][DSTATE];
@@ -31,9 +31,11 @@ struct SharedStorageSimple {
       std::conditional_t<scaleState, state_scale_t, char> state_scale[STATE_ROWS];
 };
 
+// Grid: (batch, nheads, cdiv(DIM, ROWS_PER_BLOCK))
+// When ROWS_PER_BLOCK == DIM, degenerates to the non-tiled case (blockIdx.z == 0 always).
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t,
           typename stateIndex_t, typename state_scale_t, int TOKENS_MTP, int DIM, int DSTATE,
-          int PHILOX_ROUNDS, int numWarps>
+          int ROWS_PER_BLOCK, int PHILOX_ROUNDS, int numWarps>
 __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams params) {
   constexpr bool scaleState = !std::is_same_v<state_scale_t, void>;
   auto* __restrict__ output = reinterpret_cast<input_t*>(params.output);
@@ -59,6 +61,7 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
 
   auto const batch = blockIdx.x;
   auto const head = blockIdx.y;
+  auto const dim_offset = blockIdx.z * ROWS_PER_BLOCK;
   auto const group = head / (nheads / ngroups);
   auto lane = threadIdx.x % warpSize;
   auto warp = threadIdx.y;
@@ -70,7 +73,8 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
   auto const state_batch = (state_batch_indices) ? state_batch_indices[batch] : batch;
   auto const intermediate_cache_idx =
       intermediate_state_indices ? intermediate_state_indices[batch] : state_batch;
-  state += state_batch * params.state_stride_batch + head * DIM * DSTATE;
+  auto const state_ptr_offset = state_batch * params.state_stride_batch + head * DIM * DSTATE;
+  state += state_ptr_offset;
   if constexpr (scaleState) {
     state_scale += state_batch * params.state_scale_stride_batch + head * DIM;
   }
@@ -79,9 +83,8 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
   constexpr auto stageRows = stateRowsPerWarpPerStage * numWarps;
 
   extern __shared__ __align__(128) char smem[];
-  auto& sram = *reinterpret_cast<
-      SharedStorageSimple<input_t, state_t, state_scale_t, TOKENS_MTP, DIM, DSTATE, stageRows>*>(
-      smem);
+  auto& sram = *reinterpret_cast<SharedStorageSimple<input_t, state_t, state_scale_t, TOKENS_MTP,
+                                                     ROWS_PER_BLOCK, DSTATE, stageRows>*>(smem);
 
   static constexpr auto stateLoadSize = getVectorLoadSizeForFullUtilization<state_t, DSTATE>();
   using load_state_t = PackedAligned<state_t, stateLoadSize>;
@@ -95,10 +98,14 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
   // Loop over multiple tokens
   if (warp == 0) {  // Load x: gmem -> smem
     for (int mtp_step = 0; mtp_step < TOKENS_MTP; mtp_step++) {
-      for (auto d = lane * load_input_t::count; d < DIM; d += warpSize * load_input_t::count) {
-        auto* dst = reinterpret_cast<load_input_t*>(&sram.x[mtp_step][d]);
-        *dst = *reinterpret_cast<load_input_t const*>(
-            &x[batch * params.x_stride_batch + mtp_step * params.x_stride_mtp + head * DIM + d]);
+      for (auto d = lane * load_input_t::count; d < ROWS_PER_BLOCK;
+           d += warpSize * load_input_t::count) {
+        if (dim_offset + d < DIM) {
+          auto* dst = reinterpret_cast<load_input_t*>(&sram.x[mtp_step][d]);
+          *dst = *reinterpret_cast<load_input_t const*>(
+              &x[batch * params.x_stride_batch + mtp_step * params.x_stride_mtp + head * DIM +
+                 dim_offset + d]);
+        }
       }
     }
   } else if (warp == 1) {  // Load B: gmem -> smem
@@ -112,12 +119,15 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
     }
   } else if (warp == 2) {  // Load z: gmem -> smem
     for (int mtp_step = 0; mtp_step < TOKENS_MTP; mtp_step++) {
-      for (auto d = lane * load_input_t::count; d < DIM; d += warpSize * load_input_t::count) {
-        auto* dst = reinterpret_cast<load_input_t*>(&sram.z[mtp_step][d]);
-        *dst = z ? *reinterpret_cast<load_input_t const*>(
-                       &z[batch * params.z_stride_batch + mtp_step * params.z_stride_mtp +
-                          head * DIM + d])
-                 : make_zeros<load_input_t>();
+      for (auto d = lane * load_input_t::count; d < ROWS_PER_BLOCK;
+           d += warpSize * load_input_t::count) {
+        if (dim_offset + d < DIM) {
+          auto* dst = reinterpret_cast<load_input_t*>(&sram.z[mtp_step][d]);
+          *dst = z ? *reinterpret_cast<load_input_t const*>(
+                         &z[batch * params.z_stride_batch + mtp_step * params.z_stride_mtp +
+                            head * DIM + dim_offset + d])
+                   : make_zeros<load_input_t>();
+        }
       }
     }
   }
@@ -146,17 +156,17 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
 
   __syncthreads();
 
-  for (auto dBegin = 0; dBegin < DIM; dBegin += stageRows) {
+  for (auto dBegin = 0; dBegin < ROWS_PER_BLOCK; dBegin += stageRows) {
     // Load state gmem -> smem
     for (int warpRow = 0; warpRow < stateRowsPerWarpPerStage; warpRow++) {
       auto dd = warp * stateRowsPerWarpPerStage + warpRow;
       auto d = dBegin + dd;
-      if (d < DIM) {
+      if (dim_offset + d < DIM) {
         if (state_batch != params.pad_slot_id) {
           for (int i = lane * load_state_t::count; i < DSTATE;
                i += warpSize * load_state_t::count) {
             auto* dst = reinterpret_cast<load_state_t*>(&sram.state[dd][i]);
-            *dst = *reinterpret_cast<load_state_t*>(&state[d * DSTATE + i]);
+            *dst = *reinterpret_cast<load_state_t*>(&state[(dim_offset + d) * DSTATE + i]);
           }
         }
       }
@@ -166,8 +176,8 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
       for (int warpRow = lane; warpRow < stateRowsPerWarpPerStage; warpRow += warpSize) {
         auto dd = warp * stateRowsPerWarpPerStage + warpRow;
         auto d = dBegin + dd;
-        if (d < DIM && state_batch != params.pad_slot_id) {
-          sram.state_scale[dd] = state_scale[d];
+        if (dim_offset + d < DIM && state_batch != params.pad_slot_id) {
+          sram.state_scale[dd] = state_scale[dim_offset + d];
         }
       }
     }
@@ -188,7 +198,7 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
 
     for (int warpRow = 0; warpRow < stateRowsPerWarpPerStage; warpRow++) {
       auto dd = warp * stateRowsPerWarpPerStage + warpRow;
-      auto d = dBegin + dd;
+      auto d = dim_offset + dBegin + dd;  // global DIM index
 
       if (d >= DIM) break;
 
@@ -209,7 +219,7 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
       }
 
       for (int step = 0; step < TOKENS_MTP; step++) {
-        float x_value = toFloat(sram.x[step][d]);
+        float x_value = toFloat(sram.x[step][d - dim_offset]);
         float out_value = d_value * x_value * int(lane == 0);  // first lane has the value
 
         // Compute dt value for this token
@@ -244,11 +254,16 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
               if (intermediate_states) {
                 using packed_state_t = PackedAligned<state_t, packed_input_t::count>;
                 packed_state_t rStateOut;
+                // Philox-4x32 produces 4 random ints per call; amortize across packed elements.
+                [[maybe_unused]] uint32_t rand_ints[4];
 #pragma unroll
                 for (int k = 0; k < packed_input_t::count; k++) {
                   if constexpr (PHILOX_ROUNDS > 0) {
-                    convertSRAndStore<PHILOX_ROUNDS>(&rStateOut.val[k], rState[ii + k],
-                                                     params.rand_seed, d * DSTATE + base_i + k);
+                    if (k % 4 == 0)
+                      philox_randint4x<PHILOX_ROUNDS>(
+                          params.rand_seed, state_ptr_offset + d * DSTATE + base_i + k,
+                          rand_ints[0], rand_ints[1], rand_ints[2], rand_ints[3]);
+                    rStateOut.val[k] = cvt_rs_f16_f32(rState[ii + k], rand_ints[k % 4] & 0x1FFFu);
                   } else {
                     convertAndStore(&rStateOut.val[k], rState[ii + k]);
                   }
@@ -257,11 +272,17 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
               }
             } else {
               if (intermediate_states) {
+                // Philox-4x32 produces 4 random ints per call; amortize across packed elements.
+                [[maybe_unused]] uint32_t rand_ints[4];
 #pragma unroll
                 for (int k = 0; k < packed_input_t::count; k++) {
                   if constexpr (PHILOX_ROUNDS > 0) {
-                    convertSRAndStore<PHILOX_ROUNDS>(&sram.state[dd][base_i + k], rState[ii + k],
-                                                     params.rand_seed, d * DSTATE + base_i + k);
+                    if (k % 4 == 0)
+                      philox_randint4x<PHILOX_ROUNDS>(
+                          params.rand_seed, state_ptr_offset + d * DSTATE + base_i + k,
+                          rand_ints[0], rand_ints[1], rand_ints[2], rand_ints[3]);
+                    sram.state[dd][base_i + k] =
+                        cvt_rs_f16_f32(rState[ii + k], rand_ints[k % 4] & 0x1FFFu);
                   } else {
                     convertAndStore(&sram.state[dd][base_i + k], rState[ii + k]);
                   }
@@ -301,7 +322,7 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
 
         out_value = warpReduceSum(out_value);
         if (lane == 0) {
-          sram.out[step][d] = out_value;
+          sram.out[step][d - dim_offset] = out_value;
         }
 
         if (intermediate_states && state_batch != params.pad_slot_id) {
@@ -329,40 +350,50 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
 
       // Update state if enabled and not padded
       if (params.update_state && state_batch != params.pad_slot_id) {
-        if constexpr (scaleState) {
-          // 2-pass quantization: compute max, then re-encode
-          float new_state_max = std::numeric_limits<float>::lowest();
-          for (int ii = 0; ii < stateValuesPerThread; ii++) {
-            new_state_max = fmaxf(new_state_max, fabsf(rState[ii]));
-          }
-          new_state_max = warpReduceMax(new_state_max);
-          new_state_max = __shfl_sync(UINT32_MAX, new_state_max, 0);
-          float const new_encode_scale =
-              static_cast<float>(std::numeric_limits<state_t>::max()) / new_state_max;
-          float const new_decode_scale = 1.f / new_encode_scale;
-
-          // Re-encode state values and store to smem
-          for (int ii = 0; ii < stateValuesPerThread; ii++) {
-            int i = lane * packed_input_t::count +
-                    (ii / packed_input_t::count) * warpSize * packed_input_t::count +
-                    (ii % packed_input_t::count);
-            if (i < DSTATE) {
-              convertAndStore(&sram.state[dd][i], rState[ii] * new_encode_scale);
+        // When intermediate_states is enabled, sram.state[dd] already holds the
+        // stochastically-rounded (or scaled) state from the last token step's intermediate write.
+        // Skip the redundant Philox PRNG / re-quantization and write directly to gmem.
+        if (!intermediate_states) {
+          if constexpr (scaleState) {
+            // 2-pass quantization: compute max, then re-encode
+            float new_state_max = std::numeric_limits<float>::lowest();
+            for (int ii = 0; ii < stateValuesPerThread; ii++) {
+              new_state_max = fmaxf(new_state_max, fabsf(rState[ii]));
             }
-          }
-          if (lane == 0) convertAndStore(&sram.state_scale[dd], new_decode_scale);
-        } else {
-          // Store to rmem -> smem
-          for (int ii = 0; ii < stateValuesPerThread; ii++) {
-            int i = lane * packed_input_t::count +
-                    (ii / packed_input_t::count) * warpSize * packed_input_t::count +
-                    (ii % packed_input_t::count);
-            if (i < DSTATE) {
-              if constexpr (PHILOX_ROUNDS > 0) {
-                convertSRAndStore<PHILOX_ROUNDS>(&sram.state[dd][i], rState[ii], params.rand_seed,
-                                                 d * DSTATE + i);
-              } else {
-                convertAndStore(&sram.state[dd][i], rState[ii]);
+            new_state_max = warpReduceMax(new_state_max);
+            new_state_max = __shfl_sync(UINT32_MAX, new_state_max, 0);
+            float const new_encode_scale =
+                static_cast<float>(std::numeric_limits<state_t>::max()) / new_state_max;
+            float const new_decode_scale = 1.f / new_encode_scale;
+
+            // Re-encode state values and store to smem
+            for (int ii = 0; ii < stateValuesPerThread; ii++) {
+              int i = lane * packed_input_t::count +
+                      (ii / packed_input_t::count) * warpSize * packed_input_t::count +
+                      (ii % packed_input_t::count);
+              if (i < DSTATE) {
+                convertAndStore(&sram.state[dd][i], rState[ii] * new_encode_scale);
+              }
+            }
+            if (lane == 0) convertAndStore(&sram.state_scale[dd], new_decode_scale);
+          } else {
+            // Store to rmem -> smem
+            // Philox-4x32 produces 4 random ints per call; amortize across consecutive elements.
+            [[maybe_unused]] uint32_t rand_ints[4];
+            for (int ii = 0; ii < stateValuesPerThread; ii++) {
+              int i = lane * packed_input_t::count +
+                      (ii / packed_input_t::count) * warpSize * packed_input_t::count +
+                      (ii % packed_input_t::count);
+              if (i < DSTATE) {
+                if constexpr (PHILOX_ROUNDS > 0) {
+                  if (ii % 4 == 0)
+                    philox_randint4x<PHILOX_ROUNDS>(params.rand_seed,
+                                                    state_ptr_offset + d * DSTATE + i, rand_ints[0],
+                                                    rand_ints[1], rand_ints[2], rand_ints[3]);
+                  sram.state[dd][i] = cvt_rs_f16_f32(rState[ii], rand_ints[ii % 4] & 0x1FFFu);
+                } else {
+                  convertAndStore(&sram.state[dd][i], rState[ii]);
+                }
               }
             }
           }
@@ -379,7 +410,7 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
       if (params.update_state && state_batch != params.pad_slot_id) {
         for (int warpRow = lane; warpRow < stateRowsPerWarpPerStage; warpRow += warpSize) {
           auto dd = warp * stateRowsPerWarpPerStage + warpRow;
-          auto d = dBegin + dd;
+          auto d = dim_offset + dBegin + dd;
           if (d < DIM) {
             state_scale[d] = sram.state_scale[dd];
           }
@@ -391,17 +422,20 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
   __syncthreads();
 
   for (auto step = warp; step < TOKENS_MTP; step += numWarps) {
-    for (auto d = lane; d < DIM; d += warpSize) {
-      auto out_value = sram.out[step][d];
-      if (z) {
-        float z_value = toFloat(sram.z[step][d]);
-        float sig_z = __fdividef(1.f, (1.f + __expf(0.f - z_value)));
-        float silu_z = z_value * sig_z;
-        out_value *= silu_z;
+    for (auto d = lane; d < ROWS_PER_BLOCK; d += warpSize) {
+      if (dim_offset + d < DIM) {
+        auto out_value = sram.out[step][d];
+        if (z) {
+          float z_value = toFloat(sram.z[step][d]);
+          float sig_z = __fdividef(1.f, (1.f + __expf(0.f - z_value)));
+          float silu_z = z_value * sig_z;
+          out_value *= silu_z;
+        }
+        auto* dst = reinterpret_cast<input_t*>(
+            &output[batch * params.out_stride_batch + step * params.out_stride_mtp + head * DIM +
+                    dim_offset + d]);
+        convertAndStore(dst, out_value);
       }
-      auto* dst = reinterpret_cast<input_t*>(
-          &output[batch * params.out_stride_batch + step * params.out_stride_mtp + head * DIM + d]);
-      convertAndStore(dst, out_value);
     }
   }
 }
@@ -432,22 +466,39 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
 
   constexpr int numWarps = 4;
   constexpr int stateRowsPerWarpPerStage = 4;
-  constexpr int stageRows = stateRowsPerWarpPerStage * numWarps;
+  constexpr int stateRowsPerBlockPerStage = stateRowsPerWarpPerStage * numWarps;
+  int const total_tiles = params.batch * params.nheads;
+  int const num_sms = GetCudaMultiProcessorCount();
 
   dim3 block(warpSize, numWarps);
-  dim3 grid(params.batch, params.nheads);
-
-  auto func = selective_state_update_kernel_simple_mtp<input_t, weight_t, matrixA_t, state_t,
-                                                       stateIndex_t, state_scale_t, NTOKENS_MTP,
-                                                       DIM, DSTATE, PHILOX_ROUNDS, numWarps>;
-  using sram_t =
-      SharedStorageSimple<input_t, state_t, state_scale_t, NTOKENS_MTP, DIM, DSTATE, stageRows>;
-  constexpr size_t smem_size = sizeof(sram_t);
-
-  FLASHINFER_CUDA_CHECK(
-      cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-
-  func<<<grid, block, smem_size, stream>>>(params);
+  if (total_tiles < num_sms * 2) {
+    // Small tile per CTA (stateRowsPerBlockPerStage * DSTATE): split dim across grid.z for GPU
+    // occupancy
+    int const dim_tiles = (DIM + stateRowsPerBlockPerStage - 1) / stateRowsPerBlockPerStage;
+    dim3 grid(params.batch, params.nheads, dim_tiles);
+    auto func = selective_state_update_kernel_simple_mtp<
+        input_t, weight_t, matrixA_t, state_t, stateIndex_t, state_scale_t, NTOKENS_MTP, DIM,
+        DSTATE, stateRowsPerBlockPerStage, PHILOX_ROUNDS, numWarps>;
+    using sram_t =
+        SharedStorageSimple<input_t, state_t, state_scale_t, NTOKENS_MTP, stateRowsPerBlockPerStage,
+                            DSTATE, stateRowsPerBlockPerStage>;
+    constexpr size_t smem_size = sizeof(sram_t);
+    FLASHINFER_CUDA_CHECK(
+        cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    func<<<grid, block, smem_size, stream>>>(params);
+  } else {
+    // Full tile per CTA (DIM * DSTATE): enough blocks for occupancy, no dim splitting needed
+    dim3 grid(params.batch, params.nheads);
+    auto func = selective_state_update_kernel_simple_mtp<input_t, weight_t, matrixA_t, state_t,
+                                                         stateIndex_t, state_scale_t, NTOKENS_MTP,
+                                                         DIM, DSTATE, DIM, PHILOX_ROUNDS, numWarps>;
+    using sram_t = SharedStorageSimple<input_t, state_t, state_scale_t, NTOKENS_MTP, DIM, DSTATE,
+                                       stateRowsPerBlockPerStage>;
+    constexpr size_t smem_size = sizeof(sram_t);
+    FLASHINFER_CUDA_CHECK(
+        cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    func<<<grid, block, smem_size, stream>>>(params);
+  }
 }
 
 }  // namespace flashinfer::mamba::mtp

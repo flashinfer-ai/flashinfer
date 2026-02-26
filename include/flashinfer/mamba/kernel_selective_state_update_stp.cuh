@@ -111,7 +111,8 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
   auto warp = threadIdx.y;
 
   auto const state_batch = (state_batch_indices) ? state_batch_indices[batch] : batch;
-  state += state_batch * params.state_stride_batch + head * DIM * DSTATE;
+  auto const state_ptr_offset = state_batch * params.state_stride_batch + head * DIM * DSTATE;
+  state += state_ptr_offset;
   if constexpr (scaleState) {
     state_scale += state_batch * params.state_scale_stride_batch + head * DIM;
   }
@@ -201,7 +202,8 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
       for (int ii = 0; ii < load_state_t::count; ii++) {
         if constexpr (PHILOX_ROUNDS > 0 && !scaleState) {
           if (ii % 4 == 0)
-            philox_randint4x<PHILOX_ROUNDS>(params.rand_seed, d * DSTATE + i + ii, rand_ints[0],
+            philox_randint4x<PHILOX_ROUNDS>(params.rand_seed,
+                                            state_ptr_offset + d * DSTATE + i + ii, rand_ints[0],
                                             rand_ints[1], rand_ints[2], rand_ints[3]);
         }
 
@@ -444,7 +446,7 @@ __device__ __forceinline__ void consumer_func_vertical(
     int lane, int warp, float d_value, float dt_value, float dA,
     SharedStorageVertical<input_t, weight_t, matrixA_t, state_t, state_scale_t, rowsPerStage, DIM,
                           DSTATE, numStages>& sram,
-    int64_t rand_seed) {
+    int64_t rand_seed, [[maybe_unused]] int64_t state_ptr_offset) {
   constexpr bool scaleState = !std::is_same_v<state_scale_t, void>;
 #ifdef FLASHINFER_MAMBA_ENABLE_SM90
   namespace cde = cuda::device::experimental;
@@ -491,8 +493,9 @@ __device__ __forceinline__ void consumer_func_vertical(
           for (int e = 0; e < stateValuesPerBank; e++) {
             if constexpr (PHILOX_ROUNDS > 0 && !scaleState) {
               if (e % 4 == 0)
-                philox_randint4x<PHILOX_ROUNDS>(rand_seed, d * DSTATE + i + e, rand_ints[0],
-                                                rand_ints[1], rand_ints[2], rand_ints[3]);
+                philox_randint4x<PHILOX_ROUNDS>(rand_seed, state_ptr_offset + d * DSTATE + i + e,
+                                                rand_ints[0], rand_ints[1], rand_ints[2],
+                                                rand_ints[3]);
             }
 
             float state_value;
@@ -534,8 +537,9 @@ __device__ __forceinline__ void consumer_func_vertical(
           for (int e = 0; e < stateValuesPerBank; e++) {
             if constexpr (PHILOX_ROUNDS > 0 && !scaleState) {
               if (e % 4 == 0)
-                philox_randint4x<PHILOX_ROUNDS>(rand_seed, d * DSTATE + i + e, rand_ints[0],
-                                                rand_ints[1], rand_ints[2], rand_ints[3]);
+                philox_randint4x<PHILOX_ROUNDS>(rand_seed, state_ptr_offset + d * DSTATE + i + e,
+                                                rand_ints[0], rand_ints[1], rand_ints[2],
+                                                rand_ints[3]);
             }
 
             float state_value;
@@ -640,6 +644,8 @@ __global__ void selective_state_update_kernel_producer_consumer_vertical(
   auto warp = threadIdx.y;
 
   auto const state_batch = (state_batch_indices) ? __ldg(&state_batch_indices[batch]) : batch;
+  auto const state_ptr_offset =
+      static_cast<int64_t>(state_batch) * params.state_stride_batch + head * DIM * DSTATE;
 
   extern __shared__ uint8_t sbuffer[];
   using sram_t = SharedStorageVertical<input_t, weight_t, matrixA_t, state_t, state_scale_t,
@@ -723,11 +729,11 @@ __global__ void selective_state_update_kernel_producer_consumer_vertical(
     if (state_batch != params.pad_slot_id)
       consumer_func_vertical<input_t, weight_t, matrixA_t, state_t, state_scale_t, DIM, DSTATE,
                              consumerWarps, rowsPerStage, numStages, true, PHILOX_ROUNDS>(
-          lane, warp, d_value, dt_value, dA, sram, params.rand_seed);
+          lane, warp, d_value, dt_value, dA, sram, params.rand_seed, state_ptr_offset);
     else
       consumer_func_vertical<input_t, weight_t, matrixA_t, state_t, state_scale_t, DIM, DSTATE,
                              consumerWarps, rowsPerStage, numStages, false, PHILOX_ROUNDS>(
-          lane, warp, d_value, dt_value, dA, sram, params.rand_seed);
+          lane, warp, d_value, dt_value, dA, sram, params.rand_seed, state_ptr_offset);
 
     // Write output — wait for all consumer warps to finish writing sram.out
     sram.bar_consumers.wait(sram.bar_consumers.arrive());
@@ -860,7 +866,7 @@ __device__ __forceinline__ void consumer_func_horizontal(
     int d, int member, float A_value, float dt_value, float x_value,
     SharedStorageHorizontal<input_t, weight_t, matrixA_t, state_t, DIM, DSTATE, colsPerStage,
                             numStages>& sram,
-    float& out_value, int64_t rand_seed) {
+    float& out_value, int64_t rand_seed, [[maybe_unused]] int64_t state_ptr_offset) {
   namespace cde = cuda::device::experimental;
   constexpr auto lanesPerRow = (consumerWarps * warpSize) / DIM;
   constexpr auto itemsPerThread = colsPerStage / lanesPerRow;
@@ -903,8 +909,9 @@ __device__ __forceinline__ void consumer_func_horizontal(
           int flat_e = item + e;
           if constexpr (PHILOX_ROUNDS > 0) {
             if (flat_e % 4 == 0)
-              philox_randint4x<PHILOX_ROUNDS>(rand_seed, d * DSTATE + i + e, rand_ints[0],
-                                              rand_ints[1], rand_ints[2], rand_ints[3]);
+              philox_randint4x<PHILOX_ROUNDS>(rand_seed, state_ptr_offset + d * DSTATE + i + e,
+                                              rand_ints[0], rand_ints[1], rand_ints[2],
+                                              rand_ints[3]);
           }
 
           float state_value;
@@ -947,8 +954,9 @@ __device__ __forceinline__ void consumer_func_horizontal(
           int flat_e = item + e;
           if constexpr (PHILOX_ROUNDS > 0) {
             if (flat_e % 4 == 0)
-              philox_randint4x<PHILOX_ROUNDS>(rand_seed, d * DSTATE + i + e, rand_ints[0],
-                                              rand_ints[1], rand_ints[2], rand_ints[3]);
+              philox_randint4x<PHILOX_ROUNDS>(rand_seed, state_ptr_offset + d * DSTATE + i + e,
+                                              rand_ints[0], rand_ints[1], rand_ints[2],
+                                              rand_ints[3]);
           }
 
           float state_value;
@@ -1009,6 +1017,8 @@ __global__ void selective_state_update_kernel_producer_consumer_horizontal(
   auto warp = threadIdx.y;
 
   auto const state_batch = (state_batch_indices) ? state_batch_indices[batch] : batch;
+  auto const state_ptr_offset =
+      static_cast<int64_t>(state_batch) * params.state_stride_batch + head * DIM * DSTATE;
 
   extern __shared__ uint8_t sbuffer[];
   using sram_t = SharedStorageHorizontal<input_t, weight_t, matrixA_t, state_t, DIM, DSTATE,
@@ -1100,11 +1110,13 @@ __global__ void selective_state_update_kernel_producer_consumer_horizontal(
     if (state_batch != params.pad_slot_id)
       consumer_func_horizontal<input_t, weight_t, matrixA_t, state_t, DIM, DSTATE, PHILOX_ROUNDS,
                                consumerWarps, colsPerStage, numStages, true>(
-          d, member, A_value, dt_value, x_value, sram, out_value, params.rand_seed);
+          d, member, A_value, dt_value, x_value, sram, out_value, params.rand_seed,
+          state_ptr_offset);
     else
       consumer_func_horizontal<input_t, weight_t, matrixA_t, state_t, DIM, DSTATE, PHILOX_ROUNDS,
                                consumerWarps, colsPerStage, numStages, false>(
-          d, member, A_value, dt_value, x_value, sram, out_value, params.rand_seed);
+          d, member, A_value, dt_value, x_value, sram, out_value, params.rand_seed,
+          state_ptr_offset);
 
     out_value += __shfl_down_sync(UINT32_MAX, out_value, 16);
     if constexpr (lanesPerRow == 4) {

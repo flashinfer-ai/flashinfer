@@ -351,7 +351,16 @@ def _selective_scan_update_kernel(
                     )
                 elif USE_RS_ROUNDING:
                     rand_seed = tl.load(rand_seed_ptr)
-                    rand_offsets = (
+                    if HAS_STATE_BATCH_INDICES:
+                        rand_offsets = (
+                            state_batch_idx * stride_state_batch
+                            + pid_h * stride_state_head
+                        )
+                    else:
+                        rand_offsets = (
+                            pid_b * stride_state_batch + pid_h * stride_state_head
+                        )
+                    rand_offsets += (
                         offs_m[:, None] * stride_state_dim
                         + offs_n[None, :] * stride_state_dstate
                     )
@@ -400,7 +409,13 @@ def _selective_scan_update_kernel(
         elif USE_RS_ROUNDING:
             # Stochastic rounding for fp16 state
             rand_seed = tl.load(rand_seed_ptr)
-            rand_offsets = (
+            if HAS_STATE_BATCH_INDICES:
+                rand_offsets = (
+                    state_batch_idx * stride_state_batch + pid_h * stride_state_head
+                )
+            else:
+                rand_offsets = pid_b * stride_state_batch + pid_h * stride_state_head
+            rand_offsets += (
                 offs_m[:, None] * stride_state_dim
                 + offs_n[None, :] * stride_state_dstate
             )
