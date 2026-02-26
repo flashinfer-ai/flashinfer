@@ -264,8 +264,7 @@ class MinPOp(ParameterizedOp):
                 min_p_val * tensor.data.max(dim=-1, keepdim=True)[0]
             )
 
-        masked_probs = tensor.data.clone()
-        masked_probs[~min_p_mask] = 0
+        masked_probs = torch.where(min_p_mask, tensor.data, torch.zeros_like(tensor.data))
         probs = masked_probs / masked_probs.sum(dim=-1, keepdim=True)
 
         return TaggedTensor(probs, output_type)

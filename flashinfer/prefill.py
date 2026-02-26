@@ -55,6 +55,7 @@ from .utils import (
     device_support_pdl,
     get_device_sm_count,
     is_float8,
+    _apply_v_scale,
     is_sm100a_supported,
     is_sm110a_supported,
     is_sm120a_supported,
@@ -2295,10 +2296,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             is_float_one = isinstance(v_scale, float) and v_scale == 1.0
             if v_scale is not None and not is_float_one:
                 # TODO(Zihao): fused into kernel
-                if is_float8(out):
-                    out = (out.to(torch.float32) * v_scale).to(out.dtype)
-                else:
-                    out *= v_scale
+                out = _apply_v_scale(out, v_scale)
 
         return (out, lse) if return_lse else out
 
