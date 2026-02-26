@@ -2008,8 +2008,10 @@ def gated_delta_rule(
         k: Key tensor [B, T, H, K]
         v: Value tensor [B, T, HV, V]
         b: Beta gate input [B, T, HV]
-        initial_state_source: H state [B, HV, V, K] (K-fast layout), modified in-place
-        initial_state_indices: Optional pool indices [B] for indirect state access
+        initial_state_source: H state [B, HV, V, K] or [pool_size, HV, V, K] (K-fast layout), modified in-place
+        initial_state_indices: Optional int32 pool indices [B] for indirect state access.
+            Values must be in [-1, pool_size). -1 = padding slot (output zeros, state
+            untouched). No runtime bounds checking is performed.
         use_qk_l2norm_in_kernel: Whether to L2-normalize Q/K in kernel (default: True)
         scale: Optional attention scale (default: 1/sqrt(K))
 
