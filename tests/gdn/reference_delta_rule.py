@@ -136,7 +136,7 @@ def blockwise_linear_attention(
     decay_factor: float
     | torch.Tensor = 1.0,  # float or tensor with num_elems == num_qo_heads
     decay_exponent_offset=0,
-    kv_dtype: torch.dtype = torch.float32,
+    state_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     num_qo_heads = q.size(1)
     head_size = q.size(2)
@@ -156,7 +156,7 @@ def blockwise_linear_attention(
     KVs = []  # FIXME: kernel debug only
     kv = torch.zeros(
         (len(seq_lens), num_qo_heads, head_size, head_size),
-        dtype=kv_dtype,
+        dtype=state_dtype,
         device=q.device,
     )
     output = torch.zeros_like(q)
@@ -166,7 +166,7 @@ def blockwise_linear_attention(
         seq_end = seq_offset[seq_idx + 1]
         blk_offset = seq_start
         carried_kv = torch.zeros(
-            (num_qo_heads, head_size, head_size), dtype=kv_dtype, device=q.device
+            (num_qo_heads, head_size, head_size), dtype=state_dtype, device=q.device
         )
         while blk_offset < seq_end:
             is_full_block = seq_end - blk_offset >= block_size
@@ -205,7 +205,10 @@ def blockwise_linear_attention(
             )
 
             o_inter = (
-                matmul(q_t.transpose(0, 1).to(kv_dtype) * Lq, carried_kv)
+                matmul(
+                    q_t.transpose(0, 1).to(torch.float32) * Lq,
+                    carried_kv.to(torch.float32),
+                )
                 .transpose(0, 1)
                 .to(q.dtype)
             )
@@ -219,10 +222,10 @@ def blockwise_linear_attention(
 
             if (decay_factor == 1.0).all():
                 inc_kv = matmul(
-                    k_t.transpose(0, 1).transpose(-2, -1).to(kv_dtype),
-                    v_t.transpose(0, 1).to(kv_dtype),
+                    k_t.transpose(0, 1).transpose(-2, -1).to(torch.float32),
+                    v_t.transpose(0, 1).to(torch.float32),
                 )
-                carried_kv = carried_kv + inc_kv
+                carried_kv = (carried_kv.to(torch.float32) + inc_kv).to(state_dtype)
             else:
                 Lk = LambdaK(
                     decay_factor,
@@ -232,11 +235,13 @@ def blockwise_linear_attention(
                     offset=decay_exponent_offset,
                 )
                 inc_kv = matmul(
-                    (k_t.transpose(0, 1) * Lk).transpose(-2, -1).to(kv_dtype),
-                    v_t.transpose(0, 1).to(kv_dtype),
+                    (k_t.transpose(0, 1) * Lk).transpose(-2, -1).to(torch.float32),
+                    v_t.transpose(0, 1).to(torch.float32),
                 )
                 block_decay = decay_factor**valid_len
-                carried_kv = block_decay * carried_kv + inc_kv
+                carried_kv = (block_decay * carried_kv.to(torch.float32) + inc_kv).to(
+                    state_dtype
+                )
             KVs.append(carried_kv.clone())
 
             blk_offset += block_size
@@ -256,7 +261,7 @@ def delta_rule(
     alpha: torch.Tensor | None = None,  # [total_seq_len, num_qo_heads]
     beta: torch.Tensor | None = None,  # [total_seq_len, num_qo_heads]
     scale_factor=1.0,
-    kv_dtype: torch.dtype = torch.float32,
+    state_dtype: torch.dtype = torch.float32,
 ):
     o = []
     kv = []
@@ -297,7 +302,7 @@ def delta_rule(
         betas = beta[s]
 
         state_HKV = torch.zeros(
-            num_q_heads, head_size, head_size, dtype=kv_dtype, device=q.device
+            num_q_heads, head_size, head_size, dtype=state_dtype, device=q.device
         )
         for i in range(seq_len):
             # var_DS where var is variable basename and DS is the dimensional semantics.
@@ -311,14 +316,15 @@ def delta_rule(
             ### listed at the bottom of page3 of section 2.2 DELTA NETWORKS: LINEAR ATTENTION WITH DELTA RULE
 
             # state update rule, use the middle version for clearer dimensional semantics
-            old_state_HKV = alpha_H11 * state_HKV
+            # Read state in fp32, compute in fp32, store back in state_dtype
+            old_state_HKV = alpha_H11 * state_HKV.to(torch.float32)
             old_v_H1V = matmul(k_H1K, old_state_HKV)
             new_v_H1V = beta_H11 * v_H1V + (1 - beta_H11) * old_v_H1V
             state_remove = torch.einsum("htv,htk->hkv", old_v_H1V, k_H1K)
             state_update = torch.einsum("htv,htk->hkv", new_v_H1V, k_H1K)
-            state_HKV[:] = old_state_HKV - state_remove + state_update
+            state_HKV[:] = (old_state_HKV - state_remove + state_update).to(state_dtype)
 
-            o_H1V = scale_factor * matmul(q_H1Q, state_HKV)
+            o_H1V = scale_factor * matmul(q_H1Q, state_HKV.to(torch.float32))
             o.append(o_H1V.squeeze(1))
 
         kv.append(state_HKV.clone())
@@ -356,7 +362,7 @@ def blockwise_delta_rule(
     beta: torch.Tensor | None = None,  # [total_seq_len, num_qo_heads]
     block_size: int = 32,
     scale_factor=1.0,
-    kv_dtype: torch.dtype = torch.float32,
+    state_dtype: torch.dtype = torch.float32,
     # intermediate_outputs = None,  # debug output
 ) -> torch.Tensor:
     total_seqlen = q.size(0)
@@ -386,7 +392,7 @@ def blockwise_delta_rule(
 
     kv = torch.zeros(
         (len(seq_lens), num_sab_heads, head_size, head_size),
-        dtype=kv_dtype,
+        dtype=state_dtype,
         device=q.device,
     )
     output = torch.zeros_like(q)
@@ -396,7 +402,7 @@ def blockwise_delta_rule(
         seq_end = seq_offset[seq_idx + 1]
         blk_offset = seq_start
         state_HKV = torch.zeros(
-            (num_sab_heads, head_size, head_size), dtype=kv_dtype, device=q.device
+            (num_sab_heads, head_size, head_size), dtype=state_dtype, device=q.device
         )
         while blk_offset < seq_end:
             is_full_block = seq_end - blk_offset >= block_size
@@ -455,7 +461,9 @@ def blockwise_delta_rule(
             # new_v_HSV = matmul(T, (v_HSV - matmul(torch.exp(gamma_HS1) * k_HSK, state_HKV)))
             u_HSV = matmul(T, v_HSV)
             w_HSK = matmul(T, torch.exp(gamma_HS1) * k_HSK)
-            new_v_HSV = u_HSV - matmul(w_HSK.to(kv_dtype), state_HKV).to(u_HSV.dtype)
+            new_v_HSV = u_HSV - matmul(
+                w_HSK.to(torch.float32), state_HKV.to(torch.float32)
+            ).to(u_HSV.dtype)
             new_v_SHV = new_v_HSV.transpose(0, 1)
 
             # if intermediate_outputs is not None:
@@ -468,7 +476,10 @@ def blockwise_delta_rule(
             #     intermediate_outputs["new_v"].append(new_v_HSV.clone())
 
             o_inter = (
-                matmul(torch.exp(gamma_HS1) * q_HSQ.to(kv_dtype), state_HKV)
+                matmul(
+                    torch.exp(gamma_HS1) * q_HSQ.to(torch.float32),
+                    state_HKV.to(torch.float32),
+                )
                 .transpose(0, 1)
                 .to(q.dtype)
             )
@@ -484,10 +495,12 @@ def blockwise_delta_rule(
             inc_HKV = matmul(
                 (torch.exp(block_gamma - gamma_HS1) * k_HSK)
                 .transpose(-2, -1)
-                .to(kv_dtype),
-                new_v_HSV.to(kv_dtype),
+                .to(torch.float32),
+                new_v_HSV.to(torch.float32),
             )
-            state_HKV = torch.exp(block_gamma) * state_HKV + inc_HKV
+            state_HKV = (
+                torch.exp(block_gamma) * state_HKV.to(torch.float32) + inc_HKV
+            ).to(state_dtype)
 
             blk_offset += block_size
 
@@ -510,6 +523,7 @@ def decode_delta_rule(
     softplus_beta: float = 1.0,
     softplus_threshold: float = 20.0,
     use_l2_norm: bool = True,
+    state_dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Reference implementation for single-step decode with GDN formula.
@@ -537,6 +551,7 @@ def decode_delta_rule(
         softplus_beta: Beta parameter for softplus activation
         softplus_threshold: Threshold for softplus numerical stability
         use_l2_norm: Whether to apply L2 normalization to q and k
+        state_dtype: Storage dtype for the hidden state (read in fp32, stored in this dtype)
 
     Returns:
         output: [B, num_heads, V]
@@ -617,7 +632,7 @@ def decode_delta_rule(
     # ============================================
     # Process each batch and head
     # ============================================
-    new_state = torch.zeros(B, num_heads, K, V, device=device, dtype=dtype)
+    new_state = torch.zeros(B, num_heads, K, V, device=device, dtype=state_dtype)
     output = torch.zeros(B, num_heads, V, device=device, dtype=dtype)
 
     for b_idx in range(B):
@@ -626,7 +641,9 @@ def decode_delta_rule(
             q_h = q[b_idx, h_idx]  # [K]
             k_h = k[b_idx, h_idx]  # [K]
             v_h = v[b_idx, h_idx]  # [V]
-            h_state = state[b_idx, h_idx].clone()  # [K, V] (matches Triton's [BK, BV])
+            h_state = (
+                state[b_idx, h_idx].clone().to(torch.float32)
+            )  # [K, V] read as fp32
 
             # Get gating values for this batch and head
             g_val = g[b_idx, h_idx]  # scalar
@@ -673,8 +690,8 @@ def decode_delta_rule(
             # [K] @ [K, V] = [V]
             output[b_idx, h_idx] = q_h @ h_state
 
-            # Store updated state
-            new_state[b_idx, h_idx] = h_state
+            # Store updated state (cast back to state_dtype)
+            new_state[b_idx, h_idx] = h_state.to(state_dtype)
 
     return output, new_state
 
@@ -694,6 +711,7 @@ def verify_delta_rule(
     softplus_threshold: float = 20.0,
     use_l2_norm: bool = True,
     cache_intermediate_states: bool = False,
+    state_dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """
     Reference implementation for multi-token (verify mode) delta rule.
@@ -715,6 +733,7 @@ def verify_delta_rule(
         softplus_threshold: Threshold for softplus approximation
         use_l2_norm: Whether to apply L2 normalization
         cache_intermediate_states: Whether to cache state at each time step
+        state_dtype: Storage dtype for the hidden state (read in fp32, stored in this dtype)
 
     Returns:
         output: Output tensor [B, T, num_heads, V]
@@ -779,11 +798,13 @@ def verify_delta_rule(
 
     # Initialize output and intermediate states
     output = torch.zeros(B, T, num_heads, V, dtype=torch.float32, device=q.device)
-    current_state = state.clone()  # [B, num_heads, K, V]
+    current_state = state.clone().to(
+        state_dtype
+    )  # [B, num_heads, K, V] stored in state_dtype
 
     if cache_intermediate_states:
         intermediate_states = torch.zeros(
-            B, T, num_heads, K, V, dtype=torch.float32, device=q.device
+            B, T, num_heads, K, V, dtype=state_dtype, device=q.device
         )
     else:
         intermediate_states = None
@@ -802,7 +823,9 @@ def verify_delta_rule(
                 q_h = q_t[b_idx, h_idx]  # [K]
                 k_h = k_t[b_idx, h_idx]  # [K]
                 v_h = v_t[b_idx, h_idx]  # [V]
-                h_state = current_state[b_idx, h_idx].clone()  # [K, V]
+                h_state = (
+                    current_state[b_idx, h_idx].clone().to(torch.float32)
+                )  # [K, V] read as fp32
                 g_val = g_t[b_idx, h_idx]
                 beta_val = beta_t[b_idx, h_idx]
 
@@ -825,11 +848,11 @@ def verify_delta_rule(
                 # 5. Compute output: o = q^T @ h
                 output[b_idx, t, h_idx] = q_h @ h_state  # [K] @ [K, V] = [V]
 
-                # Update current state
-                current_state[b_idx, h_idx] = h_state
+                # Update current state (cast back to state_dtype)
+                current_state[b_idx, h_idx] = h_state.to(state_dtype)
 
                 # Cache intermediate state if requested
                 if cache_intermediate_states:
-                    intermediate_states[b_idx, t, h_idx] = h_state
+                    intermediate_states[b_idx, t, h_idx] = h_state.to(state_dtype)
 
     return output, current_state, intermediate_states

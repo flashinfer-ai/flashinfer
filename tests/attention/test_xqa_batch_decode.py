@@ -352,7 +352,7 @@ def generate_causal_mask(
 
 @pytest.mark.skipif(
     get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12],
-    reason="XQA is only supported on SM90, SM100, SM120 GPUs",
+    reason="XQA is only supported on SM90, SM100, SM120/SM121 GPUs",
 )
 @pytest.mark.parametrize(
     "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",

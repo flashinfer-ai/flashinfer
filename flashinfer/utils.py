@@ -408,6 +408,12 @@ def is_fa3_backend_supported(
         return False
     if use_fp16_qk_reductions:
         return False
+    # FA3 FP8 KV cache currently requires FP8 query.
+    if dtype_kv in {torch.float8_e4m3fn, torch.float8_e5m2} and dtype_q not in {
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+    }:
+        return False
     return True
 
 
@@ -555,7 +561,24 @@ def is_sm120a_supported(device: torch.device) -> bool:
 
 def is_sm121a_supported(device: torch.device) -> bool:
     major, minor = get_compute_capability(device)
-    return major == 12 and minor == 1 and version_at_least(torch.version.cuda, "12.9")
+    return major == 12 and minor == 1 and version_at_least(torch.version.cuda, "13.0")
+
+
+def is_sm12x_supported(device: torch.device) -> bool:
+    """Check if the device is any SM12x GPU (SM120a, SM121a, or future variants).
+
+    Uses a major-version check (``major == 12``) so that future SM12x minor
+    variants are automatically covered without code changes, matching the
+    pattern used by ``is_sm100a_supported`` (``major == 10``).
+
+    The minimum CUDA version depends on the minor variant:
+    SM120a requires CUDA 12.8, SM121a requires CUDA 13.0.
+    """
+    major, minor = get_compute_capability(device)
+    if major != 12:
+        return False
+    min_cuda = "13.0" if minor >= 1 else "12.8"
+    return version_at_least(torch.version.cuda, min_cuda)
 
 
 def determine_mla_backend(device: torch.device) -> str:

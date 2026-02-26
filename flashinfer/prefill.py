@@ -53,12 +53,12 @@ from .utils import (
     canonicalize_torch_dtype,
     determine_attention_backend,
     device_support_pdl,
+    get_compute_capability,
     get_device_sm_count,
     is_float8,
     is_sm100a_supported,
     is_sm110a_supported,
-    is_sm120a_supported,
-    is_sm121a_supported,
+    is_sm12x_supported,
     register_custom_op,
     register_fake_op,
     ceil_div,
@@ -103,8 +103,7 @@ def get_fmha_module(
     if (
         is_sm100a_supported(device)
         or is_sm110a_supported(device)
-        or is_sm120a_supported(device)
-        or is_sm121a_supported(device)
+        or is_sm12x_supported(device)
     ):
         return gen_fmha_cutlass_sm100a_module(
             dtype_q,
@@ -118,7 +117,16 @@ def get_fmha_module(
             use_logits_soft_cap,
         ).build_and_load()
     else:
-        raise ValueError("SM100A is not supported on this device")
+        major, minor = get_compute_capability(device)
+        if major == 12:
+            min_cuda = "13.0" if minor >= 1 else "12.8"
+            raise ValueError(
+                f"SM12x detected but CUDA version is too old; "
+                f"SM12{minor}x requires CUDA >= {min_cuda}."
+            )
+        raise ValueError(
+            "This device is not supported; requires SM100a, SM110a, or SM12x."
+        )
 
 
 def make_hashable_cache(func):
@@ -223,6 +231,7 @@ def get_trtllm_gen_prefill_module():
         window_left: int = -1,
         out: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> torch.Tensor:
         sm_count = get_device_sm_count(query.device)
         if out is None:
@@ -256,6 +265,7 @@ def get_trtllm_gen_prefill_module():
             enable_pdl,
             workspace_size,
             sinks,
+            skip_softmax_threshold_scale_factor,
         )
         return out
 
@@ -623,6 +633,7 @@ def get_batch_prefill_module(backend, *args):
         cum_seq_lens_q: Optional[torch.Tensor] = None,
         cum_seq_lens_kv: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> None:
         if backend == "trtllm-gen":
             assert maybe_lse is None
@@ -656,6 +667,7 @@ def get_batch_prefill_module(backend, *args):
                 window_left,
                 out=o,
                 sinks=sinks,
+                skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
             )
         elif backend == "fa2":
             assert not is_float8(q)
@@ -773,6 +785,9 @@ def get_batch_prefill_module(backend, *args):
         maybe_max_item_len_ptr: Optional[torch.Tensor],
         logits_soft_cap: float,
         sm_scale: float,
+        scale_q: Optional[torch.Tensor],
+        scale_k: Optional[torch.Tensor],
+        scale_v: Optional[torch.Tensor],
         rope_scale: float,
         rope_theta: float,
         token_pos_in_items_len: int,
@@ -787,6 +802,8 @@ def get_batch_prefill_module(backend, *args):
         batch_size: Optional[int] = None,
         cum_seq_lens_q: Optional[torch.Tensor] = None,
         cum_seq_lens_kv: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
+        skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> None:
         pass
 
@@ -2028,6 +2045,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         return_lse: Literal[False] = False,
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
+        sinks: Optional[torch.Tensor] = None,
+        skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> torch.Tensor: ...
 
     @overload
@@ -2043,6 +2062,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         return_lse: Literal[True] = True,
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
+        sinks: Optional[torch.Tensor] = None,
+        skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     @flashinfer_api
@@ -2060,6 +2081,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
+        skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch prefill/append attention between query and paged kv-cache.
 
@@ -2272,6 +2294,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     self._qo_indptr_buf,
                     self._paged_kv_indptr_buf,
                     sinks,
+                    skip_softmax_threshold_scale_factor,
                 ]
 
             assert self._cached_module is not None, "cached module is not initialized"
@@ -3419,6 +3442,7 @@ def trtllm_ragged_attention_deepseek(
     is_causal: bool,
     return_lse: bool,
     attention_sinks: Optional[torch.Tensor] = None,
+    skip_softmax_threshold_scale_factor: Optional[float] = None,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -3461,6 +3485,12 @@ def trtllm_ragged_attention_deepseek(
         is causal
     attention_sinks : Optional[torch.Tensor]
         attention sinks
+    skip_softmax_threshold_scale_factor : Optional[float]
+        threshold scale factor for skipping softmax operations.
+        Providing a value for this parameter enables skip-softmax sparsity as described in: https://arxiv.org/abs/2512.12087
+        If no value is provided, then standard attention is used.
+        Setting the threshold to a higher value generally increases kernel performance at the cost of accuracy degradation.
+        The actual threshold value equals the provided threshold_scale_factor divided by the context length.
     out : Optional[torch.Tensor]
         output tensor, if not provided, will be allocated with shape [query.shape[0], query.shape[1], value.shape[2]]
     lse : Optional[torch.Tensor]
@@ -3526,6 +3556,7 @@ def trtllm_ragged_attention_deepseek(
         is_causal,
         workspace_size,
         attention_sinks,
+        skip_softmax_threshold_scale_factor,
         lse,
     )
     if return_lse:
@@ -3556,6 +3587,7 @@ def trtllm_batch_context_with_kv_cache(
     kv_layout: str = "HND",
     enable_pdl: Optional[bool] = None,
     sinks: Optional[List[torch.Tensor]] = None,
+    skip_softmax_threshold_scale_factor: Optional[float] = None,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
     Parameters
@@ -3608,7 +3640,12 @@ def trtllm_batch_context_with_kv_cache(
         Layout of kv-cache, can be "HND" or "NHD", default is "HND".
     sinks : Optional[List[torch.Tensor]] = None
         additional value per head in the denominator of the softmax.
-
+    skip_softmax_threshold_scale_factor: Optional[float] = None
+        threshold scale factor for skipping softmax operations.
+        Providing a value for this parameter enables skip-softmax sparsity as described in: https://arxiv.org/abs/2512.12087
+        If no value is provided, then standard attention is used.
+        Setting the threshold to a higher value generally increases kernel performance at the cost of accuracy degradation.
+        The actual threshold value equals the provided threshold_scale_factor divided by the context length.
     Returns
     -------
     out: Union[torch.Tensor, FP4Tensor]
@@ -3742,6 +3779,7 @@ def trtllm_batch_context_with_kv_cache(
         enable_pdl,
         workspace_size,
         sinks,
+        skip_softmax_threshold_scale_factor,
     )
     return (
         out
@@ -3799,8 +3837,15 @@ def fmha_v2_prefill_deepseek(
         If return_lse is True, the output will be a tuple of two tensors, the first is the output tensor, the second is the lse tensor.
         If return_lse is False, the output will be a single tensor.
     """
-    if not is_sm120a_supported(query.device):
-        raise ValueError("fmha_v2_prefill_deepseek is only supported on SM120 GPUs.")
+    if not is_sm12x_supported(query.device):
+        major, minor = get_compute_capability(query.device)
+        if major == 12:
+            min_cuda = "13.0" if minor >= 1 else "12.8"
+            raise ValueError(
+                f"fmha_v2_prefill_deepseek requires CUDA >= {min_cuda} "
+                f"for SM12{minor}x GPUs."
+            )
+        raise ValueError("fmha_v2_prefill_deepseek is only supported on SM12x GPUs.")
     assert query.shape[3] == 192 and key.shape[3] == 192 and value.shape[3] == 128, (
         "currently only support deepseek r1 192 query and 128 value"
     )

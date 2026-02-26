@@ -60,6 +60,18 @@ except ImportError:
         return func
 
 
+# GDN decode K-last bf16 state kernel (T=1..4, bf16 state, K-last layout) - optional backend
+try:
+    from .gdn_kernels.gdn_decode_bf16_state import (
+        gated_delta_rule as _gated_delta_rule_gdn_decode_klast_bf16_state,
+    )
+
+    _GDN_DECODE_KLAST_BF16_STATE_AVAILABLE = True
+except ImportError:
+    _GDN_DECODE_KLAST_BF16_STATE_AVAILABLE = False
+    _gated_delta_rule_gdn_decode_klast_bf16_state = None
+
+
 # ============================================================================
 # Global configuration for PRETRANSPOSE version ([B*HV, V, K])
 # ============================================================================
@@ -1025,7 +1037,6 @@ def gated_delta_rule_decode_pretranspose(
 
     # Validate input shapes
     B, T, H, K = q.shape
-    assert T == 1, f"Decode only supports T=1, got T={T}"
     _, _, HV, V = v.shape
     pool_size = state.shape[0]
 
@@ -1051,6 +1062,48 @@ def gated_delta_rule_decode_pretranspose(
             f"state_indices must be int32, got {state_indices.dtype}"
         )
 
+    # Backend: gdn_decode_klast_bf16_state when bf16 state, T<=4, K-last layout, K=V=128
+    use_gdn_decode_klast_bf16_state = (
+        _GDN_DECODE_KLAST_BF16_STATE_AVAILABLE
+        and state.dtype == torch.bfloat16
+        and T in (1, 2, 3, 4)
+        and K == 128
+        and V == 128
+    )
+    if use_gdn_decode_klast_bf16_state:
+        assert q.dtype in (torch.float16, torch.bfloat16), (
+            f"q must be float16/bfloat16, got {q.dtype}"
+        )
+        assert A_log.dtype == torch.float32, f"A_log must be float32, got {A_log.dtype}"
+        scale_val = K**-0.5 if scale is None else scale
+        out = _gated_delta_rule_gdn_decode_klast_bf16_state(
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            initial_state_source=state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm,
+            scale=scale_val,
+        )
+        output_provided = output is not None
+        target_dtype = output.dtype if output_provided else q.dtype
+        if output is not None:
+            output.copy_(out)
+        else:
+            output = out
+        if output.dtype != target_dtype:
+            output = output.to(target_dtype)
+        return output, state
+
+    # Legacy path: T=1 only, float32 state
+    assert T == 1, f"Decode only supports T=1, got T={T}"
+    assert state.dtype == torch.float32, f"state must be float32, got {state.dtype}"
+
     # Validate K and V constraints
     assert K >= 128, f"K must be at least 128, got K={K}"
     assert V >= 128, f"V must be at least 128, got V={V}"
@@ -1062,7 +1115,6 @@ def gated_delta_rule_decode_pretranspose(
     assert q.dtype in (torch.float16, torch.bfloat16), (
         f"q must be float16/bfloat16, got {q.dtype}"
     )
-    assert state.dtype == torch.float32, f"state must be float32, got {state.dtype}"
     assert A_log.dtype == torch.float32, f"A_log must be float32, got {A_log.dtype}"
 
     # Set default scale
