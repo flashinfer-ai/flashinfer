@@ -19,11 +19,11 @@
 #include <cstdint>
 #include <numeric>
 
-#include "fp8_types.cuh"
 #include "flashinfer/trtllm/common/cudaTypeUtils.cuh"
 #include "flashinfer/trtllm/common/cudaUtils.h"
 #include "flashinfer/trtllm/common/reduceKernelUtils.cuh"
 #include "flashinfer/utils.cuh"
+#include "fp8_types.cuh"
 #include "math.cuh"
 #include "utils.cuh"
 #include "vec_dtypes.cuh"
@@ -215,7 +215,8 @@ __global__ void RMSNormQuantKernel(T* __restrict__ input, T* __restrict__ weight
     for (uint32_t j = 0; j < VEC_SIZE; j++) {
       output_vec[j] =
           float(input_vec[j]) * rms_rcp * (weight_bias + float(weight_vec[j])) * scale_inv;
-      output_vec[j] = fmaxf(-fp8_clamp_max<O>::value, fminf(output_vec[j], fp8_clamp_max<O>::value));
+      output_vec[j] =
+          fmaxf(-fp8_clamp_max<O>::value, fminf(output_vec[j], fp8_clamp_max<O>::value));
     }
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
       output_vec.cast_store(output + bx * stride_output + i * num_threads * VEC_SIZE +
@@ -599,7 +600,8 @@ __global__ void FusedAddRMSNormQuantKernel(T* __restrict__ input, T* __restrict_
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; j++) {
       output_vec[j] = x_vec[j] * rms_rcp * (weight_bias + float(weight_vec[j])) * scale_inv;
-      output_vec[j] = fmaxf(-fp8_clamp_max<O>::value, fminf(output_vec[j], fp8_clamp_max<O>::value));
+      output_vec[j] =
+          fmaxf(-fp8_clamp_max<O>::value, fminf(output_vec[j], fp8_clamp_max<O>::value));
     }
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
       output_vec.cast_store(output + bx * stride_output + i * num_threads * VEC_SIZE +

@@ -274,7 +274,8 @@ __device__ __forceinline__ void scale_store_partial_chunk(const DType* in_ptr, Q
 #pragma unroll
   for (uint32_t i = 0; i < vec_size; ++i) {
     vec[i] = vec[i] * scale;
-    vec[i] = fmaxf(-fp8_clamp_max<QuantType>::value, fminf(vec[i], fp8_clamp_max<QuantType>::value));
+    vec[i] =
+        fmaxf(-fp8_clamp_max<QuantType>::value, fminf(vec[i], fp8_clamp_max<QuantType>::value));
   }
   if (lane_elem_offset + vec_size <= chunk_valid) {
     vec.cast_store(out_ptr + lane_elem_offset);
@@ -504,7 +505,7 @@ __global__ void RopeQuantizeKernel(
       for (uint32_t i = 0; i < vec_size; ++i) {
         q_rope_vec[i] = q_rope_vec[i] * quant_scale_q;
         q_rope_vec[i] = fmaxf(-fp8_clamp_max<QuantType>::value,
-                               fminf(q_rope_vec[i], fp8_clamp_max<QuantType>::value));
+                              fminf(q_rope_vec[i], fp8_clamp_max<QuantType>::value));
       }
       q_rope_vec.cast_store(q_rope_out_ptr + tx * vec_size);
 
@@ -531,7 +532,7 @@ __global__ void RopeQuantizeKernel(
       for (uint32_t i = 0; i < vec_size; ++i) {
         k_rope_vec[i] = k_rope_vec[i] * quant_scale_kv;
         k_rope_vec[i] = fmaxf(-fp8_clamp_max<QuantType>::value,
-                               fminf(k_rope_vec[i], fp8_clamp_max<QuantType>::value));
+                              fminf(k_rope_vec[i], fp8_clamp_max<QuantType>::value));
       }
       k_rope_vec.cast_store(k_rope_out_ptr + tx * vec_size);
 
@@ -909,7 +910,7 @@ __global__ void RopeQuantizeAppendPagedKVCacheKernel(
       for (uint32_t i = 0; i < vec_size; ++i) {
         q_rope_vec[i] = q_rope_vec[i] * quant_scale_q;
         q_rope_vec[i] = fmaxf(-fp8_clamp_max<QuantType>::value,
-                               fminf(q_rope_vec[i], fp8_clamp_max<QuantType>::value));
+                              fminf(q_rope_vec[i], fp8_clamp_max<QuantType>::value));
       }
       q_rope_vec.cast_store(q_rope_out_ptr + tx * vec_size);
 
@@ -940,7 +941,7 @@ __global__ void RopeQuantizeAppendPagedKVCacheKernel(
       for (uint32_t i = 0; i < vec_size; ++i) {
         k_rope_vec[i] = k_rope_vec[i] * quant_scale_kv;
         k_rope_vec[i] = fmaxf(-fp8_clamp_max<QuantType>::value,
-                               fminf(k_rope_vec[i], fp8_clamp_max<QuantType>::value));
+                              fminf(k_rope_vec[i], fp8_clamp_max<QuantType>::value));
       }
 
       if constexpr (IS_MLA) {
@@ -972,7 +973,7 @@ __global__ void RopeQuantizeAppendPagedKVCacheKernel(
       for (uint32_t i = 0; i < vec_size; ++i) {
         k_nope_vec[i] = k_nope_vec[i] * quant_scale_kv;
         k_nope_vec[i] = fmaxf(-fp8_clamp_max<QuantType>::value,
-                               fminf(k_nope_vec[i], fp8_clamp_max<QuantType>::value));
+                              fminf(k_nope_vec[i], fp8_clamp_max<QuantType>::value));
       }
 
       if constexpr (IS_MLA) {
@@ -1035,7 +1036,7 @@ __global__ void RopeQuantizeAppendPagedKVCacheKernel(
       for (uint32_t i = 0; i < vec_size; ++i) {
         q_nope_vec[i] = q_nope_vec[i] * quant_scale_q;
         q_nope_vec[i] = fmaxf(-fp8_clamp_max<QuantType>::value,
-                               fminf(q_nope_vec[i], fp8_clamp_max<QuantType>::value));
+                              fminf(q_nope_vec[i], fp8_clamp_max<QuantType>::value));
       }
       q_nope_vec.cast_store(q_nope_out_ptr + tx * vec_size);
     }
