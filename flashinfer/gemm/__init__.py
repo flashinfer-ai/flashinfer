@@ -19,9 +19,10 @@ from .gemm_base import gemm_fp8_nt_groupwise as gemm_fp8_nt_groupwise
 from .gemm_base import group_gemm_fp8_nt_groupwise as group_gemm_fp8_nt_groupwise
 from .gemm_base import fp8_blockscale_gemm_sm90 as fp8_blockscale_gemm_sm90
 
-from .routergemm_dsv3 import (
+from .routergemm import (
     mm_M1_16_K7168_N128 as mm_M1_16_K7168_N128,
     mm_M1_16_K7168_N256 as mm_M1_16_K7168_N256,
+    tinygemm_bf16 as tinygemm_bf16,
 )
 
 # Import CuTe-DSL kernels if available
@@ -63,4 +64,5 @@ __all__ = [
     "fp8_blockscale_gemm_sm90",
     "mm_M1_16_K7168_N128",
     "mm_M1_16_K7168_N256",
+    "tinygemm_bf16",
 ] + _cute_dsl_kernels

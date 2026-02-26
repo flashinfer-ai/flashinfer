@@ -480,7 +480,7 @@ def test_moe_fp8(
 )
 @pytest.mark.skipif(
     torch.cuda.get_device_capability()[0] not in [10, 11, 12],
-    reason="NVFP4 is only supported on SM100, SM110 and SM120",
+    reason="NVFP4 is only supported on SM100, SM110 and SM120/SM121",
 )
 def test_moe_nvfp4(
     batch_size,
@@ -1206,7 +1206,7 @@ def dequant_mxfp4_batches(
 )
 @pytest.mark.skipif(
     torch.cuda.get_device_capability()[0] not in [10, 11, 12],
-    reason="MXFP8xMXFP4 is only supported on SM100, SM110 and SM120",
+    reason="MXFP8xMXFP4 is only supported on SM100, SM110 and SM120/SM121",
 )
 def test_moe_mxfp8_mxfp4(
     batch_size,

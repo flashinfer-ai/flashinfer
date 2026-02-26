@@ -44,7 +44,9 @@ void selective_state_update(
     Optional<TensorView> intermediate_states_buffer,  // (batch, cache_steps, nheads, dim, dstate)
     Optional<TensorView> intermediate_state_indices,  // (batch,)
     Optional<TensorView> intermediate_state_scales,   // float32: (batch, cache_steps, nheads, dim)
-    int64_t rand_seed, int64_t cache_steps, int64_t algorithm);
+    int64_t rand_seed,                                // used for Philox rounding
+    int64_t cache_steps,
+    int64_t algorithm);  // SSUAlgorithm: 0=auto, 1=simple, 2=vertical, 3=horizontal
 
 }  // namespace flashinfer::mamba
 

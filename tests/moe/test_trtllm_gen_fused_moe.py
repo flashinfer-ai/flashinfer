@@ -192,13 +192,13 @@ class CUDAGraphMoE:
             hidden_states_scale=input_quantized["hidden_states_scale"],
             gemm1_weights=self.static_data["gemm1_weights_fp4_shuffled"],
             gemm1_weights_scale=self.static_data["gemm1_scales_fp4_shuffled"],
-            gemm1_bias=None,
+            gemm1_bias=self.config["gemm1_bias"],
             gemm1_alpha=None,
             gemm1_beta=None,
             gemm1_clamp_limit=None,
             gemm2_weights=self.static_data["gemm2_weights_fp4_shuffled"],
             gemm2_weights_scale=self.static_data["gemm2_scales_fp4_shuffled"],
-            gemm2_bias=None,
+            gemm2_bias=self.config["gemm2_bias"],
             output1_scale_scalar=self.static_data["scale_c_fc1"],
             output1_scale_gate_scalar=self.static_data["scale_gate_fc1"],
             output2_scale_scalar=self.static_data["scale_c_fc2"],
@@ -570,6 +570,8 @@ class FP4Moe(Moe):
         activation_type = kwargs["activation_type"]
         routing_method_type = kwargs["routing_method_type"]
         enable_autotune = kwargs.get("enable_autotune", True)
+        gemm1_bias = kwargs["gemm1_bias"]
+        gemm2_bias = kwargs["gemm2_bias"]
 
         # Create CUDA graph configuration
         config = {
@@ -583,6 +585,8 @@ class FP4Moe(Moe):
             "activation_type": activation_type,
             "routing_method_type": routing_method_type,
             "enable_autotune": enable_autotune,
+            "gemm1_bias": gemm1_bias,
+            "gemm2_bias": gemm2_bias,
         }
 
         runtime_args = {
@@ -1561,6 +1565,8 @@ class moe_args:
         permute_info,
         use_routing_scales_on_input,
         activation_type,
+        gemm1_bias=None,
+        gemm2_bias=None,
     ):
         self.num_tokens = num_tokens
         self.num_experts = num_experts
@@ -1581,6 +1587,8 @@ class moe_args:
         self.permute_info = permute_info
         self.use_routing_scales_on_input = use_routing_scales_on_input
         self.activation_type = activation_type
+        self.gemm1_bias = gemm1_bias
+        self.gemm2_bias = gemm2_bias
 
 
 class moe_args_dequant:
@@ -1602,6 +1610,8 @@ class moe_args_dequant:
         use_routing_scales_on_input,
         activation_type,
         hidden_states_scale=None,
+        gemm1_bias=None,
+        gemm2_bias=None,
     ):
         self.num_tokens = num_tokens
         self.num_experts = num_experts
@@ -1617,6 +1627,8 @@ class moe_args_dequant:
         self.use_routing_scales_on_input = use_routing_scales_on_input
         self.activation_type = activation_type
         self.hidden_states_scale = hidden_states_scale
+        self.gemm1_bias = gemm1_bias
+        self.gemm2_bias = gemm2_bias
 
 
 def routing_reference(expertLogits, topK, padding):
@@ -2088,6 +2100,8 @@ def run_moe_dequant(args, quant_mode: QuantMode):
         my_a = permute_output[i : i + my_num_tokens]
         my_b = args.gemm1_weights[expert_idx]
         my_c = my_a @ my_b.t()
+        if args.gemm1_bias is not None:
+            my_c = my_c + args.gemm1_bias[expert_idx].to(torch.float)
         gemm1_output[i : i + my_num_tokens] = my_c
         i += my_num_tokens
         i = (i + args.padding - 1) // args.padding * args.padding
@@ -2180,6 +2194,8 @@ def run_moe_dequant(args, quant_mode: QuantMode):
         my_a = activation_output[i : i + my_num_tokens]
         my_b = args.gemm2_weights[expert_idx]
         my_c = my_a @ my_b.t()
+        if args.gemm2_bias is not None:
+            my_c = my_c + args.gemm2_bias[expert_idx].to(torch.float)
         gemm2_output[i : i + my_num_tokens] = my_c
         i += my_num_tokens
         i = (i + args.padding - 1) // args.padding * args.padding
@@ -2262,6 +2278,8 @@ def run_moe_reference_fp4(args, quant_mode: QuantMode):
         args.permute_info,
         args.use_routing_scales_on_input,
         args.activation_type,
+        gemm1_bias=args.gemm1_bias,
+        gemm2_bias=args.gemm2_bias,
     )
 
     return run_moe_dequant(args_dequant, quant_mode), args_dequant
@@ -2365,6 +2383,8 @@ def run_moe_reference_dsfp8(args):
         args.permute_info,
         args.use_routing_scales_on_input,
         args.activation_type,
+        gemm1_bias=args.gemm1_bias,
+        gemm2_bias=args.gemm2_bias,
     )
 
     return run_moe_dequant(
@@ -2404,6 +2424,8 @@ def run_moe_reference_per_tensor_scale_fp8(args):
         args.permute_info,
         args.use_routing_scales_on_input,
         args.activation_type,
+        gemm1_bias=args.gemm1_bias,
+        gemm2_bias=args.gemm2_bias,
     )
 
     return run_moe_dequant(args_dequant, QuantMode.FP8_PER_TENSOR), args_dequant
@@ -2435,6 +2457,8 @@ def run_moe_reference_bf16(args):
         args.permute_info,
         args.use_routing_scales_on_input,
         args.activation_type,
+        gemm1_bias=args.gemm1_bias,
+        gemm2_bias=args.gemm2_bias,
     )
 
     return run_moe_dequant(args_dequant, QuantMode.BF16), args_dequant
@@ -2486,6 +2510,8 @@ def run_moe_reference_mxint4(args):
         args.permute_info,
         args.use_routing_scales_on_input,
         args.activation_type,
+        gemm1_bias=args.gemm1_bias,
+        gemm2_bias=args.gemm2_bias,
     )
 
     return run_moe_dequant(args_dequant, QuantMode.MXINT4_BF16_BF16), args_dequant
@@ -2523,6 +2549,8 @@ def _compute_moe_actual_unified(moe_impl, args_dequant, args, **kwargs):
         "hidden_states_scale": args.hidden_states_scale,
         "hidden_states_quant": kwargs["hidden_states_quant"],
         "enable_autotune": kwargs.get("enable_autotune", True),
+        "gemm1_bias": args.gemm1_bias,
+        "gemm2_bias": args.gemm2_bias,
     }
 
     return moe_impl.call_moe(
@@ -2550,6 +2578,8 @@ def run_moe_test(
     activation_type,
     cache_permute_indices,
     zero_hidden_states=False,
+    gemm1_bias=None,
+    gemm2_bias=None,
 ):
     """Common test logic for all routing methods."""
     skip_checks(
@@ -2699,6 +2729,8 @@ def run_moe_test(
         permute_info,
         use_routing_scales_on_input,
         activation_type,
+        gemm1_bias=gemm1_bias,
+        gemm2_bias=gemm2_bias,
     )
 
     # Compute reference output
@@ -3244,4 +3276,57 @@ def test_llama4_routing(
         weight_processing,
         activation_type,
         cache_permute_indices,
+    )
+
+
+@pytest.mark.parametrize("num_tokens", [32, 768, 3072])
+@pytest.mark.parametrize("hidden_size", [1024])
+@pytest.mark.parametrize("intermediate_size", [2048, 1024, 768, 512])
+@pytest.mark.parametrize("bias", ["gemm2", "gemm1", "gemm1_and_gemm2"])
+def test_nvfp4_moe_gemm_bias(
+    num_tokens, hidden_size, intermediate_size, bias, cache_permute_indices
+):
+    """Test NvFP4 MoE with GEMM bias support."""
+    num_experts = 8
+    top_k = 2
+    device = "cuda"
+
+    gemm1_bias = None
+    gemm2_bias = None
+    if "gemm1" in bias:
+        gemm1_bias = torch.randn(
+            (num_experts, 2 * intermediate_size), device=device, dtype=torch.float32
+        )
+    if "gemm2" in bias:
+        gemm2_bias = torch.randn(
+            (num_experts, hidden_size), device=device, dtype=torch.float32
+        )
+
+    run_moe_test(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        moe_impl=FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4),
+        routing_config={
+            "num_experts": num_experts,
+            "top_k": top_k,
+            "padding": 8,
+            "n_groups": None,
+            "top_k_groups": None,
+            "routed_scaling": None,
+            "has_routing_bias": False,
+            "routing_method_type": RoutingMethodType.Renormalize,
+            "compatible_moe_impls": [FP4Moe],
+            "compatible_intermediate_size": [512, 768, 1024, 2048],
+            "enable_autotune": True,
+        },
+        weight_processing={
+            "use_shuffled_weight": True,
+            "layout": WeightLayout.MajorK,
+            "compatible_moe_impls": [FP4Moe, FP8PerTensorMoe, FP8BlockScaleMoe],
+        },
+        activation_type=ActivationType.Swiglu,
+        cache_permute_indices=cache_permute_indices,
+        gemm1_bias=gemm1_bias,
+        gemm2_bias=gemm2_bias,
     )
