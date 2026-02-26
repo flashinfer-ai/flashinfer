@@ -16,7 +16,7 @@
 // clang-format off
 // config.inc MUST come before the header: it defines DIM, DSTATE, NTOKENS_MTP
 // constexprs that the header's function templates rely on. Reordering breaks compilation.
-// NOTE: the .inc file is generated from the jinja templates
+// NOTE: the .inc file is generated from the jinja template csrc/selective_state_update_customize_config.jinja
 #include "selective_state_update_config.inc"
 #include <flashinfer/mamba/selective_state_update.cuh>
 // clang-format on
@@ -99,6 +99,22 @@ inline void validate_intermediate_states_buffer(
   CHECK_CONTIGUOUS(intermediate_states_buffer.value());
 }
 
+inline void validate_state_scale(Optional<TensorView> const& state_scale, int64_t state_cache_size,
+                                 int64_t nheads, int64_t dim) {
+  if (!state_scale.has_value()) return;
+  auto const& scale = state_scale.value();
+  CHECK_CUDA(scale);
+  CHECK_DIM(3, scale);  // state_scale: {state_cache_size, nheads, dim}
+  FLASHINFER_CHECK(scale.size(0) == state_cache_size,
+                   "state_scale.size(0) must equal state_cache_size");
+  FLASHINFER_CHECK(scale.size(1) == nheads, "state_scale.size(1) must equal nheads");
+  FLASHINFER_CHECK(scale.size(2) == dim, "state_scale.size(2) must equal dim");
+  // Inner dims (nheads, dim) must be contiguous
+  FLASHINFER_CHECK(scale.stride(2) == 1, "state_scale.stride(2) must be 1, got ", scale.stride(2));
+  FLASHINFER_CHECK(scale.stride(1) == dim, "state_scale.stride(1) must equal dim, got ",
+                   scale.stride(1));
+}
+
 // Validates dtype consistency across tensors
 inline void validate_dtype_consistency(
     TensorView const& state, TensorView const& dt, TensorView const& D, TensorView const& x,
@@ -133,8 +149,9 @@ void run_selective_state_update_stp(TensorView const& state, TensorView const& x
                                     TensorView const& C, TensorView const& D,
                                     Optional<TensorView> z, Optional<TensorView> dt_bias,
                                     bool dt_softplus, Optional<TensorView> state_batch_indices,
-                                    int64_t pad_slot_id, Optional<TensorView> out,
-                                    bool disable_state_update, int64_t algorithm) {
+                                    Optional<TensorView> state_scale, int64_t pad_slot_id,
+                                    Optional<TensorView> out, bool disable_state_update,
+                                    int64_t rand_seed, int64_t algorithm) {
   // Extract dimensions from input tensors
   auto const batch = x.size(0);
   auto const state_cache_size = state.size(0);
@@ -219,6 +236,7 @@ void run_selective_state_update_stp(TensorView const& state, TensorView const& x
 
   // Validate dtype consistency
   validate_dtype_consistency(state, dt, D, x, B, C, dt_bias, z, out);
+  validate_state_scale(state_scale, state_cache_size, nheads, dim);
 
   // Initialize params struct
   SelectiveStateUpdateParams p;
@@ -248,6 +266,11 @@ void run_selective_state_update_stp(TensorView const& state, TensorView const& x
   if (state_batch_indices.has_value()) {
     p.state_batch_indices = const_cast<void*>(state_batch_indices.value().data_ptr());
   }
+  if (state_scale.has_value()) {
+    p.state_scale = state_scale.value().data_ptr();
+    p.state_scale_stride_batch = state_scale.value().stride(0);
+  }
+  p.rand_seed = rand_seed;
 
   // Copy pointers
   p.state = const_cast<void*>(state.data_ptr());
@@ -275,16 +298,18 @@ void run_selective_state_update_stp(TensorView const& state, TensorView const& x
   const cudaStream_t stream = get_stream(state.device());
 
   auto algo = static_cast<SSUAlgorithm>(algorithm);
-  invokeSelectiveStateUpdate<input_t, weight_t, matrixA_t, state_t, stateIndex_t>(p, algo, stream);
+  invokeSelectiveStateUpdate<input_t, weight_t, matrixA_t, state_t, stateIndex_t, state_scale_t>(
+      p, algo, stream);
 }
 
 void run_selective_state_update_mtp(
     TensorView const& state, TensorView const& x, TensorView const& dt, TensorView const& A,
     TensorView const& B, TensorView const& C, TensorView const& D, Optional<TensorView> z,
     Optional<TensorView> dt_bias, bool dt_softplus, Optional<TensorView> state_batch_indices,
-    int64_t pad_slot_id, Optional<TensorView> out, bool disable_state_update,
-    Optional<TensorView> intermediate_states_buffer,
-    Optional<TensorView> intermediate_state_indices, int64_t cache_steps, int64_t algorithm) {
+    Optional<TensorView> state_scale, int64_t pad_slot_id, Optional<TensorView> out,
+    bool disable_state_update, Optional<TensorView> intermediate_states_buffer,
+    Optional<TensorView> intermediate_state_indices, Optional<TensorView> intermediate_state_scales,
+    int64_t rand_seed, int64_t cache_steps, int64_t algorithm) {
   // Extract dimensions from input tensors
   auto const batch = x.size(0);
   auto const ntokens_mtp = x.size(1);
@@ -378,6 +403,7 @@ void run_selective_state_update_mtp(
   validate_dtype_consistency(state, dt, D, x, B, C, dt_bias, z, out, intermediate_states_buffer);
   validate_intermediate_state_indices(intermediate_state_indices, batch);
   validate_intermediate_states_buffer(intermediate_states_buffer);
+  validate_state_scale(state_scale, state_cache_size, nheads, dim);
 
   // Validate that state_batch_indices and intermediate_state_indices have the same dtype
   if (state_batch_indices.has_value() && intermediate_state_indices.has_value()) {
@@ -435,6 +461,10 @@ void run_selective_state_update_mtp(
   if (state_batch_indices.has_value()) {
     p.state_batch_indices = const_cast<void*>(state_batch_indices.value().data_ptr());
   }
+  if (state_scale.has_value()) {
+    p.state_scale = state_scale.value().data_ptr();
+    p.state_scale_stride_batch = state_scale.value().stride(0);
+  }
 
   if (intermediate_states_buffer.has_value()) {
     p.intermediate_states = const_cast<void*>(intermediate_states_buffer.value().data_ptr());
@@ -444,6 +474,23 @@ void run_selective_state_update_mtp(
   if (intermediate_state_indices.has_value()) {
     p.intermediate_state_indices = const_cast<void*>(intermediate_state_indices.value().data_ptr());
   }
+
+  if (intermediate_state_scales.has_value()) {
+    auto const& iscales = intermediate_state_scales.value();
+    CHECK_CUDA(iscales);
+    CHECK_CONTIGUOUS(iscales);
+    CHECK_DIM(4, iscales);  // (batch, cache_steps, nheads, dim)
+    FLASHINFER_CHECK(iscales.size(0) == batch,
+                     "intermediate_state_scales.size(0) must equal batch");
+    FLASHINFER_CHECK(iscales.size(1) == cache_steps,
+                     "intermediate_state_scales.size(1) must equal cache_steps");
+    FLASHINFER_CHECK(iscales.size(2) == nheads,
+                     "intermediate_state_scales.size(2) must equal nheads");
+    FLASHINFER_CHECK(iscales.size(3) == dim, "intermediate_state_scales.size(3) must equal dim");
+    p.intermediate_state_scales = iscales.data_ptr();
+    p.intermediate_state_scales_stride_batch = iscales.stride(0);
+  }
+  p.rand_seed = rand_seed;
 
   // Copy pointers
   p.state = const_cast<void*>(state.data_ptr());
@@ -472,30 +519,29 @@ void run_selective_state_update_mtp(
   const cudaStream_t stream = get_stream(state.device());
 
   auto algo = static_cast<SSUAlgorithm>(algorithm);
-  mtp::invokeSelectiveStateUpdateMTP<input_t, weight_t, matrixA_t, state_t, stateIndex_t>(p, algo,
-                                                                                          stream);
+  mtp::invokeSelectiveStateUpdateMTP<input_t, weight_t, matrixA_t, state_t, stateIndex_t,
+                                     state_scale_t>(p, algo, stream);
 }
 
 // =============================================================================
 // Generic dispatcher - routes to single-token or multi-token based on x.dim()
 // =============================================================================
-void selective_state_update(TensorView state, TensorView x, TensorView dt, TensorView A,
-                            TensorView B, TensorView C, TensorView D, Optional<TensorView> z,
-                            Optional<TensorView> dt_bias, bool dt_softplus,
-                            Optional<TensorView> state_batch_indices, int64_t pad_slot_id,
-                            TensorView output, bool disable_state_update,
-                            Optional<TensorView> intermediate_states_buffer,
-                            Optional<TensorView> intermediate_state_indices, int64_t cache_steps,
-                            int64_t algorithm) {
+void selective_state_update(
+    TensorView state, TensorView x, TensorView dt, TensorView A, TensorView B, TensorView C,
+    TensorView D, Optional<TensorView> z, Optional<TensorView> dt_bias, bool dt_softplus,
+    Optional<TensorView> state_batch_indices, int64_t pad_slot_id, Optional<TensorView> state_scale,
+    TensorView output, bool disable_state_update, Optional<TensorView> intermediate_states_buffer,
+    Optional<TensorView> intermediate_state_indices, Optional<TensorView> intermediate_state_scales,
+    int64_t rand_seed, int64_t cache_steps, int64_t algorithm) {
   if (x.dim() == 3) {
     run_selective_state_update_stp(state, x, dt, A, B, C, D, z, dt_bias, dt_softplus,
-                                   state_batch_indices, pad_slot_id, output, disable_state_update,
-                                   algorithm);
+                                   state_batch_indices, state_scale, pad_slot_id, output,
+                                   disable_state_update, rand_seed, algorithm);
   } else if (x.dim() == 4) {
-    run_selective_state_update_mtp(state, x, dt, A, B, C, D, z, dt_bias, dt_softplus,
-                                   state_batch_indices, pad_slot_id, output, disable_state_update,
-                                   intermediate_states_buffer, intermediate_state_indices,
-                                   cache_steps, algorithm);
+    run_selective_state_update_mtp(
+        state, x, dt, A, B, C, D, z, dt_bias, dt_softplus, state_batch_indices, state_scale,
+        pad_slot_id, output, disable_state_update, intermediate_states_buffer,
+        intermediate_state_indices, intermediate_state_scales, rand_seed, cache_steps, algorithm);
   } else {
     FLASHINFER_CHECK(false,
                      "x must have 3 dimensions (single-token) or 4 dimensions (multi-token), got ",

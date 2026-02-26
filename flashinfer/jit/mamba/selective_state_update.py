@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import os
+from typing import Optional
 
 import jinja2
 import torch
@@ -29,6 +30,7 @@ _dtype_map = {
     torch.float16: "half",
     torch.bfloat16: "nv_bfloat16",
     torch.float32: "float",
+    torch.int16: "int16_t",
     torch.int32: "int32_t",
     torch.int64: "int64_t",
 }
@@ -38,6 +40,7 @@ _filename_safe_dtype_map = {
     torch.float16: "f16",
     torch.bfloat16: "bf16",
     torch.float32: "f32",
+    torch.int16: "i16",
     torch.int32: "i32",
     torch.int64: "i64",
 }
@@ -52,14 +55,21 @@ def get_selective_state_update_uri(
     dim: int,
     dstate: int,
     ntokens_mtp: int,
+    state_scale_dtype: Optional[torch.dtype] = None,
+    philox_rounds: int = 0,
 ) -> str:
     s = _filename_safe_dtype_map
-    return (
+    uri = (
         f"selective_state_update_"
         f"s_{s[state_dtype]}_i_{s[input_dtype]}_w_{s[weight_dtype]}_"
         f"a_{s[matrixA_dtype]}_si_{s[stateIndex_dtype]}_"
         f"d_{dim}_ds_{dstate}_nt_{ntokens_mtp}"
     )
+    if state_scale_dtype is not None:
+        uri += f"_sc_{s[state_scale_dtype]}"
+    if philox_rounds > 0:
+        uri += f"_pr_{philox_rounds}"
+    return uri
 
 
 def _gen_module(
@@ -72,6 +82,8 @@ def _gen_module(
     dim: int,
     dstate: int,
     ntokens_mtp: int,
+    state_scale_dtype: Optional[torch.dtype] = None,
+    philox_rounds: int = 0,
     extra_cuda_cflags: list = None,
 ) -> JitSpec:
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
@@ -83,6 +95,9 @@ def _gen_module(
     ) as f:
         config_templ = jinja2.Template(f.read())
 
+    state_scale_type = (
+        _dtype_map[state_scale_dtype] if state_scale_dtype is not None else "void"
+    )
     config_str = config_templ.render(
         state_dtype=_dtype_map[state_dtype],
         input_dtype=_dtype_map[input_dtype],
@@ -92,6 +107,8 @@ def _gen_module(
         dim=dim,
         dstate=dstate,
         ntokens_mtp=ntokens_mtp,
+        state_scale_type=state_scale_type,
+        philox_rounds=philox_rounds,
     )
     write_if_different(gen_directory / "selective_state_update_config.inc", config_str)
 
@@ -125,6 +142,8 @@ def gen_selective_state_update_module(
     dim: int,
     dstate: int,
     ntokens_mtp: int,
+    state_scale_dtype: Optional[torch.dtype] = None,
+    philox_rounds: int = 0,
 ) -> JitSpec:
     uri = get_selective_state_update_uri(
         state_dtype,
@@ -135,6 +154,8 @@ def gen_selective_state_update_module(
         dim,
         dstate,
         ntokens_mtp,
+        state_scale_dtype,
+        philox_rounds,
     )
     return _gen_module(
         uri,
@@ -146,6 +167,9 @@ def gen_selective_state_update_module(
         dim,
         dstate,
         ntokens_mtp,
+        state_scale_dtype=state_scale_dtype,
+        philox_rounds=philox_rounds,
+        extra_cuda_cflags=["-lineinfo"],
     )
 
 
@@ -158,6 +182,8 @@ def gen_selective_state_update_sm90_module(
     dim: int,
     dstate: int,
     ntokens_mtp: int,
+    state_scale_dtype: Optional[torch.dtype] = None,
+    philox_rounds: int = 0,
 ) -> JitSpec:
     uri = (
         get_selective_state_update_uri(
@@ -169,6 +195,8 @@ def gen_selective_state_update_sm90_module(
             dim,
             dstate,
             ntokens_mtp,
+            state_scale_dtype,
+            philox_rounds,
         )
         + "_sm90"
     )
@@ -176,7 +204,7 @@ def gen_selective_state_update_sm90_module(
     nvcc_flags = compilation_context.get_nvcc_flags_list(
         supported_major_versions=[9, 10, 11, 12]
     )
-    nvcc_flags += ["-DFLASHINFER_MAMBA_ENABLE_SM90"]
+    nvcc_flags += ["-DFLASHINFER_MAMBA_ENABLE_SM90", "-lineinfo"]
     return _gen_module(
         uri,
         state_dtype,
@@ -187,5 +215,7 @@ def gen_selective_state_update_sm90_module(
         dim,
         dstate,
         ntokens_mtp,
+        state_scale_dtype=state_scale_dtype,
+        philox_rounds=philox_rounds,
         extra_cuda_cflags=nvcc_flags,
     )

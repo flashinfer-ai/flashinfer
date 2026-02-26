@@ -467,6 +467,305 @@ class TestSelectiveStateUpdateInt32Indices(TestSelectiveStateUpdate):
         )
 
 
+# fmt: off
+_INT16_PARAMS = [
+    # (batch, nheads, dim, dstate, weight_dtype, use_out_tensor)
+    (  64,    64,     64,  128,    torch.float32,     True ),  # base
+    (   1,    64,     64,  128,    torch.float32,     True ),  # batch=1
+    (  64,     8,     64,  128,    torch.float32,     True ),  # nheads=8
+    (  64,    64,    128,  128,    torch.float32,     True ),  # dim=128
+    (  64,    64,     64,   64,    torch.float32,     True ),  # dstate=64
+    (  64,    64,     64,  256,    torch.float32,     True ),  # dstate=256
+    (  64,    64,     64,  128,    torch.bfloat16,    True ),  # weight_dtype=bf16
+]
+# fmt: on
+
+
+class TestSelectiveStateUpdateInt16(TestSelectiveStateUpdate):
+    """Test selective_state_update with int16 quantized state and block scaling."""
+
+    ATOL = 1e-1
+    RTOL = 1e-2
+
+    def make_inputs(self, batch, nheads, dim, dstate, state_dtype, weight_dtype):
+        """Create test inputs with int16 state."""
+        return create_test_inputs(
+            batch,
+            nheads,
+            dim,
+            dstate,
+            self.NGROUPS,
+            self.INPUT_DTYPE,
+            weight_dtype=weight_dtype,
+            matrixA_dtype=self.MATRIX_A_DTYPE,
+            state_dtype=torch.int16,
+            generate_z=False,
+            seed=0,
+        )
+
+    def make_reference_output(self, inputs):
+        """Compute reference output using Triton with state_scale."""
+        state_ref = inputs["state_cache"].clone()
+        state_scale_ref = inputs["state_scale"].clone()
+        y_ref = selective_state_update_triton(
+            state_ref,
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            D=inputs["D"],
+            z=inputs.get("z"),
+            dt_bias=inputs["dt_bias"],
+            dt_softplus=True,
+            state_batch_indices=inputs["slot_idx"],
+            pad_slot_id=-1,
+            state_scale=state_scale_ref,
+        )
+        return y_ref, state_ref, state_scale_ref
+
+    def run_kernel(self, inputs, out=None, algorithm="auto"):
+        """Run the flashinfer kernel with state_scale."""
+        return flashinfer.mamba.selective_state_update(
+            inputs["state_cache"],
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            D=inputs["D"],
+            z=inputs.get("z"),
+            dt_bias=inputs["dt_bias"],
+            dt_softplus=True,
+            state_batch_indices=inputs["slot_idx"],
+            pad_slot_id=-1,
+            out=out,
+            state_scale=inputs["state_scale"],
+            algorithm=algorithm,
+        )
+
+    def assert_states_match(
+        self,
+        state_ref,
+        state_test,
+        slot_idx,
+        msg_prefix="",
+        state_scale_ref=None,
+        state_scale_test=None,
+    ):
+        """Compare dequantized int16 states."""
+        state_ref_batch = state_ref[slot_idx].float()
+        state_test_batch = state_test[slot_idx].float()
+
+        # Dequantize using the respective scales
+        if state_scale_ref is not None:
+            scale_ref = state_scale_ref[
+                slot_idx
+            ]  # (batch, nheads, dim, 1) or (batch, nheads, dim)
+            if scale_ref.dim() == 3:
+                scale_ref = scale_ref.unsqueeze(-1)
+            state_ref_batch = state_ref_batch * scale_ref
+        if state_scale_test is not None:
+            scale_test = state_scale_test[slot_idx]
+            if scale_test.dim() == 3:
+                scale_test = scale_test.unsqueeze(-1)
+            state_test_batch = state_test_batch * scale_test
+
+        states_match = torch.allclose(
+            state_ref_batch, state_test_batch, atol=self.ATOL, rtol=self.RTOL
+        )
+
+        if states_match:
+            print(
+                f"✓ {msg_prefix}Dequantized states match within tolerance (atol={self.ATOL}, rtol={self.RTOL})"
+            )
+        else:
+            print(f"✗ {msg_prefix}Dequantized states do NOT match")
+            diff = (state_ref_batch - state_test_batch).abs()
+            print(
+                f"  Max diff: {diff.max().item():.6f}, Mean diff: {diff.mean().item():.6f}"
+            )
+
+        assert states_match
+
+    @pytest.mark.parametrize(
+        "algorithm", [a for a in _get_algorithms() if a != "horizontal"]
+    )
+    @pytest.mark.parametrize(
+        "batch,nheads,dim,dstate,state_dtype,weight_dtype,use_out_tensor",
+        [(b, nh, d, ds, torch.int16, wd, uo) for b, nh, d, ds, wd, uo in _INT16_PARAMS],
+    )
+    def test_output_correctness(
+        self,
+        batch,
+        nheads,
+        dim,
+        dstate,
+        state_dtype,
+        weight_dtype,
+        use_out_tensor,
+        algorithm,
+    ):
+        inputs = self.make_inputs(batch, nheads, dim, dstate, state_dtype, weight_dtype)
+        y_ref, state_ref, state_scale_ref = self.make_reference_output(inputs)
+
+        if use_out_tensor:
+            out = torch.empty(batch, nheads, dim, dtype=self.INPUT_DTYPE, device="cuda")
+        else:
+            out = None
+
+        y_test = self.run_kernel(inputs, out=out, algorithm=algorithm)
+
+        if use_out_tensor:
+            assert y_test.data_ptr() == out.data_ptr()
+
+        self.assert_outputs_match(y_ref, y_test, msg_prefix=f"[{algorithm}] ")
+        self.assert_states_match(
+            state_ref,
+            inputs["state_cache"],
+            inputs["slot_idx"],
+            msg_prefix=f"[{algorithm}] ",
+            state_scale_ref=state_scale_ref,
+            state_scale_test=inputs["state_scale"],
+        )
+
+
+def _get_algorithms_no_horizontal():
+    """Return algorithms that support stochastic rounding (no horizontal)."""
+    major, _ = get_compute_capability(torch.device("cuda"))
+    algos = ["simple"]
+    if major >= 9:
+        algos.append("vertical")
+    return algos
+
+
+class TestSelectiveStateUpdateStochasticRounding(TestSelectiveStateUpdate):
+    """Test fp16 state with stochastic rounding vs Triton reference."""
+
+    ATOL = 0.001
+    RTOL = 0.01
+
+    RAND_SEED = 42
+
+    def make_inputs(self, batch, nheads, dim, dstate, state_dtype, weight_dtype):
+        """Create test inputs with fp16 state."""
+        return create_test_inputs(
+            batch,
+            nheads,
+            dim,
+            dstate,
+            self.NGROUPS,
+            self.INPUT_DTYPE,
+            weight_dtype=weight_dtype,
+            matrixA_dtype=self.MATRIX_A_DTYPE,
+            state_dtype=torch.float16,
+            generate_z=False,
+            seed=0,
+        )
+
+    def make_reference_output(self, inputs):
+        """Compute reference output using Triton with stochastic rounding."""
+        state_ref = inputs["state_cache"].clone()
+        rand_seed = torch.tensor(self.RAND_SEED, dtype=torch.int64, device="cuda")
+        y_ref = selective_state_update_triton(
+            state_ref,
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            D=inputs["D"],
+            z=inputs.get("z"),
+            dt_bias=inputs["dt_bias"],
+            dt_softplus=True,
+            state_batch_indices=inputs["slot_idx"],
+            pad_slot_id=-1,
+            rand_seed=rand_seed,
+        )
+        return y_ref, state_ref
+
+    def run_kernel(self, inputs, out=None, algorithm="auto"):
+        """Run the flashinfer kernel with stochastic rounding."""
+        return flashinfer.mamba.selective_state_update(
+            inputs["state_cache"],
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            D=inputs["D"],
+            z=inputs.get("z"),
+            dt_bias=inputs["dt_bias"],
+            dt_softplus=True,
+            state_batch_indices=inputs["slot_idx"],
+            pad_slot_id=-1,
+            out=out,
+            algorithm=algorithm,
+            rand_seed=self.RAND_SEED,
+        )
+
+    def assert_states_match(
+        self, state_ref, state_test, slot_idx, msg_prefix="", **kwargs
+    ):
+        """Assert states match within tolerance (SR path has different FP operation order than Triton)."""
+        state_ref_batch = state_ref[slot_idx]
+        state_test_batch = state_test[slot_idx]
+        states_match = torch.allclose(
+            state_ref_batch.float(),
+            state_test_batch.float(),
+            atol=self.ATOL,
+            rtol=self.RTOL,
+        )
+
+        if states_match:
+            print(
+                f"✓ {msg_prefix}States match within tolerance (atol={self.ATOL}, rtol={self.RTOL})"
+            )
+        else:
+            max_diff = (
+                (state_ref_batch.float() - state_test_batch.float()).abs().max().item()
+            )
+            print(f"✗ {msg_prefix}States do NOT match (max_diff={max_diff:.6e})")
+            self._print_mismatch_details(state_ref_batch, state_test_batch, "state")
+
+        assert states_match
+
+    # fmt: off
+    _SR_PARAMS = [
+        # (batch, nheads, dim, dstate,  state_dtype,    weight_dtype,   use_out_tensor)
+        (  64,    64,     64,  128,     torch.float16,  torch.float32,  True ),  # base
+        (  64,    64,     64,   64,     torch.float16,  torch.float32,  True ),  # dstate=64
+    ]
+    # fmt: on
+
+    @pytest.mark.parametrize("algorithm", _get_algorithms_no_horizontal())
+    @pytest.mark.parametrize(
+        "batch,nheads,dim,dstate,state_dtype,weight_dtype,use_out_tensor",
+        _SR_PARAMS,
+    )
+    def test_output_correctness(
+        self,
+        batch,
+        nheads,
+        dim,
+        dstate,
+        state_dtype,
+        weight_dtype,
+        use_out_tensor,
+        algorithm,
+    ):
+        super().test_output_correctness(
+            batch,
+            nheads,
+            dim,
+            dstate,
+            state_dtype,
+            weight_dtype,
+            use_out_tensor,
+            algorithm,
+        )
+
+
 class TestSelectiveStateUpdateDtypeMismatch:
     """Test that selective_state_update fails with dtype mismatch between D and dt."""
 
