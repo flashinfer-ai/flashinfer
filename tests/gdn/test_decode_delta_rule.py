@@ -754,7 +754,7 @@ def _test_gdn_decode_klast_bf16_state_kernel(
     # Tolerances for bf16 h state comparison
     atol_o = 0.001
     rtol_o = 0.005
-    atol_kv = 0.005
+    atol_kv = 0.016  # Accommodates 1 ULP for BF16 (~2.0) from parallel reductions
     rtol_kv = 0.005
 
     # Compare outputs

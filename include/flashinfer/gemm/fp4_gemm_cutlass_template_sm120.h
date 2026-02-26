@@ -175,7 +175,7 @@ std::vector<CutlassGemmConfig> CutlassFp4GemmRunner<T, fp4GemmType>::getConfigs(
       CutlassTileConfigSM120::CtaShape256x128x128B,
   };
 
-  // SM120 only supports 1x1x1 cluster shape
+  // SM120/SM121 only supports 1x1x1 cluster shape
   ClusterShape clusterShape = ClusterShape::ClusterShape_1x1x1;
 
   // Generate configs for both DP and StreamK schedulers
