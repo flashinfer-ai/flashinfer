@@ -59,6 +59,7 @@ from ..jit.gemm import gen_tgv_gemm_sm10x_module
 from ..jit.gemm import gen_deepgemm_sm100_module
 from ..jit.cpp_ext import get_cuda_version
 from ..jit.gemm import gen_fp8_blockscale_gemm_sm90_module
+from ..tllm_enums import *
 
 
 CUDNN_AVAILABLE = False
@@ -764,14 +765,6 @@ def get_gemm_sm120_module_cutlass_fp8():
     return SimpleNamespace(
         cutlass_fp8_gemm_runner=cutlass_fp8_gemm_runner,
     )
-
-
-@functools.cache
-def get_trtllm_gemm_module():
-    mod = gen_trtllm_gen_gemm_module()
-    op = mod.build_and_load()
-    setup_cubin_loader(mod.get_library_path())
-    return op
 
 
 @functools.cache
@@ -3870,8 +3863,8 @@ def mm_fp4(
 
     backend_to_runner_factory = {
         "cudnn": lambda: _cudnn_gemm_fp4_runner(),
-        "trtllm": lambda: get_trtllm_fp4_gemm_module().trtllm_fp4_gemm_runner(
-            use_8x4_sf_layout
+        "trtllm": lambda: get_trtllm_gemm_module().trtllm_gemm_runner(
+            DtypeTrtllmGen.E2m1, DtypeTrtllmGen.Bfloat16, use_8x4_sf_layout
         ),
         "cutlass": lambda: get_cutlass_fp4_gemm_module(
             major, minor
@@ -4316,16 +4309,27 @@ def gemm_fp8_nt_groupwise(
 
 
 @functools.cache
-def get_trtllm_fp4_gemm_module():
+def get_trtllm_gemm_module():
     mod = gen_trtllm_gen_gemm_module()
     op = mod.build_and_load()
     setup_cubin_loader(mod.get_library_path())
 
-    def trtllm_fp4_gemm_runner(use_8x4_sf_layout: bool = True):
-        class TrtllmFp4GemmRunner(TunableRunner):
-            def __init__(self, use_8x4_sf_layout: bool = True):
-                self._fp4_gemm_runner = op.trtllm_gemm
+    def trtllm_gemm_runner(
+        input_dtype: DtypeTrtllmGen,
+        output_dtype: DtypeTrtllmGen,
+        use_8x4_sf_layout: bool = True,
+    ):
+        class TrtllmGemmRunner(TunableRunner):
+            def __init__(
+                self,
+                input_dtype: DtypeTrtllmGen,
+                output_dtype: DtypeTrtllmGen,
+                use_8x4_sf_layout: bool = True,
+            ):
+                self._gemm_runner = op.trtllm_gemm
                 self._use_8x4_sf_layout = use_8x4_sf_layout
+                self._input_dtype = input_dtype
+                self._output_dtype = output_dtype
 
             def get_valid_tactics(
                 self,
@@ -4352,11 +4356,14 @@ def get_trtllm_fp4_gemm_module():
                     _,
                     workspace_buffer,
                 ) = inputs
-                type_e2m1 = 0
-                type_bf16 = 2
                 return list(
                     op.trtllm_gemm_tactics(
-                        m, n, k, type_e2m1, type_bf16, self._use_8x4_sf_layout
+                        m,
+                        n,
+                        k,
+                        self._input_dtype,
+                        self._output_dtype,
+                        self._use_8x4_sf_layout,
                     )
                 )
 
@@ -4379,7 +4386,7 @@ def get_trtllm_fp4_gemm_module():
                     _,
                     workspace_buffer,
                 ) = inputs
-                self._fp4_gemm_runner(
+                self._gemm_runner(
                     workspace_buffer,
                     a,
                     b.T,
@@ -4392,11 +4399,12 @@ def get_trtllm_fp4_gemm_module():
                 )
                 return out
 
-        return TrtllmFp4GemmRunner(use_8x4_sf_layout)
+        return TrtllmGemmRunner(input_dtype, output_dtype, use_8x4_sf_layout)
 
     # Register the module
     return SimpleNamespace(
-        trtllm_fp4_gemm_runner=trtllm_fp4_gemm_runner,
+        trtllm_gemm_runner=trtllm_gemm_runner,
+        trtllm_gemm=op.trtllm_gemm,
     )
 
 

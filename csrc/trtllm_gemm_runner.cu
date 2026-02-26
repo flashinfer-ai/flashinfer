@@ -320,24 +320,18 @@ void trtllm_gemm(TensorView workspace_buffer, TensorView a, TensorView b, Tensor
   }
 }
 
-enum class Dtype : int64_t {
-  E2m1 = 0,
-  E4m3 = 1,
-  Bfloat16 = 2,
-};
-
-Array<int64_t> trtllm_gemm_tactics(int64_t m, int64_t n, int64_t k, int64_t input_dtype,
-                                   int64_t output_dtype, bool use_8x4_sf_layout) {
-  TVM_FFI_ICHECK(input_dtype == static_cast<int64_t>(Dtype::E4m3) ||
-                 input_dtype == static_cast<int64_t>(Dtype::E2m1))
-      << "Unsupported input dtype";
-  TVM_FFI_ICHECK_EQ(output_dtype, static_cast<int64_t>(Dtype::Bfloat16))
-      << "Unsupported output dtype";
+Array<int64_t> trtllm_gemm_tactics(int64_t m, int64_t n, int64_t k, int64_t input_dtype_,
+                                   int64_t output_dtype_, bool use_8x4_sf_layout) {
+  auto input_dtype = static_cast<gemm::trtllm::gen::Dtype>(input_dtype_);
+  auto output_dtype = static_cast<gemm::trtllm::gen::Dtype>(output_dtype_);
+  TVM_FFI_CHECK(input_dtype == gemm::trtllm::gen::Dtype::E4m3 ||
+                    input_dtype == gemm::trtllm::gen::Dtype::E2m1,
+                "Unsupported input dtype");
+  TVM_FFI_CHECK(output_dtype == gemm::trtllm::gen::Dtype::Bfloat16, "Unsupported output dtype");
 
   auto runner = flashinfer::TrtllmGenGemmRunner(flashinfer::TrtllmGenGemmRunnerOptions{
-      .eltType = input_dtype == static_cast<int64_t>(Dtype::E4m3) ? gemm::trtllm::gen::Dtype::E4m3
-                                                                  : gemm::trtllm::gen::Dtype::E2m1,
-      .outputType = gemm::trtllm::gen::Dtype::Bfloat16,
+      .eltType = input_dtype,
+      .outputType = output_dtype,
       .transposeMmaOutput = true,
       .sfLayoutB = use_8x4_sf_layout ? gemm::trtllm::gen::SfLayout::R8c4
                                      : gemm::trtllm::gen::SfLayout::R128c4,
