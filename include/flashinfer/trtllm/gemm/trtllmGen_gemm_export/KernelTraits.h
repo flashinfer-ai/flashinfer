@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
  * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,12 +17,14 @@
 #pragma once
 
 #include <cassert>
+#include <cstdio>
 #include <stdexcept>
 
 #include "Enums.h"
 #include "trtllm/gen/CommonUtils.h"
 #include "trtllm/gen/DtypeDecl.h"
 #include "trtllm/gen/MmaDecl.h"
+#include "trtllm/gen/SparsityDecl.h"
 
 namespace gemm {
 
@@ -137,7 +139,7 @@ class MemAllocatorHelper {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-int getNumSmemBitsPerElt(tg::Dtype dtype, tg::MmaKind mmaKind) {
+inline int getNumSmemBitsPerElt(tg::Dtype dtype, tg::MmaKind mmaKind, int mmaK, bool isSparseA) {
   if (mmaKind == tg::MmaKind::Auto) {
     throw std::runtime_error("mmaKind != tg::MmaKind::Auto");
   }
@@ -157,14 +159,19 @@ class KernelTraits {
 
   // The constructor.
   KernelTraits(tg::Dtype dtypeA, tg::Dtype dtypeB, tg::Dtype dtypeC, tg::Dtype dtypeAcc,
-               tg::Dtype dtypeMmaA, tg::Dtype dtypeMmaB, tg::MmaKind mmaKind, int32_t mmaK,
-               int32_t tileM, int32_t tileN, int32_t tileK, int32_t epilogueTileM,
-               int32_t epilogueTileN, int32_t numStages, int32_t numStagesMma,
+               tg::Dtype dtypeMmaA, tg::Dtype dtypeMmaB, tg::MmaKind mmaKind,
+               tg::Sparsity sparsityA, int32_t mmaK, int32_t tileM, int32_t tileN, int32_t tileK,
+               int32_t epilogueTileM, int32_t epilogueTileN, int32_t numEltsPerSfA,
+               int32_t numEltsPerSfB, int32_t numStages, int32_t numStagesMma,
                int32_t numSlicesForSplitK, int32_t numSlicesForSliceK, SplitK splitK,
                bool useTmaStore, bool transposeMmaOutput, AllReduceAlgo allReduceAlgo,
+               bool fuseUtccpWithUtcmma, bool useMaxTmemOverlap, int32_t numEpilogueWarps,
                bool usePersistentScheduler, bool useDeepSeekFp8, bool usePerTokenSfA,
                bool usePerTokenSfB, bool useTwoCtas, BiasType biasType)
-      : mMmaKind{mmaKind} {
+      : mMmaKind{mmaKind},
+        mFuseUtccpWithUtcmma{fuseUtccpWithUtcmma},
+        mUseMaxTmemOverlap{useMaxTmemOverlap},
+        mNumEpilogueWarps{numEpilogueWarps} {
     //
     // SMEM
     //
@@ -194,11 +201,15 @@ class KernelTraits {
       // Buffer names for inspection purposes.
       std::vector<std::string> smemChunkNames;
 
+      int const isSparseA = static_cast<int>(tg::isSparse(sparsityA));
+
       // LoadA
       {
         // Number of bytes in load A shared memory.
-        auto const numSmemBytesLoadA =
-            numStages * tileM * tileK * getNumSmemBitsPerElt(dtypeA, mMmaKind) / 8 /* bits */;
+        // If A is sparse, we load only the non-zero elements.
+        auto const numSmemBytesLoadA = numStages * tileM * (tileK >> isSparseA) *
+                                       getNumSmemBitsPerElt(dtypeA, mMmaKind, mmaK, isSparseA) /
+                                       8 /* bits */;
         // Number of bytes for load A alignment for TMA load.
         auto const numBytesAlignmentLoadA = 1024;
         // loadA is already at first chunk. No need to reuse it.
@@ -214,7 +225,8 @@ class KernelTraits {
       {
         // Number of bytes in load B shared memory.
         auto const numSmemBytesLoadB = numStages * (useTwoCtas ? tileN / 2 : tileN) * tileK *
-                                       getNumSmemBitsPerElt(dtypeB, mMmaKind) / 8 /* bits */;
+                                       getNumSmemBitsPerElt(dtypeB, mMmaKind, mmaK, isSparseA) /
+                                       8 /* bits */;
         // Number of bytes for load B alignment for TMA load.
         auto const numBytesAlignmentLoadB = 1024;
         // No need to reuse the first chunk.
@@ -235,7 +247,8 @@ class KernelTraits {
         // Number of bytes in save shuffled B in shared memory.
         auto const numSmemBytesLoadB =
             numSlicesForSliceK > 1
-                ? numStages * tileN * tileK * getNumSmemBitsPerElt(dtypeB, mMmaKind) / 8 /* bits */
+                ? numStages * tileN * tileK *
+                      getNumSmemBitsPerElt(dtypeB, mMmaKind, mmaK, isSparseA) / 8 /* bits */
                 : 0;
         // Number of bytes for load B alignment for TMA load.
         auto const numBytesAlignmentLoadB = 1024;
@@ -271,6 +284,10 @@ class KernelTraits {
           extraGmemCMultiplier = 0;
         }
 
+        if (numEpilogueWarps) {
+          extraGmemCMultiplier *= numEpilogueWarps / 4;
+        }
+
         // Number of bytes to store the output in smem.
         auto const numBytesSmemStoreC = usesSmemForGmemC
                                             ? extraGmemCMultiplier * epilogueTileM * epilogueTileN *
@@ -281,6 +298,7 @@ class KernelTraits {
         // gmemC reuses loadAb memory for split-K in DSMEM.
         // Epilogue1 does not reuse and continues after the memory allocated Epilogue0
         // NOTE: we can always reuse loadAb SMEM as long as we don't have persistent scheduler.
+
         auto const reuseFirstChunksSmemStoreC =
             doesSplitKUseDsmem(splitK) && resIdx == 0 && !usePersistentScheduler;
 
@@ -289,6 +307,23 @@ class KernelTraits {
         numBytesAndAlignmentPerSmemChunk.emplace_back(
             std::make_pair(numBytesSmemStoreC, numBytesAlignmentStoreC));
         firstChunkReuseSmem.emplace_back(reuseFirstChunksSmemStoreC);
+      }
+
+      // SmemSparsityInfoA
+      {
+        // Number of bytes for sparsity info in SMEM.
+        auto const numBytesSmemSparsityInfoA =
+            numStages * tileM * tg::getNumBytesSparsityInfo(sparsityA, tileK);
+        // Number of bytes alignment for sparsity info in SMEM.
+        auto const numBytesAlignmentSparsityInfoA = 1024;
+        // No need to reuse the first chunk.
+        auto const reuseChunksSmemSparsityInfoA = false;
+
+        // Add info.
+        smemChunkNames.emplace_back("smemSparsityInfoA");
+        numBytesAndAlignmentPerSmemChunk.emplace_back(
+            std::make_pair(numBytesSmemSparsityInfoA, numBytesAlignmentSparsityInfoA));
+        firstChunkReuseSmem.emplace_back(reuseChunksSmemSparsityInfoA);
       }
 
       // RowMax
@@ -327,16 +362,28 @@ class KernelTraits {
 
       // Per-token Scale Factors
       {
-        // Number of bytes for per-token scale factors
-        auto const numBytesSmemPerTokenSf = (usePerTokenSfA ? (tileM) * sizeof(float) : 0) +
-                                            (usePerTokenSfB ? (tileN) * sizeof(float) : 0);
-        // Number of bytes alignment for per-token scale factors
-        auto const numBytesAlignmentPerTokenSf = 16;
-        // Add info.
-        smemChunkNames.emplace_back("smemPerTokenSf");
-        numBytesAndAlignmentPerSmemChunk.emplace_back(
-            std::make_pair(numBytesSmemPerTokenSf, numBytesAlignmentPerTokenSf));
-        firstChunkReuseSmem.emplace_back(false);
+        {
+          // Number of bytes for per-token scale factors
+          auto const numBytesSmemPerTokenSf = (usePerTokenSfA ? (tileM) * sizeof(float) : 0);
+          // Number of bytes alignment for per-token scale factors
+          auto const numBytesAlignmentPerTokenSf = 16;
+          // Add info.
+          smemChunkNames.emplace_back("smemPerTokenSfA");
+          numBytesAndAlignmentPerSmemChunk.emplace_back(
+              std::make_pair(numBytesSmemPerTokenSf, numBytesAlignmentPerTokenSf));
+          firstChunkReuseSmem.emplace_back(false);
+        }
+        {
+          // Number of bytes for per-token scale factors
+          auto const numBytesSmemPerTokenSf = (usePerTokenSfB ? (tileN) * sizeof(float) : 0);
+          // Number of bytes alignment for per-token scale factors
+          auto const numBytesAlignmentPerTokenSf = 16;
+          // Add info.
+          smemChunkNames.emplace_back("smemPerTokenSfB");
+          numBytesAndAlignmentPerSmemChunk.emplace_back(
+              std::make_pair(numBytesSmemPerTokenSf, numBytesAlignmentPerTokenSf));
+          firstChunkReuseSmem.emplace_back(false);
+        }
       }
 
       // Bias
@@ -361,7 +408,6 @@ class KernelTraits {
       // Per-block absolute maximum for multi-warp reduction.
       {
         // Number of bytes: number of epilogue warps * number of tile columns.
-        // TODO: avoid allocating this memory when it's not needed (it's only for MxFp8 + fusedAct)
         auto const numBytesSmemBlockAmax = transposeMmaOutput ? 4 * tileN * sizeof(float) : 0;
         // Number of bytes alignment.
         auto const numBytesAlignmentBlockAmax = 16;
@@ -403,7 +449,8 @@ class KernelTraits {
       // Chunk 4 smemGmemC1: 65536 bytes, 1024 alignment, false, offset 65536
       // Chunk 5 smemRowMax: 512 bytes, 16 alignment, false, offset 131072
       // Chunk 6 smemSliceK: 0 bytes, 16 alignment, false, offset 131584
-      // Chunk 7 smemPerTokenSf: 0 bytes, 16 alignment, false, offset 131584
+      // Chunk 7 smemPerTokenSfA: 0 bytes, 16 alignment, false, offset 131584
+      // Chunk 8 smemPerTokenSfB: 0 bytes, 16 alignment, false, offset 131584
       mSmemAllocatorHelper.print();
 #endif
     }
@@ -418,8 +465,11 @@ class KernelTraits {
       std::vector<std::string> tmemChunkNames;
       // Matrix D
       {
+        // Two set of TMEM resources for D share epilogueTileN columns,
+        //  | set0:epiTileN0 | set0:epiTileN1/set1:epiTileN0 | set1:epiTileN1 |
+        auto const numCols = mUseMaxTmemOverlap ? 2 * tileN - epilogueTileN : tileN;
         // Number of columns for accumulators.
-        auto const numTmemColsD = numSlicesForSliceK * tileN * numStagesMma *
+        auto const numTmemColsD = numSlicesForSliceK * numCols * numStagesMma *
                                   tg::dtypeGetNumBits(dtypeAcc) /
                                   tg::dtypeGetNumBits(tg::Dtype::UInt32);
         // Number of columns for D alignment.
@@ -462,13 +512,17 @@ class KernelTraits {
         bool const useBlockScalingA = tg::dtypeIsBlockFmt(dtypeMmaA);
         // Are the block scales constant?
         bool const useConstSfA = useBlockScalingA && !tg::dtypeIsBlockFmt(dtypeA);
+        // TMEM cols group size in the K dimension.
+        int32_t kGroupSize = 4;
+        // Number of columns per stage.
+        int32_t const numColsPerStage =
+            useBlockScalingA ? ((tileK / (kGroupSize * numEltsPerSfA)) *
+                                tg::getTmemColStridePerGroup(tileM, mmaK, kGroupSize))
+                             : 0;
         // Number of columns for scaling factors of A.
         auto const numTmemColsSfA =
-            useConstSfA
-                ? tg::roundUp((tileK / 64) * tg::getTmemColStridePerGroup(tileM, mmaK), 4)
-                : (useBlockScalingA
-                       ? ((tileK / 64) * tg::getTmemColStridePerGroup(tileM, mmaK)) * numStages
-                       : 0);
+            useConstSfA ? tg::roundUp(numColsPerStage, 4)
+                        : (numColsPerStage * (mFuseUtccpWithUtcmma ? 1 : numStages));
         // Number of columns for Sf alignment.
         auto const numColsAlignmentSfA = 4;
         // No need to reuse TMEM.
@@ -487,13 +541,17 @@ class KernelTraits {
         bool const useBlockScalingB = tg::dtypeIsBlockFmt(dtypeMmaB);
         // Are the block scales constant?
         bool const useConstSfB = useBlockScalingB && !tg::dtypeIsBlockFmt(dtypeB);
+        // TMEM cols group size in the K dimension.
+        int32_t kGroupSize = 4;
+        // Number of columns per stage.
+        int32_t const numColsPerStage =
+            useBlockScalingB ? ((tileK / (kGroupSize * numEltsPerSfB)) *
+                                tg::getTmemColStridePerGroup(tileN, mmaK, kGroupSize))
+                             : 0;
         // Number of columns for scaling factors of B.
         auto const numTmemColsSfB =
-            useConstSfB
-                ? tg::roundUp((tileK / 64) * tg::getTmemColStridePerGroup(tileN, mmaK), 4)
-                : (useBlockScalingB
-                       ? ((tileK / 64) * tg::getTmemColStridePerGroup(tileN, mmaK)) * numStages
-                       : 0);
+            useConstSfB ? tg::roundUp(numColsPerStage, 4)
+                        : (numColsPerStage * (mFuseUtccpWithUtcmma ? 1 : numStages));
         // Number of columns for Sf alignment.
         auto const numColsAlignmentSfB = 4;
         // No need to reuse TMEM.
@@ -506,6 +564,23 @@ class KernelTraits {
         firstChunkReuseTmem.emplace_back(reuseChunksTmemSfB);
       }
 
+      // Sparsity info for A
+      {
+        // Number of columns for the sparsity info for A (note: for Dense, this is 0).
+        auto const numTmemColsSparsityInfoA =
+            numStages * tg::getNumBytesSparsityInfo(sparsityA, tileK) / 4 /* bytes */;
+        // Number of columns for Sf alignment.
+        auto const numColsAlignmentSparsityInfoA = 2;
+        // No need to reuse TMEM.
+        auto const reuseChunksTmemSparsityInfoA = false;
+
+        // Add info.
+        tmemChunkNames.emplace_back("tmemSparsityInfoA");
+        numBytesAndAlignmentPerTmemChunk.emplace_back(
+            std::make_pair(numTmemColsSparsityInfoA, numColsAlignmentSparsityInfoA));
+        firstChunkReuseTmem.emplace_back(reuseChunksTmemSparsityInfoA);
+      }
+
       // Create TMEM helper object.
       mTmemAllocatorHelper =
           MemAllocatorHelper(numBytesAndAlignmentPerTmemChunk, firstChunkReuseTmem, tmemChunkNames);
@@ -514,7 +589,13 @@ class KernelTraits {
 
  public:
   // The MMA kind.
-  tg::MmaKind mMmaKind;
+  tg::MmaKind mMmaKind{};
+  // Whether fuse Utccp into the MMA task.
+  bool mFuseUtccpWithUtcmma{};
+  // Whether use the max TMEM overlap trick.
+  bool mUseMaxTmemOverlap{};
+  // The number of epilogue warps.
+  int32_t mNumEpilogueWarps{};
   // Helper for SMEM allocation.
   MemAllocatorHelper mSmemAllocatorHelper;
   // Helper for TMEM allocation.
@@ -579,8 +660,14 @@ inline int32_t getSmemOffsetSliceK(KernelTraits traits) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-inline int32_t getSmemOffsetPerTokenSf(KernelTraits traits) {
-  return traits.mSmemAllocatorHelper.getChunkOffsetByName("smemPerTokenSf");
+inline int32_t getSmemOffsetPerTokenSfA(KernelTraits traits) {
+  return traits.mSmemAllocatorHelper.getChunkOffsetByName("smemPerTokenSfA");
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline int32_t getSmemOffsetPerTokenSfB(KernelTraits traits) {
+  return traits.mSmemAllocatorHelper.getChunkOffsetByName("smemPerTokenSfB");
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -599,6 +686,12 @@ inline int32_t getSmemOffsetBlockAmax(KernelTraits traits) {
 
 inline int32_t getSmemOffsetConstSfBuf(KernelTraits traits) {
   return traits.mSmemAllocatorHelper.getChunkOffsetByName("smemConstSfBuf");
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline int32_t getSmemOffsetSparsityInfoA(KernelTraits traits) {
+  return traits.mSmemAllocatorHelper.getChunkOffsetByName("smemSparsityInfoA");
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -634,6 +727,12 @@ inline int32_t getTmemOffsetSfA(KernelTraits traits) {
 
 inline int32_t getTmemOffsetSfB(KernelTraits traits) {
   return traits.mTmemAllocatorHelper.getChunkOffsetByName("tmemSfB");
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline int32_t getTmemOffsetSparsityInfoA(KernelTraits traits) {
+  return traits.mTmemAllocatorHelper.getChunkOffsetByName("tmemSparsityInfoA");
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

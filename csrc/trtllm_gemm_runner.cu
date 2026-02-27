@@ -142,6 +142,10 @@ class TrtllmGenGemmRunner {
     gemmData.mProblemDimensions.mRank = 0;
     gemmData.mProblemDimensions.mWorldSize = 1;
 
+    gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
+    gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
+    gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
+
     // Inputs
     gemmData.mInputBuffers.mPtrA = mOptions.transposeMmaOutput ? b : a;
     gemmData.mInputBuffers.mPtrSfA = mOptions.transposeMmaOutput ? bScale : aScale;
