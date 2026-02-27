@@ -238,7 +238,9 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
         new_state_max = warpReduceMax(new_state_max);
         new_state_max = __shfl_sync(UINT32_MAX, new_state_max, 0);  // broadcast to all lanes
         float const new_state_encode_scale =
-            static_cast<float>(std::numeric_limits<state_t>::max()) / new_state_max;
+            (new_state_max == 0.f)
+                ? 1.f
+                : static_cast<float>(std::numeric_limits<state_t>::max()) / new_state_max;
         float const new_state_decode_scale = 1.f / new_state_encode_scale;
 
         for (int iter = 0, i = lane * load_state_t::count; i < DSTATE;
@@ -582,7 +584,9 @@ __device__ __forceinline__ void consumer_func_vertical(
         new_state_max = warpReduceMax(new_state_max);
         new_state_max = __shfl_sync(UINT32_MAX, new_state_max, 0);
         float const new_encode_scale =
-            static_cast<float>(std::numeric_limits<state_t>::max()) / new_state_max;
+            (new_state_max == 0.f)
+                ? 1.f
+                : static_cast<float>(std::numeric_limits<state_t>::max()) / new_state_max;
         float const new_decode_scale = 1.f / new_encode_scale;
 
         for (int iter = 0, i = lane * stateValuesPerBank; i < DSTATE;

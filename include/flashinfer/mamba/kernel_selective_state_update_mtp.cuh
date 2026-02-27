@@ -303,7 +303,9 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
             istate_max = warpReduceMax(istate_max);
             istate_max = __shfl_sync(UINT32_MAX, istate_max, 0);
             float const ie_scale =
-                static_cast<float>(std::numeric_limits<state_t>::max()) / istate_max;
+                (istate_max == 0.f)
+                    ? 1.f
+                    : static_cast<float>(std::numeric_limits<state_t>::max()) / istate_max;
             float const id_scale = 1.f / ie_scale;
 
             // Encode rState → sram.state
@@ -363,7 +365,9 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
             new_state_max = warpReduceMax(new_state_max);
             new_state_max = __shfl_sync(UINT32_MAX, new_state_max, 0);
             float const new_encode_scale =
-                static_cast<float>(std::numeric_limits<state_t>::max()) / new_state_max;
+                (new_state_max == 0.f)
+                    ? 1.f
+                    : static_cast<float>(std::numeric_limits<state_t>::max()) / new_state_max;
             float const new_decode_scale = 1.f / new_encode_scale;
 
             // Re-encode state values and store to smem
