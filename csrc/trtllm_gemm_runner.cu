@@ -103,9 +103,12 @@ class TrtllmGenGemmRunner {
       }
     }
 
-    FLASHINFER_CHECK(
-        mPassingConfigIndices.size() > 0,
-        "No valid tactic found for the given options (precision, transpose, sf layout)");
+    FLASHINFER_CHECK(mPassingConfigIndices.size() > 0,
+                     "No valid tactic found for the given options",
+                     "mDtypeA: ", gemm::trtllm::gen::dtypeToString(mOptions.eltType),
+                     "mDtypeC: ", gemm::trtllm::gen::dtypeToString(mOptions.outputType),
+                     "mTransposeMmaOutput: ", mOptions.transposeMmaOutput,
+                     "mSfLayoutB: ", gemm::trtllm::gen::sfLayoutToString(mOptions.sfLayoutB));
   }
 
   int64_t getWorkspaceSizeInBytes(int64_t m, int64_t n, int64_t k, int64_t tactic) {
@@ -194,6 +197,10 @@ class TrtllmGenGemmRunner {
     gemmData.mProblemDimensions.mRank = 0;
     gemmData.mProblemDimensions.mWorldSize = 1;
 
+    gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
+    gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
+    gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
+
     std::vector<int64_t> sortedIndices = mPassingConfigIndices;
     std::sort(sortedIndices.begin(), sortedIndices.end(), [&configs](int64_t idx0, int64_t idx1) {
       auto const& optionsA = configs[idx0].mOptions;
@@ -242,14 +249,12 @@ class TrtllmGenGemmRunner {
   int64_t selectHeuristic(int64_t m, int64_t n, int64_t k) const {
     if (mOptions.eltType == gemm::trtllm::gen::Dtype::E4m3) {
       return select_kernel_fp8(m, n, k, gemm::gemm::GemmInterface());
-    } else if (mOptions.eltType == gemm::trtllm::gen::Dtype::E2m1) {
+    } else {
       auto sortedIndices = getValidTactics(m, n, k);
       TVM_FFI_ICHECK(!sortedIndices.empty()) << "No valid tactic found";
 
       // the getValidTactics is sorted by priority, so the first one is the best one
       return sortedIndices[0];
-    } else {
-      TVM_FFI_ICHECK(false) << "Unsupported eltType";
     }
   }
 
@@ -261,9 +266,12 @@ class TrtllmGenGemmRunner {
 using tvm::ffi::Array;
 using tvm::ffi::Optional;
 
-void trtllm_gemm(TensorView workspace_buffer, TensorView a, TensorView b, TensorView a_scale,
-                 TensorView b_scale, Optional<TensorView> globalScale, TensorView out,
-                 bool use_8x4_sf_layout, int64_t tactic) {
+void trtllm_gemm(int64_t input_dtype_, int64_t output_dtype_, TensorView workspace_buffer,
+                 TensorView a, TensorView b, TensorView a_scale, TensorView b_scale,
+                 Optional<TensorView> globalScale, TensorView out, bool use_8x4_sf_layout,
+                 int64_t tactic) {
+  auto input_dtype = static_cast<gemm::trtllm::gen::Dtype>(input_dtype_);
+  auto output_dtype = static_cast<gemm::trtllm::gen::Dtype>(output_dtype_);
   CHECK_DEVICE(a, b);
   CHECK_DEVICE(a, out);
   CHECK_INPUT(a);
@@ -294,8 +302,8 @@ void trtllm_gemm(TensorView workspace_buffer, TensorView a, TensorView b, Tensor
   TVM_FFI_ICHECK(out.size(0) == m && out.size(1) == n) << "Output tensor has wrong dimensions";
 
   auto runner = flashinfer::TrtllmGenGemmRunner(flashinfer::TrtllmGenGemmRunnerOptions{
-      .eltType = is_fp8 ? gemm::trtllm::gen::Dtype::E4m3 : gemm::trtllm::gen::Dtype::E2m1,
-      .outputType = gemm::trtllm::gen::Dtype::Bfloat16,
+      .eltType = input_dtype,
+      .outputType = output_dtype,
       .transposeMmaOutput = true,
       .sfLayoutB = use_8x4_sf_layout ? gemm::trtllm::gen::SfLayout::R8c4
                                      : gemm::trtllm::gen::SfLayout::R128c4,
@@ -329,6 +337,7 @@ Array<int64_t> trtllm_gemm_tactics(int64_t m, int64_t n, int64_t k, int64_t inpu
   auto input_dtype = static_cast<gemm::trtllm::gen::Dtype>(input_dtype_);
   auto output_dtype = static_cast<gemm::trtllm::gen::Dtype>(output_dtype_);
   TVM_FFI_CHECK(input_dtype == gemm::trtllm::gen::Dtype::E4m3 ||
+                    input_dtype == gemm::trtllm::gen::Dtype::MxE4m3 ||
                     input_dtype == gemm::trtllm::gen::Dtype::E2m1,
                 "Unsupported input dtype");
   TVM_FFI_CHECK(output_dtype == gemm::trtllm::gen::Dtype::Bfloat16, "Unsupported output dtype");
