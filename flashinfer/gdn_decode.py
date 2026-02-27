@@ -186,11 +186,6 @@ def gdn_decode_kernel_small_batch_pretranspose(
     i_h = i_hv // (HV // H)
     i_t = 0
 
-    r_A_log = cutlass.Float32(A_log[i_hv])
-    r_a = cutlass.Float32(a[i_n, i_t, i_hv])
-    r_dt_bias = cutlass.Float32(dt_bias[i_hv])
-    r_b = cutlass.Float32(b[i_n, i_t, i_hv])
-
     smem = cutlass.utils.SmemAllocator()
 
     # ===================================================================
@@ -227,6 +222,12 @@ def gdn_decode_kernel_small_batch_pretranspose(
 
     # Compute k_start for contiguous access pattern
     k_start = lane_id * vec_size
+
+    # Read gate values from GMEM EARLY (before barrier, latency hidden during sync)
+    r_A_log = cutlass.Float32(A_log[i_hv])
+    r_a = cutlass.Float32(a[i_n, i_t, i_hv])
+    r_dt_bias = cutlass.Float32(dt_bias[i_hv])
+    r_b = cutlass.Float32(b[i_n, i_t, i_hv])
 
     cute.arch.barrier()
 
@@ -1102,11 +1103,8 @@ def gated_delta_rule_decode_pretranspose(
         h0_indices_tensor = from_dlpack(h0_indices, assumed_align=16)
         cu_seqlens_tensor = from_dlpack(cu_seqlens, assumed_align=16)
 
-        # Choose kernel based on batch size
-        if B <= 32:
-            run_func = run_gdn_decode_kernel_small_batch_pretranspose
-        else:
-            run_func = run_gdn_decode_kernel_big_batch_pretranspose
+        # Always use 8-CTA architecture (benchmarks show it's better for all batch sizes)
+        run_func = run_gdn_decode_kernel_small_batch_pretranspose
 
         # Use TVM FFI to reduce runtime overhead
         compiled = cute.compile(

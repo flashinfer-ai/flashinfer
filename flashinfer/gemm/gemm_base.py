@@ -39,8 +39,7 @@ from ..utils import (
     get_native_fp4_dtype,
     is_sm100a_supported,
     is_sm100f_supported,
-    is_sm120a_supported,
-    is_sm121a_supported,
+    is_sm12x_supported,
     LibraryError,
     backend_requirement,
     supported_compute_capability,
@@ -4273,7 +4272,7 @@ def gemm_fp8_nt_groupwise(
         )
 
     if backend == "cutlass":
-        if is_sm120a_supported(a.device) or is_sm121a_supported(a.device):
+        if is_sm12x_supported(a.device):
             # SM120/121 doesn't use mma_sm parameter
             get_gemm_sm120_module().gemm_fp8_nt_groupwise(
                 workspace_buffer,
@@ -4534,7 +4533,7 @@ def _check_group_gemm_fp8_nt_groupwise_problem_size(
 
     num_groups = m_indptr.shape[0] - 1
 
-    if is_sm120a_supported(a.device) or is_sm121a_supported(a.device):
+    if is_sm12x_supported(a.device):
         if num_groups > 1:
             raise RuntimeError(
                 "group_gemm_fp8_nt_groupwise has correctness issues for num_groups > 1 on SM120/121"
@@ -4633,7 +4632,7 @@ def group_gemm_fp8_nt_groupwise(
     if out is None:
         out = torch.empty(out_shape, dtype=out_dtype, device=a.device)
 
-    if is_sm120a_supported(a.device) or is_sm121a_supported(a.device):
+    if is_sm12x_supported(a.device):
         # SM120/121 doesn't use mma_sm parameter
         get_gemm_sm120_module().group_gemm_fp8_nt_groupwise(
             int_workspace_buffer,

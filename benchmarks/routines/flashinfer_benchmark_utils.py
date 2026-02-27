@@ -54,7 +54,8 @@ output_column_dict = {
         "use_routing_bias",
         "use_routing_scales_on_input",
         "weight_dtype",
-        "gated_act",
+        "activation_type",
+        "fp4_mode",
         # CUTLASS fused MoE specific
         "cutlass_variant",
         "quantized_input",

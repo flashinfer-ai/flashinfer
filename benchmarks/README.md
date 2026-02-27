@@ -13,6 +13,7 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
 - Attention:
     - `BatchDecodeWithPagedKVCacheWrapper` - Decode attention with paged KV cache.
         - Also supports computationally similar `cudnn_batch_decode_with_kv_cache` and `trtllm_batch_decode_with_kv_cache`.
+        - Speculative decode is supported by setting `--s_qo > 1` (subject to backend limitations noted below).
     - `BatchPrefillWithPagedKVCacheWrapper` - Prefill attention with paged KV cache.
         - Also supports computationally similar `cudnn_batch_prefill_with_kv_cache` and  `trtllm_batch_context_with_kv_cache`.
     - `BatchPrefillWithRaggedKVCacheWrapper` - Prefill attention with ragged KV cache.
@@ -195,7 +196,7 @@ The output CSV will contain detailed metrics including:
 |--------------------------|-------------------------------------------------------------------------------------------------------------|
 | `--page_size`            | Page size for paged attention. Required for paged attention tests.                                          |
 | `--batch_size`           | Number of sequences to process in parallel                                                                  |
-| `--s_qo`                 | Query/output sequence length. Should be 1 for decode tests.                                                 |
+| `--s_qo`                 | Query/output sequence length. For decode, `1` is standard decode and `>1` enables speculative decode on supported backends. |
 | `--s_kv`                 | Key/value sequence length (context length)                                                                  |
 | `--num_qo_heads`         | Number of query/output attention heads                                                                      |
 | `--num_kv_heads`         | Number of key/value attention heads                                                                         |
