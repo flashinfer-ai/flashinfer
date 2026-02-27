@@ -1363,12 +1363,10 @@ class TestSelectiveStateUpdateMTPStochasticRoundingWithIntermediateStates(
             assert states_match, f"Intermediate state at step {t} mismatch"
 
 
-@pytest.mark.xfail(strict=True, reason="vertical MTP kernel not yet implemented")
 class TestSelectiveStateUpdateMTPVertical(TestSelectiveStateUpdateMTP):
     """Test multi-token selective_state_update with the vertical algorithm.
 
     This forces algorithm="vertical" to exercise the MTP vertical kernel path.
-    Expected to xfail until the kernel is wired up.
     """
 
     def run_kernel(self, inputs, out=None, disable_state_update=False):
