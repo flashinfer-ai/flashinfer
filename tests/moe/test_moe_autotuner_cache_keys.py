@@ -89,7 +89,7 @@ def test_deepseek_fp8_precomputed_routing(num_tokens):
         hidden_states_scale=torch.empty(SCALE_DIM, num_tokens),
         output=output,
         topk_ids=torch.empty(num_tokens, TOP_K, dtype=torch.int32),
-        expert_weights=torch.empty(num_tokens, TOP_K),
+        expert_weights=None,
     )
     _assert_cache_key_match(config, inputs)
 

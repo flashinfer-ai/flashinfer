@@ -993,7 +993,7 @@ class MoETuningSetup:
     #         4=hidden_states, 5=hidden_states_scale
     _ALL_IDX = (0, 1, 2, 3, 4, 5)
     _ROUTING_IDX = (0, 1, 4, 5)  # skip topk_ids/expert_weights
-    _PRECOMPUTED_IDX = (0, 2, 3, 4, 5)  # skip routing_logits
+    _PRECOMPUTED_IDX = (0, 2, 4, 5)  # skip routing_logits and expert_weights
     _NO_SCALE_IDX = (0, 1, 2, 3, 4)  # no hidden_states_scale
 
     _routing_inits = [
@@ -1006,7 +1006,6 @@ class MoETuningSetup:
     _precomputed_inits = [
         dynamic_tensor_initializers[0],
         dynamic_tensor_initializers[2],
-        dynamic_tensor_initializers[3],
         dynamic_tensor_initializers[4],
         dynamic_tensor_initializers[5],
     ]
@@ -1033,12 +1032,12 @@ class MoETuningSetup:
     )
     tuning_config_precomputed_routing = _make_tuning_config(
         _PRECOMPUTED_IDX,
-        (0, 0, 0, 0, 0),
+        (0, 0, 0, 0),
         _precomputed_inits,
     )
     tuning_config_precomputed_routing_deepseek_fp8 = _make_tuning_config(
         _PRECOMPUTED_IDX,
-        (0, 0, 0, 0, 1),
+        (0, 0, 0, 1),
         _precomputed_inits,
     )
     tuning_config_no_hidden_states_scales = _make_tuning_config(
@@ -1088,12 +1087,12 @@ class MoETuningSetup:
         )
         cls.tuning_config_precomputed_routing = mk(
             cls._PRECOMPUTED_IDX,
-            (0, 0, 0, 0, 0),
+            (0, 0, 0, 0),
             precomputed_inits,
         )
         cls.tuning_config_precomputed_routing_deepseek_fp8 = mk(
             cls._PRECOMPUTED_IDX,
-            (0, 0, 0, 0, 1),
+            (0, 0, 0, 1),
             precomputed_inits,
         )
 
@@ -1195,7 +1194,7 @@ def get_trtllm_moe_sm100_module():
                 hidden_states,
                 *extra_inputs,
             ) = inputs
-            num_tokens = routing_logits.shape[0]
+            num_tokens = hidden_states.shape[0]
 
             instance_key = (
                 self.dtype_act,
@@ -1236,7 +1235,7 @@ def get_trtllm_moe_sm100_module():
                 hidden_states,
                 *extra_inputs,
             ) = inputs
-            num_tokens = routing_logits.shape[0]
+            num_tokens = hidden_states.shape[0]
 
             extra_input_idx = 0
             if trtllm_gen_dtype_has_scale(self.dtype_act):
