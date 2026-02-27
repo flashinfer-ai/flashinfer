@@ -230,9 +230,16 @@ def selective_state_update(
 
     # Validate rand_seed and philox_rounds
     if rand_seed is not None:
-        assert isinstance(rand_seed, int), "rand_seed must be an integer"
-        assert state_scale is None, "rand_seed and state_scale cannot both be provided"
-        assert philox_rounds > 0, "philox_rounds must be > 0 when rand_seed is provided"
+        if not isinstance(rand_seed, int):
+            raise TypeError(
+                f"rand_seed must be an integer, got {type(rand_seed).__name__}"
+            )
+        if state_scale is not None:
+            raise ValueError("rand_seed and state_scale cannot both be provided")
+        if not philox_rounds > 0:
+            raise ValueError(
+                f"philox_rounds must be > 0 when rand_seed is provided, got {philox_rounds}"
+            )
     else:
         # No stochastic rounding when rand_seed is None
         philox_rounds = 0
