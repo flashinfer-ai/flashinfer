@@ -19,7 +19,7 @@ from .utils import create_test_inputs, clone_preserving_strides
 #                   state_dtype=bf16, weight_dtype=f32, use_out_tensor=True
 # Each additional row varies exactly one parameter from the base.
 # fmt: off
-_BASE_PARAMS = [
+_BASE_PARAMS = (
     # (batch, nheads, dim, dstate, cache_steps, state_dtype,        weight_dtype,   use_out_tensor)
     (  64,    64,     64,  128,    4,           torch.bfloat16,     torch.float32,  True ),  # base
     (   1,    64,     64,  128,    4,           torch.bfloat16,     torch.float32,  True ),  # batch=1
@@ -31,7 +31,7 @@ _BASE_PARAMS = [
     (  64,    64,     64,  128,    8,           torch.bfloat16,     torch.float32,  True ),  # cache_steps=8
     (  64,    64,     64,  128,    4,           torch.float32,      torch.float32,  True ),  # state_dtype=f32
     (  64,    64,     64,  128,    4,           torch.bfloat16,     torch.float32,  False),  # use_out_tensor=False
-]
+)
 # fmt: on
 
 
@@ -399,7 +399,7 @@ class TestSelectiveStateUpdateMTPWithIntermediateStates(TestSelectiveStateUpdate
         )
 
     # fmt: off
-    _INTERMEDIATE_PARAMS = [
+    _INTERMEDIATE_PARAMS = (
         # (batch, nheads, dim, dstate, cache_steps, state_dtype,    weight_dtype,   use_out_tensor)
         (  64,    64,     64,  128,    4,           torch.bfloat16, torch.float32,  True ),  # base bf16
         (  64,    64,     64,   64,    4,           torch.bfloat16, torch.float32,  True ),  # dstate=64
@@ -408,7 +408,7 @@ class TestSelectiveStateUpdateMTPWithIntermediateStates(TestSelectiveStateUpdate
         (  64,    64,     64,  128,    4,           torch.bfloat16, torch.float32,  False),  # use_out_tensor=False
         (  64,    64,     64,  128,    4,           torch.float16,  torch.float32,  True ),  # state_dtype=f16
         (  64,    64,     64,  128,    4,           torch.float32,  torch.float32,  True ),  # state_dtype=f32
-    ]
+    )
     # fmt: on
 
     @pytest.mark.parametrize(
@@ -601,13 +601,13 @@ class TestSelectiveStateUpdateMTPVariousNgroups(TestSelectiveStateUpdateMTP):
     """Test multi-token selective_state_update with various ngroups values."""
 
     # fmt: off
-    _NGROUPS_PARAMS = [
+    _NGROUPS_PARAMS = (
         # (batch, nheads, dim, dstate, cache_steps, state_dtype,    weight_dtype,   use_out_tensor, ngroups)
         (  64,    64,     64,  128,    4,           torch.bfloat16, torch.float32,  True,           1),
         (  64,    64,     64,  128,    4,           torch.bfloat16, torch.float32,  True,           2),
         (  64,    64,     64,  128,    4,           torch.bfloat16, torch.float32,  True,           4),
         (  64,    64,     64,  128,    4,           torch.bfloat16, torch.float32,  True,           8),
-    ]
+    )
     # fmt: on
 
     @pytest.mark.parametrize(
@@ -664,11 +664,11 @@ class TestSelectiveStateUpdateMTPLargeBatch(TestSelectiveStateUpdateMTP):
     """Test multi-token selective_state_update with larger batch sizes."""
 
     # fmt: off
-    _LARGE_BATCH_PARAMS = [
+    _LARGE_BATCH_PARAMS = (
         # (batch, nheads, dim, dstate, cache_steps, state_dtype,    weight_dtype,   use_out_tensor)
         (  16,    64,     64,  128,    4,           torch.bfloat16, torch.float32,  True ),  # batch=16
         ( 256,    64,     64,  128,    4,           torch.bfloat16, torch.float32,  True ),  # batch=256
-    ]
+    )
     # fmt: on
 
     @pytest.mark.parametrize(
@@ -699,12 +699,12 @@ class TestSelectiveStateUpdateMTPLargeBatch(TestSelectiveStateUpdateMTP):
 
 
 # fmt: off
-_INT16_MTP_PARAMS = [
+_INT16_MTP_PARAMS = (
     # (batch, nheads, dim, dstate, cache_steps, weight_dtype, use_out_tensor)
     (  64,    64,     64,  128,    4,           torch.float32,     True ),  # base
     (  64,    64,    128,  128,    4,           torch.float32,     True ),  # dim=128
     (  64,    64,     64,  128,    4,           torch.bfloat16,    True ),  # weight_dtype=bf16
-]
+)
 # fmt: on
 
 
@@ -715,7 +715,7 @@ class TestSelectiveStateUpdateMTPInt16(TestSelectiveStateUpdateMTP):
     RTOL = 1e-2
 
     def make_inputs(
-        self, batch, nheads, dim, dstate, cache_steps, state_dtype, weight_dtype
+        self, batch, nheads, dim, dstate, cache_steps, _state_dtype, weight_dtype
     ):
         """Create test inputs with int16 state."""
         return create_test_inputs(
@@ -869,7 +869,7 @@ class TestSelectiveStateUpdateMTPInt16IntermediateStates(
     RTOL = 1e-2
 
     def make_inputs(
-        self, batch, nheads, dim, dstate, cache_steps, state_dtype, weight_dtype
+        self, batch, nheads, dim, dstate, cache_steps, _state_dtype, weight_dtype
     ):
         """Create test inputs with int16 state and intermediate states buffer."""
         return create_test_inputs(
@@ -942,12 +942,12 @@ class TestSelectiveStateUpdateMTPInt16IntermediateStates(
         )
 
     # fmt: off
-    _INT16_INTERMEDIATE_PARAMS = [
+    _INT16_INTERMEDIATE_PARAMS = (
         # (batch, nheads, dim, dstate, cache_steps, state_dtype,  weight_dtype,   use_out_tensor)
         (  64,    64,     64,  128,    4,           torch.int16,  torch.float32,  True ),  # base
         (  64,    64,     64,  128,    2,           torch.int16,  torch.float32,  True ),  # cache_steps=2
         (  64,    64,     64,  128,    8,           torch.int16,  torch.float32,  True ),  # cache_steps=8
-    ]
+    )
     # fmt: on
 
     @pytest.mark.parametrize(
@@ -1091,7 +1091,7 @@ class TestSelectiveStateUpdateMTPStochasticRounding(TestSelectiveStateUpdateMTP)
     RAND_SEED = 42
 
     def make_inputs(
-        self, batch, nheads, dim, dstate, cache_steps, state_dtype, weight_dtype
+        self, batch, nheads, dim, dstate, cache_steps, _state_dtype, weight_dtype
     ):
         """Create test inputs with fp16 state."""
         return create_test_inputs(
@@ -1176,11 +1176,11 @@ class TestSelectiveStateUpdateMTPStochasticRounding(TestSelectiveStateUpdateMTP)
         assert states_match
 
     # fmt: off
-    _SR_PARAMS = [
+    _SR_PARAMS = (
         # (batch, nheads, dim, dstate, cache_steps, state_dtype,    weight_dtype,   use_out_tensor)
         (  64,    64,     64,  128,    4,           torch.float16,  torch.float32,  True ),  # base
         (  64,    64,     64,   64,    4,           torch.float16,  torch.float32,  True ),  # dstate=64
-    ]
+    )
     # fmt: on
 
     @pytest.mark.parametrize(
@@ -1221,7 +1221,7 @@ class TestSelectiveStateUpdateMTPStochasticRoundingWithIntermediateStates(
     RAND_SEED = 42
 
     def make_inputs(
-        self, batch, nheads, dim, dstate, cache_steps, state_dtype, weight_dtype
+        self, batch, nheads, dim, dstate, cache_steps, _state_dtype, weight_dtype
     ):
         """Create test inputs with fp16 state and intermediate states."""
         return create_test_inputs(
@@ -1291,11 +1291,11 @@ class TestSelectiveStateUpdateMTPStochasticRoundingWithIntermediateStates(
         )
 
     # fmt: off
-    _SR_INTERMEDIATE_PARAMS = [
+    _SR_INTERMEDIATE_PARAMS = (
         # (batch, nheads, dim, dstate, cache_steps, state_dtype,    weight_dtype,   use_out_tensor)
         (  64,    64,     64,  128,    4,           torch.float16,  torch.float32,  True ),  # base
         (  64,    64,     64,   64,    4,           torch.float16,  torch.float32,  True ),  # dstate=64
-    ]
+    )
     # fmt: on
 
     @pytest.mark.parametrize(
