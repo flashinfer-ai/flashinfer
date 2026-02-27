@@ -265,9 +265,11 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
           // Use int64_t to avoid overflow when permutedIdx * innerDim > INT32_MAX
           int64_t const baseIdx = (int64_t)permutedIdx * params.innerDim + hiddenIdx;
 
-          int64_t const scale1Idx = (int64_t)permutedIdx + (int64_t)totalNumPaddedTokens * (hiddenIdx / 128);
-          int64_t const scale2Idx = (int64_t)permutedIdx + (int64_t)totalNumPaddedTokens *
-                                                  ((hiddenIdx / 128) + (params.innerDim / 2 / 128));
+          int64_t const scale1Idx =
+              (int64_t)permutedIdx + (int64_t)totalNumPaddedTokens * (hiddenIdx / 128);
+          int64_t const scale2Idx =
+              (int64_t)permutedIdx +
+              (int64_t)totalNumPaddedTokens * ((hiddenIdx / 128) + (params.innerDim / 2 / 128));
 
           scale1Arr[tokenInCtaIdx] = params.inDqSfsPtr[scale1Idx];
           scale2Arr[tokenInCtaIdx] = params.inDqSfsPtr[scale2Idx];
@@ -306,8 +308,8 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
             float scaleOut =
                 fmaxf(aMaxArr[tokenInCtaIdx] / E4m3MaxVal, std::numeric_limits<float>::min());
             s_scaleOutArr[tokenInCtaIdx] = scaleOut;
-            int64_t const scaleOut_idx =
-                (int64_t)permutedIdxArr[tokenInCtaIdx] + (int64_t)totalNumPaddedTokens * (hiddenIdx / 128);
+            int64_t const scaleOut_idx = (int64_t)permutedIdxArr[tokenInCtaIdx] +
+                                         (int64_t)totalNumPaddedTokens * (hiddenIdx / 128);
             params.outDqSfsPtr[scaleOut_idx] = scaleOut;
           }
         }
