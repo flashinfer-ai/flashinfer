@@ -12,6 +12,7 @@
 #include "common.cuh"
 #include "conversion.cuh"
 #include "create_tensor_map.cuh"
+#include "kernel_selective_state_update_mtp_vertical.cuh"
 
 namespace flashinfer::mamba::mtp {
 
@@ -457,9 +458,10 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
     static_assert(std::is_same_v<state_t, half>,
                   "Stochastic rounding (PHILOX_ROUNDS > 0) only supports fp16 state");
   }
-  // MTP only supports the simple kernel
-  FLASHINFER_CHECK(algorithm == SSUAlgorithm::kAuto || algorithm == SSUAlgorithm::kSimple,
-                   "MTP selective_state_update only supports 'auto' or 'simple' algorithm, got ",
+  FLASHINFER_CHECK(algorithm == SSUAlgorithm::kAuto || algorithm == SSUAlgorithm::kSimple ||
+                       algorithm == SSUAlgorithm::kVertical,
+                   "MTP selective_state_update only supports 'auto', 'simple', or 'vertical' "
+                   "algorithm, got ",
                    static_cast<int32_t>(algorithm));
   // Common alignment checks for all kernels
   check_ptr_alignment_input_vars<input_t>(params);
@@ -471,6 +473,38 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
   FLASHINFER_CHECK((params.dim * params.dstate * sizeof(state_t)) % sizeof(load_state_t) == 0,
                    "state head stride must be aligned to ", sizeof(load_state_t), " bytes");
 
+  // ── Vertical MTP kernel ──────────────────────────────────────────────────
+  if (algorithm == SSUAlgorithm::kVertical) {
+    FLASHINFER_CHECK(params.nheads % params.ngroups == 0, "nheads (", params.nheads,
+                     ") must be divisible by ngroups (", params.ngroups,
+                     ") for vertical algorithm");
+    FLASHINFER_CHECK(params.nheads / params.ngroups <= 32, "HEADS_PER_GROUP (",
+                     params.nheads / params.ngroups, ") must be <= 32 for vertical algorithm");
+
+    constexpr int ROWS_PER_TILE = 16;
+    constexpr int NUM_OUT_STAGES = 3;
+
+    dispatchRatio(
+        params, std::integer_sequence<int, 1, 2, 4, 8, 16, 32>{}, [&]<int HEADS_PER_GROUP>() {
+          using sram_t = SharedStorageVertical<input_t, state_t, NTOKENS_MTP, HEADS_PER_GROUP,
+                                               ROWS_PER_TILE, DSTATE, NUM_OUT_STAGES>;
+          constexpr size_t smem_size = sizeof(sram_t);
+
+          auto func = selective_state_update_kernel_vertical_mtp<
+              input_t, weight_t, matrixA_t, state_t, stateIndex_t, NTOKENS_MTP, DIM, DSTATE,
+              ROWS_PER_TILE, HEADS_PER_GROUP, NUM_OUT_STAGES>;
+
+          dim3 grid(params.batch, params.ngroups);
+          dim3 block(warpSize, NUM_WARPS);
+
+          FLASHINFER_CUDA_CHECK(
+              cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+          func<<<grid, block, smem_size, stream>>>(params);
+        });
+    return;
+  }
+
+  // ── Simple MTP kernel ────────────────────────────────────────────────────
   constexpr int numWarps = 4;
   constexpr int stateRowsPerWarpPerStage = 4;
   constexpr int stateRowsPerBlockPerStage = stateRowsPerWarpPerStage * numWarps;
