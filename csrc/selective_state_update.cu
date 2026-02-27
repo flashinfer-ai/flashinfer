@@ -414,15 +414,6 @@ void run_selective_state_update_mtp(
                      "state_batch_indices and intermediate_state_indices must have the same dtype");
   }
 
-  // Validate that state_batch_indices and intermediate_state_indices have the same dtype
-  if (state_batch_indices.has_value() && intermediate_state_indices.has_value()) {
-    DLDataType state_batch_idx_dtype = state_batch_indices.value().dtype();
-    DLDataType intermediate_idx_dtype = intermediate_state_indices.value().dtype();
-    FLASHINFER_CHECK(state_batch_idx_dtype.code == intermediate_idx_dtype.code &&
-                         state_batch_idx_dtype.bits == intermediate_idx_dtype.bits,
-                     "state_batch_indices and intermediate_state_indices must have the same dtype");
-  }
-
   // Validate cache_steps is non-negative
   FLASHINFER_CHECK(cache_steps >= 0, "cache_steps must be non-negative, got ", cache_steps);
 
