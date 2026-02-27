@@ -259,6 +259,9 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
 #pragma unroll
                 for (int k = 0; k < packed_input_t::count; k++) {
                   if constexpr (PHILOX_ROUNDS > 0) {
+                    // SR only applies to fp16 state, so packed count is always >= 2.
+                    static_assert(packed_input_t::count >= 2,
+                                  "Stochastic rounding requires fp16 state (packed count >= 2)");
                     if (k % 4 == 0)
                       philox_randint4x<PHILOX_ROUNDS>(
                           params.rand_seed, state_ptr_offset + d * DSTATE + base_i + k,
