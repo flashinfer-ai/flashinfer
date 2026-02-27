@@ -71,12 +71,14 @@ sizeof_i32 = 4
 
 
 @dsl_user_op
-def with_byte(arr: cute.typing.Tensor, index: Int32, value: Uint8, *, loc=None, ip=None) -> cute.typing.Tensor:
+def with_byte(
+    arr: cute.typing.Tensor, index: Int32, value: Uint8, *, loc=None, ip=None
+) -> cute.typing.Tensor:
     element_index = index // 4
     byte_offset = index % 4
     arr[element_index] &= ~(0xFF << (byte_offset * 8))
     arr[element_index] |= value << (byte_offset * 8)
-    assert isinstance(arr[index//4], Uint64), f"{arr[index//4]=}"
+    assert isinstance(arr[index // 4], Uint64), f"{arr[index//4]=}"
     return arr
 
 
@@ -227,9 +229,7 @@ class MaskedScheduler:
         new_num_tiles_executed = new_from_mlir_values(
             self._num_tiles_executed, [values[7]]
         )
-        new_last_batch_idx = new_from_mlir_values(
-            self._last_batch_idx, [values[8]]
-        )
+        new_last_batch_idx = new_from_mlir_values(self._last_batch_idx, [values[8]])
         return MaskedScheduler(
             self.params,
             new_num_persistent_clusters,
@@ -328,8 +328,7 @@ class MaskedScheduler:
             batch_idx += Int32(1)
 
         if cutlass.const_expr(
-            (dsm_pending_packed is not None)
-            and (self.params.dst_signals is not None)
+            (dsm_pending_packed is not None) and (self.params.dst_signals is not None)
         ):
             if self._current_batch_idx != batch_idx and self._num_tiles_executed > 0:
                 self._last_batch_idx = self._current_batch_idx
@@ -1674,7 +1673,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 assert self.num_c_stage < 256, "must be representable in 1 byte"
                 num_experts = tile_sched_params.masked_m.shape[0]
                 assert num_experts <= 64, "num_experts must be <= 64"
-            dsm_pending_packed = cute.make_fragment(cute.make_layout((1, 8), stride=(8, 1)), dtype=cutlass.Uint64)
+            dsm_pending_packed = cute.make_fragment(
+                cute.make_layout((1, 8), stride=(8, 1)), dtype=cutlass.Uint64
+            )
             dsm_pending_packed.fill(0)
             dsm_pending_idx = Int32(0)
 
@@ -1772,7 +1773,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         ):
                             dsm_counter = (dsm_counter + 1).to(Uint8)
                             will_write_signals = (
-                                read_byte(dsm_pending_packed, tile_sched._last_batch_idx)
+                                read_byte(
+                                    dsm_pending_packed, tile_sched._last_batch_idx
+                                )
                                 == dsm_counter
                             )
 
@@ -1801,7 +1804,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         lane_id = tidx % 32
                         if warp_idx == self.epilog_warp_id[0] and lane_id == 0:
                             if (
-                                read_byte(dsm_pending_packed, tile_sched._last_batch_idx)
+                                read_byte(
+                                    dsm_pending_packed, tile_sched._last_batch_idx
+                                )
                                 == dsm_counter
                             ):
                                 atomic_add_release_global(
@@ -1809,7 +1814,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                                     + sizeof_i32 * tile_sched._last_batch_idx,
                                     value=1,
                                 )
-                                with_byte(dsm_pending_packed, tile_sched._last_batch_idx, 0)
+                                with_byte(
+                                    dsm_pending_packed, tile_sched._last_batch_idx, 0
+                                )
                                 dsm_pending_idx = tile_sched._last_batch_idx + 1
 
                 #
@@ -1862,13 +1869,16 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 lane_id = tidx % 32
                 if warp_idx == self.epilog_warp_id[0] and lane_id == 0:
                     while dsm_pending_idx < num_experts:
-                        if read_byte(dsm_pending_packed, dsm_pending_idx) == self.num_c_stage-1:
+                        if (
+                            read_byte(dsm_pending_packed, dsm_pending_idx)
+                            == self.num_c_stage - 1
+                        ):
                             atomic_add_release_global(
                                 tile_sched_params.dst_signals.toint()
                                 + sizeof_i32 * dsm_pending_idx,
-                             value=1,
+                                value=1,
                             )
-                        
+
                         dsm_pending_idx += 1
 
             else:
