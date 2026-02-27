@@ -96,7 +96,7 @@ __device__ __forceinline__ uint32_t philox_randint(int64_t seed, uint32_t offset
 // Adds random noise at the sub-fp16-mantissa position, then truncates.
 // rand13: 13-bit random value in bits [12:0].
 __device__ __forceinline__ uint16_t cvt_rs_f16_sw(float x, uint32_t rand13) {
-  uint32_t bits = *reinterpret_cast<uint32_t*>(&x);
+  uint32_t bits = __float_as_uint(x);
   uint32_t sign = bits & 0x80000000u;
   uint32_t abs_bits = bits & 0x7FFFFFFFu;
 
@@ -159,7 +159,7 @@ __device__ __forceinline__ uint32_t cvt_rs_f16x2_f32(float a, float b, uint32_t 
   uint32_t packed;
   asm("cvt.rs.f16x2.f32 %0, %2, %1, %3;"
       : "=r"(packed)
-      : "r"(*reinterpret_cast<uint32_t*>(&a)), "r"(*reinterpret_cast<uint32_t*>(&b)), "r"(rbits));
+      : "r"(__float_as_uint(a)), "r"(__float_as_uint(b)), "r"(rbits));
   return packed;
 #else
   uint32_t rand_a = rbits & 0x1FFFu;          // bits [12:0] → C++ a (PTX b → low half)
