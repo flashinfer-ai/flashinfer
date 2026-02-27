@@ -322,23 +322,24 @@ class MaskedScheduler:
             <= current_work_linear_idx
             and batch_idx < self.params.masked_m.shape[0]
         ):
-            if cutlass.const_expr(
-                (dsm_pending_packed is not None)
-                and (self.params.dst_signals is not None)
-            ):
-                dsm_pending_packed = with_byte(
-                    dsm_pending_packed,
-                    index=self._current_batch_idx,
-                    value=num_c_stage - 1,
-                )
-
             accum_tile_m += cute.ceil_div(
                 self.params.masked_m[batch_idx], self.params.c_tiler[0]
             )
             batch_idx += Int32(1)
 
+        if cutlass.const_expr(
+            (dsm_pending_packed is not None)
+            and (self.params.dst_signals is not None)
+        ):
+            if self._current_batch_idx != batch_idx and self._num_tiles_executed > 0:
+                self._last_batch_idx = self._current_batch_idx
+                dsm_pending_packed = with_byte(
+                    dsm_pending_packed,
+                    index=self._last_batch_idx,
+                    value=num_c_stage - 1,
+                )
+
         self._accum_tile_m = accum_tile_m
-        self._last_batch_idx = self._current_batch_idx
         self._current_batch_idx = batch_idx
 
         is_valid = self._current_batch_idx < self.params.masked_m.shape[0]
@@ -1674,6 +1675,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 num_experts = tile_sched_params.masked_m.shape[0]
                 assert num_experts <= 64, "num_experts must be <= 64"
             dsm_pending_packed = cute.make_fragment(cute.make_layout((1, 8), stride=(8, 1)), dtype=cutlass.Uint64)
+            dsm_pending_packed.fill(0)
             dsm_pending_idx = Int32(0)
 
             while work_tile.is_valid_tile:
@@ -1807,6 +1809,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                                     + sizeof_i32 * tile_sched._last_batch_idx,
                                     value=1,
                                 )
+                                with_byte(dsm_pending_packed, tile_sched._last_batch_idx, 0)
                                 dsm_pending_idx = tile_sched._last_batch_idx + 1
 
                 #

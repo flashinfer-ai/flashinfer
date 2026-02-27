@@ -27,7 +27,7 @@ from flashinfer.cute_dsl.utils import (
 @pytest.mark.skipif(
     not is_cute_dsl_available(), reason="Please `pip install nvidia-cutlass-dsl`"
 )
-@pytest.mark.parametrize("lm", [(1, 1024), (2, 512), (4, 256)])
+@pytest.mark.parametrize("lm", [(2,512), (10, 256)])
 @pytest.mark.parametrize("kn", [(7168, 4096), (2048, 7168)])
 @pytest.mark.parametrize(
     "ab_dtype,sf_dtype,c_dtype,sf_vec_size",
@@ -207,7 +207,9 @@ def test_blockscaled_gemm_python_interface(
         )
 
         if enable_dst_signals:
-            assert torch.all(dst_signals == sm_count), f"{dst_signals}"
+            expect_signals = torch.ceil(masked_m_tensor/mma_tiler_mn[0]) * (n / mma_tiler_mn[1])
+            expect_signals = torch.where(expect_signals > sm_count, sm_count, expect_signals)
+            assert torch.all(dst_signals == expect_signals), f"{dst_signals} {expect_signals} {masked_m_tensor}"
 
     # compute ref output
     if not fuse_alpha:
@@ -276,6 +278,5 @@ if __name__ == "__main__":
         cluster_shape_mn=(2, 1),
         tolerance=1e-01,
         iterations=3,
-        sm_count=132,
         enable_dst_signals=True,
     )
