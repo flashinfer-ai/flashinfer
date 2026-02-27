@@ -28,6 +28,7 @@ from .jit import (
     gen_jit_spec,
     sm121a_nvcc_flags,
     sm120a_nvcc_flags,
+    sm120f_nvcc_flags,
     sm110a_nvcc_flags,
     sm103a_nvcc_flags,
     sm100a_nvcc_flags,
@@ -99,6 +100,10 @@ def gen_fp4_quantization_sm120_module() -> JitSpec:
     return gen_fp4_quantization_module(sm120a_nvcc_flags, "120")
 
 
+def gen_fp4_quantization_sm120f_module() -> JitSpec:
+    return gen_fp4_quantization_module(sm120f_nvcc_flags, "120f")
+
+
 def gen_fp4_quantization_sm121_module() -> JitSpec:
     return gen_fp4_quantization_module(sm121a_nvcc_flags, "121")
 
@@ -138,12 +143,21 @@ def gen_fp4_quantization_module(nvcc_flags: List[str], device_arch: str) -> JitS
 def get_fp4_quantization_module(backend: str = "100"):
     backend_modules = {
         "121": gen_fp4_quantization_sm121_module,
+        "120f": gen_fp4_quantization_sm120f_module,
         "120": gen_fp4_quantization_sm120_module,
         "110": gen_fp4_quantization_sm110_module,
         "103": gen_fp4_quantization_sm103_module,
         "100": gen_fp4_quantization_sm100_module,
         "90": gen_fp4_quantization_sm90_module,
     }
+
+    # Prefer 'f' (feature-set) variant when CUDA version supports it (>= 12.9),
+    # as it enables native FP4 conversion instructions (cvt.rn.satfinite.e2m1x2.f32).
+    if backend == "120":
+        from .utils import version_at_least
+        import torch
+        if version_at_least(torch.version.cuda, "12.9"):
+            backend = "120f"
 
     if backend not in backend_modules:
         raise ValueError(f"Invalid backend: {backend}")
