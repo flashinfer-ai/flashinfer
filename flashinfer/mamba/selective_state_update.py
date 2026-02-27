@@ -47,10 +47,10 @@ def _get_module(
         weight_dtype,
         matrixA_dtype,
         stateIndex_dtype,
+        state_scale_dtype,
         dim,
         dstate,
         ntokens_mtp,
-        state_scale_dtype,
         philox_rounds,
     )
     if sm_major >= 9:
