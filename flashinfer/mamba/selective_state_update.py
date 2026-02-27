@@ -236,7 +236,7 @@ def selective_state_update(
             )
         if state_scale is not None:
             raise ValueError("rand_seed and state_scale cannot both be provided")
-        if not philox_rounds > 0:
+        if philox_rounds <= 0:
             raise ValueError(
                 f"philox_rounds must be > 0 when rand_seed is provided, got {philox_rounds}"
             )
