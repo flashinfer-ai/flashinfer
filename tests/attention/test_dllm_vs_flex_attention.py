@@ -915,7 +915,7 @@ def test_block_size_sweep(
     print(f"Block Size 对齐效应汇总 (kv_len={total_kv_len}, qo_len={qo_len}, batch={num_requests})")
     print(f"{'='*130}")
     print(f"  {'block_size':>10} | {'PARTIAL%':>8} | "
-          f"{'Ragged(ms)':>10} | {'Ragged CG':>10} | {'Paged(ms)':>10} | "
+          f"{'Ragged(ms)':>10} | {'Ragged cuda_graph':>10} | {'Paged(ms)':>10} | "
           f"{'Flex compiled':>14} | {'Ragged Mem':>10} | {'Flex Mem':>10} | "
           f"{'加速比':>10}")
     print(f"  {'-'*10}-+-{'-'*8}-+-"
@@ -925,7 +925,7 @@ def test_block_size_sweep(
     for bs in block_sizes:
         r = all_results.get(bs, {})
         ragged = r.get("ragged_qoffset", {}).get("no_cuda_graph_ms", 0)
-        ragged_cg = r.get("ragged_qoffset", {}).get("cuda_graph_ms", 0)
+        ragged_cuda_graph = r.get("ragged_qoffset", {}).get("cuda_graph_ms", 0)
         paged = r.get("paged_qoffset", {}).get("no_cuda_graph_ms", 0)
         flex = r.get("flex_compiled", {}).get("no_cuda_graph_ms", 0)
         ragged_mem = r.get("ragged_qoffset", {}).get("memory", {}).get("memory_increase_mb", 0)
@@ -949,7 +949,7 @@ def test_block_size_sweep(
         pct = f"{partial_count/total_tiles*100:.1f}%"
 
         print(f"  {bs:>10} | {pct:>8} | "
-              f"{ragged:>10.3f} | {ragged_cg:>10.3f} | {paged:>10.3f} | "
+              f"{ragged:>10.3f} | {ragged_cuda_graph:>10.3f} | {paged:>10.3f} | "
               f"{flex:>14.3f} | {ragged_mem:>10.1f} | {flex_mem:>10.1f} | {speedup:>10}")
 
     return all_results
@@ -1086,8 +1086,8 @@ def test_total_memory_comparison(
 
                 # cuda_graph latency
                 try:
-                    fi_cg_ms = benchmark_with_cuda_graph(_run_fi, warmup_iters, bench_iters)
-                    entry["fi_cg_ms"] = fi_cg_ms
+                    fi_cuda_graph_ms = benchmark_with_cuda_graph(_run_fi, warmup_iters, bench_iters)
+                    entry["fi_cuda_graph_ms"] = fi_cuda_graph_ms
                 except Exception:
                     pass
 
@@ -1134,8 +1134,8 @@ def test_total_memory_comparison(
             all_results[key] = entry
 
             # 单行进度
-            fi_cg = f"CG={entry['fi_cg_ms']:.3f}ms" if "fi_cg_ms" in entry else "CG=N/A"
-            fi_s = f"{entry.get('fi_ms', 0):.3f}ms/{fi_cg}/{entry.get('fi_peak', 0):.0f}MB"
+            fi_cuda_graph = f"cuda_graph={entry['fi_cuda_graph_ms']:.3f}ms" if "fi_cuda_graph_ms" in entry else "cuda_graph=N/A"
+            fi_s = f"{entry.get('fi_ms', 0):.3f}ms/{fi_cuda_graph}/{entry.get('fi_peak', 0):.0f}MB"
             fx_s = f"{entry.get('flex_ms', 0):.3f}ms/{entry.get('flex_peak', 0):.0f}MB" if "flex_ms" in entry else "N/A"
             print(f"    dllm_bs={dbs:<3}  FI={fi_s:<32} Flex={fx_s}")
 
@@ -1146,47 +1146,47 @@ def test_total_memory_comparison(
     print(f"全量 Prefill 汇总: FlashInfer Ragged vs Flex compiled")
     print(f"  场景: qo_len = kv_len, q_offset = 0, FI workspace={min_ws_mb}MB, Flex BLOCK_SIZE=默认(kernel自决)")
     print(f"{'='*170}")
-    print(f"  {'seq_len':>8} | {'batch':>5} | {'dllm_bs':>7} | {'FI(ms)':>8} | {'FI CG(ms)':>10} | {'FI peak(MB)':>12} | {'Flex(ms)':>9} | {'Flex peak(MB)':>14} | {'加速比':>8} | {'CG加速比':>9} | {'显存节省':>8}")
+    print(f"  {'seq_len':>8} | {'batch':>5} | {'dllm_bs':>7} | {'FI(ms)':>8} | {'FI cuda_graph(ms)':>10} | {'FI peak(MB)':>12} | {'Flex(ms)':>9} | {'Flex peak(MB)':>14} | {'加速比':>8} | {'cuda_graph加速比':>9} | {'显存节省':>8}")
     print(f"  {'-'*8}-+-{'-'*5}-+-{'-'*7}-+-{'-'*8}-+-{'-'*10}-+-{'-'*12}-+-{'-'*9}-+-{'-'*14}-+-{'-'*8}-+-{'-'*9}-+-{'-'*8}")
 
-    fi_wins_perf, fi_wins_cg, fi_wins_mem, total_cmp = 0, 0, 0, 0
+    fi_wins_perf, fi_wins_cuda_graph, fi_wins_mem, total_cmp = 0, 0, 0, 0
 
     for seq_len, batch in configs:
         for dbs in dllm_block_sizes:
             e = all_results.get((seq_len, batch, dbs), {})
             fi_ms = e.get("fi_ms", 0)
-            fi_cg = e.get("fi_cg_ms", 0)
+            fi_cuda_graph = e.get("fi_cuda_graph_ms", 0)
             fi_pk = e.get("fi_peak", 0)
             fx_ms = e.get("flex_ms", 0)
             fx_pk = e.get("flex_peak", 0)
 
             if fi_ms > 0 and fx_ms > 0:
                 ratio = f"{fx_ms / fi_ms:.2f}x"
-                cg_ratio = f"{fx_ms / fi_cg:.2f}x" if fi_cg > 0 else "N/A"
+                cuda_graph_ratio = f"{fx_ms / fi_cuda_graph:.2f}x" if fi_cuda_graph > 0 else "N/A"
                 mem_save = f"{(1 - fi_pk / fx_pk) * 100:+.0f}%" if fx_pk > 0 else "N/A"
                 total_cmp += 1
                 if fi_ms < fx_ms:
                     fi_wins_perf += 1
-                if fi_cg > 0 and fi_cg < fx_ms:
-                    fi_wins_cg += 1
+                if fi_cuda_graph > 0 and fi_cuda_graph < fx_ms:
+                    fi_wins_cuda_graph += 1
                 if fi_pk < fx_pk:
                     fi_wins_mem += 1
             else:
                 ratio = "N/A"
-                cg_ratio = "N/A"
+                cuda_graph_ratio = "N/A"
                 mem_save = "N/A"
 
-            fi_cg_s = f"{fi_cg:>10.3f}" if fi_cg > 0 else f"{'N/A':>10}"
+            fi_cuda_graph_s = f"{fi_cuda_graph:>10.3f}" if fi_cuda_graph > 0 else f"{'N/A':>10}"
             fx_ms_s = f"{fx_ms:>9.3f}" if fx_ms > 0 else f"{'N/A':>9}"
             fx_pk_s = f"{fx_pk:>14.1f}" if fx_pk > 0 else f"{'N/A':>14}"
 
-            print(f"  {seq_len:>8} | {batch:>5} | {dbs:>7} | {fi_ms:>8.3f} | {fi_cg_s} | {fi_pk:>12.1f} | {fx_ms_s} | {fx_pk_s} | {ratio:>8} | {cg_ratio:>9} | {mem_save:>8}")
+            print(f"  {seq_len:>8} | {batch:>5} | {dbs:>7} | {fi_ms:>8.3f} | {fi_cuda_graph_s} | {fi_pk:>12.1f} | {fx_ms_s} | {fx_pk_s} | {ratio:>8} | {cuda_graph_ratio:>9} | {mem_save:>8}")
 
     # 统计
     print(f"\n  统计 ({total_cmp} 场有效对比):")
     if total_cmp > 0:
-        print(f"    性能 (no CG):  FlashInfer 胜出 {fi_wins_perf}/{total_cmp} 场")
-        print(f"    性能 (FI CG):  FlashInfer 胜出 {fi_wins_cg}/{total_cmp} 场")
+        print(f"    性能 (no cuda_graph):  FlashInfer 胜出 {fi_wins_perf}/{total_cmp} 场")
+        print(f"    性能 (FI cuda_graph):  FlashInfer 胜出 {fi_wins_cuda_graph}/{total_cmp} 场")
         print(f"    显存:          FlashInfer 胜出 {fi_wins_mem}/{total_cmp} 场")
     print(f"\n  注: 16K+ 序列使用 batch=1 避免 OOM")
 
