@@ -98,7 +98,10 @@ class TrtllmGenGemmRunner {
 
       if (options.mDtypeA == mOptions.eltType && options.mDtypeC == mOptions.outputType &&
           options.mTransposeMmaOutput == mOptions.transposeMmaOutput &&
-          options.mSfLayoutB == mOptions.sfLayoutB) {
+          options.mSfLayoutB == mOptions.sfLayoutB &&
+          options.mLayoutA == gemm::gemm::MatrixLayout::MajorK &&
+          options.mLayoutB ==
+              gemm::gemm::MatrixLayout::MajorK) {  // FIXME(siyuanf): expose matrix layout to user
         mPassingConfigIndices.push_back(i);
       }
     }
