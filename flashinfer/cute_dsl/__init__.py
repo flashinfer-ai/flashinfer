@@ -35,14 +35,6 @@ from .utils import (
     get_mma_sf_shape,
 )
 
-
-def is_cute_dsl_available() -> bool:
-    return (
-        importlib.util.find_spec("cutlass") is not None
-        and importlib.util.find_spec("cutlass.cute") is not None
-    )
-
-
 # Conditionally import CuTe-DSL kernels (including utils which requires cutlass)
 if is_cute_dsl_available():
     # Deprecated GEMM symbols: re-exported for backwards compatibility.
