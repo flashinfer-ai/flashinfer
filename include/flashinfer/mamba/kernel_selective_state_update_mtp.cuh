@@ -480,30 +480,34 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
                      ") for vertical algorithm");
     FLASHINFER_CHECK(params.nheads / params.ngroups <= 32, "HEADS_PER_GROUP (",
                      params.nheads / params.ngroups, ") must be <= 32 for vertical algorithm");
+    FLASHINFER_CHECK(params.dim % NUM_COMPUTE_WARPS == 0, "DIM (", params.dim,
+                     ") must be divisible by NUM_COMPUTE_WARPS (", NUM_COMPUTE_WARPS,
+                     ") for vertical algorithm");
 
-    constexpr int ROWS_PER_TILE = 16;
+    constexpr int NUM_IN_STAGES = 2;
     constexpr int NUM_OUT_STAGES = 3;
 
     dispatchRatio(
         params, std::integer_sequence<int, 1, 2, 4, 8, 16, 32>{}, [&]<int HEADS_PER_GROUP>() {
-          using sram_t = SharedStorageVertical<input_t, state_t, NTOKENS_MTP, HEADS_PER_GROUP,
-                                               ROWS_PER_TILE, DSTATE, NUM_OUT_STAGES>;
+          using sram_t = SharedStorageVertical<input_t, state_t, NTOKENS_MTP, HEADS_PER_GROUP, DIM,
+                                               DSTATE, NUM_IN_STAGES, NUM_OUT_STAGES>;
           constexpr size_t smem_size = sizeof(sram_t);
 
           auto func = selective_state_update_kernel_vertical_mtp<
               input_t, weight_t, matrixA_t, state_t, stateIndex_t, NTOKENS_MTP, DIM, DSTATE,
-              ROWS_PER_TILE, HEADS_PER_GROUP, NUM_OUT_STAGES>;
+              HEADS_PER_GROUP, NUM_IN_STAGES, NUM_OUT_STAGES>;
 
           dim3 grid(params.batch, params.ngroups);
           dim3 block(warpSize, NUM_WARPS);
 
+          // state descriptor: tile covers full DIM×DSTATE
           auto state_tensor = tma::buildNdDescriptor(
               typeid(state_t),
               /*shapes*/ {DSTATE, DIM, params.nheads, params.state_cache_size},
               /*strides*/ {1, DSTATE, DSTATE * DIM, params.state_stride_batch},
-              /*tiles*/ {DSTATE, ROWS_PER_TILE, 1, 1}, params.state);
+              /*tiles*/ {DSTATE, DIM, 1, 1}, params.state);
 
-          // B/C descriptor: 4D {dstate, ngroups, ntokens, batch}, box {DSTATE, 1, NTOKENS_MTP, 1}
+          // B/C descriptor (unchanged)
           auto B_tensor = tma::buildNdDescriptor(
               typeid(input_t),
               {(uint64_t)DSTATE, (uint64_t)params.ngroups, (uint64_t)params.ntokens_mtp,
@@ -518,8 +522,7 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
               {1, (uint64_t)DSTATE, (uint64_t)params.C_stride_mtp, (uint64_t)params.C_stride_batch},
               {DSTATE, 1, NTOKENS_MTP, 1}, params.C);
 
-          // intermediate_states descriptor: 5D {dstate, dim, nheads, ntokens, icache_size}
-          // When intermediate_states is null, build a dummy descriptor from state (never used).
+          // intermediate_states descriptor: tile covers full DIM×DSTATE
           CUtensorMap istate_tensor;
           if (params.intermediate_states) {
             istate_tensor = tma::buildNdDescriptor(
@@ -531,16 +534,25 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
                 {1, (uint64_t)DSTATE, (uint64_t)(DIM * DSTATE),
                  (uint64_t)params.nheads * DIM * DSTATE,
                  (uint64_t)params.intermediate_state_stride_batch},
-                /*tiles*/ {DSTATE, ROWS_PER_TILE, 1, 1, 1}, params.intermediate_states);
+                /*tiles*/ {DSTATE, DIM, 1, 1, 1}, params.intermediate_states);
           } else {
-            // Dummy descriptor — never accessed; kernel guards on intermediate_states != nullptr
             istate_tensor = state_tensor;
           }
+
+          // x descriptor: tile covers full DIM, all tokens
+          auto x_tensor = tma::buildNdDescriptor(
+              typeid(input_t),
+              /*shapes*/
+              {(uint64_t)DIM, (uint64_t)params.nheads, (uint64_t)params.ntokens_mtp,
+               (uint64_t)params.batch},
+              /*strides*/
+              {1, (uint64_t)DIM, (uint64_t)params.x_stride_mtp, (uint64_t)params.x_stride_batch},
+              /*tiles*/ {DIM, 1, NTOKENS_MTP, 1}, params.x);
 
           FLASHINFER_CUDA_CHECK(
               cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
           func<<<grid, block, smem_size, stream>>>(params, state_tensor, B_tensor, C_tensor,
-                                                   istate_tensor);
+                                                   istate_tensor, x_tensor);
         });
     return;
   }
