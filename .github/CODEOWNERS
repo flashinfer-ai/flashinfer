@@ -4,6 +4,7 @@
 # Minimum commits threshold: 1
 
 benchmarks/ @bkryu @jiahanc @yzh119 @Anerudhan @kahyunnam
+benchmarks/gdn/ @kahyunnam
 benchmarks/routines/ @bkryu @nv-yunzheq @Anerudhan @jiahanc @cyx-6
 ci/ @cyx-6 @yzh119 @nvmbreughe
 ci/scripts/ @cyx-6
@@ -29,6 +30,9 @@ flashinfer/cudnn/ @Anerudhan @yzh119 @bkryu @cyx-6
 flashinfer/cute_dsl/ @aleozlx @bkryu @yzh119 @kaixih @jimmyzho
 flashinfer/dsv3_ops/ @nv-yunzheq @jiahanc @nvmbreughe
 flashinfer/fused_moe/ @nv-yunzheq @yzh119 @jiahanc @djmmoss @cyx-6
+flashinfer/gdn_decode.py @kahyunnam
+flashinfer/gdn_prefill.py @kahyunnam
+flashinfer/gdn_kernels/ @kahyunnam
 flashinfer/gemm/ @bkryu @nvmbreughe @yongwww @jimmyzho
 flashinfer/jit/ @yzh119 @jimmyzho @cyx-6 @jiahanc @aleozlx
 flashinfer/jit/attention/ @yzh119 @jimmyzho @cyx-6
@@ -46,3 +50,4 @@ include/flashinfer/gemm/ @ttyio @yongwww @yzh119 @nvmbreughe @aleozlx
 include/flashinfer/trtllm/ @yzh119 @jiahanc @aleozlx @joker-eph @IwakuraRein
 profiler/ @cyx-6
 scripts/ @yzh119 @nvmbreughe @kahyunnam @jimmyzho @dierksen
+tests/gdn/ @kahyunnam
