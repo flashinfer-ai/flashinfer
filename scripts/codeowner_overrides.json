@@ -1,6 +1,6 @@
 {
   "scripts/codeownder_overrides.js": ["@ci-users"],
-  
+
   "flashinfer/attention.py": ["@flashinfer-ai/attention-owners"],
   "include/flashinfer/attention": ["@flashinfer-ai/attention-owners"],
   "csrc/fmha_v2": ["@flashinfer-ai/attention-owners"],
