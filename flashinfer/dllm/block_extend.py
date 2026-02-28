@@ -56,7 +56,7 @@ from ..utils import MaskMode, is_sm90a_supported
 #
 # ════════════════════════════════════════════════════════════════════════════════════
 
-BLOCK_EXPANDING_V2_VARIANT_DECL = r"""
+BLOCK_EXTEND_V2_VARIANT_DECL = r"""
 // ════════════════════════════════════════════════════════════════════════════════════
 // BlockExpandingAttentionV2: 使用原生 MaskMode::kBlockExpanding
 // ════════════════════════════════════════════════════════════════════════════════════
@@ -112,17 +112,7 @@ struct BlockExpandingAttentionV2 : AttentionVariantBase {
 #
 # ════════════════════════════════════════════════════════════════════════════════════
 
-BLOCK_EXPANDING_V2_WITH_OFFSET_VARIANT_DECL = r"""
-// ════════════════════════════════════════════════════════════════════════════════════
-// BlockExpandingAttentionV2WithOffset: 支持 q_offset 的 Block Expanding Attention
-// ════════════════════════════════════════════════════════════════════════════════════
-//
-// 用于增量 Chunk Prefill 场景：
-//   - 每个 chunk 的 Q 有全局偏移 q_offset
-//   - kernel 通过 params.get_q_block_expanding_offset() 获取偏移
-//   - position_mask 内部计算：(q_global_block >= k_block)
-//
-// ════════════════════════════════════════════════════════════════════════════════════
+BLOCK_EXTEND_V2_WITH_OFFSET_VARIANT_DECL = r"""
 
 struct BlockExpandingAttentionV2WithOffset : AttentionVariantBase {
   static constexpr bool use_softmax = true;
@@ -141,17 +131,6 @@ struct BlockExpandingAttentionV2WithOffset : AttentionVariantBase {
     window_left = kv_len;  // 不使用 sliding window
   }
 
-  // ════════════════════════════════════════════════════════════════════════════════
-  // LogitsMask: 直接返回 true
-  // ════════════════════════════════════════════════════════════════════════════════
-  //
-  // CUDA kernel 已原生支持 MaskMode::kBlockExpanding:
-  //   - q_offset 通过 params.get_q_block_expanding_offset(batch_idx) 获取
-  //   - position_mask 内部处理：(q_global_block >= k_block)
-  //
-  // 因此 LogitsMask 只需返回 true
-  //
-  // ════════════════════════════════════════════════════════════════════════════════
   REGISTER_LOGITS_MASK(params, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
     return true;  // kernel 的 position_mask 已处理 Block Expanding + q_offset 逻辑
   });
@@ -163,10 +142,6 @@ struct BlockExpandingAttentionV2WithOffset : AttentionVariantBase {
 };
 """
 
-
-# ════════════════════════════════════════════════════════════════════════════════════
-# 统一的 AOT 工具函数
-# ════════════════════════════════════════════════════════════════════════════════════
 
 def _get_aot_path(uri: str) -> Path:
     """获取 AOT 预编译路径 (统一接口)"""
@@ -189,10 +164,6 @@ def _get_dtype_str(dtype: torch.dtype) -> str:
     }.get(dtype, "fp16")
 
 
-# ════════════════════════════════════════════════════════════════════════════════════
-# 模块 URI 生成函数
-# ════════════════════════════════════════════════════════════════════════════════════
-
 def _get_module_uri_v2(head_dim: int, dtype: torch.dtype) -> str:
     """生成 V2 模块的唯一标识符"""
     return f"single_prefill_block_expanding_v2_hd{head_dim}_{_get_dtype_str(dtype)}"
@@ -213,19 +184,16 @@ def _get_module_uri_v3_with_offset(head_dim: int, dtype: torch.dtype) -> str:
     return _get_module_uri_with_offset(head_dim, dtype, "fa3")
 
 
-# ════════════════════════════════════════════════════════════════════════════════════
-# 模块缓存
-# ════════════════════════════════════════════════════════════════════════════════════
 _MODULE_CACHE_V2 = {}
 _MODULE_CACHE_WITH_OFFSET = {}  # key = (head_dim, dtype, backend)
 
 
-def get_block_expanding_module_v2(
+def get_block_extend_module_v2(
     head_dim: int = 128,
     dtype: torch.dtype = torch.float16,
 ):
     """
-    获取优化版 Block Expanding Attention 模块
+    获取优化版 Block Extend Attention 模块
     
     与 v1 的区别:
     - 使用 MaskMode::kBlockExpanding 触发 tile 级跳过优化
@@ -276,7 +244,7 @@ def get_block_expanding_module_v2(
         additional_scalar_names=["sm_scale", "dllm_block_size"],
         additional_scalar_dtypes=["double", "int64_t"],
         variant_name="BlockExpandingAttentionV2",
-        variant_decl=BLOCK_EXPANDING_V2_VARIANT_DECL,
+        variant_decl=BLOCK_EXTEND_V2_VARIANT_DECL,
         mask_modes=[4],  # ★ kBlockExpanding = 4
     )
     module = spec.build_and_load()
@@ -298,19 +266,7 @@ def get_block_expanding_module_v2(
 #
 # ════════════════════════════════════════════════════════════════════════════════════
 
-BLOCK_EXPANDING_V3_WITH_OFFSET_VARIANT_DECL = r"""
-// ════════════════════════════════════════════════════════════════════════════════════
-// BlockExpandingAttentionV3WithOffset: FA3 (Hopper SM90) 版本的 Block Expanding Attention
-// ════════════════════════════════════════════════════════════════════════════════════
-//
-// FA3 kernel 已原生支持 MaskMode::kBlockExpanding:
-//   - get_num_kv_tiles(): 根据 Block Expanding 边界精确计算 KV 有效范围
-//   - mma_f16(): BLOCK_EXPANDING 模板参数控制 n_masking_steps 和 col_limit
-//   - position_mask: (q_global_block >= k_block) && (kv_idx < kv_len)
-//
-// 因此 LogitsTransform 只需返回 logits，让 kernel 的原生 mask 逻辑生效
-//
-// ════════════════════════════════════════════════════════════════════════════════════
+BLOCK_EXTEND_V3_WITH_OFFSET_VARIANT_DECL = r"""
 
 struct BlockExpandingAttentionV3WithOffset : AttentionVariantBase {
   float sm_scale_log2;
@@ -328,18 +284,6 @@ struct BlockExpandingAttentionV3WithOffset : AttentionVariantBase {
     return OnlineSoftmax<NUM_ROWS_PER_THREAD, /*WITH_SCALE=*/true>(sm_scale_log2);
   }
 
-  // ════════════════════════════════════════════════════════════════════════════════
-  // LogitsTransform: 直接返回 logits
-  // ════════════════════════════════════════════════════════════════════════════════
-  //
-  // FA3 kernel 已原生支持 MaskMode::kBlockExpanding:
-  //   - BLOCK_EXPANDING 模板参数启用后，mma_f16 会计算 block_expanding_col_limit
-  //   - n_masking_steps 类似 CAUSAL，只在边界 tile 上检查 mask
-  //   - 完全不可见的 KV tiles 被 get_num_kv_tiles() 跳过
-  //
-  // 因此 LogitsTransform 只需返回 logits
-  //
-  // ════════════════════════════════════════════════════════════════════════════════
   REGISTER_LOGITS_TRANSFORM(params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
     return logits;  // kernel 的原生 BLOCK_EXPANDING mask 已处理
   });
@@ -347,13 +291,13 @@ struct BlockExpandingAttentionV3WithOffset : AttentionVariantBase {
 """
 
 
-def get_block_expanding_module_with_offset(
+def get_block_extend_module_with_offset(
     head_dim: int = 128,
     dtype: torch.dtype = torch.float16,
     backend: str = "fa2",
 ):
     """
-    获取支持 q_offset/kv_offset 的 Block Expanding Attention 模块
+    获取支持 q_offset/kv_offset 的 Block Extend Attention 模块
     
     Args:
         head_dim: Head 维度
@@ -399,10 +343,10 @@ def get_block_expanding_module_with_offset(
     # JIT 模式
     if backend == "fa3":
         variant_name = "BlockExpandingAttentionV3WithOffset"
-        variant_decl = BLOCK_EXPANDING_V3_WITH_OFFSET_VARIANT_DECL
+        variant_decl = BLOCK_EXTEND_V3_WITH_OFFSET_VARIANT_DECL
     else:
         variant_name = "BlockExpandingAttentionV2WithOffset"
-        variant_decl = BLOCK_EXPANDING_V2_WITH_OFFSET_VARIANT_DECL
+        variant_decl = BLOCK_EXTEND_V2_WITH_OFFSET_VARIANT_DECL
     
     spec = gen_customize_single_prefill_module(
         backend=backend,
@@ -425,7 +369,7 @@ def get_block_expanding_module_with_offset(
     _MODULE_CACHE_WITH_OFFSET[cache_key] = module
     return module
 
-def block_expanding_attention_v2(
+def block_extend_attention_v2(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -434,7 +378,7 @@ def block_expanding_attention_v2(
     return_lse: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
-    Block Expanding Attention with Tile-Level Skip Optimization (V2)
+    Block Extend Attention with Tile-Level Skip Optimization (V2)
     
     相比 v1 的优化:
     1. 利用 MaskMode::kCausal 的 tile 级跳过优化
@@ -454,17 +398,8 @@ def block_expanding_attention_v2(
         sm_scale = 1.0 / math.sqrt(head_dim)
     
     # 获取优化版模块
-    module = get_block_expanding_module_v2(head_dim=head_dim, dtype=dtype)
-    
-    # ════════════════════════════════════════════════════════════════════════════
-    # 关键优化：使用 MaskMode::kBlockExpanding 触发原生 tile 级跳过
-    # ════════════════════════════════════════════════════════════════════════════
-    #
-    # kernel 会按 Block Expanding 边界精确计算 num_iterations 和 mask_iteration：
-    #   - num_iterations: 根据 ((q_tile_end - 1) / B + 1) * B 计算 KV 有效范围
-    #   - mask_iteration: 根据 (q_tile_start / B) * B 确定无需 mask 检查的 tiles
-    #   - 完全不可见的 KV tiles 会被跳过（不加载、不 MMA）
-    # ════════════════════════════════════════════════════════════════════════════
+    module = get_block_extend_module_v2(head_dim=head_dim, dtype=dtype)
+
     return single_prefill_with_kv_cache_with_jit_module(
         module,
         q, k, v,
@@ -475,7 +410,7 @@ def block_expanding_attention_v2(
     )
 
 
-def block_expanding_attention_with_offset(
+def block_extend_attention_with_offset(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -487,7 +422,7 @@ def block_expanding_attention_with_offset(
     backend: str = "auto",
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
-    Block Expanding Attention with Q and KV Offset Support
+    Block Extend Attention with Q and KV Offset Support
     
     支持增量 Chunk Prefill 和 Cascade Current Chunk 场景。
     
@@ -536,7 +471,7 @@ def block_expanding_attention_with_offset(
     if backend == "auto":
         backend = "fa3" if is_sm90a_supported(q.device) else "fa2"
     
-    module = get_block_expanding_module_with_offset(head_dim=head_dim, dtype=dtype, backend=backend)
+    module = get_block_extend_module_with_offset(head_dim=head_dim, dtype=dtype, backend=backend)
     
     return single_prefill_with_kv_cache_with_jit_module(
         module,
@@ -550,8 +485,7 @@ def block_expanding_attention_with_offset(
     )
 
 
-# 保留旧接口作为别名（向后兼容）
-def block_expanding_attention_v2_with_offset(
+def block_extend_attention_v2_with_offset(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -561,13 +495,12 @@ def block_expanding_attention_v2_with_offset(
     sm_scale: Optional[float] = None,
     return_lse: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    """[Deprecated] Use block_expanding_attention_with_offset(backend='fa2') instead."""
-    return block_expanding_attention_with_offset(
+    """[Deprecated] Use block_extend_attention_with_offset(backend='fa2') instead."""
+    return block_extend_attention_with_offset(
         q, k, v, dllm_block_size, q_offset, kv_offset, sm_scale, return_lse, backend="fa2"
     )
 
-
-def block_expanding_attention_v3_with_offset(
+def block_extend_attention_v3_with_offset(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -577,24 +510,12 @@ def block_expanding_attention_v3_with_offset(
     sm_scale: Optional[float] = None,
     return_lse: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    """[Deprecated] Use block_expanding_attention_with_offset(backend='fa3') instead."""
-    return block_expanding_attention_with_offset(
+    """[Deprecated] Use block_extend_attention_with_offset(backend='fa3') instead."""
+    return block_extend_attention_with_offset(
         q, k, v, dllm_block_size, q_offset, kv_offset, sm_scale, return_lse, backend="fa3"
     )
 
-
-# ════════════════════════════════════════════════════════════════════════════════════
-# FA2 Cascade 版本：Current Chunk (causal=True) + Prefix (causal=False) + merge_state
-# ════════════════════════════════════════════════════════════════════════════════════
-#
-# 类似 SGLang 的 Cascade Attention 实现：
-#   - 当 chunk_size = dllm_block_size 时，causal mask ≡ block expanding mask
-#   - 使用标准 FlashInfer API，无需 custom_mask
-#   - 前缀全可见 (Q 的 block >= 所有 prefix 的 block)
-#
-# ════════════════════════════════════════════════════════════════════════════════════
-
-def block_expanding_cascade(
+def block_extend_cascade(
     q: torch.Tensor,
     k_current: torch.Tensor,
     v_current: torch.Tensor,
@@ -606,9 +527,9 @@ def block_expanding_cascade(
     backend: str = "auto",
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
-    Cascade Block Expanding Attention (Single Request)
+    Cascade Block Extend Attention (Single Request)
     
-    使用原生 Block Expanding mask 实现 Cascade Attention。
+    使用原生 Block Extend mask 实现 Cascade Attention。
     
     三阶段 Cascade:
     1. Current Chunk: Q attend to K_current/V_current (Block Expanding mask)
@@ -651,20 +572,9 @@ def block_expanding_cascade(
     has_prefix = k_prefix is not None and v_prefix is not None
     prefix_len = k_prefix.size(0) if has_prefix else 0
     
-    # ════════════════════════════════════════════════════════════════════════════
-    # 阶段 1: Current Chunk (Block Expanding mask)
-    # ════════════════════════════════════════════════════════════════════════════
-    #
-    # 使用原生 Block Expanding mask:
-    #   - q_offset = prefix_len (Q 的全局位置从 prefix_len 开始)
-    #   - kv_offset = prefix_len (K_current 的全局位置也从 prefix_len 开始)
-    #   - mask[q, k] = (q_global / B) >= (kv_global / B)
-    #
-    # ════════════════════════════════════════════════════════════════════════════
-    
     # 没有 prefix 时直接返回，有 prefix 时需要 merge 所以强制 return_lse=True
     if not has_prefix:
-        return block_expanding_attention_with_offset(
+        return block_extend_attention_with_offset(
             q, k_current, v_current,
             dllm_block_size=dllm_block_size,
             q_offset=prefix_len,  # = 0
@@ -674,7 +584,7 @@ def block_expanding_cascade(
             backend=backend,
         )
     
-    o1, s1 = block_expanding_attention_with_offset(
+    o1, s1 = block_extend_attention_with_offset(
         q, k_current, v_current,
         dllm_block_size=dllm_block_size,
         q_offset=prefix_len,
@@ -683,27 +593,14 @@ def block_expanding_cascade(
         return_lse=True,  # merge 需要 lse
         backend=backend,
     )
-    
-    # ════════════════════════════════════════════════════════════════════════════
-    # 阶段 2: Prefix (causal=False, 全可见)
-    # ════════════════════════════════════════════════════════════════════════════
-    #
-    # Q 的全局位置 >= prefix 的末尾位置，所以：
-    #   - Q_block >= 所有 prefix 的 K_block
-    #   - Block Expanding mask 对 prefix 全部为 1
-    #   - 使用 causal=False (全可见)
-    #
-    # ════════════════════════════════════════════════════════════════════════════
+
     o2, s2 = single_prefill_with_kv_cache(
         q, k_prefix, v_prefix,
         causal=False,  # prefix 全可见
         sm_scale=sm_scale,
         return_lse=True,
     )
-    
-    # ════════════════════════════════════════════════════════════════════════════
-    # 阶段 3: Merge State (in-place 合并)
-    # ════════════════════════════════════════════════════════════════════════════
+
     merge_state_in_place(o1, s1, o2, s2)
     
     if return_lse:

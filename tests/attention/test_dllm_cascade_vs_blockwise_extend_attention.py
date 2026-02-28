@@ -6,7 +6,7 @@
    - Paged: 访问之前所有 cached blocks (causal=False)
    - merge_state: 合并两个阶段的 softmax 状态
 
-2. Batch Prefill + kBlockExpanding + q_offset (FlashInfer 优化方式)
+2. Batch Prefill + kBlockExtend + q_offset (FlashInfer 优化方式)
    - 单次 kernel launch
    - tile 级别跳过无效计算
 
@@ -28,13 +28,13 @@ from flashinfer import (
     single_prefill_with_kv_cache,
 )
 from flashinfer.dllm import (
-    BatchBlockExpandingPagedQOffsetWrapper,
-    BatchBlockExpandingRaggedQOffsetWrapper,
-    block_expanding_attention_v2_with_offset,
+    BatchBlockExtendPagedOffsetWrapper,
+    BatchBlockExtendRaggedOffsetWrapper,
+    block_extend_attention_v2_with_offset,
 )
 
 
-def compute_block_expanding_reference(
+def compute_block_extend_reference(
     q: torch.Tensor,
     k: torch.Tensor, 
     v: torch.Tensor,
@@ -43,7 +43,7 @@ def compute_block_expanding_reference(
     sm_scale: float = None,
 ) -> torch.Tensor:
     """
-    使用 custom_mask 计算 Block Expanding Attention 的参考结果
+    使用 custom_mask 计算 Block Extend Attention 的参考结果
     
     Mask 规则: mask[q, k] = ((q_local + q_offset) // B) >= (k // B)
     
@@ -81,7 +81,7 @@ def compute_block_expanding_reference(
         sm_scale=sm_scale,
     )
 
-def test_incremental_batchprefill_step_by_step_with_cg(
+def test_incremental_batchprefill_step_by_step_with_cuda_graph(
     num_requests: int = 4,
     tokens_per_request: int = 256,
     dllm_block_size: int = 32,
@@ -99,7 +99,7 @@ def test_incremental_batchprefill_step_by_step_with_cg(
     关键点:
       1. 必须分步执行，每个 chunk step 依赖前一个 step 的 KV cache
       2. SGLang Cascade 强制 chunk_size = dllm_block_size
-      3. BatchBlockExpanding 可以使用更大的 chunk_size，减少 step 数
+      3. BatchBlockExtend 可以使用更大的 chunk_size，减少 step 数
       4. 启用 CUDA Graph 减少 CPU 开销和 kernel launch 延迟
     
     CUDA Graph 注意事项:
@@ -132,7 +132,7 @@ def test_incremental_batchprefill_step_by_step_with_cg(
     print(f"\n关键特性:")
     print(f"  - 分步执行: 每个 step 必须等待前一个 step 完成")
     print(f"  - SGLang 强制 chunk_size = dllm_block_size = {dllm_block_size}")
-    print(f"  - BatchBlockExpanding 可以使用更大的 chunk_size")
+    print(f"  - BatchBlockExtend 可以使用更大的 chunk_size")
     print(f"  - CUDA Graph: 减少 CPU 开销和 kernel launch 延迟")
     
     # 数据准备，生成每个 request 的完整 Q, K, V
@@ -173,7 +173,7 @@ def test_incremental_batchprefill_step_by_step_with_cg(
     ref_outputs = []
     for step_idx in range(baseline_num_chunks):
         q_offset = step_idx * baseline_chunk_size
-        ref_out = compute_block_expanding_reference(
+        ref_out = compute_block_extend_reference(
             qs_chunks[req_idx][step_idx],
             k_cumul_verify[step_idx],
             v_cumul_verify[step_idx],
@@ -191,7 +191,7 @@ def test_incremental_batchprefill_step_by_step_with_cg(
         kv_indptr = torch.tensor([0, kv_len], dtype=torch.int32, device=device)
         q_offset_tensor = torch.tensor([step_idx * baseline_chunk_size], dtype=torch.int32, device=device)
         
-        wrapper = BatchBlockExpandingRaggedQOffsetWrapper(
+        wrapper = BatchBlockExtendRaggedOffsetWrapper(
             workspace_verify, kv_layout="NHD", dllm_block_size=dllm_block_size
         )
         wrapper.plan(
@@ -211,7 +211,7 @@ def test_incremental_batchprefill_step_by_step_with_cg(
     tol = 1e-2
     bbe_max_diff = max((bbe_outputs[i] - ref_outputs[i]).abs().max().item() for i in range(baseline_num_chunks))
     bbe_pass = bbe_max_diff < tol
-    print(f"\n  [BBE] BatchBlockExpandingRaggedQOffsetWrapper:")
+    print(f"\n  [BBE] BatchBlockExtendRaggedOffsetWrapper:")
     print(f"        max_diff = {bbe_max_diff:.6f}, tolerance = {tol}")
     print(f"        {' PASS' if bbe_pass else ' FAIL'}")
     
@@ -333,26 +333,26 @@ def test_incremental_batchprefill_step_by_step_with_cg(
     with torch.cuda.graph(cm_graph, stream=cm_stream):
         run_custom_mask_pipeline()
     
-    # Warmup with CG
+    # Warmup with cuda_graph
     for _ in range(warmup_iters):
         cm_graph.replay()
     torch.cuda.synchronize()
     
     # Benchmark
-    print(f"  Benchmark (with CG)...")
+    print(f"  Benchmark (with cuda_graph)...")
     start = time.perf_counter()
     for _ in range(bench_iters):
         cm_graph.replay()
     torch.cuda.synchronize()
-    cm_cg_time = (time.perf_counter() - start) / bench_iters * 1000
+    cm_cuda_graph_time = (time.perf_counter() - start) / bench_iters * 1000
     
     results["custom_mask_baseline"] = {
-        "time_cg_ms": cm_cg_time,
+        "time_cuda_graph_ms": cm_cuda_graph_time,
         "chunk_size": baseline_chunk_size,
         "num_steps": baseline_num_chunks,
         "method": "Custom Mask (Baseline 2)",
     }
-    print(f"  => CG: {cm_cg_time:.3f} ms ({cm_cg_time/baseline_num_chunks:.3f} ms/step × {baseline_num_chunks} steps)")
+    print(f"  => cuda_graph: {cm_cuda_graph_time:.3f} ms ({cm_cuda_graph_time/baseline_num_chunks:.3f} ms/step × {baseline_num_chunks} steps)")
     
     del cm_graph, custom_mask_buffers, cm_wrappers
     torch.cuda.empty_cache()
@@ -495,31 +495,31 @@ def test_incremental_batchprefill_step_by_step_with_cg(
     with torch.cuda.graph(cascade_graph, stream=cascade_stream):
         run_cascade_pipeline()
     
-    # Warmup with CG
+    # Warmup with cuda_graph
     for _ in range(warmup_iters):
         cascade_graph.replay()
     torch.cuda.synchronize()
     
     # Benchmark
-    print(f"  Benchmark (with CG)...")
+    print(f"  Benchmark (with cuda_graph)...")
     start = time.perf_counter()
     for _ in range(bench_iters):
         cascade_graph.replay()
     torch.cuda.synchronize()
-    cascade_cg_time = (time.perf_counter() - start) / bench_iters * 1000
+    cascade_cuda_graph_time = (time.perf_counter() - start) / bench_iters * 1000
     
     results["cascade_baseline"] = {
-        "time_cg_ms": cascade_cg_time,
+        "time_cuda_graph_ms": cascade_cuda_graph_time,
         "chunk_size": baseline_chunk_size,
         "num_steps": baseline_num_chunks,
         "method": "SGLang Cascade (Baseline 1)",
     }
-    print(f"  => CG: {cascade_cg_time:.3f} ms ({cascade_cg_time/baseline_num_chunks:.3f} ms/step × {baseline_num_chunks} steps)")
+    print(f"  => cuda_graph: {cascade_cuda_graph_time:.3f} ms ({cascade_cuda_graph_time/baseline_num_chunks:.3f} ms/step × {baseline_num_chunks} steps)")
     
     del cascade_wrappers_current, cascade_wrappers_prefix, cascade_graph
     torch.cuda.empty_cache()
 
-    # 对比方案: BatchBlockExpanding Ragged (不同 chunk_size) + CUDA Graph
+    # 对比方案: BatchBlockExtend Ragged (不同 chunk_size) + CUDA Graph
 
     for test_chunk_size in chunk_sizes:
         if tokens_per_request % test_chunk_size != 0:
@@ -529,7 +529,7 @@ def test_incremental_batchprefill_step_by_step_with_cg(
         num_chunks_bbe = tokens_per_request // test_chunk_size
         
         print(f"\n{'-'*60}")
-        print(f"[BatchBlockExpanding Ragged] chunk_size = {test_chunk_size}")
+        print(f"[BatchBlockExtend Ragged] chunk_size = {test_chunk_size}")
         print(f"{'-'*60}")
         print(f"  num_steps: {num_chunks_bbe} (比 Baseline 少 {baseline_num_chunks - num_chunks_bbe} 步)")
         print(f"  每个 step 内 kernel: 1 次")
@@ -584,7 +584,7 @@ def test_incremental_batchprefill_step_by_step_with_cg(
         print(f"  创建 wrappers 并完成 plan...")
         bbe_wrappers = []
         for step_idx in range(num_chunks_bbe):
-            wrapper = BatchBlockExpandingRaggedQOffsetWrapper(
+            wrapper = BatchBlockExtendRaggedOffsetWrapper(
                 torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device),
                 kv_layout="NHD", dllm_block_size=dllm_block_size
             )
@@ -632,26 +632,26 @@ def test_incremental_batchprefill_step_by_step_with_cg(
         with torch.cuda.graph(bbe_graph, stream=bbe_stream):
             run_bbe_pipeline()
         
-        # Warmup with CG
+        # Warmup with cuda_graph
         for _ in range(warmup_iters):
             bbe_graph.replay()
         torch.cuda.synchronize()
         
         # Benchmark
-        print(f"  Benchmark (with CG)...")
+        print(f"  Benchmark (with cuda_graph)...")
         start = time.perf_counter()
         for _ in range(bench_iters):
             bbe_graph.replay()
         torch.cuda.synchronize()
-        bbe_cg_time = (time.perf_counter() - start) / bench_iters * 1000
+        bbe_cuda_graph_time = (time.perf_counter() - start) / bench_iters * 1000
         
         results[f"bbe_chunk{test_chunk_size}"] = {
-            "time_cg_ms": bbe_cg_time,
+            "time_cuda_graph_ms": bbe_cuda_graph_time,
             "chunk_size": test_chunk_size,
             "num_steps": num_chunks_bbe,
-            "method": "BatchBlockExpanding Ragged",
+            "method": "BatchBlockExtend Ragged",
         }
-        print(f"  => CG: {bbe_cg_time:.3f} ms ({bbe_cg_time/num_chunks_bbe:.3f} ms/step × {num_chunks_bbe} steps)")
+        print(f"  => cuda_graph: {bbe_cuda_graph_time:.3f} ms ({bbe_cuda_graph_time/num_chunks_bbe:.3f} ms/step × {num_chunks_bbe} steps)")
         
         del bbe_wrappers, bbe_graph
         torch.cuda.empty_cache()
@@ -776,13 +776,13 @@ def test_incremental_batchprefill_step_by_step_with_cg(
         with torch.cuda.graph(cm_graph_var, stream=cm_stream_var):
             run_cm_pipeline_var()
         
-        # Warmup with CG
+        # Warmup with cuda_graph
         for _ in range(warmup_iters):
             cm_graph_var.replay()
         torch.cuda.synchronize()
         
         # Benchmark
-        print(f"  Benchmark (with CG)...")
+        print(f"  Benchmark (with cuda_graph)...")
         start = time.perf_counter()
         for _ in range(bench_iters):
             cm_graph_var.replay()
@@ -790,12 +790,12 @@ def test_incremental_batchprefill_step_by_step_with_cg(
         cm_var_time = (time.perf_counter() - start) / bench_iters * 1000
         
         results[f"cm_chunk{test_chunk_size}"] = {
-            "time_cg_ms": cm_var_time,
+            "time_cuda_graph_ms": cm_var_time,
             "chunk_size": test_chunk_size,
             "num_steps": num_chunks_cm,
             "method": "Custom Mask",
         }
-        print(f"  => CG: {cm_var_time:.3f} ms ({cm_var_time/num_chunks_cm:.3f} ms/step × {num_chunks_cm} steps)")
+        print(f"  => cuda_graph: {cm_var_time:.3f} ms ({cm_var_time/num_chunks_cm:.3f} ms/step × {num_chunks_cm} steps)")
         
         del cm_graph_var, cm_mask_buffers_var, cm_wrappers_var
         torch.cuda.empty_cache()
@@ -804,8 +804,8 @@ def test_incremental_batchprefill_step_by_step_with_cg(
     print(f"结果汇总 (分步执行 + CUDA Graph)")
     print(f"{'='*80}")
     
-    cm_baseline_time = results["custom_mask_baseline"]["time_cg_ms"]
-    cascade_baseline_time = results["cascade_baseline"]["time_cg_ms"]
+    cm_baseline_time = results["custom_mask_baseline"]["time_cuda_graph_ms"]
+    cascade_baseline_time = results["cascade_baseline"]["time_cuda_graph_ms"]
     
 
     print(f"\n说明:")
@@ -814,40 +814,40 @@ def test_incremental_batchprefill_step_by_step_with_cg(
     print(f"  - vs Base1: 相对于 SGLang Cascade 的加速比")
     print(f"  - vs Base2: 相对于 Custom Mask 的加速比")
     
-    print(f"\n{'方案':<40} | {'chunk':>6} | {'steps':>6} | {'CG(ms)':>10} | {'ms/step':>10} | {'vs Base1':>10} | {'vs Base2':>10}")
+    print(f"\n{'方案':<40} | {'chunk':>6} | {'steps':>6} | {'cuda_graph(ms)':>10} | {'ms/step':>10} | {'vs Base1':>10} | {'vs Base2':>10}")
     print(f"{'-'*40}-+-{'-'*6}-+-{'-'*6}-+-{'-'*10}-+-{'-'*10}-+-{'-'*10}-+-{'-'*10}")
     
     # Baseline 1: SGLang Cascade
     r = results["cascade_baseline"]
-    print(f"{'[Baseline 1] SGLang Cascade':<40} | {r['chunk_size']:>6} | {r['num_steps']:>6} | {r['time_cg_ms']:>10.3f} | {r['time_cg_ms']/r['num_steps']:>10.3f} | {'1.00x':>10} | {cm_baseline_time/cascade_baseline_time:>9.2f}x")
+    print(f"{'[Baseline 1] SGLang Cascade':<40} | {r['chunk_size']:>6} | {r['num_steps']:>6} | {r['time_cuda_graph_ms']:>10.3f} | {r['time_cuda_graph_ms']/r['num_steps']:>10.3f} | {'1.00x':>10} | {cm_baseline_time/cascade_baseline_time:>9.2f}x")
     
     # Baseline 2: Custom Mask
     r = results["custom_mask_baseline"]
-    print(f"{'[Baseline 2] Custom Mask':<40} | {r['chunk_size']:>6} | {r['num_steps']:>6} | {r['time_cg_ms']:>10.3f} | {r['time_cg_ms']/r['num_steps']:>10.3f} | {cascade_baseline_time/cm_baseline_time:>9.2f}x | {'1.00x':>10}")
+    print(f"{'[Baseline 2] Custom Mask':<40} | {r['chunk_size']:>6} | {r['num_steps']:>6} | {r['time_cuda_graph_ms']:>10.3f} | {r['time_cuda_graph_ms']/r['num_steps']:>10.3f} | {cascade_baseline_time/cm_baseline_time:>9.2f}x | {'1.00x':>10}")
     
 
     cm_keys = [k for k in results.keys() if k.startswith("cm_chunk")]
     cm_keys_sorted = sorted(cm_keys, key=lambda k: results[k]["chunk_size"])
     for key in cm_keys_sorted:
         r = results[key]
-        speedup_vs_cascade = cascade_baseline_time / r["time_cg_ms"]
-        speedup_vs_cm = cm_baseline_time / r["time_cg_ms"]
-        print(f"{'Custom Mask':<40} | {r['chunk_size']:>6} | {r['num_steps']:>6} | {r['time_cg_ms']:>10.3f} | {r['time_cg_ms']/r['num_steps']:>10.3f} | {speedup_vs_cascade:>9.2f}x | {speedup_vs_cm:>9.2f}x")
+        speedup_vs_cascade = cascade_baseline_time / r["time_cuda_graph_ms"]
+        speedup_vs_cm = cm_baseline_time / r["time_cuda_graph_ms"]
+        print(f"{'Custom Mask':<40} | {r['chunk_size']:>6} | {r['num_steps']:>6} | {r['time_cuda_graph_ms']:>10.3f} | {r['time_cuda_graph_ms']/r['num_steps']:>10.3f} | {speedup_vs_cascade:>9.2f}x | {speedup_vs_cm:>9.2f}x")
     
 
     bbe_keys = [k for k in results.keys() if k.startswith("bbe_chunk")]
     bbe_keys_sorted = sorted(bbe_keys, key=lambda k: results[k]["chunk_size"])
     for key in bbe_keys_sorted:
         r = results[key]
-        speedup_vs_cascade = cascade_baseline_time / r["time_cg_ms"]
-        speedup_vs_cm = cm_baseline_time / r["time_cg_ms"]
-        print(f"{'BatchBlockExpanding Ragged':<40} | {r['chunk_size']:>6} | {r['num_steps']:>6} | {r['time_cg_ms']:>10.3f} | {r['time_cg_ms']/r['num_steps']:>10.3f} | {speedup_vs_cascade:>9.2f}x | {speedup_vs_cm:>9.2f}x")
+        speedup_vs_cascade = cascade_baseline_time / r["time_cuda_graph_ms"]
+        speedup_vs_cm = cm_baseline_time / r["time_cuda_graph_ms"]
+        print(f"{'BatchBlockExtend Ragged':<40} | {r['chunk_size']:>6} | {r['num_steps']:>6} | {r['time_cuda_graph_ms']:>10.3f} | {r['time_cuda_graph_ms']/r['num_steps']:>10.3f} | {speedup_vs_cascade:>9.2f}x | {speedup_vs_cm:>9.2f}x")
 
     
     return results
 
 
-def test_incremental_singlereq_prefill_step_by_step_with_cg(
+def test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
     tokens_per_request: int = 512,
     dllm_block_size: int = 32,
     chunk_sizes: list = None,
@@ -873,8 +873,8 @@ def test_incremental_singlereq_prefill_step_by_step_with_cg(
       每个 step: 2-3 kernel launches
     
     对比方案:
-      1. block_expanding_attention_v2_with_offset + CUDA Graph
-      2. BatchBlockExpandingRaggedQOffsetWrapper + CUDA Graph
+      1. block_extend_attention_v2_with_offset + CUDA Graph
+      2. BatchBlockExtendRaggedOffsetWrapper + CUDA Graph
       每个 step: 1 kernel launch
     """
     if chunk_sizes is None:
@@ -934,7 +934,7 @@ def test_incremental_singlereq_prefill_step_by_step_with_cg(
     ref_outputs = []
     for step_idx in range(num_chunks):
         q_offset = step_idx * baseline_chunk_size
-        ref_out = compute_block_expanding_reference(
+        ref_out = compute_block_extend_reference(
             qs_chunks[step_idx],
             k_cumul_list[step_idx],
             v_cumul_list[step_idx],
@@ -948,7 +948,7 @@ def test_incremental_singlereq_prefill_step_by_step_with_cg(
     v2_outputs = []
     for step_idx in range(num_chunks):
         q_offset = step_idx * baseline_chunk_size
-        v2_out = block_expanding_attention_v2_with_offset(
+        v2_out = block_extend_attention_v2_with_offset(
             qs_chunks[step_idx],
             k_cumul_list[step_idx],
             v_cumul_list[step_idx],
@@ -962,7 +962,7 @@ def test_incremental_singlereq_prefill_step_by_step_with_cg(
     v2_max_diff = max((v2_outputs[i] - ref_outputs[i]).abs().max().item() for i in range(num_chunks))
     tol = 1e-3
     v2_pass = v2_max_diff < tol
-    print(f"\n  [V2] block_expanding_attention_v2_with_offset:")
+    print(f"\n  [V2] block_extend_attention_v2_with_offset:")
     print(f"       max_diff = {v2_max_diff:.6f}, tolerance = {tol}")
     print(f"       {' PASS' if v2_pass else ' FAIL'}")
     
@@ -975,7 +975,7 @@ def test_incremental_singlereq_prefill_step_by_step_with_cg(
         kv_indptr = torch.tensor([0, kv_len], dtype=torch.int32, device=device)
         q_offset_tensor = torch.tensor([step_idx * baseline_chunk_size], dtype=torch.int32, device=device)
         
-        wrapper = BatchBlockExpandingRaggedQOffsetWrapper(
+        wrapper = BatchBlockExtendRaggedOffsetWrapper(
             workspace_verify, kv_layout="NHD", dllm_block_size=dllm_block_size
         )
         wrapper.plan(
@@ -994,7 +994,7 @@ def test_incremental_singlereq_prefill_step_by_step_with_cg(
     # 验证 BBE
     bbe_max_diff = max((bbe_outputs[i] - ref_outputs[i]).abs().max().item() for i in range(num_chunks))
     bbe_pass = bbe_max_diff < tol
-    print(f"\n  [BBE] BatchBlockExpandingRaggedQOffsetWrapper:")
+    print(f"\n  [BBE] BatchBlockExtendRaggedOffsetWrapper:")
     print(f"        max_diff = {bbe_max_diff:.6f}, tolerance = {tol}")
     print(f"        {' PASS' if bbe_pass else ' FAIL'}")
     
@@ -1066,26 +1066,26 @@ def test_incremental_singlereq_prefill_step_by_step_with_cg(
     with torch.cuda.graph(cm_graph, stream=cm_stream):
         run_custom_mask_pipeline()
     
-    # Warmup with CG
+    # Warmup with cuda_graph
     for _ in range(warmup_iters):
         cm_graph.replay()
     torch.cuda.synchronize()
     
     # Benchmark
-    print(f"  Benchmark (with CG)...")
+    print(f"  Benchmark (with cuda_graph)...")
     start = time.perf_counter()
     for _ in range(bench_iters):
         cm_graph.replay()
     torch.cuda.synchronize()
-    cm_cg_time = (time.perf_counter() - start) / bench_iters * 1000
+    cm_cuda_graph_time = (time.perf_counter() - start) / bench_iters * 1000
     
     results["custom_mask_baseline"] = {
-        "time_cg_ms": cm_cg_time,
+        "time_cuda_graph_ms": cm_cuda_graph_time,
         "chunk_size": baseline_chunk_size,
         "num_steps": num_chunks,
         "method": "Custom Mask (Baseline 2)",
     }
-    print(f"  => CG: {cm_cg_time:.3f} ms ({cm_cg_time/num_chunks:.3f} ms/step × {num_chunks} steps)")
+    print(f"  => cuda_graph: {cm_cuda_graph_time:.3f} ms ({cm_cuda_graph_time/num_chunks:.3f} ms/step × {num_chunks} steps)")
     
     del cm_graph, custom_mask_buffers
     torch.cuda.empty_cache()
@@ -1166,13 +1166,13 @@ def test_incremental_singlereq_prefill_step_by_step_with_cg(
         with torch.cuda.graph(cm_graph_var, stream=cm_stream_var):
             run_cm_pipeline()
         
-        # Warmup with CG
+        # Warmup with cuda_graph
         for _ in range(warmup_iters):
             cm_graph_var.replay()
         torch.cuda.synchronize()
         
         # Benchmark
-        print(f"  Benchmark (with CG)...")
+        print(f"  Benchmark (with cuda_graph)...")
         start = time.perf_counter()
         for _ in range(bench_iters):
             cm_graph_var.replay()
@@ -1180,12 +1180,12 @@ def test_incremental_singlereq_prefill_step_by_step_with_cg(
         cm_var_time = (time.perf_counter() - start) / bench_iters * 1000
         
         results[f"cm_chunk{test_chunk_size}"] = {
-            "time_cg_ms": cm_var_time,
+            "time_cuda_graph_ms": cm_var_time,
             "chunk_size": test_chunk_size,
             "num_steps": num_steps_cm,
             "method": "Custom Mask",
         }
-        print(f"  => CG: {cm_var_time:.3f} ms ({cm_var_time/num_steps_cm:.3f} ms/step × {num_steps_cm} steps)")
+        print(f"  => cuda_graph: {cm_var_time:.3f} ms ({cm_var_time/num_steps_cm:.3f} ms/step × {num_steps_cm} steps)")
         
         del cm_graph_var, cm_mask_buffers
         torch.cuda.empty_cache()
@@ -1312,31 +1312,31 @@ def test_incremental_singlereq_prefill_step_by_step_with_cg(
     with torch.cuda.graph(cascade_graph, stream=cascade_stream):
         run_cascade_pipeline()
     
-    # Warmup with CG
+    # Warmup with cuda_graph
     for _ in range(warmup_iters):
         cascade_graph.replay()
     torch.cuda.synchronize()
     
     # Benchmark
-    print(f"  Benchmark (with CG)...")
+    print(f"  Benchmark (with cuda_graph)...")
     start = time.perf_counter()
     for _ in range(bench_iters):
         cascade_graph.replay()
     torch.cuda.synchronize()
-    cascade_cg_time = (time.perf_counter() - start) / bench_iters * 1000
+    cascade_cuda_graph_time = (time.perf_counter() - start) / bench_iters * 1000
     
     results["cascade_baseline"] = {
-        "time_cg_ms": cascade_cg_time,
+        "time_cuda_graph_ms": cascade_cuda_graph_time,
         "chunk_size": baseline_chunk_size,
         "num_steps": num_chunks,
         "method": "SGLang Cascade (Baseline 1)",
     }
-    print(f"  => CG: {cascade_cg_time:.3f} ms ({cascade_cg_time/num_chunks:.3f} ms/step × {num_chunks} steps)")
+    print(f"  => cuda_graph: {cascade_cuda_graph_time:.3f} ms ({cascade_cuda_graph_time/num_chunks:.3f} ms/step × {num_chunks} steps)")
     
     del cascade_wrappers_current, cascade_wrappers_prefix, cascade_graph
     torch.cuda.empty_cache()
 
-    # 方案 1: block_expanding_attention_v2_with_offset + CUDA Graph
+    # 方案 1: block_extend_attention_v2_with_offset + CUDA Graph
     for test_chunk_size in chunk_sizes:
         if tokens_per_request % test_chunk_size != 0:
             print(f"\n[跳过] chunk_size={test_chunk_size} 无法整除 tokens_per_request={tokens_per_request}")
@@ -1345,7 +1345,7 @@ def test_incremental_singlereq_prefill_step_by_step_with_cg(
         num_steps = tokens_per_request // test_chunk_size
         
         print(f"\n{'-'*60}")
-        print(f"[V2] block_expanding_attention_v2_with_offset (chunk_size={test_chunk_size})")
+        print(f"[V2] block_extend_attention_v2_with_offset (chunk_size={test_chunk_size})")
         print(f"{'-'*60}")
         print(f"  num_steps: {num_steps} (比 Baseline 少 {num_chunks - num_steps} 步)")
         print(f"  每个 step 内 kernel: 1 次")
@@ -1362,7 +1362,7 @@ def test_incremental_singlereq_prefill_step_by_step_with_cg(
         
         def run_v2_pipeline():
             for step_idx in range(num_steps):
-                v2_output.copy_(block_expanding_attention_v2_with_offset(
+                v2_output.copy_(block_extend_attention_v2_with_offset(
                     qs_v2[step_idx], k_cumul_v2[step_idx], v_cumul_v2[step_idx],
                     dllm_block_size=dllm_block_size,
                     q_offset=step_idx * test_chunk_size,
@@ -1394,32 +1394,32 @@ def test_incremental_singlereq_prefill_step_by_step_with_cg(
         with torch.cuda.graph(v2_graph, stream=v2_stream):
             run_v2_pipeline()
         
-        # Warmup with CG
+        # Warmup with cuda_graph
         for _ in range(warmup_iters):
             v2_graph.replay()
         torch.cuda.synchronize()
         
         # Benchmark
-        print(f"  Benchmark (with CG)...")
+        print(f"  Benchmark (with cuda_graph)...")
         start = time.perf_counter()
         for _ in range(bench_iters):
             v2_graph.replay()
         torch.cuda.synchronize()
-        v2_cg_time = (time.perf_counter() - start) / bench_iters * 1000
+        v2_cuda_graph_time = (time.perf_counter() - start) / bench_iters * 1000
         
         results[f"v2_chunk{test_chunk_size}"] = {
-            "time_cg_ms": v2_cg_time,
+            "time_cuda_graph_ms": v2_cuda_graph_time,
             "chunk_size": test_chunk_size,
             "num_steps": num_steps,
             "method": "V2 + CUDA Graph",
         }
-        print(f"  => CG: {v2_cg_time:.3f} ms ({v2_cg_time/num_steps:.3f} ms/step × {num_steps} steps)")
+        print(f"  => cuda_graph: {v2_cuda_graph_time:.3f} ms ({v2_cuda_graph_time/num_steps:.3f} ms/step × {num_steps} steps)")
         
         del v2_graph
         torch.cuda.empty_cache()
     
 
-    # 方案 2: BatchBlockExpandingRaggedQOffsetWrapper + CUDA Graph
+    # 方案 2: BatchBlockExtendRaggedOffsetWrapper + CUDA Graph
     for test_chunk_size in chunk_sizes:
         if tokens_per_request % test_chunk_size != 0:
             continue
@@ -1427,7 +1427,7 @@ def test_incremental_singlereq_prefill_step_by_step_with_cg(
         num_steps = tokens_per_request // test_chunk_size
         
         print(f"\n{'-'*60}")
-        print(f"[BBE] BatchBlockExpandingRaggedQOffsetWrapper (chunk_size={test_chunk_size})")
+        print(f"[BBE] BatchBlockExtendRaggedOffsetWrapper (chunk_size={test_chunk_size})")
         print(f"{'-'*60}")
         print(f"  num_steps: {num_steps} (比 Baseline 少 {num_chunks - num_steps} 步)")
         print(f"  每个 step 内 kernel: 1 次")
@@ -1452,7 +1452,7 @@ def test_incremental_singlereq_prefill_step_by_step_with_cg(
             kv_indptr = torch.tensor([0, kv_len], dtype=torch.int32, device=device)
             q_offset = torch.tensor([step_idx * test_chunk_size], dtype=torch.int32, device=device)
             
-            wrapper = BatchBlockExpandingRaggedQOffsetWrapper(
+            wrapper = BatchBlockExtendRaggedOffsetWrapper(
                 torch.empty(workspace_size, dtype=torch.uint8, device=device),
                 kv_layout="NHD", dllm_block_size=dllm_block_size
             )
@@ -1502,26 +1502,26 @@ def test_incremental_singlereq_prefill_step_by_step_with_cg(
         with torch.cuda.graph(bbe_graph, stream=bbe_stream):
             run_bbe_pipeline()
         
-        # Warmup with CG
+        # Warmup with cuda_graph
         for _ in range(warmup_iters):
             bbe_graph.replay()
         torch.cuda.synchronize()
         
         # Benchmark
-        print(f"  Benchmark (with CG)...")
+        print(f"  Benchmark (with cuda_graph)...")
         start = time.perf_counter()
         for _ in range(bench_iters):
             bbe_graph.replay()
         torch.cuda.synchronize()
-        bbe_cg_time = (time.perf_counter() - start) / bench_iters * 1000
+        bbe_cuda_graph_time = (time.perf_counter() - start) / bench_iters * 1000
         
         results[f"bbe_chunk{test_chunk_size}"] = {
-            "time_cg_ms": bbe_cg_time,
+            "time_cuda_graph_ms": bbe_cuda_graph_time,
             "chunk_size": test_chunk_size,
             "num_steps": num_steps,
             "method": "BBE Ragged + CUDA Graph",
         }
-        print(f"  => CG: {bbe_cg_time:.3f} ms ({bbe_cg_time/num_steps:.3f} ms/step × {num_steps} steps)")
+        print(f"  => cuda_graph: {bbe_cuda_graph_time:.3f} ms ({bbe_cuda_graph_time/num_steps:.3f} ms/step × {num_steps} steps)")
         
         del bbe_wrappers, bbe_graph
         torch.cuda.empty_cache()
@@ -1534,8 +1534,8 @@ def test_incremental_singlereq_prefill_step_by_step_with_cg(
     cascade_baseline_r = results.get("cascade_baseline", {})
     cascade_skipped = cascade_baseline_r.get("skipped", False)
     
-    cm_baseline_time = cm_baseline_r.get("time_cg_ms", float('nan'))
-    cascade_baseline_time = cascade_baseline_r.get("time_cg_ms", float('nan'))
+    cm_baseline_time = cm_baseline_r.get("time_cuda_graph_ms", float('nan'))
+    cascade_baseline_time = cascade_baseline_r.get("time_cuda_graph_ms", float('nan'))
     
     # 表头说明
     print(f"\n说明:")
@@ -1544,7 +1544,7 @@ def test_incremental_singlereq_prefill_step_by_step_with_cg(
     print(f"  - vs Base1: 相对于 SGLang Cascade 的加速比")
     print(f"  - vs Base2: 相对于 Custom Mask 的加速比")
     
-    print(f"\n{'方案':<45} | {'chunk':>6} | {'steps':>6} | {'CG(ms)':>10} | {'ms/step':>10} | {'vs Base1':>10} | {'vs Base2':>10}")
+    print(f"\n{'方案':<45} | {'chunk':>6} | {'steps':>6} | {'cuda_graph(ms)':>10} | {'ms/step':>10} | {'vs Base1':>10} | {'vs Base2':>10}")
     print(f"{'-'*45}-+-{'-'*6}-+-{'-'*6}-+-{'-'*10}-+-{'-'*10}-+-{'-'*10}-+-{'-'*10}")
     
     # Baseline 1: SGLang Cascade
@@ -1552,7 +1552,7 @@ def test_incremental_singlereq_prefill_step_by_step_with_cg(
         print(f"{'[Baseline 1] SGLang Cascade':<45} | {cascade_baseline_r['chunk_size']:>6} | {cascade_baseline_r['num_steps']:>6} | {'SKIPPED':>10} | {'-':>10} | {'-':>10} | {'-':>10}")
     else:
         r = cascade_baseline_r
-        print(f"{'[Baseline 1] SGLang Cascade':<45} | {r['chunk_size']:>6} | {r['num_steps']:>6} | {r['time_cg_ms']:>10.3f} | {r['time_cg_ms']/r['num_steps']:>10.3f} | {'1.00x':>10} | {cm_baseline_time/cascade_baseline_time:>9.2f}x")
+        print(f"{'[Baseline 1] SGLang Cascade':<45} | {r['chunk_size']:>6} | {r['num_steps']:>6} | {r['time_cuda_graph_ms']:>10.3f} | {r['time_cuda_graph_ms']/r['num_steps']:>10.3f} | {'1.00x':>10} | {cm_baseline_time/cascade_baseline_time:>9.2f}x")
     
     # Baseline 2: Custom Mask
     r = cm_baseline_r
@@ -1560,52 +1560,52 @@ def test_incremental_singlereq_prefill_step_by_step_with_cg(
         vs_base1_str = "-"
     else:
         vs_base1_str = f"{cascade_baseline_time/cm_baseline_time:>9.2f}x"
-    print(f"{'[Baseline 2] Custom Mask':<45} | {r['chunk_size']:>6} | {r['num_steps']:>6} | {r['time_cg_ms']:>10.3f} | {r['time_cg_ms']/r['num_steps']:>10.3f} | {vs_base1_str:>10} | {'1.00x':>10}")
+    print(f"{'[Baseline 2] Custom Mask':<45} | {r['chunk_size']:>6} | {r['num_steps']:>6} | {r['time_cuda_graph_ms']:>10.3f} | {r['time_cuda_graph_ms']/r['num_steps']:>10.3f} | {vs_base1_str:>10} | {'1.00x':>10}")
     
     # Custom Mask 不同 chunk_size 结果 (按 chunk_size 递增排序)
     cm_keys = sorted([k for k in results.keys() if k.startswith("cm_chunk")],
                      key=lambda k: results[k]["chunk_size"])
     for key in cm_keys:
         r = results[key]
-        speedup_vs_cm = cm_baseline_time / r["time_cg_ms"]
+        speedup_vs_cm = cm_baseline_time / r["time_cuda_graph_ms"]
         if cascade_skipped:
             speedup_vs_cascade_str = "-"
         else:
-            speedup_vs_cascade = cascade_baseline_time / r["time_cg_ms"]
+            speedup_vs_cascade = cascade_baseline_time / r["time_cuda_graph_ms"]
             speedup_vs_cascade_str = f"{speedup_vs_cascade:>9.2f}x"
-        print(f"{'Custom Mask':<45} | {r['chunk_size']:>6} | {r['num_steps']:>6} | {r['time_cg_ms']:>10.3f} | {r['time_cg_ms']/r['num_steps']:>10.3f} | {speedup_vs_cascade_str:>10} | {speedup_vs_cm:>9.2f}x")
+        print(f"{'Custom Mask':<45} | {r['chunk_size']:>6} | {r['num_steps']:>6} | {r['time_cuda_graph_ms']:>10.3f} | {r['time_cuda_graph_ms']/r['num_steps']:>10.3f} | {speedup_vs_cascade_str:>10} | {speedup_vs_cm:>9.2f}x")
     
     # V2 结果 (按 chunk_size 递增排序)
     v2_keys = sorted([k for k in results.keys() if k.startswith("v2_chunk")], 
                      key=lambda k: results[k]["chunk_size"])
     for key in v2_keys:
         r = results[key]
-        speedup_vs_cm = cm_baseline_time / r["time_cg_ms"]
+        speedup_vs_cm = cm_baseline_time / r["time_cuda_graph_ms"]
         if cascade_skipped:
             speedup_vs_cascade_str = "-"
         else:
-            speedup_vs_cascade = cascade_baseline_time / r["time_cg_ms"]
+            speedup_vs_cascade = cascade_baseline_time / r["time_cuda_graph_ms"]
             speedup_vs_cascade_str = f"{speedup_vs_cascade:>9.2f}x"
-        print(f"{'V2 block_expanding_attention':<45} | {r['chunk_size']:>6} | {r['num_steps']:>6} | {r['time_cg_ms']:>10.3f} | {r['time_cg_ms']/r['num_steps']:>10.3f} | {speedup_vs_cascade_str:>10} | {speedup_vs_cm:>9.2f}x")
+        print(f"{'V2 block_extend_attention':<45} | {r['chunk_size']:>6} | {r['num_steps']:>6} | {r['time_cuda_graph_ms']:>10.3f} | {r['time_cuda_graph_ms']/r['num_steps']:>10.3f} | {speedup_vs_cascade_str:>10} | {speedup_vs_cm:>9.2f}x")
     
     # BBE 结果 (按 chunk_size 递增排序)
     bbe_keys = sorted([k for k in results.keys() if k.startswith("bbe_chunk")],
                       key=lambda k: results[k]["chunk_size"])
     for key in bbe_keys:
         r = results[key]
-        speedup_vs_cm = cm_baseline_time / r["time_cg_ms"]
+        speedup_vs_cm = cm_baseline_time / r["time_cuda_graph_ms"]
         if cascade_skipped:
             speedup_vs_cascade_str = "-"
         else:
-            speedup_vs_cascade = cascade_baseline_time / r["time_cg_ms"]
+            speedup_vs_cascade = cascade_baseline_time / r["time_cuda_graph_ms"]
             speedup_vs_cascade_str = f"{speedup_vs_cascade:>9.2f}x"
-        print(f"{'BBE BatchBlockExpandingRagged':<45} | {r['chunk_size']:>6} | {r['num_steps']:>6} | {r['time_cg_ms']:>10.3f} | {r['time_cg_ms']/r['num_steps']:>10.3f} | {speedup_vs_cascade_str:>10} | {speedup_vs_cm:>9.2f}x")
+        print(f"{'BBE BatchBlockExtendRagged':<45} | {r['chunk_size']:>6} | {r['num_steps']:>6} | {r['time_cuda_graph_ms']:>10.3f} | {r['time_cuda_graph_ms']/r['num_steps']:>10.3f} | {speedup_vs_cascade_str:>10} | {speedup_vs_cm:>9.2f}x")
 
     
     return results
 
 
-def test_fa2_fa3_block_expanding_vs_causal(
+def test_fa2_fa3_block_extending_vs_causal(
     num_requests: int = 4,
     chunk_sizes: list = None,
     tokens_per_request: int = 2048,
@@ -1618,22 +1618,22 @@ def test_fa2_fa3_block_expanding_vs_causal(
     verbose: bool = False,
 ):
     """
-    FA2 vs FA3 BlockExpanding Mask vs FA3 Causal Mask 性能对比
+    FA2 vs FA3 BlockExtend Mask vs FA3 Causal Mask 性能对比
     
     测试场景 (增量 Prefill):
       - 每个 request 的总 tokens 固定 (tokens_per_request)
       - 按 chunk_size 分多步执行增量 prefill
-      - 每个 step 累积 KV，实现 Block Expanding Mask
+      - 每个 step 累积 KV，实现 Block Extend Mask
       - 使用 CUDA Graph 减少 kernel launch overhead
     
     对比方案:
       1. FA3 Causal Mask (baseline) - BatchPrefillWithRaggedKVCacheWrapper
-      2. FA2 BlockExpanding Mask - BatchBlockExpandingRaggedQOffsetWrapper (backend="fa2")
-      3. FA3 BlockExpanding Mask - BatchBlockExpandingRaggedQOffsetWrapper (backend="fa3")
+      2. FA2 BlockExtend Mask - BatchBlockExtendRaggedOffsetWrapper (backend="fa2")
+      3. FA3 BlockExtend Mask - BatchBlockExtendRaggedOffsetWrapper (backend="fa3")
     
     Mask 规则:
       - Causal: mask[q, k] = (q + q_offset) >= k
-      - BlockExpanding: mask[q, k] = ((q + q_offset) // B) >= (k // B)
+      - BlockExtend: mask[q, k] = ((q + q_offset) // B) >= (k // B)
     """
     if chunk_sizes is None:
         chunk_sizes = [32, 64, 128, 256]
@@ -1643,7 +1643,7 @@ def test_fa2_fa3_block_expanding_vs_causal(
     sm_scale = 1.0 / (head_dim ** 0.5)
     
     print(f"\n{'='*90}")
-    print(f"FA2 vs FA3 BlockExpanding vs Causal - 增量 Prefill 性能对比")
+    print(f"FA2 vs FA3 BlockExtend vs Causal - 增量 Prefill 性能对比")
     print(f"{'='*90}")
     print(f"配置:")
     print(f"  num_requests        = {num_requests}")
@@ -1721,17 +1721,17 @@ def test_fa2_fa3_block_expanding_vs_causal(
         workspace_size = 256 * 1024 * 1024
         output_buffer = torch.empty(num_requests * chunk_size, num_heads, head_dim, dtype=dtype, device=device)
 
-        # [0] 精度验证: FA2 vs FA3 BlockExpanding
-        print(f"  [精度验证] 对比 FA2 vs FA3 BlockExpanding 输出...")
+        # [0] 精度验证: FA2 vs FA3 BlockExtend
+        print(f"  [精度验证] 对比 FA2 vs FA3 BlockExtend 输出...")
         
         # 创建临时 wrappers 进行精度验证
-        fa2_verify_wrapper = BatchBlockExpandingRaggedQOffsetWrapper(
+        fa2_verify_wrapper = BatchBlockExtendRaggedOffsetWrapper(
             torch.empty(workspace_size, dtype=torch.uint8, device=device),
             kv_layout="NHD",
             dllm_block_size=dllm_block_size,
             backend="fa2",
         )
-        fa3_verify_wrapper = BatchBlockExpandingRaggedQOffsetWrapper(
+        fa3_verify_wrapper = BatchBlockExtendRaggedOffsetWrapper(
             torch.empty(workspace_size, dtype=torch.uint8, device=device),
             kv_layout="NHD",
             dllm_block_size=dllm_block_size,
@@ -1777,7 +1777,7 @@ def test_fa2_fa3_block_expanding_vs_causal(
         print(f"  [精度验证] FA2 vs FA3 max_diff = {max_diff_all_steps:.6f} {status}")
         
         if not precision_ok:
-            print(f"  [警告] FA2 和 FA3 BlockExpanding 输出差异过大，性能数据可能不可信！")
+            print(f"  [警告] FA2 和 FA3 BlockExtend 输出差异过大，性能数据可能不可信！")
         
         del fa2_verify_wrapper, fa3_verify_wrapper
         torch.cuda.empty_cache()
@@ -1823,7 +1823,7 @@ def test_fa2_fa3_block_expanding_vs_causal(
         with torch.cuda.graph(causal_graph, stream=causal_stream):
             run_causal_pipeline()
         
-        # Warmup with CG
+        # Warmup with cuda_graph
         for _ in range(warmup_iters):
             causal_graph.replay()
         torch.cuda.synchronize()
@@ -1840,11 +1840,11 @@ def test_fa2_fa3_block_expanding_vs_causal(
         del causal_wrappers, causal_graph
         torch.cuda.empty_cache()
 
-        # [2] FA2 BlockExpanding Mask
+        # [2] FA2 BlockExtend Mask
         print(f"  [FA2 BlockExp] 创建 wrappers...")
         fa2_be_wrappers = []
         for step_idx in range(num_steps):
-            wrapper = BatchBlockExpandingRaggedQOffsetWrapper(
+            wrapper = BatchBlockExtendRaggedOffsetWrapper(
                 torch.empty(workspace_size, dtype=torch.uint8, device=device),
                 kv_layout="NHD",
                 dllm_block_size=dllm_block_size,
@@ -1883,7 +1883,7 @@ def test_fa2_fa3_block_expanding_vs_causal(
         with torch.cuda.graph(fa2_graph, stream=fa2_stream):
             run_fa2_be_pipeline()
         
-        # Warmup with CG
+        # Warmup with cuda_graph
         for _ in range(warmup_iters):
             fa2_graph.replay()
         torch.cuda.synchronize()
@@ -1902,12 +1902,12 @@ def test_fa2_fa3_block_expanding_vs_causal(
         torch.cuda.empty_cache()
         
         # ================================================================
-        # [3] FA3 BlockExpanding Mask
+        # [3] FA3 BlockExtend Mask
         # ================================================================
         print(f"  [FA3 BlockExp] 创建 wrappers...")
         fa3_be_wrappers = []
         for step_idx in range(num_steps):
-            wrapper = BatchBlockExpandingRaggedQOffsetWrapper(
+            wrapper = BatchBlockExtendRaggedOffsetWrapper(
                 torch.empty(workspace_size, dtype=torch.uint8, device=device),
                 kv_layout="NHD",
                 dllm_block_size=dllm_block_size,
@@ -1946,7 +1946,7 @@ def test_fa2_fa3_block_expanding_vs_causal(
         with torch.cuda.graph(fa3_graph, stream=fa3_stream):
             run_fa3_be_pipeline()
         
-        # Warmup with CG
+        # Warmup with cuda_graph
         for _ in range(warmup_iters):
             fa3_graph.replay()
         torch.cuda.synchronize()
@@ -1992,10 +1992,10 @@ def test_fa2_fa3_block_expanding_vs_causal(
     
     print(f"\n说明:")
     print(f"  - 场景: 增量 Prefill，固定总 tokens = {tokens_per_request}，按 chunk_size 分多步执行")
-    print(f"  - FA2/Causal: FA2 BlockExpanding 相对于 FA3 Causal 的加速比 (>1 表示 FA2 BE 更快)")
-    print(f"  - FA3/Causal: FA3 BlockExpanding 相对于 FA3 Causal 的加速比 (>1 表示 FA3 BE 更快)")
-    print(f"  - FA3/FA2: FA3 BlockExpanding 相对于 FA2 BlockExpanding 的加速比 (>1 表示 FA3 更快)")
-    print(f"  - BlockExpanding mask 比 Causal mask 计算量更少 (tile 级别跳过)，理论上应该更快")
+    print(f"  - FA2/Causal: FA2 BlockExtend 相对于 FA3 Causal 的加速比 (>1 表示 FA2 BE 更快)")
+    print(f"  - FA3/Causal: FA3 BlockExtend 相对于 FA3 Causal 的加速比 (>1 表示 FA3 BE 更快)")
+    print(f"  - FA3/FA2: FA3 BlockExtend 相对于 FA2 BlockExtend 的加速比 (>1 表示 FA3 更快)")
+    print(f"  - BlockExtend mask 比 Causal mask 计算量更少 (tile 级别跳过)，理论上应该更快")
     
     return results
 
@@ -2012,9 +2012,9 @@ def test_dllm_precision_vs_custom_mask_fa2(
       - 多请求: BatchPrefillWithRaggedKVCacheWrapper + custom_mask (FA2)
     
     被测对象 (第31-33行导入的三个 DLLM 组件):
-      1. BatchBlockExpandingRaggedQOffsetWrapper
-      2. BatchBlockExpandingPagedQOffsetWrapper  
-      3. block_expanding_attention_v2_with_offset
+      1. BatchBlockExtendRaggedOffsetWrapper
+      2. BatchBlockExtendPagedOffsetWrapper  
+      3. block_extend_attention_v2_with_offset
     
     测试覆盖:
       - 数据类型: fp16, bf16
@@ -2133,9 +2133,9 @@ def test_dllm_precision_vs_custom_mask_fa2(
         print(f"{'='*100}")
         print(f"参考实现: single_prefill_with_kv_cache + custom_mask (FA2)")
         print(f"被测对象:")
-        print(f"  1. BatchBlockExpandingRaggedQOffsetWrapper (batch_size=1) - FA2 后端")
-        print(f"  2. BatchBlockExpandingRaggedQOffsetWrapper (batch_size=1) - FA3 后端")
-        print(f"  3. block_expanding_attention_v2_with_offset")
+        print(f"  1. BatchBlockExtendRaggedOffsetWrapper (batch_size=1) - FA2 后端")
+        print(f"  2. BatchBlockExtendRaggedOffsetWrapper (batch_size=1) - FA3 后端")
+        print(f"  3. block_extend_attention_v2_with_offset")
         
         single_req_results = []
         
@@ -2180,14 +2180,14 @@ def test_dllm_precision_vs_custom_mask_fa2(
                 "head_dim": head_dim,
             }
 
-            # 被测 1 & 2: BatchBlockExpandingRaggedQOffsetWrapper (FA2 和 FA3 后端)
+            # 被测 1 & 2: BatchBlockExtendRaggedOffsetWrapper (FA2 和 FA3 后端)
             qo_indptr = torch.tensor([0, qo_len], dtype=torch.int32, device=device)
             kv_indptr = torch.tensor([0, kv_len], dtype=torch.int32, device=device)
             q_offset_tensor = torch.tensor([q_offset], dtype=torch.int32, device=device)
             
             for backend in backends:
                 workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
-                wrapper = BatchBlockExpandingRaggedQOffsetWrapper(
+                wrapper = BatchBlockExtendRaggedOffsetWrapper(
                     workspace, kv_layout="NHD", dllm_block_size=dllm_block_size, backend=backend
                 )
                 wrapper.plan(
@@ -2213,8 +2213,8 @@ def test_dllm_precision_vs_custom_mask_fa2(
                 
                 del workspace, wrapper
 
-            # 被测 3: block_expanding_attention_v2_with_offset
-            v2_output = block_expanding_attention_v2_with_offset(
+            # 被测 3: block_extend_attention_v2_with_offset
+            v2_output = block_extend_attention_v2_with_offset(
                 q, k, v,
                 dllm_block_size=dllm_block_size,
                 q_offset=q_offset,
@@ -2255,14 +2255,14 @@ def test_dllm_precision_vs_custom_mask_fa2(
             pass_count = sum(1 for r in single_req_results if r[f"bbe_{backend}_pass"])
             max_diff_all = max(r[f"bbe_{backend}_max_diff"] for r in single_req_results)
             mean_diff_all = sum(r[f"bbe_{backend}_mean_diff"] for r in single_req_results) / total_tests
-            print(f"  BatchBlockExpandingRaggedQOffsetWrapper ({backend.upper()}): {pass_count}/{total_tests} PASS")
+            print(f"  BatchBlockExtendRaggedOffsetWrapper ({backend.upper()}): {pass_count}/{total_tests} PASS")
             print(f"    max_diff (all tests): {max_diff_all:.6f}")
             print(f"    mean_diff (avg):      {mean_diff_all:.6f}")
         
         v2_pass_count = sum(1 for r in single_req_results if r["v2_pass"])
         v2_max_diff_all = max(r["v2_max_diff"] for r in single_req_results)
         v2_mean_diff_all = sum(r["v2_mean_diff"] for r in single_req_results) / total_tests
-        print(f"  block_expanding_attention_v2_with_offset: {v2_pass_count}/{total_tests} PASS")
+        print(f"  block_extend_attention_v2_with_offset: {v2_pass_count}/{total_tests} PASS")
         print(f"    max_diff (all tests): {v2_max_diff_all:.6f}")
         print(f"    mean_diff (avg):      {v2_mean_diff_all:.6f}")
         
@@ -2290,8 +2290,8 @@ def test_dllm_precision_vs_custom_mask_fa2(
         print(f"{'='*100}")
         print(f"参考实现: BatchPrefillWithRaggedKVCacheWrapper + custom_mask (FA2)")
         print(f"被测对象:")
-        print(f"  1. BatchBlockExpandingRaggedQOffsetWrapper - FA2 后端")
-        print(f"  2. BatchBlockExpandingRaggedQOffsetWrapper - FA3 后端")
+        print(f"  1. BatchBlockExtendRaggedOffsetWrapper - FA2 后端")
+        print(f"  2. BatchBlockExtendRaggedOffsetWrapper - FA3 后端")
         
         multi_req_results = []
         
@@ -2348,7 +2348,7 @@ def test_dllm_precision_vs_custom_mask_fa2(
             }
             
             for backend in backends:
-                bbe_wrapper = BatchBlockExpandingRaggedQOffsetWrapper(
+                bbe_wrapper = BatchBlockExtendRaggedOffsetWrapper(
                     torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device),
                     kv_layout="NHD", dllm_block_size=dllm_block_size, backend=backend
                 )
@@ -2456,7 +2456,7 @@ def test_dllm_precision_vs_custom_mask_fa2(
             q_offsets = torch.tensor([q_offset], dtype=torch.int32, device=device)
             
             for backend in backends:
-                paged_wrapper = BatchBlockExpandingPagedQOffsetWrapper(
+                paged_wrapper = BatchBlockExtendPagedOffsetWrapper(
                     torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device),
                     kv_layout="NHD", dllm_block_size=dllm_block_size, backend=backend
                 )
@@ -2575,7 +2575,7 @@ def test_cascade_interfaces_perf(
     对比两个 Cascade 接口的性能 (Step by Step 增量 Prefill 场景)
     
     被测接口:
-      1. batch_block_expanding_cascade: 使用 Block Expanding mask
+      1. batch_block_extend_cascade: 使用 Block Extend mask
          - 支持 chunk_size != dllm_block_size
       2. sglang_style_cascade_attention: 使用 Causal mask (SGLang 原生风格)
          - 要求 chunk_size == dllm_block_size
@@ -2587,10 +2587,10 @@ def test_cascade_interfaces_perf(
     
     关键点:
       - 当 chunk_size == dllm_block_size 时，两者结果应该一致
-      - batch_block_expanding_cascade 可以使用更大的 chunk_size
+      - batch_block_extend_cascade 可以使用更大的 chunk_size
     """
     from flashinfer.dllm import (
-        batch_block_expanding_cascade,
+        batch_block_extend_cascade,
         sglang_style_cascade_attention,
     )
     
@@ -2715,7 +2715,7 @@ def test_cascade_interfaces_perf(
             dtype=torch.int32, device=device
         )
         
-        # q_offsets 和 kv_offsets (block_expanding_cascade 需要)
+        # q_offsets 和 kv_offsets (block_extend_cascade 需要)
         q_offsets_list = []
         for step_idx in range(num_steps):
             prefix_len = step_idx * chunk_size
@@ -2738,8 +2738,8 @@ def test_cascade_interfaces_perf(
                 v_current = v_current_buffers[step_idx]
                 paged_params = paged_kv_params_list[step_idx]
                 
-                # batch_block_expanding_cascade (函数内部自动判断 has_prefix)
-                be_out = batch_block_expanding_cascade(
+                # batch_block_extend_cascade (函数内部自动判断 has_prefix)
+                be_out = batch_block_extend_cascade(
                     q=q_batch,
                     k_current=k_current,
                     v_current=v_current,
@@ -2786,8 +2786,8 @@ def test_cascade_interfaces_perf(
             print(f"  [精度验证] max_diff = {max_diff_all_steps:.6f} {status}")
         
 
-        # [1] batch_block_expanding_cascade 性能测试
-        print(f"  [batch_block_expanding_cascade] 性能测试 (无 CUDA Graph)...")
+        # [1] batch_block_extend_cascade 性能测试
+        print(f"  [batch_block_extend_cascade] 性能测试 (无 CUDA Graph)...")
         
         # ========== 分段计时: 测量 Python 开销 vs Kernel 开销 ==========
         if verbose:
@@ -2796,7 +2796,7 @@ def test_cascade_interfaces_perf(
             # 1) 测量单次完整调用
             torch.cuda.synchronize()
             t0 = time_module.perf_counter()
-            _ = batch_block_expanding_cascade(
+            _ = batch_block_extend_cascade(
                 q=q_current_buffers[0],
                 k_current=k_current_buffers[0],
                 v_current=v_current_buffers[0],
@@ -2835,10 +2835,10 @@ def test_cascade_interfaces_perf(
             print(f"    [分段计时] 测量复用 Wrapper 的纯 run() 时间...")
             
             # BE: 创建并 plan 一次
-            from flashinfer.dllm.batch_block_expanding import (
-                BatchBlockExpandingRaggedQOffsetWrapper,
+            from flashinfer.dllm.batch_block_extend import (
+                BatchBlockExtendRaggedOffsetWrapper,
             )
-            be_wrapper = BatchBlockExpandingRaggedQOffsetWrapper(
+            be_wrapper = BatchBlockExtendRaggedOffsetWrapper(
                 workspace_buffer.clone(),
                 kv_layout="NHD",
                 dllm_block_size=dllm_block_size,
@@ -2910,7 +2910,7 @@ def test_cascade_interfaces_perf(
                 paged_params = paged_kv_params_list[step_idx]
                 
                 # 函数内部自动判断 has_prefix
-                output_buffer.copy_(batch_block_expanding_cascade(
+                output_buffer.copy_(batch_block_extend_cascade(
                     q=q_batch,
                     k_current=k_current,
                     v_current=v_current,
@@ -2989,7 +2989,7 @@ def test_cascade_interfaces_perf(
 
         speedup = sg_time / be_time if be_time > 0 else 0
         if speedup > 1:
-            print(f"    => batch_block_expanding_cascade 快 {speedup:.2f}x")
+            print(f"    => batch_block_extend_cascade 快 {speedup:.2f}x")
         else:
             print(f"    => sglang_style_cascade_attention 快 {1/speedup:.2f}x")
         
@@ -3017,12 +3017,12 @@ def test_cascade_interfaces_perf(
         print(f"{r['chunk_size']:>8} | {r['num_steps']:>6} | {r['be_cascade_ms']:>12.3f}ms | {r['sg_cascade_ms']:>12.3f}ms | {r['speedup_be_over_sg']:>9.2f}x")
     
     print(f"\n说明:")
-    print(f"  - BE Cascade: batch_block_expanding_cascade (Block Expanding mask)")
+    print(f"  - BE Cascade: batch_block_extend_cascade (Block Extend mask)")
     print(f"  - SG Cascade: sglang_style_cascade_attention (Causal mask)")
-    print(f"  - BE/SG: batch_block_expanding_cascade 相对于 sglang_style 的速度比")
+    print(f"  - BE/SG: batch_block_extend_cascade 相对于 sglang_style 的速度比")
     print(f"    (>1 表示 BE 更快, <1 表示 SG 更快)")
-    print(f"  - 当 chunk_size == dllm_block_size 时, causal mask ≡ block_expanding mask")
-    print(f"  - batch_block_expanding_cascade 支持 chunk_size != dllm_block_size")
+    print(f"  - 当 chunk_size == dllm_block_size 时, causal mask = block_extend mask")
+    print(f"  - batch_block_extend_cascade 支持 chunk_size != dllm_block_size")
     
     return results
 
@@ -3057,12 +3057,12 @@ def test_cascade_interfaces_perf_with_cuda_graph(
     4. 每个 step 的 paged_kv 配置不同，需要独立 Wrapper
     
     被测接口:
-      1. batch_block_expanding_cascade (通过 Wrapper.run())
+      1. batch_block_extend_cascade (通过 Wrapper.run())
       2. sglang_style_cascade_attention (通过 Wrapper.run())
     """
     from flashinfer.dllm import (
-        BatchBlockExpandingRaggedQOffsetWrapper,
-        BatchBlockExpandingPagedQOffsetWrapper,
+        BatchBlockExtendRaggedOffsetWrapper,
+        BatchBlockExtendPagedOffsetWrapper
     )
     from flashinfer.prefill import (
         BatchPrefillWithRaggedKVCacheWrapper,
@@ -3213,7 +3213,7 @@ def test_cascade_interfaces_perf_with_cuda_graph(
             
             # Ragged Wrapper (Current Chunk)
             ws_ragged = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
-            ragged_wrapper = BatchBlockExpandingRaggedQOffsetWrapper(
+            ragged_wrapper = BatchBlockExtendRaggedOffsetWrapper(
                 ws_ragged,
                 kv_layout="NHD",
                 dllm_block_size=dllm_block_size,
@@ -3237,7 +3237,7 @@ def test_cascade_interfaces_perf_with_cuda_graph(
             if prefix_len > 0:
                 paged_params = paged_kv_params_list[step_idx]
                 ws_paged = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
-                # 使用原生 BatchPrefillWithPagedKVCacheWrapper (causal=False) 而非 BlockExpanding
+                # 使用原生 BatchPrefillWithPagedKVCacheWrapper (causal=False) 而非 BlockExtend
                 # 因为 Prefix 的 mask 全为 1, 不需要额外的 mask 计算
                 paged_wrapper = BatchPrefillWithPagedKVCacheWrapper(
                     ws_paged,
@@ -3360,21 +3360,21 @@ def test_cascade_interfaces_perf_with_cuda_graph(
         for _ in range(bench_iters):
             be_graph.replay()
         torch.cuda.synchronize()
-        be_cg_time = (time.perf_counter() - start) / bench_iters * 1000
+        be_cuda_graph_time = (time.perf_counter() - start) / bench_iters * 1000
         
         # Benchmark without CUDA Graph (for comparison)
         start = time.perf_counter()
         for _ in range(bench_iters):
             run_be_cascade_with_wrappers()
         torch.cuda.synchronize()
-        be_no_cg_time = (time.perf_counter() - start) / bench_iters * 1000
+        be_no_cuda_graph_time = (time.perf_counter() - start) / bench_iters * 1000
         
-        print(f"    => CUDA Graph:  {be_cg_time:.3f} ms ({be_cg_time/num_steps:.3f} ms/step × {num_steps} steps)")
-        print(f"    => No Graph:    {be_no_cg_time:.3f} ms ({be_no_cg_time/num_steps:.3f} ms/step × {num_steps} steps)")
-        if be_no_cg_time > 0:
-            cg_speedup = be_no_cg_time / be_cg_time
-            if cg_speedup > 1:
-                print(f"    => CUDA Graph 加速: {cg_speedup:.2f}x")
+        print(f"    => CUDA Graph:  {be_cuda_graph_time:.3f} ms ({be_cuda_graph_time/num_steps:.3f} ms/step × {num_steps} steps)")
+        print(f"    => No Graph:    {be_no_cuda_graph_time:.3f} ms ({be_no_cuda_graph_time/num_steps:.3f} ms/step × {num_steps} steps)")
+        if be_no_cuda_graph_time > 0:
+            cuda_graph_speedup = be_no_cuda_graph_time / be_cuda_graph_time
+            if cuda_graph_speedup > 1:
+                print(f"    => CUDA Graph 加速: {cuda_graph_speedup:.2f}x")
             else:
                 print(f"    => CUDA Graph 无加速 (可能已被 kernel 时间主导)")
 
@@ -3421,27 +3421,27 @@ def test_cascade_interfaces_perf_with_cuda_graph(
         for _ in range(bench_iters):
             sg_graph.replay()
         torch.cuda.synchronize()
-        sg_cg_time = (time.perf_counter() - start) / bench_iters * 1000
+        sg_cuda_graph_time = (time.perf_counter() - start) / bench_iters * 1000
         
         # Benchmark without CUDA Graph
         start = time.perf_counter()
         for _ in range(bench_iters):
             run_sg_cascade_with_wrappers()
         torch.cuda.synchronize()
-        sg_no_cg_time = (time.perf_counter() - start) / bench_iters * 1000
+        sg_no_cuda_graph_time = (time.perf_counter() - start) / bench_iters * 1000
         
-        print(f"    => CUDA Graph:  {sg_cg_time:.3f} ms ({sg_cg_time/num_steps:.3f} ms/step × {num_steps} steps)")
-        print(f"    => No Graph:    {sg_no_cg_time:.3f} ms ({sg_no_cg_time/num_steps:.3f} ms/step × {num_steps} steps)")
-        if sg_no_cg_time > 0:
-            cg_speedup = sg_no_cg_time / sg_cg_time
-            if cg_speedup > 1:
-                print(f"    => CUDA Graph 加速: {cg_speedup:.2f}x")
+        print(f"    => CUDA Graph:  {sg_cuda_graph_time:.3f} ms ({sg_cuda_graph_time/num_steps:.3f} ms/step × {num_steps} steps)")
+        print(f"    => No Graph:    {sg_no_cuda_graph_time:.3f} ms ({sg_no_cuda_graph_time/num_steps:.3f} ms/step × {num_steps} steps)")
+        if sg_no_cuda_graph_time > 0:
+            cuda_graph_speedup = sg_no_cuda_graph_time / sg_cuda_graph_time
+            if cuda_graph_speedup > 1:
+                print(f"    => CUDA Graph 加速: {cuda_graph_speedup:.2f}x")
             else:
                 print(f"    => CUDA Graph 无加速")
         
         # 对比 BE vs SG (CUDA Graph)
-        if be_cg_time > 0 and sg_cg_time > 0:
-            speedup = sg_cg_time / be_cg_time
+        if be_cuda_graph_time > 0 and sg_cuda_graph_time > 0:
+            speedup = sg_cuda_graph_time / be_cuda_graph_time
             if speedup > 1:
                 print(f"  [对比] BE Cascade 快 {speedup:.2f}x (CUDA Graph)")
             else:
@@ -3450,11 +3450,11 @@ def test_cascade_interfaces_perf_with_cuda_graph(
         results[f"chunk{chunk_size}"] = {
             "chunk_size": chunk_size,
             "num_steps": num_steps,
-            "be_cg_ms": be_cg_time,
-            "be_no_cg_ms": be_no_cg_time,
-            "sg_cg_ms": sg_cg_time,
-            "sg_no_cg_ms": sg_no_cg_time,
-            "speedup_be_over_sg_cg": sg_cg_time / be_cg_time if be_cg_time > 0 else 0,
+            "be_cuda_graph_ms": be_cuda_graph_time,
+            "be_no_cuda_graph_ms": be_no_cuda_graph_time,
+            "sg_cuda_graph_ms": sg_cuda_graph_time,
+            "sg_no_cuda_graph_ms": sg_no_cuda_graph_time,
+            "speedup_be_over_sg_cuda_graph": sg_cuda_graph_time / be_cuda_graph_time if be_cuda_graph_time > 0 else 0,
         }
         
         # 清理
@@ -3468,18 +3468,18 @@ def test_cascade_interfaces_perf_with_cuda_graph(
     print(f"结果汇总 (CUDA Graph 版本)")
     print(f"{'='*90}")
     
-    print(f"\n{'chunk':>8} | {'steps':>6} | {'BE(CG)':>10} | {'BE(No)':>10} | {'SG(CG)':>10} | {'SG(No)':>10} | {'BE/SG':>8}")
+    print(f"\n{'chunk':>8} | {'steps':>6} | {'BE(cuda_graph)':>10} | {'BE(No)':>10} | {'SG(cuda_graph)':>10} | {'SG(No)':>10} | {'BE/SG':>8}")
     print(f"{'-'*8}-+-{'-'*6}-+-{'-'*10}-+-{'-'*10}-+-{'-'*10}-+-{'-'*10}-+-{'-'*8}")
     
     for key in sorted(results.keys(), key=lambda k: results[k]["chunk_size"]):
         r = results[key]
-        print(f"{r['chunk_size']:>8} | {r['num_steps']:>6} | {r['be_cg_ms']:>8.3f}ms | {r['be_no_cg_ms']:>8.3f}ms | "
-              f"{r['sg_cg_ms']:>8.3f}ms | {r['sg_no_cg_ms']:>8.3f}ms | {r['speedup_be_over_sg_cg']:>7.2f}x")
+        print(f"{r['chunk_size']:>8} | {r['num_steps']:>6} | {r['be_cuda_graph_ms']:>8.3f}ms | {r['be_no_cuda_graph_ms']:>8.3f}ms | "
+              f"{r['sg_cuda_graph_ms']:>8.3f}ms | {r['sg_no_cuda_graph_ms']:>8.3f}ms | {r['speedup_be_over_sg_cuda_graph']:>7.2f}x")
     
     print(f"\n说明:")
-    print(f"  - BE(CG): batch_block_expanding Wrapper.run() with CUDA Graph")
-    print(f"  - BE(No): batch_block_expanding Wrapper.run() without CUDA Graph")
-    print(f"  - SG(CG): sglang_style Wrapper.run() with CUDA Graph")
+    print(f"  - BE(cuda_graph): batch_block_extend Wrapper.run() with CUDA Graph")
+    print(f"  - BE(No): batch_block_extend Wrapper.run() without CUDA Graph")
+    print(f"  - SG(cuda_graph): sglang_style Wrapper.run() with CUDA Graph")
     print(f"  - SG(No): sglang_style Wrapper.run() without CUDA Graph")
     print(f"  - BE/SG: BE 相对于 SG 的速度比 (>1 表示 BE 更快)")
     print(f"  - CUDA Graph 优化: 预先 plan(), 只 capture run()")
@@ -3497,7 +3497,7 @@ def test_heterogeneous_prefix_batch(
     场景复现:
       - Req 0: 已经 prefill 过，有 prefix (kv_len=128, q_offset=64)
       - Req 1: 新请求，没有 prefix (kv_len=32, q_offset=0)
-      - 两个请求拼在一起传给 batch block-expanding attention 算子
+      - 两个请求拼在一起传给 batch block-extend attention 算子
     
     测试目的:
       1. 验证算子是否支持异构 kv_len 输入
@@ -3506,7 +3506,7 @@ def test_heterogeneous_prefix_batch(
     
     参考实现: 每个请求独立使用 custom_mask 计算，然后拼接
     """
-    from flashinfer.dllm import BatchBlockExpandingRaggedQOffsetWrapper
+    from flashinfer.dllm import BatchBlockExtendRaggedOffsetWrapper
     from flashinfer.prefill import single_prefill_with_kv_cache
     
     device = torch.device("cuda:0")
@@ -3707,10 +3707,10 @@ def test_heterogeneous_prefix_batch(
             print(f"           kv_indptr: {kv_indptr.tolist()}")
             print(f"           q_offsets: {q_offsets.tolist()}")
         
-        # 被测对象: BatchBlockExpandingRaggedQOffsetWrapper
+        # 被测对象: BatchBlockExtendRaggedOffsetWrapper
         try:
             workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
-            wrapper = BatchBlockExpandingRaggedQOffsetWrapper(
+            wrapper = BatchBlockExtendRaggedOffsetWrapper(
                 workspace, kv_layout="NHD", dllm_block_size=dllm_block_size, backend=backend
             )
             wrapper.plan(
@@ -3796,10 +3796,10 @@ def test_cascade_current_chunk_batch(
     测试完整的三阶段 Cascade Attention（模拟 SGLang DLLM 流程）
     
     三阶段流程:
-      Stage 1 (prefix): BatchBlockExpandingRaggedQOffsetWrapper 算 prefix
+      Stage 1 (prefix): BatchBlockExtendRaggedOffsetWrapper 算 prefix
         - K/V: [0, prefix_len)
         - kv_offset = 0
-      Stage 2 (current chunk): BatchBlockExpandingRaggedQOffsetWrapper 算当前 chunk
+      Stage 2 (current chunk): BatchBlockExtendRaggedOffsetWrapper 算当前 chunk
         - K/V: [prefix_len, prefix_len + chunk_len)（只有当前 chunk）
         - kv_offset = prefix_len
       Stage 3 (merge): merge_state(o1, s1, o2, s2)
@@ -3808,7 +3808,7 @@ def test_cascade_current_chunk_batch(
     
     关键点:
       - Stage 2 的 K/V 不是从 0 开始，需要 kv_offset
-      - 使用 blockwise expanding mask（不是 causal mask）
+      - 使用 blockwise extend mask（不是 causal mask）
     """
     device = "cuda"
     dtype = torch.bfloat16
@@ -3937,7 +3937,7 @@ def test_cascade_current_chunk_batch(
                 k_full = k_chunks[req_idx]
                 v_full = v_chunks[req_idx]
             
-            # 构造 blockwise expanding mask
+            # 构造 blockwise extend mask
             # Q: [prefix_len, prefix_len + chunk_len)
             # K: [0, prefix_len + chunk_len)
             q_offset = prefix_len
@@ -3981,7 +3981,7 @@ def test_cascade_current_chunk_batch(
                     prefix_q_offsets = torch.tensor([prefix_len], dtype=torch.int32, device=device)  # Q 的全局位置
                     prefix_kv_offsets = torch.tensor([0], dtype=torch.int32, device=device)  # prefix K/V 从 0 开始
                     
-                    prefix_wrapper = BatchBlockExpandingRaggedQOffsetWrapper(
+                    prefix_wrapper = BatchBlockExtendRaggedOffsetWrapper(
                         workspace, kv_layout="NHD", dllm_block_size=dllm_block_size, backend=backend
                     )
                     prefix_wrapper.plan(
@@ -4007,7 +4007,7 @@ def test_cascade_current_chunk_batch(
                 chunk_q_offsets = torch.tensor([prefix_len], dtype=torch.int32, device=device)   # Q 的全局位置
                 chunk_kv_offsets = torch.tensor([prefix_len], dtype=torch.int32, device=device)  # chunk K/V 的全局位置
                 
-                chunk_wrapper = BatchBlockExpandingRaggedQOffsetWrapper(
+                chunk_wrapper = BatchBlockExtendRaggedOffsetWrapper(
                     workspace, kv_layout="NHD", dllm_block_size=dllm_block_size, backend=backend
                 )
                 chunk_wrapper.plan(
@@ -4095,14 +4095,14 @@ def test_cascade_precision_alignment(
     verbose: bool = True,
 ):
     """
-    测试 block_expanding_cascade 精度对齐（单请求版本）
+    测试 block_extend_cascade 精度对齐（单请求版本）
     
     对比对象:
-      1. block_expanding_cascade: 使用 block_expanding_attention_with_offset (Current Chunk)
+      1. block_extend_cascade: 使用 block_extend_attention_with_offset (Current Chunk)
       2. 参考实现: 使用 single_prefill_with_kv_cache(causal=True) (Current Chunk)
     
     当 chunk_size == dllm_block_size 时:
-      - Causal mask ≡ Block Expanding mask
+      - Causal mask ≡ Block Extend mask
       - 两个实现的输出应该完全一致
     
     测试覆盖:
@@ -4111,7 +4111,7 @@ def test_cascade_precision_alignment(
       3. 不同 head 配置 (MHA, GQA, MQA)
       4. 不同 head_dim
     """
-    from flashinfer.dllm import block_expanding_cascade
+    from flashinfer.dllm import block_extend_cascade
     from flashinfer.cascade import merge_state_in_place
     from flashinfer.prefill import single_prefill_with_kv_cache
     
@@ -4120,10 +4120,10 @@ def test_cascade_precision_alignment(
     tol = 1e-2  # 精度容差
     
     print(f"\n{'='*100}")
-    print(f"单请求 Cascade 精度对齐测试: block_expanding_cascade vs custom_mask 参考实现")
+    print(f"单请求 Cascade 精度对齐测试: block_extend_cascade vs custom_mask 参考实现")
     print(f"{'='*100}")
     print(f"测试条件: chunk_size == dllm_block_size")
-    print(f"注意: Block Expanding mask != Causal mask (块内全可见，不是下三角)")
+    print(f"注意: Block Extend mask != Causal mask (块内全可见，不是下三角)")
     print(f"精度容差: {tol}")
     
     # 测试配置
@@ -4192,8 +4192,8 @@ def test_cascade_precision_alignment(
                 k_prefix = None
                 v_prefix = None
 
-            # 被测: block_expanding_cascade
-            be_out = block_expanding_cascade(
+            # 被测: block_extend_cascade
+            be_out = block_extend_cascade(
                 q=q_current,
                 k_current=k_current,
                 v_current=v_current,
@@ -4205,24 +4205,24 @@ def test_cascade_precision_alignment(
                 backend="fa2",
             )
 
-            # 参考: 使用 custom_mask 计算 Block Expanding Attention
-            # 注意: Block Expanding mask != Causal mask
-            # Block Expanding: mask[q,k] = ((q+offset)//B) >= (k//B)
+            # 参考: 使用 custom_mask 计算 Block Extend Attention
+            # 注意: Block Extend mask != Causal mask
+            # Block Extend: mask[q,k] = ((q+offset)//B) >= (k//B)
             # 当 chunk_size == dllm_block_size 时，chunk 内全可见（不是下三角）
             prefix_len = step_idx * chunk_size
             if k_prefix is None:
-                # 无 prefix，直接使用 Block Expanding mask
-                ref_out = compute_block_expanding_reference(
+                # 无 prefix，直接使用 Block Extend mask
+                ref_out = compute_block_extend_reference(
                     q_current, k_current, v_current,
                     dllm_block_size=dllm_block_size,
                     q_offset=prefix_len,
                     sm_scale=sm_scale,
                 )
             else:
-                # 有 prefix: Current Chunk (Block Expanding) + Prefix (全可见) + merge
+                # 有 prefix: Current Chunk (Block Extend) + Prefix (全可见) + merge
                 # Current chunk: q_offset = prefix_len, kv 从 prefix_len 开始
                 
-                # 构造 current chunk 的 Block Expanding mask
+                # 构造 current chunk 的 Block Extend mask
                 qo_len = q_current.shape[0]
                 kv_len = k_current.shape[0]
                 q_pos = torch.arange(qo_len, device=q_current.device) + prefix_len
@@ -4305,7 +4305,7 @@ def test_cascade_precision_alignment(
     }
 
 
-def test_sglang_vs_block_expanding_cascade(
+def test_sglang_vs_block_extend_cascade(
     num_steps: int = 4,
     dllm_block_size: int = 64,
     num_heads: int = 32,
@@ -4318,14 +4318,14 @@ def test_sglang_vs_block_expanding_cascade(
     backend: str = "fa2",
 ):
     """
-    sglang_style_cascade_attention vs block_expanding_cascade 精度和性能比对
+    sglang_style_cascade_attention vs block_extend_cascade 精度和性能比对
     
     关键设计:
     ═══════════════════════════════════════════════════════════════════════════════
     确保输入完全一致:
       1. 使用相同的 Q, K_current, V_current 和 K_prefix, V_prefix 数据
       2. sglang_style_cascade_attention: K_prefix/V_prefix 转换为 Paged KV Cache 格式
-      3. block_expanding_cascade: K_prefix/V_prefix 使用连续存储格式
+      3. block_extend_cascade: K_prefix/V_prefix 使用连续存储格式
     
     对比对象:
     ═══════════════════════════════════════════════════════════════════════════════
@@ -4334,18 +4334,18 @@ def test_sglang_vs_block_expanding_cascade(
         * Prefix: BatchPrefillWithPagedKVCacheWrapper (causal=False)
         * 使用 Paged KV Cache 存储 prefix
     
-      - block_expanding_cascade (单请求版本):
-        * Current Chunk: block_expanding_attention_with_offset (Block Expanding mask)
+      - block_extend_cascade (单请求版本):
+        * Current Chunk: block_extend_attention_with_offset (Block Extend mask)
         * Prefix: single_prefill_with_kv_cache (causal=False)
         * 使用连续内存存储 prefix
     
     适用条件:
     ═══════════════════════════════════════════════════════════════════════════════
-      chunk_size == dllm_block_size (此时 causal mask ≡ block_expanding mask)
+      chunk_size == dllm_block_size (此时 causal mask = block_extend mask)
     """
     from flashinfer.dllm import (
         sglang_style_cascade_attention,
-        block_expanding_cascade,
+        block_extend_cascade,
     )
     import time as time_module
     
@@ -4358,7 +4358,7 @@ def test_sglang_vs_block_expanding_cascade(
     sm_scale = 1.0 / math.sqrt(head_dim)
     
     print(f"\n{'='*100}")
-    print(f"sglang_style_cascade_attention vs block_expanding_cascade 精度和性能比对")
+    print(f"sglang_style_cascade_attention vs block_extend_cascade 精度和性能比对")
     print(f"{'='*100}")
     print(f"配置:")
     print(f"  num_steps           = {num_steps}")
@@ -4373,7 +4373,7 @@ def test_sglang_vs_block_expanding_cascade(
     print(f"  精度容差            = {tol}")
     print(f"\n对比实现:")
     print(f"  sglang_style_cascade_attention: Ragged (causal=False) + Paged (causal=False) + merge_state")
-    print(f"  block_expanding_cascade:        BlockExpanding (with offset) + single_prefill (causal=False) + merge_state")
+    print(f"  block_extend_cascade:        BlockExtend (with offset) + single_prefill (causal=False) + merge_state")
 
     q_full = torch.randn(tokens_per_request, num_heads, head_dim, dtype=dtype, device=device)
     k_full = torch.randn(tokens_per_request, num_kv_heads, head_dim, dtype=dtype, device=device)
@@ -4458,7 +4458,7 @@ def test_sglang_vs_block_expanding_cascade(
             k_prefix = None
             v_prefix = None
 
-        be_out = block_expanding_cascade(
+        be_out = block_extend_cascade(
             q=q_current,
             k_current=k_current,
             v_current=v_current,
@@ -4546,7 +4546,7 @@ def test_sglang_vs_block_expanding_cascade(
     kv_curr_indptr = torch.tensor([0, chunk_size], dtype=torch.int32, device=device)
 
     def run_be_cascade():
-        return block_expanding_cascade(
+        return block_extend_cascade(
             q=q_current,
             k_current=k_current,
             v_current=v_current,
@@ -4601,12 +4601,12 @@ def test_sglang_vs_block_expanding_cascade(
     sg_time = (time_module.perf_counter() - start) / bench_iters * 1000
 
     print(f"\n  测试参数: chunk_size={chunk_size}, prefix_len={prefix_len}")
-    print(f"  block_expanding_cascade:        {be_time:.3f} ms")
+    print(f"  block_extend_cascade:        {be_time:.3f} ms")
     print(f"  sglang_style_cascade_attention: {sg_time:.3f} ms")
     
     if be_time < sg_time:
         speedup = sg_time / be_time
-        print(f"  block_expanding_cascade faster by {speedup:.2f}x")
+        print(f"  block_extend_cascade faster by {speedup:.2f}x")
     else:
         speedup = be_time / sg_time
         print(f"  sglang_style_cascade_attention faster by {speedup:.2f}x")
@@ -4620,23 +4620,23 @@ def test_sglang_vs_block_expanding_cascade(
         "sg_time_ms": sg_time,
     }
 
-
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Cascade vs Batch 对比测试")
     parser.add_argument("--batch-prefill", action="store_true", help="多 Request Batch Prefill 对比 (chunk_size 可变)")
     parser.add_argument("--step-by-step", action="store_true", help="真实分步执行对比 (模拟流水线依赖)")
-    parser.add_argument("--step-by-step-cg", action="store_true", help="真实分步执行对比 + CUDA Graph")
-    parser.add_argument("--single-req-cg", action="store_true", help="单请求分步执行 + CUDA Graph (流水线依赖)")
-    parser.add_argument("--fa2-fa3-be", action="store_true", help="FA2 vs FA3 BlockExpanding vs Causal 性能对比")
-    parser.add_argument("--cascade-perf", action="store_true", help="Cascade 接口性能对比 (batch_block_expanding_cascade vs sglang_style)")
-    parser.add_argument("--cascade-perf-cg", action="store_true", help="Cascade 接口性能对比 + CUDA Graph (预创建 Wrapper, 只 capture run)")
-    parser.add_argument("--cascade-precision", action="store_true", help="Cascade 接口精度对齐测试 (sglang_style vs block_expanding)")
-    parser.add_argument("--sglang-vs-be", action="store_true", help="sglang_style_cascade vs block_expanding_cascade 精度和性能比对 (输入相等)")
+    parser.add_argument("--step-by-step-cuda_graph", action="store_true", help="真实分步执行对比 + CUDA Graph")
+    parser.add_argument("--single-req-cuda_graph", action="store_true", help="单请求分步执行 + CUDA Graph (流水线依赖)")
+    parser.add_argument("--fa2-fa3-be", action="store_true", help="FA2 vs FA3 BlockExtend vs Causal 性能对比")
+    parser.add_argument("--cascade-perf", action="store_true", help="Cascade 接口性能对比 (batch_block_extend_cascade vs sglang_style)")
+    parser.add_argument("--cascade-perf-cuda_graph", action="store_true", help="Cascade 接口性能对比 + CUDA Graph (预创建 Wrapper, 只 capture run)")
+    parser.add_argument("--cascade-precision", action="store_true", help="Cascade 接口精度对齐测试 (sglang_style vs block_extend)")
+    parser.add_argument("--sglang-vs-be", action="store_true", help="sglang_style_cascade vs block_extend_cascade 精度和性能比对 (输入相等)")
     parser.add_argument("--heterogeneous-prefix", action="store_true", help="异构 prefix 测试: 不同请求有不同的 prefix 长度")
     parser.add_argument("--cascade-chunk", action="store_true", help="Cascade Current Chunk 测试: K/V 只有当前 block，需要 kv_offset")
-    parser.add_argument("--cg-reuse-bug", action="store_true", help="测试 CUDA Graph 模式下复用 wrapper 的 bug (暴露 q_offsets 地址变化问题)")
+    parser.add_argument("--tvm-ffi-slice-bug", action="store_true", help="TVM FFI 切片 tensor bug 复现测试")
+    parser.add_argument("--cuda_graph-reuse-bug", action="store_true", help="测试 CUDA Graph 模式下复用 wrapper 的 bug (暴露 q_offsets 地址变化问题)")
     parser.add_argument("--precision-test", action="store_true", help="DLLM 组件精度测试 (与原生 Custom Mask FA2 对比)")
     parser.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16", "all"], 
                         help="精度测试的数据类型: fp16, bf16, 或 all (同时测试两者)")
@@ -4659,9 +4659,9 @@ if __name__ == "__main__":
     dllm_bs = args.dllm_block_size if args.dllm_block_size is not None else args.chunk_len
     
     if args.fa2_fa3_be:
-        # FA2 vs FA3 BlockExpanding vs Causal 性能对比 (增量 Prefill 场景)
+        # FA2 vs FA3 BlockExtend vs Causal 性能对比 (增量 Prefill 场景)
         chunk_sizes = [int(x) for x in args.chunk_sizes.split(",")]
-        test_fa2_fa3_block_expanding_vs_causal(
+        test_fa2_fa3_block_extending_vs_causal(
             num_requests=args.num_requests,
             chunk_sizes=chunk_sizes,
             tokens_per_request=args.kv_len,  # 使用 kv_len 参数作为 tokens_per_request
@@ -4671,9 +4671,9 @@ if __name__ == "__main__":
             head_dim=args.head_dim,
             verbose=args.verbose,
         )
-    elif args.step_by_step_cg:
+    elif args.step_by_step_cuda_graph:
         # 多请求真实分步执行对比 + CUDA Graph
-        test_incremental_batchprefill_step_by_step_with_cg(
+        test_incremental_batchprefill_step_by_step_with_cuda_graph(
             num_requests=args.num_requests,
             tokens_per_request=args.tokens_per_request,
             dllm_block_size=dllm_bs,
@@ -4681,9 +4681,9 @@ if __name__ == "__main__":
             head_dim=args.head_dim,
             verbose=args.verbose,
         )
-    elif args.single_req_cg:
+    elif args.single_req_cuda_graph:
         # 单请求分步执行 + CUDA Graph (流水线依赖)
-        test_incremental_singlereq_prefill_step_by_step_with_cg(
+        test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
             tokens_per_request=args.tokens_per_request,
             dllm_block_size=dllm_bs,
             num_heads=args.num_heads,
@@ -4729,7 +4729,7 @@ if __name__ == "__main__":
             verbose=args.verbose,
             backend=args.backend,
         )
-    elif args.cascade_perf_cg:
+    elif args.cascade_perf_cuda_graph:
         # 多请求，开cuda graph 端到端性能测试，baseline 是 sglang_style_cascade_attention CUDA Graph
         chunk_sizes = [int(x) for x in args.chunk_sizes.split(",")]
         test_cascade_interfaces_perf_with_cuda_graph(
@@ -4744,14 +4744,14 @@ if __name__ == "__main__":
             backend=args.backend,
         )
     elif args.cascade_precision:
-        # 纯精度测试，验证 block_expanding_cascade 与 sglang_style_cascade_attention 的数值一致性
+        # 纯精度测试，验证 block_extend_cascade 与 sglang_style_cascade_attention 的数值一致性
         test_cascade_precision_alignment(
             verbose=args.verbose,
         )
     elif args.sglang_vs_be:
         # 单请求测试cascade 性能测试，baseline 是 sglang_style_cascade_attention
         num_steps = args.tokens_per_request // dllm_bs
-        test_sglang_vs_block_expanding_cascade(
+        test_sglang_vs_block_extend_cascade(
             num_steps=num_steps,
             dllm_block_size=dllm_bs,
             num_heads=args.num_heads,
@@ -4775,4 +4775,3 @@ if __name__ == "__main__":
                 verbose=args.verbose,
                 backend=be,
             )
-            

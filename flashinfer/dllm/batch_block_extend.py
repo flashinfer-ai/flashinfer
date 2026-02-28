@@ -1,13 +1,15 @@
 """
-Batch Block Expanding Attention for DLLM (Draft-based LLM)
+Batch Block Extend Attention for DLLM (Diffusion LLM)
 
-Block Expanding Mask 规则:
-  mask[q, k] = (q / dllm_block_size) >= (k / dllm_block_size)
+Block Extend Mask 规则:
+  q_global = q_offset + q_idx
+  kv_global = kv_offset + kv_idx
+  mask[q, k] = (q_global / dllm_block_size) >= (kv_global / dllm_block_size)
   同一 block 内双向可见，可以看见之前的 blocks，不能看见后续 blocks
 
 使用方法:
-    from flashinfer.dllm import BatchBlockExpandingAttentionWrapper
-    wrapper = BatchBlockExpandingAttentionWrapper(workspace, kv_layout="NHD", dllm_block_size=32)
+    from flashinfer.dllm import BatchBlockExtendAttentionWrapper
+        wrapper = BatchBlockExtendAttentionWrapper(workspace, kv_layout="NHD", dllm_block_size=32)
     wrapper.plan(qo_indptr, kv_indptr, num_heads, num_kv_heads, head_dim)
     output = wrapper.run(q, k, v)
 """
@@ -108,7 +110,7 @@ def select_best_backend(head_dim: int, dtype: torch.dtype, preferred_backend: st
                 return "fa3"
         
         raise RuntimeError(
-            f"No Block Expanding kernel available for head_dim={head_dim}, dtype={dtype}. "
+            f"No Block Extend kernel available for head_dim={head_dim}, dtype={dtype}. "
             f"FA2: AOT={fa2_aot}, JIT={fa2_jit}; FA3: AOT={fa3_aot}, JIT={fa3_jit}"
         )
     
@@ -156,7 +158,7 @@ def select_best_backend_paged(head_dim: int, dtype: torch.dtype, preferred_backe
                 return "fa3"
         
         raise RuntimeError(
-            f"No Paged Block Expanding kernel available for head_dim={head_dim}, dtype={dtype}"
+            f"No Paged Block Extend kernel available for head_dim={head_dim}, dtype={dtype}"
         )
     
     if preferred_backend == "fa2":
@@ -173,7 +175,7 @@ def select_best_backend_paged(head_dim: int, dtype: torch.dtype, preferred_backe
 
 
 # FA2 Variant
-BATCH_BLOCK_EXPANDING_VARIANT_DECL = r"""
+BATCH_BLOCK_EXTEND_VARIANT_DECL = r"""
 struct BatchBlockExpandingAttention : AttentionVariantBase {
   static constexpr bool use_softmax = true;
 
@@ -202,7 +204,7 @@ struct BatchBlockExpandingAttention : AttentionVariantBase {
 """
 
 # FA3 Variant (SM90 Hopper)
-BATCH_BLOCK_EXPANDING_VARIANT_DECL_FA3 = r"""
+BATCH_BLOCK_EXTEND_VARIANT_DECL_FA3 = r"""
 struct BatchBlockExpandingAttentionFA3 : AttentionVariantBase {
   float sm_scale_log2;
 
@@ -241,8 +243,8 @@ def _check_batch_be_aot_available(uri: str) -> bool:
     return _get_batch_be_aot_path(uri).exists()
 
 
-class BatchBlockExpandingAttentionWrapper:
-    """Batch Block Expanding Attention Wrapper with Tile-Level Skip Optimization"""
+class BatchBlockExtendAttentionWrapper:
+    """Batch Block Extend Attention Wrapper with Tile-Level Skip Optimization"""
     
     def __init__(
         self,
@@ -275,11 +277,11 @@ class BatchBlockExpandingAttentionWrapper:
         if self._backend == "fa3":
             uri = _get_batch_be_module_uri(head_dim, dtype) + "_fa3"
             variant_name = "BatchBlockExpandingAttentionFA3"
-            variant_decl = BATCH_BLOCK_EXPANDING_VARIANT_DECL_FA3
+            variant_decl = BATCH_BLOCK_EXTEND_VARIANT_DECL_FA3
         else:
             uri = _get_batch_be_module_uri(head_dim, dtype)
             variant_name = "BatchBlockExpandingAttention"
-            variant_decl = BATCH_BLOCK_EXPANDING_VARIANT_DECL
+            variant_decl = BATCH_BLOCK_EXTEND_VARIANT_DECL
         
         jit_args = [
             uri, dtype, dtype, dtype, idtype, head_dim, head_dim,
@@ -341,8 +343,8 @@ class BatchBlockExpandingAttentionWrapper:
         return self._use_cuda_graph
 
 
-class BatchBlockExpandingPagedAttentionWrapper:
-    """Batch Block Expanding Attention Wrapper with Paged KV Cache"""
+class BatchBlockExtendPagedAttentionWrapper:
+    """Batch Block Extend Attention Wrapper with Paged KV Cache"""
     
     def __init__(
         self,
@@ -379,11 +381,11 @@ class BatchBlockExpandingPagedAttentionWrapper:
         if self._backend == "fa3":
             uri = _get_batch_be_module_uri(head_dim, dtype) + "_paged_fa3"
             variant_name = "BatchBlockExpandingAttentionFA3"
-            variant_decl = BATCH_BLOCK_EXPANDING_VARIANT_DECL_FA3
+            variant_decl = BATCH_BLOCK_EXTEND_VARIANT_DECL_FA3
         else:
             uri = _get_batch_be_module_uri(head_dim, dtype) + "_paged"
             variant_name = "BatchBlockExpandingAttention"
-            variant_decl = BATCH_BLOCK_EXPANDING_VARIANT_DECL
+            variant_decl = BATCH_BLOCK_EXTEND_VARIANT_DECL
         
         jit_args = [
             uri, dtype, dtype, dtype, idtype, head_dim, head_dim,
@@ -492,8 +494,8 @@ struct BatchBlockExpandingQOffsetAttentionFA3 : AttentionVariantBase {
 """
 
 
-class BatchBlockExpandingPagedQOffsetWrapper:
-    """Batch Block Expanding Paged Attention with Q Offset Support"""
+class BatchBlockExtendPagedOffsetWrapper:
+    """Batch Block Extend Paged Attention with Offset Support"""
     
     def __init__(
         self,
@@ -631,8 +633,8 @@ def dtype_map_for_idtype(idtype: torch.dtype) -> str:
     return {torch.int32: "int32_t", torch.int64: "int64_t"}.get(idtype, "int32_t")
 
 
-class BatchBlockExpandingRaggedQOffsetWrapper:
-    """Batch Block Expanding Ragged Attention with Q Offset Support"""
+class BatchBlockExtendRaggedOffsetWrapper:
+    """Batch Block Extend Ragged Attention with Offset Support"""
     
     def __init__(
         self,
@@ -758,7 +760,7 @@ class BatchBlockExpandingRaggedQOffsetWrapper:
         return self._dllm_block_size
 
 
-def batch_block_expanding_cascade(
+def batch_block_extend_cascade(
     q: torch.Tensor,
     k_current: torch.Tensor,
     v_current: torch.Tensor,
@@ -777,7 +779,7 @@ def batch_block_expanding_cascade(
     return_lse: bool = False,
     backend: str = "auto",
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    """Batch Block Expanding Cascade Attention (Current Chunk + Prefix + Merge State)"""
+    """Batch Block Extend Cascade Attention (Current Chunk + Prefix + Merge State)"""
     from ..cascade import merge_state
     
     assert q.dim() == 3 and k_current.dim() == 3 and v_current.dim() == 3
@@ -812,7 +814,7 @@ def batch_block_expanding_cascade(
         kv_offsets = q_offsets
     
     # Stage 1: Current Chunk (Ragged)
-    current_wrapper = BatchBlockExpandingRaggedQOffsetWrapper(
+    current_wrapper = BatchBlockExtendRaggedOffsetWrapper(
         workspace_buffer, kv_layout="NHD", dllm_block_size=dllm_block_size, backend=actual_backend,
     )
     current_wrapper.plan(
@@ -827,7 +829,7 @@ def batch_block_expanding_cascade(
         return current_wrapper.run(q, k_current, v_current, return_lse=return_lse)
     
     # Stage 2: Prefix (Paged)
-    prefix_wrapper = BatchBlockExpandingPagedQOffsetWrapper(
+    prefix_wrapper = BatchBlockExtendPagedOffsetWrapper(
         workspace_buffer, kv_layout="NHD", dllm_block_size=dllm_block_size, backend=actual_backend,
     )
     prefix_wrapper.plan(
