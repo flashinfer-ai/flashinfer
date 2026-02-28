@@ -517,6 +517,13 @@ def gen_all_modules(
             jit_specs.append(gen_gemm_sm120_module_cutlass_fp4())
         if has_sm121:
             jit_specs.append(gen_fp4_quantization_sm121_module())
+            # SM121 shares the same CUTLASS kernels as SM120 for fused MOE and GEMM.
+            # The SM120 module generators use supported_major_versions=[12] which
+            # compiles for all SM12x targets. Dedup at end of gen_all_modules()
+            # prevents duplicate modules when both has_sm120 and has_sm121 are True.
+            jit_specs.append(gen_cutlass_fused_moe_sm120_module())
+            jit_specs.append(gen_gemm_sm120_module())
+            jit_specs.append(gen_gemm_sm120_module_cutlass_fp4())
 
     if add_comm:
         from .jit.comm import (
