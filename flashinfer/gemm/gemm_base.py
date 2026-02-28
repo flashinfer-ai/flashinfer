@@ -2640,6 +2640,11 @@ def _trtllm_gemm_mxfp8_requirement(
 ):
     if out_dtype != torch.bfloat16:
         return False
+    if a.ndim != 2 or b.ndim != 2: # currently don't support BlockMajorK layout
+        return False
+    k, n = b.shape
+    if k % 256 != 0:
+        return False
     return True
 
 

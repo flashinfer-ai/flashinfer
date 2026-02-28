@@ -2,8 +2,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from flashinfer import autotune, mm_mxfp8
-from flashinfer.fp8_quantization import mxfp8_quantize
+from flashinfer import autotune, mm_mxfp8, shuffle_matrix_a, shuffle_matrix_sf_a
+from flashinfer.fp8_quantization import mxfp8_quantize, mxfp8_dequantize_host
 from flashinfer.utils import get_compute_capability
 
 
@@ -84,7 +84,18 @@ def _run_mm_mxfp8(
     input_mxfp8, mat2_mxfp8, input_descale, mat2_descale = _prepare_mxfp8_tensors(
         input, mat2, is_sf_swizzled_layout
     )
-    reference = torch.mm(input, mat2.T)
+
+    input_dequantize = mxfp8_dequantize_host(
+        input_mxfp8.cpu().view(torch.uint8),
+        input_descale.cpu().view(torch.uint8).reshape(-1),
+        is_sf_swizzled_layout,
+    ).cuda().to(input_dtype)
+    mat2_dequantize = mxfp8_dequantize_host(
+        mat2_mxfp8.cpu().view(torch.uint8),
+        mat2_descale.cpu().view(torch.uint8).reshape(-1),
+        is_sf_swizzled_layout,
+    ).cuda().to(input_dtype)
+    reference = torch.mm(input_dequantize, mat2_dequantize.T)
 
     res = torch.empty([m, n], device="cuda", dtype=out_dtype) if provide_out else None
 
