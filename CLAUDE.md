@@ -189,6 +189,17 @@ FlashInfer's JIT system has three layers:
 - `sources`: List of .cu/.cpp files to compile
 - `extra_cuda_cflags`, `extra_cflags`, `extra_ldflags`: Compiler flags
 
+### JIT Directory Rules
+
+**NEVER write to package directories** - they may be read-only after installation.
+
+| Directory | Writable | Use for |
+|-----------|----------|---------|
+| `FLASHINFER_GEN_SRC_DIR` | ✓ Yes | Generated source files (Jinja output, copied .cu files) |
+| `FLASHINFER_JIT_DIR` | ✓ Yes | Compiled `.so` outputs |
+| `FLASHINFER_CSRC_DIR` | ✗ No | Read-only source templates |
+| `FLASHINFER_AOT_DIR` | ✗ No | Read-only pre-compiled binaries |
+
 ### Compilation Context: Architecture-Specific Compilation
 
 FlashInfer uses `CompilationContext` to manage CUDA architecture targets. Some kernels only work on specific GPU architectures (e.g., Hopper SM90, Blackwell SM100/SM12x).

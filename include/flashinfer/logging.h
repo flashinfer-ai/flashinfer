@@ -36,6 +36,7 @@ inline void set_log_level(spdlog::level::level_enum lvl) {
   console_sink->set_pattern(fmt);
   console_sink->set_level(lvl);
   spdlog::set_default_logger(std::make_shared<spdlog::logger>("flashinfer", console_sink));
+  spdlog::set_level(lvl);
 }
 
 }  // namespace logging

@@ -19,6 +19,9 @@ RUN echo "source activate py312" >> ~/.bashrc
 ENV PATH="/opt/conda/bin:$PATH"
 ENV PATH="/opt/conda/envs/py312/bin:$PATH"
 
+# Ensure pip-installed nvidia-cublas takes precedence over system libraries
+ENV LD_LIBRARY_PATH="/opt/conda/envs/py312/lib/python3.12/site-packages/nvidia/cublas/lib/:$LD_LIBRARY_PATH"
+
 # Install torch and other python packages
 COPY requirements.txt /install/requirements.txt
 COPY docker/install/install_python_packages.sh /install/install_python_packages.sh
@@ -26,3 +29,9 @@ RUN bash /install/install_python_packages.sh cu126
 
 # Install mpi4py in the conda environment
 RUN conda install -n py312 -y mpi4py mpich
+
+# Configure pip for user-site installations (allows arbitrary users to install packages)
+# This enables 'pip install --user' and 'pip install -e .' to work for any user
+RUN mkdir -p /opt/pip-user && chmod 1777 /opt/pip-user
+ENV PYTHONUSERBASE=/opt/pip-user
+ENV PATH="/opt/pip-user/bin:$PATH"

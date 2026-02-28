@@ -16,9 +16,24 @@ FlashInfer CuTe-DSL Kernels
 ===========================
 
 This module provides high-performance GPU kernels implemented using NVIDIA CuTe-DSL.
+
+.. deprecated::
+    Importing GEMM kernels (``grouped_gemm_nt_masked``,
+    ``Sm100BlockScaledPersistentDenseGemmKernel``, ``create_scale_factor_tensor``)
+    from ``flashinfer.cute_dsl`` is deprecated.
+    Use ``flashinfer.gemm`` instead. The old import paths will be
+    removed in a future release.
 """
 
-import importlib.util
+from .utils import (
+    is_cute_dsl_available,
+    make_ptr,
+    get_cutlass_dtype,
+    get_num_sm,
+    convert_sf_to_mma_layout,
+    convert_sf_from_mma_layout,
+    get_mma_sf_shape,
+)
 
 
 def is_cute_dsl_available() -> bool:
@@ -30,10 +45,12 @@ def is_cute_dsl_available() -> bool:
 
 # Conditionally import CuTe-DSL kernels (including utils which requires cutlass)
 if is_cute_dsl_available():
-    from .utils import make_ptr, get_cutlass_dtype, get_num_sm
+    # Deprecated GEMM symbols: re-exported for backwards compatibility.
+    # Use flashinfer.gemm instead.
     from .blockscaled_gemm import (
         grouped_gemm_nt_masked,
         Sm100BlockScaledPersistentDenseGemmKernel,
+        create_scale_factor_tensor,
     )
     from .rmsnorm_fp4quant import (
         rmsnorm_fp4quant,
@@ -66,17 +83,21 @@ if is_cute_dsl_available():
 __all__ = [
     # Always available
     "is_cute_dsl_available",
+    "make_ptr",
+    "get_cutlass_dtype",
+    "get_num_sm",
+    # Scale factor layout conversion utilities
+    "convert_sf_to_mma_layout",
+    "convert_sf_from_mma_layout",
+    "get_mma_sf_shape",
 ]
 
 if is_cute_dsl_available():
     __all__ += [
-        # Utils (require cutlass)
-        "make_ptr",
-        "get_cutlass_dtype",
-        "get_num_sm",
-        # Blockscaled GEMM
+        # Blockscaled GEMM (deprecated, use flashinfer.gemm instead)
         "grouped_gemm_nt_masked",
         "Sm100BlockScaledPersistentDenseGemmKernel",
+        "create_scale_factor_tensor",
         # RMSNorm + FP4 Quantization
         "rmsnorm_fp4quant",
         "RMSNormFP4QuantKernel",

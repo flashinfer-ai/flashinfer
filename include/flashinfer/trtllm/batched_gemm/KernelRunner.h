@@ -47,11 +47,27 @@ enum class ActType {
   GeGlu,
 };
 
+// Type of the element-wise activation to apply after the Gemm
+enum class EltwiseActType {
+  None = 0,
+  // Gelu is defined as the following operation:
+  // act = x0 * phi(x0)
+  // where x0 is the output of the Gemm
+  // phi is the CDF of standard normal distribution approximated by
+  // phi(x) = 0.5 * (1 + tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)))
+  Gelu,
+  // Relu2 (also known as squared Relu) is defined as the following operation:
+  // act = relu(x0) ^ 2
+  // where x0 is the output of the Gemm.
+  Relu2,
+};
+
 struct TrtllmGenBatchedGemmRunnerOptions {
   batchedGemm::trtllm::gen::Dtype dtypeA;
   batchedGemm::trtllm::gen::Dtype dtypeB;
   batchedGemm::trtllm::gen::Dtype dtypeC;
   ActType actType{ActType::SwiGlu};
+  EltwiseActType eltwiseActType{EltwiseActType::None};
   bool deepSeekFp8{false};
   bool fusedAct{false};
   bool routeAct{false};
@@ -59,7 +75,7 @@ struct TrtllmGenBatchedGemmRunnerOptions {
   bool transposeMmaOutput{false};
   int32_t tileSize{8};
   int32_t epilogueTileM{128};
-  bool useShuffledMatrixA{false};
+  bool useShuffledMatrix{false};
   batchedGemm::gemm::MatrixLayout weightLayout{batchedGemm::gemm::MatrixLayout::MajorK};
 };
 

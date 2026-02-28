@@ -41,7 +41,8 @@ jobs:
             --min-commits ${{ env.MIN_COMMITS }} \
             --days-back ${{ env.DAYS_BACK }} \
             --top-n ${{ env.TOP_N }} \
-            --allowed-users-file scripts/authorized_codeowner.txt
+            --allowed-users-file scripts/authorized_codeowner.txt \
+            --overrides-file scripts/codeowner_overrides.json
 
       - name: Check for changes
         id: check_changes
@@ -88,6 +89,7 @@ jobs:
               - Commit frequency
               - File coverage
               - Commit recency
+              - Manual overrides from `scripts/codeowner_overrides.json`
 
             ## How to Review
 

@@ -72,6 +72,19 @@ def bench_top_k(
     result["torch_us"] = torch_ms * 1e3
     result["speedup_vs_torch"] = torch_ms / fi_ms
 
+    # SGLang comparison (only supports k=2048 and float32)
+    if compare_sglang and HAS_SGL_KERNEL and k == 2048 and dtype == torch.float32:
+        lengths = torch.full((batch_size,), seq_len, dtype=torch.int32, device="cuda")
+        measurements = bench_gpu_time(
+            lambda: sgl_kernel.fast_topk_v2(scores, lengths, k, row_starts=None),
+            enable_cupti=True,
+            dry_run_iters=10,
+            repeat_iters=100,
+        )
+        sg_ms = np.median(measurements)
+        result["sglang_us"] = sg_ms * 1e3
+        result["speedup_vs_sglang"] = sg_ms / fi_ms
+
     return result
 
 
@@ -282,11 +295,15 @@ def main():
     if args.op in ["all", "top_k"]:
         print("=" * 100)
         print(f"top_k: Basic radix-based top-k selection (dtype={dtype_str})")
+        if args.compare_sglang:
+            print("NOTE: SGLang only supports k=2048 and float32")
         print("=" * 100)
-        print(
-            f"{'batch':>6} {'seq_len':>10} {'k':>6} | {'FlashInfer':>12} {'torch.topk':>12} {'Speedup':>10}"
-        )
-        print("-" * 70)
+
+        header = f"{'batch':>6} {'seq_len':>10} {'k':>6} | {'FlashInfer':>12} {'torch.topk':>12} {'Speedup':>10}"
+        if args.compare_sglang:
+            header += f" {'SGLang':>12} {'Speedup':>10}"
+        print(header)
+        print("-" * (70 if not args.compare_sglang else 90))
 
         for batch_size in batch_sizes:
             for seq_len in seq_lens:
@@ -294,12 +311,23 @@ def main():
                     if k > seq_len:
                         continue
                     try:
-                        result = bench_top_k(batch_size, seq_len, k, dtype)
-                        print(
+                        result = bench_top_k(
+                            batch_size,
+                            seq_len,
+                            k,
+                            dtype,
+                            compare_sglang=args.compare_sglang,
+                        )
+                        line = (
                             f"{result['batch_size']:>6} {result['seq_len']:>10} {result['k']:>6} | "
                             f"{result['flashinfer_us']:>10.2f}us {result['torch_us']:>10.2f}us "
                             f"{result['speedup_vs_torch']:>9.2f}x"
                         )
+                        if "sglang_us" in result:
+                            line += f" {result['sglang_us']:>10.2f}us {result['speedup_vs_sglang']:>9.2f}x"
+                        elif args.compare_sglang and k == 2048:
+                            line += " (SGLang error)"
+                        print(line)
                     except RuntimeError as e:
                         if "out of memory" in str(e):
                             print(f"{batch_size:>6} {seq_len:>10} {k:>6} | OOM")
