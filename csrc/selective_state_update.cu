@@ -469,6 +469,7 @@ void run_selective_state_update_mtp(
   if (intermediate_states_buffer.has_value()) {
     p.intermediate_states = const_cast<void*>(intermediate_states_buffer.value().data_ptr());
     p.intermediate_state_stride_batch = intermediate_states_buffer.value().stride(0);
+    p.intermediate_state_cache_size = intermediate_states_buffer.value().size(0);
   }
 
   if (intermediate_state_indices.has_value()) {
