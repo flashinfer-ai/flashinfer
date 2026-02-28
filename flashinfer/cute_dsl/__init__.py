@@ -35,7 +35,7 @@ from .utils import (
     get_mma_sf_shape,
 )
 
-# Conditionally import CuTe-DSL kernels (including utils which requires cutlass)
+# Conditionally import CuTe-DSL kernels
 if is_cute_dsl_available():
     # Deprecated GEMM symbols: re-exported for backwards compatibility.
     # Use flashinfer.gemm instead.
@@ -73,7 +73,7 @@ if is_cute_dsl_available():
     )
 
 __all__ = [
-    # Always available
+    # Utils (always available)
     "is_cute_dsl_available",
     "make_ptr",
     "get_cutlass_dtype",
