@@ -84,8 +84,9 @@ struct SelectiveStateMTPParams : public SelectiveStateUpdateParams {
   int64_t x_stride_mtp{}, dt_stride_mtp{}, B_stride_mtp{}, C_stride_mtp{}, out_stride_mtp{},
       z_stride_mtp{};
   int64_t intermediate_state_stride_batch{}, intermediate_state_scales_stride_batch{};
+  uint32_t intermediate_state_cache_size{0};  // outermost dim of intermediate_states buffer
   void* __restrict__ intermediate_states{
-      nullptr};  // state_t: (ntokens_mtp, state_cache_size, nheads, dim, dstate)
+      nullptr};  // state_t: (icache_size, cache_steps, nheads, dim, dstate)
   void* __restrict__ intermediate_state_indices{nullptr};  // (batch,)
   void* __restrict__ intermediate_state_scales{
       nullptr};  // float: (batch, cache_steps, nheads, dim)
