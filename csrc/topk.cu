@@ -22,8 +22,20 @@ using namespace flashinfer;
 
 using tvm::ffi::Optional;
 
+namespace {
+
+bool ParseDeterministic(int64_t mode) {
+  TVM_FFI_ICHECK(mode == 0 || mode == 1)
+      << "Invalid deterministic_mode=" << mode
+      << ", expected 0 (non_deterministic) or 1 (deterministic).";
+  return mode == 1;
+}
+
+}  // namespace
+
 void radix_topk(TensorView input, TensorView output_indices, TensorView output_values,
-                Optional<TensorView> maybe_row_states_buffer, int64_t top_k) {
+                Optional<TensorView> maybe_row_states_buffer, int64_t top_k,
+                int64_t deterministic_mode) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_indices);
   CHECK_INPUT(output_values);
@@ -48,11 +60,12 @@ void radix_topk(TensorView input, TensorView output_indices, TensorView output_v
   }
 
   // Use unified dispatch with heuristics to choose between FilteredTopK and RadixTopK
+  bool deterministic = ParseDeterministic(deterministic_mode);
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(dtype, c_type, [&] {
     status = sampling::TopKDispatch<c_type, int32_t>(
         static_cast<c_type*>(input.data_ptr()), static_cast<int32_t*>(output_indices.data_ptr()),
         static_cast<c_type*>(output_values.data_ptr()), batch_size, static_cast<uint32_t>(top_k), d,
-        row_states_ptr, stream);
+        row_states_ptr, deterministic, stream);
     return true;
   });
 
@@ -63,7 +76,8 @@ void radix_topk(TensorView input, TensorView output_indices, TensorView output_v
 void radix_topk_page_table_transform(TensorView input, TensorView output_page_table,
                                      TensorView src_page_table,
                                      Optional<TensorView> maybe_row_to_batch, TensorView lengths,
-                                     Optional<TensorView> maybe_row_states_buffer, int64_t top_k) {
+                                     Optional<TensorView> maybe_row_states_buffer, int64_t top_k,
+                                     int64_t deterministic_mode) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_page_table);
   CHECK_INPUT(src_page_table);
@@ -95,12 +109,13 @@ void radix_topk_page_table_transform(TensorView input, TensorView output_page_ta
   }
 
   // Use unified dispatch with heuristics to choose between FilteredTopK and RadixTopK
+  bool deterministic = ParseDeterministic(deterministic_mode);
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(dtype, c_type, [&] {
     status = sampling::TopKPageTableTransformDispatch<c_type, int32_t>(
         static_cast<c_type*>(input.data_ptr()), static_cast<int32_t*>(output_page_table.data_ptr()),
         static_cast<const int32_t*>(src_page_table.data_ptr()), src_stride, row_to_batch_ptr,
         static_cast<int32_t*>(lengths.data_ptr()), num_rows, static_cast<uint32_t>(top_k), max_len,
-        row_states_ptr, stream);
+        row_states_ptr, deterministic, stream);
     return true;
   });
 
@@ -110,7 +125,7 @@ void radix_topk_page_table_transform(TensorView input, TensorView output_page_ta
 
 void radix_topk_ragged_transform(TensorView input, TensorView output_indices, TensorView offsets,
                                  TensorView lengths, Optional<TensorView> maybe_row_states_buffer,
-                                 int64_t top_k) {
+                                 int64_t top_k, int64_t deterministic_mode) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_indices);
   CHECK_INPUT(offsets);
@@ -136,11 +151,12 @@ void radix_topk_ragged_transform(TensorView input, TensorView output_indices, Te
   }
 
   // Use unified dispatch with heuristics to choose between FilteredTopK and RadixTopK
+  bool deterministic = ParseDeterministic(deterministic_mode);
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(dtype, c_type, [&] {
     status = sampling::TopKRaggedTransformDispatch<c_type, int32_t>(
         static_cast<c_type*>(input.data_ptr()), static_cast<int32_t*>(output_indices.data_ptr()),
         static_cast<const int32_t*>(offsets.data_ptr()), static_cast<int32_t*>(lengths.data_ptr()),
-        num_rows, static_cast<uint32_t>(top_k), max_len, row_states_ptr, stream);
+        num_rows, static_cast<uint32_t>(top_k), max_len, row_states_ptr, deterministic, stream);
     return true;
   });
 
