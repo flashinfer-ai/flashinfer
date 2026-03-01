@@ -170,7 +170,7 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         self.buffer_flags = torch.tensor(
             [0, 2, self.buffer_size_bytes, 0, *num_bytes_to_clear, 0],
             dtype=torch.uint32,
-            device=torch.device("cuda", mapping.local_rank),
+            device=torch.device("cuda", torch.cuda.current_device()),
         )
 
         self.uc_ptrs_dev = self.mcast_buffer_handle.get_buffer_ptrs_dev()
