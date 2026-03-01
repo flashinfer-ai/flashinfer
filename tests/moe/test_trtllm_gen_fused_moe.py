@@ -16,6 +16,7 @@ limitations under the License.
 
 import pytest
 from abc import ABC, abstractmethod
+from itertools import product
 from typing import Dict
 import torch
 from cuda.bindings import runtime
@@ -849,7 +850,10 @@ class FP8BlockScaleMoe(Moe):
     def quantize_weights(self, gemm1_weights, gemm2_weights, hidden_states_sample):
         """Quantize weights to FP8 with block scaling."""
         num_experts = gemm1_weights.shape[0]
-        intermediate_size = gemm1_weights.shape[1] // 2
+        # Non-gated activations (e.g. Relu2) use [E, I, H], gated use [E, 2I, H].
+        intermediate_size = gemm2_weights.shape[2]
+        intermediate_size_factor = gemm1_weights.shape[1] // intermediate_size
+        assert intermediate_size_factor in (1, 2)
         hidden_size = gemm1_weights.shape[
             2
         ]  # [num_experts, 2*intermediate_size, hidden_size]
@@ -858,7 +862,11 @@ class FP8BlockScaleMoe(Moe):
             # Quantize weights to FP8
             gemm1_weights_fp8 = gemm1_weights.to(torch.float8_e4m3fn)
             gemm1_scales = 2 * torch.rand(
-                (num_experts, 2 * intermediate_size // 128, hidden_size // 128),
+                (
+                    num_experts,
+                    intermediate_size_factor * intermediate_size // 128,
+                    hidden_size // 128,
+                ),
                 device="cuda",
             ).to(torch.float)
 
@@ -1005,24 +1013,25 @@ class FP8BlockScaleMoe(Moe):
             gemm1_weights_fp8_interleaved = args.gemm1_weights.clone()
             gemm1_scales_fp8_interleaved = args.gemm1_scales.clone()
             if self.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_MXFP8:
-                # Reorder rows of W1 for fused gated activation
+                # Reorder rows of W1 only for fused gated activation.
                 gemm1_weights_fp8_interleaved = []
                 gemm1_scales_fp8_interleaved = []
                 for i in range(num_experts):
-                    gemm1_weights_fp8_interleaved.append(
-                        reorder_rows_for_gated_act_gemm(
-                            args.gemm1_weights[i]
-                            .clone()
-                            .reshape(intermediate_size_factor * intermediate_size, -1)
-                        )
+                    gemm1_w = (
+                        args.gemm1_weights[i]
+                        .clone()
+                        .reshape(intermediate_size_factor * intermediate_size, -1)
                     )
-                    gemm1_scales_fp8_interleaved.append(
-                        reorder_rows_for_gated_act_gemm(
-                            args.gemm1_scales[i]
-                            .clone()
-                            .reshape(intermediate_size_factor * intermediate_size, -1)
-                        )
+                    gemm1_s = (
+                        args.gemm1_scales[i]
+                        .clone()
+                        .reshape(intermediate_size_factor * intermediate_size, -1)
                     )
+                    if is_gated_activation(args.activation_type):
+                        gemm1_w = reorder_rows_for_gated_act_gemm(gemm1_w)
+                        gemm1_s = reorder_rows_for_gated_act_gemm(gemm1_s)
+                    gemm1_weights_fp8_interleaved.append(gemm1_w)
+                    gemm1_scales_fp8_interleaved.append(gemm1_s)
 
                 # Stack weights and scales for all experts
                 gemm1_weights_fp8_interleaved = torch.stack(
@@ -1047,7 +1056,7 @@ class FP8BlockScaleMoe(Moe):
                     tmp_scales1 = shuffle_matrix_sf_a(
                         gemm1_scales_fp8_interleaved[i]
                         .view(torch.uint8)
-                        .reshape(2 * intermediate_size, -1),
+                        .reshape(intermediate_size_factor * intermediate_size, -1),
                         epilogue_tile_m,
                     )
                     tmp_scales2 = shuffle_matrix_sf_a(
@@ -1109,6 +1118,7 @@ class FP8BlockScaleMoe(Moe):
         intermediate_size = kwargs["intermediate_size"]
         routed_scaling = kwargs["routed_scaling"]
         routing_method_type = kwargs["routing_method_type"]
+        activation_type = kwargs["activation_type"]
         enable_autotune = kwargs.get("enable_autotune", True)
         enable_pdl = kwargs.get("enable_pdl")
         hidden_states_scale = kwargs["hidden_states_scale"]
@@ -1154,6 +1164,7 @@ class FP8BlockScaleMoe(Moe):
                 enable_pdl=enable_pdl,
                 tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
                 fp8_quantization_type=quantization_mode,
+                activation_type=activation_type,
             )
         return output.to(torch.float)
 
@@ -3329,4 +3340,163 @@ def test_nvfp4_moe_gemm_bias(
         cache_permute_indices=cache_permute_indices,
         gemm1_bias=gemm1_bias,
         gemm2_bias=gemm2_bias,
+    )
+
+
+@pytest.mark.parametrize("num_tokens", [1, 16, 64, 256, 1000, 4000])
+@pytest.mark.parametrize("hidden_size", [512, 1024])
+@pytest.mark.parametrize("intermediate_size", [512, 1024])
+@pytest.mark.parametrize(
+    "zero_hidden_states",
+    [
+        pytest.param(True, id="ZeroHiddenStates"),
+        pytest.param(False, id="RandomHiddenStates"),
+    ],
+)
+@pytest.mark.parametrize(
+    "routing_config",
+    [
+        pytest.param(
+            {
+                "num_experts": 32,
+                "top_k": 4,
+                "padding": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.Renormalize,
+                "compatible_moe_impls": [FP8BlockScaleMoe],
+                "compatible_intermediate_size": [512, 1024],
+                "compatible_activation_types": [ActivationType.Relu2],
+                "enable_autotune": False,
+            },
+            id="E32_K4",
+        ),
+        pytest.param(
+            {
+                "num_experts": 64,
+                "top_k": 8,
+                "padding": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.Renormalize,
+                "compatible_moe_impls": [FP8BlockScaleMoe],
+                "compatible_intermediate_size": [512, 1024],
+                "compatible_activation_types": [ActivationType.Relu2],
+                "enable_autotune": False,
+            },
+            id="E64_K8",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "weight_processing",
+    [
+        pytest.param(
+            {
+                "use_shuffled_weight": True,
+                "layout": WeightLayout.MajorK,
+                "compatible_moe_impls": [FP8BlockScaleMoe],
+            },
+            id="Shuffled_MajorK",
+        ),
+    ],
+)
+def test_mxfp8_block_scale_moe_relu2_non_gated(
+    num_tokens,
+    hidden_size,
+    intermediate_size,
+    zero_hidden_states,
+    routing_config,
+    weight_processing,
+    cache_permute_indices,
+):
+    """Test MXFP8 block-scale TRTLLM MoE with non-gated RELU2."""
+    run_moe_test(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        moe_impl=FP8BlockScaleMoe(
+            fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_MXFP8
+        ),
+        routing_config=routing_config,
+        weight_processing=weight_processing,
+        activation_type=ActivationType.Relu2,
+        cache_permute_indices=cache_permute_indices,
+        zero_hidden_states=zero_hidden_states,
+    )
+
+
+_NEMOTRON_H_RELU2_MXFP8_CASES = [
+    pytest.param(
+        {
+            "num_tokens": num_tokens,
+            "hidden_size": hidden_size,
+            "intermediate_size": intermediate_size,
+            "num_experts": num_experts,
+            "top_k": top_k,
+            "enable_autotune": False,
+        },
+        id=(
+            f"NemoH_nt{num_tokens}_h{hidden_size}_i{intermediate_size}_"
+            f"e{num_experts}_k{top_k}_autotune_off"
+        ),
+    )
+    for num_tokens, hidden_size, intermediate_size, (num_experts, top_k) in product(
+        [1, 16, 64, 256, 1000, 4000],
+        [2688, 4096],
+        [4096],
+        [(128, 6), (256, 8), (512, 10)],
+    )
+] + [
+    # Keep one explicit autotune-on check without doubling the full matrix runtime.
+    pytest.param(
+        {
+            "num_tokens": 128,
+            "hidden_size": 2688,
+            "intermediate_size": 4096,
+            "num_experts": 128,
+            "top_k": 6,
+            "enable_autotune": True,
+        },
+        id="NemoH_nt128_h2688_i4096_e128_k6_autotune_on",
+    )
+]
+
+
+@pytest.mark.parametrize("case", _NEMOTRON_H_RELU2_MXFP8_CASES)
+def test_mxfp8_block_scale_moe_relu2_nemotron_h_config(cache_permute_indices, case):
+    """Coverage check aligned with Nemotron-H MoE config (Relu2, non-gated MXFP8)."""
+    intermediate_size = case["intermediate_size"]
+    run_moe_test(
+        num_tokens=case["num_tokens"],
+        hidden_size=case["hidden_size"],
+        intermediate_size=intermediate_size,
+        moe_impl=FP8BlockScaleMoe(
+            fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_MXFP8
+        ),
+        routing_config={
+            "num_experts": case["num_experts"],  # n_routed_experts
+            "top_k": case["top_k"],  # num_experts_per_tok
+            "padding": 8,
+            "n_groups": 1,  # n_group
+            "top_k_groups": 1,  # topk_group
+            "routed_scaling": 2.5,  # routed_scaling_factor
+            "has_routing_bias": False,
+            "routing_method_type": RoutingMethodType.RenormalizeNaive,
+            "compatible_moe_impls": [FP8BlockScaleMoe],
+            "compatible_intermediate_size": [intermediate_size],
+            "compatible_activation_types": [ActivationType.Relu2],
+            "enable_autotune": case["enable_autotune"],
+        },
+        weight_processing={
+            "use_shuffled_weight": True,
+            "layout": WeightLayout.MajorK,
+            "compatible_moe_impls": [FP8BlockScaleMoe],
+        },
+        activation_type=ActivationType.Relu2,
+        cache_permute_indices=cache_permute_indices,
     )

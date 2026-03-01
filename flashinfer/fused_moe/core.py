@@ -1190,6 +1190,7 @@ def get_trtllm_moe_sm100_module():
                         kwargs["enable_pdl"],
                         [-1, -1] if tactic == -1 else tactic,
                         self.fp8_quantization_type,
+                        self.activation_type,
                     )
                 else:
                     # FP8 per tensor scale
@@ -1657,6 +1658,7 @@ def get_trtllm_moe_sm100_module():
         enable_pdl: Optional[bool] = None,
         tune_max_num_tokens: int = 8192,
         fp8_quantization_type: Fp8QuantizationType = Fp8QuantizationType.DeepSeekFp8,
+        activation_type: int = ActivationType.Swiglu.value,
     ) -> List[torch.Tensor]:
         # Determine routing mode: compute from logits or use pre-computed
         if routing_logits is None:
@@ -1718,6 +1720,7 @@ def get_trtllm_moe_sm100_module():
             fp8_quantization_type=fp8_quantization_type,  # block_scale mode
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            activation_type=activation_type,
             weight_layout=weight_layout,
             use_shuffled_weight=use_shuffled_weight,
         )
@@ -1781,6 +1784,7 @@ def get_trtllm_moe_sm100_module():
             enable_pdl,
             [-1, -1] if tactic == -1 else tactic,
             fp8_quantization_type,
+            activation_type,
         )
 
         if do_finalize:
@@ -1824,6 +1828,7 @@ def get_trtllm_moe_sm100_module():
         enable_pdl: Optional[bool] = None,
         tune_max_num_tokens: int = 8192,
         fp8_quantization_type: Fp8QuantizationType = Fp8QuantizationType.DeepSeekFp8,
+        activation_type: int = ActivationType.Swiglu.value,
     ) -> List[torch.Tensor]:
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
@@ -2543,6 +2548,7 @@ def trtllm_fp8_block_scale_moe(
     enable_pdl: Optional[bool] = None,
     tune_max_num_tokens: int = 8192,
     fp8_quantization_type: Fp8QuantizationType = Fp8QuantizationType.DeepSeekFp8,
+    activation_type: int = ActivationType.Swiglu.value,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     """FP8 block scale MoE operation.
 
@@ -2552,8 +2558,10 @@ def trtllm_fp8_block_scale_moe(
         hidden_states: [seq_len, hidden_size] tensor of input hidden states
         hidden_states_scale: [hidden_size//128, seq_len] tensor of hidden states block scales
         gemm1_weights: tensor of first layer weights
-            - [num_experts, 2*intermediate_size, hidden_size] if weight_layout == WeightLayout.MajorK
-            - [num_experts, 2*intermediate_size // 128, hidden_size, 128] if weight_layout == WeightLayout.BlockMajorK
+            - [num_experts, M, hidden_size] if weight_layout == WeightLayout.MajorK
+            - [num_experts, M // 128, hidden_size, 128] if weight_layout == WeightLayout.BlockMajorK
+            where M is `2*intermediate_size` for gated activations and
+            `intermediate_size` for non-gated activations (e.g. Relu2/Identity).
         gemm1_weights_scale: [num_experts, 2*intermediate_size//(32 if mxfp8 else 128), hidden_size//(32 if mxfp8 else 128)] tensor of first layer block scales
         gemm2_weights: tensor of second layer weights
             - [num_experts, hidden_size, intermediate_size] if weight_layout == WeightLayout.MajorK
@@ -2575,6 +2583,11 @@ def trtllm_fp8_block_scale_moe(
         enable_pdl: Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
         tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
         fp8_quantization_type: Type of FP8 quantization to use (default: DeepSeekFp8)
+        activation_type (int): Type of activation function (default: 3 - Swiglu)
+            - 3: Swiglu
+            - 4: Geglu
+            - 6: Relu2
+            - 7: Identity
     Returns:
         when do_finalize=True, returns the final MoE output.
         otherwise, returns the intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
@@ -2609,6 +2622,7 @@ def trtllm_fp8_block_scale_moe(
         enable_pdl,
         tune_max_num_tokens,
         fp8_quantization_type,
+        activation_type,
     )
 
     if do_finalize:
@@ -2646,6 +2660,7 @@ def trtllm_fp8_block_scale_routed_moe(
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
     fp8_quantization_type: Fp8QuantizationType = Fp8QuantizationType.DeepSeekFp8,
+    activation_type: int = ActivationType.Swiglu.value,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     """FP8 block scale MoE operation with pre-computed routing (packed format).
 
@@ -2661,7 +2676,9 @@ def trtllm_fp8_block_scale_routed_moe(
         routing_bias: [num_experts] tensor of routing bias (can be None)
         hidden_states: [seq_len, hidden_size] tensor of input hidden states
         hidden_states_scale: [hidden_size//(32 if mxfp8 else 128), seq_len] tensor of hidden states block scales
-        gemm1_weights: [num_experts, 2*intermediate_size, hidden_size] tensor of first layer weights
+        gemm1_weights: [num_experts, M, hidden_size] tensor of first layer weights where
+            M is `2*intermediate_size` for gated activations and
+            `intermediate_size` for non-gated activations.
         gemm1_weights_scale: [num_experts, 2*intermediate_size//(32 if mxfp8 else 128), hidden_size//(32 if mxfp8 else 128)] tensor of first layer block scales
         gemm2_weights: [num_experts, hidden_size, intermediate_size] tensor of second layer weights
         gemm2_weights_scale: [num_experts, hidden_size//(32 if mxfp8 else 128), intermediate_size//(32 if mxfp8 else 128)] tensor of second layer block scales
@@ -2682,6 +2699,11 @@ def trtllm_fp8_block_scale_routed_moe(
             Optional inplace output tensor.
         tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
         fp8_quantization_type: Type of FP8 quantization to use (default: DeepSeekFp8)
+        activation_type (int): Type of activation function (default: 3 - Swiglu)
+            - 3: Swiglu
+            - 4: Geglu
+            - 6: Relu2
+            - 7: Identity
     Returns:
         when do_finalize=True, returns the final MoE output.
         otherwise, returns the intermediate results (gemm2_output, undefined, expanded_idx_to_permuted_idx) that need further processing.
@@ -2713,6 +2735,7 @@ def trtllm_fp8_block_scale_routed_moe(
         enable_pdl,
         tune_max_num_tokens,
         fp8_quantization_type,
+        activation_type,
     )
 
     if do_finalize:
