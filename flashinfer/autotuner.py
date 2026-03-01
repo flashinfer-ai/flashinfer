@@ -603,15 +603,18 @@ class AutoTuner:
             end = torch.cuda.Event(enable_timing=True)
             graph = torch.cuda.CUDAGraph()
 
+            def _run_kernels():
+                for r in range(repeat):
+                    runner(
+                        input_tensor_batches[r % len(input_tensor_batches)],
+                        tactic=tactic,
+                        **kwargs,
+                    )
+
             with torch.cuda.stream(stream):
                 if tuning_config.use_cuda_graph:
                     with torch.cuda.graph(graph):
-                        for r in range(repeat):
-                            runner(
-                                input_tensor_batches[r % len(input_tensor_batches)],
-                                tactic=tactic,
-                                **kwargs,
-                            )
+                        _run_kernels()
 
                 stream.synchronize()
 
@@ -628,12 +631,7 @@ class AutoTuner:
                 if tuning_config.use_cuda_graph:
                     graph.replay()
                 else:
-                    for r in range(repeat):
-                        runner(
-                            input_tensor_batches[r % len(input_tensor_batches)],
-                            tactic=tactic,
-                            **kwargs,
-                        )
+                    _run_kernels()
 
                 end.record()
                 stream.synchronize()
