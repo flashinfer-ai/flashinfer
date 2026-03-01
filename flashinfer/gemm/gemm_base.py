@@ -91,6 +91,11 @@ DEFAULT_WORKSPACE_SIZE = 32 * 1024 * 1024
 # Error messages
 CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR = "cudnn FP4 GEMM with mxfp4 quantization is not supported on SM120/SM121 with cuDNN backend version < 9.14.0."
 
+_TORCH_TO_CUTLASS_DTYPE_ATTR = {
+    torch.bfloat16: "BFloat16",
+    torch.float16: "Float16",
+}
+
 
 def _match_sm_version(device: torch.device, sm_version: list[str]):
     major, minor = get_compute_capability(device)
@@ -2648,17 +2653,21 @@ def _cute_dsl_gemm_mxfp8_requirement(
         raise ValueError(
             "cute_dsl mm_mxfp8 requires swizzled 1D scale tensors for a_descale and b_descale."
         )
-    try:
-        from flashinfer.cute_dsl.utils import is_cute_dsl_available
-
-        if not is_cute_dsl_available():
-            raise RuntimeError("CuTe DSL is not available.")
-    except ImportError as err:
-        raise RuntimeError("CuTe DSL is not available.") from err
+    _check_cute_dsl_availability()
     return True
 
 
 _CUTE_DSL_MM_MXFP8_KERNEL_CACHE = {}
+
+
+def _check_cute_dsl_availability():
+    try:
+        from flashinfer.cute_dsl.utils import is_cute_dsl_available
+    except ImportError as err:
+        raise RuntimeError("CuTe DSL is not available.") from err
+
+    if not is_cute_dsl_available():
+        raise RuntimeError("CuTe DSL is not available.")
 
 
 def _cute_dsl_gemm_mxfp8_runner(
@@ -2682,11 +2691,13 @@ def _cute_dsl_gemm_mxfp8_runner(
             "Supported: torch.bfloat16, torch.float16."
         )
 
-    _torch_to_cutlass_dtype = {
-        torch.bfloat16: cutlass.BFloat16,
-        torch.float16: cutlass.Float16,
-    }
-    c_cutlass_dtype = _torch_to_cutlass_dtype[out_dtype]
+    cutlass_dtype_attr = _TORCH_TO_CUTLASS_DTYPE_ATTR.get(out_dtype)
+    if cutlass_dtype_attr is None:
+        raise ValueError(
+            f"cute_dsl mm_mxfp8 does not support output dtype {out_dtype}. "
+            "Supported: torch.bfloat16, torch.float16."
+        )
+    c_cutlass_dtype = getattr(cutlass, cutlass_dtype_attr)
     _ = sm_major, sm_minor
 
     class CuteDSLMxfp8GemmRunner(TunableRunner):
@@ -2710,9 +2721,6 @@ def _cute_dsl_gemm_mxfp8_runner(
             m = a.shape[0]
             real_k = a.shape[1]
             n = b.shape[1]
-
-            if a_descale.ndim != 1 or b_descale.ndim != 1:
-                return []
 
             sf_vec_size = 32
             ab_dtype = cutlass.Float8E4M3FN
@@ -2812,11 +2820,6 @@ def _cute_dsl_gemm_mxfp8_runner(
             m = a.shape[0]
             real_k = a.shape[1]
             n = b.shape[1]
-
-            if a_descale.ndim != 1 or b_descale.ndim != 1:
-                raise ValueError(
-                    "cute_dsl mm_mxfp8 requires swizzled 1D scale tensors for a_descale and b_descale."
-                )
 
             sf_vec_size = 32
             sf_dtype = cutlass.Float8E8M0FNU
@@ -3481,13 +3484,7 @@ def _cute_dsl_gemm_fp4_requirement(
     # preparation for 128x4 layout.
     if use_8x4_sf_layout:
         raise ValueError("cute_dsl FP4 GEMM only supports 128x4 scale factor layout.")
-    try:
-        from flashinfer.cute_dsl.utils import is_cute_dsl_available
-
-        if not is_cute_dsl_available():
-            raise RuntimeError("CuTe DSL is not available.")
-    except ImportError as err:
-        raise RuntimeError("CuTe DSL is not available.") from err
+    _check_cute_dsl_availability()
     return True
 
 
@@ -3536,11 +3533,10 @@ def _cute_dsl_gemm_fp4_runner(
     #         pass
 
     # Map torch output dtype to cutlass dtype
-    _torch_to_cutlass_dtype = {
-        torch.bfloat16: cutlass.BFloat16,
-        torch.float16: cutlass.Float16,
-    }
-    c_cutlass_dtype = _torch_to_cutlass_dtype.get(out_dtype)
+    cutlass_dtype_attr = _TORCH_TO_CUTLASS_DTYPE_ATTR.get(out_dtype)
+    c_cutlass_dtype = (
+        getattr(cutlass, cutlass_dtype_attr) if cutlass_dtype_attr is not None else None
+    )
     if c_cutlass_dtype is None:
         raise ValueError(
             f"cute_dsl backend does not support output dtype {out_dtype}. "

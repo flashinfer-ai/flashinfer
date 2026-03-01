@@ -2139,11 +2139,19 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         k_raw = cute.size(mA, mode=[1])
         n = cute.size(mB, mode=[0])
 
-        if cutlass.const_expr(mA.element_type == cutlass.Uint8):
+        if cutlass.const_expr(
+            mA.element_type == cutlass.Uint8 and mB.element_type == cutlass.Uint8
+        ):
             # FP4 packed path: 2 FP4 values per uint8 byte
             k = k_raw * 2
             a_ptr = cute.recast_ptr(mA.iterator, dtype=cutlass.Float4E2M1FN)
             b_ptr = cute.recast_ptr(mB.iterator, dtype=cutlass.Float4E2M1FN)
+        elif cutlass.const_expr(mA.element_type != mB.element_type):
+            raise TypeError(
+                "Unsupported mixed input dtypes for block-scaled GEMM: "
+                "mA and mB must have matching element_type "
+                "(both Uint8 for FP4 path, or both FP8 for MXFP8 path)."
+            )
         else:
             # MXFP8 path: input tensors are already FP8.
             k = k_raw
