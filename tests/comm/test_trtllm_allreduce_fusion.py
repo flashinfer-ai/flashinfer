@@ -25,7 +25,13 @@ SCALE_FACTOR_RANGE = (-1, 1)
 
 
 def _run_correctness_worker(
-    world_size, rank, dtype, hidden_dim, distributed_init_port, legacy_api=True, gpu_offset=0
+    world_size,
+    rank,
+    dtype,
+    hidden_dim,
+    distributed_init_port,
+    legacy_api=True,
+    gpu_offset=0,
 ):
     device = torch.device(f"cuda:{rank + gpu_offset}")
     torch.cuda.set_device(device)
@@ -429,12 +435,16 @@ def multi_process_parallel(
     distributed_init_port = get_open_port()
     for i in range(world_size):
         proc_args = (
-            world_size,
-            i,
-            dtype,
-            hidden_dim,
-            distributed_init_port,
-        ) + target_args + (gpu_offset,)
+            (
+                world_size,
+                i,
+                dtype,
+                hidden_dim,
+                distributed_init_port,
+            )
+            + target_args
+            + (gpu_offset,)
+        )
         proc = mp.Process(target=test_target, args=proc_args, name=f"Worker-{i}")
         proc.start()
         procs.append(proc)
