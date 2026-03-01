@@ -601,7 +601,7 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
                 aligned_size,
                 tp_size,
                 tp_rank,
-                torch.device("cuda", tp_rank).index,
+                torch.cuda.current_device(),
                 comm_backend,
                 enable_multicast=False,
                 allocate_signal_pads=False,
