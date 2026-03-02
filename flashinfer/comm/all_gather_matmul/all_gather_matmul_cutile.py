@@ -92,6 +92,8 @@ def wait_signal_matmul_kernel(
             m_tile_idx, n_tile_idx = swizzle_2d_from_bid(
                 real_chunk_size_m, N, tile_m, tile_n, group_size_m, bid
             )
+            if m_tile_idx * tile_m >= real_chunk_size_m:
+                break
 
             # Wait for input ready signal
             if shift > 0:
