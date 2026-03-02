@@ -137,7 +137,9 @@ class _SSDKernel:
         self.io_dtype = io_dtype or cutlass.BFloat16
         self.cumsum_dtype = cumsum_dtype or cutlass.Float32
         self.acc_dtype = acc_dtype or cutlass.Float32
-        seq_idx_cutlass_dtype = cutlass.Int64 if seq_idx_dtype == "int64" else cutlass.Int32
+        seq_idx_cutlass_dtype = (
+            cutlass.Int64 if seq_idx_dtype == "int64" else cutlass.Int32
+        )
 
         # Create the kernel
         SSDKernel = self.modules["SSDKernel"]
@@ -261,17 +263,19 @@ class _SSDKernel:
                 mode=mode, stride_order=cumsum_permuted.dim_order()
             )
 
-        # B: Torch (batch, seqlen, ngroups, dstate) -> CUTLASS (chunk_size, dstate, nchunks, ngroups, batch)
+        # B: zero-copy (L, N, C, G, B) with N stride 1 (K-major for MMA B operand)
+        # PyTorch (B, C, L, G, N) permuted (2, 4, 1, 3, 0) gives (L, N, C, G, B) with N contiguous
+        # Modes 0,1 are (N_mma, K_mma) = (L, N) matching make_tiled_tma_atom_B expectations
         B_reshaped = B.reshape(batch, nchunks, chunk_size, ngroups, dstate)
-        b_tensor, b_dst = _create_cutlass_tensor(
-            [batch, ngroups, dstate, nchunks, chunk_size],
-            [4, 2, 3, 1, 0],
-            self.io_dtype,
-            [2, 3, 4],
-            cutlass_torch,
-            from_dlpack,
+        assert B.dtype == io_torch_dtype, (
+            f"B dtype {B.dtype} doesn't match {io_torch_dtype}"
         )
-        b_dst.copy_(B_reshaped.permute(2, 4, 1, 3, 0).to(b_dst.dtype))
+        b_permuted = B_reshaped.permute(2, 4, 1, 3, 0)  # (L, N, C, G, B)
+        b_tensor = from_dlpack(b_permuted, assumed_align=16)
+        for mode in [2, 3, 4]:
+            b_tensor = b_tensor.mark_compact_shape_dynamic(
+                mode=mode, stride_order=b_permuted.dim_order()
+            )
 
         # C: zero-copy (L, N, C, G, B) with N stride 1 (K-major for MMA A operand)
         # PyTorch (B, C, L, G, N) permuted (2, 4, 1, 3, 0) gives (L, N, C, G, B) with N contiguous
@@ -389,7 +393,9 @@ class _SSDKernel:
                 0, chunk_indices.long() * chunk_size + chunk_offsets.long()
             ]
             counts = torch.zeros(num_seqs, dtype=torch.int32, device=seq_idx.device)
-            counts.scatter_add_(0, seq_ids.int(), torch.ones_like(seq_ids, dtype=torch.int32))
+            counts.scatter_add_(
+                0, seq_ids.int(), torch.ones_like(seq_ids, dtype=torch.int32)
+            )
             seq_chunk_cumsum = torch.zeros(
                 num_seqs + 1, dtype=torch.int32, device=seq_idx.device
             )
@@ -667,7 +673,9 @@ def ssd_combined_fwd(
     has_z = z is not None
     # Map torch seq_idx dtype to cutlass type for kernel compilation
     _seq_idx_dtype_map = {torch.int32: "int32", torch.int64: "int64"}
-    seq_idx_dtype_key = _seq_idx_dtype_map.get(seq_idx.dtype) if seq_idx is not None else None
+    seq_idx_dtype_key = (
+        _seq_idx_dtype_map.get(seq_idx.dtype) if seq_idx is not None else None
+    )
     torch.cuda.nvtx.range_push("get_ssd_kernel")
     kernel = _get_ssd_kernel(
         chunk_size=chunk_size,
@@ -685,8 +693,13 @@ def ssd_combined_fwd(
     # Allocate output in kernel's native layout if not provided
     if out is None:
         out = torch.empty(
-            batch, nheads, headdim, nchunks, chunk_size,
-            dtype=x.dtype, device=x.device,
+            batch,
+            nheads,
+            headdim,
+            nchunks,
+            chunk_size,
+            dtype=x.dtype,
+            device=x.device,
         )
 
     torch.cuda.nvtx.range_push("kernel.run")

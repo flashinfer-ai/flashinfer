@@ -221,12 +221,27 @@ class SSDKernel:
         )
 
         # B needs to be proprocessed to be used as A operand of INTER1_MMA
+        # bt_smem_layout aliases smem_b for PRE_INTER element-wise reads.
+        # Now N-contiguous (COL_MAJOR) to match new K-major b_smem_layout.
         self.bt_smem_layout = cute.coalesce(
+            sm100_utils.make_smem_layout_epi(
+                self.io_dtype,
+                utils.LayoutEnum.COL_MAJOR,
+                (self.tile_shape_mnk_inter1[0], self.tile_shape_mnk_inter1[2]),
+                self.input_stages,
+            ),
+            target_profile=(1, 1, 1),
+        )
+
+        # Store layout for PRE_INTER R2S into smem_bt_internal.
+        # ROW_MAJOR (L-contiguous) matching bt_internal_smem_layout's physical mapping,
+        # but with simpler epi shape compatible with the S2R tiled_copy partition.
+        self.bt_store_smem_layout = cute.coalesce(
             sm100_utils.make_smem_layout_epi(
                 self.io_dtype,
                 utils.LayoutEnum.ROW_MAJOR,
                 (self.tile_shape_mnk_inter1[0], self.tile_shape_mnk_inter1[2]),
-                self.input_stages,
+                self.internal_stages,
             ),
             target_profile=(1, 1, 1),
         )
@@ -685,6 +700,7 @@ class SSDKernel:
             self.b_smem_layout,
             self.bt_smem_layout,
             self.bt_internal_smem_layout,
+            self.bt_store_smem_layout,
             self.c_smem_layout,
             self.pt_smem_layout,
             self.p_smem_layout,
@@ -741,6 +757,7 @@ class SSDKernel:
         b_smem_layout: cute.ComposedLayout,
         bt_smem_layout: cute.ComposedLayout,
         bt_internal_smem_layout: cute.ComposedLayout,
+        bt_store_smem_layout: cute.ComposedLayout,
         c_smem_layout: cute.ComposedLayout,
         pt_smem_layout: cute.ComposedLayout,
         p_smem_layout: cute.ComposedLayout,
@@ -844,6 +861,11 @@ class SSDKernel:
         )
         smem_bt_internal = smem_storage.smem_bt_internal.get_tensor(
             bt_internal_smem_layout.outer, swizzle=bt_internal_smem_layout.inner
+        )
+        # Store view of smem_bt_internal: ROW_MAJOR (L-contiguous) epi layout
+        # compatible with PRE_INTER S2R tiled_copy partition (simpler than MMA layout)
+        smem_bt_internal_store = smem_storage.smem_bt_internal.get_tensor(
+            bt_store_smem_layout.outer, swizzle=bt_store_smem_layout.inner
         )
         smem_c = smem_storage.smem_c.get_tensor(
             c_smem_layout.outer, swizzle=c_smem_layout.inner
@@ -1052,6 +1074,7 @@ class SSDKernel:
                 local_warp_idx,
                 smem_bt,
                 smem_bt_internal,
+                smem_bt_internal_store,
                 smem_delta,
                 smem_cumsum_delta,
                 smem_pt,
@@ -1172,6 +1195,7 @@ class SSDKernel:
         local_warp_idx,
         smem_bt,
         smem_bt_internal,
+        smem_bt_internal_store,
         smem_delta,
         smem_cumsum_delta,
         smem_pt,
@@ -1205,14 +1229,14 @@ class SSDKernel:
             local_tidx, smem_bt
         )
 
-        # Partition shared tensor for smem store Bt
-        smem_bt_internal_ = cute.make_tensor(smem_bt_internal.iterator, smem_bt.layout)
         # Make tiledCopy and partition register/smem tensor for smem store Bt
+        # Use bt_store_smem_layout view: ROW_MAJOR (L-contiguous) epi layout
+        # matching bt_internal_smem_layout physical mapping, compatible with S2R partition
         # ((R2S_ATOM_V, R2S_REST_V), R2S_M, R2S_N)
         # ((R2S_ATOM_V, R2S_REST_V), R2S_M, R2S_N, INTERNAL_STAGE)
         tiled_r2s_b, tBrB_r2s, tBsB_r2s = self.pre_inter_smem_store_and_partition_b(
             local_tidx,
-            smem_bt_internal_,
+            smem_bt_internal_store,
             tiled_s2r_b,
             tBrB_s2r,
         )
@@ -1554,7 +1578,9 @@ class SSDKernel:
                     if not is_last_chunk:
                         next_chunk = chunk_indices[physical_chunk + 1]
                         chunk_offset_next = chunk_offsets[physical_chunk + 1]
-                        next_seq = cutlass.Int32(seq_idx[0, next_chunk * L + chunk_offset_next])
+                        next_seq = cutlass.Int32(
+                            seq_idx[0, next_chunk * L + chunk_offset_next]
+                        )
                         seq_ends_here = next_seq != seq_id
 
                     # A. Store final state of ending sequence to gmem
@@ -3302,7 +3328,7 @@ class SSDKernel:
         tiled_mma_intra1 = sm100_utils.make_trivial_tiled_mma(
             io_dtype,
             tcgen05.OperandMajorMode("k"),  # A operand (C) is K-major (N-contiguous)
-            tcgen05.OperandMajorMode("mn"),
+            tcgen05.OperandMajorMode("k"),  # B operand (B) is K-major (N-contiguous)
             acc_dtype,
             cta_group,
             tile_shape_mnk_intra1[:2],
@@ -3937,13 +3963,14 @@ class SSDKernel:
             num_bits_per_copy=128,
         )
         num_elements_per_thread = 128 // dtype.width
-        num_threads_per_row = self.tile_shape_mnk_inter1[2] // num_elements_per_thread
-        num_threads_per_col = 128 // num_threads_per_row
+        # N (mode 0) is now contiguous — distribute threads along N
+        num_threads_per_col = self.tile_shape_mnk_inter1[0] // num_elements_per_thread
+        num_threads_per_row = 128 // num_threads_per_col
         thread_layout = cute.make_layout(
             (num_threads_per_col, num_threads_per_row),
-            stride=(num_threads_per_row, 1),
+            stride=(1, num_threads_per_col),
         )
-        val_layout = cute.make_layout((1, num_elements_per_thread))
+        val_layout = cute.make_layout((num_elements_per_thread, 1))
         tiled_s2r_b = cute.make_tiled_copy_tv(
             copy_atom_s2r_b,
             thread_layout,
@@ -3967,10 +3994,11 @@ class SSDKernel:
     ):
         dtype = smem_bt_internal.element_type
         # Make tiledCopy from register to smem store Bt
+        # Element-wise copy (not vectorized): read is N-contiguous but store
+        # is L-contiguous, so 128-bit vector stores can't be used here.
         copy_atom_r2s_b = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
             dtype,
-            num_bits_per_copy=128,
         )
         tiled_r2s_b = cute.make_tiled_copy_S(copy_atom_r2s_b, tiled_s2r_b)
         thr_r2s_b = tiled_r2s_b.get_slice(local_tidx)
@@ -4064,18 +4092,31 @@ class SSDKernel:
         )
         return tiled_r2s_p, tRS_rP, tRS_sP
 
+    @staticmethod
+    def _make_zero_stride(shape_elem):
+        """Create zero stride matching the nesting of a shape element."""
+        if isinstance(shape_elem, tuple):
+            return tuple(0 for _ in shape_elem)
+        return 0
+
+    @staticmethod
+    def _make_contiguous_stride(shape_elem):
+        """Create contiguous stride matching the nesting of a shape element."""
+        if isinstance(shape_elem, tuple):
+            return (1, shape_elem[0])
+        return 1
+
     def pre_inter_make_delta(self, smem_delta, smem_bt_layout):
-        # Broadcast Delta/DeltaA to Bt shape on M dimension
-        # before: (128,(64,2),2):(64,(1,8192),16384)
-        # after : (128,(64,2),2):(0,(1,64),128)
-        # (MMA, MMA_M, MMA_K, INPUT_STAGE)
+        # Broadcast Delta/DeltaA to Bt shape.
+        # Mode 0 = N (broadcast, stride 0), Mode 1 = L (contiguous), Mode 2 = STAGE
+        shape = smem_bt_layout.shape
         sDeltaA = cute.make_tensor(
             smem_delta.iterator,
             cute.make_layout(
-                smem_bt_layout.shape,
+                shape,
                 stride=(
-                    0,
-                    (1, cute.get(smem_bt_layout.shape, mode=[1, 0])),
+                    self._make_zero_stride(shape[0]),
+                    self._make_contiguous_stride(shape[1]),
                     smem_delta.layout.stride[1],
                 ),
             ),
