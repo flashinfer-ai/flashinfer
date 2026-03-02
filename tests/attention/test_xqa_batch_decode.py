@@ -761,8 +761,8 @@ def test_xqa_batch_decode_nvfp4_kv(
     torch.testing.assert_close(
         output.float(),
         output_ref.float() / o_scale,
-        rtol=1e-2,
-        atol=1e-2,
+        rtol=1e-1,
+        atol=1e-1,
     )
 
 

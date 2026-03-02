@@ -1081,11 +1081,10 @@ __device__ inline void smemQKPartGemm(Warp const& warp, WarpAcc& acc,
                 auto data =
                     convertKCacheWordToF16<InputElem, KElemType>(kSliceOrig(m, n).data[i][j]);
 #if ENABLE_4BIT_KV_CACHE
-                // Apply scaling factor to the data
-                auto scaledData = applyF16ScalingFactors<InputElem>(data[0], data[1],
-                                                                    kSfSlice[s][m][n][i / 2][0]);
-                data[0] = reinterpret_cast<uint32_t&>(scaledData[0]);
-                data[1] = reinterpret_cast<uint32_t&>(scaledData[1]);
+                uint32_t const sfPacked = kSfSlice[s][m][n][i / 2][0];
+                uint16_t const sf = reinterpret_cast<uint16_t const*>(&sfPacked)[i % 2];
+                data[0] = applyF16ScalingFactor<InputElem>(data[0], sf);
+                data[1] = applyF16ScalingFactor<InputElem>(data[1], sf);
 #endif
 
                 ret(m, n).data[i][j * cvtExp] = data[0];

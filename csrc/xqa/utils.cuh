@@ -858,36 +858,27 @@ __device__ inline Vec<uint32_t, 2> convertVCacheWordToF16(uint32_t i8data) {
 }
 
 template <typename InputElem>
-__device__ inline Vec<uint32_t, 2> applyF16ScalingFactors(uint32_t x01, uint32_t x23, uint32_t y) {
-  // Applies half-precision multiplication:
-  // (o0, o1) = (x0, x1) * (y0, y0); (o2, o3) = (x2, x3) * (y1, y1)
-  // (y0, y1) are packed in y.
-  Vec<uint32_t, 2> ret;
+__device__ inline uint32_t applyF16ScalingFactor(uint32_t x, uint16_t sf) {
+  // Broadcasts sf to both lanes and multiplies:
+  // (o0, o1) = (x0, x1) * (sf, sf)
+  uint32_t ret;
   if constexpr (mha::is_same_v<InputElem, half>) {
     asm("{\n"
-        ".reg .b16 sf0, sf1;\n"
-        "mov.b32 {sf0, sf1}, %4;\n"
-        ".reg .b32 sf0_0, sf1_1;\n"
-        "mov.b32 sf0_0, {sf0, sf0};\n"
-        "mov.b32 sf1_1, {sf1, sf1};\n"
-        "mul.rn.f16x2 %0, %2, sf0_0;\n"
-        "mul.rn.f16x2 %1, %3, sf1_1;\n"
+        ".reg .b32 sf2;\n"
+        "mov.b32 sf2, {%2, %2};\n"
+        "mul.rn.f16x2 %0, %1, sf2;\n"
         "}"
-        : "=r"(ret[0]), "=r"(ret[1])
-        : "r"(x01), "r"(x23), "r"(y));
+        : "=r"(ret)
+        : "r"(x), "h"(sf));
   } else {
     static_assert(mha::is_same_v<InputElem, __nv_bfloat16>);
     asm("{\n"
-        ".reg .b16 sf0, sf1;\n"
-        "mov.b32 {sf0, sf1}, %4;\n"
-        ".reg .b32 sf0_0, sf1_1;\n"
-        "mov.b32 sf0_0, {sf0, sf0};\n"
-        "mov.b32 sf1_1, {sf1, sf1};\n"
-        "mul.rn.bf16x2 %0, %2, sf0_0;\n"
-        "mul.rn.bf16x2 %1, %3, sf1_1;\n"
+        ".reg .b32 sf2;\n"
+        "mov.b32 sf2, {%2, %2};\n"
+        "mul.rn.bf16x2 %0, %1, sf2;\n"
         "}"
-        : "=r"(ret[0]), "=r"(ret[1])
-        : "r"(x01), "r"(x23), "r"(y));
+        : "=r"(ret)
+        : "r"(x), "h"(sf));
   }
   return ret;
 }
