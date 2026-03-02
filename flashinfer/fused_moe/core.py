@@ -1175,6 +1175,7 @@ def get_trtllm_moe_sm100_module():
                         output,
                         kwargs["num_experts"],
                         self.top_k,
+                        kwargs.get("num_fused_shared_experts", 0),
                         kwargs["n_group"],
                         kwargs["topk_group"],
                         self.intermediate_size,
@@ -1634,6 +1635,7 @@ def get_trtllm_moe_sm100_module():
         enable_pdl: Optional[bool] = None,
         tune_max_num_tokens: int = 8192,
         fp8_quantization_type: Fp8QuantizationType = Fp8QuantizationType.DeepSeekFp8,
+        num_fused_shared_experts: int = 0,
     ) -> List[torch.Tensor]:
         # Determine routing mode: compute from logits or use pre-computed
         if routing_logits is None:
@@ -1729,7 +1731,9 @@ def get_trtllm_moe_sm100_module():
             weight_layout=weight_layout,
             do_finalize=do_finalize,
             enable_pdl=enable_pdl,
+            num_fused_shared_experts=num_fused_shared_experts,
         )
+        _nfse = num_fused_shared_experts if num_fused_shared_experts is not None else 0
         # Call the C++ function for block scale MoE
         intermediate_output = moe_op.trtllm_fp8_block_scale_moe(
             routing_logits,
@@ -1745,6 +1749,7 @@ def get_trtllm_moe_sm100_module():
             output,
             num_experts,
             top_k,
+            _nfse,
             n_group,
             topk_group,
             intermediate_size,
@@ -2422,6 +2427,7 @@ def trtllm_fp8_block_scale_moe(
     enable_pdl: Optional[bool] = None,
     tune_max_num_tokens: int = 8192,
     fp8_quantization_type: Fp8QuantizationType = Fp8QuantizationType.DeepSeekFp8,
+    num_fused_shared_experts: Optional[int] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     """FP8 block scale MoE operation.
 
@@ -2438,7 +2444,7 @@ def trtllm_fp8_block_scale_moe(
             - [num_experts, hidden_size, intermediate_size] if weight_layout == WeightLayout.MajorK
             - [num_experts, hidden_size//128, intermediate_size, 128] if weight_layout == WeightLayout.BlockMajorK
         gemm2_weights_scale: [num_experts, hidden_size//(32 if mxfp8 else 128), intermediate_size//(32 if mxfp8 else 128)] tensor of second layer block scales
-        num_experts: Total number of experts
+        num_experts: Total number of routed experts
         top_k: Number of experts to route to per token
         n_group: Number of expert groups
         topk_group: Number of groups to consider for top-k routing
@@ -2454,6 +2460,8 @@ def trtllm_fp8_block_scale_moe(
         enable_pdl: Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
         tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
         fp8_quantization_type: Type of FP8 quantization to use (default: DeepSeekFp8)
+        num_fused_shared_experts: Number of shared experts to fuse into the MoE kernel (default: None/0).
+            When > 0, weight tensors must have num_experts + num_fused_shared_experts in the expert dim.
     Returns:
         when do_finalize=True, returns the final MoE output.
         otherwise, returns the intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
@@ -2488,6 +2496,7 @@ def trtllm_fp8_block_scale_moe(
         enable_pdl,
         tune_max_num_tokens,
         fp8_quantization_type,
+        num_fused_shared_experts if num_fused_shared_experts is not None else 0,
     )
 
     if do_finalize:

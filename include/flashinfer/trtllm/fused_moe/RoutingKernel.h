@@ -102,6 +102,12 @@ struct DataBase {
   int32_t mLocalExpertsStartIdx;
   int32_t mLocalExpertsStrideLog2;
   int32_t mNumLocalExperts;
+
+  /// For fused shared expert
+  int32_t mNumFusedSharedExperts;
+  int32_t mSharedExpertTokenOffset;
+  int32_t mSharedExpertNumTokens;
+  int32_t mTotalExpertsPerToken;
 };
 
 template <typename InputT_, typename OutputT_, int MaxNumExperts_, bool isPow2_, bool UsePdl_>
@@ -135,6 +141,11 @@ struct KernelParamsBase {
   int32_t mLocalExpertsStrideLog2 = 0;
   int32_t mNumLocalExperts = 0;
 
+  int32_t mNumFusedSharedExperts = 0;
+  int32_t mSharedExpertTokenOffset = 0;
+  int32_t mSharedExpertNumTokens = 0;
+  int32_t mTotalExpertsPerToken = 0;
+
   // Public initialization function - make it a template to accept different Data types
   template <typename DataType>
   void setBaseParams(DataType const& data) {
@@ -158,6 +169,11 @@ struct KernelParamsBase {
     mLocalExpertsStartIdx = data.mLocalExpertsStartIdx;
     mLocalExpertsStrideLog2 = data.mLocalExpertsStrideLog2;
     mNumLocalExperts = data.mNumLocalExperts;
+
+    mNumFusedSharedExperts = data.mNumFusedSharedExperts;
+    mSharedExpertTokenOffset = data.mSharedExpertTokenOffset;
+    mSharedExpertNumTokens = data.mSharedExpertNumTokens;
+    mTotalExpertsPerToken = data.mTotalExpertsPerToken;
   }
 };
 
