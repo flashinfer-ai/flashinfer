@@ -10,6 +10,7 @@ import pytest
 import torch
 
 import flashinfer
+from flashinfer.utils import get_compute_capability
 
 from .triton_reference.selective_state_update import selective_state_update_triton
 from .utils import create_test_inputs, clone_preserving_strides
@@ -1113,7 +1114,15 @@ class TestSelectiveStateUpdateMTPStochasticRounding(TestSelectiveStateUpdateMTP)
     def make_reference_output(self, inputs):
         """Compute reference output using Triton with stochastic rounding."""
         state_ref = clone_preserving_strides(inputs["state_cache"])
-        rand_seed = torch.tensor(self.RAND_SEED, dtype=torch.int64, device="cuda")
+        major, _ = get_compute_capability(torch.device("cuda"))
+        # Triton cvt.rs.f16x2.f32 requires SM100a+; on older GPUs the Triton
+        # reference falls back to regular rounding while the CUDA kernel still
+        # exercises its software stochastic rounding path.
+        rand_seed = (
+            torch.tensor(self.RAND_SEED, dtype=torch.int64, device="cuda")
+            if major >= 10
+            else None
+        )
         y_ref = selective_state_update_triton(
             state_ref,
             inputs["x"],
@@ -1244,7 +1253,15 @@ class TestSelectiveStateUpdateMTPStochasticRoundingWithIntermediateStates(
         """Compute reference output using Triton with SR and intermediate states."""
         state_ref = clone_preserving_strides(inputs["state_cache"])
         intermediate_states_ref = inputs["intermediate_states_buffer"].clone()
-        rand_seed = torch.tensor(self.RAND_SEED, dtype=torch.int64, device="cuda")
+        major, _ = get_compute_capability(torch.device("cuda"))
+        # Triton cvt.rs.f16x2.f32 requires SM100a+; on older GPUs the Triton
+        # reference falls back to regular rounding while the CUDA kernel still
+        # exercises its software stochastic rounding path.
+        rand_seed = (
+            torch.tensor(self.RAND_SEED, dtype=torch.int64, device="cuda")
+            if major >= 10
+            else None
+        )
 
         y_ref = selective_state_update_triton(
             state_ref,

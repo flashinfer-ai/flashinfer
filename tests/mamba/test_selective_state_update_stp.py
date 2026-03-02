@@ -666,7 +666,15 @@ class TestSelectiveStateUpdateStochasticRounding(TestSelectiveStateUpdate):
     def make_reference_output(self, inputs):
         """Compute reference output using Triton with stochastic rounding."""
         state_ref = inputs["state_cache"].clone()
-        rand_seed = torch.tensor(self.RAND_SEED, dtype=torch.int64, device="cuda")
+        major, _ = get_compute_capability(torch.device("cuda"))
+        # Triton cvt.rs.f16x2.f32 requires SM100a+; on older GPUs the Triton
+        # reference falls back to regular rounding while the CUDA kernel still
+        # exercises its software stochastic rounding path.
+        rand_seed = (
+            torch.tensor(self.RAND_SEED, dtype=torch.int64, device="cuda")
+            if major >= 10
+            else None
+        )
         y_ref = selective_state_update_triton(
             state_ref,
             inputs["x"],
