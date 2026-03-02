@@ -87,6 +87,17 @@ class ActAndMulKernel:
         d: int,
         act_func_name: str,
     ):
+        """Initialize kernel parameters and compute vector size for 128-bit loads.
+
+        Parameters
+        ----------
+        dtype : cutlass.Numeric
+            Element type (Float16 or BFloat16).
+        d : int
+            Hidden dimension (half of the last input dimension).
+        act_func_name : str
+            Activation function: "silu", "gelu", or "gelu_tanh".
+        """
         if act_func_name not in self._VALID_ACT_FUNCS:
             raise ValueError(
                 f"Unknown activation: {act_func_name!r}. "
@@ -166,7 +177,7 @@ class ActAndMulKernel:
                         act_val = silu_f32(x_val)
                     elif cutlass.const_expr(self.act_func_name == "gelu"):
                         act_val = gelu_f32(x_val)
-                    else:
+                    elif cutlass.const_expr(self.act_func_name == "gelu_tanh"):
                         act_val = gelu_tanh_f32(x_val)
 
                     mOut[token_idx, col] = act_val * y_val
