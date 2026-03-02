@@ -38,6 +38,7 @@ struct TrtllmGenGemmRunnerOptions {
   gemm::trtllm::gen::Dtype outputType;
   bool transposeMmaOutput{false};
   gemm::trtllm::gen::SfLayout sfLayoutB;
+  gemm::gemm::MatrixLayout layoutA{gemm::gemm::MatrixLayout::MajorK};
 };
 
 int64_t select_kernel_fp8(int32_t M, int32_t N, int32_t K,
@@ -99,9 +100,7 @@ class TrtllmGenGemmRunner {
       if (options.mDtypeA == mOptions.eltType && options.mDtypeC == mOptions.outputType &&
           options.mTransposeMmaOutput == mOptions.transposeMmaOutput &&
           options.mSfLayoutB == mOptions.sfLayoutB &&
-          options.mLayoutA == gemm::gemm::MatrixLayout::MajorK &&
-          options.mLayoutB ==
-              gemm::gemm::MatrixLayout::MajorK) {  // FIXME(siyuanf): expose matrix layout to user
+          options.mLayoutA == mOptions.layoutA) {  // FIXME(siyuanf): expose matrix layout to user
         mPassingConfigIndices.push_back(i);
       }
     }
@@ -310,6 +309,7 @@ void trtllm_gemm(int64_t input_dtype_, int64_t output_dtype_, TensorView workspa
       .transposeMmaOutput = true,
       .sfLayoutB = use_8x4_sf_layout ? gemm::trtllm::gen::SfLayout::R8c4
                                      : gemm::trtllm::gen::SfLayout::R128c4,
+      .layoutA = gemm::gemm::MatrixLayout::MajorK,  // currently only support major k layout
   });
 
   if (tactic == -1) {
@@ -351,6 +351,7 @@ Array<int64_t> trtllm_gemm_tactics(int64_t m, int64_t n, int64_t k, int64_t inpu
       .transposeMmaOutput = true,
       .sfLayoutB = use_8x4_sf_layout ? gemm::trtllm::gen::SfLayout::R8c4
                                      : gemm::trtllm::gen::SfLayout::R128c4,
+      .layoutA = gemm::gemm::MatrixLayout::MajorK,  // currently only support major k layout
   });
 
   return runner.getValidTactics(m, n, k);
