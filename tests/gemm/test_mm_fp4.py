@@ -29,6 +29,13 @@ def _test_mm_fp4(
             pytest.skip("Skipping test for trtllm fp4 with float16")
         if compute_capability[0] in [11, 12]:
             pytest.skip("trtllm gemm does not support SM110/SM120/SM121 GPUs.")
+    if backend == "cute-dsl":
+        if not use_nvfp4:
+            pytest.skip("cute_dsl backend only supports nvfp4")
+        if not use_128x4_sf_layout:
+            pytest.skip("cute_dsl backend only supports 128x4 SF layout")
+        if compute_capability[0] not in [10]:
+            pytest.skip("cute_dsl backend only supports SM100/SM103 GPUs.")
     if not use_128x4_sf_layout and backend != "trtllm":
         pytest.skip("Skipping test for non-trtllm fp4 with use_128x4_sf_layout=False")
     if not use_nvfp4 and backend not in ["cudnn", "auto"]:
@@ -99,7 +106,7 @@ def _test_mm_fp4(
 @pytest.mark.parametrize("n", [128, 256, 512])
 @pytest.mark.parametrize("k", [128, 256, 512])
 @pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("backend", ["trtllm", "cudnn", "cutlass"])
+@pytest.mark.parametrize("backend", ["trtllm", "cudnn", "cutlass", "cute-dsl"])
 @pytest.mark.parametrize("use_128x4_sf_layout", [False, True])
 @pytest.mark.parametrize("auto_tuning", [False, True])
 @pytest.mark.parametrize("fp4_type", ["nvfp4", "mxfp4", "mxfp4_alpha"])
