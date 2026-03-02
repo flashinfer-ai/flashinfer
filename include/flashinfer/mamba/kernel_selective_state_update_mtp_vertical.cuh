@@ -214,15 +214,15 @@ __device__ __forceinline__ void role_store(SramT& sram, int lane,
 }
 
 // =============================================================================
-// role_compute — warps 4-11: SSM update, all warps process same head
+// role_update_state — warps 4-11: SSM update, all warps process same head
 // =============================================================================
 
 template <typename input_t, typename state_t, typename matrixA_t, typename weight_t, int NTOKENS,
           int DIM, int DSTATE, int HEADS_PER_GROUP, int NUM_IN_STAGES, int NUM_OUT_STAGES,
           typename SramT>
-__device__ __forceinline__ void role_compute(SramT& sram, int lane, int compute_warp,
-                                             SelectiveStateMTPParams const& params, int batch,
-                                             int first_head) {
+__device__ __forceinline__ void role_update_state(SramT& sram, int lane, int compute_warp,
+                                                  SelectiveStateMTPParams const& params, int batch,
+                                                  int first_head) {
   using load_input_t = PackedAligned<input_t>;
   constexpr auto stateLoadSize = getVectorLoadSizeForFullUtilization<state_t, DSTATE>();
   using load_state_t = PackedAligned<state_t, stateLoadSize>;
@@ -477,9 +477,9 @@ __global__ void selective_state_update_kernel_vertical_mtp(
 
   } else if (warp >= WARP_COMPUTE_BASE && warp < WARP_EPILOGUE) {
     int const compute_warp = warp - WARP_COMPUTE_BASE;
-    role_compute<input_t, state_t, matrixA_t, weight_t, NTOKENS, DIM, DSTATE, HEADS_PER_GROUP,
-                 NUM_IN_STAGES, NUM_OUT_STAGES>(sram, lane, compute_warp, params, batch,
-                                                first_head);
+    role_update_state<input_t, state_t, matrixA_t, weight_t, NTOKENS, DIM, DSTATE, HEADS_PER_GROUP,
+                      NUM_IN_STAGES, NUM_OUT_STAGES>(sram, lane, compute_warp, params, batch,
+                                                     first_head);
 
   } else if (warp == WARP_EPILOGUE) {
     role_epilogue<input_t, NTOKENS, DIM, HEADS_PER_GROUP>(sram, lane, params, batch, first_head);
