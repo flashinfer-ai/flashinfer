@@ -176,7 +176,7 @@ def select_best_backend_paged(head_dim: int, dtype: torch.dtype, preferred_backe
 
 # FA2 Variant
 BATCH_BLOCK_EXTEND_VARIANT_DECL = r"""
-struct BatchBlockExpandingAttention : AttentionVariantBase {
+struct BatchBlockExtendAttention : AttentionVariantBase {
   static constexpr bool use_softmax = true;
 
   uint32_t qo_len;
@@ -185,7 +185,7 @@ struct BatchBlockExpandingAttention : AttentionVariantBase {
   float sm_scale_log2;
 
   template <typename Params>
-  __device__ __host__ BatchBlockExpandingAttention(const Params& params, uint32_t batch_idx,
+  __device__ __host__ BatchBlockExtendAttention(const Params& params, uint32_t batch_idx,
                                                     uint8_t* smem_ptr) {
     qo_len = params.get_qo_len(batch_idx);
     kv_len = params.get_kv_len(batch_idx);
@@ -205,11 +205,11 @@ struct BatchBlockExpandingAttention : AttentionVariantBase {
 
 # FA3 Variant (SM90 Hopper)
 BATCH_BLOCK_EXTEND_VARIANT_DECL_FA3 = r"""
-struct BatchBlockExpandingAttentionFA3 : AttentionVariantBase {
+struct BatchBlockExtendAttentionFA3 : AttentionVariantBase {
   float sm_scale_log2;
 
   template <typename MainloopParams, typename BlockCoord>
-  __device__ __host__ BatchBlockExpandingAttentionFA3(
+  __device__ __host__ BatchBlockExtendAttentionFA3(
       const MainloopParams& params, const BlockCoord& block_coord) {
     sm_scale_log2 = params.additional_params.sm_scale * math::log2e;
   }
@@ -276,11 +276,11 @@ class BatchBlockExtendAttentionWrapper:
     def _create_inner_wrapper(self, dtype: torch.dtype, head_dim: int, idtype: torch.dtype = torch.int32) -> None:
         if self._backend == "fa3":
             uri = _get_batch_be_module_uri(head_dim, dtype) + "_fa3"
-            variant_name = "BatchBlockExpandingAttentionFA3"
+            variant_name = "BatchBlockExtendAttentionFA3"
             variant_decl = BATCH_BLOCK_EXTEND_VARIANT_DECL_FA3
         else:
             uri = _get_batch_be_module_uri(head_dim, dtype)
-            variant_name = "BatchBlockExpandingAttention"
+            variant_name = "BatchBlockExtendAttention"
             variant_decl = BATCH_BLOCK_EXTEND_VARIANT_DECL
         
         jit_args = [
@@ -380,11 +380,11 @@ class BatchBlockExtendPagedAttentionWrapper:
     def _create_inner_wrapper(self, dtype: torch.dtype, head_dim: int, idtype: torch.dtype = torch.int32) -> None:
         if self._backend == "fa3":
             uri = _get_batch_be_module_uri(head_dim, dtype) + "_paged_fa3"
-            variant_name = "BatchBlockExpandingAttentionFA3"
+            variant_name = "BatchBlockExtendAttentionFA3"
             variant_decl = BATCH_BLOCK_EXTEND_VARIANT_DECL_FA3
         else:
             uri = _get_batch_be_module_uri(head_dim, dtype) + "_paged"
-            variant_name = "BatchBlockExpandingAttention"
+            variant_name = "BatchBlockExtendAttention"
             variant_decl = BATCH_BLOCK_EXTEND_VARIANT_DECL
         
         jit_args = [
@@ -444,7 +444,7 @@ class BatchBlockExtendPagedAttentionWrapper:
 
 # FA2 QOffset Variant
 _BATCH_BE_QOFFSET_VARIANT_DECL = r"""
-struct BatchBlockExpandingQOffsetAttention : AttentionVariantBase {
+struct BatchBlockExtendQOffsetAttention : AttentionVariantBase {
   static constexpr bool use_softmax = true;
 
   uint32_t qo_len;
@@ -453,7 +453,7 @@ struct BatchBlockExpandingQOffsetAttention : AttentionVariantBase {
   float sm_scale_log2;
 
   template <typename Params>
-  __device__ __host__ BatchBlockExpandingQOffsetAttention(const Params& params, uint32_t batch_idx,
+  __device__ __host__ BatchBlockExtendQOffsetAttention(const Params& params, uint32_t batch_idx,
                                                            uint8_t* smem_ptr) {
     qo_len = params.get_qo_len(batch_idx);
     kv_len = params.get_kv_len(batch_idx);
@@ -473,11 +473,11 @@ struct BatchBlockExpandingQOffsetAttention : AttentionVariantBase {
 
 # FA3 QOffset Variant
 _BATCH_BE_QOFFSET_VARIANT_DECL_FA3 = r"""
-struct BatchBlockExpandingQOffsetAttentionFA3 : AttentionVariantBase {
+struct BatchBlockExtendQOffsetAttentionFA3 : AttentionVariantBase {
   float sm_scale_log2;
 
   template <typename MainloopParams, typename BlockCoord>
-  __device__ __host__ BatchBlockExpandingQOffsetAttentionFA3(
+  __device__ __host__ BatchBlockExtendQOffsetAttentionFA3(
       const MainloopParams& params, const BlockCoord& block_coord) {
     sm_scale_log2 = params.additional_params.sm_scale * math::log2e;
   }
@@ -541,11 +541,11 @@ class BatchBlockExtendPagedOffsetWrapper:
         
         if self._backend == "fa3":
             uri = _get_batch_be_module_uri(head_dim, dtype) + "_paged_qoffset_fa3"
-            variant_name = "BatchBlockExpandingQOffsetAttentionFA3"
+            variant_name = "BatchBlockExtendQOffsetAttentionFA3"
             variant_decl = _BATCH_BE_QOFFSET_VARIANT_DECL_FA3
         else:
             uri = _get_batch_be_module_uri(head_dim, dtype) + "_paged_qoffset"
-            variant_name = "BatchBlockExpandingQOffsetAttention"
+            variant_name = "BatchBlockExtendQOffsetAttention"
             variant_decl = _BATCH_BE_QOFFSET_VARIANT_DECL
         
         jit_args = [
@@ -676,11 +676,11 @@ class BatchBlockExtendRaggedOffsetWrapper:
         
         if self._backend == "fa3":
             uri = _get_batch_be_module_uri(head_dim, dtype) + "_ragged_qoffset_fa3"
-            variant_name = "BatchBlockExpandingQOffsetAttentionFA3"
+            variant_name = "BatchBlockExtendQOffsetAttentionFA3"
             variant_decl = _BATCH_BE_QOFFSET_VARIANT_DECL_FA3
         else:
             uri = _get_batch_be_module_uri(head_dim, dtype) + "_ragged_qoffset"
-            variant_name = "BatchBlockExpandingQOffsetAttention"
+            variant_name = "BatchBlockExtendQOffsetAttention"
             variant_decl = _BATCH_BE_QOFFSET_VARIANT_DECL
         
         jit_args = [

@@ -43,34 +43,11 @@ from ..prefill import single_prefill_with_kv_cache_with_jit_module
 from ..utils import MaskMode, is_sm90a_supported
 
 
-# ════════════════════════════════════════════════════════════════════════════════════
-# Variant 定义：使用原生 MaskMode::kBlockExpanding
-# ════════════════════════════════════════════════════════════════════════════════════
-#
-# CUDA kernel 支持 MaskMode::kBlockExpanding 的 tile 级跳过：
-#   - num_iterations: block_expanding_num_iterations() 精确计算 KV 有效范围
-#   - mask_iteration: block_expanding_mask_iteration() 确定无需 mask 检查的 tiles
-#   - position_mask: (q_block >= k_block) && (kv_idx < chunk_end)
-#
-# 因此 variant 的 LogitsMask 只需返回 true，让 kernel 的 position_mask 生效
-#
-# ════════════════════════════════════════════════════════════════════════════════════
+
 
 BLOCK_EXTEND_V2_VARIANT_DECL = r"""
-// ════════════════════════════════════════════════════════════════════════════════════
-// BlockExpandingAttentionV2: 使用原生 MaskMode::kBlockExpanding
-// ════════════════════════════════════════════════════════════════════════════════════
-//
-// CUDA kernel 已原生支持 MaskMode::kBlockExpanding 的 tile 级跳过：
-//   - num_iterations: 根据 Block Expanding 边界精确计算
-//   - mask_iteration: 确定无需 mask 检查的 tiles
-//   - position_mask: (q_block >= k_block) && (kv_idx < chunk_end)
-//
-// 因此 LogitsMask 直接返回 true，让 kernel 的 position_mask 生效
-//
-// ════════════════════════════════════════════════════════════════════════════════════
 
-struct BlockExpandingAttentionV2 : AttentionVariantBase {
+struct BlockExtendAttentionV2 : AttentionVariantBase {
   static constexpr bool use_softmax = true;
 
   uint32_t qo_len;
@@ -79,7 +56,7 @@ struct BlockExpandingAttentionV2 : AttentionVariantBase {
   float sm_scale_log2;
 
   template <typename Params>
-  __device__ __host__ BlockExpandingAttentionV2(const Params& params, uint32_t batch_idx,
+  __device__ __host__ BlockExtendAttentionV2(const Params& params, uint32_t batch_idx,
                                                  uint8_t* smem_ptr) {
     qo_len = params.get_qo_len(batch_idx);
     kv_len = params.get_kv_len(batch_idx);
@@ -101,20 +78,9 @@ struct BlockExpandingAttentionV2 : AttentionVariantBase {
 };
 """
 
-
-# ════════════════════════════════════════════════════════════════════════════════════
-# V2 with offset Variant 定义：支持 q_offset 的 Block Expanding Attention
-# ════════════════════════════════════════════════════════════════════════════════════
-#
-# 用于增量 Chunk Prefill 场景，每个 chunk 的 Q 有全局偏移
-# q_offset 通过 SinglePrefillParams.q_block_expanding_offset 传入
-# kernel 内部通过 get_q_block_expanding_offset(batch_idx) 获取偏移
-#
-# ════════════════════════════════════════════════════════════════════════════════════
-
 BLOCK_EXTEND_V2_WITH_OFFSET_VARIANT_DECL = r"""
 
-struct BlockExpandingAttentionV2WithOffset : AttentionVariantBase {
+struct BlockExtendAttentionV2WithOffset : AttentionVariantBase {
   static constexpr bool use_softmax = true;
 
   uint32_t qo_len;
@@ -123,7 +89,7 @@ struct BlockExpandingAttentionV2WithOffset : AttentionVariantBase {
   float sm_scale_log2;
 
   template <typename Params>
-  __device__ __host__ BlockExpandingAttentionV2WithOffset(const Params& params, uint32_t batch_idx,
+  __device__ __host__ BlockExtendAttentionV2WithOffset(const Params& params, uint32_t batch_idx,
                                                            uint8_t* smem_ptr) {
     qo_len = params.get_qo_len(batch_idx);
     kv_len = params.get_kv_len(batch_idx);
@@ -162,6 +128,7 @@ def _get_dtype_str(dtype: torch.dtype) -> str:
         torch.float16: "fp16",
         torch.bfloat16: "bf16",
     }.get(dtype, "fp16")
+
 
 
 def _get_module_uri_v2(head_dim: int, dtype: torch.dtype) -> str:
@@ -215,14 +182,14 @@ def get_block_extend_module_v2(
     
     uri = _get_module_uri_v2(head_dim, dtype)
     
-    # 优先检查 AOT kernel
+
     if _check_aot_available(uri):
         aot_path = _get_aot_path(uri)
         module = tvm_ffi.load_module(str(aot_path))
         _MODULE_CACHE_V2[cache_key] = module
         return module
     
-    # AOT 不存在，检查是否禁用了 JIT
+
     if os.environ.get("FLASHINFER_DISABLE_JIT"):
         raise RuntimeError(
             f"JIT compilation is disabled via FLASHINFER_DISABLE_JIT environment variable, "
@@ -230,7 +197,7 @@ def get_block_extend_module_v2(
             f"Please add the missing module to the AOT build configuration."
         )
     
-    # JIT 编译
+
     spec = gen_customize_single_prefill_module(
         backend="fa2",
         uri=uri,
@@ -243,7 +210,7 @@ def get_block_extend_module_v2(
         additional_tensor_dtypes=[],
         additional_scalar_names=["sm_scale", "dllm_block_size"],
         additional_scalar_dtypes=["double", "int64_t"],
-        variant_name="BlockExpandingAttentionV2",
+        variant_name="BlockExtendAttentionV2",
         variant_decl=BLOCK_EXTEND_V2_VARIANT_DECL,
         mask_modes=[4],  # ★ kBlockExpanding = 4
     )
@@ -253,27 +220,14 @@ def get_block_extend_module_v2(
     return module
 
 
-# ════════════════════════════════════════════════════════════════════════════════════
-# V3 FA3 Variant 定义：Hopper (SM90) 架构的 Block Expanding Attention
-# ════════════════════════════════════════════════════════════════════════════════════
-#
-# FA3 使用不同的 variant 接口：
-#   - 构造函数接收 MainloopParams 和 BlockCoord
-#   - 需要 GetAttentionUpdater() 模板函数
-#   - 通过 params.additional_params.xxx 访问自定义参数
-#
-# FA3 kernel 已原生支持 kBlockExpanding，因此 LogitsTransform 只需返回 logits
-#
-# ════════════════════════════════════════════════════════════════════════════════════
-
 BLOCK_EXTEND_V3_WITH_OFFSET_VARIANT_DECL = r"""
 
-struct BlockExpandingAttentionV3WithOffset : AttentionVariantBase {
+struct BlockExtendAttentionV3WithOffset : AttentionVariantBase {
   float sm_scale_log2;
 
   // FA3 构造函数签名
   template <typename MainloopParams, typename BlockCoord>
-  __device__ __host__ BlockExpandingAttentionV3WithOffset(
+  __device__ __host__ BlockExtendAttentionV3WithOffset(
       const MainloopParams& params, const BlockCoord& block_coord) {
     sm_scale_log2 = params.additional_params.sm_scale * math::log2e;
   }
@@ -313,7 +267,7 @@ def get_block_extend_module_with_offset(
     import os
     import tvm_ffi
     
-    # FA3 需要 SM90 支持
+
     if backend == "fa3" and not is_sm90a_supported(torch.device("cuda")):
         raise RuntimeError(
             "FA3 backend requires SM90 (Hopper) architecture. "
@@ -326,26 +280,26 @@ def get_block_extend_module_with_offset(
     
     uri = _get_module_uri_with_offset(head_dim, dtype, backend)
     
-    # AOT 模式
+
     if _check_aot_available(uri):
         aot_path = _get_aot_path(uri)
         module = tvm_ffi.load_module(str(aot_path))
         _MODULE_CACHE_WITH_OFFSET[cache_key] = module
         return module
     
-    # AOT 不存在，检查是否禁用了 JIT
+
     if os.environ.get("FLASHINFER_DISABLE_JIT"):
         raise RuntimeError(
             f"JIT compilation is disabled via FLASHINFER_DISABLE_JIT environment variable, "
             f"but the required AOT module is not found at: {_get_aot_path(uri)}."
         )
     
-    # JIT 模式
+
     if backend == "fa3":
-        variant_name = "BlockExpandingAttentionV3WithOffset"
+        variant_name = "BlockExtendAttentionV3WithOffset"
         variant_decl = BLOCK_EXTEND_V3_WITH_OFFSET_VARIANT_DECL
     else:
-        variant_name = "BlockExpandingAttentionV2WithOffset"
+        variant_name = "BlockExtendAttentionV2WithOffset"
         variant_decl = BLOCK_EXTEND_V2_WITH_OFFSET_VARIANT_DECL
     
     spec = gen_customize_single_prefill_module(
@@ -515,6 +469,7 @@ def block_extend_attention_v3_with_offset(
         q, k, v, dllm_block_size, q_offset, kv_offset, sm_scale, return_lse, backend="fa3"
     )
 
+
 def block_extend_cascade(
     q: torch.Tensor,
     k_current: torch.Tensor,
@@ -571,6 +526,7 @@ def block_extend_cascade(
     
     has_prefix = k_prefix is not None and v_prefix is not None
     prefix_len = k_prefix.size(0) if has_prefix else 0
+
     
     # 没有 prefix 时直接返回，有 prefix 时需要 merge 所以强制 return_lse=True
     if not has_prefix:
@@ -593,6 +549,7 @@ def block_extend_cascade(
         return_lse=True,  # merge 需要 lse
         backend=backend,
     )
+    
 
     o2, s2 = single_prefill_with_kv_cache(
         q, k_prefix, v_prefix,
@@ -600,6 +557,7 @@ def block_extend_cascade(
         sm_scale=sm_scale,
         return_lse=True,
     )
+    
 
     merge_state_in_place(o1, s1, o2, s2)
     

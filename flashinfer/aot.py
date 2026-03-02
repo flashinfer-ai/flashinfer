@@ -89,28 +89,28 @@ from .compilation_context import CompilationContext
 
 # Import DLLM variant definitions
 from .dllm.block_expanding import BLOCK_EXPANDING_VARIANT_DECL
-from .dllm.block_expanding_tile_skip import (
-    BLOCK_EXPANDING_V2_VARIANT_DECL,
-    BLOCK_EXPANDING_V3_WITH_OFFSET_VARIANT_DECL,
+from .dllm.block_extend import (
+    BLOCK_EXTEND_V2_VARIANT_DECL,
+    BLOCK_EXTEND_V3_WITH_OFFSET_VARIANT_DECL,
     _get_module_uri_v3_with_offset,
 )
-from .dllm.batch_block_expanding import (
-    BATCH_BLOCK_EXPANDING_VARIANT_DECL,
-    BATCH_BLOCK_EXPANDING_VARIANT_DECL_FA3,
+from .dllm.batch_block_extend import (
+    BATCH_BLOCK_EXTEND_VARIANT_DECL,
+    BATCH_BLOCK_EXTEND_VARIANT_DECL_FA3,
     _BATCH_BE_QOFFSET_VARIANT_DECL,
     _BATCH_BE_QOFFSET_VARIANT_DECL_FA3,
     _get_batch_be_module_uri,
 )
 
 
-def gen_dllm_block_expanding(
+def gen_dllm_block_extend(
     f16_dtype_: List[torch.dtype],
     head_dim_: List[Tuple[int, int]],
 ) -> Iterator[JitSpec]:
     """
-    生成 DLLM Block Expanding Attention 的 JitSpec
+    生成 DLLM Block Extend Attention 的 JitSpec
     
-    Block Expanding Mask 语义:
+    Block Extend Mask 语义:
     - 同一个 DLLM block 内的 token 双向可见
     - 可以看见之前所有 blocks
     - 不能看见后续 blocks
@@ -141,18 +141,16 @@ def gen_dllm_block_expanding(
                 additional_scalar_dtypes=["double", "int64_t"],
                 variant_name="BlockExpandingAttention",
                 variant_decl=BLOCK_EXPANDING_VARIANT_DECL,
-                mask_modes=[0, 1, 2, 3, 4],  # 自定义变体支持所有 mask_mode 包括 kBlockExpanding
+                mask_modes=[0, 1, 2, 3, 4],
             )
 
 
-def gen_dllm_block_expanding_v2(
+def gen_dllm_block_extend_v2(
     f16_dtype_: List[torch.dtype],
     head_dim_: List[Tuple[int, int]],
 ) -> Iterator[JitSpec]:
     """
-    生成 DLLM Block Expanding Attention V2 (原生 tile 跳过) 的 JitSpec
-    
-    V2 使用原生 MaskMode::kBlockExpanding 触发 kernel 内置的 tile 级跳过优化
+    生成 DLLM Block Extend Attention V2 (原生 tile 跳过) 的 JitSpec
     
     Args:
         f16_dtype_: 数据类型列表 [torch.float16, torch.bfloat16]
@@ -178,20 +176,20 @@ def gen_dllm_block_expanding_v2(
                 additional_tensor_dtypes=[],
                 additional_scalar_names=["sm_scale", "dllm_block_size"],
                 additional_scalar_dtypes=["double", "int64_t"],
-                variant_name="BlockExpandingAttentionV2",
-                variant_decl=BLOCK_EXPANDING_V2_VARIANT_DECL,
-                mask_modes=[4],  # V2 使用原生 kBlockExpanding
+                variant_name="BlockExtendAttentionV2",
+                variant_decl=BLOCK_EXTEND_V2_VARIANT_DECL,
+                mask_modes=[4],
             )
 
 
-def gen_dllm_batch_block_expanding(
+def gen_dllm_batch_block_extend(
     f16_dtype_: List[torch.dtype],
     head_dim_: List[Tuple[int, int]],
 ) -> Iterator[JitSpec]:
     """
-    生成 DLLM Batch Block Expanding Attention 的 JitSpec
+    生成 DLLM Batch Block Extend Attention 的 JitSpec
     
-    Batch Prefill 版本的 Block Expanding Mask，支持多请求并行处理
+    Batch Prefill 版本的 Block Extend Mask，支持多请求并行处理
     并保持 tile 级跳过优化
     
     Args:
@@ -221,22 +219,21 @@ def gen_dllm_batch_block_expanding(
                 additional_tensor_dtypes=[],
                 additional_scalar_names=["sm_scale", "dllm_block_size"],
                 additional_scalar_dtypes=["double", "int64_t"],
-                variant_name="BatchBlockExpandingAttention",
-                variant_decl=BATCH_BLOCK_EXPANDING_VARIANT_DECL,
-                mask_modes=[4],  # 原生 kBlockExpanding tile 跳过
+                variant_name="BatchBlockExtendAttention",
+                variant_decl=BATCH_BLOCK_EXTEND_VARIANT_DECL,
+                mask_modes=[4],  
             )
 
 
-def gen_dllm_batch_block_expanding_fa3(
+def gen_dllm_batch_block_extend_fa3(
     f16_dtype_: List[torch.dtype],
     head_dim_: List[Tuple[int, int]],
     has_sm90: bool,
 ) -> Iterator[JitSpec]:
     """
-    生成 DLLM Batch Block Expanding Attention FA3 版本的 JitSpec
+    生成 DLLM Batch Block Extend Attention FA3 版本的 JitSpec
     
-    FA3 (Hopper SM90) 版本的 Batch Block Expanding Mask
-    支持原生 MaskMode::kBlockExpanding tile 级跳过优化
+    FA3 (Hopper SM90) 版本的 Batch Block Extend Mask
     
     Args:
         f16_dtype_: 数据类型列表 [torch.float16, torch.bfloat16]
@@ -253,7 +250,7 @@ def gen_dllm_batch_block_expanding_fa3(
     
     for dtype in f16_dtype_:
         for head_dim_qk, head_dim_vo in head_dim_:
-            # 基础 Batch Block Expanding FA3 (Ragged)
+            # 基础 Batch Block Extend FA3 (Ragged)
             uri = _get_batch_be_module_uri(head_dim_qk, dtype) + "_fa3"
             yield gen_customize_batch_prefill_module(
                 backend="fa3",
@@ -268,9 +265,9 @@ def gen_dllm_batch_block_expanding_fa3(
                 additional_tensor_dtypes=[],
                 additional_scalar_names=["sm_scale", "dllm_block_size"],
                 additional_scalar_dtypes=["double", "int64_t"],
-                variant_name="BatchBlockExpandingAttentionFA3",
-                variant_decl=BATCH_BLOCK_EXPANDING_VARIANT_DECL_FA3,
-                mask_modes=[4],  # kBlockExpanding tile 跳过
+                variant_name="BatchBlockExtendAttentionFA3",
+                variant_decl=BATCH_BLOCK_EXTEND_VARIANT_DECL_FA3,
+                mask_modes=[4],
             )
             
             # Paged 版本 FA3
@@ -288,8 +285,8 @@ def gen_dllm_batch_block_expanding_fa3(
                 additional_tensor_dtypes=[],
                 additional_scalar_names=["sm_scale", "dllm_block_size"],
                 additional_scalar_dtypes=["double", "int64_t"],
-                variant_name="BatchBlockExpandingAttentionFA3",
-                variant_decl=BATCH_BLOCK_EXPANDING_VARIANT_DECL_FA3,
+                variant_name="BatchBlockExtendAttentionFA3",
+                variant_decl=BATCH_BLOCK_EXTEND_VARIANT_DECL_FA3,
                 mask_modes=[4],
             )
             
@@ -308,7 +305,7 @@ def gen_dllm_batch_block_expanding_fa3(
                 additional_tensor_dtypes=["int32_t", "int32_t"],
                 additional_scalar_names=["sm_scale", "dllm_block_size"],
                 additional_scalar_dtypes=["double", "int64_t"],
-                variant_name="BatchBlockExpandingQOffsetAttentionFA3",
+                variant_name="BatchBlockExtendQOffsetAttentionFA3",
                 variant_decl=_BATCH_BE_QOFFSET_VARIANT_DECL_FA3,
                 mask_modes=[4],
             )
@@ -328,19 +325,19 @@ def gen_dllm_batch_block_expanding_fa3(
                 additional_tensor_dtypes=["int32_t", "int32_t"],
                 additional_scalar_names=["sm_scale", "dllm_block_size"],
                 additional_scalar_dtypes=["double", "int64_t"],
-                variant_name="BatchBlockExpandingQOffsetAttentionFA3",
+                variant_name="BatchBlockExtendQOffsetAttentionFA3",
                 variant_decl=_BATCH_BE_QOFFSET_VARIANT_DECL_FA3,
                 mask_modes=[4],
             )
 
 
-def gen_dllm_block_expanding_v3_with_offset(
+def gen_dllm_block_extend_v3_with_offset(
     f16_dtype_: List[torch.dtype],
     head_dim_: List[Tuple[int, int]],
     has_sm90: bool,
 ) -> Iterator[JitSpec]:
     """
-    生成 DLLM Block Expanding Attention V3 with offset (FA3 Hopper) 的 JitSpec
+    生成 DLLM Block Extend Attention V3 with offset (FA3 Hopper) 的 JitSpec
     
     V3 版本使用 FA3 backend，专为 Hopper (SM90) 架构优化
     支持 q_offset 参数用于增量 Chunk Prefill 场景
@@ -372,8 +369,8 @@ def gen_dllm_block_expanding_v3_with_offset(
                 additional_tensor_dtypes=[],
                 additional_scalar_names=["sm_scale", "dllm_block_size", "q_block_expanding_offset"],
                 additional_scalar_dtypes=["double", "int64_t", "int64_t"],
-                variant_name="BlockExpandingAttentionV3WithOffset",
-                variant_decl=BLOCK_EXPANDING_V3_WITH_OFFSET_VARIANT_DECL,
+                variant_name="BlockExtendAttentionV3WithOffset",
+                variant_decl=BLOCK_EXTEND_V3_WITH_OFFSET_VARIANT_DECL,
                 mask_modes=[4],
             )
 
@@ -753,42 +750,42 @@ def gen_all_modules(
     )
 
     
-    # DLLM Block Expanding Attention modules
+    # DLLM Block Extend Attention modules
     jit_specs += list(
-        gen_dllm_block_expanding(
+        gen_dllm_block_extend(
             f16_dtype_,
             fa2_head_dim_,
         )
     )
     
-    # DLLM Block Expanding V2 (原生 tile 跳过优化)
+    # DLLM Block Extend V2 (原生 tile 跳过优化)
     jit_specs += list(
-        gen_dllm_block_expanding_v2(
+        gen_dllm_block_extend_v2(
             f16_dtype_,
             fa2_head_dim_,
         )
     )
     
-    # DLLM Batch Block Expanding (Batch Prefill 版本)
+    # DLLM Batch Block Extend (Batch Prefill 版本)
     jit_specs += list(
-        gen_dllm_batch_block_expanding(
+        gen_dllm_batch_block_extend(
             f16_dtype_,
             fa2_head_dim_,
         )
     )
     
-    # DLLM Block Expanding V3 with offset (FA3 Hopper 版本)
+    # DLLM Block Extend V3 with offset (FA3 Hopper 版本)
     jit_specs += list(
-        gen_dllm_block_expanding_v3_with_offset(
+        gen_dllm_block_extend_v3_with_offset(
             f16_dtype_,
             fa3_head_dim_,
             has_sm90,
         )
     )
     
-    # DLLM Batch Block Expanding FA3 版本 (Hopper SM90)
+    # DLLM Batch Block Extend FA3 版本 (Hopper SM90)
     jit_specs += list(
-        gen_dllm_batch_block_expanding_fa3(
+        gen_dllm_batch_block_extend_fa3(
             f16_dtype_,
             fa3_head_dim_,
             has_sm90,
