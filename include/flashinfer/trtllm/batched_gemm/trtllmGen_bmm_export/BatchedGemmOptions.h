@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
  * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -83,9 +83,9 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions {
   BatchedGemmOptions() = default;
   // FIXME We create explicit constructor with all options to WAR stubgen issue in TRT-LLM.
   BatchedGemmOptions(
-      gemm::AllReduceAlgo allReduceAlgo, gemm::BiasType biasType, int blockK, int clusterDimX,
-      int clusterDimY, int clusterDimZ, gemm::CtaSwizzleType ctaSwizzleType, tg::Dtype dtypeAcc,
-      tg::Dtype dtypeA, tg::Dtype dtypeB, tg::Dtype dtypeC, tg::Dtype dtypeMmaA,
+      gemm::AllReduceAlgo allReduceAlgo, gemm::BiasType biasType, int blockK, bool clcFastDrain,
+      int clusterDimX, int clusterDimY, int clusterDimZ, gemm::CtaSwizzleType ctaSwizzleType,
+      tg::Dtype dtypeAcc, tg::Dtype dtypeA, tg::Dtype dtypeB, tg::Dtype dtypeC, tg::Dtype dtypeMmaA,
       tg::Dtype dtypeMmaB, gemm::EltwiseActType eltwiseActType, bool enablesEarlyExit,
       bool enablesDelayedEarlyExit, bool enablesGlobalPtxKnobs, int epilogueLdtmDps,
       int epilogueLdtmBits, int epilogueTileM, int epilogueTileN, bool fuseUtccpWithUtcmma,
@@ -118,8 +118,8 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions {
       std::optional<RouteImpl> routeSfsImpl, bool useTmaOobOpt)
       : gemmGatedAct::GemmGatedActOptions(
             gemm::GemmOptions(
-                allReduceAlgo, biasType, blockK, clusterDimX, clusterDimY, clusterDimZ,
-                ctaSwizzleType, dtypeAcc, dtypeA, dtypeB, dtypeC, dtypeMmaA, dtypeMmaB,
+                allReduceAlgo, biasType, blockK, clcFastDrain, clusterDimX, clusterDimY,
+                clusterDimZ, ctaSwizzleType, dtypeAcc, dtypeA, dtypeB, dtypeC, dtypeMmaA, dtypeMmaB,
                 eltwiseActType, enablesEarlyExit, enablesDelayedEarlyExit, enablesGlobalPtxKnobs,
                 epilogueLdtmDps, epilogueLdtmBits, epilogueTileM, epilogueTileN,
                 fuseUtccpWithUtcmma, gridTriggerSecondaryA, gridTriggerSecondaryB,

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
  * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -576,13 +576,13 @@ class KernelTraits {
 
  public:
   // The MMA kind.
-  tg::MmaKind mMmaKind;
+  tg::MmaKind mMmaKind{};
   // Whether fuse Utccp into the MMA task.
-  bool mFuseUtccpWithUtcmma;
+  bool mFuseUtccpWithUtcmma{};
   // Whether use the max TMEM overlap trick.
-  bool mUseMaxTmemOverlap;
+  bool mUseMaxTmemOverlap{};
   // The number of epilogue warps.
-  int32_t mNumEpilogueWarps;
+  int32_t mNumEpilogueWarps{};
   // Helper for SMEM allocation.
   MemAllocatorHelper mSmemAllocatorHelper;
   // Helper for TMEM allocation.

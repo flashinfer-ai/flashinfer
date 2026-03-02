@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
  * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -538,6 +538,18 @@ struct KernelParams {
   //
   // The memory must be set to 0 before the kernel launch.
   uint32_t* ptrRowMaxCompletionBars{nullptr};
+
+  //////////////////////////////////////////////////////////////////////////////////////////////////
+  //
+  // Dynamic tile scheduling parameters.
+  //
+  //////////////////////////////////////////////////////////////////////////////////////////////////
+
+  // Global counter for SW-emulated dynamic tile scheduling. When dynamic scheduling is enabled,
+  // Must be intialized to the number equal to the grid size before each kernel launch.
+  // Set to nullptr if static scheduling is used.
+  // Shape is [1].
+  uint32_t* ptrDynamicTileCounter{nullptr};
 };
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////

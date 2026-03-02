@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
  * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -111,13 +111,13 @@ struct GemmOptions {
 #endif
 
   GemmOptions() = default;
-  GemmOptions(AllReduceAlgo allReduceAlgo, BiasType biasType, int blockK, int clusterDimX,
-              int clusterDimY, int clusterDimZ, CtaSwizzleType ctaSwizzleType, tg::Dtype dtypeAcc,
-              tg::Dtype dtypeA, tg::Dtype dtypeB, tg::Dtype dtypeC, tg::Dtype dtypeMmaA,
-              tg::Dtype dtypeMmaB, EltwiseActType eltwiseActType, bool enablesEarlyExit,
-              bool enablesDelayedEarlyExit, bool enablesGlobalPtxKnobs, int epilogueLdtmDps,
-              int epilogueLdtmBits, int epilogueTileM, int epilogueTileN, bool fuseUtccpWithUtcmma,
-              bool gridTriggerSecondaryA, bool gridTriggerSecondaryB,
+  GemmOptions(AllReduceAlgo allReduceAlgo, BiasType biasType, int blockK, bool clcFastDrain,
+              int clusterDimX, int clusterDimY, int clusterDimZ, CtaSwizzleType ctaSwizzleType,
+              tg::Dtype dtypeAcc, tg::Dtype dtypeA, tg::Dtype dtypeB, tg::Dtype dtypeC,
+              tg::Dtype dtypeMmaA, tg::Dtype dtypeMmaB, EltwiseActType eltwiseActType,
+              bool enablesEarlyExit, bool enablesDelayedEarlyExit, bool enablesGlobalPtxKnobs,
+              int epilogueLdtmDps, int epilogueLdtmBits, int epilogueTileM, int epilogueTileN,
+              bool fuseUtccpWithUtcmma, bool gridTriggerSecondaryA, bool gridTriggerSecondaryB,
               bool gridWaitForPrimaryEarlyExit, bool gridWaitForPrimaryA, bool gridWaitForPrimaryB,
               bool hoistLoadTaskInit, bool hoistMmaTaskTryWaits, int k, KernelTraits kernelTraits,
               MatrixLayout layoutA, MatrixLayout layoutB, int m, int mmaK, tg::MmaKind mmaKind,
@@ -138,6 +138,7 @@ struct GemmOptions {
       : mAllReduceAlgo{allReduceAlgo},
         mBiasType{biasType},
         mBlockK(blockK),
+        mClcFastDrain{clcFastDrain},
         mClusterDimX{clusterDimX},
         mClusterDimY{clusterDimY},
         mClusterDimZ{clusterDimZ},
@@ -226,6 +227,8 @@ struct GemmOptions {
   BiasType mBiasType{BiasType::None};
   // Block size in the K dimension
   int mBlockK{-1};
+  // Whether to enable CLC fast drain for early exit in SM100 CLC-based scheduler.
+  bool mClcFastDrain{true};
   // Cluster size in X dim.
   int mClusterDimX{1};
   // Cluster size in Y dim.
@@ -465,6 +468,28 @@ inline std::string toString(trtllm::gen::MmaKind e) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+template <>
+inline std::string toString(CtaSwizzleType e) {
+  switch (e) {
+    case CtaSwizzleType::RasterizeAlongM:
+      return "RasterizeAlongM";
+    case CtaSwizzleType::RasterizeAlongN:
+      return "RasterizeAlongN";
+    case CtaSwizzleType::ZigZagAlongM2:
+      return "ZigZagAlongM2";
+    case CtaSwizzleType::ZigZagAlongN2:
+      return "ZigZagAlongN2";
+    case CtaSwizzleType::ZigZagAlongM4:
+      return "ZigZagAlongM4";
+    case CtaSwizzleType::ZigZagAlongN4:
+      return "ZigZagAlongN4";
+    default:
+      return std::to_string(static_cast<int32_t>(e));
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 inline std::string dumpOptions(GemmOptions const& options, bool dumpRuntimeParams = true) {
   std::stringstream ss;
   ss << "mAllReduceAlgo=" << "gemm::AllReduceAlgo(" << static_cast<int32_t>(options.mAllReduceAlgo)
@@ -472,6 +497,7 @@ inline std::string dumpOptions(GemmOptions const& options, bool dumpRuntimeParam
   ss << "mBiasType=" << "gemm::BiasType(" << static_cast<int32_t>(options.mBiasType) << ")" << ","
      << std::endl;
   ss << "mBlockK=" << options.mBlockK << "," << std::endl;
+  ss << "mClcFastDrain=" << options.mClcFastDrain << "," << std::endl;
   ss << "mClusterDimX=" << options.mClusterDimX << "," << std::endl;
   ss << "mClusterDimY=" << options.mClusterDimY << "," << std::endl;
   ss << "mClusterDimZ=" << options.mClusterDimZ << "," << std::endl;
@@ -1328,7 +1354,7 @@ inline bool checkAndUpdateGemmOptions(GemmOptions& options, tg::CudaArch cudaArc
     TLLM_CHECK_ERROR(options.mNumStagesMmaWithinWorkTile == 1,
                      "Non-DeepSeekFp8 requires numStagesMmaWithinWorkTile == 1");
     if (options.mNumStagesMma > 1) {
-      TLLM_CHECK_ERROR(options.mTileScheduler == TileScheduler::Persistent,
+      TLLM_CHECK_ERROR(isPersistentScheduler(options.mTileScheduler),
                        "Non-DeepSeekFp8 requires persistent scheduler when using numStagesMma >1");
     }
   }
@@ -1464,8 +1490,9 @@ inline bool checkAndUpdateGemmOptions(GemmOptions& options, tg::CudaArch cudaArc
   }
 
   if (!isBlackwell && options.mTileScheduler == TileScheduler::Persistent) {
-    // TODO(anchengc): will be supported in upcoming MRs.
-    TLLM_LOG_WARNING("Persistent scheduling is not supported on Hopper. Using Static scheduling.");
+    TLLM_LOG_WARNING(
+        "Persistent scheduling is not supported on Hopper. Use StaticPersistent or "
+        "PersistentSm90 instead. Fallback to Static scheduling.");
     if (updateOptions) {
       options.mTileScheduler = TileScheduler::Static;
     } else {
@@ -1474,12 +1501,11 @@ inline bool checkAndUpdateGemmOptions(GemmOptions& options, tg::CudaArch cudaArc
   }
 
   if (isBlackwell && !options.mUseCustomMmaSchedule && !options.mUseDeepSeekFp8 &&
-      options.mTileScheduler == TileScheduler::Persistent) {
+      isPersistentScheduler(options.mTileScheduler)) {
     if (updateOptions) {
       options.mUseCustomMmaSchedule = true;
     } else {
-      TLLM_CHECK_ERROR(false,
-                       "TileScheduler::Persistent and !UseCustomMmaSchedule is not supported.");
+      TLLM_CHECK_ERROR(false, "Persistent scheduler and !UseCustomMmaSchedule is not supported.");
     }
   }
 
@@ -1634,7 +1660,7 @@ inline bool checkAndUpdateGemmOptions(GemmOptions& options, tg::CudaArch cudaArc
         options.mNumSlicesForSplitK, options.mNumSlicesForSliceK, options.mSplitK,
         options.mUseTmaStore, options.mTransposeMmaOutput, options.mAllReduceAlgo,
         options.mFuseUtccpWithUtcmma, options.mUseMaxTmemOverlap, options.mNumEpilogueWarps,
-        options.mTileScheduler == TileScheduler::Persistent, options.mUseDeepSeekFp8,
+        isPersistentScheduler(options.mTileScheduler), options.mUseDeepSeekFp8,
         options.mUsePerTokenSfA, options.mUsePerTokenSfB,
         /* useTwoCtas*/ options.mClusterDimX == 2, options.mBiasType);
   }

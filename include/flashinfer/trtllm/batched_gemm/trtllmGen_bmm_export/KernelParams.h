@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
  * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -334,7 +334,8 @@ static KernelParams setKernelParams(
     int32_t const* routeMap, float* rowMax, uint32_t* rowMaxBars,
     int32_t const* ptrNumNonExitingCtas = nullptr, int32_t const* ptrTotalNumPaddedTokens = nullptr,
     int32_t const* ptrCtaIdxXyToBatchIdx = nullptr, int32_t const* ptrCtaIdxXyToMnLimit = nullptr,
-    int32_t const maxNumCtas = KernelParams::MaxNumCtas) {
+    int32_t const maxNumCtas = KernelParams::MaxNumCtas,
+    uint32_t* ptrDynamicTileCounter = nullptr) {
   static_assert(sizeof(KernelParams) <= 32 * 1024,
                 "sizeof(KernelParams) has to be less or equal than 32KB");
 
@@ -666,6 +667,9 @@ static KernelParams setKernelParams(
   params.ptrPerTokenSfA = ptrPerTokenSfA;
   params.ptrPerTokenSfB = ptrPerTokenSfB;
   params.ptrBias = ptrBias;
+
+  // Set the dynamic tile counter pointer for dynamic scheduling.
+  params.ptrDynamicTileCounter = ptrDynamicTileCounter;
 
   return params;
 }

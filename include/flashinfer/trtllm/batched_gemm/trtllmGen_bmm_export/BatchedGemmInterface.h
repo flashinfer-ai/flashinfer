@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
  * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -436,6 +436,13 @@ struct BatchedGemmData {
     // The shape is
     // [divUp(numTokens + numBatches * (tileM/N - 1), tileM/N)]
     int32_t const* mPtrCtaIdxXyToMnLimit;
+
+    // Global counter for SW-emulated dynamic tile scheduling. When dynamic scheduling is enabled,
+    // must be initialized to gridDim.x * gridDim.y (gridDim.z is reserved for K-dim in CGA splitK)
+    // before each kernel launch.
+    // Set to nullptr if not using the PersistentSm90 tile scheduler.
+    // Shape is [1].
+    uint32_t* mPtrDynamicTileCounter{nullptr};
   };
 
   struct OutputBuffers {
@@ -522,9 +529,11 @@ class BatchedGemmInterface {
 
   // Launch the cubin from the provided config. It calls all necessary memsets for internal buffers.
   // Provided config must be validated with isValidConfig before the call.
+  //
+  // pinnedHostBuffer: if provided, it must be pinned host memory buffer of 4 bytes.
   int32_t run(BatchedGemmConfig const& config, void* workspace,
-              BatchedGemmData const& batchedGemmData, void* cudaStream,
-              int32_t /*multiProcessorCount*/, bool usePdl = true,
+              BatchedGemmData const& batchedGemmData, void* cudaStream, int32_t multiProcessorCount,
+              bool usePdl = true, void* pinnedHostBuffer = nullptr,
               std::optional<std::reference_wrapper<ModuleCache>> moduleCache = std::nullopt) {
     // Get options from config and data.
     auto options = getOptionsFromConfigAndData(config, batchedGemmData);
@@ -532,7 +541,9 @@ class BatchedGemmInterface {
     bool const batchM = options.mBatchMode == BatchedGemmOptions::BatchMode::BatchM;
     bool const useDeepSeekFp8 = options.mUseDeepSeekFp8 && options.mDtypeA == tg::Dtype::E4m3 &&
                                 options.mDtypeB == tg::Dtype::E4m3;
-
+    // Get the grid dimensions.
+    auto [numCtaBatch, numCtaTile, numCtaInner] =
+        getGridDim(options, batchedGemmData.mProblemDimensions.mMaxNumCtasInTokenDim);
     auto workspaceSizes = getWorkspaceSizesInBytes(config, batchedGemmData);
     float* dPtrRowMax{nullptr};
     uint32_t* dPtrRowMaxBars{nullptr};
@@ -549,8 +560,34 @@ class BatchedGemmInterface {
       }
     }
 
-    auto [numCtaBatch, numCtaTile, numCtaInner] =
-        getGridDim(options, batchedGemmData.mProblemDimensions.mMaxNumCtasInTokenDim);
+    // Initialize the dynamic tile counter if dynamic scheduling is enabled.
+    // The counter must be initialized to the fixed grid dim.
+    // TODO: we may avoid H2D copy by offloading the operation to some kernel.
+    if (batchedGemmData.mInputBuffers.mPtrDynamicTileCounter != nullptr) {
+      auto [numFixedCtaBatch, numFixedCtaTile, numFixedCtaInner] =
+          getFixedGridDim(options, multiProcessorCount);
+      static uint32_t* pinnedCounterValue_ = nullptr;
+      if (pinnedHostBuffer) {
+        // Use the pre-allocated pinned host memory if provided.
+        pinnedCounterValue_ = reinterpret_cast<uint32_t*>(pinnedHostBuffer);
+      }
+      // Use pinned host memory for the source value to support CUDA graph, or it silently breaks
+      // during CUDA graph replay and corrupts the data.
+      if (pinnedHostBuffer == nullptr && pinnedCounterValue_ == nullptr) {
+        // Allocate pinned host memory if not provided.
+        auto err = cudaMallocHost((void**)&pinnedCounterValue_, sizeof(uint32_t));
+        if (err != cudaSuccess) {
+          return 1;
+        }
+      }
+      *pinnedCounterValue_ = numFixedCtaBatch * numFixedCtaTile;
+      auto err = cudaMemcpyAsync((void*)batchedGemmData.mInputBuffers.mPtrDynamicTileCounter,
+                                 pinnedCounterValue_, sizeof(uint32_t), cudaMemcpyHostToDevice,
+                                 reinterpret_cast<cudaStream_t>(cudaStream));
+      if (err != cudaSuccess) {
+        return 1;
+      }
+    }
 
     auto kernelParams = KernelParamsSetup::setKernelParams(
         options, batchM, batchedGemmData.mInputBuffers.mPtrA, batchedGemmData.mInputBuffers.mPtrB,
@@ -566,10 +603,12 @@ class BatchedGemmInterface {
         dPtrRowMax, dPtrRowMaxBars, batchedGemmData.mInputBuffers.mPtrNumNonExitingCtas,
         batchedGemmData.mInputBuffers.mPtrTotalNumPaddedTokens,
         batchedGemmData.mInputBuffers.mPtrCtaIdxXyToBatchIdx,
-        batchedGemmData.mInputBuffers.mPtrCtaIdxXyToMnLimit, numCtaBatch);
+        batchedGemmData.mInputBuffers.mPtrCtaIdxXyToMnLimit, numCtaBatch,
+        batchedGemmData.mInputBuffers.mPtrDynamicTileCounter);
 
     // The size of the grid.
-    auto grid = getLaunchGrid(options, batchedGemmData.mProblemDimensions.mMaxNumCtasInTokenDim);
+    auto grid = getLaunchGrid(options, batchedGemmData.mProblemDimensions.mMaxNumCtasInTokenDim,
+                              multiProcessorCount);
 
     BatchedGemmConfig batchedGemmConfig = config;
 #ifndef TLLM_GEN_EXPORT_INTERFACE
@@ -682,10 +721,31 @@ class BatchedGemmInterface {
   // Returns the number of available cubin configurations
   size_t getNumBatchedGemmConfigs() const {
 #ifdef TLLM_GEN_EXPORT_INTERFACE
-    return tensorrt_llm::kernels::tllmGenBatchedGemmListLen;
+    return sizeof(tensorrt_llm::kernels::tllmGenBatchedGemmList) /
+           sizeof(tensorrt_llm::kernels::tllmGenBatchedGemmList[0]);
 #else
     return 0;
 #endif
+  }
+
+  //////////////////////////////////////////////////////////////////////////////////////////////////
+
+  // Returns the grid dimensions of the current kernel when using fixed grid size.
+  std::tuple<int32_t, int32_t, int32_t> getFixedGridDim(BatchedGemmOptions const& options,
+                                                        int32_t multiProcessorCount,
+                                                        int32_t multiProcessorOccupancy = 1) const {
+    // For StaticPersistent scheduler, limit grid size based on SM count.
+    assert(multiProcessorCount > 0 &&
+           "multiProcessorCount must be provided when using StaticPersistent scheduler");
+    // The cluster size spanned in the XY dimension.
+    auto clusterSizeXy = options.mClusterDimX * options.mClusterDimY;
+    // The maximum number of CTAs a GPU can run across the XY dimension.
+    auto numCtasXy = multiProcessorCount / options.mNumSlicesForSplitK;
+    // Round down to the nearest multiple of the cluster size.
+    numCtasXy = (numCtasXy / clusterSizeXy) * clusterSizeXy;
+    // Account for available occupancy for the kernel. Defaults to 1 CTA per multiprocessor.
+    numCtasXy *= multiProcessorOccupancy;
+    return std::make_tuple(numCtasXy, 1, options.mNumSlicesForSplitK);
   }
 
   //////////////////////////////////////////////////////////////////////////////////////////////////
@@ -738,13 +798,20 @@ class BatchedGemmInterface {
   //////////////////////////////////////////////////////////////////////////////////////////////////
 
   // Returns the number of CTAs of the current kernel.
-  std::vector<int32_t> getLaunchGrid(
-      BatchedGemmOptions const& options,
-      std::optional<int32_t> maxNumCtasInBatchDim = std::nullopt) const {
-    auto [numCtaBatch, numCtaTile, numCtaInner] = getGridDim(options, maxNumCtasInBatchDim);
+  std::vector<int32_t> getLaunchGrid(BatchedGemmOptions const& options,
+                                     std::optional<int32_t> maxNumCtasInBatchDim = std::nullopt,
+                                     int32_t multiProcessorCount = 0) const {
     bool const batchM = options.mBatchMode == BatchedGemmOptions::BatchMode::BatchM;
-    std::vector<int32_t> grid = batchM ? std::vector<int32_t>{numCtaBatch, numCtaTile, numCtaInner}
-                                       : std::vector<int32_t>{numCtaTile, numCtaBatch, numCtaInner};
+    // Determine if the scheduler requires a fixed grid dimension.
+    bool const isFixedGridDim = (options.mTileScheduler == gemm::TileScheduler::StaticPersistent ||
+                                 options.mTileScheduler == gemm::TileScheduler::PersistentSm90);
+    // Get the grid dimensions.
+    auto [numCtaBatch, numCtaTile, numCtaInner] =
+        isFixedGridDim ? getFixedGridDim(options, multiProcessorCount)
+                       : getGridDim(options, maxNumCtasInBatchDim);
+    std::vector<int32_t> grid = isFixedGridDim || batchM
+                                    ? std::vector<int32_t>{numCtaBatch, numCtaTile, numCtaInner}
+                                    : std::vector<int32_t>{numCtaTile, numCtaBatch, numCtaInner};
     return grid;
   }
 
@@ -753,8 +820,8 @@ class BatchedGemmInterface {
   // Returns the number of CTAs of the current kernel.
   int32_t getNumCtas(BatchedGemmOptions const& options,
                      std::optional<int32_t> maxNumCtasInBatchDim = std::nullopt) const {
-    auto grid = getLaunchGrid(options, maxNumCtasInBatchDim);
-    return grid[0] * grid[1] * grid[2];
+    auto [dim0, dim1, dim2] = getGridDim(options, maxNumCtasInBatchDim);
+    return dim0 * dim1 * dim2;
   }
 
   //////////////////////////////////////////////////////////////////////////////////////////////////
@@ -827,7 +894,6 @@ class BatchedGemmInterface {
         auto tileTokensDim = batchM ? options.mTileM * options.mClusterDimX : options.mTileN;
         totalNumPaddedTokens = data.mProblemDimensions.mMaxNumCtasInTokenDim * tileTokensDim;
       }
-
       // Get options from config.
       auto& options = config.mOptions;
 
@@ -846,6 +912,10 @@ class BatchedGemmInterface {
       // TODO: do we need to pad to 1024?
       workspaceSizes.push_back(getSizePaddedToAlignment(numBytesRowMax, 1024));
       workspaceSizes.push_back(getSizePaddedToAlignment(numBytesRowMaxBars, 1024));
+    }
+
+    if (options.mTileScheduler == gemm::TileScheduler::PersistentSm90) {
+      workspaceSizes.push_back(sizeof(uint32_t));
     }
 
     return workspaceSizes;
