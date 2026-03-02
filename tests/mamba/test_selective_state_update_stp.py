@@ -739,11 +739,11 @@ class TestSelectiveStateUpdateStochasticRounding(TestSelectiveStateUpdate):
         assert states_match
 
     # fmt: off
-    _SR_PARAMS = [
+    _SR_PARAMS = (
         # (batch, nheads, dim, dstate,  state_dtype,    weight_dtype,   use_out_tensor)
         (  64,    64,     64,  128,     torch.float16,  torch.float32,  True ),  # base
         (  64,    64,     64,   64,     torch.float16,  torch.float32,  True ),  # dstate=64
-    ]
+    )
     # fmt: on
 
     @pytest.mark.parametrize("algorithm", _get_algorithms_no_horizontal())
