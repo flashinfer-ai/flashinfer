@@ -289,7 +289,7 @@ def xqa(
         run_sm90_fp8_mha = False
 
     if get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12]:
-        raise RuntimeError("XQA is only supported on SM90, SM100, SM120 GPUs")
+        raise RuntimeError("XQA is only supported on SM90, SM100, SM120/SM121 GPUs")
 
     xqa_module = get_xqa_module(
         q.dtype,
@@ -501,7 +501,7 @@ def xqa_mla(
     assert k_cache.dtype == v_cache.dtype, "K and V cache must have the same dtype"
 
     if get_compute_capability(torch.device(device="cuda"))[0] not in [12]:
-        raise RuntimeError("XQA MLA is only supported on SM120 GPUs")
+        raise RuntimeError("XQA MLA is only supported on SM120/SM121 GPUs")
 
     xqa_module = get_xqa_module_mla(
         q.dtype,

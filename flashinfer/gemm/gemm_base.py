@@ -39,8 +39,7 @@ from ..utils import (
     get_native_fp4_dtype,
     is_sm100a_supported,
     is_sm100f_supported,
-    is_sm120a_supported,
-    is_sm121a_supported,
+    is_sm12x_supported,
     LibraryError,
     backend_requirement,
     supported_compute_capability,
@@ -90,7 +89,7 @@ from ..utils import (
 DEFAULT_WORKSPACE_SIZE = 32 * 1024 * 1024
 
 # Error messages
-CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR = "cudnn FP4 GEMM with mxfp4 quantization is not supported on SM120 with cuDNN backend version < 9.14.0."
+CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR = "cudnn FP4 GEMM with mxfp4 quantization is not supported on SM120/SM121 with cuDNN backend version < 9.14.0."
 
 
 def _match_sm_version(device: torch.device, sm_version: list[str]):
@@ -622,7 +621,7 @@ def get_gemm_sm120_module_cutlass_fp8():
                 a, b, scale_a, scale_b, out, workspace_buffer = inputs
 
                 # Handle both 2D (MM) and 3D (BMM) cases
-                # SM120 kernel now supports batch operations natively
+                # SM120/SM121 kernel now supports batch operations natively
                 if a.dim() == 2:
                     # 2D case: simple matrix multiplication
                     # Make B column-major for the kernel
@@ -652,7 +651,7 @@ def get_gemm_sm120_module_cutlass_fp8():
                 def _pad_to_multiple(x, multiple):
                     return ((x + multiple - 1) // multiple) * multiple
 
-                # SM120 CUTLASS blockwise scaling requires:
+                # SM120/SM121 CUTLASS blockwise scaling requires:
                 # - N % 128 == 0 (ScaleGranularityN)
                 # - K % 128 == 0 (TileK)
                 # If not aligned, we pad and then slice the result
@@ -709,7 +708,7 @@ def get_gemm_sm120_module_cutlass_fp8():
                 else:
                     out_padded = out
 
-                # For scalar scales, create compatible shapes for SM120
+                # For scalar scales, create compatible shapes for SM120/SM121
                 if scale_a.numel() == 1:
                     scale_m_count = (
                         batch_size * m_dim + scale_gran_m - 1
@@ -736,7 +735,7 @@ def get_gemm_sm120_module_cutlass_fp8():
                 else:
                     scale_b_expanded = scale_b
 
-                # Call SM120 gemm_fp8_nt_groupwise (now handles both 2D and 3D)
+                # Call SM120/SM121 gemm_fp8_nt_groupwise (now handles both 2D and 3D)
                 module.gemm_fp8_nt_groupwise(
                     workspace_buffer,
                     a_padded,
@@ -3038,7 +3037,7 @@ def _cudnn_gemm_fp4_requirement(
         raise ValueError("Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
     if (
         not use_nvfp4
-        and _match_sm_version(a.device, ["120"])
+        and _match_sm_version(a.device, ["120", "121"])
         and cudnn.backend_version() < 91400
     ):
         raise LibraryError(CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR)
@@ -4273,7 +4272,7 @@ def gemm_fp8_nt_groupwise(
         )
 
     if backend == "cutlass":
-        if is_sm120a_supported(a.device) or is_sm121a_supported(a.device):
+        if is_sm12x_supported(a.device):
             # SM120/121 doesn't use mma_sm parameter
             get_gemm_sm120_module().gemm_fp8_nt_groupwise(
                 workspace_buffer,
@@ -4534,7 +4533,7 @@ def _check_group_gemm_fp8_nt_groupwise_problem_size(
 
     num_groups = m_indptr.shape[0] - 1
 
-    if is_sm120a_supported(a.device) or is_sm121a_supported(a.device):
+    if is_sm12x_supported(a.device):
         if num_groups > 1:
             raise RuntimeError(
                 "group_gemm_fp8_nt_groupwise has correctness issues for num_groups > 1 on SM120/121"
@@ -4633,7 +4632,7 @@ def group_gemm_fp8_nt_groupwise(
     if out is None:
         out = torch.empty(out_shape, dtype=out_dtype, device=a.device)
 
-    if is_sm120a_supported(a.device) or is_sm121a_supported(a.device):
+    if is_sm12x_supported(a.device):
         # SM120/121 doesn't use mma_sm parameter
         get_gemm_sm120_module().group_gemm_fp8_nt_groupwise(
             int_workspace_buffer,

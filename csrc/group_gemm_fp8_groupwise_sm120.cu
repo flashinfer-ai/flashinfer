@@ -34,8 +34,9 @@ using namespace flashinfer;
     constexpr int SCALE_GRANULARITY_K = 128;                                                      \
     if (scale_granularity_k != 128) {                                                             \
       TVM_FFI_ICHECK(false)                                                                       \
-          << "SM120 requires scale_granularity_k=128. CUTLASS enforces ScaleGranularityK must "   \
-             "equal tile shape K dimension (128 for both Cooperative and PingPong schedules).";   \
+          << "SM120/SM121 requires scale_granularity_k=128. CUTLASS enforces ScaleGranularityK "  \
+             "must equal tile shape K dimension (128 for both Cooperative and PingPong "          \
+             "schedules).";                                                                       \
       return false;                                                                               \
     }                                                                                             \
     /* Match SM100's approach: support only (1,128,128) and (128,128,128) */                      \

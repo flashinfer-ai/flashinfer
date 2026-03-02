@@ -441,7 +441,7 @@ def gen_gemm_sm120_module() -> JitSpec:
     dtype_in_list = [torch.float8_e4m3fn, torch.float8_e5m2]
     dtype_out_list = [torch.float16, torch.bfloat16]
     scale_major_k_list = ["true", "false"]
-    # SM120 uses fixed 128x128x128 tiles with Cooperative schedule
+    # SM120/SM121 uses fixed 128x128x128 tiles with Cooperative schedule
 
     with open(jit_env.FLASHINFER_CSRC_DIR / f"{prefix}_sm120_kernel_inst.jinja") as f:
         kernel_inst_templ = jinja2.Template(f.read())
