@@ -487,7 +487,7 @@ class TestSelectiveStateUpdateInt16(TestSelectiveStateUpdate):
     ATOL = 1e-1
     RTOL = 1e-2
 
-    def make_inputs(self, batch, nheads, dim, dstate, state_dtype, weight_dtype):
+    def make_inputs(self, batch, nheads, dim, dstate, _state_dtype, weight_dtype):
         """Create test inputs with int16 state."""
         return create_test_inputs(
             batch,
@@ -647,7 +647,7 @@ class TestSelectiveStateUpdateStochasticRounding(TestSelectiveStateUpdate):
 
     RAND_SEED = 42
 
-    def make_inputs(self, batch, nheads, dim, dstate, state_dtype, weight_dtype):
+    def make_inputs(self, batch, nheads, dim, dstate, _state_dtype, weight_dtype):
         """Create test inputs with fp16 state."""
         return create_test_inputs(
             batch,
@@ -713,7 +713,7 @@ class TestSelectiveStateUpdateStochasticRounding(TestSelectiveStateUpdate):
         )
 
     def assert_states_match(
-        self, state_ref, state_test, slot_idx, msg_prefix="", **kwargs
+        self, state_ref, state_test, slot_idx, msg_prefix="", **_kwargs
     ):
         """Assert states match within tolerance (SR path has different FP operation order than Triton)."""
         state_ref_batch = state_ref[slot_idx]
