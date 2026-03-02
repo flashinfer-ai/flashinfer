@@ -873,7 +873,7 @@ def rmsnorm_quant_cute(
     kernel = _get_compiled_rmsnorm_quant_kernel(
         dtype_str, out_dtype_str, H, weight_bias, enable_pdl
     )
-    kernel(out, input, weight, M, scale, eps)
+    kernel(input, weight, out, M, scale, eps)
 
 
 __all__ = [
