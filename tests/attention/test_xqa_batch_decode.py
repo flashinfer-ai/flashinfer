@@ -34,7 +34,7 @@ def to_float8(x, dtype=torch.float8_e4m3fn):
 
 def to_nvfp4(x):
     # Get the amax
-    min_val, max_val = x.aminmax()
+    min_val, max_val = x.float().aminmax()
     amax = torch.maximum(min_val.abs(), max_val.abs()).clamp(min=1e-12)
     # The global scale, which is amax / (448. * 6.)
     global_scale = amax / (448.0 * 6.0)
@@ -587,6 +587,8 @@ def test_xqa_batch_decode(
     "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
     [
         (4, 4, 64, 4, 2),
+        (1, 1, 64, 2, 4),
+        (1, 1, 64, 2, 8),
     ],
 )
 @pytest.mark.parametrize("window_left", [-1])
@@ -623,7 +625,7 @@ def test_xqa_batch_decode_nvfp4_kv(
 
     # Set up test parameters
     torch.manual_seed(0)
-    head_dim = 128
+    head_dim = 256
 
     # Generate random sequence lengths
     num_qo_heads = num_kv_heads * head_grp_size
