@@ -36,6 +36,8 @@ from flashinfer.fused_moe import (
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_block_scale_routed_moe,
     WeightLayout,
+    trtllm_mxint4_block_scale_moe,
+    trtllm_mxint4_block_scale_routed_moe,
 )
 from flashinfer.fused_moe.core import Fp8QuantizationType
 from flashinfer.utils import device_support_pdl
@@ -46,6 +48,10 @@ from .test_trtllm_gen_fused_moe import (
     routing_reference_renormalize,
     routing_reference_renormalize_naive,
     routing_reference_topk,
+    mxint4_quantize,
+    block_scale_interleave,
+    _maybe_get_cached_w3_w1_permute_indices,
+    get_w2_permute_indices_with_cache,
 )
 
 from flashinfer.utils import get_compute_capability
@@ -704,4 +710,213 @@ def test_trtllm_gen_fp8_mxfp8_routed_activation_parity(activation_type: int):
 
     close = torch.isclose(output_ref, output_routed, atol=1e-2, rtol=1e-2)
     mismatch_pct = (~close).float().mean().item() * 100
+    assert mismatch_pct < 10, f"Mismatch percentage is {mismatch_pct:.2f}%"
+
+@pytest.mark.parametrize("num_tokens", [8, 64])
+@pytest.mark.parametrize("hidden_size", [1024, 2048])
+@pytest.mark.parametrize("intermediate_size", [1024, 2048])
+@pytest.mark.parametrize("num_experts", [8, 16])
+@pytest.mark.parametrize("top_k", [2, 4])
+@pytest.mark.parametrize(
+    "routing_method_type",
+    [
+        RoutingMethodType.Renormalize,
+    ],
+)
+def test_trtllm_gen_mxint4_routed_fused_moe(
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    top_k: int,
+    num_experts: int,
+    routing_method_type: RoutingMethodType,
+):
+    """Test MxInt4 block scale routed MoE matches standard routing."""
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] not in [10]:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+    torch.manual_seed(42)
+    device = torch.device("cuda:0")
+    enable_pdl = device_support_pdl(device)
+
+    # Generate random routing logits for reference
+    routing_logits = torch.rand(num_tokens, num_experts, device=device).to(
+        torch.bfloat16
+    )
+
+    # Generate random hidden states in BF16
+    hidden_states = (
+        torch.randn(num_tokens, hidden_size, device=device).to(torch.bfloat16) * 0.1
+    )
+
+    # Generate BF16 weights and quantize to MxInt4
+    gemm1_weights_bf16 = (
+        torch.randn(num_experts, 2 * intermediate_size, hidden_size, device=device).to(
+            torch.bfloat16
+        )
+        * 0.1
+    )
+    gemm2_weights_bf16 = (
+        torch.randn(num_experts, hidden_size, intermediate_size, device=device).to(
+            torch.bfloat16
+        )
+        * 0.1
+    )
+
+    # Quantize weights to MxInt4
+    sf_vec_size = 32
+    gemm1_weights_int4, gemm1_scales = mxint4_quantize(gemm1_weights_bf16, sf_vec_size)
+    gemm2_weights_int4, gemm2_scales = mxint4_quantize(gemm2_weights_bf16, sf_vec_size)
+    gemm1_scales = gemm1_scales.to(torch.bfloat16).reshape(
+        num_experts, 2 * intermediate_size, hidden_size // sf_vec_size
+    )
+    gemm2_scales = gemm2_scales.to(torch.bfloat16).reshape(
+        num_experts, hidden_size, intermediate_size // sf_vec_size
+    )
+
+    # Prepare shuffled weights for kernel
+    epilogue_tile_m = 128
+    gemm1_weights_mxint4_shuffled = []
+    gemm1_scales_shuffled = []
+    gemm2_weights_mxint4_shuffled = []
+    gemm2_scales_shuffled = []
+    cache_permute_indices = {}
+
+    for i in range(num_experts):
+        # Calculate the permute indices for the following:
+        # 1. Reorder rows of W1 and scales for fused gated activation
+        # 2. Shuffle weights and scaling factors for transposed mma output
+        permute_indices = _maybe_get_cached_w3_w1_permute_indices(
+            cache_permute_indices,
+            gemm1_weights_int4[i].view(torch.uint8),
+            epilogue_tile_m,
+        )
+        gemm1_weights_shuffled = (
+            gemm1_weights_int4[i]
+            .view(torch.uint8)[permute_indices.to(gemm1_weights_int4.device)]
+            .contiguous()
+        )
+        permute_sf_indices = _maybe_get_cached_w3_w1_permute_indices(
+            cache_permute_indices,
+            gemm1_scales[i].view(torch.bfloat16),
+            epilogue_tile_m,
+            num_elts_per_sf=32,
+        )
+        gemm1_scales_shuffled.append(
+            block_scale_interleave(
+                gemm1_scales[i]
+                .view(torch.bfloat16)[permute_sf_indices.to(gemm1_scales.device)]
+                .contiguous()
+            )
+        )
+
+        permute_indices = get_w2_permute_indices_with_cache(
+            cache_permute_indices,
+            gemm2_weights_int4[i].view(torch.uint8),
+            epilogue_tile_m,
+        )
+        gemm2_weights_shuffled = (
+            gemm2_weights_int4[i]
+            .view(torch.uint8)[permute_indices.to(gemm2_weights_int4.device)]
+            .contiguous()
+        )
+
+        permute_sf_indices = get_w2_permute_indices_with_cache(
+            cache_permute_indices,
+            gemm2_scales[i].view(torch.bfloat16),
+            epilogue_tile_m,
+            num_elts_per_sf=16,
+        )
+        gemm2_scales_shuffled.append(
+            block_scale_interleave(
+                gemm2_scales[i]
+                .view(torch.bfloat16)[permute_sf_indices.to(gemm2_scales.device)]
+                .contiguous()
+            )
+        )
+
+        block_k = 128
+        gemm1_weights_shuffled = convert_to_block_layout(
+            gemm1_weights_shuffled, block_k
+        )
+        gemm2_weights_shuffled = convert_to_block_layout(
+            gemm2_weights_shuffled.view(torch.uint8), block_k
+        )
+
+        gemm1_weights_mxint4_shuffled.append(gemm1_weights_shuffled)
+        gemm2_weights_mxint4_shuffled.append(gemm2_weights_shuffled)
+
+    gemm1_weights_mxint4_shuffled = torch.stack(gemm1_weights_mxint4_shuffled)
+    gemm2_weights_mxint4_shuffled = torch.stack(gemm2_weights_mxint4_shuffled)
+    gemm1_scales_shuffled = torch.stack(gemm1_scales_shuffled).view(torch.bfloat16)
+    gemm2_scales_shuffled = torch.stack(gemm2_scales_shuffled).view(torch.bfloat16)
+
+    # Run reference with routing_logits
+    reference_output = trtllm_mxint4_block_scale_moe(
+        routing_logits,
+        None,  # routing_bias
+        hidden_states,
+        gemm1_weights_mxint4_shuffled,
+        gemm1_scales_shuffled,
+        None,  # gemm1_alpha
+        None,  # gemm1_beta
+        None,  # gemm1_clamp_limit
+        gemm2_weights_mxint4_shuffled,
+        gemm2_scales_shuffled,
+        num_experts,
+        top_k,
+        None,  # n_group
+        None,  # topk_group
+        intermediate_size,
+        0,  # local_expert_offset
+        num_experts,
+        None,  # routed_scaling_factor
+        routing_method_type.value,
+        True,  # do_finalize
+        enable_pdl,
+    )[0].to(torch.float)
+
+    # Compute routing using reference implementation
+    permute_info, expert_weights_ref = routing_reference_renormalize(
+        routing_logits, top_k, num_experts, 8
+    )
+    topk_ids = permute_info["topKIndices"].to(torch.int32)
+    expert_weights = expert_weights_ref.view(num_tokens, num_experts)[
+        torch.arange(num_tokens, device=device).unsqueeze(1), topk_ids
+    ].to(torch.bfloat16)
+
+    # Pack topk_ids and expert_weights into single tensor
+    # Format: (expert_id << 16) | (weight_bf16.view(int16))
+    packed_topk_ids = (topk_ids << 16) | expert_weights.view(torch.int16).to(
+        torch.int32
+    )
+
+    # Run with pre-computed routing (packed format)
+    output = trtllm_mxint4_block_scale_routed_moe(
+        topk_ids=packed_topk_ids,
+        routing_bias=None,
+        hidden_states=hidden_states,
+        gemm1_weights=gemm1_weights_mxint4_shuffled,
+        gemm1_weights_scale=gemm1_scales_shuffled,
+        gemm1_alpha=None,
+        gemm1_beta=None,
+        gemm1_clamp_limit=None,
+        gemm2_weights=gemm2_weights_mxint4_shuffled,
+        gemm2_weights_scale=gemm2_scales_shuffled,
+        num_experts=num_experts,
+        top_k=top_k,
+        n_group=None,
+        topk_group=None,
+        intermediate_size=intermediate_size,
+        local_expert_offset=0,
+        local_num_experts=num_experts,
+        routed_scaling_factor=None,
+        routing_method_type=routing_method_type.value,
+        enable_pdl=enable_pdl,
+    )[0].to(torch.float)
+
+    mask = torch.isclose(output, reference_output, rtol=1e-2, atol=1e-2)
+
+    # mismatch percentage
+    mismatch_pct = (~mask).float().mean().item() * 100
     assert mismatch_pct < 10, f"Mismatch percentage is {mismatch_pct:.2f}%"
