@@ -5,6 +5,8 @@
 import os
 import torch
 
+from torch.torch_version import TorchVersion
+
 
 class Configs:
     TRANSFER: str
@@ -17,7 +19,7 @@ class Configs:
             return
 
         # Torch version >= 2.11 is required for implicit MemPool in `symm_mem.empty`
-        if torch.__version__ < "2.11":
+        if TorchVersion(torch.__version__) < TorchVersion("2.11"):
             raise ValueError("all_gather_matmul requires Torch version >= 2.11")
 
         transfer = os.getenv("TRANSFER", "CE")
