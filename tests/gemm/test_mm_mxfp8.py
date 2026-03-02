@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 
 from flashinfer import autotune, mm_mxfp8, shuffle_matrix_a, shuffle_matrix_sf_a
-from flashinfer.fp8_quantization import mxfp8_quantize, mxfp8_dequantize_host
+from flashinfer.fp8_quantization import mxfp8_quantize
 from flashinfer.utils import get_compute_capability
 
 
@@ -92,25 +92,7 @@ def _run_mm_mxfp8(
         input, mat2, is_sf_swizzled_layout
     )
 
-    input_dequantize = (
-        mxfp8_dequantize_host(
-            input_mxfp8.cpu().view(torch.uint8),
-            input_descale.cpu().view(torch.uint8).reshape(-1),
-            is_sf_swizzled_layout,
-        )
-        .cuda()
-        .to(input_dtype)
-    )
-    mat2_dequantize = (
-        mxfp8_dequantize_host(
-            mat2_mxfp8.cpu().view(torch.uint8),
-            mat2_descale.cpu().view(torch.uint8).reshape(-1),
-            is_sf_swizzled_layout,
-        )
-        .cuda()
-        .to(input_dtype)
-    )
-    reference = torch.mm(input_dequantize, mat2_dequantize.T)
+    reference = torch.mm(input, mat2.T)
 
     res = torch.empty([m, n], device="cuda", dtype=out_dtype) if provide_out else None
 
@@ -244,7 +226,7 @@ def test_mm_mxfp8_invalid_input_dtype():
     b = torch.randn([k, n], device="cuda", dtype=torch.bfloat16)
     a_scale = torch.empty([m * (k // 32)], device="cuda", dtype=torch.uint8)
     b_scale = torch.empty([n * (k // 32)], device="cuda", dtype=torch.uint8)
-    with pytest.raises(ValueError, match="float8_e4m3fn"):
+    with pytest.raises(RuntimeError, match="float8_e4m3fn"):
         mm_mxfp8(a, b, a_scale, b_scale, out_dtype=torch.bfloat16, backend="cutlass")
 
 
@@ -255,7 +237,7 @@ def test_mm_mxfp8_invalid_ndim():
     b = torch.randn([k, n], device="cuda", dtype=torch.bfloat16)
     a_scale = torch.empty([m * (k // 32)], device="cuda", dtype=torch.uint8)
     b_scale = torch.empty([n * (k // 32)], device="cuda", dtype=torch.uint8)
-    with pytest.raises(ValueError, match="accepts 2d tensors"):
+    with pytest.raises(AssertionError, match="a must be 2D"):
         mm_mxfp8(a, b, a_scale, b_scale, out_dtype=torch.bfloat16, backend="cutlass")
 
     a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
@@ -265,7 +247,7 @@ def test_mm_mxfp8_invalid_ndim():
     a_descale = a_scale.view(1, -1, 1)
     b_descale = b_scale.view(1, -1, 1)
     with pytest.raises(
-        ValueError,
+        AssertionError,
         match=r"a_descale must be 1D \(swizzled\) or 2D \(non-swizzled\)",
     ):
         mm_mxfp8(
