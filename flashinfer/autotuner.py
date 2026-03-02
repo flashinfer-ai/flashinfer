@@ -886,7 +886,10 @@ class AutoTuner:
         """Reset all statistics counters."""
         self.stats = AutoTunerStatistics()
 
-    def _get_l2_cache_size_in_bytes(self, device_id: int = 0) -> int:
+    def _get_l2_cache_size_in_bytes(self, device_id: Optional[int] = None) -> int:
+        if device_id is None:
+            device_id = torch.cuda.current_device()
+
         device = self._checkCudaErrors(driver.cuDeviceGet(device_id))
         return self._checkCudaErrors(
             driver.cuDeviceGetAttribute(
