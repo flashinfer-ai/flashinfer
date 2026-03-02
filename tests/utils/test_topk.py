@@ -21,6 +21,7 @@ import torch
 
 import flashinfer
 from flashinfer.topk import can_implement_filtered_topk
+from flashinfer.utils import get_compute_capability
 
 
 @pytest.fixture
@@ -51,6 +52,12 @@ def compute_topk_accuracy(test_indices, ref_indices, batch_size, k):
         test_set = set(test_indices[i].cpu().numpy())
         total_intersection += len(ref_set & test_set)
     return total_intersection / (batch_size * k)
+
+
+def _require_sm80_for_bf16():
+    major, _ = get_compute_capability(torch.device("cuda"))
+    if major < 8:
+        pytest.skip("BF16 requires SM80+")
 
 
 def verify_topk_correctness(logits, values, indices, k):
@@ -1225,6 +1232,218 @@ def test_algorithms_with_large_k(algo, set_topk_algo):
     assert values.shape == (batch_size, k)
     accuracy = compute_topk_accuracy(indices.int(), ref_indices.int(), batch_size, k)
     assert accuracy >= 0.98, f"Algorithm {algo}: Accuracy {accuracy:.4f} < 0.98"
+
+
+@pytest.mark.parametrize("algo", ["auto", "multi_cta", "filtered"])
+def test_bf16_long_seq_regression_across_algorithms(algo, set_topk_algo):
+    """Regression for bf16 long-seq topk across algorithm overrides."""
+    _require_sm80_for_bf16()
+    if algo == "filtered" and not can_implement_filtered_topk():
+        pytest.skip("GPU does not support filtered topk (requires 128KB shared memory)")
+
+    set_topk_algo(algo)
+
+    logits, _, _, _, _, k, _ = _build_bf16_long_seq_bucket_inputs()
+
+    values, indices = flashinfer.top_k(logits, k, sorted=True)
+    ref_values, _ = torch.topk(logits, k, dim=-1, sorted=True)
+
+    # Value set must match torch.topk; ties make index order non-unique.
+    torch.testing.assert_close(values, ref_values)
+    gathered_values = torch.gather(logits, dim=-1, index=indices)
+    torch.testing.assert_close(values, gathered_values)
+
+
+def _build_bf16_long_seq_bucket_inputs():
+    """Construct a tie-heavy bf16 workload used by long-sequence regression tests."""
+    batch_size = 4
+    vocab_size = 65536
+    k = 1024
+    device = "cuda"
+
+    logits = (
+        ((torch.arange(vocab_size, device=device, dtype=torch.float32) % 64) / 64.0)
+        .unsqueeze(0)
+        .repeat(batch_size, 1)
+        .to(torch.bfloat16)
+    )
+    lengths = torch.full((batch_size,), vocab_size, device=device, dtype=torch.int32)
+    expected = (
+        torch.arange(63, vocab_size, 64, device=device, dtype=torch.int32)
+        .unsqueeze(0)
+        .repeat(batch_size, 1)
+    )
+    return logits, lengths, expected, batch_size, vocab_size, k, device
+
+
+def _build_fp32_long_seq_overflow_inputs():
+    """Construct a float32 case that overflows FilteredTopK refine candidate buffer.
+
+    Values are crafted so that all elements share the same coarse/first-refine bucket,
+    while the true top-k elements are concentrated in the tail. This triggers candidate
+    truncation if overflow fallback is missing in multi-round refine.
+    """
+    batch_size = 1
+    vocab_size = 65536
+    k = 1024
+    device = "cuda"
+
+    idx = torch.arange(vocab_size, device=device, dtype=torch.int32)
+    bits = torch.full((vocab_size,), 0x3F800000, device=device, dtype=torch.int32) + idx
+    logits = bits.view(torch.float32).unsqueeze(0).contiguous()
+    return logits, batch_size, vocab_size, k
+
+
+def _build_fp32_long_seq_pivot_mismatch_inputs():
+    """Construct a float32 case that exposes pivot reconstruction mismatch.
+
+    This bit pattern keeps a dense coarse bucket while making the coarse threshold
+    byte differ from the first FP32 ordered-byte threshold. If pivot reconstruction
+    incorrectly mixes the coarse bin into high 8 bits, filtered top-k output drifts
+    from torch.topk.
+    """
+    batch_size = 1
+    vocab_size = 65536
+    k = 1024
+    device = "cuda"
+
+    base = 0x3805ED27
+    idx = torch.arange(vocab_size, device=device, dtype=torch.int64)
+    bits = (
+        (torch.tensor(base, device=device, dtype=torch.int64) + idx) & 0xFFFFFFFF
+    ).to(torch.int32)
+    logits = bits.view(torch.float32).unsqueeze(0).contiguous()
+    return logits, batch_size, vocab_size, k
+
+
+def _assert_unordered_indices_match(output, expected):
+    """Compare index sets row-wise while ignoring order under ties."""
+    output_sorted = torch.sort(output, dim=-1).values.to(torch.long)
+    expected_sorted = torch.sort(expected, dim=-1).values.to(torch.long)
+    assert torch.equal(
+        output_sorted,
+        expected_sorted,
+    )
+
+
+def _run_transform_with_identity_mapping(logits, k, transform_mode):
+    """Run transform API with identity mapping so output equals selected indices."""
+    batch_size, vocab_size = logits.shape
+    device = logits.device
+    lengths = torch.full((batch_size,), vocab_size, device=device, dtype=torch.int32)
+
+    if transform_mode == "page_table":
+        src_page_table = (
+            torch.arange(vocab_size, device=device, dtype=torch.int32)
+            .unsqueeze(0)
+            .repeat(batch_size, 1)
+            .contiguous()
+        )
+        return flashinfer.top_k_page_table_transform(logits, src_page_table, lengths, k)
+
+    offsets = torch.zeros((batch_size,), device=device, dtype=torch.int32)
+    return flashinfer.top_k_ragged_transform(logits, offsets, lengths, k)
+
+
+@pytest.mark.parametrize("transform_mode", ["page_table", "ragged"])
+def test_bf16_long_seq_transform_regression_filtered(transform_mode, set_topk_algo):
+    """Regression for bf16 long-seq transform APIs under filtered algorithm."""
+    _require_sm80_for_bf16()
+    if not can_implement_filtered_topk():
+        pytest.skip("Filtered top-k not supported on this device")
+
+    set_topk_algo("filtered")
+
+    logits, lengths, expected, batch_size, vocab_size, k, device = (
+        _build_bf16_long_seq_bucket_inputs()
+    )
+
+    if transform_mode == "page_table":
+        # Identity page table: output should match selected local indices.
+        src_page_table = (
+            torch.arange(vocab_size, device=device, dtype=torch.int32)
+            .unsqueeze(0)
+            .repeat(batch_size, 1)
+            .contiguous()
+        )
+        output = flashinfer.top_k_page_table_transform(
+            logits, src_page_table, lengths, k
+        )
+    else:
+        offsets = torch.zeros((batch_size,), device=device, dtype=torch.int32)
+        output = flashinfer.top_k_ragged_transform(logits, offsets, lengths, k)
+
+    _assert_unordered_indices_match(output, expected)
+
+
+@pytest.mark.parametrize("algo", ["auto", "multi_cta", "filtered"])
+def test_fp32_long_seq_refine_overflow_regression_across_algorithms(
+    algo, set_topk_algo
+):
+    """Regression for float32 long-seq refine overflow across algorithms."""
+    if algo == "filtered" and not can_implement_filtered_topk():
+        pytest.skip("Filtered top-k not supported on this device")
+
+    set_topk_algo(algo)
+    logits, batch_size, _, k = _build_fp32_long_seq_overflow_inputs()
+
+    values, indices = flashinfer.top_k(logits, k, sorted=True)
+    ref_values, ref_indices = torch.topk(logits, k, dim=-1, sorted=True)
+
+    assert values.shape == (batch_size, k)
+    assert indices.shape == (batch_size, k)
+    torch.testing.assert_close(values, ref_values)
+    assert torch.equal(indices, ref_indices)
+
+
+@pytest.mark.parametrize("algo", ["auto", "multi_cta", "filtered"])
+@pytest.mark.parametrize("transform_mode", ["page_table", "ragged"])
+def test_fp32_long_seq_refine_overflow_transform_regression_across_algorithms(
+    algo, transform_mode, set_topk_algo
+):
+    """Regression for fp32 long-seq overflow on transform APIs."""
+    if algo == "filtered" and not can_implement_filtered_topk():
+        pytest.skip("Filtered top-k not supported on this device")
+
+    set_topk_algo(algo)
+    logits, _, _, k = _build_fp32_long_seq_overflow_inputs()
+
+    output = _run_transform_with_identity_mapping(logits, k, transform_mode)
+    ref_indices = torch.topk(logits, k, dim=-1, sorted=True).indices.to(torch.int32)
+    _assert_unordered_indices_match(output, ref_indices)
+
+
+def test_fp32_long_seq_pivot_rebuild_regression_filtered(set_topk_algo):
+    """Regression for pivot reconstruction in float32 overflow fallback."""
+    if not can_implement_filtered_topk():
+        pytest.skip("Filtered top-k not supported on this device")
+
+    set_topk_algo("filtered")
+    logits, batch_size, _, k = _build_fp32_long_seq_pivot_mismatch_inputs()
+
+    values, indices = flashinfer.top_k(logits, k, sorted=True)
+    ref_values, ref_indices = torch.topk(logits, k, dim=-1, sorted=True)
+
+    assert values.shape == (batch_size, k)
+    assert indices.shape == (batch_size, k)
+    torch.testing.assert_close(values, ref_values)
+    assert torch.equal(indices, ref_indices)
+
+
+@pytest.mark.parametrize("transform_mode", ["page_table", "ragged"])
+def test_fp32_long_seq_pivot_rebuild_transform_regression_filtered(
+    transform_mode, set_topk_algo
+):
+    """Regression for fp32 pivot reconstruction in filtered transform APIs."""
+    if not can_implement_filtered_topk():
+        pytest.skip("Filtered top-k not supported on this device")
+
+    set_topk_algo("filtered")
+    logits, _, _, k = _build_fp32_long_seq_pivot_mismatch_inputs()
+
+    output = _run_transform_with_identity_mapping(logits, k, transform_mode)
+    ref_indices = torch.topk(logits, k, dim=-1, sorted=True).indices.to(torch.int32)
+    _assert_unordered_indices_match(output, ref_indices)
 
 
 if __name__ == "__main__":
