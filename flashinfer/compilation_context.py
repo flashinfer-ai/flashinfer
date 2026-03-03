@@ -24,33 +24,6 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def _get_arch_suffix(major: int, minor: int) -> str:
-    """Determine the architecture suffix ('a' or 'f') based on GPU capability and CUDA version.
-
-    For SM >= 9, architectures use the 'a' (architecture-specific) suffix by default.
-    For SM120 (Blackwell GeForce/workstation), the 'f' (feature-set / family) suffix is
-    preferred when the CUDA toolkit supports it (>= 12.9), as it enables additional
-    instructions such as native FP4 conversion (cvt.rn.satfinite.e2m1x2.f32).
-
-    Note: 'a' and 'f' are different feature sets, not a superset relationship.
-    We only auto-select 'f' for SM120 where it's been verified to improve FP4 performance.
-    Other architectures (SM100, SM103, SM110) keep 'a' by default; specific modules can
-    opt into 'f' explicitly via sm100f_nvcc_flags etc.
-    """
-    from packaging import version as pkg_version
-
-    cuda_version = torch.version.cuda
-    suffix = "a"
-    # Use 'f' suffix for SM120 when CUDA >= 12.9, enabling native FP4 conversion
-    if major == 12 and minor == 0 and cuda_version is not None:
-        try:
-            if pkg_version.parse(cuda_version) >= pkg_version.parse("12.9"):
-                suffix = "f"
-        except Exception:
-            pass
-    return str(minor) + suffix
-
-
 class CompilationContext:
     COMMON_NVCC_FLAGS = [
         "-DFLASHINFER_ENABLE_FP8_E8M0",
@@ -69,7 +42,7 @@ class CompilationContext:
                 for device in range(torch.cuda.device_count()):
                     major, minor = torch.cuda.get_device_capability(device)
                     if major >= 9:
-                        minor = _get_arch_suffix(major, minor)
+                        minor = str(minor) + "a"
                     self.TARGET_CUDA_ARCHS.add((int(major), str(minor)))
             except Exception as e:
                 logger.warning(f"Failed to get device capability: {e}.")
