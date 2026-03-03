@@ -94,6 +94,15 @@ def _create_cutlass_tensor(
     return cute_tensor, dst_tensor
 
 
+def _wrap_tensor(from_dlpack, tensor, dynamic_modes, align=16):
+    """from_dlpack + mark_compact_shape_dynamic for all dynamic modes."""
+    ct = from_dlpack(tensor, assumed_align=align)
+    dim_order = tensor.dim_order()
+    for m in dynamic_modes:
+        ct = ct.mark_compact_shape_dynamic(mode=m, stride_order=dim_order)
+    return ct
+
+
 class _SSDKernel:
     """
     Internal wrapper around CuTe DSL SSD kernel.
@@ -401,8 +410,13 @@ class _SSDKernel:
                 num_seqs + 1, dtype=torch.int32, device=seq_idx.device
             )
             _get_seq_chunk_cumsum_module().seq_chunk_cumsum(
-                seq_idx, chunk_indices, chunk_offsets, seq_chunk_cumsum,
-                chunk_size, num_logical_chunks_local, num_seqs,
+                seq_idx,
+                chunk_indices,
+                chunk_offsets,
+                seq_chunk_cumsum,
+                chunk_size,
+                num_logical_chunks_local,
+                num_seqs,
             )
             seq_chunk_cumsum_tensor = from_dlpack(seq_chunk_cumsum, assumed_align=4)
 
@@ -491,6 +505,504 @@ def _get_ssd_kernel(
         has_d=has_d,
         d_has_hdim=d_has_hdim,
         has_init_states=has_init_states,
+        has_varlen=has_varlen,
+        has_z=has_z,
+        seq_idx_dtype=seq_idx_dtype,
+    )
+
+
+class SSDCombined:
+    """Mamba2 SSD combined forward pass with cached host-side state.
+
+    Caches compiled kernel, hardware info, and pre-allocated buffers
+    to minimize host-side overhead on repeated calls.
+
+    Usage::
+
+        ssd = SSDCombined(chunk_size=128, nheads=8, headdim=64,
+                          dstate=128, ngroups=8)
+        out, final_states = ssd.run(x, dt, A, B, C, D=D, dt_bias=dt_bias, ...)
+    """
+
+    def __init__(
+        self,
+        chunk_size: int,
+        nheads: int,
+        headdim: int,
+        dstate: int,
+        ngroups: int,
+        dtype: torch.dtype = torch.bfloat16,
+        has_d: bool = True,
+        d_has_hdim: bool = False,
+        has_initial_states: bool = False,
+        has_varlen: bool = False,
+        has_z: bool = False,
+        seq_idx_dtype=None,
+    ):
+        self.chunk_size = chunk_size
+        self.nheads = nheads
+        self.headdim = headdim
+        self.dstate = dstate
+        self.ngroups = ngroups
+        self._has_d = has_d
+        self._d_has_hdim = d_has_hdim
+        self._has_init_states = has_initial_states
+        self._has_varlen = has_varlen
+        self._has_z = has_z
+
+        # Import CUTLASS modules once
+        mods = _import_cutlass_modules()
+        self._cutlass = mods["cutlass"]
+        self._cute = mods["cute"]
+        self._cutlass_torch = mods["cutlass_torch"]
+        self._from_dlpack = mods["from_dlpack"]
+
+        # Resolve dtypes
+        _dtype_map = {
+            torch.bfloat16: self._cutlass.BFloat16,
+            torch.float16: self._cutlass.Float16,
+        }
+        self._io_dtype = _dtype_map.get(dtype, self._cutlass.BFloat16)
+        self._cumsum_dtype = self._cutlass.Float32
+        self._acc_dtype = self._cutlass.Float32
+        self._io_torch_dtype = self._cutlass_torch.dtype(self._io_dtype)
+
+        # Create kernel object
+        seq_idx_cutlass_dtype = (
+            self._cutlass.Int64 if seq_idx_dtype == "int64" else self._cutlass.Int32
+        )
+        SSDKernel = mods["SSDKernel"]
+        self._kernel_obj = SSDKernel(
+            self._io_dtype,
+            self._cumsum_dtype,
+            self._acc_dtype,
+            chunk_size,
+            headdim,
+            dstate,
+            has_d,
+            d_has_hdim,
+            has_initial_states,
+            has_varlen,
+            has_z,
+            seq_idx_cutlass_dtype,
+        )
+        self._compiled_kernel = None
+
+        # Lazily cached on first run() (needs active CUDA context)
+        self._max_active_clusters = None
+
+        # Pre-allocated buffer caches (lazily initialized on first run)
+        self._fstate_shape = None
+        self._fstate_cute = None
+        self._fstate_torch = None
+
+        self._d_ptr = None
+        self._d_shape = None
+        self._d_cute = None
+        self._d_torch = None
+
+        self._seq_cumsum_size = 0
+        self._seq_cumsum_buf = None
+
+    # -- buffer cache helpers --------------------------------------------------
+
+    def _get_or_alloc_fstate(self, fstate_batch):
+        shape = (fstate_batch, self.nheads, self.headdim, self.dstate)
+        if self._fstate_shape != shape:
+            self._fstate_cute, self._fstate_torch = _create_cutlass_tensor(
+                list(shape),
+                [3, 2, 1, 0],
+                self._io_dtype,
+                [2, 3],
+                self._cutlass_torch,
+                self._from_dlpack,
+            )
+            self._fstate_shape = shape
+        return self._fstate_cute, self._fstate_torch
+
+    def _get_or_wrap_d(self, D):
+        if D is None:
+            return None
+        d_ptr = D.data_ptr()
+        d_shape = D.shape
+        if self._d_ptr == d_ptr and self._d_shape == d_shape:
+            return self._d_cute
+
+        if self._d_has_hdim:
+            d_val = D
+            if D.dim() == 1:
+                d_val = D.unsqueeze(1).expand(-1, self.headdim)
+            self._d_cute, self._d_torch = _create_cutlass_tensor(
+                [self.nheads, self.headdim],
+                [1, 0],
+                self._io_dtype,
+                [1],
+                self._cutlass_torch,
+                self._from_dlpack,
+            )
+            self._d_torch.copy_(d_val.t().to(self._d_torch.dtype))
+        else:
+            d_val = D
+            if D.dim() == 2:
+                d_val = D[:, 0]
+            self._d_cute, self._d_torch = _create_cutlass_tensor(
+                [self.nheads, 1],
+                [1, 0],
+                self._io_dtype,
+                [1],
+                self._cutlass_torch,
+                self._from_dlpack,
+            )
+            self._d_torch.copy_(d_val.unsqueeze(0).to(self._d_torch.dtype))
+
+        self._d_ptr = d_ptr
+        self._d_shape = d_shape
+        return self._d_cute
+
+    def _get_or_alloc_seq_cumsum(self, num_seqs, device):
+        size = num_seqs + 1
+        if self._seq_cumsum_size != size:
+            self._seq_cumsum_buf = torch.zeros(
+                size,
+                dtype=torch.int32,
+                device=device,
+            )
+            self._seq_cumsum_size = size
+        else:
+            self._seq_cumsum_buf.zero_()
+        return self._seq_cumsum_buf
+
+    # -- main entry point ------------------------------------------------------
+
+    def run(
+        self,
+        x: torch.Tensor,
+        dt: torch.Tensor,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        C: torch.Tensor,
+        D: Optional[torch.Tensor] = None,
+        z: Optional[torch.Tensor] = None,
+        dt_bias: Optional[torch.Tensor] = None,
+        dt_softplus: bool = False,
+        dt_limit: Tuple[float, float] = (0.0, float("inf")),
+        initial_states: Optional[torch.Tensor] = None,
+        seq_idx: Optional[torch.Tensor] = None,
+        chunk_indices: Optional[torch.Tensor] = None,
+        chunk_offsets: Optional[torch.Tensor] = None,
+        out: Optional[torch.Tensor] = None,
+        return_final_states: bool = True,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Run SSD combined forward pass.
+
+        Parameters match ``ssd_combined_fwd`` — see its docstring for details.
+        """
+        from_dlpack = self._from_dlpack
+        chunk_size = self.chunk_size
+
+        batch, seqlen, nheads, headdim = x.shape
+        _, _, ngroups, dstate = B.shape
+        nchunks = seqlen // chunk_size
+
+        assert seqlen % chunk_size == 0, (
+            f"seqlen ({seqlen}) must be divisible by chunk_size ({chunk_size})"
+        )
+
+        # Validate varlen arguments
+        if seq_idx is not None:
+            assert seq_idx.shape == (batch, seqlen), (
+                f"seq_idx shape {seq_idx.shape} doesn't match "
+                f"(batch={batch}, seqlen={seqlen})"
+            )
+            assert seq_idx.dtype in (torch.int32, torch.int64), (
+                f"seq_idx must be int32 or int64, got {seq_idx.dtype}"
+            )
+        if chunk_indices is not None:
+            assert chunk_indices.dim() == 1, (
+                f"chunk_indices must be 1D, got {chunk_indices.dim()}D"
+            )
+            assert chunk_indices.dtype == torch.int32, (
+                f"chunk_indices must be int32, got {chunk_indices.dtype}"
+            )
+        if chunk_offsets is not None:
+            assert chunk_offsets.dim() == 1, (
+                f"chunk_offsets must be 1D, got {chunk_offsets.dim()}D"
+            )
+            assert chunk_offsets.dtype == torch.int32, (
+                f"chunk_offsets must be int32, got {chunk_offsets.dtype}"
+            )
+        if chunk_indices is not None and chunk_offsets is not None:
+            assert chunk_indices.shape == chunk_offsets.shape, (
+                f"chunk_indices and chunk_offsets must have the same shape, "
+                f"got {chunk_indices.shape} vs {chunk_offsets.shape}"
+            )
+
+        if out is not None:
+            assert out.shape == (batch, nheads, headdim, nchunks, chunk_size), (
+                f"out shape {out.shape} doesn't match "
+                f"expected ({batch}, {nheads}, {headdim}, {nchunks}, {chunk_size})"
+            )
+            assert out.dtype == x.dtype, (
+                f"out dtype {out.dtype} doesn't match x dtype {x.dtype}"
+            )
+            assert out.is_contiguous(), (
+                "out must be contiguous in (B, EH, D, C, L) layout"
+            )
+
+        # -- Step 1: Cumsum (Triton) ------------------------------------------
+        # Triton kernel outputs dt_processed directly in io_dtype (bf16),
+        # avoiding a separate float32->bf16 copy.
+        dA_cumsum, dt_processed = chunk_cumsum_fwd(
+            dt,
+            A,
+            chunk_size,
+            dt_bias=dt_bias,
+            dt_softplus=dt_softplus,
+            dt_limit=dt_limit,
+            dt_out_dtype=self._io_torch_dtype,
+        )
+
+        # -- Step 2: Allocate output if needed --------------------------------
+        if out is None:
+            out = torch.empty(
+                batch,
+                nheads,
+                headdim,
+                nchunks,
+                chunk_size,
+                dtype=x.dtype,
+                device=x.device,
+            )
+
+        # -- Step 3: Wrap input tensors for CuTe DSL --------------------------
+        io_torch_dtype = self._io_torch_dtype
+
+        # x: (B, seqlen, EH, D) -> (D, L, C, EH, B)
+        x_reshaped = x.reshape(batch, nchunks, chunk_size, nheads, headdim)
+        assert x.dtype == io_torch_dtype, (
+            f"x dtype {x.dtype} doesn't match {io_torch_dtype}"
+        )
+        x_tensor = _wrap_tensor(
+            from_dlpack,
+            x_reshaped.permute(4, 2, 1, 3, 0),
+            [2, 3, 4],
+        )
+
+        # z: same layout as x
+        z_tensor = None
+        if z is not None:
+            z_reshaped = z.reshape(batch, nchunks, chunk_size, nheads, headdim)
+            assert z.dtype == io_torch_dtype, (
+                f"z dtype {z.dtype} doesn't match {io_torch_dtype}"
+            )
+            z_tensor = _wrap_tensor(
+                from_dlpack,
+                z_reshaped.permute(4, 2, 1, 3, 0),
+                [2, 3, 4],
+            )
+
+        # dt: already in io_dtype from cumsum kernel, just permute
+        delta_tensor = _wrap_tensor(
+            from_dlpack,
+            dt_processed.permute(3, 2, 1, 0),
+            [1, 2, 3],
+        )
+
+        # dA_cumsum: (B, EH, C, L) -> (L, C, EH, B)
+        assert dA_cumsum.dtype == self._cutlass_torch.dtype(self._cumsum_dtype), (
+            f"dA_cumsum dtype {dA_cumsum.dtype} doesn't match "
+            f"cumsum_dtype {self._cumsum_dtype}"
+        )
+        cumsum_delta_tensor = _wrap_tensor(
+            from_dlpack,
+            dA_cumsum.permute(3, 2, 1, 0),
+            [1, 2, 3],
+        )
+
+        # B: (B, seqlen, G, N) -> (L, N, C, G, B)
+        B_reshaped = B.reshape(batch, nchunks, chunk_size, ngroups, dstate)
+        assert B.dtype == io_torch_dtype, (
+            f"B dtype {B.dtype} doesn't match {io_torch_dtype}"
+        )
+        b_tensor = _wrap_tensor(
+            from_dlpack,
+            B_reshaped.permute(2, 4, 1, 3, 0),
+            [2, 3, 4],
+        )
+
+        # C: (B, seqlen, G, N) -> (L, N, C, G, B)
+        C_reshaped = C.reshape(batch, nchunks, chunk_size, ngroups, dstate)
+        assert C.dtype == io_torch_dtype, (
+            f"C dtype {C.dtype} doesn't match {io_torch_dtype}"
+        )
+        c_tensor = _wrap_tensor(
+            from_dlpack,
+            C_reshaped.permute(2, 4, 1, 3, 0),
+            [2, 3, 4],
+        )
+
+        # D (cached)
+        d_tensor = self._get_or_wrap_d(D) if self._has_d else None
+
+        # init_states
+        init_states_tensor = None
+        if self._has_init_states and initial_states is not None:
+            assert initial_states.dtype == io_torch_dtype, (
+                f"init_states dtype {initial_states.dtype} doesn't match "
+                f"{io_torch_dtype}"
+            )
+            init_states_tensor = _wrap_tensor(
+                from_dlpack,
+                initial_states.permute(3, 2, 1, 0),
+                [2, 3],
+            )
+
+        # out: (B, EH, D, C, L) -> (L, D, C, EH, B)
+        assert out.dtype == io_torch_dtype, (
+            f"out dtype {out.dtype} doesn't match {io_torch_dtype}"
+        )
+        y_tensor = _wrap_tensor(
+            from_dlpack,
+            out.permute(4, 2, 3, 1, 0),
+            [2, 3, 4],
+        )
+
+        # fstate (cached)
+        fstate_batch = initial_states.shape[0] if initial_states is not None else batch
+        fstate_tensor, fstate_torch = self._get_or_alloc_fstate(fstate_batch)
+
+        # Stream
+        stream = cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream)
+
+        # -- Step 4: Varlen metadata ------------------------------------------
+        seq_idx_tensor = None
+        chunk_indices_tensor = None
+        chunk_offsets_tensor = None
+        seq_chunk_cumsum_tensor = None
+        num_seqs = 0
+
+        if seq_idx is not None:
+            seq_idx_tensor = from_dlpack(seq_idx, assumed_align=4)
+        if chunk_indices is not None:
+            chunk_indices_tensor = from_dlpack(chunk_indices, assumed_align=4)
+        if chunk_offsets is not None:
+            chunk_offsets_tensor = from_dlpack(chunk_offsets, assumed_align=4)
+
+        if (
+            seq_idx is not None
+            and chunk_indices is not None
+            and chunk_offsets is not None
+        ):
+            num_seqs = initial_states.shape[0] if initial_states is not None else 1
+            num_logical_chunks_local = len(chunk_indices)
+            seq_chunk_cumsum = self._get_or_alloc_seq_cumsum(
+                num_seqs,
+                seq_idx.device,
+            )
+            _get_seq_chunk_cumsum_module().seq_chunk_cumsum(
+                seq_idx,
+                chunk_indices,
+                chunk_offsets,
+                seq_chunk_cumsum,
+                chunk_size,
+                num_logical_chunks_local,
+                num_seqs,
+            )
+            seq_chunk_cumsum_tensor = from_dlpack(
+                seq_chunk_cumsum,
+                assumed_align=4,
+            )
+
+        num_logical_chunks = (
+            len(chunk_indices) if chunk_indices is not None else nchunks
+        )
+
+        # -- Step 5: Compile on first call ------------------------------------
+        if self._max_active_clusters is None:
+            hardware_info = self._cutlass.utils.HardwareInfo()
+            self._max_active_clusters = hardware_info.get_max_active_clusters(1)
+
+        if self._compiled_kernel is None:
+            self._compiled_kernel = self._cute.compile[GenerateLineInfo(True)](
+                self._kernel_obj,
+                x_tensor,
+                cumsum_delta_tensor,
+                delta_tensor,
+                b_tensor,
+                c_tensor,
+                y_tensor,
+                init_states_tensor,
+                fstate_tensor,
+                d_tensor,
+                z_tensor,
+                seq_idx_tensor,
+                chunk_indices_tensor,
+                chunk_offsets_tensor,
+                seq_chunk_cumsum_tensor,
+                num_logical_chunks,
+                num_seqs,
+                self._max_active_clusters,
+                stream,
+            )
+
+        # -- Step 6: Launch kernel --------------------------------------------
+        self._compiled_kernel(
+            x_tensor,
+            cumsum_delta_tensor,
+            delta_tensor,
+            b_tensor,
+            c_tensor,
+            y_tensor,
+            init_states_tensor,
+            fstate_tensor,
+            d_tensor,
+            z_tensor,
+            seq_idx_tensor,
+            chunk_indices_tensor,
+            chunk_offsets_tensor,
+            seq_chunk_cumsum_tensor,
+            num_logical_chunks,
+            num_seqs,
+            stream,
+        )
+
+        # -- Step 7: Output ---------------------------------------------------
+        out_view = out.permute(0, 3, 4, 1, 2).reshape(
+            batch,
+            seqlen,
+            nheads,
+            headdim,
+        )
+        fstate_out = fstate_torch.permute(3, 2, 1, 0) if return_final_states else None
+        return out_view, fstate_out
+
+
+@functools.cache
+def _get_ssd_combined(
+    chunk_size,
+    nheads,
+    headdim,
+    dstate,
+    ngroups,
+    dtype,
+    has_d,
+    d_has_hdim,
+    has_init_states,
+    has_varlen,
+    has_z,
+    seq_idx_dtype,
+):
+    """Get cached SSDCombined instance."""
+    return SSDCombined(
+        chunk_size=chunk_size,
+        nheads=nheads,
+        headdim=headdim,
+        dstate=dstate,
+        ngroups=ngroups,
+        dtype=dtype,
+        has_d=has_d,
+        d_has_hdim=d_has_hdim,
+        has_initial_states=has_init_states,
         has_varlen=has_varlen,
         has_z=has_z,
         seq_idx_dtype=seq_idx_dtype,
@@ -598,135 +1110,46 @@ def ssd_combined_fwd(
     batch, seqlen, nheads, headdim = x.shape
     _, _, ngroups, dstate = B.shape
 
-    # In varlen (continuous batching) mode, the caller is expected to
-    # independently pad each sequence to a chunk boundary so that no
-    # physical chunk is shared by two sequences. This is the convention
-    # adopted by vLLM (see https://github.com/vllm-project/vllm/pull/24683):
-    # each sequence's new tokens are partitioned so that
-    # len(previous_state) + len(new_partition) = chunk_size, and the
-    # last chunk is zero-padded to a full chunk_size. As a result, the
-    # total packed seqlen is always a multiple of chunk_size.
-    # Supporting non-aligned total seqlen is not planned.
-    assert seqlen % chunk_size == 0, (
-        f"seqlen ({seqlen}) must be divisible by chunk_size ({chunk_size})"
+    has_d = D is not None
+    d_has_hdim = has_d and D.dim() == 2
+    has_init_states = initial_states is not None
+    has_varlen = seq_idx is not None
+    has_z = z is not None
+    _seq_idx_dtype_map = {torch.int32: "int32", torch.int64: "int64"}
+    seq_idx_dtype = (
+        _seq_idx_dtype_map.get(seq_idx.dtype) if seq_idx is not None else None
     )
 
-    # Validate varlen arguments
-    if seq_idx is not None:
-        assert seq_idx.shape == (batch, seqlen), (
-            f"seq_idx shape {seq_idx.shape} doesn't match (batch={batch}, seqlen={seqlen})"
-        )
-        assert seq_idx.dtype in (torch.int32, torch.int64), (
-            f"seq_idx must be int32 or int64, got {seq_idx.dtype}"
-        )
-    if chunk_indices is not None:
-        assert chunk_indices.dim() == 1, (
-            f"chunk_indices must be 1D, got {chunk_indices.dim()}D"
-        )
-        assert chunk_indices.dtype == torch.int32, (
-            f"chunk_indices must be int32, got {chunk_indices.dtype}"
-        )
-    if chunk_offsets is not None:
-        assert chunk_offsets.dim() == 1, (
-            f"chunk_offsets must be 1D, got {chunk_offsets.dim()}D"
-        )
-        assert chunk_offsets.dtype == torch.int32, (
-            f"chunk_offsets must be int32, got {chunk_offsets.dtype}"
-        )
-    if chunk_indices is not None and chunk_offsets is not None:
-        assert chunk_indices.shape == chunk_offsets.shape, (
-            f"chunk_indices and chunk_offsets must have the same shape, "
-            f"got {chunk_indices.shape} vs {chunk_offsets.shape}"
-        )
-    # Validate pre-allocated output tensor
-    # Kernel's native layout: (B, EH, D, C, L) contiguous
-    nchunks = seqlen // chunk_size
-    if out is not None:
-        assert out.shape == (batch, nheads, headdim, nchunks, chunk_size), (
-            f"out shape {out.shape} doesn't match "
-            f"expected ({batch}, {nheads}, {headdim}, {nchunks}, {chunk_size})"
-        )
-        assert out.dtype == x.dtype, (
-            f"out dtype {out.dtype} doesn't match x dtype {x.dtype}"
-        )
-        assert out.is_contiguous(), "out must be contiguous in (B, EH, D, C, L) layout"
-        assert out.device == x.device, (
-            f"out device {out.device} doesn't match x device {x.device}"
-        )
+    ssd = _get_ssd_combined(
+        chunk_size,
+        nheads,
+        headdim,
+        dstate,
+        ngroups,
+        x.dtype,
+        has_d,
+        d_has_hdim,
+        has_init_states,
+        has_varlen,
+        has_z,
+        seq_idx_dtype,
+    )
 
-    # Step 1: Compute cumsum using Triton kernel
-    # dA_cumsum: (batch, nheads, nchunks, chunk_size)
-    # dt_processed: (batch, nheads, nchunks, chunk_size) - after softplus/bias
-    torch.cuda.nvtx.range_push("cumsum_fwd")
-    dA_cumsum, dt_processed = chunk_cumsum_fwd(
+    return ssd.run(
+        x,
         dt,
         A,
-        chunk_size,
+        B,
+        C,
+        D=D,
+        z=z,
         dt_bias=dt_bias,
         dt_softplus=dt_softplus,
         dt_limit=dt_limit,
-    )
-    torch.cuda.nvtx.range_pop()
-
-    # Step 2: Run SSD kernel
-    has_d = D is not None
-    d_has_hdim = has_d and D.dim() == 2
-    has_init_state = True if initial_states is not None else False
-
-    has_varlen = seq_idx is not None
-    has_z = z is not None
-    # Map torch seq_idx dtype to cutlass type for kernel compilation
-    _seq_idx_dtype_map = {torch.int32: "int32", torch.int64: "int64"}
-    seq_idx_dtype_key = (
-        _seq_idx_dtype_map.get(seq_idx.dtype) if seq_idx is not None else None
-    )
-    torch.cuda.nvtx.range_push("get_ssd_kernel")
-    kernel = _get_ssd_kernel(
-        chunk_size=chunk_size,
-        headdim=headdim,
-        dstate=dstate,
-        has_d=has_d,
-        d_has_hdim=d_has_hdim,
-        has_init_states=has_init_state,
-        has_varlen=has_varlen,
-        has_z=has_z,
-        seq_idx_dtype=seq_idx_dtype_key,
-    )
-    torch.cuda.nvtx.range_pop()
-
-    # Allocate output in kernel's native layout if not provided
-    if out is None:
-        out = torch.empty(
-            batch,
-            nheads,
-            headdim,
-            nchunks,
-            chunk_size,
-            dtype=x.dtype,
-            device=x.device,
-        )
-
-    torch.cuda.nvtx.range_push("kernel.run")
-    final_states = kernel.run(
-        x=x,
-        dA_cumsum=dA_cumsum,
-        dt_processed=dt_processed,
-        B=B,
-        C=C,
-        out=out,
-        D=D,
-        z=z,
-        init_states=initial_states,
+        initial_states=initial_states,
         seq_idx=seq_idx,
         chunk_indices=chunk_indices,
         chunk_offsets=chunk_offsets,
+        out=out,
+        return_final_states=return_final_states,
     )
-    torch.cuda.nvtx.range_pop()
-
-    # Zero-copy view: (B, EH, D, C, L) -> (B, C, L, EH, D) -> (B, seqlen, EH, D)
-    out_view = out.permute(0, 3, 4, 1, 2).reshape(batch, seqlen, nheads, headdim)
-
-    if return_final_states:
-        return out_view, final_states
-    else:
-        return out_view, None

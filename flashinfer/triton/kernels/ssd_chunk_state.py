@@ -157,6 +157,7 @@ def chunk_cumsum_fwd(
     dt_bias: torch.Tensor = None,
     dt_softplus: bool = False,
     dt_limit: tuple = (0.0, float("inf")),
+    dt_out_dtype: torch.dtype = torch.float32,
 ):
     """
     Compute the cumulative sum of dA for SSD (Structured State-Space Duality).
@@ -193,7 +194,7 @@ def chunk_cumsum_fwd(
         assert dt_bias.shape == (nheads,)
     nchunks = math.ceil(seqlen / chunk_size)
     dt_out = torch.empty(
-        batch, nheads, nchunks, chunk_size, device=dt.device, dtype=torch.float32
+        batch, nheads, nchunks, chunk_size, device=dt.device, dtype=dt_out_dtype
     )
     dA_cumsum = torch.empty(
         batch, nheads, nchunks, chunk_size, device=dt.device, dtype=torch.float32

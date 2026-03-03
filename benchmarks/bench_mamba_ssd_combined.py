@@ -21,7 +21,7 @@ import sys
 import numpy as np
 import torch
 
-from flashinfer.mamba import ssd_combined_fwd
+from flashinfer.mamba import SSDCombined, ssd_combined_fwd
 from flashinfer.testing.utils import bench_gpu_time
 
 sys.path.insert(0, "tests/mamba")
@@ -65,7 +65,9 @@ def compute_varlen_metadata(cu_seqlens, chunk_size):
     return seq_idx, chunk_indices, chunk_offsets
 
 
-def make_batched_inputs(batch, nchunks, nheads, headdim, dstate, ngroups, chunk_size, dtype):
+def make_batched_inputs(
+    batch, nchunks, nheads, headdim, dstate, ngroups, chunk_size, dtype
+):
     """Create batched input tensors. Returns (kwargs, label_dict)."""
     seqlen = nchunks * chunk_size
     x = torch.randn(batch, seqlen, nheads, headdim, dtype=dtype, device="cuda")
@@ -76,18 +78,32 @@ def make_batched_inputs(batch, nchunks, nheads, headdim, dstate, ngroups, chunk_
     D = torch.randn(nheads, dtype=dtype, device="cuda")
     dt_bias = torch.rand(nheads, dtype=torch.float32, device="cuda") - 4.0
     initial_states = torch.randn(
-        batch, nheads, headdim, dstate, dtype=dtype, device="cuda",
+        batch,
+        nheads,
+        headdim,
+        dstate,
+        dtype=dtype,
+        device="cuda",
     )
     kwargs = dict(
-        x=x, dt=dt, A=A, B=B, C=C, chunk_size=chunk_size,
-        D=D, dt_bias=dt_bias, dt_softplus=True,
+        x=x,
+        dt=dt,
+        A=A,
+        B=B,
+        C=C,
+        chunk_size=chunk_size,
+        D=D,
+        dt_bias=dt_bias,
+        dt_softplus=True,
         initial_states=initial_states,
     )
     label = dict(col0=batch, chunks_per_seq=nchunks, nchunks=nchunks, seqlen=seqlen)
     return kwargs, label
 
 
-def make_varlen_inputs(num_seqs, chunks_per_seq, nheads, headdim, dstate, ngroups, chunk_size, dtype):
+def make_varlen_inputs(
+    num_seqs, chunks_per_seq, nheads, headdim, dstate, ngroups, chunk_size, dtype
+):
     """Create packed varlen inputs. Returns (kwargs, label_dict).
 
     kwargs includes cu_seqlens (needed by triton only — callers strip it for flashinfer).
@@ -103,18 +119,33 @@ def make_varlen_inputs(num_seqs, chunks_per_seq, nheads, headdim, dstate, ngroup
     D = torch.randn(nheads, dtype=dtype, device="cuda")
     dt_bias = torch.rand(nheads, dtype=torch.float32, device="cuda") - 4.0
     initial_states = torch.randn(
-        num_seqs, nheads, headdim, dstate, dtype=dtype, device="cuda",
+        num_seqs,
+        nheads,
+        headdim,
+        dstate,
+        dtype=dtype,
+        device="cuda",
     )
 
     cu_seqlens = torch.tensor(
         [i * seq_len_each for i in range(num_seqs + 1)],
-        dtype=torch.int32, device="cuda",
+        dtype=torch.int32,
+        device="cuda",
     )
-    seq_idx, chunk_indices, chunk_offsets = compute_varlen_metadata(cu_seqlens, chunk_size)
+    seq_idx, chunk_indices, chunk_offsets = compute_varlen_metadata(
+        cu_seqlens, chunk_size
+    )
 
     kwargs = dict(
-        x=x, dt=dt, A=A, B=B, C=C, chunk_size=chunk_size,
-        D=D, dt_bias=dt_bias, dt_softplus=True,
+        x=x,
+        dt=dt,
+        A=A,
+        B=B,
+        C=C,
+        chunk_size=chunk_size,
+        D=D,
+        dt_bias=dt_bias,
+        dt_softplus=True,
         initial_states=initial_states,
         seq_idx=seq_idx,
         chunk_indices=chunk_indices,
@@ -122,7 +153,12 @@ def make_varlen_inputs(num_seqs, chunks_per_seq, nheads, headdim, dstate, ngroup
         cu_seqlens=cu_seqlens,
     )
     nchunks = total_seqlen // chunk_size
-    label = dict(col0=num_seqs, chunks_per_seq=chunks_per_seq, nchunks=nchunks, seqlen=total_seqlen)
+    label = dict(
+        col0=num_seqs,
+        chunks_per_seq=chunks_per_seq,
+        nchunks=nchunks,
+        seqlen=total_seqlen,
+    )
     return kwargs, label
 
 
@@ -131,8 +167,17 @@ def make_varlen_inputs(num_seqs, chunks_per_seq, nheads, headdim, dstate, ngroup
 # ---------------------------------------------------------------------------
 
 
-def bench_one(fn, mode, config, model_params, strip_keys, warmup, repetitions,
-              enable_cupti, use_cuda_graph):
+def bench_one(
+    fn,
+    mode,
+    config,
+    model_params,
+    strip_keys,
+    warmup,
+    repetitions,
+    enable_cupti,
+    use_cuda_graph,
+):
     """Create inputs, warmup, and measure a single kernel on a single config.
 
     Args:
@@ -153,10 +198,20 @@ def bench_one(fn, mode, config, model_params, strip_keys, warmup, repetitions,
     a, b = config
     make_fn = make_varlen_inputs if mode == "varlen" else make_batched_inputs
     kwargs, label = make_fn(
-        a, b, p["nheads"], p["headdim"], p["dstate"], p["ngroups"],
-        p["chunk_size"], p["dtype"],
+        a,
+        b,
+        p["nheads"],
+        p["headdim"],
+        p["dstate"],
+        p["ngroups"],
+        p["chunk_size"],
+        p["dtype"],
     )
-    kw = {k: v for k, v in kwargs.items() if k not in strip_keys} if strip_keys else kwargs
+    kw = (
+        {k: v for k, v in kwargs.items() if k not in strip_keys}
+        if strip_keys
+        else kwargs
+    )
 
     # Explicit warmup
     for _ in range(warmup):
@@ -210,16 +265,29 @@ def bench_mode(configs, mode, model_params, bench_params, title=None):
     )
     print("  " + "-" * 108)
 
+    # Construct SSDCombined once for this mode — uses class-based API directly
+    ssd = SSDCombined(
+        chunk_size=p["chunk_size"],
+        nheads=p["nheads"],
+        headdim=p["headdim"],
+        dstate=p["dstate"],
+        ngroups=p["ngroups"],
+        dtype=p["dtype"],
+        has_d=True,
+        has_initial_states=True,
+        has_varlen=(mode == "varlen"),
+    )
+
     # Keys to strip per kernel per mode.
-    # - FlashInfer doesn't accept cu_seqlens (varlen metadata is via seq_idx/chunk_indices/chunk_offsets)
+    # - FlashInfer (SSDCombined.run) doesn't accept chunk_size or cu_seqlens
     # - Triton doesn't support initial_states in batched mode (only varlen with chunk_indices)
     strip_keys = {
-        "batched": {"FlashInfer": set(), "Triton": {"initial_states"}},
-        "varlen":  {"FlashInfer": {"cu_seqlens"}, "Triton": set()},
+        "batched": {"FlashInfer": {"chunk_size"}, "Triton": {"initial_states"}},
+        "varlen": {"FlashInfer": {"cu_seqlens", "chunk_size"}, "Triton": set()},
     }
 
     kernels = [
-        ("FlashInfer", ssd_combined_fwd),
+        ("FlashInfer", ssd.run),
         ("Triton", _mamba_chunk_scan_combined_fwd),
     ]
 
@@ -228,7 +296,12 @@ def bench_mode(configs, mode, model_params, bench_params, title=None):
         label = None
         for name, fn in kernels:
             label, median_ms = bench_one(
-                fn, mode, cfg, p, strip_keys[mode][name], **bench_params,
+                fn,
+                mode,
+                cfg,
+                p,
+                strip_keys[mode][name],
+                **bench_params,
             )
             results[name] = median_ms
 
@@ -247,16 +320,36 @@ def bench_mode(configs, mode, model_params, bench_params, title=None):
 # ---------------------------------------------------------------------------
 
 VARLEN_CONFIGS = [
-    (1, 1), (4, 1), (8, 1),
-    (32, 1), (64, 1), (128, 1), (256, 1),
-    (4, 8), (8, 8), (16, 8), (32, 8), (64, 8),
-    (32, 32), (64, 32), (128, 32),
+    (1, 1),
+    (4, 1),
+    (8, 1),
+    (32, 1),
+    (64, 1),
+    (128, 1),
+    (256, 1),
+    (4, 8),
+    (8, 8),
+    (16, 8),
+    (32, 8),
+    (64, 8),
+    (32, 32),
+    (64, 32),
+    (128, 32),
 ]
 
 BATCHED_CONFIGS = [
-    (1, 1), (1, 4), (1, 16), (1, 64), (1, 256),
-    (4, 1), (4, 4), (4, 16), (4, 64),
-    (16, 1), (16, 4), (16, 16),
+    (1, 1),
+    (1, 4),
+    (1, 16),
+    (1, 64),
+    (1, 256),
+    (4, 1),
+    (4, 4),
+    (4, 16),
+    (4, 64),
+    (16, 1),
+    (16, 4),
+    (16, 16),
 ]
 
 
@@ -268,31 +361,43 @@ def run_benchmarks(args, model_params, bench_params):
         if args.varlen:
             bench_mode(
                 [(args.batch, args.nchunks)],
-                "varlen", model_params, bench_params,
+                "varlen",
+                model_params,
+                bench_params,
                 title="SINGLE POINT (varlen)",
             )
         if args.batched:
             bench_mode(
                 [(args.batch, args.nchunks)],
-                "batched", model_params, bench_params,
+                "batched",
+                model_params,
+                bench_params,
                 title="SINGLE POINT (batched)",
             )
         # default to batched if neither flag given
         if not args.varlen and not args.batched:
             bench_mode(
                 [(args.batch, args.nchunks)],
-                "batched", model_params, bench_params,
+                "batched",
+                model_params,
+                bench_params,
                 title="SINGLE POINT (batched)",
             )
     else:
         if args.varlen:
             bench_mode(
-                VARLEN_CONFIGS, "varlen", model_params, bench_params,
+                VARLEN_CONFIGS,
+                "varlen",
+                model_params,
+                bench_params,
                 title="VARLEN: serving scenario — packed user sequences (batch=1)",
             )
         if args.batched:
             bench_mode(
-                BATCHED_CONFIGS, "batched", model_params, bench_params,
+                BATCHED_CONFIGS,
+                "batched",
+                model_params,
+                bench_params,
                 title="BATCHED: uniform sequence lengths (no varlen metadata)",
             )
 
@@ -309,18 +414,30 @@ def ncu_mode(args, model_params):
     )
     p = model_params
     seqlen = args.nchunks * p["chunk_size"]
-    x = torch.randn(args.batch, seqlen, p["nheads"], p["headdim"], dtype=p["dtype"], device="cuda")
-    dt = torch.randn(args.batch, seqlen, p["nheads"], dtype=torch.float32, device="cuda")
+    x = torch.randn(
+        args.batch, seqlen, p["nheads"], p["headdim"], dtype=p["dtype"], device="cuda"
+    )
+    dt = torch.randn(
+        args.batch, seqlen, p["nheads"], dtype=torch.float32, device="cuda"
+    )
     A = -torch.rand(p["nheads"], dtype=torch.float32, device="cuda") - 1.0
-    B = torch.randn(args.batch, seqlen, p["ngroups"], p["dstate"], dtype=p["dtype"], device="cuda")
-    C = torch.randn(args.batch, seqlen, p["ngroups"], p["dstate"], dtype=p["dtype"], device="cuda")
+    B = torch.randn(
+        args.batch, seqlen, p["ngroups"], p["dstate"], dtype=p["dtype"], device="cuda"
+    )
+    C = torch.randn(
+        args.batch, seqlen, p["ngroups"], p["dstate"], dtype=p["dtype"], device="cuda"
+    )
     D = torch.randn(p["nheads"], dtype=p["dtype"], device="cuda")
     dt_bias = torch.rand(p["nheads"], dtype=torch.float32, device="cuda") - 4.0
 
     torch.cuda.synchronize()
-    print(f"  NCU mode: launching kernel once (batch={args.batch}, "
-          f"nchunks={args.nchunks}, seqlen={seqlen})")
-    ssd_combined_fwd(x, dt, A, B, C, p["chunk_size"], D=D, dt_bias=dt_bias, dt_softplus=True)
+    print(
+        f"  NCU mode: launching kernel once (batch={args.batch}, "
+        f"nchunks={args.nchunks}, seqlen={seqlen})"
+    )
+    ssd_combined_fwd(
+        x, dt, A, B, C, p["chunk_size"], D=D, dt_bias=dt_bias, dt_softplus=True
+    )
     torch.cuda.synchronize()
     print("  Done.")
 
@@ -331,7 +448,7 @@ def ncu_mode(args, model_params):
 
 
 def profile_mode(args, model_params):
-    """Profile ssd_combined_fwd with torch.profiler to find host-side bottlenecks.
+    """Profile SSDCombined.run() with torch.profiler to find host-side bottlenecks.
 
     Writes traces to ./profiler_traces/ — view with:
       - Perfetto UI: https://ui.perfetto.dev/ (drag-drop the .json file)
@@ -344,21 +461,41 @@ def profile_mode(args, model_params):
     )
     p = model_params
     kwargs, _ = make_batched_inputs(
-        args.batch, args.nchunks,
-        p["nheads"], p["headdim"], p["dstate"], p["ngroups"],
-        p["chunk_size"], p["dtype"],
+        args.batch,
+        args.nchunks,
+        p["nheads"],
+        p["headdim"],
+        p["dstate"],
+        p["ngroups"],
+        p["chunk_size"],
+        p["dtype"],
+    )
+    # SSDCombined.run() doesn't take chunk_size (it's set in __init__)
+    kw = {k: v for k, v in kwargs.items() if k != "chunk_size"}
+
+    ssd = SSDCombined(
+        chunk_size=p["chunk_size"],
+        nheads=p["nheads"],
+        headdim=p["headdim"],
+        dstate=p["dstate"],
+        ngroups=p["ngroups"],
+        dtype=p["dtype"],
+        has_d=True,
+        has_initial_states=True,
     )
 
     warmup = args.warmup
     active = args.repetitions or 3
 
-    print(f"  Profiler mode: batch={args.batch}, nchunks={args.nchunks}, "
-          f"seqlen={args.nchunks * p['chunk_size']}")
+    print(
+        f"  Profiler mode: batch={args.batch}, nchunks={args.nchunks}, "
+        f"seqlen={args.nchunks * p['chunk_size']}"
+    )
     print(f"  Warmup: {warmup}, Active (profiled) iterations: {active}")
 
     # Warmup (outside profiler to avoid capturing JIT compilation)
     for _ in range(warmup):
-        ssd_combined_fwd(**kwargs)
+        ssd.run(**kw)
     torch.cuda.synchronize()
     print("  Warmup done, starting profiler...")
 
@@ -372,14 +509,17 @@ def profile_mode(args, model_params):
         on_trace_ready=torch.profiler.tensorboard_trace_handler("./profiler_traces"),
     ) as prof:
         for _ in range(active):
-            ssd_combined_fwd(**kwargs)
+            ssd.run(**kw)
             torch.cuda.synchronize()
             prof.step()
 
     print()
-    print(prof.key_averages(group_by_stack_n=5).table(
-        sort_by="cpu_time_total", row_limit=30,
-    ))
+    print(
+        prof.key_averages(group_by_stack_n=5).table(
+            sort_by="cpu_time_total",
+            row_limit=30,
+        )
+    )
     print()
     print("  Traces saved to ./profiler_traces/")
     print("  View with: https://ui.perfetto.dev/ (drag-drop the .json file)")
@@ -393,7 +533,9 @@ def profile_mode(args, model_params):
 def main():
     parser = argparse.ArgumentParser(description="Benchmark Mamba2 SSD combined kernel")
     parser.add_argument("--cupti", action="store_true", help="Use CUPTI timing")
-    parser.add_argument("--cuda-graph", action="store_true", help="Use CUDA graph timing")
+    parser.add_argument(
+        "--cuda-graph", action="store_true", help="Use CUDA graph timing"
+    )
     parser.add_argument("--nheads", type=int, default=8)
     parser.add_argument("--headdim", type=int, default=64)
     parser.add_argument("--dstate", type=int, default=128)
@@ -403,22 +545,46 @@ def main():
     parser.add_argument("--batched", action="store_true", help="Run batched benchmark")
     parser.add_argument("--varlen", action="store_true", help="Run varlen benchmark")
     parser.add_argument("-w", "--warmup", type=int, default=3, help="Warmup iterations")
-    parser.add_argument("-r", "--repetitions", type=int, default=None, help="Measurement iterations")
-    parser.add_argument("--batch", type=int, default=None, help="Batch size (single-point or varlen num_seqs)")
-    parser.add_argument("--nchunks", type=int, default=None, help="Number of chunks (or chunks_per_seq for varlen)")
-    parser.add_argument("--ncu", action="store_true", help="NCU profiling mode: single kernel launch")
-    parser.add_argument("--prof", action="store_true", help="torch.profiler mode: host-side overhead analysis")
+    parser.add_argument(
+        "-r", "--repetitions", type=int, default=None, help="Measurement iterations"
+    )
+    parser.add_argument(
+        "--batch",
+        type=int,
+        default=None,
+        help="Batch size (single-point or varlen num_seqs)",
+    )
+    parser.add_argument(
+        "--nchunks",
+        type=int,
+        default=None,
+        help="Number of chunks (or chunks_per_seq for varlen)",
+    )
+    parser.add_argument(
+        "--ncu", action="store_true", help="NCU profiling mode: single kernel launch"
+    )
+    parser.add_argument(
+        "--prof",
+        action="store_true",
+        help="torch.profiler mode: host-side overhead analysis",
+    )
     args = parser.parse_args()
 
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
 
     model_params = dict(
-        nheads=args.nheads, headdim=args.headdim, dstate=args.dstate,
-        ngroups=args.ngroups, chunk_size=args.chunk_size, dtype=dtype,
+        nheads=args.nheads,
+        headdim=args.headdim,
+        dstate=args.dstate,
+        ngroups=args.ngroups,
+        chunk_size=args.chunk_size,
+        dtype=dtype,
     )
     bench_params = dict(
-        warmup=args.warmup, repetitions=args.repetitions,
-        enable_cupti=args.cupti, use_cuda_graph=args.cuda_graph,
+        warmup=args.warmup,
+        repetitions=args.repetitions,
+        enable_cupti=args.cupti,
+        use_cuda_graph=args.cuda_graph,
     )
 
     # Header
@@ -426,7 +592,9 @@ def main():
     print("Mamba2 SSD Combined Kernel Benchmark")
     print("=" * 100)
     print(f"  Device:     {torch.cuda.get_device_name()}")
-    timing = "CUPTI" if args.cupti else "CUDA Graphs" if args.cuda_graph else "CUDA Events"
+    timing = (
+        "CUPTI" if args.cupti else "CUDA Graphs" if args.cuda_graph else "CUDA Events"
+    )
     print(f"  Timing:     {timing}")
     print(f"  Dtype:      {args.dtype}")
     print(f"  Warmup:     {args.warmup}")
@@ -451,7 +619,9 @@ def main():
         if single_point:
             do_batched = True  # default single-point to batched
         else:
-            print("\n  Error: specify --batched and/or --varlen (or --batch/--nchunks for single-point)")
+            print(
+                "\n  Error: specify --batched and/or --varlen (or --batch/--nchunks for single-point)"
+            )
             return
 
     run_benchmarks(args, model_params, bench_params)
