@@ -645,7 +645,7 @@ class TestSelectiveStateUpdateStochasticRounding(TestSelectiveStateUpdate):
     ATOL = 0.001
     RTOL = 0.01
 
-    RAND_SEED = 42
+    RAND_SEED = torch.tensor(42, dtype=torch.int64, device="cuda")
 
     def make_inputs(self, batch, nheads, dim, dstate, _state_dtype, weight_dtype):
         """Create test inputs with fp16 state."""
@@ -670,11 +670,7 @@ class TestSelectiveStateUpdateStochasticRounding(TestSelectiveStateUpdate):
         # Triton cvt.rs.f16x2.f32 requires SM100a+; on older GPUs the Triton
         # reference falls back to regular rounding while the CUDA kernel still
         # exercises its software stochastic rounding path.
-        rand_seed = (
-            torch.tensor(self.RAND_SEED, dtype=torch.int64, device="cuda")
-            if major >= 10
-            else None
-        )
+        rand_seed = self.RAND_SEED if major >= 10 else None
         y_ref = selective_state_update_triton(
             state_ref,
             inputs["x"],

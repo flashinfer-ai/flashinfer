@@ -151,7 +151,7 @@ void run_selective_state_update_stp(TensorView const& state, TensorView const& x
                                     bool dt_softplus, Optional<TensorView> state_batch_indices,
                                     Optional<TensorView> state_scale, int64_t pad_slot_id,
                                     Optional<TensorView> out, bool disable_state_update,
-                                    int64_t rand_seed, int64_t algorithm) {
+                                    Optional<TensorView> rand_seed, int64_t algorithm) {
   // Extract dimensions from input tensors
   auto const batch = x.size(0);
   auto const state_cache_size = state.size(0);
@@ -270,7 +270,14 @@ void run_selective_state_update_stp(TensorView const& state, TensorView const& x
     p.state_scale = state_scale.value().data_ptr();
     p.state_scale_stride_batch = state_scale.value().stride(0);
   }
-  p.rand_seed = rand_seed;
+  if (rand_seed.has_value()) {
+    auto const& rs = rand_seed.value();
+    CHECK_CUDA(rs);
+    FLASHINFER_CHECK(rs.numel() == 1,
+                     "rand_seed must be a single-element tensor, got numel=", rs.numel());
+    FLASHINFER_CHECK(rs.dtype().code == kDLInt && rs.dtype().bits == 64, "rand_seed must be int64");
+    p.rand_seed = static_cast<const int64_t*>(rs.data_ptr());
+  }
 
   // Copy pointers
   p.state = const_cast<void*>(state.data_ptr());
@@ -309,7 +316,7 @@ void run_selective_state_update_mtp(
     Optional<TensorView> state_scale, int64_t pad_slot_id, Optional<TensorView> out,
     bool disable_state_update, Optional<TensorView> intermediate_states_buffer,
     Optional<TensorView> intermediate_state_indices, Optional<TensorView> intermediate_state_scales,
-    int64_t rand_seed, int64_t cache_steps, int64_t algorithm) {
+    Optional<TensorView> rand_seed, int64_t cache_steps, int64_t algorithm) {
   // Extract dimensions from input tensors
   auto const batch = x.size(0);
   auto const ntokens_mtp = x.size(1);
@@ -490,7 +497,14 @@ void run_selective_state_update_mtp(
     p.intermediate_state_scales = iscales.data_ptr();
     p.intermediate_state_scales_stride_batch = iscales.stride(0);
   }
-  p.rand_seed = rand_seed;
+  if (rand_seed.has_value()) {
+    auto const& rs = rand_seed.value();
+    CHECK_CUDA(rs);
+    FLASHINFER_CHECK(rs.numel() == 1,
+                     "rand_seed must be a single-element tensor, got numel=", rs.numel());
+    FLASHINFER_CHECK(rs.dtype().code == kDLInt && rs.dtype().bits == 64, "rand_seed must be int64");
+    p.rand_seed = static_cast<const int64_t*>(rs.data_ptr());
+  }
 
   // Copy pointers
   p.state = const_cast<void*>(state.data_ptr());
@@ -532,7 +546,7 @@ void selective_state_update(
     Optional<TensorView> state_batch_indices, int64_t pad_slot_id, Optional<TensorView> state_scale,
     TensorView output, bool disable_state_update, Optional<TensorView> intermediate_states_buffer,
     Optional<TensorView> intermediate_state_indices, Optional<TensorView> intermediate_state_scales,
-    int64_t rand_seed, int64_t cache_steps, int64_t algorithm) {
+    Optional<TensorView> rand_seed, int64_t cache_steps, int64_t algorithm) {
   if (x.dim() == 3) {
     run_selective_state_update_stp(state, x, dt, A, B, C, D, z, dt_bias, dt_softplus,
                                    state_batch_indices, state_scale, pad_slot_id, output,

@@ -70,6 +70,9 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
   [[maybe_unused]] auto* __restrict__ state_scale =
       reinterpret_cast<state_scale_t*>(params.state_scale);
 
+  // Load device-side Philox seed once into a register
+  [[maybe_unused]] int64_t const rand_seed = params.rand_seed ? *params.rand_seed : 0;
+
   auto const state_batch = (state_batch_indices) ? state_batch_indices[batch] : batch;
   auto const intermediate_cache_idx =
       intermediate_state_indices ? intermediate_state_indices[batch] : state_batch;
@@ -264,8 +267,8 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
                                   "Stochastic rounding requires fp16 state (packed count >= 2)");
                     if (k % 4 == 0)
                       philox_randint4x<PHILOX_ROUNDS>(
-                          params.rand_seed, state_ptr_offset + d * DSTATE + base_i + k,
-                          rand_ints[0], rand_ints[1], rand_ints[2], rand_ints[3]);
+                          rand_seed, state_ptr_offset + d * DSTATE + base_i + k, rand_ints[0],
+                          rand_ints[1], rand_ints[2], rand_ints[3]);
                     rStateOut.val[k] = cvt_rs_f16_f32(rState[ii + k], rand_ints[k % 4] & 0x1FFFu);
                   } else {
                     convertAndStore(&rStateOut.val[k], rState[ii + k]);
@@ -282,8 +285,8 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
                   if constexpr (PHILOX_ROUNDS > 0) {
                     if (k % 4 == 0)
                       philox_randint4x<PHILOX_ROUNDS>(
-                          params.rand_seed, state_ptr_offset + d * DSTATE + base_i + k,
-                          rand_ints[0], rand_ints[1], rand_ints[2], rand_ints[3]);
+                          rand_seed, state_ptr_offset + d * DSTATE + base_i + k, rand_ints[0],
+                          rand_ints[1], rand_ints[2], rand_ints[3]);
                     sram.state[dd][base_i + k] =
                         cvt_rs_f16_f32(rState[ii + k], rand_ints[k % 4] & 0x1FFFu);
                   } else {
@@ -394,9 +397,9 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
               if (i < DSTATE) {
                 if constexpr (PHILOX_ROUNDS > 0) {
                   if (ii % 4 == 0)
-                    philox_randint4x<PHILOX_ROUNDS>(params.rand_seed,
-                                                    state_ptr_offset + d * DSTATE + i, rand_ints[0],
-                                                    rand_ints[1], rand_ints[2], rand_ints[3]);
+                    philox_randint4x<PHILOX_ROUNDS>(rand_seed, state_ptr_offset + d * DSTATE + i,
+                                                    rand_ints[0], rand_ints[1], rand_ints[2],
+                                                    rand_ints[3]);
                   sram.state[dd][i] = cvt_rs_f16_f32(rState[ii], rand_ints[ii % 4] & 0x1FFFu);
                 } else {
                   convertAndStore(&sram.state[dd][i], rState[ii]);

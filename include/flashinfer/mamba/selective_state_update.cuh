@@ -71,7 +71,8 @@ struct SelectiveStateUpdateParams {
 
   // Philox PRNG seed for stochastic rounding of fp16 state stores.
   // Only used when the kernel is compiled with NUM_PHILOX_ROUNDS > 0.
-  int64_t rand_seed{0};
+  // Device-side pointer to a single int64_t value.
+  const int64_t* rand_seed{nullptr};
 };
 
 namespace mtp {
