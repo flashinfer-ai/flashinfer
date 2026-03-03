@@ -244,6 +244,9 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
 
       params.mPtrExpandedIdxToPermutedIdx[expandedIdx] = permutedIdx;
       if (isLocalExpert) {
+        if (params.mPtrPermutedIdxToExpandedIdx != nullptr) {
+          params.mPtrPermutedIdxToExpandedIdx[permutedIdx] = expandedIdx;
+        }
         params.mPtrPermutedIdxToTokenIdx[permutedIdx] = tokenIdx;
       }
     }

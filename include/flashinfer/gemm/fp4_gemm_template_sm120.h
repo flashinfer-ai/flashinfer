@@ -181,14 +181,14 @@ inline size_t runFp4GemmImpl(void* D, void const* A, void const* B, void const* 
   auto initStatus = gemm.initialize(args, workspace, stream);
   if (initStatus != cutlass::Status::kSuccess) {
     throw std::runtime_error(std::string("[FP4 gemm Runner") + scheduler_name + "] " +
-                             "Failed to initialize cutlass FP4 gemm on sm120. Error: " +
+                             "Failed to initialize cutlass FP4 gemm on sm120/sm121. Error: " +
                              std::string(cutlass::cutlassGetStatusString(initStatus)));
   }
 
   auto runStatus = gemm.run(args, workspace, stream, nullptr, /*enablePDL=*/true);
   if (runStatus != cutlass::Status::kSuccess) {
     throw std::runtime_error(std::string("[FP4 gemm Runner") + scheduler_name + "] " +
-                             "Failed to run cutlass FP4 gemm on sm120. Error: " +
+                             "Failed to run cutlass FP4 gemm on sm120/sm121. Error: " +
                              std::string(cutlass::cutlassGetStatusString(runStatus)));
   }
 
@@ -251,8 +251,8 @@ inline size_t runFp4GemmImpl(void* D, void const* A, void const* B, void const* 
         cutlass::epilogue::fusion::LinearCombination<OutElementType, float, void,                          \
                                                      float>>::CollectiveOp;                                \
                                                                                                            \
-    /* SM120 BlockScaled - Use nv_float4_t without tuples like example 79 */                               \
-    /* Use fixed 2 stages for SM120 to meet minimum requirement */                                         \
+    /* SM120/SM121 BlockScaled - Use nv_float4_t without tuples like example 79 */                         \
+    /* Use fixed 2 stages for SM120/SM121 to meet minimum requirement */                                   \
     using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<                      \
         Arch, OperatorClass, ElementA, LayoutA, AlignmentA, ElementB, LayoutB, AlignmentB,                 \
         ElementAccumulator, ThreadBlockShape, ClusterShape,                                                \

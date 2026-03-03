@@ -976,10 +976,10 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       TVM_FFI_ICHECK_EQ(quant_scales.value().size(), 4)
       "Expecting 4 quant scales for W4A8_MXFP4_MXFP8 quantization";
 
-      TensorView fc1_weight_block = quant_scales.value()[0];
-      TensorView fc1_global = quant_scales.value()[1];
-      TensorView fc2_weight_block = quant_scales.value()[2];
-      TensorView fc2_global = quant_scales.value()[3];
+      auto const& fc1_weight_block = quant_scales.value()[0];
+      auto const& fc1_global = quant_scales.value()[1];
+      auto const& fc2_weight_block = quant_scales.value()[2];
+      auto const& fc2_global = quant_scales.value()[3];
 
       // The input for scale fc1_weight_block / fc2_weight_block is packed into INT32
       constexpr int FP8_PER_INT32 = 4;
@@ -1035,12 +1035,12 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       TVM_FFI_ICHECK_EQ(quant_scales.value().size(), 6)
           << "Expecting 6 quant scales for nvfp4 quantization";
 
-      TensorView fc1_act_global = quant_scales.value()[0];
-      TensorView fc1_weight_block = quant_scales.value()[1];
-      TensorView fc1_global = quant_scales.value()[2];
-      TensorView fc2_act_global = quant_scales.value()[3];
-      TensorView fc2_weight_block = quant_scales.value()[4];
-      TensorView fc2_global = quant_scales.value()[5];
+      auto const& fc1_act_global = quant_scales.value()[0];
+      auto const& fc1_weight_block = quant_scales.value()[1];
+      auto const& fc1_global = quant_scales.value()[2];
+      auto const& fc2_act_global = quant_scales.value()[3];
+      auto const& fc2_weight_block = quant_scales.value()[4];
+      auto const& fc2_global = quant_scales.value()[5];
 
       // The input for scale fc1_weight_block / fc2_weight_block is packed into INT32
       constexpr int FP8_PER_INT32 = 4;
@@ -1118,8 +1118,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           static_cast<float const*>(fc2_global.data_ptr()), fc1_act_global.ndim() == 1,
           fc2_act_global.ndim() == 1);
     } else if (mUseDeepSeekFP8BlockScaling) {
-      TensorView fc1_scales = quant_scales.value()[0];
-      TensorView fc2_scales = quant_scales.value()[1];
+      auto const& fc1_scales = quant_scales.value()[0];
+      auto const& fc2_scales = quant_scales.value()[1];
       return kernels::QuantParams::FP8BlockScaling(
           static_cast<float const*>(fc1_scales.data_ptr()),
           static_cast<float const*>(fc2_scales.data_ptr()));
@@ -1128,8 +1128,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       TVM_FFI_ICHECK_EQ(quant_scales.value().size(), 2)
           << "Expecting 2 quant scales for W4A16 quantization";
 
-      TensorView fc1_weight_scales = quant_scales.value()[0];
-      TensorView fc2_weight_scales = quant_scales.value()[1];
+      auto const& fc1_weight_scales = quant_scales.value()[0];
+      auto const& fc2_weight_scales = quant_scales.value()[1];
       int group_size = TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::wfp4a16_group_size;
       return kernels::QuantParams::GroupWise(group_size,
                                              static_cast<void const*>(fc1_weight_scales.data_ptr()),
@@ -1139,14 +1139,14 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       TVM_FFI_ICHECK(quant_scales.has_value()) << "Expecting quant scales for INT4 quantization";
       TVM_FFI_ICHECK_EQ(quant_scales.value().size(), 8)
           << "Expecting 8 quant scales for INT4 quantization";
-      TensorView fc1_weight_scales = quant_scales.value()[0];
-      TensorView fc2_weight_scales = quant_scales.value()[1];
-      TensorView fc1_act_scales = quant_scales.value()[2];
-      TensorView fc2_act_scales = quant_scales.value()[3];
-      TensorView fc1_weight_zeros = quant_scales.value()[4];
-      TensorView fc2_weight_zeros = quant_scales.value()[5];
-      TensorView fc1_alpha = quant_scales.value()[6];
-      TensorView fc2_alpha = quant_scales.value()[7];
+      auto const& fc1_weight_scales = quant_scales.value()[0];
+      auto const& fc2_weight_scales = quant_scales.value()[1];
+      auto const& fc1_act_scales = quant_scales.value()[2];
+      auto const& fc2_act_scales = quant_scales.value()[3];
+      auto const& fc1_weight_zeros = quant_scales.value()[4];
+      auto const& fc2_weight_zeros = quant_scales.value()[5];
+      auto const& fc1_alpha = quant_scales.value()[6];
+      auto const& fc2_alpha = quant_scales.value()[7];
       int group_size = TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::int4_group_size;
       return kernels::QuantParams::GroupWise(
           group_size, static_cast<void const*>(fc1_weight_scales.data_ptr()),

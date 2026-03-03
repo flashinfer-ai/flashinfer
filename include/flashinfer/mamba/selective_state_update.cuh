@@ -21,12 +21,29 @@
 
 namespace flashinfer::mamba {
 
-// =============================================================================
-// Allowed dispatch values for kernel instantiation
-// =============================================================================
-using AllowedDims = std::integer_sequence<int, 64, 128, 256>;
-using AllowedDstates = std::integer_sequence<int, 64, 128, 256>;
-using AllowedNtokens = std::integer_sequence<int, 1, 2, 4, 6, 8, 12, 16>;
+// Host-side algorithm selection for invokeSelectiveStateUpdate dispatch.
+// Not stored in kernel params — no register overhead.
+enum class SSUAlgorithm : int32_t {
+  kAuto = 0,
+  kSimple = 1,
+  kVertical = 2,
+  kHorizontal = 3,
+};
+
+inline const char* SSUAlgorithmToString(SSUAlgorithm algo) {
+  switch (algo) {
+    case SSUAlgorithm::kAuto:
+      return "Auto";
+    case SSUAlgorithm::kSimple:
+      return "Simple";
+    case SSUAlgorithm::kVertical:
+      return "Vertical";
+    case SSUAlgorithm::kHorizontal:
+      return "Horizontal";
+    default:
+      return "Unknown";
+  }
+}
 
 struct SelectiveStateUpdateParams {
   uint32_t batch{}, nheads{}, dim{}, dstate{}, ngroups{}, state_cache_size{};
