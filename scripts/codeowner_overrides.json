@@ -1,5 +1,5 @@
 {
-  "scripts/codeowner_overrides.js": ["@ci-users"],
+  "scripts/codeowner_overrides.json": ["@ci-users"],
 
   "flashinfer/attention.py": ["@flashinfer-ai/attention-owners"],
   "include/flashinfer/attention": ["@flashinfer-ai/attention-owners"],
