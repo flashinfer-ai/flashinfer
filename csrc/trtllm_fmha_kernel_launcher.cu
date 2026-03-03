@@ -20,10 +20,7 @@
 #include <nvrtc.h>
 #include <tvm/ffi/container/variant.h>
 
-#include <algorithm>
-#include <cctype>
 #include <cstdint>
-#include <cstdlib>
 #include <flashinfer/trtllm/fmha/fmhaRunner.cuh>
 #include <flashinfer/utils.cuh>
 #include <iostream>
@@ -45,20 +42,6 @@ enum class TllmPagedAttentionMode {
 };
 
 namespace {
-
-bool is_trtllm_swa_block_table_sanitize_enabled() {
-  static const bool enabled = []() {
-    const char* env = std::getenv("FLASHINFER_TRTLLM_SWA_BLOCK_TABLE_SANITIZE");
-    if (env == nullptr) {
-      return true;
-    }
-    std::string value(env);
-    std::transform(value.begin(), value.end(), value.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    return !(value == "0" || value == "false" || value == "no" || value == "off");
-  }();
-  return enabled;
-}
 
 template <typename BlockT, typename SeqLenT>
 __global__ void sanitize_trtllm_swa_block_tables_kernel(
@@ -134,9 +117,6 @@ void sanitize_trtllm_swa_block_tables_inplace(BlockT* block_tables_ptr, const Se
                                               int64_t max_q_len, int64_t page_size,
                                               int64_t window_left, int64_t num_pages_in_mem_pool,
                                               cudaStream_t stream) {
-  if (!is_trtllm_swa_block_table_sanitize_enabled()) {
-    return;
-  }
   if (window_left < 0 || page_size <= 0 || batch_size <= 0 || max_num_blocks_per_seq <= 0) {
     return;
   }
