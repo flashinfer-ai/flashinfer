@@ -47,8 +47,9 @@ struct GemmData {
     // The M dimension.
     // It is the total number of tokens if A is the activation matrix.
     // It is the total number of output channels if A is the weight matrix.
-    // ValidM/N/K by default assumes to be full range of M/N/K respectively. If we pad M/N/K due to
-    // alignment of other constraints, then we can specify ValidM/N/K to indicate the valid range.
+    // ValidM/N/K by default assumes to be full range of M/N/K respectively. If
+    // we pad M/N/K due to alignment of other constraints, then we can specify
+    // ValidM/N/K to indicate the valid range.
     int32_t mM{0};
     int32_t mValidM{0};
     // The N dimension.
@@ -70,10 +71,10 @@ struct GemmData {
     //
     // If S is the sparsity ratio (1 for dense, 2 for sparse):
     // When layoutA is MatrixLayout::MajorK, the shape is [M, K / S].
-    // When LayoutA is MatrixLayout::MajorMn, the shape is [K, M] (sparsity not supported)
-    // When LayoutA is MatrixLayout::BlockMajorK, the shape is [K / S / blockK, M, blockK] where
-    // blockK is 128B.
-    // The rightmost dimension is contiguous in memory.
+    // When LayoutA is MatrixLayout::MajorMn, the shape is [K, M] (sparsity not
+    // supported) When LayoutA is MatrixLayout::BlockMajorK, the shape is [K / S
+    // / blockK, M, blockK] where blockK is 128B. The rightmost dimension is
+    // contiguous in memory.
     void const* mPtrA{nullptr};
 
     // The block scaling factors to dequantize A.
@@ -83,14 +84,16 @@ struct GemmData {
     //    Otherwise, shape is [M / 128, K / 128].
     //  The rightmost dimension is contiguous in memory.
     //
-    // If DeepSeek FP8 recipe is not used, but for MxFp{4,8}, MxInt4 and NvFp4 formats:
-    //  If the layout is R128c4,
+    // If DeepSeek FP8 recipe is not used, but for MxFp{4,8}, MxInt4 and NvFp4
+    // formats:
+    //    The layout of scaling factors for A is always R128c4
     //    M must be a multiple of 128.
-    //    K must be a multiple of 4 * P, where P is the scaling block size.
-    //    The "logical" shape is: [M, K / P].
+    //    K must be a multiple of 64.
+    //    The "logical" shape is: [M, K / P], where P is the scaling block size.
     //    The R128c4 layout is: [M / 128, K / P / 4, 512].
     //    The shape we use for TMA is: [M / 128, K / P / 4, 2, 256].
-    //  Dtype is E4m3 for NvFp4, UE8m0 for MxFp{4,8} formats, Bfloat16 for MxInt4.
+    //    Dtype is E4m3 for NvFp4, UE8m0 for MxFp{4,8} formats, Bfloat16 for
+    //    MxInt4.
     //
     // Otherwise should be set to nullptr.
     void const* mPtrSfA{nullptr};
@@ -98,10 +101,10 @@ struct GemmData {
     // The per-token scaling factors from scale A.
     //
     // This is used for either:
-    //   * Per-token scaling factor quantization schemes, such as MetaFP8. The dtype is
-    //   Dtype::Float32
-    //   * When the routing scales are applied to the input activations (only when output is not
-    //   transposed). The dtype is Dtype::Bfloat16
+    //   * Per-token scaling factor quantization schemes, such as MetaFP8. The
+    //   dtype is Dtype::Float32
+    //   * When the routing scales are applied to the input activations (only
+    //   when output is not transposed). The dtype is Dtype::Bfloat16
     //
     // The shape is [M]
     void const* mPtrPerTokenSfA{nullptr};
@@ -111,13 +114,15 @@ struct GemmData {
     // When sparsityA is Any_2_4:
     //     2 elements are non-zero in any chunk of 4 elements.
     //     A 4-bit index indicates the position of the non-zero elements.
-    //     The shape in Uint8 is: [M, K / 8] (two 4-bit indices packed into one UInt8)
+    //     The shape in Uint8 is: [M, K / 8] (two 4-bit indices packed into one
+    //     UInt8)
     //
     // When sparsityA is Pairwise_4_8:
     //     4 elements are non-zero in any chunk of 8 elements.
     //     The zero and non-zero elements are grouped in pairs.
     //     A 4-bit index indicates the position of the non-zero pairs.
-    //     The shape in Uint8 is: [M, K / 16] (two 4-bit indices packed into one UInt8)
+    //     The shape in Uint8 is: [M, K / 16] (two 4-bit indices packed into one
+    //     UInt8)
     //
     // If sparsityA is Dense, this should be set to nullptr.
     void const* mPtrSparsityInfoA{nullptr};
@@ -126,9 +131,9 @@ struct GemmData {
     //
     // When layoutB is MatrixLayout::MajorK, the shape is [N, K].
     // When layoutB is MatrixLayout::MajorMn, the shape is [K, N].
-    // When layoutB is MatrixLayout::BlockMajorK, the shape is [K / blockK, N, blockK] where blockK
-    // is 128B.
-    // The rightmost dimension is contiguous in memory.
+    // When layoutB is MatrixLayout::BlockMajorK, the shape is [K / blockK, N,
+    // blockK] where blockK is 128B. The rightmost dimension is contiguous in
+    // memory.
     void const* mPtrB{nullptr};
 
     // The scaling factors to dequantize B.
@@ -142,15 +147,16 @@ struct GemmData {
     //  If the layout is R128c4,
     //     N must be a multiple of 128.
     //     K must be a multiple of 64.
-    //     The R128c4 layout is: [N / 128, K / P / 4, 512], where P is the scaling block size.
-    //     The shape we use for TMA is: [N / 128, K / P / 4, 2, 256]
+    //     The R128c4 layout is: [N / 128, K / P / 4, 512], where P is the
+    //     scaling block size. The shape we use for TMA is: [N / 128, K / P / 4,
+    //     2, 256]
     //
     //  If the layout is R8c4,
     //     N must be a multiple of 8.
     //     K must be a multiple of 64.
-    //     The R8c4 layout is: [N / 8, K / P / 4, 32], where P is the scaling block size.
-    //     The shape we use for TMA is: [N / 8, K / P / 4 / repeats, repeats * 32]
-    //     where repeats = min(tileK / P / 4, 8)
+    //     The R8c4 layout is: [N / 8, K / P / 4, 32], where P is the scaling
+    //     block size. The shape we use for TMA is: [N / 8, K / P / 4 / repeats,
+    //     repeats * 32] where repeats = min(tileK / P / 4, 8)
     //
     // Dtype is E4m3 for NvFp4, UE8m0 for MxFp{4,8} formats.
     //
@@ -160,10 +166,10 @@ struct GemmData {
     // The per-token scaling factors from scale B.
     //
     // This is used for either:
-    //   * Per-token scaling factor quantization schemes, such as MetaFP8. The dtype is
-    //   Dtype::Float32
-    //   * When the routing scales are applied to the input activations (only when output is
-    //   transposed). The dtype is Dtype::Bfloat16
+    //   * Per-token scaling factor quantization schemes, such as MetaFP8. The
+    //   dtype is Dtype::Float32
+    //   * When the routing scales are applied to the input activations (only
+    //   when output is transposed). The dtype is Dtype::Bfloat16
     //
     // The shape is [N]
     void const* mPtrPerTokenSfB{nullptr};
@@ -172,7 +178,8 @@ struct GemmData {
     // The bias is applied before applying the global scaling factor. I.e.
     // C' = (A * B + bias') * scaleC
     // scaleC = dequantA * dequantB * quantC
-    // Thus, the bias' = bias / (dequantA * dequantB), where the bias is the original bias.
+    // Thus, the bias' = bias / (dequantA * dequantB), where the bias is the
+    // original bias.
     //
     // if BiasType is N, the shape is [N].
     // The bias is broadcasted along the M dimension.
@@ -183,25 +190,25 @@ struct GemmData {
     // The dtype is float32.
     void const* mPtrBias{nullptr};
 
-    // The output tensor scaling factor for Fp8 (not DeepSeek FP8) and NvFp4 quantization.
-    // TensorRT-LLM API requires a scaling factor on the device.
+    // The output tensor scaling factor for Fp8 (not DeepSeek FP8) and NvFp4
+    // quantization. TensorRT-LLM API requires a scaling factor on the device.
     // scaleC = dequantA * dequantB * quantC,
     // where dequantA is global dequantization scaling factor of A
-    //    if dtypeA is FP8, it transforms the range from [-448, 448] to [-amaxA, amaxA]
-    //    if dtypeA is NvFp4, it transforms the range from [-448 * 6, 448 * 6] to [-amaxA, amaxA],
-    //    otherwise it is 1.
+    //    if dtypeA is FP8, it transforms the range from [-448, 448] to [-amaxA,
+    //    amaxA] if dtypeA is NvFp4, it transforms the range from [-448 * 6, 448
+    //    * 6] to [-amaxA, amaxA], otherwise it is 1.
     // dequantB is defined similarly to dequantA.
     // quantC is the quantization scaling factor of C.
-    //    if dtypeC is FP8, it transforms the range from [-amaxC, amaxC] to [-448, 448]
-    //    if dtypeC is NvFp4, it transforms the range from [-amaxC, amaxC] to [-448 * 6, 448 * 6],
-    //    otherwise it is 1.
+    //    if dtypeC is FP8, it transforms the range from [-amaxC, amaxC] to
+    //    [-448, 448] if dtypeC is NvFp4, it transforms the range from [-amaxC,
+    //    amaxC] to [-448 * 6, 448 * 6], otherwise it is 1.
     // Shape is [1].
     void* mPtrScaleC{nullptr};
 
-    // The pre-activation scaling factor (typically dequantA * dequantB) for non-linear activation.
-    // Only used when non-linear activation is applied (e.g., GELU, Relu2, Silu).
-    // When used, scaleC should be quantScaleC only, and this scale is applied before the
-    // activation. Shape is [1].
+    // The pre-activation scaling factor (typically dequantA * dequantB) for
+    // non-linear activation. Only used when non-linear activation is applied
+    // (e.g., GELU, Relu2). When used, scaleC should be quantScaleC only, and
+    // this scale is applied before the activation. Shape is [1].
     void* mPtrScaleAct{nullptr};
   };
 
@@ -213,13 +220,13 @@ struct GemmData {
     // Elements in a given row are stored contiguously in memory (row-major).
     void* mPtrC{nullptr};
 
-    // Pointer for output with multicast mapping. It is used by the "reduce" op (LDGMC.ADD) of the
-    // two-shot reduce-scatter phase. Otherwise, it should be set to nullptr.
-    // The shape is [M, N] and the dtype is float.
+    // Pointer for output with multicast mapping. It is used by the "reduce" op
+    // (LDGMC.ADD) of the two-shot reduce-scatter phase. Otherwise, it should be
+    // set to nullptr. The shape is [M, N] and the dtype is float.
     void* mPtrMultiMemC{nullptr};
 
-    // The scaling factors calculated when quantizing C, for MxFp{4,8} and NvFp4 formats, also
-    // used for the DeepSeek FP8 recipe.
+    // The scaling factors calculated when quantizing C, for MxFp{4,8} and NvFp4
+    // formats, also used for the DeepSeek FP8 recipe.
     //
     // For DeepSeek FP8 recipe:
     //    If transposeMmaOutput is false, shape is [N / 128, M].
@@ -227,10 +234,10 @@ struct GemmData {
     //    The rightmost dimension is contiguous in memory.
     //
     // For MxFp{4,8} and NvFp4 formats:
-    //    If transposeMmaOutput is false, shape is [M, N / P], where P is the scaling block size.
-    //    Otherwise, shape is [N, M / P].
-    //    The layout is controlled by options.mSfLayoutC (either R128c4 or R8c4).
-    //    The layout (R128c4 and R8c4) is the same as explained in mPtrSfB.
+    //    If transposeMmaOutput is false, shape is [M, N / P], where P is the
+    //    scaling block size. Otherwise, shape is [N, M / P]. The layout is
+    //    controlled by options.mSfLayoutC (either R128c4 or R8c4). The layout
+    //    (R128c4 and R8c4) is the same as explained in mPtrSfB.
     //
     // Otherwise should be set to nullptr.
     void* mPtrSfC{nullptr};
@@ -239,13 +246,14 @@ struct GemmData {
   struct AllReduceBuffers {
     // The barriers in global memory.
     //
-    // The kernel arrives at (with release ordering) the multicast mapping of the barrier to
-    // broadcast amongst peer devices. It then waits (with acquire ordering) for the unicast mapping
-    // of the barrier.
+    // The kernel arrives at (with release ordering) the multicast mapping of
+    // the barrier to broadcast amongst peer devices. It then waits (with
+    // acquire ordering) for the unicast mapping of the barrier.
     //
-    // Flags in global memory that sync on "entrance" of reduce-scatter phase in two-shot
-    // all-reduce. The shape is [numTilesM * numTilesN] and the dtype is uint32_t. The pointer to
-    // the unicast memory created with IpcNvlsHandle. Must be set to 0 before the kernel launch.
+    // Flags in global memory that sync on "entrance" of reduce-scatter phase in
+    // two-shot all-reduce. The shape is [numTilesM * numTilesN] and the dtype
+    // is uint32_t. The pointer to the unicast memory created with
+    // IpcNvlsHandle. Must be set to 0 before the kernel launch.
     void* mPtrTileBars{nullptr};
 
     // The shape is [numTilesM * numTilesN] and the dtype is uint32_t.
@@ -341,7 +349,8 @@ class GemmInterface {
 
   ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-  // Returns true if the configuration of the cubin can be executed for the given params.
+  // Returns true if the configuration of the cubin can be executed for the
+  // given params.
   bool isValidConfig(GemmConfig const& config, GemmData const& data) const {
     // Get options from config and data.
     auto options = getOptionsFromConfigAndData(config, data);
@@ -353,11 +362,11 @@ class GemmInterface {
 
   ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-  // If config.mData is specified, it launches the cubin from the provided config.
-  // Otherwise, it generates and compiles the kernel using either nvcc or nvrtc.
-  // Launch the cubin from the provided config.
-  // It calls all necessary memsets for internal buffers.
-  // Provided config must be validated with isValidConfig before the call.
+  // If config.mData is specified, it launches the cubin from the provided
+  // config. Otherwise, it generates and compiles the kernel using either nvcc
+  // or nvrtc. Launch the cubin from the provided config. It calls all necessary
+  // memsets for internal buffers. Provided config must be validated with
+  // isValidConfig before the call.
   int32_t run(GemmConfig const& config, void* workspace, GemmData const& data, void* cudaStream,
               int32_t multiProcessorCount, bool usePdl = true,
               std::optional<std::reference_wrapper<ModuleCache>> moduleCache = std::nullopt) const {
@@ -406,12 +415,13 @@ class GemmInterface {
     // The size of the grid.
     std::vector<int32_t> grid{gridDimX, gridDimY, gridDimZ};
 
-    // When split-k is enabled and to guarantee the forward progress, we must ensure that the number
-    // of tiles is less than number of SMs. This way, at least one CTA in the grid can make forward.
+    // When split-k is enabled and to guarantee the forward progress, we must
+    // ensure that the number of tiles is less than number of SMs. This way, at
+    // least one CTA in the grid can make forward.
     if (doesSplitKUseGmem(options.mSplitK)) {
       if (grid[0] * grid[1] >= multiProcessorCount) {
-        // The number of MN tiles in Split-K (grid[0] * grid[1]) must be less than the number of
-        // SMs.
+        // The number of MN tiles in Split-K (grid[0] * grid[1]) must be less
+        // than the number of SMs.
         return 2;
       }
     }
@@ -437,14 +447,15 @@ class GemmInterface {
     if (moduleCache.has_value()) {
       ModuleCache& moduleCacheRef = moduleCache.value().get();
 
-      // Modules are associated with a specific context, so the context is included in the key
+      // Modules are associated with a specific context, so the context is
+      // included in the key
       CUcontext ctx;
       unsigned long long ctxId;
       cuCtxGetCurrent(&ctx);
       cuCtxGetId(ctx, &ctxId);
 
-      // Reinterpret the ctxId as a string to avoid needing a custom hash or converting it to a
-      // string in decimal representation.
+      // Reinterpret the ctxId as a string to avoid needing a custom hash or
+      // converting it to a string in decimal representation.
       std::string const ctxName =
           std::string(reinterpret_cast<char*>(&ctxId), sizeof(unsigned long long) / sizeof(char));
       std::string const funcName = std::string(gemmConfig.mFunctionName);
@@ -509,9 +520,11 @@ class GemmInterface {
                                            ? tg::dtypeGetNumBits(options.mDtypeAcc)
                                            : tg::dtypeGetNumBits(options.mDtypeC);
         // The number of bytes for C.
-        int64_t const numBytesC =
-            data.mProblemDimensions.mM * data.mProblemDimensions.mN * numBitsPerEltC / /*bits*/ 8;
-        // Reset the output buffer as one-shot uses UTMAREDG at multicast memory for reduction.
+        int64_t const numBytesC = data.mProblemDimensions.mM * data.mProblemDimensions.mN *
+                                  numBitsPerEltC /
+                                  /*bits*/ 8;
+        // Reset the output buffer as one-shot uses UTMAREDG at multicast memory
+        // for reduction.
         auto err = cudaMemsetAsync(data.mOutputBuffers.mPtrC, 0x00, numBytesC,
                                    reinterpret_cast<cudaStream_t>(cudaStream));
         if (err != cudaSuccess) {
@@ -560,7 +573,8 @@ class GemmInterface {
                                                          int32_t numSlicesForSplitK,
                                                          int32_t multiProcessorCount) const {
     assert(multiProcessorCount > 0 &&
-           "multiProcessorCount must be provided when using StaticPersistent scheduler");
+           "multiProcessorCount must be provided "
+           "when using StaticPersistent scheduler");
     // The cluster size spanned in the XY dimension.
     auto clusterSizeXy = clusterDimX * clusterDimY;
     // The maximum number of CTAs a GPU can run across the XY dimension.
@@ -602,16 +616,18 @@ class GemmInterface {
 
     int64_t numBytesSplitK{0}, numBytesSplitKBars{0};
     if (doesSplitKUseGmem(options.mSplitK)) {
-      // The number of elements for intermediate split-k buffer that contains K slices padded to
-      // TileM/TileN sizes to avoid OOB accesses during the reduction.
+      // The number of elements for intermediate split-k buffer that contains K
+      // slices padded to TileM/TileN sizes to avoid OOB accesses during the
+      // reduction.
       // FIXME: Split-K has excessive memory traffic when combined with slice-K.
-      // Currently, data for all slice-K slices is sent, even though the slice-K reduction
-      // has already been performed.
-      // This should be optimized to send data for only one reduced slice.
+      // Currently, data for all slice-K slices is sent, even though the slice-K
+      // reduction has already been performed. This should be optimized to send
+      // data for only one reduced slice.
       auto numEltsSplitK = options.mNumSlicesForSplitK * numTilesM * numTilesN * options.mTileM *
                            options.mTileN * options.mNumSlicesForSliceK;
 
-      // The number of bytes for intermediate split-k buffer that contains K slices.
+      // The number of bytes for intermediate split-k buffer that contains K
+      // slices.
       numBytesSplitK = numEltsSplitK * tg::dtypeGetNumBits(tg::Dtype::Fp32) / /* bits */ 8;
       // The number of bytes for the split-k completion barriers.
       numBytesSplitKBars = numTilesM * numTilesN * sizeof(uint32_t);

@@ -16,16 +16,14 @@
  */
 #pragma once
 
-#include <tuple>
-
 #include "Enums.h"
 #include "TmaDescriptor.h"
 #include "trtllm/gen/CommonUtils.h"
 #include "trtllm/gen/SfLayoutDecl.h"
 #include "trtllm/gen/SparsityDecl.h"
 
-// NOTE: keep this code dependency free. It has to be included by the device code and has to be
-// compilable with NVRTC.
+// NOTE: keep this code dependency free. It has to be included by the device
+// code and has to be compilable with NVRTC.
 #include "KernelParamsDecl.h"
 
 namespace gemm {
@@ -57,7 +55,8 @@ static auto makeTmaShapeStrideAb(GemmOptions const& options, MatrixType matrixTy
   int const validN = options.mValidN;
   int const validK = options.mValidK >> isSparse;
 
-  // The outer dimension. Uses padded dimensions for strides and valid dimensions for shapes.
+  // The outer dimension. Uses padded dimensions for strides and valid
+  // dimensions for shapes.
   auto numTokens = (matrixType == MatrixType::MatrixA) ? sizeM : sizeN;
   auto numTokensValid = (matrixType == MatrixType::MatrixA) ? validM : validN;
   // The outer dimension tile size.
@@ -67,8 +66,8 @@ static auto makeTmaShapeStrideAb(GemmOptions const& options, MatrixType matrixTy
   auto hiddenSizeValid = validK;
   // The cute tensor shape for A/B: (numTokens, hiddenSize).
   // Note that TMA descriptor expects the first dimension's stride to be
-  // 1, so swap the first two dimension so that the hiddenSize dimension comes first.
-  // Use valid dimensions for shape, padded dimension for stride.
+  // 1, so swap the first two dimension so that the hiddenSize dimension comes
+  // first. Use valid dimensions for shape, padded dimension for stride.
   auto shape = std::vector<uint64_t>{static_cast<uint64_t>(hiddenSizeValid),
                                      static_cast<uint64_t>(numTokensValid)};
 
@@ -78,8 +77,9 @@ static auto makeTmaShapeStrideAb(GemmOptions const& options, MatrixType matrixTy
 
   // Assemble the box shape
   std::vector<int32_t> tileShape = {tileK, tileMn};
-  // When using 2CTA MMA, we only need to load half of the tile in each CTA for B.
-  if (matrixType == MatrixType::MatrixB && options.mClusterDimX >= 2) {
+  // When using 2CTA MMA, we only need to load half of the tile in each CTA for
+  // B.
+  if (matrixType == MatrixType::MatrixB && options.mClusterDimX == 2) {
     tileShape[1] /= 2;
   }
 
@@ -113,7 +113,8 @@ static auto makeTmaShapeStrideC(GemmOptions const& options) {
   // The hidden dimension.
   auto hiddenSize = options.mTransposeMmaOutput ? options.mM : options.mN;
   // Note that TMA descriptor expects the first dimension's stride to be
-  // 1, so swap the first two dimension so that the hiddenSize dimension comes first.
+  // 1, so swap the first two dimension so that the hiddenSize dimension comes
+  // first.
   auto shape =
       std::vector<uint64_t>{static_cast<uint64_t>(hiddenSize), static_cast<uint64_t>(numTokens)};
 
@@ -159,20 +160,22 @@ static auto makeTmaShapeStrideSfAb(GemmOptions const& options, MatrixType matrix
     case tg::SfLayout::R8c4: {
       // The scaling factor tensor packs 8x4 tiles into contiguous 32B blocks.
       //
-      // As the inner dimension (k) is often a multiple of the tile size, we can reshape to use
-      // fewer read requests, if the tile dimensions allow. It does not reduce the number of
-      // instructions.
+      // As the inner dimension (k) is often a multiple of the tile size, we can
+      // reshape to use fewer read requests, if the tile dimensions allow. It does
+      // not reduce the number of instructions.
       //
       // I.e., let's define r = min(⌈hiddenSizePerTile / (numEltsPerSf * 4)⌉, 8)
       //
       // The "logical" tensor is: [outer,      inner / numEltsPerSf]
       // The 8x4 SF layout is:    [⌈outer / 8⌉, inner / (4 * numEltsPerSf), 32]
-      // The TMA tensor shape is: [⌈outer / 8⌉, inner / (4 * numEltsPerSf * r), r * 32]
+      // The TMA tensor shape is: [⌈outer / 8⌉, inner / (4 * numEltsPerSf * r), r
+      // * 32]
       //
-      // The caveat of NumRepeats>1 is we must pad the hidden dimension of SF to multiples of
-      // NumRepeats * numEltsPerSf * 4.
+      // The caveat of NumRepeats>1 is we must pad the hidden dimension of SF to
+      // multiples of NumRepeats * numEltsPerSf * 4.
 
-      // Detect if the supplied factor is power of 2. E.g., 0b0100 and (0b0100 - 1) == 0b0000.
+      // Detect if the supplied factor is power of 2. E.g., 0b0100 and (0b0100 -
+      // 1) == 0b0000.
       int const r = options.mSfReshapeFactor;
       if (r > 0 && (r & (r - 1)) != 0) {
         throw std::runtime_error("mSfReshapeFactor must be positive and a power of 2. Found " +
@@ -293,7 +296,7 @@ static KernelParams setKernelParams(
 
     // Build TMA descriptor for gmem A block scaling factors.
     auto [shapeSfA, strideSfA, tileShapesSfA] =
-        makeTmaShapeStrideSfAb(options, MatrixType::MatrixA, options.mSfLayoutA, numEltsPerSfA);
+        makeTmaShapeStrideSfAb(options, MatrixType::MatrixA, tg::SfLayout::R128c4, numEltsPerSfA);
     params.tmaSfA = gemm::buildSfTmaDescriptor(dTypeSfA, shapeSfA, strideSfA, tileShapesSfA,
                                                const_cast<void*>(ptrSfA));
   }
@@ -333,9 +336,9 @@ static KernelParams setKernelParams(
     auto outputTileN =
         options.mTransposeMmaOutput ? options.mEpilogueTileM : options.mEpilogueTileN;
 
-    // One-shot performs TMA reduction on multicast mapping of the output buffer directly.
-    // Two-shot performs TMA store on unicast mapping of the output buffer. The reduction happens
-    // in the next phase.
+    // One-shot performs TMA reduction on multicast mapping of the output buffer
+    // directly. Two-shot performs TMA store on unicast mapping of the output
+    // buffer. The reduction happens in the next phase.
     void* ptrTmaC{oneShotAr && multiDevice ? multimemC : ptrC};
     auto dtypeC{options.mDtypeC};
     // Regardless of output dtype, two-shot all-reduce store partial
@@ -351,7 +354,8 @@ static KernelParams setKernelParams(
                                              /*doPad=*/false);
   }
 
-  // Set the dequantization factors for A and B when DeepSeek FP8 recipe is used.
+  // Set the dequantization factors for A and B when DeepSeek FP8 recipe is
+  // used.
   params.ptrSfA = ptrSfA;
   params.ptrSfB = ptrSfB;
 
@@ -362,7 +366,8 @@ static KernelParams setKernelParams(
   // Set the bias.
   params.ptrBias = ptrBias;
 
-  // Also set ptrC (it may be used by the NCCL reduction code in "layers/Llama").
+  // Also set ptrC (it may be used by the NCCL reduction code in
+  // "layers/Llama").
   params.ptrC = ptrC;
 
   // The scaling factors for the output tensor and the pre-activation scale.
@@ -370,7 +375,8 @@ static KernelParams setKernelParams(
   params.ptrScaleAct = ptrScaleAct;
 
   // The block scaling factors of C for MxFp{4,8} and NvFp4 formats.
-  // (not to be confused with the tensor-level scaling factor stored in ptrScaleC)
+  // (not to be confused with the tensor-level scaling factor stored in
+  // ptrScaleC)
   params.ptrSfC = ptrSfC;
 
   params.m = options.mM;

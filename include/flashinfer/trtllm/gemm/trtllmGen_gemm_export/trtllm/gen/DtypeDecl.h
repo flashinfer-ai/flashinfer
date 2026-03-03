@@ -28,8 +28,9 @@
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 //
-// Be careful when modifying this file as it is included by the generated kernels. For example, do
-// not add TLLM_CHECK_* constructs in this file. Thanks!
+// Be careful when modifying this file as it is included by the generated
+// kernels. For example, do not add TLLM_CHECK_* constructs in this file.
+// Thanks!
 //
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -44,9 +45,9 @@ enum class Dtype : uint32_t {
 
 // We use the following encoding for the types:
 //
-// Byte 0: Identifier for the type (going from 0 to the number of data types - 1,
-// Byte 1: Number of bits in the type,
-// Byte 2: Bit 0: Is it an integer? 0x1 if true, 0x0 otherwise;
+// Byte 0: Identifier for the type (going from 0 to the number of data types -
+// 1, Byte 1: Number of bits in the type, Byte 2: Bit 0: Is it an integer? 0x1
+// if true, 0x0 otherwise;
 //         Bit 4: is it signed?  0x1 if true, 0x0 otherwise.
 // Byte 3: Is it a block format? 0x1 if true, 0x0 otherwise.
 
@@ -261,7 +262,8 @@ inline MmaKind dtypeGetMmaKind(Dtype dtypeA, Dtype dtypeB) {
     return MmaKind::Fp8Fp6Fp4;
   }
 
-  // At this point we know that both dtypes are Mx types and not both MxE2m1 at the same time.
+  // At this point we know that both dtypes are Mx types and not both MxE2m1 at
+  // the same time.
   if ((dtypeEltA == Dtype::E4m3 || dtypeEltA == Dtype::E5m2 || dtypeEltA == Dtype::E2m3 ||
        dtypeEltA == Dtype::E3m2 || dtypeEltA == Dtype::E2m1) &&
       (dtypeEltB == Dtype::E4m3 || dtypeEltB == Dtype::E5m2 || dtypeEltB == Dtype::E2m3 ||

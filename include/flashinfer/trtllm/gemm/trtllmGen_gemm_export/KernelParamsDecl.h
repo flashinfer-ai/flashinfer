@@ -18,8 +18,8 @@
 
 #include <cuda.h>
 
-// NOTE: keep this code dependency free. It has to be included by the device code and has to be
-// compilable with NVRTC.
+// NOTE: keep this code dependency free. It has to be included by the device
+// code and has to be compilable with NVRTC.
 
 namespace gemm {
 
@@ -54,9 +54,9 @@ struct KernelParams {
   // If layoutA is MatrixLayout::BlockMajorK
   //   Logical shape is [K / blockK, M, blockK].
   //   Logical strides are [M * blockK, blockK, 1].
-  //   Tile box shape is [tileK / min(blockK, tileK), tileM, min(blockK, tileK)].
-  //   Tile box strides are [tileM * min(blockK, tileK), min(blockK, tileK), 1].
-  //   Dtype is set from options.mDtypeA, and blockK is 128B.
+  //   Tile box shape is [tileK / min(blockK, tileK), tileM, min(blockK,
+  //   tileK)]. Tile box strides are [tileM * min(blockK, tileK), min(blockK,
+  //   tileK), 1]. Dtype is set from options.mDtypeA, and blockK is 128B.
   CUtensorMap tmaA;
 
   // TMA descriptor for B.
@@ -80,9 +80,9 @@ struct KernelParams {
   // If layoutB is MatrixLayout::BlockMajorK
   //   Logical shape is [K / blockK, N, blockK].
   //   Logical strides are [N * blockK, blockK, 1].
-  //   Tile box shape is [tileK / min(blockK, tileK), tileN, min(blockK, tileK)].
-  //   Tile box strides are [tileN * min(blockK, tileK), min(blockK, tileK), 1].
-  //   Dtype is set from options.mDtypeB, and blockK is 128B.
+  //   Tile box shape is [tileK / min(blockK, tileK), tileN, min(blockK,
+  //   tileK)]. Tile box strides are [tileN * min(blockK, tileK), min(blockK,
+  //   tileK), 1]. Dtype is set from options.mDtypeB, and blockK is 128B.
   CUtensorMap tmaB;
 
   // TMA descriptor for C, (when useTmaStore is true)
@@ -104,27 +104,26 @@ struct KernelParams {
   //    Dtype is set from options.mDtypeC.
   CUtensorMap tmaC;
 
-  // TMA descriptor for the block scaling factors for A, for MxFp{4,8} and NvFp4 formats.
-  // Must be setup using gemm::buildSfTmaDescriptor with shapes and strides from
-  // makeTmaShapeStrideSfAb.
-  // The layout of scaling factors for A is always R128c4
+  // TMA descriptor for the block scaling factors for A, for MxFp{4,8} and NvFp4
+  // formats. Must be setup using gemm::buildSfTmaDescriptor with shapes and
+  // strides from makeTmaShapeStrideSfAb. The layout of scaling factors for A is
+  // always R128c4
   //
-  // Let P be the number of elements per SF. P=16 for NvFp4, P=32 for Mx formats.
-  // K must be a multiple of 4P.
-  // The "logical" shape is: [M, K / P].
+  // Let P be the number of elements per SF. P=16 for NvFp4, P=32 for Mx
+  // formats. K must be a multiple of 4P. The "logical" shape is: [M, K / P].
   // The R128c4 layout is: [⌈M / 128⌉, K / P / 4, 512].
   // The shape we use for TMA is: [⌈M / 128⌉, K / P / 4, 2, 256].
   //
   // Dtype is Dtype::E4m3 for NvFp4, Dtype::UE8m0 for Mx formats.
   CUtensorMap tmaSfA;
 
-  // TMA descriptor for the block scaling factors for B, for MxFp{4,8}, MxInt4 and NvFp4 formats.
-  // Must be setup using gemm::buildSfTmaDescriptor with shapes and strides from
-  // makeTmaShapeStrideSfAb.
-  // The layout of scaling factors for B is controlled by options.mSfLayoutB.
+  // TMA descriptor for the block scaling factors for B, for MxFp{4,8}, MxInt4
+  // and NvFp4 formats. Must be setup using gemm::buildSfTmaDescriptor with
+  // shapes and strides from makeTmaShapeStrideSfAb. The layout of scaling
+  // factors for B is controlled by options.mSfLayoutB.
   //
-  // Let P be the number of elements per SF. P=16 for NvFp4, P=32 for Mx formats.
-  // The "logical" shape is: [N, K / P]
+  // Let P be the number of elements per SF. P=16 for NvFp4, P=32 for Mx
+  // formats. The "logical" shape is: [N, K / P]
   //
   // If the layout is R128c4,
   //    K must be a multiple of 4P.
@@ -137,12 +136,13 @@ struct KernelParams {
   //    The shape we use for TMA is: [⌈N / 8⌉, K / P / 4 / r, r * 32]
   //    where r = min(tileK / P / 4, 8)
   //
-  // Dtype is Dtype::E4m3 for NvFp4, Dtype::UE8m0 for MxFp{4,8} formats, Dtype::Bfloat16 for MxInt4.
+  // Dtype is Dtype::E4m3 for NvFp4, Dtype::UE8m0 for MxFp{4,8} formats,
+  // Dtype::Bfloat16 for MxInt4.
   CUtensorMap tmaSfB;
 
-  // TMA descriptor for the sparsity information of A, if structured sparsity is used.
-  // Must be setup using gemm::buildNdTmaDescriptor with shapes and strides from
-  // makeTmaShapeStrideSparsityInfoA.
+  // TMA descriptor for the sparsity information of A, if structured sparsity is
+  // used. Must be setup using gemm::buildNdTmaDescriptor with shapes and
+  // strides from makeTmaShapeStrideSparsityInfoA.
   //
   // When sparsityA is Any_2_4:
   //     2 elements are non-zero in any chunk of 4 elements.
@@ -195,7 +195,8 @@ struct KernelParams {
   // The bias is applied before applying the global scaling factor. I.e.
   // C' = (A * B + bias') * scaleC
   // scaleC = dequantA * dequantB * quantC
-  // Thus, the bias' = bias / (dequantA * dequantB), where the bias is the original bias.
+  // Thus, the bias' = bias / (dequantA * dequantB), where the bias is the
+  // original bias.
   //
   // if BiasType is N, the shape is [N].
   // The bias is broadcasted along the M dimension.
@@ -209,9 +210,10 @@ struct KernelParams {
   // The per-token scaling factors from scale A.
   //
   // This is used for either:
-  //   * Per-token scaling factor quantization schemes, such as MetaFP8. The dtype is Dtype::Float32
-  //   * When the routing scales are applied to the input activations (only when output is not
-  //   transposed). The dtype is Dtype::Bfloat16
+  //   * Per-token scaling factor quantization schemes, such as MetaFP8. The
+  //   dtype is Dtype::Float32
+  //   * When the routing scales are applied to the input activations (only when
+  //   output is not transposed). The dtype is Dtype::Bfloat16
   //
   // The shape is [M]
   void const* ptrPerTokenSfA;
@@ -219,15 +221,16 @@ struct KernelParams {
   // The per-token scaling factors from scale B.
   //
   // This is used for either:
-  //   * Per-token scaling factor quantization schemes, such as MetaFP8. The dtype is Dtype::Float32
-  //   * When the routing scales are applied to the input activations (only when output is
-  //   transposed). The dtype is Dtype::Bfloat16
+  //   * Per-token scaling factor quantization schemes, such as MetaFP8. The
+  //   dtype is Dtype::Float32
+  //   * When the routing scales are applied to the input activations (only when
+  //   output is transposed). The dtype is Dtype::Bfloat16
   //
   // The shape is [N]
   void const* ptrPerTokenSfB;
 
-  // The scaling factors calculated when quantizing C, for MxFp{4,8} and NvFp4 formats, also
-  // used for the DeepSeek FP8 recipe.
+  // The scaling factors calculated when quantizing C, for MxFp{4,8} and NvFp4
+  // formats, also used for the DeepSeek FP8 recipe.
   //
   // For DeepSeek FP8 recipe:
   //    If transposeMmaOutput is false, shape is [N / 128, M].
@@ -240,16 +243,16 @@ struct KernelParams {
   //    The layout is controlled by options.mSfLayoutC (either R128c4 or R8c4).
   void* ptrSfC;
 
-  // The output tensor scaling factor for MxFp{4,8}, Fp8, NvFp4 and DeepSeek FP8 quantization.
-  // TensorRT-LLM API requires a scaling factor on the device.
-  // Without non-linear activation, it is typically defined as quantScaleC * dequantScaleAb.
-  // With non-linear activation, it is typically defined as quantScaleC only.
-  // Shape is [1].
+  // The output tensor scaling factor for MxFp{4,8}, Fp8, NvFp4 and DeepSeek FP8
+  // quantization. TensorRT-LLM API requires a scaling factor on the device.
+  // Without non-linear activation, it is typically defined as quantScaleC *
+  // dequantScaleAb. With non-linear activation, it is typically defined as
+  // quantScaleC only. Shape is [1].
   float const* ptrScaleC;
 
-  // The pre-activation scaling factor for MxFp{4,8}, Fp8, NvFp4 and DeepSeek FP8 quantization.
-  // Only used with non-linear activation functions (e.g., GELU, Relu2).
-  // Without non-linear activation, this is ignored by the kernel.
+  // The pre-activation scaling factor for MxFp{4,8}, Fp8, NvFp4 and DeepSeek
+  // FP8 quantization. Only used with non-linear activation functions (e.g.,
+  // GELU, Relu2). Without non-linear activation, this is ignored by the kernel.
   // With non-linear activation, it is typically defined as dequantScaleAb.
   // Shape is [1].
   float const* ptrScaleAct;
@@ -275,20 +278,20 @@ struct KernelParams {
   int rank;
   // The number of peer devices in tensor-parallel group.
   int tpGrpSize;
-  // Pointer for output with multicast mapping. It is used by the "reduce" op (LDGMC.ADD) of the
-  // two-shot reduce-scatter phase.
-  // The shape is [M, N] and the dtype is float.
+  // Pointer for output with multicast mapping. It is used by the "reduce" op
+  // (LDGMC.ADD) of the two-shot reduce-scatter phase. The shape is [M, N] and
+  // the dtype is float.
   void* multimemC;
 
   // The barriers in global memory.
   //
-  // The kernel arrives at (with release ordering) the multicast mapping of the barrier to broadcast
-  // amongst peer devices. It then waits (with acquire ordering) for the unicast mapping of the
-  // barrier.
+  // The kernel arrives at (with release ordering) the multicast mapping of the
+  // barrier to broadcast amongst peer devices. It then waits (with acquire
+  // ordering) for the unicast mapping of the barrier.
   //
-  // Flags in global memory that sync on "entrance" of reduce-scatter phase in two-shot all-reduce.
-  // The shape is [numTilesM * numTilesN] and the dtype is uint32_t.
-  // The pointer to the unicast memory created with IpcNvlsHandle.
+  // Flags in global memory that sync on "entrance" of reduce-scatter phase in
+  // two-shot all-reduce. The shape is [numTilesM * numTilesN] and the dtype is
+  // uint32_t. The pointer to the unicast memory created with IpcNvlsHandle.
   // Must be set to 0 before the kernel launch.
   void* ptrTileBars;
   // The shape is [numTilesM * numTilesN] and the dtype is uint32_t.
@@ -311,22 +314,24 @@ struct KernelParams {
   //////////////////////////////////////////////////////////////////////////////////////////////////
 
   // The barriers in global memory for Split-k reduction with exchange in GMEM.
-  // Each CTAs arrives at the barrier and blockIdx.z == gridDim.Z - 1 waits for the barrier to flip
-  // to perform a reduction.
-  // The shape is [numTilesM * numTilesN] and the dtype is uint32_t.
-  // For DeepSeek FP8 recipe, the shape is [numTilesM * numTilesN * 2].
-  // The memory must be set to 0 before the kernel launch.
+  // Each CTAs arrives at the barrier and blockIdx.z == gridDim.Z - 1 waits for
+  // the barrier to flip to perform a reduction. The shape is [numTilesM *
+  // numTilesN] and the dtype is uint32_t. For DeepSeek FP8 recipe, the shape is
+  // [numTilesM * numTilesN * 2]. The memory must be set to 0 before the kernel
+  // launch.
   void* ptrSplitKCompletionBars;
 
   // Pointer to the memory holding the partial sums for split-K in GMEM.
-  // The shape is [numSlicesForSplitK, numSlicesForSliceK, numTilesM * tileM, numTilesN * tileN].
-  // The dtype is dtypeAcc, i.e. float.
+  // The shape is [numSlicesForSplitK, numSlicesForSliceK, numTilesM * tileM,
+  // numTilesN * tileN]. The dtype is dtypeAcc, i.e. float.
   void* ptrPartialSumsForSplitK;
 
-  // In some cases, some CTAs need to exit early. E.g. when the grid is statically set, but the
-  // actual workload is decided at runtime. This device pointer maps to the number of non exiting
-  // CTAs in the X dim of the grid when transposeMmaOutput is false. And the Y dim, otherwise.
-  // The pointer points to a scalar and the dtype is int32_t. The pointed value must be >= 0.
+  // In some cases, some CTAs need to exit early. E.g. when the grid is
+  // statically set, but the actual workload is decided at runtime. This device
+  // pointer maps to the number of non exiting CTAs in the X dim of the grid
+  // when transposeMmaOutput is false. And the Y dim, otherwise. The pointer
+  // points to a scalar and the dtype is int32_t. The pointed value must be >=
+  // 0.
   int32_t* ptrNumNonExitingCtas;
 
   //////////////////////////////////////////////////////////////////////////////////////////////////

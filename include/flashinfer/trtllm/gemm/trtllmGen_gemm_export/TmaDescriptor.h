@@ -17,7 +17,6 @@
 #pragma once
 
 #include <iostream>
-#include <sstream>
 
 #include "trtllm/gen/DtypeDecl.h"
 #include "trtllm/gen/MmaDecl.h"
@@ -72,8 +71,8 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, std::vector<uint64_t> c
 
   // The swizzle type.
   CUtensorMapSwizzle swizzleType{CU_TENSOR_MAP_SWIZZLE_NONE};
-  int32_t fastestDimTileSizeBytes =
-      (tileShapes[0] * tg::dtypeGetNumBits(dtype) * padMultiplier) / /* bits */ 8;
+  int32_t fastestDimTileSizeBytes = (tileShapes[0] * tg::dtypeGetNumBits(dtype) * padMultiplier) /
+                                    /* bits */ 8;
   if (doSwizzle) {
     if ((fastestDimTileSizeBytes % 128) == 0) {
       swizzleType = CU_TENSOR_MAP_SWIZZLE_128B;
@@ -97,8 +96,8 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, std::vector<uint64_t> c
 
   // Check shape must be in range [1, 2^32]
   int32_t dim = shapes.size();
-  // Expect 2 dimensions for regular gemm, 3 dimensions for batched gemm or blocked layout, and 4
-  // dimensions for batched gemm with blocked layout.
+  // Expect 2 dimensions for regular gemm, 3 dimensions for batched gemm or
+  // blocked layout, and 4 dimensions for batched gemm with blocked layout.
   assert(dim == 2 || dim == 3 || dim == 4);
   // Check shape range.
   for (int32_t ii = 0; ii < dim; ++ii) {
@@ -111,7 +110,8 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, std::vector<uint64_t> c
   assert(strides[0] == 1);
 
   // Build strides in bytes.
-  // cuTensorMapEncodeTiled ignores the stride of the first dimension (implicitly 1).
+  // cuTensorMapEncodeTiled ignores the stride of the first dimension
+  // (implicitly 1).
   std::vector<uint64_t> stridesInBytes(dim - 1);
   for (int32_t ii = 0; ii < dim - 1; ++ii) {
     stridesInBytes[ii] = (strides[ii + 1] * tg::dtypeGetNumBits(dtype)) / /* bits */ 8;
@@ -121,7 +121,8 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, std::vector<uint64_t> c
   auto const numEltsPerUInt32 = 4 * /* bits */ 8 / (tg::dtypeGetNumBits(dtype) * padMultiplier);
   // The number of elements in 128B.
   auto const numEltsIn128B = numEltsPerUInt32 /*4B*/ * 32;
-  // The number of tile K hidden size (per token) in each block of shared memory.
+  // The number of tile K hidden size (per token) in each block of shared
+  // memory.
   auto const numEltsInClampedFastestTileSize = std::min(numEltsIn128B, tileShapes[0]);
 
   // Build box dim array. If tileShapes is smaller than dim, just fill with 1s.
@@ -223,7 +224,8 @@ inline CUtensorMap buildSfTmaDescriptor(tg::Dtype dtype, std::vector<uint64_t> c
   assert(strides[0] == 1);
 
   // Build strides in bytes.
-  // cuTensorMapEncodeTiled ignores the stride of the first dimension (implicitly 1).
+  // cuTensorMapEncodeTiled ignores the stride of the first dimension
+  // (implicitly 1).
   std::vector<uint64_t> stridesInBytes(dim - 1);
   for (int32_t ii = 0; ii < dim - 1; ++ii) {
     stridesInBytes[ii] = (strides[ii + 1] * tg::dtypeGetNumBits(dtype)) / /* bits */ 8;

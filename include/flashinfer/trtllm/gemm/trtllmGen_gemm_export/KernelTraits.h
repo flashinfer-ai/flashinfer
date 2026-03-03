@@ -60,7 +60,8 @@ class MemAllocatorHelper {
         // E.g. possible in case of
         // mNumBytesAndAlignmentPerSmemChunk = {{1, 1}, {1, 1}, {1024, 1}}
         // mFirstChunkReuse = {false, false, true}
-        // The last chunk is larger than the first plus second, so total size is 1024.
+        // The last chunk is larger than the first plus second, so total size is
+        // 1024.
         totalSize = paddedSize;
       } else if (!mFirstChunkReuse[ii]) {
         totalSize += paddedSize;
@@ -131,7 +132,8 @@ class MemAllocatorHelper {
   // NOTE: be careful and make sure that the memory dependency is clear and
   // chunks in the beginning of the SMEM can be overwritten.
   std::vector<std::pair<int32_t, int32_t>> mNumBytesAndAlignmentPerSmemChunk;
-  // Chunk reuse configuration. True at ith position means that ith chunk starts at smemOffset = 0.
+  // Chunk reuse configuration. True at ith position means that ith chunk starts
+  // at smemOffset = 0.
   std::vector<bool> mFirstChunkReuse;
   // Buffer names for inspection purposes.
   std::vector<std::string> mSmemChunkNames;
@@ -186,10 +188,12 @@ class KernelTraits {
       // [per-token SF ] (16B aligned) (if needed)
       // [bias         ] (16B aligned) (if needed)
       //
-      // SMEM for smemA and smemB might be repurposed and used for gmemC0 and gmemC1:
+      // SMEM for smemA and smemB might be repurposed and used for gmemC0 and
+      // gmemC1:
       //
       // [..smemA..][..smemB..][..smemBShuffle..]
-      // [..gmemC0..][..gmemC1..][..rowMax..][..sliceK..][..per-token SF..][..bias..]
+      // [..gmemC0..][..gmemC1..][..rowMax..][..sliceK..][..per-token
+      // SF..][..bias..]
       //
 
       if (mMmaKind == tg::MmaKind::Auto) {
@@ -240,8 +244,8 @@ class KernelTraits {
 
       // SmemBShuffle
       // FIXME: we should be able either:
-      // - Do modification in-place. For that we need to resolve pipeline dependency between
-      // smemB -> shuffleSmemB -> mma
+      // - Do modification in-place. For that we need to resolve pipeline
+      // dependency between smemB -> shuffleSmemB -> mma
       // - Do 4 TMA SW32 loads or several LDGSTS loads.
       {
         // Number of bytes in save shuffled B in shared memory.
@@ -263,7 +267,8 @@ class KernelTraits {
       }
 
       // GmemC
-      // FIXME we might need to fix this for GemmGatedAct, it needs less SMEM to store gated output.
+      // FIXME we might need to fix this for GemmGatedAct, it needs less SMEM to
+      // store gated output.
       for (int resIdx = 0; resIdx < 2; ++resIdx) {
         // Type of the data in the SMEM for GmemC
         auto dtypeSmemC = dtypeC;
@@ -296,8 +301,9 @@ class KernelTraits {
         // Number of bytes for store C alignment for TMA store.
         auto const numBytesAlignmentStoreC = 1024;
         // gmemC reuses loadAb memory for split-K in DSMEM.
-        // Epilogue1 does not reuse and continues after the memory allocated Epilogue0
-        // NOTE: we can always reuse loadAb SMEM as long as we don't have persistent scheduler.
+        // Epilogue1 does not reuse and continues after the memory allocated
+        // Epilogue0 NOTE: we can always reuse loadAb SMEM as long as we don't
+        // have persistent scheduler.
 
         auto const reuseFirstChunksSmemStoreC =
             doesSplitKUseDsmem(splitK) && resIdx == 0 && !usePersistentScheduler;
@@ -362,28 +368,16 @@ class KernelTraits {
 
       // Per-token Scale Factors
       {
-        {
-          // Number of bytes for per-token scale factors
-          auto const numBytesSmemPerTokenSf = (usePerTokenSfA ? (tileM) * sizeof(float) : 0);
-          // Number of bytes alignment for per-token scale factors
-          auto const numBytesAlignmentPerTokenSf = 16;
-          // Add info.
-          smemChunkNames.emplace_back("smemPerTokenSfA");
-          numBytesAndAlignmentPerSmemChunk.emplace_back(
-              std::make_pair(numBytesSmemPerTokenSf, numBytesAlignmentPerTokenSf));
-          firstChunkReuseSmem.emplace_back(false);
-        }
-        {
-          // Number of bytes for per-token scale factors
-          auto const numBytesSmemPerTokenSf = (usePerTokenSfB ? (tileN) * sizeof(float) : 0);
-          // Number of bytes alignment for per-token scale factors
-          auto const numBytesAlignmentPerTokenSf = 16;
-          // Add info.
-          smemChunkNames.emplace_back("smemPerTokenSfB");
-          numBytesAndAlignmentPerSmemChunk.emplace_back(
-              std::make_pair(numBytesSmemPerTokenSf, numBytesAlignmentPerTokenSf));
-          firstChunkReuseSmem.emplace_back(false);
-        }
+        // Number of bytes for per-token scale factors
+        auto const numBytesSmemPerTokenSf = (usePerTokenSfA ? (tileM) * sizeof(float) : 0) +
+                                            (usePerTokenSfB ? (tileN) * sizeof(float) : 0);
+        // Number of bytes alignment for per-token scale factors
+        auto const numBytesAlignmentPerTokenSf = 16;
+        // Add info.
+        smemChunkNames.emplace_back("smemPerTokenSf");
+        numBytesAndAlignmentPerSmemChunk.emplace_back(
+            std::make_pair(numBytesSmemPerTokenSf, numBytesAlignmentPerTokenSf));
+        firstChunkReuseSmem.emplace_back(false);
       }
 
       // Bias
@@ -449,8 +443,7 @@ class KernelTraits {
       // Chunk 4 smemGmemC1: 65536 bytes, 1024 alignment, false, offset 65536
       // Chunk 5 smemRowMax: 512 bytes, 16 alignment, false, offset 131072
       // Chunk 6 smemSliceK: 0 bytes, 16 alignment, false, offset 131584
-      // Chunk 7 smemPerTokenSfA: 0 bytes, 16 alignment, false, offset 131584
-      // Chunk 8 smemPerTokenSfB: 0 bytes, 16 alignment, false, offset 131584
+      // Chunk 7 smemPerTokenSf: 0 bytes, 16 alignment, false, offset 131584
       mSmemAllocatorHelper.print();
 #endif
     }
@@ -566,7 +559,8 @@ class KernelTraits {
 
       // Sparsity info for A
       {
-        // Number of columns for the sparsity info for A (note: for Dense, this is 0).
+        // Number of columns for the sparsity info for A (note: for Dense, this
+        // is 0).
         auto const numTmemColsSparsityInfoA =
             numStages * tg::getNumBytesSparsityInfo(sparsityA, tileK) / 4 /* bytes */;
         // Number of columns for Sf alignment.
@@ -660,14 +654,8 @@ inline int32_t getSmemOffsetSliceK(KernelTraits traits) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-inline int32_t getSmemOffsetPerTokenSfA(KernelTraits traits) {
-  return traits.mSmemAllocatorHelper.getChunkOffsetByName("smemPerTokenSfA");
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-inline int32_t getSmemOffsetPerTokenSfB(KernelTraits traits) {
-  return traits.mSmemAllocatorHelper.getChunkOffsetByName("smemPerTokenSfB");
+inline int32_t getSmemOffsetPerTokenSf(KernelTraits traits) {
+  return traits.mSmemAllocatorHelper.getChunkOffsetByName("smemPerTokenSf");
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

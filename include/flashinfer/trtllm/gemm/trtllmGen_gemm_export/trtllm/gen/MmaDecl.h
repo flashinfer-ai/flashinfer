@@ -43,7 +43,8 @@ enum class MmaKind : uint32_t {
   // or dtypeA = dtypeB = Bfloat16 and dtypeD = [Fp32]
   // Corresponds to the kind::f16 of tcgen05.mma.
   Fp16 = 1,
-  // Supports dtypeA/B = [E4m3, E5m2, E2m3, E3m2, E2m1] and dtypeD = [Fp16, Fp32]
+  // Supports dtypeA/B = [E4m3, E5m2, E2m3, E3m2, E2m1] and dtypeD = [Fp16,
+  // Fp32]
   // Corresponds to the kind::f8f6f4 of tcgen05.mma.
   Fp8Fp6Fp4 = 2,
   // Supports dtypeA = dtypeB = [Int8, Uint8] and dtypeD = [Int32]
@@ -95,18 +96,14 @@ inline std::string mmaKindToString(MmaKind mmaKind) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Get the TMEM column stride per group.
-// A group is one or more MMA instructions that share the same TMEM columns.
-inline int32_t getTmemColStridePerGroup(int32_t mmaMn, int32_t mmaK,
-                                        [[maybe_unused]] int32_t kGroupSize) {
-  int32_t colStride = 2 * ceilDiv(mmaMn, 64);
+// Get the TMEM column stride per group (i.e. kGroupSize * blockSize K elements)
+inline int32_t getTmemColStridePerGroup(int32_t tileMn, int32_t mmaK, int32_t kGroupSize) {
+  int32_t colStride = 2 * ceilDiv(tileMn, 64);
   if (mmaK == 96) {
     colStride = std::max(4, colStride);
   }
   return colStride;
 }
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

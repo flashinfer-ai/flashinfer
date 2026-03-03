@@ -92,7 +92,7 @@ class ArtifactPath:
         "456b1ae890d436c794b17e4435b41b849d3e5950/batched_gemm-2a674db-3a84a12"
     )
     TRTLLM_GEN_GEMM: str = (
-        "1fddc48b7b48af33914d040051b3e2ee9ba4701e/gemm-145d1b1-9b113e3"
+        "a6abaccde860f1933d2ac7a2f73f581259e6fd97/gemm-b3c1646-8adb015"
     )
     CUDNN_SDPA: str = "a72d85b019dc125b9f711300cb989430f762f5a6/fmha/cudnn/"
     # For DEEPGEMM, we also need to update KernelMap.KERNEL_MAP_HASH in flashinfer/deep_gemm.py

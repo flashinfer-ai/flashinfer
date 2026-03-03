@@ -16,14 +16,14 @@
  */
 #pragma once
 
-#include <cassert>
 #include <cstring>
 #include <string>
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 //
-// Be careful when modifying this file as it is included by the generated kernels. For example, do
-// not add TLLM_CHECK_* constructs in this file. Thanks!
+// Be careful when modifying this file as it is included by the generated
+// kernels. For example, do not add TLLM_CHECK_* constructs in this file.
+// Thanks!
 //
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
