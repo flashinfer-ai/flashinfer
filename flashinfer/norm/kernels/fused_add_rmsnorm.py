@@ -273,7 +273,7 @@ class FusedAddRMSNormQuantKernel:
         mR: cute.Tensor,
         mW: cute.Tensor,
         M: Int32,
-        scale: Float32,
+        mS: cute.Tensor,
         eps: Float32,
         enable_pdl: cutlass.Constexpr[bool],
         stream,
@@ -286,9 +286,7 @@ class FusedAddRMSNormQuantKernel:
         tv_layout = cute.make_layout(tv_shape, stride=tv_stride)
         tiler_mn = (1, self.cols_per_tile)
 
-        self.kernel(
-            mY, mX, mR, mW, M, scale, eps, enable_pdl, tv_layout, tiler_mn
-        ).launch(
+        self.kernel(mY, mX, mR, mW, M, mS, eps, enable_pdl, tv_layout, tiler_mn).launch(
             grid=[M, 1, 1],
             block=[self.num_threads, 1, 1],
             smem=self._smem_size_in_bytes(),
@@ -304,7 +302,7 @@ class FusedAddRMSNormQuantKernel:
         mR: cute.Tensor,
         mW: cute.Tensor,
         M: Int32,
-        scale: Float32,
+        mS: cute.Tensor,
         eps: Float32,
         enable_pdl: cutlass.Constexpr[bool],
         tv_layout: cute.Layout,
@@ -325,7 +323,7 @@ class FusedAddRMSNormQuantKernel:
         vec_size = self.vec_size
         num_vec_blocks = self.num_vec_blocks
 
-        inv_scale = rcp_approx_ftz(scale)
+        inv_scale = rcp_approx_ftz(mS[0])
 
         smem = cutlass.utils.SmemAllocator()
         reduction_buffer = smem.allocate_tensor(
@@ -487,6 +485,7 @@ def _get_compiled_fused_add_rmsnorm_quant_kernel(
         dtype, (sym_m, H), (sym_row_stride_r, 1), assumed_align=16
     )
     w_fake = cute.runtime.make_fake_compact_tensor(dtype, (H,), assumed_align=16)
+    s_fake = cute.runtime.make_fake_compact_tensor(Float32, (1,), assumed_align=4)
 
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
@@ -497,7 +496,7 @@ def _get_compiled_fused_add_rmsnorm_quant_kernel(
         r_fake,
         w_fake,
         Int32(1),
-        Float32(1.0),  # scale
+        s_fake,
         Float32(1e-6),
         enable_pdl,
         stream_fake,
@@ -542,7 +541,7 @@ def fused_add_rmsnorm_quant_cute(
     input: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
-    scale: float,
+    scale: torch.Tensor,
     eps: float = 1e-6,
     weight_bias: float = 0.0,
     enable_pdl: bool = False,
