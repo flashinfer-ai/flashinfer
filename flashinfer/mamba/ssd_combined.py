@@ -27,9 +27,17 @@ from typing import Optional, Tuple
 import torch
 
 from ..api_logging import flashinfer_api
+from ..jit.mamba.seq_chunk_cumsum import gen_seq_chunk_cumsum_module
 from ..triton.kernels.ssd_chunk_state import chunk_cumsum_fwd
 
+import cuda.bindings.driver as cuda_drv
 from cutlass.base_dsl.compiler import GenerateLineInfo  # profiling
+
+
+@functools.cache
+def _get_seq_chunk_cumsum_module():
+    """Get cached seq_chunk_cumsum JIT module."""
+    return gen_seq_chunk_cumsum_module().build_and_load()
 
 
 def _import_cutlass_modules():
@@ -365,7 +373,8 @@ class _SSDKernel:
         hardware_info = cutlass.utils.HardwareInfo()
         max_active_clusters = hardware_info.get_max_active_clusters(1)
 
-        stream = cutlass.cuda.default_stream()
+        # stream = cutlass.cuda.default_stream()
+        stream = cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream)
 
         # Varlen metadata: tiny 1D int32 tensors, just wrap via from_dlpack
         seq_idx_tensor = None
@@ -386,20 +395,15 @@ class _SSDKernel:
             and chunk_indices is not None
             and chunk_offsets is not None
         ):
-            # num_seqs from init_states batch dim (already on host, no sync)
             num_seqs = init_states.shape[0] if init_states is not None else 1
-            # seq_id for each logical chunk (device ops, no host sync)
-            seq_ids = seq_idx[
-                0, chunk_indices.long() * chunk_size + chunk_offsets.long()
-            ]
-            counts = torch.zeros(num_seqs, dtype=torch.int32, device=seq_idx.device)
-            counts.scatter_add_(
-                0, seq_ids.int(), torch.ones_like(seq_ids, dtype=torch.int32)
-            )
+            num_logical_chunks_local = len(chunk_indices)
             seq_chunk_cumsum = torch.zeros(
                 num_seqs + 1, dtype=torch.int32, device=seq_idx.device
             )
-            torch.cumsum(counts.int(), dim=0, out=seq_chunk_cumsum[1:])
+            _get_seq_chunk_cumsum_module().seq_chunk_cumsum(
+                seq_idx, chunk_indices, chunk_offsets, seq_chunk_cumsum,
+                chunk_size, num_logical_chunks_local, num_seqs,
+            )
             seq_chunk_cumsum_tensor = from_dlpack(seq_chunk_cumsum, assumed_align=4)
 
         # Number of logical chunks (may differ from physical chunks for varlen)

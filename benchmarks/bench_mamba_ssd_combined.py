@@ -12,6 +12,7 @@ Usage:
     python benchmarks/bench_mamba_ssd_combined.py --varlen --batched
     python benchmarks/bench_mamba_ssd_combined.py --varlen --batch 4 --nchunks 8
     python benchmarks/bench_mamba_ssd_combined.py --ncu --batch 4 --nchunks 8
+    python benchmarks/bench_mamba_ssd_combined.py --prof --batch 4 --nchunks 8
 """
 
 import argparse
@@ -82,7 +83,7 @@ def make_batched_inputs(batch, nchunks, nheads, headdim, dstate, ngroups, chunk_
         D=D, dt_bias=dt_bias, dt_softplus=True,
         initial_states=initial_states,
     )
-    label = dict(col0=batch, nchunks=nchunks, seqlen=seqlen)
+    label = dict(col0=batch, chunks_per_seq=nchunks, nchunks=nchunks, seqlen=seqlen)
     return kwargs, label
 
 
@@ -121,7 +122,7 @@ def make_varlen_inputs(num_seqs, chunks_per_seq, nheads, headdim, dstate, ngroup
         cu_seqlens=cu_seqlens,
     )
     nchunks = total_seqlen // chunk_size
-    label = dict(col0=num_seqs, nchunks=nchunks, seqlen=total_seqlen)
+    label = dict(col0=num_seqs, chunks_per_seq=chunks_per_seq, nchunks=nchunks, seqlen=total_seqlen)
     return kwargs, label
 
 
@@ -204,10 +205,10 @@ def bench_mode(configs, mode, model_params, bench_params, title=None):
     col0_name = "num_seqs" if mode == "varlen" else "batch"
     print()
     print(
-        f"  {col0_name:<10} {'nchunks':<10} {'seqlen':<10} "
+        f"  {col0_name:<10} {'chunks/sequence':<18} {'total chunks':<14} {'total seqlen':<14} "
         f"{'FlashInfer (ms)':<18} {'Triton (ms)':<18} {'Speedup':<10}"
     )
-    print("  " + "-" * 76)
+    print("  " + "-" * 108)
 
     # Keys to strip per kernel per mode.
     # - FlashInfer doesn't accept cu_seqlens (varlen metadata is via seq_idx/chunk_indices/chunk_offsets)
@@ -236,7 +237,7 @@ def bench_mode(configs, mode, model_params, bench_params, title=None):
         speedup = tr_ms / fi_ms
 
         print(
-            f"  {label['col0']:<10} {label['nchunks']:<10} {label['seqlen']:<10} "
+            f"  {label['col0']:<10} {label['chunks_per_seq']:<18} {label['nchunks']:<14} {label['seqlen']:<14} "
             f"{fi_ms:<18.4f} {tr_ms:<18.4f} {speedup:<10.2f}x"
         )
 
@@ -325,6 +326,66 @@ def ncu_mode(args, model_params):
 
 
 # ---------------------------------------------------------------------------
+# torch.profiler mode — host-side overhead analysis
+# ---------------------------------------------------------------------------
+
+
+def profile_mode(args, model_params):
+    """Profile ssd_combined_fwd with torch.profiler to find host-side bottlenecks.
+
+    Writes traces to ./profiler_traces/ — view with:
+      - Perfetto UI: https://ui.perfetto.dev/ (drag-drop the .json file)
+      - TensorBoard: tensorboard --logdir=./profiler_traces
+    """
+    from torch.profiler import ProfilerActivity, profile, schedule
+
+    assert args.batch is not None and args.nchunks is not None, (
+        "--prof requires --batch and --nchunks"
+    )
+    p = model_params
+    kwargs, _ = make_batched_inputs(
+        args.batch, args.nchunks,
+        p["nheads"], p["headdim"], p["dstate"], p["ngroups"],
+        p["chunk_size"], p["dtype"],
+    )
+
+    warmup = args.warmup
+    active = args.repetitions or 3
+
+    print(f"  Profiler mode: batch={args.batch}, nchunks={args.nchunks}, "
+          f"seqlen={args.nchunks * p['chunk_size']}")
+    print(f"  Warmup: {warmup}, Active (profiled) iterations: {active}")
+
+    # Warmup (outside profiler to avoid capturing JIT compilation)
+    for _ in range(warmup):
+        ssd_combined_fwd(**kwargs)
+    torch.cuda.synchronize()
+    print("  Warmup done, starting profiler...")
+
+    # schedule: wait=0, warmup=0, active=N
+    # (real warmup already done above, so all profiler steps are active)
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        record_shapes=True,
+        with_stack=True,
+        schedule=schedule(wait=0, warmup=0, active=active, repeat=1),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler("./profiler_traces"),
+    ) as prof:
+        for _ in range(active):
+            ssd_combined_fwd(**kwargs)
+            torch.cuda.synchronize()
+            prof.step()
+
+    print()
+    print(prof.key_averages(group_by_stack_n=5).table(
+        sort_by="cpu_time_total", row_limit=30,
+    ))
+    print()
+    print("  Traces saved to ./profiler_traces/")
+    print("  View with: https://ui.perfetto.dev/ (drag-drop the .json file)")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -346,6 +407,7 @@ def main():
     parser.add_argument("--batch", type=int, default=None, help="Batch size (single-point or varlen num_seqs)")
     parser.add_argument("--nchunks", type=int, default=None, help="Number of chunks (or chunks_per_seq for varlen)")
     parser.add_argument("--ncu", action="store_true", help="NCU profiling mode: single kernel launch")
+    parser.add_argument("--prof", action="store_true", help="torch.profiler mode: host-side overhead analysis")
     args = parser.parse_args()
 
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
@@ -373,6 +435,11 @@ def main():
     # NCU mode
     if args.ncu:
         ncu_mode(args, model_params)
+        return
+
+    # Profiler mode
+    if args.prof:
+        profile_mode(args, model_params)
         return
 
     # Determine which modes to run
