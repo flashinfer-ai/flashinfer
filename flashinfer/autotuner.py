@@ -10,7 +10,6 @@ from functools import lru_cache
 from typing import Any, Callable, Dict, List, Set, Tuple, Union, Optional
 
 import torch
-from cuda.bindings import driver
 
 # from tensorrt_llm.bindings.internal.runtime import delay_kernel
 # from tensorrt_llm.logger import logger
@@ -889,37 +888,4 @@ class AutoTuner:
     def _get_l2_cache_size_in_bytes(self, device_id: Optional[int] = None) -> int:
         if device_id is None:
             device_id = torch.cuda.current_device()
-
-        device = self._checkCudaErrors(driver.cuDeviceGet(device_id))
-        return self._checkCudaErrors(
-            driver.cuDeviceGetAttribute(
-                driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE,
-                device,
-            )
-        )
-
-    def _checkCudaErrors(self, result) -> Any:
-        status = result[0]
-        if status != driver.CUresult.CUDA_SUCCESS:
-            code = getattr(status, "value", status)
-            raise RuntimeError(
-                f"CUDA error code={code}({self._cudaGetErrorEnum(status)})"
-            )
-        # CUDA APIs always return the status as the first element of the result tuple
-        if len(result) == 1:
-            return None
-        elif len(result) == 2:
-            return result[1]
-        else:
-            return result[1:]
-
-    def _cudaGetErrorEnum(self, error) -> str:
-        from cuda.bindings import nvrtc
-
-        if isinstance(error, driver.CUresult):
-            err, name = driver.cuGetErrorName(error)
-            return name if err == driver.CUresult.CUDA_SUCCESS else "<unknown>"
-        elif isinstance(error, nvrtc.nvrtcResult):
-            return nvrtc.nvrtcGetErrorString(error)[1]
-        else:
-            raise RuntimeError("Unknown error type: {}".format(error))
+        return torch.cuda.get_device_properties(device_id).L2_cache_size
