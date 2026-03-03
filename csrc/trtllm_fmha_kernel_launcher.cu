@@ -91,9 +91,7 @@ __global__ void sanitize_trtllm_swa_block_tables_kernel(
   }
 
   int64_t total_pages = (seq_len + page_size - 1) / page_size;
-  if (total_pages < 0) {
-    total_pages = 0;
-  } else if (total_pages > max_num_blocks_per_seq) {
+  if (total_pages > max_num_blocks_per_seq) {
     total_pages = max_num_blocks_per_seq;
   }
 
@@ -103,9 +101,7 @@ __global__ void sanitize_trtllm_swa_block_tables_kernel(
     in_window_tokens = 0;
   }
   int64_t in_window_pages = (in_window_tokens + page_size - 1) / page_size;
-  if (in_window_pages < 0) {
-    in_window_pages = 0;
-  } else if (in_window_pages > max_num_blocks_per_seq) {
+  if (in_window_pages > max_num_blocks_per_seq) {
     in_window_pages = max_num_blocks_per_seq;
   }
 
