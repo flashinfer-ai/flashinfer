@@ -84,8 +84,8 @@ def select_best_backend(head_dim: int, dtype: torch.dtype, preferred_backend: st
     from ..utils import is_sm90a_supported
     
     base_uri = _get_batch_be_module_uri(head_dim, dtype)
-    fa2_uri = base_uri + "_ragged_qoffset"
-    fa3_uri = base_uri + "_ragged_qoffset_fa3"
+    fa2_uri = base_uri + "_ragged_offset"
+    fa3_uri = base_uri + "_ragged_offset_fa3"
     
     fa2_aot, fa2_jit, _ = check_kernel_availability(fa2_uri)
     fa3_aot, fa3_jit, _ = check_kernel_availability(fa3_uri)
@@ -132,8 +132,8 @@ def select_best_backend_paged(head_dim: int, dtype: torch.dtype, preferred_backe
     from ..utils import is_sm90a_supported
     
     base_uri = _get_batch_be_module_uri(head_dim, dtype)
-    fa2_uri = base_uri + "_paged_qoffset"
-    fa3_uri = base_uri + "_paged_qoffset_fa3"
+    fa2_uri = base_uri + "_paged_offset"
+    fa3_uri = base_uri + "_paged_offset_fa3"
     
     fa2_aot, fa2_jit, _ = check_kernel_availability(fa2_uri)
     fa3_aot, fa3_jit, _ = check_kernel_availability(fa3_uri)
@@ -191,9 +191,9 @@ def _check_batch_be_aot_available(uri: str) -> bool:
     return _get_batch_be_aot_path(uri).exists()
 
 
-# FA2 QOffset Variant
-_BATCH_BE_QOFFSET_VARIANT_DECL = r"""
-struct BatchBlockExtendQOffsetAttention : AttentionVariantBase {
+# FA2 Offset Variant
+_BATCH_BE_OFFSET_VARIANT_DECL = r"""
+struct BatchBlockExtendOffsetAttention : AttentionVariantBase {
   static constexpr bool use_softmax = true;
 
   uint32_t qo_len;
@@ -202,7 +202,7 @@ struct BatchBlockExtendQOffsetAttention : AttentionVariantBase {
   float sm_scale_log2;
 
   template <typename Params>
-  __device__ __host__ BatchBlockExtendQOffsetAttention(const Params& params, uint32_t batch_idx,
+  __device__ __host__ BatchBlockExtendOffsetAttention(const Params& params, uint32_t batch_idx,
                                                            uint8_t* smem_ptr) {
     qo_len = params.get_qo_len(batch_idx);
     kv_len = params.get_kv_len(batch_idx);
@@ -220,13 +220,13 @@ struct BatchBlockExtendQOffsetAttention : AttentionVariantBase {
 };
 """
 
-# FA3 QOffset Variant
-_BATCH_BE_QOFFSET_VARIANT_DECL_FA3 = r"""
-struct BatchBlockExtendQOffsetAttentionFA3 : AttentionVariantBase {
+# FA3 Offset Variant
+_BATCH_BE_OFFSET_VARIANT_DECL_FA3 = r"""
+struct BatchBlockExtendOffsetAttentionFA3 : AttentionVariantBase {
   float sm_scale_log2;
 
   template <typename MainloopParams, typename BlockCoord>
-  __device__ __host__ BatchBlockExtendQOffsetAttentionFA3(
+  __device__ __host__ BatchBlockExtendOffsetAttentionFA3(
       const MainloopParams& params, const BlockCoord& block_coord) {
     sm_scale_log2 = params.additional_params.sm_scale * math::log2e;
   }
@@ -289,13 +289,13 @@ class BatchBlockExtendPagedOffsetWrapper:
             self._backend = effective_backend
         
         if self._backend == "fa3":
-            uri = _get_batch_be_module_uri(head_dim, dtype) + "_paged_qoffset_fa3"
-            variant_name = "BatchBlockExtendQOffsetAttentionFA3"
-            variant_decl = _BATCH_BE_QOFFSET_VARIANT_DECL_FA3
+            uri = _get_batch_be_module_uri(head_dim, dtype) + "_paged_offset_fa3"
+            variant_name = "BatchBlockExtendOffsetAttentionFA3"
+            variant_decl = _BATCH_BE_OFFSET_VARIANT_DECL_FA3
         else:
-            uri = _get_batch_be_module_uri(head_dim, dtype) + "_paged_qoffset"
-            variant_name = "BatchBlockExtendQOffsetAttention"
-            variant_decl = _BATCH_BE_QOFFSET_VARIANT_DECL
+            uri = _get_batch_be_module_uri(head_dim, dtype) + "_paged_offset"
+            variant_name = "BatchBlockExtendOffsetAttention"
+            variant_decl = _BATCH_BE_OFFSET_VARIANT_DECL
         
         jit_args = [
             uri, dtype, dtype, dtype, idtype, head_dim, head_dim,
@@ -424,13 +424,13 @@ class BatchBlockExtendRaggedOffsetWrapper:
             self._backend = effective_backend
         
         if self._backend == "fa3":
-            uri = _get_batch_be_module_uri(head_dim, dtype) + "_ragged_qoffset_fa3"
-            variant_name = "BatchBlockExtendQOffsetAttentionFA3"
-            variant_decl = _BATCH_BE_QOFFSET_VARIANT_DECL_FA3
+            uri = _get_batch_be_module_uri(head_dim, dtype) + "_ragged_offset_fa3"
+            variant_name = "BatchBlockExtendOffsetAttentionFA3"
+            variant_decl = _BATCH_BE_OFFSET_VARIANT_DECL_FA3
         else:
-            uri = _get_batch_be_module_uri(head_dim, dtype) + "_ragged_qoffset"
-            variant_name = "BatchBlockExtendQOffsetAttention"
-            variant_decl = _BATCH_BE_QOFFSET_VARIANT_DECL
+            uri = _get_batch_be_module_uri(head_dim, dtype) + "_ragged_offset"
+            variant_name = "BatchBlockExtendOffsetAttention"
+            variant_decl = _BATCH_BE_OFFSET_VARIANT_DECL
         
         jit_args = [
             uri, dtype, dtype, dtype, idtype, head_dim, head_dim,

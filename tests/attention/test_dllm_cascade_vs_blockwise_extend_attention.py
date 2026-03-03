@@ -30,7 +30,7 @@ from flashinfer import (
 from flashinfer.dllm import (
     BatchBlockExtendPagedOffsetWrapper,
     BatchBlockExtendRaggedOffsetWrapper,
-    block_extend_attention_v2_with_offset,
+    block_extend_attention_with_offset,
 )
 
 
@@ -873,7 +873,7 @@ def test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
       每个 step: 2-3 kernel launches
     
     对比方案:
-      1. block_extend_attention_v2_with_offset + CUDA Graph
+      1. block_extend_attention_with_offset + CUDA Graph
       2. BatchBlockExtendRaggedOffsetWrapper + CUDA Graph
       每个 step: 1 kernel launch
     """
@@ -948,13 +948,14 @@ def test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
     v2_outputs = []
     for step_idx in range(num_chunks):
         q_offset = step_idx * baseline_chunk_size
-        v2_out = block_extend_attention_v2_with_offset(
+        v2_out = block_extend_attention_with_offset(
             qs_chunks[step_idx],
             k_cumul_list[step_idx],
             v_cumul_list[step_idx],
             dllm_block_size=dllm_block_size,
             q_offset=q_offset,
             sm_scale=sm_scale,
+            backend="fa2",
         )
         v2_outputs.append(v2_out)
     
@@ -962,7 +963,7 @@ def test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
     v2_max_diff = max((v2_outputs[i] - ref_outputs[i]).abs().max().item() for i in range(num_chunks))
     tol = 1e-3
     v2_pass = v2_max_diff < tol
-    print(f"\n  [V2] block_extend_attention_v2_with_offset:")
+    print(f"\n  [V2] block_extend_attention_with_offset:")
     print(f"       max_diff = {v2_max_diff:.6f}, tolerance = {tol}")
     print(f"       {' PASS' if v2_pass else ' FAIL'}")
     
@@ -1336,7 +1337,7 @@ def test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
     del cascade_wrappers_current, cascade_wrappers_prefix, cascade_graph
     torch.cuda.empty_cache()
 
-    # 方案 1: block_extend_attention_v2_with_offset + CUDA Graph
+    # 方案 1: block_extend_attention_with_offset + CUDA Graph
     for test_chunk_size in chunk_sizes:
         if tokens_per_request % test_chunk_size != 0:
             print(f"\n[跳过] chunk_size={test_chunk_size} 无法整除 tokens_per_request={tokens_per_request}")
@@ -1345,7 +1346,7 @@ def test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
         num_steps = tokens_per_request // test_chunk_size
         
         print(f"\n{'-'*60}")
-        print(f"[V2] block_extend_attention_v2_with_offset (chunk_size={test_chunk_size})")
+        print(f"[V2] block_extend_attention_with_offset (chunk_size={test_chunk_size})")
         print(f"{'-'*60}")
         print(f"  num_steps: {num_steps} (比 Baseline 少 {num_chunks - num_steps} 步)")
         print(f"  每个 step 内 kernel: 1 次")
@@ -1362,11 +1363,12 @@ def test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
         
         def run_v2_pipeline():
             for step_idx in range(num_steps):
-                v2_output.copy_(block_extend_attention_v2_with_offset(
+                v2_output.copy_(block_extend_attention_with_offset(
                     qs_v2[step_idx], k_cumul_v2[step_idx], v_cumul_v2[step_idx],
                     dllm_block_size=dllm_block_size,
                     q_offset=step_idx * test_chunk_size,
                     sm_scale=sm_scale,
+                    backend="fa2",
                 ))
         
         # 显示 step 流程
@@ -2014,7 +2016,7 @@ def test_dllm_precision_vs_custom_mask_fa2(
     被测对象 (第31-33行导入的三个 DLLM 组件):
       1. BatchBlockExtendRaggedOffsetWrapper
       2. BatchBlockExtendPagedOffsetWrapper  
-      3. block_extend_attention_v2_with_offset
+      3. block_extend_attention_with_offset
     
     测试覆盖:
       - 数据类型: fp16, bf16
@@ -2136,7 +2138,7 @@ def test_dllm_precision_vs_custom_mask_fa2(
         print(f"被测对象:")
         print(f"  1. BatchBlockExtendRaggedOffsetWrapper (batch_size=1) - FA2 后端")
         print(f"  2. BatchBlockExtendRaggedOffsetWrapper (batch_size=1) - FA3 后端")
-        print(f"  3. block_extend_attention_v2_with_offset")
+        print(f"  3. block_extend_attention_with_offset")
         
         single_req_results = []
         
@@ -2214,12 +2216,13 @@ def test_dllm_precision_vs_custom_mask_fa2(
                 
                 del workspace, wrapper
 
-            # 被测 3: block_extend_attention_v2_with_offset
-            v2_output = block_extend_attention_v2_with_offset(
+            # 被测 3: block_extend_attention_with_offset (backend="fa2")
+            v2_output = block_extend_attention_with_offset(
                 q, k, v,
                 dllm_block_size=dllm_block_size,
                 q_offset=q_offset,
                 sm_scale=sm_scale,
+                backend="fa2",
             )
             
             # 计算 V2 精度差异
@@ -2263,7 +2266,7 @@ def test_dllm_precision_vs_custom_mask_fa2(
         v2_pass_count = sum(1 for r in single_req_results if r["v2_pass"])
         v2_max_diff_all = max(r["v2_max_diff"] for r in single_req_results)
         v2_mean_diff_all = sum(r["v2_mean_diff"] for r in single_req_results) / total_tests
-        print(f"  block_extend_attention_v2_with_offset: {v2_pass_count}/{total_tests} PASS")
+        print(f"  block_extend_attention_with_offset: {v2_pass_count}/{total_tests} PASS")
         print(f"    max_diff (all tests): {v2_max_diff_all:.6f}")
         print(f"    mean_diff (avg):      {v2_mean_diff_all:.6f}")
         

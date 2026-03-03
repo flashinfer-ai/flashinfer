@@ -94,8 +94,8 @@ from .dllm.block_extend import (
     _get_module_uri_with_offset,
 )
 from .dllm.batch_block_extend import (
-    _BATCH_BE_QOFFSET_VARIANT_DECL,
-    _BATCH_BE_QOFFSET_VARIANT_DECL_FA3,
+    _BATCH_BE_OFFSET_VARIANT_DECL,
+    _BATCH_BE_OFFSET_VARIANT_DECL_FA3,
     _get_batch_be_module_uri,
 )
 
@@ -124,15 +124,15 @@ def gen_dllm_batch_block_extend(
     """
     from .jit.attention import gen_customize_batch_prefill_module
     
-    # FA2 QOffset variants (兼容所有架构)
+    # FA2 Offset variants (兼容所有架构)
     for dtype in f16_dtype_:
         for head_dim_qk, head_dim_vo in fa2_head_dim_:
             base_uri = _get_batch_be_module_uri(head_dim_qk, dtype)
             
-            # FA2 QOffset Paged
+            # FA2 Offset Paged
             yield gen_customize_batch_prefill_module(
                 backend="fa2",
-                uri=base_uri + "_paged_qoffset",
+                uri=base_uri + "_paged_offset",
                 dtype_q=dtype, dtype_kv=dtype, dtype_o=dtype,
                 idtype=torch.int32,
                 head_dim_qk=head_dim_qk, head_dim_vo=head_dim_vo,
@@ -140,15 +140,15 @@ def gen_dllm_batch_block_extend(
                 additional_tensor_dtypes=["int32_t", "int32_t"],
                 additional_scalar_names=["sm_scale", "dllm_block_size"],
                 additional_scalar_dtypes=["double", "int64_t"],
-                variant_name="BatchBlockExtendQOffsetAttention",
-                variant_decl=_BATCH_BE_QOFFSET_VARIANT_DECL,
+                variant_name="BatchBlockExtendOffsetAttention",
+                variant_decl=_BATCH_BE_OFFSET_VARIANT_DECL,
                 mask_modes=[4],
             )
             
-            # FA2 QOffset Ragged
+            # FA2 Offset Ragged
             yield gen_customize_batch_prefill_module(
                 backend="fa2",
-                uri=base_uri + "_ragged_qoffset",
+                uri=base_uri + "_ragged_offset",
                 dtype_q=dtype, dtype_kv=dtype, dtype_o=dtype,
                 idtype=torch.int32,
                 head_dim_qk=head_dim_qk, head_dim_vo=head_dim_vo,
@@ -156,12 +156,12 @@ def gen_dllm_batch_block_extend(
                 additional_tensor_dtypes=["int32_t", "int32_t"],
                 additional_scalar_names=["sm_scale", "dllm_block_size"],
                 additional_scalar_dtypes=["double", "int64_t"],
-                variant_name="BatchBlockExtendQOffsetAttention",
-                variant_decl=_BATCH_BE_QOFFSET_VARIANT_DECL,
+                variant_name="BatchBlockExtendOffsetAttention",
+                variant_decl=_BATCH_BE_OFFSET_VARIANT_DECL,
                 mask_modes=[4],
             )
     
-    # FA3 QOffset variants (仅 Hopper SM90)
+    # FA3 Offset variants (仅 Hopper SM90)
     if not has_sm90:
         return
     
@@ -169,10 +169,10 @@ def gen_dllm_batch_block_extend(
         for head_dim_qk, head_dim_vo in fa3_head_dim_:
             base_uri = _get_batch_be_module_uri(head_dim_qk, dtype)
             
-            # FA3 QOffset Paged
+            # FA3 Offset Paged
             yield gen_customize_batch_prefill_module(
                 backend="fa3",
-                uri=base_uri + "_paged_qoffset_fa3",
+                uri=base_uri + "_paged_offset_fa3",
                 dtype_q=dtype, dtype_kv=dtype, dtype_o=dtype,
                 idtype=torch.int32,
                 head_dim_qk=head_dim_qk, head_dim_vo=head_dim_vo,
@@ -180,15 +180,15 @@ def gen_dllm_batch_block_extend(
                 additional_tensor_dtypes=["int32_t", "int32_t"],
                 additional_scalar_names=["sm_scale", "dllm_block_size"],
                 additional_scalar_dtypes=["double", "int64_t"],
-                variant_name="BatchBlockExtendQOffsetAttentionFA3",
-                variant_decl=_BATCH_BE_QOFFSET_VARIANT_DECL_FA3,
+                variant_name="BatchBlockExtendOffsetAttentionFA3",
+                variant_decl=_BATCH_BE_OFFSET_VARIANT_DECL_FA3,
                 mask_modes=[4],
             )
             
-            # FA3 QOffset Ragged
+            # FA3 Offset Ragged
             yield gen_customize_batch_prefill_module(
                 backend="fa3",
-                uri=base_uri + "_ragged_qoffset_fa3",
+                uri=base_uri + "_ragged_offset_fa3",
                 dtype_q=dtype, dtype_kv=dtype, dtype_o=dtype,
                 idtype=torch.int32,
                 head_dim_qk=head_dim_qk, head_dim_vo=head_dim_vo,
@@ -196,8 +196,8 @@ def gen_dllm_batch_block_extend(
                 additional_tensor_dtypes=["int32_t", "int32_t"],
                 additional_scalar_names=["sm_scale", "dllm_block_size"],
                 additional_scalar_dtypes=["double", "int64_t"],
-                variant_name="BatchBlockExtendQOffsetAttentionFA3",
-                variant_decl=_BATCH_BE_QOFFSET_VARIANT_DECL_FA3,
+                variant_name="BatchBlockExtendOffsetAttentionFA3",
+                variant_decl=_BATCH_BE_OFFSET_VARIANT_DECL_FA3,
                 mask_modes=[4],
             )
 

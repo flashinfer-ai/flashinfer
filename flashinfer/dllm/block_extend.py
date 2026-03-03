@@ -150,16 +150,6 @@ def _get_module_uri_with_offset(head_dim: int, dtype: torch.dtype, backend: str)
     return f"block_expanding_{backend}_with_offset_v2_hdim{head_dim}_{_get_dtype_str(dtype)}"
 
 
-def _get_module_uri_v2_with_offset(head_dim: int, dtype: torch.dtype) -> str:
-    """生成 V2 (FA2) with offset 模块的唯一标识符"""
-    return _get_module_uri_with_offset(head_dim, dtype, "fa2")
-
-
-def _get_module_uri_v3_with_offset(head_dim: int, dtype: torch.dtype) -> str:
-    """生成 V3 (FA3) with offset 模块的唯一标识符"""
-    return _get_module_uri_with_offset(head_dim, dtype, "fa3")
-
-
 # ════════════════════════════════════════════════════════════════════════════════════
 # 模块缓存
 # ════════════════════════════════════════════════════════════════════════════════════
@@ -378,37 +368,6 @@ def block_extend_attention_with_offset(
         kv_offset,
         mask_mode=MaskMode.BLOCK_EXPANDING.value,
         return_lse=return_lse,
-    )
-
-
-def block_extend_attention_v2_with_offset(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    dllm_block_size: int,
-    q_offset: int = 0,
-    kv_offset: int = 0,
-    sm_scale: Optional[float] = None,
-    return_lse: bool = False,
-) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    """[Deprecated] Use block_extend_attention_with_offset(backend='fa2') instead."""
-    return block_extend_attention_with_offset(
-        q, k, v, dllm_block_size, q_offset, kv_offset, sm_scale, return_lse, backend="fa2"
-    )
-
-def block_extend_attention_v3_with_offset(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    dllm_block_size: int,
-    q_offset: int = 0,
-    kv_offset: int = 0,
-    sm_scale: Optional[float] = None,
-    return_lse: bool = False,
-) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    """[Deprecated] Use block_extend_attention_with_offset(backend='fa3') instead."""
-    return block_extend_attention_with_offset(
-        q, k, v, dllm_block_size, q_offset, kv_offset, sm_scale, return_lse, backend="fa3"
     )
 
 
