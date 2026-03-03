@@ -47,7 +47,7 @@ template <typename BlockT, typename SeqLenT>
 __global__ void sanitize_trtllm_swa_block_tables_kernel(
     BlockT* block_tables, const SeqLenT* seq_lens, const int32_t* cum_seq_lens_q,
     int64_t batch_size, int64_t max_num_blocks_per_seq, int64_t max_q_len, int64_t page_size,
-    int64_t window_left, int64_t num_pages_in_mem_pool) {
+    int64_t window_left, int64_t num_pages_in_mem_pool, int64_t cum_seq_lens_q_size) {
   const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const int64_t total_elems = batch_size * max_num_blocks_per_seq;
   if (idx >= total_elems) {
@@ -65,7 +65,7 @@ __global__ void sanitize_trtllm_swa_block_tables_kernel(
   // For multi-token queries, preserve every page needed by any token in the
   // sequence. If query lengths are ragged, derive q_len from cum_seq_lens_q.
   int64_t q_len = max_q_len;
-  if (cum_seq_lens_q != nullptr) {
+  if (cum_seq_lens_q != nullptr && row + 1 < cum_seq_lens_q_size) {
     q_len =
         static_cast<int64_t>(cum_seq_lens_q[row + 1]) - static_cast<int64_t>(cum_seq_lens_q[row]);
   }
@@ -116,7 +116,7 @@ void sanitize_trtllm_swa_block_tables_inplace(BlockT* block_tables_ptr, const Se
                                               int64_t max_num_blocks_per_seq, int64_t max_kv_len,
                                               int64_t max_q_len, int64_t page_size,
                                               int64_t window_left, int64_t num_pages_in_mem_pool,
-                                              cudaStream_t stream) {
+                                              int64_t cum_seq_lens_q_size, cudaStream_t stream) {
   if (window_left < 0 || page_size <= 0 || batch_size <= 0 || max_num_blocks_per_seq <= 0) {
     return;
   }
@@ -132,33 +132,34 @@ void sanitize_trtllm_swa_block_tables_inplace(BlockT* block_tables_ptr, const Se
   int blocks = static_cast<int>((total_elems + kThreads - 1) / kThreads);
   sanitize_trtllm_swa_block_tables_kernel<<<blocks, kThreads, 0, stream>>>(
       block_tables_ptr, seq_lens_ptr, cum_seq_lens_q_ptr, batch_size, max_num_blocks_per_seq,
-      max_q_len, page_size, window_left, num_pages_in_mem_pool);
+      max_q_len, page_size, window_left, num_pages_in_mem_pool, cum_seq_lens_q_size);
   FLASHINFER_CUDA_CHECK(cudaGetLastError());
 }
 
 void maybe_sanitize_trtllm_swa_block_tables_inplace(
     TensorView block_tables, TensorView seq_lens, const int32_t* cum_seq_lens_q_ptr,
-    int64_t batch_size, int64_t max_num_blocks_per_seq, int64_t max_kv_len, int64_t max_q_len,
-    int64_t page_size, int64_t window_left, int64_t num_pages_in_mem_pool, cudaStream_t stream) {
+    int64_t cum_seq_lens_q_size, int64_t batch_size, int64_t max_num_blocks_per_seq,
+    int64_t max_kv_len, int64_t max_q_len, int64_t page_size, int64_t window_left,
+    int64_t num_pages_in_mem_pool, cudaStream_t stream) {
   if (block_tables.dtype() == dl_int32 && seq_lens.dtype() == dl_int32) {
     sanitize_trtllm_swa_block_tables_inplace<int32_t, int32_t>(
         static_cast<int32_t*>(block_tables.data_ptr()), static_cast<int32_t*>(seq_lens.data_ptr()),
         cum_seq_lens_q_ptr, batch_size, max_num_blocks_per_seq, max_kv_len, max_q_len, page_size,
-        window_left, num_pages_in_mem_pool, stream);
+        window_left, num_pages_in_mem_pool, cum_seq_lens_q_size, stream);
     return;
   }
   if (block_tables.dtype() == dl_int32 && seq_lens.dtype() == dl_uint32) {
     sanitize_trtllm_swa_block_tables_inplace<int32_t, uint32_t>(
         static_cast<int32_t*>(block_tables.data_ptr()), static_cast<uint32_t*>(seq_lens.data_ptr()),
         cum_seq_lens_q_ptr, batch_size, max_num_blocks_per_seq, max_kv_len, max_q_len, page_size,
-        window_left, num_pages_in_mem_pool, stream);
+        window_left, num_pages_in_mem_pool, cum_seq_lens_q_size, stream);
     return;
   }
   if (block_tables.dtype() == dl_uint32 && seq_lens.dtype() == dl_int32) {
     sanitize_trtllm_swa_block_tables_inplace<uint32_t, int32_t>(
         static_cast<uint32_t*>(block_tables.data_ptr()), static_cast<int32_t*>(seq_lens.data_ptr()),
         cum_seq_lens_q_ptr, batch_size, max_num_blocks_per_seq, max_kv_len, max_q_len, page_size,
-        window_left, num_pages_in_mem_pool, stream);
+        window_left, num_pages_in_mem_pool, cum_seq_lens_q_size, stream);
     return;
   }
   if (block_tables.dtype() == dl_uint32 && seq_lens.dtype() == dl_uint32) {
@@ -166,7 +167,7 @@ void maybe_sanitize_trtllm_swa_block_tables_inplace(
         static_cast<uint32_t*>(block_tables.data_ptr()),
         static_cast<uint32_t*>(seq_lens.data_ptr()), cum_seq_lens_q_ptr, batch_size,
         max_num_blocks_per_seq, max_kv_len, max_q_len, page_size, window_left,
-        num_pages_in_mem_pool, stream);
+        num_pages_in_mem_pool, cum_seq_lens_q_size, stream);
     return;
   }
   FLASHINFER_ERROR("Unsupported block_tables/seq_lens dtype combination for SWA sanitization.");
@@ -368,11 +369,9 @@ void trtllm_paged_attention_decode(
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
   TVM_FFI_ICHECK_EQ(block_tables.ndim(), 2) << "block_tables must be a 2D tensor";
-  TVM_FFI_ICHECK(block_tables.dtype() == dl_int32 || block_tables.dtype() == dl_uint32)
-      << "block_tables must be int32 or uint32";
+  TVM_FFI_ICHECK_EQ(block_tables.dtype(), dl_int32) << "block_tables must be int32";
   TVM_FFI_ICHECK_EQ(seq_lens.ndim(), 1) << "seq_lens must be a 1D tensor";
-  TVM_FFI_ICHECK(seq_lens.dtype() == dl_int32 || seq_lens.dtype() == dl_uint32)
-      << "seq_lens must be int32 or uint32";
+  TVM_FFI_ICHECK_EQ(seq_lens.dtype(), dl_int32) << "seq_lens must be int32";
   TVM_FFI_ICHECK_EQ(block_tables.size(0), seq_lens.size(0))
       << "block_tables batch size must match seq_lens batch size";
   TVM_FFI_ICHECK_GE(window_left, -1) << "window_left must be >= -1";
@@ -385,6 +384,14 @@ void trtllm_paged_attention_decode(
   int num_qo_heads = query.size(1);
   // the cum_seq_lens_q is optional, and can be nullptr when all sequences have the same query
   // length
+  int64_t cum_seq_lens_q_size = 0;
+  if (cum_seq_lens_q.has_value()) {
+    TVM_FFI_ICHECK_EQ(cum_seq_lens_q.value().ndim(), 1) << "cum_seq_lens_q must be a 1D tensor";
+    TVM_FFI_ICHECK_EQ(cum_seq_lens_q.value().dtype(), dl_int32) << "cum_seq_lens_q must be int32";
+    TVM_FFI_ICHECK_EQ(cum_seq_lens_q.value().size(0), batch_size + 1)
+        << "cum_seq_lens_q size must be batch_size + 1";
+    cum_seq_lens_q_size = cum_seq_lens_q.value().size(0);
+  }
   int* cum_seq_lens_q_ptr =
       cum_seq_lens_q.has_value() ? static_cast<int*>(cum_seq_lens_q.value().data_ptr()) : nullptr;
   // Multiply by two for FP4 tensor as it is stored as UINT8 dtype. Assume the dim is even.
@@ -449,8 +456,9 @@ void trtllm_paged_attention_decode(
   bool const skips_softmax = skip_softmax_threshold_scale_factor_value != 0.0f;
 
   maybe_sanitize_trtllm_swa_block_tables_inplace(
-      block_tables, seq_lens, cum_seq_lens_q_ptr, batch_size, max_num_blocks_per_seq, max_kv_len,
-      max_q_len, page_size, window_left, num_pages_in_mem_pool, stream);
+      block_tables, seq_lens, cum_seq_lens_q_ptr, cum_seq_lens_q_size, batch_size,
+      max_num_blocks_per_seq, max_kv_len, max_q_len, page_size, window_left, num_pages_in_mem_pool,
+      stream);
 
   trtllm_paged_attention_launcher(
       out.data_ptr(), output_sf_ptr, query.data_ptr(), key_cache.data_ptr(), value_cache.data_ptr(),
@@ -478,14 +486,16 @@ void trtllm_paged_attention_context(
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
   TVM_FFI_ICHECK_EQ(block_tables.ndim(), 2) << "block_tables must be a 2D tensor";
-  TVM_FFI_ICHECK(block_tables.dtype() == dl_int32 || block_tables.dtype() == dl_uint32)
-      << "block_tables must be int32 or uint32";
+  TVM_FFI_ICHECK_EQ(block_tables.dtype(), dl_int32) << "block_tables must be int32";
   TVM_FFI_ICHECK_EQ(seq_lens.ndim(), 1) << "seq_lens must be a 1D tensor";
-  TVM_FFI_ICHECK(seq_lens.dtype() == dl_int32 || seq_lens.dtype() == dl_uint32)
-      << "seq_lens must be int32 or uint32";
+  TVM_FFI_ICHECK_EQ(seq_lens.dtype(), dl_int32) << "seq_lens must be int32";
   TVM_FFI_ICHECK_EQ(block_tables.size(0), seq_lens.size(0))
       << "block_tables batch size must match seq_lens batch size";
   TVM_FFI_ICHECK_GE(window_left, -1) << "window_left must be >= -1";
+  TVM_FFI_ICHECK_EQ(cum_seq_lens_q.ndim(), 1) << "cum_seq_lens_q must be a 1D tensor";
+  TVM_FFI_ICHECK_EQ(cum_seq_lens_q.dtype(), dl_int32) << "cum_seq_lens_q must be int32";
+  TVM_FFI_ICHECK_EQ(cum_seq_lens_q.size(0), batch_size + 1)
+      << "cum_seq_lens_q size must be batch_size + 1";
   auto o_data_type = dl_dtype_to_tllm_data_type(out.dtype());
   int num_qo_heads = query.size(1);
   int sum_seq_q = query.size(0);
@@ -552,9 +562,9 @@ void trtllm_paged_attention_context(
   bool const skips_softmax = skip_softmax_threshold_scale_factor_value != 0.0f;
 
   maybe_sanitize_trtllm_swa_block_tables_inplace(
-      block_tables, seq_lens, static_cast<int32_t*>(cum_seq_lens_q.data_ptr()), batch_size,
-      max_num_blocks_per_seq, max_kv_len, max_q_len, page_size, window_left, num_pages_in_mem_pool,
-      stream);
+      block_tables, seq_lens, static_cast<int32_t*>(cum_seq_lens_q.data_ptr()),
+      cum_seq_lens_q.size(0), batch_size, max_num_blocks_per_seq, max_kv_len, max_q_len, page_size,
+      window_left, num_pages_in_mem_pool, stream);
 
   trtllm_paged_attention_launcher(
       out.data_ptr(), output_sf_ptr, query.data_ptr(), key_cache.data_ptr(), value_cache.data_ptr(),
