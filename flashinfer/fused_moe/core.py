@@ -1112,6 +1112,8 @@ def get_trtllm_moe_sm100_module():
                 moe_op.trtllm_bf16_moe(
                     routing_logits,
                     kwargs["routing_bias"],
+                    topk_ids,
+                    expert_weights,
                     hidden_states,
                     kwargs["gemm1_weights"],
                     kwargs["gemm2_weights"],
@@ -1314,8 +1316,10 @@ def get_trtllm_moe_sm100_module():
         mutates_args=(""),
     )
     def trtllm_bf16_moe_op(
-        routing_logits: torch.Tensor,
+        routing_logits: Optional[torch.Tensor],
         routing_bias: Optional[torch.Tensor],
+        topk_ids: Optional[torch.Tensor],
+        expert_weights: Optional[torch.Tensor],
         hidden_states: torch.Tensor,
         gemm1_weights: torch.Tensor,
         gemm2_weights: torch.Tensor,
@@ -1334,6 +1338,9 @@ def get_trtllm_moe_sm100_module():
         enable_pdl: Optional[bool] = None,
         tune_max_num_tokens: int = 8192,
     ) -> List[torch.Tensor]:
+        assert routing_logits is not None or topk_ids is not None, (
+            "either routing_logits or topk_ids must be provided"
+        )
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
 
@@ -1348,12 +1355,22 @@ def get_trtllm_moe_sm100_module():
         output = torch.empty(
             num_tokens, hidden_size, dtype=torch.bfloat16, device=hidden_states.device
         )
-        topk_ids = torch.empty(
-            num_tokens, top_k, dtype=torch.int32, device=hidden_states.device
-        )
-        expert_weights = torch.empty(
-            num_tokens, top_k, dtype=routing_logits.dtype, device=hidden_states.device
-        )
+        if routing_logits is not None:
+            # When routing_logits is provided, we must pass topk_ids/expert_weights with no allocation
+            topk_ids = torch.empty(0, dtype=torch.int32, device=hidden_states.device)
+            expert_weights = torch.empty(
+                0, dtype=routing_logits.dtype, device=hidden_states.device
+            )
+        else:
+            # When routing_logits is provided, we either have topk_ids/expert_weights,
+            # packed into a single tensor as topk_id
+            # or have them individually as topk_ids and expert_weights respectively
+            topk_ids = topk_ids
+            expert_weights = (
+                expert_weights
+                if expert_weights is not None
+                else torch.empty(0, dtype=torch.bfloat16, device=hidden_states.device)
+            )
 
         dtype_act = DtypeTrtllmGen.Bfloat16
         dtype_weights = DtypeTrtllmGen.Bfloat16
@@ -1398,6 +1415,8 @@ def get_trtllm_moe_sm100_module():
         intermediate_output = moe_op.trtllm_bf16_moe(
             routing_logits,
             routing_bias,
+            topk_ids,
+            expert_weights,
             hidden_states,
             gemm1_weights,
             gemm2_weights,
@@ -1428,8 +1447,10 @@ def get_trtllm_moe_sm100_module():
 
     @register_fake_op("flashinfer::trtllm_bf16_moe")
     def _fake_trtllm_bf16_moe(
-        routing_logits: torch.Tensor,
+        routing_logits: Optional[torch.Tensor],
         routing_bias: Optional[torch.Tensor],
+        expert_indices: Optional[torch.Tensor],
+        expert_weights: Optional[torch.Tensor],
         hidden_states: torch.Tensor,
         gemm1_weights: torch.Tensor,
         gemm2_weights: torch.Tensor,
@@ -2279,6 +2300,102 @@ def trtllm_bf16_moe(
     result = get_trtllm_moe_sm100_module().trtllm_bf16_moe(
         routing_logits,
         routing_bias,
+        None,
+        None,
+        hidden_states,
+        gemm1_weights,
+        gemm2_weights,
+        num_experts,
+        top_k,
+        n_group,
+        topk_group,
+        intermediate_size,
+        local_expert_offset,
+        local_num_experts,
+        routed_scaling_factor,
+        routing_method_type,
+        use_shuffled_weight,
+        weight_layout,
+        do_finalize,
+        enable_pdl,
+        tune_max_num_tokens,
+    )
+
+    if do_finalize:
+        logger.warning_once(
+            "the single torch.Tensor return type is deprecated and will be replaced with List[torch.Tensor] in the v0.8.0."
+        )
+        return result[0]
+    else:
+        return result
+
+
+@flashinfer_api
+def trtllm_bf16_routed_moe(
+    topk_ids: torch.Tensor,
+    hidden_states: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
+    intermediate_size: int,
+    local_expert_offset: int,
+    local_num_experts: int,
+    routed_scaling_factor: Optional[float] = None,
+    routing_method_type: int = 0,
+    use_shuffled_weight: bool = True,
+    weight_layout: int = WeightLayout.BlockMajorK,
+    do_finalize: bool = True,
+    enable_pdl: bool = True,
+    tune_max_num_tokens: int = 8192,
+) -> List[torch.Tensor]:
+    """BF16 MoE operation with autotuning support.
+
+    This function implements a bfloat16 Mixture of Experts layer using the TensorRT-LLM backend
+    with automatic performance tuning for optimal tile size selection.
+
+    Args:
+        topk_ids: [seq_len, top_k] tensor of packed expert indices and weights (int32).
+            Format: (expert_id << 16) | (weight_bf16.view(int16))
+            Can be created as: (topk_ids.int32 << 16) | expert_weights.bfloat16.view(int16)
+        hidden_states: [seq_len, hidden_size] tensor of input hidden states.
+            Must be bfloat16.
+        gemm1_weights: [num_experts, 2*intermediate_size // 128, hidden_size // 128, 128] tensor of first layer weights. must be bfloat16.
+        gemm2_weights: [num_experts, hidden_size//128, intermediate_size, 128] tensor of second layer weights. must be bfloat16.
+        num_experts: Total number of experts.
+        top_k: Number of experts to route to per token.
+        n_group: Number of expert groups.
+        topk_group: Number of groups to consider for top-k routing.
+        intermediate_size: Size of intermediate layer.
+        local_expert_offset: Offset of local experts in global expert space.
+        local_num_experts: Number of experts handled by this device.
+        routed_scaling_factor (Optional[float]): Scaling factor for routing (can be None for some routing methods)
+        routing_method_type: Type of routing method to use (default: 0).
+            - 0: Default (Softmax -> TopK)
+            - 1: Renormalize (TopK -> Softmax)
+            - 2: DeepSeekV3 (Sigmoid -> RoutingBiasAdd -> Top2 in group -> Top4 groups -> Top8 experts)
+            - 3: Llama4 (Top1 -> Sigmoid)
+            - 4: RenormalizeNaive (Softmax -> TopK -> Renormalize)
+        use_shuffled_weight: Whether to use shuffled weight layout for optimization (default: True).
+        weight_layout: Weight layout format (default: WeightLayout.BlockMajorK).
+            - 0: MajorK - K-major layout [Mn, K]
+            - 1: MajorMn - M-major for A and N-major for B [K, Mn]
+            - 2: BlockMajorK - Blocked along K dimension [K/blockK, Mn, blockK]
+        do_finalize: Whether to finalize the output (default: True).
+        enable_pdl: Whether to enable Programmatic Dependent Launch. Auto-enabled for >= sm90.
+        tune_max_num_tokens: Maximum number of tokens for autotuning (default: 8192).
+
+    Returns:
+        when do_finalize=True, returns the final MoE output.
+        otherwise, returns the intermediate results (gemm2_output, undefined, expanded_idx_to_permuted_idx) that need further processing.
+    """
+    result = get_trtllm_moe_sm100_module().trtllm_bf16_moe(
+        None,
+        None,
+        topk_ids,
+        None,
         hidden_states,
         gemm1_weights,
         gemm2_weights,
