@@ -956,7 +956,7 @@ class SSDKernel:
 
         # Specialized TMA load Delta/CumsumDelta/X/States warp
         if warp_idx == self.tma_deltas_x_d_states_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
+            cute.arch.setmaxregister_decrease(self.num_regs_uniform_warps)
             self._warp_tma_x_deltas(
                 tma_atom_x,
                 tma_tensor_x,
@@ -993,7 +993,7 @@ class SSDKernel:
 
         # Specialized TMA load B/C warp
         elif warp_idx == self.tma_b_c_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
+            cute.arch.setmaxregister_decrease(self.num_regs_uniform_warps)
             self._warp_tma_b_c(
                 tma_atom_b,
                 tma_tensor_b,
@@ -1017,7 +1017,7 @@ class SSDKernel:
 
         # Specialized MMA Intra warp
         elif warp_idx == self.mma_intra_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
+            cute.arch.setmaxregister_decrease(self.num_regs_uniform_warps)
             self._warp_mma_intra(
                 smem_c,
                 smem_b,
@@ -1040,7 +1040,7 @@ class SSDKernel:
 
         # Specialized MMA Inter warp
         elif warp_idx == self.mma_inter_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
+            cute.arch.setmaxregister_decrease(self.num_regs_uniform_warps)
             self._warp_mma_inter(
                 smem_bt_internal,
                 smem_x,
@@ -1068,7 +1068,7 @@ class SSDKernel:
             or warp_idx == self.pre_inter_warp_id[2]
             or warp_idx == self.pre_inter_warp_id[3]
         ):
-            cute.arch.warpgroup_reg_alloc(self.num_regs_pre_inter_warps)
+            cute.arch.setmaxregister_increase(self.num_regs_pre_inter_warps)
             self._warp_pre_inter(
                 local_tidx,
                 local_warp_idx,
@@ -1109,7 +1109,7 @@ class SSDKernel:
             or warp_idx == self.pre_intra_warp_id[2]
             or warp_idx == self.pre_intra_warp_id[3]
         ):
-            cute.arch.warpgroup_reg_alloc(self.num_regs_pre_intra_warps)
+            cute.arch.setmaxregister_increase(self.num_regs_pre_intra_warps)
             self._warp_pre_intra(
                 local_tidx,
                 smem_cumsum_delta,
@@ -1133,7 +1133,7 @@ class SSDKernel:
 
         # Specialized Epilogue warp
         else:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_epilogue_warps)
+            cute.arch.setmaxregister_decrease(self.num_regs_epilogue_warps)
             self._warp_epilog(
                 local_tidx,
                 local_warp_idx,
@@ -1298,7 +1298,7 @@ class SSDKernel:
         ) = self.pre_inter_tmem_load_and_partition_p(local_tidx, tInter1, smem_pt)
 
         # Make fragment for register to hold P after post-processing (in acc dtype)
-        tState = cute.make_fragment(tTR_rP.shape, self.acc_dtype)
+        tState = cute.make_rmem_tensor(tTR_rP.shape, self.acc_dtype)
 
         # Make tiledCopy and partition smem/register tensor for:
         # - Loading initial_states from SMEM to registers (S2R, reuses tRS_rP)
@@ -1418,8 +1418,8 @@ class SSDKernel:
 
             # Fence for shared memory
             cute.arch.fence_proxy(
-                cute.arch.ProxyKind.async_shared,
-                space=cute.arch.SharedSpace.shared_cta,
+                "async.shared",
+                space="cta",
             )
             # Async arrive INTER2_P buffer full
             inter2_p_pipeline.producer_commit(inter2_p_producer_state)
@@ -1474,8 +1474,8 @@ class SSDKernel:
 
                 # Fence for shared memory
                 cute.arch.fence_proxy(
-                    cute.arch.ProxyKind.async_shared,
-                    space=cute.arch.SharedSpace.shared_cta,
+                    "async.shared",
+                    space="cta",
                 )
 
                 # Combine B/Delta/DeltaA/last_column
@@ -1511,8 +1511,8 @@ class SSDKernel:
 
                 # Fence for shared memory
                 cute.arch.fence_proxy(
-                    cute.arch.ProxyKind.async_shared,
-                    space=cute.arch.SharedSpace.shared_cta,
+                    "async.shared",
+                    space="cta",
                 )
 
                 # Async arrive B/Delta/B_TMEM buffer empty/empty/full
@@ -1563,8 +1563,8 @@ class SSDKernel:
 
                 # Fence for shared memory
                 cute.arch.fence_proxy(
-                    cute.arch.ProxyKind.async_shared,
-                    space=cute.arch.SharedSpace.shared_cta,
+                    "async.shared",
+                    space="cta",
                 )
 
                 # Async arrive INTER1_ACC buffer empty
@@ -1647,8 +1647,8 @@ class SSDKernel:
 
             # Store last INTER2_P (State) from smem to gmem
             cute.arch.fence_proxy(
-                cute.arch.ProxyKind.async_shared,
-                space=cute.arch.SharedSpace.shared_cta,
+                "async.shared",
+                space="cta",
             )
             cute.arch.barrier(
                 barrier_id=self.pre_inter_sync_bar_id,
@@ -1776,12 +1776,12 @@ class SSDKernel:
             local_tidx, smem_y, tiled_t2r_inter2
         )
 
-        tRS_rCompute = cute.make_fragment(tRS_rY.shape, self.acc_dtype)
+        tRS_rCompute = cute.make_rmem_tensor(tRS_rY.shape, self.acc_dtype)
 
         # Register fragment for z gating (loaded from gmem per subtile)
         tRS_rZ = None
         if cutlass.const_expr(self.has_z):
-            tRS_rZ = cute.make_fragment(tRS_rY.shape, self.acc_dtype)
+            tRS_rZ = cute.make_rmem_tensor(tRS_rY.shape, self.acc_dtype)
 
         # Coordinate tensor for per-register (l, d) within epi_tile
         epi_coord_tensor = cute.make_identity_tensor(epi_tile)
@@ -2051,8 +2051,8 @@ class SSDKernel:
 
                         # Fence for R2S store
                         cute.arch.fence_proxy(
-                            cute.arch.ProxyKind.async_shared,
-                            space=cute.arch.SharedSpace.shared_cta,
+                            "async.shared",
+                            space="cta",
                         )
                         cute.arch.barrier(
                             barrier_id=self.epilog_sync_bar_id,
@@ -3890,7 +3890,7 @@ class SSDKernel:
 
         # Partition tmem/register tensor for tensor memory store INTRA2_Q
         # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N, ...)
-        tRT_rQ = cute.make_fragment(
+        tRT_rQ = cute.make_rmem_tensor(
             cute.slice_(thr_r2t_q.partition_S(tCrQ).shape, (None, None, None, None, 0)),
             dtype,
         )
@@ -3904,10 +3904,10 @@ class SSDKernel:
         self, tTR_rQ, tQrDeltaA_Row, tQrDeltaA_Col, tQrDelta, tCoord, tRT_rQ
     ):
         # Make tmp acc type fragments
-        tCrDeltaA_Row = cute.make_fragment(tQrDeltaA_Row.shape, self.acc_dtype)
-        tCrDeltaA_Col = cute.make_fragment(tQrDeltaA_Col.shape, self.acc_dtype)
-        tCrDelta = cute.make_fragment(tQrDelta.shape, self.acc_dtype)
-        tCompute = cute.make_fragment(tRT_rQ.shape, self.acc_dtype)
+        tCrDeltaA_Row = cute.make_rmem_tensor(tQrDeltaA_Row.shape, self.acc_dtype)
+        tCrDeltaA_Col = cute.make_rmem_tensor(tQrDeltaA_Col.shape, self.acc_dtype)
+        tCrDelta = cute.make_rmem_tensor(tQrDelta.shape, self.acc_dtype)
+        tCompute = cute.make_rmem_tensor(tRT_rQ.shape, self.acc_dtype)
 
         # Combine tTR_rQ/tCrDeltaA_Row/tCrDeltaA_Col/tCrDelta
         tCrDeltaA_Row.store(tQrDeltaA_Row.load().to(self.acc_dtype))
@@ -3983,7 +3983,7 @@ class SSDKernel:
         tBsB_s2r = thr_s2r_b.partition_S(smem_bt)
 
         # ((S2R_ATOM_V, S2R_REST_V), S2R_M, S2R_N)
-        tBrB_s2r = cute.make_fragment(
+        tBrB_s2r = cute.make_rmem_tensor(
             cute.slice_(tBsB_s2r.shape, (None, None, None, 0)),
             dtype,
         )
@@ -4024,7 +4024,7 @@ class SSDKernel:
 
         # Make register fragments for smem load/store of Delta/DeltaA
         # ((S2R_ATOM_V, S2R_REST_V), S2R_M, S2R_N)
-        tBrDelta_s2r = cute.make_fragment(tBsDelta_s2r[smem_tile_coord].shape, dtype)
+        tBrDelta_s2r = cute.make_rmem_tensor(tBsDelta_s2r[smem_tile_coord].shape, dtype)
         return s2r_atom_delta, tBsDelta_s2r, tBrDelta_s2r
 
     def pre_inter_tmem_load_and_partition_p(self, local_tidx, tInter1, smem_pt):
@@ -4052,7 +4052,7 @@ class SSDKernel:
         tTR_s = thr_t2r.partition_D(smem_tensor)
         # Make register fragments for tmem load INTER1_ACC
         # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N)
-        tTR_r = cute.make_fragment(
+        tTR_r = cute.make_rmem_tensor(
             tTR_s.shape,
             dtype,
         )
@@ -4087,7 +4087,7 @@ class SSDKernel:
         # ((R2S_ATOM_V, R2S_REST_V), R2S_M, R2S_N, INTERNAL_STAGE)
         tRS_sP = thr_r2s_p.partition_D(smem_pt)
         # ((R2S_ATOM_V, R2S_REST_V), R2S_M, R2S_N)
-        tRS_rP = cute.make_fragment(
+        tRS_rP = cute.make_rmem_tensor(
             cute.slice_(tRS_sP.shape, (None, None, None, 0)), self.io_dtype
         )
         return tiled_r2s_p, tRS_rP, tRS_sP
@@ -4126,10 +4126,10 @@ class SSDKernel:
     def pre_inter_scale_bt_with_delta(
         self, tBrB_s2r, tBrDelta_s2r, tBrDeltaA_s2r, last_column
     ):
-        tCompute = cute.make_fragment(tBrB_s2r.shape, self.acc_dtype)
-        tBrB_Compute = cute.make_fragment(tBrB_s2r.shape, self.acc_dtype)
-        tBrDelta_Compute = cute.make_fragment(tBrDelta_s2r.shape, self.acc_dtype)
-        tBrDeltaA_Compute = cute.make_fragment(tBrDeltaA_s2r.shape, self.acc_dtype)
+        tCompute = cute.make_rmem_tensor(tBrB_s2r.shape, self.acc_dtype)
+        tBrB_Compute = cute.make_rmem_tensor(tBrB_s2r.shape, self.acc_dtype)
+        tBrDelta_Compute = cute.make_rmem_tensor(tBrDelta_s2r.shape, self.acc_dtype)
+        tBrDeltaA_Compute = cute.make_rmem_tensor(tBrDeltaA_s2r.shape, self.acc_dtype)
 
         tBrB_Compute.store(tBrB_s2r.load().to(self.acc_dtype))
         tBrDelta_Compute.store(tBrDelta_s2r.load().to(self.acc_dtype))
@@ -4210,7 +4210,7 @@ class SSDKernel:
         # (R2S_ATOM, R2S_M, R2S_N, EPI_M, EPI_N, INPUT_STAGES)
         tSR_sX = thr_s2r_x.partition_S(cute.flat_divide(smem_xt, epi_tile))
         # (R2S_ATOM, R2S_M, R2S_N)
-        tSR_rX = cute.make_fragment(
+        tSR_rX = cute.make_rmem_tensor(
             cute.slice_(tSR_sX.shape, (None, None, None, 0, 0, 0)), dtype
         )
         return tiled_s2r_x, tSR_sX, tSR_rX
