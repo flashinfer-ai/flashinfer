@@ -102,10 +102,25 @@ def trtllm_allreduce(x_in: torch.Tensor, workspace: AllReduceFusionWorkspace):
 
 
 class MixedCommMode(enum.IntEnum):
-    # Run a fused kernel (correspond to OPT_WAITS, OPT_BYTES, MIXED in fused_comm.cuh)
-    FUSED_OPT_WAITS = 0
-    FUSED_OPT_BYTES = enum.auto()
-    FUSED_MIXED = enum.auto()
+    # Run a fused kernel (should be aligned with MixedCommMode in fused_comm.cuh)
+    FUSED_OPT_WAITS_SIGNAL_MC = 0
+    FUSED_OPT_WAITS_SIGNAL_UC = enum.auto()
+    FUSED_OPT_WAITS_LAMPORT1_MC = enum.auto()
+    FUSED_OPT_WAITS_LAMPORT1_UC = enum.auto()
+    FUSED_OPT_WAITS_LAMPORT2_MC = enum.auto()
+    FUSED_OPT_WAITS_LAMPORT2_UC = enum.auto()
+    FUSED_OPT_BYTES_SIGNAL_MC = enum.auto()
+    FUSED_OPT_BYTES_SIGNAL_UC = enum.auto()
+    FUSED_OPT_BYTES_LAMPORT1_MC = enum.auto()
+    FUSED_OPT_BYTES_LAMPORT1_UC = enum.auto()
+    FUSED_OPT_BYTES_LAMPORT2_MC = enum.auto()
+    FUSED_OPT_BYTES_LAMPORT2_UC = enum.auto()
+    FUSED_MIXED_SIGNAL_MC = enum.auto()
+    FUSED_MIXED_SIGNAL_UC = enum.auto()
+    FUSED_MIXED_LAMPORT1_MC = enum.auto()
+    FUSED_MIXED_LAMPORT1_UC = enum.auto()
+    FUSED_MIXED_LAMPORT2_MC = enum.auto()
+    FUSED_MIXED_LAMPORT2_UC = enum.auto()
     # Run different NCCL kernels for TP and DP
     NCCL_TP_DP = enum.auto()
     # Run a NCCL all-reduce kernel with preprocessing or postprocessing
@@ -389,6 +404,7 @@ class MixedComm:
         self.dtype = dtype
         self.device = device
         self.should_init_nvshmem = should_init_nvshmem
+        self.maybe_use_trtllm_comm = maybe_use_trtllm_comm
         self.local_comm_group = self.para_info.get_local_comm_group()
         self.inter_comm_group = (
             self.para_info.get_inter_comm_group()
@@ -407,7 +423,6 @@ class MixedComm:
             max_local_bs * hidden_size * get_element_size(dtype),
             access_bytes * self.para_info.tp_size * self.grid_size,
         )
-        self.flip_flag = 0
         self.vm_data_bytes_base = (
             self.para_info.inter_dp_size * self.para_info.local_size * max_local_bytes
         )
@@ -422,11 +437,16 @@ class MixedComm:
         self.ns_signal_bytes_base = round_up(
             2 * self.grid_size * get_element_size(torch.uint64), access_bytes
         )
-        self.vm_data_bytes = 2 * self.vm_data_bytes_base
-        self.vm_signal_bytes = 2 * self.vm_signal_bytes_base
-        self.ns_data_bytes = 2 * self.ns_data_bytes_base
-        self.ns_signal_bytes = 2 * self.ns_signal_bytes_base
-
+        self.vm_data_bytes = 6 * self.vm_data_bytes_base
+        self.vm_signal_bytes = 3 * self.vm_signal_bytes_base
+        self.ns_data_bytes = 6 * self.ns_data_bytes_base
+        self.ns_signal_bytes = 3 * self.ns_signal_bytes_base
+        self.index_bytes = round_up(
+            self.grid_size * get_element_size(torch.uint32), access_bytes
+        )
+        self.reset_bytes = round_up(
+            4 * self.grid_size * get_element_size(torch.uint64), access_bytes
+        )
         if "NVSHMEM_IB_ENABLE_IBGDA" not in os.environ:
             os.environ["NVSHMEM_IB_ENABLE_IBGDA"] = "true"
         if "NVSHMEM_IBGDA_NUM_RC_PER_PE" not in os.environ:
@@ -439,53 +459,35 @@ class MixedComm:
         self.vm_buffer_size = None
         self.uc_handle_list = None
         self.uc_ptr_list = None
-        void_p_null = ctypes.c_void_p(None)
-        self.mem_data = [void_p_null for _ in range(2)]
-        self.mem_signal = [void_p_null for _ in range(2)]
-        uc_name_list = ["raw", "void_p"]
-        self.uc_data_dict = [
-            {key: void_p_null for key in uc_name_list} for _ in range(2)
-        ]
+        self.ns_buffer = None
+        self.void_p_null = ctypes.c_void_p(None)
         mc_name_list = ["full", "tp"]
-        self.mc_handle_dict = {key: None for key in mc_name_list}
-        self.mc_ptr_dict = {key: None for key in mc_name_list}
-        self.mc_data_dict = [
-            {key: void_p_null for key in mc_name_list} for _ in range(2)
-        ]
-        self.mc_signal_dict = [
-            {key: void_p_null for key in mc_name_list} for _ in range(2)
-        ]
+        info_name_list = ["raw", "void_p"]
+        self.mem_data_dict = {key: self.void_p_null for key in info_name_list}
+        self.mem_signal_dict = {key: self.void_p_null for key in info_name_list}
+        self.uc_data_dict = {key: self.void_p_null for key in info_name_list}
+        self.mc_handle_dict = {name: None for name in mc_name_list}
+        self.mc_ptr_dict = {name: None for name in mc_name_list}
+        self.mc_data_dict = {
+            name: {key: self.void_p_null for key in info_name_list}
+            for name in mc_name_list
+        }
+        self.mc_signal_dict = {
+            name: {key: self.void_p_null for key in info_name_list}
+            for name in mc_name_list
+        }
+        self.ns_data_dict = {key: self.void_p_null for key in info_name_list}
+        self.ns_signal_dict = {key: self.void_p_null for key in info_name_list}
+        self.index_info = self.void_p_null
+        self.reset_info = self.void_p_null
         self.init_virtual_memory()
-
         if self.para_info.num_nodes > 1:
             self.init_nvshmem()
-            self.ns_data = [
-                self.mixed_comm_module.nvshmem_malloc(
-                    [self.ns_data_bytes],
-                    torch.uint8,
-                    self.device.index,
-                )
-                for _ in range(2)
-            ]
-            self.ns_signal = [
-                self.mixed_comm_module.nvshmem_malloc_with_init(
-                    [self.ns_signal_bytes],
-                    torch.uint8,
-                    self.device.index,
-                )
-                for _ in range(2)
-            ]
-        else:
-            self.ns_data = [None for _ in range(2)]
-            self.ns_signal = [None for _ in range(2)]
 
         self.valid_block_size_dict = self.get_valid_block_size_dict()
         self.valid_mode_list = [val for val in MixedCommMode if self.check_mode(val)[0]]
 
-        if (
-            maybe_use_trtllm_comm
-            and MixedCommMode.TRTLLM_LOCAL_INTER in self.valid_mode_list
-        ):
+        if MixedCommMode.TRTLLM_LOCAL_INTER in self.valid_mode_list:
             self.trtllm_workspace = create_allreduce_fusion_workspace(
                 backend="trtllm",
                 world_size=self.para_info.local_size,
@@ -500,6 +502,17 @@ class MixedComm:
 
         torch.cuda.synchronize()
         torch.distributed.barrier()
+
+    @staticmethod
+    def create_gpu_array(ptr_list):
+        ArrayType = ctypes.c_void_p * len(ptr_list)
+        cpu_array = ArrayType(*ptr_list)
+        array_bytes = ctypes.sizeof(cpu_array)
+        gpu_array = checkCudaErrors(cuda.cuMemAlloc(array_bytes))
+        checkCudaErrors(
+            cuda.cuMemcpyHtoD(gpu_array, ctypes.addressof(cpu_array), array_bytes)
+        )
+        return {"raw": gpu_array, "void_p": ctypes.c_void_p(int(gpu_array))}
 
     def init_virtual_memory(self):
         def get_socket_path(pid):
@@ -573,16 +586,6 @@ class MixedComm:
             )
             return ptr
 
-        def create_gpu_array(ptr_list):
-            ArrayType = ctypes.c_void_p * len(ptr_list)
-            cpu_array = ArrayType(*ptr_list)
-            array_bytes = ctypes.sizeof(cpu_array)
-            gpu_array = checkCudaErrors(cuda.cuMemAlloc(array_bytes))
-            checkCudaErrors(
-                cuda.cuMemcpyHtoD(gpu_array, ctypes.addressof(cpu_array), array_bytes)
-            )
-            return {"raw": gpu_array, "void_p": ctypes.c_void_p(int(gpu_array))}
-
         # Create socket for broadcasting multicast and unicast handles
         local_pid_list = [None for _ in range(self.para_info.local_size)]
         torch.distributed.all_gather_object(
@@ -621,7 +624,15 @@ class MixedComm:
         )
         vm_granularity = math.lcm(mc_granularity, uc_granularity)
         self.vm_buffer_size = round_up(
-            self.vm_data_bytes + self.vm_signal_bytes, vm_granularity
+            sum(
+                [
+                    self.vm_data_bytes,
+                    self.vm_signal_bytes,
+                    self.index_bytes,
+                    self.reset_bytes,
+                ]
+            ),
+            vm_granularity,
         )
         self.uc_handle_list = create_and_allgather_uc_handle(sock, uc_prop)
         mc_prop.size = self.vm_buffer_size
@@ -660,37 +671,54 @@ class MixedComm:
             map_handle(val, access_desc, vm_granularity) for val in self.uc_handle_list
         ]
         ptr_list = [int(val) for val in self.uc_ptr_list]
-        self.mem_data[0] = ctypes.c_void_p(ptr_list[self.para_info.local_rank])
-        self.uc_data_dict[0] = create_gpu_array(ptr_list)
-        ptr_list = [val + self.vm_data_bytes_base for val in ptr_list]
-        self.mem_data[1] = ctypes.c_void_p(ptr_list[self.para_info.local_rank])
-        self.uc_data_dict[1] = create_gpu_array(ptr_list)
-        ptr_list = [val + self.vm_data_bytes_base for val in ptr_list]
+        mem_data_list, uc_data_list = [], []
+        for _ in range(6):
+            mem_data_list.append(ptr_list[self.para_info.local_rank])
+            uc_data_list += ptr_list
+            ptr_list = [val + self.vm_data_bytes_base for val in ptr_list]
+        self.mem_data_dict = self.create_gpu_array(mem_data_list)
+        self.uc_data_dict = self.create_gpu_array(uc_data_list)
         checkCudaErrors(
-            cuda.cuMemsetD8(
-                ptr_list[self.para_info.local_rank], 0, self.vm_signal_bytes
-            )
+            cuda.cuMemsetD16(mem_data_list[3], 0x8000, self.vm_data_bytes_base // 2 * 3)
         )
-        self.mem_signal[0] = ctypes.c_void_p(ptr_list[self.para_info.local_rank])
-        ptr_list = [val + self.vm_signal_bytes_base for val in ptr_list]
-        self.mem_signal[1] = ctypes.c_void_p(ptr_list[self.para_info.local_rank])
+        mem_signal_list = []
+        for _ in range(3):
+            mem_signal_list.append(ptr_list[self.para_info.local_rank])
+            ptr_list = [val + self.vm_signal_bytes_base for val in ptr_list]
+        self.mem_signal_dict = self.create_gpu_array(mem_signal_list)
+        checkCudaErrors(cuda.cuMemsetD8(mem_signal_list[0], 0, self.vm_signal_bytes))
         uc_handle_self = self.uc_handle_list[self.para_info.local_rank]
         for key, val in self.mc_handle_dict.items():
-            if val is not None:
-                checkCudaErrors(
-                    cuda.cuMulticastBindMem(
-                        val, 0, uc_handle_self, 0, self.vm_buffer_size, 0
-                    )
+            if val is None:
+                continue
+            mc_data_list, mc_signal_list = [], []
+            checkCudaErrors(
+                cuda.cuMulticastBindMem(
+                    val, 0, uc_handle_self, 0, self.vm_buffer_size, 0
                 )
-                self.mc_ptr_dict[key] = map_handle(val, access_desc, vm_granularity)
-                ptr = int(self.mc_ptr_dict[key])
-                self.mc_data_dict[0][key] = ctypes.c_void_p(ptr)
+            )
+            self.mc_ptr_dict[key] = map_handle(val, access_desc, vm_granularity)
+            ptr = int(self.mc_ptr_dict[key])
+            for _ in range(6):
+                mc_data_list.append(ptr)
                 ptr += self.vm_data_bytes_base
-                self.mc_data_dict[1][key] = ctypes.c_void_p(ptr)
-                ptr += self.vm_data_bytes_base
-                self.mc_signal_dict[0][key] = ctypes.c_void_p(ptr)
+            for _ in range(3):
+                mc_signal_list.append(ptr)
                 ptr += self.vm_signal_bytes_base
-                self.mc_signal_dict[1][key] = ctypes.c_void_p(ptr)
+            self.mc_data_dict[key] = self.create_gpu_array(mc_data_list)
+            self.mc_signal_dict[key] = self.create_gpu_array(mc_signal_list)
+        self.index_info = ctypes.c_void_p(ptr_list[self.para_info.local_rank])
+        checkCudaErrors(
+            cuda.cuMemsetD16(
+                ptr_list[self.para_info.local_rank], 0x0300, self.index_bytes // 2
+            )
+        )
+        ptr_list = [val + self.index_bytes for val in ptr_list]
+        self.reset_info = ctypes.c_void_p(ptr_list[self.para_info.local_rank])
+        checkCudaErrors(
+            cuda.cuMemsetD8(ptr_list[self.para_info.local_rank], 0, self.reset_bytes)
+        )
+        ptr_list = [val + self.reset_bytes for val in ptr_list]
 
     def init_nvshmem(self):
         if self.should_init_nvshmem:
@@ -729,6 +757,27 @@ class MixedComm:
             f"Rank {self.para_info.world_rank}: nvshmem local_size mismatch. "
             f"Expected local_size {self.para_info.local_size}, got local_size {local_n_pes}."
         )
+        self.ns_buffer = self.mixed_comm_module.nvshmem_malloc(
+            [self.ns_data_bytes + self.ns_signal_bytes],
+            torch.uint8,
+            self.device.index,
+        )
+        ns_tensor = torch.from_dlpack(self.ns_buffer)
+        ptr = int(ns_tensor.data_ptr())
+        ns_data_list = []
+        for _ in range(6):
+            ns_data_list.append(ptr)
+            ptr += self.ns_data_bytes_base
+        checkCudaErrors(
+            cuda.cuMemsetD16(ns_data_list[3], 0x8000, self.ns_data_bytes_base // 2 * 3)
+        )
+        self.ns_data_dict = self.create_gpu_array(ns_data_list)
+        ns_signal_list = []
+        for _ in range(3):
+            ns_signal_list.append(ptr)
+            ptr += self.ns_signal_bytes_base
+        checkCudaErrors(cuda.cuMemsetD8(ns_signal_list[0], 0, self.ns_signal_bytes))
+        self.ns_signal_dict = self.create_gpu_array(ns_signal_list)
 
     def __del__(self):
         def unmap_handle(ptr, handle):
@@ -749,12 +798,17 @@ class MixedComm:
                 unmap_handle(self.mc_ptr_dict[key], val)
         for handle, ptr in zip(self.uc_handle_list, self.uc_ptr_list, strict=True):
             unmap_handle(ptr, handle)
-        for val in self.uc_data_dict:
+        for val in [self.mem_data_dict, self.mem_signal_dict, self.uc_data_dict]:
             checkCudaErrors(cuda.cuMemFree(val["raw"]))
+        for val in [self.mc_data_dict, self.mc_signal_dict]:
+            for sub_val in val.values():
+                if sub_val["raw"] != self.void_p_null:
+                    checkCudaErrors(cuda.cuMemFree(sub_val["raw"]))
 
         if self.para_info.num_nodes > 1:
-            del self.ns_data
-            del self.ns_signal
+            del self.ns_buffer
+            for val in [self.ns_data_dict, self.ns_signal_dict]:
+                checkCudaErrors(cuda.cuMemFree(val["raw"]))
             if self.should_init_nvshmem:
                 self.mixed_comm_module.nvshmem_finalize()
 
@@ -777,9 +831,10 @@ class MixedComm:
         outputs = {
             op: {mode: [None] for mode in MixedCommMode} for op in ["ar_ag", "rs_ar"]
         }
-        mode_list = [MixedCommMode.FUSED_OPT_WAITS, MixedCommMode.FUSED_OPT_BYTES]
-        if self.para_info.num_nodes > 1:
-            mode_list.append(MixedCommMode.FUSED_MIXED)
+        if self.para_info.num_nodes == 1:
+            mode_list = self.get_fused_single_mode_list()
+        else:
+            mode_list = self.get_fused_mode_list()
         for op, sub_outputs in outputs.items():
             for mode in mode_list:
                 min_val = block_size_range["min_val"]
@@ -792,14 +847,48 @@ class MixedComm:
                 )
         return outputs
 
+    @staticmethod
+    def get_fused_single_mode_list():
+        return [
+            MixedCommMode.FUSED_OPT_WAITS_SIGNAL_MC,
+            MixedCommMode.FUSED_OPT_WAITS_SIGNAL_UC,
+            MixedCommMode.FUSED_OPT_WAITS_LAMPORT1_MC,
+            MixedCommMode.FUSED_OPT_WAITS_LAMPORT1_UC,
+            MixedCommMode.FUSED_OPT_BYTES_SIGNAL_MC,
+            MixedCommMode.FUSED_OPT_BYTES_SIGNAL_UC,
+            MixedCommMode.FUSED_OPT_BYTES_LAMPORT1_MC,
+            MixedCommMode.FUSED_OPT_BYTES_LAMPORT1_UC,
+        ]
+
+    @staticmethod
+    def get_fused_multi_mode_list():
+        return [
+            MixedCommMode.FUSED_OPT_WAITS_LAMPORT2_MC,
+            MixedCommMode.FUSED_OPT_WAITS_LAMPORT2_UC,
+            MixedCommMode.FUSED_OPT_BYTES_LAMPORT2_MC,
+            MixedCommMode.FUSED_OPT_BYTES_LAMPORT2_UC,
+            MixedCommMode.FUSED_MIXED_SIGNAL_MC,
+            MixedCommMode.FUSED_MIXED_SIGNAL_UC,
+            MixedCommMode.FUSED_MIXED_LAMPORT1_MC,
+            MixedCommMode.FUSED_MIXED_LAMPORT1_UC,
+            MixedCommMode.FUSED_MIXED_LAMPORT2_MC,
+            MixedCommMode.FUSED_MIXED_LAMPORT2_UC,
+        ]
+
+    @staticmethod
+    def get_fused_mode_list():
+        return [
+            *MixedComm.get_fused_single_mode_list(),
+            *MixedComm.get_fused_multi_mode_list(),
+        ]
+
     def check_mode(self, mode: MixedCommMode) -> Tuple[bool, str | None]:
         if mode in [
-            MixedCommMode.FUSED_OPT_WAITS,
-            MixedCommMode.FUSED_OPT_BYTES,
+            *self.get_fused_single_mode_list(),
             MixedCommMode.NCCL_TP_DP,
         ]:
             return True, None
-        if mode == MixedCommMode.FUSED_MIXED:
+        if mode in self.get_fused_multi_mode_list():
             if self.para_info.num_nodes == 1:
                 info = (
                     f"Rank {self.para_info.world_rank}: too small number of nodes. "
@@ -843,24 +932,12 @@ class MixedComm:
                     "Should use NCCL_TP_DP in this case."
                 )
                 return False, info
-            if (
-                self.para_info.local_tp_size > 1 and self.para_info.local_dp_size > 2
-            ) or (
-                self.para_info.inter_tp_size > 1 and self.para_info.inter_dp_size > 2
-            ):
-                info = (
-                    f"Rank {self.para_info.world_rank}: {mode.name} is not in candidate list. "
-                    f"{mode.name} is expected to be suboptimal in this case."
-                )
-                return False, info
             return True, None
         if mode == MixedCommMode.TRTLLM_LOCAL_INTER:
-            if self.para_info.local_dp_size > 2 or (
-                self.para_info.inter_tp_size > 1 and self.para_info.inter_dp_size > 2
-            ):
+            if not self.maybe_use_trtllm_comm:
                 info = (
-                    f"Rank {self.para_info.world_rank}: {mode.name} is not in candidate list. "
-                    f"{mode.name} is expected to be suboptimal in this case."
+                    f"Rank {self.para_info.world_rank}: {mode.name} is not enabled. "
+                    "Should set maybe_use_trtllm_comm to True if this mode is needed."
                 )
                 return False, info
             return True, None
@@ -912,23 +989,22 @@ class MixedComm:
                     .flatten(0, 2)
                 )
 
-        if mode in [
-            MixedCommMode.FUSED_OPT_WAITS,
-            MixedCommMode.FUSED_OPT_BYTES,
-            MixedCommMode.FUSED_MIXED,
-        ]:
+        if mode in self.get_fused_mode_list():
             x_out = create_tensor(x_in)
             self.mixed_comm_module.fused_allreduce_allgather(
                 x_out,
                 x_in,
-                self.mem_data[self.flip_flag],
-                self.mem_signal[self.flip_flag],
-                self.mc_data_dict[self.flip_flag]["full"],
-                self.mc_data_dict[self.flip_flag]["tp"],
-                self.mc_signal_dict[self.flip_flag]["full"],
-                self.mc_signal_dict[self.flip_flag]["tp"],
-                self.ns_data[self.flip_flag],
-                self.ns_signal[self.flip_flag],
+                self.mem_data_dict["void_p"],
+                self.mem_signal_dict["void_p"],
+                self.uc_data_dict["void_p"],
+                self.mc_data_dict["full"]["void_p"],
+                self.mc_data_dict["tp"]["void_p"],
+                self.mc_signal_dict["full"]["void_p"],
+                self.mc_signal_dict["tp"]["void_p"],
+                self.ns_data_dict["void_p"],
+                self.ns_signal_dict["void_p"],
+                self.index_info,
+                self.reset_info,
                 self.para_info.local_tp_rank,
                 self.para_info.local_tp_size,
                 self.para_info.local_dp_rank,
@@ -941,7 +1017,6 @@ class MixedComm:
                 mode,
                 block_size,
             )
-            self.flip_flag ^= 1
         elif mode == MixedCommMode.NCCL_TP_DP:
             if self.para_info.tp_size == 1:
                 x_out = create_tensor(x_in)
@@ -1090,23 +1165,22 @@ class MixedComm:
         )
 
         x_out_shape = [x_in.shape[0] // self.para_info.dp_size, *x_in.shape[1:]]
-        if mode in [
-            MixedCommMode.FUSED_OPT_WAITS,
-            MixedCommMode.FUSED_OPT_BYTES,
-            MixedCommMode.FUSED_MIXED,
-        ]:
+        if mode in self.get_fused_mode_list():
             x_out = torch.empty(x_out_shape, dtype=x_in.dtype, device=x_in.device)
             self.mixed_comm_module.fused_reducescatter_allreduce(
                 x_out,
                 x_in,
-                self.mem_data[self.flip_flag],
-                self.mem_signal[self.flip_flag],
-                self.uc_data_dict[self.flip_flag]["void_p"],
-                self.mc_data_dict[self.flip_flag]["full"],
-                self.mc_data_dict[self.flip_flag]["tp"],
-                self.mc_signal_dict[self.flip_flag]["full"],
-                self.ns_data[self.flip_flag],
-                self.ns_signal[self.flip_flag],
+                self.mem_data_dict["void_p"],
+                self.mem_signal_dict["void_p"],
+                self.uc_data_dict["void_p"],
+                self.mc_data_dict["full"]["void_p"],
+                self.mc_data_dict["tp"]["void_p"],
+                self.mc_signal_dict["full"]["void_p"],
+                self.mc_signal_dict["tp"]["void_p"],
+                self.ns_data_dict["void_p"],
+                self.ns_signal_dict["void_p"],
+                self.index_info,
+                self.reset_info,
                 self.para_info.local_tp_rank,
                 self.para_info.local_tp_size,
                 self.para_info.local_dp_rank,
@@ -1119,7 +1193,6 @@ class MixedComm:
                 mode,
                 block_size,
             )
-            self.flip_flag ^= 1
         elif mode == MixedCommMode.NCCL_TP_DP:
             if self.para_info.tp_size == 1:
                 x_out = torch.empty(x_out_shape, dtype=x_in.dtype, device=x_in.device)

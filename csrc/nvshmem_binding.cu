@@ -68,22 +68,8 @@ struct NVSHMEMNDAlloc {
   void FreeData(DLTensor* tensor) { nvshmem_free(tensor->data); }
 };
 
-struct NVSHMEMNDAllocWithInit {
-  void AllocData(DLTensor* tensor) {
-    size_t size = tvm::ffi::GetDataSize(*tensor);
-    tensor->data = nvshmem_calloc(size, 1);
-    TVM_FFI_ICHECK_NE(tensor->data, nullptr) << "nvshmem_calloc failed. size: " << size;
-  }
-  void FreeData(DLTensor* tensor) { nvshmem_free(tensor->data); }
-};
-
 Tensor malloc_tensor(Shape shape, DLDataType dtype, int device_id) {
   return Tensor::FromNDAlloc(NVSHMEMNDAlloc(), tvm::ffi::Shape(shape), dtype,
-                             DLDevice{kDLCUDA, device_id});
-}
-
-Tensor malloc_tensor_with_init(Shape shape, DLDataType dtype, int device_id) {
-  return Tensor::FromNDAlloc(NVSHMEMNDAllocWithInit(), tvm::ffi::Shape(shape), dtype,
                              DLDevice{kDLCUDA, device_id});
 }
 
@@ -182,7 +168,6 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvshmem_n_pes, n_pes);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvshmem_local_my_pe, local_my_pe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvshmem_local_n_pes, local_n_pes);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvshmem_malloc, malloc_tensor);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvshmem_malloc_with_init, malloc_tensor_with_init);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvshmem_barrier_all, barrier_all);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvshmem_barrier_all_on_current_stream, barrier_all_on_current_stream);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvshmem_alltoall, alltoall);

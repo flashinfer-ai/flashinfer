@@ -14,6 +14,9 @@
  * limitations under the License.
  */
 
+#include <algorithm>
+#include <array>
+#include <set>
 #include <tuple>
 
 #include "flashinfer/comm/mixed_comm.cuh"
@@ -28,8 +31,13 @@ using flashinfer::mixed_comm::fused_allreduce_allgather_multi_node;
 using flashinfer::mixed_comm::fused_allreduce_allgather_single_node;
 using flashinfer::mixed_comm::fused_reducescatter_allreduce_multi_node;
 using flashinfer::mixed_comm::fused_reducescatter_allreduce_single_node;
+using flashinfer::mixed_comm::is_mixed_mode;
+using flashinfer::mixed_comm::is_opt_bytes_mode;
+using flashinfer::mixed_comm::is_opt_waits_mode;
+using flashinfer::mixed_comm::MixedCommArgs;
 using flashinfer::mixed_comm::MixedCommMode;
 using flashinfer::mixed_comm::mod;
+using flashinfer::mixed_comm::NUM_MIXED_COMM_MODES;
 using flashinfer::mixed_comm::round_down;
 using flashinfer::mixed_comm::round_up;
 using flashinfer::mixed_comm::WARP_SIZE;
@@ -55,9 +63,9 @@ template <int elems_per_thd>
 size_t get_num_accesses(size_t num_elems, int grid_size, int local_tp_size, int inter_tp_size,
                         int dp_size, int mode) {
   size_t num_accesses = ceil_div(num_elems, grid_size * elems_per_thd);
-  if (mode == MixedCommMode::OPT_BYTES) {
+  if (is_opt_bytes_mode(static_cast<MixedCommMode>(mode))) {
     num_accesses = round_up(num_accesses, local_tp_size * inter_tp_size);
-  } else if (mode == MixedCommMode::MIXED) {
+  } else if (is_mixed_mode(static_cast<MixedCommMode>(mode))) {
     num_accesses = round_up(num_accesses, local_tp_size);
   }
   num_accesses *= dp_size;
@@ -140,12 +148,36 @@ int get_block_size(T* kernel, Optional<int> block_size_raw, size_t num_accesses,
 #define DISPATCH_MODE_SINGLE_NODE(mode, ...)                                                 \
   [&]() -> bool {                                                                            \
     switch (mode) {                                                                          \
-      case MixedCommMode::OPT_WAITS: {                                                       \
-        constexpr int MODE = MixedCommMode::OPT_WAITS;                                       \
+      case MixedCommMode::OPT_WAITS_SIGNAL_MC: {                                             \
+        constexpr int MODE = MixedCommMode::OPT_WAITS_SIGNAL_MC;                             \
         return __VA_ARGS__();                                                                \
       }                                                                                      \
-      case MixedCommMode::OPT_BYTES: {                                                       \
-        constexpr int MODE = MixedCommMode::OPT_BYTES;                                       \
+      case MixedCommMode::OPT_WAITS_SIGNAL_UC: {                                             \
+        constexpr int MODE = MixedCommMode::OPT_WAITS_SIGNAL_UC;                             \
+        return __VA_ARGS__();                                                                \
+      }                                                                                      \
+      case MixedCommMode::OPT_WAITS_LAMPORT1_MC: {                                           \
+        constexpr int MODE = MixedCommMode::OPT_WAITS_LAMPORT1_MC;                           \
+        return __VA_ARGS__();                                                                \
+      }                                                                                      \
+      case MixedCommMode::OPT_WAITS_LAMPORT1_UC: {                                           \
+        constexpr int MODE = MixedCommMode::OPT_WAITS_LAMPORT1_UC;                           \
+        return __VA_ARGS__();                                                                \
+      }                                                                                      \
+      case MixedCommMode::OPT_BYTES_SIGNAL_MC: {                                             \
+        constexpr int MODE = MixedCommMode::OPT_BYTES_SIGNAL_MC;                             \
+        return __VA_ARGS__();                                                                \
+      }                                                                                      \
+      case MixedCommMode::OPT_BYTES_SIGNAL_UC: {                                             \
+        constexpr int MODE = MixedCommMode::OPT_BYTES_SIGNAL_UC;                             \
+        return __VA_ARGS__();                                                                \
+      }                                                                                      \
+      case MixedCommMode::OPT_BYTES_LAMPORT1_MC: {                                           \
+        constexpr int MODE = MixedCommMode::OPT_BYTES_LAMPORT1_MC;                           \
+        return __VA_ARGS__();                                                                \
+      }                                                                                      \
+      case MixedCommMode::OPT_BYTES_LAMPORT1_UC: {                                           \
+        constexpr int MODE = MixedCommMode::OPT_BYTES_LAMPORT1_UC;                           \
         return __VA_ARGS__();                                                                \
       }                                                                                      \
       default: {                                                                             \
@@ -158,16 +190,76 @@ int get_block_size(T* kernel, Optional<int> block_size_raw, size_t num_accesses,
 #define DISPATCH_MODE_MULTI_NODE(mode, ...)                                                  \
   [&]() -> bool {                                                                            \
     switch (mode) {                                                                          \
-      case MixedCommMode::OPT_WAITS: {                                                       \
-        constexpr int MODE = MixedCommMode::OPT_WAITS;                                       \
+      case MixedCommMode::OPT_WAITS_SIGNAL_MC: {                                             \
+        constexpr int MODE = MixedCommMode::OPT_WAITS_SIGNAL_MC;                             \
         return __VA_ARGS__();                                                                \
       }                                                                                      \
-      case MixedCommMode::OPT_BYTES: {                                                       \
-        constexpr int MODE = MixedCommMode::OPT_BYTES;                                       \
+      case MixedCommMode::OPT_WAITS_SIGNAL_UC: {                                             \
+        constexpr int MODE = MixedCommMode::OPT_WAITS_SIGNAL_UC;                             \
         return __VA_ARGS__();                                                                \
       }                                                                                      \
-      case MixedCommMode::MIXED: {                                                           \
-        constexpr int MODE = MixedCommMode::MIXED;                                           \
+      case MixedCommMode::OPT_WAITS_LAMPORT1_MC: {                                           \
+        constexpr int MODE = MixedCommMode::OPT_WAITS_LAMPORT1_MC;                           \
+        return __VA_ARGS__();                                                                \
+      }                                                                                      \
+      case MixedCommMode::OPT_WAITS_LAMPORT1_UC: {                                           \
+        constexpr int MODE = MixedCommMode::OPT_WAITS_LAMPORT1_UC;                           \
+        return __VA_ARGS__();                                                                \
+      }                                                                                      \
+      case MixedCommMode::OPT_WAITS_LAMPORT2_MC: {                                           \
+        constexpr int MODE = MixedCommMode::OPT_WAITS_LAMPORT2_MC;                           \
+        return __VA_ARGS__();                                                                \
+      }                                                                                      \
+      case MixedCommMode::OPT_WAITS_LAMPORT2_UC: {                                           \
+        constexpr int MODE = MixedCommMode::OPT_WAITS_LAMPORT2_UC;                           \
+        return __VA_ARGS__();                                                                \
+      }                                                                                      \
+      case MixedCommMode::OPT_BYTES_SIGNAL_MC: {                                             \
+        constexpr int MODE = MixedCommMode::OPT_BYTES_SIGNAL_MC;                             \
+        return __VA_ARGS__();                                                                \
+      }                                                                                      \
+      case MixedCommMode::OPT_BYTES_SIGNAL_UC: {                                             \
+        constexpr int MODE = MixedCommMode::OPT_BYTES_SIGNAL_UC;                             \
+        return __VA_ARGS__();                                                                \
+      }                                                                                      \
+      case MixedCommMode::OPT_BYTES_LAMPORT1_MC: {                                           \
+        constexpr int MODE = MixedCommMode::OPT_BYTES_LAMPORT1_MC;                           \
+        return __VA_ARGS__();                                                                \
+      }                                                                                      \
+      case MixedCommMode::OPT_BYTES_LAMPORT1_UC: {                                           \
+        constexpr int MODE = MixedCommMode::OPT_BYTES_LAMPORT1_UC;                           \
+        return __VA_ARGS__();                                                                \
+      }                                                                                      \
+      case MixedCommMode::OPT_BYTES_LAMPORT2_MC: {                                           \
+        constexpr int MODE = MixedCommMode::OPT_BYTES_LAMPORT2_MC;                           \
+        return __VA_ARGS__();                                                                \
+      }                                                                                      \
+      case MixedCommMode::OPT_BYTES_LAMPORT2_UC: {                                           \
+        constexpr int MODE = MixedCommMode::OPT_BYTES_LAMPORT2_UC;                           \
+        return __VA_ARGS__();                                                                \
+      }                                                                                      \
+      case MixedCommMode::MIXED_SIGNAL_MC: {                                                 \
+        constexpr int MODE = MixedCommMode::MIXED_SIGNAL_MC;                                 \
+        return __VA_ARGS__();                                                                \
+      }                                                                                      \
+      case MixedCommMode::MIXED_SIGNAL_UC: {                                                 \
+        constexpr int MODE = MixedCommMode::MIXED_SIGNAL_UC;                                 \
+        return __VA_ARGS__();                                                                \
+      }                                                                                      \
+      case MixedCommMode::MIXED_LAMPORT1_MC: {                                               \
+        constexpr int MODE = MixedCommMode::MIXED_LAMPORT1_MC;                               \
+        return __VA_ARGS__();                                                                \
+      }                                                                                      \
+      case MixedCommMode::MIXED_LAMPORT1_UC: {                                               \
+        constexpr int MODE = MixedCommMode::MIXED_LAMPORT1_UC;                               \
+        return __VA_ARGS__();                                                                \
+      }                                                                                      \
+      case MixedCommMode::MIXED_LAMPORT2_MC: {                                               \
+        constexpr int MODE = MixedCommMode::MIXED_LAMPORT2_MC;                               \
+        return __VA_ARGS__();                                                                \
+      }                                                                                      \
+      case MixedCommMode::MIXED_LAMPORT2_UC: {                                               \
+        constexpr int MODE = MixedCommMode::MIXED_LAMPORT2_UC;                               \
         return __VA_ARGS__();                                                                \
       }                                                                                      \
       default: {                                                                             \
@@ -198,67 +290,78 @@ Map<String, int> get_block_size_range(DLDataType dtype, int local_tp_rank, int l
                                       int inter_tp_size, int inter_dp_rank, int inter_dp_size) {
   int num_nodes = inter_tp_size * inter_dp_size;
   int min_val = round_up<WARP_SIZE>(num_nodes);
-  int max_val_ar_ag_opt_waits;
-  int max_val_ar_ag_opt_bytes;
-  int max_val_ar_ag_mixed;
-  int max_val_rs_ar_opt_waits;
-  int max_val_rs_ar_opt_bytes;
-  int max_val_rs_ar_mixed;
+  std::array<int, NUM_MIXED_COMM_MODES> max_val_ar_ag;
+  std::array<int, NUM_MIXED_COMM_MODES> max_val_rs_ar;
+  std::fill(max_val_ar_ag.begin(), max_val_ar_ag.end(), 0);
+  std::fill(max_val_rs_ar.begin(), max_val_rs_ar.end(), 0);
+
+#define GET_SINGLE_MAX_BLOCK_SIZE(mode)                                                    \
+  do {                                                                                     \
+    max_val_ar_ag[mode] = get_max_block_size(                                              \
+        fused_allreduce_allgather_single_node<LOCAL_TP_SIZE, LOCAL_DP_SIZE, mode, T>);     \
+    max_val_rs_ar[mode] = get_max_block_size(                                              \
+        fused_reducescatter_allreduce_single_node<LOCAL_TP_SIZE, LOCAL_DP_SIZE, mode, T>); \
+  } while (false)
+
+#define GET_MULTI_MAX_BLOCK_SIZE(mode)                                                    \
+  do {                                                                                    \
+    max_val_ar_ag[mode] = get_max_block_size(                                             \
+        fused_allreduce_allgather_multi_node<LOCAL_TP_SIZE, LOCAL_DP_SIZE, mode, T>);     \
+    max_val_rs_ar[mode] = get_max_block_size(                                             \
+        fused_reducescatter_allreduce_multi_node<LOCAL_TP_SIZE, LOCAL_DP_SIZE, mode, T>); \
+  } while (false)
+
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(dtype, T, [&] {
     return DISPATCH_LOCAL_TP_DP_SIZE(local_tp_size, local_dp_size, [&] {
       if (num_nodes == 1) {
-        max_val_ar_ag_opt_waits =
-            get_max_block_size(fused_allreduce_allgather_single_node<LOCAL_TP_SIZE, LOCAL_DP_SIZE,
-                                                                     MixedCommMode::OPT_WAITS, T>);
-        max_val_ar_ag_opt_bytes =
-            get_max_block_size(fused_allreduce_allgather_single_node<LOCAL_TP_SIZE, LOCAL_DP_SIZE,
-                                                                     MixedCommMode::OPT_BYTES, T>);
-        max_val_ar_ag_mixed = 0;
-        max_val_rs_ar_opt_waits = get_max_block_size(
-            fused_reducescatter_allreduce_single_node<LOCAL_TP_SIZE, LOCAL_DP_SIZE,
-                                                      MixedCommMode::OPT_WAITS, T>);
-        max_val_rs_ar_opt_bytes = get_max_block_size(
-            fused_reducescatter_allreduce_single_node<LOCAL_TP_SIZE, LOCAL_DP_SIZE,
-                                                      MixedCommMode::OPT_BYTES, T>);
-        max_val_rs_ar_mixed = 0;
+        GET_SINGLE_MAX_BLOCK_SIZE(MixedCommMode::OPT_WAITS_SIGNAL_MC);
+        GET_SINGLE_MAX_BLOCK_SIZE(MixedCommMode::OPT_WAITS_SIGNAL_UC);
+        GET_SINGLE_MAX_BLOCK_SIZE(MixedCommMode::OPT_WAITS_LAMPORT1_MC);
+        GET_SINGLE_MAX_BLOCK_SIZE(MixedCommMode::OPT_WAITS_LAMPORT1_UC);
+        GET_SINGLE_MAX_BLOCK_SIZE(MixedCommMode::OPT_BYTES_SIGNAL_MC);
+        GET_SINGLE_MAX_BLOCK_SIZE(MixedCommMode::OPT_BYTES_SIGNAL_UC);
+        GET_SINGLE_MAX_BLOCK_SIZE(MixedCommMode::OPT_BYTES_LAMPORT1_MC);
+        GET_SINGLE_MAX_BLOCK_SIZE(MixedCommMode::OPT_BYTES_LAMPORT1_UC);
       } else {
-        max_val_ar_ag_opt_waits =
-            get_max_block_size(fused_allreduce_allgather_multi_node<LOCAL_TP_SIZE, LOCAL_DP_SIZE,
-                                                                    MixedCommMode::OPT_WAITS, T>);
-        max_val_ar_ag_opt_bytes =
-            get_max_block_size(fused_allreduce_allgather_multi_node<LOCAL_TP_SIZE, LOCAL_DP_SIZE,
-                                                                    MixedCommMode::OPT_BYTES, T>);
-        max_val_ar_ag_mixed =
-            get_max_block_size(fused_allreduce_allgather_multi_node<LOCAL_TP_SIZE, LOCAL_DP_SIZE,
-                                                                    MixedCommMode::MIXED, T>);
-        max_val_rs_ar_opt_waits = get_max_block_size(
-            fused_reducescatter_allreduce_multi_node<LOCAL_TP_SIZE, LOCAL_DP_SIZE,
-                                                     MixedCommMode::OPT_WAITS, T>);
-        max_val_rs_ar_opt_bytes = get_max_block_size(
-            fused_reducescatter_allreduce_multi_node<LOCAL_TP_SIZE, LOCAL_DP_SIZE,
-                                                     MixedCommMode::OPT_BYTES, T>);
-        max_val_rs_ar_mixed = get_max_block_size(
-            fused_reducescatter_allreduce_multi_node<LOCAL_TP_SIZE, LOCAL_DP_SIZE,
-                                                     MixedCommMode::MIXED, T>);
+        GET_MULTI_MAX_BLOCK_SIZE(MixedCommMode::OPT_WAITS_SIGNAL_MC);
+        GET_MULTI_MAX_BLOCK_SIZE(MixedCommMode::OPT_WAITS_SIGNAL_UC);
+        GET_MULTI_MAX_BLOCK_SIZE(MixedCommMode::OPT_WAITS_LAMPORT1_MC);
+        GET_MULTI_MAX_BLOCK_SIZE(MixedCommMode::OPT_WAITS_LAMPORT1_UC);
+        GET_MULTI_MAX_BLOCK_SIZE(MixedCommMode::OPT_WAITS_LAMPORT2_MC);
+        GET_MULTI_MAX_BLOCK_SIZE(MixedCommMode::OPT_WAITS_LAMPORT2_UC);
+        GET_MULTI_MAX_BLOCK_SIZE(MixedCommMode::OPT_BYTES_SIGNAL_MC);
+        GET_MULTI_MAX_BLOCK_SIZE(MixedCommMode::OPT_BYTES_SIGNAL_UC);
+        GET_MULTI_MAX_BLOCK_SIZE(MixedCommMode::OPT_BYTES_LAMPORT1_MC);
+        GET_MULTI_MAX_BLOCK_SIZE(MixedCommMode::OPT_BYTES_LAMPORT1_UC);
+        GET_MULTI_MAX_BLOCK_SIZE(MixedCommMode::OPT_BYTES_LAMPORT2_MC);
+        GET_MULTI_MAX_BLOCK_SIZE(MixedCommMode::OPT_BYTES_LAMPORT2_UC);
+        GET_MULTI_MAX_BLOCK_SIZE(MixedCommMode::MIXED_SIGNAL_MC);
+        GET_MULTI_MAX_BLOCK_SIZE(MixedCommMode::MIXED_SIGNAL_UC);
+        GET_MULTI_MAX_BLOCK_SIZE(MixedCommMode::MIXED_LAMPORT1_MC);
+        GET_MULTI_MAX_BLOCK_SIZE(MixedCommMode::MIXED_LAMPORT1_UC);
+        GET_MULTI_MAX_BLOCK_SIZE(MixedCommMode::MIXED_LAMPORT2_MC);
+        GET_MULTI_MAX_BLOCK_SIZE(MixedCommMode::MIXED_LAMPORT2_UC);
       }
       return true;
     });
   });
+
+#undef GET_SINGLE_MAX_BLOCK_SIZE
+#undef GET_MULTI_MAX_BLOCK_SIZE
+
   Map<String, int> outputs;
   outputs.Set("min_val", min_val);
-  outputs.Set("max_val_ar_ag_0", max_val_ar_ag_opt_waits);
-  outputs.Set("max_val_ar_ag_1", max_val_ar_ag_opt_bytes);
-  outputs.Set("max_val_ar_ag_2", max_val_ar_ag_mixed);
-  outputs.Set("max_val_rs_ar_0", max_val_rs_ar_opt_waits);
-  outputs.Set("max_val_rs_ar_1", max_val_rs_ar_opt_bytes);
-  outputs.Set("max_val_rs_ar_2", max_val_rs_ar_mixed);
+  for (int mode = 0; mode < NUM_MIXED_COMM_MODES; ++mode) {
+    outputs.Set("max_val_ar_ag_" + std::to_string(mode), max_val_ar_ag[mode]);
+    outputs.Set("max_val_rs_ar_" + std::to_string(mode), max_val_rs_ar[mode]);
+  }
   return outputs;
 }
 
-void fused_allreduce_allgather(TensorView x_out, TensorView x_in, void* mem_data_raw,
-                               void* mem_signal_raw, void* mc_data_full_raw, void* mc_data_tp_raw,
-                               void* mc_signal_full_raw, void* mc_signal_tp_raw,
-                               Optional<TensorView> ns_data_raw, Optional<TensorView> ns_signal_raw,
+void fused_allreduce_allgather(TensorView x_out, TensorView x_in, void* mem_data, void* mem_signal,
+                               void* uc_data_array, void* mc_data_full, void* mc_data_tp,
+                               void* mc_signal_full, void* mc_signal_tp, void* ns_data,
+                               void* ns_signal, void* index_info, void* reset_info,
                                int local_tp_rank, int local_tp_size, int local_dp_rank,
                                int local_dp_size, int inter_tp_rank, int inter_tp_size,
                                int inter_dp_rank, int inter_dp_size, int grid_size, int mode,
@@ -268,14 +371,6 @@ void fused_allreduce_allgather(TensorView x_out, TensorView x_in, void* mem_data
   CHECK_CUDA(x_out);
   CHECK_DEVICE(x_out, x_in);
   int num_nodes = inter_tp_size * inter_dp_size;
-  if (num_nodes > 1) {
-    TVM_FFI_ICHECK(ns_data_raw.has_value()) << "ns_data must be provided when num_nodes > 1";
-    TVM_FFI_ICHECK(ns_signal_raw.has_value()) << "ns_signal must be provided when num_nodes > 1";
-    CHECK_CONTIGUOUS(ns_data_raw.value());
-    CHECK_CONTIGUOUS(ns_signal_raw.value());
-    CHECK_DEVICE(x_out, ns_data_raw.value());
-    CHECK_DEVICE(x_out, ns_signal_raw.value());
-  }
   int dp_size = local_dp_size * inter_dp_size;
   TVM_FFI_ICHECK_EQ(x_out.dtype(), x_in.dtype()) << "x_out and x_in must have the same dtype";
   TVM_FFI_ICHECK_EQ(x_out.ndim(), x_in.ndim())
@@ -291,15 +386,32 @@ void fused_allreduce_allgather(TensorView x_out, TensorView x_in, void* mem_data
   cudaStream_t stream = get_stream(x_out.device());
   int smem_size = get_dummy_smem_size(x_out.device().device_id);
   size_t num_elems_in = x_in.numel();
+  size_t num_elems_out = x_out.numel();
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(x_out.dtype(), T, [&] {
-    T* x_out_ptr = reinterpret_cast<T*>(x_out.data_ptr());
-    T const* x_in_ptr = reinterpret_cast<T const*>(x_in.data_ptr());
-    T* mem_data = reinterpret_cast<T*>(mem_data_raw);
-    uint32_t* mem_signal = reinterpret_cast<uint32_t*>(mem_signal_raw);
-    T* mc_data_full = reinterpret_cast<T*>(mc_data_full_raw);
-    T* mc_data_tp = reinterpret_cast<T*>(mc_data_tp_raw);
-    uint32_t* mc_signal_full = reinterpret_cast<uint32_t*>(mc_signal_full_raw);
-    uint32_t* mc_signal_tp = reinterpret_cast<uint32_t*>(mc_signal_tp_raw);
+    MixedCommArgs<T> mixed_comm_args = {
+        .x_out = reinterpret_cast<T*>(x_out.data_ptr()),
+        .x_in = reinterpret_cast<T const*>(x_in.data_ptr()),
+        .mem_data_buffer = reinterpret_cast<T* const*>(mem_data),
+        .mem_signal_buffer = reinterpret_cast<uint32_t* const*>(mem_signal),
+        .uc_data_array_buffer = reinterpret_cast<T* const*>(uc_data_array),
+        .mc_data_full_buffer = reinterpret_cast<T* const*>(mc_data_full),
+        .mc_data_tp_buffer = reinterpret_cast<T* const*>(mc_data_tp),
+        .mc_signal_full_buffer = reinterpret_cast<uint32_t* const*>(mc_signal_full),
+        .mc_signal_tp_buffer = reinterpret_cast<uint32_t* const*>(mc_signal_tp),
+        .ns_data_buffer = reinterpret_cast<T* const*>(ns_data),
+        .ns_signal_buffer = reinterpret_cast<uint64_t* const*>(ns_signal),
+        .index_info = reinterpret_cast<uint32_t*>(index_info),
+        .reset_info = reinterpret_cast<int4*>(reset_info),
+        .num_elems_in = num_elems_in,
+        .num_elems_out = num_elems_out,
+        .local_tp_rank = local_tp_rank,
+        .local_dp_rank = local_dp_rank,
+        .inter_tp_rank = inter_tp_rank,
+        .inter_dp_rank = inter_dp_rank,
+        .inter_tp_size = inter_tp_size,
+        .inter_dp_size = inter_dp_size,
+    };
+    void* args[] = {&mixed_comm_args};
     constexpr int elems_per_thd = ACCESS_BYTES / sizeof(T);
     TVM_FFI_ICHECK_EQ(mod<elems_per_thd>(num_elems_in), 0)
         << "The number of elements in x_in must be divisible by " << elems_per_thd;
@@ -307,9 +419,6 @@ void fused_allreduce_allgather(TensorView x_out, TensorView x_in, void* mem_data
                                                           inter_tp_size, dp_size, mode);
     return DISPATCH_LOCAL_TP_DP_SIZE(local_tp_size, local_dp_size, [&] {
       if (num_nodes == 1) {
-        void* args[] = {&x_out_ptr,    &x_in_ptr,      &mem_data,       &mem_signal,
-                        &mc_data_full, &mc_data_tp,    &mc_signal_full, &mc_signal_tp,
-                        &num_elems_in, &local_tp_rank, &local_dp_rank};
         return DISPATCH_MODE_SINGLE_NODE(mode, [&] {
           auto kernel =
               fused_allreduce_allgather_single_node<LOCAL_TP_SIZE, LOCAL_DP_SIZE, MODE, T>;
@@ -317,13 +426,6 @@ void fused_allreduce_allgather(TensorView x_out, TensorView x_in, void* mem_data
                                smem_size, stream);
         });
       } else {
-        T* ns_data_ptr = reinterpret_cast<T*>(ns_data_raw.value().data_ptr());
-        uint64_t* ns_signal_ptr = reinterpret_cast<uint64_t*>(ns_signal_raw.value().data_ptr());
-        void* args[] = {&x_out_ptr,     &x_in_ptr,      &mem_data,       &mem_signal,
-                        &mc_data_full,  &mc_data_tp,    &mc_signal_full, &mc_signal_tp,
-                        &ns_data_ptr,   &ns_signal_ptr, &num_elems_in,   &local_tp_rank,
-                        &local_dp_rank, &inter_tp_rank, &inter_dp_rank,  &inter_tp_size,
-                        &inter_dp_size};
         return DISPATCH_MODE_MULTI_NODE(mode, [&] {
           auto kernel = fused_allreduce_allgather_multi_node<LOCAL_TP_SIZE, LOCAL_DP_SIZE, MODE, T>;
           return LAUNCH_KERNEL(kernel, block_size_raw, num_accesses, num_nodes, grid_size, args,
@@ -334,25 +436,19 @@ void fused_allreduce_allgather(TensorView x_out, TensorView x_in, void* mem_data
   });
 }
 
-void fused_reducescatter_allreduce(
-    TensorView x_out, TensorView x_in, void* mem_data_raw, void* mem_signal_raw,
-    void* uc_data_array_raw, void* mc_data_full_raw, void* mc_data_tp_raw, void* mc_signal_full_raw,
-    Optional<TensorView> ns_data_raw, Optional<TensorView> ns_signal_raw, int local_tp_rank,
-    int local_tp_size, int local_dp_rank, int local_dp_size, int inter_tp_rank, int inter_tp_size,
-    int inter_dp_rank, int inter_dp_size, int grid_size, int mode, Optional<int> block_size_raw) {
+void fused_reducescatter_allreduce(TensorView x_out, TensorView x_in, void* mem_data,
+                                   void* mem_signal, void* uc_data_array, void* mc_data_full,
+                                   void* mc_data_tp, void* mc_signal_full, void* mc_signal_tp,
+                                   void* ns_data, void* ns_signal, void* index_info,
+                                   void* reset_info, int local_tp_rank, int local_tp_size,
+                                   int local_dp_rank, int local_dp_size, int inter_tp_rank,
+                                   int inter_tp_size, int inter_dp_rank, int inter_dp_size,
+                                   int grid_size, int mode, Optional<int> block_size_raw) {
   CHECK_CONTIGUOUS(x_out);
   CHECK_CONTIGUOUS(x_in);
   CHECK_CUDA(x_out);
   CHECK_DEVICE(x_out, x_in);
   int num_nodes = inter_tp_size * inter_dp_size;
-  if (num_nodes > 1) {
-    TVM_FFI_ICHECK(ns_data_raw.has_value()) << "ns_data must be provided when num_nodes > 1";
-    TVM_FFI_ICHECK(ns_signal_raw.has_value()) << "ns_signal must be provided when num_nodes > 1";
-    CHECK_CONTIGUOUS(ns_data_raw.value());
-    CHECK_CONTIGUOUS(ns_signal_raw.value());
-    CHECK_DEVICE(x_out, ns_data_raw.value());
-    CHECK_DEVICE(x_out, ns_signal_raw.value());
-  }
   int dp_size = local_dp_size * inter_dp_size;
   TVM_FFI_ICHECK_EQ(x_out.dtype(), x_in.dtype()) << "x_out and x_in must have the same dtype";
   TVM_FFI_ICHECK_EQ(x_out.ndim(), x_in.ndim())
@@ -367,16 +463,33 @@ void fused_reducescatter_allreduce(
   }
   cudaStream_t stream = get_stream(x_out.device());
   int smem_size = get_dummy_smem_size(x_out.device().device_id);
+  size_t num_elems_in = x_in.numel();
   size_t num_elems_out = x_out.numel();
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(x_out.dtype(), T, [&] {
-    T* x_out_ptr = reinterpret_cast<T*>(x_out.data_ptr());
-    T const* x_in_ptr = reinterpret_cast<T const*>(x_in.data_ptr());
-    T* mem_data = reinterpret_cast<T*>(mem_data_raw);
-    uint32_t* mem_signal = reinterpret_cast<uint32_t*>(mem_signal_raw);
-    T* const* uc_data_array = reinterpret_cast<T* const*>(uc_data_array_raw);
-    T* mc_data_full = reinterpret_cast<T*>(mc_data_full_raw);
-    T* mc_data_tp = reinterpret_cast<T*>(mc_data_tp_raw);
-    uint32_t* mc_signal_full = reinterpret_cast<uint32_t*>(mc_signal_full_raw);
+    MixedCommArgs<T> mixed_comm_args = {
+        .x_out = reinterpret_cast<T*>(x_out.data_ptr()),
+        .x_in = reinterpret_cast<T const*>(x_in.data_ptr()),
+        .mem_data_buffer = reinterpret_cast<T* const*>(mem_data),
+        .mem_signal_buffer = reinterpret_cast<uint32_t* const*>(mem_signal),
+        .uc_data_array_buffer = reinterpret_cast<T* const*>(uc_data_array),
+        .mc_data_full_buffer = reinterpret_cast<T* const*>(mc_data_full),
+        .mc_data_tp_buffer = reinterpret_cast<T* const*>(mc_data_tp),
+        .mc_signal_full_buffer = reinterpret_cast<uint32_t* const*>(mc_signal_full),
+        .mc_signal_tp_buffer = reinterpret_cast<uint32_t* const*>(mc_signal_tp),
+        .ns_data_buffer = reinterpret_cast<T* const*>(ns_data),
+        .ns_signal_buffer = reinterpret_cast<uint64_t* const*>(ns_signal),
+        .index_info = reinterpret_cast<uint32_t*>(index_info),
+        .reset_info = reinterpret_cast<int4*>(reset_info),
+        .num_elems_in = num_elems_in,
+        .num_elems_out = num_elems_out,
+        .local_tp_rank = local_tp_rank,
+        .local_dp_rank = local_dp_rank,
+        .inter_tp_rank = inter_tp_rank,
+        .inter_dp_rank = inter_dp_rank,
+        .inter_tp_size = inter_tp_size,
+        .inter_dp_size = inter_dp_size,
+    };
+    void* args[] = {&mixed_comm_args};
     constexpr int elems_per_thd = ACCESS_BYTES / sizeof(T);
     TVM_FFI_ICHECK_EQ(mod<elems_per_thd>(num_elems_out), 0)
         << "The number of elements in x_out must be divisible by " << elems_per_thd;
@@ -384,9 +497,6 @@ void fused_reducescatter_allreduce(
                                                           inter_tp_size, dp_size, mode);
     return DISPATCH_LOCAL_TP_DP_SIZE(local_tp_size, local_dp_size, [&] {
       if (num_nodes == 1) {
-        void* args[] = {&x_out_ptr,     &x_in_ptr,      &mem_data,     &mem_signal,
-                        &uc_data_array, &mc_data_full,  &mc_data_tp,   &mc_signal_full,
-                        &num_elems_out, &local_tp_rank, &local_dp_rank};
         return DISPATCH_MODE_SINGLE_NODE(mode, [&] {
           auto kernel =
               fused_reducescatter_allreduce_single_node<LOCAL_TP_SIZE, LOCAL_DP_SIZE, MODE, T>;
@@ -394,13 +504,6 @@ void fused_reducescatter_allreduce(
                                smem_size, stream);
         });
       } else {
-        T* ns_data_ptr = reinterpret_cast<T*>(ns_data_raw.value().data_ptr());
-        uint64_t* ns_signal_ptr = reinterpret_cast<uint64_t*>(ns_signal_raw.value().data_ptr());
-        void* args[] = {&x_out_ptr,     &x_in_ptr,      &mem_data,      &mem_signal,
-                        &uc_data_array, &mc_data_full,  &mc_data_tp,    &mc_signal_full,
-                        &ns_data_ptr,   &ns_signal_ptr, &num_elems_out, &local_tp_rank,
-                        &local_dp_rank, &inter_tp_rank, &inter_dp_rank, &inter_tp_size,
-                        &inter_dp_size};
         return DISPATCH_MODE_MULTI_NODE(mode, [&] {
           auto kernel =
               fused_reducescatter_allreduce_multi_node<LOCAL_TP_SIZE, LOCAL_DP_SIZE, MODE, T>;

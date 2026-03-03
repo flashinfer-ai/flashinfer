@@ -1,7 +1,7 @@
 import argparse
 import multiprocessing as mp
+import statistics
 
-import numpy as np
 import torch
 
 from flashinfer.comm.mixed_comm import MixedComm
@@ -34,11 +34,8 @@ def print_duration(info, func, input_args, input_kwargs=None):
         use_cuda_graph=True,
         num_iters_within_graph=10,
     )
-    duration_us = (
-        torch.tensor(duration_list).median() / torch.distributed.get_world_size() * 1000
-    )
-    torch.distributed.reduce(duration_us, dst=0)
-    print_first_rank(f"{info}: {duration_us.item():.3f} us")
+    duration_us = statistics.mean(duration_list) * 1000
+    print_first_rank(f"{info}: {duration_us:.3f} us")
 
 
 def bench_allreduce_allgather(mixed_comm, data, local_bs):
@@ -81,7 +78,6 @@ def _run_worker(local_rank, local_size, args):
     world_size = num_nodes * local_size
     torch.cuda.set_device(local_rank)
     torch.random.manual_seed(world_rank)
-    np.random.seed(0)
     device = torch.device("cuda", local_rank)
     torch.distributed.init_process_group(
         backend="cpu:gloo,cuda:nccl",
