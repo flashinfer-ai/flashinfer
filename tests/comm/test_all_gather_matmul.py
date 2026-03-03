@@ -24,6 +24,7 @@ import torch.distributed._symmetric_memory as symm_mem
 import torch.multiprocessing as mp
 
 from flashinfer.comm import all_gather_matmul
+from flashinfer.utils import get_compute_capability
 
 HID = 8192
 OUT_HID = 2048
@@ -73,6 +74,14 @@ def unit_test(rank: int, world_size: int, port: int, dtype: torch.dtype):
     dist.destroy_process_group()
 
 
+@pytest.mark.skipif(
+    torch.cuda.device_count() < 2,
+    reason="Tests require at least 2 CUDA devices",
+)
+@pytest.mark.skipif(
+    get_compute_capability(torch.device("cuda:0"))[0] < 9,
+    reason="Tests runs only on SM90+ devices",
+)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_all_gather_matmul(dtype: torch.dtype):
     import os
