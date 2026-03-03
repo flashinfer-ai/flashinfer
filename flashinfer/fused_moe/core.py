@@ -2061,9 +2061,17 @@ def get_trtllm_moe_sm100_module():
             use_shuffled_weight=True,
         )
         tunning_config = MoERunner.tuning_config_no_hidden_states_scales
+        # Create placeholder for tuning when routing_logits is None (routed mode)
+        routing_logits_for_tuning = (
+            routing_logits
+            if routing_logits is not None
+            else torch.empty(
+                num_tokens, num_experts, dtype=routing_dtype, device="meta"
+            )
+        )
         inputs = [
             output,
-            routing_logits,
+            routing_logits_for_tuning,
             topk_ids,
             expert_weights,
             hidden_states,
