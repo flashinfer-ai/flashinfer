@@ -1180,11 +1180,9 @@ class MxInt4BlockScaleLauncher : public FusedMoeLauncher {
   }
 
   void check_routing() const override {
-    // Check ndim==2 and size>0 because empty placeholder tensors may have non-null data_ptr
-    if (expert_indices.ndim() == 2 && expert_indices.size(0) > 0) {
+    if (has_precomputed_indices()) {
       // Pre-computed routing: expert_indices is a packed tensor
       // Format: (expert_id << 16) | (weight_bf16.view(int16))
-      TVM_FFI_ICHECK_EQ(expert_indices.ndim(), 2) << "expert_indices must be 2D.";
       TVM_FFI_ICHECK_EQ(expert_indices.size(0), hidden_states.size(0))
           << "expert_indices and hidden_states must have same number of tokens.";
       TVM_FFI_ICHECK_EQ(expert_indices.size(1), args->top_k)
@@ -1205,9 +1203,7 @@ class MxInt4BlockScaleLauncher : public FusedMoeLauncher {
         routing_bias.has_value() ? routing_bias.value().dtype() : dl_bfloat16;
     mRoutingBiasDtype = routing_bias_dtype == dl_bfloat16 ? btg::Dtype::Bfloat16 : btg::Dtype::Fp32;
 
-    // Check ndim==2 and size>0 because empty placeholder tensors may have non-null data_ptr
-    bool has_precomputed_indices = expert_indices.ndim() == 2 && expert_indices.size(0) > 0;
-    if (has_precomputed_indices) {
+    if (has_precomputed_indices()) {
       // Use expert_indices directly
       workspace.routing_expert_indexes =
           static_cast<int*>(const_cast<void*>(expert_indices.data_ptr()));
@@ -1216,15 +1212,13 @@ class MxInt4BlockScaleLauncher : public FusedMoeLauncher {
       args->routing_logits = static_cast<float*>(routing_logits.value().data_ptr());
     }
 
-    // Check ndim==2 and size>0 because empty placeholder tensors may have non-null data_ptr
-    bool has_precomputed_weights = expert_weights_in.ndim() == 2 && expert_weights_in.size(0) > 0;
-    if (!has_precomputed_weights) {
+    if (has_precomputed_weights()) {
+      workspace.expert_weights = const_cast<void*>(expert_weights_in.data_ptr());
+    } else {
       // Allocate expert_weights buffer for routing output
       expert_weights =
           alloc_tensor({args->num_tokens, args->top_k}, dl_bfloat16, hidden_states.device());
       workspace.expert_weights = expert_weights.data_ptr();
-    } else {
-      workspace.expert_weights = const_cast<void*>(expert_weights_in.data_ptr());
     }
   }
 
@@ -1298,6 +1292,17 @@ class MxInt4BlockScaleLauncher : public FusedMoeLauncher {
   int32_t max_num_padded_tokens_gemm1{};
   int32_t max_num_padded_tokens_gemm2{};
 
+  // Helper to check if pre-computed routing indices are provided
+  // Check ndim==2 and size>0 because empty placeholder tensors may have non-null data_ptr
+  bool has_precomputed_indices() const {
+    return expert_indices.ndim() == 2 && expert_indices.size(0) > 0;
+  }
+
+  // Helper to check if pre-computed routing weights are provided
+  bool has_precomputed_weights() const {
+    return expert_weights_in.ndim() == 2 && expert_weights_in.size(0) > 0;
+  }
+
  public:
   // Override to handle pre-computed routing
   Array<Tensor> run(int64_t moe_tactic, bool enable_pdl = true,
@@ -1309,15 +1314,13 @@ class MxInt4BlockScaleLauncher : public FusedMoeLauncher {
     cudaStream_t routing_stream = get_stream(hidden_states.device());
     tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
 
-    // Check ndim==2 and size>0 because empty placeholder tensors may have non-null data_ptr
-    bool use_precomputed = expert_indices.ndim() == 2 && expert_indices.size(0) > 0;
     // When using pre-computed routing, pass nullptr as routing_logits to tell the
     // routing runner to use the pre-computed expert indices from workspace.routing_expert_indexes
     routing_runner.run(
-        use_precomputed ? nullptr : args->routing_logits, args->routing_bias, args->num_tokens,
-        args->num_experts, args->top_k, args->n_group, args->topk_group, args->local_expert_offset,
-        args->local_num_experts, args->routed_scaling_factor, workspace.routing_expert_indexes,
-        static_cast<int*>(expert_count_histogram.data_ptr()),
+        has_precomputed_indices() ? nullptr : args->routing_logits, args->routing_bias,
+        args->num_tokens, args->num_experts, args->top_k, args->n_group, args->topk_group,
+        args->local_expert_offset, args->local_num_experts, args->routed_scaling_factor,
+        workspace.routing_expert_indexes, static_cast<int*>(expert_count_histogram.data_ptr()),
         static_cast<int*>(total_num_padded_tokens.data_ptr()),
         static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
         nullptr /*permuted_idx_to_expanded_idx.data_ptr()*/,
