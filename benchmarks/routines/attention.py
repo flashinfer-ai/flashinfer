@@ -1440,7 +1440,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
 def testBatchPrefillWithRaggedKVCacheWrapper(args):
     """
     Test BatchPrefillWithRaggedKVCacheWrapper API and equivalent cuDNN API.
-    Supports fa2, fa3, cutlass, cudnn and trtllm-gen backends.
+    Supports fa2, fa3, cutlass, cudnn and trtllm-native backends.
 
     This test:
     1. Creates ragged KV cache and query tensors for prefill

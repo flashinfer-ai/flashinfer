@@ -3438,7 +3438,7 @@ def trtllm_ragged_attention_deepseek(
     window_left: int,
     cum_seq_lens_q: torch.Tensor,
     cum_seq_lens_kv: torch.Tensor,
-    enable_pdl: bool,
+    enable_pdl: bool | None,
     is_causal: bool,
     return_lse: bool,
     attention_sinks: Optional[torch.Tensor] = None,
@@ -3530,6 +3530,20 @@ def trtllm_ragged_attention_deepseek(
             device=query.device,
             dtype=out_dtype,
         )
+    else:
+        expected_shape = (query.shape[0], query.shape[1], value.shape[2])
+        if tuple(out.shape) != expected_shape:
+            raise ValueError(
+                f"out must have shape {expected_shape}, got {tuple(out.shape)}"
+            )
+        if query.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and out.dtype in (
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        ):
+            raise ValueError(
+                "FP8 output is not supported for trtllm_ragged_attention_deepseek; "
+                "use bfloat16 or float16 for out."
+            )
     if return_lse and lse is None:
         lse = torch.empty(
             query.shape[0],
@@ -3570,6 +3584,9 @@ def trtllm_ragged_attention_deepseek(
         lse,
     )
     if return_lse:
+        assert lse is not None, (
+            "lse assumed not None beyond this point when return_lse is True"
+        )
         return out, lse
     else:
         return out

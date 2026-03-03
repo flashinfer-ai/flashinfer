@@ -60,7 +60,10 @@ def generate_seq_lens_prefill(batch_size: int, max_q_len: int, max_in_kv_len: in
 
 
 def generate_seq_lens_decode(
-    batch_size: int, q_len_per_req: int | None, max_in_kv_len: int, max_q_len: int
+    batch_size: int,
+    q_len_per_req: int | None,
+    max_in_kv_len: int,
+    max_q_len: int | None,
 ):
     if q_len_per_req is not None:
         assert max_q_len is None, "Can not specify both q_len_per_req and max_q_len."

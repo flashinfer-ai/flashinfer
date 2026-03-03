@@ -254,7 +254,8 @@ void trtllm_paged_attention_decode(
       << std::to_string(head_dim_q);
   TVM_FFI_ICHECK((head_dim_v == 576 && head_dim_o == 512) ||
                  (head_dim_v == 320 && head_dim_o == 256) || head_dim_v == head_dim_o)
-      << "head_dim_v and head_dim_o must be the same for non-MLA attention, got "
+      << "head_dim_v and head_dim_o must be the same for non-MLA attention, or equal to (576, 512) "
+         "or (320, 256) for MLA attention, got "
       << std::to_string(head_dim_v) << " and " << std::to_string(head_dim_o);
   int max_num_blocks_per_seq = block_tables.size(-1);
   bool is_shared_kv = key_cache.data_ptr() == value_cache.data_ptr();
