@@ -18,5 +18,11 @@
   "tests/comm": ["@flashinfer-ai/comm-owners"],
 
   "flashinfer/norm.py": ["@flashinfer-ai/misc-op-owners"],
-  "tests/norm": ["@flashinfer-ai/misc-op-owners"]
+  "tests/norm": ["@flashinfer-ai/misc-op-owners"],
+  
+  "benchmarks/gdn/": ["@flashinfer-ai/misc-op-owners"],
+  "flashinfer/gdn_decode.py": ["@flashinfer-ai/misc-op-owners"],
+  "flashinfer/gdn_prefill.py": ["@flashinfer-ai/misc-op-owners"],
+  "flashinfer/gdn_kernels/": ["@flashinfer-ai/misc-op-owners"],
+  "tests/gdn/": ["@flashinfer-ai/misc-op-owners"]
 }
