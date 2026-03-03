@@ -1190,6 +1190,16 @@ class MxInt4BlockScaleLauncher : public FusedMoeLauncher {
       TVM_FFI_ICHECK_EQ(expert_indices.dtype(), dl_int32) << "expert_indices must be int32.";
     }
 
+    if (has_precomputed_weights()) {
+      // Pre-computed expert weights: validate shape and dtype
+      TVM_FFI_ICHECK_EQ(expert_weights_in.size(0), hidden_states.size(0))
+          << "expert_weights_in and hidden_states must have same number of tokens.";
+      TVM_FFI_ICHECK_EQ(expert_weights_in.size(1), args->top_k)
+          << "expert_weights_in dim1 must match top_k.";
+      TVM_FFI_ICHECK_EQ(expert_weights_in.dtype(), dl_bfloat16)
+          << "expert_weights_in must be bfloat16.";
+    }
+
     FusedMoeLauncher::check_routing_common();
   }
 
