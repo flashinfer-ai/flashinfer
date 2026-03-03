@@ -82,27 +82,19 @@ def _run_mm_mxfp8(
             pytest.skip("trtllm does not support swizzled scales")
         if k % 256 != 0:
             pytest.skip("trtllm does not support non-multiple of 256")
-        if out_dtype == torch.float16:
-            pytest.skip("trtllm does not support float16 output")
+        if out_dtype != torch.bfloat16:
+            pytest.skip("trtllm does not support non-bfloat16 output")
 
     input = torch.randn([m, k], device="cuda", dtype=input_dtype)
     mat2 = torch.randn([n, k], device="cuda", dtype=input_dtype)
 
     input_mxfp8, mat2_mxfp8, input_descale, mat2_descale = _prepare_mxfp8_tensors(
-        input, mat2, is_sf_swizzled_layout
+        input, mat2, is_sf_swizzled_layout, backend
     )
 
     reference = torch.mm(input, mat2.T)
 
     res = torch.empty([m, n], device="cuda", dtype=out_dtype) if provide_out else None
-
-    if backend == "trtllm":
-        mat2_mxfp8 = shuffle_matrix_a(mat2_mxfp8, 128).reshape(n, k)
-        mat2_descale = shuffle_matrix_sf_a(
-            mat2_descale.reshape(n, k // 32),
-            128,
-            num_elts_per_sf=32,
-        ).reshape(n, k // 32)
 
     with autotune(auto_tuning):
         res = mm_mxfp8(
@@ -123,15 +115,9 @@ def _run_mm_mxfp8(
     _assert_cosine_similarity(reference, res, is_sf_swizzled_layout)
 
 
-def _prepare_descales(input_scale, weight_scale, m, n, k, is_sf_swizzled_layout):
-    if is_sf_swizzled_layout:
-        return input_scale, weight_scale
-    input_descale = input_scale.view(m, k // 32)
-    weight_descale = weight_scale.view(n, k // 32).t()
-    return input_descale, weight_descale
-
-
-def _prepare_mxfp8_tensors(input_bf16, weight_bf16, is_sf_swizzled_layout):
+def _prepare_mxfp8_tensors(
+    input_bf16, weight_bf16, is_sf_swizzled_layout, backend="cutlass"
+):
     m, k = input_bf16.shape
     n = weight_bf16.shape[0]
     input_mxfp8, input_scale = mxfp8_quantize(
@@ -140,10 +126,17 @@ def _prepare_mxfp8_tensors(input_bf16, weight_bf16, is_sf_swizzled_layout):
     weight_mxfp8, weight_scale = mxfp8_quantize(
         weight_bf16, is_sf_swizzled_layout=is_sf_swizzled_layout
     )
-    input_descale, weight_descale = _prepare_descales(
-        input_scale, weight_scale, m, n, k, is_sf_swizzled_layout
-    )
-    return input_mxfp8, weight_mxfp8, input_descale, weight_descale
+    if backend == "trtllm":
+        weight_mxfp8 = shuffle_matrix_a(weight_mxfp8, 128).reshape(n, k)
+        weight_scale = shuffle_matrix_sf_a(
+            weight_scale.reshape(n, k // 32),
+            128,
+            num_elts_per_sf=32,
+        ).reshape(-1)
+    if not is_sf_swizzled_layout:
+        input_scale = input_scale.view(m, k // 32)
+        weight_scale = weight_scale.view(n, k // 32).t()
+    return input_mxfp8, weight_mxfp8, input_scale, weight_scale
 
 
 @pytest.mark.parametrize("m", [128, 256, 512, 1024])
@@ -226,7 +219,7 @@ def test_mm_mxfp8_invalid_input_dtype():
     b = torch.randn([k, n], device="cuda", dtype=torch.bfloat16)
     a_scale = torch.empty([m * (k // 32)], device="cuda", dtype=torch.uint8)
     b_scale = torch.empty([n * (k // 32)], device="cuda", dtype=torch.uint8)
-    with pytest.raises(RuntimeError, match="float8_e4m3fn"):
+    with pytest.raises(ValueError, match="float8_e4m3fn"):
         mm_mxfp8(a, b, a_scale, b_scale, out_dtype=torch.bfloat16, backend="cutlass")
 
 
@@ -237,7 +230,7 @@ def test_mm_mxfp8_invalid_ndim():
     b = torch.randn([k, n], device="cuda", dtype=torch.bfloat16)
     a_scale = torch.empty([m * (k // 32)], device="cuda", dtype=torch.uint8)
     b_scale = torch.empty([n * (k // 32)], device="cuda", dtype=torch.uint8)
-    with pytest.raises(AssertionError, match="a must be 2D"):
+    with pytest.raises(ValueError, match="accepts 2d tensors"):
         mm_mxfp8(a, b, a_scale, b_scale, out_dtype=torch.bfloat16, backend="cutlass")
 
     a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
@@ -247,7 +240,7 @@ def test_mm_mxfp8_invalid_ndim():
     a_descale = a_scale.view(1, -1, 1)
     b_descale = b_scale.view(1, -1, 1)
     with pytest.raises(
-        AssertionError,
+        ValueError,
         match=r"a_descale must be 1D \(swizzled\) or 2D \(non-swizzled\)",
     ):
         mm_mxfp8(
