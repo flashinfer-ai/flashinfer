@@ -2027,10 +2027,9 @@ def get_trtllm_moe_sm100_module():
                 0, dtype=routing_dtype, device=hidden_states.device
             )
         else:
-            # When routing_logits is None, we either have topk_ids/expert_weights,
-            # packed into a single tensor as topk_ids
+            # When routing_logits is None, we either have topk_ids/expert_weights
+            # packed into a single tensor as topk_ids,
             # or have them individually as topk_ids and expert_weights respectively
-            topk_ids = topk_ids
             expert_weights = (
                 expert_weights
                 if expert_weights is not None
