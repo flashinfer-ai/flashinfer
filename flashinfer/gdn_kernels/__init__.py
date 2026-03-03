@@ -9,25 +9,29 @@ implementations and JIT-compiled kernels. This submodule provides high-performan
 CuTe DSL variants optimized for specific use cases.
 
 Exported Kernels:
-- gated_delta_rule: BF16 hidden state decode kernel (T=1,2,3,4)
-- GatedDeltaRuleKernel: Kernel class for advanced usage
+- gated_delta_rule: BF16 hidden state decode kernel (T=1)
+- gated_delta_rule_mtp: BF16 hidden state MTP kernel (T>=1)
 """
-
-from typing import Optional, Type
 
 try:
     from .gdn_decode_bf16_state import (
         gated_delta_rule,
-        GatedDeltaRuleKernel,
+        gated_delta_rule_mtp,
+        gated_delta_rule_bf16state_cooprow,  # backward compat alias
+        gated_delta_rule_bf16state_cooprow_mtp,  # backward compat alias
     )
 
     _has_cute_dsl = True
 except ImportError:
     _has_cute_dsl = False
     gated_delta_rule = None  # type: ignore
-    GatedDeltaRuleKernel: Optional[Type] = None  # type: ignore
+    gated_delta_rule_mtp = None  # type: ignore
+    gated_delta_rule_bf16state_cooprow = None  # type: ignore
+    gated_delta_rule_bf16state_cooprow_mtp = None  # type: ignore
 
 __all__ = [
     "gated_delta_rule",
-    "GatedDeltaRuleKernel",
+    "gated_delta_rule_mtp",
+    "gated_delta_rule_bf16state_cooprow",
+    "gated_delta_rule_bf16state_cooprow_mtp",
 ]

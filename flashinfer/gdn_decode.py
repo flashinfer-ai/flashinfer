@@ -60,16 +60,18 @@ except ImportError:
         return func
 
 
-# GDN decode K-last bf16 state kernel (T=1..4, bf16 state, K-last layout) - optional backend
+# GDN decode BF16 state kernels - optional backend
 try:
     from .gdn_kernels.gdn_decode_bf16_state import (
-        gated_delta_rule as _gated_delta_rule_gdn_decode_klast_bf16_state,
+        gated_delta_rule as _gated_delta_rule_bf16_state,
+        gated_delta_rule_mtp as _gated_delta_rule_bf16_state_mtp,
     )
 
-    _GDN_DECODE_KLAST_BF16_STATE_AVAILABLE = True
+    _GDN_DECODE_BF16_STATE_AVAILABLE = True
 except ImportError:
-    _GDN_DECODE_KLAST_BF16_STATE_AVAILABLE = False
-    _gated_delta_rule_gdn_decode_klast_bf16_state = None
+    _GDN_DECODE_BF16_STATE_AVAILABLE = False
+    _gated_delta_rule_bf16_state = None
+    _gated_delta_rule_bf16_state_mtp = None
 
 
 # ============================================================================
@@ -965,8 +967,8 @@ def gated_delta_rule_decode_pretranspose(
             Current value of shape ``[B, 1, HV, V]``. Must be float16/bfloat16.
         state (torch.Tensor):
             Current state of shape ``[B, HV, V, K]`` (v-major / K-last layout).
-            Float32: legacy kernel (T=1 only).             Bfloat16: gdn_decode_klast_bf16_state backend
-            when T in 1..4 and K=V=128. Will be updated in-place.
+            Float32: legacy kernel (T=1 only). Bfloat16: BF16 state backend
+            (T=1 or MTP for T>1) when K=V=128. Will be updated in-place.
         A_log (torch.Tensor):
             Log decay parameter of shape ``[HV]``. Must be float32.
         a (torch.Tensor):
@@ -992,7 +994,7 @@ def gated_delta_rule_decode_pretranspose(
         - Requires SM90 (Hopper) architecture
         - State is updated in-place
         - State layout is v-major (K-last): [B, HV, V, K]. When state is bfloat16
-          and T in 1..4 with K=V=128, the gdn_decode_klast_bf16_state kernel is used.
+          and K=V=128, the BF16 state kernel is used (T=1 or MTP for T>1).
         - Legacy path (float32 state, T=1): K and V must be multiples of 4.
     """
     # Validate input shapes
@@ -1004,34 +1006,49 @@ def gated_delta_rule_decode_pretranspose(
         f"Expected state shape [B={B}, HV={HV}, V={V}, K={K}], got {state.shape}"
     )
 
-    # Backend: gdn_decode_klast_bf16_state when bf16 state, T<=4, K-last layout, K=V=128
-    use_gdn_decode_klast_bf16_state = (
-        _GDN_DECODE_KLAST_BF16_STATE_AVAILABLE
+    # Backend: BF16 state kernel when bf16 state, K=V=128
+    use_bf16_state = (
+        _GDN_DECODE_BF16_STATE_AVAILABLE
         and state.dtype == torch.bfloat16
-        and T in (1, 2, 3, 4)
         and K == 128
         and V == 128
     )
-    if use_gdn_decode_klast_bf16_state:
+    if use_bf16_state:
         assert q.dtype in (torch.float16, torch.bfloat16), (
             f"q must be float16/bfloat16, got {q.dtype}"
         )
         assert A_log.dtype == torch.float32, f"A_log must be float32, got {A_log.dtype}"
         scale_val = K**-0.5 if scale is None else scale
-        out = _gated_delta_rule_gdn_decode_klast_bf16_state(
-            A_log=A_log,
-            a=a,
-            dt_bias=dt_bias,
-            softplus_beta=1.0,
-            softplus_threshold=20.0,
-            q=q,
-            k=k,
-            v=v,
-            b=b,
-            initial_state_source=state,
-            use_qk_l2norm_in_kernel=use_qk_l2norm,
-            scale=scale_val,
-        )
+        if T == 1:
+            out = _gated_delta_rule_bf16_state(
+                A_log=A_log,
+                a=a,
+                dt_bias=dt_bias,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+                q=q,
+                k=k,
+                v=v,
+                b=b,
+                initial_state_source=state,
+                use_qk_l2norm_in_kernel=use_qk_l2norm,
+                scale=scale_val,
+            )
+        else:
+            out = _gated_delta_rule_bf16_state_mtp(
+                A_log=A_log,
+                a=a,
+                dt_bias=dt_bias,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+                q=q,
+                k=k,
+                v=v,
+                b=b,
+                initial_state_source=state,
+                use_qk_l2norm_in_kernel=use_qk_l2norm,
+                scale=scale_val,
+            )
         output_provided = output is not None
         target_dtype = output.dtype if output_provided else q.dtype
         if output is not None:
@@ -2400,7 +2417,7 @@ def gated_delta_rule_mtp(
     scale: Optional[float] = None,
     output: Optional[torch.Tensor] = None,
     intermediate_states_buffer: Optional[torch.Tensor] = None,
-    disable_state_update: bool = True,
+    disable_state_update: bool = False,
     use_qk_l2norm: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
