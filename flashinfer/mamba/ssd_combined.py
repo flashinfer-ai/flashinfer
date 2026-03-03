@@ -24,14 +24,18 @@ This module provides the combined forward pass for Mamba2 SSD, combining:
 import functools
 from typing import Optional, Tuple
 
+import cutlass
+import cutlass.cute as cute
+import cutlass.torch as cutlass_torch
+import cuda.bindings.driver as cuda_drv
 import torch
+from cutlass.base_dsl.compiler import GenerateLineInfo  # profiling
+from cutlass.cute.runtime import from_dlpack
 
 from ..api_logging import flashinfer_api
 from ..jit.mamba.seq_chunk_cumsum import gen_seq_chunk_cumsum_module
 from ..triton.kernels.ssd_chunk_state import chunk_cumsum_fwd
-
-import cuda.bindings.driver as cuda_drv
-from cutlass.base_dsl.compiler import GenerateLineInfo  # profiling
+from .ssd_kernel import SSDKernel
 
 
 @functools.cache
@@ -40,29 +44,7 @@ def _get_seq_chunk_cumsum_module():
     return gen_seq_chunk_cumsum_module().build_and_load()
 
 
-def _import_cutlass_modules():
-    """Import CUTLASS modules (only when needed, as they require SM100)."""
-    import cuda.bindings.driver as cuda
-    import cutlass
-    import cutlass.cute as cute
-    import cutlass.torch as cutlass_torch
-    from cutlass.cute.runtime import from_dlpack
-
-    from .ssd_kernel import SSDKernel
-
-    return {
-        "cuda": cuda,
-        "cutlass": cutlass,
-        "cute": cute,
-        "cutlass_torch": cutlass_torch,
-        "from_dlpack": from_dlpack,
-        "SSDKernel": SSDKernel,
-    }
-
-
-def _create_cutlass_tensor(
-    shape, permute_order, dtype, dynamic_modes, cutlass_torch, from_dlpack
-):
+def _create_cutlass_tensor(shape, permute_order, dtype, dynamic_modes):
     """
     Create a tensor using the exact logic from mamba2_ssd.py to ensure compatibility.
 
@@ -71,8 +53,6 @@ def _create_cutlass_tensor(
         permute_order: Order to permute dimensions
         dtype: CUTLASS dtype
         dynamic_modes: List of modes to mark as dynamic
-        cutlass_torch: cutlass.torch module
-        from_dlpack: cutlass.cute.runtime.from_dlpack function
 
     Returns:
         (cute_tensor, torch_tensor): The CuTe tensor wrapper and the underlying PyTorch tensor on GPU
@@ -85,21 +65,31 @@ def _create_cutlass_tensor(
     )
 
     # Create CuTe tensor
+    # For a contiguous tensor permuted by p, dim_order == argsort(p)
     cute_tensor = from_dlpack(dst_tensor, assumed_align=16)
+    inv = [0] * len(permute_order)
+    for i, p in enumerate(permute_order):
+        inv[p] = i
+    stride_order = tuple(inv)
     for mode in dynamic_modes:
         cute_tensor = cute_tensor.mark_compact_shape_dynamic(
-            mode=mode, stride_order=dst_tensor.dim_order()
+            mode=mode, stride_order=stride_order
         )
 
     return cute_tensor, dst_tensor
 
 
-def _wrap_tensor(from_dlpack, tensor, dynamic_modes, align=16):
-    """from_dlpack + mark_compact_shape_dynamic for all dynamic modes."""
+def _wrap_tensor(tensor, dynamic_modes, stride_order, align=16):
+    """from_dlpack + mark_compact_shape_dynamic for all dynamic modes.
+
+    stride_order: the dim_order of the tensor — for a contiguous tensor
+    permuted by `perm`, this is `argsort(perm)` (the inverse permutation).
+    Passing it explicitly avoids torch's expensive
+    compute_elementwise_output_logical_to_physical_perm.
+    """
     ct = from_dlpack(tensor, assumed_align=align)
-    dim_order = tensor.dim_order()
     for m in dynamic_modes:
-        ct = ct.mark_compact_shape_dynamic(mode=m, stride_order=dim_order)
+        ct = ct.mark_compact_shape_dynamic(mode=m, stride_order=stride_order)
     return ct
 
 
@@ -141,9 +131,6 @@ class _SSDKernel:
             cumsum_dtype: Cumsum intermediate dtype (default: cutlass.Float32)
             acc_dtype: Accumulator dtype (default: cutlass.Float32)
         """
-        self.modules = _import_cutlass_modules()
-        cutlass = self.modules["cutlass"]
-
         self.chunk_size = chunk_size
         self.headdim = headdim
         self.dstate = dstate
@@ -159,7 +146,6 @@ class _SSDKernel:
         )
 
         # Create the kernel
-        SSDKernel = self.modules["SSDKernel"]
         self.kernel = SSDKernel(
             self.io_dtype,
             self.cumsum_dtype,
@@ -209,11 +195,6 @@ class _SSDKernel:
         Returns:
             final_states: (batch, nheads, headdim, dstate)
         """
-        cutlass = self.modules["cutlass"]
-        cute = self.modules["cute"]
-        cutlass_torch = self.modules["cutlass_torch"]
-        from_dlpack = self.modules["from_dlpack"]
-
         batch, seqlen, nheads, headdim = x.shape
         _, _, ngroups, dstate = B.shape
         chunk_size = self.chunk_size
@@ -232,9 +213,9 @@ class _SSDKernel:
         )
         x_permuted = x_reshaped.permute(4, 2, 1, 3, 0)  # (D, L, C, EH, B)
         x_tensor = from_dlpack(x_permuted, assumed_align=16)
-        for mode in [2, 3, 4]:
+        for mode in (2, 3, 4):
             x_tensor = x_tensor.mark_compact_shape_dynamic(
-                mode=mode, stride_order=x_permuted.dim_order()
+                mode=mode, stride_order=(4, 2, 1, 3, 0)
             )
 
         # z: same layout as x — (D, L, C, EH, B) with D stride 1, zero-copy
@@ -246,9 +227,9 @@ class _SSDKernel:
             )
             z_permuted = z_reshaped.permute(4, 2, 1, 3, 0)  # (D, L, C, EH, B)
             z_tensor = from_dlpack(z_permuted, assumed_align=16)
-            for mode in [2, 3, 4]:
+            for mode in (2, 3, 4):
                 z_tensor = z_tensor.mark_compact_shape_dynamic(
-                    mode=mode, stride_order=z_permuted.dim_order()
+                    mode=mode, stride_order=(4, 2, 1, 3, 0)
                 )
 
         # delta (dt_processed): (batch, nheads, nchunks, chunk_size) -> (chunk_size, nchunks, nheads, batch)
@@ -260,9 +241,9 @@ class _SSDKernel:
         )  # (L, C, EH, B)
         delta_tensor = from_dlpack(dt_permuted, assumed_align=16)
         # Mark dynamic modes: C=1, EH=2, B=3 (L=0 is static)
-        for mode in [1, 2, 3]:
+        for mode in (1, 2, 3):
             delta_tensor = delta_tensor.mark_compact_shape_dynamic(
-                mode=mode, stride_order=dt_permuted.dim_order()
+                mode=mode, stride_order=(3, 2, 1, 0)
             )
 
         assert dA_cumsum.dtype == cutlass_torch.dtype(self.cumsum_dtype), (
@@ -275,9 +256,9 @@ class _SSDKernel:
         )  # (L, C, EH, B) - zero-copy view
         cumsum_delta_tensor = from_dlpack(cumsum_permuted, assumed_align=16)
         # Mark dynamic modes: C=1, EH=2, B=3 (L=0 is static)
-        for mode in [1, 2, 3]:
+        for mode in (1, 2, 3):
             cumsum_delta_tensor = cumsum_delta_tensor.mark_compact_shape_dynamic(
-                mode=mode, stride_order=cumsum_permuted.dim_order()
+                mode=mode, stride_order=(3, 2, 1, 0)
             )
 
         # B: zero-copy (L, N, C, G, B) with N stride 1 (K-major for MMA B operand)
@@ -289,9 +270,9 @@ class _SSDKernel:
         )
         b_permuted = B_reshaped.permute(2, 4, 1, 3, 0)  # (L, N, C, G, B)
         b_tensor = from_dlpack(b_permuted, assumed_align=16)
-        for mode in [2, 3, 4]:
+        for mode in (2, 3, 4):
             b_tensor = b_tensor.mark_compact_shape_dynamic(
-                mode=mode, stride_order=b_permuted.dim_order()
+                mode=mode, stride_order=(4, 2, 0, 3, 1)
             )
 
         # C: zero-copy (L, N, C, G, B) with N stride 1 (K-major for MMA A operand)
@@ -303,9 +284,9 @@ class _SSDKernel:
         )
         c_permuted = C_reshaped.permute(2, 4, 1, 3, 0)  # (L, N, C, G, B)
         c_tensor = from_dlpack(c_permuted, assumed_align=16)
-        for mode in [2, 3, 4]:
+        for mode in (2, 3, 4):
             c_tensor = c_tensor.mark_compact_shape_dynamic(
-                mode=mode, stride_order=c_permuted.dim_order()
+                mode=mode, stride_order=(4, 2, 0, 3, 1)
             )
 
         # D: (nheads,) -> CUTLASS (1, nheads) or (headdim, nheads)
@@ -319,8 +300,6 @@ class _SSDKernel:
                     [1, 0],
                     self.io_dtype,
                     [1],
-                    cutlass_torch,
-                    from_dlpack,
                 )
                 d_dst.copy_(D.t().to(d_dst.dtype))
             else:
@@ -332,8 +311,6 @@ class _SSDKernel:
                     [1, 0],
                     self.io_dtype,
                     [1],
-                    cutlass_torch,
-                    from_dlpack,
                 )
                 d_dst.copy_(D.unsqueeze(0).to(d_dst.dtype))
         else:
@@ -347,9 +324,9 @@ class _SSDKernel:
             # B, EH, D, N -> D, N, EH, B - zero-copy view
             init_states_reshaped = init_states.permute(3, 2, 1, 0)
             init_states_tensor = from_dlpack(init_states_reshaped, assumed_align=16)
-            for mode in [2, 3]:  # EH and B are dynamic
+            for mode in (2, 3):  # EH and B are dynamic
                 init_states_tensor = init_states_tensor.mark_compact_shape_dynamic(
-                    mode=mode, stride_order=init_states_reshaped.dim_order()
+                    mode=mode, stride_order=(3, 2, 1, 0)
                 )
         else:
             init_states_tensor = None
@@ -361,9 +338,9 @@ class _SSDKernel:
         )
         out_permuted = out.permute(4, 2, 3, 1, 0)  # (L, D, C, EH, B)
         y_tensor = from_dlpack(out_permuted, assumed_align=16)
-        for mode in [2, 3, 4]:
+        for mode in (2, 3, 4):
             y_tensor = y_tensor.mark_compact_shape_dynamic(
-                mode=mode, stride_order=out_permuted.dim_order()
+                mode=mode, stride_order=(4, 3, 1, 2, 0)
             )
 
         # fstate: (headdim, dstate, nheads, batch_or_num_seqs)
@@ -374,8 +351,6 @@ class _SSDKernel:
             [3, 2, 1, 0],
             self.io_dtype,
             [2, 3],
-            cutlass_torch,
-            from_dlpack,
         )
 
         # Get max active clusters
@@ -550,28 +525,20 @@ class SSDCombined:
         self._has_varlen = has_varlen
         self._has_z = has_z
 
-        # Import CUTLASS modules once
-        mods = _import_cutlass_modules()
-        self._cutlass = mods["cutlass"]
-        self._cute = mods["cute"]
-        self._cutlass_torch = mods["cutlass_torch"]
-        self._from_dlpack = mods["from_dlpack"]
-
         # Resolve dtypes
         _dtype_map = {
-            torch.bfloat16: self._cutlass.BFloat16,
-            torch.float16: self._cutlass.Float16,
+            torch.bfloat16: cutlass.BFloat16,
+            torch.float16: cutlass.Float16,
         }
-        self._io_dtype = _dtype_map.get(dtype, self._cutlass.BFloat16)
-        self._cumsum_dtype = self._cutlass.Float32
-        self._acc_dtype = self._cutlass.Float32
-        self._io_torch_dtype = self._cutlass_torch.dtype(self._io_dtype)
+        self._io_dtype = _dtype_map.get(dtype, cutlass.BFloat16)
+        self._cumsum_dtype = cutlass.Float32
+        self._acc_dtype = cutlass.Float32
+        self._io_torch_dtype = cutlass_torch.dtype(self._io_dtype)
 
         # Create kernel object
         seq_idx_cutlass_dtype = (
-            self._cutlass.Int64 if seq_idx_dtype == "int64" else self._cutlass.Int32
+            cutlass.Int64 if seq_idx_dtype == "int64" else cutlass.Int32
         )
-        SSDKernel = mods["SSDKernel"]
         self._kernel_obj = SSDKernel(
             self._io_dtype,
             self._cumsum_dtype,
@@ -614,8 +581,6 @@ class SSDCombined:
                 [3, 2, 1, 0],
                 self._io_dtype,
                 [2, 3],
-                self._cutlass_torch,
-                self._from_dlpack,
             )
             self._fstate_shape = shape
         return self._fstate_cute, self._fstate_torch
@@ -637,8 +602,6 @@ class SSDCombined:
                 [1, 0],
                 self._io_dtype,
                 [1],
-                self._cutlass_torch,
-                self._from_dlpack,
             )
             self._d_torch.copy_(d_val.t().to(self._d_torch.dtype))
         else:
@@ -650,8 +613,6 @@ class SSDCombined:
                 [1, 0],
                 self._io_dtype,
                 [1],
-                self._cutlass_torch,
-                self._from_dlpack,
             )
             self._d_torch.copy_(d_val.unsqueeze(0).to(self._d_torch.dtype))
 
@@ -697,7 +658,6 @@ class SSDCombined:
 
         Parameters match ``ssd_combined_fwd`` — see its docstring for details.
         """
-        from_dlpack = self._from_dlpack
         chunk_size = self.chunk_size
 
         batch, seqlen, nheads, headdim = x.shape
@@ -783,9 +743,9 @@ class SSDCombined:
             f"x dtype {x.dtype} doesn't match {io_torch_dtype}"
         )
         x_tensor = _wrap_tensor(
-            from_dlpack,
             x_reshaped.permute(4, 2, 1, 3, 0),
-            [2, 3, 4],
+            (2, 3, 4),
+            (4, 2, 1, 3, 0),
         )
 
         # z: same layout as x
@@ -796,27 +756,27 @@ class SSDCombined:
                 f"z dtype {z.dtype} doesn't match {io_torch_dtype}"
             )
             z_tensor = _wrap_tensor(
-                from_dlpack,
                 z_reshaped.permute(4, 2, 1, 3, 0),
-                [2, 3, 4],
+                (2, 3, 4),
+                (4, 2, 1, 3, 0),
             )
 
         # dt: already in io_dtype from cumsum kernel, just permute
         delta_tensor = _wrap_tensor(
-            from_dlpack,
             dt_processed.permute(3, 2, 1, 0),
-            [1, 2, 3],
+            (1, 2, 3),
+            (3, 2, 1, 0),
         )
 
         # dA_cumsum: (B, EH, C, L) -> (L, C, EH, B)
-        assert dA_cumsum.dtype == self._cutlass_torch.dtype(self._cumsum_dtype), (
+        assert dA_cumsum.dtype == cutlass_torch.dtype(self._cumsum_dtype), (
             f"dA_cumsum dtype {dA_cumsum.dtype} doesn't match "
             f"cumsum_dtype {self._cumsum_dtype}"
         )
         cumsum_delta_tensor = _wrap_tensor(
-            from_dlpack,
             dA_cumsum.permute(3, 2, 1, 0),
-            [1, 2, 3],
+            (1, 2, 3),
+            (3, 2, 1, 0),
         )
 
         # B: (B, seqlen, G, N) -> (L, N, C, G, B)
@@ -825,9 +785,9 @@ class SSDCombined:
             f"B dtype {B.dtype} doesn't match {io_torch_dtype}"
         )
         b_tensor = _wrap_tensor(
-            from_dlpack,
             B_reshaped.permute(2, 4, 1, 3, 0),
-            [2, 3, 4],
+            (2, 3, 4),
+            (4, 2, 0, 3, 1),
         )
 
         # C: (B, seqlen, G, N) -> (L, N, C, G, B)
@@ -836,9 +796,9 @@ class SSDCombined:
             f"C dtype {C.dtype} doesn't match {io_torch_dtype}"
         )
         c_tensor = _wrap_tensor(
-            from_dlpack,
             C_reshaped.permute(2, 4, 1, 3, 0),
-            [2, 3, 4],
+            (2, 3, 4),
+            (4, 2, 0, 3, 1),
         )
 
         # D (cached)
@@ -852,9 +812,9 @@ class SSDCombined:
                 f"{io_torch_dtype}"
             )
             init_states_tensor = _wrap_tensor(
-                from_dlpack,
                 initial_states.permute(3, 2, 1, 0),
-                [2, 3],
+                (2, 3),
+                (3, 2, 1, 0),
             )
 
         # out: (B, EH, D, C, L) -> (L, D, C, EH, B)
@@ -862,9 +822,9 @@ class SSDCombined:
             f"out dtype {out.dtype} doesn't match {io_torch_dtype}"
         )
         y_tensor = _wrap_tensor(
-            from_dlpack,
             out.permute(4, 2, 3, 1, 0),
-            [2, 3, 4],
+            (2, 3, 4),
+            (4, 3, 1, 2, 0),
         )
 
         # fstate (cached)
@@ -919,11 +879,11 @@ class SSDCombined:
 
         # -- Step 5: Compile on first call ------------------------------------
         if self._max_active_clusters is None:
-            hardware_info = self._cutlass.utils.HardwareInfo()
+            hardware_info = cutlass.utils.HardwareInfo()
             self._max_active_clusters = hardware_info.get_max_active_clusters(1)
 
         if self._compiled_kernel is None:
-            self._compiled_kernel = self._cute.compile[GenerateLineInfo(True)](
+            self._compiled_kernel = cute.compile[GenerateLineInfo(True)](
                 self._kernel_obj,
                 x_tensor,
                 cumsum_delta_tensor,
