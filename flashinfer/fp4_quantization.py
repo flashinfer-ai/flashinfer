@@ -155,7 +155,6 @@ def get_fp4_quantization_module(backend: str = "100"):
     # as it enables native FP4 conversion instructions (cvt.rn.satfinite.e2m1x2.f32).
     if backend == "120":
         from .utils import version_at_least
-        import torch
         if version_at_least(torch.version.cuda, "12.9"):
             backend = "120f"
 
