@@ -260,7 +260,7 @@ void TrtllmGenBatchedGemmRunner::run(
 
   auto const err =
       bmm.run(config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount,
-              enable_pdl, nullptr, globalTrtllmGenBatchedGemmModuleCache);
+              enable_pdl, /*pinnedHostBuffer=*/nullptr, globalTrtllmGenBatchedGemmModuleCache);
 
   FLASHINFER_CHECK(err == 0,
                    "Error occurred when running GEMM!"
