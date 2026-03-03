@@ -43,6 +43,18 @@ enum class TllmPagedAttentionMode {
 
 namespace {
 
+#define DISPATCH_DTYPE(dtype, c_type, ...) \
+  [&]() -> bool {                          \
+    if ((dtype) == dl_int32) {             \
+      using c_type = int32_t;              \
+      return __VA_ARGS__();                \
+    } else if ((dtype) == dl_uint32) {     \
+      using c_type = uint32_t;             \
+      return __VA_ARGS__();                \
+    }                                      \
+    return false;                          \
+  }()
+
 template <typename BlockT, typename SeqLenT>
 __global__ void sanitize_trtllm_swa_block_tables_kernel(
     BlockT* block_tables, const SeqLenT* seq_lens, const int32_t* cum_seq_lens_q,
@@ -141,36 +153,18 @@ void maybe_sanitize_trtllm_swa_block_tables_inplace(
     int64_t cum_seq_lens_q_size, int64_t batch_size, int64_t max_num_blocks_per_seq,
     int64_t max_kv_len, int64_t max_q_len, int64_t page_size, int64_t window_left,
     int64_t num_pages_in_mem_pool, cudaStream_t stream) {
-  if (block_tables.dtype() == dl_int32 && seq_lens.dtype() == dl_int32) {
-    sanitize_trtllm_swa_block_tables_inplace<int32_t, int32_t>(
-        static_cast<int32_t*>(block_tables.data_ptr()), static_cast<int32_t*>(seq_lens.data_ptr()),
-        cum_seq_lens_q_ptr, batch_size, max_num_blocks_per_seq, max_kv_len, max_q_len, page_size,
-        window_left, num_pages_in_mem_pool, cum_seq_lens_q_size, stream);
-    return;
+  bool dispatched = DISPATCH_DTYPE(block_tables.dtype(), TBlock, [&] {
+    return DISPATCH_DTYPE(seq_lens.dtype(), TSeq, [&] {
+      sanitize_trtllm_swa_block_tables_inplace<TBlock, TSeq>(
+          static_cast<TBlock*>(block_tables.data_ptr()), static_cast<TSeq*>(seq_lens.data_ptr()),
+          cum_seq_lens_q_ptr, batch_size, max_num_blocks_per_seq, max_kv_len, max_q_len, page_size,
+          window_left, num_pages_in_mem_pool, cum_seq_lens_q_size, stream);
+      return true;
+    });
+  });
+  if (!dispatched) {
+    FLASHINFER_ERROR("Unsupported block_tables/seq_lens dtype combination for SWA sanitization.");
   }
-  if (block_tables.dtype() == dl_int32 && seq_lens.dtype() == dl_uint32) {
-    sanitize_trtllm_swa_block_tables_inplace<int32_t, uint32_t>(
-        static_cast<int32_t*>(block_tables.data_ptr()), static_cast<uint32_t*>(seq_lens.data_ptr()),
-        cum_seq_lens_q_ptr, batch_size, max_num_blocks_per_seq, max_kv_len, max_q_len, page_size,
-        window_left, num_pages_in_mem_pool, cum_seq_lens_q_size, stream);
-    return;
-  }
-  if (block_tables.dtype() == dl_uint32 && seq_lens.dtype() == dl_int32) {
-    sanitize_trtllm_swa_block_tables_inplace<uint32_t, int32_t>(
-        static_cast<uint32_t*>(block_tables.data_ptr()), static_cast<int32_t*>(seq_lens.data_ptr()),
-        cum_seq_lens_q_ptr, batch_size, max_num_blocks_per_seq, max_kv_len, max_q_len, page_size,
-        window_left, num_pages_in_mem_pool, cum_seq_lens_q_size, stream);
-    return;
-  }
-  if (block_tables.dtype() == dl_uint32 && seq_lens.dtype() == dl_uint32) {
-    sanitize_trtllm_swa_block_tables_inplace<uint32_t, uint32_t>(
-        static_cast<uint32_t*>(block_tables.data_ptr()),
-        static_cast<uint32_t*>(seq_lens.data_ptr()), cum_seq_lens_q_ptr, batch_size,
-        max_num_blocks_per_seq, max_kv_len, max_q_len, page_size, window_left,
-        num_pages_in_mem_pool, cum_seq_lens_q_size, stream);
-    return;
-  }
-  FLASHINFER_ERROR("Unsupported block_tables/seq_lens dtype combination for SWA sanitization.");
 }
 
 }  // namespace
@@ -374,6 +368,9 @@ void trtllm_paged_attention_decode(
   TVM_FFI_ICHECK_EQ(seq_lens.dtype(), dl_int32) << "seq_lens must be int32";
   TVM_FFI_ICHECK_EQ(block_tables.size(0), seq_lens.size(0))
       << "block_tables batch size must match seq_lens batch size";
+  TVM_FFI_ICHECK_EQ(batch_size, block_tables.size(0))
+      << "batch_size must match block_tables.size(0)";
+  TVM_FFI_ICHECK_EQ(batch_size, seq_lens.size(0)) << "batch_size must match seq_lens.size(0)";
   TVM_FFI_ICHECK_GE(window_left, -1) << "window_left must be >= -1";
   TVM_FFI_ICHECK_EQ(key_cache.ndim(), value_cache.ndim());
   for (int i = 0; i < key_cache.ndim(); i++) {
@@ -491,6 +488,9 @@ void trtllm_paged_attention_context(
   TVM_FFI_ICHECK_EQ(seq_lens.dtype(), dl_int32) << "seq_lens must be int32";
   TVM_FFI_ICHECK_EQ(block_tables.size(0), seq_lens.size(0))
       << "block_tables batch size must match seq_lens batch size";
+  TVM_FFI_ICHECK_EQ(batch_size, block_tables.size(0))
+      << "batch_size must match block_tables.size(0)";
+  TVM_FFI_ICHECK_EQ(batch_size, seq_lens.size(0)) << "batch_size must match seq_lens.size(0)";
   TVM_FFI_ICHECK_GE(window_left, -1) << "window_left must be >= -1";
   TVM_FFI_ICHECK_EQ(cum_seq_lens_q.ndim(), 1) << "cum_seq_lens_q must be a 1D tensor";
   TVM_FFI_ICHECK_EQ(cum_seq_lens_q.dtype(), dl_int32) << "cum_seq_lens_q must be int32";
