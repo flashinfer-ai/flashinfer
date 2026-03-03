@@ -1,9 +1,9 @@
 """
-Block Expanding Attention with Tile-Level Skip Optimization (V2)
+Blockwise Extend Attention with Tile-Level Skip Optimization
 
 优化原理:
 ═══════════════════════════════════════════════════════════════════════════════
-V2 版本使用原生 MaskMode::kBlockExpanding 触发 kernel 内置的 tile 级跳过优化：
+使用原生 MaskMode::kBlockExpanding 触发 kernel 内置的 tile 级跳过优化：
 
 1. num_iterations 计算：根据 Block Expanding 边界精确计算需要迭代的 KV tiles
    kv_valid_end = ((q_tile_end - 1) / dllm_block_size + 1) * dllm_block_size
@@ -15,21 +15,14 @@ V2 版本使用原生 MaskMode::kBlockExpanding 触发 kernel 内置的 tile 级
 
 3. 原生 mask 计算：在边界 tile 上使用 (q_block >= k_block) 规则
 
-Block Expanding Mask 规则:
+Block Extend Mask 规则:
 ───────────────────────────────────────────────────────────────────────────────
   mask[q, k] = (q / dllm_block_size) >= (k / dllm_block_size)
   同一 block 内双向可见，可以看见之前的 blocks，不能看见后续 blocks
 
-V1 vs V2 对比:
-───────────────────────────────────────────────────────────────────────────────
-  V1: MaskMode::kCustom - 每个 tile 都调用 LogitsMask，无 tile 级跳过
-  V2: MaskMode::kBlockExpanding - 原生 tile 级跳过 + 精确 mask
-
 使用方法:
-    from flashinfer.dllm.block_expanding_tile_skip import block_expanding_attention_v2
-    
-    # 使用优化版本
-    o = block_expanding_attention_v2(q, k, v, dllm_block_size=32)
+    from flashinfer.dllm import block_extend_attention_with_offset
+    o = block_extend_attention_with_offset(q, k, v, dllm_block_size=32)
 """
 
 import math
@@ -43,42 +36,40 @@ from ..prefill import single_prefill_with_kv_cache_with_jit_module
 from ..utils import MaskMode, is_sm90a_supported
 
 
+# ════════════════════════════════════════════════════════════════════════════════════
+# Variant 定义：使用原生 MaskMode::kBlockExpanding
+# ════════════════════════════════════════════════════════════════════════════════════
+#
+# CUDA kernel 支持 MaskMode::kBlockExpanding 的 tile 级跳过：
+#   - num_iterations: block_expanding_num_iterations() 精确计算 KV 有效范围
+#   - mask_iteration: block_expanding_mask_iteration() 确定无需 mask 检查的 tiles
+#   - position_mask: (q_block >= k_block) && (kv_idx < chunk_end)
+#
+# 因此 variant 的 LogitsMask 只需返回 true，让 kernel 的 position_mask 生效
+#
+# ════════════════════════════════════════════════════════════════════════════════════
 
-
-BLOCK_EXTEND_V2_VARIANT_DECL = r"""
-
-struct BlockExtendAttentionV2 : AttentionVariantBase {
-  static constexpr bool use_softmax = true;
-
-  uint32_t qo_len;
-  uint32_t kv_len;
-  uint32_t window_left;
-  float sm_scale_log2;
-
-  template <typename Params>
-  __device__ __host__ BlockExtendAttentionV2(const Params& params, uint32_t batch_idx,
-                                                 uint8_t* smem_ptr) {
-    qo_len = params.get_qo_len(batch_idx);
-    kv_len = params.get_kv_len(batch_idx);
-    sm_scale_log2 = params.sm_scale * math::log2e;
-    window_left = kv_len;  // 不使用 sliding window
-  }
-
-  // ════════════════════════════════════════════════════════════════════════════════
-  // LogitsMask: 直接返回 true
-  // ════════════════════════════════════════════════════════════════════════════════
-  REGISTER_LOGITS_MASK(params, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
-    return true;  // kernel 的 position_mask 已处理 Block Expanding 逻辑
-  });
-
-  // 不需要额外的 logits 变换
-  REGISTER_LOGITS_TRANSFORM(params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
-    return logits;
-  });
-};
-"""
+# ════════════════════════════════════════════════════════════════════════════════════
+# V2 with offset Variant 定义：支持 q_offset 的 Block Expanding Attention
+# ════════════════════════════════════════════════════════════════════════════════════
+#
+# 用于增量 Chunk Prefill 场景，每个 chunk 的 Q 有全局偏移
+# q_offset 通过 SinglePrefillParams.q_block_expanding_offset 传入
+# kernel 内部通过 get_q_block_expanding_offset(batch_idx) 获取偏移
+#
+# ════════════════════════════════════════════════════════════════════════════════════
 
 BLOCK_EXTEND_V2_WITH_OFFSET_VARIANT_DECL = r"""
+// ════════════════════════════════════════════════════════════════════════════════════
+// BlockExtendAttentionV2WithOffset: 支持 q_offset 的 Block Expanding Attention
+// ════════════════════════════════════════════════════════════════════════════════════
+//
+// 用于增量 Chunk Prefill 场景：
+//   - 每个 chunk 的 Q 有全局偏移 q_offset
+//   - kernel 通过 params.get_q_block_expanding_offset() 获取偏移
+//   - position_mask 内部计算：(q_global_block >= k_block)
+//
+// ════════════════════════════════════════════════════════════════════════════════════
 
 struct BlockExtendAttentionV2WithOffset : AttentionVariantBase {
   static constexpr bool use_softmax = true;
@@ -97,6 +88,17 @@ struct BlockExtendAttentionV2WithOffset : AttentionVariantBase {
     window_left = kv_len;  // 不使用 sliding window
   }
 
+  // ════════════════════════════════════════════════════════════════════════════════
+  // LogitsMask: 直接返回 true
+  // ════════════════════════════════════════════════════════════════════════════════
+  //
+  // CUDA kernel 已原生支持 MaskMode::kBlockExpanding:
+  //   - q_offset 通过 params.get_q_block_expanding_offset(batch_idx) 获取
+  //   - position_mask 内部处理：(q_global_block >= k_block)
+  //
+  // 因此 LogitsMask 只需返回 true
+  //
+  // ════════════════════════════════════════════════════════════════════════════════
   REGISTER_LOGITS_MASK(params, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
     return true;  // kernel 的 position_mask 已处理 Block Expanding + q_offset 逻辑
   });
@@ -108,6 +110,10 @@ struct BlockExtendAttentionV2WithOffset : AttentionVariantBase {
 };
 """
 
+
+# ════════════════════════════════════════════════════════════════════════════════════
+# 统一的 AOT 工具函数
+# ════════════════════════════════════════════════════════════════════════════════════
 
 def _get_aot_path(uri: str) -> Path:
     """获取 AOT 预编译路径 (统一接口)"""
@@ -130,15 +136,18 @@ def _get_dtype_str(dtype: torch.dtype) -> str:
     }.get(dtype, "fp16")
 
 
-
-def _get_module_uri_v2(head_dim: int, dtype: torch.dtype) -> str:
-    """生成 V2 模块的唯一标识符"""
-    return f"single_prefill_block_expanding_v2_hd{head_dim}_{_get_dtype_str(dtype)}"
-
+# ════════════════════════════════════════════════════════════════════════════════════
+# 模块 URI 生成函数
+# ════════════════════════════════════════════════════════════════════════════════════
 
 def _get_module_uri_with_offset(head_dim: int, dtype: torch.dtype, backend: str) -> str:
-    """生成 with offset 模块的唯一标识符"""
-    return f"block_expanding_{backend}_with_offset_hdim{head_dim}_{_get_dtype_str(dtype)}"
+    """生成 with offset 模块的唯一标识符
+    
+    v2: 4 scalar params (sm_scale, dllm_block_size, q_block_expanding_offset,
+                         kv_block_expanding_offset)
+    旧版本 (无 _v2 后缀) 只有 3 scalar，需要重新编译时会自动匹配新 URI。
+    """
+    return f"block_expanding_{backend}_with_offset_v2_hdim{head_dim}_{_get_dtype_str(dtype)}"
 
 
 def _get_module_uri_v2_with_offset(head_dim: int, dtype: torch.dtype) -> str:
@@ -151,76 +160,38 @@ def _get_module_uri_v3_with_offset(head_dim: int, dtype: torch.dtype) -> str:
     return _get_module_uri_with_offset(head_dim, dtype, "fa3")
 
 
-_MODULE_CACHE_V2 = {}
+# ════════════════════════════════════════════════════════════════════════════════════
+# 模块缓存
+# ════════════════════════════════════════════════════════════════════════════════════
 _MODULE_CACHE_WITH_OFFSET = {}  # key = (head_dim, dtype, backend)
 
 
-def get_block_extend_module_v2(
-    head_dim: int = 128,
-    dtype: torch.dtype = torch.float16,
-):
-    """
-    获取优化版 Block Extend Attention 模块
-    
-    与 v1 的区别:
-    - 使用 MaskMode::kBlockExpanding 触发 tile 级跳过优化
-    - 在 LogitsMask 中返回 true，让 kernel 的 position_mask 生效
-    
-    Args:
-        head_dim: Head 维度
-        dtype: 数据类型
-    
-    Returns:
-        编译好的模块
-    """
-    import os
-    import tvm_ffi
-    
-    cache_key = (head_dim, dtype)
-    if cache_key in _MODULE_CACHE_V2:
-        return _MODULE_CACHE_V2[cache_key]
-    
-    uri = _get_module_uri_v2(head_dim, dtype)
-    
-
-    if _check_aot_available(uri):
-        aot_path = _get_aot_path(uri)
-        module = tvm_ffi.load_module(str(aot_path))
-        _MODULE_CACHE_V2[cache_key] = module
-        return module
-    
-
-    if os.environ.get("FLASHINFER_DISABLE_JIT"):
-        raise RuntimeError(
-            f"JIT compilation is disabled via FLASHINFER_DISABLE_JIT environment variable, "
-            f"but the required AOT module is not found at: {_get_aot_path(uri)}. "
-            f"Please add the missing module to the AOT build configuration."
-        )
-    
-
-    spec = gen_customize_single_prefill_module(
-        backend="fa2",
-        uri=uri,
-        dtype_q=dtype,
-        dtype_kv=dtype,
-        dtype_o=dtype,
-        head_dim_qk=head_dim,
-        head_dim_vo=head_dim,
-        additional_tensor_names=[],
-        additional_tensor_dtypes=[],
-        additional_scalar_names=["sm_scale", "dllm_block_size"],
-        additional_scalar_dtypes=["double", "int64_t"],
-        variant_name="BlockExtendAttentionV2",
-        variant_decl=BLOCK_EXTEND_V2_VARIANT_DECL,
-        mask_modes=[4],  # ★ kBlockExpanding = 4
-    )
-    module = spec.build_and_load()
-    
-    _MODULE_CACHE_V2[cache_key] = module
-    return module
-
+# ════════════════════════════════════════════════════════════════════════════════════
+# V3 FA3 Variant 定义：Hopper (SM90) 架构的 Block Expanding Attention
+# ════════════════════════════════════════════════════════════════════════════════════
+#
+# FA3 使用不同的 variant 接口：
+#   - 构造函数接收 MainloopParams 和 BlockCoord
+#   - 需要 GetAttentionUpdater() 模板函数
+#   - 通过 params.additional_params.xxx 访问自定义参数
+#
+# FA3 kernel 已原生支持 kBlockExpanding，因此 LogitsTransform 只需返回 logits
+#
+# ════════════════════════════════════════════════════════════════════════════════════
 
 BLOCK_EXTEND_V3_WITH_OFFSET_VARIANT_DECL = r"""
+// ════════════════════════════════════════════════════════════════════════════════════
+// BlockExtendAttentionV3WithOffset: FA3 (Hopper SM90) 版本的 Block Expanding Attention
+// ════════════════════════════════════════════════════════════════════════════════════
+//
+// FA3 kernel 已原生支持 MaskMode::kBlockExpanding:
+//   - get_num_kv_tiles(): 根据 Block Expanding 边界精确计算 KV 有效范围
+//   - mma_f16(): BLOCK_EXPANDING 模板参数控制 n_masking_steps 和 col_limit
+//   - position_mask: (q_global_block >= k_block) && (kv_idx < kv_len)
+//
+// 因此 LogitsTransform 只需返回 logits，让 kernel 的原生 mask 逻辑生效
+//
+// ════════════════════════════════════════════════════════════════════════════════════
 
 struct BlockExtendAttentionV3WithOffset : AttentionVariantBase {
   float sm_scale_log2;
@@ -238,6 +209,18 @@ struct BlockExtendAttentionV3WithOffset : AttentionVariantBase {
     return OnlineSoftmax<NUM_ROWS_PER_THREAD, /*WITH_SCALE=*/true>(sm_scale_log2);
   }
 
+  // ════════════════════════════════════════════════════════════════════════════════
+  // LogitsTransform: 直接返回 logits
+  // ════════════════════════════════════════════════════════════════════════════════
+  //
+  // FA3 kernel 已原生支持 MaskMode::kBlockExpanding:
+  //   - BLOCK_EXPANDING 模板参数启用后，mma_f16 会计算 block_expanding_col_limit
+  //   - n_masking_steps 类似 CAUSAL，只在边界 tile 上检查 mask
+  //   - 完全不可见的 KV tiles 被 get_num_kv_tiles() 跳过
+  //
+  // 因此 LogitsTransform 只需返回 logits
+  //
+  // ════════════════════════════════════════════════════════════════════════════════
   REGISTER_LOGITS_TRANSFORM(params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
     return logits;  // kernel 的原生 BLOCK_EXPANDING mask 已处理
   });
@@ -267,7 +250,7 @@ def get_block_extend_module_with_offset(
     import os
     import tvm_ffi
     
-
+    # FA3 需要 SM90 支持
     if backend == "fa3" and not is_sm90a_supported(torch.device("cuda")):
         raise RuntimeError(
             "FA3 backend requires SM90 (Hopper) architecture. "
@@ -280,21 +263,21 @@ def get_block_extend_module_with_offset(
     
     uri = _get_module_uri_with_offset(head_dim, dtype, backend)
     
-
+    # AOT 模式
     if _check_aot_available(uri):
         aot_path = _get_aot_path(uri)
         module = tvm_ffi.load_module(str(aot_path))
         _MODULE_CACHE_WITH_OFFSET[cache_key] = module
         return module
     
-
+    # AOT 不存在，检查是否禁用了 JIT
     if os.environ.get("FLASHINFER_DISABLE_JIT"):
         raise RuntimeError(
             f"JIT compilation is disabled via FLASHINFER_DISABLE_JIT environment variable, "
             f"but the required AOT module is not found at: {_get_aot_path(uri)}."
         )
     
-
+    # JIT 模式
     if backend == "fa3":
         variant_name = "BlockExtendAttentionV3WithOffset"
         variant_decl = BLOCK_EXTEND_V3_WITH_OFFSET_VARIANT_DECL
@@ -322,47 +305,6 @@ def get_block_extend_module_with_offset(
     
     _MODULE_CACHE_WITH_OFFSET[cache_key] = module
     return module
-
-def block_extend_attention_v2(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    dllm_block_size: int,
-    sm_scale: Optional[float] = None,
-    return_lse: bool = False,
-) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    """
-    Block Extend Attention with Tile-Level Skip Optimization (V2)
-    
-    相比 v1 的优化:
-    1. 利用 MaskMode::kCausal 的 tile 级跳过优化
-    2. num_iterations 裁剪：完全跳过不可见的 KV tiles
-    3. mask_iteration 优化：只在边界 tile 调用 LogitsMask
-    """
-    # 参数验证
-    assert q.dim() == 3 and k.dim() == 3 and v.dim() == 3, \
-        "q, k, v must be 3D tensors [seq_len, num_heads, head_dim]"
-    assert (dllm_block_size & (dllm_block_size - 1)) == 0, \
-        f"dllm_block_size must be power of 2, got {dllm_block_size}"
-    
-    head_dim = q.size(-1)
-    dtype = q.dtype
-    
-    if sm_scale is None:
-        sm_scale = 1.0 / math.sqrt(head_dim)
-    
-    # 获取优化版模块
-    module = get_block_extend_module_v2(head_dim=head_dim, dtype=dtype)
-
-    return single_prefill_with_kv_cache_with_jit_module(
-        module,
-        q, k, v,
-        sm_scale,
-        dllm_block_size,
-        mask_mode=MaskMode.BLOCK_EXPANDING.value,  # BLOCK_EXPANDING tile 跳过
-        return_lse=return_lse,
-    )
-
 
 def block_extend_attention_with_offset(
     q: torch.Tensor,
@@ -470,6 +412,17 @@ def block_extend_attention_v3_with_offset(
     )
 
 
+# ════════════════════════════════════════════════════════════════════════════════════
+# FA2 Cascade 版本：Current Chunk (causal=True) + Prefix (causal=False) + merge_state
+# ════════════════════════════════════════════════════════════════════════════════════
+#
+# 类似 SGLang 的 Cascade Attention 实现：
+#   - 当 chunk_size = dllm_block_size 时，causal mask ≡ block extend mask
+#   - 使用标准 FlashInfer API，无需 custom_mask
+#   - 前缀全可见 (Q 的 block >= 所有 prefix 的 block)
+#
+# ════════════════════════════════════════════════════════════════════════════════════
+
 def block_extend_cascade(
     q: torch.Tensor,
     k_current: torch.Tensor,
@@ -526,7 +479,17 @@ def block_extend_cascade(
     
     has_prefix = k_prefix is not None and v_prefix is not None
     prefix_len = k_prefix.size(0) if has_prefix else 0
-
+    
+    # ════════════════════════════════════════════════════════════════════════════
+    # 阶段 1: Current Chunk (Block Expanding mask)
+    # ════════════════════════════════════════════════════════════════════════════
+    #
+    # 使用原生 Block Expanding mask:
+    #   - q_offset = prefix_len (Q 的全局位置从 prefix_len 开始)
+    #   - kv_offset = prefix_len (K_current 的全局位置也从 prefix_len 开始)
+    #   - mask[q, k] = (q_global / B) >= (kv_global / B)
+    #
+    # ════════════════════════════════════════════════════════════════════════════
     
     # 没有 prefix 时直接返回，有 prefix 时需要 merge 所以强制 return_lse=True
     if not has_prefix:
@@ -550,7 +513,16 @@ def block_extend_cascade(
         backend=backend,
     )
     
-
+    # ════════════════════════════════════════════════════════════════════════════
+    # 阶段 2: Prefix (causal=False, 全可见)
+    # ════════════════════════════════════════════════════════════════════════════
+    #
+    # Q 的全局位置 >= prefix 的末尾位置，所以：
+    #   - Q_block >= 所有 prefix 的 K_block
+    #   - Block Expanding mask 对 prefix 全部为 1
+    #   - 使用 causal=False (全可见)
+    #
+    # ════════════════════════════════════════════════════════════════════════════
     o2, s2 = single_prefill_with_kv_cache(
         q, k_prefix, v_prefix,
         causal=False,  # prefix 全可见
@@ -558,7 +530,9 @@ def block_extend_cascade(
         return_lse=True,
     )
     
-
+    # ════════════════════════════════════════════════════════════════════════════
+    # 阶段 3: Merge State (in-place 合并)
+    # ════════════════════════════════════════════════════════════════════════════
     merge_state_in_place(o1, s1, o2, s2)
     
     if return_lse:

@@ -88,219 +88,94 @@ from .compilation_context import CompilationContext
 
 
 # Import DLLM variant definitions
-from .dllm.block_expanding import BLOCK_EXPANDING_VARIANT_DECL
 from .dllm.block_extend import (
-    BLOCK_EXTEND_V2_VARIANT_DECL,
+    BLOCK_EXTEND_V2_WITH_OFFSET_VARIANT_DECL,
     BLOCK_EXTEND_V3_WITH_OFFSET_VARIANT_DECL,
-    _get_module_uri_v3_with_offset,
+    _get_module_uri_with_offset,
 )
 from .dllm.batch_block_extend import (
-    BATCH_BLOCK_EXTEND_VARIANT_DECL,
-    BATCH_BLOCK_EXTEND_VARIANT_DECL_FA3,
     _BATCH_BE_QOFFSET_VARIANT_DECL,
     _BATCH_BE_QOFFSET_VARIANT_DECL_FA3,
     _get_batch_be_module_uri,
 )
 
 
-def gen_dllm_block_extend(
-    f16_dtype_: List[torch.dtype],
-    head_dim_: List[Tuple[int, int]],
-) -> Iterator[JitSpec]:
-    """
-    生成 DLLM Block Extend Attention 的 JitSpec
-    
-    Block Extend Mask 语义:
-    - 同一个 DLLM block 内的 token 双向可见
-    - 可以看见之前所有 blocks
-    - 不能看见后续 blocks
-    
-    Args:
-        f16_dtype_: 数据类型列表 [torch.float16, torch.bfloat16]
-        head_dim_: Head 维度列表 [(64, 64), (128, 128), ...]
-    
-    Yields:
-        JitSpec 对象
-    """
-    for dtype in f16_dtype_:
-        for head_dim_qk, head_dim_vo in head_dim_:
-            dtype_str = "fp16" if dtype == torch.float16 else "bf16"
-            uri = f"single_prefill_block_expanding_hd{head_dim_qk}_{dtype_str}"
-            
-            yield gen_customize_single_prefill_module(
-                backend="fa2",
-                uri=uri,
-                dtype_q=dtype,
-                dtype_kv=dtype,
-                dtype_o=dtype,
-                head_dim_qk=head_dim_qk,
-                head_dim_vo=head_dim_vo,
-                additional_tensor_names=[],
-                additional_tensor_dtypes=[],
-                additional_scalar_names=["sm_scale", "dllm_block_size"],
-                additional_scalar_dtypes=["double", "int64_t"],
-                variant_name="BlockExpandingAttention",
-                variant_decl=BLOCK_EXPANDING_VARIANT_DECL,
-                mask_modes=[0, 1, 2, 3, 4],
-            )
-
-
-def gen_dllm_block_extend_v2(
-    f16_dtype_: List[torch.dtype],
-    head_dim_: List[Tuple[int, int]],
-) -> Iterator[JitSpec]:
-    """
-    生成 DLLM Block Extend Attention V2 (原生 tile 跳过) 的 JitSpec
-    
-    Args:
-        f16_dtype_: 数据类型列表 [torch.float16, torch.bfloat16]
-        head_dim_: Head 维度列表 [(64, 64), (128, 128), ...]
-    
-    Yields:
-        JitSpec 对象
-    """
-    for dtype in f16_dtype_:
-        for head_dim_qk, head_dim_vo in head_dim_:
-            dtype_str = "fp16" if dtype == torch.float16 else "bf16"
-            uri = f"single_prefill_block_expanding_v2_hd{head_dim_qk}_{dtype_str}"
-            
-            yield gen_customize_single_prefill_module(
-                backend="fa2",
-                uri=uri,
-                dtype_q=dtype,
-                dtype_kv=dtype,
-                dtype_o=dtype,
-                head_dim_qk=head_dim_qk,
-                head_dim_vo=head_dim_vo,
-                additional_tensor_names=[],
-                additional_tensor_dtypes=[],
-                additional_scalar_names=["sm_scale", "dllm_block_size"],
-                additional_scalar_dtypes=["double", "int64_t"],
-                variant_name="BlockExtendAttentionV2",
-                variant_decl=BLOCK_EXTEND_V2_VARIANT_DECL,
-                mask_modes=[4],
-            )
-
-
 def gen_dllm_batch_block_extend(
     f16_dtype_: List[torch.dtype],
-    head_dim_: List[Tuple[int, int]],
-) -> Iterator[JitSpec]:
-    """
-    生成 DLLM Batch Block Extend Attention 的 JitSpec
-    
-    Batch Prefill 版本的 Block Extend Mask，支持多请求并行处理
-    并保持 tile 级跳过优化
-    
-    Args:
-        f16_dtype_: 数据类型列表 [torch.float16, torch.bfloat16]
-        head_dim_: Head 维度列表 [(64, 64), (128, 128), ...]
-    
-    Yields:
-        JitSpec 对象
-    """
-    from .jit.attention import gen_customize_batch_prefill_module
-    
-    for dtype in f16_dtype_:
-        for head_dim_qk, head_dim_vo in head_dim_:
-            dtype_str = "fp16" if dtype == torch.float16 else "bf16"
-            uri = f"batch_prefill_block_expanding_hd{head_dim_qk}_{dtype_str}"
-            
-            yield gen_customize_batch_prefill_module(
-                backend="fa2",
-                uri=uri,
-                dtype_q=dtype,
-                dtype_kv=dtype,
-                dtype_o=dtype,
-                idtype=torch.int32,
-                head_dim_qk=head_dim_qk,
-                head_dim_vo=head_dim_vo,
-                additional_tensor_names=[],
-                additional_tensor_dtypes=[],
-                additional_scalar_names=["sm_scale", "dllm_block_size"],
-                additional_scalar_dtypes=["double", "int64_t"],
-                variant_name="BatchBlockExtendAttention",
-                variant_decl=BATCH_BLOCK_EXTEND_VARIANT_DECL,
-                mask_modes=[4],  
-            )
-
-
-def gen_dllm_batch_block_extend_fa3(
-    f16_dtype_: List[torch.dtype],
-    head_dim_: List[Tuple[int, int]],
+    fa2_head_dim_: List[Tuple[int, int]],
+    fa3_head_dim_: List[Tuple[int, int]],
     has_sm90: bool,
 ) -> Iterator[JitSpec]:
     """
-    生成 DLLM Batch Block Extend Attention FA3 版本的 JitSpec
+    生成 DLLM Batch Block Extend Attention 的 JitSpec (FA2 + FA3)
     
-    FA3 (Hopper SM90) 版本的 Batch Block Extend Mask
+    根据硬件能力生成对应 backend 的 AOT kernel:
+    - FA2: 始终生成 (兼容所有架构)
+    - FA3: 仅在 has_sm90=True 时生成 (Hopper SM90 架构)
     
     Args:
         f16_dtype_: 数据类型列表 [torch.float16, torch.bfloat16]
-        head_dim_: Head 维度列表 [(64, 64), (128, 128), ...]
+        fa2_head_dim_: FA2 Head 维度列表 [(64, 64), (128, 128), ...]
+        fa3_head_dim_: FA3 Head 维度列表 [(192, 128), (128, 128), ...]
         has_sm90: 是否支持 SM90 架构
     
     Yields:
         JitSpec 对象
     """
-    if not has_sm90:
-        return  # FA3 需要 SM90 (Hopper) 架构
-    
     from .jit.attention import gen_customize_batch_prefill_module
     
+    # FA2 QOffset variants (兼容所有架构)
     for dtype in f16_dtype_:
-        for head_dim_qk, head_dim_vo in head_dim_:
-            # 基础 Batch Block Extend FA3 (Ragged)
-            uri = _get_batch_be_module_uri(head_dim_qk, dtype) + "_fa3"
+        for head_dim_qk, head_dim_vo in fa2_head_dim_:
+            base_uri = _get_batch_be_module_uri(head_dim_qk, dtype)
+            
+            # FA2 QOffset Paged
             yield gen_customize_batch_prefill_module(
-                backend="fa3",
-                uri=uri,
-                dtype_q=dtype,
-                dtype_kv=dtype,
-                dtype_o=dtype,
+                backend="fa2",
+                uri=base_uri + "_paged_qoffset",
+                dtype_q=dtype, dtype_kv=dtype, dtype_o=dtype,
                 idtype=torch.int32,
-                head_dim_qk=head_dim_qk,
-                head_dim_vo=head_dim_vo,
-                additional_tensor_names=[],
-                additional_tensor_dtypes=[],
+                head_dim_qk=head_dim_qk, head_dim_vo=head_dim_vo,
+                additional_tensor_names=["maybe_q_block_expanding_offset", "maybe_kv_block_expanding_offset"],
+                additional_tensor_dtypes=["int32_t", "int32_t"],
                 additional_scalar_names=["sm_scale", "dllm_block_size"],
                 additional_scalar_dtypes=["double", "int64_t"],
-                variant_name="BatchBlockExtendAttentionFA3",
-                variant_decl=BATCH_BLOCK_EXTEND_VARIANT_DECL_FA3,
+                variant_name="BatchBlockExtendQOffsetAttention",
+                variant_decl=_BATCH_BE_QOFFSET_VARIANT_DECL,
                 mask_modes=[4],
             )
             
-            # Paged 版本 FA3
-            uri_paged = _get_batch_be_module_uri(head_dim_qk, dtype) + "_paged_fa3"
+            # FA2 QOffset Ragged
             yield gen_customize_batch_prefill_module(
-                backend="fa3",
-                uri=uri_paged,
-                dtype_q=dtype,
-                dtype_kv=dtype,
-                dtype_o=dtype,
+                backend="fa2",
+                uri=base_uri + "_ragged_qoffset",
+                dtype_q=dtype, dtype_kv=dtype, dtype_o=dtype,
                 idtype=torch.int32,
-                head_dim_qk=head_dim_qk,
-                head_dim_vo=head_dim_vo,
-                additional_tensor_names=[],
-                additional_tensor_dtypes=[],
+                head_dim_qk=head_dim_qk, head_dim_vo=head_dim_vo,
+                additional_tensor_names=["maybe_q_block_expanding_offset", "maybe_kv_block_expanding_offset"],
+                additional_tensor_dtypes=["int32_t", "int32_t"],
                 additional_scalar_names=["sm_scale", "dllm_block_size"],
                 additional_scalar_dtypes=["double", "int64_t"],
-                variant_name="BatchBlockExtendAttentionFA3",
-                variant_decl=BATCH_BLOCK_EXTEND_VARIANT_DECL_FA3,
+                variant_name="BatchBlockExtendQOffsetAttention",
+                variant_decl=_BATCH_BE_QOFFSET_VARIANT_DECL,
                 mask_modes=[4],
             )
+    
+    # FA3 QOffset variants (仅 Hopper SM90)
+    if not has_sm90:
+        return
+    
+    for dtype in f16_dtype_:
+        for head_dim_qk, head_dim_vo in fa3_head_dim_:
+            base_uri = _get_batch_be_module_uri(head_dim_qk, dtype)
             
-            # QOffset Paged 版本 FA3
-            uri_paged_qoffset = _get_batch_be_module_uri(head_dim_qk, dtype) + "_paged_qoffset_fa3"
+            # FA3 QOffset Paged
             yield gen_customize_batch_prefill_module(
                 backend="fa3",
-                uri=uri_paged_qoffset,
-                dtype_q=dtype,
-                dtype_kv=dtype,
-                dtype_o=dtype,
+                uri=base_uri + "_paged_qoffset_fa3",
+                dtype_q=dtype, dtype_kv=dtype, dtype_o=dtype,
                 idtype=torch.int32,
-                head_dim_qk=head_dim_qk,
-                head_dim_vo=head_dim_vo,
+                head_dim_qk=head_dim_qk, head_dim_vo=head_dim_vo,
                 additional_tensor_names=["maybe_q_block_expanding_offset", "maybe_kv_block_expanding_offset"],
                 additional_tensor_dtypes=["int32_t", "int32_t"],
                 additional_scalar_names=["sm_scale", "dllm_block_size"],
@@ -310,17 +185,13 @@ def gen_dllm_batch_block_extend_fa3(
                 mask_modes=[4],
             )
             
-            # QOffset Ragged 版本 FA3
-            uri_ragged_qoffset = _get_batch_be_module_uri(head_dim_qk, dtype) + "_ragged_qoffset_fa3"
+            # FA3 QOffset Ragged
             yield gen_customize_batch_prefill_module(
                 backend="fa3",
-                uri=uri_ragged_qoffset,
-                dtype_q=dtype,
-                dtype_kv=dtype,
-                dtype_o=dtype,
+                uri=base_uri + "_ragged_qoffset_fa3",
+                dtype_q=dtype, dtype_kv=dtype, dtype_o=dtype,
                 idtype=torch.int32,
-                head_dim_qk=head_dim_qk,
-                head_dim_vo=head_dim_vo,
+                head_dim_qk=head_dim_qk, head_dim_vo=head_dim_vo,
                 additional_tensor_names=["maybe_q_block_expanding_offset", "maybe_kv_block_expanding_offset"],
                 additional_tensor_dtypes=["int32_t", "int32_t"],
                 additional_scalar_names=["sm_scale", "dllm_block_size"],
@@ -331,40 +202,58 @@ def gen_dllm_batch_block_extend_fa3(
             )
 
 
-def gen_dllm_block_extend_v3_with_offset(
+def gen_dllm_block_extend_with_offset(
     f16_dtype_: List[torch.dtype],
-    head_dim_: List[Tuple[int, int]],
+    fa2_head_dim_: List[Tuple[int, int]],
+    fa3_head_dim_: List[Tuple[int, int]],
     has_sm90: bool,
 ) -> Iterator[JitSpec]:
     """
-    生成 DLLM Block Extend Attention V3 with offset (FA3 Hopper) 的 JitSpec
+    生成 DLLM Block Extend Attention with offset 的 JitSpec (FA2 + FA3)
     
-    V3 版本使用 FA3 backend，专为 Hopper (SM90) 架构优化
+    根据硬件能力生成对应 backend 的 AOT kernel:
+    - FA2: 始终生成 (兼容所有架构)
+    - FA3: 仅在 has_sm90=True 时生成 (Hopper SM90 架构)
+    
     支持 q_offset 参数用于增量 Chunk Prefill 场景
     
     Args:
         f16_dtype_: 数据类型列表 [torch.float16, torch.bfloat16]
-        head_dim_: Head 维度列表 [(64, 64), (128, 128), ...]
+        fa2_head_dim_: FA2 Head 维度列表 [(64, 64), (128, 128), ...]
+        fa3_head_dim_: FA3 Head 维度列表 [(192, 128), (128, 128), ...]
         has_sm90: 是否支持 SM90 架构
     
     Yields:
         JitSpec 对象
     """
+    # FA2 with offset (兼容所有架构)
+    for dtype in f16_dtype_:
+        for head_dim_qk, head_dim_vo in fa2_head_dim_:
+            yield gen_customize_single_prefill_module(
+                backend="fa2",
+                uri=_get_module_uri_with_offset(head_dim_qk, dtype, "fa2"),
+                dtype_q=dtype, dtype_kv=dtype, dtype_o=dtype,
+                head_dim_qk=head_dim_qk, head_dim_vo=head_dim_vo,
+                additional_tensor_names=[],
+                additional_tensor_dtypes=[],
+                additional_scalar_names=["sm_scale", "dllm_block_size", "q_block_expanding_offset"],
+                additional_scalar_dtypes=["double", "int64_t", "int64_t"],
+                variant_name="BlockExtendAttentionV2WithOffset",
+                variant_decl=BLOCK_EXTEND_V2_WITH_OFFSET_VARIANT_DECL,
+                mask_modes=[4],
+            )
+    
+    # FA3 with offset (仅 Hopper SM90)
     if not has_sm90:
-        return  # V3 需要 SM90 (Hopper) 架构
+        return
     
     for dtype in f16_dtype_:
-        for head_dim_qk, head_dim_vo in head_dim_:
-            uri = _get_module_uri_v3_with_offset(head_dim_qk, dtype)
-            
+        for head_dim_qk, head_dim_vo in fa3_head_dim_:
             yield gen_customize_single_prefill_module(
                 backend="fa3",
-                uri=uri,
-                dtype_q=dtype,
-                dtype_kv=dtype,
-                dtype_o=dtype,
-                head_dim_qk=head_dim_qk,
-                head_dim_vo=head_dim_vo,
+                uri=_get_module_uri_with_offset(head_dim_qk, dtype, "fa3"),
+                dtype_q=dtype, dtype_kv=dtype, dtype_o=dtype,
+                head_dim_qk=head_dim_qk, head_dim_vo=head_dim_vo,
                 additional_tensor_names=[],
                 additional_tensor_dtypes=[],
                 additional_scalar_names=["sm_scale", "dllm_block_size", "q_block_expanding_offset"],
@@ -750,43 +639,21 @@ def gen_all_modules(
     )
 
     
-    # DLLM Block Extend Attention modules
+    # DLLM Block Extend with offset (FA2 + FA3)
     jit_specs += list(
-        gen_dllm_block_extend(
+        gen_dllm_block_extend_with_offset(
             f16_dtype_,
             fa2_head_dim_,
-        )
-    )
-    
-    # DLLM Block Extend V2 (原生 tile 跳过优化)
-    jit_specs += list(
-        gen_dllm_block_extend_v2(
-            f16_dtype_,
-            fa2_head_dim_,
-        )
-    )
-    
-    # DLLM Batch Block Extend (Batch Prefill 版本)
-    jit_specs += list(
-        gen_dllm_batch_block_extend(
-            f16_dtype_,
-            fa2_head_dim_,
-        )
-    )
-    
-    # DLLM Block Extend V3 with offset (FA3 Hopper 版本)
-    jit_specs += list(
-        gen_dllm_block_extend_v3_with_offset(
-            f16_dtype_,
             fa3_head_dim_,
             has_sm90,
         )
     )
     
-    # DLLM Batch Block Extend FA3 版本 (Hopper SM90)
+    # DLLM Batch Block Extend (FA2 + FA3)
     jit_specs += list(
-        gen_dllm_batch_block_extend_fa3(
+        gen_dllm_batch_block_extend(
             f16_dtype_,
+            fa2_head_dim_,
             fa3_head_dim_,
             has_sm90,
         )

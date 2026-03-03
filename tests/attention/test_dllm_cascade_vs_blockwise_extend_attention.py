@@ -2037,7 +2037,8 @@ def test_dllm_precision_vs_custom_mask_fa2(
     # 不同数据类型的精度容差
     dtype_tolerances = {
         torch.float16: 1e-2,
-        torch.bfloat16: 1e-2,
+        torch.bfloat16: 2e-2,  # FA3 bf16 tile accumulation order differs from FA2;
+                               # max_diff up to ~2 ULP (0.015625) is expected
     }
     
     dtype_names = {

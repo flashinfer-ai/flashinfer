@@ -20,7 +20,6 @@ from .version import __version__ as __version__
 from .version import __git_version__ as __git_version__
 
 from . import dllm as dllm
-from .dllm import block_expanding_attention as block_expanding_attention
 
 from . import jit as jit
 from .activation import gelu_and_mul as gelu_and_mul
