@@ -707,7 +707,7 @@ def gated_delta_rule_decode_kernel_seqlen1(
     gA_log: cute.Tensor,
     gdt_bias: cute.Tensor,
     gH: cute.Tensor,
-    gH0_indices: cute.Tensor,
+    gH_slot_indices: cute.Tensor,
     gO: cute.Tensor,
     scale: cutlass.Float32,
     softplus_beta: cutlass.Float32,
@@ -731,7 +731,7 @@ def gated_delta_rule_decode_kernel_seqlen1(
     batch_idx = bidx // HV
     value_head_idx = bidx % HV
     query_head_idx = value_head_idx // (HV // H)
-    pool_batch_idx = gH0_indices[batch_idx]
+    pool_batch_idx = gH_slot_indices[batch_idx]
 
     smem = utils.SmemAllocator()
 
@@ -1117,7 +1117,7 @@ def gated_delta_rule_decode_kernel_seqlen234_unified(
     gA_log: cute.Tensor,  # [HV]
     gdt_bias: cute.Tensor,  # [HV]
     gH: cute.Tensor,  # [pool, HV, V=128, K=128] - K-fast layout
-    gH0_indices: cute.Tensor,  # [B] indices mapping batch -> pool slot
+    gH_slot_indices: cute.Tensor,  # [B] indices mapping batch -> pool slot
     gO: cute.Tensor,  # [B, T=2/3/4, HV, V=128]
     scale: cutlass.Float32,
     softplus_beta: cutlass.Float32,
@@ -1142,7 +1142,7 @@ def gated_delta_rule_decode_kernel_seqlen234_unified(
     batch_idx = bidx // HV
     value_head_idx = bidx % HV
     query_head_idx = value_head_idx // (HV // H)
-    pool_batch_idx = gH0_indices[batch_idx]
+    pool_batch_idx = gH_slot_indices[batch_idx]
 
     warp_idx = tidx // 32
     lane_idx = tidx % 32
@@ -1502,7 +1502,7 @@ def gated_delta_rule_launch_seqlen1(
     mA_log: cute.Tensor,
     mdt_bias: cute.Tensor,
     mH: cute.Tensor,
-    mH0_indices: cute.Tensor,
+    mH_slot_indices: cute.Tensor,
     mO: cute.Tensor,
     scale: cutlass.Float32,
     softplus_beta: cutlass.Float32,
@@ -1522,7 +1522,7 @@ def gated_delta_rule_launch_seqlen1(
         mA_log,
         mdt_bias,
         mH,
-        mH0_indices,
+        mH_slot_indices,
         mO,
         scale,
         softplus_beta,
@@ -1550,7 +1550,7 @@ def gated_delta_rule_decode_kernel_seqlen1_lowBS_1chunk(
     gA_log: cute.Tensor,
     gdt_bias: cute.Tensor,
     gH: cute.Tensor,
-    gH0_indices: cute.Tensor,
+    gH_slot_indices: cute.Tensor,
     gO: cute.Tensor,
     scale: cutlass.Float32,
     softplus_beta: cutlass.Float32,
@@ -1575,7 +1575,7 @@ def gated_delta_rule_decode_kernel_seqlen1_lowBS_1chunk(
 
     query_head_idx = value_head_idx // (HV // H)
     v_row_base = v_chunk_idx * 32
-    pool_batch_idx = gH0_indices[batch_idx]
+    pool_batch_idx = gH_slot_indices[batch_idx]
 
     smem = utils.SmemAllocator()
 
@@ -1714,7 +1714,7 @@ def gated_delta_rule_launch_seqlen1_lowBS_1chunk(
     mA_log: cute.Tensor,
     mdt_bias: cute.Tensor,
     mH: cute.Tensor,
-    mH0_indices: cute.Tensor,
+    mH_slot_indices: cute.Tensor,
     mO: cute.Tensor,
     scale: cutlass.Float32,
     softplus_beta: cutlass.Float32,
@@ -1735,7 +1735,7 @@ def gated_delta_rule_launch_seqlen1_lowBS_1chunk(
         mA_log,
         mdt_bias,
         mH,
-        mH0_indices,
+        mH_slot_indices,
         mO,
         scale,
         softplus_beta,
@@ -1758,7 +1758,7 @@ def gated_delta_rule_launch_seqlen2(
     mA_log: cute.Tensor,
     mdt_bias: cute.Tensor,
     mH: cute.Tensor,
-    mH0_indices: cute.Tensor,
+    mH_slot_indices: cute.Tensor,
     mO: cute.Tensor,
     scale: cutlass.Float32,
     softplus_beta: cutlass.Float32,
@@ -1778,7 +1778,7 @@ def gated_delta_rule_launch_seqlen2(
         mA_log,
         mdt_bias,
         mH,
-        mH0_indices,
+        mH_slot_indices,
         mO,
         scale,
         softplus_beta,
@@ -1802,7 +1802,7 @@ def gated_delta_rule_launch_seqlen3(
     mA_log: cute.Tensor,
     mdt_bias: cute.Tensor,
     mH: cute.Tensor,
-    mH0_indices: cute.Tensor,
+    mH_slot_indices: cute.Tensor,
     mO: cute.Tensor,
     scale: cutlass.Float32,
     softplus_beta: cutlass.Float32,
@@ -1822,7 +1822,7 @@ def gated_delta_rule_launch_seqlen3(
         mA_log,
         mdt_bias,
         mH,
-        mH0_indices,
+        mH_slot_indices,
         mO,
         scale,
         softplus_beta,
@@ -1846,7 +1846,7 @@ def gated_delta_rule_launch_seqlen4(
     mA_log: cute.Tensor,
     mdt_bias: cute.Tensor,
     mH: cute.Tensor,
-    mH0_indices: cute.Tensor,
+    mH_slot_indices: cute.Tensor,
     mO: cute.Tensor,
     scale: cutlass.Float32,
     softplus_beta: cutlass.Float32,
@@ -1866,7 +1866,7 @@ def gated_delta_rule_launch_seqlen4(
         mA_log,
         mdt_bias,
         mH,
-        mH0_indices,
+        mH_slot_indices,
         mO,
         scale,
         softplus_beta,
@@ -2009,11 +2009,11 @@ def gated_delta_rule(
 
     # Resolve indices: identity mapping when not provided
     if initial_state_indices is None:
-        h0_indices = torch.arange(B, dtype=torch.int32, device=q.device)
+        h_slot_indices = torch.arange(B, dtype=torch.int32, device=q.device)
     elif initial_state_indices.dtype != torch.int32:
-        h0_indices = initial_state_indices.to(torch.int32)
+        h_slot_indices = initial_state_indices.to(torch.int32)
     else:
-        h0_indices = initial_state_indices
+        h_slot_indices = initial_state_indices
 
     output = torch.empty(B, T, HV, V, device=q.device, dtype=q.dtype)
 
@@ -2025,7 +2025,7 @@ def gated_delta_rule(
     A_log_ = from_dlpack(A_log, assumed_align=32, enable_tvm_ffi=True)
     dt_bias_ = from_dlpack(dt_bias, assumed_align=32, enable_tvm_ffi=True)
     h_ = from_dlpack(initial_state_source, assumed_align=32, enable_tvm_ffi=True)
-    h0_indices_ = from_dlpack(h0_indices, assumed_align=32, enable_tvm_ffi=True)
+    h_slot_indices_ = from_dlpack(h_slot_indices, assumed_align=32, enable_tvm_ffi=True)
     o_ = from_dlpack(output, assumed_align=32, enable_tvm_ffi=True)
 
     scale_f32 = cutlass.Float32(scale)
@@ -2060,7 +2060,7 @@ def gated_delta_rule(
             A_log_,
             dt_bias_,
             h_,
-            h0_indices_,
+            h_slot_indices_,
             o_,
             scale_f32,
             softplus_beta_f32,
@@ -2080,7 +2080,7 @@ def gated_delta_rule(
         A_log_,
         dt_bias_,
         h_,
-        h0_indices_,
+        h_slot_indices_,
         o_,
         scale_f32,
         softplus_beta_f32,

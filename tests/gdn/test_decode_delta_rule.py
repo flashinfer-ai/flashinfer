@@ -468,7 +468,6 @@ def _test_decode_kernel_pretranspose_pool(
         initial_state=pool_under_test,
         initial_state_indices=indices,
     )
-    torch.cuda.synchronize()
 
     # ── Direct-state reference (gather → kernel) ─────────────────────────────
     gathered_state = pool[indices].clone()  # [B, HV, V, K]
@@ -484,7 +483,6 @@ def _test_decode_kernel_pretranspose_pool(
         scale=scale,
         use_qk_l2norm=True,
     )
-    torch.cuda.synchronize()
 
     atol = 5e-3
     rtol = 5e-3
