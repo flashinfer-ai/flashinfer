@@ -14,11 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import warnings
 from abc import ABC, abstractmethod
 from typing import Optional, Any
 
 import torch
-
 
 class AllReduceFusionWorkspace(ABC):
     """Base class for AllReduce fusion workspaces."""
@@ -69,8 +69,6 @@ class AllReduceFusionWorkspace(ABC):
         distributed/CUDA resources.
         """
         if not self._destroyed:
-            import warnings
-
             warnings.warn(
                 f"{self.__class__.__name__} was not explicitly destroyed. "
                 f"Call workspace.destroy() or use AllReduceFusionContext to ensure "
