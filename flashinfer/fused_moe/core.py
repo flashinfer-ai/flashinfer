@@ -1285,7 +1285,7 @@ def get_trtllm_moe_sm100_module():
 
         @classmethod
         @functools.lru_cache(maxsize=None)
-        def refine_tuning_config(cls, tune_max_num_tokens: int):
+        def refine_tuning_config(cls, tune_max_num_tokens: int, **kwargs):
             cls.tuning_config_with_hidden_states_scales = TuningConfig(
                 dynamic_tensor_specs=(
                     DynamicTensorSpec(
@@ -1295,7 +1295,8 @@ def get_trtllm_moe_sm100_module():
                         lambda x: min(last_positive_power_of_2(x), tune_max_num_tokens),
                         cls.dynamic_tensor_initializers,
                     ),
-                )
+                ),
+                **kwargs,
             )
             cls.tuning_config_no_hidden_states_scales = TuningConfig(
                 dynamic_tensor_specs=(
@@ -1307,6 +1308,7 @@ def get_trtllm_moe_sm100_module():
                         cls.dynamic_tensor_initializers[:5],
                     ),
                 ),
+                **kwargs,
             )
 
     @register_custom_op(
@@ -1909,7 +1911,9 @@ def get_trtllm_moe_sm100_module():
             )
 
         tuner = AutoTuner.get()
-        MoERunner.refine_tuning_config(tune_max_num_tokens)
+        MoERunner.refine_tuning_config(
+            tune_max_num_tokens, use_cold_l2_cache=True, use_cuda_graph=True
+        )
         dtype_act = deduce_trtllm_gen_tensor_dtype(hidden_states, hidden_states_scale)
         dtype_weights = deduce_trtllm_gen_tensor_dtype(
             gemm1_weights, gemm1_weights_scale

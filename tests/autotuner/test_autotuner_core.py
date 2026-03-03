@@ -261,7 +261,9 @@ def test_search_cache_preserving_leading_dims_hits_while_flattened_misses(monkey
     # Flattening destroys the num_tokens axis and changes autotuner's shape key.
     flattened_layout_shapes = (torch.Size([m * n]),)
 
-    def fake_profile(self, runner_obj, prof_inputs, tactic, **kwargs):
+    def fake_profile(
+        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+    ):
         return {0: 5.0, 1: 1.0, 2: 3.0}[tactic]
 
     monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
@@ -315,7 +317,9 @@ def test_choose_one_tuning_selects_best_tactic_and_populates_cache(monkeypatch):
     inputs = [torch.empty((16, 32), dtype=torch.float32)]
     config = TuningConfig()
 
-    def fake_profile(self, runner_obj, prof_inputs, tactic, **kwargs):
+    def fake_profile(
+        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+    ):
         return {0: 5.0, 1: 1.0, 2: 3.0}[tactic]
 
     monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
