@@ -1440,7 +1440,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
 def testBatchPrefillWithRaggedKVCacheWrapper(args):
     """
     Test BatchPrefillWithRaggedKVCacheWrapper API and equivalent cuDNN API.
-    Supports fa2, fa3, cutlass, and cudnn backends.
+    Supports fa2, fa3, cutlass, cudnn and trtllm-gen backends.
 
     This test:
     1. Creates ragged KV cache and query tensors for prefill
@@ -1558,9 +1558,11 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             backends.remove("trtllm-gen")
     if "trtllm-native" in backends:
         remove_trtllm_native = False
-        if not (head_dim_qk == 192 and head_dim_vo == 128):
+        if not (head_dim_qk == 192 and head_dim_vo == 128) and not (
+            head_dim_qk == 128 and head_dim_vo == 128
+        ):
             print(
-                "[INFO] trtllm-native backend requires head_dim_qk == 192 and head_dim_vo == 128"
+                "[INFO] trtllm-native backend requires head_dim_qk == 192 and head_dim_vo == 128 or head_dim_qk == 128 and head_dim_vo == 128. Skipping."
             )
             remove_trtllm_native = True
         if remove_trtllm_native:
