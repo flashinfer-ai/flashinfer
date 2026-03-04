@@ -4095,8 +4095,8 @@ def trtllm_fmha_v2_prefill(
         num_qo_heads = query.shape[2]
         page_size = 0  # Not applicable for packed layouts
         head_dim_v = query.shape[3]  # Assume same as head_dim_qk
-    elif input_layout == "Q_PAGED_KV":
-        # Q is 3D: [tokens, H, D], Paged KV is 4D: [num_pages, H_kv, page_size, D]
+    elif input_layout in ("Q_PAGED_KV_NHD", "Q_PAGED_KV_HND"):
+        # Q is 3D: [tokens, H, D], Paged KV (HND after any transpose): [num_pages, H_kv, page_size, D]
         num_qo_heads = query.shape[1]
         page_size = k_cache.shape[2]
         head_dim_v = v_cache.shape[3]
