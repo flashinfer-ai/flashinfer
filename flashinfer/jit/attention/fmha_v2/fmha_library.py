@@ -1236,9 +1236,11 @@ def generate_jit_sources(
     enable_attn_logit_softcapping_values = [True, False]
     return_softmax_values = [True, False]
     alibi_values = [True, False]
-    generate_sm90 = target_sm_versions is None or 9 in target_sm_versions
-    generate_sm120 = target_sm_versions is None or 12 in target_sm_versions
-
+    target_major_archs = {
+        major for major, _minor in compilation_context.TARGET_CUDA_ARCHS
+    }
+    include_sm90_kernels = 9 in target_major_archs
+    include_sm120_kernels = 12 in target_major_archs
     warp_spec_configs: itertools.product = itertools.product(
         [90] if generate_sm90 else [],
         dtype_values,
@@ -1281,12 +1283,6 @@ def generate_jit_sources(
         input_layout_values,
         output_dtype_values,
     )
-
-    target_major_archs = {
-        major for major, _minor in compilation_context.TARGET_CUDA_ARCHS
-    }
-    include_sm90_kernels = 9 in target_major_archs
-    include_sm120_kernels = 12 in target_major_archs
 
     config_lists = [other_configs]
     if include_sm90_kernels:
