@@ -247,7 +247,7 @@ def gdn_decode_kernel_small_batch_pretranspose(
         gSrc_batch = h0_source[(state_idx, None, None)]  # (V, K)
         gDst = cute.local_tile(h0_source, (1, TILE_V, TILE_K), (state_idx, None, 0))
 
-        # V 方向分 tiles
+        # Tile along V dimension
         gSrc = cute.local_tile(
             gSrc_batch, (TILE_V, TILE_K), (None, 0)
         )  # (TILE_V, TILE_K, num_v_tiles)
@@ -536,7 +536,7 @@ def gdn_decode_kernel_big_batch_pretranspose(
         gSrc_batch = h0_source[(state_idx, None, None)]  # (V, K)
         gDst = cute.local_tile(h0_source, (1, TILE_V, TILE_K), (state_idx, None, 0))
 
-        # V 方向分 tiles
+        # Tile along V dimension
         gSrc = cute.local_tile(
             gSrc_batch, (TILE_V, TILE_K), (None, 0)
         )  # (TILE_V, TILE_K, num_v_tiles)
@@ -948,7 +948,6 @@ def _get_compiled_decode_kernel(
     HV: int,
     K: int,
     V: int,
-    pool_size: int,
     dtype: torch.dtype,
     scale: float,
     use_qk_l2norm: bool,
@@ -959,8 +958,9 @@ def _get_compiled_decode_kernel(
     When ``use_pool_indexing=True``, the kernel reads/writes state from a shared
     pool using ``state_indices``.  Because ``use_pool_indexing`` is a
     ``cutlass.Constexpr``, the two modes produce different compiled CUDA code and
-    must have separate cache entries (ensured by including ``pool_size`` and
-    ``use_pool_indexing`` in the key).
+    must have separate cache entries (ensured by including
+    ``use_pool_indexing`` in the key).  ``pool_size`` is a runtime parameter
+    (only affects tensor shapes, not compiled code) and is intentionally excluded.
     """
     # This will be populated on first call
     return {}
@@ -1142,7 +1142,6 @@ def gated_delta_rule_decode_pretranspose(
         HV,
         K,
         V,
-        pool_size,
         q.dtype,
         scale,
         use_qk_l2norm,
