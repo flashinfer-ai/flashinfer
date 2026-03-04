@@ -261,6 +261,12 @@ __global__ void routingMainKernel(KernelParams params) {
           params.mPtrTopKIds == nullptr) {
         params.mPtrTopKWeights[idxTopK] = finalScore;
       }
+
+      // Routing replay: record all top-K selected expert IDs per token.
+      // Layout: [num_tokens, topK] — same indexing as mPtrTopKPacked.
+      if (laneIdx < params.mTopK && params.mPtrRoutingReplayOut != nullptr) {
+        params.mPtrRoutingReplayOut[idxTopK] = static_cast<int16_t>(expertIdx);
+      }
     }
   }
 }

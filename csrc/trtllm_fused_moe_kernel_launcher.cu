@@ -134,6 +134,9 @@ class FusedMoeLauncher {
 
   int64_t intermediate_size_factor{2};
 
+  // Optional routing replay output: [num_tokens, top_k] int16 tensor
+  Optional<TensorView> routing_replay_out;
+
  public:
   // Constructor that initializes all TensorView members
   FusedMoeLauncher(const Optional<TensorView>& routing_logits,
@@ -159,6 +162,10 @@ class FusedMoeLauncher {
         mDtypeWeights{btg::Dtype::Bfloat16},
         activation_type{ActivationType::Swiglu},
         intermediate_size_factor{2} {}
+
+  void set_routing_replay_out(const Optional<TensorView>& replay_out) {
+    routing_replay_out = replay_out;
+  }
 
  protected:
   // Initialize common data necessary for later.
@@ -375,6 +382,11 @@ class FusedMoeLauncher {
     tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
     cudaStream_t routing_stream = get_stream(hidden_states.device());
 
+    int16_t* replay_ptr = nullptr;
+    if (routing_replay_out.has_value()) {
+      replay_ptr = reinterpret_cast<int16_t*>(routing_replay_out.value().data_ptr());
+    }
+
     routing_runner.run(
         args->routing_logits, args->routing_bias, args->num_tokens, args->num_experts, args->top_k,
         args->n_group, args->topk_group, args->local_expert_offset, args->local_num_experts,
@@ -389,7 +401,7 @@ class FusedMoeLauncher {
         static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
         static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
         use_routing_scales_on_input, use_deep_seek_fp8,
-        static_cast<RoutingMethodType>(routing_method_type), routing_stream);
+        static_cast<RoutingMethodType>(routing_method_type), routing_stream, replay_ptr);
 
     check_moe();
     prepare_moe(moe_tactic);
@@ -1076,6 +1088,11 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     cudaStream_t routing_stream = get_stream(hidden_states.device());
     tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
 
+    int16_t* replay_ptr = nullptr;
+    if (routing_replay_out.has_value()) {
+      replay_ptr = reinterpret_cast<int16_t*>(routing_replay_out.value().data_ptr());
+    }
+
     // Check ndim==2 and size>0 because empty placeholder tensors may have non-null data_ptr
     bool use_precomputed = expert_indices.ndim() == 2 && expert_indices.size(0) > 0;
     // When using pre-computed routing, pass nullptr as routing_logits to tell the
@@ -1094,7 +1111,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
         static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
         static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
         use_routing_scales_on_input, use_deep_seek_fp8,
-        static_cast<RoutingMethodType>(routing_method_type), routing_stream);
+        static_cast<RoutingMethodType>(routing_method_type), routing_stream, replay_ptr);
 
     check_moe();
     prepare_moe(moe_tactic);
@@ -1543,6 +1560,11 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
     cudaStream_t routing_stream = get_stream(hidden_states.device());
 
+    int16_t* replay_ptr = nullptr;
+    if (routing_replay_out.has_value()) {
+      replay_ptr = reinterpret_cast<int16_t*>(routing_replay_out.value().data_ptr());
+    }
+
     routing_runner.run(
         args->routing_logits, args->routing_bias, args->num_tokens, args->num_experts, args->top_k,
         args->n_group, args->topk_group, args->local_expert_offset, args->local_num_experts,
@@ -1557,7 +1579,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
         static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
         static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
         use_routing_scales_on_input, use_deep_seek_fp8,
-        static_cast<RoutingMethodType>(routing_method_type), routing_stream);
+        static_cast<RoutingMethodType>(routing_method_type), routing_stream, replay_ptr);
 
     check_moe();
     prepare_moe(moe_tactic);
@@ -1782,7 +1804,8 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
     Optional<int64_t> n_group, Optional<int64_t> topk_group, int64_t intermediate_size,
     int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
     int64_t routing_method_type, bool use_shuffled_weight, int64_t weight_layout, bool do_finalize,
-    bool enable_pdl, Array<int64_t> config_index, Fp8QuantizationType quantization_type) {
+    bool enable_pdl, Array<int64_t> config_index, Fp8QuantizationType quantization_type,
+    Optional<TensorView> routing_replay_out) {
   // Basic type validation
   auto dtype = hidden_states.dtype();
 
@@ -1875,6 +1898,7 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
         quantization_type);
     launcher->init(std::move(args), curr_tile_N, routing_method_type, use_shuffled_weight,
                    weight_layout);
+    launcher->set_routing_replay_out(routing_replay_out);
 
     launchers_map[curr_tile_N] = std::move(launcher);
   }
