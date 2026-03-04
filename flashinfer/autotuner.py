@@ -66,32 +66,36 @@ def _get_cublas_version() -> str:
 
     Checks sources in the same priority order as the runtime loader:
       1. LD_LIBRARY_PATH — probe the actual shared library via ctypes
-         (tries cuBLAS and cuBLASLt .so variants)
-      2. pip package (nvidia-cublas-cu13, nvidia-cublas-cu12, nvidia-cublas)
+         (tries cuBLAS and cuBLASLt .so variants via dynamic linker)
+      2. pip package (any installed ``nvidia-cublas-*`` package)
       3. CUDA toolkit bundled with PyTorch (torch.version.cuda)
 
     All sources are normalized to ``major.minor.patch`` so that comparisons
     across different environments are meaningful.
     """
     import ctypes
+    import ctypes.util
     import sys
 
     # Source 1: probe the actual loaded shared library via ctypes.
     # This respects LD_LIBRARY_PATH and reports the true runtime version.
     # We try both cuBLAS and cuBLASLt variants — whichever loads first wins.
+    # Unversioned names are tried first (follow the dynamic linker);
+    # ctypes.util.find_library is used as a fallback (queries ldconfig).
     if sys.platform == "win32":
-        lib_specs = (
-            ("cublas64_13.dll", "cublasGetProperty"),
-            ("cublas64_12.dll", "cublasGetProperty"),
-            ("cublas.dll", "cublasGetProperty"),
-        )
+        lib_specs = [("cublas.dll", "cublasGetProperty")]
     else:
-        lib_specs = (
-            ("libcublas.so.13", "cublasGetProperty"),
-            ("libcublasLt.so.13", "cublasLtGetProperty"),
-            ("libcublas.so.12", "cublasGetProperty"),
-            ("libcublasLt.so.12", "cublasLtGetProperty"),
-        )
+        lib_specs = [
+            ("libcublas.so", "cublasGetProperty"),
+            ("libcublasLt.so", "cublasLtGetProperty"),
+        ]
+        for base, fn in (
+            ("cublas", "cublasGetProperty"),
+            ("cublasLt", "cublasLtGetProperty"),
+        ):
+            found = ctypes.util.find_library(base)
+            if found:
+                lib_specs.append((found, fn))
     for lib_name, fn_name in lib_specs:
         try:
             lib = ctypes.cdll.LoadLibrary(lib_name)
@@ -107,17 +111,26 @@ def _get_cublas_version() -> str:
     # Source 2: pip-installed nvidia-cublas package.
     # Pip versions may have 4 components (e.g. 13.2.1.1); truncate to
     # major.minor.patch to align with the ctypes output.
+    # Package names are discovered dynamically to avoid hardcoding CUDA versions.
     try:
         import importlib.metadata as _ilm
 
-        for pkg in ("nvidia-cublas-cu13", "nvidia-cublas-cu12", "nvidia-cublas"):
+        cublas_pkgs = sorted(
+            (
+                d.metadata["Name"]
+                for d in _ilm.distributions()
+                if (d.metadata["Name"] or "").startswith("nvidia-cublas")
+            ),
+            reverse=True,
+        )
+        for pkg in cublas_pkgs:
             try:
                 pip_ver = _ilm.version(pkg)
                 parts = pip_ver.split(".")
                 return ".".join(parts[:3])
             except _ilm.PackageNotFoundError:
                 continue
-    except ImportError:
+    except (ImportError, Exception):
         pass
 
     # Source 3: CUDA toolkit version from PyTorch (not the cuBLAS version
@@ -653,6 +666,9 @@ class AutoTuner:
         # Hold the lock for the entire method.  In non-tuning mode this is a
         # fast cache lookup; in tuning mode it serializes GPU profiling which
         # must not run concurrently (measurements would interfere).
+        # Note: this is a single global lock, so multi-threaded tuning on
+        # separate GPUs is serialized.  Use multi-process (one per GPU) for
+        # parallel multi-GPU tuning.
         with self._lock:
             input_shapes = tuple(self._get_input_sizes(inputs))
 
