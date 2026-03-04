@@ -47,13 +47,13 @@ struct _2SM {};
 template <typename T, typename arch, int32_t CTA_M_, int32_t CTA_N_, int32_t CTA_K_,
           typename ClusterShape_, typename XSM_>
 size_t genericBf16GemmKernelLauncherSm100(__nv_bfloat16 const* A, __nv_bfloat16 const* B, T* D,
-                                          int m, int n, int k, int b, CutlassGemmConfig config,
-                                          char* workspacePtr, size_t const workspaceBytes,
-                                          cudaStream_t stream);
+                                          T* bias, int m, int n, int k, int b,
+                                          CutlassGemmConfig config, char* workspacePtr,
+                                          size_t const workspaceBytes, cudaStream_t stream);
 
 template <typename T, typename arch, int32_t CTA_M_, int32_t CTA_N_, int32_t CTA_K_>
-size_t dispatchGemmClusterShapeSm100(__nv_bfloat16 const* A, __nv_bfloat16 const* B, T* D, int m,
-                                     int n, int k, int b, CutlassGemmConfig gemmConfig,
+size_t dispatchGemmClusterShapeSm100(__nv_bfloat16 const* A, __nv_bfloat16 const* B, T* D, T* bias,
+                                     int m, int n, int k, int b, CutlassGemmConfig gemmConfig,
                                      char* workspacePtr, size_t const workspaceBytes,
                                      cudaStream_t stream) {
   using namespace cute;
@@ -61,28 +61,28 @@ size_t dispatchGemmClusterShapeSm100(__nv_bfloat16 const* A, __nv_bfloat16 const
   switch (gemmConfig.cluster_shape) {
     case ClusterShape::ClusterShape_1x1x1:
       return genericBf16GemmKernelLauncherSm100<T, arch, CTA_M_, CTA_N_, CTA_K_, Shape<_1, _1, _1>,
-                                                _1SM>(A, B, D, m, n, k, b, gemmConfig, workspacePtr,
-                                                      workspaceBytes, stream);
+                                                _1SM>(A, B, D, bias, m, n, k, b, gemmConfig,
+                                                      workspacePtr, workspaceBytes, stream);
       break;
     case ClusterShape::ClusterShape_1x2x1:
       return genericBf16GemmKernelLauncherSm100<T, arch, CTA_M_, CTA_N_, CTA_K_, Shape<_1, _2, _1>,
-                                                _1SM>(A, B, D, m, n, k, b, gemmConfig, workspacePtr,
-                                                      workspaceBytes, stream);
+                                                _1SM>(A, B, D, bias, m, n, k, b, gemmConfig,
+                                                      workspacePtr, workspaceBytes, stream);
       break;
     case ClusterShape::ClusterShape_1x4x1:
       return genericBf16GemmKernelLauncherSm100<T, arch, CTA_M_, CTA_N_, CTA_K_, Shape<_1, _4, _1>,
-                                                _1SM>(A, B, D, m, n, k, b, gemmConfig, workspacePtr,
-                                                      workspaceBytes, stream);
+                                                _1SM>(A, B, D, bias, m, n, k, b, gemmConfig,
+                                                      workspacePtr, workspaceBytes, stream);
       break;
     case ClusterShape::ClusterShape_2x1x1:
       return genericBf16GemmKernelLauncherSm100<T, arch, CTA_M_, CTA_N_, CTA_K_, Shape<_2, _1, _1>,
-                                                _2SM>(A, B, D, m, n, k, b, gemmConfig, workspacePtr,
-                                                      workspaceBytes, stream);
+                                                _2SM>(A, B, D, bias, m, n, k, b, gemmConfig,
+                                                      workspacePtr, workspaceBytes, stream);
       break;
     case ClusterShape::ClusterShape_2x2x1:
       return genericBf16GemmKernelLauncherSm100<T, arch, CTA_M_, CTA_N_, CTA_K_, Shape<_2, _2, _1>,
-                                                _2SM>(A, B, D, m, n, k, b, gemmConfig, workspacePtr,
-                                                      workspaceBytes, stream);
+                                                _2SM>(A, B, D, bias, m, n, k, b, gemmConfig,
+                                                      workspacePtr, workspaceBytes, stream);
       break;
     default:
       throw std::runtime_error("invalid config for bf16 gemm");
@@ -91,31 +91,36 @@ size_t dispatchGemmClusterShapeSm100(__nv_bfloat16 const* A, __nv_bfloat16 const
 }
 
 template <typename T>
-size_t dispatchToArch(__nv_bfloat16 const* A, __nv_bfloat16 const* B, void* D, int m, int n, int k,
-                      int b, CutlassGemmConfig gemmConfig, char* workspacePtr,
+size_t dispatchToArch(__nv_bfloat16 const* A, __nv_bfloat16 const* B, void* D, void* bias, int m,
+                      int n, int k, int b, CutlassGemmConfig gemmConfig, char* workspacePtr,
                       size_t const workspaceBytes, cudaStream_t stream) {
   using arch = cutlass::arch::Sm100;
 
   switch (gemmConfig.tile_config_sm100) {
     case CutlassTileConfigSM100::CtaShape64x64x128B:
       return dispatchGemmClusterShapeSm100<T, arch, 64, 64, 128>(
-          B, A, static_cast<T*>(D), n, m, k, b, gemmConfig, workspacePtr, workspaceBytes, stream);
+          B, A, static_cast<T*>(D), static_cast<T*>(bias), n, m, k, b, gemmConfig, workspacePtr,
+          workspaceBytes, stream);
       break;
     case CutlassTileConfigSM100::CtaShape64x128x128B:
       return dispatchGemmClusterShapeSm100<T, arch, 64, 128, 128>(
-          B, A, static_cast<T*>(D), n, m, k, b, gemmConfig, workspacePtr, workspaceBytes, stream);
+          B, A, static_cast<T*>(D), static_cast<T*>(bias), n, m, k, b, gemmConfig, workspacePtr,
+          workspaceBytes, stream);
       break;
     case CutlassTileConfigSM100::CtaShape64x256x128B:
       return dispatchGemmClusterShapeSm100<T, arch, 64, 256, 128>(
-          B, A, static_cast<T*>(D), n, m, k, b, gemmConfig, workspacePtr, workspaceBytes, stream);
+          B, A, static_cast<T*>(D), static_cast<T*>(bias), n, m, k, b, gemmConfig, workspacePtr,
+          workspaceBytes, stream);
       break;
     case CutlassTileConfigSM100::CtaShape128x64x128B:
       return dispatchGemmClusterShapeSm100<T, arch, 128, 64, 128>(
-          B, A, static_cast<T*>(D), n, m, k, b, gemmConfig, workspacePtr, workspaceBytes, stream);
+          B, A, static_cast<T*>(D), static_cast<T*>(bias), n, m, k, b, gemmConfig, workspacePtr,
+          workspaceBytes, stream);
       break;
     case CutlassTileConfigSM100::CtaShape128x128x128B:
       return dispatchGemmClusterShapeSm100<T, arch, 128, 128, 128>(
-          B, A, static_cast<T*>(D), n, m, k, b, gemmConfig, workspacePtr, workspaceBytes, stream);
+          B, A, static_cast<T*>(D), static_cast<T*>(bias), n, m, k, b, gemmConfig, workspacePtr,
+          workspaceBytes, stream);
       break;
 
     default:
@@ -125,11 +130,11 @@ size_t dispatchToArch(__nv_bfloat16 const* A, __nv_bfloat16 const* B, void* D, i
 }
 
 template <typename T>
-void CutlassBf16GemmRunner<T>::gemm(__nv_bfloat16 const* A, __nv_bfloat16 const* B, void* D, int m,
-                                    int n, int k, int b, CutlassGemmConfig gemmConfig,
-                                    char* workspacePtr, size_t const workspaceBytes,
-                                    cudaStream_t stream) {
-  dispatchToArch<T>(A, B, reinterpret_cast<T*>(D), m, n, k, b, gemmConfig, workspacePtr,
+void CutlassBf16GemmRunner<T>::gemm(__nv_bfloat16 const* A, __nv_bfloat16 const* B, void* D,
+                                    void* bias, int m, int n, int k, int b,
+                                    CutlassGemmConfig gemmConfig, char* workspacePtr,
+                                    size_t const workspaceBytes, cudaStream_t stream) {
+  dispatchToArch<T>(A, B, reinterpret_cast<T*>(D), bias, m, n, k, b, gemmConfig, workspacePtr,
                     workspaceBytes, stream);
 }
 
@@ -139,8 +144,8 @@ size_t CutlassBf16GemmRunner<T>::getWorkspaceSizeImpl(int m, int n, int k) {
   auto gemmConfigs = CutlassBf16GemmRunner<T>{}.getConfigs();
   for (auto const& gemmConfig : gemmConfigs) {
     try {
-      size_t curr_workspace_size =
-          dispatchToArch<T>(nullptr, nullptr, nullptr, m, n, k, 1, gemmConfig, nullptr, 0, nullptr);
+      size_t curr_workspace_size = dispatchToArch<T>(nullptr, nullptr, nullptr, nullptr, m, n, k, 1,
+                                                     gemmConfig, nullptr, 0, nullptr);
       workspace_size = std::max(workspace_size, curr_workspace_size);
     } catch (std::runtime_error&) {
       // Swallow errors when SMEM exceeds maximum allowed
