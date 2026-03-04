@@ -668,7 +668,7 @@ def _test_gdn_decode_klast_bf16_state_kernel(
         # NOTE: Do NOT pre-normalize K here. Both the kernel (use_qk_l2norm_in_kernel=True)
         # and reference will apply L2 normalization internally after GQA expansion.
 
-        # gdn_decode_klast_bf16_state kernel expects [B, HV, V, K] (K-fast layout) in BF16.
+        # gdn_decode_klast_bf16_state kernel expects [B, HV, V, K] (K-last layout) in BF16.
         # Use the same bf16 initial state for both kernel and reference so we
         # compare the bf16 h state path.
         input_state_kernel = torch.randn(
@@ -818,6 +818,222 @@ def test_gdn_decode_klast_bf16_state_kernel(
         alpha,
         beta,
         seed,
+    )
+
+
+# ============================================================================
+# Pool Indexing Tests for gdn_decode_klast_bf16_state
+# ============================================================================
+
+
+def _test_gdn_decode_klast_bf16_state_pool_indexing(
+    dtype: str,
+    batch_size: int,
+    pool_size: int,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_size: int,
+    seq_len: int,  # T=1,2,3,4
+    scale: float,
+    use_negative_indices: bool = False,
+    seed: int | None = None,
+):
+    """Test gdn_decode_klast_bf16_state kernel with pool indexing.
+
+    Verifies that indirect state access via initial_state_indices produces
+    correct results by comparing against the Python reference implementation.
+
+    Test scenarios:
+    1. pool_size > batch_size with shuffled indices (non-identity mapping)
+    2. Negative indices for padding slots (output should be zero)
+    """
+    _skip_if_not_sm90_or_later()
+
+    if not GDN_DECODE_KLAST_BF16_STATE_AVAILABLE:
+        pytest.skip("gdn_decode_klast_bf16_state kernel not available")
+
+    random.seed(seed)
+    torch.random.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+    assert seq_len in [1, 2, 3, 4], (
+        f"gdn_decode_klast_bf16_state supports T=1,2,3,4, got T={seq_len}"
+    )
+    assert pool_size >= batch_size, "pool_size must be >= batch_size"
+
+    num_sab_heads = num_v_heads
+    dtype_torch = getattr(torch, dtype)
+    device = torch.device("cuda")
+    K = head_size
+    V = head_size
+    HV = num_v_heads
+
+    with device:
+        # Generate inputs
+        q = torch.randn(batch_size, seq_len, num_q_heads, K, dtype=dtype_torch)
+        k = torch.randn(batch_size, seq_len, num_k_heads, K, dtype=dtype_torch)
+        v = torch.randn(batch_size, seq_len, HV, V, dtype=dtype_torch)
+
+        # GDN parameters
+        A_log = torch.randn(num_sab_heads, dtype=torch.float32) * 0.1
+        dt_bias = torch.randn(num_sab_heads, dtype=torch.float32) * 0.1
+        a = torch.randn(batch_size, seq_len, num_sab_heads, dtype=dtype_torch) * 0.1
+        b_tensor = torch.randn(batch_size, seq_len, num_sab_heads, dtype=dtype_torch)
+
+        # State pool: [pool_size, HV, V, K] — larger than batch_size
+        state_pool = torch.randn(pool_size, HV, V, K, dtype=torch.bfloat16) * 0.01
+
+        # Build shuffled indices: random mapping from batch to pool slots
+        # Use a random permutation of pool slots, pick first batch_size
+        perm = torch.randperm(pool_size, device=device)
+        indices = perm[:batch_size].to(torch.int32)
+
+        if use_negative_indices:
+            # Replace ~25% of indices with -1 (padding slots)
+            num_padding = max(1, batch_size // 4)
+            padding_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
+            padding_positions = torch.randperm(batch_size, device=device)[:num_padding]
+            padding_mask[padding_positions] = True
+            indices[padding_mask] = -1
+
+    # =========================================================================
+    # Run with pool indexing (indirect access)
+    # =========================================================================
+    state_pool_indexed = state_pool.clone()
+    out_indexed = gdn_decode_klast_bf16_state(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        softplus_beta=1.0,
+        softplus_threshold=20.0,
+        q=q,
+        k=k,
+        v=v,
+        b=b_tensor,
+        initial_state_source=state_pool_indexed,
+        initial_state_indices=indices,
+        use_qk_l2norm_in_kernel=True,
+        scale=scale,
+    )
+    torch.cuda.synchronize()
+
+    # =========================================================================
+    # Identify valid (non-padding) batch elements
+    # =========================================================================
+    valid_mask = indices >= 0
+    valid_count = valid_mask.sum().item()
+
+    # =========================================================================
+    # Verify padding slots produce zero output
+    # =========================================================================
+    if use_negative_indices:
+        padding_indices = torch.where(~valid_mask)[0]
+        if len(padding_indices) > 0:
+            padding_output = out_indexed[padding_indices]
+            assert torch.all(padding_output == 0), (
+                f"Padding slots should produce zero output, "
+                f"got max abs value {padding_output.abs().max().item()}"
+            )
+
+    # =========================================================================
+    # Verify against Python reference implementation for valid slots
+    # =========================================================================
+    if valid_count > 0:
+        valid_indices = torch.where(valid_mask)[0]
+        valid_pool_indices = indices[valid_mask].long()
+
+        # Gather valid inputs
+        q_valid = q[valid_indices]
+        k_valid = k[valid_indices]
+        v_valid = v[valid_indices]
+        a_valid = a[valid_indices]
+        b_valid = b_tensor[valid_indices]
+
+        # Reference uses V-last layout: [B, HV, K, V]
+        ref_state = state_pool[valid_pool_indices].transpose(-2, -1).contiguous()
+        ref_outputs = []
+        for t in range(seq_len):
+            ref_o_t, ref_state = decode_delta_rule(
+                q_valid[:, t].float(),
+                k_valid[:, t].float(),
+                v_valid[:, t].float(),
+                ref_state,
+                A_log=A_log,
+                a=a_valid[:, t],
+                dt_bias=dt_bias,
+                b=b_valid[:, t],
+                scale_factor=scale,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+                use_l2_norm=True,
+                state_dtype=torch.bfloat16,
+            )
+            ref_outputs.append(ref_o_t)
+        ref_o = torch.stack(ref_outputs, dim=1).to(dtype_torch)
+
+        torch.testing.assert_close(
+            out_indexed[valid_indices].float(),
+            ref_o.float(),
+            atol=0.002,
+            rtol=0.005,
+            msg=(
+                f"Pool indexing vs reference mismatch "
+                f"(B={batch_size}, pool={pool_size}, T={seq_len})"
+            ),
+        )
+
+    scenario = "with padding" if use_negative_indices else "shuffled"
+    print(
+        f"\u2713 Pool indexing test passed ({scenario}, "
+        f"batch={batch_size}, pool={pool_size}, T={seq_len})"
+    )
+
+
+@pytest.mark.parametrize("use_negative_indices", [False, True])
+@pytest.mark.parametrize("seq_len", [1, 2, 4])
+@pytest.mark.parametrize("head_size", [128])
+@pytest.mark.parametrize(
+    "num_q_heads, num_k_heads, num_v_heads",
+    [(16, 16, 32)],
+)
+@pytest.mark.parametrize(
+    "batch_size, pool_size",
+    [
+        (1, 4),  # single batch, small pool
+        (4, 16),  # small batch, 4x pool
+        (8, 32),  # medium batch, 4x pool
+        (16, 64),  # larger batch, 4x pool
+        (32, 128),  # large batch, 4x pool
+        (64, 256),  # SGLang-scale batch, 4x pool
+    ],
+)
+@pytest.mark.parametrize("dtype", ["bfloat16"])
+def test_gdn_decode_klast_bf16_state_pool_indexing(
+    dtype: str,
+    batch_size: int,
+    pool_size: int,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_size: int,
+    seq_len: int,
+    use_negative_indices: bool,
+    seed: int = int(os.environ.get("SEED", "42")),
+):
+    scale_val = 1.0 / math.sqrt(head_size)
+    _test_gdn_decode_klast_bf16_state_pool_indexing(
+        dtype=dtype,
+        batch_size=batch_size,
+        pool_size=pool_size,
+        num_q_heads=num_q_heads,
+        num_k_heads=num_k_heads,
+        num_v_heads=num_v_heads,
+        head_size=head_size,
+        seq_len=seq_len,
+        scale=scale_val,
+        use_negative_indices=use_negative_indices,
+        seed=seed,
     )
 
 
@@ -986,6 +1202,41 @@ if __name__ == "__main__":
     else:
         print("⚠ gdn_decode_klast_bf16_state kernel not available, skipping...")
 
+    print("\n=== Testing POOL INDEXING (gdn_decode_klast_bf16_state) ===")
+    if GDN_DECODE_KLAST_BF16_STATE_AVAILABLE:
+        # Shuffled indices, no padding
+        _test_gdn_decode_klast_bf16_state_pool_indexing(
+            dtype="bfloat16",
+            batch_size=4,
+            pool_size=16,
+            num_q_heads=16,
+            num_k_heads=16,
+            num_v_heads=32,
+            head_size=128,
+            seq_len=1,
+            scale=1.0 / (128**0.5),
+            use_negative_indices=False,
+            seed=42,
+        )
+        # With negative indices (padding)
+        _test_gdn_decode_klast_bf16_state_pool_indexing(
+            dtype="bfloat16",
+            batch_size=8,
+            pool_size=32,
+            num_q_heads=16,
+            num_k_heads=16,
+            num_v_heads=32,
+            head_size=128,
+            seq_len=2,
+            scale=1.0 / (128**0.5),
+            use_negative_indices=True,
+            seed=42,
+        )
+    else:
+        print(
+            "\u26a0 gdn_decode_klast_bf16_state kernel not available, skipping pool indexing tests..."
+        )
+
     print("\n✅ All smoke tests passed!")
     print("\nTo run full test suite:")
     print(
@@ -999,5 +1250,8 @@ if __name__ == "__main__":
     )
     print(
         "  gdn_decode_klast_bf16_state:  pytest test_decode_delta_rule.py::test_gdn_decode_klast_bf16_state_kernel -v"
+    )
+    print(
+        "  POOL INDEXING:      pytest test_decode_delta_rule.py::test_gdn_decode_klast_bf16_state_pool_indexing -v"
     )
     print("  ALL: pytest test_decode_delta_rule.py -v")
