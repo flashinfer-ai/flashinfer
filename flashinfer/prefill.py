@@ -33,6 +33,7 @@ from .jit import (
     get_single_prefill_uri,
     setup_cubin_loader,
     gen_trtllm_gen_fmha_module,
+    gen_trtllm_fmha_v2_sm120_module,
 )
 from .cudnn import cudnn_batch_prefill_with_kv_cache
 from .page import get_seq_lens
@@ -3827,6 +3828,11 @@ def trtllm_batch_context_with_kv_cache(
     )
 
 
+@functools.cache
+def get_trtllm_fmha_v2_sm120_module():
+    return gen_trtllm_fmha_v2_sm120_module().build_and_load()
+
+
 @flashinfer_api
 def fmha_v2_prefill_deepseek(
     query: torch.Tensor,
@@ -3888,7 +3894,7 @@ def fmha_v2_prefill_deepseek(
     assert query.shape[3] == 192 and key.shape[3] == 192 and value.shape[3] == 128, (
         "currently only support deepseek r1 192 query and 128 value"
     )
-    module = get_trtllm_fmha_v2_module(120)
+    module = get_trtllm_fmha_v2_sm120_module()
     is_e4m3 = query.dtype == torch.float8_e4m3fn
     is_bf16_output = out.dtype == torch.bfloat16
     scale_softmax = (
@@ -3945,13 +3951,13 @@ def trtllm_fmha_v2_prefill(
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[Union[torch.dtype, str]] = None,
     sinks: Optional[List[torch.Tensor]] = None,
-    pos_encoding_mode: Optional[str] = "NONE",
+    pos_encoding_mode: str = None,
     logits_soft_cap_scale: Optional[float] = None,
-    mask_mode: Optional[str] = "causal",
-    window_left: Optional[int] = -1,
-    chunked_attention_size: Optional[int] = 0,
-    save_softmax_stats: Optional[bool] = False,
-    skip_softmax_threshold_scale_factor: Optional[float] = 0,
+    mask_mode: str = "causal",
+    window_left: int = -1,
+    chunked_attention_size: int = 0,
+    save_softmax_stats: bool = False,
+    skip_softmax_threshold_scale_factor: float = 0,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""TRT-LLM FMHAv2 prefill attention.
 
@@ -4019,13 +4025,13 @@ def trtllm_fmha_v2_prefill(
     chunked_attention_size : Optional[int]
         The chunked attention size. Defaults to ``0``, which means no chunked attention.
         Only effective when :attr:`mask_mode` is ``chunked``. Must be a power of 2.
-    save_softmax_stats : Optional[bool]
+    save_softmax_stats : bool
         Whether to save the softmax statistics. Defaults to ``False``.
-    skip_softmax_threshold_scale_factor: Optional[float]
+    skip_softmax_threshold_scale_factor : float
         The factor of skip-softmax (Sparse Attention),
         Skip softmax and BMM2 when exp(local_max - global_max) < threshold,
         where threshold = skip_softmax_threshold_scale_factor / seqlen.
-        0 means disabling it.
+        Defaults to ``0`` (disabled).
     Returns
     -------
     Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -4116,6 +4122,13 @@ def trtllm_fmha_v2_prefill(
     uses_chunked = chunked_attention_size is not None and chunked_attention_size > 0
     is_non_causal = mask_mode is not None and mask_mode.lower() == "padding"
 
+    if (uses_sliding_window or uses_chunked) and is_sm12x_supported(query.device):
+        feature = "Sliding window" if uses_sliding_window else "Chunked"
+        raise ValueError(
+            f"{feature} attention is not yet supported for FMHAv2 on SM120 (Blackwell). "
+            "Only CAUSAL masks are available. "
+        )
+
     if (uses_sliding_window or uses_chunked) and is_non_causal:
         feature = "Sliding window" if uses_sliding_window else "Chunked"
         raise ValueError(
@@ -4149,6 +4162,12 @@ def trtllm_fmha_v2_prefill(
     is_e4m3 = (
         query.dtype == torch.float8_e4m3fn if hasattr(torch, "float8_e4m3fn") else False
     )
+    if is_e4m3:
+        if is_sm12x_supported(query.device):
+            raise ValueError(
+                "FP8 (e4m3) is not yet supported for FMHAv2 on SM120 (Blackwell). "
+                "Use fp16 or bf16 instead."
+            )
     scale_softmax = 1.0 if is_e4m3 else 1.0
     softcapping_scale = (
         logits_soft_cap_scale if logits_soft_cap_scale is not None else 0.0
@@ -4207,7 +4226,7 @@ def trtllm_fmha_v2_prefill(
         scale_bmm2,  # BMM2 scale (float, still needed for set_alpha in C++)
         window_left,  # Window left
         chunked_attention_size,  # Chunked attention size
-        pos_encoding_mode == "ALIBI",  # Alibi mode
+        pos_encoding_mode.lower() == "alibi",  # Alibi mode
         softcapping_scale,  # Softcapping scale (0.0 = disabled)
         skip_softmax_threshold_scale_factor,  # threshold_scale_factor for skip-softmax (0.0 = disable)
         scale_bmm2_d,  # Pre-populated scale_bmm2 on device (avoids cudaMemcpy)

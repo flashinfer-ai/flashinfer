@@ -15,6 +15,22 @@ from .softplus import softplus
 PAD_SLOT_ID = -1
 
 
+@triton.jit
+def convert_rs_fp16x2(x: tl.tensor, rand: tl.tensor) -> tl.tensor:
+    """Stochastic rounding: fp32 pair → fp16x2 using random bits (PTX cvt.rs.f16x2.f32)."""
+    y = tl.inline_asm_elementwise(
+        asm="""{
+        cvt.rs.f16x2.f32 $0, $2, $1, $3;
+        }""",
+        constraints=("=r,r,r,r,r"),
+        args=(x, rand),
+        dtype=tl.float16,
+        is_pure=True,
+        pack=2,
+    )
+    return y
+
+
 @triton.heuristics({"HAS_DT_BIAS": lambda args: args["dt_bias_ptr"] is not None})
 @triton.heuristics({"HAS_D": lambda args: args["D_ptr"] is not None})
 @triton.heuristics({"HAS_Z": lambda args: args["z_ptr"] is not None})
@@ -49,10 +65,24 @@ PAD_SLOT_ID = -1
         is not None
     }
 )
+@triton.heuristics(
+    {"HAS_STATE_SCALE": lambda args: args["state_scale_ptr"] is not None}
+)
+@triton.heuristics(
+    {
+        "HAS_INTERMEDIATE_STATE_SCALES": lambda args: args[
+            "intermediate_state_scales_ptr"
+        ]
+        is not None
+    }
+)
+@triton.heuristics({"USE_RS_ROUNDING": lambda args: args["rand_seed_ptr"] is not None})
 @triton.jit(do_not_specialize=["T"])
 def _selective_scan_update_kernel(
     # Pointers to matrices
     state_ptr,
+    state_scale_ptr,
+    rand_seed_ptr,
     x_ptr,
     dt_ptr,
     dt_bias_ptr,
@@ -68,6 +98,7 @@ def _selective_scan_update_kernel(
     cache_steps,
     retrieve_parent_token_ptr,
     intermediate_state_indices_ptr,
+    intermediate_state_scales_ptr,
     # Matrix dimensions
     batch,
     T,
@@ -80,6 +111,9 @@ def _selective_scan_update_kernel(
     stride_state_head,
     stride_state_dim,
     stride_state_dstate,
+    stride_state_scale_batch,
+    stride_state_scale_head,
+    stride_state_scale_dim,
     stride_x_batch,
     stride_x_T,
     stride_x_head,
@@ -125,6 +159,10 @@ def _selective_scan_update_kernel(
     CACHE_INTERMEDIATE_STATES: tl.constexpr,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr,
     HAS_INTERMEDIATE_STATE_INDICES: tl.constexpr,
+    HAS_STATE_SCALE: tl.constexpr,
+    HAS_INTERMEDIATE_STATE_SCALES: tl.constexpr,
+    USE_RS_ROUNDING: tl.constexpr,
+    PHILOX_ROUNDS: tl.constexpr,
     BLOCK_SIZE_DSTATE: tl.constexpr,
 ):
     pid_m = tl.program_id(axis=0)
@@ -138,9 +176,18 @@ def _selective_scan_update_kernel(
         state_batch_indices_ptr += pid_b
         state_batch_idx = tl.load(state_batch_indices_ptr).to(tl.int64)
         state_ptr += state_batch_idx * stride_state_batch + pid_h * stride_state_head
+        if HAS_STATE_SCALE:
+            state_scale_ptr += (
+                state_batch_idx * stride_state_scale_batch
+                + pid_h * stride_state_scale_head
+            )
     else:
         state_batch_idx = pid_b
         state_ptr += pid_b * stride_state_batch + pid_h * stride_state_head
+        if HAS_STATE_SCALE:
+            state_scale_ptr += (
+                pid_b * stride_state_scale_batch + pid_h * stride_state_scale_head
+            )
 
     x_ptr += pid_b * stride_x_batch + pid_h * stride_x_head
     dt_ptr += pid_b * stride_dt_batch + pid_h * stride_dt_head
@@ -163,6 +210,16 @@ def _selective_scan_update_kernel(
     if HAS_STATE_BATCH_INDICES:
         mask &= state_batch_idx != pad_slot_id
     state = tl.load(state_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+    if HAS_STATE_SCALE:
+        state_scale_ptrs = state_scale_ptr + offs_m[:, None] * stride_state_scale_dim
+        scales_mask = offs_m[:, None] < dim
+        if HAS_STATE_BATCH_INDICES:
+            scales_mask = scales_mask & (state_batch_idx != pad_slot_id)
+        decode_scale = tl.load(state_scale_ptrs, mask=scales_mask, other=1.0).to(
+            tl.float32
+        )
+        state = state * decode_scale
 
     if HAS_DT_BIAS:
         dt_bias_ptrs = dt_bias_ptr + offs_m * stride_dt_bias_dim
@@ -205,6 +262,19 @@ def _selective_scan_update_kernel(
                         + offs_n[None, :]
                     )
                     state = tl.load(cache_ptr, mask=mask, other=0.0).to(tl.float32)
+                    if HAS_INTERMEDIATE_STATE_SCALES:
+                        # Dequantize using the stored per-step scale
+                        iscale_load_ptrs = (
+                            intermediate_state_scales_ptr
+                            + cache_idx * cache_steps * nheads * dim
+                            + parent_step_idx * nheads * dim
+                            + pid_h * dim
+                            + offs_m
+                        )
+                        iscale = tl.load(
+                            iscale_load_ptrs, mask=offs_m < dim, other=1.0
+                        ).to(tl.float32)
+                        state = state * iscale[:, None]
 
         x_ptrs = x_ptr + offs_m * stride_x_dim
         dt_ptrs = dt_ptr + offs_m * stride_dt_dim
@@ -257,7 +327,52 @@ def _selective_scan_update_kernel(
                 cache_ptrs = cache_ptr_base + (
                     offs_m[:, None] * dstate + offs_n[None, :]
                 )
-                tl.store(cache_ptrs, state.to(cache_ptrs.dtype.element_ty), mask=mask)
+                if HAS_INTERMEDIATE_STATE_SCALES:
+                    # Quantize intermediate state with per-step block scaling
+                    int16_max_i: tl.constexpr = 32767.0
+                    amax_i = tl.max(tl.abs(state), axis=-1)
+                    encode_scale_i = tl.where(amax_i == 0.0, 1.0, int16_max_i / amax_i)
+                    decode_scale_i = 1.0 / encode_scale_i
+                    # Store intermediate decode scale
+                    iscale_ptrs = (
+                        intermediate_state_scales_ptr
+                        + cache_idx * cache_steps * nheads * dim
+                        + current_step_idx * nheads * dim
+                        + pid_h * dim
+                        + offs_m
+                    )
+                    tl.store(iscale_ptrs, decode_scale_i, mask=offs_m < dim)
+                    # Quantize and store
+                    q_state = state * encode_scale_i[:, None]
+                    q_state = tl.extra.cuda.libdevice.round(q_state)
+                    q_state = tl.minimum(tl.maximum(q_state, -int16_max_i), int16_max_i)
+                    tl.store(
+                        cache_ptrs, q_state.to(cache_ptrs.dtype.element_ty), mask=mask
+                    )
+                elif USE_RS_ROUNDING:
+                    rand_seed = tl.load(rand_seed_ptr)
+                    if HAS_STATE_BATCH_INDICES:
+                        rand_offsets = (
+                            state_batch_idx * stride_state_batch
+                            + pid_h * stride_state_head
+                        )
+                    else:
+                        rand_offsets = (
+                            pid_b * stride_state_batch + pid_h * stride_state_head
+                        )
+                    rand_offsets += (
+                        offs_m[:, None] * stride_state_dim
+                        + offs_n[None, :] * stride_state_dstate
+                    )
+                    if PHILOX_ROUNDS > 0:
+                        rand = tl.randint(rand_seed, rand_offsets, PHILOX_ROUNDS)
+                    else:
+                        rand = tl.randint(rand_seed, rand_offsets)
+                    tl.store(cache_ptrs, convert_rs_fp16x2(state, rand), mask=mask)
+                else:
+                    tl.store(
+                        cache_ptrs, state.to(cache_ptrs.dtype.element_ty), mask=mask
+                    )
 
         out = tl.sum(state * C[None, :], axis=1)
         if HAS_D:
@@ -277,7 +392,40 @@ def _selective_scan_update_kernel(
             z_ptr += stride_z_T
 
     if not DISABLE_STATE_UPDATE:
-        tl.store(state_ptrs, state.to(state_ptrs.dtype.element_ty), mask=mask)
+        if HAS_STATE_SCALE:
+            # Quantize state back with block scaling (int16 path)
+            int16_max: tl.constexpr = 32767.0
+            amax = tl.max(tl.abs(state), axis=-1, keep_dims=True)
+            encode_scale = tl.where(amax == 0.0, 1.0, int16_max / amax)
+            new_decode_scale = 1.0 / encode_scale
+            # Store updated decode scales
+            dst_scales_mask = offs_m[:, None] < dim
+            tl.store(state_scale_ptrs, new_decode_scale, mask=dst_scales_mask)
+            # Quantize
+            state = state * encode_scale
+            state = tl.extra.cuda.libdevice.round(state)
+            state = tl.minimum(tl.maximum(state, -int16_max), int16_max)
+            tl.store(state_ptrs, state.to(state_ptrs.dtype.element_ty), mask=mask)
+        elif USE_RS_ROUNDING:
+            # Stochastic rounding for fp16 state
+            rand_seed = tl.load(rand_seed_ptr)
+            if HAS_STATE_BATCH_INDICES:
+                rand_offsets = (
+                    state_batch_idx * stride_state_batch + pid_h * stride_state_head
+                )
+            else:
+                rand_offsets = pid_b * stride_state_batch + pid_h * stride_state_head
+            rand_offsets += (
+                offs_m[:, None] * stride_state_dim
+                + offs_n[None, :] * stride_state_dstate
+            )
+            if PHILOX_ROUNDS > 0:
+                rand = tl.randint(rand_seed, rand_offsets, PHILOX_ROUNDS)
+            else:
+                rand = tl.randint(rand_seed, rand_offsets)
+            tl.store(state_ptrs, convert_rs_fp16x2(state, rand), mask=mask)
+        else:
+            tl.store(state_ptrs, state.to(state_ptrs.dtype.element_ty), mask=mask)
 
 
 def selective_state_update_triton(
@@ -299,6 +447,10 @@ def selective_state_update_triton(
     cache_steps=None,
     retrieve_parent_token=None,
     intermediate_state_indices=None,
+    state_scale=None,
+    intermediate_state_scales=None,
+    rand_seed=None,
+    philox_rounds=0,
 ):
     """
     Argument:
@@ -325,6 +477,13 @@ def selective_state_update_triton(
         retrieve_parent_token: (batch, T) tensor of parent token indices for EAGLE tree attention
         intermediate_state_indices: (batch,) tensor of indices for intermediate_states_buffer operations.
             If provided, uses these indices instead of state_batch_indices for the buffer.
+        state_scale: Optional (batch, nheads, dim, 1) float32 tensor of decode scales for
+            block-scaled state quantization. When provided, the kernel dequantizes state
+            on load and requantizes on store.
+        rand_seed: Optional scalar tensor (int64 or int32) for Philox PRNG seed.
+            When provided, enables stochastic rounding for fp16 state stores.
+            Mutually exclusive with state_scale (int16 block scaling).
+        philox_rounds: Number of Philox PRNG rounds (0 = default, typically 10).
     """
     # Track original x dimensionality to squeeze output appropriately
     x_orig_dim = x.dim()
@@ -409,6 +568,20 @@ def selective_state_update_triton(
         and (dt_bias is None or dt_bias.stride(-1) == 0)
     )
 
+    if state_scale is not None:
+        assert state_scale.dtype == torch.float32
+        assert state_scale.shape == (
+            state.shape[0],
+            nheads,
+            dim,
+        ) or state_scale.shape == (state.shape[0], nheads, dim, 1)
+
+    state_scale_strides = (
+        (state_scale.stride(0), state_scale.stride(1), state_scale.stride(2))
+        if state_scale is not None
+        else (0, 0, 0)
+    )
+
     retrieve_parent_token_strides = (
         (retrieve_parent_token.stride(0), retrieve_parent_token.stride(1))
         if retrieve_parent_token is not None
@@ -418,6 +591,8 @@ def selective_state_update_triton(
     with torch.cuda.device(x.device.index):
         _selective_scan_update_kernel[grid](
             state,
+            state_scale,
+            rand_seed,
             x,
             dt,
             dt_bias,
@@ -433,6 +608,7 @@ def selective_state_update_triton(
             cache_steps if cache_steps is not None else 0,
             retrieve_parent_token,
             intermediate_state_indices,
+            intermediate_state_scales,
             batch,
             T,
             nheads,
@@ -443,6 +619,9 @@ def selective_state_update_triton(
             state.stride(1),
             state.stride(2),
             state.stride(3),
+            state_scale_strides[0],
+            state_scale_strides[1],
+            state_scale_strides[2],
             x.stride(0),
             x.stride(1),
             x.stride(2),
@@ -478,6 +657,7 @@ def selective_state_update_triton(
             tie_hdim,
             BLOCK_SIZE_M,
             DISABLE_STATE_UPDATE=disable_state_update,
+            PHILOX_ROUNDS=philox_rounds,
             num_warps=num_warps,
         )
     # Squeeze T dimension if original x didn't have it (was 2D or 3D)

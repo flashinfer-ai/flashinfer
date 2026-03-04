@@ -101,7 +101,8 @@ Use `flashinfer.utils` functions to skip tests on unsupported GPU architectures:
 - `get_compute_capability(device)` - Returns `(major, minor)` tuple
 - `is_sm90a_supported()` - Hopper (requires CUDA 12.3+)
 - `is_sm100a_supported()` - Blackwell (requires CUDA 12.8+)
-- `is_sm110a_supported()`, `is_sm120a_supported()`, `is_sm121a_supported()`
+- `is_sm100f_supported()` - Blackwell feature-set (requires CUDA 12.9+)
+- `is_sm110a_supported()`, `is_sm120a_supported()`, `is_sm120f_supported()`, `is_sm121a_supported()`
 
 **APIs decorated with `@backend_requirement`** also provide:
 - `api_name.is_compute_capability_supported(cc)` - e.g., `mm_fp4.is_compute_capability_supported(100)`

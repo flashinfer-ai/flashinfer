@@ -53,6 +53,7 @@ from .jit.fp4_quantization import (
     gen_fp4_quantization_sm103_module,
     gen_fp4_quantization_sm110_module,
     gen_fp4_quantization_sm120_module,
+    gen_fp4_quantization_sm120f_module,
     gen_fp4_quantization_sm121_module,
 )
 from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
@@ -452,6 +453,7 @@ def gen_all_modules(
     has_sm103 = sm_capabilities.get("sm103", False)
     has_sm110 = sm_capabilities.get("sm110", False)
     has_sm120 = sm_capabilities.get("sm120", False)
+    has_sm120f = sm_capabilities.get("sm120f", False)
     has_sm121 = sm_capabilities.get("sm121", False)
 
     jit_specs += list(
@@ -521,6 +523,8 @@ def gen_all_modules(
             jit_specs.append(gen_cutlass_fused_moe_sm120_module())
             jit_specs.append(gen_gemm_sm120_module())
             jit_specs.append(gen_gemm_sm120_module_cutlass_fp4())
+        if has_sm120f:
+            jit_specs.append(gen_fp4_quantization_sm120f_module())
 
     if add_comm:
         from .jit.comm import (
@@ -552,15 +556,32 @@ def gen_all_modules(
         ]
         # selective_state_update: one module per dtype combo per GPU arch
         _ssu_dtype_combos = [
-            # (state,        input,          weight,         matrixA,      stateIndex)
+            # (state,        input,          weight,         matrixA,      stateIndex, state_scale_dtype)
             (
                 torch.bfloat16,
                 torch.bfloat16,
                 torch.bfloat16,
                 torch.float32,
                 torch.int64,
+                None,
             ),
-            (torch.float32, torch.bfloat16, torch.bfloat16, torch.float32, torch.int64),
+            # int16 state (block-scaled quantization, scale stored as float32)
+            (
+                torch.int16,
+                torch.bfloat16,
+                torch.bfloat16,
+                torch.float32,
+                torch.int64,
+                torch.float32,
+            ),
+            (
+                torch.float32,
+                torch.bfloat16,
+                torch.bfloat16,
+                torch.float32,
+                torch.int64,
+                None,
+            ),
         ]
         _ssu_dims = [64]
         _ssu_dstates = [128]
@@ -799,6 +820,7 @@ def detect_sm_capabilities():
         "sm103": has_sm("compute_103", "12.9"),
         "sm110": has_sm("compute_110", "13.0"),
         "sm120": has_sm("compute_120", "12.8"),
+        "sm120f": has_sm("compute_120f", "12.9"),
         "sm121": has_sm("compute_121", "12.9"),
     }
 

@@ -1236,8 +1236,11 @@ def generate_jit_sources(
     enable_attn_logit_softcapping_values = [True, False]
     return_softmax_values = [True, False]
     alibi_values = [True, False]
+    generate_sm90 = target_sm_versions is None or 9 in target_sm_versions
+    generate_sm120 = target_sm_versions is None or 12 in target_sm_versions
+
     warp_spec_configs: itertools.product = itertools.product(
-        [90],
+        [90] if generate_sm90 else [],
         dtype_values,
         head_size_qk_warpspec_values,
         head_size_v_values,
@@ -1250,14 +1253,10 @@ def generate_jit_sources(
         output_dtype_values,
     )
 
-    # SM120 uses Ampere-era mma.sync (sm_mma=80) with flash attention.
-    # No warp specialization (no WGMMA), no skip-softmax.
-    # Head sizes restricted to 64-256 (kernel_traits CTA tile decomposition
-    # requires d >= 64 for flash attention on SM80 instruction set).
     head_size_qk_sm120_values = [64, 128, 256]
     sm120_configs: itertools.product = itertools.product(
-        [120],
-        dtype_values,
+        [120] if generate_sm120 else [],
+        dtype_values,  # fallback to avoid empty product
         head_size_qk_sm120_values,
         head_size_v_values,
         enable_attn_logit_softcapping_values,
