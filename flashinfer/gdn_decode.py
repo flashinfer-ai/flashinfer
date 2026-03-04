@@ -1164,8 +1164,19 @@ def gated_delta_rule_decode_pretranspose(
     if "compiled" not in cache:
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-        # Convert tensors to CuTe format for compilation only
-        h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
+        # Convert tensors to CuTe format for compilation only.
+        # h0_source uses symbolic first dim so the same compiled kernel
+        # works for any pool_size (pool_size only affects this dimension).
+        # stride_order=(2,1,0) = row-major: dim K (stride 1) is innermost,
+        # giving concrete strides (V*K, K, 1) so the compiler can verify
+        # 128-bit alignment for cp.async copy atoms.
+        sym_pool_batch = cute.sym_int()
+        h0_source_tensor = cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32,
+            (sym_pool_batch, V, K),
+            stride_order=(2, 1, 0),
+            assumed_align=16,
+        )
         A_log_tensor = from_dlpack(A_log, assumed_align=16)
         a_tensor = from_dlpack(a, assumed_align=16)
         dt_bias_tensor = from_dlpack(dt_bias, assumed_align=16)
