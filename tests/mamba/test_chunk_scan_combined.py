@@ -1527,3 +1527,69 @@ def test_seq_idx_int64():
     assert torch.allclose(fs_ref_cmp, final_states_test, atol=ATOL, rtol=RTOL), (
         "Final states mismatch with int64 seq_idx"
     )
+
+
+def test_fp16_state_dtype():
+    """Test that initial_states in fp16 works with bf16 io_dtype."""
+    torch.manual_seed(42)
+    batch, seqlen, nheads, headdim = 1, 128, 8, 64
+    ngroups, dstate, chunk_size = 8, 128, 128
+
+    x = torch.randn(batch, seqlen, nheads, headdim, dtype=torch.bfloat16, device="cuda")
+    dt = torch.randn(batch, seqlen, nheads, dtype=torch.float32, device="cuda")
+    A = -torch.rand(nheads, dtype=torch.float32, device="cuda") - 1.0
+    B = torch.randn(batch, seqlen, ngroups, dstate, dtype=torch.bfloat16, device="cuda")
+    C = torch.randn(batch, seqlen, ngroups, dstate, dtype=torch.bfloat16, device="cuda")
+    D = torch.randn(nheads, dtype=torch.bfloat16, device="cuda")
+    dt_bias = torch.rand(nheads, dtype=torch.float32, device="cuda") - 4.0
+
+    # initial_states in fp16 (different from io_dtype=bf16)
+    initial_states = torch.randn(
+        batch, nheads, headdim, dstate, dtype=torch.float16, device="cuda"
+    )
+
+    out_test, final_states_test = ssd_combined_fwd(
+        x, dt, A, B, C, chunk_size,
+        D=D, dt_bias=dt_bias, dt_softplus=True,
+        initial_states=initial_states,
+    )
+
+    # final_states must be in state_dtype (fp16), not io_dtype (bf16)
+    assert final_states_test.dtype == torch.float16, (
+        f"final_states dtype {final_states_test.dtype} must be float16"
+    )
+
+    # Compute reference with Triton sub-functions
+    dA_cumsum, dt_processed = _chunk_cumsum_fwd(
+        dt, A, chunk_size, dt_bias=dt_bias, dt_softplus=True
+    )
+    states = _chunk_state_fwd(
+        B, x, dt_processed, dA_cumsum, seq_idx=None, states_in_fp32=True
+    )
+    states, final_states_ref = _state_passing_fwd(
+        rearrange(states, "... p n -> ... (p n)"),
+        dA_cumsum,
+        initial_states=rearrange(initial_states, "... p n -> ... (p n)"),
+        seq_idx=None,
+        chunk_size=chunk_size,
+        out_dtype=torch.float16,
+    )
+    states, final_states_ref = (
+        rearrange(t, "... (p n) -> ... p n", n=dstate)
+        for t in [states, final_states_ref]
+    )
+    CB = _bmm_chunk_fwd(C, B, chunk_size, seq_idx=None, output_dtype=torch.float32)
+    out_ref = _chunk_scan_fwd(
+        CB, x, dt_processed, dA_cumsum, C, states,
+        D=D, z=None, seq_idx=None, initial_states=None,
+    )
+
+    ATOL, RTOL = 7e-2, 7e-2
+    out_ref_cmp = out_ref.to(out_test.dtype)
+    assert torch.allclose(out_ref_cmp, out_test, atol=ATOL, rtol=RTOL), (
+        "Output mismatch with fp16 state_dtype"
+    )
+    final_states_ref_cmp = final_states_ref.to(final_states_test.dtype)
+    assert torch.allclose(
+        final_states_ref_cmp, final_states_test, atol=ATOL, rtol=RTOL
+    ), "Final states mismatch with fp16 state_dtype"

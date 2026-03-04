@@ -272,7 +272,7 @@ def bench_mode(configs, mode, model_params, bench_params, title=None):
         headdim=p["headdim"],
         dstate=p["dstate"],
         ngroups=p["ngroups"],
-        dtype=p["dtype"],
+        io_dtype=p["dtype"],
         has_d=True,
         has_initial_states=True,
         has_varlen=(mode == "varlen"),
@@ -479,7 +479,7 @@ def profile_mode(args, model_params):
         headdim=p["headdim"],
         dstate=p["dstate"],
         ngroups=p["ngroups"],
-        dtype=p["dtype"],
+        io_dtype=p["dtype"],
         has_d=True,
         has_initial_states=True,
     )

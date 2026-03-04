@@ -110,7 +110,7 @@ class _SSDKernel:
         has_init_states: bool = False,
         has_varlen: bool = False,
         has_z: bool = False,
-        seq_idx_dtype=None,
+        seq_idx_dtype=torch.int64,
         io_dtype=None,
         state_dtype=None,
         cumsum_dtype=None,
@@ -144,8 +144,12 @@ class _SSDKernel:
         self.state_dtype = state_dtype or self.io_dtype
         self.cumsum_dtype = cumsum_dtype or cutlass.Float32
         self.acc_dtype = acc_dtype or cutlass.Float32
-        seq_idx_cutlass_dtype = (
-            cutlass.Int64 if seq_idx_dtype == "int64" else cutlass.Int32
+        _seq_idx_dtype_map = {
+            torch.int32: cutlass.Int32,
+            torch.int64: cutlass.Int64,
+        }
+        seq_idx_cutlass_dtype = _seq_idx_dtype_map.get(
+            seq_idx_dtype, cutlass.Int32
         )
 
         # Create the kernel
@@ -162,6 +166,7 @@ class _SSDKernel:
             has_varlen,
             has_z,
             seq_idx_cutlass_dtype,
+            state_dtype=self.state_dtype,
         )
 
         self._compiled_kernel = None
@@ -361,7 +366,7 @@ class _SSDKernel:
         fstate_tensor, fstate_cutlass = _create_cutlass_tensor(
             [fstate_batch, nheads, headdim, dstate],
             [3, 2, 1, 0],
-            self.io_dtype,
+            self.state_dtype,
             [2, 3],
         )
 
@@ -482,7 +487,7 @@ def _get_ssd_kernel(
     has_init_states: bool = False,
     has_varlen: bool = False,
     has_z: bool = False,
-    seq_idx_dtype=None,
+    seq_idx_dtype=torch.int64,
     state_dtype=None,
 ) -> _SSDKernel:
     """Get cached SSD kernel."""
@@ -526,14 +531,14 @@ class SSDCombined:
         headdim: int,
         dstate: int,
         ngroups: int,
-        dtype: torch.dtype = torch.bfloat16,
+        io_dtype: torch.dtype = torch.bfloat16,
         state_dtype: torch.dtype = torch.bfloat16,
         has_d: bool = True,
         d_has_hdim: bool = False,
         has_initial_states: bool = False,
         has_varlen: bool = False,
         has_z: bool = False,
-        seq_idx_dtype=None,
+        seq_idx_dtype=torch.int64,
     ):
         self.chunk_size = chunk_size
         self.nheads = nheads
@@ -548,17 +553,29 @@ class SSDCombined:
         self._state_torch_dtype = state_dtype
 
         # Resolve dtypes
-        assert dtype == torch.bfloat16, (
-            f"io_dtype must be bfloat16, got {dtype}"
+        assert io_dtype == torch.bfloat16, (
+            f"io_dtype must be bfloat16, got {io_dtype}"
         )
         self._io_dtype = cutlass.BFloat16
+        _state_dtype_map = {
+            torch.bfloat16: cutlass.BFloat16,
+            torch.float16: cutlass.Float16,
+        }
+        assert state_dtype in _state_dtype_map, (
+            f"state_dtype must be bfloat16 or float16, got {state_dtype}"
+        )
+        self._state_dtype = _state_dtype_map[state_dtype]
         self._cumsum_dtype = cutlass.Float32
         self._acc_dtype = cutlass.Float32
         self._io_torch_dtype = cutlass_torch.dtype(self._io_dtype)
 
         # Create kernel object
-        seq_idx_cutlass_dtype = (
-            cutlass.Int64 if seq_idx_dtype == "int64" else cutlass.Int32
+        _seq_idx_dtype_map = {
+            torch.int32: cutlass.Int32,
+            torch.int64: cutlass.Int64,
+        }
+        seq_idx_cutlass_dtype = _seq_idx_dtype_map.get(
+            seq_idx_dtype, cutlass.Int32
         )
         self._kernel_obj = SSDKernel(
             self._io_dtype,
@@ -573,6 +590,7 @@ class SSDCombined:
             has_varlen,
             has_z,
             seq_idx_cutlass_dtype,
+            state_dtype=self._state_dtype,
         )
         self._compiled_kernel = None
 
@@ -600,7 +618,7 @@ class SSDCombined:
             self._fstate_cute, self._fstate_torch = _create_cutlass_tensor(
                 list(shape),
                 [3, 2, 1, 0],
-                self._io_dtype,
+                self._state_dtype,
                 [2, 3],
             )
             self._fstate_shape = shape
@@ -980,7 +998,7 @@ def _get_ssd_combined(
     headdim,
     dstate,
     ngroups,
-    dtype,
+    io_dtype,
     state_dtype,
     has_d,
     d_has_hdim,
@@ -996,7 +1014,7 @@ def _get_ssd_combined(
         headdim=headdim,
         dstate=dstate,
         ngroups=ngroups,
-        dtype=dtype,
+        io_dtype=io_dtype,
         state_dtype=state_dtype,
         has_d=has_d,
         d_has_hdim=d_has_hdim,
@@ -1133,10 +1151,7 @@ def ssd_combined_fwd(
     has_varlen = seq_idx is not None
     has_z = z is not None
     state_dtype = initial_states.dtype if initial_states is not None else x.dtype
-    _seq_idx_dtype_map = {torch.int32: "int32", torch.int64: "int64"}
-    seq_idx_dtype = (
-        _seq_idx_dtype_map.get(seq_idx.dtype) if seq_idx is not None else None
-    )
+    seq_idx_dtype = seq_idx.dtype if seq_idx is not None else torch.int32
 
     ssd = _get_ssd_combined(
         chunk_size,

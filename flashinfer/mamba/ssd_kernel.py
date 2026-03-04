@@ -61,8 +61,10 @@ class SSDKernel:
         has_varlen: bool = False,
         has_z: bool = False,
         seq_idx_dtype: Type[cutlass.Numeric] = cutlass.Int32,
+        state_dtype: Type[cutlass.Numeric] = None,
     ):
         self.io_dtype: Type[cutlass.Numeric] = io_dtype
+        self.state_dtype: Type[cutlass.Numeric] = state_dtype or io_dtype
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.cumsum_delta_dtype: Type[cutlass.Numeric] = cumsum_delta_dtype
         self.seq_idx_dtype: Type[cutlass.Numeric] = seq_idx_dtype
@@ -85,6 +87,10 @@ class SSDKernel:
         assert cumsum_delta_dtype in {cutlass.Float32}, (
             "Do not support other cumsum types."
         )
+        assert self.state_dtype in {
+            cutlass.Float16,
+            cutlass.BFloat16,
+        }, f"state_dtype must be Float16 or BFloat16, got {self.state_dtype}"
         assert not (not has_d and d_has_hdim), "D cannot have Hdim if has_d is False"
 
         # Hardcode default setting
@@ -289,7 +295,7 @@ class SSDKernel:
         #     self.internal_stages,
         # )
         self.p_smem_layout_store = sm100_utils.make_smem_layout_epi(
-            self.io_dtype,
+            self.state_dtype,
             utils.LayoutEnum.COL_MAJOR,
             (self.tile_shape_mnk_inter2[2], self.tile_shape_mnk_inter2[1]),
             self.internal_stages,
@@ -303,7 +309,7 @@ class SSDKernel:
         # Physical layout: (N, D) COL_MAJOR has N contiguous, same as pt_smem_layout.
         self.p_smem_layout_load = (
             sm100_utils.make_smem_layout_epi(
-                self.io_dtype,
+                self.state_dtype,
                 utils.LayoutEnum.COL_MAJOR,
                 (
                     self.tile_shape_mnk_inter2[2],
@@ -316,7 +322,7 @@ class SSDKernel:
         )
         self.num_init_state_load_bytes = (
             cute.size_in_bytes(
-                self.io_dtype,
+                self.state_dtype,
                 cute.slice_(self.p_smem_layout_load, (None, None, 0)),
             )
             if self.has_init_states
@@ -1301,18 +1307,36 @@ class SSDKernel:
         tState = cute.make_rmem_tensor(tTR_rP.shape, self.acc_dtype)
 
         # Make tiledCopy and partition smem/register tensor for:
-        # - Loading initial_states from SMEM to registers (S2R, reuses tRS_rP)
+        # - Loading initial_states from SMEM to registers (S2R, reuses tRS_rP_io)
         # - Storing INTER2_P from registers to SMEM (R2S)
         # ((R2S_ATOM_V, R2S_REST_V), R2S_M, R2S_N)
         # ((R2S_ATOM_V, R2S_REST_V), R2S_M, R2S_N, INTERNAL_STAGE)
-        tiled_r2s_p, tRS_rP, tRS_sP = self.smem_store_and_partition_p_y(
+        tiled_r2s_p_io, tRS_rP_io, tRS_sP_io = self.smem_store_and_partition_p_y(
             local_tidx, smem_pt, tiled_t2r_inter1
         )
 
-        tiled_s2r_p = None
-        tS2R_sP = None
+        tiled_s2r_p_io = None
+        tS2R_sP_io = None
+        # state_dtype R2S copies for fstate gmem store (always needed)
+        (
+            tiled_r2s_p_state,
+            tRS_rP_state,
+            tRS_sP_state,
+        ) = self.smem_store_and_partition_p_state(
+            local_tidx, smem_pt, tiled_t2r_inter1
+        )
+        # state_dtype S2R copies for init_states gmem load (only with init_states)
+        tiled_s2r_p_state = None
+        tS2R_sP_state = None
         if cutlass.const_expr(self.has_init_states):
-            tiled_s2r_p, tS2R_sP = self.smem_load_and_partition_istate(
+            tiled_s2r_p_io, tS2R_sP_io = self.smem_load_and_partition_istate(
+                local_tidx, smem_pt, tiled_t2r_inter1
+            )
+            (
+                tiled_s2r_p_state,
+                tS2R_sP_state,
+                _,  # tRS_rP_state already created above
+            ) = self.smem_load_and_partition_istate_state(
                 local_tidx, smem_pt, tiled_t2r_inter1
             )
 
@@ -1384,10 +1408,12 @@ class SSDKernel:
                 init_states_pipeline.consumer_wait(istate_consumer_state)
 
                 istate_coord = (None, None, None, istate_consumer_state.index)
-                cute.copy(tiled_s2r_p, tS2R_sP[istate_coord], tRS_rP)
+                cute.copy(
+                    tiled_s2r_p_state, tS2R_sP_state[istate_coord], tRS_rP_state
+                )
 
-                for reg_idx in range(cute.size(tRS_rP)):
-                    tState[reg_idx] = tRS_rP[reg_idx].to(self.acc_dtype)
+                for reg_idx in range(cute.size(tRS_rP_state)):
+                    tState[reg_idx] = tRS_rP_state[reg_idx].to(self.acc_dtype)
             else:
                 tState.fill(0.0)
 
@@ -1406,15 +1432,15 @@ class SSDKernel:
             # Wait for INTER2_P buffer empty
             inter2_p_pipeline.producer_acquire(inter2_p_producer_state)
 
-            tRS_rP.fill(0.0)
+            tRS_rP_io.fill(0.0)
             # Copy INTER2_P from register to smem
             inter2_p_coord = (None, None, None, inter2_p_producer_state.index)
             # Don't overwrite smem_p if we already have init states there
             if cutlass.const_expr(self.has_init_states):
-                # Convert tState to tRS_rP (same as done in chunk loop at line 1876-1878)
+                # Convert tState to tRS_rP_io (same as done in chunk loop at line 1876-1878)
                 for reg_idx in range(cute.size(tState)):
-                    tRS_rP[reg_idx] = tState[reg_idx].to(self.io_dtype)
-            cute.copy(tiled_r2s_p, tRS_rP, tRS_sP[inter2_p_coord])
+                    tRS_rP_io[reg_idx] = tState[reg_idx].to(self.io_dtype)
+            cute.copy(tiled_r2s_p_io, tRS_rP_io, tRS_sP_io[inter2_p_coord])
 
             # Fence for shared memory
             cute.arch.fence_proxy(
@@ -1550,16 +1576,16 @@ class SSDKernel:
                         (tTR_rP[reg_idx], tTR_rP[reg_idx + 1]),
                     )
 
-                # Store scaled P to tRS_rP
+                # Store scaled P to tRS_rP_io
                 for reg_idx in range(cute.size(tTR_rP)):
-                    tRS_rP[reg_idx] = tTR_rP[reg_idx].to(self.io_dtype)
+                    tRS_rP_io[reg_idx] = tTR_rP[reg_idx].to(self.io_dtype)
 
                 # Update old state
                 tState.store(tTR_rP.load())
 
                 # Store INTER2_P
                 inter2_p_coord = (None, None, None, inter2_p_producer_state.index)
-                cute.copy(tiled_r2s_p, tRS_rP, tRS_sP[inter2_p_coord])
+                cute.copy(tiled_r2s_p_io, tRS_rP_io, tRS_sP_io[inter2_p_coord])
 
                 # Fence for shared memory
                 cute.arch.fence_proxy(
@@ -1585,6 +1611,20 @@ class SSDKernel:
 
                     # A. Store final state of ending sequence to gmem
                     if seq_ends_here:
+                        # Convert smem_p from io_dtype to state_dtype for TMA store
+                        for reg_idx in range(cute.size(tState)):
+                            tRS_rP_state[reg_idx] = tState[reg_idx].to(
+                                self.state_dtype
+                            )
+                        cute.copy(
+                            tiled_r2s_p_state,
+                            tRS_rP_state,
+                            tRS_sP_state[inter2_p_coord],
+                        )
+                        cute.arch.fence_proxy(
+                            "async.shared",
+                            space="cta",
+                        )
                         if local_warp_idx == 0:
                             bSG_gP_seq = bSG_gP_pre_slice[(None, 0, 0, eh_idx, seq_id)]
                             cute.copy(
@@ -1603,21 +1643,25 @@ class SSDKernel:
                         istate_consumer_state.advance()
                         init_states_pipeline.consumer_wait(istate_consumer_state)
 
-                        # Load new init_state: smem → tRS_rP → tState
+                        # Load new init_state: smem → tRS_rP_state → tState
                         istate_coord = (
                             None,
                             None,
                             None,
                             istate_consumer_state.index,
                         )
-                        cute.copy(tiled_s2r_p, tS2R_sP[istate_coord], tRS_rP)
-                        for reg_idx in range(cute.size(tRS_rP)):
-                            tState[reg_idx] = tRS_rP[reg_idx].to(self.acc_dtype)
+                        cute.copy(
+                            tiled_s2r_p_state,
+                            tS2R_sP_state[istate_coord],
+                            tRS_rP_state,
+                        )
+                        for reg_idx in range(cute.size(tRS_rP_state)):
+                            tState[reg_idx] = tRS_rP_state[reg_idx].to(self.acc_dtype)
 
                         # Overwrite same inter2_p smem slot with new init_state
                         for reg_idx in range(cute.size(tState)):
-                            tRS_rP[reg_idx] = tState[reg_idx].to(self.io_dtype)
-                        cute.copy(tiled_r2s_p, tRS_rP, tRS_sP[inter2_p_coord])
+                            tRS_rP_io[reg_idx] = tState[reg_idx].to(self.io_dtype)
+                        cute.copy(tiled_r2s_p_io, tRS_rP_io, tRS_sP_io[inter2_p_coord])
 
                 # Commit INTER2_P buffer full
                 # Last iteration consumer is PRE_INTER warp itself, not MMA_INTER warp
@@ -1645,6 +1689,15 @@ class SSDKernel:
                     # Advance INTER2_P producer state
                     inter2_p_producer_state.advance()
 
+            # Convert smem_p from io_dtype to state_dtype for final TMA store
+            for reg_idx in range(cute.size(tState)):
+                tRS_rP_state[reg_idx] = tState[reg_idx].to(self.state_dtype)
+            cute.copy(
+                tiled_r2s_p_state,
+                tRS_rP_state,
+                tRS_sP_state[inter2_p_coord],
+            )
+
             # Store last INTER2_P (State) from smem to gmem
             cute.arch.fence_proxy(
                 "async.shared",
@@ -1656,7 +1709,7 @@ class SSDKernel:
             )
 
             if local_warp_idx == 0:
-                # TMA store P
+                # TMA store fstate (state_dtype)
                 if cutlass.const_expr(self.has_init_states and self.has_varlen):
                     bSG_gP_final = bSG_gP_pre_slice[(None, 0, 0, eh_idx, seq_id)]
                 else:
@@ -4065,15 +4118,33 @@ class SSDKernel:
         )
         # Use make_tiled_copy_D (not _S) so the thread-value layout comes from
         # the destination (SMEM) side of tiled_t2r_inter1, matching the layout
-        # used by tiled_r2s_p / tRS_rP (which also uses the D side).
-        tiled_s2r_p = cute.make_tiled_copy_D(copy_atom_s2r_p, tiled_t2r_inter1)
-        thr_s2r_p = tiled_s2r_p.get_slice(local_tidx)
+        # used by tiled_r2s_p_io / tRS_rP_io (which also uses the D side).
+        tiled_s2r_p_io = cute.make_tiled_copy_D(copy_atom_s2r_p, tiled_t2r_inter1)
+        thr_s2r_p = tiled_s2r_p_io.get_slice(local_tidx)
         # Partition from smem_pt (same underlying buffer as smem_p_load, same physical
         # layout since (D,N) ROW_MAJOR == (N,D) COL_MAJOR) so that the S2R partition
-        # shape matches tRS_rP which is also partitioned from smem_pt.
-        tS2R_sP = thr_s2r_p.partition_S(smem_pt)  # Source: SMEM
-        # Reuse tRS_rP as destination - shapes match since both use D-side layout
-        return tiled_s2r_p, tS2R_sP
+        # shape matches tRS_rP_io which is also partitioned from smem_pt.
+        tS2R_sP_io = thr_s2r_p.partition_S(smem_pt)  # Source: SMEM
+        # Reuse tRS_rP_io as destination - shapes match since both use D-side layout
+        return tiled_s2r_p_io, tS2R_sP_io
+
+    def smem_load_and_partition_istate_state(
+        self, local_tidx, smem_pt, tiled_t2r_inter1
+    ):
+        """S2R copy atoms/partitions in state_dtype for init_states gmem load."""
+        copy_atom_s2r_p_state = cute.make_copy_atom(
+            cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4),
+            self.state_dtype,
+        )
+        tiled_s2r_p_state = cute.make_tiled_copy_D(
+            copy_atom_s2r_p_state, tiled_t2r_inter1
+        )
+        thr_s2r_p_state = tiled_s2r_p_state.get_slice(local_tidx)
+        tS2R_sP_state = thr_s2r_p_state.partition_S(smem_pt)
+        tRS_rP_state = cute.make_rmem_tensor(
+            cute.slice_(tS2R_sP_state.shape, (None, None, None, 0)), self.state_dtype
+        )
+        return tiled_s2r_p_state, tS2R_sP_state, tRS_rP_state
 
     def smem_store_and_partition_p_y(self, local_tidx, smem_pt, tiled_t2r_inter1):
         dtype = smem_pt.element_type
@@ -4081,16 +4152,34 @@ class SSDKernel:
             cute.nvgpu.warp.StMatrix8x8x16bOp(transpose=True, num_matrices=4),
             dtype,
         )
-        tiled_r2s_p = cute.make_tiled_copy_D(copy_atom_r2s_p, tiled_t2r_inter1)
-        thr_r2s_p = tiled_r2s_p.get_slice(local_tidx)
+        tiled_r2s_p_io = cute.make_tiled_copy_D(copy_atom_r2s_p, tiled_t2r_inter1)
+        thr_r2s_p = tiled_r2s_p_io.get_slice(local_tidx)
         # Partition smem/register tensor for smem store INTER2_P
         # ((R2S_ATOM_V, R2S_REST_V), R2S_M, R2S_N, INTERNAL_STAGE)
-        tRS_sP = thr_r2s_p.partition_D(smem_pt)
+        tRS_sP_io = thr_r2s_p.partition_D(smem_pt)
         # ((R2S_ATOM_V, R2S_REST_V), R2S_M, R2S_N)
-        tRS_rP = cute.make_rmem_tensor(
-            cute.slice_(tRS_sP.shape, (None, None, None, 0)), self.io_dtype
+        tRS_rP_io = cute.make_rmem_tensor(
+            cute.slice_(tRS_sP_io.shape, (None, None, None, 0)), self.io_dtype
         )
-        return tiled_r2s_p, tRS_rP, tRS_sP
+        return tiled_r2s_p_io, tRS_rP_io, tRS_sP_io
+
+    def smem_store_and_partition_p_state(
+        self, local_tidx, smem_pt, tiled_t2r_inter1
+    ):
+        """R2S copy atoms/partitions in state_dtype for fstate gmem store."""
+        copy_atom_r2s_p_state = cute.make_copy_atom(
+            cute.nvgpu.warp.StMatrix8x8x16bOp(transpose=True, num_matrices=4),
+            self.state_dtype,
+        )
+        tiled_r2s_p_state = cute.make_tiled_copy_D(
+            copy_atom_r2s_p_state, tiled_t2r_inter1
+        )
+        thr_r2s_p_state = tiled_r2s_p_state.get_slice(local_tidx)
+        tRS_sP_state = thr_r2s_p_state.partition_D(smem_pt)
+        tRS_rP_state = cute.make_rmem_tensor(
+            cute.slice_(tRS_sP_state.shape, (None, None, None, 0)), self.state_dtype
+        )
+        return tiled_r2s_p_state, tRS_rP_state, tRS_sP_state
 
     @staticmethod
     def _make_zero_stride(shape_elem):
