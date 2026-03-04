@@ -1220,7 +1220,8 @@ def generate_jit_sources(
     # 0 means head_size_v = head_size_qk (required for flash_valid)
     head_size_v_values = [0]
     map_input_layout = {
-        "q_paged_kv": InputLayout.Q_PAGED_KV,
+        "q_paged_kv_nhd": InputLayout.Q_PAGED_KV,
+        "q_paged_kv_hnd": InputLayout.Q_PAGED_KV,
         "packed_qkv": InputLayout.PACKED_QKV,
         "separate_q_k_v": InputLayout.SEPARATE_Q_K_V,
         "contiguous_q_kv": InputLayout.CONTIGUOUS_Q_KV,
