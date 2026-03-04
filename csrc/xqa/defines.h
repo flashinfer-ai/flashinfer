@@ -36,8 +36,13 @@
 #define IS_MLA (HEAD_GRP_SIZE == 128 && HEAD_ELEMS == 576)
 
 #if IS_MLA
+#if defined(MLA_BF16) && MLA_BF16
+#define INPUT_ELEM __nv_bfloat16
+#define INPUT_ELEM2 __nv_bfloat162
+#else
 #define INPUT_ELEM __nv_fp8_e4m3
 #define INPUT_ELEM2 __nv_fp8x2_e4m3
+#endif
 #define HEAD_ELEMS_V 512
 #else
 // 1 means fp16 and 0 means bf16 input/output
