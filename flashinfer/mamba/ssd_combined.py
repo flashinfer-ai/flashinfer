@@ -112,6 +112,7 @@ class _SSDKernel:
         has_z: bool = False,
         seq_idx_dtype=None,
         io_dtype=None,
+        state_dtype=None,
         cumsum_dtype=None,
         acc_dtype=None,
     ):
@@ -127,7 +128,8 @@ class _SSDKernel:
             has_init_states: Whether initial states are provided
             has_z: Whether to apply z gating (y *= z * sigmoid(z))
             seq_idx_dtype: Element type of seq_idx tensor (default: cutlass.Int32)
-            io_dtype: Input/output dtype (default: cutlass.BFloat16)
+            io_dtype: I/O dtype for x, B, C, z, out (default: cutlass.BFloat16)
+            state_dtype: State dtype for initial/final states (default: io_dtype)
             cumsum_dtype: Cumsum intermediate dtype (default: cutlass.Float32)
             acc_dtype: Accumulator dtype (default: cutlass.Float32)
         """
@@ -139,6 +141,7 @@ class _SSDKernel:
         self.has_init_states = has_init_states
 
         self.io_dtype = io_dtype or cutlass.BFloat16
+        self.state_dtype = state_dtype or self.io_dtype
         self.cumsum_dtype = cumsum_dtype or cutlass.Float32
         self.acc_dtype = acc_dtype or cutlass.Float32
         seq_idx_cutlass_dtype = (
@@ -233,10 +236,12 @@ class _SSDKernel:
                 )
 
         # delta (dt_processed): (batch, nheads, nchunks, chunk_size) -> (chunk_size, nchunks, nheads, batch)
-        # Need dtype conversion from float32 to bf16, but keep the non-contiguous permuted layout
-        # so that mode 0 (L) has stride 1 as the kernel expects
-        # First convert dtype (creates contiguous copy in original layout), then permute (zero-copy view)
-        dt_permuted = dt_processed.to(io_torch_dtype).permute(
+        # dt_processed is already in io_dtype from Triton cumsum kernel (dt_out_dtype param)
+        assert dt_processed.dtype == io_torch_dtype, (
+            f"dt_processed dtype {dt_processed.dtype} doesn't match "
+            f"io_dtype {io_torch_dtype}"
+        )
+        dt_permuted = dt_processed.permute(
             3, 2, 1, 0
         )  # (L, C, EH, B)
         delta_tensor = from_dlpack(dt_permuted, assumed_align=16)
@@ -301,7 +306,10 @@ class _SSDKernel:
                     self.io_dtype,
                     [1],
                 )
-                d_dst.copy_(D.t().to(d_dst.dtype))
+                assert D.dtype == d_dst.dtype, (
+                    f"D dtype {D.dtype} doesn't match io_dtype {d_dst.dtype}"
+                )
+                d_dst.copy_(D.t())
             else:
                 # D is (nheads,) -> (1, nheads)
                 if D.dim() == 2:
@@ -312,14 +320,18 @@ class _SSDKernel:
                     self.io_dtype,
                     [1],
                 )
-                d_dst.copy_(D.unsqueeze(0).to(d_dst.dtype))
+                assert D.dtype == d_dst.dtype, (
+                    f"D dtype {D.dtype} doesn't match io_dtype {d_dst.dtype}"
+                )
+                d_dst.copy_(D.unsqueeze(0))
         else:
             d_tensor = None
 
         if self.has_init_states and init_states is not None:
-            # init_states_dst.copy_(init_states_reshaped.to(init_states_dst.dtype))
-            assert init_states.dtype == cutlass_torch.dtype(self.io_dtype), (
-                f"init_states dtype {init_states.dtype} doesn't match cumsum_dtype {self.io_dtype}"
+            state_torch_dtype = cutlass_torch.dtype(self.state_dtype)
+            assert init_states.dtype == state_torch_dtype, (
+                f"init_states dtype {init_states.dtype} doesn't match "
+                f"state_dtype {state_torch_dtype}"
             )
             # B, EH, D, N -> D, N, EH, B - zero-copy view
             init_states_reshaped = init_states.permute(3, 2, 1, 0)
@@ -471,6 +483,7 @@ def _get_ssd_kernel(
     has_varlen: bool = False,
     has_z: bool = False,
     seq_idx_dtype=None,
+    state_dtype=None,
 ) -> _SSDKernel:
     """Get cached SSD kernel."""
     return _SSDKernel(
@@ -483,6 +496,7 @@ def _get_ssd_kernel(
         has_varlen=has_varlen,
         has_z=has_z,
         seq_idx_dtype=seq_idx_dtype,
+        state_dtype=state_dtype,
     )
 
 
@@ -491,6 +505,12 @@ class SSDCombined:
 
     Caches compiled kernel, hardware info, and pre-allocated buffers
     to minimize host-side overhead on repeated calls.
+
+    Dtype expectations (no runtime conversions — assert on mismatch):
+        io_dtype (bf16):  x, B, C, z, D, out, dt_processed
+        state_dtype (bf16): initial_states, final_states
+        fp32 always:      A, dA_cumsum
+        any (bf16/fp32):  dt, dt_bias (consumed by Triton cumsum preprocessor)
 
     Usage::
 
@@ -507,6 +527,7 @@ class SSDCombined:
         dstate: int,
         ngroups: int,
         dtype: torch.dtype = torch.bfloat16,
+        state_dtype: torch.dtype = torch.bfloat16,
         has_d: bool = True,
         d_has_hdim: bool = False,
         has_initial_states: bool = False,
@@ -524,13 +545,13 @@ class SSDCombined:
         self._has_init_states = has_initial_states
         self._has_varlen = has_varlen
         self._has_z = has_z
+        self._state_torch_dtype = state_dtype
 
         # Resolve dtypes
-        _dtype_map = {
-            torch.bfloat16: cutlass.BFloat16,
-            torch.float16: cutlass.Float16,
-        }
-        self._io_dtype = _dtype_map.get(dtype, cutlass.BFloat16)
+        assert dtype == torch.bfloat16, (
+            f"io_dtype must be bfloat16, got {dtype}"
+        )
+        self._io_dtype = cutlass.BFloat16
         self._cumsum_dtype = cutlass.Float32
         self._acc_dtype = cutlass.Float32
         self._io_torch_dtype = cutlass_torch.dtype(self._io_dtype)
@@ -603,7 +624,11 @@ class SSDCombined:
                 self._io_dtype,
                 [1],
             )
-            self._d_torch.copy_(d_val.t().to(self._d_torch.dtype))
+            assert d_val.dtype == self._d_torch.dtype, (
+                f"D dtype {d_val.dtype} doesn't match "
+                f"io_dtype {self._d_torch.dtype}"
+            )
+            self._d_torch.copy_(d_val.t())
         else:
             d_val = D
             if D.dim() == 2:
@@ -614,7 +639,11 @@ class SSDCombined:
                 self._io_dtype,
                 [1],
             )
-            self._d_torch.copy_(d_val.unsqueeze(0).to(self._d_torch.dtype))
+            assert d_val.dtype == self._d_torch.dtype, (
+                f"D dtype {d_val.dtype} doesn't match "
+                f"io_dtype {self._d_torch.dtype}"
+            )
+            self._d_torch.copy_(d_val.unsqueeze(0))
 
         self._d_ptr = d_ptr
         self._d_shape = d_shape
@@ -667,6 +696,9 @@ class SSDCombined:
         assert seqlen % chunk_size == 0, (
             f"seqlen ({seqlen}) must be divisible by chunk_size ({chunk_size})"
         )
+
+        # A is always fp32
+        assert A.dtype == torch.float32, f"A must be float32, got {A.dtype}"
 
         # Validate varlen arguments
         if seq_idx is not None:
@@ -801,15 +833,19 @@ class SSDCombined:
             (4, 2, 0, 3, 1),
         )
 
-        # D (cached)
+        # D: must be io_dtype (kernel buffer is io_dtype, no conversion)
+        if D is not None:
+            assert D.dtype == io_torch_dtype, (
+                f"D dtype {D.dtype} doesn't match io_dtype {io_torch_dtype}"
+            )
         d_tensor = self._get_or_wrap_d(D) if self._has_d else None
 
-        # init_states
+        # init_states (state_dtype)
         init_states_tensor = None
         if self._has_init_states and initial_states is not None:
-            assert initial_states.dtype == io_torch_dtype, (
+            assert initial_states.dtype == self._state_torch_dtype, (
                 f"init_states dtype {initial_states.dtype} doesn't match "
-                f"{io_torch_dtype}"
+                f"state_dtype {self._state_torch_dtype}"
             )
             init_states_tensor = _wrap_tensor(
                 initial_states.permute(3, 2, 1, 0),
@@ -945,6 +981,7 @@ def _get_ssd_combined(
     dstate,
     ngroups,
     dtype,
+    state_dtype,
     has_d,
     d_has_hdim,
     has_init_states,
@@ -960,6 +997,7 @@ def _get_ssd_combined(
         dstate=dstate,
         ngroups=ngroups,
         dtype=dtype,
+        state_dtype=state_dtype,
         has_d=has_d,
         d_has_hdim=d_has_hdim,
         has_initial_states=has_init_states,
@@ -1070,11 +1108,31 @@ def ssd_combined_fwd(
     batch, seqlen, nheads, headdim = x.shape
     _, _, ngroups, dstate = B.shape
 
+    # A is always fp32
+    assert A.dtype == torch.float32, f"A must be float32, got {A.dtype}"
+    # io_dtype: x, B, C, z must match
+    io_dtype = x.dtype
+    assert B.dtype == io_dtype, (
+        f"B dtype {B.dtype} must match io_dtype (x.dtype={io_dtype})"
+    )
+    assert C.dtype == io_dtype, (
+        f"C dtype {C.dtype} must match io_dtype (x.dtype={io_dtype})"
+    )
+    if z is not None:
+        assert z.dtype == io_dtype, (
+            f"z dtype {z.dtype} must match io_dtype (x.dtype={io_dtype})"
+        )
+    # D must be io_dtype (kernel buffer is io_dtype, no conversion)
+    if D is not None:
+        assert D.dtype == x.dtype, (
+            f"D dtype {D.dtype} must match io_dtype (x.dtype={x.dtype})"
+        )
     has_d = D is not None
     d_has_hdim = has_d and D.dim() == 2
     has_init_states = initial_states is not None
     has_varlen = seq_idx is not None
     has_z = z is not None
+    state_dtype = initial_states.dtype if initial_states is not None else x.dtype
     _seq_idx_dtype_map = {torch.int32: "int32", torch.int64: "int64"}
     seq_idx_dtype = (
         _seq_idx_dtype_map.get(seq_idx.dtype) if seq_idx is not None else None
@@ -1087,6 +1145,7 @@ def ssd_combined_fwd(
         dstate,
         ngroups,
         x.dtype,
+        state_dtype,
         has_d,
         d_has_hdim,
         has_init_states,
