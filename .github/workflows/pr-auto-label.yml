@@ -1,0 +1,64 @@
+name: PR Auto-Label
+
+on:
+  pull_request_target:
+    types: [opened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Skip PRs older than 21 days
+        env:
+          PR_CREATED: ${{ github.event.pull_request.created_at }}
+        run: |
+          created=$(date -d "$PR_CREATED" +%s)
+          cutoff=$(date -d '21 days ago' +%s)
+          if [ "$created" -lt "$cutoff" ]; then
+            echo "PR older than 21 days, skipping"
+            exit 1
+          fi
+
+      - name: Sparse checkout overrides file from base branch
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/codeowner_overrides.json
+          sparse-checkout-cone-mode: false
+
+      - name: Apply labels based on changed files
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # Fetch changed files in the PR
+          changed_files=$(gh api "repos/${{ github.repository }}/pulls/${PR_NUMBER}/files" \
+            --paginate --jq '.[].filename')
+
+          # Read override groups and apply matching labels
+          jq -c '.[]' scripts/codeowner_overrides.json | while read -r group; do
+            readarray -t labels < <(echo "$group" | jq -r '.labels[]')
+            readarray -t prefixes < <(echo "$group" | jq -r '.owners | keys[]')
+
+            match=false
+            for prefix in "${prefixes[@]}"; do
+              for file in $changed_files; do
+                case "$file" in
+                  "$prefix"*) match=true; break ;;
+                esac
+              done
+              if $match; then break; fi
+            done
+
+            if $match; then
+              for label in "${labels[@]}"; do
+                echo "Adding label: $label"
+                gh pr edit "$PR_NUMBER" \
+                  --repo "${{ github.repository }}" \
+                  --add-label "$label" || true
+              done
+            fi
+          done

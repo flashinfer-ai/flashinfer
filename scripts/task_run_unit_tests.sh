@@ -50,7 +50,13 @@ find_test_files() {
         done
 
         if [ "$exclude_file" = false ]; then
-            TEST_FILES="$TEST_FILES $test_file"
+            # Apply label-based filtering if --labels was provided
+            local skip_reason
+            if skip_reason=$(gh_label_filter "$test_file"); then
+                TEST_FILES="$TEST_FILES $test_file"
+            else
+                echo "  Skipping $test_file: $skip_reason"
+            fi
         fi
     done
 

@@ -18,6 +18,31 @@ from typing import List, Dict, Optional, Tuple, Any, DefaultDict
 import re
 
 
+def load_overrides(filename: str) -> Dict[str, List[str]]:
+    """Load codeowner overrides from a grouped JSON array file.
+
+    Returns a flat dict mapping path prefixes to lists of owners.
+    """
+    with open(filename, "r") as f:
+        raw = json.load(f)
+
+    if not isinstance(raw, list):
+        raise ValueError("Overrides file must contain a JSON array")
+
+    overrides: Dict[str, List[str]] = {}
+    for group in raw:
+        if not isinstance(group, dict) or not isinstance(group.get("owners"), dict):
+            raise ValueError("Each group must be an object with an 'owners' dict")
+        for path, users in group["owners"].items():
+            if not isinstance(users, list) or not all(
+                isinstance(u, str) for u in users
+            ):
+                raise ValueError(f"Override for '{path}' must be a list of strings")
+            overrides[path.lstrip("./").rstrip("/")] = users
+
+    return overrides
+
+
 class CodeOwnersAnalyzer:
     def __init__(
         self,
@@ -524,62 +549,67 @@ class CodeOwnersAnalyzer:
         """Normalize usernames to have @ prefix."""
         return [f"@{u}" if not u.startswith("@") else u for u in users]
 
+    def _extract_computed_usernames(self, data: Dict[str, Any]) -> List[str]:
+        """Extract deduplicated GitHub usernames from computed ownership data."""
+        usernames: List[str] = []
+        seen_lower: set = set()
+        if not data["owners"]:
+            return usernames
+        top_owners = [
+            o for o in data["owners"][: self.top_n_owners] if o["ownership_score"] > 0.1
+        ]
+        for owner in top_owners:
+            gh = self.get_github_username(owner["author"])
+            name = f"@{gh}" if gh else owner["author"].split("<")[1].rstrip(">")
+            if name.lower() not in seen_lower:
+                usernames.append(name)
+                seen_lower.add(name.lower())
+        return usernames
+
     def _merge_owners_with_overrides(
         self, module: str, computed_usernames: List[str]
     ) -> List[str]:
-        """Merge manual overrides with computed owners.
+        """Merge manual overrides with computed owners for an exact-match path.
 
-        Override users are prepended to the list (indicating primary ownership),
-        and duplicates are removed. Override users are always included, even if
-        that exceeds top_n_owners. Only computed owners are subject to truncation.
-
-        Note: File-level overrides are handled separately in generate_codeowners_file(),
-        since there's no computed ownership for individual files.
-
-        Args:
-            module: The module path (e.g., "flashinfer/fused_moe")
-            computed_usernames: List of GitHub usernames from git history analysis
-                (with @ prefix, e.g., ["@alice", "@bob"])
-
-        Returns:
-            Merged list of usernames with overrides first (all overrides preserved)
+        Override users are prepended; computed users fill remaining slots up to
+        top_n_owners.  The result is wider than either list alone.
         """
-        if not self.owner_overrides:
-            return computed_usernames[: self.top_n_owners]
-
-        # Skip file-level overrides (handled separately)
-        if self._is_file_path(module):
-            return computed_usernames[: self.top_n_owners]
-
-        # Get override users for this module (without @ prefix in the config)
         override_users = self.owner_overrides.get(module, [])
         if not override_users:
             return computed_usernames[: self.top_n_owners]
 
-        # Normalize override users to have @ prefix
-        override_usernames = self._normalize_usernames(override_users)
-
-        # Build merged list: overrides first, then computed (excluding duplicates)
-        # Override users are always preserved; only computed users are truncated
-        # Use case-insensitive comparison since GitHub usernames are case-insensitive
-        merged = list(override_usernames)
+        merged = self._normalize_usernames(override_users)
         merged_lower = {u.lower() for u in merged}
-        num_overrides = len(merged)
-        remaining_slots = max(0, self.top_n_owners - num_overrides)
+        remaining = max(0, self.top_n_owners - len(merged))
 
         for username in computed_usernames:
+            if remaining <= 0:
+                break
             if username.lower() not in merged_lower:
-                if remaining_slots > 0:
-                    merged.append(username)
-                    merged_lower.add(username.lower())
-                    remaining_slots -= 1
+                merged.append(username)
+                merged_lower.add(username.lower())
+                remaining -= 1
 
         return merged
+
+    def _format_codeowners_path(self, path: str) -> str:
+        """Format a path for CODEOWNERS (append / for directories)."""
+        return path if self._is_file_path(path) else f"{path}/"
 
     def generate_codeowners_file(
         self, results: Dict[str, Any], output_file: str = "CODEOWNERS"
     ) -> None:
-        """Generate a CODEOWNERS file based on analysis."""
+        """Generate a CODEOWNERS file from computed results and overrides.
+
+        All paths (computed and override-only) are emitted in alphabetical
+        order.  For exact-match paths, override owners are prepended to the
+        computed list so the final owner set is wider.  Alphabetical ordering
+        naturally puts parent dirs before children, which matters because
+        CODEOWNERS uses last-match-wins.
+        """
+        override_paths = set(self.owner_overrides) if self.owner_overrides else set()
+        all_paths = sorted(set(results) | override_paths)
+
         with open(output_file, "w") as f:
             f.write("# Code Owners File\n")
             f.write("# Generated automatically from git history analysis\n")
@@ -589,58 +619,23 @@ class CodeOwnersAnalyzer:
                 f.write("# Manual overrides applied from overrides file\n")
             f.write("\n")
 
-            # Write directory entries (computed + merged overrides)
-            for module, data in results.items():
-                # Extract GitHub usernames from computed owners
-                # Use case-insensitive deduplication since the same user may appear
-                # multiple times with different email addresses
-                computed_usernames = []
-                seen_usernames_lower = set()
-                if data["owners"]:
-                    # Take top N owners or those with ownership score > 0.1
-                    top_owners = [
-                        owner
-                        for owner in data["owners"][: self.top_n_owners]
-                        if owner["ownership_score"] > 0.1
-                    ]
+            for path in all_paths:
+                if path in results:
+                    computed = self._extract_computed_usernames(results[path])
+                    final = self._merge_owners_with_overrides(path, computed)
+                else:
+                    # Override-only path (no computed match)
+                    final = self._normalize_usernames(self.owner_overrides[path])
 
-                    for owner in top_owners:
-                        github_username = self.get_github_username(owner["author"])
-                        if github_username:
-                            username = f"@{github_username}"
-                        else:
-                            # Fallback to email if no GitHub username found
-                            username = owner["author"].split("<")[1].rstrip(">")
-
-                        # Skip duplicates (case-insensitive)
-                        if username.lower() not in seen_usernames_lower:
-                            computed_usernames.append(username)
-                            seen_usernames_lower.add(username.lower())
-
-                # Merge with overrides
-                final_usernames = self._merge_owners_with_overrides(
-                    module, computed_usernames
-                )
-
-                if final_usernames:
-                    owners_list = " ".join(final_usernames)
-                    f.write(f"{module}/ {owners_list}\n")
-
-            # Write file-level overrides LAST (CODEOWNERS uses last-match-wins)
-            # This ensures file-specific overrides take precedence over directory patterns
-            if self.owner_overrides:
-                file_overrides = [
-                    (path, users)
-                    for path, users in self.owner_overrides.items()
-                    if self._is_file_path(path)
-                ]
-                if file_overrides:
-                    f.write(
-                        "\n# File-level overrides (must come last for precedence)\n"
+                if final:
+                    # Sanitize against newline injection
+                    safe_path = (
+                        self._format_codeowners_path(path)
+                        .replace("\n", "")
+                        .replace("\r", "")
                     )
-                    for path, users in sorted(file_overrides):
-                        usernames = self._normalize_usernames(users)
-                        f.write(f"{path} {' '.join(usernames)}\n")
+                    safe_owners = [u.replace("\n", "").replace("\r", "") for u in final]
+                    f.write(f"{safe_path} {' '.join(safe_owners)}\n")
 
     def print_detailed_report(self, results: Dict[str, Any]) -> None:
         """Print a detailed ownership report."""
@@ -777,46 +772,15 @@ Examples:
     owner_overrides = None
     if args.overrides_file:
         try:
-            with open(args.overrides_file, "r") as f:
-                owner_overrides = json.load(f)
-            if not isinstance(owner_overrides, dict):
-                print(
-                    "Error: Overrides file must contain a JSON object (dict)",
-                    file=sys.stderr,
-                )
-                return 1
-            # Validate structure: all values should be lists of strings
-            for path, users in owner_overrides.items():
-                if not isinstance(users, list):
-                    print(
-                        f"Error: Override for '{path}' must be a list of usernames",
-                        file=sys.stderr,
-                    )
-                    return 1
-                for user in users:
-                    if not isinstance(user, str):
-                        print(
-                            f"Error: Override users for '{path}' must be strings",
-                            file=sys.stderr,
-                        )
-                        return 1
-
-            # Normalize paths: strip leading "./" and trailing "/"
-            owner_overrides = {
-                path.lstrip("./").rstrip("/"): users
-                for path, users in owner_overrides.items()
-            }
+            owner_overrides = load_overrides(args.overrides_file)
         except FileNotFoundError:
             print(
                 f"Error: Overrides file not found: {args.overrides_file}",
                 file=sys.stderr,
             )
             return 1
-        except json.JSONDecodeError as e:
-            print(f"Error: Invalid JSON in overrides file: {e}", file=sys.stderr)
-            return 1
-        except Exception as e:
-            print(f"Error reading overrides file: {e}", file=sys.stderr)
+        except (json.JSONDecodeError, ValueError) as e:
+            print(f"Error in overrides file: {e}", file=sys.stderr)
             return 1
 
     try:

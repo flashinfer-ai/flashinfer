@@ -36,8 +36,9 @@ EXIT_CODE=0
 parse_args() {
     DRY_RUN=false
     SANITY_TEST=false
-    for arg in "$@"; do
-        case $arg in
+    LABELS=""
+    while [ $# -gt 0 ]; do
+        case $1 in
             --dry-run)
                 DRY_RUN=true
                 ;;
@@ -50,8 +51,88 @@ parse_args() {
                     SANITY_TEST=true
                 fi
                 ;;
+            --labels)
+                shift
+                LABELS="$1"
+                ;;
         esac
+        shift
     done
+}
+
+# Label filter state (populated once by _init_label_filter)
+_LABEL_FILTER_INITIALIZED=false
+_CATEGORIZED_PREFIXES=""  # all tests/* prefixes in the JSON
+_INCLUDED_PREFIXES=""     # tests/* prefixes whose group labels match LABELS
+
+_init_label_filter() {
+    if [ "$_LABEL_FILTER_INITIALIZED" = true ]; then
+        return
+    fi
+    _LABEL_FILTER_INITIALIZED=true
+
+    local overrides_file="${SCRIPT_DIR}/codeowner_overrides.json"
+    if [ ! -f "$overrides_file" ]; then
+        echo "Warning: $overrides_file not found, label filter disabled" >&2
+        LABELS=""
+        return
+    fi
+
+    # All test prefixes mentioned in the JSON
+    _CATEGORIZED_PREFIXES=$(jq -r '.[].owners | keys[] | select(startswith("tests/"))' "$overrides_file")
+
+    # Test prefixes whose group labels intersect with the requested labels
+    IFS=',' read -ra _label_array <<< "$LABELS"
+    for _req_label in "${_label_array[@]}"; do
+        _req_label=$(echo "$_req_label" | xargs)  # trim whitespace
+        local matches
+        matches=$(jq -r --arg label "$_req_label" \
+            '.[] | select(.labels[] == $label) | .owners | keys[] | select(startswith("tests/"))' \
+            "$overrides_file")
+        if [ -n "$matches" ]; then
+            _INCLUDED_PREFIXES="${_INCLUDED_PREFIXES}${_INCLUDED_PREFIXES:+
+}${matches}"
+        fi
+    done
+}
+
+# Filter a test file by PR labels.
+# Returns 0 (include) or 1 (skip). On skip, prints a brief reason to stdout.
+#
+# Four-step logic:
+#   1. No labels specified        → include (run everything)
+#   2. File matches included label → include (label hit)
+#   3. File is categorized but not included → skip (label mismatch)
+#   4. File is uncategorized       → include (always run)
+gh_label_filter() {
+    local test_file="$1"
+
+    # Step 1: no labels specified — include everything
+    if [ -z "$LABELS" ]; then
+        return 0
+    fi
+
+    _init_label_filter
+
+    # Step 2: file matches a prefix whose group label is in LABELS — include
+    while IFS= read -r prefix; do
+        [ -z "$prefix" ] && continue
+        if [[ "$test_file" == "$prefix"* ]]; then
+            return 0
+        fi
+    done <<< "$_INCLUDED_PREFIXES"
+
+    # Step 3: file is categorized in the JSON but no label matched — skip
+    while IFS= read -r prefix; do
+        [ -z "$prefix" ] && continue
+        if [[ "$test_file" == "$prefix"* ]]; then
+            echo "no matching label (have: $LABELS)"
+            return 1
+        fi
+    done <<< "$_CATEGORIZED_PREFIXES"
+
+    # Step 4: file not mentioned in any group — uncategorized, always run
+    return 0
 }
 
 # Print test mode banner
