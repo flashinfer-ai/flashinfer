@@ -604,9 +604,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         fp8_ok = (
             query.dtype == torch.float8_e4m3fn and kv_cache.dtype == torch.float8_e4m3fn
         )
-        bf16_ok = (
-            query.dtype == torch.bfloat16 and kv_cache.dtype == torch.bfloat16
-        )
+        bf16_ok = query.dtype == torch.bfloat16 and kv_cache.dtype == torch.bfloat16
         if not (fp8_ok or bf16_ok):
             raise ValueError(
                 f"XQA MLA on SM120/SM121 supports (fp8, fp8) or (bfloat16, bfloat16) only, got {query.dtype} and {kv_cache.dtype}"

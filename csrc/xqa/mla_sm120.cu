@@ -46,11 +46,11 @@ inline constexpr uint32_t mathElemBytes = sizeof(MathElem);
 inline constexpr bool is_fp8 = (mathElemBytes == 1);
 inline constexpr bool is_bf16 = (mathElemBytes == 2);
 // BF16: partElemsK=64, nbKBufs=2 → ~100KB, under 99KB opt-in (101376).
-inline constexpr uint32_t partElemsK = is_fp8 ? 64 : is_bf16 ? 64 : 64;
+inline constexpr uint32_t partElemsK = 64;
 inline constexpr uint32_t nbKParts = exactDiv(validElemsPerKHead, partElemsK);
 inline constexpr uint32_t nbQParts = nbKParts;
 
-inline constexpr uint32_t tokensPerTile = is_fp8 ? 64 : is_bf16 ? 32 : 64;
+inline constexpr uint32_t tokensPerTile = is_fp8 ? 64 : 32;
 
 inline constexpr uint32_t partElemsV = is_fp8 ? 128 : 64;
 inline constexpr uint32_t nbVSplit = 2;
@@ -271,7 +271,7 @@ constexpr bool useRegQ = USE_REG_Q;
 struct SharedMemA {
   // BF16: 2 K-buffers to fit ≤99KB opt-in (~100096 bytes); 3 buffers would need ~104KB (128KB
   // arch).
-  static inline constexpr uint32_t nbKBufs = is_fp8 ? 12 : (is_bf16 ? 2 : 12);
+  static inline constexpr uint32_t nbKBufs = is_fp8 ? 12 : 2;
 
   static inline constexpr uint32_t regQParts = (useRegQ ? 4 : 0);
   static inline constexpr uint32_t shmQParts = nbQParts - regQParts;
@@ -1741,6 +1741,8 @@ CUtensorMap makeTensorMapForQ(void const* addr, CUtensorMapDataType_enum dataTyp
 }
 #endif  // IS_MLA
 
+static uint32_t configureKernel();
+
 void launchMLA(
     cudaDeviceProp const& prop,
     uint32_t inputSeqLen,  // uniform for all requests and causal mask is assumed
@@ -1760,23 +1762,7 @@ void launchMLA(
   if (beamWidth != 1) {
     throw std::runtime_error("not implemented");
   }
-  static uint32_t const hostSmemSize = [&]() {
-    uint32_t size;
-    checkCuda(cudaMemcpyFromSymbol(&size, smemSize, sizeof(smemSize)));
-    int devMaxShmem = 0;
-    checkCuda(cudaDeviceGetAttribute(&devMaxShmem, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0));
-    if (size > (uint32_t)devMaxShmem) {
-      throw std::runtime_error("XQA MLA kernel requires " + std::to_string(size) +
-                               " bytes shared memory per block, but "
-                               "device opt-in max is " +
-                               std::to_string(devMaxShmem) +
-                               ". BF16 MLA needs 128 KB (e.g. SM12x).");
-    }
-    checkCuda(cudaFuncSetAttribute(kernel_mha, cudaFuncAttributePreferredSharedMemoryCarveout,
-                                   cudaSharedmemCarveoutMaxShared));
-    checkCuda(cudaFuncSetAttribute(kernel_mha, cudaFuncAttributeMaxDynamicSharedMemorySize, size));
-    return size;
-  }();
+  static uint32_t const hostSmemSize = configureKernel();
   uint32_t const nbKHeads = 1;
   uint32_t const nbVHeads = nbKHeads;
   uint32_t const nbQHeads = nbKHeads * headGrpSize;
