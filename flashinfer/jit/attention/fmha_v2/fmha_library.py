@@ -1242,7 +1242,7 @@ def generate_jit_sources(
     include_sm90_kernels = 9 in target_major_archs
     include_sm120_kernels = 12 in target_major_archs
     warp_spec_configs: itertools.product = itertools.product(
-        [90] if generate_sm90 else [],
+        [90] if include_sm90_kernels else [],
         dtype_values,
         head_size_qk_warpspec_values,
         head_size_v_values,
@@ -1257,7 +1257,7 @@ def generate_jit_sources(
 
     head_size_qk_sm120_values = [64, 128, 256]
     sm120_configs: itertools.product = itertools.product(
-        [120] if generate_sm120 else [],
+        [120] if include_sm120_kernels else [],
         dtype_values,  # fallback to avoid empty product
         head_size_qk_sm120_values,
         head_size_v_values,
