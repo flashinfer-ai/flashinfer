@@ -8,6 +8,8 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
+from __future__ import annotations
+
 import os
 import subprocess
 from collections import namedtuple
@@ -104,81 +106,84 @@ class InputLayout(IntEnum):
     SEPARATE_Q_K_V = 3
 
 
-spec_fields = (
-    "sm",
-    "dtype",
-    "seq_len",
-    "head_size",
-    "warps_m",
-    "warps_n",
-    "version",
-    "interleaved",
-    "ldgsts_q",
-    "ldgsts_k",
-    "ldgsts_v",
-    "share_smem_k_v",
-    "loop_step",
-    "has_noloop",
-    "noloop_step",
-    "unroll_threshold",
-    "has_scale_max",
-    "ctas_per_head",
-    "sm_mma",
-    "head_interleaved",
-    # new added fields (only used by flash attention implementation)
-    "flash_attention",
-    "kv_loop_step",
-    "flash_attention_bh_upper_threshold",  # to deprecate; not actively used
-    "limit_qk_fragments",
-    "limit_v_fragments",
-    "tiled",
-    # fields for warp specialized kernel
-    "warp_specialization",
-    "q_tile_buffers",
-    "kv_tile_buffers",
-    "scheduling_mode",
-    # attention qkv input layout.
-    "input_layout",
-    # fused MHCA.
-    "cross_mha",
-    # other features
-    "alibi",
-    "enable_attn_logit_softcapping",
-    "return_softmax_stats",
-    "disabled_mask_types",
-    "head_size_v",
-    "sage_block_sizes",
-    "output_dtype",
-    "is_mtp",
-    "enable_skip_softmax",
+kernel_spec = namedtuple(
+    "kernel_spec",
+    [
+        "sm",
+        "dtype",
+        "seq_len",
+        "head_size",
+        "warps_m",
+        "warps_n",
+        "version",
+        "interleaved",
+        "ldgsts_q",
+        "ldgsts_k",
+        "ldgsts_v",
+        "share_smem_k_v",
+        "loop_step",
+        "has_noloop",
+        "noloop_step",
+        "unroll_threshold",
+        "has_scale_max",
+        "ctas_per_head",
+        "sm_mma",
+        "head_interleaved",
+        # new added fields (only used by flash attention implementation)
+        "flash_attention",
+        "kv_loop_step",
+        "flash_attention_bh_upper_threshold",  # to deprecate; not actively used
+        "limit_qk_fragments",
+        "limit_v_fragments",
+        "tiled",
+        # fields for warp specialized kernel
+        "warp_specialization",
+        "q_tile_buffers",
+        "kv_tile_buffers",
+        "scheduling_mode",
+        # attention qkv input layout.
+        "input_layout",
+        # fused MHCA.
+        "cross_mha",
+        # other features
+        "alibi",
+        "enable_attn_logit_softcapping",
+        "return_softmax_stats",
+        "disabled_mask_types",
+        "head_size_v",
+        "sage_block_sizes",
+        "output_dtype",
+        "is_mtp",
+        "enable_skip_softmax",
+    ],
+    defaults=(
+        1,  # ctas_per_head
+        1,  # sm_mma
+        True,  # head_interleaved
+        False,  # flash_attention
+        64,  # kv_loop_step
+        -1,  # flash_attention_bh_upper_threshold
+        False,  # limit_qk_fragments
+        False,  # limit_v_fragments
+        0,  # tiled
+        False,  # warp_specialization
+        1,  # q_tile_buffers
+        1,  # kv_tile_buffers
+        0,  # scheduling_mode
+        InputLayout.PACKED_QKV,  # input_layout
+        0,  # cross_mha
+        True,  # alibi
+        False,  # enable_attn_logit_softcapping
+        False,  # return_softmax_stats
+        None,  # disabled_mask_types
+        0,  # head_size_v
+        None,  # sage_block_sizes
+        None,  # output_dtype, same as dtype by default.
+        False,  # is_mtp
+        False,  # enable_skip_softmax
+    ),
 )
-kernel_spec = namedtuple("kernel_spec", spec_fields)  # type: ignore[misc]
-kernel_spec.__new__.__defaults__ = (
-    1,  # ctas_per_head
-    1,  # sm_mma
-    True,  # head_interleaved
-    False,  # flash_attention
-    64,  # kv_loop_step
-    -1,  # flash_attention_bh_upper_threshold
-    False,  # limit_qk_fragments
-    False,  # limit_v_fragments
-    0,  # tiled
-    False,  # warp_specialization
-    1,  # q_tile_buffers
-    1,  # kv_tile_buffers
-    0,  # scheduling_mode
-    InputLayout.PACKED_QKV,
-    0,  # cross_mha
-    True,  # alibi
-    False,  # enable_attn_logit_softcapping
-    False,  # return_softmax_stats
-    None,  # disabled_mask_types
-    0,  # head size of V
-    None,  # sage_block_sizes
-    None,  # output_dtype, same as dtype by default.
-    False,  # use MTP or not
-    False,  # enable skip softmax
-)
+spec_fields = kernel_spec._fields
 
 generate_cu_trtllm = os.environ.get("GENERATE_CU_TRTLLM", "False").lower() == "true"
 
@@ -273,7 +278,7 @@ OBJECTS_MHCA += obj/convert.cu.o
 """
 
 
-def get_makefile_code(specs_names):
+def get_makefile_code(specs_names: list[tuple[kernel_spec, str, str, str]]) -> str:
     objects = "\n".join(
         [
             "OBJECTS_MHA += obj/{}.o".format(fname)
@@ -1832,7 +1837,7 @@ void {launcher_name}(
 """
 
 
-def encode_name(kernel_spec):
+def encode_name(kernel_spec: kernel_spec) -> tuple[str, str, str]:
     effective_sm, sm_name = get_effective_sm_and_name(kernel_spec)
     # Is it a kernel for the interleaved NC/32HW32 INT8 layout?
     il_tag = "_il" if kernel_spec.interleaved else ""
@@ -1920,7 +1925,9 @@ def encode_name(kernel_spec):
     return fname, lname, kname
 
 
-def get_GMMA_shape(instruction_traits, m, n, k, warps_n):
+def get_GMMA_shape(
+    instruction_traits: str, m: int, n: int, k: int, warps_n: int
+) -> tuple[int, int, int]:
     gmma_k = hopper_traits2shape[instruction_traits][-1]
 
     # gmma shape is 64xgmma_nx16, gmma_n should be as big as possible, but not bigger than n
@@ -1941,13 +1948,13 @@ def get_GMMA_shape(instruction_traits, m, n, k, warps_n):
     return gmma_m, gmma_n, gmma_k
 
 
-def enable_mutex(kspec):
+def enable_mutex(kspec: kernel_spec) -> str:
     fp32_accu_dtype = kspec.dtype in ["fp16_fp32", "bf16"]
     enable_mutex = "false" if (fp32_accu_dtype or kspec.head_size <= 64) else "true"
     return enable_mutex
 
 
-def enable_tma_store(kspec):
+def enable_tma_store(kspec: kernel_spec) -> str:
     output_dtype = kspec.output_dtype if kspec.output_dtype is not None else kspec.dtype
     # TMA copies data in the 16B granularity.
     return (
@@ -1957,7 +1964,7 @@ def enable_tma_store(kspec):
     )
 
 
-def get_reg_count(kspec):
+def get_reg_count(kspec: kernel_spec) -> tuple[int, int]:
     # if kspec.paged_kv_input and kspec.dtype in ['fp16', 'fp16_fp32', 'bf16']:
     #     dma_reg_count = 72
     #     compute_reg_count = 216
@@ -1970,7 +1977,9 @@ def get_reg_count(kspec):
     return dma_reg_count, compute_reg_count
 
 
-def get_hopper_instruction_traits(instruction_traits, kernel_spec):
+def get_hopper_instruction_traits(
+    instruction_traits: str, kernel_spec: kernel_spec
+) -> tuple[str, str]:
     gmma_shape_p = get_GMMA_shape(
         instruction_traits,
         kernel_spec.loop_step,
@@ -1993,7 +2002,7 @@ def get_hopper_instruction_traits(instruction_traits, kernel_spec):
     return instruction_traits_p, instruction_traits_o
 
 
-def get_effective_sm_and_name(kspec):
+def get_effective_sm_and_name(kspec: kernel_spec) -> tuple[int, str]:
     sm = kspec.sm
     # Override the mma instruction with an older one.
     if kspec.sm_mma in sm2name:
@@ -2005,7 +2014,7 @@ def get_effective_sm_and_name(kspec):
     return sm, sm_name
 
 
-def selected_mask_types(kspec):
+def selected_mask_types(kspec: kernel_spec) -> tuple[str, str, str, str]:
     # by default, we generate all combinations.
     # '1' means true, '0' means false.
     padding_mask = "1"
@@ -2060,7 +2069,7 @@ def selected_mask_types(kspec):
     return padding_mask, causal_mask, sliding_or_chunked_causal_mask, custom_mask
 
 
-def get_kernel_code(kspec, kname, lname):
+def get_kernel_code(kspec: kernel_spec, kname: str, lname: str) -> str | None:
     min_cuda_version = 0  # no restriction
 
     # The architecture that determines the instruction.
@@ -2338,8 +2347,8 @@ def get_kernel_code(kspec, kname, lname):
     return code
 
 
-def get_api_code(specs_names):
-    def get_signature(lname, version, cross_mha, use_tma):
+def get_api_code(specs_names: list[tuple[kernel_spec, str, str, str]]) -> str:
+    def get_signature(lname: str, version: int, cross_mha: int, use_tma: bool) -> str:
         # The architecture that determines the instruction.
         effective_sm, sm_name = get_effective_sm_and_name(kspec)
         if cross_mha:
@@ -2373,7 +2382,7 @@ def get_api_code(specs_names):
             )
         if not kspec.warp_specialization:
             signatures.append("void {}_get_max_heads_per_wave(int*);".format(lname))
-    signatures = "\n".join(signatures)
+    signatures = "\n".join(signatures)  # type: ignore[assignment]
 
     # v1
     # - normal
@@ -2387,7 +2396,7 @@ def get_api_code(specs_names):
     # - flash attention no loop tiled
     # - flash attention warp_specialized (on Hopper)
 
-    def gen_unroll_check(kspec):
+    def gen_unroll_check(kspec: kernel_spec) -> str:
         code = "if (!{has_noloop} || (!force_unroll && (ignore_b1opt || b > {unroll_threshold})))".format(
             **kspec._asdict()
         )
@@ -2397,7 +2406,7 @@ def get_api_code(specs_names):
             )
         return code
 
-    def gen_call(kspec, lname):
+    def gen_call(kspec: kernel_spec, lname: str) -> str:
         effective_sm, _ = get_effective_sm_and_name(kspec)
         data_type = dtype2typename[kspec.dtype]
         output_data_type = data_type
@@ -2566,7 +2575,7 @@ if( data_type == {data_type} && output_data_type == {output_data_type} && s == {
             )
         return call_stmt
 
-    def gen_call_fmhca(kspec, lname):
+    def gen_call_fmhca(kspec: kernel_spec, lname: str) -> str:
         effective_sm, _ = get_effective_sm_and_name(kspec)
         data_type = dtype2typename[kspec.dtype]
         il_check = ""
@@ -2619,7 +2628,7 @@ if( data_type == {data_type} && s_kv == {s_kv_len} && d == {head_size} && sm == 
         if kspec.version == 2 and kspec.cross_mha == 0
     ]
 
-    calls_v2 = "else ".join(calls_v2) if len(calls_v2) > 0 else "if( false ) {}"
+    calls_v2 = "else ".join(calls_v2) if len(calls_v2) > 0 else "if( false ) {}"  # type: ignore[assignment]
 
     calls_v1 = [
         gen_call(kspec, lname)
@@ -2627,7 +2636,7 @@ if( data_type == {data_type} && s_kv == {s_kv_len} && d == {head_size} && sm == 
         if kspec.version == 1 and kspec.cross_mha == 0
     ]
 
-    calls_v1 = "else ".join(calls_v1) if len(calls_v1) > 0 else "if( false ) {}"
+    calls_v1 = "else ".join(calls_v1) if len(calls_v1) > 0 else "if( false ) {}"  # type: ignore[assignment]
 
     calls_mhca = [
         gen_call_fmhca(kspec, lname)
@@ -2635,9 +2644,9 @@ if( data_type == {data_type} && s_kv == {s_kv_len} && d == {head_size} && sm == 
         if kspec.cross_mha == 1
     ]
 
-    calls_mhca = "else ".join(calls_mhca) if len(calls_mhca) > 0 else "if( false ) {}"
+    calls_mhca = "else ".join(calls_mhca) if len(calls_mhca) > 0 else "if( false ) {}"  # type: ignore[assignment]
 
-    def gen_warp_spec(kspec):
+    def gen_warp_spec(kspec: kernel_spec) -> str:
         data_type = dtype2typename[kspec.dtype]
         if kspec.sage_block_sizes is not None:
             assert kspec.output_dtype is not None
@@ -2693,7 +2702,7 @@ if( data_type == {data_type} && s == {slen} && d == {head_size} && sm == {sm} {w
         warp_specs += 'else {\n\tassert(false && "Unsupported config");\n}'
 
     # Generate the cta spec.
-    def gen_cta_spec(spec):
+    def gen_cta_spec(spec: tuple[kernel_spec, str, str, str]) -> str:
         kspec, _, lname, _ = spec
         slen = kspec.seq_len * kspec.ctas_per_head
         return """\
@@ -2876,7 +2885,7 @@ int main(){{
 """
 
 
-def get_kernel_traits_code(specs_names):
+def get_kernel_traits_code(specs_names: list[tuple[kernel_spec, str, str, str]]) -> str:
     print_kernel_specs = []
 
     for kspec, fname, lname, kname in specs_names:  # noqa: B007 (fname, lname used via locals())
@@ -3244,7 +3253,7 @@ def get_kernel_traits_code(specs_names):
             print_kernel_specs.append(snippet_ws_custom_mask)
     # remove none.
     print_kernel_specs = [spec for spec in print_kernel_specs if spec is not None]
-    print_kernel_specs = "\n".join(print_kernel_specs)
+    print_kernel_specs = "\n".join(print_kernel_specs)  # type: ignore[assignment]
 
     code = ktraits_code_template.format(print_kernel_specs=print_kernel_specs)
     return code
@@ -3257,8 +3266,12 @@ def get_kernel_traits_code(specs_names):
 # You should set the condition `use_cubin_header` to false if you have modified the source codes of those kernels that use cubins.
 # This ensures that the kernels will be recompiled using the updated source code rather than relying on precompiled cubins.
 def use_cubin_header(
-    sm, head_size, dtype, output_dtype=None, enable_skip_softmax=False
-):
+    sm: int,
+    head_size: int,
+    dtype: str,
+    output_dtype: str | None = None,
+    enable_skip_softmax: bool = False,
+) -> bool:
     if enable_skip_softmax:
         return False
     if "e4m3" in dtype and output_dtype in ["bf16", "fp16"]:
@@ -3266,11 +3279,13 @@ def use_cubin_header(
     return (sm == 90 and head_size == 128) or (sm == 89 and "e4m3" in dtype)
 
 
-def get_cubin_header(kernel_traits, specs_names):
+def get_cubin_header(
+    kernel_traits: list[list[str]], specs_names: list[tuple[kernel_spec, str, str, str]]
+) -> str:
     cubins = []
     cubin_lens = []
-    cubins_dict = {}
-    cubin_lens_dict = {}
+    cubins_dict: dict[int, list[str]] = {}
+    cubin_lens_dict: dict[int, list[str]] = {}
     for kspec, fname, lname, kname in specs_names:  # noqa: B007 (lname, kname used via locals())
         if generate_cu_trtllm and not use_cubin_header(
             kspec.sm,
@@ -3293,7 +3308,7 @@ def get_cubin_header(kernel_traits, specs_names):
     metadata_v1 = []
     # Only metadata_v2 is used by TRT-LLM.
     metadata_v2 = []
-    metadata_v2_dict = {}
+    metadata_v2_dict: dict[str, list[str]] = {}
     unroll_config_v1 = []
     unroll_config_v2 = []
     for kname, smem, threads, fname, unroll_step, unroll_threshold in kernel_traits:  # noqa: B007 (smem, threads, unroll_threshold used via locals())
@@ -3346,7 +3361,7 @@ def get_cubin_header(kernel_traits, specs_names):
             toks.pop(-4)
             toks.pop(-3)
         else:
-            sage_block_sizes = (0, 0, 0)
+            sage_block_sizes = ["0", "0", "0"]
         head_size = toks[-3]
         if "x" in head_size:
             (head_size, head_size_v) = head_size.split("x")
@@ -3418,7 +3433,8 @@ def get_cubin_header(kernel_traits, specs_names):
             sm != "90" or (sm == "90" and "_softmax" in kname)
         ]
 
-        enable_skip_softmax_flag = pythonBoolean2cpp["_skipSoftmax" in kname]
+        enable_skip_softmax = "_skipSoftmax" in kname
+        enable_skip_softmax_flag = pythonBoolean2cpp[enable_skip_softmax]
 
         # meta_unroll_step
         meta_unroll_step = unroll_step if ("_nl" in kname or "_ws" in kname) else "0"
@@ -3449,7 +3465,7 @@ def get_cubin_header(kernel_traits, specs_names):
                         int(head_size),
                         prec.lower(),
                         output_prec.lower(),
-                        enable_skip_softmax_flag,
+                        enable_skip_softmax,
                     ):
                         return "nullptr"
                     lname = kname.replace("_kernel", "")
@@ -3478,7 +3494,7 @@ def get_cubin_header(kernel_traits, specs_names):
                         int(head_size),
                         prec.lower(),
                         output_prec.lower(),
-                        enable_skip_softmax_flag,
+                        enable_skip_softmax,
                     )
                     else """\
 {{ DATA_TYPE_{prec}, DATA_TYPE_{output_prec}, {seq_len}, {q_step}, {kv_step}, {head_size}, {head_size_v}, \
@@ -3519,10 +3535,10 @@ def get_cubin_header(kernel_traits, specs_names):
         else:
             raise AssertionError("Something terrible happened")
 
-    metadata_v1 = ",\n".join(metadata_v1)
+    metadata_v1 = ",\n".join(metadata_v1)  # type: ignore[assignment]
     # Add macros to only include needed cubins during compilation.
     if bool(metadata_v2_dict):
-        metadata_v2 = ""
+        metadata_v2 = ""  # type: ignore[assignment]
         for sm in metadata_v2_dict.keys():
             macro_begin = f"#ifndef EXCLUDE_SM_{sm}"
             macro_end = "#endif\n\n"
@@ -3530,19 +3546,19 @@ def get_cubin_header(kernel_traits, specs_names):
             last_key = list(metadata_v2_dict.keys())[-1]
             metadata_v2 += ("" if sm == last_key else ",") + "\n" + macro_end
     else:
-        metadata_v2 = ",\n".join(metadata_v2)
+        metadata_v2 = ",\n".join(metadata_v2)  # type: ignore[assignment]
     # Add macros to only include needed cubins during compilation.
-    for sm in cubins_dict.keys():
-        macro_begin = f"#ifndef EXCLUDE_SM_{sm}"
+    for sm_key in cubins_dict.keys():
+        macro_begin = f"#ifndef EXCLUDE_SM_{sm_key}"
         macro_end = "#endif\n"
-        cubins.extend([macro_begin] + cubins_dict[sm] + [macro_end])
-        if sm in cubin_lens_dict:
-            cubin_lens.extend([macro_begin] + cubin_lens_dict[sm] + [macro_end])
+        cubins.extend([macro_begin] + cubins_dict[sm_key] + [macro_end])
+        if sm_key in cubin_lens_dict:
+            cubin_lens.extend([macro_begin] + cubin_lens_dict[sm_key] + [macro_end])
 
-    unroll_config_v1 = ",\n".join(unroll_config_v1)
-    unroll_config_v2 = ",\n".join(unroll_config_v2)
-    cubins = "\n".join(cubins)
-    cubin_lens = "\n".join(cubin_lens)
+    unroll_config_v1 = ",\n".join(unroll_config_v1)  # type: ignore[assignment]
+    unroll_config_v2 = ",\n".join(unroll_config_v2)  # type: ignore[assignment]
+    cubins = "\n".join(cubins)  # type: ignore[assignment]
+    cubin_lens = "\n".join(cubin_lens)  # type: ignore[assignment]
     local_ns_open = ns_open
     local_ns_close = ns_close if generate_cu_trtllm else "}"
     launcher_line = (
@@ -3664,11 +3680,11 @@ static const struct TestMetaV2
 
 
 # This is used to add some kernels running in cubins for passing CI cases.
-def modify_cubin_header(cubin_header):
+def modify_cubin_header(cubin_header: str) -> str:
     result = cubin_header
 
     # for CI cases
-    def add_kernel_line(result, target, addition):
+    def add_kernel_line(result: str, target: str, addition: str) -> str:
         pos = result.find(target)
         if pos != -1:
             end_pos = result.find("\n", pos)
@@ -3682,7 +3698,7 @@ def modify_cubin_header(cubin_header):
 extern uint32_t cubin_fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_sm80_cu_cubin_len;"""
     result = add_kernel_line(result, target, addition)
 
-    def modify_kernel_line(result, target, new_line):
+    def modify_kernel_line(result: str, target: str, new_line: str) -> str:
         lines = result.split("\n")
         for i, line in enumerate(lines):
             if target in line:
@@ -3703,7 +3719,7 @@ extern uint32_t cubin_fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_sm80_
     return "\n".join(lines)
 
 
-def generate_files(specs_names):
+def generate_files(specs_names: list[tuple[kernel_spec, str, str, str]]) -> None:
     kfiles = []
     valid_specs_names = []
 
@@ -3767,9 +3783,9 @@ def generate_files(specs_names):
         "bin/print_traits.exe", stdin=subprocess.PIPE, stdout=subprocess.PIPE
     )
     output, error = process.communicate()
-    output = output.decode("utf-8").strip()
+    output_str = output.decode("utf-8").strip()
     # this gives: kname, smem bytes, threads_per_cta, loop_step
-    kernel_traits = [traits.split() for traits in output.splitlines()]
+    kernel_traits = [traits.split() for traits in output_str.splitlines()]
     cubin_header = get_cubin_header(kernel_traits, valid_specs_names)
     if generate_cu_trtllm:
         cubin_header = modify_cubin_header(cubin_header)
@@ -3778,7 +3794,7 @@ def generate_files(specs_names):
         f.write(cubin_header)
 
 
-def enumerate_hgmma_tma_kernels(specs, sm=90):
+def enumerate_hgmma_tma_kernels(specs: list[kernel_spec], sm: int = 90) -> None:
     specs.append(
         kernel_spec(
             sm=sm,
@@ -3804,7 +3820,9 @@ def enumerate_hgmma_tma_kernels(specs, sm=90):
 
 
 # Note this will be used in TRT-LLM.
-def enumerate_hgmma_ldgsts_kernels(specs, sm=90, dtype="fp16"):
+def enumerate_hgmma_ldgsts_kernels(
+    specs: list[kernel_spec], sm: int = 90, dtype: str = "fp16"
+) -> None:
     for enable_attn_logit_softcapping in [False, True]:
         specs.append(
             kernel_spec(
@@ -3857,8 +3875,11 @@ def enumerate_hgmma_ldgsts_kernels(specs, sm=90, dtype="fp16"):
 
 # Note this will be used in TRT-LLM.
 def enumerate_hgmma_flash_warpspec_kernels(
-    specs, sm=90, dtype="fp16", enable_skip_softmax=False
-):
+    specs: list[kernel_spec],
+    sm: int = 90,
+    dtype: str = "fp16",
+    enable_skip_softmax: bool = False,
+) -> None:
     scheduling_mode = int(os.getenv("SCHEDULING_MODE", "1"))
 
     # use specialized kernels for cases without alibi scales.
@@ -4043,13 +4064,13 @@ def enumerate_hgmma_flash_warpspec_kernels(
 
 # Note this will be used in TRT-LLM.
 def enumerate_qgmma_flash_warpspec_kernels(
-    specs,
-    sm=90,
-    dtype="e4m3",
-    sage_block_sizes=None,
-    output_dtype=None,
-    enable_skip_softmax=False,
-):
+    specs: list[kernel_spec],
+    sm: int = 90,
+    dtype: str = "e4m3",
+    sage_block_sizes: tuple[int, int, int] | None = None,
+    output_dtype: str | None = None,
+    enable_skip_softmax: bool = False,
+) -> None:
     scheduling_mode = int(os.getenv("SCHEDULING_MODE", "1"))
 
     # use specialized kernels for cases without alibi scales.
@@ -4232,7 +4253,7 @@ def enumerate_qgmma_flash_warpspec_kernels(
             )
 
 
-def enumerate_igmma_kernels(specs, sm=90):
+def enumerate_igmma_kernels(specs: list[kernel_spec], sm: int = 90) -> None:
     specs.append(
         kernel_spec(
             sm=sm,
@@ -4280,7 +4301,9 @@ def enumerate_igmma_kernels(specs, sm=90):
     )
 
 
-def enumerate_hmma_kernels(specs, sm=80, dtype="fp16"):
+def enumerate_hmma_kernels(
+    specs: list[kernel_spec], sm: int = 80, dtype: str = "fp16"
+) -> None:
     # The following kernels are hmma-based kernels tuned for sm90
     if sm == 90:
         specs.append(
@@ -4887,7 +4910,7 @@ def enumerate_hmma_kernels(specs, sm=80, dtype="fp16"):
     # -  S=64
 
 
-def enumerate_hmma884_kernels(specs, sm=70):
+def enumerate_hmma884_kernels(specs: list[kernel_spec], sm: int = 70) -> None:
     # - FP16
     # - S=512: STEP=32, STEP NL=-- FLAGS=0x9 (0x9 for SM86!)
     specs.append(
@@ -5102,14 +5125,18 @@ def enumerate_hmma884_kernels(specs, sm=70):
     )
 
 
-def enumerate_hmma_paged_kv_flash_kernels(specs, sm=80, dtype="fp16"):
+def enumerate_hmma_paged_kv_flash_kernels(
+    specs: list[kernel_spec], sm: int = 80, dtype: str = "fp16"
+) -> None:
     for enable_attn_logit_softcapping in [False, True]:
         enumerate_hmma_flash_kernels_base(
             specs, sm, dtype, InputLayout.PACKED_QKV, enable_attn_logit_softcapping
         )
 
 
-def enumerate_hmma_flash_kernels(specs, sm=80, dtype="fp16", head_size_v=0):
+def enumerate_hmma_flash_kernels(
+    specs: list[kernel_spec], sm: int = 80, dtype: str = "fp16", head_size_v: int = 0
+) -> None:
     input_layouts = [
         InputLayout.PACKED_QKV,
         InputLayout.CONTIGUOUS_Q_KV,
@@ -5128,13 +5155,13 @@ def enumerate_hmma_flash_kernels(specs, sm=80, dtype="fp16", head_size_v=0):
 
 # Note this will be used in TRT-LLM.
 def enumerate_hmma_flash_kernels_base(
-    specs,
-    sm=80,
-    dtype="fp16",
-    input_layout=InputLayout.PACKED_QKV,
-    enable_attn_logit_softcapping=False,
-    head_size_v=0,
-):
+    specs: list[kernel_spec],
+    sm: int = 80,
+    dtype: str = "fp16",
+    input_layout: InputLayout = InputLayout.PACKED_QKV,
+    enable_attn_logit_softcapping: bool = False,
+    head_size_v: int = 0,
+) -> None:
     # - FP16 Flash Attention (use nl as default)
     # Any Sequence Length H = 16/32/40/48/64/80/128/160/256/512 flash attention
 
@@ -5308,7 +5335,7 @@ def enumerate_hmma_flash_kernels_base(
             )
 
 
-def enumerate_qgmma_kernels(specs, sm=90):
+def enumerate_qgmma_kernels(specs: list[kernel_spec], sm: int = 90) -> None:
     specs.append(
         kernel_spec(
             sm=sm,
@@ -5356,7 +5383,7 @@ def enumerate_qgmma_kernels(specs, sm=90):
     )
 
 
-def enumerate_qmma_kernels(specs, sm=89):
+def enumerate_qmma_kernels(specs: list[kernel_spec], sm: int = 89) -> None:
     # SM89 (Ada) fp8
     # Head Size 64
 
@@ -5486,13 +5513,13 @@ def enumerate_qmma_kernels(specs, sm=89):
 
 
 def enumerate_qmma_flash_kernels(
-    specs,
-    sm=89,
-    dtype="e4m3_fp32",
-    head_sizes=None,
-    sage_block_sizes=None,
-    output_dtype=None,
-):
+    specs: list[kernel_spec],
+    sm: int = 89,
+    dtype: str = "e4m3_fp32",
+    head_sizes: list[int] | None = None,
+    sage_block_sizes: tuple[int, int, int] | None = None,
+    output_dtype: str | None = None,
+) -> None:
     # ((head_size, head_size_v), (q_loop_step, kv_loop_step), tiled).
     params_q_kv_step = [
         (32, (128, 128), 0),
@@ -5568,7 +5595,7 @@ def enumerate_qmma_flash_kernels(
         )
 
 
-def enumerate_imma_kernels(specs, sm=80):
+def enumerate_imma_kernels(specs: list[kernel_spec], sm: int = 80) -> None:
     if sm == 90:
         # The following kernels are imma-based kernels tuned for sm90
         specs.append(
@@ -6354,7 +6381,7 @@ def enumerate_imma_kernels(specs, sm=80):
     # -  S=64
 
 
-def enumerate_cross_mha_kernels(specs):
+def enumerate_cross_mha_kernels(specs: list[kernel_spec]) -> None:
     # TODO: combine cross_mha and mha kernel enumeration
     # -  S_Q=4096, S_KV=128:  STEP=64, STEP NL=64
     # HEAD_SIZE: 64
@@ -6717,11 +6744,11 @@ def enumerate_cross_mha_kernels(specs):
     )
 
 
-def enumerate_kernels():
+def enumerate_kernels() -> None:
     if not os.path.exists("./generated"):
         os.mkdir("./generated")
 
-    specs = []
+    specs: list[kernel_spec] = []
 
     # TODO we have to select the unroll_threshold over a grid of b and h for each arch
 

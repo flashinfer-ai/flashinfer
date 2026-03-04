@@ -1900,7 +1900,7 @@ def gen_cudnn_fmha_module():
     )
 
 
-def gen_trtllm_fmha_v2_sm120_module(device: torch.device) -> JitSpec:
+def gen_trtllm_fmha_v2_sm120_module() -> JitSpec:
     uri = "trtllm_fmha_v2"
     cached_ops = jit_env.FLASHINFER_JIT_DIR / uri
     cached_ops.mkdir(parents=True, exist_ok=True)
@@ -1959,8 +1959,15 @@ def gen_fmha_v2_module(
     # Source directories
     csrc_dir = jit_env.FLASHINFER_CSRC_DIR
     fmha_v2_src_dir = csrc_dir / "fmha_v2"
+    # Determine which SM major versions are available in the compilation context
+    # so we only generate kernel sources for architectures that will be compiled.
+    target_sm_versions = {
+        major
+        for major, _ in current_compilation_context.TARGET_CUDA_ARCHS
+        if major in (9, 12)
+    }
     source_paths = generate_jit_sources(
-        uri, input_layout, input_dtype_str, output_dtype_str
+        uri, input_layout, input_dtype_str, output_dtype_str, target_sm_versions
     )
 
     # copy static fmha_v2_run.cu

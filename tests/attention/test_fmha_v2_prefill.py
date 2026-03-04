@@ -6,7 +6,7 @@ from typing import Optional, Tuple, Union
 import flashinfer
 from flashinfer.prefill import fmha_v2_prefill_deepseek
 from tests.utils_fp8 import to_float8
-from flashinfer.utils import is_sm12x_supported
+from flashinfer.utils import is_sm12x_supported, is_sm120a_supported
 
 
 def attention_mla_ref_torch(
@@ -467,12 +467,29 @@ def run_trtllm_fmha_v2_prefill_case(
     from flashinfer.prefill import trtllm_fmha_v2_prefill
     from flashinfer.utils import is_sm90a_supported
 
-    if not is_sm90a_supported(torch.device("cuda")):
-        pytest.skip("FMHA v2 requires SM90+ (Hopper) GPUs.")
+    if not is_sm90a_supported(torch.device("cuda")) and not is_sm120a_supported(
+        torch.device("cuda")
+    ):
+        pytest.skip("FMHA v2 requires SM90+ (Hopper) or SM12x GPUs.")
 
     # Skip invalid combinations
+    is_sm120_plus = is_sm120a_supported(torch.device("cuda"))
+    if dtype == torch.float8_e4m3fn and is_sm120_plus:
+        pytest.skip("FP8 FMHAv2 not yet supported on SM120+")
     if input_layout == "SEPARATE_Q_K_V" and dtype == torch.float8_e4m3fn:
         pytest.skip("FP8 not supported for SEPARATE_Q_K_V layout")
+    if input_layout == "SEPARATE_Q_K_V" and is_sm120_plus:
+        pytest.skip(
+            "SEPARATE_Q_K_V requires SM90 warp-specialization, not available on SM120+"
+        )
+    if (
+        is_sm120_plus
+        and mask_mode is not None
+        and mask_mode.upper() == "SLIDING_WINDOW"
+    ):
+        pytest.skip(
+            "SLIDING_WINDOW mask not yet supported on SM120+ (only CAUSAL and PADDING)"
+        )
     if input_layout == "SEPARATE_Q_K_V" and logits_soft_cap > 0:
         pytest.skip("Logits soft capping not supported for SEPARATE_Q_K_V layout")
     # save_softmax_stats only supported for CONTIGUOUS_Q_KV (normal attention)
@@ -743,11 +760,10 @@ def run_trtllm_fmha_v2_prefill_case(
     [
         ("PACKED_QKV", None, False),
         ("CONTIGUOUS_Q_KV", None, False),
+        ("CONTIGUOUS_Q_KV", None, True),
         ("SEPARATE_Q_K_V", None, False),
         ("Q_PAGED_KV", 32, False),
         ("Q_PAGED_KV", 128, False),
-        ("Q_PAGED_KV", 32, True),
-        ("Q_PAGED_KV", 128, True),
     ],
 )
 @pytest.mark.parametrize(
