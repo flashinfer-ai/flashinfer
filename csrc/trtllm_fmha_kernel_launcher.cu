@@ -496,6 +496,10 @@ void trtllm_paged_attention_context(
   TVM_FFI_ICHECK_EQ(cum_seq_lens_q.dtype(), dl_int32) << "cum_seq_lens_q must be int32";
   TVM_FFI_ICHECK_EQ(cum_seq_lens_q.size(0), batch_size + 1)
       << "cum_seq_lens_q size must be batch_size + 1";
+  TVM_FFI_ICHECK_EQ(cum_seq_lens_kv.ndim(), 1) << "cum_seq_lens_kv must be a 1D tensor";
+  TVM_FFI_ICHECK_EQ(cum_seq_lens_kv.dtype(), dl_int32) << "cum_seq_lens_kv must be int32";
+  TVM_FFI_ICHECK_EQ(cum_seq_lens_kv.size(0), batch_size + 1)
+      << "cum_seq_lens_kv size must be batch_size + 1";
   auto o_data_type = dl_dtype_to_tllm_data_type(out.dtype());
   int num_qo_heads = query.size(1);
   int sum_seq_q = query.size(0);
