@@ -116,7 +116,7 @@ def parse_quantization_args(line, parser):
         required=False,
         nargs="+",
         default=["cuda"],
-        choices=["cuda"],
+        choices=["cuda", "cute-dsl"],
         help="Backend to test. Default: cuda",
     )
     # FP4 quantization specific arguments
@@ -231,15 +231,13 @@ def testMxfp8Quantize(args):
         print(f"[VVERBOSE] {enable_pdl = }")
 
     def run_backend(backend, input_tensor):
-        if backend == "cuda":
-            return flashinfer.mxfp8_quantize(
-                input_tensor,
-                is_sf_swizzled_layout=is_sf_swizzled_layout,
-                alignment=alignment,
-                enable_pdl=enable_pdl,
-            )
-        else:
-            raise ValueError(f"Unsupported backend: {backend}")
+        return flashinfer.mxfp8_quantize(
+            input_tensor,
+            is_sf_swizzled_layout=is_sf_swizzled_layout,
+            alignment=alignment,
+            enable_pdl=enable_pdl,
+            backend=backend,
+        )
 
     # Reference check via dequantize round-trip
     has_reference_output = False
@@ -391,6 +389,7 @@ def testMxfp4Quantize(args):
     backends = args.backends[:]  # Make a copy to avoid modifying the original
     m = args.m
     k = args.k
+    enable_pdl = args.enable_pdl
     is_cuda_graph_compatible = not args.no_cuda_graph
     run_refcheck = args.refcheck
     res = []
@@ -421,12 +420,14 @@ def testMxfp4Quantize(args):
     if args.verbose >= 2:
         print(f"[VVERBOSE] {input_tensor.shape = }")
         print(f"[VVERBOSE] {input_tensor.dtype = }")
+        print(f"[VVERBOSE] {enable_pdl = }")
 
     def run_backend(backend, input_tensor):
-        if backend == "cuda":
-            return flashinfer.mxfp4_quantize(input_tensor)
-        else:
-            raise ValueError(f"Unsupported backend: {backend}")
+        return flashinfer.mxfp4_quantize(
+            input_tensor,
+            backend=backend,
+            enable_pdl=enable_pdl,
+        )
 
     # Reference check via dequantize round-trip
     has_reference_output = False
@@ -529,6 +530,7 @@ def testMxfp4Quantize(args):
                 cur_res["m"] = m
                 cur_res["k"] = k
                 cur_res["input_dtype"] = str(input_dtype)
+                cur_res["enable_pdl"] = enable_pdl
                 cur_res["backend"] = backend
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)

@@ -15,7 +15,19 @@ from flashinfer import (
     silu_and_mul_scaled_nvfp4_experts_quantize,
     silu_and_mul,
 )
-from flashinfer.utils import is_sm100a_supported
+
+
+def is_fp4_supported(device: torch.device) -> bool:
+    """Check if FP4 quantization is supported (SM100+ with CUDA >= 12.8)."""
+    major, _ = torch.cuda.get_device_capability(device)
+    cuda_version = torch.version.cuda
+    if cuda_version is None:
+        return False
+    # Check CUDA >= 12.8
+    parts = cuda_version.split(".")
+    cuda_major, cuda_minor = int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
+    return major >= 10 and (cuda_major > 12 or (cuda_major == 12 and cuda_minor >= 8))
+
 
 DTYPES = [torch.float16, torch.bfloat16]
 # The batch dimension doesn't need to be multiple of 128
@@ -112,8 +124,8 @@ def test_fp4_quantization(
     sf_use_ue8m0: bool,
     is_swizzled: bool,
 ) -> None:
-    if not is_sm100a_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    if not is_fp4_supported(torch.device(device)):
+        pytest.skip("FP4 requires SM100+ and CUDA >= 12.8")
     torch.set_default_device(device)
     torch.manual_seed(seed)
     m, n = shape
@@ -155,8 +167,8 @@ def test_scale_swizzling(
     seed: int,
     device: str,
 ) -> None:
-    if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    if not is_fp4_supported(torch.device("cuda")):
+        pytest.skip("FP4 requires SM100+ and CUDA >= 12.8")
     torch.set_default_device(device)
     torch.manual_seed(seed)
     m, n = shape
@@ -191,8 +203,8 @@ def test_block_scale_interleave(
     device: str,
 ) -> None:
     """Test the block_scale_interleave function directly."""
-    if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    if not is_fp4_supported(torch.device("cuda")):
+        pytest.skip("FP4 requires SM100+ and CUDA >= 12.8")
     torch.set_default_device(device)
     torch.manual_seed(seed)
 
@@ -240,8 +252,8 @@ def test_e2m1_dequantization(
     sf_use_ue8m0: bool,
 ) -> None:
     """Test roundtrip: fp4_quantize -> e2m1_and_ufp8sf_scale_to_float."""
-    if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    if not is_fp4_supported(torch.device("cuda")):
+        pytest.skip("FP4 requires SM100+ and CUDA >= 12.8")
     torch.set_default_device(device)
     torch.manual_seed(seed)
 
@@ -303,21 +315,151 @@ def test_e2m1_dequantization(
     )
 
 
+# =============================================================================
+# MXFP4 Quantization Tests (Both Backends)
+# =============================================================================
+
+MXFP4_SHAPES = [(128, 64), (256, 128), (512, 256), (128, 1024), (1024, 2048)]
+MXFP4_BACKENDS = ["cuda", "cute-dsl"]
+
+
+def _is_cute_dsl_available():
+    """Check if CuTe-DSL is available."""
+    try:
+        from flashinfer.cute_dsl import is_cute_dsl_available
+
+        return is_cute_dsl_available()
+    except ImportError:
+        return False
+
+
+@pytest.mark.parametrize("backend", MXFP4_BACKENDS)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("shape", MXFP4_SHAPES)
 @pytest.mark.parametrize("device", CUDA_DEVICES)
-def test_mxfp4_quantize_roundtrip(device: str):
-    if not is_sm100a_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
-    x = torch.randn((128, 64), device="cuda", dtype=torch.bfloat16) / 10
+@torch.inference_mode()
+def test_mxfp4_quantize_roundtrip(
+    backend: str,
+    dtype: torch.dtype,
+    shape: tuple[int, int],
+    device: str,
+) -> None:
+    """Test MXFP4 quantization roundtrip for both backends."""
+    if not is_fp4_supported(torch.device(device)):
+        pytest.skip("FP4 requires SM100+ and CUDA >= 12.8")
+    if backend == "cute-dsl" and not _is_cute_dsl_available():
+        pytest.skip("CuTe-DSL not available")
 
-    quant_a, sfs = mxfp4_quantize(x)
-    dq_a = mxfp4_dequantize(quant_a, sfs)
+    torch.set_default_device(device)
+    torch.manual_seed(42)
 
+    m, n = shape
+    x = torch.randn((m, n), dtype=dtype)
+
+    # Test specified backend
+    quant_out, scale_out = mxfp4_quantize(x, backend=backend)
+
+    # Basic shape checks
+    assert quant_out.shape == (m, n // 2), (
+        f"Expected shape ({m}, {n // 2}), got {quant_out.shape}"
+    )
+    assert quant_out.dtype == torch.uint8, f"Expected uint8, got {quant_out.dtype}"
+    assert scale_out.dtype == torch.uint8, f"Expected uint8, got {scale_out.dtype}"
+
+    # Check roundtrip with mxfp4_dequantize
+    dq_out = mxfp4_dequantize(quant_out, scale_out)
+
+    # Verify no NaN/Inf
+    assert not torch.isnan(dq_out).any(), "Dequantized tensor contains NaN"
+    assert not torch.isinf(dq_out).any(), "Dequantized tensor contains Inf"
+
+    # Verify roundtrip is reasonably accurate
     torch.testing.assert_close(
-        dq_a.cpu().to(torch.float32),
+        dq_out.cpu().to(torch.float32),
         x.cpu().to(torch.float32),
         rtol=0.3,
         atol=0.5,
-        msg="Quantize -> dequantize mxfp4 roundtrip failed",
+        msg=f"{backend} MXFP4 quantize -> dequantize roundtrip failed",
+    )
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("shape", MXFP4_SHAPES)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_mxfp4_quantize_backend_parity(
+    dtype: torch.dtype,
+    shape: tuple[int, int],
+    device: str,
+) -> None:
+    """Test that CUDA and CuTe-DSL backends produce matching results."""
+    if not is_fp4_supported(torch.device(device)):
+        pytest.skip("FP4 requires SM100+ and CUDA >= 12.8")
+    if not _is_cute_dsl_available():
+        pytest.skip("CuTe-DSL not available")
+
+    torch.set_default_device(device)
+    torch.manual_seed(42)
+
+    m, n = shape
+    x = torch.randn((m, n), dtype=dtype)
+
+    # Get results from both backends
+    quant_cuda, scale_cuda = mxfp4_quantize(x, backend="cuda")
+    quant_cute, scale_cute = mxfp4_quantize(x, backend="cute-dsl")
+
+    # Shape should match
+    assert quant_cuda.shape == quant_cute.shape, "Quantized output shape mismatch"
+    assert scale_cuda.shape == scale_cute.shape, "Scale output shape mismatch"
+
+    # Dequantize both and compare
+    dq_cuda = mxfp4_dequantize(quant_cuda, scale_cuda)
+    dq_cute = mxfp4_dequantize(quant_cute, scale_cute)
+
+    # Compute detailed error statistics
+    dq_cuda_f32 = dq_cuda.cpu().to(torch.float32)
+    dq_cute_f32 = dq_cute.cpu().to(torch.float32)
+    abs_diff = (dq_cuda_f32 - dq_cute_f32).abs()
+    rel_diff = abs_diff / (dq_cuda_f32.abs() + 1e-8)
+
+    # Print diagnostic info on failure
+    max_abs_diff = abs_diff.max().item()
+    mean_abs_diff = abs_diff.mean().item()
+    max_rel_diff = rel_diff.max().item()
+    mean_rel_diff = rel_diff.mean().item()
+
+    # Check quantized data match
+    quant_match_pct = (quant_cuda == quant_cute).float().mean().item() * 100
+    scale_match_pct = (scale_cuda == scale_cute).float().mean().item() * 100
+
+    error_msg = (
+        f"CUDA and CuTe-DSL backends differ after dequantization:\n"
+        f"  Shape: {shape}, dtype: {dtype}\n"
+        f"  Quantized match: {quant_match_pct:.1f}%, Scale match: {scale_match_pct:.1f}%\n"
+        f"  Abs diff - max: {max_abs_diff:.6f}, mean: {mean_abs_diff:.6f}\n"
+        f"  Rel diff - max: {max_rel_diff:.6f}, mean: {mean_rel_diff:.6f}\n"
+        f"  CUDA dq range: [{dq_cuda_f32.min().item():.4f}, {dq_cuda_f32.max().item():.4f}]\n"
+        f"  CuTe dq range: [{dq_cute_f32.min().item():.4f}, {dq_cute_f32.max().item():.4f}]"
+    )
+
+    # Verify high agreement between backends
+    # For FP4 quantization, we expect >95% exact match due to minor rounding differences
+    assert quant_match_pct > 95.0, (
+        f"Quantized values should match >95%, got {quant_match_pct:.1f}%"
+    )
+    assert scale_match_pct > 95.0, (
+        f"Scale factors should match >95%, got {scale_match_pct:.1f}%"
+    )
+
+    # Both should roundtrip to similar values
+    # Note: FP4 (E2M1) has coarse quantization steps (0.25-0.5 between adjacent values),
+    # so we allow atol=0.5 (one quantization step) for edge-case rounding differences.
+    torch.testing.assert_close(
+        dq_cuda_f32,
+        dq_cute_f32,
+        rtol=0.2,
+        atol=0.5,  # Allow one FP4 quantization step difference
+        msg=error_msg,
     )
 
 
@@ -333,8 +475,8 @@ def test_nvfp4_batched_quantize(
     device: str,
 ) -> None:
     """Test nvfp4_batched_quantize function."""
-    if not is_sm100a_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability of 10 or above")
+    if not is_fp4_supported(torch.device(device)):
+        pytest.skip("FP4 requires SM100+ and CUDA >= 12.8")
     torch.set_default_device(device)
     torch.manual_seed(seed)
 
@@ -376,8 +518,8 @@ def test_scaled_fp4_grouped_quantize(
     device: str,
 ) -> None:
     """Test scaled_fp4_grouped_quantize function."""
-    if not is_sm100a_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability of 10 or above")
+    if not is_fp4_supported(torch.device(device)):
+        pytest.skip("FP4 requires SM100+ and CUDA >= 12.8")
     torch.set_default_device(device)
     torch.manual_seed(seed)
 
@@ -423,8 +565,8 @@ def test_silu_and_mul_scaled_nvfp4_experts_quantize(
     device: str,
 ) -> None:
     """Test silu_and_mul_nvfp4_batched_quantize function."""
-    if not is_sm100a_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability of 10 or above")
+    if not is_fp4_supported(torch.device(device)):
+        pytest.skip("FP4 requires SM100+ and CUDA >= 12.8")
     torch.set_default_device(device)
     torch.manual_seed(seed)
 
