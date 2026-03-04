@@ -238,7 +238,7 @@ struct KernelParams {
     printf("ptrScaleSfKv: %p\n", (void*)ptrScaleSfKv);
     printf("ptrScaleSfO: %p\n", (void*)ptrScaleSfO);
     printf("ptrSeqLensKv: %p\n", (void*)ptrSeqLensKv);
-    printf("ptrReservedMem: %p\n", (void*)ptrReservedMem);
+    printf("ptrSkipSoftmaxStats: %p\n", (void*)ptrSkipSoftmaxStats);
     printf("ptrSoftmaxStats: %p\n", (void*)ptrSoftmaxStats);
 
     // Integer and float members
@@ -266,7 +266,7 @@ struct KernelParams {
     printf("mScaleSoftmaxLog2: %f\n", mScaleSoftmaxLog2);
     printf("mScaleSfKv: %f\n", mScaleSfKv);
     printf("mScaleSfO: %f\n", mScaleSfO);
-    printf("mReservedParam: %f\n", mReservedParam);
+    printf("mSkipSoftmaxThresholdScaleFactor: %f\n", mSkipSoftmaxThresholdScaleFactor);
     printf("mStartTokenIdxSfO: %d\n", mStartTokenIdxSfO);
     printf("mSumOfSeqLensQ: %d\n", mSumOfSeqLensQ);
     printf("mSumOfSeqLensKv: %d\n", mSumOfSeqLensKv);
@@ -920,8 +920,7 @@ struct KernelParams {
     params.mMaxNumPagesPerSeqKv = options.mMaxNumPagesPerSeqKv;
     // TODO: just use mMaxSeqLenQ for number of MTP tokens.
     params.mSumOfSeqLensQ = options.mSumOfSeqLensQ;
-    // params.mSumOfSeqLensKv = options.mSumOfSeqLensKv;
-    params.mSumOfSeqLensKv = 64;
+    params.mSumOfSeqLensKv = options.mSumOfSeqLensKv;
     params.mBatchSize = options.mBatchSize;
     params.mChunkedAttentionSizeLog2 = 0;
     params.mNumHeadsQ = options.mNumHeadsQ;
