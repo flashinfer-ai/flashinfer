@@ -40,11 +40,11 @@ jobs:
 
           # Read override groups and apply matching labels
           jq -c '.[]' scripts/codeowner_overrides.json | while read -r group; do
-            labels=$(echo "$group" | jq -r '.labels[]')
-            prefixes=$(echo "$group" | jq -r '.owners | keys[]')
+            readarray -t labels < <(echo "$group" | jq -r '.labels[]')
+            readarray -t prefixes < <(echo "$group" | jq -r '.owners | keys[]')
 
             match=false
-            for prefix in $prefixes; do
+            for prefix in "${prefixes[@]}"; do
               for file in $changed_files; do
                 case "$file" in
                   "$prefix"*) match=true; break ;;
@@ -54,7 +54,7 @@ jobs:
             done
 
             if $match; then
-              for label in $labels; do
+              for label in "${labels[@]}"; do
                 echo "Adding label: $label"
                 gh pr edit "$PR_NUMBER" \
                   --repo "${{ github.repository }}" \

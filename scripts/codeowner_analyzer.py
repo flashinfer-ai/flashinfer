@@ -31,8 +31,8 @@ def load_overrides(filename: str) -> Dict[str, List[str]]:
 
     overrides: Dict[str, List[str]] = {}
     for group in raw:
-        if not isinstance(group, dict) or "owners" not in group:
-            raise ValueError("Each group must be an object with an 'owners' key")
+        if not isinstance(group, dict) or not isinstance(group.get("owners"), dict):
+            raise ValueError("Each group must be an object with an 'owners' dict")
         for path, users in group["owners"].items():
             if not isinstance(users, list) or not all(
                 isinstance(u, str) for u in users
@@ -628,7 +628,14 @@ class CodeOwnersAnalyzer:
                     final = self._normalize_usernames(self.owner_overrides[path])
 
                 if final:
-                    f.write(f"{self._format_codeowners_path(path)} {' '.join(final)}\n")
+                    # Sanitize against newline injection
+                    safe_path = (
+                        self._format_codeowners_path(path)
+                        .replace("\n", "")
+                        .replace("\r", "")
+                    )
+                    safe_owners = [u.replace("\n", "").replace("\r", "") for u in final]
+                    f.write(f"{safe_path} {' '.join(safe_owners)}\n")
 
     def print_detailed_report(self, results: Dict[str, Any]) -> None:
         """Print a detailed ownership report."""
