@@ -865,7 +865,12 @@ class TestThreadSafety:
             os.unlink(tmp_path)
 
     def test_autotune_mode_flag_thread_safety(self):
-        """Concurrent autotune() contexts should not corrupt is_tuning_mode."""
+        """Concurrent autotune() contexts should not corrupt is_tuning_mode.
+
+        Uses reference counting: is_tuning_mode stays True as long as at
+        least one autotune(True) context is active, and returns to False
+        once all have exited.
+        """
         import threading
 
         tuner = AutoTuner.get()
@@ -877,7 +882,6 @@ class TestThreadSafety:
                 barrier.wait()
                 for _ in range(50):
                     with autotune(True):
-                        # Brief work inside tuning mode
                         pass
             except Exception as e:
                 errors.append(e)
@@ -890,4 +894,5 @@ class TestThreadSafety:
 
         # After all threads complete, tuning mode should be restored to False
         assert not tuner.is_tuning_mode, "is_tuning_mode was not properly restored"
+        assert tuner._active_tuning_contexts == 0, "reference count leak"
         assert len(errors) == 0, f"Errors in threads: {errors}"

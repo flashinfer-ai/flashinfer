@@ -40,6 +40,8 @@ def _tactic_to_json(tactic):
     # not plain tuple/list but still support iteration.
     if hasattr(tactic, "__iter__") and not isinstance(tactic, (str, bytes, dict)):
         return [_tactic_to_json(v) for v in tactic]
+    if isinstance(tactic, bool):
+        return tactic
     # Coerce numpy / pybind int types to plain Python int for JSON safety.
     if isinstance(tactic, int):
         return int(tactic)
@@ -418,14 +420,21 @@ def autotune(tune_mode: bool = True, cache: Optional[str] = None):
     # in that case we skip saving on exit to avoid overwriting configs from
     # a different environment.
     cache_valid = True
-    if cache is not None and os.path.isfile(cache):
-        cache_valid = tuner.load_configs(cache)
+    if cache is not None:
+        with tuner._lock:
+            tuner._file_configs.clear()
+            tuner._logged_file_hits.clear()
+        if os.path.isfile(cache):
+            cache_valid = tuner.load_configs(cache)
 
-    # Protect mode flag save/restore so concurrent autotune() contexts
-    # on different threads cannot corrupt each other's saved state.
+    # Reference-counted tuning mode: is_tuning_mode stays True as long as
+    # at least one autotune(True) context is active, even if an
+    # autotune(False) context overlaps on another thread.
     with tuner._lock:
+        if tune_mode:
+            tuner._active_tuning_contexts += 1
         old_mode = tuner.is_tuning_mode
-        tuner.is_tuning_mode = tune_mode
+        tuner.is_tuning_mode = tuner._active_tuning_contexts > 0
         autotune_enabled = tune_mode and not old_mode
     if autotune_enabled:
         logger.info("[Autotuner]: Autotuning process starts ...")
@@ -433,7 +442,9 @@ def autotune(tune_mode: bool = True, cache: Optional[str] = None):
         yield
     finally:
         with tuner._lock:
-            tuner.is_tuning_mode = old_mode
+            if tune_mode:
+                tuner._active_tuning_contexts -= 1
+            tuner.is_tuning_mode = tuner._active_tuning_contexts > 0
         if autotune_enabled:
             logger.info("[Autotuner]: Autotuning process ends")
 
@@ -536,6 +547,7 @@ class AutoTuner:
         self.stream_delay_micro_secs = stream_delay_micro_secs
         self.profiling_cache = {}
         self.is_tuning_mode = False
+        self._active_tuning_contexts = 0
 
         # Reentrant lock protecting all mutable state on this instance.
         # RLock is used because choose_one() calls search_cache() internally.
@@ -552,6 +564,7 @@ class AutoTuner:
         self._logged_file_hits: Set[Tuple[str, str]] = set()
         # Set when new profiling results are added; cleared on save.
         self._dirty = False
+        self._dirty_seq = 0
 
     @classmethod
     def get(cls):
@@ -781,6 +794,7 @@ class AutoTuner:
                             # inspect call stack
                             self.profiling_cache[cache_key] = (runner_id, tactic, p)
                             self._dirty = True
+                            self._dirty_seq += 1
                             self.stats.tuned_op_successful_configs[custom_op] = (
                                 self.stats.tuned_op_successful_configs.get(custom_op, 0)
                                 + 1
@@ -1123,6 +1137,7 @@ class AutoTuner:
             AutoTuner.get().save_configs("/path/to/config.json")
         """
         with self._lock:
+            seq_at_snapshot = self._dirty_seq
             configs: Dict[str, Any] = {}
 
             # Include previously loaded file configs as a base
@@ -1189,7 +1204,9 @@ class AutoTuner:
             raise
 
         with self._lock:
-            self._dirty = False
+            # Only clear dirty if no new results arrived during the save.
+            if self._dirty_seq == seq_at_snapshot:
+                self._dirty = False
 
         logger.info(
             f"[Autotuner]: Saved {len(configs)} configs to {path} "
@@ -1312,6 +1329,7 @@ class AutoTuner:
             self._file_configs.clear()
             self._logged_file_hits.clear()
             self._dirty = False
+            self._dirty_seq = 0
 
     def reset_statistics(self) -> None:
         """Reset all statistics counters."""
