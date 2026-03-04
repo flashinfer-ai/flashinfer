@@ -236,8 +236,7 @@ void trtllm_paged_attention_decode(
     int64_t window_left, int64_t sparse_mla_top_k, int64_t sm_count, bool enable_pdl,
     int64_t workspace_size, Optional<TensorView> attention_sinks,
     Optional<TensorView> cum_seq_lens_q, Optional<TensorView> key_block_scales,
-    Optional<TensorView> value_block_scales,
-    Optional<float> skip_softmax_threshold_scale_factor) {
+    Optional<TensorView> value_block_scales, Optional<float> skip_softmax_threshold_scale_factor) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
   TVM_FFI_ICHECK_EQ(key_cache.ndim(), value_cache.ndim());
