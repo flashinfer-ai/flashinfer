@@ -1119,7 +1119,7 @@ def gated_delta_rule_decode_kernel_seqlen234_unified(
     gb: cute.Tensor,  # [B, T=2/3/4, HV]
     gA_log: cute.Tensor,  # [HV]
     gdt_bias: cute.Tensor,  # [HV]
-    gH: cute.Tensor,  # [B, HV, V=128, K=128] - K-fast layout
+    gH: cute.Tensor,  # [B, HV, V=128, K=128] - K-last layout
     gO: cute.Tensor,  # [B, T=2/3/4, HV, V=128]
     scale: cutlass.Float32,
     softplus_beta: cutlass.Float32,
@@ -2008,7 +2008,7 @@ def gated_delta_rule(
         k: Key tensor [B, T, H, K]
         v: Value tensor [B, T, HV, V]
         b: Beta gate input [B, T, HV]
-        initial_state_source: H state [B, HV, V, K] or [pool_size, HV, V, K] (K-fast layout), modified in-place
+        initial_state_source: H state [B, HV, V, K] or [pool_size, HV, V, K] (K-last layout), modified in-place
         initial_state_indices: Optional int32 pool indices [B] for indirect state access.
             Values must be in [-1, pool_size). -1 = padding slot (output zeros, state
             untouched). No runtime bounds checking is performed.

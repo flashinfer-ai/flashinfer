@@ -668,7 +668,7 @@ def _test_gdn_decode_klast_bf16_state_kernel(
         # NOTE: Do NOT pre-normalize K here. Both the kernel (use_qk_l2norm_in_kernel=True)
         # and reference will apply L2 normalization internally after GQA expansion.
 
-        # gdn_decode_klast_bf16_state kernel expects [B, HV, V, K] (K-fast layout) in BF16.
+        # gdn_decode_klast_bf16_state kernel expects [B, HV, V, K] (K-last layout) in BF16.
         # Use the same bf16 initial state for both kernel and reference so we
         # compare the bf16 h state path.
         input_state_kernel = torch.randn(

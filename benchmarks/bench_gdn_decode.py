@@ -28,7 +28,7 @@ Kernels benchmarked:
 - FlashInfer Nontranspose [B, HV, K, V] (K-major layout)
 - Triton Pretranspose [B, HV, V, K]
 - Triton Nontranspose [B, HV, K, V]
-- gdn_decode_klast_bf16_state [B, HV, V, K] (K-fast layout, T=1..4, bf16 state)
+- gdn_decode_klast_bf16_state [B, HV, V, K] (K-last layout, T=1..4, bf16 state)
   from flashinfer.cute_dsl.gated_delta_rule
 
 Usage:
@@ -2168,7 +2168,7 @@ def run_all_layouts_benchmark(args, dtype, use_qk_l2norm):
     print("  TR-PreTr  = Triton Pretranspose [B, HV, V, K]")
     print("  TR-NonTr  = Triton Nontranspose [B, HV, K, V]")
     print(
-        "  KlastBf16 = gdn_decode_klast_bf16_state [B, HV, V, K] (K-fast layout, T=1..4, bf16 state)"
+        "  KlastBf16 = gdn_decode_klast_bf16_state [B, HV, V, K] (K-last layout, T=1..4, bf16 state)"
     )
     print("  FI/TR speedup > 1.0 means FlashInfer is faster than Triton")
     print(
@@ -2251,7 +2251,7 @@ def bench_gdn_decode_klast_bf16_state(
     dt_bias = torch.randn(num_sab_heads, dtype=dtype, device="cuda")
     b = torch.randn(batch_size, T, num_sab_heads, dtype=dtype, device="cuda")
 
-    # Initial state: [B, HV, V, K] (K-fast layout, BF16)
+    # Initial state: [B, HV, V, K] (K-last layout, BF16)
     state = torch.randn(
         batch_size,
         num_sab_heads,
