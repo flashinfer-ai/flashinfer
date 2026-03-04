@@ -1960,7 +1960,11 @@ def gen_fmha_v2_module(
     csrc_dir = jit_env.FLASHINFER_CSRC_DIR
     fmha_v2_src_dir = csrc_dir / "fmha_v2"
     source_paths = generate_jit_sources(
-        uri, input_layout, input_dtype_str, output_dtype_str
+        uri,
+        input_layout,
+        input_dtype_str,
+        output_dtype_str,
+        compilation_context=current_compilation_context,
     )
 
     # copy static fmha_v2_run.cu

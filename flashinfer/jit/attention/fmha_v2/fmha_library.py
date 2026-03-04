@@ -2,6 +2,7 @@ import itertools
 import pathlib
 from typing import Any, Optional, Tuple
 from ... import env as jit_env
+from ....compilation_context import CompilationContext
 from dataclasses import dataclass, asdict
 from .utils import (
     get_effective_sm_and_name,
@@ -1204,7 +1205,11 @@ inline void get_grid_size(int &heads_per_wave,
 
 
 def generate_jit_sources(
-    uri: str, input_layout: str, input_dtype: str, output_dtype: Optional[str]
+    uri: str,
+    input_layout: str,
+    input_dtype: str,
+    output_dtype: Optional[str],
+    compilation_context: CompilationContext,
 ) -> list[pathlib.Path]:
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     source_paths = []
@@ -1277,7 +1282,19 @@ def generate_jit_sources(
         output_dtype_values,
     )
 
-    for config_list in [warp_spec_configs, other_configs, sm120_configs]:
+    target_major_archs = {
+        major for major, _minor in compilation_context.TARGET_CUDA_ARCHS
+    }
+    include_sm90_kernels = 9 in target_major_archs
+    include_sm120_kernels = 12 in target_major_archs
+
+    config_lists = [other_configs]
+    if include_sm90_kernels:
+        config_lists.append(warp_spec_configs)
+    if include_sm120_kernels:
+        config_lists.append(sm120_configs)
+
+    for config_list in config_lists:
         for (
             sm_iter,
             dtype_iter,
