@@ -67,6 +67,13 @@ __device__ __forceinline__ float warpReduceSum(float val) {
   return val;
 }
 
+__device__ __forceinline__ float warpReduceMax(float val) {
+  for (int s = warpSize / 2; s > 0; s /= 2) {
+    val = max(val, __shfl_down_sync(UINT32_MAX, val, s));
+  }
+  return val;
+}
+
 __forceinline__ __device__ float softplus(float x) { return __logf(1.f + __expf(x)); }
 
 __device__ __forceinline__ float thresholded_softplus(float dt_value) {

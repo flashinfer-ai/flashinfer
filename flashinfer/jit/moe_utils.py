@@ -21,9 +21,6 @@ from .core import (
     current_compilation_context,
 )
 
-from .cubin_loader import download_trtllm_headers, get_cubin
-from ..artifacts import ArtifactPath, CheckSumHash
-
 
 def gen_moe_utils_module() -> JitSpec:
     """
@@ -36,6 +33,12 @@ def gen_moe_utils_module() -> JitSpec:
     - moeActivation: Apply activation functions with optional FP4 quantization
     - moeSort: Sort tokens by expert assignment (DeepSeekV3 routing)
     """
+    # Lazy imports to avoid circular dependency:
+    # artifacts.py imports from jit.cubin_loader, which triggers jit/__init__.py,
+    # which imports this module — so ArtifactPath/CheckSumHash aren't defined yet
+    # at module load time if these imports are at the top level.
+    from .cubin_loader import download_trtllm_headers, get_cubin
+    from ..artifacts import ArtifactPath, CheckSumHash
 
     download_trtllm_headers(
         "bmm",
