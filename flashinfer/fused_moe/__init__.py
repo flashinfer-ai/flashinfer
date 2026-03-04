@@ -40,6 +40,9 @@ from .core import (
 from .fused_routing_dsv3 import (  # noqa: F401
     fused_topk_deepseek as fused_topk_deepseek,
 )
+from .raw_logits_topk import (
+    fused_topk_raw_logits as fused_topk_raw_logits,
+)
 
 # CuteDSL MoE APIs (conditionally imported if cute_dsl available)
 try:
@@ -74,6 +77,7 @@ __all__ = [
     "trtllm_fp8_per_tensor_scale_moe",
     "trtllm_mxint4_block_scale_moe",
     "fused_topk_deepseek",
+    "fused_topk_raw_logits",
 ]
 
 # Add CuteDSL exports if available
