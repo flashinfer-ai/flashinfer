@@ -1961,11 +1961,6 @@ def gen_fmha_v2_module(
     fmha_v2_src_dir = csrc_dir / "fmha_v2"
     # Determine which SM major versions are available in the compilation context
     # so we only generate kernel sources for architectures that will be compiled.
-    target_sm_versions = {
-        major
-        for major, _ in current_compilation_context.TARGET_CUDA_ARCHS
-        if major in (9, 12)
-    }
     source_paths = generate_jit_sources(
         uri,
         input_layout,
