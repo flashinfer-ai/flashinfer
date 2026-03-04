@@ -49,11 +49,20 @@ Example usage:
 """
 
 from typing import Union, Literal, Optional, Tuple, List, cast, Any
-from .workspace_base import AllReduceFusionWorkspace
 
 import torch
 
 from flashinfer.api_logging import flashinfer_api
+# ============================================================================
+# SHARED TYPE DEFINITIONS (canonical source: _types.py)
+# ============================================================================
+# These types are re-exported here for public API convenience.
+
+from ._types import AllReduceFusionPattern
+from ._types import QuantizationSFLayout
+from ._types import get_pattern_traits
+
+from .workspace_base import AllReduceFusionWorkspace
 
 from .trtllm_ar import trtllm_allreduce_fusion
 from .trtllm_ar import trtllm_create_ipc_workspace_for_all_reduce_fusion
@@ -63,13 +72,13 @@ from .mapping import Mapping
 
 from .mnnvl import CommBackend, SymmDeviceMemory
 
-# Note: AllReduceFusionPattern and QuantizationSFLayout are pseudo-types (classes with int constants)
-# Import them for runtime use but type hint as int for mypy compatibility
-from .trtllm_ar import AllReduceFusionPattern
+# Backend-specific imports
 from .trtllm_mnnvl_ar import MNNVLAllReduceFusionWorkspace
 from .trtllm_mnnvl_ar import MNNVLAllreduceFusionStrategy
 from .trtllm_mnnvl_ar import trtllm_mnnvl_allreduce
 from .trtllm_mnnvl_ar import trtllm_mnnvl_fused_allreduce_add_rmsnorm
+from .trtllm_mnnvl_ar import trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant
+
 
 # ============================================================================
 # WORKSPACE IMPLEMENTATIONS
@@ -633,17 +642,11 @@ def allreduce_fusion(
             return output
 
     elif isinstance(workspace, MNNVLAllReduceFusionWorkspace):
-        if (
-            pattern != AllReduceFusionPattern.kARResidualRMSNorm
-            and pattern != AllReduceFusionPattern.kAllReduce
-        ):
-            raise ValueError(
-                f"MNNVL AllReduce+RMS fusion does not support pattern {pattern}. Please try the TRTLLM backend instead."
-            )
+        pattern_traits = get_pattern_traits(pattern)
 
-        if layout_code is not None:
+        if layout_code == QuantizationSFLayout.SWIZZLED_8x4:
             raise ValueError(
-                "MNNVL AllReduce does not support quantization fusion and thus no layout_code"
+                "MNNVL AllReduce does not support 8x4 swizzled sf layout. Please use 128x4 or linear layout instead."
             )
 
         # MNNVL backend implementation
@@ -659,7 +662,7 @@ def allreduce_fusion(
             )
             return output
 
-        elif pattern == AllReduceFusionPattern.kARResidualRMSNorm:
+        elif pattern_traits.has_rmsnorm:
             # AllReduce + Residual + RMSNorm fusion
             # Validate required parameters
             if residual_in is None:
@@ -668,22 +671,41 @@ def allreduce_fusion(
                 raise ValueError("MNNVL AllReduce+RMS fusion requires rms_gamma")
 
             # Allocate output tensors if not provided
-            if norm_out is None:
+            if pattern_traits.has_norm_out and norm_out is None:
                 norm_out = torch.empty_like(input)
             if residual_out is None:
                 residual_out = torch.empty_like(input)
 
-            # Call the MNNVL fusion function
-            norm_result, residual_result = trtllm_mnnvl_fused_allreduce_add_rmsnorm(
-                input=input,
-                residual_in=residual_in,
-                gamma=rms_gamma,
-                workspace=workspace,
-                epsilon=rms_eps,
-                output=norm_out,
-                residual_out=residual_out,
-                launch_with_pdl=launch_with_pdl,
-            )
+            if pattern_traits.has_quant:
+                # FIXME: I have the function below to handle the creation of the buffer, is this correct?
+                quant_result, scale_out, residual_out, norm_result = (
+                    trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
+                        input=input,
+                        residual_in=residual_in,
+                        gamma=rms_gamma,
+                        workspace=workspace,
+                        epsilon=rms_eps,
+                        output=norm_out,
+                        residual_out=residual_out,
+                        launch_with_pdl=launch_with_pdl,
+                        output_scale=scale_factor,
+                        layout_code=layout_code,
+                        quant_type=pattern_traits.quant_type,
+                    )
+                )
+                return quant_result
+            else:
+                # Call the MNNVL fusion function
+                norm_result, residual_result = trtllm_mnnvl_fused_allreduce_add_rmsnorm(
+                    input=input,
+                    residual_in=residual_in,
+                    gamma=rms_gamma,
+                    workspace=workspace,
+                    epsilon=rms_eps,
+                    output=norm_out,
+                    residual_out=residual_out,
+                    launch_with_pdl=launch_with_pdl,
+                )
             return norm_result
 
         else:
