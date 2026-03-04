@@ -391,10 +391,9 @@ with ``torchrun``), you could use separate output files per rank and merge them 
     with open("configs_merged.json", "w") as f:
         json.dump(merged, f, indent=2, sort_keys=True)
 
-.. warning::
+.. note::
 
-   Atomic file writes rely on ``os.replace()``, which is atomic on local
-   filesystems (ext4, XFS, APFS, NTFS).  On **NFS** mounts, ``os.replace()``
-   is **not guaranteed to be atomic**, so concurrent readers may briefly see
-   incomplete data.  If you store the cache file on NFS, consider writing to a
-   local path first and copying afterwards.
+   Atomic file writes rely on ``os.replace()``, which maps to the POSIX
+   ``rename()`` syscall.  This is atomic on all local filesystems and is
+   expected to be atomic on most network filesystems (NFS, Lustre) per POSIX
+   semantics.  FlashInfer's cubin caching also relies on this guarantee.

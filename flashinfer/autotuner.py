@@ -1165,6 +1165,8 @@ class AutoTuner:
         # Atomic write: write to a temp file then replace the target.
         # This prevents readers from seeing a partially-written file and
         # guards against data loss if the process is killed mid-write.
+        # The temp file is created in the same directory (dir=dir_name) so
+        # that os.replace() is a same-filesystem rename, which is atomic.
         dir_name = os.path.dirname(abs_path)
         if dir_name:
             os.makedirs(dir_name, exist_ok=True)

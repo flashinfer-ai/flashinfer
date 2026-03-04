@@ -18,10 +18,16 @@ from flashinfer.autotuner import (
     AutoTuner,
     TunableRunner,
     TuningConfig,
+    _METADATA_KEY,
     _json_to_tactic,
     _tactic_to_json,
     autotune,
 )
+
+
+def _config_entries(data: dict) -> dict:
+    """Return only the config entries from a saved JSON dict (strip metadata)."""
+    return {k: v for k, v in data.items() if not k.startswith("_")}
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +72,7 @@ def _populate_cache(tuner, runner, custom_op, profile, tactic, runner_id=0):
     """Insert a fake entry into the profiling cache."""
     cache_key = AutoTuner._get_cache_key(custom_op, runner, profile, _TUNING_CONFIG)
     tuner.profiling_cache[cache_key] = (runner_id, tactic, None)
+    tuner._dirty = True
 
 
 # ---------------------------------------------------------------------------
@@ -133,10 +140,12 @@ class TestSaveLoadRoundTrip:
                 data = json.load(f)
 
             assert isinstance(data, dict)
-            assert len(data) == 1
+            assert _METADATA_KEY in data
+            configs = _config_entries(data)
+            assert len(configs) == 1
 
             # Verify config entry uses runner class name, not runner_id
-            config_values = list(data.values())
+            config_values = list(configs.values())
             runner_name, tactic = config_values[0]
             assert runner_name == "FakeRunnerA"
             assert tactic == 5
@@ -196,7 +205,7 @@ class TestSaveLoadRoundTrip:
 
             with open(tmp_path, "r") as f:
                 data = json.load(f)
-            assert len(data) == 2
+            assert len(_config_entries(data)) == 2
 
             self.tuner.clear_cache()
             self.tuner.load_configs(tmp_path)
@@ -213,7 +222,7 @@ class TestSaveLoadRoundTrip:
 
             with open(tmp_path, "r") as f:
                 data = json.load(f)
-            assert data == {}
+            assert len(_config_entries(data)) == 0
         finally:
             os.unlink(tmp_path)
 
@@ -402,7 +411,7 @@ class TestEndToEnd:
                 data = json.load(f)
 
             # Should contain both entries
-            assert len(data) == 2
+            assert len(_config_entries(data)) == 2
 
             # Verify old loaded config is included
             assert "('old_op', 'FakeRunnerA', ((1, 2),))" in data
@@ -434,8 +443,9 @@ class TestEndToEnd:
                 data = json.load(f)
 
             # Only one entry (merged), with the in-memory value
-            assert len(data) == 1
-            entry = list(data.values())[0]
+            configs = _config_entries(data)
+            assert len(configs) == 1
+            entry = list(configs.values())[0]
             assert entry[1] == 42  # in-memory wins over loaded 99
         finally:
             os.unlink(tmp_path)
@@ -484,8 +494,9 @@ class TestAutotuneCache:
             # Verify file was written
             with open(tmp_path, "r") as f:
                 data = json.load(f)
-            assert len(data) == 1
-            entry = list(data.values())[0]
+            configs = _config_entries(data)
+            assert len(configs) == 1
+            entry = list(configs.values())[0]
             assert entry == ["FakeRunnerA", 5]
         finally:
             if os.path.exists(tmp_path):
@@ -538,7 +549,7 @@ class TestAutotuneCache:
             assert os.path.exists(cache_path)
             with open(cache_path, "r") as f:
                 data = json.load(f)
-            assert len(data) == 1
+            assert len(_config_entries(data)) == 1
         finally:
             if os.path.exists(cache_path):
                 os.unlink(cache_path)
@@ -602,7 +613,7 @@ class TestAutotuneCache:
 
             with open(tmp_path, "r") as f:
                 data = json.load(f)
-            assert len(data) == 1
+            assert len(_config_entries(data)) == 1
 
             # Block 2: tune op2 (should merge with op1)
             _populate_cache(tuner, runner_b, "op2", ((3, 4),), tactic=20)
@@ -612,7 +623,7 @@ class TestAutotuneCache:
             with open(tmp_path, "r") as f:
                 data = json.load(f)
             # Should have both op1 (from loaded file) and op2 (from profiling)
-            assert len(data) == 2
+            assert len(_config_entries(data)) == 2
         finally:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
@@ -677,7 +688,7 @@ class TestAtomicWrite:
             assert os.path.isfile(target)
             with open(target, "r") as f:
                 data = json.load(f)
-            assert len(data) == 1
+            assert len(_config_entries(data)) == 1
 
             # No temp files should remain in the directory
             files = os.listdir(tmp_dir)
@@ -716,16 +727,17 @@ class TestAtomicWrite:
             # File should be valid JSON with 2 entries
             with open(target, "r") as f:
                 data = json.load(f)
-            assert len(data) == 2
+            assert len(_config_entries(data)) == 2
 
-    def test_save_replaces_existing_file(self):
-        """os.replace should overwrite the previous file atomically."""
+    def test_save_merges_with_existing_file(self):
+        """save_configs re-reads the disk file and merges entries."""
         with tempfile.TemporaryDirectory() as tmp_dir:
             target = os.path.join(tmp_dir, "configs.json")
 
-            # Write initial content
+            # Write a pre-existing config entry on disk
+            existing = {"('old_op', 'OldRunner', ((1, 1),))": ["OldRunner", 0]}
             with open(target, "w") as f:
-                json.dump({"old": "data"}, f)
+                json.dump(existing, f)
 
             tuner = AutoTuner.get()
             runner = FakeRunnerA(value=1)
@@ -734,9 +746,10 @@ class TestAtomicWrite:
 
             with open(target, "r") as f:
                 data = json.load(f)
-            # Should only contain the new config, not "old"
-            assert "old" not in data
-            assert len(data) == 1
+            configs = _config_entries(data)
+            # Should contain both the old disk entry and the new in-memory one
+            assert len(configs) == 2
+            assert "('old_op', 'OldRunner', ((1, 1),))" in configs
 
 
 # ---------------------------------------------------------------------------
