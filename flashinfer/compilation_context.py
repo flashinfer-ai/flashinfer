@@ -64,5 +64,5 @@ class CompilationContext:
             )
         return [
             f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}"
-            for major, minor in supported_cuda_archs
+            for major, minor in sorted(supported_cuda_archs)
         ] + self.COMMON_NVCC_FLAGS
