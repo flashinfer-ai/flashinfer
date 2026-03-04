@@ -595,19 +595,19 @@ def run_trtllm_fmha_v2_prefill_case(
         qkv_arg = (q, kv)
         k_scale, v_scale = kv_scale, kv_scale
 
-    elif input_layout == "Q_PAGED_KV":
+    elif input_layout in ("Q_PAGED_KV_NHD", "Q_PAGED_KV_HND"):
+        is_nhd = input_layout == "Q_PAGED_KV_NHD"
         max_num_blocks = (max_kv_len + page_size - 1) // page_size
         num_pages = batch_size * max_num_blocks
+        # NHD: [num_pages, 2, page_size, num_kv_heads, head_dim]
+        # HND: [num_pages, 2, num_kv_heads, page_size, head_dim]
+        paged_shape = (
+            (num_pages, 2, page_size, num_kv_heads, head_dim)
+            if is_nhd
+            else (num_pages, 2, num_kv_heads, page_size, head_dim)
+        )
         if dtype == torch.float8_e4m3fn:
-            paged_bf16 = torch.randn(
-                num_pages,
-                2,
-                page_size,
-                num_kv_heads,
-                head_dim,
-                dtype=torch.bfloat16,
-                device=device,
-            )
+            paged_bf16 = torch.randn(*paged_shape, dtype=torch.bfloat16, device=device)
             paged_kv_cache, kv_scale = to_float8(paged_bf16, dtype=torch.float8_e4m3fn)
             kv_scale = kv_scale.item()
             q_bf16 = torch.randn(
@@ -620,15 +620,7 @@ def run_trtllm_fmha_v2_prefill_case(
             q, q_scale = to_float8(q_bf16, dtype=torch.float8_e4m3fn)
             q_scale = q_scale.item()
         else:
-            paged_kv_cache = torch.randn(
-                num_pages,
-                2,
-                page_size,
-                num_kv_heads,
-                head_dim,
-                dtype=dtype,
-                device=device,
-            )
+            paged_kv_cache = torch.randn(*paged_shape, dtype=dtype, device=device)
             q = torch.randn(
                 total_tokens, num_qo_heads, head_dim, dtype=dtype, device=device
             )
@@ -649,6 +641,12 @@ def run_trtllm_fmha_v2_prefill_case(
         qkv_arg = (q, paged_kv_cache)
         k_scale, v_scale = kv_scale, kv_scale
 
+    # attention_ref_torch expects NHD paged KV cache; for HND, transpose back
+    if input_layout == "Q_PAGED_KV_HND":
+        ref_qkv_arg = (q, paged_kv_cache.transpose(-3, -2).contiguous())
+    else:
+        ref_qkv_arg = qkv_arg
+
     # --- Compute BMM scales ---
     if dtype == torch.float8_e4m3fn:
         bmm1_scale = sm_scale * q_scale * k_scale
@@ -663,6 +661,7 @@ def run_trtllm_fmha_v2_prefill_case(
     # --- Run kernel ---
     result = trtllm_fmha_v2_prefill(
         qkv_arg,
+        input_layout,
         workspace_buffer=workspace_buffer,
         seq_lens=seq_lens,
         max_q_len=max_q_len,
@@ -675,7 +674,6 @@ def run_trtllm_fmha_v2_prefill_case(
         block_tables=block_tables,
         out=o,
         out_dtype=o_dtype,
-        kv_layout="NHD",
         mask_mode=mask_mode,
         window_left=window_left,
         logits_soft_cap_scale=logits_soft_cap if logits_soft_cap > 0 else None,
@@ -691,7 +689,7 @@ def run_trtllm_fmha_v2_prefill_case(
 
     # --- Reference ---
     ref_result = attention_ref_torch(
-        qkv_arg,
+        ref_qkv_arg,
         seq_lens=seq_lens,
         cum_seq_lens_q=cum_seq_lens,
         sm_scale=sm_scale,
@@ -826,7 +824,9 @@ def test_trtllm_fmha_v2_prefill(
         (torch.float8_e4m3fn, torch.bfloat16),
     ],
 )
-@pytest.mark.parametrize("input_layout", ["CONTIGUOUS_Q_KV", "Q_PAGED_KV"])
+@pytest.mark.parametrize(
+    "input_layout", ["CONTIGUOUS_Q_KV", "Q_PAGED_KV_NHD", "Q_PAGED_KV_HND"]
+)
 @pytest.mark.parametrize(
     (
         "skip_softmax_threshold_scale_factor",
@@ -940,7 +940,8 @@ def test_trtllm_fmha_v2_prefill_attention_sinks(
 
     # Test trtllm_fmha_v2_prefill with sinks parameter
     output = trtllm_fmha_v2_prefill(
-        (q, k, v),  # Tuple of separate tensors
+        (q, k, v),
+        "SEPARATE_Q_K_V",
         workspace_buffer=workspace_buffer,
         seq_lens=seq_lens,
         max_q_len=max_q_len,
@@ -952,7 +953,6 @@ def test_trtllm_fmha_v2_prefill_attention_sinks(
         cum_seq_lens_kv=cum_seq_lens,
         out=o,
         out_dtype=dtype,
-        kv_layout="NHD",
         sinks=sink,
         mask_mode=mask_mode,
         window_left=window_left,
@@ -1019,7 +1019,7 @@ def test_trtllm_fmha_v2_prefill_attention_sinks(
     [
         ("CONTIGUOUS_Q_KV", None),
         ("SEPARATE_Q_K_V", None),
-        ("Q_PAGED_KV", 32),
+        ("Q_PAGED_KV_NHD", 32),
     ],
 )
 @pytest.mark.parametrize("chunked_attention_size", [64, 256])
@@ -1087,7 +1087,7 @@ def test_trtllm_fmha_v2_prefill_chunked_attention(
         )
         qkv_arg = (q, kv)
 
-    elif input_layout == "Q_PAGED_KV":
+    elif input_layout == "Q_PAGED_KV_NHD":
         max_num_blocks = (max_kv_len + page_size - 1) // page_size
         num_pages = batch_size * max_num_blocks
         paged_kv_cache = torch.randn(
@@ -1127,6 +1127,7 @@ def test_trtllm_fmha_v2_prefill_chunked_attention(
     # --- Run kernel with chunked attention ---
     output = trtllm_fmha_v2_prefill(
         qkv_arg,
+        "Q_PAGED_KV_NHD",
         workspace_buffer=workspace_buffer,
         seq_lens=seq_lens,
         max_q_len=max_kv_len,
@@ -1138,7 +1139,6 @@ def test_trtllm_fmha_v2_prefill_chunked_attention(
         cum_seq_lens_kv=cum_seq_lens,
         block_tables=block_tables,
         out_dtype=dtype,
-        kv_layout="NHD",
         mask_mode="chunked",
         chunked_attention_size=chunked_attention_size,
     )
@@ -1184,7 +1184,7 @@ def test_trtllm_fmha_v2_chunked_prefill_chunked_attention(
     non-overlapping blocks of ``chunked_attention_size`` and restricts each
     query to attend causally within its own block.
 
-    Uses Q_PAGED_KV layout only.  The non-paged layouts (CONTIGUOUS_Q_KV,
+    Uses Q_PAGED_KV_NHD layout only.  The non-paged layouts (CONTIGUOUS_Q_KV,
     SEPARATE_Q_K_V) have a known kernel issue with chunked attention mask when
     past_kv_length >= STEP_Q (64).
     """
@@ -1259,6 +1259,7 @@ def test_trtllm_fmha_v2_chunked_prefill_chunked_attention(
     # --- Run kernel ---
     output = trtllm_fmha_v2_prefill(
         qkv_arg,
+        "Q_PAGED_KV_NHD",
         workspace_buffer=workspace_buffer,
         seq_lens=kv_seq_lens,
         max_q_len=actual_max_q_len,
@@ -1270,7 +1271,6 @@ def test_trtllm_fmha_v2_chunked_prefill_chunked_attention(
         cum_seq_lens_kv=cum_seq_lens_kv,
         block_tables=block_tables,
         out_dtype=dtype,
-        kv_layout="NHD",
         mask_mode="chunked",
         chunked_attention_size=chunked_attention_size,
     )

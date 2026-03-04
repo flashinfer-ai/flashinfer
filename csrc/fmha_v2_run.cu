@@ -23,6 +23,7 @@
 #include <cmath>
 #include <cstring>
 #include <numeric>
+#include <stdexcept>
 #include <tuple>
 #include <vector>
 
@@ -308,9 +309,10 @@ static inline Attention_mask_type string_to_mask_type(const std::string& s) {
 static inline Attention_input_layout string_to_input_layout(const std::string& s) {
   if (s == "packed_qkv") return Attention_input_layout::PACKED_QKV;
   if (s == "contiguous_q_kv") return Attention_input_layout::CONTIGUOUS_Q_KV;
-  if (s == "q_paged_kv") return Attention_input_layout::Q_PAGED_KV;
+  if (s == "q_paged_kv_nhd") return Attention_input_layout::Q_PAGED_KV;
+  if (s == "q_paged_kv_hnd") return Attention_input_layout::Q_PAGED_KV;
   if (s == "separate_q_k_v") return Attention_input_layout::SEPARATE_Q_K_V;
-  return Attention_input_layout::Q_PAGED_KV;  // default
+  throw std::invalid_argument("Unsupported input_layout: " + s);
 }
 
 void fmha_v2_run(

@@ -2,6 +2,7 @@ import itertools
 import pathlib
 from typing import Any, Optional, Tuple
 from ... import env as jit_env
+from ....compilation_context import CompilationContext
 from dataclasses import dataclass, asdict
 from .utils import (
     get_effective_sm_and_name,
@@ -1208,7 +1209,7 @@ def generate_jit_sources(
     input_layout: str,
     input_dtype: str,
     output_dtype: Optional[str],
-    target_sm_versions: Optional[set[int]] = None,
+    compilation_context: CompilationContext,
 ) -> list[pathlib.Path]:
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     source_paths = []
@@ -1219,7 +1220,8 @@ def generate_jit_sources(
     # 0 means head_size_v = head_size_qk (required for flash_valid)
     head_size_v_values = [0]
     map_input_layout = {
-        "q_paged_kv": InputLayout.Q_PAGED_KV,
+        "q_paged_kv_nhd": InputLayout.Q_PAGED_KV,
+        "q_paged_kv_hnd": InputLayout.Q_PAGED_KV,
         "packed_qkv": InputLayout.PACKED_QKV,
         "separate_q_k_v": InputLayout.SEPARATE_Q_K_V,
         "contiguous_q_kv": InputLayout.CONTIGUOUS_Q_KV,
@@ -1234,11 +1236,13 @@ def generate_jit_sources(
     enable_attn_logit_softcapping_values = [True, False]
     return_softmax_values = [True, False]
     alibi_values = [True, False]
-    generate_sm90 = target_sm_versions is None or 9 in target_sm_versions
-    generate_sm120 = target_sm_versions is None or 12 in target_sm_versions
-
+    target_major_archs = {
+        major for major, _minor in compilation_context.TARGET_CUDA_ARCHS
+    }
+    include_sm90_kernels = 9 in target_major_archs
+    include_sm120_kernels = 12 in target_major_archs
     warp_spec_configs: itertools.product = itertools.product(
-        [90] if generate_sm90 else [],
+        [90] if include_sm90_kernels else [],
         dtype_values,
         head_size_qk_warpspec_values,
         head_size_v_values,
@@ -1253,7 +1257,7 @@ def generate_jit_sources(
 
     head_size_qk_sm120_values = [64, 128, 256]
     sm120_configs: itertools.product = itertools.product(
-        [120] if generate_sm120 else [],
+        [120] if include_sm120_kernels else [],
         dtype_values,  # fallback to avoid empty product
         head_size_qk_sm120_values,
         head_size_v_values,
@@ -1280,7 +1284,13 @@ def generate_jit_sources(
         output_dtype_values,
     )
 
-    for config_list in [warp_spec_configs, other_configs, sm120_configs]:
+    config_lists = [other_configs]
+    if include_sm90_kernels:
+        config_lists.append(warp_spec_configs)
+    if include_sm120_kernels:
+        config_lists.append(sm120_configs)
+
+    for config_list in config_lists:
         for (
             sm_iter,
             dtype_iter,

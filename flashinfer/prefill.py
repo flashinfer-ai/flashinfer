@@ -3937,6 +3937,7 @@ def trtllm_fmha_v2_prefill(
         Tuple[torch.Tensor, torch.Tensor],
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     ],
+    input_layout: str,
     workspace_buffer: torch.Tensor,
     seq_lens: torch.Tensor,
     max_q_len: int,
@@ -3949,7 +3950,6 @@ def trtllm_fmha_v2_prefill(
     block_tables: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[Union[torch.dtype, str]] = None,
-    kv_layout: Optional[str] = "HND",
     sinks: Optional[List[torch.Tensor]] = None,
     pos_encoding_mode: str = None,
     logits_soft_cap_scale: Optional[float] = None,
@@ -3964,20 +3964,24 @@ def trtllm_fmha_v2_prefill(
     Parameters
     ----------
     qkv : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
-        The query, key, value tensors. Accepts multiple formats:
-        - **Packed QKV** (torch.Tensor): shape ``[num_tokens, 3, num_heads, head_dim]``.
-        - **Tuple of two tensors** (Q, KV): Two sub-formats supported:
-          - *Contiguous Q+KV*: Q with shape ``[num_tokens, num_heads, head_dim]``,
-            KV with shape ``[num_tokens, 2, num_kv_heads, head_dim]`` where
-            ``KV[:, 0, ...]`` is key and ``KV[:, 1, ...]`` is value.
-          - *Q + Paged KV*: Q with shape ``[num_tokens, num_heads, head_dim]``,
-            paged_KV with shape ``[num_pages, 2, num_kv_heads, page_size, head_dim]``
-            if :attr:`kv_layout` is ``HND``, or
-            ``[num_pages, 2, page_size, num_kv_heads, head_dim]`` if :attr:`kv_layout`
-            is ``NHD``. The second dimension is 2, where ``paged_KV[:, 0, ...]`` is
-            key cache and ``paged_KV[:, 1, ...]`` is value cache.
-        - **Tuple of three tensors** (Q, K, V): Q with shape
-          ``[num_tokens, num_heads, head_dim]``, K and V with shape
+        Query/key/value input; expected format is determined by :attr:`input_layout`.
+    input_layout : str
+        Specifies the layout of the query/key/value tensors:
+
+        - ``PACKED_QKV``: ``qkv`` is a single tensor of shape
+          ``[num_tokens, 3, num_heads, head_dim]``.
+        - ``CONTIGUOUS_Q_KV``: ``qkv`` is ``(Q, KV)`` where Q has shape
+          ``[num_tokens, num_heads, head_dim]`` and KV has shape
+          ``[num_tokens, 2, num_kv_heads, head_dim]``
+          (``KV[:, 0, ...]`` is key, ``KV[:, 1, ...]`` is value).
+        - ``Q_PAGED_KV_HND``: ``qkv`` is ``(Q, paged_KV)`` where Q has shape
+          ``[num_tokens, num_heads, head_dim]`` and paged_KV has shape
+          ``[num_pages, 2, num_kv_heads, page_size, head_dim]``
+          (``paged_KV[:, 0, ...]`` is key cache, ``paged_KV[:, 1, ...]`` is value cache).
+        - ``Q_PAGED_KV_NHD``: same as ``Q_PAGED_KV_HND`` but paged_KV shape is
+          ``[num_pages, 2, page_size, num_kv_heads, head_dim]``.
+        - ``SEPARATE_Q_K_V``: ``qkv`` is ``(Q, K, V)`` where Q has shape
+          ``[num_tokens, num_heads, head_dim]`` and K, V have shape
           ``[num_tokens, num_kv_heads, head_dim]``.
     workspace_buffer : torch.Tensor
         The workspace buffer. Must be initialized to 0 for its first use.
@@ -4005,8 +4009,6 @@ def trtllm_fmha_v2_prefill(
         If ``out_dtype`` is also not provided, will use the dtype of query.
     out_dtype : Optional[Union[torch.dtype, str]]
         The output dtype. If not provided, will use the dtype of ``out`` or query.
-    kv_layout : Optional[str]
-        The layout of KV cache, could be ``HND`` or ``NHD``. Defaults to ``HND``.
     sinks : Optional[List[torch.Tensor]]
         Additional value per head in the denominator of the softmax.
     pos_encoding_mode : Optional[str]
@@ -4040,64 +4042,58 @@ def trtllm_fmha_v2_prefill(
         * The softmax statistics tensor (LSE).
     """
 
-    if isinstance(qkv, torch.Tensor):
-        # Packed QKV: [tokens, 3, H, D]
-        input_layout = "PACKED_QKV"
-        if qkv.dim() < 2 or qkv.shape[1] != 3:
+    if input_layout == "PACKED_QKV":
+        assert isinstance(qkv, torch.Tensor)
+        if qkv.dim() != 4 or qkv.shape[1] != 3:
             raise ValueError(
-                f"Packed QKV tensor must have shape [tokens, 3, H, D] with dim 1 == 3. "
-                f"Got shape {qkv.shape}"
+                f"PACKED_QKV expects shape [tokens, 3, num_heads, head_dim], got {tuple(qkv.shape)}"
             )
-        query = qkv  # Full packed tensor [tokens, 3, H, D]
-        k_cache, v_cache = qkv, qkv  # placeholder
-    elif isinstance(qkv, tuple):
-        if len(qkv) == 2:
-            query, kv_or_paged = qkv
-            if kv_or_paged.dim() == 4 and kv_or_paged.shape[1] == 2:
-                input_layout = "CONTIGUOUS_Q_KV"
-                kv_cache = kv_or_paged
-                k_cache = kv_cache  # Pass KV tensor as k_cache for C++ kernel
-                v_cache = kv_cache  # v_cache is placeholder (not used for this layout)
-
-            elif kv_or_paged.dim() == 5 and kv_or_paged.shape[1] == 2:
-                input_layout = "Q_PAGED_KV"
-                kv_cache = kv_or_paged
-                if kv_layout == "NHD":
-                    kv_cache = kv_cache.transpose(-3, -2).contiguous()
-                k_cache, v_cache = kv_cache.unbind(dim=1)
-            else:
-                raise ValueError(
-                    "Invalid shape for CONTIGUOUS_Q_KV or Q_PAGED_KV format."
-                )
-
-        elif len(qkv) == 3:
-            input_layout = "SEPARATE_Q_K_V"
-            query, k_cache, v_cache = qkv
-            if hasattr(torch, "float8_e4m3fn") and query.dtype == torch.float8_e4m3fn:
-                raise ValueError(
-                    "FP8 (e4m3) is not supported for the SEPARATE_Q_K_V input layout. "
-                    "Use PACKED_QKV, CONTIGUOUS_Q_KV, or Q_PAGED_KV layout instead."
-                )
-            if is_sm12x_supported(query.device):
-                raise ValueError(
-                    "SEPARATE_Q_K_V layout is not yet supported for FMHAv2 on SM120 (Blackwell). "
-                    "It requires SM90 warp-specialization kernels. "
-                    "Use PACKED_QKV or CONTIGUOUS_Q_KV layout instead."
-                )
-            if logits_soft_cap_scale is not None and logits_soft_cap_scale > 0:
-                raise ValueError(
-                    "Logits soft capping is not supported for the SEPARATE_Q_K_V input layout. "
-                    "Use PACKED_QKV, CONTIGUOUS_Q_KV, or Q_PAGED_KV layout instead."
-                )
-
-        else:
+        query = qkv
+        k_cache, v_cache = qkv, qkv  # placeholders
+    elif input_layout == "CONTIGUOUS_Q_KV":
+        assert isinstance(qkv, tuple)
+        query, kv_cache = qkv[0], qkv[1]
+        if kv_cache.dim() != 4 or kv_cache.shape[1] != 2:
             raise ValueError(
-                f"qkv tuple must have 2 or 3 elements: (Q, paged_KV) or (Q, K, V). "
-                f"Got {len(qkv)} elements"
+                f"CONTIGUOUS_Q_KV expects KV shape [tokens, 2, num_kv_heads, head_dim], got {tuple(kv_cache.shape)}"
+            )
+        k_cache = kv_cache
+        v_cache = kv_cache  # placeholder (not used for this layout)
+    elif input_layout == "Q_PAGED_KV_NHD":
+        assert isinstance(qkv, tuple)
+        query, paged_kv = qkv[0], qkv[1]
+        if paged_kv.dim() != 5 or paged_kv.shape[1] != 2:
+            raise ValueError(
+                f"Q_PAGED_KV_NHD expects paged_KV shape [pages, 2, page_size, num_kv_heads, head_dim], got {tuple(paged_kv.shape)}"
+            )
+        # TODO: implement native NHD support in the kernel to avoid this transpose
+        kv_cache = paged_kv.transpose(-3, -2).contiguous()
+        k_cache, v_cache = kv_cache.unbind(dim=1)
+    elif input_layout == "Q_PAGED_KV_HND":
+        assert isinstance(qkv, tuple)
+        query, paged_kv = qkv[0], qkv[1]
+        if paged_kv.dim() != 5 or paged_kv.shape[1] != 2:
+            raise ValueError(
+                f"Q_PAGED_KV_HND expects paged_KV shape [pages, 2, num_kv_heads, page_size, head_dim], got {tuple(paged_kv.shape)}"
+            )
+        k_cache, v_cache = paged_kv.unbind(dim=1)
+    elif input_layout == "SEPARATE_Q_K_V":
+        assert isinstance(qkv, tuple)
+        query, k_cache, v_cache = qkv[0], qkv[1], qkv[2]
+        if hasattr(torch, "float8_e4m3fn") and query.dtype == torch.float8_e4m3fn:
+            raise ValueError(
+                "FP8 (e4m3) is not supported for the SEPARATE_Q_K_V input layout. "
+                "Use PACKED_QKV, CONTIGUOUS_Q_KV, or Q_PAGED_KV layout instead."
+            )
+        if logits_soft_cap_scale is not None and logits_soft_cap_scale > 0:
+            raise ValueError(
+                "Logits soft capping is not supported for the SEPARATE_Q_K_V input layout. "
+                "Use PACKED_QKV, CONTIGUOUS_Q_KV, or Q_PAGED_KV layout instead."
             )
     else:
-        raise TypeError(
-            f"qkv must be a torch.Tensor or tuple. Got {type(qkv).__name__}"
+        raise ValueError(
+            f"Unsupported input_layout: {input_layout!r}. Expected one of: "
+            "PACKED_QKV, CONTIGUOUS_Q_KV, Q_PAGED_KV_HND, Q_PAGED_KV_NHD, SEPARATE_Q_K_V."
         )
 
     if input_layout == "PACKED_QKV":
@@ -4105,8 +4101,8 @@ def trtllm_fmha_v2_prefill(
         num_qo_heads = query.shape[2]
         page_size = 0  # Not applicable for packed layouts
         head_dim_v = query.shape[3]  # Assume same as head_dim_qk
-    elif input_layout == "Q_PAGED_KV":
-        # Q is 3D: [tokens, H, D], Paged KV is 4D: [num_pages, H_kv, page_size, D]
+    elif input_layout in ("Q_PAGED_KV_NHD", "Q_PAGED_KV_HND"):
+        # Q is 3D: [tokens, H, D], Paged KV (HND after any transpose): [num_pages, H_kv, page_size, D]
         num_qo_heads = query.shape[1]
         page_size = k_cache.shape[2]
         head_dim_v = v_cache.shape[3]
@@ -4198,7 +4194,7 @@ def trtllm_fmha_v2_prefill(
     # TRT-LLM kernel expects separate K and V block offset arrays.
     # FlashInfer layout: K for page i is at block index 2*i, V at 2*i+1
     expanded_block_tables = None
-    if block_tables is not None and input_layout.lower() == "q_paged_kv":
+    if block_tables is not None and input_layout.lower().startswith("q_paged_kv"):
         # K offsets = page_idx * 2 (even blocks)
         # V offsets = page_idx * 2 + 1 (odd blocks)
         expanded_block_tables = torch.stack(
