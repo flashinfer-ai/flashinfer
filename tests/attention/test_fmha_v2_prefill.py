@@ -1,6 +1,7 @@
 import pytest
 import torch
 import math
+from typing import Optional, Tuple, Union
 
 import flashinfer
 from flashinfer.prefill import fmha_v2_prefill_deepseek
@@ -8,14 +9,14 @@ from tests.utils_fp8 import to_float8
 from flashinfer.utils import is_sm120a_supported, is_sm121a_supported
 
 
-def attention_ref(
-    batch_size,
+def attention_mla_ref_torch(
+    batch_size: int,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     causal: bool,
     sm_scale: float,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     # tensors are (batch_size, seq_len, num_heads, head_dim)
     qo_len = q.shape[1]
     kv_len = k.shape[1]
@@ -42,7 +43,7 @@ def attention_ref(
 
 
 def attention_ref_torch(
-    qkv,
+    qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
     seq_lens: torch.Tensor,
     cum_seq_lens_q: torch.Tensor,
     sm_scale: float,
@@ -52,10 +53,10 @@ def attention_ref_torch(
     causal: bool = True,
     window_left: int = -1,
     logits_soft_cap: float = 0.0,
-    block_tables: torch.Tensor = None,
-    cum_seq_lens_kv: torch.Tensor = None,
+    block_tables: Optional[torch.Tensor] = None,
+    cum_seq_lens_kv: Optional[torch.Tensor] = None,
     return_lse: bool = False,
-):
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Pure-torch reference for attention supporting multiple input layouts.
 
@@ -187,6 +188,133 @@ def attention_ref_torch(
     return out
 
 
+def chunked_attention_ref_torch(
+    qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+    seq_lens: torch.Tensor,
+    cum_seq_lens_q: torch.Tensor,
+    sm_scale: float,
+    chunked_attention_size: int,
+    cum_seq_lens_kv: Optional[torch.Tensor] = None,
+    block_tables: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Pure-torch reference for chunked causal attention.
+
+    Chunked attention divides the KV-space into non-overlapping chunks of
+    ``chunked_attention_size`` tokens.  Each query token (mapped to its absolute
+    KV-space position) can only attend causally *within its own chunk*.
+
+    For a query at absolute KV position ``row``:
+        chunk_start = floor(row / chunk_size) * chunk_size
+        mask: chunk_start <= col <= row
+
+    This matches the TRT-LLM FMHAv2 kernel logic in
+    ``csrc/fmha_v2/fmha/warpspec/epilogue.h:compute_sliding_window_or_chunk_start``.
+    """
+    device = seq_lens.device
+    batch_size = seq_lens.shape[0]
+
+    if cum_seq_lens_kv is None:
+        cum_seq_lens_kv = cum_seq_lens_q
+
+    # --- parse input layout ---
+    is_paged = False
+    if isinstance(qkv, torch.Tensor):
+        q_flat = qkv[:, 0, :, :].contiguous()
+        k_flat = qkv[:, 1, :, :].contiguous()
+        v_flat = qkv[:, 2, :, :].contiguous()
+    elif isinstance(qkv, tuple):
+        if len(qkv) == 3:
+            q_flat, k_flat, v_flat = qkv
+        elif len(qkv) == 2:
+            q_flat = qkv[0]
+            second = qkv[1]
+            if second.ndim == 5:
+                is_paged = True
+                paged_kv_cache = second
+                page_size = paged_kv_cache.shape[2]
+            else:
+                k_flat = second[:, 0, :, :].contiguous()
+                v_flat = second[:, 1, :, :].contiguous()
+        else:
+            raise ValueError(f"Unexpected tuple length: {len(qkv)}")
+    else:
+        raise TypeError(f"Unexpected qkv type: {type(qkv)}")
+
+    num_qo_heads = q_flat.shape[1]
+    head_dim = q_flat.shape[2]
+    if is_paged:
+        num_kv_heads = paged_kv_cache.shape[3]
+    else:
+        num_kv_heads = k_flat.shape[1]
+    heads_per_group = num_qo_heads // num_kv_heads
+
+    q_float = q_flat.float()
+
+    outputs = []
+    for b in range(batch_size):
+        kv_len = seq_lens[b].item()
+        q_start = cum_seq_lens_q[b].item()
+        q_end = cum_seq_lens_q[b + 1].item()
+        q_len = q_end - q_start
+        q_seq = q_float[q_start:q_end]
+
+        if is_paged:
+            num_pages_needed = (kv_len + page_size - 1) // page_size
+            k_pages = []
+            v_pages = []
+            for p in range(num_pages_needed):
+                page_idx = block_tables[b, p].item()
+                k_pages.append(paged_kv_cache[page_idx, 0])
+                v_pages.append(paged_kv_cache[page_idx, 1])
+            k_seq = torch.cat(k_pages, dim=0)[:kv_len].float()
+            v_seq = torch.cat(v_pages, dim=0)[:kv_len].float()
+        else:
+            kv_start = cum_seq_lens_kv[b].item()
+            kv_end = cum_seq_lens_kv[b + 1].item()
+            k_seq = k_flat[kv_start:kv_end].float()
+            v_seq = v_flat[kv_start:kv_end].float()
+
+        o_seq = torch.zeros(
+            q_len, num_qo_heads, head_dim, dtype=torch.float32, device=device
+        )
+
+        # Absolute KV-space positions for each query token.
+        # Query token i corresponds to KV position (kv_len - q_len + i).
+        offset = kv_len - q_len
+
+        for h in range(num_qo_heads):
+            kv_h = h // heads_per_group
+            q_h = q_seq[:, h, :]
+            k_h = k_seq[:, kv_h, :]
+            v_h = v_seq[:, kv_h, :]
+
+            # scores: [q_len, kv_len]
+            scores = torch.matmul(q_h, k_h.t()) * sm_scale
+
+            # Build chunked causal mask.
+            # q_abs[i] = offset + i  (absolute KV-space row for query token i)
+            # kv_pos[j] = j           (KV column index)
+            q_abs = torch.arange(q_len, device=device).unsqueeze(1) + offset
+            kv_pos = torch.arange(kv_len, device=device).unsqueeze(0)
+
+            # Causal: col <= row
+            causal_mask = kv_pos <= q_abs
+
+            # Chunk left boundary: col >= floor(row / chunk_size) * chunk_size
+            chunk_start = (q_abs // chunked_attention_size) * chunked_attention_size
+            chunk_mask = kv_pos >= chunk_start
+
+            mask = causal_mask & chunk_mask
+            scores = scores.masked_fill(~mask, float("-inf"))
+
+            attn = torch.softmax(scores, dim=-1)
+            o_seq[:, h, :] = torch.matmul(attn, v_h)
+
+        outputs.append(o_seq)
+
+    return torch.cat(outputs, dim=0)
+
+
 @pytest.mark.parametrize("batch_size", [8])
 @pytest.mark.parametrize("num_heads", [8])
 @pytest.mark.parametrize("head_dim_qk", [192])
@@ -201,8 +329,14 @@ def attention_ref_torch(
     ],
 )
 def test_fmha_v2_prefill_deepseek(
-    batch_size, num_heads, head_dim_qk, head_dim_v, seq_len, qkv_dtype, o_dtype
-):
+    batch_size: int,
+    num_heads: int,
+    head_dim_qk: int,
+    head_dim_v: int,
+    seq_len: int,
+    qkv_dtype: torch.dtype,
+    o_dtype: torch.dtype,
+) -> None:
     if not (
         is_sm120a_supported(torch.device("cuda"))
         or is_sm121a_supported(torch.device("cuda"))
@@ -210,7 +344,19 @@ def test_fmha_v2_prefill_deepseek(
         pytest.skip("fmha_v2_prefill_deepseek is only supported on SM12x GPUs.")
     torch.manual_seed(42)
 
-    def initialize_tensors(batch_size, num_heads, head_dim_qk, head_dim_v, seq_len):
+    def initialize_tensors(
+        batch_size: int, num_heads: int, head_dim_qk: int, head_dim_v: int, seq_len: int
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        float,
+        float,
+        float,
+        float,
+    ]:
         device = "cuda"
         if qkv_dtype == torch.float8_e4m3fn:
             q = torch.randn(
@@ -299,11 +445,11 @@ def test_fmha_v2_prefill_deepseek(
         q_32 = q.to(torch.float32) * q_scale
         k_32 = k.to(torch.float32) * k_scale
         v_32 = v.to(torch.float32) * v_scale
-        out_ref, lse_ref = attention_ref(
+        out_ref, lse_ref = attention_mla_ref_torch(
             batch_size, q_32, k_32, v_32, causal=True, sm_scale=sm_scale
         )
     else:
-        out_ref, lse_ref = attention_ref(
+        out_ref, lse_ref = attention_mla_ref_torch(
             batch_size, q, k, v, causal=True, sm_scale=sm_scale
         )
         out_ref = out_ref.to(o.dtype)
@@ -321,25 +467,25 @@ def test_fmha_v2_prefill_deepseek(
 
 
 def run_trtllm_fmha_v2_prefill_case(
-    input_layout,
-    batch_size,
-    max_seq_len,
-    num_qo_heads,
-    num_kv_heads,
-    head_dim,
-    page_size,
-    dtype,
-    o_dtype,
-    causal,
-    mask_mode,
-    window_left,
-    logits_soft_cap,
-    pos_encoding_mode,
-    save_softmax_stats,
-    skip_softmax_threshold_scale_factor,
-    rtol=None,
-    atol=None,
-):
+    input_layout: str,
+    batch_size: int,
+    max_seq_len: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    page_size: Optional[int],
+    dtype: torch.dtype,
+    o_dtype: torch.dtype,
+    causal: bool,
+    mask_mode: str,
+    window_left: int,
+    logits_soft_cap: float,
+    pos_encoding_mode: Optional[str],
+    save_softmax_stats: bool,
+    skip_softmax_threshold_scale_factor: float,
+    rtol: Optional[float] = None,
+    atol: Optional[float] = None,
+) -> None:
     from flashinfer.prefill import trtllm_fmha_v2_prefill
     from flashinfer.utils import is_sm90a_supported
 
@@ -637,22 +783,22 @@ def run_trtllm_fmha_v2_prefill_case(
 @pytest.mark.parametrize("pos_encoding_mode", ["NONE"])
 @pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
 def test_trtllm_fmha_v2_prefill(
-    input_layout,
-    batch_size,
-    max_seq_len,
-    num_qo_heads,
-    num_kv_heads,
-    head_dim,
-    page_size,
-    dtype,
-    o_dtype,
-    causal,
-    mask_mode,
-    window_left,
-    logits_soft_cap,
-    pos_encoding_mode,
-    save_softmax_stats,
-):
+    input_layout: str,
+    batch_size: int,
+    max_seq_len: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    page_size: Optional[int],
+    dtype: torch.dtype,
+    o_dtype: torch.dtype,
+    causal: bool,
+    mask_mode: str,
+    window_left: int,
+    logits_soft_cap: float,
+    pos_encoding_mode: str,
+    save_softmax_stats: bool,
+) -> None:
     run_trtllm_fmha_v2_prefill_case(
         input_layout=input_layout,
         batch_size=batch_size,
@@ -699,18 +845,18 @@ def test_trtllm_fmha_v2_prefill(
     ],
 )
 def test_trtllm_fmha_v2_prefill_skip_softmax(
-    input_layout,
-    batch_size,
-    max_seq_len,
-    num_qo_heads,
-    num_kv_heads,
-    head_dim,
-    dtype,
-    o_dtype,
-    skip_softmax_threshold_scale_factor,
-    rtol,
-    atol,
-):
+    input_layout: str,
+    batch_size: int,
+    max_seq_len: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    o_dtype: torch.dtype,
+    skip_softmax_threshold_scale_factor: float,
+    rtol: float,
+    atol: float,
+) -> None:
     run_trtllm_fmha_v2_prefill_case(
         input_layout=input_layout,
         batch_size=batch_size,
@@ -749,17 +895,17 @@ def test_trtllm_fmha_v2_prefill_skip_softmax(
 )
 @pytest.mark.parametrize("pos_encoding_mode", ["NONE"])
 def test_trtllm_fmha_v2_prefill_attention_sinks(
-    batch_size,
-    max_seq_len,
-    num_qo_heads,
-    num_kv_heads,
-    head_dim,
-    dtype,
-    causal,
-    window_left,
-    mask_mode,
-    pos_encoding_mode,
-):
+    batch_size: int,
+    max_seq_len: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    causal: bool,
+    window_left: int,
+    mask_mode: str,
+    pos_encoding_mode: str,
+) -> None:
     """
     Test trtllm_fmha_v2_prefill with attention sinks.
     Compares against BatchAttentionWithAttentionSinkWrapper as reference.
@@ -863,6 +1009,288 @@ def test_trtllm_fmha_v2_prefill_attention_sinks(
         kv_data_type=dtype,
     )
     output_ref = wrapper_ref.run(q, (k, v), sink, sm_scale)
+
+    rtol, atol = 1e-2, 1e-2
+    torch.testing.assert_close(output.float(), output_ref.float(), rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("max_seq_len", [1024, 4096])
+@pytest.mark.parametrize("num_qo_heads", [4, 32])
+@pytest.mark.parametrize("num_kv_heads", [4])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    ("input_layout", "page_size"),
+    [
+        ("CONTIGUOUS_Q_KV", None),
+        ("SEPARATE_Q_K_V", None),
+        ("Q_PAGED_KV", 32),
+    ],
+)
+@pytest.mark.parametrize("chunked_attention_size", [64, 256])
+def test_trtllm_fmha_v2_prefill_chunked_attention(
+    batch_size: int,
+    max_seq_len: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    input_layout: str,
+    page_size: Optional[int],
+    chunked_attention_size: int,
+) -> None:
+    """Test trtllm_fmha_v2_prefill with chunked attention mask against a
+    pure-PyTorch reference that builds the exact same mask pattern.
+
+    Chunked attention divides the KV-space into fixed-size, non-overlapping
+    chunks.  Each query token can only attend causally within its chunk.
+    """
+    from flashinfer.prefill import trtllm_fmha_v2_prefill
+    from flashinfer.utils import is_sm90a_supported
+
+    if not is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("FMHA v2 requires SM90+ (Hopper) GPUs.")
+
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+
+    # --- Generate per-sequence lengths ---
+    seq_lens = torch.randint(
+        max_seq_len // 2,
+        max_seq_len + 1,
+        (batch_size,),
+        dtype=torch.int32,
+        device=device,
+    )
+    max_kv_len = seq_lens.max().item()
+    cum_seq_lens = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    cum_seq_lens[1:] = torch.cumsum(seq_lens, dim=0)
+    total_tokens = cum_seq_lens[-1].item()
+
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    block_tables = None
+
+    # --- Create inputs per layout ---
+    if input_layout == "SEPARATE_Q_K_V":
+        q = torch.randn(
+            total_tokens, num_qo_heads, head_dim, dtype=dtype, device=device
+        )
+        k = torch.randn(
+            total_tokens, num_kv_heads, head_dim, dtype=dtype, device=device
+        )
+        v = torch.randn(
+            total_tokens, num_kv_heads, head_dim, dtype=dtype, device=device
+        )
+        qkv_arg = (q, k, v)
+
+    elif input_layout == "CONTIGUOUS_Q_KV":
+        q = torch.randn(
+            total_tokens, num_qo_heads, head_dim, dtype=dtype, device=device
+        )
+        kv = torch.randn(
+            total_tokens, 2, num_kv_heads, head_dim, dtype=dtype, device=device
+        )
+        qkv_arg = (q, kv)
+
+    elif input_layout == "Q_PAGED_KV":
+        max_num_blocks = (max_kv_len + page_size - 1) // page_size
+        num_pages = batch_size * max_num_blocks
+        paged_kv_cache = torch.randn(
+            num_pages,
+            2,
+            page_size,
+            num_kv_heads,
+            head_dim,
+            dtype=dtype,
+            device=device,
+        )
+        q = torch.randn(
+            total_tokens, num_qo_heads, head_dim, dtype=dtype, device=device
+        )
+        block_tables = torch.zeros(
+            batch_size,
+            max_num_blocks,
+            dtype=torch.int32,
+            device=device,
+        )
+        for i in range(batch_size):
+            num_blocks_needed = (seq_lens[i].item() + page_size - 1) // page_size
+            block_tables[i, :num_blocks_needed] = torch.arange(
+                i * max_num_blocks,
+                i * max_num_blocks + num_blocks_needed,
+                device=device,
+            )
+        qkv_arg = (q, paged_kv_cache)
+    else:
+        raise ValueError(f"Unsupported input_layout: {input_layout}")
+
+    bmm1_scale = sm_scale
+    bmm2_scale = 1.0
+
+    workspace_buffer = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+
+    # --- Run kernel with chunked attention ---
+    output = trtllm_fmha_v2_prefill(
+        qkv_arg,
+        workspace_buffer=workspace_buffer,
+        seq_lens=seq_lens,
+        max_q_len=max_kv_len,
+        max_kv_len=max_kv_len,
+        bmm1_scale=bmm1_scale,
+        bmm2_scale=bmm2_scale,
+        batch_size=batch_size,
+        cum_seq_lens_q=cum_seq_lens,
+        cum_seq_lens_kv=cum_seq_lens,
+        block_tables=block_tables,
+        out_dtype=dtype,
+        kv_layout="NHD",
+        mask_mode="chunked",
+        chunked_attention_size=chunked_attention_size,
+    )
+
+    # --- Reference ---
+    output_ref = chunked_attention_ref_torch(
+        qkv_arg,
+        seq_lens=seq_lens,
+        cum_seq_lens_q=cum_seq_lens,
+        sm_scale=sm_scale,
+        chunked_attention_size=chunked_attention_size,
+        block_tables=block_tables,
+    )
+
+    rtol, atol = 1e-2, 1e-2
+    torch.testing.assert_close(output.float(), output_ref.float(), rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("max_kv_len", [1024, 4096])
+@pytest.mark.parametrize("max_new_tokens", [64, 256])
+@pytest.mark.parametrize("num_qo_heads", [4, 32])
+@pytest.mark.parametrize("num_kv_heads", [4])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("page_size", [32, 128])
+@pytest.mark.parametrize("chunked_attention_size", [64, 256])
+def test_trtllm_fmha_v2_chunked_prefill_chunked_attention(
+    batch_size: int,
+    max_kv_len: int,
+    max_new_tokens: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    page_size: int,
+    chunked_attention_size: int,
+) -> None:
+    """Test chunked prefill (Q < KV) with chunked attention mask on paged KV cache.
+
+    Each sequence has kv_len total tokens in the paged KV cache but only q_len
+    new query tokens.  The chunked attention mask divides the KV-space into
+    non-overlapping blocks of ``chunked_attention_size`` and restricts each
+    query to attend causally within its own block.
+
+    Uses Q_PAGED_KV layout only.  The non-paged layouts (CONTIGUOUS_Q_KV,
+    SEPARATE_Q_K_V) have a known kernel issue with chunked attention mask when
+    past_kv_length >= STEP_Q (64).
+    """
+    from flashinfer.prefill import trtllm_fmha_v2_prefill
+    from flashinfer.utils import is_sm90a_supported
+
+    if not is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("FMHA v2 requires SM90+ (Hopper) GPUs.")
+
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+
+    # --- Generate per-sequence KV and Q lengths (Q < KV) ---
+    kv_seq_lens = torch.randint(
+        max_kv_len // 2,
+        max_kv_len + 1,
+        (batch_size,),
+        dtype=torch.int32,
+        device=device,
+    )
+    q_seq_lens = torch.randint(
+        max(1, max_new_tokens // 2),
+        max_new_tokens + 1,
+        (batch_size,),
+        dtype=torch.int32,
+        device=device,
+    )
+    q_seq_lens = torch.minimum(q_seq_lens, kv_seq_lens)
+
+    actual_max_kv_len = kv_seq_lens.max().item()
+    actual_max_q_len = q_seq_lens.max().item()
+
+    cum_seq_lens_kv = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    cum_seq_lens_kv[1:] = torch.cumsum(kv_seq_lens, dim=0)
+
+    cum_seq_lens_q = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    cum_seq_lens_q[1:] = torch.cumsum(q_seq_lens, dim=0)
+    total_q_tokens = cum_seq_lens_q[-1].item()
+
+    sm_scale = 1.0 / math.sqrt(head_dim)
+
+    # --- Create paged KV cache and query ---
+    max_num_blocks = (actual_max_kv_len + page_size - 1) // page_size
+    num_pages = batch_size * max_num_blocks
+    paged_kv_cache = torch.randn(
+        num_pages,
+        2,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        dtype=dtype,
+        device=device,
+    )
+    q = torch.randn(total_q_tokens, num_qo_heads, head_dim, dtype=dtype, device=device)
+    block_tables = torch.zeros(
+        batch_size,
+        max_num_blocks,
+        dtype=torch.int32,
+        device=device,
+    )
+    for i in range(batch_size):
+        num_blocks_needed = (kv_seq_lens[i].item() + page_size - 1) // page_size
+        block_tables[i, :num_blocks_needed] = torch.arange(
+            i * max_num_blocks,
+            i * max_num_blocks + num_blocks_needed,
+            device=device,
+        )
+    qkv_arg = (q, paged_kv_cache)
+
+    workspace_buffer = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+
+    # --- Run kernel ---
+    output = trtllm_fmha_v2_prefill(
+        qkv_arg,
+        workspace_buffer=workspace_buffer,
+        seq_lens=kv_seq_lens,
+        max_q_len=actual_max_q_len,
+        max_kv_len=actual_max_kv_len,
+        bmm1_scale=sm_scale,
+        bmm2_scale=1.0,
+        batch_size=batch_size,
+        cum_seq_lens_q=cum_seq_lens_q,
+        cum_seq_lens_kv=cum_seq_lens_kv,
+        block_tables=block_tables,
+        out_dtype=dtype,
+        kv_layout="NHD",
+        mask_mode="chunked",
+        chunked_attention_size=chunked_attention_size,
+    )
+
+    # --- Reference ---
+    output_ref = chunked_attention_ref_torch(
+        qkv_arg,
+        seq_lens=kv_seq_lens,
+        cum_seq_lens_q=cum_seq_lens_q,
+        sm_scale=sm_scale,
+        chunked_attention_size=chunked_attention_size,
+        cum_seq_lens_kv=cum_seq_lens_kv,
+        block_tables=block_tables,
+    )
 
     rtol, atol = 1e-2, 1e-2
     torch.testing.assert_close(output.float(), output_ref.float(), rtol=rtol, atol=atol)

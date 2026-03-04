@@ -3937,7 +3937,7 @@ def trtllm_fmha_v2_prefill(
     chunked_attention_size: Optional[int] = 0,
     save_softmax_stats: Optional[bool] = False,
     skip_softmax_threshold_scale_factor: Optional[float] = 0,
-) -> torch.Tensor:
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""TRT-LLM FMHAv2 prefill attention.
 
     Parameters
