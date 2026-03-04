@@ -1632,8 +1632,10 @@ Array<Tensor> trtllm_bf16_moe(Optional<TensorView> const& routing_logits,
   // Calculate supported tile sizes
   std::vector<int32_t> mSupportedTileN(Bf16MoeLauncher::mSupportedTileNums.begin(),
                                        Bf16MoeLauncher::mSupportedTileNums.end());
-  std::set<int32_t> selected_tile_nums =
-      computeSelectedTileN(mSupportedTileN, num_tokens, top_k, local_num_experts);
+  // Build launchers for ALL supported tiles (not just the computeSelectedTileN subset)
+  // so that autotuner-cached tactics always find their tile_N in the map.
+  // Launcher creation is cheap (no GPU allocation until run()), so this is safe.
+  std::set<int32_t> selected_tile_nums(mSupportedTileN.begin(), mSupportedTileN.end());
 
   // Create a map of launchers for each tile size
   std::unordered_map<int32_t, std::unique_ptr<Bf16MoeLauncher>> launchers_map;
@@ -1670,9 +1672,9 @@ Array<Tensor> trtllm_bf16_moe(Optional<TensorView> const& routing_logits,
   int64_t tile_N = moe_tactic[0];
   int64_t config = moe_tactic[1];
 
-  // Handle default case or stale autotuner cache (tile_N not in current selected set)
-  if (tile_N == -1 || config == -1 || launchers_map.find(tile_N) == launchers_map.end()) {
-    tile_N = *selected_tile_nums.begin();
+  // Handle default case
+  if (tile_N == -1 || config == -1) {
+    tile_N = *computeSelectedTileN(mSupportedTileN, num_tokens, top_k, local_num_experts).begin();
     config = -1;  // Let the runner choose default
   }
 
@@ -1725,8 +1727,8 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
   // Calculate supported tile sizes
   std::vector<int32_t> mSupportedTileN(Fp8PerTensorLauncher::mSupportedTileNums.begin(),
                                        Fp8PerTensorLauncher::mSupportedTileNums.end());
-  std::set<int32_t> selected_tile_nums =
-      computeSelectedTileN(mSupportedTileN, num_tokens, top_k, local_num_experts);
+  // Build launchers for ALL supported tiles so autotuner-cached tactics always find their tile_N.
+  std::set<int32_t> selected_tile_nums(mSupportedTileN.begin(), mSupportedTileN.end());
 
   // Create a map of launchers for each tile size
   std::unordered_map<int32_t, std::unique_ptr<Fp8PerTensorLauncher>> launchers_map;
@@ -1763,9 +1765,9 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
   int64_t tile_N = config_index[0];
   int64_t config = config_index[1];
 
-  // Handle default case or stale autotuner cache (tile_N not in current selected set)
-  if (tile_N == -1 || config == -1 || launchers_map.find(tile_N) == launchers_map.end()) {
-    tile_N = *selected_tile_nums.begin();
+  // Handle default case
+  if (tile_N == -1 || config == -1) {
+    tile_N = *computeSelectedTileN(mSupportedTileN, num_tokens, top_k, local_num_experts).begin();
     config = -1;  // Let the runner choose default
   }
 
@@ -1846,8 +1848,8 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
   auto const hidden_size = hidden_states.size(1);
 
   auto supported_tile_nums = Fp8BlockScaleLauncher::getSupportedTileNums(quantization_type);
-  std::set<int32_t> selected_tile_nums =
-      computeSelectedTileN(supported_tile_nums, num_tokens, top_k, local_num_experts);
+  // Build launchers for ALL supported tiles so autotuner-cached tactics always find their tile_N.
+  std::set<int32_t> selected_tile_nums(supported_tile_nums.begin(), supported_tile_nums.end());
 
   // Create a map of launchers for each tile size
   std::unordered_map<int32_t, std::unique_ptr<Fp8BlockScaleLauncher>> launchers_map;
@@ -1885,9 +1887,10 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
   int64_t tile_N = config_index[0];
   int64_t config = config_index[1];
 
-  // Handle default case or stale autotuner cache (tile_N not in current selected set)
-  if (tile_N == -1 || config == -1 || launchers_map.find(tile_N) == launchers_map.end()) {
-    tile_N = *selected_tile_nums.begin();
+  // Handle default case
+  if (tile_N == -1 || config == -1) {
+    tile_N =
+        *computeSelectedTileN(supported_tile_nums, num_tokens, top_k, local_num_experts).begin();
     config = -1;  // Let the runner choose default
   }
 
@@ -1988,8 +1991,8 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
 
   // Determine supported tile sizes
   std::vector<int32_t> mSupportedTileN = FP4BlockScaleLauncher::getSupportedTileNums(mDtypeAct);
-  std::set<int32_t> selected_tile_nums =
-      computeSelectedTileN(mSupportedTileN, num_tokens, top_k, local_num_experts);
+  // Build launchers for ALL supported tiles so autotuner-cached tactics always find their tile_N.
+  std::set<int32_t> selected_tile_nums(mSupportedTileN.begin(), mSupportedTileN.end());
 
   // Create a map of launchers for each tile size
   std::unordered_map<int32_t, std::unique_ptr<FP4BlockScaleLauncher>> launchers_map;
@@ -2030,9 +2033,9 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
   int64_t tile_N = config_index[0];
   int64_t config = config_index[1];
 
-  // Handle default case or stale autotuner cache (tile_N not in current selected set)
-  if (tile_N == -1 || config == -1 || launchers_map.find(tile_N) == launchers_map.end()) {
-    tile_N = *selected_tile_nums.begin();
+  // Handle default case
+  if (tile_N == -1 || config == -1) {
+    tile_N = *computeSelectedTileN(mSupportedTileN, num_tokens, top_k, local_num_experts).begin();
     config = -1;  // Let the runner choose default
   }
 
@@ -2081,8 +2084,8 @@ Array<Tensor> trtllm_mxint4_block_scale_moe(
   // Determine supported tile sizes
   std::vector<int32_t> mSupportedTileN(MxInt4BlockScaleLauncher::mSupportedTileNums.begin(),
                                        MxInt4BlockScaleLauncher::mSupportedTileNums.end());
-  std::set<int32_t> selected_tile_nums =
-      computeSelectedTileN(mSupportedTileN, num_tokens, top_k, local_num_experts);
+  // Build launchers for ALL supported tiles so autotuner-cached tactics always find their tile_N.
+  std::set<int32_t> selected_tile_nums(mSupportedTileN.begin(), mSupportedTileN.end());
 
   // Create a map of launchers for each tile size
   std::unordered_map<int32_t, std::unique_ptr<MxInt4BlockScaleLauncher>> launchers_map;
@@ -2119,9 +2122,9 @@ Array<Tensor> trtllm_mxint4_block_scale_moe(
   int64_t tile_N = config_index[0];
   int64_t config = config_index[1];
 
-  // Handle default case or stale autotuner cache (tile_N not in current selected set)
-  if (tile_N == -1 || config == -1 || launchers_map.find(tile_N) == launchers_map.end()) {
-    tile_N = *selected_tile_nums.begin();
+  // Handle default case
+  if (tile_N == -1 || config == -1) {
+    tile_N = *computeSelectedTileN(mSupportedTileN, num_tokens, top_k, local_num_experts).begin();
     config = -1;  // Let the runner choose default
   }
 
