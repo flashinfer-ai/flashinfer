@@ -362,7 +362,15 @@ void trtllm_paged_attention_decode(
     Optional<TensorView> cum_seq_lens_q, Optional<float> skip_softmax_threshold_scale_factor) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
-  TVM_FFI_ICHECK_EQ(block_tables.ndim(), 2) << "block_tables must be a 2D tensor";
+  if (sparse_mla_top_k > 0) {
+    TVM_FFI_ICHECK_EQ(block_tables.ndim(), 3) << "block_tables must be a 3D tensor for sparse MLA";
+    TVM_FFI_ICHECK_EQ(block_tables.size(1), max_q_len)
+        << "For sparse MLA, block_tables.size(1) must match max_q_len";
+    TVM_FFI_ICHECK_EQ(block_tables.size(2), sparse_mla_top_k)
+        << "For sparse MLA, block_tables.size(2) must match sparse_mla_top_k";
+  } else {
+    TVM_FFI_ICHECK_EQ(block_tables.ndim(), 2) << "block_tables must be a 2D tensor";
+  }
   TVM_FFI_ICHECK_EQ(block_tables.dtype(), dl_int32) << "block_tables must be int32";
   TVM_FFI_ICHECK_EQ(seq_lens.ndim(), 1) << "seq_lens must be a 1D tensor";
   TVM_FFI_ICHECK_EQ(seq_lens.dtype(), dl_int32) << "seq_lens must be int32";
@@ -452,10 +460,12 @@ void trtllm_paged_attention_decode(
       skip_softmax_threshold_scale_factor.value_or(0.0f);
   bool const skips_softmax = skip_softmax_threshold_scale_factor_value != 0.0f;
 
-  maybe_sanitize_trtllm_swa_block_tables_inplace(
-      block_tables, seq_lens, cum_seq_lens_q_ptr, cum_seq_lens_q_size, batch_size,
-      max_num_blocks_per_seq, max_kv_len, max_q_len, page_size, window_left, num_pages_in_mem_pool,
-      stream);
+  if (sparse_mla_top_k <= 0) {
+    maybe_sanitize_trtllm_swa_block_tables_inplace(
+        block_tables, seq_lens, cum_seq_lens_q_ptr, cum_seq_lens_q_size, batch_size,
+        max_num_blocks_per_seq, max_kv_len, max_q_len, page_size, window_left,
+        num_pages_in_mem_pool, stream);
+  }
 
   trtllm_paged_attention_launcher(
       out.data_ptr(), output_sf_ptr, query.data_ptr(), key_cache.data_ptr(), value_cache.data_ptr(),
