@@ -6,7 +6,7 @@ from typing import Optional, Tuple, Union
 import flashinfer
 from flashinfer.prefill import fmha_v2_prefill_deepseek
 from tests.utils_fp8 import to_float8
-from flashinfer.utils import is_sm120a_supported, is_sm121a_supported
+from flashinfer.utils import is_sm12x_supported
 
 
 def attention_mla_ref_torch(
@@ -329,34 +329,13 @@ def chunked_attention_ref_torch(
     ],
 )
 def test_fmha_v2_prefill_deepseek(
-    batch_size: int,
-    num_heads: int,
-    head_dim_qk: int,
-    head_dim_v: int,
-    seq_len: int,
-    qkv_dtype: torch.dtype,
-    o_dtype: torch.dtype,
-) -> None:
-    if not (
-        is_sm120a_supported(torch.device("cuda"))
-        or is_sm121a_supported(torch.device("cuda"))
-    ):
+    batch_size, num_heads, head_dim_qk, head_dim_v, seq_len, qkv_dtype, o_dtype
+):
+    if not is_sm12x_supported(torch.device("cuda")):
         pytest.skip("fmha_v2_prefill_deepseek is only supported on SM12x GPUs.")
     torch.manual_seed(42)
 
-    def initialize_tensors(
-        batch_size: int, num_heads: int, head_dim_qk: int, head_dim_v: int, seq_len: int
-    ) -> Tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        float,
-        float,
-        float,
-        float,
-    ]:
+    def initialize_tensors(batch_size, num_heads, head_dim_qk, head_dim_v, seq_len):
         device = "cuda"
         if qkv_dtype == torch.float8_e4m3fn:
             q = torch.randn(
@@ -432,7 +411,6 @@ def test_fmha_v2_prefill_deepseek(
         return_lse=True,
         lse=lse,
     )
-
     # implementation gives [max(s_i), sum(exp(s_i - max(s_i)))], compute lse from this
     if qkv_dtype == torch.float8_e4m3fn:
         # For E4M3 the softmax is scaled by 256 (the largest power-of-2 below E4M3_MAX=448.0)
