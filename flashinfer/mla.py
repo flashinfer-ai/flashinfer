@@ -769,6 +769,9 @@ def xqa_batch_decode_with_kv_cache_mla(
         raise ValueError(
             f"XQA MLA only supports q_len_per_request == 1, got {q_len_per_request}"
         )
+    cc = get_compute_capability(query.device)
+    if cc[0] != 12:
+        raise ValueError("XQA MLA BF16 is only supported on SM120/SM121 GPUs")
     fp8_ok = (
         query.dtype == torch.float8_e4m3fn and kv_cache.dtype == torch.float8_e4m3fn
     )
