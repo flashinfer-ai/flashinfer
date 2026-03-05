@@ -6,11 +6,7 @@ flashinfer's bench_gpu_time utility with CUPTI for accurate GPU timing.
 
 Usage:
     python benchmarks/bench_fused_rmsnorm_silu.py
-    python benchmarks/bench_fused_rmsnorm_silu.py --enable-cupti
-    python benchmarks/bench_fused_rmsnorm_silu.py --use-cuda-graph
 """
-
-import argparse
 
 import numpy as np
 import torch
@@ -23,26 +19,16 @@ TOKEN_VALUES = [1560, 6240, 24960, 99840, 399360]
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark fused_rmsnorm_silu")
-    parser.add_argument("--enable-cupti", action="store_true", help="Use CUPTI for accurate GPU timing")
-    parser.add_argument("--use-cuda-graph", action="store_true", help="Use CUDA graph for reduced launch overhead")
-    parser.add_argument("--C", type=int, nargs="+", default=None, help="Hidden dims to test (default: all)")
-    parser.add_argument("--tokens", type=int, nargs="+", default=None, help="Token counts to test (default: all)")
-    args = parser.parse_args()
-
-    c_values = args.C or C_VALUES
-    token_values = args.tokens or TOKEN_VALUES
-
     device = torch.cuda.current_device()
     print(f"GPU: {torch.cuda.get_device_name(device)}")
     print(f"SM: {torch.cuda.get_device_capability(device)}")
-    print(f"Timing: {'CUPTI' if args.enable_cupti else 'CUDA graph' if args.use_cuda_graph else 'CUDA events'}")
+    print(f"Timing: CUPTI, dry_run=10, repeat=30")
     print()
     print(f"{'C':>6}  {'tokens':>8}  {'elements':>12}  {'median_ms':>10}  {'min_ms':>10}  {'GB/s':>8}")
     print("-" * 65)
 
-    for C in c_values:
-        for num_tokens in token_values:
+    for C in C_VALUES:
+        for num_tokens in TOKEN_VALUES:
             x = torch.randn(num_tokens, C, dtype=torch.bfloat16, device="cuda") * 5.0 + 5.0
             w = torch.rand(C, dtype=torch.bfloat16, device="cuda") * 1.5 + 0.5
             out = torch.empty_like(x)
@@ -53,8 +39,9 @@ def main():
 
             times = bench_gpu_time(
                 fn=lambda: flashinfer.fused_rmsnorm_silu(x, w, 1e-6, out=out),
-                enable_cupti=args.enable_cupti,
-                use_cuda_graph=args.use_cuda_graph,
+                enable_cupti=True,
+                dry_run_iters=10,
+                repeat_iters=30,
             )
 
             median_ms = np.median(times)
