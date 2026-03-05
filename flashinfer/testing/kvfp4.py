@@ -199,3 +199,53 @@ class KVFP4QuantizeUtil:
         dequantized = scaled.view(b, m, n) * global_scale
 
         return dequantized.to(dtype)
+
+    @staticmethod
+    def quantize_paged_kv_cache(
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+    ) -> tuple[
+        tuple[torch.Tensor, torch.Tensor],
+        tuple[torch.Tensor, torch.Tensor],
+        float,
+        float,
+    ]:
+        """Quantize paged KV cache (HND layout) to NVFP4 format with scale adjustment.
+
+        Takes BF16 K/V caches in HND layout, quantizes to NVFP4 with two-level scaling,
+        and applies the /6 block-scale and *6 global-scale adjustment for FP8 compute.
+
+        Args:
+            k_cache: Key cache, shape [num_pages, num_kv_heads, page_size, head_dim].
+            v_cache: Value cache, shape [num_pages, num_kv_heads, page_size, head_dim].
+
+        Returns:
+            kv_cache_fp4: Tuple of (k_fp4, v_fp4), each
+                [num_pages, num_kv_heads, page_size, head_dim//2] dtype=uint8.
+            kv_block_scales: Tuple of (k_scales, v_scales), each
+                [num_pages, num_kv_heads, page_size, head_dim//16] dtype=float8_e4m3fn.
+            k_global_scale: Adjusted global scale for K (float).
+            v_global_scale: Adjusted global scale for V (float).
+        """
+        num_pages, num_kv_heads, page_size, head_dim = k_cache.shape
+
+        k_flat = k_cache.reshape(num_pages, num_kv_heads * page_size, head_dim)
+        v_flat = v_cache.reshape(num_pages, num_kv_heads * page_size, head_dim)
+
+        k_packed, k_blk_scales, k_gs = KVFP4QuantizeUtil.batched_quantize(k_flat)
+        v_packed, v_blk_scales, v_gs = KVFP4QuantizeUtil.batched_quantize(v_flat)
+
+        # Adjust scales for FP8 compute: block_scale /= 6, global_scale *= 6
+        k_blk_scales = (k_blk_scales.float() / 6.0).to(torch.float8_e4m3fn)
+        v_blk_scales = (v_blk_scales.float() / 6.0).to(torch.float8_e4m3fn)
+
+        kv_cache_fp4 = (
+            k_packed.reshape(num_pages, num_kv_heads, page_size, head_dim // 2),
+            v_packed.reshape(num_pages, num_kv_heads, page_size, head_dim // 2),
+        )
+        kv_block_scales = (
+            k_blk_scales.reshape(num_pages, num_kv_heads, page_size, head_dim // 16),
+            v_blk_scales.reshape(num_pages, num_kv_heads, page_size, head_dim // 16),
+        )
+
+        return kv_cache_fp4, kv_block_scales, (k_gs * 6.0).item(), (v_gs * 6.0).item()
