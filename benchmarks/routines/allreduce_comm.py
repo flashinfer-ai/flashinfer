@@ -228,9 +228,7 @@ def _validate_allreduce(
         ref_norm_out = rmsnorm(ref_residual_out, norm_weight, eps, enable_pdl=False)
 
         try:
-            torch.testing.assert_close(
-                norm_out, ref_norm_out, atol=0.15, rtol=0.05
-            )
+            torch.testing.assert_close(norm_out, ref_norm_out, atol=0.15, rtol=0.05)
             torch.testing.assert_close(
                 residual_out, ref_residual_out, atol=0.05, rtol=0.05
             )
@@ -357,9 +355,7 @@ def _benchmark_single_config(
     all_times = comm.allgather(times)
 
     if rank == 0:
-        per_iter_max = [
-            max(t[i] for t in all_times) for i in range(num_measure_iters)
-        ]
+        per_iter_max = [max(t[i] for t in all_times) for i in range(num_measure_iters)]
         median_time = float(np.median(per_iter_max))
         std_time = float(np.std(per_iter_max))
 
@@ -461,7 +457,6 @@ def parse_allreduce_comm_args(line, parser):
 def test_allreduce_fusion(args):
     """Benchmark allreduce fusion across shapes, backends, and patterns."""
     comm, rank, world_size, local_rank = _setup_mpi_and_device()
-    device = torch.device("cuda")
     gpus_per_node = torch.cuda.device_count()
 
     if world_size < 2:
@@ -485,7 +480,6 @@ def test_allreduce_fusion(args):
     oneshot_list: List[Optional[bool]] = [True, False]
 
     # Initialize backends
-    mnnvl_initialized = False
     torch_dist_initialized = False
 
     needs_mnnvl = any(b in ("mnnvl", "auto") for b in backend_list)
@@ -494,7 +488,6 @@ def test_allreduce_fusion(args):
     if needs_mnnvl:
         try:
             MnnvlMemory.initialize()
-            mnnvl_initialized = True
         except Exception as e:
             if rank == 0:
                 print(f"[WARNING] MNNVL initialization failed: {e}")
@@ -615,4 +608,3 @@ def test_allreduce_fusion(args):
             _cleanup_torch_distributed()
 
     return res
-
