@@ -411,3 +411,67 @@ except ImportError:
     # CuTe-DSL not available
     rmsnorm_fp4quant = None  # type: ignore[misc,assignment]
     add_rmsnorm_fp4quant = None  # type: ignore[misc,assignment]
+
+
+# cuDNN OSS fused RMSNorm + SiLU engine (SM100+ Blackwell)
+try:
+    from .cudnn.norm import cudnn_fused_rmsnorm_silu as _cudnn_fused_rmsnorm_silu
+    from .cudnn.norm import _is_sm100_plus, CUDNN_AVAILABLE as _CUDNN_NORM_AVAILABLE
+except ImportError:
+    _cudnn_fused_rmsnorm_silu = None  # type: ignore[misc,assignment]
+    _is_sm100_plus = lambda: False
+    _CUDNN_NORM_AVAILABLE = False
+
+
+@flashinfer_api
+def fused_rmsnorm_silu(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Fused RMSNorm + SiLU activation.
+
+    ``out = SiLU(RMSNorm(input, weight, eps))``
+
+    where ``RMSNorm(x) = x / sqrt(mean(x^2) + eps) * weight``
+    and ``SiLU(y) = y * sigmoid(y)``.
+
+    Uses the cuDNN OSS engine on SM100+ (Blackwell) GPUs for optimal
+    performance. Falls back to unfused PyTorch operations on other GPUs.
+
+    Parameters
+    ----------
+    input: torch.Tensor
+        Input tensor, shape (num_tokens, hidden_size). Must be bf16.
+    weight: torch.Tensor
+        Weight tensor, shape (hidden_size,). Must be bf16.
+    eps: float
+        Epsilon for numerical stability.
+    out: Optional[torch.Tensor]
+        The output tensor, if specified, the kernel will update this tensor inplace.
+
+    Returns
+    -------
+    output: torch.Tensor
+        Output tensor, same shape and dtype as input.
+    """
+    if out is None:
+        out = torch.empty_like(input)
+
+    if (
+        _CUDNN_NORM_AVAILABLE
+        and _is_sm100_plus()
+        and input.dtype == torch.bfloat16
+        and input.dim() == 2
+    ):
+        _cudnn_fused_rmsnorm_silu(input, weight, eps, out)
+    else:
+        # Fallback: unfused RMSNorm + SiLU via PyTorch
+        x = input.float()
+        rms = torch.sqrt(torch.mean(x**2, dim=-1, keepdim=True) + eps)
+        normed = (x / rms) * weight.float()
+        torch.nn.functional.silu(normed, inplace=True)
+        out.copy_(normed.to(input.dtype))
+
+    return out
