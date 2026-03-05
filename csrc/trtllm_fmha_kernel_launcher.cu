@@ -374,11 +374,8 @@ void trtllm_paged_attention_decode(
   TVM_FFI_ICHECK_EQ(block_tables.dtype(), dl_int32) << "block_tables must be int32";
   TVM_FFI_ICHECK_EQ(seq_lens.ndim(), 1) << "seq_lens must be a 1D tensor";
   TVM_FFI_ICHECK_EQ(seq_lens.dtype(), dl_int32) << "seq_lens must be int32";
-  TVM_FFI_ICHECK_EQ(block_tables.size(0), seq_lens.size(0))
-      << "block_tables batch size must match seq_lens batch size";
   TVM_FFI_ICHECK_EQ(batch_size, block_tables.size(0))
       << "batch_size must match block_tables.size(0)";
-  TVM_FFI_ICHECK_EQ(batch_size, seq_lens.size(0)) << "batch_size must match seq_lens.size(0)";
   TVM_FFI_ICHECK_GE(window_left, -1) << "window_left must be >= -1";
   TVM_FFI_ICHECK_EQ(key_cache.ndim(), value_cache.ndim());
   for (int i = 0; i < key_cache.ndim(); i++) {
@@ -496,11 +493,8 @@ void trtllm_paged_attention_context(
   TVM_FFI_ICHECK_EQ(block_tables.dtype(), dl_int32) << "block_tables must be int32";
   TVM_FFI_ICHECK_EQ(seq_lens.ndim(), 1) << "seq_lens must be a 1D tensor";
   TVM_FFI_ICHECK_EQ(seq_lens.dtype(), dl_int32) << "seq_lens must be int32";
-  TVM_FFI_ICHECK_EQ(block_tables.size(0), seq_lens.size(0))
-      << "block_tables batch size must match seq_lens batch size";
   TVM_FFI_ICHECK_EQ(batch_size, block_tables.size(0))
       << "batch_size must match block_tables.size(0)";
-  TVM_FFI_ICHECK_EQ(batch_size, seq_lens.size(0)) << "batch_size must match seq_lens.size(0)";
   TVM_FFI_ICHECK_GE(window_left, -1) << "window_left must be >= -1";
   TVM_FFI_ICHECK_EQ(cum_seq_lens_q.ndim(), 1) << "cum_seq_lens_q must be a 1D tensor";
   TVM_FFI_ICHECK_EQ(cum_seq_lens_q.dtype(), dl_int32) << "cum_seq_lens_q must be int32";
@@ -508,8 +502,6 @@ void trtllm_paged_attention_context(
       << "cum_seq_lens_q size must be batch_size + 1";
   TVM_FFI_ICHECK_EQ(cum_seq_lens_kv.ndim(), 1) << "cum_seq_lens_kv must be a 1D tensor";
   TVM_FFI_ICHECK_EQ(cum_seq_lens_kv.dtype(), dl_int32) << "cum_seq_lens_kv must be int32";
-  TVM_FFI_ICHECK_EQ(cum_seq_lens_kv.size(0), batch_size + 1)
-      << "cum_seq_lens_kv size must be batch_size + 1";
   auto o_data_type = dl_dtype_to_tllm_data_type(out.dtype());
   int num_qo_heads = query.size(1);
   int sum_seq_q = query.size(0);
