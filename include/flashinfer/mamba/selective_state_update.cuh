@@ -66,6 +66,14 @@ struct SelectiveStateUpdateParams {
   // Block-scale decode factors for quantized state: float32 (state_cache_size, nheads, dim, 1)
   void* __restrict__ state_scale{nullptr};
 
+  void* __restrict__ dst_state_batch_indices{nullptr};
+
+  // stride_T=0 means 1D (broadcast), stride_T>0 means 2D indexing
+  int64_t state_batch_indices_stride_batch{1};
+  int64_t state_batch_indices_stride_T{0};
+  int64_t dst_state_batch_indices_stride_batch{0};
+  int64_t dst_state_batch_indices_stride_T{0};
+
   bool dt_softplus{false};
   bool update_state{true};
 
@@ -90,6 +98,9 @@ struct SelectiveStateMTPParams : public SelectiveStateUpdateParams {
   void* __restrict__ intermediate_state_indices{nullptr};  // (batch,)
   void* __restrict__ intermediate_state_scales{
       nullptr};  // float: (batch, cache_steps, nheads, dim)
+
+  void* __restrict__ cu_seqlens{nullptr};           // int32: (n_sequences + 1,)
+  void* __restrict__ num_accepted_tokens{nullptr};  // int32: (n_sequences,)
 };
 }  // namespace mtp
 
