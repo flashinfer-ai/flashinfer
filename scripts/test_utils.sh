@@ -90,9 +90,9 @@ install_precompiled_kernels() {
     echo ""
 
     if [ -n "${JIT_ARCH}" ]; then
-        # 12.0a for CUDA 12.9.0, 12.0f for CUDA 13.0.0
+        # 12.0a for CUDA 12.8, 12.0f for CUDA 12.9+
         if [ "${JIT_ARCH}" = "12.0" ]; then
-            if [ "${CUDA_STREAM}" = "cu129" ]; then
+            if [ "${CUDA_STREAM}" = "cu128" ]; then
                 JIT_ARCH_EFFECTIVE="12.0a"
             else
                 JIT_ARCH_EFFECTIVE="12.0f"

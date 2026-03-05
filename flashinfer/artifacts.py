@@ -79,6 +79,54 @@ def get_available_cubin_files(
     return tuple()
 
 
+def get_available_header_files(
+    source: str, retries: int = 3, delay: int = 5, timeout: int = 10
+) -> tuple[str, ...]:
+    """
+    Recursively navigates through child directories (e.g., include/) and finds
+    all *.h header files, returning them as a tuple of relative paths.
+    """
+    result: list[str] = []
+
+    def fetch_directory(url: str, prefix: str = "") -> None:
+        for attempt in range(1, retries + 1):
+            try:
+                response = requests.get(url, timeout=timeout)
+                response.raise_for_status()
+
+                # Find all .h header files in this directory
+                header_hrefs = re.findall(r'<a href="([^"]+\.h)">', response.text)
+                for h in header_hrefs:
+                    result.append(prefix + h if prefix else h)
+
+                # Find all subdirectories (links ending with /)
+                dir_hrefs = re.findall(r'<a href="([^"]+/)">', response.text)
+                for d in dir_hrefs:
+                    # Skip parent directory links
+                    if d == "../" or d.startswith(".."):
+                        continue
+                    subdir_url = safe_urljoin(url, d)
+                    subdir_prefix = prefix + d if prefix else d
+                    fetch_directory(subdir_url, subdir_prefix)
+
+                return  # Success, exit retry loop
+
+            except requests.exceptions.RequestException as e:
+                logger.warning(
+                    f"Fetching available header files {url}: attempt {attempt} failed: {e}"
+                )
+
+                if attempt < retries:
+                    logger.info(f"Retrying in {delay} seconds...")
+                    time.sleep(delay)
+
+        logger.error(f"Max retries reached for {url}. Fetch failed.")
+
+    fetch_directory(source)
+    logger.info(f"result: {result}")
+    return tuple(result)
+
+
 @dataclass(frozen=True)
 class ArtifactPath:
     """
@@ -87,12 +135,12 @@ class ArtifactPath:
     When compiling new cubins for backend directories, update the corresponding path.
     """
 
-    TRTLLM_GEN_FMHA: str = "e86f0e45764555d070c3d143b4caaea61a45b777/fmha/trtllm-gen/"
+    TRTLLM_GEN_FMHA: str = "f1ed60e5666a7620683a8c34a41c850a25029b35/fmha/trtllm-gen/"
     TRTLLM_GEN_BMM: str = (
-        "456b1ae890d436c794b17e4435b41b849d3e5950/batched_gemm-2a674db-3a84a12"
+        "b55211623be7f5697c5262ffd8361fc06c147bc9/batched_gemm-b3c1646-c111d7c/"
     )
     TRTLLM_GEN_GEMM: str = (
-        "a6abaccde860f1933d2ac7a2f73f581259e6fd97/gemm-b3c1646-8adb015"
+        "1fddc48b7b48af33914d040051b3e2ee9ba4701e/gemm-145d1b1-9b113e3/"
     )
     CUDNN_SDPA: str = "a72d85b019dc125b9f711300cb989430f762f5a6/fmha/cudnn/"
     # For DEEPGEMM, we also need to update KernelMap.KERNEL_MAP_HASH in flashinfer/deep_gemm.py
@@ -107,10 +155,10 @@ class CheckSumHash:
     """
 
     TRTLLM_GEN_FMHA: str = (
-        "c4c93904a4c72b8a3d0d5c525c6decb71c835b477d7d75651ecaaa7007c5a3ef"
+        "10a54e8c3175099481aed2739ae30fa0f782368c40f9ad1b423ed8353315d65b"
     )
     TRTLLM_GEN_BMM: str = (
-        "b9121fed5dd7700b7c2a0dcbcf2ef022483855cf585263324275b0072cca6bb7"
+        "0af823880730c4f0b3832d2208fab035946694b83444410b9309db5613d60195"
     )
     DEEPGEMM: str = "1a2a166839042dbd2a57f48051c82cd1ad032815927c753db269a4ed10d0ffbf"
     TRTLLM_GEN_GEMM: str = (
@@ -182,6 +230,9 @@ def get_subdir_file_list() -> Generator[tuple[str, str], None, None]:
         yield (checksum_path, CheckSumHash.map_checksums[checksum_path])
         for name in get_available_cubin_files(safe_urljoin(base, cubin_dir)):
             yield (safe_urljoin(cubin_dir, name), checksums[name])
+        for name in get_available_header_files(safe_urljoin(base, cubin_dir)):
+            full_path = safe_urljoin(cubin_dir, name)
+            yield (full_path, checksums[full_path])
 
 
 def download_artifacts() -> None:
@@ -190,7 +241,7 @@ def download_artifacts() -> None:
     # use a shared session to make use of HTTP keep-alive and reuse of
     # HTTPS connections.
     session = requests.Session()
-    cubin_files = list(get_subdir_file_list())
+    cubin_files = list[tuple[str, str]](get_subdir_file_list())
     num_threads = int(os.environ.get("FLASHINFER_CUBIN_DOWNLOAD_THREADS", "4"))
     with tqdm_logging_redirect(
         total=len(cubin_files), desc="Downloading cubins"
