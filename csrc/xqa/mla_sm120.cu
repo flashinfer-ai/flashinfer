@@ -1852,8 +1852,10 @@ void launchMLA(
 static uint32_t configureKernel() {
   uint32_t size;
   checkCuda(cudaMemcpyFromSymbol(&size, smemSize, sizeof(smemSize)));
+  int dev = 0;
+  checkCuda(cudaGetDevice(&dev));
   int devMaxShmem = 0;
-  checkCuda(cudaDeviceGetAttribute(&devMaxShmem, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0));
+  checkCuda(cudaDeviceGetAttribute(&devMaxShmem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
   if (size > (uint32_t)devMaxShmem) {
     throw std::runtime_error("XQA MLA kernel requires " + std::to_string(size) +
                              " bytes shared memory per block, but "
