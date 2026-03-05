@@ -596,7 +596,7 @@ def is_cvt_rs_supported(device: torch.device = None) -> bool:
         device = torch.device("cuda")
     major, _ = get_compute_capability(device)
     # SM100a and SM110a support cvt.rs; SM120 does not.
-    return major >= 10 and major not in (12,)
+    return major in (10, 11)
 
 
 def determine_mla_backend(device: torch.device) -> str:
