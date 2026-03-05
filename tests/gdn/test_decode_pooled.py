@@ -80,9 +80,9 @@ def _verify_pooled_decode_against_reference(
     a = torch.randn(batch_size, 1, num_heads, dtype=dtype_torch, device=device) * 0.1
     b = torch.randn(batch_size, 1, num_heads, dtype=dtype_torch, device=device) * 0.1
 
-    # State pool: [pool_size, HV, V, K] (K-last layout, bfloat16 for bf16 fast path)
+    # State pool: [pool_size, HV, V, K] (K-last layout, float32 for CuTe DSL kernel)
     state_pool = torch.randn(
-        pool_size, num_heads, head_dim, head_dim, dtype=torch.bfloat16, device=device
+        pool_size, num_heads, head_dim, head_dim, dtype=torch.float32, device=device
     )
     initial_state_pool = state_pool.clone()
 
@@ -181,7 +181,6 @@ def _verify_pooled_decode_against_reference(
 # ============================================================================
 
 
-@pytest.mark.skip(reason="bf16 fast path kernel does not support negative indices yet")
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 @pytest.mark.parametrize("batch_size", [1, 4, 8, 32, 127])
 @pytest.mark.parametrize("pool_size_multiplier", [2])
@@ -237,7 +236,6 @@ def test_decode_pooled_with_negative_indices(
 # ============================================================================
 
 
-@pytest.mark.skip(reason="bf16 fast path kernel does not support negative indices yet")
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 @pytest.mark.parametrize("batch_size", [1, 4, 8, 16, 32])
 @pytest.mark.parametrize("pool_size", [128, 256])
@@ -387,7 +385,6 @@ def test_decode_pooled_vs_nonpooled_equivalence(dtype, batch_size, seed=42):
 # ============================================================================
 
 
-@pytest.mark.skip(reason="bf16 fast path kernel does not support negative indices yet")
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 @pytest.mark.parametrize("batch_size", [1, 4, 16, 32])
 def test_decode_pooled_all_padding(dtype, batch_size, seed=42):
@@ -424,7 +421,7 @@ def test_decode_pooled_all_padding(dtype, batch_size, seed=42):
     b = torch.randn(batch_size, 1, num_heads, dtype=dtype_torch, device=device) * 0.1
 
     state_pool = torch.randn(
-        pool_size, num_heads, head_dim, head_dim, dtype=torch.bfloat16, device=device
+        pool_size, num_heads, head_dim, head_dim, dtype=torch.float32, device=device
     )
     initial_state_pool = state_pool.clone()
 

@@ -1111,13 +1111,16 @@ def gated_delta_rule_decode_pretranspose(
         return_state = initial_state if use_pool else state
         return output, return_state
 
-    # Legacy path: T=1 only, float32 state (no pool+indices support)
-    assert not use_pool, (
-        "pool+indices (initial_state/initial_state_indices) requires bfloat16 state "
-        "with T in 1..4 and K=V=128 (the gdn_decode_klast_bf16_state fast path)"
-    )
+    # Legacy path: T=1 only, float32 state
     assert T == 1, f"Decode only supports T=1, got T={T}"
-    assert state.dtype == torch.float32, f"state must be float32, got {state.dtype}"
+
+    if use_pool:
+        assert initial_state.dtype == torch.float32, (
+            f"initial_state must be float32 for legacy path, got {initial_state.dtype}"
+        )
+    else:
+        assert state is not None, "Either state or initial_state must be provided"
+        assert state.dtype == torch.float32, f"state must be float32, got {state.dtype}"
 
     # Validate K and V constraints
     assert K >= 128, f"K must be at least 128, got K={K}"
@@ -1142,12 +1145,17 @@ def gated_delta_rule_decode_pretranspose(
     target_dtype = output.dtype if output_provided else q.dtype
 
     if output is None:
-        # Kernel outputs bfloat16, allocate in that dtype first
         output = torch.zeros((B, T, HV, V), dtype=torch.bfloat16, device=q.device)
 
-    # Convert state from [B, HV, V, K] to [B*HV, V, K] for kernel
-    pool_size = B
-    h0_source = state.reshape(pool_size * HV, V, K)
+    # Build h0_source: [pool_size*HV, V, K] for kernel
+    if use_pool:
+        pool_size = initial_state.shape[0]
+        h0_source = initial_state.reshape(pool_size * HV, V, K)
+        return_state = initial_state
+    else:
+        pool_size = B
+        h0_source = state.reshape(pool_size * HV, V, K)
+        return_state = state
 
     # Compile kernel with TVM FFI (cached)
     cache_key = (
@@ -1166,7 +1174,11 @@ def gated_delta_rule_decode_pretranspose(
 
     if "h0_indices" not in cache or cache["h0_indices"].device != q.device:
         cache["h0_indices"] = torch.zeros(B, dtype=torch.int32, device=q.device)
-    h0_indices = cache["h0_indices"]
+
+    if use_pool:
+        h0_indices = initial_state_indices.to(torch.int32)
+    else:
+        h0_indices = cache["h0_indices"]
 
     if "cu_seqlens" not in cache or cache["cu_seqlens"].device != q.device:
         cache["cu_seqlens"] = torch.zeros(B + 1, dtype=torch.int32, device=q.device)
@@ -1246,11 +1258,9 @@ def gated_delta_rule_decode_pretranspose(
     if output.dtype != target_dtype:
         output = output.to(target_dtype)
 
-    # Copy state back only if state was not contiguous
-    # (if contiguous, reshape returns a view and kernel updated state in-place)
-    if not state.is_contiguous():
+    if not use_pool and not state.is_contiguous():
         state.copy_(h0_source.reshape(B, HV, V, K))
-    return output, state
+    return output, return_state
 
 
 # ============================================================================
