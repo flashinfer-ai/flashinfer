@@ -3,7 +3,7 @@ import pytest
 import torch
 
 import flashinfer
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import get_compute_capability, is_cvt_rs_supported
 
 from .triton_reference.selective_state_update import selective_state_update_triton
 from .utils import create_test_inputs, clone_preserving_strides
@@ -666,11 +666,11 @@ class TestSelectiveStateUpdateStochasticRounding(TestSelectiveStateUpdate):
     def make_reference_output(self, inputs):
         """Compute reference output using Triton with stochastic rounding."""
         state_ref = inputs["state_cache"].clone()
-        major, _ = get_compute_capability(torch.device("cuda"))
-        # Triton cvt.rs.f16x2.f32 requires SM100a+; on older GPUs the Triton
-        # reference falls back to regular rounding while the CUDA kernel still
-        # exercises its software stochastic rounding path.
-        rand_seed = self.RAND_SEED if major >= 10 else None
+        # Triton cvt.rs.f16x2.f32 requires SM100a (non-forward-compatible);
+        # on unsupported GPUs the Triton reference falls back to regular
+        # rounding while the CUDA kernel still exercises its software
+        # stochastic rounding path.
+        rand_seed = self.RAND_SEED if is_cvt_rs_supported() else None
         y_ref = selective_state_update_triton(
             state_ref,
             inputs["x"],

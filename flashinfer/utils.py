@@ -586,6 +586,19 @@ def is_sm12x_supported(device: torch.device) -> bool:
     return version_at_least(torch.version.cuda, min_cuda)
 
 
+def is_cvt_rs_supported(device: torch.device = None) -> bool:
+    """Check if the GPU supports the PTX cvt.rs.f16x2.f32 instruction.
+
+    This is a non-forward-compatible SM100a feature — not all SM >= 100 have it.
+    In particular, SM120 (Blackwell lite) does NOT support it.
+    """
+    if device is None:
+        device = torch.device("cuda")
+    major, _ = get_compute_capability(device)
+    # SM100a and SM110a support cvt.rs; SM120 does not.
+    return major >= 10 and major not in (12,)
+
+
 def determine_mla_backend(device: torch.device) -> str:
     return "fa3" if is_sm90a_supported(device) else "fa2"
 
