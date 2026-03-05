@@ -77,6 +77,33 @@ def test_fused_rmsnorm_silu_output_properties():
     assert not torch.isinf(out).any()
 
 
+@pytest.mark.parametrize("C", [64, 256, 512, 1024])
+@pytest.mark.parametrize("num_tokens", [1560, 6240])
+def test_fused_rmsnorm_silu_fp8_output(C, num_tokens):
+    """Test FP8 E4M3 output: pass out=float8_e4m3fn tensor."""
+    torch.manual_seed(42)
+
+    x = (torch.randn(num_tokens, C, dtype=torch.bfloat16, device="cuda") * 5.0 + 5.0)
+    w = (torch.rand(C, dtype=torch.bfloat16, device="cuda") * 1.5 + 0.5)
+
+    # FP8 output
+    out_fp8 = torch.empty(num_tokens, C, dtype=torch.float8_e4m3fn, device="cuda")
+    result = flashinfer.fused_rmsnorm_silu(x, w, 1e-6, out=out_fp8)
+
+    assert result is out_fp8
+    assert result.dtype == torch.float8_e4m3fn
+    assert not torch.isnan(result.float()).any()
+
+    # Compare against bf16 reference quantized to FP8
+    ref_bf16 = rmsnorm_silu_reference(x, w, 1e-6)
+    ref_fp8 = ref_bf16.float().clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+
+    # FP8 has 3-bit mantissa — allow 1 ULP tolerance
+    torch.testing.assert_close(
+        result.float(), ref_fp8.float(), atol=0.125, rtol=0.125
+    )
+
+
 def test_fused_rmsnorm_silu_l2norm_equivalence():
     """Verify L2Norm(eps) ≡ RMSNorm(eps/C) with weight adjustment.
 
@@ -134,4 +161,34 @@ if __name__ == "__main__":
                 failed += 1
                 print(f"  C={C:>4}, tokens={tokens:>6}: ERROR  {e}")
 
-    print(f"\n--- Results: {passed} passed, {failed} failed ---")
+    print(f"\n--- bf16 Results: {passed} passed, {failed} failed ---")
+
+    # FP8 sweep
+    print("\n--- FP8 Output ---")
+    fp8_passed = 0
+    fp8_failed = 0
+    for C in [64, 256, 512, 1024]:
+        for tokens in [1560, 6240]:
+            try:
+                torch.manual_seed(42)
+                x = (torch.randn(tokens, C, dtype=torch.bfloat16, device="cuda") * 5.0 + 5.0)
+                w = (torch.rand(C, dtype=torch.bfloat16, device="cuda") * 1.5 + 0.5)
+                out_fp8 = torch.empty(tokens, C, dtype=torch.float8_e4m3fn, device="cuda")
+                flashinfer.fused_rmsnorm_silu(x, w, 1e-6, out=out_fp8)
+                ref = rmsnorm_silu_reference(x, w, 1e-6)
+                ref_fp8 = ref.float().clamp(-448, 448).to(torch.float8_e4m3fn)
+                max_diff = (out_fp8.float() - ref_fp8.float()).abs().max().item()
+                status = "PASS" if max_diff < 0.5 else "FAIL"
+                if max_diff < 0.5:
+                    fp8_passed += 1
+                else:
+                    fp8_failed += 1
+                print(f"  FP8 C={C:>4}, tokens={tokens:>6}: {status}  max_diff={max_diff:.3e}")
+            except Exception as e:
+                fp8_failed += 1
+                print(f"  FP8 C={C:>4}, tokens={tokens:>6}: ERROR  {e}")
+
+    print(f"\n--- FP8 Results: {fp8_passed} passed, {fp8_failed} failed ---")
+    total = passed + failed + fp8_passed + fp8_failed
+    total_pass = passed + fp8_passed
+    print(f"\n--- Total: {total_pass}/{total} passed ---")

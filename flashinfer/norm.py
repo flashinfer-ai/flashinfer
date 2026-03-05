@@ -440,6 +440,10 @@ def fused_rmsnorm_silu(
     Uses the cuDNN OSS engine on SM100+ (Blackwell) GPUs for optimal
     performance. Falls back to unfused PyTorch operations on other GPUs.
 
+    The output dtype is determined by the ``out`` tensor:
+      - ``out.dtype == bfloat16``: standard bf16 output (default)
+      - ``out.dtype == float8_e4m3fn``: FP8 quantized output (scale=1.0)
+
     Parameters
     ----------
     input: torch.Tensor
@@ -449,12 +453,13 @@ def fused_rmsnorm_silu(
     eps: float
         Epsilon for numerical stability.
     out: Optional[torch.Tensor]
-        The output tensor, if specified, the kernel will update this tensor inplace.
+        The output tensor. If specified, the kernel will update this tensor
+        inplace. The dtype of ``out`` determines the output quantization.
 
     Returns
     -------
     output: torch.Tensor
-        Output tensor, same shape and dtype as input.
+        Output tensor, same shape as input. Dtype matches ``out``.
     """
     if out is None:
         out = torch.empty_like(input)
@@ -464,6 +469,7 @@ def fused_rmsnorm_silu(
         and _is_sm100_plus()
         and input.dtype == torch.bfloat16
         and input.dim() == 2
+        and out.dtype in (torch.bfloat16, torch.float8_e4m3fn)
     ):
         _cudnn_fused_rmsnorm_silu(input, weight, eps, out)
     else:
@@ -472,6 +478,6 @@ def fused_rmsnorm_silu(
         rms = torch.sqrt(torch.mean(x**2, dim=-1, keepdim=True) + eps)
         normed = (x / rms) * weight.float()
         torch.nn.functional.silu(normed, inplace=True)
-        out.copy_(normed.to(input.dtype))
+        out.copy_(normed.to(out.dtype))
 
     return out
