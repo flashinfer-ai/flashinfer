@@ -601,7 +601,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
         assert bmm2_scale.dtype == torch.float32
     if backend == "xqa":
         if not is_sm12x_supported(query.device):
-            raise ValueError("XQA MLA is only supported on SM12x GPUs")
+            raise ValueError(
+                "XQA MLA requires SM120a (CUDA >= 12.8) or SM121a (CUDA >= 13.0)"
+            )
         fp8_ok = (
             query.dtype == torch.float8_e4m3fn and kv_cache.dtype == torch.float8_e4m3fn
         )
@@ -771,7 +773,9 @@ def xqa_batch_decode_with_kv_cache_mla(
             f"XQA MLA only supports q_len_per_request == 1, got {q_len_per_request}"
         )
     if not is_sm12x_supported(query.device):
-        raise ValueError("XQA MLA is only supported on SM12x GPUs")
+        raise ValueError(
+            "XQA MLA requires SM120a (CUDA >= 12.8) or SM121a (CUDA >= 13.0)"
+        )
     fp8_ok = (
         query.dtype == torch.float8_e4m3fn and kv_cache.dtype == torch.float8_e4m3fn
     )
