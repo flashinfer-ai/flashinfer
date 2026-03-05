@@ -11,11 +11,13 @@ import flashinfer
 
 
 def rmsnorm_silu_reference(x, weight, eps):
-    """PyTorch reference: L2Norm + scale + weight + SiLU (matches WAN VAE)."""
-    C = x.shape[-1]
-    scale = math.sqrt(C)
-    l2norm = torch.sqrt(torch.sum(x.float() ** 2, dim=-1, keepdim=True) + eps)
-    normed = (x.float() / l2norm) * scale * weight.float()
+    """PyTorch reference: RMSNorm + SiLU.
+
+    RMSNorm: x / sqrt(mean(x^2) + eps) * weight
+    SiLU: y * sigmoid(y)
+    """
+    rms = torch.sqrt(torch.mean(x.float() ** 2, dim=-1, keepdim=True) + eps)
+    normed = (x.float() / rms) * weight.float()
     return F.silu(normed).to(x.dtype)
 
 

@@ -427,13 +427,12 @@ def fused_rmsnorm_silu(
     eps: float = 1e-6,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    r"""Fused RMSNorm + SiLU activation (L2Norm variant).
+    r"""Fused RMSNorm + SiLU activation.
 
-    Computes: ``out = SiLU(x / sqrt(sum(x^2) + eps) * scale * weight)``
+    Computes: ``out = SiLU(RMSNorm(x, weight, eps))``
 
-    This matches the WAN VAE's ``F.normalize(x, dim=1) * scale * gamma``
-    followed by SiLU activation. The ``scale`` factor is ``sqrt(hidden_size)``
-    to convert from L2Norm to RMSNorm convention.
+    where ``RMSNorm(x) = x / sqrt(mean(x^2) + eps) * weight``
+    and ``SiLU(y) = y * sigmoid(y)``.
 
     Parameters
     ----------
@@ -442,8 +441,7 @@ def fused_rmsnorm_silu(
     weight: torch.Tensor
         Weight tensor, shape (hidden_size,). Must be bf16.
     eps: float
-        Epsilon for L2 normalization (NOT divided by C — the kernel handles
-        the L2Norm convention directly).
+        Epsilon for RMSNorm (standard convention: added to mean of squares).
     out: Optional[torch.Tensor]
         The output tensor, if specified, the kernel will update this tensor inplace.
 
@@ -455,6 +453,12 @@ def fused_rmsnorm_silu(
     if out is None:
         out = torch.empty_like(input)
     hidden_size = input.shape[-1]
+    # The kernel internally uses L2Norm: x / sqrt(sum(x²) + eps_k) * scale * weight
+    # To compute RMSNorm: x / sqrt(mean(x²) + eps) * weight
+    #   = x / sqrt(sum(x²)/C + eps) * weight
+    #   = x / sqrt(sum(x²) + eps*C) * sqrt(C) * weight
+    # So: eps_kernel = eps * C, scale = sqrt(C)
+    kernel_eps = eps * hidden_size
     scale = math.sqrt(hidden_size)
-    get_fused_rmsnorm_silu_module().fused_rmsnorm_silu(out, input, weight, eps, scale)
+    get_fused_rmsnorm_silu_module().fused_rmsnorm_silu(out, input, weight, kernel_eps, scale)
     return out
