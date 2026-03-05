@@ -512,6 +512,145 @@ except ImportError:
     pass
 
 
+# cuDNN OSS fused RMSNorm + SiLU engine (SM80+, optimized for VAE shapes on B200)
+try:
+    from ..cudnn.norm import cudnn_fused_rmsnorm_silu as _cudnn_fused_rmsnorm_silu
+    from ..cudnn.norm import CUDNN_AVAILABLE as _CUDNN_NORM_AVAILABLE
+except ImportError:
+    _cudnn_fused_rmsnorm_silu = None  # type: ignore[misc,assignment]
+    _CUDNN_NORM_AVAILABLE = False
+
+# Problem sizes with sweep-tuned knob configurations (SM100 / B200).
+# Other (C, token) combinations use a conservative fallback heuristic.
+_TUNED_C_VALUES = frozenset({64, 128, 160, 256, 320, 512, 640, 1024})
+_TUNED_TOKEN_VALUES = frozenset({1560, 6240, 24960, 99840, 399360})
+
+
+@flashinfer_api
+def fused_rmsnorm_silu(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Fused RMSNorm + SiLU activation.
+
+    ``out = SiLU(RMSNorm(input, weight, eps))``
+
+    where ``RMSNorm(x) = x / sqrt(mean(x^2) + eps) * weight``
+    and ``SiLU(y) = y * sigmoid(y)``.
+
+    Uses the cuDNN OSS RmsNormSilu engine on SM80+ GPUs via NVRTC JIT
+    compilation.  Requires ``nvidia-cudnn-frontend`` to be installed.
+
+    .. note::
+
+       This kernel is **tuned and optimized for WAN VAE decoder problem
+       sizes on B200 (SM100)**:
+
+       - **Optimized C:** {64, 128, 160, 256, 320, 512, 640, 1024}
+       - **Optimized token counts:** {1560, 6240, 24960, 99840, 399360}
+
+       On other architectures (A100, H100, L40, etc.) and non-VAE problem
+       sizes, a conservative fallback heuristic selects valid kernel
+       parameters -- functional but not performance-optimal.
+
+    The output dtype is determined by the ``out`` tensor:
+      - ``out.dtype == bfloat16``: standard bf16 output (default)
+      - ``out.dtype == float8_e4m3fn``: FP8 quantized output (SM89+)
+      - ``out.dtype == uint8``: NVFP4 E2M1 packed output (SM100+)
+
+    Parameters
+    ----------
+    input: torch.Tensor
+        Input tensor, shape (num_tokens, hidden_size). Must be bf16.
+    weight: torch.Tensor
+        Weight tensor, shape (hidden_size,). Must be bf16.
+    eps: float
+        Epsilon for numerical stability.
+    out: Optional[torch.Tensor]
+        The output tensor. If specified, the kernel will update this tensor
+        inplace. The dtype of ``out`` determines the output quantization.
+
+    Returns
+    -------
+    output: torch.Tensor
+        Output tensor, same shape as input. Dtype matches ``out``.
+
+    Raises
+    ------
+    RuntimeError
+        If cuDNN frontend is not available, the GPU is older than SM80,
+        or the input dtype/shape is unsupported.
+    """
+    import warnings
+    from ..utils import get_compute_capability
+
+    if not _CUDNN_NORM_AVAILABLE:
+        raise RuntimeError(
+            "fused_rmsnorm_silu requires nvidia-cudnn-frontend. "
+            "Install with: pip install nvidia-cudnn-frontend"
+        )
+
+    if not input.is_cuda:
+        raise RuntimeError("fused_rmsnorm_silu requires CUDA tensors")
+
+    major, minor = get_compute_capability(input.device)
+    sm = major * 10 + minor
+    if major < 8:
+        raise RuntimeError(
+            f"fused_rmsnorm_silu requires SM80+ (Ampere or newer), "
+            f"got SM{sm} ({torch.cuda.get_device_name(input.device)})"
+        )
+
+    if input.dtype != torch.bfloat16:
+        raise RuntimeError(
+            f"fused_rmsnorm_silu requires bfloat16 input, got {input.dtype}"
+        )
+
+    if input.dim() != 2:
+        raise RuntimeError(
+            f"fused_rmsnorm_silu requires 2D input (num_tokens, hidden_size), "
+            f"got {input.dim()}D"
+        )
+
+    if out is None:
+        out = torch.empty_like(input)
+
+    if out.dtype not in (torch.bfloat16, torch.float8_e4m3fn, torch.uint8):
+        raise RuntimeError(
+            f"fused_rmsnorm_silu output dtype must be bfloat16, float8_e4m3fn, "
+            f"or uint8 (NVFP4), got {out.dtype}"
+        )
+
+    if out.dtype == torch.float8_e4m3fn and sm < 89:
+        raise RuntimeError(
+            f"FP8 E4M3 output requires SM89+ (Ada/Hopper), got SM{sm}"
+        )
+
+    if out.dtype == torch.uint8 and sm < 100:
+        raise RuntimeError(
+            f"NVFP4 E2M1 output requires SM100+ (Blackwell), got SM{sm}"
+        )
+
+    # Warn once if the problem size or GPU is outside the tuned regime.
+    num_tokens, C = input.shape
+    is_sm100 = major == 10 and minor == 0
+    is_tuned = C in _TUNED_C_VALUES and num_tokens in _TUNED_TOKEN_VALUES
+    if not (is_sm100 and is_tuned):
+        warnings.warn(
+            f"fused_rmsnorm_silu: this kernel is tuned and optimized for "
+            f"WAN VAE problem sizes (C in {sorted(_TUNED_C_VALUES)}, "
+            f"tokens in {sorted(_TUNED_TOKEN_VALUES)}) on B200 (SM100). "
+            f"Current: C={C}, tokens={num_tokens}, "
+            f"SM{sm}. Performance may not be optimal.",
+            stacklevel=2,
+        )
+
+    _cudnn_fused_rmsnorm_silu(input, weight, eps, out)
+    return out
+
+
 # Public API exports
 __all__ = [
     # JIT module generator (always available)
@@ -524,4 +663,5 @@ __all__ = [
     "gemma_rmsnorm",
     "gemma_fused_add_rmsnorm",
     "layernorm",
+    "fused_rmsnorm_silu",
 ]

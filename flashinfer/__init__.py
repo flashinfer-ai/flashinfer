@@ -112,6 +112,7 @@ from .norm import gemma_fused_add_rmsnorm as gemma_fused_add_rmsnorm
 from .norm import gemma_rmsnorm as gemma_rmsnorm
 from .norm import rmsnorm as rmsnorm
 
+from .norm import fused_rmsnorm_silu as fused_rmsnorm_silu
 try:
     from .norm import rmsnorm_fp4quant as rmsnorm_fp4quant
     from .norm import add_rmsnorm_fp4quant as add_rmsnorm_fp4quant
