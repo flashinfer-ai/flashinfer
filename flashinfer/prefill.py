@@ -3963,11 +3963,10 @@ def trtllm_fmha_v2_prefill(
 
     Parameters
     ----------
-    qkv : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+    qkv
         Query/key/value input; expected format is determined by :attr:`input_layout`.
-    input_layout : str
+    input_layout
         Specifies the layout of the query/key/value tensors:
-
         - ``PACKED_QKV``: ``qkv`` is a single tensor of shape
           ``[num_tokens, 3, num_heads, head_dim]``.
         - ``CONTIGUOUS_Q_KV``: ``qkv`` is ``(Q, KV)`` where Q has shape
@@ -3983,61 +3982,59 @@ def trtllm_fmha_v2_prefill(
         - ``SEPARATE_Q_K_V``: ``qkv`` is ``(Q, K, V)`` where Q has shape
           ``[num_tokens, num_heads, head_dim]`` and K, V have shape
           ``[num_tokens, num_kv_heads, head_dim]``.
-    workspace_buffer : torch.Tensor
+    workspace_buffer
         The workspace buffer. Must be initialized to 0 for its first use.
-    seq_lens : torch.Tensor
+    seq_lens
         The KV sequence length of each request, shape: ``[batch_size]``.
-    max_q_len : int
+    max_q_len
         The maximum sequence length for query.
-    max_kv_len : int
+    max_kv_len
         The maximum sequence length for KV cache.
-    bmm1_scale : float
+    bmm1_scale
         The fused scale for BMM1 (QK^T) computation.
-    bmm2_scale : float
+    bmm2_scale
         The fused scale for BMM2 (softmax(QK^T) * V) computation.
-    batch_size : int
+    batch_size
         The batch size.
-    cum_seq_lens_q : torch.Tensor
+    cum_seq_lens_q
         The cumulative sequence lengths for query, shape: ``[batch_size + 1]``.
-    cum_seq_lens_kv : torch.Tensor
+    cum_seq_lens_kv
         The cumulative sequence lengths for KV cache, shape: ``[batch_size + 1]``.
-    block_tables : Optional[torch.Tensor]
+    block_tables
         The page table for KV cache, shape: ``[batch_size, max_num_pages_per_seq]``.
         Required when using paged KV cache format.
-    out : Optional[torch.Tensor]
+    out
         The output tensor. If not provided, will be allocated with ``out_dtype``.
         If ``out_dtype`` is also not provided, will use the dtype of query.
-    out_dtype : Optional[Union[torch.dtype, str]]
+    out_dtype
         The output dtype. If not provided, will use the dtype of ``out`` or query.
-    sinks : Optional[List[torch.Tensor]]
+    sinks
         Additional value per head in the denominator of the softmax.
-    pos_encoding_mode : Optional[str]
-        The position encoding mode, could be ``NONE`` or ``ALIBI``. Defaults to ``NONE``.
-    logits_soft_cap_scale : Optional[float]
+    pos_encoding_mode
+        The position encoding mode, could be ``alibi``. Defaults to ``None``.
+    logits_soft_cap_scale
         The logits soft cap scale. Defaults to ``None``, which means no soft cap.
-    mask_mode : Optional[str]
+    mask_mode
         The mask mode, could be ``causal``, ``sliding_window``, or ``chunked``.
         Defaults to ``causal``.
-    window_left : Optional[int]
+    window_left
         The left (inclusive) window size for the attention window, when set to ``-1``,
         the window size will be set to the full length of the sequence. Defaults to ``-1``.
         Only effective when :attr:`mask_mode` is ``sliding_window``.
-    chunked_attention_size : Optional[int]
+    chunked_attention_size
         The chunked attention size. Defaults to ``0``, which means no chunked attention.
         Only effective when :attr:`mask_mode` is ``chunked``. Must be a power of 2.
-    save_softmax_stats : bool
+    save_softmax_stats
         Whether to save the softmax statistics. Defaults to ``False``.
-    skip_softmax_threshold_scale_factor : float
+    skip_softmax_threshold_scale_factor
         The factor of skip-softmax (Sparse Attention),
         Skip softmax and BMM2 when exp(local_max - global_max) < threshold,
         where threshold = skip_softmax_threshold_scale_factor / seqlen.
         Defaults to ``0`` (disabled).
     Returns
     -------
-    Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         If :attr:`save_softmax_stats` is ``False``, the attention output tensor.
         If :attr:`save_softmax_stats` is ``True``, a tuple of two tensors:
-
         * The attention output tensor.
         * The softmax statistics tensor (LSE).
     """
@@ -4226,7 +4223,8 @@ def trtllm_fmha_v2_prefill(
         scale_bmm2,  # BMM2 scale (float, still needed for set_alpha in C++)
         window_left,  # Window left
         chunked_attention_size,  # Chunked attention size
-        pos_encoding_mode.lower() == "alibi",  # Alibi mode
+        pos_encoding_mode is not None
+        and pos_encoding_mode.lower() == "alibi",  # Alibi mode
         softcapping_scale,  # Softcapping scale (0.0 = disabled)
         skip_softmax_threshold_scale_factor,  # threshold_scale_factor for skip-softmax (0.0 = disable)
         scale_bmm2_d,  # Pre-populated scale_bmm2 on device (avoids cudaMemcpy)

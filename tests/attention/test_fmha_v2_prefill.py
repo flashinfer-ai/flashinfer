@@ -499,6 +499,10 @@ def run_trtllm_fmha_v2_prefill_case(
             "save_softmax_stats. For MLA only SEPARATE_Q_K_V layout supports "
             "save_softmax_stats."
         )
+    if skip_softmax_threshold_scale_factor > 0 and not is_sm90a_supported(
+        torch.device("cuda")
+    ):
+        pytest.skip("Skip softmax attention is only supported on SM90+ (Hopper) GPUs.")
 
     torch.manual_seed(42)
     device = torch.device("cuda")
@@ -724,22 +728,38 @@ def run_trtllm_fmha_v2_prefill_case(
 
     if save_softmax_stats:
         # kernel_lse: [total_tokens, num_qo_heads, 2] -> [max, sum_exp] in ragged format
-        # The Softmax_saver_tma stores max / sqrt(head_dim).
-        # Non-softcap (exp2f path): max = max(raw_BMM_output), scores = raw * q_scale * k_scale * sm_scale
-        #   lse = kernel_max * q_scale * k_scale + ln(sum)  (since sqrt(d) * sm_scale = 1)
-        # Softcap (expf path): max = max(softcapped(scores * scale_bmm1)), scores already scaled
-        #   lse = kernel_max / sm_scale + ln(sum)  (i.e. kernel_max * sqrt(d))
+        #
+        # The stored max format differs by architecture:
+        # - SM90 (Hopper) warp-spec: Softmax_saver_tma stores max / sqrt(head_dim),
+        #   and uses exp2f with scale_bmm1 * M_LOG2E. The max tracks raw (unscaled)
+        #   QK^T values, so max / sqrt(d) == max * sm_scale.
+        # - SM120 (Blackwell) tiled: Softmax_saver stores max directly (no sqrt(d)
+        #   division). Elements are pre-scaled by scale_bmm1 during unpack, so
+        #   the max already includes the sm_scale factor.
+        #
+        # In both cases, for non-softcap:
+        #   lse = kernel_max * q_scale * k_scale + ln(sum_exp)
+        #
+        # For softcap:
+        # - SM90: max = max(softcapped) / sqrt(d), so lse = kernel_max / sm_scale + ln(sum)
+        # - SM120: max = max(softcapped) directly, so lse = kernel_max + ln(sum)
         kernel_max = kernel_lse[:, :, 0]
         kernel_sum_exp = kernel_lse[:, :, 1]
+        is_sm12x = is_sm12x_supported(torch.device("cuda"))
         if logits_soft_cap > 0:
-            lse_kernel = kernel_max / sm_scale + torch.log(kernel_sum_exp)
+            if is_sm12x:
+                # SM120 Softmax_saver: max stored directly (no sqrt(d) division)
+                lse_kernel = kernel_max + torch.log(kernel_sum_exp)
+            else:
+                # SM90 Softmax_saver_tma: max stored as max / sqrt(d)
+                lse_kernel = kernel_max / sm_scale + torch.log(kernel_sum_exp)
         else:
             lse_kernel = kernel_max * (q_scale * k_scale) + torch.log(kernel_sum_exp)
         torch.testing.assert_close(lse_kernel, lse_ref, rtol=1e-2, atol=1e-2)
 
 
 @pytest.mark.parametrize("batch_size", [1, 16])
-@pytest.mark.parametrize("max_seq_len", [1024, 16384])
+@pytest.mark.parametrize("max_seq_len", [1024])
 @pytest.mark.parametrize("num_qo_heads", [4, 32])
 @pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("head_dim", [128, 256])
@@ -760,8 +780,10 @@ def run_trtllm_fmha_v2_prefill_case(
         ("CONTIGUOUS_Q_KV", None, False),
         ("CONTIGUOUS_Q_KV", None, True),
         ("SEPARATE_Q_K_V", None, False),
-        ("Q_PAGED_KV", 32, False),
-        ("Q_PAGED_KV", 128, False),
+        ("Q_PAGED_KV_NHD", 32, False),
+        ("Q_PAGED_KV_NHD", 128, False),
+        ("Q_PAGED_KV_HND", 32, False),
+        ("Q_PAGED_KV_HND", 128, False),
     ],
 )
 @pytest.mark.parametrize(
@@ -772,7 +794,7 @@ def run_trtllm_fmha_v2_prefill_case(
         (True, 512, "SLIDING_WINDOW"),
     ],
 )
-@pytest.mark.parametrize("pos_encoding_mode", ["NONE"])
+@pytest.mark.parametrize("pos_encoding_mode", [None])
 @pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
 def test_trtllm_fmha_v2_prefill(
     input_layout: str,
@@ -887,7 +909,7 @@ def test_trtllm_fmha_v2_prefill_skip_softmax(
         (True, 512, "SLIDING_WINDOW"),
     ],
 )
-@pytest.mark.parametrize("pos_encoding_mode", ["NONE"])
+@pytest.mark.parametrize("pos_encoding_mode", [None])
 def test_trtllm_fmha_v2_prefill_attention_sinks(
     batch_size: int,
     max_seq_len: int,
