@@ -25,11 +25,24 @@ from einops import rearrange
 
 
 def ssd_combined_fwd(
-    x, dt, A, B, C, chunk_size,
-    D=None, z=None, dt_bias=None, dt_softplus=False,
-    dt_limit=(0.0, float("inf")), initial_states=None,
-    seq_idx=None, chunk_indices=None, chunk_offsets=None,
-    cu_seqlens=None, out=None, return_final_states=True,
+    x,
+    dt,
+    A,
+    B,
+    C,
+    chunk_size,
+    D=None,
+    z=None,
+    dt_bias=None,
+    dt_softplus=False,
+    dt_limit=(0.0, float("inf")),
+    initial_states=None,
+    seq_idx=None,
+    chunk_indices=None,
+    chunk_offsets=None,
+    cu_seqlens=None,
+    out=None,
+    return_final_states=True,
 ):
     """Test-local convenience wrapper around SSDCombined."""
     _, _, nheads, headdim = x.shape
@@ -49,13 +62,24 @@ def ssd_combined_fwd(
         has_varlen=seq_idx is not None,
         has_z=z is not None,
         state_dtype=state_dtype,
+        seq_idx_dtype=seq_idx.dtype if seq_idx is not None else torch.int64,
     )
     return ssd.run(
-        x, dt, A, B, C,
-        D=D, z=z, dt_bias=dt_bias, dt_softplus=dt_softplus,
-        dt_limit=dt_limit, initial_states=initial_states,
-        seq_idx=seq_idx, chunk_indices=chunk_indices,
-        chunk_offsets=chunk_offsets, out=out,
+        x,
+        dt,
+        A,
+        B,
+        C,
+        D=D,
+        z=z,
+        dt_bias=dt_bias,
+        dt_softplus=dt_softplus,
+        dt_limit=dt_limit,
+        initial_states=initial_states,
+        seq_idx=seq_idx,
+        chunk_indices=chunk_indices,
+        chunk_offsets=chunk_offsets,
+        out=out,
         return_final_states=return_final_states,
     )
 
@@ -1329,7 +1353,9 @@ def test_preallocated_output():
 
     # Run with pre-allocated output in kernel's native layout (B, EH, D, C, L)
     nchunks = seqlen // chunk_size
-    out = torch.empty(batch, nheads, headdim, nchunks, chunk_size, dtype=dtype, device="cuda")
+    out = torch.empty(
+        batch, nheads, headdim, nchunks, chunk_size, dtype=dtype, device="cuda"
+    )
     out_test, _ = ssd_combined_fwd(
         x,
         dt,
@@ -1585,8 +1611,15 @@ def test_fp16_state_dtype():
     )
 
     out_test, final_states_test = ssd_combined_fwd(
-        x, dt, A, B, C, chunk_size,
-        D=D, dt_bias=dt_bias, dt_softplus=True,
+        x,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size,
+        D=D,
+        dt_bias=dt_bias,
+        dt_softplus=True,
         initial_states=initial_states,
     )
 
@@ -1616,8 +1649,16 @@ def test_fp16_state_dtype():
     )
     CB = _bmm_chunk_fwd(C, B, chunk_size, seq_idx=None, output_dtype=torch.float32)
     out_ref = _chunk_scan_fwd(
-        CB, x, dt_processed, dA_cumsum, C, states,
-        D=D, z=None, seq_idx=None, initial_states=None,
+        CB,
+        x,
+        dt_processed,
+        dA_cumsum,
+        C,
+        states,
+        D=D,
+        z=None,
+        seq_idx=None,
+        initial_states=None,
     )
 
     ATOL, RTOL = 7e-2, 7e-2

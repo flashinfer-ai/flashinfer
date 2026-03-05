@@ -21,7 +21,7 @@ import sys
 import numpy as np
 import torch
 
-from flashinfer.mamba import SSDCombined, ssd_combined_fwd
+from flashinfer.mamba import SSDCombined
 from flashinfer.testing.utils import bench_gpu_time
 
 sys.path.insert(0, "tests/mamba")
@@ -276,6 +276,7 @@ def bench_mode(configs, mode, model_params, bench_params, title=None):
         has_d=True,
         has_initial_states=True,
         has_varlen=(mode == "varlen"),
+        seq_idx_dtype=torch.int32,  # varlen metadata uses int32
     )
 
     # Keys to strip per kernel per mode.
@@ -435,9 +436,17 @@ def ncu_mode(args, model_params):
         f"  NCU mode: launching kernel once (batch={args.batch}, "
         f"nchunks={args.nchunks}, seqlen={seqlen})"
     )
-    ssd_combined_fwd(
-        x, dt, A, B, C, p["chunk_size"], D=D, dt_bias=dt_bias, dt_softplus=True
+    ssd = SSDCombined(
+        chunk_size=p["chunk_size"],
+        nheads=p["nheads"],
+        headdim=p["headdim"],
+        dstate=p["dstate"],
+        ngroups=p["ngroups"],
+        io_dtype=p["dtype"],
+        has_d=True,
+        has_initial_states=False,
     )
+    ssd.run(x, dt, A, B, C, D=D, dt_bias=dt_bias, dt_softplus=True)
     torch.cuda.synchronize()
     print("  Done.")
 

@@ -22,13 +22,14 @@ This module provides the combined forward pass for Mamba2 SSD, combining:
 """
 
 import functools
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
 import cuda.bindings.driver as cuda_drv
 import torch
+from cutlass import Int32
 from cutlass.base_dsl.compiler import GenerateLineInfo  # profiling
 from cutlass.cute.runtime import from_dlpack
 
@@ -41,6 +42,211 @@ from .ssd_kernel import SSDKernel
 def _get_seq_chunk_cumsum_module():
     """Get cached seq_chunk_cumsum JIT module."""
     return gen_seq_chunk_cumsum_module().build_and_load()
+
+
+@functools.cache
+def _get_compiled_ssd_kernel(
+    chunk_size: int,
+    headdim: int,
+    dstate: int,
+    has_d: bool,
+    d_has_hdim: bool,
+    has_init_states: bool,
+    has_varlen: bool,
+    has_z: bool,
+    io_dtype,
+    state_dtype,
+    seq_idx_dtype,
+    cumsum_dtype,
+    acc_dtype,
+    max_active_clusters: int,
+):
+    """Compile SSD kernel with fake tensors for shape-polymorphic caching.
+
+    Uses CuTe DSL fake tensors with symbolic dimensions so the compiled kernel
+    can be reused across different batch sizes, sequence lengths, etc.
+    The compiled kernel accepts torch tensors directly via TVM-FFI.
+    """
+    kernel_obj = SSDKernel(
+        chunk_size,
+        headdim,
+        dstate,
+        has_d,
+        d_has_hdim,
+        has_init_states,
+        has_varlen,
+        has_z,
+        io_dtype=io_dtype,
+        state_dtype=state_dtype,
+        seq_idx_dtype=seq_idx_dtype,
+        cumsum_delta_dtype=cumsum_dtype,
+        acc_dtype=acc_dtype,
+    )
+
+    L = chunk_size
+    D = headdim
+    N = dstate
+
+    # Symbolic dimensions for all runtime-variable sizes
+    sym_C = cute.sym_int()  # nchunks
+    sym_EH = cute.sym_int()  # nheads
+    sym_B = cute.sym_int()  # batch
+    sym_G = cute.sym_int()  # ngroups
+
+    # Stride order convention for make_fake_compact_tensor:
+    #   stride_order[i] = rank of dim i, where rank 0 = innermost (stride 1).
+    # This differs from mark_compact_shape_dynamic which uses inv(perm).
+    # Formula: make_fake_stride_order[i] = N - 1 - permute_order[i]
+
+    # x: (D, L, C, EH, B) — D stride 1 (from permute (4,2,1,3,0) of 5D)
+    x_fake = cute.runtime.make_fake_compact_tensor(
+        io_dtype,
+        (D, L, sym_C, sym_EH, sym_B),
+        stride_order=(0, 2, 3, 1, 4),
+        assumed_align=16,
+    )
+
+    # cumsum_delta: (L, C, EH, B) — L stride 1 (from permute (3,2,1,0) of 4D)
+    cumsum_delta_fake = cute.runtime.make_fake_compact_tensor(
+        cumsum_dtype,
+        (L, sym_C, sym_EH, sym_B),
+        stride_order=(0, 1, 2, 3),
+        assumed_align=16,
+    )
+
+    # delta: (L, C, EH, B) — L stride 1 (same layout as cumsum_delta)
+    delta_fake = cute.runtime.make_fake_compact_tensor(
+        io_dtype,
+        (L, sym_C, sym_EH, sym_B),
+        stride_order=(0, 1, 2, 3),
+        assumed_align=16,
+    )
+
+    # B: (L, N, C, G, B) — N stride 1 (from permute (2,4,1,3,0) of 5D)
+    b_fake = cute.runtime.make_fake_compact_tensor(
+        io_dtype,
+        (L, N, sym_C, sym_G, sym_B),
+        stride_order=(2, 0, 3, 1, 4),
+        assumed_align=16,
+    )
+
+    # C: (L, N, C, G, B) — N stride 1 (same layout as B)
+    c_fake = cute.runtime.make_fake_compact_tensor(
+        io_dtype,
+        (L, N, sym_C, sym_G, sym_B),
+        stride_order=(2, 0, 3, 1, 4),
+        assumed_align=16,
+    )
+
+    # y: (L, D, C, EH, B) — L stride 1 (from permute (4,2,3,1,0) of 5D)
+    y_fake = cute.runtime.make_fake_compact_tensor(
+        io_dtype,
+        (L, D, sym_C, sym_EH, sym_B),
+        stride_order=(0, 2, 1, 3, 4),
+        assumed_align=16,
+    )
+
+    # init_states and fstate use a separate batch sym because in varlen mode
+    # init_states has num_seqs as batch dim (not the packed batch dim of x).
+    sym_state_B = cute.sym_int()
+
+    # init_states: (N, D, EH, state_B) — N stride 1 (from permute (3,2,1,0) of 4D)
+    init_states_fake = None
+    if has_init_states:
+        init_states_fake = cute.runtime.make_fake_compact_tensor(
+            state_dtype,
+            (N, D, sym_EH, sym_state_B),
+            stride_order=(0, 1, 2, 3),
+            assumed_align=16,
+        )
+
+    # fstate: (N, D, EH, state_B) — N stride 1 (same layout as init_states)
+    fstate_fake = cute.runtime.make_fake_compact_tensor(
+        state_dtype,
+        (N, D, sym_EH, sym_state_B),
+        stride_order=(0, 1, 2, 3),
+        assumed_align=16,
+    )
+
+    # D tensor: (D_dim, EH) — D_dim stride 1 (from permute (1,0) of 2D)
+    d_fake = None
+    if has_d:
+        d_dim = D if d_has_hdim else 1
+        d_fake = cute.runtime.make_fake_compact_tensor(
+            io_dtype,
+            (d_dim, sym_EH),
+            stride_order=(0, 1),
+            assumed_align=16,
+        )
+
+    # z: same layout as x — optional
+    z_fake = None
+    if has_z:
+        z_fake = cute.runtime.make_fake_compact_tensor(
+            io_dtype,
+            (D, L, sym_C, sym_EH, sym_B),
+            stride_order=(0, 2, 3, 1, 4),
+            assumed_align=16,
+        )
+
+    # Varlen metadata — optional
+    seq_idx_fake = None
+    chunk_indices_fake = None
+    chunk_offsets_fake = None
+    seq_chunk_cumsum_fake = None
+    if has_varlen:
+        sym_batch_dim = cute.sym_int()
+        sym_seqlen = cute.sym_int()
+        seq_idx_fake = cute.runtime.make_fake_compact_tensor(
+            seq_idx_dtype,
+            (sym_batch_dim, sym_seqlen),
+            stride_order=(1, 0),
+            assumed_align=4,
+        )
+        sym_nlc = cute.sym_int()  # num_logical_chunks
+        chunk_indices_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (sym_nlc,),
+            assumed_align=4,
+        )
+        chunk_offsets_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (sym_nlc,),
+            assumed_align=4,
+        )
+        sym_nsp1 = cute.sym_int()  # num_seqs + 1
+        seq_chunk_cumsum_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (sym_nsp1,),
+            assumed_align=4,
+        )
+
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
+    compiled = cute.compile[GenerateLineInfo(True)](
+        kernel_obj,
+        x_fake,
+        cumsum_delta_fake,
+        delta_fake,
+        b_fake,
+        c_fake,
+        y_fake,
+        init_states_fake,
+        fstate_fake,
+        d_fake,
+        z_fake,
+        seq_idx_fake,
+        chunk_indices_fake,
+        chunk_offsets_fake,
+        seq_chunk_cumsum_fake,
+        Int32(0),  # num_logical_chunks (dummy, runtime value)
+        Int32(0),  # num_seqs (dummy, runtime value)
+        max_active_clusters,
+        stream_fake,
+        options="--enable-tvm-ffi",
+    )
+
+    return compiled
 
 
 def _create_cutlass_tensor(shape, permute_order, dtype, dynamic_modes):
@@ -147,9 +353,7 @@ class _SSDKernel:
             torch.int32: cutlass.Int32,
             torch.int64: cutlass.Int64,
         }
-        seq_idx_cutlass_dtype = _seq_idx_dtype_map.get(
-            seq_idx_dtype, cutlass.Int32
-        )
+        seq_idx_cutlass_dtype = _seq_idx_dtype_map.get(seq_idx_dtype, cutlass.Int32)
 
         # Create the kernel
         self.kernel = SSDKernel(
@@ -168,7 +372,7 @@ class _SSDKernel:
             acc_dtype=self.acc_dtype,
         )
 
-        self._compiled_kernel = None
+        self._compiled_kernel: Optional[Callable] = None
 
     def run(
         self,
@@ -245,9 +449,7 @@ class _SSDKernel:
             f"dt_processed dtype {dt_processed.dtype} doesn't match "
             f"io_dtype {io_torch_dtype}"
         )
-        dt_permuted = dt_processed.permute(
-            3, 2, 1, 0
-        )  # (L, C, EH, B)
+        dt_permuted = dt_processed.permute(3, 2, 1, 0)  # (L, C, EH, B)
         delta_tensor = from_dlpack(dt_permuted, assumed_align=16)
         # Mark dynamic modes: C=1, EH=2, B=3 (L=0 is static)
         for mode in (1, 2, 3):
@@ -552,9 +754,7 @@ class SSDCombined:
         self._state_torch_dtype = state_dtype
 
         # Resolve dtypes
-        assert io_dtype == torch.bfloat16, (
-            f"io_dtype must be bfloat16, got {io_dtype}"
-        )
+        assert io_dtype == torch.bfloat16, f"io_dtype must be bfloat16, got {io_dtype}"
         self._io_dtype = cutlass.BFloat16
         _state_dtype_map = {
             torch.bfloat16: cutlass.BFloat16,
@@ -568,15 +768,26 @@ class SSDCombined:
         self._acc_dtype = cutlass.Float32
         self._io_torch_dtype = cutlass_torch.dtype(self._io_dtype)
 
-        # Create kernel object
+        # Resolve seq_idx dtype
         _seq_idx_dtype_map = {
             torch.int32: cutlass.Int32,
             torch.int64: cutlass.Int64,
         }
-        seq_idx_cutlass_dtype = _seq_idx_dtype_map.get(
+        self._seq_idx_cutlass_dtype = _seq_idx_dtype_map.get(
             seq_idx_dtype, cutlass.Int32
         )
-        self._kernel_obj = SSDKernel(
+
+        # Compile kernel (cached across instances with same compile-time params).
+        # HardwareInfo uses cuda.bindings.driver which requires a driver context.
+        # torch.cuda.init() alone is insufficient; allocating on GPU forces
+        # creation of the full driver context.
+        _, ctx = cuda_drv.cuCtxGetCurrent()
+        if int(ctx) == 0:
+            torch.empty(0, device="cuda")
+        hardware_info = cutlass.utils.HardwareInfo()
+        self._max_active_clusters = hardware_info.get_max_active_clusters(1)
+
+        self._compiled_kernel = _get_compiled_ssd_kernel(
             chunk_size,
             headdim,
             dstate,
@@ -585,26 +796,17 @@ class SSDCombined:
             has_initial_states,
             has_varlen,
             has_z,
-            io_dtype=self._io_dtype,
-            state_dtype=self._state_dtype,
-            seq_idx_dtype=seq_idx_cutlass_dtype,
-            cumsum_delta_dtype=self._cumsum_dtype,
-            acc_dtype=self._acc_dtype,
+            self._io_dtype,
+            self._state_dtype,
+            self._seq_idx_cutlass_dtype,
+            self._cumsum_dtype,
+            self._acc_dtype,
+            self._max_active_clusters,
         )
-        self._compiled_kernel = None
-
-        # Lazily cached on first run() (needs active CUDA context)
-        self._max_active_clusters = None
 
         # Pre-allocated buffer caches (lazily initialized on first run)
         self._fstate_shape = None
-        self._fstate_cute = None
         self._fstate_torch = None
-
-        self._d_ptr = None
-        self._d_shape = None
-        self._d_cute = None
-        self._d_torch = None
 
         self._seq_cumsum_size = 0
         self._seq_cumsum_buf = None
@@ -614,57 +816,13 @@ class SSDCombined:
     def _get_or_alloc_fstate(self, fstate_batch):
         shape = (fstate_batch, self.nheads, self.headdim, self.dstate)
         if self._fstate_shape != shape:
-            self._fstate_cute, self._fstate_torch = _create_cutlass_tensor(
-                list(shape),
-                [3, 2, 1, 0],
-                self._state_dtype,
-                [2, 3],
+            state_torch_dtype = cutlass_torch.dtype(self._state_dtype)
+            # Allocate contiguous (B, EH, D, N); kernel receives permuted view
+            self._fstate_torch = torch.empty(
+                *shape, dtype=state_torch_dtype, device="cuda"
             )
             self._fstate_shape = shape
-        return self._fstate_cute, self._fstate_torch
-
-    def _get_or_wrap_d(self, D):
-        if D is None:
-            return None
-        d_ptr = D.data_ptr()
-        d_shape = D.shape
-        if self._d_ptr == d_ptr and self._d_shape == d_shape:
-            return self._d_cute
-
-        if self._d_has_hdim:
-            d_val = D
-            if D.dim() == 1:
-                d_val = D.unsqueeze(1).expand(-1, self.headdim)
-            self._d_cute, self._d_torch = _create_cutlass_tensor(
-                [self.nheads, self.headdim],
-                [1, 0],
-                self._io_dtype,
-                [1],
-            )
-            assert d_val.dtype == self._d_torch.dtype, (
-                f"D dtype {d_val.dtype} doesn't match "
-                f"io_dtype {self._d_torch.dtype}"
-            )
-            self._d_torch.copy_(d_val.t())
-        else:
-            d_val = D
-            if D.dim() == 2:
-                d_val = D[:, 0]
-            self._d_cute, self._d_torch = _create_cutlass_tensor(
-                [self.nheads, 1],
-                [1, 0],
-                self._io_dtype,
-                [1],
-            )
-            assert d_val.dtype == self._d_torch.dtype, (
-                f"D dtype {d_val.dtype} doesn't match "
-                f"io_dtype {self._d_torch.dtype}"
-            )
-            self._d_torch.copy_(d_val.unsqueeze(0))
-
-        self._d_ptr = d_ptr
-        self._d_shape = d_shape
-        return self._d_cute
+        return self._fstate_torch
 
     def _get_or_alloc_seq_cumsum(self, num_seqs, device):
         size = num_seqs + 1
@@ -783,7 +941,9 @@ class SSDCombined:
                 device=x.device,
             )
 
-        # -- Step 3: Wrap input tensors for CuTe DSL --------------------------
+        # -- Step 3: Prepare torch tensors in CuTe-expected layouts -------------
+        # With TVM-FFI, we pass torch tensors directly (no from_dlpack needed).
+        # The stride patterns must match the fake tensors used at compile time.
         io_torch_dtype = self._io_torch_dtype
 
         # x: (B, seqlen, EH, D) -> (D, L, C, EH, B)
@@ -791,115 +951,83 @@ class SSDCombined:
         assert x.dtype == io_torch_dtype, (
             f"x dtype {x.dtype} doesn't match {io_torch_dtype}"
         )
-        x_tensor = _wrap_tensor(
-            x_reshaped.permute(4, 2, 1, 3, 0),
-            (2, 3, 4),
-            (4, 2, 1, 3, 0),
-        )
+        x_permuted = x_reshaped.permute(4, 2, 1, 3, 0)
 
         # z: same layout as x
-        z_tensor = None
+        z_permuted = None
         if z is not None:
             z_reshaped = z.reshape(batch, nchunks, chunk_size, nheads, headdim)
             assert z.dtype == io_torch_dtype, (
                 f"z dtype {z.dtype} doesn't match {io_torch_dtype}"
             )
-            z_tensor = _wrap_tensor(
-                z_reshaped.permute(4, 2, 1, 3, 0),
-                (2, 3, 4),
-                (4, 2, 1, 3, 0),
-            )
+            z_permuted = z_reshaped.permute(4, 2, 1, 3, 0)
 
-        # dt: already in io_dtype from cumsum kernel, just permute
-        delta_tensor = _wrap_tensor(
-            dt_processed.permute(3, 2, 1, 0),
-            (1, 2, 3),
-            (3, 2, 1, 0),
-        )
+        # dt: already in io_dtype from cumsum kernel
+        delta_permuted = dt_processed.permute(3, 2, 1, 0)  # (L, C, EH, B)
 
         # dA_cumsum: (B, EH, C, L) -> (L, C, EH, B)
         assert dA_cumsum.dtype == cutlass_torch.dtype(self._cumsum_dtype), (
             f"dA_cumsum dtype {dA_cumsum.dtype} doesn't match "
             f"cumsum_dtype {self._cumsum_dtype}"
         )
-        cumsum_delta_tensor = _wrap_tensor(
-            dA_cumsum.permute(3, 2, 1, 0),
-            (1, 2, 3),
-            (3, 2, 1, 0),
-        )
+        cumsum_delta_permuted = dA_cumsum.permute(3, 2, 1, 0)
 
         # B: (B, seqlen, G, N) -> (L, N, C, G, B)
         B_reshaped = B.reshape(batch, nchunks, chunk_size, ngroups, dstate)
         assert B.dtype == io_torch_dtype, (
             f"B dtype {B.dtype} doesn't match {io_torch_dtype}"
         )
-        b_tensor = _wrap_tensor(
-            B_reshaped.permute(2, 4, 1, 3, 0),
-            (2, 3, 4),
-            (4, 2, 0, 3, 1),
-        )
+        b_permuted = B_reshaped.permute(2, 4, 1, 3, 0)
 
         # C: (B, seqlen, G, N) -> (L, N, C, G, B)
         C_reshaped = C.reshape(batch, nchunks, chunk_size, ngroups, dstate)
         assert C.dtype == io_torch_dtype, (
             f"C dtype {C.dtype} doesn't match {io_torch_dtype}"
         )
-        c_tensor = _wrap_tensor(
-            C_reshaped.permute(2, 4, 1, 3, 0),
-            (2, 3, 4),
-            (4, 2, 0, 3, 1),
-        )
+        c_permuted = C_reshaped.permute(2, 4, 1, 3, 0)
 
-        # D: must be io_dtype (kernel buffer is io_dtype, no conversion)
-        if D is not None:
+        # D tensor: reshape to match kernel layout
+        d_tensor = None
+        if self._has_d and D is not None:
             assert D.dtype == io_torch_dtype, (
                 f"D dtype {D.dtype} doesn't match io_dtype {io_torch_dtype}"
             )
-        d_tensor = self._get_or_wrap_d(D) if self._has_d else None
+            if self._d_has_hdim:
+                if D.dim() == 1:
+                    # (nheads,) -> (headdim, nheads): broadcast must be materialized
+                    d_tensor = D.unsqueeze(1).expand(-1, headdim).contiguous().t()
+                else:
+                    # (nheads, headdim) -> (headdim, nheads)
+                    d_tensor = D.t().contiguous()
+            else:
+                if D.dim() == 2:
+                    d_tensor = D[:, 0].unsqueeze(0)  # (1, nheads)
+                else:
+                    d_tensor = D.unsqueeze(0)  # (1, nheads)
 
-        # init_states (state_dtype)
-        init_states_tensor = None
+        # init_states: (B, EH, D, N) -> (N, D, EH, B)
+        init_states_permuted = None
         if self._has_init_states and initial_states is not None:
             assert initial_states.dtype == self._state_torch_dtype, (
                 f"init_states dtype {initial_states.dtype} doesn't match "
                 f"state_dtype {self._state_torch_dtype}"
             )
-            init_states_tensor = _wrap_tensor(
-                initial_states.permute(3, 2, 1, 0),
-                (2, 3),
-                (3, 2, 1, 0),
-            )
+            init_states_permuted = initial_states.permute(3, 2, 1, 0)
 
         # out: (B, EH, D, C, L) -> (L, D, C, EH, B)
         assert out.dtype == io_torch_dtype, (
             f"out dtype {out.dtype} doesn't match {io_torch_dtype}"
         )
-        y_tensor = _wrap_tensor(
-            out.permute(4, 2, 3, 1, 0),
-            (2, 3, 4),
-            (4, 3, 1, 2, 0),
-        )
+        y_permuted = out.permute(4, 2, 3, 1, 0)
 
-        # fstate (cached)
+        # fstate: allocate (B, EH, D, N), pass permuted (N, D, EH, B) to kernel
         fstate_batch = initial_states.shape[0] if initial_states is not None else batch
-        fstate_tensor, fstate_torch = self._get_or_alloc_fstate(fstate_batch)
-
-        # Stream
-        stream = cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream)
+        fstate_torch = self._get_or_alloc_fstate(fstate_batch)
+        fstate_permuted = fstate_torch.permute(3, 2, 1, 0)
 
         # -- Step 4: Varlen metadata ------------------------------------------
-        seq_idx_tensor = None
-        chunk_indices_tensor = None
-        chunk_offsets_tensor = None
-        seq_chunk_cumsum_tensor = None
+        seq_chunk_cumsum = None
         num_seqs = 0
-
-        if seq_idx is not None:
-            seq_idx_tensor = from_dlpack(seq_idx, assumed_align=4)
-        if chunk_indices is not None:
-            chunk_indices_tensor = from_dlpack(chunk_indices, assumed_align=4)
-        if chunk_offsets is not None:
-            chunk_offsets_tensor = from_dlpack(chunk_offsets, assumed_align=4)
 
         if (
             seq_idx is not None
@@ -921,70 +1049,38 @@ class SSDCombined:
                 num_logical_chunks_local,
                 num_seqs,
             )
-            seq_chunk_cumsum_tensor = from_dlpack(
-                seq_chunk_cumsum,
-                assumed_align=4,
-            )
 
         num_logical_chunks = (
             len(chunk_indices) if chunk_indices is not None else nchunks
         )
 
-        # -- Step 5: Compile on first call ------------------------------------
-        if self._max_active_clusters is None:
-            hardware_info = cutlass.utils.HardwareInfo()
-            self._max_active_clusters = hardware_info.get_max_active_clusters(1)
-
-        if self._compiled_kernel is None:
-            self._compiled_kernel = cute.compile[GenerateLineInfo(True)](
-                self._kernel_obj,
-                x_tensor,
-                cumsum_delta_tensor,
-                delta_tensor,
-                b_tensor,
-                c_tensor,
-                y_tensor,
-                init_states_tensor,
-                fstate_tensor,
-                d_tensor,
-                z_tensor,
-                seq_idx_tensor,
-                chunk_indices_tensor,
-                chunk_offsets_tensor,
-                seq_chunk_cumsum_tensor,
-                num_logical_chunks,
-                num_seqs,
-                self._max_active_clusters,
-                stream,
-            )
-
-        # -- Step 6: Launch kernel --------------------------------------------
+        # -- Step 5: Launch kernel (TVM-FFI: torch tensors passed directly) ---
         self._compiled_kernel(
-            x_tensor,
-            cumsum_delta_tensor,
-            delta_tensor,
-            b_tensor,
-            c_tensor,
-            y_tensor,
-            init_states_tensor,
-            fstate_tensor,
+            x_permuted,
+            cumsum_delta_permuted,
+            delta_permuted,
+            b_permuted,
+            c_permuted,
+            y_permuted,
+            init_states_permuted,
+            fstate_permuted,
             d_tensor,
-            z_tensor,
-            seq_idx_tensor,
-            chunk_indices_tensor,
-            chunk_offsets_tensor,
-            seq_chunk_cumsum_tensor,
-            num_logical_chunks,
-            num_seqs,
-            stream,
+            z_permuted,
+            seq_idx,
+            chunk_indices,
+            chunk_offsets,
+            seq_chunk_cumsum,
+            Int32(num_logical_chunks),
+            Int32(num_seqs),
         )
 
-        # -- Step 7: Output ---------------------------------------------------
+        # -- Step 6: Output ---------------------------------------------------
         out_view = out.permute(0, 3, 4, 1, 2).reshape(
             batch,
             seqlen,
             nheads,
             headdim,
         )
-        fstate_out = fstate_torch.permute(3, 2, 1, 0) if return_final_states else None
+        # fstate_torch is (B, EH, D, N) — already in the expected return layout
+        fstate_out = fstate_torch if return_final_states else None
         return out_view, fstate_out
