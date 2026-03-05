@@ -15,18 +15,25 @@ limitations under the License.
 """
 
 import functools
+import math
 from typing import Optional
 
 import torch
 
 from .api_logging import flashinfer_api
 from .jit.norm import gen_norm_module
+from .jit.fused_rmsnorm_silu import gen_fused_rmsnorm_silu_module
 from .utils import device_support_pdl, register_custom_op, register_fake_op
 
 
 @functools.cache
 def get_norm_module():
     return gen_norm_module().build_and_load()
+
+
+@functools.cache
+def get_fused_rmsnorm_silu_module():
+    return gen_fused_rmsnorm_silu_module().build_and_load()
 
 
 @flashinfer_api
@@ -411,3 +418,43 @@ except ImportError:
     # CuTe-DSL not available
     rmsnorm_fp4quant = None  # type: ignore[misc,assignment]
     add_rmsnorm_fp4quant = None  # type: ignore[misc,assignment]
+
+
+@flashinfer_api
+def fused_rmsnorm_silu(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Fused RMSNorm + SiLU activation (L2Norm variant).
+
+    Computes: ``out = SiLU(x / sqrt(sum(x^2) + eps) * scale * weight)``
+
+    This matches the WAN VAE's ``F.normalize(x, dim=1) * scale * gamma``
+    followed by SiLU activation. The ``scale`` factor is ``sqrt(hidden_size)``
+    to convert from L2Norm to RMSNorm convention.
+
+    Parameters
+    ----------
+    input: torch.Tensor
+        Input tensor, shape (num_tokens, hidden_size). Must be bf16.
+    weight: torch.Tensor
+        Weight tensor, shape (hidden_size,). Must be bf16.
+    eps: float
+        Epsilon for L2 normalization (NOT divided by C — the kernel handles
+        the L2Norm convention directly).
+    out: Optional[torch.Tensor]
+        The output tensor, if specified, the kernel will update this tensor inplace.
+
+    Returns
+    -------
+    output: torch.Tensor
+        Output tensor, same shape and dtype as input.
+    """
+    if out is None:
+        out = torch.empty_like(input)
+    hidden_size = input.shape[-1]
+    scale = math.sqrt(hidden_size)
+    get_fused_rmsnorm_silu_module().fused_rmsnorm_silu(out, input, weight, eps, scale)
+    return out
