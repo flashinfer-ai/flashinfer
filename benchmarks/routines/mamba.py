@@ -14,12 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-# ==============================================================================
-# Triton reference implementation for selective_state_update.
-# Imported from tests/mamba/selective_state_update_triton.py to avoid code
-# duplication. See that file for the canonical Triton kernel source.
-# ==============================================================================
-
 import os
 import sys
 from collections import defaultdict
@@ -30,6 +24,14 @@ import torch
 import flashinfer
 from flashinfer.testing.utils import bench_gpu_time
 
+# Add tests/mamba to sys.path so triton_reference is importable as a package
+_repo_root = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
+)
+_tests_mamba = os.path.join(_repo_root, "tests", "mamba")
+if _tests_mamba not in sys.path:
+    sys.path.insert(0, _tests_mamba)
+
 from .flashinfer_benchmark_utils import (
     dtype_str_to_torch_dtype,
     get_device,
@@ -38,43 +40,9 @@ from .flashinfer_benchmark_utils import (
     filter_backends_by_compute_capability,
 )
 
-# ---- Import Triton reference kernel from tests/mamba/ ----
-# The canonical Triton selective_state_update lives in tests/mamba/selective_state_update_triton.py.
-# We import it here rather than duplicating ~400 lines of kernel code.
-
-
-def _import_triton_reference():
-    """Import selective_state_update_triton from tests/mamba/.
-
-    Uses importlib to load the module directly by file path, avoiding sys.path
-    pollution and fragile relative path assumptions.
-    """
-    # Resolve path: benchmarks/routines/mamba.py -> ../../tests/mamba/selective_state_update_triton.py
-    _this_dir = os.path.dirname(os.path.abspath(__file__))
-    _repo_root = os.path.normpath(os.path.join(_this_dir, "..", ".."))
-    _triton_ref_path = os.path.join(
-        _repo_root, "tests", "mamba", "triton_reference", "selective_state_update.py"
-    )
-
-    if not os.path.isfile(_triton_ref_path):
-        raise ImportError(
-            f"Cannot find Triton reference kernel at: {_triton_ref_path}\n"
-            f"Expected location: <repo>/tests/mamba/triton_reference/selective_state_update.py\n"
-            f"Make sure you are running from within the FlashInfer repository."
-        )
-
-    # Add the tests/mamba directory to sys.path so that the relative imports
-    # inside the triton_reference package resolve correctly.
-    _tests_mamba_dir = os.path.join(_repo_root, "tests", "mamba")
-    if _tests_mamba_dir not in sys.path:
-        sys.path.insert(0, _tests_mamba_dir)
-
-    from triton_reference.selective_state_update import selective_state_update_triton
-
-    return selective_state_update_triton
-
-
-selective_state_update_triton_reference = _import_triton_reference()
+from triton_reference.selective_state_update import (
+    selective_state_update_triton as selective_state_update_triton_reference,
+)
 
 
 # ==============================================================================

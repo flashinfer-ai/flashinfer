@@ -3,9 +3,39 @@ import pytest
 import torch
 
 import flashinfer
+from flashinfer.utils import get_compute_capability
 
 from .triton_reference.selective_state_update import selective_state_update_triton
 from .utils import create_test_inputs, clone_preserving_strides
+
+
+def _get_algorithms():
+    """Return list of algorithms supported on the current GPU."""
+    major, _ = get_compute_capability(torch.device("cuda"))
+    algos = ["simple"]
+    if major >= 9:
+        algos.extend(["vertical", "horizontal"])
+    return algos
+
+
+# Base combination: batch=64, nheads=64, dim=64, dstate=128, state_dtype=bf16,
+#                   weight_dtype=f32, use_out_tensor=True
+# Each additional row varies exactly one parameter from the base.
+# fmt: off
+_BASE_PARAMS = [
+    # (batch, nheads, dim, dstate,  state_dtype,        weight_dtype,      use_out_tensor)
+    (  64,    64,     64,  128,     torch.bfloat16,     torch.float32,     True ),  # base bf16
+    (  64,    64,     64,  128,     torch.float32,      torch.float32,     True ),  # state_dtype=f32
+    (   1,    64,     64,  128,     torch.bfloat16,     torch.float32,     True ),  # batch=1
+    (  64,     8,     64,  128,     torch.bfloat16,     torch.float32,     True ),  # nheads=8
+    (  64,    64,    128,  128,     torch.bfloat16,     torch.float32,     True ),  # dim=128
+    (  64,    64,     64,   64,     torch.bfloat16,     torch.float32,     True ),  # dstate=64
+    (  64,    64,     64,  256,     torch.bfloat16,     torch.float32,     True ),  # dstate=256
+    (  64,    64,     64,  128,     torch.float16,      torch.float32,     True ),  # state_dtype=f16
+    (  64,    64,     64,  128,     torch.bfloat16,     torch.bfloat16,    True ),  # weight_dtype=bf16
+    (  64,    64,     64,  128,     torch.bfloat16,     torch.float32,     False),  # use_out_tensor=False
+]
+# fmt: on
 
 
 class TestSelectiveStateUpdate:
@@ -18,36 +48,7 @@ class TestSelectiveStateUpdate:
     INPUT_DTYPE = torch.bfloat16
     MATRIX_A_DTYPE = torch.float32
 
-    @pytest.fixture(params=[1, 64])
-    def batch(self, request):
-        return request.param
-
-    @pytest.fixture(params=[8, 64])
-    def nheads(self, request):
-        return request.param
-
-    @pytest.fixture(params=[64, 128])
-    def dim(self, request):
-        return request.param
-
-    @pytest.fixture(params=[64, 128, 256])
-    def dstate(self, request):
-        return request.param
-
-    @pytest.fixture(params=[torch.float16, torch.bfloat16, torch.float32])
-    def state_dtype(self, request):
-        return request.param
-
-    @pytest.fixture(params=[torch.float32, torch.bfloat16])
-    def weight_dtype(self, request):
-        return request.param
-
-    @pytest.fixture(params=[False, True])
-    def use_out_tensor(self, request):
-        return request.param
-
-    @pytest.fixture
-    def inputs(self, batch, nheads, dim, dstate, state_dtype, weight_dtype):
+    def make_inputs(self, batch, nheads, dim, dstate, state_dtype, weight_dtype):
         """Create test inputs for given parameters."""
         return create_test_inputs(
             batch,
@@ -63,8 +64,7 @@ class TestSelectiveStateUpdate:
             seed=0,
         )
 
-    @pytest.fixture
-    def reference_output(self, inputs):
+    def make_reference_output(self, inputs):
         """Compute reference output using triton implementation."""
         state_ref = inputs["state_cache"].clone()
         y_ref = selective_state_update_triton(
@@ -83,7 +83,7 @@ class TestSelectiveStateUpdate:
         )
         return y_ref, state_ref
 
-    def run_kernel(self, inputs, out=None):
+    def run_kernel(self, inputs, out=None, algorithm="auto"):
         """Run the flashinfer kernel and return output."""
         return flashinfer.mamba.selective_state_update(
             inputs["state_cache"],
@@ -99,6 +99,7 @@ class TestSelectiveStateUpdate:
             state_batch_indices=inputs["slot_idx"],
             pad_slot_id=-1,
             out=out,
+            algorithm=algorithm,
         )
 
     def assert_outputs_match(self, y_ref, y_test, msg_prefix=""):
@@ -165,20 +166,32 @@ class TestSelectiveStateUpdate:
                 f"diff={diff:.6e}, rel_diff={rel_diff:.6e}"
             )
 
-    def test_output_correctness(self, inputs, reference_output, use_out_tensor):
+    @pytest.mark.parametrize("algorithm", _get_algorithms())
+    @pytest.mark.parametrize(
+        "batch,nheads,dim,dstate,state_dtype,weight_dtype,use_out_tensor", _BASE_PARAMS
+    )
+    def test_output_correctness(
+        self,
+        batch,
+        nheads,
+        dim,
+        dstate,
+        state_dtype,
+        weight_dtype,
+        use_out_tensor,
+        algorithm,
+    ):
         """Test that kernel output matches reference within tolerance."""
-        y_ref, state_ref = reference_output
+        inputs = self.make_inputs(batch, nheads, dim, dstate, state_dtype, weight_dtype)
+        y_ref, state_ref = self.make_reference_output(inputs)
 
         # Prepare output tensor if requested
         if use_out_tensor:
-            batch = inputs["x"].shape[0]
-            nheads = inputs["x"].shape[1]
-            dim = inputs["x"].shape[2]
             out = torch.empty(batch, nheads, dim, dtype=self.INPUT_DTYPE, device="cuda")
         else:
             out = None
 
-        y_test = self.run_kernel(inputs, out=out)
+        y_test = self.run_kernel(inputs, out=out, algorithm=algorithm)
 
         # Verify output tensor identity if provided
         if use_out_tensor:
@@ -186,39 +199,19 @@ class TestSelectiveStateUpdate:
                 "Returned tensor should be the same object as the provided output tensor"
             )
 
-        self.assert_outputs_match(y_ref, y_test)
-        self.assert_states_match(state_ref, inputs["state_cache"], inputs["slot_idx"])
+        self.assert_outputs_match(y_ref, y_test, msg_prefix=f"[{algorithm}] ")
+        self.assert_states_match(
+            state_ref,
+            inputs["state_cache"],
+            inputs["slot_idx"],
+            msg_prefix=f"[{algorithm}] ",
+        )
 
 
 class TestSelectiveStateUpdateWithZ(TestSelectiveStateUpdate):
     """Test selective_state_update with z tensor (gating)."""
 
-    @pytest.fixture(params=[1])
-    def batch(self, request):
-        return request.param
-
-    @pytest.fixture(params=[8])
-    def nheads(self, request):
-        return request.param
-
-    @pytest.fixture(params=[64])
-    def dim(self, request):
-        return request.param
-
-    @pytest.fixture(params=[128])
-    def dstate(self, request):
-        return request.param
-
-    @pytest.fixture(params=[torch.bfloat16])
-    def state_dtype(self, request):
-        return request.param
-
-    @pytest.fixture(params=[torch.bfloat16])
-    def weight_dtype(self, request):
-        return request.param
-
-    @pytest.fixture
-    def inputs(self, batch, nheads, dim, dstate, state_dtype, weight_dtype):
+    def make_inputs(self, batch, nheads, dim, dstate, state_dtype, weight_dtype):
         """Create test inputs with z tensor."""
         return create_test_inputs(
             batch,
@@ -234,35 +227,38 @@ class TestSelectiveStateUpdateWithZ(TestSelectiveStateUpdate):
             seed=0,
         )
 
+    @pytest.mark.parametrize("algorithm", _get_algorithms())
+    @pytest.mark.parametrize(
+        "batch,nheads,dim,dstate,state_dtype,weight_dtype,use_out_tensor",
+        [(64, 64, 64, 128, torch.bfloat16, torch.float32, True)],
+    )
+    def test_output_correctness(
+        self,
+        batch,
+        nheads,
+        dim,
+        dstate,
+        state_dtype,
+        weight_dtype,
+        use_out_tensor,
+        algorithm,
+    ):
+        super().test_output_correctness(
+            batch,
+            nheads,
+            dim,
+            dstate,
+            state_dtype,
+            weight_dtype,
+            use_out_tensor,
+            algorithm,
+        )
+
 
 class TestSelectiveStateUpdateDisableStateUpdate(TestSelectiveStateUpdate):
     """Test selective_state_update with disable_state_update=True."""
 
-    @pytest.fixture(params=[1])
-    def batch(self, request):
-        return request.param
-
-    @pytest.fixture(params=[8])
-    def nheads(self, request):
-        return request.param
-
-    @pytest.fixture(params=[128])
-    def dim(self, request):
-        return request.param
-
-    @pytest.fixture(params=[64])
-    def dstate(self, request):
-        return request.param
-
-    @pytest.fixture(params=[torch.bfloat16])
-    def state_dtype(self, request):
-        return request.param
-
-    @pytest.fixture(params=[torch.bfloat16])
-    def weight_dtype(self, request):
-        return request.param
-
-    def run_kernel(self, inputs, out=None):
+    def run_kernel(self, inputs, out=None, algorithm="auto"):
         """Run the flashinfer kernel with disable_state_update=True."""
         return flashinfer.mamba.selective_state_update(
             inputs["state_cache"],
@@ -279,25 +275,38 @@ class TestSelectiveStateUpdateDisableStateUpdate(TestSelectiveStateUpdate):
             pad_slot_id=-1,
             out=out,
             disable_state_update=True,
+            algorithm=algorithm,
         )
 
-    def test_output_correctness(self, inputs, reference_output, use_out_tensor):
+    @pytest.mark.parametrize(
+        "batch,nheads,dim,dstate,state_dtype,weight_dtype,use_out_tensor",
+        [(64, 64, 64, 128, torch.bfloat16, torch.float32, True)],
+    )
+    def test_output_correctness(
+        self,
+        batch,
+        nheads,
+        dim,
+        dstate,
+        state_dtype,
+        weight_dtype,
+        use_out_tensor,
+        algorithm="auto",
+    ):
         """Test that kernel output matches reference but state is not updated."""
-        y_ref, state_ref = reference_output
+        inputs = self.make_inputs(batch, nheads, dim, dstate, state_dtype, weight_dtype)
+        y_ref, _state_ref = self.make_reference_output(inputs)
 
         # Save the initial state before running the kernel
         state_initial = inputs["state_cache"].clone()
 
         # Prepare output tensor if requested
         if use_out_tensor:
-            batch = inputs["x"].shape[0]
-            nheads = inputs["x"].shape[1]
-            dim = inputs["x"].shape[2]
             out = torch.empty(batch, nheads, dim, dtype=self.INPUT_DTYPE, device="cuda")
         else:
             out = None
 
-        y_test = self.run_kernel(inputs, out=out)
+        y_test = self.run_kernel(inputs, out=out, algorithm=algorithm)
 
         # Verify output tensor identity if provided
         if use_out_tensor:
@@ -339,20 +348,7 @@ class TestSelectiveStateUpdateDisableStateUpdate(TestSelectiveStateUpdate):
 class TestSelectiveStateUpdateNonContiguous(TestSelectiveStateUpdate):
     """Test selective_state_update with non-contiguous state cache."""
 
-    @pytest.fixture(params=[128])
-    def dstate(self, request):
-        return request.param
-
-    @pytest.fixture(params=[torch.bfloat16])
-    def state_dtype(self, request):
-        return request.param
-
-    @pytest.fixture(params=[torch.float32])
-    def weight_dtype(self, request):
-        return request.param
-
-    @pytest.fixture
-    def inputs(self, batch, nheads, dim, dstate, state_dtype, weight_dtype):
+    def make_inputs(self, batch, nheads, dim, dstate, state_dtype, weight_dtype):
         """Create test inputs with non-contiguous state cache (2x batch stride)."""
         noncontiguous_batch_stride = 2 * nheads * dim * dstate
 
@@ -371,8 +367,7 @@ class TestSelectiveStateUpdateNonContiguous(TestSelectiveStateUpdate):
             seed=0,
         )
 
-    @pytest.fixture
-    def reference_output(self, inputs):
+    def make_reference_output(self, inputs):
         """Compute reference output, preserving non-contiguous strides."""
         state_ref = clone_preserving_strides(inputs["state_cache"])
         y_ref = selective_state_update_triton(
@@ -391,35 +386,38 @@ class TestSelectiveStateUpdateNonContiguous(TestSelectiveStateUpdate):
         )
         return y_ref, state_ref
 
+    @pytest.mark.parametrize("algorithm", _get_algorithms())
+    @pytest.mark.parametrize(
+        "batch,nheads,dim,dstate,state_dtype,weight_dtype,use_out_tensor",
+        [(64, 64, 64, 128, torch.bfloat16, torch.float32, True)],
+    )
+    def test_output_correctness(
+        self,
+        batch,
+        nheads,
+        dim,
+        dstate,
+        state_dtype,
+        weight_dtype,
+        use_out_tensor,
+        algorithm,
+    ):
+        super().test_output_correctness(
+            batch,
+            nheads,
+            dim,
+            dstate,
+            state_dtype,
+            weight_dtype,
+            use_out_tensor,
+            algorithm,
+        )
+
 
 class TestSelectiveStateUpdateInt32Indices(TestSelectiveStateUpdate):
     """Test selective_state_update with int32 state_batch_indices."""
 
-    @pytest.fixture(params=[1])
-    def batch(self, request):
-        return request.param
-
-    @pytest.fixture(params=[8])
-    def nheads(self, request):
-        return request.param
-
-    @pytest.fixture(params=[64])
-    def dim(self, request):
-        return request.param
-
-    @pytest.fixture(params=[128])
-    def dstate(self, request):
-        return request.param
-
-    @pytest.fixture(params=[torch.bfloat16])
-    def state_dtype(self, request):
-        return request.param
-
-    @pytest.fixture(params=[torch.bfloat16])
-    def weight_dtype(self, request):
-        return request.param
-
-    def run_kernel(self, inputs, out=None):
+    def run_kernel(self, inputs, out=None, algorithm="auto"):
         """Run the flashinfer kernel with int32 state_batch_indices."""
         # Cast slot_idx to int32
         slot_idx_int32 = inputs["slot_idx"].to(torch.int32)
@@ -438,6 +436,337 @@ class TestSelectiveStateUpdateInt32Indices(TestSelectiveStateUpdate):
             state_batch_indices=slot_idx_int32,
             pad_slot_id=-1,
             out=out,
+            algorithm=algorithm,
+        )
+
+    @pytest.mark.parametrize("algorithm", _get_algorithms())
+    @pytest.mark.parametrize(
+        "batch,nheads,dim,dstate,state_dtype,weight_dtype,use_out_tensor",
+        [(64, 64, 64, 128, torch.bfloat16, torch.float32, True)],
+    )
+    def test_output_correctness(
+        self,
+        batch,
+        nheads,
+        dim,
+        dstate,
+        state_dtype,
+        weight_dtype,
+        use_out_tensor,
+        algorithm,
+    ):
+        super().test_output_correctness(
+            batch,
+            nheads,
+            dim,
+            dstate,
+            state_dtype,
+            weight_dtype,
+            use_out_tensor,
+            algorithm,
+        )
+
+
+# fmt: off
+_INT16_PARAMS = [
+    # (batch, nheads, dim, dstate, weight_dtype, use_out_tensor)
+    (  64,    64,     64,  128,    torch.float32,     True ),  # base
+    (   1,    64,     64,  128,    torch.float32,     True ),  # batch=1
+    (  64,     8,     64,  128,    torch.float32,     True ),  # nheads=8
+    (  64,    64,    128,  128,    torch.float32,     True ),  # dim=128
+    (  64,    64,     64,   64,    torch.float32,     True ),  # dstate=64
+    (  64,    64,     64,  256,    torch.float32,     True ),  # dstate=256
+    (  64,    64,     64,  128,    torch.bfloat16,    True ),  # weight_dtype=bf16
+]
+# fmt: on
+
+
+class TestSelectiveStateUpdateInt16(TestSelectiveStateUpdate):
+    """Test selective_state_update with int16 quantized state and block scaling."""
+
+    ATOL = 1e-1
+    RTOL = 1e-2
+
+    def make_inputs(self, batch, nheads, dim, dstate, _state_dtype, weight_dtype):
+        """Create test inputs with int16 state."""
+        return create_test_inputs(
+            batch,
+            nheads,
+            dim,
+            dstate,
+            self.NGROUPS,
+            self.INPUT_DTYPE,
+            weight_dtype=weight_dtype,
+            matrixA_dtype=self.MATRIX_A_DTYPE,
+            state_dtype=torch.int16,
+            generate_z=False,
+            seed=0,
+        )
+
+    def make_reference_output(self, inputs):
+        """Compute reference output using Triton with state_scale."""
+        state_ref = inputs["state_cache"].clone()
+        state_scale_ref = inputs["state_scale"].clone()
+        y_ref = selective_state_update_triton(
+            state_ref,
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            D=inputs["D"],
+            z=inputs.get("z"),
+            dt_bias=inputs["dt_bias"],
+            dt_softplus=True,
+            state_batch_indices=inputs["slot_idx"],
+            pad_slot_id=-1,
+            state_scale=state_scale_ref,
+        )
+        return y_ref, state_ref, state_scale_ref
+
+    def run_kernel(self, inputs, out=None, algorithm="auto"):
+        """Run the flashinfer kernel with state_scale."""
+        return flashinfer.mamba.selective_state_update(
+            inputs["state_cache"],
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            D=inputs["D"],
+            z=inputs.get("z"),
+            dt_bias=inputs["dt_bias"],
+            dt_softplus=True,
+            state_batch_indices=inputs["slot_idx"],
+            pad_slot_id=-1,
+            out=out,
+            state_scale=inputs["state_scale"],
+            algorithm=algorithm,
+        )
+
+    def assert_states_match(
+        self,
+        state_ref,
+        state_test,
+        slot_idx,
+        msg_prefix="",
+        state_scale_ref=None,
+        state_scale_test=None,
+    ):
+        """Compare dequantized int16 states."""
+        state_ref_batch = state_ref[slot_idx].float()
+        state_test_batch = state_test[slot_idx].float()
+
+        # Dequantize using the respective scales
+        if state_scale_ref is not None:
+            scale_ref = state_scale_ref[
+                slot_idx
+            ]  # (batch, nheads, dim, 1) or (batch, nheads, dim)
+            if scale_ref.dim() == 3:
+                scale_ref = scale_ref.unsqueeze(-1)
+            state_ref_batch = state_ref_batch * scale_ref
+        if state_scale_test is not None:
+            scale_test = state_scale_test[slot_idx]
+            if scale_test.dim() == 3:
+                scale_test = scale_test.unsqueeze(-1)
+            state_test_batch = state_test_batch * scale_test
+
+        states_match = torch.allclose(
+            state_ref_batch, state_test_batch, atol=self.ATOL, rtol=self.RTOL
+        )
+
+        if states_match:
+            print(
+                f"✓ {msg_prefix}Dequantized states match within tolerance (atol={self.ATOL}, rtol={self.RTOL})"
+            )
+        else:
+            print(f"✗ {msg_prefix}Dequantized states do NOT match")
+            diff = (state_ref_batch - state_test_batch).abs()
+            print(
+                f"  Max diff: {diff.max().item():.6f}, Mean diff: {diff.mean().item():.6f}"
+            )
+
+        assert states_match
+
+    @pytest.mark.parametrize(
+        "algorithm", [a for a in _get_algorithms() if a != "horizontal"]
+    )
+    @pytest.mark.parametrize(
+        "batch,nheads,dim,dstate,state_dtype,weight_dtype,use_out_tensor",
+        [(b, nh, d, ds, torch.int16, wd, uo) for b, nh, d, ds, wd, uo in _INT16_PARAMS],
+    )
+    def test_output_correctness(
+        self,
+        batch,
+        nheads,
+        dim,
+        dstate,
+        state_dtype,
+        weight_dtype,
+        use_out_tensor,
+        algorithm,
+    ):
+        inputs = self.make_inputs(batch, nheads, dim, dstate, state_dtype, weight_dtype)
+        y_ref, state_ref, state_scale_ref = self.make_reference_output(inputs)
+
+        if use_out_tensor:
+            out = torch.empty(batch, nheads, dim, dtype=self.INPUT_DTYPE, device="cuda")
+        else:
+            out = None
+
+        y_test = self.run_kernel(inputs, out=out, algorithm=algorithm)
+
+        if use_out_tensor:
+            assert y_test.data_ptr() == out.data_ptr()
+
+        self.assert_outputs_match(y_ref, y_test, msg_prefix=f"[{algorithm}] ")
+        self.assert_states_match(
+            state_ref,
+            inputs["state_cache"],
+            inputs["slot_idx"],
+            msg_prefix=f"[{algorithm}] ",
+            state_scale_ref=state_scale_ref,
+            state_scale_test=inputs["state_scale"],
+        )
+
+
+def _get_algorithms_no_horizontal():
+    """Return algorithms that support stochastic rounding (no horizontal)."""
+    major, _ = get_compute_capability(torch.device("cuda"))
+    algos = ["simple"]
+    if major >= 9:
+        algos.append("vertical")
+    return algos
+
+
+class TestSelectiveStateUpdateStochasticRounding(TestSelectiveStateUpdate):
+    """Test fp16 state with stochastic rounding vs Triton reference."""
+
+    ATOL = 0.001
+    RTOL = 0.01
+
+    RAND_SEED = torch.tensor(42, dtype=torch.int64, device="cuda")
+
+    def make_inputs(self, batch, nheads, dim, dstate, _state_dtype, weight_dtype):
+        """Create test inputs with fp16 state."""
+        return create_test_inputs(
+            batch,
+            nheads,
+            dim,
+            dstate,
+            self.NGROUPS,
+            self.INPUT_DTYPE,
+            weight_dtype=weight_dtype,
+            matrixA_dtype=self.MATRIX_A_DTYPE,
+            state_dtype=torch.float16,
+            generate_z=False,
+            seed=0,
+        )
+
+    def make_reference_output(self, inputs):
+        """Compute reference output using Triton with stochastic rounding."""
+        state_ref = inputs["state_cache"].clone()
+        major, _ = get_compute_capability(torch.device("cuda"))
+        # Triton cvt.rs.f16x2.f32 requires SM100a+; on older GPUs the Triton
+        # reference falls back to regular rounding while the CUDA kernel still
+        # exercises its software stochastic rounding path.
+        rand_seed = self.RAND_SEED if major >= 10 else None
+        y_ref = selective_state_update_triton(
+            state_ref,
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            D=inputs["D"],
+            z=inputs.get("z"),
+            dt_bias=inputs["dt_bias"],
+            dt_softplus=True,
+            state_batch_indices=inputs["slot_idx"],
+            pad_slot_id=-1,
+            rand_seed=rand_seed,
+        )
+        return y_ref, state_ref
+
+    def run_kernel(self, inputs, out=None, algorithm="auto"):
+        """Run the flashinfer kernel with stochastic rounding."""
+        return flashinfer.mamba.selective_state_update(
+            inputs["state_cache"],
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            D=inputs["D"],
+            z=inputs.get("z"),
+            dt_bias=inputs["dt_bias"],
+            dt_softplus=True,
+            state_batch_indices=inputs["slot_idx"],
+            pad_slot_id=-1,
+            out=out,
+            algorithm=algorithm,
+            rand_seed=self.RAND_SEED,
+        )
+
+    def assert_states_match(
+        self, state_ref, state_test, slot_idx, msg_prefix="", **_kwargs
+    ):
+        """Assert states match within tolerance (SR path has different FP operation order than Triton)."""
+        state_ref_batch = state_ref[slot_idx]
+        state_test_batch = state_test[slot_idx]
+        states_match = torch.allclose(
+            state_ref_batch.float(),
+            state_test_batch.float(),
+            atol=self.ATOL,
+            rtol=self.RTOL,
+        )
+
+        if states_match:
+            print(
+                f"✓ {msg_prefix}States match within tolerance (atol={self.ATOL}, rtol={self.RTOL})"
+            )
+        else:
+            max_diff = (
+                (state_ref_batch.float() - state_test_batch.float()).abs().max().item()
+            )
+            print(f"✗ {msg_prefix}States do NOT match (max_diff={max_diff:.6e})")
+            self._print_mismatch_details(state_ref_batch, state_test_batch, "state")
+
+        assert states_match
+
+    # fmt: off
+    _SR_PARAMS = (
+        # (batch, nheads, dim, dstate,  state_dtype,    weight_dtype,   use_out_tensor)
+        (  64,    64,     64,  128,     torch.float16,  torch.float32,  True ),  # base
+        (  64,    64,     64,   64,     torch.float16,  torch.float32,  True ),  # dstate=64
+    )
+    # fmt: on
+
+    @pytest.mark.parametrize("algorithm", _get_algorithms_no_horizontal())
+    @pytest.mark.parametrize(
+        "batch,nheads,dim,dstate,state_dtype,weight_dtype,use_out_tensor",
+        _SR_PARAMS,
+    )
+    def test_output_correctness(
+        self,
+        batch,
+        nheads,
+        dim,
+        dstate,
+        state_dtype,
+        weight_dtype,
+        use_out_tensor,
+        algorithm,
+    ):
+        super().test_output_correctness(
+            batch,
+            nheads,
+            dim,
+            dstate,
+            state_dtype,
+            weight_dtype,
+            use_out_tensor,
+            algorithm,
         )
 
 
