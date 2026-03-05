@@ -1731,6 +1731,7 @@ CUtensorMap makeTensorMapForQ(void const* addr, CUtensorMapDataType_enum dataTyp
   uint32_t const boxDims[] = {partElems, headGrpSize};
   uint32_t const elemStrides[] = {1, 1};
   uint32_t const partBytes = partElems * elemBytes;
+  assert(partBytes == 128 || partBytes == 64);
   auto const swizzle = (partBytes == 128) ? CU_TENSOR_MAP_SWIZZLE_128B : CU_TENSOR_MAP_SWIZZLE_64B;
 
   checkCu(cuTensorMapEncodeTiled(&tensorMap, dataType, 2, const_cast<void*>(addr), globalDims,
@@ -1762,7 +1763,6 @@ void launchMLA(
   if (beamWidth != 1) {
     throw std::runtime_error("not implemented");
   }
-  static uint32_t const hostSmemSize = configureKernel();
   uint32_t const nbKHeads = 1;
   uint32_t const nbVHeads = nbKHeads;
   uint32_t const nbQHeads = nbKHeads * headGrpSize;
