@@ -1,2 +1,3 @@
 from .decode import cudnn_batch_decode_with_kv_cache
+from .norm import cudnn_fused_rmsnorm_silu
 from .prefill import cudnn_batch_prefill_with_kv_cache
