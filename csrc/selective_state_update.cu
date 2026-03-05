@@ -189,6 +189,7 @@ void run_selective_state_update_stp(TensorView const& state, TensorView const& x
   validate_A_tensor(A, nheads, dim, dstate);
   validate_dt_bias_tensor(dt_bias, nheads, dim);
   validate_state_batch_indices(state_batch_indices, batch);
+  validate_state_batch_indices(dst_state_batch_indices, batch);
 
   // Check B shape and strides
   CHECK_CUDA(B);
@@ -389,9 +390,8 @@ void run_selective_state_update_mtp(
   validate_D_tensor(D, nheads, dim);
   validate_A_tensor(A, nheads, dim, dstate);
   validate_dt_bias_tensor(dt_bias, nheads, dim);
-  if (!is_varlen) {
-    validate_state_batch_indices(state_batch_indices, batch);
-  }
+  validate_state_batch_indices(state_batch_indices, batch);
+  validate_state_batch_indices(dst_state_batch_indices, batch);
 
   // Check B shape and strides
   CHECK_CUDA(B);
