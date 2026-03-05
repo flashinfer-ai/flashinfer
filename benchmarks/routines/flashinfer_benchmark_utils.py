@@ -71,6 +71,12 @@ output_column_dict = {
         "ep_size",
         "max_num_tokens",
     ],
+    "allreduce_comm": [
+        "num_tokens",
+        "ar_backend",
+        "pattern",
+        "layout_code",
+    ],
     "norm": [
         "num_heads",
         "scale",
@@ -146,6 +152,7 @@ full_output_columns = (
     + output_column_dict["gemm"]
     + output_column_dict["moe"]
     + output_column_dict["moe_comm"]
+    + output_column_dict["allreduce_comm"]
     + output_column_dict["norm"]
     + output_column_dict["quantization"]
     + output_column_dict["sampling"]
@@ -179,6 +186,9 @@ benchmark_apis = {
     ],
     "moe_comm": [
         "moe_a2a_dispatch_combine",
+    ],
+    "allreduce_comm": [
+        "allreduce_fusion",
     ],
     "norm": [
         "rmsnorm",
@@ -227,9 +237,9 @@ benchmark_apis = {
 
 
 def print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec):
-    output_backend_width = 15
+    output_backend_width = max(15, len(backend))
     print(
-        f"[PERF] {backend.ljust(output_backend_width)[:output_backend_width]}:: median time {median_time:.3f} ms; std {std_time:.3f} ms; achieved tflops {tflops:.3f} TFLOPs/sec; achieved tb_per_sec {tb_per_sec:.3f} TB/sec"
+        f"[PERF] {backend.ljust(output_backend_width)}:: median time {median_time:.3f} ms; std {std_time:.3f} ms; achieved tflops {tflops:.3f} TFLOPs/sec; achieved tb_per_sec {tb_per_sec:.3f} TB/sec"
     )
 
 
