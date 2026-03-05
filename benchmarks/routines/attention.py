@@ -181,6 +181,13 @@ def parse_attention_args(line, parser):
         help="Data type of the key and value. Currently only bfloat16 is supported.",
     )
     parser.add_argument(
+        "--out_dtype",
+        type=str,
+        required=False,
+        default=None,
+        help="Data type of the output. If not specified, defaults to q_dtype.",
+    )
+    parser.add_argument(
         "--causal",
         action="store_true",
         default=False,
@@ -311,6 +318,11 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
     if kv_dtype not in [torch.bfloat16, torch.float8_e4m3fn]:
         print(f"[ERROR] Unsupported kv_dtype: {args.kv_dtype}")
         return res
+
+    if args.out_dtype is not None:
+        print(
+            "[WARNING] --out_dtype is not yet supported for BatchDecodeWithPagedKVCacheWrapper; ignoring."
+        )
 
     # Parse and validate backend configurations
     backends = args.backends
@@ -821,6 +833,11 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
     if kv_dtype not in [torch.bfloat16, torch.float8_e4m3fn]:
         print(f"[ERROR] Unsupported kv_dtype: {args.kv_dtype}")
         return res
+
+    if args.out_dtype is not None:
+        print(
+            "[WARNING] --out_dtype is not yet supported for BatchPrefillWithPagedKVCacheWrapper; ignoring."
+        )
 
     # Increase tolerances for FP8 due to lower precision
     if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] or kv_dtype in [
@@ -1462,6 +1479,16 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
     if kv_dtype not in [torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2]:
         print(f"[ERROR] Unsupported kv_dtype: {args.kv_dtype}")
         return res
+    if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] and args.out_dtype is None:
+        print(
+            "[ERROR] --out_dtype must be set to bfloat16 or float16 when --q_dtype is FP8."
+        )
+        return res
+
+    out_dtype = dtype_str_to_torch_dtype(args.out_dtype) if args.out_dtype else q_dtype
+    if out_dtype not in [torch.bfloat16, torch.float16]:
+        print(f"[ERROR] Unsupported out_dtype: {args.out_dtype}")
+        return res
 
     # Parse and validate backend configurations
     backends = args.backends
@@ -1531,12 +1558,6 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             backends.remove("trtllm-gen")
     if "trtllm-native" in backends:
         remove_trtllm_native = False
-        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] or kv_dtype in [
-            torch.float8_e4m3fn,
-            torch.float8_e5m2,
-        ]:
-            print("[INFO] trtllm-native backend does not support FP8. Skipping.")
-            remove_trtllm_native = True
         if not (head_dim_qk == 192 and head_dim_vo == 128):
             print(
                 "[INFO] trtllm-native backend requires head_dim_qk == 192 and head_dim_vo == 128"
@@ -1741,7 +1762,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 sm_scale=scale,
                 q_data_type=q_dtype,
                 kv_data_type=kv_dtype,
-                o_data_type=q_dtype,
+                o_data_type=out_dtype,
                 seq_lens=actual_seq_lens_kv_device,
                 seq_lens_q=actual_seq_lens_q_device,
                 max_token_per_sequence=s_qo,
@@ -1750,14 +1771,25 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 o_indptr=o_indptr,
             )
 
-    k_scale, v_scale = None, None
+    q_scale, k_scale, v_scale = None, None, None
     if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
-        q = q.to(q_dtype)
+        q_scale = q.abs().amax().item() / 256
+        q = (q / q_scale).to(q_dtype)
     if kv_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
-        k_scale = k.amax().item() / 256
-        v_scale = v.amax().item() / 256
+        k_scale = k.abs().amax().item() / 256
+        v_scale = v.abs().amax().item() / 256
         k = (k / k_scale).to(kv_dtype)
         v = (v / v_scale).to(kv_dtype)
+
+    trtllm_out = None
+    if "trtllm-native" in backends:
+        trtllm_out = torch.empty(
+            q.shape[0],
+            q.shape[1],
+            v.shape[2],
+            device=q.device,
+            dtype=out_dtype,
+        )
 
     def run_backend_wrapper(
         backend,
@@ -1802,8 +1834,12 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 batch_offsets_o=o_indptr,
                 batch_offsets_stats=batch_offsets_stats,
                 is_cuda_graph_compatible=True,
+                o_data_type=out_dtype,
             )[0]
         elif backend == "trtllm-native":
+            _q_scale = q_scale if q_scale is not None else 1.0
+            _k_scale = k_scale if k_scale is not None else 1.0
+            _v_scale = v_scale if v_scale is not None else 1.0
             return flashinfer.prefill.trtllm_ragged_attention_deepseek(
                 query=q,
                 key=k,
@@ -1812,8 +1848,8 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 seq_lens=actual_seq_lens_kv_device,
                 max_q_len=s_qo,
                 max_kv_len=s_kv,
-                bmm1_scale=scale,
-                bmm2_scale=1.0,
+                bmm1_scale=_q_scale * _k_scale * scale,
+                bmm2_scale=_v_scale,
                 o_sf_scale=-1,
                 batch_size=batch_size,
                 window_left=-1,
@@ -1822,6 +1858,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 enable_pdl=False,
                 is_causal=causal,
                 return_lse=True,
+                out=trtllm_out,
             )[0]
         else:
             print(f"[ERROR] Backend {backend} not supported")
@@ -1938,7 +1975,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 median_time,
                 q_dtype=q_dtype,
                 kv_dtype=kv_dtype,
-                o_dtype=q_dtype,
+                o_dtype=out_dtype,
             )
 
             print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
@@ -1962,6 +1999,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 cur_res["causal"] = causal
                 cur_res["q_dtype"] = q_dtype
                 cur_res["kv_dtype"] = kv_dtype
+                cur_res["out_dtype"] = out_dtype
                 cur_res["avg_actual_seq_len"] = avg_seq_len_q
                 cur_res["random_actual_seq_len"] = args.random_actual_seq_len
                 cur_res["case_tag"] = args.case_tag
@@ -2014,6 +2052,11 @@ def testBatchMLAPagedAttentionWrapper(args):
     if kv_dtype not in [torch.bfloat16, torch.float8_e4m3fn]:
         print(f"[ERROR] Unsupported kv_dtype: {args.kv_dtype}")
         return res
+
+    if args.out_dtype is not None:
+        print(
+            "[WARNING] --out_dtype is not yet supported for BatchMLAPagedAttentionWrapper; ignoring."
+        )
 
     backends = args.backends
     page_size = args.page_size

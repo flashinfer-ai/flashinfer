@@ -7,12 +7,14 @@
 
 namespace flashinfer::mamba {
 
-template void invokeSelectiveStateUpdate<input_t, weight_t, matrixA_t, state_t, stateIndex_t>(
-    SelectiveStateUpdateParams&, SSUAlgorithm, cudaStream_t);
+template void invokeSelectiveStateUpdate<input_t, weight_t, matrixA_t, state_t, stateIndex_t,
+                                         state_scale_t>(SelectiveStateUpdateParams&, SSUAlgorithm,
+                                                        cudaStream_t);
 
 namespace mtp {
-template void invokeSelectiveStateUpdateMTP<input_t, weight_t, matrixA_t, state_t, stateIndex_t>(
-    SelectiveStateMTPParams&, SSUAlgorithm, cudaStream_t);
+template void invokeSelectiveStateUpdateMTP<input_t, weight_t, matrixA_t, state_t, stateIndex_t,
+                                            state_scale_t>(SelectiveStateMTPParams&, SSUAlgorithm,
+                                                           cudaStream_t);
 }  // namespace mtp
 
 }  // namespace flashinfer::mamba

@@ -971,7 +971,7 @@ def gated_delta_rule_decode_pretranspose(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    state: torch.Tensor,
+    state: Optional[torch.Tensor],
     A_log: torch.Tensor,
     a: torch.Tensor,
     dt_bias: torch.Tensor,
@@ -979,17 +979,18 @@ def gated_delta_rule_decode_pretranspose(
     scale: Optional[float] = None,
     output: Optional[torch.Tensor] = None,
     use_qk_l2norm: bool = True,
-    state_indices: Optional[torch.Tensor] = None,
+    initial_state: Optional[torch.Tensor] = None,
+    initial_state_indices: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Gated Delta Rule Decode kernel for single-token generation.
 
     This implements the decode phase of gated delta rule linear attention,
     processing one token at a time and updating the recurrent state.
 
-    When ``state_indices`` is provided, the kernel reads/writes state directly
-    from/to the state pool using indirect indexing (zero-copy pooled mode),
-    eliminating the need for gather before and scatter after the kernel call.
-    Negative indices are treated as padding and skipped.
+    When ``initial_state`` and ``initial_state_indices`` are provided, the kernel
+    reads/writes state directly from/to the state pool using indirect indexing
+    (zero-copy pooled mode), eliminating the need for gather before and scatter
+    after the kernel call. Negative indices are treated as padding and skipped.
 
     Args:
         q (torch.Tensor):
@@ -998,10 +999,11 @@ def gated_delta_rule_decode_pretranspose(
             Current key of shape ``[B, 1, H, K]``. Must be float16/bfloat16.
         v (torch.Tensor):
             Current value of shape ``[B, 1, HV, V]``. Must be float16/bfloat16.
-        state (torch.Tensor):
-            Current state of shape ``[B, HV, V, K]`` or, when ``state_indices``
-            is provided, the full state pool of shape ``[pool_size, HV, V, K]``
-            (V-major / K-last layout).  Must be float32.  Updated in-place.
+        state (Optional[torch.Tensor]):
+            Current state of shape ``[B, HV, V, K]`` (v-major / K-last layout).
+            Float32: legacy kernel (T=1 only).  Bfloat16: gdn_decode_klast_bf16_state backend
+            when T in 1..4 and K=V=128. Will be updated in-place.
+            Pass ``None`` when using ``initial_state`` / ``initial_state_indices`` instead.
         A_log (torch.Tensor):
             Log decay parameter of shape ``[HV]``. Must be float32.
         a (torch.Tensor):
@@ -1017,56 +1019,62 @@ def gated_delta_rule_decode_pretranspose(
             If None, will be allocated automatically.
         use_qk_l2norm (bool):
             Whether to apply L2 normalization to q and k. Default: ``True``.
-        state_indices (Optional[torch.Tensor]):
-            When provided, enables pool-indexed (zero-copy) mode.  Shape ``[B]``,
-            dtype ``int32``.  Each element maps a batch element to a slot in the
-            state pool.  Negative values are treated as padding (output zeroed,
-            state not updated).  Default: ``None`` (direct 1:1 batch mapping).
+        initial_state (Optional[torch.Tensor]):
+            State pool of shape ``[pool_size, HV, V, K]`` (K-last / K-contiguous,
+            same layout as the per-batch ``state`` argument).
+            When provided, the kernel gathers directly from the pool using
+            ``initial_state_indices`` and writes updates back in-place — eliminating
+            the caller-side gather/scatter overhead.
+            Requires bfloat16 state with T in 1..4 and K=V=128 (bf16 fast path).
+        initial_state_indices (Optional[torch.Tensor]):
+            Per-batch indices of shape ``[B]`` (int32 or int64) mapping each batch
+            entry to its slot in ``initial_state``.  Required when ``initial_state``
+            is provided.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
             - output: Output tensor of shape ``[B, 1, HV, V]``
-            - state: The (updated) state tensor
+            - state or initial_state: Updated state (in-place).
 
     Note:
-        - Requires SM90 (Hopper) architecture
-        - State is updated in-place
-        - K and V must be multiples of 4 for vectorized loads
-        - State layout is V-major: [*, HV, V, K]
+        - Requires SM90+ (Hopper, Blackwell, etc.)
+        - State is always updated in-place; the pool path writes directly into
+          ``initial_state`` memory (no separate scatter step needed)
+        - State layout is v-major (K-last): [B, HV, V, K]. When state is bfloat16
+          and T in 1..4 with K=V=128, the gdn_decode_klast_bf16_state kernel is used
+          (supports both the direct ``state`` path and the pool+indices path).
+        - pool+indices (``initial_state``/``initial_state_indices``) only supported
+          via the bf16 fast path; float32 state raises an error.
+        - Legacy path (float32 state, T=1): K and V must be multiples of 4.
     """
-    use_pool_indexing = state_indices is not None
+    use_pool_indexing = initial_state_indices is not None
 
     # Validate input shapes
     B, T, H, K = q.shape
     _, _, HV, V = v.shape
-    pool_size = state.shape[0]
 
-    # Validate state shape
-    assert state.shape[1:] == (HV, V, K), (
-        f"Expected state shape [*, HV={HV}, V={V}, K={K}], got {state.shape}"
+    use_pool = initial_state is not None
+    assert use_pool == (initial_state_indices is not None), (
+        "initial_state and initial_state_indices must be provided together"
     )
-    if not use_pool_indexing:
-        assert state.shape[0] == B, (
-            f"Without state_indices, state dim-0 must equal B={B}, got {state.shape[0]}"
-        )
 
-    # Validate indices (pooled mode)
-    if use_pool_indexing:
-        assert state.is_contiguous(), (
-            "state must be contiguous when using pool indexing (state_indices); "
-            "a non-contiguous tensor may silently produce incorrect results"
+    if use_pool:
+        pool_size = initial_state.shape[0]
+        assert initial_state.shape == (pool_size, HV, V, K), (
+            f"Expected initial_state shape [pool_size={pool_size}, HV={HV}, V={V}, K={K}], "
+            f"got {initial_state.shape}"
         )
-        assert state_indices.shape == (B,), (
-            f"Expected state_indices shape [{B}], got {state_indices.shape}"
-        )
-        assert state_indices.dtype == torch.int32, (
-            f"state_indices must be int32, got {state_indices.dtype}"
+    else:
+        assert state is not None, "Either state or initial_state must be provided"
+        assert state.shape == (B, HV, V, K), (
+            f"Expected state shape [B={B}, HV={HV}, V={V}, K={K}], got {state.shape}"
         )
 
     # Backend: gdn_decode_klast_bf16_state when bf16 state, T<=4, K-last layout, K=V=128
+    state_dtype = initial_state.dtype if use_pool else state.dtype
     use_gdn_decode_klast_bf16_state = (
         _GDN_DECODE_KLAST_BF16_STATE_AVAILABLE
-        and state.dtype == torch.bfloat16
+        and state_dtype == torch.bfloat16
         and T in (1, 2, 3, 4)
         and K == 128
         and V == 128
@@ -1087,7 +1095,8 @@ def gated_delta_rule_decode_pretranspose(
             k=k,
             v=v,
             b=b,
-            initial_state_source=state,
+            initial_state_source=initial_state if use_pool else state,
+            initial_state_indices=initial_state_indices,
             use_qk_l2norm_in_kernel=use_qk_l2norm,
             scale=scale_val,
         )
@@ -1099,9 +1108,14 @@ def gated_delta_rule_decode_pretranspose(
             output = out
         if output.dtype != target_dtype:
             output = output.to(target_dtype)
-        return output, state
+        return_state = initial_state if use_pool else state
+        return output, return_state
 
-    # Legacy path: T=1 only, float32 state
+    # Legacy path: T=1 only, float32 state (no pool+indices support)
+    assert not use_pool, (
+        "pool+indices (initial_state/initial_state_indices) requires bfloat16 state "
+        "with T in 1..4 and K=V=128 (the gdn_decode_klast_bf16_state fast path)"
+    )
     assert T == 1, f"Decode only supports T=1, got T={T}"
     assert state.dtype == torch.float32, f"state must be float32, got {state.dtype}"
 
@@ -1131,7 +1145,8 @@ def gated_delta_rule_decode_pretranspose(
         # Kernel outputs bfloat16, allocate in that dtype first
         output = torch.zeros((B, T, HV, V), dtype=torch.bfloat16, device=q.device)
 
-    # Convert state from [pool_size, HV, V, K] to [pool_size*HV, V, K] for kernel
+    # Convert state from [B, HV, V, K] to [B*HV, V, K] for kernel
+    pool_size = B
     h0_source = state.reshape(pool_size * HV, V, K)
 
     # Compile kernel with TVM FFI (cached)
@@ -1149,13 +1164,9 @@ def gated_delta_rule_decode_pretranspose(
     )
     cache = _get_compiled_decode_kernel(*cache_key)
 
-    # Get or create h0_indices and cu_seqlens (cached per config)
-    if use_pool_indexing:
-        h0_indices = state_indices
-    else:
-        if "h0_indices" not in cache or cache["h0_indices"].device != q.device:
-            cache["h0_indices"] = torch.zeros(B, dtype=torch.int32, device=q.device)
-        h0_indices = cache["h0_indices"]
+    if "h0_indices" not in cache or cache["h0_indices"].device != q.device:
+        cache["h0_indices"] = torch.zeros(B, dtype=torch.int32, device=q.device)
+    h0_indices = cache["h0_indices"]
 
     if "cu_seqlens" not in cache or cache["cu_seqlens"].device != q.device:
         cache["cu_seqlens"] = torch.zeros(B + 1, dtype=torch.int32, device=q.device)
@@ -1227,20 +1238,18 @@ def gated_delta_rule_decode_pretranspose(
 
     # Run kernel directly with PyTorch tensors (no from_dlpack needed)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    cache["compiled"](
+    compiled(
         h0_source, A_log, a, dt_bias, q, k, v, b, output, h0_indices, cu_seqlens, stream
     )
-
-    # Copy state back only if non-pooled mode and state was not contiguous
-    # (if contiguous, reshape returns a view and kernel updated state in-place)
-    # In pooled mode, state is always updated in-place via pool indexing.
-    if not use_pool_indexing and not state.is_contiguous():
-        state.copy_(h0_source.reshape(B, HV, V, K))
 
     # Convert output to target dtype if needed (kernel outputs bfloat16)
     if output.dtype != target_dtype:
         output = output.to(target_dtype)
 
+    # Copy state back only if state was not contiguous
+    # (if contiguous, reshape returns a view and kernel updated state in-place)
+    if not state.is_contiguous():
+        state.copy_(h0_source.reshape(B, HV, V, K))
     return output, state
 
 
