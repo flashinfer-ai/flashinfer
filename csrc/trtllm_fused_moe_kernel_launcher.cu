@@ -1866,6 +1866,19 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
   auto const num_tokens = hidden_states.size(0);
   auto const hidden_size = hidden_states.size(1);
 
+  if (routing_replay_out.has_value()) {
+    auto replay = routing_replay_out.value();
+    TVM_FFI_ICHECK(replay.device().device_type == kDLCUDA)
+        << "routing_replay_out must be a CUDA tensor";
+    TVM_FFI_ICHECK(replay.device().device_id == hidden_states.device().device_id)
+        << "routing_replay_out must be on the same device as hidden_states";
+    TVM_FFI_ICHECK(replay.ndim() == 2) << "routing_replay_out must be 2D [num_tokens, top_k]";
+    TVM_FFI_ICHECK(replay.size(0) == num_tokens) << "routing_replay_out dim0 must equal num_tokens";
+    TVM_FFI_ICHECK(replay.size(1) == top_k) << "routing_replay_out dim1 must equal top_k";
+    TVM_FFI_ICHECK(encode_dlpack_dtype(replay.dtype()) == int16_code)
+        << "routing_replay_out must be int16 dtype";
+  }
+
   auto supported_tile_nums = Fp8BlockScaleLauncher::getSupportedTileNums(quantization_type);
   std::set<int32_t> selected_tile_nums =
       computeSelectedTileN(supported_tile_nums, num_tokens, top_k, local_num_experts);
