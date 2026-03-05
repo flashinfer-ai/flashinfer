@@ -32,7 +32,6 @@ import torch
 from cutlass.base_dsl.compiler import GenerateLineInfo  # profiling
 from cutlass.cute.runtime import from_dlpack
 
-from ..api_logging import flashinfer_api
 from ..jit.mamba.seq_chunk_cumsum import gen_seq_chunk_cumsum_module
 from ..triton.kernels.ssd_chunk_state import chunk_cumsum_fwd
 from .ssd_kernel import SSDKernel
@@ -154,9 +153,6 @@ class _SSDKernel:
 
         # Create the kernel
         self.kernel = SSDKernel(
-            self.io_dtype,
-            self.cumsum_dtype,
-            self.acc_dtype,
             chunk_size,
             headdim,
             dstate,
@@ -165,8 +161,11 @@ class _SSDKernel:
             has_init_states,
             has_varlen,
             has_z,
-            seq_idx_cutlass_dtype,
+            io_dtype=self.io_dtype,
             state_dtype=self.state_dtype,
+            seq_idx_dtype=seq_idx_cutlass_dtype,
+            cumsum_delta_dtype=self.cumsum_dtype,
+            acc_dtype=self.acc_dtype,
         )
 
         self._compiled_kernel = None
@@ -578,9 +577,6 @@ class SSDCombined:
             seq_idx_dtype, cutlass.Int32
         )
         self._kernel_obj = SSDKernel(
-            self._io_dtype,
-            self._cumsum_dtype,
-            self._acc_dtype,
             chunk_size,
             headdim,
             dstate,
@@ -589,8 +585,11 @@ class SSDCombined:
             has_initial_states,
             has_varlen,
             has_z,
-            seq_idx_cutlass_dtype,
+            io_dtype=self._io_dtype,
             state_dtype=self._state_dtype,
+            seq_idx_dtype=seq_idx_cutlass_dtype,
+            cumsum_delta_dtype=self._cumsum_dtype,
+            acc_dtype=self._acc_dtype,
         )
         self._compiled_kernel = None
 
@@ -989,201 +988,3 @@ class SSDCombined:
         )
         fstate_out = fstate_torch.permute(3, 2, 1, 0) if return_final_states else None
         return out_view, fstate_out
-
-
-@functools.cache
-def _get_ssd_combined(
-    chunk_size,
-    nheads,
-    headdim,
-    dstate,
-    ngroups,
-    io_dtype,
-    state_dtype,
-    has_d,
-    d_has_hdim,
-    has_init_states,
-    has_varlen,
-    has_z,
-    seq_idx_dtype,
-):
-    """Get cached SSDCombined instance."""
-    return SSDCombined(
-        chunk_size=chunk_size,
-        nheads=nheads,
-        headdim=headdim,
-        dstate=dstate,
-        ngroups=ngroups,
-        io_dtype=io_dtype,
-        state_dtype=state_dtype,
-        has_d=has_d,
-        d_has_hdim=d_has_hdim,
-        has_initial_states=has_init_states,
-        has_varlen=has_varlen,
-        has_z=has_z,
-        seq_idx_dtype=seq_idx_dtype,
-    )
-
-
-@flashinfer_api
-def ssd_combined_fwd(
-    x: torch.Tensor,
-    dt: torch.Tensor,
-    A: torch.Tensor,
-    B: torch.Tensor,
-    C: torch.Tensor,
-    chunk_size: int,
-    D: Optional[torch.Tensor] = None,
-    z: Optional[torch.Tensor] = None,
-    dt_bias: Optional[torch.Tensor] = None,
-    dt_softplus: bool = False,
-    dt_limit: Tuple[float, float] = (0.0, float("inf")),
-    initial_states: Optional[torch.Tensor] = None,
-    seq_idx: Optional[torch.Tensor] = None,
-    chunk_indices: Optional[torch.Tensor] = None,
-    chunk_offsets: Optional[torch.Tensor] = None,
-    cu_seqlens: Optional[torch.Tensor] = None,
-    out: Optional[torch.Tensor] = None,
-    return_final_states: bool = True,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """
-    SSD (Structured State-Space Duality) combined forward pass for Mamba2.
-
-    This function combines:
-    1. Triton kernel for cumsum computation (_chunk_cumsum_fwd)
-    2. CuTe DSL kernel for the main SSD computation (Blackwell optimized)
-
-    Parameters
-    ----------
-    x : torch.Tensor
-        Input tensor with shape (batch, seqlen, nheads, headdim)
-    dt : torch.Tensor
-        Delta time tensor with shape (batch, seqlen, nheads)
-    A : torch.Tensor
-        A matrix with shape (nheads,) - should be negative for stability
-    B : torch.Tensor
-        B matrix with shape (batch, seqlen, ngroups, dstate)
-    C : torch.Tensor
-        C matrix with shape (batch, seqlen, ngroups, dstate)
-    chunk_size : int
-        Size of each chunk for processing (must divide seqlen)
-    D : torch.Tensor, optional
-        D vector with shape (nheads,) or (nheads, headdim)
-    dt_bias : torch.Tensor, optional
-        Optional dt bias with shape (nheads,)
-    dt_softplus : bool
-        Whether to apply softplus to dt
-    dt_limit : tuple
-        (min, max) limits for dt values
-    initial_states : torch.Tensor, optional
-        Optional (batch, nheads, headdim, dstate) or (num_seqs, nheads, headdim, dstate)
-        when cu_seqlens is provided
-    seq_idx : torch.Tensor, optional
-        Sequence index tensor (batch, seqlen) mapping each position to its sequence ID.
-        Required for variable-length sequence (continuous batching) support.
-    chunk_indices : torch.Tensor, optional
-        Int32 tensor mapping logical chunk index to physical chunk index.
-        Required together with chunk_offsets when seq_idx and initial_states are provided.
-    chunk_offsets : torch.Tensor, optional
-        Int32 tensor mapping logical chunk index to offset within physical chunk.
-        Required together with chunk_indices when seq_idx and initial_states are provided.
-    cu_seqlens : torch.Tensor, optional
-        Cumulative sequence lengths (num_seqs + 1,) for variable-length batching.
-    out : torch.Tensor, optional
-        Pre-allocated output tensor with shape (batch, seqlen, nheads, headdim).
-        Must be contiguous and have the same dtype as x. If None, a new tensor
-        is allocated internally.
-    return_final_states : bool
-        Whether to return final_states. If False, the second element of the
-        return tuple is None. Default: True.
-
-    Returns
-    -------
-    out : torch.Tensor
-        Output tensor with shape (batch, seqlen, nheads, headdim)
-    final_states : torch.Tensor or None
-        Final state tensor with shape (batch, nheads, headdim, dstate),
-        or (num_seqs, nheads, headdim, dstate) when varlen is active
-        (seq_idx provided). None if return_final_states is False.
-
-    Notes
-    -----
-    - Requires SM100+ (Blackwell) for the CuTe DSL SSD kernel.
-    - The kernel is hardcoded for N=128 (dstate), L=128 (chunk_size), D=64 (headdim).
-    - Difference from the Triton reference: the reference
-      mamba_chunk_scan_combined has a separate return_varlen_states flag
-      that triggers chunk_state_varlen — an extra Triton kernel that
-      recomputes per-sequence final states from cu_seqlens. This is
-      necessary because the reference's _state_passing_fwd only produces
-      a single final_states of shape (batch, ...), which for batch=1
-      varlen is just the state after the last sequence. Our fused CuTe
-      kernel computes per-sequence final states on the fly (stored to
-      fstate[seq_id] at every sequence transition), so final_states
-      already has shape (num_seqs, nheads, headdim, dstate) when varlen
-      is active. No separate varlen_states tensor or flag is needed —
-      final_states serves both purposes.
-    """
-    batch, seqlen, nheads, headdim = x.shape
-    _, _, ngroups, dstate = B.shape
-
-    # A is always fp32
-    assert A.dtype == torch.float32, f"A must be float32, got {A.dtype}"
-    # io_dtype: x, B, C, z must match
-    io_dtype = x.dtype
-    assert B.dtype == io_dtype, (
-        f"B dtype {B.dtype} must match io_dtype (x.dtype={io_dtype})"
-    )
-    assert C.dtype == io_dtype, (
-        f"C dtype {C.dtype} must match io_dtype (x.dtype={io_dtype})"
-    )
-    if z is not None:
-        assert z.dtype == io_dtype, (
-            f"z dtype {z.dtype} must match io_dtype (x.dtype={io_dtype})"
-        )
-    # D must be io_dtype (kernel buffer is io_dtype, no conversion)
-    if D is not None:
-        assert D.dtype == x.dtype, (
-            f"D dtype {D.dtype} must match io_dtype (x.dtype={x.dtype})"
-        )
-    has_d = D is not None
-    d_has_hdim = has_d and D.dim() == 2
-    has_init_states = initial_states is not None
-    has_varlen = seq_idx is not None
-    has_z = z is not None
-    state_dtype = initial_states.dtype if initial_states is not None else x.dtype
-    seq_idx_dtype = seq_idx.dtype if seq_idx is not None else torch.int32
-
-    ssd = _get_ssd_combined(
-        chunk_size,
-        nheads,
-        headdim,
-        dstate,
-        ngroups,
-        x.dtype,
-        state_dtype,
-        has_d,
-        d_has_hdim,
-        has_init_states,
-        has_varlen,
-        has_z,
-        seq_idx_dtype,
-    )
-
-    return ssd.run(
-        x,
-        dt,
-        A,
-        B,
-        C,
-        D=D,
-        z=z,
-        dt_bias=dt_bias,
-        dt_softplus=dt_softplus,
-        dt_limit=dt_limit,
-        initial_states=initial_states,
-        seq_idx=seq_idx,
-        chunk_indices=chunk_indices,
-        chunk_offsets=chunk_offsets,
-        out=out,
-        return_final_states=return_final_states,
-    )

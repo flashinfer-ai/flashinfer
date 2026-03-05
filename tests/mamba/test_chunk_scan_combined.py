@@ -10,7 +10,7 @@ import pytest
 import torch
 
 # Import FlashInfer SSD combined API
-from flashinfer.mamba import ssd_combined_fwd
+from flashinfer.mamba import SSDCombined
 
 # Import Triton reference for comparison
 from .triton_reference.ssd_combined import (
@@ -22,6 +22,42 @@ from .triton_reference.ssd_state_passing import _state_passing_fwd
 from .triton_reference.ssd_bmm import _bmm_chunk_fwd
 from .triton_reference.ssd_chunk_scan import _chunk_scan_fwd
 from einops import rearrange
+
+
+def ssd_combined_fwd(
+    x, dt, A, B, C, chunk_size,
+    D=None, z=None, dt_bias=None, dt_softplus=False,
+    dt_limit=(0.0, float("inf")), initial_states=None,
+    seq_idx=None, chunk_indices=None, chunk_offsets=None,
+    cu_seqlens=None, out=None, return_final_states=True,
+):
+    """Test-local convenience wrapper around SSDCombined."""
+    _, _, nheads, headdim = x.shape
+    _, _, ngroups, dstate = B.shape
+    state_dtype = initial_states.dtype if initial_states is not None else x.dtype
+    # This constructor is very heavy, so don't you dare use this ssd_combined_fwd wrapper in
+    # prod. Do create an SSDCombined instance once and call run() on it multiple times instead.
+    ssd = SSDCombined(
+        chunk_size=chunk_size,
+        nheads=nheads,
+        headdim=headdim,
+        dstate=dstate,
+        ngroups=ngroups,
+        has_d=D is not None,
+        d_has_hdim=D is not None and D.dim() == 2,
+        has_initial_states=initial_states is not None,
+        has_varlen=seq_idx is not None,
+        has_z=z is not None,
+        state_dtype=state_dtype,
+    )
+    return ssd.run(
+        x, dt, A, B, C,
+        D=D, z=z, dt_bias=dt_bias, dt_softplus=dt_softplus,
+        dt_limit=dt_limit, initial_states=initial_states,
+        seq_idx=seq_idx, chunk_indices=chunk_indices,
+        chunk_offsets=chunk_offsets, out=out,
+        return_final_states=return_final_states,
+    )
 
 
 def _compute_varlen_metadata(cu_seqlens, chunk_size):

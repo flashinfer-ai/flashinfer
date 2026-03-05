@@ -49,9 +49,6 @@ from .ssd_tile_scheduler import (
 class SSDKernel:
     def __init__(
         self,
-        io_dtype: Type[cutlass.Numeric],
-        cumsum_delta_dtype: Type[cutlass.Numeric],
-        acc_dtype: Type[cutlass.Numeric],
         L: int,
         D: int,
         N: int,
@@ -60,8 +57,11 @@ class SSDKernel:
         has_init_states: bool,
         has_varlen: bool = False,
         has_z: bool = False,
-        seq_idx_dtype: Type[cutlass.Numeric] = cutlass.Int32,
+        io_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
         state_dtype: Type[cutlass.Numeric] = None,
+        seq_idx_dtype: Type[cutlass.Numeric] = cutlass.Int32,
+        cumsum_delta_dtype: Type[cutlass.Numeric] = cutlass.Float32,
+        acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
     ):
         self.io_dtype: Type[cutlass.Numeric] = io_dtype
         self.state_dtype: Type[cutlass.Numeric] = state_dtype or io_dtype
