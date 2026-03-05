@@ -64,11 +64,6 @@ class LayerNormKernel:
         self.vec_size = compute_optimal_vec_size(H, max_vec_size)
         self.copy_bits = self.vec_size * elem_bits
 
-        # float32 gamma/beta have different vec_size (128-bit / 32 bits = 4 elements max)
-        max_vec_size_f32 = COPY_BITS // 32  # = 4
-        self.vec_size_f32 = compute_optimal_vec_size(H, max_vec_size_f32)
-        self.copy_bits_f32 = self.vec_size_f32 * 32
-
         self.threads_per_row = compute_threads_per_row(H, self.vec_size)
         self.num_threads = self.threads_per_row
         self.num_warps = max(self.threads_per_row // 32, 1)
@@ -78,26 +73,9 @@ class LayerNormKernel:
         )
         self.cols_per_tile = self.vec_size * self.num_vec_blocks * self.threads_per_row
 
-        # For float32 gamma/beta vectorized load
-        self.num_vec_blocks_f32 = max(
-            1,
-            (H // self.vec_size_f32 + self.threads_per_row - 1) // self.threads_per_row,
-        )
-        self.cols_per_tile_f32 = (
-            self.vec_size_f32 * self.num_vec_blocks_f32 * self.threads_per_row
-        )
-
     def _smem_size_in_bytes(self) -> int:
-        # Shared memory for:
-        # - gamma/beta f32 tiles: cols_per_tile_f32 * 4 * 2
-        # - gamma/beta input dtype tiles: cols_per_tile * elem_bytes * 2
-        # - reduction buffers: 2 * num_warps * 4
-        elem_bytes = self.dtype.width // 8
-        return (
-            self.cols_per_tile_f32 * 4 * 2
-            + self.cols_per_tile * elem_bytes * 2
-            + 2 * self.num_warps * 4
-        )
+        # Two reduction buffers (sum and variance), one float32 slot per warp each
+        return 2 * self.num_warps * 4
 
     @cute.jit
     def __call__(
@@ -120,15 +98,6 @@ class LayerNormKernel:
         tv_layout = cute.make_layout(tv_shape, stride=tv_stride)
         tiler_mn = (1, self.cols_per_tile)
 
-        # Layout for gamma/beta (float32)
-        tv_shape_f32, tv_stride_f32 = make_tv_layout(
-            self.threads_per_row,
-            self.vec_size_f32,
-            self.num_vec_blocks_f32,
-        )
-        tv_layout_f32 = cute.make_layout(tv_shape_f32, stride=tv_stride_f32)
-        tiler_mn_f32 = (1, self.cols_per_tile_f32)
-
         self.kernel(
             mY,
             mX,
@@ -139,8 +108,6 @@ class LayerNormKernel:
             enable_pdl,
             tv_layout,
             tiler_mn,
-            tv_layout_f32,
-            tiler_mn_f32,
         ).launch(
             grid=[M, 1, 1],
             block=[self.num_threads, 1, 1],
@@ -161,8 +128,6 @@ class LayerNormKernel:
         enable_pdl: cutlass.Constexpr[bool],
         tv_layout: cute.Layout,
         tiler_mn: cute.Shape,
-        tv_layout_f32: cute.Layout,
-        tiler_mn_f32: cute.Shape,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -177,33 +142,8 @@ class LayerNormKernel:
         vec_size = self.vec_size
         num_vec_blocks = self.num_vec_blocks
         copy_bits = self.copy_bits
-        copy_bits_f32 = self.copy_bits_f32
 
         smem = cutlass.utils.SmemAllocator()
-
-        # Shared memory tiles for gamma, beta (float32)
-        sGamma_f32 = smem.allocate_tensor(
-            Float32,
-            cute.make_ordered_layout(tiler_mn_f32, order=(1, 0)),
-            byte_alignment=16,
-        )
-        sBeta_f32 = smem.allocate_tensor(
-            Float32,
-            cute.make_ordered_layout(tiler_mn_f32, order=(1, 0)),
-            byte_alignment=16,
-        )
-
-        # Shared memory tiles for gamma, beta in input dtype (for matching shape with x)
-        sGamma = smem.allocate_tensor(
-            mX.element_type,
-            cute.make_ordered_layout(tiler_mn, order=(1, 0)),
-            byte_alignment=16,
-        )
-        sBeta = smem.allocate_tensor(
-            mX.element_type,
-            cute.make_ordered_layout(tiler_mn, order=(1, 0)),
-            byte_alignment=16,
-        )
 
         # Two reduction buffers: one for sum, one for variance
         reduction_buffer_sum = smem.allocate_tensor(
@@ -224,14 +164,6 @@ class LayerNormKernel:
         gX = cute.local_tile(mX, tiler_mn, (bidx, 0))
         cX = cute.local_tile(idX, tiler_mn, (bidx, 0))
 
-        # Expand gamma and beta to 2D for tiled copy (float32)
-        mGamma_2d = cute.prepend_ones(mGamma, up_to_rank=2)
-        mBeta_2d = cute.prepend_ones(mBeta, up_to_rank=2)
-
-        # Identity tensor for gamma/beta bounds checking
-        idGamma = cute.make_identity_tensor(mGamma_2d.shape)
-        cGamma = cute.local_tile(idGamma, tiler_mn_f32, (0, 0))
-
         # Copy atom for input (input dtype) - sync load
         copy_atom_load = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
@@ -239,56 +171,23 @@ class LayerNormKernel:
             num_bits_per_copy=copy_bits,
         )
 
-        # Copy atom for gamma/beta (float32) - load to shared memory
-        copy_atom_load_f32 = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
-            Float32,
-            num_bits_per_copy=copy_bits_f32,
-        )
-
         tiled_copy_load = cute.make_tiled_copy(copy_atom_load, tv_layout, tiler_mn)
-        tiled_copy_load_f32 = cute.make_tiled_copy(
-            copy_atom_load_f32, tv_layout_f32, tiler_mn_f32
-        )
 
         thr_copy_load = tiled_copy_load.get_slice(tidx)
-        thr_copy_load_f32 = tiled_copy_load_f32.get_slice(tidx)
 
         # Partitions for input
         tXgX = thr_copy_load.partition_S(gX)
         tXgY = thr_copy_load.partition_D(gY)
         tXcX = thr_copy_load.partition_S(cX)
 
-        # Partitions for gamma/beta (float32)
-        tGgGamma = thr_copy_load_f32.partition_S(mGamma_2d)
-        tGsGamma = thr_copy_load_f32.partition_D(sGamma_f32)
-        tGgBeta = thr_copy_load_f32.partition_S(mBeta_2d)
-        tGsBeta = thr_copy_load_f32.partition_D(sBeta_f32)
-        tGcGamma = thr_copy_load_f32.partition_S(cGamma)
-
-        # Partitions for gamma/beta (input dtype)
-        thr_copy_load.partition_D(sGamma)
-        thr_copy_load.partition_D(sBeta)
-
-        # Register fragments - initialize to zero for proper handling of out-of-bounds threads
+        # Register fragment - initialize to zero for proper handling of out-of-bounds threads
         tXrX = cute.make_rmem_tensor(tXgX.shape, mX.element_type)
-        tXrGamma = cute.make_rmem_tensor(tXgX.shape, mX.element_type)
-        tXrBeta = cute.make_rmem_tensor(tXgX.shape, mX.element_type)
         tXrX.store(cute.zeros_like(tXrX, dtype=mX.element_type))
-        tXrGamma.store(cute.zeros_like(tXrGamma, dtype=mX.element_type))
-        tXrBeta.store(cute.zeros_like(tXrBeta, dtype=mX.element_type))
 
         tXpX = predicate_k(tXcX, limit=H)
-        tGpGamma = predicate_k(tGcGamma, limit=H)
 
         # Phase 1: Load input from global to register
         cute.copy(copy_atom_load, tXgX, tXrX, pred=tXpX)
-
-        # Phase 1b: Load gamma/beta global -> shared (float32)
-        cute.copy(copy_atom_load_f32, tGgGamma, tGsGamma, pred=tGpGamma)
-        cute.copy(copy_atom_load_f32, tGgBeta, tGsBeta, pred=tGpGamma)
-
-        cute.arch.barrier()
 
         x = tXrX.load().to(Float32)
         sum_x = row_reduce_sum(x, threads_per_row, reduction_buffer_sum)
@@ -323,8 +222,9 @@ class LayerNormKernel:
 
         cute.arch.barrier()
 
-        # Phase 3: Load gamma/beta directly from float32 shared memory
-        # Avoid converting to bf16 and back to float32 which loses precision
+        # Phase 3: Load gamma/beta directly from global memory into registers.
+        # Each thread owns a disjoint range of columns so there is no sharing
+        # between threads — staging through shared memory is unnecessary.
         gamma_reg = cute.make_rmem_tensor(x.shape, Float32)
         beta_reg = cute.make_rmem_tensor(x.shape, Float32)
         gamma_reg.store(cute.zeros_like(gamma_reg, dtype=Float32))
@@ -336,8 +236,8 @@ class LayerNormKernel:
                 idx = col_offset + v * threads_per_row * vec_size + e
                 reg_idx = v * vec_size + e
                 if idx < H:
-                    gamma_reg[reg_idx] = sGamma_f32[0, idx]
-                    beta_reg[reg_idx] = sBeta_f32[0, idx]
+                    gamma_reg[reg_idx] = mGamma[idx]
+                    beta_reg[reg_idx] = mBeta[idx]
 
         gamma = gamma_reg.load()
         beta = beta_reg.load()
