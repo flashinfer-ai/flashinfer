@@ -353,6 +353,10 @@ void NoAuxTc(TensorView scores, TensorView bias, int64_t n_group, int64_t topk_g
   int16_t* replay_ptr = nullptr;
   if (routing_replay_out.has_value()) {
     auto replay = routing_replay_out.value();
+    TVM_FFI_ICHECK(replay.device().device_type == kDLCUDA)
+        << "routing_replay_out must be a CUDA tensor";
+    TVM_FFI_ICHECK(replay.device().device_id == scores.device().device_id)
+        << "routing_replay_out must be on the same device as scores";
     TVM_FFI_ICHECK(replay.dim() == 2)
         << "routing_replay_out must be a 2D Tensor [num_tokens, topk]";
     TVM_FFI_ICHECK(replay.sizes()[0] == num_tokens)
