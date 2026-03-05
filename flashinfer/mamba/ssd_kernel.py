@@ -27,19 +27,15 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 
-from typing import Optional, Tuple, Type
+from typing import Optional, Type
 
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
-import cutlass.torch as cutlass_torch
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cute.runtime import from_dlpack
-from torch.cuda.random import initial_seed
-
 from .ssd_tile_scheduler import (
     Mamba2SSDTileScheduler,
     Mamba2SSDTileSchedulerParams,
@@ -87,10 +83,6 @@ class SSDKernel:
         assert cumsum_delta_dtype in {cutlass.Float32}, (
             "Do not support other cumsum types."
         )
-        assert self.state_dtype in {
-            cutlass.Float16,
-            cutlass.BFloat16,
-        }, f"state_dtype must be Float16 or BFloat16, got {self.state_dtype}"
         assert not (not has_d and d_has_hdim), "D cannot have Hdim if has_d is False"
 
         # Hardcode default setting
@@ -143,7 +135,7 @@ class SSDKernel:
         self.num_regs_epilogue_warps = 112
 
         # Shared storage
-        self.shared_storage = None
+        self.shared_storage = None  # type: ignore[assignment]
 
         # TMEM buffer offsets
         self.tmem_intra1_acc_offset = 0
@@ -288,12 +280,6 @@ class SSDKernel:
         )
 
         # P is ACC operand (from tmem) of INTER1_MMA, to be TMA stored by PRE_INTER
-        # self.p_smem_layout_store = sm100_utils.make_smem_layout_epi(
-        #     self.io_dtype,
-        #     utils.LayoutEnum.ROW_MAJOR,
-        #     self.tile_shape_mnk_inter2[1:],
-        #     self.internal_stages,
-        # )
         self.p_smem_layout_store = sm100_utils.make_smem_layout_epi(
             self.state_dtype,
             utils.LayoutEnum.COL_MAJOR,
@@ -392,8 +378,6 @@ class SSDKernel:
             self.internal_stages,
             self.intra1_acc_stages,
         )
-
-        return
 
     @cute.jit
     def __call__(
@@ -666,10 +650,10 @@ class SSDKernel:
                 nonswizzle_buffer_align_bytes,
             ]
 
-        self.shared_storage = SharedStorage
-        if cutlass.const_expr(self.shared_storage.size_in_bytes() > self.smem_capacity):
+        self.shared_storage = SharedStorage  # type: ignore[assignment]
+        if cutlass.const_expr(self.shared_storage.size_in_bytes() > self.smem_capacity):  # type: ignore[attr-defined]
             raise ValueError(
-                f"SharedStorage size {self.shared_storage.size_in_bytes()} exceeds smem_capacity {self.smem_capacity}"
+                f"SharedStorage size {self.shared_storage.size_in_bytes()} exceeds smem_capacity {self.smem_capacity}"  # type: ignore[attr-defined]
             )
 
         # Launch the kernel synchronously
@@ -795,20 +779,20 @@ class SSDKernel:
             for tma_atom in tma_atoms:
                 cpasync.prefetch_descriptor(tma_atom)
 
-        # Static consts
-        D = cute.size(tma_tensor_x, mode=[0])
+        # Static consts (CuTe DSL tracing needs these even if unused by Python)
+        D = cute.size(tma_tensor_x, mode=[0])  # noqa: F841
         L = cute.size(tma_tensor_x, mode=[1])
-        N = cute.size(tma_tensor_b, mode=[1])
+        N = cute.size(tma_tensor_b, mode=[1])  # noqa: F841
         # Dynamic values
         # In varlen mode, C/first_chunk are set per-tile from seq_chunk_cumsum.
         # In non-varlen mode, C = num_logical_chunks and first_chunk = 0.
         C = num_logical_chunks
-        first_chunk = cutlass.Int32(0)
-        seq_id = cutlass.Int32(0)
+        first_chunk = cutlass.Int32(0)  # noqa: F841
+        seq_id = cutlass.Int32(0)  # noqa: F841
         EH = cute.size(tma_tensor_x, mode=[3])
-        B = cute.size(tma_tensor_x, mode=[4])
+        B = cute.size(tma_tensor_x, mode=[4])  # noqa: F841
         G = cute.size(tma_tensor_b, mode=[3])
-        NGROUP_RATIO = EH // G
+        NGROUP_RATIO = EH // G  # noqa: F841
 
         # Make TiledMma
         (
@@ -1188,8 +1172,6 @@ class SSDKernel:
                 number_of_threads=self.threads_per_cta,
             )
 
-        return
-
     # ------------------------------------------------------------------ #
     #  Warp-specialized device functions
     # ------------------------------------------------------------------ #
@@ -1322,9 +1304,7 @@ class SSDKernel:
             tiled_r2s_p_state,
             tRS_rP_state,
             tRS_sP_state,
-        ) = self.smem_store_and_partition_p_state(
-            local_tidx, smem_pt, tiled_t2r_inter1
-        )
+        ) = self.smem_store_and_partition_p_state(local_tidx, smem_pt, tiled_t2r_inter1)
         # state_dtype S2R copies for init_states gmem load (only with init_states)
         tiled_s2r_p_state = None
         tS2R_sP_state = None
@@ -1408,9 +1388,7 @@ class SSDKernel:
                 init_states_pipeline.consumer_wait(istate_consumer_state)
 
                 istate_coord = (None, None, None, istate_consumer_state.index)
-                cute.copy(
-                    tiled_s2r_p_state, tS2R_sP_state[istate_coord], tRS_rP_state
-                )
+                cute.copy(tiled_s2r_p_state, tS2R_sP_state[istate_coord], tRS_rP_state)
 
                 for reg_idx in range(cute.size(tRS_rP_state)):
                     tState[reg_idx] = tRS_rP_state[reg_idx].to(self.acc_dtype)
@@ -1437,7 +1415,6 @@ class SSDKernel:
             inter2_p_coord = (None, None, None, inter2_p_producer_state.index)
             # Don't overwrite smem_p if we already have init states there
             if cutlass.const_expr(self.has_init_states):
-                # Convert tState to tRS_rP_io (same as done in chunk loop at line 1876-1878)
                 for reg_idx in range(cute.size(tState)):
                     tRS_rP_io[reg_idx] = tState[reg_idx].to(self.io_dtype)
             cute.copy(tiled_r2s_p_io, tRS_rP_io, tRS_sP_io[inter2_p_coord])
@@ -1613,9 +1590,7 @@ class SSDKernel:
                     if seq_ends_here:
                         # Convert smem_p from io_dtype to state_dtype for TMA store
                         for reg_idx in range(cute.size(tState)):
-                            tRS_rP_state[reg_idx] = tState[reg_idx].to(
-                                self.state_dtype
-                            )
+                            tRS_rP_state[reg_idx] = tState[reg_idx].to(self.state_dtype)
                         cute.copy(
                             tiled_r2s_p_state,
                             tRS_rP_state,
@@ -2567,7 +2542,7 @@ class SSDKernel:
             )
 
             # Manual pipeline: batched gemm over C-1 dimension
-            for chunk_idx in cutlass.range(C - 1, unroll=1):
+            for chunk_idx in cutlass.range(C - 1, unroll=1):  # noqa: B007
                 # Conditionally wait for B/C/INTRA1_ACC buffer full/full/empty
                 b_pipeline.consumer_wait(b_consumer_state, peek_b_full_status)
                 c_pipeline.consumer_wait(c_consumer_state, peek_c_full_status)
@@ -2872,7 +2847,7 @@ class SSDKernel:
                 d_producer_state.advance()
 
             # Batched load over C dimension
-            for chunk_idx in cutlass.range(C, unroll=1):
+            for chunk_idx in cutlass.range(C, unroll=1):  # noqa: B007
                 # Index into global chunk_indices/chunk_offsets arrays
                 physical_chunk, chunk, chunk_offset = self.resolve_physical_chunk(
                     first_chunk,
@@ -3035,7 +3010,7 @@ class SSDKernel:
             )
 
             # Batched load over C dimension
-            for chunk_idx in cutlass.range(C, unroll=1):
+            for chunk_idx in cutlass.range(C, unroll=1):  # noqa: B007
                 # Index into global chunk_indices/chunk_offsets arrays
                 physical_chunk, chunk, _ = self.resolve_physical_chunk(
                     first_chunk,
@@ -3183,7 +3158,7 @@ class SSDKernel:
             # Batched gemm over C dimension
             # MMA1 (B_scaled^T @ X) runs before MMA2 (C @ P) so that
             # the pre-inter warp has more time to prepare inter2_p.
-            for chunk_idx in cutlass.range(C, unroll=1):
+            for chunk_idx in cutlass.range(C, unroll=1):  # noqa: B007
                 # Conditionally wait for X/INTER1_B/INTER1_ACC buffer full/full/empty
                 x_pipeline.consumer_wait(x_consumer_state, peek_x_full_status)
                 inter1_b_pipeline.consumer_wait(
@@ -3807,7 +3782,7 @@ class SSDKernel:
         b_consumer_state,
     ):
         for kphase_idx in cutlass.range(cute.size(tCrB, mode=[2]), unroll_full=True):
-            # set accu = 1
+            # Accumulate on all but first k-phase.
             tiled_mma.set(
                 tcgen05.Field.ACCUMULATE,
                 cutlass.Boolean(kphase_idx != 0),
@@ -4163,9 +4138,7 @@ class SSDKernel:
         )
         return tiled_r2s_p_io, tRS_rP_io, tRS_sP_io
 
-    def smem_store_and_partition_p_state(
-        self, local_tidx, smem_pt, tiled_t2r_inter1
-    ):
+    def smem_store_and_partition_p_state(self, local_tidx, smem_pt, tiled_t2r_inter1):
         """R2S copy atoms/partitions in state_dtype for fstate gmem store."""
         copy_atom_r2s_p_state = cute.make_copy_atom(
             cute.nvgpu.warp.StMatrix8x8x16bOp(transpose=True, num_matrices=4),
@@ -4295,7 +4268,7 @@ class SSDKernel:
         )
         tiled_s2r_x = cute.make_tiled_copy_D(copy_atom_s2r_x, tiled_t2r_inter2_intra2)
         thr_s2r_x = tiled_s2r_x.get_slice(local_tidx)
-        # Partition smem/register tensor for smem store INTER2_P
+        # Partition smem/register tensor for smem load X
         # (R2S_ATOM, R2S_M, R2S_N, EPI_M, EPI_N, INPUT_STAGES)
         tSR_sX = thr_s2r_x.partition_S(cute.flat_divide(smem_xt, epi_tile))
         # (R2S_ATOM, R2S_M, R2S_N)

@@ -351,6 +351,214 @@ class TestChunkScanCombined:
         assert states_match, "Final states mismatch between CUTLASS and Triton"
 
 
+class TestChunkScanCombinedDHasHdim(TestChunkScanCombined):
+    """Test chunk scan with 2D D tensor (nheads, headdim) triggering d_has_hdim=True."""
+
+    @pytest.fixture(params=[1])
+    def batch(self, request):
+        return request.param
+
+    @pytest.fixture(params=[1])
+    def nchunks(self, request):
+        return request.param
+
+    @pytest.fixture
+    def inputs(self, batch, nheads, headdim, dstate, chunk_size, nchunks, ngroups):
+        """Create test inputs with 2D D tensor."""
+        torch.manual_seed(42)
+
+        seqlen = chunk_size * nchunks
+
+        x = torch.randn(
+            batch, seqlen, nheads, headdim, dtype=self.INPUT_DTYPE, device="cuda"
+        )
+        dt = torch.randn(batch, seqlen, nheads, dtype=torch.float32, device="cuda")
+        A = -torch.rand(nheads, dtype=torch.float32, device="cuda") - 1.0
+        B = torch.randn(
+            batch, seqlen, ngroups, dstate, dtype=self.INPUT_DTYPE, device="cuda"
+        )
+        C = torch.randn(
+            batch, seqlen, ngroups, dstate, dtype=self.INPUT_DTYPE, device="cuda"
+        )
+        # 2D D: (nheads, headdim) -> triggers d_has_hdim=True
+        D = torch.randn(nheads, headdim, dtype=self.INPUT_DTYPE, device="cuda")
+        dt_bias = torch.rand(nheads, dtype=torch.float32, device="cuda") - 4.0
+
+        return {
+            "x": x,
+            "dt": dt,
+            "A": A,
+            "B": B,
+            "C": C,
+            "D": D,
+            "dt_bias": dt_bias,
+            "chunk_size": chunk_size,
+            "seqlen": seqlen,
+            "nheads": nheads,
+            "headdim": headdim,
+            "dstate": dstate,
+            "ngroups": ngroups,
+        }
+
+    def test_output_correctness(self, inputs, reference_output):
+        """Test with 2D D (d_has_hdim=True)."""
+        out_ref, final_states_ref = reference_output
+
+        out_test, final_states_test = ssd_combined_fwd(
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            inputs["chunk_size"],
+            D=inputs["D"],
+            dt_bias=inputs["dt_bias"],
+            dt_softplus=True,
+        )
+
+        out_ref_cmp = out_ref.to(out_test.dtype)
+        final_states_ref_cmp = final_states_ref.to(final_states_test.dtype)
+
+        out_match = torch.allclose(
+            out_ref_cmp, out_test, atol=self.ATOL, rtol=self.RTOL
+        )
+        states_match = torch.allclose(
+            final_states_ref_cmp, final_states_test, atol=self.ATOL, rtol=self.RTOL
+        )
+
+        if out_match:
+            print("✓ [DHasHdim] Outputs match within tolerance")
+        else:
+            print("✗ [DHasHdim] Outputs do NOT match")
+            self._print_mismatch_details(
+                out_ref_cmp, out_test, "output", self.ATOL, self.RTOL
+            )
+
+        if states_match:
+            print("✓ [DHasHdim] Final states match within tolerance")
+        else:
+            print("✗ [DHasHdim] Final states do NOT match")
+            self._print_mismatch_details(
+                final_states_ref_cmp,
+                final_states_test,
+                "final_states",
+                self.ATOL,
+                self.RTOL,
+            )
+
+        assert out_match, "Output mismatch with d_has_hdim=True"
+        assert states_match, "Final states mismatch with d_has_hdim=True"
+
+
+class TestChunkScanCombinedDHasHdim1D(TestChunkScanCombined):
+    """Test chunk scan with 1D D tensor but d_has_hdim=True (broadcast via TMA)."""
+
+    @pytest.fixture(params=[1])
+    def batch(self, request):
+        return request.param
+
+    @pytest.fixture(params=[1])
+    def nchunks(self, request):
+        return request.param
+
+    @pytest.fixture
+    def inputs(self, batch, nheads, headdim, dstate, chunk_size, nchunks, ngroups):
+        """Create test inputs with 1D D but d_has_hdim=True."""
+        torch.manual_seed(42)
+
+        seqlen = chunk_size * nchunks
+
+        x = torch.randn(
+            batch, seqlen, nheads, headdim, dtype=self.INPUT_DTYPE, device="cuda"
+        )
+        dt = torch.randn(batch, seqlen, nheads, dtype=torch.float32, device="cuda")
+        A = -torch.rand(nheads, dtype=torch.float32, device="cuda") - 1.0
+        B = torch.randn(
+            batch, seqlen, ngroups, dstate, dtype=self.INPUT_DTYPE, device="cuda"
+        )
+        C = torch.randn(
+            batch, seqlen, ngroups, dstate, dtype=self.INPUT_DTYPE, device="cuda"
+        )
+        # 1D D: (nheads,) — will be broadcast to (headdim, nheads) by d_has_hdim path
+        D = torch.randn(nheads, dtype=self.INPUT_DTYPE, device="cuda")
+        dt_bias = torch.rand(nheads, dtype=torch.float32, device="cuda") - 4.0
+
+        return {
+            "x": x,
+            "dt": dt,
+            "A": A,
+            "B": B,
+            "C": C,
+            "D": D,
+            "dt_bias": dt_bias,
+            "chunk_size": chunk_size,
+            "seqlen": seqlen,
+            "nheads": nheads,
+            "headdim": headdim,
+            "dstate": dstate,
+            "ngroups": ngroups,
+        }
+
+    def test_output_correctness(self, inputs, reference_output):
+        """Test with 1D D and d_has_hdim=True (broadcast)."""
+        out_ref, final_states_ref = reference_output
+
+        # Construct SSDCombined with d_has_hdim=True explicitly,
+        # even though D is 1D. This exercises the broadcast path.
+        ssd = SSDCombined(
+            chunk_size=inputs["chunk_size"],
+            nheads=inputs["nheads"],
+            headdim=inputs["headdim"],
+            dstate=inputs["dstate"],
+            ngroups=inputs["ngroups"],
+            has_d=True,
+            d_has_hdim=True,
+        )
+        out_test, final_states_test = ssd.run(
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            D=inputs["D"],
+            dt_bias=inputs["dt_bias"],
+            dt_softplus=True,
+        )
+
+        out_ref_cmp = out_ref.to(out_test.dtype)
+        final_states_ref_cmp = final_states_ref.to(final_states_test.dtype)
+
+        out_match = torch.allclose(
+            out_ref_cmp, out_test, atol=self.ATOL, rtol=self.RTOL
+        )
+        states_match = torch.allclose(
+            final_states_ref_cmp, final_states_test, atol=self.ATOL, rtol=self.RTOL
+        )
+
+        if out_match:
+            print("✓ [DHasHdim1D] Outputs match within tolerance")
+        else:
+            print("✗ [DHasHdim1D] Outputs do NOT match")
+            self._print_mismatch_details(
+                out_ref_cmp, out_test, "output", self.ATOL, self.RTOL
+            )
+
+        if states_match:
+            print("✓ [DHasHdim1D] Final states match within tolerance")
+        else:
+            print("✗ [DHasHdim1D] Final states do NOT match")
+            self._print_mismatch_details(
+                final_states_ref_cmp,
+                final_states_test,
+                "final_states",
+                self.ATOL,
+                self.RTOL,
+            )
+
+        assert out_match, "Output mismatch with 1D D + d_has_hdim=True"
+        assert states_match, "Final states mismatch with 1D D + d_has_hdim=True"
+
+
 class TestChunkScanCombinedNoD(TestChunkScanCombined):
     """Test chunk scan without D scaling."""
 
@@ -1670,3 +1878,39 @@ def test_fp16_state_dtype():
     assert torch.allclose(
         final_states_ref_cmp, final_states_test, atol=ATOL, rtol=RTOL
     ), "Final states mismatch with fp16 state_dtype"
+
+
+@pytest.mark.xfail(
+    reason="state_dtype=float32 not yet supported (only float16/bfloat16)",
+    strict=True,
+)
+def test_fp32_state_dtype():
+    """Test that initial_states in fp32 is not yet supported."""
+    torch.manual_seed(42)
+    batch, seqlen, nheads, headdim = 1, 128, 8, 64
+    ngroups, dstate, chunk_size = 8, 128, 128
+
+    x = torch.randn(batch, seqlen, nheads, headdim, dtype=torch.bfloat16, device="cuda")
+    dt = torch.randn(batch, seqlen, nheads, dtype=torch.float32, device="cuda")
+    A = -torch.rand(nheads, dtype=torch.float32, device="cuda") - 1.0
+    B = torch.randn(batch, seqlen, ngroups, dstate, dtype=torch.bfloat16, device="cuda")
+    C = torch.randn(batch, seqlen, ngroups, dstate, dtype=torch.bfloat16, device="cuda")
+    D = torch.randn(nheads, dtype=torch.bfloat16, device="cuda")
+    dt_bias = torch.rand(nheads, dtype=torch.float32, device="cuda") - 4.0
+
+    initial_states = torch.randn(
+        batch, nheads, headdim, dstate, dtype=torch.float32, device="cuda"
+    )
+
+    out_test, final_states_test = ssd_combined_fwd(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size,
+        D=D,
+        dt_bias=dt_bias,
+        dt_softplus=True,
+        initial_states=initial_states,
+    )

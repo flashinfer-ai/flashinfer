@@ -337,9 +337,10 @@ class SSDCombined:
         _state_dtype_map = {
             torch.bfloat16: cutlass.BFloat16,
             torch.float16: cutlass.Float16,
+            # torch.float32: cutlass.Float32, # -- not supported yet
         }
         assert state_dtype in _state_dtype_map, (
-            f"state_dtype must be bfloat16 or float16, got {state_dtype}"
+            f"state_dtype must be one of {list(_state_dtype_map.keys())}, got {state_dtype}"
         )
         self._state_dtype = _state_dtype_map[state_dtype]
         self._cumsum_dtype = cutlass.Float32
@@ -494,7 +495,6 @@ class SSDCombined:
                 "out must be contiguous in (B, EH, D, C, L) layout"
             )
 
-        # -- Step 1: Cumsum (Triton) ------------------------------------------
         # Triton kernel outputs dt_processed directly in io_dtype (bf16),
         # avoiding a separate float32->bf16 copy.
         dA_cumsum, dt_processed = chunk_cumsum_fwd(
@@ -507,7 +507,6 @@ class SSDCombined:
             dt_out_dtype=self._io_torch_dtype,
         )
 
-        # -- Step 2: Allocate output if needed --------------------------------
         if out is None:
             out = torch.empty(
                 batch,
@@ -519,9 +518,6 @@ class SSDCombined:
                 device=x.device,
             )
 
-        # -- Step 3: Prepare torch tensors in CuTe-expected layouts -------------
-        # With TVM-FFI, we pass torch tensors directly (no from_dlpack needed).
-        # The stride patterns must match the fake tensors used at compile time.
         io_torch_dtype = self._io_torch_dtype
 
         # x: (B, seqlen, EH, D) -> (D, L, C, EH, B)
@@ -573,10 +569,13 @@ class SSDCombined:
             if self._d_has_hdim:
                 if D.dim() == 1:
                     # (nheads,) -> (headdim, nheads): broadcast must be materialized
+                    # (TVM-FFI enforces stride_order=(0,1), so dim 0 must be stride 1)
+                    # it's a copy, but a small one.
+                    # afaik no inference framework really hits this case
                     d_tensor = D.unsqueeze(1).expand(-1, headdim).contiguous().t()
                 else:
-                    # (nheads, headdim) -> (headdim, nheads)
-                    d_tensor = D.t().contiguous()
+                    # (nheads, headdim) -> (headdim, nheads): view, no copy
+                    d_tensor = D.t()
             else:
                 if D.dim() == 2:
                     d_tensor = D[:, 0].unsqueeze(0)  # (1, nheads)
@@ -603,7 +602,7 @@ class SSDCombined:
         fstate_torch = self._get_or_alloc_fstate(fstate_batch)
         fstate_permuted = fstate_torch.permute(3, 2, 1, 0)
 
-        # -- Step 4: Varlen metadata ------------------------------------------
+        # Varlen metadata: seq_chunk_cumsum is output buffer for Triton kernel, passed as input to CUTLASS kernel
         seq_chunk_cumsum = None
         num_seqs = 0
 
@@ -632,7 +631,6 @@ class SSDCombined:
             len(chunk_indices) if chunk_indices is not None else nchunks
         )
 
-        # -- Step 5: Launch kernel (TVM-FFI: torch tensors passed directly) ---
         self._compiled_kernel(
             x_permuted,
             cumsum_delta_permuted,
@@ -652,7 +650,6 @@ class SSDCombined:
             Int32(num_seqs),
         )
 
-        # -- Step 6: Output ---------------------------------------------------
         out_view = out.permute(0, 3, 4, 1, 2).reshape(
             batch,
             seqlen,
