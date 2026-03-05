@@ -16,7 +16,6 @@ limitations under the License.
 
 import functools
 import math
-import os
 from enum import Enum
 from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple, Union
 
@@ -188,93 +187,6 @@ def _unpack_paged_kv_cache(
                 type(paged_kv_cache)
             )
         )
-
-
-def _sanitize_trtllm_sliding_window_block_tables(
-    block_tables: torch.Tensor,
-    seq_lens: torch.Tensor,
-    page_size: int,
-    window_left: int,
-    num_pages_in_mem_pool: Optional[int] = None,
-) -> torch.Tensor:
-    r"""Normalize TRTLLM paged-KV block tables for sliding-window attention.
-
-    TRTLLM kernels should only attend to the in-window pages for SWA. To avoid any
-    impact from out-of-window placeholder pages, this helper rewrites the prefix
-    pages (left of the in-window region) to the first in-window page id.
-
-    Notes
-    -----
-    - The transform is only applied when ``window_left >= 0``.
-    - If no sequence in the batch exceeds the window, the input is returned as-is.
-    - This helper intentionally does not modify the in-window pages.
-    """
-    if not _is_trtllm_swa_block_table_sanitize_enabled():
-        return block_tables
-    if window_left < 0 or block_tables.numel() == 0:
-        return block_tables
-    if block_tables.ndim != 2:
-        raise ValueError(
-            f"block_tables must be a 2D tensor, got shape={tuple(block_tables.shape)}"
-        )
-    if seq_lens.ndim != 1:
-        raise ValueError(
-            f"seq_lens must be a 1D tensor, got shape={tuple(seq_lens.shape)}"
-        )
-    if block_tables.size(0) != seq_lens.numel():
-        raise ValueError(
-            "block_tables and seq_lens batch size mismatch: "
-            f"{block_tables.size(0)} vs {seq_lens.numel()}"
-        )
-    if page_size <= 0:
-        raise ValueError(f"page_size must be positive, got {page_size}")
-
-    batch_size, max_num_blocks_per_seq = block_tables.shape
-    if max_num_blocks_per_seq == 0:
-        return block_tables
-
-    # Compute page counts on the same device as block_tables.
-    seq_lens_i64 = seq_lens.to(device=block_tables.device, dtype=torch.int64)
-    total_pages = (seq_lens_i64 + page_size - 1) // page_size
-    total_pages = total_pages.clamp_(min=0, max=max_num_blocks_per_seq)
-
-    window_tokens = window_left + 1
-    in_window_tokens = torch.minimum(
-        seq_lens_i64,
-        torch.full_like(seq_lens_i64, window_tokens),
-    )
-    in_window_pages = (in_window_tokens + page_size - 1) // page_size
-    in_window_pages = in_window_pages.clamp_(min=0, max=max_num_blocks_per_seq)
-
-    start_live = (total_pages - in_window_pages).clamp_(
-        min=0, max=max_num_blocks_per_seq
-    )
-
-    row_ids = torch.arange(batch_size, device=block_tables.device)
-    anchor_col = torch.where(total_pages > 0, start_live, torch.zeros_like(start_live))
-    anchor_vals = block_tables[row_ids, anchor_col]
-    if num_pages_in_mem_pool is not None and num_pages_in_mem_pool > 0:
-        anchor_vals = anchor_vals.clamp_(0, num_pages_in_mem_pool - 1)
-    else:
-        anchor_vals = anchor_vals.clamp_min_(0)
-
-    col_ids = torch.arange(
-        max_num_blocks_per_seq, device=block_tables.device
-    ).unsqueeze(0)
-    prefix_mask = col_ids < start_live.unsqueeze(1)
-    return torch.where(prefix_mask, anchor_vals.unsqueeze(1), block_tables)
-
-
-@functools.cache
-def _is_trtllm_swa_block_table_sanitize_enabled() -> bool:
-    """Return whether TRTLLM SWA block-table sanitization is enabled.
-
-    Controlled by env var ``FLASHINFER_TRTLLM_SWA_BLOCK_TABLE_SANITIZE``:
-    - enabled (default): unset, ``1``, ``true``, ``yes``, ``on``
-    - disabled: ``0``, ``false``, ``no``, ``off``
-    """
-    value = os.getenv("FLASHINFER_TRTLLM_SWA_BLOCK_TABLE_SANITIZE", "1")
-    return value.strip().lower() not in ("0", "false", "no", "off")
 
 
 def get_alibi_slopes(n_heads: int) -> torch.Tensor:
