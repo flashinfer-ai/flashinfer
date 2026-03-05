@@ -28,7 +28,7 @@ def _is_sm100_plus():
 
 # VAE problem sizes
 C_VALUES = [64, 128, 160, 256, 320, 512, 640, 1024]
-TOKEN_VALUES_SMALL = [1560, 6240, 24960]
+TOKEN_VALUES_SMALL = [1560, 6240, 24960, 99840, 399360]
 
 
 @pytest.mark.parametrize("C", C_VALUES)
