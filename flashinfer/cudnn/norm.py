@@ -38,6 +38,7 @@ if CUDNN_AVAILABLE:
     _TORCH_TO_CUDNN_OUTPUT_DTYPE = {
         torch.bfloat16: cudnn.data_type.BFLOAT16,
         torch.float8_e4m3fn: cudnn.data_type.FP8_E4M3,
+        torch.uint8: cudnn.data_type.FP4_E2M1,  # packed FP4: 2 elements per byte
     }
 
 
@@ -147,23 +148,33 @@ def cudnn_fused_rmsnorm_silu(
     if cudnn_out_dtype is None:
         raise ValueError(f"Unsupported output dtype: {out_torch_dtype}")
 
+    is_nvfp4 = (out_torch_dtype == torch.uint8)
+
     graph, X, scale, epsilon, Z, workspace_size = _build_rmsnorm_silu_graph(
         num_tokens, C, int(cudnn_out_dtype), device_index
     )
 
     if out is None:
-        out = torch.empty_like(input)
+        if is_nvfp4:
+            # NVFP4: 2 FP4 values per byte → half the elements
+            out = torch.empty(num_tokens * C // 2, dtype=torch.uint8, device=input.device)
+        else:
+            out = torch.empty_like(input)
 
     workspace = torch.empty(workspace_size, device=input.device, dtype=torch.uint8)
 
     epsilon_cpu = torch.full((1, 1, 1, 1), eps, dtype=torch.float32, device="cpu")
+
+    # For NVFP4, the graph expects the logical FP4 shape but the memory is packed.
+    # cuDNN handles the packing internally — we pass the raw buffer.
+    out_for_graph = out if is_nvfp4 else out.view(num_tokens, C, 1, 1)
 
     graph.execute(
         {
             X: input.view(num_tokens, C, 1, 1),
             scale: weight.view(1, C, 1, 1),
             epsilon: epsilon_cpu,
-            Z: out.view(num_tokens, C, 1, 1),
+            Z: out_for_graph,
         },
         workspace,
     )

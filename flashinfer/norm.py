@@ -469,7 +469,7 @@ def fused_rmsnorm_silu(
         and _is_sm100_plus()
         and input.dtype == torch.bfloat16
         and input.dim() == 2
-        and out.dtype in (torch.bfloat16, torch.float8_e4m3fn)
+        and out.dtype in (torch.bfloat16, torch.float8_e4m3fn, torch.uint8)
     ):
         _cudnn_fused_rmsnorm_silu(input, weight, eps, out)
     else:
