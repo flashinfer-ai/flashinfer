@@ -13,7 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <flashinfer/fused_rmsnorm_silu/fusedRMSNormSiLU.h>
+// Include the full kernel implementation (contains template definitions + explicit instantiations)
+#include <flashinfer/fused_rmsnorm_silu/fusedRmsNormSiLU.cu>
 
 #include "tvm_ffi_utils.h"
 
