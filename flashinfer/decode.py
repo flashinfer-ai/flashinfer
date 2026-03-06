@@ -2080,6 +2080,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             if backend == "fa2":
                 args.append(fixed_split_size)
                 args.append(disable_split_kv)
+                args.append(-1)  # fixed_cta_tile_q
                 args.append(0)  # num_colocated_ctas
                 args.append(q_len_per_req)  # uniform_q_len
                 args.append(True)  # fixed_uniform_q_len
@@ -2228,6 +2229,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
             ``e5m2``) with standard layout (last dim ``head_dim``), ``q`` must be ``fp16``
             (or ``bf16`` on SM80+), and the ``fa2`` tensor-core backend is forced.
             Defaults to ``False``.
+        fixed_cta_tile_q : Optional[int]
+            Fixed CTA tile size for FA2 prefill planning. Supported values are ``16``, ``64``, and
+            ``128``. Defaults to ``None`` (auto heuristic).
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -2304,6 +2308,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         q_len_per_req: int = 1,
         is_causal: Optional[bool] = None,
         use_token_head_sf: bool = False,
+        fixed_cta_tile_q: Optional[int] = None,
     ) -> None:
         """Shared plan() implementation for the paged-decode wrapper across backends."""
         _check_workspace_buffer_alignment(
@@ -2511,6 +2516,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
             )
         if fixed_split_size is None:
             fixed_split_size = -1
+        if fixed_cta_tile_q is None:
+            fixed_cta_tile_q = -1
+        elif fixed_cta_tile_q not in (16, 64, 128):
+            raise ValueError(
+                f"fixed_cta_tile_q should be one of {{16, 64, 128}}, got {fixed_cta_tile_q}"
+            )
 
         self._cached_q_data_type = q_data_type
         self._cached_kv_data_type = kv_data_type
@@ -2870,6 +2881,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             if self._backend == "fa2":
                 args.append(fixed_split_size)
                 args.append(disable_split_kv)
+                args.append(fixed_cta_tile_q)
                 args.append(0)  # num_colocated_ctas
                 args.append(q_len_per_req)  # uniform_q_len
                 args.append(True)  # fixed_uniform_q_len
@@ -5542,6 +5554,7 @@ def fast_decode_plan(
     disable_split_kv: bool = False,
     q_len_per_req: int = 1,
     global_override_indptr_cpu: Optional[torch.Tensor] = None,
+    fixed_cta_tile_q: Optional[int] = None,
 ) -> None:
     """
     A faster version of BatchDecodeWithPagedKVCacheWrapper::plan used for FlashInferMultiStepDraftBackend.
@@ -5711,6 +5724,12 @@ def fast_decode_plan(
         # Here we set fixed_split_size to -1 to avoid the assertion error in flashinfer's plan function
         if fixed_split_size is None:
             fixed_split_size = -1
+        if fixed_cta_tile_q is None:
+            fixed_cta_tile_q = -1
+        elif fixed_cta_tile_q not in (16, 64, 128):
+            raise ValueError(
+                f"fixed_cta_tile_q should be one of {{16, 64, 128}}, got {fixed_cta_tile_q}"
+            )
 
     if self.is_cuda_graph_enabled:
         if batch_size != self._fixed_batch_size:
@@ -5776,7 +5795,7 @@ def fast_decode_plan(
             kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
 
             try:
-                # Make sure we pass exactly 19 arguments for fa2 backend and 16 arguments for fa3 backend
+                # Make sure we pass exactly 20 arguments for fa2 backend and 16 arguments for fa3 backend
                 args = [
                     self._float_workspace_buffer,
                     self._int_workspace_buffer,
@@ -5798,6 +5817,7 @@ def fast_decode_plan(
                 if self._backend == "fa2":
                     args.append(fixed_split_size)
                     args.append(disable_split_kv)
+                    args.append(fixed_cta_tile_q)
                     args.append(0)  # num_colocated_ctas
                     args.append(q_len_per_req)  # uniform_q_len
                     args.append(True)  # fixed_uniform_q_len

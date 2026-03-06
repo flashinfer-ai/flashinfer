@@ -547,7 +547,7 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
                                    uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
                                    uint32_t page_size, uint32_t max_batch_size_if_split,
                                    bool enable_cuda_graph, int32_t window_left,
-                                   int32_t fixed_split_size, bool disable_split_kv,
+                                   int32_t fixed_split_size, bool disable_split_kv, int32_t fixed_cta_tile_q,
                                    int64_t uniform_q_len, bool fixed_uniform_q_len,
                                    uint32_t head_dim_qk = 0, uint32_t kv_dtype_bytes = 2) {
   std::vector<IdType> request_indices, qo_tile_indices, kv_tile_indices, merge_indptr, o_indptr;
@@ -579,7 +579,17 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
   const uint32_t min_kv_chunk_size = std::max((128 / page_size), 1U);
   uint32_t cta_tile_q;
   uint32_t total_num_tiles_q;
-  if (enable_cuda_graph) {
+  if (fixed_cta_tile_q > 0) {
+    if (fixed_cta_tile_q != 16 && fixed_cta_tile_q != 64 && fixed_cta_tile_q != 128) {
+      std::ostringstream err_msg;
+      err_msg << "fixed_cta_tile_q should be one of {16, 64, 128}, but got " << fixed_cta_tile_q;
+      FLASHINFER_ERROR(err_msg.str());
+    }
+    cta_tile_q = fixed_cta_tile_q;
+    if (enable_cuda_graph) {
+      total_num_tiles_q = ceil_div(total_num_rows * gqa_group_size, cta_tile_q) + batch_size - 1;
+    }
+  } else if (enable_cuda_graph) {
     if (uniform_q_len > 0) {
       // The caller guarantees that every request has exactly uniform_q_len
       // rows in every plan replayed through this graph, so tiles can be
@@ -618,6 +628,9 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
     const int64_t avg_packed_qo_len = sum_packed_qo_len / batch_size;
     cta_tile_q = FA2DetermineCtaTileQ(avg_packed_qo_len, head_dim, head_dim_qk, kv_dtype_bytes);
 
+  }
+
+  if (!enable_cuda_graph) {
     total_num_tiles_q = 0;
     for (uint32_t i = 0; i < batch_size; ++i) {
       total_num_tiles_q += ceil_div(packed_qo_len_arr[i], cta_tile_q);
@@ -775,7 +788,7 @@ inline cudaError_t PrefillPlanImpl(
     IdType* kv_indptr_h, uint32_t total_num_rows, uint32_t batch_size, uint32_t num_qo_heads,
     uint32_t num_kv_heads, uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size,
     bool enable_cuda_graph, uint32_t sizeof_dtype_o, int32_t window_left, int32_t fixed_split_size,
-    bool disable_split_kv,
+    bool disable_split_kv, int32_t fixed_cta_tile_q,
     int64_t num_colocated_ctas,  // for POD attention, limit prefill
                                  // splits by #colocated decode CTAs
     int64_t uniform_q_len, bool fixed_uniform_q_len, cudaStream_t stream,
@@ -803,7 +816,7 @@ inline cudaError_t PrefillPlanImpl(
         qo_tile_indices_vec, kv_tile_indices_vec, merge_indptr_vec, o_indptr_vec] =
       PrefillSplitQOKVIndptr(qo_indptr_h, kv_indptr_h, total_num_rows, batch_size, num_qo_heads,
                              num_kv_heads, head_dim_vo, page_size, max_batch_size_if_split,
-                             enable_cuda_graph, window_left, fixed_split_size, disable_split_kv,
+                             enable_cuda_graph, window_left, fixed_split_size, disable_split_kv, fixed_cta_tile_q,
                              uniform_q_len, fixed_uniform_q_len, head_dim_qk, kv_dtype_bytes);
 
   plan_info.cta_tile_q = cta_tile_q;
@@ -943,7 +956,7 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
                                uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
                                uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size,
                                bool enable_cuda_graph, uint32_t sizeof_dtype_o, int32_t window_left,
-                               int32_t fixed_split_size, bool disable_split_kv,
+                               int32_t fixed_split_size, bool disable_split_kv, int32_t fixed_cta_tile_q,
                                int64_t num_colocated_ctas,  // for POD attention, limit prefill
                                                             // splits by #colocated decode CTAs
                                int64_t uniform_q_len, bool fixed_uniform_q_len, cudaStream_t stream,
@@ -955,7 +968,7 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
                                int_workspace_size_in_bytes, plan_info, qo_indptr_h, kv_indptr_h,
                                total_num_rows, batch_size, num_qo_heads, num_kv_heads, head_dim_qk,
                                head_dim_vo, page_size, enable_cuda_graph, sizeof_dtype_o,
-                               window_left, fixed_split_size, disable_split_kv, num_colocated_ctas,
+                               window_left, fixed_split_size, disable_split_kv, fixed_cta_tile_q, num_colocated_ctas,
                                uniform_q_len, fixed_uniform_q_len, stream, kv_dtype_bytes);
 }
 
@@ -965,7 +978,7 @@ inline cudaError_t PrefillPlanWorkspaceSize(
     IdType* kv_indptr_h, uint32_t total_num_rows, uint32_t batch_size, uint32_t num_qo_heads,
     uint32_t num_kv_heads, uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size,
     bool enable_cuda_graph, uint32_t sizeof_dtype_o, int32_t window_left, int32_t fixed_split_size,
-    bool disable_split_kv, int64_t num_colocated_ctas, int64_t uniform_q_len,
+    bool disable_split_kv, int32_t fixed_cta_tile_q, int64_t num_colocated_ctas, int64_t uniform_q_len,
     bool fixed_uniform_q_len, cudaStream_t stream, uint32_t kv_dtype_bytes = 2) {
   PrefillPlanInfo plan_info;
   return PrefillPlanImpl<false>(
@@ -974,7 +987,7 @@ inline cudaError_t PrefillPlanWorkspaceSize(
       /*int_buffer=*/nullptr, /*page_locked_int_buffer=*/nullptr,
       /*int_workspace_size_in_bytes=*/0, plan_info, qo_indptr_h, kv_indptr_h, total_num_rows,
       batch_size, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, page_size,
-      enable_cuda_graph, sizeof_dtype_o, window_left, fixed_split_size, disable_split_kv,
+      enable_cuda_graph, sizeof_dtype_o, window_left, fixed_split_size, disable_split_kv, fixed_cta_tile_q,
       num_colocated_ctas, uniform_q_len, fixed_uniform_q_len, stream, kv_dtype_bytes);
 }
 

@@ -435,6 +435,7 @@ class PODWithPagedKVCacheWrapper:
             window_left,
             -1,  # fixed_split_size
             False,  # disable_split_kv
+            -1,  # fixed_cta_tile_q
             0,  # num_colocated_ctas
             0,  # uniform_q_len
             False,  # fixed_uniform_q_len
@@ -1080,6 +1081,7 @@ class BatchPODWithPagedKVCacheWrapper:
             window_left,
             -1,  # fixed_split_size
             False,  # disable_split_kv
+            -1,  # fixed_cta_tile_q
             0,  # num_colocated_ctas
             0,  # uniform_q_len
             False,  # fixed_uniform_q_len
@@ -1108,6 +1110,7 @@ class BatchPODWithPagedKVCacheWrapper:
             window_left,
             -1,  # fixed_split_size
             False,  # disable_split_kv
+            -1,  # fixed_cta_tile_q
             num_colocated_ctas,
             0,  # uniform_q_len
             False,  # fixed_uniform_q_len

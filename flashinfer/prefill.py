@@ -3514,6 +3514,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if backend == "fa2":
             args.append(fixed_split_size)
             args.append(disable_split_kv)
+            args.append(-1)  # fixed_cta_tile_q
             args.append(0)  # num_colocated_ctas
             args.append(
                 _resolve_uniform_q_len(
@@ -3567,6 +3568,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         disable_split_kv: bool = False,
         uniform_q_len: Optional[int] = None,
         use_token_head_sf: bool = False,
+        fixed_cta_tile_q: Optional[int] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -3697,6 +3699,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
             minus head_dim) is passed via ``kv_cache_sf`` at :meth:`run` time. When
             enabled, the query must be fp16/bf16 and the backend is forced to ``fa2``.
             Defaults to ``False``.
+        fixed_cta_tile_q : Optional[int]
+            Fixed CTA tile size for FA2 prefill. Supported values are ``16``, ``64``, and ``128``.
+            Defaults to ``None`` (auto heuristic).
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -3799,6 +3804,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
         paged_kv_last_page_len = paged_kv_last_page_len.contiguous()
         if seq_lens is not None:
             seq_lens = seq_lens.contiguous()
+        if fixed_cta_tile_q is None:
+            fixed_cta_tile_q = -1
+        elif fixed_cta_tile_q not in (16, 64, 128):
+            raise ValueError(
+                f"fixed_cta_tile_q should be one of {{16, 64, 128}}, got {fixed_cta_tile_q}"
+            )
 
         batch_size = len(qo_indptr) - 1
         self._batch_size = batch_size
@@ -4248,6 +4259,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     # _nvfp4_kv_requires_disabled_split_kv for details.
                     disable_split_kv = True
                 args.append(disable_split_kv)  # disable_split_kv
+                args.append(fixed_cta_tile_q)  # fixed_cta_tile_q
                 args.append(0)  # num_colocated_ctas
                 forwarded_uniform_q_len = _resolve_uniform_q_len(
                     uniform_q_len,
@@ -5723,6 +5735,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         kv_indptr_cpu: Optional[torch.Tensor] = None,
         uniform_q_len: Optional[int] = None,
         use_token_head_sf: bool = False,
+        fixed_cta_tile_q: Optional[int] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Ragged KV-Cache for given problem specification.
 
@@ -5827,6 +5840,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             and lead to a varied number of launched CTAs.
         disable_split_kv : bool,
             Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
+        fixed_cta_tile_q : Optional[int]
+            Fixed CTA tile size for FA2 prefill. Supported values are ``16``, ``64``, and ``128``.
+            Defaults to ``None`` (auto heuristic).
         seq_lens: Optional[torch.Tensor]
             Only used by the cudnn backend. A 1D int32 tensor with the kv sequence length
             of each prompt, shape: ``[batch_size]``. Optional: cuDNN derives it from ``kv_indptr``.
@@ -5883,6 +5899,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             head_dim_vo = head_dim_qk
         if fixed_split_size is None:
             fixed_split_size = -1
+        if fixed_cta_tile_q is None:
+            fixed_cta_tile_q = -1
+        elif fixed_cta_tile_q not in (16, 64, 128):
+            raise ValueError(
+                f"fixed_cta_tile_q should be one of {{16, 64, 128}}, got {fixed_cta_tile_q}"
+            )
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
         self._head_dim_qk = head_dim_qk
@@ -6611,6 +6633,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     # _nvfp4_kv_requires_disabled_split_kv for details.
                     disable_split_kv = True
                 args.append(disable_split_kv)  # disable_split_kv
+                args.append(fixed_cta_tile_q)  # fixed_cta_tile_q
                 args.append(0)  # num_colocated_ctas
                 args.append(
                     _resolve_uniform_q_len(
