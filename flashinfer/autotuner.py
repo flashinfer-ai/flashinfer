@@ -395,6 +395,12 @@ class TunableRunner(ABC):
 def autotune(tune_mode: bool = True, cache: Optional[str] = None):
     """Context manager for autotuning with optional file-based caching.
 
+    .. note::
+        The ``cache`` parameter is **experimental**.  Single-process and
+        multi-threaded use is fully supported.  Multi-process and multi-node
+        use works under low write contention but is best-effort: concurrent writes
+        to a shared cache file may result in lost updates from race conditions.
+
     Args:
         tune_mode: If True, profile uncovered shapes during execution.
             If False, only use cached/loaded configs (no profiling).

@@ -91,6 +91,13 @@ from a cache file are never re-profiled.
 Config Caching
 --------------
 
+.. note::
+
+   Config caching (the ``cache`` parameter) is **experimental**.
+   Single-process and multi-threaded use is fully supported.
+   Multi-process and multi-node use is best-effort: concurrent writes to
+   a shared cache file may result in lost updates from race conditions.
+
 By default, autotuning results live only in memory and are lost when the
 process exits.  The ``cache`` parameter on ``flashinfer.autotune`` lets you
 persist results to a JSON file and load them back in future runs, avoiding
