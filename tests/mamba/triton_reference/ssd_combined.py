@@ -241,7 +241,7 @@ def mamba_chunk_scan_combined(
         assert cu_seqlens is not None, (
             "cu_seqlens must be provided if return_varlen_states is True"
         )
-    out_x, dt_out, dA_cumsum, states, final_states, *rest = (
+    _out_x, _dt_out, _dA_cumsum, _states, final_states, *rest = (
         _mamba_chunk_scan_combined_fwd(
             x,
             dt,

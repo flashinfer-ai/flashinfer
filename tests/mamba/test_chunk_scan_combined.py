@@ -10,6 +10,7 @@ import pytest
 import torch
 
 import flashinfer.mamba as mamba
+from flashinfer.utils import is_sm100a_supported
 
 # Import Triton reference for comparison
 from .triton_reference.ssd_combined import (
@@ -142,17 +143,11 @@ def _compute_varlen_metadata(cu_seqlens, chunk_size):
     return seq_idx, chunk_indices, chunk_offsets
 
 
-def is_blackwell_available():
-    """Check if Blackwell GPU (SM100) is available."""
-    if not torch.cuda.is_available():
-        return False
-    major, _ = torch.cuda.get_device_capability()
-    return major >= 10  # SM100 = Blackwell
-
-
 # Skip all tests if not on Blackwell
 pytestmark = pytest.mark.skipif(
-    not is_blackwell_available(),
+    not is_sm100a_supported(torch.device("cuda"))
+    if torch.cuda.is_available()
+    else True,
     reason="Blackwell GPU (SM100+) required for CuTe DSL Mamba2 SSD kernel",
 )
 
