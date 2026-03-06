@@ -620,7 +620,12 @@ class SSDCombined:
             and chunk_indices is not None
             and chunk_offsets is not None
         ):
-            num_seqs = initial_states.shape[0] if initial_states is not None else 1
+            if initial_states is None:
+                raise ValueError(
+                    "initial_states must be provided in varlen mode (when seq_idx, "
+                    "chunk_indices, and chunk_offsets are given) to determine num_seqs"
+                )
+            num_seqs = initial_states.shape[0]
             num_logical_chunks_local = len(chunk_indices)
             seq_chunk_cumsum = self._get_or_alloc_seq_cumsum(
                 num_seqs,
