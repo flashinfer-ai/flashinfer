@@ -42,8 +42,10 @@ __device__ __forceinline__ int lower_bound_seq_id(const SeqIdxT* __restrict__ se
                                                   int target) {
   int lo = 0, hi = num_logical_chunks;
   while (lo < hi) {
-    int mid = lo + (hi - lo) / 2;
-    int seq_id = static_cast<int>(seq_idx[chunk_indices[mid] * chunk_size + chunk_offsets[mid]]);
+    int const mid = lo + (hi - lo) / 2;
+    auto const index = static_cast<int64_t>(chunk_indices[mid]) * chunk_size + chunk_offsets[mid];
+    int const seq_id = static_cast<int>(seq_idx[index]);
+
     if (seq_id < target) {
       lo = mid + 1;
     } else {
