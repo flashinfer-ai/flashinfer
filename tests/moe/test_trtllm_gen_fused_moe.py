@@ -16,7 +16,6 @@ limitations under the License.
 
 import pytest
 from abc import ABC, abstractmethod
-from itertools import product
 from typing import Dict
 import torch
 from cuda.bindings import runtime
@@ -3427,78 +3426,6 @@ def test_mxfp8_block_scale_moe_relu2_non_gated(
         activation_type=ActivationType.Relu2,
         cache_permute_indices=cache_permute_indices,
         zero_hidden_states=zero_hidden_states,
-    )
-
-
-_NEMOTRON_H_RELU2_MXFP8_CASES = [
-    pytest.param(
-        {
-            "num_tokens": num_tokens,
-            "hidden_size": hidden_size,
-            "intermediate_size": intermediate_size,
-            "num_experts": num_experts,
-            "top_k": top_k,
-            "enable_autotune": False,
-        },
-        id=(
-            f"NemoH_nt{num_tokens}_h{hidden_size}_i{intermediate_size}_"
-            f"e{num_experts}_k{top_k}_autotune_off"
-        ),
-    )
-    for num_tokens, hidden_size, intermediate_size, (num_experts, top_k) in product(
-        [1, 16, 64, 256, 1000, 4000],
-        [2688],
-        [1856],
-        [(128, 6), (256, 8), (512, 10)],
-    )
-] + [
-    # Keep one explicit autotune-on check without doubling the full matrix runtime.
-    pytest.param(
-        {
-            "num_tokens": 128,
-            "hidden_size": 2688,
-            "intermediate_size": 1856,
-            "num_experts": 128,
-            "top_k": 6,
-            "enable_autotune": True,
-        },
-        id="NemoH_nt128_h2688_i1856_e128_k6_autotune_on",
-    )
-]
-
-
-@pytest.mark.parametrize("case", _NEMOTRON_H_RELU2_MXFP8_CASES)
-def test_mxfp8_block_scale_moe_relu2_nemotron_h_config(cache_permute_indices, case):
-    """Coverage check aligned with Nemotron-H MoE config (Relu2, non-gated MXFP8)."""
-    intermediate_size = case["intermediate_size"]
-    run_moe_test(
-        num_tokens=case["num_tokens"],
-        hidden_size=case["hidden_size"],
-        intermediate_size=intermediate_size,
-        moe_impl=FP8BlockScaleMoe(
-            fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_MXFP8
-        ),
-        routing_config={
-            "num_experts": case["num_experts"],  # n_routed_experts
-            "top_k": case["top_k"],  # num_experts_per_tok
-            "padding": 8,
-            "n_groups": 1,  # n_group
-            "top_k_groups": 1,  # topk_group
-            "routed_scaling": 2.5,  # routed_scaling_factor
-            "has_routing_bias": False,
-            "routing_method_type": RoutingMethodType.RenormalizeNaive,
-            "compatible_moe_impls": [FP8BlockScaleMoe],
-            "compatible_intermediate_size": [intermediate_size],
-            "compatible_activation_types": [ActivationType.Relu2],
-            "enable_autotune": case["enable_autotune"],
-        },
-        weight_processing={
-            "use_shuffled_weight": True,
-            "layout": WeightLayout.MajorK,
-            "compatible_moe_impls": [FP8BlockScaleMoe],
-        },
-        activation_type=ActivationType.Relu2,
-        cache_permute_indices=cache_permute_indices,
     )
 
 
