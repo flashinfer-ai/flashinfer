@@ -261,22 +261,80 @@ def _get_compiled_kernel(
     mma_tiler_mn: Tuple[int, int],
     cluster_shape_mn: Tuple[int, int],
 ):
-    """Get or compile the grouped GEMM kernel.
+    """Get or compile the grouped GEMM kernel with TVM-FFI and AOT caching."""
+    from flashinfer.jit.cute_dsl_aot import compile_and_cache_cute_dsl_kernel
 
-    This function is cached to avoid recompilation for the same parameters.
-    """
     ab_dtype = get_cutlass_dtype(ab_dtype_name)
     sf_dtype = get_cutlass_dtype(sf_dtype_name)
     c_dtype = get_cutlass_dtype(c_dtype_name)
 
-    # Create kernel instance
     gemm = Sm100BlockScaledContiguousGroupedGemmKernel(
         sf_vec_size=sf_vec_size,
         mma_tiler_mn=mma_tiler_mn,
         cluster_shape_mn=cluster_shape_mn,
     )
 
-    return gemm, ab_dtype, sf_dtype, c_dtype
+    max_active_clusters = get_max_active_clusters(
+        cluster_shape_mn[0] * cluster_shape_mn[1]
+    )
+
+    # Use fake tensors for compile-time type inference with TVM-FFI
+    sym_m, sym_n, sym_k, sym_l = (cute.sym_int() for _ in range(4))
+    sym_sf_a = cute.sym_int()
+    sym_sf_b_dims = tuple(cute.sym_int() for _ in range(6))
+    sym_tiles = cute.sym_int()
+
+    a_fake = cute.runtime.make_fake_compact_tensor(
+        ab_dtype, (sym_m, sym_k, 1), stride_order=(2, 1, 0), assumed_align=16
+    )
+    b_fake = cute.runtime.make_fake_compact_tensor(
+        ab_dtype, (sym_n, sym_k, sym_l), stride_order=(2, 1, 0), assumed_align=16
+    )
+    c_fake = cute.runtime.make_fake_compact_tensor(
+        c_dtype, (sym_m, sym_n, 1), stride_order=(2, 1, 0), assumed_align=16
+    )
+    sfa_fake = cute.runtime.make_fake_compact_tensor(
+        sf_dtype, (sym_sf_a,), assumed_align=16
+    )
+    sfb_fake = cute.runtime.make_fake_compact_tensor(
+        sf_dtype, sym_sf_b_dims, assumed_align=16
+    )
+    tile_idx_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (sym_tiles,), assumed_align=4
+    )
+    num_tiles_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (1,), assumed_align=4
+    )
+    alpha_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32, (sym_l,), assumed_align=4
+    )
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
+    mma_str = f"{mma_tiler_mn[0]}x{mma_tiler_mn[1]}"
+    cl_str = f"{cluster_shape_mn[0]}x{cluster_shape_mn[1]}"
+    aot_func_name = (
+        f"moe_grouped_gemm_{ab_dtype_name}_{sf_dtype_name}_{c_dtype_name}"
+        f"_sfv{sf_vec_size}_mma{mma_str}_cl{cl_str}"
+    )
+
+    def _do_compile():
+        return cute.compile(
+            gemm,
+            a_fake,
+            b_fake,
+            c_fake,
+            sfa_fake,
+            sfb_fake,
+            tile_idx_fake,
+            num_tiles_fake,
+            alpha_fake,
+            max_active_clusters,
+            stream_fake,
+            options="--enable-tvm-ffi",
+        )
+
+    compiled_gemm = compile_and_cache_cute_dsl_kernel(_do_compile, aot_func_name)
+    return compiled_gemm, ab_dtype, sf_dtype, c_dtype
 
 
 @flashinfer_api
@@ -410,8 +468,8 @@ def blockscaled_contiguous_grouped_gemm_nvfp4(
     if sm_count is None:
         sm_count = get_num_sm(a.device)
 
-    # Get or compile the kernel
-    gemm, _, _, _ = _get_compiled_kernel(
+    # Get compiled kernel (cached with AOT support)
+    compiled_gemm, _, _, _ = _get_compiled_kernel(
         permuted_m=permuted_m,
         n=n,
         k=k,
@@ -424,63 +482,17 @@ def blockscaled_contiguous_grouped_gemm_nvfp4(
         cluster_shape_mn=cluster_shape_mn,
     )
 
-    # Compute max active clusters (cached to avoid expensive HardwareInfo queries)
-    max_active_clusters = get_max_active_clusters(
-        cluster_shape_mn[0] * cluster_shape_mn[1]
-    )
-
-    # Create CuTe tensors from PyTorch tensors
-    # A: (permuted_m, k, 1) - single batch of permuted tokens
-    # B: (n, k, num_experts) - expert weights
-    # C: (permuted_m, n, 1) - output
-    a_tensor = from_dlpack(a.unsqueeze(-1), assumed_align=16).mark_layout_dynamic(
-        leading_dim=1
-    )
-    b_tensor = from_dlpack(b.permute(1, 2, 0), assumed_align=16).mark_layout_dynamic(
-        leading_dim=1
-    )
-    c_tensor = from_dlpack(out.unsqueeze(-1), assumed_align=16).mark_layout_dynamic(
-        leading_dim=1
-    )
-
-    # Scale factor tensors
-    sfa_tensor = from_dlpack(a_scale, assumed_align=16).mark_layout_dynamic()
-    sfb_tensor = from_dlpack(b_scale, assumed_align=16).mark_layout_dynamic()
-
-    # Mapping tensors
-    tile_idx_tensor = from_dlpack(tile_idx_to_group_idx).mark_layout_dynamic()
-    num_tiles_tensor = from_dlpack(num_non_exiting_tiles).mark_layout_dynamic()
-    alpha_tensor = from_dlpack(alpha).mark_layout_dynamic()
-
-    # Get current CUDA stream
-    current_stream = cutlass_torch.current_stream()
-
-    # Compile and run the kernel
-    compiled_gemm = cute.compile(
-        gemm,
-        a_tensor,
-        b_tensor,
-        c_tensor,
-        sfa_tensor,
-        sfb_tensor,
-        tile_idx_tensor,
-        num_tiles_tensor,
-        alpha_tensor,
-        max_active_clusters,
-        current_stream,
-    )
-
-    # Execute
+    # Execute with torch tensors directly (TVM-FFI handles conversion)
+    # A: (permuted_m, k, 1), B: (n, k, num_experts), C: (permuted_m, n, 1)
     compiled_gemm(
-        a_tensor,
-        b_tensor,
-        c_tensor,
-        sfa_tensor,
-        sfb_tensor,
-        tile_idx_tensor,
-        num_tiles_tensor,
-        alpha_tensor,
-        current_stream,
+        a.unsqueeze(-1),
+        b.permute(1, 2, 0),
+        out.unsqueeze(-1),
+        a_scale,
+        b_scale,
+        tile_idx_to_group_idx,
+        num_non_exiting_tiles,
+        alpha,
     )
 
     return out

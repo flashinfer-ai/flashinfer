@@ -2885,28 +2885,49 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
             alpha_ptr,
         ]
 
-    kernel = cute.compile(
-        MaskedBatchedMatmulCuteDSL(
-            m=m,
-            n=n,
-            k=k,
-            l=l,
-            a_major=a_major,
-            b_major=b_major,
-            c_major=c_major,
-            ab_dtype=ab_dtype,
-            sf_dtype=sf_dtype,
-            c_dtype=c_dtype,
-            alpha_dtype=alpha_dtype,
-            sf_vec_size=sf_vec_size,
-            mma_tiler_mn=mma_tiler_mn,
-            cluster_shape_mn=cluster_shape_mn,
-            sm_count=sm_count,
-            sm_version=sm_version,
-        ),
-        *get_cute_pointers(None),
-        cutlass_torch.current_stream(),
+    from flashinfer.jit.cute_dsl_aot import compile_and_cache_cute_dsl_kernel
+
+    mma_str = f"{mma_tiler_mn[0]}x{mma_tiler_mn[1]}"
+    cl_str = f"{cluster_shape_mn[0]}x{cluster_shape_mn[1]}"
+    ab_dtype_name = str(ab_dtype).split(".")[-1]
+    sf_dtype_name = str(sf_dtype).split(".")[-1]
+    c_dtype_name = str(c_dtype).split(".")[-1]
+    alpha_dtype_name = str(alpha_dtype).split(".")[-1] if alpha_dtype else "none"
+    aot_func_name = (
+        f"masked_gemm_{ab_dtype_name}_{sf_dtype_name}_{c_dtype_name}"
+        f"_a{alpha_dtype_name}"
+        f"_sfv{sf_vec_size}_mma{mma_str}_cl{cl_str}"
+        f"_{a_major}{b_major}{c_major}"
+        f"_m{m}_n{n}_k{k}_l{l}_sm{sm_version}"
+        f"_{'sig' if enable_dst_signals else 'nosig'}"
     )
+
+    def _do_compile():
+        return cute.compile(
+            MaskedBatchedMatmulCuteDSL(
+                m=m,
+                n=n,
+                k=k,
+                l=l,
+                a_major=a_major,
+                b_major=b_major,
+                c_major=c_major,
+                ab_dtype=ab_dtype,
+                sf_dtype=sf_dtype,
+                c_dtype=c_dtype,
+                alpha_dtype=alpha_dtype,
+                sf_vec_size=sf_vec_size,
+                mma_tiler_mn=mma_tiler_mn,
+                cluster_shape_mn=cluster_shape_mn,
+                sm_count=sm_count,
+                sm_version=sm_version,
+            ),
+            *get_cute_pointers(None),
+            cutlass_torch.current_stream(),
+            options="--enable-tvm-ffi",
+        )
+
+    kernel = compile_and_cache_cute_dsl_kernel(_do_compile, aot_func_name)
 
     def tensor_api(
         a_tensor_gpu: torch.Tensor,

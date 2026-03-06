@@ -37,11 +37,10 @@ Key features:
 - Support for SM100 (Blackwell) architecture
 """
 
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
-import functools
 import torch
 from cutlass.cute.runtime import from_dlpack
 
@@ -62,7 +61,9 @@ from .blackwell.blockscaled_contiguous_grouped_gemm_swiglu_fusion import (
 # Re-export the kernel class
 
 
-@functools.cache
+_swiglu_compiled_cache: Dict[Tuple, Any] = {}
+
+
 def _get_compiled_swiglu_kernel(
     ab_dtype_name: str,
     sf_dtype_name: str,
@@ -72,9 +73,8 @@ def _get_compiled_swiglu_kernel(
     cluster_shape_mn: Tuple[int, int],
     vectorized_f32: bool,
 ):
-    """Get or compile the grouped GEMM with SwiGLU kernel.
+    """Get or compile the grouped GEMM with SwiGLU kernel with AOT caching.
 
-    This function is cached to avoid recompilation for the same parameters.
     Shape parameters (permuted_m, n, k, num_experts) are not included in the
     cache key since the kernel is shape-agnostic.
     """
@@ -341,22 +341,52 @@ def blockscaled_contiguous_grouped_gemm_swiglu_fusion_nvfp4(
     # Get current CUDA stream
     current_stream = cutlass_torch.current_stream()
 
-    # Compile and run the kernel
-    compiled_gemm = cute.compile(
-        gemm,
-        a_tensor,
-        b_tensor,
-        c_tensor,
-        sfa_tensor,
-        sfb_tensor,
-        sfc_tensor,
-        norm_const_tensor,
-        tile_idx_tensor,
-        num_tiles_tensor,
-        alpha_tensor,
-        max_active_clusters,
-        current_stream,
+    # Compile (cached) and run the kernel
+    cache_key = (
+        ab_dtype,
+        sf_dtype,
+        c_dtype,
+        sf_vec_size,
+        mma_tiler_mn,
+        cluster_shape_mn,
+        vectorized_f32,
+        generate_sfc,
     )
+    if cache_key not in _swiglu_compiled_cache:
+        from flashinfer.jit.cute_dsl_aot import compile_and_cache_cute_dsl_kernel
+
+        mma_str = f"{mma_tiler_mn[0]}x{mma_tiler_mn[1]}"
+        cl_str = f"{cluster_shape_mn[0]}x{cluster_shape_mn[1]}"
+        aot_func_name = (
+            f"moe_swiglu_{ab_dtype}_{sf_dtype}_{c_dtype}"
+            f"_sfv{sf_vec_size}_mma{mma_str}_cl{cl_str}"
+            f"_{'vf32' if vectorized_f32 else 'novf32'}"
+            f"_{'sfc' if generate_sfc else 'nosfc'}"
+        )
+
+        def _do_compile():
+            return cute.compile(
+                gemm,
+                a_tensor,
+                b_tensor,
+                c_tensor,
+                sfa_tensor,
+                sfb_tensor,
+                sfc_tensor,
+                norm_const_tensor,
+                tile_idx_tensor,
+                num_tiles_tensor,
+                alpha_tensor,
+                max_active_clusters,
+                current_stream,
+                options="--enable-tvm-ffi",
+            )
+
+        _swiglu_compiled_cache[cache_key] = compile_and_cache_cute_dsl_kernel(
+            _do_compile, aot_func_name
+        )
+
+    compiled_gemm = _swiglu_compiled_cache[cache_key]
 
     # Execute
     compiled_gemm(
