@@ -33,6 +33,50 @@ using namespace flashinfer;
 
 {{ act_func_def }}
 
+// Macro to dispatch kernel launch by vec_size template parameter.
+// Defined outside DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16 because preprocessor
+// directives (#define) cannot appear inside macro arguments.
+#define DISPATCH_VEC_SIZE(vec_size, c_type, config, out, input, d, ...)         \
+  switch (vec_size) {                                                          \
+    case 16: {                                                                 \
+      auto kernel = flashinfer::activation::act_and_mul_kernel<                \
+          c_type, __VA_ARGS__, 16>;                                            \
+      cudaLaunchKernelEx(&config, kernel, static_cast<c_type*>(out),           \
+                         static_cast<c_type*>(input), d);                      \
+      break;                                                                   \
+    }                                                                          \
+    case 8: {                                                                  \
+      auto kernel = flashinfer::activation::act_and_mul_kernel<                \
+          c_type, __VA_ARGS__, 8>;                                             \
+      cudaLaunchKernelEx(&config, kernel, static_cast<c_type*>(out),           \
+                         static_cast<c_type*>(input), d);                      \
+      break;                                                                   \
+    }                                                                          \
+    case 4: {                                                                  \
+      auto kernel = flashinfer::activation::act_and_mul_kernel<                \
+          c_type, __VA_ARGS__, 4>;                                             \
+      cudaLaunchKernelEx(&config, kernel, static_cast<c_type*>(out),           \
+                         static_cast<c_type*>(input), d);                      \
+      break;                                                                   \
+    }                                                                          \
+    case 2: {                                                                  \
+      auto kernel = flashinfer::activation::act_and_mul_kernel<                \
+          c_type, __VA_ARGS__, 2>;                                             \
+      cudaLaunchKernelEx(&config, kernel, static_cast<c_type*>(out),           \
+                         static_cast<c_type*>(input), d);                      \
+      break;                                                                   \
+    }                                                                          \
+    case 1: {                                                                  \
+      auto kernel = flashinfer::activation::act_and_mul_kernel<                \
+          c_type, __VA_ARGS__, 1>;                                             \
+      cudaLaunchKernelEx(&config, kernel, static_cast<c_type*>(out),           \
+                         static_cast<c_type*>(input), d);                      \
+      break;                                                                   \
+    }                                                                          \
+    default:                                                                   \
+      TVM_FFI_ICHECK(false) << "Unsupported vec_size: " << vec_size;           \
+  }
+
 void {{ func_name }}(TensorView out, TensorView input, bool enable_pdl) {
   int d = input.size(input.ndim() -1) / 2;
   int64_t num_tokens = input.numel() / input.size(input.ndim() -1);
@@ -42,6 +86,10 @@ void {{ func_name }}(TensorView out, TensorView input, bool enable_pdl) {
   const cudaStream_t stream = get_stream(out.device());
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
     uint32_t vec_size = 16 / sizeof(c_type);
+    while (vec_size > 1 && d % vec_size != 0) {
+      vec_size /= 2;
+    }
+
     cudaLaunchConfig_t config;
     config.gridDim = num_tokens;
     config.blockDim = std::min(d / vec_size, 1024U);
@@ -53,10 +101,8 @@ void {{ func_name }}(TensorView out, TensorView input, bool enable_pdl) {
     config.numAttrs = 1;
     config.attrs = attrs;
 
-    auto kernel = flashinfer::activation::act_and_mul_kernel<c_type, {{ act_func_name }}>;
-
-    cudaLaunchKernelEx(&config, kernel, static_cast<c_type*>(out.data_ptr()),
-                       static_cast<c_type*>(input.data_ptr()), d);
+    DISPATCH_VEC_SIZE(vec_size, c_type, config, out.data_ptr(), input.data_ptr(), d,
+                      {{ act_func_name }});
 
     cudaError_t err = cudaGetLastError();
     TVM_FFI_ICHECK(err == cudaSuccess) << "Failed to launch kernel: " << cudaGetErrorString(err);
@@ -64,6 +110,8 @@ void {{ func_name }}(TensorView out, TensorView input, bool enable_pdl) {
     return true;
   });
 }
+
+#undef DISPATCH_VEC_SIZE
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC({{ func_name }}, {{ func_name }});
 """
