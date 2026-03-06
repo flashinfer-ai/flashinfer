@@ -128,7 +128,7 @@ def _chunk_cumsum_fwd_kernel(
         ).to(tl.float32)
         dt += dt_bias[:, None]
     if DT_SOFTPLUS:
-        dt = tl.where(dt <= 20.0, softplus(dt), dt)
+        dt = softplus(dt)
     # As of Triton 2.2.0, tl.clamp is not available yet
     # dt = tl.clamp(dt, dt_min, dt_max)
     dt = tl.minimum(tl.maximum(dt, dt_min), dt_max)
