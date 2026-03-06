@@ -18,9 +18,9 @@ from .selective_state_update import selective_state_update
 
 __all__ = ["selective_state_update"]
 
-from ..cute_dsl.utils import is_cute_dsl_available
-
-if is_cute_dsl_available():
+try:
     from .ssd_combined import SSDCombined
 
     __all__.append("SSDCombined")
+except ImportError:
+    pass
