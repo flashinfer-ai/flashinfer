@@ -153,14 +153,8 @@ __global__ void SeqChunkCumsumKernelMultiBlock(
   if (s < num_seqs) {
     output[s] = global_prefix + inclusive - count;
   }
-  // Last active thread writes the sentinel
-  if (s == num_seqs - 1 || (s < num_seqs && s == num_seqs - 1)) {
-    output[num_seqs] = global_prefix + inclusive;
-  }
-  // Handle case where num_seqs isn't a multiple of TILE_SIZE:
-  // the last block's last active thread writes the final element.
-  int last_seq_in_tile = min((tile_idx + 1) * TILE_SIZE, num_seqs) - 1;
-  if (s == last_seq_in_tile) {
+  // Last active thread writes the sentinel (total number of logical chunks)
+  if (s == num_seqs - 1) {
     output[num_seqs] = global_prefix + inclusive;
   }
 }
