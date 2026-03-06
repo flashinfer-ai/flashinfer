@@ -4,6 +4,7 @@ import numpy as np
 import torch
 
 import flashinfer
+import flashinfer.decode
 
 # Try to import cudnn for version checking
 CUDNN_AVAILABLE = False
@@ -20,6 +21,7 @@ except OSError as e:
     is_lib_missing = any(ext in error_msg for ext in [".so", ".dll"])
     if not is_lib_missing:
         raise
+from flashinfer.testing.kvfp4 import KVFP4QuantizeUtil
 from flashinfer.testing.utils import (
     attention_tb_per_sec_with_actual_seq_lens,
     attention_tflops_per_sec_with_actual_seq_lens,
@@ -314,8 +316,9 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         return res
 
     # Handle different KV cache data types.
+    is_nvfp4_kv = args.kv_dtype == "nvfp4"
     kv_dtype = dtype_str_to_torch_dtype(args.kv_dtype)
-    if kv_dtype not in [torch.bfloat16, torch.float8_e4m3fn]:
+    if kv_dtype not in [torch.bfloat16, torch.float8_e4m3fn, torch.uint8]:
         print(f"[ERROR] Unsupported kv_dtype: {args.kv_dtype}")
         return res
 
@@ -334,7 +337,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
     num_qo_heads = args.num_qo_heads
     num_kv_heads = args.num_kv_heads
     head_dim_qk = args.head_dim_qk
-    head_dim_vo = args.head_dim_vo
+    head_dim_vo = args.head_dim_vo if args.head_dim_vo is not None else head_dim_qk
     is_cuda_graph_compatible = not args.no_cuda_graph
     # return_lse = not args.no_lse # TO-DO: Add support for this
     run_refcheck = args.refcheck
@@ -390,6 +393,15 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
     if "auto" in backends and speculative_decode:
         print("[INFO] auto backend is disabled for speculative decode. Skipping.")
         backends.remove("auto")
+
+    # NVFP4 KV cache only works with trtllm-native (direct API with kv_block_scales)
+    if is_nvfp4_kv:
+        unsupported = [b for b in backends if b != "trtllm-native"]
+        for b in unsupported:
+            print(f"[INFO] {b} backend does not support NVFP4 KV cache. Skipping.")
+            backends.remove(b)
+        if "trtllm-native" not in backends:
+            backends.append("trtllm-native")
 
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
@@ -579,11 +591,21 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         else:
             resolved_backends[backend] = backend
 
-    ## If FP8, prepare
+    ## Prepare dtype-specific data
     k_scale, v_scale = None, None
+    kv_block_scales = None
+    kv_cache_nvfp4 = None
     if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
         q = q.to(q_dtype)
-    if kv_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+    if is_nvfp4_kv:
+        # NVFP4 KV requires FP8 query
+        if q_dtype != torch.float8_e4m3fn:
+            print("[ERROR] NVFP4 KV cache requires --q_dtype fp8_e4m3.")
+            return res
+        kv_cache_nvfp4, kv_block_scales, k_scale, v_scale = (
+            KVFP4QuantizeUtil.quantize_paged_kv_cache(kv_cache[:, 0], kv_cache[:, 1])
+        )
+    elif kv_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
         k_data, v_data = torch.chunk(kv_cache, 2, dim=1)
         k_scale = k_data.amax().item() / 256
         v_scale = v_data.amax().item() / 256
@@ -627,9 +649,10 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 batch_offsets_o=ragged_q,
             )
         elif backend == "trtllm-native":
+            native_kv = kv_cache_nvfp4 if is_nvfp4_kv else kv_cache
             return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
                 query=q.contiguous(),
-                kv_cache=kv_cache,
+                kv_cache=native_kv,
                 workspace_buffer=workspace_buffer,
                 block_tables=block_tables,
                 seq_lens=actual_seq_lens_kv,
@@ -640,6 +663,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 backend="auto",
                 q_len_per_req=s_qo,
                 mask=speculative_mask,
+                kv_block_scales=kv_block_scales,
             )
         else:
             print(f"[ERROR] Backend {backend} not supported")
@@ -736,6 +760,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 False,
                 median_time,
             )
+            bw_kv_dtype = kv_dtype
             tb_per_sec = attention_tb_per_sec_with_actual_seq_lens(
                 actual_seq_lens_q_flat,
                 actual_seq_lens_kv_flat,
@@ -745,7 +770,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 num_kv_heads,
                 median_time,
                 q_dtype=q_dtype,
-                kv_dtype=kv_dtype,
+                kv_dtype=bw_kv_dtype,
                 o_dtype=q_dtype,
             )
             resolved_backend = resolved_backends.get(backend, backend)
