@@ -32,6 +32,16 @@ from .fp4_quantization import get_fp4_quantization_module
 
 
 @functools.cache
+def _is_cute_dsl_available():
+    import importlib.util
+
+    return (
+        importlib.util.find_spec("cutlass") is not None
+        and importlib.util.find_spec("cutlass.cute") is not None
+    )
+
+
+@functools.cache
 def get_act_and_mul_module(act_func_name: str):
     module = gen_act_and_mul_module(act_func_name).build_and_load()
 
@@ -104,11 +114,14 @@ def silu_and_mul(
             device=input.device,
             dtype=input.dtype,
         )
-    get_act_and_mul_module("silu").silu_and_mul(
-        out,
-        input,
-        enable_pdl,
-    )
+    if _is_cute_dsl_available():
+        from .cute_dsl.activation import act_and_mul
+
+        # CuTe-DSL path does not support PDL (no CuTe-DSL kernel in
+        # FlashInfer uses programmatic dependent launch).
+        act_and_mul("silu", input, out)
+    else:
+        get_act_and_mul_module("silu").silu_and_mul(out, input, enable_pdl)
     return out
 
 
@@ -149,7 +162,14 @@ def gelu_tanh_and_mul(
             device=input.device,
             dtype=input.dtype,
         )
-    get_act_and_mul_module("gelu_tanh").gelu_tanh_and_mul(out, input, enable_pdl)
+    if _is_cute_dsl_available():
+        from .cute_dsl.activation import act_and_mul
+
+        # CuTe-DSL path does not support PDL (no CuTe-DSL kernel in
+        # FlashInfer uses programmatic dependent launch).
+        act_and_mul("gelu_tanh", input, out)
+    else:
+        get_act_and_mul_module("gelu_tanh").gelu_tanh_and_mul(out, input, enable_pdl)
     return out
 
 
@@ -190,7 +210,14 @@ def gelu_and_mul(
             device=input.device,
             dtype=input.dtype,
         )
-    get_act_and_mul_module("gelu").gelu_and_mul(out, input, enable_pdl)
+    if _is_cute_dsl_available():
+        from .cute_dsl.activation import act_and_mul
+
+        # CuTe-DSL path does not support PDL (no CuTe-DSL kernel in
+        # FlashInfer uses programmatic dependent launch).
+        act_and_mul("gelu", input, out)
+    else:
+        get_act_and_mul_module("gelu").gelu_and_mul(out, input, enable_pdl)
     return out
 
 
