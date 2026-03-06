@@ -2112,7 +2112,7 @@ CUBIN_EXPORT __global__
 #else
       auto& dst = smem.vCachePages[grpLoadV ? warpGrpIdx : warpIdx.x];
 #if ENABLE_4BIT_KV_CACHE
-      auto& dstSf = getSmemVSfTile(idxNextSMemVBuf);
+      static_assert(false, "4bit kv cache + beam search is not implemented");
 #endif
 
       loadPagesForBeamSearchAsync<grpLoadV ? gemm1WarpsPerGrp : 1U>(

@@ -165,7 +165,7 @@ def create_kv_cache(
         k_cache, k_scale, k_global_scale = to_nvfp4(k_cache / 4.0)
         v_cache, v_scale, v_global_scale = to_nvfp4(v_cache / 4.0)
         k_cache_dq = nvfp4_to_float(k_cache, k_scale, k_global_scale)
-        v_cache_dq = nvfp4_to_float(v_cache, v_scale, k_global_scale)
+        v_cache_dq = nvfp4_to_float(v_cache, v_scale, v_global_scale)
         ref_kv_cache = torch.stack(
             [
                 k_cache_dq.to(ref_kv_dtype_torch),
