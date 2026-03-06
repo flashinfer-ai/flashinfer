@@ -2681,6 +2681,9 @@ _SM100_CLUSTER_SHAPE_MN_CANDIDATES = [
     (4, 4),
 ]
 
+_SM100_DEFAULT_MMA_TILER_MN = (128, 128)
+_SM100_DEFAULT_CLUSTER_SHAPE_MN = (1, 1)
+
 
 def _get_approximate_cta_nums(m, n, tile_mn, cluster_shape_mn):
     tile_m, tile_n = tile_mn
@@ -2966,7 +2969,12 @@ def _cute_dsl_gemm_mxfp8_runner(
             batch_size = 1
 
             if tactic is None or tactic == -1:
-                tactic = ((128, 128), (1, 1), False, False)
+                tactic = (
+                    _SM100_DEFAULT_MMA_TILER_MN,
+                    _SM100_DEFAULT_CLUSTER_SHAPE_MN,
+                    False,
+                    False,
+                )
 
             (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch) = tactic
 
@@ -3732,7 +3740,14 @@ def _cute_dsl_gemm_fp4_runner(
             batch_size = 1
 
             if tactic is None or tactic == -1:
-                tactic = ((128, 128), (1, 1), False, False, "sm100", None)
+                tactic = (
+                    _SM100_DEFAULT_MMA_TILER_MN,
+                    _SM100_DEFAULT_CLUSTER_SHAPE_MN,
+                    False,
+                    False,
+                    "sm100",
+                    None,
+                )
 
             (
                 mma_tiler_mn,

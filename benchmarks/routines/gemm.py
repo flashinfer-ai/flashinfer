@@ -1071,6 +1071,8 @@ def testMmFp4(args):
         print(f"[VVERBOSE] {mat2_fp4.dtype = }")
 
     alpha = 1.0 / (global_sf_input * global_sf_mat2) if use_nvfp4 else None
+    # TODO: for MXFP4, we don't need a global scale, we should change the compile interface to make
+    # alpha optional.
     alpha_for_cute_dsl_mxfp4 = (
         torch.tensor([1.0], dtype=torch.float32, device=device)
         if not use_nvfp4
