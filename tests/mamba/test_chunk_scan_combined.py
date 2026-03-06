@@ -248,7 +248,7 @@ class TestChunkScanCombined:
     @pytest.fixture
     def reference_output(self, inputs):
         """Compute reference output using Triton implementation."""
-        out, dt_out, dA_cumsum, states, final_states = _mamba_chunk_scan_combined_fwd(
+        out, _, _, _, final_states = _mamba_chunk_scan_combined_fwd(
             inputs["x"],
             inputs["dt"],
             inputs["A"],
@@ -608,7 +608,7 @@ class TestChunkScanCombinedNoD(TestChunkScanCombined):
     @pytest.fixture
     def reference_output(self, inputs):
         """Compute reference output using Triton implementation without D."""
-        out, dt_out, dA_cumsum, states, final_states = _mamba_chunk_scan_combined_fwd(
+        out, _, _, _, final_states = _mamba_chunk_scan_combined_fwd(
             inputs["x"],
             inputs["dt"],
             inputs["A"],
@@ -1291,7 +1291,7 @@ class TestChunkScanCombinedWithZ:
         The Triton combined reference returns un-gated output when z is provided.
         We compute without z, then apply z gating manually: out *= silu(z).
         """
-        out, dt_out, dA_cumsum, states, final_states = _mamba_chunk_scan_combined_fwd(
+        out, _, _, _, final_states = _mamba_chunk_scan_combined_fwd(
             inputs["x"],
             inputs["dt"],
             inputs["A"],
