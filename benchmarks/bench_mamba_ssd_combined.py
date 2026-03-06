@@ -266,6 +266,7 @@ def bench_mode(configs, mode, model_params, bench_params, title=None):
     print("  " + "-" * 108)
 
     # Construct SSDCombined once for this mode — uses class-based API directly
+    has_init_states = mode == "varlen"
     ssd = SSDCombined(
         chunk_size=p["chunk_size"],
         nheads=p["nheads"],
@@ -274,16 +275,20 @@ def bench_mode(configs, mode, model_params, bench_params, title=None):
         ngroups=p["ngroups"],
         io_dtype=p["dtype"],
         has_d=True,
-        has_initial_states=True,
+        has_initial_states=has_init_states,
         has_varlen=(mode == "varlen"),
         seq_idx_dtype=torch.int32,  # varlen metadata uses int32
     )
 
     # Keys to strip per kernel per mode.
     # - FlashInfer (SSDCombined.run) doesn't accept chunk_size or cu_seqlens
-    # - Triton doesn't support initial_states in batched mode (only varlen with chunk_indices)
+    # - In batched mode, strip initial_states from both: Triton's _chunk_scan_fwd
+    #   only supports initial_states with batch==1 + varlen metadata.
     strip_keys = {
-        "batched": {"FlashInfer": {"chunk_size"}, "Triton": {"initial_states"}},
+        "batched": {
+            "FlashInfer": {"chunk_size", "initial_states"},
+            "Triton": {"initial_states"},
+        },
         "varlen": {"FlashInfer": {"cu_seqlens", "chunk_size"}, "Triton": set()},
     }
 
@@ -360,6 +365,7 @@ BATCHED_CONFIGS = [
     (256, 1),
     (256, 4),
     (256, 16),
+    (512, 2),
 ]
 
 
@@ -408,7 +414,7 @@ def run_benchmarks(args, model_params, bench_params):
                 "batched",
                 model_params,
                 bench_params,
-                title="BATCHED: uniform sequence lengths (no varlen metadata)",
+                title="BATCHED: uniform sequence lengths (no varlen metadata, no init states)",
             )
 
 
