@@ -31,8 +31,6 @@ import cuda.bindings.driver as cuda_drv
 import torch
 from cutlass import Int32
 from cutlass.base_dsl.compiler import GenerateLineInfo  # profiling
-from cutlass.cute.runtime import from_dlpack
-
 from ..jit.mamba.seq_chunk_cumsum import gen_seq_chunk_cumsum_module
 from ..triton.kernels.ssd_chunk_state import chunk_cumsum_fwd
 from .ssd_kernel import SSDKernel
@@ -247,41 +245,6 @@ def _get_compiled_ssd_kernel(
     )
 
     return compiled
-
-
-def _create_cutlass_tensor(shape, permute_order, dtype, dynamic_modes):
-    """
-    Create a tensor using the exact logic from mamba2_ssd.py to ensure compatibility.
-
-    Args:
-        shape: Base shape of the tensor (before permutation)
-        permute_order: Order to permute dimensions
-        dtype: CUTLASS dtype
-        dynamic_modes: List of modes to mark as dynamic
-
-    Returns:
-        (cute_tensor, torch_tensor): The CuTe tensor wrapper and the underlying PyTorch tensor on GPU
-    """
-    # Allocate directly on GPU with the target dtype and apply permutation to
-    # establish the stride pattern CUTLASS expects.
-    torch_dtype = cutlass_torch.dtype(dtype)
-    dst_tensor = torch.empty(*shape, dtype=torch_dtype, device="cuda").permute(
-        permute_order
-    )
-
-    # Create CuTe tensor
-    # For a contiguous tensor permuted by p, dim_order == argsort(p)
-    cute_tensor = from_dlpack(dst_tensor, assumed_align=16)
-    inv = [0] * len(permute_order)
-    for i, p in enumerate(permute_order):
-        inv[p] = i
-    stride_order = tuple(inv)
-    for mode in dynamic_modes:
-        cute_tensor = cute_tensor.mark_compact_shape_dynamic(
-            mode=mode, stride_order=stride_order
-        )
-
-    return cute_tensor, dst_tensor
 
 
 class SSDCombined:
