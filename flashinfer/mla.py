@@ -701,6 +701,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
             workspace_buffer.numel() * workspace_buffer.element_size(),
             sinks,
             None,  # cum_seq_lens_q
+            None,  # key_block_scales
+            None,  # value_block_scales
             skip_softmax_threshold_scale_factor,
         )
 

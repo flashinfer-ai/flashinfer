@@ -1177,6 +1177,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         sinks: Optional[torch.Tensor] = None,
         q_len_per_req: Optional[int] = 1,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        kv_block_scales: Optional[
+            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        ] = None,
     ) -> torch.Tensor: ...
 
     @overload
@@ -1196,6 +1199,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         sinks: Optional[torch.Tensor] = None,
         q_len_per_req: Optional[int] = 1,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        kv_block_scales: Optional[
+            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        ] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     @flashinfer_api
@@ -1215,6 +1221,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         sinks: Optional[torch.Tensor] = None,
         q_len_per_req: Optional[int] = 1,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        kv_block_scales: Optional[
+            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        ] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch decode attention between query and paged kv cache.
 
@@ -1273,6 +1282,15 @@ class BatchDecodeWithPagedKVCacheWrapper:
             enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
 
+        # Unpack kv_block_scales
+        key_block_scales = None
+        value_block_scales = None
+        if kv_block_scales is not None:
+            if isinstance(kv_block_scales, tuple):
+                key_block_scales, value_block_scales = kv_block_scales
+            else:
+                key_block_scales, value_block_scales = kv_block_scales.unbind(dim=1)
+
         if self._kv_layout == "NHD":
             page_size = k_cache.shape[1]
         else:
@@ -1286,6 +1304,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
             # For NHD: [..., N, H, D] -> HND: [..., H, N, D]
             k_cache = k_cache.transpose(-3, -2)
             v_cache = v_cache.transpose(-3, -2)
+            if key_block_scales is not None:
+                key_block_scales = key_block_scales.transpose(-3, -2)
+            if value_block_scales is not None:
+                value_block_scales = value_block_scales.transpose(-3, -2)
 
         pos_encoding_mode = self._pos_encoding_mode
         window_left = self._window_left if window_left is None else window_left
@@ -1324,8 +1346,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         if out is None:
             out_dtype = getattr(self, "_cached_o_data_type", None) or q.dtype
+            # For NVFP4 KV (uint8 packed), v_cache last dim is head_dim//2;
+            # use q's head_dim for output instead
+            out_head_dim = (
+                q.shape[-1] if kv_block_scales is not None else v_cache.shape[-1]
+            )
             out = torch.empty(
-                q.shape[:-1] + v_cache.shape[-1:], dtype=out_dtype, device=q.device
+                q.shape[:-1] + (out_head_dim,), dtype=out_dtype, device=q.device
             )
         else:
             out_dtype = getattr(self, "_cached_o_data_type", None) or q.dtype
@@ -1389,6 +1416,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     page_size,
                     self._max_kv_len,
                     sinks,
+                    key_block_scales,
+                    value_block_scales,
                     skip_softmax_threshold_scale_factor,
                 ]
 
@@ -1940,6 +1969,8 @@ class TrtllmGenDecodeModule:
         enable_pdl: bool = None,
         out: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        key_block_scales: Optional[torch.Tensor] = None,
+        value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> torch.Tensor:
         if out is None:
@@ -1982,6 +2013,8 @@ class TrtllmGenDecodeModule:
             workspace_size,
             sinks,
             None,  # cum_seq_lens_q
+            key_block_scales,
+            value_block_scales,
             skip_softmax_threshold_scale_factor,
         )
         return out
@@ -2044,6 +2077,8 @@ def get_trtllm_gen_decode_module(*args):
         page_size: Optional[int] = None,
         max_kv_len: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
+        key_block_scales: Optional[torch.Tensor] = None,
+        value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> None:
         assert maybe_lse is None
@@ -2071,6 +2106,8 @@ def get_trtllm_gen_decode_module(*args):
             enable_pdl,
             out=o,
             sinks=sinks,
+            key_block_scales=key_block_scales,
+            value_block_scales=value_block_scales,
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         )
 
@@ -2111,6 +2148,8 @@ def get_trtllm_gen_decode_module(*args):
         page_size: Optional[int] = None,
         max_kv_len: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
+        key_block_scales: Optional[torch.Tensor] = None,
+        value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> None:
         pass
