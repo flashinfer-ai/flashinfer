@@ -3854,9 +3854,7 @@ def mm_fp4(
             dtype=out_dtype,
         )
 
-    workspace_buffer = _get_cache_buf(
-        "mm_fp4_workspace", DEFAULT_WORKSPACE_SIZE, a.device
-    )
+    workspace_buffer = torch.empty(DEFAULT_WORKSPACE_SIZE, dtype=torch.uint8, device=a.device)
 
     # Auto-select the best backend
     if backend == "auto":
