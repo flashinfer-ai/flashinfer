@@ -128,7 +128,7 @@ class Runner {
            int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit, int32_t* numNonExitingCtas,
            batchedGemm::trtllm::gen::Dtype dtypeElt, batchedGemm::trtllm::gen::Dtype dtypeBias,
            bool useRoutingScalesOnInput, bool useDeepSeekFp8, RoutingMethodType routingMethodType,
-           cudaStream_t stream);
+           cudaStream_t stream, int16_t* routingReplayOut = nullptr);
 
  private:
   int32_t mTileTokensDim{8};
