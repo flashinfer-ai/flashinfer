@@ -845,6 +845,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         seq_lens: Optional[torch.Tensor] = None,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
+        fixed_cta_tile_q: Optional[int] = None,
     ) -> None:
         r"""Plan batch decode for given problem specification.
 
@@ -903,6 +904,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
             and lead to a varied number of launched CTAs.
         disable_split_kv : bool,
             Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
+        fixed_cta_tile_q : Optional[int]
+            Fixed CTA tile size for FA2 prefill planning. Supported values are ``16``, ``64``, and
+            ``128``. Defaults to ``None`` (auto heuristic).
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -981,6 +985,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
             )
         if fixed_split_size is None:
             fixed_split_size = -1
+        if fixed_cta_tile_q is None:
+            fixed_cta_tile_q = -1
+        elif fixed_cta_tile_q not in (16, 64, 128):
+            raise ValueError(
+                f"fixed_cta_tile_q should be one of {{16, 64, 128}}, got {fixed_cta_tile_q}"
+            )
 
         self._cached_q_data_type = q_data_type
         self._cached_kv_data_type = kv_data_type
@@ -1089,6 +1099,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             if self._backend == "fa2":
                 args.append(fixed_split_size)
                 args.append(disable_split_kv)
+                args.append(fixed_cta_tile_q)
                 args.append(0)  # num_colocated_ctas
             self._plan_info = self._cached_module.plan(
                 *args,
@@ -2605,6 +2616,7 @@ def fast_decode_plan(
     fixed_split_size: Optional[int] = None,
     disable_split_kv: bool = False,
     global_override_indptr_cpu: Optional[torch.Tensor] = None,
+    fixed_cta_tile_q: Optional[int] = None,
 ) -> None:
     """
     A faster version of BatchDecodeWithPagedKVCacheWrapper::plan used for FlashInferMultiStepDraftBackend.
@@ -2633,6 +2645,12 @@ def fast_decode_plan(
         # Here we set fixed_split_size to -1 to avoid the assertion error in flashinfer's plan function
         if fixed_split_size is None:
             fixed_split_size = -1
+        if fixed_cta_tile_q is None:
+            fixed_cta_tile_q = -1
+        elif fixed_cta_tile_q not in (16, 64, 128):
+            raise ValueError(
+                f"fixed_cta_tile_q should be one of {{16, 64, 128}}, got {fixed_cta_tile_q}"
+            )
 
     if self.is_cuda_graph_enabled:
         if batch_size != self._fixed_batch_size:
@@ -2695,7 +2713,7 @@ def fast_decode_plan(
             kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
 
             try:
-                # Make sure we pass exactly 19 arguments for fa2 backend and 16 arguments for fa3 backend
+                # Make sure we pass exactly 20 arguments for fa2 backend and 16 arguments for fa3 backend
                 args = [
                     self._float_workspace_buffer,
                     self._int_workspace_buffer,
@@ -2717,6 +2735,7 @@ def fast_decode_plan(
                 if self._backend == "fa2":
                     args.append(fixed_split_size)
                     args.append(disable_split_kv)
+                    args.append(fixed_cta_tile_q)
                     args.append(0)  # num_colocated_ctas
                 self._plan_info = self._cached_module.plan(
                     *args,
