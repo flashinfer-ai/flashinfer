@@ -1110,6 +1110,63 @@ def test_sampling_with_default_device_cuda(batch_size, vocab_size):
         torch.set_default_device(original_device)
 
 
+@pytest.mark.parametrize("batch_size", [1, 4, 19])
+@pytest.mark.parametrize("vocab_size", [111, 32000])
+def test_sampling_nan_input(batch_size, vocab_size):
+    torch.manual_seed(42)
+    probs = torch.rand(batch_size, vocab_size, device="cuda:0", dtype=torch.float32)
+    probs = probs / probs.sum(dim=-1, keepdim=True)
+
+    # Set NaN at different positions: first, middle, last
+    nan_indices = [0]
+    if batch_size > 1:
+        nan_indices.append(batch_size // 2)
+    if batch_size > 2:
+        nan_indices.append(batch_size - 1)
+
+    for idx in nan_indices:
+        probs[idx, :] = float("nan")
+
+    valid_indices = [i for i in range(batch_size) if i not in nan_indices]
+
+    def check_result(result, valid):
+        # NaN rows should return 0 and valid=False
+        for idx in nan_indices:
+            assert result[idx].item() == 0 and not valid[idx].item()
+        # Non-NaN rows should have valid=True and valid token index
+        for idx in valid_indices:
+            assert valid[idx].item()
+            assert 0 <= result[idx].item() < vocab_size
+
+    # sampling_from_probs
+    result, valid = flashinfer.sampling.sampling_from_probs(probs, return_valid=True)
+    check_result(result, valid)
+
+    # top_k_sampling_from_probs
+    result, valid = flashinfer.sampling.top_k_sampling_from_probs(
+        probs, top_k=50, return_valid=True
+    )
+    check_result(result, valid)
+
+    # top_p_sampling_from_probs
+    result, valid = flashinfer.sampling.top_p_sampling_from_probs(
+        probs, top_p=0.9, return_valid=True
+    )
+    check_result(result, valid)
+
+    # min_p_sampling_from_probs
+    result, valid = flashinfer.sampling.min_p_sampling_from_probs(
+        probs, min_p=0.1, return_valid=True
+    )
+    check_result(result, valid)
+
+    # top_k_top_p_sampling_from_probs (joint mode)
+    result, valid = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+        probs, top_k=50, top_p=0.9, filter_apply_order="joint", return_valid=True
+    )
+    check_result(result, valid)
+
+
 if __name__ == "__main__":
     # test_sampling_freq(128256, gumbel_distribution(0.1), 0.5)
     test_sampling_from_logits_freq(128256, gumbel_distribution(0.1))

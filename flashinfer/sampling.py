@@ -145,12 +145,14 @@ def get_sampling_module():
         generator: Optional[torch.Generator],
         seed: Optional[Union[int, torch.Tensor]] = None,
         offset: Optional[Union[int, torch.Tensor]] = None,
-    ) -> torch.Tensor:
+        return_valid: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         device = probs.device
         probs = probs.float()
         batch_size = indices.size(0) if indices is not None else probs.size(0)
         out_dtype = indices.dtype if indices is not None else torch.int32
         samples = torch.empty(batch_size, dtype=out_dtype, device=device)
+        valid = torch.empty(batch_size, dtype=torch.bool, device=device)
         if seed is None or offset is None:
             seed, offset = get_seed_and_offset(batch_size, generator, device)
 
@@ -161,6 +163,7 @@ def get_sampling_module():
         module.sampling_from_probs(
             probs,
             samples,
+            valid,
             indices,
             deterministic,
             maybe_seed_arr,
@@ -168,6 +171,8 @@ def get_sampling_module():
             maybe_offset_arr,
             offset_val,
         )
+        if return_valid:
+            return samples, valid
         return samples
 
     # torch library for sampling_from_probs
@@ -178,9 +183,15 @@ def get_sampling_module():
         indices: Optional[torch.Tensor],
         deterministic: bool,
         generator: Optional[torch.Generator],
-    ) -> torch.Tensor:
+        return_valid: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         batch_size = indices.size(0) if indices is not None else probs.size(0)
         out_dtype = indices.dtype if indices is not None else torch.int32
+        if return_valid:
+            return (
+                torch.empty(batch_size, dtype=out_dtype, device=probs.device),
+                torch.empty(batch_size, dtype=torch.bool, device=probs.device),
+            )
         return torch.empty(batch_size, dtype=out_dtype, device=probs.device)
 
     # torch library for top_p_sampling_from_probs
@@ -195,7 +206,8 @@ def get_sampling_module():
         generator: Optional[torch.Generator],
         seed: Optional[Union[int, torch.Tensor]] = None,
         offset: Optional[Union[int, torch.Tensor]] = None,
-    ) -> torch.Tensor:
+        return_valid: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         device = probs.device
         probs = probs.float()
         maybe_top_p_arr = (
@@ -204,6 +216,7 @@ def get_sampling_module():
         batch_size = indices.size(0) if indices is not None else probs.size(0)
         out_dtype = indices.dtype if indices is not None else torch.int32
         samples = torch.empty(batch_size, dtype=out_dtype, device=device)
+        valid = torch.empty(batch_size, dtype=torch.bool, device=device)
         if seed is None or offset is None:
             seed, offset = get_seed_and_offset(batch_size * 32, generator, device)
 
@@ -214,6 +227,7 @@ def get_sampling_module():
         module.top_p_sampling_from_probs(
             probs,
             samples,
+            valid,
             indices,
             maybe_top_p_arr,
             top_p_val,
@@ -223,6 +237,8 @@ def get_sampling_module():
             maybe_offset_arr,
             offset_val,
         )
+        if return_valid:
+            return samples, valid
         return samples
 
     @register_fake_op("flashinfer::top_p_sampling_from_probs")
@@ -233,11 +249,16 @@ def get_sampling_module():
         top_p_val: float,
         deterministic: bool,
         generator: Optional[torch.Generator],
-    ) -> torch.Tensor:
+        return_valid: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         batch_size = indices.size(0) if indices is not None else probs.size(0)
         out_dtype = indices.dtype if indices is not None else torch.int32
-        sample = torch.empty(batch_size, dtype=out_dtype, device=probs.device)
-        return sample
+        if return_valid:
+            return (
+                torch.empty(batch_size, dtype=out_dtype, device=probs.device),
+                torch.empty(batch_size, dtype=torch.bool, device=probs.device),
+            )
+        return torch.empty(batch_size, dtype=out_dtype, device=probs.device)
 
     # torch library for top_k_sampling_from_probs
 
@@ -251,13 +272,15 @@ def get_sampling_module():
         generator: Optional[torch.Generator],
         seed: Optional[Union[int, torch.Tensor]] = None,
         offset: Optional[Union[int, torch.Tensor]] = None,
-    ) -> torch.Tensor:
+        return_valid: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         device = probs.device
         probs = probs.float()
         batch_size = indices.size(0) if indices is not None else probs.size(0)
         maybe_top_k_arr = maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
         out_dtype = indices.dtype if indices is not None else torch.int32
         samples = torch.empty(batch_size, dtype=out_dtype, device=device)
+        valid = torch.empty(batch_size, dtype=torch.bool, device=device)
         if seed is None or offset is None:
             seed, offset = get_seed_and_offset(batch_size * 32, generator, device)
 
@@ -268,6 +291,7 @@ def get_sampling_module():
         module.top_k_sampling_from_probs(
             probs,
             samples,
+            valid,
             indices,
             maybe_top_k_arr,
             top_k_val,
@@ -277,6 +301,8 @@ def get_sampling_module():
             maybe_offset_arr,
             offset_val,
         )
+        if return_valid:
+            return samples, valid
         return samples
 
     @register_fake_op("flashinfer::top_k_sampling_from_probs")
@@ -287,11 +313,16 @@ def get_sampling_module():
         top_k_val: int,
         deterministic: bool,
         generator: Optional[torch.Generator],
-    ) -> torch.Tensor:
+        return_valid: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         batch_size = indices.size(0) if indices is not None else probs.size(0)
         out_dtype = indices.dtype if indices is not None else torch.int32
-        sample = torch.empty(batch_size, dtype=out_dtype, device=probs.device)
-        return sample
+        if return_valid:
+            return (
+                torch.empty(batch_size, dtype=out_dtype, device=probs.device),
+                torch.empty(batch_size, dtype=torch.bool, device=probs.device),
+            )
+        return torch.empty(batch_size, dtype=out_dtype, device=probs.device)
 
     # torch library for min_p_sampling_from_probs
 
@@ -305,7 +336,8 @@ def get_sampling_module():
         generator: Optional[torch.Generator],
         seed: Optional[Union[int, torch.Tensor]] = None,
         offset: Optional[Union[int, torch.Tensor]] = None,
-    ) -> torch.Tensor:
+        return_valid: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         device = probs.device
         probs = probs.float()
         maybe_min_p_arr = (
@@ -314,6 +346,7 @@ def get_sampling_module():
         batch_size = indices.size(0) if indices is not None else probs.size(0)
         out_dtype = indices.dtype if indices is not None else torch.int32
         samples = torch.empty(batch_size, dtype=out_dtype, device=device)
+        valid = torch.empty(batch_size, dtype=torch.bool, device=device)
         if seed is None or offset is None:
             seed, offset = get_seed_and_offset(batch_size, generator, device)
 
@@ -324,6 +357,7 @@ def get_sampling_module():
         module.min_p_sampling_from_probs(
             probs,
             samples,
+            valid,
             indices,
             maybe_min_p_arr,
             min_p_val,
@@ -333,10 +367,30 @@ def get_sampling_module():
             maybe_offset_arr,
             offset_val,
         )
+        if return_valid:
+            return samples, valid
         return samples
 
-    # torch library for top_k_top_p_sampling_from_probs
+    @register_fake_op("flashinfer::min_p_sampling_from_probs")
+    def _fake_min_p_sampling_from_probs(
+        probs: torch.Tensor,
+        indices: Optional[torch.Tensor],
+        maybe_min_p_arr: Optional[torch.Tensor],
+        min_p_val: float,
+        deterministic: bool,
+        generator: Optional[torch.Generator],
+        return_valid: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        batch_size = indices.size(0) if indices is not None else probs.size(0)
+        out_dtype = indices.dtype if indices is not None else torch.int32
+        if return_valid:
+            return (
+                torch.empty(batch_size, dtype=out_dtype, device=probs.device),
+                torch.empty(batch_size, dtype=torch.bool, device=probs.device),
+            )
+        return torch.empty(batch_size, dtype=out_dtype, device=probs.device)
 
+    # torch library for top_k_top_p_sampling_from_probs
     @register_custom_op("flashinfer::top_k_top_p_sampling_from_probs", mutates_args=())
     def top_k_top_p_sampling_from_probs(
         probs: torch.Tensor,
@@ -349,7 +403,8 @@ def get_sampling_module():
         generator: Optional[torch.Generator],
         seed: Optional[Union[int, torch.Tensor]] = None,
         offset: Optional[Union[int, torch.Tensor]] = None,
-    ) -> torch.Tensor:
+        return_valid: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         device = probs.device
         probs = probs.float()
         maybe_top_k_arr = maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
@@ -359,6 +414,7 @@ def get_sampling_module():
         batch_size = indices.size(0) if indices is not None else probs.size(0)
         out_dtype = indices.dtype if indices is not None else torch.int32
         samples = torch.empty(batch_size, dtype=out_dtype, device=device)
+        valid = torch.empty(batch_size, dtype=torch.bool, device=device)
         if seed is None or offset is None:
             seed, offset = get_seed_and_offset(batch_size * 32, generator, device)
 
@@ -369,6 +425,7 @@ def get_sampling_module():
         module.top_k_top_p_sampling_from_probs(
             probs,
             samples,
+            valid,
             indices,
             maybe_top_k_arr,
             top_k_val,
@@ -380,6 +437,8 @@ def get_sampling_module():
             maybe_offset_arr,
             offset_val,
         )
+        if return_valid:
+            return samples, valid
         return samples
 
     @register_fake_op("flashinfer::top_k_top_p_sampling_from_probs")
@@ -392,11 +451,16 @@ def get_sampling_module():
         top_p_val: float,
         deterministic: bool,
         generator: Optional[torch.Generator],
-    ) -> torch.Tensor:
+        return_valid: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         batch_size = indices.size(0) if indices is not None else probs.size(0)
         out_dtype = indices.dtype if indices is not None else torch.int32
-        sample = torch.empty(batch_size, dtype=out_dtype, device=probs.device)
-        return sample
+        if return_valid:
+            return (
+                torch.empty(batch_size, dtype=out_dtype, device=probs.device),
+                torch.empty(batch_size, dtype=torch.bool, device=probs.device),
+            )
+        return torch.empty(batch_size, dtype=out_dtype, device=probs.device)
 
     # torch library for top_p_renorm_probs
 
@@ -796,6 +860,7 @@ def sampling_from_probs(
     check_nan: bool = False,
     seed: Optional[Union[int, torch.Tensor]] = None,
     offset: Optional[Union[int, torch.Tensor]] = None,
+    return_valid: bool = False,
 ) -> torch.Tensor:
     r"""Fused GPU kernel for category sampling from probabilities.
 
@@ -869,7 +934,13 @@ def sampling_from_probs(
         if torch.any(torch.isnan(probs)):
             raise ValueError("Input probs contains NaN.")
     return get_sampling_module().sampling_from_probs(
-        probs, indices, deterministic, generator, seed, offset
+        probs,
+        indices,
+        deterministic,
+        generator,
+        seed,
+        offset,
+        return_valid,
     )
 
 
@@ -883,6 +954,7 @@ def top_p_sampling_from_probs(
     check_nan: bool = False,
     seed: Optional[Union[int, torch.Tensor]] = None,
     offset: Optional[Union[int, torch.Tensor]] = None,
+    return_valid: bool = False,
 ) -> torch.Tensor:
     r"""Fused GPU kernel for top-p sampling (nucleus sampling) from probabilities,
     this operator implements GPU-based rejection sampling without explicit sorting.
@@ -980,6 +1052,7 @@ def top_p_sampling_from_probs(
         generator,
         seed,
         offset,
+        return_valid,
     )
 
 
@@ -993,6 +1066,7 @@ def top_k_sampling_from_probs(
     check_nan: bool = False,
     seed: Optional[Union[int, torch.Tensor]] = None,
     offset: Optional[Union[int, torch.Tensor]] = None,
+    return_valid: bool = False,
 ) -> torch.Tensor:
     r"""Fused GPU kernel for top-k sampling from probabilities,
     this operator implements GPU-based rejection sampling without explicit sorting.
@@ -1090,6 +1164,7 @@ def top_k_sampling_from_probs(
         generator,
         seed,
         offset,
+        return_valid,
     )
 
 
@@ -1103,6 +1178,7 @@ def min_p_sampling_from_probs(
     check_nan: bool = False,
     seed: Optional[Union[int, torch.Tensor]] = None,
     offset: Optional[Union[int, torch.Tensor]] = None,
+    return_valid: bool = False,
 ) -> torch.Tensor:
     r"""Fused GPU kernel for `min_p sampling <https://arxiv.org/abs/2407.01082>`_ from probabilities,
 
@@ -1196,6 +1272,7 @@ def min_p_sampling_from_probs(
         generator,
         seed,
         offset,
+        return_valid,
     )
 
 
@@ -1357,6 +1434,7 @@ def top_k_top_p_sampling_from_probs(
     check_nan: bool = False,
     seed: Optional[Union[int, torch.Tensor]] = None,
     offset: Optional[Union[int, torch.Tensor]] = None,
+    return_valid: bool = False,
 ) -> torch.Tensor:
     r"""Fused GPU kernel for top-k and top-p sampling from probabilities,
 
@@ -1465,6 +1543,7 @@ def top_k_top_p_sampling_from_probs(
             generator=generator,
             seed=seed,
             offset=offset,
+            return_valid=return_valid,
         )
     elif filter_apply_order == "joint":
         if check_nan:
@@ -1479,6 +1558,7 @@ def top_k_top_p_sampling_from_probs(
             generator,
             seed,
             offset,
+            return_valid,
         )
     else:
         raise ValueError(f"Invalid filter_apply_order: {filter_apply_order}")
