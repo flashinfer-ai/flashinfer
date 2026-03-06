@@ -137,8 +137,9 @@ class KVFP4QuantizeUtil:
 
         # Scale each block to FP4 range: x_scaled = x / block_max * E2M1_MAX
         # This ensures values are in [-6, 6] range
+        # Clamp denominator to avoid division by zero for all-zero blocks
         block_scales_fixed = block_scales.unsqueeze(-1)
-        x_scaled = reshaped / (block_scales_fixed * global_scale)
+        x_scaled = reshaped / (block_scales_fixed * global_scale).clamp(min=1e-12)
 
         # Step 3: Convert scaled values (x_scaled) to packed FP4
         # E2M1 format: bit 3 = sign, bits 2-0 = magnitude (exponent + mantissa)
