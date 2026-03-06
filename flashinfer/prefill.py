@@ -3443,6 +3443,13 @@ def trtllm_ragged_attention_deepseek(
     return_lse: bool,
     attention_sinks: Optional[torch.Tensor] = None,
     skip_softmax_threshold_scale_factor: Optional[float] = None,
+    sage_attn_sfs: Tuple[
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ] = (None, None, None, None),
+    num_elts_per_sage_attn_blk: Tuple[int, int, int, int] = (0, 0, 0, 0),
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -3491,6 +3498,11 @@ def trtllm_ragged_attention_deepseek(
         If no value is provided, then standard attention is used.
         Setting the threshold to a higher value generally increases kernel performance at the cost of accuracy degradation.
         The actual threshold value equals the provided threshold_scale_factor divided by the context length.
+    sage_attn_sfs : Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]
+        SageAttention scaling-factor tensors (Q/K/P/V).
+        NOTE: these shapes will not be validated.
+    num_elts_per_sage_attn_blk : Tuple[int, int, int, int]
+        number of elements per SageAttention block for Q/K/P/V.
     out : Optional[torch.Tensor]
         output tensor, if not provided, will be allocated with shape [query.shape[0], query.shape[1], value.shape[2]]
     lse : Optional[torch.Tensor]
@@ -3558,6 +3570,11 @@ def trtllm_ragged_attention_deepseek(
     if isinstance(bmm2_scale, torch.Tensor):
         assert bmm2_scale.dtype == torch.float32
 
+    sage_attn_sfs_q, sage_attn_sfs_k, sage_attn_sfs_p, sage_attn_sfs_v = sage_attn_sfs
+    num_elts_sage_q, num_elts_sage_k, num_elts_sage_p, num_elts_sage_v = (
+        num_elts_per_sage_attn_blk
+    )
+
     workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
     run_func(
         out,
@@ -3581,6 +3598,14 @@ def trtllm_ragged_attention_deepseek(
         workspace_size,
         attention_sinks,
         skip_softmax_threshold_scale_factor,
+        sage_attn_sfs_q,
+        sage_attn_sfs_k,
+        sage_attn_sfs_p,
+        sage_attn_sfs_v,
+        num_elts_sage_q,
+        num_elts_sage_k,
+        num_elts_sage_p,
+        num_elts_sage_v,
         lse,
     )
     if return_lse:
