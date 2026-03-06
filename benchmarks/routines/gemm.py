@@ -1508,9 +1508,9 @@ def testMmBf16(args):
     res = []
 
     out_dtype = dtype_str_to_torch_dtype(args.out_dtype)
-    if out_dtype not in [torch.bfloat16, torch.float16]:
+    if out_dtype not in [torch.bfloat16, torch.float16, torch.float32]:
         raise ValueError(
-            f"Unsupported output dtype: {args.out_dtype}. Supported dtypes are bfloat16 and float16."
+            f"Unsupported output dtype: {args.out_dtype}. Supported dtypes are bfloat16, float16, and float32."
         )
 
     ## Prepare input tensors
@@ -1728,9 +1728,9 @@ def testBmmBf16(args):
     res = []
 
     out_dtype = dtype_str_to_torch_dtype(args.out_dtype)
-    if out_dtype not in [torch.bfloat16, torch.float16]:
+    if out_dtype not in [torch.bfloat16, torch.float16, torch.float32]:
         raise ValueError(
-            f"Unsupported output dtype: {args.out_dtype}. Supported dtypes are bfloat16 and float16."
+            f"Unsupported output dtype: {args.out_dtype}. Supported dtypes are bfloat16, float16, and float32."
         )
 
     ## Prepare input tensors
