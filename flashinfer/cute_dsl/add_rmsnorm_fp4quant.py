@@ -967,21 +967,34 @@ def _get_compiled_kernel(
         cutlass.Float32, (1,), assumed_align=4
     )
 
-    # Compile with TVM-FFI enabled
-    compiled_kernel = cute.compile(
-        kernel_obj,
-        x_fake,
-        r_fake,
-        w_fake,
-        y_fake,
-        s_fake,
-        s_unswizzled_fake,
-        global_scale_fake,
-        Int32(1),  # Dummy M
-        Float32(1e-6),  # Dummy eps
-        stream_fake,
-        options="--enable-tvm-ffi",
+    # Compile with TVM-FFI enabled, with AOT caching
+    from ..jit.cute_dsl_aot import compile_and_cache_cute_dsl_kernel
+
+    dtype_str = "fp16" if is_fp16 else "bf16"
+    swizzle_str = "swz" if is_sf_swizzled_layout else "noswz"
+    both_str = "both" if output_both_sf_layouts else "single"
+    aot_func_name = (
+        f"add_rmsnorm_fp4quant_{dtype_str}_h{hidden_size}"
+        f"_bs{block_size}_sm{sm_version}_{scale_format}_{swizzle_str}_{both_str}"
     )
+
+    def _do_compile():
+        return cute.compile(
+            kernel_obj,
+            x_fake,
+            r_fake,
+            w_fake,
+            y_fake,
+            s_fake,
+            s_unswizzled_fake,
+            global_scale_fake,
+            Int32(1),  # Dummy M
+            Float32(1e-6),  # Dummy eps
+            stream_fake,
+            options="--enable-tvm-ffi",
+        )
+
+    compiled_kernel = compile_and_cache_cute_dsl_kernel(_do_compile, aot_func_name)
 
     def tensor_api(
         x: torch.Tensor,

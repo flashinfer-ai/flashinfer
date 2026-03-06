@@ -220,31 +220,43 @@ def _get_compiled_finalize_kernel(
         #  permuted_idx_to_expanded_idx_ptr, num_non_exiting_tiles_ptr,
         #  token_final_scales_ptr, m, n, k, l, num_tokens, top_k,
         #  tile_size, scaling_vector_size, max_active_clusters, stream)
-        compiled_gemm = cute.compile(
-            gemm.wrapper,
-            a_ptr,
-            b_ptr,
-            a_sf_ptr,
-            b_sf_ptr,
-            c_ptr,
-            alpha_ptr,
-            tile_idx_ptr,
-            mn_limit_ptr,
-            permuted_idx_ptr,
-            num_tiles_ptr,
-            token_scales_ptr,
-            permuted_m,
-            n,
-            k,
-            num_experts,
-            seq_len,
-            topk,
-            tile_size=tile_size,
-            scaling_vector_size=sf_vec_size,
-            max_active_clusters=max_active_clusters,
-            stream=stream,
+        from flashinfer.jit.cute_dsl_aot import compile_and_cache_cute_dsl_kernel
+
+        mma_str = f"{mma_tiler_mn[0]}x{mma_tiler_mn[1]}"
+        cl_str = f"{cluster_shape_mn[0]}x{cluster_shape_mn[1]}"
+        aot_func_name = (
+            f"moe_finalize_sfv{sf_vec_size}_ts{tile_size}"
+            f"_mma{mma_str}_cl{cl_str}"
+            f"_{'rm' if raster_along_m else 'rn'}"
         )
 
+        def _do_compile():
+            return cute.compile(
+                gemm.wrapper,
+                a_ptr,
+                b_ptr,
+                a_sf_ptr,
+                b_sf_ptr,
+                c_ptr,
+                alpha_ptr,
+                tile_idx_ptr,
+                mn_limit_ptr,
+                permuted_idx_ptr,
+                num_tiles_ptr,
+                token_scales_ptr,
+                permuted_m,
+                n,
+                k,
+                num_experts,
+                seq_len,
+                topk,
+                tile_size=tile_size,
+                scaling_vector_size=sf_vec_size,
+                max_active_clusters=max_active_clusters,
+                stream=stream,
+            )
+
+        compiled_gemm = compile_and_cache_cute_dsl_kernel(_do_compile, aot_func_name)
         _finalize_kernel_cache[cache_key] = compiled_gemm
 
     return _finalize_kernel_cache[cache_key]

@@ -3547,22 +3547,43 @@ def _cute_dsl_gemm_fp4_runner(
                 # Fake stream: auto uses current CUDA stream at runtime
                 stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
-                compiled_gemm = cute.compile(
-                    gemm.wrapper,
-                    a_fake,
-                    b_fake,
-                    c_fake,
-                    sf_m,
-                    sf_n,
-                    sf_k,
-                    batch_size,
-                    a_sf_ptr,
-                    b_sf_ptr,
-                    alpha_fake,
-                    max_active_clusters,
-                    stream_fake,
-                    swap_ab,
-                    options="--opt-level 2 --enable-tvm-ffi",
+                from flashinfer.jit.cute_dsl_aot import (
+                    compile_and_cache_cute_dsl_kernel,
+                )
+
+                mma_str = f"{mma_tiler_mn[0]}x{mma_tiler_mn[1]}"
+                cl_str = f"{cluster_shape_mn[0]}x{cluster_shape_mn[1]}"
+                aot_func_name = (
+                    f"mm_fp4_{kernel_type}_sfv{sf_vec_size}"
+                    f"_mma{mma_str}_cl{cl_str}"
+                    f"_{'swap' if swap_ab else 'noswap'}"
+                    f"_{'pf' if use_prefetch else 'nopf'}"
+                    f"_{'tma' if use_tma_store else 'notma'}"
+                    f"_{'pdl' if enable_pdl else 'nopdl'}"
+                    f"_{out_dtype}"
+                )
+
+                def _do_compile():
+                    return cute.compile(
+                        gemm.wrapper,
+                        a_fake,
+                        b_fake,
+                        c_fake,
+                        sf_m,
+                        sf_n,
+                        sf_k,
+                        batch_size,
+                        a_sf_ptr,
+                        b_sf_ptr,
+                        alpha_fake,
+                        max_active_clusters,
+                        stream_fake,
+                        swap_ab,
+                        options="--opt-level 2 --enable-tvm-ffi",
+                    )
+
+                compiled_gemm = compile_and_cache_cute_dsl_kernel(
+                    _do_compile, aot_func_name
                 )
 
                 _CUTE_DSL_MM_FP4_KERNEL_CACHE[cache_key] = (

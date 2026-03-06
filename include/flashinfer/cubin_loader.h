@@ -14,45 +14,26 @@
  * limitations under the License.
  */
 
-// This file exposes a C API to manage dynamic cubin loading.
-// It is meant to be included in a .so file that is loaded dynamically
-// as a python module, where the following functions can be referenced.
+// Cubin loading via TVM-FFI.
 //
-// The python code is expected to call `FlashInferSetCubinCallback` when
-// loading the module. This sets a callback that can be called by the
-// library to load a cubin.
-// The callback is expected to call `FlashInferSetCurrentCubin` with the
-// cubin data and the size of the cubin.
-//
-// Internally the library can just rely on the `getCubin` function to encapsulate
-// this back and forth.
-//
-// This is a C API so that we can use it with ctypes and don't rely on pybind11,
-// because pybind11 support of arbitrary callback requires >=python3.11.
+// The Python side registers a TVM-FFI global function "flashinfer.get_cubin"
+// that downloads/caches cubin files and returns their bytes.
+// C++ code calls getCubin() which invokes this function through TVM-FFI's
+// cross-language function call mechanism — no ctypes callbacks, no global
+// function pointers, no thread-local storage needed.
 
-// Callback into the python function that will get us the requested cubin.
-void (*callbackGetCubin)(const char* path, const char* sha256) = nullptr;
+#pragma once
 
-// Set the python callback, called by the python code using ctypes.
-extern "C" void FlashInferSetCubinCallback(void (*callback)(const char* path, const char* sha256)) {
-  callbackGetCubin = callback;
-}
+#include <tvm/ffi/function.h>
+#include <tvm/ffi/string.h>
 
-// Thread-local variable that stores the current cubin.
-// It is reset on every call to `getCubin()`.
-thread_local std::string current_cubin;
+#include <stdexcept>
+#include <string>
 
-// Called by the callback to set the current cubin.
-extern "C" void FlashInferSetCurrentCubin(const char* binary, int size) {
-  current_cubin = std::string(binary, size);
-}
-
-// Get the cubin from the python callback.
-// This is the API for the native library to use.
-std::string getCubin(const std::string& name, const std::string& sha256) {
-  if (!callbackGetCubin) {
-    throw std::runtime_error("FlashInferSetCubinCallback not set");
-  }
-  callbackGetCubin(name.c_str(), sha256.c_str());
-  return current_cubin;
+// Get cubin bytes from the Python-registered TVM-FFI function.
+// The Python function handles downloading, caching, and SHA256 verification.
+inline std::string getCubin(const std::string& name, const std::string& sha256) {
+  static tvm::ffi::Function func = tvm::ffi::Function::GetGlobalRequired("flashinfer.get_cubin");
+  tvm::ffi::Bytes result = func(name, sha256).cast<tvm::ffi::Bytes>();
+  return std::string(result.data(), result.size());
 }

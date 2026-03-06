@@ -588,9 +588,8 @@ void trtllm_ragged_attention(TensorView out, TensorView query, TensorView key, T
       skip_softmax_threshold_scale_factor_value, skips_softmax, workspace_size, stream);
 }
 
-namespace trtllm_cubin_loader {
-#include <flashinfer/cubin_loader.h>
-}
+// cubin_loader.h is now included via fmhaKernels.cuh and provides getCubin()
+// through TVM-FFI (no per-library callback setup needed).
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_paged_attention_decode, trtllm_paged_attention_decode);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_paged_attention_context, trtllm_paged_attention_context);

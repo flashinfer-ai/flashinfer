@@ -13,6 +13,7 @@
  */
 
 #include <cuda_fp16.h>
+#include <flashinfer/cubin_loader.h>
 #include <flashinfer/exception.h>
 #include <flashinfer/trtllm/common.h>
 #include <nvrtc.h>
@@ -38,8 +39,6 @@ static_assert(false, "CUDNN_SDPA_CUBIN_PATH macro is not defined when compiling"
 namespace flashinfer {
 
 namespace cudnn_sdpa_kernel_launcher {
-
-#include <flashinfer/cubin_loader.h>
 
 using tvm::ffi::Optional;
 

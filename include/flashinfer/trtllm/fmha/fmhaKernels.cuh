@@ -47,10 +47,7 @@ static const std::string tllm_gen_fmha_metainfo_hash = std::string(TLLM_GEN_FMHA
 static_assert(false, "TLLM_GEN_FMHA_METAINFO_HASH macro is not defined when compiling");
 #endif
 
-namespace flashinfer::trtllm_cubin_loader {
-std::string getCubin(const std::string& kernelName, const std::string& sha256);
-}  // namespace flashinfer::trtllm_cubin_loader
-using flashinfer::trtllm_cubin_loader::getCubin;
+#include <flashinfer/cubin_loader.h>
 
 // Check if two SM values are family/specific versions of the same architecture
 // Returns true only if one is a family version and the other is a compatible specific version

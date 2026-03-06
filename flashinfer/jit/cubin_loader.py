@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import ctypes
 import hashlib
 import os
 import pathlib
@@ -25,6 +24,7 @@ from typing import Union
 import uuid
 
 import filelock
+import tvm_ffi
 
 from .utils import write_if_different
 from .core import logger
@@ -315,32 +315,19 @@ def download_trtllm_headers(
     write_if_different(artifact_hash_path, artifact_path)
 
 
-def convert_to_ctypes_char_p(data: bytes):
-    return ctypes.c_char_p(data)
-
-
-# Keep a reference to the callback for each loaded library to prevent GC
-dll_cubin_handlers = {}
-
-
 def setup_cubin_loader(dll_path: str) -> None:
-    if dll_path in dll_cubin_handlers:
-        return
+    """No-op kept for backwards compatibility.
 
-    _LIB = ctypes.CDLL(dll_path)
+    Cubin loading now uses TVM-FFI: C++ calls the registered
+    ``flashinfer.get_cubin`` global function directly, so per-library
+    callback setup is no longer needed.
+    """
+    pass
 
-    # Define the correct callback type
-    CALLBACK_TYPE = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_char_p)
 
-    def get_cubin_callback(name: bytes, sha256: bytes):
-        # Both name and sha256 are bytes (c_char_p)
-        cubin = get_cubin(name.decode("utf-8"), sha256.decode("utf-8"))
-        _LIB.FlashInferSetCurrentCubin(
-            convert_to_ctypes_char_p(cubin), ctypes.c_int(len(cubin))
-        )
-
-    # Create the callback and keep a reference to prevent GC
-    cb = CALLBACK_TYPE(get_cubin_callback)
-    dll_cubin_handlers[dll_path] = cb
-
-    _LIB.FlashInferSetCubinCallback(cb)
+# Register the cubin loader as a TVM-FFI global function so that
+# C++ code (include/flashinfer/cubin_loader.h) can call it directly
+# through TVM-FFI's cross-language function call mechanism.
+@tvm_ffi.register_global_func("flashinfer.get_cubin")
+def _tvm_ffi_get_cubin(name: str, sha256: str) -> bytes:
+    return get_cubin(name, sha256)

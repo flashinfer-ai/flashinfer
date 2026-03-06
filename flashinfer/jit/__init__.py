@@ -74,6 +74,9 @@ from .core import sm120f_nvcc_flags as sm120f_nvcc_flags
 from .core import sm121a_nvcc_flags as sm121a_nvcc_flags
 from .core import current_compilation_context as current_compilation_context
 from .cubin_loader import setup_cubin_loader
+from .cute_dsl_aot import compile_and_cache_cute_dsl_kernel
+from .cute_dsl_aot import try_load_aot_kernel as try_load_aot_cute_dsl_kernel
+from .cute_dsl_aot import export_cute_dsl_kernel
 from .comm import gen_comm_alltoall_module as gen_comm_alltoall_module
 from .comm import gen_trtllm_mnnvl_comm_module as gen_trtllm_mnnvl_comm_module
 from .comm import gen_trtllm_comm_module as gen_trtllm_comm_module

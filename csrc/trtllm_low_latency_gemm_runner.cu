@@ -315,10 +315,6 @@ Array<int64_t> trtllm_low_latency_gemm_tactics(int64_t m, int64_t n, int64_t k, 
   return runner.getValidTactics(m, n, k);
 }
 
-namespace trtllm_cubin_loader {
-#include <flashinfer/cubin_loader.h>
-}
-
 }  // namespace flashinfer
 
 // Exposes low latency optimized GEMMs that require some pre-processing of the inputs.

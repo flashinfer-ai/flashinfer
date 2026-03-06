@@ -358,10 +358,6 @@ Array<int64_t> trtllm_gemm_tactics(int64_t m, int64_t n, int64_t k, int64_t inpu
   return runner.getValidTactics(m, n, k);
 }
 
-namespace trtllm_cubin_loader {
-#include <flashinfer/cubin_loader.h>
-}
-
 }  // namespace flashinfer
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_gemm, flashinfer::trtllm_gemm);

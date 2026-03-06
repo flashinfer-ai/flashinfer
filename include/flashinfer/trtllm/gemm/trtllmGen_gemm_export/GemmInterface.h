@@ -33,9 +33,7 @@ static const std::string tllm_gen_gemm_cubin_path = std::string(TLLM_GEN_GEMM_CU
 static_assert(false, "TLLM_GEN_GEMM_CUBIN_PATH macro is not defined when compiling");
 #endif
 
-namespace flashinfer::trtllm_cubin_loader {
-std::string getCubin(const std::string& kernelName, const std::string& sha256);
-}  // namespace flashinfer::trtllm_cubin_loader
+#include <flashinfer/cubin_loader.h>
 
 namespace gemm {
 
@@ -498,7 +496,7 @@ int32_t GemmInterface::run(GemmConfig const& config, void* workspace, GemmData c
       fname_cubin[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(fname_cubin[0])));
     }
     fname_cubin = tllm_gen_gemm_cubin_path + "/" + fname_cubin + ".cubin";
-    std::string cubin = flashinfer::trtllm_cubin_loader::getCubin(fname_cubin, sha256);
+    std::string cubin = getCubin(fname_cubin, sha256);
     cuModuleLoadData(&cuModule, cubin.c_str());
   };
 
