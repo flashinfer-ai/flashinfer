@@ -227,9 +227,19 @@ def mamba_chunk_scan_combined(
         D: (nheads, headdim) or (nheads,)
         z: (batch, seqlen, nheads, headdim)
         dt_bias: (nheads,)
-        initial_states: (batch, nheads, headdim, dstate)
-        seq_idx: (batch, seqlen)
-        cu_seqlens: (num_sequences + 1) or None, only used if return_varlen_states is True
+        initial_states: (batch, nheads, headdim, dstate) in standard mode, or
+            (num_sequences, nheads, headdim, dstate) in varlen mode (when cu_seqlens
+            is provided). In varlen mode there is one state per sequence rather than
+            per batch element; num_sequences = len(cu_seqlens) - 1. seq_idx maps each
+            (batch, seqlen) position to a sequence index in [0, num_sequences), and
+            cu_seqlens gives the cumulative token counts per sequence. The dtype should
+            match x (or state_dtype if given). _mamba_chunk_scan_combined_fwd()
+            validates the shape (one state per sequence) in varlen mode.
+        seq_idx: (batch, seqlen) — per-token sequence index mapping batch positions
+            to sequence IDs in [0, num_sequences)
+        cu_seqlens: (num_sequences + 1) or None, only used if return_varlen_states is True.
+            Cumulative sequence lengths; cu_seqlens[i+1] - cu_seqlens[i] is the length
+            of sequence i.
         dt_softplus: Whether to apply softplus to dt
         out: Preallocated output tensor
         state_dtype: The data type of the ssm state
