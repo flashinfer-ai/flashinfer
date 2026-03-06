@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include <flashinfer/pos_enc.cuh>
+#include <flashinfer/rope/launchers.cuh>
 
 #include "tvm_ffi_utils.h"
 

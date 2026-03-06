@@ -1,5 +1,5 @@
 """
-Copyright (c) 2024 by FlashInfer team.
+Copyright (c) 2024-2026 by FlashInfer team.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -12,425 +12,54 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
+
+RoPE Public API Functions
+=========================
+
+This module contains the public API functions for RoPE operations:
+
+Standard RoPE:
+- apply_rope: Apply RoPE using indptr/offsets
+- apply_rope_inplace: Apply RoPE inplace using indptr/offsets
+- apply_rope_pos_ids: Apply RoPE using position IDs
+- apply_rope_pos_ids_inplace: Apply RoPE inplace using position IDs
+
+Llama 3.1 style RoPE:
+- apply_llama31_rope: Apply Llama 3.1 RoPE using indptr/offsets
+- apply_llama31_rope_inplace: Apply Llama 3.1 RoPE inplace using indptr/offsets
+- apply_llama31_rope_pos_ids: Apply Llama 3.1 RoPE using position IDs
+- apply_llama31_rope_pos_ids_inplace: Apply Llama 3.1 RoPE inplace using position IDs
+
+RoPE with cos/sin cache:
+- apply_rope_with_cos_sin_cache: Apply RoPE with precomputed cos/sin cache
+- apply_rope_with_cos_sin_cache_inplace: Apply RoPE with cos/sin cache inplace
+
+RoPE + Quantize:
+- rope_quantize_fp8: Apply RoPE and quantize to FP8
+- mla_rope_quantize_fp8: Alias for rope_quantize_fp8
+- rope_quantize_fp8_append_paged_kv_cache: RoPE + quantize + append to paged KV cache
 """
 
-import functools
 from typing import Literal, Optional, Tuple
 
 import torch
 
-from .api_logging import flashinfer_api
-from .jit.rope import gen_rope_module
-from .utils import register_custom_op, register_fake_op
-
-
-def _is_cute_dsl_available() -> bool:
-    """Check if CuTe-DSL backend is available."""
-    try:
-        from .cute_dsl import is_cute_dsl_available
-
-        return is_cute_dsl_available()
-    except ImportError:
-        return False
-
-
-def _get_cute_dsl_rope_kernel(
-    head_dim: int, rotary_dim: int, interleave: bool, dtype_str: str
-):
-    """Get the compiled CuTe-DSL RoPE kernel."""
-    from .cute_dsl.rope import _get_compiled_kernel
-
-    return _get_compiled_kernel(head_dim, rotary_dim, interleave, dtype_str)
-
-
-@functools.cache
-def get_rope_module():
-    return gen_rope_module().build_and_load()
-
-
-@register_custom_op("flashinfer::apply_rope", mutates_args=("q_rope", "k_rope"))
-def _apply_rope(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    q_rope: torch.Tensor,
-    k_rope: torch.Tensor,
-    indptr: torch.Tensor,
-    offsets: torch.Tensor,
-    rotary_dim: int,
-    interleave: bool,
-    rope_scale: float,
-    rope_theta: float,
-) -> None:
-    get_rope_module().apply_rope(
-        q,
-        k,
-        q_rope,
-        k_rope,
-        indptr,
-        offsets,
-        rotary_dim,
-        interleave,
-        rope_scale,
-        rope_theta,
-    )
-
-
-@register_fake_op("flashinfer::apply_rope")
-def _fake_apply_rope(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    q_rope: torch.Tensor,
-    k_rope: torch.Tensor,
-    indptr: torch.Tensor,
-    offsets: torch.Tensor,
-    rotary_dim: int,
-    interleave: bool,
-    rope_scale: float,
-    rope_theta: float,
-) -> None:
-    pass
-
-
-@register_custom_op("flashinfer::apply_llama31_rope", mutates_args=("q_rope", "k_rope"))
-def _apply_llama31_rope(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    q_rope: torch.Tensor,
-    k_rope: torch.Tensor,
-    indptr: torch.Tensor,
-    offsets: torch.Tensor,
-    rotary_dim: int,
-    interleave: bool,
-    rope_scale: float,
-    rope_theta: float,
-    low_freq_factor: float,
-    high_freq_factor: float,
-    old_context_len: float,
-) -> None:
-    get_rope_module().apply_llama31_rope(
-        q,
-        k,
-        q_rope,
-        k_rope,
-        indptr,
-        offsets,
-        rotary_dim,
-        interleave,
-        rope_scale,
-        rope_theta,
-        low_freq_factor,
-        high_freq_factor,
-        old_context_len,
-    )
-
-
-@register_fake_op("flashinfer::apply_llama31_rope")
-def _fake_apply_llama31_rope(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    q_rope: torch.Tensor,
-    k_rope: torch.Tensor,
-    indptr: torch.Tensor,
-    offsets: torch.Tensor,
-    rotary_dim: int,
-    interleave: bool,
-    rope_scale: float,
-    rope_theta: float,
-    low_freq_factor: float,
-    high_freq_factor: float,
-    old_context_len: float,
-) -> None:
-    pass
-
-
-@register_custom_op("flashinfer::apply_rope_pos_ids", mutates_args=("q_rope", "k_rope"))
-def _apply_rope_pos_ids(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    q_rope: torch.Tensor,
-    k_rope: torch.Tensor,
-    pos_ids: torch.Tensor,
-    rotary_dim: int,
-    interleave: bool,
-    rope_scale: float,
-    rope_theta: float,
-) -> None:
-    get_rope_module().apply_rope_pos_ids(
-        q,
-        k,
-        q_rope,
-        k_rope,
-        pos_ids,
-        rotary_dim,
-        interleave,
-        rope_scale,
-        rope_theta,
-    )
-
-
-@register_fake_op("flashinfer::apply_rope_pos_ids")
-def _fake_apply_rope_pos_ids(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    q_rope: torch.Tensor,
-    k_rope: torch.Tensor,
-    pos_ids: torch.Tensor,
-    rotary_dim: int,
-    interleave: bool,
-    rope_scale: float,
-    rope_theta: float,
-) -> None:
-    pass
-
-
-@register_custom_op(
-    "flashinfer::rope_quantize",
-    mutates_args=("q_rope_out", "k_rope_out", "q_nope_out", "k_nope_out"),
+from ..api_logging import flashinfer_api
+from .utils import _is_cute_dsl_available
+from .custom_ops import (
+    _apply_rope,
+    _apply_llama31_rope,
+    _apply_rope_pos_ids,
+    _apply_llama31_rope_pos_ids,
+    _apply_rope_pos_ids_cos_sin_cache,
+    _rope_quantize,
+    _rope_quantize_fp8_append_paged_kv_cache,
 )
-def _rope_quantize(
-    q_rope_in: torch.Tensor,
-    k_rope_in: torch.Tensor,
-    q_nope_in: torch.Tensor,
-    k_nope_in: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    pos_ids: torch.Tensor,
-    q_rope_out: torch.Tensor,
-    k_rope_out: torch.Tensor,
-    q_nope_out: torch.Tensor,
-    k_nope_out: torch.Tensor,
-    quant_scale_q: float,
-    quant_scale_kv: float,
-    interleave: bool,
-    enable_pdl: bool,
-) -> None:
-    r"""Custom operator that routes to the CUDA kernel implementation.
-
-    Converts is_neox parameter to interleave format and dispatches to the underlying
-    CUDA kernel via the JIT-compiled module.
-    """
-    get_rope_module().rope_quantize(
-        q_rope_in,
-        k_rope_in,
-        q_nope_in,
-        k_nope_in,
-        q_rope_out,
-        k_rope_out,
-        q_nope_out,
-        k_nope_out,
-        cos_sin_cache,
-        pos_ids,
-        quant_scale_q,
-        quant_scale_kv,
-        interleave,
-        enable_pdl,
-    )
 
 
-@register_fake_op("flashinfer::rope_quantize")
-def _fake_rope_quantize(
-    q_rope_in: torch.Tensor,
-    k_rope_in: torch.Tensor,
-    q_nope_in: torch.Tensor,
-    k_nope_in: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    pos_ids: torch.Tensor,
-    q_rope_out: torch.Tensor,
-    k_rope_out: torch.Tensor,
-    q_nope_out: torch.Tensor,
-    k_nope_out: torch.Tensor,
-    quant_scale_q: float,
-    quant_scale_kv: float,
-    interleave: bool,
-    enable_pdl: bool,
-) -> None:
-    pass
-
-
-@register_custom_op(
-    "flashinfer::rope_quantize_append_paged_kv_cache",
-    mutates_args=(
-        "q_rope_out",
-        "q_nope_out",
-        "k_cache",
-        "v_cache",
-        "ckv_cache",
-        "kpe_cache",
-    ),
-)
-def _rope_quantize_fp8_append_paged_kv_cache(
-    q_rope_in: torch.Tensor,
-    k_rope_in: torch.Tensor,
-    q_nope_in: torch.Tensor,
-    k_nope_in: torch.Tensor,
-    v_in: torch.Tensor,
-    q_rope_out: torch.Tensor,
-    q_nope_out: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    pos_ids: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    ckv_cache: torch.Tensor,
-    kpe_cache: torch.Tensor,
-    kv_indices: torch.Tensor,
-    kv_indptr: torch.Tensor,
-    batch_indices: torch.Tensor,
-    positions: torch.Tensor,
-    kv_layout_code: int,
-    page_size: int,
-    quant_scale_q: float,
-    quant_scale_kv: float,
-    interleave: bool,
-    enable_pdl: bool,
-) -> None:
-    r"""Custom operator that routes to the CUDA kernel implementation.
-
-    Fuses RoPE application, FP8 quantization, and paged KV cache append into a single kernel.
-
-    Converts is_neox parameter to interleave format and dispatches to the underlying
-    CUDA kernel via the JIT-compiled module.
-    """
-    get_rope_module().rope_quantize_append_paged_kv_cache(
-        q_rope_in,
-        k_rope_in,
-        q_nope_in,
-        k_nope_in,
-        v_in,
-        q_rope_out,
-        q_nope_out,
-        cos_sin_cache,
-        pos_ids,
-        k_cache,
-        v_cache,
-        ckv_cache,
-        kpe_cache,
-        kv_indices,
-        kv_indptr,
-        batch_indices,
-        positions,
-        kv_layout_code,
-        page_size,
-        quant_scale_q,
-        quant_scale_kv,
-        interleave,
-        enable_pdl,
-    )
-
-
-@register_fake_op("flashinfer::rope_quantize_append_paged_kv_cache")
-def _fake_rope_quantize_fp8_append_paged_kv_cache(
-    q_rope_in: torch.Tensor,
-    k_rope_in: torch.Tensor,
-    q_nope_in: torch.Tensor,
-    k_nope_in: torch.Tensor,
-    v_in: torch.Tensor,
-    q_rope_out: torch.Tensor,
-    q_nope_out: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    pos_ids: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    ckv_cache: torch.Tensor,
-    kpe_cache: torch.Tensor,
-    kv_indices: torch.Tensor,
-    kv_indptr: torch.Tensor,
-    batch_indices: torch.Tensor,
-    positions: torch.Tensor,
-    kv_layout_code: int,
-    page_size: int,
-    quant_scale_q: float,
-    quant_scale_kv: float,
-    interleave: bool,
-    enable_pdl: bool,
-) -> None:
-    pass
-
-
-@register_custom_op(
-    "flashinfer::apply_rope_pos_ids_cos_sin_cache", mutates_args=("q_rope", "k_rope")
-)
-def _apply_rope_pos_ids_cos_sin_cache(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    q_rope: torch.Tensor,
-    k_rope: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    pos_ids: torch.Tensor,
-    interleave: bool,
-) -> None:
-    get_rope_module().apply_rope_pos_ids_cos_sin_cache(
-        q,
-        k,
-        q_rope,
-        k_rope,
-        cos_sin_cache,
-        pos_ids,
-        interleave,
-    )
-
-
-@register_fake_op("flashinfer::apply_rope_pos_ids_cos_sin_cache")
-def _fake_apply_rope_pos_ids_cos_sin_cache(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    q_rope: torch.Tensor,
-    k_rope: torch.Tensor,
-    cos_cache: torch.Tensor,
-    sin_cache: torch.Tensor,
-    pos_ids: torch.Tensor,
-    interleave: bool,
-) -> None:
-    pass
-
-
-@register_custom_op(
-    "flashinfer::apply_llama31_rope_pos_ids", mutates_args=("q_rope", "k_rope")
-)
-def _apply_llama31_rope_pos_ids(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    q_rope: torch.Tensor,
-    k_rope: torch.Tensor,
-    pos_ids: torch.Tensor,
-    rotary_dim: int,
-    interleave: bool,
-    rope_scale: float,
-    rope_theta: float,
-    low_freq_factor: float,
-    high_freq_factor: float,
-    old_context_len: float,
-) -> None:
-    get_rope_module().apply_llama31_rope_pos_ids(
-        q,
-        k,
-        q_rope,
-        k_rope,
-        pos_ids,
-        rotary_dim,
-        interleave,
-        rope_scale,
-        rope_theta,
-        low_freq_factor,
-        high_freq_factor,
-        old_context_len,
-    )
-
-
-@register_fake_op("flashinfer::apply_llama31_rope_pos_ids")
-def _fake_apply_llama31_rope_pos_ids(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    q_rope: torch.Tensor,
-    k_rope: torch.Tensor,
-    pos_ids: torch.Tensor,
-    rotary_dim: int,
-    interleave: bool,
-    rope_scale: float,
-    rope_theta: float,
-    low_freq_factor: float,
-    high_freq_factor: float,
-    old_context_len: float,
-) -> None:
-    pass
+# ============================================================================
+# Standard RoPE with indptr/offsets
+# ============================================================================
 
 
 @flashinfer_api
@@ -443,6 +72,7 @@ def apply_rope_inplace(
     interleave: bool = False,
     rope_scale: float = 1,
     rope_theta: float = 1e4,
+    backend: Literal["cuda", "cute-dsl"] = "cuda",
 ) -> None:
     r"""Apply rotary embedding to a batch of queries/keys (stored as RaggedTensor) inplace.
     cos/sin values are computed on the fly inside the kernel.
@@ -483,32 +113,11 @@ def apply_rope_inplace(
         The scaling factor used in the rope embedding, default: ``1``.
     rope_theta : float
         The theta value used in the rope embedding, default: ``1e4``.
+    backend : Literal["cuda", "cute-dsl"]
+        Backend to use for the RoPE computation, default: ``"cuda"``.
 
-    Examples
-    --------
-    >>> import torch
-    >>> import flashinfer
-    >>> batch_size = 128
-    >>> qkv_len = 1024
-    >>> num_qo_heads = 32
-    >>> num_kv_heads = 32
-    >>> head_dim = 128
-    >>> nnz = batch_size * qkv_len
-    >>> qkv_packed = torch.randn(
-    >>>    nnz,
-    >>>    (num_qo_heads + 2 * num_kv_heads) * head_dim,
-    >>>    dtype=torch.float16,
-    >>>    device="cuda:0",
-    >>> )
-    >>> q = qkv_packed[:, : num_qo_heads * head_dim].reshape(nnz, num_qo_heads, head_dim)
-    >>> k = qkv_packed[
-    ...    :, num_qo_heads * head_dim : (num_qo_heads + num_kv_heads) * head_dim
-    ... ].reshape(nnz, num_kv_heads, head_dim)
-    >>> indptr = torch.tensor(
-    ...    [i * qkv_len for i in range(batch_size + 1)], dtype=torch.int32, device="cuda:0"
-    >>> )
-    >>> offsets = torch.full((batch_size,), 10, dtype=torch.int32, device="cuda:0")
-    >>> flashinfer.apply_rope_inplace(q, k, indptr, offsets)
+        * ``"cuda"``: Use the CUDA C++ backend (default).
+        * ``"cute-dsl"``: Use the CuTe-DSL backend (requires CuTe-DSL to be available).
 
     See Also
     --------
@@ -516,255 +125,32 @@ def apply_rope_inplace(
     """
     if rotary_dim is None:
         rotary_dim = q.size(-1)
+
+    if backend == "cute-dsl":
+        if not _is_cute_dsl_available():
+            raise RuntimeError(
+                "CuTe-DSL backend is not available. Please install CuTe-DSL."
+            )
+        from .kernels import apply_rope_with_indptr_cute_dsl
+
+        # Write directly to input tensors (no copy needed)
+        apply_rope_with_indptr_cute_dsl(
+            q,
+            k,
+            indptr,
+            offsets,
+            rotary_dim=rotary_dim,
+            interleave=interleave,
+            rope_scale=rope_scale,
+            rope_theta=rope_theta,
+            q_rope=q,  # Write directly to input
+            k_rope=k,  # Write directly to input
+        )
+        return
+
+    # Default: CUDA C++ backend
     _apply_rope(
         q, k, q, k, indptr, offsets, rotary_dim, interleave, rope_scale, rope_theta
-    )
-
-
-@flashinfer_api
-def apply_rope_pos_ids_inplace(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    pos_ids: torch.Tensor,
-    rotary_dim: Optional[int] = None,
-    interleave: bool = False,
-    rope_scale: float = 1,
-    rope_theta: float = 1e4,
-) -> None:
-    r"""Apply rotary embedding to a batch of queries/keys (stored as RaggedTensor) inplace.
-    cos/sin values are computed on the fly inside the kernel.
-
-    We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
-    segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
-    i-th segment is ``k[indptr[i]:indptr[i+1]]``, the first element of :attr:`indptr` is always
-    0 and the last element of :attr:`indptr` is the total number of queries/keys in the batch.
-    Please see :ref:`Ragged Tensor tutorial <kv-layout>` for more details about the
-    ragged tensor.
-
-    Parameters
-    ----------
-    q : torch.Tensor
-        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)`, where ``nnz`` is the last
-        element of ``indptr``.
-    k : torch.Tensor
-        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
-    pos_ids : torch.Tensor
-        Position indices, shape: ``(nnz)``.
-    rotary_dim : Optional[int]
-        The dimensions to apply RoPE, if ``None``, we apply RoPE to the entire head dimension,
-        otherwise, we apply RoPE to the first ``rotary_dim`` dimensions, default: ``None``.
-    interleave : bool
-        Whether to use interleaved layout in the last dimension, default: ``False``.
-
-        * If ``True``, the last dimension of the query/key tensor is interleaved, i.e.,
-          we rotate the even dimensions ``([..., ::2])`` and odd dimensions ``([..., 1::2])``.
-
-        * If ``False``, the last dimension of the query/key tensor is not interleaved, i.e.,
-          we rotate the first half dimensions ``([..., :head_dim//2])`` and the second half
-          dimensions ``([..., head_dim//2:])``.
-
-    rope_scale : float
-        The scaling factor used in the rope embedding, default: ``1``.
-    rope_theta : float
-        The theta value used in the rope embedding, default: ``1e4``.
-
-    See Also
-    --------
-    apply_rope_pos_ids
-    """
-    if rotary_dim is None:
-        rotary_dim = q.size(-1)
-    _apply_rope_pos_ids(
-        q, k, q, k, pos_ids, rotary_dim, interleave, rope_scale, rope_theta
-    )
-
-
-@flashinfer_api
-def apply_llama31_rope_inplace(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    indptr: torch.Tensor,
-    offsets: torch.Tensor,
-    rotary_dim: Optional[int] = None,
-    interleave: bool = False,
-    rope_scale: float = 8,
-    rope_theta: float = 5e5,
-    low_freq_factor: float = 1,
-    high_freq_factor: float = 4,
-    old_context_len: int = 8192,
-) -> None:
-    r"""Apply Llama 3.1 style rotary embedding to a batch of queries/keys (stored as
-    RaggedTensor) inplace. cos/sin values are computed on the fly inside the kernel.
-
-    We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
-    segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
-    i-th segment is ``k[indptr[i]:indptr[i+1]]``, the first element of :attr:`indptr` is always
-    0 and the last element of :attr:`indptr` is the total number of queries/keys in the batch.
-    Please see :ref:`Ragged Tensor tutorial <kv-layout>` for more details about the
-    ragged tensor.
-
-    Parameters
-    ----------
-    q : torch.Tensor
-        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
-    k : torch.Tensor
-        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
-    indptr : torch.Tensor
-        Indptr tensor, shape: ``(batch_size + 1)``.
-    offsets : torch.Tensor
-        The relative position offsets of each query in the batch, shape: ``(batch_size)``.
-    rotary_dim : Optional[int]
-        The dimensions to apply RoPE, if ``None``, we apply RoPE to the entire head dimension,
-        otherwise, we apply RoPE to the first ``rotary_dim`` dimensions, default: ``None``.
-    interleave : bool
-        Whether to use interleaved layout in the last dimension, default: ``False``.
-
-        * If ``True``, the last dimension of the query/key tensor is interleaved, i.e.,
-          we rotate the even dimensions ``([..., ::2])`` and odd dimensions ``([..., 1::2])``.
-
-        * If ``False``, the last dimension of the query/key tensor is not interleaved, i.e.,
-          we rotate the first half dimensions ``([..., :head_dim//2])`` and the second half
-          dimensions ``([..., head_dim//2:])``.
-
-    rope_scale : float
-        The scaling factor used in the rope embedding, default: ``8``.
-    rope_theta : float
-        The theta value used in the rope embedding, default: ``5e5``.
-    low_freq_factor : float
-        The low frequency factor used in Llama 3.1 RoPE, default: ``1``.
-    high_freq_factor : float
-        The high frequency factor used in Llama 3.1 RoPE, default: ``4``.
-    old_context_len : int
-        The old context length used in Llama 3.1 RoPE, default: ``8192``.
-
-    Examples
-    --------
-    >>> import torch
-    >>> import flashinfer
-    >>> batch_size = 128
-    >>> qkv_len = 1024
-    >>> num_qo_heads = 32
-    >>> num_kv_heads = 32
-    >>> head_dim = 128
-    >>> nnz = batch_size * qkv_len
-    >>> qkv_packed = torch.randn(
-    >>>    nnz,
-    >>>    (num_qo_heads + 2 * num_kv_heads) * head_dim,
-    >>>    dtype=torch.float16,
-    >>>    device="cuda:0",
-    >>> )
-    >>> q = qkv_packed[:, : num_qo_heads * head_dim].reshape(nnz, num_qo_heads, head_dim)
-    >>> k = qkv_packed[
-    ...    :, num_qo_heads * head_dim : (num_qo_heads + num_kv_heads) * head_dim
-    ... ].reshape(nnz, num_kv_heads, head_dim)
-    >>> indptr = torch.tensor(
-    ...    [i * qkv_len for i in range(batch_size + 1)], dtype=torch.int32, device="cuda:0"
-    >>> )
-    >>> offsets = torch.full((batch_size,), 10, dtype=torch.int32, device="cuda:0")
-    >>> flashinfer.apply_llama31_rope_inplace(q, k, indptr, offsets)
-
-    See Also
-    --------
-    apply_llama31_rope
-    """
-    if rotary_dim is None:
-        rotary_dim = q.size(-1)
-    _apply_llama31_rope(
-        q,
-        k,
-        q,
-        k,
-        indptr,
-        offsets,
-        rotary_dim,
-        interleave,
-        rope_scale,
-        rope_theta,
-        low_freq_factor,
-        high_freq_factor,
-        float(old_context_len),
-    )
-
-
-@flashinfer_api
-def apply_llama31_rope_pos_ids_inplace(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    pos_ids: torch.Tensor,
-    rotary_dim: Optional[int] = None,
-    interleave: bool = False,
-    rope_scale: float = 8,
-    rope_theta: float = 5e5,
-    low_freq_factor: float = 1,
-    high_freq_factor: float = 4,
-    old_context_len: int = 8192,
-) -> None:
-    r"""Apply Llama 3.1 style rotary embedding to a batch of queries/keys (stored as
-    RaggedTensor) inplace. cos/sin values are computed on the fly inside the kernel.
-
-    We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
-    segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
-    i-th segment is ``k[indptr[i]:indptr[i+1]]``, the first element of :attr:`indptr` is always
-    0 and the last element of :attr:`indptr` is the total number of queries/keys in the batch.
-    Please see :ref:`Ragged Tensor tutorial <kv-layout>` for more details about the
-    ragged tensor.
-
-    Parameters
-    ----------
-    q : torch.Tensor
-        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
-    k : torch.Tensor
-        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
-    pos_ids : torch.Tensor
-        Position indices, shape: ``(nnz)``.
-    rotary_dim : Optional[int]
-        The dimensions to apply RoPE, if ``None``, we apply RoPE to the entire head dimension,
-        otherwise, we apply RoPE to the first ``rotary_dim`` dimensions, default: ``None``.
-    interleave : bool
-        Whether to use interleaved layout in the last dimension, default: ``False``.
-
-        * If ``True``, the last dimension of the query/key tensor is interleaved, i.e.,
-          we rotate the even dimensions ``([..., ::2])`` and odd dimensions ``([..., 1::2])``.
-
-        * If ``False``, the last dimension of the query/key tensor is not interleaved, i.e.,
-          we rotate the first half dimensions ``([..., :head_dim//2])`` and the second half
-          dimensions ``([..., head_dim//2:])``.
-
-    rope_scale : float
-        The scaling factor used in the rope embedding, default: ``8``.
-    rope_theta : float
-        The theta value used in the rope embedding, default: ``5e5``.
-    low_freq_factor : float
-        The low frequency factor used in Llama 3.1 RoPE, default: ``1``.
-    high_freq_factor : float
-        The high frequency factor used in Llama 3.1 RoPE, default: ``4``.
-    old_context_len : int
-        The old context length used in Llama 3.1 RoPE, default: ``8192``.
-
-    See Also
-    --------
-    apply_llama31_rope_pos_ids
-    """
-    if rotary_dim is None:
-        rotary_dim = q.size(-1)
-    _apply_llama31_rope_pos_ids(
-        q,
-        k,
-        q,
-        k,
-        pos_ids,
-        rotary_dim,
-        interleave,
-        rope_scale,
-        rope_theta,
-        low_freq_factor,
-        high_freq_factor,
-        float(old_context_len),
     )
 
 
@@ -832,36 +218,6 @@ def apply_rope(
     k_rope : torch.Tensor
         The rotated key tensor, shape: ``(nnz, num_k_heads, head_dim)``.
 
-    Examples
-    --------
-    >>> import torch
-    >>> import flashinfer
-    >>> batch_size = 128
-    >>> qkv_len = 1024
-    >>> num_qo_heads = 32
-    >>> num_kv_heads = 32
-    >>> head_dim = 128
-    >>> nnz = batch_size * qkv_len
-    >>> qkv_packed = torch.randn(
-    >>>    nnz,
-    >>>    (num_qo_heads + 2 * num_kv_heads) * head_dim,
-    >>>    dtype=torch.float16,
-    >>>    device="cuda:0",
-    >>> )
-    >>> q = qkv_packed[:, : num_qo_heads * head_dim].reshape(nnz, num_qo_heads, head_dim)
-    >>> k = qkv_packed[
-    ...    :, num_qo_heads * head_dim : (num_qo_heads + num_kv_heads) * head_dim
-    ... ].reshape(nnz, num_kv_heads, head_dim)
-    >>> indptr = torch.tensor(
-    ...    [i * qkv_len for i in range(batch_size + 1)], dtype=torch.int32, device="cuda:0"
-    >>> )
-    >>> offsets = torch.full((batch_size,), 10, dtype=torch.int32, device="cuda:0")
-    >>> q_rope, k_rope = flashinfer.apply_rope(q, k, indptr, offsets)
-    >>> q_rope.shape
-    torch.Size([131072, 32, 128])
-    >>> k_rope.shape
-    torch.Size([131072, 32, 128])
-
     See Also
     --------
     apply_rope_inplace
@@ -872,11 +228,14 @@ def apply_rope(
         rotary_dim = q.size(-1)
 
     if backend == "cute-dsl":
+        # Note: CuTe-DSL backend has a ~500K token limit per call due to Int32 offset
+        # arithmetic (nnz * num_heads * head_dim must fit in Int32). This covers all
+        # realistic inference workloads (e.g., batch=256 decode, batch=8 prefill with 32K seq).
         if not _is_cute_dsl_available():
             raise RuntimeError(
                 "CuTe-DSL backend is not available. Please install CuTe-DSL."
             )
-        from .cute_dsl.rope import apply_rope_with_indptr_cute_dsl
+        from .kernels import apply_rope_with_indptr_cute_dsl
 
         return apply_rope_with_indptr_cute_dsl(
             q,
@@ -903,6 +262,90 @@ def apply_rope(
         rope_theta,
     )
     return q_rope, k_rope
+
+
+# ============================================================================
+# Standard RoPE with position IDs
+# ============================================================================
+
+
+@flashinfer_api
+def apply_rope_pos_ids_inplace(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    pos_ids: torch.Tensor,
+    rotary_dim: Optional[int] = None,
+    interleave: bool = False,
+    rope_scale: float = 1,
+    rope_theta: float = 1e4,
+    backend: Literal["cuda", "cute-dsl"] = "cuda",
+) -> None:
+    r"""Apply rotary embedding to a batch of queries/keys using position IDs inplace.
+    cos/sin values are computed on the fly inside the kernel.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        Query tensor, shape: ``(nnz, num_q_heads, head_dim)``.
+    k : torch.Tensor
+        Key tensor, shape: ``(nnz, num_k_heads, head_dim)``.
+    pos_ids : torch.Tensor
+        Position indices, shape: ``(nnz)``.
+    rotary_dim : Optional[int]
+        The dimensions to apply RoPE, if ``None``, we apply RoPE to the entire head dimension,
+        otherwise, we apply RoPE to the first ``rotary_dim`` dimensions, default: ``None``.
+    interleave : bool
+        Whether to use interleaved layout in the last dimension, default: ``False``.
+
+        * If ``True``, the last dimension of the query/key tensor is interleaved, i.e.,
+          we rotate the even dimensions ``([..., ::2])`` and odd dimensions ``([..., 1::2])``.
+
+        * If ``False``, the last dimension of the query/key tensor is not interleaved, i.e.,
+          we rotate the first half dimensions ``([..., :head_dim//2])`` and the second half
+          dimensions ``([..., head_dim//2:])``.
+
+    rope_scale : float
+        The scaling factor used in the rope embedding, default: ``1``.
+    rope_theta : float
+        The theta value used in the rope embedding, default: ``1e4``.
+    backend : Literal["cuda", "cute-dsl"]
+        Backend to use for the RoPE computation, default: ``"cuda"``.
+
+        * ``"cuda"``: Use the CUDA C++ backend (default).
+        * ``"cute-dsl"``: Use the CuTe-DSL backend (requires CuTe-DSL to be available).
+
+    See Also
+    --------
+    apply_rope_pos_ids
+    """
+    if rotary_dim is None:
+        rotary_dim = q.size(-1)
+
+    if backend == "cute-dsl":
+        if not _is_cute_dsl_available():
+            raise RuntimeError(
+                "CuTe-DSL backend is not available. Please install CuTe-DSL."
+            )
+        from .kernels import apply_rope_cute_dsl
+
+        # Write directly to input tensors (no copy needed)
+        apply_rope_cute_dsl(
+            q,
+            k,
+            pos_ids,
+            rotary_dim=rotary_dim,
+            interleave=interleave,
+            rope_scale=rope_scale,
+            rope_theta=rope_theta,
+            q_rope=q,  # Write directly to input
+            k_rope=k,  # Write directly to input
+        )
+        return
+
+    # Default: CUDA C++ backend
+    _apply_rope_pos_ids(
+        q, k, q, k, pos_ids, rotary_dim, interleave, rope_scale, rope_theta
+    )
 
 
 @flashinfer_api
@@ -967,11 +410,14 @@ def apply_rope_pos_ids(
         rotary_dim = q.size(-1)
 
     if backend == "cute-dsl":
+        # Note: CuTe-DSL backend has a ~500K token limit per call due to Int32 offset
+        # arithmetic (nnz * num_heads * head_dim must fit in Int32). This covers all
+        # realistic inference workloads (e.g., batch=256 decode, batch=8 prefill with 32K seq).
         if not _is_cute_dsl_available():
             raise RuntimeError(
                 "CuTe-DSL backend is not available. Please install CuTe-DSL."
             )
-        from .cute_dsl.rope import apply_rope_cute_dsl
+        from .kernels import apply_rope_cute_dsl
 
         return apply_rope_cute_dsl(
             q,
@@ -988,6 +434,127 @@ def apply_rope_pos_ids(
         q, k, q_rope, k_rope, pos_ids, rotary_dim, interleave, rope_scale, rope_theta
     )
     return q_rope, k_rope
+
+
+# ============================================================================
+# Llama 3.1 style RoPE with indptr/offsets
+# ============================================================================
+
+
+@flashinfer_api
+def apply_llama31_rope_inplace(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    indptr: torch.Tensor,
+    offsets: torch.Tensor,
+    rotary_dim: Optional[int] = None,
+    interleave: bool = False,
+    rope_scale: float = 8,
+    rope_theta: float = 5e5,
+    low_freq_factor: float = 1,
+    high_freq_factor: float = 4,
+    old_context_len: int = 8192,
+    backend: Literal["cuda", "cute-dsl"] = "cuda",
+) -> None:
+    r"""Apply Llama 3.1 style rotary embedding to a batch of queries/keys (stored as
+    RaggedTensor) inplace. cos/sin values are computed on the fly inside the kernel.
+
+    We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
+    segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
+    i-th segment is ``k[indptr[i]:indptr[i+1]]``, the first element of :attr:`indptr` is always
+    0 and the last element of :attr:`indptr` is the total number of queries/keys in the batch.
+    Please see :ref:`Ragged Tensor tutorial <kv-layout>` for more details about the
+    ragged tensor.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where ``nnz`` is the last
+        element of ``indptr``.
+    k : torch.Tensor
+        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``, where ``nnz`` is the last
+        element of ``indptr``.
+    indptr : torch.Tensor
+        Indptr tensor, shape: ``(batch_size + 1)``.
+    offsets : torch.Tensor
+        The relative position offsets of each query in the batch, shape: ``(batch_size)``.
+    rotary_dim : Optional[int]
+        The dimensions to apply RoPE, if ``None``, we apply RoPE to the entire head dimension,
+        otherwise, we apply RoPE to the first ``rotary_dim`` dimensions, default: ``None``.
+    interleave : bool
+        Whether to use interleaved layout in the last dimension, default: ``False``.
+
+        * If ``True``, the last dimension of the query/key tensor is interleaved, i.e.,
+          we rotate the even dimensions ``([..., ::2])`` and odd dimensions ``([..., 1::2])``.
+
+        * If ``False``, the last dimension of the query/key tensor is not interleaved, i.e.,
+          we rotate the first half dimensions ``([..., :head_dim//2])`` and the second half
+          dimensions ``([..., head_dim//2:])``.
+
+    rope_scale : float
+        The scaling factor used in the rope embedding, default: ``8``.
+    rope_theta : float
+        The theta value used in the rope embedding, default: ``5e5``.
+    low_freq_factor : float
+        The low frequency factor used in Llama 3.1 RoPE, default: ``1``.
+    high_freq_factor : float
+        The high frequency factor used in Llama 3.1 RoPE, default: ``4``.
+    old_context_len : int
+        The old context length used in Llama 3.1 RoPE, default: ``8192``.
+    backend : Literal["cuda", "cute-dsl"]
+        Backend to use for the RoPE computation, default: ``"cuda"``.
+
+        * ``"cuda"``: Use the CUDA C++ backend (default).
+        * ``"cute-dsl"``: Use the CuTe-DSL backend (requires CuTe-DSL to be available).
+
+    See Also
+    --------
+    apply_llama31_rope
+    """
+    if rotary_dim is None:
+        rotary_dim = q.size(-1)
+
+    if backend == "cute-dsl":
+        if not _is_cute_dsl_available():
+            raise RuntimeError(
+                "CuTe-DSL backend is not available. Please install CuTe-DSL."
+            )
+        from .kernels import apply_llama31_rope_with_indptr_cute_dsl
+
+        # Write directly to input tensors (no copy needed)
+        apply_llama31_rope_with_indptr_cute_dsl(
+            q,
+            k,
+            indptr,
+            offsets,
+            rotary_dim=rotary_dim,
+            interleave=interleave,
+            rope_scale=rope_scale,
+            rope_theta=rope_theta,
+            low_freq_factor=low_freq_factor,
+            high_freq_factor=high_freq_factor,
+            old_context_len=old_context_len,
+            q_rope=q,  # Write directly to input
+            k_rope=k,  # Write directly to input
+        )
+        return
+
+    # Default: CUDA C++ backend
+    _apply_llama31_rope(
+        q,
+        k,
+        q,
+        k,
+        indptr,
+        offsets,
+        rotary_dim,
+        interleave,
+        rope_scale,
+        rope_theta,
+        low_freq_factor,
+        high_freq_factor,
+        float(old_context_len),
+    )
 
 
 @flashinfer_api
@@ -1063,36 +630,6 @@ def apply_llama31_rope(
     k_rope : torch.Tensor
         The rotated key tensor, shape: ``(nnz, num_k_heads, head_dim)``.
 
-    Examples
-    --------
-    >>> import torch
-    >>> import flashinfer
-    >>> batch_size = 128
-    >>> qkv_len = 1024
-    >>> num_qo_heads = 32
-    >>> num_kv_heads = 32
-    >>> head_dim = 128
-    >>> nnz = batch_size * qkv_len
-    >>> qkv_packed = torch.randn(
-    >>>    nnz,
-    >>>    (num_qo_heads + 2 * num_kv_heads) * head_dim,
-    >>>    dtype=torch.float16,
-    >>>    device="cuda:0",
-    >>> )
-    >>> q = qkv_packed[:, : num_qo_heads * head_dim].reshape(nnz, num_qo_heads, head_dim)
-    >>> k = qkv_packed[
-    ...    :, num_qo_heads * head_dim : (num_qo_heads + num_kv_heads) * head_dim
-    ... ].reshape(nnz, num_kv_heads, head_dim)
-    >>> indptr = torch.tensor(
-    ...    [i * qkv_len for i in range(batch_size + 1)], dtype=torch.int32, device="cuda:0"
-    >>> )
-    >>> offsets = torch.full((batch_size,), 10, dtype=torch.int32, device="cuda:0")
-    >>> q_rope, k_rope = flashinfer.apply_llama31_rope(q, k, indptr, offsets)
-    >>> q_rope.shape
-    torch.Size([131072, 32, 128])
-    >>> k_rope.shape
-    torch.Size([131072, 32, 128])
-
     See Also
     --------
     apply_llama31_rope_inplace
@@ -1103,11 +640,14 @@ def apply_llama31_rope(
         rotary_dim = q.size(-1)
 
     if backend == "cute-dsl":
+        # Note: CuTe-DSL backend has a ~500K token limit per call due to Int32 offset
+        # arithmetic (nnz * num_heads * head_dim must fit in Int32). This covers all
+        # realistic inference workloads (e.g., batch=256 decode, batch=8 prefill with 32K seq).
         if not _is_cute_dsl_available():
             raise RuntimeError(
                 "CuTe-DSL backend is not available. Please install CuTe-DSL."
             )
-        from .cute_dsl.rope import apply_llama31_rope_with_indptr_cute_dsl
+        from .kernels import apply_llama31_rope_with_indptr_cute_dsl
 
         return apply_llama31_rope_with_indptr_cute_dsl(
             q,
@@ -1140,6 +680,113 @@ def apply_llama31_rope(
         float(old_context_len),
     )
     return q_rope, k_rope
+
+
+# ============================================================================
+# Llama 3.1 style RoPE with position IDs
+# ============================================================================
+
+
+@flashinfer_api
+def apply_llama31_rope_pos_ids_inplace(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    pos_ids: torch.Tensor,
+    rotary_dim: Optional[int] = None,
+    interleave: bool = False,
+    rope_scale: float = 8,
+    rope_theta: float = 5e5,
+    low_freq_factor: float = 1,
+    high_freq_factor: float = 4,
+    old_context_len: int = 8192,
+    backend: Literal["cuda", "cute-dsl"] = "cuda",
+) -> None:
+    r"""Apply Llama 3.1 style rotary embedding to queries/keys using position IDs inplace.
+    cos/sin values are computed on the fly inside the kernel.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        Query tensor, shape: ``(nnz, num_q_heads, head_dim)``.
+    k : torch.Tensor
+        Key tensor, shape: ``(nnz, num_k_heads, head_dim)``.
+    pos_ids : torch.Tensor
+        Position indices, shape: ``(nnz)``.
+    rotary_dim : Optional[int]
+        The dimensions to apply RoPE, if ``None``, we apply RoPE to the entire head dimension,
+        otherwise, we apply RoPE to the first ``rotary_dim`` dimensions, default: ``None``.
+    interleave : bool
+        Whether to use interleaved layout in the last dimension, default: ``False``.
+
+        * If ``True``, the last dimension of the query/key tensor is interleaved, i.e.,
+          we rotate the even dimensions ``([..., ::2])`` and odd dimensions ``([..., 1::2])``.
+
+        * If ``False``, the last dimension of the query/key tensor is not interleaved, i.e.,
+          we rotate the first half dimensions ``([..., :head_dim//2])`` and the second half
+          dimensions ``([..., head_dim//2:])``.
+
+    rope_scale : float
+        The scaling factor used in the rope embedding, default: ``8``.
+    rope_theta : float
+        The theta value used in the rope embedding, default: ``5e5``.
+    low_freq_factor : float
+        The low frequency factor used in Llama 3.1 RoPE, default: ``1``.
+    high_freq_factor : float
+        The high frequency factor used in Llama 3.1 RoPE, default: ``4``.
+    old_context_len : int
+        The old context length used in Llama 3.1 RoPE, default: ``8192``.
+    backend : Literal["cuda", "cute-dsl"]
+        Backend to use for the RoPE computation, default: ``"cuda"``.
+
+        * ``"cuda"``: Use the CUDA C++ backend (default).
+        * ``"cute-dsl"``: Use the CuTe-DSL backend (requires CuTe-DSL to be available).
+
+    See Also
+    --------
+    apply_llama31_rope_pos_ids
+    """
+    if rotary_dim is None:
+        rotary_dim = q.size(-1)
+
+    if backend == "cute-dsl":
+        if not _is_cute_dsl_available():
+            raise RuntimeError(
+                "CuTe-DSL backend is not available. Please install CuTe-DSL."
+            )
+        from .kernels import apply_rope_cute_dsl
+
+        # Write directly to input tensors (no copy needed)
+        apply_rope_cute_dsl(
+            q,
+            k,
+            pos_ids,
+            rotary_dim=rotary_dim,
+            interleave=interleave,
+            rope_scale=rope_scale,
+            rope_theta=rope_theta,
+            low_freq_factor=low_freq_factor,
+            high_freq_factor=high_freq_factor,
+            old_context_len=old_context_len,
+            q_rope=q,  # Write directly to input
+            k_rope=k,  # Write directly to input
+        )
+        return
+
+    # Default: CUDA C++ backend
+    _apply_llama31_rope_pos_ids(
+        q,
+        k,
+        q,
+        k,
+        pos_ids,
+        rotary_dim,
+        interleave,
+        rope_scale,
+        rope_theta,
+        low_freq_factor,
+        high_freq_factor,
+        float(old_context_len),
+    )
 
 
 @flashinfer_api
@@ -1212,11 +859,14 @@ def apply_llama31_rope_pos_ids(
         rotary_dim = q.size(-1)
 
     if backend == "cute-dsl":
+        # Note: CuTe-DSL backend has a ~500K token limit per call due to Int32 offset
+        # arithmetic (nnz * num_heads * head_dim must fit in Int32). This covers all
+        # realistic inference workloads (e.g., batch=256 decode, batch=8 prefill with 32K seq).
         if not _is_cute_dsl_available():
             raise RuntimeError(
                 "CuTe-DSL backend is not available. Please install CuTe-DSL."
             )
-        from .cute_dsl.rope import apply_rope_cute_dsl
+        from .kernels import apply_rope_cute_dsl
 
         return apply_rope_cute_dsl(
             q,
@@ -1249,6 +899,11 @@ def apply_llama31_rope_pos_ids(
     return q_rope, k_rope
 
 
+# ============================================================================
+# RoPE with cos/sin cache
+# ============================================================================
+
+
 @flashinfer_api
 def apply_rope_with_cos_sin_cache(
     positions: torch.Tensor,
@@ -1257,6 +912,7 @@ def apply_rope_with_cos_sin_cache(
     head_size: int,
     cos_sin_cache: torch.Tensor,
     is_neox: bool = True,
+    backend: Literal["cuda", "cute-dsl"] = "cuda",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""
     Apply rotary embedding to keys and queries with precomputed cos/sin values.
@@ -1283,6 +939,12 @@ def apply_rope_with_cos_sin_cache(
         * If ``False``, the last dimension of the query/key tensor is interleaved, i.e.,
           we rotate the even dimensions ``([..., ::2])`` and odd dimensions ``([..., 1::2])``.
 
+    backend : Literal["cuda", "cute-dsl"]
+        Backend to use for the RoPE computation, default: ``"cuda"``.
+
+        * ``"cuda"``: Use the CUDA C++ backend (default).
+        * ``"cute-dsl"``: Use the CuTe-DSL backend (requires CuTe-DSL to be available).
+
     Returns
     -------
     query_out : torch.Tensor
@@ -1297,6 +959,25 @@ def apply_rope_with_cos_sin_cache(
     if cos_sin_cache.dtype != torch.float32:
         raise ValueError("cos_sin_cache should be float32")
 
+    if backend == "cute-dsl":
+        if not _is_cute_dsl_available():
+            raise RuntimeError(
+                "CuTe-DSL backend is not available. Please install CuTe-DSL."
+            )
+        from .kernels import apply_rope_with_cos_sin_cache_cute_dsl
+
+        # CuTe-DSL expects 3D tensors: (nnz, num_heads, head_dim)
+        # Input query is (nnz, num_qo_heads * head_dim), reshape to (nnz, num_qo_heads, head_dim)
+        query_out, key_out = apply_rope_with_cos_sin_cache_cute_dsl(
+            q=query.view(query.shape[0], -1, head_size),
+            k=key.view(key.shape[0], -1, head_size),
+            cos_sin_cache=cos_sin_cache,
+            pos_ids=positions.view(-1),  # Flatten positions to 1D
+            interleave=(not is_neox),
+        )
+        return query_out.view(query.shape), key_out.view(key.shape)
+
+    # Default: CUDA C++ backend
     query_out = torch.empty_like(query)
     key_out = torch.empty_like(key)
 
@@ -1321,6 +1002,7 @@ def apply_rope_with_cos_sin_cache_inplace(
     head_size: int,
     cos_sin_cache: torch.Tensor,
     is_neox: bool = True,
+    backend: Literal["cuda", "cute-dsl"] = "cuda",
 ) -> None:
     r"""
     Apply rotary embedding to keys and queries with precomputed cos/sin values.
@@ -1347,6 +1029,13 @@ def apply_rope_with_cos_sin_cache_inplace(
 
         * If ``False``, the last dimension of the query/key tensor is interleaved, i.e.,
           we rotate the even dimensions ``([..., ::2])`` and odd dimensions ``([..., 1::2])``.
+
+    backend : Literal["cuda", "cute-dsl"]
+        Backend to use for the RoPE computation, default: ``"cuda"``.
+
+        * ``"cuda"``: Use the CUDA C++ backend (default).
+        * ``"cute-dsl"``: Use the CuTe-DSL backend (requires CuTe-DSL to be available).
+
     Note
     ----
     The rotary dimension is determined by the cosine cache and sine cache.
@@ -1354,7 +1043,31 @@ def apply_rope_with_cos_sin_cache_inplace(
     if cos_sin_cache.dtype != torch.float32:
         raise ValueError("cos_sin_cache should be float32")
 
-    # pass q_rope and k_rope as q and k to perform inplace operation
+    if backend == "cute-dsl":
+        if not _is_cute_dsl_available():
+            raise RuntimeError(
+                "CuTe-DSL backend is not available. Please install CuTe-DSL."
+            )
+        from .kernels import apply_rope_with_cos_sin_cache_cute_dsl
+
+        # CuTe-DSL expects 3D tensors: (nnz, num_heads, head_dim)
+        # Input query is (nnz, num_qo_heads * head_dim), reshape to (nnz, num_qo_heads, head_dim)
+        q_view = query.view(query.shape[0], -1, head_size)
+        k_view = key.view(key.shape[0], -1, head_size)
+
+        # Write directly to input tensors (no copy needed)
+        apply_rope_with_cos_sin_cache_cute_dsl(
+            q=q_view,
+            k=k_view,
+            cos_sin_cache=cos_sin_cache,
+            pos_ids=positions.view(-1),  # Flatten positions to 1D
+            interleave=(not is_neox),
+            q_rope=q_view,  # Write directly to input
+            k_rope=k_view,  # Write directly to input
+        )
+        return
+
+    # Default: CUDA C++ backend - pass q_rope and k_rope as q and k for inplace
     _apply_rope_pos_ids_cos_sin_cache(
         q=query.view(query.shape[0], -1, head_size),
         k=key.view(key.shape[0], -1, head_size),
@@ -1364,6 +1077,11 @@ def apply_rope_with_cos_sin_cache_inplace(
         pos_ids=positions,
         interleave=(not is_neox),
     )
+
+
+# ============================================================================
+# RoPE + Quantize APIs
+# ============================================================================
 
 
 @flashinfer_api
@@ -1384,6 +1102,7 @@ def mla_rope_quantize_fp8(
     k_nope_out: Optional[torch.Tensor] = None,
     enable_pdl: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Alias for rope_quantize_fp8. See rope_quantize_fp8 for documentation."""
     return rope_quantize_fp8(
         q_rope,
         k_rope,
@@ -1640,15 +1359,6 @@ def rope_quantize_fp8_append_paged_kv_cache(
     Tuple[torch.Tensor, torch.Tensor]
         Quantized query tensors: (q_rope_out, q_nope_out).
         K/V are written directly to the paged cache and not returned.
-
-    Notes
-    -----
-    - Architecture detection: Automatically distinguishes MLA (2D K tensors) from GQA/MHA (3D K tensors).
-    - MLA writes K-RoPE to ``kpe_cache`` and K-noRoPE to ``ckv_cache``; V is not used.
-    - GQA/MHA writes full K (RoPE+noRoPE) to ``k_cache`` and V to ``v_cache``.
-    - The ``batch_indices`` and ``positions`` tensors are typically obtained from
-      ``flashinfer.get_batch_indices_positions()``.
-    - Cache tensors must already be allocated in the target FP8 dtype.
     """
     if cos_sin_cache.dtype != torch.float32:
         raise ValueError("cos_sin_cache should be float32")
@@ -1746,7 +1456,7 @@ def rope_quantize_fp8_append_paged_kv_cache(
         kpe_cache = torch.empty(0, dtype=quantize_dtype, device=q_rope.device)
 
     # Import TensorLayout enum
-    from .utils import TensorLayout
+    from ..utils import TensorLayout
 
     kv_layout_code = TensorLayout[kv_layout].value
 
