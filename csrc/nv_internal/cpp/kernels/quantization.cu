@@ -320,15 +320,19 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
   if constexpr (std::is_same_v<T, __nv_fp8_e4m3>) {
     // Use TMA kernel for large m (high throughput mode)
     // TODO: fix the issue when n is not a multiple of NUM_CONSUMER_WARPS * TMA_COL_TILE
-    constexpr int TMA_COL_CHUNK = 8 * 64;  // NUM_CONSUMER_WARPS * TMA_COL_TILE
-    if constexpr (SF_VEC_SIZE == 16) {
-      if (SF_VEC_SIZE == 16 && m >= 1024 && n % TMA_COL_CHUNK == 0) {
-        launchFP4QuantizationTma<BlockScaleQuantizationType::FP8_TO_FP4, T, SF_VEC_SIZE>(
-            b, m, n, input, SFScale, output, SFOuput, useUE8M0, layout, multiProcessorCount,
-            enable_pdl, stream);
-        return;
-      }
-    }
+    // TODO: @rainj-me , write the unittest to cover the random failure before enabling
+    // the tma path for fp4 quantization
+
+    // constexpr int TMA_COL_CHUNK = 8 * 64;  // NUM_CONSUMER_WARPS * TMA_COL_TILE
+    // if constexpr (SF_VEC_SIZE == 16) {
+    //   if (SF_VEC_SIZE == 16 && m >= 1024 && n % TMA_COL_CHUNK == 0) {
+    //     launchFP4QuantizationTma<BlockScaleQuantizationType::FP8_TO_FP4, T, SF_VEC_SIZE>(
+    //         b, m, n, input, SFScale, output, SFOuput, useUE8M0, layout, multiProcessorCount,
+    //         enable_pdl, stream);
+    //     return;
+    //   }
+    // }
+
     // Original non-TMA path for small m or SF_VEC_SIZE != 16
     // Grid, Block size.
     // Each thread converts 16 values.
@@ -352,15 +356,19 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
   {
     // Use TMA kernel for large m (high throughput mode)
     // TODO: fix the issue when n is not a multiple of NUM_CONSUMER_WARPS * TMA_COL_TILE
-    constexpr int TMA_COL_CHUNK = 8 * 64;  // NUM_CONSUMER_WARPS * TMA_COL_TILE
-    if constexpr (SF_VEC_SIZE == 16) {
-      if (SF_VEC_SIZE == 16 && m >= 1024 && n % TMA_COL_CHUNK == 0) {
-        launchFP4QuantizationTma<BlockScaleQuantizationType::FP16_TO_FP4, T, SF_VEC_SIZE>(
-            b, m, n, input, SFScale, output, SFOuput, useUE8M0, layout, multiProcessorCount,
-            enable_pdl, stream);
-        return;
-      }
-    }
+    // TODO: @rainj-me , write the unittest to cover the random failure before enabling
+    // the tma path for fp4 quantization
+
+    // constexpr int TMA_COL_CHUNK = 8 * 64;  // NUM_CONSUMER_WARPS * TMA_COL_TILE
+    // if constexpr (SF_VEC_SIZE == 16) {
+    //   if (SF_VEC_SIZE == 16 && m >= 1024 && n % TMA_COL_CHUNK == 0) {
+    //     launchFP4QuantizationTma<BlockScaleQuantizationType::FP16_TO_FP4, T, SF_VEC_SIZE>(
+    //         b, m, n, input, SFScale, output, SFOuput, useUE8M0, layout, multiProcessorCount,
+    //         enable_pdl, stream);
+    //     return;
+    //   }
+    // }
+
     // Original non-TMA path for small m or SF_VEC_SIZE != 16
     // Grid, Block size.
     // Each thread converts 8 values.
