@@ -1446,6 +1446,227 @@ def test_fp32_long_seq_pivot_rebuild_transform_regression_filtered(
     _assert_unordered_indices_match(output, ref_indices)
 
 
+def test_top_k_deterministic_bool_repeatability_smoke():
+    """deterministic=True should produce repeatable results."""
+    batch_size = 2
+    vocab_size = 8192
+    k = 256
+    device = "cuda"
+    logits = torch.randn(batch_size, vocab_size, device=device, dtype=torch.float32)
+
+    values_a, indices_a = flashinfer.top_k(logits, k, deterministic=True, sorted=False)
+    values_b, indices_b = flashinfer.top_k(logits, k, deterministic=True, sorted=False)
+    assert torch.equal(values_a, values_b)
+    assert torch.equal(indices_a, indices_b)
+
+
+def test_top_k_deterministic_repeatability():
+    """deterministic=True should be bitwise identical across repeated runs."""
+    batch_size = 4
+    vocab_size = 16384
+    k = 256
+    num_runs = 20
+    device = "cuda"
+
+    pattern = (torch.arange(vocab_size, device=device, dtype=torch.float32) % 32) / 32.0
+    logits = pattern.unsqueeze(0).repeat(batch_size, 1).contiguous()
+
+    ref_values, ref_indices = flashinfer.top_k(logits, k, deterministic=True, sorted=False)
+    for _ in range(num_runs - 1):
+        values, indices = flashinfer.top_k(logits, k, deterministic=True, sorted=False)
+        assert torch.equal(values, ref_values)
+        assert torch.equal(indices, ref_indices)
+
+
+def test_top_k_deterministic_repeatability_multi_cta(set_topk_algo):
+    """deterministic=True should remain repeatable when forcing Radix multi-CTA."""
+    set_topk_algo("multi_cta")
+
+    batch_size = 1
+    vocab_size = 131072
+    k = 1024
+    num_runs = 20
+    device = "cuda"
+
+    pattern = (torch.arange(vocab_size, device=device, dtype=torch.float32) % 64) / 64.0
+    logits = pattern.unsqueeze(0).repeat(batch_size, 1).to(torch.bfloat16).contiguous()
+
+    ref_values, ref_indices = flashinfer.top_k(logits, k, deterministic=True, sorted=False)
+    for _ in range(num_runs - 1):
+        values, indices = flashinfer.top_k(logits, k, deterministic=True, sorted=False)
+        assert torch.equal(values, ref_values)
+        assert torch.equal(indices, ref_indices)
+
+
+@pytest.mark.parametrize("pattern", ["tie_heavy", "pivot_tie"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_top_k_deterministic_repeatability_filtered_tie_cases(
+    pattern, dtype, set_topk_algo
+):
+    """Filtered deterministic top-k should be repeatable under tie pressure."""
+    if not can_implement_filtered_topk():
+        pytest.skip("Filtered top-k not supported on this device")
+
+    set_topk_algo("filtered")
+    batch_size = 4
+    vocab_size = 16384
+    k = 256
+    num_runs = 20
+    device = "cuda"
+
+    if pattern == "tie_heavy":
+        base = (torch.arange(vocab_size, device=device, dtype=torch.float32) % 32) / 32.0
+        logits = base.unsqueeze(0).repeat(batch_size, 1).to(dtype).contiguous()
+    else:  # pivot_tie
+        logits = torch.ones(batch_size, vocab_size, device=device, dtype=dtype)
+        gt_count = max(1, min(k // 4, vocab_size // 8))
+        logits[:, vocab_size - gt_count :] = 2.0
+
+    ref_values, ref_indices = flashinfer.top_k(logits, k, deterministic=True, sorted=False)
+    for _ in range(num_runs - 1):
+        values, indices = flashinfer.top_k(logits, k, deterministic=True, sorted=False)
+        assert torch.equal(values, ref_values)
+        assert torch.equal(indices, ref_indices)
+
+
+@pytest.mark.parametrize("transform_mode", ["page_table", "ragged"])
+def test_top_k_transform_deterministic_repeatability_filtered_tie_heavy(
+    transform_mode, set_topk_algo
+):
+    """Filtered deterministic transform APIs should be repeatable under tie-heavy input."""
+    if not can_implement_filtered_topk():
+        pytest.skip("Filtered top-k not supported on this device")
+
+    set_topk_algo("filtered")
+    num_rows = 4
+    max_len = 16384
+    k = 256
+    num_runs = 20
+    device = "cuda"
+
+    base = (torch.arange(max_len, device=device, dtype=torch.float32) % 32) / 32.0
+    scores = base.unsqueeze(0).repeat(num_rows, 1).to(torch.bfloat16).contiguous()
+
+    if transform_mode == "page_table":
+        src_page_table = (
+            torch.arange(max_len, device=device, dtype=torch.int32)
+            .unsqueeze(0)
+            .repeat(num_rows, 1)
+            .contiguous()
+        )
+        lengths = torch.full((num_rows,), max_len, device=device, dtype=torch.int32)
+        ref = flashinfer.top_k_page_table_transform(
+            scores, src_page_table, lengths, k, deterministic=True
+        )
+        for _ in range(num_runs - 1):
+            out = flashinfer.top_k_page_table_transform(
+                scores, src_page_table, lengths, k, deterministic=True
+            )
+            assert torch.equal(out, ref)
+    else:
+        offsets = torch.arange(
+            0, num_rows * max_len, max_len, device=device, dtype=torch.int32
+        )
+        lengths = torch.full((num_rows,), max_len, device=device, dtype=torch.int32)
+        ref = flashinfer.top_k_ragged_transform(
+            scores, offsets, lengths, k, deterministic=True
+        )
+        for _ in range(num_runs - 1):
+            out = flashinfer.top_k_ragged_transform(
+                scores, offsets, lengths, k, deterministic=True
+            )
+            assert torch.equal(out, ref)
+
+
+def test_top_k_invalid_deterministic_type():
+    with pytest.raises(TypeError):
+        flashinfer.top_k(
+            torch.randn(1, 128, device="cuda", dtype=torch.float32),
+            16,
+            deterministic="invalid",
+        )
+    with pytest.raises(TypeError):
+        flashinfer.top_k(
+            torch.randn(1, 128, device="cuda", dtype=torch.float32),
+            16,
+            deterministic=1,
+        )
+
+
+def test_top_k_deterministic_bitwise_repeatability():
+    """Deterministic top-k should be bitwise identical across repeated runs."""
+    batch_size = 8
+    vocab_size = 32768
+    k = 512
+    num_runs = 50
+    device = "cuda"
+
+    # Tie-heavy logits: repeated value buckets to stress tie handling.
+    pattern = (torch.arange(vocab_size, device=device, dtype=torch.float32) % 64) / 64.0
+    logits = pattern.unsqueeze(0).repeat(batch_size, 1).contiguous()
+
+    ref_values, ref_indices = flashinfer.top_k(
+        logits, k, deterministic=True, sorted=False
+    )
+    for _ in range(num_runs - 1):
+        values, indices = flashinfer.top_k(logits, k, deterministic=True, sorted=False)
+        assert torch.equal(values, ref_values)
+        assert torch.equal(indices, ref_indices)
+
+
+def test_top_k_page_table_transform_deterministic_repeatability():
+    """Deterministic page-table transform should be bitwise identical across runs."""
+    num_rows = 8
+    max_len = 8192
+    k = 512
+    num_runs = 30
+    device = "cuda"
+
+    pattern = (torch.arange(max_len, device=device, dtype=torch.float32) % 32) / 32.0
+    scores = pattern.unsqueeze(0).repeat(num_rows, 1).contiguous()
+    src_page_table = (
+        torch.arange(max_len, device=device, dtype=torch.int32)
+        .unsqueeze(0)
+        .repeat(num_rows, 1)
+        .contiguous()
+    )
+    lengths = torch.full((num_rows,), max_len, device=device, dtype=torch.int32)
+
+    ref = flashinfer.top_k_page_table_transform(
+        scores, src_page_table, lengths, k, deterministic=True
+    )
+    for _ in range(num_runs - 1):
+        out = flashinfer.top_k_page_table_transform(
+            scores, src_page_table, lengths, k, deterministic=True
+        )
+        assert torch.equal(out, ref)
+
+
+def test_top_k_ragged_transform_deterministic_repeatability():
+    """Deterministic ragged transform should be bitwise identical across runs."""
+    num_rows = 8
+    max_len = 8192
+    k = 512
+    num_runs = 30
+    device = "cuda"
+
+    pattern = (torch.arange(max_len, device=device, dtype=torch.float32) % 32) / 32.0
+    scores = pattern.unsqueeze(0).repeat(num_rows, 1).contiguous()
+    offsets = torch.arange(
+        0, num_rows * max_len, max_len, device=device, dtype=torch.int32
+    )
+    lengths = torch.full((num_rows,), max_len, device=device, dtype=torch.int32)
+
+    ref = flashinfer.top_k_ragged_transform(
+        scores, offsets, lengths, k, deterministic=True
+    )
+    for _ in range(num_runs - 1):
+        out = flashinfer.top_k_ragged_transform(
+            scores, offsets, lengths, k, deterministic=True
+        )
+        assert torch.equal(out, ref)
+
+
 if __name__ == "__main__":
     # Basic tests
     test_top_k(4, 32000, 256, torch.float32)
