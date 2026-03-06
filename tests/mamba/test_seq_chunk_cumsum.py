@@ -5,11 +5,12 @@ The kernel replaces the Python-side computation in _SSDKernel.run()
 ranges for varlen parallelization.
 """
 
-import pytest
 import torch
 
 
-def seq_chunk_cumsum_reference(seq_idx, chunk_indices, chunk_offsets, chunk_size, num_seqs):
+def seq_chunk_cumsum_reference(
+    seq_idx, chunk_indices, chunk_offsets, chunk_size, num_seqs
+):
     """Python reference: compute seq_chunk_cumsum from varlen metadata.
 
     Extracted from flashinfer/mamba/ssd_combined.py:391-402.
@@ -26,13 +27,9 @@ def seq_chunk_cumsum_reference(seq_idx, chunk_indices, chunk_offsets, chunk_size
             per-sequence chunk counts.  seq_chunk_cumsum[s] = number of logical
             chunks in sequences 0..s-1.
     """
-    seq_ids = seq_idx[
-        0, chunk_indices.long() * chunk_size + chunk_offsets.long()
-    ]
+    seq_ids = seq_idx[0, chunk_indices.long() * chunk_size + chunk_offsets.long()]
     counts = torch.zeros(num_seqs, dtype=torch.int32, device=seq_idx.device)
-    counts.scatter_add_(
-        0, seq_ids.int(), torch.ones_like(seq_ids, dtype=torch.int32)
-    )
+    counts.scatter_add_(0, seq_ids.int(), torch.ones_like(seq_ids, dtype=torch.int32))
     seq_chunk_cumsum = torch.zeros(
         num_seqs + 1, dtype=torch.int32, device=seq_idx.device
     )
@@ -72,14 +69,14 @@ def _make_variable_seqs(chunks_per_seq_list, chunk_size):
     pos = 0
     for s, n in enumerate(chunks_per_seq_list):
         length = n * chunk_size
-        seq_idx[0, pos:pos + length] = s
+        seq_idx[0, pos : pos + length] = s
         pos += length
 
     chunk_indices = []
     chunk_offsets = []
     phys = 0
-    for s, n in enumerate(chunks_per_seq_list):
-        for c in range(n):
+    for _s, n in enumerate(chunks_per_seq_list):
+        for _c in range(n):
             chunk_indices.append(phys)
             chunk_offsets.append(0)
             phys += 1
@@ -97,27 +94,41 @@ class TestSeqChunkCumsum:
     def _call_kernel(self, seq_idx, chunk_indices, chunk_offsets, chunk_size, num_seqs):
         """Call the CUDA kernel. Will fail until the kernel is implemented."""
         from flashinfer.mamba.ssd_combined import _get_seq_chunk_cumsum_module
+
         module = _get_seq_chunk_cumsum_module()
         num_logical_chunks = len(chunk_indices)
         output = torch.zeros(num_seqs + 1, dtype=torch.int32, device="cuda")
         module.seq_chunk_cumsum(
-            seq_idx, chunk_indices, chunk_offsets, output,
-            chunk_size, num_logical_chunks, num_seqs,
+            seq_idx,
+            chunk_indices,
+            chunk_offsets,
+            output,
+            chunk_size,
+            num_logical_chunks,
+            num_seqs,
         )
         return output
 
     def test_single_seq(self):
         """1 sequence, 4 chunks."""
         seq_idx, chunk_indices, chunk_offsets = _make_equal_seqs(1, 4, self.CHUNK_SIZE)
-        ref = seq_chunk_cumsum_reference(seq_idx, chunk_indices, chunk_offsets, self.CHUNK_SIZE, 1)
-        out = self._call_kernel(seq_idx, chunk_indices, chunk_offsets, self.CHUNK_SIZE, 1)
+        ref = seq_chunk_cumsum_reference(
+            seq_idx, chunk_indices, chunk_offsets, self.CHUNK_SIZE, 1
+        )
+        out = self._call_kernel(
+            seq_idx, chunk_indices, chunk_offsets, self.CHUNK_SIZE, 1
+        )
         torch.testing.assert_close(out, ref)
 
     def test_equal_seqs(self):
         """4 sequences, 8 chunks each."""
         seq_idx, chunk_indices, chunk_offsets = _make_equal_seqs(4, 8, self.CHUNK_SIZE)
-        ref = seq_chunk_cumsum_reference(seq_idx, chunk_indices, chunk_offsets, self.CHUNK_SIZE, 4)
-        out = self._call_kernel(seq_idx, chunk_indices, chunk_offsets, self.CHUNK_SIZE, 4)
+        ref = seq_chunk_cumsum_reference(
+            seq_idx, chunk_indices, chunk_offsets, self.CHUNK_SIZE, 4
+        )
+        out = self._call_kernel(
+            seq_idx, chunk_indices, chunk_offsets, self.CHUNK_SIZE, 4
+        )
         torch.testing.assert_close(out, ref)
 
     def test_variable_seqs(self):
@@ -126,27 +137,45 @@ class TestSeqChunkCumsum:
         seq_idx, chunk_indices, chunk_offsets, num_seqs = _make_variable_seqs(
             chunks_list, self.CHUNK_SIZE
         )
-        ref = seq_chunk_cumsum_reference(seq_idx, chunk_indices, chunk_offsets, self.CHUNK_SIZE, num_seqs)
-        out = self._call_kernel(seq_idx, chunk_indices, chunk_offsets, self.CHUNK_SIZE, num_seqs)
+        ref = seq_chunk_cumsum_reference(
+            seq_idx, chunk_indices, chunk_offsets, self.CHUNK_SIZE, num_seqs
+        )
+        out = self._call_kernel(
+            seq_idx, chunk_indices, chunk_offsets, self.CHUNK_SIZE, num_seqs
+        )
         torch.testing.assert_close(out, ref)
 
     def test_many_seqs(self):
         """128 sequences, 1 chunk each — stress-tests parallelism."""
-        seq_idx, chunk_indices, chunk_offsets = _make_equal_seqs(128, 1, self.CHUNK_SIZE)
-        ref = seq_chunk_cumsum_reference(seq_idx, chunk_indices, chunk_offsets, self.CHUNK_SIZE, 128)
-        out = self._call_kernel(seq_idx, chunk_indices, chunk_offsets, self.CHUNK_SIZE, 128)
+        seq_idx, chunk_indices, chunk_offsets = _make_equal_seqs(
+            128, 1, self.CHUNK_SIZE
+        )
+        ref = seq_chunk_cumsum_reference(
+            seq_idx, chunk_indices, chunk_offsets, self.CHUNK_SIZE, 128
+        )
+        out = self._call_kernel(
+            seq_idx, chunk_indices, chunk_offsets, self.CHUNK_SIZE, 128
+        )
         torch.testing.assert_close(out, ref)
 
     def test_single_chunk_per_seq(self):
         """Each sequence has exactly 1 chunk."""
         seq_idx, chunk_indices, chunk_offsets = _make_equal_seqs(32, 1, self.CHUNK_SIZE)
-        ref = seq_chunk_cumsum_reference(seq_idx, chunk_indices, chunk_offsets, self.CHUNK_SIZE, 32)
-        out = self._call_kernel(seq_idx, chunk_indices, chunk_offsets, self.CHUNK_SIZE, 32)
+        ref = seq_chunk_cumsum_reference(
+            seq_idx, chunk_indices, chunk_offsets, self.CHUNK_SIZE, 32
+        )
+        out = self._call_kernel(
+            seq_idx, chunk_indices, chunk_offsets, self.CHUNK_SIZE, 32
+        )
         torch.testing.assert_close(out, ref)
 
     def test_many_chunks_few_seqs(self):
         """2 sequences, 64 chunks each — large scan range."""
         seq_idx, chunk_indices, chunk_offsets = _make_equal_seqs(2, 64, self.CHUNK_SIZE)
-        ref = seq_chunk_cumsum_reference(seq_idx, chunk_indices, chunk_offsets, self.CHUNK_SIZE, 2)
-        out = self._call_kernel(seq_idx, chunk_indices, chunk_offsets, self.CHUNK_SIZE, 2)
+        ref = seq_chunk_cumsum_reference(
+            seq_idx, chunk_indices, chunk_offsets, self.CHUNK_SIZE, 2
+        )
+        out = self._call_kernel(
+            seq_idx, chunk_indices, chunk_offsets, self.CHUNK_SIZE, 2
+        )
         torch.testing.assert_close(out, ref)

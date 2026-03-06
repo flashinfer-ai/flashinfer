@@ -15,7 +15,6 @@ from .softplus import softplus
 PAD_SLOT_ID = -1
 
 
-
 @triton.jit
 def convert_rs_fp16x2(x: tl.tensor, rand: tl.tensor) -> tl.tensor:
     """Stochastic rounding: fp32 pair → fp16x2 using random bits (PTX cvt.rs.f16x2.f32)."""

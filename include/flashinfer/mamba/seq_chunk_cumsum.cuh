@@ -15,6 +15,7 @@
  */
 #pragma once
 #include <cuda_runtime.h>
+
 #include <cub/device/device_scan.cuh>
 
 namespace flashinfer {
@@ -88,8 +89,7 @@ template <typename SeqIdxT>
 __global__ void SeqChunkCumsumKernelMultiBlock(
     const SeqIdxT* __restrict__ seq_idx, const int32_t* __restrict__ chunk_indices,
     const int32_t* __restrict__ chunk_offsets, int32_t* __restrict__ output,
-    cub::ScanTileState<int32_t> tile_state, int chunk_size, int num_logical_chunks,
-    int num_seqs) {
+    cub::ScanTileState<int32_t> tile_state, int chunk_size, int num_logical_chunks, int num_seqs) {
   using ScanOp = SumOp;
   using TileState = cub::ScanTileState<int32_t>;
   using PrefixOp = cub::TilePrefixCallbackOp<int32_t, ScanOp, TileState>;
@@ -174,8 +174,7 @@ __global__ void InitTileStateKernel(ScanTileStateT tile_state, int num_tiles) {
  * \brief Host-side launcher.  Picks single-block or multi-block path.
  */
 template <typename SeqIdxT>
-inline cudaError_t SeqChunkCumsumLauncher(const SeqIdxT* seq_idx,
-                                          const int32_t* chunk_indices,
+inline cudaError_t SeqChunkCumsumLauncher(const SeqIdxT* seq_idx, const int32_t* chunk_indices,
                                           const int32_t* chunk_offsets, int32_t* output,
                                           int chunk_size, int num_logical_chunks, int num_seqs,
                                           cudaStream_t stream = nullptr) {

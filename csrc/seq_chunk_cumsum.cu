@@ -34,9 +34,8 @@ void seq_chunk_cumsum(TensorView seq_idx, TensorView chunk_indices, TensorView c
         static_cast<const SeqIdxT*>(seq_idx.data_ptr()),
         static_cast<const int32_t*>(chunk_indices.data_ptr()),
         static_cast<const int32_t*>(chunk_offsets.data_ptr()),
-        static_cast<int32_t*>(output.data_ptr()),
-        static_cast<int>(chunk_size), static_cast<int>(num_logical_chunks),
-        static_cast<int>(num_seqs), stream);
+        static_cast<int32_t*>(output.data_ptr()), static_cast<int>(chunk_size),
+        static_cast<int>(num_logical_chunks), static_cast<int>(num_seqs), stream);
     return true;
   });
 

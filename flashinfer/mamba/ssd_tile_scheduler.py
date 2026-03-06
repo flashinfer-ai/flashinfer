@@ -29,7 +29,6 @@
 from typing import Tuple
 
 from cutlass.cutlass_dsl import (
-    Boolean,
     Integer,
     Int32,
     min,
@@ -68,7 +67,9 @@ class Mamba2SSDTileSchedulerParams:
     def __new_from_mlir_values__(self, values):
         obj_list = []
         for obj, n_items in zip(
-            [self.problem_shape_ntiles, self.eh, self.ngroup_ratio], self._values_pos
+            [self.problem_shape_ntiles, self.eh, self.ngroup_ratio],
+            self._values_pos,
+            strict=False,
         ):
             obj_list.append(new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
