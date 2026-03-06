@@ -3447,8 +3447,8 @@ _NEMOTRON_H_RELU2_MXFP8_CASES = [
     )
     for num_tokens, hidden_size, intermediate_size, (num_experts, top_k) in product(
         [1, 16, 64, 256, 1000, 4000],
-        [2688, 4096],
-        [4096],
+        [2688],
+        [1856],
         [(128, 6), (256, 8), (512, 10)],
     )
 ] + [
@@ -3457,12 +3457,12 @@ _NEMOTRON_H_RELU2_MXFP8_CASES = [
         {
             "num_tokens": 128,
             "hidden_size": 2688,
-            "intermediate_size": 4096,
+            "intermediate_size": 1856,
             "num_experts": 128,
             "top_k": 6,
             "enable_autotune": True,
         },
-        id="NemoH_nt128_h2688_i4096_e128_k6_autotune_on",
+        id="NemoH_nt128_h2688_i1856_e128_k6_autotune_on",
     )
 ]
 
@@ -3491,6 +3491,40 @@ def test_mxfp8_block_scale_moe_relu2_nemotron_h_config(cache_permute_indices, ca
             "compatible_intermediate_size": [intermediate_size],
             "compatible_activation_types": [ActivationType.Relu2],
             "enable_autotune": case["enable_autotune"],
+        },
+        weight_processing={
+            "use_shuffled_weight": True,
+            "layout": WeightLayout.MajorK,
+            "compatible_moe_impls": [FP8BlockScaleMoe],
+        },
+        activation_type=ActivationType.Relu2,
+        cache_permute_indices=cache_permute_indices,
+    )
+
+
+def test_mxfp8_block_scale_moe_relu2_deepseekv3_topk22(cache_permute_indices):
+    """Targeted coverage for MXFP8 non-gated Relu2 with DeepSeekV3 routing top_k=22."""
+    run_moe_test(
+        num_tokens=128,
+        hidden_size=1024,
+        intermediate_size=512,
+        moe_impl=FP8BlockScaleMoe(
+            fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_MXFP8
+        ),
+        routing_config={
+            # top_k=22 is only supported when num_experts > NumKimiK2Experts (384)
+            "num_experts": 512,
+            "top_k": 22,
+            "padding": 8,
+            "n_groups": 1,
+            "top_k_groups": 1,
+            "routed_scaling": 2.5,
+            "has_routing_bias": True,
+            "routing_method_type": RoutingMethodType.DeepSeekV3,
+            "compatible_moe_impls": [FP8BlockScaleMoe],
+            "compatible_intermediate_size": [512],
+            "compatible_activation_types": [ActivationType.Relu2],
+            "enable_autotune": False,
         },
         weight_processing={
             "use_shuffled_weight": True,

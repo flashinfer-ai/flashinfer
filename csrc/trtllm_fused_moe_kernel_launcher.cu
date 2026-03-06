@@ -860,8 +860,10 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
       TVM_FFI_ICHECK(args->topk_group != 0) << "if n_group is given, topk_group must be given";
       TVM_FFI_ICHECK_EQ(args->num_experts % args->n_group, 0)
           << "num_experts must be divisible by n_group";
-      TVM_FFI_ICHECK(args->top_k <= 8 && args->top_k > 0)
-          << "Current routing kernel (with groups) only supports top_k<=8 && top_k>0.";
+      // DeepSeekV3 supports top_k up to 22
+      // (see MaxSupportedTopExperts in trtllm_fused_moe_routing_deepseek.cu)
+      TVM_FFI_ICHECK(args->top_k <= 22 && args->top_k > 0)
+          << "Current routing kernel (with groups) only supports top_k<=22 && top_k>0.";
       TVM_FFI_ICHECK(args->topk_group <= 4 && args->topk_group > 0)
           << "Current routing kernel only (with groups) supports topk_group<=4 && topk_group > 0.";
       TVM_FFI_ICHECK_LE(args->topk_group, args->n_group)
