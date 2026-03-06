@@ -219,6 +219,10 @@ def parse_mamba_args(line, parser):
             raise ValueError(
                 "--varlen requires --cache_steps >= 1 (specifies max_seqlen)"
             )
+    if args.cache_steps >= 1 and args.algorithm in ("vertical", "horizontal"):
+        raise ValueError(
+            f"MTP/varlen mode only supports 'auto' or 'simple' algorithm, got '{args.algorithm}'"
+        )
 
     if args.verbose >= 1:
         print(f"[INFO] {args = }")
