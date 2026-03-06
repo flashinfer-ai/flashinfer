@@ -59,6 +59,7 @@ from ..jit.gemm import gen_tgv_gemm_sm10x_module
 from ..jit.gemm import gen_deepgemm_sm100_module
 from ..jit.cpp_ext import get_cuda_version
 from ..jit.gemm import gen_fp8_blockscale_gemm_sm90_module
+from ..tllm_enums import DtypeTrtllmGen
 
 
 CUDNN_AVAILABLE = False
@@ -764,14 +765,6 @@ def get_gemm_sm120_module_cutlass_fp8():
     return SimpleNamespace(
         cutlass_fp8_gemm_runner=cutlass_fp8_gemm_runner,
     )
-
-
-@functools.cache
-def get_trtllm_gemm_module():
-    mod = gen_trtllm_gen_gemm_module()
-    op = mod.build_and_load()
-    setup_cubin_loader(mod.get_library_path())
-    return op
 
 
 @functools.cache
@@ -2513,6 +2506,7 @@ def _check_mm_mxfp8_problem_size(
     b_descale: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
+    use_8x4_sf_layout: bool = True,
     backend: Literal["cutlass", "auto"] = "auto",  # unused
 ) -> bool:
     # Generic checks
@@ -2627,8 +2621,30 @@ def _cutlass_gemm_mxfp8_requirement(
     b_descale: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
+    use_8x4_sf_layout: bool = True,
     backend: Literal["cutlass", "auto"] = "auto",
 ):
+    return True
+
+
+@supported_compute_capability([100, 103])
+def _trtllm_gemm_mxfp8_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    use_8x4_sf_layout: bool = True,
+    backend: Literal["trtllm", "auto"] = "auto",
+):
+    if out_dtype != torch.bfloat16:
+        return False
+    if a.ndim != 2 or b.ndim != 2: # currently don't support BlockMajorK layout
+        return False
+    k, n = b.shape
+    if k % 256 != 0:
+        return False
     return True
 
 
@@ -2640,8 +2656,10 @@ def _heuristic_func_mm_mxfp8(
     b_descale: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cutlass", "auto"] = "auto",
+    use_8x4_sf_layout: bool = True,
+    backend: Literal["cutlass", "trtllm", "auto"] = "auto",
 ) -> List[str]:
+    # don't select trtllm since it requires weight shuffling
     if "cutlass" in suitable_backends:
         return ["cutlass"]
     return []
@@ -2650,6 +2668,7 @@ def _heuristic_func_mm_mxfp8(
 @backend_requirement(
     {
         "cutlass": _cutlass_gemm_mxfp8_requirement,
+        "trtllm": _trtllm_gemm_mxfp8_requirement,
     },
     common_check=_check_mm_mxfp8_problem_size,
     heuristic_func=_heuristic_func_mm_mxfp8,  # result stored in mm_mxfp8.suitable_auto_backends
@@ -2662,7 +2681,8 @@ def mm_mxfp8(
     b_descale: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cutlass", "auto"] = "auto",
+    use_8x4_sf_layout: bool = True,
+    backend: Literal["cutlass", "trtllm", "auto"] = "auto",
 ) -> torch.Tensor:
     r"""MM MXFP8 (block size 32)
 
@@ -2773,6 +2793,9 @@ def mm_mxfp8(
         "cutlass": lambda: get_cutlass_mxfp8_gemm_module(
             major
         ).cutlass_mxfp8_gemm_runner(),
+        "trtllm": lambda: get_trtllm_gemm_module().trtllm_mxfp8_gemm_runner(
+            use_8x4_sf_layout
+        ),
     }
 
     runners: List[TunableRunner] = [
@@ -3870,7 +3893,7 @@ def mm_fp4(
 
     backend_to_runner_factory = {
         "cudnn": lambda: _cudnn_gemm_fp4_runner(),
-        "trtllm": lambda: get_trtllm_fp4_gemm_module().trtllm_fp4_gemm_runner(
+        "trtllm": lambda: get_trtllm_gemm_module().trtllm_fp4_gemm_runner(
             use_8x4_sf_layout
         ),
         "cutlass": lambda: get_cutlass_fp4_gemm_module(
@@ -4301,6 +4324,8 @@ def gemm_fp8_nt_groupwise(
     elif backend == "trtllm":
         # mma_sm is ignored
         get_trtllm_gemm_module().trtllm_gemm(
+            DtypeTrtllmGen.E4m3,
+            DtypeTrtllmGen.Bfloat16,
             workspace_buffer,
             a,
             b,
@@ -4316,87 +4341,160 @@ def gemm_fp8_nt_groupwise(
 
 
 @functools.cache
-def get_trtllm_fp4_gemm_module():
+def get_trtllm_gemm_module():
     mod = gen_trtllm_gen_gemm_module()
     op = mod.build_and_load()
     setup_cubin_loader(mod.get_library_path())
 
-    def trtllm_fp4_gemm_runner(use_8x4_sf_layout: bool = True):
-        class TrtllmFp4GemmRunner(TunableRunner):
-            def __init__(self, use_8x4_sf_layout: bool = True):
-                self._fp4_gemm_runner = op.trtllm_gemm
-                self._use_8x4_sf_layout = use_8x4_sf_layout
+    class TrtllmGemmRunner(TunableRunner):
+        def __init__(
+            self,
+            input_dtype: DtypeTrtllmGen,
+            output_dtype: DtypeTrtllmGen,
+            use_8x4_sf_layout: bool = True,
+        ):
+            self._gemm_runner = op.trtllm_gemm
+            self._use_8x4_sf_layout = use_8x4_sf_layout
+            self._input_dtype = input_dtype
+            self._output_dtype = output_dtype
 
-            def get_valid_tactics(
-                self,
-                inputs: List[torch.Tensor],
-                profile: OptimizationProfile,
-            ) -> List[int]:
-                a_tensor_index = 1
-                b_tensor_index = 2
+        def unpack_inputs(
+            self,
+            inputs: List[torch.Tensor],
+        ) -> Tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+        ]:
+            (
+                a,
+                b,
+                a_descale,
+                b_descale,
+                alpha,
+                _,
+                out,
+                _,
+                _,
+                workspace_buffer,
+            ) = inputs
+            return a, b, a_descale, b_descale, alpha, out, workspace_buffer
 
-                a = profile.get_opt_shapes()[a_tensor_index]
-                b = profile.get_opt_shapes()[b_tensor_index]
-                m = a[0]
-                n = b[0]
-                k = a[1] * 2
-                (
-                    a,
-                    b,
-                    a_descale,
-                    b_descale,
-                    alpha,
-                    _,
-                    out,
-                    _,
-                    _,
-                    workspace_buffer,
-                ) = inputs
-                type_e2m1 = 0
-                type_bf16 = 2
-                return list(
-                    op.trtllm_gemm_tactics(
-                        m, n, k, type_e2m1, type_bf16, self._use_8x4_sf_layout
-                    )
-                )
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> List[int]:
+            a_tensor_index = 1
+            b_tensor_index = 2
 
-            def forward(
-                self,
-                inputs: List[torch.Tensor],
-                tactic: int = -1,
-                do_preparation: bool = False,
-                **kwargs,
-            ):
-                (
-                    a,
-                    b,
-                    a_descale,
-                    b_descale,
-                    alpha,
-                    _,
-                    out,
-                    _,
-                    _,
-                    workspace_buffer,
-                ) = inputs
-                self._fp4_gemm_runner(
-                    workspace_buffer,
-                    a,
-                    b.T,
-                    a_descale,
-                    b_descale.T,
-                    alpha,
-                    out,
+            a = profile.get_opt_shapes()[a_tensor_index]
+            b = profile.get_opt_shapes()[b_tensor_index]
+            m = a[0]
+            n = b[0]
+            k = a[1] * 2
+            (
+                a,
+                b,
+                a_descale,
+                b_descale,
+                alpha,
+                out,
+                workspace_buffer,
+            ) = self.unpack_inputs(inputs)
+            return list(
+                op.trtllm_gemm_tactics(
+                    m,
+                    n,
+                    k,
+                    self._input_dtype,
+                    self._output_dtype,
                     self._use_8x4_sf_layout,
-                    tactic,
                 )
-                return out
+            )
 
-        return TrtllmFp4GemmRunner(use_8x4_sf_layout)
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic: int = -1,
+            do_preparation: bool = False,
+            **kwargs,
+        ):
+            a, b, a_descale, b_descale, alpha, out, workspace_buffer = (
+                self.unpack_inputs(inputs)
+            )
+            self._gemm_runner(
+                self._input_dtype,
+                self._output_dtype,
+                workspace_buffer,
+                a,
+                b.T,
+                a_descale,
+                b_descale.T,
+                alpha,
+                out,
+                self._use_8x4_sf_layout,
+                tactic,
+            )
+            return out
+
+    def trtllm_gemm_runner(
+        input_dtype: DtypeTrtllmGen,
+        output_dtype: DtypeTrtllmGen,
+        use_8x4_sf_layout: bool = True,
+    ):
+        return TrtllmGemmRunner(input_dtype, output_dtype, use_8x4_sf_layout)
+
+    def trtllm_fp4_gemm_runner(
+        use_8x4_sf_layout: bool = True,
+    ):
+        return TrtllmGemmRunner(
+            DtypeTrtllmGen.E2m1, DtypeTrtllmGen.Bfloat16, use_8x4_sf_layout
+        )
+
+    def trtllm_mxfp8_gemm_runner(
+        use_8x4_sf_layout: bool = True,
+    ):
+        # monkey patch to align with cutlass runner's input format
+        class TrtllmMxFp8GemmRunner(TrtllmGemmRunner):
+            def unpack_inputs(
+                self,
+                inputs: List[torch.Tensor],
+            ) -> Tuple[
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+            ]:
+                (
+                    a,
+                    b,
+                    a_descale,
+                    b_descale,
+                    out_dtype,
+                    out,
+                    workspace_buffer,
+                ) = inputs
+                assert out_dtype == torch.bfloat16
+                return a, b, a_descale, b_descale, None, out, workspace_buffer
+
+        return TrtllmMxFp8GemmRunner(
+            DtypeTrtllmGen.MxE4m3, DtypeTrtllmGen.Bfloat16, use_8x4_sf_layout
+        )
 
     # Register the module
     return SimpleNamespace(
+        trtllm_gemm_runner=trtllm_gemm_runner,
         trtllm_fp4_gemm_runner=trtllm_fp4_gemm_runner,
+        trtllm_mxfp8_gemm_runner=trtllm_mxfp8_gemm_runner,
+        trtllm_gemm=op.trtllm_gemm,
     )
 
 

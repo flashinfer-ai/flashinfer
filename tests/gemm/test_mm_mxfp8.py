@@ -2,7 +2,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from flashinfer import autotune, mm_mxfp8
+from flashinfer import autotune, mm_mxfp8, shuffle_matrix_a, shuffle_matrix_sf_a
 from flashinfer.fp8_quantization import mxfp8_quantize
 from flashinfer.utils import get_compute_capability
 
@@ -77,13 +77,21 @@ def _run_mm_mxfp8(
     provide_out,
 ):
     _skip_if_unsupported(backend)
+    if backend == "trtllm":
+        if is_sf_swizzled_layout:
+            pytest.skip("trtllm does not support swizzled scales")
+        if k % 256 != 0:
+            pytest.skip("trtllm does not support non-multiple of 256")
+        if out_dtype != torch.bfloat16:
+            pytest.skip("trtllm does not support non-bfloat16 output")
 
     input = torch.randn([m, k], device="cuda", dtype=input_dtype)
     mat2 = torch.randn([n, k], device="cuda", dtype=input_dtype)
 
     input_mxfp8, mat2_mxfp8, input_descale, mat2_descale = _prepare_mxfp8_tensors(
-        input, mat2, is_sf_swizzled_layout
+        input, mat2, is_sf_swizzled_layout, backend
     )
+
     reference = torch.mm(input, mat2.T)
 
     res = torch.empty([m, n], device="cuda", dtype=out_dtype) if provide_out else None
@@ -107,15 +115,9 @@ def _run_mm_mxfp8(
     _assert_cosine_similarity(reference, res, is_sf_swizzled_layout)
 
 
-def _prepare_descales(input_scale, weight_scale, m, n, k, is_sf_swizzled_layout):
-    if is_sf_swizzled_layout:
-        return input_scale, weight_scale
-    input_descale = input_scale.view(m, k // 32)
-    weight_descale = weight_scale.view(n, k // 32).t()
-    return input_descale, weight_descale
-
-
-def _prepare_mxfp8_tensors(input_bf16, weight_bf16, is_sf_swizzled_layout):
+def _prepare_mxfp8_tensors(
+    input_bf16, weight_bf16, is_sf_swizzled_layout, backend="cutlass"
+):
     m, k = input_bf16.shape
     n = weight_bf16.shape[0]
     input_mxfp8, input_scale = mxfp8_quantize(
@@ -124,10 +126,17 @@ def _prepare_mxfp8_tensors(input_bf16, weight_bf16, is_sf_swizzled_layout):
     weight_mxfp8, weight_scale = mxfp8_quantize(
         weight_bf16, is_sf_swizzled_layout=is_sf_swizzled_layout
     )
-    input_descale, weight_descale = _prepare_descales(
-        input_scale, weight_scale, m, n, k, is_sf_swizzled_layout
-    )
-    return input_mxfp8, weight_mxfp8, input_descale, weight_descale
+    if backend == "trtllm":
+        weight_mxfp8 = shuffle_matrix_a(weight_mxfp8, 128).reshape(n, k)
+        weight_scale = shuffle_matrix_sf_a(
+            weight_scale.reshape(n, k // 32),
+            128,
+            num_elts_per_sf=32,
+        ).reshape(-1)
+    if not is_sf_swizzled_layout:
+        input_scale = input_scale.view(m, k // 32)
+        weight_scale = weight_scale.view(n, k // 32).t()
+    return input_mxfp8, weight_mxfp8, input_scale, weight_scale
 
 
 @pytest.mark.parametrize("m", [128, 256, 512, 1024])
@@ -136,7 +145,7 @@ def _prepare_mxfp8_tensors(input_bf16, weight_bf16, is_sf_swizzled_layout):
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("backend", ["cutlass"])
+@pytest.mark.parametrize("backend", ["cutlass", "trtllm"])
 @pytest.mark.parametrize("auto_tuning", [True, False])
 def test_mm_mxfp8(
     m, n, k, input_dtype, is_sf_swizzled_layout, out_dtype, backend, auto_tuning
@@ -160,7 +169,7 @@ def test_mm_mxfp8(
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16])
-@pytest.mark.parametrize("backend", ["cutlass", "auto"])
+@pytest.mark.parametrize("backend", ["cutlass", "trtllm", "auto"])
 def test_mm_mxfp8_large_dimensions(
     m, n, k, input_dtype, is_sf_swizzled_layout, out_dtype, backend
 ):
