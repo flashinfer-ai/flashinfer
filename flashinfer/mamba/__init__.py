@@ -18,9 +18,10 @@ from .selective_state_update import selective_state_update
 
 __all__ = ["selective_state_update"]
 
-try:
+import torch
+from ..utils import is_sm100a_supported
+
+if is_sm100a_supported(torch.device("cuda")):
     from .ssd_combined import SSDCombined
 
     __all__.append("SSDCombined")
-except ImportError:
-    pass

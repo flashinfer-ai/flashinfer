@@ -36,11 +36,10 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from packaging.version import Version
 
 # setmaxregister_decrease/increase were introduced in cutlass-dsl 4.4.0,
 # replacing the deprecated warpgroup_reg_dealloc/alloc.
-if Version(cutlass.__version__) < Version("4.4.0"):
+if not hasattr(cute.arch, "setmaxregister_decrease"):
     cute.arch.setmaxregister_decrease = cute.arch.warpgroup_reg_dealloc
     cute.arch.setmaxregister_increase = cute.arch.warpgroup_reg_alloc
 
