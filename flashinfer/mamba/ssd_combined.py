@@ -319,6 +319,15 @@ class SSDCombined:
         has_z: bool = False,
         seq_idx_dtype=torch.int64,
     ):
+        from ..utils import get_compute_capability
+
+        major, minor = get_compute_capability(torch.device("cuda"))
+        if major < 10:
+            raise ValueError(
+                f"SSDCombined requires SM100+ (Blackwell or newer). "
+                f"Got SM{major}{minor}."
+            )
+
         self.chunk_size = chunk_size
         self.nheads = nheads
         self.headdim = headdim

@@ -9,8 +9,7 @@ import numpy as np
 import pytest
 import torch
 
-# Import FlashInfer SSD combined API
-from flashinfer.mamba import SSDCombined
+import flashinfer.mamba as mamba
 
 # Import Triton reference for comparison
 from .triton_reference.ssd_combined import (
@@ -50,7 +49,7 @@ def ssd_combined_fwd(
     state_dtype = initial_states.dtype if initial_states is not None else x.dtype
     # This constructor is very heavy, so don't you dare use this ssd_combined_fwd wrapper in
     # prod. Do create an SSDCombined instance once and call run() on it multiple times instead.
-    ssd = SSDCombined(
+    ssd = mamba.SSDCombined(
         chunk_size=chunk_size,
         nheads=nheads,
         headdim=headdim,
@@ -505,7 +504,7 @@ class TestChunkScanCombinedDHasHdim1D(TestChunkScanCombined):
 
         # Construct SSDCombined with d_has_hdim=True explicitly,
         # even though D is 1D. This exercises the broadcast path.
-        ssd = SSDCombined(
+        ssd = mamba.SSDCombined(
             chunk_size=inputs["chunk_size"],
             nheads=inputs["nheads"],
             headdim=inputs["headdim"],
@@ -796,7 +795,6 @@ class TestChunkScanCombinedWithInitialStates(TestChunkScanCombined):
 
         return out, final_states
 
-    # @pytest.mark.xfail(reason="initial_states not yet implemented in ssd_combined_fwd")
     def test_output_correctness(self, inputs, reference_output):
         """Test with initial states."""
         out_ref, final_states_ref = reference_output
@@ -858,9 +856,6 @@ class TestChunkScanCombinedVarlen:
 
     Chunk-aligned sequences: all sequence lengths are multiples of chunk_size,
     so no physical chunk is shared by two sequences.
-
-    Non-chunk-aligned sequences (mid-chunk boundaries) are tested separately
-    and marked xfail until step 4.2 (chunk_size_limit) is implemented.
     """
 
     ATOL = 7e-2
@@ -1123,12 +1118,7 @@ class TestChunkScanCombinedVarlen:
 
 
 class TestChunkScanCombinedVarlenNonAligned:
-    """Test CuTe DSL kernel with non-chunk-aligned variable-length sequences.
-
-    Sequences don't align to chunk boundaries, so a physical chunk may
-    contain data from two sequences. Requires step 4.2 (chunk_size_limit
-    masking) — see CHUNK_SCAN_FEATURE_PLAN.md.
-    """
+    """Test CuTe DSL kernel with non-chunk-aligned variable-length sequences."""
 
     ATOL = 7e-2
     RTOL = 7e-2
@@ -1197,20 +1187,6 @@ class TestChunkScanCombinedVarlenNonAligned:
         states_match = torch.allclose(
             fs_ref_cmp, final_states_test, atol=self.ATOL, rtol=self.RTOL
         )
-        # Always print per-seq final states summary
-        # fs_diff_all = (fs_ref_cmp - final_states_test).abs()
-        # for seq_i in range(final_states_test.shape[0]):
-        #     fs_mm_i = ~torch.isclose(
-        #         fs_ref_cmp[seq_i],
-        #         final_states_test[seq_i],
-        #         atol=self.ATOL,
-        #         rtol=self.RTOL,
-        #     )
-        #     fs_n_i = fs_mm_i.sum().item()
-        #     fs_tot_i = fs_mm_i.numel()
-        #     print(
-        #         f"Final states seq {seq_i}: {fs_n_i}/{fs_tot_i} ({100 * fs_n_i / fs_tot_i:.2f}%) mismatch, max_diff={fs_diff_all[seq_i].max():.6f}"
-        #     )
         if not states_match:
             fs_diff = (fs_ref_cmp - final_states_test).abs()
             fs_mm = ~torch.isclose(
