@@ -92,7 +92,6 @@ class TestSeqChunkCumsum:
     CHUNK_SIZE = 128
 
     def _call_kernel(self, seq_idx, chunk_indices, chunk_offsets, chunk_size, num_seqs):
-        """Call the CUDA kernel. Will fail until the kernel is implemented."""
         from flashinfer.mamba.ssd_combined import _get_seq_chunk_cumsum_module
 
         module = _get_seq_chunk_cumsum_module()
