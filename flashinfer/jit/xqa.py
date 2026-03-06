@@ -144,15 +144,21 @@ def gen_xqa_module_mla(
 ) -> JitSpec:
     assert head_group_ratio == 128, "Only head group ratio 128 is supported for xqa MLA"
     assert head_dim == 576, "Only head dim 576 is supported for xqa_module_mla"
-    assert input_dtype == torch.float8_e4m3fn, (
-        "Only fp8 input is supported for xqa_module_mla"
+    assert input_dtype in (torch.float8_e4m3fn, torch.bfloat16), (
+        f"Only fp8 and bf16 input are supported for xqa_module_mla, got {input_dtype}"
     )
-    assert kv_cache_dtype == torch.float8_e4m3fn, (
-        "Only fp8 kv cache is supported for xqa_module_mla"
+    assert kv_cache_dtype in (torch.float8_e4m3fn, torch.bfloat16), (
+        f"Only fp8 and bf16 kv cache are supported for xqa_module_mla, got {kv_cache_dtype}"
+    )
+    assert input_dtype == kv_cache_dtype, (
+        f"input_dtype ({input_dtype}) and kv_cache_dtype ({kv_cache_dtype}) must match for xqa MLA"
     )
     assert not use_sliding_window, "Sliding window is not supported for xqa_module_mla"
 
-    flag_kv_cache_dtype = ["-DCACHE_ELEM_ENUM=2"]
+    if input_dtype == torch.float8_e4m3fn:
+        flag_kv_cache_dtype = ["-DCACHE_ELEM_ENUM=2"]
+    else:
+        flag_kv_cache_dtype = ["-DCACHE_ELEM_ENUM=0", "-DMLA_BF16=1"]
 
     if page_size not in [16, 32, 64, 128]:
         raise ValueError(

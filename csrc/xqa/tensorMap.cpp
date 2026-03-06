@@ -96,7 +96,9 @@ CUtensorMap makeTensorMapForPagedKVCache(void const* addr, CUtensorMapDataType_e
       case 64:
         return CU_TENSOR_MAP_SWIZZLE_64B;
       default:
-        throw std::runtime_error("unsupported cache head size");
+        throw std::runtime_error("unsupported cache partition size: " + std::to_string(partBytes) +
+                                 " bytes (partElems=" + std::to_string(partElems) +
+                                 ", elemBytes=" + std::to_string(elemBytes) + ")");
     }
   }();
 
