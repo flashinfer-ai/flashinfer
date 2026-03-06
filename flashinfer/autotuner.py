@@ -770,12 +770,11 @@ class AutoTuner:
         base_profile = list(list(shape) for shape in shapes)
 
         for spec in tuning_config.dynamic_tensor_specs:
-            mapped_val = spec.map_to_tuning_buckets(
-                base_profile[spec.input_idx[0]][spec.dim_idx[0]]
+            base_profile[spec.input_idx[0]][spec.dim_idx[0]] = (
+                spec.map_to_tuning_buckets(
+                    base_profile[spec.input_idx[0]][spec.dim_idx[0]]
+                )
             )
-            # Apply the same mapped bucket to all linked dimensions in this spec.
-            for input_i, dim_i in zip(spec.input_idx, spec.dim_idx, strict=True):
-                base_profile[input_i][dim_i] = mapped_val
 
         # associated dimensions dependent on other free dynamic dimensions, so assign -1 in the profile
         for constraint_spec in tuning_config.constraint_specs:
