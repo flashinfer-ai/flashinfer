@@ -1136,35 +1136,47 @@ def gated_delta_rule_decode_pretranspose(
         # Always use 8-CTA architecture (benchmarks show it's better for all batch sizes)
         run_func = run_gdn_decode_kernel_small_batch_pretranspose
 
-        # Use TVM FFI to reduce runtime overhead
-        compiled = cute.compile(
-            run_func,
-            h0_source_tensor,
-            A_log_tensor,
-            a_tensor,
-            dt_bias_tensor,
-            q_tensor,
-            k_tensor,
-            v_tensor,
-            b_tensor,
-            o_tensor,
-            h0_indices_tensor,
-            cu_seqlens_tensor,
-            softplus_beta=1.0,
-            softplus_threshold=20.0,
-            scale=scale,
-            HV=HV,
-            B=B,
-            T=T,
-            H=H,
-            K=K,
-            V=V,
-            use_initial_state=True,
-            use_qk_l2norm=use_qk_l2norm,
-            is_varlen=False,
-            stream=stream,
-            options="--enable-tvm-ffi",
+        # Use TVM FFI to reduce runtime overhead, with AOT caching
+        from flashinfer.jit.cute_dsl_aot import compile_and_cache_cute_dsl_kernel
+
+        dtype_str = str(q.dtype).split(".")[-1]
+        aot_func_name = (
+            f"gdn_decode_pretranspose_{dtype_str}"
+            f"_B{B}_T{T}_H{H}_HV{HV}_K{K}_V{V}"
+            f"_{'l2' if use_qk_l2norm else 'nol2'}"
         )
+
+        def _do_compile():
+            return cute.compile(
+                run_func,
+                h0_source_tensor,
+                A_log_tensor,
+                a_tensor,
+                dt_bias_tensor,
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                b_tensor,
+                o_tensor,
+                h0_indices_tensor,
+                cu_seqlens_tensor,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+                scale=scale,
+                HV=HV,
+                B=B,
+                T=T,
+                H=H,
+                K=K,
+                V=V,
+                use_initial_state=True,
+                use_qk_l2norm=use_qk_l2norm,
+                is_varlen=False,
+                stream=stream,
+                options="--enable-tvm-ffi",
+            )
+
+        compiled = compile_and_cache_cute_dsl_kernel(_do_compile, aot_func_name)
         cache["compiled"] = compiled
     else:
         compiled = cache["compiled"]
@@ -1958,34 +1970,46 @@ def gated_delta_rule_decode(
         h0_indices_tensor = from_dlpack(h0_indices, assumed_align=16)
         cu_seqlens_tensor = from_dlpack(cu_seqlens, assumed_align=16)
 
-        # Use TVM FFI to reduce runtime overhead
-        compiled = cute.compile(
-            run_func,
-            cu_seqlens_tensor,
-            q_tensor,
-            k_tensor,
-            v_tensor,
-            a_tensor,
-            b_tensor,
-            A_log_tensor,
-            dt_bias_tensor,
-            h0_source_tensor,
-            h0_indices_tensor,
-            o_tensor,
-            softplus_beta=1.0,
-            softplus_threshold=20.0,
-            scale=scale,
-            B=B,
-            T=T,
-            H=H,
-            HV=HV,
-            K=K,
-            V=V,
-            use_initial_state=True,
-            use_qk_l2norm=use_qk_l2norm,
-            stream=stream,
-            options="--enable-tvm-ffi",
+        # Use TVM FFI to reduce runtime overhead, with AOT caching
+        from flashinfer.jit.cute_dsl_aot import compile_and_cache_cute_dsl_kernel
+
+        dtype_str = str(q.dtype).split(".")[-1]
+        aot_func_name = (
+            f"gdn_decode_nontranspose_{dtype_str}"
+            f"_B{B}_T{T}_H{H}_HV{HV}_K{K}_V{V}"
+            f"_{'l2' if use_qk_l2norm else 'nol2'}"
         )
+
+        def _do_compile():
+            return cute.compile(
+                run_func,
+                cu_seqlens_tensor,
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                a_tensor,
+                b_tensor,
+                A_log_tensor,
+                dt_bias_tensor,
+                h0_source_tensor,
+                h0_indices_tensor,
+                o_tensor,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+                scale=scale,
+                B=B,
+                T=T,
+                H=H,
+                HV=HV,
+                K=K,
+                V=V,
+                use_initial_state=True,
+                use_qk_l2norm=use_qk_l2norm,
+                stream=stream,
+                options="--enable-tvm-ffi",
+            )
+
+        compiled = compile_and_cache_cute_dsl_kernel(_do_compile, aot_func_name)
         cache["compiled"] = compiled
     else:
         compiled = cache["compiled"]
@@ -2584,40 +2608,55 @@ def gated_delta_rule_mtp(
         h0_indices_tensor = from_dlpack(initial_state_indices, assumed_align=16)
         cu_seqlens_tensor = from_dlpack(cu_seqlens, assumed_align=16)
 
-        # Use TVM FFI to reduce runtime overhead
-        compiled = cute.compile(
-            run_gdn_verify_kernel_mtp,
-            h0_source_tensor,
-            intermediate_states_tensor,
-            A_log_tensor,
-            a_tensor,
-            dt_bias_tensor,
-            q_tensor,
-            k_tensor,
-            v_tensor,
-            b_tensor,
-            o_tensor,
-            h0_indices_tensor,
-            cu_seqlens_tensor,
-            softplus_beta=1.0,
-            softplus_threshold=20.0,
-            scale=scale,
-            HV=HV,
-            B=B,
-            T=T,
-            H=H,
-            K=K,
-            V=V,
-            tile_v=tile_v,
-            vec_size=vec_size,
-            use_initial_state=True,
-            use_qk_l2norm=use_qk_l2norm,
-            is_varlen=False,
-            disable_state_update=disable_state_update,
-            cache_intermediate_states=cache_intermediate_states,
-            stream=stream,
-            options="--enable-tvm-ffi",
+        # Use TVM FFI to reduce runtime overhead, with AOT caching
+        from flashinfer.jit.cute_dsl_aot import compile_and_cache_cute_dsl_kernel
+
+        dtype_str = str(q.dtype).split(".")[-1]
+        aot_func_name = (
+            f"gdn_mtp_{dtype_str}"
+            f"_B{B}_T{T}_H{H}_HV{HV}_K{K}_V{V}"
+            f"_tv{tile_v}_vs{vec_size}"
+            f"_{'l2' if use_qk_l2norm else 'nol2'}"
+            f"_{'nosu' if disable_state_update else 'su'}"
+            f"_{'cis' if cache_intermediate_states else 'nocis'}"
         )
+
+        def _do_compile():
+            return cute.compile(
+                run_gdn_verify_kernel_mtp,
+                h0_source_tensor,
+                intermediate_states_tensor,
+                A_log_tensor,
+                a_tensor,
+                dt_bias_tensor,
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                b_tensor,
+                o_tensor,
+                h0_indices_tensor,
+                cu_seqlens_tensor,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+                scale=scale,
+                HV=HV,
+                B=B,
+                T=T,
+                H=H,
+                K=K,
+                V=V,
+                tile_v=tile_v,
+                vec_size=vec_size,
+                use_initial_state=True,
+                use_qk_l2norm=use_qk_l2norm,
+                is_varlen=False,
+                disable_state_update=disable_state_update,
+                cache_intermediate_states=cache_intermediate_states,
+                stream=stream,
+                options="--enable-tvm-ffi",
+            )
+
+        compiled = compile_and_cache_cute_dsl_kernel(_do_compile, aot_func_name)
         cache["compiled"] = compiled
     else:
         compiled = cache["compiled"]

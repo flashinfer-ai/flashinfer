@@ -2029,24 +2029,33 @@ def gated_delta_rule(
         else:  # T == 4
             launch_fn = gated_delta_rule_launch_seqlen4
 
-        _compiled_kernels[cache_key] = cute.compile(
-            launch_fn,
-            q_,
-            k_,
-            v_,
-            a_,
-            b_,
-            A_log_,
-            dt_bias_,
-            h_,
-            h_slot_indices_,
-            o_,
-            scale_f32,
-            softplus_beta_f32,
-            softplus_threshold_f32,
-            eps_f32,
-            stream,
-            options="--enable-tvm-ffi --generate-line-info",
+        from flashinfer.jit.cute_dsl_aot import compile_and_cache_cute_dsl_kernel
+
+        aot_func_name = f"gdn_bf16state_T{T}_B{B}_H{H}_HV{HV}_K{K}_V{V}_ps{pool_size}"
+
+        def _do_compile():
+            return cute.compile(
+                launch_fn,
+                q_,
+                k_,
+                v_,
+                a_,
+                b_,
+                A_log_,
+                dt_bias_,
+                h_,
+                h_slot_indices_,
+                o_,
+                scale_f32,
+                softplus_beta_f32,
+                softplus_threshold_f32,
+                eps_f32,
+                stream,
+                options="--enable-tvm-ffi --generate-line-info",
+            )
+
+        _compiled_kernels[cache_key] = compile_and_cache_cute_dsl_kernel(
+            _do_compile, aot_func_name
         )
 
     # Execute
