@@ -115,7 +115,7 @@ def _chunk_cumsum_fwd_kernel(
     dA_cs_ptrs = dA_cumsum_ptr + (
         offs_h[:, None] * stride_dA_cs_head + offs_c[None, :] * stride_dA_cs_csize
     )
-    chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
+    chunk_size_limit = tl.minimum(chunk_size, seqlen - pid_c * chunk_size)
 
     dt = tl.load(
         dt_ptrs,
