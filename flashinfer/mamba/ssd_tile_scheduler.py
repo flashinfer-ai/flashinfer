@@ -194,7 +194,7 @@ class Mamba2SSDTileScheduler:
         self._current_work_linear_idx += Int32(advance_count) * Int32(
             self.num_persistent_ctas
         )
-        self._num_tiles_executed += Int32(1)
+        self._num_tiles_executed += Int32(advance_count)
 
     @property
     def num_tiles_executed(self) -> Int32:
