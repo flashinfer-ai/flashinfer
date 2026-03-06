@@ -74,13 +74,17 @@ inline void validate_dt_bias_tensor(Optional<TensorView> const& dt_bias, int64_t
 }
 
 inline void validate_state_batch_indices(Optional<TensorView> const& state_batch_indices,
-                                         int64_t batch) {
+                                         int64_t batch, int64_t max_seqlen = 1) {
   if (!state_batch_indices.has_value()) return;
   auto const& sbi = state_batch_indices.value();
   FLASHINFER_CHECK(sbi.dim() == 1 || sbi.dim() == 2, "state_batch_indices must be 1D or 2D, got ",
                    sbi.dim(), "D");
   FLASHINFER_CHECK(sbi.size(0) >= batch, "state_batch_indices.size(0) must be >= batch (", batch,
                    ")");
+  if (sbi.dim() == 2) {
+    FLASHINFER_CHECK(sbi.size(1) >= max_seqlen,
+                     "state_batch_indices.size(1) must be >= max_seqlen (", max_seqlen, ")");
+  }
 }
 
 inline void validate_intermediate_state_indices(
@@ -240,6 +244,13 @@ void run_selective_state_update_stp(TensorView const& state, TensorView const& x
   // Validate dtype consistency
   validate_dtype_consistency(state, dt, D, x, B, C, dt_bias, z, out);
   validate_state_scale(state_scale, state_cache_size, nheads, dim);
+  if (state_batch_indices.has_value() && dst_state_batch_indices.has_value()) {
+    DLDataType state_batch_idx_dtype = state_batch_indices.value().dtype();
+    DLDataType dst_state_batch_idx_dtype = dst_state_batch_indices.value().dtype();
+    FLASHINFER_CHECK(state_batch_idx_dtype.code == dst_state_batch_idx_dtype.code &&
+                         state_batch_idx_dtype.bits == dst_state_batch_idx_dtype.bits,
+                     "state_batch_indices and dst_state_batch_indices must have the same dtype");
+  }
 
   // Initialize params struct
   SelectiveStateUpdateParams p;
@@ -367,6 +378,7 @@ void run_selective_state_update_mtp(
 
   auto const ngroups = is_varlen ? B.size(1) : B.size(2);
 
+  FLASHINFER_CHECK(state_cache_size >= batch, "state.size(0) must be >= batch");
   FLASHINFER_CHECK(nheads % ngroups == 0, "nheads must be divisible by ngroups");
 
   // Check dt shape and strides
@@ -390,8 +402,8 @@ void run_selective_state_update_mtp(
   validate_D_tensor(D, nheads, dim);
   validate_A_tensor(A, nheads, dim, dstate);
   validate_dt_bias_tensor(dt_bias, nheads, dim);
-  validate_state_batch_indices(state_batch_indices, batch);
-  validate_state_batch_indices(dst_state_batch_indices, batch);
+  validate_state_batch_indices(state_batch_indices, batch, ntokens_mtp);
+  validate_state_batch_indices(dst_state_batch_indices, batch, ntokens_mtp);
 
   // Check B shape and strides
   CHECK_CUDA(B);
@@ -465,13 +477,20 @@ void run_selective_state_update_mtp(
   validate_intermediate_states_buffer(intermediate_states_buffer);
   validate_state_scale(state_scale, state_cache_size, nheads, dim);
 
-  // Validate that state_batch_indices and intermediate_state_indices have the same dtype
+  // Validate that index tensors have consistent dtypes
   if (state_batch_indices.has_value() && intermediate_state_indices.has_value()) {
     DLDataType state_batch_idx_dtype = state_batch_indices.value().dtype();
     DLDataType intermediate_idx_dtype = intermediate_state_indices.value().dtype();
     FLASHINFER_CHECK(state_batch_idx_dtype.code == intermediate_idx_dtype.code &&
                          state_batch_idx_dtype.bits == intermediate_idx_dtype.bits,
                      "state_batch_indices and intermediate_state_indices must have the same dtype");
+  }
+  if (state_batch_indices.has_value() && dst_state_batch_indices.has_value()) {
+    DLDataType state_batch_idx_dtype = state_batch_indices.value().dtype();
+    DLDataType dst_state_batch_idx_dtype = dst_state_batch_indices.value().dtype();
+    FLASHINFER_CHECK(state_batch_idx_dtype.code == dst_state_batch_idx_dtype.code &&
+                         state_batch_idx_dtype.bits == dst_state_batch_idx_dtype.bits,
+                     "state_batch_indices and dst_state_batch_indices must have the same dtype");
   }
 
   // Validate cache_steps is non-negative
@@ -546,6 +565,8 @@ void run_selective_state_update_mtp(
     CHECK_CONTIGUOUS(cs);
     FLASHINFER_CHECK(cs.dtype().code == kDLInt && cs.dtype().bits == 32,
                      "cu_seqlens must be int32");
+    FLASHINFER_CHECK(cs.size(0) == batch + 1, "cu_seqlens.size(0) must equal n_sequences + 1 (",
+                     batch + 1, ")");
     p.cu_seqlens = const_cast<void*>(cs.data_ptr());
   }
   if (num_accepted_tokens.has_value()) {
@@ -555,8 +576,14 @@ void run_selective_state_update_mtp(
     CHECK_CONTIGUOUS(nat);
     FLASHINFER_CHECK(nat.dtype().code == kDLInt && nat.dtype().bits == 32,
                      "num_accepted_tokens must be int32");
+    FLASHINFER_CHECK(nat.size(0) >= batch, "num_accepted_tokens.size(0) must be >= n_sequences (",
+                     batch, ")");
+    FLASHINFER_CHECK(state_batch_indices.has_value(),
+                     "state_batch_indices is required when num_accepted_tokens is provided");
     p.num_accepted_tokens = const_cast<void*>(nat.data_ptr());
   }
+  FLASHINFER_CHECK(!(dst_state_batch_indices.has_value() && intermediate_states_buffer.has_value()),
+                   "dst_state_batch_indices and intermediate_states_buffer are mutually exclusive");
   if (state_scale.has_value()) {
     p.state_scale = state_scale.value().data_ptr();
     p.state_scale_stride_batch = state_scale.value().stride(0);
