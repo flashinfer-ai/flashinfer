@@ -31,7 +31,7 @@ struct SharedStorageSimple {
       std::conditional_t<scaleState, state_scale_t, char> state_scale[STATE_ROWS];
 };
 
-// Grid: (batch, nheads, cdiv(DIM, ROWS_PER_BLOCK))
+// Grid: (batch_or_n_sequences, nheads, cdiv(DIM, ROWS_PER_BLOCK))
 // When ROWS_PER_BLOCK == DIM, degenerates to the non-tiled case (blockIdx.z == 0 always).
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t,
           typename stateIndex_t, typename state_scale_t, int TOKENS_MTP, int DIM, int DSTATE,
@@ -54,17 +54,41 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
       reinterpret_cast<stateIndex_t const*>(params.state_batch_indices);
   auto const* __restrict__ intermediate_state_indices =
       reinterpret_cast<stateIndex_t const*>(params.intermediate_state_indices);
+  auto const* __restrict__ cu_seqlens = reinterpret_cast<int32_t const*>(params.cu_seqlens);
+  auto const* __restrict__ num_accepted_tokens =
+      reinterpret_cast<int32_t const*>(params.num_accepted_tokens);
+  auto const* __restrict__ dst_state_batch_indices =
+      reinterpret_cast<stateIndex_t const*>(params.dst_state_batch_indices);
   bool const dt_softplus = params.dt_softplus;
 
   int const nheads = params.nheads;
   int const ngroups = params.ngroups;
 
-  auto const batch = blockIdx.x;
+  auto const seq_idx = blockIdx.x;
   auto const head = blockIdx.y;
   auto const dim_offset = blockIdx.z * ROWS_PER_BLOCK;
   auto const group = head / (nheads / ngroups);
   auto lane = threadIdx.x % warpSize;
   auto warp = threadIdx.y;
+
+  int bos;
+  int seq_len;
+  bool const has_cu_seqlens = (cu_seqlens != nullptr);
+  if (has_cu_seqlens) {
+    bos = __ldg(&cu_seqlens[seq_idx]);
+    int eos = __ldg(&cu_seqlens[seq_idx + 1]);
+    seq_len = eos - bos;
+    if (seq_len <= 0) return;
+  } else {
+    bos = 0;
+    seq_len = TOKENS_MTP;
+  }
+
+  int init_token_idx = 0;
+  if (num_accepted_tokens) {
+    int num_accepted = __ldg(&num_accepted_tokens[seq_idx]);
+    init_token_idx = max(num_accepted - 1, 0);
+  }
 
   // State scale pointer (only used when scaleState == true)
   [[maybe_unused]] auto* __restrict__ state_scale =
@@ -73,14 +97,46 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
   // Load device-side Philox seed once into a register
   [[maybe_unused]] int64_t const rand_seed = params.rand_seed ? *params.rand_seed : 0;
 
-  auto const state_batch = (state_batch_indices) ? state_batch_indices[batch] : batch;
+  int64_t state_batch;
+  if (state_batch_indices) {
+    state_batch = static_cast<int64_t>(
+        state_batch_indices[seq_idx * params.state_batch_indices_stride_batch +
+                            init_token_idx * params.state_batch_indices_stride_T]);
+  } else {
+    state_batch = static_cast<int64_t>(seq_idx);
+  }
   auto const intermediate_cache_idx =
-      intermediate_state_indices ? intermediate_state_indices[batch] : state_batch;
+      intermediate_state_indices ? intermediate_state_indices[seq_idx] : state_batch;
   auto const state_ptr_offset = state_batch * params.state_stride_batch + head * DIM * DSTATE;
   state += state_ptr_offset;
   if constexpr (scaleState) {
     state_scale += state_batch * params.state_scale_stride_batch + head * DIM;
   }
+
+  int64_t const x_base = has_cu_seqlens ? (int64_t)bos * params.x_stride_batch
+                                        : (int64_t)seq_idx * params.x_stride_batch;
+  int64_t const x_tstride = has_cu_seqlens ? params.x_stride_batch : params.x_stride_mtp;
+
+  int64_t const dt_base = has_cu_seqlens ? (int64_t)bos * params.dt_stride_batch
+                                         : (int64_t)seq_idx * params.dt_stride_batch;
+  int64_t const dt_tstride = has_cu_seqlens ? params.dt_stride_batch : params.dt_stride_mtp;
+
+  int64_t const B_base = has_cu_seqlens ? (int64_t)bos * params.B_stride_batch
+                                        : (int64_t)seq_idx * params.B_stride_batch;
+  int64_t const B_tstride = has_cu_seqlens ? params.B_stride_batch : params.B_stride_mtp;
+
+  int64_t const C_base = has_cu_seqlens ? (int64_t)bos * params.C_stride_batch
+                                        : (int64_t)seq_idx * params.C_stride_batch;
+  int64_t const C_tstride = has_cu_seqlens ? params.C_stride_batch : params.C_stride_mtp;
+
+  int64_t const out_base = has_cu_seqlens ? (int64_t)bos * params.out_stride_batch
+                                          : (int64_t)seq_idx * params.out_stride_batch;
+  int64_t const out_tstride = has_cu_seqlens ? params.out_stride_batch : params.out_stride_mtp;
+
+  int64_t const z_base = z ? (has_cu_seqlens ? (int64_t)bos * params.z_stride_batch
+                                             : (int64_t)seq_idx * params.z_stride_batch)
+                           : 0;
+  int64_t const z_tstride = z ? (has_cu_seqlens ? params.z_stride_batch : params.z_stride_mtp) : 0;
 
   constexpr auto stateRowsPerWarpPerStage = 4;
   constexpr auto stageRows = stateRowsPerWarpPerStage * numWarps;
@@ -105,9 +161,12 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
            d += warpSize * load_input_t::count) {
         if (dim_offset + d < DIM) {
           auto* dst = reinterpret_cast<load_input_t*>(&sram.x[mtp_step][d]);
-          *dst = *reinterpret_cast<load_input_t const*>(
-              &x[batch * params.x_stride_batch + mtp_step * params.x_stride_mtp + head * DIM +
-                 dim_offset + d]);
+          if (mtp_step < seq_len) {
+            *dst = *reinterpret_cast<load_input_t const*>(
+                &x[x_base + mtp_step * x_tstride + head * DIM + dim_offset + d]);
+          } else {
+            *dst = make_zeros<load_input_t>();
+          }
         }
       }
     }
@@ -115,9 +174,12 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
     for (int mtp_step = 0; mtp_step < TOKENS_MTP; mtp_step++) {
       for (auto i = lane * load_input_t::count; i < DSTATE; i += warpSize * load_input_t::count) {
         auto* dst = reinterpret_cast<load_input_t*>(&sram.B[mtp_step][i]);
-        *dst = *reinterpret_cast<load_input_t const*>(
-            &B[batch * params.B_stride_batch + mtp_step * params.B_stride_mtp + group * DSTATE +
-               i]);
+        if (mtp_step < seq_len) {
+          *dst = *reinterpret_cast<load_input_t const*>(
+              &B[B_base + mtp_step * B_tstride + group * DSTATE + i]);
+        } else {
+          *dst = make_zeros<load_input_t>();
+        }
       }
     }
   } else if (warp == 2) {  // Load z: gmem -> smem
@@ -126,10 +188,12 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
            d += warpSize * load_input_t::count) {
         if (dim_offset + d < DIM) {
           auto* dst = reinterpret_cast<load_input_t*>(&sram.z[mtp_step][d]);
-          *dst = z ? *reinterpret_cast<load_input_t const*>(
-                         &z[batch * params.z_stride_batch + mtp_step * params.z_stride_mtp +
-                            head * DIM + dim_offset + d])
-                   : make_zeros<load_input_t>();
+          if (z && mtp_step < seq_len) {
+            *dst = *reinterpret_cast<load_input_t const*>(
+                &z[z_base + mtp_step * z_tstride + head * DIM + dim_offset + d]);
+          } else {
+            *dst = make_zeros<load_input_t>();
+          }
         }
       }
     }
@@ -139,25 +203,33 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
     for (int mtp_step = 0; mtp_step < TOKENS_MTP; mtp_step++) {
       for (auto i = lane * load_input_t::count; i < DSTATE; i += warpSize * load_input_t::count) {
         auto* dst = reinterpret_cast<load_input_t*>(&sram.C[mtp_step][i]);
-        *dst = *reinterpret_cast<load_input_t const*>(
-            &C[batch * params.C_stride_batch + mtp_step * params.C_stride_mtp + group * DSTATE +
-               i]);
+        if (mtp_step < seq_len) {
+          *dst = *reinterpret_cast<load_input_t const*>(
+              &C[C_base + mtp_step * C_tstride + group * DSTATE + i]);
+        } else {
+          *dst = make_zeros<load_input_t>();
+        }
       }
     }
   }
 
   float rdt[TOKENS_MTP];
   for (int step = 0; step < TOKENS_MTP; step++) {
-    auto dt_value =
-        dt_bias_value +
-        toFloat(dt[batch * params.dt_stride_batch + step * params.dt_stride_mtp + head]);
-    if (dt_softplus) {
-      dt_value = thresholded_softplus(dt_value);
+    if (step < seq_len) {
+      auto dt_value = dt_bias_value + toFloat(dt[dt_base + step * dt_tstride + head]);
+      if (dt_softplus) {
+        dt_value = thresholded_softplus(dt_value);
+      }
+      rdt[step] = dt_value;
+    } else {
+      rdt[step] = 0.f;
     }
-    rdt[step] = dt_value;
   }
 
   __syncthreads();
+
+  bool const has_dst_indices = (dst_state_batch_indices != nullptr);
+  bool const has_intermediate = (intermediate_states != nullptr);
 
   for (auto dBegin = 0; dBegin < ROWS_PER_BLOCK; dBegin += stageRows) {
     // Load state gmem -> smem
@@ -222,6 +294,8 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
       }
 
       for (int step = 0; step < TOKENS_MTP; step++) {
+        if (step >= seq_len) break;
+
         float x_value = toFloat(sram.x[step][d - dim_offset]);
         float out_value = d_value * x_value * int(lane == 0);  // first lane has the value
 
@@ -254,7 +328,7 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
           // Store intermediate state to smem (non-scaleState path)
           if constexpr (!scaleState) {
             if constexpr (sizeof(state_t) == sizeof(input_t)) {
-              if (intermediate_states) {
+              if (has_intermediate || has_dst_indices) {
                 using packed_state_t = PackedAligned<state_t, packed_input_t::count>;
                 packed_state_t rStateOut;
                 // Philox-4x32 produces 4 random ints per call; amortize across packed elements.
@@ -277,7 +351,7 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
                 *reinterpret_cast<packed_state_t*>(&sram.state[dd][base_i]) = rStateOut;
               }
             } else {
-              if (intermediate_states) {
+              if (has_intermediate || has_dst_indices) {
                 // Philox-4x32 produces 4 random ints per call; amortize across packed elements.
                 [[maybe_unused]] uint32_t rand_ints[4];
 #pragma unroll
@@ -298,9 +372,9 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
           }
         }
 
-        // For scaleState + intermediate_states: quantize rState → sram.state with block scaling
+        // For scaleState + per-step writes: quantize rState → sram.state with block scaling
         if constexpr (scaleState) {
-          if (intermediate_states && state_batch != params.pad_slot_id) {
+          if ((has_intermediate || has_dst_indices) && state_batch != params.pad_slot_id) {
             // 2-pass: compute max, then encode
             float istate_max = std::numeric_limits<float>::lowest();
             for (int ii = 0; ii < stateValuesPerThread; ii++) {
@@ -333,35 +407,58 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
           sram.out[step][d - dim_offset] = out_value;
         }
 
-        if (intermediate_states && state_batch != params.pad_slot_id) {
-          // Write intermediate state smem → gmem
-          for (int i = lane * load_state_t::count; i < DSTATE;
-               i += warpSize * load_state_t::count) {
-            auto* src = reinterpret_cast<load_state_t*>(&sram.state[dd][i]);
-            auto* dst = reinterpret_cast<load_state_t*>(
-                &intermediate_states[intermediate_cache_idx *
-                                         params.intermediate_state_stride_batch +
-                                     step * nheads * DIM * DSTATE + head * DIM * DSTATE +
-                                     d * DSTATE + i]);
-            *dst = *src;
-          }
-          // Write intermediate state decode scale → gmem
-          if constexpr (scaleState) {
-            if (lane == 0) {
-              auto* iscales = reinterpret_cast<float*>(params.intermediate_state_scales);
-              iscales[intermediate_cache_idx * params.intermediate_state_scales_stride_batch +
-                      step * nheads * DIM + head * DIM + d] = sram.state_scale[dd];
+        if (state_batch != params.pad_slot_id) {
+          if (has_dst_indices) {
+            auto dst_idx = static_cast<int64_t>(
+                dst_state_batch_indices[seq_idx * params.dst_state_batch_indices_stride_batch +
+                                        step * params.dst_state_batch_indices_stride_T]);
+            if (dst_idx != params.pad_slot_id) {
+              auto* dst_state_ptr = reinterpret_cast<state_t*>(params.state);
+              for (int i = lane * load_state_t::count; i < DSTATE;
+                   i += warpSize * load_state_t::count) {
+                auto* src = reinterpret_cast<load_state_t*>(&sram.state[dd][i]);
+                *reinterpret_cast<load_state_t*>(
+                    &dst_state_ptr[dst_idx * params.state_stride_batch + head * DIM * DSTATE +
+                                   d * DSTATE + i]) = *src;
+              }
+              if constexpr (scaleState) {
+                if (lane == 0) {
+                  auto* dst_scale = reinterpret_cast<state_scale_t*>(params.state_scale);
+                  dst_scale[dst_idx * params.state_scale_stride_batch + head * DIM + d] =
+                      sram.state_scale[dd];
+                }
+              }
+            }
+          } else if (has_intermediate) {
+            // Write intermediate state smem → gmem
+            for (int i = lane * load_state_t::count; i < DSTATE;
+                 i += warpSize * load_state_t::count) {
+              auto* src = reinterpret_cast<load_state_t*>(&sram.state[dd][i]);
+              auto* dst = reinterpret_cast<load_state_t*>(
+                  &intermediate_states[intermediate_cache_idx *
+                                           params.intermediate_state_stride_batch +
+                                       step * nheads * DIM * DSTATE + head * DIM * DSTATE +
+                                       d * DSTATE + i]);
+              *dst = *src;
+            }
+            // Write intermediate state decode scale → gmem
+            if constexpr (scaleState) {
+              if (lane == 0) {
+                auto* iscales = reinterpret_cast<float*>(params.intermediate_state_scales);
+                iscales[intermediate_cache_idx * params.intermediate_state_scales_stride_batch +
+                        step * nheads * DIM + head * DIM + d] = sram.state_scale[dd];
+              }
             }
           }
         }
       }
 
       // Update state if enabled and not padded
-      if (params.update_state && state_batch != params.pad_slot_id) {
+      if (params.update_state && state_batch != params.pad_slot_id && !has_dst_indices) {
         // When intermediate_states is enabled, sram.state[dd] already holds the
         // stochastically-rounded (or scaled) state from the last token step's intermediate write.
         // Skip the redundant Philox PRNG / re-quantization and write directly to gmem.
-        if (!intermediate_states) {
+        if (!has_intermediate) {
           if constexpr (scaleState) {
             // 2-pass quantization: compute max, then re-encode
             float new_state_max = std::numeric_limits<float>::lowest();
@@ -417,7 +514,7 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
     }
     // Store state_scale smem -> gmem (contiguous across warpRows)
     if constexpr (scaleState) {
-      if (params.update_state && state_batch != params.pad_slot_id) {
+      if (params.update_state && state_batch != params.pad_slot_id && !has_dst_indices) {
         for (int warpRow = lane; warpRow < stateRowsPerWarpPerStage; warpRow += warpSize) {
           auto dd = warp * stateRowsPerWarpPerStage + warpRow;
           auto d = dim_offset + dBegin + dd;
@@ -432,6 +529,7 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
   __syncthreads();
 
   for (auto step = warp; step < TOKENS_MTP; step += numWarps) {
+    if (step >= seq_len) continue;
     for (auto d = lane; d < ROWS_PER_BLOCK; d += warpSize) {
       if (dim_offset + d < DIM) {
         auto out_value = sram.out[step][d];
@@ -442,8 +540,7 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
           out_value *= silu_z;
         }
         auto* dst = reinterpret_cast<input_t*>(
-            &output[batch * params.out_stride_batch + step * params.out_stride_mtp + head * DIM +
-                    dim_offset + d]);
+            &output[out_base + step * out_tstride + head * DIM + dim_offset + d]);
         convertAndStore(dst, out_value);
       }
     }
