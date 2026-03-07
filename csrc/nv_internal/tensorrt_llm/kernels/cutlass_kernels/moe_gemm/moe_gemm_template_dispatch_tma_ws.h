@@ -434,8 +434,8 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(
     break;
 
     if (gemm_config.sm_version == 90) {
-      if constexpr (kernels::cutlass_kernels::isValidHopperMOESpecialisation<
-                        T, WeightType, EpilogueTag, FUSION>()) {
+      if constexpr (!IsMXFPX && kernels::cutlass_kernels::isValidHopperMOESpecialisation<
+                                    T, WeightType, EpilogueTag, FUSION>()) {
         switch (gemm_config.tile_config_sm90) {
           SHAPE_CASE(90, 128, 16, 128)
           SHAPE_CASE(90, 128, 32, 128)
