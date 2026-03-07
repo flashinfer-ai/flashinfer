@@ -56,7 +56,6 @@ cudaError_t RunSm120GroupwiseGemm(void* float_buffer, size_t float_buffer_size_i
   auto layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(cute::make_shape(m, n, k, l));
   auto layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(cute::make_shape(m, n, k, l));
 
-  // For beta=0 case, C and D can be the same buffer.
   DTypeOut* C_ptr = D_ptr;
 
   typename Gemm::Arguments arguments{
@@ -99,7 +98,6 @@ cudaError_t TrySm120PingpongThenCooperative(void* float_buffer, size_t float_buf
                                             DTypeIn* A_ptr, DTypeIn* B_ptr, float* SFA_ptr,
                                             float* SFB_ptr, DTypeOut* D_ptr, int m, int n, int k,
                                             int l, cudaStream_t stream) {
-  // Try pingpong first; fallback to cooperative when pingpong is unsupported for this problem.
   auto status = RunSm120GroupwiseGemm<PingpongGemm, ScaleConfig>(
       float_buffer, float_buffer_size_in_bytes, A_ptr, B_ptr, SFA_ptr, SFB_ptr, D_ptr, m, n, k, l,
       stream);
@@ -112,7 +110,6 @@ cudaError_t TrySm120PingpongThenCooperative(void* float_buffer, size_t float_buf
   return status;
 }
 
-// SM120 supports cooperative (128x128x128) and pingpong (64x128x128) schedules.
 template <int ScaleGranularityM, int ScaleGranularityN, int ScaleGranularityK, bool ScaleMajorK,
           typename DTypeIn, typename DTypeOut>
 cudaError_t CutlassGroupwiseScaledGEMMSM120(void* float_buffer, size_t float_buffer_size_in_bytes,
@@ -150,7 +147,6 @@ cudaError_t CutlassGroupwiseScaledGEMMSM120(void* float_buffer, size_t float_buf
   using PingpongMmaTileShape_MNK = Shape<_64, _128, _128>;
   using ClusterShape_MNK = Shape<_1, _1, _1>;
 
-  // Pingpong tile M=64 requires ScaleGranularityM to divide 64.
   constexpr bool kCanUsePingpong = (64 % ScaleGranularityM == 0);
 
   using ScaleConfig = std::conditional_t<
@@ -185,9 +181,6 @@ cudaError_t CutlassGroupwiseScaledGEMMSM120(void* float_buffer, size_t float_buf
 
   using CooperativeGemm = cutlass::gemm::device::GemmUniversalAdapter<CooperativeGemmKernel>;
 
-  // Guard pingpong type instantiation behind if constexpr so the CUTLASS builder's
-  // static_assert (tile_M % ScaleGranularityM == 0) is never triggered for
-  // ScaleGranularityM=128 with tile_M=64.
   if constexpr (kCanUsePingpong) {
     using PingpongCollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
         cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp, PingpongMmaTileShape_MNK,
