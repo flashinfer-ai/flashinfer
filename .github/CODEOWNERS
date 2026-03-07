@@ -29,7 +29,7 @@ flashinfer/cute_dsl/ @bkryu @yzh119 @kahyunnam @nv-yunzheq @aleozlx
 flashinfer/dsv3_ops/ @nv-yunzheq @jiahanc @nvmbreughe
 flashinfer/fused_moe/ @flashinfer-ai/moe-owners @nv-yunzheq @yzh119 @IwakuraRein @bkryu
 flashinfer/fused_moe/cute_dsl/ @nv-yunzheq
-flashinfer/gdn_kernels/ @flashinfer-ai/misc-op-owners @kaixih
+flashinfer/gdn_kernels/ @flashinfer-ai/misc-op-owners @kahyunnam @kaixih
 flashinfer/gemm/ @flashinfer-ai/gemm-owners @bkryu @jimmyzho @nv-yunzheq @yongwww
 flashinfer/gemm/kernels/ @nv-yunzheq @bkryu
 flashinfer/jit/ @yzh119 @jimmyzho @nv-yunzheq @kahyunnam @dierksen
@@ -51,21 +51,21 @@ tests/ @bkryu @yzh119 @nvmbreughe @jimmyzho @nv-yunzheq
 tests/attention/ @flashinfer-ai/attention-owners @nvmbreughe @yzh119 @bkryu @Anerudhan
 tests/cli/ @sricketts
 tests/comm/ @flashinfer-ai/comm-owners @nvmbreughe @bkryu @dierksen @wenscarl
-tests/gdn/ @flashinfer-ai/misc-op-owners @kaixih @bkryu @yzh119
+tests/gdn/ @flashinfer-ai/misc-op-owners @kahyunnam @kaixih @bkryu @yzh119
 tests/gemm/ @flashinfer-ai/gemm-owners @yongwww @bkryu @nv-yunzheq @aleozlx
 tests/mamba/ @bkryu
 tests/model_optimizations/ @nv-yunzheq @jimmyzho @nvmbreughe
 tests/moe/ @flashinfer-ai/moe-owners @nv-yunzheq @IwakuraRein @yzh119 @jimmyzho
-tests/norm/ @flashinfer-ai/misc-op-owners @bkryu
+tests/norm/ @flashinfer-ai/misc-op-owners @kahyunnam @bkryu
 tests/test_helpers/ @nvmbreughe @yzh119
 tests/utils/ @yzh119 @bkryu @nvmbreughe @kahyunnam @cyx-6
 
 # File-level overrides (must come last for precedence)
-csrc/gdn_prefill_launcher.cu @flashinfer-ai/misc-op-owners
-csrc/gdn_prefill_sm90_kernel_inst.jinja @flashinfer-ai/misc-op-owners
+csrc/gdn_prefill_launcher.cu @flashinfer-ai/misc-op-owners @kahyunnam
+csrc/gdn_prefill_sm90_kernel_inst.jinja @flashinfer-ai/misc-op-owners @kahyunnam
 flashinfer/attention.py @flashinfer-ai/attention-owners
-flashinfer/gdn_decode.py @flashinfer-ai/misc-op-owners
-flashinfer/gdn_prefill.py @flashinfer-ai/misc-op-owners
-flashinfer/jit/gdn.py @flashinfer-ai/misc-op-owners
-flashinfer/norm.py @flashinfer-ai/misc-op-owners
+flashinfer/gdn_decode.py @flashinfer-ai/misc-op-owners @kahyunnam
+flashinfer/gdn_prefill.py @flashinfer-ai/misc-op-owners @kahyunnam
+flashinfer/jit/gdn.py @flashinfer-ai/misc-op-owners @kahyunnam
+flashinfer/norm.py @flashinfer-ai/misc-op-owners @kahyunnam
 scripts/codeowner_overrides.json @ci-users
