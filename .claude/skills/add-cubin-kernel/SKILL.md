@@ -5,7 +5,7 @@ description: Guide for integrating pre-compiled cubin kernels into FlashInfer vi
 
 # Tutorial: Adding a Pre-compiled Cubin Kernel to FlashInfer
 
-This tutorial covers integrating pre-compiled CUDA binary (cubin) kernels into FlashInfer. Cubin kernels are typically provided by NVIDIA (e.g., TRT-LLM attention, GEMM, cuDNN SDPA) as binary blobs that are downloaded at runtime and loaded via the CUDA driver API.
+This tutorial covers integrating pre-compiled CUDA binary (cubin) kernels into FlashInfer. Cubin kernels are typically provided by NVIDIA (e.g., TRT-LLM attention, GEMM, cuDNN SDPA) as binary blobs that are downloaded at runtime and loaded via TVM-FFI's CubinModule.
 
 ## Architecture Overview
 
@@ -17,11 +17,11 @@ This tutorial covers integrating pre-compiled CUDA binary (cubin) kernels into F
 │  C++: flashinfer::cubin_loader  │  include/flashinfer/cubin_loader.h
 │  getCubinModule / getCubinKernel│
 ├─────────────────────────────────┤
-│  tvm::ffi::CubinModule          │  RAII module from tvm-ffi
-│  tvm::ffi::CubinKernel          │  Kernel handle with launch support
+│  tvm::ffi::CubinModule          │  RAII module loading (CUlibrary)
+│  tvm::ffi::CubinKernel          │  Kernel handle (CUkernel)
 ├─────────────────────────────────┤
-│  cuLaunchKernelEx               │  CUDA driver API for launch
-│  (cluster dims, PDL, etc.)      │  with CUlaunchConfig
+│  CubinKernel::Launch()          │  Basic launch (grid/block/stream)
+│  CubinKernel::LaunchEx()        │  Extended launch (clusters, PDL)
 └─────────────────────────────────┘
 ```
 
@@ -45,9 +45,6 @@ This function:
 
 ### C++ Side (`include/flashinfer/cubin_loader.h`)
 
-Two levels of API:
-
-**Preferred: CubinModule (RAII, cached)**
 ```cpp
 #include <flashinfer/cubin_loader.h>
 
@@ -58,23 +55,6 @@ auto kernel = flashinfer::cubin_loader::getCubinKernel(
     kernel_name,    // function name inside the cubin
     smem_bytes      // optional: sets max dynamic shared memory (>= 48KB)
 );
-
-// Launch with basic grid/block/stream
-kernel.Launch(args, grid, block, stream, dyn_smem_bytes);
-
-// Or get the raw handle for cuLaunchKernelEx
-CUfunction func = reinterpret_cast<CUfunction>(kernel.GetHandle());
-cuLaunchKernelEx(&launch_config, func, kernel_params, nullptr);
-```
-
-**Legacy: Raw bytes (for code using CUmodule/CUfunction directly)**
-```cpp
-// Get raw cubin bytes — for code that needs cuModuleLoadData
-std::string cubin = flashinfer::getCubin(cubin_path, sha256);
-CUmodule hmod;
-cuModuleLoadData(&hmod, cubin.data());
-CUfunction func;
-cuModuleGetFunction(&func, hmod, kernel_name);
 ```
 
 ## Step-by-Step: Adding a New Cubin Kernel
@@ -107,7 +87,7 @@ namespace flashinfer {
 void my_kernel_launcher(
     void* input, void* output, int n,
     const std::string& cubin_path, const std::string& sha256,
-    cudaStream_t stream) {
+    tvm::ffi::cuda_api::StreamHandle stream) {
 
   // Load kernel via CubinModule (cached, RAII)
   auto kernel = cubin_loader::getCubinKernel(
@@ -120,14 +100,13 @@ void my_kernel_launcher(
 
   // Launch
   TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(
-      kernel.Launch(args, grid, block,
-                    static_cast<tvm::ffi::cuda_api::StreamHandle>(stream)));
+      kernel.Launch(args, grid, block, stream));
 }
 
 // Export via TVM-FFI
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(my_kernel, [](
     TensorView input, TensorView output) {
-  auto stream = reinterpret_cast<cudaStream_t>(
+  auto stream = static_cast<tvm::ffi::cuda_api::StreamHandle>(
       TVMFFIEnvGetStream(kDLCUDA, input.device().device_id));
   my_kernel_launcher(
       input.data_ptr(), output.data_ptr(), input.size(0),
@@ -137,25 +116,34 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(my_kernel, [](
 }  // namespace flashinfer
 ```
 
-### Step 3: For Kernels Needing cuLaunchKernelEx (Clusters, PDL)
+### Step 3: For Kernels Needing Extended Launch (Clusters, PDL)
 
-When kernels need cluster dimensions or other launch attributes:
+Use `CubinKernel::LaunchEx` with a `cuda_api::LaunchConfig`:
 
 ```cpp
-// Get kernel handle
-auto cubinKernel = cubin_loader::getCubinKernel(
+auto kernel = cubin_loader::getCubinKernel(
     cubin_path, sha256, kernel_name, smem_bytes);
 
-// Set up launch config with cluster dimensions
-CUlaunchConfig launch_config;
-launch_config.blockDimX = threads_per_cta;
-launch_config.blockDimY = 1;
-launch_config.blockDimZ = 1;
-launch_config.gridDimX = num_blocks_x;
-launch_config.gridDimY = num_blocks_y;
-launch_config.gridDimZ = 1;
-launch_config.hStream = stream;
-launch_config.sharedMemBytes = smem_bytes;
+// Option A: Use ConstructLaunchConfig helper (simple cluster dim only)
+tvm::ffi::cuda_api::LaunchConfig config;
+tvm::ffi::cuda_api::LaunchAttrType attr;
+tvm::ffi::cuda_api::ConstructLaunchConfig(
+    kernel.GetHandle(), stream, smem_bytes,
+    grid, block, cluster_dim, config, attr);
+
+TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(
+    kernel.LaunchEx(args, config));
+
+// Option B: Build full config manually (multiple attributes)
+tvm::ffi::cuda_api::LaunchConfig config;
+config.gridDimX = grid_x;
+config.gridDimY = grid_y;
+config.gridDimZ = 1;
+config.blockDimX = block_x;
+config.blockDimY = 1;
+config.blockDimZ = 1;
+config.hStream = stream;
+config.sharedMemBytes = smem_bytes;
 
 CUlaunchAttribute attrs[3];
 attrs[0].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
@@ -164,14 +152,11 @@ attrs[1].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE;
 attrs[1].value.clusterSchedulingPolicyPreference = CU_CLUSTER_SCHEDULING_POLICY_SPREAD;
 attrs[2].id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
 attrs[2].value.programmaticStreamSerializationAllowed = enable_pdl;
-launch_config.attrs = attrs;
-launch_config.numAttrs = 3;
+config.attrs = attrs;
+config.numAttrs = 3;
 
-// Cast CUkernel to CUfunction for cuLaunchKernelEx
-void* kernel_params[] = {&params};
-cuLaunchKernelEx(&launch_config,
-                 reinterpret_cast<CUfunction>(cubinKernel.GetHandle()),
-                 kernel_params, nullptr);
+TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(
+    kernel.LaunchEx(args, config));
 ```
 
 ### Step 4: Write the JIT Module Generator
@@ -218,42 +203,7 @@ def my_operation(x, y):
 
 Note: `setup_cubin_loader()` is no longer needed — the TVM-FFI function registration happens at import time.
 
-## CubinModule vs CUmodule: When to Use Which
-
-| API | Use When | Example Files |
-|-----|----------|---------------|
-| `getCubinKernel` (CubinModule) | **Default** — new code, simple Launch or cuLaunchKernelEx | `fmhaKernels.cuh`, `cudnn_sdpa_kernel_launcher.cu` |
-| `getCubin` (raw bytes + CUmodule) | Upstream code calls `cuFuncSetAttribute` which needs `CUfunction` | `GemmInterface.h` (TRT-LLM vendored code) |
-
-The `CUkernel` handle from `CubinModule` works with:
-- `cuLaunchKernelEx` (via `reinterpret_cast<CUfunction>`)
-- `cuKernelSetAttribute` (native `CUkernel` API)
-- `cuOccupancyMaxActiveClusters`
-
-But does **NOT** work with:
-- `cuFuncSetAttribute` (needs real `CUfunction` from `cuModuleGetFunction`)
-
-If upstream vendored code uses `cuFuncSetAttribute`, use the legacy `getCubin` path until the upstream switches to `cuKernelSetAttribute`.
-
-## Environment Variables
-
-| Variable | Purpose |
-|----------|---------|
-| `FLASHINFER_CUBINS_REPOSITORY` | Override cubin download URL |
-| `FLASHINFER_CUBIN_DIR` | Override local cubin cache directory |
-| `FLASHINFER_CUBIN_CHECKSUM_DISABLED` | Skip SHA256 verification |
-
-## Reference Examples
-
-| Pattern | File |
-|---------|------|
-| CubinModule + cuLaunchKernelEx | `include/flashinfer/trtllm/fmha/fmhaKernels.cuh` |
-| CubinModule + simple launch | `csrc/cudnn_sdpa_kernel_launcher.cu` |
-| Legacy CUmodule (upstream constraint) | `include/flashinfer/trtllm/gemm/trtllmGen_gemm_export/GemmInterface.h` |
-| Python cubin download + cache | `flashinfer/jit/cubin_loader.py` |
-| Artifact metadata | `flashinfer/artifacts.py` |
-
-## TVM-FFI CubinModule API Reference
+## CubinKernel API
 
 From `tvm/ffi/extra/cuda/cubin_launcher.h`:
 
@@ -267,11 +217,68 @@ tvm::ffi::CubinKernel kernel = module.GetKernel("func_name");
 // Get kernel with shared memory > 48KB
 tvm::ffi::CubinKernel kernel = module.GetKernelWithMaxDynamicSharedMemory("func_name", smem);
 
-// Launch
+// Basic launch
 kernel.Launch(args, grid, block, stream, dyn_smem_bytes);
 
-// Get raw handle for cuLaunchKernelEx
+// Extended launch with cluster dimensions, PDL, etc.
+kernel.LaunchEx(args, config);
+
+// Get raw handle (only needed for upstream code requiring CUfunction)
 cuda_api::KernelHandle handle = kernel.GetHandle();
 ```
+
+## Unified CUDA API (`tvm::ffi::cuda_api`)
+
+TVM-FFI provides a unified API that works with both CUDA Driver API (< 12.8) and Runtime API (>= 12.8):
+
+| Function | Purpose |
+|----------|---------|
+| `LaunchKernel(kernel, args, grid, block, stream, smem)` | Basic kernel launch |
+| `LaunchKernelEx(kernel, args, config)` | Extended launch with attributes |
+| `ConstructLaunchConfig(kernel, stream, smem, grid, block, cluster_dim, config, attr)` | Build launch config |
+| `SetKernelMaxDynamicSharedMem(kernel, smem, device)` | Set shared memory attribute |
+| `GetKernelSharedMem(kernel, out, device)` | Query static shared memory |
+
+| Type Alias | Driver API | Runtime API |
+|-----------|-----------|-------------|
+| `KernelHandle` | `CUkernel` | `cudaKernel_t` |
+| `LibraryHandle` | `CUlibrary` | `cudaLibrary_t` |
+| `LaunchConfig` | `CUlaunchConfig` | `cudaLaunchConfig_t` |
+| `StreamHandle` | `CUstream` | `cudaStream_t` |
+| `ResultType` | `CUresult` | `cudaError_t` |
+| `kSuccess` | `CUDA_SUCCESS` | `cudaSuccess` |
+
+## Legacy Code: When CUfunction is Required
+
+Some vendored upstream code (e.g., TRT-LLM `CudaKernelLauncher.h`) calls `cuFuncSetAttribute` which requires `CUfunction`, not `CUkernel`. In these cases, use the legacy `getCubin` path:
+
+```cpp
+// Legacy: get raw cubin bytes for cuModuleLoadData
+std::string cubin = flashinfer::getCubin(cubin_path, sha256);
+CUmodule hmod;
+cuModuleLoadData(&hmod, cubin.data());
+CUfunction func;
+cuModuleGetFunction(&func, hmod, kernel_name);
+```
+
+This is only needed when upstream code you can't modify uses `cuFuncSetAttribute`. For new code, always use `CubinModule`/`CubinKernel`.
+
+## Environment Variables
+
+| Variable | Purpose |
+|----------|---------|
+| `FLASHINFER_CUBINS_REPOSITORY` | Override cubin download URL |
+| `FLASHINFER_CUBIN_DIR` | Override local cubin cache directory |
+| `FLASHINFER_CUBIN_CHECKSUM_DISABLED` | Skip SHA256 verification |
+
+## Reference Examples
+
+| Pattern | File |
+|---------|------|
+| CubinModule + LaunchEx | `csrc/cudnn_sdpa_kernel_launcher.cu` |
+| CubinModule + upstream cuLaunchKernelEx | `include/flashinfer/trtllm/fmha/fmhaKernels.cuh` |
+| Legacy CUmodule (upstream constraint) | `include/flashinfer/trtllm/gemm/trtllmGen_gemm_export/GemmInterface.h` |
+| Python cubin download + cache | `flashinfer/jit/cubin_loader.py` |
+| Artifact metadata | `flashinfer/artifacts.py` |
 
 Documentation: <https://tvm.apache.org/ffi/guides/cubin_launcher.html>
