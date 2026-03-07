@@ -55,6 +55,10 @@ int64_t my_pe() { return nvshmem_my_pe(); }
 
 int64_t n_pes() { return nvshmem_n_pes(); }
 
+int64_t local_my_pe() { return nvshmem_team_my_pe(NVSHMEMX_TEAM_NODE); }
+
+int64_t local_n_pes() { return nvshmem_team_n_pes(NVSHMEMX_TEAM_NODE); }
+
 struct NVSHMEMNDAlloc {
   void AllocData(DLTensor* tensor) {
     size_t size = tvm::ffi::GetDataSize(*tensor);
@@ -161,6 +165,8 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvshmem_init, init);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvshmem_finalize, finalize);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvshmem_my_pe, my_pe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvshmem_n_pes, n_pes);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvshmem_local_my_pe, local_my_pe);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvshmem_local_n_pes, local_n_pes);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvshmem_malloc, malloc_tensor);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvshmem_barrier_all, barrier_all);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvshmem_barrier_all_on_current_stream, barrier_all_on_current_stream);

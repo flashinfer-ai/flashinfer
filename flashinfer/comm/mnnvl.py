@@ -313,6 +313,9 @@ class TorchDistBackend(CommBackend):
 
         return TorchDistBackend(group=new_group)
 
+    def get_group_ranks(self) -> List[int]:
+        return self._dist.get_process_group_ranks(self._group)
+
 
 @dataclass
 class MnnvlConfig:
@@ -808,7 +811,11 @@ class PosixFDHandleExchanger(HandleExchanger):
             opId = random.randint(0, 2**64 - 1)
         else:
             opId = None
-        opId = self.comm.bcast(opId, root=0)
+        if hasattr(self.comm, "get_group_ranks"):
+            root = self.comm.get_group_ranks()[0]
+        else:
+            root = 0
+        opId = self.comm.bcast(opId, root=root)
         return IpcSocket(self.rank, opId)
 
     @property
