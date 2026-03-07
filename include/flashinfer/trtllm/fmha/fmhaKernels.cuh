@@ -901,6 +901,9 @@ class TllmFmhaKernelFactory {
                                int numEltsPerSageAttnBlkP, int numEltsPerSageAttnBlkV) {
     static std::mutex s_mutex;
     std::lock_guard<std::mutex> lg(s_mutex);
+    FLASHINFER_CHECK(numEltsPerSageAttnBlkQ <= 64 && numEltsPerSageAttnBlkK <= 64 &&
+                         numEltsPerSageAttnBlkP <= 64 && numEltsPerSageAttnBlkV <= 64,
+                     "SageAttention allows numEltsPerSageAttnBlk up to 64.");
 
     auto const id =
         hashID(dtypeQ, dtypeKv, dtypeOut, sm, dtypeQkReinterpret, numEltsPerSageAttnBlkQ,
@@ -950,13 +953,13 @@ class TllmFmhaKernelFactory {
                          Data_type dtypeQkReinterpret, int numEltsPerSageAttnBlkQ,
                          int numEltsPerSageAttnBlkK, int numEltsPerSageAttnBlkP,
                          int numEltsPerSageAttnBlkV) const {
-    auto const computeLog2BlockSize = [](int blockSize) -> int {
+    auto const computeLog2BlockSizePlus1 = [](int blockSize) -> int {
       if (blockSize <= 0) {
         return 0;
       }
       FLASHINFER_CHECK((blockSize & (blockSize - 1)) == 0,
                        "SageAttention block size must be a power of 2.");
-      return __builtin_ctz(static_cast<unsigned int>(blockSize));
+      return __builtin_ctz(static_cast<unsigned int>(blockSize) + 1);
     };
     // Format of the hash key:
     // Bit 0  - 15: smVer
@@ -964,17 +967,17 @@ class TllmFmhaKernelFactory {
     // Bit 20 - 23: dtypeKv
     // Bit 24 - 27: dtypeOut
     // Bit 28 - 31: reserved [VisualGen kernels from below].
-    // Bit 32 - 34: log2NumEltsPerSageAttnBlkQ -- max numEltsPerSageAttnBlkQ is 128.
-    // Bit 35 - 37: log2NumEltsPerSageAttnBlkK -- max numEltsPerSageAttnBlkK is 128.
-    // Bit 38 - 40: log2NumEltsPerSageAttnBlkP -- max numEltsPerSageAttnBlkP is 128.
-    // Bit 41 - 43: log2NumEltsPerSageAttnBlkV -- max numEltsPerSageAttnBlkV is 128.
+    // Bit 32 - 34: log2NumEltsPerSageAttnBlkQ + 1 -- 0 = no-sage, max numEltsPerSageAttnBlkQ is 64.
+    // Bit 35 - 37: log2NumEltsPerSageAttnBlkK + 1 -- 0 = no-sage, max numEltsPerSageAttnBlkK is 64.
+    // Bit 38 - 40: log2NumEltsPerSageAttnBlkP + 1 -- 0 = no-sage, max numEltsPerSageAttnBlkP is 64.
+    // Bit 41 - 43: log2NumEltsPerSageAttnBlkV + 1 -- 0 = no-sage, max numEltsPerSageAttnBlkV is 64.
     // Bit 44 - 47: dataTypeQkReinterpret.
     return static_cast<uint64_t>(sm) | static_cast<uint64_t>(dtypeQ) << 16 |
            static_cast<uint64_t>(dtypeKv) << 20 | static_cast<uint64_t>(dtypeOut) << 24 |
-           (static_cast<uint64_t>(computeLog2BlockSize(numEltsPerSageAttnBlkQ)) << 32) |
-           (static_cast<uint64_t>(computeLog2BlockSize(numEltsPerSageAttnBlkK)) << 35) |
-           (static_cast<uint64_t>(computeLog2BlockSize(numEltsPerSageAttnBlkP)) << 38) |
-           (static_cast<uint64_t>(computeLog2BlockSize(numEltsPerSageAttnBlkV)) << 41) |
+           (static_cast<uint64_t>(computeLog2BlockSizePlus1(numEltsPerSageAttnBlkQ)) << 32) |
+           (static_cast<uint64_t>(computeLog2BlockSizePlus1(numEltsPerSageAttnBlkK)) << 35) |
+           (static_cast<uint64_t>(computeLog2BlockSizePlus1(numEltsPerSageAttnBlkP)) << 38) |
+           (static_cast<uint64_t>(computeLog2BlockSizePlus1(numEltsPerSageAttnBlkV)) << 41) |
            (static_cast<uint64_t>(dtypeQkReinterpret) << 44);
   }
 
