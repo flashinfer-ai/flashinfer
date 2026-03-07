@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from .kvfp4 import KVFP4QuantizeUtil as KVFP4QuantizeUtil
 from .utils import (
     attention_flops,
     attention_flops_with_actual_seq_lens,

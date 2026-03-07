@@ -18,6 +18,7 @@
 
 #include <cuda.h>
 
+#include <cfloat>
 #include <cstdint>
 #include <cuda/std/cfloat>
 #include <iterator>
@@ -301,6 +302,7 @@ class TllmGenFmhaKernel {
           continue;
         }
       }
+
       cuErrCheck(cuLaunchKernelEx(&launch_config, func, kernelParamsList, nullptr));
 
       // Run the separate reduction kernel if needed.
@@ -348,6 +350,7 @@ class TllmGenFmhaKernel {
         numCtasPerSeqQ = flashinfer::ceil_div(params.mMaxSeqLenQ, numTokensPerCtaQ);
       }
     }
+    // printf("[numCtasX trace] numCtasPerSeqQ = %d\n", numCtasPerSeqQ);
 
     // Compute the grid dimension Y.
     int numHeadsPerCta =
@@ -371,6 +374,7 @@ class TllmGenFmhaKernel {
     if (isMlaGenKernel(params) && selectKernelParams.mUses2CtaMma) {
       FLASHINFER_CHECK(numCtasForAllHeadsQ == 2 && numCtasPerHeadDim == 2,
                        "Internal error: numCtasPerHeadDim should be 2.");
+      // int oldNumCtasX = numCtasX;
       numCtasX *= 2;
       numCtasY /= (numCtasForAllHeadsQ * numCtasPerHeadDim);
     }
@@ -409,6 +413,7 @@ class TllmGenFmhaKernel {
           maxNumCtasPerSeqKv,
           std::max(1, int32_t(params.mMultiProcessorCount / (numCtasX * numCtasY * numCtasZ))));
       // Update the numCtasX.
+      int oldNumCtasX = numCtasX;
       numCtasX *= numCtasPerSeqKv;
       // The current total number of CTAs.
       int totalNumCtas = numCtasX * numCtasZ * numCtasY;
