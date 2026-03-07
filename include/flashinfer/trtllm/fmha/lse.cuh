@@ -34,7 +34,7 @@ __global__ void ComputeLSEFromMDKernel(float2* __restrict__ md, float* __restric
   int elem_idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (elem_idx >= n) return;
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  cudaGridDependencySynchronize();
 #endif
   float2 md_elem = md[elem_idx];
   float m = md_elem.x;
@@ -45,7 +45,7 @@ __global__ void ComputeLSEFromMDKernel(float2* __restrict__ md, float* __restric
                     static_cast<int64_t>(head_idx) * lse_stride_heads;
   lse[out_idx] = math::log2e * m + math::ptx_log2(d);
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
