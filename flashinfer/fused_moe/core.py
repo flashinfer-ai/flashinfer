@@ -30,9 +30,6 @@ from ..autotuner import (
 )
 from ..jit.cpp_ext import is_cuda_version_at_least
 from ..jit.core import logger
-from ..jit import (
-    setup_cubin_loader,
-)
 from ..jit.fused_moe import (
     gen_cutlass_fused_moe_sm120_module,
     gen_cutlass_fused_moe_sm103_module,
@@ -950,7 +947,6 @@ def cutlass_fused_moe(
 def get_trtllm_moe_sm100_module():
     module = gen_trtllm_gen_fused_moe_sm100_module()
     moe_op = module.build_and_load()
-    setup_cubin_loader(str(module.get_library_path()))
 
     class MoERunner(TunableRunner):
         dynamic_tensor_initializers = [

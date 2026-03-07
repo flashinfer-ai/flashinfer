@@ -21,7 +21,7 @@ from typing import List, Literal, Optional, Tuple, Union, overload
 import torch
 
 from .api_logging import flashinfer_api
-from .jit import gen_batch_mla_module, gen_trtllm_gen_fmha_module, setup_cubin_loader
+from .jit import gen_batch_mla_module, gen_trtllm_gen_fmha_module
 from .jit.mla import gen_mla_module
 from .utils import (
     MaskMode,
@@ -191,7 +191,6 @@ def _check_trtllm_gen_mla_shape(
 def get_trtllm_gen_fmha_module():
     mod = gen_trtllm_gen_fmha_module()
     op = mod.build_and_load()
-    setup_cubin_loader(mod.get_library_path())
     return op
 
 

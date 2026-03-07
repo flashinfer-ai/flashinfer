@@ -75,7 +75,6 @@ except OSError as e:
         raise
 
 
-from ..jit.cubin_loader import setup_cubin_loader
 from ..utils import (
     _get_cache_buf,
     determine_gemm_backend,
@@ -770,7 +769,6 @@ def get_gemm_sm120_module_cutlass_fp8():
 def get_trtllm_gemm_module():
     mod = gen_trtllm_gen_gemm_module()
     op = mod.build_and_load()
-    setup_cubin_loader(mod.get_library_path())
     return op
 
 
@@ -4340,7 +4338,6 @@ def gemm_fp8_nt_groupwise(
 def get_trtllm_fp4_gemm_module():
     mod = gen_trtllm_gen_gemm_module()
     op = mod.build_and_load()
-    setup_cubin_loader(mod.get_library_path())
 
     def trtllm_fp4_gemm_runner(use_8x4_sf_layout: bool = True):
         class TrtllmFp4GemmRunner(TunableRunner):

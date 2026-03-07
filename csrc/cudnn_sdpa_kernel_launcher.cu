@@ -757,7 +757,7 @@ void prefill(int64_t b, int64_t s_qo, int64_t max_s_kv, TensorView q, TensorView
   if (err_launch != tvm::ffi::cuda_api::kSuccess) {
     const char* errstr = NULL;
     cuGetErrorString(err_launch, &errstr);
-    throw std::runtime_error("Failed to cuLaunchKernelEx for prefill");
+    throw std::runtime_error("Failed to launch kernel for prefill");
   }
 }
 
@@ -1110,8 +1110,8 @@ void decode(int64_t max_s_kv, TensorView q, TensorView k_cache, TensorView v_cac
   auto err_launch =
       tvm::ffi::cuda_api::LaunchKernelEx(hfunc_decode[kernel_id], (void**)args, config);
   if (err_launch != tvm::ffi::cuda_api::kSuccess) {
-    std::cerr << "cuLaunchKernelEx failed with error code " << err_launch << std::endl;
-    throw std::runtime_error("cuLaunchKernelEx failed for decode");
+    std::cerr << "Kernel launch failed with error code " << err_launch << std::endl;
+    throw std::runtime_error("Kernel launch failed for decode");
   }
 
   // Now setting up the reduction kernel
@@ -1163,8 +1163,8 @@ void decode(int64_t max_s_kv, TensorView q, TensorView k_cache, TensorView v_cac
     auto err_launch = tvm::ffi::cuda_api::LaunchKernelEx(
         lean_attn_reduction, (void**)args_lean_attn_reduction, reduction_config);
     if (err_launch != tvm::ffi::cuda_api::kSuccess) {
-      std::cerr << "cuLaunchKernelEx failed with error code " << err_launch << std::endl;
-      throw std::runtime_error("cuLaunchKernelEx failed for decode");
+      std::cerr << "Kernel launch failed with error code " << err_launch << std::endl;
+      throw std::runtime_error("Kernel launch failed for decode");
     }
   }
 }

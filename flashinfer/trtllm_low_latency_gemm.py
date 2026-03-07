@@ -39,7 +39,6 @@ from flashinfer.fused_moe.utils import (
     get_last_power_of_2_num_tokens_buckets,
     last_positive_power_of_2,
 )
-from flashinfer.jit import setup_cubin_loader
 from flashinfer.utils import _get_cache_buf
 
 
@@ -47,7 +46,6 @@ from flashinfer.utils import _get_cache_buf
 def get_trtllm_low_latency_gemm_module():
     mod = gen_trtllm_low_latency_gemm_module()
     op = mod.build_and_load()
-    setup_cubin_loader(str(mod.get_library_path()))
 
     class TrtllmLowLatencyGemmRunner(TunableRunner):
         def get_valid_tactics(
