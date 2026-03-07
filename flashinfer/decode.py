@@ -67,6 +67,7 @@ from .utils import (
     device_support_pdl,
     get_device_sm_count,
     is_float8,
+    _apply_v_scale,
     register_custom_op,
     register_fake_op,
     ceil_div,
@@ -580,10 +581,7 @@ def single_decode_with_kv_cache(
 
     if v_scale is not None:
         # TODO(Zihao): fused into kernel
-        if out.itemsize == 1:
-            out = (out.to(float) * v_scale).to(out.dtype)
-        else:
-            out *= v_scale
+        out = _apply_v_scale(out, v_scale)
     if return_lse:
         return out, lse
     else:
@@ -1434,10 +1432,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         is_float_one = isinstance(v_scale, float) and v_scale == 1.0
         if v_scale is not None and not is_float_one:
             # TODO(Zihao): fused into kernel
-            if is_float8(out):
-                out = (out.to(torch.float32) * v_scale).to(out.dtype)
-            else:
-                out *= v_scale
+            out = _apply_v_scale(out, v_scale)
 
         return (out, lse) if return_lse else out
 
