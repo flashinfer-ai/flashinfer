@@ -73,6 +73,7 @@ Batch Prefill/Append Attention
 
     cudnn_batch_prefill_with_kv_cache
     trtllm_batch_context_with_kv_cache
+    trtllm_ragged_attention_deepseek
 
 .. autoclass:: BatchPrefillWithPagedKVCacheWrapper
     :members:
