@@ -220,7 +220,7 @@ def _get_compiled_finalize_kernel(
         #  permuted_idx_to_expanded_idx_ptr, num_non_exiting_tiles_ptr,
         #  token_final_scales_ptr, m, n, k, l, num_tokens, top_k,
         #  tile_size, scaling_vector_size, max_active_clusters, stream)
-        from flashinfer.jit.cute_dsl_aot import compile_and_cache_cute_dsl_kernel
+        from flashinfer.jit.cute_dsl import compile_and_cache_cute_dsl_kernel
 
         mma_str = f"{mma_tiler_mn[0]}x{mma_tiler_mn[1]}"
         cl_str = f"{cluster_shape_mn[0]}x{cluster_shape_mn[1]}"

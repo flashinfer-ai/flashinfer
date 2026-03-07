@@ -262,7 +262,7 @@ def _get_compiled_kernel(
     cluster_shape_mn: Tuple[int, int],
 ):
     """Get or compile the grouped GEMM kernel with TVM-FFI and AOT caching."""
-    from flashinfer.jit.cute_dsl_aot import compile_and_cache_cute_dsl_kernel
+    from flashinfer.jit.cute_dsl import compile_and_cache_cute_dsl_kernel
 
     ab_dtype = get_cutlass_dtype(ab_dtype_name)
     sf_dtype = get_cutlass_dtype(sf_dtype_name)

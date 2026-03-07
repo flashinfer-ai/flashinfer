@@ -2029,7 +2029,7 @@ def gated_delta_rule(
         else:  # T == 4
             launch_fn = gated_delta_rule_launch_seqlen4
 
-        from flashinfer.jit.cute_dsl_aot import compile_and_cache_cute_dsl_kernel
+        from flashinfer.jit.cute_dsl import compile_and_cache_cute_dsl_kernel
 
         aot_func_name = f"gdn_bf16state_T{T}_B{B}_H{H}_HV{HV}_K{K}_V{V}_ps{pool_size}"
 

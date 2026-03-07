@@ -42,7 +42,7 @@ from .core import logger
 CUTE_DSL_AOT_SUBDIR = "cute_dsl"
 
 
-def get_cute_dsl_aot_dir() -> Path:
+def get_cute_dsl_dir() -> Path:
     """Get the directory for pre-compiled CuTe DSL shared libraries."""
     return jit_env.FLASHINFER_AOT_DIR / CUTE_DSL_AOT_SUBDIR
 
@@ -113,7 +113,7 @@ def try_load_aot_kernel(func_name: str) -> Optional[Callable]:
     Returns:
         The loaded TVM-FFI function, or None if not found.
     """
-    for base_dir in [get_cute_dsl_aot_dir(), get_cute_dsl_jit_dir()]:
+    for base_dir in [get_cute_dsl_dir(), get_cute_dsl_jit_dir()]:
         so_path = base_dir / f"{func_name}.so"
         if so_path.exists():
             try:

@@ -3547,7 +3547,7 @@ def _cute_dsl_gemm_fp4_runner(
                 # Fake stream: auto uses current CUDA stream at runtime
                 stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
-                from flashinfer.jit.cute_dsl_aot import (
+                from flashinfer.jit.cute_dsl import (
                     compile_and_cache_cute_dsl_kernel,
                 )
 

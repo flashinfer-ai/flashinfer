@@ -268,7 +268,7 @@ def _get_compiled_gather_kernel(
         #  tile_idx_to_group_idx_ptr, tile_idx_to_mn_limit_ptr, token_id_mapping_ptr,
         #  num_non_exiting_tiles_ptr, global_sf_ptr, orig_m, m, n, k, l,
         #  tile_size, scaling_vector_size, max_active_clusters, stream)
-        from flashinfer.jit.cute_dsl_aot import compile_and_cache_cute_dsl_kernel
+        from flashinfer.jit.cute_dsl import compile_and_cache_cute_dsl_kernel
 
         mma_str = f"{mma_tiler_mn[0]}x{mma_tiler_mn[1]}"
         cl_str = f"{cluster_shape_mn[0]}x{cluster_shape_mn[1]}"

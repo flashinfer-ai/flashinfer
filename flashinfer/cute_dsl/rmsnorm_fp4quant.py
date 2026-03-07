@@ -716,7 +716,7 @@ def _get_compiled_kernel(
     )
 
     # Compile with TVM-FFI enabled, with AOT caching
-    from ..jit.cute_dsl_aot import compile_and_cache_cute_dsl_kernel
+    from ..jit.cute_dsl import compile_and_cache_cute_dsl_kernel
 
     dtype_str = "fp16" if is_fp16 else "bf16"
     swizzle_str = "swz" if is_sf_swizzled_layout else "noswz"

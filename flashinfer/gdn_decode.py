@@ -1137,7 +1137,7 @@ def gated_delta_rule_decode_pretranspose(
         run_func = run_gdn_decode_kernel_small_batch_pretranspose
 
         # Use TVM FFI to reduce runtime overhead, with AOT caching
-        from flashinfer.jit.cute_dsl_aot import compile_and_cache_cute_dsl_kernel
+        from flashinfer.jit.cute_dsl import compile_and_cache_cute_dsl_kernel
 
         dtype_str = str(q.dtype).split(".")[-1]
         aot_func_name = (
@@ -1971,7 +1971,7 @@ def gated_delta_rule_decode(
         cu_seqlens_tensor = from_dlpack(cu_seqlens, assumed_align=16)
 
         # Use TVM FFI to reduce runtime overhead, with AOT caching
-        from flashinfer.jit.cute_dsl_aot import compile_and_cache_cute_dsl_kernel
+        from flashinfer.jit.cute_dsl import compile_and_cache_cute_dsl_kernel
 
         dtype_str = str(q.dtype).split(".")[-1]
         aot_func_name = (
@@ -2609,7 +2609,7 @@ def gated_delta_rule_mtp(
         cu_seqlens_tensor = from_dlpack(cu_seqlens, assumed_align=16)
 
         # Use TVM FFI to reduce runtime overhead, with AOT caching
-        from flashinfer.jit.cute_dsl_aot import compile_and_cache_cute_dsl_kernel
+        from flashinfer.jit.cute_dsl import compile_and_cache_cute_dsl_kernel
 
         dtype_str = str(q.dtype).split(".")[-1]
         aot_func_name = (

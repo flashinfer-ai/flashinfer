@@ -91,7 +91,7 @@ def _get_compiled_swiglu_kernel(
     if cache_key in _swiglu_compiled_cache:
         return _swiglu_compiled_cache[cache_key]
 
-    from flashinfer.jit.cute_dsl_aot import compile_and_cache_cute_dsl_kernel
+    from flashinfer.jit.cute_dsl import compile_and_cache_cute_dsl_kernel
 
     ab_dtype = get_cutlass_dtype(ab_dtype_name)
     sf_dtype = get_cutlass_dtype(sf_dtype_name)

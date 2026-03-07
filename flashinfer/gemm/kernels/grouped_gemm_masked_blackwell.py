@@ -2885,7 +2885,7 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
             alpha_ptr,
         ]
 
-    from flashinfer.jit.cute_dsl_aot import compile_and_cache_cute_dsl_kernel
+    from flashinfer.jit.cute_dsl import compile_and_cache_cute_dsl_kernel
 
     mma_str = f"{mma_tiler_mn[0]}x{mma_tiler_mn[1]}"
     cl_str = f"{cluster_shape_mn[0]}x{cluster_shape_mn[1]}"
