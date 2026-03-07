@@ -39,10 +39,9 @@ Key features:
 
 from typing import Any, Dict, Optional, Tuple
 
+import cutlass
 import cutlass.cute as cute
-import cutlass.torch as cutlass_torch
 import torch
-from cutlass.cute.runtime import from_dlpack
 
 from flashinfer.utils import get_compute_capability
 from flashinfer.api_logging import flashinfer_api
@@ -72,17 +71,32 @@ def _get_compiled_swiglu_kernel(
     mma_tiler_mn: Tuple[int, int],
     cluster_shape_mn: Tuple[int, int],
     vectorized_f32: bool,
+    generate_sfc: bool,
 ):
     """Get or compile the grouped GEMM with SwiGLU kernel with AOT caching.
 
     Shape parameters (permuted_m, n, k, num_experts) are not included in the
     cache key since the kernel is shape-agnostic.
     """
+    cache_key = (
+        ab_dtype_name,
+        sf_dtype_name,
+        c_dtype_name,
+        sf_vec_size,
+        mma_tiler_mn,
+        cluster_shape_mn,
+        vectorized_f32,
+        generate_sfc,
+    )
+    if cache_key in _swiglu_compiled_cache:
+        return _swiglu_compiled_cache[cache_key]
+
+    from flashinfer.jit.cute_dsl_aot import compile_and_cache_cute_dsl_kernel
+
     ab_dtype = get_cutlass_dtype(ab_dtype_name)
     sf_dtype = get_cutlass_dtype(sf_dtype_name)
     c_dtype = get_cutlass_dtype(c_dtype_name)
 
-    # Create kernel instance
     gemm = Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel(
         sf_vec_size=sf_vec_size,
         mma_tiler_mn=mma_tiler_mn,
@@ -90,7 +104,83 @@ def _get_compiled_swiglu_kernel(
         vectorized_f32=vectorized_f32,
     )
 
-    return gemm, ab_dtype, sf_dtype, c_dtype
+    max_active_clusters = get_max_active_clusters(
+        cluster_shape_mn[0] * cluster_shape_mn[1]
+    )
+
+    # Create fake tensors for compile-time type inference
+    sym_m, sym_n, sym_k, sym_l = (cute.sym_int() for _ in range(4))
+    sym_sf_a = cute.sym_int()
+    sym_sf_b_dims = tuple(cute.sym_int() for _ in range(6))
+    sym_tiles = cute.sym_int()
+
+    a_fake = cute.runtime.make_fake_compact_tensor(
+        ab_dtype, (sym_m, sym_k, 1), stride_order=(2, 1, 0), assumed_align=16
+    )
+    b_fake = cute.runtime.make_fake_compact_tensor(
+        ab_dtype, (sym_n, sym_k, sym_l), stride_order=(2, 1, 0), assumed_align=16
+    )
+    c_fake = cute.runtime.make_fake_compact_tensor(
+        c_dtype, (sym_m, sym_n, 1), stride_order=(2, 1, 0), assumed_align=16
+    )
+    sfa_fake = cute.runtime.make_fake_compact_tensor(
+        sf_dtype, (sym_sf_a,), assumed_align=16
+    )
+    sfb_fake = cute.runtime.make_fake_compact_tensor(
+        sf_dtype, sym_sf_b_dims, assumed_align=16
+    )
+    if generate_sfc:
+        sym_sfc_dims = tuple(cute.sym_int() for _ in range(6))
+        sfc_fake = cute.runtime.make_fake_compact_tensor(
+            sf_dtype, sym_sfc_dims, assumed_align=16
+        )
+        norm_const_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32, (1,), assumed_align=4
+        )
+    else:
+        sfc_fake = None
+        norm_const_fake = None
+    tile_idx_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (sym_tiles,), assumed_align=4
+    )
+    num_tiles_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (1,), assumed_align=4
+    )
+    alpha_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32, (sym_l,), assumed_align=4
+    )
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
+    mma_str = f"{mma_tiler_mn[0]}x{mma_tiler_mn[1]}"
+    cl_str = f"{cluster_shape_mn[0]}x{cluster_shape_mn[1]}"
+    aot_func_name = (
+        f"moe_swiglu_{ab_dtype_name}_{sf_dtype_name}_{c_dtype_name}"
+        f"_sfv{sf_vec_size}_mma{mma_str}_cl{cl_str}"
+        f"_{'vf32' if vectorized_f32 else 'novf32'}"
+        f"_{'sfc' if generate_sfc else 'nosfc'}"
+    )
+
+    def _do_compile():
+        return cute.compile(
+            gemm,
+            a_fake,
+            b_fake,
+            c_fake,
+            sfa_fake,
+            sfb_fake,
+            sfc_fake,
+            norm_const_fake,
+            tile_idx_fake,
+            num_tiles_fake,
+            alpha_fake,
+            max_active_clusters,
+            stream_fake,
+            options="--enable-tvm-ffi",
+        )
+
+    compiled = compile_and_cache_cute_dsl_kernel(_do_compile, aot_func_name)
+    _swiglu_compiled_cache[cache_key] = compiled
+    return compiled
 
 
 @flashinfer_api
@@ -269,8 +359,8 @@ def blockscaled_contiguous_grouped_gemm_swiglu_fusion_nvfp4(
     if sm_count is None:
         sm_count = get_num_sm(a.device)
 
-    # Get or compile the kernel
-    gemm, _, _, _ = _get_compiled_swiglu_kernel(
+    # Get compiled kernel (cached with AOT support)
+    compiled_gemm = _get_compiled_swiglu_kernel(
         ab_dtype_name=ab_dtype,
         sf_dtype_name=sf_dtype,
         c_dtype_name=c_dtype,
@@ -278,129 +368,22 @@ def blockscaled_contiguous_grouped_gemm_swiglu_fusion_nvfp4(
         mma_tiler_mn=mma_tiler_mn,
         cluster_shape_mn=cluster_shape_mn,
         vectorized_f32=vectorized_f32,
+        generate_sfc=generate_sfc,
     )
 
-    # Compute max active clusters (cached to avoid expensive HardwareInfo queries)
-    max_active_clusters = get_max_active_clusters(
-        cluster_shape_mn[0] * cluster_shape_mn[1]
-    )
-
-    # Create CuTe tensors from PyTorch tensors
-    # A: (permuted_m, k, 1) - single batch of permuted tokens
-    # B: (n, k, num_experts) - expert weights (note: n = 2*intermediate_size)
-    # C: (permuted_m, intermediate_size, 1) - output
-    a_tensor = from_dlpack(a.unsqueeze(-1), assumed_align=16).mark_layout_dynamic(
-        leading_dim=1
-    )
-    b_tensor = from_dlpack(b.permute(1, 2, 0), assumed_align=16).mark_layout_dynamic(
-        leading_dim=1
-    )
-    c_tensor = from_dlpack(out.unsqueeze(-1), assumed_align=16).mark_layout_dynamic(
-        leading_dim=1
-    )
-
-    # Set the correct element types for FP4 tensors
-    # from_dlpack infers dtype from PyTorch (uint8) but the kernel needs Float4E2M1FN
-    a_tensor.element_type = ab_dtype_cutlass
-    b_tensor.element_type = ab_dtype_cutlass
-    c_tensor.element_type = c_dtype_cutlass
-
-    # Scale factor tensors
-    # For A scale: 2D or 3D linear layout with dim 1 contiguous
-    sfa_tensor = from_dlpack(a_scale, assumed_align=16).mark_layout_dynamic(
-        leading_dim=1
-    )
-    # For B scale: 6D strided MMA layout with physical dim 3 contiguous
-    sfb_tensor = from_dlpack(b_scale, assumed_align=16).mark_layout_dynamic(
-        leading_dim=3
-    )
-
-    # Set the correct element types for scale factor tensors
-    sfa_tensor.element_type = sf_dtype_cutlass
-    sfb_tensor.element_type = sf_dtype_cutlass
-
-    # Optional output scale factor tensor
-    if generate_sfc:
-        # Output scale is contiguous 6D with dim 4 having stride 1
-        sfc_tensor = from_dlpack(out_scale, assumed_align=16).mark_layout_dynamic(
-            leading_dim=4
-        )
-        sfc_tensor.element_type = sf_dtype_cutlass
-        norm_const_tensor = from_dlpack(
-            global_scale, assumed_align=16
-        ).mark_layout_dynamic()
-    else:
-        sfc_tensor = None
-        norm_const_tensor = None
-
-    # Mapping tensors
-    tile_idx_tensor = from_dlpack(tile_idx_to_group_idx).mark_layout_dynamic()
-    num_tiles_tensor = from_dlpack(num_non_exiting_tiles).mark_layout_dynamic()
-    alpha_tensor = from_dlpack(alpha).mark_layout_dynamic()
-
-    # Get current CUDA stream
-    current_stream = cutlass_torch.current_stream()
-
-    # Compile (cached) and run the kernel
-    cache_key = (
-        ab_dtype,
-        sf_dtype,
-        c_dtype,
-        sf_vec_size,
-        mma_tiler_mn,
-        cluster_shape_mn,
-        vectorized_f32,
-        generate_sfc,
-    )
-    if cache_key not in _swiglu_compiled_cache:
-        from flashinfer.jit.cute_dsl_aot import compile_and_cache_cute_dsl_kernel
-
-        mma_str = f"{mma_tiler_mn[0]}x{mma_tiler_mn[1]}"
-        cl_str = f"{cluster_shape_mn[0]}x{cluster_shape_mn[1]}"
-        aot_func_name = (
-            f"moe_swiglu_{ab_dtype}_{sf_dtype}_{c_dtype}"
-            f"_sfv{sf_vec_size}_mma{mma_str}_cl{cl_str}"
-            f"_{'vf32' if vectorized_f32 else 'novf32'}"
-            f"_{'sfc' if generate_sfc else 'nosfc'}"
-        )
-
-        def _do_compile():
-            return cute.compile(
-                gemm,
-                a_tensor,
-                b_tensor,
-                c_tensor,
-                sfa_tensor,
-                sfb_tensor,
-                sfc_tensor,
-                norm_const_tensor,
-                tile_idx_tensor,
-                num_tiles_tensor,
-                alpha_tensor,
-                max_active_clusters,
-                current_stream,
-                options="--enable-tvm-ffi",
-            )
-
-        _swiglu_compiled_cache[cache_key] = compile_and_cache_cute_dsl_kernel(
-            _do_compile, aot_func_name
-        )
-
-    compiled_gemm = _swiglu_compiled_cache[cache_key]
-
-    # Execute
+    # Execute with torch tensors directly (TVM-FFI handles conversion)
+    # A: (permuted_m, k, 1), B: (n, k, num_experts), C: (permuted_m, intermediate_size, 1)
     compiled_gemm(
-        a_tensor,
-        b_tensor,
-        c_tensor,
-        sfa_tensor,
-        sfb_tensor,
-        sfc_tensor,
-        norm_const_tensor,
-        tile_idx_tensor,
-        num_tiles_tensor,
-        alpha_tensor,
-        current_stream,
+        a.unsqueeze(-1),
+        b.permute(1, 2, 0),
+        out.unsqueeze(-1),
+        a_scale,
+        b_scale,
+        out_scale if generate_sfc else None,
+        global_scale if generate_sfc else None,
+        tile_idx_to_group_idx,
+        num_non_exiting_tiles,
+        alpha,
     )
 
     return out, out_scale if generate_sfc else None

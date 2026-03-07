@@ -2940,16 +2940,13 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
         alpha_tensor_gpu: Optional[torch.Tensor] = None,
     ):
         if c_tensor_gpu is None:
-            # fp4 gemm output is not supported
             c_tensor_gpu = torch.empty(
                 (l, m, n),
                 dtype=cutlass_to_torch_dtype(c_dtype),
                 device="cuda",
             )
 
-        # fp4 or fp8 torch tensor to cute tensor
-        current_stream = cutlass_torch.current_stream()
-
+        # Execute with torch tensors directly (TVM-FFI handles conversion)
         nonlocal kernel
         kernel(
             *get_cute_pointers(
@@ -2964,7 +2961,7 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                     alpha_tensor_gpu,
                 ]
             ),
-            current_stream,
+            cutlass_torch.current_stream(),
         )
 
         return c_tensor_gpu
