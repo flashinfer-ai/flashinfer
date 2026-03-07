@@ -837,6 +837,7 @@ def _test_verify_kernel_mtp(
     alpha: bool,
     beta: bool,
     cache_intermediate_states: bool = True,
+    disable_state_update: bool = True,
     seed: int = 0,
 ):
     """Test gated_delta_rule_mtp API (MTP version) against reference."""
@@ -922,7 +923,7 @@ def _test_verify_kernel_mtp(
         scale=scale_val,
         output=None,
         intermediate_states_buffer=intermediate_states_buffer,
-        disable_state_update=True,  # Don't update state for testing
+        disable_state_update=disable_state_update,
         use_qk_l2norm=True,
     )
 
@@ -990,6 +991,18 @@ def _test_verify_kernel_mtp(
             msg=f"Intermediate states mismatch for MTP kernel (B={B}, T={T}, dtype={dtype})",
         )
 
+    # Compare final state if state update is enabled
+    if not disable_state_update:
+        # Kernel returns [pool_size, HV, V, K], reference returns [B, HV, K, V]
+        final_state_ref_transposed = final_state_ref.transpose(-2, -1).contiguous()
+        torch.testing.assert_close(
+            final_state_kernel.float(),
+            final_state_ref_transposed.float(),
+            atol=atol_s,
+            rtol=rtol_s,
+            msg=f"Final state mismatch for MTP kernel (B={B}, T={T}, dtype={dtype})",
+        )
+
     print(f"✓ MTP kernel test passed (batch={B}, seq_len={T}, dtype={dtype})")
 
 
@@ -1033,6 +1046,49 @@ def test_verify_kernel_mtp(
         beta,
         cache_intermediate_states,
         seed,
+    )
+
+
+# ============================================================================
+# Test MTP kernel with FP32 state, cache ON, state update ON (comprehensive)
+# This tests the full production configuration: all BS and T values
+# ============================================================================
+
+
+@pytest.mark.parametrize("seq_len", [2, 3, 4, 5, 6, 7, 8])
+@pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64, 128, 256, 512])
+@pytest.mark.parametrize("dtype", ["bfloat16"])
+def test_mtp_fp32_state_with_cache_and_state_update(
+    dtype: str,
+    batch_size: int,
+    seq_len: int,
+    seed: int = int(os.environ.get("SEED", "0")),
+):
+    """
+    Comprehensive MTP test with FP32 state, intermediate caching ON, state update ON.
+
+    This tests the production configuration:
+    - FP32 h state (not bf16)
+    - cache_intermediate_states=True
+    - disable_state_update=False (h is updated)
+    - All batch sizes: 1, 2, 4, 8, 16, 32, 64, 128, 256, 512
+    - All sequence lengths: 2, 3, 4, 5, 6, 7, 8
+    """
+    scale_val = 1.0 / math.sqrt(128)  # head_size=128
+    _test_verify_kernel_mtp(
+        dtype=dtype,
+        batch_size=batch_size,
+        num_q_heads=16,
+        num_k_heads=16,
+        num_v_heads=32,
+        head_size=128,
+        seq_len=seq_len,
+        scale=scale_val,
+        alpha=True,
+        beta=True,
+        cache_intermediate_states=True,
+        disable_state_update=False,  # State update ON
+        seed=seed,
     )
 
 
