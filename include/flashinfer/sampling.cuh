@@ -301,7 +301,7 @@ __global__ void OnlineSoftmaxFusedKernel(DType* logits, DType* output, DType* te
   float threadlocal_running_denominator = 0.0f;
 
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  cudaGridDependencySynchronize();
 #endif
 
   // Pass 1: Compute running max and denominator
@@ -389,7 +389,7 @@ __global__ void OnlineSoftmaxFusedKernel(DType* logits, DType* output, DType* te
     }
   }
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -420,7 +420,7 @@ __global__ void OnlineSoftmaxMapKernel(DType* logits, PartialSoftmaxResult* part
   float threadlocal_running_denominator = 0.0f;
 
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  cudaGridDependencySynchronize();
 #endif
 
 #pragma unroll 2
@@ -474,7 +474,7 @@ __global__ void OnlineSoftmaxMapKernel(DType* logits, PartialSoftmaxResult* part
     partial_results[bx * num_slices + by] = {running_max, running_denominator};
   }
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -498,7 +498,7 @@ __global__ void OnlineSoftmaxReduceKernel(DType* logits, DType* output,
   float2 thread_aggregate = make_float2(-cuda::std::numeric_limits<float>::infinity(), 0.0f);
 
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  cudaGridDependencySynchronize();
 #endif
 
   for (uint32_t i = tx; i < num_slices; i += BLOCK_THREADS) {
@@ -545,7 +545,7 @@ __global__ void OnlineSoftmaxReduceKernel(DType* logits, DType* output,
     }
   }
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 

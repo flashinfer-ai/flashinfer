@@ -934,7 +934,7 @@ template <typename T, int NRanks, bool AllReduceOut, bool ResidualOut, bool Norm
 __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
     MoeReductionAllReduceFusionParams<T> params) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  cudaGridDependencySynchronize();
 #endif
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -1075,7 +1075,7 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
 #endif
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 

@@ -438,7 +438,7 @@ __global__ void RopeQuantizeKernel(
     size_t k_rope_out_stride, size_t k_rope_out_stride_h, size_t k_nope_out_stride,
     size_t k_nope_out_stride_h, float quant_scale_q, float quant_scale_kv) {  // generalized kernel
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  cudaGridDependencySynchronize();
 #endif
   uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y;
   uint32_t by = blockIdx.y;
@@ -570,7 +570,7 @@ __global__ void RopeQuantizeKernel(
     }
   }
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -812,7 +812,7 @@ __global__ void RopeQuantizeAppendPagedKVCacheKernel(
     float* __restrict__ cos_sin_cache, RoPEIdType* __restrict__ pos_ids,
     const RopeQuantizeAppendPagedKVCacheParams params) {
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  cudaGridDependencySynchronize();
 #endif
   uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y;
   uint32_t by = blockIdx.y;
@@ -1025,7 +1025,7 @@ __global__ void RopeQuantizeAppendPagedKVCacheKernel(
     }
   }
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
