@@ -256,20 +256,23 @@ def ring_attn_p2p_communicate(
 
 def ulysses_wrapper(func):
     def wrapper(self, query, key, value, tensor_layout, attn_mask=None, **kwargs):
-        attn_parallel_config = self.attn_parallel_config
+        ulysses_group = self.ulysses_group
+        ring_group = self.ring_group
         uneven_cp_config = self.uneven_cp_config
         varlen_cp_config = self.varlen_cp_config
+
+        ulysses_size = (
+            dist.get_world_size(ulysses_group) if ulysses_group is not None else 1
+        )
+        ring_size = dist.get_world_size(ring_group) if ring_group is not None else 1
 
         if kwargs.get("return_lse", False):
             raise ValueError("return_lse=True is not supported in parallel attention")
 
-        if attn_parallel_config.ulysses_size() == 1:
+        if ulysses_size == 1:
             return func(self, query, key, value, tensor_layout, attn_mask, **kwargs)
 
-        ulysses_size = attn_parallel_config.ulysses_size()
-        ulysses_rank = attn_parallel_config.ulysses_rank()
-        ulysses_group = attn_parallel_config.ulysses_group()
-        ring_size = attn_parallel_config.ring_size()
+        ulysses_rank = dist.get_rank(ulysses_group)
 
         assert tensor_layout in ["NHD", "HND"], (
             f"tensor_layout must be NHD or HND, but got {tensor_layout}"
@@ -313,7 +316,7 @@ def ulysses_wrapper(func):
         )
 
         # truncate and pad if cp is uneven
-        truncate_and_pad = uneven_cp_config.seq_len_all_ranks is not None
+        truncate_and_pad = uneven_cp_config is not None
 
         if ring_size == 1 and truncate_and_pad:
             # there is no ring, so we can use uneven_cp_config.seq_len
@@ -324,10 +327,7 @@ def ulysses_wrapper(func):
             key = torch.narrow(key, seq_dim, 0, seq_len).contiguous()
             value = torch.narrow(value, seq_dim, 0, seq_len).contiguous()
 
-        if (
-            ring_size == 1
-            and varlen_cp_config.cu_seqlens_q_cur_ulysses_group is not None
-        ):
+        if ring_size == 1 and varlen_cp_config is not None:
             cu_seqlens_q = varlen_cp_config.cu_seqlens_q_cur_ulysses_group
             cu_seqlens_kv = varlen_cp_config.cu_seqlens_kv_cur_ulysses_group
             kwargs["cur_rank_cu_seqlens_q"] = cu_seqlens_q
@@ -357,7 +357,7 @@ def ulysses_wrapper(func):
 
         if (
             ring_size == 1
-            and varlen_cp_config.cu_seqlens_q_cur_ulysses_group is not None
+            and varlen_cp_config is not None
             and result.shape[seq_dim]
             > varlen_cp_config.cu_seqlens_q_cur_ulysses_group[-1]
         ):
@@ -387,17 +387,16 @@ def get_kv_rank(ring_size, ring_rank, cur_iter):
 
 def ring_wrapper(func):
     def wrapper(self, query, key, value, tensor_layout, attn_mask=None, **kwargs):
-        attn_parallel_config = self.attn_parallel_config
+        ring_group = self.ring_group
         uneven_cp_config = self.uneven_cp_config
         varlen_cp_config = self.varlen_cp_config
 
-        ring_size = attn_parallel_config.ring_size()
-        ring_group = attn_parallel_config.ring_group()
+        ring_size = dist.get_world_size(ring_group) if ring_group is not None else 1
 
         if ring_size == 1:
             return func(self, query, key, value, tensor_layout, attn_mask, **kwargs)
 
-        rank = attn_parallel_config.ring_rank()
+        rank = dist.get_rank(ring_group)
         send_dst = (rank + 1) % ring_size
         recv_src = (rank - 1) % ring_size
 
@@ -436,7 +435,7 @@ def ring_wrapper(func):
             kv_inputs = p2p_comm_buffers[i % 2]
 
             # do truncate and pad if cp is uneven,
-            if uneven_cp_config.seq_len_cur_ring_group is not None:
+            if uneven_cp_config is not None:
                 # seq_dim+1 because kv_inputs is concated to
                 # [2, H, S, D] or [2, S, H, D]
                 if (
@@ -451,7 +450,7 @@ def ring_wrapper(func):
                         uneven_cp_config.seq_len_cur_ring_group[kv_rank],
                     )
 
-            if varlen_cp_config.cu_seqlens_q_cur_ring_group is not None:
+            if varlen_cp_config is not None:
                 cu_seqlens_q = varlen_cp_config.cu_seqlens_q_cur_ring_group[rank]
                 cu_seqlens_kv = varlen_cp_config.cu_seqlens_kv_cur_ring_group[kv_rank]
                 kwargs["cur_rank_cu_seqlens_q"] = cu_seqlens_q
@@ -508,13 +507,13 @@ def ring_wrapper(func):
         start_pos = out.shape[out_seq_dim]
 
         if (
-            uneven_cp_config.seq_len_cur_ring_group is not None
+            uneven_cp_config is not None
             and out.shape[out_seq_dim] > uneven_cp_config.seq_len_cur_ring_group[rank]
         ):
             start_pos = uneven_cp_config.seq_len_cur_ring_group[rank]
 
         if (
-            varlen_cp_config.cu_seqlens_q_cur_ring_group is not None
+            varlen_cp_config is not None
             and out.shape[out_seq_dim]
             > varlen_cp_config.cu_seqlens_q_cur_ring_group[rank][-1]
         ):

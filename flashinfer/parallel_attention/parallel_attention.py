@@ -1,7 +1,9 @@
 import logging
 
+import torch
+
 from .attention_ops import AttentionOpManager
-from .parallel_config import AttnParallelConfig, UnevenCPConfig, VarlenCPConfig
+from .parallel_config import UnevenCPConfig, VarlenCPConfig
 from .parallel_wrapper import ring_wrapper, ulysses_wrapper
 
 logger = logging.getLogger(__name__)
@@ -16,7 +18,8 @@ class ParallelAttention:
 
     Args:
         attn_type: Name of the registered attention backend (e.g. ``"flash-attn3"``).
-        attn_parallel_config: Parallel configuration specifying ring/ulysses sizes.
+        ulysses_group: Ulysses process group.
+        ring_group: Ring process group.
         uneven_cp_config: Configuration for uneven context parallelism where
             sequence lengths are not evenly divisible across ranks.
         varlen_cp_config: Configuration for variable-length context parallelism
@@ -30,9 +33,8 @@ class ParallelAttention:
         config.set_config(ulysses_size=2, ring_size=2)
         attn = ParallelAttention(
             attn_type="flash-attn3",
-            attn_parallel_config=config,
-            uneven_cp_config=UnevenCPConfig(),
-            varlen_cp_config=VarlenCPConfig(),
+            ulysses_group=ulysses_group,
+            ring_group=ring_group,
         )
         output = attn.run(query, key, value, tensor_layout="HND")
     """
@@ -40,14 +42,16 @@ class ParallelAttention:
     def __init__(
         self,
         attn_type: str,
-        attn_parallel_config: AttnParallelConfig,
-        uneven_cp_config: UnevenCPConfig,
-        varlen_cp_config: VarlenCPConfig,
+        ulysses_group: torch.distributed.ProcessGroup,
+        ring_group: torch.distributed.ProcessGroup,
+        uneven_cp_config: UnevenCPConfig = None,
+        varlen_cp_config: VarlenCPConfig = None,
         fuse_qkv: bool = False,
     ):
         self.attn_type = attn_type
         self.attn_impl = AttentionOpManager.get_impl(attn_type)
-        self.attn_parallel_config = attn_parallel_config
+        self.ulysses_group = ulysses_group
+        self.ring_group = ring_group
         self.uneven_cp_config = uneven_cp_config
         self.varlen_cp_config = varlen_cp_config
         self.fuse_qkv = fuse_qkv

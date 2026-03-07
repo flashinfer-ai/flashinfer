@@ -13,11 +13,14 @@ import torch.nn.functional as F
 
 from flashinfer.utils import get_compute_capability, is_sm90a_supported
 from flashinfer.parallel_attention import (
-    AttnParallelConfig,
     UnevenCPConfig,
     VarlenCPConfig,
     ParallelAttention,
     split_varlen_input,
+    get_parallel_groups,
+    uneven_cp_config,
+    ulysses_varlen_config,
+    ring_varlen_config,
 )
 
 
@@ -117,7 +120,7 @@ def _assert_cos_similarity(output, ref_output, threshold=0.99):
 @pytest.mark.parametrize("num_heads", [24])
 @pytest.mark.parametrize("seq_len", [6 * 8 * 1024])
 @pytest.mark.parametrize("head_dim", [128])
-@pytest.mark.parametrize("ulysses_size,ring_size", [(2, 2)])
+@pytest.mark.parametrize("ulysses_size,ring_size", [(2, 2), (1, 4), (4, 1)])
 @pytest.mark.parametrize("attn_type", ["flash-attn3"])
 @pytest.mark.parametrize("tensor_layout", ["HND", "NHD"])
 def test_attn_parallel(
@@ -139,13 +142,13 @@ def test_attn_parallel(
         local_key = local_key.permute(1, 0, 2).contiguous()
         local_value = local_value.permute(1, 0, 2).contiguous()
 
-    attn_parallel_config = AttnParallelConfig()
-    attn_parallel_config.set_config(ulysses_size=ulysses_size, ring_size=ring_size)
+    ring_group, ulysses_group = get_parallel_groups(
+        ulysses_size=ulysses_size, ring_size=ring_size
+    )
     attn = ParallelAttention(
         attn_type=attn_type,
-        attn_parallel_config=attn_parallel_config,
-        uneven_cp_config=UnevenCPConfig(),
-        varlen_cp_config=VarlenCPConfig(),
+        ulysses_group=ulysses_group,
+        ring_group=ring_group,
     )
 
     local_output = attn.run(local_query, local_key, local_value, tensor_layout)
@@ -185,9 +188,7 @@ def test_uneven_attn_parallel(
     )
 
     uneven_number = world_size - 1
-    seq_len_cur_rank = torch.tensor(
-        [local_query.shape[1]], dtype=torch.int32, device=device
-    )
+    seq_len_cur_rank = local_query.shape[1]
     if rank == world_size - 1:
         seq_len_cur_rank = seq_len_cur_rank - uneven_number
 
@@ -196,21 +197,26 @@ def test_uneven_attn_parallel(
         local_key = local_key.permute(1, 0, 2).contiguous()
         local_value = local_value.permute(1, 0, 2).contiguous()
 
-    attn_parallel_config = AttnParallelConfig()
-    attn_parallel_config.set_config(ulysses_size=ulysses_size, ring_size=ring_size)
-    uneven_cp_config = UnevenCPConfig()
-    uneven_cp_config.set_uneven_cp_config(
-        seq_len_padded - uneven_number,
-        seq_len_padded,
-        seq_len_cur_rank,
-        attn_parallel_config,
+    ring_group, ulysses_group = get_parallel_groups(
+        ulysses_size=ulysses_size, ring_size=ring_size
     )
-    varlen_cp_config = VarlenCPConfig()
+    seq_len_cur_ring_group = uneven_cp_config(
+        seq_len=seq_len_padded - uneven_number,
+        seq_len_padded=seq_len_padded,
+        seq_len_cur_rank=seq_len_cur_rank,
+        ulysses_group=ulysses_group,
+        ring_group=ring_group,
+    )
+    ucp_config = UnevenCPConfig(
+        seq_len=seq_len_padded - uneven_number,
+        seq_len_padded=seq_len_padded,
+        seq_len_cur_ring_group=seq_len_cur_ring_group,
+    )
     attn = ParallelAttention(
         attn_type=attn_type,
-        attn_parallel_config=attn_parallel_config,
-        uneven_cp_config=uneven_cp_config,
-        varlen_cp_config=varlen_cp_config,
+        ulysses_group=ulysses_group,
+        ring_group=ring_group,
+        uneven_cp_config=ucp_config,
     )
 
     local_output = attn.run(
@@ -260,18 +266,23 @@ def test_ulysses_varlen_attn_parallel(
         local_key = local_key.permute(1, 0, 2).contiguous()
         local_value = local_value.permute(1, 0, 2).contiguous()
 
-    attn_parallel_config = AttnParallelConfig()
-    attn_parallel_config.set_config(ulysses_size=ulysses_size, ring_size=ring_size)
-    varlen_cp_config = VarlenCPConfig()
-    varlen_cp_config.set_ulysses_varlen_config(
-        seq_len_list, seq_len_list, attn_parallel_config
+    ring_group, ulysses_group = get_parallel_groups(
+        ulysses_size=ulysses_size, ring_size=ring_size
     )
-    uneven_cp_config = UnevenCPConfig()
+    cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv = ulysses_varlen_config(
+        seq_len_list, seq_len_list
+    )
+    vcp_config = VarlenCPConfig(
+        cu_seqlens_q_cur_ulysses_group=cu_seqlens_q,
+        cu_seqlens_kv_cur_ulysses_group=cu_seqlens_kv,
+        max_seq_len_q_cur_ulysses_group=max_seqlen_q,
+        max_seq_len_kv_cur_ulysses_group=max_seqlen_kv,
+    )
     attn = ParallelAttention(
         attn_type=attn_type,
-        attn_parallel_config=attn_parallel_config,
-        uneven_cp_config=uneven_cp_config,
-        varlen_cp_config=varlen_cp_config,
+        ulysses_group=ulysses_group,
+        ring_group=ring_group,
+        varlen_cp_config=vcp_config,
     )
 
     local_output = attn.run(
@@ -281,8 +292,8 @@ def test_ulysses_varlen_attn_parallel(
     if tensor_layout == "NHD":
         local_output = local_output.permute(1, 0, 2)
 
-    cu_seqlens_q = varlen_cp_config.cu_seqlens_q_cur_ulysses_group.cpu()
-    cu_seqlens_kv = varlen_cp_config.cu_seqlens_kv_cur_ulysses_group.cpu()
+    cu_seqlens_q = cu_seqlens_q.cpu()
+    cu_seqlens_kv = cu_seqlens_kv.cpu()
     local_ref_output_list = []
     for i in range(len(seq_len_list)):
         q_tmp = query[:, cu_seqlens_q[i] : cu_seqlens_q[i + 1], :]
@@ -329,20 +340,21 @@ def test_ring_varlen_attn_parallel(
         local_key = local_key.permute(1, 0, 2).contiguous()
         local_value = local_value.permute(1, 0, 2).contiguous()
 
-    attn_parallel_config = AttnParallelConfig()
-    attn_parallel_config.set_config(ulysses_size=1, ring_size=ring_size)
-
-    varlen_cp_config = VarlenCPConfig()
-    varlen_cp_config.set_ring_varlen_config(
-        seq_len_list, seq_len_list, attn_parallel_config
+    ring_group, ulysses_group = get_parallel_groups(ulysses_size=1, ring_size=ring_size)
+    cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv = ring_varlen_config(
+        seq_len_list, seq_len_list, ring_group
     )
-    uneven_cp_config = UnevenCPConfig()
-
+    vcp_config = VarlenCPConfig(
+        cu_seqlens_q_cur_ring_group=cu_seqlens_q,
+        cu_seqlens_kv_cur_ring_group=cu_seqlens_kv,
+        max_seq_len_q_cur_ring_group=max_seqlen_q,
+        max_seq_len_kv_cur_ring_group=max_seqlen_kv,
+    )
     attn = ParallelAttention(
         attn_type=attn_type,
-        attn_parallel_config=attn_parallel_config,
-        uneven_cp_config=uneven_cp_config,
-        varlen_cp_config=varlen_cp_config,
+        ulysses_group=ulysses_group,
+        ring_group=ring_group,
+        varlen_cp_config=vcp_config,
     )
     local_output = attn.run(
         local_query, local_key, local_value, tensor_layout=tensor_layout
