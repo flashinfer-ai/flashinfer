@@ -593,10 +593,11 @@ void trtllm_ragged_attention(
     q_data_type = kv_data_type;
     // reinterpret shapes (for TMA) related to Qk
     int dtype_size = get_size_in_bits(qk_reinterpret_type) / get_size_in_bits(q_data_type);
-    head_dim_qk *= dtype_size;
     k_stride_keys_values *= dtype_size;
     k_stride_heads *= dtype_size;
     k_stride_batch *= dtype_size;
+    // starting below, head dim only serves kernel meta & TMA desc, bmm1 scale must be caller-given
+    head_dim_qk *= dtype_size;
   } else {
     // no reinterpret (ignored when qk_reinterpret_type == E4m3 or q_data_type != E4m3)
     qk_reinterpret_type = DATA_TYPE_E4M3;
