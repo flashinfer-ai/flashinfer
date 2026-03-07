@@ -226,7 +226,7 @@ quantize_with_block_size(
   int numPaddedColThreads = numPaddedCols / ELTS_PER_THREAD;
   int numColThreadsForSf = numColsForSf / ELTS_PER_THREAD;
 
-  asm volatile("griddepcontrol.wait;");
+  cudaGridDependencySynchronize();
 
   // Input tensor batch/row/col loops.
   // Optimization: Iterate over actual rows first (hot path), then padding rows (cold path)
@@ -313,7 +313,7 @@ quantize_with_block_size(
       }
     }
   }
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -376,7 +376,7 @@ quantize_with_block_size_tma(
   int numPaddedRowsForSf = isSfSwizzledLayout ? PadUpFn(numRows, rowTile) : numRows;
   int numColsForSf = isSfSwizzledLayout ? PadUpFn(numPaddedCols, 4 * SF_VEC_SIZE) : numPaddedCols;
 
-  asm volatile("griddepcontrol.wait;");
+  cudaGridDependencySynchronize();
 
   // TMA barrier initialization.
   if (warpIdx == 0 and laneIdx == 0) {
@@ -501,7 +501,7 @@ quantize_with_block_size_tma(
       }
     }
   }
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
