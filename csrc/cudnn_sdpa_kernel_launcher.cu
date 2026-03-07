@@ -402,7 +402,7 @@ static void create_packed_tma_desc_qo_prefill(int b, int32_t* actual_seq_lens_q_
   }
 }
 
-void setup_prefill(CUfunction* prefill_func) {
+void setup_prefill(tvm::ffi::cuda_api::KernelHandle* prefill_func) {
   // Use cu++filt to get the kernel name
   std::string kernel_name_deepseek_causal =
       "_Z47cudnn_sm100_fprop_sdpa_prefill_bf16_"
@@ -439,17 +439,16 @@ void setup_prefill(CUfunction* prefill_func) {
   auto mod_deepseek = std::make_shared<tvm::ffi::CubinModule>(
       tvm::ffi::Bytes(cubin_deepseek.data(), cubin_deepseek.size()));
 
-  prefill_func[KERNEL_PREFILL] =
-      reinterpret_cast<CUfunction>(mod->GetKernel(kernel_name.c_str()).GetHandle());
-  prefill_func[KERNEL_PREFILL_DEEPSEEK] = reinterpret_cast<CUfunction>(
-      mod_deepseek->GetKernel(kernel_name_deepseek.c_str()).GetHandle());
-  prefill_func[KERNEL_PREFILL_CAUSAL] =
-      reinterpret_cast<CUfunction>(mod->GetKernel(kernel_name_causal.c_str()).GetHandle());
-  prefill_func[KERNEL_PREFILL_DEEPSEEK_CAUSAL] = reinterpret_cast<CUfunction>(
-      mod_deepseek->GetKernel(kernel_name_deepseek_causal.c_str()).GetHandle());
+  prefill_func[KERNEL_PREFILL] = mod->GetKernel(kernel_name.c_str()).GetHandle();
+  prefill_func[KERNEL_PREFILL_DEEPSEEK] =
+      mod_deepseek->GetKernel(kernel_name_deepseek.c_str()).GetHandle();
+  prefill_func[KERNEL_PREFILL_CAUSAL] = mod->GetKernel(kernel_name_causal.c_str()).GetHandle();
+  prefill_func[KERNEL_PREFILL_DEEPSEEK_CAUSAL] =
+      mod_deepseek->GetKernel(kernel_name_deepseek_causal.c_str()).GetHandle();
 };
 
-void setup_decode(CUfunction* hfunc_decode, CUfunction* lean_attn_reduction) {
+void setup_decode(tvm::ffi::cuda_api::KernelHandle* hfunc_decode,
+                  tvm::ffi::cuda_api::KernelHandle* lean_attn_reduction) {
   constexpr int NUM_DECODE_KERNELS = 5;
 
   std::string decode_kernel_name[NUM_DECODE_KERNELS] = {
@@ -483,11 +482,9 @@ void setup_decode(CUfunction* hfunc_decode, CUfunction* lean_attn_reduction) {
   auto mod = std::make_shared<tvm::ffi::CubinModule>(tvm::ffi::Bytes(cubin.data(), cubin.size()));
 
   for (int i = 0; i < NUM_DECODE_KERNELS; i++) {
-    hfunc_decode[i] =
-        reinterpret_cast<CUfunction>(mod->GetKernel(decode_kernel_name[i].c_str()).GetHandle());
+    hfunc_decode[i] = mod->GetKernel(decode_kernel_name[i].c_str()).GetHandle();
   }
-  *lean_attn_reduction = reinterpret_cast<CUfunction>(
-      mod->GetKernel(lean_attn_reduction_kernel_name.c_str()).GetHandle());
+  *lean_attn_reduction = mod->GetKernel(lean_attn_reduction_kernel_name.c_str()).GetHandle();
 };
 
 void prefill(int64_t b, int64_t s_qo, int64_t max_s_kv, TensorView q, TensorView k_cache,
@@ -518,7 +515,8 @@ void prefill(int64_t b, int64_t s_qo, int64_t max_s_kv, TensorView q, TensorView
 
   // Step 1: Setup the kernel pointer
 
-  static CUfunction prefill_func[KERNEL_NUM_PREFILL_TYPES] = {nullptr, nullptr, nullptr, nullptr};
+  static tvm::ffi::cuda_api::KernelHandle prefill_func[KERNEL_NUM_PREFILL_TYPES] = {
+      nullptr, nullptr, nullptr, nullptr};
 
   int64_t d_qk = q.size(2);
 
@@ -745,7 +743,7 @@ void prefill(int64_t b, int64_t s_qo, int64_t max_s_kv, TensorView q, TensorView
   args[12] = &num_pages_per_seq32;
   args[13] = &page_size_div;
 
-  auto err_launch = CUDA_SUCCESS;
+  auto err_launch = tvm::ffi::cuda_api::kSuccess;
 
   auto choice = KERNEL_PREFILL;
   if (causal) {
@@ -754,9 +752,9 @@ void prefill(int64_t b, int64_t s_qo, int64_t max_s_kv, TensorView q, TensorView
     choice = d_qk == 192 ? KERNEL_PREFILL_DEEPSEEK : KERNEL_PREFILL;
   }
 
-  err_launch = cuLaunchKernelEx(&config, prefill_func[choice], (void**)args, nullptr);
+  err_launch = tvm::ffi::cuda_api::LaunchKernelEx(prefill_func[choice], (void**)args, config);
 
-  if (err_launch != CUDA_SUCCESS) {
+  if (err_launch != tvm::ffi::cuda_api::kSuccess) {
     const char* errstr = NULL;
     cuGetErrorString(err_launch, &errstr);
     throw std::runtime_error("Failed to cuLaunchKernelEx for prefill");
@@ -914,9 +912,9 @@ void decode(int64_t max_s_kv, TensorView q, TensorView k_cache, TensorView v_cac
   const CUstream stream = get_stream(q.device());
 
   constexpr int NUM_DECODE_KERNELS = 5;
-  static CUfunction hfunc_decode[NUM_DECODE_KERNELS] = {nullptr, nullptr, nullptr, nullptr,
-                                                        nullptr};
-  static CUfunction lean_attn_reduction{nullptr};
+  static tvm::ffi::cuda_api::KernelHandle hfunc_decode[NUM_DECODE_KERNELS] = {
+      nullptr, nullptr, nullptr, nullptr, nullptr};
+  static tvm::ffi::cuda_api::KernelHandle lean_attn_reduction{nullptr};
 
   static int sm_count = 0;
 
@@ -1109,8 +1107,9 @@ void decode(int64_t max_s_kv, TensorView q, TensorView k_cache, TensorView v_cac
 
   auto kernel_id = get_kernel_id(attnDesc.q_heads_per_kv);
 
-  auto err_launch = cuLaunchKernelEx(&config, hfunc_decode[kernel_id], (void**)args, nullptr);
-  if (err_launch != CUDA_SUCCESS) {
+  auto err_launch =
+      tvm::ffi::cuda_api::LaunchKernelEx(hfunc_decode[kernel_id], (void**)args, config);
+  if (err_launch != tvm::ffi::cuda_api::kSuccess) {
     std::cerr << "cuLaunchKernelEx failed with error code " << err_launch << std::endl;
     throw std::runtime_error("cuLaunchKernelEx failed for decode");
   }
@@ -1161,9 +1160,9 @@ void decode(int64_t max_s_kv, TensorView q, TensorView k_cache, TensorView v_cac
     reduction_config.numAttrs = 1;
     reduction_config.attrs = reduction_attrs;
 
-    auto err_launch = cuLaunchKernelEx(&reduction_config, lean_attn_reduction,
-                                       (void**)args_lean_attn_reduction, nullptr);
-    if (err_launch != CUDA_SUCCESS) {
+    auto err_launch = tvm::ffi::cuda_api::LaunchKernelEx(
+        lean_attn_reduction, (void**)args_lean_attn_reduction, reduction_config);
+    if (err_launch != tvm::ffi::cuda_api::kSuccess) {
       std::cerr << "cuLaunchKernelEx failed with error code " << err_launch << std::endl;
       throw std::runtime_error("cuLaunchKernelEx failed for decode");
     }
