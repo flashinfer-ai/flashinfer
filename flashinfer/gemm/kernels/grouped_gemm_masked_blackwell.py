@@ -2946,21 +2946,17 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                 device="cuda",
             )
 
-        # Execute with torch tensors directly (TVM-FFI handles conversion)
+        # Pass torch tensors directly — TVM-FFI converts to pointers at the ABI boundary
         nonlocal kernel
         kernel(
-            *get_cute_pointers(
-                [
-                    a_tensor_gpu,
-                    b_tensor_gpu,
-                    sfa_tensor_gpu,
-                    sfb_tensor_gpu,
-                    c_tensor_gpu,
-                    masked_m_tensor_gpu,
-                    dst_signals_tensor_gpu,
-                    alpha_tensor_gpu,
-                ]
-            ),
+            a_tensor_gpu,
+            b_tensor_gpu,
+            sfa_tensor_gpu,
+            sfb_tensor_gpu,
+            c_tensor_gpu,
+            masked_m_tensor_gpu,
+            dst_signals_tensor_gpu,
+            alpha_tensor_gpu,
             cutlass_torch.current_stream(),
         )
 
