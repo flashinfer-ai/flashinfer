@@ -489,6 +489,10 @@ int32_t GemmInterface::run(GemmConfig const& config, void* workspace, GemmData c
   CUmodule cuModule;
   CUfunction cuFunction;
 
+  // NOTE: CubinModule (CUlibrary/CUkernel API) cannot be used here because
+  // cuFuncSetAttribute in trtllm::gen::launchKernel requires CUfunction,
+  // not CUkernel. We use cuModuleLoadData which produces CUfunction handles
+  // compatible with cuFuncSetAttribute and cuLaunchKernelEx.
   auto fiModuleLoadData = [&](CUmodule* module) {
     const std::string sha256 = config.mHash ? config.mHash : "";
     std::string fname_cubin = config.mFunctionName;
@@ -496,28 +500,24 @@ int32_t GemmInterface::run(GemmConfig const& config, void* workspace, GemmData c
       fname_cubin[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(fname_cubin[0])));
     }
     fname_cubin = tllm_gen_gemm_cubin_path + "/" + fname_cubin + ".cubin";
-    std::string cubin = getCubin(fname_cubin, sha256);
+    std::string cubin = flashinfer::getCubin(fname_cubin, sha256);
     cuModuleLoadData(&cuModule, cubin.c_str());
   };
 
   if (moduleCache.has_value()) {
     ModuleCache& moduleCacheRef = moduleCache.value().get();
 
-    // Modules are associated with a specific context, so the context is included in the key
     CUcontext ctx;
     unsigned long long ctxId;
     cuCtxGetCurrent(&ctx);
     cuCtxGetId(ctx, &ctxId);
 
-    // Reinterpret the ctxId as a string to avoid needing a custom hash or converting it to a
-    // string in decimal representation.
     std::string const ctxName =
         std::string(reinterpret_cast<char*>(&ctxId), sizeof(unsigned long long) / sizeof(char));
     std::string const funcName = std::string(config.mFunctionName);
     auto const moduleKey = ctxName + funcName;
     auto module = moduleCacheRef.find(moduleKey);
 
-    // Use cache if module is found, otherwise load and insert into cache
     if (module != moduleCacheRef.end()) {
       cuFunction = std::get<1>(module->second);
     } else {

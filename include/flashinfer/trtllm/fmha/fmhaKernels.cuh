@@ -792,44 +792,17 @@ class TllmGenFmhaKernel {
 
     // Load the function if not found.
     if (mFunctions.find(hashId) == mFunctions.end()) {
-      // Load the kernel on-demand.
+      // Load the kernel on-demand via TVM-FFI CubinModule.
       auto const& kernelMeta = mKernelMeta[metaIndex];
-      CUmodule hmod{0};
-      std::string kernelName(kernelMeta.mFuncName);
+      std::string cubin_path = tllm_gen_fmha_cubin_path + "/" + kernelMeta.mFuncName + ".cubin";
 
-      // Check if the module is already loaded.
-      auto findModuleIter = mModules.find(kernelMeta.mFuncName);
-      auto capitalizeFirst = [](std::string str) {
-        if (!str.empty()) {
-          str[0] = std::toupper(str[0]);
-        }
-        return str;
-      };
-      if (findModuleIter == mModules.end()) {
-        // Load the module.
-        std::string cubin_path = tllm_gen_fmha_cubin_path + "/" + kernelMeta.mFuncName + ".cubin";
-        std::string cubin = getCubin(cubin_path, kernelMeta.sha256);
-        if (cubin.empty()) {
-          throw std::runtime_error("Failed to load cubin for " + kernelName);
-        }
-        cuErrCheck(cuModuleLoadData(&hmod, cubin.data()));
-        mModules[kernelName] = hmod;
-      } else {
-        hmod = findModuleIter->second;
-      }
-
-      // Load the function.
-      KernelInfo funcInfo;
-      funcInfo.mMetaInfoIndex = metaIndex;
-      cuErrCheck(cuModuleGetFunction(&funcInfo.mDeviceFunction, hmod, kernelMeta.mFuncName));
-
-      if (kernelMeta.mSharedMemBytes >= 48 * 1024) {
-        cuErrCheck(cuFuncSetAttribute(funcInfo.mDeviceFunction,
-                                      CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                                      kernelMeta.mSharedMemBytes));
-      }
+      auto cubinKernel = flashinfer::cubin_loader::getCubinKernel(
+          cubin_path, kernelMeta.sha256, kernelMeta.mFuncName, kernelMeta.mSharedMemBytes);
 
       // Cache the loaded function.
+      KernelInfo funcInfo;
+      funcInfo.mMetaInfoIndex = metaIndex;
+      funcInfo.mDeviceFunction = reinterpret_cast<CUfunction>(cubinKernel.GetHandle());
       mFunctions[hashId] = funcInfo;
     }
 
@@ -846,8 +819,6 @@ class TllmGenFmhaKernel {
   KernelMeta const* mKernelMeta;
   unsigned int mKernelMetaCount;
   unsigned int mSM;
-  mutable std::unordered_map<std::string, CUmodule> mModules;
-
   mutable std::unordered_map<uint64_t, unsigned int> mKernelMetaMap;
 
   struct KernelInfo {

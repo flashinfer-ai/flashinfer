@@ -434,35 +434,19 @@ void setup_prefill(CUfunction* prefill_func) {
     throw std::runtime_error("Failed to load cubin for prefill_deepseek");
   }
 
-  CUmodule hmod{0};
-  CUmodule hmod_deepseek{0};
-  if (cuModuleLoadData(&hmod_deepseek, cubin_deepseek.data()) != CUDA_SUCCESS) {
-    throw std::runtime_error("Failed to cuModuleLoadData for prefill_deepseek");
-  }
+  // Load via TVM-FFI CubinModule (RAII, cached).
+  auto mod = std::make_shared<tvm::ffi::CubinModule>(tvm::ffi::Bytes(cubin.data(), cubin.size()));
+  auto mod_deepseek = std::make_shared<tvm::ffi::CubinModule>(
+      tvm::ffi::Bytes(cubin_deepseek.data(), cubin_deepseek.size()));
 
-  if (cuModuleLoadData(&hmod, cubin.data()) != CUDA_SUCCESS) {
-    throw std::runtime_error("Failed to cuModuleLoadData for prefill");
-  }
-
-  if (cuModuleGetFunction(&prefill_func[KERNEL_PREFILL], hmod, kernel_name.c_str()) !=
-      CUDA_SUCCESS) {
-    throw std::runtime_error("Failed to cuModuleGetFunction for prefill");
-  }
-
-  if (cuModuleGetFunction(&prefill_func[KERNEL_PREFILL_DEEPSEEK], hmod_deepseek,
-                          kernel_name_deepseek.c_str()) != CUDA_SUCCESS) {
-    throw std::runtime_error("Failed to cuModuleGetFunction for prefill_deepseek");
-  }
-
-  if (cuModuleGetFunction(&prefill_func[KERNEL_PREFILL_CAUSAL], hmod, kernel_name_causal.c_str()) !=
-      CUDA_SUCCESS) {
-    throw std::runtime_error("Failed to cuModuleGetFunction for prefill");
-  }
-
-  if (cuModuleGetFunction(&prefill_func[KERNEL_PREFILL_DEEPSEEK_CAUSAL], hmod_deepseek,
-                          kernel_name_deepseek_causal.c_str()) != CUDA_SUCCESS) {
-    throw std::runtime_error("Failed to cuModuleGetFunction for prefill_deepseek");
-  }
+  prefill_func[KERNEL_PREFILL] =
+      reinterpret_cast<CUfunction>(mod->GetKernel(kernel_name.c_str()).GetHandle());
+  prefill_func[KERNEL_PREFILL_DEEPSEEK] = reinterpret_cast<CUfunction>(
+      mod_deepseek->GetKernel(kernel_name_deepseek.c_str()).GetHandle());
+  prefill_func[KERNEL_PREFILL_CAUSAL] =
+      reinterpret_cast<CUfunction>(mod->GetKernel(kernel_name_causal.c_str()).GetHandle());
+  prefill_func[KERNEL_PREFILL_DEEPSEEK_CAUSAL] = reinterpret_cast<CUfunction>(
+      mod_deepseek->GetKernel(kernel_name_deepseek_causal.c_str()).GetHandle());
 };
 
 void setup_decode(CUfunction* hfunc_decode, CUfunction* lean_attn_reduction) {
@@ -495,22 +479,15 @@ void setup_decode(CUfunction* hfunc_decode, CUfunction* lean_attn_reduction) {
     throw std::runtime_error("Failed to load cubin for decode");
   }
 
-  CUmodule hmod{0};
-  if (cuModuleLoadData(&hmod, cubin.data()) != CUDA_SUCCESS) {
-    throw std::runtime_error("Failed to cuModuleLoadData for decode");
-  }
+  // Load via TVM-FFI CubinModule (RAII, cached).
+  auto mod = std::make_shared<tvm::ffi::CubinModule>(tvm::ffi::Bytes(cubin.data(), cubin.size()));
 
   for (int i = 0; i < NUM_DECODE_KERNELS; i++) {
-    if (cuModuleGetFunction(&hfunc_decode[i], hmod, decode_kernel_name[i].c_str()) !=
-        CUDA_SUCCESS) {
-      throw std::runtime_error("Failed to cuModuleGetFunction for decode at location " +
-                               std::to_string(i) + " " + decode_kernel_name[i]);
-    }
+    hfunc_decode[i] =
+        reinterpret_cast<CUfunction>(mod->GetKernel(decode_kernel_name[i].c_str()).GetHandle());
   }
-  if (cuModuleGetFunction(lean_attn_reduction, hmod, lean_attn_reduction_kernel_name.c_str()) !=
-      CUDA_SUCCESS) {
-    throw std::runtime_error("Failed to cuModuleGetFunction for lean_attn_reduction decode");
-  }
+  *lean_attn_reduction = reinterpret_cast<CUfunction>(
+      mod->GetKernel(lean_attn_reduction_kernel_name.c_str()).GetHandle());
 };
 
 void prefill(int64_t b, int64_t s_qo, int64_t max_s_kv, TensorView q, TensorView k_cache,
