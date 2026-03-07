@@ -345,3 +345,63 @@ void moe_sort(
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(flashinfer_moe_sort, moe_sort);
+
+#ifdef ENABLE_BF16
+// ============================ fused_topk_raw_logits bindings ============================
+// Use TRTLLM routingRenormalize code path (same kernel family as non-routed TRTLLM MoE).
+//
+// Notes:
+// - This function computes top-k scores/weights from raw routing logits (mPtrScores path).
+// - mPtrTopKIds is intentionally left nullptr to force score-driven routing selection.
+// - topk_packed_ptr is required by routing kernels for large-token paths.
+void fused_topk_raw_logits_trtllm_renormalize(
+    int64_t topk_weights_ptr, int64_t topk_packed_ptr, int64_t gating_output_ptr,
+    int32_t num_tokens, int32_t num_experts, int32_t top_k, bool renormalize, bool use_pdl,
+    int32_t tile_tokens_dim, int64_t expert_counts_ptr, int64_t permuted_idx_size_ptr,
+    int64_t expanded_idx_to_permuted_idx_ptr, int64_t permuted_idx_to_token_idx_ptr,
+    int64_t cta_idx_to_batch_idx_ptr, int64_t cta_idx_to_mn_limit_ptr,
+    int64_t num_non_exiting_ctas_ptr,
+    // Optional explicit CUDA stream pointer for CUDA graph compatibility.
+    // If 0, use TVM FFI current stream.
+    int64_t cuda_stream_ptr) {
+  moe::dev::routing::routingRenormalize::Data routingData;
+
+  // Match TRTLLM non-routed MoE routing defaults.
+  routingData.mDtypeExpW = batchedGemm::trtllm::gen::Dtype::Bfloat16;
+  routingData.mDtypeElt = batchedGemm::trtllm::gen::Dtype::Bfloat16;
+  routingData.mUsePdl = use_pdl;
+  routingData.mDoSoftmaxBeforeTopK = false;
+  routingData.mNormTopkProb = false;
+  routingData.mApplySoftmaxAfterTopK = renormalize;
+
+  routingData.mPtrScores = reinterpret_cast<void const*>(gating_output_ptr);
+  routingData.mPtrTopKWeights = reinterpret_cast<void*>(topk_weights_ptr);
+  routingData.mPtrTopKIds = nullptr;
+  routingData.mPtrTopKPacked = reinterpret_cast<void*>(topk_packed_ptr);
+
+  routingData.mPtrExpertCounts = reinterpret_cast<int32_t*>(expert_counts_ptr);
+  routingData.mPtrPermutedIdxSize = reinterpret_cast<int32_t*>(permuted_idx_size_ptr);
+  routingData.mPtrExpandedIdxToPermutedIdx =
+      reinterpret_cast<int32_t*>(expanded_idx_to_permuted_idx_ptr);
+  routingData.mPtrPermutedIdxToTokenIdx = reinterpret_cast<int32_t*>(permuted_idx_to_token_idx_ptr);
+  routingData.mPtrCtaIdxXyToBatchIdx = reinterpret_cast<int32_t*>(cta_idx_to_batch_idx_ptr);
+  routingData.mPtrCtaIdxXyToMnLimit = reinterpret_cast<int32_t*>(cta_idx_to_mn_limit_ptr);
+  routingData.mPtrNumNonExitingCtas = reinterpret_cast<int32_t*>(num_non_exiting_ctas_ptr);
+
+  routingData.mNumTokens = num_tokens;
+  routingData.mNumExperts = num_experts;
+  routingData.mTopK = top_k;
+  routingData.mPaddingLog2 = computeLog2(tile_tokens_dim);
+  routingData.mTileTokensDim = tile_tokens_dim;
+  routingData.mLocalExpertsStartIdx = 0;
+  routingData.mLocalExpertsStrideLog2 = 0;
+  routingData.mNumLocalExperts = num_experts;
+
+  cudaStream_t stream =
+      cuda_stream_ptr != 0 ? reinterpret_cast<cudaStream_t>(cuda_stream_ptr) : get_current_stream();
+  moe::dev::routing::routingRenormalize::run(routingData, stream);
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(flashinfer_fused_topk_raw_logits_trtllm_renormalize,
+                              fused_topk_raw_logits_trtllm_renormalize);
+#endif

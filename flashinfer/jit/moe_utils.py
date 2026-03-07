@@ -77,6 +77,8 @@ def gen_moe_utils_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/memoryUtils.cu",
             # Routing kernels for moe_sort
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_routing_deepseek.cu",
+            # Routing kernels for raw-logits top-k (TRTLLM renormalize path)
+            jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_routing_renormalize.cu",
         ],
         extra_cuda_cflags=nvcc_flags,
         extra_include_paths=[

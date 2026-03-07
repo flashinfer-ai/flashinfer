@@ -20,6 +20,7 @@ import pytest
 import torch
 
 import flashinfer
+from flashinfer.fused_moe import fused_topk_raw_logits
 from flashinfer.topk import can_implement_filtered_topk
 from flashinfer.utils import get_compute_capability
 
@@ -256,6 +257,65 @@ def test_top_k_vs_torch_topk_compatibility():
         fi_indices.int(), torch_indices.int(), batch_size, k
     )
     assert accuracy >= 0.98
+
+
+# ===================== TRTLLM MoE Raw Logits TopK Tests =====================
+
+
+def _skip_if_not_sm100_or_sm103() -> None:
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] not in [10]:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+
+
+@pytest.mark.parametrize("num_tokens", [1, 7, 31, 127, 257, 777, 1537])
+@pytest.mark.parametrize(
+    "num_experts, top_k",
+    [
+        (8, 2),
+        (16, 4),
+        (64, 8),
+        (128, 8),
+    ],
+)
+@pytest.mark.parametrize("renormalize", [False, True])
+def test_fused_topk_raw_logits_matches_torch_reference(
+    num_tokens, num_experts, top_k, renormalize
+):
+    _skip_if_not_sm100_or_sm103()
+
+    device = torch.device("cuda:0")
+    token_ids = torch.arange(num_tokens, device=device, dtype=torch.int32).unsqueeze(1)
+    expert_ids = torch.arange(num_experts, device=device, dtype=torch.int32).unsqueeze(
+        0
+    )
+    routing_logits = ((expert_ids + token_ids) % num_experts).to(torch.bfloat16)
+    topk_weights = torch.empty(num_tokens, top_k, device=device, dtype=torch.float32)
+    topk_ids = torch.empty(num_tokens, top_k, device=device, dtype=torch.int32)
+
+    fused_topk_raw_logits(
+        topk_weights, topk_ids, routing_logits, renormalize=renormalize
+    )
+
+    ref_values, ref_ids = torch.topk(
+        routing_logits.float(), k=top_k, dim=-1, sorted=False
+    )
+    ref_weights = torch.softmax(ref_values, dim=-1) if renormalize else ref_values
+    if renormalize:
+        # routingRenormalize stores selected weights in bf16 internally.
+        ref_weights = ref_weights.to(torch.bfloat16).to(torch.float32)
+    ref_ids = ref_ids.to(torch.int32)
+
+    sort_idx = torch.argsort(topk_ids, dim=-1)
+    sorted_ids = torch.gather(topk_ids, dim=-1, index=sort_idx)
+    sorted_weights = torch.gather(topk_weights, dim=-1, index=sort_idx)
+
+    ref_sort_idx = torch.argsort(ref_ids, dim=-1)
+    ref_sorted_ids = torch.gather(ref_ids, dim=-1, index=ref_sort_idx)
+    ref_sorted_weights = torch.gather(ref_weights, dim=-1, index=ref_sort_idx)
+
+    assert torch.equal(sorted_ids, ref_sorted_ids)
+    torch.testing.assert_close(sorted_weights, ref_sorted_weights, rtol=1e-2, atol=1e-3)
 
 
 # ===================== Fused TopK Transform Tests =====================
