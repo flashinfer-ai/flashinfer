@@ -62,6 +62,12 @@ inline std::string fp8QuantizationTypeToString(Fp8QuantizationType quantization_
   }
 }
 
+inline ActivationType validateAndCastActivationType(int64_t act_type) {
+  TVM_FFI_ICHECK(act_type >= 0 && act_type < static_cast<int64_t>(ActivationType::InvalidType))
+      << "Invalid activation type: " << act_type;
+  return static_cast<ActivationType>(act_type);
+}
+
 // Utility function to compute the next power of two
 inline int32_t nextPowerOfTwo(float value) {
   int32_t n = static_cast<int32_t>(std::ceil(value));
@@ -1126,6 +1132,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
       int64_t num_tokens, bool use_shuffled_weight, int64_t weight_layout, btg::Dtype dtype_act,
       btg::Dtype dtype_weights, Fp8QuantizationType quantization_type, int64_t act_type) {
     Array<Array<int64_t>> valid_configs;
+    auto activation_type = validateAndCastActivationType(act_type);
 
     auto supported_tile_nums = getSupportedTileNums(quantization_type);
     std::set<int32_t> selected_tile_nums =
@@ -1137,6 +1144,9 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
       // This branch is for DeepSeek FP8 (E4m3 activations + E4m3 weights).
       if (quantization_type == Fp8QuantizationType::DeepSeekFp8 && dtype_act == btg::Dtype::E4m3 &&
           dtype_weights == btg::Dtype::E4m3) {
+        TVM_FFI_ICHECK_EQ(activation_type, ActivationType::Swiglu)
+            << "DeepSeekFp8 valid-config query only supports ActivationType::Swiglu, got "
+            << static_cast<int>(activation_type) << ".";
         moe_runner = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner>(
             dtype_weights, true /* useDeepSeekFp8 */, tile_N, use_shuffled_weight,
             static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout));
@@ -1147,7 +1157,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
             dtype_act,                                              // dtypeAct
             dtype_weights,                                          // dtypeWeights
             quantization_type == Fp8QuantizationType::DeepSeekFp8,  // useDeepSeekFp8
-            tile_N, static_cast<ActivationType>(act_type), use_shuffled_weight,
+            tile_N, activation_type, use_shuffled_weight,
             static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout));
       }
 
@@ -1809,15 +1819,14 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
     int64_t routing_method_type, bool use_shuffled_weight, int64_t weight_layout, bool do_finalize,
     bool enable_pdl, Array<int64_t> config_index, Fp8QuantizationType quantization_type,
     int64_t act_type) {
-  auto activation_type = static_cast<ActivationType>(act_type);
-  // DeepSeekFp8 currently uses a TRTLLM runner path that does not consume activation_type.
-  // Fail fast for non-gated activations instead of silently running with incorrect semantics.
+  auto activation_type = validateAndCastActivationType(act_type);
+  // DeepSeekFp8 currently uses a TRTLLM runner that hardwires Swiglu activation semantics.
+  // Fail for any other activation to avoid silently running incorrect activation behavior.
   if (quantization_type == Fp8QuantizationType::DeepSeekFp8 &&
-      !isGatedActivation(activation_type)) {
+      activation_type != ActivationType::Swiglu) {
     TVM_FFI_LOG_AND_THROW(NotImplementedError)
-        << "DeepSeekFp8 only supports gated activations (e.g. Swiglu/Geglu). "
-        << "Received non-gated activation_type=" << static_cast<int>(activation_type)
-        << ". Use MxFp8 for non-gated activations such as Relu2/Identity.";
+        << "DeepSeekFp8 only supports ActivationType::Swiglu in this runner path. "
+        << "Received activation_type=" << static_cast<int>(activation_type);
   }
 
   // Basic type validation
@@ -2171,6 +2180,7 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
     int64_t const top_k, int64_t const hidden_size, int64_t const intermediate_size,
     int64_t const num_local_experts, int64_t const act_type, bool const use_shuffled_weight,
     int64_t const weight_layout, int64_t const num_tokens) {
+  auto activation_type = validateAndCastActivationType(act_type);
   auto dtype_act = static_cast<btg::Dtype>(dtype_act_);
   auto dtype_weights = static_cast<btg::Dtype>(dtype_weights_);
 
@@ -2187,10 +2197,10 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
 
   } else if (quantization_type == Fp8QuantizationType::DeepSeekFp8 &&
              dtype_act == btg::Dtype::E4m3 && dtype_weights == btg::Dtype::E4m3) {
-    if (!isGatedActivation(static_cast<ActivationType>(act_type))) {
+    if (activation_type != ActivationType::Swiglu) {
       TVM_FFI_LOG_AND_THROW(NotImplementedError)
-          << "DeepSeekFp8 valid-config query only supports gated activations "
-          << "(e.g. Swiglu/Geglu). Received non-gated act_type=" << act_type << ".";
+          << "DeepSeekFp8 valid-config query only supports ActivationType::Swiglu, "
+          << "got act_type=" << act_type << ".";
     }
     // FP8 block scale (DeepSeek)
     return Fp8BlockScaleLauncher::getValidConfigs(
