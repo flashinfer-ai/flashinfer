@@ -1810,6 +1810,15 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
     bool enable_pdl, Array<int64_t> config_index, Fp8QuantizationType quantization_type,
     int64_t act_type) {
   auto activation_type = static_cast<ActivationType>(act_type);
+  // DeepSeekFp8 currently uses a TRTLLM runner path that does not consume activation_type.
+  // Fail fast for non-gated activations instead of silently running with incorrect semantics.
+  if (quantization_type == Fp8QuantizationType::DeepSeekFp8 &&
+      !isGatedActivation(activation_type)) {
+    TVM_FFI_LOG_AND_THROW(NotImplementedError)
+        << "DeepSeekFp8 only supports gated activations (e.g. Swiglu/Geglu). "
+        << "Received non-gated activation_type=" << static_cast<int>(activation_type)
+        << ". Use MxFp8 for non-gated activations such as Relu2/Identity.";
+  }
 
   // Basic type validation
   auto dtype = hidden_states.dtype();
@@ -2178,6 +2187,11 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
 
   } else if (quantization_type == Fp8QuantizationType::DeepSeekFp8 &&
              dtype_act == btg::Dtype::E4m3 && dtype_weights == btg::Dtype::E4m3) {
+    if (!isGatedActivation(static_cast<ActivationType>(act_type))) {
+      TVM_FFI_LOG_AND_THROW(NotImplementedError)
+          << "DeepSeekFp8 valid-config query only supports gated activations "
+          << "(e.g. Swiglu/Geglu). Received non-gated act_type=" << act_type << ".";
+    }
     // FP8 block scale (DeepSeek)
     return Fp8BlockScaleLauncher::getValidConfigs(
         top_k, hidden_size, intermediate_size, num_local_experts, num_tokens, use_shuffled_weight,
