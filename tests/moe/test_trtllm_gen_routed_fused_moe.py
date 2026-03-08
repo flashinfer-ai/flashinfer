@@ -393,7 +393,7 @@ def test_trtllm_gen_fp8_routed_fused_moe(
         local_num_experts=num_experts,
         routed_scaling_factor=None,
         routing_method_type=routing_method_type.value,
-        use_shuffled_weight=True,
+        use_shuffled_weight=False,
         weight_layout=0,
         enable_pdl=enable_pdl,
     ).to(torch.float)
