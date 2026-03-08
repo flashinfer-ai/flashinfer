@@ -42,11 +42,11 @@ cudaError_t CutlassGroupwiseScaledGEMMSM120(void* float_buffer, size_t float_buf
                                             DTypeIn* A_ptr, DTypeIn* B_ptr, float* SFA_ptr,
                                             float* SFB_ptr, DTypeOut* D_ptr, int m, int n, int k,
                                             int l, cudaStream_t stream) {
-  // SM120 only supports these specific scale granularities
+  // SM120/SM121 only supports these specific scale granularities
   static_assert(ScaleGranularityM == 1 || ScaleGranularityM == 128,
-                "SM120 only supports ScaleGranularityM = 1 or 128");
-  static_assert(ScaleGranularityN == 128, "SM120 only supports ScaleGranularityN = 128");
-  static_assert(ScaleGranularityK == 128, "SM120 only supports ScaleGranularityK = 128");
+                "SM120/SM121 only supports ScaleGranularityM = 1 or 128");
+  static_assert(ScaleGranularityN == 128, "SM120/SM121 only supports ScaleGranularityN = 128");
+  static_assert(ScaleGranularityK == 128, "SM120/SM121 only supports ScaleGranularityK = 128");
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
   using namespace cute;
 

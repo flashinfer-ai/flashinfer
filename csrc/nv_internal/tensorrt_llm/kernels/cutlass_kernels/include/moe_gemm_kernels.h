@@ -239,11 +239,11 @@ constexpr bool isGatedActivation(ActivationType activation_type) {
          activation_type == ActivationType::SwigluBias;
 }
 
-template <typename T,                         /*The type used for activations/scales/compute*/
-          typename WeightType,                /* The type for the MoE weights */
-          typename OutputType,                /* The output type for the GEMM */
-          typename ScaleBiasType = OutputType /* The type for the scales/bias */
-          >
+template <typename T,                          /*The type used for activations/scales/compute*/
+          typename WeightType,                 /* The type for the MoE weights */
+          typename OutputType,                 /* The output type for the GEMM */
+          typename ScaleBiasType = OutputType, /* The type for the scales/bias */
+          bool IsMXFPX = false>
 class MoeGemmRunner {
  public:
   MoeGemmRunner();
@@ -273,6 +273,8 @@ class MoeGemmRunner {
   static constexpr bool use_fp8 = false;
   static constexpr bool use_w4afp8 = false;
 #endif
+  static constexpr bool use_mxfp8 = use_fp8 && IsMXFPX;
+
   static constexpr bool use_w4_groupwise = use_w4afp8 || use_wfp4a16;
 
 #if defined(ENABLE_FP4)

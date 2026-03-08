@@ -597,7 +597,7 @@ def test_correctness_dpsk_fp8_fused_moe(
     class FP8BlockScaleMoe:
         def __init__(self):
             self.name = "FP8BlockScale"
-            self.quant_mode = QuantMode.FP8_BLOCK_SCALE
+            self.quant_mode = QuantMode.FP8_BLOCK_SCALE_DEEPSEEK
 
     moe_impl = FP8BlockScaleMoe()
 

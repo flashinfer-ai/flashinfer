@@ -8,11 +8,14 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
+import logging
 import os
 import subprocess
 from collections import namedtuple
 from enum import IntEnum
 from itertools import product
+
+logger = logging.getLogger(__name__)
 
 sm2name = {
     70: "volta",
@@ -6706,13 +6709,13 @@ def enumerate_kernels():
         enumerate_hgmma_flash_warpspec_kernels(specs, sm=90, dtype="fp16_fp32")
     # Optionally generate HMMA kernels on SM90 for comparison.
     if "SM90_USE_HMMA" in os.environ:
-        print("WARNING: GENERATING HMMA KERNELS INSTEAD OF HGMMA FOR SM90")
+        logger.warning("GENERATING HMMA KERNELS INSTEAD OF HGMMA FOR SM90")
         enumerate_hmma_kernels(specs, sm=90, dtype="fp16")
         enumerate_hmma_kernels(specs, sm=90, dtype="bf16")
 
     # SM90 IGMMA
     if "SM90_USE_IMMA" in os.environ:
-        print("WARNING: GENERATING IMMA KERNELS INSTEAD OF IGMMA FOR SM90")
+        logger.warning("GENERATING IMMA KERNELS INSTEAD OF IGMMA FOR SM90")
         enumerate_imma_kernels(specs, sm=90)
 
     # SM 89

@@ -306,8 +306,9 @@ void moe_sort(
   routingData.mPtrCtaIdxXyToMnLimit = reinterpret_cast<int32_t*>(tile_idx_to_mn_limit_ptr);
   routingData.mPtrExpandedIdxToPermutedIdx =
       reinterpret_cast<int32_t*>(expanded_idx_to_permuted_idx_ptr);
-  routingData.mPtrPermutedIdxToTokenIdx =
+  routingData.mPtrPermutedIdxToExpandedIdx =
       reinterpret_cast<int32_t*>(permuted_idx_to_expanded_idx_ptr);
+  routingData.mPtrPermutedIdxToTokenIdx = nullptr;
   routingData.mPtrPermutedIdxSize = reinterpret_cast<int32_t*>(total_num_padded_tokens_ptr);
   routingData.mPtrNumNonExitingCtas = reinterpret_cast<int32_t*>(num_non_exiting_tiles_ptr);
 
