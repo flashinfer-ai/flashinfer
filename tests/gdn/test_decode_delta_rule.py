@@ -38,7 +38,7 @@ except ImportError:
 # Import the actual decode functions
 from flashinfer.gdn_decode import (
     gated_delta_rule_decode_pretranspose,
-    gated_delta_rule_decode,
+    gated_delta_rule_decode_kv,
     gated_delta_rule_mtp,
 )
 from flashinfer.utils import get_compute_capability
@@ -309,7 +309,7 @@ def _test_decode_kernel_nontranspose(
 
     # Call kernel (nontranspose version uses K-major layout directly, no transpose needed)
     our_state = input_state.clone()
-    our_o, our_state = gated_delta_rule_decode(
+    our_o, our_state = gated_delta_rule_decode_kv(
         q=q,
         k=k,
         v=v,

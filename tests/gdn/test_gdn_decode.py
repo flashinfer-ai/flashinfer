@@ -16,7 +16,7 @@ limitations under the License.
 
 from __future__ import annotations
 
-"""Tests for the unified GDN decode API (gated_delta_rule_decode_unified)."""
+"""Tests for the GDN decode API (gated_delta_rule_decode)."""
 
 import random
 
@@ -24,7 +24,8 @@ import torch
 import pytest
 
 from flashinfer.gdn_decode import (
-    gated_delta_rule_decode_unified,
+    gated_delta_rule_decode,
+    gated_delta_rule_decode_pretranspose,
     _gated_delta_rule_decode_pretranspose_impl,
     _gated_delta_rule_decode_kv_impl,
     _gated_delta_rule_mtp_impl,
@@ -74,16 +75,16 @@ def _make_qkv_state_and_params(
 
 
 # -----------------------------------------------------------------------------
-# Unified vs legacy: same inputs, compare outputs
+# gated_delta_rule_decode vs legacy impl: same inputs, compare outputs
 # -----------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("batch_size", [2, 8])
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16])
-def test_unified_vk_bf16_t1_no_pool_matches_pretranspose(
+def test_gated_delta_rule_decode_vk_bf16_t1_no_pool_matches_pretranspose(
     batch_size: int, state_dtype: torch.dtype
 ):
-    """Unified API (VK, bf16, T=1, no pool) should match gated_delta_rule_decode_pretranspose."""
+    """gated_delta_rule_decode (VK, bf16, T=1, no pool) should match pretranspose impl."""
     _skip_if_not_sm90_or_later()
     B, T = batch_size, 1
     num_q, num_k, num_v, head_size = 16, 16, 32, 128
@@ -106,7 +107,7 @@ def test_unified_vk_bf16_t1_no_pool_matches_pretranspose(
         scale=None,
         use_qk_l2norm=True,
     )
-    out_unified, _ = gated_delta_rule_decode_unified(
+    out_unified, _ = gated_delta_rule_decode(
         q=q,
         k=k,
         v=v,
@@ -125,8 +126,8 @@ def test_unified_vk_bf16_t1_no_pool_matches_pretranspose(
 
 
 @pytest.mark.parametrize("batch_size", [2, 8])
-def test_unified_vk_fp32_t1_no_pool_matches_pretranspose(batch_size: int):
-    """Unified API (VK, fp32, T=1, no pool) should match gated_delta_rule_decode_pretranspose."""
+def test_gated_delta_rule_decode_vk_fp32_t1_no_pool_matches_pretranspose(batch_size: int):
+    """gated_delta_rule_decode (VK, fp32, T=1, no pool) should match pretranspose impl."""
     _skip_if_not_sm90_or_later()
     B, T = batch_size, 1
     num_q, num_k, num_v, head_size = 16, 16, 32, 128
@@ -149,7 +150,7 @@ def test_unified_vk_fp32_t1_no_pool_matches_pretranspose(batch_size: int):
         scale=None,
         use_qk_l2norm=True,
     )
-    out_unified, _ = gated_delta_rule_decode_unified(
+    out_unified, _ = gated_delta_rule_decode(
         q=q,
         k=k,
         v=v,
@@ -168,8 +169,8 @@ def test_unified_vk_fp32_t1_no_pool_matches_pretranspose(batch_size: int):
 
 
 @pytest.mark.parametrize("batch_size", [2, 8])
-def test_unified_kv_fp32_t1_matches_decode_kv(batch_size: int):
-    """Unified API (KV, fp32, T=1) should match gated_delta_rule_decode (KV layout)."""
+def test_gated_delta_rule_decode_kv_fp32_t1_matches_decode_kv(batch_size: int):
+    """gated_delta_rule_decode (KV, fp32, T=1) should match KV impl."""
     _skip_if_not_sm90_or_later()
     B, T = batch_size, 1
     num_q, num_k, num_v, head_size = 16, 16, 32, 128
@@ -194,7 +195,7 @@ def test_unified_kv_fp32_t1_matches_decode_kv(batch_size: int):
         scale=None,
         use_qk_l2norm=True,
     )
-    out_unified, _ = gated_delta_rule_decode_unified(
+    out_unified, _ = gated_delta_rule_decode(
         q=q,
         k=k,
         v=v,
@@ -214,8 +215,8 @@ def test_unified_kv_fp32_t1_matches_decode_kv(batch_size: int):
 
 @pytest.mark.parametrize("batch_size", [2, 4])
 @pytest.mark.parametrize("T", [2, 3])
-def test_unified_vk_fp32_mtp_matches_mtp(batch_size: int, T: int):
-    """Unified API (VK, fp32, T>1, pool) should match gated_delta_rule_mtp."""
+def test_gated_delta_rule_decode_vk_fp32_mtp_matches_mtp(batch_size: int, T: int):
+    """gated_delta_rule_decode (VK, fp32, T>1, pool) should match MTP impl."""
     _skip_if_not_sm90_or_later()
     B = batch_size
     num_q, num_k, num_v, head_size = 16, 16, 32, 128
@@ -259,7 +260,7 @@ def test_unified_vk_fp32_mtp_matches_mtp(batch_size: int, T: int):
         disable_state_update=False,
         use_qk_l2norm=True,
     )
-    out_unified, _ = gated_delta_rule_decode_unified(
+    out_unified, _ = gated_delta_rule_decode(
         q=q,
         k=k,
         v=v,
@@ -279,8 +280,8 @@ def test_unified_vk_fp32_mtp_matches_mtp(batch_size: int, T: int):
     torch.testing.assert_close(pool_unified, pool_legacy, atol=5e-3, rtol=5e-3)
 
 
-def test_unified_vk_fp32_mtp_with_intermediate_buffer_matches_mtp():
-    """Unified API with intermediate_states_buffer should match _gated_delta_rule_mtp_impl."""
+def test_gated_delta_rule_decode_vk_fp32_mtp_with_intermediate_buffer_matches_mtp():
+    """gated_delta_rule_decode with intermediate_states_buffer should match MTP impl."""
     _skip_if_not_sm90_or_later()
     B, T, num_q, num_k, num_v, head_size = 4, 2, 16, 16, 32, 128
     pool_size = B + 2
@@ -335,7 +336,7 @@ def test_unified_vk_fp32_mtp_with_intermediate_buffer_matches_mtp():
         use_qk_l2norm=True,
         intermediate_states_buffer=intermed_legacy,
     )
-    out_unified, _ = gated_delta_rule_decode_unified(
+    out_unified, _ = gated_delta_rule_decode(
         q=q,
         k=k,
         v=v,
@@ -354,12 +355,15 @@ def test_unified_vk_fp32_mtp_with_intermediate_buffer_matches_mtp():
 
     torch.testing.assert_close(out_unified, out_legacy, atol=5e-3, rtol=5e-3)
     torch.testing.assert_close(pool_unified, pool_legacy, atol=5e-3, rtol=5e-3)
+    torch.testing.assert_close(
+        intermed_unified, intermed_legacy, atol=5e-3, rtol=5e-3
+    )
 
 
 @pytest.mark.parametrize("batch_size", [1])
 @pytest.mark.parametrize("pool_size", [1, 4])
-def test_unified_vk_fp32_mtp_edge_pool_size_and_b1(batch_size: int, pool_size: int):
-    """Edge cases: B=1 and/or pool_size=1 (unified MTP path)."""
+def test_gated_delta_rule_decode_vk_fp32_mtp_edge_pool_size_and_b1(batch_size: int, pool_size: int):
+    """Edge cases: B=1 and/or pool_size=1 (MTP path)."""
     _skip_if_not_sm90_or_later()
     B, T = batch_size, 2
     num_q, num_k, num_v, head_size = 16, 16, 32, 128
@@ -401,7 +405,7 @@ def test_unified_vk_fp32_mtp_edge_pool_size_and_b1(batch_size: int, pool_size: i
         disable_state_update=False,
         use_qk_l2norm=True,
     )
-    out_unified, _ = gated_delta_rule_decode_unified(
+    out_unified, _ = gated_delta_rule_decode(
         q=q,
         k=k,
         v=v,
@@ -426,7 +430,7 @@ def test_unified_vk_fp32_mtp_edge_pool_size_and_b1(batch_size: int, pool_size: i
 # -----------------------------------------------------------------------------
 
 
-def test_unified_invalid_state_layout_raises():
+def test_gated_delta_rule_decode_invalid_state_layout_raises():
     _skip_if_not_sm90_or_later()
     B, T, H, HV, K, V = 2, 1, 16, 32, 128, 128
     device = torch.device("cuda")
@@ -440,12 +444,12 @@ def test_unified_invalid_state_layout_raises():
     b = torch.randn(B, T, HV, dtype=torch.bfloat16, device=device)
 
     with pytest.raises(ValueError, match="state_layout must be"):
-        gated_delta_rule_decode_unified(
+        gated_delta_rule_decode(
             q, k, v, state, A_log, a, dt_bias, b, state_layout="invalid"
         )
 
 
-def test_unified_kv_with_state_indices_raises():
+def test_gated_delta_rule_decode_kv_with_state_indices_raises():
     _skip_if_not_sm90_or_later()
     B, T, H, HV, K, V = 2, 1, 16, 32, 128, 128
     device = torch.device("cuda")
@@ -460,7 +464,7 @@ def test_unified_kv_with_state_indices_raises():
     b = torch.randn(B, T, HV, dtype=torch.bfloat16, device=device)
 
     with pytest.raises(NotImplementedError, match="state_indices.*KV"):
-        gated_delta_rule_decode_unified(
+        gated_delta_rule_decode(
             q,
             k,
             v,
@@ -474,7 +478,39 @@ def test_unified_kv_with_state_indices_raises():
         )
 
 
-def test_unified_vk_fp32_t_gt_1_without_pool_raises():
+def test_gated_delta_rule_decode_state_indices_out_of_bounds_raises():
+    """state_indices must be in [0, pool_size); out-of-range raises ValueError."""
+    _skip_if_not_sm90_or_later()
+    B, T, H, HV, K, V = 2, 1, 16, 32, 128, 128
+    pool_size = 4
+    device = torch.device("cuda")
+    q = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device)
+    k = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device)
+    v = torch.randn(B, T, HV, V, dtype=torch.bfloat16, device=device)
+    state = torch.randn(pool_size, HV, V, K, dtype=torch.bfloat16, device=device)
+    A_log = torch.randn(HV, dtype=torch.float32, device=device)
+    a = torch.randn(B, T, HV, dtype=torch.bfloat16, device=device)
+    dt_bias = torch.randn(HV, dtype=torch.float32, device=device)
+    b = torch.randn(B, T, HV, dtype=torch.bfloat16, device=device)
+
+    # index >= pool_size
+    state_indices = torch.tensor([0, pool_size], dtype=torch.int32, device=device)
+    with pytest.raises(ValueError, match="state_indices must be in \\[0, pool_size"):
+        gated_delta_rule_decode(
+            q, k, v, state, A_log, a, dt_bias, b,
+            state_layout="VK", state_indices=state_indices,
+        )
+
+    # negative index
+    state_indices_neg = torch.tensor([0, -1], dtype=torch.int32, device=device)
+    with pytest.raises(ValueError, match="state_indices must be in \\[0, pool_size"):
+        gated_delta_rule_decode(
+            q, k, v, state, A_log, a, dt_bias, b,
+            state_layout="VK", state_indices=state_indices_neg,
+        )
+
+
+def test_gated_delta_rule_decode_vk_fp32_t_gt_1_without_pool_raises():
     _skip_if_not_sm90_or_later()
     B, T, H, HV, K, V = 2, 3, 16, 32, 128, 128
     device = torch.device("cuda")
@@ -489,7 +525,7 @@ def test_unified_vk_fp32_t_gt_1_without_pool_raises():
     b = torch.randn(B, T, HV, dtype=torch.bfloat16, device=device)
 
     with pytest.raises(ValueError, match="state_indices and state as pool"):
-        gated_delta_rule_decode_unified(
+        gated_delta_rule_decode(
             q,
             k,
             v,
@@ -502,7 +538,7 @@ def test_unified_vk_fp32_t_gt_1_without_pool_raises():
         )
 
 
-def test_unified_kv_t_gt_1_raises():
+def test_gated_delta_rule_decode_kv_t_gt_1_raises():
     _skip_if_not_sm90_or_later()
     B, T, H, HV, K, V = 2, 2, 16, 32, 128, 128
     device = torch.device("cuda")
@@ -516,6 +552,75 @@ def test_unified_kv_t_gt_1_raises():
     b = torch.randn(B, T, HV, dtype=torch.bfloat16, device=device)
 
     with pytest.raises(ValueError, match="state_layout='KV' only supports T=1"):
-        gated_delta_rule_decode_unified(
+        gated_delta_rule_decode(
             q, k, v, state, A_log, a, dt_bias, b, state_layout="KV"
         )
+
+
+def test_gated_delta_rule_decode_bf16_pool_unsupported_options_raises():
+    """VK bf16 path with pool does not support disable_state_update or intermediate_states_buffer."""
+    _skip_if_not_sm90_or_later()
+    B, T, H, HV, K, V = 2, 1, 16, 32, 128, 128
+    pool_size = 4
+    device = torch.device("cuda")
+    q = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device)
+    k = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device)
+    v = torch.randn(B, T, HV, V, dtype=torch.bfloat16, device=device)
+    state = torch.randn(pool_size, HV, V, K, dtype=torch.bfloat16, device=device)
+    state_indices = torch.arange(B, dtype=torch.int32, device=device)
+    A_log = torch.randn(HV, dtype=torch.float32, device=device)
+    a = torch.randn(B, T, HV, dtype=torch.bfloat16, device=device)
+    dt_bias = torch.randn(HV, dtype=torch.float32, device=device)
+    b = torch.randn(B, T, HV, dtype=torch.bfloat16, device=device)
+    intermed = torch.zeros(
+        pool_size, T, HV, V, K, dtype=torch.float32, device=device
+    )
+
+    with pytest.raises(NotImplementedError, match="disable_state_update"):
+        gated_delta_rule_decode(
+            q, k, v, state, A_log, a, dt_bias, b,
+            state_layout="VK", state_indices=state_indices,
+            disable_state_update=True,
+        )
+    with pytest.raises(NotImplementedError, match="intermediate_states_buffer"):
+        gated_delta_rule_decode(
+            q, k, v, state, A_log, a, dt_bias, b,
+            state_layout="VK", state_indices=state_indices,
+            intermediate_states_buffer=intermed,
+        )
+
+
+def test_pretranspose_shim_validation_raises():
+    """Legacy gated_delta_rule_decode_pretranspose preserves initial_state/state validation."""
+    _skip_if_not_sm90_or_later()
+    B, T, H, HV, K, V = 2, 1, 16, 32, 128, 128
+    device = torch.device("cuda")
+    q = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device)
+    k = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device)
+    v = torch.randn(B, T, HV, V, dtype=torch.bfloat16, device=device)
+    state = torch.randn(B, HV, V, K, dtype=torch.bfloat16, device=device)
+    pool = torch.randn(4, HV, V, K, dtype=torch.bfloat16, device=device)
+    indices = torch.arange(B, dtype=torch.int32, device=device)
+    A_log = torch.randn(HV, dtype=torch.float32, device=device)
+    a = torch.randn(B, T, HV, dtype=torch.bfloat16, device=device)
+    dt_bias = torch.randn(HV, dtype=torch.float32, device=device)
+    b = torch.randn(B, T, HV, dtype=torch.bfloat16, device=device)
+
+    with pytest.warns(DeprecationWarning, match="deprecated"):
+        with pytest.raises(ValueError, match="provided together"):
+            gated_delta_rule_decode_pretranspose(
+                q, k, v, state=None, A_log=A_log, a=a, dt_bias=dt_bias, b=b,
+                initial_state=pool, initial_state_indices=None,
+            )
+    with pytest.warns(DeprecationWarning, match="deprecated"):
+        with pytest.raises(ValueError, match="provided together"):
+            gated_delta_rule_decode_pretranspose(
+                q, k, v, state=state, A_log=A_log, a=a, dt_bias=dt_bias, b=b,
+                initial_state=None, initial_state_indices=indices,
+            )
+    with pytest.warns(DeprecationWarning, match="deprecated"):
+        with pytest.raises(ValueError, match="Either state or initial_state"):
+            gated_delta_rule_decode_pretranspose(
+                q, k, v, state=None, A_log=A_log, a=a, dt_bias=dt_bias, b=b,
+                initial_state=None, initial_state_indices=None,
+            )

@@ -96,7 +96,7 @@ with contextlib.suppress(ImportError):
         CuteDslMoEWrapper as CuteDslMoEWrapper,
     )
 from .gdn_decode import (
-    gated_delta_rule_decode_unified as gated_delta_rule_decode_unified,
+    gated_delta_rule_decode as gated_delta_rule_decode,
 )
 from .gdn_prefill import chunk_gated_delta_rule as chunk_gated_delta_rule
 from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
