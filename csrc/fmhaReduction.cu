@@ -34,7 +34,7 @@ namespace kernels {
 template <int32_t TileSizePerCtaQ, int32_t HeadDim, int32_t HeadDimPerCta, bool IsE4m3Bmm,
           typename DtypeO, typename DtypePartialO>
 __global__ void __launch_bounds__(NumThreadsPerCta, 2)
-    fmhaReductionKernel(KernelParams const params, int32_t numCtasForReduction,
+    fmhaReductionKernel(KernelParams const params, bool sparseMla, int32_t numCtasForReduction,
                         int32_t numCtasForAllHeads, int32_t numHeadDimCtasV) {
   // clang-format off
   // The shape of partialO buffer: [batchSize, numHeadCtas, numCtasQ, numCtasKv, TileSizePerCtaQ, headDimPerCta].
@@ -64,10 +64,25 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
 
   // The number of validRows.
   int32_t const numValidRows{TileSizePerCtaQ};
+  // The seqOffsetQ.
+  int32_t const seqOffsetQ{params.ptrCumSeqLensQ == nullptr ? batchIdx * params.mMaxSeqLenQ
+                                                            : params.ptrCumSeqLensQ[batchIdx]};
+  // The seqLenQ.
+  int32_t const seqLenQ{params.ptrCumSeqLensQ == nullptr
+                            ? params.mMaxSeqLenQ
+                            : (params.ptrCumSeqLensQ[batchIdx + 1] - seqOffsetQ)};
+  // Early exit if ctaIdxQ >= seqLenQ, where each CTA processes one tokenQ.
+  if (ctaIdxQ >= seqLenQ) {
+    return;
+  }
   // The actual number of seqLenKv.
   int32_t seqLenKv{params.ptrSeqLensKv[batchIdx]};
   // Consider the causal-mask speculative decoding.
   seqLenKv = seqLenKv - ((params.mMaxSeqLenQ - 1) - ctaIdxQ);
+  // Consider sparseMlaTopK.
+  if (sparseMla) {
+    seqLenKv = min(seqLenKv, params.mSparseMlaTopK);
+  }
   // The actual number of CtasKv (TileSizeKv is always 128 for now).
   int32_t numCtasKv{min((seqLenKv + 127) / 128, params.mMaxNumCtasKv)};
 
@@ -336,7 +351,7 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams 
   config.numAttrs = 1;
 
   // Select the kernel function pointer.
-  void (*kernel)(KernelParams const, int32_t, int32_t, int32_t) = nullptr;
+  void (*kernel)(KernelParams const, bool, int32_t, int32_t, int32_t) = nullptr;
   if (headDimPerCtaV == 128) {
     SELECT_FMHA_REDUCTION_KERNEL(128);
   } else if (headDimPerCtaV == 256) {
@@ -346,8 +361,8 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams 
   }
 
   // Launch the kernel.
-  cudaLaunchKernelEx(&config, kernel, params, numCtasForReduction, numCtasForAllHeads,
-                     numHeadDimCtasV);
+  cudaLaunchKernelEx(&config, kernel, params, kernelMeta.mSparseMla, numCtasForReduction,
+                     numCtasForAllHeads, numHeadDimCtasV);
   cudaError_t err = cudaGetLastError();
   FLASHINFER_CHECK(err == cudaSuccess, "Failed to launch kernel: ", cudaGetErrorString(err));
 }

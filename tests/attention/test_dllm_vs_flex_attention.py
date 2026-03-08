@@ -1,20 +1,20 @@
-"""FlashInfer Block Extend vs PyTorch Flex Attention 性能对比
+"""FlashInfer Block Extend vs PyTorch Flex Attention Performance Comparison
 
-对比三种实现:
+Compares three implementations:
 1. BatchBlockExtendRaggedOffsetWrapper (FlashInfer, ragged KV)
 2. BatchBlockExtendPagedOffsetWrapper (FlashInfer, paged KV)
 3. torch.nn.attention.flex_attention + create_block_mask (PyTorch native)
 
-Mask 规则 (Block Extend):
+Mask rule (Block Extend):
   q_global = q_offset + q_idx
   kv_global = kv_offset + kv_idx
   mask[q, k] = (q_global // dllm_block_size) >= (kv_global // dllm_block_size)
 
-Flex Attention KV Cache 格式:
-  Q: (B, Hq, L, E)    — dense BHSD
-  K: (B, Hkv, S, E)   — dense BHSD
-  V: (B, Hkv, S, Ev)  — dense BHSD
-  没有 paged KV cache, 只是普通的 dense tensor
+Flex Attention KV Cache format:
+  Q: (B, Hq, L, E)    - dense BHSD
+  K: (B, Hkv, S, E)   - dense BHSD
+  V: (B, Hkv, S, Ev)  - dense BHSD
+  No paged KV cache, just regular dense tensors
 """
 
 import torch
@@ -91,10 +91,10 @@ def compute_block_extend_reference(
 # ============================================================
 def make_block_extend_mask_mod(dllm_block_size: int, q_offset: int = 0):
     """
-    返回 flex_attention 使用的 mask_mod 函数
+    Returns the mask_mod function used by flex_attention
 
     mask_mod(b, h, q_idx, kv_idx) -> bool
-    True = 允许 attend, False = 屏蔽
+    True = allow attend, False = mask out
     """
     def block_extend_mask(b, h, q_idx, kv_idx):
         q_global = q_idx + q_offset
@@ -230,8 +230,8 @@ def test_flashinfer_vs_flex_attention(
     """
     Main benchmark: FlashInfer Block Extend (Ragged + Paged) vs Flex Attention
 
-    场景: 每个 request 的 Q 长度 = qo_len, KV 长度 = total_kv_len
-          q_offset = total_kv_len - qo_len  (模拟增量 prefill 的最后一步)
+    Scenario: Each request has Q length = qo_len, KV length = total_kv_len
+              q_offset = total_kv_len - qo_len (simulates the last step of incremental prefill)
     """
     device = torch.device("cuda:0")
     sm_scale = 1.0 / math.sqrt(head_dim)
@@ -255,7 +255,7 @@ def test_flashinfer_vs_flex_attention(
     results = {}
 
     # ===========================================================
-    # 数据准备
+    # Data Preparation
     # ===========================================================
     # Per-request tensors
     all_q = [torch.randn(qo_len, num_heads, head_dim, dtype=dtype, device=device)
@@ -512,7 +512,7 @@ def test_flashinfer_vs_flex_attention(
         print(f"                         K({num_requests},{num_kv_heads},{total_kv_len},{head_dim})")
         print(f"                         V({num_requests},{num_kv_heads},{total_kv_len},{head_dim})")
 
-        # Create block_mask — all requests share the same mask pattern
+        # Create block_mask - all requests share the same mask pattern
         mask_mod = make_block_extend_mask_mod(dllm_block_size, q_offset)
         block_mask = create_block_mask(
             mask_mod, B=num_requests, H=1,
@@ -525,7 +525,7 @@ def test_flashinfer_vs_flex_attention(
         )
 
         # ---------- flex_attention (no compile) ----------
-        # Skip no-compile for large sequences (materializes full QxKV score matrix → OOM)
+        # Skip no-compile for large sequences (materializes full QxKV score matrix - OOM)
         if qo_len * total_kv_len <= 4096 * 4096:
             def run_flex_no_compile():
                 flex_out_buf.copy_(
@@ -554,7 +554,7 @@ def test_flashinfer_vs_flex_attention(
             print(f"  No compile:                SKIPPED (seq too large, would OOM)")
 
         # ---------- flex_attention (compiled) ----------
-        # 每次重新创建 compile 实例 + reset dynamo 缓存，避免跨档位 shape 累积 recompilation
+        # Recreate compile instance + reset dynamo cache each time to avoid cross-tier shape cumulative recompilation
         torch._dynamo.reset()
         _flex_attention_compiled = torch.compile(flex_attention, dynamic=False)
 
@@ -671,11 +671,11 @@ def test_sweep_seq_lengths(
     dtype: torch.dtype = torch.float16,
 ):
     """
-    七档上下文长度测试:
+    Seven-tier context length test:
       1K / 2K / 4K / 8K / 16K / 24K / 32K
 
-    每个档位固定 chunk_size=256, 测试最后一个 chunk 的 per-chunk 延迟
-    (即 q_offset = kv_len - 256, 模拟增量 prefill 最后一步)
+    Each tier uses fixed chunk_size=256, tests per-chunk latency for the last chunk
+    (i.e., q_offset = kv_len - 256, simulating the last step of incremental prefill)
     """
     chunk_size = 256
     configs = [
@@ -695,7 +695,7 @@ def test_sweep_seq_lengths(
         q_offset = total_kv_len - qo_len
         tag = f"kv{total_kv_len}_q{qo_len}"
         print(f"\n{'#'*80}")
-        print(f"# 档位: {desc}")
+        print(f"# Tier: {desc}")
         print(f"#   batch={batch}, kv_len={total_kv_len}, chunk_size={qo_len}, "
               f"num_chunks={num_chunks}, q_offset={q_offset}")
         print(f"{'#'*80}")
@@ -717,11 +717,11 @@ def test_sweep_seq_lengths(
 
     # Final comparison table
     print(f"\n\n{'='*120}")
-    print(f"上下文长度对比 (chunk={chunk_size}, block_size={dllm_block_size})")
+    print(f"Context Length Comparison (chunk={chunk_size}, block_size={dllm_block_size})")
     print(f"{'='*120}")
-    header = (f"  {'档位':<20} | {'KV长度':>8} | {'Batch':>5} | {'Chunks':>6} | "
+    header = (f"  {'Tier':<20} | {'KV Len':>8} | {'Batch':>5} | {'Chunks':>6} | "
              f"{'Ragged(ms)':>12} | {'Ragged cuda_graph':>12} | {'Paged(ms)':>12} | "
-             f"{'Flex(ms)':>12} | {'加速比':>10}")
+             f"{'Flex(ms)':>12} | {'Speedup':>10}")
     print(header)
     print(f"  {'-'*20}-+-{'-'*8}-+-{'-'*5}-+-{'-'*6}-+-{'-'*12}-+-{'-'*12}-+-{'-'*12}-+-{'-'*12}-+-{'-'*10}")
 
@@ -738,16 +738,16 @@ def test_sweep_seq_lengths(
               f"{ragged:>12.3f} | {ragged_cuda_graph:>12.3f} | {paged:>12.3f} | "
               f"{flex:>12.3f} | {speedup:>10}")
 
-    # 估算全量 prefill 总耗时 (所有 chunk 累加的近似)
-    print(f"\n  注: 以上是最后一个 chunk (q_offset 最大) 的 per-chunk 延迟")
-    print(f"  实际全量 prefill 中早期 chunk 的 kv_len 更短, 延迟更低")
-    print(f"  24K/32K 档位 batch 已降低以避免 OOM")
+    # Note about full prefill timing
+    print(f"\n  Note: Above shows per-chunk latency for the last chunk (max q_offset)")
+    print(f"  In actual full prefill, earlier chunks have shorter kv_len, thus lower latency")
+    print(f"  24K/32K tiers use reduced batch to avoid OOM")
 
     return all_results
 
 
 # ============================================================
-# 全量 Prefill 四档上下文长度测试
+# Full Prefill Four-tier Context Length Test
 # ============================================================
 def test_full_prefill_four_tiers(
     dllm_block_size: int = 32,
@@ -758,11 +758,11 @@ def test_full_prefill_four_tiers(
     dtype: torch.dtype = torch.float16,
 ):
     """
-    全量 Prefill 场景: qo_len = kv_len, q_offset = 0
-    一次性处理整个序列, 模拟首次 prefill
+    Full Prefill scenario: qo_len = kv_len, q_offset = 0
+    Process the entire sequence at once, simulating initial prefill
 
-    七档: 1K / 2K / 4K / 8K / 16K / 24K / 32K
-    长序列使用 batch=1 避免 OOM
+    Seven tiers: 1K / 2K / 4K / 8K / 16K / 24K / 32K
+    Long sequences use batch=1 to avoid OOM
     """
     configs = [
         # (seq_len, batch, label)
@@ -779,13 +779,13 @@ def test_full_prefill_four_tiers(
     for seq_len, batch, desc in configs:
         tag = f"seq{seq_len}_b{batch}"
         print(f"\n{'#'*80}")
-        print(f"# 全量 Prefill | {desc}")
+        print(f"# Full Prefill | {desc}")
         print(f"#   batch={batch}, seq_len={seq_len} (qo_len=kv_len={seq_len}, q_offset=0)")
         print(f"{'#'*80}")
         r = test_flashinfer_vs_flex_attention(
             num_requests=batch,
             total_kv_len=seq_len,
-            qo_len=seq_len,       # 全量 prefill: Q 和 KV 一样长
+            qo_len=seq_len,       # Full prefill: Q and KV have same length
             dllm_block_size=dllm_block_size,
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
@@ -794,17 +794,17 @@ def test_full_prefill_four_tiers(
             dtype=dtype,
             warmup_iters=5,
             bench_iters=20,
-            verify=(seq_len <= 4096),  # 长序列跳过 verify (custom_mask 太大)
+            verify=(seq_len <= 4096),  # Skip verify for long sequences (custom_mask too large)
         )
         all_results[tag] = r
 
-    # 汇总表
+    # Summary table
     print(f"\n\n{'='*110}")
-    print(f"全量 Prefill 上下文对比 (block_size={dllm_block_size})")
+    print(f"Full Prefill Context Comparison (block_size={dllm_block_size})")
     print(f"{'='*110}")
-    print(f"  {'档位':<18} | {'序列长度':>8} | {'Batch':>5} | "
+    print(f"  {'Tier':<18} | {'Seq Len':>8} | {'Batch':>5} | "
           f"{'Ragged':>10} | {'Ragged cuda_graph':>10} | {'Paged':>10} | "
-          f"{'Flex compiled':>14} | {'加速比':>10}")
+          f"{'Flex compiled':>14} | {'Speedup':>10}")
     print(f"  {'-'*18}-+-{'-'*8}-+-{'-'*5}-+-"
           f"{'-'*10}-+-{'-'*10}-+-{'-'*10}-+-"
           f"{'-'*14}-+-{'-'*10}")
@@ -821,13 +821,13 @@ def test_full_prefill_four_tiers(
               f"{ragged:>10.3f} | {ragged_cuda_graph:>10.3f} | {paged:>10.3f} | "
               f"{flex:>14.3f} | {speedup:>10}")
 
-    print(f"\n  注: 长/超长上下文使用 batch=1 (避免 OOM)")
+    print(f"\n  Note: Long/extra-long contexts use batch=1 (to avoid OOM)")
 
     return all_results
 
 
 # ============================================================
-# Block size 对齐效应测试
+# Block size alignment effect test
 # ============================================================
 def test_block_size_sweep(
     num_requests: int = 4,
@@ -840,33 +840,33 @@ def test_block_size_sweep(
     dtype: torch.dtype = torch.float16,
 ):
     """
-    测试不同 dllm_block_size 对性能的影响
+    Test the effect of different dllm_block_size on performance
 
-    Flex Attention 的 Triton tile 固定 128x128:
-      - block_size=128 时完美对齐: 每个 tile 要么全 FULL 要么全 SKIP
-      - block_size<128 时对角线 tile 变 PARTIAL, 需逐元素判断 mask
-      - block_size>128 时 tile 粒度比 mask 粒度更细, 同样产生 PARTIAL
+    Flex Attention's Triton tile is fixed at 128x128:
+      - block_size=128: Perfect alignment, each tile is either all FULL or all SKIP
+      - block_size<128: Diagonal tiles become PARTIAL, requiring per-element mask check
+      - block_size>128: Tile granularity is finer than mask granularity, also produces PARTIAL
 
-    FlashInfer 的 block extend kernel 内部按 dllm_block_size 粒度跳过,
-    不受 128 tile 限制。
+    FlashInfer's block extend kernel internally skips by dllm_block_size granularity,
+    not constrained by the 128 tile size.
     """
     block_sizes = [32, 64, 128, 256]
     q_offset = total_kv_len - qo_len
 
     print(f"\n{'='*100}")
-    print(f"Block Size 对齐效应测试")
+    print(f"Block Size Alignment Effect Test")
     print(f"  kv_len={total_kv_len}, qo_len={qo_len}, q_offset={q_offset}")
-    print(f"  Flex Attention Triton tile = 128x128 (硬编码)")
+    print(f"  Flex Attention Triton tile = 128x128 (hardcoded)")
     print(f"{'='*100}")
 
-    # 预计算每种 block_size 的 tile 分布
+    # Precompute tile distribution for each block_size
     num_q_tiles = (qo_len + 127) // 128
     num_kv_tiles = (total_kv_len + 127) // 128
     total_tiles = num_q_tiles * num_kv_tiles
 
     all_results = {}
     for bs in block_sizes:
-        # 统计 tile 类型分布
+        # Count tile type distribution
         full, skip, partial = 0, 0, 0
         for qi in range(num_q_tiles):
             for ki in range(num_kv_tiles):
@@ -874,22 +874,22 @@ def test_block_size_sweep(
                 q_end = min(q_start + 128, q_offset + qo_len)
                 k_start = ki * 128
                 k_end = min(k_start + 128, total_kv_len)
-                # 检查 tile 内 mask 是否全 True / 全 False
+                # Check if mask in tile is all True / all False
                 q_blk_min = q_start // bs
                 q_blk_max = (q_end - 1) // bs
                 k_blk_min = k_start // bs
                 k_blk_max = (k_end - 1) // bs
-                if q_blk_min >= k_blk_max:  # Q 最小 block >= KV 最大 block → 全 True
+                if q_blk_min >= k_blk_max:  # Q min block >= KV max block - all True
                     full += 1
-                elif q_blk_max < k_blk_min:  # Q 最大 block < KV 最小 block → 全 False
+                elif q_blk_max < k_blk_min:  # Q max block < KV min block - all False
                     skip += 1
                 else:
                     partial += 1
 
         print(f"\n{'#'*80}")
         print(f"# dllm_block_size = {bs}")
-        print(f"#   128x128 tile 分布: FULL={full}, SKIP={skip}, PARTIAL={partial} (共{total_tiles})")
-        print(f"#   PARTIAL 占比: {partial/total_tiles*100:.1f}%")
+        print(f"#   128x128 tile distribution: FULL={full}, SKIP={skip}, PARTIAL={partial} (total {total_tiles})")
+        print(f"#   PARTIAL ratio: {partial/total_tiles*100:.1f}%")
         print(f"{'#'*80}")
 
         r = test_flashinfer_vs_flex_attention(
@@ -908,14 +908,14 @@ def test_block_size_sweep(
         )
         all_results[bs] = r
 
-    # 汇总表
+    # Summary table
     print(f"\n\n{'='*130}")
-    print(f"Block Size 对齐效应汇总 (kv_len={total_kv_len}, qo_len={qo_len}, batch={num_requests})")
+    print(f"Block Size Alignment Effect Summary (kv_len={total_kv_len}, qo_len={qo_len}, batch={num_requests})")
     print(f"{'='*130}")
     print(f"  {'block_size':>10} | {'PARTIAL%':>8} | "
           f"{'Ragged(ms)':>10} | {'Ragged CG':>10} | {'Paged(ms)':>10} | "
           f"{'Flex compiled':>14} | {'Ragged Mem':>10} | {'Flex Mem':>10} | "
-          f"{'加速比':>10}")
+          f"{'Speedup':>10}")
     print(f"  {'-'*10}-+-{'-'*8}-+-"
           f"{'-'*10}-+-{'-'*10}-+-{'-'*10}-+-"
           f"{'-'*14}-+-{'-'*10}-+-{'-'*10}-+-{'-'*10}")
@@ -930,7 +930,7 @@ def test_block_size_sweep(
         flex_mem = r.get("flex_compiled", {}).get("memory", {}).get("memory_increase_mb", 0)
         speedup = f"{flex / ragged:.2f}x" if ragged > 0 and flex > 0 else "N/A"
 
-        # 计算 partial 比例
+        # Calculate partial ratio
         partial_count = 0
         for qi in range(num_q_tiles):
             for ki in range(num_kv_tiles):
@@ -954,7 +954,7 @@ def test_block_size_sweep(
 
 
 # ============================================================
-# 全量 Prefill 总显存+性能全面对比: 扫描上下文长度 × dllm_block_size
+# Full Prefill Total Memory + Performance Comparison: Sweep context length x dllm_block_size
 # ============================================================
 def test_total_memory_comparison(
     num_requests: int = 4,
@@ -967,16 +967,16 @@ def test_total_memory_comparison(
     dtype: torch.dtype = torch.float16,
 ):
     """
-    全量 Prefill 全面对比: qo_len = kv_len, q_offset = 0
-    扫描 6 档上下文长度 × 4 档 dllm_block_size
-    每个组合测量: FlashInfer 和 Flex Attention 的延迟(ms) + 峰值总显存(MB)
-    Flex Attention BLOCK_SIZE 保持默认, 仅变化 mask 逻辑粒度
-    长序列自动降 batch 避免 OOM
+    Full Prefill comprehensive comparison: qo_len = kv_len, q_offset = 0
+    Sweep 6 context lengths x 4 dllm_block_sizes
+    Measure for each combination: FlashInfer and Flex Attention latency(ms) + peak total memory(MB)
+    Flex Attention BLOCK_SIZE stays default, only mask logic granularity varies
+    Long sequences automatically reduce batch to avoid OOM
     """
     device = torch.device("cuda:0")
     sm_scale = 1.0 / math.sqrt(head_dim)
 
-    # (seq_len, batch) — 长序列降 batch 避免 OOM
+    # (seq_len, batch) - reduce batch for long sequences to avoid OOM
     configs = [
         (2048,  num_requests),
         (4096,  num_requests),
@@ -989,22 +989,22 @@ def test_total_memory_comparison(
     warmup_iters, bench_iters = 10, 50
 
     print(f"\n{'='*140}")
-    print(f"全量 Prefill: FlashInfer Ragged vs Flex compiled 全面对比")
+    print(f"Full Prefill: FlashInfer Ragged vs Flex compiled Comprehensive Comparison")
     print(f"{'='*140}")
-    print(f"  场景: qo_len = kv_len (全量 prefill), q_offset = 0")
+    print(f"  Scenario: qo_len = kv_len (full prefill), q_offset = 0")
     print(f"  heads={num_heads}/{num_kv_heads}, head_dim={head_dim}")
     print(f"  seq_lens: {[c[0] for c in configs]}")
     print(f"  batch:    {[c[1] for c in configs]}")
     print(f"  dllm_block_sizes: {dllm_block_sizes}")
-    print(f"  Flex BLOCK_SIZE: 默认 (kernel 自决)")
+    print(f"  Flex BLOCK_SIZE: default (kernel decides)")
     print()
 
-    # 探测最小 workspace (最大 seq_len, batch=1)
+    # Probe minimum workspace (max seq_len, batch=1)
     min_ws_mb = 256
     if HAS_FLASHINFER:
         max_seq = configs[-1][0]
         probe_batch = configs[-1][1]
-        print(f"  探测最小 workspace (seq_len={max_seq}, batch={probe_batch}) ...")
+        print(f"  Probing minimum workspace (seq_len={max_seq}, batch={probe_batch}) ...")
         _q = torch.randn(probe_batch * max_seq, num_heads, head_dim, dtype=dtype, device=device)
         _k = torch.randn(probe_batch * max_seq, num_kv_heads, head_dim, dtype=dtype, device=device)
         _v = torch.randn(probe_batch * max_seq, num_kv_heads, head_dim, dtype=dtype, device=device)
@@ -1028,7 +1028,7 @@ def test_total_memory_comparison(
                 continue
         del _q, _k, _v, _qo, _kv, _qoff
         torch.cuda.empty_cache()
-        print(f"    最小可用 workspace: {min_ws_mb} MB")
+        print(f"    Minimum usable workspace: {min_ws_mb} MB")
     print()
 
     def _reset():
@@ -1041,9 +1041,9 @@ def test_total_memory_comparison(
     all_results = {}
 
     for seq_len, batch in configs:
-        # 全量 prefill: qo_len = kv_len = seq_len, q_offset = 0
+        # Full prefill: qo_len = kv_len = seq_len, q_offset = 0
         q_offset = 0
-        print(f"  --- seq_len={seq_len}, batch={batch} (全量 prefill, q_offset=0) ---")
+        print(f"  --- seq_len={seq_len}, batch={batch} (full prefill, q_offset=0) ---")
 
         for dbs in dllm_block_sizes:
             key = (seq_len, batch, dbs)
@@ -1093,7 +1093,7 @@ def test_total_memory_comparison(
                 entry["fi_peak"] = fi_peak
                 del q, k, v, ws, wrapper, qo_indptr, kv_indptr, q_offsets
 
-            # ===== Flex Attention (compiled, 默认 BLOCK_SIZE) =====
+            # ===== Flex Attention (compiled, default BLOCK_SIZE) =====
             if HAS_FLEX_ATTENTION:
                 base = _reset()
                 q = torch.randn(batch, num_heads, seq_len, head_dim, dtype=dtype, device=device)
@@ -1125,24 +1125,24 @@ def test_total_memory_comparison(
                     entry["flex_ms"] = flex_ms
                     entry["flex_peak"] = flex_peak
                 except Exception as e:
-                    print(f"    [dllm_bs={dbs}, seq={seq_len}] Flex 失败: {e}")
+                    print(f"    [dllm_bs={dbs}, seq={seq_len}] Flex failed: {e}")
 
                 del q, k, v, block_mask, _compiled
 
             all_results[key] = entry
 
-            # 单行进度
+            # Progress line
             fi_cg = f"CG={entry['fi_cg_ms']:.3f}ms" if "fi_cg_ms" in entry else "CG=N/A"
             fi_s = f"{entry.get('fi_ms', 0):.3f}ms/{fi_cg}/{entry.get('fi_peak', 0):.0f}MB"
             fx_s = f"{entry.get('flex_ms', 0):.3f}ms/{entry.get('flex_peak', 0):.0f}MB" if "flex_ms" in entry else "N/A"
             print(f"    dllm_bs={dbs:<3}  FI={fi_s:<32} Flex={fx_s}")
 
-    # ===== 汇总表 =====
+    # ===== Summary table =====
     print(f"\n{'='*170}")
-    print(f"全量 Prefill 汇总: FlashInfer Ragged vs Flex compiled")
-    print(f"  场景: qo_len = kv_len, q_offset = 0, FI workspace={min_ws_mb}MB, Flex BLOCK_SIZE=默认(kernel自决)")
+    print(f"Full Prefill Summary: FlashInfer Ragged vs Flex compiled")
+    print(f"  Scenario: qo_len = kv_len, q_offset = 0, FI workspace={min_ws_mb}MB, Flex BLOCK_SIZE=default(kernel decides)")
     print(f"{'='*170}")
-    print(f"  {'seq_len':>8} | {'batch':>5} | {'dllm_bs':>7} | {'FI(ms)':>8} | {'FI CG(ms)':>10} | {'FI peak(MB)':>12} | {'Flex(ms)':>9} | {'Flex peak(MB)':>14} | {'加速比':>8} | {'CG加速比':>9} | {'显存节省':>8}")
+    print(f"  {'seq_len':>8} | {'batch':>5} | {'dllm_bs':>7} | {'FI(ms)':>8} | {'FI CG(ms)':>10} | {'FI peak(MB)':>12} | {'Flex(ms)':>9} | {'Flex peak(MB)':>14} | {'Speedup':>8} | {'CG Speedup':>9} | {'Mem Save':>8}")
     print(f"  {'-'*8}-+-{'-'*5}-+-{'-'*7}-+-{'-'*8}-+-{'-'*10}-+-{'-'*12}-+-{'-'*9}-+-{'-'*14}-+-{'-'*8}-+-{'-'*9}-+-{'-'*8}")
 
     fi_wins_perf, fi_wins_cg, fi_wins_mem, total_cmp = 0, 0, 0, 0
@@ -1178,13 +1178,13 @@ def test_total_memory_comparison(
 
             print(f"  {seq_len:>8} | {batch:>5} | {dbs:>7} | {fi_ms:>8.3f} | {fi_cg_s} | {fi_pk:>12.1f} | {fx_ms_s} | {fx_pk_s} | {ratio:>8} | {cg_ratio:>9} | {mem_save:>8}")
 
-    # 统计
-    print(f"\n  统计 ({total_cmp} 场有效对比):")
+    # Statistics
+    print(f"\n  Statistics ({total_cmp} valid comparisons):")
     if total_cmp > 0:
-        print(f"    性能 (no CG):  FlashInfer 胜出 {fi_wins_perf}/{total_cmp} 场")
-        print(f"    性能 (FI CG):  FlashInfer 胜出 {fi_wins_cg}/{total_cmp} 场")
-        print(f"    显存:          FlashInfer 胜出 {fi_wins_mem}/{total_cmp} 场")
-    print(f"\n  注: 16K+ 序列使用 batch=1 避免 OOM")
+        print(f"    Performance (no CG):  FlashInfer wins {fi_wins_perf}/{total_cmp} cases")
+        print(f"    Performance (FI CG):  FlashInfer wins {fi_wins_cg}/{total_cmp} cases")
+        print(f"    Memory:               FlashInfer wins {fi_wins_mem}/{total_cmp} cases")
+    print(f"\n  Note: 16K+ sequences use batch=1 to avoid OOM")
 
     return all_results
 

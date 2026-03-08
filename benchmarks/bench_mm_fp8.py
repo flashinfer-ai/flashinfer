@@ -67,11 +67,12 @@ def bench_mm_fp8(m, n, k, in_dtype, out_dtype):
             input_fp8,
             prepared_weights,
             global_scale,
-            res,
+            out=res,
         ),
-        dry_run_time_ms=500,
-        repeat_time_ms=2500,
+        dry_run_time_ms=25,
+        repeat_time_ms=100,  # 100ms should be enough for low latency kernels that run within 100 usec
         use_cuda_graph=True,
+        enable_cupti=True,
     )
     ms = np.median(measurements)
     tflops_per_second = 2 * m * n * k * 1e-9 / ms

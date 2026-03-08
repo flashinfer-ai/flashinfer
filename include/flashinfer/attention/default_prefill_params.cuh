@@ -58,8 +58,8 @@ struct SinglePrefillParams {
 
   uint32_t partition_kv;
   uint32_t dllm_block_size;  // DLLM block size for BlockExpanding mask (0 = disabled)
-  uint32_t q_block_expanding_offset;  // Q 全局偏移 (用于增量 chunk prefill)
-  uint32_t kv_block_expanding_offset; // KV 全局偏移 (用于 Cascade Current Chunk)
+  uint32_t q_block_expanding_offset;  // Q global offset (for incremental chunk prefill)
+  uint32_t kv_block_expanding_offset; // KV global offset (for Cascade Current Chunk)
 
   __host__ SinglePrefillParams()
       : q(nullptr),
@@ -135,12 +135,12 @@ struct SinglePrefillParams {
     return kv_len;
   }
 
-  // Single prefill 支持增量 chunk prefill
+  // Single prefill supports incremental chunk prefill
   __host__ __device__ __forceinline__ uint32_t get_q_block_expanding_offset(uint32_t batch_idx) const {
     return q_block_expanding_offset;
   }
 
-  // Single prefill 支持 Cascade Current Chunk
+  // Single prefill supports Cascade Current Chunk
   __host__ __device__ __forceinline__ uint32_t get_kv_block_expanding_offset(uint32_t batch_idx) const {
     return kv_block_expanding_offset;
   }
@@ -196,10 +196,10 @@ struct BatchPrefillRaggedParams {
   uint32_t token_pos_in_items_len;
   uint16_t* maybe_max_item_len_ptr;
 
-  // Block Expanding mask 支持增量 chunk prefill
+  // Block Expanding mask supports incremental chunk prefill
   uint32_t dllm_block_size;                    // DLLM block size (0 = disabled)
-  IdType* maybe_q_block_expanding_offset;      // Q 全局偏移 (每个 batch item 一个值)
-  IdType* maybe_kv_block_expanding_offset;     // KV 全局偏移 (每个 batch item 一个值，用于 Cascade Current Chunk)
+  IdType* maybe_q_block_expanding_offset;      // Q global offset (one value per batch item)
+  IdType* maybe_kv_block_expanding_offset;     // KV global offset (one value per batch item, for Cascade Current Chunk)
 
   __host__ BatchPrefillRaggedParams()
       : q(nullptr),
@@ -309,12 +309,12 @@ struct BatchPrefillRaggedParams {
     return kv_indptr[batch_idx + 1] - kv_indptr[batch_idx];
   }
 
-  // 获取 batch item 的 Q 全局偏移 (用于增量 chunk prefill)
+  // Get batch item's Q global offset (for incremental chunk prefill)
   __host__ __device__ __forceinline__ uint32_t get_q_block_expanding_offset(uint32_t batch_idx) const {
     return (maybe_q_block_expanding_offset != nullptr) ? maybe_q_block_expanding_offset[batch_idx] : 0;
   }
 
-  // 获取 batch item 的 KV 全局偏移 (用于 Cascade Current Chunk)
+  // Get batch item's KV global offset (for Cascade Current Chunk)
   __host__ __device__ __forceinline__ uint32_t get_kv_block_expanding_offset(uint32_t batch_idx) const {
     return (maybe_kv_block_expanding_offset != nullptr) ? maybe_kv_block_expanding_offset[batch_idx] : 0;
   }
@@ -362,10 +362,10 @@ struct BatchPrefillPagedParams {
   uint32_t token_pos_in_items_len;
   uint16_t* maybe_max_item_len_ptr;
 
-  // Block Expanding mask 支持增量 chunk prefill
+  // Block Expanding mask supports incremental chunk prefill
   uint32_t dllm_block_size;                    // DLLM block size (0 = disabled)
-  IdType* maybe_q_block_expanding_offset;      // Q 全局偏移 (每个 batch item 一个值)
-  IdType* maybe_kv_block_expanding_offset;     // KV 全局偏移 (每个 batch item 一个值，用于 Cascade Current Chunk)
+  IdType* maybe_q_block_expanding_offset;      // Q global offset (one value per batch item)
+  IdType* maybe_kv_block_expanding_offset;     // KV global offset (one value per batch item, for Cascade Current Chunk)
 
   __host__ BatchPrefillPagedParams()
       : q(nullptr),
@@ -457,12 +457,12 @@ struct BatchPrefillPagedParams {
     return paged_kv.get_length(batch_idx);
   }
 
-  // 获取 batch item 的 Q 全局偏移 (用于增量 chunk prefill)
+  // Get batch item's Q global offset (for incremental chunk prefill)
   __host__ __device__ __forceinline__ uint32_t get_q_block_expanding_offset(uint32_t batch_idx) const {
     return (maybe_q_block_expanding_offset != nullptr) ? maybe_q_block_expanding_offset[batch_idx] : 0;
   }
 
-  // 获取 batch item 的 KV 全局偏移 (用于 Cascade Current Chunk)
+  // Get batch item's KV global offset (for Cascade Current Chunk)
   __host__ __device__ __forceinline__ uint32_t get_kv_block_expanding_offset(uint32_t batch_idx) const {
     return (maybe_kv_block_expanding_offset != nullptr) ? maybe_kv_block_expanding_offset[batch_idx] : 0;
   }

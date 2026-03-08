@@ -13,15 +13,22 @@ flashinfer/_build_meta.py
 flashinfer/data/
 flashinfer/jit/aot_config.py
 csrc/aot_default_additional_params.h
+flashinfer/trtllm/gemm/trtllmGen_gemm_export
+flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export
 
 # DS_Store files
 .DS_store
 
 # Microbenchmark files
 microbenchmark/
+flashinfer/cute_dsl/benchmark_gated_delta_rule.py
 
 # vscode
 .vscode/
+
+# zed text editor
+.zed/
+.rules
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -134,6 +141,11 @@ ipython_config.py
 #   in version control.
 #   https://pdm.fming.dev/#use-with-ide
 .pdm.toml
+
+# uv
+#   For libraries, lock files should not be committed as they can conflict with
+#   downstream users' environments.
+uv.lock
 
 # PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
 __pypackages__/

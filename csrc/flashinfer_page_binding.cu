@@ -27,12 +27,5 @@ void append_paged_mla_kv_cache(TensorView append_ckv, TensorView append_kpe,
                                TensorView kpe_cache, TensorView kv_indices, TensorView kv_indptr,
                                TensorView kv_last_page_len);
 
-void block_sparse_indices_to_vector_sparse_offsets(
-    TensorView block_sparse_indices, TensorView block_sparse_indptr,
-    TensorView vector_sparse_offsets, TensorView vector_sparse_indptr, TensorView kv_len_arr,
-    int64_t stride_block, int64_t stride_n, int64_t batch_size, int64_t block_size);
-
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(append_paged_kv_cache, append_paged_kv_cache);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(append_paged_mla_kv_cache, append_paged_mla_kv_cache);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(block_sparse_indices_to_vector_sparse_offsets,
-                              block_sparse_indices_to_vector_sparse_offsets);

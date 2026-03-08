@@ -25,50 +25,15 @@ import os
 import shutil
 from itertools import product
 from pathlib import Path
-from typing import List, Tuple, Iterator, Optional
+from typing import Iterator, List, Optional, Tuple
 
 import torch
-
 from packaging.version import Version
+
+from .compilation_context import CompilationContext
+from .jit import JitSpec, build_jit_specs
+from .jit import env as jit_env
 from .jit.activation import act_func_def_str, gen_act_and_mul_module
-from .jit.cascade import gen_cascade_module
-from .jit.fp4_quantization import (
-    gen_fp4_quantization_sm90_module,
-    gen_fp4_quantization_sm100_module,
-    gen_fp4_quantization_sm103_module,
-    gen_fp4_quantization_sm110_module,
-    gen_fp4_quantization_sm120_module,
-    gen_fp4_quantization_sm121_module,
-)
-from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
-from .jit.fused_moe import (
-    gen_cutlass_fused_moe_sm120_module,
-    gen_cutlass_fused_moe_sm103_module,
-    gen_cutlass_fused_moe_sm100_module,
-    gen_cutlass_fused_moe_sm90_module,
-    gen_trtllm_gen_fused_moe_sm100_module,
-)
-from .jit.gemm import (
-    gen_gemm_module,
-    gen_gemm_sm90_module,
-    gen_gemm_sm100_module,
-    gen_gemm_sm100_module_cutlass_fp4,
-    gen_gemm_sm100_module_cutlass_fp8,
-    gen_tgv_gemm_sm10x_module,
-    gen_gemm_sm120_module,
-    gen_gemm_sm120_module_cutlass_fp4,
-    gen_trtllm_gen_gemm_module,
-    gen_trtllm_low_latency_gemm_module,
-)
-from .jit.spdlog import gen_spdlog_module
-from .jit.mla import gen_mla_module
-from .jit.norm import gen_norm_module
-from .jit.page import gen_page_module
-from .jit.quantization import gen_quantization_module
-from .jit.rope import gen_rope_module
-from .jit.sampling import gen_sampling_module
-from .jit.tllm_utils import gen_trtllm_utils_module
-from .jit.xqa import gen_xqa_module, gen_xqa_module_mla
 from .jit.attention import (
     gen_batch_attention_module,
     gen_batch_decode_module,
@@ -79,189 +44,56 @@ from .jit.attention import (
     gen_single_decode_module,
     gen_single_prefill_module,
     gen_trtllm_gen_fmha_module,
-    gen_customize_single_prefill_module,
 )
-from .jit import JitSpec, build_jit_specs
-from .jit import env as jit_env
+from .jit.cascade import gen_cascade_module
 from .jit.cpp_ext import get_cuda_version
-from .compilation_context import CompilationContext
-
-
-# Import DLLM variant definitions
-from .dllm.block_extend import (
-    BLOCK_EXTEND_V2_WITH_OFFSET_VARIANT_DECL,
-    BLOCK_EXTEND_V3_WITH_OFFSET_VARIANT_DECL,
-    _get_module_uri_with_offset,
+from .jit.fp4_quantization import (
+    gen_fp4_quantization_sm90_module,
+    gen_fp4_quantization_sm100_module,
+    gen_fp4_quantization_sm103_module,
+    gen_fp4_quantization_sm110_module,
+    gen_fp4_quantization_sm120_module,
+    gen_fp4_quantization_sm120f_module,
+    gen_fp4_quantization_sm121_module,
 )
-from .dllm.batch_block_extend import (
-    _BATCH_BE_OFFSET_VARIANT_DECL,
-    _BATCH_BE_OFFSET_VARIANT_DECL_FA3,
-    _get_batch_be_module_uri,
+from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
+from .jit.fused_moe import (
+    gen_cutlass_fused_moe_sm90_module,
+    gen_cutlass_fused_moe_sm100_module,
+    gen_cutlass_fused_moe_sm103_module,
+    gen_cutlass_fused_moe_sm120_module,
+    gen_trtllm_gen_fused_moe_sm100_module,
 )
+from .jit.gdn import gen_gdn_prefill_sm90_module
+from .jit.gemm import (
+    gen_fp8_blockscale_gemm_sm90_module,
+    gen_gemm_module,
+    gen_gemm_sm90_module,
+    gen_gemm_sm100_module,
+    gen_gemm_sm100_module_cutlass_fp4,
+    gen_gemm_sm100_module_cutlass_fp8,
+    gen_gemm_sm100_module_cutlass_mxfp8,
+    gen_gemm_sm120_module,
+    gen_gemm_sm120_module_cutlass_fp4,
+    gen_tgv_gemm_sm10x_module,
+    gen_trtllm_gen_gemm_module,
+    gen_trtllm_low_latency_gemm_module,
+)
+from .jit.mamba import (
+    gen_selective_state_update_module,
+    gen_selective_state_update_sm90_module,
+)
+from .jit.mla import gen_mla_module
+from .jit.norm import gen_norm_module
+from .jit.page import gen_page_module
+from .jit.quantization import gen_quantization_module
+from .jit.rope import gen_rope_module
+from .jit.sampling import gen_sampling_module
+from .jit.spdlog import gen_spdlog_module
+from .jit.tllm_utils import gen_trtllm_utils_module
+from .jit.topk import gen_topk_module
+from .jit.xqa import gen_xqa_module, gen_xqa_module_mla
 
-
-def gen_dllm_batch_block_extend(
-    f16_dtype_: List[torch.dtype],
-    fa2_head_dim_: List[Tuple[int, int]],
-    fa3_head_dim_: List[Tuple[int, int]],
-    has_sm90: bool,
-) -> Iterator[JitSpec]:
-    """
-    生成 DLLM Batch Block Extend Attention 的 JitSpec (FA2 + FA3)
-    
-    根据硬件能力生成对应 backend 的 AOT kernel:
-    - FA2: 始终生成 (兼容所有架构)
-    - FA3: 仅在 has_sm90=True 时生成 (Hopper SM90 架构)
-    
-    Args:
-        f16_dtype_: 数据类型列表 [torch.float16, torch.bfloat16]
-        fa2_head_dim_: FA2 Head 维度列表 [(64, 64), (128, 128), ...]
-        fa3_head_dim_: FA3 Head 维度列表 [(192, 128), (128, 128), ...]
-        has_sm90: 是否支持 SM90 架构
-    
-    Yields:
-        JitSpec 对象
-    """
-    from .jit.attention import gen_customize_batch_prefill_module
-    
-    # FA2 Offset variants (兼容所有架构)
-    for dtype in f16_dtype_:
-        for head_dim_qk, head_dim_vo in fa2_head_dim_:
-            base_uri = _get_batch_be_module_uri(head_dim_qk, dtype)
-            
-            # FA2 Offset Paged
-            yield gen_customize_batch_prefill_module(
-                backend="fa2",
-                uri=base_uri + "_paged_offset",
-                dtype_q=dtype, dtype_kv=dtype, dtype_o=dtype,
-                idtype=torch.int32,
-                head_dim_qk=head_dim_qk, head_dim_vo=head_dim_vo,
-                additional_tensor_names=["maybe_q_block_expanding_offset", "maybe_kv_block_expanding_offset"],
-                additional_tensor_dtypes=["int32_t", "int32_t"],
-                additional_scalar_names=["sm_scale", "dllm_block_size"],
-                additional_scalar_dtypes=["double", "int64_t"],
-                variant_name="BatchBlockExtendOffsetAttention",
-                variant_decl=_BATCH_BE_OFFSET_VARIANT_DECL,
-                mask_modes=[4],
-            )
-            
-            # FA2 Offset Ragged
-            yield gen_customize_batch_prefill_module(
-                backend="fa2",
-                uri=base_uri + "_ragged_offset",
-                dtype_q=dtype, dtype_kv=dtype, dtype_o=dtype,
-                idtype=torch.int32,
-                head_dim_qk=head_dim_qk, head_dim_vo=head_dim_vo,
-                additional_tensor_names=["maybe_q_block_expanding_offset", "maybe_kv_block_expanding_offset"],
-                additional_tensor_dtypes=["int32_t", "int32_t"],
-                additional_scalar_names=["sm_scale", "dllm_block_size"],
-                additional_scalar_dtypes=["double", "int64_t"],
-                variant_name="BatchBlockExtendOffsetAttention",
-                variant_decl=_BATCH_BE_OFFSET_VARIANT_DECL,
-                mask_modes=[4],
-            )
-    
-    # FA3 Offset variants (仅 Hopper SM90)
-    if not has_sm90:
-        return
-    
-    for dtype in f16_dtype_:
-        for head_dim_qk, head_dim_vo in fa3_head_dim_:
-            base_uri = _get_batch_be_module_uri(head_dim_qk, dtype)
-            
-            # FA3 Offset Paged
-            yield gen_customize_batch_prefill_module(
-                backend="fa3",
-                uri=base_uri + "_paged_offset_fa3",
-                dtype_q=dtype, dtype_kv=dtype, dtype_o=dtype,
-                idtype=torch.int32,
-                head_dim_qk=head_dim_qk, head_dim_vo=head_dim_vo,
-                additional_tensor_names=["maybe_q_block_expanding_offset", "maybe_kv_block_expanding_offset"],
-                additional_tensor_dtypes=["int32_t", "int32_t"],
-                additional_scalar_names=["sm_scale", "dllm_block_size"],
-                additional_scalar_dtypes=["double", "int64_t"],
-                variant_name="BatchBlockExtendOffsetAttentionFA3",
-                variant_decl=_BATCH_BE_OFFSET_VARIANT_DECL_FA3,
-                mask_modes=[4],
-            )
-            
-            # FA3 Offset Ragged
-            yield gen_customize_batch_prefill_module(
-                backend="fa3",
-                uri=base_uri + "_ragged_offset_fa3",
-                dtype_q=dtype, dtype_kv=dtype, dtype_o=dtype,
-                idtype=torch.int32,
-                head_dim_qk=head_dim_qk, head_dim_vo=head_dim_vo,
-                additional_tensor_names=["maybe_q_block_expanding_offset", "maybe_kv_block_expanding_offset"],
-                additional_tensor_dtypes=["int32_t", "int32_t"],
-                additional_scalar_names=["sm_scale", "dllm_block_size"],
-                additional_scalar_dtypes=["double", "int64_t"],
-                variant_name="BatchBlockExtendOffsetAttentionFA3",
-                variant_decl=_BATCH_BE_OFFSET_VARIANT_DECL_FA3,
-                mask_modes=[4],
-            )
-
-
-def gen_dllm_block_extend_with_offset(
-    f16_dtype_: List[torch.dtype],
-    fa2_head_dim_: List[Tuple[int, int]],
-    fa3_head_dim_: List[Tuple[int, int]],
-    has_sm90: bool,
-) -> Iterator[JitSpec]:
-    """
-    生成 DLLM Block Extend Attention with offset 的 JitSpec (FA2 + FA3)
-    
-    根据硬件能力生成对应 backend 的 AOT kernel:
-    - FA2: 始终生成 (兼容所有架构)
-    - FA3: 仅在 has_sm90=True 时生成 (Hopper SM90 架构)
-    
-    支持 q_offset 参数用于增量 Chunk Prefill 场景
-    
-    Args:
-        f16_dtype_: 数据类型列表 [torch.float16, torch.bfloat16]
-        fa2_head_dim_: FA2 Head 维度列表 [(64, 64), (128, 128), ...]
-        fa3_head_dim_: FA3 Head 维度列表 [(192, 128), (128, 128), ...]
-        has_sm90: 是否支持 SM90 架构
-    
-    Yields:
-        JitSpec 对象
-    """
-    # FA2 with offset (兼容所有架构)
-    for dtype in f16_dtype_:
-        for head_dim_qk, head_dim_vo in fa2_head_dim_:
-            yield gen_customize_single_prefill_module(
-                backend="fa2",
-                uri=_get_module_uri_with_offset(head_dim_qk, dtype, "fa2"),
-                dtype_q=dtype, dtype_kv=dtype, dtype_o=dtype,
-                head_dim_qk=head_dim_qk, head_dim_vo=head_dim_vo,
-                additional_tensor_names=[],
-                additional_tensor_dtypes=[],
-                additional_scalar_names=["sm_scale", "dllm_block_size", "q_block_expanding_offset"],
-                additional_scalar_dtypes=["double", "int64_t", "int64_t"],
-                variant_name="BlockExtendAttentionV2WithOffset",
-                variant_decl=BLOCK_EXTEND_V2_WITH_OFFSET_VARIANT_DECL,
-                mask_modes=[4],
-            )
-    
-    # FA3 with offset (仅 Hopper SM90)
-    if not has_sm90:
-        return
-    
-    for dtype in f16_dtype_:
-        for head_dim_qk, head_dim_vo in fa3_head_dim_:
-            yield gen_customize_single_prefill_module(
-                backend="fa3",
-                uri=_get_module_uri_with_offset(head_dim_qk, dtype, "fa3"),
-                dtype_q=dtype, dtype_kv=dtype, dtype_o=dtype,
-                head_dim_qk=head_dim_qk, head_dim_vo=head_dim_vo,
-                additional_tensor_names=[],
-                additional_tensor_dtypes=[],
-                additional_scalar_names=["sm_scale", "dllm_block_size", "q_block_expanding_offset"],
-                additional_scalar_dtypes=["double", "int64_t", "int64_t"],
-                variant_name="BlockExtendAttentionV3WithOffset",
-                variant_decl=BLOCK_EXTEND_V3_WITH_OFFSET_VARIANT_DECL,
-                mask_modes=[4],
-            )
 
 def gen_fa2(
     dtype_qo: torch.dtype,
@@ -621,6 +453,7 @@ def gen_all_modules(
     has_sm103 = sm_capabilities.get("sm103", False)
     has_sm110 = sm_capabilities.get("sm110", False)
     has_sm120 = sm_capabilities.get("sm120", False)
+    has_sm120f = sm_capabilities.get("sm120f", False)
     has_sm121 = sm_capabilities.get("sm121", False)
 
     jit_specs += list(
@@ -638,27 +471,6 @@ def gen_all_modules(
         )
     )
 
-    
-    # DLLM Block Extend with offset (FA2 + FA3)
-    jit_specs += list(
-        gen_dllm_block_extend_with_offset(
-            f16_dtype_,
-            fa2_head_dim_,
-            fa3_head_dim_,
-            has_sm90,
-        )
-    )
-    
-    # DLLM Batch Block Extend (FA2 + FA3)
-    jit_specs += list(
-        gen_dllm_batch_block_extend(
-            f16_dtype_,
-            fa2_head_dim_,
-            fa3_head_dim_,
-            has_sm90,
-        )
-    )
-
     if add_act:
         for act_name in act_func_def_str:
             jit_specs.append(gen_act_and_mul_module(act_name))
@@ -667,6 +479,8 @@ def gen_all_modules(
         jit_specs.append(gen_gemm_module())
         if has_sm90:
             jit_specs.append(gen_gemm_sm90_module())
+            # fp8 blockscale GEMM (SM90)
+            jit_specs.append(gen_fp8_blockscale_gemm_sm90_module())
             jit_specs.append(gen_fp4_quantization_sm90_module())
             jit_specs.append(gen_cutlass_fused_moe_sm90_module())
         if has_sm100:
@@ -675,6 +489,7 @@ def gen_all_modules(
             jit_specs.append(gen_gemm_sm100_module())
             jit_specs.append(gen_gemm_sm100_module_cutlass_fp4())
             jit_specs.append(gen_gemm_sm100_module_cutlass_fp8())
+            jit_specs.append(gen_gemm_sm100_module_cutlass_mxfp8())
             # Add TGV GEMM modules for both bf16 and fp16
             jit_specs.append(
                 gen_tgv_gemm_sm10x_module(torch.bfloat16, use_sm_100f=False)
@@ -699,23 +514,34 @@ def gen_all_modules(
             jit_specs.append(gen_fp4_quantization_sm110_module())
         if has_sm120:
             jit_specs.append(gen_fp4_quantization_sm120_module())
+        if has_sm121:
+            jit_specs.append(gen_fp4_quantization_sm121_module())
+        if has_sm120 or has_sm121:
+            # SM120 and SM121 share the same CUTLASS kernels for fused MOE and GEMM.
+            # The SM120 module generators use supported_major_versions=[12] which
+            # compiles for all SM12x targets.
             jit_specs.append(gen_cutlass_fused_moe_sm120_module())
             jit_specs.append(gen_gemm_sm120_module())
             jit_specs.append(gen_gemm_sm120_module_cutlass_fp4())
-        if has_sm121:
-            jit_specs.append(gen_fp4_quantization_sm121_module())
+        if has_sm120f:
+            jit_specs.append(gen_fp4_quantization_sm120f_module())
 
     if add_comm:
-        from .jit.comm import gen_trtllm_comm_module, gen_vllm_comm_module
-        from .jit.comm import gen_nvshmem_module
-        from .jit.comm import gen_comm_alltoall_module
-        from .jit.comm import gen_trtllm_mnnvl_comm_module
+        from .jit.comm import (
+            gen_comm_alltoall_module,
+            gen_moe_alltoall_module,
+            gen_nvshmem_module,
+            gen_trtllm_comm_module,
+            gen_trtllm_mnnvl_comm_module,
+            gen_vllm_comm_module,
+        )
 
         jit_specs.append(gen_nvshmem_module())
         jit_specs.append(gen_comm_alltoall_module())
         if has_sm100:
             jit_specs.append(gen_trtllm_comm_module())
             jit_specs.append(gen_trtllm_mnnvl_comm_module())
+            jit_specs.append(gen_moe_alltoall_module())
         jit_specs.append(gen_vllm_comm_module())
 
     if add_misc:
@@ -726,9 +552,61 @@ def gen_all_modules(
             gen_quantization_module(),
             gen_rope_module(),
             gen_sampling_module(),
+            gen_topk_module(),
         ]
-        if has_sm90:
+        # selective_state_update: one module per dtype combo per GPU arch
+        _ssu_dtype_combos = [
+            # (state,        input,          weight,         matrixA,      stateIndex, state_scale_dtype)
+            (
+                torch.bfloat16,
+                torch.bfloat16,
+                torch.bfloat16,
+                torch.float32,
+                torch.int64,
+                None,
+            ),
+            # int16 state (block-scaled quantization, scale stored as float32)
+            (
+                torch.int16,
+                torch.bfloat16,
+                torch.bfloat16,
+                torch.float32,
+                torch.int64,
+                torch.float32,
+            ),
+            (
+                torch.float32,
+                torch.bfloat16,
+                torch.bfloat16,
+                torch.float32,
+                torch.int64,
+                None,
+            ),
+        ]
+        _ssu_dims = [64]
+        _ssu_dstates = [128]
+        _ssu_ntokens = [1, 4, 6, 8]
+        for dtype_combo, dim, dstate, ntokens in product(
+            _ssu_dtype_combos, _ssu_dims, _ssu_dstates, _ssu_ntokens
+        ):
+            jit_specs.append(
+                # false positive: mypy can't resolve the signature because flashinfer.jit deps (filelock etc.)
+                # are absent in mypy's isolated env, causing it to infer an incorrect function signature
+                gen_selective_state_update_module(*dtype_combo, dim, dstate, ntokens)  # type: ignore[call-arg]
+            )
+        if has_sm90 or has_sm100:
+            for dtype_combo, dim, dstate, ntokens in product(
+                _ssu_dtype_combos, _ssu_dims, _ssu_dstates, _ssu_ntokens
+            ):
+                jit_specs.append(
+                    # same false positive as above
+                    gen_selective_state_update_sm90_module(  # type: ignore[call-arg]
+                        *dtype_combo, dim, dstate, ntokens
+                    )
+                )
             jit_specs.append(gen_trtllm_utils_module())
+        if has_sm90:
+            jit_specs.append(gen_gdn_prefill_sm90_module())
 
     if (
         add_xqa and get_cuda_version() > Version("12.8")
@@ -940,9 +818,10 @@ def detect_sm_capabilities():
         "sm100": has_sm("compute_100", "12.8"),
         "sm100f": has_sm("compute_100", "12.9"),
         "sm103": has_sm("compute_103", "12.9"),
-        "sm110": has_sm("compute_110", "12.9"),
-        "sm120": has_sm("compute_120", "13.0"),
-        "sm121": has_sm("compute_121", "13.0"),
+        "sm110": has_sm("compute_110", "13.0"),
+        "sm120": has_sm("compute_120", "12.8"),
+        "sm120f": has_sm("compute_120f", "12.9"),
+        "sm121": has_sm("compute_121", "12.9"),
     }
 
 

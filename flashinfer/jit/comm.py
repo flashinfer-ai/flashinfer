@@ -78,3 +78,32 @@ def gen_vllm_comm_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "vllm_custom_all_reduce.cu",
         ],
     )
+
+
+def gen_moe_alltoall_module() -> JitSpec:
+    return gen_jit_spec(
+        "mnnvl_moe_alltoall",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "trtllm_moe_alltoall.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal"
+            / "tensorrt_llm"
+            / "kernels"
+            / "communicationKernels"
+            / "moeAlltoAllKernels.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal"
+            / "cpp"
+            / "common"
+            / "envUtils.cpp",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal"
+            / "cpp"
+            / "common"
+            / "tllmException.cpp",
+        ],
+        extra_include_paths=[
+            str(jit_env.FLASHINFER_CSRC_DIR / "nv_internal"),
+            str(jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include"),
+        ],
+    )

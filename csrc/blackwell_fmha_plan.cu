@@ -21,7 +21,7 @@ void blackwell_fmha_plan(TensorView qo_segment_offsets, TensorView kv_segment_of
                          TensorView work_indptr, TensorView qo_tile_indices,
                          TensorView head_indices, TensorView batch_indices, int64_t qo_tile_size,
                          int64_t num_heads, int64_t num_buckets, bool causal) {
-  cudaSetDevice(qo_segment_offsets.device().device_id);
+  ffi::CUDADeviceGuard device_guard(qo_segment_offsets.device().device_id);
   const cudaStream_t stream = get_stream(qo_tile_indices.device());
   int batch_size = qo_segment_offsets.size(0) - 1;
 

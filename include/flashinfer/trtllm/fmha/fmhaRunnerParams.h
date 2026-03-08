@@ -232,6 +232,11 @@ struct TllmGenFmhaRunnerParams {
   // The output scaling factor buffer.
   void* oSfPtr;
 
+  // The stride between different tokens for Q.
+  int qStrideTokens;
+  // The stride between different heads for Q.
+  int qStrideHeads;
+
   // The stride between different keys.
   int kStrideKeysValues;
   // The stride between different heads for K.
@@ -287,6 +292,14 @@ struct TllmGenFmhaRunnerParams {
   float mScaleSfKv;
   // The SF scale for output.
   float mScaleSfO;
+  // Do we skip softmax when possible?
+  bool mSkipsSoftmaxWhenPossible;
+  // Skip softmax threshold scale factor.
+  float mSkipSoftmaxThresholdScaleFactor;
+  // Whether to use sparse MLA.
+  bool mSparseMla;
+  // The top k value for sparse MLA.
+  int mSparseMlaTopK;
   // The cuda stream.
   cudaStream_t stream;
   // Whether to enable PDL (Programmatic Dependent Launch).
@@ -339,12 +352,18 @@ struct TllmGenSelectKernelParams {
   bool mForceGmemReduction;
   // The mask type.
   TrtllmGenAttentionMaskType mMaskType;
+  // The number of tokens per page.
+  int mNumTokensPerPage;
   // Reuse smemK for V or not (only work with MLA generation kernels).
   bool mReuseSmemKForV;
   // Do we need to select a new kernel as the parameters have been updated.
   bool mSelectNewKernel;
+  // Do we enable skip softmax?
+  bool mSkipsSoftmaxWhenPossible;
   // The tile scheduler.
   TileScheduler mTileScheduler;
+  // The tile size for Q.
+  int mTileSizeQ;
   // The tile size for Kv.
   int mTileSizeKv;
   // Use 2 CTA MMA or not.
@@ -360,9 +379,12 @@ struct TllmGenSelectKernelParams {
                                                  : MultiCtasKvMode::Disabled),
         mForceGmemReduction(false),
         mMaskType(params.mMaskType),
+        mNumTokensPerPage(params.mNumTokensPerPage),
         mReuseSmemKForV(false),
         mSelectNewKernel(false),
+        mSkipsSoftmaxWhenPossible(params.mSkipsSoftmaxWhenPossible),
         mTileScheduler(params.mTileScheduler),
+        mTileSizeQ(128),
         mTileSizeKv(128),
         mUses2CtaMma(false) {};
 };

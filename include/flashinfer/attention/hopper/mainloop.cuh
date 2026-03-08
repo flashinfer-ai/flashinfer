@@ -148,17 +148,17 @@ CUTLASS_DEVICE
                               cute::ceil_div((q_tile_idx + 1) * CTA_Q + kv_len - qo_len, CTA_KV));
     }
     if constexpr (BLOCK_EXPANDING) {
-      // Block Expanding: 根据 block 边界计算有效 KV 范围
+      // Block Expanding: Calculate valid KV range based on block boundaries
       // q_tile_end = min((q_tile_idx + 1) * CTA_Q, qo_len)
       // q_block = (q_offset + q_tile_end - 1) / B
       // kv_valid_end = (q_block + 1) * B - kv_offset
       int64_t dllm_block_size = 1;
       int64_t q_offset = 0;
-      int64_t kv_offset = 0;  // 新增: kv_offset 支持
+      int64_t kv_offset = 0;  // kv_offset support for Cascade Current Chunk
       if constexpr (has_dllm_block_size_v<AdditionalParams>) {
         dllm_block_size = mainloop_params.additional_params.dllm_block_size;
       }
-      // 优先从 maybe_q_block_expanding_offset 数组读取 per-batch offset
+      // Prefer reading per-batch offset from maybe_q_block_expanding_offset array
       if constexpr (has_maybe_q_block_expanding_offset_v<AdditionalParams>) {
         auto* offset_ptr = mainloop_params.additional_params.maybe_q_block_expanding_offset;
         if (offset_ptr != nullptr) {
@@ -167,7 +167,7 @@ CUTLASS_DEVICE
       } else if constexpr (has_q_block_expanding_offset_v<AdditionalParams>) {
         q_offset = mainloop_params.additional_params.q_block_expanding_offset;
       }
-      // 新增: 读取 kv_offset（用于 Cascade Current Chunk 场景）
+      // Read kv_offset (for Cascade Current Chunk scenario)
       if constexpr (has_maybe_kv_block_expanding_offset_v<AdditionalParams>) {
         auto* offset_ptr = mainloop_params.additional_params.maybe_kv_block_expanding_offset;
         if (offset_ptr != nullptr) {
@@ -179,7 +179,7 @@ CUTLASS_DEVICE
       int q_tile_end = std::min((q_tile_idx + 1) * CTA_Q, qo_len);
       int64_t q_global_end = q_offset + q_tile_end - 1;
       int64_t q_block = q_global_end / dllm_block_size;
-      // 考虑 kv_offset: 最大有效 kv_idx = (q_block + 1) * B - kv_offset
+      // Consider kv_offset: max valid kv_idx = (q_block + 1) * B - kv_offset
       int64_t max_kv_global = (q_block + 1) * dllm_block_size;
       int kv_valid_end = static_cast<int>(std::max(max_kv_global - kv_offset, int64_t(0)));
       num_kv_tiles = std::min(num_kv_tiles, cute::ceil_div(std::min(kv_len, kv_valid_end), CTA_KV));

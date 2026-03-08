@@ -533,7 +533,7 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm110(
 #ifdef FAST_BUILD
   // Fast build disables all configs except this
   return {CutlassGemmConfig{CutlassTileConfigSM100::CtaShape128x128x128B,
-                            MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
+                            MainloopScheduleType::AUTO, EpilogueScheduleType::TMA,
                             ClusterShape::ClusterShape_1x1x1}};
 #else
   std::vector<CutlassGemmConfig> candidate_configs;
@@ -574,7 +574,7 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm110(
           std::array{ClusterShape::ClusterShape_2x1x1, ClusterShape::ClusterShape_2x2x1}};
       auto cluster = cluster_shapes[cluster_m - 1][cluster_n - 1];
       for (auto tile : base) {
-        CutlassGemmConfig config{tile, MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
+        CutlassGemmConfig config{tile, MainloopScheduleType::AUTO, EpilogueScheduleType::TMA,
                                  cluster};
         candidate_configs.push_back(config);
       }

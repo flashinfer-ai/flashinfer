@@ -67,9 +67,9 @@ void invokeSiluAndMulNVFP4Quantization(void* output, void* output_scale, void* i
                                        void* input_global_scale, void* mask, bool use_silu_and_mul,
                                        int m_topk, int k, int n_experts, cudaStream_t stream);
 
-void invokeBlockScaleInterleave(int b, int m, int m_padded, int n, int n_padded,
-                                uint8_t const* SFIn, uint8_t* SFOutput, int multiProcessorCount,
-                                cudaStream_t stream = 0);
+template <typename T>
+void invokeBlockScaleInterleave(int b, int m, int m_padded, int n, int n_padded, T const* SFIn,
+                                T* SFOutput, int multiProcessorCount, cudaStream_t stream = 0);
 
 void invokeBlockScaleInterleaveReverse(int b, int m, int n, uint8_t const* SFIn, uint8_t* SFOutput,
                                        int multiProcessorCount, cudaStream_t stream = 0);

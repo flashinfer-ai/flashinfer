@@ -17,6 +17,10 @@ void BatchDecodeWithPagedKVCacheRunMLA(
     TensorView paged_kv_last_page_len, TensorView o, double sm_scale, int64_t window_left,
     double logits_soft_cap, double rope_scale, double rope_theta, Optional<TensorView> maybe_lse,
     bool enable_pdl) {
+  CHECK_INPUT_TYPE(paged_kv_indptr, dl_int32);
+  CHECK_INPUT_TYPE(paged_kv_indices, dl_int32);
+  CHECK_INPUT_TYPE(paged_kv_last_page_len, dl_int32);
+
   DecodePlanInfo plan_info;
   plan_info.FromVector(std::vector<int64_t>(plan_info_vec.begin(), plan_info_vec.end()));
 
@@ -35,7 +39,7 @@ void BatchDecodeWithPagedKVCacheRunMLA(
   void* float_buffer = static_cast<void*>(float_workspace_buffer.data_ptr());
   void* int_buffer = static_cast<void*>(int_workspace_buffer.data_ptr());
 
-  cudaSetDevice(q_nope.device().device_id);
+  ffi::CUDADeviceGuard device_guard(q_nope.device().device_id);
   const cudaStream_t stream = get_stream(q_nope.device());
 
   paged_kv_mla_t<DTypeKV, IdType> paged_kv(

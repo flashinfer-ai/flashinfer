@@ -67,7 +67,7 @@ struct RaggedParams {
 
   bool causal;
 
-  // Block Expanding 支持
+  // Block Expanding support
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
     return qo_lens[batch_idx];
   }
@@ -129,6 +129,11 @@ struct PagedParams {
   int64_t o_stride_h;
   int64_t nnz_qo;
 
+  // NOTE: For sparse paged KV cache, we need the stride between pages
+  // This is paged_k_cache.stride(0), not the layout stride
+  int64_t k_page_stride;  // Stride between pages for K
+  int64_t v_page_stride;  // Stride between pages for V
+
   int head_dim;
   int num_qo_heads;
   int num_kv_heads;
@@ -138,7 +143,7 @@ struct PagedParams {
 
   bool causal;
 
-  // Block Expanding 支持
+  // Block Expanding support
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
     return qo_lens[batch_idx];
   }

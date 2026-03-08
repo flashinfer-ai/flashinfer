@@ -63,7 +63,7 @@ struct Params {
 
   bool causal;
 
-  // Block Expanding 支持
+  // Block Expanding support
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
     return qo_len;
   }
@@ -72,7 +72,7 @@ struct Params {
     return kv_len;
   }
 
-  // SinglePrefill: q_block_expanding_offset 支持
+  // SinglePrefill: q_block_expanding_offset support
   __host__ __device__ __forceinline__ uint32_t get_q_block_expanding_offset(uint32_t batch_idx) const {
 {% if has_q_block_expanding_offset %}
     return static_cast<uint32_t>(additional_params.q_block_expanding_offset);
@@ -81,7 +81,7 @@ struct Params {
 {% endif %}
   }
 
-  // SinglePrefill: kv_block_expanding_offset 支持 (用于 Cascade Current Chunk)
+  // SinglePrefill: kv_block_expanding_offset support (for Cascade Current Chunk)
   __host__ __device__ __forceinline__ uint32_t get_kv_block_expanding_offset(uint32_t batch_idx) const {
 {% if has_kv_block_expanding_offset %}
     return static_cast<uint32_t>(additional_params.kv_block_expanding_offset);

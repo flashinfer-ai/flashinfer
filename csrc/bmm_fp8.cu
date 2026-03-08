@@ -45,7 +45,7 @@ void bmm_fp8(TensorView A, TensorView B, TensorView D, TensorView A_scale, Tenso
         auto n = B.size(2);
 
         auto lt_handle = reinterpret_cast<cublasLtHandle_t>(cublas_handle);
-        cudaSetDevice(A.device().device_id);
+        ffi::CUDADeviceGuard device_guard(A.device().device_id);
         auto stream = get_stream(A.device());
 
         auto status = flashinfer::bmm_fp8::bmm_fp8_internal_cublaslt(

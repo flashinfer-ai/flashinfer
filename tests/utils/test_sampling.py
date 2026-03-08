@@ -385,10 +385,11 @@ def test_top_k_top_p_sampling_from_probs_logits_alignment(batch_size, vocab_size
     # NOTE(Zihao): Applying softmax followed by top_k_renorm (softmax -> top_k_renorm)
     # does not guarantee bitwise-identical results compared to top_k_mask followed by softmax (top_k_mask -> softmax).
     # This may cause slight differences in subsequent top-p sampling.
-    # We tolerate up to a 1% mismatch rate.
-    assert match_rate >= 0.99, (
+    # Additionally, ties at the k-th position may be resolved differently.
+    # We tolerate up to a 5% mismatch rate.
+    assert match_rate >= 0.95, (
         f"Sample match rate {match_rate:.2%} is below threshold "
-        f"({batch_size - num_matches}/{batch_size} mismatches, expected <=1%)"
+        f"({samples.numel() - num_matches}/{samples.numel()} mismatches, expected <=5%)"
     )
 
 
@@ -447,58 +448,292 @@ def test_top_p_renorm_probs(batch_size, vocab_size, p):
     )
 
 
-@pytest.mark.parametrize("batch_size", [1, 99, 989])
+@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("k", [10, 100, 500])
-def test_top_k_renorm_probs(batch_size, vocab_size, k):
+@pytest.mark.parametrize(
+    "distribution",
+    [
+        normal_distribution(1),
+        normal_distribution(5),
+        gumbel_distribution(0.1),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_top_k_renorm_probs(batch_size, vocab_size, k, distribution, dtype):
     if k > vocab_size:
         pytest.skip("k should be less than vocab_size")
+
     torch.manual_seed(42)
-    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
-    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
-    sorted_prob, _ = torch.sort(normalized_prob, descending=True)
-    pivot = sorted_prob[:, k - 1]
-    mask = (normalized_prob >= pivot.unsqueeze(-1)).int()
-    renorm_prob_ground_truth = normalized_prob.clone()
-    renorm_prob_ground_truth[mask == 0] = 0
-    renorm_prob_ground_truth = renorm_prob_ground_truth / renorm_prob_ground_truth.sum(
-        dim=-1, keepdim=True
-    )
+    logits = distribution((batch_size, vocab_size), "cuda:0")
+    normalized_prob_fp32 = torch.softmax(logits, dim=-1)
+    normalized_prob = normalized_prob_fp32.to(dtype)
 
     renorm_prob = flashinfer.sampling.top_k_renorm_probs(normalized_prob, k)
+
+    # Check output dtype matches input
+    assert renorm_prob.dtype == dtype
+
+    # Check that the output sums to 1
+    sums = renorm_prob.float().sum(dim=-1)
+    torch.testing.assert_close(sums, torch.ones_like(sums), rtol=1e-2, atol=1e-2)
+
+    # Count non-zero elements in output
+    nonzero_counts = (renorm_prob > 0).sum(dim=-1)
+
+    # Find the pivot value (k-th largest) and count ties
+    sorted_prob, _ = torch.sort(normalized_prob, descending=True)
+    pivot = sorted_prob[:, k - 1]
+
+    # Count how many elements are strictly greater than pivot
+    num_greater = (normalized_prob > pivot.unsqueeze(-1)).sum(dim=-1)
+    # Count how many elements equal the pivot (ties)
+    num_ties = (normalized_prob == pivot.unsqueeze(-1)).sum(dim=-1)
+
+    # Valid range: [num_greater, num_greater + num_ties]
+    # The kernel must keep all elements > pivot, and may keep some/all/none of the ties
+    # But it must keep exactly k elements total (if there are enough)
+    nonzero_input = (normalized_prob > 0).sum(dim=-1)
+    expected_k = torch.minimum(
+        torch.full_like(nonzero_input, k, dtype=torch.int64), nonzero_input
+    )
+
+    # Check: nonzero_counts should be in valid range considering ties
+    max_valid = num_greater + num_ties
+
+    # The actual count should be >= k (we keep at least k) and within tie range
+    # Due to floating point, allow small tolerance
+    assert torch.all(nonzero_counts >= torch.clamp(expected_k - 1, min=0)), (
+        f"Some rows have fewer non-zero elements than expected. "
+        f"nonzero_counts min: {nonzero_counts.min()}, expected_k min: {expected_k.min()}"
+    )
+    assert torch.all(nonzero_counts <= max_valid + 1), (
+        f"Some rows have more non-zero elements than allowed by ties. "
+        f"nonzero_counts max: {nonzero_counts.max()}, max_valid max: {max_valid.max()}"
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_top_k_renorm_probs_mixed_k_persistent_loop(dtype):
+    """Test top_k_renorm_probs with mixed k values in persistent loop (multi-CTA mode).
+
+    This test catches a specific bug where:
+    - Large batch size triggers the persistent loop (multiple iterations per CTA group)
+    - Large vocab_size triggers multi-CTA mode (multiple CTAs per row)
+    - Mixed k values: some rows have k >= vocab_size (skip radix select),
+      others have k < vocab_size (use radix select)
+
+    The bug was that k >= vocab_size iterations would skip radix select
+    without clearing the histogram buffers, leaving stale data that corrupted
+    subsequent k < vocab_size iterations.
+    """
+    batch_size = 1024  # Large batch to trigger persistent loop
+    vocab_size = 128 * 1024  # Large vocab to trigger multi-CTA mode
+
+    torch.manual_seed(42)
+    generator = torch.Generator(device="cuda:0").manual_seed(42)
+
+    # Generate random logits
+    logits = torch.rand((batch_size, vocab_size), device="cuda:0", generator=generator)
+
+    # Generate k values: mix of small k and k == vocab_size
+    generator = torch.Generator(device="cuda:0").manual_seed(42)
+    k_values = torch.randint(
+        1, 1000, (batch_size,), device="cuda:0", generator=generator
+    )
+
+    # Randomly set some rows to k == vocab_size (about 50%)
+    generator = torch.Generator(device="cuda:0").manual_seed(42)
+    mask = torch.randint(
+        0, 2, (batch_size,), generator=generator, dtype=torch.bool, device="cuda:0"
+    )
+    k_values.masked_fill_(mask, vocab_size)
+
+    # Convert to probs
+    probs = torch.softmax(logits, dim=-1).to(dtype)
+
+    # Run FlashInfer top_k_renorm_probs
+    renorm_probs = flashinfer.sampling.top_k_renorm_probs(probs, k_values)
+
+    # Verify output dtype
+    assert renorm_probs.dtype == dtype
+
+    # Verify sum to 1
+    sums = renorm_probs.float().sum(dim=-1)
+    torch.testing.assert_close(sums, torch.ones_like(sums), rtol=1e-2, atol=1e-2)
+
+    # Verify non-zero count matches k for each row
+    nonzero_counts = (renorm_probs > 0).sum(dim=-1)
+
+    # For rows with k >= vocab_size, all elements should be non-zero
+    # For rows with k < vocab_size, non-zero count should be >= k (may be more due to ties)
     for i in range(batch_size):
-        torch.testing.assert_close(
-            renorm_prob_ground_truth[i],
-            renorm_prob[i],
-            rtol=1e-3,
-            atol=1e-3,
-        )
+        k = k_values[i].item()
+        count = nonzero_counts[i].item()
+
+        if k >= vocab_size:
+            # All elements should be non-zero
+            assert count == vocab_size, (
+                f"Row {i}: k >= vocab_size but count={count} != {vocab_size}"
+            )
+        else:
+            # Count should be at least k (may be more due to ties at the threshold)
+            row_probs = probs[i].float()
+            topk_vals, _ = torch.topk(row_probs, k, sorted=True)
+            threshold = topk_vals[-1]
+            expected_ge_threshold = (row_probs >= threshold).sum().item()
+
+            # Allow small tolerance for floating point
+            assert count >= k - 1, f"Row {i}: k={k} but only {count} non-zero elements"
+            assert count <= expected_ge_threshold + 1, (
+                f"Row {i}: k={k}, expected at most {expected_ge_threshold} but got {count}"
+            )
 
 
-@pytest.mark.parametrize("batch_size", [1, 99, 989])
+@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("k", [10, 100, 500])
+@pytest.mark.parametrize(
+    "distribution",
+    [
+        normal_distribution(1),
+        normal_distribution(5),
+        gumbel_distribution(0.1),
+    ],
+)
 @pytest.mark.parametrize("neginf_input", [False, True])
-def test_top_k_mask_logits(batch_size, vocab_size, k, neginf_input):
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_top_k_mask_logits(
+    batch_size, vocab_size, k, distribution, neginf_input, dtype
+):
     if k > vocab_size:
         pytest.skip("k should be less than vocab_size")
+
     torch.manual_seed(42)
-    logits = torch.randn(batch_size, vocab_size, device="cuda:0") * 5
+    logits = distribution((batch_size, vocab_size), "cuda:0")
     if neginf_input:
         num_neginf = torch.randint(1, vocab_size * batch_size, (1,)).item()
         idxs = torch.randperm(batch_size * vocab_size, device="cuda:0")[:num_neginf]
         logits[idxs // vocab_size, idxs % vocab_size] = -float("inf")
-    probs = torch.softmax(logits, dim=-1)
-    masked_logits = flashinfer.sampling.top_k_mask_logits(logits, k)
-    renormed_probs = torch.softmax(masked_logits, dim=-1)
-    renormed_probs_ref = flashinfer.sampling.top_k_renorm_prob(probs, k)
 
-    torch.testing.assert_close(
-        renormed_probs,
-        renormed_probs_ref,
-        rtol=1e-3,
-        atol=1e-3,
+    logits = logits.to(dtype)
+    masked_logits = flashinfer.sampling.top_k_mask_logits(logits, k)
+
+    # Check output dtype matches input
+    assert masked_logits.dtype == dtype
+
+    # Check that softmax of masked logits sums to 1
+    probs = torch.softmax(masked_logits.float(), dim=-1)
+    sums = probs.sum(dim=-1)
+    torch.testing.assert_close(sums, torch.ones_like(sums), rtol=1e-3, atol=1e-3)
+
+    # Count finite elements in output
+    finite_counts = torch.isfinite(masked_logits).sum(dim=-1)
+
+    # Find the pivot value (k-th largest among finite values) and count ties
+    # Replace -inf with a very small value for sorting
+    logits_for_sort = logits.clone()
+    logits_for_sort[~torch.isfinite(logits_for_sort)] = -float("inf")
+    sorted_logits, _ = torch.sort(logits_for_sort, descending=True)
+
+    # Count finite inputs per row
+    finite_inputs = torch.isfinite(logits).sum(dim=-1)
+
+    # For each row, find the pivot (k-th largest if enough finite values)
+    effective_k = torch.minimum(
+        torch.full_like(finite_inputs, k, dtype=torch.int64), finite_inputs
     )
+
+    # Get pivot for each row (handle case where effective_k might be 0)
+    pivot = torch.zeros(batch_size, dtype=dtype, device=logits.device)
+    for i in range(batch_size):
+        ek = effective_k[i].item()
+        if ek > 0:
+            pivot[i] = sorted_logits[i, ek - 1]
+        else:
+            pivot[i] = float("-inf")
+
+    # Count how many elements are strictly greater than pivot
+    num_greater = (logits > pivot.unsqueeze(-1)).sum(dim=-1)
+    # Count how many elements equal the pivot (ties) - only among finite values
+    num_ties = ((logits == pivot.unsqueeze(-1)) & torch.isfinite(logits)).sum(dim=-1)
+
+    # Valid range considering ties
+    max_valid = num_greater + num_ties
+
+    # Check: finite_counts should be >= effective_k (we keep at least k finite values)
+    # and <= max_valid (we don't keep more than all elements >= pivot)
+    # Allow small tolerance for floating point issues
+    assert torch.all(finite_counts >= torch.clamp(effective_k - 1, min=0)), (
+        f"Some rows have fewer finite elements than expected. "
+        f"finite_counts min: {finite_counts.min()}, effective_k min: {effective_k.min()}"
+    )
+    assert torch.all(finite_counts <= max_valid + 1), (
+        f"Some rows have more finite elements than allowed by ties. "
+        f"finite_counts max: {finite_counts.max()}, max_valid max: {max_valid.max()}"
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_top_k_mask_logits_mixed_k_persistent_loop(dtype):
+    """Test top_k_mask_logits with mixed k values in persistent loop (multi-CTA mode).
+
+    This test catches the same bug as test_top_k_renorm_probs_mixed_k_persistent_loop
+    but for the mask_logits variant.
+    """
+    batch_size = 1024  # Large batch to trigger persistent loop
+    vocab_size = 128 * 1024  # Large vocab to trigger multi-CTA mode
+
+    torch.manual_seed(42)
+    generator = torch.Generator(device="cuda:0").manual_seed(42)
+
+    # Generate random logits
+    logits = torch.rand((batch_size, vocab_size), device="cuda:0", generator=generator)
+    logits = logits.to(dtype)
+
+    # Generate k values: mix of small k and k == vocab_size
+    generator = torch.Generator(device="cuda:0").manual_seed(42)
+    k_values = torch.randint(
+        1, 1000, (batch_size,), device="cuda:0", generator=generator
+    )
+
+    # Randomly set some rows to k == vocab_size (about 50%)
+    generator = torch.Generator(device="cuda:0").manual_seed(42)
+    mask = torch.randint(
+        0, 2, (batch_size,), generator=generator, dtype=torch.bool, device="cuda:0"
+    )
+    k_values.masked_fill_(mask, vocab_size)
+
+    # Run FlashInfer top_k_mask_logits
+    masked_logits = flashinfer.sampling.top_k_mask_logits(logits, k_values)
+
+    # Verify output dtype
+    assert masked_logits.dtype == dtype
+
+    # Verify finite count matches k for each row
+    finite_counts = torch.isfinite(masked_logits).sum(dim=-1)
+
+    for i in range(batch_size):
+        k = k_values[i].item()
+        count = finite_counts[i].item()
+
+        if k >= vocab_size:
+            # All elements should be finite
+            assert count == vocab_size, (
+                f"Row {i}: k >= vocab_size but finite count={count} != {vocab_size}"
+            )
+        else:
+            # Count should be at least k (may be more due to ties at the threshold)
+            row_logits = logits[i].float()
+            topk_vals, _ = torch.topk(row_logits, k, sorted=True)
+            threshold = topk_vals[-1]
+            expected_ge_threshold = (row_logits >= threshold).sum().item()
+
+            # Allow small tolerance for floating point
+            assert count >= k - 1, f"Row {i}: k={k} but only {count} finite elements"
+            assert count <= expected_ge_threshold + 1, (
+                f"Row {i}: k={k}, expected at most {expected_ge_threshold} but got {count}"
+            )
 
 
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
@@ -572,7 +807,7 @@ def test_chain_speculative_sampling(
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("p", [0.05, 0.1, 0.2, 0.7, 1])
-def test_check_tensor_param_min_p(batch_size, vocab_size, p):
+def test_tensor_validation_min_p(batch_size, vocab_size, p):
     pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
 
@@ -587,7 +822,7 @@ def test_check_tensor_param_min_p(batch_size, vocab_size, p):
         flashinfer.sampling.min_p_sampling_from_probs(
             normalized_prob,
             torch.tensor(
-                [[p] * vocab_size] * batch_size, dtype=torch.int, device="cuda:0"
+                [[p] * vocab_size] * batch_size, dtype=torch.float32, device="cuda:0"
             ),
         )
 
@@ -597,7 +832,7 @@ def test_check_tensor_param_min_p(batch_size, vocab_size, p):
         match=r"Expected a 1D tensor of shape \(batch_size,\) or scalar.*got a 0-dimensional tensor",
     ):
         flashinfer.sampling.min_p_sampling_from_probs(
-            normalized_prob, torch.tensor(p, dtype=torch.int, device="cuda:0")
+            normalized_prob, torch.tensor(p, dtype=torch.float32, device="cuda:0")
         )
 
     # 4: 1D tensor with a broken batch size raises error (only when batch_size > 1).
@@ -606,13 +841,13 @@ def test_check_tensor_param_min_p(batch_size, vocab_size, p):
             ValueError, match="Sampling parameter tensor batch size mismatch"
         ):
             flashinfer.sampling.min_p_sampling_from_probs(
-                normalized_prob, torch.tensor([p], dtype=torch.int, device="cuda:0")
+                normalized_prob, torch.tensor([p], dtype=torch.float32, device="cuda:0")
             )
 
     # 5: 1D tensor with the correct batch size works.
     samples = flashinfer.sampling.min_p_sampling_from_probs(
         normalized_prob,
-        torch.tensor([p] * batch_size, dtype=torch.int, device="cuda:0"),
+        torch.tensor([p] * batch_size, dtype=torch.float32, device="cuda:0"),
     )
     assert samples.shape == (batch_size,)
 
@@ -650,9 +885,7 @@ def test_check_tensor_param_top_p(batch_size, vocab_size, p):
 
     # 4: 1D tensor with a broken batch size raises error (only when batch_size > 1).
     if batch_size > 1:
-        with pytest.raises(
-            ValueError, match="Sampling parameter tensor batch size mismatch"
-        ):
+        with pytest.raises(ValueError, match="Sampling parameter.*batch size mismatch"):
             flashinfer.sampling.top_p_renorm_probs(
                 normalized_prob, torch.tensor([p], dtype=torch.int, device="cuda:0")
             )
@@ -700,9 +933,7 @@ def test_check_tensor_param_top_k(batch_size, vocab_size, k):
 
     # 4: 1D tensor with a wrong shape raises error (only when batch_size > 1).
     if batch_size > 1:
-        with pytest.raises(
-            ValueError, match="Sampling parameter tensor batch size mismatch"
-        ):
+        with pytest.raises(ValueError, match="Sampling parameter.*batch size mismatch"):
             flashinfer.sampling.top_k_renorm_probs(
                 normalized_prob, torch.tensor([k], dtype=torch.int, device="cuda:0")
             )
@@ -713,6 +944,170 @@ def test_check_tensor_param_top_k(batch_size, vocab_size, k):
         torch.tensor([k] * batch_size, dtype=torch.int, device="cuda:0"),
     )
     assert samples.shape == normalized_prob.shape
+
+
+@pytest.mark.parametrize("batch_size", [1, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+def test_sampling_from_probs_seed_offset_reproducibility(batch_size, vocab_size):
+    """Test that explicit seed/offset produces reproducible results."""
+    torch.manual_seed(42)
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
+    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+
+    seed, offset = 12345, 0
+
+    samples1 = flashinfer.sampling.sampling_from_probs(
+        normalized_prob, seed=seed, offset=offset
+    )
+    samples2 = flashinfer.sampling.sampling_from_probs(
+        normalized_prob, seed=seed, offset=offset
+    )
+
+    assert torch.all(samples1 == samples2), (
+        "Same seed/offset should produce identical samples"
+    )
+
+
+@pytest.mark.parametrize("batch_size", [1, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+def test_sampling_from_logits_seed_offset_reproducibility(batch_size, vocab_size):
+    """Test that explicit seed/offset produces reproducible results."""
+    torch.manual_seed(42)
+    logits = torch.randn(batch_size, vocab_size, device="cuda:0")
+
+    seed, offset = 12345, 0
+
+    samples1 = flashinfer.sampling.sampling_from_logits(
+        logits, seed=seed, offset=offset
+    )
+    samples2 = flashinfer.sampling.sampling_from_logits(
+        logits, seed=seed, offset=offset
+    )
+
+    assert torch.all(samples1 == samples2), (
+        "Same seed/offset should produce identical samples"
+    )
+
+
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+def test_sampling_different_seed_offset_produces_different_results(vocab_size):
+    """Test that different seed/offset values produce different samples."""
+    torch.manual_seed(42)
+    batch_size = 1000
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
+    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+
+    samples_seed1 = flashinfer.sampling.sampling_from_probs(
+        normalized_prob, seed=12345, offset=0
+    )
+    samples_seed2 = flashinfer.sampling.sampling_from_probs(
+        normalized_prob, seed=67890, offset=0
+    )
+
+    samples_offset1 = flashinfer.sampling.sampling_from_probs(
+        normalized_prob, seed=12345, offset=0
+    )
+    samples_offset2 = flashinfer.sampling.sampling_from_probs(
+        normalized_prob, seed=12345, offset=1000
+    )
+
+    seed_match_rate = (samples_seed1 == samples_seed2).float().mean().item()
+    offset_match_rate = (samples_offset1 == samples_offset2).float().mean().item()
+
+    assert seed_match_rate < 1, (
+        f"Different seeds should produce mostly different samples, "
+        f"got {seed_match_rate:.2%} match rate"
+    )
+    assert offset_match_rate < 1, (
+        f"Different offsets should produce mostly different samples, "
+        f"got {offset_match_rate:.2%} match rate"
+    )
+
+
+@pytest.mark.parametrize("batch_size", [1, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 32000])
+@pytest.mark.parametrize(
+    "sampling_type",
+    ["from_probs", "from_logits", "top_p", "top_k", "min_p", "top_k_top_p"],
+)
+@pytest.mark.parametrize("indices_dtype", [torch.int32, torch.int64])
+def test_int64_indices_sampling(batch_size, vocab_size, sampling_type, indices_dtype):
+    """Test that all sampling functions work with int64 indices."""
+    torch.manual_seed(42)
+
+    logits = torch.randn(batch_size, vocab_size, device="cuda:0")
+    probs = torch.softmax(logits, dim=-1)
+    indices = torch.arange(batch_size, dtype=indices_dtype, device="cuda:0")
+
+    if sampling_type == "from_probs":
+        samples = flashinfer.sampling.sampling_from_probs(probs, indices=indices)
+    elif sampling_type == "from_logits":
+        samples = flashinfer.sampling.sampling_from_logits(logits, indices=indices)
+    elif sampling_type == "top_p":
+        samples = flashinfer.sampling.top_p_sampling_from_probs(
+            probs, 0.9, indices=indices
+        )
+    elif sampling_type == "top_k":
+        k = min(100, vocab_size)
+        samples = flashinfer.sampling.top_k_sampling_from_probs(
+            probs, k, indices=indices
+        )
+    elif sampling_type == "min_p":
+        samples = flashinfer.sampling.min_p_sampling_from_probs(
+            probs, 0.1, indices=indices
+        )
+    elif sampling_type == "top_k_top_p":
+        k = min(100, vocab_size)
+        samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+            probs, k, 0.9, indices=indices, filter_apply_order="joint"
+        )
+
+    assert samples.dtype == indices_dtype, (
+        f"Output dtype {samples.dtype} doesn't match indices dtype {indices_dtype}"
+    )
+    assert samples.shape == (batch_size,)
+    assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
+
+
+@pytest.mark.parametrize("batch_size", [1, 19, 99])
+@pytest.mark.parametrize("vocab_size", [111, 32000])
+def test_sampling_with_default_device_cuda(batch_size, vocab_size):
+    """Test that sampling works correctly when torch.set_default_device("cuda") is set.
+
+    This is a regression test for issue #2333 where generator.set_state() would fail
+    with "RNG state must be a torch.ByteTensor" error when the default device is CUDA.
+    """
+    torch.manual_seed(42)
+    original_device = torch.get_default_device()
+    try:
+        # Set default device to CUDA
+        torch.set_default_device("cuda")
+
+        # Create logits and test top_k_top_p_sampling_from_logits
+        logits = torch.randn(batch_size, vocab_size, device="cuda:0")
+
+        # This should not raise "RNG state must be a torch.ByteTensor" error
+        samples = flashinfer.sampling.top_k_top_p_sampling_from_logits(
+            logits, top_k=100, top_p=0.9
+        )
+
+        assert samples.shape == (batch_size,)
+        assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
+
+        # Also test other sampling functions
+        probs = torch.softmax(logits, dim=-1)
+
+        samples = flashinfer.sampling.sampling_from_probs(probs)
+        assert samples.shape == (batch_size,)
+        assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
+
+        samples = flashinfer.sampling.top_p_sampling_from_probs(probs, 0.9)
+        assert samples.shape == (batch_size,)
+        assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
+
+    finally:
+        # Restore original default device
+        torch.set_default_device(original_device)
 
 
 if __name__ == "__main__":

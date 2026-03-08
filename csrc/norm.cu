@@ -36,7 +36,7 @@ void rmsnorm(TensorView output, TensorView input, TensorView weight, double eps,
     unsigned int hidden_size = input.size(1);
     TVM_FFI_ICHECK_EQ(output.size(0), batch_size);
     TVM_FFI_ICHECK_EQ(output.size(1), hidden_size);
-    cudaSetDevice(input.device().device_id);
+    ffi::CUDADeviceGuard device_guard(input.device().device_id);
     const cudaStream_t stream = get_stream(input.device());
 
     DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
@@ -60,7 +60,7 @@ void rmsnorm(TensorView output, TensorView input, TensorView weight, double eps,
     TVM_FFI_ICHECK_EQ(output.size(1), num_heads);
     TVM_FFI_ICHECK_EQ(output.size(2), hidden_size);
 
-    cudaSetDevice(input.device().device_id);
+    ffi::CUDADeviceGuard device_guard(input.device().device_id);
     const cudaStream_t stream = get_stream(input.device());
     DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
       cudaError_t status = norm::QKRMSNorm(
@@ -71,6 +71,43 @@ void rmsnorm(TensorView output, TensorView input, TensorView weight, double eps,
       TVM_FFI_ICHECK(status == cudaSuccess)
           << "QKRMSNorm failed with error code " << cudaGetErrorString(status);
       return true;
+    });
+  } else {
+    TVM_FFI_ICHECK(false) << "Unsupported input dimension: " << input_ndim;
+  }
+}
+
+void rmsnorm_quant(TensorView output, TensorView input, TensorView weight, double scale, double eps,
+                   bool enable_pdl) {
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(output);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(weight);
+  CHECK_DEVICE(input, weight);
+  CHECK_DIM(1, weight);  // weight: (hidden_size)
+
+  auto input_ndim = input.ndim();
+  if (input_ndim == 2) {
+    // Normal RMSNorm: [batch_size, hidden_size]
+    // Use CTA parallelization for better parallelism
+    CHECK_DIM(2, output);
+    TVM_FFI_ICHECK_EQ(input.size(1), weight.size(0));
+    unsigned int batch_size = input.size(0);
+    unsigned int hidden_size = input.size(1);
+    TVM_FFI_ICHECK_EQ(output.size(0), batch_size);
+    TVM_FFI_ICHECK_EQ(output.size(1), hidden_size);
+    ffi::CUDADeviceGuard device_guard(input.device().device_id);
+    const cudaStream_t stream = get_stream(input.device());
+
+    DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
+      return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP8(output.dtype(), o_type, [&] {
+        cudaError_t status = norm::RMSNormQuant(
+            static_cast<c_type*>(input.data_ptr()), static_cast<c_type*>(weight.data_ptr()),
+            static_cast<o_type*>(output.data_ptr()), batch_size, hidden_size, input.stride(0),
+            output.stride(0), static_cast<float>(scale), eps, enable_pdl, stream);
+        TVM_FFI_ICHECK(status == cudaSuccess)
+            << "RMSNormQuant failed with error code " << cudaGetErrorString(status);
+        return true;
+      });
     });
   } else {
     TVM_FFI_ICHECK(false) << "Unsupported input dimension: " << input_ndim;
@@ -92,7 +129,7 @@ void fused_add_rmsnorm(TensorView input, TensorView residual, TensorView weight,
   TVM_FFI_ICHECK_EQ(residual.size(0), batch_size);
   TVM_FFI_ICHECK_EQ(residual.size(1), hidden_size);
   TVM_FFI_ICHECK_EQ(weight.size(0), hidden_size);
-  cudaSetDevice(input.device().device_id);
+  ffi::CUDADeviceGuard device_guard(input.device().device_id);
   const cudaStream_t stream = get_stream(input.device());
 
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
@@ -104,6 +141,42 @@ void fused_add_rmsnorm(TensorView input, TensorView residual, TensorView weight,
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "FusedAddRMSNorm failed with error code " << cudaGetErrorString(status);
     return true;
+  });
+}
+
+void fused_add_rmsnorm_quant(TensorView output, TensorView input, TensorView residual,
+                             TensorView weight, double scale, double eps, bool enable_pdl) {
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(residual);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(weight);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(output);
+  CHECK_DEVICE(input, residual);
+  CHECK_DEVICE(input, weight);
+  CHECK_DEVICE(input, output);
+  CHECK_DIM(2, input);     // input: (batch_size, hidden_size)
+  CHECK_DIM(2, residual);  // residual: (batch_size, hidden_size)
+  CHECK_DIM(1, weight);    // weight: (hidden_size)
+  CHECK_DIM(2, output);
+  unsigned int batch_size = input.size(0);
+  unsigned int hidden_size = input.size(1);
+  TVM_FFI_ICHECK_EQ(residual.size(0), batch_size);
+  TVM_FFI_ICHECK_EQ(residual.size(1), hidden_size);
+  TVM_FFI_ICHECK_EQ(weight.size(0), hidden_size);
+  ffi::CUDADeviceGuard device_guard(input.device().device_id);
+  const cudaStream_t stream = get_stream(input.device());
+
+  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
+    return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP8(output.dtype(), o_type, [&] {
+      cudaError_t status = norm::FusedAddRMSNormQuant(
+          static_cast<c_type*>(input.data_ptr()), static_cast<c_type*>(residual.data_ptr()),
+          static_cast<c_type*>(weight.data_ptr()), static_cast<o_type*>(output.data_ptr()),
+          batch_size, hidden_size, input.stride(0), residual.stride(0), output.stride(0), scale,
+          eps, enable_pdl, stream);
+
+      TVM_FFI_ICHECK(status == cudaSuccess)
+          << "FusedAddRMSNormQuant failed with error code " << cudaGetErrorString(status);
+      return true;
+    });
   });
 }
 
@@ -119,7 +192,7 @@ void gemma_rmsnorm(TensorView output, TensorView input, TensorView weight, doubl
   unsigned int hidden_size = input.size(1);
   TVM_FFI_ICHECK_EQ(output.size(0), batch_size);
   TVM_FFI_ICHECK_EQ(output.size(1), hidden_size);
-  cudaSetDevice(input.device().device_id);
+  ffi::CUDADeviceGuard device_guard(input.device().device_id);
   const cudaStream_t stream = get_stream(input.device());
 
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
@@ -148,7 +221,7 @@ void gemma_fused_add_rmsnorm(TensorView input, TensorView residual, TensorView w
   TVM_FFI_ICHECK_EQ(residual.size(0), batch_size);
   TVM_FFI_ICHECK_EQ(residual.size(1), hidden_size);
   TVM_FFI_ICHECK_EQ(weight.size(0), hidden_size);
-  cudaSetDevice(input.device().device_id);
+  ffi::CUDADeviceGuard device_guard(input.device().device_id);
   const cudaStream_t stream = get_stream(input.device());
 
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
@@ -177,7 +250,7 @@ void layernorm(Tensor output, Tensor input, Tensor gamma, Tensor beta, double ep
   unsigned int hidden_size = input.size(1);
   TVM_FFI_ICHECK_EQ(output.size(0), batch_size);
   TVM_FFI_ICHECK_EQ(output.size(1), hidden_size);
-  cudaSetDevice(input.device().device_id);
+  ffi::CUDADeviceGuard device_guard(input.device().device_id);
   const cudaStream_t stream = get_stream(input.device());
   // TODO(kaixih): This is currently our only use case; Add more if needed.
   TVM_FFI_ICHECK_EQ(input.dtype(), dl_bfloat16) << "input must be bfloat16";

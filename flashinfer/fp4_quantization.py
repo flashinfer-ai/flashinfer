@@ -21,12 +21,14 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from .api_logging import flashinfer_api
 from .jit import JitSpec
 from .jit import env as jit_env
 from .jit import (
     gen_jit_spec,
     sm121a_nvcc_flags,
     sm120a_nvcc_flags,
+    sm120f_nvcc_flags,
     sm110a_nvcc_flags,
     sm103a_nvcc_flags,
     sm100a_nvcc_flags,
@@ -98,6 +100,10 @@ def gen_fp4_quantization_sm120_module() -> JitSpec:
     return gen_fp4_quantization_module(sm120a_nvcc_flags, "120")
 
 
+def gen_fp4_quantization_sm120f_module() -> JitSpec:
+    return gen_fp4_quantization_module(sm120f_nvcc_flags, "120f")
+
+
 def gen_fp4_quantization_sm121_module() -> JitSpec:
     return gen_fp4_quantization_module(sm121a_nvcc_flags, "121")
 
@@ -137,12 +143,23 @@ def gen_fp4_quantization_module(nvcc_flags: List[str], device_arch: str) -> JitS
 def get_fp4_quantization_module(backend: str = "100"):
     backend_modules = {
         "121": gen_fp4_quantization_sm121_module,
+        "120f": gen_fp4_quantization_sm120f_module,
         "120": gen_fp4_quantization_sm120_module,
         "110": gen_fp4_quantization_sm110_module,
         "103": gen_fp4_quantization_sm103_module,
         "100": gen_fp4_quantization_sm100_module,
         "90": gen_fp4_quantization_sm90_module,
     }
+
+    # Prefer 'f' (family / feature-set) variant for SM12x when CUDA >= 12.9,
+    # as it enables native FP4 conversion instructions (cvt.rn.satfinite.e2m1x2.f32).
+    # sm_120f covers the entire SM12x family (both SM120 and SM121).
+    # See: https://developer.nvidia.com/blog/nvidia-blackwell-and-nvidia-cuda-12-9-introduce-family-specific-architecture-features/
+    if backend in ("120", "121"):
+        from .utils import version_at_least
+
+        if version_at_least(torch.version.cuda, "12.9"):
+            backend = "120f"
 
     if backend not in backend_modules:
         raise ValueError(f"Invalid backend: {backend}")
@@ -264,10 +281,10 @@ def get_fp4_quantization_module(backend: str = "100"):
         """Swizzle block scale tensor for FP4 format.
 
         Args:
-            unswizzled_sf (torch.Tensor): unswizzled block scale tensor with dtype uint8.
+            unswizzled_sf (torch.Tensor): unswizzled block scale tensor with dtype uint8 or bfloat16.
 
         Returns:
-            torch.Tensor: output tensor for swizzled block scale with dtype uint8.
+            torch.Tensor: output tensor for swizzled block scale with dtype uint8 or bfloat16.
         """
         num_experts = unswizzled_sf.shape[0] if unswizzled_sf.dim() == 3 else 1
         expert_out_size = _compute_swizzled_layout_sf_size(
@@ -275,7 +292,7 @@ def get_fp4_quantization_module(backend: str = "100"):
         )
         out = torch.empty(
             (num_experts * expert_out_size,),
-            dtype=torch.uint8,
+            dtype=unswizzled_sf.dtype,
             device=unswizzled_sf.device,
         )
         module.block_scale_interleave_sm100(unswizzled_sf, out)
@@ -624,6 +641,7 @@ def get_fp4_quantization_module(backend: str = "100"):
     )
 
 
+@flashinfer_api
 def fp4_quantize(
     input: torch.Tensor,
     global_scale: Optional[torch.Tensor] = None,
@@ -689,6 +707,7 @@ def fp4_quantize(
     return x_q, sf
 
 
+@flashinfer_api
 def block_scale_interleave(unswizzled_sf: torch.Tensor) -> torch.Tensor:
     """Swizzle block scale tensor for FP4 format.
 
@@ -696,18 +715,18 @@ def block_scale_interleave(unswizzled_sf: torch.Tensor) -> torch.Tensor:
     for FP4 operations. The output needs to be padded in the m dimension to be a multiple of 128.
 
     Args:
-        unswizzled_sf (torch.Tensor): Input tensor with dtype uint8.
+        unswizzled_sf (torch.Tensor): Input tensor with dtype uint8 or bfloat16.
 
     Returns:
         torch.Tensor: Swizzled tensor with the same shape as input.
 
     Raises:
-        AssertionError: If input dtype is not uint8.
+        AssertionError: If input dtype is not uint8 or bfloat16.
     """
     # TODO(shuw): check input dtype is uint8
-    assert unswizzled_sf.dtype == torch.uint8, (
-        f"Input dtype must be uint8, got {unswizzled_sf.dtype}"
-    )
+    assert (
+        unswizzled_sf.dtype == torch.uint8 or unswizzled_sf.dtype == torch.bfloat16
+    ), f"Input dtype must be uint8 or bfloat16, got {unswizzled_sf.dtype}"
 
     major, minor = get_compute_capability(unswizzled_sf.device)
     device_arch = f"{major * 10 + minor}"
@@ -721,6 +740,7 @@ def block_scale_interleave(unswizzled_sf: torch.Tensor) -> torch.Tensor:
 nvfp4_block_scale_interleave = block_scale_interleave
 
 
+@flashinfer_api
 def e2m1_and_ufp8sf_scale_to_float(
     e2m1_tensor: torch.Tensor,
     ufp8_scale_tensor: torch.Tensor,
@@ -763,6 +783,7 @@ def e2m1_and_ufp8sf_scale_to_float(
     )
 
 
+@flashinfer_api
 def shuffle_matrix_a(input_tensor: torch.Tensor, epilogue_tile_m: int) -> torch.Tensor:
     """
     PyTorch equivalent of trtllm-gen `shuffleMatrixA`
@@ -772,6 +793,7 @@ def shuffle_matrix_a(input_tensor: torch.Tensor, epilogue_tile_m: int) -> torch.
     return input_tensor[row_indices.to(input_tensor.device)]
 
 
+@flashinfer_api
 def shuffle_matrix_sf_a(
     input_tensor: torch.Tensor,
     epilogue_tile_m: int,
@@ -806,6 +828,7 @@ class SfLayout(Enum):
     layout_linear = 2
 
 
+@flashinfer_api
 def nvfp4_quantize(
     a,
     a_global_sf,
@@ -866,6 +889,7 @@ def nvfp4_quantize(
     return a_fp4, a_sf
 
 
+@flashinfer_api
 def mxfp4_quantize(a):
     """
     Quantize input tensor to MXFP4 format.
@@ -883,6 +907,7 @@ def mxfp4_quantize(a):
     return a_fp4, a_sf
 
 
+@flashinfer_api
 def mxfp4_dequantize(a_fp4, a_sf):
     """
     Dequantize input tensor from MXFP4 format.
@@ -904,6 +929,7 @@ def mxfp4_dequantize(a_fp4, a_sf):
     )
 
 
+@flashinfer_api
 def mxfp4_dequantize_host(
     weight: torch.Tensor,
     scale: torch.Tensor,
@@ -932,6 +958,7 @@ def mxfp4_dequantize_host(
     )
 
 
+@flashinfer_api
 def nvfp4_batched_quantize(
     a,
     a_global_sf,
@@ -961,6 +988,7 @@ def nvfp4_batched_quantize(
     return a_fp4, a_sf
 
 
+@flashinfer_api
 def scaled_fp4_grouped_quantize(
     a,
     mask,

@@ -1,7 +1,7 @@
 """
-Test for NoAuxTc (DSv3 Fused Routing) Kernel
+Test for fused_topk_deepseek (DSv3 Fused Routing) Kernel
 
-This test validates the NoAuxTc kernel against a reference implementation,
+This test validates the fused_topk_deepseek kernel against a reference implementation,
 accounting for numerical precision and tie-breaking differences.
 
 ================================================================================
@@ -118,7 +118,7 @@ accumulating more numerical error.
 
 import torch
 import pytest
-from flashinfer.dsv3_ops import NoAuxTc
+from flashinfer.dsv3_ops import fused_topk_deepseek
 # from flashinfer.utils import get_compute_capability
 
 
@@ -429,7 +429,7 @@ def test_dsv3_fused_routing_op(
     num_tokens, num_experts, topk, n_group, topk_group, data_type, bias_type
 ):
     """
-    Test NoAuxTc kernel against reference implementation.
+    Test fused_topk_deepseek kernel against reference implementation.
 
     Validates:
     1. Expert selection equivalence (allowing for ties)
@@ -473,7 +473,7 @@ def test_dsv3_fused_routing_op(
     topk_values = torch.empty(num_tokens, topk, device="cuda", dtype=data_type)
     topk_indices = torch.zeros(num_tokens, topk, device="cuda", dtype=torch.int32)
 
-    NoAuxTc(
+    fused_topk_deepseek(
         scores,
         bias,
         n_group,

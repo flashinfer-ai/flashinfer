@@ -1,6 +1,7 @@
 # Adapted from https://github.com/pytorch/pytorch/blob/v2.7.0/torch/utils/cpp_extension.py
 
 import functools
+import logging
 import os
 import re
 import subprocess
@@ -16,6 +17,8 @@ import torch
 from . import env as jit_env
 from ..compilation_context import CompilationContext
 
+logger = logging.getLogger(__name__)
+
 
 def parse_env_flags(env_var_name) -> List[str]:
     env_flags = os.environ.get(env_var_name)
@@ -25,9 +28,10 @@ def parse_env_flags(env_var_name) -> List[str]:
 
             return shlex.split(env_flags)
         except ValueError as e:
-            print(
-                f"Warning: Could not parse {env_var_name} with shlex: {e}. Falling back to simple split.",
-                file=sys.stderr,
+            logger.warning(
+                "Could not parse %s with shlex: %s. Falling back to simple split.",
+                env_var_name,
+                e,
             )
             return env_flags.split()
     return []
@@ -91,15 +95,8 @@ def join_multiline(vs: List[str]) -> str:
     return " $\n    ".join(vs)
 
 
-def generate_ninja_build_for_op(
-    name: str,
-    sources: List[Path],
-    extra_cflags: Optional[List[str]],
-    extra_cuda_cflags: Optional[List[str]],
-    extra_ldflags: Optional[List[str]],
-    extra_include_dirs: Optional[List[Path]],
-    needs_device_linking: bool = False,
-) -> str:
+def get_system_includes(cuda_home: str) -> List:
+    """Get list of system include directories."""
     system_includes = [
         sysconfig.get_path("include"),
         "$cuda_home/include",
@@ -112,10 +109,19 @@ def generate_ninja_build_for_op(
     system_includes += [p.resolve() for p in jit_env.CUTLASS_INCLUDE_DIRS]
     system_includes.append(jit_env.SPDLOG_INCLUDE_DIR.resolve())
 
-    cuda_home = get_cuda_path()
     if cuda_home == "/usr":
         # NOTE: this will resolve to /usr/include, which will mess up includes. See #1793
         system_includes.remove("$cuda_home/include")
+
+    return system_includes
+
+
+def build_common_cflags(
+    cuda_home: str,
+    extra_include_dirs: Optional[List[Path]] = None,
+) -> List[str]:
+    """Build common compilation flags."""
+    system_includes = get_system_includes(cuda_home)
 
     common_cflags = []
     if not sysconfig.get_config_var("Py_GIL_DISABLED"):
@@ -127,6 +133,14 @@ def generate_ninja_build_for_op(
     for sys_dir in system_includes:
         common_cflags.append(f"-isystem {sys_dir}")
 
+    return common_cflags
+
+
+def build_cflags(
+    common_cflags: List[str],
+    extra_cflags: Optional[List[str]] = None,
+) -> List[str]:
+    """Build C++ compilation flags."""
     cflags = [
         "$common_cflags",
         "-fPIC",
@@ -134,6 +148,18 @@ def generate_ninja_build_for_op(
     if extra_cflags is not None:
         cflags += extra_cflags
 
+    env_extra_cflags = parse_env_flags("FLASHINFER_EXTRA_CFLAGS")
+    if env_extra_cflags is not None:
+        cflags += env_extra_cflags
+
+    return cflags
+
+
+def build_cuda_cflags(
+    common_cflags: List[str],
+    extra_cuda_cflags: Optional[List[str]] = None,
+) -> List[str]:
+    """Build CUDA compilation flags."""
     cuda_cflags: List[str] = []
     cc_env = os.environ.get("CC")
     if cc_env is not None:
@@ -171,6 +197,27 @@ def generate_ninja_build_for_op(
         # No module flags, use global flags
         cuda_cflags += global_flags
 
+    env_extra_cuda_cflags = parse_env_flags("FLASHINFER_EXTRA_CUDAFLAGS")
+    if env_extra_cuda_cflags is not None:
+        cuda_cflags += env_extra_cuda_cflags
+
+    return cuda_cflags
+
+
+def generate_ninja_build_for_op(
+    name: str,
+    sources: List[Path],
+    extra_cflags: Optional[List[str]],
+    extra_cuda_cflags: Optional[List[str]],
+    extra_ldflags: Optional[List[str]],
+    extra_include_dirs: Optional[List[Path]],
+    needs_device_linking: bool = False,
+) -> str:
+    cuda_home = get_cuda_path()
+    common_cflags = build_common_cflags(cuda_home, extra_include_dirs)
+    cflags = build_cflags(common_cflags, extra_cflags)
+    cuda_cflags = build_cuda_cflags(common_cflags, extra_cuda_cflags)
+
     ldflags = [
         "-shared",
         "-L$cuda_home/lib64",
@@ -185,14 +232,6 @@ def generate_ninja_build_for_op(
 
     if extra_ldflags is not None:
         ldflags += extra_ldflags
-
-    extra_cflags = parse_env_flags("FLASHINFER_EXTRA_CFLAGS")
-    if extra_cflags is not None:
-        cflags += extra_cflags
-
-    extra_cuda_cflags = parse_env_flags("FLASHINFER_EXTRA_CUDAFLAGS")
-    if extra_cuda_cflags is not None:
-        cuda_cflags += extra_cuda_cflags
 
     cxx = os.environ.get("CXX", "c++")
     nvcc = os.environ.get("FLASHINFER_NVCC", "$cuda_home/bin/nvcc")
@@ -241,20 +280,26 @@ def generate_ninja_build_for_op(
             ]
         )
 
+    # Use absolute paths for outputs so ninja files work with any workdir
+    # This enables isolated workdirs for runtime JIT (avoiding .ninja_log races)
+    # while still supporting subninja for parallel AOT builds
+    output_dir = jit_env.FLASHINFER_JIT_DIR / name
+
     objects = []
     for source in sources:
         is_cuda = source.suffix == ".cu"
         object_suffix = ".cuda.o" if is_cuda else ".o"
         cmd = "cuda_compile" if is_cuda else "compile"
         obj_name = source.with_suffix(object_suffix).name
-        obj = f"$name/{obj_name}"
+        obj = str((output_dir / obj_name).resolve())
         objects.append(obj)
         lines.append(f"build {obj}: {cmd} {source.resolve()}")
 
     lines.append("")
     link_rule = "nvcc_link" if needs_device_linking else "link"
-    lines.append(f"build $name/$name.so: {link_rule} " + " ".join(objects))
-    lines.append("default $name/$name.so")
+    output_so = str((output_dir / f"{name}.so").resolve())
+    lines.append(f"build {output_so}: {link_rule} " + " ".join(objects))
+    lines.append(f"default {output_so}")
     lines.append("")
 
     return "\n".join(lines)

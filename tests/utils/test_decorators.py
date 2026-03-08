@@ -344,7 +344,27 @@ def test_suitable_auto_backends():
     def _cudnn_check(x, backend):
         return x.shape[0] > 5
 
-    @backend_requirement({"cutlass": _cutlass_check, "cudnn": _cudnn_check})
+    # When using an auto backend, some heuristic function must exist
+    def _heuristic_func(suitable_backends, x, backend):
+        candidate_backends = None
+        if x.shape[0] > 5:
+            candidate_backends = ["cudnn", "cutlass"]
+        else:
+            candidate_backends = ["cutlass", "cudnn"]
+
+        heuristic_backends = []
+        for backend in candidate_backends:
+            if backend in suitable_backends:
+                heuristic_backends.append(backend)
+        return heuristic_backends
+
+    @backend_requirement(
+        backend_checks={
+            "cutlass": _cutlass_check,
+            "cudnn": _cudnn_check,
+        },
+        heuristic_func=_heuristic_func,
+    )
     def my_kernel(x, backend="auto"):
         backends = my_kernel.suitable_auto_backends
         if x.shape[0] > 5:

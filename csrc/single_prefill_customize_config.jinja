@@ -68,8 +68,8 @@ struct Params {
     return kv_len;
   }
 
-  // SinglePrefill: q_block_expanding_offset 支持
-  // 如果传入了 q_block_expanding_offset 参数则使用，否则返回 0
+  // SinglePrefill: q_block_expanding_offset support
+  // If q_block_expanding_offset parameter is provided, use it; otherwise return 0
   __host__ __device__ __forceinline__ uint32_t get_q_block_expanding_offset(uint32_t batch_idx) const {
 {% if has_q_block_expanding_offset %}
     return static_cast<uint32_t>(q_block_expanding_offset);
@@ -78,8 +78,8 @@ struct Params {
 {% endif %}
   }
 
-  // SinglePrefill: kv_block_expanding_offset 支持 (用于 Cascade Current Chunk)
-  // 如果传入了 kv_block_expanding_offset 参数则使用，否则返回 0
+  // SinglePrefill: kv_block_expanding_offset support (for Cascade Current Chunk)
+  // If kv_block_expanding_offset parameter is provided, use it; otherwise return 0
   __host__ __device__ __forceinline__ uint32_t get_kv_block_expanding_offset(uint32_t batch_idx) const {
 {% if has_kv_block_expanding_offset %}
     return static_cast<uint32_t>(kv_block_expanding_offset);

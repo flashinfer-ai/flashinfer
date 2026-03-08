@@ -1,20 +1,20 @@
-"""DLLM Block-wise Mask 实现方案对比
+"""DLLM Block-wise Mask Implementation Comparison
 
-对比三种实现方式：
-1. Cascade Attention (SGLang 方式): Ragged + Paged + merge_state
-   - Ragged: 当前 block 内部双向 attention (causal=False)
-   - Paged: 访问之前所有 cached blocks (causal=False)
-   - merge_state: 合并两个阶段的 softmax 状态
+Comparing three implementation approaches:
+1. Cascade Attention (SGLang approach): Ragged + Paged + merge_state
+   - Ragged: Bidirectional attention within current block (causal=False)
+   - Paged: Access all previous cached blocks (causal=False)
+   - merge_state: Merge softmax states from both stages
 
-2. Batch Prefill + kBlockExtend + q_offset (FlashInfer 优化方式)
-   - 单次 kernel launch
-   - tile 级别跳过无效计算
+2. Batch Prefill + kBlockExtend + q_offset (FlashInfer optimized approach)
+   - Single kernel launch
+   - Tile-level skip for invalid computations
 
-3. V2 串行方式 (参考基准)
-   - 每个 chunk 独立调用
-   - tile 级别跳过
+3. V2 Serial approach (reference baseline)
+   - Each chunk called independently
+   - Tile-level skip
 
-Mask 规则: mask[q, k] = (q_global // B) >= (k_global // B)
+Mask rule: mask[q, k] = (q_global // B) >= (k_global // B)
 """
 
 import torch
@@ -43,16 +43,16 @@ def compute_block_extend_reference(
     sm_scale: float = None,
 ) -> torch.Tensor:
     """
-    使用 custom_mask 计算 Block Extend Attention 的参考结果
+    Compute Block Extend Attention reference result using custom_mask
     
-    Mask 规则: mask[q, k] = ((q_local + q_offset) // B) >= (k // B)
+    Mask rule: mask[q, k] = ((q_local + q_offset) // B) >= (k // B)
     
     Args:
         q: [qo_len, num_heads, head_dim]
         k: [kv_len, num_kv_heads, head_dim]
         v: [kv_len, num_kv_heads, head_dim]
-        dllm_block_size: DLLM block 大小
-        q_offset: Q 的全局起始位置
+        dllm_block_size: DLLM block size
+        q_offset: Q's global starting position
         sm_scale: softmax scale
     
     Returns:
@@ -66,7 +66,7 @@ def compute_block_extend_reference(
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(head_dim)
     
-    # 构造 custom_mask
+    # Construct custom_mask
     # q_global = q_local + q_offset
     # mask[q, k] = (q_global // B) >= (k // B)
     q_pos = torch.arange(qo_len, device=device) + q_offset
@@ -94,18 +94,18 @@ def test_incremental_batchprefill_step_by_step_with_cuda_graph(
     verbose: bool = False,
 ):
     """
-    真实模拟 DLLM 增量 Prefill 的分步执行流程 + CUDA Graph
+    Realistically simulate DLLM incremental Prefill step-by-step execution flow + CUDA Graph
     
-    关键点:
-      1. 必须分步执行，每个 chunk step 依赖前一个 step 的 KV cache
-      2. SGLang Cascade 强制 chunk_size = dllm_block_size
-      3. BatchBlockExtend 可以使用更大的 chunk_size，减少 step 数
-      4. 启用 CUDA Graph 减少 CPU 开销和 kernel launch 延迟
+    Key points:
+      1. Must execute step by step, each chunk step depends on previous step's KV cache
+      2. SGLang Cascade forces chunk_size = dllm_block_size
+      3. BatchBlockExtend can use larger chunk_size, reducing number of steps
+      4. Enable CUDA Graph to reduce CPU overhead and kernel launch latency
     
-    CUDA Graph 注意事项:
-      - plan() 包含 CPU-GPU 同步，不能在 capture 期间执行
-      - 必须为每个 step 创建独立的 wrapper，在 capture 前完成 plan
-      - 只 capture run() 操作
+    CUDA Graph notes:
+      - plan() contains CPU-GPU synchronization, cannot execute during capture
+      - Must create independent wrapper for each step, complete plan before capture
+      - Only capture run() operations
     """
     if chunk_sizes is None:
         chunk_sizes = [32, 64, 128, 256]
@@ -119,9 +119,9 @@ def test_incremental_batchprefill_step_by_step_with_cuda_graph(
     baseline_num_chunks = tokens_per_request // baseline_chunk_size
     
     print(f"\n{'='*80}")
-    print(f"真实分步执行 + CUDA Graph: DLLM 增量 Prefill 性能对比")
+    print(f"Step-by-step Execution + CUDA Graph: DLLM Incremental Prefill Performance Comparison")
     print(f"{'='*80}")
-    print(f"配置:")
+    print(f"Configuration:")
     print(f"  num_requests        = {num_requests}")
     print(f"  tokens_per_request  = {tokens_per_request}")
     print(f"  dllm_block_size     = {dllm_block_size}")
@@ -129,13 +129,13 @@ def test_incremental_batchprefill_step_by_step_with_cuda_graph(
     print(f"  num_heads           = {num_heads}")
     print(f"  num_kv_heads        = {num_kv_heads}")
     print(f"  head_dim            = {head_dim}")
-    print(f"\n关键特性:")
-    print(f"  - 分步执行: 每个 step 必须等待前一个 step 完成")
-    print(f"  - SGLang 强制 chunk_size = dllm_block_size = {dllm_block_size}")
-    print(f"  - BatchBlockExtend 可以使用更大的 chunk_size")
-    print(f"  - CUDA Graph: 减少 CPU 开销和 kernel launch 延迟")
+    print(f"\nKey features:")
+    print(f"  - Step-by-step execution: Each step must wait for previous step to complete")
+    print(f"  - SGLang forces chunk_size = dllm_block_size = {dllm_block_size}")
+    print(f"  - BatchBlockExtend can use larger chunk_size")
+    print(f"  - CUDA Graph: Reduce CPU overhead and kernel launch latency")
     
-    # 数据准备，生成每个 request 的完整 Q, K, V
+    # Data preparation, generate complete Q, K, V for each request
     all_qs = [torch.randn(tokens_per_request, num_heads, head_dim, dtype=dtype, device=device) 
               for _ in range(num_requests)]
     all_ks = [torch.randn(tokens_per_request, num_kv_heads, head_dim, dtype=dtype, device=device) 
@@ -143,7 +143,7 @@ def test_incremental_batchprefill_step_by_step_with_cuda_graph(
     all_vs = [torch.randn(tokens_per_request, num_kv_heads, head_dim, dtype=dtype, device=device) 
               for _ in range(num_requests)]
     
-    # 为每个 request 分 chunk 
+    # Split each request into chunks 
     def split_chunks(tensor, chunk_size):
         return [tensor[i*chunk_size:(i+1)*chunk_size] for i in range(tensor.shape[0] // chunk_size)]
     
@@ -153,23 +153,23 @@ def test_incremental_batchprefill_step_by_step_with_cuda_graph(
     
     results = {}
 
-    # 正确性验证 (抽样验证第一个 request)
+    # Correctness verification (sample verification of first request)
     print(f"\n{'='*80}")
-    print(f"正确性验证 (抽样验证 request_0)")
+    print(f"Correctness verification (sample verification of request_0)")
     print(f"{'='*80}")
-    print(f"  参考实现: single_prefill_with_kv_cache + custom_mask")
-    print(f"  Mask 规则: mask[q,k] = ((q + offset) // B) >= (k // B)")
+    print(f"  Reference implementation: single_prefill_with_kv_cache + custom_mask")
+    print(f"  Mask rule: mask[q,k] = ((q + offset) // B) >= (k // B)")
     
-    # 抽样验证第一个 request
+    # Sample verification of first request
     req_idx = 0
     k_req = all_ks[req_idx]
     v_req = all_vs[req_idx]
     
-    # 累积 KV buffer
+    # Cumulative KV buffer
     k_cumul_verify = [k_req[:(i+1)*baseline_chunk_size] for i in range(baseline_num_chunks)]
     v_cumul_verify = [v_req[:(i+1)*baseline_chunk_size] for i in range(baseline_num_chunks)]
     
-    # 计算参考结果
+    # Compute reference results
     ref_outputs = []
     for step_idx in range(baseline_num_chunks):
         q_offset = step_idx * baseline_chunk_size
@@ -207,7 +207,7 @@ def test_incremental_batchprefill_step_by_step_with_cuda_graph(
         bbe_out = wrapper.run(qs_chunks[req_idx][step_idx], k_cumul_verify[step_idx], v_cumul_verify[step_idx])
         bbe_outputs.append(bbe_out)
     
-    # 验证
+    # Verification
     tol = 1e-2
     bbe_max_diff = max((bbe_outputs[i] - ref_outputs[i]).abs().max().item() for i in range(baseline_num_chunks))
     bbe_pass = bbe_max_diff < tol
@@ -216,9 +216,9 @@ def test_incremental_batchprefill_step_by_step_with_cuda_graph(
     print(f"        {' PASS' if bbe_pass else ' FAIL'}")
     
     if not bbe_pass:
-        print(f"\n   正确性验证未通过，但继续执行性能测试")
+        print(f"\n   Correctness verification failed, but continue with performance test")
     else:
-        print(f"\n   BBE 正确性验证通过")
+        print(f"\n   BBE correctness verification passed")
     
     del workspace_verify, bbe_outputs, ref_outputs, k_cumul_verify, v_cumul_verify
     torch.cuda.empty_cache()
@@ -229,16 +229,16 @@ def test_incremental_batchprefill_step_by_step_with_cuda_graph(
     print(f"{'='*80}")
     print(f"  num_steps: {baseline_num_chunks}")
     print(f"  num_requests: {num_requests}")
-    print(f"  每个 step: BatchPrefillWithRaggedKVCacheWrapper + custom_mask")
-    print(f"  每个 step 内 kernel: 1 次 (batch 处理所有 requests)")
+    print(f"  Each step: BatchPrefillWithRaggedKVCacheWrapper + custom_mask")
+    print(f"  Kernels per step: 1 (batch processes all requests)")
     
-    # 预分配 Q buffers (concat 所有 requests)
+    # Pre-allocate Q buffers (concat all requests)
     cm_q_buffers = []
     for step_idx in range(baseline_num_chunks):
         q_list = [qs_chunks[req_idx][step_idx] for req_idx in range(num_requests)]
         cm_q_buffers.append(torch.cat(q_list, dim=0))
     
-    # 预分配累积 KV buffers (concat 所有 requests)
+    # Pre-allocate cumulative KV buffers (concat all requests)
     cm_k_buffers = []
     cm_v_buffers = []
     for step_idx in range(baseline_num_chunks):
@@ -248,26 +248,26 @@ def test_incremental_batchprefill_step_by_step_with_cuda_graph(
         cm_k_buffers.append(torch.cat(k_cumul_list, dim=0))
         cm_v_buffers.append(torch.cat(v_cumul_list, dim=0))
     
-    # 构造 flattened custom_mask (batch 版本)
+    # Construct flattened custom_mask (batch version)
     # custom_mask shape: (sum(q_len[i] * k_len[i] for i in range(batch_size)))
-    # 每个 request 的 mask 都相同，concat num_requests 次
+    # Each request's mask is the same, concat num_requests times
     custom_mask_buffers = []
     for step_idx in range(baseline_num_chunks):
         kv_len = (step_idx + 1) * baseline_chunk_size
         q_offset = step_idx * baseline_chunk_size
-        # 构造单个 request 的 2D mask: [q_len, kv_len]
+        # Construct single request's 2D mask: [q_len, kv_len]
         q_pos = torch.arange(baseline_chunk_size, device=device) + q_offset
         k_pos = torch.arange(kv_len, device=device)
         q_block = q_pos.unsqueeze(1) // dllm_block_size
         k_block = k_pos.unsqueeze(0) // dllm_block_size
         mask_2d = (q_block >= k_block)  # [q_len, kv_len], bool
-        # flatten 并 repeat 为 batch
+        # Flatten and repeat for batch
         mask_flat = mask_2d.flatten()  # [q_len * kv_len]
-        # 所有 requests 的 mask 相同，concat
+        # All requests have the same mask, concat
         batch_mask = mask_flat.repeat(num_requests)  # [num_requests * q_len * kv_len]
         custom_mask_buffers.append(batch_mask)
     
-    # qo_indptr 和 kv_indptr
+    # qo_indptr and kv_indptr
     cm_qo_indptr = torch.tensor(
         [i * baseline_chunk_size for i in range(num_requests + 1)],
         dtype=torch.int32, device=device
@@ -280,15 +280,15 @@ def test_incremental_batchprefill_step_by_step_with_cuda_graph(
             dtype=torch.int32, device=device
         ))
     
-    # 为每个 step 创建独立的 wrapper 并完成 plan
-    # 注意: custom_mask 只在 FA2 后端支持，FA3 不支持
-    print(f"  创建 wrappers 并完成 plan...")
+    # Create independent wrapper for each step and complete plan
+    # Note: custom_mask is only supported in FA2 backend, not FA3
+    print(f"  Creating wrappers and completing plan...")
     cm_wrappers = []
     for step_idx in range(baseline_num_chunks):
         wrapper = BatchPrefillWithRaggedKVCacheWrapper(
             torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device), 
             kv_layout="NHD",
-            backend="fa2",  # custom_mask 只在 FA2 支持
+            backend="fa2",  # custom_mask only supported in FA2
         )
         wrapper.plan(
             qo_indptr=cm_qo_indptr,
@@ -311,7 +311,7 @@ def test_incremental_batchprefill_step_by_step_with_cuda_graph(
             ))
 
     if verbose:
-        print(f"  Step 流程预览:")
+        print(f"  Step flow preview:")
         for step_id in range(baseline_num_chunks):
             kv_len = (step_id + 1) * baseline_chunk_size
             print(f"    Step {step_id}: Q[{step_id*baseline_chunk_size}:{(step_id+1)*baseline_chunk_size}] attend to KV[0:{kv_len}]")
@@ -362,10 +362,10 @@ def test_incremental_batchprefill_step_by_step_with_cuda_graph(
     print(f"[Baseline 1] SGLang Cascade (chunk_size = dllm_block_size = {baseline_chunk_size})")
     print(f"{'='*80}")
     print(f"  num_steps: {baseline_num_chunks}")
-    print(f"  每个 step: BatchRagged(当前chunk) + BatchRagged(prefix) + merge_state")
-    print(f"  每个 step 内 kernel: 2-3 次")
+    print(f"  Each step: BatchRagged(current chunk) + BatchRagged(prefix) + merge_state")
+    print(f"  Kernels per step: 2-3")
     
-    # 预分配所有 buffer（用于 CUDA Graph）
+    # Pre-allocate all buffers (for CUDA Graph)
     q_current_buffers = []
     k_current_buffers = []
     v_current_buffers = []
@@ -377,7 +377,7 @@ def test_incremental_batchprefill_step_by_step_with_cuda_graph(
         k_current_buffers.append(torch.cat(k_list, dim=0))
         v_current_buffers.append(torch.cat(v_list, dim=0))
     
-    # 预分配 prefix KV buffer
+    # Pre-allocate prefix KV buffer
     k_prefix_buffers = [None]
     v_prefix_buffers = [None]
     for step_idx in range(1, baseline_num_chunks):
@@ -402,13 +402,13 @@ def test_incremental_batchprefill_step_by_step_with_cuda_graph(
             dtype=torch.int32, device=device
         ))
     
-    # 为每个 step 创建独立的 wrapper 并完成 plan（关键！）
-    print(f"  创建 wrappers 并完成 plan...")
+    # Create independent wrapper for each step and complete plan (critical!)
+    print(f"  Creating wrappers and completing plan...")
     cascade_wrappers_current = []
     cascade_wrappers_prefix = []
     
     for step_idx in range(baseline_num_chunks):
-        # 当前 chunk 的 wrapper
+        # Wrapper for current chunk
         wrapper_current = BatchPrefillWithRaggedKVCacheWrapper(
             torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device), kv_layout="NHD",backend = "fa3",
         )
@@ -423,7 +423,7 @@ def test_incremental_batchprefill_step_by_step_with_cuda_graph(
         )
         cascade_wrappers_current.append(wrapper_current)
         
-        # prefix 的 wrapper（step 0 没有 prefix）
+        # Wrapper for prefix (step 0 has no prefix)
         if step_idx == 0:
             cascade_wrappers_prefix.append(None)
         else:
@@ -468,9 +468,9 @@ def test_incremental_batchprefill_step_by_step_with_cuda_graph(
                 o, _ = merge_state(o1_buffer, s1_buffer, o2_buffer, s2_buffer)
                 cascade_output.copy_(o)
     
-    # 显示 step 流程
+    # Display step flow
     if verbose:
-        print(f"  Step 流程预览:")
+        print(f"  Step flow preview:")
         for step_id in range(baseline_num_chunks):
             prefix_len = step_id * baseline_chunk_size
             if step_id == 0:
@@ -519,11 +519,11 @@ def test_incremental_batchprefill_step_by_step_with_cuda_graph(
     del cascade_wrappers_current, cascade_wrappers_prefix, cascade_graph
     torch.cuda.empty_cache()
 
-    # 对比方案: BatchBlockExtend Ragged (不同 chunk_size) + CUDA Graph
+    # Comparison: BatchBlockExtend Ragged (different chunk_size) + CUDA Graph
 
     for test_chunk_size in chunk_sizes:
         if tokens_per_request % test_chunk_size != 0:
-            print(f"\n[跳过] chunk_size={test_chunk_size} 无法整除 tokens_per_request={tokens_per_request}")
+            print(f"\n[Skip] chunk_size={test_chunk_size} cannot divide tokens_per_request={tokens_per_request}")
             continue
         
         num_chunks_bbe = tokens_per_request // test_chunk_size
@@ -531,13 +531,13 @@ def test_incremental_batchprefill_step_by_step_with_cuda_graph(
         print(f"\n{'-'*60}")
         print(f"[BatchBlockExtend Ragged] chunk_size = {test_chunk_size}")
         print(f"{'-'*60}")
-        print(f"  num_steps: {num_chunks_bbe} (比 Baseline 少 {baseline_num_chunks - num_chunks_bbe} 步)")
-        print(f"  每个 step 内 kernel: 1 次")
+        print(f"  num_steps: {num_chunks_bbe} ({baseline_num_chunks - num_chunks_bbe} steps fewer than Baseline)")
+        print(f"  Kernels per step: 1")
         
-        # 为每个 request 分 chunk
+        # Split each request into chunks
         qs_chunks_bbe = [split_chunks(q, test_chunk_size) for q in all_qs]
         
-        # 预分配所有 buffer
+        # Pre-allocate all buffers
         bbe_q_buffers = []
         for step_idx in range(num_chunks_bbe):
             q_list = [qs_chunks_bbe[req_idx][step_idx] for req_idx in range(num_requests)]
@@ -581,7 +581,7 @@ def test_incremental_batchprefill_step_by_step_with_cuda_graph(
         
         bbe_output = torch.empty(num_requests * test_chunk_size, num_heads, head_dim, dtype=dtype, device=device)
 
-        print(f"  创建 wrappers 并完成 plan...")
+        print(f"  Creating wrappers and completing plan...")
         bbe_wrappers = []
         for step_idx in range(num_chunks_bbe):
             wrapper = BatchBlockExtendRaggedOffsetWrapper(
@@ -606,9 +606,9 @@ def test_incremental_batchprefill_step_by_step_with_cuda_graph(
                     bbe_q_buffers[step_idx], bbe_k_buffers[step_idx], bbe_v_buffers[step_idx]
                 ))
         
-        # 显示 step 流程
+        # Display step flow
         if verbose:
-            print(f"  Step 流程预览:")
+            print(f"  Step flow preview:")
             for step_id in range(num_chunks_bbe):
                 kv_len = (step_id + 1) * test_chunk_size
                 q_offset = step_id * test_chunk_size
@@ -656,13 +656,13 @@ def test_incremental_batchprefill_step_by_step_with_cuda_graph(
         del bbe_wrappers, bbe_graph
         torch.cuda.empty_cache()
 
-    # Custom Mask 不同 chunk_size 测试 (不要求 chunk_size = dllm_block_size)
+    # Custom Mask different chunk_size test (chunk_size = dllm_block_size not required)
     for test_chunk_size in chunk_sizes:
         if tokens_per_request % test_chunk_size != 0:
-            print(f"\n[跳过] chunk_size={test_chunk_size} 无法整除 tokens_per_request={tokens_per_request}")
+            print(f"\n[Skip] chunk_size={test_chunk_size} cannot divide tokens_per_request={tokens_per_request}")
             continue
         
-        # 跳过已经测试过的 baseline chunk_size
+        # Skip already tested baseline chunk_size
         if test_chunk_size == baseline_chunk_size:
             continue
         
@@ -671,19 +671,19 @@ def test_incremental_batchprefill_step_by_step_with_cuda_graph(
         print(f"\n{'-'*60}")
         print(f"[Custom Mask] chunk_size = {test_chunk_size}")
         print(f"{'-'*60}")
-        print(f"  num_steps: {num_chunks_cm} (比 Baseline 少 {baseline_num_chunks - num_chunks_cm} 步)")
-        print(f"  每个 step 内 kernel: 1 次 (batch 处理所有 requests)")
+        print(f"  num_steps: {num_chunks_cm} ({baseline_num_chunks - num_chunks_cm} steps fewer than Baseline)")
+        print(f"  Kernels per step: 1 (batch processes all requests)")
         
-        # 为每个 request 分 chunk
+        # Split each request into chunks
         qs_chunks_cm = [split_chunks(q, test_chunk_size) for q in all_qs]
         
-        # 预分配 Q buffers (concat 所有 requests)
+        # Pre-allocate Q buffers (concat all requests)
         cm_q_buffers_var = []
         for step_idx in range(num_chunks_cm):
             q_list = [qs_chunks_cm[req_idx][step_idx] for req_idx in range(num_requests)]
             cm_q_buffers_var.append(torch.cat(q_list, dim=0))
         
-        # 预分配累积 KV buffers (concat 所有 requests)
+        # Pre-allocate cumulative KV buffers (concat all requests)
         cm_k_buffers_var = []
         cm_v_buffers_var = []
         for step_idx in range(num_chunks_cm):
@@ -693,24 +693,24 @@ def test_incremental_batchprefill_step_by_step_with_cuda_graph(
             cm_k_buffers_var.append(torch.cat(k_cumul_list, dim=0))
             cm_v_buffers_var.append(torch.cat(v_cumul_list, dim=0))
         
-        # 构造 flattened custom_mask (batch 版本)
+        # Construct flattened custom_mask (batch version)
         # DLLM blockwise mask: mask[q, k] = ((q + q_offset) // B) >= (k // B)
         cm_mask_buffers_var = []
         for step_idx in range(num_chunks_cm):
             kv_len = (step_idx + 1) * test_chunk_size
             q_offset = step_idx * test_chunk_size
-            # 构造单个 request 的 2D mask: [q_len, kv_len]
+            # Construct single request's 2D mask: [q_len, kv_len]
             q_pos = torch.arange(test_chunk_size, device=device) + q_offset
             k_pos = torch.arange(kv_len, device=device)
             q_block = q_pos.unsqueeze(1) // dllm_block_size
             k_block = k_pos.unsqueeze(0) // dllm_block_size
             mask_2d = (q_block >= k_block)  # [q_len, kv_len], bool
-            # flatten 并 repeat 为 batch
+            # Flatten and repeat for batch
             mask_flat = mask_2d.flatten()
             batch_mask = mask_flat.repeat(num_requests)
             cm_mask_buffers_var.append(batch_mask)
         
-        # qo_indptr 和 kv_indptr
+        # qo_indptr and kv_indptr
         cm_qo_indptr_var = torch.tensor(
             [i * test_chunk_size for i in range(num_requests + 1)],
             dtype=torch.int32, device=device
@@ -723,14 +723,14 @@ def test_incremental_batchprefill_step_by_step_with_cuda_graph(
                 dtype=torch.int32, device=device
             ))
         
-        # 为每个 step 创建独立的 wrapper 并完成 plan
-        print(f"  创建 wrappers 并完成 plan...")
+        # Create independent wrapper for each step and complete plan
+        print(f"  Creating wrappers and completing plan...")
         cm_wrappers_var = []
         for step_idx in range(num_chunks_cm):
             wrapper = BatchPrefillWithRaggedKVCacheWrapper(
                 torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device), 
                 kv_layout="NHD",
-                backend="fa2",  # custom_mask 只在 FA2 支持
+                backend="fa2",  # custom_mask only supported in FA2
             )
             wrapper.plan(
                 qo_indptr=cm_qo_indptr_var,
@@ -753,7 +753,7 @@ def test_incremental_batchprefill_step_by_step_with_cuda_graph(
                 ))
 
         if verbose:
-            print(f"  Step 流程预览:")
+            print(f"  Step flow preview:")
             for step_id in range(num_chunks_cm):
                 kv_len = (step_id + 1) * test_chunk_size
                 q_offset = step_id * test_chunk_size
@@ -801,20 +801,20 @@ def test_incremental_batchprefill_step_by_step_with_cuda_graph(
         torch.cuda.empty_cache()
 
     print(f"\n{'='*80}")
-    print(f"结果汇总 (分步执行 + CUDA Graph)")
+    print(f"Results Summary (Step-by-step Execution + CUDA Graph)")
     print(f"{'='*80}")
     
     cm_baseline_time = results["custom_mask_baseline"]["time_cuda_graph_ms"]
     cascade_baseline_time = results["cascade_baseline"]["time_cuda_graph_ms"]
     
 
-    print(f"\n说明:")
+    print(f"\nNotes:")
     print(f"  - Baseline 1: SGLang Cascade (BatchPrefill + merge_state)")
     print(f"  - Baseline 2: Custom Mask (BatchPrefill + custom_mask)")
-    print(f"  - vs Base1: 相对于 SGLang Cascade 的加速比")
-    print(f"  - vs Base2: 相对于 Custom Mask 的加速比")
+    print(f"  - vs Base1: Speedup relative to SGLang Cascade")
+    print(f"  - vs Base2: Speedup relative to Custom Mask")
     
-    print(f"\n{'方案':<40} | {'chunk':>6} | {'steps':>6} | {'cuda_graph(ms)':>10} | {'ms/step':>10} | {'vs Base1':>10} | {'vs Base2':>10}")
+    print(f"\n{'Method':<40} | {'chunk':>6} | {'steps':>6} | {'cuda_graph(ms)':>10} | {'ms/step':>10} | {'vs Base1':>10} | {'vs Base2':>10}")
     print(f"{'-'*40}-+-{'-'*6}-+-{'-'*6}-+-{'-'*10}-+-{'-'*10}-+-{'-'*10}-+-{'-'*10}")
     
     # Baseline 1: SGLang Cascade
@@ -859,23 +859,23 @@ def test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
     verbose: bool = False,
 ):
     """
-    单请求增量 Prefill 分步执行测试 + CUDA Graph
+    Single request incremental Prefill step-by-step execution test + CUDA Graph
     
-    场景说明:
-      - 单个 request 的增量 prefill
-      - 必须分步执行: chunk0 完成后才能算 chunk1 (流水线依赖)
-      - SGLang 即使 batch_size=1 也使用 BatchPrefill 接口
+    Scenario description:
+      - Incremental prefill of single request
+      - Must execute step by step: chunk1 can only be computed after chunk0 completes (pipeline dependency)
+      - SGLang uses BatchPrefill interface even with batch_size=1
     
-    Baseline (SGLang 3阶段 DLLM Cascade):
-      1. BatchPrefillWithRaggedKVCacheWrapper: 当前 chunk (causal=False)
+    Baseline (SGLang 3-stage DLLM Cascade):
+      1. BatchPrefillWithRaggedKVCacheWrapper: current chunk (causal=False)
       2. BatchPrefillWithRaggedKVCacheWrapper: prefix KV (causal=False)
-      3. merge_state: 合并两部分结果
-      每个 step: 2-3 kernel launches
+      3. merge_state: merge results from both parts
+      Each step: 2-3 kernel launches
     
-    对比方案:
+    Comparison:
       1. block_extend_attention_with_offset + CUDA Graph
       2. BatchBlockExtendRaggedOffsetWrapper + CUDA Graph
-      每个 step: 1 kernel launch
+      Each step: 1 kernel launch
     """
     if chunk_sizes is None:
         chunk_sizes = [32, 64, 128, 256]
@@ -884,32 +884,32 @@ def test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
     dtype = torch.float16
     sm_scale = 1.0 / (head_dim ** 0.5)
     
-    # Baseline: chunk_size = dllm_block_size (SGLang 约束)
+    # Baseline: chunk_size = dllm_block_size (SGLang constraint)
     baseline_chunk_size = dllm_block_size
     num_chunks = tokens_per_request // baseline_chunk_size
     
     print(f"\n{'='*80}")
-    print(f"单请求增量 Prefill 分步执行 + CUDA Graph")
+    print(f"Single Request Incremental Prefill Step-by-step + CUDA Graph")
     print(f"{'='*80}")
-    print(f"配置:")
+    print(f"Configuration:")
     print(f"  tokens_per_request  = {tokens_per_request}")
     print(f"  dllm_block_size     = {dllm_block_size}")
     print(f"  chunk_sizes to test = {chunk_sizes}")
     print(f"  num_heads           = {num_heads}")
     print(f"  num_kv_heads        = {num_kv_heads}")
     print(f"  head_dim            = {head_dim}")
-    print(f"\n场景说明:")
-    print(f"  - 单请求 (batch_size=1)，但使用 BatchPrefill 接口 (SGLang 做法)")
-    print(f"  - 分步执行: chunk0 完成后才能算 chunk1 (流水线依赖)")
+    print(f"\nScenario description:")
+    print(f"  - Single request (batch_size=1), but uses BatchPrefill interface (SGLang approach)")
+    print(f"  - Step-by-step execution: chunk1 can only be computed after chunk0 completes (pipeline dependency)")
     print(f"  - num_steps = {num_chunks}")
     
-    # 数据准备
-    # 单个 request 的完整 Q, K, V
+    # Data preparation
+    # Single request's complete Q, K, V
     q_full = torch.randn(tokens_per_request, num_heads, head_dim, dtype=dtype, device=device)
     k_full = torch.randn(tokens_per_request, num_kv_heads, head_dim, dtype=dtype, device=device)
     v_full = torch.randn(tokens_per_request, num_kv_heads, head_dim, dtype=dtype, device=device)
     
-    # 分 chunk
+    # Split into chunks
     def split_chunks(tensor, chunk_size):
         return [tensor[i*chunk_size:(i+1)*chunk_size] for i in range(tensor.shape[0] // chunk_size)]
     
@@ -917,20 +917,20 @@ def test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
     ks_chunks = split_chunks(k_full, baseline_chunk_size)
     vs_chunks = split_chunks(v_full, baseline_chunk_size)
     
-    # 累积 KV buffer
+    # Cumulative KV buffer
     k_cumul_list = [torch.cat([k_full[:(i+1)*baseline_chunk_size]], dim=0) for i in range(num_chunks)]
     v_cumul_list = [torch.cat([v_full[:(i+1)*baseline_chunk_size]], dim=0) for i in range(num_chunks)]
     
     results = {}
 
-    # 正确性验证
+    # Correctness verification
     print(f"\n{'='*80}")
-    print(f"正确性验证")
+    print(f"Correctness Verification")
     print(f"{'='*80}")
-    print(f"  参考实现: single_prefill_with_kv_cache + custom_mask")
-    print(f"  Mask 规则: mask[q,k] = ((q + offset) // B) >= (k // B)")
+    print(f"  Reference implementation: single_prefill_with_kv_cache + custom_mask")
+    print(f"  Mask rule: mask[q,k] = ((q + offset) // B) >= (k // B)")
     
-    # 计算参考结果 (每个 chunk 独立计算)
+    # Compute reference results (each chunk computed independently)
     ref_outputs = []
     for step_idx in range(num_chunks):
         q_offset = step_idx * baseline_chunk_size
@@ -944,7 +944,7 @@ def test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
         )
         ref_outputs.append(ref_out)
     
-    # 计算 V2 结果并验证
+    # Compute V2 results and verify
     v2_outputs = []
     for step_idx in range(num_chunks):
         q_offset = step_idx * baseline_chunk_size
@@ -959,7 +959,7 @@ def test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
         )
         v2_outputs.append(v2_out)
     
-    # 验证 V2
+    # Verify V2
     v2_max_diff = max((v2_outputs[i] - ref_outputs[i]).abs().max().item() for i in range(num_chunks))
     tol = 1e-3
     v2_pass = v2_max_diff < tol
@@ -967,7 +967,7 @@ def test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
     print(f"       max_diff = {v2_max_diff:.6f}, tolerance = {tol}")
     print(f"       {' PASS' if v2_pass else ' FAIL'}")
     
-    # 计算 BBE 结果并验证
+    # Compute BBE results and verify
     bbe_outputs = []
     workspace_verify = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
     qo_indptr_verify = torch.tensor([0, baseline_chunk_size], dtype=torch.int32, device=device)
@@ -992,7 +992,7 @@ def test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
         bbe_out = wrapper.run(qs_chunks[step_idx], k_cumul_list[step_idx], v_cumul_list[step_idx])
         bbe_outputs.append(bbe_out)
     
-    # 验证 BBE
+    # Verify BBE
     bbe_max_diff = max((bbe_outputs[i] - ref_outputs[i]).abs().max().item() for i in range(num_chunks))
     bbe_pass = bbe_max_diff < tol
     print(f"\n  [BBE] BatchBlockExtendRaggedOffsetWrapper:")
@@ -1000,21 +1000,21 @@ def test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
     print(f"        {' PASS' if bbe_pass else ' FAIL'}")
     
     if not (v2_pass and bbe_pass):
-        print(f"\n   正确性验证未通过，但继续执行性能测试")
+        print(f"\n   Correctness verification failed, but continue with performance test")
     else:
-        print(f"\n   所有方案正确性验证通过")
+        print(f"\n   All methods passed correctness verification")
     
     del workspace_verify, bbe_outputs, v2_outputs, ref_outputs
     torch.cuda.empty_cache()
     
 
-    # Baseline 2: Custom Mask (原生 single_prefill + custom_mask) + CUDA Graph
+    # Baseline 2: Custom Mask (native single_prefill + custom_mask) + CUDA Graph
     print(f"\n{'='*80}")
     print(f"[Baseline 2] Custom Mask (single_prefill + custom_mask)")
     print(f"{'='*80}")
     print(f"  num_steps: {num_chunks}")
-    print(f"  每个 step: single_prefill_with_kv_cache + custom_mask")
-    print(f"  每个 step 内 kernel: 1 次 (但需要构造 mask tensor)")
+    print(f"  Each step: single_prefill_with_kv_cache + custom_mask")
+    print(f"  Kernels per step: 1 (but needs to construct mask tensor)")
     
 
     custom_mask_buffers = []
@@ -1031,7 +1031,7 @@ def test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
     
     cm_output = torch.empty(baseline_chunk_size, num_heads, head_dim, dtype=dtype, device=device)
     
-    # 注意: custom_mask 只在 FA2 后端支持，FA3 不支持
+    # Note: custom_mask is only supported in FA2 backend, not FA3
     def run_custom_mask_pipeline():
         for step_idx in range(num_chunks):
             cm_output.copy_(single_prefill_with_kv_cache(
@@ -1040,12 +1040,12 @@ def test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
                 v_cumul_list[step_idx],
                 custom_mask=custom_mask_buffers[step_idx],
                 sm_scale=sm_scale,
-                backend="fa2",  # custom_mask 只在 FA2 支持
+                backend="fa2",  # custom_mask only supported in FA2
             ))
     
 
     if verbose:
-        print(f"  Step 流程预览:")
+        print(f"  Step flow preview:")
         for step_id in range(num_chunks):
             kv_len = (step_id + 1) * baseline_chunk_size
             print(f"    Step {step_id}: Q[{step_id*baseline_chunk_size}:{(step_id+1)*baseline_chunk_size}] attend to KV[0:{kv_len}]")
@@ -1092,13 +1092,13 @@ def test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
     torch.cuda.empty_cache()
     
 
-    # Custom Mask 不同 chunk_size 测试 (不要求 chunk_size = dllm_block_size)
+    # Custom Mask different chunk_size test (chunk_size = dllm_block_size not required)
     for test_chunk_size in chunk_sizes:
         if tokens_per_request % test_chunk_size != 0:
-            print(f"\n[跳过] chunk_size={test_chunk_size} 无法整除 tokens_per_request={tokens_per_request}")
+            print(f"\n[Skip] chunk_size={test_chunk_size} cannot divide tokens_per_request={tokens_per_request}")
             continue
         
-        # 跳过已经测试过的 baseline chunk_size
+        # Skip already tested baseline chunk_size
         if test_chunk_size == baseline_chunk_size:
             continue
         
@@ -1107,17 +1107,17 @@ def test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
         print(f"\n{'-'*60}")
         print(f"[Custom Mask] chunk_size = {test_chunk_size}")
         print(f"{'-'*60}")
-        print(f"  num_steps: {num_steps_cm} (比 Baseline 少 {num_chunks - num_steps_cm} 步)")
-        print(f"  每个 step 内 kernel: 1 次")
+        print(f"  num_steps: {num_steps_cm} ({num_chunks - num_steps_cm} steps fewer than Baseline)")
+        print(f"  Kernels per step: 1")
         
-        # 分 chunk
+        # Split into chunks
         qs_cm = split_chunks(q_full, test_chunk_size)
         
-        # 累积 KV buffer
+        # Cumulative KV buffer
         k_cumul_cm = [k_full[:(i+1)*test_chunk_size].clone() for i in range(num_steps_cm)]
         v_cumul_cm = [v_full[:(i+1)*test_chunk_size].clone() for i in range(num_steps_cm)]
         
-        # 预分配 custom_mask buffers (每个 step 的 mask 不同)
+        # Pre-allocate custom_mask buffers (different mask for each step)
         cm_mask_buffers = []
         for step_idx in range(num_steps_cm):
             kv_len = (step_idx + 1) * test_chunk_size
@@ -1130,7 +1130,7 @@ def test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
             mask_2d = (q_block >= k_block).to(torch.uint8)
             cm_mask_buffers.append(mask_2d)
         
-        # 预分配 output buffer
+        # Pre-allocate output buffer
         cm_output_var = torch.empty(test_chunk_size, num_heads, head_dim, dtype=dtype, device=device)
         
         def run_cm_pipeline():
@@ -1139,12 +1139,12 @@ def test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
                     qs_cm[step_idx], k_cumul_cm[step_idx], v_cumul_cm[step_idx],
                     custom_mask=cm_mask_buffers[step_idx],
                     sm_scale=sm_scale,
-                    backend="fa2",  # custom_mask 只在 FA2 支持
+                    backend="fa2",  # custom_mask only supported in FA2
                 ))
         
-        # 显示 step 流程
+        # Display step flow
         if verbose:
-            print(f"  Step 流程预览:")
+            print(f"  Step flow preview:")
             for step_id in range(num_steps_cm):
                 kv_len = (step_id + 1) * test_chunk_size
                 q_offset = step_id * test_chunk_size
@@ -1191,34 +1191,34 @@ def test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
         del cm_graph_var, cm_mask_buffers
         torch.cuda.empty_cache()
 
-    # Baseline 1: SGLang 3阶段 DLLM Cascade (BatchPrefill 接口, batch_size=1)
+    # Baseline 1: SGLang 3-stage DLLM Cascade (BatchPrefill interface, batch_size=1)
     print(f"\n{'='*80}")
-    print(f"[Baseline 1] SGLang 3阶段 Cascade (BatchPrefill, batch_size=1)")
+    print(f"[Baseline 1] SGLang 3-stage Cascade (BatchPrefill, batch_size=1)")
     print(f"{'='*80}")
     print(f"  num_steps: {num_chunks}")
-    print(f"  每个 step: BatchPrefill(当前 chunk) + BatchPrefill(prefix) + merge_state")
-    print(f"  每个 step 内 kernel: 2-3 次")
+    print(f"  Each step: BatchPrefill(current chunk) + BatchPrefill(prefix) + merge_state")
+    print(f"  Kernels per step: 2-3")
     
-    # batch_size=1 的 indptr
+    # indptr for batch_size=1
     qo_indptr_chunk = torch.tensor([0, baseline_chunk_size], dtype=torch.int32, device=device)
     
-    # workspace 大小:
+    # workspace size:
     workspace_size = 16 * 1024 * 1024
     
-    # 为每个 step 创建独立的 wrapper 并完成 plan
-    print(f"  创建 wrappers 并完成 plan...")
+    # Create independent wrapper for each step and complete plan
+    print(f"  Creating wrappers and completing plan...")
     cascade_wrappers_current = []
     cascade_wrappers_prefix = []
-    kv_indptr_prefix_list = [None]  # step 0 没有 prefix
+    kv_indptr_prefix_list = [None]  # step 0 has no prefix
     
     for step_idx in range(num_chunks):
-        # 当前 chunk 的 wrapper
+        # Wrapper for current chunk
         wrapper_current = BatchPrefillWithRaggedKVCacheWrapper(
             torch.empty(workspace_size, dtype=torch.uint8, device=device), kv_layout="NHD", backend="fa3",
         )
         wrapper_current.plan(
             qo_indptr=qo_indptr_chunk,
-            kv_indptr=qo_indptr_chunk,  # 当前 chunk KV 长度 = Q 长度
+            kv_indptr=qo_indptr_chunk,  # current chunk KV length = Q length
             num_qo_heads=num_heads,
             num_kv_heads=num_kv_heads,
             head_dim_qk=head_dim,
@@ -1227,7 +1227,7 @@ def test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
         )
         cascade_wrappers_current.append(wrapper_current)
         
-        # prefix 的 wrapper (step 0 没有 prefix)
+        # Wrapper for prefix (step 0 has no prefix)
         if step_idx == 0:
             cascade_wrappers_prefix.append(None)
         else:
@@ -1249,14 +1249,14 @@ def test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
             )
             cascade_wrappers_prefix.append(wrapper_prefix)
     
-    # 预分配 buffer
+    # Pre-allocate buffer
     cascade_output = torch.empty(baseline_chunk_size, num_heads, head_dim, dtype=dtype, device=device)
     o1_buffer = torch.empty(baseline_chunk_size, num_heads, head_dim, dtype=dtype, device=device)
     s1_buffer = torch.empty(baseline_chunk_size, num_heads, dtype=torch.float32, device=device)
     o2_buffer = torch.empty(baseline_chunk_size, num_heads, head_dim, dtype=dtype, device=device)
     s2_buffer = torch.empty(baseline_chunk_size, num_heads, dtype=torch.float32, device=device)
     
-    # 预分配 prefix KV buffer
+    # Pre-allocate prefix KV buffer
     k_prefix_buffers = [None]
     v_prefix_buffers = [None]
     for step_idx in range(1, num_chunks):
@@ -1288,7 +1288,7 @@ def test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
     
 
     if verbose:
-        print(f"  Step 流程预览:")
+        print(f"  Step flow preview:")
         for step_id in range(num_chunks):
             prefix_len = step_id * baseline_chunk_size
             if step_id == 0:
@@ -1337,10 +1337,10 @@ def test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
     del cascade_wrappers_current, cascade_wrappers_prefix, cascade_graph
     torch.cuda.empty_cache()
 
-    # 方案 1: block_extend_attention_with_offset + CUDA Graph
+    # Method 1: block_extend_attention_with_offset + CUDA Graph
     for test_chunk_size in chunk_sizes:
         if tokens_per_request % test_chunk_size != 0:
-            print(f"\n[跳过] chunk_size={test_chunk_size} 无法整除 tokens_per_request={tokens_per_request}")
+            print(f"\n[Skip] chunk_size={test_chunk_size} cannot divide tokens_per_request={tokens_per_request}")
             continue
         
         num_steps = tokens_per_request // test_chunk_size
@@ -1348,16 +1348,16 @@ def test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
         print(f"\n{'-'*60}")
         print(f"[V2] block_extend_attention_with_offset (chunk_size={test_chunk_size})")
         print(f"{'-'*60}")
-        print(f"  num_steps: {num_steps} (比 Baseline 少 {num_chunks - num_steps} 步)")
-        print(f"  每个 step 内 kernel: 1 次")
+        print(f"  num_steps: {num_steps} ({num_chunks - num_steps} steps fewer than Baseline)")
+        print(f"  Kernels per step: 1")
         
-        # 分 chunk
+        # Split into chunks
         qs_v2 = split_chunks(q_full, test_chunk_size)
         
-        # 预分配 output buffer
+        # Pre-allocate output buffer
         v2_output = torch.empty(test_chunk_size, num_heads, head_dim, dtype=dtype, device=device)
         
-        # 累积 KV buffer
+        # Cumulative KV buffer
         k_cumul_v2 = [k_full[:(i+1)*test_chunk_size].clone() for i in range(num_steps)]
         v_cumul_v2 = [v_full[:(i+1)*test_chunk_size].clone() for i in range(num_steps)]
         
@@ -1371,9 +1371,9 @@ def test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
                     backend="fa2",
                 ))
         
-        # 显示 step 流程
+        # Display step flow
         if verbose:
-            print(f"  Step 流程预览:")
+            print(f"  Step flow preview:")
             for step_id in range(num_steps):
                 kv_len = (step_id + 1) * test_chunk_size
                 q_offset = step_id * test_chunk_size
@@ -1421,7 +1421,7 @@ def test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
         torch.cuda.empty_cache()
     
 
-    # 方案 2: BatchBlockExtendRaggedOffsetWrapper + CUDA Graph
+    # Method 2: BatchBlockExtendRaggedOffsetWrapper + CUDA Graph
     for test_chunk_size in chunk_sizes:
         if tokens_per_request % test_chunk_size != 0:
             continue
@@ -1431,23 +1431,23 @@ def test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
         print(f"\n{'-'*60}")
         print(f"[BBE] BatchBlockExtendRaggedOffsetWrapper (chunk_size={test_chunk_size})")
         print(f"{'-'*60}")
-        print(f"  num_steps: {num_steps} (比 Baseline 少 {num_chunks - num_steps} 步)")
-        print(f"  每个 step 内 kernel: 1 次")
+        print(f"  num_steps: {num_steps} ({num_chunks - num_steps} steps fewer than Baseline)")
+        print(f"  Kernels per step: 1")
         
-        # 分 chunk
+        # Split into chunks
         qs_bbe = split_chunks(q_full, test_chunk_size)
         
-        # batch_size=1 的 indptr
+        # indptr for batch_size=1
         qo_indptr_bbe = torch.tensor([0, test_chunk_size], dtype=torch.int32, device=device)
         
-        # 累积 KV buffer
+        # Cumulative KV buffer
         k_cumul_bbe = [k_full[:(i+1)*test_chunk_size].clone() for i in range(num_steps)]
         v_cumul_bbe = [v_full[:(i+1)*test_chunk_size].clone() for i in range(num_steps)]
         
-        # 为每个 step 创建独立的 wrapper 并完成 plan
-        print(f"  创建 wrappers 并完成 plan...")
+        # Create independent wrapper for each step and complete plan
+        print(f"  Creating wrappers and completing plan...")
         
-        workspace_size = 128 * 1024 * 1024  # 128MB - BBE 使用 JIT 需要更大 workspace
+        workspace_size = 128 * 1024 * 1024  # 128MB - BBE uses JIT which requires larger workspace
         bbe_wrappers = []
         for step_idx in range(num_steps):
             kv_len = (step_idx + 1) * test_chunk_size
@@ -1470,7 +1470,7 @@ def test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
             )
             bbe_wrappers.append(wrapper)
         
-        # 预分配 output buffer
+        # Pre-allocate output buffer
         bbe_output = torch.empty(test_chunk_size, num_heads, head_dim, dtype=dtype, device=device)
         
         def run_bbe_pipeline():
@@ -1479,9 +1479,9 @@ def test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
                     qs_bbe[step_idx], k_cumul_bbe[step_idx], v_cumul_bbe[step_idx]
                 ))
         
-        # 显示 step 流程
+        # Display step flow
         if verbose:
-            print(f"  Step 流程预览:")
+            print(f"  Step flow preview:")
             for step_id in range(num_steps):
                 kv_len = (step_id + 1) * test_chunk_size
                 q_offset = step_id * test_chunk_size
@@ -1529,7 +1529,7 @@ def test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
         torch.cuda.empty_cache()
 
     print(f"\n{'='*80}")
-    print(f"结果汇总 (单请求分步执行 + CUDA Graph)")
+    print(f"Results Summary (Single Request Step-by-step + CUDA Graph)")
     print(f"{'='*80}")
     
     cm_baseline_r = results.get("custom_mask_baseline", {})
@@ -1539,14 +1539,14 @@ def test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
     cm_baseline_time = cm_baseline_r.get("time_cuda_graph_ms", float('nan'))
     cascade_baseline_time = cascade_baseline_r.get("time_cuda_graph_ms", float('nan'))
     
-    # 表头说明
-    print(f"\n说明:")
+    # Header explanation
+    print(f"\nNotes:")
     print(f"  - Baseline 1: SGLang Cascade (BatchPrefill + merge_state)")
     print(f"  - Baseline 2: Custom Mask (single_prefill + custom_mask)")
-    print(f"  - vs Base1: 相对于 SGLang Cascade 的加速比")
-    print(f"  - vs Base2: 相对于 Custom Mask 的加速比")
+    print(f"  - vs Base1: Speedup relative to SGLang Cascade")
+    print(f"  - vs Base2: Speedup relative to Custom Mask")
     
-    print(f"\n{'方案':<45} | {'chunk':>6} | {'steps':>6} | {'cuda_graph(ms)':>10} | {'ms/step':>10} | {'vs Base1':>10} | {'vs Base2':>10}")
+    print(f"\n{'Method':<45} | {'chunk':>6} | {'steps':>6} | {'cuda_graph(ms)':>10} | {'ms/step':>10} | {'vs Base1':>10} | {'vs Base2':>10}")
     print(f"{'-'*45}-+-{'-'*6}-+-{'-'*6}-+-{'-'*10}-+-{'-'*10}-+-{'-'*10}-+-{'-'*10}")
     
     # Baseline 1: SGLang Cascade
@@ -1564,7 +1564,7 @@ def test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
         vs_base1_str = f"{cascade_baseline_time/cm_baseline_time:>9.2f}x"
     print(f"{'[Baseline 2] Custom Mask':<45} | {r['chunk_size']:>6} | {r['num_steps']:>6} | {r['time_cuda_graph_ms']:>10.3f} | {r['time_cuda_graph_ms']/r['num_steps']:>10.3f} | {vs_base1_str:>10} | {'1.00x':>10}")
     
-    # Custom Mask 不同 chunk_size 结果 (按 chunk_size 递增排序)
+    # Custom Mask different chunk_size results (sorted by chunk_size ascending)
     cm_keys = sorted([k for k in results.keys() if k.startswith("cm_chunk")],
                      key=lambda k: results[k]["chunk_size"])
     for key in cm_keys:
@@ -1577,7 +1577,7 @@ def test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
             speedup_vs_cascade_str = f"{speedup_vs_cascade:>9.2f}x"
         print(f"{'Custom Mask':<45} | {r['chunk_size']:>6} | {r['num_steps']:>6} | {r['time_cuda_graph_ms']:>10.3f} | {r['time_cuda_graph_ms']/r['num_steps']:>10.3f} | {speedup_vs_cascade_str:>10} | {speedup_vs_cm:>9.2f}x")
     
-    # V2 结果 (按 chunk_size 递增排序)
+    # V2 results (sorted by chunk_size ascending)
     v2_keys = sorted([k for k in results.keys() if k.startswith("v2_chunk")], 
                      key=lambda k: results[k]["chunk_size"])
     for key in v2_keys:
@@ -1590,7 +1590,7 @@ def test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
             speedup_vs_cascade_str = f"{speedup_vs_cascade:>9.2f}x"
         print(f"{'V2 block_extend_attention':<45} | {r['chunk_size']:>6} | {r['num_steps']:>6} | {r['time_cuda_graph_ms']:>10.3f} | {r['time_cuda_graph_ms']/r['num_steps']:>10.3f} | {speedup_vs_cascade_str:>10} | {speedup_vs_cm:>9.2f}x")
     
-    # BBE 结果 (按 chunk_size 递增排序)
+    # BBE results (sorted by chunk_size ascending)
     bbe_keys = sorted([k for k in results.keys() if k.startswith("bbe_chunk")],
                       key=lambda k: results[k]["chunk_size"])
     for key in bbe_keys:
@@ -1620,20 +1620,20 @@ def test_fa2_fa3_block_extending_vs_causal(
     verbose: bool = False,
 ):
     """
-    FA2 vs FA3 BlockExtend Mask vs FA3 Causal Mask 性能对比
+    FA2 vs FA3 BlockExtend Mask vs FA3 Causal Mask Performance Comparison
     
-    测试场景 (增量 Prefill):
-      - 每个 request 的总 tokens 固定 (tokens_per_request)
-      - 按 chunk_size 分多步执行增量 prefill
-      - 每个 step 累积 KV，实现 Block Extend Mask
-      - 使用 CUDA Graph 减少 kernel launch overhead
+    Test scenario (Incremental Prefill):
+      - Each request's total tokens is fixed (tokens_per_request)
+      - Execute incremental prefill in multiple steps by chunk_size
+      - Each step accumulates KV, implementing Block Extend Mask
+      - Use CUDA Graph to reduce kernel launch overhead
     
-    对比方案:
+    Comparison methods:
       1. FA3 Causal Mask (baseline) - BatchPrefillWithRaggedKVCacheWrapper
       2. FA2 BlockExtend Mask - BatchBlockExtendRaggedOffsetWrapper (backend="fa2")
       3. FA3 BlockExtend Mask - BatchBlockExtendRaggedOffsetWrapper (backend="fa3")
     
-    Mask 规则:
+    Mask rules:
       - Causal: mask[q, k] = (q + q_offset) >= k
       - BlockExtend: mask[q, k] = ((q + q_offset) // B) >= (k // B)
     """
@@ -1645,9 +1645,9 @@ def test_fa2_fa3_block_extending_vs_causal(
     sm_scale = 1.0 / (head_dim ** 0.5)
     
     print(f"\n{'='*90}")
-    print(f"FA2 vs FA3 BlockExtend vs Causal - 增量 Prefill 性能对比")
+    print(f"FA2 vs FA3 BlockExtend vs Causal - Incremental Prefill Performance Comparison")
     print(f"{'='*90}")
-    print(f"配置:")
+    print(f"Configuration:")
     print(f"  num_requests        = {num_requests}")
     print(f"  tokens_per_request  = {tokens_per_request}")
     print(f"  dllm_block_size     = {dllm_block_size}")
@@ -1655,12 +1655,12 @@ def test_fa2_fa3_block_extending_vs_causal(
     print(f"  num_heads           = {num_heads}")
     print(f"  num_kv_heads        = {num_kv_heads}")
     print(f"  head_dim            = {head_dim}")
-    print(f"\n场景说明:")
-    print(f"  - 固定总 tokens = {tokens_per_request}")
-    print(f"  - 按 chunk_size 分多步执行增量 prefill")
-    print(f"  - 使用 CUDA Graph 减少 overhead")
+    print(f"\nScenario description:")
+    print(f"  - Fixed total tokens = {tokens_per_request}")
+    print(f"  - Execute incremental prefill in multiple steps by chunk_size")
+    print(f"  - Use CUDA Graph to reduce overhead")
     
-    # 数据准备，生成每个 request 的完整 Q, K, V
+    # Data preparation, generate complete Q, K, V for each request
     all_qs = [torch.randn(tokens_per_request, num_heads, head_dim, dtype=dtype, device=device) 
               for _ in range(num_requests)]
     all_ks = [torch.randn(tokens_per_request, num_kv_heads, head_dim, dtype=dtype, device=device) 
@@ -1675,7 +1675,7 @@ def test_fa2_fa3_block_extending_vs_causal(
     
     for chunk_size in chunk_sizes:
         if tokens_per_request % chunk_size != 0:
-            print(f"\n[跳过] chunk_size={chunk_size} 无法整除 tokens_per_request={tokens_per_request}")
+            print(f"\n[Skip] chunk_size={chunk_size} cannot divide tokens_per_request={tokens_per_request}")
             continue
         
         num_steps = tokens_per_request // chunk_size
@@ -1684,17 +1684,17 @@ def test_fa2_fa3_block_extending_vs_causal(
         print(f"chunk_size = {chunk_size}, num_steps = {num_steps}")
         print(f"{'-'*90}")
         
-        # 为每个 request 分 chunk
+        # Split each request into chunks
         qs_chunks = [split_chunks(q, chunk_size) for q in all_qs]
         
-        # 预分配所有 step 的 buffer
-        # Q buffers: 每个 step 的 Q concat
+        # Pre-allocate all step buffers
+        # Q buffers: Q concat for each step
         q_buffers = []
         for step_idx in range(num_steps):
             q_list = [qs_chunks[req_idx][step_idx] for req_idx in range(num_requests)]
             q_buffers.append(torch.cat(q_list, dim=0))
         
-        # KV buffers: 累积的 K, V
+        # KV buffers: cumulative K, V
         k_buffers = []
         v_buffers = []
         for step_idx in range(num_steps):
@@ -1723,10 +1723,10 @@ def test_fa2_fa3_block_extending_vs_causal(
         workspace_size = 256 * 1024 * 1024
         output_buffer = torch.empty(num_requests * chunk_size, num_heads, head_dim, dtype=dtype, device=device)
 
-        # [0] 精度验证: FA2 vs FA3 BlockExtend
-        print(f"  [精度验证] 对比 FA2 vs FA3 BlockExtend 输出...")
+        # [0] Precision verification: FA2 vs FA3 BlockExtend
+        print(f"  [Precision verification] Comparing FA2 vs FA3 BlockExtend output...")
         
-        # 创建临时 wrappers 进行精度验证
+        # Create temporary wrappers for precision verification
         fa2_verify_wrapper = BatchBlockExtendRaggedOffsetWrapper(
             torch.empty(workspace_size, dtype=torch.uint8, device=device),
             kv_layout="NHD",
@@ -1740,7 +1740,7 @@ def test_fa2_fa3_block_extending_vs_causal(
             backend="fa3",
         )
         
-        # 对每个 step 验证精度
+        # Verify precision for each step
         max_diff_all_steps = 0.0
         for step_idx in range(num_steps):
             fa2_verify_wrapper.plan(
@@ -1773,19 +1773,19 @@ def test_fa2_fa3_block_extending_vs_causal(
             if verbose:
                 print(f"    step {step_idx}: max_diff = {step_max_diff:.6f}")
         
-        # fp16 精度下约 0.001 差异属正常
+        # fp16 precision ~0.001 difference is normal
         precision_ok = max_diff_all_steps < 0.01
         status = "PASS" if precision_ok else " FAIL"
-        print(f"  [精度验证] FA2 vs FA3 max_diff = {max_diff_all_steps:.6f} {status}")
+        print(f"  [Precision verification] FA2 vs FA3 max_diff = {max_diff_all_steps:.6f} {status}")
         
         if not precision_ok:
-            print(f"  [警告] FA2 和 FA3 BlockExtend 输出差异过大，性能数据可能不可信！")
+            print(f"  [Warning] FA2 and FA3 BlockExtend output difference too large, performance data may not be reliable!")
         
         del fa2_verify_wrapper, fa3_verify_wrapper
         torch.cuda.empty_cache()
 
         # [1] FA3 Causal Mask (baseline)
-        print(f"  [FA3 Causal] 创建 wrappers...")
+        print(f"  [FA3 Causal] Creating wrappers...")
         causal_wrappers = []
         for step_idx in range(num_steps):
             wrapper = BatchPrefillWithRaggedKVCacheWrapper(
@@ -1843,7 +1843,7 @@ def test_fa2_fa3_block_extending_vs_causal(
         torch.cuda.empty_cache()
 
         # [2] FA2 BlockExtend Mask
-        print(f"  [FA2 BlockExp] 创建 wrappers...")
+        print(f"  [FA2 BlockExp] Creating wrappers...")
         fa2_be_wrappers = []
         for step_idx in range(num_steps):
             wrapper = BatchBlockExtendRaggedOffsetWrapper(
@@ -1906,7 +1906,7 @@ def test_fa2_fa3_block_extending_vs_causal(
         # ================================================================
         # [3] FA3 BlockExtend Mask
         # ================================================================
-        print(f"  [FA3 BlockExp] 创建 wrappers...")
+        print(f"  [FA3 BlockExp] Creating wrappers...")
         fa3_be_wrappers = []
         for step_idx in range(num_steps):
             wrapper = BatchBlockExtendRaggedOffsetWrapper(
@@ -1982,7 +1982,7 @@ def test_fa2_fa3_block_extending_vs_causal(
     
 
     print(f"\n{'='*90}")
-    print(f"结果汇总 (num_requests={num_requests}, tokens_per_request={tokens_per_request}, dllm_block_size={dllm_block_size})")
+    print(f"Results Summary (num_requests={num_requests}, tokens_per_request={tokens_per_request}, dllm_block_size={dllm_block_size})")
     print(f"{'='*90}")
     
     print(f"\n{'chunk':>8} | {'steps':>5} | {'FA3 Causal':>12} | {'FA2 BlockExp':>12} | {'FA3 BlockExp':>12} | {'FA2/Causal':>10} | {'FA3/Causal':>10} | {'FA3/FA2':>10}")
@@ -1992,12 +1992,12 @@ def test_fa2_fa3_block_extending_vs_causal(
         r = results[key]
         print(f"{r['chunk_size']:>8} | {r['num_steps']:>5} | {r['fa3_causal_ms']:>10.3f}ms | {r['fa2_be_ms']:>10.3f}ms | {r['fa3_be_ms']:>10.3f}ms | {r['speedup_fa2_vs_causal']:>9.2f}x | {r['speedup_fa3_vs_causal']:>9.2f}x | {r['speedup_fa3_vs_fa2']:>9.2f}x")
     
-    print(f"\n说明:")
-    print(f"  - 场景: 增量 Prefill，固定总 tokens = {tokens_per_request}，按 chunk_size 分多步执行")
-    print(f"  - FA2/Causal: FA2 BlockExtend 相对于 FA3 Causal 的加速比 (>1 表示 FA2 BE 更快)")
-    print(f"  - FA3/Causal: FA3 BlockExtend 相对于 FA3 Causal 的加速比 (>1 表示 FA3 BE 更快)")
-    print(f"  - FA3/FA2: FA3 BlockExtend 相对于 FA2 BlockExtend 的加速比 (>1 表示 FA3 更快)")
-    print(f"  - BlockExtend mask 比 Causal mask 计算量更少 (tile 级别跳过)，理论上应该更快")
+    print(f"\nNotes:")
+    print(f"  - Scenario: Incremental Prefill, fixed total tokens = {tokens_per_request}, execute in multiple steps by chunk_size")
+    print(f"  - FA2/Causal: Speedup of FA2 BlockExtend relative to FA3 Causal (>1 means FA2 BE is faster)")
+    print(f"  - FA3/Causal: Speedup of FA3 BlockExtend relative to FA3 Causal (>1 means FA3 BE is faster)")
+    print(f"  - FA3/FA2: Speedup of FA3 BlockExtend relative to FA2 BlockExtend (>1 means FA3 is faster)")
+    print(f"  - BlockExtend mask has less computation than Causal mask (tile-level skip), should theoretically be faster")
     
     return results
 
@@ -2007,36 +2007,36 @@ def test_dllm_precision_vs_custom_mask_fa2(
     test_dtypes: list = None,
 ):
     """
-    DLLM 组件精度测试: 与原生 Custom Mask FA2 实现进行对比
+    DLLM Component Precision Test: Comparison with native Custom Mask FA2 implementation
     
-    参考实现 (Ground Truth):
-      - 单请求: single_prefill_with_kv_cache + custom_mask (FA2)
-      - 多请求: BatchPrefillWithRaggedKVCacheWrapper + custom_mask (FA2)
+    Reference implementation (Ground Truth):
+      - Single request: single_prefill_with_kv_cache + custom_mask (FA2)
+      - Multi-request: BatchPrefillWithRaggedKVCacheWrapper + custom_mask (FA2)
     
-    被测对象 (第31-33行导入的三个 DLLM 组件):
+    Tested components (three DLLM components imported at lines 31-33):
       1. BatchBlockExtendRaggedOffsetWrapper
       2. BatchBlockExtendPagedOffsetWrapper  
       3. block_extend_attention_with_offset
     
-    测试覆盖:
-      - 数据类型: fp16, bf16
-      - 不同的 dllm_block_size: [16, 32, 64, 128]
-      - 不同的 qo_len: [32, 64, 128, 256]
-      - 不同的 kv_len: [64, 128, 256, 512, 1024]
-      - 不同的 q_offset: [0, 32, 64, 128]
-      - 不同的 num_heads / num_kv_heads 组合
-      - 不同的 head_dim: [64, 128]
+    Test coverage:
+      - Data types: fp16, bf16
+      - Different dllm_block_size: [16, 32, 64, 128]
+      - Different qo_len: [32, 64, 128, 256]
+      - Different kv_len: [64, 128, 256, 512, 1024]
+      - Different q_offset: [0, 32, 64, 128]
+      - Different num_heads / num_kv_heads combinations
+      - Different head_dim: [64, 128]
     
-    Mask 规则: mask[q, k] = ((q_local + q_offset) // B) >= (k // B)
+    Mask rule: mask[q, k] = ((q_local + q_offset) // B) >= (k // B)
     """
     device = torch.device("cuda:0")
     backends = ["fa2", "fa3"]
-    
+
 
     if test_dtypes is None:
         test_dtypes = [torch.float16, torch.bfloat16]
     
-    # 不同数据类型的精度容差
+    # Precision tolerance for different data types
     dtype_tolerances = {
         torch.float16: 1e-2,
         torch.bfloat16: 2e-2,  # FA3 bf16 tile accumulation order differs from FA2;
@@ -2048,72 +2048,72 @@ def test_dllm_precision_vs_custom_mask_fa2(
         torch.bfloat16: "bf16",
     }
     
-    # 测试参数组合
+    # Test parameter combinations
     test_configs = [
-        # 基础测试: 不同 dllm_block_size
+        # Basic tests: different dllm_block_size
         {"dllm_block_size": 16, "qo_len": 64, "kv_len": 128, "q_offset": 0, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
         {"dllm_block_size": 32, "qo_len": 64, "kv_len": 128, "q_offset": 0, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
         {"dllm_block_size": 64, "qo_len": 64, "kv_len": 128, "q_offset": 0, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
         {"dllm_block_size": 128, "qo_len": 128, "kv_len": 256, "q_offset": 0, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
         
-        # 不同 qo_len
+        # Different qo_len
         {"dllm_block_size": 32, "qo_len": 32, "kv_len": 128, "q_offset": 0, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
         {"dllm_block_size": 32, "qo_len": 128, "kv_len": 256, "q_offset": 0, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
         {"dllm_block_size": 32, "qo_len": 256, "kv_len": 512, "q_offset": 0, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
         
-        # 不同 kv_len
+        # Different kv_len
         {"dllm_block_size": 32, "qo_len": 64, "kv_len": 64, "q_offset": 0, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
         {"dllm_block_size": 32, "qo_len": 64, "kv_len": 256, "q_offset": 0, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
         {"dllm_block_size": 32, "qo_len": 64, "kv_len": 512, "q_offset": 0, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
         {"dllm_block_size": 32, "qo_len": 64, "kv_len": 1024, "q_offset": 0, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
         
-        # 不同 q_offset (模拟增量 prefill 的不同 step)
+        # Different q_offset (simulating different steps in incremental prefill)
         {"dllm_block_size": 32, "qo_len": 64, "kv_len": 128, "q_offset": 32, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
         {"dllm_block_size": 32, "qo_len": 64, "kv_len": 192, "q_offset": 64, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
         {"dllm_block_size": 32, "qo_len": 64, "kv_len": 256, "q_offset": 128, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
         {"dllm_block_size": 32, "qo_len": 64, "kv_len": 320, "q_offset": 192, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
         
-        # 不同 head 配置 (MHA vs GQA vs MQA)
+        # Different head configurations (MHA vs GQA vs MQA)
         {"dllm_block_size": 32, "qo_len": 64, "kv_len": 128, "q_offset": 0, "num_heads": 32, "num_kv_heads": 32, "head_dim": 128},  # MHA
         {"dllm_block_size": 32, "qo_len": 64, "kv_len": 128, "q_offset": 0, "num_heads": 32, "num_kv_heads": 4, "head_dim": 128},   # GQA-8
         {"dllm_block_size": 32, "qo_len": 64, "kv_len": 128, "q_offset": 0, "num_heads": 32, "num_kv_heads": 1, "head_dim": 128},   # MQA
         
-        # 不同 head_dim
+        # Different head_dim
         {"dllm_block_size": 32, "qo_len": 64, "kv_len": 128, "q_offset": 0, "num_heads": 32, "num_kv_heads": 8, "head_dim": 64},
         {"dllm_block_size": 32, "qo_len": 64, "kv_len": 128, "q_offset": 0, "num_heads": 16, "num_kv_heads": 4, "head_dim": 256},
         
-        # 边界条件测试
-        {"dllm_block_size": 32, "qo_len": 1, "kv_len": 32, "q_offset": 0, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},     # 单 query
+        # Boundary condition tests
+        {"dllm_block_size": 32, "qo_len": 1, "kv_len": 32, "q_offset": 0, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},     # single query
         {"dllm_block_size": 32, "qo_len": 32, "kv_len": 32, "q_offset": 0, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},    # qo_len == kv_len == block_size
-        {"dllm_block_size": 64, "qo_len": 33, "kv_len": 97, "q_offset": 17, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},  # 非对齐边界
+        {"dllm_block_size": 64, "qo_len": 33, "kv_len": 97, "q_offset": 17, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},  # non-aligned boundary
         
-        # 长序列测试
+        # Long sequence tests
         {"dllm_block_size": 32, "qo_len": 128, "kv_len": 2048, "q_offset": 0, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
         {"dllm_block_size": 64, "qo_len": 256, "kv_len": 4096, "q_offset": 0, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
     ]
     
-    # 多请求测试配置
+    # Multi-request test configurations
     multi_req_configs = [
-        # 基础多请求测试
+        # Basic multi-request tests
         {"num_requests": 2, "dllm_block_size": 32, "qo_len": 64, "kv_len": 128, "q_offset": 0, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
         {"num_requests": 4, "dllm_block_size": 32, "qo_len": 64, "kv_len": 128, "q_offset": 0, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
         {"num_requests": 8, "dllm_block_size": 32, "qo_len": 64, "kv_len": 128, "q_offset": 0, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
         
-        # 不同 dllm_block_size
+        # Different dllm_block_size
         {"num_requests": 4, "dllm_block_size": 16, "qo_len": 64, "kv_len": 128, "q_offset": 0, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
         {"num_requests": 4, "dllm_block_size": 64, "qo_len": 64, "kv_len": 128, "q_offset": 0, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
         
-        # 不同 q_offset (模拟增量 prefill step)
+        # Different q_offset (simulating incremental prefill step)
         {"num_requests": 4, "dllm_block_size": 32, "qo_len": 64, "kv_len": 128, "q_offset": 32, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
         {"num_requests": 4, "dllm_block_size": 32, "qo_len": 64, "kv_len": 192, "q_offset": 64, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
         {"num_requests": 4, "dllm_block_size": 32, "qo_len": 64, "kv_len": 256, "q_offset": 128, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
         
-        # 不同 head 配置
+        # Different head configurations
         {"num_requests": 4, "dllm_block_size": 32, "qo_len": 64, "kv_len": 128, "q_offset": 0, "num_heads": 32, "num_kv_heads": 32, "head_dim": 128},  # MHA
         {"num_requests": 4, "dllm_block_size": 32, "qo_len": 64, "kv_len": 128, "q_offset": 0, "num_heads": 32, "num_kv_heads": 4, "head_dim": 128},   # GQA-8
         {"num_requests": 4, "dllm_block_size": 32, "qo_len": 64, "kv_len": 128, "q_offset": 0, "num_heads": 32, "num_kv_heads": 1, "head_dim": 128},   # MQA
         
-        # 长序列多请求测试
+        # Long sequence multi-request tests
         {"num_requests": 4, "dllm_block_size": 32, "qo_len": 128, "kv_len": 1024, "q_offset": 0, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
         {"num_requests": 2, "dllm_block_size": 64, "qo_len": 256, "kv_len": 2048, "q_offset": 0, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
     ]
@@ -2123,21 +2123,21 @@ def test_dllm_precision_vs_custom_mask_fa2(
         tol = dtype_tolerances[dtype]
         
         print(f"\n{'='*120}")
-        print(f"DLLM 组件精度测试: 与原生 Custom Mask FA2 对比 [{dtype_name.upper()}]")
+        print(f"DLLM Component Precision Test: Comparing with Native Custom Mask FA2 [{dtype_name.upper()}]")
         print(f"{'='*120}")
-        print(f"参考实现: single_prefill_with_kv_cache / BatchPrefillWithRaggedKVCacheWrapper + custom_mask (FA2)")
-        print(f"被测后端: FA2, FA3 (DLLM BlockWise 已支持两个后端)")
-        print(f"数据类型: {dtype_name}")
-        print(f"Mask 规则: mask[q, k] = ((q_local + q_offset) // B) >= (k // B)")
-        print(f"精度容差: {tol}")
+        print(f"Reference implementation: single_prefill_with_kv_cache / BatchPrefillWithRaggedKVCacheWrapper + custom_mask (FA2)")
+        print(f"Backends under test: FA2, FA3 (DLLM BlockWise supports both backends)")
+        print(f"Data type: {dtype_name}")
+        print(f"Mask rule: mask[q, k] = ((q_local + q_offset) // B) >= (k // B)")
+        print(f"Precision tolerance: {tol}")
 
         print(f"\n{'='*100}")
-        print(f"[第一部分] 单请求精度测试 (FA2 & FA3 后端) [{dtype_name}]")
+        print(f"[Part 1] Single-request Precision Test (FA2 & FA3 backends) [{dtype_name}]")
         print(f"{'='*100}")
-        print(f"参考实现: single_prefill_with_kv_cache + custom_mask (FA2)")
-        print(f"被测对象:")
-        print(f"  1. BatchBlockExtendRaggedOffsetWrapper (batch_size=1) - FA2 后端")
-        print(f"  2. BatchBlockExtendRaggedOffsetWrapper (batch_size=1) - FA3 后端")
+        print(f"Reference implementation: single_prefill_with_kv_cache + custom_mask (FA2)")
+        print(f"Objects under test:")
+        print(f"  1. BatchBlockExtendRaggedOffsetWrapper (batch_size=1) - FA2 backend")
+        print(f"  2. BatchBlockExtendRaggedOffsetWrapper (batch_size=1) - FA3 backend")
         print(f"  3. block_extend_attention_with_offset")
         
         single_req_results = []
@@ -2152,13 +2152,13 @@ def test_dllm_precision_vs_custom_mask_fa2(
             head_dim = cfg["head_dim"]
             sm_scale = 1.0 / math.sqrt(head_dim)
             
-            # 生成测试数据
+            # Generate test data
             q = torch.randn(qo_len, num_heads, head_dim, dtype=dtype, device=device)
             k = torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device=device)
             v = torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device=device)
 
-            # 参考实现: single_prefill_with_kv_cache + custom_mask (FA2)
-            # 构造 custom_mask: mask[q, k] = ((q_local + q_offset) // B) >= (k // B)
+            # Reference implementation: single_prefill_with_kv_cache + custom_mask (FA2)
+            # Build custom_mask: mask[q, k] = ((q_local + q_offset) // B) >= (k // B)
             q_pos = torch.arange(qo_len, device=device) + q_offset
             k_pos = torch.arange(kv_len, device=device)
             q_block = q_pos.unsqueeze(1) // dllm_block_size  # [qo_len, 1]
@@ -2183,7 +2183,7 @@ def test_dllm_precision_vs_custom_mask_fa2(
                 "head_dim": head_dim,
             }
 
-            # 被测 1 & 2: BatchBlockExtendRaggedOffsetWrapper (FA2 和 FA3 后端)
+            # Object under test 1 & 2: BatchBlockExtendRaggedOffsetWrapper (FA2 and FA3 backends)
             qo_indptr = torch.tensor([0, qo_len], dtype=torch.int32, device=device)
             kv_indptr = torch.tensor([0, kv_len], dtype=torch.int32, device=device)
             q_offset_tensor = torch.tensor([q_offset], dtype=torch.int32, device=device)
@@ -2205,7 +2205,7 @@ def test_dllm_precision_vs_custom_mask_fa2(
                 )
                 bbe_output = wrapper.run(q, k, v)
                 
-                # 计算精度差异
+                # Calculate precision differences
                 bbe_diff = (bbe_output - ref_output).abs().max().item()
                 bbe_mean_diff = (bbe_output - ref_output).abs().mean().item()
                 bbe_pass = bbe_diff < tol
@@ -2216,7 +2216,7 @@ def test_dllm_precision_vs_custom_mask_fa2(
                 
                 del workspace, wrapper
 
-            # 被测 3: block_extend_attention_with_offset (backend="fa2")
+            # Object under test 3: block_extend_attention_with_offset (backend="fa2")
             v2_output = block_extend_attention_with_offset(
                 q, k, v,
                 dllm_block_size=dllm_block_size,
@@ -2225,7 +2225,7 @@ def test_dllm_precision_vs_custom_mask_fa2(
                 backend="fa2",
             )
             
-            # 计算 V2 精度差异
+            # Calculate V2 precision differences
             v2_diff = (v2_output - ref_output).abs().max().item()
             v2_mean_diff = (v2_output - ref_output).abs().mean().item()
             v2_pass = v2_diff < tol
@@ -2248,9 +2248,9 @@ def test_dllm_precision_vs_custom_mask_fa2(
             
             torch.cuda.empty_cache()
         
-        # 单请求测试汇总
+        # Single-request test summary
         print(f"\n{'-'*100}")
-        print(f"[单请求精度测试汇总] [{dtype_name}]")
+        print(f"[Single-request Precision Test Summary] [{dtype_name}]")
         print(f"{'-'*100}")
         
         total_tests = len(single_req_results)
@@ -2270,32 +2270,32 @@ def test_dllm_precision_vs_custom_mask_fa2(
         print(f"    max_diff (all tests): {v2_max_diff_all:.6f}")
         print(f"    mean_diff (avg):      {v2_mean_diff_all:.6f}")
         
-        # 失败测试详情
+        # Failed test details
         for backend in backends:
             failed = [r for r in single_req_results if not r[f"bbe_{backend}_pass"]]
             if failed:
-                print(f"\n  [BBE-{backend.upper()} 失败测试详情]")
+                print(f"\n  [BBE-{backend.upper()} Failed Test Details]")
                 for r in failed:
                     print(f"    Test {r['config_idx']:02d}: B={r['dllm_block_size']}, qo={r['qo_len']}, kv={r['kv_len']}, "
                           f"q_off={r['q_offset']}, max_diff={r[f'bbe_{backend}_max_diff']:.6f}")
         
         failed_v2 = [r for r in single_req_results if not r["v2_pass"]]
         if failed_v2:
-            print(f"\n  [V2 失败测试详情]")
+            print(f"\n  [V2 Failed Test Details]")
             for r in failed_v2:
                 print(f"    Test {r['config_idx']:02d}: B={r['dllm_block_size']}, qo={r['qo_len']}, kv={r['kv_len']}, "
                       f"q_off={r['q_offset']}, max_diff={r['v2_max_diff']:.6f}")
         
         # ═══════════════════════════════════════════════════════════════════════════════
-        # 第二部分: 多请求精度测试 (FA2 & FA3 后端)
+        # Part 2: Multi-request Precision Test (FA2 & FA3 backends)
         # ═══════════════════════════════════════════════════════════════════════════════
         print(f"\n{'='*100}")
-        print(f"[第二部分] 多请求精度测试 (FA2 & FA3 后端) [{dtype_name}]")
+        print(f"[Part 2] Multi-request Precision Test (FA2 & FA3 backends) [{dtype_name}]")
         print(f"{'='*100}")
-        print(f"参考实现: BatchPrefillWithRaggedKVCacheWrapper + custom_mask (FA2)")
-        print(f"被测对象:")
-        print(f"  1. BatchBlockExtendRaggedOffsetWrapper - FA2 后端")
-        print(f"  2. BatchBlockExtendRaggedOffsetWrapper - FA3 后端")
+        print(f"Reference implementation: BatchPrefillWithRaggedKVCacheWrapper + custom_mask (FA2)")
+        print(f"Objects under test:")
+        print(f"  1. BatchBlockExtendRaggedOffsetWrapper - FA2 backend")
+        print(f"  2. BatchBlockExtendRaggedOffsetWrapper - FA3 backend")
         
         multi_req_results = []
         
@@ -2318,7 +2318,7 @@ def test_dllm_precision_vs_custom_mask_fa2(
             k_batch = torch.cat(k_list, dim=0)
             v_batch = torch.cat(v_list, dim=0)
             
-            # 构造 mask
+            # Build mask
             q_pos = torch.arange(qo_len, device=device) + q_offset
             k_pos = torch.arange(kv_len, device=device)
             q_block = q_pos.unsqueeze(1) // dllm_block_size
@@ -2330,7 +2330,7 @@ def test_dllm_precision_vs_custom_mask_fa2(
             qo_indptr = torch.tensor([i * qo_len for i in range(num_requests + 1)], dtype=torch.int32, device=device)
             kv_indptr = torch.tensor([i * kv_len for i in range(num_requests + 1)], dtype=torch.int32, device=device)
             
-            # 参考实现
+            # Reference implementation
             ref_wrapper = BatchPrefillWithRaggedKVCacheWrapper(
                 torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device),
                 kv_layout="NHD", backend="fa2",
@@ -2386,8 +2386,8 @@ def test_dllm_precision_vs_custom_mask_fa2(
             del ref_wrapper
             torch.cuda.empty_cache()
         
-        # 多请求测试汇总
-        print(f"\n[多请求精度测试汇总] [{dtype_name}]")
+        # Multi-request test summary
+        print(f"\n[Multi-request Precision Test Summary] [{dtype_name}]")
         total_tests = len(multi_req_results)
         for backend in backends:
             pass_count = sum(1 for r in multi_req_results if r[f"bbe_{backend}_pass"])
@@ -2397,12 +2397,12 @@ def test_dllm_precision_vs_custom_mask_fa2(
         for backend in backends:
             failed = [r for r in multi_req_results if not r[f"bbe_{backend}_pass"]]
             if failed:
-                print(f"\n  [BBE-{backend.upper()} 失败详情]")
+                print(f"\n  [BBE-{backend.upper()} Failed Details]")
                 for r in failed:
                     print(f"    Test {r['config_idx']:02d}: reqs={r['num_requests']}, B={r['dllm_block_size']}, max_diff={r[f'bbe_{backend}_max_diff']:.6f}")
         
-        # 第三部分: Paged KV Cache 测试
-        print(f"\n[第三部分] Paged KV Cache 精度测试 [{dtype_name}]")
+        # Part 3: Paged KV Cache Test
+        print(f"\n[Part 3] Paged KV Cache Precision Test [{dtype_name}]")
         
         page_size = 16
         paged_configs = [
@@ -2437,7 +2437,7 @@ def test_dllm_precision_vs_custom_mask_fa2(
             k_continuous = kv_data[:, 0, :, :, :].reshape(-1, num_kv_heads, head_dim)[:kv_len]
             v_continuous = kv_data[:, 1, :, :, :].reshape(-1, num_kv_heads, head_dim)[:kv_len]
             
-            # 参考实现
+            # Reference implementation
             q_pos = torch.arange(qo_len, device=device) + q_offset
             k_pos = torch.arange(kv_len, device=device)
             q_block = q_pos.unsqueeze(1) // dllm_block_size
@@ -2489,8 +2489,8 @@ def test_dllm_precision_vs_custom_mask_fa2(
             
             torch.cuda.empty_cache()
         
-        # Paged 测试汇总
-        print(f"\n[Paged KV Cache 精度测试汇总] [{dtype_name}]")
+        # Paged test summary
+        print(f"\n[Paged KV Cache Precision Test Summary] [{dtype_name}]")
         for backend in backends:
             pass_count = sum(1 for r in paged_results if r[f"paged_{backend}_pass"])
             max_diff_all = max(r[f"paged_{backend}_max_diff"] for r in paged_results)
@@ -2499,33 +2499,33 @@ def test_dllm_precision_vs_custom_mask_fa2(
         for backend in backends:
             failed = [r for r in paged_results if not r[f"paged_{backend}_pass"]]
             if failed:
-                print(f"\n  [Paged-{backend.upper()} 失败详情]")
+                print(f"\n  [Paged-{backend.upper()} Failed Details]")
                 for r in failed:
                     print(f"    Test {r['config_idx']:02d}: B={r['dllm_block_size']}, max_diff={r[f'paged_{backend}_max_diff']:.6f}")
     
-        # 总结
+        # Summary
         print(f"\n{'='*100}")
-        print(f"精度测试总结 [{dtype_name}]")
+        print(f"Precision Test Summary [{dtype_name}]")
         print(f"{'='*100}")
         
-        print(f"\n  单请求测试:")
+        print(f"\n  Single-request tests:")
         for backend in backends:
             pass_count = sum(1 for r in single_req_results if r[f"bbe_{backend}_pass"])
             print(f"    BBE ({backend.upper()}): {pass_count}/{len(single_req_results)} PASS")
         v2_pass_count = sum(1 for r in single_req_results if r["v2_pass"])
         print(f"    V2: {v2_pass_count}/{len(single_req_results)} PASS")
         
-        print(f"\n  多请求测试:")
+        print(f"\n  Multi-request tests:")
         for backend in backends:
             pass_count = sum(1 for r in multi_req_results if r[f"bbe_{backend}_pass"])
             print(f"    BBE ({backend.upper()}): {pass_count}/{len(multi_req_results)} PASS")
         
-        print(f"\n  Paged 测试:")
+        print(f"\n  Paged tests:")
         for backend in backends:
             pass_count = sum(1 for r in paged_results if r[f"paged_{backend}_pass"])
             print(f"    Paged ({backend.upper()}): {pass_count}/{len(paged_results)} PASS")
         
-        # 总体结果
+        # Overall results
         all_single_pass = all(
             r["bbe_fa2_pass"] and r["bbe_fa3_pass"] and r["v2_pass"] 
             for r in single_req_results
@@ -2541,9 +2541,9 @@ def test_dllm_precision_vs_custom_mask_fa2(
         
         overall_pass = all_single_pass and all_multi_pass and all_paged_pass
         overall_status = "ALL TESTS PASSED" if overall_pass else "SOME TESTS FAILED"
-        print(f"\n  总体结果: {overall_status}")
+        print(f"\n  Overall results: {overall_status}")
         
-        # FA2 vs FA3 对比
+        # FA2 vs FA3 comparison
         fa2_single_max = max(r["bbe_fa2_max_diff"] for r in single_req_results)
         fa3_single_max = max(r["bbe_fa3_max_diff"] for r in single_req_results)
         fa2_multi_max = max(r["bbe_fa2_max_diff"] for r in multi_req_results)
@@ -2552,8 +2552,8 @@ def test_dllm_precision_vs_custom_mask_fa2(
         fa3_paged_max = max(r["paged_fa3_max_diff"] for r in paged_results)
         
         print(f"\n  FA2 vs FA3 max_diff:")
-        print(f"    单请求: FA2={fa2_single_max:.6f}, FA3={fa3_single_max:.6f}")
-        print(f"    多请求: FA2={fa2_multi_max:.6f}, FA3={fa3_multi_max:.6f}")
+        print(f"    Single-request: FA2={fa2_single_max:.6f}, FA3={fa3_single_max:.6f}")
+        print(f"    Multi-request: FA2={fa2_multi_max:.6f}, FA3={fa3_multi_max:.6f}")
         print(f"    Paged:  FA2={fa2_paged_max:.6f}, FA3={fa3_paged_max:.6f}")
     
     return {
@@ -2576,22 +2576,22 @@ def test_cascade_interfaces_perf(
     backend: str = "fa2",
 ):
     """
-    对比两个 Cascade 接口的性能 (Step by Step 增量 Prefill 场景)
+    Compare performance of two Cascade interfaces (Step by Step incremental Prefill scenario)
     
-    被测接口:
-      1. batch_block_extend_cascade: 使用 Block Extend mask
-         - 支持 chunk_size != dllm_block_size
-      2. sglang_style_cascade_attention: 使用 Causal mask (SGLang 原生风格)
-         - 要求 chunk_size == dllm_block_size
+    Interfaces under test:
+      1. batch_block_extend_cascade: Uses Block Extend mask
+         - Supports chunk_size != dllm_block_size
+      2. sglang_style_cascade_attention: Uses Causal mask (SGLang native style)
+         - Requires chunk_size == dllm_block_size
     
-    测试场景:
-      - 真实的增量 Prefill: 每个 step 依赖前一个 step 的 KV Cache
-      - 每个 step: Q attend to (current_chunk KV + prefix KV)
-      - 使用 Paged KV Cache 存储 prefix
+    Test scenario:
+      - Real incremental Prefill: each step depends on previous step's KV Cache
+      - Each step: Q attends to (current_chunk KV + prefix KV)
+      - Uses Paged KV Cache to store prefix
     
-    关键点:
-      - 当 chunk_size == dllm_block_size 时，两者结果应该一致
-      - batch_block_extend_cascade 可以使用更大的 chunk_size
+    Key points:
+      - When chunk_size == dllm_block_size, both should produce identical results
+      - batch_block_extend_cascade can use larger chunk_size
     """
     from flashinfer.dllm import (
         batch_block_extend_cascade,
@@ -2599,16 +2599,16 @@ def test_cascade_interfaces_perf(
     )
     
     if chunk_sizes is None:
-        chunk_sizes = [dllm_block_size]  # 默认只测试 chunk_size == dllm_block_size
+        chunk_sizes = [dllm_block_size]  # Default: only test chunk_size == dllm_block_size
     
     device = torch.device("cuda:0")
     dtype = torch.float16
     sm_scale = 1.0 / (head_dim ** 0.5)
     
     print(f"\n{'='*90}")
-    print(f"Cascade 接口性能对比: Step by Step 增量 Prefill")
+    print(f"Cascade Interface Performance Comparison: Step by Step Incremental Prefill")
     print(f"{'='*90}")
-    print(f"配置:")
+    print(f"Configuration:")
     print(f"  num_requests        = {num_requests}")
     print(f"  tokens_per_request  = {tokens_per_request}")
     print(f"  dllm_block_size     = {dllm_block_size}")
@@ -2618,13 +2618,13 @@ def test_cascade_interfaces_perf(
     print(f"  head_dim            = {head_dim}")
     print(f"  page_size           = {page_size}")
     print(f"  backend             = {backend}")
-    print(f"\n场景说明:")
-    print(f"  - Step by Step 增量 Prefill: 每个 step 依赖前一个 step 的 KV Cache")
-    print(f"  - Current Chunk: Ragged KV (连续内存)")
+    print(f"\nScenario description:")
+    print(f"  - Step by Step incremental Prefill: each step depends on previous step's KV Cache")
+    print(f"  - Current Chunk: Ragged KV (contiguous memory)")
     print(f"  - Prefix: Paged KV Cache")
-    print(f"  - 使用 CUDA Graph 减少 overhead")
+    print(f"  - Uses CUDA Graph to reduce overhead")
     
-    # 生成每个 request 的完整 Q, K, V
+    # Generate complete Q, K, V for each request
     all_qs = [torch.randn(tokens_per_request, num_heads, head_dim, dtype=dtype, device=device) 
               for _ in range(num_requests)]
     all_ks = [torch.randn(tokens_per_request, num_kv_heads, head_dim, dtype=dtype, device=device) 
@@ -2639,7 +2639,7 @@ def test_cascade_interfaces_perf(
     
     for chunk_size in chunk_sizes:
         if tokens_per_request % chunk_size != 0:
-            print(f"\n[跳过] chunk_size={chunk_size} 无法整除 tokens_per_request={tokens_per_request}")
+            print(f"\n[Skip] chunk_size={chunk_size} doesn't evenly divide tokens_per_request={tokens_per_request}")
             continue
         
         num_steps = tokens_per_request // chunk_size
@@ -2648,13 +2648,13 @@ def test_cascade_interfaces_perf(
         print(f"chunk_size = {chunk_size}, num_steps = {num_steps}")
         print(f"{'-'*90}")
         
-        # 为每个 request 分 chunk
+        # Split chunks for each request
         qs_chunks = [split_chunks(q, chunk_size) for q in all_qs]
         ks_chunks = [split_chunks(k, chunk_size) for k in all_ks]
         vs_chunks = [split_chunks(v, chunk_size) for v in all_vs]
         
-        # 预分配所有 step 的 buffer
-        # Current chunk Q, K, V (concat 所有 requests)
+        # Pre-allocate buffers for all steps
+        # Current chunk Q, K, V (concatenate all requests)
         q_current_buffers = []
         k_current_buffers = []
         v_current_buffers = []
@@ -2666,13 +2666,13 @@ def test_cascade_interfaces_perf(
             k_current_buffers.append(torch.cat(k_list, dim=0))
             v_current_buffers.append(torch.cat(v_list, dim=0))
         
-        # Paged KV Cache 设置 (prefix 存储)
-        # 计算最大需要的 page 数
+        # Paged KV Cache setup (prefix storage)
+        # Calculate maximum number of pages needed
         max_prefix_len = (num_steps - 1) * chunk_size
         max_pages_per_request = (max_prefix_len + page_size - 1) // page_size if max_prefix_len > 0 else 0
         total_max_pages = num_requests * max_pages_per_request
         
-        # 分配 Paged KV Cache
+        # Allocate Paged KV Cache
         if total_max_pages > 0:
             paged_kv_cache = torch.randn(
                 total_max_pages, 2, page_size, num_kv_heads, head_dim,
@@ -2681,12 +2681,12 @@ def test_cascade_interfaces_perf(
         else:
             paged_kv_cache = None
         
-        # 为每个 step 准备 paged kv 参数
+        # Prepare paged kv parameters for each step
         paged_kv_params_list = []
         for step_idx in range(num_steps):
             prefix_len = step_idx * chunk_size
             if prefix_len == 0:
-                # 第一个 step 没有 prefix
+                # First step has no prefix
                 paged_kv_params_list.append(None)
             else:
                 pages_per_request = (prefix_len + page_size - 1) // page_size
@@ -2719,21 +2719,21 @@ def test_cascade_interfaces_perf(
             dtype=torch.int32, device=device
         )
         
-        # q_offsets 和 kv_offsets (block_extend_cascade 需要)
+        # q_offsets and kv_offsets (required by block_extend_cascade)
         q_offsets_list = []
         for step_idx in range(num_steps):
             prefix_len = step_idx * chunk_size
             q_offsets_list.append(torch.full((num_requests,), prefix_len, dtype=torch.int32, device=device))
         
-        # Workspace buffer (共享)
+        # Workspace buffer (shared)
         workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
         
         # Output buffer
         output_buffer = torch.empty(num_requests * chunk_size, num_heads, head_dim, dtype=dtype, device=device)
 
-        # 精度验证 (当 chunk_size == dllm_block_size 时)
+        # Precision verification (when chunk_size == dllm_block_size)
         if chunk_size == dllm_block_size:
-            print(f"  [精度验证] chunk_size == dllm_block_size, 对比两个接口输出...")
+            print(f"  [Precision Verification] chunk_size == dllm_block_size, comparing outputs of both interfaces...")
             
             max_diff_all_steps = 0.0
             for step_idx in range(num_steps):
@@ -2742,7 +2742,7 @@ def test_cascade_interfaces_perf(
                 v_current = v_current_buffers[step_idx]
                 paged_params = paged_kv_params_list[step_idx]
                 
-                # batch_block_extend_cascade (函数内部自动判断 has_prefix)
+                # batch_block_extend_cascade (function internally determines has_prefix)
                 be_out = batch_block_extend_cascade(
                     q=q_batch,
                     k_current=k_current,
@@ -2756,13 +2756,13 @@ def test_cascade_interfaces_perf(
                     page_size=page_size,
                     dllm_block_size=dllm_block_size,
                     q_offsets=q_offsets_list[step_idx],
-                    kv_offsets=q_offsets_list[step_idx],  # Cascade 场景: kv_offset == q_offset == prefix_len
+                    kv_offsets=q_offsets_list[step_idx],  # Cascade scenario: kv_offset == q_offset == prefix_len
                     workspace_buffer=workspace_buffer,
                     sm_scale=sm_scale,
                     backend=backend,
                 )
                 
-                # sglang_style_cascade_attention (函数内部自动判断 has_prefix)
+                # sglang_style_cascade_attention (function internally determines has_prefix)
                 sg_out = sglang_style_cascade_attention(
                     q=q_batch,
                     k_current=k_current,
@@ -2787,17 +2787,17 @@ def test_cascade_interfaces_perf(
             
             precision_ok = max_diff_all_steps < 0.01
             status = " PASS" if precision_ok else " FAIL"
-            print(f"  [精度验证] max_diff = {max_diff_all_steps:.6f} {status}")
+            print(f"  [Precision Verification] max_diff = {max_diff_all_steps:.6f} {status}")
         
 
-        # [1] batch_block_extend_cascade 性能测试
-        print(f"  [batch_block_extend_cascade] 性能测试 (无 CUDA Graph)...")
+        # [1] batch_block_extend_cascade performance test
+        print(f"  [batch_block_extend_cascade] Performance test (without CUDA Graph)...")
         
-        # ========== 分段计时: 测量 Python 开销 vs Kernel 开销 ==========
+        # ========== Segmented timing: measure Python overhead vs Kernel overhead ==========
         if verbose:
             import time as time_module
             
-            # 1) 测量单次完整调用
+            # 1) Measure single complete call
             torch.cuda.synchronize()
             t0 = time_module.perf_counter()
             _ = batch_block_extend_cascade(
@@ -2815,9 +2815,9 @@ def test_cascade_interfaces_perf(
             )
             torch.cuda.synchronize()
             be_single_call = (time_module.perf_counter() - t0) * 1000
-            print(f"    [分段计时] BE 单次调用: {be_single_call:.3f} ms (包含 Wrapper 创建 + plan + run)")
+            print(f"    [Segmented Timing] BE single call: {be_single_call:.3f} ms (includes Wrapper creation + plan + run)")
             
-            # 2) 测量 SG 单次完整调用
+            # 2) Measure SG single complete call
             torch.cuda.synchronize()
             t0 = time_module.perf_counter()
             _ = sglang_style_cascade_attention(
@@ -2832,13 +2832,13 @@ def test_cascade_interfaces_perf(
             )
             torch.cuda.synchronize()
             sg_single_call = (time_module.perf_counter() - t0) * 1000
-            print(f"    [分段计时] SG 单次调用: {sg_single_call:.3f} ms (包含 Wrapper 创建 + plan + run)")
-            print(f"    [分段计时] 单次调用差异: BE={be_single_call:.3f}ms, SG={sg_single_call:.3f}ms, 差={sg_single_call-be_single_call:.3f}ms")
+            print(f"    [Segmented Timing] SG single call: {sg_single_call:.3f} ms (includes Wrapper creation + plan + run)")
+            print(f"    [Segmented Timing] Single call diff: BE={be_single_call:.3f}ms, SG={sg_single_call:.3f}ms, diff={sg_single_call-be_single_call:.3f}ms")
             
-            # 3) 测量复用 Wrapper 的纯 kernel 时间 (排除 Wrapper 创建和 plan 开销)
-            print(f"    [分段计时] 测量复用 Wrapper 的纯 run() 时间...")
+            # 3) Measure pure kernel time with reused Wrapper (excluding Wrapper creation and plan overhead)
+            print(f"    [Segmented Timing] Measuring pure run() time with reused Wrapper...")
             
-            # BE: 创建并 plan 一次
+            # BE: Create and plan once
             from flashinfer.dllm.batch_block_extend import (
                 BatchBlockExtendRaggedOffsetWrapper,
             )
@@ -2860,7 +2860,7 @@ def test_cascade_interfaces_perf(
                 kv_offsets=q_offsets_list[0],
             )
             
-            # SG: 创建并 plan 一次
+            # SG: Create and plan once
             from flashinfer.prefill import BatchPrefillWithRaggedKVCacheWrapper
             sg_wrapper = BatchPrefillWithRaggedKVCacheWrapper(
                 workspace_buffer.clone(),
@@ -2875,10 +2875,10 @@ def test_cascade_interfaces_perf(
                 head_dim_qk=head_dim,
                 head_dim_vo=head_dim,
                 q_data_type=q_current_buffers[0].dtype,
-                causal=False,  # 与 BE 一致: 使用 non-causal (全可见)
+                causal=False,  # Same as BE: use non-causal (fully visible)
             )
             
-            # BE: 只测 run() 时间
+            # BE: Only measure run() time
             for _ in range(10):  # warmup
                 _ = be_wrapper.run(q_current_buffers[0], k_current_buffers[0], v_current_buffers[0])
             torch.cuda.synchronize()
@@ -2888,7 +2888,7 @@ def test_cascade_interfaces_perf(
             torch.cuda.synchronize()
             be_run_only = (time_module.perf_counter() - t0) / 100 * 1000
             
-            # SG: 只测 run() 时间
+            # SG: Only measure run() time
             for _ in range(10):  # warmup
                 _ = sg_wrapper.run(q_current_buffers[0], k_current_buffers[0], v_current_buffers[0])
             torch.cuda.synchronize()
@@ -2898,13 +2898,13 @@ def test_cascade_interfaces_perf(
             torch.cuda.synchronize()
             sg_run_only = (time_module.perf_counter() - t0) / 100 * 1000
             
-            print(f"    [分段计时] BE run() only: {be_run_only:.3f} ms")
-            print(f"    [分段计时] SG run() only: {sg_run_only:.3f} ms")
-            print(f"    [分段计时] run() 差异: BE={be_run_only:.3f}ms, SG={sg_run_only:.3f}ms, diff={sg_run_only-be_run_only:.3f}ms")
+            print(f"    [Segmented Timing] BE run() only: {be_run_only:.3f} ms")
+            print(f"    [Segmented Timing] SG run() only: {sg_run_only:.3f} ms")
+            print(f"    [Segmented Timing] run() diff: BE={be_run_only:.3f}ms, SG={sg_run_only:.3f}ms, diff={sg_run_only-be_run_only:.3f}ms")
             if abs(sg_run_only - be_run_only) < 0.01:
-                print(f"    [结论] kernel 层面性能相当，差异来自 Python 开销")
+                print(f"    [Conclusion] Kernel-level performance is comparable, diff comes from Python overhead")
             else:
-                print(f"    [结论] kernel 层面存在差异，可能是 mask_mode 实现不同")
+                print(f"    [Conclusion] Kernel-level diff exists, possibly due to different mask_mode implementations")
         
         def run_be_cascade_pipeline():
             for step_idx in range(num_steps):
@@ -2913,7 +2913,7 @@ def test_cascade_interfaces_perf(
                 v_current = v_current_buffers[step_idx]
                 paged_params = paged_kv_params_list[step_idx]
                 
-                # 函数内部自动判断 has_prefix
+                # Function internally determines has_prefix
                 output_buffer.copy_(batch_block_extend_cascade(
                     q=q_batch,
                     k_current=k_current,
@@ -2927,7 +2927,7 @@ def test_cascade_interfaces_perf(
                     page_size=page_size,
                     dllm_block_size=dllm_block_size,
                     q_offsets=q_offsets_list[step_idx],
-                    kv_offsets=q_offsets_list[step_idx],  # Cascade 场景: kv_offset == q_offset == prefix_len
+                    kv_offsets=q_offsets_list[step_idx],  # Cascade scenario: kv_offset == q_offset == prefix_len
                     workspace_buffer=workspace_buffer,
                     sm_scale=sm_scale,
                     backend=backend,
@@ -2938,7 +2938,7 @@ def test_cascade_interfaces_perf(
             run_be_cascade_pipeline()
         torch.cuda.synchronize()
         
-        # Benchmark (无 CUDA Graph)
+        # Benchmark (without CUDA Graph)
         start = time.perf_counter()
         for _ in range(bench_iters):
             run_be_cascade_pipeline()
@@ -2949,8 +2949,8 @@ def test_cascade_interfaces_perf(
         
         torch.cuda.empty_cache()
 
-        # [2] sglang_style_cascade_attention 性能测试
-        print(f"  [sglang_style_cascade_attention] 性能测试 (无 CUDA Graph)...")
+        # [2] sglang_style_cascade_attention performance test
+        print(f"  [sglang_style_cascade_attention] Performance test (without CUDA Graph)...")
         
         def run_sg_cascade_pipeline():
             for step_idx in range(num_steps):
@@ -2959,7 +2959,7 @@ def test_cascade_interfaces_perf(
                 v_current = v_current_buffers[step_idx]
                 paged_params = paged_kv_params_list[step_idx]
                 
-                # 函数内部自动判断 has_prefix
+                # Function internally determines has_prefix
                 output_buffer.copy_(sglang_style_cascade_attention(
                     q=q_batch,
                     k_current=k_current,
@@ -2981,7 +2981,7 @@ def test_cascade_interfaces_perf(
             run_sg_cascade_pipeline()
         torch.cuda.synchronize()
         
-        # Benchmark (无 CUDA Graph)
+        # Benchmark (without CUDA Graph)
         start = time.perf_counter()
         for _ in range(bench_iters):
             run_sg_cascade_pipeline()
@@ -2993,9 +2993,9 @@ def test_cascade_interfaces_perf(
 
         speedup = sg_time / be_time if be_time > 0 else 0
         if speedup > 1:
-            print(f"    => batch_block_extend_cascade 快 {speedup:.2f}x")
+            print(f"    => batch_block_extend_cascade is faster by {speedup:.2f}x")
         else:
-            print(f"    => sglang_style_cascade_attention 快 {1/speedup:.2f}x")
+            print(f"    => sglang_style_cascade_attention is faster by {1/speedup:.2f}x")
         
         results[f"chunk{chunk_size}"] = {
             "chunk_size": chunk_size,
@@ -3008,9 +3008,9 @@ def test_cascade_interfaces_perf(
         torch.cuda.empty_cache()
     
 
-    # 结果汇总
+    # Results summary
     print(f"\n{'='*90}")
-    print(f"结果汇总 (num_requests={num_requests}, tokens_per_request={tokens_per_request}, dllm_block_size={dllm_block_size})")
+    print(f"Results Summary (num_requests={num_requests}, tokens_per_request={tokens_per_request}, dllm_block_size={dllm_block_size})")
     print(f"{'='*90}")
     
     print(f"\n{'chunk':>8} | {'steps':>6} | {'BE Cascade':>14} | {'SG Cascade':>14} | {'BE/SG':>10}")
@@ -3020,13 +3020,13 @@ def test_cascade_interfaces_perf(
         r = results[key]
         print(f"{r['chunk_size']:>8} | {r['num_steps']:>6} | {r['be_cascade_ms']:>12.3f}ms | {r['sg_cascade_ms']:>12.3f}ms | {r['speedup_be_over_sg']:>9.2f}x")
     
-    print(f"\n说明:")
+    print(f"\nNotes:")
     print(f"  - BE Cascade: batch_block_extend_cascade (Block Extend mask)")
     print(f"  - SG Cascade: sglang_style_cascade_attention (Causal mask)")
-    print(f"  - BE/SG: batch_block_extend_cascade 相对于 sglang_style 的速度比")
-    print(f"    (>1 表示 BE 更快, <1 表示 SG 更快)")
-    print(f"  - 当 chunk_size == dllm_block_size 时, causal mask = block_extend mask")
-    print(f"  - batch_block_extend_cascade 支持 chunk_size != dllm_block_size")
+    print(f"  - BE/SG: Speed ratio of batch_block_extend_cascade vs sglang_style")
+    print(f"    (>1 means BE is faster, <1 means SG is faster)")
+    print(f"  - When chunk_size == dllm_block_size, causal mask = block_extend mask")
+    print(f"  - batch_block_extend_cascade supports chunk_size != dllm_block_size")
     
     return results
 
@@ -3046,23 +3046,23 @@ def test_cascade_interfaces_perf_with_cuda_graph(
     backend: str = "fa2",
 ):
     """
-    对比两个 Cascade 接口的性能 (带 CUDA Graph 优化)
+    Compare performance of two Cascade interfaces (with CUDA Graph optimization)
     
-    与 test_cascade_interfaces_perf 的区别:
+    Differences from test_cascade_interfaces_perf:
     ═══════════════════════════════════════════════════════════════════════════════
-    - 本函数: 使用 CUDA Graph capture run() 操作，减少 Python/launch 开销
-    - 原函数: 每次调用都包含 Wrapper 创建 + plan() + run()
+    - This function: Uses CUDA Graph to capture run() operations, reducing Python/launch overhead
+    - Original function: Each call includes Wrapper creation + plan() + run()
     
-    CUDA Graph 实现要点:
+    CUDA Graph implementation notes:
     ═══════════════════════════════════════════════════════════════════════════════
-    1. plan() 包含 CPU-GPU 同步，不能在 Graph capture 中执行
-    2. 为每个 step 预先创建独立 Wrapper 并完成 plan()
-    3. CUDA Graph 只 capture run() 操作
-    4. 每个 step 的 paged_kv 配置不同，需要独立 Wrapper
+    1. plan() contains CPU-GPU synchronization, cannot be executed during Graph capture
+    2. Pre-create independent Wrappers for each step and complete plan()
+    3. CUDA Graph only captures run() operations
+    4. Each step has different paged_kv configuration, requires independent Wrapper
     
-    被测接口:
-      1. batch_block_extend_cascade (通过 Wrapper.run())
-      2. sglang_style_cascade_attention (通过 Wrapper.run())
+    Interfaces under test:
+      1. batch_block_extend_cascade (via Wrapper.run())
+      2. sglang_style_cascade_attention (via Wrapper.run())
     """
     from flashinfer.dllm import (
         BatchBlockExtendRaggedOffsetWrapper,
@@ -3082,9 +3082,9 @@ def test_cascade_interfaces_perf_with_cuda_graph(
     sm_scale = 1.0 / (head_dim ** 0.5)
     
     print(f"\n{'='*90}")
-    print(f"Cascade 接口性能对比: Step by Step 增量 Prefill (CUDA Graph 版本)")
+    print(f"Cascade Interface Performance Comparison: Step by Step Incremental Prefill (CUDA Graph Version)")
     print(f"{'='*90}")
-    print(f"配置:")
+    print(f"Configuration:")
     print(f"  num_requests        = {num_requests}")
     print(f"  tokens_per_request  = {tokens_per_request}")
     print(f"  dllm_block_size     = {dllm_block_size}")
@@ -3094,12 +3094,12 @@ def test_cascade_interfaces_perf_with_cuda_graph(
     print(f"  head_dim            = {head_dim}")
     print(f"  page_size           = {page_size}")
     print(f"  backend             = {backend}")
-    print(f"\nCUDA Graph 优化:")
-    print(f"  - 预先为每个 step 创建 Wrapper 并完成 plan()")
-    print(f"  - CUDA Graph 只 capture run() 操作")
-    print(f"  - 减少 Python/launch 开销")
+    print(f"\nCUDA Graph Optimization:")
+    print(f"  - Pre-create Wrappers for each step and complete plan()")
+    print(f"  - CUDA Graph only captures run() operations")
+    print(f"  - Reduces Python/launch overhead")
     
-    # 生成每个 request 的完整 Q, K, V
+    # Generate complete Q, K, V for each request
     all_qs = [torch.randn(tokens_per_request, num_heads, head_dim, dtype=dtype, device=device) 
               for _ in range(num_requests)]
     all_ks = [torch.randn(tokens_per_request, num_kv_heads, head_dim, dtype=dtype, device=device) 
@@ -3114,7 +3114,7 @@ def test_cascade_interfaces_perf_with_cuda_graph(
     
     for chunk_size in chunk_sizes:
         if tokens_per_request % chunk_size != 0:
-            print(f"\n[跳过] chunk_size={chunk_size} 无法整除 tokens_per_request={tokens_per_request}")
+            print(f"\n[Skip] chunk_size={chunk_size} doesn't evenly divide tokens_per_request={tokens_per_request}")
             continue
         
         num_steps = tokens_per_request // chunk_size
@@ -3123,12 +3123,12 @@ def test_cascade_interfaces_perf_with_cuda_graph(
         print(f"chunk_size = {chunk_size}, num_steps = {num_steps}")
         print(f"{'-'*90}")
         
-        # 为每个 request 分 chunk
+        # Split chunks for each request
         qs_chunks = [split_chunks(q, chunk_size) for q in all_qs]
         ks_chunks = [split_chunks(k, chunk_size) for k in all_ks]
         vs_chunks = [split_chunks(v, chunk_size) for v in all_vs]
         
-        # 预分配所有 step 的 buffer
+        # Pre-allocate buffers for all steps
         q_current_buffers = []
         k_current_buffers = []
         v_current_buffers = []
@@ -3140,7 +3140,7 @@ def test_cascade_interfaces_perf_with_cuda_graph(
             k_current_buffers.append(torch.cat(k_list, dim=0))
             v_current_buffers.append(torch.cat(v_list, dim=0))
         
-        # Paged KV Cache 设置
+        # Paged KV Cache setup
         max_prefix_len = (num_steps - 1) * chunk_size
         max_pages_per_request = (max_prefix_len + page_size - 1) // page_size if max_prefix_len > 0 else 0
         total_max_pages = num_requests * max_pages_per_request
@@ -3153,7 +3153,7 @@ def test_cascade_interfaces_perf_with_cuda_graph(
         else:
             paged_kv_cache = None
         
-        # 为每个 step 准备 paged kv 参数
+        # Prepare paged kv parameters for each step
         paged_kv_params_list = []
         for step_idx in range(num_steps):
             prefix_len = step_idx * chunk_size
@@ -3201,14 +3201,14 @@ def test_cascade_interfaces_perf_with_cuda_graph(
         be_output_buffers = [torch.empty_like(output_buffer) for _ in range(num_steps)]
         sg_output_buffers = [torch.empty_like(output_buffer) for _ in range(num_steps)]
         
-        # LSE buffers for merge (只有 step > 0 需要)
+        # LSE buffers for merge (only needed for step > 0)
         be_lse_ragged = [torch.empty(num_requests * chunk_size, num_heads, dtype=torch.float32, device=device) for _ in range(num_steps)]
         be_lse_paged = [torch.empty(num_requests * chunk_size, num_heads, dtype=torch.float32, device=device) for _ in range(num_steps)]
         sg_lse_ragged = [torch.empty(num_requests * chunk_size, num_heads, dtype=torch.float32, device=device) for _ in range(num_steps)]
         sg_lse_paged = [torch.empty(num_requests * chunk_size, num_heads, dtype=torch.float32, device=device) for _ in range(num_steps)]
 
-        # 预创建 BE Wrappers (每个 step 独立)
-        print(f"  [准备] 为 BE Cascade 预创建 {num_steps} 个 step 的 Wrappers...")
+        # Pre-create BE Wrappers (independent for each step)
+        print(f"  [Preparation] Pre-creating {num_steps} step Wrappers for BE Cascade...")
         be_ragged_wrappers = []
         be_paged_wrappers = []
         
@@ -3236,13 +3236,13 @@ def test_cascade_interfaces_perf_with_cuda_graph(
             )
             be_ragged_wrappers.append(ragged_wrapper)
             
-            # Paged Wrapper (Prefix) - 只有 step > 0 需要
-            # Cascade 场景: Q 的 block >= 所有 prefix 的 block, 所以 mask 全为 1, 用 full attention
+            # Paged Wrapper (Prefix) - only needed for step > 0
+            # Cascade scenario: Q's block >= all prefix blocks, so mask is all 1s, use full attention
             if prefix_len > 0:
                 paged_params = paged_kv_params_list[step_idx]
                 ws_paged = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
-                # 使用原生 BatchPrefillWithPagedKVCacheWrapper (causal=False) 而非 BlockExtend
-                # 因为 Prefix 的 mask 全为 1, 不需要额外的 mask 计算
+                # Use native BatchPrefillWithPagedKVCacheWrapper (causal=False) instead of BlockExtend
+                # Because Prefix mask is all 1s, no additional mask computation needed
                 paged_wrapper = BatchPrefillWithPagedKVCacheWrapper(
                     ws_paged,
                     kv_layout="NHD",
@@ -3259,14 +3259,14 @@ def test_cascade_interfaces_perf_with_cuda_graph(
                     head_dim_vo=head_dim,
                     page_size=page_size,
                     q_data_type=dtype,
-                    causal=False,  # Prefix 全可见
+                    causal=False,  # Prefix is fully visible
                 )
                 be_paged_wrappers.append(paged_wrapper)
             else:
                 be_paged_wrappers.append(None)
 
-        # 预创建 SG Wrappers (每个 step 独立)
-        print(f"  [准备] 为 SG Cascade 预创建 {num_steps} 个 step 的 Wrappers...")
+        # Pre-create SG Wrappers (independent for each step)
+        print(f"  [Preparation] Pre-creating {num_steps} step Wrappers for SG Cascade...")
         sg_ragged_wrappers = []
         sg_paged_wrappers = []
         
@@ -3288,11 +3288,11 @@ def test_cascade_interfaces_perf_with_cuda_graph(
                 head_dim_qk=head_dim,
                 head_dim_vo=head_dim,
                 q_data_type=dtype,
-                causal=True,  # SGLang: Current Chunk 使用 causal=True
+                causal=True,  # SGLang: Current Chunk uses causal=True
             )
             sg_ragged_wrappers.append(ragged_wrapper)
             
-            # Paged Wrapper (Prefix, causal=False) - 只有 step > 0 需要
+            # Paged Wrapper (Prefix, causal=False) - only needed for step > 0
             if prefix_len > 0:
                 paged_params = paged_kv_params_list[step_idx]
                 ws_paged = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
@@ -3320,8 +3320,8 @@ def test_cascade_interfaces_perf_with_cuda_graph(
         
         torch.cuda.synchronize()
 
-        # BE Cascade 性能测试 (CUDA Graph)
-        print(f"  [BE Cascade] 性能测试 (CUDA Graph)...")
+        # BE Cascade performance test (CUDA Graph)
+        print(f"  [BE Cascade] Performance test (CUDA Graph)...")
         
         def run_be_cascade_with_wrappers():
             for step_idx in range(num_steps):
@@ -3330,12 +3330,12 @@ def test_cascade_interfaces_perf_with_cuda_graph(
                 v = v_current_buffers[step_idx]
                 
                 if step_idx == 0:
-                    # 无 prefix，只需 ragged
+                    # No prefix, only ragged needed
                     be_output_buffers[step_idx].copy_(
                         be_ragged_wrappers[step_idx].run(q, k, v)
                     )
                 else:
-                    # 有 prefix: ragged + paged + merge
+                    # Has prefix: ragged + paged + merge
                     o1, s1 = be_ragged_wrappers[step_idx].run(q, k, v, return_lse=True)
                     be_lse_ragged[step_idx].copy_(s1)
                     
@@ -3378,12 +3378,12 @@ def test_cascade_interfaces_perf_with_cuda_graph(
         if be_no_cuda_graph_time > 0:
             cuda_graph_speedup = be_no_cuda_graph_time / be_cuda_graph_time
             if cuda_graph_speedup > 1:
-                print(f"    => CUDA Graph 加速: {cuda_graph_speedup:.2f}x")
+                print(f"    => CUDA Graph speedup: {cuda_graph_speedup:.2f}x")
             else:
-                print(f"    => CUDA Graph 无加速 (可能已被 kernel 时间主导)")
+                print(f"    => CUDA Graph no speedup (probably dominated by kernel time)")
 
-        # SG Cascade 性能测试 (CUDA Graph)
-        print(f"  [SG Cascade] 性能测试 (CUDA Graph)...")
+        # SG Cascade performance test (CUDA Graph)
+        print(f"  [SG Cascade] Performance test (CUDA Graph)...")
         
         def run_sg_cascade_with_wrappers():
             for step_idx in range(num_steps):
@@ -3392,12 +3392,12 @@ def test_cascade_interfaces_perf_with_cuda_graph(
                 v = v_current_buffers[step_idx]
                 
                 if step_idx == 0:
-                    # 无 prefix，只需 ragged
+                    # No prefix, only ragged needed
                     sg_output_buffers[step_idx].copy_(
                         sg_ragged_wrappers[step_idx].run(q, k, v)
                     )
                 else:
-                    # 有 prefix: ragged + paged + merge
+                    # Has prefix: ragged + paged + merge
                     o1, s1 = sg_ragged_wrappers[step_idx].run(q, k, v, return_lse=True)
                     sg_lse_ragged[step_idx].copy_(s1)
                     
@@ -3439,17 +3439,17 @@ def test_cascade_interfaces_perf_with_cuda_graph(
         if sg_no_cuda_graph_time > 0:
             cuda_graph_speedup = sg_no_cuda_graph_time / sg_cuda_graph_time
             if cuda_graph_speedup > 1:
-                print(f"    => CUDA Graph 加速: {cuda_graph_speedup:.2f}x")
+                print(f"    => CUDA Graph speedup: {cuda_graph_speedup:.2f}x")
             else:
-                print(f"    => CUDA Graph 无加速")
+                print(f"    => CUDA Graph no speedup")
         
-        # 对比 BE vs SG (CUDA Graph)
+        # Compare BE vs SG (CUDA Graph)
         if be_cuda_graph_time > 0 and sg_cuda_graph_time > 0:
             speedup = sg_cuda_graph_time / be_cuda_graph_time
             if speedup > 1:
-                print(f"  [对比] BE Cascade 快 {speedup:.2f}x (CUDA Graph)")
+                print(f"  [Comparison] BE Cascade is faster by {speedup:.2f}x (CUDA Graph)")
             else:
-                print(f"  [对比] SG Cascade 快 {1/speedup:.2f}x (CUDA Graph)")
+                print(f"  [Comparison] SG Cascade is faster by {1/speedup:.2f}x (CUDA Graph)")
         
         results[f"chunk{chunk_size}"] = {
             "chunk_size": chunk_size,
@@ -3461,15 +3461,15 @@ def test_cascade_interfaces_perf_with_cuda_graph(
             "speedup_be_over_sg_cuda_graph": sg_cuda_graph_time / be_cuda_graph_time if be_cuda_graph_time > 0 else 0,
         }
         
-        # 清理
+        # Cleanup
         del be_graph, sg_graph
         torch.cuda.empty_cache()
     
     # ================================================================
-    # 结果汇总
+    # Results summary
     # ================================================================
     print(f"\n{'='*90}")
-    print(f"结果汇总 (CUDA Graph 版本)")
+    print(f"Results Summary (CUDA Graph Version)")
     print(f"{'='*90}")
     
     print(f"\n{'chunk':>8} | {'steps':>6} | {'BE(cuda_graph)':>10} | {'BE(No)':>10} | {'SG(cuda_graph)':>10} | {'SG(No)':>10} | {'BE/SG':>8}")
@@ -3480,13 +3480,13 @@ def test_cascade_interfaces_perf_with_cuda_graph(
         print(f"{r['chunk_size']:>8} | {r['num_steps']:>6} | {r['be_cuda_graph_ms']:>8.3f}ms | {r['be_no_cuda_graph_ms']:>8.3f}ms | "
               f"{r['sg_cuda_graph_ms']:>8.3f}ms | {r['sg_no_cuda_graph_ms']:>8.3f}ms | {r['speedup_be_over_sg_cuda_graph']:>7.2f}x")
     
-    print(f"\n说明:")
+    print(f"\nNotes:")
     print(f"  - BE(cuda_graph): batch_block_extend Wrapper.run() with CUDA Graph")
     print(f"  - BE(No): batch_block_extend Wrapper.run() without CUDA Graph")
     print(f"  - SG(cuda_graph): sglang_style Wrapper.run() with CUDA Graph")
     print(f"  - SG(No): sglang_style Wrapper.run() without CUDA Graph")
-    print(f"  - BE/SG: BE 相对于 SG 的速度比 (>1 表示 BE 更快)")
-    print(f"  - CUDA Graph 优化: 预先 plan(), 只 capture run()")
+    print(f"  - BE/SG: Speed ratio of BE vs SG (>1 means BE is faster)")
+    print(f"  - CUDA Graph optimization: pre-plan(), only capture run()")
     
     return results
 
@@ -3496,19 +3496,19 @@ def test_heterogeneous_prefix_batch(
     backend: str = "fa2",
 ):
     """
-    异构 prefix 测试: 不同请求有不同的 prefix 长度
+    Heterogeneous prefix test: different requests have different prefix lengths
     
-    场景复现:
-      - Req 0: 已经 prefill 过，有 prefix (kv_len=128, q_offset=64)
-      - Req 1: 新请求，没有 prefix (kv_len=32, q_offset=0)
-      - 两个请求拼在一起传给 batch block-extend attention 算子
+    Scenario reproduction:
+      - Req 0: Already prefilled, has prefix (kv_len=128, q_offset=64)
+      - Req 1: New request, no prefix (kv_len=32, q_offset=0)
+      - Both requests concatenated together for batch block-extend attention operator
     
-    测试目的:
-      1. 验证算子是否支持异构 kv_len 输入
-      2. 检查是否有访存越界问题
-      3. 验证精度是否正确
+    Test purposes:
+      1. Verify whether operator supports heterogeneous kv_len input
+      2. Check for out-of-bounds memory access issues
+      3. Verify precision correctness
     
-    参考实现: 每个请求独立使用 custom_mask 计算，然后拼接
+    Reference implementation: Each request computed independently with custom_mask, then concatenated
     """
     from flashinfer.dllm import BatchBlockExtendRaggedOffsetWrapper
     from flashinfer.prefill import single_prefill_with_kv_cache
@@ -3518,27 +3518,27 @@ def test_heterogeneous_prefix_batch(
     tol = 1e-2
     
     print(f"\n{'='*100}")
-    print(f"异构 Prefix 测试: 不同请求有不同的 prefix 长度")
+    print(f"Heterogeneous Prefix Test: Different requests have different prefix lengths")
     print(f"{'='*100}")
-    print(f"测试后端: {backend}")
-    print(f"精度容差: {tol}")
+    print(f"Test backend: {backend}")
+    print(f"Precision tolerance: {tol}")
     
-    # 测试配置: 异构 prefix 场景
-    # 每个 config 是一个请求列表，每个请求有不同的 qo_len, kv_len, q_offset
+    # Test configuration: Heterogeneous prefix scenarios
+    # Each config is a list of requests, each request has different qo_len, kv_len, q_offset
     test_configs = [
-        # 场景 1: 一个有 prefix，一个没有
+        # Scenario 1: One with prefix, one without
         {
-            "name": "Req0(有prefix) + Req1(无prefix)",
+            "name": "Req0(has_prefix) + Req1(no_prefix)",
             "dllm_block_size": 32,
             "num_heads": 32,
             "num_kv_heads": 8,
             "head_dim": 128,
             "requests": [
-                {"qo_len": 64, "kv_len": 128, "q_offset": 64},  # Req0: step_2, 已有 64 tokens prefix
-                {"qo_len": 32, "kv_len": 32, "q_offset": 0},    # Req1: step_0, 无 prefix
+                {"qo_len": 64, "kv_len": 128, "q_offset": 64},  # Req0: step_2, already has 64 tokens prefix
+                {"qo_len": 32, "kv_len": 32, "q_offset": 0},    # Req1: step_0, no prefix
             ],
         },
-        # 场景 2: 三个请求，不同 step
+        # Scenario 2: Three requests, different steps
         {
             "name": "Req0(step_3) + Req1(step_0) + Req2(step_1)",
             "dllm_block_size": 32,
@@ -3551,7 +3551,7 @@ def test_heterogeneous_prefix_batch(
                 {"qo_len": 32, "kv_len": 64, "q_offset": 32},   # Req2: step_1
             ],
         },
-        # 场景 3: 两个请求，kv_len 差异更大
+        # Scenario 3: Two requests, larger kv_len difference
         {
             "name": "Req0(kv=256) + Req1(kv=32)",
             "dllm_block_size": 32,
@@ -3559,11 +3559,11 @@ def test_heterogeneous_prefix_batch(
             "num_kv_heads": 8,
             "head_dim": 128,
             "requests": [
-                {"qo_len": 32, "kv_len": 256, "q_offset": 224}, # Req0: 很长的 prefix
-                {"qo_len": 32, "kv_len": 32, "q_offset": 0},    # Req1: 无 prefix
+                {"qo_len": 32, "kv_len": 256, "q_offset": 224}, # Req0: very long prefix
+                {"qo_len": 32, "kv_len": 32, "q_offset": 0},    # Req1: no prefix
             ],
         },
-        # 场景 4: 两个请求，qo_len 也不同
+        # Scenario 4: Two requests, qo_len also different
         {
             "name": "Req0(qo=64,kv=128) + Req1(qo=32,kv=32)",
             "dllm_block_size": 32,
@@ -3575,9 +3575,9 @@ def test_heterogeneous_prefix_batch(
                 {"qo_len": 32, "kv_len": 32, "q_offset": 0},    # Req1
             ],
         },
-        # 场景 5: 四个请求，混合场景
+        # Scenario 5: Four requests, mixed scenario
         {
-            "name": "4个请求混合场景",
+            "name": "4_requests_mixed_scenario",
             "dllm_block_size": 64,
             "num_heads": 32,
             "num_kv_heads": 8,
@@ -3589,54 +3589,54 @@ def test_heterogeneous_prefix_batch(
                 {"qo_len": 64, "kv_len": 192, "q_offset": 128}, # Req3: step_2
             ],
         },
-        # 场景 6: 类似 SGLang batch 推理 - 长 prompt + 短 prompt
+        # Scenario 6: Similar to SGLang batch inference - long prompt + short prompt
         {
-            "name": "长短 prompt 混合(512 vs 32)",
+            "name": "Long_short_prompt_mix(512_vs_32)",
             "dllm_block_size": 32,
             "num_heads": 32,
             "num_kv_heads": 8,
             "head_dim": 128,
             "requests": [
-                {"qo_len": 512, "kv_len": 512, "q_offset": 0},  # Req0: 长 prompt (如数学题)
-                {"qo_len": 32, "kv_len": 32, "q_offset": 0},    # Req1: 短 prompt (如 "Say hello")
+                {"qo_len": 512, "kv_len": 512, "q_offset": 0},  # Req0: long prompt (e.g., math problem)
+                {"qo_len": 32, "kv_len": 32, "q_offset": 0},    # Req1: short prompt (e.g., "Say hello")
             ],
         },
-        # 场景 7: 极端差异 - 超长 vs 超短
+        # Scenario 7: Extreme difference - super long vs super short
         {
-            "name": "极端差异(1024 vs 16)",
+            "name": "Extreme_difference(1024_vs_16)",
             "dllm_block_size": 32,
             "num_heads": 32,
             "num_kv_heads": 8,
             "head_dim": 128,
             "requests": [
-                {"qo_len": 1024, "kv_len": 1024, "q_offset": 0}, # Req0: 超长 prompt
-                {"qo_len": 16, "kv_len": 16, "q_offset": 0},     # Req1: 超短 prompt
+                {"qo_len": 1024, "kv_len": 1024, "q_offset": 0}, # Req0: super long prompt
+                {"qo_len": 16, "kv_len": 16, "q_offset": 0},     # Req1: super short prompt
             ],
         },
-        # 场景 8: 三个请求，长度递增
+        # Scenario 8: Three requests, increasing lengths
         {
-            "name": "三个请求长度递增(64,256,512)",
+            "name": "Three_requests_increasing_length(64,256,512)",
             "dllm_block_size": 64,
             "num_heads": 32,
             "num_kv_heads": 8,
             "head_dim": 128,
             "requests": [
-                {"qo_len": 64, "kv_len": 64, "q_offset": 0},     # Req0: 短
-                {"qo_len": 256, "kv_len": 256, "q_offset": 0},   # Req1: 中
-                {"qo_len": 512, "kv_len": 512, "q_offset": 0},   # Req2: 长
+                {"qo_len": 64, "kv_len": 64, "q_offset": 0},     # Req0: short
+                {"qo_len": 256, "kv_len": 256, "q_offset": 0},   # Req1: medium
+                {"qo_len": 512, "kv_len": 512, "q_offset": 0},   # Req2: long
             ],
         },
-        # 场景 9: 混合 prefill 阶段 + 不同 prompt 长度
+        # Scenario 9: Mixed prefill stages + different prompt lengths
         {
-            "name": "混合prefill阶段+不同prompt长度",
+            "name": "Mixed_prefill_stages+different_prompt_lengths",
             "dllm_block_size": 32,
             "num_heads": 32,
             "num_kv_heads": 8,
             "head_dim": 128,
             "requests": [
-                {"qo_len": 32, "kv_len": 512, "q_offset": 480},  # Req0: 长 prompt, step_15
-                {"qo_len": 32, "kv_len": 32, "q_offset": 0},     # Req1: 短 prompt, step_0
-                {"qo_len": 32, "kv_len": 128, "q_offset": 96},   # Req2: 中 prompt, step_3
+                {"qo_len": 32, "kv_len": 512, "q_offset": 480},  # Req0: long prompt, step_15
+                {"qo_len": 32, "kv_len": 32, "q_offset": 0},     # Req1: short prompt, step_0
+                {"qo_len": 32, "kv_len": 128, "q_offset": 96},   # Req2: medium prompt, step_3
             ],
         },
     ]
@@ -3656,7 +3656,7 @@ def test_heterogeneous_prefix_batch(
         print(f"\n  [Test {cfg_idx:02d}] {cfg['name']}")
         print(f"           B={dllm_block_size}, heads={num_heads}/{num_kv_heads}, dim={head_dim}")
         
-        # 生成每个请求的数据
+        # Generate data for each request
         qs = []
         ks = []
         vs = []
@@ -3667,14 +3667,14 @@ def test_heterogeneous_prefix_batch(
             ks.append(torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device=device))
             vs.append(torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device=device))
         
-        # 参考实现: 每个请求独立计算
+        # Reference implementation: compute each request independently
         ref_outputs = []
         for req_idx, req in enumerate(requests):
             qo_len = req["qo_len"]
             kv_len = req["kv_len"]
             q_offset = req["q_offset"]
             
-            # 构造 custom_mask
+            # Build custom_mask
             q_pos = torch.arange(qo_len, device=device) + q_offset
             k_pos = torch.arange(kv_len, device=device)
             q_block = q_pos.unsqueeze(1) // dllm_block_size
@@ -3689,15 +3689,15 @@ def test_heterogeneous_prefix_batch(
             )
             ref_outputs.append(ref_output)
         
-        # 拼接参考输出
+        # Concatenate reference outputs
         ref_output_cat = torch.cat(ref_outputs, dim=0)
         
-        # 构造 batch 输入
+        # Build batch input
         q_cat = torch.cat(qs, dim=0)
         k_cat = torch.cat(ks, dim=0)
         v_cat = torch.cat(vs, dim=0)
         
-        # 构造 indptr
+        # Build indptr
         qo_lens = [req["qo_len"] for req in requests]
         kv_lens = [req["kv_len"] for req in requests]
         q_offsets_list = [req["q_offset"] for req in requests]
@@ -3711,7 +3711,7 @@ def test_heterogeneous_prefix_batch(
             print(f"           kv_indptr: {kv_indptr.tolist()}")
             print(f"           q_offsets: {q_offsets.tolist()}")
         
-        # 被测对象: BatchBlockExtendRaggedOffsetWrapper
+        # Object under test: BatchBlockExtendRaggedOffsetWrapper
         try:
             workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
             wrapper = BatchBlockExtendRaggedOffsetWrapper(
@@ -3729,7 +3729,7 @@ def test_heterogeneous_prefix_batch(
             )
             bbe_output = wrapper.run(q_cat, k_cat, v_cat)
             
-            # 计算精度差异
+            # Calculate precision differences
             max_diff = (bbe_output - ref_output_cat).abs().max().item()
             mean_diff = (bbe_output - ref_output_cat).abs().mean().item()
             passed = max_diff < tol
@@ -3739,7 +3739,7 @@ def test_heterogeneous_prefix_batch(
             
             if not passed:
                 all_pass = False
-                # 详细打印每个请求的差异
+                # Print detailed diff for each request
                 start_idx = 0
                 for req_idx, req in enumerate(requests):
                     qo_len = req["qo_len"]
@@ -3771,17 +3771,17 @@ def test_heterogeneous_prefix_batch(
         
         torch.cuda.empty_cache()
     
-    # 汇总
+    # Summary
     print(f"\n{'='*100}")
-    print(f"异构 Prefix 测试汇总")
+    print(f"Heterogeneous Prefix Test Summary")
     print(f"{'='*100}")
     
     passed_count = sum(1 for r in results if r["passed"])
     total_count = len(results)
-    print(f"  通过: {passed_count}/{total_count}")
+    print(f"  Passed: {passed_count}/{total_count}")
     
     if not all_pass:
-        print(f"\n  失败的测试:")
+        print(f"\n  Failed tests:")
         for r in results:
             if not r["passed"]:
                 if r["error"]:
@@ -3797,48 +3797,48 @@ def test_cascade_current_chunk_batch(
     backend: str = "fa2",
 ):
     """
-    测试完整的三阶段 Cascade Attention（模拟 SGLang DLLM 流程）
+    Test complete three-stage Cascade Attention (simulating SGLang DLLM flow)
     
-    三阶段流程:
-      Stage 1 (prefix): BatchBlockExtendRaggedOffsetWrapper 算 prefix
+    Three-stage flow:
+      Stage 1 (prefix): BatchBlockExtendRaggedOffsetWrapper computes prefix
         - K/V: [0, prefix_len)
         - kv_offset = 0
-      Stage 2 (current chunk): BatchBlockExtendRaggedOffsetWrapper 算当前 chunk
-        - K/V: [prefix_len, prefix_len + chunk_len)（只有当前 chunk）
+      Stage 2 (current chunk): BatchBlockExtendRaggedOffsetWrapper computes current chunk
+        - K/V: [prefix_len, prefix_len + chunk_len) (only current chunk)
         - kv_offset = prefix_len
       Stage 3 (merge): merge_state(o1, s1, o2, s2)
     
-    Mask 规则: mask[q, k] = (q_global // B) >= (k_global // B)
+    Mask rule: mask[q, k] = (q_global // B) >= (k_global // B)
     
-    关键点:
-      - Stage 2 的 K/V 不是从 0 开始，需要 kv_offset
-      - 使用 blockwise extend mask（不是 causal mask）
+    Key points:
+      - Stage 2's K/V doesn't start from 0, needs kv_offset
+      - Uses blockwise extend mask (not causal mask)
     """
     device = "cuda"
     dtype = torch.bfloat16
     tol = 0.01 if backend == "fa3" else 0.01
     
     print(f"\n{'='*100}")
-    print(f"三阶段 Cascade Attention 测试 (prefix + current_chunk + merge)")
+    print(f"Three-stage Cascade Attention Test (prefix + current_chunk + merge)")
     print(f"{'='*100}")
-    print(f"测试后端: {backend}")
-    print(f"精度容差: {tol}")
+    print(f"Test backend: {backend}")
+    print(f"Precision tolerance: {tol}")
     
-    # 测试配置: 每个请求有 prefix_len 和 chunk_len
+    # Test configuration: each request has prefix_len and chunk_len
     test_configs = [
-        # 场景 1: 两个请求，一个有 prefix，一个没有
+        # Scenario 1: Two requests, one with prefix, one without
         {
-            "name": "Req0(有prefix) + Req1(无prefix)",
+            "name": "Req0(has_prefix) + Req1(no_prefix)",
             "dllm_block_size": 32,
             "num_heads": 32,
             "num_kv_heads": 8,
             "head_dim": 128,
             "requests": [
                 {"prefix_len": 64, "chunk_len": 32},   # Req0: step_2, prefix [0,64), chunk [64,96)
-                {"prefix_len": 0, "chunk_len": 32},    # Req1: step_0, 无 prefix, chunk [0,32)
+                {"prefix_len": 0, "chunk_len": 32},    # Req1: step_0, no prefix, chunk [0,32)
             ],
         },
-        # 场景 2: 三个请求，不同 step
+        # Scenario 2: Three requests, different steps
         {
             "name": "Req0(step_3) + Req1(step_0) + Req2(step_1)",
             "dllm_block_size": 32,
@@ -3851,9 +3851,9 @@ def test_cascade_current_chunk_batch(
                 {"prefix_len": 32, "chunk_len": 32},   # Req2: step_1
             ],
         },
-        # 场景 3: 大 prefix
+        # Scenario 3: Large prefix
         {
-            "name": "Req0(大prefix=256) + Req1(无prefix)",
+            "name": "Req0(large_prefix=256) + Req1(no_prefix)",
             "dllm_block_size": 32,
             "num_heads": 32,
             "num_kv_heads": 8,
@@ -3863,7 +3863,7 @@ def test_cascade_current_chunk_batch(
                 {"prefix_len": 0, "chunk_len": 32},    # Req1: step_0
             ],
         },
-        # 场景 4: chunk_len != block_size
+        # Scenario 4: chunk_len != block_size
         {
             "name": "Req0(chunk=64) + Req1(chunk=32)",
             "dllm_block_size": 32,
@@ -3875,9 +3875,9 @@ def test_cascade_current_chunk_batch(
                 {"prefix_len": 0, "chunk_len": 32},    # Req1: 1 block chunk
             ],
         },
-        # 场景 5: 四个请求混合
+        # Scenario 5: Four requests mixed
         {
-            "name": "4个请求混合(step_0,1,2,3)",
+            "name": "4_requests_mixed(step_0,1,2,3)",
             "dllm_block_size": 64,
             "num_heads": 32,
             "num_kv_heads": 8,
@@ -3905,13 +3905,13 @@ def test_cascade_current_chunk_batch(
         print(f"\n  [Test {cfg_idx:02d}] {cfg['name']}")
         print(f"           B={dllm_block_size}, heads={num_heads}/{num_kv_heads}, dim={head_dim}")
         
-        # 生成每个请求的数据
-        # 每个请求有: Q(chunk_len), K_prefix(prefix_len), V_prefix(prefix_len), K_chunk(chunk_len), V_chunk(chunk_len)
-        qs = []           # Q: 当前 chunk 的 query
-        k_prefixes = []   # K_prefix: prefix 部分的 K
-        v_prefixes = []   # V_prefix: prefix 部分的 V
-        k_chunks = []     # K_chunk: 当前 chunk 的 K
-        v_chunks = []     # V_chunk: 当前 chunk 的 V
+        # Generate data for each request
+        # Each request has: Q(chunk_len), K_prefix(prefix_len), V_prefix(prefix_len), K_chunk(chunk_len), V_chunk(chunk_len)
+        qs = []           # Q: current chunk's query
+        k_prefixes = []   # K_prefix: K of prefix part
+        v_prefixes = []   # V_prefix: V of prefix part
+        k_chunks = []     # K_chunk: K of current chunk
+        v_chunks = []     # V_chunk: V of current chunk
         
         for req in requests:
             prefix_len = req["prefix_len"]
@@ -3926,14 +3926,14 @@ def test_cascade_current_chunk_batch(
             k_chunks.append(torch.randn(chunk_len, num_kv_heads, head_dim, dtype=dtype, device=device))
             v_chunks.append(torch.randn(chunk_len, num_kv_heads, head_dim, dtype=dtype, device=device))
         
-        # 参考实现: 每个请求独立计算（完整 KV + blockwise mask）
+        # Reference implementation: compute each request independently (full KV + blockwise mask)
         ref_outputs = []
         for req_idx, req in enumerate(requests):
             prefix_len = req["prefix_len"]
             chunk_len = req["chunk_len"]
             total_kv_len = prefix_len + chunk_len
             
-            # 拼接完整的 K/V
+            # Concatenate full K/V
             if prefix_len > 0:
                 k_full = torch.cat([k_prefixes[req_idx], k_chunks[req_idx]], dim=0)
                 v_full = torch.cat([v_prefixes[req_idx], v_chunks[req_idx]], dim=0)
@@ -3941,12 +3941,12 @@ def test_cascade_current_chunk_batch(
                 k_full = k_chunks[req_idx]
                 v_full = v_chunks[req_idx]
             
-            # 构造 blockwise extend mask
+            # Construct blockwise extend mask
             # Q: [prefix_len, prefix_len + chunk_len)
             # K: [0, prefix_len + chunk_len)
             q_offset = prefix_len
             q_pos = torch.arange(chunk_len, device=device) + q_offset
-            k_pos = torch.arange(total_kv_len, device=device)  # K 从 0 开始
+            k_pos = torch.arange(total_kv_len, device=device)  # K starts from 0
             q_block = q_pos.unsqueeze(1) // dllm_block_size
             k_block = k_pos.unsqueeze(0) // dllm_block_size
             mask_2d = (q_block >= k_block).to(torch.uint8)
@@ -3967,7 +3967,7 @@ def test_cascade_current_chunk_batch(
                 chunk_len = req["chunk_len"]
                 print(f"           Req{req_idx}: prefix_len={prefix_len}, chunk_len={chunk_len}, q_offset={prefix_len}, kv_offset={prefix_len}")
         
-        # 被测对象: 三阶段 Cascade Attention
+        # Target under test: three-stage Cascade Attention
         try:
             cascade_outputs = []
             workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
@@ -3979,11 +3979,11 @@ def test_cascade_current_chunk_batch(
                 
                 # Stage 1: prefix (if exists)
                 if prefix_len > 0:
-                    # 构造 prefix 的 indptr
+                    # Construct prefix indptr
                     prefix_qo_indptr = torch.tensor([0, chunk_len], dtype=torch.int32, device=device)
                     prefix_kv_indptr = torch.tensor([0, prefix_len], dtype=torch.int32, device=device)
-                    prefix_q_offsets = torch.tensor([prefix_len], dtype=torch.int32, device=device)  # Q 的全局位置
-                    prefix_kv_offsets = torch.tensor([0], dtype=torch.int32, device=device)  # prefix K/V 从 0 开始
+                    prefix_q_offsets = torch.tensor([prefix_len], dtype=torch.int32, device=device)  # Q's global position
+                    prefix_kv_offsets = torch.tensor([0], dtype=torch.int32, device=device)  # prefix K/V starts from 0
                     
                     prefix_wrapper = BatchBlockExtendRaggedOffsetWrapper(
                         workspace, kv_layout="NHD", dllm_block_size=dllm_block_size, backend=backend
@@ -4008,8 +4008,8 @@ def test_cascade_current_chunk_batch(
                 # Stage 2: current chunk
                 chunk_qo_indptr = torch.tensor([0, chunk_len], dtype=torch.int32, device=device)
                 chunk_kv_indptr = torch.tensor([0, chunk_len], dtype=torch.int32, device=device)
-                chunk_q_offsets = torch.tensor([prefix_len], dtype=torch.int32, device=device)   # Q 的全局位置
-                chunk_kv_offsets = torch.tensor([prefix_len], dtype=torch.int32, device=device)  # chunk K/V 的全局位置
+                chunk_q_offsets = torch.tensor([prefix_len], dtype=torch.int32, device=device)   # Q's global position
+                chunk_kv_offsets = torch.tensor([prefix_len], dtype=torch.int32, device=device)  # chunk K/V's global position
                 
                 chunk_wrapper = BatchBlockExtendRaggedOffsetWrapper(
                     workspace, kv_layout="NHD", dllm_block_size=dllm_block_size, backend=backend
@@ -4037,7 +4037,7 @@ def test_cascade_current_chunk_batch(
             
             cascade_output_cat = torch.cat(cascade_outputs, dim=0)
             
-            # 计算精度差异
+            # Compute precision difference
             max_diff = (cascade_output_cat - ref_output_cat).abs().max().item()
             mean_diff = (cascade_output_cat - ref_output_cat).abs().mean().item()
             passed = max_diff < tol
@@ -4074,17 +4074,17 @@ def test_cascade_current_chunk_batch(
         
         torch.cuda.empty_cache()
     
-    # 汇总
+    # Summary
     print(f"\n{'='*100}")
-    print(f"三阶段 Cascade Attention 测试汇总")
+    print(f"Three-stage Cascade Attention Test Summary")
     print(f"{'='*100}")
     
     passed_count = sum(1 for r in results if r["passed"])
     total_count = len(results)
-    print(f"  通过: {passed_count}/{total_count}")
+    print(f"  Passed: {passed_count}/{total_count}")
     
     if not all_pass:
-        print(f"\n  失败的测试:")
+        print(f"\n  Failed tests:")
         for r in results:
             if not r["passed"]:
                 if r["error"]:
@@ -4099,21 +4099,21 @@ def test_cascade_precision_alignment(
     verbose: bool = True,
 ):
     """
-    测试 block_extend_cascade 精度对齐（单请求版本）
+    Test block_extend_cascade precision alignment (single request version)
     
-    对比对象:
-      1. block_extend_cascade: 使用 block_extend_attention_with_offset (Current Chunk)
-      2. 参考实现: 使用 single_prefill_with_kv_cache(causal=True) (Current Chunk)
+    Comparison targets:
+      1. block_extend_cascade: uses block_extend_attention_with_offset (Current Chunk)
+      2. Reference implementation: uses single_prefill_with_kv_cache(causal=True) (Current Chunk)
     
-    当 chunk_size == dllm_block_size 时:
+    When chunk_size == dllm_block_size:
       - Causal mask ≡ Block Extend mask
-      - 两个实现的输出应该完全一致
+      - The outputs of both implementations should be completely consistent
     
-    测试覆盖:
-      1. 不同的 dllm_block_size: [32, 64, 128]
-      2. 不同的 num_steps (有/无 prefix)
-      3. 不同 head 配置 (MHA, GQA, MQA)
-      4. 不同 head_dim
+    Test coverage:
+      1. Different dllm_block_size: [32, 64, 128]
+      2. Different num_steps (with/without prefix)
+      3. Different head configurations (MHA, GQA, MQA)
+      4. Different head_dim
     """
     from flashinfer.dllm import block_extend_cascade
     from flashinfer.cascade import merge_state_in_place
@@ -4121,36 +4121,36 @@ def test_cascade_precision_alignment(
     
     device = torch.device("cuda:0")
     dtype = torch.float16
-    tol = 1e-2  # 精度容差
+    tol = 1e-2  # Precision tolerance
     
     print(f"\n{'='*100}")
-    print(f"单请求 Cascade 精度对齐测试: block_extend_cascade vs custom_mask 参考实现")
+    print(f"Single Request Cascade Precision Alignment Test: block_extend_cascade vs custom_mask Reference Implementation")
     print(f"{'='*100}")
-    print(f"测试条件: chunk_size == dllm_block_size")
-    print(f"注意: Block Extend mask != Causal mask (块内全可见，不是下三角)")
-    print(f"精度容差: {tol}")
+    print(f"Test condition: chunk_size == dllm_block_size")
+    print(f"Note: Block Extend mask != Causal mask (all visible within block, not lower triangular)")
+    print(f"Precision tolerance: {tol}")
     
-    # 测试配置
+    # Test configurations
     test_configs = [
-        # 基础测试: 不同 dllm_block_size
+        # Basic tests: different dllm_block_size
         {"dllm_block_size": 32, "num_steps": 4, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
         {"dllm_block_size": 64, "num_steps": 4, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
         {"dllm_block_size": 128, "num_steps": 2, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
         
-        # 更多 steps (更长序列)
+        # More steps (longer sequences)
         {"dllm_block_size": 32, "num_steps": 8, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
         {"dllm_block_size": 64, "num_steps": 8, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
         
-        # 不同 head 配置 (MHA, GQA, MQA)
+        # Different head configurations (MHA, GQA, MQA)
         {"dllm_block_size": 32, "num_steps": 4, "num_heads": 32, "num_kv_heads": 32, "head_dim": 128},  # MHA
         {"dllm_block_size": 32, "num_steps": 4, "num_heads": 32, "num_kv_heads": 4, "head_dim": 128},   # GQA-8
         {"dllm_block_size": 32, "num_steps": 4, "num_heads": 32, "num_kv_heads": 1, "head_dim": 128},   # MQA
         
-        # 不同 head_dim
+        # Different head_dim
         {"dllm_block_size": 32, "num_steps": 4, "num_heads": 32, "num_kv_heads": 8, "head_dim": 64},
         {"dllm_block_size": 32, "num_steps": 4, "num_heads": 16, "num_kv_heads": 4, "head_dim": 256},
         
-        # 边界测试: 单 step (无 prefix)
+        # Boundary tests: single step (no prefix)
         {"dllm_block_size": 32, "num_steps": 1, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
         {"dllm_block_size": 64, "num_steps": 1, "num_heads": 32, "num_kv_heads": 8, "head_dim": 128},
     ]
@@ -4164,11 +4164,11 @@ def test_cascade_precision_alignment(
         num_kv_heads = cfg["num_kv_heads"]
         head_dim = cfg["head_dim"]
         
-        chunk_size = dllm_block_size  # 关键: chunk_size == dllm_block_size
+        chunk_size = dllm_block_size  # Key: chunk_size == dllm_block_size
         tokens_per_request = num_steps * chunk_size
         sm_scale = 1.0 / math.sqrt(head_dim)
         
-        # 生成完整序列的测试数据
+        # Generate test data for full sequence
         q_full = torch.randn(tokens_per_request, num_heads, head_dim, dtype=dtype, device=device)
         k_full = torch.randn(tokens_per_request, num_kv_heads, head_dim, dtype=dtype, device=device)
         v_full = torch.randn(tokens_per_request, num_kv_heads, head_dim, dtype=dtype, device=device)
@@ -4188,7 +4188,7 @@ def test_cascade_precision_alignment(
             k_current = ks_chunks[step_idx]
             v_current = vs_chunks[step_idx]
             
-            # Prefix (之前所有 chunks 的 KV)
+            # Prefix (KV from all previous chunks)
             if step_idx > 0:
                 k_prefix = k_full[:step_idx * chunk_size]
                 v_prefix = v_full[:step_idx * chunk_size]
@@ -4196,7 +4196,7 @@ def test_cascade_precision_alignment(
                 k_prefix = None
                 v_prefix = None
 
-            # 被测: block_extend_cascade
+            # Target under test: block_extend_cascade
             be_out = block_extend_cascade(
                 q=q_current,
                 k_current=k_current,
@@ -4209,13 +4209,13 @@ def test_cascade_precision_alignment(
                 backend="fa2",
             )
 
-            # 参考: 使用 custom_mask 计算 Block Extend Attention
-            # 注意: Block Extend mask != Causal mask
+            # Reference: compute Block Extend Attention using custom_mask
+            # Note: Block Extend mask != Causal mask
             # Block Extend: mask[q,k] = ((q+offset)//B) >= (k//B)
-            # 当 chunk_size == dllm_block_size 时，chunk 内全可见（不是下三角）
+            # When chunk_size == dllm_block_size, all positions within chunk are visible (not lower triangular)
             prefix_len = step_idx * chunk_size
             if k_prefix is None:
-                # 无 prefix，直接使用 Block Extend mask
+                # No prefix, directly use Block Extend mask
                 ref_out = compute_block_extend_reference(
                     q_current, k_current, v_current,
                     dllm_block_size=dllm_block_size,
@@ -4223,14 +4223,14 @@ def test_cascade_precision_alignment(
                     sm_scale=sm_scale,
                 )
             else:
-                # 有 prefix: Current Chunk (Block Extend) + Prefix (全可见) + merge
-                # Current chunk: q_offset = prefix_len, kv 从 prefix_len 开始
+                # With prefix: Current Chunk (Block Extend) + Prefix (fully visible) + merge
+                # Current chunk: q_offset = prefix_len, kv starts from prefix_len
                 
-                # 构造 current chunk 的 Block Extend mask
+                # Construct Block Extend mask for current chunk
                 qo_len = q_current.shape[0]
                 kv_len = k_current.shape[0]
                 q_pos = torch.arange(qo_len, device=q_current.device) + prefix_len
-                k_pos = torch.arange(kv_len, device=q_current.device) + prefix_len  # kv 也从 prefix_len 开始
+                k_pos = torch.arange(kv_len, device=q_current.device) + prefix_len  # kv also starts from prefix_len
                 q_block = q_pos.unsqueeze(1) // dllm_block_size
                 k_block = k_pos.unsqueeze(0) // dllm_block_size
                 mask_current = (q_block >= k_block).to(torch.uint8)
@@ -4242,7 +4242,7 @@ def test_cascade_precision_alignment(
                     return_lse=True,
                 )
                 
-                # Prefix: q_offset = prefix_len, kv 从 0 开始 (全可见)
+                # Prefix: q_offset = prefix_len, kv starts from 0 (fully visible)
                 o2, s2 = single_prefill_with_kv_cache(
                     q_current, k_prefix, v_prefix,
                     causal=False,
@@ -4282,26 +4282,26 @@ def test_cascade_precision_alignment(
         torch.cuda.empty_cache()
 
     print(f"\n{'='*100}")
-    print(f"精度对齐测试汇总")
+    print(f"Precision Alignment Test Summary")
     print(f"{'='*100}")
     
     total_tests = len(results)
     pass_count = sum(1 for r in results if r["pass"])
     
-    print(f"\n  总测试数: {total_tests}")
-    print(f"  通过数:   {pass_count}/{total_tests} PASS")
+    print(f"\n  Total tests: {total_tests}")
+    print(f"  Passed:      {pass_count}/{total_tests} PASS")
     print(f"  max_diff (all tests): {max(r['max_diff'] for r in results):.6f}")
 
     failed = [r for r in results if not r["pass"]]
     if failed:
-        print(f"\n  [失败测试详情]")
+        print(f"\n  [Failed Test Details]")
         for r in failed:
             print(f"    Test {r['config_idx']:02d}: B={r['dllm_block_size']}, steps={r['num_steps']}, "
                   f"heads={r['num_heads']}/{r['num_kv_heads']}, dim={r['head_dim']}, max_diff={r['max_diff']:.6f}")
     
     overall_pass = all(r["pass"] for r in results)
     overall_status = "ALL TESTS PASSED" if overall_pass else "SOME TESTS FAILED"
-    print(f"\n  总体结果: {overall_status}")
+    print(f"\n  Overall Result: {overall_status}")
     
     return {
         "results": results,
@@ -4322,30 +4322,30 @@ def test_sglang_vs_block_extend_cascade(
     backend: str = "fa2",
 ):
     """
-    sglang_style_cascade_attention vs block_extend_cascade 精度和性能比对
+    sglang_style_cascade_attention vs block_extend_cascade precision and performance comparison
     
-    关键设计:
+    Key Design:
     ═══════════════════════════════════════════════════════════════════════════════
-    确保输入完全一致:
-      1. 使用相同的 Q, K_current, V_current 和 K_prefix, V_prefix 数据
-      2. sglang_style_cascade_attention: K_prefix/V_prefix 转换为 Paged KV Cache 格式
-      3. block_extend_cascade: K_prefix/V_prefix 使用连续存储格式
+    Ensure completely identical inputs:
+      1. Use the same Q, K_current, V_current and K_prefix, V_prefix data
+      2. sglang_style_cascade_attention: K_prefix/V_prefix converted to Paged KV Cache format
+      3. block_extend_cascade: K_prefix/V_prefix uses contiguous storage format
     
-    对比对象:
+    Comparison targets:
     ═══════════════════════════════════════════════════════════════════════════════
-      - sglang_style_cascade_attention (批量版本):
+      - sglang_style_cascade_attention (batch version):
         * Current Chunk: BatchPrefillWithRaggedKVCacheWrapper (causal=False)
         * Prefix: BatchPrefillWithPagedKVCacheWrapper (causal=False)
-        * 使用 Paged KV Cache 存储 prefix
+        * Uses Paged KV Cache to store prefix
     
-      - block_extend_cascade (单请求版本):
+      - block_extend_cascade (single request version):
         * Current Chunk: block_extend_attention_with_offset (Block Extend mask)
         * Prefix: single_prefill_with_kv_cache (causal=False)
-        * 使用连续内存存储 prefix
+        * Uses contiguous memory to store prefix
     
-    适用条件:
+    Applicable conditions:
     ═══════════════════════════════════════════════════════════════════════════════
-      chunk_size == dllm_block_size (此时 causal mask = block_extend mask)
+      chunk_size == dllm_block_size (when causal mask = block_extend mask)
     """
     from flashinfer.dllm import (
         sglang_style_cascade_attention,
@@ -4355,16 +4355,16 @@ def test_sglang_vs_block_extend_cascade(
     
     device = torch.device("cuda:0")
     dtype = torch.float16
-    tol = 1e-2  # 精度容差
+    tol = 1e-2  # Precision tolerance
     
-    chunk_size = dllm_block_size  # 关键: chunk_size == dllm_block_size
+    chunk_size = dllm_block_size  # Key: chunk_size == dllm_block_size
     tokens_per_request = num_steps * chunk_size
     sm_scale = 1.0 / math.sqrt(head_dim)
     
     print(f"\n{'='*100}")
-    print(f"sglang_style_cascade_attention vs block_extend_cascade 精度和性能比对")
+    print(f"sglang_style_cascade_attention vs block_extend_cascade Precision and Performance Comparison")
     print(f"{'='*100}")
-    print(f"配置:")
+    print(f"Configuration:")
     print(f"  num_steps           = {num_steps}")
     print(f"  dllm_block_size     = {dllm_block_size}")
     print(f"  chunk_size          = {chunk_size} (= dllm_block_size)")
@@ -4374,8 +4374,8 @@ def test_sglang_vs_block_extend_cascade(
     print(f"  head_dim            = {head_dim}")
     print(f"  page_size           = {page_size}")
     print(f"  backend             = {backend}")
-    print(f"  精度容差            = {tol}")
-    print(f"\n对比实现:")
+    print(f"  Precision tolerance = {tol}")
+    print(f"\nComparison implementations:")
     print(f"  sglang_style_cascade_attention: Ragged (causal=False) + Paged (causal=False) + merge_state")
     print(f"  block_extend_cascade:        BlockExtend (with offset) + single_prefill (causal=False) + merge_state")
 
@@ -4395,18 +4395,18 @@ def test_sglang_vs_block_extend_cascade(
 
     def create_paged_kv_cache_from_prefix(k_prefix, v_prefix, page_size):
         """
-        将连续的 K/V prefix 转换为 Paged KV Cache 格式
+        Convert contiguous K/V prefix to Paged KV Cache format
         
         Args:
             k_prefix: [prefix_len, num_kv_heads, head_dim]
             v_prefix: [prefix_len, num_kv_heads, head_dim]
-            page_size: 页大小
+            page_size: Page size
         
         Returns:
             paged_kv_cache: [num_pages, 2, page_size, num_kv_heads, head_dim]
             paged_kv_indptr: [2] - [0, num_pages]
             paged_kv_indices: [num_pages] - [0, 1, ..., num_pages-1]
-            paged_kv_last_page_len: [1] - 最后一页的有效长度
+            paged_kv_last_page_len: [1] - Valid length of last page
         """
         prefix_len = k_prefix.size(0)
         num_kv_heads = k_prefix.size(1)
@@ -4414,17 +4414,17 @@ def test_sglang_vs_block_extend_cascade(
         device = k_prefix.device
         dtype = k_prefix.dtype
         
-        # 计算需要的页数
+        # Calculate number of pages needed
         num_pages = (prefix_len + page_size - 1) // page_size
         last_page_len = prefix_len - (num_pages - 1) * page_size if num_pages > 0 else 0
         
-        # 创建 Paged KV Cache: [num_pages, 2, page_size, num_kv_heads, head_dim]
+        # Create Paged KV Cache: [num_pages, 2, page_size, num_kv_heads, head_dim]
         paged_kv_cache = torch.zeros(
             num_pages, 2, page_size, num_kv_heads, head_dim,
             dtype=dtype, device=device
         )
         
-        # 填充数据
+        # Fill data
         for page_idx in range(num_pages):
             start = page_idx * page_size
             end = min(start + page_size, prefix_len)
@@ -4443,7 +4443,7 @@ def test_sglang_vs_block_extend_cascade(
         return paged_kv_cache, paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len
 
     print(f"\n{'='*100}")
-    print(f"精度比对 (Step by Step)")
+    print(f"Precision Comparison (Step by Step)")
     print(f"{'='*100}")
     
     max_diff_all_steps = 0.0
@@ -4454,7 +4454,7 @@ def test_sglang_vs_block_extend_cascade(
         k_current = ks_chunks[step_idx]
         v_current = vs_chunks[step_idx]
         
-        # Prefix (之前所有 chunks 的 KV)
+        # Prefix (KV from all previous chunks)
         if step_idx > 0:
             k_prefix = k_full[:step_idx * chunk_size]
             v_prefix = v_full[:step_idx * chunk_size]
@@ -4474,12 +4474,12 @@ def test_sglang_vs_block_extend_cascade(
             backend=backend,
         )
 
-        # 构造 batch_size=1 的批量参数
+        # Construct batch_size=1 batch parameters
         qo_indptr = torch.tensor([0, chunk_size], dtype=torch.int32, device=device)
         kv_curr_indptr = torch.tensor([0, chunk_size], dtype=torch.int32, device=device)
         
         if k_prefix is not None:
-            # 将连续 prefix 转换为 Paged KV Cache 格式
+            # Convert contiguous prefix to Paged KV Cache format
             paged_kv_cache, paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len = \
                 create_paged_kv_cache_from_prefix(k_prefix, v_prefix, page_size)
             
@@ -4500,7 +4500,7 @@ def test_sglang_vs_block_extend_cascade(
                 backend=backend,
             )
         else:
-            # 无 prefix (第一个 chunk)
+            # No prefix (first chunk)
             sg_out = sglang_style_cascade_attention(
                 q=q_current,
                 k_current=k_current,
@@ -4518,7 +4518,7 @@ def test_sglang_vs_block_extend_cascade(
                 backend=backend,
             )
         
-        # 计算差异
+        # Compute difference
         step_diff = (be_out - sg_out).abs().max().item()
         step_diffs.append(step_diff)
         max_diff_all_steps = max(max_diff_all_steps, step_diff)
@@ -4529,12 +4529,12 @@ def test_sglang_vs_block_extend_cascade(
     
     precision_ok = max_diff_all_steps < tol
     status = "PASS" if precision_ok else "FAIL"
-    print(f"\n  [精度汇总] max_diff (all steps) = {max_diff_all_steps:.6f} [{status}]")
+    print(f"\n  [Precision Summary] max_diff (all steps) = {max_diff_all_steps:.6f} [{status}]")
     print(f"\n{'='*100}")
-    print(f"性能比对 (测量最后一个 Step: step={num_steps-1}, prefix_len={(num_steps-1)*chunk_size})")
+    print(f"Performance Comparison (measuring last Step: step={num_steps-1}, prefix_len={(num_steps-1)*chunk_size})")
     print(f"{'='*100}")
     
-    # 使用最后一个 step 进行性能测试 (prefix 最长)
+    # Use last step for performance testing (longest prefix)
     test_step = num_steps - 1
     q_current = qs_chunks[test_step]
     k_current = ks_chunks[test_step]
@@ -4543,7 +4543,7 @@ def test_sglang_vs_block_extend_cascade(
     v_prefix = v_full[:test_step * chunk_size]
     prefix_len = test_step * chunk_size
     
-    # 准备 Paged KV Cache (只创建一次)
+    # Prepare Paged KV Cache (create only once)
     paged_kv_cache, paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len = \
         create_paged_kv_cache_from_prefix(k_prefix, v_prefix, page_size)
     qo_indptr = torch.tensor([0, chunk_size], dtype=torch.int32, device=device)
@@ -4604,7 +4604,7 @@ def test_sglang_vs_block_extend_cascade(
     torch.cuda.synchronize()
     sg_time = (time_module.perf_counter() - start) / bench_iters * 1000
 
-    print(f"\n  测试参数: chunk_size={chunk_size}, prefix_len={prefix_len}")
+    print(f"\n  Test parameters: chunk_size={chunk_size}, prefix_len={prefix_len}")
     print(f"  block_extend_cascade:        {be_time:.3f} ms")
     print(f"  sglang_style_cascade_attention: {sg_time:.3f} ms")
     
@@ -4627,48 +4627,48 @@ def test_sglang_vs_block_extend_cascade(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Cascade vs Batch 对比测试")
-    parser.add_argument("--batch-prefill", action="store_true", help="多 Request Batch Prefill 对比 (chunk_size 可变)")
-    parser.add_argument("--step-by-step", action="store_true", help="真实分步执行对比 (模拟流水线依赖)")
-    parser.add_argument("--step-by-step-cuda_graph", action="store_true", help="真实分步执行对比 + CUDA Graph")
-    parser.add_argument("--single-req-cuda_graph", action="store_true", help="单请求分步执行 + CUDA Graph (流水线依赖)")
-    parser.add_argument("--fa2-fa3-be", action="store_true", help="FA2 vs FA3 BlockExtend vs Causal 性能对比")
-    parser.add_argument("--cascade-perf", action="store_true", help="Cascade 接口性能对比 (batch_block_extend_cascade vs sglang_style)")
-    parser.add_argument("--cascade-perf-cuda_graph", action="store_true", help="Cascade 接口性能对比 + CUDA Graph (预创建 Wrapper, 只 capture run)")
-    parser.add_argument("--cascade-precision", action="store_true", help="Cascade 接口精度对齐测试 (sglang_style vs block_extend)")
-    parser.add_argument("--sglang-vs-be", action="store_true", help="sglang_style_cascade vs block_extend_cascade 精度和性能比对 (输入相等)")
-    parser.add_argument("--heterogeneous-prefix", action="store_true", help="异构 prefix 测试: 不同请求有不同的 prefix 长度")
-    parser.add_argument("--cascade-chunk", action="store_true", help="Cascade Current Chunk 测试: K/V 只有当前 block，需要 kv_offset")
-    parser.add_argument("--tvm-ffi-slice-bug", action="store_true", help="TVM FFI 切片 tensor bug 复现测试")
-    parser.add_argument("--cuda_graph-reuse-bug", action="store_true", help="测试 CUDA Graph 模式下复用 wrapper 的 bug (暴露 q_offsets 地址变化问题)")
-    parser.add_argument("--precision-test", action="store_true", help="DLLM 组件精度测试 (与原生 Custom Mask FA2 对比)")
+    parser = argparse.ArgumentParser(description="Cascade vs Batch Comparison Test")
+    parser.add_argument("--batch-prefill", action="store_true", help="Multi Request Batch Prefill comparison (variable chunk_size)")
+    parser.add_argument("--step-by-step", action="store_true", help="Real step-by-step execution comparison (simulating pipeline dependencies)")
+    parser.add_argument("--step-by-step-cuda_graph", action="store_true", help="Real step-by-step execution comparison + CUDA Graph")
+    parser.add_argument("--single-req-cuda_graph", action="store_true", help="Single request step-by-step execution + CUDA Graph (pipeline dependencies)")
+    parser.add_argument("--fa2-fa3-be", action="store_true", help="FA2 vs FA3 BlockExtend vs Causal performance comparison")
+    parser.add_argument("--cascade-perf", action="store_true", help="Cascade interface performance comparison (batch_block_extend_cascade vs sglang_style)")
+    parser.add_argument("--cascade-perf-cuda_graph", action="store_true", help="Cascade interface performance comparison + CUDA Graph (pre-create Wrapper, only capture run)")
+    parser.add_argument("--cascade-precision", action="store_true", help="Cascade interface precision alignment test (sglang_style vs block_extend)")
+    parser.add_argument("--sglang-vs-be", action="store_true", help="sglang_style_cascade vs block_extend_cascade precision and performance comparison (equal inputs)")
+    parser.add_argument("--heterogeneous-prefix", action="store_true", help="Heterogeneous prefix test: different requests have different prefix lengths")
+    parser.add_argument("--cascade-chunk", action="store_true", help="Cascade Current Chunk test: K/V only has current block, requires kv_offset")
+    parser.add_argument("--tvm-ffi-slice-bug", action="store_true", help="TVM FFI slice tensor bug reproduction test")
+    parser.add_argument("--cuda_graph-reuse-bug", action="store_true", help="Test CUDA Graph mode wrapper reuse bug (exposes q_offsets address change issue)")
+    parser.add_argument("--precision-test", action="store_true", help="DLLM component precision test (compare with native Custom Mask FA2)")
     parser.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16", "all"], 
-                        help="精度测试的数据类型: fp16, bf16, 或 all (同时测试两者)")
-    parser.add_argument("--verbose", "-v", action="store_true", help="显示详细的 Step 流程预览信息")
+                        help="Data type for precision test: fp16, bf16, or all (test both)")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Show detailed Step flow preview information")
     parser.add_argument("--num_chunks", type=int, default=8)
-    parser.add_argument("--chunk_len", type=int, default=32, help="chunk 长度 (prefill seq_len)")
-    parser.add_argument("--dllm_block_size", type=int, default=None, help="DLLM block size (默认 = chunk_len)")
+    parser.add_argument("--chunk_len", type=int, default=32, help="Chunk length (prefill seq_len)")
+    parser.add_argument("--dllm_block_size", type=int, default=None, help="DLLM block size (default = chunk_len)")
     parser.add_argument("--num_heads", type=int, default=32)
     parser.add_argument("--num_kv_heads", type=int, default=8)
     parser.add_argument("--head_dim", type=int, default=128)
-    parser.add_argument("--total_tokens", type=int, default=256, help="总 token 数 (用于 fair/width 模式)")
-    parser.add_argument("--batch_size", type=int, default=8, help="batch size (用于 --multi 模式)")
-    parser.add_argument("--num_requests", type=int, default=4, help="request 数量")
-    parser.add_argument("--tokens_per_request", type=int, default=256, help="每个 request 的 tokens")
-    parser.add_argument("--kv_len", type=int, default=2048, help="总 tokens 数 (用于 --fa2-fa3-be 模式，即 tokens_per_request)")
-    parser.add_argument("--chunk_sizes", type=str, default="32,64,128,256,512", help="chunk sizes 列表，逗号分隔")
-    parser.add_argument("--backend", type=str, default="fa2", choices=["auto", "fa2", "fa3"], help="后端实现: auto/fa2/fa3")
+    parser.add_argument("--total_tokens", type=int, default=256, help="Total tokens (for fair/width mode)")
+    parser.add_argument("--batch_size", type=int, default=8, help="Batch size (for --multi mode)")
+    parser.add_argument("--num_requests", type=int, default=4, help="Number of requests")
+    parser.add_argument("--tokens_per_request", type=int, default=256, help="Tokens per request")
+    parser.add_argument("--kv_len", type=int, default=2048, help="Total tokens (for --fa2-fa3-be mode, i.e., tokens_per_request)")
+    parser.add_argument("--chunk_sizes", type=str, default="32,64,128,256,512", help="Chunk sizes list, comma separated")
+    parser.add_argument("--backend", type=str, default="fa2", choices=["auto", "fa2", "fa3"], help="Backend implementation: auto/fa2/fa3")
     args = parser.parse_args()
     
     dllm_bs = args.dllm_block_size if args.dllm_block_size is not None else args.chunk_len
     
     if args.fa2_fa3_be:
-        # FA2 vs FA3 BlockExtend vs Causal 性能对比 (增量 Prefill 场景)
+        # FA2 vs FA3 BlockExtend vs Causal performance comparison (incremental Prefill scenario)
         chunk_sizes = [int(x) for x in args.chunk_sizes.split(",")]
         test_fa2_fa3_block_extending_vs_causal(
             num_requests=args.num_requests,
             chunk_sizes=chunk_sizes,
-            tokens_per_request=args.kv_len,  # 使用 kv_len 参数作为 tokens_per_request
+            tokens_per_request=args.kv_len,  # Use kv_len parameter as tokens_per_request
             dllm_block_size=dllm_bs,
             num_heads=args.num_heads,
             num_kv_heads=args.num_kv_heads,
@@ -4676,7 +4676,7 @@ if __name__ == "__main__":
             verbose=args.verbose,
         )
     elif args.step_by_step_cuda_graph:
-        # 多请求真实分步执行对比 + CUDA Graph
+        # Multi-request real step-by-step execution comparison + CUDA Graph
         test_incremental_batchprefill_step_by_step_with_cuda_graph(
             num_requests=args.num_requests,
             tokens_per_request=args.tokens_per_request,
@@ -4686,7 +4686,7 @@ if __name__ == "__main__":
             verbose=args.verbose,
         )
     elif args.single_req_cuda_graph:
-        # 单请求分步执行 + CUDA Graph (流水线依赖)
+        # Single request step-by-step execution + CUDA Graph (pipeline dependencies)
         test_incremental_singlereq_prefill_step_by_step_with_cuda_graph(
             tokens_per_request=args.tokens_per_request,
             dllm_block_size=dllm_bs,
@@ -4697,14 +4697,14 @@ if __name__ == "__main__":
     elif args.precision_test:
         if args.dtype == "all":
             print("\n" + "="*120)
-            print("进行 FP16 精度测试...")
+            print("Running FP16 precision test...")
             print("="*120)
             test_dllm_precision_vs_custom_mask_fa2(
                 verbose=args.verbose,
                 test_dtypes=[torch.float16],
             )
             print("\n" + "="*120)
-            print("进行 BF16 精度测试...")
+            print("Running BF16 precision test...")
             print("="*120)
             test_dllm_precision_vs_custom_mask_fa2(
                 verbose=args.verbose,
@@ -4720,7 +4720,7 @@ if __name__ == "__main__":
                 test_dtypes=test_dtypes,
             )
     elif args.cascade_perf:
-        # 多请求，端到端性能测试，baseline 是 sglang_style_cascade_attention
+        # Multi-request end-to-end performance test, baseline is sglang_style_cascade_attention
         chunk_sizes = [int(x) for x in args.chunk_sizes.split(",")]
         test_cascade_interfaces_perf(
             num_requests=args.num_requests,
@@ -4734,7 +4734,7 @@ if __name__ == "__main__":
             backend=args.backend,
         )
     elif args.cascade_perf_cuda_graph:
-        # 多请求，开cuda graph 端到端性能测试，baseline 是 sglang_style_cascade_attention CUDA Graph
+        # Multi-request CUDA Graph end-to-end performance test, baseline is sglang_style_cascade_attention CUDA Graph
         chunk_sizes = [int(x) for x in args.chunk_sizes.split(",")]
         test_cascade_interfaces_perf_with_cuda_graph(
             num_requests=args.num_requests,
@@ -4748,12 +4748,12 @@ if __name__ == "__main__":
             backend=args.backend,
         )
     elif args.cascade_precision:
-        # 纯精度测试，验证 block_extend_cascade 与 sglang_style_cascade_attention 的数值一致性
+        # Pure precision test, verify numerical consistency between block_extend_cascade and sglang_style_cascade_attention
         test_cascade_precision_alignment(
             verbose=args.verbose,
         )
     elif args.sglang_vs_be:
-        # 单请求测试cascade 性能测试，baseline 是 sglang_style_cascade_attention
+        # Single request cascade performance test, baseline is sglang_style_cascade_attention
         num_steps = args.tokens_per_request // dllm_bs
         test_sglang_vs_block_extend_cascade(
             num_steps=num_steps,
@@ -4765,7 +4765,7 @@ if __name__ == "__main__":
             backend=args.backend,
         )
     elif args.heterogeneous_prefix:
-        # 异构 prefix 测试：不同请求有不同的 prefix 长度
+        # Heterogeneous prefix test: different requests have different prefix lengths
         for be in ["fa2", "fa3"]:
             test_heterogeneous_prefix_batch(
                 verbose=args.verbose,
@@ -4773,7 +4773,7 @@ if __name__ == "__main__":
             )
         
     elif args.cascade_chunk:
-        # Cascade Current Chunk 测试：K/V 只有当前 block，需要 kv_offset
+        # Cascade Current Chunk test: K/V only has current block, requires kv_offset
         for be in ["fa2", "fa3"]:
             test_cascade_current_chunk_batch(
                 verbose=args.verbose,

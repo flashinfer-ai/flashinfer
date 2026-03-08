@@ -29,6 +29,10 @@ Array<int64_t> BatchMLAPagedAttentionPlan(TensorView float_workspace_buffer,
                                           TensorView qo_indptr, TensorView kv_indptr,
                                           TensorView kv_len, int64_t num_heads, int64_t head_dim_o,
                                           bool causal) {
+  CHECK_INPUT_TYPE(qo_indptr, dl_int32);
+  CHECK_INPUT_TYPE(kv_indptr, dl_int32);
+  CHECK_INPUT_TYPE(kv_len, dl_int32);
+
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * get_element_size(float_workspace_buffer);
   size_t int_workspace_size_in_bytes =
@@ -38,7 +42,7 @@ Array<int64_t> BatchMLAPagedAttentionPlan(TensorView float_workspace_buffer,
 
   int batch_size = kv_len.size(0);
 
-  cudaSetDevice(float_workspace_buffer.device().device_id);
+  ffi::CUDADeviceGuard device_guard(float_workspace_buffer.device().device_id);
   const cudaStream_t stream = get_stream(float_workspace_buffer.device());
 
   cudaError_t status =

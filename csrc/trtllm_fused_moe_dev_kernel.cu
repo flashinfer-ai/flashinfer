@@ -78,7 +78,8 @@ __global__ void activationKernel(KernelParams params) {
       // Loop over hidden dim
       for (int hiddenIdx = threadIdx.x + blockDim.x * blockIdx.x; hiddenIdx < params.innerDim / 2;
            hiddenIdx += blockDim.x * gridDim.x) {
-        int const baseIdx = permutedIdx * params.innerDim + hiddenIdx;
+        // Use int64_t to avoid overflow when permutedIdx * innerDim > INT32_MAX
+        int64_t const baseIdx = (int64_t)permutedIdx * params.innerDim + hiddenIdx;
 
         float x1 = (float)params.inPtr[baseIdx];
         float x2 = (float)params.inPtr[baseIdx + params.innerDim / 2];
@@ -86,7 +87,7 @@ __global__ void activationKernel(KernelParams params) {
         float act = silu(x2);
         Type out = (Type)(act * x1);
 
-        int const outIdx = permutedIdx * (params.innerDim / 2) + hiddenIdx;
+        int64_t const outIdx = (int64_t)permutedIdx * (params.innerDim / 2) + hiddenIdx;
         params.outPtr[outIdx] = out;
       }
     }
@@ -196,6 +197,8 @@ struct KernelTraits<1> {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+constexpr int DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA = 128;
+
 template <typename KernelParams>
 __global__ void activationDeepSeekKernel(KernelParams params) {
   using Type = typename KernelParams::Type;
@@ -203,7 +206,7 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
   using KernelTraits = KernelTraits<NumTokensPerCta>;
   using MaxOp = typename KernelTraits::MaxOp;
   using PackedType = typename KernelTraits::PackedType;
-  using BlockReduce = cub::BlockReduce<PackedType, 128>;
+  using BlockReduce = cub::BlockReduce<PackedType, DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA>;
 
   __shared__ float s_scaleOutArr[NumTokensPerCta];
   __shared__ typename BlockReduce::TempStorage tempStorage;
@@ -237,6 +240,15 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
            hiddenIdx += blockDim.x * gridDim.x) {
 #pragma unroll
         for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
+          scale1Arr[tokenInCtaIdx] = 0.0f;
+          scale2Arr[tokenInCtaIdx] = 0.0f;
+          dataX1Arr[tokenInCtaIdx] = 0.0f;
+          dataX2Arr[tokenInCtaIdx] = 0.0f;
+          outArr[tokenInCtaIdx] = 0.0f;
+          absOutArr[tokenInCtaIdx] = 0.0f;
+        }
+#pragma unroll
+        for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
           int const tokenIdx = tokenCtaIdx + tokenInCtaIdx;
           if (tokenIdx >= params.numTokens) {
             break;
@@ -250,11 +262,14 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
           }
 
           // Process blocks for this CTA
-          int const baseIdx = permutedIdx * params.innerDim + hiddenIdx;
+          // Use int64_t to avoid overflow when permutedIdx * innerDim > INT32_MAX
+          int64_t const baseIdx = (int64_t)permutedIdx * params.innerDim + hiddenIdx;
 
-          int const scale1Idx = permutedIdx + totalNumPaddedTokens * (hiddenIdx / 128);
-          int const scale2Idx = permutedIdx + totalNumPaddedTokens *
-                                                  ((hiddenIdx / 128) + (params.innerDim / 2 / 128));
+          int64_t const scale1Idx =
+              (int64_t)permutedIdx + (int64_t)totalNumPaddedTokens * (hiddenIdx / 128);
+          int64_t const scale2Idx =
+              (int64_t)permutedIdx +
+              (int64_t)totalNumPaddedTokens * ((hiddenIdx / 128) + (params.innerDim / 2 / 128));
 
           scale1Arr[tokenInCtaIdx] = params.inDqSfsPtr[scale1Idx];
           scale2Arr[tokenInCtaIdx] = params.inDqSfsPtr[scale2Idx];
@@ -288,10 +303,14 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
             if (permutedIdx == -1) {
               continue;
             }
-            s_scaleOutArr[tokenInCtaIdx] = aMaxArr[tokenInCtaIdx] / E4m3MaxVal;
-            int const scaleOut_idx =
-                permutedIdxArr[tokenInCtaIdx] + totalNumPaddedTokens * (hiddenIdx / 128);
-            params.outDqSfsPtr[scaleOut_idx] = aMaxArr[tokenInCtaIdx] / E4m3MaxVal;
+            // Make sure the scale is strictly positive to avoid division by zero in case the
+            // maximum is zero.
+            float scaleOut =
+                fmaxf(aMaxArr[tokenInCtaIdx] / E4m3MaxVal, std::numeric_limits<float>::min());
+            s_scaleOutArr[tokenInCtaIdx] = scaleOut;
+            int64_t const scaleOut_idx = (int64_t)permutedIdxArr[tokenInCtaIdx] +
+                                         (int64_t)totalNumPaddedTokens * (hiddenIdx / 128);
+            params.outDqSfsPtr[scaleOut_idx] = scaleOut;
           }
         }
         __syncthreads();
@@ -307,7 +326,7 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
             continue;
           }
           float const scaleOut = s_scaleOutArr[tokenInCtaIdx];
-          int const outIdx = permutedIdx * (params.innerDim / 2) + hiddenIdx;
+          int64_t const outIdx = (int64_t)permutedIdx * (params.innerDim / 2) + hiddenIdx;
           params.outPtr[outIdx] = static_cast<Type>(outArr[tokenInCtaIdx] / scaleOut);
         }
       }
@@ -328,7 +347,6 @@ void run(Data const& data, void* stream) {
   if (data.mUseDeepSeekFp8) {
     constexpr int NUM_ELTS_PER_LOAD = 1;
     constexpr int NUM_ELTS_PER_SF = 128;
-    int const NUM_THREADS_PER_CTA = 128;
 
     int device{-1};
     cudaGetDevice(&device);
@@ -355,8 +373,8 @@ void run(Data const& data, void* stream) {
 
     const dim3 grid(gridSizeX, gridSizeY, data.topK);
 
-    LAUNCH_ACTIVATION(data, activationDeepSeekKernel, numTokensPerCta, grid, NUM_THREADS_PER_CTA, 0,
-                      stream);
+    LAUNCH_ACTIVATION(data, activationDeepSeekKernel, numTokensPerCta, grid,
+                      DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA, 0, stream);
   } else {
     int const numThreads = 256;
     const dim3 grid(data.innerDim / 128, data.topK, data.numTokens);

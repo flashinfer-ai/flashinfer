@@ -4,6 +4,7 @@ from typing import Optional, Tuple
 
 import torch
 
+from .api_logging import flashinfer_api
 from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
 from .utils import (
     device_support_pdl,
@@ -142,6 +143,7 @@ def get_mxfp8_quantization_sm100_module():
     )
 
 
+@flashinfer_api
 def mxfp8_quantize(
     input: torch.Tensor,
     is_sf_swizzled_layout: bool = True,
@@ -178,6 +180,7 @@ def mxfp8_quantize(
     return x_q, sf
 
 
+@flashinfer_api
 def mxfp8_dequantize_host(
     input: torch.Tensor,
     scale_tensor: torch.Tensor,

@@ -129,8 +129,15 @@ class ProbsTopKOp(ParameterizedOp):
         ):
             raise ValueError("top_k must be a positive integer or a tensor array")
 
+        # Allocate row_states buffer for multi-CTA kernel (1MB is enough for any GPU)
+        row_states_buffer = _get_cache_buf(
+            f"top_k_renorm_probs_row_states_{tensor.data.device}",
+            1024 * 1024,
+            tensor.data.device,
+            zero_init=True,
+        )
         renorm_probs = get_sampling_module().top_k_renorm_probs(
-            tensor.data, maybe_top_k_arr, top_k_val
+            tensor.data, maybe_top_k_arr, top_k_val, row_states_buffer
         )
 
         return TaggedTensor(renorm_probs, output_type)
@@ -168,8 +175,15 @@ class LogitsTopKOp(ParameterizedOp):
         ):
             raise ValueError("top_k must be a positive integer or a tensor array")
 
+        # Allocate row_states buffer for multi-CTA kernel (1MB is enough for any GPU)
+        row_states_buffer = _get_cache_buf(
+            f"top_k_mask_logits_row_states_{tensor.data.device}",
+            1024 * 1024,
+            tensor.data.device,
+            zero_init=True,
+        )
         masked_logits = get_sampling_module().top_k_mask_logits(
-            tensor.data, maybe_top_k_arr, top_k_val
+            tensor.data, maybe_top_k_arr, top_k_val, row_states_buffer
         )
         return TaggedTensor(masked_logits, output_type)
 

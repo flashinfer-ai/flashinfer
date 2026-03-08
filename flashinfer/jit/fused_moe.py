@@ -26,7 +26,7 @@ from .core import (
     sm89_nvcc_flags,
 )
 from .cpp_ext import is_cuda_version_at_least
-from .cubin_loader import get_cubin, get_meta_hash
+from .cubin_loader import get_cubin, get_meta_hash, download_trtllm_headers
 from .gemm.cutlass.generate_kernels import generate_gemm_operations
 
 
@@ -111,9 +111,10 @@ def gen_cutlass_fused_moe_module(
     """
     Generate a JitSpec for the cutlass fused moe module.
     """
+    # Use FLASHINFER_GEN_SRC_DIR (user's writable cache) instead of FLASHINFER_CSRC_DIR
+    # (package directory which may be read-only after installation)
     output_dir = (
-        jit_env.FLASHINFER_CSRC_DIR
-        / f"nv_internal/tensorrt_llm/cutlass_instantiations/{device_arch}"
+        jit_env.FLASHINFER_GEN_SRC_DIR / f"cutlass_instantiations/{device_arch}"
     )
 
     try:
@@ -164,7 +165,9 @@ def gen_cutlass_fused_moe_module(
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_sm100_binding.cu",
+            / "fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "fused_moe/cutlass_backend/deepgemm_jit_setup.cu",
             jit_env.FLASHINFER_CSRC_DIR
             / "fused_moe/cutlass_backend/cutlass_fused_moe_instantiation.cu",
             # Add all generated kernels
@@ -203,6 +206,8 @@ def gen_cutlass_fused_moe_module(
             / "tensorrt_llm"
             / "kernels"
             / "cutlass_kernels",
+            # Include the generated output directory for header files
+            output_dir,
         ],
     )
 
@@ -227,6 +232,19 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
     )
     # make sure "flashinferMetaInfo.h" is downloaded or cached
     assert metainfo, f"{header_name}.h not found"
+
+    header_path = f"{include_path}/trtllmGen_bmm_export"
+    header_dest_dir = (
+        jit_env.FLASHINFER_CUBIN_DIR
+        / "flashinfer"
+        / "trtllm"
+        / "batched_gemm"
+        / "trtllmGen_bmm_export"
+    )
+
+    download_trtllm_headers(
+        "bmm", header_dest_dir, header_path, ArtifactPath.TRTLLM_GEN_BMM, checksum
+    )
 
     # currently only support Blackwell
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
@@ -260,7 +278,7 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
         ]
         + nvcc_flags,
         extra_include_paths=[
-            # link "include" sub-directory in cache
+            jit_env.FLASHINFER_CUBIN_DIR,
             jit_env.FLASHINFER_CUBIN_DIR / include_path,
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/include",

@@ -1,13 +1,13 @@
 """
 Batch Block Extend Attention for DLLM (Diffusion LLM)
 
-Block Extend Mask 规则:
+Block Extend Mask Rules:
   q_global = q_offset + q_idx
   kv_global = kv_offset + kv_idx
   mask[q, k] = (q_global / dllm_block_size) >= (kv_global / dllm_block_size)
-  同一 block 内双向可见，可以看见之前的 blocks，不能看见后续 blocks
+  Bidirectional visibility within the same block, can see previous blocks, cannot see subsequent blocks
 
-使用方法:
+Usage:
     from flashinfer.dllm import BatchBlockExtendRaggedOffsetWrapper
         wrapper = BatchBlockExtendRaggedOffsetWrapper(workspace, kv_layout="NHD", dllm_block_size=32)
     wrapper.plan(qo_indptr, kv_indptr, num_heads, num_kv_heads, head_dim)
@@ -32,7 +32,7 @@ from ..utils import MaskMode
 
 
 def check_jit_environment() -> dict:
-    """检查 JIT 编译环境是否正常"""
+    """Check if JIT compilation environment is working properly"""
     results = {
         "tvm_ffi_ok": False,
         "device_guard_ok": False,
@@ -65,7 +65,7 @@ def check_jit_environment() -> dict:
 
 
 def check_kernel_availability(uri: str) -> tuple:
-    """检查指定 kernel 的可用性"""
+    """Check availability of specified kernel"""
     aot_path = jit_env.FLASHINFER_AOT_DIR / uri / f"{uri}.so"
     aot_available = aot_path.exists()
     
@@ -80,7 +80,7 @@ def check_kernel_availability(uri: str) -> tuple:
 
 
 def select_best_backend(head_dim: int, dtype: torch.dtype, preferred_backend: str = "auto", device: torch.device = None) -> str:
-    """根据 kernel 可用性和计算能力选择 backend"""
+    """Select backend based on kernel availability and compute capability"""
     from ..utils import is_sm90a_supported
     
     base_uri = _get_batch_be_module_uri(head_dim, dtype)
@@ -128,7 +128,7 @@ def select_best_backend(head_dim: int, dtype: torch.dtype, preferred_backend: st
 
 
 def select_best_backend_paged(head_dim: int, dtype: torch.dtype, preferred_backend: str = "auto", device: torch.device = None) -> str:
-    """根据 Paged kernel 可用性和计算能力选择 backend"""
+    """Select backend based on Paged kernel availability and compute capability"""
     from ..utils import is_sm90a_supported
     
     base_uri = _get_batch_be_module_uri(head_dim, dtype)

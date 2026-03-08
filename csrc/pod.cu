@@ -133,7 +133,7 @@ void pod_with_kv_cache_tensor(
   }
   kv_cache_strides_d = k_strides_d.data();
 
-  cudaSetDevice(float_workspace_buffer_d.device().device_id);
+  ffi::CUDADeviceGuard device_guard(float_workspace_buffer_d.device().device_id);
   const cudaStream_t stream = get_stream(float_workspace_buffer_d.device());
 
   DISPATCH_context(

@@ -19,10 +19,12 @@ from typing import Optional, Tuple, Union
 
 import torch
 
+from .api_logging import flashinfer_api
 from .jit.page import gen_page_module
 from .utils import (
     TensorLayout,
     _check_kv_layout,
+    check_shape_dtype_device,
     _unpack_paged_kv_cache,
     register_custom_op,
     register_fake_op,
@@ -32,42 +34,6 @@ from .utils import (
 @functools.cache
 def get_page_module():
     return gen_page_module().build_and_load()
-
-
-def block_sparse_indices_to_vector_sparse_offsets(
-    block_sparse_indices: torch.Tensor,
-    block_sparse_indptr: torch.Tensor,
-    vector_sparse_offsets: torch.Tensor,
-    vector_sparse_indptr: torch.Tensor,
-    kv_lens: torch.Tensor,
-    stride_block: int,
-    stride_n: int,
-    block_size: int,
-) -> torch.Tensor:
-    if block_size == 1:
-        if stride_block == 1:
-            return block_sparse_indices
-        else:
-            return block_sparse_indices * stride_block
-
-    assert block_sparse_indices.dtype == torch.int32
-    assert block_sparse_indptr.dtype == torch.int32
-    assert vector_sparse_offsets.dtype == torch.int32
-    assert vector_sparse_indptr.dtype == torch.int32
-    assert kv_lens.dtype == torch.int32
-    batch_size = block_sparse_indptr.size(0) - 1
-    get_page_module().block_sparse_indices_to_vector_sparse_offsets(
-        block_sparse_indices,
-        block_sparse_indptr,
-        vector_sparse_offsets,
-        vector_sparse_indptr,
-        kv_lens,
-        stride_block,
-        stride_n,
-        batch_size,
-        block_size,
-    )
-    return vector_sparse_offsets
 
 
 @register_custom_op(
@@ -154,8 +120,13 @@ def _fake_append_paged_kv_cache_kernel(
     pass
 
 
+@flashinfer_api
 def get_batch_indices_positions(
-    append_indptr: torch.Tensor, seq_lens: torch.Tensor, nnz: int
+    append_indptr: torch.Tensor,
+    seq_lens: torch.Tensor,
+    nnz: int,
+    batch_indices: Optional[torch.Tensor] = None,
+    positions: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Convert append indptr and sequence lengths to batch indices and positions.
 
@@ -167,6 +138,10 @@ def get_batch_indices_positions(
         The sequence lengths of each request in the KV-Cache, shape: ``[batch_size]``.
     nnz : int
         The number of entries in the ragged tensor.
+    batch_indices : Optional[torch.Tensor]
+        Pre-allocated output tensor for batch_indices. If ``None``, allocated automatically.
+    positions : Optional[torch.Tensor]
+        Pre-allocated output tensor for positions. If ``None``, allocated automatically.
 
     Returns
     -------
@@ -199,8 +174,19 @@ def get_batch_indices_positions(
     append_paged_kv_cache
     """
     batch_size = append_indptr.size(0) - 1
-    batch_indices = torch.empty((nnz,), device=append_indptr.device, dtype=torch.int32)
-    positions = torch.empty((nnz,), device=append_indptr.device, dtype=torch.int32)
+    device = append_indptr.device
+    dtype = torch.int32
+
+    if batch_indices is None:
+        batch_indices = torch.empty((nnz,), device=device, dtype=dtype)
+    else:
+        check_shape_dtype_device(batch_indices, (nnz,), dtype, device, "batch_indices")
+
+    if positions is None:
+        positions = torch.empty((nnz,), device=device, dtype=dtype)
+    else:
+        check_shape_dtype_device(positions, (nnz,), dtype, device, "positions")
+
     from .triton.page import get_batch_indices_positions_kernel
 
     get_batch_indices_positions_kernel[(batch_size,)](
@@ -235,6 +221,7 @@ def get_seq_lens(
     )
 
 
+@flashinfer_api
 def append_paged_mla_kv_cache(
     append_ckv: torch.Tensor,
     append_kpe: torch.Tensor,
@@ -284,6 +271,7 @@ def append_paged_mla_kv_cache(
     )
 
 
+@flashinfer_api
 def append_paged_kv_cache(
     append_key: torch.Tensor,
     append_value: torch.Tensor,

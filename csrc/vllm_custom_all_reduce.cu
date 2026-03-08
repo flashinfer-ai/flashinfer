@@ -66,7 +66,7 @@ bool _is_weak_contiguous(TensorView t) {
 void all_reduce(fptr_t _fa, TensorView inp, TensorView out, fptr_t _reg_buffer,
                 int64_t reg_buffer_sz_bytes, int64_t num_ctas) {
   auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
-  cudaSetDevice(inp.device().device_id);
+  ffi::CUDADeviceGuard device_guard(inp.device().device_id);
   auto stream = get_stream(inp.device());
 
   TVM_FFI_ICHECK_EQ(inp.dtype(), out.dtype());

@@ -32,6 +32,36 @@
 #include "fmhaRunnerParams.h"
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+//
+// CCCL >= 3.1.0 (CUDA CTK 13.1) introduces the fast_mod_div math operations.
+// The following code makes sure that the host initialization works with older CUDA CTK versions.
+//
+
+// Refer to
+// https://github.com/NVIDIA/cccl/blob/main/libcudacxx/include/cuda/__cmath/fast_modulo_division.h#L76-L81
+// about how to compute the fast modulo division.
+struct FastModDivInt32 {
+ public:
+  FastModDivInt32(int32_t divisor) : mDivisor(divisor) {
+    mShift = std::max(ceilLog2(mDivisor) - 1, 0);
+    mMultiplier = static_cast<uint32_t>(
+        flashinfer::ceil_div(uint64_t(1) << (32 + mShift), static_cast<uint64_t>(mDivisor)));
+  }
+
+ private:
+  int32_t ceilLog2(int32_t value) const {
+    return static_cast<int32_t>(std::ceil(std::log2(value)));
+  }
+
+ private:
+  int32_t mDivisor = 1;
+  uint32_t mMultiplier = 0;
+  uint32_t mAdd = 0;
+  int32_t mShift = 0;
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 using Dtype = Data_type;
 
 struct KernelParams {
@@ -104,8 +134,12 @@ struct KernelParams {
   // The sequence lengths for K/V. Required by pagedKv kernels to avoid unnecessary computation
   // based on (ptrCumSeqLensKv[batchIdx + 1] - ptrCumSeqLensKv[batchIdx]).
   int32_t const* ptrSeqLensKv;
-  // The reserved memory buffer.
-  int32_t* ptrReservedMem;
+  // When collecting skip softmax stats, store them here
+  // Note that softmax and BMM2 are skipped at different granularity (warp vs tile)
+  // [0] -> skipped softmax warp blocks; [1] -> total softmax warp blocks.
+  // [2] -> skipped BMM2s; [3] -> total BMM2s.
+  int32_t* ptrSkipSoftmaxStats;
+
   // The softmax stats buffer.
   float2* ptrSoftmaxStats;
 
@@ -115,6 +149,9 @@ struct KernelParams {
   int32_t mBatchSize;
   // The chunked attention size in log2.
   int32_t mChunkedAttentionSizeLog2;
+  // The factor to add to the maximum value to increase the probability
+  //   of skip correction during next iterations.
+  float mInflateMax;
   // The log of the Sage Attention block size for K.
   int32_t mLogNumEltsPerSageAttnBlkK;
   // The log of the Sage Attention block size for P.
@@ -137,10 +174,14 @@ struct KernelParams {
   int32_t mNumHeadsQ;
   // The number of Q heads per K/V head (i.e. mNumHeadsQ / mNumHeadsKv).
   int32_t mNumHeadsQPerKv;
+  // The number of headsQ per K/V head as a fast_mod_div divisor.
+  FastModDivInt32 mNumHeadsQPerKvDivisor{1};
   // The hidden size of O.
   int64_t mNumHiddenEltsO;
   // The total number of pages in the paged-kv memory pool.
   int32_t mNumPagesInMemPool;
+  // The number of tokensQ per CTA (used for groupsHeadsTokensQ generation kernel).
+  int32_t mNumTokensPerCtaQ;
   // The number of tokens per page (used if dynamic numTokensPerPage is enabled).
   int32_t mNumTokensPerPageLog2;
   // The output scale for FP8 quantization.
@@ -151,8 +192,8 @@ struct KernelParams {
   float mScaleSfKv;
   // The SF scale for O.
   float mScaleSfO;
-  // The reserved parameter.
-  float mReservedParam;
+  // Threshold to decide whether warp skips softmax ops
+  float mSkipSoftmaxThresholdScaleFactor;
   // The start token index in SF tensor. Used for FP4 SF offset calculation in generation phase
   // kernel when inflight batching is enabled in TRT-LLM.
   int32_t mStartTokenIdxSfO;
@@ -165,7 +206,8 @@ struct KernelParams {
 
   // Create the TMA shape/stride for Q.
   template <class FmhaOptions>
-  static auto makeTmaShapeStrideQ(FmhaOptions const& options, bool groupsHeadsQ, int32_t tileSizeQ,
+  static auto makeTmaShapeStrideQ(FmhaOptions const& options, bool groupsHeadsQ,
+                                  bool groupsTokensHeadsQ, int32_t tileSizeQ,
                                   int32_t numEltsInClampedHeadDimQ) {
     //
     // The Q has shape of [numTokens * numHeadsQPerKv, numHeadsKv * 1, headDim]
@@ -194,24 +236,38 @@ struct KernelParams {
         static_cast<uint64_t>(options.mHeadDimQk), static_cast<uint64_t>(numGroupedHeads),
         static_cast<uint64_t>(numHeads), static_cast<uint64_t>(numTokens)};
 
-    // The hidden dimension when the tensor contains only Q (i.e. not QKV packed).
-    int32_t const hiddenDimQ{options.mNumHeadsQ * options.mHeadDimQk};
-
-    // The hidden dimension when the Q, K and V tensors are packed.
-    int32_t hiddenDimQkv{hiddenDimQ};
-    if (isPackedQkv(options.mQkvLayout)) {
-      FLASHINFER_CHECK(!groupsHeadsQ, "internal error");
-      hiddenDimQkv += options.mNumHeadsKv * (options.mHeadDimQk + options.mHeadDimV);
+    // The stride between tokens.
+    // Use user-provided stride if available, otherwise compute from layout.
+    int32_t strideTokens{options.qStrideTokens};
+    if (strideTokens == 0) {
+      // The hidden dimension when the tensor contains only Q (i.e. not QKV packed).
+      int32_t const hiddenDimQ{options.mNumHeadsQ * options.mHeadDimQk};
+      // The hidden dimension when the Q, K and V tensors are packed.
+      int32_t hiddenDimQkv{hiddenDimQ};
+      if (isPackedQkv(options.mQkvLayout)) {
+        FLASHINFER_CHECK(!groupsHeadsQ, "internal error");
+        hiddenDimQkv += options.mNumHeadsKv * (options.mHeadDimQk + options.mHeadDimV);
+      }
+      strideTokens = hiddenDimQkv;
     }
 
-    // The stride between tokens.
-    int32_t strideTokens{hiddenDimQkv};
-
     // The stride between heads.
-    int32_t strideHeads{groupsHeadsQ ? numGroupedHeads * options.mHeadDimQk : options.mHeadDimQk};
+    // Use user-provided stride if available, otherwise compute from layout.
+    int32_t strideHeads{options.qStrideHeads};
+    if (strideHeads == 0) {
+      strideHeads = options.mHeadDimQk;
+    }
+    // The stride between grouped heads (consecutive heads within a GQA group).
+    // Use user-provided stride if available, otherwise use headDimQk.
+    int32_t strideGroupedHeads{options.qStrideHeads};
+    if (strideGroupedHeads == 0) {
+      strideGroupedHeads = options.mHeadDimQk;
+    }
 
-    // The stride between grouped heads.
-    int32_t strideGroupedHeads{options.mHeadDimQk};
+    // For GQA, the TMA iterates over groups of heads, so we need to multiply by numGroupedHeads.
+    if (groupsHeadsQ) {
+      strideHeads = numGroupedHeads * strideHeads;
+    }
 
     // Assemble the stride (1, strideTokens, strideHeads).
     // Swap the first two dimension as mentioned before.
@@ -222,19 +278,26 @@ struct KernelParams {
     // The tile shape for TMA.
     auto tileShapes = std::vector<uint32_t>{static_cast<uint32_t>(numEltsInClampedHeadDimQ), 1, 1,
                                             static_cast<uint32_t>(tileSizeQ)};
+    // The number of tokensQ per CTA.
+    int32_t numTokensPerCtaQ{tileSizeQ};
+    // Re-compute the number of tokensQ per CTA if groupsHeadsQ is enabled.
     if (groupsHeadsQ) {
-      if (isSpecDecodingGenerationKernel(options.mKernelType)) {
-        FLASHINFER_CHECK((tileSizeQ % numGroupedHeads == 0), "internal error");
-        tileShapes = std::vector<uint32_t>{static_cast<uint32_t>(numEltsInClampedHeadDimQ),
-                                           static_cast<uint32_t>(numGroupedHeads), 1,
-                                           static_cast<uint32_t>(tileSizeQ / numGroupedHeads)};
+      if (groupsTokensHeadsQ) {
+        // Currently, it requires each CTA to process complete headsQ (i.e. numGroupedHeads) at a
+        // time, so it allows paddings in the end. Removing paddings needs re-organizing the Q
+        // tensor to [numTokensQ, numGroupedHeads, numHeads, headDimQ] and we might want to revisit
+        // this in the future.
+        numTokensPerCtaQ = static_cast<int32_t>(numTokensPerCtaQ / numGroupedHeads);
       } else {
-        tileShapes = std::vector<uint32_t>{static_cast<uint32_t>(numEltsInClampedHeadDimQ),
-                                           static_cast<uint32_t>(tileSizeQ), 1, 1};
+        numGroupedHeads = tileSizeQ;
+        numTokensPerCtaQ = 1;
       }
+      tileShapes = std::vector<uint32_t>{static_cast<uint32_t>(numEltsInClampedHeadDimQ),
+                                         static_cast<uint32_t>(numGroupedHeads), 1,
+                                         static_cast<uint32_t>(numTokensPerCtaQ)};
     }
 
-    return std::make_tuple(shape, stride, tileShapes);
+    return std::make_tuple(shape, stride, tileShapes, numTokensPerCtaQ);
   }
 
   // Create the TMA shape/stride for O.
@@ -331,6 +394,12 @@ struct KernelParams {
       strideHeads = options.vStrideHeads;
       strideBatch = options.vStrideBatch;
     }
+
+    // Ragged layout has no batch stride; reset negative overflow to 0 for TMA descriptor.
+    if (!isPagedKv(options.mQkvLayout) && !isContiguousKv(options.mQkvLayout) && strideBatch < 0) {
+      strideBatch = 0;
+    }
+
     // The 3 strides (the other ones are 1 and 0).
     return std::make_tuple(strideKeysVals, strideHeads, strideBatch);
   }
@@ -486,8 +555,8 @@ struct KernelParams {
 
     // Check shape must be in range [1, 2^32]
     int32_t dim = shapes.size();
-    // Max five dimension and min 3 dimension.
-    FLASHINFER_CHECK((dim <= 5) && (dim >= 3));
+    // Max five dimension and min 2 dimension.
+    FLASHINFER_CHECK((dim <= 5) && (dim >= 2));
     // Check shape range.
     for (int32_t ii = 0; ii < dim; ++ii) {
       FLASHINFER_CHECK(shapes[ii] >= (uint64_t(1)));        // Size must be min 1
@@ -521,6 +590,9 @@ struct KernelParams {
     if (result != CUDA_SUCCESS) {
       char const* err_str;
       cuGetErrorString(result, &err_str);
+      // Note that the error is thrown out before launching fmha kernels, so it is highly possible
+      // that the errors are broadcasted by previous kernels. Please enable CUDA_LAUNCH_BLOCKING or
+      // use cuda-gdb for more details.
       std::cerr << "Error: Failed to initialize the TMA descriptor due to " << err_str << std::endl;
       std::cerr << "tmaFormat: " << static_cast<int>(tmaDataFormat) << " dim: " << dim
                 << " gmem: " << gmemAddr << std::endl;
@@ -568,8 +640,9 @@ struct KernelParams {
     int32_t numEltsInClampedHeadDimQ = std::min(numEltsIn128BQ, options.mHeadDimQk);
 
     // Shape/stride for gmem tensor Q.
-    auto [shapeQ, strideQ, tileShapeQ] = makeTmaShapeStrideQ(
-        options, kernelMeta.mGroupsHeadsQ, kernelMeta.mTileSizeQ, numEltsInClampedHeadDimQ);
+    auto [shapeQ, strideQ, tileShapeQ, numTokensPerCtaQ] =
+        makeTmaShapeStrideQ(options, kernelMeta.mGroupsHeadsQ, kernelMeta.mGroupsTokensHeadsQ,
+                            kernelMeta.mTileSizeQ, numEltsInClampedHeadDimQ);
     // Build tma descriptor for Q.
     params.tmaQ_ = buildNdTmaDescriptor(options, kernelMeta.mDataTypeQ, shapeQ, strideQ, tileShapeQ,
                                         const_cast<void*>(qPtr));
@@ -597,6 +670,16 @@ struct KernelParams {
     std::vector<uint32_t> tileShapeKv(shapeK.size(), 1);
     tileShapeKv[0] = numEltsInClampedHeadDimKv / numEltsDivisor;
     tileShapeKv[1] = numKeysPerTile;
+
+    // If sparse MLA is enabled, the shape and stride for K need to be updated for 2D layout
+    // (numTokensKvInPagedKv, headDimQk).
+    if (options.mSparseMla) {
+      shapeK = std::vector<uint64_t>{static_cast<uint64_t>(options.mHeadDimQk),
+                                     static_cast<uint64_t>(INT_MAX)};
+      strideK = std::vector<uint64_t>{1, static_cast<uint64_t>(options.mHeadDimQk)};
+      tileShapeKv[1] = 1;
+    }
+
     // Build tma descriptor for K.
     params.tmaK_ = buildNdTmaDescriptor(options, kernelMeta.mDataTypeKv, shapeK, strideK,
                                         tileShapeKv, const_cast<void*>(kPtr),
@@ -714,12 +797,20 @@ struct KernelParams {
     params.mNumHeadsQ = options.mNumHeadsQ;
     params.mNumHeadsKv = options.mNumHeadsKv;
     params.mNumHeadsQPerKv = options.mNumHeadsQPerKv;
+    params.mNumHeadsQPerKvDivisor = FastModDivInt32(options.mNumHeadsQPerKv);
     params.mNumHiddenEltsO = options.mNumHeadsQ * options.mHeadDimQk;
+    params.mNumTokensPerCtaQ = numTokensPerCtaQ;
     params.mOutputScale = options.outputScale;
     params.mScaleSoftmaxLog2 = options.scaleSoftmaxLog2;
+    params.mSkipSoftmaxThresholdScaleFactor = options.mSkipSoftmaxThresholdScaleFactor;
     params.mStartTokenIdxSfO = options.mSfStartTokenIdx;
     params.mScaleSfKv = options.mScaleSfKv;
     params.ptrSoftmaxStats = options.softmaxStatsPtr;
+    // The sparseMlaTopK needs to be a multiple of 4 as we use 16B cpAsync instructions for the
+    // indices.
+    FLASHINFER_CHECK(!options.mSparseMla || (options.mSparseMlaTopK % 4) == 0,
+                     "SparseMlaTopK must be a multiple of 4");
+    params.mSparseMlaTopK = options.mSparseMlaTopK;
     // TODO: Integrate trtllm block-sparse attention kernels when needed.
     params.mUseBlockSparseAttention = false;
     return params;

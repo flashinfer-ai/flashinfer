@@ -204,11 +204,16 @@ def get_alibi_slopes(n_heads: int) -> torch.Tensor:
 _cache_buf: Dict[Tuple[str, torch.device], torch.Tensor] = {}
 
 
-def _get_cache_buf(name: str, bytes: int, device: torch.device) -> torch.Tensor:
+def _get_cache_buf(
+    name: str, bytes: int, device: torch.device, zero_init: bool = False
+) -> torch.Tensor:
     key = (name, device)
     buf = _cache_buf.get(key)
     if buf is None or buf.size(0) < bytes:
-        buf = torch.empty(bytes, dtype=torch.uint8, device=device)
+        if zero_init:
+            buf = torch.zeros(bytes, dtype=torch.uint8, device=device)
+        else:
+            buf = torch.empty(bytes, dtype=torch.uint8, device=device)
         _cache_buf[key] = buf
     return buf
 
@@ -404,6 +409,12 @@ def is_fa3_backend_supported(
         return False
     if use_fp16_qk_reductions:
         return False
+    # FA3 FP8 KV cache currently requires FP8 query.
+    if dtype_kv in {torch.float8_e4m3fn, torch.float8_e5m2} and dtype_q not in {
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+    }:
+        return False
     return True
 
 
@@ -549,9 +560,44 @@ def is_sm120a_supported(device: torch.device) -> bool:
     return major == 12 and minor == 0 and version_at_least(torch.version.cuda, "12.8")
 
 
+def is_sm120f_supported(device: torch.device) -> bool:
+    major, minor = get_compute_capability(device)
+    return major == 12 and minor == 0 and version_at_least(torch.version.cuda, "12.9")
+
+
 def is_sm121a_supported(device: torch.device) -> bool:
     major, minor = get_compute_capability(device)
-    return major == 12 and minor == 1 and version_at_least(torch.version.cuda, "12.9")
+    return major == 12 and minor == 1 and version_at_least(torch.version.cuda, "13.0")
+
+
+def is_sm12x_supported(device: torch.device) -> bool:
+    """Check if the device is any SM12x GPU (SM120a, SM121a, or future variants).
+
+    Uses a major-version check (``major == 12``) so that future SM12x minor
+    variants are automatically covered without code changes, matching the
+    pattern used by ``is_sm100a_supported`` (``major == 10``).
+
+    The minimum CUDA version depends on the minor variant:
+    SM120a requires CUDA 12.8, SM121a requires CUDA 13.0.
+    """
+    major, minor = get_compute_capability(device)
+    if major != 12:
+        return False
+    min_cuda = "13.0" if minor >= 1 else "12.8"
+    return version_at_least(torch.version.cuda, min_cuda)
+
+
+def is_cvt_rs_supported(device: torch.device = None) -> bool:
+    """Check if the GPU supports the PTX cvt.rs.f16x2.f32 instruction.
+
+    This is a non-forward-compatible SM100a feature — not all SM >= 100 have it.
+    In particular, SM120 (Blackwell lite) does NOT support it.
+    """
+    if device is None:
+        device = torch.device("cuda")
+    major, _ = get_compute_capability(device)
+    # SM100a and SM110a support cvt.rs; SM120 does not.
+    return major in (10, 11)
 
 
 def determine_mla_backend(device: torch.device) -> str:
@@ -787,8 +833,8 @@ def get_shuffle_matrix_a_row_indices(
 def get_shuffle_matrix_sf_a_row_indices(
     input_tensor: torch.Tensor, epilogue_tile_m: int, num_elts_per_sf: int = 16
 ) -> torch.Tensor:
-    assert input_tensor.dtype == torch.uint8
-    assert num_elts_per_sf == 16
+    assert input_tensor.dtype == torch.uint8 or input_tensor.dtype == torch.bfloat16
+    assert num_elts_per_sf == 16 or num_elts_per_sf == 32
 
     assert input_tensor.dim() == 2, (
         f"input_tensor should be a 2D tensor, not {input_tensor.dim()}"
@@ -922,6 +968,13 @@ def backend_requirement(
         backends. Should accept the same arguments as the decorated function and return
         True if requirements are met, False otherwise.
         In the case where the kernel function does not have any specific backends, this can be decorated with @supported_compute_capability to specify the function's supported compute capabilities.
+    heuristic_func : callable, optional
+        A function that performs heuristic backend selection when backend is "auto".
+        Must be provided if backend is "auto". Does not do anything if backend is not "auto".
+        Should accept the same arguments as the decorated function.
+        Should return an ordered list of runnable backends with the most preferred backend first.
+        When decorated function is not autotuned, the first backend in the heuristic list will be run.
+        When decorated function is autotuned, the backends in the heuristic list will be autotuned over to find the best backend.
 
     Returns
     -------
@@ -1077,8 +1130,8 @@ def backend_requirement(
                 except ValueError:
                     continue
             # If a heuristic function is provided, filter the suitable backends based on the heuristic function
-            if heuristic_func is not None:
-                suitable_backends = heuristic_func(suitable_backends, *args, **kwargs)
+            assert heuristic_func is not None, "Heuristic function must be provided"
+            suitable_backends = heuristic_func(suitable_backends, *args, **kwargs)
             if not suitable_backends:
                 return False
             wrapper.suitable_auto_backends = suitable_backends
@@ -1171,3 +1224,9 @@ def backend_requirement(
         return wrapper
 
     return decorator
+
+
+@functools.cache
+def get_default_generators(device: torch.device):
+    torch.cuda.init()
+    return torch.cuda.default_generators[device.index]

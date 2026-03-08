@@ -15,6 +15,8 @@ FlashInfer is a library and kernel generator for Large Language Models that prov
    :caption: Get Started
 
    installation
+   cli
+   logging
 
 .. toctree::
    :maxdepth: 2
@@ -35,6 +37,7 @@ FlashInfer is a library and kernel generator for Large Language Models that prov
    api/sparse
    api/page
    api/sampling
+   api/topk
    api/logits_processor
    api/norm
    api/rope

@@ -23,7 +23,7 @@ Array<int64_t> BatchDecodeWithPagedKVCachePlanMLA(ffi::TensorView float_workspac
       int_workspace_buffer.size(0) * get_element_size(int_workspace_buffer);
 
   DecodePlanInfo plan_info;
-  cudaSetDevice(float_workspace_buffer.device().device_id);
+  ffi::CUDADeviceGuard device_guard(float_workspace_buffer.device().device_id);
   const cudaStream_t stream = get_stream(float_workspace_buffer.device());
 
   auto work_estimation_func = BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMlaCuteSM80<
@@ -103,7 +103,7 @@ void BatchDecodeWithPagedKVCacheRunMLA(
   }
   params.padded_batch_size = plan_info.padded_batch_size;
 
-  cudaSetDevice(paged_ckv_cache.device().device_id);
+  ffi::CUDADeviceGuard device_guard(paged_ckv_cache.device().device_id);
   const cudaStream_t stream = get_stream(paged_ckv_cache.device());
   cudaError_t status = BatchDecodeWithPagedKVCacheDispatchedMlaCuteSM80<HEAD_DIM_CKV, HEAD_DIM_KPE,
                                                                         QO_TILE_LEN, Params>(

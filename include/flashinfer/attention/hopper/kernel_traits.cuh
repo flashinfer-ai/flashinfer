@@ -63,7 +63,8 @@ struct AttentionKernelTraits {
   static constexpr int NUM_THREADS = NUM_WARPS * cutlass::NumThreadsPerWarp;
   // NOTE(Zihao): the following constant should only be used when TMA is enabled,
   // where only one warp inside a warp group is used for TMA.
-  static constexpr int NUM_PRODUCER_THREADS = cutlass::NumThreadsPerWarp;
+  static constexpr int NUM_PRODUCER_THREADS =
+      USE_TMA_LOAD_KV ? cutlass::NumThreadsPerWarp : 4 * cutlass::NumThreadsPerWarp;
 
   using TileShape_QKD = Shape<Int<CTA_Q>, Int<CTA_KV>, Int<HEAD_DIM_QK>>;
   using TileShape_PDV = Shape<Int<CTA_Q>, Int<HEAD_DIM_VO>, Int<CTA_KV>>;

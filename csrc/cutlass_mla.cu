@@ -23,7 +23,7 @@ using namespace flashinfer::attention;
 void CutlassMLAPagedAttention(ffi::TensorView workspace, ffi::TensorView out, ffi::TensorView lse,
                               ffi::TensorView q_nope_pe, ffi::TensorView ckv_kpe_cache,
                               ffi::TensorView kv_lens, ffi::TensorView page_table) {
-  cudaSetDevice(q_nope_pe.device().device_id);
+  ffi::CUDADeviceGuard device_guard(q_nope_pe.device().device_id);
   const cudaStream_t stream = get_stream(q_nope_pe.device());
 
   int device_index = q_nope_pe.device().device_id;

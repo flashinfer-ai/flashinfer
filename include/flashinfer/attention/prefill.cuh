@@ -1449,7 +1449,7 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
 
     uint32_t num_iterations;
     if constexpr (MASK_MODE == MaskMode::kBlockExpanding) {
-      // Block Expanding: 使用 block 边界计算 kv_valid_end
+      // Block Expanding: Calculate kv_valid_end based on block boundaries
       const uint32_t dllm_block_size = params.dllm_block_size;
       const uint32_t q_tile_end = min(qo_len, ceil_div(((bx + 1) * CTA_TILE_Q), group_size));
       const uint32_t q_offset = params.get_q_block_expanding_offset(0);  // Single prefill: batch_idx=0
@@ -1900,7 +1900,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
 
     uint32_t num_iterations;
     if constexpr (MASK_MODE == MaskMode::kBlockExpanding) {
-      // Block Expanding: 使用 block 边界计算 kv_valid_end
+      // Block Expanding: Calculate kv_valid_end based on block boundaries
       const uint32_t dllm_block_size = params.dllm_block_size;
       const uint32_t q_offset = params.get_q_block_expanding_offset(request_idx);
       const uint32_t q_tile_end = min(qo_len, ceil_div(((qo_tile_idx + 1) * CTA_TILE_Q), group_size));

@@ -34,8 +34,9 @@ using namespace flashinfer;
     constexpr int SCALE_GRANULARITY_K = 128;                                                      \
     if (scale_granularity_k != 128) {                                                             \
       TVM_FFI_ICHECK(false)                                                                       \
-          << "SM120 requires scale_granularity_k=128. CUTLASS enforces ScaleGranularityK must "   \
-             "equal tile shape K dimension (128 for both Cooperative and PingPong schedules).";   \
+          << "SM120/SM121 requires scale_granularity_k=128. CUTLASS enforces ScaleGranularityK "  \
+             "must equal tile shape K dimension (128 for both Cooperative and PingPong "          \
+             "schedules).";                                                                       \
       return false;                                                                               \
     }                                                                                             \
     /* Match SM100's approach: support only (1,128,128) and (128,128,128) */                      \
@@ -85,7 +86,7 @@ void CutlassGroupGemmFP8GroupwiseScaledSM120(
     TensorView SFA, TensorView SFB, TensorView D, TensorView m_indptr, int64_t n, int64_t k,
     int64_t scale_granularity_m, int64_t scale_granularity_n, int64_t scale_granularity_k,
     std::string scale_major_mode) {
-  cudaSetDevice(float_workspace_buffer.device().device_id);
+  ffi::CUDADeviceGuard device_guard(float_workspace_buffer.device().device_id);
   auto stream = get_stream(D.device());
   int num_groups = m_indptr.size(0) - 1;
 

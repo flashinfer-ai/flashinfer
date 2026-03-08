@@ -20,7 +20,11 @@
 
 #include <cstdint>
 
+#include "../utils.cuh"
+
 namespace flashinfer {
+
+DEFINE_HAS_MEMBER(v_scale)
 
 #define REGISTER_QUERY_TRANSFORM(params, q, ...)                                    \
   template <typename Params, typename T>                                            \
@@ -80,8 +84,19 @@ struct AttentionVariantBase {
 
   REGISTER_OUTPUT_TRANSFORM(params, output, batch_idx, qo_idx, qo_head_idx, m, d, scale, {
     float d_rcp = (m != -math::inf) ? math::ptx_rcp(d) : 0.f;
-    return output * d_rcp;
+    float v_scale_val = get_v_scale(params);
+    return output * d_rcp * v_scale_val;
   })
+
+  // Helper to get v_scale from params, returns 1.0f if not present
+  template <typename Params>
+  __device__ __forceinline__ static float get_v_scale(const Params& params) {
+    if constexpr (has_v_scale_v<Params>) {
+      return params.v_scale;
+    } else {
+      return 1.0f;
+    }
+  }
 };
 
 }  // namespace flashinfer

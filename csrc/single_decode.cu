@@ -62,7 +62,7 @@ void single_decode_with_kv_cache(TensorView q, TensorView k, TensorView v, Tenso
       << "num_qo_heads(" << num_qo_heads << ") must be divisible by num_kv_heads(" << num_kv_heads
       << ")";
 
-  cudaSetDevice(q.device().device_id);
+  ffi::CUDADeviceGuard device_guard(q.device().device_id);
   const cudaStream_t stream = get_stream(q.device());
 
   TVM_FFI_ICHECK_EQ(head_dim_qk, head_dim_vo)

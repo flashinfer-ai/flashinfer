@@ -24,7 +24,7 @@ autodoc_mock_imports = [
 
 project = "FlashInfer"
 author = "FlashInfer Contributors"
-copyright = f"2023-2025, {author}"
+copyright = f"2023-2026, {author}"
 
 version = flashinfer.__version__
 release = flashinfer.__version__

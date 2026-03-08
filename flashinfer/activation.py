@@ -20,6 +20,7 @@ from typing import Optional
 
 import torch
 
+from .api_logging import flashinfer_api
 from .jit import gen_act_and_mul_module
 from .utils import (
     device_support_pdl,
@@ -66,6 +67,7 @@ def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
     )
 
 
+@flashinfer_api
 def silu_and_mul(
     input: torch.Tensor, out: torch.Tensor = None, enable_pdl: Optional[bool] = None
 ) -> torch.Tensor:
@@ -110,6 +112,7 @@ def silu_and_mul(
     return out
 
 
+@flashinfer_api
 def gelu_tanh_and_mul(
     input: torch.Tensor, out: torch.Tensor = None, enable_pdl: Optional[bool] = None
 ) -> torch.Tensor:
@@ -150,6 +153,7 @@ def gelu_tanh_and_mul(
     return out
 
 
+@flashinfer_api
 def gelu_and_mul(
     input: torch.Tensor, out: torch.Tensor = None, enable_pdl: Optional[bool] = None
 ) -> torch.Tensor:
@@ -190,6 +194,7 @@ def gelu_and_mul(
     return out
 
 
+@flashinfer_api
 def silu_and_mul_scaled_nvfp4_experts_quantize(
     a,
     mask,

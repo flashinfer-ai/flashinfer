@@ -96,7 +96,7 @@ void trtllm_custom_all_reduce(TensorView in, TensorView out, int64_t tp_size, in
                               Optional<TensorView> lamport_peer_comm_buffer_ptrs_1,
                               Optional<TensorView> lamport_peer_comm_buffer_ptrs_2) {
   AllReduceFusionOp fusion_op = static_cast<AllReduceFusionOp>(fusion_op_code);
-  cudaSetDevice(in.device().device_id);
+  ffi::CUDADeviceGuard device_guard(in.device().device_id);
   auto stream = get_stream(in.device());
 
   // TODO(zihao): review dispatch type - support fp16, bf16 only

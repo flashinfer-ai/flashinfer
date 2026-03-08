@@ -13,6 +13,8 @@
 #include <cutlass/numeric_types.h>
 #include "../../utils.cuh"
 
+#include "variants.cuh"
+
 namespace flashinfer {
 
 template <typename Ktraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL, bool BLOCK_EXPANDING, bool MULTIITEMSCORING,
@@ -104,13 +106,13 @@ CUTLASS_DEVICE void mma_f16(
   // ════════════════════════════════════════════════════════════════════════════════════
   int64_t dllm_block_size = 1;
   int64_t q_block_expanding_offset = 0;
-  int64_t kv_block_expanding_offset = 0;  // 新增: kv_offset 支持
+  int64_t kv_block_expanding_offset = 0;  // kv_offset support for Cascade Current Chunk
   if constexpr (BLOCK_EXPANDING) {
     if constexpr (has_dllm_block_size_v<decltype(mainloop_params.additional_params)>) {
       dllm_block_size = mainloop_params.additional_params.dllm_block_size;
     }
-    // 优先从 maybe_q_block_expanding_offset 数组读取 per-batch offset
-    // 否则回退到标量 q_block_expanding_offset
+    // Prefer reading per-batch offset from maybe_q_block_expanding_offset array
+    // Otherwise fallback to scalar q_block_expanding_offset
     if constexpr (has_maybe_q_block_expanding_offset_v<decltype(mainloop_params.additional_params)>) {
       auto* offset_ptr = mainloop_params.additional_params.maybe_q_block_expanding_offset;
       if (offset_ptr != nullptr) {
@@ -119,9 +121,9 @@ CUTLASS_DEVICE void mma_f16(
     } else if constexpr (has_q_block_expanding_offset_v<decltype(mainloop_params.additional_params)>) {
       q_block_expanding_offset = mainloop_params.additional_params.q_block_expanding_offset;
     }
-    // 新增: 读取 kv_offset（用于 Cascade Current Chunk 场景）
-    // 优先从 maybe_kv_block_expanding_offset 数组读取 per-batch offset
-    // 否则回退到标量 kv_block_expanding_offset
+    // Read kv_offset (for Cascade Current Chunk scenario)
+    // Prefer reading per-batch offset from maybe_kv_block_expanding_offset array
+    // Otherwise fallback to scalar kv_block_expanding_offset
     if constexpr (has_maybe_kv_block_expanding_offset_v<decltype(mainloop_params.additional_params)>) {
       auto* offset_ptr = mainloop_params.additional_params.maybe_kv_block_expanding_offset;
       if (offset_ptr != nullptr) {
@@ -133,9 +135,9 @@ CUTLASS_DEVICE void mma_f16(
   }
   auto block_expanding_col_limit = [&](int qo_idx) -> int {
     // q_block = (q_offset + qo_idx) / B
-    // 考虑 kv_offset: kv_global = kv_offset + kv_idx < (q_block + 1) * B
-    // 所以 kv_idx < (q_block + 1) * B - kv_offset
-    // 修复: 确保结果非负 (当 max_kv_global <= kv_offset 时返回 0)
+    // Consider kv_offset: kv_global = kv_offset + kv_idx < (q_block + 1) * B
+    // So kv_idx < (q_block + 1) * B - kv_offset
+    // Fix: Ensure result is non-negative (return 0 when max_kv_global <= kv_offset)
     int64_t q_global = q_block_expanding_offset + qo_idx;
     int64_t q_block = q_global / dllm_block_size;
     int64_t max_kv_global = (q_block + 1) * dllm_block_size;
@@ -259,7 +261,7 @@ CUTLASS_DEVICE void mma_f16(
       if (MULTIITEMSCORING) {
         mask_multi_item_scoring(tSrS, i, qo_idx, kv_idx);
       } else if constexpr (BLOCK_EXPANDING) {
-        // 修复: 添加 kv_len 边界检查，与初始 mask 逻辑保持一致
+        // Fix: Add kv_len boundary check to be consistent with initial mask logic
         if (kv_idx >= std::min(kv_len, block_expanding_col_limit(qo_idx))) {
           tSrS(i) = AttentionUpdater::fill_value;
         }
@@ -375,7 +377,7 @@ CUTLASS_DEVICE void mma_f16(
   consumer_wait(pipeline_v, smem_pipe_read_v);
   gemm</*init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, tOrP, tOrV(_, _, _, smem_pipe_read_v.index()),
                                        tOrO);
-  attention_updater.finalize(tSrS);
+  attention_updater.finalize(tSrS, get_variant_scale_pv(variant));
   warpgroup_wait<0>();
   pipeline_v.consumer_release(smem_pipe_read_v);  // release V, otherwise producers will hang
   ++smem_pipe_read_v;

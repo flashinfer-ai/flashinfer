@@ -68,7 +68,7 @@ void single_prefill_with_kv_cache(ffi::TensorView q, ffi::TensorView k, ffi::Ten
 
   const MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
 
-  cudaSetDevice(q.device().device_id);
+  ffi::CUDADeviceGuard device_guard(q.device().device_id);
   const cudaStream_t stream = get_stream(q.device());
 
   DISPATCH_context(

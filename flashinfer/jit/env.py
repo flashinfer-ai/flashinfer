@@ -56,19 +56,6 @@ FLASHINFER_CACHE_DIR: pathlib.Path = FLASHINFER_BASE_DIR / ".cache" / "flashinfe
 _package_root: pathlib.Path = pathlib.Path(__file__).resolve().parents[1]
 
 
-def _get_base_version(version: str) -> str:
-    """Extract base version (first 3 segments) from version string.
-
-    Examples:
-        "0.5.3.20260202" -> "0.5.3"
-        "0.5.3" -> "0.5.3"
-        "0.5.3+cu129" -> "0.5.3"
-    """
-    base = version.split("+")[0]  # Remove any suffix like +cu129
-    parts = base.split(".")
-    return ".".join(parts[:3])
-
-
 def _get_cubin_dir():
     """
     Get the cubin directory path with the following priority:
@@ -82,11 +69,9 @@ def _get_cubin_dir():
 
         flashinfer_cubin_version = flashinfer_cubin.__version__
         # Allow bypassing version check with environment variable
-        # Compare only base version (first 3 segments) to allow date suffix differences
         if (
             not os.getenv("FLASHINFER_DISABLE_VERSION_CHECK")
-            and _get_base_version(flashinfer_version)
-            != _get_base_version(flashinfer_cubin_version)
+            and flashinfer_version != flashinfer_cubin_version
         ):
             raise RuntimeError(
                 f"flashinfer-cubin version ({flashinfer_cubin_version}) does not match "
@@ -123,12 +108,9 @@ def _get_aot_dir():
         # NOTE(Zihao): we don't use exact version match here because the version of flashinfer-jit-cache
         # contains the CUDA version suffix: e.g. 0.3.1+cu129.
         # Allow bypassing version check with environment variable
-        # Compare only base version (first 3 segments) to allow date suffix and CUDA version differences
-        if (
-            not os.getenv("FLASHINFER_DISABLE_VERSION_CHECK")
-            and _get_base_version(flashinfer_version)
-            != _get_base_version(flashinfer_jit_cache_version)
-        ):
+        if not os.getenv(
+            "FLASHINFER_DISABLE_VERSION_CHECK"
+        ) and not flashinfer_jit_cache_version.startswith(flashinfer_version):
             raise RuntimeError(
                 f"flashinfer-jit-cache version ({flashinfer_jit_cache_version}) does not match "
                 f"flashinfer version ({flashinfer_version}). "

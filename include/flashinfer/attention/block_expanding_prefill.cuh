@@ -23,7 +23,7 @@
 namespace flashinfer {
 
 // Block Expanding Mask: mask[q, k] = (q / B) >= (k / B)
-// 对于 Q tile [q_start, q_end)，可见 KV 范围: [0, ceil(q_end / B) * B)
+// For Q tile [q_start, q_end), visible KV range: [0, ceil(q_end / B) * B)
 
 template <uint32_t CTA_TILE_KV>
 struct BlockExpandingTileSkipController {
@@ -125,7 +125,7 @@ __device__ __forceinline__ uint32_t block_expanding_mask_iteration(
     uint32_t dllm_block_size, uint32_t CTA_TILE_KV, uint32_t q_offset = 0, uint32_t kv_offset = 0) {
   uint32_t q_global_start = q_offset + q_tile_start;
   uint32_t q_first_block_id = q_global_start / dllm_block_size;
-  // 考虑 kv_offset: kv_global < (q_block + 1) * B
+  // Consider kv_offset: kv_global < (q_block + 1) * B
   // kv_offset + kv_local < (q_block + 1) * B
   // kv_local < (q_block + 1) * B - kv_offset
   int64_t max_kv_global = (int64_t)(q_first_block_id + 1) * dllm_block_size;
@@ -145,7 +145,7 @@ __device__ __forceinline__ bool block_expanding_needs_mask(
   return iter >= mask_iteration && iter < num_iterations;
 }
 
-// MMA tile 级别检查
+// MMA tile level check
 __device__ __forceinline__ bool block_expanding_tile_fully_visible(
     uint32_t q_start, uint32_t q_end, uint32_t kv_start, uint32_t kv_end,
     uint32_t log2_block_size) {

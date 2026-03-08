@@ -38,7 +38,7 @@ Array<int64_t> BatchMLAPagedAttentionSM90Plan(TensorView float_workspace_buffer,
 
   int batch_size = kv_len.size(0);
 
-  cudaSetDevice(float_workspace_buffer.device().device_id);
+  ffi::CUDADeviceGuard device_guard(float_workspace_buffer.device().device_id);
   const cudaStream_t stream = get_stream(float_workspace_buffer.device());
 
   cudaError_t status =

@@ -21,6 +21,7 @@ from typing import Any, List, Optional, Tuple, Union
 
 import torch
 
+from .api_logging import flashinfer_api
 from .jit import gen_pod_module, gen_batch_pod_module
 from .page import get_seq_lens
 from .prefill import get_batch_prefill_module
@@ -119,6 +120,7 @@ class PODWithPagedKVCacheWrapper:
     manages the lifecycle of these data structures.
     """
 
+    @flashinfer_api
     def __init__(
         self,
         float_workspace_buffer: torch.Tensor,
@@ -259,6 +261,7 @@ class PODWithPagedKVCacheWrapper:
             pin_memory=True,
         )
 
+    @flashinfer_api
     def plan(
         self,
         indptr: torch.Tensor,
@@ -432,6 +435,7 @@ class PODWithPagedKVCacheWrapper:
 
     begin_forward = plan
 
+    @flashinfer_api
     def run(
         self,
         # Main params (prefill and decode)
@@ -724,6 +728,7 @@ class BatchPODWithPagedKVCacheWrapper:
     manages the lifecycle of these data structures.
     """
 
+    @flashinfer_api
     def __init__(
         self,
         float_workspace_buffer: torch.Tensor,
@@ -791,6 +796,7 @@ class BatchPODWithPagedKVCacheWrapper:
     def is_cuda_graph_enabled(self) -> bool:
         return self._use_cuda_graph
 
+    @flashinfer_api
     def plan(
         self,
         qo_indptr_p: torch.Tensor,
@@ -1009,6 +1015,7 @@ class BatchPODWithPagedKVCacheWrapper:
 
     begin_forward = plan
 
+    @flashinfer_api
     def run(
         self,
         # Main params (prefill and decode)
