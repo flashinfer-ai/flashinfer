@@ -60,7 +60,7 @@ def _skip_if_unsupported(backend: str = "cutlass"):
     compute_capability_number = compute_capability[0] * 10 + compute_capability[1]
     if not mm_mxfp8.is_backend_supported(backend, compute_capability_number):
         pytest.skip(
-            "Skipping test because mm_mxfp8 cutlass is not supported on compute "
+            "Skipping test because mm_mxfp8 backend is not supported on compute "
             f"capability {compute_capability_number}."
         )
 
@@ -77,6 +77,10 @@ def _run_mm_mxfp8(
     provide_out,
 ):
     _skip_if_unsupported(backend)
+    if backend == "cute-dsl" and not is_sf_swizzled_layout:
+        pytest.skip(
+            "cute-dsl mm_mxfp8 currently supports only swizzled 1D scale layout."
+        )
 
     input = torch.randn([m, k], device="cuda", dtype=input_dtype)
     mat2 = torch.randn([n, k], device="cuda", dtype=input_dtype)
@@ -136,7 +140,7 @@ def _prepare_mxfp8_tensors(input_bf16, weight_bf16, is_sf_swizzled_layout):
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("backend", ["cutlass"])
+@pytest.mark.parametrize("backend", ["cutlass", "cute-dsl"])
 @pytest.mark.parametrize("auto_tuning", [True, False])
 def test_mm_mxfp8(
     m, n, k, input_dtype, is_sf_swizzled_layout, out_dtype, backend, auto_tuning
@@ -160,7 +164,7 @@ def test_mm_mxfp8(
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16])
-@pytest.mark.parametrize("backend", ["cutlass", "auto"])
+@pytest.mark.parametrize("backend", ["cutlass", "cute-dsl", "auto"])
 def test_mm_mxfp8_large_dimensions(
     m, n, k, input_dtype, is_sf_swizzled_layout, out_dtype, backend
 ):

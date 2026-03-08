@@ -72,7 +72,6 @@ try:
 except ImportError:
     GDN_DECODE_KLAST_BF16_STATE_AVAILABLE = False
 
-
 # ============================================================================
 # Utility Functions
 # ============================================================================
@@ -1167,6 +1166,7 @@ def bench_gdn_mtp(
     use_beta: bool = True,
     use_qk_l2norm: bool = True,
     cache_intermediate_states: bool = True,
+    disable_state_update: bool = True,
     warmup_iters: int = 10,
     bench_iters: int = 100,
 ):
@@ -1243,7 +1243,7 @@ def bench_gdn_mtp(
             scale,
             output,
             intermediate_states_buffer,
-            disable_state_update=True,
+            disable_state_update=disable_state_update,
             use_qk_l2norm=use_qk_l2norm,
         ),
         enable_cupti=True,
@@ -1264,7 +1264,7 @@ def bench_gdn_mtp(
         head_size,
         dtype,
         seq_len,
-        disable_state_update=True,  # MTP mode: state is not written back
+        disable_state_update=disable_state_update,
     )
 
     kernel_tflops = flops / kernel_median_ms / 1e9 if kernel_median_ms > 0 else 0
@@ -1577,7 +1577,7 @@ def bench_mtp_comparison(
             scale,
             output_fi,
             intermediate_fi,
-            disable_state_update=True,
+            disable_state_update=False,
             use_qk_l2norm=use_qk_l2norm,
         ),
         enable_cupti=True,
@@ -1627,7 +1627,7 @@ def bench_mtp_comparison(
             scale,
             output_tr,
             intermediate_tr,
-            disable_state_update=True,
+            disable_state_update=False,
             use_qk_l2norm=use_qk_l2norm,
         ),
         enable_cupti=True,
@@ -2399,7 +2399,9 @@ def run_flashinfer_only_benchmark(args, dtype, use_qk_l2norm):
                 f"\nGDN MTP Benchmark "
                 f"(heads: q={args.num_q_heads}, k={args.num_k_heads}, "
                 f"v={args.num_v_heads}, d={args.head_size}, dtype={args.dtype}, "
-                f"qk_l2norm={'ON' if use_qk_l2norm else 'OFF'})"
+                f"qk_l2norm={'ON' if use_qk_l2norm else 'OFF'}, "
+                f"cache_intermediate={'ON' if args.cache_intermediate_states else 'OFF'}, "
+                f"update_state={'ON' if args.update_state else 'OFF'})"
             )
             print("-" * 100)
             print(
@@ -2419,6 +2421,7 @@ def run_flashinfer_only_benchmark(args, dtype, use_qk_l2norm):
                         dtype=dtype,
                         use_qk_l2norm=use_qk_l2norm,
                         cache_intermediate_states=args.cache_intermediate_states,
+                        disable_state_update=not args.update_state,
                         warmup_iters=args.warmup,
                         bench_iters=args.iters,
                     )
@@ -2735,6 +2738,11 @@ Examples:
         "--cache-intermediate-states",
         action="store_true",
         help="Cache intermediate states for MTP benchmark",
+    )
+    parser.add_argument(
+        "--update-state",
+        action="store_true",
+        help="Update final state (disable_state_update=False) for MTP benchmark",
     )
     parser.add_argument(
         "--warmup",
