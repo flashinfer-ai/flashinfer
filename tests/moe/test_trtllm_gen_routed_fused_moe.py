@@ -23,7 +23,9 @@ from flashinfer import (
     ActivationType,
     fp4_quantize,
     mxfp8_quantize,
+    reorder_rows_for_gated_act_gemm,
     shuffle_matrix_a,
+    shuffle_matrix_sf_a,
 )
 from flashinfer.fused_moe import (
     convert_to_block_layout,
@@ -35,9 +37,12 @@ from flashinfer.fused_moe import (
     trtllm_fp8_block_scale_routed_moe,
     WeightLayout,
 )
+from flashinfer.fused_moe.core import Fp8QuantizationType
 from flashinfer.utils import device_support_pdl
 
 from .test_trtllm_gen_fused_moe import (
+    FP8BlockScaleMoe,
+    QuantMode,
     routing_reference_renormalize,
     routing_reference_renormalize_naive,
     routing_reference_topk,
@@ -388,7 +393,7 @@ def test_trtllm_gen_fp8_routed_fused_moe(
         local_num_experts=num_experts,
         routed_scaling_factor=None,
         routing_method_type=routing_method_type.value,
-        use_shuffled_weight=False,
+        use_shuffled_weight=True,
         weight_layout=0,
         enable_pdl=enable_pdl,
     ).to(torch.float)
@@ -527,4 +532,171 @@ def test_trtllm_gen_bf16_routed_fused_moe(
 
     # mismatch percentage
     mismatch_pct = (~mask).float().mean().item() * 100
+    assert mismatch_pct < 10, f"Mismatch percentage is {mismatch_pct:.2f}%"
+
+
+@pytest.mark.parametrize(
+    "activation_type",
+    [
+        pytest.param(ActivationType.Swiglu.value, id="Swiglu"),
+        pytest.param(ActivationType.Relu2.value, id="Relu2"),
+    ],
+)
+def test_trtllm_gen_fp8_mxfp8_routed_activation_parity(activation_type: int):
+    """MXFP8 routed path should match non-routed reference for gated and non-gated activations."""
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] not in [10]:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+
+    torch.manual_seed(42)
+    device = torch.device("cuda:0")
+    enable_pdl = device_support_pdl(device)
+
+    num_tokens = 32
+    hidden_size = 512
+    intermediate_size = 512
+    num_experts = 64
+    top_k = 8
+    routing_method_type = RoutingMethodType.Renormalize
+    is_gated = activation_type in [
+        ActivationType.Swiglu.value,
+        ActivationType.Geglu.value,
+    ]
+
+    routing_logits = torch.randn((num_tokens, num_experts), device=device).to(
+        torch.bfloat16
+    )
+    hidden_states = torch.randn((num_tokens, hidden_size), device=device).to(
+        torch.bfloat16
+    )
+    gemm1_weights = torch.randn(
+        (
+            num_experts,
+            (2 if is_gated else 1) * intermediate_size,
+            hidden_size,
+        ),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    gemm2_weights = torch.randn(
+        (num_experts, hidden_size, intermediate_size),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+
+    quant_impl = FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_MXFP8)
+    quant_weights = quant_impl.quantize_weights(
+        gemm1_weights, gemm2_weights, hidden_states
+    )
+    quant_inputs = quant_impl.quantize_inputs(hidden_states)
+    epilogue_tile_m = 128
+    w13_rows = (2 if is_gated else 1) * intermediate_size
+    gemm1_weights_shuffled = []
+    gemm1_scales_shuffled = []
+    gemm2_weights_shuffled = []
+    gemm2_scales_shuffled = []
+    for i in range(num_experts):
+        w1_interleaved = quant_weights["gemm1_weights"][i].clone().reshape(w13_rows, -1)
+        s1_interleaved = quant_weights["gemm1_scales"][i].clone().reshape(w13_rows, -1)
+        if is_gated:
+            w1_interleaved = reorder_rows_for_gated_act_gemm(w1_interleaved)
+            s1_interleaved = reorder_rows_for_gated_act_gemm(s1_interleaved)
+        gemm1_weights_shuffled.append(
+            shuffle_matrix_a(w1_interleaved.view(torch.uint8), epilogue_tile_m)
+            .contiguous()
+            .view(quant_weights["gemm1_weights"].dtype)
+        )
+        gemm2_weights_shuffled.append(
+            shuffle_matrix_a(
+                quant_weights["gemm2_weights"][i].view(torch.uint8), epilogue_tile_m
+            )
+            .contiguous()
+            .view(quant_weights["gemm2_weights"].dtype)
+        )
+        gemm1_scales_shuffled.append(
+            shuffle_matrix_sf_a(
+                s1_interleaved.view(torch.uint8).reshape(w13_rows, -1),
+                epilogue_tile_m,
+            )
+            .contiguous()
+            .view(quant_weights["gemm1_scales"].dtype)
+        )
+        gemm2_scales_shuffled.append(
+            shuffle_matrix_sf_a(
+                quant_weights["gemm2_scales"][i]
+                .view(torch.uint8)
+                .reshape(hidden_size, -1),
+                epilogue_tile_m,
+            )
+            .contiguous()
+            .view(quant_weights["gemm2_scales"].dtype)
+        )
+    gemm1_weights_kernel = torch.stack(gemm1_weights_shuffled)
+    gemm1_scales_kernel = torch.stack(gemm1_scales_shuffled)
+    gemm2_weights_kernel = torch.stack(gemm2_weights_shuffled)
+    gemm2_scales_kernel = torch.stack(gemm2_scales_shuffled)
+
+    output_ref = trtllm_fp8_block_scale_moe(
+        routing_logits=routing_logits,
+        routing_bias=None,
+        hidden_states=quant_inputs["hidden_states"],
+        hidden_states_scale=quant_inputs["hidden_states_scale"],
+        gemm1_weights=gemm1_weights_kernel,
+        gemm1_weights_scale=gemm1_scales_kernel,
+        gemm2_weights=gemm2_weights_kernel,
+        gemm2_weights_scale=gemm2_scales_kernel,
+        num_experts=num_experts,
+        top_k=top_k,
+        n_group=None,
+        topk_group=None,
+        intermediate_size=intermediate_size,
+        local_expert_offset=0,
+        local_num_experts=num_experts,
+        routed_scaling_factor=None,
+        routing_method_type=routing_method_type.value,
+        use_shuffled_weight=True,
+        weight_layout=WeightLayout.MajorK.value,
+        enable_pdl=enable_pdl,
+        fp8_quantization_type=Fp8QuantizationType.MxFp8,
+        activation_type=activation_type,
+    ).to(torch.float)
+
+    permute_info, expert_weights_full = routing_reference_renormalize(
+        routing_logits, top_k, num_experts, 8
+    )
+    topk_ids = permute_info["topKIndices"].to(torch.int32)
+    expert_weights = expert_weights_full.view(num_tokens, num_experts)[
+        torch.arange(num_tokens, device=device).unsqueeze(1), topk_ids
+    ].to(torch.bfloat16)
+    packed_topk_ids = (topk_ids << 16) | expert_weights.view(torch.int16).to(
+        torch.int32
+    )
+
+    output_routed = trtllm_fp8_block_scale_routed_moe(
+        topk_ids=packed_topk_ids,
+        routing_bias=None,
+        hidden_states=quant_inputs["hidden_states"],
+        hidden_states_scale=quant_inputs["hidden_states_scale"],
+        gemm1_weights=gemm1_weights_kernel,
+        gemm1_weights_scale=gemm1_scales_kernel,
+        gemm2_weights=gemm2_weights_kernel,
+        gemm2_weights_scale=gemm2_scales_kernel,
+        num_experts=num_experts,
+        top_k=top_k,
+        n_group=None,
+        topk_group=None,
+        intermediate_size=intermediate_size,
+        local_expert_offset=0,
+        local_num_experts=num_experts,
+        routed_scaling_factor=None,
+        routing_method_type=routing_method_type.value,
+        use_shuffled_weight=True,
+        weight_layout=WeightLayout.MajorK.value,
+        enable_pdl=enable_pdl,
+        fp8_quantization_type=Fp8QuantizationType.MxFp8,
+        activation_type=activation_type,
+    ).to(torch.float)
+
+    close = torch.isclose(output_ref, output_routed, atol=1e-2, rtol=1e-2)
+    mismatch_pct = (~close).float().mean().item() * 100
     assert mismatch_pct < 10, f"Mismatch percentage is {mismatch_pct:.2f}%"
