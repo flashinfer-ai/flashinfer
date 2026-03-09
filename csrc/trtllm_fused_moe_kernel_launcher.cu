@@ -414,7 +414,7 @@ void FusedMoeLauncher::init_common(
   int major = 0, minor = 0;
   cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
   cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
-  TVM_FFI_ICHECK_EQ(major, 10) << "MoE kernel requires 10.x architecture. Current device has SM "
+  TVM_FFI_ICHECK_GE(major, 10) << "MoE kernel requires 10.x architecture. Current device has SM "
                                << major << minor;
   this->device_version = std::make_tuple(major, minor);
 
@@ -1342,7 +1342,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
       return std::make_tuple(major, minor);
     }();
 
-    TVM_FFI_ICHECK_EQ(std::get<0>(device_props), 10)
+    TVM_FFI_ICHECK_GE(std::get<0>(device_props), 10)
         << "This kernel requires 10.x architecture. Current device has SM "
         << std::get<0>(device_props) << std::get<1>(device_props);
 
