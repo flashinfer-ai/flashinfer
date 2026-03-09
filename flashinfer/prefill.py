@@ -353,6 +353,8 @@ def get_single_prefill_module(backend, *args):
         scale_v: Optional[torch.Tensor],
         rope_scale: float,
         rope_theta: float,
+        maybe_k_cache_sf: Optional[torch.Tensor] = None,
+        maybe_v_cache_sf: Optional[torch.Tensor] = None,
     ) -> None:
         if backend == "fa3":
             scale_v_tensor, scale_v_scalar = _split_scale_param(scale_v)
@@ -407,6 +409,8 @@ def get_single_prefill_module(backend, *args):
                 window_left,
                 maybe_packed_custom_mask,
                 maybe_alibi_slopes,
+                maybe_k_cache_sf,
+                maybe_v_cache_sf,
                 logits_soft_cap,
                 sm_scale,
                 1.0 / rope_scale,  # rope_rcp_scale
@@ -431,6 +435,8 @@ def get_single_prefill_module(backend, *args):
         sm_scale: float,
         rope_scale: float,
         rope_theta: float,
+        maybe_k_cache_sf: Optional[torch.Tensor] = None,
+        maybe_v_cache_sf: Optional[torch.Tensor] = None,
     ) -> None:
         pass
 
@@ -462,6 +468,8 @@ def get_batch_prefill_module(backend, *args):
             "int_workspace_buffer",
             "o",
             "maybe_lse",
+            "maybe_k_cache_sf",
+            "maybe_v_cache_sf",
         ),
     )
     def ragged_run(
@@ -490,6 +498,8 @@ def get_batch_prefill_module(backend, *args):
         rope_scale: float,
         rope_theta: float,
         token_pos_in_items_len: int,
+        maybe_k_cache_sf: Optional[torch.Tensor] = None,
+        maybe_v_cache_sf: Optional[torch.Tensor] = None,
         scale_q: Optional[torch.Tensor] = None,
         scale_k: Optional[torch.Tensor] = None,
         scale_v: Optional[torch.Tensor] = None,
@@ -519,6 +529,8 @@ def get_batch_prefill_module(backend, *args):
                 maybe_prefix_len_ptr,
                 maybe_token_pos_in_items_ptr,
                 maybe_max_item_len_ptr,
+                maybe_k_cache_sf,
+                maybe_v_cache_sf,
                 logits_soft_cap,
                 sm_scale,
                 1.0 / rope_scale,  # rope_rcp_scale
@@ -611,6 +623,8 @@ def get_batch_prefill_module(backend, *args):
         rope_scale: float,
         rope_theta: float,
         token_pos_in_items_len: int,
+        maybe_k_cache_sf: Optional[torch.Tensor] = None,
+        maybe_v_cache_sf: Optional[torch.Tensor] = None,
     ) -> None:
         pass
 
@@ -625,6 +639,8 @@ def get_batch_prefill_module(backend, *args):
             "paged_v_cache",
             "o",
             "maybe_lse",
+            "key_block_scales",
+            "value_block_scales",
         ),
     )
     def paged_run(
@@ -737,6 +753,8 @@ def get_batch_prefill_module(backend, *args):
                 maybe_prefix_len_ptr,
                 maybe_token_pos_in_items_ptr,
                 maybe_max_item_len_ptr,
+                key_block_scales,
+                value_block_scales,
                 logits_soft_cap,
                 sm_scale,
                 1.0 / rope_scale,  # rope_rcp_scale
@@ -1070,6 +1088,9 @@ def single_prefill_with_kv_cache(
     rope_theta: Optional[float] = None,
     backend: str = "auto",
     return_lse: Literal[False] = False,
+    kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
 ) -> torch.Tensor: ...
 
 
@@ -1095,6 +1116,9 @@ def single_prefill_with_kv_cache(
     rope_theta: Optional[float] = None,
     backend: str = "auto",
     return_lse: Literal[True] = True,
+    kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
 
@@ -1120,6 +1144,9 @@ def single_prefill_with_kv_cache(
     rope_theta: Optional[float] = None,
     backend: str = "auto",
     return_lse: bool = False,
+    kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Prefill/Append attention with KV cache for single request, return the attention
     output.
@@ -1295,10 +1322,20 @@ def single_prefill_with_kv_cache(
             k.dtype,
         )
 
+    # Unpack NVFP4 scale factors
+    k_sf, v_sf = None, None
+    if kv_cache_sf is not None:
+        k_sf, v_sf = kv_cache_sf
+
+    if k_scale is not None:
+        sm_scale *= k_scale
+
     # o_dtype should be provided for FP8 attention
     if o_dtype is None:
         o_dtype = q.dtype
-    out = torch.empty(q.shape[:-1] + v.shape[-1:], dtype=o_dtype, device=q.device)
+    # For NVFP4 KV (uint8 packed), last dim is head_dim//2; output uses q head_dim
+    out_head_dim = q.shape[-1] if kv_cache_sf is not None else v.shape[-1]
+    out = torch.empty(q.shape[:-1] + (out_head_dim,), dtype=o_dtype, device=q.device)
 
     module = get_single_prefill_module(
         backend,
@@ -1306,7 +1343,7 @@ def single_prefill_with_kv_cache(
         k.dtype,
         out.dtype,
         q.shape[-1],  # head_dim_qk
-        v.shape[-1],  # head_dim_vo
+        out_head_dim,  # head_dim_vo
         PosEncodingMode[pos_encoding_mode].value,
         window_left >= 0,  # use_sliding_window
         logits_soft_cap > 0,  # use_logits_soft_cap
@@ -1332,6 +1369,8 @@ def single_prefill_with_kv_cache(
         scale_v,
         rope_scale,
         rope_theta,
+        k_sf,
+        v_sf,
     )
 
     return (out, lse) if return_lse else out
@@ -3067,6 +3106,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[False] = False,
         enable_pdl: Optional[bool] = None,
+        kv_cache_sf: Optional[
+            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        ] = None,
     ) -> torch.Tensor: ...
 
     @overload
@@ -3080,6 +3122,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[True] = True,
         enable_pdl: Optional[bool] = None,
+        kv_cache_sf: Optional[
+            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        ] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     @flashinfer_api
@@ -3097,6 +3142,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
         enable_pdl: Optional[bool] = None,
+        kv_cache_sf: Optional[
+            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        ] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch prefill/append attention between query and kv-cache stored as
         ragged tensor.
@@ -3167,6 +3215,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             logits_soft_cap = 0.0
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(q.size(-1))
+        if q_scale is not None:
+            sm_scale *= q_scale
+        if k_scale is not None:
+            sm_scale *= k_scale
         if rope_scale is None:
             rope_scale = 1.0
         if rope_theta is None:
@@ -3180,18 +3232,28 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 check_shape_dtype_device(
                     lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
                 )
+        # Unpack kv_cache_sf for NVFP4 ragged KV
+        k_sf, v_sf = None, None
+        if kv_cache_sf is not None:
+            if isinstance(kv_cache_sf, tuple):
+                k_sf, v_sf = kv_cache_sf
+            else:
+                k_sf, v_sf = kv_cache_sf.unbind(dim=1)
+
+        # For NVFP4 KV (uint8 packed), v last dim is head_dim//2; use q head_dim for output
+        out_head_dim = q.shape[-1] if kv_cache_sf is not None else v.shape[-1]
         if out is None:
             # when input dtype is fp8, we need to use bf16 output
             out_dtype = torch.bfloat16 if q.dtype.itemsize == 1 else q.dtype
             out = torch.empty(
-                q.shape[:-1] + v.shape[-1:],
+                q.shape[:-1] + (out_head_dim,),
                 dtype=out_dtype,
                 device=q.device,
             )
         else:
             check_shape_dtype_device(
                 out,
-                q.shape[:-1] + v.shape[-1:],
+                q.shape[:-1] + (out_head_dim,),
                 self._cached_o_data_type,
                 q.device,
                 "out",
@@ -3300,6 +3362,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 rope_scale,
                 rope_theta,
                 self._token_pos_in_items_len,
+                k_sf,
+                v_sf,
             ]
             # For FP8, append scale tensors
             if is_float8(q):
