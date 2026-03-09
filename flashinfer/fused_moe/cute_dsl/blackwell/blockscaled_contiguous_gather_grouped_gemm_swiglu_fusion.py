@@ -309,9 +309,7 @@ if not hasattr(cutlass, "__version__"):
     cutlass.utils.PersistentTileSchedulerParams.__init__ = (
         hooked_PersistentTileSchedulerParams_init
     )
-    cutlass.utils.StaticPersistentTileScheduler._get_cluster_work_idx_with_fastdivmod = (
-        hooked_get_cluster_work_idx_with_fastdivmod
-    )
+    cutlass.utils.StaticPersistentTileScheduler._get_cluster_work_idx_with_fastdivmod = hooked_get_cluster_work_idx_with_fastdivmod
 
 
 class BlockScaledContiguousGatherGroupedGemmKernel:
