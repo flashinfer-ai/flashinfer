@@ -1301,13 +1301,18 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         # Convert NHD layout to HND for trtllm-gen backend
         if self._backend == "trtllm-gen" and self._kv_layout == "NHD":
-            # For NHD: [..., N, H, D] -> HND: [..., H, N, D]
             k_cache = k_cache.transpose(-3, -2)
             v_cache = v_cache.transpose(-3, -2)
             if key_block_scales is not None:
-                key_block_scales = key_block_scales.transpose(-3, -2)
-            if value_block_scales is not None:
-                value_block_scales = value_block_scales.transpose(-3, -2)
+                print(
+                    "[WARNING] NVFP4 KV cache with NHD layout will be converted to HND, "
+                    "incurring extra transpose and contiguous copy overhead. "
+                    "Use kv_layout='HND' for better performance."
+                )
+                k_cache = k_cache.contiguous()
+                v_cache = v_cache.contiguous()
+                key_block_scales = key_block_scales.transpose(-3, -2).contiguous()
+                value_block_scales = value_block_scales.transpose(-3, -2).contiguous()
 
         pos_encoding_mode = self._pos_encoding_mode
         window_left = self._window_left if window_left is None else window_left
@@ -2369,14 +2374,20 @@ def trtllm_batch_decode_with_kv_cache(
             mask=mask,
         )
     elif backend == "trtllm-gen":
-        # Convert NHD layout to HND if necessary (transpose only changes stride, not data)
+        # Convert NHD layout to HND if necessary
         if kv_layout == "NHD":
-            # For NHD: [..., N, H, D] -> HND: [..., H, N, D]
             k_cache = k_cache.transpose(-3, -2)
             v_cache = v_cache.transpose(-3, -2)
             if is_nvfp4_kvcache:
-                k_block_scales = k_block_scales.transpose(-3, -2)
-                v_block_scales = v_block_scales.transpose(-3, -2)
+                print(
+                    "[WARNING] NVFP4 KV cache with NHD layout will be converted to HND, "
+                    "incurring extra transpose and contiguous copy overhead. "
+                    "Use kv_layout='HND' for better performance."
+                )
+                k_cache = k_cache.contiguous()
+                v_cache = v_cache.contiguous()
+                k_block_scales = k_block_scales.transpose(-3, -2).contiguous()
+                v_block_scales = v_block_scales.transpose(-3, -2).contiguous()
 
         run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
         sm_count = get_device_sm_count(query.device)

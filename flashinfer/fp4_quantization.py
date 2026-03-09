@@ -976,38 +976,18 @@ _E2M1_MAX = 6.0
 _FLOAT8_E4M3_MAX = 448.0  # torch.finfo(torch.float8_e4m3fn).max
 
 
-def _swizzle_kv_scales(
-    scales: torch.Tensor,
-    num_pages: int,
-    num_kv_heads: int,
-    page_size: int,
-    head_dim: int,
-) -> torch.Tensor:
-    """Apply scale factor swizzling for SM100 trtllm-gen MHA kernel.
-
-    Rearranges scale factors within each [page_size, head_dim//16] tile
-    using a 4x4 interleaving pattern required by the hardware layout.
-    """
-    scale_dim = head_dim // 16
-    return (
-        scales.reshape(num_pages, num_kv_heads, page_size // 4, 4, 4, scale_dim // 4)
-        .permute(0, 1, 2, 4, 5, 3)
-        .reshape(num_pages, num_kv_heads, page_size, scale_dim)
-        .contiguous()
-    )
-
-
 @flashinfer_api
 def nvfp4_quantize_paged_kv_cache(
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
+    kv_layout: str = "HND",
 ) -> Tuple[
     Tuple[torch.Tensor, torch.Tensor],
     Tuple[torch.Tensor, torch.Tensor],
     float,
     float,
 ]:
-    """Quantize paged KV cache (HND layout) to NVFP4 format for trtllm-gen MHA.
+    """Quantize paged KV cache to NVFP4 format for trtllm-gen MHA.
 
     Quantizes BF16/FP16 K/V caches to NVFP4 with two-level scaling
     (global FP32 + per-block FP8), applies the /6 block-scale and *6
@@ -1015,20 +995,29 @@ def nvfp4_quantize_paged_kv_cache(
     for the SM100 trtllm-gen MHA kernel layout.
 
     Args:
-        k_cache: Key cache, shape [num_pages, num_kv_heads, page_size, head_dim].
-        v_cache: Value cache, shape [num_pages, num_kv_heads, page_size, head_dim].
+        k_cache: Key cache tensor.
+            HND layout: [num_pages, num_kv_heads, page_size, head_dim].
+            NHD layout: [num_pages, page_size, num_kv_heads, head_dim].
+        v_cache: Value cache tensor (same layout as k_cache).
+        kv_layout: Layout of the input KV cache, either ``"HND"`` or ``"NHD"``.
 
     Returns:
-        kv_cache_fp4: Tuple of (k_fp4, v_fp4), each
-            [num_pages, num_kv_heads, page_size, head_dim//2] dtype=uint8.
-        kv_block_scales: Tuple of (k_scales, v_scales), each
-            [num_pages, num_kv_heads, page_size, head_dim//16] dtype=float8_e4m3fn,
+        kv_cache_fp4: Tuple of (k_fp4, v_fp4) in the same layout as input,
+            with head_dim replaced by head_dim//2, dtype=uint8.
+        kv_block_scales: Tuple of (k_scales, v_scales) in the same layout as input,
+            with head_dim replaced by head_dim//16, dtype=float8_e4m3fn,
             with /6 adjustment and SM100 swizzling applied.
         k_global_scale: Adjusted global scale for K (float), with *6 applied.
         v_global_scale: Adjusted global scale for V (float), with *6 applied.
     """
-    num_pages, num_kv_heads, page_size, head_dim = k_cache.shape
+    # Extract dimensions based on layout
+    if kv_layout == "NHD":
+        num_pages, page_size, num_kv_heads, head_dim = k_cache.shape
+    else:
+        num_pages, num_kv_heads, page_size, head_dim = k_cache.shape
+
     device = k_cache.device
+    scale_dim = head_dim // 16
 
     # Compute global scale factors (kernel convention: reciprocal)
     # global_sf = FLOAT8_E4M3_MAX * E2M1_MAX / tensor_amax
@@ -1046,6 +1035,7 @@ def nvfp4_quantize_paged_kv_cache(
     )
 
     # Flatten to 2D [total_tokens, head_dim] for fp4_quantize
+    # Both layouts flatten identically since total elements are the same
     k_2d = k_cache.reshape(-1, head_dim)
     v_2d = v_cache.reshape(-1, head_dim)
 
@@ -1058,34 +1048,63 @@ def nvfp4_quantize_paged_kv_cache(
     )
 
     # fp4_quantize returns uint8 packed FP4 and uint8 scale factors (FP8 E4M3 encoded)
-    # Reshape packed data to page layout
+    # Reshape packed data and scale factors back to the original layout
+    if kv_layout == "NHD":
+        out_shape_fp4 = (num_pages, page_size, num_kv_heads, head_dim // 2)
+        out_shape_sf = (num_pages, page_size, num_kv_heads, scale_dim)
+    else:
+        out_shape_fp4 = (num_pages, num_kv_heads, page_size, head_dim // 2)
+        out_shape_sf = (num_pages, num_kv_heads, page_size, scale_dim)
+
     kv_cache_fp4 = (
-        k_packed.view(torch.uint8).reshape(
-            num_pages, num_kv_heads, page_size, head_dim // 2
-        ),
-        v_packed.view(torch.uint8).reshape(
-            num_pages, num_kv_heads, page_size, head_dim // 2
-        ),
+        k_packed.view(torch.uint8).reshape(out_shape_fp4),
+        v_packed.view(torch.uint8).reshape(out_shape_fp4),
     )
 
-    # Reshape scale factors to page layout and apply /6 adjustment for FP8 compute.
+    # Reshape scale factors and apply /6 adjustment for FP8 compute.
     # Block scales from kernel are FP8 E4M3 encoded as uint8.
     # The /6 makes E2M1 range [0,6] effectively [0,1] in FP8 compute.
-    k_sf_fp8 = k_sf.view(torch.float8_e4m3fn).reshape(
-        num_pages, num_kv_heads, page_size, head_dim // 16
-    )
-    v_sf_fp8 = v_sf.view(torch.float8_e4m3fn).reshape(
-        num_pages, num_kv_heads, page_size, head_dim // 16
-    )
+    k_sf_fp8 = k_sf.view(torch.float8_e4m3fn).reshape(out_shape_sf)
+    v_sf_fp8 = v_sf.view(torch.float8_e4m3fn).reshape(out_shape_sf)
     k_sf_fp8 = (k_sf_fp8.float() / _E2M1_MAX).to(torch.float8_e4m3fn)
     v_sf_fp8 = (v_sf_fp8.float() / _E2M1_MAX).to(torch.float8_e4m3fn)
 
-    # Apply scale factor swizzling for SM100 trtllm-gen MHA kernel
-    k_sf_fp8 = _swizzle_kv_scales(
-        k_sf_fp8, num_pages, num_kv_heads, page_size, head_dim
+    # Apply scale factor swizzling for SM100 trtllm-gen MHA kernel.
+    # The swizzle interleaves within each [page_size, head_dim//16] tile per page/head.
+    # HND: [P, H, T//4, 4, 4, S//4] -> permute(0,1,2,4,5,3) -> [P, H, T, S]
+    # NHD: [P, T//4, 4, H, 4, S//4] -> permute(0,1,4,3,5,2) -> [P, T, H, S]
+    if kv_layout == "NHD":
+        swizzle_shape = (
+            num_pages,
+            page_size // 4,
+            4,
+            num_kv_heads,
+            4,
+            scale_dim // 4,
+        )
+        swizzle_perm = (0, 1, 4, 3, 5, 2)
+    else:
+        swizzle_shape = (
+            num_pages,
+            num_kv_heads,
+            page_size // 4,
+            4,
+            4,
+            scale_dim // 4,
+        )
+        swizzle_perm = (0, 1, 2, 4, 5, 3)
+
+    k_sf_fp8 = (
+        k_sf_fp8.reshape(swizzle_shape)
+        .permute(swizzle_perm)
+        .reshape(out_shape_sf)
+        .contiguous()
     )
-    v_sf_fp8 = _swizzle_kv_scales(
-        v_sf_fp8, num_pages, num_kv_heads, page_size, head_dim
+    v_sf_fp8 = (
+        v_sf_fp8.reshape(swizzle_shape)
+        .permute(swizzle_perm)
+        .reshape(out_shape_sf)
+        .contiguous()
     )
 
     kv_block_scales = (k_sf_fp8, v_sf_fp8)

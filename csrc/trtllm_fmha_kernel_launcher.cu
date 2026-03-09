@@ -266,7 +266,7 @@ void trtllm_paged_attention_decode(
   bool is_fp4_kv = is_4bit(kv_data_type);
   int stride_idx_factor = is_fp4_kv ? 2 : 1;
 
-  // Assume HND layout: [..., H, N, D]
+  // Assume HND layout after Python-side transpose: [..., H, N, D]
   int page_size = key_cache.size(-2);
   int num_kv_heads = key_cache.size(-3);
   int kv_stride_keys_values = key_cache.stride(-2) * stride_idx_factor;  // key/values

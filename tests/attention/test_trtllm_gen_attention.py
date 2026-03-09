@@ -170,11 +170,10 @@ def create_kv_cache(
         )
         kv_cache = torch.stack([k_cache, v_cache], dim=1)
     elif kv_dtype == "nvfp4":
-        assert kv_layout == "HND", "NVFP4 KV cache only supports HND layout"
         # Reference is the unquantized BF16 data
         ref_kv_cache = torch.stack([k_cache, v_cache], dim=1)
         kv_cache, kv_block_scales, k_scale, v_scale = nvfp4_quantize_paged_kv_cache(
-            k_cache, v_cache
+            k_cache, v_cache, kv_layout=kv_layout
         )
     else:
         k_scale = v_scale = 1.0
@@ -841,10 +840,6 @@ def _test_trtllm_batch_decode(
             pytest.skip("NVFP4 KV cache requires FP8 query")
         if o_dtype != "fp8":
             pytest.skip("NVFP4 KV cache only supports FP8 output")
-        if kv_layout != "HND":
-            pytest.skip("NVFP4 KV cache only supports HND layout")
-        if enable_sink:
-            pytest.skip("NVFP4 KV cache does not support sink attention")
         if (q_len_per_req is not None and q_len_per_req > 1) or (
             max_q_len is not None and max_q_len > 1
         ):
@@ -1047,7 +1042,7 @@ def _test_trtllm_batch_decode(
         rtol, atol = rtol * 2, atol * 2
 
     # Arbitary small mismatch rate
-    allowed_mismatch_rate = 0.05 if kv_dtype == "nvfp4" else 5e-5
+    allowed_mismatch_rate = 0.03 if kv_dtype == "nvfp4" else 5e-5
     # Calculate max allowed mismatched elements based on tensor size
     total_elements = (output.float() * o_scale).numel()
     max_mismatched_elements = int(allowed_mismatch_rate * total_elements)
