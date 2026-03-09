@@ -75,7 +75,6 @@ class DtypeTrtllmGen(IntEnum):
 
 def trtllm_gen_dtype_has_scale(dtype: DtypeTrtllmGen) -> bool:
     if dtype in [
-        DtypeTrtllmGen.MxE4m3,
         DtypeTrtllmGen.E2m1,
         DtypeTrtllmGen.MxE2m1,
         DtypeTrtllmGen.MxE4m3,

@@ -1329,12 +1329,13 @@ def testMmMxfp8(args):
         return res
 
     inputs = {}
+    input = torch.randn([m, k], device=device, dtype=torch.bfloat16)
+    mat2 = torch.randn([n, k], device=device, dtype=torch.bfloat16)
     for backend in backends:
         ## Prepare input tensors
         # Use swizzled layout for optimal performance
         is_sf_swizzled_layout = backend in ["cutlass", "trtllm"]
 
-        input = torch.randn([m, k], device=device, dtype=torch.bfloat16)
         if not is_sf_swizzled_layout:
             sf_layout_input = flashinfer.SfLayout.layout_linear
         elif backend == "cutlass" or args.use_128x4_sf_layout:
@@ -1344,8 +1345,6 @@ def testMmMxfp8(args):
         input_mxfp8, input_scale = mxfp8_quantize(
             input, sf_swizzle_layout=sf_layout_input
         )
-
-        mat2 = torch.randn([n, k], device=device, dtype=torch.bfloat16)
         mat2_mxfp8, mat2_scale = mxfp8_quantize(
             mat2,
             is_sf_swizzled_layout=False

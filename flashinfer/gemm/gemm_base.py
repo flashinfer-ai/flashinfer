@@ -4685,7 +4685,7 @@ def get_trtllm_gemm_module():
                 a,
                 b.T,
                 a_descale,
-                b_descale.T,
+                b_descale,
                 alpha,
                 out,
                 self._use_8x4_sf_layout,
