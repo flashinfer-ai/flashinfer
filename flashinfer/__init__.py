@@ -60,7 +60,6 @@ from .decode import (
 from .decode import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .decode import single_decode_with_kv_cache as single_decode_with_kv_cache
 from .fp4_quantization import (
-    SfLayout,
     block_scale_interleave,
     nvfp4_block_scale_interleave,
     e2m1_and_ufp8sf_scale_to_float,
@@ -76,8 +75,6 @@ from .fp4_quantization import (
 )
 from .fp8_quantization import mxfp8_dequantize_host, mxfp8_quantize
 from .fused_moe import (
-    ActivationType,
-    RoutingMethodType,
     cutlass_fused_moe,
     reorder_rows_for_gated_act_gemm,
     trtllm_bf16_moe,
@@ -160,6 +157,7 @@ from .sampling import (
 from .sampling import top_k_top_p_sampling_from_probs as top_k_top_p_sampling_from_probs
 from .sampling import top_p_renorm_probs as top_p_renorm_probs
 from .sampling import top_p_sampling_from_probs as top_p_sampling_from_probs
+from .tllm_enums import SfLayout, ActivationType, RoutingMethodType
 from . import topk as topk
 from .topk import top_k as top_k
 from .topk import top_k_page_table_transform as top_k_page_table_transform

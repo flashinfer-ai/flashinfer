@@ -11,6 +11,7 @@ from .utils import (
     register_custom_op,
     register_fake_op,
 )
+from .tllm_enums import SfLayout
 
 
 def _compute_swizzled_layout_sf_size(total_row, total_column, row_size=128):
@@ -29,7 +30,7 @@ def get_mxfp8_quantization_sm100_module():
     )
     def mxfp8_quantize_sm100(
         input: torch.Tensor,
-        is_sf_swizzled_layout: bool = True,
+        sf_layout: int = SfLayout.layout_linear.value,
         alignment: int = 32,
         enable_pdl: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -37,7 +38,7 @@ def get_mxfp8_quantization_sm100_module():
 
         Args:
             input (torch.Tensor): Input tensor of shape [M, K] with dtype fp16/bf16/fp8_quantized.
-            is_sf_swizzled_layout (bool, optional): Whether to use swizzled layout for scale factors. Defaults to True.
+            sf_layout (int, optional): Swizzle layout for scale factors. Defaults to SfLayout.layout_linear.value.
             alignment (int, optional): sfVecSize. Defaults to 32. Note that alignment is not used in the host kernel.
             enable_pdl (Optional[bool], optional): Whether to enable PDL (Programmatic Dependent Launch).
                 If None, automatically detects based on device capability. Defaults to None.
@@ -48,18 +49,24 @@ def get_mxfp8_quantization_sm100_module():
         """
         if input.device.type == "cpu":
             out_val = torch.empty(input.shape, dtype=torch.uint8, device=input.device)
-            if is_sf_swizzled_layout:
+            if sf_layout == SfLayout.layout_128x4.value:
                 out_sf_size = _compute_swizzled_layout_sf_size(
                     input.shape[0], input.shape[1] // 32, 128
                 )
-            else:
+            elif sf_layout == SfLayout.layout_8x4.value:
+                out_sf_size = _compute_swizzled_layout_sf_size(
+                    input.shape[0], input.shape[1] // 32, 8
+                )
+            elif sf_layout == SfLayout.layout_linear.value:
                 out_sf_size = input.numel() // 32
+            else:
+                raise ValueError(f"Invalid sf_layout value: {sf_layout}")
             out_sf = torch.empty((out_sf_size,), dtype=torch.uint8, device=input.device)
             module.mxfp8_quantize_host(
                 input,
                 out_val,
                 out_sf,
-                is_sf_swizzled_layout,
+                sf_layout,
             )
             return out_val, out_sf
         else:
@@ -73,16 +80,20 @@ def get_mxfp8_quantization_sm100_module():
                 dtype=torch.float8_e4m3fn,
                 device=input.device,
             )
-            if is_sf_swizzled_layout:
+            if sf_layout == SfLayout.layout_128x4.value:
                 out_sf_size = _compute_swizzled_layout_sf_size(m, padded_k // 32, 128)
-            else:
+            elif sf_layout == SfLayout.layout_8x4.value:
+                out_sf_size = _compute_swizzled_layout_sf_size(m, padded_k // 32, 8)
+            elif sf_layout == SfLayout.layout_linear.value:
                 out_sf_size = m * padded_k // 32
+            else:
+                raise ValueError(f"Invalid sf_layout value: {sf_layout}")
             out_sf = torch.empty((out_sf_size,), dtype=torch.uint8, device=input.device)
             module.mxfp8_quantize(
                 input,
                 out_val,
                 out_sf,
-                is_sf_swizzled_layout,
+                sf_layout,
                 alignment,
                 enable_pdl,
             )
@@ -91,7 +102,7 @@ def get_mxfp8_quantization_sm100_module():
     @register_fake_op("flashinfer::mxfp8_quantize_sm100")
     def _fake_mxfp8_quantize_sm100(
         input: torch.Tensor,
-        is_sf_swizzled_layout: bool = True,
+        sf_layout: int = SfLayout.layout_linear.value,
         alignment: int = 32,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         m, k = input.shape
@@ -107,14 +118,14 @@ def get_mxfp8_quantization_sm100_module():
     def mxfp8_dequantize_host_sm100(
         input: torch.Tensor,
         scale_tensor: torch.Tensor,
-        is_sf_swizzled_layout: bool = True,
+        sf_layout: int = SfLayout.layout_linear.value,
     ) -> torch.Tensor:
         """Dequantize input tensor from MxFP8 format.
 
         Args:
             input (torch.Tensor): Input tensor of shape [M, K] with dtype FLOAT8_E4M3.
             scale_tensor (torch.Tensor): Scale factors tensor with shape determined by layout and sf_vec_size.
-            is_sf_swizzled_layout (bool, optional): Whether to use swizzled layout for scale factors. Defaults to True.
+            sf_layout (int, optional): Swizzle layout for scale factors. Defaults to SfLayout.layout_linear.value.
 
         Returns:
             torch.Tensor: Dequantized float tensor of shape [M, K] with dtype float32.
@@ -124,7 +135,7 @@ def get_mxfp8_quantization_sm100_module():
             input,
             scale_tensor,
             out,
-            is_sf_swizzled_layout,
+            sf_layout,
         )
         return out
 
@@ -132,7 +143,7 @@ def get_mxfp8_quantization_sm100_module():
     def _fake_mxfp8_dequantize_host_sm100(
         input: torch.Tensor,
         scale_tensor: torch.Tensor,
-        is_sf_swizzled_layout: bool = True,
+        sf_layout: int = SfLayout.layout_linear.value,
     ) -> torch.Tensor:
         return input.new_empty([input.shape[0], input.shape[1]], dtype=torch.float32)
 
@@ -149,6 +160,7 @@ def mxfp8_quantize(
     is_sf_swizzled_layout: bool = True,
     alignment: int = 32,
     enable_pdl: Optional[bool] = None,
+    sf_swizzle_layout: Optional[SfLayout] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize input tensor to MxFP8 format.
 
@@ -161,19 +173,24 @@ def mxfp8_quantize(
         alignment (int, optional): sfVecSize. Defaults to 32.
         enable_pdl (Optional[bool], optional): Whether to enable PDL (Programmatic Dependent Launch).
             If None, automatically detects based on device capability. Defaults to None.
+        sf_swizzle_layout (Optional[SfLayout], optional): Swizzle layout for scale factors. If provided, it overrides is_sf_swizzled_layout. Defaults to None.
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
             - Quantized tensor of shape [M, K] with dtype FLOAT8_E4M3
             - Scale factors tensor with shape determined by layout and sf_vec_size
     """
     sf_vec_size = 32
+    if sf_swizzle_layout is None:
+        sf_swizzle_layout = (
+            SfLayout.layout_128x4 if is_sf_swizzled_layout else SfLayout.layout_linear
+        )
 
     assert input.shape[-1] % sf_vec_size == 0
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
     x_q, sf = get_mxfp8_quantization_sm100_module().mxfp8_quantize_sm100(
         input,
-        is_sf_swizzled_layout,
+        sf_swizzle_layout,
         alignment,
         enable_pdl,
     )
@@ -185,6 +202,7 @@ def mxfp8_dequantize_host(
     input: torch.Tensor,
     scale_tensor: torch.Tensor,
     is_sf_swizzled_layout: bool = True,
+    sf_swizzle_layout: Optional[SfLayout] = None,
 ) -> torch.Tensor:
     """Dequantize input tensor from MxFP8 format.
 
@@ -195,14 +213,20 @@ def mxfp8_dequantize_host(
         input (torch.Tensor): Packed FP8 tensor in MxFP8 format of shape [M, K] with dtype FLOAT8_E4M3.
         scale_tensor (torch.Tensor): Scale factors tensor with shape determined by layout and sf_vec_size.
         is_sf_swizzled_layout (bool, optional): Whether scale factors use swizzled layout. Defaults to True.
+        sf_swizzle_layout (Optional[SfLayout], optional): Swizzle layout for scale factors. If provided, it overrides is_sf_swizzled_layout. Defaults to None.
 
     Returns:
         torch.Tensor: Dequantized float tensor of shape [M, K] with dtype float32.
 
     """
 
+    if sf_swizzle_layout is None:
+        sf_swizzle_layout = (
+            SfLayout.layout_128x4 if is_sf_swizzled_layout else SfLayout.layout_linear
+        )
+
     return get_mxfp8_quantization_sm100_module().mxfp8_dequantize_host_sm100(
         input,
         scale_tensor,
-        is_sf_swizzled_layout,
+        sf_swizzle_layout,
     )

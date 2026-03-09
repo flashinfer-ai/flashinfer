@@ -109,6 +109,17 @@ def deduce_trtllm_gen_tensor_dtype(
     return dtype
 
 
+# Please keep the values in sync with include/flashinfer/fp4_layout.cuh
+class SfLayout(IntEnum):
+    """
+    Layout of scale factors for quantization.
+    """
+
+    layout_128x4 = 0
+    layout_8x4 = 1
+    layout_linear = 2
+
+
 # See MatrixLayout from include/flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/Enums.h
 class WeightLayout(IntEnum):
     # K-major layout (default). [Mn, K]
