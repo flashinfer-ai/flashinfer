@@ -10,7 +10,7 @@ from tests.test_helpers.utils_fp4 import (
 from tests.test_helpers.test_helpers import assert_close_with_mismatch_tolerance
 import einops
 from tests.test_helpers.sink_attention_reference import sink_attention_unified
-from flashinfer.testing.kvfp4 import KVFP4QuantizeUtil
+from flashinfer.fp4_quantization import nvfp4_quantize_paged_kv_cache
 
 import flashinfer
 from flashinfer.utils import FP4Tensor, ceil_div, round_up, get_compute_capability
@@ -173,8 +173,8 @@ def create_kv_cache(
         assert kv_layout == "HND", "NVFP4 KV cache only supports HND layout"
         # Reference is the unquantized BF16 data
         ref_kv_cache = torch.stack([k_cache, v_cache], dim=1)
-        kv_cache, kv_block_scales, k_scale, v_scale = (
-            KVFP4QuantizeUtil.quantize_paged_kv_cache(k_cache, v_cache)
+        kv_cache, kv_block_scales, k_scale, v_scale = nvfp4_quantize_paged_kv_cache(
+            k_cache, v_cache
         )
     else:
         k_scale = v_scale = 1.0

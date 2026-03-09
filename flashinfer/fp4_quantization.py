@@ -972,6 +972,132 @@ def nvfp4_batched_quantize(
     return a_fp4, a_sf
 
 
+_E2M1_MAX = 6.0
+_FLOAT8_E4M3_MAX = 448.0  # torch.finfo(torch.float8_e4m3fn).max
+
+
+def _swizzle_kv_scales(
+    scales: torch.Tensor,
+    num_pages: int,
+    num_kv_heads: int,
+    page_size: int,
+    head_dim: int,
+) -> torch.Tensor:
+    """Apply scale factor swizzling for SM100 trtllm-gen MHA kernel.
+
+    Rearranges scale factors within each [page_size, head_dim//16] tile
+    using a 4x4 interleaving pattern required by the hardware layout.
+    """
+    scale_dim = head_dim // 16
+    return (
+        scales.reshape(num_pages, num_kv_heads, page_size // 4, 4, 4, scale_dim // 4)
+        .permute(0, 1, 2, 4, 5, 3)
+        .reshape(num_pages, num_kv_heads, page_size, scale_dim)
+        .contiguous()
+    )
+
+
+@flashinfer_api
+def nvfp4_quantize_paged_kv_cache(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+) -> Tuple[
+    Tuple[torch.Tensor, torch.Tensor],
+    Tuple[torch.Tensor, torch.Tensor],
+    float,
+    float,
+]:
+    """Quantize paged KV cache (HND layout) to NVFP4 format for trtllm-gen MHA.
+
+    Quantizes BF16/FP16 K/V caches to NVFP4 with two-level scaling
+    (global FP32 + per-block FP8), applies the /6 block-scale and *6
+    global-scale adjustment for FP8 compute, and swizzles scale factors
+    for the SM100 trtllm-gen MHA kernel layout.
+
+    Args:
+        k_cache: Key cache, shape [num_pages, num_kv_heads, page_size, head_dim].
+        v_cache: Value cache, shape [num_pages, num_kv_heads, page_size, head_dim].
+
+    Returns:
+        kv_cache_fp4: Tuple of (k_fp4, v_fp4), each
+            [num_pages, num_kv_heads, page_size, head_dim//2] dtype=uint8.
+        kv_block_scales: Tuple of (k_scales, v_scales), each
+            [num_pages, num_kv_heads, page_size, head_dim//16] dtype=float8_e4m3fn,
+            with /6 adjustment and SM100 swizzling applied.
+        k_global_scale: Adjusted global scale for K (float), with *6 applied.
+        v_global_scale: Adjusted global scale for V (float), with *6 applied.
+    """
+    num_pages, num_kv_heads, page_size, head_dim = k_cache.shape
+    device = k_cache.device
+
+    # Compute global scale factors (kernel convention: reciprocal)
+    # global_sf = FLOAT8_E4M3_MAX * E2M1_MAX / tensor_amax
+    k_amax = k_cache.float().abs().amax()
+    v_amax = v_cache.float().abs().amax()
+    k_global_sf = torch.tensor(
+        [_FLOAT8_E4M3_MAX * _E2M1_MAX / max(k_amax.item(), 1e-12)],
+        dtype=torch.float32,
+        device=device,
+    )
+    v_global_sf = torch.tensor(
+        [_FLOAT8_E4M3_MAX * _E2M1_MAX / max(v_amax.item(), 1e-12)],
+        dtype=torch.float32,
+        device=device,
+    )
+
+    # Flatten to 2D [total_tokens, head_dim] for fp4_quantize
+    k_2d = k_cache.reshape(-1, head_dim)
+    v_2d = v_cache.reshape(-1, head_dim)
+
+    # Quantize using FlashInfer's GPU kernel with linear scale layout
+    k_packed, k_sf = fp4_quantize(
+        k_2d, k_global_sf, sf_vec_size=16, is_sf_swizzled_layout=False
+    )
+    v_packed, v_sf = fp4_quantize(
+        v_2d, v_global_sf, sf_vec_size=16, is_sf_swizzled_layout=False
+    )
+
+    # fp4_quantize returns uint8 packed FP4 and uint8 scale factors (FP8 E4M3 encoded)
+    # Reshape packed data to page layout
+    kv_cache_fp4 = (
+        k_packed.view(torch.uint8).reshape(
+            num_pages, num_kv_heads, page_size, head_dim // 2
+        ),
+        v_packed.view(torch.uint8).reshape(
+            num_pages, num_kv_heads, page_size, head_dim // 2
+        ),
+    )
+
+    # Reshape scale factors to page layout and apply /6 adjustment for FP8 compute.
+    # Block scales from kernel are FP8 E4M3 encoded as uint8.
+    # The /6 makes E2M1 range [0,6] effectively [0,1] in FP8 compute.
+    k_sf_fp8 = k_sf.view(torch.float8_e4m3fn).reshape(
+        num_pages, num_kv_heads, page_size, head_dim // 16
+    )
+    v_sf_fp8 = v_sf.view(torch.float8_e4m3fn).reshape(
+        num_pages, num_kv_heads, page_size, head_dim // 16
+    )
+    k_sf_fp8 = (k_sf_fp8.float() / _E2M1_MAX).to(torch.float8_e4m3fn)
+    v_sf_fp8 = (v_sf_fp8.float() / _E2M1_MAX).to(torch.float8_e4m3fn)
+
+    # Apply scale factor swizzling for SM100 trtllm-gen MHA kernel
+    k_sf_fp8 = _swizzle_kv_scales(
+        k_sf_fp8, num_pages, num_kv_heads, page_size, head_dim
+    )
+    v_sf_fp8 = _swizzle_kv_scales(
+        v_sf_fp8, num_pages, num_kv_heads, page_size, head_dim
+    )
+
+    kv_block_scales = (k_sf_fp8, v_sf_fp8)
+
+    # Return global_scale with *6 adjustment for FP8 compute.
+    # kernel_gs = 448 * 6 / max, returned = E2M1_MAX / kernel_gs = max / 448
+    k_gs_ret = (_E2M1_MAX / k_global_sf).item()
+    v_gs_ret = (_E2M1_MAX / v_global_sf).item()
+
+    return kv_cache_fp4, kv_block_scales, k_gs_ret, v_gs_ret
+
+
 @flashinfer_api
 def scaled_fp4_grouped_quantize(
     a,

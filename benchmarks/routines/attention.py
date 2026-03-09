@@ -21,7 +21,7 @@ except OSError as e:
     is_lib_missing = any(ext in error_msg for ext in [".so", ".dll"])
     if not is_lib_missing:
         raise
-from flashinfer.testing.kvfp4 import KVFP4QuantizeUtil
+from flashinfer.fp4_quantization import nvfp4_quantize_paged_kv_cache
 from flashinfer.testing.utils import (
     attention_tb_per_sec_with_actual_seq_lens,
     attention_tflops_per_sec_with_actual_seq_lens,
@@ -603,7 +603,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             print("[ERROR] NVFP4 KV cache requires --q_dtype fp8_e4m3.")
             return res
         kv_cache_nvfp4, kv_block_scales, k_scale, v_scale = (
-            KVFP4QuantizeUtil.quantize_paged_kv_cache(kv_cache[:, 0], kv_cache[:, 1])
+            nvfp4_quantize_paged_kv_cache(kv_cache[:, 0], kv_cache[:, 1])
         )
     elif kv_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
         k_data, v_data = torch.chunk(kv_cache, 2, dim=1)

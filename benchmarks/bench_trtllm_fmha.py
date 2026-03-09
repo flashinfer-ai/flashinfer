@@ -4,7 +4,7 @@ import torch
 import flashinfer
 import flashinfer.decode
 from flashinfer.testing.utils import bench_gpu_time, bench_gpu_time_with_cudagraph
-from flashinfer.testing.kvfp4 import KVFP4QuantizeUtil
+from flashinfer.fp4_quantization import nvfp4_quantize_paged_kv_cache
 
 page_size = 16
 num_kv_heads = 4
@@ -132,8 +132,8 @@ def bench_trtllm_fmha_wrapper(
         else:
             k_scale_val = 1.0
 
-        kv_cache, kv_block_scales, k_gs, v_gs = (
-            KVFP4QuantizeUtil.quantize_paged_kv_cache(kv_cache[:, 0], kv_cache[:, 1])
+        kv_cache, kv_block_scales, k_gs, v_gs = nvfp4_quantize_paged_kv_cache(
+            kv_cache[:, 0], kv_cache[:, 1]
         )
         k_scale_val *= k_gs
         v_scale_val = v_gs
