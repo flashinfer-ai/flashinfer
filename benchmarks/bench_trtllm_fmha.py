@@ -4,7 +4,7 @@ import torch
 import flashinfer
 import flashinfer.decode
 from flashinfer.testing.utils import bench_gpu_time, bench_gpu_time_with_cudagraph
-from flashinfer.testing.kvfp4 import KVFP4QuantizeUtil
+from flashinfer.fp4_quantization import nvfp4_quantize_paged_kv_cache
 
 page_size = 16
 num_kv_heads = 4
@@ -132,8 +132,8 @@ def bench_trtllm_fmha_wrapper(
         else:
             k_scale_val = 1.0
 
-        kv_cache, kv_block_scales, k_gs, v_gs = (
-            KVFP4QuantizeUtil.quantize_paged_kv_cache(kv_cache[:, 0], kv_cache[:, 1])
+        kv_cache, kv_block_scales, k_gs, v_gs = nvfp4_quantize_paged_kv_cache(
+            kv_cache[:, 0], kv_cache[:, 1]
         )
         k_scale_val *= k_gs
         v_scale_val = v_gs
@@ -208,9 +208,18 @@ def bench_trtllm_fmha_wrapper(
     )
     ms = np.median(measurements)
     if isinstance(kv_cache, tuple):
-        io = q.numel() * q.element_size() + kv_cache[0].numel() + kv_cache[1].numel()
+        io = (
+            q.numel() * q.element_size()
+            + kv_cache[0].numel() * kv_cache[0].element_size()
+            + kv_cache[1].numel() * kv_cache[1].element_size()
+        )
     else:
         io = q.numel() * q.element_size() + kv_cache.numel() * kv_cache.element_size()
+    if kv_block_scales is not None:
+        io += (
+            kv_block_scales[0].numel() * kv_block_scales[0].element_size()
+            + kv_block_scales[1].numel() * kv_block_scales[1].element_size()
+        )
     print(
         f"batch_size={batch_size}, seq_len={max_seq_len}, num_qo_heads={num_qo_heads}, num_kv_heads={num_kv_heads}, head_dim={head_dim}, page_size={page_size}"
     )

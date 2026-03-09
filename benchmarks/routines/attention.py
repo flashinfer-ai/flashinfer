@@ -21,7 +21,7 @@ except OSError as e:
     is_lib_missing = any(ext in error_msg for ext in [".so", ".dll"])
     if not is_lib_missing:
         raise
-from flashinfer.testing.kvfp4 import KVFP4QuantizeUtil
+from flashinfer.fp4_quantization import nvfp4_quantize_paged_kv_cache
 from flashinfer.testing.utils import (
     attention_tb_per_sec_with_actual_seq_lens,
     attention_tflops_per_sec_with_actual_seq_lens,
@@ -394,19 +394,6 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         print("[INFO] auto backend is disabled for speculative decode. Skipping.")
         backends.remove("auto")
 
-    # NVFP4 KV cache only works with trtllm-native (direct API with kv_block_scales)
-    if is_nvfp4_kv:
-        unsupported = [b for b in backends if b != "trtllm-native"]
-        for b in unsupported:
-            print(f"[INFO] {b} backend does not support NVFP4 KV cache. Skipping.")
-            backends.remove(b)
-        if "trtllm-native" not in backends:
-            backends.append("trtllm-native")
-
-    if len(backends) == 0:
-        print("[ERROR] No backends to test. Exiting.")
-        return res
-
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
     outputs = {}
@@ -603,7 +590,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             print("[ERROR] NVFP4 KV cache requires --q_dtype fp8_e4m3.")
             return res
         kv_cache_nvfp4, kv_block_scales, k_scale, v_scale = (
-            KVFP4QuantizeUtil.quantize_paged_kv_cache(kv_cache[:, 0], kv_cache[:, 1])
+            nvfp4_quantize_paged_kv_cache(kv_cache[:, 0], kv_cache[:, 1])
         )
     elif kv_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
         k_data, v_data = torch.chunk(kv_cache, 2, dim=1)
@@ -631,8 +618,14 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         speculative_mask,
     ):
         if backend in ["fa2", "fa2_tc", "auto", "trtllm-gen"]:
+            wrapper_kv = kv_cache_nvfp4 if is_nvfp4_kv else kv_cache
             return backend_wrappers[backend].run(
-                q, kv_cache, k_scale=k_scale, v_scale=v_scale, q_len_per_req=s_qo
+                q,
+                wrapper_kv,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                q_len_per_req=s_qo,
+                kv_block_scales=kv_block_scales,
             )
         elif backend == "cudnn":
             return flashinfer.decode.cudnn_batch_decode_with_kv_cache(
@@ -760,7 +753,6 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 False,
                 median_time,
             )
-            bw_kv_dtype = kv_dtype
             tb_per_sec = attention_tb_per_sec_with_actual_seq_lens(
                 actual_seq_lens_q_flat,
                 actual_seq_lens_kv_flat,
@@ -770,7 +762,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 num_kv_heads,
                 median_time,
                 q_dtype=q_dtype,
-                kv_dtype=bw_kv_dtype,
+                kv_dtype=kv_dtype,
                 o_dtype=q_dtype,
             )
             resolved_backend = resolved_backends.get(backend, backend)
@@ -854,8 +846,9 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         print(f"[ERROR] Unsupported q_dtype: {args.q_dtype}")
         return res
 
+    is_nvfp4_kv = args.kv_dtype == "nvfp4"
     kv_dtype = dtype_str_to_torch_dtype(args.kv_dtype)
-    if kv_dtype not in [torch.bfloat16, torch.float8_e4m3fn]:
+    if kv_dtype not in [torch.bfloat16, torch.float8_e4m3fn, torch.uint8]:
         print(f"[ERROR] Unsupported kv_dtype: {args.kv_dtype}")
         return res
 
@@ -1133,6 +1126,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
     # Compute scales and convert to FP8 if needed (before creating wrappers)
     q_scale, k_scale, v_scale = None, None, None
     q_scale_tensor, k_scale_tensor, v_scale_tensor = None, None, None
+    kv_block_scales = None
     o_data_type = q_dtype  # Default output dtype
     # Separate K/V caches for cuDNN (which requires separate tensors, not combined kv_cache)
     k_cache_cudnn, v_cache_cudnn = k_cache, v_cache
@@ -1143,7 +1137,12 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         q_scale_tensor = q_scale_t.reshape(1, 1, 1, 1)
         # o_data_type stays as q_dtype (FP8 output)
 
-    if kv_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+    if is_nvfp4_kv:
+        kv_cache_nvfp4, kv_block_scales, k_scale, v_scale = (
+            nvfp4_quantize_paged_kv_cache(kv_cache[:, 0], kv_cache[:, 1])
+        )
+        kv_cache = kv_cache_nvfp4
+    elif kv_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
         # Convert k_cache and v_cache to quantized dtype for cuDNN
         k_cache_cudnn, k_scale_t = to_float8(k_cache, kv_dtype)
         v_cache_cudnn, v_scale_t = to_float8(v_cache, kv_dtype)
@@ -1242,7 +1241,12 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
     ):
         if backend in ["fa2", "fa3", "auto", "trtllm-gen"]:
             return backend_wrappers[backend].run(
-                q, kv_cache, q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
+                q,
+                kv_cache,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                kv_block_scales=kv_block_scales,
             )
         elif backend == "cudnn":
             # cuDNN uses wrapper API with tensor scales for FP8
@@ -1274,6 +1278,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 batch_size=batch_size,
                 cum_seq_lens_q=qo_indptr,
                 cum_seq_lens_kv=kv_indptr,
+                kv_block_scales=kv_block_scales,
             )
         elif backend == "cudnn-native":
             # Direct cudnn_batch_prefill_with_kv_cache call (similar to trtllm-native)
