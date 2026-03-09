@@ -50,14 +50,14 @@ static constexpr int NUM_COMPUTE_WARPS = 8;
 
 // Warp index layout:
 //   0       = load warp (per-head state_in + x)
-//   1       = idle (was z warp)
-//   2       = store warp (drain state_out ring → gmem)
+//   1       = idle
+//   2       = idle (was store warp — eliminated in step 18)
 //   3       = BC warp (issues TMA for B and C once at startup, then idle)
 //   4..11   = 8 compute warps (all process same head, split on DIM)
 //   12      = epilogue warp (silu(z) * out → gmem)
 static constexpr int WARP_LOAD = 0;
 static constexpr int WARP_IDLE_1 = 1;
-static constexpr int WARP_STORE = 2;
+static constexpr int WARP_IDLE_2 = 2;
 static constexpr int WARP_BC = 3;
 static constexpr int WARP_COMPUTE_BASE = 4;
 static constexpr int WARP_EPILOGUE = WARP_COMPUTE_BASE + NUM_COMPUTE_WARPS;  // 12
@@ -68,7 +68,7 @@ static constexpr int NUM_WARPS = WARP_EPILOGUE + 1;                          // 
 // =============================================================================
 
 template <typename input_t, typename state_t, int TOKENS_MTP, int HEADS_PER_GROUP, int DIM,
-          int DSTATE, int NUM_IN_STAGES, int NUM_OUT_STAGES>
+          int DSTATE, int NUM_IN_STAGES>
 struct SharedStorageVertical {
   // ── Shared across all heads (loaded once via TMA at startup) ────────────
   alignas(128) input_t B[TOKENS_MTP][DSTATE];
@@ -81,9 +81,6 @@ struct SharedStorageVertical {
   alignas(128) state_t state_in[NUM_IN_STAGES][DIM * DSTATE];
   alignas(128) input_t x[NUM_IN_STAGES][TOKENS_MTP][DIM];
 
-  // ── Ring-buffered state_out (compute writes, store warp drains) ─────────
-  alignas(128) state_t state_out[NUM_OUT_STAGES][DIM * DSTATE];
-
   // ── Output values: single buffer, all tokens for one head ───────────────
   float out[TOKENS_MTP][DIM];
 
@@ -91,8 +88,6 @@ struct SharedStorageVertical {
   barrier_t bar_BC_full;
   barrier_t bar_state_in_empty[NUM_IN_STAGES];
   barrier_t bar_state_in_full[NUM_IN_STAGES];
-  barrier_t bar_out_empty[NUM_OUT_STAGES];
-  barrier_t bar_out_full[NUM_OUT_STAGES];
   barrier_t bar_out_ready;
   barrier_t bar_epilogue_done;
 };
@@ -139,134 +134,42 @@ __device__ __forceinline__ void role_load(SramT& sram, int lane,
 }
 
 // =============================================================================
-// role_store — warp 2: drain state_out ring → gmem via TMA
-// =============================================================================
-
-template <typename state_t, typename stateIndex_t, int NTOKENS, int DIM, int DSTATE,
-          int HEADS_PER_GROUP, int NUM_OUT_STAGES, typename SramT>
-__device__ __forceinline__ void role_store(SramT& sram, int lane,
-                                           SelectiveStateMTPParams const& params, int batch,
-                                           int first_head, bool is_pad,
-                                           CUtensorMap const& tensorState,
-                                           CUtensorMap const& tensorIntermediateState) {
-  namespace cde = cuda::device::experimental;
-
-  auto const* __restrict__ intermediate_states = params.intermediate_states;
-  auto const* __restrict__ intermediate_state_indices =
-      reinterpret_cast<stateIndex_t const*>(params.intermediate_state_indices);
-  auto const* __restrict__ state_batch_indices =
-      reinterpret_cast<stateIndex_t const*>(params.state_batch_indices);
-
-  auto const state_batch =
-      state_batch_indices ? (int64_t)state_batch_indices[batch] : (int64_t)batch;
-  auto const icache_idx =
-      intermediate_state_indices ? (int64_t)intermediate_state_indices[batch] : state_batch;
-
-  // Pre-arrive: initial out slots start empty
-  for (int s = 0; s < NUM_OUT_STAGES; s++) {
-    sram.bar_out_empty[s].arrive();
-  }
-
-  // Pipelined TMA stores: commit each store into its own group, allow 1 in flight.
-  // The previous slot is released only after its store completes (wait_group_read<1>),
-  // overlapping the current store with the wait for the next slot from compute.
-  int prev_slot = -1;
-
-  for (int h_local = 0; h_local < HEADS_PER_GROUP; h_local++) {
-    int const head = first_head + h_local;
-
-    for (int step = 0; step < NTOKENS; step++) {
-      int const slot = step % NUM_OUT_STAGES;
-
-      // If there's an in-flight TMA store occupying this same slot, drain it first.
-      // Otherwise compute can't produce bar_out_full[slot] (blocked on bar_out_empty[slot]).
-      if (prev_slot == slot) {
-        if (lane == 0) {
-          cde::cp_async_bulk_wait_group_read<0>();
-        }
-        __syncwarp();
-        sram.bar_out_empty[prev_slot].arrive();
-        prev_slot = -1;
-      }
-
-      // Wait for compute to fill this slot
-      sram.bar_out_full[slot].wait(sram.bar_out_full[slot].arrive());
-
-      if (!is_pad) {
-        bool did_tma_store = false;
-
-        // Write intermediate states via TMA store
-        if (intermediate_states) {
-          if (lane == 0) {
-            cde::cp_async_bulk_tensor_5d_shared_to_global(&tensorIntermediateState, 0, 0, head,
-                                                          step, (int)icache_idx,
-                                                          &sram.state_out[slot][0]);
-          }
-          did_tma_store = true;
-        }
-
-        // Write final state via TMA store (last token step only)
-        if (step == NTOKENS - 1 && params.update_state) {
-          if (lane == 0) {
-            cde::cp_async_bulk_tensor_4d_shared_to_global(
-                &tensorState, 0, 0, head, (int)state_batch, &sram.state_out[slot][0]);
-          }
-          did_tma_store = true;
-        }
-
-        if (did_tma_store) {
-          if (lane == 0) {
-            cde::cp_async_bulk_commit_group();
-          }
-          // Wait for previous store to complete, release its slot
-          if (prev_slot >= 0) {
-            if (lane == 0) {
-              cde::cp_async_bulk_wait_group_read<1>();
-            }
-            __syncwarp();
-            sram.bar_out_empty[prev_slot].arrive();
-          }
-          prev_slot = slot;
-        } else {
-          // No TMA store — release slot immediately
-          sram.bar_out_empty[slot].arrive();
-        }
-      } else {
-        // Padded batch — release slot immediately
-        sram.bar_out_empty[slot].arrive();
-      }
-    }
-  }
-
-  // Drain last in-flight store
-  if (prev_slot >= 0) {
-    if (lane == 0) {
-      cde::cp_async_bulk_wait_group_read<0>();
-    }
-    __syncwarp();
-    sram.bar_out_empty[prev_slot].arrive();
-  }
-}
-
-// =============================================================================
 // role_update_state — warps 4-11: SSM update, all warps process same head
+// Compute warps write intermediate_states and final state directly to gmem
+// using vectorized STG (contiguous-per-thread DSTATE layout).
 // =============================================================================
 
-template <typename input_t, typename state_t, typename matrixA_t, typename weight_t, int NTOKENS,
-          int DIM, int DSTATE, int HEADS_PER_GROUP, int NUM_IN_STAGES, int NUM_OUT_STAGES,
-          typename SramT>
+template <typename input_t, typename state_t, typename matrixA_t, typename weight_t,
+          typename stateIndex_t, int NTOKENS, int DIM, int DSTATE, int HEADS_PER_GROUP,
+          int NUM_IN_STAGES, typename SramT>
 __device__ __forceinline__ void role_update_state(SramT& sram, int lane, int compute_warp,
                                                   SelectiveStateMTPParams const& params, int batch,
-                                                  int first_head) {
+                                                  int first_head, bool is_pad) {
   // sizeof(state_t) == sizeof(input_t) is enforced by the launcher via FLASHINFER_CHECK + if
   // constexpr guard
   constexpr int rowsPerWarp = DIM / NUM_COMPUTE_WARPS;
   constexpr auto stateValuesPerThread = DSTATE / warpSize;
+  // Packed type for vectorized gmem stores: stateValuesPerThread contiguous state_t values
+  using packed_state_t = PackedAligned<state_t, stateValuesPerThread>;
 
   auto const* __restrict__ dt_ptr = reinterpret_cast<weight_t const*>(params.dt);
   auto const* __restrict__ A_ptr = reinterpret_cast<matrixA_t const*>(params.A);
   auto const* __restrict__ D_ptr = reinterpret_cast<weight_t const*>(params.D);
   auto const* __restrict__ dt_bias_ptr = reinterpret_cast<weight_t const*>(params.dt_bias);
+
+  // Gmem pointers for direct STG writes
+  auto* __restrict__ state_ptr = reinterpret_cast<state_t*>(params.state);
+  auto* __restrict__ istate_ptr = reinterpret_cast<state_t*>(params.intermediate_states);
+
+  auto const* __restrict__ state_batch_indices =
+      reinterpret_cast<stateIndex_t const*>(params.state_batch_indices);
+  auto const* __restrict__ intermediate_state_indices =
+      reinterpret_cast<stateIndex_t const*>(params.intermediate_state_indices);
+
+  auto const state_batch =
+      state_batch_indices ? (int64_t)state_batch_indices[batch] : (int64_t)batch;
+  auto const icache_idx =
+      intermediate_state_indices ? (int64_t)intermediate_state_indices[batch] : state_batch;
 
   // Wait for B/C to be loaded
   sram.bar_BC_full.wait(sram.bar_BC_full.arrive());
@@ -302,24 +205,21 @@ __device__ __forceinline__ void role_update_state(SramT& sram, int lane, int com
     sram.bar_state_in_full[in_slot].wait(sram.bar_state_in_full[in_slot].arrive());
 
     // Load state into registers: rState[wr][ii] persists across token steps
-    // Simple stride-by-warpSize indexing: element i = lane + ii * warpSize
+    // Contiguous-per-thread indexing: thread t holds elements [t*N, t*N+1, ..., t*N+(N-1)]
     float rState[rowsPerWarp][stateValuesPerThread];
 
     for (int wr = 0; wr < rowsPerWarp; wr++) {
       int const dd = compute_warp * rowsPerWarp + wr;
       for (int ii = 0; ii < stateValuesPerThread; ii++) {
-        rState[wr][ii] = toFloat(sram.state_in[in_slot][dd * DSTATE + lane + ii * warpSize]);
+        rState[wr][ii] =
+            toFloat(sram.state_in[in_slot][dd * DSTATE + lane * stateValuesPerThread + ii]);
       }
     }
 
     // Step-major loop
     for (int step = 0; step < NTOKENS; step++) {
-      int const slot = step % NUM_OUT_STAGES;
       float const dt_value = sram.dt[step];
       float const dA = __expf(A_val * dt_value);
-
-      // Wait for store warp to free this out-slot
-      sram.bar_out_empty[slot].wait(sram.bar_out_empty[slot].arrive());
 
       for (int wr = 0; wr < rowsPerWarp; wr++) {
         int const dd = compute_warp * rowsPerWarp + wr;
@@ -330,9 +230,9 @@ __device__ __forceinline__ void role_update_state(SramT& sram, int lane, int com
 #pragma unroll
         for (int ii = 0; ii < stateValuesPerThread; ii++) {
           float& sv = rState[wr][ii];
-          float dB = toFloat(sram.B[step][lane + ii * warpSize]) * dt_value;
+          float dB = toFloat(sram.B[step][lane * stateValuesPerThread + ii]) * dt_value;
           sv = sv * dA + dB * x_value;
-          out_value += sv * toFloat(sram.C[step][lane + ii * warpSize]);
+          out_value += sv * toFloat(sram.C[step][lane * stateValuesPerThread + ii]);
         }
 
         out_value = warpReduceSum(out_value);
@@ -341,15 +241,31 @@ __device__ __forceinline__ void role_update_state(SramT& sram, int lane, int com
           sram.out[step][dd] = out_value;
         }
 
-        // Write rState to state_out ring
-        for (int ii = 0; ii < stateValuesPerThread; ii++) {
-          convertAndStore(&sram.state_out[slot][dd * DSTATE + lane + ii * warpSize],
-                          rState[wr][ii]);
+        // Write intermediate state directly to gmem via vectorized STG
+        if (istate_ptr && !is_pad) {
+          packed_state_t rStateOut;
+#pragma unroll
+          for (int k = 0; k < stateValuesPerThread; k++) {
+            convertAndStore(&rStateOut.val[k], rState[wr][k]);
+          }
+          *reinterpret_cast<packed_state_t*>(
+              &istate_ptr[icache_idx * params.intermediate_state_stride_batch +
+                          step * params.nheads * DIM * DSTATE + head * DIM * DSTATE + dd * DSTATE +
+                          lane * stateValuesPerThread]) = rStateOut;
+        }
+
+        // Write final state directly to gmem at last step
+        if (step == NTOKENS - 1 && params.update_state && !is_pad) {
+          packed_state_t rStateOut;
+#pragma unroll
+          for (int k = 0; k < stateValuesPerThread; k++) {
+            convertAndStore(&rStateOut.val[k], rState[wr][k]);
+          }
+          *reinterpret_cast<packed_state_t*>(
+              &state_ptr[state_batch * params.state_stride_batch + head * DIM * DSTATE +
+                         dd * DSTATE + lane * stateValuesPerThread]) = rStateOut;
         }
       }  // warpRow loop
-
-      // All rows written for this step — signal store warp
-      sram.bar_out_full[slot].arrive();
     }  // step loop
 
     // Signal epilogue: out[] ready
@@ -422,15 +338,14 @@ __device__ __forceinline__ void role_epilogue(SramT& sram, int lane,
 // Block: (32, NUM_WARPS)
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t,
           typename stateIndex_t, int NTOKENS, int DIM, int DSTATE, int HEADS_PER_GROUP,
-          int NUM_IN_STAGES, int NUM_OUT_STAGES>
+          int NUM_IN_STAGES>
 __global__ void selective_state_update_kernel_vertical_mtp(
     SelectiveStateMTPParams params, __grid_constant__ CUtensorMap const tensorState,
     __grid_constant__ CUtensorMap const tensorB, __grid_constant__ CUtensorMap const tensorC,
-    __grid_constant__ CUtensorMap const tensorIntermediateState,
     __grid_constant__ CUtensorMap const tensorX) {
   extern __shared__ __align__(128) char smem[];
-  using sram_t = SharedStorageVertical<input_t, state_t, NTOKENS, HEADS_PER_GROUP, DIM, DSTATE,
-                                       NUM_IN_STAGES, NUM_OUT_STAGES>;
+  using sram_t =
+      SharedStorageVertical<input_t, state_t, NTOKENS, HEADS_PER_GROUP, DIM, DSTATE, NUM_IN_STAGES>;
   auto& sram = *reinterpret_cast<sram_t*>(smem);
 
   int const batch = blockIdx.x;
@@ -449,7 +364,6 @@ __global__ void selective_state_update_kernel_vertical_mtp(
   if (warp == 0 && lane == 0) {
     constexpr int numBCLoadWarps = 1;
     constexpr int numLoadWarps = 1;
-    constexpr int numStoreWarps = 1;
     constexpr int numEpilogueWarps = 1;
 
     init(&sram.bar_BC_full, (numBCLoadWarps + NUM_COMPUTE_WARPS) * warpSize);
@@ -457,10 +371,6 @@ __global__ void selective_state_update_kernel_vertical_mtp(
     for (int s = 0; s < NUM_IN_STAGES; s++) {
       init(&sram.bar_state_in_empty[s], (NUM_COMPUTE_WARPS + numLoadWarps) * warpSize);
       init(&sram.bar_state_in_full[s], 1 + NUM_COMPUTE_WARPS * warpSize);
-    }
-    for (int s = 0; s < NUM_OUT_STAGES; s++) {
-      init(&sram.bar_out_empty[s], (numStoreWarps + NUM_COMPUTE_WARPS) * warpSize);
-      init(&sram.bar_out_full[s], (NUM_COMPUTE_WARPS + numStoreWarps) * warpSize);
     }
     init(&sram.bar_out_ready, (NUM_COMPUTE_WARPS + numEpilogueWarps) * warpSize);
     init(&sram.bar_epilogue_done, (numEpilogueWarps + NUM_COMPUTE_WARPS) * warpSize);
@@ -471,13 +381,6 @@ __global__ void selective_state_update_kernel_vertical_mtp(
   if (warp == WARP_LOAD) {
     role_load<input_t, state_t, stateIndex_t, NTOKENS, DIM, DSTATE, HEADS_PER_GROUP, NUM_IN_STAGES>(
         sram, lane, params, batch, first_head, tensorState, tensorX);
-
-  } else if (warp == WARP_IDLE_1) {
-    // Idle
-
-  } else if (warp == WARP_STORE) {
-    role_store<state_t, stateIndex_t, NTOKENS, DIM, DSTATE, HEADS_PER_GROUP, NUM_OUT_STAGES>(
-        sram, lane, params, batch, first_head, is_pad, tensorState, tensorIntermediateState);
 
   } else if (warp == WARP_BC) {
     // Issue TMA loads for B and C at startup; then idle.
@@ -493,13 +396,14 @@ __global__ void selective_state_update_kernel_vertical_mtp(
 
   } else if (warp >= WARP_COMPUTE_BASE && warp < WARP_EPILOGUE) {
     int const compute_warp = warp - WARP_COMPUTE_BASE;
-    role_update_state<input_t, state_t, matrixA_t, weight_t, NTOKENS, DIM, DSTATE, HEADS_PER_GROUP,
-                      NUM_IN_STAGES, NUM_OUT_STAGES>(sram, lane, compute_warp, params, batch,
-                                                     first_head);
+    role_update_state<input_t, state_t, matrixA_t, weight_t, stateIndex_t, NTOKENS, DIM, DSTATE,
+                      HEADS_PER_GROUP, NUM_IN_STAGES>(sram, lane, compute_warp, params, batch,
+                                                      first_head, is_pad);
 
   } else if (warp == WARP_EPILOGUE) {
     role_epilogue<input_t, NTOKENS, DIM, HEADS_PER_GROUP>(sram, lane, params, batch, first_head);
   }
+  // Warps 1, 2 are idle
 }
 
 }  // namespace flashinfer::mamba::mtp
