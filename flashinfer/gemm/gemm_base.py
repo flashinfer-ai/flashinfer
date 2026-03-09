@@ -3113,7 +3113,8 @@ def mm_mxfp8(
     a_descale: torch.Tensor
         Block scale tensor for A. Can be:
         - 2D non-swizzled: shape (m, k // 32)
-        - 1D swizzled: shape (M_padded * K_padded,) where M_padded = round_up(m, 128), K_padded = round_up(k // 32, 4)
+        - 1D swizzled: shape (M_padded * K_padded,)
+          where M_padded = round_up(m, 8 if 8x4 layout else 128), K_padded = round_up(k // 32, 4)
         dtype: uint8.
 
     b_descale: torch.Tensor
@@ -3133,9 +3134,10 @@ def mm_mxfp8(
     backend: Literal["cutlass", "cute-dsl", "trtllm", "auto"]
         The backend to use for the operation. Defaults to ``"auto"``.
         ``"auto"`` selects the CUTLASS backend.
-        The ``"cute-dsl"`` backend currently requires swizzled 1D scales
-        (``mxfp8_quantize(..., is_sf_swizzled_layout=True)``).
-        The ``"trtllm"`` requires b to be quantized with 128x4 swizzle layout and shuffled. a can be quantized with either 128x4 or 8x4 layout (controlled by `use_8x4_sf_layout`).
+        - The ``"cute-dsl"`` backend currently requires swizzled 1D scales
+          (``mxfp8_quantize(..., is_sf_swizzled_layout=True)``).
+        - The ``"trtllm"`` requires b to be quantized with 128x4 swizzle layout and shuffled.
+          a can be quantized with either 128x4 or 8x4 layout (controlled by `use_8x4_sf_layout`).
 
     Returns
     -------

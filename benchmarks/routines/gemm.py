@@ -1360,7 +1360,7 @@ def testMmMxfp8(args):
                 mat2_scale.reshape(n, k // 32),
                 128,
                 num_elts_per_sf=32,
-            ).reshape(n, k // 32)
+            )
             mat2_scale = mat2_scale.t()
 
         inputs[backend] = (input_mxfp8, mat2_mxfp8, input_scale, mat2_scale)
