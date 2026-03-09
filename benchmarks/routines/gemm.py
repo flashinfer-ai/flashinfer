@@ -1332,7 +1332,7 @@ def testMmMxfp8(args):
     for backend in backends:
         ## Prepare input tensors
         # Use swizzled layout for optimal performance
-        is_sf_swizzled_layout = backend == "cutlass"
+        is_sf_swizzled_layout = backend in ["cutlass", "trtllm"]
 
         input = torch.randn([m, k], device=device, dtype=torch.bfloat16)
         input_mxfp8, input_scale = mxfp8_quantize(
@@ -1341,7 +1341,10 @@ def testMmMxfp8(args):
 
         mat2 = torch.randn([n, k], device=device, dtype=torch.bfloat16)
         mat2_mxfp8, mat2_scale = mxfp8_quantize(
-            mat2, is_sf_swizzled_layout=is_sf_swizzled_layout
+            mat2,
+            is_sf_swizzled_layout=False
+            if backend == "trtllm"
+            else is_sf_swizzled_layout,
         )
 
         if backend == "trtllm":
@@ -1353,6 +1356,7 @@ def testMmMxfp8(args):
                 128,
                 num_elts_per_sf=32,
             ).reshape(n, k // 32)
+            mat2_scale = mat2_scale.t()
 
         inputs[backend] = (input_mxfp8, mat2_mxfp8, input_scale, mat2_scale)
 
@@ -1368,7 +1372,7 @@ def testMmMxfp8(args):
             a=input_mxfp8,
             b=mat2_mxfp8.t(),  # mm_mxfp8 expects b.t()
             a_descale=input_scale,
-            b_descale=mat2_scale,  # mm_mxfp8 handles swizzled 1D internally
+            b_descale=mat2_scale,
             out_dtype=res_dtype,
             backend=backend,
         )
