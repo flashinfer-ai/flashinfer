@@ -59,7 +59,7 @@ from ..jit.gemm import gen_tgv_gemm_sm10x_module
 from ..jit.gemm import gen_deepgemm_sm100_module
 from ..jit.cpp_ext import get_cuda_version
 from ..jit.gemm import gen_fp8_blockscale_gemm_sm90_module
-from ..tllm_enums import DtypeTrtllmGen
+from ..tllm_enums import DtypeTrtllmGen, SfLayout
 
 
 CUDNN_AVAILABLE = False
@@ -2550,9 +2550,13 @@ def _check_mm_mxfp8_problem_size(
 
     # MXFP8 block size
     sf_vec_size = 32
+    if a_descale.ndim == 2:
+        sf_layout = SfLayout.layout_linear
+    else:
+        sf_layout = SfLayout.layout_8x4 if use_8x4_sf_layout else SfLayout.layout_128x4
 
     if a_descale.ndim == 1:
-        expected_len = _mxfp8_swizzled_scale_len(a.shape[0], a.shape[1])
+        expected_len = _mxfp8_swizzled_scale_len(a.shape[0], a.shape[1], sf_layout)
         if a_descale.shape[0] != expected_len:
             raise ValueError(
                 "a_descale shape mismatch for swizzled layout. "
@@ -2576,7 +2580,7 @@ def _check_mm_mxfp8_problem_size(
         )
 
     if b_descale.ndim == 1:
-        expected_len = _mxfp8_swizzled_scale_len(b.shape[1], b.shape[0])
+        expected_len = _mxfp8_swizzled_scale_len(b.shape[1], b.shape[0], sf_layout)
         if b_descale.shape[0] != expected_len:
             raise ValueError(
                 "b_descale shape mismatch for swizzled layout. "
@@ -3917,11 +3921,20 @@ def _pad_up(x, y):
     return ((x + y - 1) // y) * y
 
 
-def _mxfp8_swizzled_scale_len(m: int, k: int) -> int:
-    """Return the 1D swizzled scale length for MXFP8 (F8_128x4 layout)."""
-    m_padded = _pad_up(m, 128)
-    num_k_tiles = _pad_up(k, 128) // 128
-    return m_padded * num_k_tiles * 4
+def _mxfp8_swizzled_scale_len(m: int, k: int, swizzle_layout: SfLayout) -> int:
+    """Return the 1D swizzled scale length for MXFP8."""
+    if swizzle_layout == SfLayout.layout_128x4:
+        m_padded = _pad_up(m, 128)
+        num_k_tiles = _pad_up(k, 128) // 128
+        return m_padded * num_k_tiles * 4
+    elif swizzle_layout == SfLayout.layout_8x4:
+        m_padded = _pad_up(m, 8)
+        num_k_tiles = _pad_up(k, 128) // 128
+        return m_padded * num_k_tiles * 4
+    elif swizzle_layout == SfLayout.layout_linear:
+        return m * k
+    else:
+        raise ValueError(f"Unsupported swizzle layout: {swizzle_layout}")
 
 
 _MM_FP4_TUNING_CONFIG_8x4 = TuningConfig(
@@ -3986,7 +3999,9 @@ _MM_MXFP8_TUNING_CONFIG = TuningConfig(
             2,  # a_descale_tensor_index
             0,
             lambda shapes: (
-                _mxfp8_swizzled_scale_len(shapes[0][0], shapes[0][1])
+                _mxfp8_swizzled_scale_len(
+                    shapes[0][0], shapes[0][1], SfLayout.layout_128x4
+                )
                 if len(shapes[2]) == 1
                 else shapes[0][0]
             ),
@@ -4619,14 +4634,20 @@ def get_trtllm_gemm_module():
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
         ) -> List[int]:
-            a_tensor_index = 1
-            b_tensor_index = 2
+            a_tensor_index = 0
+            b_tensor_index = 1
 
             a = profile.get_opt_shapes()[a_tensor_index]
             b = profile.get_opt_shapes()[b_tensor_index]
             m = a[0]
-            n = b[0]
-            k = a[1] * 2
+            n = b[1]
+            assert a[1] == b[0], (
+                f"The k dimension is inconsistent between A ({a}) and B ({b})"
+            )
+            if self._input_dtype == DtypeTrtllmGen.E2m1:
+                k = a[1] * 2
+            else:
+                k = a[1]
             (
                 a,
                 b,

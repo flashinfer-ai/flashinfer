@@ -1335,8 +1335,14 @@ def testMmMxfp8(args):
         is_sf_swizzled_layout = backend in ["cutlass", "trtllm"]
 
         input = torch.randn([m, k], device=device, dtype=torch.bfloat16)
+        if not is_sf_swizzled_layout:
+            sf_layout_input = flashinfer.SfLayout.layout_linear
+        elif backend == "cutlass" or args.use_128x4_sf_layout:
+            sf_layout_input = flashinfer.SfLayout.layout_128x4
+        elif backend == "trtllm":
+            sf_layout_input = flashinfer.SfLayout.layout_8x4
         input_mxfp8, input_scale = mxfp8_quantize(
-            input, is_sf_swizzled_layout=is_sf_swizzled_layout
+            input, sf_swizzle_layout=sf_layout_input
         )
 
         mat2 = torch.randn([n, k], device=device, dtype=torch.bfloat16)
@@ -1375,6 +1381,7 @@ def testMmMxfp8(args):
             b_descale=mat2_scale,
             out_dtype=res_dtype,
             backend=backend,
+            use_8x4_sf_layout=backend == "trtllm" and not args.use_128x4_sf_layout,
         )
 
     has_reference_output = False
