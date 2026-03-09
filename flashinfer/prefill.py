@@ -3438,7 +3438,7 @@ def trtllm_ragged_attention_deepseek(
     window_left: int,
     cum_seq_lens_q: torch.Tensor,
     cum_seq_lens_kv: torch.Tensor,
-    enable_pdl: bool,
+    enable_pdl: bool | None,
     is_causal: bool,
     return_lse: bool,
     attention_sinks: Optional[torch.Tensor] = None,
@@ -3503,8 +3503,12 @@ def trtllm_ragged_attention_deepseek(
         If return_lse is True, the output will be a tuple of two tensors, the first is the output tensor, the second is the lse tensor.
         If return_lse is False, the output will be a single tensor.
     """
-    assert query.shape[2] == 192 and key.shape[2] == 192 and value.shape[2] == 128, (
-        "currently only support deepseek r1 192 query and 128 value"
+    is_dsr1 = query.shape[2] == 192 and key.shape[2] == 192 and value.shape[2] == 128
+    is_smaller_dimensions = (
+        query.shape[2] == 128 and key.shape[2] == 128 and value.shape[2] == 128
+    )
+    assert is_dsr1 or is_smaller_dimensions, (
+        "currently only support deepseek r1 192 query and 128 value or smaller dimensions 128 query and 128 value"
     )
 
     if enable_pdl is None:
@@ -3513,13 +3517,33 @@ def trtllm_ragged_attention_deepseek(
     run_func = get_trtllm_gen_fmha_module().trtllm_ragged_attention
     sm_count = get_device_sm_count(query.device)
     if out is None:
+        # FP8 inputs produce bfloat16 output by default (TRT-LLM kernels
+        # do not support FP8 output for ragged attention)
+        if query.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            out_dtype = torch.bfloat16
+        else:
+            out_dtype = query.dtype
         out = torch.empty(
             query.shape[0],
             query.shape[1],
             value.shape[2],
             device=query.device,
-            dtype=query.dtype,
+            dtype=out_dtype,
         )
+    else:
+        expected_shape = (query.shape[0], query.shape[1], value.shape[2])
+        if tuple(out.shape) != expected_shape:
+            raise ValueError(
+                f"out must have shape {expected_shape}, got {tuple(out.shape)}"
+            )
+        if query.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and out.dtype in (
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        ):
+            raise ValueError(
+                "FP8 output is not supported for trtllm_ragged_attention_deepseek; "
+                "use bfloat16 or float16 for out."
+            )
     if return_lse and lse is None:
         lse = torch.empty(
             query.shape[0],
@@ -3560,6 +3584,9 @@ def trtllm_ragged_attention_deepseek(
         lse,
     )
     if return_lse:
+        assert lse is not None, (
+            "lse assumed not None beyond this point when return_lse is True"
+        )
         return out, lse
     else:
         return out

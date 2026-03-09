@@ -401,14 +401,24 @@ namespace tinygemm2 {
 // and writes output in column-major: output[n * M + m].
 // The Python wrapper transposes this back to row-major (batch_size, output_features).
 
-void launch_tinygemm2(__nv_bfloat16* gA, __nv_bfloat16* gB, __nv_bfloat16* gC, __nv_bfloat16* bias,
-                      int batch_size, int output_features, int input_features, cudaStream_t stream,
-                      bool use_pdl) {
+// Query the max dynamic shared memory for the current device (cached per device).
+static int get_max_dynamic_smem() {
+  static int cached = -1;
+  if (cached >= 0) return cached;
+  int device;
+  cudaGetDevice(&device);
+  cudaDeviceGetAttribute(&cached, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+  return cached;
+}
+
+template <int STAGES>
+void launch_tinygemm2_impl(__nv_bfloat16* gA, __nv_bfloat16* gB, __nv_bfloat16* gC,
+                           __nv_bfloat16* bias, int batch_size, int output_features,
+                           int input_features, cudaStream_t stream, bool use_pdl) {
   static int const WARP_TILE_M = 16;
   static int const TILE_M = WARP_TILE_M;
   static int const TILE_N = 8;
   static int const TILE_K = 64;
-  static int const STAGES = 16;
   static int const STAGE_UNROLL = 4;
 
   CUtensorMap weight_map{};
@@ -489,6 +499,32 @@ void launch_tinygemm2(__nv_bfloat16* gA, __nv_bfloat16* gB, __nv_bfloat16* gC, _
     status = cudaGetLastError();
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "tinygemm_kernel launch failed: " << cudaGetErrorString(status);
+  }
+}
+
+void launch_tinygemm2(__nv_bfloat16* gA, __nv_bfloat16* gB, __nv_bfloat16* gC, __nv_bfloat16* bias,
+                      int batch_size, int output_features, int input_features, cudaStream_t stream,
+                      bool use_pdl) {
+  // Dynamic shared memory per pipeline stage (STAGE_UNROLL=4 stages per group):
+  //   STAGE_UNROLL * (TILE_M * TILE_K + TILE_N * TILE_K) * sizeof(bf16)
+  //   = 4 * (16*64 + 8*64) * 2 = 12288 bytes per STAGES increment
+  static constexpr int SMEM_PER_STAGE_GROUP = 4 * (16 * 64 + 8 * 64) * 2;  // 12288
+
+  int max_smem = get_max_dynamic_smem();
+  int max_stages = max_smem / SMEM_PER_STAGE_GROUP;
+
+  // Dispatch to the largest STAGES that fits. SM90/100f typically allows 16, SM120 allows 4.
+  if (max_stages >= 16) {
+    launch_tinygemm2_impl<16>(gA, gB, gC, bias, batch_size, output_features, input_features, stream,
+                              use_pdl);
+  } else if (max_stages >= 4) {
+    // We must keep STAGES as a multiple of 4 (one slot per compute warp).
+    launch_tinygemm2_impl<4>(gA, gB, gC, bias, batch_size, output_features, input_features, stream,
+                             use_pdl);
+  } else {
+    TVM_FFI_ICHECK(false) << "Device has insufficient shared memory for tinygemm2 kernel ("
+                          << max_smem << " bytes available, minimum " << 4 * SMEM_PER_STAGE_GROUP
+                          << " bytes required)";
   }
 }
 
