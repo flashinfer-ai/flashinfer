@@ -20,6 +20,7 @@ from tests.test_helpers.jit_utils import (
     gen_decode_attention_modules,
     gen_prefill_attention_modules,
 )
+from tests.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
 from functools import partial
 import flashinfer
 from flashinfer.utils import has_flashinfer_jit_cache
@@ -680,6 +681,135 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
         torch.testing.assert_close(o[i], o_ref_i, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize("batch_size", [12, 17, 128])
+@pytest.mark.parametrize("kv_len", [54, 97, 512, 2048, 16384])
+@pytest.mark.parametrize("page_size", [1, 8, 16])
+@pytest.mark.parametrize("num_kv_heads", [4])
+@pytest.mark.parametrize("num_qo_heads", [4, 32])
+@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize("q_dtype", [torch.float16, torch.bfloat16])
+def test_batch_decode_with_paged_kv_cache_nvfp4(
+    batch_size,
+    kv_len,
+    page_size,
+    num_kv_heads,
+    num_qo_heads,
+    head_dim,
+    q_dtype,
+):
+    """Test BatchDecodeWithPagedKVCacheWrapper with NVFP4 KV cache.
+
+    KV cache layout (NHD):
+      kv_cache:    [num_pages, 2, page_size, num_kv_heads, head_dim//2]   uint8 (packed FP4x2)
+      kv_cache_sf: [num_pages, 2, page_size, num_kv_heads, head_dim//16]  uint8 (FP8 SFs)
+
+    Reference is computed by dequantizing the packed KV back to q_dtype and running
+    single_decode_with_kv_cache per batch item.
+    """
+    kv_layout = "NHD"
+    torch.manual_seed(42)
+
+    # --- query: one token per request ---
+    q = torch.randn(batch_size, num_qo_heads, head_dim, device="cuda:0", dtype=q_dtype)
+
+    # --- paged KV metadata ---
+    num_pages_per_seq = (kv_len + page_size - 1) // page_size
+    total_num_pages = num_pages_per_seq * batch_size
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda:0", dtype=torch.int32)
+        * num_pages_per_seq
+    )
+    kv_indices = torch.arange(0, total_num_pages, device="cuda:0", dtype=torch.int32)
+    kv_last_page_len = torch.full(
+        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32, device="cuda:0"
+    )
+
+    # --- create NVFP4 KV pages directly (NHD: [num_pages, page_size, num_kv_heads, head_dim//2]) ---
+    kv_shape = (total_num_pages, page_size, num_kv_heads, head_dim // 2)
+    k_packed, k_sf, k_global_scale = create_nvfp4_kv(kv_shape, "cuda:0")
+    v_packed, v_sf, v_global_scale = create_nvfp4_kv(kv_shape, "cuda:0")
+
+    # Dequantize for reference attention
+    k_dq = nvfp4_to_float(k_packed, k_sf, k_global_scale).to(q_dtype)
+    v_dq = nvfp4_to_float(v_packed, v_sf, v_global_scale).to(q_dtype)
+
+    # Pack into combined tensors:
+    #   kv_cache:    [num_pages, 2, page_size, num_kv_heads, head_dim//2]
+    #   kv_cache_sf: [num_pages, 2, page_size, num_kv_heads, head_dim//16]
+    kv_cache = torch.stack([k_packed, v_packed], dim=1)  # [P, 2, S, H, D//2]
+    kv_cache_sf = torch.stack([k_sf, v_sf], dim=1)  # [P, 2, S, H, D//16]
+
+    # --- run BatchDecodeWithPagedKVCacheWrapper ---
+    # NVFP4 KV is only supported via the tensor-cores path (FA2 prefill kernel),
+    # not the legacy FA2 decode kernel.
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
+
+    # This actually initialize the smem buffers to 0x7F (NaN as FP8), to trigger the SF addressing issue.
+    workspace_buffer.fill_(0x7F)
+
+    wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        workspace_buffer, kv_layout, use_tensor_cores=True
+    )
+    wrapper.plan(
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        pos_encoding_mode="NONE",
+        logits_soft_cap=0.0,
+        kv_data_type=torch.uint8,
+        q_data_type=q_dtype,
+    )
+    o = wrapper.run(
+        q,
+        kv_cache,
+        k_scale=k_global_scale.item(),
+        v_scale=v_global_scale.item(),
+        kv_block_scales=kv_cache_sf,
+    )
+
+    # --- reference: single_decode_with_kv_cache per batch item using dequantized KV ---
+    kv_indptr_cpu = kv_indptr.cpu()
+    kv_last_page_len_cpu = kv_last_page_len.cpu()
+    for i in range(batch_size):
+        qi = q[i]
+
+        # Gather full (non-padded) KV for sequence i from pages
+        full_pages_k = k_dq[
+            kv_indptr_cpu[i] : kv_indptr_cpu[i + 1] - 1
+        ]  # [p-1, S, H, D]
+        last_page_k = k_dq[
+            kv_indptr_cpu[i + 1] - 1, : kv_last_page_len_cpu[i]
+        ]  # [l, H, D]
+        ki = torch.cat(
+            [
+                full_pages_k.reshape(-1, num_kv_heads, head_dim),
+                last_page_k.reshape(-1, num_kv_heads, head_dim),
+            ],
+            dim=0,
+        )
+
+        full_pages_v = v_dq[kv_indptr_cpu[i] : kv_indptr_cpu[i + 1] - 1]
+        last_page_v = v_dq[kv_indptr_cpu[i + 1] - 1, : kv_last_page_len_cpu[i]]
+        vi = torch.cat(
+            [
+                full_pages_v.reshape(-1, num_kv_heads, head_dim),
+                last_page_v.reshape(-1, num_kv_heads, head_dim),
+            ],
+            dim=0,
+        )
+
+        o_ref_i = flashinfer.decode.single_decode_with_kv_cache(
+            qi, ki, vi, pos_encoding_mode="NONE", logits_soft_cap=0.0
+        )
+
+        # NVFP4 is 4-bit; use relaxed tolerance
+        torch.testing.assert_close(o[i], o_ref_i, rtol=1e-1, atol=1e-1)
+
+
 if __name__ == "__main__":
     test_batch_decode_with_paged_kv_cache(
         256,
@@ -765,6 +895,7 @@ if __name__ == "__main__":
     test_cuda_graph_batch_decode_with_paged_kv_cache(
         12, 54, 8, 8, 8, 128, "HND", "NONE", torch.float16, torch.float8_e5m2, True
     )
+    test_batch_decode_with_paged_kv_cache_nvfp4(4, 128, 64, 1, 1, 128, torch.float16)
 
 
 def test_single_decode_torch_compile_cuda_graph():

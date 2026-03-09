@@ -420,6 +420,9 @@ def is_fa3_backend_supported(
         torch.float8_e5m2,
     }:
         return False
+    # FA3 does not support NVFP4 KV cache (uint8 packed FP4).
+    if dtype_kv == torch.uint8:
+        return False
     return True
 
 

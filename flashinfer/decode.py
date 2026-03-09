@@ -1448,13 +1448,24 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     rope_theta,
                     0,  # token_pos_in_items_len
                     self._workspace_size,
-                    paged_kv_cache,
+                ]
+
+                if self._backend == "trtllm-gen":
+                    # decode.py's trtllm-gen paged_run (get_trtllm_gen_decode_module)
+                    # has a different optional-param layout than prefill.py's paged_run
+                    run_args += [paged_kv_cache]
+
+                run_args += [
                     self._num_qo_heads,
                     self._num_kv_heads,
                     self._block_tables,
                     self._kv_lens_buffer,
                     page_size,
+                    None,  # max_q_len (not applicable for decode)
                     self._max_kv_len,
+                    None,  # batch_size (not applicable for decode)
+                    None,  # cum_seq_lens_q (not applicable for decode)
+                    None,  # cum_seq_lens_kv (not applicable for decode)
                     sinks,
                     key_block_scales,
                     value_block_scales,
