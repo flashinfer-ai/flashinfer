@@ -46,6 +46,7 @@
 from dataclasses import dataclass
 from typing import Optional
 
+import cutlass
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import Boolean, if_generate
 from cutlass.pipeline import (
@@ -56,6 +57,27 @@ from cutlass.pipeline import (
     PipelineState,
     agent_sync,
 )
+from cutlass.pipeline.helpers import MbarrierArray
+
+# In cutlass >= 4.4.0, PipelineAsync._make_sync_object no longer handles
+# PipelineOp.TCGen05Mma directly. Patch it back so our custom pipelines
+# (which pass TCGen05Mma as producer/consumer) keep working.
+# cutlass.__version__ was added in 4.4.0, so its presence indicates the new version.
+if hasattr(cutlass, "__version__"):
+    _original_make_sync_object = PipelineAsync._make_sync_object
+
+    @staticmethod
+    def _patched_make_sync_object(barrier_storage, num_stages, agent, tx_count=0):
+        if agent[0] is PipelineOp.TCGen05Mma:
+            return MbarrierArray(
+                barrier_storage=barrier_storage,
+                num_stages=num_stages,
+                agent=agent,
+                tx_count=tx_count,
+            )
+        return _original_make_sync_object(barrier_storage, num_stages, agent, tx_count)
+
+    PipelineAsync._make_sync_object = _patched_make_sync_object
 
 
 def pipeline_init_wait(cta_layout_vmnk: Optional[cute.Layout] = None):
