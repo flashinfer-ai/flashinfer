@@ -92,6 +92,11 @@ DEFAULT_WORKSPACE_SIZE = 32 * 1024 * 1024
 # Error messages
 CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR = "cudnn FP4 GEMM with mxfp4 quantization is not supported on SM120/SM121 with cuDNN backend version < 9.14.0."
 
+_TORCH_TO_CUTLASS_DTYPE_ATTR = {
+    torch.bfloat16: "BFloat16",
+    torch.float16: "Float16",
+}
+
 
 def _match_sm_version(device: torch.device, sm_version: list[str]):
     major, minor = get_compute_capability(device)
@@ -2507,7 +2512,7 @@ def _check_mm_mxfp8_problem_size(
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
     use_8x4_sf_layout: bool = True,
-    backend: Literal["cutlass", "auto"] = "auto",  # unused
+    backend: Literal["cutlass", "cute-dsl", "trtllm", "auto"] = "auto",  # unused
 ) -> bool:
     # Generic checks
     ## pre-check the input tensors and block scale tensors
@@ -2622,7 +2627,7 @@ def _cutlass_gemm_mxfp8_requirement(
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
     use_8x4_sf_layout: bool = True,
-    backend: Literal["cutlass", "auto"] = "auto",
+    backend: Literal["cutlass", "cute-dsl", "trtllm", "auto"] = "auto",
 ):
     return True
 
@@ -2648,6 +2653,410 @@ def _trtllm_gemm_mxfp8_requirement(
     return True
 
 
+def _cute_dsl_gemm_mxfp8_requirement(
+    a: torch.Tensor,  # unused
+    b: torch.Tensor,  # unused
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    out: Optional[torch.Tensor] = None,  # unused
+    out_dtype: torch.dtype = torch.bfloat16,  # unused
+    backend: Literal["cutlass", "cute-dsl", "auto"] = "auto",  # unused
+):
+    # CuTe DSL MXFP8 path currently expects swizzled 1D block scales
+    # in F8_128x4 layout for both A and B.
+    if a_descale.ndim != 1 or b_descale.ndim != 1:
+        raise ValueError(
+            "cute_dsl mm_mxfp8 requires swizzled 1D scale tensors for a_descale and b_descale."
+        )
+    _check_cute_dsl_availability()
+    return True
+
+
+# Shared helpers for CuTe DSL block-scaled GEMM runners (mxfp8 & mxfp4/nvfp4)
+_SM100_MMA_TILER_MN_CANDIDATES = [
+    (128, 64),
+    (256, 64),
+    (128, 128),
+    (256, 128),
+    (128, 192),
+    (256, 192),
+    (128, 256),
+    (256, 256),
+]
+
+_SM100_CLUSTER_SHAPE_MN_CANDIDATES = [
+    (1, 1),
+    (1, 2),
+    (1, 4),
+    (2, 1),
+    (2, 2),
+    (2, 4),
+    (4, 1),
+    (4, 2),
+    (4, 4),
+]
+
+_SM100_DEFAULT_MMA_TILER_MN = (128, 128)
+_SM100_DEFAULT_CLUSTER_SHAPE_MN = (1, 1)
+
+
+def _get_approximate_cta_nums(m, n, tile_mn, cluster_shape_mn):
+    tile_m, tile_n = tile_mn
+    cluster_m, cluster_n = cluster_shape_mn
+    ctas_m = ((m + tile_m - 1) // tile_m + cluster_m - 1) // cluster_m * cluster_m
+    ctas_n = ((n + tile_n - 1) // tile_n + cluster_n - 1) // cluster_n * cluster_n
+    return ctas_m * ctas_n
+
+
+def _get_sm100_block_scaled_tactics(
+    m,
+    n,
+    real_k,
+    ab_dtype,
+    sf_dtype,
+    sf_vec_size,
+    c_cutlass_dtype,
+    device,
+):
+    """Enumerate valid SM100 block-scaled GEMM tactics for autotuning.
+
+    Returns list of (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch)
+    tuples.  Shared by both the mxfp8 and fp4 cute-dsl runners.
+    """
+    from .kernels.dense_blockscaled_gemm_sm100 import (
+        Sm100BlockScaledPersistentDenseGemmKernel,
+    )
+
+    batch_size = 1
+    m_aligned = m % 8 == 0
+    n_aligned = n % 8 == 0
+
+    valid_tactics = []
+    for mma_tiler_mn in _SM100_MMA_TILER_MN_CANDIDATES:
+        for cluster_shape_mn in _SM100_CLUSTER_SHAPE_MN_CANDIDATES:
+            for swap_ab in (False, True):
+                if not swap_ab and not n_aligned:
+                    continue
+                if swap_ab and not m_aligned:
+                    continue
+
+                if swap_ab:
+                    c_major = "m"
+                    kernel_m, kernel_n = n, m
+                else:
+                    c_major = "n"
+                    kernel_m, kernel_n = m, n
+
+                if not Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
+                    ab_dtype,
+                    sf_dtype,
+                    sf_vec_size,
+                    c_cutlass_dtype,
+                    mma_tiler_mn,
+                    cluster_shape_mn,
+                    kernel_m,
+                    kernel_n,
+                    real_k,
+                    batch_size,
+                    "k",
+                    "k",
+                    c_major,
+                ):
+                    continue
+
+                for use_prefetch in (False, True):
+                    if use_prefetch:
+                        cta_nums = _get_approximate_cta_nums(
+                            kernel_m, kernel_n, mma_tiler_mn, cluster_shape_mn
+                        )
+                        sm_count = torch.cuda.get_device_properties(
+                            device
+                        ).multi_processor_count
+                        cta_wave_ratio = cta_nums / sm_count
+                        if not (0.5 < cta_wave_ratio < 1.0 or real_k >= 8192):
+                            continue
+
+                    valid_tactics.append(
+                        (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch)
+                    )
+    return valid_tactics
+
+
+def _compile_block_scaled_gemm(
+    cache,
+    cache_key,
+    make_gemm_kernel,
+    ab_cutlass_dtype,
+    sf_dtype,
+    c_cutlass_dtype,
+    ab_assumed_align,
+    cluster_shape_mn,
+    swap_ab,
+    sf_m,
+    sf_n,
+    sf_k,
+    batch_size,
+):
+    """Compile a block-scaled GEMM kernel via CuTe DSL and cache it.
+
+    ``make_gemm_kernel`` is a zero-arg callable that returns a kernel instance
+    (Sm100 or Sm103).  It is only invoked on a cache miss.
+
+    TVM-FFI compilation pattern:
+      - A, B, C, alpha: make_fake_compact_tensor -> torch tensors
+        passed directly at runtime via TVM-FFI C-level dlpack
+      - SF tensors: make_ptr (complex 6D BlockScaledBasicChunk
+        layout can't be expressed as torch tensor) -> data_ptr() at runtime
+      - Stream: make_fake_stream -> automatic env stream at runtime
+
+    For FP4 runners, ``ab_cutlass_dtype`` is ``Uint8`` because FP4 data is
+    stored as uint8 in torch (2 FP4 values per byte); the kernel wrapper
+    recasts from Uint8 to Float4E2M1FN internally.
+    """
+    if cache_key in cache:
+        return cache[cache_key]
+
+    import cutlass
+    import cutlass.cute as cute
+
+    from cutlass.cute.runtime import make_ptr
+    from flashinfer.cute_dsl.utils import get_max_active_clusters
+
+    gemm = make_gemm_kernel()
+
+    sym_m = cute.sym_int()
+    sym_k = cute.sym_int()
+    sym_n = cute.sym_int()
+
+    a_fake = cute.runtime.make_fake_compact_tensor(
+        ab_cutlass_dtype,
+        (sym_m, sym_k),
+        stride_order=(1, 0),
+        assumed_align=ab_assumed_align,
+    )
+    b_fake = cute.runtime.make_fake_compact_tensor(
+        ab_cutlass_dtype,
+        (sym_n, sym_k),
+        stride_order=(1, 0),
+        assumed_align=ab_assumed_align,
+    )
+    if swap_ab:
+        c_fake = cute.runtime.make_fake_compact_tensor(
+            c_cutlass_dtype,
+            (sym_n, sym_m),
+            stride_order=(0, 1),
+            assumed_align=16,
+        )
+    else:
+        c_fake = cute.runtime.make_fake_compact_tensor(
+            c_cutlass_dtype,
+            (sym_m, sym_n),
+            stride_order=(1, 0),
+            assumed_align=16,
+        )
+
+    a_sf_ptr = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, 16)
+    b_sf_ptr = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, 16)
+    alpha_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32, (1,), assumed_align=4
+    )
+
+    max_active_clusters = get_max_active_clusters(
+        cluster_shape_mn[0] * cluster_shape_mn[1]
+    )
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
+    compiled_gemm = cute.compile(
+        gemm.wrapper,
+        a_fake,
+        b_fake,
+        c_fake,
+        sf_m,
+        sf_n,
+        sf_k,
+        batch_size,
+        a_sf_ptr,
+        b_sf_ptr,
+        alpha_fake,
+        max_active_clusters,
+        stream_fake,
+        swap_ab,
+        options="--opt-level 2 --enable-tvm-ffi",
+    )
+
+    result = (compiled_gemm, max_active_clusters)
+    cache[cache_key] = result
+    return result
+
+
+_CUTE_DSL_ALPHA_ONE_CACHE: dict = {}
+
+
+def _prepare_alpha_for_launch(alpha_tensor, device):
+    """Prepare alpha as a 1-dim float32 device tensor with shape [1].
+
+    When *alpha_tensor* is ``None``, returns a cached ``tensor([1.0])``
+    on *device* (allocated once, reused forever).
+    """
+    if alpha_tensor is None:
+        cached = _CUTE_DSL_ALPHA_ONE_CACHE.get(device)
+        if cached is None:
+            cached = torch.tensor([1.0], dtype=torch.float32, device=device)
+            _CUTE_DSL_ALPHA_ONE_CACHE[device] = cached
+        return cached
+    if alpha_tensor.dim() == 0:
+        return alpha_tensor.unsqueeze(0)
+    return alpha_tensor.reshape(1)
+
+
+_CUTE_DSL_MM_MXFP8_KERNEL_CACHE: dict[tuple, tuple] = {}
+
+
+def _check_cute_dsl_availability():
+    try:
+        from flashinfer.cute_dsl.utils import is_cute_dsl_available
+    except ImportError as err:
+        raise RuntimeError("CuTe DSL is not available.") from err
+
+    if not is_cute_dsl_available():
+        raise RuntimeError("CuTe DSL is not available.")
+
+
+def _cute_dsl_gemm_mxfp8_runner(
+    sm_major: int,
+    sm_minor: int,
+    enable_pdl: bool,
+    out_dtype: torch.dtype,
+):
+    import cutlass
+
+    from .kernels.dense_blockscaled_gemm_sm100 import (
+        Sm100BlockScaledPersistentDenseGemmKernel,
+    )
+
+    if out_dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(
+            f"cute_dsl mm_mxfp8 does not support output dtype {out_dtype}. "
+            "Supported: torch.bfloat16, torch.float16."
+        )
+
+    cutlass_dtype_attr = _TORCH_TO_CUTLASS_DTYPE_ATTR.get(out_dtype)
+    if cutlass_dtype_attr is None:
+        raise ValueError(
+            f"cute_dsl mm_mxfp8 does not support output dtype {out_dtype}. "
+            "Supported: torch.bfloat16, torch.float16."
+        )
+    c_cutlass_dtype = getattr(cutlass, cutlass_dtype_attr)
+    _ = sm_major, sm_minor
+
+    class CuteDSLMxfp8GemmRunner(TunableRunner):
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> list:
+            (a, b, a_descale, b_descale, _, out, _) = inputs
+            return _get_sm100_block_scaled_tactics(
+                m=a.shape[0],
+                n=b.shape[1],
+                real_k=a.shape[1],
+                ab_dtype=cutlass.Float8E4M3FN,
+                sf_dtype=cutlass.Float8E8M0FNU,
+                sf_vec_size=32,
+                c_cutlass_dtype=c_cutlass_dtype,
+                device=a.device,
+            )
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic=None,
+            do_preparation: bool = False,
+            **kwargs,
+        ):
+            (a, b, a_descale, b_descale, _, out, _) = inputs
+            m = a.shape[0]
+            real_k = a.shape[1]
+            n = b.shape[1]
+
+            sf_vec_size = 32
+            sf_dtype = cutlass.Float8E8M0FNU
+            batch_size = 1
+
+            if tactic is None or tactic == -1:
+                tactic = (
+                    _SM100_DEFAULT_MMA_TILER_MN,
+                    _SM100_DEFAULT_CLUSTER_SHAPE_MN,
+                    False,
+                    False,
+                )
+
+            (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch) = tactic
+
+            if swap_ab:
+                kernel_m, kernel_n = n, m
+                kernel_a, kernel_b = b.T, a.T
+                kernel_a_sf, kernel_b_sf = b_descale, a_descale
+            else:
+                kernel_m, kernel_n = m, n
+                kernel_a, kernel_b = a, b.T
+                kernel_a_sf, kernel_b_sf = a_descale, b_descale
+
+            sf_m = (kernel_m + 127) // 128
+            sf_n = (kernel_n + 127) // 128
+            sf_k = (real_k // sf_vec_size + 3) // 4
+
+            cache_key = (
+                sf_vec_size,
+                mma_tiler_mn,
+                cluster_shape_mn,
+                swap_ab,
+                use_prefetch,
+                enable_pdl,
+                out_dtype,
+            )
+
+            compiled_gemm, _ = _compile_block_scaled_gemm(
+                _CUTE_DSL_MM_MXFP8_KERNEL_CACHE,
+                cache_key,
+                lambda: Sm100BlockScaledPersistentDenseGemmKernel(
+                    sf_vec_size,
+                    mma_tiler_mn,
+                    cluster_shape_mn,
+                    use_prefetch,
+                    enable_pdl,
+                ),
+                ab_cutlass_dtype=cutlass.Float8E4M3FN,
+                sf_dtype=sf_dtype,
+                c_cutlass_dtype=c_cutlass_dtype,
+                ab_assumed_align=16,
+                cluster_shape_mn=cluster_shape_mn,
+                swap_ab=swap_ab,
+                sf_m=sf_m,
+                sf_n=sf_n,
+                sf_k=sf_k,
+                batch_size=batch_size,
+            )
+
+            launch_out = out.T if swap_ab else out
+            alpha_for_launch = _prepare_alpha_for_launch(None, a.device)
+
+            compiled_gemm(
+                kernel_a,
+                kernel_b,
+                launch_out,
+                sf_m,
+                sf_n,
+                sf_k,
+                kernel_a_sf.data_ptr(),
+                kernel_b_sf.data_ptr(),
+                alpha_for_launch,
+            )
+            return out
+
+    return CuteDSLMxfp8GemmRunner()
+
+
 def _heuristic_func_mm_mxfp8(
     suitable_backends: List[str],
     a: torch.Tensor,
@@ -2657,7 +3066,7 @@ def _heuristic_func_mm_mxfp8(
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
     use_8x4_sf_layout: bool = True,
-    backend: Literal["cutlass", "trtllm", "auto"] = "auto",
+    backend: Literal["cutlass", "cute-dsl", "trtllm", "auto"] = "auto",
 ) -> List[str]:
     # don't select trtllm since it requires weight shuffling
     if "cutlass" in suitable_backends:
@@ -2669,6 +3078,7 @@ def _heuristic_func_mm_mxfp8(
     {
         "cutlass": _cutlass_gemm_mxfp8_requirement,
         "trtllm": _trtllm_gemm_mxfp8_requirement,
+        "cute-dsl": _cute_dsl_gemm_mxfp8_requirement,
     },
     common_check=_check_mm_mxfp8_problem_size,
     heuristic_func=_heuristic_func_mm_mxfp8,  # result stored in mm_mxfp8.suitable_auto_backends
@@ -2682,7 +3092,7 @@ def mm_mxfp8(
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
     use_8x4_sf_layout: bool = True,
-    backend: Literal["cutlass", "trtllm", "auto"] = "auto",
+    backend: Literal["cutlass", "cute-dsl", "trtllm", "auto"] = "auto",
 ) -> torch.Tensor:
     r"""MM MXFP8 (block size 32)
 
@@ -2714,13 +3124,12 @@ def mm_mxfp8(
     out_dtype: torch.dtype
         Output dtype, bf16 or fp16. Defaults to ``torch.bfloat16``.
 
-    use_8x4_sf_layout: bool
-        Whether to use 8x4 scale factor layout or 128x4 scale factor layout for the matrix a. Defaults to False.
-
-    backend: Literal["cutlass", "trtllm", "auto"]
+    backend: Literal["cutlass", "cute-dsl", "trtllm", "auto"]
         The backend to use for the operation. Defaults to ``"auto"``.
-        ``"auto"`` selects the best backend between CUTLASS and TRTLLM.
-        When trtllm backend is used, b must be quantized with 128x4 layout and shuffled. a can be quantized with either 128x4 or 8x4 layout (controlled by `use_8x4_sf_layout`).
+        ``"auto"`` selects the CUTLASS backend.
+        The ``"cute-dsl"`` backend currently requires swizzled 1D scales
+        (``mxfp8_quantize(..., is_sf_swizzled_layout=True)``).
+        The ``"trtllm"`` requires b to be quantized with 128x4 swizzle layout and shuffled. a can be quantized with either 128x4 or 8x4 layout (controlled by `use_8x4_sf_layout`).
 
     Returns
     -------
@@ -2791,7 +3200,7 @@ def mm_mxfp8(
     else:
         backends = [backend]
 
-    major, _ = get_compute_capability(a.device)
+    major, minor = get_compute_capability(a.device)
 
     backend_to_runner_factory = {
         "cutlass": lambda: get_cutlass_mxfp8_gemm_module(
@@ -2800,6 +3209,7 @@ def mm_mxfp8(
         "trtllm": lambda: get_trtllm_gemm_module().trtllm_mxfp8_gemm_runner(
             use_8x4_sf_layout
         ),
+        "cute-dsl": lambda: _cute_dsl_gemm_mxfp8_runner(major, minor, True, out_dtype),
     }
 
     runners: List[TunableRunner] = [
@@ -3175,28 +3585,20 @@ def _cute_dsl_gemm_fp4_requirement(
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
 ):
-    # cute_dsl backend requires 128x4 scale factor layout (same as cudnn/cutlass).
+    # cute_dsl backend requires 128x4 scale factor layout.
     # The kernel internally uses CUTLASS BlockScaledBasicChunk which expects
-    # M/N padded to 128, K padded to 4 -- matching FlashInfer's nvfp4_quantize
-    # with sfLayout=SfLayout.layout_128x4 and do_shuffle=False.
+    # M/N padded to 128, K padded to 4 -- matching FlashInfer's quantization
+    # preparation for 128x4 layout.
     if use_8x4_sf_layout:
         raise ValueError("cute_dsl FP4 GEMM only supports 128x4 scale factor layout.")
-    if not use_nvfp4:
-        raise ValueError("cute_dsl FP4 GEMM only supports nvfp4 quantization.")
-    try:
-        from flashinfer.cute_dsl.utils import is_cute_dsl_available
-
-        if not is_cute_dsl_available():
-            raise RuntimeError("CuTe DSL is not available.")
-    except ImportError as err:
-        raise RuntimeError("CuTe DSL is not available.") from err
+    _check_cute_dsl_availability()
     return True
 
 
 # Module-level kernel cache for CuTe DSL GEMM, shared across runner instances.
 # Keyed by (sf_vec_size, mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch,
 #            kernel_type, use_tma_store, enable_pdl, out_dtype).
-_CUTE_DSL_MM_FP4_KERNEL_CACHE = {}
+_CUTE_DSL_MM_FP4_KERNEL_CACHE: dict[tuple, tuple] = {}
 
 
 def _cute_dsl_gemm_fp4_runner(
@@ -3204,6 +3606,7 @@ def _cute_dsl_gemm_fp4_runner(
     sm_minor: int,
     enable_pdl: bool,
     out_dtype: torch.dtype,
+    use_nvfp4: bool,
 ):
     """Create a CuTe DSL FP4 GEMM runner for the cute_dsl backend.
 
@@ -3213,9 +3616,7 @@ def _cute_dsl_gemm_fp4_runner(
     use_tma_store) combination.
     """
     import cutlass
-    import cutlass.cute as cute
 
-    from cutlass.cute.runtime import make_ptr
     from .kernels.dense_blockscaled_gemm_sm100 import (
         Sm100BlockScaledPersistentDenseGemmKernel,
     )
@@ -3236,12 +3637,10 @@ def _cute_dsl_gemm_fp4_runner(
     #     except ImportError:
     #         pass
 
-    # Map torch output dtype to cutlass dtype
-    _torch_to_cutlass_dtype = {
-        torch.bfloat16: cutlass.BFloat16,
-        torch.float16: cutlass.Float16,
-    }
-    c_cutlass_dtype = _torch_to_cutlass_dtype.get(out_dtype)
+    cutlass_dtype_attr = _TORCH_TO_CUTLASS_DTYPE_ATTR.get(out_dtype)
+    c_cutlass_dtype = (
+        getattr(cutlass, cutlass_dtype_attr) if cutlass_dtype_attr is not None else None
+    )
     if c_cutlass_dtype is None:
         raise ValueError(
             f"cute_dsl backend does not support output dtype {out_dtype}. "
@@ -3258,20 +3657,6 @@ def _cute_dsl_gemm_fp4_runner(
             - use_tma_store: None for sm100, True/False for sm103
         """
 
-        def __init__(self):
-            pass
-
-        def _get_approximate_cta_nums(self, m, n, tile_mn, cluster_shape_mn):
-            tile_m, tile_n = tile_mn
-            cluster_m, cluster_n = cluster_shape_mn
-            ctas_m = (
-                ((m + tile_m - 1) // tile_m + cluster_m - 1) // cluster_m * cluster_m
-            )
-            ctas_n = (
-                ((n + tile_n - 1) // tile_n + cluster_n - 1) // cluster_n * cluster_n
-            )
-            return ctas_m * ctas_n
-
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
@@ -3283,113 +3668,39 @@ def _cute_dsl_gemm_fp4_runner(
             n = b.shape[1]
             real_k = k_packed * 2  # FP4 packed as uint8
 
-            sf_vec_size = 16  # NVF4
+            sf_vec_size = 16 if use_nvfp4 else 32
             ab_dtype = cutlass.Float4E2M1FN
-            sf_dtype = cutlass.Float8E4M3FN
-            batch_size = 1
+            sf_dtype = cutlass.Float8E4M3FN if use_nvfp4 else cutlass.Float8E8M0FNU
 
-            # SM100 tactic candidates
-            mma_tiler_mn_candidates = [
-                (128, 64),
-                (256, 64),
-                (128, 128),
-                (256, 128),
-                (128, 192),
-                (256, 192),
-                (128, 256),
-                (256, 256),
-            ]
-            cluster_shape_mn_candidates = [
-                (1, 1),
-                (1, 2),
-                (1, 4),
-                (2, 1),
-                (2, 2),
-                (2, 4),
-                (4, 1),
-                (4, 2),
-                (4, 4),
-            ]
-            swap_ab_candidates = [False, True]
-            use_prefetch_candidates = [False, True]
-
-            # Alignment checks for swap_ab
-            m_aligned = m % 8 == 0
-            n_aligned = n % 8 == 0
-
-            valid_tactics = []
-
-            # --- SM100 tactics ---
-            for mma_tiler_mn in mma_tiler_mn_candidates:
-                for cluster_shape_mn in cluster_shape_mn_candidates:
-                    for swap_ab in swap_ab_candidates:
-                        # Check alignment for C layout
-                        if not swap_ab and not n_aligned:
-                            continue
-                        if swap_ab and not m_aligned:
-                            continue
-
-                        if swap_ab:
-                            c_major = "m"
-                            kernel_m, kernel_n = n, m
-                        else:
-                            c_major = "n"
-                            kernel_m, kernel_n = m, n
-
-                        if not Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
-                            ab_dtype,
-                            sf_dtype,
-                            sf_vec_size,
-                            c_cutlass_dtype,
-                            mma_tiler_mn,
-                            cluster_shape_mn,
-                            kernel_m,
-                            kernel_n,
-                            real_k,
-                            batch_size,
-                            "k",
-                            "k",
-                            c_major,
-                        ):
-                            continue
-
-                        for use_prefetch in use_prefetch_candidates:
-                            # Prefetch pruning heuristic
-                            if use_prefetch:
-                                cta_nums = self._get_approximate_cta_nums(
-                                    kernel_m, kernel_n, mma_tiler_mn, cluster_shape_mn
-                                )
-                                sm_count = torch.cuda.get_device_properties(
-                                    a.device
-                                ).multi_processor_count
-                                cta_wave_ratio = cta_nums / sm_count
-                                if not (0.5 < cta_wave_ratio < 1.0 or real_k >= 8192):
-                                    continue
-
-                            valid_tactics.append(
-                                (
-                                    mma_tiler_mn,
-                                    cluster_shape_mn,
-                                    swap_ab,
-                                    use_prefetch,
-                                    "sm100",
-                                    None,
-                                )
-                            )
+            # SM100 tactics (shared enumeration with mxfp8)
+            sm100_base = _get_sm100_block_scaled_tactics(
+                m,
+                n,
+                real_k,
+                ab_dtype,
+                sf_dtype,
+                sf_vec_size,
+                c_cutlass_dtype,
+                a.device,
+            )
+            valid_tactics = [(*t, "sm100", None) for t in sm100_base]
 
             # --- SM103 tactics (only on SM103) ---
             if sm_version == 103 and Sm103Kernel is not None:
+                batch_size = 1
+                m_aligned = m % 8 == 0
+                n_aligned = n % 8 == 0
+
                 sm103_mma_tiler_candidates = [
                     (128, 128),
                     (256, 128),
                     (128, 256),
                     (256, 256),
                 ]
-                use_tma_store_candidates = [True, False]
 
                 for mma_tiler_mn in sm103_mma_tiler_candidates:
-                    for cluster_shape_mn in cluster_shape_mn_candidates:
-                        for swap_ab in swap_ab_candidates:
+                    for cluster_shape_mn in _SM100_CLUSTER_SHAPE_MN_CANDIDATES:
+                        for swap_ab in (False, True):
                             if not swap_ab and not n_aligned:
                                 continue
                             if swap_ab and not m_aligned:
@@ -3402,7 +3713,7 @@ def _cute_dsl_gemm_fp4_runner(
                                 c_major = "n"
                                 kernel_m, kernel_n = m, n
 
-                            for use_tma_store in use_tma_store_candidates:
+                            for use_tma_store in (True, False):
                                 if not Sm103Kernel.can_implement(
                                     ab_dtype,
                                     sf_dtype,
@@ -3421,18 +3732,16 @@ def _cute_dsl_gemm_fp4_runner(
                                 ):
                                     continue
 
-                                for use_prefetch in [False]:
-                                    # SM103 kernel does not have prefetch support
-                                    valid_tactics.append(
-                                        (  # type: ignore[arg-type]
-                                            mma_tiler_mn,
-                                            cluster_shape_mn,
-                                            swap_ab,
-                                            use_prefetch,
-                                            "sm103",
-                                            use_tma_store,
-                                        )
+                                valid_tactics.append(
+                                    (  # type: ignore[arg-type]
+                                        mma_tiler_mn,
+                                        cluster_shape_mn,
+                                        swap_ab,
+                                        False,
+                                        "sm103",
+                                        use_tma_store,
                                     )
+                                )
 
             return valid_tactics
 
@@ -3449,12 +3758,19 @@ def _cute_dsl_gemm_fp4_runner(
             n = b.shape[1]
             real_k = k_packed * 2
 
-            sf_vec_size = 16
+            sf_vec_size = 16 if use_nvfp4 else 32
+            sf_dtype = cutlass.Float8E4M3FN if use_nvfp4 else cutlass.Float8E8M0FNU
             batch_size = 1
 
             if tactic is None or tactic == -1:
-                # Fallback tactic
-                tactic = ((128, 128), (1, 1), False, False, "sm100", None)
+                tactic = (
+                    _SM100_DEFAULT_MMA_TILER_MN,
+                    _SM100_DEFAULT_CLUSTER_SHAPE_MN,
+                    False,
+                    False,
+                    "sm100",
+                    None,
+                )
 
             (
                 mma_tiler_mn,
@@ -3476,12 +3792,11 @@ def _cute_dsl_gemm_fp4_runner(
                 kernel_a, kernel_b = a, b.T
                 kernel_a_sf, kernel_b_sf = a_descale, b_descale.T
 
-            # Compute scale factor dimensions (128x4 padded)
+            # Scale factor dimensions (128x4 padded)
             sf_m = (kernel_m + 127) // 128
             sf_n = (kernel_n + 127) // 128
             sf_k = (real_k // sf_vec_size + 3) // 4
 
-            # Cache key for compiled kernel
             cache_key = (
                 sf_vec_size,
                 mma_tiler_mn,
@@ -3494,133 +3809,42 @@ def _cute_dsl_gemm_fp4_runner(
                 out_dtype,
             )
 
-            if cache_key not in _CUTE_DSL_MM_FP4_KERNEL_CACHE:
-                # Create kernel instance
-                if kernel_type == "sm103" and Sm103Kernel is not None:
-                    gemm = Sm103Kernel(  # type: ignore[assignment]
-                        sf_vec_size,
-                        mma_tiler_mn,
-                        cluster_shape_mn,
-                        use_tma_store,
-                        enable_pdl,
-                    )
-                else:
-                    gemm = Sm100BlockScaledPersistentDenseGemmKernel(  # type: ignore[assignment]
-                        sf_vec_size,
-                        mma_tiler_mn,
-                        cluster_shape_mn,
-                        use_prefetch,
-                        enable_pdl,
-                    )
-
-                # TVM-FFI compilation pattern (commit edb37cd):
-                # - A, B, C, alpha: make_fake_compact_tensor → torch tensors
-                #   passed directly at runtime via TVM-FFI C-level dlpack
-                # - SF tensors: make_ptr (complex 6D BlockScaledBasicChunk
-                #   layout can't be expressed as torch tensor) → data_ptr() at runtime
-                # - Stream: make_fake_stream → automatic env stream at runtime
-                sym_m = cute.sym_int()
-                sym_k = cute.sym_int()  # k_packed (FP4 stored as uint8)
-                sym_n = cute.sym_int()
-
-                # A/B: FP4 data stored as uint8 in torch (2 FP4 values per byte).
-                # Use Uint8 to match torch.uint8 dtype at runtime. The kernel
-                # wrapper recasts from Uint8 to Float4E2M1FN internally.
-                a_fake = cute.runtime.make_fake_compact_tensor(
-                    cutlass.Uint8,
-                    (sym_m, sym_k),
-                    stride_order=(1, 0),
-                    assumed_align=32,
+            if kernel_type == "sm103" and Sm103Kernel is not None:
+                make_kernel = lambda: Sm103Kernel(
+                    sf_vec_size,
+                    mma_tiler_mn,
+                    cluster_shape_mn,
+                    use_tma_store,
+                    enable_pdl,
                 )
-                b_fake = cute.runtime.make_fake_compact_tensor(
-                    cutlass.Uint8,
-                    (sym_n, sym_k),
-                    stride_order=(1, 0),
-                    assumed_align=32,
-                )
-                # C: (m, n) layout depends on swap_ab, torch tensor at runtime
-                if swap_ab:
-                    c_fake = cute.runtime.make_fake_compact_tensor(
-                        c_cutlass_dtype,
-                        (sym_n, sym_m),
-                        stride_order=(0, 1),
-                        assumed_align=16,
-                    )
-                else:
-                    c_fake = cute.runtime.make_fake_compact_tensor(
-                        c_cutlass_dtype,
-                        (sym_m, sym_n),
-                        stride_order=(1, 0),
-                        assumed_align=16,
-                    )
-                # SF tensors: pointers (complex 6D layout, not expressible as torch tensor)
-                a_sf_ptr = make_ptr(
-                    cutlass.Float8E4M3FN, 16, cute.AddressSpace.gmem, 16
-                )
-                b_sf_ptr = make_ptr(
-                    cutlass.Float8E4M3FN, 16, cute.AddressSpace.gmem, 16
-                )
-                # Alpha: 1-dim tensor, torch tensor at runtime
-                alpha_fake = cute.runtime.make_fake_compact_tensor(
-                    cutlass.Float32, (1,), assumed_align=4
-                )
-
-                from flashinfer.cute_dsl.utils import get_max_active_clusters
-
-                max_active_clusters = get_max_active_clusters(
-                    cluster_shape_mn[0] * cluster_shape_mn[1]
-                )
-
-                # Fake stream: auto uses current CUDA stream at runtime
-                stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-
-                compiled_gemm = cute.compile(
-                    gemm.wrapper,
-                    a_fake,
-                    b_fake,
-                    c_fake,
-                    sf_m,
-                    sf_n,
-                    sf_k,
-                    batch_size,
-                    a_sf_ptr,
-                    b_sf_ptr,
-                    alpha_fake,
-                    max_active_clusters,
-                    stream_fake,
-                    swap_ab,
-                    options="--opt-level 2 --enable-tvm-ffi",
-                )
-
-                _CUTE_DSL_MM_FP4_KERNEL_CACHE[cache_key] = (
-                    compiled_gemm,
-                    max_active_clusters,
-                )
-
-            compiled_gemm, max_active_clusters = _CUTE_DSL_MM_FP4_KERNEL_CACHE[
-                cache_key
-            ]
-
-            # Handle output tensor for swap_ab
-            if swap_ab:
-                launch_out = out.T
             else:
-                launch_out = out
-
-            # Prepare alpha: ensure it is always a 1-dim tensor with shape [1].
-            if alpha_tensor is None:
-                alpha_for_launch = torch.tensor(
-                    [1.0], dtype=torch.float32, device=a.device
+                make_kernel = lambda: Sm100BlockScaledPersistentDenseGemmKernel(
+                    sf_vec_size,
+                    mma_tiler_mn,
+                    cluster_shape_mn,
+                    use_prefetch,
+                    enable_pdl,
                 )
-            elif alpha_tensor.dim() == 0:
-                alpha_for_launch = alpha_tensor.unsqueeze(0)
-            else:
-                alpha_for_launch = alpha_tensor.reshape(1)
 
-            # Launch via TVM-FFI:
-            # - A, B, C, alpha: torch.Tensor directly (C-level dlpack, negligible cost)
-            # - SF pointers: data_ptr() ints (complex 6D layout)
-            # - Stream: automatic (fake_stream)
+            compiled_gemm, _ = _compile_block_scaled_gemm(
+                _CUTE_DSL_MM_FP4_KERNEL_CACHE,
+                cache_key,
+                make_kernel,
+                ab_cutlass_dtype=cutlass.Uint8,
+                sf_dtype=sf_dtype,
+                c_cutlass_dtype=c_cutlass_dtype,
+                ab_assumed_align=32,
+                cluster_shape_mn=cluster_shape_mn,
+                swap_ab=swap_ab,
+                sf_m=sf_m,
+                sf_n=sf_n,
+                sf_k=sf_k,
+                batch_size=batch_size,
+            )
+
+            launch_out = out.T if swap_ab else out
+            alpha_for_launch = _prepare_alpha_for_launch(alpha_tensor, a.device)
+
             compiled_gemm(
                 kernel_a,
                 kernel_b,
@@ -3632,7 +3856,6 @@ def _cute_dsl_gemm_fp4_runner(
                 kernel_b_sf.data_ptr(),
                 alpha_for_launch,
             )
-
             return out
 
     return CuteDSLFp4GemmRunner()
@@ -3851,7 +4074,8 @@ def mm_fp4(
     -----
     When cudnn/cutlass backend is used, both a and b should quantized with nvfp4_quantize using the 128x4 scale factor layout and do_shuffle=False.
     When trtllm backend is used, b must be quantized with 128x4 layout and `do_shuffle=True`. a can be quantized with either 128x4 or 8x4 layout (controlled by `use_8x4_sf_layout`) and `do_shuffle=False`.
-    When cute_dsl backend is used, both a and b should be quantized with nvfp4_quantize using the 128x4 scale factor layout and do_shuffle=False (same as cudnn/cutlass).
+    When cute_dsl backend is used, both a and b should be quantized with 128x4 scale factor layout:
+    nvfp4_quantize(..., do_shuffle=False) for NVFP4, or mxfp4_quantize(...) for MXFP4.
 
     Returns
     -------
@@ -3904,7 +4128,7 @@ def mm_fp4(
             major, minor
         ).cutlass_fp4_gemm_runner(),
         "cute-dsl": lambda: _cute_dsl_gemm_fp4_runner(
-            major, minor, enable_pdl, out_dtype
+            major, minor, enable_pdl, out_dtype, use_nvfp4
         ),
     }
     runners = [backend_to_runner_factory[cur_backend]() for cur_backend in backends]

@@ -1071,6 +1071,13 @@ def testMmFp4(args):
         print(f"[VVERBOSE] {mat2_fp4.dtype = }")
 
     alpha = 1.0 / (global_sf_input * global_sf_mat2) if use_nvfp4 else None
+    # TODO: for MXFP4, we don't need a global scale, we should change the compile interface to make
+    # alpha optional.
+    alpha_for_cute_dsl_mxfp4 = (
+        torch.tensor([1.0], dtype=torch.float32, device=device)
+        if not use_nvfp4
+        else None
+    )
     # Completed preparing inputs. Now programmatically filter backends
     block_size = 16 if use_nvfp4 else 32
     backends_to_remove = []
@@ -1091,7 +1098,7 @@ def testMmFp4(args):
                 b=mat2_fp4.T if backend != "trtllm" else mat2_fp4_trtllm.T,
                 a_descale=input_inv_s,
                 b_descale=mat2_inv_s.T if backend != "trtllm" else mat2_inv_s_trtllm.T,
-                alpha=alpha,
+                alpha=(alpha_for_cute_dsl_mxfp4 if (backend == "cute-dsl") else alpha),
                 out_dtype=res_dtype,
                 block_size=16
                 if use_nvfp4
@@ -1129,7 +1136,7 @@ def testMmFp4(args):
                 b=mat2_fp4.T if backend != "trtllm" else mat2_fp4_trtllm.T,
                 a_descale=input_inv_s,
                 b_descale=mat2_inv_s.T if backend != "trtllm" else mat2_inv_s_trtllm.T,
-                alpha=alpha,
+                alpha=(alpha_for_cute_dsl_mxfp4 if (backend == "cute-dsl") else alpha),
                 out_dtype=res_dtype,
                 block_size=block_size,
                 use_8x4_sf_layout=not use_128x4_sf_layout,
@@ -1291,6 +1298,7 @@ def testMmMxfp8(args):
     run_refcheck = args.refcheck
     autotune_supported_backends = [
         "cutlass",
+        "cute-dsl",
         "trtllm",
     ]
     res = []
@@ -1346,22 +1354,15 @@ def testMmMxfp8(args):
                 num_elts_per_sf=32,
             ).reshape(n, k // 32)
 
-        if args.verbose >= 2:
-            print(f"[VVERBOSE] {input_mxfp8.shape = }")
-            print(f"[VVERBOSE] {input_mxfp8.dtype = }")
-            print(f"[VVERBOSE] {mat2_mxfp8.shape = }")
-            print(f"[VVERBOSE] {mat2_mxfp8.dtype = }")
-            print(f"[VVERBOSE] {input_scale.shape = }")
-            print(f"[VVERBOSE] {input_scale.dtype = }")
-            print(f"[VVERBOSE] {mat2_scale.shape = }")
-            print(f"[VVERBOSE] {mat2_scale.dtype = }")
         inputs[backend] = (input_mxfp8, mat2_mxfp8, input_scale, mat2_scale)
 
     def run_backend(
         backend: str,
         inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        assert backend in ["cutlass", "trtllm"], f"Unsupported backend: {backend}"
+        assert backend in ["cutlass", "trtllm", "cute-dsl", "auto"], (
+            f"Unsupported backend: {backend}"
+        )
         input_mxfp8, mat2_mxfp8, input_scale, mat2_scale = inputs
         return flashinfer.gemm.mm_mxfp8(
             a=input_mxfp8,
