@@ -840,10 +840,7 @@ def _test_trtllm_batch_decode(
             pytest.skip("NVFP4 KV cache requires FP8 query")
         if o_dtype != "fp8":
             pytest.skip("NVFP4 KV cache only supports FP8 output")
-        if (q_len_per_req is not None and q_len_per_req > 1) or (
-            max_q_len is not None and max_q_len > 1
-        ):
-            pytest.skip("NVFP4 KV cache does not support speculative decoding")
+        pass
 
     # Set up test parameters
     torch.manual_seed(0)

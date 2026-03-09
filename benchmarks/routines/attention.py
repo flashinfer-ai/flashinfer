@@ -394,19 +394,6 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         print("[INFO] auto backend is disabled for speculative decode. Skipping.")
         backends.remove("auto")
 
-    # NVFP4 KV cache only works with trtllm-native (direct API with kv_block_scales)
-    if is_nvfp4_kv:
-        unsupported = [b for b in backends if b != "trtllm-native"]
-        for b in unsupported:
-            print(f"[INFO] {b} backend does not support NVFP4 KV cache. Skipping.")
-            backends.remove(b)
-        if "trtllm-native" not in backends:
-            backends.append("trtllm-native")
-
-    if len(backends) == 0:
-        print("[ERROR] No backends to test. Exiting.")
-        return res
-
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
     outputs = {}
@@ -631,8 +618,14 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         speculative_mask,
     ):
         if backend in ["fa2", "fa2_tc", "auto", "trtllm-gen"]:
+            wrapper_kv = kv_cache_nvfp4 if is_nvfp4_kv else kv_cache
             return backend_wrappers[backend].run(
-                q, kv_cache, k_scale=k_scale, v_scale=v_scale, q_len_per_req=s_qo
+                q,
+                wrapper_kv,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                q_len_per_req=s_qo,
+                kv_block_scales=kv_block_scales,
             )
         elif backend == "cudnn":
             return flashinfer.decode.cudnn_batch_decode_with_kv_cache(

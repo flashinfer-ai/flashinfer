@@ -208,7 +208,11 @@ def bench_trtllm_fmha_wrapper(
     )
     ms = np.median(measurements)
     if isinstance(kv_cache, tuple):
-        io = q.numel() * q.element_size() + kv_cache[0].numel() + kv_cache[1].numel()
+        io = (
+            q.numel() * q.element_size()
+            + kv_cache[0].numel() * kv_cache[0].element_size()
+            + kv_cache[1].numel() * kv_cache[1].element_size()
+        )
     else:
         io = q.numel() * q.element_size() + kv_cache.numel() * kv_cache.element_size()
     print(
