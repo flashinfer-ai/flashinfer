@@ -2653,6 +2653,7 @@ def _trtllm_gemm_mxfp8_requirement(
     return True
 
 
+@supported_compute_capability([100, 103])
 def _cute_dsl_gemm_mxfp8_requirement(
     a: torch.Tensor,  # unused
     b: torch.Tensor,  # unused
@@ -2660,6 +2661,7 @@ def _cute_dsl_gemm_mxfp8_requirement(
     b_descale: torch.Tensor,
     out: Optional[torch.Tensor] = None,  # unused
     out_dtype: torch.dtype = torch.bfloat16,  # unused
+    use_8x4_sf_layout: bool = True,  # unused
     backend: Literal["cutlass", "cute-dsl", "auto"] = "auto",  # unused
 ):
     # CuTe DSL MXFP8 path currently expects swizzled 1D block scales

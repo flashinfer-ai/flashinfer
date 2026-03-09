@@ -200,7 +200,6 @@ def test_mm_mxfp8(
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("backend", ["cutlass", "cute-dsl", "trtllm", "auto"])
-@pytest.mark.parametrize("backend", ["cutlass", "cute-dsl", "auto"])
 def test_mm_mxfp8_large_dimensions(
     m, n, k, input_dtype, is_sf_swizzled_layout, out_dtype, backend
 ):
