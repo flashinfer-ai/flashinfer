@@ -155,7 +155,7 @@ def _collect_metadata() -> Dict[str, str]:
     except Exception:
         meta["cudnn_version"] = "unknown"
     try:
-        meta["gpu"] = torch.cuda.get_device_name(0)
+        meta["gpu"] = torch.cuda.get_device_name(torch.cuda.current_device())
     except Exception:
         meta["gpu"] = "unknown"
     return meta
@@ -1164,8 +1164,6 @@ class AutoTuner:
                 tactic_json = _tactic_to_json(tactic)
                 configs[file_key] = [runner_class_name, tactic_json]
 
-        num_new = len(configs) - num_previous
-
         current_meta = _collect_metadata()
 
         # Re-read the file from disk and merge to reduce lost updates when
@@ -1182,6 +1180,9 @@ class AutoTuner:
             configs = disk_configs
         except (FileNotFoundError, json.JSONDecodeError):
             pass  # file doesn't exist yet or is being replaced -- proceed with what we have
+
+        # Compute after disk merge so the count reflects the actual file delta.
+        num_new = len(configs) - num_previous
 
         # Atomic write: write to a temp file then replace the target.
         # This prevents readers from seeing a partially-written file and
