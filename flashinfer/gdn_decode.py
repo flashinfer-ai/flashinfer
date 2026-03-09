@@ -31,6 +31,8 @@ from typing import Optional, Tuple
 
 import torch
 
+from .jit.core import logger
+
 try:
     from .api_logging import flashinfer_api
 
@@ -487,7 +489,7 @@ def gated_delta_rule_mtp(
     scale: Optional[float] = None,
     output: Optional[torch.Tensor] = None,
     intermediate_states_buffer: Optional[torch.Tensor] = None,
-    disable_state_update: bool = False,
+    disable_state_update: Optional[bool] = None,
     use_qk_l2norm: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -523,8 +525,15 @@ def gated_delta_rule_mtp(
         intermediate_states_buffer (Optional[torch.Tensor]):
             Buffer for caching intermediate states, shape ``[pool_size, T, HV, V, K]``.
             If None, intermediate states are not cached.
-        disable_state_update (bool):
-            If True, the initial state is not updated. Default: ``True``.
+        disable_state_update (Optional[bool]):
+            If True, the initial state is not updated. Currently defaults to ``True``.
+            Please pass this argument explicitly — the default will change to ``False``
+            in FlashInfer 0.7.0.
+
+            .. deprecated::
+                The implicit default of ``True`` is deprecated and will change to
+                ``False`` in version 0.7.0. Pass ``disable_state_update=True`` or
+                ``disable_state_update=False`` explicitly to silence the warning.
         use_qk_l2norm (bool):
             Whether to apply L2 normalization to q and k. Default: ``True``.
 
@@ -539,6 +548,16 @@ def gated_delta_rule_mtp(
         - State layout is K-last: [pool_size, HV, V, K]
         - Optimized for speculative decoding verification scenarios
     """
+    # Handle deprecation of disable_state_update default value
+    if disable_state_update is None:
+        logger.warning_once(
+            "gated_delta_rule_mtp(): the 'disable_state_update' parameter currently "
+            "defaults to True, but this default will change to False in FlashInfer "
+            "0.7.0. Please pass disable_state_update=True or "
+            "disable_state_update=False explicitly to suppress this warning."
+        )
+        disable_state_update = True
+
     # Validate input shapes
     B, T, H, K = q.shape
     _, _, HV, V = v.shape
