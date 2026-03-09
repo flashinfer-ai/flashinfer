@@ -2217,6 +2217,11 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
               quantization_type == Fp8QuantizationType::NoneFp8) &&
              dtype_weights == btg::Dtype::E4m3) {
     // FP8 per-tensor scale. NoneFp8 is kept for backward compatibility.
+    if (!isGatedActivation(activation_type)) {
+      TVM_FFI_LOG_AND_THROW(NotImplementedError)
+          << "FP8 per-tensor valid-config query currently supports gated activations only, "
+          << "got act_type=" << act_type << ".";
+    }
     return Fp8PerTensorLauncher::getValidConfigs(
         top_k, hidden_size, intermediate_size, num_local_experts, num_tokens, act_type,
         use_shuffled_weight, weight_layout, dtype_act, dtype_weights);
