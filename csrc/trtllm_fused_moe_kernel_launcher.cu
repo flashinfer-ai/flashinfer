@@ -1146,7 +1146,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
           dtype_weights == btg::Dtype::E4m3) {
         TVM_FFI_ICHECK(static_cast<int>(activation_type) ==
                        static_cast<int>(ActivationType::Swiglu))
-            << "DeepSeekFp8 valid-config query only supports ActivationType::Swiglu, got "
+            << "DeepSeekFp8 only supports ActivationType::Swiglu, got "
             << static_cast<int>(activation_type) << ".";
         moe_runner = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner>(
             dtype_weights, true /* useDeepSeekFp8 */, tile_N, use_shuffled_weight,
@@ -2200,7 +2200,7 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
              dtype_act == btg::Dtype::E4m3 && dtype_weights == btg::Dtype::E4m3) {
     if (activation_type != ActivationType::Swiglu) {
       TVM_FFI_LOG_AND_THROW(NotImplementedError)
-          << "DeepSeekFp8 valid-config query only supports ActivationType::Swiglu, "
+          << "DeepSeekFp8 only supports ActivationType::Swiglu, "
           << "got act_type=" << act_type << ".";
     }
     // FP8 block scale (DeepSeek)
@@ -2219,7 +2219,7 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
     // FP8 per-tensor scale. NoneFp8 is kept for backward compatibility.
     if (!isGatedActivation(activation_type)) {
       TVM_FFI_LOG_AND_THROW(NotImplementedError)
-          << "FP8 per-tensor valid-config query currently supports gated activations only, "
+          << "FP8 per-tensor currently supports gated activations only, "
           << "got act_type=" << act_type << ".";
     }
     return Fp8PerTensorLauncher::getValidConfigs(
