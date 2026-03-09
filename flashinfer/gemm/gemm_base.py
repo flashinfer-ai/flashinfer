@@ -2640,7 +2640,7 @@ def _trtllm_gemm_mxfp8_requirement(
 ):
     if out_dtype != torch.bfloat16:
         return False
-    if a.ndim != 2 or b.ndim != 2: # currently don't support BlockMajorK layout
+    if a.ndim != 2 or b.ndim != 2:  # currently don't support BlockMajorK layout
         return False
     k, n = b.shape
     if k % 256 != 0:
@@ -2714,9 +2714,13 @@ def mm_mxfp8(
     out_dtype: torch.dtype
         Output dtype, bf16 or fp16. Defaults to ``torch.bfloat16``.
 
-    backend: Literal["cutlass", "auto"]
+    use_8x4_sf_layout: bool
+        Whether to use 8x4 scale factor layout or 128x4 scale factor layout for the matrix a. Defaults to False.
+
+    backend: Literal["cutlass", "trtllm", "auto"]
         The backend to use for the operation. Defaults to ``"auto"``.
-        ``"auto"`` selects the CUTLASS backend.
+        ``"auto"`` selects the best backend between CUTLASS and TRTLLM.
+        When trtllm backend is used, b must be quantized with 128x4 layout and shuffled. a can be quantized with either 128x4 or 8x4 layout (controlled by `use_8x4_sf_layout`).
 
     Returns
     -------
