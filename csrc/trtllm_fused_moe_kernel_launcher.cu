@@ -1144,7 +1144,8 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
       // This branch is for DeepSeek FP8 (E4m3 activations + E4m3 weights).
       if (quantization_type == Fp8QuantizationType::DeepSeekFp8 && dtype_act == btg::Dtype::E4m3 &&
           dtype_weights == btg::Dtype::E4m3) {
-        TVM_FFI_ICHECK(activation_type == ActivationType::Swiglu)
+        TVM_FFI_ICHECK(static_cast<int>(activation_type) ==
+                       static_cast<int>(ActivationType::Swiglu))
             << "DeepSeekFp8 valid-config query only supports ActivationType::Swiglu, got "
             << static_cast<int>(activation_type) << ".";
         moe_runner = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner>(
