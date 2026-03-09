@@ -167,11 +167,27 @@ __device__ __forceinline__ void role_store(SramT& sram, int lane,
     sram.bar_out_empty[s].arrive();
   }
 
+  // Pipelined TMA stores: commit each store into its own group, allow 1 in flight.
+  // The previous slot is released only after its store completes (wait_group_read<1>),
+  // overlapping the current store with the wait for the next slot from compute.
+  int prev_slot = -1;
+
   for (int h_local = 0; h_local < HEADS_PER_GROUP; h_local++) {
     int const head = first_head + h_local;
 
     for (int step = 0; step < NTOKENS; step++) {
       int const slot = step % NUM_OUT_STAGES;
+
+      // If there's an in-flight TMA store occupying this same slot, drain it first.
+      // Otherwise compute can't produce bar_out_full[slot] (blocked on bar_out_empty[slot]).
+      if (prev_slot == slot) {
+        if (lane == 0) {
+          cde::cp_async_bulk_wait_group_read<0>();
+        }
+        __syncwarp();
+        sram.bar_out_empty[prev_slot].arrive();
+        prev_slot = -1;
+      }
 
       // Wait for compute to fill this slot
       sram.bar_out_full[slot].wait(sram.bar_out_full[slot].arrive());
@@ -201,15 +217,34 @@ __device__ __forceinline__ void role_store(SramT& sram, int lane,
         if (did_tma_store) {
           if (lane == 0) {
             cde::cp_async_bulk_commit_group();
-            cde::cp_async_bulk_wait_group_read<0>();
           }
-          __syncwarp();
+          // Wait for previous store to complete, release its slot
+          if (prev_slot >= 0) {
+            if (lane == 0) {
+              cde::cp_async_bulk_wait_group_read<1>();
+            }
+            __syncwarp();
+            sram.bar_out_empty[prev_slot].arrive();
+          }
+          prev_slot = slot;
+        } else {
+          // No TMA store — release slot immediately
+          sram.bar_out_empty[slot].arrive();
         }
+      } else {
+        // Padded batch — release slot immediately
+        sram.bar_out_empty[slot].arrive();
       }
-
-      // Release slot back to compute
-      sram.bar_out_empty[slot].arrive();
     }
+  }
+
+  // Drain last in-flight store
+  if (prev_slot >= 0) {
+    if (lane == 0) {
+      cde::cp_async_bulk_wait_group_read<0>();
+    }
+    __syncwarp();
+    sram.bar_out_empty[prev_slot].arrive();
   }
 }
 
@@ -223,15 +258,10 @@ template <typename input_t, typename state_t, typename matrixA_t, typename weigh
 __device__ __forceinline__ void role_update_state(SramT& sram, int lane, int compute_warp,
                                                   SelectiveStateMTPParams const& params, int batch,
                                                   int first_head) {
-  using load_input_t = PackedAligned<input_t>;
-  constexpr auto stateLoadSize = getVectorLoadSizeForFullUtilization<state_t, DSTATE>();
-  using load_state_t = PackedAligned<state_t, stateLoadSize>;
+  // sizeof(state_t) == sizeof(input_t) is enforced by the launcher via FLASHINFER_CHECK + if
+  // constexpr guard
   constexpr int rowsPerWarp = DIM / NUM_COMPUTE_WARPS;
   constexpr auto stateValuesPerThread = DSTATE / warpSize;
-  constexpr auto maxPackedElements = sizeof(uint64_t) / sizeof(input_t);
-  constexpr auto packedSramLdInputElements =
-      (stateValuesPerThread >= maxPackedElements) ? maxPackedElements : stateValuesPerThread;
-  using packed_input_t = PackedAligned<input_t, packedSramLdInputElements>;
 
   auto const* __restrict__ dt_ptr = reinterpret_cast<weight_t const*>(params.dt);
   auto const* __restrict__ A_ptr = reinterpret_cast<matrixA_t const*>(params.A);
@@ -272,16 +302,13 @@ __device__ __forceinline__ void role_update_state(SramT& sram, int lane, int com
     sram.bar_state_in_full[in_slot].wait(sram.bar_state_in_full[in_slot].arrive());
 
     // Load state into registers: rState[wr][ii] persists across token steps
+    // Simple stride-by-warpSize indexing: element i = lane + ii * warpSize
     float rState[rowsPerWarp][stateValuesPerThread];
-    packed_input_t rB, rC;
 
     for (int wr = 0; wr < rowsPerWarp; wr++) {
       int const dd = compute_warp * rowsPerWarp + wr;
       for (int ii = 0; ii < stateValuesPerThread; ii++) {
-        int i = lane * packed_input_t::count +
-                (ii / packed_input_t::count) * warpSize * packed_input_t::count +
-                (ii % packed_input_t::count);
-        rState[wr][ii] = (i < DSTATE) ? toFloat(sram.state_in[in_slot][dd * DSTATE + i]) : 0.f;
+        rState[wr][ii] = toFloat(sram.state_in[in_slot][dd * DSTATE + lane + ii * warpSize]);
       }
     }
 
@@ -300,19 +327,12 @@ __device__ __forceinline__ void role_update_state(SramT& sram, int lane, int com
         float x_value = toFloat(sram.x[in_slot][step][dd]);
         float out_value = D_val * x_value * int(lane == 0);
 
-        for (int ii = 0; ii < stateValuesPerThread; ii += packed_input_t::count) {
-          int base_i = lane * packed_input_t::count +
-                       (ii / packed_input_t::count) * warpSize * packed_input_t::count;
-          rB = *reinterpret_cast<packed_input_t const*>(&sram.B[step][base_i]);
-          rC = *reinterpret_cast<packed_input_t const*>(&sram.C[step][base_i]);
-
 #pragma unroll
-          for (int k = 0; k < packed_input_t::count; k++) {
-            float& sv = rState[wr][ii + k];
-            float dB = toFloat(rB.val[k]) * dt_value;
-            sv = sv * dA + dB * x_value;
-            out_value += sv * toFloat(rC.val[k]);
-          }
+        for (int ii = 0; ii < stateValuesPerThread; ii++) {
+          float& sv = rState[wr][ii];
+          float dB = toFloat(sram.B[step][lane + ii * warpSize]) * dt_value;
+          sv = sv * dA + dB * x_value;
+          out_value += sv * toFloat(sram.C[step][lane + ii * warpSize]);
         }
 
         out_value = warpReduceSum(out_value);
@@ -323,12 +343,8 @@ __device__ __forceinline__ void role_update_state(SramT& sram, int lane, int com
 
         // Write rState to state_out ring
         for (int ii = 0; ii < stateValuesPerThread; ii++) {
-          int i = lane * packed_input_t::count +
-                  (ii / packed_input_t::count) * warpSize * packed_input_t::count +
-                  (ii % packed_input_t::count);
-          if (i < DSTATE) {
-            convertAndStore(&sram.state_out[slot][dd * DSTATE + i], rState[wr][ii]);
-          }
+          convertAndStore(&sram.state_out[slot][dd * DSTATE + lane + ii * warpSize],
+                          rState[wr][ii]);
         }
       }  // warpRow loop
 

@@ -475,6 +475,9 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
 
   // ── Vertical MTP kernel ──────────────────────────────────────────────────
   if (algorithm == SSUAlgorithm::kVertical) {
+    FLASHINFER_CHECK(sizeof(state_t) == sizeof(input_t),
+                     "vertical algorithm requires sizeof(state_t) (", sizeof(state_t),
+                     ") == sizeof(input_t) (", sizeof(input_t), ")");
     FLASHINFER_CHECK(params.nheads % params.ngroups == 0, "nheads (", params.nheads,
                      ") must be divisible by ngroups (", params.ngroups,
                      ") for vertical algorithm");
@@ -483,6 +486,11 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
     FLASHINFER_CHECK(params.dim % NUM_COMPUTE_WARPS == 0, "DIM (", params.dim,
                      ") must be divisible by NUM_COMPUTE_WARPS (", NUM_COMPUTE_WARPS,
                      ") for vertical algorithm");
+
+    if constexpr (sizeof(state_t) != sizeof(input_t)) {
+      // Unreachable due to FLASHINFER_CHECK above, but prevents template instantiation errors
+      return;
+    }
 
     constexpr int NUM_IN_STAGES = 2;
     constexpr int NUM_OUT_STAGES = 3;

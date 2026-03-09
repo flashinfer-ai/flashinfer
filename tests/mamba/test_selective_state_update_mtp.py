@@ -1375,6 +1375,8 @@ class TestSelectiveStateUpdateMTPVertical(TestSelectiveStateUpdateMTP):
             pytest.skip(
                 "Known bug: float32 state ordering-dependent failure (see plan Bug 1)"
             )
+        if inputs["x"].shape[-1] > 64:
+            pytest.skip("Vertical kernel only supports DIM <= 64 (smem budget)")
         return flashinfer.mamba.selective_state_update(
             inputs["state_cache"],
             inputs["x"],
@@ -1405,6 +1407,8 @@ class TestSelectiveStateUpdateMTPVerticalWithIntermediateStates(
             pytest.skip(
                 "Known bug: float32 state ordering-dependent failure (see plan Bug 1)"
             )
+        if inputs["x"].shape[-1] > 64:
+            pytest.skip("Vertical kernel only supports DIM <= 64 (smem budget)")
         return flashinfer.mamba.selective_state_update(
             inputs["state_cache"],
             inputs["x"],
