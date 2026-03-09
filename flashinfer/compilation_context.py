@@ -41,8 +41,10 @@ class CompilationContext:
             try:
                 for device in range(torch.cuda.device_count()):
                     major, minor = torch.cuda.get_device_capability(device)
-                    if major >= 9:
+                    if major == 9:
                         minor = str(minor) + "a"
+                    elif major >= 10:
+                        minor = str(minor) + "f"
                     self.TARGET_CUDA_ARCHS.add((int(major), str(minor)))
             except Exception as e:
                 logger.warning(f"Failed to get device capability: {e}.")
