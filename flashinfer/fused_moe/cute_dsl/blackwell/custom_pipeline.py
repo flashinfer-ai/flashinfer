@@ -46,7 +46,6 @@
 from dataclasses import dataclass
 from typing import Optional
 
-import cutlass
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import Boolean, if_generate
 from cutlass.pipeline import (
@@ -58,26 +57,6 @@ from cutlass.pipeline import (
     agent_sync,
 )
 from cutlass.pipeline.helpers import MbarrierArray
-
-# In cutlass >= 4.4.0, PipelineAsync._make_sync_object no longer handles
-# PipelineOp.TCGen05Mma directly. Patch it back so our custom pipelines
-# (which pass TCGen05Mma as producer/consumer) keep working.
-# cutlass.__version__ was added in 4.4.0, so its presence indicates the new version.
-if hasattr(cutlass, "__version__"):
-    _original_make_sync_object = PipelineAsync._make_sync_object
-
-    @staticmethod
-    def _patched_make_sync_object(barrier_storage, num_stages, agent, tx_count=0):
-        if agent[0] is PipelineOp.TCGen05Mma:
-            return MbarrierArray(
-                barrier_storage=barrier_storage,
-                num_stages=num_stages,
-                agent=agent,
-                tx_count=tx_count,
-            )
-        return _original_make_sync_object(barrier_storage, num_stages, agent, tx_count)
-
-    PipelineAsync._make_sync_object = _patched_make_sync_object
 
 
 def pipeline_init_wait(cta_layout_vmnk: Optional[cute.Layout] = None):
@@ -217,8 +196,12 @@ class PipelineTmaUmma(PipelineAsync):
         sync_object_full = PipelineAsync._make_sync_object(
             barrier_storage.align(min_align=8), num_stages, producer, tx_count
         )
-        sync_object_empty = PipelineAsync._make_sync_object(
-            barrier_storage.align(min_align=8) + num_stages, num_stages, consumer
+        # Directly create MbarrierArray for TCGen05Mma consumer, since
+        # PipelineAsync._make_sync_object does not handle TCGen05Mma in cutlass >= 4.4.0.
+        sync_object_empty = MbarrierArray(
+            barrier_storage=barrier_storage.align(min_align=8) + num_stages,
+            num_stages=num_stages,
+            agent=consumer,
         )
 
         if cta_layout_vmnk is None or cute.size(cta_layout_vmnk) == 1:
@@ -359,8 +342,12 @@ class PipelineUmmaAsync(PipelineAsync):
         producer = (producer_type, producer_group)
         consumer = (consumer_type, consumer_group)
 
-        sync_object_full = PipelineAsync._make_sync_object(
-            barrier_storage.align(min_align=8), num_stages, producer
+        # Directly create MbarrierArray for TCGen05Mma producer, since
+        # PipelineAsync._make_sync_object does not handle TCGen05Mma in cutlass >= 4.4.0.
+        sync_object_full = MbarrierArray(
+            barrier_storage=barrier_storage.align(min_align=8),
+            num_stages=num_stages,
+            agent=producer,
         )
         sync_object_empty = PipelineAsync._make_sync_object(
             barrier_storage.align(min_align=8) + num_stages, num_stages, consumer
@@ -519,8 +506,12 @@ class PipelineCpAsyncUmma(PipelineAsync):
             num_stages,
             producer,
         )
-        sync_object_empty = PipelineAsync._make_sync_object(
-            barrier_storage.align(min_align=8) + num_stages, num_stages, consumer
+        # Directly create MbarrierArray for TCGen05Mma consumer, since
+        # PipelineAsync._make_sync_object does not handle TCGen05Mma in cutlass >= 4.4.0.
+        sync_object_empty = MbarrierArray(
+            barrier_storage=barrier_storage.align(min_align=8) + num_stages,
+            num_stages=num_stages,
+            agent=consumer,
         )
 
         cta_v_size = (
