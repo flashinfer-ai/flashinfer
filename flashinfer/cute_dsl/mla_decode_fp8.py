@@ -26,8 +26,6 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-import os
-import sys
 import argparse
 import math
 from typing import Type, Tuple, Optional
@@ -704,7 +702,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
             cluster=self.cluster_shape_mnk,
-            smem=SplitKVKernelSharedStorage.size_in_bytes(),
+            smem=SplitKVKernelSharedStorage.size_in_bytes(),  # type: ignore[attr-defined]
             stream=stream,
             min_blocks_per_mp=1,
         )
@@ -1394,7 +1392,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             # calculate the global_lse
             global_lse = (
                 lse_max + cute.math.log2(sum_lse, fastmath=True)
-                if not sum_lse == self.lse_dtype(0.0) or sum_lse != sum_lse
+                if not sum_lse == self.lse_dtype(0.0) or sum_lse != sum_lse  # noqa: SIM201
                 else self.lse_dtype.inf
             )
             if tidx == 0:
@@ -2029,7 +2027,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 mma_o_producer_state,
             )
 
-        return (
+        return (  # type: ignore[return-value]
             tiled_mma_qk,
             tiled_mma_pv,
             load_q_consumer_state,
@@ -2794,7 +2792,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         tTR_gO = tmem_load_thr_copy.partition_D(gO)
         tTR_cO = tmem_load_thr_copy.partition_D(cO)
         tTR_rAcc = cute.make_fragment_like(tTR_gO, self.acc_dtype)
-        return tmem_load_tiled_copy, tAcc, tTR_tAcc, tTR_gO, tTR_cO, tTR_rAcc
+        return tmem_load_tiled_copy, tAcc, tTR_tAcc, tTR_gO, tTR_cO, tTR_rAcc  # type: ignore[return-value]
 
     def get_correction_factor(
         self,
@@ -4145,7 +4143,7 @@ if __name__ == "__main__":
         try:
             return tuple(int(x.strip()) for x in s.split(","))
         except ValueError:
-            raise argparse.ArgumentTypeError(
+            raise argparse.ArgumentTypeError(  # noqa: B904
                 "Invalid format. Expected comma-separated integers."
             )
 
@@ -4155,7 +4153,7 @@ if __name__ == "__main__":
             raise argparse.ArgumentTypeError(
                 "Invalid format. Expected 2 comma-separated integers."
             )
-        return (ret[0], ret[1])
+        return (ret[0], ret[1])  # type: ignore[return-value]
 
     parser = argparse.ArgumentParser(description="Example of MLA on Blackwell.")
 

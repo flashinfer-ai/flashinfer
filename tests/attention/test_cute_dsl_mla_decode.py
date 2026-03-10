@@ -54,7 +54,6 @@ def torch_reference_mla(
         page_size: int
     """
     B, q_len, H, latent_dim = q_nope.shape
-    rope_dim = q_rope.shape[-1]
 
     outputs = []
     for b in range(B):
@@ -117,15 +116,25 @@ def test_cute_dsl_mla_decode_fp16(batch_size, seq_len_k, page_size):
 
     # Allocate query: [B, q_len, H, D_qk]
     D_qk = latent_dim + rope_dim
-    query = torch.randn(batch_size, q_len, num_heads, D_qk, dtype=torch.float16, device=device)
+    query = torch.randn(
+        batch_size, q_len, num_heads, D_qk, dtype=torch.float16, device=device
+    )
 
     # Allocate paged KV cache
     num_pages_per_batch = (seq_len_k + page_size - 1) // page_size
     total_pages = num_pages_per_batch * batch_size + 10  # extra pages
-    kv_cache = torch.randn(total_pages, page_size, latent_dim + rope_dim, dtype=torch.float16, device=device)
+    kv_cache = torch.randn(
+        total_pages,
+        page_size,
+        latent_dim + rope_dim,
+        dtype=torch.float16,
+        device=device,
+    )
 
     # Page table: [B, max_pages] — sequential assignment
-    block_tables = torch.zeros(batch_size, num_pages_per_batch, dtype=torch.int32, device=device)
+    block_tables = torch.zeros(
+        batch_size, num_pages_per_batch, dtype=torch.int32, device=device
+    )
     for b in range(batch_size):
         for p in range(num_pages_per_batch):
             block_tables[b, p] = b * num_pages_per_batch + p
@@ -158,8 +167,15 @@ def test_cute_dsl_mla_decode_fp16(batch_size, seq_len_k, page_size):
     q_rope = query[..., latent_dim:]
 
     ref_out = torch_reference_mla(
-        q_nope, q_rope, c_latent_ref, c_rope_ref,
-        block_tables, seq_lens, softmax_scale, output_scale, page_size,
+        q_nope,
+        q_rope,
+        c_latent_ref,
+        c_rope_ref,
+        block_tables,
+        seq_lens,
+        softmax_scale,
+        output_scale,
+        page_size,
     )
 
     if q_len == 1:
@@ -190,7 +206,9 @@ def test_cute_dsl_mla_decode_variable_seq_len(batch_size, seq_len_k, page_size=1
     output_scale = 1.0
     D_qk = latent_dim + rope_dim
 
-    query = torch.randn(batch_size, q_len, num_heads, D_qk, dtype=torch.float16, device=device)
+    query = torch.randn(
+        batch_size, q_len, num_heads, D_qk, dtype=torch.float16, device=device
+    )
 
     # Variable sequence lengths
     max_seq_len = seq_len_k
@@ -200,9 +218,13 @@ def test_cute_dsl_mla_decode_variable_seq_len(batch_size, seq_len_k, page_size=1
 
     max_pages_per_batch = (max_seq_len + page_size - 1) // page_size
     total_pages = max_pages_per_batch * batch_size + 10
-    kv_cache = torch.randn(total_pages, page_size, D_qk, dtype=torch.float16, device=device)
+    kv_cache = torch.randn(
+        total_pages, page_size, D_qk, dtype=torch.float16, device=device
+    )
 
-    block_tables = torch.zeros(batch_size, max_pages_per_batch, dtype=torch.int32, device=device)
+    block_tables = torch.zeros(
+        batch_size, max_pages_per_batch, dtype=torch.int32, device=device
+    )
     for b in range(batch_size):
         for p in range(max_pages_per_batch):
             block_tables[b, p] = b * max_pages_per_batch + p
@@ -230,8 +252,15 @@ def test_cute_dsl_mla_decode_variable_seq_len(batch_size, seq_len_k, page_size=1
     q_rope = query[..., latent_dim:]
 
     ref_out = torch_reference_mla(
-        q_nope, q_rope, c_latent_ref, c_rope_ref,
-        block_tables, seq_lens, softmax_scale, output_scale, page_size,
+        q_nope,
+        q_rope,
+        c_latent_ref,
+        c_rope_ref,
+        block_tables,
+        seq_lens,
+        softmax_scale,
+        output_scale,
+        page_size,
     )
     if q_len == 1:
         ref_out = ref_out.squeeze(1)
@@ -258,13 +287,19 @@ def test_cute_dsl_mla_decode_via_api(batch_size, seq_len_k, page_size=128):
     softmax_scale = 1.0 / (latent_dim**0.5)
     D_qk = latent_dim + rope_dim
 
-    query = torch.randn(batch_size, q_len, num_heads, D_qk, dtype=torch.float16, device=device)
+    query = torch.randn(
+        batch_size, q_len, num_heads, D_qk, dtype=torch.float16, device=device
+    )
 
     num_pages_per_batch = (seq_len_k + page_size - 1) // page_size
     total_pages = num_pages_per_batch * batch_size + 10
-    kv_cache = torch.randn(total_pages, page_size, D_qk, dtype=torch.float16, device=device)
+    kv_cache = torch.randn(
+        total_pages, page_size, D_qk, dtype=torch.float16, device=device
+    )
 
-    block_tables = torch.zeros(batch_size, num_pages_per_batch, dtype=torch.int32, device=device)
+    block_tables = torch.zeros(
+        batch_size, num_pages_per_batch, dtype=torch.int32, device=device
+    )
     for b in range(batch_size):
         for p in range(num_pages_per_batch):
             block_tables[b, p] = b * num_pages_per_batch + p

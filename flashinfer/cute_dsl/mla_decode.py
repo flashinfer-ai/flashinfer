@@ -86,7 +86,7 @@ def _get_compiled_mla_kernel(
     sym_latent = cute.sym_int()
     sym_seq_q = cute.sym_int()
     sym_rope = cute.sym_int()
-    sym_batch = cute.sym_int()     # query/output batch dimension
+    sym_batch = cute.sym_int()  # query/output batch dimension
     sym_kv_batch = cute.sym_int()  # KV cache batch dim (flat pool, =1 in paged mode)
     sym_seq_kv = cute.sym_int()
     sym_page_count = cute.sym_int()
@@ -289,17 +289,18 @@ def cute_dsl_mla_decode(
     q_latent_k = q_nope.permute(2, 3, 1, 0)  # [H, latent_dim, q_len, B], stride[1]=1
     q_rope_k = q_rope.permute(2, 3, 1, 0)  # [H, rope_dim, q_len, B], stride[1]=1
 
-    # Total number of physical pages in the KV cache pool
-    num_pages = kv_cache.shape[0]
-
     # Reshape KV cache to kernel layout [page_size, D, num_pages].
     # The kernel indexes via page_table: for batch b, page p, offset t:
     #   c_latent[t, d, page_table[p, b]] = token (page_table[p,b]*page_size + t)'s latent[d]
     # kv_cache: [num_pages, page_size, D_total] with strides (page_size*D_total, D_total, 1)
     # After permute(1, 2, 0) on latent slice: [page_size, latent_dim, num_pages]
     #   strides = (D_total, 1, page_size*D_total) → stride[1]=1 ✓
-    c_latent_k = kv_cache[:, :, :kv_lora_rank].permute(1, 2, 0)  # [page_size, latent_dim, num_pages]
-    c_rope_k = kv_cache[:, :, kv_lora_rank:].permute(1, 2, 0)  # [page_size, rope_dim, num_pages]
+    c_latent_k = kv_cache[:, :, :kv_lora_rank].permute(
+        1, 2, 0
+    )  # [page_size, latent_dim, num_pages]
+    c_rope_k = kv_cache[:, :, kv_lora_rank:].permute(
+        1, 2, 0
+    )  # [page_size, rope_dim, num_pages]
 
     # Page table: [B, max_pages] -> [max_pages, B]
     page_table_k = block_tables.t().contiguous().to(torch.int32)
@@ -320,7 +321,7 @@ def cute_dsl_mla_decode(
 
     # Prepare workspace tensor
     if workspace_size > 0:
-        workspace_bytes = workspace_buffer[: workspace_size].contiguous()
+        workspace_bytes = workspace_buffer[:workspace_size].contiguous()
     else:
         workspace_bytes = workspace_buffer[:1].contiguous()
 

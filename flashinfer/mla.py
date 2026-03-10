@@ -780,8 +780,12 @@ def trtllm_batch_decode_with_kv_cache_mla(
             block_tables=block_tables,
             seq_lens=seq_lens,
             max_seq_len=max_seq_len,
-            softmax_scale=bmm1_scale if isinstance(bmm1_scale, float) else float(bmm1_scale.item()),
-            output_scale=bmm2_scale if isinstance(bmm2_scale, float) else float(bmm2_scale.item()),
+            softmax_scale=bmm1_scale
+            if isinstance(bmm1_scale, float)
+            else float(bmm1_scale.item()),
+            output_scale=bmm2_scale
+            if isinstance(bmm2_scale, float)
+            else float(bmm2_scale.item()),
             out=out,
         )
     else:
