@@ -164,6 +164,11 @@
       __VA_ARGS__                                                 \
       break;                                                      \
     }                                                             \
+    case MaskMode::kMultiItemScoringV2: {                             \
+      constexpr MaskMode MASK_MODE = MaskMode::kMultiItemScoringV2;   \
+      __VA_ARGS__                                                     \
+      break;                                                          \
+    }                                                                 \
     default: {                                                    \
       std::ostringstream err_msg;                                 \
       err_msg << "Unsupported mask_mode: " << int(mask_mode);     \

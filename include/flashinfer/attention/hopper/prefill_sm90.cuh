@@ -39,10 +39,12 @@ DEFINE_HAS_MEMBER(maybe_prefix_len_ptr)
 DEFINE_HAS_MEMBER(maybe_token_pos_in_items_ptr)
 DEFINE_HAS_MEMBER(token_pos_in_items_len)
 DEFINE_HAS_MEMBER(maybe_max_item_len_ptr)
+DEFINE_HAS_MEMBER(maybe_item_start_ptr)
+DEFINE_HAS_MEMBER(item_start_len)
 
 template <typename CollectiveMainloop, typename CollectiveEpilogue, typename Ktraits,
           bool LEFT_SLIDING_WINDOW, bool CAUSAL, typename TileScheduler,
-          bool MULTIITEMSCORING = false>
+          bool MULTIITEMSCORING = false, bool MULTIITEMSCORINGV2 = false>
 __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp, 1)
     PrefillWithKVCacheKernel(CUTE_GRID_CONSTANT
                              typename CollectiveMainloop::Params const mainloop_params,
@@ -144,6 +146,14 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   if constexpr (has_maybe_max_item_len_ptr_v<decltype(mainloop_params.additional_params)>) {
     maybe_max_item_len_ptr = mainloop_params.additional_params.maybe_max_item_len_ptr;
   }
+  uint32_t* maybe_item_start_ptr = nullptr;
+  if constexpr (has_maybe_item_start_ptr_v<decltype(mainloop_params.additional_params)>) {
+    maybe_item_start_ptr = mainloop_params.additional_params.maybe_item_start_ptr;
+  }
+  uint32_t item_start_len = 0;
+  if constexpr (has_item_start_len_v<decltype(mainloop_params.additional_params)>) {
+    item_start_len = mainloop_params.additional_params.item_start_len;
+  }
 
   if (warp_group_idx == 0) {  // Producer
     if constexpr (use_tma_load_kv) {
@@ -180,7 +190,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
         }
         int num_kv_tiles_outside_items_window = 0;
         int num_kv_tiles_prefix = 0;
-        if constexpr (MULTIITEMSCORING) {
+        if constexpr (MULTIITEMSCORING || MULTIITEMSCORINGV2) {
           auto prefix_len = __ldg(maybe_prefix_len_ptr + batch_idx);
           auto max_item_len = __ldg(maybe_max_item_len_ptr + batch_idx);
           auto valid_items_window_len =
@@ -188,7 +198,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
           num_kv_tiles_outside_items_window = valid_items_window_len / CTA_KV;
           num_kv_tiles_prefix = cute::ceil_div(prefix_len, CTA_KV);
         }
-        if constexpr (MULTIITEMSCORING) {
+        if constexpr (MULTIITEMSCORING || MULTIITEMSCORINGV2) {
           collective_mainloop.load<LEFT_SLIDING_WINDOW>(
               mainloop_params, pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v,
               shared_storage, scheduler, scheduler_params, work_tile_info, block_coord, work_idx,
@@ -259,13 +269,18 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
 
       uint32_t prefix_len = 0;
       uint16_t* token_pos_in_items = nullptr;
+      uint32_t* item_start = nullptr;
       if constexpr (MULTIITEMSCORING) {
         prefix_len = __ldg(maybe_prefix_len_ptr + batch_idx);
         token_pos_in_items = maybe_token_pos_in_items_ptr + batch_idx * token_pos_in_items_len;
       }
+      if constexpr (MULTIITEMSCORINGV2) {
+        prefix_len = __ldg(maybe_prefix_len_ptr + batch_idx);
+        item_start = maybe_item_start_ptr + batch_idx * item_start_len;
+      }
       int num_kv_tiles_outside_items_window = 0;
       int num_kv_tiles_prefix = 0;
-      if constexpr (MULTIITEMSCORING) {
+      if constexpr (MULTIITEMSCORING || MULTIITEMSCORINGV2) {
         auto prefix_len = __ldg(maybe_prefix_len_ptr + batch_idx);
         auto max_item_len = __ldg(maybe_max_item_len_ptr + batch_idx);
         auto valid_items_window_len =
@@ -274,11 +289,11 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
         num_kv_tiles_prefix = cute::ceil_div(prefix_len, CTA_KV);
       }
       mma_f16<Ktraits, /*LEFT_SLIDING_WINDOW=*/LEFT_SLIDING_WINDOW, CAUSAL, MULTIITEMSCORING,
-              CollectiveMainloop::WarpScheduler>(
+              MULTIITEMSCORINGV2, CollectiveMainloop::WarpScheduler>(
           mainloop_params, variant, pipeline_k, pipeline_v, smem_pipe_read_k, smem_pipe_read_v,
           tOrO, attention_updater, num_kv_tiles, swa_begin_kv_tile_idx, swa_end_kv_tile_idx,
           threadIdx.x - NUM_COPY_THREADS, work_idx, q_tile_idx, shared_storage, qo_len, kv_len,
-          qo_head_idx, kv_head_idx, prefix_len, token_pos_in_items,
+          qo_head_idx, kv_head_idx, prefix_len, token_pos_in_items, item_start,
           num_kv_tiles_outside_items_window, num_kv_tiles_prefix);
       collective_epilogue.store(epilogue_params, tOrO, attention_updater.get_lse(), shared_storage,
                                 tiled_mma_pv, threadIdx.x - NUM_COPY_THREADS, block_coord);
@@ -352,7 +367,8 @@ cudaError_t SinglePrefillWithKVCacheKernelTraitsDispatched(Params& params, cudaS
 }
 
 template <typename KernelTraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL,
-          bool SAME_SCHEDULE_FOR_ALL_HEADS, typename Params, bool MULTIITEMSCORING = false>
+          bool SAME_SCHEDULE_FOR_ALL_HEADS, typename Params, bool MULTIITEMSCORING = false,
+          bool MULTIITEMSCORINGV2 = false>
 cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
                                                                cudaStream_t stream) {
   using DTypeQ = typename KernelTraits::DTypeQ;
@@ -361,7 +377,8 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
   using IdType = typename KernelTraits::IdType;
 
   using CollectiveMainloop = SparseCollectiveMainloop<typename Params::AdditionalParams,
-                                                      KernelTraits, CAUSAL, MULTIITEMSCORING>;
+                                                      KernelTraits, CAUSAL,
+                                                      MULTIITEMSCORING || MULTIITEMSCORINGV2>;
   using CollectiveEpilogue = CollectiveEpilogue<KernelTraits>;
   using Scheduler =
       std::conditional_t<SAME_SCHEDULE_FOR_ALL_HEADS, BatchPrefillTileScheduler<IdType>,
@@ -405,7 +422,8 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
   // Get the ptr to kernel function.
   auto kernel =
       (void*)PrefillWithKVCacheKernel<CollectiveMainloop, CollectiveEpilogue, KernelTraits,
-                                      LEFT_SLIDING_WINDOW, CAUSAL, Scheduler, MULTIITEMSCORING>;
+                                      LEFT_SLIDING_WINDOW, CAUSAL, Scheduler, MULTIITEMSCORING,
+                                      MULTIITEMSCORINGV2>;
   int smem_size = sizeof(typename KernelTraits::SharedStorage);
   FLASHINFER_CUDA_CALL(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -571,6 +589,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, bool enable_p
   }
   constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
   constexpr bool MULTIITEMSCORING = MASK_MODE == MaskMode::kMultiItemScoring;
+  constexpr bool MULTIITEMSCORINGV2 = MASK_MODE == MaskMode::kMultiItemScoringV2;
   if constexpr (HEAD_DIM_QK == HEAD_DIM_VO) {
     if constexpr (HEAD_DIM_VO == 64) {
       // NOTE(Zihao): CTA_KV not tuned for HEAD_DIM == 64, need to optimize later
@@ -581,8 +600,8 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, bool enable_p
                                 /*NUM_STAGES_=*/2, typename Params::DTypeQ,
                                 typename Params::DTypeKV, typename Params::DTypeO,
                                 typename Params::IdType, AttentionVariant>,
-          LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(
-          params, stream);
+          LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING,
+          MULTIITEMSCORINGV2>(params, stream);
     } else if constexpr (HEAD_DIM_VO == 128) {
       BatchPrefillWithPagedKVCacheKernelTraitsDispatched<
           AttentionKernelTraits</*USE_TMA_LOAD_KV=*/false, HEAD_DIM_QK, HEAD_DIM_VO,
@@ -591,8 +610,8 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, bool enable_p
                                 /*NUM_STAGES_=*/2, typename Params::DTypeQ,
                                 typename Params::DTypeKV, typename Params::DTypeO,
                                 typename Params::IdType, AttentionVariant>,
-          LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(
-          params, stream);
+          LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING,
+          MULTIITEMSCORINGV2>(params, stream);
     } else {
       // HEAD_DIM == 256;
       // NOTE(Zihao): CTA_KV not tuned for HEAD_DIM == 256, need to optimize later
@@ -603,8 +622,8 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, bool enable_p
                                 /*NUM_STAGES_=*/2, typename Params::DTypeQ,
                                 typename Params::DTypeKV, typename Params::DTypeO,
                                 typename Params::IdType, AttentionVariant>,
-          LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(
-          params, stream);
+          LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING,
+          MULTIITEMSCORINGV2>(params, stream);
     }
   } else {
     return cudaErrorNotSupported;
