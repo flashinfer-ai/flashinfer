@@ -16,7 +16,6 @@ limitations under the License.
 
 from itertools import product
 
-from flashinfer.utils import is_sm12x_supported
 import numpy as np
 import torch
 
@@ -24,19 +23,16 @@ import flashinfer
 from flashinfer.testing.utils import bench_gpu_time
 
 
-def bench_groupwise_grouped_gemm_mxfp4_blackwell(
-    group_size, m, n, k, in_dtype, out_dtype
+def bench_groupwise_grouped_gemm_nvfp4_blackwell(
+    group_size, m, n, k, out_dtype
 ):
     torch.random.manual_seed(0)
     assert n % 8 == 0
     assert k % 128 == 0
-    tile_size = 32
+    tile_size = 16
     alignment_sf = 128
-    fp8_info = torch.finfo(in_dtype)
-    a = (
-        torch.empty(group_size * m, k, dtype=torch.float32, device="cuda:0")
-        .uniform_(-fp8_info.max, fp8_info.max)
-        .to(in_dtype)
+    a = torch.randint(
+        0, 256, (group_size * m, k // 2), dtype=torch.uint8, device="cuda:0"
     )
     b = torch.randint(
         0, 256, (group_size, n, k // 2), dtype=torch.uint8, device="cuda:0"
@@ -70,37 +66,28 @@ def bench_groupwise_grouped_gemm_mxfp4_blackwell(
     segment_offsets = torch.arange(
         0, (group_size + 1) * m, m, device="cuda:0", dtype=torch.int32
     )
-    if is_sm12x_supported(a.device):
-        mma_sm_list = [1]
-        tile_m_list = [128]
-        tile_n_list = [128]
-        tile_k_list = [128]
-        swap_ab_list = [False]
-    else:
-        mma_sm_list = [1, 2]
-        tile_m_list = [128]
-        tile_n_list = [64, 128, 192, 256]
-        tile_k_list = [128, 256]
-        swap_ab_list = [True, False]
+
+    tile_m_list = [128]
+    tile_n_list = [128]
+    tile_k_list = [128, 256]
+    
 
     ms_best = float("inf")
     config_best = None
-    for mma_sm, tile_m, tile_n, tile_k, swap_ab in product(
-        mma_sm_list, tile_m_list, tile_n_list, tile_k_list, swap_ab_list
+    for tile_m, tile_n, tile_k in product(
+        tile_m_list, tile_n_list, tile_k_list
     ):
         measurements = bench_gpu_time(
-            lambda: flashinfer.gemm.group_gemm_mxfp4_nt_groupwise(
+            lambda: flashinfer.gemm.group_gemm_nvfp4_nt_groupwise(
                 a,
                 b,
                 a_scale,
                 b_scale,
                 segment_offsets,
                 out=out,
-                mma_sm=mma_sm,
                 tile_m=tile_m,
                 tile_n=tile_n,
                 tile_k=tile_k,
-                swap_ab=swap_ab,
             ),
             dry_run_time_ms=10,
             repeat_time_ms=100,
@@ -109,15 +96,13 @@ def bench_groupwise_grouped_gemm_mxfp4_blackwell(
         if ms < ms_best:
             ms_best = ms
             config_best = {
-                "mma_sm": mma_sm,
                 "tile_m": tile_m,
                 "tile_n": tile_n,
                 "tile_k": tile_k,
-                "swap_ab": swap_ab,
             }
     tflops_per_second = 2 * group_size * m * n * k * 1e-9 / ms_best
     print(
-        f"group_gemm_mxfp4_nt_groupwise group_size={group_size} m={m} n={n} k={k} in_dtype={in_dtype} out_dtype={out_dtype}: {tflops_per_second:.2f} TFLOPs/s"
+        f"group_gemm_nvfp4_nt_groupwise group_size={group_size} m={m} n={n} k={k} out_dtype={out_dtype}: {tflops_per_second:.2f} TFLOPs/s"
     )
     print(f"best config: {config_best}")
     print()
@@ -128,6 +113,6 @@ if __name__ == "__main__":
         for m in [128, 512, 1024, 2048, 4096, 8192]:
             for n in [1024, 2048, 4096, 8192]:
                 for k in [1024, 2048, 4096, 8192]:
-                    bench_groupwise_grouped_gemm_mxfp4_blackwell(
-                        group_size, m, n, k, torch.float8_e4m3fn, torch.bfloat16
+                    bench_groupwise_grouped_gemm_nvfp4_blackwell(
+                        group_size, m, n, k, torch.bfloat16
                     )

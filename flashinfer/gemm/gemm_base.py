@@ -4998,7 +4998,7 @@ def group_gemm_mxfp8_mxfp4_nt_groupwise(
     out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     r"""Perform group GEMM with MXFP4 data types using groupwise scaling. Currently only supported on NVIDIA
-    Blackwell architecture.
+    Blackwell, Blackwell Geforce, and DGX Spark architectures.
 
     Parameters
     ----------
@@ -5074,7 +5074,223 @@ def group_gemm_mxfp8_mxfp4_nt_groupwise(
     if out is None:
         out = torch.empty(out_shape, dtype=out_dtype, device=a.device)
 
-    get_gemm_sm100_module().group_gemm_mxfp4_nt_groupwise(
+    if is_sm12x_supported(a.device):
+        # SM120/121 doesn't use mma_sm parameter or swap_ab
+        get_gemm_sm120_module().group_gemm_mxfp4_nt_groupwise(
+            int_workspace_buffer,
+            float_workspace_buffer,
+            a,
+            b,
+            a_scale,
+            b_scale,
+            out,
+            m_indptr,
+            n,
+            k,
+            tile_m,
+            tile_n,
+            tile_k,
+        )
+    elif is_sm100a_supported(a.device):
+        get_gemm_sm100_module().group_gemm_mxfp4_nt_groupwise(
+            int_workspace_buffer,
+            float_workspace_buffer,
+            a,
+            b,
+            a_scale,
+            b_scale,
+            out,
+            m_indptr,
+            n,
+            k,
+            mma_sm,
+            tile_m,
+            tile_n,
+            tile_k,
+            swap_ab,
+        )
+
+    return out
+
+# NOTE(Zihao): keep the old name for backward compatibility
+group_gemm_mxfp4_nt_groupwise = group_gemm_mxfp8_mxfp4_nt_groupwise
+
+# NOTE: Just 120/121 support has been added, but it is trivial to generalize
+@supported_compute_capability([120, 121])
+def _check_group_gemm_nvfp4_nt_groupwise_problem_size(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    m_indptr: torch.Tensor,
+    alpha: Optional[torch.Tensor] = None,
+    tile_m: int = 128,
+    tile_n: int = 128,
+    tile_k: int = 128,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+):
+    if a.dtype not in [torch.uint8]:
+        raise ValueError(
+            f"a must be a uint8 tensor, but got {a.dtype}"
+        )
+    if b.dtype != torch.uint8:
+        raise ValueError(f"b must be a uint8 tensor, but got {b.dtype}")
+    if a_scale.dtype != torch.uint8:
+        raise ValueError(f"a_scale must be a uint8 tensor, but got {a_scale.dtype}")
+    if b_scale.dtype != torch.uint8:
+        raise ValueError(f"b_scale must be a uint8 tensor, but got {b_scale.dtype}")
+    if m_indptr.dtype != torch.int32:
+        raise ValueError(f"m_indptr must be a int32 tensor, but got {m_indptr.dtype}")
+    if tile_m not in [128]:
+        raise ValueError(f"tile_m must be 128, but got {tile_m}")
+    if tile_n not in [128]:
+        raise ValueError(f"tile_n must be one of 128, but got {tile_n}")
+    if tile_k not in [128, 256]:
+        raise ValueError(f"tile_k must be either 128 or 256, but got {tile_k}")
+
+    # Determine out_dtype if not specified
+    if out is None:
+        if out_dtype is None:
+            out_dtype = torch.bfloat16
+    else:
+        if out_dtype is None:
+            out_dtype = out.dtype
+
+    if out_dtype not in [torch.bfloat16, torch.float16]:
+        raise ValueError(
+            f"out_dtype must be either torch.bfloat16 or torch.float16, but got {out_dtype}"
+        )
+
+    num_groups = m_indptr.shape[0] - 1
+    if b.shape[0] != num_groups:
+        raise ValueError(
+            f"b.shape[0] must equal num_groups (m_indptr.shape[0] - 1), but got b.shape[0]={b.shape[0]}, num_groups={num_groups}"
+        )
+
+    n = b.shape[1]
+    k = b.shape[2] * 2  # Multiply by 2 because b is e2m1 packed as uint8
+
+    # assert a.shape[0] == m_indptr[-1].item()  # Not enabled in consideration of performance
+    if a.shape[1] * 2 != k:
+        raise ValueError(
+            f"a.shape[1] * 2 must equal k, but got a.shape[1]={a.shape[1]}, k={k}"
+        )
+
+    align_n = 8
+    align_k = 128
+    if n % align_n != 0:
+        raise ValueError(f"n must be a multiple of {align_n}, but got n={n}")
+    if k % align_k != 0:
+        raise ValueError(f"k must be a multiple of {align_k}, but got k={k}")
+
+    out_shape = (a.shape[0], n)
+    if out is not None:
+        if out.shape != out_shape:
+            raise ValueError(f"out.shape must be {out_shape}, but got {out.shape}")
+        if out.dtype != out_dtype:
+            raise ValueError(f"out.dtype must be {out_dtype}, but got {out.dtype}")
+
+    return True
+
+
+@backend_requirement(
+    {},
+    common_check=_check_group_gemm_nvfp4_nt_groupwise_problem_size,
+)
+@flashinfer_api
+def group_gemm_nvfp4_nt_groupwise(
+    a: torch.Tensor,  # (cum_m, k)
+    b: torch.Tensor,  # (batch_size, n, k // 2)
+    a_scale: torch.Tensor,  # (cum_m_padded, k // 16)
+    b_scale: torch.Tensor,  # (batch_size, n_padded, k // 16)
+    m_indptr: torch.Tensor,  # (batch_size + 1, )
+    alpha: Optional[torch.Tensor] = None, # (batch_size, )
+    tile_m: int = 128,
+    tile_n: int = 128,
+    tile_k: int = 128,
+    out: Optional[torch.Tensor] = None,  # (cum_m, n)
+    out_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    r"""Perform group GEMM with NVFP4 data types using groupwise scaling. Currently only implemented on NVIDIA
+    Blackwell Geforce, and DGX Spark architectures.
+
+    Parameters
+    ----------
+    a: torch.Tensor
+        Row-major input tensor, shape ``(cum_m, k)``, data type is ``torch.float8_e4m3fn`` or ``torch.float8_e5m2``.
+        ``cum_m`` is the cumulative sum of the segment lengths.
+
+    b: torch.Tensor
+        Column-major input tensor, shape ``(batch_size, n, k // 2)``, data type is ``torch.uint8``.
+
+    a_scale: torch.Tensor
+        Column-major scale tensor for a, shape ``(cum_m_padded, k // 16)``, data type is ``torch.uint8``.
+
+    b_scale: torch.Tensor
+        Row-major scale tensor for b, shape ``(batch_size, n_padded, k // 16)``, data type is ``torch.uint8``.
+
+    m_indptr: torch.Tensor
+        The indptr of the segment lengths, shape ``(batch_size + 1,)``, data type is ``torch.int32``.
+        Element element in ``m_indptr`` must be a multiple of 4.
+
+    alpha: Optional[torch.Tensor] = None, # (batch_size, )
+        The alpha tensor, shape ``(batch_size, )``, data type is ``torch.float32``.
+
+    tile_m: int
+        The tile size for the M dimension, must be 128.
+
+    tile_n: int
+        The tile size for the N dimension, must be 64, 128, 192, or 256.
+
+    tile_k: int
+        The tile size for the K dimension, must be 128 or 256.
+
+    out: Optional[torch.Tensor]
+        The output tensor, shape ``(cum_m, n)``. If not specified, we will create an output tensor explicitly.
+
+    out_dtype: Optional[torch.dtype]
+        The data type of the output tensor, must be ``torch.bfloat16`` or ``torch.float16``.
+
+    Returns
+    -------
+    out: torch.Tensor
+        The output tensor, shape ``(cum_m, n)``.
+
+    Notes
+    -----
+    Each value in ``m_indptr`` should be padded to a multiple of 4 before calling this function,
+    to accommodate the kernel's requirement.
+    """
+    int_workspace_buffer = _get_cache_buf(
+        "group_gemm_nvfp4_nt_groupwise_int_workspace", DEFAULT_WORKSPACE_SIZE, a.device
+    )
+    float_workspace_buffer = _get_cache_buf(
+        "group_gemm_nvfp4_nt_groupwise_float_workspace",
+        DEFAULT_WORKSPACE_SIZE,
+        a.device,
+    )
+    # Determine out_dtype if not specified
+    if out is None:
+        if out_dtype is None:
+            out_dtype = torch.bfloat16
+    else:
+        if out_dtype is None:
+            out_dtype = out.dtype
+
+    n = b.shape[1]
+    k = b.shape[2] * 2  # Multiply by 2 because b is e2m1 packed as uint8
+
+    out_shape = (a.shape[0], n)
+    if out is None:
+        out = torch.empty(out_shape, dtype=out_dtype, device=a.device)
+
+    if alpha is None:
+        # empty torch tensor
+        alpha = torch.tensor([], dtype=torch.float32, device=a.device)
+
+
+    get_gemm_sm120_module().group_gemm_nvfp4_nt_groupwise(
         int_workspace_buffer,
         float_workspace_buffer,
         a,
@@ -5082,20 +5298,17 @@ def group_gemm_mxfp8_mxfp4_nt_groupwise(
         a_scale,
         b_scale,
         out,
+        alpha,
         m_indptr,
         n,
         k,
-        mma_sm,
         tile_m,
         tile_n,
         tile_k,
-        swap_ab,
     )
+
+
     return out
-
-
-# NOTE(Zihao): keep the old name for backward compatibility
-group_gemm_mxfp4_nt_groupwise = group_gemm_mxfp8_mxfp4_nt_groupwise
 
 
 def pad_indptr_to_multiple_of_4(
