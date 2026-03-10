@@ -483,9 +483,12 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
                      ") for vertical algorithm");
     FLASHINFER_CHECK(params.nheads / params.ngroups <= 32, "HEADS_PER_GROUP (",
                      params.nheads / params.ngroups, ") must be <= 32 for vertical algorithm");
-    FLASHINFER_CHECK(params.dim % NUM_COMPUTE_WARPS == 0, "DIM (", params.dim,
-                     ") must be divisible by NUM_COMPUTE_WARPS (", NUM_COMPUTE_WARPS,
+    FLASHINFER_CHECK(params.ngroups % NUM_GROUPS_PER_CTA == 0, "ngroups (", params.ngroups,
+                     ") must be divisible by NUM_GROUPS_PER_CTA (", NUM_GROUPS_PER_CTA,
                      ") for vertical algorithm");
+    FLASHINFER_CHECK(params.dim % NUM_COMPUTE_WARPS_PER_GROUP == 0, "DIM (", params.dim,
+                     ") must be divisible by NUM_COMPUTE_WARPS_PER_GROUP (",
+                     NUM_COMPUTE_WARPS_PER_GROUP, ") for vertical algorithm");
 
     if constexpr (sizeof(state_t) != sizeof(input_t)) {
       // Unreachable due to FLASHINFER_CHECK above, but prevents template instantiation errors
@@ -505,7 +508,7 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
                                                          stateIndex_t, NTOKENS_MTP, DIM, DSTATE,
                                                          HEADS_PER_GROUP, NUM_IN_STAGES>;
 
-          dim3 grid(params.batch, params.ngroups);
+          dim3 grid(params.batch, params.ngroups / NUM_GROUPS_PER_CTA);
           dim3 block(warpSize, NUM_WARPS);
 
           // state descriptor: tile covers full DIM×DSTATE (used for TMA load only)
