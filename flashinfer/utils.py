@@ -40,6 +40,7 @@ class MaskMode(Enum):
     CAUSAL = 1
     CUSTOM = 2
     MULTIITEMSCORING = 3
+    MULTIITEMSCORINGV2 = 4
 
 
 class TensorLayout(Enum):
