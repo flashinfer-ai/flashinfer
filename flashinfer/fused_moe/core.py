@@ -1679,9 +1679,18 @@ def get_trtllm_moe_sm100_module():
         hidden_size = hidden_states.shape[-1]
 
         # Create workspace buffers
-        output = torch.empty(
-            num_tokens, hidden_size, dtype=torch.bfloat16, device=hidden_states.device
-        )
+        if output is None:
+            output = torch.empty(
+                num_tokens, hidden_size, dtype=torch.bfloat16, device=hidden_states.device
+            )
+        else:
+            assert output.shape == (num_tokens, hidden_size), (
+                f"output shape: {output.shape} must be ({num_tokens}, {hidden_size})"
+            )
+            assert output.dtype == torch.bfloat16, (
+                f"output dtype: {output.dtype} must be torch.bfloat16"
+            )
+
         if routing_logits is not None:
             # When routing_logits is provided, we must pass topk_ids/expert_weights with no allocation
             topk_ids = torch.empty(0, dtype=torch.int32, device=hidden_states.device)
