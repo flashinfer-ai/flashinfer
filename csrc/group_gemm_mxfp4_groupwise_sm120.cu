@@ -79,8 +79,8 @@ constexpr bool is_valid_config() {
 namespace flashinfer {
 namespace group_gemm {
 
-template <int TileM, int TileN, int TileK, typename DTypeInA,
-          typename DTypeInB, typename DTypeSFA, typename DTypeSFB, typename DTypeOut>
+template <int TileM, int TileN, int TileK, typename DTypeInA, typename DTypeInB, typename DTypeSFA,
+          typename DTypeSFB, typename DTypeOut>
 cudaError_t CutlassMXFP4GroupwiseScaledGroupGEMMSM120(
     void* int_buffer, size_t int_buffer_size_in_bytes, void* float_buffer,
     size_t float_buffer_size_in_bytes, DTypeInA* A, DTypeInB* B, DTypeSFA* SFA, DTypeSFB* SFB,
@@ -93,8 +93,8 @@ void CutlassGroupGemmMXFP4GroupwiseScaledSM120(TensorView int_workspace_buffer,
                                                TensorView float_workspace_buffer, TensorView A,
                                                TensorView B, TensorView SFA, TensorView SFB,
                                                TensorView D, TensorView m_indptr, int64_t n,
-                                               int64_t k, int64_t tile_m,
-                                               int64_t tile_n, int64_t tile_k) {
+                                               int64_t k, int64_t tile_m, int64_t tile_n,
+                                               int64_t tile_k) {
   ffi::CUDADeviceGuard device_guard(float_workspace_buffer.device().device_id);
   auto stream = get_stream(A.device());
   int num_groups = m_indptr.size(0) - 1;

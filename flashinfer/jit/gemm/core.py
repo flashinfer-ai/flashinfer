@@ -311,7 +311,7 @@ def gen_gemm_sm100_module_cutlass_bf16() -> JitSpec:
         "bf16_gemm_cutlass",
         source_paths,
         extra_cuda_cflags=nvcc_flags
-        + [ 
+        + [
             "-DENABLE_BF16",
             "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
             "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
@@ -520,15 +520,10 @@ def gen_gemm_sm120_module() -> JitSpec:
     dtype_a_list = [torch.float8_e4m3fn, torch.float8_e5m2]
     dtype_d_list = [torch.float16, torch.bfloat16]
 
-    for dtype_a, dtype_d in product(
-        dtype_a_list, dtype_d_list
-    ):
+    for dtype_a, dtype_d in product(dtype_a_list, dtype_d_list):
         name_dtype_a = filename_safe_dtype_map[dtype_a]
         name_dtype_d = filename_safe_dtype_map[dtype_d]
-        dest_path = (
-            gen_directory
-            / f"{prefix}_{name_dtype_a}_{name_dtype_d}_sm120.cu"
-        )
+        dest_path = gen_directory / f"{prefix}_{name_dtype_a}_{name_dtype_d}_sm120.cu"
         source_paths.append(dest_path)
         source = kernel_inst_templ.render(
             dtype_a=dtype_cutlass_map[dtype_a],
@@ -546,10 +541,7 @@ def gen_gemm_sm120_module() -> JitSpec:
 
     for dtype_d in dtype_d_list:
         name_dtype_d = filename_safe_dtype_map[dtype_d]
-        dest_path = (
-            gen_directory
-            / f"{prefix}_{name_dtype_d}_sm120.cu"
-        )
+        dest_path = gen_directory / f"{prefix}_{name_dtype_d}_sm120.cu"
         source_paths.append(dest_path)
         source = kernel_inst_templ.render(
             dtype_a="cutlass::float_e2m1_t",

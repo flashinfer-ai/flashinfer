@@ -23,9 +23,7 @@ import flashinfer
 from flashinfer.testing.utils import bench_gpu_time
 
 
-def bench_groupwise_grouped_gemm_nvfp4_blackwell(
-    group_size, m, n, k, out_dtype
-):
+def bench_groupwise_grouped_gemm_nvfp4_blackwell(group_size, m, n, k, out_dtype):
     torch.random.manual_seed(0)
     assert n % 8 == 0
     assert k % 128 == 0
@@ -70,13 +68,10 @@ def bench_groupwise_grouped_gemm_nvfp4_blackwell(
     tile_m_list = [128]
     tile_n_list = [128]
     tile_k_list = [128, 256]
-    
 
     ms_best = float("inf")
     config_best = None
-    for tile_m, tile_n, tile_k in product(
-        tile_m_list, tile_n_list, tile_k_list
-    ):
+    for tile_m, tile_n, tile_k in product(tile_m_list, tile_n_list, tile_k_list):
         measurements = bench_gpu_time(
             lambda: flashinfer.gemm.group_gemm_nvfp4_nt_groupwise(
                 a,

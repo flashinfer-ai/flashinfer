@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import math
-
 import pytest
 import torch
 import torch.nn.functional as F
@@ -104,7 +102,9 @@ def test_group_gemm_nvfp4(
         0, (group_size + 1) * m, m, dtype=torch.int32, device=device
     )
 
-    a_fp4, b_fp4, a_scale, b_scale, alpha = _quantize_nvfp4_group_inputs(a_float, b_float)
+    a_fp4, b_fp4, a_scale, b_scale, alpha = _quantize_nvfp4_group_inputs(
+        a_float, b_float
+    )
     out_ref = gemm_nvfp4_nt_groupwise_ref(a_float, b_float, out_dtype)
 
     for tile_k in [128, 256]:

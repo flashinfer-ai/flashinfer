@@ -5112,8 +5112,10 @@ def group_gemm_mxfp8_mxfp4_nt_groupwise(
 
     return out
 
+
 # NOTE(Zihao): keep the old name for backward compatibility
 group_gemm_mxfp4_nt_groupwise = group_gemm_mxfp8_mxfp4_nt_groupwise
+
 
 # NOTE: Just 120/121 support has been added, but it is trivial to generalize
 @supported_compute_capability([120, 121])
@@ -5131,9 +5133,7 @@ def _check_group_gemm_nvfp4_nt_groupwise_problem_size(
     out_dtype: Optional[torch.dtype] = None,
 ):
     if a.dtype not in [torch.uint8]:
-        raise ValueError(
-            f"a must be a uint8 tensor, but got {a.dtype}"
-        )
+        raise ValueError(f"a must be a uint8 tensor, but got {a.dtype}")
     if b.dtype != torch.uint8:
         raise ValueError(f"b must be a uint8 tensor, but got {b.dtype}")
     if a_scale.dtype != torch.uint8:
@@ -5205,7 +5205,7 @@ def group_gemm_nvfp4_nt_groupwise(
     a_scale: torch.Tensor,  # (cum_m_padded, k // 16)
     b_scale: torch.Tensor,  # (batch_size, n_padded, k // 16)
     m_indptr: torch.Tensor,  # (batch_size + 1, )
-    alpha: Optional[torch.Tensor] = None, # (batch_size, )
+    alpha: Optional[torch.Tensor] = None,  # (batch_size, )
     tile_m: int = 128,
     tile_n: int = 128,
     tile_k: int = 128,
@@ -5289,7 +5289,6 @@ def group_gemm_nvfp4_nt_groupwise(
         # empty torch tensor
         alpha = torch.tensor([], dtype=torch.float32, device=a.device)
 
-
     get_gemm_sm120_module().group_gemm_nvfp4_nt_groupwise(
         int_workspace_buffer,
         float_workspace_buffer,
@@ -5306,7 +5305,6 @@ def group_gemm_nvfp4_nt_groupwise(
         tile_n,
         tile_k,
     )
-
 
     return out
 

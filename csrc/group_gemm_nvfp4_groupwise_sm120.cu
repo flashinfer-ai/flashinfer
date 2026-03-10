@@ -56,9 +56,9 @@ using namespace flashinfer;
 #if defined(FLASHINFER_ENABLE_FP8_E4M3) && \
     (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
 #define _DISPATCH_SF_CASE_FP8_UE4M3(c_type, ...) \
-  case uint8_code: {                            \
-    using c_type = __nv_fp8_e4m3;               \
-    return __VA_ARGS__();                       \
+  case uint8_code: {                             \
+    using c_type = __nv_fp8_e4m3;                \
+    return __VA_ARGS__();                        \
   }
 #else
 #define _DISPATCH_SF_CASE_FP8_E4M3(c_type, ...)
@@ -95,10 +95,8 @@ using namespace flashinfer;
 
 template <typename T_A, typename T_B, typename T_SFA, typename T_SFB, typename T_OUT>
 constexpr bool is_valid_config() {
-  if constexpr (std::is_same_v<T_A, __nv_fp4_e2m1> &&
-                std::is_same_v<T_B, __nv_fp4_e2m1> && 
-                std::is_same_v<T_SFA, __nv_fp8_e4m3> &&
-                std::is_same_v<T_SFB, __nv_fp8_e4m3> &&
+  if constexpr (std::is_same_v<T_A, __nv_fp4_e2m1> && std::is_same_v<T_B, __nv_fp4_e2m1> &&
+                std::is_same_v<T_SFA, __nv_fp8_e4m3> && std::is_same_v<T_SFB, __nv_fp8_e4m3> &&
                 (std::is_same_v<T_OUT, nv_half> || std::is_same_v<T_OUT, nv_bfloat16>)) {
     return true;
   }
@@ -108,8 +106,8 @@ constexpr bool is_valid_config() {
 namespace flashinfer {
 namespace group_gemm {
 
-template <int TileM, int TileN, int TileK, typename DTypeInA,
-          typename DTypeInB, typename DTypeSFA, typename DTypeSFB, typename DTypeOut>
+template <int TileM, int TileN, int TileK, typename DTypeInA, typename DTypeInB, typename DTypeSFA,
+          typename DTypeSFB, typename DTypeOut>
 cudaError_t CutlassNVFP4GroupwiseScaledGroupGEMMSM120(
     void* int_buffer, size_t int_buffer_size_in_bytes, void* float_buffer,
     size_t float_buffer_size_in_bytes, DTypeInA* A, DTypeInB* B, DTypeSFA* SFA, DTypeSFB* SFB,
@@ -121,14 +119,14 @@ cudaError_t CutlassNVFP4GroupwiseScaledGroupGEMMSM120(
 void CutlassGroupGemmNVFP4GroupwiseScaledSM120(TensorView int_workspace_buffer,
                                                TensorView float_workspace_buffer, TensorView A,
                                                TensorView B, TensorView SFA, TensorView SFB,
-                                               TensorView D, TensorView alpha, TensorView m_indptr, int64_t n,
-                                               int64_t k, int64_t tile_m,
-                                               int64_t tile_n, int64_t tile_k) {
+                                               TensorView D, TensorView alpha, TensorView m_indptr,
+                                               int64_t n, int64_t k, int64_t tile_m, int64_t tile_n,
+                                               int64_t tile_k) {
   ffi::CUDADeviceGuard device_guard(float_workspace_buffer.device().device_id);
   auto stream = get_stream(A.device());
   int num_groups = m_indptr.size(0) - 1;
-  TVM_FFI_ICHECK(alpha.size(0) == num_groups || alpha.numel() == 0) << 
-      "alpha must have " << num_groups << " elements or be empty";
+  TVM_FFI_ICHECK(alpha.size(0) == num_groups || alpha.numel() == 0)
+      << "alpha must have " << num_groups << " elements or be empty";
   DISPATCH_DLPACK_INPUT_OUTPUT_DTYPE(
       A.dtype(), B.dtype(), SFA.dtype(), SFB.dtype(), D.dtype(), c_type_in_a, c_type_in_b,
       c_type_sf_a, c_type_sf_b, c_type_out, [&] {
