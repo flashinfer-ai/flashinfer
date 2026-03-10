@@ -92,7 +92,6 @@ def gen_gemm_sm100_module_cutlass_fp4() -> JitSpec:
             "-DENABLE_BF16",
             "-DENABLE_FP4",
             "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
-            "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
         ],
         extra_cflags=[
             "-DFAST_BUILD",
@@ -161,7 +160,6 @@ def gen_gemm_sm103_module_cutlass_fp4() -> JitSpec:
             "-DENABLE_BF16",
             "-DENABLE_FP4",
             "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
-            "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
         ],
         extra_cflags=[
             "-DFAST_BUILD",
@@ -211,7 +209,6 @@ def gen_gemm_sm120_module_cutlass_fp4() -> JitSpec:
             "-DENABLE_BF16",
             "-DENABLE_FP4",
             "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
-            "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
         ],
         extra_cflags=[
             "-DFAST_BUILD",
@@ -263,7 +260,6 @@ def gen_gemm_sm100_module_cutlass_fp8() -> JitSpec:
         + [
             "-DENABLE_BF16",
             "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
-            "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
         ],
         extra_cflags=[
             "-DFAST_BUILD",
@@ -314,7 +310,6 @@ def gen_gemm_sm100_module_cutlass_bf16() -> JitSpec:
         + [
             "-DENABLE_BF16",
             "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
-            "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
         ],
         extra_cflags=[
             "-DFAST_BUILD",
@@ -363,7 +358,6 @@ def gen_gemm_sm100_module_cutlass_mxfp8() -> JitSpec:
         + [
             "-DENABLE_BF16",
             "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
-            "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
         ],
         extra_cflags=[
             "-DFAST_BUILD",
@@ -449,7 +443,6 @@ def gen_gemm_sm100_module() -> JitSpec:
         extra_cuda_cflags=nvcc_flags
         + [
             "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
-            "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
         ],
     )
 
@@ -578,7 +571,6 @@ def gen_gemm_sm120_module() -> JitSpec:
         extra_cuda_cflags=nvcc_flags
         + [
             "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
-            "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
         ],
     )
 
