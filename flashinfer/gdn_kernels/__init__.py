@@ -47,6 +47,13 @@ except ImportError:
     get_tile_v_mtp = None  # type: ignore
     get_vec_size_mtp = None  # type: ignore
 
+
+try:
+    from .blackwell_prefill.gdn import chunk_gated_delta_rule
+except ImportError:
+    chunk_gated_delta_rule = None  # type: ignore
+
+
 __all__ = [
     "gated_delta_rule",
     "GatedDeltaRuleKernel",
@@ -55,4 +62,5 @@ __all__ = [
     "run_mtp_decode",
     "get_tile_v_mtp",
     "get_vec_size_mtp",
+    "chunk_gated_delta_rule",
 ]
