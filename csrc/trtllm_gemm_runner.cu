@@ -38,51 +38,8 @@ struct TrtllmGenGemmRunnerOptions {
   gemm::trtllm::gen::Dtype outputType;
   bool transposeMmaOutput{false};
   gemm::trtllm::gen::SfLayout sfLayoutB;
+  bool useDeepSeekFp8{false};
 };
-
-int64_t select_kernel_fp8(int32_t M, int32_t N, int32_t K,
-                          const gemm::gemm::GemmInterface& interface) {
-  static constexpr const char* KERNEL_NAME_HIGH_N_K_RATIO =
-      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_s6_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_"
-      "transOut_"
-      "noShflA_dsFp8_schedP2x2x1x3_sm100f";
-
-  static constexpr const char* KERNEL_NAME_LOW_N_K_RATIO =
-      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_"
-      "transOut_noShflA_dsFp8_schedS_sm100f";
-
-  static constexpr const char* KERNEL_NAME_LARGE_N =
-      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_"
-      "transOut_noShflA_dsFp8_schedP2x2x1x3_sm100f";
-
-  static constexpr const char* KERNEL_NAME_DEFAULT =
-      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x16x128u2_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_"
-      "transOut_noShflA_dsFp8_schedS_sm100f";
-
-  double const n_k_ratio = static_cast<double>(N) / static_cast<double>(K);
-
-  std::string kernel_name;
-  if (n_k_ratio >= 32) {
-    kernel_name = KERNEL_NAME_HIGH_N_K_RATIO;
-  } else if (n_k_ratio <= 2.0) {
-    kernel_name = KERNEL_NAME_LOW_N_K_RATIO;
-  } else if (N >= 20000) {
-    kernel_name = KERNEL_NAME_LARGE_N;
-  } else {
-    kernel_name = KERNEL_NAME_DEFAULT;
-  }
-
-  auto const& configs = interface.getGemmConfigs();
-  size_t const num_configs = interface.getNumGemmConfigs();
-
-  for (size_t i = 0; i < num_configs; ++i) {
-    if (std::string(configs[i].mFunctionName) == kernel_name) {
-      return static_cast<int64_t>(i);
-    }
-  }
-
-  TVM_FFI_ICHECK(false) << "Kernel not found";
-}
 
 class TrtllmGenGemmRunner {
  public:
@@ -98,7 +55,8 @@ class TrtllmGenGemmRunner {
 
       if (options.mDtypeA == mOptions.eltType && options.mDtypeC == mOptions.outputType &&
           options.mTransposeMmaOutput == mOptions.transposeMmaOutput &&
-          options.mSfLayoutB == mOptions.sfLayoutB) {
+          options.mSfLayoutB == mOptions.sfLayoutB &&
+          options.mUseDeepSeekFp8 == mOptions.useDeepSeekFp8) {
         mPassingConfigIndices.push_back(i);
       }
     }
@@ -119,10 +77,9 @@ class TrtllmGenGemmRunner {
     gemmData.mProblemDimensions.mM = mOptions.transposeMmaOutput ? n : m;
     gemmData.mProblemDimensions.mN = mOptions.transposeMmaOutput ? m : n;
     gemmData.mProblemDimensions.mK = k;
-    // TODO(jimmyzho) disable until fix trtllm-gen
-    // gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
-    // gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
-    // gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
+    gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
+    gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
+    gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
     gemmData.mProblemDimensions.mRank = 0;
     gemmData.mProblemDimensions.mWorldSize = 1;
 
@@ -143,10 +100,9 @@ class TrtllmGenGemmRunner {
     gemmData.mProblemDimensions.mM = mOptions.transposeMmaOutput ? n : m;
     gemmData.mProblemDimensions.mN = mOptions.transposeMmaOutput ? m : n;
     gemmData.mProblemDimensions.mK = k;
-    // TODO(jimmyzho) disable until fix trtllm-gen
-    // gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
-    // gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
-    // gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
+    gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
+    gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
+    gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
     gemmData.mProblemDimensions.mRank = 0;
     gemmData.mProblemDimensions.mWorldSize = 1;
 
@@ -195,10 +151,9 @@ class TrtllmGenGemmRunner {
     gemmData.mProblemDimensions.mM = mOptions.transposeMmaOutput ? n : m;
     gemmData.mProblemDimensions.mN = mOptions.transposeMmaOutput ? m : n;
     gemmData.mProblemDimensions.mK = k;
-    // TODO(jimmyzho) disable until fix trtllm-gen
-    // gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
-    // gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
-    // gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
+    gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
+    gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
+    gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
     gemmData.mProblemDimensions.mRank = 0;
     gemmData.mProblemDimensions.mWorldSize = 1;
 
@@ -248,17 +203,11 @@ class TrtllmGenGemmRunner {
   }
 
   int64_t selectHeuristic(int64_t m, int64_t n, int64_t k) const {
-    if (mOptions.eltType == gemm::trtllm::gen::Dtype::E4m3) {
-      return select_kernel_fp8(m, n, k, gemm::gemm::GemmInterface());
-    } else if (mOptions.eltType == gemm::trtllm::gen::Dtype::E2m1) {
-      auto sortedIndices = getValidTactics(m, n, k);
-      TVM_FFI_ICHECK(!sortedIndices.empty()) << "No valid tactic found";
+    auto sortedIndices = getValidTactics(m, n, k);
+    TVM_FFI_ICHECK(!sortedIndices.empty()) << "No valid tactic found";
 
-      // the getValidTactics is sorted by priority, so the first one is the best one
-      return sortedIndices[0];
-    } else {
-      TVM_FFI_ICHECK(false) << "Unsupported eltType";
-    }
+    // the getValidTactics is sorted by priority, so the first one is the best one
+    return sortedIndices[0];
   }
 
  private:
@@ -307,6 +256,7 @@ void trtllm_gemm(TensorView workspace_buffer, TensorView a, TensorView b, Tensor
       .transposeMmaOutput = true,
       .sfLayoutB = use_8x4_sf_layout ? gemm::trtllm::gen::SfLayout::R8c4
                                      : gemm::trtllm::gen::SfLayout::R128c4,
+      .useDeepSeekFp8 = is_fp8,
   });
 
   if (tactic == -1) {
@@ -346,13 +296,14 @@ Array<int64_t> trtllm_gemm_tactics(int64_t m, int64_t n, int64_t k, int64_t inpu
   TVM_FFI_ICHECK_EQ(output_dtype, static_cast<int64_t>(Dtype::Bfloat16))
       << "Unsupported output dtype";
 
+  bool is_fp8 = input_dtype == static_cast<int64_t>(Dtype::E4m3);
   auto runner = flashinfer::TrtllmGenGemmRunner(flashinfer::TrtllmGenGemmRunnerOptions{
-      .eltType = input_dtype == static_cast<int64_t>(Dtype::E4m3) ? gemm::trtllm::gen::Dtype::E4m3
-                                                                  : gemm::trtllm::gen::Dtype::E2m1,
+      .eltType = is_fp8 ? gemm::trtllm::gen::Dtype::E4m3 : gemm::trtllm::gen::Dtype::E2m1,
       .outputType = gemm::trtllm::gen::Dtype::Bfloat16,
       .transposeMmaOutput = true,
       .sfLayoutB = use_8x4_sf_layout ? gemm::trtllm::gen::SfLayout::R8c4
                                      : gemm::trtllm::gen::SfLayout::R128c4,
+      .useDeepSeekFp8 = is_fp8,
   });
 
   return runner.getValidTactics(m, n, k);

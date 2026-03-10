@@ -286,6 +286,7 @@ def download_trtllm_headers(
             "trtllm/gen/MmaDecl.h",
             "trtllm/gen/SfLayoutDecl.h",
             "trtllm/gen/CudaArchDecl.h",
+            "trtllm/gen/SparsityDecl.h",
         ]
 
     artifact_hash_path = header_dest_dir / ".artifact_hash"
