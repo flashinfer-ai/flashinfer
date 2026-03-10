@@ -14,9 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import logging
 from typing import Optional
 
 import torch
+
+logger = logging.getLogger(__name__)
 from torch.distributed import ProcessGroup
 
 from .nvshmem import get_nvshmem_module
@@ -69,14 +72,18 @@ class NVSHMEMAllReduce:
         my_pe = self.nvshmem_module.nvshmem_my_pe()
         n_pes = self.nvshmem_module.nvshmem_n_pes()
         if my_pe != local_rank:
-            print(
-                f"WARNING: Rank {local_rank}: PE mismatch! Expected PE {local_rank}, got PE {my_pe}",
-                flush=True,
+            logger.warning(
+                "Rank %d: PE mismatch! Expected PE %d, got PE %d",
+                local_rank,
+                local_rank,
+                my_pe,
             )
         if n_pes != world_size:
-            print(
-                f"WARNING: Rank {local_rank}: World size mismatch! Expected {world_size}, got {n_pes}",
-                flush=True,
+            logger.warning(
+                "Rank %d: World size mismatch! Expected %d, got %d",
+                local_rank,
+                world_size,
+                n_pes,
             )
 
         # allocate memory in nvshmem symm heap

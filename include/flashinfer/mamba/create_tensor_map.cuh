@@ -8,6 +8,8 @@
 #include <iostream>
 #include <type_traits>
 
+#include "../utils.cuh"
+
 namespace flashinfer::mamba::tma {
 
 inline CUtensorMap buildNdDescriptor(std::type_info const& dtype,
@@ -27,6 +29,9 @@ inline CUtensorMap buildNdDescriptor(std::type_info const& dtype,
   } else if (dtype == typeid(__nv_bfloat16)) {
     tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
     dtype_size = sizeof(__nv_bfloat16);
+  } else if (dtype == typeid(int16_t)) {
+    tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_UINT16;
+    dtype_size = sizeof(int16_t);
   } else {
     throw std::invalid_argument("buildNdDescriptor: unsupported dtype");
   }
@@ -34,9 +39,8 @@ inline CUtensorMap buildNdDescriptor(std::type_info const& dtype,
   // The swizzle type.
   CUtensorMapSwizzle swizzleType{CU_TENSOR_MAP_SWIZZLE_NONE};
 
-  // Check gmem address must be 16B-aligned
-  FLASHINFER_CHECK((reinterpret_cast<uint64_t>(gmemAddr) & 0b1111) == 0,
-                   "Tensor must be 16B-aligned");
+  // Check gmem address must be 128B-aligned for TMA
+  FLASHINFER_CHECK_TMA_ALIGNED(gmemAddr);
 
   // Check shape must be in range [1, 2^32]
   int32_t dim = shapes.size();

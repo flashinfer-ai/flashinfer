@@ -114,7 +114,7 @@ struct Hmma_gmem_tile_o {
     //
     // row_offset += binfo.bidx * VALID_BYTES_PER_ROW;
     //
-    row_offset += binfo.bidx * valid_bytes_per_row;
+    row_offset += (int64_t)binfo.bidx * valid_bytes_per_row;
 
     // Assemble the final pointer.
     o_ptr_ += row_offset + col_in_bytes_;
@@ -753,7 +753,7 @@ struct Gmem_tile_o_8bit {
     // The amount of bytes per row without padding (runtime).
     int const valid_bytes_per_row = params.dv * BYTES_PER_ELEMENT;
     // Take the batch/head offset into account.
-    row_offset += block_info.bidx * valid_bytes_per_row;
+    row_offset += (int64_t)block_info.bidx * valid_bytes_per_row;
     // Assemble the final pointer.
     o_ptr_ += row_offset + col_in_bytes_;
 
@@ -1088,7 +1088,7 @@ struct Gmem_tile_o_16bit {
     // The amount of bytes per row without padding (runtime).
     int const valid_bytes_per_row = params.dv * BYTES_PER_ELEMENT;
     // Take the batch/head offset into account.
-    row_offset += block_info.bidx * valid_bytes_per_row;
+    row_offset += (int64_t)block_info.bidx * valid_bytes_per_row;
     // Assemble the final pointer.
     o_ptr_ += row_offset + col_in_bytes_;
 

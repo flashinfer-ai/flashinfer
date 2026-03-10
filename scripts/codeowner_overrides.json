@@ -19,6 +19,15 @@
   "include/flashinfer/comm": ["@flashinfer-ai/comm-owners"],
   "tests/comm": ["@flashinfer-ai/comm-owners"],
 
-  "flashinfer/norm.py": ["@flashinfer-ai/misc-op-owners"],
-  "tests/norm": ["@flashinfer-ai/misc-op-owners"]
+  "flashinfer/norm.py": ["@flashinfer-ai/misc-op-owners", "@kahyunnam"],
+  "tests/norm": ["@flashinfer-ai/misc-op-owners", "@kahyunnam"],
+
+  "benchmarks/gdn/": ["@flashinfer-ai/misc-op-owners", "@kahyunnam"],
+  "csrc/gdn_prefill_launcher.cu": ["@flashinfer-ai/misc-op-owners", "@kahyunnam"],
+  "csrc/gdn_prefill_sm90_kernel_inst.jinja": ["@flashinfer-ai/misc-op-owners", "@kahyunnam"],
+  "flashinfer/gdn_decode.py": ["@flashinfer-ai/misc-op-owners", "@kahyunnam"],
+  "flashinfer/gdn_kernels/": ["@flashinfer-ai/misc-op-owners", "@kahyunnam"],
+  "flashinfer/gdn_prefill.py": ["@flashinfer-ai/misc-op-owners", "@kahyunnam"],
+  "flashinfer/jit/gdn.py": ["@flashinfer-ai/misc-op-owners", "@kahyunnam"],
+  "tests/gdn/": ["@flashinfer-ai/misc-op-owners", "@kahyunnam"]
 }
