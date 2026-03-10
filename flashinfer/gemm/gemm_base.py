@@ -4922,16 +4922,29 @@ def _check_group_gemm_mxfp8_mxfp4_nt_groupwise_problem_size(
         raise ValueError(f"b_scale must be a uint8 tensor, but got {b_scale.dtype}")
     if m_indptr.dtype != torch.int32:
         raise ValueError(f"m_indptr must be a int32 tensor, but got {m_indptr.dtype}")
-    if mma_sm not in [1, 2]:
-        raise ValueError(f"mma_sm must be either 1 or 2, but got {mma_sm}")
-    if tile_m not in [128]:
-        raise ValueError(f"tile_m must be 128, but got {tile_m}")
-    if tile_n not in [64, 128, 192, 256]:
-        raise ValueError(f"tile_n must be one of [64, 128, 192, 256], but got {tile_n}")
-    if tile_k not in [128, 256]:
-        raise ValueError(f"tile_k must be either 128 or 256, but got {tile_k}")
     if swap_ab not in [True, False]:
         raise ValueError(f"swap_ab must be a boolean value, but got {swap_ab}")
+
+    if is_sm12x_supported(a.device):
+        if mma_sm not in [1]:
+            raise ValueError(f"mma_sm must be 1, but got {mma_sm}")
+        if tile_m not in [128]:
+            raise ValueError(f"tile_m must be 128, but got {tile_m}")
+        if tile_n not in [128]:
+            raise ValueError(f"tile_n must be 128, but got {tile_n}")
+        if tile_k not in [128]:
+            raise ValueError(f"tile_k must be 128, but got {tile_k}")
+    else:
+        if mma_sm not in [1, 2]:
+            raise ValueError(f"mma_sm must be either 1 or 2, but got {mma_sm}")
+        if tile_m not in [128]:
+            raise ValueError(f"tile_m must be 128, but got {tile_m}")
+        if tile_n not in [64, 128, 192, 256]:
+            raise ValueError(
+                f"tile_n must be one of [64, 128, 192, 256], but got {tile_n}"
+            )
+        if tile_k not in [128, 256]:
+            raise ValueError(f"tile_k must be either 128 or 256, but got {tile_k}")
 
     # Determine out_dtype if not specified
     if out is None:
@@ -5109,7 +5122,8 @@ def group_gemm_mxfp8_mxfp4_nt_groupwise(
             tile_k,
             swap_ab,
         )
-
+    else:
+        raise ValueError(f"Unsupported device for MXFP4 group GEMM: {a.device}")
     return out
 
 
@@ -5142,6 +5156,10 @@ def _check_group_gemm_nvfp4_nt_groupwise_problem_size(
         raise ValueError(f"b_scale must be a uint8 tensor, but got {b_scale.dtype}")
     if m_indptr.dtype != torch.int32:
         raise ValueError(f"m_indptr must be a int32 tensor, but got {m_indptr.dtype}")
+    if alpha is not None and alpha.dtype != torch.float32:
+        raise ValueError(
+            f"alpha must be a float32 tensor or None, but got {alpha.dtype}"
+        )
     if tile_m not in [128]:
         raise ValueError(f"tile_m must be 128, but got {tile_m}")
     if tile_n not in [128]:
@@ -5163,6 +5181,12 @@ def _check_group_gemm_nvfp4_nt_groupwise_problem_size(
         )
 
     num_groups = m_indptr.shape[0] - 1
+
+    if alpha is not None and alpha.shape[0] != num_groups:
+        raise ValueError(
+            f"alpha.shape[0] must equal num_groups, but got alpha.shape[0]={alpha.shape[0]}, num_groups={num_groups}"
+        )
+
     if b.shape[0] != num_groups:
         raise ValueError(
             f"b.shape[0] must equal num_groups (m_indptr.shape[0] - 1), but got b.shape[0]={b.shape[0]}, num_groups={num_groups}"

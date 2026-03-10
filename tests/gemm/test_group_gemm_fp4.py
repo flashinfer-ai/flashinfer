@@ -47,6 +47,7 @@ def _quantize_nvfp4_group_inputs(
     b_float: torch.Tensor,
     m_indptr: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    alignment = 128
     a_fp4_chunks = []
     a_scale_chunks = []
     b_fp4_chunks = []
@@ -67,10 +68,35 @@ def _quantize_nvfp4_group_inputs(
         b_scale_chunks.append(b_scale_group)
         alpha_chunks.append(1.0 / (a_global_sf * b_global_sf))
 
+    # Build padded a_scale to match kernel's sf_m_offset alignment formula:
+    #   sf_m_offset = (m_offset + i * (alignment - 1)) // alignment * alignment
+    # Note: nvfp4_quantize pads the scale's m-dimension to a multiple of `alignment`,
+    # so each a_scale_chunks[i] has shape (ceil(m_i / alignment) * alignment, sf_k).
+    num_groups = a_float.shape[0]
+    sf_k = a_scale_chunks[0].shape[1]
+    m_indptr_cpu = m_indptr.cpu().tolist()
+    # Compute total padded rows needed
+    last_group = num_groups - 1
+    last_sf_m_offset = (
+        (m_indptr_cpu[last_group] + last_group * (alignment - 1))
+        // alignment
+        * alignment
+    )
+    last_sf_rows = a_scale_chunks[last_group].shape[0]
+    total_sf_rows = last_sf_m_offset + last_sf_rows
+    a_scale_padded = torch.zeros(
+        (total_sf_rows, sf_k), dtype=a_scale_chunks[0].dtype, device=a_float.device
+    )
+    for i in range(num_groups):
+        m_offset = m_indptr_cpu[i]
+        sf_rows = a_scale_chunks[i].shape[0]
+        sf_m_offset = (m_offset + i * (alignment - 1)) // alignment * alignment
+        a_scale_padded[sf_m_offset : sf_m_offset + sf_rows] = a_scale_chunks[i]
+
     return (
         torch.cat(a_fp4_chunks, dim=0),
         torch.stack(b_fp4_chunks, dim=0),
-        torch.cat(a_scale_chunks, dim=0),
+        a_scale_padded,
         torch.stack(b_scale_chunks, dim=0),
         torch.tensor(alpha_chunks, dtype=torch.float32, device=a_float.device),
     )
@@ -103,7 +129,7 @@ def test_group_gemm_nvfp4(
     )
 
     a_fp4, b_fp4, a_scale, b_scale, alpha = _quantize_nvfp4_group_inputs(
-        a_float, b_float
+        a_float, b_float, m_indptr
     )
     out_ref = gemm_nvfp4_nt_groupwise_ref(a_float, b_float, out_dtype)
 

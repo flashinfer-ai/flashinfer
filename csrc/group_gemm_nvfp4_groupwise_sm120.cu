@@ -53,37 +53,13 @@ using namespace flashinfer;
     return false;                                  \
   }()
 
-#if defined(FLASHINFER_ENABLE_FP8_E4M3) && \
-    (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
-#define _DISPATCH_SF_CASE_FP8_UE4M3(c_type, ...) \
-  case uint8_code: {                             \
-    using c_type = __nv_fp8_e4m3;                \
-    return __VA_ARGS__();                        \
-  }
-#else
-#define _DISPATCH_SF_CASE_FP8_E4M3(c_type, ...)
-#endif
-
-#define DISPATCH_DLPACK_DTYPE_TO_CTYPE_SF_UE4M3(dlpack_dtype, c_type, ...)          \
-  [&]() -> bool {                                                                   \
-    switch (encode_dlpack_dtype(dlpack_dtype)) {                                    \
-      _DISPATCH_CASE_F32(c_type, __VA_ARGS__)                                       \
-      _DISPATCH_SF_CASE_FP8_UE4M3(c_type, __VA_ARGS__)                              \
-      default:                                                                      \
-        TVM_FFI_ICHECK(false) << __PRETTY_FUNCTION__                                \
-                              << " failed to dispatch scaling factor data type "    \
-                              << (dlpack_dtype).code << " " << (dlpack_dtype).bits; \
-        return false;                                                               \
-    }                                                                               \
-  }()
-
 #define DISPATCH_DLPACK_INPUT_OUTPUT_DTYPE(input_a_dtype, input_b_dtype, sf_a_dtype, sf_b_dtype, \
                                            output_dtype, c_type_in_a, c_type_in_b, c_type_sf_a,  \
                                            c_type_sf_b, c_type_out, ...)                         \
   [&]() -> bool {                                                                                \
     return DISPATCH_DLPACK_DTYPE_TO_CTYPE(output_dtype, c_type_out, [&] {                        \
-      return DISPATCH_DLPACK_DTYPE_TO_CTYPE_SF_UE4M3(sf_b_dtype, c_type_sf_b, [&] {              \
-        return DISPATCH_DLPACK_DTYPE_TO_CTYPE_SF_UE4M3(sf_a_dtype, c_type_sf_a, [&] {            \
+      return DISPATCH_DLPACK_DTYPE_TO_CTYPE_SF(sf_b_dtype, c_type_sf_b, [&] {                    \
+        return DISPATCH_DLPACK_DTYPE_TO_CTYPE_SF(sf_a_dtype, c_type_sf_a, [&] {                  \
           return DISPATCH_DLPACK_DTYPE_TO_CTYPE(input_b_dtype, c_type_in_b, [&] {                \
             return DISPATCH_DLPACK_DTYPE_TO_CTYPE(input_a_dtype, c_type_in_a,                    \
                                                   [&] { return __VA_ARGS__(); });                \
@@ -127,6 +103,7 @@ void CutlassGroupGemmNVFP4GroupwiseScaledSM120(TensorView int_workspace_buffer,
   int num_groups = m_indptr.size(0) - 1;
   TVM_FFI_ICHECK(alpha.size(0) == num_groups || alpha.numel() == 0)
       << "alpha must have " << num_groups << " elements or be empty";
+  TVM_FFI_ICHECK(encode_dlpack_dtype(alpha.dtype()) == float32_code) << "alpha must be float32";
   DISPATCH_DLPACK_INPUT_OUTPUT_DTYPE(
       A.dtype(), B.dtype(), SFA.dtype(), SFB.dtype(), D.dtype(), c_type_in_a, c_type_in_b,
       c_type_sf_a, c_type_sf_b, c_type_out, [&] {

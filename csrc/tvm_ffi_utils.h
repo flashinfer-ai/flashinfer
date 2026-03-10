@@ -187,11 +187,23 @@ constexpr DLDevice cpu = DLDevice{kDLCPU, 0};
 #define _DISPATCH_SF_CASE_FP8_E8M0(c_type, ...)
 #endif
 
+#if defined(FLASHINFER_ENABLE_FP8_E4M3) && \
+    (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
+#define _DISPATCH_SF_CASE_FP8_UE4M3(c_type, ...) \
+  case uint8_code: {                             \
+    using c_type = __nv_fp8_e4m3;                \
+    return __VA_ARGS__();                        \
+  }
+#else
+#define _DISPATCH_SF_CASE_FP8_UE4M3(c_type, ...)
+#endif
+
 #define DISPATCH_DLPACK_DTYPE_TO_CTYPE_SF(dlpack_dtype, c_type, ...)                \
   [&]() -> bool {                                                                   \
     switch (encode_dlpack_dtype(dlpack_dtype)) {                                    \
       _DISPATCH_CASE_F32(c_type, __VA_ARGS__)                                       \
       _DISPATCH_SF_CASE_FP8_E8M0(c_type, __VA_ARGS__)                               \
+      _DISPATCH_SF_CASE_FP8_UE4M3(c_type, __VA_ARGS__)                              \
       default:                                                                      \
         TVM_FFI_ICHECK(false) << __PRETTY_FUNCTION__                                \
                               << " failed to dispatch scaling factor data type "    \
