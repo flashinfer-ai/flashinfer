@@ -768,6 +768,22 @@ def trtllm_batch_decode_with_kv_cache_mla(
         )
 
         return out
+    elif backend == "cute-dsl":
+        from .cute_dsl.mla_decode import cute_dsl_mla_decode
+
+        return cute_dsl_mla_decode(
+            query=query,
+            kv_cache=kv_cache,
+            workspace_buffer=workspace_buffer,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=max_seq_len,
+            softmax_scale=bmm1_scale if isinstance(bmm1_scale, float) else float(bmm1_scale.item()),
+            output_scale=bmm2_scale if isinstance(bmm2_scale, float) else float(bmm2_scale.item()),
+            out=out,
+        )
     else:
         raise ValueError(f"Backend {backend} not supported")
 

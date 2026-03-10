@@ -1,0 +1,290 @@
+# Copyright (c) 2025 by FlashInfer team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for CuTe DSL MLA decode kernel."""
+
+import pytest
+import torch
+import torch.nn.functional as F
+
+from flashinfer.utils import is_sm100a_supported
+from flashinfer.cute_dsl import is_cute_dsl_available
+
+
+def skip_if_unsupported():
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("Requires SM100a (Blackwell)")
+    if not is_cute_dsl_available():
+        pytest.skip("CuTe DSL not available")
+
+
+def torch_reference_mla(
+    q_nope,
+    q_rope,
+    c_latent,
+    c_rope,
+    page_table,
+    cache_seqs,
+    softmax_scale,
+    output_scale,
+    page_size,
+):
+    """PyTorch reference implementation for MLA decode.
+
+    Args:
+        q_nope: [B, q_len, H, latent_dim]
+        q_rope: [B, q_len, H, rope_dim]
+        c_latent: [num_pages * page_size, latent_dim]
+        c_rope: [num_pages * page_size, rope_dim]
+        page_table: [B, max_pages]
+        cache_seqs: [B] — actual sequence lengths
+        softmax_scale: float
+        output_scale: float
+        page_size: int
+    """
+    B, q_len, H, latent_dim = q_nope.shape
+    rope_dim = q_rope.shape[-1]
+
+    outputs = []
+    for b in range(B):
+        seq_len = cache_seqs[b].item()
+        num_pages_needed = (seq_len + page_size - 1) // page_size
+
+        # Gather KV for this batch via page table
+        page_indices = page_table[b, :num_pages_needed]
+        kv_indices = []
+        for p in page_indices:
+            start = p.item() * page_size
+            kv_indices.extend(range(start, start + page_size))
+        kv_indices = kv_indices[:seq_len]
+        kv_indices_t = torch.tensor(kv_indices, device=q_nope.device)
+
+        k_latent = c_latent[kv_indices_t]  # [seq_len, latent_dim]
+        k_rope = c_rope[kv_indices_t]  # [seq_len, rope_dim]
+
+        # q: [q_len, H, D], k: [seq_len, D]
+        q_lat_b = q_nope[b]  # [q_len, H, latent_dim]
+        q_rope_b = q_rope[b]  # [q_len, H, rope_dim]
+
+        # Compute attention scores
+        # QK^T = q_latent @ k_latent^T + q_rope @ k_rope^T
+        # [q_len, H, latent_dim] @ [latent_dim, seq_len] -> [q_len, H, seq_len]
+        attn_latent = torch.einsum("qhd,kd->qhk", q_lat_b.float(), k_latent.float())
+        attn_rope = torch.einsum("qhd,kd->qhk", q_rope_b.float(), k_rope.float())
+        attn = (attn_latent + attn_rope) * softmax_scale
+
+        # Softmax
+        attn = F.softmax(attn, dim=-1)
+
+        # Output: attn @ V (V = k_latent for MLA)
+        # [q_len, H, seq_len] @ [seq_len, latent_dim] -> [q_len, H, latent_dim]
+        out_b = torch.einsum("qhk,kd->qhd", attn, k_latent.float())
+        out_b = out_b * output_scale
+        outputs.append(out_b)
+
+    return torch.stack(outputs, dim=0)  # [B, q_len, H, latent_dim]
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("seq_len_k", [128, 512, 2048])
+@pytest.mark.parametrize("page_size", [128])
+def test_cute_dsl_mla_decode_fp16(batch_size, seq_len_k, page_size):
+    """Test FP16 MLA decode kernel."""
+    skip_if_unsupported()
+
+    from flashinfer.cute_dsl.mla_decode import cute_dsl_mla_decode
+
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+
+    num_heads = 128
+    latent_dim = 512
+    rope_dim = 64
+    q_len = 1
+    softmax_scale = 1.0 / (latent_dim**0.5)
+    output_scale = 1.0
+
+    # Allocate query: [B, q_len, H, D_qk]
+    D_qk = latent_dim + rope_dim
+    query = torch.randn(batch_size, q_len, num_heads, D_qk, dtype=torch.float16, device=device)
+
+    # Allocate paged KV cache
+    num_pages_per_batch = (seq_len_k + page_size - 1) // page_size
+    total_pages = num_pages_per_batch * batch_size + 10  # extra pages
+    kv_cache = torch.randn(total_pages, page_size, latent_dim + rope_dim, dtype=torch.float16, device=device)
+
+    # Page table: [B, max_pages] — sequential assignment
+    block_tables = torch.zeros(batch_size, num_pages_per_batch, dtype=torch.int32, device=device)
+    for b in range(batch_size):
+        for p in range(num_pages_per_batch):
+            block_tables[b, p] = b * num_pages_per_batch + p
+
+    # Sequence lengths
+    seq_lens = torch.full((batch_size,), seq_len_k, dtype=torch.int32, device=device)
+
+    # Workspace
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
+
+    # Run kernel
+    out = cute_dsl_mla_decode(
+        query=query,
+        kv_cache=kv_cache,
+        workspace_buffer=workspace_buffer,
+        kv_lora_rank=latent_dim,
+        qk_rope_head_dim=rope_dim,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=seq_len_k,
+        softmax_scale=softmax_scale,
+        output_scale=output_scale,
+    )
+
+    # Reference
+    kv_flat = kv_cache.reshape(-1, latent_dim + rope_dim)
+    c_latent_ref = kv_flat[:, :latent_dim]
+    c_rope_ref = kv_flat[:, latent_dim:]
+    q_nope = query[..., :latent_dim]
+    q_rope = query[..., latent_dim:]
+
+    ref_out = torch_reference_mla(
+        q_nope, q_rope, c_latent_ref, c_rope_ref,
+        block_tables, seq_lens, softmax_scale, output_scale, page_size,
+    )
+
+    if q_len == 1:
+        ref_out = ref_out.squeeze(1)
+
+    ref_out_fp16 = ref_out.to(torch.float16)
+
+    # Check with tolerance appropriate for FP16
+    torch.testing.assert_close(out, ref_out_fp16, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("seq_len_k", [128, 512])
+def test_cute_dsl_mla_decode_variable_seq_len(batch_size, seq_len_k, page_size=128):
+    """Test MLA decode with variable sequence lengths across the batch."""
+    skip_if_unsupported()
+
+    from flashinfer.cute_dsl.mla_decode import cute_dsl_mla_decode
+
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+
+    num_heads = 128
+    latent_dim = 512
+    rope_dim = 64
+    q_len = 1
+    softmax_scale = 1.0 / (latent_dim**0.5)
+    output_scale = 1.0
+    D_qk = latent_dim + rope_dim
+
+    query = torch.randn(batch_size, q_len, num_heads, D_qk, dtype=torch.float16, device=device)
+
+    # Variable sequence lengths
+    max_seq_len = seq_len_k
+    seq_lens = torch.randint(
+        page_size, max_seq_len + 1, (batch_size,), dtype=torch.int32, device=device
+    )
+
+    max_pages_per_batch = (max_seq_len + page_size - 1) // page_size
+    total_pages = max_pages_per_batch * batch_size + 10
+    kv_cache = torch.randn(total_pages, page_size, D_qk, dtype=torch.float16, device=device)
+
+    block_tables = torch.zeros(batch_size, max_pages_per_batch, dtype=torch.int32, device=device)
+    for b in range(batch_size):
+        for p in range(max_pages_per_batch):
+            block_tables[b, p] = b * max_pages_per_batch + p
+
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
+
+    out = cute_dsl_mla_decode(
+        query=query,
+        kv_cache=kv_cache,
+        workspace_buffer=workspace_buffer,
+        kv_lora_rank=latent_dim,
+        qk_rope_head_dim=rope_dim,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=max_seq_len,
+        softmax_scale=softmax_scale,
+        output_scale=output_scale,
+    )
+
+    # Reference
+    kv_flat = kv_cache.reshape(-1, D_qk)
+    c_latent_ref = kv_flat[:, :latent_dim]
+    c_rope_ref = kv_flat[:, latent_dim:]
+    q_nope = query[..., :latent_dim]
+    q_rope = query[..., latent_dim:]
+
+    ref_out = torch_reference_mla(
+        q_nope, q_rope, c_latent_ref, c_rope_ref,
+        block_tables, seq_lens, softmax_scale, output_scale, page_size,
+    )
+    if q_len == 1:
+        ref_out = ref_out.squeeze(1)
+    ref_out_fp16 = ref_out.to(torch.float16)
+
+    torch.testing.assert_close(out, ref_out_fp16, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("seq_len_k", [128, 512])
+def test_cute_dsl_mla_decode_via_api(batch_size, seq_len_k, page_size=128):
+    """Test MLA decode via the trtllm_batch_decode_with_kv_cache_mla API with cute-dsl backend."""
+    skip_if_unsupported()
+
+    from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
+
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+
+    num_heads = 128
+    latent_dim = 512
+    rope_dim = 64
+    q_len = 1
+    softmax_scale = 1.0 / (latent_dim**0.5)
+    D_qk = latent_dim + rope_dim
+
+    query = torch.randn(batch_size, q_len, num_heads, D_qk, dtype=torch.float16, device=device)
+
+    num_pages_per_batch = (seq_len_k + page_size - 1) // page_size
+    total_pages = num_pages_per_batch * batch_size + 10
+    kv_cache = torch.randn(total_pages, page_size, D_qk, dtype=torch.float16, device=device)
+
+    block_tables = torch.zeros(batch_size, num_pages_per_batch, dtype=torch.int32, device=device)
+    for b in range(batch_size):
+        for p in range(num_pages_per_batch):
+            block_tables[b, p] = b * num_pages_per_batch + p
+
+    seq_lens = torch.full((batch_size,), seq_len_k, dtype=torch.int32, device=device)
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
+
+    out = trtllm_batch_decode_with_kv_cache_mla(
+        query=query,
+        kv_cache=kv_cache,
+        workspace_buffer=workspace_buffer,
+        qk_nope_head_dim=latent_dim,
+        kv_lora_rank=latent_dim,
+        qk_rope_head_dim=rope_dim,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=seq_len_k,
+        bmm1_scale=softmax_scale,
+        bmm2_scale=1.0,
+        backend="cute-dsl",
+    )
+
+    assert out.shape == (batch_size, num_heads, latent_dim)
