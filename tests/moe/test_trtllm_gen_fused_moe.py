@@ -2870,6 +2870,27 @@ def run_moe_test(
             },
             id="Qwen3_next",
         ),
+        pytest.param(
+            {
+                "num_experts": 2048,
+                "top_k": 32,
+                "padding": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.Renormalize,
+                "compatible_moe_impls": [
+                    FP8BlockScaleMoe,
+                    FP4Moe,
+                    BF16Moe,
+                    MxInt4BlockScaleMoe,
+                ],
+                "compatible_intermediate_size": [384],
+                "enable_autotune": True,
+            },
+            id="RoutingRenormalize_large_experts",
+        ),
     ],
 )
 @pytest.mark.parametrize(

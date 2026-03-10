@@ -151,18 +151,21 @@ __device__ void calcSoftmax(cg::thread_block_tile<WarpSize> const& warp,
 template <typename DataType>
 __device__ DataType calcSoftmax(cg::thread_block_tile<WarpSize> const& warp, DataType score,
                                 int32_t laneIdx, int32_t NumTopExperts) {
-  DataType maxScore = DataType{-INFINITY};
+  // Compute max in float to support half/bfloat16 inputs safely.
+  // cg::reduce with cg::greater<T> only supports float/double and integer types;
+  // using __nv_bfloat16 or __half directly can generate unsupported redux.sync.max instructions.
+  float maxScore = -INFINITY;
   if (laneIdx < NumTopExperts) {
-    maxScore = score >= maxScore ? score : maxScore;
+    float si = static_cast<float>(score);
+    maxScore = si >= maxScore ? si : maxScore;
   }
-  maxScore = cg::reduce(warp, maxScore, cg::greater<DataType>());
+  maxScore = cg::reduce(warp, maxScore, cg::greater<float>());
 
   float sumScore = float{0.f};
-  float newScore;
-  // Get the summation of scores for each token
+  float newScore = 0.f;
   if (laneIdx < NumTopExperts) {
-    newScore = static_cast<float>(score) - static_cast<float>(maxScore);
-    newScore = static_cast<float>(exp(newScore));
+    newScore = static_cast<float>(score) - maxScore;
+    newScore = expf(newScore);
     sumScore += newScore;
   }
   sumScore = cg::reduce(warp, sumScore, cg::plus<float>());
@@ -243,7 +246,7 @@ __device__ void routingPermutation(KernelParams params,
     // check whether this expert is local to our GPU at all and ignore if not
     auto localExpertIdx = scoreIdx.idx - params.mLocalExpertsStartIdx;
     auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent &&
-                         (localExpertIdx & params.mLocalExpertsStrideLog2) == 0;
+                         (localExpertIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
     expertOffsets[ii] = isLocalExpert ? atomicAdd(smemExpertCount + scoreIdx.idx, 1) : 0;
     if (params.mPtrTopKWeights != nullptr && params.mPtrTopKIds == nullptr) {
       params.mPtrTopKWeights[expandedIdx] = OutputT{scoreIdx.score};
@@ -402,7 +405,7 @@ __device__ void routingPermutation(KernelParams params,
     // check whether this expert is local to our GPU at all
     auto localExpertIdx = static_cast<int32_t>(expertIdx) - params.mLocalExpertsStartIdx;
     auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent &&
-                         (localExpertIdx & params.mLocalExpertsStrideLog2) == 0;
+                         (localExpertIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
     auto tokenIdx = expandedIdx / params.mTopK;
     auto permutedIdx =
         isLocalExpert ? int32_t{smemExpertOffset[expertIdx]} + expertOffsets[ii] : int32_t{-1};
@@ -475,7 +478,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
     // check whether this expert is local to our GPU at all and ignore if not
     auto localExpertIdx = idx - params.mLocalExpertsStartIdx;
     auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent &&
-                         (localExpertIdx & params.mLocalExpertsStrideLog2) == 0;
+                         (localExpertIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
     if (isLocalExpert) {
       atomicAdd(&smemExpertCount[idx], 1);
     }
@@ -646,7 +649,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
       // check whether this expert is local to our GPU at all and ignore if not
       auto localExpertIdx = expertIndexes[ii] - params.mLocalExpertsStartIdx;
       auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent &&
-                           (localExpertIdx & params.mLocalExpertsStrideLog2) == 0;
+                           (localExpertIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
       expertOffsets[ii] = isLocalExpert ? atomicAdd(smemExpertCount + expertIndexes[ii], 1) : 0;
     };
 
@@ -725,7 +728,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
       // check whether this expert is local to our GPU at all
       auto localExpertIdx = static_cast<int32_t>(expertIdx) - params.mLocalExpertsStartIdx;
       auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent &&
-                           (localExpertIdx & params.mLocalExpertsStrideLog2) == 0;
+                           (localExpertIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
       auto tokenIdx = expandedIdx / params.mTopK;
       auto permutedIdx =
           isLocalExpert ? (expertOffsets[ii] + smemExpertTileOffset[expertIdx]) : int32_t{-1};
