@@ -1886,14 +1886,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._item_start_ptr = None
         self._item_start_len = 0
         if item_offsets is not None:
-            import torch
             batch_size = len(prefix_len_ptr) if prefix_len_ptr is not None else 1
             item_start_list = []
             max_items_tokens = 0
             for b in range(batch_size):
                 offsets_b = item_offsets[b * item_offsets_len:(b + 1) * item_offsets_len]
                 # Filter out padding (zeros after the valid offsets)
-                num_offsets = (offsets_b > 0).sum().item() + 1  # +1 for leading 0
+                num_offsets = (offsets_b.to(torch.int64) > 0).sum().item() + 1  # +1 for leading 0
                 valid_offsets = offsets_b[:num_offsets].long()
                 # Build per-token item_start
                 total_tokens = valid_offsets[-1].item()
@@ -1917,7 +1916,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 max_lens = []
                 for b in range(batch_size):
                     offsets_b = item_offsets[b * item_offsets_len:(b + 1) * item_offsets_len]
-                    num_offsets = (offsets_b > 0).sum().item() + 1
+                    num_offsets = (offsets_b.to(torch.int64) > 0).sum().item() + 1
                     valid_offsets = offsets_b[:num_offsets].long()
                     diffs = valid_offsets[1:] - valid_offsets[:-1]
                     max_lens.append(diffs.max().item())
@@ -3076,14 +3075,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._item_start_ptr = None
         self._item_start_len = 0
         if item_offsets is not None:
-            import torch
             batch_size_v2 = len(prefix_len_ptr) if prefix_len_ptr is not None else 1
             item_start_list = []
             max_items_tokens = 0
             for b in range(batch_size_v2):
                 offsets_b = item_offsets[b * item_offsets_len:(b + 1) * item_offsets_len]
                 # Filter out padding (zeros after the valid offsets)
-                num_offsets = (offsets_b > 0).sum().item() + 1  # +1 for leading 0
+                num_offsets = (offsets_b.to(torch.int64) > 0).sum().item() + 1  # +1 for leading 0
                 valid_offsets = offsets_b[:num_offsets].long()
                 # Build per-token item_start
                 total_tokens = valid_offsets[-1].item()
@@ -3107,7 +3105,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 max_lens = []
                 for b in range(batch_size_v2):
                     offsets_b = item_offsets[b * item_offsets_len:(b + 1) * item_offsets_len]
-                    num_offsets = (offsets_b > 0).sum().item() + 1
+                    num_offsets = (offsets_b.to(torch.int64) > 0).sum().item() + 1
                     valid_offsets = offsets_b[:num_offsets].long()
                     diffs = valid_offsets[1:] - valid_offsets[:-1]
                     max_lens.append(diffs.max().item())
