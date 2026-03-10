@@ -203,6 +203,20 @@ constexpr DLDevice cpu = DLDevice{kDLCPU, 0};
     switch (encode_dlpack_dtype(dlpack_dtype)) {                                    \
       _DISPATCH_CASE_F32(c_type, __VA_ARGS__)                                       \
       _DISPATCH_SF_CASE_FP8_E8M0(c_type, __VA_ARGS__)                               \
+      default:                                                                      \
+        TVM_FFI_ICHECK(false) << __PRETTY_FUNCTION__                                \
+                              << " failed to dispatch scaling factor data type "    \
+                              << (dlpack_dtype).code << " " << (dlpack_dtype).bits; \
+        return false;                                                               \
+    }                                                                               \
+  }()
+
+// We require a separate definition since both E8M0 and UE4M3 are passed as
+// uint8
+#define DISPATCH_DLPACK_DTYPE_TO_CTYPE_SF_UE4M3(dlpack_dtype, c_type, ...)          \
+  [&]() -> bool {                                                                   \
+    switch (encode_dlpack_dtype(dlpack_dtype)) {                                    \
+      _DISPATCH_CASE_F32(c_type, __VA_ARGS__)                                       \
       _DISPATCH_SF_CASE_FP8_UE4M3(c_type, __VA_ARGS__)                              \
       default:                                                                      \
         TVM_FFI_ICHECK(false) << __PRETTY_FUNCTION__                                \

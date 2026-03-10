@@ -58,8 +58,8 @@ using namespace flashinfer;
                                            c_type_sf_b, c_type_out, ...)                         \
   [&]() -> bool {                                                                                \
     return DISPATCH_DLPACK_DTYPE_TO_CTYPE(output_dtype, c_type_out, [&] {                        \
-      return DISPATCH_DLPACK_DTYPE_TO_CTYPE_SF(sf_b_dtype, c_type_sf_b, [&] {                    \
-        return DISPATCH_DLPACK_DTYPE_TO_CTYPE_SF(sf_a_dtype, c_type_sf_a, [&] {                  \
+      return DISPATCH_DLPACK_DTYPE_TO_CTYPE_SF_UE4M3(sf_b_dtype, c_type_sf_b, [&] {              \
+        return DISPATCH_DLPACK_DTYPE_TO_CTYPE_SF_UE4M3(sf_a_dtype, c_type_sf_a, [&] {            \
           return DISPATCH_DLPACK_DTYPE_TO_CTYPE(input_b_dtype, c_type_in_b, [&] {                \
             return DISPATCH_DLPACK_DTYPE_TO_CTYPE(input_a_dtype, c_type_in_a,                    \
                                                   [&] { return __VA_ARGS__(); });                \
