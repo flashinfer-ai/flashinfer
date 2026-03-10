@@ -106,6 +106,33 @@ std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& supported_til
   return selected_tile_nums;
 }
 
+template <typename LauncherType>
+// Select a launcher
+LauncherType& get_launcher(
+    std::unordered_map<int32_t, std::unique_ptr<LauncherType>>& launchers_map,
+    std::set<int32_t> const& selected_tile_nums, int64_t& tile_N, int64_t& config,
+    char const* op_name) {
+  FLASHINFER_CHECK(!selected_tile_nums.empty(), op_name, ": no available tile_N candidates");
+
+  if (tile_N == -1 || config == -1) {
+    tile_N = *selected_tile_nums.begin();
+    config = -1;
+  }
+
+  auto it = launchers_map.find(static_cast<int32_t>(tile_N));
+  if (it == launchers_map.end()) {
+    auto const requestedTileN = tile_N;
+    tile_N = *selected_tile_nums.begin();
+    config = -1;
+    it = launchers_map.find(static_cast<int32_t>(tile_N));
+    FLASHINFER_CHECK(it != launchers_map.end(), op_name, ": failed to select launcher for tile_N ",
+                     tile_N, " after fallback from requested tile_N ", requestedTileN,
+                     " (selected_tile_count=", selected_tile_nums.size(), ")");
+  }
+
+  return *(it->second);
+}
+
 class FusedMoeLauncher {
  protected:
   Optional<TensorView> routing_logits;
@@ -255,8 +282,11 @@ class FusedMoeLauncher {
   Tensor cta_idx_xy_to_mn_limit;
   Tensor num_non_exiting_ctas;
 
-  void prepare_routing_common() {
-    // Allocate routing phase workspace tensors
+  void prepare_routing_common(int32_t clusterSize) {
+    // Allocate routing phase workspace tensors.
+    // tile_tokens_dim is cluster-level tile (tile * clusterSize) for config matching.
+    // The routing kernel internally expands cluster-level tiles to CTA-level output entries.
+
     num_tokens_per_expert = alloc_tensor({args->num_experts}, dl_int32, hidden_states.device());
     int32_t max_num_padded_tokens =
         tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxPermutedPaddedCount(
@@ -281,8 +311,10 @@ class FusedMoeLauncher {
                                                      // and max number of experts
                                           hidden_states.device());
 
-    int32_t max_num_ctas = tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxNumCtasInBatchDim(
+    // Buffer sized at CTA count: routing kernel expands CGA entries to CTA entries
+    int32_t max_num_cgas = tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxNumCgasInBatchDim(
         args->num_tokens, args->top_k, args->num_experts, tile_tokens_dim);
+    int32_t max_num_ctas = max_num_cgas * clusterSize;
 
     cta_idx_xy_to_batch_idx = alloc_tensor({max_num_ctas}, dl_int32, hidden_states.device());
 
@@ -292,7 +324,6 @@ class FusedMoeLauncher {
 
     workspace.total_num_padded_tokens = static_cast<int*>(total_num_padded_tokens.data_ptr());
     workspace.total_max_padded_tokens = max_num_padded_tokens;
-    workspace.ProjUpTileN = tile_tokens_dim;
     workspace.routing_expert_indexes = static_cast<int*>(expert_indexes.data_ptr());
     workspace.permuted_idx_size = static_cast<int*>(total_num_padded_tokens.data_ptr());
     workspace.expanded_idx_to_permuted_idx =
@@ -319,7 +350,7 @@ class FusedMoeLauncher {
   int64_t moe_tactic{-1};
   std::unique_ptr<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner> moe_runner;
 
-  void prepare_moe_common(int64_t& moe_tactic) {
+  void instantiate_moe_runner(int64_t& moe_tactic) {
     using RunnerType = tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner;
     // For FP8 block-scale (E4m3 activations, E4m3 weights) with DeepSeek FP8, use the
     // weights-only Runner constructor to match the original kernel path and numerics.
@@ -358,7 +389,7 @@ class FusedMoeLauncher {
 
  public:
   virtual void check_routing() const = 0;
-  virtual void prepare_routing() = 0;
+  virtual void prepare_routing(int32_t clusterSize) = 0;
   virtual void check_moe() const = 0;
   virtual void prepare_moe(int64_t& moe_tactic) = 0;
 
@@ -369,10 +400,13 @@ class FusedMoeLauncher {
                             bool use_routing_scales_on_input = false,
                             bool use_deep_seek_fp8 = false) {
     check_routing();
-    prepare_routing();
+    instantiate_moe_runner(moe_tactic);
+    int32_t clusterSize = moe_runner->getConfigClusterSizeInBatchDim(moe_tactic);
+    prepare_routing(clusterSize);
 
     // Execute routing
-    tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
+    tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim,
+                                                                         clusterSize);
     cudaStream_t routing_stream = get_stream(hidden_states.device());
 
     routing_runner.run(
@@ -476,8 +510,8 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
     // TODO n_group, topk_group validation?
   }
 
-  void prepare_routing() override {
-    FusedMoeLauncher::prepare_routing_common();
+  void prepare_routing(int32_t clusterSize) override {
+    FusedMoeLauncher::prepare_routing_common(clusterSize);
 
     args->mDtypeElt = btg::Dtype::Bfloat16;
     args->mUseDeepSeekFp8 = false;
@@ -517,8 +551,6 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
   }
 
   void prepare_moe(int64_t& moe_tactic) override {
-    FusedMoeLauncher::prepare_moe_common(moe_tactic);
-
     int32_t max_num_padded_tokens = workspace.total_max_padded_tokens;
     gemm1_output = alloc_tensor({max_num_padded_tokens, args->intermediate_size}, dl_bfloat16,
                                 hidden_states.device());
@@ -617,8 +649,8 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
 
   void check_routing() const override { FusedMoeLauncher::check_routing_common(); }
 
-  void prepare_routing() override {
-    FusedMoeLauncher::prepare_routing_common();
+  void prepare_routing(int32_t clusterSize) override {
+    FusedMoeLauncher::prepare_routing_common(clusterSize);
 
     auto dtype = hidden_states.dtype();
     if (dtype == dl_float16) {
@@ -687,8 +719,6 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
   }
 
   void prepare_moe(int64_t& moe_tactic) override {
-    FusedMoeLauncher::prepare_moe_common(moe_tactic);
-
     int32_t max_num_padded_tokens_gemm1 = workspace.total_max_padded_tokens + args->num_experts;
     int32_t max_num_padded_tokens_gemm2 = workspace.total_max_padded_tokens;
 
@@ -881,8 +911,8 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
         << "num_experts must be greater or equal to local_num_experts + local_expert_offset";
   }
 
-  void prepare_routing() override {
-    FusedMoeLauncher::prepare_routing_common();
+  void prepare_routing(int32_t clusterSize) override {
+    FusedMoeLauncher::prepare_routing_common(clusterSize);
 
     auto dtype = hidden_states.dtype();
     if (dtype == dl_float16) {
@@ -995,8 +1025,6 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
   }
 
   void prepare_moe(int64_t& moe_tactic) override {
-    FusedMoeLauncher::prepare_moe_common(moe_tactic);
-
     // Calculate max_num_padded_tokens for gemm1 and gemm2 using maybeGetMinTokenCount
     int32_t max_num_padded_tokens_gemm1 =
         tensorrt_llm::kernels::trtllmgen_moe::Routing::maybeGetMinTokenCount(
@@ -1071,10 +1099,13 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
                     bool use_routing_scales_on_input = false,
                     bool use_deep_seek_fp8 = false) override {
     check_routing();
-    prepare_routing();
+    instantiate_moe_runner(moe_tactic);
+    int32_t clusterSize = moe_runner->getConfigClusterSizeInBatchDim(moe_tactic);
+    prepare_routing(clusterSize);
 
     cudaStream_t routing_stream = get_stream(hidden_states.device());
-    tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
+    tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim,
+                                                                         clusterSize);
 
     // Check ndim==2 and size>0 because empty placeholder tensors may have non-null data_ptr
     bool use_precomputed = expert_indices.ndim() == 2 && expert_indices.size(0) > 0;
@@ -1178,8 +1209,8 @@ class MxInt4BlockScaleLauncher : public FusedMoeLauncher {
 
   void check_routing() const override { FusedMoeLauncher::check_routing_common(); }
 
-  void prepare_routing() override {
-    FusedMoeLauncher::prepare_routing_common();
+  void prepare_routing(int32_t clusterSize) override {
+    FusedMoeLauncher::prepare_routing_common(clusterSize);
 
     args->mDtypeElt = mDtypeAct;
     args->mUseDeepSeekFp8 = false;
@@ -1223,8 +1254,6 @@ class MxInt4BlockScaleLauncher : public FusedMoeLauncher {
     args->output1_scales_scalar = nullptr;
     args->output1_scales_gate_scalar = nullptr;
     args->output2_scales_scalar = nullptr;
-
-    FusedMoeLauncher::prepare_moe_common(moe_tactic);
 
     max_num_padded_tokens_gemm1 =
         tensorrt_llm::kernels::trtllmgen_moe::Routing::maybeGetMinTokenCount(
@@ -1363,7 +1392,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     FusedMoeLauncher::check_routing_common();
   }
 
-  void prepare_routing() override {
+  void prepare_routing(int32_t clusterSize) override {
     num_tokens_per_expert = alloc_tensor({args->num_experts}, dl_int32, hidden_states.device());
     int32_t max_num_padded_tokens =
         tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxPermutedPaddedCount(
@@ -1379,15 +1408,15 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     expert_count_histogram =
         alloc_tensor({size_of_expert_count_histogram}, dl_int32, hidden_states.device());
 
-    int32_t max_num_ctas = tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxNumCtasInBatchDim(
+    int32_t max_num_cgas = tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxNumCgasInBatchDim(
         args->num_tokens, args->top_k, args->num_experts, tile_tokens_dim);
+    int32_t max_num_ctas = max_num_cgas * clusterSize;
     cta_idx_xy_to_batch_idx = alloc_tensor({max_num_ctas}, dl_int32, hidden_states.device());
     cta_idx_xy_to_mn_limit = alloc_tensor({max_num_ctas}, dl_int32, hidden_states.device());
     num_non_exiting_ctas = alloc_tensor({1}, dl_int32, hidden_states.device());
 
     workspace.total_num_padded_tokens = static_cast<int*>(total_num_padded_tokens.data_ptr());
     workspace.total_max_padded_tokens = max_num_padded_tokens;
-    workspace.ProjUpTileN = tile_tokens_dim;
     workspace.routing_expert_indexes =
         static_cast<int*>(const_cast<void*>(expert_indices.data_ptr()));
     workspace.expert_weights = const_cast<void*>(expert_weights.data_ptr());
@@ -1476,8 +1505,6 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
             ? static_cast<float*>(output2_scales_scalar.value().data_ptr())
             : nullptr;
 
-    FusedMoeLauncher::prepare_moe_common(moe_tactic);
-
     auto const sf_vec_size = mDtypeWeights == btg::Dtype::MxE2m1 ? 32 : 16;
 
     max_num_padded_tokens_gemm1 =
@@ -1537,10 +1564,13 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
                     bool use_routing_scales_on_input = false,
                     bool use_deep_seek_fp8 = false) override {
     check_routing();
-    prepare_routing();
+    instantiate_moe_runner(moe_tactic);
+    int32_t clusterSize = moe_runner->getConfigClusterSizeInBatchDim(moe_tactic);
+    prepare_routing(clusterSize);
 
     // Execute routing
-    tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
+    tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim,
+                                                                         clusterSize);
     cudaStream_t routing_stream = get_stream(hidden_states.device());
 
     routing_runner.run(
@@ -1670,16 +1700,12 @@ Array<Tensor> trtllm_bf16_moe(Optional<TensorView> const& routing_logits,
   int64_t tile_N = moe_tactic[0];
   int64_t config = moe_tactic[1];
 
-  // Handle default case
-  if (tile_N == -1 || config == -1) {
-    tile_N = *selected_tile_nums.begin();
-  }
-
-  // Get the launcher for the selected tile_N
-  auto& selected_launcher = launchers_map.at(tile_N);
+  // Choose or fall back to default launcher for the given tile_N
+  auto& selected_launcher =
+      get_launcher(launchers_map, selected_tile_nums, tile_N, config, "trtllm_bf16_moe");
 
   // Run the launcher - it will create its own runner internally
-  return selected_launcher->run(config, enable_pdl);
+  return selected_launcher.run(config, enable_pdl);
 }
 
 Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
@@ -1762,16 +1788,12 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
   int64_t tile_N = config_index[0];
   int64_t config = config_index[1];
 
-  // Handle default case
-  if (tile_N == -1 || config == -1) {
-    tile_N = *selected_tile_nums.begin();
-  }
-
-  // Get the launcher for the selected tile_N
-  auto& selected_launcher = launchers_map.at(tile_N);
+  // Select a launcher
+  auto& selected_launcher = get_launcher(launchers_map, selected_tile_nums, tile_N, config,
+                                         "trtllm_fp8_per_tensor_scale_moe");
 
   // Run the launcher - it will create its own runner internally
-  return selected_launcher->run(config, enable_pdl, use_routing_scales_on_input);
+  return selected_launcher.run(config, enable_pdl, use_routing_scales_on_input);
 }
 
 Array<Tensor> trtllm_fp8_block_scale_moe(
@@ -1883,16 +1905,12 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
   int64_t tile_N = config_index[0];
   int64_t config = config_index[1];
 
-  // Handle default case
-  if (tile_N == -1 || config == -1) {
-    tile_N = *selected_tile_nums.begin();
-  }
-
-  // Get the launcher for the selected tile_N
-  auto& selected_launcher = launchers_map.at(tile_N);
+  // Select a launcher
+  auto& selected_launcher =
+      get_launcher(launchers_map, selected_tile_nums, tile_N, config, "trtllm_fp8_block_scale_moe");
 
   // Run the launcher with DeepSeek FP8 enabled - it will create its own runner internally
-  return selected_launcher->run(
+  return selected_launcher.run(
       config, enable_pdl, false /* use_routing_scales_on_input */,
       quantization_type == Fp8QuantizationType::DeepSeekFp8 /* use_deep_seek_fp8 */);
 }
@@ -2027,17 +2045,12 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
   int64_t tile_N = config_index[0];
   int64_t config = config_index[1];
 
-  // Handle default case
-  if (tile_N == -1 || config == -1) {
-    tile_N = *selected_tile_nums.begin();
-    config = -1;  // Let the runner choose default
-  }
-
-  // Get the launcher for the selected tile_N
-  auto& selected_launcher = launchers_map.at(tile_N);
+  // Select a launcher
+  auto& selected_launcher =
+      get_launcher(launchers_map, selected_tile_nums, tile_N, config, "trtllm_fp4_block_scale_moe");
 
   // Run the launcher - it will create its own runner internally
-  return selected_launcher->run(config, enable_pdl);
+  return selected_launcher.run(config, enable_pdl);
 }
 
 Array<Tensor> trtllm_mxint4_block_scale_moe(
@@ -2116,17 +2129,12 @@ Array<Tensor> trtllm_mxint4_block_scale_moe(
   int64_t tile_N = config_index[0];
   int64_t config = config_index[1];
 
-  // Handle default case
-  if (tile_N == -1 || config == -1) {
-    tile_N = *selected_tile_nums.begin();
-    config = -1;  // Let the runner choose default
-  }
-
-  // Get the launcher for the selected tile_N
-  auto& selected_launcher = launchers_map.at(tile_N);
+  // Select a launcher
+  auto& selected_launcher = get_launcher(launchers_map, selected_tile_nums, tile_N, config,
+                                         "trtllm_mxint4_block_scale_moe");
 
   // Run the launcher - it will create its own runner internally
-  return selected_launcher->run(config, enable_pdl);
+  return selected_launcher.run(config, enable_pdl);
 }
 
 Array<Array<int64_t>> trtllm_get_valid_moe_configs(

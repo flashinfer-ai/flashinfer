@@ -78,18 +78,18 @@ inline std::string serializeMoeRoutingMethodType(RoutingMethodType routingMethod
   };
 }
 
-inline int32_t getMaxNumCtasInBatchDim(int32_t numTokens, int32_t topK, int32_t numExperts,
-                                       int32_t tileTokensDim) {
-  // For MoE, mNumTokens != 0 and the number of CTAs is known only at runtime.
-  // We launch maximally possible number of CTAs and use ptrNumNonExitingCtas to determine
-  // the actual number of CTAs to run.
+inline int32_t getMaxNumCgasInBatchDim(int32_t numTokens, int32_t topK, int32_t numExperts,
+                                       int32_t cgaTileTokensDim) {
+  // For MoE, mNumTokens != 0 and the number of CGAs is known only at runtime.
+  // We launch maximally possible number of CGAs and use ptrNumNonExitingCtas to determine
+  // the actual number of CGAs to run.
 
   // Initialize number of tokens with the number of expanded tokens after routing.
-  int32_t numRemainingTokens = numTokens * topK;
-  int32_t maxNumCtasInBatchDim = 0;
+  auto numRemainingTokens = numTokens * topK;
+  int32_t maxNumCgasInBatchDim = 0;
   // First, distribute one token each expert until token depletion to maximize CTA tile count.
-  int32_t numExpertsFilled = std::min(numExperts, numRemainingTokens);
-  maxNumCtasInBatchDim += numExpertsFilled;
+  auto numExpertsFilled = std::min(numExperts, numRemainingTokens);
+  maxNumCgasInBatchDim += numExpertsFilled;
   numRemainingTokens -= numExpertsFilled;
   // Next, greedily pour all remaining tokens to one expert to maximize CTA tile count.
   // E.g., at this point tokens over 4 experts are [1, 1, 1, 1], and we have 4 tokens left.
@@ -100,24 +100,29 @@ inline int32_t getMaxNumCtasInBatchDim(int32_t numTokens, int32_t topK, int32_t 
   // capacity. These buckets, if full, can then be attributed to any expert; it does not have to
   // belong to the same expert every time.
   if (numRemainingTokens > 0) {
-    // For every tileTokenDim tokens, we add an extra CTA tile in the token dimension.
-    // The number of CTA tiles is given by divDown(numRemainingTokens, tokenTileDim).
-    maxNumCtasInBatchDim += (numRemainingTokens / tileTokensDim);
+    // For every tileTokenDim tokens, we add an extra CGA tile in the token dimension.
+    // The number of CGA tiles is given by divDown(numRemainingTokens, tokenTileDim).
+    maxNumCgasInBatchDim += (numRemainingTokens / cgaTileTokensDim);
   }
-  return maxNumCtasInBatchDim;
+  return maxNumCgasInBatchDim;
+}
+
+inline int32_t getCgaSizeInBatchDim(bool transposeMmaOutput, int32_t clusterDimX,
+                                    int32_t clusterDimY) {
+  return transposeMmaOutput ? clusterDimY : clusterDimX;
 }
 
 inline int32_t getMaxPermutedPaddedCount(int32_t numTokens, int32_t expertsPerToken,
                                          int32_t numExperts, int32_t padding) {
-  int32_t maxCtas = getMaxNumCtasInBatchDim(numTokens, expertsPerToken, numExperts, padding);
-  return maxCtas * padding;
+  int32_t maxCgas = getMaxNumCgasInBatchDim(numTokens, expertsPerToken, numExperts, padding);
+  return maxCgas * padding;
 }
 
 class Runner {
  public:
   explicit Runner();
 
-  explicit Runner(int32_t tileTokensDim);
+  explicit Runner(int32_t tileTokensDim, int32_t clusterSizeInBatchDim = 1);
 
   void run(void* routingLogits, void* routingBias, int32_t numTokens, int32_t numExperts,
            int32_t topK, int32_t nGroups, int32_t topkGroups, int32_t localExpertOffset,
@@ -132,6 +137,7 @@ class Runner {
 
  private:
   int32_t mTileTokensDim{8};
+  int32_t mClusterSizeInBatchDim{1};
 };
 }  // namespace Routing
 
@@ -201,6 +207,8 @@ class Runner {
 
   [[nodiscard]] std::vector<int64_t> getPassingConfigIndices() const;
 
+  [[nodiscard]] int32_t getConfigClusterSizeInBatchDim(int32_t configIndex) const;
+
   void run(void* hiddenState, void* hiddenStateScale, void* weight, void* weightScale,
            void* expertWeights, float* outputScalesScalar, float* outputScalesGateScalar,
            float* ptrBias, float* ptrGatedActAlpha, float* ptrGatedActBeta, float* ptrClampLimit,
@@ -241,6 +249,8 @@ class Runner {
                                         int32_t numTokens) const;
 
   [[nodiscard]] std::vector<int64_t> getPassingConfigIndices() const;
+
+  [[nodiscard]] int32_t getConfigClusterSizeInBatchDim(int32_t configIndex) const;
 
   void run(void* permutedHiddenState, void* permutedHiddenStateScale, void* weight,
            void* weightScale, float* outputScalesScalar, float* ptrBias, void* output,
@@ -348,7 +358,6 @@ struct MoEWorkspace {
   float* permuted_hidden_states_scale = nullptr;
 
   // Gemm1 intermediate outputs:
-  int32_t ProjUpTileN{0};
   void* gemm1_output = nullptr;
   float* gemm1_output_scale = nullptr;
 
@@ -403,6 +412,8 @@ class Runner {
                                                    int32_t intermediateSize,
                                                    int32_t numLocalExperts,
                                                    int32_t numTokens) const;
+
+  [[nodiscard]] int32_t getConfigClusterSizeInBatchDim(int64_t configIndex) const;
 
  private:
   void setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace,

@@ -34,9 +34,22 @@ Metrics:
 """
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import dataclass
 import numpy as np
 import torch
+
+
+@contextmanager
+def cuda_profiler_range(name):
+    """Context manager for CUDA profiler + NVTX range."""
+    torch.cuda.cudart().cudaProfilerStart()
+    torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.cudart().cudaProfilerStop()
 
 
 @dataclass
@@ -343,15 +356,16 @@ def bench_cute_dsl(
         "topk_indices": ti,
     }
 
-    times = bench_gpu_time(
-        run,
-        dry_run_iters=warmup,
-        repeat_iters=iters,
-        cold_l2_cache=True,
-        enable_cupti=use_cupti,
-        use_cuda_graph=use_cuda_graph,
-        input_kwargs=input_kwargs,
-    )
+    with cuda_profiler_range("bench_cute_dsl"):
+        times = bench_gpu_time(
+            run,
+            dry_run_iters=warmup,
+            repeat_iters=iters,
+            cold_l2_cache=True,
+            enable_cupti=use_cupti,
+            use_cuda_graph=use_cuda_graph,
+            input_kwargs=input_kwargs,
+        )
     return np.median(times)
 
 
@@ -450,15 +464,16 @@ def bench_cutlass(
         "topk_indices": ti,
     }
 
-    times = bench_gpu_time(
-        run,
-        dry_run_iters=warmup,
-        repeat_iters=iters,
-        cold_l2_cache=True,
-        enable_cupti=use_cupti,
-        use_cuda_graph=use_cuda_graph,
-        input_kwargs=input_kwargs,
-    )
+    with cuda_profiler_range("bench_cutlass"):
+        times = bench_gpu_time(
+            run,
+            dry_run_iters=warmup,
+            repeat_iters=iters,
+            cold_l2_cache=True,
+            enable_cupti=use_cupti,
+            use_cuda_graph=use_cuda_graph,
+            input_kwargs=input_kwargs,
+        )
     return np.median(times)
 
 
@@ -576,15 +591,16 @@ def bench_trtllm(
         "hidden_states_scale": hsc,
     }
 
-    times = bench_gpu_time(
-        run,
-        dry_run_iters=warmup,
-        repeat_iters=iters,
-        cold_l2_cache=True,
-        enable_cupti=use_cupti,
-        use_cuda_graph=use_cuda_graph,
-        input_kwargs=input_kwargs,
-    )
+    with cuda_profiler_range("bench_trtllm"):
+        times = bench_gpu_time(
+            run,
+            dry_run_iters=warmup,
+            repeat_iters=iters,
+            cold_l2_cache=True,
+            enable_cupti=use_cupti,
+            use_cuda_graph=use_cuda_graph,
+            input_kwargs=input_kwargs,
+        )
     return np.median(times)
 
 
