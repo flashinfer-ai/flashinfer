@@ -181,12 +181,15 @@ def _get_compiled_mla_kernel(
         (sym_batch,),
         assumed_align=128,
     )
-    # block_split_kvs: [batch_size] — int32
-    block_split_kvs_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (sym_batch,),
-        assumed_align=128,
-    )
+    # block_split_kvs: [batch_size] — int32 (only needed for is_var_split_kv=True)
+    if is_var_split_kv:
+        block_split_kvs_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (sym_batch,),
+            assumed_align=128,
+        )
+    else:
+        block_split_kvs_fake = None
 
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
@@ -211,7 +214,10 @@ def _get_compiled_mla_kernel(
 
     return compiled_kernel
 
-
+# TODO: need to tell users the max size of the workspace in the doc, so that they can allocate the workspace_buffer.
+# TODO: how to set split_kv, is_persistent, is_var_seq, is_var_split_kv?
+# TODO: check if page_size setup is right.
+# TODO: query[..., :kv_lora_rank], do we need to remove such kind of slice and move the logic to call routine in the kernel file.
 def cute_dsl_mla_decode(
     query: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -223,6 +229,7 @@ def cute_dsl_mla_decode(
     max_seq_len: int,
     softmax_scale: float,
     output_scale: float = 1.0,
+    is_var_split_kv: bool = False,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """CuTe DSL MLA decode kernel for Blackwell SM100.
@@ -249,6 +256,10 @@ def cute_dsl_mla_decode(
         Scale factor for QK^T before softmax.
     output_scale : float
         Scale factor applied to the output.
+    is_var_split_kv : bool
+        Whether to use variable split_kv per batch. When False (default),
+        uses a uniform scalar split_kv, avoiding a torch.full GPU kernel.
+        When True, allocates a per-batch block_split_kvs tensor.
     out : Optional[torch.Tensor]
         Pre-allocated output tensor [B, H, kv_lora_rank].
 
@@ -296,6 +307,10 @@ def cute_dsl_mla_decode(
     )
 
     # Prepare workspace — slice of contiguous 1D buffer is already contiguous
+    assert workspace_buffer.numel() >= workspace_size, (
+        f"workspace_buffer too small: {workspace_buffer.numel()} bytes, "
+        f"need {workspace_size} bytes"
+    )
     workspace_bytes = workspace_buffer[: max(workspace_size, 1)]
 
     # Output buffer: contiguous [B, q_len, H, D].
@@ -318,10 +333,16 @@ def cute_dsl_mla_decode(
 
     # cache_seqs: per-batch sequence lengths (skip .to() if already int32)
     cache_seqs = seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
-    
-    # TOOD: this will trigger a kernel. Need to remove it.
-    # block_split_kvs: uniform split_kv for all batches
-    block_split_kvs = torch.full((B,), split_kv, dtype=torch.int32, device=query.device)
+
+    # block_split_kvs: only needed when is_var_split_kv=True
+    if is_var_split_kv:
+        # TODO: this will trigger a kernel. 
+        # TODO: need to align with the test in kernel file.
+        block_split_kvs = torch.full(
+            (B,), split_kv, dtype=torch.int32, device=query.device
+        )
+    else:
+        block_split_kvs = None
 
     # Get compiled kernel (cached after first compile)
     compiled_kernel = _get_compiled_mla_kernel(
@@ -331,7 +352,7 @@ def cute_dsl_mla_decode(
         seq_len_q=q_len,
         is_persistent=True,
         is_var_seq=True,
-        is_var_split_kv=True,
+        is_var_split_kv=is_var_split_kv,
     )
 
     # Call the kernel
