@@ -43,6 +43,24 @@ _SKIP_CORRECTION_THRESHOLD = 0.0
 
 
 @functools.cache
+def _get_split_kv_and_workspace_size(
+    B: int,
+    q_len: int,
+    max_seq_len: int,
+    H: int,
+    max_active_blocks: int,
+) -> Tuple[int, int]:
+    """Cache split_kv and workspace_size since they are deterministic for the same params."""
+    split_kv = BlackwellMultiHeadLatentAttentionForwardFP16.get_split_kv(
+        B, q_len, max_seq_len, _MMA_QK_TILER_MN, max_active_blocks
+    )
+    workspace_size = BlackwellMultiHeadLatentAttentionForwardFP16.get_workspace_size(
+        H, q_len, _LATENT_DIM, B, split_kv, cutlass.Float32
+    )
+    return split_kv, workspace_size
+
+
+@functools.cache
 def _get_compiled_mla_kernel(
     is_fp8: bool,
     page_size: int,
@@ -51,11 +69,14 @@ def _get_compiled_mla_kernel(
     is_persistent: bool,
     is_var_seq: bool,
     is_var_split_kv: bool,
-) -> Tuple[Callable, object]:
+) -> Callable:
     """Compile and cache an MLA decode kernel.
 
-    Returns (compiled_kernel_closure, kernel_class_instance).
-    The kernel_class_instance is needed for get_split_kv() and get_workspace_size().
+    Returns a callable that accepts (q_latent, q_rope, c_latent, c_rope,
+    page_table, o, lse, workspace, split_kv_scalar, cache_seqs,
+    block_split_kvs, softmax_scale_scalar, output_scale_scalar).
+
+    All scalar arguments must be pre-wrapped as Int32/Float32.
     """
     KernelClass = (
         BlackwellMultiHeadLatentAttentionForwardFP8
@@ -122,11 +143,14 @@ def _get_compiled_mla_kernel(
         stride_order=(2, 0, 1),
         assumed_align=128,
     )
-    # page_table: [page_count, batch_size]
+    # page_table: [page_count, batch_size] with stride[0]==1
+    # Matches the original kernel's convention: page_table_ref.permute(1, 0) gives
+    # strides (1, page_count), so dim0(page_count) is the contiguous dimension.
+    # This allows passing block_tables.t() directly without .contiguous().
     page_table_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
         (sym_page_count, sym_batch),
-        stride_order=(1, 0),
+        stride_order=(0, 1),
         assumed_align=128,
     )
     # o: [num_heads, latent_dim, seq_len_q, batch_size] — stride[1]==1
@@ -184,39 +208,7 @@ def _get_compiled_mla_kernel(
         options="--enable-tvm-ffi",
     )
 
-    def tensor_api(
-        q_latent: torch.Tensor,
-        q_rope: torch.Tensor,
-        c_latent: torch.Tensor,
-        c_rope: torch.Tensor,
-        page_table: torch.Tensor,
-        o: torch.Tensor,
-        lse: torch.Tensor,
-        workspace: torch.Tensor,
-        split_kv: int,
-        cache_seqs: torch.Tensor,
-        block_split_kvs: torch.Tensor,
-        softmax_scale: float,
-        output_scale: float,
-    ) -> None:
-        nonlocal compiled_kernel
-        compiled_kernel(
-            q_latent,
-            q_rope,
-            c_latent,
-            c_rope,
-            page_table,
-            o,
-            lse,
-            workspace,
-            Int32(split_kv),
-            cache_seqs,
-            block_split_kvs,
-            Float32(softmax_scale),
-            Float32(output_scale),
-        )
-
-    return tensor_api, kernel_obj
+    return compiled_kernel
 
 
 def cute_dsl_mla_decode(
@@ -280,95 +272,78 @@ def cute_dsl_mla_decode(
 
     # Handle 3D vs 4D kv_cache: normalize to 3D [num_pages, page_size, D_total]
     if kv_cache.dim() == 4:
-        # [num_pages, 1, page_size, D_total] -> [num_pages, page_size, D_total]
         kv_cache = kv_cache.squeeze(1)
     page_size = kv_cache.shape[1]
-    D_total = kv_cache.shape[2]
-    assert D_total == kv_lora_rank + qk_rope_head_dim
 
-    # Split query into latent and rope components
-    q_nope = query[..., :kv_lora_rank]  # [B, q_len, H, latent_dim]
-    q_rope = query[..., kv_lora_rank:]  # [B, q_len, H, rope_dim]
-
-    # Reshape to kernel layout: [B, q_len, H, D] -> [H, D, q_len, B]
+    # Split query into latent and rope components and reshape to kernel layout.
+    # [B, q_len, H, D] -> slice -> permute -> [H, D, q_len, B] with stride[1]=1.
     # Do NOT call .contiguous() — permute gives stride[1]=1 which the kernel requires.
-    # .contiguous() would rearrange to row-major making stride[3]=1 instead.
-    q_latent_k = q_nope.permute(2, 3, 1, 0)  # [H, latent_dim, q_len, B], stride[1]=1
-    q_rope_k = q_rope.permute(2, 3, 1, 0)  # [H, rope_dim, q_len, B], stride[1]=1
+    q_latent_k = query[..., :kv_lora_rank].permute(2, 3, 1, 0)
+    q_rope_k = query[..., kv_lora_rank:].permute(2, 3, 1, 0)
 
     # Reshape KV cache to kernel layout [page_size, D, num_pages].
-    # The kernel indexes via page_table: for batch b, page p, offset t:
-    #   c_latent[t, d, page_table[p, b]] = token (page_table[p,b]*page_size + t)'s latent[d]
-    # kv_cache: [num_pages, page_size, D_total] with strides (page_size*D_total, D_total, 1)
-    # After permute(1, 2, 0) on latent slice: [page_size, latent_dim, num_pages]
-    #   strides = (D_total, 1, page_size*D_total) → stride[1]=1 ✓
-    c_latent_k = kv_cache[:, :, :kv_lora_rank].permute(
-        1, 2, 0
-    )  # [page_size, latent_dim, num_pages]
-    c_rope_k = kv_cache[:, :, kv_lora_rank:].permute(
-        1, 2, 0
-    )  # [page_size, rope_dim, num_pages]
+    # The kernel indexes via page_table: c_latent[intra_page_offset, d, physical_page_idx].
+    # After permute: strides = (D_total, 1, page_size*D_total) → stride[1]=1 ✓
+    c_latent_k = kv_cache[:, :, :kv_lora_rank].permute(1, 2, 0)
+    c_rope_k = kv_cache[:, :, kv_lora_rank:].permute(1, 2, 0)
 
-    # Page table: [B, max_pages] -> [max_pages, B]
-    page_table_k = block_tables.t().contiguous().to(torch.int32)
+    # Page table: [B, max_pages] -> [max_pages, B] (view only, no copy needed).
+    # The kernel accepts non-contiguous strides via CuTe layout, matching the original
+    # kernel's convention of page_table_ref.permute(1, 0) without .contiguous().
+    page_table_k = block_tables.permute(1, 0)
 
-    # Determine split_kv and workspace
-    is_persistent = True
-    is_var_seq = True
-    is_var_split_kv = True
+    # Cached split_kv and workspace_size computation
     max_active_blocks = get_num_sm(query.device)
-
-    split_kv = BlackwellMultiHeadLatentAttentionForwardFP16.get_split_kv(
-        B, q_len, max_seq_len, _MMA_QK_TILER_MN, max_active_blocks
+    split_kv, workspace_size = _get_split_kv_and_workspace_size(
+        B, q_len, max_seq_len, H, max_active_blocks
     )
 
-    workspace_size = BlackwellMultiHeadLatentAttentionForwardFP16.get_workspace_size(
-        H, q_len, _LATENT_DIM, B, split_kv, cutlass.Float32
-    )
+    # Prepare workspace — slice of contiguous 1D buffer is already contiguous
+    workspace_bytes = workspace_buffer[: max(workspace_size, 1)]
 
-    # Prepare workspace tensor
-    if workspace_size > 0:
-        workspace_bytes = workspace_buffer[:workspace_size].contiguous()
-    else:
-        workspace_bytes = workspace_buffer[:1].contiguous()
-
-    # Allocate output: [H, latent_dim, q_len, B] with stride[1]==1
-    # torch.empty(B, H, q_len, D) has row-major strides (H*q_len*D, q_len*D, D, 1).
-    # After permute(1, 3, 2, 0) → shape [H, D, q_len, B] with strides (q_len*D, 1, D, H*q_len*D).
-    # Do NOT call .contiguous() — that would collapse to row-major making stride[3]=1.
+    # Output buffer setup: kernel needs [H, D, q_len, B] with stride[1]==1.
+    # If caller provides `out`, reuse it directly via permute to avoid allocation + copy_.
+    #   q_len==1: out [B, H, D] → permute(1,2,0) → [H, D, B] → unsqueeze(2) → [H, D, 1, B]
+    #   q_len >1: out [B, q_len, H, D] → permute(2,3,1,0) → [H, D, q_len, B]
+    # Both give stride[1]=1 ✓, kernel writes directly into out's memory.
     out_dtype = torch.float8_e4m3fn if is_fp8 else torch.float16
-    o_k = torch.empty(
-        (B, H, q_len, _LATENT_DIM), dtype=out_dtype, device=query.device
-    ).permute(1, 3, 2, 0)  # [H, latent_dim, q_len, B], stride[1]=1
+    if out is not None:
+        if q_len == 1:
+            o_k = out.permute(1, 2, 0).unsqueeze(2)
+        else:
+            o_k = out.permute(2, 3, 1, 0)
+    else:
+        # Allocate as [B, q_len, H, D] so that permute back is already contiguous.
+        # permute(2, 3, 1, 0) → [H, D, q_len, B] with stride[1]=1 ✓
+        o_k = torch.empty(
+            (B, q_len, H, _LATENT_DIM), dtype=out_dtype, device=query.device
+        ).permute(2, 3, 1, 0)
 
-    # LSE: [H, q_len, B] with stride[0]==1 (H dim is contiguous).
-    # torch.empty(B, q_len, H) has row-major strides (q_len*H, H, 1).
-    # After permute(2, 1, 0) → shape [H, q_len, B] with strides (1, H, q_len*H).
-    # Do NOT call .contiguous() — that would make stride[2]=1 instead of stride[0]=1.
+    # LSE: [H, q_len, B] with stride[0]==1 (H dim is contiguous)
     lse_k = torch.empty(
         (B, q_len, H), dtype=torch.float32, device=query.device
-    ).permute(2, 1, 0)  # [H, q_len, B], stride[0]=1
+    ).permute(2, 1, 0)
 
-    # cache_seqs: per-batch sequence lengths
-    cache_seqs = seq_lens.to(torch.int32).contiguous()
+    # cache_seqs: per-batch sequence lengths (skip .to() if already int32)
+    cache_seqs = seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
+    
+    # TOOD: this will trigger a kernel.
+    # block_split_kvs: uniform split_kv for all batches
+    block_split_kvs = torch.full((B,), split_kv, dtype=torch.int32, device=query.device)
 
-    # block_split_kvs: per-batch split_kv values
-    # Compute per-batch split_kv based on actual sequence lengths
-    block_split_kvs = torch.ones(B, dtype=torch.int32, device=query.device) * split_kv
-
-    # Get compiled kernel
-    tensor_api, kernel_cls = _get_compiled_mla_kernel(
+    # Get compiled kernel (cached after first compile)
+    compiled_kernel = _get_compiled_mla_kernel(
         is_fp8=is_fp8,
         page_size=page_size,
         num_heads=H,
         seq_len_q=q_len,
-        is_persistent=is_persistent,
-        is_var_seq=is_var_seq,
-        is_var_split_kv=is_var_split_kv,
+        is_persistent=True,
+        is_var_seq=True,
+        is_var_split_kv=True,
     )
 
     # Call the kernel
-    tensor_api(
+    compiled_kernel(
         q_latent_k,
         q_rope_k,
         c_latent_k,
@@ -376,23 +351,22 @@ def cute_dsl_mla_decode(
         page_table_k,
         o_k,
         lse_k,
-        workspace_bytes.view(torch.uint8),
-        split_kv,
+        workspace_bytes,
+        Int32(split_kv),
         cache_seqs,
         block_split_kvs,
-        softmax_scale,
-        output_scale,
+        Float32(softmax_scale),
+        Float32(output_scale),
     )
 
-    # Reshape output: [H, latent_dim, q_len, B] -> [B, q_len, H, latent_dim]
-    result = o_k.permute(3, 2, 0, 1).contiguous()
+    # If out was provided, kernel already wrote into it — return directly.
+    if out is not None:
+        return out
 
-    # Squeeze q_len dimension if it's 1: [B, 1, H, D] -> [B, H, D]
+    # No out provided: reshape kernel output [H, D, q_len, B] -> [B, (q_len,) H, D]
+    # The permute back is always contiguous because we allocated as [B, q_len, H, D].
+    result = o_k.permute(3, 2, 0, 1)
     if q_len == 1:
         result = result.squeeze(1)
-
-    if out is not None:
-        out.copy_(result)
-        return out
 
     return result
