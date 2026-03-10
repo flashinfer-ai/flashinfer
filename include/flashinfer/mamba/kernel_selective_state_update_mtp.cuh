@@ -483,9 +483,6 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
                      ") for vertical algorithm");
     FLASHINFER_CHECK(params.nheads / params.ngroups <= 32, "HEADS_PER_GROUP (",
                      params.nheads / params.ngroups, ") must be <= 32 for vertical algorithm");
-    FLASHINFER_CHECK(params.ngroups % NUM_GROUPS_PER_CTA == 0, "ngroups (", params.ngroups,
-                     ") must be divisible by NUM_GROUPS_PER_CTA (", NUM_GROUPS_PER_CTA,
-                     ") for vertical algorithm");
     FLASHINFER_CHECK(params.dim % NUM_COMPUTE_WARPS_PER_GROUP == 0, "DIM (", params.dim,
                      ") must be divisible by NUM_COMPUTE_WARPS_PER_GROUP (",
                      NUM_COMPUTE_WARPS_PER_GROUP, ") for vertical algorithm");
@@ -495,12 +492,12 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
       return;
     }
 
-    constexpr int NUM_IN_STAGES = 2;
+    constexpr int NUM_IN_STAGES = 1;
 
     dispatchRatio(
         params, std::integer_sequence<int, 1, 2, 4, 8, 16, 32>{}, [&]<int HEADS_PER_GROUP>() {
-          using sram_t = SharedStorageVertical<input_t, state_t, NTOKENS_MTP, HEADS_PER_GROUP, DIM,
-                                               DSTATE, NUM_IN_STAGES>;
+          using sram_t =
+              SharedStorageVertical<input_t, state_t, NTOKENS_MTP, DIM, DSTATE, NUM_IN_STAGES>;
           constexpr size_t smem_size = sizeof(sram_t);
 
           auto func =
@@ -508,7 +505,9 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
                                                          stateIndex_t, NTOKENS_MTP, DIM, DSTATE,
                                                          HEADS_PER_GROUP, NUM_IN_STAGES>;
 
-          dim3 grid(params.batch, params.ngroups / NUM_GROUPS_PER_CTA);
+          int const total_heads = params.nheads;
+          int const num_chunks = (total_heads + NUM_COMPUTE_GROUPS - 1) / NUM_COMPUTE_GROUPS;
+          dim3 grid(params.batch, num_chunks);
           dim3 block(warpSize, NUM_WARPS);
 
           // state descriptor: tile covers full DIM×DSTATE (used for TMA load only)
