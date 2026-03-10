@@ -3097,7 +3097,7 @@ def mm_mxfp8(
     b_descale: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    use_8x4_sf_layout: bool = True,
+    use_8x4_sf_layout: bool = False,
     backend: Literal["cutlass", "cute-dsl", "trtllm", "auto"] = "auto",
 ) -> torch.Tensor:
     r"""MM MXFP8 (block size 32)
@@ -3130,6 +3130,9 @@ def mm_mxfp8(
 
     out_dtype: torch.dtype
         Output dtype, bf16 or fp16. Defaults to ``torch.bfloat16``.
+
+    use_8x4_sf_layout: bool
+        Whether the scale tensors for a are in 8x4 layout (vs 128x4).
 
     backend: Literal["cutlass", "cute-dsl", "trtllm", "auto"]
         The backend to use for the operation. Defaults to ``"auto"``.
