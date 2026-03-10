@@ -488,11 +488,13 @@ def get_batch_prefill_module(backend, *args):
         maybe_prefix_len_ptr: Optional[torch.Tensor],
         maybe_token_pos_in_items_ptr: Optional[torch.Tensor],
         maybe_max_item_len_ptr: Optional[torch.Tensor],
+        maybe_item_start_ptr: Optional[torch.Tensor],
         logits_soft_cap: float,
         sm_scale: float,
         rope_scale: float,
         rope_theta: float,
         token_pos_in_items_len: int,
+        item_start_len: int,
         scale_q: Optional[torch.Tensor] = None,
         scale_k: Optional[torch.Tensor] = None,
         scale_v: Optional[torch.Tensor] = None,
@@ -522,11 +524,13 @@ def get_batch_prefill_module(backend, *args):
                 maybe_prefix_len_ptr,
                 maybe_token_pos_in_items_ptr,
                 maybe_max_item_len_ptr,
+                maybe_item_start_ptr,
                 logits_soft_cap,
                 sm_scale,
                 1.0 / rope_scale,  # rope_rcp_scale
                 1.0 / rope_theta,  # rope_rcp_theta,
                 token_pos_in_items_len,
+                item_start_len,
             )
         elif is_fp8:
             # FA3 FP8: scale_q, scale_k, scale_v, sm_scale, scale_q_scalar, scale_k_scalar, scale_v_scalar
@@ -579,10 +583,12 @@ def get_batch_prefill_module(backend, *args):
                 maybe_token_pos_in_items_ptr,
                 maybe_max_item_len_ptr,
                 scale_v_tensor,
+                maybe_item_start_ptr,
                 logits_soft_cap,
                 sm_scale,
                 scale_v_scalar,
                 token_pos_in_items_len,
+                item_start_len,
             )
 
         return o
@@ -609,11 +615,13 @@ def get_batch_prefill_module(backend, *args):
         maybe_prefix_len_ptr: Optional[torch.Tensor],
         maybe_token_pos_in_items_ptr: Optional[torch.Tensor],
         maybe_max_item_len_ptr: Optional[torch.Tensor],
+        maybe_item_start_ptr: Optional[torch.Tensor],
         logits_soft_cap: float,
         sm_scale: float,
         rope_scale: float,
         rope_theta: float,
         token_pos_in_items_len: int,
+        item_start_len: int,
     ) -> None:
         pass
 
@@ -653,6 +661,7 @@ def get_batch_prefill_module(backend, *args):
         maybe_prefix_len_ptr: Optional[torch.Tensor],
         maybe_token_pos_in_items_ptr: Optional[torch.Tensor],
         maybe_max_item_len_ptr: Optional[torch.Tensor],
+        maybe_item_start_ptr: Optional[torch.Tensor],
         logits_soft_cap: float,
         sm_scale: float,
         scale_q: Optional[torch.Tensor],
@@ -661,6 +670,7 @@ def get_batch_prefill_module(backend, *args):
         rope_scale: float,
         rope_theta: float,
         token_pos_in_items_len: int,
+        item_start_len: int,
         workspace_size: int,
         num_qo_heads: Optional[int] = None,
         num_kv_heads: Optional[int] = None,
@@ -740,11 +750,13 @@ def get_batch_prefill_module(backend, *args):
                 maybe_prefix_len_ptr,
                 maybe_token_pos_in_items_ptr,
                 maybe_max_item_len_ptr,
+                maybe_item_start_ptr,
                 logits_soft_cap,
                 sm_scale,
                 1.0 / rope_scale,  # rope_rcp_scale
                 1.0 / rope_theta,  # rope_rcp_theta
                 token_pos_in_items_len,
+                item_start_len,
             )
         else:
             scale_v_tensor, scale_v_scalar = _split_scale_param(scale_v)
@@ -770,10 +782,12 @@ def get_batch_prefill_module(backend, *args):
                     maybe_token_pos_in_items_ptr,
                     maybe_max_item_len_ptr,
                     scale_v_tensor,
+                    maybe_item_start_ptr,
                     logits_soft_cap,
                     sm_scale,
                     scale_v_scalar,
                     token_pos_in_items_len,
+                    item_start_len,
                 )
             else:
                 scale_q_tensor, scale_q_scalar = _split_scale_param(scale_q)
@@ -829,6 +843,7 @@ def get_batch_prefill_module(backend, *args):
         maybe_prefix_len_ptr: Optional[torch.Tensor],
         maybe_token_pos_in_items_ptr: Optional[torch.Tensor],
         maybe_max_item_len_ptr: Optional[torch.Tensor],
+        maybe_item_start_ptr: Optional[torch.Tensor],
         logits_soft_cap: float,
         sm_scale: float,
         scale_q: Optional[torch.Tensor],
@@ -837,6 +852,7 @@ def get_batch_prefill_module(backend, *args):
         rope_scale: float,
         rope_theta: float,
         token_pos_in_items_len: int,
+        item_start_len: int,
         workspace_size: int,
         num_qo_heads: Optional[int] = None,
         num_kv_heads: Optional[int] = None,
@@ -1696,6 +1712,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         token_pos_in_items_ptr: Optional[torch.Tensor] = None,
         token_pos_in_items_len: int = 0,
         max_item_len_ptr: Optional[torch.Tensor] = None,
+        item_offsets: Optional[torch.Tensor] = None,
+        item_offsets_len: int = 0,
         seq_lens: Optional[torch.Tensor] = None,
         seq_lens_q: Optional[torch.Tensor] = None,
         block_tables: Optional[torch.Tensor] = None,
@@ -1863,6 +1881,47 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._token_pos_in_items_ptr = token_pos_in_items_ptr
         self._token_pos_in_items_len = token_pos_in_items_len
         self._max_item_len_ptr = max_item_len_ptr
+
+        # V2 MIS: precompute item_start from item_offsets
+        self._item_start_ptr = None
+        self._item_start_len = 0
+        if item_offsets is not None:
+            import torch
+            batch_size = len(prefix_len_ptr) if prefix_len_ptr is not None else 1
+            item_start_list = []
+            max_items_tokens = 0
+            for b in range(batch_size):
+                offsets_b = item_offsets[b * item_offsets_len:(b + 1) * item_offsets_len]
+                # Filter out padding (zeros after the valid offsets)
+                num_offsets = (offsets_b > 0).sum().item() + 1  # +1 for leading 0
+                valid_offsets = offsets_b[:num_offsets].long()
+                # Build per-token item_start
+                total_tokens = valid_offsets[-1].item()
+                max_items_tokens = max(max_items_tokens, total_tokens)
+                item_start_b = torch.zeros(total_tokens, dtype=torch.uint32, device=item_offsets.device)
+                for i in range(num_offsets - 1):
+                    start = valid_offsets[i].item()
+                    end = valid_offsets[i + 1].item()
+                    item_start_b[start:end] = start
+                item_start_list.append(item_start_b)
+            # Pad and concatenate
+            self._item_start_len = max_items_tokens
+            padded = []
+            for ist in item_start_list:
+                if len(ist) < max_items_tokens:
+                    ist = torch.cat([ist, torch.zeros(max_items_tokens - len(ist), dtype=torch.uint32, device=ist.device)])
+                padded.append(ist)
+            self._item_start_ptr = torch.cat(padded).to(item_offsets.device)
+            # Compute max_item_len from offsets
+            if max_item_len_ptr is None:
+                max_lens = []
+                for b in range(batch_size):
+                    offsets_b = item_offsets[b * item_offsets_len:(b + 1) * item_offsets_len]
+                    num_offsets = (offsets_b > 0).sum().item() + 1
+                    valid_offsets = offsets_b[:num_offsets].long()
+                    diffs = valid_offsets[1:] - valid_offsets[:-1]
+                    max_lens.append(diffs.max().item())
+                self._max_item_len_ptr = torch.tensor(max_lens, dtype=torch.uint16, device=item_offsets.device)
 
         # NOTE(Zihao): only required if qo_indptr/paged_kv_indptr are device tensors
         qo_indptr_host = qo_indptr.to("cpu")
@@ -2333,6 +2392,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if self._prefix_len_ptr is not None:
             mask_mode = MaskMode.MULTIITEMSCORING.value
 
+        if self._item_start_ptr is not None:
+            mask_mode = MaskMode.MULTIITEMSCORINGV2.value
+
+
         if self._backend == "cudnn":
             if self._seq_lens_q is not None and self._seq_lens_q.dim() == 1:
                 self._seq_lens_q = self._seq_lens_q.reshape(self._batch_size, 1, 1, 1)
@@ -2413,6 +2476,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     self._prefix_len_ptr,
                     self._token_pos_in_items_ptr,
                     self._max_item_len_ptr,
+                    self._item_start_ptr,
                     logits_soft_cap,
                     sm_scale,
                     fp8_scale_q,
@@ -2421,6 +2485,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     rope_scale,
                     rope_theta,
                     self._token_pos_in_items_len,
+                    self._item_start_len,
                     self._workspace_size,
                     self._num_qo_heads,
                     self._num_kv_heads,
@@ -2774,6 +2839,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         token_pos_in_items_ptr: Optional[torch.Tensor] = None,
         token_pos_in_items_len: int = 0,
         max_item_len_ptr: Optional[torch.Tensor] = None,
+        item_offsets: Optional[torch.Tensor] = None,
+        item_offsets_len: int = 0,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
         seq_lens: Optional[torch.Tensor] = None,
@@ -3004,6 +3071,47 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._seq_lens_kv = seq_lens
         self._max_token_per_sequence = max_token_per_sequence
         self._max_sequence_kv = max_sequence_kv
+
+        # V2 MIS: precompute item_start from item_offsets
+        self._item_start_ptr = None
+        self._item_start_len = 0
+        if item_offsets is not None:
+            import torch
+            batch_size_v2 = len(prefix_len_ptr) if prefix_len_ptr is not None else 1
+            item_start_list = []
+            max_items_tokens = 0
+            for b in range(batch_size_v2):
+                offsets_b = item_offsets[b * item_offsets_len:(b + 1) * item_offsets_len]
+                # Filter out padding (zeros after the valid offsets)
+                num_offsets = (offsets_b > 0).sum().item() + 1  # +1 for leading 0
+                valid_offsets = offsets_b[:num_offsets].long()
+                # Build per-token item_start
+                total_tokens = valid_offsets[-1].item()
+                max_items_tokens = max(max_items_tokens, total_tokens)
+                item_start_b = torch.zeros(total_tokens, dtype=torch.uint32, device=item_offsets.device)
+                for i in range(num_offsets - 1):
+                    start = valid_offsets[i].item()
+                    end = valid_offsets[i + 1].item()
+                    item_start_b[start:end] = start
+                item_start_list.append(item_start_b)
+            # Pad and concatenate
+            self._item_start_len = max_items_tokens
+            padded = []
+            for ist in item_start_list:
+                if len(ist) < max_items_tokens:
+                    ist = torch.cat([ist, torch.zeros(max_items_tokens - len(ist), dtype=torch.uint32, device=ist.device)])
+                padded.append(ist)
+            self._item_start_ptr = torch.cat(padded).to(item_offsets.device)
+            # Compute max_item_len from offsets
+            if max_item_len_ptr is None:
+                max_lens = []
+                for b in range(batch_size_v2):
+                    offsets_b = item_offsets[b * item_offsets_len:(b + 1) * item_offsets_len]
+                    num_offsets = (offsets_b > 0).sum().item() + 1
+                    valid_offsets = offsets_b[:num_offsets].long()
+                    diffs = valid_offsets[1:] - valid_offsets[:-1]
+                    max_lens.append(diffs.max().item())
+                self._max_item_len_ptr = torch.tensor(max_lens, dtype=torch.uint16, device=item_offsets.device)
 
         if self._backend == "cute-dsl":
             if custom_mask is not None or packed_custom_mask is not None:
@@ -3387,6 +3495,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             else:
                 mask_mode = MaskMode.NON_CAUSAL.value
 
+        if self._prefix_len_ptr is not None:
+            mask_mode = MaskMode.MULTIITEMSCORING.value
+
+        if self._item_start_ptr is not None:
+            mask_mode = MaskMode.MULTIITEMSCORINGV2.value
+
         run_args = [
             self._float_workspace_buffer,
             self._int_workspace_buffer,
@@ -3425,11 +3539,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._prefix_len_ptr,
                 self._token_pos_in_items_ptr,
                 self._max_item_len_ptr,
+                self._item_start_ptr,
                 logits_soft_cap,
                 sm_scale,
                 rope_scale,
                 rope_theta,
                 self._token_pos_in_items_len,
+                self._item_start_len,
             ]
             # For FP8, append scale tensors
             if is_float8(q):
