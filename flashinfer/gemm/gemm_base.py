@@ -5242,7 +5242,7 @@ def group_gemm_nvfp4_nt_groupwise(
     Parameters
     ----------
     a: torch.Tensor
-        Row-major input tensor, shape ``(cum_m, k)``, data type is ``torch.float8_e4m3fn`` or ``torch.float8_e5m2``.
+        Row-major input tensor, shape ``(cum_m, k // 2)``, data type is ``torch.uint8`` (packed NVFP4).
         ``cum_m`` is the cumulative sum of the segment lengths.
 
     b: torch.Tensor
@@ -5265,7 +5265,7 @@ def group_gemm_nvfp4_nt_groupwise(
         The tile size for the M dimension, must be 128.
 
     tile_n: int
-        The tile size for the N dimension, must be 64, 128, 192, or 256.
+        The tile size for the N dimension, must be 128.
 
     tile_k: int
         The tile size for the K dimension, must be 128 or 256.
