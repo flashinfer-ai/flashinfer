@@ -341,6 +341,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             raise TypeError(
                 f"Type mismatch: {self.q_dtype} != {self.k_dtype} or {self.q_dtype} != {self.v_dtype}"
             )
+
         # Reinterpret contiguous [B, S_q, H, D] as [H, D, S_q, B]
         # Input stride: (S_q*H*D, H*D, D, 1) → Target: (D, 1, H*D, S_q*H*D)
         def _reinterpret_4d(t):
@@ -3954,9 +3955,7 @@ def run(
         k_ref_paged = torch.cat([c_latent, c_rope], dim=2).reshape(
             batch_size * page_count, page_size, latent_dim + rope_dim
         )
-        v_ref_paged = c_latent.reshape(
-            batch_size * page_count, page_size, latent_dim
-        )
+        v_ref_paged = c_latent.reshape(batch_size * page_count, page_size, latent_dim)
 
         if is_var_seq:
             max_seq_len = torch.max(cache_seqs_ref)

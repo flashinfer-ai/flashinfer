@@ -214,6 +214,7 @@ def _get_compiled_mla_kernel(
 
     return compiled_kernel
 
+
 # TODO: need to tell users the max size of the workspace in the doc, so that they can allocate the workspace_buffer.
 # TODO: how to set split_kv, is_persistent, is_var_seq, is_var_split_kv?
 # TODO: check if page_size setup is right.
@@ -327,16 +328,14 @@ def cute_dsl_mla_decode(
         )
 
     # LSE: contiguous [B, q_len, H]. Kernel reinterprets to [H, q_len, B].
-    lse_k = torch.empty(
-        (B, q_len, H), dtype=torch.float32, device=query.device
-    )
+    lse_k = torch.empty((B, q_len, H), dtype=torch.float32, device=query.device)
 
     # cache_seqs: per-batch sequence lengths (skip .to() if already int32)
     cache_seqs = seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
 
     # block_split_kvs: only needed when is_var_split_kv=True
     if is_var_split_kv:
-        # TODO: this will trigger a kernel. 
+        # TODO: this will trigger a kernel.
         # TODO: need to align with the test in kernel file.
         block_split_kvs = torch.full(
             (B,), split_kv, dtype=torch.int32, device=query.device
