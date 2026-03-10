@@ -296,19 +296,19 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         5. Grid and work scheduling computation
         6. Kernel launch(split KV kernel and reduction kernel) with appropriate parameters
 
-        :param q_latent: The query tensor with shape [num_head, latent_dim, seq_len_q, batch_size]
+        :param q_latent: The query tensor with shape [batch_size, seq_len_q, num_head, latent_dim] (contiguous)
         :type q_latent: cute.Tensor
-        :param q_rope: The query RoPE tensor with shape [num_head, rope_dim, seq_len_q, batch_size]
+        :param q_rope: The query RoPE tensor with shape [batch_size, seq_len_q, num_head, rope_dim] (contiguous)
         :type q_rope: cute.Tensor
-        :param c_latent: The key tensor with shape [seq_len_k, latent_dim, batch_size]
+        :param c_latent: The key tensor with shape [num_pages, page_size, latent_dim] (contiguous)
         :type c_latent: cute.Tensor
-        :param c_rope: The key RoPE tensor with shape [seq_len_k, rope_dim, batch_size]
+        :param c_rope: The key RoPE tensor with shape [num_pages, page_size, rope_dim] (contiguous)
         :type c_rope: cute.Tensor
-        :param page_table: The page table tensor with shape [page_count, batch_size]
+        :param page_table: The page table tensor with shape [batch_size, page_count] (contiguous)
         :type page_table: cute.Tensor
-        :param o: The output tensor with shape [num_head, latent_dim, seq_len_q, batch_size]
+        :param o: The output tensor with shape [batch_size, seq_len_q, num_head, latent_dim] (contiguous)
         :type o: cute.Tensor
-        :param lse: The LSE tensor with shape [num_head, seq_len_q, batch_size]
+        :param lse: The LSE tensor with shape [batch_size, seq_len_q, num_head] (contiguous)
         :type lse: cute.Tensor
         :param workspace: The workspace tensor with 1-d shape prepared for acc_o and acc_lse
         :type workspace: cute.Tensor
@@ -341,15 +341,53 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             raise TypeError(
                 f"Type mismatch: {self.q_dtype} != {self.k_dtype} or {self.q_dtype} != {self.v_dtype}"
             )
-        # check leading dimensions of input/output
-        if cutlass.const_expr(q_latent.stride[1] != 1 or q_rope.stride[1] != 1):
-            raise ValueError("q_latent and q_rope must have leading dimension 1")
-        if cutlass.const_expr(c_latent.stride[1] != 1 or c_rope.stride[1] != 1):
-            raise ValueError("c_latent and c_rope must have leading dimension 1")
-        if cutlass.const_expr(o.stride[1] != 1):
-            raise ValueError("o must have leading dimension 1")
-        if cutlass.const_expr(lse.stride[0] != 1):
-            raise ValueError("lse must have leading dimension 0")
+        # Reinterpret contiguous [B, S_q, H, D] as [H, D, S_q, B]
+        # Input stride: (S_q*H*D, H*D, D, 1) → Target: (D, 1, H*D, S_q*H*D)
+        def _reinterpret_4d(t):
+            return cute.make_tensor(
+                t.iterator,
+                cute.make_layout(
+                    (t.shape[2], t.shape[3], t.shape[1], t.shape[0]),
+                    stride=(t.stride[2], t.stride[3], t.stride[1], t.stride[0]),
+                ),
+            )
+
+        q_latent = _reinterpret_4d(q_latent)
+        q_rope = _reinterpret_4d(q_rope)
+        o = _reinterpret_4d(o)
+
+        # Reinterpret contiguous [num_pages, page_size, D] as [page_size, D, num_pages]
+        # Input stride: (PS*D, D, 1) → Target: (D, 1, PS*D)
+        def _reinterpret_3d_kv(t):
+            return cute.make_tensor(
+                t.iterator,
+                cute.make_layout(
+                    (t.shape[1], t.shape[2], t.shape[0]),
+                    stride=(t.stride[1], t.stride[2], t.stride[0]),
+                ),
+            )
+
+        c_latent = _reinterpret_3d_kv(c_latent)
+        c_rope = _reinterpret_3d_kv(c_rope)
+
+        # Reinterpret contiguous [B, page_count] as [page_count, B]
+        page_table = cute.make_tensor(
+            page_table.iterator,
+            cute.make_layout(
+                (page_table.shape[1], page_table.shape[0]),
+                stride=(page_table.stride[1], page_table.stride[0]),
+            ),
+        )
+
+        # Reinterpret contiguous [B, S_q, H] as [H, S_q, B]
+        # Input stride: (S_q*H, H, 1) → Target: (1, H, S_q*H)
+        lse = cute.make_tensor(
+            lse.iterator,
+            cute.make_layout(
+                (lse.shape[2], lse.shape[1], lse.shape[0]),
+                stride=(lse.stride[2], lse.stride[1], lse.stride[0]),
+            ),
+        )
 
         acc_o, acc_lse = self.initialize_workspace(
             q_latent.shape[0],
@@ -3632,18 +3670,17 @@ def run(
         if seq_len_q is not None:
             shape = (B, seq_len_q, HK, D)
 
-        permute_order = (1, 2, 0)
-        stride_order = (2, 0, 1)
-        leading_dim = 1
+        # Contiguous row-major: last dim has stride 1 (highest stride_order value = fastest)
         if is_lse:
             shape = (B, seq_len_q, HK)
-            permute_order = (2, 1, 0)
-            stride_order = (2, 1, 0)
-            leading_dim = 0
+            leading_dim = 2
+            stride_order = (0, 1, 2)
         elif seq_len_q is not None:
-            permute_order = (2, 3, 1, 0)
-            stride_order = (3, 2, 0, 1)
-            leading_dim = 1
+            leading_dim = 3
+            stride_order = (0, 1, 2, 3)
+        else:
+            leading_dim = 2
+            stride_order = (0, 1, 2)
 
         init_config = cutlass.torch.RandomInitConfig(min_val=-2, max_val=2)
 
@@ -3651,11 +3688,10 @@ def run(
             cutlass_torch.dtype(dtype) if dtype != cutlass.Float8E4M3FN else torch.int8
         )
 
-        # Create dtype torch tensor (cpu)
+        # Create contiguous dtype torch tensor (cpu) — no permute
         torch_tensor_cpu = cutlass_torch.create_and_permute_torch_tensor(
             shape,
             torch_dtype,
-            permute_order=permute_order,
             init_type=cutlass.torch.TensorInitType.RANDOM,
             init_config=init_config,
         )
@@ -3717,9 +3753,9 @@ def run(
         for b in range(batch_size):
             for j in range(page_count):
                 page_table_ref[b, j] = b + j * batch_size
-        page_table_gpu = page_table_ref.permute(1, 0).cuda()
+        page_table_gpu = page_table_ref.cuda()  # contiguous [B, page_count]
         page_table = from_dlpack(page_table_gpu, assumed_align=16).mark_layout_dynamic(
-            leading_dim=0
+            leading_dim=1
         )
         return page_table_ref, page_table, page_table_gpu
 
@@ -3908,16 +3944,17 @@ def run(
         softmax_scale=1.0,
         output_scale=1.0,
     ):
-        # expand and concat q_latent and q_rope to have the dimension of sequence length for q
-        q_ref = torch.cat([q_latent, q_rope], dim=1).permute(3, 2, 0, 1)
-        # expand and concat c_latent and c_rope to have the dimension of num_heads for k and v
+        # Ref tensors are now contiguous:
+        #   q_latent/q_rope: [B, S_q, H, D]
+        #   c_latent/c_rope: [num_pages, page_size, D]
+        # Concat along last dim and reshape for SDPA [B, S_q, H, D_total]
+        q_ref = torch.cat([q_latent, q_rope], dim=3)
+        # KV cache: concat along last dim, already [num_pages, page_size, D_total]
         page_count = page_table_ref.shape[1]
-        k_ref_paged = (
-            torch.cat([c_latent, c_rope], dim=1)
-            .permute(2, 0, 1)
-            .reshape(batch_size * page_count, page_size, latent_dim + rope_dim)
+        k_ref_paged = torch.cat([c_latent, c_rope], dim=2).reshape(
+            batch_size * page_count, page_size, latent_dim + rope_dim
         )
-        v_ref_paged = c_latent.permute(2, 0, 1).reshape(
+        v_ref_paged = c_latent.reshape(
             batch_size * page_count, page_size, latent_dim
         )
 
@@ -3956,9 +3993,9 @@ def run(
         )
 
         lse_ref = s_ref_max * softmax_scale_log2 + torch.log2(s_ref_sum)
-        lse_ref = lse_ref.squeeze(3).permute(2, 1, 0)
+        lse_ref = lse_ref.squeeze(3)  # [B, S_q, H]
         o_ref = o_ref * output_scale
-        o_ref = o_ref.permute(2, 3, 1, 0)
+        # o_ref already [B, S_q, H, D_latent] — matches contiguous output layout
 
         return o_ref, lse_ref
 
@@ -4015,15 +4052,13 @@ def run(
             cute.testing.convert(o, o_fp32)
             o = o_fp32_torch.cpu()
             ref_fp8, _ = cutlass_torch.cute_tensor_like(
-                torch.empty(
-                    *o_ref.permute(3, 2, 0, 1).shape, dtype=torch.uint8
-                ).permute(2, 3, 1, 0),
+                torch.empty(*o_ref.shape, dtype=torch.uint8),
                 out_dtype,
                 is_dynamic_layout=True,
                 assumed_align=16,
             )
             o_ref_gpu = o_ref.cuda()
-            o_ref_f32 = from_dlpack(o_ref_gpu).mark_layout_dynamic(leading_dim=1)
+            o_ref_f32 = from_dlpack(o_ref_gpu).mark_layout_dynamic(leading_dim=3)
 
             # convert ref : f32 -> fp8 -> f32
             cute.testing.convert(o_ref_f32, ref_fp8)

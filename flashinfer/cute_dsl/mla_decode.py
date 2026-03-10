@@ -113,59 +113,60 @@ def _get_compiled_mla_kernel(
     sym_page_count = cute.sym_int()
     sym_workspace_size = cute.sym_int()
 
-    # q_latent: [num_heads, latent_dim, seq_len_q, batch_size] — stride[1]==1
+    # All tensors use contiguous row-major layout (stride_order descending).
+    # The kernel's __call__ reinterprets them to the required layout via
+    # cute.make_tensor zero-cost metadata shuffle.
+
+    # q_latent: [batch_size, seq_len_q, num_heads, latent_dim] — contiguous
+    # make_fake_compact_tensor stride_order: value 0 = fastest (stride=1)
     q_latent_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype,
-        (sym_heads, sym_latent, sym_seq_q, sym_batch),
-        stride_order=(3, 0, 2, 1),
+        (sym_batch, sym_seq_q, sym_heads, sym_latent),
+        stride_order=(3, 2, 1, 0),
         assumed_align=128,
     )
-    # q_rope: [num_heads, rope_dim, seq_len_q, batch_size] — stride[1]==1
+    # q_rope: [batch_size, seq_len_q, num_heads, rope_dim] — contiguous
     q_rope_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype,
-        (sym_heads, sym_rope, sym_seq_q, sym_batch),
-        stride_order=(3, 0, 2, 1),
+        (sym_batch, sym_seq_q, sym_heads, sym_rope),
+        stride_order=(3, 2, 1, 0),
         assumed_align=128,
     )
-    # c_latent: [seq_len_k, latent_dim, kv_batch] — stride[1]==1
+    # c_latent: [kv_batch, seq_len_k, latent_dim] — contiguous
     # kv_batch is a separate sym_int from query batch: paged KV cache uses a flat
-    # pool so kv_batch=1 at runtime, while query batch can be any value.
+    # pool so kv_batch=num_pages at runtime, while query batch can be any value.
     c_latent_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype,
-        (sym_seq_kv, sym_latent, sym_kv_batch),
-        stride_order=(2, 0, 1),
+        (sym_kv_batch, sym_seq_kv, sym_latent),
+        stride_order=(2, 1, 0),
         assumed_align=128,
     )
-    # c_rope: [seq_len_k, rope_dim, kv_batch] — stride[1]==1
+    # c_rope: [kv_batch, seq_len_k, rope_dim] — contiguous
     c_rope_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype,
-        (sym_seq_kv, sym_rope, sym_kv_batch),
-        stride_order=(2, 0, 1),
+        (sym_kv_batch, sym_seq_kv, sym_rope),
+        stride_order=(2, 1, 0),
         assumed_align=128,
     )
-    # page_table: [page_count, batch_size] with stride[0]==1
-    # Matches the original kernel's convention: page_table_ref.permute(1, 0) gives
-    # strides (1, page_count), so dim0(page_count) is the contiguous dimension.
-    # This allows passing block_tables.t() directly without .contiguous().
+    # page_table: [batch_size, page_count] — contiguous
     page_table_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (sym_page_count, sym_batch),
-        stride_order=(0, 1),
+        (sym_batch, sym_page_count),
+        stride_order=(1, 0),
         assumed_align=128,
     )
-    # o: [num_heads, latent_dim, seq_len_q, batch_size] — stride[1]==1
+    # o: [batch_size, seq_len_q, num_heads, latent_dim] — contiguous
     o_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype,
-        (sym_heads, sym_latent, sym_seq_q, sym_batch),
-        stride_order=(3, 0, 2, 1),
+        (sym_batch, sym_seq_q, sym_heads, sym_latent),
+        stride_order=(3, 2, 1, 0),
         assumed_align=128,
     )
-    # lse: [num_heads, seq_len_q, batch_size] — stride[0]==1 (num_heads dim is contiguous)
-    # stride_order[d]=rank: dim0 rank=0 means dim0 is fastest → stride[0]=1 compile-time constant
+    # lse: [batch_size, seq_len_q, num_heads] — contiguous
     lse_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
-        (sym_heads, sym_seq_q, sym_batch),
-        stride_order=(0, 1, 2),
+        (sym_batch, sym_seq_q, sym_heads),
+        stride_order=(2, 1, 0),
         assumed_align=128,
     )
     # workspace: 1-D
@@ -275,22 +276,18 @@ def cute_dsl_mla_decode(
         kv_cache = kv_cache.squeeze(1)
     page_size = kv_cache.shape[1]
 
-    # Split query into latent and rope components and reshape to kernel layout.
-    # [B, q_len, H, D] -> slice -> permute -> [H, D, q_len, B] with stride[1]=1.
-    # Do NOT call .contiguous() — permute gives stride[1]=1 which the kernel requires.
-    q_latent_k = query[..., :kv_lora_rank].permute(2, 3, 1, 0)
-    q_rope_k = query[..., kv_lora_rank:].permute(2, 3, 1, 0)
+    # Split query into latent and rope components — keep contiguous [B, q_len, H, D].
+    # The kernel's __call__ reinterprets to [H, D, q_len, B] via zero-cost make_tensor.
+    q_latent_k = query[..., :kv_lora_rank]
+    q_rope_k = query[..., kv_lora_rank:]
 
-    # Reshape KV cache to kernel layout [page_size, D, num_pages].
-    # The kernel indexes via page_table: c_latent[intra_page_offset, d, physical_page_idx].
-    # After permute: strides = (D_total, 1, page_size*D_total) → stride[1]=1 ✓
-    c_latent_k = kv_cache[:, :, :kv_lora_rank].permute(1, 2, 0)
-    c_rope_k = kv_cache[:, :, kv_lora_rank:].permute(1, 2, 0)
+    # KV cache slices — keep contiguous [num_pages, page_size, D].
+    # The kernel reinterprets to [page_size, D, num_pages] internally.
+    c_latent_k = kv_cache[:, :, :kv_lora_rank]
+    c_rope_k = kv_cache[:, :, kv_lora_rank:]
 
-    # Page table: [B, max_pages] -> [max_pages, B] (view only, no copy needed).
-    # The kernel accepts non-contiguous strides via CuTe layout, matching the original
-    # kernel's convention of page_table_ref.permute(1, 0) without .contiguous().
-    page_table_k = block_tables.permute(1, 0)
+    # Page table: [B, max_pages] — passed directly, kernel reinterprets.
+    page_table_k = block_tables
 
     # Cached split_kv and workspace_size computation
     max_active_blocks = get_num_sm(query.device)
@@ -301,33 +298,28 @@ def cute_dsl_mla_decode(
     # Prepare workspace — slice of contiguous 1D buffer is already contiguous
     workspace_bytes = workspace_buffer[: max(workspace_size, 1)]
 
-    # Output buffer setup: kernel needs [H, D, q_len, B] with stride[1]==1.
-    # If caller provides `out`, reuse it directly via permute to avoid allocation + copy_.
-    #   q_len==1: out [B, H, D] → permute(1,2,0) → [H, D, B] → unsqueeze(2) → [H, D, 1, B]
-    #   q_len >1: out [B, q_len, H, D] → permute(2,3,1,0) → [H, D, q_len, B]
-    # Both give stride[1]=1 ✓, kernel writes directly into out's memory.
+    # Output buffer: contiguous [B, q_len, H, D].
+    # Kernel reinterprets to [H, D, q_len, B] internally via zero-cost make_tensor.
     out_dtype = torch.float8_e4m3fn if is_fp8 else torch.float16
     if out is not None:
         if q_len == 1:
-            o_k = out.permute(1, 2, 0).unsqueeze(2)
+            o_k = out.unsqueeze(1)  # [B, H, D] → [B, 1, H, D]
         else:
-            o_k = out.permute(2, 3, 1, 0)
+            o_k = out
     else:
-        # Allocate as [B, q_len, H, D] so that permute back is already contiguous.
-        # permute(2, 3, 1, 0) → [H, D, q_len, B] with stride[1]=1 ✓
         o_k = torch.empty(
             (B, q_len, H, _LATENT_DIM), dtype=out_dtype, device=query.device
-        ).permute(2, 3, 1, 0)
+        )
 
-    # LSE: [H, q_len, B] with stride[0]==1 (H dim is contiguous)
+    # LSE: contiguous [B, q_len, H]. Kernel reinterprets to [H, q_len, B].
     lse_k = torch.empty(
         (B, q_len, H), dtype=torch.float32, device=query.device
-    ).permute(2, 1, 0)
+    )
 
     # cache_seqs: per-batch sequence lengths (skip .to() if already int32)
     cache_seqs = seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
     
-    # TOOD: this will trigger a kernel.
+    # TOOD: this will trigger a kernel. Need to remove it.
     # block_split_kvs: uniform split_kv for all batches
     block_split_kvs = torch.full((B,), split_kv, dtype=torch.int32, device=query.device)
 
@@ -363,10 +355,7 @@ def cute_dsl_mla_decode(
     if out is not None:
         return out
 
-    # No out provided: reshape kernel output [H, D, q_len, B] -> [B, (q_len,) H, D]
-    # The permute back is always contiguous because we allocated as [B, q_len, H, D].
-    result = o_k.permute(3, 2, 0, 1)
+    # o_k is already [B, q_len, H, D] contiguous — just squeeze for q_len==1.
     if q_len == 1:
-        result = result.squeeze(1)
-
-    return result
+        return o_k.squeeze(1)
+    return o_k
