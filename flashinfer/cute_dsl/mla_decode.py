@@ -264,6 +264,13 @@ def cute_dsl_mla_decode(
     torch.Tensor
         Output tensor [B, H, kv_lora_rank].
     """
+    assert query.dtype in (
+        torch.float16,
+        torch.float8_e4m3fn,
+    ), f"cute_dsl_mla_decode only supports float16 and float8_e4m3fn, got {query.dtype}"
+    assert kv_cache.dtype == query.dtype, (
+        f"kv_cache dtype {kv_cache.dtype} must match query dtype {query.dtype}"
+    )
     B, q_len, H, D_qk = query.shape
     assert D_qk == kv_lora_rank + qk_rope_head_dim
     assert kv_lora_rank == _LATENT_DIM

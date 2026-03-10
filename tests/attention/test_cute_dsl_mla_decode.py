@@ -323,3 +323,91 @@ def test_cute_dsl_mla_decode_via_api(batch_size, seq_len_k, page_size=128):
     )
 
     assert out.shape == (batch_size, num_heads, latent_dim)
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("seq_len_k", [128, 512])
+@pytest.mark.parametrize("page_size", [128])
+def test_cute_dsl_mla_decode_fp8(batch_size, seq_len_k, page_size):
+    """Test FP8 MLA decode kernel against FP32 reference."""
+    skip_if_unsupported()
+
+    from flashinfer.cute_dsl.mla_decode import cute_dsl_mla_decode
+
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+
+    num_heads = 128
+    latent_dim = 512
+    rope_dim = 64
+    q_len = 1
+    softmax_scale = 1.0 / (latent_dim**0.5)
+    output_scale = 1.0
+    D_qk = latent_dim + rope_dim
+
+    # Create FP8 query and KV cache (cast from small-valued FP16 to stay in FP8 range)
+    query = (
+        torch.randn(
+            batch_size, q_len, num_heads, D_qk, dtype=torch.float16, device=device
+        )
+        * 0.1
+    ).to(torch.float8_e4m3fn)
+
+    num_pages_per_batch = (seq_len_k + page_size - 1) // page_size
+    total_pages = num_pages_per_batch * batch_size + 10
+    kv_cache = (
+        torch.randn(total_pages, page_size, D_qk, dtype=torch.float16, device=device)
+        * 0.1
+    ).to(torch.float8_e4m3fn)
+
+    block_tables = torch.zeros(
+        batch_size, num_pages_per_batch, dtype=torch.int32, device=device
+    )
+    for b in range(batch_size):
+        for p in range(num_pages_per_batch):
+            block_tables[b, p] = b * num_pages_per_batch + p
+
+    seq_lens = torch.full((batch_size,), seq_len_k, dtype=torch.int32, device=device)
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
+
+    out = cute_dsl_mla_decode(
+        query=query,
+        kv_cache=kv_cache,
+        workspace_buffer=workspace_buffer,
+        kv_lora_rank=latent_dim,
+        qk_rope_head_dim=rope_dim,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=seq_len_k,
+        softmax_scale=softmax_scale,
+        output_scale=output_scale,
+    )
+
+    assert out.dtype == torch.float8_e4m3fn
+    assert out.shape == (batch_size, num_heads, latent_dim)
+
+    # Reference: compute in FP32 using FP8 values dequantized to FP32
+    kv_flat = kv_cache.reshape(-1, D_qk).to(torch.float32)
+    c_latent_ref = kv_flat[:, :latent_dim]
+    c_rope_ref = kv_flat[:, latent_dim:]
+    q_nope = query[..., :latent_dim].to(torch.float32)
+    q_rope_tensor = query[..., latent_dim:].to(torch.float32)
+
+    ref_out = torch_reference_mla(
+        q_nope,
+        q_rope_tensor,
+        c_latent_ref,
+        c_rope_ref,
+        block_tables,
+        seq_lens,
+        softmax_scale,
+        output_scale,
+        page_size,
+    )
+    if q_len == 1:
+        ref_out = ref_out.squeeze(1)
+
+    # Compare outputs in FP32; FP8 has limited precision so use wider tolerance
+    torch.testing.assert_close(
+        out.to(torch.float32), ref_out.to(torch.float32), atol=0.1, rtol=0.1
+    )
