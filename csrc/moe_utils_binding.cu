@@ -329,6 +329,14 @@ void moe_sort(
   routingData.mLocalExpertsStrideLog2 = 0;
   routingData.mNumLocalExperts = num_local_experts;
 
+  // Fused shared expert fields — unused in cute DSL moe_sort path, but must be zero-initialized
+  // because the routing kernel reads mNumFusedSharedExperts unconditionally (adds it to numExperts
+  // and topK at lines 576-577 of trtllm_fused_moe_routing_deepseek.cu).
+  routingData.mNumFusedSharedExperts = 0;
+  routingData.mSharedExpertTokenOffset = 0;
+  routingData.mSharedExpertNumTokens = 0;
+  routingData.mTotalExpertsPerToken = top_k;
+
   // DeepSeekV3 specific parameters
   // For moe_sort, we use n_group=1, topk_group=1 since experts are already selected
   routingData.mNumExpertGroups = 1;
