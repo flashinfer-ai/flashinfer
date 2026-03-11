@@ -73,7 +73,8 @@ def test_fp4_quantize_unaligned_m_non_swizzled(
     out_ref, scale_ref = ref_fp4_quant(x, global_scale, sf_vec_size)
     out_ans = cast_from_fp4(out_val).reshape(m, n)
     out_scale = out_sf.view(torch.float8_e4m3fn).to(torch.float32)
-    torch.testing.assert_close(out_ans, out_ref, rtol=1e0, atol=1e-1)
+    # atol=0.5 accounts for FP4 E2M1 rounding at the 0/0.5 boundary
+    torch.testing.assert_close(out_ans, out_ref, rtol=1e0, atol=5e-1)
     torch.testing.assert_close(out_scale, scale_ref, rtol=1e-1, atol=1e-1)
 
 
