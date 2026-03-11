@@ -103,6 +103,18 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
         }
       }
     }  // end if (validToken)
+  } else if (params.mPtrTopKPacked != nullptr) {
+    if (validToken) {
+      if (laneIdx < params.mTopK) {
+        int offset = warpIdx * MaxNumExperts +
+                     static_cast<int>(params.mPtrTopKPacked[warpIdx * params.mTopK + laneIdx].idx);
+        smemKIdx[offset] = static_cast<int8_t>(laneIdx);
+        if (params.mPtrTopKWeights != nullptr) {
+          params.mPtrTopKWeights[warpIdx * params.mTopK + laneIdx] =
+              static_cast<OutputT>(params.mPtrTopKPacked[warpIdx * params.mTopK + laneIdx].score);
+        }
+      }
+    }
   }
   __syncthreads();
 

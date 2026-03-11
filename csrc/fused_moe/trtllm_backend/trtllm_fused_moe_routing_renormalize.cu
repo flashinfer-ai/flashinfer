@@ -53,7 +53,8 @@ void run(Data const& data, void* stream) {
   FLASHINFER_CHECK(data.mNumExperts % 4 == 0,
                    "Routing kernel expects #experts %d to be a multiple of 4.", data.mNumExperts);
 
-  bool const useSingleBlock = data.mNumTokens <= BlockKernelMaxNumTokens;
+  bool const useSingleBlock =
+      data.mNumTokens <= BlockKernelMaxNumTokens && data.mPtrTopKPacked == nullptr;
 
   bool const useSingleCluster =
       data.mNumTokens <= ((data.mPtrScores != nullptr || data.mPtrTopKIds != nullptr)
