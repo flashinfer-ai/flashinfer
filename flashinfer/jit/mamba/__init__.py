@@ -16,10 +16,12 @@ limitations under the License.
 
 from .selective_state_update import (
     gen_selective_state_update_module,
+    gen_selective_state_update_sm100_module,
     gen_selective_state_update_sm90_module,
 )
 
 __all__ = [
     "gen_selective_state_update_module",
     "gen_selective_state_update_sm90_module",
+    "gen_selective_state_update_sm100_module",
 ]

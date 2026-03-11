@@ -1472,3 +1472,129 @@ class TestSelectiveStateUpdateMTPVerticalStochasticRounding(
             rand_seed=self.RAND_SEED,
             algorithm="vertical",
         )
+
+
+class TestSelectiveStateUpdateMTPVerticalDisableStateUpdate(
+    TestSelectiveStateUpdateMTPDisableStateUpdate
+):
+    """Test vertical algorithm with disable_state_update=True."""
+
+    def run_kernel(self, inputs, out=None, disable_state_update=False):
+        return flashinfer.mamba.selective_state_update(
+            inputs["state_cache"],
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            D=inputs["D"],
+            z=inputs.get("z"),
+            dt_bias=inputs["dt_bias"],
+            dt_softplus=True,
+            state_batch_indices=inputs["slot_idx"],
+            pad_slot_id=-1,
+            out=out,
+            disable_state_update=disable_state_update,
+            algorithm="vertical",
+        )
+
+
+class TestSelectiveStateUpdateMTPVerticalNonContiguous(
+    TestSelectiveStateUpdateMTPNonContiguous
+):
+    """Test vertical algorithm with non-contiguous state cache."""
+
+    def run_kernel(self, inputs, out=None, disable_state_update=False):
+        return flashinfer.mamba.selective_state_update(
+            inputs["state_cache"],
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            D=inputs["D"],
+            z=inputs.get("z"),
+            dt_bias=inputs["dt_bias"],
+            dt_softplus=True,
+            state_batch_indices=inputs["slot_idx"],
+            pad_slot_id=-1,
+            out=out,
+            disable_state_update=disable_state_update,
+            algorithm="vertical",
+        )
+
+
+class TestSelectiveStateUpdateMTPVerticalInt32Indices(
+    TestSelectiveStateUpdateMTPInt32Indices
+):
+    """Test vertical algorithm with int32 state_batch_indices."""
+
+    def run_kernel(self, inputs, out=None, disable_state_update=False):
+        slot_idx_int32 = inputs["slot_idx"].to(torch.int32)
+        return flashinfer.mamba.selective_state_update(
+            inputs["state_cache"],
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            D=inputs["D"],
+            z=inputs.get("z"),
+            dt_bias=inputs["dt_bias"],
+            dt_softplus=True,
+            state_batch_indices=slot_idx_int32,
+            pad_slot_id=-1,
+            out=out,
+            disable_state_update=disable_state_update,
+            algorithm="vertical",
+        )
+
+
+class TestSelectiveStateUpdateMTPVerticalVariousNgroups(
+    TestSelectiveStateUpdateMTPVariousNgroups
+):
+    """Test vertical algorithm with various ngroups values."""
+
+    def run_kernel(self, inputs, out=None, disable_state_update=False):
+        return flashinfer.mamba.selective_state_update(
+            inputs["state_cache"],
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            D=inputs["D"],
+            z=inputs.get("z"),
+            dt_bias=inputs["dt_bias"],
+            dt_softplus=True,
+            state_batch_indices=inputs["slot_idx"],
+            pad_slot_id=-1,
+            out=out,
+            disable_state_update=disable_state_update,
+            algorithm="vertical",
+        )
+
+
+class TestSelectiveStateUpdateMTPVerticalLargeBatch(
+    TestSelectiveStateUpdateMTPLargeBatch
+):
+    """Test vertical algorithm with larger batch sizes."""
+
+    def run_kernel(self, inputs, out=None, disable_state_update=False):
+        return flashinfer.mamba.selective_state_update(
+            inputs["state_cache"],
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            D=inputs["D"],
+            z=inputs.get("z"),
+            dt_bias=inputs["dt_bias"],
+            dt_softplus=True,
+            state_batch_indices=inputs["slot_idx"],
+            pad_slot_id=-1,
+            out=out,
+            disable_state_update=disable_state_update,
+            algorithm="vertical",
+        )

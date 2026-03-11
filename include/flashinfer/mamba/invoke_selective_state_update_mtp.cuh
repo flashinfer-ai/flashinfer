@@ -12,7 +12,9 @@
 #include "conversion.cuh"
 #include "create_tensor_map.cuh"
 #include "kernel_selective_state_update_mtp_simple.cuh"
+#ifdef FLASHINFER_MAMBA_ENABLE_SM100
 #include "kernel_selective_state_update_mtp_vertical.cuh"
+#endif
 
 namespace flashinfer::mamba::mtp {
 
@@ -33,6 +35,15 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
                    "MTP selective_state_update only supports 'auto', 'simple', or 'vertical' "
                    "algorithm, got ",
                    static_cast<int32_t>(algorithm));
+  // ── Auto algorithm selection ──────────────────────────────────────────────
+  if (algorithm == SSUAlgorithm::kAuto) {
+#ifdef FLASHINFER_MAMBA_ENABLE_SM100
+    algorithm = (params.batch >= 32) ? SSUAlgorithm::kVertical : SSUAlgorithm::kSimple;
+#else
+    algorithm = SSUAlgorithm::kSimple;
+#endif
+  }
+
   // Common alignment checks for all kernels
   check_ptr_alignment_input_vars<input_t>(params);
 
@@ -43,13 +54,22 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
   FLASHINFER_CHECK((params.dim * params.dstate * sizeof(state_t)) % sizeof(load_state_t) == 0,
                    "state head stride must be aligned to ", sizeof(load_state_t), " bytes");
 
-  // ── Vertical MTP kernel ──────────────────────────────────────────────────
+  // Output pointer alignment (both kernels do vectorized stores)
+  constexpr auto outputLoadSize = getVectorLoadSizeForFullUtilization<input_t, DIM>();
+  using load_output_t = PackedAligned<input_t, outputLoadSize>;
+  FLASHINFER_CHECK_ALIGNMENT(params.output, sizeof(load_output_t));
+
+  // Intermediate states pointer alignment (vectorized stores in both kernels)
+  if (params.intermediate_states) {
+    FLASHINFER_CHECK_ALIGNMENT(params.intermediate_states, sizeof(load_state_t));
+  }
+
+  // ── Vertical MTP kernel (SM100+ only) ────────────────────────────────────
+#ifdef FLASHINFER_MAMBA_ENABLE_SM100
   if (algorithm == SSUAlgorithm::kVertical) {
     FLASHINFER_CHECK(params.nheads % params.ngroups == 0, "nheads (", params.nheads,
                      ") must be divisible by ngroups (", params.ngroups,
                      ") for vertical algorithm");
-    FLASHINFER_CHECK(params.nheads / params.ngroups <= 32, "HEADS_PER_GROUP (",
-                     params.nheads / params.ngroups, ") must be <= 32 for vertical algorithm");
     FLASHINFER_CHECK(params.dim % NUM_COMPUTE_WARPS_PER_GROUP == 0, "DIM (", params.dim,
                      ") must be divisible by NUM_COMPUTE_WARPS_PER_GROUP (",
                      NUM_COMPUTE_WARPS_PER_GROUP, ") for vertical algorithm");
@@ -61,7 +81,7 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
     constexpr int NUM_IN_STAGES = 1;
 
     dispatchRatio(
-        params, std::integer_sequence<int, 1, 2, 4, 8, 16, 32>{}, [&]<int HEADS_PER_GROUP>() {
+        params, std::integer_sequence<int, 1, 2, 4, 8, 16, 32, 64>{}, [&]<int HEADS_PER_GROUP>() {
           using sram_t =
               SharedStorageVertical<input_t, state_t, NTOKENS_MTP, DIM, DSTATE, NUM_IN_STAGES>;
           constexpr size_t smem_size = sizeof(sram_t);
@@ -115,6 +135,11 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
         });
     return;
   }
+#else
+  FLASHINFER_CHECK(algorithm != SSUAlgorithm::kVertical,
+                   "vertical MTP algorithm requires SM100+ (Blackwell); "
+                   "recompile with FLASHINFER_MAMBA_ENABLE_SM100");
+#endif
 
   // ── Simple MTP kernel ────────────────────────────────────────────────────
   constexpr int numWarps = 4;

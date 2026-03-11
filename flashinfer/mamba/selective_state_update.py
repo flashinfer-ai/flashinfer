@@ -22,6 +22,7 @@ import torch
 from ..api_logging import flashinfer_api
 from ..jit.mamba import (
     gen_selective_state_update_module,
+    gen_selective_state_update_sm100_module,
     gen_selective_state_update_sm90_module,
 )
 from ..utils import get_compute_capability, register_custom_op, register_fake_op
@@ -53,7 +54,9 @@ def _get_module(
         ntokens_mtp,
         philox_rounds,
     )
-    if sm_major >= 9:
+    if sm_major >= 10:
+        return gen_selective_state_update_sm100_module(*args).build_and_load()
+    elif sm_major >= 9:
         return gen_selective_state_update_sm90_module(*args).build_and_load()
     else:
         return gen_selective_state_update_module(*args).build_and_load()

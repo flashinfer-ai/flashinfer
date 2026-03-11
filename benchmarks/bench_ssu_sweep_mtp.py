@@ -87,7 +87,7 @@ def benchmark_kernel(name, kernel_fn, inputs, cache_steps=0, ncu=False):
     if ncu:
         kernel_fn(**kwargs)
         torch.cuda.synchronize()
-        print(f"    Single invocation done (ncu mode)")
+        print("    Single invocation done (ncu mode)")
         return 0.0
 
     try:
@@ -221,6 +221,7 @@ def run_measurement(
         "triton_reference": make_triton_wrapper(),
         "flashinfer_simple": make_flashinfer_wrapper(algorithm="simple"),
         "flashinfer_vertical": make_flashinfer_wrapper(algorithm="vertical"),
+        "flashinfer_auto": make_flashinfer_wrapper(algorithm="auto"),
     }
 
     results = {}
@@ -258,13 +259,25 @@ parser.add_argument(
     default=None,
     help="Output image file path (default: auto-generated in benchmarks/img/)",
 )
+parser.add_argument(
+    "--dtype",
+    type=str,
+    nargs="+",
+    default=["bf16", "f32"],
+    choices=["bf16", "f16", "f32"],
+    help="State dtype(s) to benchmark (default: bf16 f32)",
+)
 args = parser.parse_args()
 
 # Powers of two from 1 to 2048
 batch_sizes = args.batch if args.batch is not None else [2**i for i in range(12)]
 
-state_dtype_name = "bf16"
-state_dtype_torch = torch.bfloat16
+_dtype_name_to_torch = {
+    "bf16": torch.bfloat16,
+    "f16": torch.float16,
+    "f32": torch.float32,
+}
+state_dtypes = [(name, _dtype_name_to_torch[name]) for name in args.dtype]
 mtp_value = 6
 
 all_results = []
@@ -273,39 +286,43 @@ print("=" * 80)
 print("COLLECTING BENCHMARK RESULTS (MTP ENABLED)")
 print("=" * 80)
 print(f"Batch sizes to test: {batch_sizes}")
-print(f"State dtype: {state_dtype_name}")
+print(f"State dtypes: {[name for name, _ in state_dtypes]}")
 print(f"MTP (cache_steps): {mtp_value}")
 if args.ncu:
     print("NCU mode: single invocation, no warmup/timing")
 print("=" * 80)
 
-for batch_size in batch_sizes:
-    print(f"\n  Running benchmark for batch_size={batch_size}, mtp={mtp_value}")
-
-    results = run_measurement(
-        batch_size=batch_size,
-        nheads=64,
-        dim=64,
-        ngroups=8,
-        dstate=128,
-        state_dtype=state_dtype_torch,
-        mtp=mtp_value,
-        generate_intermediate_states_buffer=True,
-        ncu=args.ncu,
-    )
-
-    if not results:
-        print(f"  Warning: No results returned for batch_size={batch_size}")
-        continue
-
-    for kernel_name, avg_time in results.items():
-        all_results.append(
-            {
-                "batch_size": batch_size,
-                "kernel": kernel_name,
-                "avg_time_ms": avg_time,
-            }
+for state_dtype_name, state_dtype_torch in state_dtypes:
+    for batch_size in batch_sizes:
+        print(
+            f"\n  Running benchmark for batch_size={batch_size}, state_dtype={state_dtype_name}, mtp={mtp_value}"
         )
+
+        results = run_measurement(
+            batch_size=batch_size,
+            nheads=64,
+            dim=64,
+            ngroups=8,
+            dstate=128,
+            state_dtype=state_dtype_torch,
+            mtp=mtp_value,
+            generate_intermediate_states_buffer=True,
+            ncu=args.ncu,
+        )
+
+        if not results:
+            print(f"  Warning: No results returned for batch_size={batch_size}")
+            continue
+
+        for kernel_name, avg_time in results.items():
+            all_results.append(
+                {
+                    "batch_size": batch_size,
+                    "state_dtype": state_dtype_name,
+                    "kernel": kernel_name,
+                    "avg_time_ms": avg_time,
+                }
+            )
 
 # Create DataFrame
 df = pd.DataFrame(all_results)
@@ -323,69 +340,79 @@ else:
         torch.cuda.get_device_name(0) if torch.cuda.is_available() else "Unknown GPU"
     )
     print(f"\nGPU: {gpu_name}")
-    print(f"State dtype: {state_dtype_name}")
+    print(f"State dtypes: {[name for name, _ in state_dtypes]}")
     print(f"MTP (cache_steps): {mtp_value}")
 
-    df_pivot = df.pivot(index="batch_size", columns="kernel", values="avg_time_ms")
+    unique_dtypes = df["state_dtype"].unique()
+    num_dtypes = len(unique_dtypes)
+    fig, axes = plt.subplots(1, num_dtypes, figsize=(10 * num_dtypes, 5), squeeze=False)
 
-    print(f"\nAverage execution time (ms) by batch size and kernel:")
-    print(df_pivot.to_csv())
-
-    # Create the plot
-    fig, ax = plt.subplots(figsize=(10, 5))
-
-    baseline_col = "triton_reference"
-
-    prop_cycle = plt.rcParams["axes.prop_cycle"]
-    default_colors = prop_cycle.by_key()["color"]
-
-    df_plot = df_pivot.reset_index()
-
-    speedup_columns = [
-        col for col in df_plot.columns if col != "batch_size" and col != baseline_col
-    ]
-
-    x_ticks = df_plot["batch_size"].values
-    x_tick_labels = [f"{x}" for x in x_ticks]
-
-    num_speedup_cols = len(speedup_columns)
-    x_positions = np.arange(len(df_plot["batch_size"]))
-    bar_width = 0.8 / max(num_speedup_cols, 1)
-
-    for idx, col in enumerate(speedup_columns):
-        if baseline_col not in df_plot.columns or col not in df_plot.columns:
-            continue
-        speedup = df_plot[baseline_col] / df_plot[col]
-        offset = (idx - num_speedup_cols / 2 + 0.5) * bar_width
-        bars = ax.bar(
-            x_positions + offset,
-            speedup,
-            bar_width,
-            color=default_colors[idx % len(default_colors)],
-            label=col,
-            alpha=0.7,
+    for dtype_idx, dtype_name in enumerate(unique_dtypes):
+        df_dtype = df[df["state_dtype"] == dtype_name]
+        df_pivot = df_dtype.pivot(
+            index="batch_size", columns="kernel", values="avg_time_ms"
         )
-        for bar, y in zip(bars, speedup):
-            ax.text(
-                bar.get_x() + bar.get_width() / 2,
-                y,
-                f"{y:.2f}",
-                ha="center",
-                va="bottom",
-                fontsize=7,
-                rotation=0,
-            )
 
-    ax.set_xlabel("Batch Size")
-    ax.set_ylabel("Speedup factor")
-    ax.set_xticks(x_positions)
-    ax.set_xticklabels(x_tick_labels)
-    ax.grid(True, alpha=0.3, axis="y")
-    ax.set_title(
-        rf"State dtype: {state_dtype_name}, MTP={mtp_value} — Speedup = Runtime$_{{triton}}$ / Runtime$_{{flashinfer}}$"
-    )
-    ax.set_ylim([0, None])
-    ax.legend(loc="best", fontsize=8)
+        print(
+            f"\nAverage execution time (ms) by batch size and kernel (state_dtype={dtype_name}):"
+        )
+        print(df_pivot.to_csv())
+
+        ax = axes[0, dtype_idx]
+        baseline_col = "triton_reference"
+
+        prop_cycle = plt.rcParams["axes.prop_cycle"]
+        default_colors = prop_cycle.by_key()["color"]
+
+        df_plot = df_pivot.reset_index()
+
+        speedup_columns = [
+            col
+            for col in df_plot.columns
+            if col != "batch_size" and col != baseline_col
+        ]
+
+        x_ticks = df_plot["batch_size"].values
+        x_tick_labels = [f"{x}" for x in x_ticks]
+
+        num_speedup_cols = len(speedup_columns)
+        x_positions = np.arange(len(df_plot["batch_size"]))
+        bar_width = 0.8 / max(num_speedup_cols, 1)
+
+        for idx, col in enumerate(speedup_columns):
+            if baseline_col not in df_plot.columns or col not in df_plot.columns:
+                continue
+            speedup = df_plot[baseline_col] / df_plot[col]
+            offset = (idx - num_speedup_cols / 2 + 0.5) * bar_width
+            bars = ax.bar(
+                x_positions + offset,
+                speedup,
+                bar_width,
+                color=default_colors[idx % len(default_colors)],
+                label=col,
+                alpha=0.7,
+            )
+            for bar, y in zip(bars, speedup, strict=True):
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    y,
+                    f"{y:.2f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=7,
+                    rotation=0,
+                )
+
+        ax.set_xlabel("Batch Size")
+        ax.set_ylabel("Speedup factor")
+        ax.set_xticks(x_positions)
+        ax.set_xticklabels(x_tick_labels)
+        ax.grid(True, alpha=0.3, axis="y")
+        ax.set_title(
+            rf"State dtype: {dtype_name}, MTP={mtp_value} — Speedup = Runtime$_{{triton}}$ / Runtime$_{{flashinfer}}$"
+        )
+        ax.set_ylim([0, None])
+        ax.legend(loc="best", fontsize=8)
 
     fig.suptitle(
         f"Selective State Update Benchmark (MTP={mtp_value}) [{gpu_name}]",
@@ -399,7 +426,10 @@ else:
         output_path.parent.mkdir(parents=True, exist_ok=True)
     else:
         gpu_name_clean = gpu_name.replace(" ", "_").replace("/", "_")
-        output_filename = f"runtime_vs_batch_size_mtp{mtp_value}_{gpu_name_clean}.png"
+        dtype_str = "_".join(name for name, _ in state_dtypes)
+        output_filename = (
+            f"runtime_vs_batch_size_mtp{mtp_value}_{dtype_str}_{gpu_name_clean}.png"
+        )
         img_dir = Path(__file__).parent / "img"
         img_dir.mkdir(exist_ok=True)
         output_path = img_dir / output_filename
