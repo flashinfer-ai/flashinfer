@@ -1,4 +1,5 @@
 import math
+from typing import Union
 
 import pytest
 import torch
@@ -210,6 +211,34 @@ def create_page_table(batch_size: int, seq_lens: torch.Tensor, page_size: int):
         ]
         page_id += num_pages_needed
     return page_tables, all_page_ids, page_per_seq
+
+
+def prepare_paged_kv_for_kernel(
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    uses_shared_paged_kv_idx: bool,
+) -> tuple[Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]], torch.Tensor]:
+    """Convert shared-page KV cache layout to separate-page layout for TRT-LLM.
+
+    When uses_shared_paged_kv_idx is True (FlashInfer/vLLM style), returns the
+    original tensors unchanged.
+
+    When False (TRT-LLM style), reshapes [num_pages, 2, ...] -> [num_pages*2, ...]
+    so original page p becomes K at index 2*p and V at 2*p+1, and builds a
+    [batch_size, 2, maxPages] page table where dim 1 distinguishes K (0) and V (1).
+    Returns the reshaped cache as a (cache, cache) tuple so both K and V share
+    the same base pointer.
+
+    Returns:
+        (kv_cache_arg, page_table) ready to pass to the trtllm kernel call.
+    """
+    if uses_shared_paged_kv_idx:
+        return kv_cache, page_table
+
+    num_pages = kv_cache.shape[0]
+    reshaped_cache = kv_cache.reshape(num_pages * 2, *kv_cache.shape[2:])
+    trtllm_page_table = torch.stack([2 * page_table, 2 * page_table + 1], dim=1)
+    return (reshaped_cache, reshaped_cache), trtllm_page_table
 
 
 def flatten_paged_kv(
@@ -475,19 +504,9 @@ def _test_trtllm_batch_prefill(
     kv_indptr = generate_cumsum_lens(page_per_seq)
     kv_last_page_len = get_last_page_len(seq_lens, page_size)
 
-    # When K and V use separate page indices, fold the interleaved KV dim into
-    # the page count so the kernel sees independent K/V pages in one pool.
-    # Reshape [num_pages, 2, ...] -> [num_pages*2, ...] so original page p
-    # becomes K at index 2*p and V at 2*p+1. The page table goes from
-    # [batch_size, maxPages] to [batch_size, 2, maxPages] where dim 1
-    # distinguishes K (0) and V (1) indices.
-    if not uses_shared_paged_kv_idx:
-        num_pages = kv_cache.shape[0]
-        kv_cache_kernel = kv_cache.reshape(num_pages * 2, *kv_cache.shape[2:])
-        page_table_kernel = torch.stack([2 * page_table, 2 * page_table + 1], dim=1)
-    else:
-        kv_cache_kernel = kv_cache
-        page_table_kernel = page_table
+    kv_cache_kernel, page_table_kernel = prepare_paged_kv_for_kernel(
+        kv_cache, page_table, uses_shared_paged_kv_idx
+    )
 
     workspace_buffer, workspace_buffer_ref = create_workspace_buffers(GPU_DEVICE)
 
@@ -574,14 +593,9 @@ def _test_trtllm_batch_prefill(
     # Using a tiny threshold should give the same result as normal attention.
     skip_softmax_threshold_scale_factor = 1e-30 if skips_softmax else None
 
-    kv_cache_arg = (
-        (kv_cache_kernel, kv_cache_kernel)
-        if not uses_shared_paged_kv_idx
-        else kv_cache_kernel
-    )
     output = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
         q_input,
-        kv_cache_arg,
+        kv_cache_kernel,
         workspace_buffer,
         page_table_kernel,
         seq_lens.to(GPU_DEVICE),
