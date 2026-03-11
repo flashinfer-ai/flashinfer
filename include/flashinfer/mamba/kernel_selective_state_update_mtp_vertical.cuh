@@ -178,23 +178,24 @@ __device__ __forceinline__ void role_update_state(SramT& sram, int lane, int com
   auto const icache_idx =
       intermediate_state_indices ? (int64_t)intermediate_state_indices[batch] : state_batch;
 
-  // Wait for B/C to be loaded
-  sram.bar_BC_full.wait(sram.bar_BC_full.arrive());
+  // Issue scalar gmem loads early so their latency overlaps with barrier waits below.
+  float const A_val = toFloat(A_ptr[head]);
+  float const D_val = D_ptr ? toFloat(D_ptr[head]) : 0.f;
+  float const dt_bias_val = dt_bias_ptr ? toFloat(dt_bias_ptr[head]) : 0.f;
 
   // Pre-arrive: unblock load warp for state_in
   for (int s = 0; s < NUM_IN_STAGES; s++) {
     sram.bar_state_in_empty[s].arrive();
   }
 
+  // Wait for B/C to be loaded
+  sram.bar_BC_full.wait(sram.bar_BC_full.arrive());
+
   constexpr int in_slot = 0;  // single head, single slot
 
-  // Pre-load A, D scalars from gmem
-  float const A_val = toFloat(A_ptr[head]);
-  float const D_val = D_ptr ? toFloat(D_ptr[head]) : 0.f;
-
-  // Load dt values — distributed across compute warps
+  // Load dt values into smem — distributed across compute warps.
+  // A_val, D_val, dt_bias_val are already in registers (loaded above).
   {
-    float const dt_bias_val = dt_bias_ptr ? toFloat(dt_bias_ptr[head]) : 0.f;
     for (int step = compute_warp; step < NTOKENS; step += NUM_COMPUTE_WARPS_PER_GROUP) {
       if (lane == 0) {
         float dt_val =
