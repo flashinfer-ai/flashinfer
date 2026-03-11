@@ -2611,7 +2611,6 @@ def run_moe_test(
 
     # Validation checks
     assert top_k <= num_experts
-    assert top_k <= 22
     if (top_k_groups is not None) and (n_groups is not None) and (n_groups > 0):
         assert top_k_groups <= 4
         assert num_experts > n_groups
