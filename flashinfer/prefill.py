@@ -232,6 +232,7 @@ def get_trtllm_gen_prefill_module():
         out: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        uses_shared_paged_kv_idx: bool = True,
     ) -> torch.Tensor:
         sm_count = get_device_sm_count(query.device)
         if out is None:
@@ -266,6 +267,7 @@ def get_trtllm_gen_prefill_module():
             workspace_size,
             sinks,
             skip_softmax_threshold_scale_factor,
+            uses_shared_paged_kv_idx,
         )
         return out
 
@@ -634,6 +636,7 @@ def get_batch_prefill_module(backend, *args):
         cum_seq_lens_kv: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        uses_shared_paged_kv_idx: bool = True,
     ) -> None:
         if backend == "trtllm-gen":
             assert maybe_lse is None
@@ -668,6 +671,7 @@ def get_batch_prefill_module(backend, *args):
                 out=o,
                 sinks=sinks,
                 skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+                uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
             )
         elif backend == "fa2":
             assert not is_float8(q)
@@ -804,6 +808,7 @@ def get_batch_prefill_module(backend, *args):
         cum_seq_lens_kv: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        uses_shared_paged_kv_idx: bool = True,
     ) -> None:
         pass
 
@@ -2047,6 +2052,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         window_left: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        uses_shared_paged_kv_idx: bool = True,
     ) -> torch.Tensor: ...
 
     @overload
@@ -2064,6 +2070,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         window_left: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        uses_shared_paged_kv_idx: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     @flashinfer_api
@@ -2082,6 +2089,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         window_left: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        uses_shared_paged_kv_idx: bool = True,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch prefill/append attention between query and paged kv-cache.
 
@@ -2295,6 +2303,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     self._paged_kv_indptr_buf,
                     sinks,
                     skip_softmax_threshold_scale_factor,
+                    True,  # uses_shared_paged_kv_idx
                 ]
 
             assert self._cached_module is not None, "cached module is not initialized"
@@ -3615,6 +3624,7 @@ def trtllm_batch_context_with_kv_cache(
     enable_pdl: Optional[bool] = None,
     sinks: Optional[List[torch.Tensor]] = None,
     skip_softmax_threshold_scale_factor: Optional[float] = None,
+    uses_shared_paged_kv_idx: bool = True,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
     Parameters
@@ -3673,6 +3683,9 @@ def trtllm_batch_context_with_kv_cache(
         If no value is provided, then standard attention is used.
         Setting the threshold to a higher value generally increases kernel performance at the cost of accuracy degradation.
         The actual threshold value equals the provided threshold_scale_factor divided by the context length.
+    uses_shared_paged_kv_idx: bool = True
+        Whether the indices for K & V pages are shared as unified index.
+        true -> vLLM/FlashInfer; false -> TRT-LLM.
     Returns
     -------
     out: Union[torch.Tensor, FP4Tensor]
@@ -3807,6 +3820,7 @@ def trtllm_batch_context_with_kv_cache(
         workspace_size,
         sinks,
         skip_softmax_threshold_scale_factor,
+        uses_shared_paged_kv_idx,
     )
     return (
         out

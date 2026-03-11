@@ -1177,6 +1177,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         sinks: Optional[torch.Tensor] = None,
         q_len_per_req: Optional[int] = 1,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        uses_shared_paged_kv_idx: bool = True,
     ) -> torch.Tensor: ...
 
     @overload
@@ -1196,6 +1197,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         sinks: Optional[torch.Tensor] = None,
         q_len_per_req: Optional[int] = 1,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        uses_shared_paged_kv_idx: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     @flashinfer_api
@@ -1215,6 +1217,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         sinks: Optional[torch.Tensor] = None,
         q_len_per_req: Optional[int] = 1,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        uses_shared_paged_kv_idx: bool = True,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch decode attention between query and paged kv cache.
 
@@ -1260,6 +1263,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
             If no value is provided, then standard attention is used.
             Setting the threshold to a higher value generally increases kernel performance at the cost of accuracy degradation.
             The actual threshold value equals the provided threshold_scale_factor divided by the context length.
+        uses_shared_paged_kv_idx: bool = True
+            Whether to use shared paged kv indices, defaults to ``True``.
+            true -> vLLM/FlashInfer; false -> TRT-LLM.
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -1390,6 +1396,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     self._max_kv_len,
                     sinks,
                     skip_softmax_threshold_scale_factor,
+                    uses_shared_paged_kv_idx,
                 ]
 
             self._cached_module.paged_run(*run_args)
@@ -1941,6 +1948,7 @@ class TrtllmGenDecodeModule:
         out: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        uses_shared_paged_kv_idx: bool = True,
     ) -> torch.Tensor:
         if out is None:
             out = torch.empty_like(query)
@@ -1983,6 +1991,7 @@ class TrtllmGenDecodeModule:
             sinks,
             None,  # cum_seq_lens_q
             skip_softmax_threshold_scale_factor,
+            uses_shared_paged_kv_idx,
         )
         return out
 
@@ -2045,6 +2054,7 @@ def get_trtllm_gen_decode_module(*args):
         max_kv_len: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        uses_shared_paged_kv_idx: bool = True,
     ) -> None:
         assert maybe_lse is None
         assert paged_kv_cache is not None
@@ -2072,6 +2082,7 @@ def get_trtllm_gen_decode_module(*args):
             out=o,
             sinks=sinks,
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+            uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
         )
 
     @register_fake_op(f"flashinfer::{uri}_paged_run")
@@ -2112,6 +2123,7 @@ def get_trtllm_gen_decode_module(*args):
         max_kv_len: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        uses_shared_paged_kv_idx: bool = True,
     ) -> None:
         pass
 
@@ -2150,6 +2162,7 @@ def trtllm_batch_decode_with_kv_cache(
     max_q_len: Optional[int] = None,
     cum_seq_lens_q: Optional[torch.Tensor] = None,
     skip_softmax_threshold_scale_factor: Optional[float] = None,
+    uses_shared_paged_kv_idx: bool = True,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
     Parameters
@@ -2239,6 +2252,10 @@ def trtllm_batch_decode_with_kv_cache(
         If no value is provided, then standard attention is used.
         Setting the threshold to a higher value generally increases kernel performance at the cost of accuracy degradation.
         The actual threshold value equals the provided threshold_scale_factor divided by the context length.
+
+    uses_shared_paged_kv_idx: bool = True
+        Whether to use shared paged kv indices, defaults to ``True``.
+        true -> vLLM/FlashInfer; false -> TRT-LLM.
 
     Returns
     -------
@@ -2421,6 +2438,7 @@ def trtllm_batch_decode_with_kv_cache(
             sinks,
             cum_seq_lens_q,
             skip_softmax_threshold_scale_factor,
+            uses_shared_paged_kv_idx,
         )
 
         return (

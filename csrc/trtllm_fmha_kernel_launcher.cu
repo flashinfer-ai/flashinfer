@@ -85,7 +85,8 @@ void trtllm_paged_attention_launcher(
     const float* bmm1_scale_log2_ptr, const float* bmm2_scale_ptr, double o_sf_scale,
     int64_t o_sf_vec_size, int64_t o_sf_start_index, int64_t window_left, int64_t sum_seq_q,
     int64_t sparse_mla_top_k, float skip_softmax_threshold_scale_factor, bool skips_softmax,
-    int64_t sm_count, bool enable_pdl, int64_t workspace_size, cudaStream_t stream) {
+    bool uses_shared_paged_kv_idx, int64_t sm_count, bool enable_pdl, int64_t workspace_size,
+    cudaStream_t stream) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads must be a multiple of num_kv_heads, got num_kv_heads: " << num_kv_heads
@@ -140,6 +141,7 @@ void trtllm_paged_attention_launcher(
       window_left == -1 ? INT_MAX : window_left + 1;  // disable window attention by INT_MAX
   runner_params.mMaxSeqLenQ = max_q_len;
   runner_params.mSumOfSeqLensQ = sum_seq_q;
+  runner_params.mUsesSharedPagedKvIdx = uses_shared_paged_kv_idx;
   runner_params.ptrAttentionSinks = attention_sinks;
   runner_params.enable_pdl = enable_pdl;
 
@@ -230,7 +232,8 @@ void trtllm_paged_attention_decode(
     double o_sf_scale, int64_t o_sf_vec_size, int64_t o_sf_start_index, int64_t batch_size,
     int64_t window_left, int64_t sparse_mla_top_k, int64_t sm_count, bool enable_pdl,
     int64_t workspace_size, Optional<TensorView> attention_sinks,
-    Optional<TensorView> cum_seq_lens_q, Optional<float> skip_softmax_threshold_scale_factor) {
+    Optional<TensorView> cum_seq_lens_q, Optional<float> skip_softmax_threshold_scale_factor,
+    Optional<bool> uses_shared_paged_kv_idx) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
   TVM_FFI_ICHECK_EQ(key_cache.ndim(), value_cache.ndim());
@@ -260,6 +263,10 @@ void trtllm_paged_attention_decode(
   int max_num_blocks_per_seq = block_tables.size(-1);
   bool is_shared_kv = key_cache.data_ptr() == value_cache.data_ptr();
   int num_pages_in_mem_pool = is_shared_kv ? key_cache.size(0) : key_cache.size(0) * 2;
+
+  // FlashInfer/vLLM layout -> true; TRT-LLM layout -> false.
+  // Default to flashinfer/vLLM layout.
+  bool const uses_shared_paged_kv_idx_value = uses_shared_paged_kv_idx.value_or(true);
 
   // Assume NHD layout: [..., H, N, D]
   int page_size = key_cache.size(-2);
@@ -317,8 +324,8 @@ void trtllm_paged_attention_decode(
       q_stride_heads, kv_stride_keys_values, kv_stride_heads, kv_stride_batch,
       max_num_blocks_per_seq, bmm1_scale_value, bmm2_scale_value, bmm1_scale_log2_ptr,
       bmm2_scale_ptr, o_sf_scale, o_sf_vec_size, o_sf_start_index, window_left, sum_seq_q,
-      sparse_mla_top_k, skip_softmax_threshold_scale_factor_value, skips_softmax, sm_count,
-      enable_pdl, workspace_size, stream);
+      sparse_mla_top_k, skip_softmax_threshold_scale_factor_value, skips_softmax,
+      uses_shared_paged_kv_idx_value, sm_count, enable_pdl, workspace_size, stream);
 }
 
 void trtllm_paged_attention_context(
@@ -329,7 +336,7 @@ void trtllm_paged_attention_context(
     double o_sf_scale, int64_t o_sf_vec_size, int64_t o_sf_start_index, int64_t batch_size,
     int64_t window_left, TensorView cum_seq_lens_q, TensorView cum_seq_lens_kv, int64_t sm_count,
     bool enable_pdl, int64_t workspace_size, Optional<TensorView> attention_sinks,
-    Optional<float> skip_softmax_threshold_scale_factor) {
+    Optional<float> skip_softmax_threshold_scale_factor, Optional<bool> uses_shared_paged_kv_idx) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
   auto o_data_type = dl_dtype_to_tllm_data_type(out.dtype());
@@ -349,6 +356,10 @@ void trtllm_paged_attention_context(
   int max_num_blocks_per_seq = block_tables.size(-1);
   bool is_shared_kv = key_cache.data_ptr() == value_cache.data_ptr();
   int num_pages_in_mem_pool = is_shared_kv ? key_cache.size(0) : key_cache.size(0) * 2;
+
+  // FlashInfer/vLLM layout -> true; TRT-LLM layout -> false.
+  // Default to flashinfer/vLLM layout.
+  bool const uses_shared_paged_kv_idx_value = uses_shared_paged_kv_idx.value_or(true);
 
   // Assume NHD layout: [..., H, N, D]
   int page_size = key_cache.size(-2);
@@ -409,7 +420,7 @@ void trtllm_paged_attention_context(
       kv_stride_heads, kv_stride_batch, max_num_blocks_per_seq, bmm1_scale_value, bmm2_scale_value,
       bmm1_scale_log2_ptr, bmm2_scale_ptr, o_sf_scale, o_sf_vec_size, o_sf_start_index, window_left,
       sum_seq_q, /*sparse_mla_top_k=*/0, skip_softmax_threshold_scale_factor_value, skips_softmax,
-      sm_count, enable_pdl, workspace_size, stream);
+      uses_shared_paged_kv_idx_value, sm_count, enable_pdl, workspace_size, stream);
 }
 
 void trtllm_ragged_attention_launcher(

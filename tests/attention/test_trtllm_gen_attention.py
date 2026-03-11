@@ -581,6 +581,7 @@ def _test_trtllm_batch_prefill(
         enable_pdl=enable_pdl,
         sinks=(sink if enable_sink else None),
         skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+        uses_shared_paged_kv_idx=True,
     )
     # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
     # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
