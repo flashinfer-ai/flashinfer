@@ -30,18 +30,7 @@ from cutlass import Float32, Int32
 
 from .mla_decode_fp16 import BlackwellMultiHeadLatentAttentionForwardFP16
 from .mla_decode_fp8 import BlackwellMultiHeadLatentAttentionForwardFP8
-from .utils import get_num_sm, torch_to_cutlass_dtype
-
-
-# Default kernel configuration — matches DeepSeek-V2/V3 MLA dimensions
-_LATENT_DIM = 512
-_ROPE_DIM = 64
-_MMA_QK_TILER_MN = (128, 128)
-_MMA_PV_TILER_MN = (128, 256)
-_MAX_ACTIVE_CLUSTERS = 2
-_SKIP_CORRECTION_THRESHOLD = 0.0
-
-_SUPPORTED_DTYPES = {torch.float16, torch.bfloat16, torch.float8_e4m3fn}
+from .utils import get_max_active_clusters, get_num_sm, torch_to_cutlass_dtype
 
 
 @functools.cache
@@ -49,6 +38,7 @@ def _get_split_kv_and_workspace_size(
     B: int,
     q_len: int,
     H: int,
+    kv_lora_rank: int,
     max_active_blocks: int,
 ) -> Tuple[int, int]:
     """Cache split_kv and workspace_size since they are deterministic for the same params."""
@@ -56,7 +46,7 @@ def _get_split_kv_and_workspace_size(
         B, q_len, max_active_blocks
     )
     workspace_size = BlackwellMultiHeadLatentAttentionForwardFP16.get_workspace_size(
-        H, q_len, _LATENT_DIM, B, split_kv, cutlass.Float32
+        H, q_len, kv_lora_rank, B, split_kv, cutlass.Float32
     )
     return split_kv, workspace_size
 
@@ -67,9 +57,12 @@ def _get_compiled_mla_kernel(
     page_size: int,
     num_heads: int,
     seq_len_q: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
     is_persistent: bool,
     is_var_seq: bool,
     is_var_split_kv: bool,
+    skip_correction_threshold: float = 0.0,
 ) -> Callable:
     """Compile and cache an MLA decode kernel.
 
@@ -79,6 +72,10 @@ def _get_compiled_mla_kernel(
 
     All scalar arguments must be pre-wrapped as Int32/Float32.
     """
+    mma_qk_tiler_mn = (128, 128)
+    mma_pv_tiler_mn = (128, 256)
+    cluster_shape_mnk = (2, 1, 1)
+
     is_fp8 = torch_dtype == torch.float8_e4m3fn
     KernelClass = (
         BlackwellMultiHeadLatentAttentionForwardFP8
@@ -92,14 +89,14 @@ def _get_compiled_mla_kernel(
         seq_len_q,
         1,  # K (runtime, use placeholder)
         num_heads,
-        _LATENT_DIM,
-        _ROPE_DIM,
+        kv_lora_rank,
+        qk_rope_head_dim,
         cutlass_dtype,
         cutlass_dtype,
         cutlass.Float32,
         cutlass.Float32,
-        _MMA_QK_TILER_MN,
-        _MMA_PV_TILER_MN,
+        mma_qk_tiler_mn,
+        mma_pv_tiler_mn,
         1,  # split_kv (runtime, use 1 to pass the H<128 check)
         is_persistent,
         is_var_seq,
@@ -115,11 +112,13 @@ def _get_compiled_mla_kernel(
     kernel_obj = KernelClass(
         acc_dtype=cutlass.Float32,
         lse_dtype=cutlass.Float32,
-        mma_qk_tiler_mn=_MMA_QK_TILER_MN,
-        mma_pv_tiler_mn=_MMA_PV_TILER_MN,
-        max_active_clusters=_MAX_ACTIVE_CLUSTERS,
+        mma_qk_tiler_mn=mma_qk_tiler_mn,
+        mma_pv_tiler_mn=mma_pv_tiler_mn,
+        max_active_clusters=get_max_active_clusters(
+            cluster_shape_mnk[0] * cluster_shape_mnk[1]
+        ),
         page_size=page_size,
-        skip_correction_threshold=_SKIP_CORRECTION_THRESHOLD,
+        skip_correction_threshold=skip_correction_threshold,
         is_persistent=is_persistent,
         is_var_seq=is_var_seq,
         is_var_split_kv=is_var_split_kv,
@@ -293,16 +292,15 @@ def cute_dsl_mla_decode(
     torch.Tensor
         Output tensor [B, H, kv_lora_rank].
     """
-    assert query.dtype in _SUPPORTED_DTYPES, (
-        f"cute_dsl_mla_decode only supports {_SUPPORTED_DTYPES}, got {query.dtype}"
+    supported_dtypes = {torch.float16, torch.bfloat16, torch.float8_e4m3fn}
+    assert query.dtype in supported_dtypes, (
+        f"cute_dsl_mla_decode only supports {supported_dtypes}, got {query.dtype}"
     )
     assert kv_cache.dtype == query.dtype, (
         f"kv_cache dtype {kv_cache.dtype} must match query dtype {query.dtype}"
     )
     B, q_len, H, D_qk = query.shape
     assert D_qk == kv_lora_rank + qk_rope_head_dim
-    assert kv_lora_rank == _LATENT_DIM
-    assert qk_rope_head_dim == _ROPE_DIM
 
     q_dtype = query.dtype
 
@@ -335,7 +333,7 @@ def cute_dsl_mla_decode(
     # Cached split_kv and workspace_size computation
     max_active_blocks = get_num_sm(query.device)
     split_kv, workspace_size = _get_split_kv_and_workspace_size(
-        B, q_len, H, max_active_blocks
+        B, q_len, H, kv_lora_rank, max_active_blocks
     )
 
     if H < 128 and split_kv != 1:
@@ -361,7 +359,7 @@ def cute_dsl_mla_decode(
             o_k = out
     else:
         o_k = torch.empty(
-            (B, q_len, H, _LATENT_DIM), dtype=out_dtype, device=query.device
+            (B, q_len, H, kv_lora_rank), dtype=out_dtype, device=query.device
         )
 
     # LSE: contiguous [B, q_len, H]. Kernel reinterprets to [H, q_len, B].
@@ -372,6 +370,7 @@ def cute_dsl_mla_decode(
 
     is_var_split_kv = False
     block_split_kvs = None
+    skip_correction_threshold = 0.0
 
     # Get compiled kernel (cached after first compile)
     compiled_kernel = _get_compiled_mla_kernel(
@@ -379,9 +378,12 @@ def cute_dsl_mla_decode(
         page_size=page_size,
         num_heads=H,
         seq_len_q=q_len,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
         is_persistent=True,
         is_var_seq=True,
         is_var_split_kv=is_var_split_kv,
+        skip_correction_threshold=skip_correction_threshold,
     )
 
     # Call the kernel
