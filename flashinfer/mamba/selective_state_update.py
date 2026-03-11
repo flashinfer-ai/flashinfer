@@ -111,7 +111,7 @@ def selective_state_update(
     intermediate_states_buffer: Optional[torch.Tensor] = None,
     intermediate_state_indices: Optional[torch.Tensor] = None,
     intermediate_state_scales: Optional[torch.Tensor] = None,
-    rand_seed: Optional[int] = None,
+    rand_seed: Optional[torch.Tensor] = None,
     philox_rounds: int = 10,
     cache_steps: int = 0,
     algorithm: str = "auto",
@@ -164,8 +164,10 @@ def selective_state_update(
     intermediate_state_indices : Optional[torch.Tensor]
         Optional indices mapping batch elements to intermediate state buffer positions
         with shape (batch,)
-    rand_seed : Optional[int]
-        Optional integer seed for stochastic rounding (Philox-4x32 PRNG).
+    rand_seed : Optional[torch.Tensor]
+        Optional single-element int64 CUDA tensor for stochastic rounding seed (Philox-4x32 PRNG).
+        Using a device-side tensor (rather than a host integer) ensures CUDA graph compatibility,
+        since the graph captures the pointer and the seed value can be updated between replays.
         When provided, state values are stochastically rounded before storing to fp16.
         When None, no stochastic rounding is applied (regardless of philox_rounds).
         Cannot be used together with state_scale.
@@ -233,10 +235,18 @@ def selective_state_update(
 
     # Validate rand_seed and philox_rounds
     if rand_seed is not None:
-        if not isinstance(rand_seed, int):
+        if not isinstance(rand_seed, torch.Tensor):
             raise TypeError(
-                f"rand_seed must be an integer, got {type(rand_seed).__name__}"
+                f"rand_seed must be a CUDA int64 tensor, got {type(rand_seed).__name__}"
             )
+        if rand_seed.numel() != 1:
+            raise ValueError(
+                f"rand_seed must be a single-element tensor, got numel={rand_seed.numel()}"
+            )
+        if rand_seed.dtype != torch.int64:
+            raise ValueError(f"rand_seed must have dtype int64, got {rand_seed.dtype}")
+        if not rand_seed.is_cuda:
+            raise ValueError("rand_seed must be a CUDA tensor")
         if state_scale is not None:
             raise ValueError("rand_seed and state_scale cannot both be provided")
         if philox_rounds <= 0:
@@ -246,7 +256,6 @@ def selective_state_update(
     else:
         # No stochastic rounding when rand_seed is None
         philox_rounds = 0
-        rand_seed = 0
 
     if out is None:
         output = torch.empty_like(x)
@@ -340,7 +349,7 @@ def _selective_state_update(
     intermediate_states_buffer: Optional[torch.Tensor],
     intermediate_state_indices: Optional[torch.Tensor],
     intermediate_state_scales: Optional[torch.Tensor],
-    rand_seed: int,
+    rand_seed: Optional[torch.Tensor],
     cache_steps: int,
     algorithm: int,
     philox_rounds: int,
@@ -411,7 +420,7 @@ def _selective_state_update_fake(
     intermediate_states_buffer: Optional[torch.Tensor],
     intermediate_state_indices: Optional[torch.Tensor],
     intermediate_state_scales: Optional[torch.Tensor],
-    rand_seed: int,
+    rand_seed: Optional[torch.Tensor],
     cache_steps: int,
     algorithm: int,
     philox_rounds: int,

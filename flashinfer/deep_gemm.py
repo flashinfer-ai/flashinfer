@@ -29,6 +29,7 @@ import enum
 import functools
 import hashlib
 import json
+import logging
 from typing import Any, Dict, Optional, Tuple
 
 try:
@@ -40,6 +41,8 @@ except ImportError as e:
     ) from e
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 from .artifacts import ArtifactPath
 from .cuda_utils import checkCudaErrors
@@ -828,7 +831,9 @@ class SM100FP8GemmRuntime:
                     cleanup(self.lib)
                 except Exception as e:
                     # Ignore any errors during shutdown
-                    print(f"Failed to delete SM100FP8GemmRuntime with exception: {e}")
+                    logger.warning(
+                        "Failed to delete SM100FP8GemmRuntime with exception: %s", e
+                    )
 
     @staticmethod
     def generate(kwargs: Dict[str, Any]) -> str:

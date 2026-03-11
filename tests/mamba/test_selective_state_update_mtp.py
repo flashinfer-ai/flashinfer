@@ -10,6 +10,7 @@ import pytest
 import torch
 
 import flashinfer
+from flashinfer.utils import is_cvt_rs_supported
 
 from .triton_reference.selective_state_update import selective_state_update_triton
 from .utils import create_test_inputs, clone_preserving_strides
@@ -102,6 +103,7 @@ class TestSelectiveStateUpdateMTP:
             pad_slot_id=-1,
             out=out,
             disable_state_update=disable_state_update,
+            algorithm="simple",
         )
 
     def assert_outputs_match(self, y_ref, y_test, msg_prefix=""):
@@ -397,6 +399,7 @@ class TestSelectiveStateUpdateMTPWithIntermediateStates(TestSelectiveStateUpdate
             intermediate_states_buffer=inputs["intermediate_states_buffer"],
             intermediate_state_indices=inputs["intermediate_slot_idx"],
             cache_steps=inputs["cache_steps"],
+            algorithm="simple",
         )
 
     # fmt: off
@@ -1089,7 +1092,7 @@ class TestSelectiveStateUpdateMTPStochasticRounding(TestSelectiveStateUpdateMTP)
     ATOL = 0.001
     RTOL = 0.01
 
-    RAND_SEED = 42
+    RAND_SEED = torch.tensor(42, dtype=torch.int64, device="cuda")
 
     def make_inputs(
         self, batch, nheads, dim, dstate, cache_steps, _state_dtype, weight_dtype
@@ -1114,7 +1117,11 @@ class TestSelectiveStateUpdateMTPStochasticRounding(TestSelectiveStateUpdateMTP)
     def make_reference_output(self, inputs):
         """Compute reference output using Triton with stochastic rounding."""
         state_ref = clone_preserving_strides(inputs["state_cache"])
-        rand_seed = torch.tensor(self.RAND_SEED, dtype=torch.int64, device="cuda")
+        # Triton cvt.rs.f16x2.f32 requires SM100a (non-forward-compatible);
+        # on unsupported GPUs the Triton reference falls back to regular
+        # rounding while the CUDA kernel still exercises its software
+        # stochastic rounding path.
+        rand_seed = self.RAND_SEED if is_cvt_rs_supported() else None
         y_ref = selective_state_update_triton(
             state_ref,
             inputs["x"],
@@ -1219,7 +1226,7 @@ class TestSelectiveStateUpdateMTPStochasticRoundingWithIntermediateStates(
     ATOL = 0.001
     RTOL = 0.01
 
-    RAND_SEED = 42
+    RAND_SEED = torch.tensor(42, dtype=torch.int64, device="cuda")
 
     def make_inputs(
         self, batch, nheads, dim, dstate, cache_steps, _state_dtype, weight_dtype
@@ -1245,7 +1252,11 @@ class TestSelectiveStateUpdateMTPStochasticRoundingWithIntermediateStates(
         """Compute reference output using Triton with SR and intermediate states."""
         state_ref = clone_preserving_strides(inputs["state_cache"])
         intermediate_states_ref = inputs["intermediate_states_buffer"].clone()
-        rand_seed = torch.tensor(self.RAND_SEED, dtype=torch.int64, device="cuda")
+        # Triton cvt.rs.f16x2.f32 requires SM100a (non-forward-compatible);
+        # on unsupported GPUs the Triton reference falls back to regular
+        # rounding while the CUDA kernel still exercises its software
+        # stochastic rounding path.
+        rand_seed = self.RAND_SEED if is_cvt_rs_supported() else None
 
         y_ref = selective_state_update_triton(
             state_ref,

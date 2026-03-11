@@ -71,7 +71,8 @@ struct SelectiveStateUpdateParams {
 
   // Philox PRNG seed for stochastic rounding of fp16 state stores.
   // Only used when the kernel is compiled with NUM_PHILOX_ROUNDS > 0.
-  int64_t rand_seed{0};
+  // Device-side pointer to a single int64_t value.
+  const int64_t* rand_seed{nullptr};
 };
 
 namespace mtp {
@@ -84,7 +85,6 @@ struct SelectiveStateMTPParams : public SelectiveStateUpdateParams {
   int64_t x_stride_mtp{}, dt_stride_mtp{}, B_stride_mtp{}, C_stride_mtp{}, out_stride_mtp{},
       z_stride_mtp{};
   int64_t intermediate_state_stride_batch{}, intermediate_state_scales_stride_batch{};
-  uint32_t intermediate_state_cache_size{0};  // outermost dim of intermediate_states buffer
   void* __restrict__ intermediate_states{
       nullptr};  // state_t: (icache_size, cache_steps, nheads, dim, dstate)
   void* __restrict__ intermediate_state_indices{nullptr};  // (batch,)

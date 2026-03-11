@@ -346,6 +346,8 @@ def test_xqa(
         q_heads,
         cache_k_heads.to(torch.float8_e4m3fn) if fp8_kv_cache else cache_k_heads,
         cache_v_heads.to(torch.float8_e4m3fn) if fp8_kv_cache else cache_v_heads,
+        None,
+        None,
         page_list_arg,
         seq_len_list,
         output,

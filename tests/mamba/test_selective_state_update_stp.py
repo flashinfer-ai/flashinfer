@@ -3,7 +3,7 @@ import pytest
 import torch
 
 import flashinfer
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import get_compute_capability, is_cvt_rs_supported
 
 from .triton_reference.selective_state_update import selective_state_update_triton
 from .utils import create_test_inputs, clone_preserving_strides
@@ -487,7 +487,7 @@ class TestSelectiveStateUpdateInt16(TestSelectiveStateUpdate):
     ATOL = 1e-1
     RTOL = 1e-2
 
-    def make_inputs(self, batch, nheads, dim, dstate, state_dtype, weight_dtype):
+    def make_inputs(self, batch, nheads, dim, dstate, _state_dtype, weight_dtype):
         """Create test inputs with int16 state."""
         return create_test_inputs(
             batch,
@@ -645,9 +645,9 @@ class TestSelectiveStateUpdateStochasticRounding(TestSelectiveStateUpdate):
     ATOL = 0.001
     RTOL = 0.01
 
-    RAND_SEED = 42
+    RAND_SEED = torch.tensor(42, dtype=torch.int64, device="cuda")
 
-    def make_inputs(self, batch, nheads, dim, dstate, state_dtype, weight_dtype):
+    def make_inputs(self, batch, nheads, dim, dstate, _state_dtype, weight_dtype):
         """Create test inputs with fp16 state."""
         return create_test_inputs(
             batch,
@@ -666,7 +666,11 @@ class TestSelectiveStateUpdateStochasticRounding(TestSelectiveStateUpdate):
     def make_reference_output(self, inputs):
         """Compute reference output using Triton with stochastic rounding."""
         state_ref = inputs["state_cache"].clone()
-        rand_seed = torch.tensor(self.RAND_SEED, dtype=torch.int64, device="cuda")
+        # Triton cvt.rs.f16x2.f32 requires SM100a (non-forward-compatible);
+        # on unsupported GPUs the Triton reference falls back to regular
+        # rounding while the CUDA kernel still exercises its software
+        # stochastic rounding path.
+        rand_seed = self.RAND_SEED if is_cvt_rs_supported() else None
         y_ref = selective_state_update_triton(
             state_ref,
             inputs["x"],
@@ -705,7 +709,7 @@ class TestSelectiveStateUpdateStochasticRounding(TestSelectiveStateUpdate):
         )
 
     def assert_states_match(
-        self, state_ref, state_test, slot_idx, msg_prefix="", **kwargs
+        self, state_ref, state_test, slot_idx, msg_prefix="", **_kwargs
     ):
         """Assert states match within tolerance (SR path has different FP operation order than Triton)."""
         state_ref_batch = state_ref[slot_idx]
@@ -731,11 +735,11 @@ class TestSelectiveStateUpdateStochasticRounding(TestSelectiveStateUpdate):
         assert states_match
 
     # fmt: off
-    _SR_PARAMS = [
+    _SR_PARAMS = (
         # (batch, nheads, dim, dstate,  state_dtype,    weight_dtype,   use_out_tensor)
         (  64,    64,     64,  128,     torch.float16,  torch.float32,  True ),  # base
         (  64,    64,     64,   64,     torch.float16,  torch.float32,  True ),  # dstate=64
-    ]
+    )
     # fmt: on
 
     @pytest.mark.parametrize("algorithm", _get_algorithms_no_horizontal())

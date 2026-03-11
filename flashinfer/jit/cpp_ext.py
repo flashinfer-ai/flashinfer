@@ -1,6 +1,7 @@
 # Adapted from https://github.com/pytorch/pytorch/blob/v2.7.0/torch/utils/cpp_extension.py
 
 import functools
+import logging
 import os
 import re
 import subprocess
@@ -16,6 +17,8 @@ import torch
 from . import env as jit_env
 from ..compilation_context import CompilationContext
 
+logger = logging.getLogger(__name__)
+
 
 def parse_env_flags(env_var_name) -> List[str]:
     env_flags = os.environ.get(env_var_name)
@@ -25,9 +28,10 @@ def parse_env_flags(env_var_name) -> List[str]:
 
             return shlex.split(env_flags)
         except ValueError as e:
-            print(
-                f"Warning: Could not parse {env_var_name} with shlex: {e}. Falling back to simple split.",
-                file=sys.stderr,
+            logger.warning(
+                "Could not parse %s with shlex: %s. Falling back to simple split.",
+                env_var_name,
+                e,
             )
             return env_flags.split()
     return []

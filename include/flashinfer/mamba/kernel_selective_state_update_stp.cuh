@@ -98,6 +98,9 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
   [[maybe_unused]] auto* __restrict__ state_scale =
       reinterpret_cast<state_scale_t*>(params.state_scale);
 
+  // Load device-side Philox seed once into a register
+  [[maybe_unused]] int64_t const rand_seed = params.rand_seed ? *params.rand_seed : 0;
+
   int const nheads = params.nheads;
   int const ngroups = params.ngroups;
 
@@ -202,9 +205,8 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
       for (int ii = 0; ii < load_state_t::count; ii++) {
         if constexpr (PHILOX_ROUNDS > 0 && !scaleState) {
           if (ii % 4 == 0)
-            philox_randint4x<PHILOX_ROUNDS>(params.rand_seed,
-                                            state_ptr_offset + d * DSTATE + i + ii, rand_ints[0],
-                                            rand_ints[1], rand_ints[2], rand_ints[3]);
+            philox_randint4x<PHILOX_ROUNDS>(rand_seed, state_ptr_offset + d * DSTATE + i + ii,
+                                            rand_ints[0], rand_ints[1], rand_ints[2], rand_ints[3]);
         }
 
         auto state_value = toFloat(rState.val[ii]) * state_decode_scale;
@@ -636,6 +638,9 @@ __global__ void selective_state_update_kernel_producer_consumer_vertical(
   [[maybe_unused]] auto* __restrict__ state_scale =
       reinterpret_cast<state_scale_t*>(params.state_scale);
 
+  // Load device-side Philox seed once into a register
+  [[maybe_unused]] int64_t const rand_seed = params.rand_seed ? *params.rand_seed : 0;
+
   int const nheads = params.nheads;
   int const ngroups = params.ngroups;
 
@@ -733,11 +738,11 @@ __global__ void selective_state_update_kernel_producer_consumer_vertical(
     if (state_batch != params.pad_slot_id)
       consumer_func_vertical<input_t, weight_t, matrixA_t, state_t, state_scale_t, DIM, DSTATE,
                              consumerWarps, rowsPerStage, numStages, true, PHILOX_ROUNDS>(
-          lane, warp, d_value, dt_value, dA, sram, params.rand_seed, state_ptr_offset);
+          lane, warp, d_value, dt_value, dA, sram, rand_seed, state_ptr_offset);
     else
       consumer_func_vertical<input_t, weight_t, matrixA_t, state_t, state_scale_t, DIM, DSTATE,
                              consumerWarps, rowsPerStage, numStages, false, PHILOX_ROUNDS>(
-          lane, warp, d_value, dt_value, dA, sram, params.rand_seed, state_ptr_offset);
+          lane, warp, d_value, dt_value, dA, sram, rand_seed, state_ptr_offset);
 
     // Write output — wait for all consumer warps to finish writing sram.out
     sram.bar_consumers.wait(sram.bar_consumers.arrive());
@@ -1010,6 +1015,9 @@ __global__ void selective_state_update_kernel_producer_consumer_horizontal(
   auto const* __restrict__ state_batch_indices =
       reinterpret_cast<stateIndex_t const*>(params.state_batch_indices);
 
+  // Load device-side Philox seed once into a register
+  [[maybe_unused]] int64_t const rand_seed = params.rand_seed ? *params.rand_seed : 0;
+
   int const nheads = params.nheads;
 
   constexpr auto numWarps = 1 + consumerWarps;
@@ -1114,13 +1122,11 @@ __global__ void selective_state_update_kernel_producer_consumer_horizontal(
     if (state_batch != params.pad_slot_id)
       consumer_func_horizontal<input_t, weight_t, matrixA_t, state_t, DIM, DSTATE, PHILOX_ROUNDS,
                                consumerWarps, colsPerStage, numStages, true>(
-          d, member, A_value, dt_value, x_value, sram, out_value, params.rand_seed,
-          state_ptr_offset);
+          d, member, A_value, dt_value, x_value, sram, out_value, rand_seed, state_ptr_offset);
     else
       consumer_func_horizontal<input_t, weight_t, matrixA_t, state_t, DIM, DSTATE, PHILOX_ROUNDS,
                                consumerWarps, colsPerStage, numStages, false>(
-          d, member, A_value, dt_value, x_value, sram, out_value, params.rand_seed,
-          state_ptr_offset);
+          d, member, A_value, dt_value, x_value, sram, out_value, rand_seed, state_ptr_offset);
 
     out_value += __shfl_down_sync(UINT32_MAX, out_value, 16);
     if constexpr (lanesPerRow == 4) {

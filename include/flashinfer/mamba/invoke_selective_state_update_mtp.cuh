@@ -38,7 +38,11 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
   // ── Auto algorithm selection ──────────────────────────────────────────────
   if (algorithm == SSUAlgorithm::kAuto) {
 #ifdef FLASHINFER_MAMBA_ENABLE_SM100
-    algorithm = (params.batch >= 32) ? SSUAlgorithm::kVertical : SSUAlgorithm::kSimple;
+    // Vertical kernel doesn't support scaleState or stochastic rounding
+    if (scaleState || PHILOX_ROUNDS > 0)
+      algorithm = SSUAlgorithm::kSimple;
+    else
+      algorithm = (params.batch >= 32) ? SSUAlgorithm::kVertical : SSUAlgorithm::kSimple;
 #else
     algorithm = SSUAlgorithm::kSimple;
 #endif
