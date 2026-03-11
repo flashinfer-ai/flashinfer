@@ -64,8 +64,10 @@ __global__ void nvfp4_dequant_vectorized_kernel(const uint8_t* __restrict__ fp4_
 
   if (row >= M) return;
 
-  __shared__ float global_scale;
-  __shared__ uint8_t smem_scales[512];
+  extern __shared__ uint8_t smem[];
+  float& global_scale = *reinterpret_cast<float*>(smem);
+  // smem_scales starts after global_scale (aligned to 4 bytes)
+  uint8_t* smem_scales = smem + sizeof(float);
 
   if (tid == 0) {
     global_scale = *global_scale_ptr;
@@ -150,6 +152,7 @@ void nvfp4_kv_dequant(TensorView fp4_data, TensorView block_scales, TensorView g
   TVM_FFI_ICHECK(output.size(1) == K) << "output column count mismatch";
   TVM_FFI_ICHECK(block_scales.size(0) == M) << "block_scales row count mismatch";
   TVM_FFI_ICHECK(block_scales.size(1) == K / 16) << "block_scales column count mismatch";
+  TVM_FFI_ICHECK(K % 16 == 0) << "K dimension must be divisible by 16";
 
   ffi::CUDADeviceGuard device_guard(fp4_data.device().device_id);
   cudaStream_t stream = get_stream(output.device());
@@ -172,11 +175,13 @@ void nvfp4_kv_dequant(TensorView fp4_data, TensorView block_scales, TensorView g
   dim3 grid(M);
   dim3 block(BLOCK_SIZE);
 
+  const size_t smem_size = sizeof(float) + static_cast<size_t>(K / 16);
+
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(output.dtype(), c_type, [&] {
-    nvfp4_dequant_vectorized_kernel<c_type, BLOCK_SIZE, 16>
-        <<<grid, block, 0, stream>>>(static_cast<const uint8_t*>(fp4_data.data_ptr()),
-                                     static_cast<const uint8_t*>(block_scales.data_ptr()),
-                                     scale_ptr, static_cast<c_type*>(output.data_ptr()), M, K);
+    nvfp4_dequant_vectorized_kernel<c_type, BLOCK_SIZE, 16><<<grid, block, smem_size, stream>>>(
+        static_cast<const uint8_t*>(fp4_data.data_ptr()),
+        static_cast<const uint8_t*>(block_scales.data_ptr()), scale_ptr,
+        static_cast<c_type*>(output.data_ptr()), M, K);
     return true;
   });
 }
