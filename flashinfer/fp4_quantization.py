@@ -36,12 +36,14 @@ from .jit import (
 )
 from .jit.cpp_ext import is_cuda_version_at_least
 from .utils import (
+    backend_requirement,
     device_support_pdl,
+    get_compute_capability,
     get_shuffle_matrix_a_row_indices,
     get_shuffle_matrix_sf_a_row_indices,
     register_custom_op,
     register_fake_op,
-    get_compute_capability,
+    supported_compute_capability,
 )
 
 
@@ -1037,11 +1039,8 @@ def get_fp4_kv_dequantization_module():
         block_scales: torch.Tensor,
         global_scale: torch.Tensor,
         output: torch.Tensor,
-        scale_on_host: bool,
     ) -> None:
-        module.nvfp4_kv_dequant(
-            fp4_data, block_scales, global_scale, output, scale_on_host
-        )
+        module.nvfp4_kv_dequant(fp4_data, block_scales, global_scale, output)
 
     @register_fake_op("flashinfer::nvfp4_kv_dequant")
     def _fake_nvfp4_kv_dequant(
@@ -1049,7 +1048,6 @@ def get_fp4_kv_dequantization_module():
         block_scales: torch.Tensor,
         global_scale: torch.Tensor,
         output: torch.Tensor,
-        scale_on_host: bool,
     ) -> None:
         pass
 
@@ -1071,11 +1069,8 @@ def get_fp4_kv_quantization_module():
         global_scale: torch.Tensor,
         fp4_output: torch.Tensor,
         block_scales: torch.Tensor,
-        scale_on_host: bool,
     ) -> None:
-        module.nvfp4_kv_quant(
-            input, global_scale, fp4_output, block_scales, scale_on_host
-        )
+        module.nvfp4_kv_quant(input, global_scale, fp4_output, block_scales)
 
     @register_fake_op("flashinfer::nvfp4_kv_quant")
     def _fake_nvfp4_kv_quant(
@@ -1083,51 +1078,62 @@ def get_fp4_kv_quantization_module():
         global_scale: torch.Tensor,
         fp4_output: torch.Tensor,
         block_scales: torch.Tensor,
-        scale_on_host: bool,
     ) -> None:
         pass
 
     return SimpleNamespace(nvfp4_kv_quant=nvfp4_kv_quant)
 
 
+@supported_compute_capability([80, 86, 89, 90, 100, 120])
+def _nvfp4_kv_dequant_check(fp4_data, block_scales, global_scale, output_dtype=None):
+    return True
+
+
+@backend_requirement({}, common_check=_nvfp4_kv_dequant_check)
 @flashinfer_api
 def nvfp4_kv_dequantize(
     fp4_data: torch.Tensor,
     block_scales: torch.Tensor,
     global_scale,
     output_dtype: torch.dtype = torch.bfloat16,
-    scale_on_host: bool = False,
 ) -> torch.Tensor:
     """GPU dequantization of NVFP4 KV cache data with linear block scale layout.
+
+    Requires SM80+.
 
     Args:
         fp4_data (torch.Tensor): Packed FP4 data of shape [M, K/2] with dtype uint8.
         block_scales (torch.Tensor): Per-block FP8 E4M3 scales of shape [M, K/16] with dtype uint8.
         global_scale (torch.Tensor or float): Global scale factor. Can be a tensor of shape [1]
-            with dtype float32, or a plain float value (implies scale_on_host=True).
+            with dtype float32 on the same device as fp4_data, or a plain float value.
         output_dtype (torch.dtype): Output dtype, either torch.bfloat16 or torch.float16.
-        scale_on_host (bool): If True, global_scale is on CPU and will be copied to GPU.
 
     Returns:
         torch.Tensor: Dequantized tensor of shape [M, K] with the specified output dtype.
     """
     if not isinstance(global_scale, torch.Tensor):
-        global_scale = torch.tensor([global_scale], dtype=torch.float32)
-        scale_on_host = True
+        global_scale = torch.tensor(
+            [global_scale], dtype=torch.float32, device=fp4_data.device
+        )
     M = fp4_data.size(0)
     K = fp4_data.size(1) * 2
     output = torch.empty((M, K), dtype=output_dtype, device=fp4_data.device)
     get_fp4_kv_dequantization_module().nvfp4_kv_dequant(
-        fp4_data, block_scales, global_scale, output, scale_on_host
+        fp4_data, block_scales, global_scale, output
     )
     return output
 
 
+@supported_compute_capability([100, 120])
+def _nvfp4_kv_quant_check(input, global_scale):
+    return True
+
+
+@backend_requirement({}, common_check=_nvfp4_kv_quant_check)
 @flashinfer_api
 def nvfp4_kv_quantize(
     input: torch.Tensor,
     global_scale,
-    scale_on_host: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """GPU quantization to NVFP4 KV cache format with linear block scale layout.
 
@@ -1137,8 +1143,7 @@ def nvfp4_kv_quantize(
         input (torch.Tensor): Input tensor of shape [M, K] with dtype bf16 or fp16.
             K must be divisible by 16.
         global_scale (torch.Tensor or float): Global scale factor. Can be a tensor of shape [1]
-            with dtype float32, or a plain float value (implies scale_on_host=True).
-        scale_on_host (bool): If True, global_scale is on CPU and will be copied to GPU.
+            with dtype float32 on the same device as input, or a plain float value.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
@@ -1146,12 +1151,13 @@ def nvfp4_kv_quantize(
             - block_scales: Per-block FP8 E4M3 scales of shape [M, K/16] with dtype uint8.
     """
     if not isinstance(global_scale, torch.Tensor):
-        global_scale = torch.tensor([global_scale], dtype=torch.float32)
-        scale_on_host = True
+        global_scale = torch.tensor(
+            [global_scale], dtype=torch.float32, device=input.device
+        )
     M, K = input.shape
     fp4_output = torch.empty((M, K // 2), dtype=torch.uint8, device=input.device)
     block_scales = torch.empty((M, K // 16), dtype=torch.uint8, device=input.device)
     get_fp4_kv_quantization_module().nvfp4_kv_quant(
-        input, global_scale, fp4_output, block_scales, scale_on_host
+        input, global_scale, fp4_output, block_scales
     )
     return fp4_output, block_scales

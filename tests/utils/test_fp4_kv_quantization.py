@@ -72,35 +72,23 @@ def reference_dequant(fp4_data, block_scales, global_scale_val, output_dtype):
     return output.to(output_dtype).to(fp4_data.device)
 
 
-def _make_global_scale(val, scale_mode):
-    """Create global_scale in different forms based on scale_mode.
-
-    Returns (global_scale, scale_on_host) tuple.
-    - "device": tensor on CUDA, scale_on_host=False
-    - "host": tensor on CPU, scale_on_host=True
-    - "float": plain Python float, scale_on_host not needed (auto-detected)
-    """
-    if scale_mode == "device":
-        return torch.tensor([val], dtype=torch.float32, device="cuda"), False
-    elif scale_mode == "host":
-        return torch.tensor([val], dtype=torch.float32, device="cpu"), True
-    else:  # "float"
-        return (
-            val,
-            True,
-        )  # scale_on_host is ignored when passing float, but set for clarity
+def get_compute_capability():
+    props = torch.cuda.get_device_properties(0)
+    return props.major * 10 + props.minor
 
 
 SHAPES = [(128, 64), (256, 128), (1, 32), (2048, 2048)]
 DTYPES = [torch.bfloat16, torch.float16]
-SCALE_MODES = ["device", "host", "float"]
 
 
 @pytest.mark.parametrize("shape", SHAPES)
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("scale_mode", SCALE_MODES)
-def test_nvfp4_kv_dequant(shape, dtype, scale_mode):
+def test_nvfp4_kv_dequant(shape, dtype):
     """Test dequantization kernel against PyTorch reference."""
+    cc = get_compute_capability()
+    if cc < 80:
+        pytest.skip(f"SM{cc} does not support FP8 E4M3 (requires SM80+)")
+
     M, K = shape
     torch.manual_seed(42)
 
@@ -112,21 +100,12 @@ def test_nvfp4_kv_dequant(shape, dtype, scale_mode):
     block_scales = torch.randint(1, 120, (M, K // 16), dtype=torch.uint8, device="cuda")
 
     global_scale_val = 0.5
-    global_scale, scale_on_host = _make_global_scale(global_scale_val, scale_mode)
+    global_scale = torch.tensor([global_scale_val], dtype=torch.float32, device="cuda")
 
     # CUDA kernel output
-    if scale_mode == "float":
-        output = flashinfer.nvfp4_kv_dequantize(
-            fp4_data, block_scales, global_scale, output_dtype=dtype
-        )
-    else:
-        output = flashinfer.nvfp4_kv_dequantize(
-            fp4_data,
-            block_scales,
-            global_scale,
-            output_dtype=dtype,
-            scale_on_host=scale_on_host,
-        )
+    output = flashinfer.nvfp4_kv_dequantize(
+        fp4_data, block_scales, global_scale, output_dtype=dtype
+    )
 
     # Reference output
     ref = reference_dequant(fp4_data, block_scales, global_scale_val, dtype)
@@ -134,15 +113,34 @@ def test_nvfp4_kv_dequant(shape, dtype, scale_mode):
     torch.testing.assert_close(output.float(), ref.float(), atol=1e-3, rtol=1e-3)
 
 
-def get_compute_capability():
-    props = torch.cuda.get_device_properties(0)
-    return props.major * 10 + props.minor
+@pytest.mark.parametrize("shape", SHAPES)
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_nvfp4_kv_dequant_float_scale(shape, dtype):
+    """Test dequantization with plain float global_scale (auto-converted to device tensor)."""
+    cc = get_compute_capability()
+    if cc < 80:
+        pytest.skip(f"SM{cc} does not support FP8 E4M3 (requires SM80+)")
+
+    M, K = shape
+    torch.manual_seed(42)
+
+    fp4_data = torch.randint(0, 256, (M, K // 2), dtype=torch.uint8, device="cuda")
+    block_scales = torch.randint(1, 120, (M, K // 16), dtype=torch.uint8, device="cuda")
+
+    global_scale_val = 0.5
+
+    output = flashinfer.nvfp4_kv_dequantize(
+        fp4_data, block_scales, global_scale_val, output_dtype=dtype
+    )
+
+    ref = reference_dequant(fp4_data, block_scales, global_scale_val, dtype)
+
+    torch.testing.assert_close(output.float(), ref.float(), atol=1e-3, rtol=1e-3)
 
 
 @pytest.mark.parametrize("shape", SHAPES)
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("scale_mode", SCALE_MODES)
-def test_nvfp4_kv_quant(shape, dtype, scale_mode):
+def test_nvfp4_kv_quant(shape, dtype):
     """Test quantization kernel output shapes and basic validity."""
     cc = get_compute_capability()
     if cc < 100:
@@ -152,19 +150,10 @@ def test_nvfp4_kv_quant(shape, dtype, scale_mode):
     torch.manual_seed(42)
 
     input_data = torch.randn((M, K), dtype=dtype, device="cuda")
-    # Use global_scale=1.0 to avoid FP8 E4M3 block scale underflow
-    # (large global_scale causes 1/global_scale * vecMax/6 to underflow to FP8 zero)
     global_scale_val = 1.0
-    global_scale, scale_on_host = _make_global_scale(global_scale_val, scale_mode)
+    global_scale = torch.tensor([global_scale_val], dtype=torch.float32, device="cuda")
 
-    if scale_mode == "float":
-        fp4_output, block_scales = flashinfer.nvfp4_kv_quantize(
-            input_data, global_scale
-        )
-    else:
-        fp4_output, block_scales = flashinfer.nvfp4_kv_quantize(
-            input_data, global_scale, scale_on_host=scale_on_host
-        )
+    fp4_output, block_scales = flashinfer.nvfp4_kv_quantize(input_data, global_scale)
 
     # Check shapes
     assert fp4_output.shape == (M, K // 2)
@@ -178,8 +167,7 @@ def test_nvfp4_kv_quant(shape, dtype, scale_mode):
 
 @pytest.mark.parametrize("shape", SHAPES)
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("scale_mode", SCALE_MODES)
-def test_nvfp4_kv_roundtrip(shape, dtype, scale_mode):
+def test_nvfp4_kv_roundtrip(shape, dtype):
     """Test quantize -> dequantize roundtrip error is within FP4 precision."""
     cc = get_compute_capability()
     if cc < 100:
@@ -191,31 +179,15 @@ def test_nvfp4_kv_roundtrip(shape, dtype, scale_mode):
     input_data = torch.randn((M, K), dtype=dtype, device="cuda")
     # Use global_scale=1.0 to avoid FP8 E4M3 block scale underflow
     global_scale_val = 1.0
-    global_scale, scale_on_host = _make_global_scale(global_scale_val, scale_mode)
+    global_scale = torch.tensor([global_scale_val], dtype=torch.float32, device="cuda")
 
     # Quantize
-    if scale_mode == "float":
-        fp4_output, block_scales = flashinfer.nvfp4_kv_quantize(
-            input_data, global_scale
-        )
-    else:
-        fp4_output, block_scales = flashinfer.nvfp4_kv_quantize(
-            input_data, global_scale, scale_on_host=scale_on_host
-        )
+    fp4_output, block_scales = flashinfer.nvfp4_kv_quantize(input_data, global_scale)
 
     # Dequantize
-    if scale_mode == "float":
-        reconstructed = flashinfer.nvfp4_kv_dequantize(
-            fp4_output, block_scales, global_scale, output_dtype=dtype
-        )
-    else:
-        reconstructed = flashinfer.nvfp4_kv_dequantize(
-            fp4_output,
-            block_scales,
-            global_scale,
-            output_dtype=dtype,
-            scale_on_host=scale_on_host,
-        )
+    reconstructed = flashinfer.nvfp4_kv_dequantize(
+        fp4_output, block_scales, global_scale, output_dtype=dtype
+    )
 
     # FP4 E2M1 has very limited precision (only 16 representable values),
     # so we check relative error with generous tolerance

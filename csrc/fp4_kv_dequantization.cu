@@ -137,9 +137,10 @@ __global__ void nvfp4_dequant_vectorized_kernel(const uint8_t* __restrict__ fp4_
 }
 
 void nvfp4_kv_dequant(TensorView fp4_data, TensorView block_scales, TensorView global_scale,
-                      TensorView output, bool scale_on_host) {
+                      TensorView output) {
   CHECK_INPUT(fp4_data);
   CHECK_INPUT(block_scales);
+  CHECK_CUDA(global_scale);
   CHECK_INPUT(output);
 
   const int M = fp4_data.size(0);
@@ -153,23 +154,17 @@ void nvfp4_kv_dequant(TensorView fp4_data, TensorView block_scales, TensorView g
   TVM_FFI_ICHECK(block_scales.size(0) == M) << "block_scales row count mismatch";
   TVM_FFI_ICHECK(block_scales.size(1) == K / 16) << "block_scales column count mismatch";
   TVM_FFI_ICHECK(K % 16 == 0) << "K dimension must be divisible by 16";
+  TVM_FFI_ICHECK(block_scales.device().device_id == fp4_data.device().device_id)
+      << "block_scales must be on the same device as fp4_data";
+  TVM_FFI_ICHECK(global_scale.device().device_id == fp4_data.device().device_id)
+      << "global_scale must be on the same device as fp4_data";
+  TVM_FFI_ICHECK(output.device().device_id == fp4_data.device().device_id)
+      << "output must be on the same device as fp4_data";
 
   ffi::CUDADeviceGuard device_guard(fp4_data.device().device_id);
-  cudaStream_t stream = get_stream(output.device());
+  cudaStream_t stream = get_stream(fp4_data.device());
 
-  const float* scale_ptr;
-  ffi::Tensor device_scale_buf;
-
-  if (scale_on_host) {
-    CHECK_CPU(global_scale);
-    device_scale_buf = alloc_tensor({1}, dl_float32, fp4_data.device());
-    cudaMemcpyAsync(device_scale_buf.data_ptr(), global_scale.data_ptr(), sizeof(float),
-                    cudaMemcpyHostToDevice, stream);
-    scale_ptr = static_cast<const float*>(device_scale_buf.data_ptr());
-  } else {
-    CHECK_CUDA(global_scale);
-    scale_ptr = static_cast<const float*>(global_scale.data_ptr());
-  }
+  const float* scale_ptr = static_cast<const float*>(global_scale.data_ptr());
 
   constexpr int BLOCK_SIZE = 128;
   dim3 grid(M);
