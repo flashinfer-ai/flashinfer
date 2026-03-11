@@ -177,9 +177,6 @@ def test_cute_dsl_mla_decode_fp16(batch_size, seq_len_k, page_size, dtype):
         page_size,
     )
 
-    if q_len == 1:
-        ref_out = ref_out.squeeze(1)
-
     ref_out_cast = ref_out.to(dtype)
 
     # Check with tolerance appropriate for FP16/BF16
@@ -261,8 +258,6 @@ def test_cute_dsl_mla_decode_variable_seq_len(batch_size, seq_len_k, page_size=1
         output_scale,
         page_size,
     )
-    if q_len == 1:
-        ref_out = ref_out.squeeze(1)
     ref_out_fp16 = ref_out.to(torch.float16)
 
     torch.testing.assert_close(out, ref_out_fp16, atol=1e-2, rtol=1e-2)
@@ -321,7 +316,71 @@ def test_cute_dsl_mla_decode_via_api(batch_size, seq_len_k, page_size=128):
         backend="cute-dsl",
     )
 
-    assert out.shape == (batch_size, num_heads, latent_dim)
+    assert out.shape == (batch_size, q_len, num_heads, latent_dim)
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("seq_len_k", [128, 512])
+def test_cute_dsl_vs_trtllm_gen(batch_size, seq_len_k, page_size=64):
+    """Test cute-dsl backend output matches trtllm-gen backend output."""
+    skip_if_unsupported()
+
+    from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
+
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+
+    num_heads = 128
+    latent_dim = 512
+    rope_dim = 64
+    q_len = 1
+    softmax_scale = 1.0 / (latent_dim**0.5)
+    D_qk = latent_dim + rope_dim
+
+    query = torch.randn(
+        batch_size, q_len, num_heads, D_qk, dtype=torch.bfloat16, device=device
+    )
+
+    num_pages_per_batch = (seq_len_k + page_size - 1) // page_size
+    total_pages = num_pages_per_batch * batch_size + 10
+    # trtllm-gen expects 4D kv_cache: [num_pages, 1, page_size, D]
+    kv_cache = torch.randn(
+        total_pages, 1, page_size, D_qk, dtype=torch.bfloat16, device=device
+    )
+
+    block_tables = torch.zeros(
+        batch_size, num_pages_per_batch, dtype=torch.int32, device=device
+    )
+    for b in range(batch_size):
+        for p in range(num_pages_per_batch):
+            block_tables[b, p] = b * num_pages_per_batch + p
+
+    seq_lens = torch.full((batch_size,), seq_len_k, dtype=torch.int32, device=device)
+    workspace_buffer = torch.zeros(256 * 1024 * 1024, dtype=torch.int8, device=device)
+
+    common_args = dict(
+        query=query,
+        kv_cache=kv_cache,
+        workspace_buffer=workspace_buffer,
+        qk_nope_head_dim=latent_dim,
+        kv_lora_rank=latent_dim,
+        qk_rope_head_dim=rope_dim,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=seq_len_k,
+        bmm1_scale=softmax_scale,
+        bmm2_scale=1.0,
+    )
+
+    out_trtllm = trtllm_batch_decode_with_kv_cache_mla(**common_args, backend="trtllm-gen")
+    out_cute_dsl = trtllm_batch_decode_with_kv_cache_mla(**common_args, backend="cute-dsl")
+
+    torch.testing.assert_close(
+        out_cute_dsl.to(torch.float32),
+        out_trtllm.to(torch.float32),
+        atol=1e-2,
+        rtol=1e-2,
+    )
 
 
 @pytest.mark.parametrize("batch_size", [1, 4])
@@ -383,7 +442,7 @@ def test_cute_dsl_mla_decode_fp8(batch_size, seq_len_k, page_size):
     )
 
     assert out.dtype == torch.float8_e4m3fn
-    assert out.shape == (batch_size, num_heads, latent_dim)
+    assert out.shape == (batch_size, q_len, num_heads, latent_dim)
 
     # Reference: compute in FP32 using FP8 values dequantized to FP32
     kv_flat = kv_cache.reshape(-1, D_qk).to(torch.float32)
@@ -403,9 +462,6 @@ def test_cute_dsl_mla_decode_fp8(batch_size, seq_len_k, page_size):
         output_scale,
         page_size,
     )
-    if q_len == 1:
-        ref_out = ref_out.squeeze(1)
-
     # Compare outputs in FP32; FP8 has limited precision so use wider tolerance
     torch.testing.assert_close(
         out.to(torch.float32), ref_out.to(torch.float32), atol=0.1, rtol=0.1

@@ -307,12 +307,12 @@ def cute_dsl_mla_decode(
     output_scale : float
         Scale factor applied to the output.
     out : Optional[torch.Tensor]
-        Pre-allocated output tensor [B, H, kv_lora_rank].
+        Pre-allocated output tensor [B, q_len, H, kv_lora_rank].
 
     Returns
     -------
     torch.Tensor
-        Output tensor [B, H, kv_lora_rank].
+        Output tensor [B, q_len, H, kv_lora_rank].
     """
     supported_dtypes = {torch.float16, torch.bfloat16, torch.float8_e4m3fn}
     assert query.dtype in supported_dtypes, (
@@ -375,10 +375,7 @@ def cute_dsl_mla_decode(
     # Kernel reinterprets to [H, D, q_len, B] internally via zero-cost make_tensor.
     out_dtype = q_dtype
     if out is not None:
-        if q_len == 1:
-            o_k = out.unsqueeze(1)  # [B, H, D] → [B, 1, H, D]
-        else:
-            o_k = out
+        o_k = out
     else:
         o_k = torch.empty(
             (B, q_len, H, kv_lora_rank), dtype=out_dtype, device=query.device
@@ -440,7 +437,5 @@ def cute_dsl_mla_decode(
     if out is not None:
         return out
 
-    # o_k is already [B, q_len, H, D] contiguous — just squeeze for q_len==1.
-    if q_len == 1:
-        return o_k.squeeze(1)
+    # o_k is [B, q_len, H, D] — return as-is to match trtllm-gen output shape.
     return o_k

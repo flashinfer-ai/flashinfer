@@ -771,6 +771,17 @@ def trtllm_batch_decode_with_kv_cache_mla(
     elif backend == "cute-dsl":
         from .cute_dsl.mla_decode import cute_dsl_mla_decode
 
+        if isinstance(bmm1_scale, torch.Tensor):
+            raise ValueError(
+                "cute-dsl backend does not support tensor bmm1_scale, "
+                "please pass a float value"
+            )
+        if isinstance(bmm2_scale, torch.Tensor):
+            raise ValueError(
+                "cute-dsl backend does not support tensor bmm2_scale, "
+                "please pass a float value"
+            )
+
         return cute_dsl_mla_decode(
             query=query,
             kv_cache=kv_cache,
@@ -780,12 +791,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
             block_tables=block_tables,
             seq_lens=seq_lens,
             max_seq_len=max_seq_len,
-            softmax_scale=bmm1_scale
-            if isinstance(bmm1_scale, float)
-            else float(bmm1_scale.item()),
-            output_scale=bmm2_scale
-            if isinstance(bmm2_scale, float)
-            else float(bmm2_scale.item()),
+            softmax_scale=bmm1_scale,
+            output_scale=bmm2_scale,
             out=out,
         )
     else:
