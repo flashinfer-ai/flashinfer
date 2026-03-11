@@ -117,9 +117,7 @@ def test_cute_dsl_mla_decode_fp16(batch_size, seq_len_k, page_size, dtype):
 
     # Allocate query: [B, q_len, H, D_qk]
     D_qk = latent_dim + rope_dim
-    query = torch.randn(
-        batch_size, q_len, num_heads, D_qk, dtype=dtype, device=device
-    )
+    query = torch.randn(batch_size, q_len, num_heads, D_qk, dtype=dtype, device=device)
 
     # Allocate paged KV cache
     num_pages_per_batch = (seq_len_k + page_size - 1) // page_size

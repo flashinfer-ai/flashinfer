@@ -10,7 +10,9 @@ qk_rope_head_dim = 64
 kv_lora_rank = 512
 
 
-def bench_trtllm_mla(batch_size, q_len_per_request, seq_len, page_size, dtype, backend="auto"):
+def bench_trtllm_mla(
+    batch_size, q_len_per_request, seq_len, page_size, dtype, backend="auto"
+):
     torch.manual_seed(42)
     device = "cuda:0"
 
@@ -134,6 +136,7 @@ def bench_trtllm_mla(batch_size, q_len_per_request, seq_len, page_size, dtype, b
     print(f"memory bandwidth: {total_mem_bytes / ms / 1e6:.2f} GB/s")
     print(f"FLOPs: {flops / ms / 1e9:.2f} TFLOPs/s")
 
+
 if __name__ == "__main__":
     import argparse
 
@@ -145,7 +148,7 @@ if __name__ == "__main__":
         help="Backend to use (auto, trtllm-gen, cute-dsl)",
     )
     args = parser.parse_args()
-    
+
     if args.backend == "cute-dsl":
         q_lens = [1, 2, 4]
     else:

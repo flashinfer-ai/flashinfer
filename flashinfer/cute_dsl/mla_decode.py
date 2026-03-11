@@ -305,7 +305,6 @@ def cute_dsl_mla_decode(
     assert qk_rope_head_dim == _ROPE_DIM
 
     q_dtype = query.dtype
-    is_fp8 = q_dtype == torch.float8_e4m3fn
 
     # Handle 3D vs 4D kv_cache: normalize to 3D [num_pages, page_size, D_total]
     if kv_cache.dim() == 4:
