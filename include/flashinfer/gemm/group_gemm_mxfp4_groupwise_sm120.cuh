@@ -84,10 +84,10 @@ __global__ void compute_sm120_cutlass_group_gemm_args(
       safe_inc_ptr(B, static_cast<size_t>(i) * static_cast<size_t>(n) * static_cast<size_t>(k));
   D_ptr[i] = safe_inc_ptr(D, static_cast<size_t>(m_offset) * static_cast<size_t>(n));
   layout_SFA[i] = ScaleConfig::tile_atom_to_shape_SFA(
-      make_shape(m, static_cast<int>(sf_n), static_cast<int>(swizzled_k), 1));
+      make_shape(static_cast<int>(m), static_cast<int>(sf_n), static_cast<int>(swizzled_k), 1));
   SFA_ptr[i] = safe_inc_ptr(SFA, static_cast<size_t>(sf_m_offset) * static_cast<size_t>(sf_k));
   layout_SFB[i] = ScaleConfig::tile_atom_to_shape_SFB(
-      make_shape(m, static_cast<int>(sf_n), static_cast<int>(swizzled_k), 1));
+      make_shape(static_cast<int>(m), static_cast<int>(sf_n), static_cast<int>(swizzled_k), 1));
   SFB_ptr[i] = safe_inc_ptr(
       SFB, static_cast<size_t>(i) * static_cast<size_t>(sf_n) * static_cast<size_t>(sf_k));
 }
