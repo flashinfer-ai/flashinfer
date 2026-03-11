@@ -404,8 +404,9 @@ __global__ void AirTopPRenormRadixKernel(Counter<T>* counters, HisT<IsDeterminis
 // ======================== Init kernel ========================
 
 template <typename T, typename HisT_>
-__global__ void AirTopPRenormInitKernel(Counter<T>* counters, int len, T const* in, float topP,
-                                        HisT_* histograms, IdxT* countHistograms) {
+__global__ void AirTopPRenormInitKernel(Counter<T>* counters, int len, T const* in,
+                                        float* top_p_arr, float top_p_val, HisT_* histograms,
+                                        IdxT* countHistograms) {
   auto const batchIdx = blockIdx.x;
   Counter<T>* counter = counters + batchIdx;
   if (threadIdx.x == 0) {
@@ -413,7 +414,7 @@ __global__ void AirTopPRenormInitKernel(Counter<T>* counters, int len, T const* 
     counter->len = len;
     counter->oriLen = len;
     counter->previousLen = len;
-    counter->p = topP;
+    counter->p = top_p_arr ? top_p_arr[batchIdx] : top_p_val;
     counter->sum = 0;
     counter->kthValueBits = 0;
     counter->finishedBlockCnt = 0;
@@ -513,8 +514,8 @@ cudaError_t AirTopPRenormProb(DType* probs, DType* renormed_prob, float* top_p_a
   DType* buf1 = reinterpret_cast<DType*>(ws + countersSize + histSize + countHistSize);
   DType* buf2 = reinterpret_cast<DType*>(ws + countersSize + histSize + countHistSize + buf1Size);
 
-  AirTopPRenormInitKernel<DType, HisT_>
-      <<<batch_size, 256, 0, stream>>>(counters, d, probs, top_p_val, histograms, countHistograms);
+  AirTopPRenormInitKernel<DType, HisT_><<<batch_size, 256, 0, stream>>>(
+      counters, d, probs, top_p_arr, top_p_val, histograms, countHistograms);
 
   dim3 grid(blockNum, batch_size);
   constexpr int numPasses = NUM_PASSES<DType>;

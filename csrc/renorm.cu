@@ -36,21 +36,23 @@ void top_p_renorm_probs(TensorView probs, TensorView renorm_probs,
   ffi::CUDADeviceGuard device_guard(probs.device().device_id);
   auto stream = get_stream(probs.device());
 
+  float* top_p_arr_ptr =
+      has_top_p_arr ? static_cast<float*>(maybe_top_p_arr.value().data_ptr()) : nullptr;
+
   cudaError_t status;
-  if (vocab_size < 2048) {
-    // Fallback to ternary search for small vocab where radix precision is insufficient
+  // Fallback to ternary search for small vocab where radix precision is insufficient
+  if (vocab_size < sampling::air_top_p::NUM_BUCKETS) {
     status = sampling::TopPRenormProb<float>(
         static_cast<float*>(probs.data_ptr()), static_cast<float*>(renorm_probs.data_ptr()),
-        has_top_p_arr ? static_cast<float*>(maybe_top_p_arr.value().data_ptr()) : nullptr,
-        batch_size, top_p_val, vocab_size, stream);
+        top_p_arr_ptr, batch_size, top_p_val, vocab_size, stream);
   } else if (is_deterministic) {
     status = sampling::air_top_p::AirTopPRenormProb<true, float>(
         static_cast<float*>(probs.data_ptr()), static_cast<float*>(renorm_probs.data_ptr()),
-        nullptr, batch_size, top_p_val, vocab_size, workspace.data_ptr(), stream);
+        top_p_arr_ptr, batch_size, top_p_val, vocab_size, workspace.data_ptr(), stream);
   } else {
     status = sampling::air_top_p::AirTopPRenormProb<false, float>(
         static_cast<float*>(probs.data_ptr()), static_cast<float*>(renorm_probs.data_ptr()),
-        nullptr, batch_size, top_p_val, vocab_size, workspace.data_ptr(), stream);
+        top_p_arr_ptr, batch_size, top_p_val, vocab_size, workspace.data_ptr(), stream);
   }
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "TopPRenormProb failed with error code " << cudaGetErrorString(status);
