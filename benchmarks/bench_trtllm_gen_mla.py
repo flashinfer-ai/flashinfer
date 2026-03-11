@@ -134,7 +134,6 @@ def bench_trtllm_mla(batch_size, q_len_per_request, seq_len, page_size, dtype, b
     print(f"memory bandwidth: {total_mem_bytes / ms / 1e6:.2f} GB/s")
     print(f"FLOPs: {flops / ms / 1e9:.2f} TFLOPs/s")
 
-
 if __name__ == "__main__":
     import argparse
 
@@ -146,18 +145,17 @@ if __name__ == "__main__":
         help="Backend to use (auto, trtllm-gen, cute-dsl)",
     )
     args = parser.parse_args()
-
-    # cute-dsl only supports float16 and float8_e4m3fn
+    
     if args.backend == "cute-dsl":
-        dtypes = [torch.float16, torch.float8_e4m3fn]
+        q_lens = [1, 2, 4]
     else:
-        dtypes = [torch.bfloat16, torch.float8_e4m3fn]
+        q_lens = [1, 2, 4, 8, 16]
 
-    for dtype in dtypes:
+    for dtype in [torch.bfloat16, torch.float8_e4m3fn]:
         for page_size in [32, 64]:
             for batch_size in [1, 2, 4, 16, 32, 64, 128, 256, 512, 768, 1024]:
                 for seq_len in [1024, 4096, 8192]:
-                    for q_len_per_request in [1, 2, 4, 8, 16]:
+                    for q_len_per_request in q_lens:
                         try:
                             bench_trtllm_mla(
                                 batch_size,
