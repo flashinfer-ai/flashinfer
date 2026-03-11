@@ -895,13 +895,14 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           fc1_weight_block.size(1) ==
               TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
                   inter_size, TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX) *
-                  2 &&
+                  (isGatedActivation(base_activation_type) ? 2 : 1) &&
           fc1_weight_block.size(2) * FP8_PER_INT32 *
                   TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize ==
               TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
                   hidden_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX))
-          << "fc1 weight block size must be (num_experts_on_rank, inter_size * 2, hidden_size // 4 "
-             "// block_scale_vector_size)";
+          << "fc1 weight block size must be (num_experts_on_rank, inter_size * "
+          << (isGatedActivation(base_activation_type) ? 2 : 1) << ", hidden_size // 4"
+             " // block_scale_vector_size)";
       TVM_FFI_ICHECK_EQ(fc1_global.size(0), num_experts_on_rank)
           << "fc1 global size must be (num_experts_on_rank,)";
       TVM_FFI_ICHECK(
@@ -1002,13 +1003,14 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           fc1_weight_block.size(1) ==
               TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
                   inter_size, TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX) *
-                  2 &&
+                  (isGatedActivation(base_activation_type) ? 2 : 1) &&
           fc1_weight_block.size(2) * FP8_PER_INT32 *
                   TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize ==
               TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
                   hidden_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX))
-          << "fc1 weight block size must be (num_experts_on_rank, inter_size * 2, hidden_size // 4 "
-             "// block_scale_vector_size)";
+          << "fc1 weight block size must be (num_experts_on_rank, inter_size * "
+          << (isGatedActivation(base_activation_type) ? 2 : 1) << ", hidden_size // 4"
+             " // block_scale_vector_size)";
       TVM_FFI_ICHECK_EQ(fc1_global.size(0), num_experts_on_rank)
           << "fc1 global size must be (num_experts_on_rank,)";
       TVM_FFI_ICHECK(fc2_act_global.ndim() == 0 || fc2_act_global.size(0) == num_experts_on_rank)
@@ -1061,13 +1063,14 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           fc1_weight_block.size(1) ==
               TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
                   inter_size, TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX) *
-                  2 &&
+                  (isGatedActivation(base_activation_type) ? 2 : 1) &&
           fc1_weight_block.size(2) * FP8_PER_INT32 *
                   TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize ==
               TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
                   hidden_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX))
-          << "fc1 weight block size must be (num_experts_on_rank, inter_size * 2, hidden_size // 4 "
-             "// block_scale_vector_size)";
+          << "fc1 weight block size must be (num_experts_on_rank, inter_size * "
+          << (isGatedActivation(base_activation_type) ? 2 : 1) << ", hidden_size // 4"
+             " // block_scale_vector_size)";
       TVM_FFI_ICHECK_EQ(fc1_global.size(0), num_experts_on_rank)
           << "fc1 global size must be (num_experts_on_rank,)";
       TVM_FFI_ICHECK(
