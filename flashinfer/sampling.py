@@ -400,9 +400,7 @@ def get_sampling_module():
 
     # torch library for top_p_renorm_probs
 
-    @register_custom_op(
-        "flashinfer::top_p_renorm_probs", mutates_args=("workspace",)
-    )
+    @register_custom_op("flashinfer::top_p_renorm_probs", mutates_args=("workspace",))
     def top_p_renorm_probs(
         probs: torch.Tensor,
         maybe_top_p_arr: Optional[torch.Tensor],

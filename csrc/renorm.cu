@@ -46,13 +46,11 @@ void top_p_renorm_probs(TensorView probs, TensorView renorm_probs,
   } else if (is_deterministic) {
     status = sampling::air_top_p::AirTopPRenormProb<true, float>(
         static_cast<float*>(probs.data_ptr()), static_cast<float*>(renorm_probs.data_ptr()),
-        nullptr, batch_size, top_p_val, vocab_size,
-        workspace.data_ptr(), stream);
+        nullptr, batch_size, top_p_val, vocab_size, workspace.data_ptr(), stream);
   } else {
     status = sampling::air_top_p::AirTopPRenormProb<false, float>(
         static_cast<float*>(probs.data_ptr()), static_cast<float*>(renorm_probs.data_ptr()),
-        nullptr, batch_size, top_p_val, vocab_size,
-        workspace.data_ptr(), stream);
+        nullptr, batch_size, top_p_val, vocab_size, workspace.data_ptr(), stream);
   }
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "TopPRenormProb failed with error code " << cudaGetErrorString(status);
