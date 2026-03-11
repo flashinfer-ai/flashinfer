@@ -2711,12 +2711,19 @@ def chunk_gated_delta_rule_cutile(
     ct.launch(stream, (NT, BH), ckkt_kernel,
               (g, k, beta, g_cumsum, A_inv, T, H, K, 64, BK))
 
-    if K <= 128 and BH >= 64 and rec_BV <= 32 and NT * BH >= 512:
+    # For fused path: if BV>32 but BV=32 with more CTAs is possible, prefer that
+    fused_BV = rec_BV
+    fused_n_v = n_v
+    if K <= 128 and BH >= 64 and rec_BV > 32 and V <= 128:
+        fused_BV = 32
+        fused_n_v = (V + 31) // 32
+    use_fused = K <= 128 and BH >= 64 and fused_BV <= 32 and NT * BH >= 512
+    if use_fused:
         # Fused WY+rec: w, u computed on-the-fly per chunk, never in HBM.
         # Saves w+u write+read bandwidth (~128MB for large configs at 8TB/s = ~16us).
-        ct.launch(stream, (n_v, BH), cutile_fused_wy_rec_kernel,
+        ct.launch(stream, (fused_n_v, BH), cutile_fused_wy_rec_kernel,
                   (k, v, beta, g_cumsum, A_inv, h, v_new,
-                   initial_state, initial_state_indices, T, H, K, V, 64, rec_BV, NT, USE_INITIAL))
+                   initial_state, initial_state_indices, T, H, K, V, 64, fused_BV, NT, USE_INITIAL))
     else:
         _recompute_w_u_cached(k, v, beta, g_cumsum, A_inv, c['w'], c['u'])
         ct.launch(stream, (n_v, BH), rec_kernel,
