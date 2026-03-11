@@ -46,13 +46,12 @@ _SKIP_CORRECTION_THRESHOLD = 0.0
 def _get_split_kv_and_workspace_size(
     B: int,
     q_len: int,
-    max_seq_len: int,
     H: int,
     max_active_blocks: int,
 ) -> Tuple[int, int]:
     """Cache split_kv and workspace_size since they are deterministic for the same params."""
-    split_kv = BlackwellMultiHeadLatentAttentionForwardFP16.get_split_kv(
-        B, q_len, max_seq_len, _MMA_QK_TILER_MN, max_active_blocks
+    split_kv = BlackwellMultiHeadLatentAttentionForwardFP16.get_split_kv_simplified(
+        B, q_len, max_active_blocks
     )
     workspace_size = BlackwellMultiHeadLatentAttentionForwardFP16.get_workspace_size(
         H, q_len, _LATENT_DIM, B, split_kv, cutlass.Float32
@@ -230,7 +229,6 @@ def cute_dsl_mla_decode(
     max_seq_len: int,
     softmax_scale: float,
     output_scale: float = 1.0,
-    is_var_split_kv: bool = False,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """CuTe DSL MLA decode kernel for Blackwell SM100.
@@ -257,10 +255,6 @@ def cute_dsl_mla_decode(
         Scale factor for QK^T before softmax.
     output_scale : float
         Scale factor applied to the output.
-    is_var_split_kv : bool
-        Whether to use variable split_kv per batch. When False (default),
-        uses a uniform scalar split_kv, avoiding a torch.full GPU kernel.
-        When True, allocates a per-batch block_split_kvs tensor.
     out : Optional[torch.Tensor]
         Pre-allocated output tensor [B, H, kv_lora_rank].
 
@@ -304,7 +298,7 @@ def cute_dsl_mla_decode(
     # Cached split_kv and workspace_size computation
     max_active_blocks = get_num_sm(query.device)
     split_kv, workspace_size = _get_split_kv_and_workspace_size(
-        B, q_len, max_seq_len, H, max_active_blocks
+        B, q_len, H, max_active_blocks
     )
 
     # Prepare workspace — slice of contiguous 1D buffer is already contiguous
@@ -333,15 +327,8 @@ def cute_dsl_mla_decode(
     # cache_seqs: per-batch sequence lengths (skip .to() if already int32)
     cache_seqs = seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
 
-    # block_split_kvs: only needed when is_var_split_kv=True
-    if is_var_split_kv:
-        # TODO: this will trigger a kernel.
-        # TODO: need to align with the test in kernel file.
-        block_split_kvs = torch.full(
-            (B,), split_kv, dtype=torch.int32, device=query.device
-        )
-    else:
-        block_split_kvs = None
+    is_var_split_kv = False
+    block_split_kvs = None
 
     # Get compiled kernel (cached after first compile)
     compiled_kernel = _get_compiled_mla_kernel(

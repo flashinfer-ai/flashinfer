@@ -1494,6 +1494,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         split_wave_aware = ceil_div(max_splits, k_waves)
         max_split_kv = 32
         return min(split_wave_aware, max_split_kv)
+   
+    @staticmethod
+    def get_split_kv_simplified(
+        B: int, S: int, max_active_blocks: int
+    ) -> int:
+        blocks_per_batch = max(1, max_active_blocks // B // (S * 2))
+        max_split_kv = 32
+        return min(blocks_per_batch, max_split_kv)
 
     @cute.jit
     def get_k_tile_count(
