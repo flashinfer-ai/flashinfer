@@ -436,6 +436,7 @@ def _test_trtllm_batch_prefill(
     head_dim: int,
     non_contiguous_query: bool = False,
     skips_softmax: bool = False,
+    uses_shared_paged_kv_idx: bool = True,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] != 10:
@@ -581,7 +582,7 @@ def _test_trtllm_batch_prefill(
         enable_pdl=enable_pdl,
         sinks=(sink if enable_sink else None),
         skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
-        uses_shared_paged_kv_idx=True,
+        uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
     )
     # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
     # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
@@ -615,7 +616,9 @@ def _test_trtllm_batch_prefill(
         max_mismatched_elements=max_mismatched_elements,
     )
 
-    if o_dtype != "nvfp4":  # wrapper api does not support fp4 output yet.
+    # wrapper api does not support fp4 output yet.
+    # Wrapper API test only supports flashinfer/vLLM layout.
+    if o_dtype != "nvfp4" and uses_shared_paged_kv_idx:
         # test wrapper with trtllm-gen backend
         wrapper_trtllm_gen = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
             workspace_buffer, kv_layout, backend="trtllm-gen"
@@ -738,6 +741,7 @@ def test_trtllm_batch_prefill(
 @pytest.mark.parametrize("max_kv_len", [8192])
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("skips_softmax", [False, True])
+@pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
 def test_trtllm_batch_prefill_bs1(
     kv_layout: str,
     batch_size: int,
@@ -754,6 +758,7 @@ def test_trtllm_batch_prefill_bs1(
     max_kv_len: int,
     head_dim: int,
     skips_softmax: bool,
+    uses_shared_paged_kv_idx: bool,
 ):
     _test_trtllm_batch_prefill(
         kv_layout,
@@ -772,6 +777,7 @@ def test_trtllm_batch_prefill_bs1(
         False,
         head_dim,
         skips_softmax=skips_softmax,
+        uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
     )
 
 
