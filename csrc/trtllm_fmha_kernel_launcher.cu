@@ -346,6 +346,7 @@ void trtllm_paged_attention_context(
     double o_sf_scale, int64_t o_sf_vec_size, int64_t o_sf_start_index, int64_t batch_size,
     int64_t window_left, TensorView cum_seq_lens_q, TensorView cum_seq_lens_kv, int64_t sm_count,
     bool enable_pdl, int64_t workspace_size, Optional<TensorView> attention_sinks,
+    Optional<TensorView> key_block_scales, Optional<TensorView> value_block_scales,
     Optional<float> skip_softmax_threshold_scale_factor) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
@@ -366,17 +367,31 @@ void trtllm_paged_attention_context(
   int max_num_blocks_per_seq = block_tables.size(-1);
   bool is_shared_kv = key_cache.data_ptr() == value_cache.data_ptr();
   int num_pages_in_mem_pool = is_shared_kv ? key_cache.size(0) : key_cache.size(0) * 2;
+  bool is_fp4_kv = is_4bit(kv_data_type);
+  int stride_idx_factor = is_fp4_kv ? 2 : 1;
 
-  // Assume NHD layout: [..., H, N, D]
+  // Assume HND layout after Python-side transpose: [..., H, N, D]
   int page_size = key_cache.size(-2);
   int num_kv_heads = key_cache.size(-3);
-  int kv_stride_keys_values = key_cache.stride(-2);  // key/values
-  int kv_stride_heads = key_cache.stride(-3);        // head
-  int kv_stride_batch = key_cache.stride(0);         // batch
+  int kv_stride_keys_values = key_cache.stride(-2) * stride_idx_factor;  // key/values
+  int kv_stride_heads = key_cache.stride(-3) * stride_idx_factor;        // head
+  int kv_stride_batch = key_cache.stride(0) * stride_idx_factor;         // batch
 
   // Query stride: [num_tokens, num_heads, head_dim]
   int q_stride_tokens = query.stride(0);  // stride between tokens
   int q_stride_heads = query.stride(1);   // stride between heads
+
+  // kv block scales
+  if (is_fp4_kv) {
+    TVM_FFI_ICHECK(key_block_scales.has_value())
+        << "key_block_scales must be provided for FP4 kv cache";
+    TVM_FFI_ICHECK(value_block_scales.has_value())
+        << "value_block_scales must be provided for FP4 kv cache";
+  }
+  const void* k_block_scales_ptr =
+      key_block_scales.has_value() ? key_block_scales.value().data_ptr() : nullptr;
+  const void* v_block_scales_ptr =
+      value_block_scales.has_value() ? value_block_scales.value().data_ptr() : nullptr;
 
   const auto stream = get_stream(query.device());
   void* output_sf_ptr =
@@ -416,9 +431,8 @@ void trtllm_paged_attention_context(
 
   trtllm_paged_attention_launcher(
       out.data_ptr(), output_sf_ptr, query.data_ptr(), key_cache.data_ptr(), value_cache.data_ptr(),
-      workspace_buffer.data_ptr(), static_cast<int*>(block_tables.data_ptr()),
-      /*k_block_scales*/ nullptr, /*v_block_scales*/ nullptr,
-      static_cast<int*>(seq_lens.data_ptr()),
+      workspace_buffer.data_ptr(), static_cast<int*>(block_tables.data_ptr()), k_block_scales_ptr,
+      v_block_scales_ptr, static_cast<int*>(seq_lens.data_ptr()),
       /*cum_seq_lens_q=*/static_cast<int*>(cum_seq_lens_q.data_ptr()),
       /*cum_seq_lens_kv=*/static_cast<int*>(cum_seq_lens_kv.data_ptr()), attention_sinks_ptr,
       q_data_type, kv_data_type, o_data_type, TllmPagedAttentionMode::Context, batch_size,
