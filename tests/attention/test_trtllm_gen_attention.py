@@ -475,6 +475,20 @@ def _test_trtllm_batch_prefill(
     kv_indptr = generate_cumsum_lens(page_per_seq)
     kv_last_page_len = get_last_page_len(seq_lens, page_size)
 
+    # When K and V use separate page indices, fold the interleaved KV dim into
+    # the page count so the kernel sees independent K/V pages in one pool.
+    # Reshape [num_pages, 2, ...] -> [num_pages*2, ...] so original page p
+    # becomes K at index 2*p and V at 2*p+1. The page table goes from
+    # [batch_size, maxPages] to [batch_size, 2, maxPages] where dim 1
+    # distinguishes K (0) and V (1) indices.
+    if not uses_shared_paged_kv_idx:
+        num_pages = kv_cache.shape[0]
+        kv_cache_kernel = kv_cache.reshape(num_pages * 2, *kv_cache.shape[2:])
+        page_table_kernel = torch.stack([2 * page_table, 2 * page_table + 1], dim=1)
+    else:
+        kv_cache_kernel = kv_cache
+        page_table_kernel = page_table
+
     workspace_buffer, workspace_buffer_ref = create_workspace_buffers(GPU_DEVICE)
 
     # Create output tensor and related data
@@ -560,11 +574,16 @@ def _test_trtllm_batch_prefill(
     # Using a tiny threshold should give the same result as normal attention.
     skip_softmax_threshold_scale_factor = 1e-30 if skips_softmax else None
 
+    kv_cache_arg = (
+        (kv_cache_kernel, kv_cache_kernel)
+        if not uses_shared_paged_kv_idx
+        else kv_cache_kernel
+    )
     output = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
         q_input,
-        kv_cache,
+        kv_cache_arg,
         workspace_buffer,
-        page_table,
+        page_table_kernel,
         seq_lens.to(GPU_DEVICE),
         torch.max(q_lens).item(),
         torch.max(seq_lens).item(),
@@ -682,6 +701,7 @@ def _test_trtllm_batch_prefill(
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("non_contiguous_query", [False, True])
 @pytest.mark.parametrize("skips_softmax", [False, True])
+@pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
 def test_trtllm_batch_prefill(
     kv_layout: str,
     batch_size: int,
@@ -699,6 +719,7 @@ def test_trtllm_batch_prefill(
     head_dim: int,
     non_contiguous_query: bool,
     skips_softmax: bool,
+    uses_shared_paged_kv_idx: bool,
 ):
     _test_trtllm_batch_prefill(
         kv_layout,
@@ -718,6 +739,7 @@ def test_trtllm_batch_prefill(
         head_dim,
         non_contiguous_query=non_contiguous_query,
         skips_softmax=skips_softmax,
+        uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
     )
 
 
