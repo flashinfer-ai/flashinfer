@@ -50,6 +50,10 @@ struct SingleDecodeParams {
   float rope_rcp_scale;
   float rope_rcp_theta;
   uint32_t kv_chunk_size;
+  // CUDA graph support: when d_kv_len is set, kernel reads actual kv_len from
+  // this device pointer; max_kv_len is used on host to size the grid.
+  uint32_t* d_kv_len;
+  uint32_t max_kv_len;
 
   __device__ __host__ SingleDecodeParams()
       : q(nullptr),
@@ -70,7 +74,9 @@ struct SingleDecodeParams {
         sm_scale(0.0f),
         rope_rcp_scale(0.0f),
         rope_rcp_theta(0.0f),
-        kv_chunk_size(0) {}
+        kv_chunk_size(0),
+        d_kv_len(nullptr),
+        max_kv_len(0) {}
 
   __device__ __host__ SingleDecodeParams(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeO* o,
                                          float* maybe_alibi_slopes, uint32_t seq_len,
@@ -96,12 +102,18 @@ struct SingleDecodeParams {
         sm_scale(sm_scale),
         rope_rcp_scale(1.f / rope_scale),
         rope_rcp_theta(1.f / rope_theta),
-        kv_chunk_size(0) {}
+        kv_chunk_size(0),
+        d_kv_len(nullptr),
+        max_kv_len(0) {}
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const { return 1; }
 
   __host__ __device__ __forceinline__ uint32_t get_kv_len(uint32_t batch_idx) const {
+#ifdef __CUDA_ARCH__
+    return d_kv_len ? *d_kv_len : kv_len;
+#else
     return kv_len;
+#endif
   }
 };
 

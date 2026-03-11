@@ -270,6 +270,23 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
   block.sync();
 
   uint32_t chunk_start = kv_chunk_idx * kv_chunk_size;
+  // Early-exit for blocks beyond the actual sequence length.  This happens
+  // when the grid is sized for max_kv_len (CUDA graph) but the real kv_len
+  // is shorter.  Write zero output and very-negative lse so MergeStates
+  // treats this chunk as having no contribution.
+  if (chunk_start >= seq_len) {
+    if (tz == 0) {
+      DTypeO* o_ptr = o + (kv_chunk_idx * num_qo_heads + qo_head_idx) * head_dim + tx * vec_size;
+#pragma unroll
+      for (uint32_t i = 0; i < vec_size; ++i) {
+        o_ptr[i] = DTypeO(0);
+      }
+      if (lse != nullptr && tx == 0) {
+        lse[kv_chunk_idx * num_qo_heads + qo_head_idx] = -5e4;
+      }
+    }
+    return;
+  }
   kv_chunk_size = min(kv_chunk_size, seq_len - chunk_start);
   uint32_t chunk_end = chunk_start + kv_chunk_size;
 
@@ -664,7 +681,9 @@ cudaError_t SingleDecodeWithKVCacheDispatched(Params params, typename Params::DT
   using DTypeO = typename Params::DTypeO;
   const uint32_t num_qo_heads = params.num_qo_heads;
   const uint32_t num_kv_heads = params.num_kv_heads;
-  const uint32_t seq_len = params.kv_len;
+  // When max_kv_len is set (CUDA graph mode), use it for grid sizing so that
+  // the grid topology stays fixed across replays with different actual kv_len.
+  const uint32_t seq_len = (params.max_kv_len > 0) ? params.max_kv_len : params.kv_len;
 
   constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeKV), HEAD_DIM / 32UL);
   constexpr uint32_t bdx = HEAD_DIM / vec_size;
