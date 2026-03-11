@@ -52,7 +52,7 @@ def _get_split_kv_and_workspace_size(
 
 
 @functools.cache
-def _get_compiled_mla_kernel(
+def _check_can_implement(
     torch_dtype: torch.dtype,
     page_size: int,
     num_heads: int,
@@ -62,19 +62,10 @@ def _get_compiled_mla_kernel(
     is_persistent: bool,
     is_var_seq: bool,
     is_var_split_kv: bool,
-    skip_correction_threshold: float = 0.0,
-) -> Callable:
-    """Compile and cache an MLA decode kernel.
-
-    Returns a callable that accepts (q_latent, q_rope, c_latent, c_rope,
-    page_table, o, lse, workspace, split_kv_scalar, cache_seqs,
-    block_split_kvs, softmax_scale_scalar, output_scale_scalar).
-
-    All scalar arguments must be pre-wrapped as Int32/Float32.
-    """
+) -> None:
+    """Check if the kernel supports the given configuration (cached)."""
     mma_qk_tiler_mn = (128, 128)
     mma_pv_tiler_mn = (128, 256)
-    cluster_shape_mnk = (2, 1, 1)
 
     is_fp8 = torch_dtype == torch.float8_e4m3fn
     KernelClass = (
@@ -82,7 +73,6 @@ def _get_compiled_mla_kernel(
         if is_fp8
         else BlackwellMultiHeadLatentAttentionForwardFP16
     )
-
     cutlass_dtype = torch_to_cutlass_dtype(torch_dtype)
     if not KernelClass.can_implement(
         1,  # B (runtime, use placeholder)
@@ -108,6 +98,38 @@ def _get_compiled_mla_kernel(
             f"(q_len={seq_len_q}, num_heads={num_heads}, page_size={page_size}, "
             f"dtype={torch_dtype})"
         )
+
+
+@functools.cache
+def _get_compiled_mla_kernel(
+    torch_dtype: torch.dtype,
+    page_size: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    is_persistent: bool,
+    is_var_seq: bool,
+    is_var_split_kv: bool,
+    skip_correction_threshold: float = 0.0,
+) -> Callable:
+    """Compile and cache an MLA decode kernel.
+
+    Returns a callable that accepts (q_latent, q_rope, c_latent, c_rope,
+    page_table, o, lse, workspace, split_kv_scalar, cache_seqs,
+    block_split_kvs, softmax_scale_scalar, output_scale_scalar).
+
+    All scalar arguments must be pre-wrapped as Int32/Float32.
+    """
+    mma_qk_tiler_mn = (128, 128)
+    mma_pv_tiler_mn = (128, 256)
+    cluster_shape_mnk = (2, 1, 1)
+
+    is_fp8 = torch_dtype == torch.float8_e4m3fn
+    KernelClass = (
+        BlackwellMultiHeadLatentAttentionForwardFP8
+        if is_fp8
+        else BlackwellMultiHeadLatentAttentionForwardFP16
+    )
+    cutlass_dtype = torch_to_cutlass_dtype(torch_dtype)
 
     kernel_obj = KernelClass(
         acc_dtype=cutlass.Float32,
@@ -372,12 +394,23 @@ def cute_dsl_mla_decode(
     block_split_kvs = None
     skip_correction_threshold = 0.0
 
-    # Get compiled kernel (cached after first compile)
-    compiled_kernel = _get_compiled_mla_kernel(
+    # Validate configuration (cached, negligible overhead after first call)
+    _check_can_implement(
         torch_dtype=q_dtype,
         page_size=page_size,
         num_heads=H,
         seq_len_q=q_len,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        is_persistent=True,
+        is_var_seq=True,
+        is_var_split_kv=is_var_split_kv,
+    )
+
+    # Get compiled kernel (cached after first compile)
+    compiled_kernel = _get_compiled_mla_kernel(
+        torch_dtype=q_dtype,
+        page_size=page_size,
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
         is_persistent=True,
