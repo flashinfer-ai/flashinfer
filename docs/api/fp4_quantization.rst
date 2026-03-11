@@ -20,6 +20,20 @@ Core Quantization Functions
     e2m1_and_ufp8sf_scale_to_float
     scaled_fp4_grouped_quantize
 
+KV Cache Quantization
+---------------------
+
+These functions provide GPU-accelerated NVFP4 quantization and dequantization for KV cache data
+using a linear (non-swizzled) block scale layout. The dequantization kernel supports SM80+,
+while the quantization kernel requires SM100+ (Blackwell) for the ``cvt.rn.satfinite.e2m1x2.f32``
+PTX instruction.
+
+.. autosummary::
+    :toctree: ../generated
+
+    nvfp4_kv_quantize
+    nvfp4_kv_dequantize
+
 Matrix Shuffling Utilities
 --------------------------
 
