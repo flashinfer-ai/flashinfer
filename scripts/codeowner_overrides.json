@@ -1,8 +1,6 @@
 {
   "scripts/codeowner_overrides.json": ["@ci-users"],
 
-  "csrc": ["@jiahanc"],
-
   "flashinfer/attention.py": ["@flashinfer-ai/attention-owners"],
   "include/flashinfer/attention": ["@flashinfer-ai/attention-owners"],
   "csrc/fmha_v2": ["@flashinfer-ai/attention-owners"],
