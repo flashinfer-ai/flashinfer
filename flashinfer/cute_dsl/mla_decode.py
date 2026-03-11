@@ -110,6 +110,7 @@ def _get_compiled_mla_kernel(
     is_var_seq: bool,
     is_var_split_kv: bool,
     skip_correction_threshold: float = 0.0,
+    is_workspace_size_zero: bool = False,
 ) -> Callable:
     """Compile and cache an MLA decode kernel.
 
@@ -216,12 +217,15 @@ def _get_compiled_mla_kernel(
         stride_order=(2, 1, 0),
         assumed_align=128,
     )
-    # workspace: 1-D (int8 to match typical torch workspace buffers)
-    workspace_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int8,
-        (sym_workspace_size,),
-        assumed_align=128,
-    )
+    if is_workspace_size_zero:
+        workspace_fake = None
+    else:
+        # workspace: 1-D (int8 to match typical torch workspace buffers)
+        workspace_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int8,
+            (sym_workspace_size,),
+            assumed_align=128,
+        )
     # cache_seqs: [batch_size] — int32
     cache_seqs_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
@@ -369,8 +373,11 @@ def cute_dsl_mla_decode(
         f"workspace_buffer too small: {workspace_buffer.numel()} bytes, "
         f"need {workspace_size} bytes"
     )
-    workspace_bytes = workspace_buffer[: max(workspace_size, 1)]
-
+    is_workspace_size_zero = workspace_size == 0
+    if is_workspace_size_zero:
+        workspace_bytes = None
+    else:
+        workspace_bytes = workspace_buffer[: workspace_size]
     # Output buffer: contiguous [B, q_len, H, D].
     # Kernel reinterprets to [H, D, q_len, B] internally via zero-cost make_tensor.
     out_dtype = q_dtype
@@ -405,6 +412,8 @@ def cute_dsl_mla_decode(
     )
 
     # Get compiled kernel (cached after first compile)
+    # Note: when is_workspace_size_zero is True, workspace_bytes is None and it will launch one kernel without workspace.
+    # Otherwise, workspace_bytes is not None and it will launch two kernels.
     compiled_kernel = _get_compiled_mla_kernel(
         torch_dtype=q_dtype,
         page_size=page_size,
@@ -414,6 +423,7 @@ def cute_dsl_mla_decode(
         is_var_seq=True,
         is_var_split_kv=is_var_split_kv,
         skip_correction_threshold=skip_correction_threshold,
+        is_workspace_size_zero=is_workspace_size_zero,
     )
 
     # Call the kernel
