@@ -171,14 +171,14 @@ def _get_compiled_mla_kernel(
         cutlass_dtype,
         (sym_batch, sym_seq_q, sym_heads, sym_latent),
         stride_order=(3, 2, 1, 0),
-        assumed_align=128,
+        assumed_align=16,
     )
     # q_rope: [batch_size, seq_len_q, num_heads, rope_dim] — contiguous
     q_rope_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype,
         (sym_batch, sym_seq_q, sym_heads, sym_rope),
         stride_order=(3, 2, 1, 0),
-        assumed_align=128,
+        assumed_align=16,
     )
     # c_latent: [kv_batch, seq_len_k, latent_dim] — contiguous
     # kv_batch is a separate sym_int from query batch: paged KV cache uses a flat
@@ -187,35 +187,35 @@ def _get_compiled_mla_kernel(
         cutlass_dtype,
         (sym_kv_batch, sym_seq_kv, sym_latent),
         stride_order=(2, 1, 0),
-        assumed_align=128,
+        assumed_align=16,
     )
     # c_rope: [kv_batch, seq_len_k, rope_dim] — contiguous
     c_rope_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype,
         (sym_kv_batch, sym_seq_kv, sym_rope),
         stride_order=(2, 1, 0),
-        assumed_align=128,
+        assumed_align=16,
     )
     # page_table: [batch_size, page_count] — contiguous
     page_table_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
         (sym_batch, sym_page_count),
         stride_order=(1, 0),
-        assumed_align=128,
+        assumed_align=16,
     )
     # o: [batch_size, seq_len_q, num_heads, latent_dim] — contiguous
     o_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype,
         (sym_batch, sym_seq_q, sym_heads, sym_latent),
         stride_order=(3, 2, 1, 0),
-        assumed_align=128,
+        assumed_align=16,
     )
     # lse: [batch_size, seq_len_q, num_heads] — contiguous
     lse_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
         (sym_batch, sym_seq_q, sym_heads),
         stride_order=(2, 1, 0),
-        assumed_align=128,
+        assumed_align=16,
     )
     if is_workspace_size_zero:
         workspace_fake = None
@@ -224,20 +224,20 @@ def _get_compiled_mla_kernel(
         workspace_fake = cute.runtime.make_fake_compact_tensor(
             cutlass.Int8,
             (sym_workspace_size,),
-            assumed_align=128,
+            assumed_align=32,
         )
     # cache_seqs: [batch_size] — int32
     cache_seqs_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
         (sym_batch,),
-        assumed_align=128,
+        assumed_align=16,
     )
     # block_split_kvs: [batch_size] — int32 (only needed for is_var_split_kv=True)
     if is_var_split_kv:
         block_split_kvs_fake = cute.runtime.make_fake_compact_tensor(
             cutlass.Int32,
             (sym_batch,),
-            assumed_align=128,
+            assumed_align=16,
         )
     else:
         block_split_kvs_fake = None
