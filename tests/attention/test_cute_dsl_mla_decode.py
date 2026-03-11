@@ -98,8 +98,9 @@ def torch_reference_mla(
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("seq_len_k", [128, 512, 2048])
 @pytest.mark.parametrize("page_size", [128])
-def test_cute_dsl_mla_decode_fp16(batch_size, seq_len_k, page_size):
-    """Test FP16 MLA decode kernel."""
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_cute_dsl_mla_decode_fp16(batch_size, seq_len_k, page_size, dtype):
+    """Test FP16/BF16 MLA decode kernel."""
     skip_if_unsupported()
 
     from flashinfer.cute_dsl.mla_decode import cute_dsl_mla_decode
@@ -117,7 +118,7 @@ def test_cute_dsl_mla_decode_fp16(batch_size, seq_len_k, page_size):
     # Allocate query: [B, q_len, H, D_qk]
     D_qk = latent_dim + rope_dim
     query = torch.randn(
-        batch_size, q_len, num_heads, D_qk, dtype=torch.float16, device=device
+        batch_size, q_len, num_heads, D_qk, dtype=dtype, device=device
     )
 
     # Allocate paged KV cache
@@ -127,7 +128,7 @@ def test_cute_dsl_mla_decode_fp16(batch_size, seq_len_k, page_size):
         total_pages,
         page_size,
         latent_dim + rope_dim,
-        dtype=torch.float16,
+        dtype=dtype,
         device=device,
     )
 
@@ -143,7 +144,7 @@ def test_cute_dsl_mla_decode_fp16(batch_size, seq_len_k, page_size):
     seq_lens = torch.full((batch_size,), seq_len_k, dtype=torch.int32, device=device)
 
     # Workspace
-    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device=device)
 
     # Run kernel
     out = cute_dsl_mla_decode(
@@ -181,10 +182,10 @@ def test_cute_dsl_mla_decode_fp16(batch_size, seq_len_k, page_size):
     if q_len == 1:
         ref_out = ref_out.squeeze(1)
 
-    ref_out_fp16 = ref_out.to(torch.float16)
+    ref_out_cast = ref_out.to(dtype)
 
-    # Check with tolerance appropriate for FP16
-    torch.testing.assert_close(out, ref_out_fp16, atol=1e-2, rtol=1e-2)
+    # Check with tolerance appropriate for FP16/BF16
+    torch.testing.assert_close(out, ref_out_cast, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("batch_size", [1, 4])
@@ -229,7 +230,7 @@ def test_cute_dsl_mla_decode_variable_seq_len(batch_size, seq_len_k, page_size=1
         for p in range(max_pages_per_batch):
             block_tables[b, p] = b * max_pages_per_batch + p
 
-    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device=device)
 
     out = cute_dsl_mla_decode(
         query=query,
@@ -305,7 +306,7 @@ def test_cute_dsl_mla_decode_via_api(batch_size, seq_len_k, page_size=128):
             block_tables[b, p] = b * num_pages_per_batch + p
 
     seq_lens = torch.full((batch_size,), seq_len_k, dtype=torch.int32, device=device)
-    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device=device)
 
     out = trtllm_batch_decode_with_kv_cache_mla(
         query=query,
@@ -368,7 +369,7 @@ def test_cute_dsl_mla_decode_fp8(batch_size, seq_len_k, page_size):
             block_tables[b, p] = b * num_pages_per_batch + p
 
     seq_lens = torch.full((batch_size,), seq_len_k, dtype=torch.int32, device=device)
-    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device=device)
 
     out = cute_dsl_mla_decode(
         query=query,

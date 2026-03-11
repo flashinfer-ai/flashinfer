@@ -16,7 +16,7 @@
 CuTe DSL MLA Decode Kernel Integration
 =======================================
 
-Wraps NVIDIA's CuTe DSL MLA decode kernels (FP16/FP8) for Blackwell SM100
+Wraps NVIDIA's CuTe DSL MLA decode kernels (FP16/BF16/FP8) for Blackwell SM100
 and exposes them via a PyTorch API compatible with FlashInfer's MLA backend.
 """
 
@@ -30,7 +30,7 @@ from cutlass import Float32, Int32
 
 from .mla_decode_fp16 import BlackwellMultiHeadLatentAttentionForwardFP16
 from .mla_decode_fp8 import BlackwellMultiHeadLatentAttentionForwardFP8
-from .utils import get_num_sm
+from .utils import get_num_sm, torch_to_cutlass_dtype
 
 
 # Default kernel configuration — matches DeepSeek-V2/V3 MLA dimensions
@@ -40,6 +40,8 @@ _MMA_QK_TILER_MN = (128, 128)
 _MMA_PV_TILER_MN = (128, 256)
 _MAX_ACTIVE_CLUSTERS = 2
 _SKIP_CORRECTION_THRESHOLD = 0.0
+
+_SUPPORTED_DTYPES = {torch.float16, torch.bfloat16, torch.float8_e4m3fn}
 
 
 @functools.cache
@@ -61,7 +63,7 @@ def _get_split_kv_and_workspace_size(
 
 @functools.cache
 def _get_compiled_mla_kernel(
-    is_fp8: bool,
+    torch_dtype: torch.dtype,
     page_size: int,
     num_heads: int,
     seq_len_q: int,
@@ -77,11 +79,38 @@ def _get_compiled_mla_kernel(
 
     All scalar arguments must be pre-wrapped as Int32/Float32.
     """
+    is_fp8 = torch_dtype == torch.float8_e4m3fn
     KernelClass = (
         BlackwellMultiHeadLatentAttentionForwardFP8
         if is_fp8
         else BlackwellMultiHeadLatentAttentionForwardFP16
     )
+
+    cutlass_dtype = torch_to_cutlass_dtype(torch_dtype)
+    if not KernelClass.can_implement(
+        1,  # B (runtime, use placeholder)
+        seq_len_q,
+        1,  # K (runtime, use placeholder)
+        num_heads,
+        _LATENT_DIM,
+        _ROPE_DIM,
+        cutlass_dtype,
+        cutlass_dtype,
+        cutlass.Float32,
+        cutlass.Float32,
+        _MMA_QK_TILER_MN,
+        _MMA_PV_TILER_MN,
+        1,  # split_kv (runtime, use 1 to pass the H<128 check)
+        is_persistent,
+        is_var_seq,
+        is_var_split_kv,
+        page_size,
+    ):
+        raise ValueError(
+            f"cute_dsl_mla_decode: unsupported configuration "
+            f"(q_len={seq_len_q}, num_heads={num_heads}, page_size={page_size}, "
+            f"dtype={torch_dtype})"
+        )
 
     kernel_obj = KernelClass(
         acc_dtype=cutlass.Float32,
@@ -95,8 +124,6 @@ def _get_compiled_mla_kernel(
         is_var_seq=is_var_seq,
         is_var_split_kv=is_var_split_kv,
     )
-
-    cutlass_dtype = cutlass.Float8E4M3FN if is_fp8 else cutlass.Float16
 
     # All dimensions as sym_int — this matches the original kernel's use of
     # mark_compact_shape_dynamic, which makes ALL shapes dynamic CuTe Integers.
@@ -168,9 +195,9 @@ def _get_compiled_mla_kernel(
         stride_order=(2, 1, 0),
         assumed_align=128,
     )
-    # workspace: 1-D
+    # workspace: 1-D (int8 to match typical torch workspace buffers)
     workspace_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Uint8,
+        cutlass.Int8,
         (sym_workspace_size,),
         assumed_align=128,
     )
@@ -214,9 +241,6 @@ def _get_compiled_mla_kernel(
     return compiled_kernel
 
 
-# TODO: need to tell users the max size of the workspace in the doc, so that they can allocate the workspace_buffer.
-# TODO: how to set split_kv, is_persistent, is_var_seq, is_var_split_kv?
-# TODO: check if page_size setup is right.
 # TODO: query[..., :kv_lora_rank], do we need to remove such kind of slice and move the logic to call routine in the kernel file.
 def cute_dsl_mla_decode(
     query: torch.Tensor,
@@ -240,7 +264,13 @@ def cute_dsl_mla_decode(
     kv_cache : torch.Tensor
         [num_pages, page_size, D_ckv + D_kpe] (3D) or [num_pages, 1, page_size, D_ckv + D_kpe] (4D)
     workspace_buffer : torch.Tensor
-        Pre-allocated workspace buffer.
+        Pre-allocated workspace buffer (uint8). Required size depends on batch size
+        and split_kv (auto-computed from B, q_len, and number of SMs):
+
+        - Formula: ``B * H * q_len * split_kv * (kv_lora_rank + 1) * 4`` bytes
+          (0 when split_kv == 1, which happens when B >= num_SMs / 2)
+        - Typical max: ~18 MB on a 148-SM GPU (e.g. B=4..8, H=128, D=512)
+        - Safe default: 128 MB covers all realistic configurations
     kv_lora_rank : int
         Latent dimension (e.g. 512).
     qk_rope_head_dim : int
@@ -263,10 +293,9 @@ def cute_dsl_mla_decode(
     torch.Tensor
         Output tensor [B, H, kv_lora_rank].
     """
-    assert query.dtype in (
-        torch.float16,
-        torch.float8_e4m3fn,
-    ), f"cute_dsl_mla_decode only supports float16 and float8_e4m3fn, got {query.dtype}"
+    assert query.dtype in _SUPPORTED_DTYPES, (
+        f"cute_dsl_mla_decode only supports {_SUPPORTED_DTYPES}, got {query.dtype}"
+    )
     assert kv_cache.dtype == query.dtype, (
         f"kv_cache dtype {kv_cache.dtype} must match query dtype {query.dtype}"
     )
@@ -275,7 +304,8 @@ def cute_dsl_mla_decode(
     assert kv_lora_rank == _LATENT_DIM
     assert qk_rope_head_dim == _ROPE_DIM
 
-    is_fp8 = query.dtype == torch.float8_e4m3fn
+    q_dtype = query.dtype
+    is_fp8 = q_dtype == torch.float8_e4m3fn
 
     # Handle 3D vs 4D kv_cache: normalize to 3D [num_pages, page_size, D_total]
     if kv_cache.dim() == 4:
@@ -292,8 +322,16 @@ def cute_dsl_mla_decode(
     c_latent_k = kv_cache[:, :, :kv_lora_rank]
     c_rope_k = kv_cache[:, :, kv_lora_rank:]
 
-    # Page table: [B, max_pages] — passed directly, kernel reinterprets.
+    # Page table: [B, max_pages]: passed directly, kernel reinterprets.
     page_table_k = block_tables
+
+    # Runtime validation (int comparisons only, negligible overhead)
+    if max_seq_len <= 0:
+        raise ValueError(f"max_seq_len must be > 0, got {max_seq_len}")
+    if H < 128 and H != 1:
+        raise ValueError(
+            f"cute_dsl_mla_decode requires num_heads == 128 (or 1), got {H}"
+        )
 
     # Cached split_kv and workspace_size computation
     max_active_blocks = get_num_sm(query.device)
@@ -301,7 +339,13 @@ def cute_dsl_mla_decode(
         B, q_len, H, max_active_blocks
     )
 
-    # Prepare workspace — slice of contiguous 1D buffer is already contiguous
+    if H < 128 and split_kv != 1:
+        raise ValueError(
+            f"cute_dsl_mla_decode: num_heads={H} < 128 requires split_kv==1, "
+            f"got split_kv={split_kv}"
+        )
+
+    # Prepare workspace: slice of contiguous 1D buffer is already contiguous
     assert workspace_buffer.numel() >= workspace_size, (
         f"workspace_buffer too small: {workspace_buffer.numel()} bytes, "
         f"need {workspace_size} bytes"
@@ -310,7 +354,7 @@ def cute_dsl_mla_decode(
 
     # Output buffer: contiguous [B, q_len, H, D].
     # Kernel reinterprets to [H, D, q_len, B] internally via zero-cost make_tensor.
-    out_dtype = torch.float8_e4m3fn if is_fp8 else torch.float16
+    out_dtype = q_dtype
     if out is not None:
         if q_len == 1:
             o_k = out.unsqueeze(1)  # [B, H, D] → [B, 1, H, D]
@@ -332,7 +376,7 @@ def cute_dsl_mla_decode(
 
     # Get compiled kernel (cached after first compile)
     compiled_kernel = _get_compiled_mla_kernel(
-        is_fp8=is_fp8,
+        torch_dtype=q_dtype,
         page_size=page_size,
         num_heads=H,
         seq_len_q=q_len,

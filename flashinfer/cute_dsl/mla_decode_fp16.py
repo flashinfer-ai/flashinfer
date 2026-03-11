@@ -3490,9 +3490,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         """
         if L != 512 or R != 64:
             return False
-        if in_dtype not in [cutlass.Float16]:
+        if in_dtype not in [cutlass.Float16, cutlass.BFloat16]:
             return False
-        if out_dtype not in [cutlass.Float16]:
+        if out_dtype not in [cutlass.Float16, cutlass.BFloat16]:
             return False
         if acc_dtype != cutlass.Float32 or lse_dtype != cutlass.Float32:
             return False

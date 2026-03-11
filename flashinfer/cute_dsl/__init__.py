@@ -29,6 +29,7 @@ from .utils import (
     is_cute_dsl_available,
     make_ptr,
     get_cutlass_dtype,
+    torch_to_cutlass_dtype,
     get_num_sm,
     convert_sf_to_mma_layout,
     convert_sf_from_mma_layout,
@@ -60,6 +61,7 @@ __all__ = [
     "is_cute_dsl_available",
     "make_ptr",
     "get_cutlass_dtype",
+    "torch_to_cutlass_dtype",
     "get_num_sm",
     # Scale factor layout conversion utilities
     "convert_sf_to_mma_layout",
