@@ -41,34 +41,29 @@ E2M1_LUT = [
 
 
 def reference_dequant(fp4_data, block_scales, global_scale_val, output_dtype):
-    """Pure PyTorch reference dequantization."""
+    """Vectorized PyTorch reference dequantization."""
     M, K_packed = fp4_data.shape
     K = K_packed * 2
 
-    output = torch.zeros((M, K), dtype=torch.float32, device=fp4_data.device)
+    lut = torch.tensor(E2M1_LUT, dtype=torch.float32)
 
-    fp4_np = fp4_data.cpu().numpy()
-    scales_np = block_scales.cpu().numpy()
+    # Unpack FP4 nibbles: [M, K_packed] -> lo/hi [M, K_packed]
+    fp4_bytes = fp4_data.cpu().to(torch.int32)
+    fp4_lo = fp4_bytes & 0xF
+    fp4_hi = (fp4_bytes >> 4) & 0xF
 
-    for row in range(M):
-        for col in range(0, K, 2):
-            packed_byte = fp4_np[row, col // 2]
-            fp4_lo = packed_byte & 0xF
-            fp4_hi = (packed_byte >> 4) & 0xF
+    # Interleave lo/hi to get [M, K] indices
+    indices = torch.stack([fp4_lo, fp4_hi], dim=-1).reshape(M, K)
+    values = lut[indices]
 
-            scale_idx = col // 16
-            scale_fp8_byte = scales_np[row, scale_idx]
-            # Interpret byte as FP8 E4M3
-            scale_val = (
-                torch.tensor([scale_fp8_byte], dtype=torch.uint8)
-                .view(torch.float8_e4m3fn)
-                .float()
-                .item()
-            )
+    # Convert block scales from FP8 E4M3 bytes to float: [M, K/16]
+    scale_floats = block_scales.cpu().view(torch.float8_e4m3fn).float()
 
-            output[row, col] = E2M1_LUT[fp4_lo] * scale_val * global_scale_val
-            output[row, col + 1] = E2M1_LUT[fp4_hi] * scale_val * global_scale_val
+    # Expand scales to match each element: each scale covers 16 elements
+    # [M, K/16] -> [M, K/16, 1] -> [M, K/16, 16] -> [M, K]
+    scale_expanded = scale_floats.unsqueeze(-1).expand(M, K // 16, 16).reshape(M, K)
 
+    output = values * scale_expanded * global_scale_val
     return output.to(output_dtype).to(fp4_data.device)
 
 
