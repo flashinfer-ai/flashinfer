@@ -114,9 +114,8 @@ LauncherType& get_launcher(
     char const* op_name) {
   FLASHINFER_CHECK(!selected_tile_nums.empty(), op_name, ": no available tile_N candidates");
 
-  if (tile_N == -1 || config == -1) {
+  if (tile_N == -1) {
     tile_N = *selected_tile_nums.begin();
-    config = -1;
   }
 
   auto it = launchers_map.find(static_cast<int32_t>(tile_N));
@@ -400,6 +399,7 @@ class FusedMoeLauncher {
                             bool use_routing_scales_on_input = false,
                             bool use_deep_seek_fp8 = false) {
     check_routing();
+    // Runner dictates contract of routing table; must instantiate runner before prepare_routing
     instantiate_moe_runner(moe_tactic);
     int32_t clusterSize = moe_runner->getConfigClusterSizeInBatchDim(moe_tactic);
     prepare_routing(clusterSize);
@@ -1099,6 +1099,10 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
                     bool use_routing_scales_on_input = false,
                     bool use_deep_seek_fp8 = false) override {
     check_routing();
+    // Set DeepSeek mode before instantiating the runner so the correct
+    // constructor (weights-only vs act+weights) is chosen.
+    args->mUseDeepSeekFp8 = quantization_type == Fp8QuantizationType::DeepSeekFp8;
+    // Runner dictates contract of routing table; must instantiate runner before prepare_routing
     instantiate_moe_runner(moe_tactic);
     int32_t clusterSize = moe_runner->getConfigClusterSizeInBatchDim(moe_tactic);
     prepare_routing(clusterSize);
@@ -1564,6 +1568,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
                     bool use_routing_scales_on_input = false,
                     bool use_deep_seek_fp8 = false) override {
     check_routing();
+    // Runner dictates contract of routing table; must instantiate runner before prepare_routing
     instantiate_moe_runner(moe_tactic);
     int32_t clusterSize = moe_runner->getConfigClusterSizeInBatchDim(moe_tactic);
     prepare_routing(clusterSize);

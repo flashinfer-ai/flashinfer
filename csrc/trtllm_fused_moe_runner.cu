@@ -459,7 +459,15 @@ Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8
   mPassingConfigs.reserve(totalPassingIndices);
 
   for (auto const& indexGemm1 : gemm1PassingIndices) {
+    int32_t const gemm1ClusterSize = mPermuteGemm1.getConfigClusterSizeInBatchDim(indexGemm1);
     for (auto const& indexGemm2 : gemm2PassingIndices) {
+      int32_t const gemm2ClusterSize = mGemm2.getConfigClusterSizeInBatchDim(indexGemm2);
+      // Routing emits one shared CTA table for both GEMMs, so FC1 and FC2 must agree on the
+      // batch-dimension cluster size & tile size. Otherwise ctaIdxXyToMnLimit/numNonExitingCtas are
+      // generated at one CTA granularity while one GEMM still consumes a different batch tile size.
+      if (gemm1ClusterSize != gemm2ClusterSize) {
+        continue;
+      }
       mPassingConfigs.push_back(MoEConfig{indexGemm1, indexGemm2});
     }
   }
@@ -588,7 +596,10 @@ int32_t Runner::getConfigClusterSizeInBatchDim(int64_t configIndex) const {
   auto const& config = mPassingConfigs[configIndex];
   int32_t const gemm1ClusterSize = mPermuteGemm1.getConfigClusterSizeInBatchDim(config.gemm1Config);
   int32_t const gemm2ClusterSize = mGemm2.getConfigClusterSizeInBatchDim(config.gemm2Config);
-  return std::max(gemm1ClusterSize, gemm2ClusterSize);
+  FLASHINFER_CHECK(gemm1ClusterSize == gemm2ClusterSize,
+                   "Incompatible MoE config pair: gemm1 clusterSizeInBatchDim=", gemm1ClusterSize,
+                   ", gemm2 clusterSizeInBatchDim=", gemm2ClusterSize, ".");
+  return gemm1ClusterSize;
 }
 
 void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int device,
