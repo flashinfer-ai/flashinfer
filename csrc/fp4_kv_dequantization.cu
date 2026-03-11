@@ -19,6 +19,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+
 #include <cstdint>
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -34,8 +35,8 @@ typedef uint8_t fp8_e4m3;
 
 // E2M1 lookup table
 __device__ __constant__ float E2M1_LUT[16] = {0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,
-                                               4.0f,  6.0f,  -0.0f, -0.5f, -1.0f, -1.5f,
-                                               -2.0f, -3.0f, -4.0f, -6.0f};
+                                              4.0f,  6.0f,  -0.0f, -0.5f, -1.0f, -1.5f,
+                                              -2.0f, -3.0f, -4.0f, -6.0f};
 
 // Dequantize 4 FP4 values (packed in uint16_t) to float2x2
 __device__ __forceinline__ void dequant_fp4x4_to_float2x2(uint16_t packed_fp4, float scale_0,
@@ -159,8 +160,8 @@ void nvfp4_kv_dequant(TensorView fp4_data, TensorView block_scales, TensorView g
   if (scale_on_host) {
     CHECK_CPU(global_scale);
     device_scale_buf = alloc_tensor({1}, dl_float32, fp4_data.device());
-    cudaMemcpyAsync(device_scale_buf.data_ptr(), global_scale.data_ptr(),
-                    sizeof(float), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(device_scale_buf.data_ptr(), global_scale.data_ptr(), sizeof(float),
+                    cudaMemcpyHostToDevice, stream);
     scale_ptr = static_cast<const float*>(device_scale_buf.data_ptr());
   } else {
     CHECK_CUDA(global_scale);
@@ -172,11 +173,10 @@ void nvfp4_kv_dequant(TensorView fp4_data, TensorView block_scales, TensorView g
   dim3 block(BLOCK_SIZE);
 
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(output.dtype(), c_type, [&] {
-    nvfp4_dequant_vectorized_kernel<c_type, BLOCK_SIZE, 16><<<grid, block, 0, stream>>>(
-        static_cast<const uint8_t*>(fp4_data.data_ptr()),
-        static_cast<const uint8_t*>(block_scales.data_ptr()),
-        scale_ptr,
-        static_cast<c_type*>(output.data_ptr()), M, K);
+    nvfp4_dequant_vectorized_kernel<c_type, BLOCK_SIZE, 16>
+        <<<grid, block, 0, stream>>>(static_cast<const uint8_t*>(fp4_data.data_ptr()),
+                                     static_cast<const uint8_t*>(block_scales.data_ptr()),
+                                     scale_ptr, static_cast<c_type*>(output.data_ptr()), M, K);
     return true;
   });
 }

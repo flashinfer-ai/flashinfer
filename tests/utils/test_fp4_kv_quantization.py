@@ -20,8 +20,24 @@ import torch
 import flashinfer
 
 # E2M1 lookup table for reference dequantization
-E2M1_LUT = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-            -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
+E2M1_LUT = [
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
+]
 
 
 def reference_dequant(fp4_data, block_scales, global_scale_val, output_dtype):
@@ -43,9 +59,12 @@ def reference_dequant(fp4_data, block_scales, global_scale_val, output_dtype):
             scale_idx = col // 16
             scale_fp8_byte = scales_np[row, scale_idx]
             # Interpret byte as FP8 E4M3
-            scale_val = torch.tensor(
-                [scale_fp8_byte], dtype=torch.uint8
-            ).view(torch.float8_e4m3fn).float().item()
+            scale_val = (
+                torch.tensor([scale_fp8_byte], dtype=torch.uint8)
+                .view(torch.float8_e4m3fn)
+                .float()
+                .item()
+            )
 
             output[row, col] = E2M1_LUT[fp4_lo] * scale_val * global_scale_val
             output[row, col + 1] = E2M1_LUT[fp4_hi] * scale_val * global_scale_val
@@ -66,7 +85,10 @@ def _make_global_scale(val, scale_mode):
     elif scale_mode == "host":
         return torch.tensor([val], dtype=torch.float32, device="cpu"), True
     else:  # "float"
-        return val, True  # scale_on_host is ignored when passing float, but set for clarity
+        return (
+            val,
+            True,
+        )  # scale_on_host is ignored when passing float, but set for clarity
 
 
 SHAPES = [(128, 64), (256, 128), (1, 32), (2048, 2048)]
@@ -99,7 +121,10 @@ def test_nvfp4_kv_dequant(shape, dtype, scale_mode):
         )
     else:
         output = flashinfer.nvfp4_kv_dequantize(
-            fp4_data, block_scales, global_scale, output_dtype=dtype,
+            fp4_data,
+            block_scales,
+            global_scale,
+            output_dtype=dtype,
             scale_on_host=scale_on_host,
         )
 
@@ -133,7 +158,9 @@ def test_nvfp4_kv_quant(shape, dtype, scale_mode):
     global_scale, scale_on_host = _make_global_scale(global_scale_val, scale_mode)
 
     if scale_mode == "float":
-        fp4_output, block_scales = flashinfer.nvfp4_kv_quantize(input_data, global_scale)
+        fp4_output, block_scales = flashinfer.nvfp4_kv_quantize(
+            input_data, global_scale
+        )
     else:
         fp4_output, block_scales = flashinfer.nvfp4_kv_quantize(
             input_data, global_scale, scale_on_host=scale_on_host
@@ -168,7 +195,9 @@ def test_nvfp4_kv_roundtrip(shape, dtype, scale_mode):
 
     # Quantize
     if scale_mode == "float":
-        fp4_output, block_scales = flashinfer.nvfp4_kv_quantize(input_data, global_scale)
+        fp4_output, block_scales = flashinfer.nvfp4_kv_quantize(
+            input_data, global_scale
+        )
     else:
         fp4_output, block_scales = flashinfer.nvfp4_kv_quantize(
             input_data, global_scale, scale_on_host=scale_on_host
@@ -181,7 +210,10 @@ def test_nvfp4_kv_roundtrip(shape, dtype, scale_mode):
         )
     else:
         reconstructed = flashinfer.nvfp4_kv_dequantize(
-            fp4_output, block_scales, global_scale, output_dtype=dtype,
+            fp4_output,
+            block_scales,
+            global_scale,
+            output_dtype=dtype,
             scale_on_host=scale_on_host,
         )
 
@@ -193,11 +225,14 @@ def test_nvfp4_kv_roundtrip(shape, dtype, scale_mode):
     # Compute per-element relative error where input is non-negligible
     mask = input_float.abs() > 1e-6
     if mask.any():
-        rel_error = ((input_float[mask] - recon_float[mask]).abs() /
-                     input_float[mask].abs().clamp(min=1e-6))
+        rel_error = (input_float[mask] - recon_float[mask]).abs() / input_float[
+            mask
+        ].abs().clamp(min=1e-6)
         # FP4 quantization can have up to ~50% relative error for some values,
         # but on average should be much better
-        assert rel_error.mean() < 0.5, f"Mean relative error too high: {rel_error.mean():.4f}"
+        assert rel_error.mean() < 0.5, (
+            f"Mean relative error too high: {rel_error.mean():.4f}"
+        )
 
     # Also check that the overall cosine similarity is reasonable
     cos_sim = torch.nn.functional.cosine_similarity(

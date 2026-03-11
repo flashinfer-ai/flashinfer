@@ -1039,7 +1039,9 @@ def get_fp4_kv_dequantization_module():
         output: torch.Tensor,
         scale_on_host: bool,
     ) -> None:
-        module.nvfp4_kv_dequant(fp4_data, block_scales, global_scale, output, scale_on_host)
+        module.nvfp4_kv_dequant(
+            fp4_data, block_scales, global_scale, output, scale_on_host
+        )
 
     @register_fake_op("flashinfer::nvfp4_kv_dequant")
     def _fake_nvfp4_kv_dequant(
@@ -1071,7 +1073,9 @@ def get_fp4_kv_quantization_module():
         block_scales: torch.Tensor,
         scale_on_host: bool,
     ) -> None:
-        module.nvfp4_kv_quant(input, global_scale, fp4_output, block_scales, scale_on_host)
+        module.nvfp4_kv_quant(
+            input, global_scale, fp4_output, block_scales, scale_on_host
+        )
 
     @register_fake_op("flashinfer::nvfp4_kv_quant")
     def _fake_nvfp4_kv_quant(
