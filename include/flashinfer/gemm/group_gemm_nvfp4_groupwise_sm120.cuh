@@ -90,7 +90,8 @@ template <int TileM, int TileN, int TileK, typename DTypeInA, typename DTypeInB,
 cudaError_t CutlassNVFP4GroupwiseScaledGroupGEMMSM120(
     void* int_buffer, size_t int_buffer_size_in_bytes, void* float_buffer,
     size_t float_buffer_size_in_bytes, DTypeInA* A, DTypeInB* B, DTypeSFA* SFA, DTypeSFB* SFB,
-    DTypeOut* D, float* alpha, int* m_indptr, int n, int k, int num_groups, cudaStream_t stream);
+    DTypeOut* D, float* alpha, int* m_indptr, int n, int k, int num_groups, cudaStream_t stream,
+    int device_id);
 
 }  // namespace group_gemm
 
@@ -120,7 +121,10 @@ cudaError_t CutlassNVFP4GroupwiseScaledGroupGEMMSM120(
           void* int_buffer, size_t int_buffer_size_in_bytes, void* float_buffer,                                                                                       \
           size_t float_buffer_size_in_bytes, DTypeInA* A, DTypeInB* B, DTypeSFA* SFA,                                                                                  \
           DTypeSFB* SFB, DTypeOut* D, float* alpha, int* m_indptr, int n, int k, int num_groups,                                                                       \
-          cudaStream_t stream) {                                                                                                                                       \
+          cudaStream_t stream, int device_id) {                                                                                                                        \
+    if (num_groups == 0) {                                                                                                                                             \
+      return cudaSuccess;                                                                                                                                              \
+    }                                                                                                                                                                  \
     using ElementA = DTypeInA;                                                                                                                                         \
     using ElementSFA = DTypeSFA;                                                                                                                                       \
     constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;                                                                                            \
@@ -218,10 +222,14 @@ cudaError_t CutlassNVFP4GroupwiseScaledGroupGEMMSM120(
                                             m_indptr, n, k, num_groups, problem_sizes, A_ptr,                                                                          \
                                             B_ptr, SFA_ptr, SFB_ptr, D_ptr, stride_A, stride_B,                                                                        \
                                             stride_D, layout_SFA, layout_SFB));                                                                                        \
-    thread_local int const sm_count =                                                                                                                                  \
-        cutlass::KernelHardwareInfo::query_device_multiprocessor_count();                                                                                              \
+    thread_local int last_device_id = -1;                                                                                                                              \
+    thread_local int sm_count = 0;                                                                                                                                     \
+    if (last_device_id != device_id) {                                                                                                                                 \
+      last_device_id = device_id;                                                                                                                                      \
+      sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count();                                                                                     \
+    }                                                                                                                                                                  \
     cutlass::KernelHardwareInfo hw_info;                                                                                                                               \
-    hw_info.device_id = 0;                                                                                                                                             \
+    hw_info.device_id = device_id;                                                                                                                                     \
     hw_info.sm_count = sm_count;                                                                                                                                       \
     typename Gemm::Arguments arguments{                                                                                                                                \
         cutlass::gemm::GemmUniversalMode::kGrouped,                                                                                                                    \
@@ -266,11 +274,11 @@ cudaError_t CutlassNVFP4GroupwiseScaledGroupGEMMSM120(
                                                         DTypeSFA, DTypeSFB, DTypeOut>(                                                                                 \
       void* int_buffer, size_t int_buffer_size_in_bytes, void* float_buffer,                                                                                           \
       size_t float_buffer_size_in_bytes, DTypeInA* A, DTypeInB* B, DTypeSFA* SFA, DTypeSFB* SFB,                                                                       \
-      DTypeOut* D, float* alpha, int* m_indptr, int n, int k, int num_groups,                                                                                          \
-      cudaStream_t stream) {                                                                                                                                           \
+      DTypeOut* D, float* alpha, int* m_indptr, int n, int k, int num_groups, cudaStream_t stream,                                                                     \
+      int device_id) {                                                                                                                                                 \
     return CutlassNVFP4GroupwiseScaledGroupGEMMSM120_##TileM##_##TileN##_##TileK##_##DTypeInAName##_##DTypeInBName##_##DTypeSFAName##_##DTypeSFBName##_##DTypeOutName( \
         int_buffer, int_buffer_size_in_bytes, float_buffer, float_buffer_size_in_bytes, A, B, SFA,                                                                     \
-        SFB, D, alpha, m_indptr, n, k, num_groups, stream);                                                                                                            \
+        SFB, D, alpha, m_indptr, n, k, num_groups, stream, device_id);                                                                                                 \
   }
 
 #endif  // FLASHINFER_GROUP_GEMM_NVFP4_GROUPWISE_SM120_CUH_

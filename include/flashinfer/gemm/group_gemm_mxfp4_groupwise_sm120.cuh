@@ -56,33 +56,40 @@ __global__ void compute_sm120_cutlass_group_gemm_args(
   if (i >= num_groups) {
     return;
   }
-  constexpr int alignment_swizzled_mn = 128;
-  constexpr int alignment_swizzled_k = ScaleGranularity * 4;
-  int sf_n = (n + alignment_swizzled_mn - 1) / alignment_swizzled_mn * alignment_swizzled_mn;
-  int swizzled_k = (k + alignment_swizzled_k - 1) / alignment_swizzled_k * alignment_swizzled_k;
-  int sf_k = swizzled_k / ScaleGranularity;
+  constexpr size_t alignment_swizzled_mn = 128;
+  constexpr size_t alignment_swizzled_k = static_cast<size_t>(ScaleGranularity) * 4;
+  size_t sf_n = (static_cast<size_t>(n) + alignment_swizzled_mn - 1) / alignment_swizzled_mn *
+                alignment_swizzled_mn;
+  size_t swizzled_k = (static_cast<size_t>(k) + alignment_swizzled_k - 1) / alignment_swizzled_k *
+                      alignment_swizzled_k;
+  size_t sf_k = swizzled_k / static_cast<size_t>(ScaleGranularity);
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.wait;");
   asm volatile("griddepcontrol.launch_dependents;");
 #endif
   int m_offset = m_indptr[i];
   int m_offset_next = m_indptr[i + 1];
-  int m = m_offset_next - m_offset;
+  size_t m = static_cast<size_t>(m_offset_next) - static_cast<size_t>(m_offset);
   // This formulation ensures that sf_m_offset_next - sf_m_offset >= m_offset_next - m_offset
-  int sf_m_offset =
-      (m_offset + i * (alignment_swizzled_mn - 1)) / alignment_swizzled_mn * alignment_swizzled_mn;
+  size_t sf_m_offset =
+      (static_cast<size_t>(m_offset) + static_cast<size_t>(i) * (alignment_swizzled_mn - 1)) /
+      alignment_swizzled_mn * alignment_swizzled_mn;
 
   problem_sizes[i] = ProblemShape(m, n, k);
   stride_A[i] = cutlass::make_cute_packed_stride(StrideA{}, {m, k, 1});
   stride_B[i] = cutlass::make_cute_packed_stride(StrideB{}, {n, k, 1});
   stride_D[i] = cutlass::make_cute_packed_stride(StrideD{}, {m, n, 1});
-  A_ptr[i] = safe_inc_ptr(A, int64_t(m_offset) * int64_t(k));
-  B_ptr[i] = safe_inc_ptr(B, int64_t(i) * int64_t(n) * int64_t(k));
-  D_ptr[i] = safe_inc_ptr(D, int64_t(m_offset) * int64_t(n));
-  layout_SFA[i] = ScaleConfig::tile_atom_to_shape_SFA(make_shape(m, sf_n, swizzled_k, 1));
-  SFA_ptr[i] = safe_inc_ptr(SFA, int64_t(sf_m_offset) * int64_t(sf_k));
-  layout_SFB[i] = ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, sf_n, swizzled_k, 1));
-  SFB_ptr[i] = safe_inc_ptr(SFB, int64_t(i) * int64_t(sf_n) * int64_t(sf_k));
+  A_ptr[i] = safe_inc_ptr(A, static_cast<size_t>(m_offset) * static_cast<size_t>(k));
+  B_ptr[i] =
+      safe_inc_ptr(B, static_cast<size_t>(i) * static_cast<size_t>(n) * static_cast<size_t>(k));
+  D_ptr[i] = safe_inc_ptr(D, static_cast<size_t>(m_offset) * static_cast<size_t>(n));
+  layout_SFA[i] = ScaleConfig::tile_atom_to_shape_SFA(
+      make_shape(m, static_cast<int>(sf_n), static_cast<int>(swizzled_k), 1));
+  SFA_ptr[i] = safe_inc_ptr(SFA, static_cast<size_t>(sf_m_offset) * static_cast<size_t>(sf_k));
+  layout_SFB[i] = ScaleConfig::tile_atom_to_shape_SFB(
+      make_shape(m, static_cast<int>(sf_n), static_cast<int>(swizzled_k), 1));
+  SFB_ptr[i] = safe_inc_ptr(
+      SFB, static_cast<size_t>(i) * static_cast<size_t>(sf_n) * static_cast<size_t>(sf_k));
 }
 
 template <int TileM, int TileN, int TileK, typename DTypeInA, typename DTypeInB, typename DTypeSFA,
@@ -112,160 +119,160 @@ cudaError_t CutlassMXFP4GroupwiseScaledGroupGEMMSM120(
 //     stringified type names used to form unique C++ symbol names (e.g., "fp4", "int4", "fp8",
 //     "fp16", "bf16")
 
-#define INSTANTIATE_GROUP_GEMM_MXFP4_GROUPWISE_SM120(                                                                                                                  \
-    TileM, TileN, TileK, DTypeInA, DTypeInB, DTypeSFA, DTypeSFB, DTypeOut, DTypeInAName,                                                                               \
-    DTypeInBName, DTypeSFAName, DTypeSFBName, DTypeOutName)                                                                                                            \
-  inline cudaError_t                                                                                                                                                   \
-      CutlassMXFP4GroupwiseScaledGroupGEMMSM120_##TileM##_##TileN##_##TileK##_##DTypeInAName##_##DTypeInBName##_##DTypeSFAName##_##DTypeSFBName##_##DTypeOutName(      \
-          void* int_buffer, size_t int_buffer_size_in_bytes, void* float_buffer,                                                                                       \
-          size_t float_buffer_size_in_bytes, DTypeInA* A, DTypeInB* B, DTypeSFA* SFA,                                                                                  \
-          DTypeSFB* SFB, DTypeOut* D, int* m_indptr, int n, int k, int num_groups,                                                                                     \
-          cudaStream_t stream) {                                                                                                                                       \
-    using ElementA = DTypeInA;                                                                                                                                         \
-    using ElementSFA = DTypeSFA;                                                                                                                                       \
-    constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;                                                                                            \
-    using ElementB = DTypeInB;                                                                                                                                         \
-    using ElementSFB = DTypeSFB;                                                                                                                                       \
-    constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;                                                                                            \
-    using ElementD = DTypeOut;                                                                                                                                         \
-    using ElementC = void;                                                                                                                                             \
-    using LayoutC = void;                                                                                                                                              \
-    constexpr int AlignmentC = 0;                                                                                                                                      \
-    constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;                                                                                            \
-    FLASHINFER_CHECK(k % std::max(AlignmentA, AlignmentB) == 0, "k must be divisible by %d",                                                                           \
-                     max(AlignmentA, AlignmentB));                                                                                                                     \
-    FLASHINFER_CHECK(n % AlignmentD == 0, "n must be divisible by %d", AlignmentD);                                                                                    \
-    using ElementAccumulator = float;                                                                                                                                  \
-    using ElementCompute = float;                                                                                                                                      \
-    using ElementAMainloop = cute::tuple<ElementA, ElementSFA>;                                                                                                        \
-    using ElementBMainloop = cute::tuple<ElementB, ElementSFB>;                                                                                                        \
-    using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;                                                                                       \
-    using LayoutA = cutlass::layout::RowMajor;                                                                                                                         \
-    using LayoutB = cutlass::layout::ColumnMajor;                                                                                                                      \
-    using LayoutD = cutlass::layout::RowMajor;                                                                                                                         \
-    using ClusterShape = Shape<_1, _1, _1>;                                                                                                                            \
-    using EpilogueSchedule = cutlass::epilogue::collective::EpilogueScheduleAuto;                                                                                      \
-    using ThreadBlockShape = Shape<Int<TileM>, Int<TileN>, Int<TileK>>;                                                                                                \
-    using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<                                                                              \
-        cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp, ThreadBlockShape,                                                                             \
-        ClusterShape, cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator,                                                                             \
-        ElementCompute, ElementC, LayoutD*, AlignmentD, ElementD, LayoutD*, AlignmentD,                                                                                \
-        EpilogueSchedule>::CollectiveOp;                                                                                                                               \
-    using MainloopSchedule = cutlass::gemm::collective::KernelScheduleAuto;                                                                                            \
-    using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<                                                                                  \
-        cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp, ElementAMainloop,                                                                             \
-        LayoutA*, AlignmentA, ElementBMainloop, LayoutB*, AlignmentB, ElementAccumulator,                                                                              \
-        ThreadBlockShape, ClusterShape,                                                                                                                                \
-        cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(                                                                                            \
-            sizeof(typename CollectiveEpilogue::SharedStorage))>,                                                                                                      \
-        MainloopSchedule>::CollectiveOp;                                                                                                                               \
-    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<ProblemShape, CollectiveMainloop,                                                                          \
-                                                            CollectiveEpilogue, void>;                                                                                 \
-    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;                                                                                              \
-    using StrideA = typename Gemm::GemmKernel::InternalStrideA;                                                                                                        \
-    using StrideB = typename Gemm::GemmKernel::InternalStrideB;                                                                                                        \
-    using StrideD = typename Gemm::GemmKernel::InternalStrideD;                                                                                                        \
-    using ScaleConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;                                                                           \
-    using LayoutSFA = typename Gemm::GemmKernel::CollectiveMainloop::InternalLayoutSFA;                                                                                \
-    using LayoutSFB = typename Gemm::GemmKernel::CollectiveMainloop::InternalLayoutSFB;                                                                                \
-    constexpr int ScaleGranularity = Gemm::GemmKernel::CollectiveMainloop::TiledMma::SFVecSize;                                                                        \
-    static_assert(ScaleGranularity == 32);                                                                                                                             \
-    AlignedAllocator allocator(int_buffer, int_buffer_size_in_bytes);                                                                                                  \
-    auto problem_sizes = allocator.aligned_alloc<typename ProblemShape::UnderlyingProblemShape>(                                                                       \
-        num_groups * sizeof(typename ProblemShape::UnderlyingProblemShape), 16,                                                                                        \
-        "sm120_groupwise_group_gemm_problem_sizes");                                                                                                                   \
-    auto A_ptr = allocator.aligned_alloc<const typename Gemm::ElementA*>(                                                                                              \
-        num_groups * sizeof(const typename Gemm::ElementA*), 16,                                                                                                       \
-        "sm120_groupwise_group_gemm_A_ptr");                                                                                                                           \
-    auto B_ptr = allocator.aligned_alloc<const typename Gemm::ElementB*>(                                                                                              \
-        num_groups * sizeof(const typename Gemm::ElementB*), 16,                                                                                                       \
-        "sm120_groupwise_group_gemm_B_ptr");                                                                                                                           \
-    auto D_ptr = allocator.aligned_alloc<typename Gemm::EpilogueOutputOp::ElementOutput*>(                                                                             \
-        num_groups * sizeof(typename Gemm::EpilogueOutputOp::ElementOutput*), 16,                                                                                      \
-        "sm120_groupwise_group_gemm_D_ptr");                                                                                                                           \
-    auto SFA_ptr = allocator.aligned_alloc<const ElementSFA*>(                                                                                                         \
-        num_groups * sizeof(const ElementSFA*), 16, "sm120_groupwise_group_gemm_SFA_ptr");                                                                             \
-    auto SFB_ptr = allocator.aligned_alloc<const ElementSFB*>(                                                                                                         \
-        num_groups * sizeof(const ElementSFB*), 16, "sm120_groupwise_group_gemm_SFB_ptr");                                                                             \
-    auto stride_A = allocator.aligned_alloc<StrideA>(num_groups * sizeof(StrideA), 16,                                                                                 \
-                                                     "sm120_groupwise_group_gemm_stride_A");                                                                           \
-    auto stride_B = allocator.aligned_alloc<StrideB>(num_groups * sizeof(StrideB), 16,                                                                                 \
-                                                     "sm120_groupwise_group_gemm_stride_B");                                                                           \
-    auto stride_D = allocator.aligned_alloc<StrideD>(num_groups * sizeof(StrideD), 16,                                                                                 \
-                                                     "sm120_groupwise_group_gemm_stride_D");                                                                           \
-    auto layout_SFA = allocator.aligned_alloc<LayoutSFA>(num_groups * sizeof(LayoutSFA), 16,                                                                           \
-                                                         "sm120_groupwise_group_gemm_layout_SFA");                                                                     \
-    auto layout_SFB = allocator.aligned_alloc<LayoutSFB>(num_groups * sizeof(LayoutSFB), 16,                                                                           \
-                                                         "sm120_groupwise_group_gemm_layout_SFB");                                                                     \
-    int num_threads = std::min(num_groups, 1024);                                                                                                                      \
-    int num_blocks = (num_groups + num_threads - 1) / num_threads;                                                                                                     \
-    cudaLaunchConfig_t config;                                                                                                                                         \
-    config.gridDim = num_blocks;                                                                                                                                       \
-    config.blockDim = num_threads;                                                                                                                                     \
-    config.dynamicSmemBytes = 0;                                                                                                                                       \
-    config.stream = stream;                                                                                                                                            \
-    cudaLaunchAttribute attrs[1];                                                                                                                                      \
-    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;                                                                                                  \
-    attrs[0].val.programmaticStreamSerializationAllowed = true;                                                                                                        \
-    config.numAttrs = 1;                                                                                                                                               \
-    config.attrs = attrs;                                                                                                                                              \
-    auto prepare_args_kernel = compute_sm120_cutlass_group_gemm_args<                                                                                                  \
-        ScaleGranularity, ScaleConfig, ElementA, ElementB, ElementSFA, ElementSFB, ElementD,                                                                           \
-        ProblemShape::UnderlyingProblemShape, StrideA, StrideB, StrideD, LayoutSFA, LayoutSFB>;                                                                        \
-    FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, prepare_args_kernel, A, B, SFA, SFB, D,                                                                           \
-                                            m_indptr, n, k, num_groups, problem_sizes, A_ptr,                                                                          \
-                                            B_ptr, SFA_ptr, SFB_ptr, D_ptr, stride_A, stride_B,                                                                        \
-                                            stride_D, layout_SFA, layout_SFB));                                                                                        \
-    thread_local int const sm_count =                                                                                                                                  \
-        cutlass::KernelHardwareInfo::query_device_multiprocessor_count();                                                                                              \
-    cutlass::KernelHardwareInfo hw_info;                                                                                                                               \
-    hw_info.device_id = 0;                                                                                                                                             \
-    hw_info.sm_count = sm_count;                                                                                                                                       \
-    typename Gemm::Arguments arguments{                                                                                                                                \
-        cutlass::gemm::GemmUniversalMode::kGrouped,                                                                                                                    \
-        {num_groups, problem_sizes, /*problem_sizes_host=*/nullptr},                                                                                                   \
-        {                                                                                                                                                              \
-            A_ptr,                                                                                                                                                     \
-            stride_A,                                                                                                                                                  \
-            B_ptr,                                                                                                                                                     \
-            stride_B,                                                                                                                                                  \
-            SFA_ptr,                                                                                                                                                   \
-            layout_SFA,                                                                                                                                                \
-            SFB_ptr,                                                                                                                                                   \
-            layout_SFB,                                                                                                                                                \
-        },                                                                                                                                                             \
-        {                                                                                                                                                              \
-            {},                                                                                                                                                        \
-            nullptr,                                                                                                                                                   \
-            nullptr,                                                                                                                                                   \
-            D_ptr,                                                                                                                                                     \
-            stride_D,                                                                                                                                                  \
-        },                                                                                                                                                             \
-        hw_info};                                                                                                                                                      \
-    auto& fusion_args = arguments.epilogue.thread;                                                                                                                     \
-    fusion_args.alpha = 1.0f;                                                                                                                                          \
-    fusion_args.beta = 0.0f;                                                                                                                                           \
-    Gemm gemm;                                                                                                                                                         \
-    size_t workspace_size = Gemm::get_workspace_size(arguments);                                                                                                       \
-    AlignedAllocator float_allocator(float_buffer, float_buffer_size_in_bytes);                                                                                        \
-    auto workspace_ptr = float_allocator.aligned_alloc<void>(                                                                                                          \
-        workspace_size, 16, "sm120_groupwise_group_gemm_float_workspace");                                                                                             \
-    CUTLASS_CHECK(gemm.can_implement(arguments));                                                                                                                      \
-    CUTLASS_CHECK(gemm.initialize(arguments, workspace_ptr));                                                                                                          \
-    /* Disable PDL until CUTLASS is updated to 4.3 or later */                                                                                                         \
-    CUTLASS_CHECK(gemm.run(stream, /*cuda_adapter=*/nullptr, /*launch_with_pdl=*/false));                                                                              \
-    return cudaSuccess;                                                                                                                                                \
-  }                                                                                                                                                                    \
-                                                                                                                                                                       \
-  template <>                                                                                                                                                          \
-  cudaError_t CutlassMXFP4GroupwiseScaledGroupGEMMSM120<TileM, TileN, TileK, DTypeInA, DTypeInB,                                                                       \
-                                                        DTypeSFA, DTypeSFB, DTypeOut>(                                                                                 \
-      void* int_buffer, size_t int_buffer_size_in_bytes, void* float_buffer,                                                                                           \
-      size_t float_buffer_size_in_bytes, DTypeInA* A, DTypeInB* B, DTypeSFA* SFA, DTypeSFB* SFB,                                                                       \
-      DTypeOut* D, int* m_indptr, int n, int k, int num_groups, cudaStream_t stream) {                                                                                 \
-    return CutlassMXFP4GroupwiseScaledGroupGEMMSM120_##TileM##_##TileN##_##TileK##_##DTypeInAName##_##DTypeInBName##_##DTypeSFAName##_##DTypeSFBName##_##DTypeOutName( \
-        int_buffer, int_buffer_size_in_bytes, float_buffer, float_buffer_size_in_bytes, A, B, SFA,                                                                     \
-        SFB, D, m_indptr, n, k, num_groups, stream);                                                                                                                   \
-  }
+#define INSTANTIATE_GROUP_GEMM_MXFP4_GROUPWISE_SM120(                                                                                                             \
+    TileM, TileN, TileK, DTypeInA, DTypeInB, DTypeSFA, DTypeSFB, DTypeOut, DTypeInAName,                                                                          \
+    DTypeInBName, DTypeSFAName, DTypeSFBName, DTypeOutName)                                                                                                       \
+  inline cudaError_t                                                                                                                                              \
+      CutlassMXFP4GroupwiseScaledGroupGEMMSM120_##TileM##_##TileN##_##TileK##_##DTypeInAName##_##DTypeInBName##_##DTypeSFAName##_##DTypeSFBName##_##DTypeOutName( \
+          void* int_buffer, size_t int_buffer_size_in_bytes, void* float_buffer,                                                                                  \
+          size_t float_buffer_size_in_bytes, DTypeInA* A, DTypeInB* B, DTypeSFA* SFA,                                                                             \
+          DTypeSFB* SFB, DTypeOut* D, int* m_indptr, int n, int k, int num_groups,                                                                                \
+          cudaStream_t stream) {                                                                                                                                  \
+    using ElementA = DTypeInA;                                                                                                                                    \
+    using ElementSFA = DTypeSFA;                                                                                                                                  \
+    constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;                                                                                       \
+    using ElementB = DTypeInB;                                                                                                                                    \
+    using ElementSFB = DTypeSFB;                                                                                                                                  \
+    constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;                                                                                       \
+    using ElementD = DTypeOut;                                                                                                                                    \
+    using ElementC = void;                                                                                                                                        \
+    using LayoutC = void;                                                                                                                                         \
+    constexpr int AlignmentC = 0;                                                                                                                                 \
+    constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;                                                                                       \
+    FLASHINFER_CHECK(k % std::max(AlignmentA, AlignmentB) == 0, "k must be divisible by %d",                                                                      \
+                     max(AlignmentA, AlignmentB));                                                                                                                \
+    FLASHINFER_CHECK(n % AlignmentD == 0, "n must be divisible by %d", AlignmentD);                                                                               \
+    using ElementAccumulator = float;                                                                                                                             \
+    using ElementCompute = float;                                                                                                                                 \
+    using ElementAMainloop = cute::tuple<ElementA, ElementSFA>;                                                                                                   \
+    using ElementBMainloop = cute::tuple<ElementB, ElementSFB>;                                                                                                   \
+    using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;                                                                                  \
+    using LayoutA = cutlass::layout::RowMajor;                                                                                                                    \
+    using LayoutB = cutlass::layout::ColumnMajor;                                                                                                                 \
+    using LayoutD = cutlass::layout::RowMajor;                                                                                                                    \
+    using ClusterShape = Shape<_1, _1, _1>;                                                                                                                       \
+    using EpilogueSchedule = cutlass::epilogue::collective::EpilogueScheduleAuto;                                                                                 \
+    using ThreadBlockShape = Shape<Int<TileM>, Int<TileN>, Int<TileK>>;                                                                                           \
+    using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<                                                                         \
+        cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp, ThreadBlockShape,                                                                        \
+        ClusterShape, cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator,                                                                        \
+        ElementCompute, ElementC, LayoutD*, AlignmentD, ElementD, LayoutD*, AlignmentD,                                                                           \
+        EpilogueSchedule>::CollectiveOp;                                                                                                                          \
+    using MainloopSchedule = cutlass::gemm::collective::KernelScheduleAuto;                                                                                       \
+    using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<                                                                             \
+        cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp, ElementAMainloop,                                                                        \
+        LayoutA*, AlignmentA, ElementBMainloop, LayoutB*, AlignmentB, ElementAccumulator,                                                                         \
+        ThreadBlockShape, ClusterShape,                                                                                                                           \
+        cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(                                                                                       \
+            sizeof(typename CollectiveEpilogue::SharedStorage))>,                                                                                                 \
+        MainloopSchedule>::CollectiveOp;                                                                                                                          \
+    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<ProblemShape, CollectiveMainloop,                                                                     \
+                                                            CollectiveEpilogue, void>;                                                                            \
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;                                                                                         \
+    using StrideA = typename Gemm::GemmKernel::InternalStrideA;                                                                                                   \
+    using StrideB = typename Gemm::GemmKernel::InternalStrideB;                                                                                                   \
+    using StrideD = typename Gemm::GemmKernel::InternalStrideD;                                                                                                   \
+    using ScaleConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;                                                                      \
+    using LayoutSFA = typename Gemm::GemmKernel::CollectiveMainloop::InternalLayoutSFA;                                                                           \
+    using LayoutSFB = typename Gemm::GemmKernel::CollectiveMainloop::InternalLayoutSFB;                                                                           \
+    constexpr int ScaleGranularity = Gemm::GemmKernel::CollectiveMainloop::TiledMma::SFVecSize;                                                                   \
+    static_assert(ScaleGranularity == 32);                                                                                                                        \
+    AlignedAllocator allocator(int_buffer, int_buffer_size_in_bytes);                                                                                             \
+    auto problem_sizes = allocator.aligned_alloc<typename ProblemShape::UnderlyingProblemShape>(                                                                  \
+        num_groups * sizeof(typename ProblemShape::UnderlyingProblemShape), 16,                                                                                   \
+        "sm120_groupwise_group_gemm_problem_sizes");                                                                                                              \
+    auto A_ptr = allocator.aligned_alloc<const typename Gemm::ElementA*>(                                                                                         \
+        num_groups * sizeof(const typename Gemm::ElementA*), 16,                                                                                                  \
+        "sm120_groupwise_group_gemm_A_ptr");                                                                                                                      \
+    auto B_ptr = allocator.aligned_alloc<const typename Gemm::ElementB*>(                                                                                         \
+        num_groups * sizeof(const typename Gemm::ElementB*), 16,                                                                                                  \
+        "sm120_groupwise_group_gemm_B_ptr");                                                                                                                      \
+    auto D_ptr = allocator.aligned_alloc<typename Gemm::EpilogueOutputOp::ElementOutput*>(                                                                        \
+        num_groups * sizeof(typename Gemm::EpilogueOutputOp::ElementOutput*), 16,                                                                                 \
+        "sm120_groupwise_group_gemm_D_ptr");                                                                                                                      \
+    auto SFA_ptr = allocator.aligned_alloc<const ElementSFA*>(                                                                                                    \
+        num_groups * sizeof(const ElementSFA*), 16, "sm120_groupwise_group_gemm_SFA_ptr");                                                                        \
+    auto SFB_ptr = allocator.aligned_alloc<const ElementSFB*>(                                                                                                    \
+        num_groups * sizeof(const ElementSFB*), 16, "sm120_groupwise_group_gemm_SFB_ptr");                                                                        \
+    auto stride_A = allocator.aligned_alloc<StrideA>(num_groups * sizeof(StrideA), 16,                                                                            \
+                                                     "sm120_groupwise_group_gemm_stride_A");                                                                      \
+    auto stride_B = allocator.aligned_alloc<StrideB>(num_groups * sizeof(StrideB), 16,                                                                            \
+                                                     "sm120_groupwise_group_gemm_stride_B");                                                                      \
+    auto stride_D = allocator.aligned_alloc<StrideD>(num_groups * sizeof(StrideD), 16,                                                                            \
+                                                     "sm120_groupwise_group_gemm_stride_D");                                                                      \
+    auto layout_SFA = allocator.aligned_alloc<LayoutSFA>(num_groups * sizeof(LayoutSFA), 16,                                                                      \
+                                                         "sm120_groupwise_group_gemm_layout_SFA");                                                                \
+    auto layout_SFB = allocator.aligned_alloc<LayoutSFB>(num_groups * sizeof(LayoutSFB), 16,                                                                      \
+                                                         "sm120_groupwise_group_gemm_layout_SFB");                                                                \
+    int num_threads = std::min(num_groups, 1024);                                                                                                                 \
+    int num_blocks = (num_groups + num_threads - 1) / num_threads;                                                                                                \
+    cudaLaunchConfig_t config;                                                                                                                                    \
+    config.gridDim = num_blocks;                                                                                                                                  \
+    config.blockDim = num_threads;                                                                                                                                \
+    config.dynamicSmemBytes = 0;                                                                                                                                  \
+    config.stream = stream;                                                                                                                                       \
+    cudaLaunchAttribute attrs[1];                                                                                                                                 \
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;                                                                                             \
+    attrs[0].val.programmaticStreamSerializationAllowed = true;                                                                                                   \
+    config.numAttrs = 1;                                                                                                                                          \
+    config.attrs = attrs;                                                                                                                                         \
+    auto prepare_args_kernel = compute_sm120_cutlass_group_gemm_args<                                                                                             \
+        ScaleGranularity, ScaleConfig, ElementA, ElementB, ElementSFA, ElementSFB, ElementD,                                                                      \
+        ProblemShape::UnderlyingProblemShape, StrideA, StrideB, StrideD, LayoutSFA, LayoutSFB>;                                                                   \
+    FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, prepare_args_kernel, A, B, SFA, SFB, D,                                                                      \
+                                            m_indptr, n, k, num_groups, problem_sizes, A_ptr,                                                                     \
+                                            B_ptr, SFA_ptr, SFB_ptr, D_ptr, stride_A, stride_B,                                                                   \
+                                            stride_D, layout_SFA, layout_SFB));                                                                                   \
+    thread_local int device_id = 0;                                                                                                                               \
+    thread_local int sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count();                                                                 \
+    if (device_id !=)
+cutlass::KernelHardwareInfo hw_info;
+hw_info.device_id = 0;
+hw_info.sm_count = sm_count;
+typename Gemm::Arguments arguments{cutlass::gemm::GemmUniversalMode::kGrouped,
+                                   {num_groups, problem_sizes, /*problem_sizes_host=*/nullptr},
+                                   {
+                                       A_ptr,
+                                       stride_A,
+                                       B_ptr,
+                                       stride_B,
+                                       SFA_ptr,
+                                       layout_SFA,
+                                       SFB_ptr,
+                                       layout_SFB,
+                                   },
+                                   {
+                                       {},
+                                       nullptr,
+                                       nullptr,
+                                       D_ptr,
+                                       stride_D,
+                                   },
+                                   hw_info};
+auto& fusion_args = arguments.epilogue.thread;
+fusion_args.alpha = 1.0f;
+fusion_args.beta = 0.0f;
+Gemm gemm;
+size_t workspace_size = Gemm::get_workspace_size(arguments);
+AlignedAllocator float_allocator(float_buffer, float_buffer_size_in_bytes);
+auto workspace_ptr = float_allocator.aligned_alloc<void>(
+    workspace_size, 16, "sm120_groupwise_group_gemm_float_workspace");
+CUTLASS_CHECK(gemm.can_implement(arguments));
+CUTLASS_CHECK(gemm.initialize(
+    arguments, workspace_ptr)); /* Disable PDL until CUTLASS is updated to 4.3 or later */
+CUTLASS_CHECK(gemm.run(stream, /*cuda_adapter=*/nullptr, /*launch_with_pdl=*/false));
+return cudaSuccess;
+}
+
+template <>
+cudaError_t CutlassMXFP4GroupwiseScaledGroupGEMMSM120<TileM, TileN, TileK, DTypeInA, DTypeInB,
+                                                      DTypeSFA, DTypeSFB, DTypeOut>(
+    void* int_buffer, size_t int_buffer_size_in_bytes, void* float_buffer,
+    size_t float_buffer_size_in_bytes, DTypeInA* A, DTypeInB* B, DTypeSFA* SFA, DTypeSFB* SFB,
+    DTypeOut* D, int* m_indptr, int n, int k, int num_groups, cudaStream_t stream) {
+  return CutlassMXFP4GroupwiseScaledGroupGEMMSM120_##TileM##_##TileN##_##TileK##_##DTypeInAName##_##DTypeInBName##_##DTypeSFAName##_##DTypeSFBName##_##DTypeOutName(
+      int_buffer, int_buffer_size_in_bytes, float_buffer, float_buffer_size_in_bytes, A, B, SFA,
+      SFB, D, m_indptr, n, k, num_groups, stream);
+}
 
 #endif  // FLASHINFER_GROUP_GEMM_MXFP4_GROUPWISE_SM120_CUH_

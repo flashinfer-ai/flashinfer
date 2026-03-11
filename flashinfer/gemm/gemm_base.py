@@ -5033,17 +5033,17 @@ def group_gemm_mxfp8_mxfp4_nt_groupwise(
         Element element in ``m_indptr`` must be a multiple of 4.
 
     mma_sm: int
-        How many SMs to use for the MMA operation, must be 1 or 2.
+        How many SMs to use for the MMA operation, must be 1 or 2. 2 is not supported on SM120/121.
         2 is faster when number of rows (M) per group is large (>= 256).
 
     tile_m: int
         The tile size for the M dimension, must be 128.
 
     tile_n: int
-        The tile size for the N dimension, must be 64, 128, 192, or 256.
+        The tile size for the N dimension, must be 64, 128, 192, or 256. Only 128 is supported on SM120/121.
 
     tile_k: int
-        The tile size for the K dimension, must be 128 or 256.
+        The tile size for the K dimension, must be 128 or 256. Only 128 is supported on SM120/121.
 
     swap_ab: bool
         Whether to swap the A and B tensors.
@@ -5182,14 +5182,35 @@ def _check_group_gemm_nvfp4_nt_groupwise_problem_size(
 
     num_groups = m_indptr.shape[0] - 1
 
-    if alpha is not None and alpha.shape[0] != num_groups:
-        raise ValueError(
-            f"alpha.shape[0] must equal num_groups, but got alpha.shape[0]={alpha.shape[0]}, num_groups={num_groups}"
-        )
+    if alpha is not None:
+        if alpha.dtype != torch.float32:
+            raise ValueError(f"alpha must be a float32 tensor, but got {alpha.dtype}")
+        if alpha.device != a.device:
+            raise ValueError(
+                f"alpha must be on the same device as a, but got alpha.device={alpha.device}, a.device={a.device}"
+            )
+        if alpha.numel() != 0 and alpha.shape != (num_groups,):
+            raise ValueError(
+                f"alpha must be a empty or have shape {(num_groups,)}, but got alpha.shape={alpha.shape}"
+            )
 
     if b.shape[0] != num_groups:
         raise ValueError(
             f"b.shape[0] must equal num_groups (m_indptr.shape[0] - 1), but got b.shape[0]={b.shape[0]}, num_groups={num_groups}"
+        )
+
+    # Check b, a_scale, and b_scale are all on the same device
+    if b.device != a.device:
+        raise ValueError(
+            f"b must be on the same device as a, but got b.device={b.device}, a.device={a.device}"
+        )
+    if a_scale.device != a.device:
+        raise ValueError(
+            f"a_scale must be on the same device as a, but got a_scale.device={a_scale.device}, a.device={a.device}"
+        )
+    if b_scale.device != b.device:
+        raise ValueError(
+            f"b_scale must be on the same device as b, but got b_scale.device={b_scale.device}, b.device={b.device}"
         )
 
     n = b.shape[1]
