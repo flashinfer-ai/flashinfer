@@ -95,7 +95,7 @@ struct SelectiveStateMTPParams : public SelectiveStateUpdateParams {
 
 }  // namespace flashinfer::mamba
 
-#include "kernel_selective_state_update_mtp.cuh"
+#include "invoke_selective_state_update_mtp.cuh"
 #include "kernel_selective_state_update_stp.cuh"
 
 #endif  // FLASHINFER_MAMBA_SELECTIVE_STATE_UPDATE_CUH_

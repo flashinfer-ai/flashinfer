@@ -1371,10 +1371,6 @@ class TestSelectiveStateUpdateMTPVertical(TestSelectiveStateUpdateMTP):
 
     def run_kernel(self, inputs, out=None, disable_state_update=False):
         """Run the flashinfer kernel with algorithm='vertical'."""
-        if inputs["state_cache"].dtype == torch.float32:
-            pytest.skip(
-                "Known bug: float32 state ordering-dependent failure (see plan Bug 1)"
-            )
         if inputs["x"].shape[-1] > 64:
             pytest.skip("Vertical kernel only supports DIM <= 64 (smem budget)")
         return flashinfer.mamba.selective_state_update(
@@ -1403,10 +1399,6 @@ class TestSelectiveStateUpdateMTPVerticalWithIntermediateStates(
 
     def run_kernel_with_intermediate_states(self, inputs, out=None):
         """Run the flashinfer kernel with algorithm='vertical' and intermediate states."""
-        if inputs["state_cache"].dtype == torch.float32:
-            pytest.skip(
-                "Known bug: float32 state ordering-dependent failure (see plan Bug 1)"
-            )
         if inputs["x"].shape[-1] > 64:
             pytest.skip("Vertical kernel only supports DIM <= 64 (smem budget)")
         return flashinfer.mamba.selective_state_update(
