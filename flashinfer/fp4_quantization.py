@@ -1094,7 +1094,7 @@ def _nvfp4_kv_dequant_check(fp4_data, block_scales, global_scale, output_dtype=N
 def nvfp4_kv_dequantize(
     fp4_data: torch.Tensor,
     block_scales: torch.Tensor,
-    global_scale,
+    global_scale: torch.Tensor,
     output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     """GPU dequantization of NVFP4 KV cache data with linear block scale layout.
@@ -1104,17 +1104,13 @@ def nvfp4_kv_dequantize(
     Args:
         fp4_data (torch.Tensor): Packed FP4 data of shape [M, K/2] with dtype uint8.
         block_scales (torch.Tensor): Per-block FP8 E4M3 scales of shape [M, K/16] with dtype uint8.
-        global_scale (torch.Tensor or float): Global scale factor. Can be a tensor of shape [1]
-            with dtype float32 on the same device as fp4_data, or a plain float value.
+        global_scale (torch.Tensor): Global scale factor of shape [1] with dtype float32,
+            on the same CUDA device as fp4_data.
         output_dtype (torch.dtype): Output dtype, either torch.bfloat16 or torch.float16.
 
     Returns:
         torch.Tensor: Dequantized tensor of shape [M, K] with the specified output dtype.
     """
-    if not isinstance(global_scale, torch.Tensor):
-        global_scale = torch.tensor(
-            [global_scale], dtype=torch.float32, device=fp4_data.device
-        )
     M = fp4_data.size(0)
     K = fp4_data.size(1) * 2
     output = torch.empty((M, K), dtype=output_dtype, device=fp4_data.device)
@@ -1133,7 +1129,7 @@ def _nvfp4_kv_quant_check(input, global_scale):
 @flashinfer_api
 def nvfp4_kv_quantize(
     input: torch.Tensor,
-    global_scale,
+    global_scale: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """GPU quantization to NVFP4 KV cache format with linear block scale layout.
 
@@ -1142,18 +1138,14 @@ def nvfp4_kv_quantize(
     Args:
         input (torch.Tensor): Input tensor of shape [M, K] with dtype bf16 or fp16.
             K must be divisible by 16.
-        global_scale (torch.Tensor or float): Global scale factor. Can be a tensor of shape [1]
-            with dtype float32 on the same device as input, or a plain float value.
+        global_scale (torch.Tensor): Global scale factor of shape [1] with dtype float32,
+            on the same CUDA device as input.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
             - fp4_output: Packed FP4 data of shape [M, K/2] with dtype uint8.
             - block_scales: Per-block FP8 E4M3 scales of shape [M, K/16] with dtype uint8.
     """
-    if not isinstance(global_scale, torch.Tensor):
-        global_scale = torch.tensor(
-            [global_scale], dtype=torch.float32, device=input.device
-        )
     M, K = input.shape
     fp4_output = torch.empty((M, K // 2), dtype=torch.uint8, device=input.device)
     block_scales = torch.empty((M, K // 16), dtype=torch.uint8, device=input.device)

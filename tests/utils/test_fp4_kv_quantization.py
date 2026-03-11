@@ -115,31 +115,6 @@ def test_nvfp4_kv_dequant(shape, dtype):
 
 @pytest.mark.parametrize("shape", SHAPES)
 @pytest.mark.parametrize("dtype", DTYPES)
-def test_nvfp4_kv_dequant_float_scale(shape, dtype):
-    """Test dequantization with plain float global_scale (auto-converted to device tensor)."""
-    cc = get_compute_capability()
-    if cc < 80:
-        pytest.skip(f"SM{cc} does not support FP8 E4M3 (requires SM80+)")
-
-    M, K = shape
-    torch.manual_seed(42)
-
-    fp4_data = torch.randint(0, 256, (M, K // 2), dtype=torch.uint8, device="cuda")
-    block_scales = torch.randint(1, 120, (M, K // 16), dtype=torch.uint8, device="cuda")
-
-    global_scale_val = 0.5
-
-    output = flashinfer.nvfp4_kv_dequantize(
-        fp4_data, block_scales, global_scale_val, output_dtype=dtype
-    )
-
-    ref = reference_dequant(fp4_data, block_scales, global_scale_val, dtype)
-
-    torch.testing.assert_close(output.float(), ref.float(), atol=1e-3, rtol=1e-3)
-
-
-@pytest.mark.parametrize("shape", SHAPES)
-@pytest.mark.parametrize("dtype", DTYPES)
 def test_nvfp4_kv_quant(shape, dtype):
     """Test quantization kernel output shapes and basic validity."""
     cc = get_compute_capability()
