@@ -1371,8 +1371,6 @@ class TestSelectiveStateUpdateMTPVertical(TestSelectiveStateUpdateMTP):
 
     def run_kernel(self, inputs, out=None, disable_state_update=False):
         """Run the flashinfer kernel with algorithm='vertical'."""
-        if inputs["x"].shape[-1] > 64:
-            pytest.skip("Vertical kernel only supports DIM <= 64 (smem budget)")
         return flashinfer.mamba.selective_state_update(
             inputs["state_cache"],
             inputs["x"],
@@ -1399,8 +1397,6 @@ class TestSelectiveStateUpdateMTPVerticalWithIntermediateStates(
 
     def run_kernel_with_intermediate_states(self, inputs, out=None):
         """Run the flashinfer kernel with algorithm='vertical' and intermediate states."""
-        if inputs["x"].shape[-1] > 64:
-            pytest.skip("Vertical kernel only supports DIM <= 64 (smem budget)")
         return flashinfer.mamba.selective_state_update(
             inputs["state_cache"],
             inputs["x"],
