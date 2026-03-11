@@ -2696,7 +2696,10 @@ def chunk_gated_delta_rule_cutile(
     # For 8<BH<64: keep CTAs ≤ 256 (empirically optimal for BH=16..32)
     rec_BV = 8
     # For BH≤4 with long sequences (NT>32, T>2048): cap at 64 CTAs to force BV=16, using occ2
-    max_rec_CTAs = 512 if BH >= 64 else (64 if (BH <= 4 and NT > 32) else (128 if BH <= 8 else 256))
+    # V<=128: smaller V means BV=32 at 256 CTAs is feasible; V>128: allow 512 CTAs for BV=32
+    # V<=128: BV=32 at 256 CTAs is optimal (0.87 waves vs 1.73 at 512); V>128: need 512 for BV=32
+    # V<=128: BV=32 at 256 CTAs is optimal (0.87 waves vs 1.73 at 512); V>128: need 512 for BV=32
+    max_rec_CTAs = (256 if V <= 128 else 512) if BH >= 64 else (64 if (BH <= 4 and NT > 32) else (128 if BH <= 8 else 256))
     while (V + rec_BV - 1) // rec_BV * BH > max_rec_CTAs and rec_BV < 64:
         rec_BV *= 2
     n_v = (V + rec_BV - 1) // rec_BV
