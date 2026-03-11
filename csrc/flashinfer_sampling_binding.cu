@@ -59,7 +59,8 @@ void top_k_top_p_sampling_from_probs(TensorView probs, TensorView output,
                                      uint64_t offset_val);
 
 void top_p_renorm_probs(TensorView probs, TensorView renorm_probs,
-                        Optional<TensorView> maybe_top_p_arr, double top_p_val);
+                        Optional<TensorView> maybe_top_p_arr, double top_p_val,
+                        bool is_deterministic, TensorView workspace);
 
 void top_k_renorm_probs(TensorView probs, TensorView renorm_probs,
                         Optional<TensorView> maybe_top_k_arr, int64_t top_k_val,
