@@ -2710,10 +2710,18 @@ def chunk_gated_delta_rule_cutile(
 
     ct.launch(stream, (NT, BH), ckkt_kernel,
               (g, k, beta, g_cumsum, A_inv, T, H, K, 64, BK))
-    _recompute_w_u_cached(k, v, beta, g_cumsum, A_inv, c['w'], c['u'])
-    ct.launch(stream, (n_v, BH), rec_kernel,
-              (k, c['w'], c['u'], g_cumsum, h, v_new,
-               initial_state, initial_state_indices, T, H, K, V, 64, rec_BV, NT, USE_INITIAL))
+
+    if K <= 128 and BH >= 64 and rec_BV <= 32 and NT * BH >= 512:
+        # Fused WY+rec: w, u computed on-the-fly per chunk, never in HBM.
+        # Saves w+u write+read bandwidth (~128MB for large configs at 8TB/s = ~16us).
+        ct.launch(stream, (n_v, BH), cutile_fused_wy_rec_kernel,
+                  (k, v, beta, g_cumsum, A_inv, h, v_new,
+                   initial_state, initial_state_indices, T, H, K, V, 64, rec_BV, NT, USE_INITIAL))
+    else:
+        _recompute_w_u_cached(k, v, beta, g_cumsum, A_inv, c['w'], c['u'])
+        ct.launch(stream, (n_v, BH), rec_kernel,
+                  (k, c['w'], c['u'], g_cumsum, h, v_new,
+                   initial_state, initial_state_indices, T, H, K, V, 64, rec_BV, NT, USE_INITIAL))
     _dispatch_output()
 
     return o, None, h
@@ -3109,6 +3117,117 @@ def cutile_recurrence_kernel_bv16(
         ct.store(initial_state, index=(idx, i_h, 2, i_v), tile=b_h3.astype(initial_state.dtype).reshape((1, 1, BK, BV)))
     if K > 192:
         ct.store(initial_state, index=(idx, i_h, 3, i_v), tile=b_h4.astype(initial_state.dtype).reshape((1, 1, BK, BV)))
+
+
+# ============================================================================
+# Kernel: Fused WY+rec — eliminates w, u HBM roundtrip
+# Computes w = A_inv @ (k * beta * exp_g) and u = A_inv @ (v * beta) on-the-fly
+# per chunk, so w and u never touch HBM.
+# Savings: w(B*T*H*K*2) + u(B*T*H*V*2) write + read = 128MB for typical config
+# Grid: (cdiv(V, BV), B*H)
+# ============================================================================
+@ct.kernel(occupancy=2)
+def cutile_fused_wy_rec_kernel(
+    k,              # [B, T, H, K]
+    v,              # [B, T, H, V]
+    beta,           # [B, T, H] (float32)
+    g_cumsum,       # [B, T, H] (float32)
+    A_inv,          # [B, T, H, BT] — stored as [B, NT*BT, H, BT]
+    h,              # [B, NT, H, K, V] output hidden states
+    v_new,          # [B, T, H, V] output v_new
+    initial_state,  # [N, H, K, V]
+    initial_state_indices,  # [B] int32
+    T: ConstInt,
+    H: ConstInt,
+    K: ConstInt,
+    V: ConstInt,
+    BT: ConstInt,
+    BV: ConstInt,
+    NT: ConstInt,
+    USE_INITIAL_STATE: ConstBool,
+):
+    """Fused WY+rec: w and u computed on-the-fly per chunk, never written to HBM."""
+    i_v = ct.bid(0)
+    i_nh = ct.bid(1)
+    i_n = i_nh // H
+    i_h = i_nh % H
+    BK = 64
+
+    b_h1 = ct.zeros((BK, BV), dtype=ct.float32)
+    b_h2 = ct.zeros((BK, BV), dtype=ct.float32)
+    if USE_INITIAL_STATE:
+        idx = ct.load(initial_state_indices, index=(i_n,), shape=()).astype(ct.int32)
+        b_h1 = b_h1 + ct.load(initial_state, index=(idx, i_h, 0, i_v),
+                               shape=(1, 1, BK, BV), padding_mode=PAD_ZERO).reshape((BK, BV)).astype(ct.float32)
+        if K > 64:
+            b_h2 = b_h2 + ct.load(initial_state, index=(idx, i_h, 1, i_v),
+                                   shape=(1, 1, BK, BV), padding_mode=PAD_ZERO).reshape((BK, BV)).astype(ct.float32)
+
+    for i_t in range(NT):
+        # Store h[t] for output kernel
+        ct.store(h, index=(i_n, i_t, i_h, 0, i_v), tile=b_h1.astype(h.dtype).reshape((1, 1, 1, BK, BV)))
+        if K > 64:
+            ct.store(h, index=(i_n, i_t, i_h, 1, i_v), tile=b_h2.astype(h.dtype).reshape((1, 1, 1, BK, BV)))
+
+        # Load A_inv for this chunk: [BT, BT]
+        b_Ai = ct.load(A_inv, index=(i_n, i_t, i_h, 0),
+                       shape=(1, BT, 1, BT), padding_mode=PAD_ZERO).reshape((BT, BT))
+
+        # Load beta and g_cumsum for this chunk
+        b_beta = ct.load(beta, index=(i_n, i_t, i_h),
+                        shape=(1, BT, 1), padding_mode=PAD_ZERO).reshape((BT,)).astype(ct.float32)
+        b_g = ct.load(g_cumsum, index=(i_n, i_t, i_h),
+                     shape=(1, BT, 1), padding_mode=PAD_ZERO).reshape((BT,)).astype(ct.float32)
+        b_g_exp = ct.exp(b_g)
+
+        # --- Compute w = A_inv @ (k * beta * exp_g) per K-block, then w @ h ---
+        b_v_corr = ct.zeros((BT, BV), dtype=ct.float32)
+
+        k1 = ct.load(k, index=(i_n, i_t, i_h, 0),
+                    shape=(1, BT, 1, BK), padding_mode=PAD_ZERO).reshape((BT, BK))
+        kb1 = (k1.astype(ct.float32) * (b_beta * b_g_exp)[:, None]).astype(k.dtype)
+        w1 = ct.mma(b_Ai.astype(k.dtype), kb1, ct.zeros((BT, BK), dtype=ct.float32)).astype(k.dtype)
+        b_v_corr = ct.mma(w1, b_h1.astype(w1.dtype), b_v_corr)
+
+        if K > 64:
+            k2 = ct.load(k, index=(i_n, i_t, i_h, 1),
+                        shape=(1, BT, 1, BK), padding_mode=PAD_ZERO).reshape((BT, BK))
+            kb2 = (k2.astype(ct.float32) * (b_beta * b_g_exp)[:, None]).astype(k.dtype)
+            w2 = ct.mma(b_Ai.astype(k.dtype), kb2, ct.zeros((BT, BK), dtype=ct.float32)).astype(k.dtype)
+            b_v_corr = ct.mma(w2, b_h2.astype(w2.dtype), b_v_corr)
+
+        # --- Compute u = A_inv @ (v * beta) for this V-block ---
+        v_tile = ct.load(v, index=(i_n, i_t, i_h, i_v),
+                        shape=(1, BT, 1, BV), padding_mode=PAD_ZERO).reshape((BT, BV))
+        vb = (v_tile.astype(ct.float32) * b_beta[:, None]).astype(v.dtype)
+        u_tile = ct.mma(b_Ai.astype(v.dtype), vb, ct.zeros((BT, BV), dtype=ct.float32))
+
+        # v_new = u - w @ h
+        b_v_new = u_tile - b_v_corr
+        ct.store(v_new, index=(i_n, i_t, i_h, i_v),
+                tile=b_v_new.astype(v_new.dtype).reshape((1, BT, 1, BV)))
+
+        # --- Update h: h[t+1] = h[t] * exp(g_last) + k^T @ (v_new * exp(g_last - g)) ---
+        b_g_last = ct.extract(b_g, index=(BT - 1,), shape=(1,))
+        g_diff = b_g_last - b_g
+        g_diff = ct.minimum(g_diff, 20.0)
+        b_v_new_scaled = (b_v_new * ct.exp(g_diff)[:, None]).astype(k.dtype)
+        b_g_last_exp = ct.exp(b_g_last)
+        b_h1 = b_h1 * b_g_last_exp
+        if K > 64:
+            b_h2 = b_h2 * b_g_last_exp
+        # k was already loaded above
+        b_h1 = ct.mma(ct.transpose(k1), b_v_new_scaled, b_h1)
+        if K > 64:
+            b_h2 = ct.mma(ct.transpose(k2), b_v_new_scaled, b_h2)
+
+    # Store final state
+    idx = ct.load(initial_state_indices, index=(i_n,), shape=()).astype(ct.int32)
+    ct.store(initial_state, index=(idx, i_h, 0, i_v),
+             tile=b_h1.astype(initial_state.dtype).reshape((1, 1, BK, BV)))
+    if K > 64:
+        ct.store(initial_state, index=(idx, i_h, 1, i_v),
+                 tile=b_h2.astype(initial_state.dtype).reshape((1, 1, BK, BV)))
 
 
 # ============================================================================
