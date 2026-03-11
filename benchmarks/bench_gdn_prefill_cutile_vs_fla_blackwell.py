@@ -92,15 +92,16 @@ except ImportError as e:
 # Benchmark configs: 8 representative workloads
 # ---------------------------------------------------------------------------
 CONFIGS_ALL = [
-    # (B,  T,    H, K,   V,   label)
-    (1,  2048, 4, 256, 256, "B=1 ,T=2048"),
-    (2,  2048, 4, 256, 256, "B=2 ,T=2048"),
-    (4,  2048, 4, 256, 256, "B=4 ,T=2048"),
-    (8,  1024, 4, 256, 256, "B=8 ,T=1024"),
-    (1,  4096, 4, 256, 256, "B=1 ,T=4096"),
-    (4,  4096, 4, 256, 256, "B=4 ,T=4096"),   # >1ms
-    (8,  2048, 4, 256, 256, "B=8 ,T=2048"),   # >1ms
-    (16, 1024, 4, 256, 256, "B=16,T=1024"),   # >1ms
+    # Qwen3.5 GDN parameters: K=128, V=128, H=32
+    # (B,  T,    H,  K,   V,   label)
+    (1,  2048, 32, 128, 128, "B=1 ,T=2048"),
+    (2,  2048, 32, 128, 128, "B=2 ,T=2048"),
+    (4,  2048, 32, 128, 128, "B=4 ,T=2048"),
+    (8,  1024, 32, 128, 128, "B=8 ,T=1024"),
+    (1,  4096, 32, 128, 128, "B=1 ,T=4096"),
+    (4,  4096, 32, 128, 128, "B=4 ,T=4096"),   # >1ms
+    (8,  2048, 32, 128, 128, "B=8 ,T=2048"),   # >1ms
+    (16, 1024, 32, 128, 128, "B=16,T=1024"),   # >1ms
 ]
 
 CONFIGS_LARGE = [cfg for cfg in CONFIGS_ALL if cfg[0] * cfg[1] >= 4 * 2048]
@@ -161,7 +162,7 @@ def bench_config(B, T, H, K, V, label):
     v = torch.randn(B, T, H, V, dtype=dtype, device=device)
     g = F.logsigmoid(torch.randn(B, T, H, device=device, dtype=torch.float32))
     beta = torch.sigmoid(torch.randn(B, T, H, device=device, dtype=torch.float32))
-    h0 = torch.randn(B, H, K, V, dtype=dtype, device=device)
+    h0 = torch.randn(B, H, K, V, dtype=torch.float32, device=device)
     idx = torch.arange(B, dtype=torch.int32, device=device)
     scale = K ** -0.5
 
@@ -242,7 +243,7 @@ def main():
             v = torch.randn(B, T, H, V, dtype=dtype, device=device)
             g = F2.logsigmoid(torch.randn(B, T, H, device=device, dtype=torch.float32))
             beta = torch.sigmoid(torch.randn(B, T, H, device=device, dtype=torch.float32))
-            h0 = torch.randn(B, H, K, V, dtype=dtype, device=device)
+            h0 = torch.randn(B, H, K, V, dtype=torch.float32, device=device)
             idx = torch.arange(B, dtype=torch.int32, device=device)
             q_n = F2.normalize(q.float(), p=2, dim=-1).to(dtype)
             k_n = F2.normalize(k.float(), p=2, dim=-1).to(dtype)

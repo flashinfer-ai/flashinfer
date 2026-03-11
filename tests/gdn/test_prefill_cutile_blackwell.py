@@ -115,10 +115,11 @@ def _test_cutile_vs_fla(
 
     # Always provide initial state tensors; use zeros when not testing initial state
     # (cuTile ct.launch can't accept None tensors; zeros == no initial state)
+    # SSM state is float32 in sglang (matching Qwen3.5 default)
     if use_initial_state:
-        h0 = torch.randn(B, H, K, V, dtype=dtype, device=device)
+        h0 = torch.randn(B, H, K, V, dtype=torch.float32, device=device)
     else:
-        h0 = torch.zeros(B, H, K, V, dtype=dtype, device=device)
+        h0 = torch.zeros(B, H, K, V, dtype=torch.float32, device=device)
     idx = torch.arange(B, dtype=torch.int32, device=device)
 
     # ---- cuTile ----
@@ -158,25 +159,23 @@ def _test_cutile_vs_fla(
 @pytest.mark.parametrize("use_initial_state", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("B,T,H,K,V", [
-    # Small configs (sanity check)
+    # Small configs (sanity check, K=V=64)
     (1, 64,  4, 64,  64),
     (1, 128, 4, 64,  64),
     (2, 128, 4, 64,  64),
-    # Medium configs
-    (1, 512,  4, 128, 128),
-    (2, 512,  4, 128, 128),
-    (4, 512,  4, 128, 128),
-    # Standard GDN configs (K=V=256, H=4)
-    (1, 512,  4, 256, 256),
-    (1, 1024, 4, 256, 256),
-    (2, 1024, 4, 256, 256),
-    (4, 1024, 4, 256, 256),
-    (8, 1024, 4, 256, 256),
+    # Qwen3.5 GDN configs (K=128, V=128, H=32)
+    (1, 512,  32, 128, 128),
+    (2, 512,  32, 128, 128),
+    (4, 512,  32, 128, 128),
+    (1, 1024, 32, 128, 128),
+    (2, 1024, 32, 128, 128),
+    (4, 1024, 32, 128, 128),
+    (8, 1024, 32, 128, 128),
     # Large configs
-    (1,  2048, 4, 256, 256),
-    (4,  2048, 4, 256, 256),
-    (8,  2048, 4, 256, 256),
-    (16, 1024, 4, 256, 256),
+    (1,  2048, 32, 128, 128),
+    (4,  2048, 32, 128, 128),
+    (8,  2048, 32, 128, 128),
+    (16, 1024, 32, 128, 128),
 ])
 def test_cutile_vs_fla_accuracy(B, T, H, K, V, dtype, use_initial_state):
     """cuTile GDN prefill output matches FLA Triton baseline on Blackwell."""
@@ -185,10 +184,10 @@ def test_cutile_vs_fla_accuracy(B, T, H, K, V, dtype, use_initial_state):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("B,T,H,K,V", [
-    # Key production-scale configs targeting >1ms total kernel time
-    (4,  4096, 4, 256, 256),
-    (8,  2048, 4, 256, 256),
-    (16, 1024, 4, 256, 256),
+    # Key production-scale Qwen3.5 configs targeting >1ms total kernel time
+    (4,  4096, 32, 128, 128),
+    (8,  2048, 32, 128, 128),
+    (16, 1024, 32, 128, 128),
 ])
 def test_cutile_large_configs(B, T, H, K, V, dtype):
     """Accuracy on large Blackwell workloads (>1ms kernel time)."""
