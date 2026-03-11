@@ -37,11 +37,45 @@ import torch
 import torch.nn.functional as F
 from torch.profiler import profile, ProfilerActivity
 
-# cuTile main entry point
+# cuTile main entry point — import directly to avoid tvm_ffi dependency
+import importlib.util, sys, types, pathlib
+_kernel_path = pathlib.Path(__file__).parent.parent / "flashinfer/gdn_kernels/cutile_gdn_prefill.py"
+_SGLANG_ROOT = pathlib.Path("/home/scratch.xutingz_wwfo/gitsrc/sglang")
+# Bootstrap sglang FLA modules needed by cutile_gdn_prefill at runtime
+def _stub(name):
+    parts = name.split('.')
+    for i in range(1, len(parts) + 1):
+        pkg = '.'.join(parts[:i])
+        if pkg not in sys.modules:
+            m = types.ModuleType(pkg); m.__path__ = []; m.__package__ = pkg
+            sys.modules[pkg] = m
+def _load(name, path):
+    _stub(name)
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    mod.__package__ = name.rsplit('.', 1)[0]
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+import torch as _torch
+_stub("sglang.srt.utils.common")
+sys.modules["sglang.srt.utils.common"].torch_release = tuple(
+    int(x) for x in _torch.__version__.split(".")[:2] if x.isdigit()
+)
+_sgl_python = str(_SGLANG_ROOT / "python")
+if _sgl_python not in sys.path:
+    sys.path.insert(0, _sgl_python)
+_fla = _SGLANG_ROOT / "python/sglang/srt/layers/attention/fla"
+for _n in ["utils", "l2norm", "op", "index", "cumsum",
+           "chunk_scaled_dot_kkt", "solve_tril", "wy_fast", "chunk_delta_h", "chunk_o"]:
+    _load(f"sglang.srt.layers.attention.fla.{_n}", str(_fla / f"{_n}.py"))
 try:
-    from flashinfer.gdn_kernels.cutile_gdn_prefill import chunk_gated_delta_rule_cutile as ct_fwd
+    _spec = importlib.util.spec_from_file_location("cutile_gdn_prefill", _kernel_path)
+    _mod = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    ct_fwd = _mod.chunk_gated_delta_rule_cutile
     CT_AVAILABLE = True
-except ImportError as e:
+except Exception as e:
     CT_AVAILABLE = False
     print(f"[WARN] cuTile not available: {e}")
 
@@ -85,6 +119,21 @@ def _profiler_time_us(fn, warmup: int = 20, reps: int = 50) -> float:
             fn()
     torch.cuda.synchronize()
     return sum(e.device_time_total for e in prof.key_averages()) / reps
+
+
+def _profiler_breakdown(fn, warmup: int = 10, reps: int = 30) -> dict:
+    """Return per-kernel GPU time breakdown (μs) via torch.profiler."""
+    for _ in range(warmup):
+        fn()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        for _ in range(reps):
+            fn()
+    torch.cuda.synchronize()
+    result = {}
+    for e in prof.key_averages():
+        if e.device_time_total > 0:
+            result[e.key] = e.device_time_total / reps
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +201,11 @@ def main():
         action="store_true",
         help="Only run configs with total tokens >= 4*2048 (>1ms kernel time)",
     )
+    parser.add_argument(
+        "--breakdown",
+        action="store_true",
+        help="Show per-kernel GPU time breakdown for cuTile",
+    )
     args = parser.parse_args()
 
     is_sm100 = _check_sm100()
@@ -178,6 +232,27 @@ def main():
             f" {ct_p/1000:>9.3f}ms"
             f" {spd:>9.2f}x"
         )
+
+        if args.breakdown and CT_AVAILABLE:
+            import torch.nn.functional as F2
+            device = torch.device("cuda")
+            dtype = torch.bfloat16
+            q = torch.randn(B, T, H, K, dtype=dtype, device=device)
+            k = torch.randn(B, T, H, K, dtype=dtype, device=device)
+            v = torch.randn(B, T, H, V, dtype=dtype, device=device)
+            g = F2.logsigmoid(torch.randn(B, T, H, device=device, dtype=torch.float32))
+            beta = torch.sigmoid(torch.randn(B, T, H, device=device, dtype=torch.float32))
+            h0 = torch.randn(B, H, K, V, dtype=dtype, device=device)
+            idx = torch.arange(B, dtype=torch.int32, device=device)
+            q_n = F2.normalize(q.float(), p=2, dim=-1).to(dtype)
+            k_n = F2.normalize(k.float(), p=2, dim=-1).to(dtype)
+            fn_ct = lambda: ct_fwd(q_n, k_n, v, g, beta, K**-0.5, h0.clone(), idx, use_qk_l2norm_in_kernel=False)
+            bd = _profiler_breakdown(fn_ct)
+            total = sum(bd.values())
+            print(f"  {'Kernel':<55} {'us':>8}  {'%':>5}")
+            for kname, us in sorted(bd.items(), key=lambda x: -x[1]):
+                print(f"  {kname:<55} {us:>8.1f}  {100*us/total:>5.1f}%")
+            print()
 
     print()
     print("GPU kernel time only (torch.profiler CUDA events). NVIDIA B200 (SM100).")
