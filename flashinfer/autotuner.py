@@ -832,15 +832,19 @@ class AutoTuner:
         ).to(dtype)
         tensors = []
         for i, p in enumerate(profile.shapes):
-            if any(isinstance(d, DynamicDim) for d in p):
+            if inputs[i] is None:
+                # Some callers pass None for optional tensors (e.g. routing_logits
+                # in non-routed MoE). Preserve None as-is.
+                tensors.append(None)
+            elif any(isinstance(d, DynamicDim) for d in p):
                 tensor = self._create_tensor_like(
                     inputs[i],
                     p,
                     profile.tensor_initializers[i] or default_initializer,
                 )
+                tensors.append(tensor)
             else:
-                tensor = inputs[i]
-            tensors.append(tensor)
+                tensors.append(inputs[i])
         return tensors
 
     def _prepare_input_tensors_with_batches(
