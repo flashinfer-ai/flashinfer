@@ -30,7 +30,11 @@ from ..core import (
     sm100f_nvcc_flags,
     current_compilation_context,
 )
-from ..cubin_loader import get_cubin, get_meta_hash
+from ..cubin_loader import (
+    # download_trtllm_headers,
+    get_cubin,
+    get_meta_hash,
+)
 from ..utils import dtype_cutlass_map, filename_safe_dtype_map, write_if_different
 
 
@@ -87,6 +91,8 @@ def gen_gemm_sm100_module_cutlass_fp4() -> JitSpec:
         + [
             "-DENABLE_BF16",
             "-DENABLE_FP4",
+            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
+            "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
         ],
         extra_cflags=[
             "-DFAST_BUILD",
@@ -154,6 +160,8 @@ def gen_gemm_sm103_module_cutlass_fp4() -> JitSpec:
         + [
             "-DENABLE_BF16",
             "-DENABLE_FP4",
+            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
+            "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
         ],
         extra_cflags=[
             "-DFAST_BUILD",
@@ -171,9 +179,11 @@ def gen_gemm_sm120_module_cutlass_fp4() -> JitSpec:
     with open(jit_env.FLASHINFER_CSRC_DIR / "fp4_gemm_cutlass_sm120.jinja") as f:
         kernel_inst_templ = jinja2.Template(f.read())
         dtype_list = ["__nv_bfloat16", "half"]
-        # SM120/121 uses only 128x128x128 tile configuration with implied 1x1x1 cluster shape
+        # SM120/121 tile configurations with implied 1x1x1 cluster shape
         cta_m_n_k_list = [
             (128, 128, 128),
+            (128, 128, 256),
+            (256, 128, 128),
         ]
         for cta_m, cta_n, cta_k in cta_m_n_k_list:
             for dtype in dtype_list:
@@ -200,6 +210,8 @@ def gen_gemm_sm120_module_cutlass_fp4() -> JitSpec:
         + [
             "-DENABLE_BF16",
             "-DENABLE_FP4",
+            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
+            "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
         ],
         extra_cflags=[
             "-DFAST_BUILD",
@@ -250,6 +262,8 @@ def gen_gemm_sm100_module_cutlass_fp8() -> JitSpec:
         extra_cuda_cflags=nvcc_flags
         + [
             "-DENABLE_BF16",
+            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
+            "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
         ],
         extra_cflags=[
             "-DFAST_BUILD",
@@ -297,6 +311,55 @@ def gen_gemm_sm100_module_cutlass_bf16() -> JitSpec:
         "bf16_gemm_cutlass",
         source_paths,
         extra_cuda_cflags=nvcc_flags + ["-DENABLE_BF16"],
+        extra_cflags=[
+            "-DFAST_BUILD",
+        ],
+    )
+
+
+def gen_gemm_sm100_module_cutlass_mxfp8() -> JitSpec:
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / "gen_gemm_sm100_cutlass_mxfp8"
+    os.makedirs(gen_directory, exist_ok=True)
+    source_paths = [
+        jit_env.FLASHINFER_CSRC_DIR / "mxfp8_gemm_cutlass.cu",
+    ]
+
+    with open(jit_env.FLASHINFER_CSRC_DIR / "mxfp8_gemm_cutlass.jinja") as f:
+        kernel_inst_templ = jinja2.Template(f.read())
+        dtype_list = ["__nv_bfloat16", "half"]
+        cta_m_n_k_list = [
+            (128, 64, 128),
+            (128, 256, 128),
+            (128, 128, 256),
+            (128, 256, 256),
+        ]
+        for cta_m, cta_n, cta_k in cta_m_n_k_list:
+            for dtype in dtype_list:
+                dest_path = (
+                    gen_directory
+                    / f"mxfp8_gemm_cutlass_{dtype}_{cta_m}_{cta_n}_{cta_k}.cu"
+                )
+                source_paths.append(dest_path)
+                source = kernel_inst_templ.render(
+                    type=dtype,
+                    cta_m=cta_m,
+                    cta_n=cta_n,
+                    cta_k=cta_k,
+                )
+                write_if_different(dest_path, source)
+
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[10, 11]
+    )
+    return gen_jit_spec(
+        "mxfp8_gemm_cutlass",
+        source_paths,
+        extra_cuda_cflags=nvcc_flags
+        + [
+            "-DENABLE_BF16",
+            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
+            "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
+        ],
         extra_cflags=[
             "-DFAST_BUILD",
         ],
@@ -392,7 +455,7 @@ def gen_gemm_sm120_module() -> JitSpec:
     dtype_in_list = [torch.float8_e4m3fn, torch.float8_e5m2]
     dtype_out_list = [torch.float16, torch.bfloat16]
     scale_major_k_list = ["true", "false"]
-    # SM120 uses fixed 128x128x128 tiles with Cooperative schedule
+    # SM120/SM121 uses fixed 128x128x128 tiles with Cooperative schedule
 
     with open(jit_env.FLASHINFER_CSRC_DIR / f"{prefix}_sm120_kernel_inst.jinja") as f:
         kernel_inst_templ = jinja2.Template(f.read())
@@ -463,7 +526,11 @@ def gen_gemm_sm120_module() -> JitSpec:
     return gen_jit_spec(
         "gemm_sm120",
         source_paths,
-        extra_cuda_cflags=nvcc_flags,
+        extra_cuda_cflags=nvcc_flags
+        + [
+            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
+            "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
+        ],
     )
 
 
@@ -487,6 +554,20 @@ def gen_trtllm_gen_gemm_module() -> JitSpec:
     )
     # make sure "flashinferMetaInfo.h" is downloaded or cached
     assert metainfo, f"{header_name}.h not found"
+
+    # TODO(jimmyzho): Re-enable after fixing trtllm-gen cubin generation issues.
+    # header_path = f"{include_path}/trtllmGen_gemm_export"
+    # header_dest_dir = (
+    #     jit_env.FLASHINFER_CUBIN_DIR
+    #     / "flashinfer"
+    #     / "trtllm"
+    #     / "gemm"
+    #     / "trtllmGen_gemm_export"
+    # )
+    # download_trtllm_headers(
+    #     "gemm", header_dest_dir, header_path, ArtifactPath.TRTLLM_GEN_GEMM, checksum
+    # )
+
     return gen_jit_spec(
         "trtllm_gemm",
         [
@@ -500,7 +581,11 @@ def gen_trtllm_gen_gemm_module() -> JitSpec:
         ]
         + sm100a_nvcc_flags,
         # link "include" sub-directory in cache
-        extra_include_paths=[jit_env.FLASHINFER_CUBIN_DIR / include_path],
+        extra_include_paths=[
+            jit_env.FLASHINFER_CUBIN_DIR / include_path,
+            # jit_env.FLASHINFER_CUBIN_DIR,
+            # jit_env.FLASHINFER_CUBIN_DIR / include_path,
+        ],
     )
 
 
@@ -638,6 +723,20 @@ def gen_trtllm_low_latency_gemm_module() -> JitSpec:
     )
     # make sure "flashinferMetaInfo.h" is downloaded or cached
     assert metainfo, f"{header_name}.h not found"
+
+    # TODO(jimmyzho): Re-enable after fixing trtllm-gen cubin generation issues.
+    # header_path = f"{include_path}/trtllmGen_gemm_export"
+    # header_dest_dir = (
+    #     jit_env.FLASHINFER_CUBIN_DIR
+    #     / "flashinfer"
+    #     / "trtllm"
+    #     / "gemm"
+    #     / "trtllmGen_gemm_export"
+    # )
+    # download_trtllm_headers(
+    #     "gemm", header_dest_dir, header_path, ArtifactPath.TRTLLM_GEN_GEMM, checksum
+    # )
+
     return gen_jit_spec(
         "trtllm_low_latency_gemm",
         [
@@ -650,7 +749,10 @@ def gen_trtllm_low_latency_gemm_module() -> JitSpec:
             f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_GEMM}\\"',
         ]
         + sm100a_nvcc_flags,
-        # link "include" sub-directory in cache
-        extra_include_paths=[jit_env.FLASHINFER_CUBIN_DIR / include_path],
+        extra_include_paths=[
+            jit_env.FLASHINFER_CUBIN_DIR / include_path
+            # jit_env.FLASHINFER_CUBIN_DIR,
+            # jit_env.FLASHINFER_CUBIN_DIR / include_path,
+        ],
         extra_ldflags=["-lcuda"],
     )

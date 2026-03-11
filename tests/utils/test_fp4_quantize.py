@@ -15,18 +15,20 @@ from flashinfer import (
     silu_and_mul_scaled_nvfp4_experts_quantize,
     silu_and_mul,
 )
+from flashinfer.utils import (
+    is_sm100a_supported,
+    is_sm110a_supported,
+    is_sm12x_supported,
+)
 
 
-def is_fp4_supported(device: torch.device) -> bool:
-    """Check if FP4 quantization is supported (SM100+ with CUDA >= 12.8)."""
-    major, _ = torch.cuda.get_device_capability(device)
-    cuda_version = torch.version.cuda
-    if cuda_version is None:
-        return False
-    # Check CUDA >= 12.8
-    parts = cuda_version.split(".")
-    cuda_major, cuda_minor = int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
-    return major >= 10 and (cuda_major > 12 or (cuda_major == 12 and cuda_minor >= 8))
+def _is_fp4_supported(device: torch.device) -> bool:
+    """Check if FP4 quantization is supported on this device."""
+    return (
+        is_sm100a_supported(device)
+        or is_sm110a_supported(device)
+        or is_sm12x_supported(device)
+    )
 
 
 DTYPES = [torch.float16, torch.bfloat16]
@@ -124,8 +126,8 @@ def test_fp4_quantization(
     sf_use_ue8m0: bool,
     is_swizzled: bool,
 ) -> None:
-    if not is_fp4_supported(torch.device(device)):
-        pytest.skip("FP4 requires SM100+ and CUDA >= 12.8")
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
     torch.set_default_device(device)
     torch.manual_seed(seed)
     m, n = shape
@@ -167,8 +169,8 @@ def test_scale_swizzling(
     seed: int,
     device: str,
 ) -> None:
-    if not is_fp4_supported(torch.device("cuda")):
-        pytest.skip("FP4 requires SM100+ and CUDA >= 12.8")
+    if not _is_fp4_supported(torch.device("cuda")):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
     torch.set_default_device(device)
     torch.manual_seed(seed)
     m, n = shape
@@ -203,8 +205,8 @@ def test_block_scale_interleave(
     device: str,
 ) -> None:
     """Test the block_scale_interleave function directly."""
-    if not is_fp4_supported(torch.device("cuda")):
-        pytest.skip("FP4 requires SM100+ and CUDA >= 12.8")
+    if not _is_fp4_supported(torch.device("cuda")):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
     torch.set_default_device(device)
     torch.manual_seed(seed)
 
@@ -252,8 +254,8 @@ def test_e2m1_dequantization(
     sf_use_ue8m0: bool,
 ) -> None:
     """Test roundtrip: fp4_quantize -> e2m1_and_ufp8sf_scale_to_float."""
-    if not is_fp4_supported(torch.device("cuda")):
-        pytest.skip("FP4 requires SM100+ and CUDA >= 12.8")
+    if not _is_fp4_supported(torch.device("cuda")):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
     torch.set_default_device(device)
     torch.manual_seed(seed)
 
@@ -345,8 +347,8 @@ def test_mxfp4_quantize_roundtrip(
     device: str,
 ) -> None:
     """Test MXFP4 quantization roundtrip for both backends."""
-    if not is_fp4_supported(torch.device(device)):
-        pytest.skip("FP4 requires SM100+ and CUDA >= 12.8")
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
     if backend == "cute-dsl" and not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
 
@@ -393,8 +395,8 @@ def test_mxfp4_quantize_backend_parity(
     device: str,
 ) -> None:
     """Test that CUDA and CuTe-DSL backends produce matching results."""
-    if not is_fp4_supported(torch.device(device)):
-        pytest.skip("FP4 requires SM100+ and CUDA >= 12.8")
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
     if not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
 
@@ -475,8 +477,8 @@ def test_nvfp4_batched_quantize(
     device: str,
 ) -> None:
     """Test nvfp4_batched_quantize function."""
-    if not is_fp4_supported(torch.device(device)):
-        pytest.skip("FP4 requires SM100+ and CUDA >= 12.8")
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability of 10 or above")
     torch.set_default_device(device)
     torch.manual_seed(seed)
 
@@ -518,8 +520,8 @@ def test_scaled_fp4_grouped_quantize(
     device: str,
 ) -> None:
     """Test scaled_fp4_grouped_quantize function."""
-    if not is_fp4_supported(torch.device(device)):
-        pytest.skip("FP4 requires SM100+ and CUDA >= 12.8")
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability of 10 or above")
     torch.set_default_device(device)
     torch.manual_seed(seed)
 
@@ -565,8 +567,8 @@ def test_silu_and_mul_scaled_nvfp4_experts_quantize(
     device: str,
 ) -> None:
     """Test silu_and_mul_nvfp4_batched_quantize function."""
-    if not is_fp4_supported(torch.device(device)):
-        pytest.skip("FP4 requires SM100+ and CUDA >= 12.8")
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability of 10 or above")
     torch.set_default_device(device)
     torch.manual_seed(seed)
 

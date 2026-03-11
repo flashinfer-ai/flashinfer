@@ -1,6 +1,7 @@
-[INFO] args = Namespace(routine='BatchPrefillWithPagedKVCacheWrapper', no_cuda_graph=False, use_cupti=False, refcheck=True, allow_output_mismatch=True, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='Llama-3.1-70B', generate_repro_command=True, repro_command='', backends=['fa2', 'fa3', 'cudnn', 'trtllm-gen'], page_size=16, batch_size=1, s_qo=1024, s_kv=1024, num_qo_heads=64, num_kv_heads=8, head_dim_qk=128, head_dim_vo=128, head_dim_ckv=None, head_dim_kpe=None, q_dtype='bfloat16', kv_dtype='bfloat16', causal=True, random_actual_seq_len=True)
+flashinfer/benchmarks$ python3 flashinfer_benchmark.py --testlist samples/sample_testlist.txt --output_path samples/sample_testlist_output.csv
+[INFO] args = Namespace(routine='BatchPrefillWithPagedKVCacheWrapper', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=True, allow_output_mismatch=True, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='Llama-3.1-70B', generate_repro_command=True, repro_command='', backends=['fa2', 'fa3', 'cudnn', 'trtllm-gen'], page_size=16, batch_size=1, s_qo=1024, s_kv=1024, num_qo_heads=64, num_kv_heads=8, head_dim_qk=128, head_dim_vo=128, head_dim_ckv=None, head_dim_kpe=None, q_dtype='bfloat16', kv_dtype='bfloat16', causal=True, random_actual_seq_len=True)
 [INFO] Running testBatchPrefillWithPagedKVCacheWrapper
-[INFO] FlashInfer version: 0.3.1
+[INFO] FlashInfer version: 0.6.2
 [VVERBOSE] gpu_name = 'NVIDIA_B200'
 [INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine BatchPrefillWithPagedKVCacheWrapper --backends fa2 fa3 cudnn trtllm-gen --page_size 16 --batch_size 1 --s_qo 1024 --s_kv 1024 --num_qo_heads 64 --num_kv_heads 8 --head_dim_qk 128 --head_dim_vo 128 --random_actual_seq_len -vv --refcheck --causal --q_dtype bfloat16 --kv_dtype bfloat16 --allow_output_mismatch --generate_repro_command --case_tag Llama-3.1-70B
 [WARNING] fa3 for routine BatchPrefillWithPagedKVCacheWrapper is not supported on compute capability 10.0. Skipping.
@@ -21,62 +22,12 @@
 [VVERBOSE] kv_indices.shape = torch.Size([7])
 [VVERBOSE] kv_last_page_len.shape = torch.Size([1])
 [VVERBOSE] scale = 0.08838834764831843
-[PERF] fa2            :: median time 0.012 ms; std 0.001 ms; achieved tflops 13.964 TFLOPs/sec; achieved tb_per_sec 0.305 TB/sec
-[PERF] cudnn          :: median time 0.018 ms; std 0.000 ms; achieved tflops 9.452 TFLOPs/sec; achieved tb_per_sec 0.206 TB/sec
-[PERF] trtllm-gen     :: median time 0.008 ms; std 0.000 ms; achieved tflops 20.700 TFLOPs/sec; achieved tb_per_sec 0.452 TB/sec
-[INFO] args = Namespace(routine='BatchPrefillWithPagedKVCacheWrapper', no_cuda_graph=False, use_cupti=False, refcheck=True, allow_output_mismatch=True, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='Llama-3.1-70B', generate_repro_command=True, repro_command='', backends=['fa2', 'fa3', 'cudnn', 'trtllm-gen'], page_size=16, batch_size=32, s_qo=1024, s_kv=1024, num_qo_heads=64, num_kv_heads=8, head_dim_qk=128, head_dim_vo=128, head_dim_ckv=None, head_dim_kpe=None, q_dtype='bfloat16', kv_dtype='bfloat16', causal=True, random_actual_seq_len=True)
-[INFO] Running testBatchPrefillWithPagedKVCacheWrapper
-[INFO] FlashInfer version: 0.3.1
-[VVERBOSE] gpu_name = 'NVIDIA_B200'
-[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine BatchPrefillWithPagedKVCacheWrapper --backends fa2 fa3 cudnn trtllm-gen --page_size 16 --batch_size 32 --s_qo 1024 --s_kv 1024 --num_qo_heads 64 --num_kv_heads 8 --head_dim_qk 128 --head_dim_vo 128 --random_actual_seq_len -vv --refcheck --causal --q_dtype bfloat16 --kv_dtype bfloat16 --allow_output_mismatch --generate_repro_command --case_tag Llama-3.1-70B
-[WARNING] fa3 for routine BatchPrefillWithPagedKVCacheWrapper is not supported on compute capability 10.0. Skipping.
-[VVERBOSE] s_qo == s_kv, making actual_seq_lens_kv the same as actual_seq_lens_q
-[VERBOSE] Average actual qo seq len: 399
-[VERBOSE] Average actual kv seq len: 399
-[VVERBOSE] actual_seq_lens_q.flatten() = tensor([103, 436, 861, 271, 107,  72, 701,  21, 615, 122, 467, 215, 331, 459,
-         88, 373, 100, 872, 664, 131, 662, 309, 770, 344, 492, 414, 806, 386,
-        192, 956, 277, 161], dtype=torch.int32)
-[VVERBOSE] actual_seq_lens_kv.flatten() = tensor([103, 436, 861, 271, 107,  72, 701,  21, 615, 122, 467, 215, 331, 459,
-         88, 373, 100, 872, 664, 131, 662, 309, 770, 344, 492, 414, 806, 386,
-        192, 956, 277, 161], dtype=torch.int32)
-[VVERBOSE] q.shape = torch.Size([12778, 64, 128])
-[VVERBOSE] num_pages_per_seq = 64
-[VVERBOSE] total_num_pages = 2048
-[VVERBOSE] kv_cache.shape = torch.Size([2048, 2, 8, 16, 128])
-[VVERBOSE] kv_cache.stride() = (32768, 16384, 128, 1024, 1)
-[VVERBOSE] block_tables.shape = torch.Size([32, 64])
-[VVERBOSE] qo_indptr.shape = torch.Size([33])
-[VVERBOSE] qo_indptr.dtype = torch.int32
-[VVERBOSE] kv_indptr.shape = torch.Size([33])
-[VVERBOSE] kv_indices.shape = torch.Size([815])
-[VVERBOSE] kv_last_page_len.shape = torch.Size([32])
-[VVERBOSE] scale = 0.08838834764831843
-[PERF] fa2            :: median time 0.483 ms; std 0.003 ms; achieved tflops 250.421 TFLOPs/sec; achieved tb_per_sec 0.975 TB/sec
-[PERF] cudnn          :: median time 0.382 ms; std 0.001 ms; achieved tflops 317.089 TFLOPs/sec; achieved tb_per_sec 1.234 TB/sec
-[PERF] trtllm-gen     :: median time 0.744 ms; std 0.000 ms; achieved tflops 162.619 TFLOPs/sec; achieved tb_per_sec 0.633 TB/sec
-[INFO] args = Namespace(routine='BatchPrefillWithRaggedKVCacheWrapper', no_cuda_graph=False, use_cupti=False, refcheck=True, allow_output_mismatch=True, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='DeepSeek-R1', generate_repro_command=True, repro_command='', backends=['fa2', 'fa3', 'cutlass', 'cudnn'], page_size=0, batch_size=1, s_qo=1024, s_kv=1024, num_qo_heads=128, num_kv_heads=128, head_dim_qk=192, head_dim_vo=128, head_dim_ckv=None, head_dim_kpe=None, q_dtype='bfloat16', kv_dtype='bfloat16', causal=True, random_actual_seq_len=True)
+[PERF] fa2            :: median time 0.012 ms; std 0.007 ms; achieved tflops 14.964 TFLOPs/sec; achieved tb_per_sec 0.327 TB/sec
+[PERF] cudnn          :: median time 0.020 ms; std 0.001 ms; achieved tflops 8.500 TFLOPs/sec; achieved tb_per_sec 0.186 TB/sec
+[PERF] trtllm-gen     :: median time 0.010 ms; std 0.000 ms; achieved tflops 16.688 TFLOPs/sec; achieved tb_per_sec 0.365 TB/sec
+[INFO] args = Namespace(routine='BatchPrefillWithRaggedKVCacheWrapper', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=True, allow_output_mismatch=True, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='DeepSeek-R1', generate_repro_command=True, repro_command='', backends=['fa2', 'fa3', 'cutlass', 'cudnn'], page_size=0, batch_size=16, s_qo=1024, s_kv=1024, num_qo_heads=128, num_kv_heads=128, head_dim_qk=192, head_dim_vo=128, head_dim_ckv=None, head_dim_kpe=None, q_dtype='bfloat16', kv_dtype='bfloat16', causal=True, random_actual_seq_len=True)
 [INFO] Running testBatchPrefillWithRaggedKVCacheWrapper
-[INFO] FlashInfer version: 0.3.1
-[VVERBOSE] gpu_name = 'NVIDIA_B200'
-[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine BatchPrefillWithRaggedKVCacheWrapper --backends fa2 fa3 cutlass cudnn --batch_size 1 --s_qo 1024 --s_kv 1024 --num_qo_heads 128 --num_kv_heads 128 --head_dim_qk 192 --head_dim_vo 128 --random_actual_seq_len -vv --refcheck --causal --q_dtype bfloat16 --kv_dtype bfloat16 --allow_output_mismatch --generate_repro_command --case_tag DeepSeek-R1
-[WARNING] fa3 for routine BatchPrefillWithRaggedKVCacheWrapper is not supported on compute capability 10.0. Skipping.
-[VVERBOSE] s_qo == s_kv, making actual_seq_lens_kv the same as actual_seq_lens_q
-[VERBOSE] Average actual qo seq len: 103
-[VERBOSE] Average actual kv seq len: 103
-[VVERBOSE] actual_seq_lens_q.flatten() = tensor([103], dtype=torch.int32)
-[VVERBOSE] actual_seq_lens_kv.flatten() = tensor([103], dtype=torch.int32)
-[VVERBOSE] q.shape = torch.Size([103, 128, 192])
-[VVERBOSE] k.shape = torch.Size([103, 128, 192])
-[VVERBOSE] v.shape = torch.Size([103, 128, 128])
-[VVERBOSE] qo_indptr.shape = torch.Size([2])
-[VVERBOSE] kv_indptr.shape = torch.Size([2])
-[VVERBOSE] scale = 0.07216878364870323
-[PERF] fa2            :: median time 0.016 ms; std 0.000 ms; achieved tflops 26.943 TFLOPs/sec; achieved tb_per_sec 1.046 TB/sec
-[PERF] cutlass        :: median time 0.012 ms; std 0.000 ms; achieved tflops 35.963 TFLOPs/sec; achieved tb_per_sec 1.397 TB/sec
-[PERF] cudnn          :: median time 0.019 ms; std 0.000 ms; achieved tflops 23.316 TFLOPs/sec; achieved tb_per_sec 0.905 TB/sec
-[INFO] args = Namespace(routine='BatchPrefillWithRaggedKVCacheWrapper', no_cuda_graph=False, use_cupti=False, refcheck=True, allow_output_mismatch=True, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='DeepSeek-R1', generate_repro_command=True, repro_command='', backends=['fa2', 'fa3', 'cutlass', 'cudnn'], page_size=0, batch_size=16, s_qo=1024, s_kv=1024, num_qo_heads=128, num_kv_heads=128, head_dim_qk=192, head_dim_vo=128, head_dim_ckv=None, head_dim_kpe=None, q_dtype='bfloat16', kv_dtype='bfloat16', causal=True, random_actual_seq_len=True)
-[INFO] Running testBatchPrefillWithRaggedKVCacheWrapper
-[INFO] FlashInfer version: 0.3.1
+[INFO] FlashInfer version: 0.6.2
 [VVERBOSE] gpu_name = 'NVIDIA_B200'
 [INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine BatchPrefillWithRaggedKVCacheWrapper --backends fa2 fa3 cutlass cudnn --batch_size 16 --s_qo 1024 --s_kv 1024 --num_qo_heads 128 --num_kv_heads 128 --head_dim_qk 192 --head_dim_vo 128 --random_actual_seq_len -vv --refcheck --causal --q_dtype bfloat16 --kv_dtype bfloat16 --allow_output_mismatch --generate_repro_command --case_tag DeepSeek-R1
 [WARNING] fa3 for routine BatchPrefillWithRaggedKVCacheWrapper is not supported on compute capability 10.0. Skipping.
@@ -93,35 +44,13 @@
 [VVERBOSE] qo_indptr.shape = torch.Size([17])
 [VVERBOSE] kv_indptr.shape = torch.Size([17])
 [VVERBOSE] scale = 0.07216878364870323
-[PERF] fa2            :: median time 0.498 ms; std 0.005 ms; achieved tflops 217.968 TFLOPs/sec; achieved tb_per_sec 1.726 TB/sec
-[PERF] cutlass        :: median time 0.533 ms; std 0.001 ms; achieved tflops 203.573 TFLOPs/sec; achieved tb_per_sec 1.612 TB/sec
-[PERF] cudnn          :: median time 0.312 ms; std 0.001 ms; achieved tflops 347.342 TFLOPs/sec; achieved tb_per_sec 2.750 TB/sec
-[INFO] args = Namespace(routine='BatchDecodeWithPagedKVCacheWrapper', no_cuda_graph=False, use_cupti=False, refcheck=True, allow_output_mismatch=True, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='Llama-3.1-70B', generate_repro_command=True, repro_command='', backends=['fa2', 'fa2_tc', 'cudnn', 'trtllm-gen', 'trtllm-gen-native'], page_size=16, batch_size=1, s_qo=1, s_kv=1024, num_qo_heads=64, num_kv_heads=8, head_dim_qk=128, head_dim_vo=128, head_dim_ckv=None, head_dim_kpe=None, q_dtype='bfloat16', kv_dtype='bfloat16', causal=False, random_actual_seq_len=True)
+[PERF] fa2            :: median time 0.508 ms; std 0.003 ms; achieved tflops 213.668 TFLOPs/sec; achieved tb_per_sec 1.692 TB/sec
+[PERF] cutlass        :: median time 0.516 ms; std 0.004 ms; achieved tflops 210.340 TFLOPs/sec; achieved tb_per_sec 1.665 TB/sec
+[PERF] cudnn          :: median time 0.292 ms; std 0.001 ms; achieved tflops 372.144 TFLOPs/sec; achieved tb_per_sec 2.946 TB/sec
+[WARNING] Backend name 'trtllm-gen-native' has been renamed to 'trtllm-native' and will be removed in a future release.
+[INFO] args = Namespace(routine='BatchDecodeWithPagedKVCacheWrapper', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=True, allow_output_mismatch=True, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='Llama-3.1-70B', generate_repro_command=True, repro_command='', backends=['fa2', 'fa2_tc', 'cudnn', 'trtllm-gen', 'trtllm-native'], page_size=16, batch_size=16, s_qo=1, s_kv=1024, num_qo_heads=64, num_kv_heads=8, head_dim_qk=128, head_dim_vo=128, head_dim_ckv=None, head_dim_kpe=None, q_dtype='bfloat16', kv_dtype='bfloat16', causal=False, random_actual_seq_len=True)
 [INFO] Running testBatchDecodeWithPagedKVCacheWrapper
-[INFO] FlashInfer version: 0.3.1
-[VVERBOSE] gpu_name = 'NVIDIA_B200'
-[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine BatchDecodeWithPagedKVCacheWrapper --backends fa2 fa2_tc cudnn trtllm-gen trtllm-gen-native --page_size 16 --batch_size 1 --s_qo 1 --s_kv 1024 --num_qo_heads 64 --num_kv_heads 8 --head_dim_qk 128 --head_dim_vo 128 --random_actual_seq_len -vv --refcheck --q_dtype bfloat16 --kv_dtype bfloat16 --allow_output_mismatch --generate_repro_command --case_tag Llama-3.1-70B
-[VERBOSE] Average actual seq len: 84
-[VVERBOSE] actual_seq_lens_kv.flatten() = tensor([84], device='cuda:0', dtype=torch.int32)
-[VVERBOSE] q.shape = torch.Size([1, 64, 128])
-[VVERBOSE] num_pages_per_seq = 64
-[VVERBOSE] total_num_pages = 64
-[VVERBOSE] kv_cache.shape = torch.Size([64, 2, 8, 16, 128])
-[VVERBOSE] kv_cache.stride() = (32768, 16384, 128, 1024, 1)
-[VVERBOSE] block_tables.shape = torch.Size([1, 64])
-[VVERBOSE] kv_indptr.shape = torch.Size([2])
-[VVERBOSE] kv_indices.shape = torch.Size([6])
-[VVERBOSE] kv_last_page_len.shape = torch.Size([1])
-[VVERBOSE] scale = 0.08838834764831843
-[ERROR] Output tensor mismatch between backends fa2 and cudnn: 5063 / 8192 (61.80%) elements are different
-[PERF] fa2            :: median time 0.035 ms; std 0.000 ms; achieved tflops 0.079 TFLOPs/sec; achieved tb_per_sec 0.011 TB/sec
-[PERF] fa2_tc         :: median time 0.010 ms; std 0.000 ms; achieved tflops 0.263 TFLOPs/sec; achieved tb_per_sec 0.036 TB/sec
-[PERF] cudnn          :: median time 0.011 ms; std 0.000 ms; achieved tflops 0.258 TFLOPs/sec; achieved tb_per_sec 0.035 TB/sec
-[PERF] trtllm-gen     :: median time 0.006 ms; std 0.000 ms; achieved tflops 0.480 TFLOPs/sec; achieved tb_per_sec 0.066 TB/sec
-[PERF] trtllm-gen-nati:: median time 0.006 ms; std 0.000 ms; achieved tflops 0.445 TFLOPs/sec; achieved tb_per_sec 0.061 TB/sec
-[INFO] args = Namespace(routine='BatchDecodeWithPagedKVCacheWrapper', no_cuda_graph=False, use_cupti=False, refcheck=True, allow_output_mismatch=True, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='Llama-3.1-70B', generate_repro_command=True, repro_command='', backends=['fa2', 'fa2_tc', 'cudnn', 'trtllm-gen', 'trtllm-gen-native'], page_size=16, batch_size=16, s_qo=1, s_kv=1024, num_qo_heads=64, num_kv_heads=8, head_dim_qk=128, head_dim_vo=128, head_dim_ckv=None, head_dim_kpe=None, q_dtype='bfloat16', kv_dtype='bfloat16', causal=False, random_actual_seq_len=True)
-[INFO] Running testBatchDecodeWithPagedKVCacheWrapper
-[INFO] FlashInfer version: 0.3.1
+[INFO] FlashInfer version: 0.6.2
 [VVERBOSE] gpu_name = 'NVIDIA_B200'
 [INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine BatchDecodeWithPagedKVCacheWrapper --backends fa2 fa2_tc cudnn trtllm-gen trtllm-gen-native --page_size 16 --batch_size 16 --s_qo 1 --s_kv 1024 --num_qo_heads 64 --num_kv_heads 8 --head_dim_qk 128 --head_dim_vo 128 --random_actual_seq_len -vv --refcheck --q_dtype bfloat16 --kv_dtype bfloat16 --allow_output_mismatch --generate_repro_command --case_tag Llama-3.1-70B
 [VERBOSE] Average actual seq len: 501
@@ -137,14 +66,15 @@
 [VVERBOSE] kv_indices.shape = torch.Size([509])
 [VVERBOSE] kv_last_page_len.shape = torch.Size([16])
 [VVERBOSE] scale = 0.08838834764831843
-[PERF] fa2            :: median time 0.055 ms; std 0.000 ms; achieved tflops 4.757 TFLOPs/sec; achieved tb_per_sec 0.604 TB/sec
-[PERF] fa2_tc         :: median time 0.017 ms; std 0.000 ms; achieved tflops 15.285 TFLOPs/sec; achieved tb_per_sec 1.941 TB/sec
-[PERF] cudnn          :: median time 0.014 ms; std 0.000 ms; achieved tflops 19.109 TFLOPs/sec; achieved tb_per_sec 2.427 TB/sec
-[PERF] trtllm-gen     :: median time 0.010 ms; std 0.000 ms; achieved tflops 27.308 TFLOPs/sec; achieved tb_per_sec 3.468 TB/sec
-[PERF] trtllm-gen-nati:: median time 0.010 ms; std 0.000 ms; achieved tflops 27.235 TFLOPs/sec; achieved tb_per_sec 3.459 TB/sec
-[INFO] args = Namespace(routine='BatchMLAPagedAttentionWrapper', no_cuda_graph=False, use_cupti=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='DeepSeek-R1', generate_repro_command=True, repro_command='', backends=['trtllm-gen-native', 'fa2', 'fa3'], page_size=32, batch_size=16, s_qo=1, s_kv=1024, num_qo_heads=128, num_kv_heads=128, head_dim_qk=None, head_dim_vo=None, head_dim_ckv=512, head_dim_kpe=64, q_dtype='bfloat16', kv_dtype='bfloat16', causal=False, random_actual_seq_len=True)
+[PERF] fa2            :: median time 0.050 ms; std 0.000 ms; achieved tflops 5.211 TFLOPs/sec; achieved tb_per_sec 0.662 TB/sec
+[PERF] fa2_tc         :: median time 0.022 ms; std 0.000 ms; achieved tflops 12.052 TFLOPs/sec; achieved tb_per_sec 1.531 TB/sec
+[PERF] cudnn          :: median time 0.015 ms; std 0.000 ms; achieved tflops 17.359 TFLOPs/sec; achieved tb_per_sec 2.205 TB/sec
+[PERF] trtllm-gen     :: median time 0.014 ms; std 0.000 ms; achieved tflops 19.478 TFLOPs/sec; achieved tb_per_sec 2.474 TB/sec
+[PERF] trtllm-native  :: median time 0.013 ms; std 0.000 ms; achieved tflops 19.501 TFLOPs/sec; achieved tb_per_sec 2.476 TB/sec
+[WARNING] Backend name 'trtllm-gen-native' has been renamed to 'trtllm-native' and will be removed in a future release.
+[INFO] args = Namespace(routine='BatchMLAPagedAttentionWrapper', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='DeepSeek-R1', generate_repro_command=True, repro_command='', backends=['trtllm-native', 'fa2', 'fa3'], page_size=32, batch_size=16, s_qo=1, s_kv=1024, num_qo_heads=128, num_kv_heads=128, head_dim_qk=None, head_dim_vo=None, head_dim_ckv=512, head_dim_kpe=64, q_dtype='bfloat16', kv_dtype='bfloat16', causal=False, random_actual_seq_len=True)
 [INFO] Running testBatchMLAPagedAttentionWrapper
-[INFO] FlashInfer version: 0.3.1
+[INFO] FlashInfer version: 0.6.2
 [VVERBOSE] gpu_name = 'NVIDIA_B200'
 [INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine BatchMLAPagedAttentionWrapper --backends trtllm-gen-native fa2 fa3 --page_size 32 --batch_size 16 --s_qo 1 --s_kv 1024 --num_qo_heads 128 --num_kv_heads 128 --head_dim_ckv 512 --head_dim_kpe 64 --random_actual_seq_len -vv --refcheck --q_dtype bfloat16 --kv_dtype bfloat16 --generate_repro_command --case_tag DeepSeek-R1
 [WARNING] fa3 for routine BatchMLAPagedAttentionWrapper is not supported on compute capability 10.0. Skipping.
@@ -164,29 +94,13 @@
 [VVERBOSE] kv_indptr.shape = torch.Size([17])
 [VVERBOSE] kv_indices.shape = torch.Size([258])
 [VVERBOSE] actual_seq_lens_kv.shape = torch.Size([16, 1, 1, 1])
-[VVERBOSE] sm_scale = 0.041666666666666664
+[VVERBOSE] sm_scale = 0.07216878364870323
 [VVERBOSE] workspace_buffer.shape = torch.Size([134217728])
-[PERF] trtllm-gen-nati:: median time 0.024 ms; std 0.000 ms; achieved tflops 91.551 TFLOPs/sec; achieved tb_per_sec 0.955 TB/sec
-[PERF] fa2            :: median time 0.041 ms; std 0.000 ms; achieved tflops 54.584 TFLOPs/sec; achieved tb_per_sec 0.570 TB/sec
-[INFO] args = Namespace(routine='bmm_fp8', no_cuda_graph=False, use_cupti=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag=None, generate_repro_command=True, repro_command='', batch_size=256, m=1, n=1024, k=7168, tile_size=128, group_size=1, scale_major_mode='MN', input_dtype='fp8_e4m3', mat2_dtype='fp8_e4m3', out_dtype='bfloat16', mma_sm=1, backends=['cudnn', 'cublas', 'cutlass'], use_128x4_sf_layout=False, use_nvfp4=False, autotune=False)
+[PERF] trtllm-native  :: median time 0.024 ms; std 0.002 ms; achieved tflops 91.928 TFLOPs/sec; achieved tb_per_sec 0.959 TB/sec
+[PERF] fa2            :: median time 0.039 ms; std 0.000 ms; achieved tflops 57.103 TFLOPs/sec; achieved tb_per_sec 0.596 TB/sec
+[INFO] args = Namespace(routine='bmm_fp8', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag=None, generate_repro_command=True, repro_command='', batch_size=64, m=4, n=1024, k=7168, tile_size=128, group_size=1, scale_major_mode='MN', input_dtype='fp8_e4m3', mat2_dtype='fp8_e4m3', out_dtype='bfloat16', mma_sm=1, backends=['cudnn', 'cublas', 'cutlass'], use_128x4_sf_layout=False, use_nvfp4=False, autotune=False)
 [INFO] Running testBmmFp8
-[INFO] FlashInfer version: 0.3.1
-[VVERBOSE] gpu_name = 'NVIDIA_B200'
-[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine bmm_fp8 --batch_size 256 --m 1 --n 1024 --k 7168 --input_dtype fp8_e4m3 --mat2_dtype fp8_e4m3 --out_dtype bfloat16 --backends cudnn cublas cutlass --refcheck -vv --generate_repro_command
-[VVERBOSE] input_fp8.shape = torch.Size([256, 1, 7168])
-[VVERBOSE] input_fp8.dtype = torch.float8_e4m3fn
-[VVERBOSE] mat2_fp8.shape = torch.Size([256, 7168, 1024])
-[VVERBOSE] mat2_fp8.dtype = torch.float8_e4m3fn
-[VVERBOSE] input_inv_s = tensor(0.0109, device='cuda:0')
-[VVERBOSE] input_inv_s.dtype = torch.float32
-[VVERBOSE] mat2_inv_s = tensor(0.0135, device='cuda:0')
-[VVERBOSE] mat2_inv_s.dtype = torch.float32
-[PERF] cudnn          :: median time 0.286 ms; std 0.000 ms; achieved tflops 13.138 TFLOPs/sec; achieved tb_per_sec 0.026 TB/sec
-[PERF] cublas         :: median time 0.286 ms; std 0.000 ms; achieved tflops 13.140 TFLOPs/sec; achieved tb_per_sec 0.026 TB/sec
-[PERF] cutlass        :: median time 0.266 ms; std 0.000 ms; achieved tflops 14.142 TFLOPs/sec; achieved tb_per_sec 0.028 TB/sec
-[INFO] args = Namespace(routine='bmm_fp8', no_cuda_graph=False, use_cupti=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag=None, generate_repro_command=True, repro_command='', batch_size=64, m=4, n=1024, k=7168, tile_size=128, group_size=1, scale_major_mode='MN', input_dtype='fp8_e4m3', mat2_dtype='fp8_e4m3', out_dtype='bfloat16', mma_sm=1, backends=['cudnn', 'cublas', 'cutlass'], use_128x4_sf_layout=False, use_nvfp4=False, autotune=False)
-[INFO] Running testBmmFp8
-[INFO] FlashInfer version: 0.3.1
+[INFO] FlashInfer version: 0.6.2
 [VVERBOSE] gpu_name = 'NVIDIA_B200'
 [INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine bmm_fp8 --batch_size 64 --m 4 --n 1024 --k 7168 --input_dtype fp8_e4m3 --mat2_dtype fp8_e4m3 --out_dtype bfloat16 --backends cudnn cublas cutlass --refcheck -vv --generate_repro_command
 [VVERBOSE] input_fp8.shape = torch.Size([64, 4, 7168])
@@ -197,24 +111,12 @@
 [VVERBOSE] input_inv_s.dtype = torch.float32
 [VVERBOSE] mat2_inv_s = tensor(0.0131, device='cuda:0')
 [VVERBOSE] mat2_inv_s.dtype = torch.float32
-[PERF] cudnn          :: median time 0.075 ms; std 0.000 ms; achieved tflops 49.999 TFLOPs/sec; achieved tb_per_sec 0.098 TB/sec
-[PERF] cublas         :: median time 0.075 ms; std 0.000 ms; achieved tflops 50.135 TFLOPs/sec; achieved tb_per_sec 0.098 TB/sec
-[PERF] cutlass        :: median time 0.072 ms; std 0.000 ms; achieved tflops 51.981 TFLOPs/sec; achieved tb_per_sec 0.102 TB/sec
-[INFO] args = Namespace(routine='gemm_fp8_nt_groupwise', no_cuda_graph=False, use_cupti=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag=None, generate_repro_command=True, repro_command='', batch_size=1, m=4, n=1024, k=7168, tile_size=128, group_size=1, scale_major_mode='MN', input_dtype='fp8_e4m3', mat2_dtype='fp8_e4m3', out_dtype='bfloat16', mma_sm=1, backends=['cutlass'], use_128x4_sf_layout=False, use_nvfp4=False, autotune=False)
+[PERF] cudnn          :: median time 0.085 ms; std 0.000 ms; achieved tflops 44.460 TFLOPs/sec; achieved tb_per_sec 0.087 TB/sec
+[PERF] cublas         :: median time 0.085 ms; std 0.000 ms; achieved tflops 44.400 TFLOPs/sec; achieved tb_per_sec 0.087 TB/sec
+[PERF] cutlass        :: median time 0.086 ms; std 0.000 ms; achieved tflops 43.593 TFLOPs/sec; achieved tb_per_sec 0.086 TB/sec
+[INFO] args = Namespace(routine='gemm_fp8_nt_groupwise', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag=None, generate_repro_command=True, repro_command='', batch_size=1, m=16, n=1024, k=7168, tile_size=128, group_size=1, scale_major_mode='MN', input_dtype='fp8_e4m3', mat2_dtype='fp8_e4m3', out_dtype='bfloat16', mma_sm=1, backends=['cutlass'], use_128x4_sf_layout=False, use_nvfp4=False, autotune=False)
 [INFO] Running testGemmFp8NtGroupwise
-[INFO] FlashInfer version: 0.3.1
-[VVERBOSE] gpu_name = 'NVIDIA_B200'
-[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine gemm_fp8_nt_groupwise --m 4 --n 1024 --k 7168 --mma_sm 1 --scale_major_mode MN --backends cutlass --refcheck -vv --generate_repro_command
-[VVERBOSE] a_val.shape = torch.Size([4, 7168])
-[VVERBOSE] b_val.shape = torch.Size([1024, 7168])
-[VVERBOSE] a_fp8.shape = torch.Size([4, 7168])
-[VVERBOSE] b_fp8.shape = torch.Size([1024, 7168])
-[VVERBOSE] a_scale.shape = torch.Size([56, 4])
-[VVERBOSE] b_scale.shape = torch.Size([56, 8])
-[PERF] cutlass        :: median time 0.020 ms; std 0.000 ms; achieved tflops 2.987 TFLOPs/sec; achieved tb_per_sec 0.375 TB/sec
-[INFO] args = Namespace(routine='gemm_fp8_nt_groupwise', no_cuda_graph=False, use_cupti=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag=None, generate_repro_command=True, repro_command='', batch_size=1, m=16, n=1024, k=7168, tile_size=128, group_size=1, scale_major_mode='MN', input_dtype='fp8_e4m3', mat2_dtype='fp8_e4m3', out_dtype='bfloat16', mma_sm=1, backends=['cutlass'], use_128x4_sf_layout=False, use_nvfp4=False, autotune=False)
-[INFO] Running testGemmFp8NtGroupwise
-[INFO] FlashInfer version: 0.3.1
+[INFO] FlashInfer version: 0.6.2
 [VVERBOSE] gpu_name = 'NVIDIA_B200'
 [INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine gemm_fp8_nt_groupwise --m 16 --n 1024 --k 7168 --mma_sm 1 --scale_major_mode MN --backends cutlass --refcheck -vv --generate_repro_command
 [VVERBOSE] a_val.shape = torch.Size([16, 7168])
@@ -223,23 +125,10 @@
 [VVERBOSE] b_fp8.shape = torch.Size([1024, 7168])
 [VVERBOSE] a_scale.shape = torch.Size([56, 16])
 [VVERBOSE] b_scale.shape = torch.Size([56, 8])
-[PERF] cutlass        :: median time 0.020 ms; std 0.000 ms; achieved tflops 11.824 TFLOPs/sec; achieved tb_per_sec 0.377 TB/sec
-[INFO] args = Namespace(routine='group_gemm_fp8_nt_groupwise', no_cuda_graph=False, use_cupti=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag=None, generate_repro_command=True, repro_command='', batch_size=1, m=4, n=1024, k=7168, tile_size=128, group_size=2, scale_major_mode='MN', input_dtype='fp8_e4m3', mat2_dtype='fp8_e4m3', out_dtype='bfloat16', mma_sm=1, backends=['cudnn'], use_128x4_sf_layout=False, use_nvfp4=False, autotune=False)
+[PERF] cutlass        :: median time 0.016 ms; std 0.000 ms; achieved tflops 14.636 TFLOPs/sec; achieved tb_per_sec 0.467 TB/sec
+[INFO] args = Namespace(routine='group_gemm_fp8_nt_groupwise', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag=None, generate_repro_command=True, repro_command='', batch_size=1, m=16, n=1024, k=7168, tile_size=128, group_size=2, scale_major_mode='MN', input_dtype='fp8_e4m3', mat2_dtype='fp8_e4m3', out_dtype='bfloat16', mma_sm=1, backends=['cudnn'], use_128x4_sf_layout=False, use_nvfp4=False, autotune=False)
 [INFO] Running testGroupGemmFp8NtGroupwise
-[INFO] FlashInfer version: 0.3.1
-[VVERBOSE] gpu_name = 'NVIDIA_B200'
-[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine group_gemm_fp8_nt_groupwise --m 4 --n 1024 --k 7168 --mma_sm 1 --group_size 2 --scale_major_mode MN --refcheck -vv --generate_repro_command
-[VVERBOSE] a_val.shape = torch.Size([8, 7168])
-[VVERBOSE] b_val.shape = torch.Size([2, 1024, 7168])
-[VVERBOSE] a_fp8.shape = torch.Size([8, 7168])
-[VVERBOSE] b_fp8.shape = torch.Size([2, 1024, 7168])
-[VVERBOSE] a_scale.shape = torch.Size([56, 8])
-[VVERBOSE] b_scale.shape = torch.Size([2, 56, 8])
-[VVERBOSE] m_indptr.shape = torch.Size([3])
-[PERF] cutlass        :: median time 0.022 ms; std 0.000 ms; achieved tflops 5.261 TFLOPs/sec; achieved tb_per_sec 0.661 TB/sec
-[INFO] args = Namespace(routine='group_gemm_fp8_nt_groupwise', no_cuda_graph=False, use_cupti=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag=None, generate_repro_command=True, repro_command='', batch_size=1, m=16, n=1024, k=7168, tile_size=128, group_size=2, scale_major_mode='MN', input_dtype='fp8_e4m3', mat2_dtype='fp8_e4m3', out_dtype='bfloat16', mma_sm=1, backends=['cudnn'], use_128x4_sf_layout=False, use_nvfp4=False, autotune=False)
-[INFO] Running testGroupGemmFp8NtGroupwise
-[INFO] FlashInfer version: 0.3.1
+[INFO] FlashInfer version: 0.6.2
 [VVERBOSE] gpu_name = 'NVIDIA_B200'
 [INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine group_gemm_fp8_nt_groupwise --m 16 --n 1024 --k 7168 --mma_sm 1 --group_size 2 --scale_major_mode MN --refcheck -vv --generate_repro_command
 [VVERBOSE] a_val.shape = torch.Size([32, 7168])
@@ -249,52 +138,43 @@
 [VVERBOSE] a_scale.shape = torch.Size([56, 32])
 [VVERBOSE] b_scale.shape = torch.Size([2, 56, 8])
 [VVERBOSE] m_indptr.shape = torch.Size([3])
-[PERF] cutlass        :: median time 0.023 ms; std 0.000 ms; achieved tflops 20.852 TFLOPs/sec; achieved tb_per_sec 0.665 TB/sec
-[INFO] args = Namespace(routine='mm_fp4', no_cuda_graph=False, use_cupti=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag=None, generate_repro_command=True, repro_command='', batch_size=1, m=1, n=1024, k=7168, tile_size=128, group_size=1, scale_major_mode='MN', input_dtype='fp8_e4m3', mat2_dtype='fp8_e4m3', out_dtype='bfloat16', mma_sm=1, backends=['cudnn', 'cutlass', 'trtllm'], use_128x4_sf_layout=True, use_nvfp4=True, autotune=False)
+[PERF] cutlass        :: median time 0.023 ms; std 0.000 ms; achieved tflops 20.574 TFLOPs/sec; achieved tb_per_sec 0.656 TB/sec
+[INFO] args = Namespace(routine='mm_fp4', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag=None, generate_repro_command=True, repro_command='', batch_size=1, m=512, n=1024, k=7168, tile_size=128, group_size=1, scale_major_mode='MN', input_dtype='fp8_e4m3', mat2_dtype='fp8_e4m3', out_dtype='bfloat16', mma_sm=1, backends=['cudnn', 'cutlass', 'trtllm'], use_128x4_sf_layout=True, use_nvfp4=True, autotune=False)
 [INFO] Running testMmFp4
-[INFO] FlashInfer version: 0.3.1
+[INFO] FlashInfer version: 0.6.2
 [VVERBOSE] gpu_name = 'NVIDIA_B200'
-[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine mm_fp4 --m 1 --n 1024 --k 7168 --out_dtype bfloat16 --backends cudnn cutlass trtllm --use_128x4_sf_layout --use_nvfp4 --refcheck -vv --generate_repro_command
-[VVERBOSE] input_fp4.shape = torch.Size([1, 3584])
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine mm_fp4 --m 512 --n 1024 --k 7168 --out_dtype bfloat16 --backends cudnn cutlass trtllm --use_128x4_sf_layout --use_nvfp4 --refcheck -vv --generate_repro_command
+[VVERBOSE] input_fp4.shape = torch.Size([512, 3584])
 [VVERBOSE] input_fp4.dtype = torch.uint8
 [VVERBOSE] mat2_fp4.shape = torch.Size([1024, 3584])
 [VVERBOSE] mat2_fp4.dtype = torch.uint8
-[PERF] cudnn          :: median time 0.013 ms; std 0.000 ms; achieved tflops 1.156 TFLOPs/sec; achieved tb_per_sec 0.289 TB/sec
-[PERF] cutlass        :: median time 0.009 ms; std 0.000 ms; achieved tflops 1.593 TFLOPs/sec; achieved tb_per_sec 0.399 TB/sec
-[PERF] trtllm         :: median time 0.011 ms; std 0.000 ms; achieved tflops 1.352 TFLOPs/sec; achieved tb_per_sec 0.339 TB/sec
-[INFO] args = Namespace(routine='mm_fp4', no_cuda_graph=False, use_cupti=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag=None, generate_repro_command=True, repro_command='', batch_size=1, m=4, n=1024, k=7168, tile_size=128, group_size=1, scale_major_mode='MN', input_dtype='fp8_e4m3', mat2_dtype='fp8_e4m3', out_dtype='bfloat16', mma_sm=1, backends=['cudnn', 'cutlass', 'trtllm'], use_128x4_sf_layout=True, use_nvfp4=True, autotune=False)
+[PERF] cudnn          :: median time 0.009 ms; std 0.000 ms; achieved tflops 821.262 TFLOPs/sec; achieved tb_per_sec 0.716 TB/sec
+[PERF] cutlass        :: median time 0.010 ms; std 0.000 ms; achieved tflops 738.620 TFLOPs/sec; achieved tb_per_sec 0.644 TB/sec
+[PERF] trtllm         :: median time 0.012 ms; std 0.000 ms; achieved tflops 634.814 TFLOPs/sec; achieved tb_per_sec 0.554 TB/sec
+[INFO] args = Namespace(routine='mm_fp4', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag=None, generate_repro_command=True, repro_command='', batch_size=1, m=512, n=1024, k=7168, tile_size=128, group_size=1, scale_major_mode='MN', input_dtype='fp8_e4m3', mat2_dtype='fp8_e4m3', out_dtype='bfloat16', mma_sm=1, backends=['cudnn', 'cutlass', 'trtllm'], use_128x4_sf_layout=True, use_nvfp4=True, autotune=True)
 [INFO] Running testMmFp4
-[INFO] FlashInfer version: 0.3.1
+[INFO] FlashInfer version: 0.6.2
 [VVERBOSE] gpu_name = 'NVIDIA_B200'
-[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine mm_fp4 --m 4 --n 1024 --k 7168 --out_dtype bfloat16 --backends cudnn cutlass trtllm --use_128x4_sf_layout --use_nvfp4 --refcheck -vv --generate_repro_command
-[VVERBOSE] input_fp4.shape = torch.Size([4, 3584])
-[VVERBOSE] input_fp4.dtype = torch.uint8
-[VVERBOSE] mat2_fp4.shape = torch.Size([1024, 3584])
-[VVERBOSE] mat2_fp4.dtype = torch.uint8
-[PERF] cudnn          :: median time 0.013 ms; std 0.000 ms; achieved tflops 4.625 TFLOPs/sec; achieved tb_per_sec 0.291 TB/sec
-[PERF] cutlass        :: median time 0.009 ms; std 0.000 ms; achieved tflops 6.372 TFLOPs/sec; achieved tb_per_sec 0.401 TB/sec
-[PERF] trtllm         :: median time 0.011 ms; std 0.000 ms; achieved tflops 5.310 TFLOPs/sec; achieved tb_per_sec 0.334 TB/sec
-[INFO] args = Namespace(routine='mm_fp4', no_cuda_graph=False, use_cupti=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag=None, generate_repro_command=True, repro_command='', batch_size=1, m=4, n=1024, k=7168, tile_size=128, group_size=1, scale_major_mode='MN', input_dtype='fp8_e4m3', mat2_dtype='fp8_e4m3', out_dtype='bfloat16', mma_sm=1, backends=['cudnn', 'cutlass', 'trtllm'], use_128x4_sf_layout=True, use_nvfp4=True, autotune=True)
-[INFO] Running testMmFp4
-[INFO] FlashInfer version: 0.3.1
-[VVERBOSE] gpu_name = 'NVIDIA_B200'
-[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine mm_fp4 --m 4 --n 1024 --k 7168 --out_dtype bfloat16 --backends cudnn cutlass trtllm --use_128x4_sf_layout --use_nvfp4 --autotune --refcheck -vv --generate_repro_command
-[INFO] cudnn backend does not support autotune
-[VVERBOSE] input_fp4.shape = torch.Size([4, 3584])
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine mm_fp4 --m 512 --n 1024 --k 7168 --out_dtype bfloat16 --backends cudnn cutlass trtllm --use_128x4_sf_layout --use_nvfp4 --autotune --refcheck -vv --generate_repro_command
+[VVERBOSE] input_fp4.shape = torch.Size([512, 3584])
 [VVERBOSE] input_fp4.dtype = torch.uint8
 [VVERBOSE] mat2_fp4.shape = torch.Size([1024, 3584])
 [VVERBOSE] mat2_fp4.dtype = torch.uint8
 [INFO] Autotune warmup for mm_fp4: 5 iters
-2025-09-23 00:32:18,077 - INFO - autotuner.py:256 - flashinfer.jit: [Autotuner]: Autotuning process starts ...
-2025-09-23 00:32:18,224 - INFO - autotuner.py:262 - flashinfer.jit: [Autotuner]: Autotuning process ends
+2026-02-03 15:06:53,361 - INFO - autotuner.py:256 - flashinfer.jit: [Autotuner]: Autotuning process starts ...
+2026-02-03 15:06:58,625 - INFO - autotuner.py:262 - flashinfer.jit: [Autotuner]: Autotuning process ends
 [INFO] Autotune warmup for mm_fp4: 5 iters
-2025-09-23 00:32:18,225 - INFO - autotuner.py:256 - flashinfer.jit: [Autotuner]: Autotuning process starts ...
-2025-09-23 00:32:18,247 - INFO - autotuner.py:262 - flashinfer.jit: [Autotuner]: Autotuning process ends
-[PERF] cutlass_autotun:: median time 0.009 ms; std 0.000 ms; achieved tflops 6.372 TFLOPs/sec; achieved tb_per_sec 0.401 TB/sec
-[PERF] trtllm_autotune:: median time 0.011 ms; std 0.000 ms; achieved tflops 5.410 TFLOPs/sec; achieved tb_per_sec 0.340 TB/sec
-[INFO] args = Namespace(routine='trtllm_fp4_block_scale_moe', no_cuda_graph=False, use_cupti=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='trtllm_moe_sample', generate_repro_command=True, repro_command='', num_tokens=1024, hidden_size=1024, intermediate_size=1024, num_experts=256, top_k=8, n_group=8, topk_group=4, routed_scaling_factor=2.5, local_expert_offset=0, local_num_experts=None, routing_method='deepseek_v3', use_shuffled_weight=True, weight_layout=0, use_routing_bias=True, use_routing_scales_on_input=False, input_dtype='bfloat16', weight_dtype='bfloat16', gated_act='swiglu', autotune=False, cutlass_variant='base', quantized_input=False, tp_size=1, tp_rank=0, ep_size=1, ep_rank=0, routing_method_type=2, gated_act_type=0)
+2026-02-03 15:06:58,625 - INFO - autotuner.py:256 - flashinfer.jit: [Autotuner]: Autotuning process starts ...
+2026-02-03 15:06:59,031 - INFO - autotuner.py:262 - flashinfer.jit: [Autotuner]: Autotuning process ends
+[INFO] Autotune warmup for mm_fp4: 5 iters
+2026-02-03 15:06:59,031 - INFO - autotuner.py:256 - flashinfer.jit: [Autotuner]: Autotuning process starts ...
+2026-02-03 15:06:59,105 - INFO - autotuner.py:262 - flashinfer.jit: [Autotuner]: Autotuning process ends
+[PERF] cudnn_autotune :: median time 0.009 ms; std 0.000 ms; achieved tflops 822.746 TFLOPs/sec; achieved tb_per_sec 0.717 TB/sec
+[PERF] cutlass_autotun:: median time 0.010 ms; std 0.000 ms; achieved tflops 756.461 TFLOPs/sec; achieved tb_per_sec 0.660 TB/sec
+[PERF] trtllm_autotune:: median time 0.014 ms; std 0.000 ms; achieved tflops 535.037 TFLOPs/sec; achieved tb_per_sec 0.467 TB/sec
+[INFO] args = Namespace(routine='trtllm_fp4_block_scale_moe', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='trtllm_moe_sample', generate_repro_command=True, repro_command='', num_tokens=1024, hidden_size=1024, num_experts=256, top_k=8, input_dtype='bfloat16', intermediate_size=1024, n_group=8, topk_group=4, routed_scaling_factor=2.5, local_expert_offset=0, local_num_experts=None, routing_method='deepseek_v3', use_shuffled_weight=True, weight_layout=0, use_routing_bias=True, use_routing_scales_on_input=False, weight_dtype='bfloat16', gated_act='swiglu', autotune=False, cutlass_variant='base', quantized_input=False, tp_size=1, tp_rank=0, ep_size=1, ep_rank=0, routing_method_type=2, gated_act_type=0)
 [INFO] Running testTrtllmFp4BlockScaleMoe
-[INFO] FlashInfer version: 0.3.1
+[INFO] FlashInfer version: 0.6.2
 [VVERBOSE] gpu_name = 'NVIDIA_B200'
 [INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine trtllm_fp4_block_scale_moe --num_tokens 1024 --hidden_size 1024 --intermediate_size 1024 --num_experts 256 --top_k 8 --n_group 8 --topk_group 4 --routed_scaling_factor 2.5 --use_routing_bias --routing_method deepseek_v3 --use_shuffled_weight -vv --generate_repro_command --case_tag trtllm_moe_sample
 [INFO] Configuration: tokens=1024, hidden=1024, intermediate=1024, experts=256, top_k=8
@@ -302,10 +182,11 @@
 [VVERBOSE] hidden_states.shape = torch.Size([1024, 1024])
 [VVERBOSE] gemm1_weights_fp4.shape = torch.Size([256, 2048, 512])
 [VVERBOSE] gemm2_weights_fp4.shape = torch.Size([256, 1024, 512])
-[PERF] trtllm         :: median time 0.224 ms; std 0.000 ms; achieved tflops 230.555 TFLOPs/sec; achieved tb_per_sec 1.818 TB/sec
-[INFO] args = Namespace(routine='trtllm_fp4_block_scale_moe', no_cuda_graph=False, use_cupti=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='trtllm_moe_sample', generate_repro_command=True, repro_command='', num_tokens=1024, hidden_size=1024, intermediate_size=1024, num_experts=128, top_k=8, n_group=None, topk_group=None, routed_scaling_factor=2.5, local_expert_offset=0, local_num_experts=None, routing_method='renormalize_naive', use_shuffled_weight=True, weight_layout=0, use_routing_bias=False, use_routing_scales_on_input=False, input_dtype='bfloat16', weight_dtype='bfloat16', gated_act='swiglu', autotune=False, cutlass_variant='base', quantized_input=False, tp_size=1, tp_rank=0, ep_size=1, ep_rank=0, routing_method_type=4, gated_act_type=0)
+[VVERBOSE] num_active_experts = 256
+[PERF] trtllm         :: median time 0.131 ms; std 0.001 ms; achieved tflops 392.306 TFLOPs/sec; achieved tb_per_sec 3.476 TB/sec
+[INFO] args = Namespace(routine='trtllm_fp4_block_scale_moe', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='trtllm_moe_sample', generate_repro_command=True, repro_command='', num_tokens=1024, hidden_size=1024, num_experts=128, top_k=8, input_dtype='bfloat16', intermediate_size=1024, n_group=None, topk_group=None, routed_scaling_factor=2.5, local_expert_offset=0, local_num_experts=None, routing_method='renormalize_naive', use_shuffled_weight=True, weight_layout=0, use_routing_bias=False, use_routing_scales_on_input=False, weight_dtype='bfloat16', gated_act='swiglu', autotune=False, cutlass_variant='base', quantized_input=False, tp_size=1, tp_rank=0, ep_size=1, ep_rank=0, routing_method_type=4, gated_act_type=0)
 [INFO] Running testTrtllmFp4BlockScaleMoe
-[INFO] FlashInfer version: 0.3.1
+[INFO] FlashInfer version: 0.6.2
 [VVERBOSE] gpu_name = 'NVIDIA_B200'
 [INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine trtllm_fp4_block_scale_moe --num_tokens 1024 --hidden_size 1024 --intermediate_size 1024 --num_experts 128 --top_k 8 --routing_method renormalize_naive --use_shuffled_weight -vv --generate_repro_command --case_tag trtllm_moe_sample
 [INFO] Configuration: tokens=1024, hidden=1024, intermediate=1024, experts=128, top_k=8
@@ -313,10 +194,11 @@
 [VVERBOSE] hidden_states.shape = torch.Size([1024, 1024])
 [VVERBOSE] gemm1_weights_fp4.shape = torch.Size([128, 2048, 512])
 [VVERBOSE] gemm2_weights_fp4.shape = torch.Size([128, 1024, 512])
-[PERF] trtllm         :: median time 0.226 ms; std 0.000 ms; achieved tflops 227.846 TFLOPs/sec; achieved tb_per_sec 0.903 TB/sec
-[INFO] args = Namespace(routine='trtllm_fp8_block_scale_moe', no_cuda_graph=False, use_cupti=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='trtllm_moe_sample', generate_repro_command=True, repro_command='', num_tokens=1024, hidden_size=1024, intermediate_size=1024, num_experts=256, top_k=8, n_group=8, topk_group=4, routed_scaling_factor=2.5, local_expert_offset=0, local_num_experts=None, routing_method='deepseek_v3', use_shuffled_weight=True, weight_layout=0, use_routing_bias=True, use_routing_scales_on_input=False, input_dtype='bfloat16', weight_dtype='bfloat16', gated_act='swiglu', autotune=False, cutlass_variant='base', quantized_input=False, tp_size=1, tp_rank=0, ep_size=1, ep_rank=0, routing_method_type=2, gated_act_type=0)
+[VVERBOSE] num_active_experts = 128
+[PERF] trtllm         :: median time 0.097 ms; std 0.001 ms; achieved tflops 531.906 TFLOPs/sec; achieved tb_per_sec 2.368 TB/sec
+[INFO] args = Namespace(routine='trtllm_fp8_block_scale_moe', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='trtllm_moe_sample', generate_repro_command=True, repro_command='', num_tokens=1024, hidden_size=1024, num_experts=256, top_k=8, input_dtype='bfloat16', intermediate_size=1024, n_group=8, topk_group=4, routed_scaling_factor=2.5, local_expert_offset=0, local_num_experts=None, routing_method='deepseek_v3', use_shuffled_weight=True, weight_layout=0, use_routing_bias=True, use_routing_scales_on_input=False, weight_dtype='bfloat16', gated_act='swiglu', autotune=False, cutlass_variant='base', quantized_input=False, tp_size=1, tp_rank=0, ep_size=1, ep_rank=0, routing_method_type=2, gated_act_type=0)
 [INFO] Running testTrtllmFp8BlockScaleMoe
-[INFO] FlashInfer version: 0.3.1
+[INFO] FlashInfer version: 0.6.2
 [VVERBOSE] gpu_name = 'NVIDIA_B200'
 [INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine trtllm_fp8_block_scale_moe --num_tokens 1024 --hidden_size 1024 --intermediate_size 1024 --num_experts 256 --top_k 8 --n_group 8 --topk_group 4 --routed_scaling_factor 2.5 --use_routing_bias --routing_method deepseek_v3 --use_shuffled_weight -vv --generate_repro_command --case_tag trtllm_moe_sample
 [INFO] Configuration: tokens=1024, hidden=1024, intermediate=1024, experts=256, top_k=8
@@ -324,10 +206,11 @@
 [VVERBOSE] hidden_states.shape = torch.Size([1024, 1024])
 [VVERBOSE] gemm1_weights_fp8.shape = torch.Size([256, 2048, 1024])
 [VVERBOSE] gemm2_weights_fp8.shape = torch.Size([256, 1024, 1024])
-[PERF] trtllm         :: median time 0.557 ms; std 0.000 ms; achieved tflops 92.607 TFLOPs/sec; achieved tb_per_sec 1.455 TB/sec
-[INFO] args = Namespace(routine='trtllm_fp8_per_tensor_scale_moe', no_cuda_graph=False, use_cupti=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='trtllm_moe_sample', generate_repro_command=True, repro_command='', num_tokens=1024, hidden_size=1024, intermediate_size=1024, num_experts=128, top_k=1, n_group=None, topk_group=None, routed_scaling_factor=2.5, local_expert_offset=0, local_num_experts=None, routing_method='llama4', use_shuffled_weight=False, weight_layout=0, use_routing_bias=True, use_routing_scales_on_input=True, input_dtype='bfloat16', weight_dtype='bfloat16', gated_act='swiglu', autotune=False, cutlass_variant='base', quantized_input=False, tp_size=1, tp_rank=0, ep_size=1, ep_rank=0, routing_method_type=3, gated_act_type=0)
+[VVERBOSE] num_active_experts = 256
+[PERF] trtllm         :: median time 0.303 ms; std 0.002 ms; achieved tflops 170.084 TFLOPs/sec; achieved tb_per_sec 2.671 TB/sec
+[INFO] args = Namespace(routine='trtllm_fp8_per_tensor_scale_moe', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='trtllm_moe_sample', generate_repro_command=True, repro_command='', num_tokens=1024, hidden_size=1024, num_experts=128, top_k=1, input_dtype='bfloat16', intermediate_size=1024, n_group=None, topk_group=None, routed_scaling_factor=2.5, local_expert_offset=0, local_num_experts=None, routing_method='llama4', use_shuffled_weight=False, weight_layout=0, use_routing_bias=True, use_routing_scales_on_input=True, weight_dtype='bfloat16', gated_act='swiglu', autotune=False, cutlass_variant='base', quantized_input=False, tp_size=1, tp_rank=0, ep_size=1, ep_rank=0, routing_method_type=3, gated_act_type=0)
 [INFO] Running testTrtllmFp8PerTensorScaleMoe
-[INFO] FlashInfer version: 0.3.1
+[INFO] FlashInfer version: 0.6.2
 [VVERBOSE] gpu_name = 'NVIDIA_B200'
 [INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine trtllm_fp8_per_tensor_scale_moe --num_tokens 1024 --hidden_size 1024 --intermediate_size 1024 --num_experts 128 --top_k 1 --routed_scaling_factor 2.5 --use_routing_bias --routing_method llama4 --use_routing_scales_on_input -vv --generate_repro_command --case_tag trtllm_moe_sample
 [INFO] Configuration: tokens=1024, hidden=1024, intermediate=1024, experts=128, top_k=1
@@ -335,10 +218,11 @@
 [VVERBOSE] hidden_states.shape = torch.Size([1024, 1024])
 [VVERBOSE] gemm1_weights_fp8.shape = torch.Size([128, 2048, 1024])
 [VVERBOSE] gemm2_weights_fp8.shape = torch.Size([128, 1024, 1024])
-[PERF] trtllm         :: median time 0.123 ms; std 0.000 ms; achieved tflops 52.340 TFLOPs/sec; achieved tb_per_sec 3.299 TB/sec
-[INFO] args = Namespace(routine='trtllm_fp8_block_scale_moe', no_cuda_graph=False, use_cupti=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='trtllm_moe_sample', generate_repro_command=True, repro_command='', num_tokens=1024, hidden_size=1024, intermediate_size=1024, num_experts=128, top_k=1, n_group=None, topk_group=None, routed_scaling_factor=2.5, local_expert_offset=0, local_num_experts=None, routing_method='renormalize', use_shuffled_weight=True, weight_layout=0, use_routing_bias=False, use_routing_scales_on_input=False, input_dtype='bfloat16', weight_dtype='bfloat16', gated_act='swiglu', autotune=False, cutlass_variant='base', quantized_input=False, tp_size=1, tp_rank=0, ep_size=1, ep_rank=0, routing_method_type=1, gated_act_type=0)
+[VVERBOSE] num_active_experts = 128
+[PERF] trtllm         :: median time 0.092 ms; std 0.000 ms; achieved tflops 70.027 TFLOPs/sec; achieved tb_per_sec 4.414 TB/sec
+[INFO] args = Namespace(routine='trtllm_fp8_block_scale_moe', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='trtllm_moe_sample', generate_repro_command=True, repro_command='', num_tokens=1024, hidden_size=1024, num_experts=128, top_k=1, input_dtype='bfloat16', intermediate_size=1024, n_group=None, topk_group=None, routed_scaling_factor=2.5, local_expert_offset=0, local_num_experts=None, routing_method='renormalize', use_shuffled_weight=True, weight_layout=0, use_routing_bias=False, use_routing_scales_on_input=False, weight_dtype='bfloat16', gated_act='swiglu', autotune=False, cutlass_variant='base', quantized_input=False, tp_size=1, tp_rank=0, ep_size=1, ep_rank=0, routing_method_type=1, gated_act_type=0)
 [INFO] Running testTrtllmFp8BlockScaleMoe
-[INFO] FlashInfer version: 0.3.1
+[INFO] FlashInfer version: 0.6.2
 [VVERBOSE] gpu_name = 'NVIDIA_B200'
 [INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine trtllm_fp8_block_scale_moe --num_tokens 1024 --hidden_size 1024 --intermediate_size 1024 --num_experts 128 --top_k 1 --routing_method renormalize --use_shuffled_weight -vv --generate_repro_command --case_tag trtllm_moe_sample
 [INFO] Configuration: tokens=1024, hidden=1024, intermediate=1024, experts=128, top_k=1
@@ -346,49 +230,1002 @@
 [VVERBOSE] hidden_states.shape = torch.Size([1024, 1024])
 [VVERBOSE] gemm1_weights_fp8.shape = torch.Size([128, 2048, 1024])
 [VVERBOSE] gemm2_weights_fp8.shape = torch.Size([128, 1024, 1024])
-[PERF] trtllm         :: median time 0.109 ms; std 0.000 ms; achieved tflops 59.297 TFLOPs/sec; achieved tb_per_sec 3.740 TB/sec
-[INFO] args = Namespace(routine='cutlass_fused_moe', no_cuda_graph=False, use_cupti=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='cutlass_moe_base', generate_repro_command=True, repro_command='', num_tokens=32, hidden_size=128, intermediate_size=128, num_experts=2, top_k=2, n_group=None, topk_group=None, routed_scaling_factor=2.5, local_expert_offset=0, local_num_experts=None, routing_method='deepseek_v3', use_shuffled_weight=False, weight_layout=0, use_routing_bias=False, use_routing_scales_on_input=False, input_dtype='float16', weight_dtype='bfloat16', gated_act='swiglu', autotune=False, cutlass_variant='base', quantized_input=False, tp_size=1, tp_rank=0, ep_size=1, ep_rank=0, routing_method_type=2, gated_act_type=0)
+[ERROR] Error running test: --routine trtllm_fp8_block_scale_moe --num_tokens 1024 --hidden_size 1024 --intermediate_size 1024 --num_experts 128 --top_k 1 --routing_method renormalize --use_shuffled_weight -vv --generate_repro_command --case_tag "trtllm_moe_sample"
+[ERROR] Error: Check failed: routing_logits.value().dtype() == dl_bfloat16 (float32 vs. bfloat16) : routing_logits must be bfloat16.
+[INFO] args = Namespace(routine='cutlass_fused_moe', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='cutlass_moe_base', generate_repro_command=True, repro_command='', num_tokens=32, hidden_size=128, num_experts=2, top_k=2, input_dtype='float16', intermediate_size=128, n_group=None, topk_group=None, routed_scaling_factor=2.5, local_expert_offset=0, local_num_experts=None, routing_method='deepseek_v3', use_shuffled_weight=False, weight_layout=0, use_routing_bias=False, use_routing_scales_on_input=False, weight_dtype='bfloat16', gated_act='swiglu', autotune=False, cutlass_variant='base', quantized_input=False, tp_size=1, tp_rank=0, ep_size=1, ep_rank=0, routing_method_type=2, gated_act_type=0)
 [INFO] Running testCutlassFusedMoe
-[INFO] FlashInfer version: 0.3.1
+[INFO] FlashInfer version: 0.6.2
 [VVERBOSE] gpu_name = 'NVIDIA_B200'
 [INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine cutlass_fused_moe --num_tokens 32 --hidden_size 128 --intermediate_size 128 --num_experts 2 --top_k 2 --cutlass_variant base --input_dtype float16 -vv --generate_repro_command --case_tag cutlass_moe_base
 [VVERBOSE] x.shape = torch.Size([32, 128])
 [VVERBOSE] w31_weight.shape = torch.Size([2, 256, 128])
 [VVERBOSE] w2_weight.shape = torch.Size([2, 128, 128])
-[PERF] cutlass        :: median time 0.026 ms; std 0.000 ms; achieved tflops 0.240 TFLOPs/sec; achieved tb_per_sec 0.008 TB/sec
-[INFO] args = Namespace(routine='cutlass_fused_moe', no_cuda_graph=False, use_cupti=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='cutlass_moe_fp8_scale', generate_repro_command=True, repro_command='', num_tokens=32, hidden_size=128, intermediate_size=128, num_experts=2, top_k=2, n_group=None, topk_group=None, routed_scaling_factor=2.5, local_expert_offset=0, local_num_experts=None, tile_tokens_dim=8, routing_method='deepseek_v3', use_shuffled_weight=False, weight_layout=0, use_routing_bias=False, use_routing_scales_on_input=False, input_dtype='float16', weight_dtype='bfloat16', gated_act='swiglu', autotune=False, cutlass_variant='fp8', quantized_input=False, tp_size=1, tp_rank=0, ep_size=1, ep_rank=0, routing_method_type=2, gated_act_type=0)
+[VVERBOSE] num_active_experts = 2
+[PERF] cutlass        :: median time 0.028 ms; std 0.000 ms; achieved tflops 0.226 TFLOPs/sec; achieved tb_per_sec 0.008 TB/sec
+[INFO] args = Namespace(routine='cutlass_fused_moe', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='cutlass_moe_fp8_scale', generate_repro_command=True, repro_command='', num_tokens=32, hidden_size=128, num_experts=2, top_k=2, input_dtype='float16', intermediate_size=128, n_group=None, topk_group=None, routed_scaling_factor=2.5, local_expert_offset=0, local_num_experts=None, routing_method='deepseek_v3', use_shuffled_weight=False, weight_layout=0, use_routing_bias=False, use_routing_scales_on_input=False, weight_dtype='bfloat16', gated_act='swiglu', autotune=False, cutlass_variant='fp8', quantized_input=False, tp_size=1, tp_rank=0, ep_size=1, ep_rank=0, routing_method_type=2, gated_act_type=0)
 [INFO] Running testCutlassFusedMoe
-[INFO] FlashInfer version: 0.3.1
+[INFO] FlashInfer version: 0.6.2
 [VVERBOSE] gpu_name = 'NVIDIA_B200'
 [INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine cutlass_fused_moe --num_tokens 32 --hidden_size 128 --intermediate_size 128 --num_experts 2 --top_k 2 --cutlass_variant fp8 --input_dtype float16 -vv --generate_repro_command --case_tag cutlass_moe_fp8_scale
 [VVERBOSE] x.shape = torch.Size([32, 128])
 [VVERBOSE] w31_weight.shape = torch.Size([2, 256, 128])
 [VVERBOSE] w2_weight.shape = torch.Size([2, 128, 128])
-[PERF] cutlass        :: median time 0.026 ms; std 0.000 ms; achieved tflops 0.244 TFLOPs/sec; achieved tb_per_sec 0.004 TB/sec
-[INFO] args = Namespace(routine='cutlass_fused_moe', no_cuda_graph=False, use_cupti=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='cutlass_moe_nvfp4_weights', generate_repro_command=True, repro_command='', num_tokens=32, hidden_size=128, intermediate_size=128, num_experts=2, top_k=2, n_group=None, topk_group=None, routed_scaling_factor=2.5, local_expert_offset=0, local_num_experts=None, tile_tokens_dim=8, routing_method='deepseek_v3', use_shuffled_weight=False, weight_layout=0, use_routing_bias=False, use_routing_scales_on_input=False, input_dtype='float16', weight_dtype='bfloat16', gated_act='swiglu', autotune=False, cutlass_variant='nvfp4', quantized_input=False, tp_size=1, tp_rank=0, ep_size=1, ep_rank=0, routing_method_type=2, gated_act_type=0)
+[VVERBOSE] num_active_experts = 2
+[PERF] cutlass        :: median time 0.028 ms; std 0.000 ms; achieved tflops 0.221 TFLOPs/sec; achieved tb_per_sec 0.004 TB/sec
+[INFO] args = Namespace(routine='cutlass_fused_moe', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='cutlass_moe_nvfp4_weights', generate_repro_command=True, repro_command='', num_tokens=32, hidden_size=128, num_experts=2, top_k=2, input_dtype='float16', intermediate_size=128, n_group=None, topk_group=None, routed_scaling_factor=2.5, local_expert_offset=0, local_num_experts=None, routing_method='deepseek_v3', use_shuffled_weight=False, weight_layout=0, use_routing_bias=False, use_routing_scales_on_input=False, weight_dtype='bfloat16', gated_act='swiglu', autotune=False, cutlass_variant='nvfp4', quantized_input=False, tp_size=1, tp_rank=0, ep_size=1, ep_rank=0, routing_method_type=2, gated_act_type=0)
 [INFO] Running testCutlassFusedMoe
-[INFO] FlashInfer version: 0.3.1
+[INFO] FlashInfer version: 0.6.2
 [VVERBOSE] gpu_name = 'NVIDIA_B200'
 [INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine cutlass_fused_moe --num_tokens 32 --hidden_size 128 --intermediate_size 128 --num_experts 2 --top_k 2 --cutlass_variant nvfp4 --input_dtype float16 -vv --generate_repro_command --case_tag cutlass_moe_nvfp4_weights
 [VVERBOSE] x.shape = torch.Size([32, 128])
 [VVERBOSE] w31_weight.shape = torch.Size([2, 256, 128])
 [VVERBOSE] w2_weight.shape = torch.Size([2, 128, 128])
+[VVERBOSE] num_active_experts = 2
 [PERF] cutlass        :: median time 0.030 ms; std 0.000 ms; achieved tflops 0.210 TFLOPs/sec; achieved tb_per_sec 0.002 TB/sec
-[INFO] args = Namespace(routine='cutlass_fused_moe', no_cuda_graph=False, use_cupti=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='cutlass_moe_nvfp4_weights_quantized', generate_repro_command=True, repro_command='', num_tokens=32, hidden_size=128, intermediate_size=128, num_experts=2, top_k=2, n_group=None, topk_group=None, routed_scaling_factor=2.5, local_expert_offset=0, local_num_experts=None, tile_tokens_dim=8, routing_method='deepseek_v3', use_shuffled_weight=False, weight_layout=0, use_routing_bias=False, use_routing_scales_on_input=False, input_dtype='float16', weight_dtype='bfloat16', gated_act='swiglu', autotune=False, cutlass_variant='nvfp4', quantized_input=True, tp_size=1, tp_rank=0, ep_size=1, ep_rank=0, routing_method_type=2, gated_act_type=0)
+[INFO] args = Namespace(routine='cutlass_fused_moe', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='cutlass_moe_nvfp4_weights_quantized', generate_repro_command=True, repro_command='', num_tokens=32, hidden_size=128, num_experts=2, top_k=2, input_dtype='float16', intermediate_size=128, n_group=None, topk_group=None, routed_scaling_factor=2.5, local_expert_offset=0, local_num_experts=None, routing_method='deepseek_v3', use_shuffled_weight=False, weight_layout=0, use_routing_bias=False, use_routing_scales_on_input=False, weight_dtype='bfloat16', gated_act='swiglu', autotune=False, cutlass_variant='nvfp4', quantized_input=True, tp_size=1, tp_rank=0, ep_size=1, ep_rank=0, routing_method_type=2, gated_act_type=0)
 [INFO] Running testCutlassFusedMoe
-[INFO] FlashInfer version: 0.3.1
+[INFO] FlashInfer version: 0.6.2
 [VVERBOSE] gpu_name = 'NVIDIA_B200'
 [INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine cutlass_fused_moe --num_tokens 32 --hidden_size 128 --intermediate_size 128 --num_experts 2 --top_k 2 --cutlass_variant nvfp4 --quantized_input --input_dtype float16 -vv --generate_repro_command --case_tag cutlass_moe_nvfp4_weights_quantized
 [VVERBOSE] x.shape = torch.Size([32, 128])
 [VVERBOSE] w31_weight.shape = torch.Size([2, 256, 128])
 [VVERBOSE] w2_weight.shape = torch.Size([2, 128, 128])
-[PERF] cutlass        :: median time 0.029 ms; std 0.000 ms; achieved tflops 0.213 TFLOPs/sec; achieved tb_per_sec 0.002 TB/sec
-[INFO] args = Namespace(routine='cutlass_fused_moe', no_cuda_graph=False, use_cupti=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='cutlass_moe_nvfp4_ep_tp', generate_repro_command=True, repro_command='', num_tokens=32, hidden_size=128, intermediate_size=128, num_experts=8, top_k=2, n_group=None, topk_group=None, routed_scaling_factor=2.5, local_expert_offset=0, local_num_experts=None, tile_tokens_dim=8, routing_method='deepseek_v3', use_shuffled_weight=False, weight_layout=0, use_routing_bias=False, use_routing_scales_on_input=False, input_dtype='float16', weight_dtype='bfloat16', gated_act='swiglu', autotune=False, cutlass_variant='base', quantized_input=False, tp_size=2, tp_rank=0, ep_size=4, ep_rank=0, routing_method_type=2, gated_act_type=0)
+[VVERBOSE] num_active_experts = 2
+[PERF] cutlass        :: median time 0.028 ms; std 0.000 ms; achieved tflops 0.222 TFLOPs/sec; achieved tb_per_sec 0.002 TB/sec
+[INFO] args = Namespace(routine='cutlass_fused_moe', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='cutlass_moe_nvfp4_ep_tp', generate_repro_command=True, repro_command='', num_tokens=32, hidden_size=128, num_experts=8, top_k=2, input_dtype='float16', intermediate_size=128, n_group=None, topk_group=None, routed_scaling_factor=2.5, local_expert_offset=0, local_num_experts=None, routing_method='deepseek_v3', use_shuffled_weight=False, weight_layout=0, use_routing_bias=False, use_routing_scales_on_input=False, weight_dtype='bfloat16', gated_act='swiglu', autotune=False, cutlass_variant='base', quantized_input=False, tp_size=2, tp_rank=0, ep_size=4, ep_rank=0, routing_method_type=2, gated_act_type=0)
 [INFO] Running testCutlassFusedMoe
-[INFO] FlashInfer version: 0.3.1
+[INFO] FlashInfer version: 0.6.2
 [VVERBOSE] gpu_name = 'NVIDIA_B200'
 [INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine cutlass_fused_moe --num_tokens 32 --hidden_size 128 --intermediate_size 128 --num_experts 8 --top_k 2 --cutlass_variant base --input_dtype float16 --tp_size 2 --tp_rank 0 --ep_size 4 --ep_rank 0 -vv --generate_repro_command --case_tag cutlass_moe_nvfp4_ep_tp
 [VVERBOSE] x.shape = torch.Size([32, 128])
 [VVERBOSE] w31_weight.shape = torch.Size([8, 256, 128])
 [VVERBOSE] w2_weight.shape = torch.Size([8, 128, 128])
-[PERF] cutlass        :: median time 0.025 ms; std 0.000 ms; achieved tflops 0.250 TFLOPs/sec; achieved tb_per_sec 0.032 TB/sec
+[VVERBOSE] num_active_experts = 8
+[PERF] cutlass        :: median time 0.026 ms; std 0.000 ms; achieved tflops 0.239 TFLOPs/sec; achieved tb_per_sec 0.030 TB/sec
+[INFO] args = Namespace(routine='rmsnorm', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='rmsnorm_llama_hidden', generate_repro_command=True, repro_command='', batch_size=32, hidden_size=4096, num_heads=None, input_dtype='bfloat16', eps=1e-06, enable_pdl=False, scale=1.0, out_dtype='fp8_e4m3', backends=['cuda'], use_global_scale=False, is_sf_swizzled_layout=False, output_both_sf_layouts=False)
+[INFO] Running testRmsnorm
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine rmsnorm --batch_size 32 --hidden_size 4096 --input_dtype bfloat16 --refcheck -vv --generate_repro_command --case_tag rmsnorm_llama_hidden
+[VVERBOSE] input_tensor.shape = torch.Size([32, 4096])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] weight.shape = torch.Size([4096])
+[PERF] cuda           :: median time 0.003 ms; std 0.000 ms; achieved tflops 0.225 TFLOPs/sec; achieved tb_per_sec 0.183 TB/sec
+[INFO] args = Namespace(routine='rmsnorm', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='rmsnorm_large_hidden', generate_repro_command=True, repro_command='', batch_size=64, hidden_size=8192, num_heads=None, input_dtype='bfloat16', eps=1e-06, enable_pdl=False, scale=1.0, out_dtype='fp8_e4m3', backends=['cuda'], use_global_scale=False, is_sf_swizzled_layout=False, output_both_sf_layouts=False)
+[INFO] Running testRmsnorm
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine rmsnorm --batch_size 64 --hidden_size 8192 --input_dtype bfloat16 --refcheck -vv --generate_repro_command --case_tag rmsnorm_large_hidden
+[VVERBOSE] input_tensor.shape = torch.Size([64, 8192])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] weight.shape = torch.Size([8192])
+[PERF] cuda           :: median time 0.003 ms; std 0.000 ms; achieved tflops 0.766 TFLOPs/sec; achieved tb_per_sec 0.617 TB/sec
+[INFO] args = Namespace(routine='rmsnorm', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='rmsnorm_3d_gqa', generate_repro_command=True, repro_command='', batch_size=32, hidden_size=128, num_heads=32, input_dtype='bfloat16', eps=1e-06, enable_pdl=False, scale=1.0, out_dtype='fp8_e4m3', backends=['cuda'], use_global_scale=False, is_sf_swizzled_layout=False, output_both_sf_layouts=False)
+[INFO] Running testRmsnorm
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine rmsnorm --batch_size 32 --num_heads 32 --hidden_size 128 --input_dtype bfloat16 --refcheck -vv --generate_repro_command --case_tag rmsnorm_3d_gqa
+[VVERBOSE] input_tensor.shape = torch.Size([32, 32, 128])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] weight.shape = torch.Size([128])
+[PERF] cuda           :: median time 0.003 ms; std 0.000 ms; achieved tflops 0.256 TFLOPs/sec; achieved tb_per_sec 0.205 TB/sec
+[INFO] args = Namespace(routine='rmsnorm', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='rmsnorm_3d_mha', generate_repro_command=True, repro_command='', batch_size=16, hidden_size=128, num_heads=64, input_dtype='float16', eps=1e-06, enable_pdl=False, scale=1.0, out_dtype='fp8_e4m3', backends=['cuda'], use_global_scale=False, is_sf_swizzled_layout=False, output_both_sf_layouts=False)
+[INFO] Running testRmsnorm
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine rmsnorm --batch_size 16 --num_heads 64 --hidden_size 128 --input_dtype float16 --refcheck -vv --generate_repro_command --case_tag rmsnorm_3d_mha
+[VVERBOSE] input_tensor.shape = torch.Size([16, 64, 128])
+[VVERBOSE] input_tensor.dtype = torch.float16
+[VVERBOSE] weight.shape = torch.Size([128])
+[PERF] cuda           :: median time 0.003 ms; std 0.000 ms; achieved tflops 0.256 TFLOPs/sec; achieved tb_per_sec 0.205 TB/sec
+[INFO] args = Namespace(routine='rmsnorm', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='rmsnorm_pdl', generate_repro_command=True, repro_command='', batch_size=32, hidden_size=4096, num_heads=None, input_dtype='bfloat16', eps=1e-06, enable_pdl=True, scale=1.0, out_dtype='fp8_e4m3', backends=['cuda'], use_global_scale=False, is_sf_swizzled_layout=False, output_both_sf_layouts=False)
+[INFO] Running testRmsnorm
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine rmsnorm --batch_size 32 --hidden_size 4096 --input_dtype bfloat16 --enable_pdl --refcheck -vv --generate_repro_command --case_tag rmsnorm_pdl
+[VVERBOSE] input_tensor.shape = torch.Size([32, 4096])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] weight.shape = torch.Size([4096])
+[PERF] cuda           :: median time 0.003 ms; std 0.000 ms; achieved tflops 0.225 TFLOPs/sec; achieved tb_per_sec 0.183 TB/sec
+[INFO] args = Namespace(routine='rmsnorm_quant', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='rmsnorm_quant_fp8_e4m3', generate_repro_command=True, repro_command='', batch_size=32, hidden_size=4096, num_heads=None, input_dtype='bfloat16', eps=1e-06, enable_pdl=False, scale=1.0, out_dtype='fp8_e4m3', backends=['cuda'], use_global_scale=False, is_sf_swizzled_layout=False, output_both_sf_layouts=False)
+[INFO] Running testRmsnormQuant
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine rmsnorm_quant --batch_size 32 --hidden_size 4096 --input_dtype bfloat16 --out_dtype fp8_e4m3 --scale 1.0 --refcheck -vv --generate_repro_command --case_tag rmsnorm_quant_fp8_e4m3
+[VVERBOSE] input_tensor.shape = torch.Size([32, 4096])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] weight.shape = torch.Size([4096])
+[VVERBOSE] out_tensor.dtype = torch.float8_e4m3fn
+[VVERBOSE] scale = 1.0
+[PERF] cuda           :: median time 0.003 ms; std 0.000 ms; achieved tflops 0.223 TFLOPs/sec; achieved tb_per_sec 0.136 TB/sec
+[INFO] args = Namespace(routine='rmsnorm_quant', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='rmsnorm_quant_large', generate_repro_command=True, repro_command='', batch_size=64, hidden_size=8192, num_heads=None, input_dtype='bfloat16', eps=1e-06, enable_pdl=False, scale=1.0, out_dtype='fp8_e4m3', backends=['cuda'], use_global_scale=False, is_sf_swizzled_layout=False, output_both_sf_layouts=False)
+[INFO] Running testRmsnormQuant
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine rmsnorm_quant --batch_size 64 --hidden_size 8192 --input_dtype bfloat16 --out_dtype fp8_e4m3 --scale 1.0 --refcheck -vv --generate_repro_command --case_tag rmsnorm_quant_large
+[VVERBOSE] input_tensor.shape = torch.Size([64, 8192])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] weight.shape = torch.Size([8192])
+[VVERBOSE] out_tensor.dtype = torch.float8_e4m3fn
+[VVERBOSE] scale = 1.0
+[PERF] cuda           :: median time 0.003 ms; std 0.000 ms; achieved tflops 0.755 TFLOPs/sec; achieved tb_per_sec 0.458 TB/sec
+[INFO] args = Namespace(routine='rmsnorm_quant', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='rmsnorm_quant_fp8_e5m2', generate_repro_command=True, repro_command='', batch_size=32, hidden_size=4096, num_heads=None, input_dtype='float16', eps=1e-06, enable_pdl=False, scale=1.0, out_dtype='fp8_e5m2', backends=['cuda'], use_global_scale=False, is_sf_swizzled_layout=False, output_both_sf_layouts=False)
+[INFO] Running testRmsnormQuant
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine rmsnorm_quant --batch_size 32 --hidden_size 4096 --input_dtype float16 --out_dtype fp8_e5m2 --scale 1.0 --refcheck -vv --generate_repro_command --case_tag rmsnorm_quant_fp8_e5m2
+[VVERBOSE] input_tensor.shape = torch.Size([32, 4096])
+[VVERBOSE] input_tensor.dtype = torch.float16
+[VVERBOSE] weight.shape = torch.Size([4096])
+[VVERBOSE] out_tensor.dtype = torch.float8_e5m2
+[VVERBOSE] scale = 1.0
+[PERF] cuda           :: median time 0.003 ms; std 0.000 ms; achieved tflops 0.225 TFLOPs/sec; achieved tb_per_sec 0.138 TB/sec
+[INFO] args = Namespace(routine='fused_add_rmsnorm_quant', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='fused_add_rmsnorm_quant_fp8_e4m3', generate_repro_command=True, repro_command='', batch_size=32, hidden_size=4096, num_heads=None, input_dtype='bfloat16', eps=1e-06, enable_pdl=False, scale=1.0, out_dtype='fp8_e4m3', backends=['cuda'], use_global_scale=False, is_sf_swizzled_layout=False, output_both_sf_layouts=False)
+[INFO] Running testFusedAddRmsnormQuant
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine fused_add_rmsnorm_quant --batch_size 32 --hidden_size 4096 --input_dtype bfloat16 --out_dtype fp8_e4m3 --scale 1.0 --refcheck -vv --generate_repro_command --case_tag fused_add_rmsnorm_quant_fp8_e4m3
+[VVERBOSE] input_tensor.shape = torch.Size([32, 4096])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] residual_tensor.shape = torch.Size([32, 4096])
+[VVERBOSE] weight.shape = torch.Size([4096])
+[VVERBOSE] out_tensor.dtype = torch.float8_e4m3fn
+[VVERBOSE] scale = 1.0
+[PERF] cuda           :: median time 0.003 ms; std 0.000 ms; achieved tflops 0.243 TFLOPs/sec; achieved tb_per_sec 0.286 TB/sec
+[INFO] args = Namespace(routine='fused_add_rmsnorm_quant', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='fused_add_rmsnorm_quant_large', generate_repro_command=True, repro_command='', batch_size=64, hidden_size=8192, num_heads=None, input_dtype='bfloat16', eps=1e-06, enable_pdl=False, scale=1.0, out_dtype='fp8_e4m3', backends=['cuda'], use_global_scale=False, is_sf_swizzled_layout=False, output_both_sf_layouts=False)
+[INFO] Running testFusedAddRmsnormQuant
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine fused_add_rmsnorm_quant --batch_size 64 --hidden_size 8192 --input_dtype bfloat16 --out_dtype fp8_e4m3 --scale 1.0 --refcheck -vv --generate_repro_command --case_tag fused_add_rmsnorm_quant_large
+[VVERBOSE] input_tensor.shape = torch.Size([64, 8192])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] residual_tensor.shape = torch.Size([64, 8192])
+[VVERBOSE] weight.shape = torch.Size([8192])
+[VVERBOSE] out_tensor.dtype = torch.float8_e4m3fn
+[VVERBOSE] scale = 1.0
+[PERF] cuda           :: median time 0.004 ms; std 0.000 ms; achieved tflops 0.799 TFLOPs/sec; achieved tb_per_sec 0.937 TB/sec
+[INFO] args = Namespace(routine='fused_add_rmsnorm_quant', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='fused_add_rmsnorm_quant_pdl', generate_repro_command=True, repro_command='', batch_size=32, hidden_size=4096, num_heads=None, input_dtype='bfloat16', eps=1e-06, enable_pdl=True, scale=1.0, out_dtype='fp8_e4m3', backends=['cuda'], use_global_scale=False, is_sf_swizzled_layout=False, output_both_sf_layouts=False)
+[INFO] Running testFusedAddRmsnormQuant
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine fused_add_rmsnorm_quant --batch_size 32 --hidden_size 4096 --input_dtype bfloat16 --out_dtype fp8_e4m3 --scale 1.0 --enable_pdl --refcheck -vv --generate_repro_command --case_tag fused_add_rmsnorm_quant_pdl
+[VVERBOSE] input_tensor.shape = torch.Size([32, 4096])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] residual_tensor.shape = torch.Size([32, 4096])
+[VVERBOSE] weight.shape = torch.Size([4096])
+[VVERBOSE] out_tensor.dtype = torch.float8_e4m3fn
+[VVERBOSE] scale = 1.0
+[PERF] cuda           :: median time 0.003 ms; std 0.000 ms; achieved tflops 0.246 TFLOPs/sec; achieved tb_per_sec 0.289 TB/sec
+[INFO] args = Namespace(routine='rmsnorm_fp4quant', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='rmsnorm_fp4quant_nvfp4', generate_repro_command=True, repro_command='', batch_size=32, hidden_size=4096, num_heads=None, input_dtype='bfloat16', eps=1e-06, enable_pdl=False, scale=1.0, out_dtype='fp8_e4m3', backends=['cuda'], use_global_scale=False, is_sf_swizzled_layout=False, output_both_sf_layouts=False)
+[INFO] Running testRmsnormFp4quant
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine rmsnorm_fp4quant --batch_size 32 --hidden_size 4096 --input_dtype bfloat16 -vv --generate_repro_command --case_tag rmsnorm_fp4quant_nvfp4
+[VVERBOSE] input_tensor.shape = torch.Size([32, 4096])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] weight.shape = torch.Size([4096])
+[VVERBOSE] out_dtype = 'nvfp4'
+[VVERBOSE] block_size = 16
+[VVERBOSE] use_global_scale = False
+[VVERBOSE] is_sf_swizzled_layout = False
+[PERF] cute-dsl       :: median time 0.006 ms; std 0.000 ms; achieved tflops 0.109 TFLOPs/sec; achieved tb_per_sec 0.057 TB/sec
+[INFO] args = Namespace(routine='rmsnorm_fp4quant', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='rmsnorm_fp4quant_nvfp4_large', generate_repro_command=True, repro_command='', batch_size=64, hidden_size=8192, num_heads=None, input_dtype='bfloat16', eps=1e-06, enable_pdl=False, scale=1.0, out_dtype='fp8_e4m3', backends=['cuda'], use_global_scale=False, is_sf_swizzled_layout=False, output_both_sf_layouts=False)
+[INFO] Running testRmsnormFp4quant
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine rmsnorm_fp4quant --batch_size 64 --hidden_size 8192 --input_dtype bfloat16 -vv --generate_repro_command --case_tag rmsnorm_fp4quant_nvfp4_large
+[VVERBOSE] input_tensor.shape = torch.Size([64, 8192])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] weight.shape = torch.Size([8192])
+[VVERBOSE] out_dtype = 'nvfp4'
+[VVERBOSE] block_size = 16
+[VVERBOSE] use_global_scale = False
+[VVERBOSE] is_sf_swizzled_layout = False
+[PERF] cute-dsl       :: median time 0.007 ms; std 0.000 ms; achieved tflops 0.394 TFLOPs/sec; achieved tb_per_sec 0.204 TB/sec
+[INFO] args = Namespace(routine='rmsnorm_fp4quant', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='rmsnorm_fp4quant_nvfp4_global', generate_repro_command=True, repro_command='', batch_size=32, hidden_size=4096, num_heads=None, input_dtype='bfloat16', eps=1e-06, enable_pdl=False, scale=1.0, out_dtype='fp8_e4m3', backends=['cuda'], use_global_scale=True, is_sf_swizzled_layout=False, output_both_sf_layouts=False)
+[INFO] Running testRmsnormFp4quant
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine rmsnorm_fp4quant --batch_size 32 --hidden_size 4096 --input_dtype bfloat16 --use_global_scale -vv --generate_repro_command --case_tag rmsnorm_fp4quant_nvfp4_global
+[VVERBOSE] input_tensor.shape = torch.Size([32, 4096])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] weight.shape = torch.Size([4096])
+[VVERBOSE] out_dtype = 'nvfp4'
+[VVERBOSE] block_size = 16
+[VVERBOSE] use_global_scale = True
+[VVERBOSE] is_sf_swizzled_layout = False
+[PERF] cute-dsl       :: median time 0.005 ms; std 0.000 ms; achieved tflops 0.145 TFLOPs/sec; achieved tb_per_sec 0.076 TB/sec
+[INFO] args = Namespace(routine='rmsnorm_fp4quant', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='rmsnorm_fp4quant_nvfp4_swizzled', generate_repro_command=True, repro_command='', batch_size=32, hidden_size=4096, num_heads=None, input_dtype='bfloat16', eps=1e-06, enable_pdl=False, scale=1.0, out_dtype='fp8_e4m3', backends=['cuda'], use_global_scale=False, is_sf_swizzled_layout=True, output_both_sf_layouts=False)
+[INFO] Running testRmsnormFp4quant
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine rmsnorm_fp4quant --batch_size 32 --hidden_size 4096 --input_dtype bfloat16 --is_sf_swizzled_layout -vv --generate_repro_command --case_tag rmsnorm_fp4quant_nvfp4_swizzled
+[VVERBOSE] input_tensor.shape = torch.Size([32, 4096])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] weight.shape = torch.Size([4096])
+[VVERBOSE] out_dtype = 'nvfp4'
+[VVERBOSE] block_size = 16
+[VVERBOSE] use_global_scale = False
+[VVERBOSE] is_sf_swizzled_layout = True
+[PERF] cute-dsl       :: median time 0.006 ms; std 0.000 ms; achieved tflops 0.104 TFLOPs/sec; achieved tb_per_sec 0.055 TB/sec
+[INFO] args = Namespace(routine='rmsnorm_fp4quant', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='rmsnorm_fp4quant_mxfp4', generate_repro_command=True, repro_command='', batch_size=32, hidden_size=4096, num_heads=None, input_dtype='bfloat16', eps=1e-06, enable_pdl=False, scale=1.0, out_dtype='mxfp4', backends=['cuda'], use_global_scale=False, is_sf_swizzled_layout=False, output_both_sf_layouts=False)
+[INFO] Running testRmsnormFp4quant
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine rmsnorm_fp4quant --batch_size 32 --hidden_size 4096 --input_dtype bfloat16 --out_dtype mxfp4 -vv --generate_repro_command --case_tag rmsnorm_fp4quant_mxfp4
+[VVERBOSE] input_tensor.shape = torch.Size([32, 4096])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] weight.shape = torch.Size([4096])
+[VVERBOSE] out_dtype = 'mxfp4'
+[VVERBOSE] block_size = 32
+[VVERBOSE] use_global_scale = False
+[VVERBOSE] is_sf_swizzled_layout = False
+[PERF] cute-dsl       :: median time 0.005 ms; std 0.000 ms; achieved tflops 0.123 TFLOPs/sec; achieved tb_per_sec 0.064 TB/sec
+[INFO] args = Namespace(routine='rmsnorm_fp4quant', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='rmsnorm_fp4quant_3d', generate_repro_command=True, repro_command='', batch_size=32, hidden_size=128, num_heads=32, input_dtype='bfloat16', eps=1e-06, enable_pdl=False, scale=1.0, out_dtype='fp8_e4m3', backends=['cuda'], use_global_scale=False, is_sf_swizzled_layout=False, output_both_sf_layouts=False)
+[INFO] Running testRmsnormFp4quant
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine rmsnorm_fp4quant --batch_size 32 --num_heads 32 --hidden_size 128 --input_dtype bfloat16 -vv --generate_repro_command --case_tag rmsnorm_fp4quant_3d
+[VVERBOSE] input_tensor.shape = torch.Size([32, 32, 128])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] weight.shape = torch.Size([128])
+[VVERBOSE] out_dtype = 'nvfp4'
+[VVERBOSE] block_size = 16
+[VVERBOSE] use_global_scale = False
+[VVERBOSE] is_sf_swizzled_layout = False
+[PERF] cute-dsl       :: median time 0.004 ms; std 0.000 ms; achieved tflops 0.163 TFLOPs/sec; achieved tb_per_sec 0.083 TB/sec
+[INFO] args = Namespace(routine='add_rmsnorm_fp4quant', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='add_rmsnorm_fp4quant_nvfp4', generate_repro_command=True, repro_command='', batch_size=32, hidden_size=4096, num_heads=None, input_dtype='bfloat16', eps=1e-06, enable_pdl=False, scale=1.0, out_dtype='fp8_e4m3', backends=['cuda'], use_global_scale=False, is_sf_swizzled_layout=False, output_both_sf_layouts=False)
+[INFO] Running testAddRmsnormFp4quant
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine add_rmsnorm_fp4quant --batch_size 32 --hidden_size 4096 --input_dtype bfloat16 -vv --generate_repro_command --case_tag add_rmsnorm_fp4quant_nvfp4
+[VVERBOSE] input_tensor.shape = torch.Size([32, 4096])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] residual_tensor.shape = torch.Size([32, 4096])
+[VVERBOSE] weight.shape = torch.Size([4096])
+[VVERBOSE] out_dtype = 'nvfp4'
+[VVERBOSE] block_size = 16
+[VVERBOSE] use_global_scale = False
+[VVERBOSE] is_sf_swizzled_layout = False
+[VVERBOSE] output_both_sf_layouts = False
+[PERF] cute-dsl       :: median time 0.005 ms; std 0.000 ms; achieved tflops 0.150 TFLOPs/sec; achieved tb_per_sec 0.165 TB/sec
+[INFO] args = Namespace(routine='add_rmsnorm_fp4quant', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='add_rmsnorm_fp4quant_nvfp4_large', generate_repro_command=True, repro_command='', batch_size=64, hidden_size=8192, num_heads=None, input_dtype='bfloat16', eps=1e-06, enable_pdl=False, scale=1.0, out_dtype='fp8_e4m3', backends=['cuda'], use_global_scale=False, is_sf_swizzled_layout=False, output_both_sf_layouts=False)
+[INFO] Running testAddRmsnormFp4quant
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine add_rmsnorm_fp4quant --batch_size 64 --hidden_size 8192 --input_dtype bfloat16 -vv --generate_repro_command --case_tag add_rmsnorm_fp4quant_nvfp4_large
+[VVERBOSE] input_tensor.shape = torch.Size([64, 8192])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] residual_tensor.shape = torch.Size([64, 8192])
+[VVERBOSE] weight.shape = torch.Size([8192])
+[VVERBOSE] out_dtype = 'nvfp4'
+[VVERBOSE] block_size = 16
+[VVERBOSE] use_global_scale = False
+[VVERBOSE] is_sf_swizzled_layout = False
+[VVERBOSE] output_both_sf_layouts = False
+[PERF] cute-dsl       :: median time 0.006 ms; std 0.000 ms; achieved tflops 0.543 TFLOPs/sec; achieved tb_per_sec 0.597 TB/sec
+[INFO] args = Namespace(routine='add_rmsnorm_fp4quant', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='add_rmsnorm_fp4quant_nvfp4_global', generate_repro_command=True, repro_command='', batch_size=32, hidden_size=4096, num_heads=None, input_dtype='bfloat16', eps=1e-06, enable_pdl=False, scale=1.0, out_dtype='fp8_e4m3', backends=['cuda'], use_global_scale=True, is_sf_swizzled_layout=False, output_both_sf_layouts=False)
+[INFO] Running testAddRmsnormFp4quant
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine add_rmsnorm_fp4quant --batch_size 32 --hidden_size 4096 --input_dtype bfloat16 --use_global_scale -vv --generate_repro_command --case_tag add_rmsnorm_fp4quant_nvfp4_global
+[VVERBOSE] input_tensor.shape = torch.Size([32, 4096])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] residual_tensor.shape = torch.Size([32, 4096])
+[VVERBOSE] weight.shape = torch.Size([4096])
+[VVERBOSE] out_dtype = 'nvfp4'
+[VVERBOSE] block_size = 16
+[VVERBOSE] use_global_scale = True
+[VVERBOSE] is_sf_swizzled_layout = False
+[VVERBOSE] output_both_sf_layouts = False
+[PERF] cute-dsl       :: median time 0.004 ms; std 0.000 ms; achieved tflops 0.217 TFLOPs/sec; achieved tb_per_sec 0.240 TB/sec
+[INFO] args = Namespace(routine='add_rmsnorm_fp4quant', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='add_rmsnorm_fp4quant_nvfp4_swizzled', generate_repro_command=True, repro_command='', batch_size=32, hidden_size=4096, num_heads=None, input_dtype='bfloat16', eps=1e-06, enable_pdl=False, scale=1.0, out_dtype='fp8_e4m3', backends=['cuda'], use_global_scale=False, is_sf_swizzled_layout=True, output_both_sf_layouts=False)
+[INFO] Running testAddRmsnormFp4quant
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine add_rmsnorm_fp4quant --batch_size 32 --hidden_size 4096 --input_dtype bfloat16 --is_sf_swizzled_layout -vv --generate_repro_command --case_tag add_rmsnorm_fp4quant_nvfp4_swizzled
+[VVERBOSE] input_tensor.shape = torch.Size([32, 4096])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] residual_tensor.shape = torch.Size([32, 4096])
+[VVERBOSE] weight.shape = torch.Size([4096])
+[VVERBOSE] out_dtype = 'nvfp4'
+[VVERBOSE] block_size = 16
+[VVERBOSE] use_global_scale = False
+[VVERBOSE] is_sf_swizzled_layout = True
+[VVERBOSE] output_both_sf_layouts = False
+[PERF] cute-dsl       :: median time 0.006 ms; std 0.000 ms; achieved tflops 0.142 TFLOPs/sec; achieved tb_per_sec 0.157 TB/sec
+[INFO] args = Namespace(routine='add_rmsnorm_fp4quant', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='add_rmsnorm_fp4quant_mxfp4', generate_repro_command=True, repro_command='', batch_size=32, hidden_size=4096, num_heads=None, input_dtype='bfloat16', eps=1e-06, enable_pdl=False, scale=1.0, out_dtype='mxfp4', backends=['cuda'], use_global_scale=False, is_sf_swizzled_layout=False, output_both_sf_layouts=False)
+[INFO] Running testAddRmsnormFp4quant
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine add_rmsnorm_fp4quant --batch_size 32 --hidden_size 4096 --input_dtype bfloat16 --out_dtype mxfp4 -vv --generate_repro_command --case_tag add_rmsnorm_fp4quant_mxfp4
+[VVERBOSE] input_tensor.shape = torch.Size([32, 4096])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] residual_tensor.shape = torch.Size([32, 4096])
+[VVERBOSE] weight.shape = torch.Size([4096])
+[VVERBOSE] out_dtype = 'mxfp4'
+[VVERBOSE] block_size = 32
+[VVERBOSE] use_global_scale = False
+[VVERBOSE] is_sf_swizzled_layout = False
+[VVERBOSE] output_both_sf_layouts = False
+[PERF] cute-dsl       :: median time 0.005 ms; std 0.000 ms; achieved tflops 0.147 TFLOPs/sec; achieved tb_per_sec 0.162 TB/sec
+[INFO] args = Namespace(routine='add_rmsnorm_fp4quant', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='add_rmsnorm_fp4quant_3d', generate_repro_command=True, repro_command='', batch_size=32, hidden_size=128, num_heads=32, input_dtype='bfloat16', eps=1e-06, enable_pdl=False, scale=1.0, out_dtype='fp8_e4m3', backends=['cuda'], use_global_scale=False, is_sf_swizzled_layout=False, output_both_sf_layouts=False)
+[INFO] Running testAddRmsnormFp4quant
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine add_rmsnorm_fp4quant --batch_size 32 --num_heads 32 --hidden_size 128 --input_dtype bfloat16 -vv --generate_repro_command --case_tag add_rmsnorm_fp4quant_3d
+[VVERBOSE] input_tensor.shape = torch.Size([32, 32, 128])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] residual_tensor.shape = torch.Size([32, 32, 128])
+[VVERBOSE] weight.shape = torch.Size([128])
+[VVERBOSE] out_dtype = 'nvfp4'
+[VVERBOSE] block_size = 16
+[VVERBOSE] use_global_scale = False
+[VVERBOSE] is_sf_swizzled_layout = False
+[VVERBOSE] output_both_sf_layouts = False
+[PERF] cute-dsl       :: median time 0.004 ms; std 0.000 ms; achieved tflops 0.198 TFLOPs/sec; achieved tb_per_sec 0.217 TB/sec
+[INFO] args = Namespace(routine='add_rmsnorm_fp4quant', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='add_rmsnorm_fp4quant_both_sf', generate_repro_command=True, repro_command='', batch_size=32, hidden_size=4096, num_heads=None, input_dtype='bfloat16', eps=1e-06, enable_pdl=False, scale=1.0, out_dtype='fp8_e4m3', backends=['cuda'], use_global_scale=False, is_sf_swizzled_layout=False, output_both_sf_layouts=True)
+[INFO] Running testAddRmsnormFp4quant
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine add_rmsnorm_fp4quant --batch_size 32 --hidden_size 4096 --input_dtype bfloat16 --output_both_sf_layouts -vv --generate_repro_command --case_tag add_rmsnorm_fp4quant_both_sf
+[VVERBOSE] input_tensor.shape = torch.Size([32, 4096])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] residual_tensor.shape = torch.Size([32, 4096])
+[VVERBOSE] weight.shape = torch.Size([4096])
+[VVERBOSE] out_dtype = 'nvfp4'
+[VVERBOSE] block_size = 16
+[VVERBOSE] use_global_scale = False
+[VVERBOSE] is_sf_swizzled_layout = False
+[VVERBOSE] output_both_sf_layouts = True
+[PERF] cute-dsl       :: median time 0.005 ms; std 0.000 ms; achieved tflops 0.150 TFLOPs/sec; achieved tb_per_sec 0.167 TB/sec
+[INFO] args = Namespace(routine='add_rmsnorm_fp4quant', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='add_rmsnorm_fp4quant_both_sf_large', generate_repro_command=True, repro_command='', batch_size=64, hidden_size=8192, num_heads=None, input_dtype='bfloat16', eps=1e-06, enable_pdl=False, scale=1.0, out_dtype='fp8_e4m3', backends=['cuda'], use_global_scale=False, is_sf_swizzled_layout=False, output_both_sf_layouts=True)
+[INFO] Running testAddRmsnormFp4quant
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine add_rmsnorm_fp4quant --batch_size 64 --hidden_size 8192 --input_dtype bfloat16 --output_both_sf_layouts -vv --generate_repro_command --case_tag add_rmsnorm_fp4quant_both_sf_large
+[VVERBOSE] input_tensor.shape = torch.Size([64, 8192])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] residual_tensor.shape = torch.Size([64, 8192])
+[VVERBOSE] weight.shape = torch.Size([8192])
+[VVERBOSE] out_dtype = 'nvfp4'
+[VVERBOSE] block_size = 16
+[VVERBOSE] use_global_scale = False
+[VVERBOSE] is_sf_swizzled_layout = False
+[VVERBOSE] output_both_sf_layouts = True
+[PERF] cute-dsl       :: median time 0.006 ms; std 0.000 ms; achieved tflops 0.559 TFLOPs/sec; achieved tb_per_sec 0.620 TB/sec
+[INFO] args = Namespace(routine='add_rmsnorm_fp4quant', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='add_rmsnorm_fp4quant_both_sf_global', generate_repro_command=True, repro_command='', batch_size=32, hidden_size=4096, num_heads=None, input_dtype='bfloat16', eps=1e-06, enable_pdl=False, scale=1.0, out_dtype='fp8_e4m3', backends=['cuda'], use_global_scale=True, is_sf_swizzled_layout=False, output_both_sf_layouts=True)
+[INFO] Running testAddRmsnormFp4quant
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine add_rmsnorm_fp4quant --batch_size 32 --hidden_size 4096 --input_dtype bfloat16 --use_global_scale --output_both_sf_layouts -vv --generate_repro_command --case_tag add_rmsnorm_fp4quant_both_sf_global
+[VVERBOSE] input_tensor.shape = torch.Size([32, 4096])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] residual_tensor.shape = torch.Size([32, 4096])
+[VVERBOSE] weight.shape = torch.Size([4096])
+[VVERBOSE] out_dtype = 'nvfp4'
+[VVERBOSE] block_size = 16
+[VVERBOSE] use_global_scale = True
+[VVERBOSE] is_sf_swizzled_layout = False
+[VVERBOSE] output_both_sf_layouts = True
+[PERF] cute-dsl       :: median time 0.004 ms; std 0.000 ms; achieved tflops 0.207 TFLOPs/sec; achieved tb_per_sec 0.231 TB/sec
+[INFO] args = Namespace(routine='add_rmsnorm_fp4quant', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='add_rmsnorm_fp4quant_mxfp4_both_sf', generate_repro_command=True, repro_command='', batch_size=32, hidden_size=4096, num_heads=None, input_dtype='bfloat16', eps=1e-06, enable_pdl=False, scale=1.0, out_dtype='mxfp4', backends=['cuda'], use_global_scale=False, is_sf_swizzled_layout=False, output_both_sf_layouts=True)
+[INFO] Running testAddRmsnormFp4quant
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine add_rmsnorm_fp4quant --batch_size 32 --hidden_size 4096 --input_dtype bfloat16 --out_dtype mxfp4 --output_both_sf_layouts -vv --generate_repro_command --case_tag add_rmsnorm_fp4quant_mxfp4_both_sf
+[VVERBOSE] input_tensor.shape = torch.Size([32, 4096])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] residual_tensor.shape = torch.Size([32, 4096])
+[VVERBOSE] weight.shape = torch.Size([4096])
+[VVERBOSE] out_dtype = 'mxfp4'
+[VVERBOSE] block_size = 32
+[VVERBOSE] use_global_scale = False
+[VVERBOSE] is_sf_swizzled_layout = False
+[VVERBOSE] output_both_sf_layouts = True
+[PERF] cute-dsl       :: median time 0.005 ms; std 0.000 ms; achieved tflops 0.146 TFLOPs/sec; achieved tb_per_sec 0.162 TB/sec
+[INFO] args = Namespace(routine='mxfp8_quantize', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='mxfp8_quantize_basic', generate_repro_command=True, repro_command='', m=1024, k=4096, input_dtype='bfloat16', is_sf_swizzled_layout=True, alignment=32, enable_pdl=False, backends=['cuda'], batch_size=None, global_scale=1.0, sf_layout='128x4', do_shuffle=False, sf_vec_size=16)
+[INFO] Running testMxfp8Quantize
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine mxfp8_quantize --m 1024 --k 4096 --input_dtype bfloat16 -vv --generate_repro_command --case_tag mxfp8_quantize_basic
+[VVERBOSE] input_tensor.shape = torch.Size([1024, 4096])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] is_sf_swizzled_layout = True
+[VVERBOSE] alignment = 32
+[VVERBOSE] enable_pdl = False
+[PERF] cuda           :: median time 0.007 ms; std 0.000 ms; achieved tflops 1.855 TFLOPs/sec; achieved tb_per_sec 1.874 TB/sec
+[INFO] args = Namespace(routine='mxfp8_quantize', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='mxfp8_quantize_large', generate_repro_command=True, repro_command='', m=2048, k=8192, input_dtype='bfloat16', is_sf_swizzled_layout=True, alignment=32, enable_pdl=False, backends=['cuda'], batch_size=None, global_scale=1.0, sf_layout='128x4', do_shuffle=False, sf_vec_size=16)
+[INFO] Running testMxfp8Quantize
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine mxfp8_quantize --m 2048 --k 8192 --input_dtype bfloat16 -vv --generate_repro_command --case_tag mxfp8_quantize_large
+[VVERBOSE] input_tensor.shape = torch.Size([2048, 8192])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] is_sf_swizzled_layout = True
+[VVERBOSE] alignment = 32
+[VVERBOSE] enable_pdl = False
+[PERF] cuda           :: median time 0.015 ms; std 0.000 ms; achieved tflops 3.393 TFLOPs/sec; achieved tb_per_sec 3.429 TB/sec
+[INFO] args = Namespace(routine='mxfp8_quantize', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='mxfp8_quantize_fp16', generate_repro_command=True, repro_command='', m=1024, k=4096, input_dtype='float16', is_sf_swizzled_layout=True, alignment=32, enable_pdl=False, backends=['cuda'], batch_size=None, global_scale=1.0, sf_layout='128x4', do_shuffle=False, sf_vec_size=16)
+[INFO] Running testMxfp8Quantize
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine mxfp8_quantize --m 1024 --k 4096 --input_dtype float16 -vv --generate_repro_command --case_tag mxfp8_quantize_fp16
+[VVERBOSE] input_tensor.shape = torch.Size([1024, 4096])
+[VVERBOSE] input_tensor.dtype = torch.float16
+[VVERBOSE] is_sf_swizzled_layout = True
+[VVERBOSE] alignment = 32
+[VVERBOSE] enable_pdl = False
+[PERF] cuda           :: median time 0.007 ms; std 0.000 ms; achieved tflops 1.872 TFLOPs/sec; achieved tb_per_sec 1.892 TB/sec
+[INFO] args = Namespace(routine='mxfp8_quantize', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='mxfp8_quantize_no_swizzle', generate_repro_command=True, repro_command='', m=1024, k=4096, input_dtype='bfloat16', is_sf_swizzled_layout=False, alignment=32, enable_pdl=False, backends=['cuda'], batch_size=None, global_scale=1.0, sf_layout='128x4', do_shuffle=False, sf_vec_size=16)
+[INFO] Running testMxfp8Quantize
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine mxfp8_quantize --m 1024 --k 4096 --input_dtype bfloat16 --no_sf_swizzled_layout -vv --generate_repro_command --case_tag mxfp8_quantize_no_swizzle
+[VVERBOSE] input_tensor.shape = torch.Size([1024, 4096])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] is_sf_swizzled_layout = False
+[VVERBOSE] alignment = 32
+[VVERBOSE] enable_pdl = False
+[PERF] cuda           :: median time 0.007 ms; std 0.000 ms; achieved tflops 1.918 TFLOPs/sec; achieved tb_per_sec 1.938 TB/sec
+[INFO] args = Namespace(routine='mxfp8_quantize', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='mxfp8_quantize_pdl', generate_repro_command=True, repro_command='', m=2048, k=8192, input_dtype='bfloat16', is_sf_swizzled_layout=True, alignment=32, enable_pdl=True, backends=['cuda'], batch_size=None, global_scale=1.0, sf_layout='128x4', do_shuffle=False, sf_vec_size=16)
+[INFO] Running testMxfp8Quantize
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine mxfp8_quantize --m 2048 --k 8192 --input_dtype bfloat16 --enable_pdl -vv --generate_repro_command --case_tag mxfp8_quantize_pdl
+[VVERBOSE] input_tensor.shape = torch.Size([2048, 8192])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] is_sf_swizzled_layout = True
+[VVERBOSE] alignment = 32
+[VVERBOSE] enable_pdl = True
+[PERF] cuda           :: median time 0.015 ms; std 0.000 ms; achieved tflops 3.386 TFLOPs/sec; achieved tb_per_sec 3.421 TB/sec
+[INFO] args = Namespace(routine='mxfp8_quantize', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='mxfp8_quantize_refcheck', generate_repro_command=True, repro_command='', m=1024, k=4096, input_dtype='bfloat16', is_sf_swizzled_layout=True, alignment=32, enable_pdl=False, backends=['cuda'], batch_size=None, global_scale=1.0, sf_layout='128x4', do_shuffle=False, sf_vec_size=16)
+[INFO] Running testMxfp8Quantize
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine mxfp8_quantize --m 1024 --k 4096 --input_dtype bfloat16 --refcheck -vv --generate_repro_command --case_tag mxfp8_quantize_refcheck
+[VVERBOSE] input_tensor.shape = torch.Size([1024, 4096])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] is_sf_swizzled_layout = True
+[VVERBOSE] alignment = 32
+[VVERBOSE] enable_pdl = False
+[VVERBOSE] Backend cuda: x_q.shape = torch.Size([1024, 4096]), x_q.dtype = torch.float8_e4m3fn, sf.shape = torch.Size([131072]), sf.dtype = torch.uint8
+[VVERBOSE] Round-trip error: 0/4194304 (0.00%) elements differ
+[PERF] cuda           :: median time 0.007 ms; std 0.000 ms; achieved tflops 1.846 TFLOPs/sec; achieved tb_per_sec 1.865 TB/sec
+[INFO] args = Namespace(routine='mxfp4_quantize', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='mxfp4_quantize_basic', generate_repro_command=True, repro_command='', m=1024, k=4096, input_dtype='bfloat16', is_sf_swizzled_layout=True, alignment=32, enable_pdl=False, backends=['cuda'], batch_size=None, global_scale=1.0, sf_layout='128x4', do_shuffle=False, sf_vec_size=16)
+[INFO] Running testMxfp4Quantize
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine mxfp4_quantize --m 1024 --k 4096 --input_dtype bfloat16 -vv --generate_repro_command --case_tag mxfp4_quantize_basic
+[VVERBOSE] input_tensor.shape = torch.Size([1024, 4096])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[PERF] cuda           :: median time 0.048 ms; std 0.001 ms; achieved tflops 0.262 TFLOPs/sec; achieved tb_per_sec 0.221 TB/sec
+[INFO] args = Namespace(routine='mxfp4_quantize', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='mxfp4_quantize_large', generate_repro_command=True, repro_command='', m=2048, k=8192, input_dtype='bfloat16', is_sf_swizzled_layout=True, alignment=32, enable_pdl=False, backends=['cuda'], batch_size=None, global_scale=1.0, sf_layout='128x4', do_shuffle=False, sf_vec_size=16)
+[INFO] Running testMxfp4Quantize
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine mxfp4_quantize --m 2048 --k 8192 --input_dtype bfloat16 -vv --generate_repro_command --case_tag mxfp4_quantize_large
+[VVERBOSE] input_tensor.shape = torch.Size([2048, 8192])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[PERF] cuda           :: median time 0.123 ms; std 0.001 ms; achieved tflops 0.408 TFLOPs/sec; achieved tb_per_sec 0.344 TB/sec
+[INFO] args = Namespace(routine='mxfp4_quantize', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='mxfp4_quantize_refcheck', generate_repro_command=True, repro_command='', m=1024, k=4096, input_dtype='bfloat16', is_sf_swizzled_layout=True, alignment=32, enable_pdl=False, backends=['cuda'], batch_size=None, global_scale=1.0, sf_layout='128x4', do_shuffle=False, sf_vec_size=16)
+[INFO] Running testMxfp4Quantize
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine mxfp4_quantize --m 1024 --k 4096 --input_dtype bfloat16 --refcheck -vv --generate_repro_command --case_tag mxfp4_quantize_refcheck
+[VVERBOSE] input_tensor.shape = torch.Size([1024, 4096])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] Backend cuda: x_q.shape = torch.Size([1024, 2048]), x_q.dtype = torch.uint8, sf.shape = torch.Size([1024, 128]), sf.dtype = torch.uint8
+[VVERBOSE] Round-trip error: 0/4194304 (0.00%) elements differ
+[PERF] cuda           :: median time 0.049 ms; std 0.000 ms; achieved tflops 0.259 TFLOPs/sec; achieved tb_per_sec 0.218 TB/sec
+[INFO] args = Namespace(routine='nvfp4_quantize', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='nvfp4_quantize_128x4', generate_repro_command=True, repro_command='', m=1024, k=4096, input_dtype='bfloat16', is_sf_swizzled_layout=True, alignment=32, enable_pdl=False, backends=['cuda'], batch_size=None, global_scale=1.0, sf_layout='128x4', do_shuffle=False, sf_vec_size=16)
+[INFO] Running testNvfp4Quantize
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine nvfp4_quantize --m 1024 --k 4096 --input_dtype bfloat16 --global_scale 1.0 --sf_layout 128x4 -vv --generate_repro_command --case_tag nvfp4_quantize_128x4
+[VVERBOSE] input_tensor.shape = torch.Size([1024, 4096])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] global_scale = 1.0
+[VVERBOSE] sf_layout_str = '128x4'
+[VVERBOSE] do_shuffle = False
+[VVERBOSE] sf_vec_size = 16
+[VVERBOSE] enable_pdl = False
+[PERF] cuda           :: median time 0.008 ms; std 0.000 ms; achieved tflops 1.576 TFLOPs/sec; achieved tb_per_sec 1.346 TB/sec
+[INFO] args = Namespace(routine='nvfp4_quantize', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='nvfp4_quantize_128x4_large', generate_repro_command=True, repro_command='', m=2048, k=8192, input_dtype='bfloat16', is_sf_swizzled_layout=True, alignment=32, enable_pdl=False, backends=['cuda'], batch_size=None, global_scale=1.0, sf_layout='128x4', do_shuffle=False, sf_vec_size=16)
+[INFO] Running testNvfp4Quantize
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine nvfp4_quantize --m 2048 --k 8192 --input_dtype bfloat16 --global_scale 1.0 --sf_layout 128x4 -vv --generate_repro_command --case_tag nvfp4_quantize_128x4_large
+[VVERBOSE] input_tensor.shape = torch.Size([2048, 8192])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] global_scale = 1.0
+[VVERBOSE] sf_layout_str = '128x4'
+[VVERBOSE] do_shuffle = False
+[VVERBOSE] sf_vec_size = 16
+[VVERBOSE] enable_pdl = False
+[PERF] cuda           :: median time 0.014 ms; std 0.000 ms; achieved tflops 3.645 TFLOPs/sec; achieved tb_per_sec 3.113 TB/sec
+[INFO] args = Namespace(routine='nvfp4_quantize', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='nvfp4_quantize_8x4', generate_repro_command=True, repro_command='', m=1024, k=4096, input_dtype='bfloat16', is_sf_swizzled_layout=True, alignment=32, enable_pdl=False, backends=['cuda'], batch_size=None, global_scale=1.0, sf_layout='8x4', do_shuffle=False, sf_vec_size=16)
+[INFO] Running testNvfp4Quantize
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine nvfp4_quantize --m 1024 --k 4096 --input_dtype bfloat16 --global_scale 1.0 --sf_layout 8x4 -vv --generate_repro_command --case_tag nvfp4_quantize_8x4
+[VVERBOSE] input_tensor.shape = torch.Size([1024, 4096])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] global_scale = 1.0
+[VVERBOSE] sf_layout_str = '8x4'
+[VVERBOSE] do_shuffle = False
+[VVERBOSE] sf_vec_size = 16
+[VVERBOSE] enable_pdl = False
+[PERF] cuda           :: median time 0.008 ms; std 0.000 ms; achieved tflops 1.573 TFLOPs/sec; achieved tb_per_sec 1.343 TB/sec
+[INFO] args = Namespace(routine='nvfp4_quantize', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='nvfp4_quantize_shuffle', generate_repro_command=True, repro_command='', m=1024, k=4096, input_dtype='bfloat16', is_sf_swizzled_layout=True, alignment=32, enable_pdl=False, backends=['cuda'], batch_size=None, global_scale=1.0, sf_layout='128x4', do_shuffle=True, sf_vec_size=16)
+[INFO] Running testNvfp4Quantize
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine nvfp4_quantize --m 1024 --k 4096 --input_dtype bfloat16 --global_scale 1.0 --do_shuffle -vv --generate_repro_command --case_tag nvfp4_quantize_shuffle
+[WARNING] do_shuffle=True is not CUDA graph compatible. Disabling CUDA graph.
+[VVERBOSE] input_tensor.shape = torch.Size([1024, 4096])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] global_scale = 1.0
+[VVERBOSE] sf_layout_str = '128x4'
+[VVERBOSE] do_shuffle = True
+[VVERBOSE] sf_vec_size = 16
+[VVERBOSE] enable_pdl = False
+[PERF] cuda           :: median time 3.709 ms; std 0.030 ms; achieved tflops 0.003 TFLOPs/sec; achieved tb_per_sec 0.003 TB/sec
+[INFO] args = Namespace(routine='nvfp4_quantize', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='nvfp4_quantize_pdl', generate_repro_command=True, repro_command='', m=1024, k=4096, input_dtype='bfloat16', is_sf_swizzled_layout=True, alignment=32, enable_pdl=True, backends=['cuda'], batch_size=None, global_scale=1.0, sf_layout='128x4', do_shuffle=False, sf_vec_size=16)
+[INFO] Running testNvfp4Quantize
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine nvfp4_quantize --m 1024 --k 4096 --input_dtype bfloat16 --global_scale 1.0 --enable_pdl -vv --generate_repro_command --case_tag nvfp4_quantize_pdl
+[VVERBOSE] input_tensor.shape = torch.Size([1024, 4096])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] global_scale = 1.0
+[VVERBOSE] sf_layout_str = '128x4'
+[VVERBOSE] do_shuffle = False
+[VVERBOSE] sf_vec_size = 16
+[VVERBOSE] enable_pdl = True
+[PERF] cuda           :: median time 0.008 ms; std 0.000 ms; achieved tflops 1.567 TFLOPs/sec; achieved tb_per_sec 1.338 TB/sec
+[INFO] args = Namespace(routine='nvfp4_batched_quantize', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='nvfp4_batched_basic', generate_repro_command=True, repro_command='', m=1024, k=4096, input_dtype='bfloat16', is_sf_swizzled_layout=True, alignment=32, enable_pdl=False, backends=['cuda'], batch_size=4, global_scale=1.0, sf_layout='128x4', do_shuffle=False, sf_vec_size=16)
+[INFO] Running testNvfp4BatchedQuantize
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine nvfp4_batched_quantize --batch_size 4 --m 1024 --k 4096 --input_dtype bfloat16 --global_scale 1.0 -vv --generate_repro_command --case_tag nvfp4_batched_basic
+[VVERBOSE] input_tensor.shape = torch.Size([4, 1024, 4096])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] global_scale = 1.0
+[VVERBOSE] sf_vec_size = 16
+[PERF] cuda           :: median time 0.022 ms; std 0.000 ms; achieved tflops 2.300 TFLOPs/sec; achieved tb_per_sec 1.964 TB/sec
+[INFO] args = Namespace(routine='nvfp4_batched_quantize', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='nvfp4_batched_large', generate_repro_command=True, repro_command='', m=2048, k=8192, input_dtype='bfloat16', is_sf_swizzled_layout=True, alignment=32, enable_pdl=False, backends=['cuda'], batch_size=8, global_scale=1.0, sf_layout='128x4', do_shuffle=False, sf_vec_size=16)
+[INFO] Running testNvfp4BatchedQuantize
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine nvfp4_batched_quantize --batch_size 8 --m 2048 --k 8192 --input_dtype bfloat16 --global_scale 1.0 -vv --generate_repro_command --case_tag nvfp4_batched_large
+[VVERBOSE] input_tensor.shape = torch.Size([8, 2048, 8192])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] global_scale = 1.0
+[VVERBOSE] sf_vec_size = 16
+[PERF] cuda           :: median time 0.079 ms; std 0.001 ms; achieved tflops 5.110 TFLOPs/sec; achieved tb_per_sec 4.365 TB/sec
+[INFO] args = Namespace(routine='nvfp4_batched_quantize', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='nvfp4_batched_fp16', generate_repro_command=True, repro_command='', m=1024, k=4096, input_dtype='float16', is_sf_swizzled_layout=True, alignment=32, enable_pdl=False, backends=['cuda'], batch_size=4, global_scale=1.0, sf_layout='128x4', do_shuffle=False, sf_vec_size=16)
+[INFO] Running testNvfp4BatchedQuantize
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine nvfp4_batched_quantize --batch_size 4 --m 1024 --k 4096 --input_dtype float16 --global_scale 1.0 -vv --generate_repro_command --case_tag nvfp4_batched_fp16
+[VVERBOSE] input_tensor.shape = torch.Size([4, 1024, 4096])
+[VVERBOSE] input_tensor.dtype = torch.float16
+[VVERBOSE] global_scale = 1.0
+[VVERBOSE] sf_vec_size = 16
+[PERF] cuda           :: median time 0.020 ms; std 0.000 ms; achieved tflops 2.537 TFLOPs/sec; achieved tb_per_sec 2.167 TB/sec
+[INFO] args = Namespace(routine='softmax', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='softmax_llama', generate_repro_command=True, repro_command='', batch_size=32, vocab_size=32000, input_dtype='float32', top_k=50, top_p=0.9, min_p=0.1, temperature=1.0, filter_apply_order='top_k_first', num_speculate_tokens=5, max_len=4096, num_rows=32, backends=['cuda'])
+[INFO] Running testSoftmax
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine softmax --batch_size 32 --vocab_size 32000 --temperature 1.0 --input_dtype float32 -vv --generate_repro_command --case_tag softmax_llama
+[VVERBOSE] logits.shape = torch.Size([32, 32000])
+[VVERBOSE] logits.dtype = torch.float32
+[PERF] cuda           :: median time 0.012 ms; std 0.000 ms; achieved tflops 0.000 TFLOPs/sec; achieved tb_per_sec 0.679 TB/sec
+[INFO] args = Namespace(routine='softmax', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='softmax_llama3_temp', generate_repro_command=True, repro_command='', batch_size=64, vocab_size=128256, input_dtype='float32', top_k=50, top_p=0.9, min_p=0.1, temperature=0.8, filter_apply_order='top_k_first', num_speculate_tokens=5, max_len=4096, num_rows=64, backends=['cuda'])
+[INFO] Running testSoftmax
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine softmax --batch_size 64 --vocab_size 128256 --temperature 0.8 --input_dtype float32 -vv --generate_repro_command --case_tag softmax_llama3_temp
+[VVERBOSE] logits.shape = torch.Size([64, 128256])
+[VVERBOSE] logits.dtype = torch.float32
+[PERF] cuda           :: median time 0.036 ms; std 0.000 ms; achieved tflops 0.000 TFLOPs/sec; achieved tb_per_sec 1.847 TB/sec
+[INFO] args = Namespace(routine='sampling_from_probs', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='sampling_from_probs_llama', generate_repro_command=True, repro_command='', batch_size=32, vocab_size=32000, input_dtype='float32', top_k=50, top_p=0.9, min_p=0.1, temperature=1.0, filter_apply_order='top_k_first', num_speculate_tokens=5, max_len=4096, num_rows=32, backends=['cuda'])
+[INFO] Running testSamplingFromProbs
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine sampling_from_probs --batch_size 32 --vocab_size 32000 -vv --generate_repro_command --case_tag sampling_from_probs_llama
+[VVERBOSE] probs.shape = torch.Size([32, 32000])
+[VVERBOSE] probs.dtype = torch.float32
+[PERF] cuda           :: median time 0.014 ms; std 0.000 ms; achieved tflops 0.000 TFLOPs/sec; achieved tb_per_sec 0.303 TB/sec
+[INFO] args = Namespace(routine='sampling_from_probs', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='sampling_from_probs_llama3', generate_repro_command=True, repro_command='', batch_size=64, vocab_size=128256, input_dtype='float32', top_k=50, top_p=0.9, min_p=0.1, temperature=1.0, filter_apply_order='top_k_first', num_speculate_tokens=5, max_len=4096, num_rows=64, backends=['cuda'])
+[INFO] Running testSamplingFromProbs
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine sampling_from_probs --batch_size 64 --vocab_size 128256 -vv --generate_repro_command --case_tag sampling_from_probs_llama3
+[VVERBOSE] probs.shape = torch.Size([64, 128256])
+[VVERBOSE] probs.dtype = torch.float32
+[PERF] cuda           :: median time 0.043 ms; std 0.000 ms; achieved tflops 0.000 TFLOPs/sec; achieved tb_per_sec 0.768 TB/sec
+[INFO] args = Namespace(routine='sampling_from_logits', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='sampling_from_logits_llama', generate_repro_command=True, repro_command='', batch_size=32, vocab_size=32000, input_dtype='float32', top_k=50, top_p=0.9, min_p=0.1, temperature=1.0, filter_apply_order='top_k_first', num_speculate_tokens=5, max_len=4096, num_rows=32, backends=['cuda'])
+[INFO] Running testSamplingFromLogits
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine sampling_from_logits --batch_size 32 --vocab_size 32000 --input_dtype float32 -vv --generate_repro_command --case_tag sampling_from_logits_llama
+[VVERBOSE] logits.shape = torch.Size([32, 32000])
+[VVERBOSE] logits.dtype = torch.float32
+[PERF] cuda           :: median time 0.016 ms; std 0.000 ms; achieved tflops 0.000 TFLOPs/sec; achieved tb_per_sec 0.253 TB/sec
+[INFO] args = Namespace(routine='sampling_from_logits', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='sampling_from_logits_llama3', generate_repro_command=True, repro_command='', batch_size=64, vocab_size=128256, input_dtype='bfloat16', top_k=50, top_p=0.9, min_p=0.1, temperature=1.0, filter_apply_order='top_k_first', num_speculate_tokens=5, max_len=4096, num_rows=64, backends=['cuda'])
+[INFO] Running testSamplingFromLogits
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine sampling_from_logits --batch_size 64 --vocab_size 128256 --input_dtype bfloat16 -vv --generate_repro_command --case_tag sampling_from_logits_llama3
+[VVERBOSE] logits.shape = torch.Size([64, 128256])
+[VVERBOSE] logits.dtype = torch.bfloat16
+[PERF] cuda           :: median time 0.078 ms; std 0.000 ms; achieved tflops 0.000 TFLOPs/sec; achieved tb_per_sec 0.211 TB/sec
+[INFO] args = Namespace(routine='top_k_sampling_from_probs', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='top_k_sampling_k50', generate_repro_command=True, repro_command='', batch_size=32, vocab_size=32000, input_dtype='float32', top_k=50, top_p=0.9, min_p=0.1, temperature=1.0, filter_apply_order='top_k_first', num_speculate_tokens=5, max_len=4096, num_rows=32, backends=['cuda'])
+[INFO] Running testTopKSamplingFromProbs
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine top_k_sampling_from_probs --batch_size 32 --vocab_size 32000 --top_k 50 -vv --generate_repro_command --case_tag top_k_sampling_k50
+[VVERBOSE] probs.shape = torch.Size([32, 32000])
+[VVERBOSE] probs.dtype = torch.float32
+[VVERBOSE] top_k = 50
+[PERF] cuda           :: median time 0.150 ms; std 0.000 ms; achieved tflops 0.000 TFLOPs/sec; achieved tb_per_sec 0.027 TB/sec
+[INFO] args = Namespace(routine='top_k_sampling_from_probs', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='top_k_sampling_k100', generate_repro_command=True, repro_command='', batch_size=32, vocab_size=128256, input_dtype='float32', top_k=100, top_p=0.9, min_p=0.1, temperature=1.0, filter_apply_order='top_k_first', num_speculate_tokens=5, max_len=4096, num_rows=32, backends=['cuda'])
+[INFO] Running testTopKSamplingFromProbs
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine top_k_sampling_from_probs --batch_size 32 --vocab_size 128256 --top_k 100 -vv --generate_repro_command --case_tag top_k_sampling_k100
+[VVERBOSE] probs.shape = torch.Size([32, 128256])
+[VVERBOSE] probs.dtype = torch.float32
+[VVERBOSE] top_k = 100
+[PERF] cuda           :: median time 0.498 ms; std 0.002 ms; achieved tflops 0.000 TFLOPs/sec; achieved tb_per_sec 0.033 TB/sec
+[INFO] args = Namespace(routine='top_p_sampling_from_probs', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='top_p_sampling_p09', generate_repro_command=True, repro_command='', batch_size=32, vocab_size=32000, input_dtype='float32', top_k=50, top_p=0.9, min_p=0.1, temperature=1.0, filter_apply_order='top_k_first', num_speculate_tokens=5, max_len=4096, num_rows=32, backends=['cuda'])
+[INFO] Running testTopPSamplingFromProbs
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine top_p_sampling_from_probs --batch_size 32 --vocab_size 32000 --top_p 0.9 -vv --generate_repro_command --case_tag top_p_sampling_p09
+[VVERBOSE] probs.shape = torch.Size([32, 32000])
+[VVERBOSE] probs.dtype = torch.float32
+[VVERBOSE] top_p = 0.9
+[PERF] cuda           :: median time 0.023 ms; std 0.000 ms; achieved tflops 0.000 TFLOPs/sec; achieved tb_per_sec 0.179 TB/sec
+[INFO] args = Namespace(routine='top_p_sampling_from_probs', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='top_p_sampling_p095', generate_repro_command=True, repro_command='', batch_size=32, vocab_size=128256, input_dtype='float32', top_k=50, top_p=0.95, min_p=0.1, temperature=1.0, filter_apply_order='top_k_first', num_speculate_tokens=5, max_len=4096, num_rows=32, backends=['cuda'])
+[INFO] Running testTopPSamplingFromProbs
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine top_p_sampling_from_probs --batch_size 32 --vocab_size 128256 --top_p 0.95 -vv --generate_repro_command --case_tag top_p_sampling_p095
+[VVERBOSE] probs.shape = torch.Size([32, 128256])
+[VVERBOSE] probs.dtype = torch.float32
+[VVERBOSE] top_p = 0.95
+[PERF] cuda           :: median time 0.072 ms; std 0.000 ms; achieved tflops 0.000 TFLOPs/sec; achieved tb_per_sec 0.229 TB/sec
+[INFO] args = Namespace(routine='top_k_top_p_sampling_from_probs', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='top_k_top_p_probs', generate_repro_command=True, repro_command='', batch_size=32, vocab_size=32000, input_dtype='float32', top_k=50, top_p=0.9, min_p=0.1, temperature=1.0, filter_apply_order='top_k_first', num_speculate_tokens=5, max_len=4096, num_rows=32, backends=['cuda'])
+[INFO] Running testTopKTopPSamplingFromProbs
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine top_k_top_p_sampling_from_probs --batch_size 32 --vocab_size 32000 --top_k 50 --top_p 0.9 --filter_apply_order top_k_first -vv --generate_repro_command --case_tag top_k_top_p_probs
+[VVERBOSE] probs.shape = torch.Size([32, 32000])
+[VVERBOSE] probs.dtype = torch.float32
+[VVERBOSE] top_k = 50
+[VVERBOSE] top_p = 0.9
+[VVERBOSE] filter_apply_order = 'top_k_first'
+[PERF] cuda           :: median time 0.044 ms; std 0.000 ms; achieved tflops 0.000 TFLOPs/sec; achieved tb_per_sec 0.094 TB/sec
+[INFO] args = Namespace(routine='top_k_top_p_sampling_from_logits', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='top_k_top_p_logits', generate_repro_command=True, repro_command='', batch_size=32, vocab_size=32000, input_dtype='float32', top_k=50, top_p=0.9, min_p=0.1, temperature=1.0, filter_apply_order='top_k_first', num_speculate_tokens=5, max_len=4096, num_rows=32, backends=['cuda'])
+[INFO] Running testTopKTopPSamplingFromLogits
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine top_k_top_p_sampling_from_logits --batch_size 32 --vocab_size 32000 --top_k 50 --top_p 0.9 --filter_apply_order top_k_first --input_dtype float32 -vv --generate_repro_command --case_tag top_k_top_p_logits
+[VVERBOSE] logits.shape = torch.Size([32, 32000])
+[VVERBOSE] logits.dtype = torch.float32
+[VVERBOSE] top_k = 50
+[VVERBOSE] top_p = 0.9
+[VVERBOSE] filter_apply_order = 'top_k_first'
+[PERF] cuda           :: median time 0.050 ms; std 0.000 ms; achieved tflops 0.000 TFLOPs/sec; achieved tb_per_sec 0.081 TB/sec
+[INFO] args = Namespace(routine='min_p_sampling_from_probs', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='min_p_sampling_p01', generate_repro_command=True, repro_command='', batch_size=32, vocab_size=32000, input_dtype='float32', top_k=50, top_p=0.9, min_p=0.1, temperature=1.0, filter_apply_order='top_k_first', num_speculate_tokens=5, max_len=4096, num_rows=32, backends=['cuda'])
+[INFO] Running testMinPSamplingFromProbs
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine min_p_sampling_from_probs --batch_size 32 --vocab_size 32000 --min_p 0.1 -vv --generate_repro_command --case_tag min_p_sampling_p01
+[VVERBOSE] probs.shape = torch.Size([32, 32000])
+[VVERBOSE] probs.dtype = torch.float32
+[VVERBOSE] min_p = 0.1
+[PERF] cuda           :: median time 0.013 ms; std 0.000 ms; achieved tflops 0.000 TFLOPs/sec; achieved tb_per_sec 0.322 TB/sec
+[INFO] args = Namespace(routine='min_p_sampling_from_probs', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='min_p_sampling_p005', generate_repro_command=True, repro_command='', batch_size=32, vocab_size=128256, input_dtype='float32', top_k=50, top_p=0.9, min_p=0.05, temperature=1.0, filter_apply_order='top_k_first', num_speculate_tokens=5, max_len=4096, num_rows=32, backends=['cuda'])
+[INFO] Running testMinPSamplingFromProbs
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine min_p_sampling_from_probs --batch_size 32 --vocab_size 128256 --min_p 0.05 -vv --generate_repro_command --case_tag min_p_sampling_p005
+[VVERBOSE] probs.shape = torch.Size([32, 128256])
+[VVERBOSE] probs.dtype = torch.float32
+[VVERBOSE] min_p = 0.05
+[PERF] cuda           :: median time 0.042 ms; std 0.000 ms; achieved tflops 0.000 TFLOPs/sec; achieved tb_per_sec 0.393 TB/sec
+[INFO] args = Namespace(routine='top_k_renorm_probs', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='top_k_renorm', generate_repro_command=True, repro_command='', batch_size=32, vocab_size=32000, input_dtype='float32', top_k=50, top_p=0.9, min_p=0.1, temperature=1.0, filter_apply_order='top_k_first', num_speculate_tokens=5, max_len=4096, num_rows=32, backends=['cuda'])
+[INFO] Running testTopKRenormProbs
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine top_k_renorm_probs --batch_size 32 --vocab_size 32000 --top_k 50 --input_dtype float32 -vv --generate_repro_command --case_tag top_k_renorm
+[VVERBOSE] probs.shape = torch.Size([32, 32000])
+[VVERBOSE] probs.dtype = torch.float32
+[VVERBOSE] top_k = 50
+[PERF] cuda           :: median time 0.024 ms; std 0.000 ms; achieved tflops 0.000 TFLOPs/sec; achieved tb_per_sec 0.348 TB/sec
+[INFO] args = Namespace(routine='top_p_renorm_probs', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='top_p_renorm', generate_repro_command=True, repro_command='', batch_size=32, vocab_size=32000, input_dtype='float32', top_k=50, top_p=0.9, min_p=0.1, temperature=1.0, filter_apply_order='top_k_first', num_speculate_tokens=5, max_len=4096, num_rows=32, backends=['cuda'])
+[INFO] Running testTopPRenormProbs
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine top_p_renorm_probs --batch_size 32 --vocab_size 32000 --top_p 0.9 -vv --generate_repro_command --case_tag top_p_renorm
+[VVERBOSE] probs.shape = torch.Size([32, 32000])
+[VVERBOSE] probs.dtype = torch.float32
+[VVERBOSE] top_p = 0.9
+[PERF] cuda           :: median time 0.080 ms; std 0.000 ms; achieved tflops 0.000 TFLOPs/sec; achieved tb_per_sec 0.102 TB/sec
+[INFO] args = Namespace(routine='top_k_mask_logits', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='top_k_mask', generate_repro_command=True, repro_command='', batch_size=32, vocab_size=32000, input_dtype='float32', top_k=50, top_p=0.9, min_p=0.1, temperature=1.0, filter_apply_order='top_k_first', num_speculate_tokens=5, max_len=4096, num_rows=32, backends=['cuda'])
+[INFO] Running testTopKMaskLogits
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine top_k_mask_logits --batch_size 32 --vocab_size 32000 --top_k 50 --input_dtype float32 -vv --generate_repro_command --case_tag top_k_mask
+[VVERBOSE] logits.shape = torch.Size([32, 32000])
+[VVERBOSE] logits.dtype = torch.float32
+[VVERBOSE] top_k = 50
+[PERF] cuda           :: median time 0.020 ms; std 0.000 ms; achieved tflops 0.000 TFLOPs/sec; achieved tb_per_sec 0.401 TB/sec
+[INFO] args = Namespace(routine='chain_speculative_sampling', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='chain_spec_sampling_5', generate_repro_command=True, repro_command='', batch_size=16, vocab_size=32000, input_dtype='float32', top_k=50, top_p=0.9, min_p=0.1, temperature=1.0, filter_apply_order='top_k_first', num_speculate_tokens=5, max_len=4096, num_rows=16, backends=['cuda'])
+[INFO] Running testChainSpeculativeSampling
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine chain_speculative_sampling --batch_size 16 --vocab_size 32000 --num_speculate_tokens 5 -vv --generate_repro_command --case_tag chain_spec_sampling_5
+[VVERBOSE] draft_probs.shape = torch.Size([16, 5, 32000])
+[VVERBOSE] draft_token_ids.shape = torch.Size([16, 5])
+[VVERBOSE] target_probs.shape = torch.Size([16, 6, 32000])
+[VVERBOSE] num_speculate_tokens = 5
+[PERF] cuda           :: median time 0.027 ms; std 0.000 ms; achieved tflops 0.000 TFLOPs/sec; achieved tb_per_sec 0.829 TB/sec
+[INFO] args = Namespace(routine='chain_speculative_sampling', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='chain_spec_sampling_8', generate_repro_command=True, repro_command='', batch_size=32, vocab_size=128256, input_dtype='float32', top_k=50, top_p=0.9, min_p=0.1, temperature=1.0, filter_apply_order='top_k_first', num_speculate_tokens=8, max_len=4096, num_rows=32, backends=['cuda'])
+[INFO] Running testChainSpeculativeSampling
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine chain_speculative_sampling --batch_size 32 --vocab_size 128256 --num_speculate_tokens 8 -vv --generate_repro_command --case_tag chain_spec_sampling_8
+[VVERBOSE] draft_probs.shape = torch.Size([32, 8, 128256])
+[VVERBOSE] draft_token_ids.shape = torch.Size([32, 8])
+[VVERBOSE] target_probs.shape = torch.Size([32, 9, 128256])
+[VVERBOSE] num_speculate_tokens = 8
+[PERF] cuda           :: median time 0.078 ms; std 0.000 ms; achieved tflops 0.000 TFLOPs/sec; achieved tb_per_sec 3.564 TB/sec
+[INFO] args = Namespace(routine='top_k', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='top_k_radix', generate_repro_command=True, repro_command='', batch_size=32, vocab_size=32000, input_dtype='float32', top_k=50, top_p=0.9, min_p=0.1, temperature=1.0, filter_apply_order='top_k_first', num_speculate_tokens=5, max_len=4096, num_rows=32, backends=['cuda'])
+[INFO] Running testTopK
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine top_k --batch_size 32 --vocab_size 32000 --top_k 50 --input_dtype float32 -vv --generate_repro_command --case_tag top_k_radix
+[VVERBOSE] input_tensor.shape = torch.Size([32, 32000])
+[VVERBOSE] input_tensor.dtype = torch.float32
+[VVERBOSE] top_k = 50
+[PERF] cuda           :: median time 0.018 ms; std 0.000 ms; achieved tflops 0.000 TFLOPs/sec; achieved tb_per_sec 0.234 TB/sec
+[INFO] args = Namespace(routine='top_k', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='top_k_radix_large', generate_repro_command=True, repro_command='', batch_size=64, vocab_size=128256, input_dtype='bfloat16', top_k=100, top_p=0.9, min_p=0.1, temperature=1.0, filter_apply_order='top_k_first', num_speculate_tokens=5, max_len=4096, num_rows=64, backends=['cuda'])
+[INFO] Running testTopK
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine top_k --batch_size 64 --vocab_size 128256 --top_k 100 --input_dtype bfloat16 -vv --generate_repro_command --case_tag top_k_radix_large
+[VVERBOSE] input_tensor.shape = torch.Size([64, 128256])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] top_k = 100
+[PERF] cuda           :: median time 0.039 ms; std 0.000 ms; achieved tflops 0.000 TFLOPs/sec; achieved tb_per_sec 0.424 TB/sec
+[INFO] args = Namespace(routine='top_k_page_table_transform', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='top_k_page_table', generate_repro_command=True, repro_command='', batch_size=16, vocab_size=None, input_dtype='float32', top_k=64, top_p=0.9, min_p=0.1, temperature=1.0, filter_apply_order='top_k_first', num_speculate_tokens=5, max_len=4096, num_rows=16, backends=['cuda'])
+[INFO] Running testTopKPageTableTransform
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine top_k_page_table_transform --batch_size 16 --num_rows 16 --max_len 4096 --top_k 64 --input_dtype float32 -vv --generate_repro_command --case_tag top_k_page_table
+[VVERBOSE] input_scores.shape = torch.Size([16, 4096])
+[VVERBOSE] input_scores.dtype = torch.float32
+[VVERBOSE] src_page_table.shape = torch.Size([16, 4096])
+[VVERBOSE] lengths.shape = torch.Size([16])
+[VVERBOSE] top_k = 64
+[PERF] cuda           :: median time 0.008 ms; std 0.000 ms; achieved tflops 0.000 TFLOPs/sec; achieved tb_per_sec 0.066 TB/sec
+[INFO] args = Namespace(routine='top_k_ragged_transform', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='top_k_ragged', generate_repro_command=True, repro_command='', batch_size=16, vocab_size=None, input_dtype='float32', top_k=64, top_p=0.9, min_p=0.1, temperature=1.0, filter_apply_order='top_k_first', num_speculate_tokens=5, max_len=4096, num_rows=16, backends=['cuda'])
+[INFO] Running testTopKRaggedTransform
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine top_k_ragged_transform --batch_size 16 --num_rows 16 --max_len 4096 --top_k 64 --input_dtype float32 -vv --generate_repro_command --case_tag top_k_ragged
+[VVERBOSE] input_scores.shape = torch.Size([16, 4096])
+[VVERBOSE] input_scores.dtype = torch.float32
+[VVERBOSE] offsets.shape = torch.Size([16])
+[VVERBOSE] lengths.shape = torch.Size([16])
+[VVERBOSE] top_k = 64
+[PERF] cuda           :: median time 0.007 ms; std 0.000 ms; achieved tflops 0.000 TFLOPs/sec; achieved tb_per_sec 0.036 TB/sec
+[INFO] args = Namespace(routine='apply_rope', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='apply_rope_llama', generate_repro_command=True, repro_command='', batch_size=16, seq_len=1024, num_qo_heads=32, num_kv_heads=8, head_dim=128, rotary_dim=128, no_rope_dim=0, input_dtype='float16', quant_dtype='fp8_e4m3', rope_scale=1.0, rope_theta=10000.0, interleave=False, page_size=16, kv_layout='NHD', low_freq_factor=1.0, high_freq_factor=4.0, old_context_len=8192, backends=['cuda'])
+[INFO] Running testApplyRope
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine apply_rope --batch_size 16 --seq_len 1024 --num_qo_heads 32 --num_kv_heads 8 --head_dim 128 --input_dtype float16 -vv --generate_repro_command --case_tag apply_rope_llama
+[VVERBOSE] q.shape = torch.Size([16384, 32, 128])
+[VVERBOSE] k.shape = torch.Size([16384, 8, 128])
+[VVERBOSE] indptr.shape = torch.Size([17])
+[VVERBOSE] offsets.shape = torch.Size([16])
+[VVERBOSE] rotary_dim = 128
+[VVERBOSE] rope_scale = 1.0
+[VVERBOSE] rope_theta = 10000.0
+[VVERBOSE] interleave = False
+[PERF] cuda           :: median time 0.123 ms; std 0.001 ms; achieved tflops 0.000 TFLOPs/sec; achieved tb_per_sec 2.730 TB/sec
+[INFO] args = Namespace(routine='apply_rope', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='apply_rope_llama70b', generate_repro_command=True, repro_command='', batch_size=32, seq_len=2048, num_qo_heads=64, num_kv_heads=8, head_dim=128, rotary_dim=128, no_rope_dim=0, input_dtype='bfloat16', quant_dtype='fp8_e4m3', rope_scale=1.0, rope_theta=10000.0, interleave=False, page_size=16, kv_layout='NHD', low_freq_factor=1.0, high_freq_factor=4.0, old_context_len=8192, backends=['cuda'])
+[INFO] Running testApplyRope
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine apply_rope --batch_size 32 --seq_len 2048 --num_qo_heads 64 --num_kv_heads 8 --head_dim 128 --input_dtype bfloat16 -vv --generate_repro_command --case_tag apply_rope_llama70b
+[VVERBOSE] q.shape = torch.Size([65536, 64, 128])
+[VVERBOSE] k.shape = torch.Size([65536, 8, 128])
+[VVERBOSE] indptr.shape = torch.Size([33])
+[VVERBOSE] offsets.shape = torch.Size([32])
+[VVERBOSE] rotary_dim = 128
+[VVERBOSE] rope_scale = 1.0
+[VVERBOSE] rope_theta = 10000.0
+[VVERBOSE] interleave = False
+[PERF] cuda           :: median time 0.560 ms; std 0.002 ms; achieved tflops 0.000 TFLOPs/sec; achieved tb_per_sec 4.314 TB/sec
+[INFO] args = Namespace(routine='apply_rope_pos_ids', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='apply_rope_pos_ids', generate_repro_command=True, repro_command='', batch_size=16, seq_len=1024, num_qo_heads=32, num_kv_heads=8, head_dim=128, rotary_dim=128, no_rope_dim=0, input_dtype='float16', quant_dtype='fp8_e4m3', rope_scale=1.0, rope_theta=10000.0, interleave=False, page_size=16, kv_layout='NHD', low_freq_factor=1.0, high_freq_factor=4.0, old_context_len=8192, backends=['cuda'])
+[INFO] Running testApplyRopePosIds
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine apply_rope_pos_ids --batch_size 16 --seq_len 1024 --num_qo_heads 32 --num_kv_heads 8 --head_dim 128 --input_dtype float16 -vv --generate_repro_command --case_tag apply_rope_pos_ids
+[VVERBOSE] q.shape = torch.Size([16384, 32, 128])
+[VVERBOSE] k.shape = torch.Size([16384, 8, 128])
+[VVERBOSE] pos_ids.shape = torch.Size([16384])
+[VVERBOSE] rotary_dim = 128
+[VVERBOSE] rope_scale = 1.0
+[VVERBOSE] rope_theta = 10000.0
+[VVERBOSE] interleave = False
+[PERF] cuda           :: median time 0.081 ms; std 0.001 ms; achieved tflops 0.000 TFLOPs/sec; achieved tb_per_sec 4.145 TB/sec
+[INFO] args = Namespace(routine='apply_rope_pos_ids', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='apply_rope_pos_ids_interleave', generate_repro_command=True, repro_command='', batch_size=32, seq_len=2048, num_qo_heads=64, num_kv_heads=8, head_dim=128, rotary_dim=128, no_rope_dim=0, input_dtype='bfloat16', quant_dtype='fp8_e4m3', rope_scale=1.0, rope_theta=10000.0, interleave=True, page_size=16, kv_layout='NHD', low_freq_factor=1.0, high_freq_factor=4.0, old_context_len=8192, backends=['cuda'])
+[INFO] Running testApplyRopePosIds
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine apply_rope_pos_ids --batch_size 32 --seq_len 2048 --num_qo_heads 64 --num_kv_heads 8 --head_dim 128 --input_dtype bfloat16 --interleave -vv --generate_repro_command --case_tag apply_rope_pos_ids_interleave
+[VVERBOSE] q.shape = torch.Size([65536, 64, 128])
+[VVERBOSE] k.shape = torch.Size([65536, 8, 128])
+[VVERBOSE] pos_ids.shape = torch.Size([65536])
+[VVERBOSE] rotary_dim = 128
+[VVERBOSE] rope_scale = 1.0
+[VVERBOSE] rope_theta = 10000.0
+[VVERBOSE] interleave = True
+[PERF] cuda           :: median time 0.412 ms; std 0.001 ms; achieved tflops 0.000 TFLOPs/sec; achieved tb_per_sec 5.858 TB/sec
+[INFO] args = Namespace(routine='apply_llama31_rope', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='apply_llama31_rope', generate_repro_command=True, repro_command='', batch_size=16, seq_len=1024, num_qo_heads=32, num_kv_heads=8, head_dim=128, rotary_dim=128, no_rope_dim=0, input_dtype='bfloat16', quant_dtype='fp8_e4m3', rope_scale=1.0, rope_theta=500000.0, interleave=False, page_size=16, kv_layout='NHD', low_freq_factor=1.0, high_freq_factor=4.0, old_context_len=8192, backends=['cuda'])
+[INFO] Running testApplyLlama31Rope
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine apply_llama31_rope --batch_size 16 --seq_len 1024 --num_qo_heads 32 --num_kv_heads 8 --head_dim 128 --rope_theta 500000.0 --rope_scale 1.0 --low_freq_factor 1.0 --high_freq_factor 4.0 --old_context_len 8192 --input_dtype bfloat16 -vv --generate_repro_command --case_tag apply_llama31_rope
+[VVERBOSE] q.shape = torch.Size([16384, 32, 128])
+[VVERBOSE] k.shape = torch.Size([16384, 8, 128])
+[VVERBOSE] indptr.shape = torch.Size([17])
+[VVERBOSE] offsets.shape = torch.Size([16])
+[VVERBOSE] rotary_dim = 128
+[VVERBOSE] rope_scale = 1.0
+[VVERBOSE] rope_theta = 500000.0
+[VVERBOSE] interleave = False
+[VVERBOSE] low_freq_factor = 1.0
+[VVERBOSE] high_freq_factor = 4.0
+[VVERBOSE] old_context_len = 8192
+[PERF] cuda           :: median time 0.124 ms; std 0.000 ms; achieved tflops 0.000 TFLOPs/sec; achieved tb_per_sec 2.701 TB/sec
+[INFO] args = Namespace(routine='apply_llama31_rope_pos_ids', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='apply_llama31_rope_pos_ids', generate_repro_command=True, repro_command='', batch_size=16, seq_len=1024, num_qo_heads=32, num_kv_heads=8, head_dim=128, rotary_dim=128, no_rope_dim=0, input_dtype='bfloat16', quant_dtype='fp8_e4m3', rope_scale=1.0, rope_theta=500000.0, interleave=False, page_size=16, kv_layout='NHD', low_freq_factor=1.0, high_freq_factor=4.0, old_context_len=8192, backends=['cuda'])
+[INFO] Running testApplyLlama31RopePosIds
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine apply_llama31_rope_pos_ids --batch_size 16 --seq_len 1024 --num_qo_heads 32 --num_kv_heads 8 --head_dim 128 --rope_theta 500000.0 --rope_scale 1.0 --low_freq_factor 1.0 --high_freq_factor 4.0 --old_context_len 8192 --input_dtype bfloat16 -vv --generate_repro_command --case_tag apply_llama31_rope_pos_ids
+[VVERBOSE] q.shape = torch.Size([16384, 32, 128])
+[VVERBOSE] k.shape = torch.Size([16384, 8, 128])
+[VVERBOSE] pos_ids.shape = torch.Size([16384])
+[VVERBOSE] rotary_dim = 128
+[VVERBOSE] rope_scale = 1.0
+[VVERBOSE] rope_theta = 500000.0
+[VVERBOSE] interleave = False
+[VVERBOSE] low_freq_factor = 1.0
+[VVERBOSE] high_freq_factor = 4.0
+[VVERBOSE] old_context_len = 8192
+[PERF] cuda           :: median time 0.081 ms; std 0.001 ms; achieved tflops 0.000 TFLOPs/sec; achieved tb_per_sec 4.131 TB/sec
+[INFO] args = Namespace(routine='apply_rope_with_cos_sin_cache', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='apply_rope_cos_sin_cache', generate_repro_command=True, repro_command='', batch_size=16, seq_len=1024, num_qo_heads=32, num_kv_heads=8, head_dim=128, rotary_dim=128, no_rope_dim=0, input_dtype='float16', quant_dtype='fp8_e4m3', rope_scale=1.0, rope_theta=10000.0, interleave=False, page_size=16, kv_layout='NHD', low_freq_factor=1.0, high_freq_factor=4.0, old_context_len=8192, backends=['cuda'])
+[INFO] Running testApplyRopeWithCosSinCache
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine apply_rope_with_cos_sin_cache --batch_size 16 --seq_len 1024 --num_qo_heads 32 --num_kv_heads 8 --head_dim 128 --input_dtype float16 -vv --generate_repro_command --case_tag apply_rope_cos_sin_cache
+[VVERBOSE] q.shape = torch.Size([16384, 4096])
+[VVERBOSE] k.shape = torch.Size([16384, 1024])
+[VVERBOSE] cos_sin_cache.shape = torch.Size([1024, 128])
+[VVERBOSE] positions.shape = torch.Size([16384])
+[VVERBOSE] is_neox = True
+[ERROR] Error running test: --routine apply_rope_with_cos_sin_cache --batch_size 16 --seq_len 1024 --num_qo_heads 32 --num_kv_heads 8 --head_dim 128 --input_dtype float16 -vv --generate_repro_command --case_tag "apply_rope_cos_sin_cache"
+[ERROR] Error: cos_sin_cache should be float32
+[INFO] args = Namespace(routine='apply_rope_with_cos_sin_cache', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='apply_rope_cos_sin_cache_interleave', generate_repro_command=True, repro_command='', batch_size=32, seq_len=2048, num_qo_heads=64, num_kv_heads=8, head_dim=128, rotary_dim=128, no_rope_dim=0, input_dtype='bfloat16', quant_dtype='fp8_e4m3', rope_scale=1.0, rope_theta=10000.0, interleave=True, page_size=16, kv_layout='NHD', low_freq_factor=1.0, high_freq_factor=4.0, old_context_len=8192, backends=['cuda'])
+[INFO] Running testApplyRopeWithCosSinCache
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine apply_rope_with_cos_sin_cache --batch_size 32 --seq_len 2048 --num_qo_heads 64 --num_kv_heads 8 --head_dim 128 --input_dtype bfloat16 --interleave -vv --generate_repro_command --case_tag apply_rope_cos_sin_cache_interleave
+[VVERBOSE] q.shape = torch.Size([65536, 8192])
+[VVERBOSE] k.shape = torch.Size([65536, 1024])
+[VVERBOSE] cos_sin_cache.shape = torch.Size([2048, 128])
+[VVERBOSE] positions.shape = torch.Size([65536])
+[VVERBOSE] is_neox = False
+[ERROR] Error running test: --routine apply_rope_with_cos_sin_cache --batch_size 32 --seq_len 2048 --num_qo_heads 64 --num_kv_heads 8 --head_dim 128 --input_dtype bfloat16 --interleave -vv --generate_repro_command --case_tag "apply_rope_cos_sin_cache_interleave"
+[ERROR] Error: cos_sin_cache should be float32
+[INFO] args = Namespace(routine='mla_rope_quantize_fp8', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='mla_rope_fp8_deepseek', generate_repro_command=True, repro_command='', batch_size=16, seq_len=1024, num_qo_heads=128, num_kv_heads=128, head_dim=192, rotary_dim=192, no_rope_dim=64, input_dtype='bfloat16', quant_dtype='fp8_e4m3', rope_scale=1.0, rope_theta=10000.0, interleave=False, page_size=16, kv_layout='NHD', low_freq_factor=1.0, high_freq_factor=4.0, old_context_len=8192, backends=['cuda'])
+[INFO] Running testMlaRopeQuantizeFp8
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine mla_rope_quantize_fp8 --batch_size 16 --seq_len 1024 --num_qo_heads 128 --num_kv_heads 128 --head_dim 192 --no_rope_dim 64 --input_dtype bfloat16 --quant_dtype fp8_e4m3 -vv --generate_repro_command --case_tag mla_rope_fp8_deepseek
+[VVERBOSE] q_rope.shape = torch.Size([16384, 128, 128])
+[VVERBOSE] k_rope.shape = torch.Size([16384, 128])
+[VVERBOSE] q_nope.shape = torch.Size([16384, 128, 64])
+[VVERBOSE] k_nope.shape = torch.Size([16384, 64])
+[VVERBOSE] cos_sin_cache.shape = torch.Size([1024, 128])
+[VVERBOSE] pos_ids.shape = torch.Size([16384])
+[VVERBOSE] rope_dim = 128
+[VVERBOSE] no_rope_dim = 64
+[VVERBOSE] is_neox = True
+[PERF] cuda           :: median time 0.441 ms; std 0.001 ms; achieved tflops 0.000 TFLOPs/sec; achieved tb_per_sec 2.759 TB/sec
+[INFO] args = Namespace(routine='rope_quantize_fp8', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='rope_fp8_llama', generate_repro_command=True, repro_command='', batch_size=16, seq_len=1024, num_qo_heads=32, num_kv_heads=8, head_dim=128, rotary_dim=128, no_rope_dim=0, input_dtype='bfloat16', quant_dtype='fp8_e4m3', rope_scale=1.0, rope_theta=10000.0, interleave=False, page_size=16, kv_layout='NHD', low_freq_factor=1.0, high_freq_factor=4.0, old_context_len=8192, backends=['cuda'])
+[INFO] Running testRopeQuantizeFp8
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine rope_quantize_fp8 --batch_size 16 --seq_len 1024 --num_qo_heads 32 --num_kv_heads 8 --head_dim 128 --input_dtype bfloat16 --quant_dtype fp8_e4m3 -vv --generate_repro_command --case_tag rope_fp8_llama
+[VVERBOSE] q_rope.shape = torch.Size([16384, 32, 128])
+[VVERBOSE] k_rope.shape = torch.Size([16384, 8, 128])
+[VVERBOSE] q_nope.shape = None
+[VVERBOSE] k_nope.shape = None
+[VVERBOSE] cos_sin_cache.shape = torch.Size([1024, 128])
+[VVERBOSE] pos_ids.shape = torch.Size([16384])
+[VVERBOSE] rotary_dim = 128
+[VVERBOSE] no_rope_dim = 0
+[VVERBOSE] is_neox = True
+[PERF] cuda           :: median time 0.083 ms; std 0.001 ms; achieved tflops 0.000 TFLOPs/sec; achieved tb_per_sec 3.041 TB/sec
+[INFO] args = Namespace(routine='rope_quantize_fp8', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='rope_fp8_llama70b', generate_repro_command=True, repro_command='', batch_size=32, seq_len=2048, num_qo_heads=64, num_kv_heads=8, head_dim=128, rotary_dim=128, no_rope_dim=0, input_dtype='bfloat16', quant_dtype='fp8_e4m3', rope_scale=1.0, rope_theta=10000.0, interleave=False, page_size=16, kv_layout='NHD', low_freq_factor=1.0, high_freq_factor=4.0, old_context_len=8192, backends=['cuda'])
+[INFO] Running testRopeQuantizeFp8
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine rope_quantize_fp8 --batch_size 32 --seq_len 2048 --num_qo_heads 64 --num_kv_heads 8 --head_dim 128 --input_dtype bfloat16 --quant_dtype fp8_e4m3 -vv --generate_repro_command --case_tag rope_fp8_llama70b
+[VVERBOSE] q_rope.shape = torch.Size([65536, 64, 128])
+[VVERBOSE] k_rope.shape = torch.Size([65536, 8, 128])
+[VVERBOSE] q_nope.shape = None
+[VVERBOSE] k_nope.shape = None
+[VVERBOSE] cos_sin_cache.shape = torch.Size([2048, 128])
+[VVERBOSE] pos_ids.shape = torch.Size([65536])
+[VVERBOSE] rotary_dim = 128
+[VVERBOSE] no_rope_dim = 0
+[VVERBOSE] is_neox = True
+[PERF] cuda           :: median time 0.570 ms; std 0.002 ms; achieved tflops 0.000 TFLOPs/sec; achieved tb_per_sec 3.183 TB/sec
+[INFO] args = Namespace(routine='rope_quantize_fp8_append_paged_kv_cache', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='rope_fp8_paged_kv', generate_repro_command=True, repro_command='', batch_size=16, seq_len=64, num_qo_heads=32, num_kv_heads=8, head_dim=128, rotary_dim=128, no_rope_dim=0, input_dtype='bfloat16', quant_dtype='fp8_e4m3', rope_scale=1.0, rope_theta=10000.0, interleave=False, page_size=16, kv_layout='NHD', low_freq_factor=1.0, high_freq_factor=4.0, old_context_len=8192, backends=['cuda'])
+[INFO] Running testRopeQuantizeFp8AppendPagedKvCache
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine rope_quantize_fp8_append_paged_kv_cache --batch_size 16 --seq_len 64 --num_qo_heads 32 --num_kv_heads 8 --head_dim 128 --page_size 16 --kv_layout NHD --input_dtype bfloat16 --quant_dtype fp8_e4m3 -vv --generate_repro_command --case_tag rope_fp8_paged_kv
+[VVERBOSE] q_rope.shape = torch.Size([1024, 32, 128])
+[VVERBOSE] k_rope.shape = torch.Size([1024, 8, 128])
+[VVERBOSE] q_nope.shape = None
+[VVERBOSE] k_nope.shape = None
+[VVERBOSE] v.shape = torch.Size([1024, 8, 128])
+[VVERBOSE] cos_sin_cache.shape = torch.Size([64, 128])
+[VVERBOSE] pos_ids.shape = torch.Size([1024])
+[VVERBOSE] k_cache.shape = torch.Size([64, 16, 8, 128])
+[VVERBOSE] v_cache.shape = torch.Size([64, 16, 8, 128])
+[VVERBOSE] kv_indices.shape = torch.Size([64])
+[VVERBOSE] kv_indptr.shape = torch.Size([17])
+[VVERBOSE] batch_indices.shape = torch.Size([1024])
+[VVERBOSE] positions.shape = torch.Size([1024])
+[VVERBOSE] rotary_dim = 128
+[VVERBOSE] no_rope_dim = 0
+[VVERBOSE] is_neox = True
+[VVERBOSE] page_size = 16
+[VVERBOSE] kv_layout = 'NHD'
+[PERF] cuda           :: median time 0.010 ms; std 0.000 ms; achieved tflops 0.000 TFLOPs/sec; achieved tb_per_sec 1.941 TB/sec
+[INFO] args = Namespace(routine='rope_quantize_fp8_append_paged_kv_cache', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=False, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='rope_fp8_paged_kv_hnd', generate_repro_command=True, repro_command='', batch_size=32, seq_len=64, num_qo_heads=64, num_kv_heads=8, head_dim=128, rotary_dim=128, no_rope_dim=0, input_dtype='bfloat16', quant_dtype='fp8_e4m3', rope_scale=1.0, rope_theta=10000.0, interleave=False, page_size=16, kv_layout='HND', low_freq_factor=1.0, high_freq_factor=4.0, old_context_len=8192, backends=['cuda'])
+[INFO] Running testRopeQuantizeFp8AppendPagedKvCache
+[INFO] FlashInfer version: 0.6.2
+[VVERBOSE] gpu_name = 'NVIDIA_B200'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine rope_quantize_fp8_append_paged_kv_cache --batch_size 32 --seq_len 64 --num_qo_heads 64 --num_kv_heads 8 --head_dim 128 --page_size 16 --kv_layout HND --input_dtype bfloat16 --quant_dtype fp8_e4m3 -vv --generate_repro_command --case_tag rope_fp8_paged_kv_hnd
+[VVERBOSE] q_rope.shape = torch.Size([2048, 64, 128])
+[VVERBOSE] k_rope.shape = torch.Size([2048, 8, 128])
+[VVERBOSE] q_nope.shape = None
+[VVERBOSE] k_nope.shape = None
+[VVERBOSE] v.shape = torch.Size([2048, 8, 128])
+[VVERBOSE] cos_sin_cache.shape = torch.Size([64, 128])
+[VVERBOSE] pos_ids.shape = torch.Size([2048])
+[VVERBOSE] k_cache.shape = torch.Size([128, 8, 16, 128])
+[VVERBOSE] v_cache.shape = torch.Size([128, 8, 16, 128])
+[VVERBOSE] kv_indices.shape = torch.Size([128])
+[VVERBOSE] kv_indptr.shape = torch.Size([33])
+[VVERBOSE] batch_indices.shape = torch.Size([2048])
+[VVERBOSE] positions.shape = torch.Size([2048])
+[VVERBOSE] rotary_dim = 128
+[VVERBOSE] no_rope_dim = 0
+[VVERBOSE] is_neox = True
+[VVERBOSE] page_size = 16
+[VVERBOSE] kv_layout = 'HND'
+[PERF] cuda           :: median time 0.026 ms; std 0.000 ms; achieved tflops 0.000 TFLOPs/sec; achieved tb_per_sec 2.399 TB/sec

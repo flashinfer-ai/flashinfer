@@ -64,6 +64,12 @@
                      ") at ", __FILE__, ":", __LINE__, " in ", STR(func));                  \
   } while (0)
 
+#define FLASHINFER_CHECK_ALIGNMENT(ptr, size_bytes)                            \
+  FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(ptr) % (size_bytes) == 0, #ptr, \
+                   " must be aligned to ", (size_bytes), " bytes, got address ", (uintptr_t)(ptr))
+
+#define FLASHINFER_CHECK_TMA_ALIGNED(ptr) FLASHINFER_CHECK_ALIGNMENT(ptr, 128)
+
 #define DISPATCH_USE_FP16_QK_REDUCTION(use_fp16_qk_reduction, USE_FP16_QK_REDUCTION, ...) \
   if (use_fp16_qk_reduction) {                                                            \
     FLASHINFER_ERROR("FP16_QK_REDUCTION disabled at compile time");                       \

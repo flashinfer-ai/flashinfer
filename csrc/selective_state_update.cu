@@ -13,9 +13,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+// clang-format off
+// config.inc MUST come before the header: it defines DIM, DSTATE, NTOKENS_MTP
+// constexprs that the header's function templates rely on. Reordering breaks compilation.
+// NOTE: the .inc file is generated from the jinja template csrc/selective_state_update_customize_config.jinja
+#include "selective_state_update_config.inc"
 #include <flashinfer/mamba/selective_state_update.cuh>
-#include <sstream>
-
+// clang-format on
 #include "tvm_ffi_utils.h"
 
 using namespace flashinfer;
@@ -95,6 +99,22 @@ inline void validate_intermediate_states_buffer(
   CHECK_CONTIGUOUS(intermediate_states_buffer.value());
 }
 
+inline void validate_state_scale(Optional<TensorView> const& state_scale, int64_t state_cache_size,
+                                 int64_t nheads, int64_t dim) {
+  if (!state_scale.has_value()) return;
+  auto const& scale = state_scale.value();
+  CHECK_CUDA(scale);
+  CHECK_DIM(3, scale);  // state_scale: {state_cache_size, nheads, dim}
+  FLASHINFER_CHECK(scale.size(0) == state_cache_size,
+                   "state_scale.size(0) must equal state_cache_size");
+  FLASHINFER_CHECK(scale.size(1) == nheads, "state_scale.size(1) must equal nheads");
+  FLASHINFER_CHECK(scale.size(2) == dim, "state_scale.size(2) must equal dim");
+  // Inner dims (nheads, dim) must be contiguous
+  FLASHINFER_CHECK(scale.stride(2) == 1, "state_scale.stride(2) must be 1, got ", scale.stride(2));
+  FLASHINFER_CHECK(scale.stride(1) == dim, "state_scale.stride(1) must equal dim, got ",
+                   scale.stride(1));
+}
+
 // Validates dtype consistency across tensors
 inline void validate_dtype_consistency(
     TensorView const& state, TensorView const& dt, TensorView const& D, TensorView const& x,
@@ -124,87 +144,14 @@ inline void validate_dtype_consistency(
   }
 }
 
-// Helper to convert dtype code to string for error messages
-inline const char* dtype_code_to_string(int64_t code) {
-  if (code == bfloat16_code) return "bfloat16";
-  if (code == float16_code) return "float16";
-  if (code == float32_code) return "float32";
-  return "unknown";
-}
-
-// Type traits to map dtype codes to C++ types
-template <int64_t code>
-struct DTypeToType;
-
-template <>
-struct DTypeToType<bfloat16_code> {
-  using type = nv_bfloat16;
-};
-template <>
-struct DTypeToType<float16_code> {
-  using type = half;
-};
-template <>
-struct DTypeToType<float32_code> {
-  using type = float;
-};
-template <>
-struct DTypeToType<int32_code> {
-  using type = int32_t;
-};
-template <>
-struct DTypeToType<int64_code> {
-  using type = int64_t;
-};
-
-// Allowed dtype combinations: {state_code, input_code, weight_code, matrixA_code, stateIndex_code}
-constexpr std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t> allowed_dtype_combos[] = {
-    {bfloat16_code, bfloat16_code, bfloat16_code, float32_code, int32_code},
-    {float16_code, bfloat16_code, bfloat16_code, float32_code, int32_code},
-    {float32_code, bfloat16_code, bfloat16_code, float32_code, int32_code},
-    {bfloat16_code, bfloat16_code, float32_code, float32_code, int32_code},
-    {float16_code, bfloat16_code, float32_code, float32_code, int32_code},
-    {float32_code, bfloat16_code, float32_code, float32_code, int32_code},
-    {bfloat16_code, bfloat16_code, bfloat16_code, float32_code, int64_code},
-    {float16_code, bfloat16_code, bfloat16_code, float32_code, int64_code},
-    {float32_code, bfloat16_code, bfloat16_code, float32_code, int64_code},
-    {bfloat16_code, bfloat16_code, float32_code, float32_code, int64_code},
-    {float16_code, bfloat16_code, float32_code, float32_code, int64_code},
-    {float32_code, bfloat16_code, float32_code, float32_code, int64_code},
-};
-
-// Helper to dispatch to the right template instantiation for STP
-template <int64_t state_code, int64_t input_code, int64_t weight_code, int64_t matrixA_code,
-          int64_t stateIndex_code>
-void dispatchCombo(SelectiveStateUpdateParams& p, cudaStream_t stream) {
-  using state_t = typename DTypeToType<state_code>::type;
-  using input_t = typename DTypeToType<input_code>::type;
-  using weight_t = typename DTypeToType<weight_code>::type;
-  using matrixA_t = typename DTypeToType<matrixA_code>::type;
-  using stateIndex_t = typename DTypeToType<stateIndex_code>::type;
-  invokeSelectiveStateUpdate<input_t, weight_t, matrixA_t, state_t, stateIndex_t>(p, stream);
-}
-
-// Helper to dispatch to the right template instantiation for MTP
-template <int64_t state_code, int64_t input_code, int64_t weight_code, int64_t matrixA_code,
-          int64_t stateIndex_code>
-void dispatchComboMTP(mtp::SelectiveStateMTPParams& p, cudaStream_t stream) {
-  using state_t = typename DTypeToType<state_code>::type;
-  using input_t = typename DTypeToType<input_code>::type;
-  using weight_t = typename DTypeToType<weight_code>::type;
-  using matrixA_t = typename DTypeToType<matrixA_code>::type;
-  using stateIndex_t = typename DTypeToType<stateIndex_code>::type;
-  mtp::invokeSelectiveStateUpdateMTP<input_t, weight_t, matrixA_t, state_t, stateIndex_t>(p,
-                                                                                          stream);
-}
-
 void run_selective_state_update_stp(TensorView const& state, TensorView const& x,
                                     TensorView const& dt, TensorView const& A, TensorView const& B,
                                     TensorView const& C, TensorView const& D,
                                     Optional<TensorView> z, Optional<TensorView> dt_bias,
                                     bool dt_softplus, Optional<TensorView> state_batch_indices,
-                                    int64_t pad_slot_id, Optional<TensorView> out,
-                                    bool disable_state_update) {
+                                    Optional<TensorView> state_scale, int64_t pad_slot_id,
+                                    Optional<TensorView> out, bool disable_state_update,
+                                    Optional<TensorView> rand_seed, int64_t algorithm) {
   // Extract dimensions from input tensors
   auto const batch = x.size(0);
   auto const state_cache_size = state.size(0);
@@ -289,6 +236,7 @@ void run_selective_state_update_stp(TensorView const& state, TensorView const& x
 
   // Validate dtype consistency
   validate_dtype_consistency(state, dt, D, x, B, C, dt_bias, z, out);
+  validate_state_scale(state_scale, state_cache_size, nheads, dim);
 
   // Initialize params struct
   SelectiveStateUpdateParams p;
@@ -318,6 +266,18 @@ void run_selective_state_update_stp(TensorView const& state, TensorView const& x
   if (state_batch_indices.has_value()) {
     p.state_batch_indices = const_cast<void*>(state_batch_indices.value().data_ptr());
   }
+  if (state_scale.has_value()) {
+    p.state_scale = state_scale.value().data_ptr();
+    p.state_scale_stride_batch = state_scale.value().stride(0);
+  }
+  if (rand_seed.has_value()) {
+    auto const& rs = rand_seed.value();
+    CHECK_CUDA(rs);
+    FLASHINFER_CHECK(rs.numel() == 1,
+                     "rand_seed must be a single-element tensor, got numel=", rs.numel());
+    FLASHINFER_CHECK(rs.dtype().code == kDLInt && rs.dtype().bits == 64, "rand_seed must be int64");
+    p.rand_seed = static_cast<const int64_t*>(rs.data_ptr());
+  }
 
   // Copy pointers
   p.state = const_cast<void*>(state.data_ptr());
@@ -344,73 +304,19 @@ void run_selective_state_update_stp(TensorView const& state, TensorView const& x
   ffi::CUDADeviceGuard device_guard(state.device().device_id);
   const cudaStream_t stream = get_stream(state.device());
 
-  // Dispatch based on dtype combination
-  DLDataType state_dtype = state.dtype();
-  DLDataType input_dtype = x.dtype();
-  DLDataType weight_dtype = dt.dtype();
-  DLDataType matrixA_dtype = A.dtype();
-  int64_t state_dtype_code = encode_dlpack_dtype(state_dtype);
-  int64_t input_dtype_code = encode_dlpack_dtype(input_dtype);
-  int64_t weight_dtype_code = encode_dlpack_dtype(weight_dtype);
-  int64_t matrixA_dtype_code = encode_dlpack_dtype(matrixA_dtype);
-
-  // Get state_batch_indices dtype, default to int32 if not provided
-  int64_t stateIndex_dtype_code = int32_code;
-  if (state_batch_indices.has_value()) {
-    DLDataType stateIndex_dtype = state_batch_indices.value().dtype();
-    stateIndex_dtype_code = encode_dlpack_dtype(stateIndex_dtype);
-  }
-
-  // Dispatch kernel based on dtype combination
-  auto dtype_key = std::make_tuple(state_dtype_code, input_dtype_code, weight_dtype_code,
-                                   matrixA_dtype_code, stateIndex_dtype_code);
-
-  // Compile-time recursive dispatcher using Y-combinator pattern for lambda self-recursion
-  auto tryDispatch = [&](const auto& key, auto idx, auto& self) -> bool {
-    constexpr size_t I = decltype(idx)::value;
-    if constexpr (I < std::size(allowed_dtype_combos)) {
-      constexpr auto combo = allowed_dtype_combos[I];
-      if (key == combo) {
-        constexpr auto s = std::get<0>(combo);
-        constexpr auto i = std::get<1>(combo);
-        constexpr auto w = std::get<2>(combo);
-        constexpr auto m = std::get<3>(combo);
-        constexpr auto si = std::get<4>(combo);
-        dispatchCombo<s, i, w, m, si>(p, stream);
-        return true;
-      }
-      return self(key, std::integral_constant<size_t, I + 1>{}, self);
-    }
-    return false;
-  };
-
-  // Dispatch using compile-time type traits
-  if (!tryDispatch(dtype_key, std::integral_constant<size_t, 0>{}, tryDispatch)) {
-    // Unsupported dtype combination - build error message dynamically
-    std::ostringstream error_msg;
-    error_msg << "Unsupported dtype combination for selective_state_update: " << "state_dtype="
-              << state_dtype.code << ":" << state_dtype.bits << ", "
-              << "input_dtype=" << input_dtype.code << ":" << input_dtype.bits << ", "
-              << "weight_dtype=" << weight_dtype.code << ":" << weight_dtype.bits << ", "
-              << "matrixA_dtype=" << matrixA_dtype.code << ":" << matrixA_dtype.bits
-              << ". Supported combos include:\n";
-    for (const auto& combo : allowed_dtype_combos) {
-      error_msg << "  (state=" << dtype_code_to_string(std::get<0>(combo))
-                << ", input=" << dtype_code_to_string(std::get<1>(combo))
-                << ", weight=" << dtype_code_to_string(std::get<2>(combo))
-                << ", matrixA=" << dtype_code_to_string(std::get<3>(combo)) << ")\n";
-    }
-    TVM_FFI_ICHECK(false) << error_msg.str();
-  }
+  auto algo = static_cast<SSUAlgorithm>(algorithm);
+  invokeSelectiveStateUpdate<input_t, weight_t, matrixA_t, state_t, stateIndex_t, state_scale_t>(
+      p, algo, stream);
 }
 
 void run_selective_state_update_mtp(
     TensorView const& state, TensorView const& x, TensorView const& dt, TensorView const& A,
     TensorView const& B, TensorView const& C, TensorView const& D, Optional<TensorView> z,
     Optional<TensorView> dt_bias, bool dt_softplus, Optional<TensorView> state_batch_indices,
-    int64_t pad_slot_id, Optional<TensorView> out, bool disable_state_update,
-    Optional<TensorView> intermediate_states_buffer,
-    Optional<TensorView> intermediate_state_indices, int64_t cache_steps) {
+    Optional<TensorView> state_scale, int64_t pad_slot_id, Optional<TensorView> out,
+    bool disable_state_update, Optional<TensorView> intermediate_states_buffer,
+    Optional<TensorView> intermediate_state_indices, Optional<TensorView> intermediate_state_scales,
+    Optional<TensorView> rand_seed, int64_t cache_steps, int64_t algorithm) {
   // Extract dimensions from input tensors
   auto const batch = x.size(0);
   auto const ntokens_mtp = x.size(1);
@@ -504,6 +410,16 @@ void run_selective_state_update_mtp(
   validate_dtype_consistency(state, dt, D, x, B, C, dt_bias, z, out, intermediate_states_buffer);
   validate_intermediate_state_indices(intermediate_state_indices, batch);
   validate_intermediate_states_buffer(intermediate_states_buffer);
+  validate_state_scale(state_scale, state_cache_size, nheads, dim);
+
+  // Validate that state_batch_indices and intermediate_state_indices have the same dtype
+  if (state_batch_indices.has_value() && intermediate_state_indices.has_value()) {
+    DLDataType state_batch_idx_dtype = state_batch_indices.value().dtype();
+    DLDataType intermediate_idx_dtype = intermediate_state_indices.value().dtype();
+    FLASHINFER_CHECK(state_batch_idx_dtype.code == intermediate_idx_dtype.code &&
+                         state_batch_idx_dtype.bits == intermediate_idx_dtype.bits,
+                     "state_batch_indices and intermediate_state_indices must have the same dtype");
+  }
 
   // Validate cache_steps is non-negative
   FLASHINFER_CHECK(cache_steps >= 0, "cache_steps must be non-negative, got ", cache_steps);
@@ -552,6 +468,10 @@ void run_selective_state_update_mtp(
   if (state_batch_indices.has_value()) {
     p.state_batch_indices = const_cast<void*>(state_batch_indices.value().data_ptr());
   }
+  if (state_scale.has_value()) {
+    p.state_scale = state_scale.value().data_ptr();
+    p.state_scale_stride_batch = state_scale.value().stride(0);
+  }
 
   if (intermediate_states_buffer.has_value()) {
     p.intermediate_states = const_cast<void*>(intermediate_states_buffer.value().data_ptr());
@@ -560,6 +480,30 @@ void run_selective_state_update_mtp(
 
   if (intermediate_state_indices.has_value()) {
     p.intermediate_state_indices = const_cast<void*>(intermediate_state_indices.value().data_ptr());
+  }
+
+  if (intermediate_state_scales.has_value()) {
+    auto const& iscales = intermediate_state_scales.value();
+    CHECK_CUDA(iscales);
+    CHECK_CONTIGUOUS(iscales);
+    CHECK_DIM(4, iscales);  // (batch, cache_steps, nheads, dim)
+    FLASHINFER_CHECK(iscales.size(0) == batch,
+                     "intermediate_state_scales.size(0) must equal batch");
+    FLASHINFER_CHECK(iscales.size(1) == cache_steps,
+                     "intermediate_state_scales.size(1) must equal cache_steps");
+    FLASHINFER_CHECK(iscales.size(2) == nheads,
+                     "intermediate_state_scales.size(2) must equal nheads");
+    FLASHINFER_CHECK(iscales.size(3) == dim, "intermediate_state_scales.size(3) must equal dim");
+    p.intermediate_state_scales = iscales.data_ptr();
+    p.intermediate_state_scales_stride_batch = iscales.stride(0);
+  }
+  if (rand_seed.has_value()) {
+    auto const& rs = rand_seed.value();
+    CHECK_CUDA(rs);
+    FLASHINFER_CHECK(rs.numel() == 1,
+                     "rand_seed must be a single-element tensor, got numel=", rs.numel());
+    FLASHINFER_CHECK(rs.dtype().code == kDLInt && rs.dtype().bits == 64, "rand_seed must be int64");
+    p.rand_seed = static_cast<const int64_t*>(rs.data_ptr());
   }
 
   // Copy pointers
@@ -588,94 +532,30 @@ void run_selective_state_update_mtp(
   ffi::CUDADeviceGuard device_guard(state.device().device_id);
   const cudaStream_t stream = get_stream(state.device());
 
-  // Dispatch based on dtype combination
-  DLDataType state_dtype = state.dtype();
-  DLDataType input_dtype = x.dtype();
-  DLDataType weight_dtype = dt.dtype();
-  DLDataType matrixA_dtype = A.dtype();
-  int64_t state_dtype_code = encode_dlpack_dtype(state_dtype);
-  int64_t input_dtype_code = encode_dlpack_dtype(input_dtype);
-  int64_t weight_dtype_code = encode_dlpack_dtype(weight_dtype);
-  int64_t matrixA_dtype_code = encode_dlpack_dtype(matrixA_dtype);
-
-  // Get stateIndex dtype from whichever index tensor is available
-  // If both are provided, they must have the same dtype
-  int64_t stateIndex_dtype_code = int32_code;  // default
-  if (state_batch_indices.has_value() && intermediate_state_indices.has_value()) {
-    DLDataType state_batch_idx_dtype = state_batch_indices.value().dtype();
-    DLDataType intermediate_idx_dtype = intermediate_state_indices.value().dtype();
-    FLASHINFER_CHECK(state_batch_idx_dtype.code == intermediate_idx_dtype.code &&
-                         state_batch_idx_dtype.bits == intermediate_idx_dtype.bits,
-                     "state_batch_indices and intermediate_state_indices must have the same dtype");
-    stateIndex_dtype_code = encode_dlpack_dtype(state_batch_idx_dtype);
-  } else if (state_batch_indices.has_value()) {
-    DLDataType state_batch_idx_dtype = state_batch_indices.value().dtype();
-    stateIndex_dtype_code = encode_dlpack_dtype(state_batch_idx_dtype);
-  } else if (intermediate_state_indices.has_value()) {
-    DLDataType intermediate_idx_dtype = intermediate_state_indices.value().dtype();
-    stateIndex_dtype_code = encode_dlpack_dtype(intermediate_idx_dtype);
-  }
-
-  // Dispatch kernel based on dtype combination
-  auto dtype_key = std::make_tuple(state_dtype_code, input_dtype_code, weight_dtype_code,
-                                   matrixA_dtype_code, stateIndex_dtype_code);
-
-  // Compile-time recursive dispatcher using Y-combinator pattern for lambda self-recursion
-  auto tryDispatch = [&](const auto& key, auto idx, auto& self) -> bool {
-    constexpr size_t I = decltype(idx)::value;
-    if constexpr (I < std::size(allowed_dtype_combos)) {
-      constexpr auto combo = allowed_dtype_combos[I];
-      if (key == combo) {
-        constexpr auto s = std::get<0>(combo);
-        constexpr auto i = std::get<1>(combo);
-        constexpr auto w = std::get<2>(combo);
-        constexpr auto m = std::get<3>(combo);
-        constexpr auto si = std::get<4>(combo);
-        dispatchComboMTP<s, i, w, m, si>(p, stream);
-        return true;
-      }
-      return self(key, std::integral_constant<size_t, I + 1>{}, self);
-    }
-    return false;
-  };
-
-  // Dispatch using compile-time type traits
-  if (!tryDispatch(dtype_key, std::integral_constant<size_t, 0>{}, tryDispatch)) {
-    // Unsupported dtype combination - build error message dynamically
-    std::ostringstream error_msg;
-    error_msg << "Unsupported dtype combination for selective_state_update: " << "state_dtype="
-              << state_dtype.code << ":" << state_dtype.bits << ", "
-              << "input_dtype=" << input_dtype.code << ":" << input_dtype.bits << ", "
-              << "weight_dtype=" << weight_dtype.code << ":" << weight_dtype.bits << ", "
-              << "matrixA_dtype=" << matrixA_dtype.code << ":" << matrixA_dtype.bits
-              << ". Supported combos include:\n";
-    for (const auto& combo : allowed_dtype_combos) {
-      error_msg << "  (state=" << dtype_code_to_string(std::get<0>(combo))
-                << ", input=" << dtype_code_to_string(std::get<1>(combo))
-                << ", weight=" << dtype_code_to_string(std::get<2>(combo))
-                << ", matrixA=" << dtype_code_to_string(std::get<3>(combo)) << ")\n";
-    }
-    TVM_FFI_ICHECK(false) << error_msg.str();
-  }
+  auto algo = static_cast<SSUAlgorithm>(algorithm);
+  mtp::invokeSelectiveStateUpdateMTP<input_t, weight_t, matrixA_t, state_t, stateIndex_t,
+                                     state_scale_t>(p, algo, stream);
 }
 
 // =============================================================================
 // Generic dispatcher - routes to single-token or multi-token based on x.dim()
 // =============================================================================
-void selective_state_update(TensorView state, TensorView x, TensorView dt, TensorView A,
-                            TensorView B, TensorView C, TensorView D, Optional<TensorView> z,
-                            Optional<TensorView> dt_bias, bool dt_softplus,
-                            Optional<TensorView> state_batch_indices, int64_t pad_slot_id,
-                            TensorView output, bool disable_state_update,
-                            Optional<TensorView> intermediate_states_buffer,
-                            Optional<TensorView> intermediate_state_indices, int64_t cache_steps) {
+void selective_state_update(
+    TensorView state, TensorView x, TensorView dt, TensorView A, TensorView B, TensorView C,
+    TensorView D, Optional<TensorView> z, Optional<TensorView> dt_bias, bool dt_softplus,
+    Optional<TensorView> state_batch_indices, int64_t pad_slot_id, Optional<TensorView> state_scale,
+    TensorView output, bool disable_state_update, Optional<TensorView> intermediate_states_buffer,
+    Optional<TensorView> intermediate_state_indices, Optional<TensorView> intermediate_state_scales,
+    Optional<TensorView> rand_seed, int64_t cache_steps, int64_t algorithm) {
   if (x.dim() == 3) {
     run_selective_state_update_stp(state, x, dt, A, B, C, D, z, dt_bias, dt_softplus,
-                                   state_batch_indices, pad_slot_id, output, disable_state_update);
+                                   state_batch_indices, state_scale, pad_slot_id, output,
+                                   disable_state_update, rand_seed, algorithm);
   } else if (x.dim() == 4) {
     run_selective_state_update_mtp(
-        state, x, dt, A, B, C, D, z, dt_bias, dt_softplus, state_batch_indices, pad_slot_id, output,
-        disable_state_update, intermediate_states_buffer, intermediate_state_indices, cache_steps);
+        state, x, dt, A, B, C, D, z, dt_bias, dt_softplus, state_batch_indices, state_scale,
+        pad_slot_id, output, disable_state_update, intermediate_states_buffer,
+        intermediate_state_indices, intermediate_state_scales, rand_seed, cache_steps, algorithm);
   } else {
     FLASHINFER_CHECK(false,
                      "x must have 3 dimensions (single-token) or 4 dimensions (multi-token), got ",

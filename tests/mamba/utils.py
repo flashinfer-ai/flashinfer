@@ -46,7 +46,8 @@ def create_test_inputs(
         ngroups: Number of groups for B and C matrices.
         input_dtype: Data type for input tensors (x, B, C, z) - from model config.json (typically bf16).
         weight_dtype: Data type for weight tensors (D, dt, dt_bias) - hardcoded fp32 in mamba2_mixer.py.
-        state_dtype: Data type for state tensor - user configurable (bf16/fp16/fp32). Defaults to input_dtype.
+        state_dtype: Data type for state tensor - user configurable (bf16/fp16/fp32/int16). Defaults to input_dtype.
+            When int16, generates float state, quantizes to int16, and returns state_scale.
         matrixA_dtype: Data type for the A matrix - hardcoded fp32 in mamba2_mixer.py.
         generate_z: If True, generate z tensor for gating.
         generate_intermediate_states_buffer: If True, generate buffer for
@@ -65,6 +66,7 @@ def create_test_inputs(
     Returns:
         Dictionary containing all generated tensors with the following keys:
         - state_cache: (total_entries, nheads, dim, dstate)
+        - state_scale: (total_entries, nheads, dim, 1) float32 - only when state_dtype=int16, else None
         - x: (batch_size, [T,] nheads, dim) - T present if cache_steps provided
         - dt: (batch_size, [T,] nheads, dim) - T present if cache_steps provided
         - A: (nheads, dim, dstate)
@@ -113,11 +115,39 @@ def create_test_inputs(
         )
 
     total_elements = ssm_state_cache_size * state_cache_batch_stride
-    state_cache_flat = torch.randn(total_elements, dtype=state_dtype, device=device)
-    state_cache = state_cache_flat.as_strided(
-        (ssm_state_cache_size, nheads, dim, dstate),
-        (state_cache_batch_stride, dim * dstate, dstate, 1),
-    )
+    if state_dtype == torch.int16:
+        # Generate in float, quantize to int16, and produce decode scales
+        state_cache_f32 = torch.randn(
+            ssm_state_cache_size,
+            nheads,
+            dim,
+            dstate,
+            device=device,
+            dtype=torch.float32,
+        )
+        int16_max = torch.iinfo(torch.int16).max  # 32767
+        amax = torch.amax(torch.abs(state_cache_f32), dim=-1, keepdim=True)
+        encode_scale = torch.where(amax == 0.0, torch.ones_like(amax), int16_max / amax)
+        state_cache_int16 = (
+            torch.round(state_cache_f32 * encode_scale)
+            .clamp(-int16_max, int16_max)
+            .to(torch.int16)
+        )
+        state_scale = 1.0 / encode_scale  # (ssm_state_cache_size, nheads, dim, 1)
+        # Re-layout with the requested batch stride
+        state_cache_flat = torch.zeros(total_elements, dtype=torch.int16, device=device)
+        state_cache = state_cache_flat.as_strided(
+            (ssm_state_cache_size, nheads, dim, dstate),
+            (state_cache_batch_stride, dim * dstate, dstate, 1),
+        )
+        state_cache.copy_(state_cache_int16)
+    else:
+        state_cache_flat = torch.randn(total_elements, dtype=state_dtype, device=device)
+        state_cache = state_cache_flat.as_strided(
+            (ssm_state_cache_size, nheads, dim, dstate),
+            (state_cache_batch_stride, dim * dstate, dstate, 1),
+        )
+        state_scale = None
 
     # Input x: (batch_size, [T,] nheads, dim)
     if T is not None:
@@ -171,6 +201,7 @@ def create_test_inputs(
     # Build result dictionary
     result = {
         "state_cache": state_cache,
+        "state_scale": state_scale,
         "x": x,
         "dt": dt,
         "A": A,
@@ -214,6 +245,17 @@ def create_test_inputs(
             batch_size, dtype=torch.int64, device=device
         )
         result["intermediate_slot_idx"] = intermediate_slot_idx
+        # For int16 state + intermediate states, generate per-step decode scales
+        if state_dtype == torch.int16:
+            intermediate_state_scales = torch.zeros(
+                batch_size,
+                cache_steps,
+                nheads,
+                dim,
+                dtype=torch.float32,
+                device=device,
+            )
+            result["intermediate_state_scales"] = intermediate_state_scales
 
     # Optional: retrieve_parent_token for EAGLE tree attention
     if generate_retrieve_parent_token:

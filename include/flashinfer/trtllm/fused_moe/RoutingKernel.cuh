@@ -409,6 +409,9 @@ __device__ void routingPermutation(KernelParams params,
     if (params.mPtrExpandedIdxToPermutedIdx != nullptr) {
       params.mPtrExpandedIdxToPermutedIdx[expandedIdx] = permutedIdx;
     }
+    if (params.mPtrPermutedIdxToExpandedIdx != nullptr && isLocalExpert) {
+      params.mPtrPermutedIdxToExpandedIdx[permutedIdx] = expandedIdx;
+    }
     if (params.mPtrPermutedIdxToTokenIdx != nullptr && isLocalExpert) {
       params.mPtrPermutedIdxToTokenIdx[permutedIdx] = tokenIdx;
     }
@@ -728,6 +731,9 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
           isLocalExpert ? (expertOffsets[ii] + smemExpertTileOffset[expertIdx]) : int32_t{-1};
       if (params.mPtrExpandedIdxToPermutedIdx != nullptr) {
         params.mPtrExpandedIdxToPermutedIdx[expandedIdx] = permutedIdx;
+      }
+      if (params.mPtrPermutedIdxToExpandedIdx != nullptr && isLocalExpert) {
+        params.mPtrPermutedIdxToExpandedIdx[permutedIdx] = expandedIdx;
       }
       if (params.mPtrPermutedIdxToTokenIdx != nullptr && isLocalExpert) {
         params.mPtrPermutedIdxToTokenIdx[permutedIdx] = tokenIdx;

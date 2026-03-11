@@ -30,6 +30,7 @@ from .quantization.fp4_quantization import (
     gen_fp4_quantization_sm103_module,
     gen_fp4_quantization_sm110_module,
     gen_fp4_quantization_sm120_module,
+    gen_fp4_quantization_sm120f_module,
     gen_fp4_quantization_sm121_module,
     # Private functions needed by some tests
     _pad_scale_factors,
@@ -57,6 +58,7 @@ __all__ = [
     "gen_fp4_quantization_sm103_module",
     "gen_fp4_quantization_sm110_module",
     "gen_fp4_quantization_sm120_module",
+    "gen_fp4_quantization_sm120f_module",
     "gen_fp4_quantization_sm121_module",
     "_pad_scale_factors",
     "_compute_swizzled_layout_sf_size",
