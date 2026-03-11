@@ -53,6 +53,10 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
     FLASHINFER_CHECK(params.dim % NUM_COMPUTE_WARPS_PER_GROUP == 0, "DIM (", params.dim,
                      ") must be divisible by NUM_COMPUTE_WARPS_PER_GROUP (",
                      NUM_COMPUTE_WARPS_PER_GROUP, ") for vertical algorithm");
+    FLASHINFER_CHECK(!scaleState, "vertical algorithm does not support scaled (quantized) state");
+    FLASHINFER_CHECK(PHILOX_ROUNDS == 0,
+                     "vertical algorithm does not support stochastic rounding (PHILOX_ROUNDS=",
+                     PHILOX_ROUNDS, ")");
 
     constexpr int NUM_IN_STAGES = 1;
 

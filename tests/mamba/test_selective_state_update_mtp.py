@@ -30,6 +30,7 @@ _BASE_PARAMS = (
     (  64,    64,     64,  128,    1,           torch.bfloat16,     torch.float32,  True ),  # cache_steps=1
     (  64,    64,     64,  128,    8,           torch.bfloat16,     torch.float32,  True ),  # cache_steps=8
     (  64,    64,     64,  128,    4,           torch.float32,      torch.float32,  True ),  # state_dtype=f32
+    (  64,    64,     64,  128,    4,           torch.float16,      torch.float32,  True ),  # state_dtype=f16
     (  64,    64,     64,  128,    4,           torch.bfloat16,     torch.float32,  False),  # use_out_tensor=False
 )
 # fmt: on
@@ -1415,5 +1416,59 @@ class TestSelectiveStateUpdateMTPVerticalWithIntermediateStates(
             intermediate_states_buffer=inputs["intermediate_states_buffer"],
             intermediate_state_indices=inputs["intermediate_slot_idx"],
             cache_steps=inputs["cache_steps"],
+            algorithm="vertical",
+        )
+
+
+@pytest.mark.xfail(
+    reason="Vertical kernel does not support scaled (quantized) state yet"
+)
+class TestSelectiveStateUpdateMTPVerticalInt16(TestSelectiveStateUpdateMTPInt16):
+    """Test vertical algorithm with int16 quantized state (scaleState)."""
+
+    def run_kernel(self, inputs, out=None, disable_state_update=False):
+        return flashinfer.mamba.selective_state_update(
+            inputs["state_cache"],
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            D=inputs["D"],
+            z=inputs.get("z"),
+            dt_bias=inputs["dt_bias"],
+            dt_softplus=True,
+            state_batch_indices=inputs["slot_idx"],
+            pad_slot_id=-1,
+            out=out,
+            disable_state_update=disable_state_update,
+            state_scale=inputs["state_scale"],
+            algorithm="vertical",
+        )
+
+
+@pytest.mark.xfail(reason="Vertical kernel does not support stochastic rounding yet")
+class TestSelectiveStateUpdateMTPVerticalStochasticRounding(
+    TestSelectiveStateUpdateMTPStochasticRounding
+):
+    """Test vertical algorithm with stochastic rounding (PHILOX_ROUNDS > 0)."""
+
+    def run_kernel(self, inputs, out=None, disable_state_update=False):
+        return flashinfer.mamba.selective_state_update(
+            inputs["state_cache"],
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            D=inputs["D"],
+            z=inputs.get("z"),
+            dt_bias=inputs["dt_bias"],
+            dt_softplus=True,
+            state_batch_indices=inputs["slot_idx"],
+            pad_slot_id=-1,
+            out=out,
+            disable_state_update=disable_state_update,
+            rand_seed=self.RAND_SEED,
             algorithm="vertical",
         )
