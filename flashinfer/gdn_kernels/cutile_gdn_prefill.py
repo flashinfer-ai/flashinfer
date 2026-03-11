@@ -1,41 +1,24 @@
 """
-cuTile GDN Prefill Kernel for Qwen3 Next GDN - Full Implementation (v2)
+cuTile GDN Prefill Kernel for Blackwell (SM100).
 
-This module implements the cuTile-based GDN chunked prefill kernels,
-replacing the 6-stage Triton pipeline with 4 fused cuTile kernels:
+5 cuTile kernels + 1 Triton WY kernel (small-batch fallback):
+  1. ckkt_solve: fused cumsum + KKT + squaring-trick solve
+  2. fused_wy_rec: fused WY + recurrence (BH>=64, K<=128)
+  3. recurrence: standalone h-update (small batch)
+  4. output: Q-cached output with causal attention
+  5. l2norm: optional Q/K normalization
 
-1. cutile_chunk_cumsum: Per-chunk cumulative sum of g
-2. cutile_chunk_prepare: Fused KKT + solve_tril + WY recompute (3-in-1)
-3. cutile_chunk_recurrence: Hidden state recurrence (h update)
-4. cutile_chunk_output: Output computation (o = q@h + intra-chunk)
-
-Based on the Triton implementation in:
-- sglang/python/sglang/srt/layers/attention/fla/chunk.py
-
-Target: Match Triton precision, achieve 50%+ speedup on B200
+Params: Qwen3.5 TP8 (K=128, V=128, H=4/8, BT=64, bf16, fp32 state).
 """
 
-import math
 from typing import Optional, Tuple
 
 import torch
-import numpy as np
 
-# Pre-import solve_tril and l2norm from Triton for hybrid approach
 try:
-    from sglang.srt.layers.attention.fla.solve_tril import solve_tril as triton_solve_tril
-    from sglang.srt.layers.attention.fla.solve_tril import (
-        solve_tril_16x16_kernel,
-        merge_16x16_to_64x64_inverse_kernel,
-    )
     from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd as triton_l2norm_fwd
-    from sglang.srt.layers.attention.fla.wy_fast import recompute_w_u_fwd as triton_recompute_w_u_fwd
 except ImportError:
-    triton_solve_tril = None
-    solve_tril_16x16_kernel = None
-    merge_16x16_to_64x64_inverse_kernel = None
     triton_l2norm_fwd = None
-    triton_recompute_w_u_fwd = None
 
 try:
     import cuda.tile as ct
@@ -224,9 +207,7 @@ def _init_cache(B, T, H, K, V, device, dtype_k, dtype_v):
     NT = (T + BT - 1) // BT
     _tensor_cache = {
         'g_cumsum': torch.empty(B, T, H, dtype=torch.float32, device=device),
-        'A': torch.empty(B, T, H, BT, dtype=torch.float32, device=device),
         'A_inv': torch.empty(B, T, H, BT, dtype=dtype_k, device=device),
-        'Ad': torch.empty(B, T, H, 16, dtype=torch.float32, device=device),  # For cached solve
         'h': torch.empty(B, NT, H, K, V, dtype=dtype_k, device=device),
         'v_new': torch.empty(B, T, H, V, dtype=dtype_v, device=device),
         'o': torch.empty(B, T, H, V, dtype=dtype_v, device=device),
@@ -234,27 +215,6 @@ def _init_cache(B, T, H, K, V, device, dtype_k, dtype_v):
         'u': torch.empty(B, T, H, V, dtype=dtype_v, device=device),
     }
 
-
-def _solve_tril_cached(A, Ad, Ai, output_dtype):
-    """Cached solve_tril using .run() for lower Python overhead."""
-    import triton
-    B, T, H, BT = A.shape
-    BH = B * H
-    solve_tril_16x16_kernel.run(
-        A, Ad, None, None,
-        T, H, BT, False,
-        grid=(triton.cdiv(T, 16), BH),
-        warmup=False,
-        num_warps=1, num_stages=4,
-    )
-    merge_16x16_to_64x64_inverse_kernel.run(
-        A, Ad, Ai, None, None,
-        T, H, BT, False,
-        grid=(triton.cdiv(T, BT), BH),
-        warmup=False,
-        num_warps=4, num_stages=3,
-    )
-    return Ai
 
 def _recompute_w_u_cached(k, v, beta, g_cumsum, A_inv, w_out, u_out):
     """Cached WY recompute using .run() for lower Python overhead."""
@@ -335,24 +295,12 @@ def chunk_gated_delta_rule_cutile(
         ct.launch(stream, (NT, BH), cutile_output_qcached_occ2_kernel,
                   (q, k, v_new, h, g_cumsum, o, scale, T, H, K, V, 64, 64, out_BV))
 
-    # Stage 4+5+6: TritonWY + adaptive-BV rec + output
-    # Adaptive BV: tune CTA count for optimal rec throughput on B200 (148 SMs, occ2 = 296 capacity)
-    # For BH≥64 (large batch): allow up to 512 CTAs (BV=32 is more efficient than BV=64 for large BH)
-    # For BH≤8 (small batch, e.g. B=2,H=4): cap at 128 CTAs forcing BV=16 (empirically 13% faster)
-    # For 8<BH<64: keep CTAs ≤ 256 (empirically optimal for BH=16..32)
+    # Adaptive BV: tune CTA count for rec throughput on B200 (148 SMs, occ2 = 296 cap)
     rec_BV = 8
-    # For BH≤4 with long sequences (NT>32, T>2048): cap at 64 CTAs to force BV=16, using occ2
-    # V<=128: smaller V means BV=32 at 256 CTAs is feasible; V>128: allow 512 CTAs for BV=32
-    # V<=128: BV=32 at 256 CTAs is optimal (0.87 waves vs 1.73 at 512); V>128: need 512 for BV=32
-    # V<=128: BV=32 at 256 CTAs is optimal (0.87 waves vs 1.73 at 512); V>128: need 512 for BV=32
     max_rec_CTAs = (256 if V <= 128 else 512) if BH >= 64 else (64 if (BH <= 4 and NT > 32) else (128 if BH <= 8 else 256))
     while (V + rec_BV - 1) // rec_BV * BH > max_rec_CTAs and rec_BV < 64:
         rec_BV *= 2
     n_v = (V + rec_BV - 1) // rec_BV
-    rec_CTAs = n_v * BH
-    # occ3 helps for BH≤4 with small BV (≤8) at ≤128 CTAs (B=1 short sequences)
-    # BV≥16 configs use occ2 (register spilling occurs with occ3/occ4 even at BV=16)
-    rec_kernel = cutile_recurrence_kernel_bv16
 
     ct.launch(stream, (NT, BH), ckkt_kernel,
               (g, k, beta, g_cumsum, A_inv, T, H, K, 64, BK))
@@ -372,7 +320,7 @@ def chunk_gated_delta_rule_cutile(
                    initial_state, initial_state_indices, T, H, K, V, 64, fused_BV, NT, USE_INITIAL))
     else:
         _recompute_w_u_cached(k, v, beta, g_cumsum, A_inv, c['w'], c['u'])
-        ct.launch(stream, (n_v, BH), rec_kernel,
+        ct.launch(stream, (n_v, BH), cutile_recurrence_kernel_bv16,
                   (k, c['w'], c['u'], g_cumsum, h, v_new,
                    initial_state, initial_state_indices, T, H, K, V, 64, rec_BV, NT, USE_INITIAL))
     _dispatch_output()
