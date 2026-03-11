@@ -959,7 +959,7 @@ class TllmFmhaKernelFactory {
       }
       FLASHINFER_CHECK((blockSize & (blockSize - 1)) == 0,
                        "SageAttention block size must be a power of 2.");
-      return __builtin_ctz(static_cast<unsigned int>(blockSize) + 1);
+      return __builtin_ctz(static_cast<unsigned int>(blockSize)) + 1;
     };
     // Format of the hash key:
     // Bit 0  - 15: smVer
