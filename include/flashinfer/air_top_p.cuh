@@ -439,7 +439,7 @@ __global__ void AirTopPRenormApplyKernel(T const* probs, T* renormedProbs, Count
   float threadSum = 0.0f;
   for (int i = tid; i < vocabSize; i += blockDim.x) {
     T val = probs[batchId * vocabSize + i];
-    if (val > threshold) threadSum += static_cast<float>(val);
+    if (val >= threshold) threadSum += static_cast<float>(val);
   }
   typedef cub::BlockReduce<float, 1024> BlockReduce;
   __shared__ typename BlockReduce::TempStorage temp;
@@ -451,7 +451,7 @@ __global__ void AirTopPRenormApplyKernel(T const* probs, T* renormedProbs, Count
   for (int i = tid; i < vocabSize; i += blockDim.x) {
     T val = probs[batchId * vocabSize + i];
     renormedProbs[batchId * vocabSize + i] =
-        (val > threshold) ? static_cast<T>(static_cast<float>(val) * norm) : static_cast<T>(0);
+        (val >= threshold) ? static_cast<T>(static_cast<float>(val) * norm) : static_cast<T>(0);
   }
 }
 
