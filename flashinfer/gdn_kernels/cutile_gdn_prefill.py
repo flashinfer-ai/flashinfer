@@ -53,112 +53,7 @@ PAD_ZERO = ct.PaddingMode.ZERO if ct else None
 
 
 # ============================================================================
-# Kernel 4: Output computation
-# o = scale * (q @ h + causal_attn(q, k, v_new))
-# where causal_attn = (q @ k^T) * exp(g_i - g_j) * causal_mask @ v_new
-#
-# Grid: (cdiv(V, BV), NT, B*H)
-#
-# Occupancy variants are created by re-decorating the same body function.
-# ============================================================================
-def _output_kernel_body(
-    q,          # [B, T, H, K]
-    k,          # [B, T, H, K]
-    v_new,      # [B, T, H, V]
-    h,          # [B, NT, H, K, V]
-    g_cumsum,   # [B, T, H] (float32)
-    o,          # [B, T, H, V] output
-    scale: ConstFloat,
-    T: ConstInt,
-    H: ConstInt,
-    K: ConstInt,
-    V: ConstInt,
-    BT: ConstInt,
-    BK: ConstInt,
-    BV: ConstInt,
-):
-    """Compute output: o = scale * (q @ h + causal_attn(q, k, v_new)).
-
-    Grid: (cdiv(V, BV), NT, B*H)
-    """
-    i_v = ct.bid(0)
-    i_t = ct.bid(1)
-    i_bh = ct.bid(2)
-    i_b = i_bh // H
-    i_h = i_bh % H
-
-    # Accumulators
-    b_o = ct.zeros((BT, BV), dtype=ct.float32)
-    b_A = ct.zeros((BT, BT), dtype=ct.float32)
-
-    for i_k in range(ct.cdiv(K, BK)):
-        # Load q: [1, BT, 1, BK] -> [BT, BK]
-        q_tile = ct.load(
-            q, index=(i_b, i_t, i_h, i_k), shape=(1, BT, 1, BK),
-            padding_mode=PAD_ZERO,
-        ).reshape((BT, BK))
-
-        # Load k: [1, BT, 1, BK] -> [BT, BK], then transpose -> [BK, BT]
-        k_tile = ct.load(
-            k, index=(i_b, i_t, i_h, i_k), shape=(1, BT, 1, BK),
-            padding_mode=PAD_ZERO,
-        ).reshape((BT, BK))
-        k_tile_t = ct.transpose(k_tile)  # [BK, BT]
-
-        # Load h: [1, 1, 1, BK, BV] -> [BK, BV]
-        h_tile = ct.load(
-            h, index=(i_b, i_t, i_h, i_k, i_v), shape=(1, 1, 1, BK, BV),
-            padding_mode=PAD_ZERO,
-        ).reshape((BK, BV))
-
-        # o += q @ h: [BT, BK] @ [BK, BV] -> [BT, BV]
-        b_o = ct.mma(q_tile, h_tile, b_o)
-        # A += q @ k^T: [BT, BK] @ [BK, BT] -> [BT, BT]
-        b_A = ct.mma(q_tile, k_tile_t, b_A)
-
-    # Apply gating
-    b_g = ct.load(
-        g_cumsum, index=(i_b, i_t, i_h), shape=(1, BT, 1),
-        padding_mode=PAD_ZERO,
-    ).reshape((BT,)).astype(ct.float32)
-
-    # o *= exp(g)
-    b_o = b_o * ct.exp(b_g)[:, None]
-
-    # A *= exp(g_i - g_j) (safe)
-    g_i = b_g[:, None]
-    g_j = b_g[None, :]
-    g_diff = g_i - g_j
-    g_diff = ct.minimum(g_diff, 20.0)
-    b_A = b_A * ct.exp(g_diff)
-
-    # Causal mask: row >= col
-    row_idx = ct.arange(BT, dtype=ct.int32)[:, None]
-    col_idx = ct.arange(BT, dtype=ct.int32)[None, :]
-    causal_mask = row_idx >= col_idx
-    b_A = ct.where(causal_mask, b_A, 0.0)
-
-    # Load v_new: [1, BT, 1, BV] -> [BT, BV]
-    v_tile = ct.load(
-        v_new, index=(i_b, i_t, i_h, i_v), shape=(1, BT, 1, BV),
-        padding_mode=PAD_ZERO,
-    ).reshape((BT, BV))
-
-    # o = scale * (o + A @ v_new)
-    b_o = ct.mma(b_A.astype(v_tile.dtype), v_tile, b_o) * scale
-
-    # Store output: [BT, BV] -> [1, BT, 1, BV]
-    ct.store(
-        o, index=(i_b, i_t, i_h, i_v),
-        tile=b_o.astype(o.dtype).reshape((1, BT, 1, BV)),
-    )
-
-
-cutile_output_kernel_occ2 = ct.kernel(occupancy=2)(_output_kernel_body)
-
-
-# ============================================================================
-# Kernel 2aa: Output with Q-cached in registers
+# Output kernel with Q-cached in registers
 # Same grid as multiV: (NT, B*H). Caches all Q K-block tiles in registers
 # (32KB bf16 for K=256, BK=64) to eliminate Q re-loads across V-blocks.
 # Saves 16 q-tile reloads per CTA (from 20 to 4) — 33% bandwidth reduction.
@@ -436,18 +331,9 @@ def chunk_gated_delta_rule_cutile(
     ckkt_kernel = cutile_fused_ckkt_solve_v2_occ3_kernel
 
     def _dispatch_output():
-        if (V + 63) // 64 * NT * BH >= 512:
-            # BV=128 when occ=2 applies or BH≥64 (2 V-iters, 128KB budget); BV=64 otherwise
-            out_BV = 128 if (BH >= 64 or NT * BH >= 256) else 64
-            # occ=2 for NT*BH>=256 (halves waves); BV=128 fits in 128KB budget
-            out_kernel = cutile_output_qcached_occ2_kernel
-            ct.launch(stream, (NT, BH), out_kernel,
-                      (q, k, v_new, h, g_cumsum, o, scale, T, H, K, V, 64, 64, out_BV))
-        else:
-            out_blocks = (V + 63) // 64 * NT * BH
-            ct.launch(stream, ((V + 63) // 64, NT, BH),
-                      cutile_output_kernel_occ2,
-                      (q, k, v_new, h, g_cumsum, o, scale, T, H, K, V, 64, 128, 64))
+        out_BV = min(128, V)
+        ct.launch(stream, (NT, BH), cutile_output_qcached_occ2_kernel,
+                  (q, k, v_new, h, g_cumsum, o, scale, T, H, K, V, 64, 64, out_BV))
 
     # Stage 4+5+6: TritonWY + adaptive-BV rec + output
     # Adaptive BV: tune CTA count for optimal rec throughput on B200 (148 SMs, occ2 = 296 capacity)
