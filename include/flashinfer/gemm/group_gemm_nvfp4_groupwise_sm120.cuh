@@ -56,33 +56,40 @@ __global__ void compute_sm120_cutlass_nvfp4_group_gemm_args(
   if (i >= num_groups) {
     return;
   }
-  constexpr int alignment_swizzled_mn = 128;
-  constexpr int alignment_swizzled_k = ScaleGranularity * 4;
-  int sf_n = (n + alignment_swizzled_mn - 1) / alignment_swizzled_mn * alignment_swizzled_mn;
-  int swizzled_k = (k + alignment_swizzled_k - 1) / alignment_swizzled_k * alignment_swizzled_k;
-  int sf_k = swizzled_k / ScaleGranularity;
+  constexpr size_t alignment_swizzled_mn = 128;
+  constexpr size_t alignment_swizzled_k = static_cast<size_t>(ScaleGranularity) * 4;
+  size_t sf_n = (static_cast<size_t>(n) + alignment_swizzled_mn - 1) / alignment_swizzled_mn *
+                alignment_swizzled_mn;
+  size_t swizzled_k = (static_cast<size_t>(k) + alignment_swizzled_k - 1) / alignment_swizzled_k *
+                      alignment_swizzled_k;
+  size_t sf_k = swizzled_k / static_cast<size_t>(ScaleGranularity);
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.wait;");
   asm volatile("griddepcontrol.launch_dependents;");
 #endif
   int m_offset = m_indptr[i];
   int m_offset_next = m_indptr[i + 1];
-  int m = m_offset_next - m_offset;
+  size_t m = static_cast<size_t>(m_offset_next) - static_cast<size_t>(m_offset);
   // This formulation ensures that sf_m_offset_next - sf_m_offset >= m_offset_next - m_offset
-  int sf_m_offset =
-      (m_offset + i * (alignment_swizzled_mn - 1)) / alignment_swizzled_mn * alignment_swizzled_mn;
+  size_t sf_m_offset =
+      (static_cast<size_t>(m_offset) + static_cast<size_t>(i) * (alignment_swizzled_mn - 1)) /
+      alignment_swizzled_mn * alignment_swizzled_mn;
 
   problem_sizes[i] = ProblemShape(m, n, k);
   stride_A[i] = cutlass::make_cute_packed_stride(StrideA{}, {m, k, 1});
   stride_B[i] = cutlass::make_cute_packed_stride(StrideB{}, {n, k, 1});
   stride_D[i] = cutlass::make_cute_packed_stride(StrideD{}, {m, n, 1});
-  A_ptr[i] = safe_inc_ptr(A, int64_t(m_offset) * int64_t(k));
-  B_ptr[i] = safe_inc_ptr(B, int64_t(i) * int64_t(n) * int64_t(k));
-  D_ptr[i] = safe_inc_ptr(D, int64_t(m_offset) * int64_t(n));
-  layout_SFA[i] = ScaleConfig::tile_atom_to_shape_SFA(make_shape(m, sf_n, swizzled_k, 1));
-  SFA_ptr[i] = safe_inc_ptr(SFA, int64_t(sf_m_offset) * int64_t(sf_k));
-  layout_SFB[i] = ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, sf_n, swizzled_k, 1));
-  SFB_ptr[i] = safe_inc_ptr(SFB, int64_t(i) * int64_t(sf_n) * int64_t(sf_k));
+  A_ptr[i] = safe_inc_ptr(A, static_cast<size_t>(m_offset) * static_cast<size_t>(k));
+  B_ptr[i] =
+      safe_inc_ptr(B, static_cast<size_t>(i) * static_cast<size_t>(n) * static_cast<size_t>(k));
+  D_ptr[i] = safe_inc_ptr(D, static_cast<size_t>(m_offset) * static_cast<size_t>(n));
+  layout_SFA[i] = ScaleConfig::tile_atom_to_shape_SFA(
+      make_shape(m, static_cast<int>(sf_n), static_cast<int>(swizzled_k), 1));
+  SFA_ptr[i] = safe_inc_ptr(SFA, static_cast<size_t>(sf_m_offset) * static_cast<size_t>(sf_k));
+  layout_SFB[i] = ScaleConfig::tile_atom_to_shape_SFB(
+      make_shape(m, static_cast<int>(sf_n), static_cast<int>(swizzled_k), 1));
+  SFB_ptr[i] = safe_inc_ptr(
+      SFB, static_cast<size_t>(i) * static_cast<size_t>(sf_n) * static_cast<size_t>(sf_k));
 }
 
 template <int TileM, int TileN, int TileK, typename DTypeInA, typename DTypeInB, typename DTypeSFA,

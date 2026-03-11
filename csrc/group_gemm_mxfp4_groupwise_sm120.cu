@@ -84,7 +84,7 @@ template <int TileM, int TileN, int TileK, typename DTypeInA, typename DTypeInB,
 cudaError_t CutlassMXFP4GroupwiseScaledGroupGEMMSM120(
     void* int_buffer, size_t int_buffer_size_in_bytes, void* float_buffer,
     size_t float_buffer_size_in_bytes, DTypeInA* A, DTypeInB* B, DTypeSFA* SFA, DTypeSFB* SFB,
-    DTypeOut* D, int* m_indptr, int n, int k, int num_groups, cudaStream_t stream);
+    DTypeOut* D, int* m_indptr, int n, int k, int num_groups, cudaStream_t stream, int device_id);
 
 }  // namespace group_gemm
 }  // namespace flashinfer
@@ -95,8 +95,9 @@ void CutlassGroupGemmMXFP4GroupwiseScaledSM120(TensorView int_workspace_buffer,
                                                TensorView D, TensorView m_indptr, int64_t n,
                                                int64_t k, int64_t tile_m, int64_t tile_n,
                                                int64_t tile_k) {
-  ffi::CUDADeviceGuard device_guard(float_workspace_buffer.device().device_id);
-  auto stream = get_stream(A.device());
+  int device_id = float_workspace_buffer.device().device_id;
+  ffi::CUDADeviceGuard device_guard(device_id);
+  auto stream = get_stream(float_workspace_buffer.device());
   int num_groups = m_indptr.size(0) - 1;
   DISPATCH_DLPACK_INPUT_OUTPUT_DTYPE(
       A.dtype(), B.dtype(), SFA.dtype(), SFB.dtype(), D.dtype(), c_type_in_a, c_type_in_b,
@@ -122,7 +123,7 @@ void CutlassGroupGemmMXFP4GroupwiseScaledSM120(TensorView int_workspace_buffer,
                     static_cast<cutlass_t_sf_a*>(SFA.data_ptr()),
                     static_cast<cutlass_t_sf_b*>(SFB.data_ptr()),
                     static_cast<cutlass_t_out*>(D.data_ptr()),
-                    static_cast<int*>(m_indptr.data_ptr()), n, k, num_groups, stream);
+                    static_cast<int*>(m_indptr.data_ptr()), n, k, num_groups, stream, device_id);
                 return status == cudaSuccess;
               } else {
                 TVM_FFI_ICHECK(false) << "Unsupported input data type";
