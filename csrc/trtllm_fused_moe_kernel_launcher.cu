@@ -1333,19 +1333,6 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
             int64_t tile_tokens_dim, int64_t routing_method_type, bool use_shuffled_weight,
             int64_t weight_layout, ActivationType activation_type, btg::Dtype dtype_act,
             btg::Dtype dtype_weights) {
-    static const std::tuple<int, int> device_props = [this] {
-      int major, minor;
-      cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
-                             hidden_states.device().device_id);
-      cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor,
-                             hidden_states.device().device_id);
-      return std::make_tuple(major, minor);
-    }();
-
-    TVM_FFI_ICHECK(std::get<0>(device_props) == 10 || std::get<0>(device_props) == 12)
-        << "This kernel requires SM 10.x or SM 12.x architecture. Current device has SM "
-        << std::get<0>(device_props) << std::get<1>(device_props);
-
     // Set data types
     args->mDtypeElt = dtype_act;
     args->mDtypeOut = btg::Dtype::Bfloat16;  // Output is always BF16 for FP4
