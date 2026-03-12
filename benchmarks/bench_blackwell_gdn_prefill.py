@@ -436,19 +436,19 @@ def print_results_table(results: List[dict], title: str = "Benchmark Results"):
 
 def main():
     parser = argparse.ArgumentParser(description="GDN Performance Benchmark")
-    parser.add_argument("--batch-size", "-b", type=int, default=1, help="Batch size")
+    parser.add_argument("--batch-size", "-b", type=int, default=4, help="Batch size")
     parser.add_argument(
-        "--seq-len", "-t", type=int, default=8192, help="Sequence length"
+        "--seq-len", "-t", type=int, default=4096, help="Sequence length"
     )
     parser.add_argument(
         "--num-qk-heads",
         "-nqk",
         type=int,
-        default=96,
+        default=32,
         help="Number of qk attention heads",
     )
     parser.add_argument(
-        "--num-v-heads", "-nv", type=int, default=96, help="Number of v attention heads"
+        "--num-v-heads", "-nv", type=int, default=32, help="Number of v attention heads"
     )
     parser.add_argument(
         "--head-dim", "-d", type=int, default=128, help="Head dimension"

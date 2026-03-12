@@ -18,7 +18,20 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from flashinfer.gdn_kernels.blackwell_prefill.gdn import chunk_gated_delta_rule
+from flashinfer.utils import (
+    is_sm100a_supported,
+    is_sm110a_supported,
+)
+
+try:
+    from flashinfer.gdn_kernels.blackwell_prefill.gdn import (
+        chunk_gated_delta_rule,
+    )
+
+    GDN_BLACKWELL_PREFILL_CUTEDSL = True
+except ImportError:
+    GDN_BLACKWELL_PREFILL_CUTEDSL = False
+
 
 testtype = torch.float16
 
@@ -66,6 +79,17 @@ def recurrent_gated_delta_rule_ref(
     return o, h
 
 
+def _skip_if_gdn_blackwell_prefill_not_available():
+    """Skip test if GDN Blackwell prefill CuTeDSL kernels not available or not Blackwell (SM100+) architecture."""
+    if not GDN_BLACKWELL_PREFILL_CUTEDSL:
+        pytest.skip("GDN Blackwell prefill CuTeDSL kernels not available")
+
+    if not is_sm100a_supported(torch.device("cuda")) and not is_sm110a_supported(
+        torch.device("cuda")
+    ):
+        pytest.skip("Only SM100A and SM110A are supported on this device")
+
+
 @pytest.fixture(autouse=True)
 def cuda_sync_and_cleanup():
     """Ensure CUDA operations are synchronized before and after each test."""
@@ -95,6 +119,8 @@ class TestGDNFixedLength:
     )
     def test_fixlen_output(self, set_seed, H, D, T, B, dtype):
         """Test fixed-length GDN output correctness."""
+        _skip_if_gdn_blackwell_prefill_not_available()
+
         device = "cuda"
 
         q = torch.randn((B, T, H, D), dtype=dtype)
@@ -161,6 +187,9 @@ class TestGDNFixedLength:
     )
     def test_fixlen_state(self, set_seed, H, D, T, B, dtype):
         """Test fixed-length GDN state output correctness."""
+
+        _skip_if_gdn_blackwell_prefill_not_available()
+
         device = "cuda"
 
         q = torch.randn((B, T, H, D), dtype=dtype)
@@ -229,6 +258,9 @@ class TestGDNVariableLength:
     )
     def test_varlen_output(self, set_seed, H, D, cu_seqlens, dtype):
         """Test variable-length GDN output correctness."""
+
+        _skip_if_gdn_blackwell_prefill_not_available()
+
         device = "cuda"
 
         cu_seqlens_tensor = torch.tensor(cu_seqlens, device=device)
@@ -291,6 +323,9 @@ class TestGDNVariableLength:
     )
     def test_varlen_state(self, set_seed, H, D, cu_seqlens, dtype):
         """Test variable-length GDN state output correctness."""
+
+        _skip_if_gdn_blackwell_prefill_not_available()
+
         device = "cuda"
 
         cu_seqlens_tensor = torch.tensor(cu_seqlens, device=device)
@@ -361,6 +396,9 @@ class TestGDNFixedLengthGVA:
     )
     def test_fixlen_gva_output(self, set_seed, H_QK, H_V, D, T, B, dtype):
         """Test fixed-length GVA output correctness."""
+
+        _skip_if_gdn_blackwell_prefill_not_available()
+
         device = "cuda"
 
         q = torch.randn((B, T, H_QK, D), dtype=dtype)
@@ -426,6 +464,9 @@ class TestGDNFixedLengthGVA:
     )
     def test_fixlen_gva_state(self, set_seed, H_QK, H_V, D, T, B, dtype):
         """Test fixed-length GVA state output correctness."""
+
+        _skip_if_gdn_blackwell_prefill_not_available()
+
         device = "cuda"
 
         q = torch.randn((B, T, H_QK, D), dtype=dtype)
@@ -499,6 +540,9 @@ class TestGDNVariableLengthGVA:
     )
     def test_varlen_gva_output(self, set_seed, H_QK, H_V, D, cu_seqlens, dtype):
         """Test variable-length GVA output correctness."""
+
+        _skip_if_gdn_blackwell_prefill_not_available()
+
         device = "cuda"
 
         cu_seqlens_tensor = torch.tensor(cu_seqlens, device=device)
@@ -565,6 +609,9 @@ class TestGDNVariableLengthGVA:
     )
     def test_varlen_gva_state(self, set_seed, H_QK, H_V, D, cu_seqlens, dtype):
         """Test variable-length GVA state output correctness."""
+
+        _skip_if_gdn_blackwell_prefill_not_available()
+
         device = "cuda"
 
         cu_seqlens_tensor = torch.tensor(cu_seqlens, device=device)
@@ -631,6 +678,7 @@ class TestGDNMultipleRuns:
 
     def test_consecutive_runs_deterministic(self, set_seed):
         """Test that multiple consecutive runs produce identical results."""
+        _skip_if_gdn_blackwell_prefill_not_available()
         H, D, T, B = 16, 128, 256, 4
         dtype = testtype
         device = "cuda"
