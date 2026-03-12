@@ -21,9 +21,14 @@ import torch
 
 import flashinfer
 from flashinfer.testing.utils import bench_gpu_time
+from flashinfer.utils import get_compute_capability
 
 
 def bench_groupwise_grouped_gemm_nvfp4_blackwell(group_size, m, n, k, out_dtype):
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    if compute_capability[0] not in [12]:
+        print("group_gemm_nvfp4_nt_groupwise is only supported on SM120/SM121 GPUs.")
+        return
     torch.random.manual_seed(0)
     assert n % 8 == 0
     assert k % 128 == 0

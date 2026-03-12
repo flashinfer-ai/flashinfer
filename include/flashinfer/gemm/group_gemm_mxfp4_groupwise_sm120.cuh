@@ -266,8 +266,8 @@ cudaError_t CutlassMXFP4GroupwiseScaledGroupGEMMSM120(
     auto workspace_ptr = float_allocator.aligned_alloc<void>(                                                                                                          \
         workspace_size, 16, "sm120_groupwise_group_gemm_float_workspace");                                                                                             \
     CUTLASS_CHECK(gemm.can_implement(arguments));                                                                                                                      \
-    CUTLASS_CHECK(gemm.initialize(                                                                                                                                     \
-        arguments, workspace_ptr)); /* Disable PDL until CUTLASS is updated to 4.3 or later */                                                                         \
+    CUTLASS_CHECK(gemm.initialize(arguments, workspace_ptr));                                                                                                          \
+    /* Disable PDL until CUTLASS is updated to 4.3 or later */                                                                                                         \
     CUTLASS_CHECK(gemm.run(stream, /*cuda_adapter=*/nullptr, /*launch_with_pdl=*/false));                                                                              \
     return cudaSuccess;                                                                                                                                                \
   }                                                                                                                                                                    \

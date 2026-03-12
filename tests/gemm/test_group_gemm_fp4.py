@@ -46,7 +46,7 @@ def _quantize_nvfp4_group_inputs(
     a_float: torch.Tensor,
     b_float: torch.Tensor,
     m_indptr: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     alignment = 128
     a_fp4_chunks = []
     a_scale_chunks = []
