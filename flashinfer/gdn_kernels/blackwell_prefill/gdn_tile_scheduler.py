@@ -34,7 +34,9 @@ class GdnStaticTileSchedulerParams:
         ):
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
-        return GdnStaticTileSchedulerParams(*(tuple(obj_list)), loc=self._loc)
+        return GdnStaticTileSchedulerParams(
+            *(tuple(obj_list)), loc=self._loc, ip=self._ip
+        )
 
 
 def create_gdn_static_tile_scheduler_params(
