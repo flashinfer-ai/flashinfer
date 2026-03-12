@@ -38,7 +38,6 @@ import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
 from .utils import (
-    TRTLLM_ENABLE_PDL,
     atomic_add_func,
     blk_reduce_bf16,
     blk_reduce_fp16,
@@ -362,6 +361,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         cluster_shape_mn: Tuple[int, int],
         use_blkred: bool = False,
         raster_along_m: bool = False,
+        enable_pdl: bool = True,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel.
 
@@ -384,6 +384,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         """
 
         self.sf_vec_size = sf_vec_size
+        self.enable_pdl = enable_pdl
         self.acc_dtype = cutlass.Float32
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
@@ -949,7 +950,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             smem=self.shared_storage.size_in_bytes(),  # type: ignore[attr-defined]
             stream=stream,
             min_blocks_per_mp=1,
-            use_pdl=TRTLLM_ENABLE_PDL,
+            use_pdl=self.enable_pdl,
         )
         return
 

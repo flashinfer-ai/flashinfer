@@ -290,6 +290,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         local_expert_offset: int = 0,
         use_fused_finalize: bool = True,
         output_dtype: torch.dtype = torch.bfloat16,
+        enable_pdl: bool = True,
     ):
         self.forward_impl = forward_impl
         self.num_experts = num_experts
@@ -298,6 +299,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.local_expert_offset = local_expert_offset
         self.use_fused_finalize = use_fused_finalize
         self.output_dtype = output_dtype
+        self.enable_pdl = enable_pdl
 
     def __hash__(self):
         return hash(
@@ -403,6 +405,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             output_dtype=self.output_dtype,
             use_fused_finalize=self.use_fused_finalize,
             moe_output=moe_output,
+            enable_pdl=self.enable_pdl,
             **kwargs,
         )
 

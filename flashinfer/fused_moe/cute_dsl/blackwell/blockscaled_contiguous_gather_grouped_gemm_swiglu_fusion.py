@@ -41,7 +41,6 @@ from cutlass.cutlass_dsl import Int32
 
 from .custom_pipeline import PipelineCpAsyncUmma
 from .utils import (
-    TRTLLM_ENABLE_PDL,
     fmin,
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
@@ -401,6 +400,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         vectorized_f32: bool,
         topk: cutlass.Int64,
         raster_along_m: bool = False,
+        enable_pdl: bool = True,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
         gather operation and SwiGLU fusion.
@@ -439,6 +439,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         """
 
         self.sf_vec_size = sf_vec_size
+        self.enable_pdl = enable_pdl
         self.topk = topk
         self.acc_dtype = cutlass.Float32
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
@@ -1079,7 +1080,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             smem=self.shared_storage.size_in_bytes(),  # type: ignore[union-attr]
             stream=stream,
             min_blocks_per_mp=1,
-            use_pdl=TRTLLM_ENABLE_PDL,
+            use_pdl=self.enable_pdl,
         )
         return
 
