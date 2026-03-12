@@ -48,9 +48,9 @@ class CompilationContext:
                 from flashinfer.jit.cpp_ext import is_cuda_version_at_least
                 if is_cuda_version_at_least("13.0"):
                     return (major, str(minor) + "f")
-            except ImportError:
+            except (ImportError, RuntimeError, ValueError):
                 logger.debug(
-                    "Could not import is_cuda_version_at_least; "
+                    "Could not determine CUDA version; "
                     "falling back to 'a' suffix for SM %d.%d", major, minor
                 )
             return (major, str(minor) + "a")
