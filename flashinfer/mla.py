@@ -765,6 +765,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
             sinks,
             None,  # cum_seq_lens_q
             skip_softmax_threshold_scale_factor,
+            True,  # uses_shared_paged_kv_idx
         )
 
         return out
