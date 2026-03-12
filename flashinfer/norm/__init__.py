@@ -515,10 +515,8 @@ except ImportError:
 # cuDNN OSS fused RMSNorm + SiLU engine (SM80+, optimized for VAE shapes on B200)
 try:
     from ..cudnn.norm import cudnn_fused_rmsnorm_silu as _cudnn_fused_rmsnorm_silu
-    from ..cudnn.norm import CUDNN_AVAILABLE as _CUDNN_NORM_AVAILABLE
 except ImportError:
     _cudnn_fused_rmsnorm_silu = None  # type: ignore[misc,assignment]
-    _CUDNN_NORM_AVAILABLE = False
 
 # Problem sizes with sweep-tuned knob configurations (SM100 / B200).
 # Other (C, token) combinations use a conservative fallback heuristic.
@@ -585,12 +583,6 @@ def fused_rmsnorm_silu(
     """
     import warnings
     from ..utils import get_compute_capability
-
-    if not _CUDNN_NORM_AVAILABLE:
-        raise RuntimeError(
-            "fused_rmsnorm_silu requires nvidia-cudnn-frontend. "
-            "Install with: pip install nvidia-cudnn-frontend"
-        )
 
     if not input.is_cuda:
         raise RuntimeError("fused_rmsnorm_silu requires CUDA tensors")
