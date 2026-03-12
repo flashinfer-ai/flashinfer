@@ -215,6 +215,11 @@ def bench_trtllm_fmha_wrapper(
         )
     else:
         io = q.numel() * q.element_size() + kv_cache.numel() * kv_cache.element_size()
+    if kv_block_scales is not None:
+        io += (
+            kv_block_scales[0].numel() * kv_block_scales[0].element_size()
+            + kv_block_scales[1].numel() * kv_block_scales[1].element_size()
+        )
     print(
         f"batch_size={batch_size}, seq_len={max_seq_len}, num_qo_heads={num_qo_heads}, num_kv_heads={num_kv_heads}, head_dim={head_dim}, page_size={page_size}"
     )
