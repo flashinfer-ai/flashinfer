@@ -372,8 +372,12 @@ def test_cute_dsl_vs_trtllm_gen(batch_size, seq_len_k, page_size=64):
         bmm2_scale=1.0,
     )
 
-    out_trtllm = trtllm_batch_decode_with_kv_cache_mla(**common_args, backend="trtllm-gen")
-    out_cute_dsl = trtllm_batch_decode_with_kv_cache_mla(**common_args, backend="cute-dsl")
+    out_trtllm = trtllm_batch_decode_with_kv_cache_mla(
+        **common_args, backend="trtllm-gen"
+    )
+    out_cute_dsl = trtllm_batch_decode_with_kv_cache_mla(
+        **common_args, backend="cute-dsl"
+    )
 
     torch.testing.assert_close(
         out_cute_dsl.to(torch.float32),

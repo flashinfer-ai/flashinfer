@@ -377,7 +377,7 @@ def cute_dsl_mla_decode(
     if is_workspace_size_zero:
         workspace_bytes = None
     else:
-        workspace_bytes = workspace_buffer[: workspace_size]
+        workspace_bytes = workspace_buffer[:workspace_size]
     # Output buffer: contiguous [B, q_len, H, D].
     # Kernel reinterprets to [H, D, q_len, B] internally via zero-cost make_tensor.
     out_dtype = q_dtype
