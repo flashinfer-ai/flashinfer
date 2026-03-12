@@ -726,6 +726,7 @@ def gated_delta_rule_decode_kernel_seqlen1(
     gA_log: cute.Tensor,
     gdt_bias: cute.Tensor,
     gH: cute.Tensor,
+    gH_slot_indices: cute.Tensor,
     gO: cute.Tensor,
     scale: cutlass.Float32,
     softplus_beta: cutlass.Float32,
@@ -749,6 +750,7 @@ def gated_delta_rule_decode_kernel_seqlen1(
     batch_idx = bidx // HV
     value_head_idx = bidx % HV
     query_head_idx = value_head_idx // (HV // H)
+    pool_batch_idx = gH_slot_indices[batch_idx]
 
     smem = utils.SmemAllocator()
 
@@ -787,7 +789,7 @@ def gated_delta_rule_decode_kernel_seqlen1(
         cutlass.Float32, cute.make_layout((32, 4), stride=(1, 32))
     )
 
-    h_global = gH[(batch_idx, value_head_idx, None, None)]
+    h_global = gH[(pool_batch_idx, value_head_idx, None, None)]
 
     # Launch first 2 async loads
     load_h_chunk_async(h_sh_chunk0, h_global, tidx, 0)
@@ -824,7 +826,7 @@ def gated_delta_rule_decode_kernel_seqlen1(
     for i in cutlass.range_constexpr(32):
         k_chunk[i] = k_sh[k_base + i]
 
-    h_out = gH[(batch_idx, value_head_idx, None, None)]
+    h_out = gH[(pool_batch_idx, value_head_idx, None, None)]
     o_head = gO[(batch_idx, 0, value_head_idx, None)]
 
     # ========================================================================
@@ -1101,7 +1103,8 @@ def gated_delta_rule_decode_kernel_seqlen234_unified(
     gb: cute.Tensor,  # [B, T=2/3/4, HV]
     gA_log: cute.Tensor,  # [HV]
     gdt_bias: cute.Tensor,  # [HV]
-    gH: cute.Tensor,  # [B, HV, V=128, K=128] - K-fast layout
+    gH: cute.Tensor,  # [pool, HV, V=128, K=128] - K-fast layout
+    gH_slot_indices: cute.Tensor,  # [B] indices mapping batch -> pool slot
     gO: cute.Tensor,  # [B, T=2/3/4, HV, V=128]
     scale: cutlass.Float32,
     softplus_beta: cutlass.Float32,
@@ -1126,6 +1129,7 @@ def gated_delta_rule_decode_kernel_seqlen234_unified(
     batch_idx = bidx // HV
     value_head_idx = bidx % HV
     query_head_idx = value_head_idx // (HV // H)
+    pool_batch_idx = gH_slot_indices[batch_idx]
 
     warp_idx = tidx // 32
     lane_idx = tidx % 32
@@ -1213,7 +1217,7 @@ def gated_delta_rule_decode_kernel_seqlen234_unified(
         )
 
     # Upfront H loading
-    h_global = gH[(batch_idx, value_head_idx, None, None)]
+    h_global = gH[(pool_batch_idx, value_head_idx, None, None)]
     load_h_chunk_async(h_sh_chunk0, h_global, tidx, 0)
     nvvm.cp_async_commit_group()
     load_h_chunk_async(h_sh_chunk1, h_global, tidx, 32)
@@ -1275,7 +1279,7 @@ def gated_delta_rule_decode_kernel_seqlen234_unified(
         load_v_to_smem(v_head3, v_sh3, tidx)
 
     # Output pointers - tokens 0, 1 always
-    h_out = gH[(batch_idx, value_head_idx, None, None)]
+    h_out = gH[(pool_batch_idx, value_head_idx, None, None)]
     o_head0 = gO[(batch_idx, 0, value_head_idx, None)]
     o_head1 = gO[(batch_idx, 1, value_head_idx, None)]
 
@@ -1485,6 +1489,7 @@ def gated_delta_rule_launch_seqlen1(
     mA_log: cute.Tensor,
     mdt_bias: cute.Tensor,
     mH: cute.Tensor,
+    mH_slot_indices: cute.Tensor,
     mO: cute.Tensor,
     scale: cutlass.Float32,
     softplus_beta: cutlass.Float32,
@@ -1504,6 +1509,7 @@ def gated_delta_rule_launch_seqlen1(
         mA_log,
         mdt_bias,
         mH,
+        mH_slot_indices,
         mO,
         scale,
         softplus_beta,
@@ -1531,6 +1537,7 @@ def gated_delta_rule_decode_kernel_seqlen1_lowBS_1chunk(
     gA_log: cute.Tensor,
     gdt_bias: cute.Tensor,
     gH: cute.Tensor,
+    gH_slot_indices: cute.Tensor,
     gO: cute.Tensor,
     scale: cutlass.Float32,
     softplus_beta: cutlass.Float32,
@@ -1555,6 +1562,7 @@ def gated_delta_rule_decode_kernel_seqlen1_lowBS_1chunk(
 
     query_head_idx = value_head_idx // (HV // H)
     v_row_base = v_chunk_idx * 32
+    pool_batch_idx = gH_slot_indices[batch_idx]
 
     smem = utils.SmemAllocator()
 
@@ -1580,7 +1588,7 @@ def gated_delta_rule_decode_kernel_seqlen1_lowBS_1chunk(
         cutlass.Float32, cute.make_layout((32, 4), stride=(1, 32))
     )
 
-    h_global = gH[(batch_idx, value_head_idx, None, None)]
+    h_global = gH[(pool_batch_idx, value_head_idx, None, None)]
 
     load_h_chunk_async(h_sh_chunk, h_global, tidx, v_row_base)
     nvvm.cp_async_commit_group()
@@ -1610,7 +1618,7 @@ def gated_delta_rule_decode_kernel_seqlen1_lowBS_1chunk(
     for i in cutlass.range_constexpr(32):
         k_chunk[i] = k_sh[k_base + i]
 
-    h_out = gH[(batch_idx, value_head_idx, None, None)]
+    h_out = gH[(pool_batch_idx, value_head_idx, None, None)]
     o_head = gO[(batch_idx, 0, value_head_idx, None)]
 
     nvvm.cp_async_wait_group(0)
@@ -1685,6 +1693,7 @@ def gated_delta_rule_launch_seqlen1_lowBS_1chunk(
     mA_log: cute.Tensor,
     mdt_bias: cute.Tensor,
     mH: cute.Tensor,
+    mH_slot_indices: cute.Tensor,
     mO: cute.Tensor,
     scale: cutlass.Float32,
     softplus_beta: cutlass.Float32,
@@ -1705,6 +1714,7 @@ def gated_delta_rule_launch_seqlen1_lowBS_1chunk(
         mA_log,
         mdt_bias,
         mH,
+        mH_slot_indices,
         mO,
         scale,
         softplus_beta,
@@ -1727,6 +1737,7 @@ def gated_delta_rule_launch_seqlen2(
     mA_log: cute.Tensor,
     mdt_bias: cute.Tensor,
     mH: cute.Tensor,
+    mH_slot_indices: cute.Tensor,
     mO: cute.Tensor,
     scale: cutlass.Float32,
     softplus_beta: cutlass.Float32,
@@ -1746,6 +1757,7 @@ def gated_delta_rule_launch_seqlen2(
         mA_log,
         mdt_bias,
         mH,
+        mH_slot_indices,
         mO,
         scale,
         softplus_beta,
@@ -1769,6 +1781,7 @@ def gated_delta_rule_launch_seqlen3(
     mA_log: cute.Tensor,
     mdt_bias: cute.Tensor,
     mH: cute.Tensor,
+    mH_slot_indices: cute.Tensor,
     mO: cute.Tensor,
     scale: cutlass.Float32,
     softplus_beta: cutlass.Float32,
@@ -1788,6 +1801,7 @@ def gated_delta_rule_launch_seqlen3(
         mA_log,
         mdt_bias,
         mH,
+        mH_slot_indices,
         mO,
         scale,
         softplus_beta,
@@ -1811,6 +1825,7 @@ def gated_delta_rule_launch_seqlen4(
     mA_log: cute.Tensor,
     mdt_bias: cute.Tensor,
     mH: cute.Tensor,
+    mH_slot_indices: cute.Tensor,
     mO: cute.Tensor,
     scale: cutlass.Float32,
     softplus_beta: cutlass.Float32,
@@ -1830,6 +1845,7 @@ def gated_delta_rule_launch_seqlen4(
         mA_log,
         mdt_bias,
         mH,
+        mH_slot_indices,
         mO,
         scale,
         softplus_beta,
@@ -1921,8 +1937,10 @@ def gated_delta_rule(
         k: Key tensor [B, T, H, K]
         v: Value tensor [B, T, HV, V]
         b: Beta gate input [B, T, HV]
-        initial_state_source: H state [B, HV, V, K] (K-fast layout), modified in-place
-        initial_state_indices: Not used (for compatibility)
+        initial_state_source: H state [pool_size, HV, V, K] (K-fast layout), modified in-place.
+            For the direct path (no pool), pass [B, HV, V, K] and omit initial_state_indices.
+        initial_state_indices: Per-batch indices [B] (int32) mapping each batch entry to its
+            slot in initial_state_source. When None, uses identity mapping (arange(B)).
         use_qk_l2norm_in_kernel: Whether to L2-normalize Q/K in kernel (default: True)
         scale: Optional attention scale (default: 1/sqrt(K))
 
@@ -1963,9 +1981,18 @@ def gated_delta_rule(
     assert T in [1, 2, 3, 4], f"Supported T=1,2,3,4, got T={T}"
     HV = v.shape[2]
     V = v.shape[3]
+    pool_size = initial_state_source.shape[0]
 
     if scale is None:
         scale = 1.0 / math.sqrt(K)
+
+    # Resolve indices: identity mapping when not provided
+    if initial_state_indices is None:
+        h_slot_indices = torch.arange(B, dtype=torch.int32, device=q.device)
+    elif initial_state_indices.dtype != torch.int32:
+        h_slot_indices = initial_state_indices.to(torch.int32)
+    else:
+        h_slot_indices = initial_state_indices
 
     output = torch.empty(B, T, HV, V, device=q.device, dtype=q.dtype)
 
@@ -1977,6 +2004,7 @@ def gated_delta_rule(
     A_log_ = from_dlpack(A_log, assumed_align=32, enable_tvm_ffi=True)
     dt_bias_ = from_dlpack(dt_bias, assumed_align=32, enable_tvm_ffi=True)
     h_ = from_dlpack(initial_state_source, assumed_align=32, enable_tvm_ffi=True)
+    h_slot_indices_ = from_dlpack(h_slot_indices, assumed_align=32, enable_tvm_ffi=True)
     o_ = from_dlpack(output, assumed_align=32, enable_tvm_ffi=True)
 
     scale_f32 = cutlass.Float32(scale)
@@ -1986,8 +2014,8 @@ def gated_delta_rule(
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-    # Check cache - include all shape dimensions to avoid incorrect reuse
-    cache_key = (T, B, H, HV, K, V)
+    # Check cache - include pool_size so pool and direct paths don't collide
+    cache_key = (T, B, H, HV, K, V, pool_size)
     if cache_key not in _compiled_kernels:
         # Select and compile the appropriate kernel
         if T == 1 and B <= 4:
@@ -2011,6 +2039,7 @@ def gated_delta_rule(
             A_log_,
             dt_bias_,
             h_,
+            h_slot_indices_,
             o_,
             scale_f32,
             softplus_beta_f32,
@@ -2030,6 +2059,7 @@ def gated_delta_rule(
         A_log_,
         dt_bias_,
         h_,
+        h_slot_indices_,
         o_,
         scale_f32,
         softplus_beta_f32,

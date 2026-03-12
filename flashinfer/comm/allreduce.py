@@ -14,6 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 """
 Unified AllReduce Fusion API
 
@@ -162,7 +166,7 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             )
             return True
         except ValueError as e:
-            print(f"Workspace is insufficient for problem size. {e}")
+            logger.warning("Workspace is insufficient for problem size. %s", e)
             return False
 
     def destroy(self) -> None:
