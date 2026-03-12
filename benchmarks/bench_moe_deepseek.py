@@ -68,10 +68,9 @@ EP_CONFIGS = {
 
 
 def is_sm100_family():
-    """Check for SM100 family (Blackwell: SM100, SM103, SM110).
+    """Check for SM100 family (Blackwell: SM100, SM103).
 
-    CuteDSL MoE NVFP4 kernels are optimized for SM100 architecture.
-    SM120+ (Rubin) may have different shared memory/TMEM configurations.
+    CuteDSL MoE NVFP4 kernels are optimized for SM10x architecture.
     """
     if not torch.cuda.is_available():
         return False
