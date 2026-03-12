@@ -10,7 +10,12 @@ import pytest
 import torch
 
 import flashinfer
-from flashinfer.utils import is_cvt_rs_supported
+from flashinfer.utils import is_cvt_rs_supported, is_sm100a_supported
+
+_requires_sm100 = pytest.mark.skipif(
+    not is_sm100a_supported(torch.device("cuda")),
+    reason="Vertical MTP kernel requires SM100+ (Blackwell)",
+)
 
 from .triton_reference.selective_state_update import selective_state_update_triton
 from .utils import create_test_inputs, clone_preserving_strides
@@ -1375,6 +1380,7 @@ class TestSelectiveStateUpdateMTPStochasticRoundingWithIntermediateStates(
             assert states_match, f"Intermediate state at step {t} mismatch"
 
 
+@_requires_sm100
 class TestSelectiveStateUpdateMTPVertical(TestSelectiveStateUpdateMTP):
     """Test multi-token selective_state_update with the vertical algorithm.
 
@@ -1402,6 +1408,7 @@ class TestSelectiveStateUpdateMTPVertical(TestSelectiveStateUpdateMTP):
         )
 
 
+@_requires_sm100
 class TestSelectiveStateUpdateMTPVerticalWithIntermediateStates(
     TestSelectiveStateUpdateMTPWithIntermediateStates
 ):
@@ -1431,6 +1438,7 @@ class TestSelectiveStateUpdateMTPVerticalWithIntermediateStates(
         )
 
 
+@_requires_sm100
 class TestSelectiveStateUpdateMTPVerticalInt16RejectsScaleState(
     TestSelectiveStateUpdateMTPInt16
 ):
@@ -1461,6 +1469,7 @@ class TestSelectiveStateUpdateMTPVerticalInt16RejectsScaleState(
         pytest.skip("Correctly rejected — scaleState not supported by vertical kernel")
 
 
+@_requires_sm100
 class TestSelectiveStateUpdateMTPVerticalStochasticRounding(
     TestSelectiveStateUpdateMTPStochasticRounding
 ):
@@ -1487,6 +1496,7 @@ class TestSelectiveStateUpdateMTPVerticalStochasticRounding(
         )
 
 
+@_requires_sm100
 class TestSelectiveStateUpdateMTPVerticalDisableStateUpdate(
     TestSelectiveStateUpdateMTPDisableStateUpdate
 ):
@@ -1512,6 +1522,7 @@ class TestSelectiveStateUpdateMTPVerticalDisableStateUpdate(
         )
 
 
+@_requires_sm100
 class TestSelectiveStateUpdateMTPVerticalNonContiguous(
     TestSelectiveStateUpdateMTPNonContiguous
 ):
@@ -1537,6 +1548,7 @@ class TestSelectiveStateUpdateMTPVerticalNonContiguous(
         )
 
 
+@_requires_sm100
 class TestSelectiveStateUpdateMTPVerticalInt32Indices(
     TestSelectiveStateUpdateMTPInt32Indices
 ):
@@ -1563,6 +1575,7 @@ class TestSelectiveStateUpdateMTPVerticalInt32Indices(
         )
 
 
+@_requires_sm100
 class TestSelectiveStateUpdateMTPVerticalVariousNgroups(
     TestSelectiveStateUpdateMTPVariousNgroups
 ):
@@ -1588,6 +1601,7 @@ class TestSelectiveStateUpdateMTPVerticalVariousNgroups(
         )
 
 
+@_requires_sm100
 class TestSelectiveStateUpdateMTPVerticalLargeBatch(
     TestSelectiveStateUpdateMTPLargeBatch
 ):
