@@ -3005,6 +3005,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             ):
                 self._backend = "fa2"
 
+            if self._backend == "cute_dsl":
+                # Cache CPU indptrs to avoid GPU→CPU sync on every run() call
+                self._qo_indptr_cpu = qo_indptr_host
+                self._kv_indptr_cpu = kv_indptr_host
+
             if self._backend == "cutlass":
                 # insert qo_indptr.device to 9th position (0-indexed) of get_module_args
                 new_get_module_args = (
@@ -3236,19 +3241,19 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
             # cute_dsl expects dense (batch, seqlen, nheads, head_dim) tensors.
             # Convert from the ragged flat format by slicing each sequence.
-            qo_indptr_cpu = self._qo_indptr_buf.cpu()
-            kv_indptr_cpu = self._kv_indptr_buf.cpu()
+            # Use cached CPU indptrs from plan() to avoid GPU→CPU sync per run().
+            qo_indptr_cpu = self._qo_indptr_cpu
+            kv_indptr_cpu = self._kv_indptr_cpu
             batch_size = qo_indptr_cpu.numel() - 1
-            out_slices = []
             for i in range(batch_size):
                 q_i = q[qo_indptr_cpu[i] : qo_indptr_cpu[i + 1]].unsqueeze(0)
                 k_i = k[kv_indptr_cpu[i] : kv_indptr_cpu[i + 1]].unsqueeze(0)
                 v_i = v[kv_indptr_cpu[i] : kv_indptr_cpu[i + 1]].unsqueeze(0)
+                out_slice = out[qo_indptr_cpu[i] : qo_indptr_cpu[i + 1]]
                 out_i = cute_dsl_prefill_sm120(
                     q_i, k_i, v_i, causal=self._causal, sm_scale=sm_scale
                 ).squeeze(0)
-                out_slices.append(out_i)
-            out.copy_(torch.cat(out_slices, dim=0))
+                out_slice.copy_(out_i)
             return (out, lse) if return_lse else out
         elif self._backend == "cutlass":
             out, lse = fmha_varlen(

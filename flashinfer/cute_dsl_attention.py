@@ -207,6 +207,11 @@ def cute_dsl_prefill_sm120(
     if key.shape[2] != value.shape[2]:
         raise ValueError("key and value must have the same number of KV heads.")
     head_dim = query.shape[-1]
+    if key.shape[-1] != head_dim or value.shape[-1] != head_dim:
+        raise ValueError(
+            f"head_dim mismatch: query={head_dim}, key={key.shape[-1]}, "
+            f"value={value.shape[-1]}. All must match."
+        )
     if head_dim % 8 != 0:
         raise ValueError(f"head_dim must be divisible by 8, got {head_dim}.")
     if out is not None:
@@ -278,6 +283,9 @@ def cute_dsl_prefill_sm120(
     cache_key = (
         query.shape,
         key.shape,
+        _get_stride_order(query),
+        _get_stride_order(key),
+        _get_stride_order(value),
         dtype_str,
         causal,
         sm_scale,
