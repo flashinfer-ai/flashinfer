@@ -1,4 +1,5 @@
-FROM nvidia/cuda:12.8.0-devel-ubuntu24.04
+ARG CUDA_BASE_IMAGE
+FROM ${CUDA_BASE_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -47,7 +48,10 @@ ENV PATH="/home/$USERNAME/conda/envs/py312/bin:$PATH"
 # Install torch and other python packages
 COPY requirements.txt /install/requirements.txt
 COPY docker/install/install_python_packages.sh /install/install_python_packages.sh
-RUN bash /install/install_python_packages.sh cu128 && pip3 install pre-commit
+ARG CUDA_VERSION
+ARG INSTALL_TILELANG=false
+RUN bash /install/install_python_packages.sh ${CUDA_VERSION} && pip3 install pre-commit && \
+    if [ "$INSTALL_TILELANG" = "true" ]; then pip install tilelang cuda-tile; fi
 
 # Install mpi4py in the conda environment
 RUN conda install -n py312 -y mpi4py mpich

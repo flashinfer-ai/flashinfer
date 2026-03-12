@@ -1,4 +1,5 @@
-FROM nvidia/cuda:12.8.0-devel-ubuntu24.04
+ARG CUDA_BASE_IMAGE
+FROM ${CUDA_BASE_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -19,13 +20,21 @@ RUN echo "source activate py312" >> ~/.bashrc
 ENV PATH="/opt/conda/bin:$PATH"
 ENV PATH="/opt/conda/envs/py312/bin:$PATH"
 
-# Ensure pip-installed nvidia-cublas takes precedence over system libraries
-ENV LD_LIBRARY_PATH="/opt/conda/envs/py312/lib/python3.12/site-packages/nvidia/cublas/lib/:$LD_LIBRARY_PATH"
+# Set LD_LIBRARY_PATH to ensure pip-installed nvidia libs take precedence over system libraries
+ARG NVIDIA_LIB_PATH
+ENV LD_LIBRARY_PATH="/opt/conda/envs/py312/lib/python3.12/site-packages/${NVIDIA_LIB_PATH}/:$LD_LIBRARY_PATH"
+
+# Triton
+ENV TRITON_PTXAS_PATH="/usr/local/cuda/bin/ptxas"
 
 # Install torch and other python packages
 COPY requirements.txt /install/requirements.txt
 COPY docker/install/install_python_packages.sh /install/install_python_packages.sh
-RUN bash /install/install_python_packages.sh cu128
+ARG CUDA_VERSION
+RUN bash /install/install_python_packages.sh ${CUDA_VERSION}
+
+ARG INSTALL_TILELANG=false
+RUN if [ "$INSTALL_TILELANG" = "true" ]; then pip install tilelang cuda-tile; fi
 
 # Install mpi4py in the conda environment
 RUN conda install -n py312 -y mpi4py mpich
