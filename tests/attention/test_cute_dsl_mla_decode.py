@@ -99,7 +99,8 @@ def torch_reference_mla(
 @pytest.mark.parametrize("seq_len_k", [128, 512, 2048])
 @pytest.mark.parametrize("page_size", [128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_cute_dsl_mla_decode_fp16(batch_size, seq_len_k, page_size, dtype):
+@pytest.mark.parametrize("q_len", [1, 2])
+def test_cute_dsl_mla_decode_fp16(batch_size, seq_len_k, page_size, dtype, q_len):
     """Test FP16/BF16 MLA decode kernel."""
     skip_if_unsupported()
 
@@ -111,7 +112,6 @@ def test_cute_dsl_mla_decode_fp16(batch_size, seq_len_k, page_size, dtype):
     num_heads = 128
     latent_dim = 512
     rope_dim = 64
-    q_len = 1
     softmax_scale = 1.0 / (latent_dim**0.5)
     output_scale = 1.0
 

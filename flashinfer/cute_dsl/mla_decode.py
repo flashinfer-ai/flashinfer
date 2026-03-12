@@ -120,8 +120,11 @@ def _get_compiled_mla_kernel(
 
     All scalar arguments must be pre-wrapped as Int32/Float32.
     """
+    # Tile sizes for Blackwell mma.
+    # (128, 128) for QK and (128, 256) for PV.
     mma_qk_tiler_mn = (128, 128)
     mma_pv_tiler_mn = (128, 256)
+    # 2 CTAs along M (num_heads)
     cluster_shape_mnk = (2, 1, 1)
 
     is_fp8 = torch_dtype == torch.float8_e4m3fn
@@ -161,39 +164,40 @@ def _get_compiled_mla_kernel(
     sym_page_count = cute.sym_int()
     sym_workspace_size = cute.sym_int()
 
-    # All tensors use contiguous row-major layout (stride_order descending).
-    # The kernel's __call__ reinterprets them to the required layout via
-    # cute.make_tensor zero-cost metadata shuffle.
+    # q_latent, q_rope, c_latent, c_rope are slices of contiguous tensors on
+    # the last dim (e.g. query[..., :kv_lora_rank]), so they are NOT contiguous:
+    #   stride[-2] = D_qk (original full last dim), not the sliced shape.
+    # Use make_fake_tensor with fully dynamic strides so the compiled kernel
+    # reads actual strides from the runtime tensor.  Last-dim stride is always 1.
 
-    # q_latent: [batch_size, seq_len_q, num_heads, latent_dim] — contiguous
-    # make_fake_compact_tensor stride_order: value 0 = fastest (stride=1)
-    q_latent_fake = cute.runtime.make_fake_compact_tensor(
+    # q_latent: [batch_size, seq_len_q, num_heads, latent_dim] — non-contiguous slice
+    q_latent_fake = cute.runtime.make_fake_tensor(
         cutlass_dtype,
         (sym_batch, sym_seq_q, sym_heads, sym_latent),
-        stride_order=(3, 2, 1, 0),
+        stride=(cute.sym_int(), cute.sym_int(), cute.sym_int(), 1),
         assumed_align=16,
     )
-    # q_rope: [batch_size, seq_len_q, num_heads, rope_dim] — contiguous
-    q_rope_fake = cute.runtime.make_fake_compact_tensor(
+    # q_rope: [batch_size, seq_len_q, num_heads, rope_dim] — non-contiguous slice
+    q_rope_fake = cute.runtime.make_fake_tensor(
         cutlass_dtype,
         (sym_batch, sym_seq_q, sym_heads, sym_rope),
-        stride_order=(3, 2, 1, 0),
+        stride=(cute.sym_int(), cute.sym_int(), cute.sym_int(), 1),
         assumed_align=16,
     )
-    # c_latent: [kv_batch, seq_len_k, latent_dim] — contiguous
+    # c_latent: [kv_batch, seq_len_k, latent_dim] — non-contiguous slice
     # kv_batch is a separate sym_int from query batch: paged KV cache uses a flat
     # pool so kv_batch=num_pages at runtime, while query batch can be any value.
-    c_latent_fake = cute.runtime.make_fake_compact_tensor(
+    c_latent_fake = cute.runtime.make_fake_tensor(
         cutlass_dtype,
         (sym_kv_batch, sym_seq_kv, sym_latent),
-        stride_order=(2, 1, 0),
+        stride=(cute.sym_int(), cute.sym_int(), 1),
         assumed_align=16,
     )
-    # c_rope: [kv_batch, seq_len_k, rope_dim] — contiguous
-    c_rope_fake = cute.runtime.make_fake_compact_tensor(
+    # c_rope: [kv_batch, seq_len_k, rope_dim] — non-contiguous slice
+    c_rope_fake = cute.runtime.make_fake_tensor(
         cutlass_dtype,
         (sym_kv_batch, sym_seq_kv, sym_rope),
-        stride_order=(2, 1, 0),
+        stride=(cute.sym_int(), cute.sym_int(), 1),
         assumed_align=16,
     )
     # page_table: [batch_size, page_count] — contiguous
@@ -220,7 +224,8 @@ def _get_compiled_mla_kernel(
     if is_workspace_size_zero:
         workspace_fake = None
     else:
-        # workspace: 1-D (int8 to match typical torch workspace buffers)
+        # workspace: 1-D int8 buffer. 32-byte alignment because workspace stores
+        # fp32 partial sums internally, requiring stricter alignment than tensors.
         workspace_fake = cute.runtime.make_fake_compact_tensor(
             cutlass.Int8,
             (sym_workspace_size,),
@@ -356,9 +361,11 @@ def cute_dsl_mla_decode(
     # Runtime validation (int comparisons only, negligible overhead)
     if max_seq_len <= 0:
         raise ValueError(f"max_seq_len must be > 0, got {max_seq_len}")
+    # H=128: standard DeepSeek-V3 MLA config; H=1: used by split-kv reduction path.
+    # Values 2..127 are not supported by the kernel's tile config.
     if H < 128 and H != 1:
         raise ValueError(
-            f"cute_dsl_mla_decode requires num_heads == 128 (or 1), got {H}"
+            f"cute_dsl_mla_decode requires num_heads >= 128 (or 1 for reduction), got {H}"
         )
 
     # Cached split_kv and workspace_size computation
@@ -374,6 +381,9 @@ def cute_dsl_mla_decode(
         )
 
     # Prepare workspace: slice of contiguous 1D buffer is already contiguous
+    assert workspace_buffer.dtype == torch.int8, (
+        f"workspace_buffer must be torch.int8, got {workspace_buffer.dtype}"
+    )
     assert workspace_buffer.numel() >= workspace_size, (
         f"workspace_buffer too small: {workspace_buffer.numel()} bytes, "
         f"need {workspace_size} bytes"
