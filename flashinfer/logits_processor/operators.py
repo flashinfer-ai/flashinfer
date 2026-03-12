@@ -222,7 +222,10 @@ class TopPOp(ParameterizedOp):
         # so that workspace allocation and small-vocab fallback are handled uniformly.
         from ..sampling import top_p_renorm_probs
 
-        renorm_probs = top_p_renorm_probs(tensor.data, top_p)
+        is_deterministic = kwargs.get("is_deterministic", False)
+        renorm_probs = top_p_renorm_probs(
+            tensor.data, top_p, is_deterministic=is_deterministic
+        )
 
         return TaggedTensor(renorm_probs, output_type)
 
