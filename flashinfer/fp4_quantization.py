@@ -1087,7 +1087,7 @@ def get_fp4_kv_quantization_module():
 _NVFP4_BLOCK_SIZE = 16
 
 
-@supported_compute_capability([80, 86, 89, 90, 100, 120])
+@supported_compute_capability([80, 86, 89, 90, 100, 103, 120])
 def _nvfp4_kv_dequant_check(fp4_data, block_scales, global_scale, output_dtype=None):
     return True
 
@@ -1126,7 +1126,7 @@ def nvfp4_kv_dequantize(
     return output
 
 
-@supported_compute_capability([100, 120])
+@supported_compute_capability([100, 103, 120])
 def _nvfp4_kv_quant_check(input, global_scale):
     return True
 

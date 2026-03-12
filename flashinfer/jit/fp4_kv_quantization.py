@@ -27,6 +27,7 @@ def gen_fp4_kv_quantization_module() -> JitSpec:
             "-DFLASHINFER_ENABLE_F16",
             "--expt-relaxed-constexpr",
             "-gencode=arch=compute_100a,code=sm_100a",
+            "-gencode=arch=compute_103a,code=sm_103a",
             "-gencode=arch=compute_120a,code=sm_120a",
         ],
     )
