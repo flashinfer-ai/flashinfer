@@ -33,6 +33,9 @@ typedef uint8_t fp8_e4m3;
 
 #include "tvm_ffi_utils.h"
 
+// Number of elements per block scale group
+constexpr int NVFP4_BLOCK_SIZE = 16;
+
 // E2M1 lookup table
 __device__ __constant__ float E2M1_LUT[16] = {0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,
                                               4.0f,  6.0f,  -0.0f, -0.5f, -1.0f, -1.5f,
@@ -73,7 +76,7 @@ __global__ void nvfp4_dequant_vectorized_kernel(const uint8_t* __restrict__ fp4_
     global_scale = *global_scale_ptr;
   }
 
-  const int K_scales = K / 16;
+  const int K_scales = K / NVFP4_BLOCK_SIZE;
   const int K_packed = K / 2;
 
   for (int i = tid; i < K_scales; i += BLOCK_SIZE) {
@@ -100,21 +103,17 @@ __global__ void nvfp4_dequant_vectorized_kernel(const uint8_t* __restrict__ fp4_
       const int packed_idx = col / 2;
       uint16_t packed_fp4 = *reinterpret_cast<const uint16_t*>(&row_fp4[packed_idx]);
 
-      const int scale_idx_0 = col / 16;
-      const int scale_idx_1 = (col + 2) / 16;
+      const int scale_idx_0 = col / NVFP4_BLOCK_SIZE;
+      const int scale_idx_1 = (col + 2) / NVFP4_BLOCK_SIZE;
 
       const uint8_t scale_fp8_0 = smem_scales[scale_idx_0];
       const uint8_t scale_fp8_1 = smem_scales[scale_idx_1];
 
-#if HAS_FP8_SUPPORT
+      static_assert(HAS_FP8_SUPPORT, "FP4 KV dequantization requires SM80+ for FP8 E4M3 support");
       const float scale_0 =
           static_cast<float>(*reinterpret_cast<const __nv_fp8_e4m3*>(&scale_fp8_0));
       const float scale_1 =
           static_cast<float>(*reinterpret_cast<const __nv_fp8_e4m3*>(&scale_fp8_1));
-#else
-      const float scale_0 = 1.0f;
-      const float scale_1 = 1.0f;
-#endif
 
       float2 out0, out1;
       dequant_fp4x4_to_float2x2(packed_fp4, scale_0, scale_1, global_scale, out0, out1);
@@ -152,8 +151,10 @@ void nvfp4_kv_dequant(TensorView fp4_data, TensorView block_scales, TensorView g
   TVM_FFI_ICHECK(output.size(0) == M) << "output row count mismatch";
   TVM_FFI_ICHECK(output.size(1) == K) << "output column count mismatch";
   TVM_FFI_ICHECK(block_scales.size(0) == M) << "block_scales row count mismatch";
-  TVM_FFI_ICHECK(block_scales.size(1) == K / 16) << "block_scales column count mismatch";
-  TVM_FFI_ICHECK(K % 16 == 0) << "K dimension must be divisible by 16";
+  TVM_FFI_ICHECK(K % NVFP4_BLOCK_SIZE == 0)
+      << "K dimension must be divisible by " << NVFP4_BLOCK_SIZE;
+  TVM_FFI_ICHECK(block_scales.size(1) == K / NVFP4_BLOCK_SIZE)
+      << "block_scales column count mismatch";
   TVM_FFI_ICHECK(block_scales.device().device_id == fp4_data.device().device_id)
       << "block_scales must be on the same device as fp4_data";
   TVM_FFI_ICHECK(global_scale.device().device_id == fp4_data.device().device_id)
@@ -170,7 +171,7 @@ void nvfp4_kv_dequant(TensorView fp4_data, TensorView block_scales, TensorView g
   dim3 grid(M);
   dim3 block(BLOCK_SIZE);
 
-  const size_t smem_size = sizeof(float) + static_cast<size_t>(K / 16);
+  const size_t smem_size = sizeof(float) + static_cast<size_t>(K / NVFP4_BLOCK_SIZE);
 
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(output.dtype(), c_type, [&] {
     nvfp4_dequant_vectorized_kernel<c_type, BLOCK_SIZE, 16><<<grid, block, smem_size, stream>>>(

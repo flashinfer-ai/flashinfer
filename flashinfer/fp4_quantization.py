@@ -1084,6 +1084,9 @@ def get_fp4_kv_quantization_module():
     return SimpleNamespace(nvfp4_kv_quant=nvfp4_kv_quant)
 
 
+_NVFP4_BLOCK_SIZE = 16
+
+
 @supported_compute_capability([80, 86, 89, 90, 100, 120])
 def _nvfp4_kv_dequant_check(fp4_data, block_scales, global_scale, output_dtype=None):
     return True
@@ -1102,17 +1105,20 @@ def nvfp4_kv_dequantize(
     Requires SM80+.
 
     Args:
-        fp4_data (torch.Tensor): Packed FP4 data of shape [M, K/2] with dtype uint8.
-        block_scales (torch.Tensor): Per-block FP8 E4M3 scales of shape [M, K/16] with dtype uint8.
-        global_scale (torch.Tensor): Global scale factor of shape [1] with dtype float32,
+        fp4_data (torch.Tensor): Packed FP4 data of shape ``[M, K/2]`` with dtype uint8.
+        block_scales (torch.Tensor): Per-block FP8 E4M3 scales of shape ``[M, K/16]``
+            with dtype uint8.
+        global_scale (torch.Tensor): Global scale factor of shape ``[1]`` with dtype float32,
             on the same CUDA device as fp4_data.
-        output_dtype (torch.dtype): Output dtype, either torch.bfloat16 or torch.float16.
+        output_dtype (torch.dtype): Output dtype, either ``torch.bfloat16`` or ``torch.float16``.
 
     Returns:
-        torch.Tensor: Dequantized tensor of shape [M, K] with the specified output dtype.
+        torch.Tensor: Dequantized tensor of shape ``[M, K]`` with the specified output dtype.
     """
     M = fp4_data.size(0)
     K = fp4_data.size(1) * 2
+    if K % _NVFP4_BLOCK_SIZE != 0:
+        raise ValueError(f"K dimension ({K}) must be divisible by {_NVFP4_BLOCK_SIZE}")
     output = torch.empty((M, K), dtype=output_dtype, device=fp4_data.device)
     get_fp4_kv_dequantization_module().nvfp4_kv_dequant(
         fp4_data, block_scales, global_scale, output
@@ -1138,17 +1144,21 @@ def nvfp4_kv_quantize(
     Args:
         input (torch.Tensor): Input tensor of shape [M, K] with dtype bf16 or fp16.
             K must be divisible by 16.
-        global_scale (torch.Tensor): Global scale factor of shape [1] with dtype float32,
+        global_scale (torch.Tensor): Global scale factor of shape ``[1]`` with dtype float32,
             on the same CUDA device as input.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
-            - fp4_output: Packed FP4 data of shape [M, K/2] with dtype uint8.
-            - block_scales: Per-block FP8 E4M3 scales of shape [M, K/16] with dtype uint8.
+            - fp4_output: Packed FP4 data of shape ``[M, K/2]`` with dtype uint8.
+            - block_scales: Per-block FP8 E4M3 scales of shape ``[M, K/16]`` with dtype uint8.
     """
     M, K = input.shape
+    if K % _NVFP4_BLOCK_SIZE != 0:
+        raise ValueError(f"K dimension ({K}) must be divisible by {_NVFP4_BLOCK_SIZE}")
     fp4_output = torch.empty((M, K // 2), dtype=torch.uint8, device=input.device)
-    block_scales = torch.empty((M, K // 16), dtype=torch.uint8, device=input.device)
+    block_scales = torch.empty(
+        (M, K // _NVFP4_BLOCK_SIZE), dtype=torch.uint8, device=input.device
+    )
     get_fp4_kv_quantization_module().nvfp4_kv_quant(
         input, global_scale, fp4_output, block_scales
     )

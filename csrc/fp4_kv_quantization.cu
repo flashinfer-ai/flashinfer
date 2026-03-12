@@ -33,6 +33,9 @@ typedef uint8_t fp8_e4m3;
 
 #include "tvm_ffi_utils.h"
 
+// Number of elements per block scale group
+constexpr int NVFP4_BLOCK_SIZE = 16;
+
 // Helper functions
 __device__ __forceinline__ float reciprocal_approximate_ftz(float a) {
   float b;
@@ -120,14 +123,10 @@ __device__ uint32_t quantize_fp16_to_e2m1_with_scaling(InType (&vec)[4], float g
   auto sf_value =
       reciprocal_approximate_ftz(global_scale) * (vecMax * reciprocal_approximate_ftz(6.0f));
 
-#if HAS_FP8_SUPPORT
+  static_assert(HAS_FP8_SUPPORT, "FP4 KV quantization requires SM80+ for FP8 E4M3 support");
   __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(sf_value);
   fp8_scale_val = tmp.__x;
   sf_value = static_cast<float>(tmp);
-#else
-  fp8_scale_val = static_cast<uint8_t>(fminf(fmaxf(sf_value, 0.0f), 255.0f));
-  sf_value = static_cast<float>(fp8_scale_val);
-#endif
 
   output_scale = vecMax != 0 ? reciprocal_approximate_ftz(sf_value * global_scale) : 0.0f;
 
@@ -178,7 +177,7 @@ __global__ void nvfp4_quant_from_bf16_kernel(const __nv_bfloat16* __restrict__ i
 
   const __nv_bfloat16* row_input = input + row * K;
   uint8_t* row_fp4 = fp4_output + row * (K / 2);
-  uint8_t* row_scales = block_scales + row * (K / 16);
+  uint8_t* row_scales = block_scales + row * (K / NVFP4_BLOCK_SIZE);
 
   for (int base_col = 0; base_col < K; base_col += elts_per_block) {
     const int col_start = base_col + tid * CVT_ELTS_PER_THREAD;
@@ -200,7 +199,7 @@ __global__ void nvfp4_quant_from_bf16_kernel(const __nv_bfloat16* __restrict__ i
       }
     }
 
-    const int block_idx = col_start / 16;
+    const int block_idx = col_start / NVFP4_BLOCK_SIZE;
     uint8_t* scale_out = (tid % 2 == 0) ? &row_scales[block_idx] : nullptr;
 
     uint32_t e2m1_vals = quantize_fp16_to_e2m1_with_scaling(vec, global_scale, scale_out);
@@ -242,7 +241,7 @@ __global__ void nvfp4_quant_from_fp16_kernel(const half* __restrict__ input,
 
   const half* row_input = input + row * K;
   uint8_t* row_fp4 = fp4_output + row * (K / 2);
-  uint8_t* row_scales = block_scales + row * (K / 16);
+  uint8_t* row_scales = block_scales + row * (K / NVFP4_BLOCK_SIZE);
 
   for (int base_col = 0; base_col < K; base_col += elts_per_block) {
     const int col_start = base_col + tid * CVT_ELTS_PER_THREAD;
@@ -264,7 +263,7 @@ __global__ void nvfp4_quant_from_fp16_kernel(const half* __restrict__ input,
       }
     }
 
-    const int block_idx = col_start / 16;
+    const int block_idx = col_start / NVFP4_BLOCK_SIZE;
     uint8_t* scale_out = (tid % 2 == 0) ? &row_scales[block_idx] : nullptr;
 
     uint32_t e2m1_vals = quantize_fp16_to_e2m1_with_scaling(vec, global_scale, scale_out);
@@ -292,13 +291,15 @@ void nvfp4_kv_quant(TensorView input, TensorView global_scale, TensorView fp4_ou
   const int K = input.size(1);
 
   TVM_FFI_ICHECK(input.ndim() == 2) << "input must be 2D";
-  TVM_FFI_ICHECK(K % 16 == 0) << "K dimension must be divisible by 16";
+  TVM_FFI_ICHECK(K % NVFP4_BLOCK_SIZE == 0)
+      << "K dimension must be divisible by " << NVFP4_BLOCK_SIZE;
   TVM_FFI_ICHECK(fp4_output.ndim() == 2) << "fp4_output must be 2D";
   TVM_FFI_ICHECK(fp4_output.size(0) == M) << "fp4_output row count mismatch";
   TVM_FFI_ICHECK(fp4_output.size(1) == K / 2) << "fp4_output column count mismatch";
   TVM_FFI_ICHECK(block_scales.ndim() == 2) << "block_scales must be 2D";
   TVM_FFI_ICHECK(block_scales.size(0) == M) << "block_scales row count mismatch";
-  TVM_FFI_ICHECK(block_scales.size(1) == K / 16) << "block_scales column count mismatch";
+  TVM_FFI_ICHECK(block_scales.size(1) == K / NVFP4_BLOCK_SIZE)
+      << "block_scales column count mismatch";
   TVM_FFI_ICHECK(global_scale.device().device_id == input.device().device_id)
       << "global_scale must be on the same device as input";
   TVM_FFI_ICHECK(fp4_output.device().device_id == input.device().device_id)
