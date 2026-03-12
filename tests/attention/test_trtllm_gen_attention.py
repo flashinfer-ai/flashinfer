@@ -867,9 +867,9 @@ def _test_trtllm_batch_decode(
     if backend == "xqa" and q_dtype == "fp8":
         pytest.skip("xqa backend only supports fp16 and bf16 query")
 
-    # Non-shared page indices are only supported by trtllm-gen backend
-    if uses_shared_paged_kv_idx and backend != "trtllm-gen":
-        pytest.skip("Non-shared page indices are only supported by trtllm-gen backend")
+    # XQA backend doesn't support non-shared page indices
+    if backend == "xqa" and not uses_shared_paged_kv_idx:
+        pytest.skip("xqa backend does not support non-shared page indices")
 
     if o_dtype == "nvfp4" and (
         q_len_per_req is not None
