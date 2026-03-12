@@ -53,7 +53,6 @@ from .utils import (
     canonicalize_torch_dtype,
     determine_attention_backend,
     device_support_pdl,
-    get_compute_capability,
     get_device_sm_count,
     is_float8,
     is_sm100a_supported,
