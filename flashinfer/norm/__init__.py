@@ -624,14 +624,10 @@ def fused_rmsnorm_silu(
         )
 
     if out.dtype == torch.float8_e4m3fn and sm < 89:
-        raise RuntimeError(
-            f"FP8 E4M3 output requires SM89+ (Ada/Hopper), got SM{sm}"
-        )
+        raise RuntimeError(f"FP8 E4M3 output requires SM89+ (Ada/Hopper), got SM{sm}")
 
     if out.dtype == torch.uint8 and sm < 100:
-        raise RuntimeError(
-            f"NVFP4 E2M1 output requires SM100+ (Blackwell), got SM{sm}"
-        )
+        raise RuntimeError(f"NVFP4 E2M1 output requires SM100+ (Blackwell), got SM{sm}")
 
     # Warn once if the problem size or GPU is outside the tuned regime.
     num_tokens, C = input.shape
