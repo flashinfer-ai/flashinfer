@@ -32,7 +32,7 @@ from typing import List
 import torch
 import torch.nn.functional as F
 
-# Blacwell GDN prefill
+# Blackwell GDN prefill
 from flashinfer.gdn_kernels.blackwell_prefill.gdn import chunk_gated_delta_rule
 
 # FLA baseline
