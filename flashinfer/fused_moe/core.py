@@ -1040,7 +1040,7 @@ def get_trtllm_moe_sm100_module():
                 hidden_states,
                 *extra_inputs,
             ) = inputs
-            num_tokens = routing_logits.shape[0]
+            num_tokens = hidden_states.shape[0]
 
             instance_key = (
                 self.dtype_act,
@@ -1081,7 +1081,7 @@ def get_trtllm_moe_sm100_module():
                 hidden_states,
                 *extra_inputs,
             ) = inputs
-            num_tokens = routing_logits.shape[0]
+            num_tokens = hidden_states.shape[0]
 
             extra_input_idx = 0
             if trtllm_gen_dtype_has_scale(self.dtype_act):
@@ -1093,12 +1093,20 @@ def get_trtllm_moe_sm100_module():
             assert output.shape[0] == num_tokens, (
                 "output's first dimension must be batch size."
             )
-            assert topk_ids.shape[0] == num_tokens, (
-                "topk_ids's first dimension must be batch size."
-            )
-            assert expert_weights.shape[0] == num_tokens, (
-                "expert_weights's first dimension must be batch size."
-            )
+            if routing_logits is not None:
+                assert routing_logits.shape[0] == num_tokens, (
+                    "routing_logits's first dimension must be batch size."
+                )
+            # topk_ids/expert_weights can be empty(0) when routing_logits is provided,
+            # or real tensors when pre-computed routing is used.
+            if topk_ids.numel() > 0:
+                assert topk_ids.shape[0] == num_tokens, (
+                    "topk_ids's first dimension must be batch size."
+                )
+            if expert_weights is not None and expert_weights.numel() > 0:
+                assert expert_weights.shape[0] == num_tokens, (
+                    "expert_weights's first dimension must be batch size."
+                )
             assert hidden_states.shape[0] == num_tokens, (
                 "hidden_states's first dimension must be batch size."
             )
