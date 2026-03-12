@@ -2876,14 +2876,13 @@ cudaError_t TopKDispatch(DType* input, IdType* output_indices, DType* output_val
                      "but got k =", top_k_val);
     FLASHINFER_CHECK(CanImplementFilteredTopK(),
                      "deterministic=True requires GPU support for 128KB shared memory");
-    FLASHINFER_CHECK(max_len > top_k_val, "deterministic=True requires vocab_size > k");
 
     cudaError_t filtered_status =
         FilteredTopK<DType, IdType>(input, output_indices, output_values, nullptr, num_rows,
                                     top_k_val, max_len, /*deterministic=*/true, stream);
     FLASHINFER_CUDA_CALL(filtered_status);
 
-    if (top_k_val > 1 && top_k_val < max_len) {
+    if (top_k_val > 1) {
       dim3 sort_grid(num_rows);
       void* sort_args[] = {&output_indices, &output_values, &top_k_val, &max_len};
 

@@ -1647,6 +1647,44 @@ def test_filtered_topk_deterministic_correctness(
     )
 
 
+@pytest.mark.parametrize("sorted_flag", [False, True])
+def test_filtered_topk_deterministic_k_equals_vocab(sorted_flag):
+    """Deterministic top_k when k == vocab_size."""
+    batch_size = 4
+    vocab_size = 512
+    k = vocab_size
+
+    torch.manual_seed(42)
+    logits = torch.randn(batch_size, vocab_size, device="cuda", dtype=torch.float32)
+
+    ref_values, ref_indices = flashinfer.top_k(
+        logits, k, sorted=sorted_flag, deterministic=True
+    )
+
+    assert ref_values.shape == (batch_size, k)
+    assert ref_indices.shape == (batch_size, k)
+
+    gathered = torch.gather(logits, dim=-1, index=ref_indices)
+    torch.testing.assert_close(ref_values, gathered)
+
+    for run in range(NUM_REPRODUCIBILITY_RUNS):
+        values, indices = flashinfer.top_k(
+            logits, k, sorted=sorted_flag, deterministic=True
+        )
+        assert torch.equal(values, ref_values), (
+            f"k==vocab sorted={sorted_flag}, run {run}: values differ"
+        )
+        assert torch.equal(indices, ref_indices), (
+            f"k==vocab sorted={sorted_flag}, run {run}: indices differ"
+        )
+
+    if sorted_flag:
+        for i in range(batch_size):
+            assert torch.all(ref_values[i, :-1] >= ref_values[i, 1:]), (
+                f"Row {i}: values not sorted in descending order"
+            )
+
+
 if __name__ == "__main__":
     # Basic tests
     test_top_k(4, 32000, 256, torch.float32)
