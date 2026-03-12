@@ -36,13 +36,14 @@ class CompilationContext:
         tuple with the correct architecture suffix for nvcc.
 
         SM 9.x  -> 'a' suffix (e.g. compute_90a)
-        SM 10+  -> 'f' suffix (e.g. compute_120f) when the installed CUDA
+        SM 12.x -> 'f' suffix (e.g. compute_120f) when the installed CUDA
                     toolchain supports it (CUDA >= 13.0), otherwise 'a'.
+        SM 10+  -> 'a' suffix (e.g. compute_100a)
         SM < 9  -> no suffix
         """
         if major == 9:
             return (major, str(minor) + "a")
-        elif major >= 10:
+        elif major == 12:
             try:
                 from flashinfer.jit.cpp_ext import is_cuda_version_at_least
                 if is_cuda_version_at_least("13.0"):
@@ -52,6 +53,8 @@ class CompilationContext:
                     "Could not import is_cuda_version_at_least; "
                     "falling back to 'a' suffix for SM %d.%d", major, minor
                 )
+            return (major, str(minor) + "a")
+        elif major >= 10:
             return (major, str(minor) + "a")
         return (major, str(minor))
 
