@@ -147,8 +147,8 @@ __device__ __forceinline__ void role_load(SramT& sram, int lane,
 // =============================================================================
 
 template <typename input_t, typename state_t, typename matrixA_t, typename weight_t,
-          typename stateIndex_t, int NTOKENS, int DIM, int DSTATE, int NUM_IN_STAGES,
-          typename SramT>
+          typename stateIndex_t, int NTOKENS, int DIM, int DSTATE, int PHILOX_ROUNDS,
+          int NUM_IN_STAGES, typename SramT>
 __device__ __forceinline__ void role_update_state(SramT& sram, int lane, int compute_warp,
                                                   SelectiveStateMTPParams const& params, int batch,
                                                   int head, bool is_pad) {
@@ -165,6 +165,9 @@ __device__ __forceinline__ void role_update_state(SramT& sram, int lane, int com
   auto const* __restrict__ D_ptr = reinterpret_cast<weight_t const*>(params.D);
   auto const* __restrict__ dt_bias_ptr = reinterpret_cast<weight_t const*>(params.dt_bias);
 
+  // Load device-side Philox seed once into a register
+  [[maybe_unused]] int64_t const rand_seed = params.rand_seed ? *params.rand_seed : 0;
+
   auto* __restrict__ state_ptr = reinterpret_cast<state_t*>(params.state);
   auto* __restrict__ istate_ptr = reinterpret_cast<state_t*>(params.intermediate_states);
 
@@ -177,6 +180,7 @@ __device__ __forceinline__ void role_update_state(SramT& sram, int lane, int com
       state_batch_indices ? (int64_t)state_batch_indices[batch] : (int64_t)batch;
   auto const icache_idx =
       intermediate_state_indices ? (int64_t)intermediate_state_indices[batch] : state_batch;
+  auto const state_ptr_offset = state_batch * params.state_stride_batch + head * DIM * DSTATE;
 
   // Issue scalar gmem loads early so their latency overlaps with barrier waits below.
   float const A_val = toFloat(A_ptr[head]);
@@ -253,9 +257,26 @@ __device__ __forceinline__ void role_update_state(SramT& sram, int lane, int com
         // Write intermediate state directly to gmem via vectorized STG
         if (istate_ptr && !is_pad) {
           packed_state_t rStateOut;
+          if constexpr (PHILOX_ROUNDS > 0) {
+            static_assert(stateValuesPerThread % 2 == 0,
+                          "SR requires even stateValuesPerThread for f16x2 packing");
+            [[maybe_unused]] uint32_t rand_ints[4];
 #pragma unroll
-          for (int k = 0; k < stateValuesPerThread; k++) {
-            convertAndStore(&rStateOut.val[k], rState[wr][k]);
+            for (int k = 0; k < stateValuesPerThread; k += 2) {
+              if (k % 4 == 0)
+                philox_randint4x<PHILOX_ROUNDS>(
+                    rand_seed, state_ptr_offset + dd * DSTATE + lane * stateValuesPerThread + k,
+                    rand_ints[0], rand_ints[1], rand_ints[2], rand_ints[3]);
+              uint32_t packed =
+                  cvt_rs_f16x2_f32(rState[wr][k], rState[wr][k + 1], rand_ints[k / 2]);
+              rStateOut.val[k] = __ushort_as_half(static_cast<uint16_t>(packed & 0xFFFFu));
+              rStateOut.val[k + 1] = __ushort_as_half(static_cast<uint16_t>(packed >> 16));
+            }
+          } else {
+#pragma unroll
+            for (int k = 0; k < stateValuesPerThread; k++) {
+              convertAndStore(&rStateOut.val[k], rState[wr][k]);
+            }
           }
           *reinterpret_cast<packed_state_t*>(
               &istate_ptr[icache_idx * params.intermediate_state_stride_batch +
@@ -266,9 +287,24 @@ __device__ __forceinline__ void role_update_state(SramT& sram, int lane, int com
         // Write final state directly to gmem at last step
         if (step == NTOKENS - 1 && params.update_state && !is_pad) {
           packed_state_t rStateOut;
+          if constexpr (PHILOX_ROUNDS > 0) {
+            [[maybe_unused]] uint32_t rand_ints[4];
 #pragma unroll
-          for (int k = 0; k < stateValuesPerThread; k++) {
-            convertAndStore(&rStateOut.val[k], rState[wr][k]);
+            for (int k = 0; k < stateValuesPerThread; k += 2) {
+              if (k % 4 == 0)
+                philox_randint4x<PHILOX_ROUNDS>(
+                    rand_seed, state_ptr_offset + dd * DSTATE + lane * stateValuesPerThread + k,
+                    rand_ints[0], rand_ints[1], rand_ints[2], rand_ints[3]);
+              uint32_t packed =
+                  cvt_rs_f16x2_f32(rState[wr][k], rState[wr][k + 1], rand_ints[k / 2]);
+              rStateOut.val[k] = __ushort_as_half(static_cast<uint16_t>(packed & 0xFFFFu));
+              rStateOut.val[k + 1] = __ushort_as_half(static_cast<uint16_t>(packed >> 16));
+            }
+          } else {
+#pragma unroll
+            for (int k = 0; k < stateValuesPerThread; k++) {
+              convertAndStore(&rStateOut.val[k], rState[wr][k]);
+            }
           }
           *reinterpret_cast<packed_state_t*>(
               &state_ptr[state_batch * params.state_stride_batch + head * DIM * DSTATE +
@@ -347,7 +383,7 @@ __device__ __forceinline__ void role_epilogue(SharedSramT& sram, int lane,
 // Each CTA processes up to NUM_COMPUTE_GROUPS heads from the flattened head list.
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t,
           typename stateIndex_t, int NTOKENS, int DIM, int DSTATE, int HEADS_PER_GROUP,
-          int NUM_IN_STAGES>
+          int PHILOX_ROUNDS, int NUM_IN_STAGES>
 __global__ void __launch_bounds__(NUM_WARPS * 32, 2)
     selective_state_update_kernel_vertical_mtp(SelectiveStateMTPParams params,
                                                __grid_constant__ CUtensorMap const tensorState,
@@ -401,8 +437,8 @@ __global__ void __launch_bounds__(NUM_WARPS * 32, 2)
     int const compute_warp = warp % NUM_COMPUTE_WARPS_PER_GROUP;
     if (g < num_active_groups) {
       role_update_state<input_t, state_t, matrixA_t, weight_t, stateIndex_t, NTOKENS, DIM, DSTATE,
-                        NUM_IN_STAGES>(sram.group[g], lane, compute_warp, params, batch, heads[g],
-                                       is_pad);
+                        PHILOX_ROUNDS, NUM_IN_STAGES>(sram.group[g], lane, compute_warp, params,
+                                                      batch, heads[g], is_pad);
     }
 
   } else if (role == WarpRole::kTMALoad) {

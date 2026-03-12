@@ -1431,34 +1431,36 @@ class TestSelectiveStateUpdateMTPVerticalWithIntermediateStates(
         )
 
 
-@pytest.mark.xfail(
-    reason="Vertical kernel does not support scaled (quantized) state yet"
-)
-class TestSelectiveStateUpdateMTPVerticalInt16(TestSelectiveStateUpdateMTPInt16):
-    """Test vertical algorithm with int16 quantized state (scaleState)."""
+class TestSelectiveStateUpdateMTPVerticalInt16RejectsScaleState(
+    TestSelectiveStateUpdateMTPInt16
+):
+    """Test that vertical algorithm rejects int16 quantized state (scaleState) with a clear error."""
 
     def run_kernel(self, inputs, out=None, disable_state_update=False):
-        return flashinfer.mamba.selective_state_update(
-            inputs["state_cache"],
-            inputs["x"],
-            inputs["dt"],
-            inputs["A"],
-            inputs["B"],
-            inputs["C"],
-            D=inputs["D"],
-            z=inputs.get("z"),
-            dt_bias=inputs["dt_bias"],
-            dt_softplus=True,
-            state_batch_indices=inputs["slot_idx"],
-            pad_slot_id=-1,
-            out=out,
-            disable_state_update=disable_state_update,
-            state_scale=inputs["state_scale"],
-            algorithm="vertical",
-        )
+        with pytest.raises(
+            RuntimeError, match="vertical algorithm does not support scaled"
+        ):
+            flashinfer.mamba.selective_state_update(
+                inputs["state_cache"],
+                inputs["x"],
+                inputs["dt"],
+                inputs["A"],
+                inputs["B"],
+                inputs["C"],
+                D=inputs["D"],
+                z=inputs.get("z"),
+                dt_bias=inputs["dt_bias"],
+                dt_softplus=True,
+                state_batch_indices=inputs["slot_idx"],
+                pad_slot_id=-1,
+                out=out,
+                disable_state_update=disable_state_update,
+                state_scale=inputs["state_scale"],
+                algorithm="vertical",
+            )
+        pytest.skip("Correctly rejected — scaleState not supported by vertical kernel")
 
 
-@pytest.mark.xfail(reason="Vertical kernel does not support stochastic rounding yet")
 class TestSelectiveStateUpdateMTPVerticalStochasticRounding(
     TestSelectiveStateUpdateMTPStochasticRounding
 ):

@@ -38,8 +38,8 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
   // ── Auto algorithm selection ──────────────────────────────────────────────
   if (algorithm == SSUAlgorithm::kAuto) {
 #ifdef FLASHINFER_MAMBA_ENABLE_SM100
-    // Vertical kernel doesn't support scaleState or stochastic rounding
-    if (scaleState || PHILOX_ROUNDS > 0)
+    // Vertical kernel doesn't support scaleState
+    if (scaleState)
       algorithm = SSUAlgorithm::kSimple;
     else
       algorithm = (params.batch >= 32) ? SSUAlgorithm::kVertical : SSUAlgorithm::kSimple;
@@ -78,9 +78,6 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
                      ") must be divisible by NUM_COMPUTE_WARPS_PER_GROUP (",
                      NUM_COMPUTE_WARPS_PER_GROUP, ") for vertical algorithm");
     FLASHINFER_CHECK(!scaleState, "vertical algorithm does not support scaled (quantized) state");
-    FLASHINFER_CHECK(PHILOX_ROUNDS == 0,
-                     "vertical algorithm does not support stochastic rounding (PHILOX_ROUNDS=",
-                     PHILOX_ROUNDS, ")");
 
     constexpr int NUM_IN_STAGES = 1;
 
@@ -90,10 +87,9 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
               SharedStorageVertical<input_t, state_t, NTOKENS_MTP, DIM, DSTATE, NUM_IN_STAGES>;
           constexpr size_t smem_size = sizeof(sram_t);
 
-          auto func =
-              selective_state_update_kernel_vertical_mtp<input_t, weight_t, matrixA_t, state_t,
-                                                         stateIndex_t, NTOKENS_MTP, DIM, DSTATE,
-                                                         HEADS_PER_GROUP, NUM_IN_STAGES>;
+          auto func = selective_state_update_kernel_vertical_mtp<
+              input_t, weight_t, matrixA_t, state_t, stateIndex_t, NTOKENS_MTP, DIM, DSTATE,
+              HEADS_PER_GROUP, PHILOX_ROUNDS, NUM_IN_STAGES>;
 
           int const total_heads = params.nheads;
           int const num_chunks = (total_heads + NUM_COMPUTE_GROUPS - 1) / NUM_COMPUTE_GROUPS;
