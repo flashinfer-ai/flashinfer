@@ -19,9 +19,18 @@ Fused Add + RMSNorm CuTe DSL Kernels
 Includes:
 - FusedAddRMSNormKernel: Fused residual add + RMSNorm
 - FusedAddRMSNormQuantKernel: Fused residual add + RMSNorm + FP8 quantization
+
+Architecture follows the overhauled RMSNormKernel:
+1. Multi-row blocks for better wave utilization at small batch sizes
+2. Async global->shared copy when H alignment permits
+3. Graceful fallback to sync copy for arbitrary H (e.g. H=111)
+4. Two-pass shared memory: load input+residual once, re-read for normalization
+5. Weight loaded via separate sync copy, overlapped with async wait
+6. Cluster reduction across CTAs for very large H on SM90+
 """
 
 import functools
+import math
 
 import cutlass
 import cutlass.cute as cute
@@ -36,14 +45,14 @@ from ..utils import (
     cvt_and_store_f32_to_e4m3_sw,
     has_hw_fp8_cvt,
     get_ptr_as_int64,
-    row_reduce_sum,
+    get_sm_version,
+    row_reduce_sum_multirow,
     predicate_k,
-    compute_optimal_vec_size,
-    compute_threads_per_row,
-    make_tv_layout,
     _torch_dtype_to_str,
     get_cutlass_dtype,
 )
+
+from .rmsnorm import RMSNormKernel
 
 
 # =============================================================================
@@ -53,11 +62,15 @@ from ..utils import (
 
 class FusedAddRMSNormKernel:
     """
-    Fused Residual Add + RMSNorm Kernel using CuTe-DSL.
+    Fused Residual Add + RMSNorm Kernel using CuTe-DSL with multi-row blocks.
 
     Computes:
     1. residual = input + residual (in-place update)
     2. input = residual / sqrt(mean(residual^2) + eps) * (weight + weight_bias)
+
+    Uses 2 shared memory tiles (input + residual) for async copy path,
+    with two-pass access: pass 1 computes h=x+r and sum-of-squares,
+    pass 2 re-reads from shared to normalize.
     """
 
     def __init__(
@@ -65,29 +78,103 @@ class FusedAddRMSNormKernel:
         dtype: cutlass.Numeric,
         H: int,
         weight_bias: float = 0.0,
+        sm_version: int | None = None,
     ):
         self.dtype = dtype
         self.H = H
         self.weight_bias = weight_bias
+        self.sm_version = sm_version if sm_version is not None else get_sm_version()
 
-        # Vectorization parameters: use optimal vec_size for warp utilization
-        elem_bits = dtype.width
-        max_vec_size = COPY_BITS // elem_bits
-        self.vec_size = compute_optimal_vec_size(H, max_vec_size)
-        self.copy_bits = self.vec_size * elem_bits
+        self.cluster_n = self._compute_cluster_n(H, dtype, self.sm_version)
+        self.H_per_cta = H // self.cluster_n
 
-        self.threads_per_row = compute_threads_per_row(H, self.vec_size)
-        self.num_threads = self.threads_per_row
-        self.num_warps = max(self.threads_per_row // 32, 1)
+        elem_bytes = dtype.width // 8
+        max_vec_size = COPY_BITS // 8 // elem_bytes
+
+        h_align = self.H_per_cta & (-self.H_per_cta)
+        self.vec_size = min(h_align, max_vec_size)
+        self.copy_bits = self.vec_size * dtype.width
+
+        self.use_async_copy = self.copy_bits >= 32
+
+        self.threads_per_row = RMSNormKernel._compute_threads_per_row(self.H_per_cta)
+        self.num_threads = RMSNormKernel._compute_num_threads(self.H_per_cta)
+        self.rows_per_block = self.num_threads // self.threads_per_row
+        self.warps_per_row = max(self.threads_per_row // 32, 1)
 
         self.num_vec_blocks = max(
-            1, (H // self.vec_size + self.threads_per_row - 1) // self.threads_per_row
+            1,
+            (self.H_per_cta // self.vec_size + self.threads_per_row - 1)
+            // self.threads_per_row,
         )
         self.cols_per_tile = self.vec_size * self.num_vec_blocks * self.threads_per_row
 
+    @staticmethod
+    def _compute_cluster_n(H: int, dtype: cutlass.Numeric, sm_version: int) -> int:
+        """Compute optimal cluster size for fused-add kernel (2 shared tiles)."""
+        if sm_version < 90:
+            return 1
+
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        max_smem_bytes = props.shared_memory_per_block_optin
+        elem_size = dtype.width // 8
+
+        for cluster_n in [1, 2, 4, 8, 16]:
+            if H % cluster_n != 0:
+                continue
+            smem_needed = FusedAddRMSNormKernel._estimate_smem_bytes(
+                H, cluster_n, elem_size
+            )
+            if smem_needed <= max_smem_bytes:
+                return cluster_n
+
+        return 16
+
+    @staticmethod
+    def _estimate_smem_bytes(H: int, cluster_n: int, elem_size: int) -> int:
+        """Estimate shared memory bytes (2 tiles for input + residual)."""
+        H_per_cta = H // cluster_n
+        threads_per_row = RMSNormKernel._compute_threads_per_row(H_per_cta)
+        num_threads = RMSNormKernel._compute_num_threads(H_per_cta)
+        rows_per_block = num_threads // threads_per_row
+        warps_per_row = max(threads_per_row // 32, 1)
+
+        max_vec_size = COPY_BITS // 8 // elem_size
+        h_align = H_per_cta & (-H_per_cta)
+        vec_size = min(h_align, max_vec_size)
+        num_vec_blocks = max(
+            1, (H_per_cta // vec_size + threads_per_row - 1) // threads_per_row
+        )
+        cols_per_tile = vec_size * num_vec_blocks * threads_per_row
+
+        tile_bytes = 2 * rows_per_block * cols_per_tile * elem_size
+
+        if cluster_n == 1:
+            return tile_bytes + rows_per_block * warps_per_row * 4
+        else:
+            return (
+                tile_bytes
+                + rows_per_block * warps_per_row * cluster_n * 4
+                + 8  # mbarrier
+            )
+
     def _smem_size_in_bytes(self) -> int:
-        # Only reduction buffer needed (register-based approach)
-        return self.num_warps * 4
+        if self.use_async_copy:
+            tile_bytes = (
+                2 * self.rows_per_block * self.cols_per_tile * (self.dtype.width // 8)
+            )
+        else:
+            tile_bytes = 0
+
+        if self.cluster_n == 1:
+            reduction_bytes = self.rows_per_block * self.warps_per_row * 4
+        else:
+            reduction_bytes = (
+                self.rows_per_block * self.warps_per_row * self.cluster_n * 4
+            )
+
+        mbar_bytes = 8 if self.cluster_n > 1 else 0
+        return tile_bytes + reduction_bytes + mbar_bytes
 
     @cute.jit
     def __call__(
@@ -100,17 +187,21 @@ class FusedAddRMSNormKernel:
         enable_pdl: cutlass.Constexpr[bool],
         stream,
     ):
-        tv_shape, tv_stride = make_tv_layout(
+        tv_shape, tv_stride = RMSNormKernel._make_tv_layout(
             self.threads_per_row,
+            self.rows_per_block,
             self.vec_size,
             self.num_vec_blocks,
         )
         tv_layout = cute.make_layout(tv_shape, stride=tv_stride)
-        tiler_mn = (1, self.cols_per_tile)
+        tiler_mn = (self.rows_per_block, self.cols_per_tile)
+
+        cluster_n = self.cluster_n
 
         self.kernel(mX, mR, mW, M, eps, enable_pdl, tv_layout, tiler_mn).launch(
-            grid=[M, 1, 1],
+            grid=[cute.ceil_div(M, self.rows_per_block), cluster_n, 1],
             block=[self.num_threads, 1, 1],
+            cluster=[1, cluster_n, 1] if cutlass.const_expr(cluster_n > 1) else None,
             smem=self._smem_size_in_bytes(),
             stream=stream,
             use_pdl=enable_pdl,
@@ -131,95 +222,192 @@ class FusedAddRMSNormKernel:
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
 
-        # PDL: Wait for previous kernel (SM90+ only)
         if enable_pdl:
             cute.arch.griddepcontrol_wait()
 
         H = self.H
+        cluster_n = self.cluster_n
         weight_bias = self.weight_bias
-        threads_per_row = tv_layout.shape[0][0]
-        num_warps = self.num_warps
         copy_bits = self.copy_bits
+        threads_per_row = tv_layout.shape[0][0]
+        rows_per_block = tiler_mn[0]
+        warps_per_row = max(threads_per_row // 32, 1)
 
+        if cutlass.const_expr(cluster_n > 1):
+            cluster_y = cute.arch.block_idx()[1]
+        else:
+            cluster_y = cutlass.const_expr(0)
+
+        # ===== Allocate shared memory =====
         smem = cutlass.utils.SmemAllocator()
-        reduction_buffer = smem.allocate_tensor(
-            Float32,
-            cute.make_layout((num_warps,)),
-            byte_alignment=4,
-        )
 
+        if cutlass.const_expr(self.use_async_copy):
+            sX = smem.allocate_tensor(
+                mX.element_type,
+                cute.make_ordered_layout(tiler_mn, order=(1, 0)),
+                byte_alignment=16,
+            )
+            sR = smem.allocate_tensor(
+                mR.element_type,
+                cute.make_ordered_layout(tiler_mn, order=(1, 0)),
+                byte_alignment=16,
+            )
+
+        if cutlass.const_expr(cluster_n == 1):
+            reduction_buffer = smem.allocate_tensor(
+                Float32,
+                cute.make_layout((rows_per_block, warps_per_row)),
+                byte_alignment=4,
+            )
+            mbar_ptr = None
+        else:
+            reduction_buffer = smem.allocate_tensor(
+                Float32,
+                cute.make_layout((rows_per_block, (warps_per_row, cluster_n))),
+                byte_alignment=4,
+            )
+            mbar_ptr = smem.allocate_array(cutlass.Int64, num_elems=1)
+
+        # ===== Initialize cluster =====
+        if cutlass.const_expr(cluster_n > 1):
+            if tidx == 0:
+                cute.arch.mbarrier_init(mbar_ptr, 1)
+            cute.arch.mbarrier_init_fence()
+            cute.arch.cluster_arrive_relaxed()
+            cute.arch.cluster_wait()
+
+        # ===== Coordinate tracking and tiling =====
         idX = cute.make_identity_tensor(mX.shape)
 
-        gX = cute.local_tile(mX, tiler_mn, (bidx, 0))
-        gR = cute.local_tile(mR, tiler_mn, (bidx, 0))
-        cX = cute.local_tile(idX, tiler_mn, (bidx, 0))
+        gX = cute.local_tile(mX, tiler_mn, (bidx, cluster_y))
+        gR = cute.local_tile(mR, tiler_mn, (bidx, cluster_y))
+        cX = cute.local_tile(idX, tiler_mn, (bidx, cluster_y))
 
-        mW_2d = cute.prepend_ones(mW, up_to_rank=2)
+        mW_expanded_layout = cute.prepend(
+            mW.layout, cute.make_layout((tiler_mn[0],), stride=(0,))
+        )
+        mW_2d = cute.make_tensor(mW.iterator, mW_expanded_layout)
+        gW = cute.local_tile(mW_2d, tiler_mn, (0, cluster_y))
 
-        copy_atom = cute.make_copy_atom(
+        # ===== Create TiledCopy atoms =====
+        copy_atom_sync = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            mX.element_type,
+            num_bits_per_copy=copy_bits,
+        )
+        copy_atom_store = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
             mX.element_type,
             num_bits_per_copy=copy_bits,
         )
 
-        tiled_copy = cute.make_tiled_copy(copy_atom, tv_layout, tiler_mn)
-        thr_copy = tiled_copy.get_slice(tidx)
+        if cutlass.const_expr(self.use_async_copy):
+            copy_atom_async = cute.make_copy_atom(
+                cute.nvgpu.cpasync.CopyG2SOp(),
+                mX.element_type,
+                num_bits_per_copy=copy_bits,
+            )
+            tiled_copy_load = cute.make_tiled_copy(copy_atom_async, tv_layout, tiler_mn)
+        else:
+            tiled_copy_load = cute.make_tiled_copy(copy_atom_sync, tv_layout, tiler_mn)
 
-        tXgX = thr_copy.partition_S(gX)
-        tXgR = thr_copy.partition_S(gR)
-        tXgW = thr_copy.partition_S(mW_2d)
-        tXcX = thr_copy.partition_S(cX)
-        tYgX = thr_copy.partition_D(gX)
-        tYgR = thr_copy.partition_D(gR)
+        tiled_copy_W = cute.make_tiled_copy(copy_atom_sync, tv_layout, tiler_mn)
+        tiled_copy_store = cute.make_tiled_copy(copy_atom_store, tv_layout, tiler_mn)
 
-        # Register fragments - initialize to zero for proper handling of out-of-bounds threads
-        tXrX = cute.make_rmem_tensor(tXgX.shape, mX.element_type)
-        tXrR = cute.make_rmem_tensor(tXgR.shape, mR.element_type)
-        tXrW = cute.make_rmem_tensor(tXgW.shape, mW.element_type)
-        tXrX.store(cute.zeros_like(tXrX, dtype=mX.element_type))
-        tXrR.store(cute.zeros_like(tXrR, dtype=mR.element_type))
-        tXrW.store(cute.zeros_like(tXrW, dtype=mW.element_type))
+        thr_copy_X = tiled_copy_load.get_slice(tidx)
+        thr_copy_W = tiled_copy_W.get_slice(tidx)
+        thr_copy_O = tiled_copy_store.get_slice(tidx)
 
+        # Partition input
+        tXgX = thr_copy_X.partition_S(gX)
+        tXcX = thr_copy_X.partition_S(cX)
+        tXrX = cute.make_fragment_like(tXgX)
+
+        # Partition residual (same load tiled copy)
+        tRgR = thr_copy_X.partition_S(gR)
+        tRrR = cute.make_fragment_like(tRgR)
+
+        if cutlass.const_expr(self.use_async_copy):
+            tXsX = thr_copy_X.partition_D(sX)
+            tRsR = thr_copy_X.partition_D(sR)
+
+        # Partition weight (sync, separate tiled copy)
+        tWgW = thr_copy_W.partition_S(gW)
+        tWrW = cute.make_fragment_like(tWgW)
+        tXrW = thr_copy_X.retile(tWrW)
+
+        # Partition output destinations
+        tXgO = thr_copy_O.partition_D(gX)
+        tRgO = thr_copy_O.partition_D(gR)
+        tXrO = cute.make_fragment_like(tXgO)
+
+        # ===== Bounds checking =====
         tXpX = predicate_k(tXcX, limit=H)
+        tWpW = predicate_k(thr_copy_W.partition_S(cX), limit=H)
+        row_coord = tXcX[(0, 0), 0, 0]
+        row_in_bounds = row_coord[0] < M
 
-        # Phase 1: Load input and residual from global to register
-        cute.copy(copy_atom, tXgX, tXrX, pred=tXpX)
-        cute.copy(copy_atom, tXgR, tXrR, pred=tXpX)
+        # ===== Pass 1: Load input + residual, compute h, reduce =====
+        if cutlass.const_expr(self.use_async_copy):
+            if row_in_bounds:
+                cute.copy(copy_atom_async, tXgX, tXsX, pred=tXpX)
+                cute.copy(copy_atom_async, tRgR, tRsR, pred=tXpX)
+            cute.arch.cp_async_commit_group()
+
+            cute.copy(copy_atom_sync, tWgW, tWrW, pred=tWpW)
+
+            cute.arch.cp_async_wait_group(0)
+
+            cute.autovec_copy(tXsX, tXrX)
+            cute.autovec_copy(tRsR, tRrR)
+        else:
+            tXrX.store(cute.zeros_like(tXrX, dtype=mX.element_type))
+            tRrR.store(cute.zeros_like(tRrR, dtype=mR.element_type))
+            if row_in_bounds:
+                cute.copy(copy_atom_sync, tXgX, tXrX, pred=tXpX)
+                cute.copy(copy_atom_sync, tRgR, tRrR, pred=tXpX)
+
+            cute.copy(copy_atom_sync, tWgW, tWrW, pred=tWpW)
 
         x_in = tXrX.load().to(Float32)
-        r_in = tXrR.load().to(Float32)
-        x = x_in + r_in
+        r_in = tRrR.load().to(Float32)
+        h = x_in + r_in
 
-        # Phase 2: Store x to residual (global)
-        tXrR_out = x.to(mR.element_type)
-        tXrR_store = cute.make_rmem_tensor(tYgR.shape, mR.element_type)
-        tXrR_store.store(tXrR_out)
+        # Write h to residual (global)
+        tXrO.store(h.to(mR.element_type))
+        if row_in_bounds:
+            cute.copy(copy_atom_store, tXrO, tRgO, pred=tXpX)
 
-        cute.copy(copy_atom, tXrR_store, tYgR, pred=tXpX)
-
-        # Phase 3: Compute sum of squares (x is kept in registers)
-        x_sq = x * x
-        sum_sq = row_reduce_sum(x_sq, threads_per_row, reduction_buffer)
+        h_sq = h * h
+        sum_sq = row_reduce_sum_multirow(
+            h_sq, threads_per_row, reduction_buffer, mbar_ptr, cluster_n
+        )
 
         mean_sq = sum_sq / Float32(H)
         rstd = cute.math.rsqrt(mean_sq + eps, fastmath=True)
 
-        # Phase 4: Load weight from global to register
-        cute.copy(copy_atom, tXgW, tXrW, pred=tXpX)
+        if cutlass.const_expr(cluster_n > 1):
+            cute.arch.cluster_arrive_relaxed()
+            cute.arch.cluster_wait()
+        else:
+            cute.arch.barrier()
+
+        # ===== Pass 2: Normalize and store output =====
+        if cutlass.const_expr(self.use_async_copy):
+            cute.autovec_copy(tXsX, tXrX)
+            cute.autovec_copy(tRsR, tRrR)
+            x_in = tXrX.load().to(Float32)
+            r_in = tRrR.load().to(Float32)
+            h = x_in + r_in
 
         w = tXrW.load().to(Float32)
+        y = h * rstd * (w + Float32(weight_bias))
 
-        # output = x * rstd * (weight + weight_bias)
-        # x is still in registers from Phase 1
-        y = x * rstd * (w + Float32(weight_bias))
+        tXrO.store(y.to(mX.element_type))
 
-        tYrY = y.to(mX.element_type)
-        tXrY = cute.make_rmem_tensor(tYgX.shape, mX.element_type)
-        tXrY.store(tYrY)
+        if row_in_bounds:
+            cute.copy(copy_atom_store, tXrO, tXgO, pred=tXpX)
 
-        cute.copy(copy_atom, tXrY, tYgX, pred=tXpX)
-
-        # PDL: Signal dependent kernels (SM90+ only)
         if enable_pdl:
             cute.arch.griddepcontrol_launch_dependents()
 
@@ -236,6 +424,9 @@ class FusedAddRMSNormQuantKernel:
     Computes:
     1. residual = input + residual (in-place update)
     2. output = clamp(residual / sqrt(mean(residual^2) + eps) * weight / scale, -448, 448)
+
+    Same multi-row / async-copy / cluster architecture as FusedAddRMSNormKernel,
+    with an element-wise FP8 clamp-convert-store loop replacing the vectorized output.
     """
 
     def __init__(
@@ -244,30 +435,57 @@ class FusedAddRMSNormQuantKernel:
         H: int,
         weight_bias: float = 0.0,
         use_hw_fp8: bool = True,
+        sm_version: int | None = None,
     ):
         self.dtype = dtype
         self.H = H
         self.weight_bias = weight_bias
         self.use_hw_fp8 = use_hw_fp8
+        self.sm_version = sm_version if sm_version is not None else get_sm_version()
 
-        # Vectorization parameters: use optimal vec_size for warp utilization
-        elem_bits = dtype.width
-        max_vec_size = COPY_BITS // elem_bits
-        self.vec_size = compute_optimal_vec_size(H, max_vec_size)
-        self.copy_bits = self.vec_size * elem_bits
+        self.cluster_n = FusedAddRMSNormKernel._compute_cluster_n(
+            H, dtype, self.sm_version
+        )
+        self.H_per_cta = H // self.cluster_n
 
-        self.threads_per_row = compute_threads_per_row(H, self.vec_size)
-        self.num_threads = self.threads_per_row
-        self.num_warps = max(self.threads_per_row // 32, 1)
+        elem_bytes = dtype.width // 8
+        max_vec_size = COPY_BITS // 8 // elem_bytes
+
+        h_align = self.H_per_cta & (-self.H_per_cta)
+        self.vec_size = min(h_align, max_vec_size)
+        self.copy_bits = self.vec_size * dtype.width
+
+        self.use_async_copy = self.copy_bits >= 32
+
+        self.threads_per_row = RMSNormKernel._compute_threads_per_row(self.H_per_cta)
+        self.num_threads = RMSNormKernel._compute_num_threads(self.H_per_cta)
+        self.rows_per_block = self.num_threads // self.threads_per_row
+        self.warps_per_row = max(self.threads_per_row // 32, 1)
 
         self.num_vec_blocks = max(
-            1, (H // self.vec_size + self.threads_per_row - 1) // self.threads_per_row
+            1,
+            (self.H_per_cta // self.vec_size + self.threads_per_row - 1)
+            // self.threads_per_row,
         )
         self.cols_per_tile = self.vec_size * self.num_vec_blocks * self.threads_per_row
 
     def _smem_size_in_bytes(self) -> int:
-        # Only reduction buffer needed (register-based approach)
-        return self.num_warps * 4
+        if self.use_async_copy:
+            tile_bytes = (
+                2 * self.rows_per_block * self.cols_per_tile * (self.dtype.width // 8)
+            )
+        else:
+            tile_bytes = 0
+
+        if self.cluster_n == 1:
+            reduction_bytes = self.rows_per_block * self.warps_per_row * 4
+        else:
+            reduction_bytes = (
+                self.rows_per_block * self.warps_per_row * self.cluster_n * 4
+            )
+
+        mbar_bytes = 8 if self.cluster_n > 1 else 0
+        return tile_bytes + reduction_bytes + mbar_bytes
 
     @cute.jit
     def __call__(
@@ -282,17 +500,21 @@ class FusedAddRMSNormQuantKernel:
         enable_pdl: cutlass.Constexpr[bool],
         stream,
     ):
-        tv_shape, tv_stride = make_tv_layout(
+        tv_shape, tv_stride = RMSNormKernel._make_tv_layout(
             self.threads_per_row,
+            self.rows_per_block,
             self.vec_size,
             self.num_vec_blocks,
         )
         tv_layout = cute.make_layout(tv_shape, stride=tv_stride)
-        tiler_mn = (1, self.cols_per_tile)
+        tiler_mn = (self.rows_per_block, self.cols_per_tile)
+
+        cluster_n = self.cluster_n
 
         self.kernel(mY, mX, mR, mW, M, mS, eps, enable_pdl, tv_layout, tiler_mn).launch(
-            grid=[M, 1, 1],
+            grid=[cute.ceil_div(M, self.rows_per_block), cluster_n, 1],
             block=[self.num_threads, 1, 1],
+            cluster=[1, cluster_n, 1] if cutlass.const_expr(cluster_n > 1) else None,
             smem=self._smem_size_in_bytes(),
             stream=stream,
             use_pdl=enable_pdl,
@@ -315,113 +537,216 @@ class FusedAddRMSNormQuantKernel:
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
 
-        # PDL: Wait for previous kernel (SM90+ only)
         if enable_pdl:
             cute.arch.griddepcontrol_wait()
 
         H = self.H
+        cluster_n = self.cluster_n
+        cols_per_tile = self.cols_per_tile
         weight_bias = self.weight_bias
-        threads_per_row = tv_layout.shape[0][0]
-        num_warps = self.num_warps
         copy_bits = self.copy_bits
         vec_size = self.vec_size
         num_vec_blocks = self.num_vec_blocks
+        threads_per_row = tv_layout.shape[0][0]
+        rows_per_block = tiler_mn[0]
+        warps_per_row = max(threads_per_row // 32, 1)
+
+        if cutlass.const_expr(cluster_n > 1):
+            cluster_y = cute.arch.block_idx()[1]
+        else:
+            cluster_y = cutlass.const_expr(0)
 
         inv_scale = rcp_approx_ftz(mS[0])
 
+        # ===== Allocate shared memory =====
         smem = cutlass.utils.SmemAllocator()
-        reduction_buffer = smem.allocate_tensor(
-            Float32,
-            cute.make_layout((num_warps,)),
-            byte_alignment=4,
-        )
 
+        if cutlass.const_expr(self.use_async_copy):
+            sX = smem.allocate_tensor(
+                mX.element_type,
+                cute.make_ordered_layout(tiler_mn, order=(1, 0)),
+                byte_alignment=16,
+            )
+            sR = smem.allocate_tensor(
+                mR.element_type,
+                cute.make_ordered_layout(tiler_mn, order=(1, 0)),
+                byte_alignment=16,
+            )
+
+        if cutlass.const_expr(cluster_n == 1):
+            reduction_buffer = smem.allocate_tensor(
+                Float32,
+                cute.make_layout((rows_per_block, warps_per_row)),
+                byte_alignment=4,
+            )
+            mbar_ptr = None
+        else:
+            reduction_buffer = smem.allocate_tensor(
+                Float32,
+                cute.make_layout((rows_per_block, (warps_per_row, cluster_n))),
+                byte_alignment=4,
+            )
+            mbar_ptr = smem.allocate_array(cutlass.Int64, num_elems=1)
+
+        # ===== Initialize cluster =====
+        if cutlass.const_expr(cluster_n > 1):
+            if tidx == 0:
+                cute.arch.mbarrier_init(mbar_ptr, 1)
+            cute.arch.mbarrier_init_fence()
+            cute.arch.cluster_arrive_relaxed()
+            cute.arch.cluster_wait()
+
+        # ===== Coordinate tracking and tiling =====
         idX = cute.make_identity_tensor(mX.shape)
 
-        gX = cute.local_tile(mX, tiler_mn, (bidx, 0))
-        gR = cute.local_tile(mR, tiler_mn, (bidx, 0))
-        cX = cute.local_tile(idX, tiler_mn, (bidx, 0))
+        gX = cute.local_tile(mX, tiler_mn, (bidx, cluster_y))
+        gR = cute.local_tile(mR, tiler_mn, (bidx, cluster_y))
+        cX = cute.local_tile(idX, tiler_mn, (bidx, cluster_y))
 
-        mW_2d = cute.prepend_ones(mW, up_to_rank=2)
+        mW_expanded_layout = cute.prepend(
+            mW.layout, cute.make_layout((tiler_mn[0],), stride=(0,))
+        )
+        mW_2d = cute.make_tensor(mW.iterator, mW_expanded_layout)
+        gW = cute.local_tile(mW_2d, tiler_mn, (0, cluster_y))
 
-        copy_atom_load = cute.make_copy_atom(
+        # ===== Create TiledCopy atoms =====
+        copy_atom_sync = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            mX.element_type,
+            num_bits_per_copy=copy_bits,
+        )
+        copy_atom_store = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
             mX.element_type,
             num_bits_per_copy=copy_bits,
         )
 
-        tiled_copy_load = cute.make_tiled_copy(copy_atom_load, tv_layout, tiler_mn)
-        thr_copy_load = tiled_copy_load.get_slice(tidx)
+        if cutlass.const_expr(self.use_async_copy):
+            copy_atom_async = cute.make_copy_atom(
+                cute.nvgpu.cpasync.CopyG2SOp(),
+                mX.element_type,
+                num_bits_per_copy=copy_bits,
+            )
+            tiled_copy_load = cute.make_tiled_copy(copy_atom_async, tv_layout, tiler_mn)
+        else:
+            tiled_copy_load = cute.make_tiled_copy(copy_atom_sync, tv_layout, tiler_mn)
 
-        tXgX = thr_copy_load.partition_S(gX)
-        tXgR = thr_copy_load.partition_S(gR)
-        tXgW = thr_copy_load.partition_S(mW_2d)
-        tXcX = thr_copy_load.partition_S(cX)
-        tYgR = thr_copy_load.partition_D(gR)
+        tiled_copy_W = cute.make_tiled_copy(copy_atom_sync, tv_layout, tiler_mn)
+        tiled_copy_store = cute.make_tiled_copy(copy_atom_store, tv_layout, tiler_mn)
 
-        # Register fragments - initialize to zero for proper handling of out-of-bounds threads
-        tXrX = cute.make_rmem_tensor(tXgX.shape, mX.element_type)
-        tXrR = cute.make_rmem_tensor(tXgR.shape, mR.element_type)
-        tXrW = cute.make_rmem_tensor(tXgW.shape, mW.element_type)
-        tXrX.store(cute.zeros_like(tXrX, dtype=mX.element_type))
-        tXrR.store(cute.zeros_like(tXrR, dtype=mR.element_type))
-        tXrW.store(cute.zeros_like(tXrW, dtype=mW.element_type))
+        thr_copy_X = tiled_copy_load.get_slice(tidx)
+        thr_copy_W = tiled_copy_W.get_slice(tidx)
+        thr_copy_O = tiled_copy_store.get_slice(tidx)
 
+        # Partition input
+        tXgX = thr_copy_X.partition_S(gX)
+        tXcX = thr_copy_X.partition_S(cX)
+        tXrX = cute.make_fragment_like(tXgX)
+
+        # Partition residual (same load tiled copy)
+        tRgR = thr_copy_X.partition_S(gR)
+        tRrR = cute.make_fragment_like(tRgR)
+
+        if cutlass.const_expr(self.use_async_copy):
+            tXsX = thr_copy_X.partition_D(sX)
+            tRsR = thr_copy_X.partition_D(sR)
+
+        # Partition weight (sync, separate tiled copy)
+        tWgW = thr_copy_W.partition_S(gW)
+        tWrW = cute.make_fragment_like(tWgW)
+        tXrW = thr_copy_X.retile(tWrW)
+
+        # Partition residual store destination (match non-quant kernel pattern)
+        tRgO = thr_copy_O.partition_D(gR)
+        tXgO_r = thr_copy_O.partition_D(gX)
+        tRrO = cute.make_fragment_like(tXgO_r)
+
+        # ===== Bounds checking =====
         tXpX = predicate_k(tXcX, limit=H)
+        tWpW = predicate_k(thr_copy_W.partition_S(cX), limit=H)
+        row_coord = tXcX[(0, 0), 0, 0]
+        row_in_bounds = row_coord[0] < M
 
-        # Phase 1: Load input and residual from global to register
-        cute.copy(copy_atom_load, tXgX, tXrX, pred=tXpX)
-        cute.copy(copy_atom_load, tXgR, tXrR, pred=tXpX)
+        # ===== Pass 1: Load input + residual, compute h, reduce =====
+        if cutlass.const_expr(self.use_async_copy):
+            if row_in_bounds:
+                cute.copy(copy_atom_async, tXgX, tXsX, pred=tXpX)
+                cute.copy(copy_atom_async, tRgR, tRsR, pred=tXpX)
+            cute.arch.cp_async_commit_group()
+
+            cute.copy(copy_atom_sync, tWgW, tWrW, pred=tWpW)
+
+            cute.arch.cp_async_wait_group(0)
+
+            cute.autovec_copy(tXsX, tXrX)
+            cute.autovec_copy(tRsR, tRrR)
+        else:
+            tXrX.store(cute.zeros_like(tXrX, dtype=mX.element_type))
+            tRrR.store(cute.zeros_like(tRrR, dtype=mR.element_type))
+            if row_in_bounds:
+                cute.copy(copy_atom_sync, tXgX, tXrX, pred=tXpX)
+                cute.copy(copy_atom_sync, tRgR, tRrR, pred=tXpX)
+
+            cute.copy(copy_atom_sync, tWgW, tWrW, pred=tWpW)
 
         x_in = tXrX.load().to(Float32)
-        r_in = tXrR.load().to(Float32)
-        x = x_in + r_in
+        r_in = tRrR.load().to(Float32)
+        h = x_in + r_in
 
-        # Store x to residual (global)
-        tXrR_out = x.to(mR.element_type)
-        tXrR_store = cute.make_rmem_tensor(tYgR.shape, mR.element_type)
-        tXrR_store.store(tXrR_out)
-        cute.copy(copy_atom_load, tXrR_store, tYgR, pred=tXpX)
+        # Write h to residual (global)
+        tRrO.store(h.to(mR.element_type))
+        if row_in_bounds:
+            cute.copy(copy_atom_store, tRrO, tRgO, pred=tXpX)
 
-        # Phase 2: Compute sum of squares (x is kept in registers)
-        x_sq = x * x
-        sum_sq = row_reduce_sum(x_sq, threads_per_row, reduction_buffer)
+        h_sq = h * h
+        sum_sq = row_reduce_sum_multirow(
+            h_sq, threads_per_row, reduction_buffer, mbar_ptr, cluster_n
+        )
 
         mean_sq = sum_sq / Float32(H)
         rstd = cute.math.rsqrt(mean_sq + eps, fastmath=True)
 
-        # Phase 3: Load weight from global to register
-        cute.copy(copy_atom_load, tXgW, tXrW, pred=tXpX)
+        if cutlass.const_expr(cluster_n > 1):
+            cute.arch.cluster_arrive_relaxed()
+            cute.arch.cluster_wait()
+        else:
+            cute.arch.barrier()
+
+        # ===== Pass 2: Normalize, quantize, and store FP8 output =====
+        if cutlass.const_expr(self.use_async_copy):
+            cute.autovec_copy(tXsX, tXrX)
+            cute.autovec_copy(tRsR, tRrR)
+            x_in = tXrX.load().to(Float32)
+            r_in = tRrR.load().to(Float32)
+            h = x_in + r_in
+
         w = tXrW.load().to(Float32)
+        y = h * rstd * (w + Float32(weight_bias)) * inv_scale
 
-        # output = x * rstd * (weight + weight_bias) * inv_scale
-        # x is still in registers from Phase 1
-        y = x * rstd * (w + Float32(weight_bias)) * inv_scale
-
-        # Phase 4: Clamp and store to FP8 output using PTX scalar stores
-        # (CuTe FP8 conversion requires vectorized ops, so we use PTX for scalar stores)
-        # Store y to register tensor for element-wise access
-        tYrY_f32 = cute.make_rmem_tensor(tXgX.shape, Float32)
+        tYrY_f32 = cute.make_rmem_tensor(tXrX.shape, Float32)
         tYrY_f32.store(y)
 
-        col_offset = tidx * vec_size
+        lane_in_row = tidx % threads_per_row
+        row_in_block = tidx // threads_per_row
+        actual_row = bidx * rows_per_block + row_in_block
+        col_offset = lane_in_row * vec_size
+
         for v in cutlass.range_constexpr(num_vec_blocks):
             for e in cutlass.range_constexpr(vec_size):
-                idx = col_offset + v * threads_per_row * vec_size + e
-                if idx < H:
-                    # Clamp and convert - use flat index for register tensor
+                local_col = col_offset + v * threads_per_row * vec_size + e
+                abs_col = cluster_y * cols_per_tile + local_col
+                if abs_col < H:
                     flat_idx = v * vec_size + e
                     clamped = max(tYrY_f32[flat_idx], Float32(-FLOAT8_E4M3_MAX))
                     clamped = min(clamped, Float32(FLOAT8_E4M3_MAX))
-                    # Use PTX to convert and store FP8 byte
-                    out_offset = bidx * H + idx
-                    out_ptr = get_ptr_as_int64(mY, Int32(out_offset))
-                    if self.use_hw_fp8:
-                        cvt_and_store_f32_to_e4m3_hw(clamped, out_ptr)
-                    else:
-                        cvt_and_store_f32_to_e4m3_sw(clamped, out_ptr)
+                    if actual_row < M:
+                        out_offset = actual_row * H + abs_col
+                        out_ptr = get_ptr_as_int64(mY, Int32(out_offset))
+                        if self.use_hw_fp8:
+                            cvt_and_store_f32_to_e4m3_hw(clamped, out_ptr)
+                        else:
+                            cvt_and_store_f32_to_e4m3_sw(clamped, out_ptr)
 
-        # PDL: Signal dependent kernels (SM90+ only)
         if enable_pdl:
             cute.arch.griddepcontrol_launch_dependents()
 
@@ -433,23 +758,31 @@ class FusedAddRMSNormQuantKernel:
 
 @functools.cache
 def _get_compiled_fused_add_rmsnorm_kernel(
-    dtype_str: str, H: int, weight_bias: float, enable_pdl: bool
+    dtype_str: str,
+    H: int,
+    weight_bias: float,
+    enable_pdl: bool,
+    sm_version: int,
 ):
     """Get a compiled Fused Add + RMSNorm kernel using TVM-FFI."""
     dtype = get_cutlass_dtype(dtype_str)
-    kernel_obj = FusedAddRMSNormKernel(dtype, H, weight_bias)
+    kernel_obj = FusedAddRMSNormKernel(dtype, H, weight_bias, sm_version=sm_version)
 
     sym_m = cute.sym_int()
-    sym_row_stride_x = cute.sym_int(divisibility=kernel_obj.vec_size)
-    sym_row_stride_r = cute.sym_int(divisibility=kernel_obj.vec_size)
 
-    x_fake = cute.runtime.make_fake_tensor(
-        dtype, (sym_m, H), (sym_row_stride_x, 1), assumed_align=16
+    elem_bytes = dtype.width // 8
+    row_bytes = H * elem_bytes
+    tensor_align = math.gcd(128, row_bytes)
+
+    x_fake = cute.runtime.make_fake_compact_tensor(
+        dtype, (sym_m, H), stride_order=(1, 0), assumed_align=tensor_align
     )
-    r_fake = cute.runtime.make_fake_tensor(
-        dtype, (sym_m, H), (sym_row_stride_r, 1), assumed_align=16
+    r_fake = cute.runtime.make_fake_compact_tensor(
+        dtype, (sym_m, H), stride_order=(1, 0), assumed_align=tensor_align
     )
-    w_fake = cute.runtime.make_fake_compact_tensor(dtype, (H,), assumed_align=16)
+    w_fake = cute.runtime.make_fake_compact_tensor(
+        dtype, (H,), assumed_align=tensor_align
+    )
 
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
@@ -476,29 +809,35 @@ def _get_compiled_fused_add_rmsnorm_quant_kernel(
     weight_bias: float,
     enable_pdl: bool,
     use_hw_fp8: bool = True,
+    sm_version: int = 80,
 ):
     """Get a compiled Fused Add + RMSNorm + Quant kernel using TVM-FFI."""
     dtype = get_cutlass_dtype(dtype_str)
     out_dtype = get_cutlass_dtype(out_dtype_str)
     kernel_obj = FusedAddRMSNormQuantKernel(
-        dtype, H, weight_bias, use_hw_fp8=use_hw_fp8
+        dtype, H, weight_bias, use_hw_fp8=use_hw_fp8, sm_version=sm_version
     )
 
     sym_m = cute.sym_int()
-    sym_row_stride_y = cute.sym_int(divisibility=kernel_obj.vec_size)
-    sym_row_stride_x = cute.sym_int(divisibility=kernel_obj.vec_size)
-    sym_row_stride_r = cute.sym_int(divisibility=kernel_obj.vec_size)
 
-    y_fake = cute.runtime.make_fake_tensor(
-        out_dtype, (sym_m, H), (sym_row_stride_y, 1), assumed_align=16
+    in_elem_bytes = dtype.width // 8
+    in_row_bytes = H * in_elem_bytes
+    in_align = math.gcd(128, in_row_bytes)
+
+    out_elem_bytes = out_dtype.width // 8
+    out_row_bytes = H * out_elem_bytes
+    out_align = math.gcd(128, out_row_bytes)
+
+    y_fake = cute.runtime.make_fake_compact_tensor(
+        out_dtype, (sym_m, H), stride_order=(1, 0), assumed_align=out_align
     )
-    x_fake = cute.runtime.make_fake_tensor(
-        dtype, (sym_m, H), (sym_row_stride_x, 1), assumed_align=16
+    x_fake = cute.runtime.make_fake_compact_tensor(
+        dtype, (sym_m, H), stride_order=(1, 0), assumed_align=in_align
     )
-    r_fake = cute.runtime.make_fake_tensor(
-        dtype, (sym_m, H), (sym_row_stride_r, 1), assumed_align=16
+    r_fake = cute.runtime.make_fake_compact_tensor(
+        dtype, (sym_m, H), stride_order=(1, 0), assumed_align=in_align
     )
-    w_fake = cute.runtime.make_fake_compact_tensor(dtype, (H,), assumed_align=16)
+    w_fake = cute.runtime.make_fake_compact_tensor(dtype, (H,), assumed_align=in_align)
     s_fake = cute.runtime.make_fake_compact_tensor(Float32, (1,), assumed_align=4)
 
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -535,19 +874,28 @@ def fused_add_rmsnorm_cute(
 ) -> None:
     """CuTe DSL Fused Add + RMSNorm implementation.
 
-    Supports arbitrary stride - no need to call contiguous().
-    Last dimension must be contiguous (stride[-1] == 1).
+    Input and residual are made contiguous for the kernel, then results are
+    copied back if the originals were non-contiguous. Both input and residual
+    are modified in-place.
     """
 
     shape = input.shape
     H = shape[-1]
     M = shape[0]
 
+    input_contig = input.contiguous()
+    residual_contig = residual.contiguous()
+
     dtype_str = _torch_dtype_to_str(input.dtype)
     kernel = _get_compiled_fused_add_rmsnorm_kernel(
-        dtype_str, H, weight_bias, enable_pdl
+        dtype_str, H, weight_bias, enable_pdl, get_sm_version(input.device)
     )
-    kernel(input, residual, weight, M, eps)
+    kernel(input_contig, residual_contig, weight.contiguous(), M, eps)
+
+    if not input.is_contiguous():
+        input.copy_(input_contig)
+    if not residual.is_contiguous():
+        residual.copy_(residual_contig)
 
 
 def fused_add_rmsnorm_quant_cute(
@@ -562,13 +910,15 @@ def fused_add_rmsnorm_quant_cute(
 ) -> None:
     """CuTe DSL Fused Add + RMSNorm + FP8 quantization implementation.
 
-    Supports arbitrary stride - no need to call contiguous().
-    Last dimension must be contiguous (stride[-1] == 1).
+    Input is read-only (made contiguous for kernel). Residual is modified
+    in-place with h = input + residual, then copied back if non-contiguous.
     """
 
     shape = input.shape
     H = shape[-1]
     M = shape[0]
+
+    residual_contig = residual.contiguous()
 
     dtype_str = _torch_dtype_to_str(input.dtype)
     out_dtype_str = _torch_dtype_to_str(out.dtype)
@@ -579,16 +929,20 @@ def fused_add_rmsnorm_quant_cute(
         weight_bias,
         enable_pdl,
         use_hw_fp8=has_hw_fp8_cvt(input.device),
+        sm_version=get_sm_version(input.device),
     )
     kernel(
         out,
-        input,
-        residual,
-        weight,
+        input.contiguous(),
+        residual_contig,
+        weight.contiguous(),
         M,
         scale,
         eps,
     )
+
+    if not residual.is_contiguous():
+        residual.copy_(residual_contig)
 
 
 __all__ = [
