@@ -14,9 +14,7 @@ Output types: bf16, FP8 E4M3 (SM89+), NVFP4 E2M1 (SM100+).
 
 import functools
 from typing import Optional
-
 import torch
-
 import cudnn
 
 _TORCH_TO_CUDNN_OUTPUT_DTYPE = {
