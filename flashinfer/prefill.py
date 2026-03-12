@@ -3312,7 +3312,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 q.device,
                 "out",
             )
-<<<<<<< HEAD
         if self._backend == "cute-dsl":
             # These checks live here (not in plan()) because return_lse and
             # scale parameters are run()-time arguments that can vary between
