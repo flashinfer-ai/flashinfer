@@ -925,5 +925,133 @@ class TestExpertParallelism:
         )
 
 
+# =============================================================================
+# Test Class: All Valid Tactics
+# =============================================================================
+
+
+@cute_dsl_available
+@sm100_required
+class TestAllValidTactics:
+    """Test that every tactic returned by get_valid_tactics produces correct output.
+
+    For each problem configuration, gets the filtered list of valid tactics via
+    can_implement checks, then runs CuteDslMoEWrapper with each tactic explicitly
+    and verifies numerical accuracy against the reference implementation.
+    """
+
+    @pytest.mark.parametrize(
+        "num_tokens,hidden_size,intermediate_size,num_experts,top_k",
+        [
+            (128, 256, 512, 256, 2),
+            (256, 1024, 2048, 256, 8),
+        ],
+    )
+    def test_all_tactics_accuracy(
+        self,
+        num_tokens: int,
+        hidden_size: int,
+        intermediate_size: int,
+        num_experts: int,
+        top_k: int,
+    ):
+        """Verify every valid tactic produces correct output."""
+        from flashinfer import CuteDslMoEWrapper
+
+        num_local_experts = num_experts
+
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_local_experts,
+            top_k=top_k,
+        )
+
+        ref_output = compute_reference_moe_fp4(
+            hidden_states=tensors["x_bf16"].float().cuda(),
+            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
+            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=tensors["fc2_input_scale"],
+        )
+
+        # Create wrapper without CUDA graph so we can freely try different tile_sizes
+        moe = CuteDslMoEWrapper(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            use_cuda_graph=False,
+        )
+
+        # Get the filtered list of valid tactics for this problem size
+        inputs = [
+            tensors["x"],
+            tensors["x_sf"],
+            tensors["token_selected_experts"],
+            tensors["token_final_scales"],
+            tensors["w1_weight"],
+            tensors["w1_weight_sf"],
+            tensors["w1_alpha"],
+            tensors["fc2_input_scale"],
+            tensors["w2_weight"],
+            tensors["w2_weight_sf"],
+            tensors["w2_alpha"],
+        ]
+        valid_tactics = moe._runner.get_valid_tactics(inputs, None)
+        assert len(valid_tactics) > 0, "No valid tactics found"
+
+        num_passed = 0
+        num_failed = 0
+        for tactic in valid_tactics:
+            tile_size = tactic[0]
+            result = moe.run(
+                x=tensors["x"],
+                x_sf=tensors["x_sf"],
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+                w1_weight=tensors["w1_weight"],
+                w1_weight_sf=tensors["w1_weight_sf"],
+                w1_alpha=tensors["w1_alpha"],
+                fc2_input_scale=tensors["fc2_input_scale"],
+                w2_weight=tensors["w2_weight"],
+                w2_weight_sf=tensors["w2_weight_sf"],
+                w2_alpha=tensors["w2_alpha"],
+                tactic=tactic,
+            )
+
+            assert result.shape == (num_tokens, hidden_size)
+            assert not torch.isnan(result).any(), f"NaN in output for tactic {tactic}"
+            assert not torch.isinf(result).any(), f"Inf in output for tactic {tactic}"
+
+            passed, percent_within, atol = check_accuracy(result, ref_output)
+            if passed:
+                num_passed += 1
+            else:
+                num_failed += 1
+                # Don't fail immediately; report all failures at the end
+                print(
+                    f"[FAIL] tactic tile_size={tile_size} "
+                    f"gemm1={tactic[1][0]},{tactic[1][1]} "
+                    f"gemm2={tactic[2][0]},{tactic[2][1]}: "
+                    f"{percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
+                )
+
+        total = len(valid_tactics)
+        assert num_failed == 0, (
+            f"{num_failed}/{total} tactics failed accuracy check "
+            f"(tokens={num_tokens}, hidden={hidden_size}, "
+            f"intermediate={intermediate_size}, experts={num_experts}, top_k={top_k})"
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

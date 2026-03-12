@@ -483,6 +483,10 @@ class CuteDslMoEWrapper:
         **kwargs,
     ) -> torch.Tensor:
         """Forward implementation called by auto-tuner."""
+        # Pre-allocated buffers are sized for self.tile_size. When the tactic
+        # uses a different tile_size (e.g. during autotune), fall back to
+        # dynamic allocation to avoid buffer overflow in moe_sort.
+        use_prealloc = self.use_cuda_graph and tile_size == self.tile_size
         return _moe_core_impl(
             x=x,
             x_sf=x_sf,
@@ -504,12 +508,12 @@ class CuteDslMoEWrapper:
             gemm1_cluster_shape_mn=gemm1_cluster_shape_mn,
             gemm2_mma_tiler_mn=gemm2_mma_tiler_mn,
             gemm2_cluster_shape_mn=gemm2_cluster_shape_mn,
-            moe_sort_buffers=self._moe_sort_buffers if self.use_cuda_graph else None,
-            gemm1_out=self._gemm1_output if self.use_cuda_graph else None,
-            gemm1_out_scale=self._gemm1_output_scale if self.use_cuda_graph else None,
+            moe_sort_buffers=self._moe_sort_buffers if use_prealloc else None,
+            gemm1_out=self._gemm1_output if use_prealloc else None,
+            gemm1_out_scale=self._gemm1_output_scale if use_prealloc else None,
             moe_output=moe_output
             if moe_output is not None
-            else (self._moe_output if self.use_cuda_graph else None),
+            else (self._moe_output if use_prealloc else None),
             aux_stream=self._aux_stream,
             main_event=self._main_event,
             memset_event=self._memset_event,
