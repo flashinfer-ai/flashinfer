@@ -25,6 +25,7 @@ Common utilities used by all norm kernels:
 - Type conversion utilities
 """
 
+import functools
 import math
 import operator
 from typing import Callable
@@ -191,6 +192,17 @@ def has_hw_fp8_cvt(device: torch.device = None) -> bool:
     return major > 8 or (major == 8 and minor >= 9)
 
 
+@functools.lru_cache(maxsize=16)
+def get_sm_version(device=None) -> int:
+    """Get the SM version of a CUDA device (e.g., 100 for SM100)."""
+    if not torch.cuda.is_available():
+        return 80
+    if device is None:
+        device = torch.cuda.current_device()
+    props = torch.cuda.get_device_properties(device)
+    return props.major * 10 + props.minor
+
+
 @dsl_user_op
 def get_ptr_as_int64(tensor: cute.Tensor, offset: Int32, *, loc=None, ip=None) -> Int64:
     """Get the memory address of tensor[offset] as Int64."""
@@ -259,6 +271,58 @@ def row_reduce_sum(
 
     if cutlass.const_expr(warps_per_row > 1):
         return block_reduce(warp_val, operator.add, reduction_buffer, Float32(0.0))
+    else:
+        return warp_val
+
+
+@cute.jit
+def block_reduce_multirow(
+    val: Float32,
+    op: Callable,
+    reduction_buffer: cute.Tensor,
+    init_val: Float32,
+) -> Float32:
+    """Block reduction with 2D buffer (rows_per_block, warps_per_row).
+
+    Each warp writes its partial sum to the row it belongs to, then
+    lane 0..warps_per_row-1 read back and do a final warp reduction.
+    """
+    lane_idx = cute.arch.lane_idx()
+    warp_idx = cute.arch.warp_idx()
+    warps_per_row = cute.size(reduction_buffer.shape[1])
+    row_idx = warp_idx // warps_per_row
+    col_idx = warp_idx % warps_per_row
+
+    if lane_idx == 0:
+        reduction_buffer[row_idx, col_idx] = val
+    cute.arch.barrier()
+
+    block_reduce_val = init_val
+    if lane_idx < warps_per_row:
+        block_reduce_val = reduction_buffer[row_idx, lane_idx]
+    return warp_reduce(block_reduce_val, op)
+
+
+@cute.jit
+def row_reduce_sum_multirow(
+    x: cute.TensorSSA,
+    threads_per_row: cutlass.Constexpr[int],
+    reduction_buffer: cute.Tensor,
+) -> Float32:
+    """Row reduction for sum with 2D buffer (rows_per_block, warps_per_row)."""
+    local_val = x.reduce(
+        cute.ReductionOp.ADD, init_val=Float32(0.0), reduction_profile=0
+    )
+
+    warp_width = min(threads_per_row, 32)
+    warp_val = warp_reduce(local_val, operator.add, width=warp_width)
+
+    warps_per_row = max(threads_per_row // 32, 1)
+
+    if cutlass.const_expr(warps_per_row > 1):
+        return block_reduce_multirow(
+            warp_val, operator.add, reduction_buffer, Float32(0.0)
+        )
     else:
         return warp_val
 
@@ -416,10 +480,14 @@ __all__ = [
     "cvt_and_store_f32_to_e4m3_sw",
     "has_hw_fp8_cvt",
     "get_ptr_as_int64",
+    # Device utilities
+    "get_sm_version",
     # Reduction utilities
     "warp_reduce",
     "block_reduce",
     "row_reduce_sum",
+    "block_reduce_multirow",
+    "row_reduce_sum_multirow",
     # Predicate utilities
     "predicate_k",
     "predicate_k_3d",
