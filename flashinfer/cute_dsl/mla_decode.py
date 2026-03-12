@@ -152,9 +152,9 @@ def _get_compiled_mla_kernel(
     # Static Python ints would cause cute.assume() to fail with AttributeError
     # inside initialize_workspace() since it expects DSL Integer types.
     sym_heads = cute.sym_int()
-    sym_latent = cute.sym_int()
+    sym_latent = cute.sym_int(divisibility=16)
     sym_seq_q = cute.sym_int()
-    sym_rope = cute.sym_int()
+    sym_rope = cute.sym_int(divisibility=16)
     sym_batch = cute.sym_int()  # query/output batch dimension
     sym_kv_batch = cute.sym_int()  # KV cache batch dim (flat pool, =1 in paged mode)
     sym_seq_kv = cute.sym_int()
@@ -260,7 +260,7 @@ def _get_compiled_mla_kernel(
         Float32(1.0),  # softmax_scale placeholder
         Float32(1.0),  # output_scale placeholder
         stream_fake,
-        options="--enable-tvm-ffi",
+        options="--enable-tvm-ffi --opt-level 2",
     )
 
     return compiled_kernel
