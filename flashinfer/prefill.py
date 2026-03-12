@@ -3640,7 +3640,10 @@ def trtllm_batch_context_with_kv_cache(
     workspace_buffer : torch.Tensor. Must be initialized to 0 for its first use.
         workspace
     block_tables : torch.Tensor
-        page_table of kv cache, [batch_size, num_pages]
+        Page table of kv cache.
+        When ``uses_shared_paged_kv_idx`` is True (default): shape ``[batch_size, max_num_pages_per_seq]``.
+        When ``uses_shared_paged_kv_idx`` is False: shape ``[batch_size, 2, max_num_pages_per_seq]``
+        where dim 1 distinguishes K (0) and V (1) page indices.
     seq_lens : torch.Tensor
         A uint32 1D tensor indicating the kv sequence length of each prompt. shape: ``[batch_size]``
     max_q_len : int
@@ -3683,9 +3686,10 @@ def trtllm_batch_context_with_kv_cache(
         If no value is provided, then standard attention is used.
         Setting the threshold to a higher value generally increases kernel performance at the cost of accuracy degradation.
         The actual threshold value equals the provided threshold_scale_factor divided by the context length.
-    uses_shared_paged_kv_idx: bool = True
-        Whether the indices for K & V pages are shared as unified index.
-        true -> vLLM/FlashInfer; false -> TRT-LLM.
+    uses_shared_paged_kv_idx : bool = True
+        Whether the K and V page indices are shared as a unified index.
+        True (default) uses vLLM/FlashInfer layout with a 2D page table.
+        False uses TRT-LLM layout with a 3D page table ``[batch_size, 2, max_num_pages_per_seq]``.
     Returns
     -------
     out: Union[torch.Tensor, FP4Tensor]
