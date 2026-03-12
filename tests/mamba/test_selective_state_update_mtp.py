@@ -1444,7 +1444,25 @@ class TestSelectiveStateUpdateMTPVerticalInt16RejectsScaleState(
 ):
     """Test that vertical algorithm rejects int16 quantized state (scaleState) with a clear error."""
 
-    def run_kernel(self, inputs, out=None, disable_state_update=False):
+    @pytest.mark.parametrize(
+        "batch,nheads,dim,dstate,cache_steps,state_dtype,weight_dtype,use_out_tensor",
+        [(64, 64, 64, 128, 4, torch.bfloat16, torch.float32, True)],
+    )
+    def test_output_correctness(
+        self,
+        batch,
+        nheads,
+        dim,
+        dstate,
+        cache_steps,
+        state_dtype,
+        weight_dtype,
+        use_out_tensor,
+    ):
+        """Verify that vertical algorithm raises RuntimeError for scaleState."""
+        inputs = self.make_inputs(
+            batch, nheads, dim, dstate, cache_steps, state_dtype, weight_dtype
+        )
         with pytest.raises(
             RuntimeError, match="vertical algorithm does not support scaled"
         ):
@@ -1456,17 +1474,13 @@ class TestSelectiveStateUpdateMTPVerticalInt16RejectsScaleState(
                 inputs["B"],
                 inputs["C"],
                 D=inputs["D"],
-                z=inputs.get("z"),
                 dt_bias=inputs["dt_bias"],
                 dt_softplus=True,
                 state_batch_indices=inputs["slot_idx"],
                 pad_slot_id=-1,
-                out=out,
-                disable_state_update=disable_state_update,
                 state_scale=inputs["state_scale"],
                 algorithm="vertical",
             )
-        pytest.skip("Correctly rejected — scaleState not supported by vertical kernel")
 
 
 @_requires_sm100
