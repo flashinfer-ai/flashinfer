@@ -1127,7 +1127,7 @@ def main():
     args = parser.parse_args()
 
     if not is_sm100_family():
-        print("ERROR: Requires SM100 family GPU (Blackwell: SM100, SM103, SM110)")
+        print("ERROR: Requires SM100 family GPU (Blackwell: SM100, SM103)")
         return 1
 
     # Determine token counts
