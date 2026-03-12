@@ -313,6 +313,10 @@ def cute_dsl_mla_decode(
         Scale factor applied to the output.
     out : Optional[torch.Tensor]
         Pre-allocated output tensor [B, q_len, H, kv_lora_rank].
+    is_var_seq : bool
+        Whether the sequence length is variable.
+        If True, the sequence length is variable.
+        Otherwise,the sequence length is fixed for all the requests in the batch.
 
     Returns
     -------

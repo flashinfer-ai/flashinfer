@@ -634,6 +634,10 @@ def trtllm_batch_decode_with_kv_cache_mla(
         When set to ``auto``, the backend will be chosen based on the device architecture and kernel availability.
         For sm_100 and sm_103 (blackwell architecture), ``auto`` will choose ``trtllm-gen`` backend.
         For sm_120 (blackwell architecture), ``auto`` will choose ``xqa`` backend.
+    is_var_seq : bool
+        Whether the sequence length is variable.
+        If True, the sequence length is variable.
+        Otherwise,the sequence length is fixed for all the requests in the batch.
 
     Note
     ----
