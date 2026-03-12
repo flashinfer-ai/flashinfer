@@ -18,18 +18,10 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
-
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-#include <cuda_fp8.h>
-typedef __nv_fp8_e4m3 fp8_e4m3;
-#define HAS_FP8_SUPPORT 1
-#else
-typedef uint8_t fp8_e4m3;
-#define HAS_FP8_SUPPORT 0
-#endif
 
 #include "tvm_ffi_utils.h"
 
@@ -109,7 +101,6 @@ __global__ void nvfp4_dequant_vectorized_kernel(const uint8_t* __restrict__ fp4_
       const uint8_t scale_fp8_0 = smem_scales[scale_idx_0];
       const uint8_t scale_fp8_1 = smem_scales[scale_idx_1];
 
-      static_assert(HAS_FP8_SUPPORT, "FP4 KV dequantization requires SM80+ for FP8 E4M3 support");
       const float scale_0 =
           static_cast<float>(*reinterpret_cast<const __nv_fp8_e4m3*>(&scale_fp8_0));
       const float scale_1 =
@@ -171,13 +162,15 @@ void nvfp4_kv_dequant(TensorView fp4_data, TensorView block_scales, TensorView g
   dim3 grid(M);
   dim3 block(BLOCK_SIZE);
 
+  constexpr int ELTS_PER_THREAD = 16;
   const size_t smem_size = sizeof(float) + static_cast<size_t>(K / NVFP4_BLOCK_SIZE);
 
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(output.dtype(), c_type, [&] {
-    nvfp4_dequant_vectorized_kernel<c_type, BLOCK_SIZE, 16><<<grid, block, smem_size, stream>>>(
-        static_cast<const uint8_t*>(fp4_data.data_ptr()),
-        static_cast<const uint8_t*>(block_scales.data_ptr()), scale_ptr,
-        static_cast<c_type*>(output.data_ptr()), M, K);
+    nvfp4_dequant_vectorized_kernel<c_type, BLOCK_SIZE, ELTS_PER_THREAD>
+        <<<grid, block, smem_size, stream>>>(static_cast<const uint8_t*>(fp4_data.data_ptr()),
+                                             static_cast<const uint8_t*>(block_scales.data_ptr()),
+                                             scale_ptr, static_cast<c_type*>(output.data_ptr()), M,
+                                             K);
     return true;
   });
 }

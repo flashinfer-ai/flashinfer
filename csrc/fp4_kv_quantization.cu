@@ -18,18 +18,10 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
-
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-#include <cuda_fp8.h>
-typedef __nv_fp8_e4m3 fp8_e4m3;
-#define HAS_FP8_SUPPORT 1
-#else
-typedef uint8_t fp8_e4m3;
-#define HAS_FP8_SUPPORT 0
-#endif
 
 #include "tvm_ffi_utils.h"
 
@@ -84,6 +76,9 @@ inline __device__ uint32_t fp32_vec_to_e2m1(float2 (&array)[4]) {
         "f"(array[2].y), "f"(array[3].x), "f"(array[3].y));
   return val;
 #else
+  // E2M1 conversion requires SM100+; abort at runtime if this code path is ever reached.
+  // Note: static_assert cannot be used here because NVCC evaluates both preprocessor branches.
+  __trap();
   return 0;
 #endif
 }
@@ -123,7 +118,6 @@ __device__ uint32_t quantize_fp16_to_e2m1_with_scaling(InType (&vec)[4], float g
   auto sf_value =
       reciprocal_approximate_ftz(global_scale) * (vecMax * reciprocal_approximate_ftz(6.0f));
 
-  static_assert(HAS_FP8_SUPPORT, "FP4 KV quantization requires SM80+ for FP8 E4M3 support");
   __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(sf_value);
   fp8_scale_val = tmp.__x;
   sf_value = static_cast<float>(tmp);
@@ -152,13 +146,33 @@ __device__ uint32_t quantize_fp16_to_e2m1_with_scaling(InType (&vec)[4], float g
   return e2m1_vec;
 }
 
-// Quantization kernel for BF16 to NVFP4
-template <int BLOCK_SIZE = 128, int ELTS_PER_THREAD = 16>
-__global__ void nvfp4_quant_from_bf16_kernel(const __nv_bfloat16* __restrict__ input,
-                                             const float* __restrict__ global_scale_ptr,
-                                             uint8_t* __restrict__ fp4_output,
-                                             uint8_t* __restrict__ block_scales, const int M,
-                                             const int K) {
+// Type traits for FP16/BF16 packed types and zero-initialization
+template <typename T>
+struct fp16_traits;
+
+template <>
+struct fp16_traits<__nv_bfloat16> {
+  using packed_type = __nv_bfloat162;
+  static __device__ __forceinline__ __nv_bfloat16 zero() { return __float2bfloat16(0.0f); }
+  static __device__ __forceinline__ __nv_bfloat162 zero2() { return __float2bfloat162_rn(0.0f); }
+};
+
+template <>
+struct fp16_traits<half> {
+  using packed_type = half2;
+  static __device__ __forceinline__ half zero() { return __float2half(0.0f); }
+  static __device__ __forceinline__ half2 zero2() { return __float2half2_rn(0.0f); }
+};
+
+// Unified quantization kernel for FP16/BF16 to NVFP4
+template <typename InType, int BLOCK_SIZE = 128, int ELTS_PER_THREAD = 16>
+__global__ void nvfp4_quant_kernel(const InType* __restrict__ input,
+                                   const float* __restrict__ global_scale_ptr,
+                                   uint8_t* __restrict__ fp4_output,
+                                   uint8_t* __restrict__ block_scales, const int M, const int K) {
+  using traits = fp16_traits<InType>;
+  using PackedType = typename traits::packed_type;
+
   const int row = blockIdx.x;
   const int tid = threadIdx.x;
 
@@ -175,7 +189,7 @@ __global__ void nvfp4_quant_from_bf16_kernel(const __nv_bfloat16* __restrict__ i
   constexpr int PACKED_PER_THREAD = CVT_ELTS_PER_THREAD / 2;
   const int elts_per_block = BLOCK_SIZE * CVT_ELTS_PER_THREAD;
 
-  const __nv_bfloat16* row_input = input + row * K;
+  const InType* row_input = input + row * K;
   uint8_t* row_fp4 = fp4_output + row * (K / 2);
   uint8_t* row_scales = block_scales + row * (K / NVFP4_BLOCK_SIZE);
 
@@ -184,82 +198,18 @@ __global__ void nvfp4_quant_from_bf16_kernel(const __nv_bfloat16* __restrict__ i
 
     if (col_start >= K) break;
 
-    __nv_bfloat162 vec[4];
+    PackedType vec[4];
 
 #pragma unroll
     for (int i = 0; i < PACKED_PER_THREAD; ++i) {
       const int col = col_start + i * 2;
       if (col + 1 < K) {
-        vec[i] = *reinterpret_cast<const __nv_bfloat162*>(&row_input[col]);
+        vec[i] = *reinterpret_cast<const PackedType*>(&row_input[col]);
       } else if (col < K) {
         vec[i].x = row_input[col];
-        vec[i].y = __float2bfloat16(0.0f);
+        vec[i].y = traits::zero();
       } else {
-        vec[i] = __float2bfloat162_rn(0.0f);
-      }
-    }
-
-    const int block_idx = col_start / NVFP4_BLOCK_SIZE;
-    uint8_t* scale_out = (tid % 2 == 0) ? &row_scales[block_idx] : nullptr;
-
-    uint32_t e2m1_vals = quantize_fp16_to_e2m1_with_scaling(vec, global_scale, scale_out);
-
-    const int packed_idx = col_start / 2;
-    if (packed_idx + 3 < K / 2) {
-      *reinterpret_cast<uint32_t*>(&row_fp4[packed_idx]) = e2m1_vals;
-    } else {
-      uint8_t* bytes = reinterpret_cast<uint8_t*>(&e2m1_vals);
-      for (int i = 0; i < 4 && packed_idx + i < K / 2; ++i) {
-        row_fp4[packed_idx + i] = bytes[i];
-      }
-    }
-  }
-}
-
-// Quantization kernel for FP16 to NVFP4
-template <int BLOCK_SIZE = 128, int ELTS_PER_THREAD = 16>
-__global__ void nvfp4_quant_from_fp16_kernel(const half* __restrict__ input,
-                                             const float* __restrict__ global_scale_ptr,
-                                             uint8_t* __restrict__ fp4_output,
-                                             uint8_t* __restrict__ block_scales, const int M,
-                                             const int K) {
-  const int row = blockIdx.x;
-  const int tid = threadIdx.x;
-
-  if (row >= M) return;
-
-  __shared__ float global_scale;
-
-  if (tid == 0) {
-    global_scale = *global_scale_ptr;
-  }
-  __syncthreads();
-
-  constexpr int CVT_ELTS_PER_THREAD = 8;
-  constexpr int PACKED_PER_THREAD = CVT_ELTS_PER_THREAD / 2;
-  const int elts_per_block = BLOCK_SIZE * CVT_ELTS_PER_THREAD;
-
-  const half* row_input = input + row * K;
-  uint8_t* row_fp4 = fp4_output + row * (K / 2);
-  uint8_t* row_scales = block_scales + row * (K / NVFP4_BLOCK_SIZE);
-
-  for (int base_col = 0; base_col < K; base_col += elts_per_block) {
-    const int col_start = base_col + tid * CVT_ELTS_PER_THREAD;
-
-    if (col_start >= K) break;
-
-    half2 vec[4];
-
-#pragma unroll
-    for (int i = 0; i < PACKED_PER_THREAD; ++i) {
-      const int col = col_start + i * 2;
-      if (col + 1 < K) {
-        vec[i] = *reinterpret_cast<const half2*>(&row_input[col]);
-      } else if (col < K) {
-        vec[i].x = row_input[col];
-        vec[i].y = __float2half(0.0f);
-      } else {
-        vec[i] = __float2half2_rn(0.0f);
+        vec[i] = traits::zero2();
       }
     }
 
@@ -316,18 +266,13 @@ void nvfp4_kv_quant(TensorView input, TensorView global_scale, TensorView fp4_ou
   dim3 grid(M);
   dim3 block(BLOCK_SIZE);
 
+  constexpr int ELTS_PER_THREAD = 16;
+
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
-    if constexpr (std::is_same_v<c_type, nv_bfloat16>) {
-      nvfp4_quant_from_bf16_kernel<BLOCK_SIZE, 16>
-          <<<grid, block, 0, stream>>>(static_cast<const __nv_bfloat16*>(input.data_ptr()),
-                                       scale_ptr, static_cast<uint8_t*>(fp4_output.data_ptr()),
-                                       static_cast<uint8_t*>(block_scales.data_ptr()), M, K);
-    } else {
-      nvfp4_quant_from_fp16_kernel<BLOCK_SIZE, 16>
-          <<<grid, block, 0, stream>>>(static_cast<const half*>(input.data_ptr()), scale_ptr,
-                                       static_cast<uint8_t*>(fp4_output.data_ptr()),
-                                       static_cast<uint8_t*>(block_scales.data_ptr()), M, K);
-    }
+    nvfp4_quant_kernel<c_type, BLOCK_SIZE, ELTS_PER_THREAD>
+        <<<grid, block, 0, stream>>>(static_cast<const c_type*>(input.data_ptr()), scale_ptr,
+                                     static_cast<uint8_t*>(fp4_output.data_ptr()),
+                                     static_cast<uint8_t*>(block_scales.data_ptr()), M, K);
     return true;
   });
 }
