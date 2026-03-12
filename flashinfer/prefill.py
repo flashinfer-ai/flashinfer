@@ -3228,6 +3228,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         if self._backend == "cute_dsl":
             from .cute_dsl_attention import cute_dsl_prefill_sm120
 
+            if return_lse:
+                raise NotImplementedError(
+                    "return_lse is not supported with the cute_dsl backend. "
+                    "The underlying CuTe DSL kernel does not compute log-sum-exp."
+                )
+
             # cute_dsl expects dense (batch, seqlen, nheads, head_dim) tensors.
             # Convert from the ragged flat format by slicing each sequence.
             qo_indptr_cpu = self._qo_indptr_buf.cpu()
