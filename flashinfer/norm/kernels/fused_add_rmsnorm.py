@@ -19,10 +19,10 @@ Fused Add + RMSNorm CuTe DSL Kernels
 Includes:
 - FusedAddRMSNormKernel: Fused residual add + RMSNorm
 - FusedAddRMSNormQuantKernel: Fused residual add + RMSNorm + FP8 quantization
-
 """
 
 import functools
+import math
 
 import cutlass
 import cutlass.cute as cute
@@ -62,7 +62,6 @@ class FusedAddRMSNormKernel:
     Computes:
     1. residual = input + residual (in-place update)
     2. input = residual / sqrt(mean(residual^2) + eps) * (weight + weight_bias)
-
     """
 
     def __init__(
@@ -231,6 +230,7 @@ class FusedAddRMSNormKernel:
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
 
+        # PDL: Wait for previous kernel (SM90+ only)
         if enable_pdl:
             cute.arch.griddepcontrol_wait()
 
@@ -417,6 +417,7 @@ class FusedAddRMSNormKernel:
         if row_in_bounds:
             cute.copy(copy_atom_store, tXrO, tXgO, pred=tXpX)
 
+        # PDL: Signal dependent kernels (SM90+ only)
         if enable_pdl:
             cute.arch.griddepcontrol_launch_dependents()
 
@@ -553,6 +554,7 @@ class FusedAddRMSNormQuantKernel:
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
 
+        # PDL: Wait for previous kernel (SM90+ only)
         if enable_pdl:
             cute.arch.griddepcontrol_wait()
 
@@ -836,6 +838,7 @@ class FusedAddRMSNormQuantKernel:
                         else:
                             cvt_and_store_f32_to_e4m3_sw(clamped, out_ptr)
 
+        # PDL: Signal dependent kernels (SM90+ only)
         if enable_pdl:
             cute.arch.griddepcontrol_launch_dependents()
 
@@ -852,21 +855,38 @@ def _get_compiled_fused_add_rmsnorm_kernel(
     weight_bias: float,
     enable_pdl: bool,
     sm_version: int,
+    contiguous: bool = True,
 ):
-    """Get a compiled Fused Add + RMSNorm kernel using TVM-FFI."""
+    """Get a compiled Fused Add + RMSNorm kernel using TVM-FFI.
+
+    When contiguous=True, tensors are compiled with compact (dense) layouts for
+    optimal codegen. When False, symbolic row strides are used to support
+    arbitrary row strides at the cost of some performance.
+    """
     dtype = get_cutlass_dtype(dtype_str)
     kernel_obj = FusedAddRMSNormKernel(dtype, H, weight_bias, sm_version=sm_version)
 
     sym_m = cute.sym_int()
-    sym_row_stride_x = cute.sym_int(divisibility=kernel_obj.vec_size)
-    sym_row_stride_r = cute.sym_int(divisibility=kernel_obj.vec_size)
 
-    x_fake = cute.runtime.make_fake_tensor(
-        dtype, (sym_m, H), (sym_row_stride_x, 1), assumed_align=16
-    )
-    r_fake = cute.runtime.make_fake_tensor(
-        dtype, (sym_m, H), (sym_row_stride_r, 1), assumed_align=16
-    )
+    if contiguous:
+        elem_bytes = dtype.width // 8
+        tensor_align = math.gcd(128, H * elem_bytes)
+        x_fake = cute.runtime.make_fake_compact_tensor(
+            dtype, (sym_m, H), stride_order=(1, 0), assumed_align=tensor_align
+        )
+        r_fake = cute.runtime.make_fake_compact_tensor(
+            dtype, (sym_m, H), stride_order=(1, 0), assumed_align=tensor_align
+        )
+    else:
+        sym_row_stride_x = cute.sym_int(divisibility=kernel_obj.vec_size)
+        sym_row_stride_r = cute.sym_int(divisibility=kernel_obj.vec_size)
+        x_fake = cute.runtime.make_fake_tensor(
+            dtype, (sym_m, H), (sym_row_stride_x, 1), assumed_align=16
+        )
+        r_fake = cute.runtime.make_fake_tensor(
+            dtype, (sym_m, H), (sym_row_stride_r, 1), assumed_align=16
+        )
+
     w_fake = cute.runtime.make_fake_compact_tensor(dtype, (H,), assumed_align=16)
 
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -895,8 +915,12 @@ def _get_compiled_fused_add_rmsnorm_quant_kernel(
     enable_pdl: bool,
     use_hw_fp8: bool = True,
     sm_version: int = 80,
+    contiguous: bool = True,
 ):
-    """Get a compiled Fused Add + RMSNorm + Quant kernel using TVM-FFI."""
+    """Get a compiled Fused Add + RMSNorm + Quant kernel using TVM-FFI.
+
+    See _get_compiled_fused_add_rmsnorm_kernel for contiguous parameter semantics.
+    """
     dtype = get_cutlass_dtype(dtype_str)
     out_dtype = get_cutlass_dtype(out_dtype_str)
     kernel_obj = FusedAddRMSNormQuantKernel(
@@ -904,19 +928,33 @@ def _get_compiled_fused_add_rmsnorm_quant_kernel(
     )
 
     sym_m = cute.sym_int()
-    sym_row_stride_y = cute.sym_int(divisibility=kernel_obj.vec_size)
-    sym_row_stride_x = cute.sym_int(divisibility=kernel_obj.vec_size)
-    sym_row_stride_r = cute.sym_int(divisibility=kernel_obj.vec_size)
 
-    y_fake = cute.runtime.make_fake_tensor(
-        out_dtype, (sym_m, H), (sym_row_stride_y, 1), assumed_align=16
-    )
-    x_fake = cute.runtime.make_fake_tensor(
-        dtype, (sym_m, H), (sym_row_stride_x, 1), assumed_align=16
-    )
-    r_fake = cute.runtime.make_fake_tensor(
-        dtype, (sym_m, H), (sym_row_stride_r, 1), assumed_align=16
-    )
+    if contiguous:
+        in_align = math.gcd(128, H * (dtype.width // 8))
+        out_align = math.gcd(128, H * (out_dtype.width // 8))
+        y_fake = cute.runtime.make_fake_compact_tensor(
+            out_dtype, (sym_m, H), stride_order=(1, 0), assumed_align=out_align
+        )
+        x_fake = cute.runtime.make_fake_compact_tensor(
+            dtype, (sym_m, H), stride_order=(1, 0), assumed_align=in_align
+        )
+        r_fake = cute.runtime.make_fake_compact_tensor(
+            dtype, (sym_m, H), stride_order=(1, 0), assumed_align=in_align
+        )
+    else:
+        sym_row_stride_y = cute.sym_int(divisibility=kernel_obj.vec_size)
+        sym_row_stride_x = cute.sym_int(divisibility=kernel_obj.vec_size)
+        sym_row_stride_r = cute.sym_int(divisibility=kernel_obj.vec_size)
+        y_fake = cute.runtime.make_fake_tensor(
+            out_dtype, (sym_m, H), (sym_row_stride_y, 1), assumed_align=16
+        )
+        x_fake = cute.runtime.make_fake_tensor(
+            dtype, (sym_m, H), (sym_row_stride_x, 1), assumed_align=16
+        )
+        r_fake = cute.runtime.make_fake_tensor(
+            dtype, (sym_m, H), (sym_row_stride_r, 1), assumed_align=16
+        )
+
     w_fake = cute.runtime.make_fake_compact_tensor(dtype, (H,), assumed_align=16)
     s_fake = cute.runtime.make_fake_compact_tensor(Float32, (1,), assumed_align=4)
 
@@ -954,8 +992,8 @@ def fused_add_rmsnorm_cute(
 ) -> None:
     """CuTe DSL Fused Add + RMSNorm implementation.
 
-    Supports arbitrary row stride — no need to call contiguous().
-    Last dimension must be contiguous (stride[-1] == 1).
+    Supports non-contiguous tensors (stride[-1] must be 1). Uses an optimized
+    compact kernel for contiguous inputs and a general strided kernel otherwise.
     Both input and residual are modified in-place.
     """
 
@@ -963,9 +1001,15 @@ def fused_add_rmsnorm_cute(
     H = shape[-1]
     M = shape[0]
 
+    is_contiguous = input.is_contiguous() and residual.is_contiguous()
     dtype_str = _torch_dtype_to_str(input.dtype)
     kernel = _get_compiled_fused_add_rmsnorm_kernel(
-        dtype_str, H, weight_bias, enable_pdl, get_sm_version(input.device)
+        dtype_str,
+        H,
+        weight_bias,
+        enable_pdl,
+        get_sm_version(input.device),
+        contiguous=is_contiguous,
     )
     kernel(input, residual, weight, M, eps)
 
@@ -982,8 +1026,8 @@ def fused_add_rmsnorm_quant_cute(
 ) -> None:
     """CuTe DSL Fused Add + RMSNorm + FP8 quantization implementation.
 
-    Supports arbitrary row stride — no need to call contiguous().
-    Last dimension must be contiguous (stride[-1] == 1).
+    Supports non-contiguous tensors (stride[-1] must be 1). Uses an optimized
+    compact kernel for contiguous inputs and a general strided kernel otherwise.
     Residual is modified in-place with h = input + residual.
     """
 
@@ -991,6 +1035,9 @@ def fused_add_rmsnorm_quant_cute(
     H = shape[-1]
     M = shape[0]
 
+    is_contiguous = (
+        input.is_contiguous() and residual.is_contiguous() and out.is_contiguous()
+    )
     dtype_str = _torch_dtype_to_str(input.dtype)
     out_dtype_str = _torch_dtype_to_str(out.dtype)
     kernel = _get_compiled_fused_add_rmsnorm_quant_kernel(
@@ -1001,6 +1048,7 @@ def fused_add_rmsnorm_quant_cute(
         enable_pdl,
         use_hw_fp8=has_hw_fp8_cvt(input.device),
         sm_version=get_sm_version(input.device),
+        contiguous=is_contiguous,
     )
     kernel(
         out,

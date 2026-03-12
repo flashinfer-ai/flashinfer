@@ -23,6 +23,7 @@ Includes:
 """
 
 import functools
+import math
 
 import cutlass
 import cutlass.cute as cute
@@ -56,17 +57,9 @@ from ..utils import (
 
 class RMSNormKernel:
     """
-    RMSNorm Kernel using CuTe-DSL with multi-row block processing.
+    RMSNorm Kernel using CuTe-DSL.
 
     Computes: output = input / sqrt(mean(input^2) + eps) * (weight + weight_bias)
-
-    Architecture follows the Blackwell CUTLASS example:
-    1. Multi-row blocks for better wave utilization at small batch sizes
-    2. Async global→shared copy when H alignment permits (H divisible by vec_size)
-    3. Graceful fallback to sync copy for arbitrary H (e.g. H=111)
-    4. Two-pass access from shared memory (sum-of-squares then normalize)
-    5. Weight loaded via separate sync copy, overlapped with async wait
-    6. Cluster reduction across CTAs for very large H on SM90+
     """
 
     def __init__(
@@ -253,6 +246,7 @@ class RMSNormKernel:
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
 
+        # PDL: Wait for previous kernel (SM90+ only)
         if enable_pdl:
             cute.arch.griddepcontrol_wait()
 
@@ -424,8 +418,7 @@ class RMSNormKernel:
 
 class QKRMSNormKernel:
     """
-    QK RMSNorm Kernel for 3D tensors [batch, heads, head_dim] with multi-row
-    blocks and async/sync copy branching.
+    QK RMSNorm Kernel using CuTe-DSL for 3D tensors [batch, heads, head_dim].
 
     Supports arbitrary stride (only stride[-1] == 1 required). Each block
     processes rows_per_block rows, where each row is a (batch, head) pair
@@ -526,6 +519,7 @@ class QKRMSNormKernel:
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
 
+        # PDL: Wait for previous kernel (SM90+ only)
         if enable_pdl:
             cute.arch.griddepcontrol_wait()
 
@@ -671,6 +665,7 @@ class QKRMSNormKernel:
         if row_in_bounds:
             cute.copy(copy_atom_store, tXrO, tXgO, pred=tXpX)
 
+        # PDL: Signal dependent kernels (SM90+ only)
         if enable_pdl:
             cute.arch.griddepcontrol_launch_dependents()
 
@@ -682,13 +677,10 @@ class QKRMSNormKernel:
 
 class RMSNormQuantKernel:
     """
-    RMSNorm + FP8 Quantization Kernel using CuTe-DSL with multi-row blocks.
+    RMSNorm + FP8 Quantization Kernel using CuTe-DSL.
 
     Computes: output = clamp(input / sqrt(mean(input^2) + eps) * weight / scale, -448, 448)
-    Then quantizes to FP8 E4M3 via scalar PTX stores.
-
-    Same multi-row / async-copy / cluster architecture as RMSNormKernel, with an
-    element-wise FP8 clamp-convert-store loop replacing the vectorized output.
+    Then quantizes to FP8 E4M3.
     """
 
     def __init__(
@@ -802,6 +794,7 @@ class RMSNormQuantKernel:
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
 
+        # PDL: Wait for previous kernel (SM90+ only)
         if enable_pdl:
             cute.arch.griddepcontrol_wait()
 
@@ -1047,6 +1040,7 @@ class RMSNormQuantKernel:
                         else:
                             cvt_and_store_f32_to_e4m3_sw(clamped, out_ptr)
 
+        # PDL: Signal dependent kernels (SM90+ only)
         if enable_pdl:
             cute.arch.griddepcontrol_launch_dependents()
 
@@ -1063,22 +1057,39 @@ def _get_compiled_rmsnorm_kernel(
     weight_bias: float,
     enable_pdl: bool,
     sm_version: int,
+    contiguous: bool = True,
 ):
-    """Get a compiled RMSNorm kernel using TVM-FFI."""
+    """Get a compiled RMSNorm kernel using TVM-FFI.
+
+    When contiguous=True, tensors are compiled with compact (dense) layouts for
+    optimal codegen. When False, symbolic row strides are used to support
+    arbitrary row strides at the cost of some performance.
+    """
     dtype = get_cutlass_dtype(dtype_str)
     kernel_obj = RMSNormKernel(dtype, H, weight_bias, sm_version=sm_version)
 
     sym_m = cute.sym_int()
-    sym_row_stride_x = cute.sym_int(divisibility=kernel_obj.vec_size)
-    sym_row_stride_y = cute.sym_int(divisibility=kernel_obj.vec_size)
 
-    x_fake = cute.runtime.make_fake_tensor(
-        dtype, (sym_m, H), (sym_row_stride_x, 1), assumed_align=16
-    )
+    if contiguous:
+        elem_bytes = dtype.width // 8
+        tensor_align = math.gcd(128, H * elem_bytes)
+        x_fake = cute.runtime.make_fake_compact_tensor(
+            dtype, (sym_m, H), stride_order=(1, 0), assumed_align=tensor_align
+        )
+        y_fake = cute.runtime.make_fake_compact_tensor(
+            dtype, (sym_m, H), stride_order=(1, 0), assumed_align=tensor_align
+        )
+    else:
+        sym_row_stride_x = cute.sym_int(divisibility=kernel_obj.vec_size)
+        sym_row_stride_y = cute.sym_int(divisibility=kernel_obj.vec_size)
+        x_fake = cute.runtime.make_fake_tensor(
+            dtype, (sym_m, H), (sym_row_stride_x, 1), assumed_align=16
+        )
+        y_fake = cute.runtime.make_fake_tensor(
+            dtype, (sym_m, H), (sym_row_stride_y, 1), assumed_align=16
+        )
+
     w_fake = cute.runtime.make_fake_compact_tensor(dtype, (H,), assumed_align=16)
-    y_fake = cute.runtime.make_fake_tensor(
-        dtype, (sym_m, H), (sym_row_stride_y, 1), assumed_align=16
-    )
 
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
@@ -1138,7 +1149,7 @@ def _get_compiled_qk_rmsnorm_kernel(
         y_fake,
         Int32(1),  # Dummy B
         Int32(1),  # Dummy N
-        Float32(1e-6),
+        Float32(1e-6),  # Dummy eps
         enable_pdl,
         stream_fake,
         options="--enable-tvm-ffi",
@@ -1156,8 +1167,12 @@ def _get_compiled_rmsnorm_quant_kernel(
     enable_pdl: bool,
     use_hw_fp8: bool = True,
     sm_version: int = 80,
+    contiguous: bool = True,
 ):
-    """Get a compiled RMSNorm + Quant kernel using TVM-FFI."""
+    """Get a compiled RMSNorm + Quant kernel using TVM-FFI.
+
+    See _get_compiled_rmsnorm_kernel for contiguous parameter semantics.
+    """
     dtype = get_cutlass_dtype(dtype_str)
     out_dtype = get_cutlass_dtype(out_dtype_str)
     kernel_obj = RMSNormQuantKernel(
@@ -1165,16 +1180,27 @@ def _get_compiled_rmsnorm_quant_kernel(
     )
 
     sym_m = cute.sym_int()
-    sym_row_stride_x = cute.sym_int(divisibility=kernel_obj.vec_size)
-    sym_row_stride_y = cute.sym_int(divisibility=kernel_obj.vec_size)
 
-    x_fake = cute.runtime.make_fake_tensor(
-        dtype, (sym_m, H), (sym_row_stride_x, 1), assumed_align=16
-    )
+    if contiguous:
+        in_align = math.gcd(128, H * (dtype.width // 8))
+        out_align = math.gcd(128, H * (out_dtype.width // 8))
+        x_fake = cute.runtime.make_fake_compact_tensor(
+            dtype, (sym_m, H), stride_order=(1, 0), assumed_align=in_align
+        )
+        y_fake = cute.runtime.make_fake_compact_tensor(
+            out_dtype, (sym_m, H), stride_order=(1, 0), assumed_align=out_align
+        )
+    else:
+        sym_row_stride_x = cute.sym_int(divisibility=kernel_obj.vec_size)
+        sym_row_stride_y = cute.sym_int(divisibility=kernel_obj.vec_size)
+        x_fake = cute.runtime.make_fake_tensor(
+            dtype, (sym_m, H), (sym_row_stride_x, 1), assumed_align=16
+        )
+        y_fake = cute.runtime.make_fake_tensor(
+            out_dtype, (sym_m, H), (sym_row_stride_y, 1), assumed_align=16
+        )
+
     w_fake = cute.runtime.make_fake_compact_tensor(dtype, (H,), assumed_align=16)
-    y_fake = cute.runtime.make_fake_tensor(
-        out_dtype, (sym_m, H), (sym_row_stride_y, 1), assumed_align=16
-    )
     s_fake = cute.runtime.make_fake_compact_tensor(Float32, (1,), assumed_align=4)
 
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -1210,8 +1236,8 @@ def rmsnorm_cute(
 ) -> None:
     """CuTe DSL RMSNorm implementation.
 
-    Supports arbitrary row stride — no need to call contiguous().
-    Last dimension must be contiguous (stride[-1] == 1).
+    Supports non-contiguous tensors (stride[-1] must be 1). Uses an optimized
+    compact kernel for contiguous inputs and a general strided kernel otherwise.
     """
     shape = input.shape
     H = shape[-1]
@@ -1225,12 +1251,14 @@ def rmsnorm_cute(
         input_2d = input
         out_2d = out
 
+    is_contiguous = input_2d.is_contiguous() and out_2d.is_contiguous()
     kernel = _get_compiled_rmsnorm_kernel(
         _torch_dtype_to_str(input.dtype),
         H,
         weight_bias,
         enable_pdl,
         get_sm_version(input.device),
+        contiguous=is_contiguous,
     )
     kernel(input_2d, weight, out_2d, M, eps)
 
@@ -1273,13 +1301,14 @@ def rmsnorm_quant_cute(
 ) -> None:
     """CuTe DSL RMSNorm + FP8 quantization implementation.
 
-    Supports arbitrary row stride — no need to call contiguous().
-    Last dimension must be contiguous (stride[-1] == 1).
+    Supports non-contiguous tensors (stride[-1] must be 1). Uses an optimized
+    compact kernel for contiguous inputs and a general strided kernel otherwise.
     """
     shape = input.shape
     H = shape[-1]
     M = shape[0]
 
+    is_contiguous = input.is_contiguous() and out.is_contiguous()
     dtype_str = _torch_dtype_to_str(input.dtype)
     out_dtype_str = _torch_dtype_to_str(out.dtype)
     kernel = _get_compiled_rmsnorm_quant_kernel(
@@ -1290,6 +1319,7 @@ def rmsnorm_quant_cute(
         enable_pdl,
         use_hw_fp8=has_hw_fp8_cvt(input.device),
         sm_version=get_sm_version(input.device),
+        contiguous=is_contiguous,
     )
     kernel(input, weight, out, M, scale, eps)
 
