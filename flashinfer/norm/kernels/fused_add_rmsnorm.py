@@ -32,7 +32,9 @@ from ..utils import (
     FLOAT8_E4M3_MAX,
     COPY_BITS,
     rcp_approx_ftz,
-    cvt_and_store_f32_to_e4m3,
+    cvt_and_store_f32_to_e4m3_hw,
+    cvt_and_store_f32_to_e4m3_sw,
+    has_hw_fp8_cvt,
     get_ptr_as_int64,
     row_reduce_sum,
     predicate_k,
@@ -241,10 +243,12 @@ class FusedAddRMSNormQuantKernel:
         dtype: cutlass.Numeric,
         H: int,
         weight_bias: float = 0.0,
+        use_hw_fp8: bool = True,
     ):
         self.dtype = dtype
         self.H = H
         self.weight_bias = weight_bias
+        self.use_hw_fp8 = use_hw_fp8
 
         # Vectorization parameters: use optimal vec_size for warp utilization
         elem_bits = dtype.width
@@ -412,7 +416,10 @@ class FusedAddRMSNormQuantKernel:
                     # Use PTX to convert and store FP8 byte
                     out_offset = bidx * H + idx
                     out_ptr = get_ptr_as_int64(mY, Int32(out_offset))
-                    cvt_and_store_f32_to_e4m3(clamped, out_ptr)
+                    if self.use_hw_fp8:
+                        cvt_and_store_f32_to_e4m3_hw(clamped, out_ptr)
+                    else:
+                        cvt_and_store_f32_to_e4m3_sw(clamped, out_ptr)
 
         # PDL: Signal dependent kernels (SM90+ only)
         if enable_pdl:
@@ -463,12 +470,19 @@ def _get_compiled_fused_add_rmsnorm_kernel(
 
 @functools.cache
 def _get_compiled_fused_add_rmsnorm_quant_kernel(
-    dtype_str: str, out_dtype_str: str, H: int, weight_bias: float, enable_pdl: bool
+    dtype_str: str,
+    out_dtype_str: str,
+    H: int,
+    weight_bias: float,
+    enable_pdl: bool,
+    use_hw_fp8: bool = True,
 ):
     """Get a compiled Fused Add + RMSNorm + Quant kernel using TVM-FFI."""
     dtype = get_cutlass_dtype(dtype_str)
     out_dtype = get_cutlass_dtype(out_dtype_str)
-    kernel_obj = FusedAddRMSNormQuantKernel(dtype, H, weight_bias)
+    kernel_obj = FusedAddRMSNormQuantKernel(
+        dtype, H, weight_bias, use_hw_fp8=use_hw_fp8
+    )
 
     sym_m = cute.sym_int()
     sym_row_stride_y = cute.sym_int(divisibility=kernel_obj.vec_size)
@@ -559,7 +573,12 @@ def fused_add_rmsnorm_quant_cute(
     dtype_str = _torch_dtype_to_str(input.dtype)
     out_dtype_str = _torch_dtype_to_str(out.dtype)
     kernel = _get_compiled_fused_add_rmsnorm_quant_kernel(
-        dtype_str, out_dtype_str, H, weight_bias, enable_pdl
+        dtype_str,
+        out_dtype_str,
+        H,
+        weight_bias,
+        enable_pdl,
+        use_hw_fp8=has_hw_fp8_cvt(input.device),
     )
     kernel(
         out,

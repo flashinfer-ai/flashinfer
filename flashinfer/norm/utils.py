@@ -69,14 +69,13 @@ def rcp_approx_ftz(a: Float32, *, loc=None, ip=None) -> Float32:
 
 
 @dsl_user_op
-def cvt_and_store_f32_to_e4m3(val: Float32, addr: Int64, *, loc=None, ip=None):
-    """Convert float32 to E4M3 and store single byte to global memory.
+def cvt_and_store_f32_to_e4m3_hw(val: Float32, addr: Int64, *, loc=None, ip=None):
+    """Convert float32 to E4M3 and store single byte — hardware path (sm_89+).
 
-    This handles the case where we need to store a single FP8 value,
-    which can't be done with vectorized CuTe copies (min 16 bits).
+    Uses the cvt.rn.satfinite.e4m3x2.f32 PTX instruction for maximum performance.
     """
     llvm.inline_asm(
-        None,  # void return type
+        None,
         [Float32(val).ir_value(loc=loc, ip=ip), Int64(addr).ir_value(loc=loc, ip=ip)],
         """
         {
@@ -92,6 +91,104 @@ def cvt_and_store_f32_to_e4m3(val: Float32, addr: Int64, *, loc=None, ip=None):
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
+
+
+@dsl_user_op
+def cvt_and_store_f32_to_e4m3_sw(val: Float32, addr: Int64, *, loc=None, ip=None):
+    """Convert float32 to E4M3 and store single byte — software path (all architectures).
+
+    Uses integer bit manipulation mirroring NVIDIA's __nv_cvt_float_to_fp8 from cuda_fp8.hpp.
+    The caller must clamp the value to [-448, 448] before calling this function.
+
+    E4M3 format: 1 sign bit, 4 exponent bits (bias=7), 3 mantissa bits.
+    Conversion strategy (operates on f32 bit representation):
+      - Normal range (f32 biased exp >= 121): direct exponent/mantissa extraction with RNE
+      - Denormal range (f32 biased exp in [118..120]): shift mantissa with implicit bit, RNE
+      - Underflow (abs <= 2^-10): flush to zero (2^-10 is the RNE midpoint to min denorm)
+    """
+    llvm.inline_asm(
+        None,
+        [Float32(val).ir_value(loc=loc, ip=ip), Int64(addr).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b32 fbits, sign8, abs_bits, f32_exp, f32_mant;
+            .reg .b32 e4m3_exp, e4m3_mant, norm_raw;
+            .reg .b32 rbit, sticky, odd_bit, radj;
+            .reg .b32 shift, dmant4, denorm_raw;
+            .reg .b32 dr_bit, dsticky, dadj;
+            .reg .b32 e4m3_raw, tmp, tmp2;
+            .reg .pred p_zero, p_denorm;
+
+            // Bitcast float to int and extract sign/exponent/mantissa
+            mov.b32 fbits, $0;
+            shr.u32 sign8, fbits, 24;
+            and.b32 sign8, sign8, 128;
+            and.b32 abs_bits, fbits, 0x7FFFFFFF;
+            shr.u32 f32_exp, abs_bits, 23;
+            and.b32 f32_mant, abs_bits, 0x007FFFFF;
+
+            // === Normal path (f32 biased exp >= 121, i.e. e4m3 exp >= 1) ===
+            sub.u32 e4m3_exp, f32_exp, 120;
+            shr.u32 e4m3_mant, f32_mant, 20;
+            shl.b32 norm_raw, e4m3_exp, 3;
+            or.b32  norm_raw, norm_raw, e4m3_mant;
+
+            // Round-to-nearest-even: round up if round_bit AND (sticky OR odd)
+            shr.u32 rbit, f32_mant, 19;
+            and.b32 rbit, rbit, 1;
+            and.b32 sticky, f32_mant, 0x0007FFFF;
+            and.b32 odd_bit, e4m3_mant, 1;
+            or.b32  tmp, sticky, odd_bit;
+            min.u32 tmp, tmp, 1;
+            and.b32 radj, tmp, rbit;
+            add.u32 norm_raw, norm_raw, radj;
+            min.u32 norm_raw, norm_raw, 126;
+
+            // === Denormal path (f32 biased exp in {118,119,120}) ===
+            sub.u32 shift, 121, f32_exp;
+            shr.u32 tmp, f32_mant, 20;
+            or.b32  dmant4, tmp, 8;
+            shr.u32 denorm_raw, dmant4, shift;
+
+            // RNE rounding for denormals
+            sub.u32 tmp, shift, 1;
+            shr.u32 dr_bit, dmant4, tmp;
+            and.b32 dr_bit, dr_bit, 1;
+            shl.b32 tmp2, 1, tmp;
+            sub.u32 tmp2, tmp2, 1;
+            and.b32 dsticky, dmant4, tmp2;
+            and.b32 tmp, f32_mant, 0x000FFFFF;
+            or.b32  dsticky, dsticky, tmp;
+            and.b32 odd_bit, denorm_raw, 1;
+            or.b32  tmp, dsticky, odd_bit;
+            min.u32 tmp, tmp, 1;
+            and.b32 dadj, tmp, dr_bit;
+            add.u32 denorm_raw, denorm_raw, dadj;
+
+            // Select between normal/denormal, then apply zero flush
+            setp.le.u32 p_denorm, f32_exp, 120;
+            selp.u32 e4m3_raw, denorm_raw, norm_raw, p_denorm;
+            setp.le.u32 p_zero, abs_bits, 0x3A800000;
+            selp.u32 e4m3_raw, 0, e4m3_raw, p_zero;
+
+            // Apply sign and store single byte
+            or.b32  e4m3_raw, e4m3_raw, sign8;
+            st.global.b8 [$1], e4m3_raw;
+        }
+        """,
+        "f,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+def has_hw_fp8_cvt(device: torch.device = None) -> bool:
+    """Check if the device supports hardware FP8 conversion (sm_89+)."""
+    if device is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    major, minor = torch.cuda.get_device_capability(device)
+    return major > 8 or (major == 8 and minor >= 9)
 
 
 @dsl_user_op
@@ -315,7 +412,9 @@ __all__ = [
     "COPY_BITS",
     # PTX intrinsics
     "rcp_approx_ftz",
-    "cvt_and_store_f32_to_e4m3",
+    "cvt_and_store_f32_to_e4m3_hw",
+    "cvt_and_store_f32_to_e4m3_sw",
+    "has_hw_fp8_cvt",
     "get_ptr_as_int64",
     # Reduction utilities
     "warp_reduce",
