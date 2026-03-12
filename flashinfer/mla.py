@@ -603,6 +603,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     skip_softmax_threshold_scale_factor: Optional[float] = None,
     enable_pdl: bool | None = None,
     backend: str = "auto",
+    is_var_seq: bool = True,
 ) -> torch.Tensor:
     """
     Parameters
@@ -794,6 +795,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
             softmax_scale=bmm1_scale,
             output_scale=bmm2_scale,
             out=out,
+            is_var_seq=is_var_seq,
         )
     else:
         raise ValueError(f"Backend {backend} not supported")

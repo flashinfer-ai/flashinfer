@@ -156,6 +156,7 @@ def test_cute_dsl_mla_decode_fp16(batch_size, seq_len_k, page_size, dtype):
         max_seq_len=seq_len_k,
         softmax_scale=softmax_scale,
         output_scale=output_scale,
+        is_var_seq=False,
     )
 
     # Reference
@@ -238,6 +239,7 @@ def test_cute_dsl_mla_decode_variable_seq_len(batch_size, seq_len_k, page_size=1
         max_seq_len=max_seq_len,
         softmax_scale=softmax_scale,
         output_scale=output_scale,
+        is_var_seq=True,
     )
 
     # Reference
@@ -314,6 +316,7 @@ def test_cute_dsl_mla_decode_via_api(batch_size, seq_len_k, page_size=128):
         bmm1_scale=softmax_scale,
         bmm2_scale=1.0,
         backend="cute-dsl",
+        is_var_seq=False,
     )
 
     assert out.shape == (batch_size, q_len, num_heads, latent_dim)
@@ -373,10 +376,10 @@ def test_cute_dsl_vs_trtllm_gen(batch_size, seq_len_k, page_size=64):
     )
 
     out_trtllm = trtllm_batch_decode_with_kv_cache_mla(
-        **common_args, backend="trtllm-gen"
+        **common_args, backend="trtllm-gen", is_var_seq=False
     )
     out_cute_dsl = trtllm_batch_decode_with_kv_cache_mla(
-        **common_args, backend="cute-dsl"
+        **common_args, backend="cute-dsl", is_var_seq=False
     )
 
     torch.testing.assert_close(

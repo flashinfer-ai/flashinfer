@@ -279,6 +279,7 @@ def cute_dsl_mla_decode(
     softmax_scale: float,
     output_scale: float = 1.0,
     out: Optional[torch.Tensor] = None,
+    is_var_seq: bool = True,
 ) -> torch.Tensor:
     """CuTe DSL MLA decode kernel for Blackwell SM100.
 
@@ -398,6 +399,9 @@ def cute_dsl_mla_decode(
     block_split_kvs = None
     skip_correction_threshold = 0.0
 
+    # for fix-length, set is_persistent to True; otherwise, set to False.
+    is_persistent = not is_var_seq
+
     # Validate configuration (cached, negligible overhead after first call)
     _check_can_implement(
         torch_dtype=q_dtype,
@@ -406,8 +410,8 @@ def cute_dsl_mla_decode(
         seq_len_q=q_len,
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
-        is_persistent=True,
-        is_var_seq=True,
+        is_persistent=is_persistent,
+        is_var_seq=is_var_seq,
         is_var_split_kv=is_var_split_kv,
     )
 
@@ -419,8 +423,8 @@ def cute_dsl_mla_decode(
         page_size=page_size,
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
-        is_persistent=True,
-        is_var_seq=True,
+        is_persistent=is_persistent,
+        is_var_seq=is_var_seq,
         is_var_split_kv=is_var_split_kv,
         skip_correction_threshold=skip_correction_threshold,
         is_workspace_size_zero=is_workspace_size_zero,
