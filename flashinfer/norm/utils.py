@@ -184,6 +184,124 @@ def cvt_and_store_f32_to_e4m3_sw(val: Float32, addr: Int64, *, loc=None, ip=None
     )
 
 
+@dsl_user_op
+def cvt_and_store_8xf32_to_e4m3_hw(
+    v0: Float32,
+    v1: Float32,
+    v2: Float32,
+    v3: Float32,
+    v4: Float32,
+    v5: Float32,
+    v6: Float32,
+    v7: Float32,
+    addr: Int64,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Convert 8 float32 values to E4M3 and store as one 64-bit global store (sm_89+).
+
+    Uses cvt.rn.satfinite.e4m3x2.f32 to convert pairs, then packs into two b32
+    words and issues a single st.global.v2.b32.  ~4x fewer instructions and ~8x
+    fewer store transactions compared to 8 scalar st.global.b8 calls.
+    """
+    llvm.inline_asm(
+        None,
+        [
+            Float32(v0).ir_value(loc=loc, ip=ip),
+            Float32(v1).ir_value(loc=loc, ip=ip),
+            Float32(v2).ir_value(loc=loc, ip=ip),
+            Float32(v3).ir_value(loc=loc, ip=ip),
+            Float32(v4).ir_value(loc=loc, ip=ip),
+            Float32(v5).ir_value(loc=loc, ip=ip),
+            Float32(v6).ir_value(loc=loc, ip=ip),
+            Float32(v7).ir_value(loc=loc, ip=ip),
+            Int64(addr).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        {
+            .reg .b16 p01, p23, p45, p67;
+            .reg .b32 lo, hi;
+            cvt.rn.satfinite.e4m3x2.f32 p01, $1, $0;
+            cvt.rn.satfinite.e4m3x2.f32 p23, $3, $2;
+            cvt.rn.satfinite.e4m3x2.f32 p45, $5, $4;
+            cvt.rn.satfinite.e4m3x2.f32 p67, $7, $6;
+            mov.b32 lo, {p01, p23};
+            mov.b32 hi, {p45, p67};
+            st.global.v2.b32 [$8], {lo, hi};
+        }
+        """,
+        "f,f,f,f,f,f,f,f,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def cvt_and_store_4xf32_to_e4m3_hw(
+    v0: Float32,
+    v1: Float32,
+    v2: Float32,
+    v3: Float32,
+    addr: Int64,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Convert 4 float32 values to E4M3 and store as one 32-bit global store (sm_89+)."""
+    llvm.inline_asm(
+        None,
+        [
+            Float32(v0).ir_value(loc=loc, ip=ip),
+            Float32(v1).ir_value(loc=loc, ip=ip),
+            Float32(v2).ir_value(loc=loc, ip=ip),
+            Float32(v3).ir_value(loc=loc, ip=ip),
+            Int64(addr).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        {
+            .reg .b16 p01, p23;
+            .reg .b32 packed;
+            cvt.rn.satfinite.e4m3x2.f32 p01, $1, $0;
+            cvt.rn.satfinite.e4m3x2.f32 p23, $3, $2;
+            mov.b32 packed, {p01, p23};
+            st.global.b32 [$4], packed;
+        }
+        """,
+        "f,f,f,f,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def cvt_and_store_2xf32_to_e4m3_hw(
+    v0: Float32, v1: Float32, addr: Int64, *, loc=None, ip=None
+):
+    """Convert 2 float32 values to E4M3 and store as one 16-bit global store (sm_89+)."""
+    llvm.inline_asm(
+        None,
+        [
+            Float32(v0).ir_value(loc=loc, ip=ip),
+            Float32(v1).ir_value(loc=loc, ip=ip),
+            Int64(addr).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        {
+            .reg .b16 packed;
+            cvt.rn.satfinite.e4m3x2.f32 packed, $1, $0;
+            st.global.b16 [$2], packed;
+        }
+        """,
+        "f,f,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
 def has_hw_fp8_cvt(device: torch.device = None) -> bool:
     """Check if the device supports hardware FP8 conversion (sm_89+)."""
     if device is None:
@@ -607,6 +725,9 @@ __all__ = [
     "rcp_approx_ftz",
     "cvt_and_store_f32_to_e4m3_hw",
     "cvt_and_store_f32_to_e4m3_sw",
+    "cvt_and_store_8xf32_to_e4m3_hw",
+    "cvt_and_store_4xf32_to_e4m3_hw",
+    "cvt_and_store_2xf32_to_e4m3_hw",
     "has_hw_fp8_cvt",
     "get_ptr_as_int64",
     # PTX intrinsics - Cluster operations

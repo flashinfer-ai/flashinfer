@@ -43,6 +43,9 @@ from ..utils import (
     rcp_approx_ftz,
     cvt_and_store_f32_to_e4m3_hw,
     cvt_and_store_f32_to_e4m3_sw,
+    cvt_and_store_8xf32_to_e4m3_hw,
+    cvt_and_store_4xf32_to_e4m3_hw,
+    cvt_and_store_2xf32_to_e4m3_hw,
     has_hw_fp8_cvt,
     get_ptr_as_int64,
     get_sm_version,
@@ -95,8 +98,6 @@ class FusedAddRMSNormKernel:
         self.vec_size = min(h_align, max_vec_size)
         self.copy_bits = self.vec_size * dtype.width
 
-        self.use_async_copy = self.copy_bits >= 32
-
         self.threads_per_row = RMSNormKernel._compute_threads_per_row(self.H_per_cta)
         self.num_threads = RMSNormKernel._compute_num_threads(self.H_per_cta)
         self.rows_per_block = self.num_threads // self.threads_per_row
@@ -109,26 +110,45 @@ class FusedAddRMSNormKernel:
         )
         self.cols_per_tile = self.vec_size * self.num_vec_blocks * self.threads_per_row
 
+        if self.copy_bits >= 32:
+            tile_bytes_2 = 2 * self.rows_per_block * self.cols_per_tile * elem_bytes
+            props = torch.cuda.get_device_properties(torch.cuda.current_device())
+            self.use_async_copy = (
+                tile_bytes_2 <= props.shared_memory_per_block_optin // 2
+            )
+        else:
+            self.use_async_copy = False
+
     @staticmethod
     def _compute_cluster_n(H: int, dtype: cutlass.Numeric, sm_version: int) -> int:
-        """Compute optimal cluster size for fused-add kernel (2 shared tiles)."""
+        """Compute optimal cluster size for fused-add kernel (2 shared tiles).
+
+        Because fused-add needs 2 tiles (input + residual) in shared memory,
+        we target smem <= max_smem // 2 so that at least 2 blocks can
+        co-schedule per SM for good occupancy.  If no cluster_n achieves
+        that, fall back to the first cluster_n that fits at all.
+        """
         if sm_version < 90:
             return 1
 
         props = torch.cuda.get_device_properties(torch.cuda.current_device())
         max_smem_bytes = props.shared_memory_per_block_optin
         elem_size = dtype.width // 8
+        occupancy_target = max_smem_bytes // 2
 
+        best_fit = 1
         for cluster_n in [1, 2, 4, 8, 16]:
             if H % cluster_n != 0:
                 continue
             smem_needed = FusedAddRMSNormKernel._estimate_smem_bytes(
                 H, cluster_n, elem_size
             )
-            if smem_needed <= max_smem_bytes:
+            if smem_needed <= occupancy_target:
                 return cluster_n
+            if smem_needed <= max_smem_bytes and best_fit == 1:
+                best_fit = cluster_n
 
-        return 16
+        return best_fit
 
     @staticmethod
     def _estimate_smem_bytes(H: int, cluster_n: int, elem_size: int) -> int:
@@ -455,10 +475,10 @@ class FusedAddRMSNormQuantKernel:
         self.vec_size = min(h_align, max_vec_size)
         self.copy_bits = self.vec_size * dtype.width
 
-        self.use_async_copy = self.copy_bits >= 32
-
         self.threads_per_row = RMSNormKernel._compute_threads_per_row(self.H_per_cta)
         self.num_threads = RMSNormKernel._compute_num_threads(self.H_per_cta)
+        if self.H_per_cta > 8192 and self.num_threads < 256:
+            self.num_threads = 256
         self.rows_per_block = self.num_threads // self.threads_per_row
         self.warps_per_row = max(self.threads_per_row // 32, 1)
 
@@ -468,6 +488,15 @@ class FusedAddRMSNormQuantKernel:
             // self.threads_per_row,
         )
         self.cols_per_tile = self.vec_size * self.num_vec_blocks * self.threads_per_row
+
+        if self.copy_bits >= 32:
+            tile_bytes_2 = 2 * self.rows_per_block * self.cols_per_tile * elem_bytes
+            props = torch.cuda.get_device_properties(torch.cuda.current_device())
+            self.use_async_copy = (
+                tile_bytes_2 <= props.shared_memory_per_block_optin // 2
+            )
+        else:
+            self.use_async_copy = False
 
     def _smem_size_in_bytes(self) -> int:
         if self.use_async_copy:
@@ -731,17 +760,90 @@ class FusedAddRMSNormQuantKernel:
         actual_row = bidx * rows_per_block + row_in_block
         col_offset = lane_in_row * vec_size
 
-        for v in cutlass.range_constexpr(num_vec_blocks):
-            for e in cutlass.range_constexpr(vec_size):
-                local_col = col_offset + v * threads_per_row * vec_size + e
+        if cutlass.const_expr(self.use_hw_fp8 and vec_size == 8):
+            for v in cutlass.range_constexpr(num_vec_blocks):
+                local_col = col_offset + v * threads_per_row * vec_size
                 abs_col = cluster_y * cols_per_tile + local_col
-                if abs_col < H:
-                    flat_idx = v * vec_size + e
-                    clamped = max(tYrY_f32[flat_idx], Float32(-FLOAT8_E4M3_MAX))
-                    clamped = min(clamped, Float32(FLOAT8_E4M3_MAX))
-                    if actual_row < M:
-                        out_offset = actual_row * H + abs_col
-                        out_ptr = get_ptr_as_int64(mY, Int32(out_offset))
+                if abs_col + 8 <= H and actual_row < M:
+                    base = v * 8
+                    cvt_and_store_8xf32_to_e4m3_hw(
+                        tYrY_f32[base],
+                        tYrY_f32[base + 1],
+                        tYrY_f32[base + 2],
+                        tYrY_f32[base + 3],
+                        tYrY_f32[base + 4],
+                        tYrY_f32[base + 5],
+                        tYrY_f32[base + 6],
+                        tYrY_f32[base + 7],
+                        get_ptr_as_int64(mY, Int32(actual_row * H + abs_col)),
+                    )
+                else:
+                    for e in cutlass.range_constexpr(vec_size):
+                        abs_col_e = cluster_y * cols_per_tile + local_col + e
+                        if abs_col_e < H and actual_row < M:
+                            flat_idx = v * vec_size + e
+                            clamped = max(tYrY_f32[flat_idx], Float32(-FLOAT8_E4M3_MAX))
+                            clamped = min(clamped, Float32(FLOAT8_E4M3_MAX))
+                            cvt_and_store_f32_to_e4m3_hw(
+                                clamped,
+                                get_ptr_as_int64(mY, Int32(actual_row * H + abs_col_e)),
+                            )
+        elif cutlass.const_expr(self.use_hw_fp8 and vec_size == 4):
+            for v in cutlass.range_constexpr(num_vec_blocks):
+                local_col = col_offset + v * threads_per_row * vec_size
+                abs_col = cluster_y * cols_per_tile + local_col
+                if abs_col + 4 <= H and actual_row < M:
+                    base = v * 4
+                    cvt_and_store_4xf32_to_e4m3_hw(
+                        tYrY_f32[base],
+                        tYrY_f32[base + 1],
+                        tYrY_f32[base + 2],
+                        tYrY_f32[base + 3],
+                        get_ptr_as_int64(mY, Int32(actual_row * H + abs_col)),
+                    )
+                else:
+                    for e in cutlass.range_constexpr(vec_size):
+                        abs_col_e = cluster_y * cols_per_tile + local_col + e
+                        if abs_col_e < H and actual_row < M:
+                            flat_idx = v * vec_size + e
+                            clamped = max(tYrY_f32[flat_idx], Float32(-FLOAT8_E4M3_MAX))
+                            clamped = min(clamped, Float32(FLOAT8_E4M3_MAX))
+                            cvt_and_store_f32_to_e4m3_hw(
+                                clamped,
+                                get_ptr_as_int64(mY, Int32(actual_row * H + abs_col_e)),
+                            )
+        elif cutlass.const_expr(self.use_hw_fp8 and vec_size == 2):
+            for v in cutlass.range_constexpr(num_vec_blocks):
+                local_col = col_offset + v * threads_per_row * vec_size
+                abs_col = cluster_y * cols_per_tile + local_col
+                if abs_col + 2 <= H and actual_row < M:
+                    base = v * 2
+                    cvt_and_store_2xf32_to_e4m3_hw(
+                        tYrY_f32[base],
+                        tYrY_f32[base + 1],
+                        get_ptr_as_int64(mY, Int32(actual_row * H + abs_col)),
+                    )
+                else:
+                    for e in cutlass.range_constexpr(vec_size):
+                        abs_col_e = cluster_y * cols_per_tile + local_col + e
+                        if abs_col_e < H and actual_row < M:
+                            flat_idx = v * vec_size + e
+                            clamped = max(tYrY_f32[flat_idx], Float32(-FLOAT8_E4M3_MAX))
+                            clamped = min(clamped, Float32(FLOAT8_E4M3_MAX))
+                            cvt_and_store_f32_to_e4m3_hw(
+                                clamped,
+                                get_ptr_as_int64(mY, Int32(actual_row * H + abs_col_e)),
+                            )
+        else:
+            for v in cutlass.range_constexpr(num_vec_blocks):
+                for e in cutlass.range_constexpr(vec_size):
+                    local_col = col_offset + v * threads_per_row * vec_size + e
+                    abs_col = cluster_y * cols_per_tile + local_col
+                    if abs_col < H and actual_row < M:
+                        flat_idx = v * vec_size + e
+                        clamped = max(tYrY_f32[flat_idx], Float32(-FLOAT8_E4M3_MAX))
+                        clamped = min(clamped, Float32(FLOAT8_E4M3_MAX))
+                        out_ptr = get_ptr_as_int64(mY, Int32(actual_row * H + abs_col))
                         if self.use_hw_fp8:
                             cvt_and_store_f32_to_e4m3_hw(clamped, out_ptr)
                         else:
