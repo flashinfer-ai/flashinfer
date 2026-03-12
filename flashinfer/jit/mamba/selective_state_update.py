@@ -169,7 +169,6 @@ def gen_selective_state_update_module(
         dstate,
         ntokens_mtp,
         philox_rounds=philox_rounds,
-        extra_cuda_cflags=["-lineinfo"],
     )
 
 
@@ -204,7 +203,7 @@ def gen_selective_state_update_sm90_module(
     nvcc_flags = compilation_context.get_nvcc_flags_list(
         supported_major_versions=[9, 10, 11, 12]
     )
-    nvcc_flags += ["-DFLASHINFER_MAMBA_ENABLE_SM90", "-lineinfo"]
+    nvcc_flags += ["-DFLASHINFER_MAMBA_ENABLE_SM90"]
     return _gen_module(
         uri,
         state_dtype,
@@ -252,11 +251,7 @@ def gen_selective_state_update_sm100_module(
     nvcc_flags = compilation_context.get_nvcc_flags_list(
         supported_major_versions=[10, 11, 12]
     )
-    nvcc_flags += [
-        "-DFLASHINFER_MAMBA_ENABLE_SM90",
-        "-DFLASHINFER_MAMBA_ENABLE_SM100",
-        "-lineinfo",
-    ]
+    nvcc_flags += ["-DFLASHINFER_MAMBA_ENABLE_SM90", "-DFLASHINFER_MAMBA_ENABLE_SM100"]
     return _gen_module(
         uri,
         state_dtype,
