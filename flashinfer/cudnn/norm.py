@@ -19,7 +19,6 @@ import torch
 
 import cudnn
 
-CUDNN_AVAILABLE = True
 _TORCH_TO_CUDNN_OUTPUT_DTYPE = {
     torch.bfloat16: cudnn.data_type.BFLOAT16,
     torch.float8_e4m3fn: cudnn.data_type.FP8_E4M3,
