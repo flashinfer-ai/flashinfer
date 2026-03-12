@@ -3092,6 +3092,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             ):
                 self._backend = "fa2"
 
+            if self._backend == "cute_dsl":
+                # Cache CPU indptrs to avoid GPU→CPU sync on every run() call
+                self._qo_indptr_cpu = qo_indptr_host
+                self._kv_indptr_cpu = kv_indptr_host
+
             if self._backend == "cutlass":
                 # insert qo_indptr.device to 9th position (0-indexed) of get_module_args
                 new_get_module_args = (
