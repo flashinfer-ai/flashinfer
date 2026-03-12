@@ -17,23 +17,14 @@ from typing import Optional
 
 import torch
 
-try:
-    import cudnn
+import cudnn
 
-    CUDNN_AVAILABLE = True
-except ImportError:
-    cudnn = None
-    CUDNN_AVAILABLE = False
-
-
-# Map torch dtypes to cuDNN data types for the output tensor
-_TORCH_TO_CUDNN_OUTPUT_DTYPE = {}
-if CUDNN_AVAILABLE:
-    _TORCH_TO_CUDNN_OUTPUT_DTYPE = {
-        torch.bfloat16: cudnn.data_type.BFLOAT16,
-        torch.float8_e4m3fn: cudnn.data_type.FP8_E4M3,
-        torch.uint8: cudnn.data_type.FP4_E2M1,  # packed FP4: 2 elements per byte
-    }
+CUDNN_AVAILABLE = True
+_TORCH_TO_CUDNN_OUTPUT_DTYPE = {
+    torch.bfloat16: cudnn.data_type.BFLOAT16,
+    torch.float8_e4m3fn: cudnn.data_type.FP8_E4M3,
+    torch.uint8: cudnn.data_type.FP4_E2M1,  # packed FP4: 2 elements per byte
+}
 
 
 @functools.lru_cache(maxsize=128)
