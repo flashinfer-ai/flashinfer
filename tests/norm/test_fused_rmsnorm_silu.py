@@ -138,11 +138,12 @@ def _quantize_to_fp4_reference(values_f32, C):
     return nibbles
 
 
-def _is_sm100_plus():
+def _get_sm():
+    """Return compute capability as major*10+minor (e.g. 80, 89, 90, 100)."""
     if not torch.cuda.is_available():
-        return False
-    prop = torch.cuda.get_device_properties(0)
-    return prop.major >= 10
+        return 0
+    major, minor = torch.cuda.get_device_capability(0)
+    return major * 10 + minor
 
 
 # ============================================================
@@ -239,12 +240,9 @@ def test_fused_rmsnorm_silu_nvfp4_output(C, num_tokens):
 
     Requires 0 mismatches (nibble_diff > 1).
     """
-    if not _is_sm100_plus():
+    cudnn = pytest.importorskip("cudnn", reason="cuDNN frontend not available")
+    if _get_sm() < 100:
         pytest.skip("NVFP4 output requires SM100+ (Blackwell)")
-    try:
-        import cudnn
-    except ImportError:
-        pytest.skip("cuDNN frontend not available")
 
     torch.manual_seed(42)
     x = torch.randn(num_tokens, C, dtype=torch.bfloat16, device="cuda") * 5.0 + 5.0

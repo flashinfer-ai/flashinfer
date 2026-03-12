@@ -40,51 +40,53 @@ def _build_rmsnorm_silu_graph(
     # Convert int back to cudnn enum (lru_cache needs hashable args)
     out_dtype = cudnn.data_type(output_cudnn_dtype)
 
-    graph = cudnn.pygraph(
-        intermediate_data_type=cudnn.data_type.FLOAT,
-        compute_data_type=cudnn.data_type.FLOAT,
-    )
+    # Ensure cuDNN builds the graph on the correct device (matters for multi-GPU).
+    with torch.cuda.device(device_index):
+        graph = cudnn.pygraph(
+            intermediate_data_type=cudnn.data_type.FLOAT,
+            compute_data_type=cudnn.data_type.FLOAT,
+        )
 
-    X = graph.tensor(
-        name="X",
-        dim=[num_tokens, C, 1, 1],
-        stride=[C, 1, 1, 1],
-        data_type=cudnn.data_type.BFLOAT16,
-    )
+        X = graph.tensor(
+            name="X",
+            dim=[num_tokens, C, 1, 1],
+            stride=[C, 1, 1, 1],
+            data_type=cudnn.data_type.BFLOAT16,
+        )
 
-    scale = graph.tensor(
-        name="scale",
-        dim=[1, C, 1, 1],
-        stride=[C, 1, 1, 1],
-        data_type=cudnn.data_type.BFLOAT16,
-    )
+        scale = graph.tensor(
+            name="scale",
+            dim=[1, C, 1, 1],
+            stride=[C, 1, 1, 1],
+            data_type=cudnn.data_type.BFLOAT16,
+        )
 
-    epsilon = graph.tensor(
-        name="epsilon",
-        dim=[1, 1, 1, 1],
-        stride=[1, 1, 1, 1],
-        data_type=cudnn.data_type.FLOAT,
-        is_pass_by_value=True,
-    )
+        epsilon = graph.tensor(
+            name="epsilon",
+            dim=[1, 1, 1, 1],
+            stride=[1, 1, 1, 1],
+            data_type=cudnn.data_type.FLOAT,
+            is_pass_by_value=True,
+        )
 
-    Y = graph.rmsnorm(
-        norm_forward_phase=cudnn.norm_forward_phase.INFERENCE,
-        input=X,
-        scale=scale,
-        epsilon=epsilon,
-    )[0]
-    Y.set_dim([num_tokens, C, 1, 1])
-    Y.set_stride([C, 1, 1, 1])
-    Y.set_data_type(cudnn.data_type.BFLOAT16)
+        Y = graph.rmsnorm(
+            norm_forward_phase=cudnn.norm_forward_phase.INFERENCE,
+            input=X,
+            scale=scale,
+            epsilon=epsilon,
+        )[0]
+        Y.set_dim([num_tokens, C, 1, 1])
+        Y.set_stride([C, 1, 1, 1])
+        Y.set_data_type(cudnn.data_type.BFLOAT16)
 
-    Z = graph.swish(input=Y, swish_beta=1.0)
-    Z.set_output(True).set_data_type(out_dtype)
+        Z = graph.swish(input=Y, swish_beta=1.0)
+        Z.set_output(True).set_data_type(out_dtype)
 
-    # Build with OPENSOURCE heuristic mode → dispatches to Sm100RmsNormSiluEngine.
-    # SM100 uses sweep-tuned LUT; other SM80+ archs use fallback heuristic.
-    graph.build([cudnn.heur_mode.OPENSOURCE])
+        # Build with OPENSOURCE heuristic mode → dispatches to Sm100RmsNormSiluEngine.
+        # SM100 uses sweep-tuned LUT; other SM80+ archs use fallback heuristic.
+        graph.build([cudnn.heur_mode.OPENSOURCE])
 
-    workspace_size = graph.get_workspace_size()
+        workspace_size = graph.get_workspace_size()
 
     return graph, X, scale, epsilon, Z, workspace_size
 
