@@ -20,17 +20,9 @@ Includes:
 - FusedAddRMSNormKernel: Fused residual add + RMSNorm
 - FusedAddRMSNormQuantKernel: Fused residual add + RMSNorm + FP8 quantization
 
-Architecture follows the overhauled RMSNormKernel:
-1. Multi-row blocks for better wave utilization at small batch sizes
-2. Async global->shared copy when H alignment permits
-3. Graceful fallback to sync copy for arbitrary H (e.g. H=111)
-4. Two-pass shared memory: load input+residual once, re-read for normalization
-5. Weight loaded via separate sync copy, overlapped with async wait
-6. Cluster reduction across CTAs for very large H on SM90+
 """
 
 import functools
-import math
 
 import cutlass
 import cutlass.cute as cute
@@ -65,15 +57,12 @@ from .rmsnorm import RMSNormKernel
 
 class FusedAddRMSNormKernel:
     """
-    Fused Residual Add + RMSNorm Kernel using CuTe-DSL with multi-row blocks.
+    Fused Residual Add + RMSNorm Kernel using CuTe-DSL.
 
     Computes:
     1. residual = input + residual (in-place update)
     2. input = residual / sqrt(mean(residual^2) + eps) * (weight + weight_bias)
 
-    Uses 2 shared memory tiles (input + residual) for async copy path,
-    with two-pass access: pass 1 computes h=x+r and sum-of-squares,
-    pass 2 re-reads from shared to normalize.
     """
 
     def __init__(
@@ -445,8 +434,6 @@ class FusedAddRMSNormQuantKernel:
     1. residual = input + residual (in-place update)
     2. output = clamp(residual / sqrt(mean(residual^2) + eps) * weight / scale, -448, 448)
 
-    Same multi-row / async-copy / cluster architecture as FusedAddRMSNormKernel,
-    with an element-wise FP8 clamp-convert-store loop replacing the vectorized output.
     """
 
     def __init__(
@@ -871,20 +858,16 @@ def _get_compiled_fused_add_rmsnorm_kernel(
     kernel_obj = FusedAddRMSNormKernel(dtype, H, weight_bias, sm_version=sm_version)
 
     sym_m = cute.sym_int()
+    sym_row_stride_x = cute.sym_int(divisibility=kernel_obj.vec_size)
+    sym_row_stride_r = cute.sym_int(divisibility=kernel_obj.vec_size)
 
-    elem_bytes = dtype.width // 8
-    row_bytes = H * elem_bytes
-    tensor_align = math.gcd(128, row_bytes)
-
-    x_fake = cute.runtime.make_fake_compact_tensor(
-        dtype, (sym_m, H), stride_order=(1, 0), assumed_align=tensor_align
+    x_fake = cute.runtime.make_fake_tensor(
+        dtype, (sym_m, H), (sym_row_stride_x, 1), assumed_align=16
     )
-    r_fake = cute.runtime.make_fake_compact_tensor(
-        dtype, (sym_m, H), stride_order=(1, 0), assumed_align=tensor_align
+    r_fake = cute.runtime.make_fake_tensor(
+        dtype, (sym_m, H), (sym_row_stride_r, 1), assumed_align=16
     )
-    w_fake = cute.runtime.make_fake_compact_tensor(
-        dtype, (H,), assumed_align=tensor_align
-    )
+    w_fake = cute.runtime.make_fake_compact_tensor(dtype, (H,), assumed_align=16)
 
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
@@ -921,25 +904,20 @@ def _get_compiled_fused_add_rmsnorm_quant_kernel(
     )
 
     sym_m = cute.sym_int()
+    sym_row_stride_y = cute.sym_int(divisibility=kernel_obj.vec_size)
+    sym_row_stride_x = cute.sym_int(divisibility=kernel_obj.vec_size)
+    sym_row_stride_r = cute.sym_int(divisibility=kernel_obj.vec_size)
 
-    in_elem_bytes = dtype.width // 8
-    in_row_bytes = H * in_elem_bytes
-    in_align = math.gcd(128, in_row_bytes)
-
-    out_elem_bytes = out_dtype.width // 8
-    out_row_bytes = H * out_elem_bytes
-    out_align = math.gcd(128, out_row_bytes)
-
-    y_fake = cute.runtime.make_fake_compact_tensor(
-        out_dtype, (sym_m, H), stride_order=(1, 0), assumed_align=out_align
+    y_fake = cute.runtime.make_fake_tensor(
+        out_dtype, (sym_m, H), (sym_row_stride_y, 1), assumed_align=16
     )
-    x_fake = cute.runtime.make_fake_compact_tensor(
-        dtype, (sym_m, H), stride_order=(1, 0), assumed_align=in_align
+    x_fake = cute.runtime.make_fake_tensor(
+        dtype, (sym_m, H), (sym_row_stride_x, 1), assumed_align=16
     )
-    r_fake = cute.runtime.make_fake_compact_tensor(
-        dtype, (sym_m, H), stride_order=(1, 0), assumed_align=in_align
+    r_fake = cute.runtime.make_fake_tensor(
+        dtype, (sym_m, H), (sym_row_stride_r, 1), assumed_align=16
     )
-    w_fake = cute.runtime.make_fake_compact_tensor(dtype, (H,), assumed_align=in_align)
+    w_fake = cute.runtime.make_fake_compact_tensor(dtype, (H,), assumed_align=16)
     s_fake = cute.runtime.make_fake_compact_tensor(Float32, (1,), assumed_align=4)
 
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -976,28 +954,20 @@ def fused_add_rmsnorm_cute(
 ) -> None:
     """CuTe DSL Fused Add + RMSNorm implementation.
 
-    Input and residual are made contiguous for the kernel, then results are
-    copied back if the originals were non-contiguous. Both input and residual
-    are modified in-place.
+    Supports arbitrary row stride — no need to call contiguous().
+    Last dimension must be contiguous (stride[-1] == 1).
+    Both input and residual are modified in-place.
     """
 
     shape = input.shape
     H = shape[-1]
     M = shape[0]
 
-    input_contig = input.contiguous()
-    residual_contig = residual.contiguous()
-
     dtype_str = _torch_dtype_to_str(input.dtype)
     kernel = _get_compiled_fused_add_rmsnorm_kernel(
         dtype_str, H, weight_bias, enable_pdl, get_sm_version(input.device)
     )
-    kernel(input_contig, residual_contig, weight.contiguous(), M, eps)
-
-    if not input.is_contiguous():
-        input.copy_(input_contig)
-    if not residual.is_contiguous():
-        residual.copy_(residual_contig)
+    kernel(input, residual, weight, M, eps)
 
 
 def fused_add_rmsnorm_quant_cute(
@@ -1012,15 +982,14 @@ def fused_add_rmsnorm_quant_cute(
 ) -> None:
     """CuTe DSL Fused Add + RMSNorm + FP8 quantization implementation.
 
-    Input is read-only (made contiguous for kernel). Residual is modified
-    in-place with h = input + residual, then copied back if non-contiguous.
+    Supports arbitrary row stride — no need to call contiguous().
+    Last dimension must be contiguous (stride[-1] == 1).
+    Residual is modified in-place with h = input + residual.
     """
 
     shape = input.shape
     H = shape[-1]
     M = shape[0]
-
-    residual_contig = residual.contiguous()
 
     dtype_str = _torch_dtype_to_str(input.dtype)
     out_dtype_str = _torch_dtype_to_str(out.dtype)
@@ -1035,16 +1004,13 @@ def fused_add_rmsnorm_quant_cute(
     )
     kernel(
         out,
-        input.contiguous(),
-        residual_contig,
-        weight.contiguous(),
+        input,
+        residual,
+        weight,
         M,
         scale,
         eps,
     )
-
-    if not residual.is_contiguous():
-        residual.copy_(residual_contig)
 
 
 __all__ = [

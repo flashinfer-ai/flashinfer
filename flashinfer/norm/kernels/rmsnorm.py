@@ -23,7 +23,6 @@ Includes:
 """
 
 import functools
-import math
 
 import cutlass
 import cutlass.cute as cute
@@ -1070,19 +1069,15 @@ def _get_compiled_rmsnorm_kernel(
     kernel_obj = RMSNormKernel(dtype, H, weight_bias, sm_version=sm_version)
 
     sym_m = cute.sym_int()
+    sym_row_stride_x = cute.sym_int(divisibility=kernel_obj.vec_size)
+    sym_row_stride_y = cute.sym_int(divisibility=kernel_obj.vec_size)
 
-    elem_bytes = dtype.width // 8
-    row_bytes = H * elem_bytes
-    tensor_align = math.gcd(128, row_bytes)
-
-    x_fake = cute.runtime.make_fake_compact_tensor(
-        dtype, (sym_m, H), stride_order=(1, 0), assumed_align=tensor_align
+    x_fake = cute.runtime.make_fake_tensor(
+        dtype, (sym_m, H), (sym_row_stride_x, 1), assumed_align=16
     )
-    w_fake = cute.runtime.make_fake_compact_tensor(
-        dtype, (H,), assumed_align=tensor_align
-    )
-    y_fake = cute.runtime.make_fake_compact_tensor(
-        dtype, (sym_m, H), stride_order=(1, 0), assumed_align=tensor_align
+    w_fake = cute.runtime.make_fake_compact_tensor(dtype, (H,), assumed_align=16)
+    y_fake = cute.runtime.make_fake_tensor(
+        dtype, (sym_m, H), (sym_row_stride_y, 1), assumed_align=16
     )
 
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -1170,21 +1165,15 @@ def _get_compiled_rmsnorm_quant_kernel(
     )
 
     sym_m = cute.sym_int()
+    sym_row_stride_x = cute.sym_int(divisibility=kernel_obj.vec_size)
+    sym_row_stride_y = cute.sym_int(divisibility=kernel_obj.vec_size)
 
-    in_elem_bytes = dtype.width // 8
-    in_row_bytes = H * in_elem_bytes
-    in_align = math.gcd(128, in_row_bytes)
-
-    out_elem_bytes = out_dtype.width // 8
-    out_row_bytes = H * out_elem_bytes
-    out_align = math.gcd(128, out_row_bytes)
-
-    x_fake = cute.runtime.make_fake_compact_tensor(
-        dtype, (sym_m, H), stride_order=(1, 0), assumed_align=in_align
+    x_fake = cute.runtime.make_fake_tensor(
+        dtype, (sym_m, H), (sym_row_stride_x, 1), assumed_align=16
     )
-    w_fake = cute.runtime.make_fake_compact_tensor(dtype, (H,), assumed_align=in_align)
-    y_fake = cute.runtime.make_fake_compact_tensor(
-        out_dtype, (sym_m, H), stride_order=(1, 0), assumed_align=out_align
+    w_fake = cute.runtime.make_fake_compact_tensor(dtype, (H,), assumed_align=16)
+    y_fake = cute.runtime.make_fake_tensor(
+        out_dtype, (sym_m, H), (sym_row_stride_y, 1), assumed_align=16
     )
     s_fake = cute.runtime.make_fake_compact_tensor(Float32, (1,), assumed_align=4)
 
@@ -1221,19 +1210,19 @@ def rmsnorm_cute(
 ) -> None:
     """CuTe DSL RMSNorm implementation.
 
-    Input and output must be contiguous (row-major). Uses async global→shared
-    copy with multi-row blocks for improved wave utilization.
+    Supports arbitrary row stride — no need to call contiguous().
+    Last dimension must be contiguous (stride[-1] == 1).
     """
     shape = input.shape
     H = shape[-1]
 
     if len(shape) == 3:
         M = shape[0] * shape[1]
-        input_2d = input.reshape(M, H).contiguous()
+        input_2d = input.reshape(M, H)
         out_2d = out.reshape(M, H)
     else:
         M = shape[0]
-        input_2d = input.contiguous()
+        input_2d = input
         out_2d = out
 
     kernel = _get_compiled_rmsnorm_kernel(
@@ -1243,7 +1232,7 @@ def rmsnorm_cute(
         enable_pdl,
         get_sm_version(input.device),
     )
-    kernel(input_2d, weight.contiguous(), out_2d, M, eps)
+    kernel(input_2d, weight, out_2d, M, eps)
 
 
 def qk_rmsnorm_cute(
@@ -1284,9 +1273,8 @@ def rmsnorm_quant_cute(
 ) -> None:
     """CuTe DSL RMSNorm + FP8 quantization implementation.
 
-    Input must be contiguous (row-major). Uses multi-row blocks with
-    async/sync copy depending on H alignment. Output is written via
-    scalar PTX FP8 stores.
+    Supports arbitrary row stride — no need to call contiguous().
+    Last dimension must be contiguous (stride[-1] == 1).
     """
     shape = input.shape
     H = shape[-1]
@@ -1303,7 +1291,7 @@ def rmsnorm_quant_cute(
         use_hw_fp8=has_hw_fp8_cvt(input.device),
         sm_version=get_sm_version(input.device),
     )
-    kernel(input.contiguous(), weight.contiguous(), out, M, scale, eps)
+    kernel(input, weight, out, M, scale, eps)
 
 
 __all__ = [
