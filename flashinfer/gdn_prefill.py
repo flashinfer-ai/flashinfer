@@ -26,6 +26,13 @@ from .utils import (
     register_fake_op,
     get_device_sm_count,
     _get_cache_buf,
+    is_sm90a_supported,
+    is_sm100a_supported,
+    is_sm110a_supported,
+)
+
+from flashinfer.gdn_kernels.blackwell_prefill import (
+    chunk_gated_delta_rule as chunk_gated_delta_rule_blackwell,
 )
 
 
@@ -82,8 +89,7 @@ def get_gdn_prefill_module():
     return SimpleNamespace(gdn_prefill=gdn_prefill)
 
 
-@flashinfer_api
-def chunk_gated_delta_rule(
+def chunk_gated_delta_rule_hopper(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -102,52 +108,6 @@ def chunk_gated_delta_rule(
     This implements the gated delta rule linear attention mechanism for efficient
     training and inference. Supports both GQA (grouped query attention) and GVA
     (grouped value attention) configurations.
-
-    Args:
-        q (torch.Tensor):
-            Queries of shape ``[total_seq_len, num_q_heads, head_size]``.
-            Must be contiguous and on CUDA.
-        k (torch.Tensor):
-            Keys of shape ``[total_seq_len, num_k_heads, head_size]``.
-            Must be contiguous and on CUDA.
-        v (torch.Tensor):
-            Values of shape ``[total_seq_len, num_v_heads, head_size]``.
-            Must be contiguous and on CUDA.
-        g (Optional[torch.Tensor]):
-            Forget gate (alpha) of shape ``[total_seq_len, num_sab_heads]`` where
-            ``num_sab_heads = max(num_q_heads, num_v_heads)``. Must be float32.
-            If None, defaults to all ones. Default: ``None``.
-        beta (Optional[torch.Tensor]):
-            Update gate (beta) of shape ``[total_seq_len, num_sab_heads]``.
-            Must be float32. If None, defaults to all ones. Default: ``None``.
-        scale (Optional[float]):
-            Scale factor for the attention scores.
-            If not provided, defaults to ``1 / sqrt(head_size)``. Default: ``None``.
-        initial_state (Optional[torch.Tensor]):
-            Initial KV state of shape ``[num_seqs, num_sab_heads, head_size, head_size]``.
-            Must be float32. If None, starts from zero state. Default: ``None``.
-        output_final_state (bool):
-            Whether to output the final state. Default: ``False``.
-        cu_seqlens (torch.Tensor):
-            Cumulative sequence lengths of shape ``[num_seqs + 1]``, int64.
-            Required for variable-length sequences (varlen mode).
-        use_qk_l2norm_in_kernel (bool):
-            Whether to use QK L2 normalization in kernel. Default: ``False``.
-        output (Optional[torch.Tensor]):
-            Pre-allocated output tensor of shape ``[total_seq_len, num_o_heads, head_size]``
-            where ``num_o_heads = max(num_q_heads, num_v_heads)``.
-            If None, will be allocated automatically. Default: ``None``.
-        output_state (Optional[torch.Tensor]):
-            Pre-allocated output state tensor of shape
-            ``[num_seqs, num_sab_heads, head_size, head_size]``, float32.
-            Required if ``output_final_state=True``. Default: ``None``.
-
-    Returns:
-        Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-            - If ``output_final_state=False``: Returns output tensor of shape
-              ``[total_seq_len, num_o_heads, head_size]``.
-            - If ``output_final_state=True``: Returns tuple of (output, final_state) where
-              final_state has shape ``[num_seqs, num_sab_heads, head_size, head_size]``.
 
     Note:
         - Supports GQA: ``num_q_heads > num_k_heads = num_v_heads``
@@ -211,3 +171,111 @@ def chunk_gated_delta_rule(
         return output, output_state
     else:
         return output
+
+
+@flashinfer_api
+def chunk_gated_delta_rule(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: Optional[torch.Tensor] = None,
+    beta: Optional[torch.Tensor] = None,
+    scale: Optional[float] = None,
+    initial_state: Optional[torch.Tensor] = None,
+    output_final_state: bool = False,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    use_qk_l2norm_in_kernel: bool = False,
+    output: Optional[torch.Tensor] = None,
+    output_state: Optional[torch.Tensor] = None,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    r"""Chunked Gated Delta Rule (GDN) attention for prefill.
+
+    Args:
+        q (torch.Tensor):
+            Queries of shape ``[total_seq_len, num_q_heads, head_size]``.
+            Must be contiguous and on CUDA.
+        k (torch.Tensor):
+            Keys of shape ``[total_seq_len, num_k_heads, head_size]``.
+            Must be contiguous and on CUDA.
+        v (torch.Tensor):
+            Values of shape ``[total_seq_len, num_v_heads, head_size]``.
+            Must be contiguous and on CUDA.
+        g (Optional[torch.Tensor]):
+            Forget gate (alpha) of shape ``[total_seq_len, num_sab_heads]`` where
+            ``num_sab_heads = max(num_q_heads, num_v_heads)``. Must be float32.
+            If None, defaults to all ones. Default: ``None``.
+        beta (Optional[torch.Tensor]):
+            Update gate (beta) of shape ``[total_seq_len, num_sab_heads]``.
+            Must be float32. If None, defaults to all ones. Default: ``None``.
+        scale (Optional[float]):
+            Scale factor for the attention scores.
+            If not provided, defaults to ``1 / sqrt(head_size)``. Default: ``None``.
+        initial_state (Optional[torch.Tensor]):
+            Initial KV state of shape ``[num_seqs, num_sab_heads, head_size, head_size]``.
+            Must be float32. If None, starts from zero state. Default: ``None``.
+        output_final_state (bool):
+            Whether to output the final state. Default: ``False``.
+        cu_seqlens (torch.Tensor):
+            Cumulative sequence lengths of shape ``[num_seqs + 1]``, int64.
+            Required for variable-length sequences (varlen mode).
+        use_qk_l2norm_in_kernel (bool):
+            Whether to use QK L2 normalization in kernel. Default: ``False``.
+        output (Optional[torch.Tensor]):
+            Pre-allocated output tensor of shape ``[total_seq_len, num_o_heads, head_size]``
+            where ``num_o_heads = max(num_q_heads, num_v_heads)``.
+            If None, will be allocated automatically. Default: ``None``.
+        output_state (Optional[torch.Tensor]):
+            Pre-allocated output state tensor of shape
+            ``[num_seqs, num_sab_heads, head_size, head_size]``, float32.
+            Required if ``output_final_state=True``. Default: ``None``.
+
+    Returns:
+        Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+            - If ``output_final_state=False``: Returns output tensor of shape
+              ``[total_seq_len, num_o_heads, head_size]``.
+            - If ``output_final_state=True``: Returns tuple of (output, final_state) where
+              final_state has shape ``[num_seqs, num_sab_heads, head_size, head_size]``.
+    """
+
+    if is_sm90a_supported(torch.device("cuda")):
+        return chunk_gated_delta_rule_hopper(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            initial_state,
+            output_final_state,
+            cu_seqlens,
+            use_qk_l2norm_in_kernel,
+            output,
+            output_state,
+        )
+
+    elif is_sm100a_supported(torch.device("cuda")) or is_sm110a_supported(
+        torch.device("cuda")
+    ):
+        if g is None or beta is None:
+            raise NotImplementedError(
+                "Gate and beta must not be None on sm100a and sm110a."
+            )
+
+        return chunk_gated_delta_rule_blackwell(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            initial_state,
+            output_final_state,
+            cu_seqlens,
+            use_qk_l2norm_in_kernel,
+            output,
+            output_state,
+        )
+    else:
+        raise NotImplementedError(
+            "chunk_gated_delta_rule only support sm90a, sm100a, sm110a."
+        )

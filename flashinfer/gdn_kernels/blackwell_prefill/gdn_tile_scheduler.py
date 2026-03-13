@@ -148,7 +148,12 @@ class GdnStaticTileScheduler:
         new_blk_coord = cutlass.new_from_mlir_values(self._blk_coord, values[4:7])
         new_grid_shape = cutlass.new_from_mlir_values(self._grid_shape, values[7:])
         return GdnStaticTileScheduler(
-            new_params, new_current_work_linear_idx, new_blk_coord, new_grid_shape
+            new_params,
+            new_current_work_linear_idx,
+            new_blk_coord,
+            new_grid_shape,
+            loc=self._loc,
+            ip=self._ip,
         )
 
 

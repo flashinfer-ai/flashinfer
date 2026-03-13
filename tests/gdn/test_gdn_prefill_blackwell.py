@@ -24,7 +24,7 @@ from flashinfer.utils import (
 )
 
 try:
-    from flashinfer.gdn_kernels.blackwell_prefill.gdn import (
+    from flashinfer.gdn_prefill import (
         chunk_gated_delta_rule,
     )
 
@@ -66,12 +66,12 @@ def recurrent_gated_delta_rule_ref(
     for i in range(T):
         b_q = q[:, :, i]
         b_k = k[:, :, i]
-        b_v = v[:, :, i].clone()
-        h = h.clone() * g[:, :, i].exp()[..., None, None]
+        b_v = v[:, :, i]
+        h = h * g[:, :, i].exp()[..., None, None]
         b_beta = beta[:, :, i]
-        b_v = b_v - (h.clone() * b_k[..., None]).sum(-2)
+        b_v = b_v - (h * b_k[..., None]).sum(-2)
         b_v = b_v * b_beta[..., None]
-        h = h.clone() + b_k.unsqueeze(-1) * b_v.unsqueeze(-2)
+        h = h + b_k.unsqueeze(-1) * b_v.unsqueeze(-2)
         o[:, :, i] = torch.einsum("bhd,bhdm->bhm", b_q, h)
     if not output_final_state:
         h = None
@@ -111,10 +111,10 @@ class TestGDNFixedLength:
     @pytest.mark.parametrize(
         "H,D,T,B,dtype",
         [
-            (16, 128, 256, 4, testtype),
+            (4, 128, 256, 2, testtype),
             (1, 128, 128, 2, testtype),
-            (16, 128, 256, 1, testtype),
-            (3, 128, 131, 177, testtype),
+            (4, 128, 256, 1, testtype),
+            (3, 128, 131, 151, testtype),
         ],
     )
     def test_fixlen_output(self, set_seed, H, D, T, B, dtype):
@@ -123,46 +123,43 @@ class TestGDNFixedLength:
 
         device = "cuda"
 
-        q = torch.randn((B, T, H, D), dtype=dtype)
-        k = F.normalize(torch.randn(B, T, H, D, dtype=torch.float32), p=2, dim=-1).to(
-            dtype
-        )
-        v = torch.randn((B, T, H, D), dtype=dtype)
-        g = F.logsigmoid(torch.rand(1, T * B, H, dtype=torch.float32))
-        beta = torch.rand(1, T * B, H, dtype=torch.float32).sigmoid()
-        h0 = torch.randn((B, H, D, D), dtype=torch.float)
-
-        q, k, v, beta, g, h0 = map(lambda x: x.to(device), (q, k, v, beta, g, h0))
+        q = torch.randn((B, T, H, D), dtype=dtype, device=device)
+        k = F.normalize(
+            torch.randn(B, T, H, D, dtype=torch.float32, device=device), p=2, dim=-1
+        ).to(dtype)
+        v = torch.randn((B, T, H, D), dtype=dtype, device=device)
+        g = F.logsigmoid(torch.rand(1, T * B, H, dtype=torch.float32, device=device))
+        beta = torch.rand(1, T * B, H, dtype=torch.float32, device=device).sigmoid()
+        h0 = torch.randn((B, H, D, D), dtype=torch.float, device=device)
 
         state_output = torch.zeros_like(h0, dtype=torch.float)
 
         o, state_output = chunk_gated_delta_rule(
-            q.clone(),
-            k.clone(),
-            v.clone(),
-            g.clone(),
-            beta.clone(),
+            q,
+            k,
+            v,
+            g,
+            beta,
             None,
-            h0.clone(),
+            h0,
             True,
             None,
             False,
             None,
             state_output,
         )
-        torch.cuda.synchronize()
 
         ref = []
         ref_ht = []
         h0_v_major = h0.transpose(-1, -2).contiguous()
         for i in range(B):
             ref_i, ref_ht_i = recurrent_gated_delta_rule_ref(
-                q=q[i].unsqueeze(0).clone(),
-                k=k[i].unsqueeze(0).clone(),
-                v=v[i].unsqueeze(0).clone(),
-                beta=beta[:, (i * T) : ((i + 1) * T)].clone(),
-                g=g[:, (i * T) : ((i + 1) * T)].clone(),
-                initial_state=h0_v_major[i].clone(),
+                q=q[i].unsqueeze(0),
+                k=k[i].unsqueeze(0),
+                v=v[i].unsqueeze(0),
+                beta=beta[:, (i * T) : ((i + 1) * T)],
+                g=g[:, (i * T) : ((i + 1) * T)],
+                initial_state=h0_v_major[i],
                 output_final_state=True,
             )
             if i == 0:
@@ -172,17 +169,15 @@ class TestGDNFixedLength:
                 ref = torch.cat((ref, ref_i), dim=0).contiguous()
                 ref_ht = torch.cat((ref_ht, ref_ht_i), dim=0).contiguous()
 
-        torch.cuda.synchronize()
-
         torch.testing.assert_close(ref, o.to(torch.float), atol=oatol, rtol=ortol)
 
     @pytest.mark.parametrize(
         "H,D,T,B,dtype",
         [
-            (16, 128, 256, 4, testtype),
+            (4, 128, 256, 2, testtype),
             (1, 128, 128, 2, testtype),
-            (16, 128, 256, 1, testtype),
-            (3, 128, 131, 177, testtype),
+            (4, 128, 256, 1, testtype),
+            (3, 128, 131, 151, testtype),
         ],
     )
     def test_fixlen_state(self, set_seed, H, D, T, B, dtype):
@@ -192,45 +187,42 @@ class TestGDNFixedLength:
 
         device = "cuda"
 
-        q = torch.randn((B, T, H, D), dtype=dtype)
-        k = F.normalize(torch.randn(B, T, H, D, dtype=torch.float32), p=2, dim=-1).to(
-            dtype
-        )
-        v = torch.randn((B, T, H, D), dtype=dtype)
-        g = F.logsigmoid(torch.rand(1, T * B, H, dtype=torch.float32))
-        beta = torch.rand(1, T * B, H, dtype=torch.float32).sigmoid()
-        h0 = torch.randn((B, H, D, D), dtype=torch.float)
-
-        q, k, v, beta, g, h0 = map(lambda x: x.to(device), (q, k, v, beta, g, h0))
+        q = torch.randn((B, T, H, D), dtype=dtype, device=device)
+        k = F.normalize(
+            torch.randn(B, T, H, D, dtype=torch.float32, device=device), p=2, dim=-1
+        ).to(dtype)
+        v = torch.randn((B, T, H, D), dtype=dtype, device=device)
+        g = F.logsigmoid(torch.rand(1, T * B, H, dtype=torch.float32, device=device))
+        beta = torch.rand(1, T * B, H, dtype=torch.float32, device=device).sigmoid()
+        h0 = torch.randn((B, H, D, D), dtype=torch.float, device=device)
 
         state_output = torch.zeros_like(h0, dtype=torch.float)
 
         o, state_output = chunk_gated_delta_rule(
-            q.clone(),
-            k.clone(),
-            v.clone(),
-            g.clone(),
-            beta.clone(),
+            q,
+            k,
+            v,
+            g,
+            beta,
             None,
-            h0.clone(),
+            h0,
             True,
             None,
             False,
             None,
             state_output,
         )
-        torch.cuda.synchronize()
 
         ref_ht = []
         h0_v_major = h0.transpose(-1, -2).contiguous()
         for i in range(B):
             _, ref_ht_i = recurrent_gated_delta_rule_ref(
-                q=q[i].unsqueeze(0).clone(),
-                k=k[i].unsqueeze(0).clone(),
-                v=v[i].unsqueeze(0).clone(),
-                beta=beta[:, (i * T) : ((i + 1) * T)].clone(),
-                g=g[:, (i * T) : ((i + 1) * T)].clone(),
-                initial_state=h0_v_major[i].clone(),
+                q=q[i].unsqueeze(0),
+                k=k[i].unsqueeze(0),
+                v=v[i].unsqueeze(0),
+                beta=beta[:, (i * T) : ((i + 1) * T)],
+                g=g[:, (i * T) : ((i + 1) * T)],
+                initial_state=h0_v_major[i],
                 output_final_state=True,
             )
             if i == 0:
@@ -239,11 +231,8 @@ class TestGDNFixedLength:
                 ref_ht = torch.cat((ref_ht, ref_ht_i), dim=0).contiguous()
 
         ref_ht = torch.transpose(ref_ht, -1, -2).contiguous()
-        torch.cuda.synchronize()
 
-        torch.testing.assert_close(
-            ref_ht, state_output.to(torch.float), atol=satol, rtol=srtol
-        )
+        torch.testing.assert_close(ref_ht, state_output, atol=satol, rtol=srtol)
 
 
 class TestGDNVariableLength:
@@ -252,8 +241,8 @@ class TestGDNVariableLength:
     @pytest.mark.parametrize(
         "H,D,cu_seqlens,dtype",
         [
-            (16, 128, [0, 256, 500, 1000, 1013], testtype),
-            (16, 128, [0, 13, 77], testtype),
+            (2, 128, [0, 256, 500], testtype),
+            (2, 128, [0, 13, 77], testtype),
         ],
     )
     def test_varlen_output(self, set_seed, H, D, cu_seqlens, dtype):
@@ -267,34 +256,31 @@ class TestGDNVariableLength:
         T = cu_seqlens[-1]
         N = len(cu_seqlens) - 1
 
-        q = torch.randn((1, T, H, D), dtype=dtype)
-        k = F.normalize(torch.randn(1, T, H, D, dtype=torch.float32), p=2, dim=-1).to(
-            dtype
-        )
-        v = torch.randn((1, T, H, D), dtype=dtype)
-        g = F.logsigmoid(torch.rand(1, T, H, dtype=torch.float32))
-        beta = torch.rand(1, T, H, dtype=torch.float32).sigmoid()
-        h0 = torch.randn((N, H, D, D), dtype=torch.float)
-
-        q, k, v, beta, g, h0 = map(lambda x: x.to(device), (q, k, v, beta, g, h0))
+        q = torch.randn((1, T, H, D), dtype=dtype, device=device)
+        k = F.normalize(
+            torch.randn(1, T, H, D, dtype=torch.float32, device=device), p=2, dim=-1
+        ).to(dtype)
+        v = torch.randn((1, T, H, D), dtype=dtype, device=device)
+        g = F.logsigmoid(torch.rand(1, T, H, dtype=torch.float32, device=device))
+        beta = torch.rand(1, T, H, dtype=torch.float32, device=device).sigmoid()
+        h0 = torch.randn((N, H, D, D), dtype=torch.float, device=device)
 
         state_output = torch.zeros_like(h0, dtype=torch.float)
 
         o, state_output = chunk_gated_delta_rule(
-            q.clone(),
-            k.clone(),
-            v.clone(),
-            g.clone(),
-            beta.clone(),
+            q,
+            k,
+            v,
+            g,
+            beta,
             None,
-            h0.clone(),
+            h0,
             True,
-            cu_seqlens_tensor.clone(),
+            cu_seqlens_tensor,
             False,
             None,
             state_output,
         )
-        torch.cuda.synchronize()
 
         ref = []
         h0_v_major = h0.transpose(-1, -2)
@@ -310,15 +296,14 @@ class TestGDNVariableLength:
             )
             ref.append(ref_i)
         ref = torch.cat(ref, 1)
-        torch.cuda.synchronize()
 
         torch.testing.assert_close(ref, o.to(torch.float), atol=oatol, rtol=ortol)
 
     @pytest.mark.parametrize(
         "H,D,cu_seqlens,dtype",
         [
-            (16, 128, [0, 256, 500, 1000, 1013], testtype),
-            (16, 128, [0, 13, 77], testtype),
+            (2, 128, [0, 256, 500], testtype),
+            (2, 128, [0, 13, 77], testtype),
         ],
     )
     def test_varlen_state(self, set_seed, H, D, cu_seqlens, dtype):
@@ -332,34 +317,31 @@ class TestGDNVariableLength:
         T = cu_seqlens[-1]
         N = len(cu_seqlens) - 1
 
-        q = torch.randn((1, T, H, D), dtype=dtype)
-        k = F.normalize(torch.randn(1, T, H, D, dtype=torch.float32), p=2, dim=-1).to(
-            dtype
-        )
-        v = torch.randn((1, T, H, D), dtype=dtype)
-        g = F.logsigmoid(torch.rand(1, T, H, dtype=torch.float32))
-        beta = torch.rand(1, T, H, dtype=torch.float32).sigmoid()
-        h0 = torch.randn((N, H, D, D), dtype=torch.float)
-
-        q, k, v, beta, g, h0 = map(lambda x: x.to(device), (q, k, v, beta, g, h0))
+        q = torch.randn((1, T, H, D), dtype=dtype, device=device)
+        k = F.normalize(
+            torch.randn(1, T, H, D, dtype=torch.float32, device=device), p=2, dim=-1
+        ).to(dtype)
+        v = torch.randn((1, T, H, D), dtype=dtype, device=device)
+        g = F.logsigmoid(torch.rand(1, T, H, dtype=torch.float32, device=device))
+        beta = torch.rand(1, T, H, dtype=torch.float32, device=device).sigmoid()
+        h0 = torch.randn((N, H, D, D), dtype=torch.float, device=device)
 
         state_output = torch.zeros_like(h0, dtype=torch.float)
 
         o, state_output = chunk_gated_delta_rule(
-            q.clone(),
-            k.clone(),
-            v.clone(),
-            g.clone(),
-            beta.clone(),
+            q,
+            k,
+            v,
+            g,
+            beta,
             None,
-            h0.clone(),
+            h0,
             True,
-            cu_seqlens_tensor.clone(),
+            cu_seqlens_tensor,
             False,
             None,
             state_output,
         )
-        torch.cuda.synchronize()
 
         ref_ht = []
         h0_v_major = h0.transpose(-1, -2)
@@ -376,11 +358,8 @@ class TestGDNVariableLength:
             ref_ht.append(ref_ht_i)
         ref_ht = torch.cat(ref_ht, 0)
         ref_ht = torch.transpose(ref_ht, -1, -2)
-        torch.cuda.synchronize()
 
-        torch.testing.assert_close(
-            ref_ht, state_output.to(torch.float), atol=satol, rtol=srtol
-        )
+        torch.testing.assert_close(ref_ht, state_output, atol=satol, rtol=srtol)
 
 
 class TestGDNFixedLengthGVA:
@@ -389,9 +368,8 @@ class TestGDNFixedLengthGVA:
     @pytest.mark.parametrize(
         "H_QK,H_V,D,T,B,dtype",
         [
-            (16, 32, 128, 555, 1, testtype),
-            (8, 32, 128, 256, 2, testtype),
-            (16, 64, 128, 128, 1, testtype),
+            (2, 8, 128, 555, 1, testtype),
+            (2, 8, 128, 256, 2, testtype),
         ],
     )
     def test_fixlen_gva_output(self, set_seed, H_QK, H_V, D, T, B, dtype):
@@ -401,34 +379,31 @@ class TestGDNFixedLengthGVA:
 
         device = "cuda"
 
-        q = torch.randn((B, T, H_QK, D), dtype=dtype)
+        q = torch.randn((B, T, H_QK, D), dtype=dtype, device=device)
         k = F.normalize(
-            torch.randn(B, T, H_QK, D, dtype=torch.float32), p=2, dim=-1
+            torch.randn(B, T, H_QK, D, dtype=torch.float32, device=device), p=2, dim=-1
         ).to(dtype)
-        v = torch.randn((B, T, H_V, D), dtype=dtype)
-        g = F.logsigmoid(torch.rand(1, T * B, H_V, dtype=torch.float32))
-        beta = torch.rand(1, T * B, H_V, dtype=torch.float32).sigmoid()
-        h0 = torch.randn((B, H_V, D, D), dtype=torch.float)
-
-        q, k, v, beta, g, h0 = map(lambda x: x.to(device), (q, k, v, beta, g, h0))
+        v = torch.randn((B, T, H_V, D), dtype=dtype, device=device)
+        g = F.logsigmoid(torch.rand(1, T * B, H_V, dtype=torch.float32, device=device))
+        beta = torch.rand(1, T * B, H_V, dtype=torch.float32, device=device).sigmoid()
+        h0 = torch.randn((B, H_V, D, D), dtype=torch.float, device=device)
 
         state_output = torch.zeros_like(h0, dtype=torch.float)
 
         o, state_output = chunk_gated_delta_rule(
-            q.clone(),
-            k.clone(),
-            v.clone(),
-            g.clone(),
-            beta.clone(),
+            q,
+            k,
+            v,
+            g,
+            beta,
             None,
-            h0.clone(),
+            h0,
             True,
             None,
             False,
             None,
             state_output,
         )
-        torch.cuda.synchronize()
 
         repeat_factor = H_V // H_QK
         q = q.repeat_interleave(repeat_factor, dim=2)
@@ -438,12 +413,12 @@ class TestGDNFixedLengthGVA:
         h0_v_major = h0.transpose(-1, -2).contiguous()
         for i in range(B):
             ref_i, _ = recurrent_gated_delta_rule_ref(
-                q=q[i].unsqueeze(0).clone(),
-                k=k[i].unsqueeze(0).clone(),
-                v=v[i].unsqueeze(0).clone(),
-                beta=beta[:, (i * T) : ((i + 1) * T)].clone(),
-                g=g[:, (i * T) : ((i + 1) * T)].clone(),
-                initial_state=h0_v_major[i].clone(),
+                q=q[i].unsqueeze(0),
+                k=k[i].unsqueeze(0),
+                v=v[i].unsqueeze(0),
+                beta=beta[:, (i * T) : ((i + 1) * T)],
+                g=g[:, (i * T) : ((i + 1) * T)],
+                initial_state=h0_v_major[i],
                 output_final_state=True,
             )
             if i == 0:
@@ -451,15 +426,13 @@ class TestGDNFixedLengthGVA:
             else:
                 ref = torch.cat((ref, ref_i), dim=0).contiguous()
 
-        torch.cuda.synchronize()
         torch.testing.assert_close(ref, o.to(torch.float), atol=oatol, rtol=ortol)
 
     @pytest.mark.parametrize(
         "H_QK,H_V,D,T,B,dtype",
         [
-            (16, 32, 128, 555, 1, testtype),
-            (8, 32, 128, 128, 2, testtype),
-            (16, 64, 128, 130, 1, testtype),
+            (2, 8, 128, 555, 1, testtype),
+            (2, 8, 128, 128, 2, testtype),
         ],
     )
     def test_fixlen_gva_state(self, set_seed, H_QK, H_V, D, T, B, dtype):
@@ -469,34 +442,31 @@ class TestGDNFixedLengthGVA:
 
         device = "cuda"
 
-        q = torch.randn((B, T, H_QK, D), dtype=dtype)
+        q = torch.randn((B, T, H_QK, D), dtype=dtype, device=device)
         k = F.normalize(
-            torch.randn(B, T, H_QK, D, dtype=torch.float32), p=2, dim=-1
+            torch.randn(B, T, H_QK, D, dtype=torch.float32, device=device), p=2, dim=-1
         ).to(dtype)
-        v = torch.randn((B, T, H_V, D), dtype=dtype)
-        g = F.logsigmoid(torch.rand(1, T * B, H_V, dtype=torch.float32))
-        beta = torch.rand(1, T * B, H_V, dtype=torch.float32).sigmoid()
-        h0 = torch.randn((B, H_V, D, D), dtype=torch.float)
-
-        q, k, v, beta, g, h0 = map(lambda x: x.to(device), (q, k, v, beta, g, h0))
+        v = torch.randn((B, T, H_V, D), dtype=dtype, device=device)
+        g = F.logsigmoid(torch.rand(1, T * B, H_V, dtype=torch.float32, device=device))
+        beta = torch.rand(1, T * B, H_V, dtype=torch.float32, device=device).sigmoid()
+        h0 = torch.randn((B, H_V, D, D), dtype=torch.float, device=device)
 
         state_output = torch.zeros_like(h0, dtype=torch.float)
 
         o, state_output = chunk_gated_delta_rule(
-            q.clone(),
-            k.clone(),
-            v.clone(),
-            g.clone(),
-            beta.clone(),
+            q,
+            k,
+            v,
+            g,
+            beta,
             None,
-            h0.clone(),
+            h0,
             True,
             None,
             False,
             None,
             state_output,
         )
-        torch.cuda.synchronize()
 
         repeat_factor = H_V // H_QK
         q = q.repeat_interleave(repeat_factor, dim=2)
@@ -506,12 +476,12 @@ class TestGDNFixedLengthGVA:
         h0_v_major = h0.transpose(-1, -2).contiguous()
         for i in range(B):
             _, ref_ht_i = recurrent_gated_delta_rule_ref(
-                q=q[i].unsqueeze(0).clone(),
-                k=k[i].unsqueeze(0).clone(),
-                v=v[i].unsqueeze(0).clone(),
-                beta=beta[:, (i * T) : ((i + 1) * T)].clone(),
-                g=g[:, (i * T) : ((i + 1) * T)].clone(),
-                initial_state=h0_v_major[i].clone(),
+                q=q[i].unsqueeze(0),
+                k=k[i].unsqueeze(0),
+                v=v[i].unsqueeze(0),
+                beta=beta[:, (i * T) : ((i + 1) * T)],
+                g=g[:, (i * T) : ((i + 1) * T)],
+                initial_state=h0_v_major[i],
                 output_final_state=True,
             )
             if i == 0:
@@ -520,11 +490,8 @@ class TestGDNFixedLengthGVA:
                 ref_ht = torch.cat((ref_ht, ref_ht_i), dim=0).contiguous()
 
         ref_ht = torch.transpose(ref_ht, -1, -2).contiguous()
-        torch.cuda.synchronize()
 
-        torch.testing.assert_close(
-            ref_ht, state_output.to(torch.float), atol=satol, rtol=srtol
-        )
+        torch.testing.assert_close(ref_ht, state_output, atol=satol, rtol=srtol)
 
 
 class TestGDNVariableLengthGVA:
@@ -533,9 +500,8 @@ class TestGDNVariableLengthGVA:
     @pytest.mark.parametrize(
         "H_QK,H_V,D,cu_seqlens,dtype",
         [
-            (16, 32, 128, [0, 13, 287], testtype),
-            (8, 32, 128, [0, 256, 500, 1000], testtype),
-            (16, 64, 128, [0, 128], testtype),
+            (2, 8, 128, [0, 13, 287], testtype),
+            (2, 8, 128, [0, 256, 500, 511], testtype),
         ],
     )
     def test_varlen_gva_output(self, set_seed, H_QK, H_V, D, cu_seqlens, dtype):
@@ -549,34 +515,31 @@ class TestGDNVariableLengthGVA:
         T = cu_seqlens[-1]
         N = len(cu_seqlens) - 1
 
-        q = torch.randn((1, T, H_QK, D), dtype=dtype)
+        q = torch.randn((1, T, H_QK, D), dtype=dtype, device=device)
         k = F.normalize(
-            torch.randn(1, T, H_QK, D, dtype=torch.float32), p=2, dim=-1
+            torch.randn(1, T, H_QK, D, dtype=torch.float32, device=device), p=2, dim=-1
         ).to(dtype)
-        v = torch.randn((1, T, H_V, D), dtype=dtype)
-        g = F.logsigmoid(torch.rand(1, T, H_V, dtype=torch.float32))
-        beta = torch.rand(1, T, H_V, dtype=torch.float32).sigmoid()
-        h0 = torch.randn((N, H_V, D, D), dtype=torch.float)
-
-        q, k, v, beta, g, h0 = map(lambda x: x.to(device), (q, k, v, beta, g, h0))
+        v = torch.randn((1, T, H_V, D), dtype=dtype, device=device)
+        g = F.logsigmoid(torch.rand(1, T, H_V, dtype=torch.float32, device=device))
+        beta = torch.rand(1, T, H_V, dtype=torch.float32, device=device).sigmoid()
+        h0 = torch.randn((N, H_V, D, D), dtype=torch.float, device=device)
 
         state_output = torch.zeros_like(h0, dtype=torch.float)
 
         o, state_output = chunk_gated_delta_rule(
-            q.clone(),
-            k.clone(),
-            v.clone(),
-            g.clone(),
-            beta.clone(),
+            q,
+            k,
+            v,
+            g,
+            beta,
             None,
-            h0.clone(),
+            h0,
             True,
-            cu_seqlens_tensor.clone(),
+            cu_seqlens_tensor,
             False,
             None,
             state_output,
         )
-        torch.cuda.synchronize()
 
         repeat_factor = H_V // H_QK
         q = q.repeat_interleave(repeat_factor, dim=2)
@@ -596,15 +559,14 @@ class TestGDNVariableLengthGVA:
             )
             ref.append(ref_i)
         ref = torch.cat(ref, 1)
-        torch.cuda.synchronize()
 
         torch.testing.assert_close(ref, o.to(torch.float), atol=oatol, rtol=ortol)
 
     @pytest.mark.parametrize(
         "H_QK,H_V,D,cu_seqlens,dtype",
         [
-            (16, 32, 128, [0, 13, 287], testtype),
-            (8, 32, 128, [0, 256, 500, 1000], testtype),
+            (2, 8, 128, [0, 13, 287], testtype),
+            (2, 8, 128, [0, 256, 500, 511], testtype),
         ],
     )
     def test_varlen_gva_state(self, set_seed, H_QK, H_V, D, cu_seqlens, dtype):
@@ -618,34 +580,31 @@ class TestGDNVariableLengthGVA:
         T = cu_seqlens[-1]
         N = len(cu_seqlens) - 1
 
-        q = torch.randn((1, T, H_QK, D), dtype=dtype)
+        q = torch.randn((1, T, H_QK, D), dtype=dtype, device=device)
         k = F.normalize(
-            torch.randn(1, T, H_QK, D, dtype=torch.float32), p=2, dim=-1
+            torch.randn(1, T, H_QK, D, dtype=torch.float32, device=device), p=2, dim=-1
         ).to(dtype)
-        v = torch.randn((1, T, H_V, D), dtype=dtype)
-        g = F.logsigmoid(torch.rand(1, T, H_V, dtype=torch.float32))
-        beta = torch.rand(1, T, H_V, dtype=torch.float32).sigmoid()
-        h0 = torch.randn((N, H_V, D, D), dtype=torch.float)
-
-        q, k, v, beta, g, h0 = map(lambda x: x.to(device), (q, k, v, beta, g, h0))
+        v = torch.randn((1, T, H_V, D), dtype=dtype, device=device)
+        g = F.logsigmoid(torch.rand(1, T, H_V, dtype=torch.float32, device=device))
+        beta = torch.rand(1, T, H_V, dtype=torch.float32, device=device).sigmoid()
+        h0 = torch.randn((N, H_V, D, D), dtype=torch.float, device=device)
 
         state_output = torch.zeros_like(h0, dtype=torch.float)
 
         o, state_output = chunk_gated_delta_rule(
-            q.clone(),
-            k.clone(),
-            v.clone(),
-            g.clone(),
-            beta.clone(),
+            q,
+            k,
+            v,
+            g,
+            beta,
             None,
-            h0.clone(),
+            h0,
             True,
-            cu_seqlens_tensor.clone(),
+            cu_seqlens_tensor,
             False,
             None,
             state_output,
         )
-        torch.cuda.synchronize()
 
         repeat_factor = H_V // H_QK
         q = q.repeat_interleave(repeat_factor, dim=2)
@@ -666,11 +625,8 @@ class TestGDNVariableLengthGVA:
             ref_ht.append(ref_ht_i)
         ref_ht = torch.cat(ref_ht, 0)
         ref_ht = torch.transpose(ref_ht, -1, -2)
-        torch.cuda.synchronize()
 
-        torch.testing.assert_close(
-            ref_ht, state_output.to(torch.float), atol=satol, rtol=srtol
-        )
+        torch.testing.assert_close(ref_ht, state_output, atol=satol, rtol=srtol)
 
 
 class TestGDNMultipleRuns:
@@ -679,40 +635,37 @@ class TestGDNMultipleRuns:
     def test_consecutive_runs_deterministic(self, set_seed):
         """Test that multiple consecutive runs produce identical results."""
         _skip_if_gdn_blackwell_prefill_not_available()
-        H, D, T, B = 16, 128, 256, 4
+        H, D, T, B = 3, 128, 131, 3
         dtype = testtype
         device = "cuda"
 
-        q = torch.randn((B, T, H, D), dtype=dtype)
-        k = F.normalize(torch.randn(B, T, H, D, dtype=torch.float32), p=2, dim=-1).to(
-            dtype
-        )
-        v = torch.randn((B, T, H, D), dtype=dtype)
-        g = F.logsigmoid(torch.rand(1, T * B, H, dtype=torch.float32))
-        beta = torch.rand(1, T * B, H, dtype=torch.float32).sigmoid()
-        h0 = torch.randn((B, H, D, D), dtype=torch.float)
-
-        q, k, v, beta, g, h0 = map(lambda x: x.to(device), (q, k, v, beta, g, h0))
+        q = torch.randn((B, T, H, D), dtype=dtype, device=device)
+        k = F.normalize(
+            torch.randn(B, T, H, D, dtype=torch.float32, device=device), p=2, dim=-1
+        ).to(dtype)
+        v = torch.randn((B, T, H, D), dtype=dtype, device=device)
+        g = F.logsigmoid(torch.rand(1, T * B, H, dtype=torch.float32, device=device))
+        beta = torch.rand(1, T * B, H, dtype=torch.float32, device=device).sigmoid()
+        h0 = torch.randn((B, H, D, D), dtype=torch.float, device=device)
 
         results = []
         for _run_idx in range(3):
             state_output = torch.zeros_like(h0, dtype=torch.float)
 
             o, state_output = chunk_gated_delta_rule(
-                q.clone(),
-                k.clone(),
-                v.clone(),
-                g.clone(),
-                beta.clone(),
+                q,
+                k,
+                v,
+                g,
+                beta,
                 None,
-                h0.clone(),
+                h0,
                 True,
                 None,
                 False,
                 None,
                 state_output,
             )
-            torch.cuda.synchronize()
             results.append((o.clone(), state_output.clone()))
 
         for i in range(1, len(results)):

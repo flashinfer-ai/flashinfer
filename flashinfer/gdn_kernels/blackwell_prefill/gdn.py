@@ -46,13 +46,23 @@ from cutlass._mlir.dialects import nvvm
 import cuda.bindings.driver as cuda
 
 
-from .gdn_tile_scheduler import *
-from .gdn_helpers import *
+from .gdn_tile_scheduler import (
+    GdnStaticTileScheduler,
+    GdnStaticTileSchedulerParams,
+    create_gdn_static_tile_scheduler,
+    create_gdn_static_tile_scheduler_params,
+)
+from .gdn_helpers import (
+    make_smem_layout_a_kind,
+    make_smem_layout_b_kind,
+    make_smem_layout_epi_kind,
+)
 
 import functools
 import warnings
 
 from cutlass.cute import EnableTVMFFI
+from cutlass import Int32, Int64
 
 
 def make_thread_cooperative_group(size: Int32):
@@ -4405,7 +4415,7 @@ class GDN:
 
         self.shared_storage = SharedStorage
 
-        if stream is None:
+        if cutlass.const_expr(stream is None):
             stream = cutlass.cuda.default_stream()
 
         # Launch kernel
@@ -4585,9 +4595,8 @@ def chunk_gated_delta_rule(
     cu_seqlens_tuple = tuple(cu_seqlens.tolist()) if cu_seqlens is not None else None
     problem_size = _get_problem_size(tuple(q.shape), tuple(v.shape), cu_seqlens_tuple)
 
-    # Allocate output_state if needed, current alloc both case.
-    # TODO: Remove output_state when output_final_state is false.
-    if output_state is None:
+    # Allocate output_state if needed
+    if output_final_state and (output_state is None):
         output_state = torch.empty(
             (problem_size[0], problem_size[4], problem_size[5], problem_size[5]),
             dtype=torch.float32,
@@ -4597,13 +4606,12 @@ def chunk_gated_delta_rule(
     # Compile kernel with TVM FFI (cached)
     is_varlen = cu_seqlens is not None
     is_initial_state = initial_state is not None
-    is_output_state = output_state is not None
     cache_key = (
         problem_size,
         q.dtype,
         is_varlen,
         is_initial_state,
-        is_output_state,
+        output_final_state,
         scale,
     )
     cache = _get_compiled_gdn_prefill_kernel(*cache_key)
@@ -4631,7 +4639,7 @@ def chunk_gated_delta_rule(
         )
         state_output_tensor = (
             from_dlpack(output_state, assumed_align=16, enable_tvm_ffi=True)
-            if output_state is not None
+            if output_final_state
             else None
         )
 
@@ -4647,7 +4655,7 @@ def chunk_gated_delta_rule(
             beta_tensor.iterator,
             problem_size,
             state_tensor.iterator if state_tensor is not None else None,
-            state_output_tensor.iterator if state_output_tensor is not None else None,
+            state_output_tensor.iterator if output_final_state else None,
             scale,
             cu_seqlens_tensor,
             stream=current_stream,
@@ -4666,7 +4674,7 @@ def chunk_gated_delta_rule(
         beta.data_ptr(),
         problem_size,
         initial_state.data_ptr() if initial_state is not None else None,
-        output_state.data_ptr() if output_state is not None else None,
+        output_state.data_ptr() if output_final_state else None,
         scale,
         cu_seqlens,
         stream=current_stream,
