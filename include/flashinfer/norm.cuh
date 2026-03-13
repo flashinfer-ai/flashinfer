@@ -110,6 +110,101 @@ __global__ void RMSNormKernel(T* __restrict__ input, T* __restrict__ weight, T* 
 #endif
 }
 
+// RMSNormSmemKernel: variant that caches the input row in shared memory (as type T) to avoid the
+// second global-memory read in Phase 2. Preferred for small hidden sizes where the input fits in
+// smem. Uses vectorized 128-bit loads/stores for both global→smem and smem→register transfers.
+//
+// Shared memory layout:
+//   [0, ceil_div(num_warps, 4)*4 * sizeof(float)): warp reduction buffer (float, 16-byte aligned)
+//   [ceil_div(num_warps, 4)*4 * sizeof(float), ...): input cache (T, d elements)
+template <uint32_t VEC_SIZE, typename T>
+__global__ void RMSNormSmemKernel(T* __restrict__ input, T* __restrict__ weight,
+                                  T* __restrict__ output, const uint32_t d,
+                                  const uint32_t stride_input, const uint32_t stride_output,
+                                  float weight_bias, float eps) {
+  const uint32_t bx = blockIdx.x;
+  const uint32_t tx = threadIdx.x, ty = threadIdx.y;
+  constexpr uint32_t warp_size = 32;
+  const uint32_t num_warps = blockDim.y;
+  // NOTE(Zihao): it's guaranteed that num_warps should be smaller than 32
+  const uint32_t thread_id = tx + ty * warp_size;
+  const uint32_t num_threads = num_warps * warp_size;
+  const uint32_t rounds = ceil_div(d, VEC_SIZE * num_threads);
+
+  // Shared memory: reduction buffer first (float), then input cache (T).
+  // ceil_div(num_warps, 4) * 4 ensures 16-byte alignment for the T* cache region.
+  extern __shared__ float smem[];
+  T* smem_x = reinterpret_cast<T*>(smem + ceil_div(num_warps, 4) * 4);
+
+  float sum_sq = 0.f;
+
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.wait;");
+#endif
+
+  // Phase 1: Load input from global memory → smem (vectorized), accumulate sum of squares.
+  for (uint32_t i = 0; i < rounds; i++) {
+    vec_t<T, VEC_SIZE> input_vec;
+    input_vec.fill(0.f);
+    if ((i * num_threads + thread_id) * VEC_SIZE < d) {
+      input_vec.load(input + bx * stride_input + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
+      // Vectorized store to shared memory cache (128-bit store for VEC_SIZE=8, T=half/bf16)
+      input_vec.store(smem_x + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
+    }
+#pragma unroll
+    for (uint32_t j = 0; j < VEC_SIZE; j++) {
+      sum_sq += float(input_vec[j]) * float(input_vec[j]);
+    }
+  }
+
+  // first, warp reduce sum
+#pragma unroll
+  for (uint32_t offset = warp_size / 2; offset > 0; offset /= 2) {
+    sum_sq += math::shfl_xor_sync(sum_sq, offset);
+  }
+
+  smem[ty] = sum_sq;
+  __syncthreads();
+  // then, cross warp reduce sum using only the first warp
+  if (ty == 0) {
+    sum_sq = (tx < num_warps) ? smem[tx] : 0.f;
+#pragma unroll
+    for (uint32_t offset = warp_size / 2; offset > 0; offset /= 2) {
+      sum_sq += math::shfl_xor_sync(sum_sq, offset);
+    }
+    smem[0] = sum_sq;
+  }
+  __syncthreads();
+
+  float rms_rcp = math::rsqrt(smem[0] / float(d) + eps);
+
+  // Phase 2: Load input from smem (not global) and weight from global, write output.
+  // The __syncthreads() above ensures smem_x is fully written before any thread reads it.
+  for (uint32_t i = 0; i < rounds; i++) {
+    vec_t<T, VEC_SIZE> input_vec;
+    vec_t<T, VEC_SIZE> weight_vec;
+    vec_t<T, VEC_SIZE> output_vec;
+    input_vec.fill(0.f);
+    weight_vec.fill(0.f);
+    if ((i * num_threads + thread_id) * VEC_SIZE < d) {
+      // Vectorized load from shared memory — avoids the second global memory read
+      input_vec.load(smem_x + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
+      weight_vec.load(weight + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
+    }
+#pragma unroll
+    for (uint32_t j = 0; j < VEC_SIZE; j++) {
+      output_vec[j] = float(input_vec[j]) * rms_rcp * (weight_bias + float(weight_vec[j]));
+    }
+    if ((i * num_threads + thread_id) * VEC_SIZE < d) {
+      output_vec.store(output + bx * stride_output + i * num_threads * VEC_SIZE +
+                       thread_id * VEC_SIZE);
+    }
+  }
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
+}
+
 template <typename T>
 cudaError_t RMSNorm(T* input, T* weight, T* output, uint32_t batch_size, uint32_t d,
                     uint32_t stride_input, uint32_t stride_output, float eps = 1e-5,
@@ -120,14 +215,15 @@ cudaError_t RMSNorm(T* input, T* weight, T* output, uint32_t batch_size, uint32_
   const uint32_t num_warps = ceil_div(block_size, 32);
   dim3 nblks(batch_size);
   dim3 nthrs(32, num_warps);
-  const uint32_t smem_size = num_warps * sizeof(float);
+  // Smem for reduction-only (original): just num_warps floats
+  const uint32_t smem_size_reduce = num_warps * sizeof(float);
+  // Smem for input-cached variant: 16-byte-aligned reduction buffer + d elements of T
+  const uint32_t smem_size_smem = ceil_div(num_warps, 4) * 4 * sizeof(float) + d * sizeof(T);
   float weight_bias = 0.f;
-  void* args[] = {&input, &weight, &output, &d, &stride_input, &stride_output, &weight_bias, &eps};
 
   cudaLaunchConfig_t config;
   config.gridDim = nblks;
   config.blockDim = nthrs;
-  config.dynamicSmemBytes = smem_size;
   config.stream = stream;
   cudaLaunchAttribute attrs[1];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
@@ -136,11 +232,24 @@ cudaError_t RMSNorm(T* input, T* weight, T* output, uint32_t batch_size, uint32_
   config.attrs = attrs;
 
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-    auto kernel = RMSNormKernel<VEC_SIZE, T>;
-    FLASHINFER_CUDA_CALL(
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, input, weight, output, d, stride_input,
-                                            stride_output, weight_bias, eps));
+    // Prefer the smem-caching variant (avoids second global read; better for small hidden sizes).
+    // Fall back to the original two-pass global-memory kernel when d is too large for smem.
+    auto smem_kernel = RMSNormSmemKernel<VEC_SIZE, T>;
+    cudaError_t smem_ret = cudaFuncSetAttribute(
+        smem_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_smem);
+    if (smem_ret == cudaSuccess) {
+      config.dynamicSmemBytes = smem_size_smem;
+      FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, smem_kernel, input, weight, output, d,
+                                              stride_input, stride_output, weight_bias, eps));
+    } else {
+      // Hidden size too large to fit in smem — fall back to original two-pass kernel
+      auto kernel = RMSNormKernel<VEC_SIZE, T>;
+      config.dynamicSmemBytes = smem_size_reduce;
+      FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                smem_size_reduce));
+      FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, input, weight, output, d,
+                                              stride_input, stride_output, weight_bias, eps));
+    }
   });
   return cudaSuccess;
 }
@@ -226,6 +335,102 @@ __global__ void RMSNormQuantKernel(T* __restrict__ input, T* __restrict__ weight
 #endif
 }
 
+// RMSNormQuantSmemKernel: smem-caching variant of RMSNormQuantKernel.
+// Caches input row in shared memory as T to avoid the second global-memory read.
+// Uses vectorized 128-bit loads/stores for global→smem and smem→register transfers.
+//
+// Shared memory layout:
+//   [0, ceil_div(num_warps, 4)*4 * sizeof(float)): warp reduction buffer (float, 16-byte aligned)
+//   [ceil_div(num_warps, 4)*4 * sizeof(float), ...): input cache (T, d elements)
+template <uint32_t VEC_SIZE, typename T, typename O>
+__global__ void RMSNormQuantSmemKernel(T* __restrict__ input, T* __restrict__ weight,
+                                       O* __restrict__ output, const uint32_t d,
+                                       const uint32_t stride_input, const uint32_t stride_output,
+                                       float weight_bias, float* scale, float eps) {
+  const uint32_t bx = blockIdx.x;
+  const uint32_t tx = threadIdx.x, ty = threadIdx.y;
+  constexpr uint32_t warp_size = 32;
+  const uint32_t num_warps = blockDim.y;
+  // NOTE(Zihao): it's guaranteed that num_warps should be smaller than 32
+  const uint32_t thread_id = tx + ty * warp_size;
+  const uint32_t num_threads = num_warps * warp_size;
+  const uint32_t rounds = ceil_div(d, VEC_SIZE * num_threads);
+  const float scale_inv = 1.0f / scale[0];
+
+  extern __shared__ float smem[];
+  T* smem_x = reinterpret_cast<T*>(smem + ceil_div(num_warps, 4) * 4);
+
+  float sum_sq = 0.f;
+
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.wait;");
+#endif
+
+  // Phase 1: Load input from global memory → smem (vectorized), accumulate sum of squares.
+  for (uint32_t i = 0; i < rounds; i++) {
+    vec_t<T, VEC_SIZE> input_vec;
+    input_vec.fill(0.f);
+    if ((i * num_threads + thread_id) * VEC_SIZE < d) {
+      input_vec.load(input + bx * stride_input + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
+      // Vectorized store to shared memory cache (128-bit store for VEC_SIZE=8, T=half/bf16)
+      input_vec.store(smem_x + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
+    }
+#pragma unroll
+    for (uint32_t j = 0; j < VEC_SIZE; j++) {
+      sum_sq += float(input_vec[j]) * float(input_vec[j]);
+    }
+  }
+
+  // first, warp reduce sum
+#pragma unroll
+  for (uint32_t offset = warp_size / 2; offset > 0; offset /= 2) {
+    sum_sq += math::shfl_xor_sync(sum_sq, offset);
+  }
+
+  smem[ty] = sum_sq;
+  __syncthreads();
+  // then, cross warp reduce sum using only the first warp
+  if (ty == 0) {
+    sum_sq = (tx < num_warps) ? smem[tx] : 0.f;
+#pragma unroll
+    for (uint32_t offset = warp_size / 2; offset > 0; offset /= 2) {
+      sum_sq += math::shfl_xor_sync(sum_sq, offset);
+    }
+    smem[0] = sum_sq;
+  }
+  __syncthreads();
+
+  float rms_rcp = math::rsqrt(smem[0] / float(d) + eps);
+
+  // Phase 2: Load input from smem (not global) and weight from global, write quantized output.
+  // The __syncthreads() above ensures smem_x is fully written before any thread reads it.
+  for (uint32_t i = 0; i < rounds; i++) {
+    vec_t<T, VEC_SIZE> input_vec;
+    vec_t<T, VEC_SIZE> weight_vec;
+    vec_t<float, VEC_SIZE> output_vec;
+    input_vec.fill(0.f);
+    weight_vec.fill(0.f);
+    if ((i * num_threads + thread_id) * VEC_SIZE < d) {
+      // Vectorized load from shared memory — avoids the second global memory read
+      input_vec.load(smem_x + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
+      weight_vec.load(weight + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
+    }
+#pragma unroll
+    for (uint32_t j = 0; j < VEC_SIZE; j++) {
+      output_vec[j] =
+          float(input_vec[j]) * rms_rcp * (weight_bias + float(weight_vec[j])) * scale_inv;
+      output_vec[j] = fmaxf(-448.0f, fminf(output_vec[j], 448.0f));
+    }
+    if ((i * num_threads + thread_id) * VEC_SIZE < d) {
+      output_vec.cast_store(output + bx * stride_output + i * num_threads * VEC_SIZE +
+                            thread_id * VEC_SIZE);
+    }
+  }
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
+}
+
 template <typename T, typename O>
 cudaError_t RMSNormQuant(T* input, T* weight, O* output, uint32_t batch_size, uint32_t d,
                          uint32_t stride_input, uint32_t stride_output, float* scale,
@@ -236,13 +441,13 @@ cudaError_t RMSNormQuant(T* input, T* weight, O* output, uint32_t batch_size, ui
   const uint32_t num_warps = ceil_div(block_size, 32);
   dim3 nblks(batch_size);
   dim3 nthrs(32, num_warps);
-  const uint32_t smem_size = num_warps * sizeof(float);
+  const uint32_t smem_size_reduce = num_warps * sizeof(float);
+  const uint32_t smem_size_smem = ceil_div(num_warps, 4) * 4 * sizeof(float) + d * sizeof(T);
   float weight_bias = 0.f;
 
   cudaLaunchConfig_t config;
   config.gridDim = nblks;
   config.blockDim = nthrs;
-  config.dynamicSmemBytes = smem_size;
   config.stream = stream;
   cudaLaunchAttribute attrs[1];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
@@ -251,11 +456,25 @@ cudaError_t RMSNormQuant(T* input, T* weight, O* output, uint32_t batch_size, ui
   config.attrs = attrs;
 
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-    auto kernel = RMSNormQuantKernel<VEC_SIZE, T, O>;
-    FLASHINFER_CUDA_CALL(
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, input, weight, output, d, stride_input,
-                                            stride_output, weight_bias, scale, eps));
+    // Prefer the smem-caching variant; fall back when d is too large for smem.
+    auto smem_kernel = RMSNormQuantSmemKernel<VEC_SIZE, T, O>;
+    cudaError_t smem_ret = cudaFuncSetAttribute(
+        smem_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_smem);
+    if (smem_ret == cudaSuccess) {
+      config.dynamicSmemBytes = smem_size_smem;
+      FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, smem_kernel, input, weight, output, d,
+                                              stride_input, stride_output, weight_bias, scale,
+                                              eps));
+    } else {
+      // Hidden size too large to fit in smem — fall back to original two-pass kernel
+      auto kernel = RMSNormQuantKernel<VEC_SIZE, T, O>;
+      config.dynamicSmemBytes = smem_size_reduce;
+      FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                smem_size_reduce));
+      FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, input, weight, output, d,
+                                              stride_input, stride_output, weight_bias, scale,
+                                              eps));
+    }
   });
   return cudaSuccess;
 }
@@ -657,14 +876,13 @@ cudaError_t GemmaRMSNorm(T* input, T* weight, T* output, uint32_t batch_size, ui
   const uint32_t num_warps = ceil_div(block_size, 32);
   dim3 nblks(batch_size);
   dim3 nthrs(32, num_warps);
-  const uint32_t smem_size = num_warps * sizeof(float);
+  const uint32_t smem_size_reduce = num_warps * sizeof(float);
+  const uint32_t smem_size_smem = ceil_div(num_warps, 4) * 4 * sizeof(float) + d * sizeof(T);
   float weight_bias = 1.f;
-  void* args[] = {&input, &weight, &output, &d, &stride_input, &stride_output, &weight_bias, &eps};
 
   cudaLaunchConfig_t config;
   config.gridDim = nblks;
   config.blockDim = nthrs;
-  config.dynamicSmemBytes = smem_size;
   config.stream = stream;
   cudaLaunchAttribute attrs[1];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
@@ -673,11 +891,23 @@ cudaError_t GemmaRMSNorm(T* input, T* weight, T* output, uint32_t batch_size, ui
   config.attrs = attrs;
 
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-    auto kernel = RMSNormKernel<VEC_SIZE, T>;
-    FLASHINFER_CUDA_CALL(
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, input, weight, output, d, stride_input,
-                                            stride_output, weight_bias, eps));
+    // Prefer the smem-caching variant; fall back when d is too large for smem.
+    auto smem_kernel = RMSNormSmemKernel<VEC_SIZE, T>;
+    cudaError_t smem_ret = cudaFuncSetAttribute(
+        smem_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_smem);
+    if (smem_ret == cudaSuccess) {
+      config.dynamicSmemBytes = smem_size_smem;
+      FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, smem_kernel, input, weight, output, d,
+                                              stride_input, stride_output, weight_bias, eps));
+    } else {
+      // Hidden size too large to fit in smem — fall back to original two-pass kernel
+      auto kernel = RMSNormKernel<VEC_SIZE, T>;
+      config.dynamicSmemBytes = smem_size_reduce;
+      FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                smem_size_reduce));
+      FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, input, weight, output, d,
+                                              stride_input, stride_output, weight_bias, eps));
+    }
   });
   return cudaSuccess;
 }
