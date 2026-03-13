@@ -447,6 +447,7 @@ class BatchMLAPagedAttentionWrapper:
         kv_len: Optional[torch.Tensor] = None,
         page_table: Optional[torch.Tensor] = None,
         return_lse_base_on_e: bool = False,
+        o_scale: Optional[float] = None,
     ) -> torch.Tensor: ...
 
     @overload
@@ -463,6 +464,7 @@ class BatchMLAPagedAttentionWrapper:
         kv_len: Optional[torch.Tensor] = None,
         page_table: Optional[torch.Tensor] = None,
         return_lse_base_on_e: bool = False,
+        o_scale: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     @flashinfer_api
@@ -479,6 +481,7 @@ class BatchMLAPagedAttentionWrapper:
         kv_len: Optional[torch.Tensor] = None,
         page_table: Optional[torch.Tensor] = None,
         return_lse_base_on_e: bool = False,
+        o_scale: Optional[float] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Run the MLA attention computation.
 
@@ -496,6 +499,7 @@ class BatchMLAPagedAttentionWrapper:
             ``head_dim_kpe`` is 64 in DeepSeek v2/v3 models.
         out : Optional[torch.Tensor]
             The output tensor, if not provided, will be allocated internally.
+            When ``o_scale`` is provided, this should be an FP8 tensor.
         lse : Optional[torch.Tensor]
             The log-sum-exp of attention logits, if not provided, will be allocated internally.
         return_lse : bool, optional
@@ -506,6 +510,10 @@ class BatchMLAPagedAttentionWrapper:
             The query length of each request, shape: ``[batch_size]``. Required when ``backend`` is ``cutlass``.
         page_table : Optional[torch.Tensor]
             The page table of the paged kv-cache, shape: ``[batch_size, num_pages]``. Required when ``backend`` is ``cutlass``.
+        o_scale : Optional[float]
+            The output scale for FP8 quantization. When provided, ``out`` must be
+            an FP8 tensor and the output will be scaled by ``o_scale`` before
+            casting to FP8. Only supported with the ``cutlass`` backend.
         """
         if self._backend == "cutlass":
             if return_lse:
@@ -517,10 +525,7 @@ class BatchMLAPagedAttentionWrapper:
             self._cached_module = get_mla_module()
             if out is None:
                 out = torch.empty_like(q_nope)
-            else:
-                check_shape_dtype_device(
-                    out, q_nope.shape, q_nope.dtype, q_nope.device, "out"
-                )
+            output_scale = 1.0 if o_scale is None else o_scale
             q_nope_pe = torch.cat([q_nope, q_pe], dim=-1)
             ckv_kpe_cache = torch.cat([ckv_cache, kpe_cache], dim=-1)
             _check_cutlass_shape(q_nope_pe, ckv_kpe_cache, kv_len, page_table)
@@ -533,9 +538,14 @@ class BatchMLAPagedAttentionWrapper:
                 ckv_kpe_cache,
                 kv_len,
                 page_table,
+                output_scale,
             )
             return out
 
+        if o_scale is not None:
+            raise ValueError(
+                "o_scale is only supported with the cutlass backend for now."
+            )
         if profiler_buffer is None:
             if self._use_profiler:
                 raise ValueError(
