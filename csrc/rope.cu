@@ -720,13 +720,14 @@ void rope_append_paged_kv_cache(TensorView q_rope_in, TensorView k_rope_in, Tens
       auto launch = [&](auto cache_dtype_tag) -> bool {
         using c_cache_type = decltype(cache_dtype_tag);
         auto k_strides = k_cache.strides();
-        auto v_strides = v_cache.strides();
         paged_kv_t<c_cache_type, int32_t> paged_kv(
-            page_size, num_kv_heads, head_dim, batch_size,
-            static_cast<c_cache_type*>(k_cache.data_ptr()), k_strides.data(),
-            static_cast<c_cache_type*>(v_cache.data_ptr()), v_strides.data(),
+            num_kv_heads, page_size, head_dim, batch_size, kv_layout,
+            static_cast<c_cache_type*>(k_cache.data_ptr()),
+            static_cast<c_cache_type*>(v_cache.data_ptr()), k_strides.data(),
             static_cast<int32_t*>(kv_indices.data_ptr()),
-            static_cast<int32_t*>(kv_indptr.data_ptr()), kv_layout);
+            static_cast<int32_t*>(kv_indptr.data_ptr()),
+            nullptr  // last_page_len not needed for this kernel
+        );
         cudaError_t status = RopeAppendPagedKVCache(
             static_cast<c_type*>(q_rope_in.data_ptr()), static_cast<c_type*>(k_rope_in.data_ptr()),
             static_cast<c_type*>(q_nope_in.data_ptr()), static_cast<c_type*>(k_nope_in.data_ptr()),
