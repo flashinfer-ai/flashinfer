@@ -37,11 +37,11 @@ struct IsPersistent {
   static const bool value = v;
 };
 
-template <typename T, typename PersistenceOption = IsPersistent<true>>
+template <typename T, typename TOut = T, typename PersistenceOption = IsPersistent<true>>
 struct MlaSm100 {
   using Element = T;
   using ElementAcc = float;
-  using ElementOut = T;
+  using ElementOut = TOut;
 
   using TileShape = Shape<_128, _128, Shape<_512, _64>>;
   using TileShapeH = cute::tuple_element_t<0, TileShape>;
@@ -69,7 +69,8 @@ typename T::Fmha::Arguments args_from_options(void* out_ptr, void* lse_ptr, void
                                               void* ckv_kpe_cache_ptr, void* seq_lens_ptr,
                                               void* page_table_ptr, int batches,
                                               int page_count_per_seq, int page_count_total,
-                                              int page_size, int device_index) {
+                                              int page_size, int device_index,
+                                              float output_scale = 1.0f) {
   cutlass::KernelHardwareInfo hw_info;
   hw_info.device_id = device_index;
   hw_info.sm_count =
@@ -114,7 +115,7 @@ typename T::Fmha::Arguments args_from_options(void* out_ptr, void* lse_ptr, void
        stride_PT, page_count_total, page_size},
       {reinterpret_cast<ElementOut*>(out_ptr), stride_O,
        // static_cast<ElementAcc*>(lse.data_ptr()), stride_LSE},
-       static_cast<ElementAcc*>(nullptr), stride_LSE},
+       static_cast<ElementAcc*>(nullptr), stride_LSE, output_scale},
       hw_info,
       -1,       // split_kv
       nullptr,  // is_var_split_kv=false
@@ -127,16 +128,16 @@ typename T::Fmha::Arguments args_from_options(void* out_ptr, void* lse_ptr, void
   return arguments;
 }
 
-template <typename Element>
+template <typename Element, typename ElementOut = Element>
 cudaError_t runMla(void* workspace_ptr, void* out_ptr, void* lse_ptr, void* q_absorbed_ptr,
                    void* ckv_kpe_cache_ptr, void* seq_lens_ptr, void* page_table_ptr, int batches,
                    int page_count_per_seq, int page_count_total, int page_size, int device_index,
-                   cudaStream_t stream) {
-  using MlaSm100Type = MlaSm100<Element>;
+                   cudaStream_t stream, float output_scale = 1.0f) {
+  using MlaSm100Type = MlaSm100<Element, ElementOut>;
   typename MlaSm100Type::Fmha fmha;
   auto arguments = args_from_options<MlaSm100Type>(
       out_ptr, lse_ptr, q_absorbed_ptr, ckv_kpe_cache_ptr, seq_lens_ptr, page_table_ptr, batches,
-      page_count_per_seq, page_count_total, page_size, device_index);
+      page_count_per_seq, page_count_total, page_size, device_index, output_scale);
 
   CUTLASS_CHECK(fmha.can_implement(arguments));
 
