@@ -436,7 +436,10 @@ def gen_gemm_sm100_module() -> JitSpec:
     return gen_jit_spec(
         "gemm_sm100",
         source_paths,
-        extra_cuda_cflags=nvcc_flags,
+        extra_cuda_cflags=nvcc_flags
+        + [
+            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
+        ],
     )
 
 
