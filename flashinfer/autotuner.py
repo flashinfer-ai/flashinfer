@@ -449,10 +449,10 @@ class AutoTuner:
             # Expect no cache miss in inference. Thus, any cache miss should be recorded.
             if not is_cache_hit:
                 logger.debug(
-                    f"[AutoTunner]: Using fallback tactic for {custom_op} with input shapes {input_shapes}"
+                    f"[AutoTuner]: Using fallback tactic for {custom_op} with input shapes {input_shapes}"
                 )
                 logger.debug(
-                    f"[AutoTunner]: Generated key{AutoTuner._get_cache_key(custom_op, runners[0], input_shapes, tuning_config)}"
+                    f"[AutoTuner]: Generated key{AutoTuner._get_cache_key(custom_op, runners[0], input_shapes, tuning_config)}"
                 )
             return runner, tactic
 
