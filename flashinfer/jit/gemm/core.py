@@ -91,8 +91,6 @@ def gen_gemm_sm100_module_cutlass_fp4() -> JitSpec:
         + [
             "-DENABLE_BF16",
             "-DENABLE_FP4",
-            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
-            "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
         ],
         extra_cflags=[
             "-DFAST_BUILD",
@@ -160,8 +158,6 @@ def gen_gemm_sm103_module_cutlass_fp4() -> JitSpec:
         + [
             "-DENABLE_BF16",
             "-DENABLE_FP4",
-            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
-            "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
         ],
         extra_cflags=[
             "-DFAST_BUILD",
@@ -210,8 +206,6 @@ def gen_gemm_sm120_module_cutlass_fp4() -> JitSpec:
         + [
             "-DENABLE_BF16",
             "-DENABLE_FP4",
-            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
-            "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
         ],
         extra_cflags=[
             "-DFAST_BUILD",
@@ -262,8 +256,6 @@ def gen_gemm_sm100_module_cutlass_fp8() -> JitSpec:
         extra_cuda_cflags=nvcc_flags
         + [
             "-DENABLE_BF16",
-            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
-            "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
         ],
         extra_cflags=[
             "-DFAST_BUILD",
@@ -357,8 +349,6 @@ def gen_gemm_sm100_module_cutlass_mxfp8() -> JitSpec:
         extra_cuda_cflags=nvcc_flags
         + [
             "-DENABLE_BF16",
-            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
-            "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
         ],
         extra_cflags=[
             "-DFAST_BUILD",
@@ -526,19 +516,7 @@ def gen_gemm_sm120_module() -> JitSpec:
     return gen_jit_spec(
         "gemm_sm120",
         source_paths,
-        extra_cuda_cflags=nvcc_flags
-        + [
-            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
-            # NOTE: Do NOT pass -DCUTLASS_ENABLE_GDC_FOR_SM90=1 here.
-            # The SM120 kernel reuses the SM90 cooperative template
-            # (sm90_gemm_tma_warpspecialized_cooperative.hpp) which has an
-            # #ifdef CUTLASS_ENABLE_GDC_FOR_SM90 block that calls
-            # scheduler.is_last_tile(). The SM120 kernel uses
-            # PersistentTileSchedulerSm100 which does NOT have is_last_tile
-            # (it uses CLC-based scheduling). GDC for SM120/SM121 is
-            # correctly handled through CUTLASS_ENABLE_GDC_FOR_SM100 via
-            # grid_dependency_control.h.
-        ],
+        extra_cuda_cflags=nvcc_flags,
     )
 
 
