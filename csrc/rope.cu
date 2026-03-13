@@ -641,8 +641,8 @@ void rope_append_paged_kv_cache(TensorView q_rope_in, TensorView k_rope_in, Tens
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q_nope_out);
   CHECK_INPUT(cos_sin_cache);
   CHECK_INPUT(pos_ids);
-  CHECK_INPUT(k_cache);
-  CHECK_INPUT(v_cache);
+  CHECK_CUDA(k_cache);
+  CHECK_CUDA(v_cache);
   CHECK_INPUT(kv_indices);
   CHECK_INPUT(kv_indptr);
   CHECK_INPUT(batch_indices);
