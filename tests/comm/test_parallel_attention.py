@@ -1,17 +1,22 @@
 """Tests for parallel attention (Ulysses + Ring).
 
 Launch with:
-    torchrun --nproc_per_node=4 -m pytest tests/attention/test_parallel_attention.py -v
+    torchrun --nproc_per_node=4 -m pytest tests/comm/test_parallel_attention.py -v
 """
 
 import math
+import os
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from flashinfer.utils import get_compute_capability, is_sm90a_supported
+from flashinfer.utils import (
+    get_compute_capability,
+    is_sm90a_supported,
+    is_sm100a_supported,
+)
 from flashinfer.parallel_attention import (
     UnevenCPConfig,
     VarlenCPConfig,
@@ -21,6 +26,12 @@ from flashinfer.parallel_attention import (
     uneven_cp_config,
     ulysses_varlen_config,
     ring_varlen_config,
+)
+
+# Skip all tests when not launched via torchrun / torch.distributed.launch
+pytestmark = pytest.mark.skipif(
+    "RANK" not in os.environ,
+    reason="Must be launched with torchrun (RANK env var not set)",
 )
 
 
@@ -58,6 +69,10 @@ def skip_if_unsupported(request):
     if attn_type == "flash-attn3" and not is_sm90a_supported(torch.device("cuda")):
         cc = get_compute_capability(torch.device("cuda"))
         pytest.skip(f"flash-attn3 requires SM90a+, got {cc}")
+
+    if attn_type == "cutlass" and not is_sm100a_supported(torch.device("cuda")):
+        cc = get_compute_capability(torch.device("cuda"))
+        pytest.skip(f"cutlass requires SM100a+, got {cc}")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -120,8 +135,8 @@ def _assert_cos_similarity(output, ref_output, threshold=0.99):
 @pytest.mark.parametrize("num_heads", [24])
 @pytest.mark.parametrize("seq_len", [6 * 8 * 1024])
 @pytest.mark.parametrize("head_dim", [128])
-@pytest.mark.parametrize("ulysses_size,ring_size", [(2, 2), (1, 4), (4, 1)])
-@pytest.mark.parametrize("attn_type", ["flash-attn3"])
+@pytest.mark.parametrize("ulysses_size,ring_size", [(4, 1), (1, 4), (2, 2)])
+@pytest.mark.parametrize("attn_type", ["flash-attn3", "cutlass"])
 @pytest.mark.parametrize("tensor_layout", ["HND", "NHD"])
 def test_attn_parallel(
     num_heads,
@@ -168,7 +183,7 @@ def test_attn_parallel(
 @pytest.mark.parametrize("seq_len_padded", [6 * 8 * 1024])
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("ulysses_size,ring_size", [(2, 2)])
-@pytest.mark.parametrize("attn_type", ["flash-attn3"])
+@pytest.mark.parametrize("attn_type", ["flash-attn3", "cutlass"])
 @pytest.mark.parametrize("tensor_layout", ["HND", "NHD"])
 def test_uneven_attn_parallel(
     num_heads,
@@ -244,7 +259,7 @@ def test_uneven_attn_parallel(
 @pytest.mark.parametrize("num_heads", [24])
 @pytest.mark.parametrize("seq_len_list", [[1 * 8 * 1024 - 1, 3 * 8 * 1024]])
 @pytest.mark.parametrize("head_dim", [128])
-@pytest.mark.parametrize("attn_type", ["flash-attn3"])
+@pytest.mark.parametrize("attn_type", ["flash-attn3", "cutlass"])
 @pytest.mark.parametrize("tensor_layout", ["HND", "NHD"])
 def test_ulysses_varlen_attn_parallel(
     num_heads, seq_len_list, head_dim, attn_type, tensor_layout, world_size, rank
@@ -319,7 +334,7 @@ def test_ulysses_varlen_attn_parallel(
     [torch.tensor([1021, 1024, 1027, 750, 826], dtype=torch.int32)],
 )
 @pytest.mark.parametrize("head_dim", [128])
-@pytest.mark.parametrize("attn_type", ["flash-attn3"])
+@pytest.mark.parametrize("attn_type", ["flash-attn3", "cutlass"])
 @pytest.mark.parametrize("tensor_layout", ["HND", "NHD"])
 def test_ring_varlen_attn_parallel(
     num_heads, seq_len_list, head_dim, attn_type, tensor_layout, world_size, rank

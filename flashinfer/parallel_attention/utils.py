@@ -276,8 +276,8 @@ def ring_varlen_config(seq_lens_q, seq_lens_kv, ring_group):
     return (
         torch.stack(cu_seqlens_q_all_ranks),
         torch.stack(cu_seqlens_kv_all_ranks),
-        max_seq_len_q,
-        max_seq_len_kv,
+        max_seq_len_q.item(),
+        max_seq_len_kv.item(),
     )
 
 
