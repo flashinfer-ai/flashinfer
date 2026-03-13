@@ -395,6 +395,13 @@ class RMSNormKernel:
             cute.arch.barrier()
 
         # ===== Pass 2: Normalize and store output =====
+        # Re-load x from shared memory to relieve register pressure.
+        # Without this, x (up to 128 FP32 values/thread at large H) must
+        # survive across the reduction + barrier, causing spills to local mem.
+        if cutlass.const_expr(self.use_async_copy):
+            cute.autovec_copy(tXsX, tXrX)
+            x = tXrX.load().to(Float32)
+
         w = tXrW.load().to(Float32)
         y = x * rstd * (w + Float32(weight_bias))
 
@@ -649,6 +656,13 @@ class QKRMSNormKernel:
         cute.arch.barrier()
 
         # ===== Pass 2: Normalize and store output =====
+        # Re-load x from shared memory to relieve register pressure.
+        # Without this, x (up to 128 FP32 values/thread at large H) must
+        # survive across the reduction + barrier, causing spills to local mem.
+        if cutlass.const_expr(self.use_async_copy):
+            cute.autovec_copy(tXsX, tXrX)
+            x = tXrX.load().to(Float32)
+
         w = tXrW.load().to(Float32)
         y = x * rstd * (w + Float32(weight_bias))
 
@@ -928,6 +942,13 @@ class RMSNormQuantKernel:
             cute.arch.barrier()
 
         # ===== Pass 2: Normalize, quantize, and store FP8 output =====
+        # Re-load x from shared memory to relieve register pressure.
+        # Without this, x (up to 128 FP32 values/thread at large H) must
+        # survive across the reduction + barrier, causing spills to local mem.
+        if cutlass.const_expr(self.use_async_copy):
+            cute.autovec_copy(tXsX, tXrX)
+            x = tXrX.load().to(Float32)
+
         w = tXrW.load().to(Float32)
         y = x * rstd * (w + Float32(weight_bias)) * inv_scale
 
