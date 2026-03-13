@@ -344,6 +344,7 @@ def _rope_append_paged_kv_cache(
     v_cache: torch.Tensor,
     kv_indices: torch.Tensor,
     kv_indptr: torch.Tensor,
+    kv_last_page_len: torch.Tensor,
     batch_indices: torch.Tensor,
     positions: torch.Tensor,
     kv_layout_code: int,
@@ -366,6 +367,7 @@ def _rope_append_paged_kv_cache(
         v_cache,
         kv_indices,
         kv_indptr,
+        kv_last_page_len,
         batch_indices,
         positions,
         kv_layout_code,
@@ -391,6 +393,7 @@ def _fake_rope_append_paged_kv_cache(
     v_cache: torch.Tensor,
     kv_indices: torch.Tensor,
     kv_indptr: torch.Tensor,
+    kv_last_page_len: torch.Tensor,
     batch_indices: torch.Tensor,
     positions: torch.Tensor,
     kv_layout_code: int,
@@ -1764,6 +1767,7 @@ def rope_append_paged_kv_cache(
     paged_kv_cache: Tuple[torch.Tensor, torch.Tensor],
     kv_indices: torch.Tensor,
     kv_indptr: torch.Tensor,
+    kv_last_page_len: torch.Tensor,
     batch_indices: torch.Tensor,
     positions: torch.Tensor,
     is_neox: bool = True,
@@ -1817,6 +1821,7 @@ def rope_append_paged_kv_cache(
     positions = positions.int()
     kv_indices = kv_indices.int()
     kv_indptr = kv_indptr.int()
+    kv_last_page_len = kv_last_page_len.int()
 
     _rope_append_paged_kv_cache(
         q_rope,
@@ -1832,6 +1837,7 @@ def rope_append_paged_kv_cache(
         v_cache,
         kv_indices,
         kv_indptr,
+        kv_last_page_len,
         batch_indices,
         positions,
         kv_layout_code,

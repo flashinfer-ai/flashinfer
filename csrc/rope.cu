@@ -629,9 +629,10 @@ void rope_append_paged_kv_cache(TensorView q_rope_in, TensorView k_rope_in, Tens
                                 TensorView k_nope_in, TensorView v_in, TensorView q_rope_out,
                                 TensorView q_nope_out, TensorView cos_sin_cache, TensorView pos_ids,
                                 TensorView k_cache, TensorView v_cache, TensorView kv_indices,
-                                TensorView kv_indptr, TensorView batch_indices,
-                                TensorView positions, int64_t kv_layout_code, int64_t page_size,
-                                double kv_scale, bool interleave, bool enable_pdl) {
+                                TensorView kv_indptr, TensorView kv_last_page_len,
+                                TensorView batch_indices, TensorView positions,
+                                int64_t kv_layout_code, int64_t page_size, double kv_scale,
+                                bool interleave, bool enable_pdl) {
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q_rope_in);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_rope_in);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q_nope_in);
@@ -645,6 +646,7 @@ void rope_append_paged_kv_cache(TensorView q_rope_in, TensorView k_rope_in, Tens
   CHECK_CUDA(v_cache);
   CHECK_INPUT(kv_indices);
   CHECK_INPUT(kv_indptr);
+  CHECK_INPUT(kv_last_page_len);
   CHECK_INPUT(batch_indices);
   CHECK_INPUT(positions);
 
@@ -657,6 +659,7 @@ void rope_append_paged_kv_cache(TensorView q_rope_in, TensorView k_rope_in, Tens
   CHECK_DIM(3, q_nope_out);
   CHECK_DIM(4, k_cache);
   CHECK_DIM(4, v_cache);
+  CHECK_DIM(1, kv_last_page_len);
 
   uint32_t rope_dim = q_rope_in.size(-1);
   uint32_t no_rope_dim = q_nope_in.size(-1);
@@ -683,6 +686,7 @@ void rope_append_paged_kv_cache(TensorView q_rope_in, TensorView k_rope_in, Tens
   TVM_FFI_ICHECK_EQ(k_cache.size(1), v_cache.size(1));
   TVM_FFI_ICHECK_EQ(k_cache.size(2), v_cache.size(2));
   TVM_FFI_ICHECK_EQ(k_cache.size(3), v_cache.size(3));
+  TVM_FFI_ICHECK_EQ(kv_last_page_len.size(0), batch_size);
 
   TVM_FFI_ICHECK(q_rope_in.dtype() == dl_float16 || q_rope_in.dtype() == dl_bfloat16)
       << "Input dtype must be float16 or bfloat16";
@@ -726,8 +730,7 @@ void rope_append_paged_kv_cache(TensorView q_rope_in, TensorView k_rope_in, Tens
             static_cast<c_cache_type*>(v_cache.data_ptr()), k_strides.data(),
             static_cast<int32_t*>(kv_indices.data_ptr()),
             static_cast<int32_t*>(kv_indptr.data_ptr()),
-            nullptr  // last_page_len not needed for this kernel
-        );
+            static_cast<int32_t*>(kv_last_page_len.data_ptr()));
         cudaError_t status = RopeAppendPagedKVCache(
             static_cast<c_type*>(q_rope_in.data_ptr()), static_cast<c_type*>(k_rope_in.data_ptr()),
             static_cast<c_type*>(q_nope_in.data_ptr()), static_cast<c_type*>(k_nope_in.data_ptr()),
