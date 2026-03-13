@@ -395,10 +395,6 @@ class RMSNormKernel:
             cute.arch.barrier()
 
         # ===== Pass 2: Normalize and store output =====
-        if cutlass.const_expr(self.use_async_copy):
-            cute.autovec_copy(tXsX, tXrX)
-            x = tXrX.load().to(Float32)
-
         w = tXrW.load().to(Float32)
         y = x * rstd * (w + Float32(weight_bias))
 
@@ -653,10 +649,6 @@ class QKRMSNormKernel:
         cute.arch.barrier()
 
         # ===== Pass 2: Normalize and store output =====
-        if cutlass.const_expr(self.use_async_copy):
-            cute.autovec_copy(tXsX, tXrX)
-            x = tXrX.load().to(Float32)
-
         w = tXrW.load().to(Float32)
         y = x * rstd * (w + Float32(weight_bias))
 
@@ -936,10 +928,6 @@ class RMSNormQuantKernel:
             cute.arch.barrier()
 
         # ===== Pass 2: Normalize, quantize, and store FP8 output =====
-        if cutlass.const_expr(self.use_async_copy):
-            cute.autovec_copy(tXsX, tXrX)
-            x = tXrX.load().to(Float32)
-
         w = tXrW.load().to(Float32)
         y = x * rstd * (w + Float32(weight_bias)) * inv_scale
 
@@ -966,7 +954,12 @@ class RMSNormQuantKernel:
                         tYrY_f32[base + 5],
                         tYrY_f32[base + 6],
                         tYrY_f32[base + 7],
-                        get_ptr_as_int64(mY, Int32(actual_row * H + abs_col)),
+                        get_ptr_as_int64(
+                            mY,
+                            cute.crd2idx(
+                                (Int32(actual_row), Int32(abs_col)), mY.layout
+                            ),
+                        ),
                     )
                 else:
                     for e in cutlass.range_constexpr(vec_size):
@@ -977,7 +970,13 @@ class RMSNormQuantKernel:
                             clamped = min(clamped, Float32(FLOAT8_E4M3_MAX))
                             cvt_and_store_f32_to_e4m3_hw(
                                 clamped,
-                                get_ptr_as_int64(mY, Int32(actual_row * H + abs_col_e)),
+                                get_ptr_as_int64(
+                                    mY,
+                                    cute.crd2idx(
+                                        (Int32(actual_row), Int32(abs_col_e)),
+                                        mY.layout,
+                                    ),
+                                ),
                             )
         elif cutlass.const_expr(self.use_hw_fp8 and vec_size == 4):
             for v in cutlass.range_constexpr(num_vec_blocks):
@@ -990,7 +989,12 @@ class RMSNormQuantKernel:
                         tYrY_f32[base + 1],
                         tYrY_f32[base + 2],
                         tYrY_f32[base + 3],
-                        get_ptr_as_int64(mY, Int32(actual_row * H + abs_col)),
+                        get_ptr_as_int64(
+                            mY,
+                            cute.crd2idx(
+                                (Int32(actual_row), Int32(abs_col)), mY.layout
+                            ),
+                        ),
                     )
                 else:
                     for e in cutlass.range_constexpr(vec_size):
@@ -1001,7 +1005,13 @@ class RMSNormQuantKernel:
                             clamped = min(clamped, Float32(FLOAT8_E4M3_MAX))
                             cvt_and_store_f32_to_e4m3_hw(
                                 clamped,
-                                get_ptr_as_int64(mY, Int32(actual_row * H + abs_col_e)),
+                                get_ptr_as_int64(
+                                    mY,
+                                    cute.crd2idx(
+                                        (Int32(actual_row), Int32(abs_col_e)),
+                                        mY.layout,
+                                    ),
+                                ),
                             )
         elif cutlass.const_expr(self.use_hw_fp8 and vec_size == 2):
             for v in cutlass.range_constexpr(num_vec_blocks):
@@ -1012,7 +1022,12 @@ class RMSNormQuantKernel:
                     cvt_and_store_2xf32_to_e4m3_hw(
                         tYrY_f32[base],
                         tYrY_f32[base + 1],
-                        get_ptr_as_int64(mY, Int32(actual_row * H + abs_col)),
+                        get_ptr_as_int64(
+                            mY,
+                            cute.crd2idx(
+                                (Int32(actual_row), Int32(abs_col)), mY.layout
+                            ),
+                        ),
                     )
                 else:
                     for e in cutlass.range_constexpr(vec_size):
@@ -1023,7 +1038,13 @@ class RMSNormQuantKernel:
                             clamped = min(clamped, Float32(FLOAT8_E4M3_MAX))
                             cvt_and_store_f32_to_e4m3_hw(
                                 clamped,
-                                get_ptr_as_int64(mY, Int32(actual_row * H + abs_col_e)),
+                                get_ptr_as_int64(
+                                    mY,
+                                    cute.crd2idx(
+                                        (Int32(actual_row), Int32(abs_col_e)),
+                                        mY.layout,
+                                    ),
+                                ),
                             )
         else:
             for v in cutlass.range_constexpr(num_vec_blocks):
@@ -1034,7 +1055,12 @@ class RMSNormQuantKernel:
                         flat_idx = v * vec_size + e
                         clamped = max(tYrY_f32[flat_idx], Float32(-FLOAT8_E4M3_MAX))
                         clamped = min(clamped, Float32(FLOAT8_E4M3_MAX))
-                        out_ptr = get_ptr_as_int64(mY, Int32(actual_row * H + abs_col))
+                        out_ptr = get_ptr_as_int64(
+                            mY,
+                            cute.crd2idx(
+                                (Int32(actual_row), Int32(abs_col)), mY.layout
+                            ),
+                        )
                         if self.use_hw_fp8:
                             cvt_and_store_f32_to_e4m3_hw(clamped, out_ptr)
                         else:

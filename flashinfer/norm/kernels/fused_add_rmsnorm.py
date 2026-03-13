@@ -402,13 +402,6 @@ class FusedAddRMSNormKernel:
             cute.arch.barrier()
 
         # ===== Pass 2: Normalize and store output =====
-        if cutlass.const_expr(self.use_async_copy):
-            cute.autovec_copy(tXsX, tXrX)
-            cute.autovec_copy(tRsR, tRrR)
-            x_in = tXrX.load().to(Float32)
-            r_in = tRrR.load().to(Float32)
-            h = x_in + r_in
-
         w = tXrW.load().to(Float32)
         y = h * rstd * (w + Float32(weight_bias))
 
@@ -731,13 +724,6 @@ class FusedAddRMSNormQuantKernel:
             cute.arch.barrier()
 
         # ===== Pass 2: Normalize, quantize, and store FP8 output =====
-        if cutlass.const_expr(self.use_async_copy):
-            cute.autovec_copy(tXsX, tXrX)
-            cute.autovec_copy(tRsR, tRrR)
-            x_in = tXrX.load().to(Float32)
-            r_in = tRrR.load().to(Float32)
-            h = x_in + r_in
-
         w = tXrW.load().to(Float32)
         y = h * rstd * (w + Float32(weight_bias)) * inv_scale
 
@@ -764,7 +750,12 @@ class FusedAddRMSNormQuantKernel:
                         tYrY_f32[base + 5],
                         tYrY_f32[base + 6],
                         tYrY_f32[base + 7],
-                        get_ptr_as_int64(mY, Int32(actual_row * H + abs_col)),
+                        get_ptr_as_int64(
+                            mY,
+                            cute.crd2idx(
+                                (Int32(actual_row), Int32(abs_col)), mY.layout
+                            ),
+                        ),
                     )
                 else:
                     for e in cutlass.range_constexpr(vec_size):
@@ -775,7 +766,13 @@ class FusedAddRMSNormQuantKernel:
                             clamped = min(clamped, Float32(FLOAT8_E4M3_MAX))
                             cvt_and_store_f32_to_e4m3_hw(
                                 clamped,
-                                get_ptr_as_int64(mY, Int32(actual_row * H + abs_col_e)),
+                                get_ptr_as_int64(
+                                    mY,
+                                    cute.crd2idx(
+                                        (Int32(actual_row), Int32(abs_col_e)),
+                                        mY.layout,
+                                    ),
+                                ),
                             )
         elif cutlass.const_expr(self.use_hw_fp8 and vec_size == 4):
             for v in cutlass.range_constexpr(num_vec_blocks):
@@ -788,7 +785,12 @@ class FusedAddRMSNormQuantKernel:
                         tYrY_f32[base + 1],
                         tYrY_f32[base + 2],
                         tYrY_f32[base + 3],
-                        get_ptr_as_int64(mY, Int32(actual_row * H + abs_col)),
+                        get_ptr_as_int64(
+                            mY,
+                            cute.crd2idx(
+                                (Int32(actual_row), Int32(abs_col)), mY.layout
+                            ),
+                        ),
                     )
                 else:
                     for e in cutlass.range_constexpr(vec_size):
@@ -799,7 +801,13 @@ class FusedAddRMSNormQuantKernel:
                             clamped = min(clamped, Float32(FLOAT8_E4M3_MAX))
                             cvt_and_store_f32_to_e4m3_hw(
                                 clamped,
-                                get_ptr_as_int64(mY, Int32(actual_row * H + abs_col_e)),
+                                get_ptr_as_int64(
+                                    mY,
+                                    cute.crd2idx(
+                                        (Int32(actual_row), Int32(abs_col_e)),
+                                        mY.layout,
+                                    ),
+                                ),
                             )
         elif cutlass.const_expr(self.use_hw_fp8 and vec_size == 2):
             for v in cutlass.range_constexpr(num_vec_blocks):
@@ -810,7 +818,12 @@ class FusedAddRMSNormQuantKernel:
                     cvt_and_store_2xf32_to_e4m3_hw(
                         tYrY_f32[base],
                         tYrY_f32[base + 1],
-                        get_ptr_as_int64(mY, Int32(actual_row * H + abs_col)),
+                        get_ptr_as_int64(
+                            mY,
+                            cute.crd2idx(
+                                (Int32(actual_row), Int32(abs_col)), mY.layout
+                            ),
+                        ),
                     )
                 else:
                     for e in cutlass.range_constexpr(vec_size):
@@ -821,7 +834,13 @@ class FusedAddRMSNormQuantKernel:
                             clamped = min(clamped, Float32(FLOAT8_E4M3_MAX))
                             cvt_and_store_f32_to_e4m3_hw(
                                 clamped,
-                                get_ptr_as_int64(mY, Int32(actual_row * H + abs_col_e)),
+                                get_ptr_as_int64(
+                                    mY,
+                                    cute.crd2idx(
+                                        (Int32(actual_row), Int32(abs_col_e)),
+                                        mY.layout,
+                                    ),
+                                ),
                             )
         else:
             for v in cutlass.range_constexpr(num_vec_blocks):
@@ -832,7 +851,12 @@ class FusedAddRMSNormQuantKernel:
                         flat_idx = v * vec_size + e
                         clamped = max(tYrY_f32[flat_idx], Float32(-FLOAT8_E4M3_MAX))
                         clamped = min(clamped, Float32(FLOAT8_E4M3_MAX))
-                        out_ptr = get_ptr_as_int64(mY, Int32(actual_row * H + abs_col))
+                        out_ptr = get_ptr_as_int64(
+                            mY,
+                            cute.crd2idx(
+                                (Int32(actual_row), Int32(abs_col)), mY.layout
+                            ),
+                        )
                         if self.use_hw_fp8:
                             cvt_and_store_f32_to_e4m3_hw(clamped, out_ptr)
                         else:
