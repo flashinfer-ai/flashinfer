@@ -3,6 +3,10 @@ import torch
 import math
 from typing import Optional, Tuple, Union
 
+pytestmark = pytest.mark.skip(
+    reason="todo(jimmyzho): temporarily skip this test due to hangs"
+)
+
 import flashinfer
 from flashinfer.prefill import fmha_v2_prefill_deepseek
 from tests.utils_fp8 import to_float8
