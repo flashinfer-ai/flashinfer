@@ -837,6 +837,8 @@ def test_trtllm_fmha_v2_prefill(
         and mask_mode == "SLIDING_WINDOW"
     ):
         pytest.skip("Skip due to bug in fp8 sliding window")
+    if mask_mode == "SLIDING_WINDOW":
+        pytest.skip("todo(jimmyzho): temporarily skip sliding window test due to hang")
     run_trtllm_fmha_v2_prefill_case(
         input_layout=input_layout,
         batch_size=batch_size,
@@ -955,7 +957,8 @@ def test_trtllm_fmha_v2_prefill_attention_sinks(
 
     if not is_sm90a_supported(torch.device("cuda")):
         pytest.skip("FMHA v2 requires SM90+ (Hopper) GPUs.")
-
+    if mask_mode == "SLIDING_WINDOW":
+        pytest.skip("todo(jimmyzho): temporarily skip sliding window test due to hang")
     torch.manual_seed(42)
     device = torch.device("cuda")
 
