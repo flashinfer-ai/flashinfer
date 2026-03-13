@@ -56,6 +56,24 @@ if is_cute_dsl_available():
     )
     from .mla_decode import cute_dsl_mla_decode
 
+    # Backwards-compatible re-exports from flashinfer.norm.kernels submodule
+    from ..norm.kernels import (
+        # Kernel classes
+        RMSNormKernel,
+        QKRMSNormKernel,
+        RMSNormQuantKernel,
+        FusedAddRMSNormKernel,
+        FusedAddRMSNormQuantKernel,
+        LayerNormKernel,
+        # Python API functions
+        rmsnorm_cute,
+        qk_rmsnorm_cute,
+        rmsnorm_quant_cute,
+        fused_add_rmsnorm_cute,
+        fused_add_rmsnorm_quant_cute,
+        layernorm_cute,
+    )
+
 __all__ = [
     # Utils (always available)
     "is_cute_dsl_available",
@@ -84,4 +102,17 @@ if is_cute_dsl_available():
         "AddRMSNormFP4QuantKernel",
         # MLA Decode
         "cute_dsl_mla_decode",
+        # Norm kernels (CuTe DSL) - backwards-compatible re-exports
+        "RMSNormKernel",
+        "QKRMSNormKernel",
+        "RMSNormQuantKernel",
+        "FusedAddRMSNormKernel",
+        "FusedAddRMSNormQuantKernel",
+        "LayerNormKernel",
+        "rmsnorm_cute",
+        "qk_rmsnorm_cute",
+        "rmsnorm_quant_cute",
+        "fused_add_rmsnorm_cute",
+        "fused_add_rmsnorm_quant_cute",
+        "layernorm_cute",
     ]

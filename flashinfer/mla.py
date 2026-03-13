@@ -791,6 +791,22 @@ def trtllm_batch_decode_with_kv_cache_mla(
                 "cute-dsl backend (MLA decode kernel) does not support tensor bmm2_scale, "
                 "please pass a float value"
             )
+        if sinks is not None:
+            raise ValueError(
+                "cute-dsl backend (MLA decode kernel) does not support sinks"
+            )
+        if sparse_mla_top_k > 0:
+            raise ValueError(
+                "cute-dsl backend (MLA decode kernel) does not support sparse_mla_top_k"
+            )
+        if enable_pdl is not None:
+            raise ValueError(
+                "cute-dsl backend (MLA decode kernel) does not support enable_pdl"
+            )
+        if skip_softmax_threshold_scale_factor is not None:
+            raise ValueError(
+                "cute-dsl backend (MLA decode kernel) does not support skip_softmax_threshold_scale_factor"
+            )
 
         return cute_dsl_mla_decode(
             query=query,

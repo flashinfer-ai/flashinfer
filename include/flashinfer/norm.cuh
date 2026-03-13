@@ -149,7 +149,7 @@ template <uint32_t VEC_SIZE, typename T, typename O>
 __global__ void RMSNormQuantKernel(T* __restrict__ input, T* __restrict__ weight,
                                    O* __restrict__ output, const uint32_t d,
                                    const uint32_t stride_input, const uint32_t stride_output,
-                                   float weight_bias, float scale, float eps) {
+                                   float weight_bias, float* scale, float eps) {
   const uint32_t bx = blockIdx.x;
   const uint32_t tx = threadIdx.x, ty = threadIdx.y;
   constexpr uint32_t warp_size = 32;
@@ -158,7 +158,7 @@ __global__ void RMSNormQuantKernel(T* __restrict__ input, T* __restrict__ weight
   const uint32_t thread_id = tx + ty * warp_size;
   const uint32_t num_threads = num_warps * warp_size;
   const uint32_t rounds = ceil_div(d, VEC_SIZE * num_threads);
-  const float scale_inv = 1.0f / scale;
+  const float scale_inv = 1.0f / scale[0];
   extern __shared__ float smem[];
 
   float sum_sq = 0.f;
@@ -228,7 +228,7 @@ __global__ void RMSNormQuantKernel(T* __restrict__ input, T* __restrict__ weight
 
 template <typename T, typename O>
 cudaError_t RMSNormQuant(T* input, T* weight, O* output, uint32_t batch_size, uint32_t d,
-                         uint32_t stride_input, uint32_t stride_output, float scale,
+                         uint32_t stride_input, uint32_t stride_output, float* scale,
                          float eps = 1e-5, bool enable_pdl = false, cudaStream_t stream = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
@@ -519,7 +519,7 @@ __global__ void FusedAddRMSNormQuantKernel(T* __restrict__ input, T* __restrict_
                                            const uint32_t d, const uint32_t stride_input,
                                            const uint32_t stride_residual,
                                            const uint32_t stride_output, float weight_bias,
-                                           float scale, float eps) {
+                                           float* scale, float eps) {
   const uint32_t bx = blockIdx.x;
   const uint32_t tx = threadIdx.x, ty = threadIdx.y;
   constexpr uint32_t warp_size = 32;
@@ -527,7 +527,7 @@ __global__ void FusedAddRMSNormQuantKernel(T* __restrict__ input, T* __restrict_
   const uint32_t thread_id = tx + ty * warp_size;
   const uint32_t num_threads = num_warps * warp_size;
   const uint32_t rounds = ceil_div(d, VEC_SIZE * num_threads);
-  const float scale_inv = 1.0f / scale;
+  const float scale_inv = 1.0f / scale[0];
   extern __shared__ float smem[];
   float* smem_x = smem + ceil_div(num_warps, 4) * 4;
 
@@ -613,7 +613,7 @@ __global__ void FusedAddRMSNormQuantKernel(T* __restrict__ input, T* __restrict_
 template <typename T, typename O>
 cudaError_t FusedAddRMSNormQuant(T* input, T* residual, T* weight, O* output, uint32_t batch_size,
                                  uint32_t d, uint32_t stride_input, uint32_t stride_residual,
-                                 uint32_t stride_output, float scale, float eps = 1e-5,
+                                 uint32_t stride_output, float* scale, float eps = 1e-5,
                                  bool enable_pdl = false, cudaStream_t stream = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
