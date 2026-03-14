@@ -29,6 +29,7 @@ from .utils import (
     is_cute_dsl_available,
     make_ptr,
     get_cutlass_dtype,
+    torch_to_cutlass_dtype,
     get_num_sm,
     convert_sf_to_mma_layout,
     convert_sf_from_mma_layout,
@@ -53,6 +54,7 @@ if is_cute_dsl_available():
         add_rmsnorm_fp4quant,
         AddRMSNormFP4QuantKernel,
     )
+    from .mla_decode import cute_dsl_mla_decode
 
     # Backwards-compatible re-exports from flashinfer.norm.kernels submodule
     from ..norm.kernels import (
@@ -77,6 +79,7 @@ __all__ = [
     "is_cute_dsl_available",
     "make_ptr",
     "get_cutlass_dtype",
+    "torch_to_cutlass_dtype",
     "get_num_sm",
     # Scale factor layout conversion utilities
     "convert_sf_to_mma_layout",
@@ -97,6 +100,8 @@ if is_cute_dsl_available():
         # Add + RMSNorm + FP4 Quantization
         "add_rmsnorm_fp4quant",
         "AddRMSNormFP4QuantKernel",
+        # MLA Decode
+        "cute_dsl_mla_decode",
         # Norm kernels (CuTe DSL) - backwards-compatible re-exports
         "RMSNormKernel",
         "QKRMSNormKernel",

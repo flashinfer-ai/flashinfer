@@ -603,6 +603,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     skip_softmax_threshold_scale_factor: Optional[float] = None,
     enable_pdl: bool | None = None,
     backend: str = "auto",
+    is_var_seq: bool = True,
 ) -> torch.Tensor:
     """
     Parameters
@@ -633,6 +634,10 @@ def trtllm_batch_decode_with_kv_cache_mla(
         When set to ``auto``, the backend will be chosen based on the device architecture and kernel availability.
         For sm_100 and sm_103 (blackwell architecture), ``auto`` will choose ``trtllm-gen`` backend.
         For sm_120 (blackwell architecture), ``auto`` will choose ``xqa`` backend.
+    is_var_seq : bool
+        Whether the sequence length is variable.
+        If True, the sequence length is variable.
+        Otherwise,the sequence length is fixed for all the requests in the batch.
 
     Note
     ----
@@ -768,6 +773,55 @@ def trtllm_batch_decode_with_kv_cache_mla(
         )
 
         return out
+    elif backend == "cute-dsl":
+        cc = get_compute_capability(query.device)
+        if cc[0] < 10:
+            raise RuntimeError(
+                f"cute-dsl backend (MLA decode kernel) requires SM100+, got SM{cc[0]}{cc[1]}"
+            )
+        from .cute_dsl.mla_decode import cute_dsl_mla_decode
+
+        if isinstance(bmm1_scale, torch.Tensor):
+            raise ValueError(
+                "cute-dsl backend (MLA decode kernel) does not support tensor bmm1_scale, "
+                "please pass a float value"
+            )
+        if isinstance(bmm2_scale, torch.Tensor):
+            raise ValueError(
+                "cute-dsl backend (MLA decode kernel) does not support tensor bmm2_scale, "
+                "please pass a float value"
+            )
+        if sinks is not None:
+            raise ValueError(
+                "cute-dsl backend (MLA decode kernel) does not support sinks"
+            )
+        if sparse_mla_top_k > 0:
+            raise ValueError(
+                "cute-dsl backend (MLA decode kernel) does not support sparse_mla_top_k"
+            )
+        if enable_pdl is not None:
+            raise ValueError(
+                "cute-dsl backend (MLA decode kernel) does not support enable_pdl"
+            )
+        if skip_softmax_threshold_scale_factor is not None:
+            raise ValueError(
+                "cute-dsl backend (MLA decode kernel) does not support skip_softmax_threshold_scale_factor"
+            )
+
+        return cute_dsl_mla_decode(
+            query=query,
+            kv_cache=kv_cache,
+            workspace_buffer=workspace_buffer,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=max_seq_len,
+            softmax_scale=bmm1_scale,
+            output_scale=bmm2_scale,
+            out=out,
+            is_var_seq=is_var_seq,
+        )
     else:
         raise ValueError(f"Backend {backend} not supported")
 
