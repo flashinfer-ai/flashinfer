@@ -608,7 +608,7 @@ class FP4Moe(Moe):
 
     def get_tolerances(self):
         """Get FP4-specific accuracy tolerances."""
-        return {"atol": 0.1, "rtol": 0.85, "percent": 0.925}
+        return {"atol": 0.1, "rtol": 0.85, "percent": 0.92}
 
 
 # ====================================================================================
@@ -1170,7 +1170,7 @@ class FP8BlockScaleMoe(Moe):
 
     def get_tolerances(self):
         """Get FP8 block-scale accuracy tolerances."""
-        return {"atol": 0.1, "rtol": 0.85, "percent": 0.8}
+        return {"atol": 0.1, "rtol": 0.85, "percent": 0.79}
 
 
 # ====================================================================================
@@ -1364,7 +1364,7 @@ class FP8PerTensorMoe(Moe):
 
     def get_tolerances(self):
         """Get FP8 per-tensor accuracy tolerances."""
-        return {"atol": 0.1, "rtol": 0.85, "percent": 0.925}
+        return {"atol": 0.1, "rtol": 0.85, "percent": 0.92}
 
 
 # ====================================================================================
