@@ -20,6 +20,22 @@
 using namespace flashinfer;
 using namespace flashinfer::attention;
 
+template <typename CutlassIn, typename CutlassOut>
+void RunCutlassMLAPagedAttention(ffi::TensorView& workspace, ffi::TensorView& out,
+                                 ffi::TensorView& lse, ffi::TensorView& q_nope_pe,
+                                 ffi::TensorView& ckv_kpe_cache, ffi::TensorView& kv_lens,
+                                 ffi::TensorView& page_table, int batches, int page_count_per_seq,
+                                 int page_count_total, int page_size, int device_index,
+                                 cudaStream_t stream, float output_scale) {
+  auto status = runMla<CutlassIn, CutlassOut>(
+      workspace.data_ptr(), out.data_ptr(), lse.data_ptr(), q_nope_pe.data_ptr(),
+      ckv_kpe_cache.data_ptr(), kv_lens.data_ptr(), page_table.data_ptr(), batches,
+      page_count_per_seq, page_count_total, page_size, device_index, stream, output_scale);
+
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "Failed to run CutlassMLAPagedAttention: " << cudaGetErrorString(status);
+}
+
 void CutlassMLAPagedAttention(ffi::TensorView workspace, ffi::TensorView out, ffi::TensorView lse,
                               ffi::TensorView q_nope_pe, ffi::TensorView ckv_kpe_cache,
                               ffi::TensorView kv_lens, ffi::TensorView page_table,
@@ -40,14 +56,10 @@ void CutlassMLAPagedAttention(ffi::TensorView workspace, ffi::TensorView out, ff
     // Input and output have the same dtype (bf16/fp16 -> bf16/fp16)
     DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(in_dtype, c_type, [&] {
       using cutlass_t = cutlass_dtype_t<c_type>;
-      auto status = runMla<cutlass_t, cutlass_t>(
-          workspace.data_ptr(), out.data_ptr(), lse.data_ptr(), q_nope_pe.data_ptr(),
-          ckv_kpe_cache.data_ptr(), kv_lens.data_ptr(), page_table.data_ptr(), batches,
+      RunCutlassMLAPagedAttention<cutlass_t, cutlass_t>(
+          workspace, out, lse, q_nope_pe, ckv_kpe_cache, kv_lens, page_table, batches,
           page_count_per_seq, page_count_total, page_size, device_index, stream,
           static_cast<float>(output_scale));
-
-      TVM_FFI_ICHECK(status == cudaSuccess)
-          << "Failed to run CutlassMLAPagedAttention: " << cudaGetErrorString(status);
       return true;
     });
   } else {
@@ -56,14 +68,10 @@ void CutlassMLAPagedAttention(ffi::TensorView workspace, ffi::TensorView out, ff
       return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP8(out_dtype, c_type_out, [&] {
         using cutlass_in = cutlass_dtype_t<c_type_in>;
         using cutlass_out = cutlass_dtype_t<c_type_out>;
-        auto status = runMla<cutlass_in, cutlass_out>(
-            workspace.data_ptr(), out.data_ptr(), lse.data_ptr(), q_nope_pe.data_ptr(),
-            ckv_kpe_cache.data_ptr(), kv_lens.data_ptr(), page_table.data_ptr(), batches,
+        RunCutlassMLAPagedAttention<cutlass_in, cutlass_out>(
+            workspace, out, lse, q_nope_pe, ckv_kpe_cache, kv_lens, page_table, batches,
             page_count_per_seq, page_count_total, page_size, device_index, stream,
             static_cast<float>(output_scale));
-
-        TVM_FFI_ICHECK(status == cudaSuccess)
-            << "Failed to run CutlassMLAPagedAttention: " << cudaGetErrorString(status);
         return true;
       });
     });
