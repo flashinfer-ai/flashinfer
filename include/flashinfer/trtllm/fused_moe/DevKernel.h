@@ -234,20 +234,39 @@ namespace moe::dev {
 
 #define LAUNCH_ROUTING_WITH_NUM_EXPERTS(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, \
                                         stream, extraFlag1, numExperts)                            \
-  if (data.mDtypeExpW == tg::Dtype::Fp32 && extraFlag1) {                                          \
+  if (data.mDtypeScore == tg::Dtype::Fp32 && data.mDtypeExpW == tg::Dtype::Fp32 && extraFlag1) {   \
     LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(float, float, numExperts, true), kernel, numBlocks,  \
                  numThreads, smemSize, stream);                                                    \
-  } else if (data.mDtypeExpW == tg::Dtype::Fp32) {                                                 \
+  } else if (data.mDtypeScore == tg::Dtype::Fp32 && data.mDtypeExpW == tg::Dtype::Fp32 &&          \
+             !extraFlag1) {                                                                        \
     LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(float, float, numExperts, false), kernel, numBlocks, \
                  numThreads, smemSize, stream);                                                    \
-  } else if (data.mDtypeExpW == tg::Dtype::Bfloat16 && extraFlag1) {                               \
+  } else if (data.mDtypeScore == tg::Dtype::Fp32 && data.mDtypeExpW == tg::Dtype::Bfloat16 &&      \
+             extraFlag1) {                                                                         \
+    LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(float, __nv_bfloat16, numExperts, true), kernel,     \
+                 numBlocks, numThreads, smemSize, stream);                                         \
+  } else if (data.mDtypeScore == tg::Dtype::Fp32 && data.mDtypeExpW == tg::Dtype::Bfloat16 &&      \
+             !extraFlag1) {                                                                        \
+    LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(float, __nv_bfloat16, numExperts, false), kernel,    \
+                 numBlocks, numThreads, smemSize, stream);                                         \
+  } else if (data.mDtypeScore == tg::Dtype::Bfloat16 && data.mDtypeExpW == tg::Dtype::Fp32 &&      \
+             extraFlag1) {                                                                         \
+    LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(__nv_bfloat16, float, numExperts, true), kernel,     \
+                 numBlocks, numThreads, smemSize, stream);                                         \
+  } else if (data.mDtypeScore == tg::Dtype::Bfloat16 && data.mDtypeExpW == tg::Dtype::Fp32 &&      \
+             !extraFlag1) {                                                                        \
+    LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(__nv_bfloat16, float, numExperts, false), kernel,    \
+                 numBlocks, numThreads, smemSize, stream);                                         \
+  } else if (data.mDtypeScore == tg::Dtype::Bfloat16 && data.mDtypeExpW == tg::Dtype::Bfloat16 &&  \
+             extraFlag1) {                                                                         \
     LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16, numExperts, true),     \
                  kernel, numBlocks, numThreads, smemSize, stream);                                 \
-  } else if (data.mDtypeExpW == tg::Dtype::Bfloat16) {                                             \
+  } else if (data.mDtypeScore == tg::Dtype::Bfloat16 && data.mDtypeExpW == tg::Dtype::Bfloat16 &&  \
+             !extraFlag1) {                                                                        \
     LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16, numExperts, false),    \
                  kernel, numBlocks, numThreads, smemSize, stream);                                 \
   } else {                                                                                         \
-    FLASHINFER_WARN("Unsupported dtypeExpW");                                                      \
+    FLASHINFER_WARN("Unsupported combination of mDtypeScore and mDtypeExpW");                      \
   }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
