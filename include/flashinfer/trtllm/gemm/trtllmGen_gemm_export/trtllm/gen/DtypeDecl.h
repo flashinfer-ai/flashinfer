@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
  * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,8 +28,9 @@
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 //
-// Be careful when modifying this file as it is included by the generated kernels. For example, do
-// not add TLLM_CHECK_* constructs in this file. Thanks!
+// Be careful when modifying this file as it is included by the generated
+// kernels. For example, do not add TLLM_CHECK_* constructs in this file.
+// Thanks!
 //
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -44,9 +45,9 @@ enum class Dtype : uint32_t {
 
 // We use the following encoding for the types:
 //
-// Byte 0: Identifier for the type (going from 0 to the number of data types - 1,
-// Byte 1: Number of bits in the type,
-// Byte 2: Bit 0: Is it an integer? 0x1 if true, 0x0 otherwise;
+// Byte 0: Identifier for the type (going from 0 to the number of data types -
+// 1, Byte 1: Number of bits in the type, Byte 2: Bit 0: Is it an integer? 0x1
+// if true, 0x0 otherwise;
 //         Bit 4: is it signed?  0x1 if true, 0x0 otherwise.
 // Byte 3: Is it a block format? 0x1 if true, 0x0 otherwise.
 
@@ -70,13 +71,14 @@ enum class Dtype : uint32_t {
   Int64    = TLLM_ENCODE_DTYPE(/*block*/ 0u, /*signed*/ 1u, /*int*/ 1u, /*bits*/  64u, /*uid*/ 11u),
   MxE2m1   = TLLM_ENCODE_DTYPE(/*block*/ 1u, /*signed*/ 1u, /*int*/ 0u, /*bits*/   4u, /*uid*/ 12u),
   MxE4m3   = TLLM_ENCODE_DTYPE(/*block*/ 1u, /*signed*/ 1u, /*int*/ 0u, /*bits*/   8u, /*uid*/ 13u),
-  UE8m0    = TLLM_ENCODE_DTYPE(/*block*/ 0u, /*signed*/ 0u, /*int*/ 0u, /*bits*/   8u, /*uid*/ 14u),
-  UInt8    = TLLM_ENCODE_DTYPE(/*block*/ 0u, /*signed*/ 0u, /*int*/ 1u, /*bits*/   8u, /*uid*/ 15u),
-  UInt16   = TLLM_ENCODE_DTYPE(/*block*/ 0u, /*signed*/ 0u, /*int*/ 1u, /*bits*/  16u, /*uid*/ 16u),
-  UInt32   = TLLM_ENCODE_DTYPE(/*block*/ 0u, /*signed*/ 0u, /*int*/ 1u, /*bits*/  32u, /*uid*/ 17u),
-  UInt64   = TLLM_ENCODE_DTYPE(/*block*/ 0u, /*signed*/ 0u, /*int*/ 1u, /*bits*/  64u, /*uid*/ 18u),
-  UInt128  = TLLM_ENCODE_DTYPE(/*block*/ 0u, /*signed*/ 0u, /*int*/ 1u, /*bits*/ 128u, /*uid*/ 19u),
-  Void     = TLLM_ENCODE_DTYPE(/*block*/ 0u, /*signed*/ 1u, /*int*/ 0u, /*bits*/   0u, /*uid*/ 20u),
+  MxInt4   = TLLM_ENCODE_DTYPE(/*block*/ 1u, /*signed*/ 1u, /*int*/ 1u, /*bits*/   4u, /*uid*/ 14u),
+  UE8m0    = TLLM_ENCODE_DTYPE(/*block*/ 0u, /*signed*/ 0u, /*int*/ 0u, /*bits*/   8u, /*uid*/ 15u),
+  UInt8    = TLLM_ENCODE_DTYPE(/*block*/ 0u, /*signed*/ 0u, /*int*/ 1u, /*bits*/   8u, /*uid*/ 16u),
+  UInt16   = TLLM_ENCODE_DTYPE(/*block*/ 0u, /*signed*/ 0u, /*int*/ 1u, /*bits*/  16u, /*uid*/ 17u),
+  UInt32   = TLLM_ENCODE_DTYPE(/*block*/ 0u, /*signed*/ 0u, /*int*/ 1u, /*bits*/  32u, /*uid*/ 18u),
+  UInt64   = TLLM_ENCODE_DTYPE(/*block*/ 0u, /*signed*/ 0u, /*int*/ 1u, /*bits*/  64u, /*uid*/ 19u),
+  UInt128  = TLLM_ENCODE_DTYPE(/*block*/ 0u, /*signed*/ 0u, /*int*/ 1u, /*bits*/ 128u, /*uid*/ 20u),
+  Void     = TLLM_ENCODE_DTYPE(/*block*/ 0u, /*signed*/ 1u, /*int*/ 0u, /*bits*/   0u, /*uid*/ 21u),
 // clang-format on
 
 #undef TLLM_ENCODE_DTYPE
@@ -160,6 +162,8 @@ inline std::string dtypeToString(Dtype dtype) {
       return "MxE4m3";
     case Dtype::MxE2m1:
       return "MxE2m1";
+    case Dtype::MxInt4:
+      return "MxInt4";
     case Dtype::UE8m0:
       return "UE8m0";
     case Dtype::UInt8:
@@ -195,13 +199,16 @@ inline Dtype dtypeEltType(Dtype dtype) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-inline int dtypeNumEltsPerSf(Dtype dtype) {
+// Note: the block size from the options should be used instead.
+// TODO: remove this function?
+inline int dtypeNumEltsPerSf(Dtype dtype, bool useSparsity = false) {
   switch (dtype) {
     case Dtype::E2m1:
-      return 16;
+      return useSparsity ? 32 : 16;
     case Dtype::MxE2m1:
     case Dtype::MxE4m3:
-      return 32;
+    case Dtype::MxInt4:
+      return useSparsity ? 64 : 32;
     default:
       assert(false);
       return -1;
@@ -218,6 +225,8 @@ inline Dtype dtypeGetBlockSfType(Dtype dtype) {
     case Dtype::MxE2m1:
     case Dtype::MxE4m3:
       return Dtype::UE8m0;
+    case Dtype::MxInt4:
+      return Dtype::Bfloat16;
     default:
       assert(false);
       return Dtype::Void;
@@ -253,7 +262,8 @@ inline MmaKind dtypeGetMmaKind(Dtype dtypeA, Dtype dtypeB) {
     return MmaKind::Fp8Fp6Fp4;
   }
 
-  // At this point we know that both dtypes are Mx types and not both MxE2m1 at the same time.
+  // At this point we know that both dtypes are Mx types and not both MxE2m1 at
+  // the same time.
   if ((dtypeEltA == Dtype::E4m3 || dtypeEltA == Dtype::E5m2 || dtypeEltA == Dtype::E2m3 ||
        dtypeEltA == Dtype::E3m2 || dtypeEltA == Dtype::E2m1) &&
       (dtypeEltB == Dtype::E4m3 || dtypeEltB == Dtype::E5m2 || dtypeEltB == Dtype::E2m3 ||
@@ -261,6 +271,14 @@ inline MmaKind dtypeGetMmaKind(Dtype dtypeA, Dtype dtypeB) {
     return MmaKind::MxFp8Fp6Fp4;
   }
   return MmaKind::Tf32;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline bool dtypeNeedsPadding(Dtype dtype, MmaKind mmaKind, [[maybe_unused]] int mmaK,
+                              [[maybe_unused]] bool isSparseA) {
+  bool needsPadding = mmaKind == MmaKind::MxFp8Fp6Fp4 && dtype == Dtype::MxE2m1;
+  return needsPadding;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

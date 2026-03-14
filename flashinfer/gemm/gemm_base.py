@@ -59,6 +59,7 @@ from ..jit.gemm import gen_tgv_gemm_sm10x_module
 from ..jit.gemm import gen_deepgemm_sm100_module
 from ..jit.cpp_ext import get_cuda_version
 from ..jit.gemm import gen_fp8_blockscale_gemm_sm90_module
+from ..tllm_enums import DtypeTrtllmGen, SfLayout
 
 
 CUDNN_AVAILABLE = False
@@ -769,14 +770,6 @@ def get_gemm_sm120_module_cutlass_fp8():
     return SimpleNamespace(
         cutlass_fp8_gemm_runner=cutlass_fp8_gemm_runner,
     )
-
-
-@functools.cache
-def get_trtllm_gemm_module():
-    mod = gen_trtllm_gen_gemm_module()
-    op = mod.build_and_load()
-    setup_cubin_loader(mod.get_library_path())
-    return op
 
 
 @functools.cache
@@ -2518,7 +2511,8 @@ def _check_mm_mxfp8_problem_size(
     b_descale: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cutlass", "cute-dsl", "auto"] = "auto",  # unused
+    use_8x4_sf_layout: bool = True,
+    backend: Literal["cutlass", "cute-dsl", "trtllm", "auto"] = "auto",  # unused
 ) -> bool:
     # Generic checks
     ## pre-check the input tensors and block scale tensors
@@ -2556,9 +2550,13 @@ def _check_mm_mxfp8_problem_size(
 
     # MXFP8 block size
     sf_vec_size = 32
+    if a_descale.ndim == 2:
+        sf_layout = SfLayout.layout_linear
+    else:
+        sf_layout = SfLayout.layout_8x4 if use_8x4_sf_layout else SfLayout.layout_128x4
 
     if a_descale.ndim == 1:
-        expected_len = _mxfp8_swizzled_scale_len(a.shape[0], a.shape[1])
+        expected_len = _mxfp8_swizzled_scale_len(a.shape[0], a.shape[1], sf_layout)
         if a_descale.shape[0] != expected_len:
             raise ValueError(
                 "a_descale shape mismatch for swizzled layout. "
@@ -2582,7 +2580,7 @@ def _check_mm_mxfp8_problem_size(
         )
 
     if b_descale.ndim == 1:
-        expected_len = _mxfp8_swizzled_scale_len(b.shape[1], b.shape[0])
+        expected_len = _mxfp8_swizzled_scale_len(b.shape[1], b.shape[0], sf_layout)
         if b_descale.shape[0] != expected_len:
             raise ValueError(
                 "b_descale shape mismatch for swizzled layout. "
@@ -2632,8 +2630,30 @@ def _cutlass_gemm_mxfp8_requirement(
     b_descale: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cutlass", "cute-dsl", "auto"] = "auto",
+    use_8x4_sf_layout: bool = True,
+    backend: Literal["cutlass", "cute-dsl", "trtllm", "auto"] = "auto",
 ):
+    return True
+
+
+@supported_compute_capability([100, 103])
+def _trtllm_gemm_mxfp8_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    use_8x4_sf_layout: bool = True,
+    backend: Literal["trtllm", "auto"] = "auto",
+):
+    if out_dtype != torch.bfloat16:
+        return False
+    if a.ndim != 2 or b.ndim != 2:  # currently don't support BlockMajorK layout
+        return False
+    k, n = b.shape
+    if k % 256 != 0:
+        return False
     return True
 
 
@@ -2645,6 +2665,7 @@ def _cute_dsl_gemm_mxfp8_requirement(
     b_descale: torch.Tensor,
     out: Optional[torch.Tensor] = None,  # unused
     out_dtype: torch.dtype = torch.bfloat16,  # unused
+    use_8x4_sf_layout: bool = True,  # unused
     backend: Literal["cutlass", "cute-dsl", "auto"] = "auto",  # unused
 ):
     # CuTe DSL MXFP8 path currently expects swizzled 1D block scales
@@ -3050,8 +3071,10 @@ def _heuristic_func_mm_mxfp8(
     b_descale: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cutlass", "cute-dsl", "auto"] = "auto",
+    use_8x4_sf_layout: bool = True,
+    backend: Literal["cutlass", "cute-dsl", "trtllm", "auto"] = "auto",
 ) -> List[str]:
+    # don't select trtllm since it requires weight shuffling
     if "cutlass" in suitable_backends:
         return ["cutlass"]
     return []
@@ -3060,6 +3083,7 @@ def _heuristic_func_mm_mxfp8(
 @backend_requirement(
     {
         "cutlass": _cutlass_gemm_mxfp8_requirement,
+        "trtllm": _trtllm_gemm_mxfp8_requirement,
         "cute-dsl": _cute_dsl_gemm_mxfp8_requirement,
     },
     common_check=_check_mm_mxfp8_problem_size,
@@ -3073,7 +3097,8 @@ def mm_mxfp8(
     b_descale: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cutlass", "cute-dsl", "auto"] = "auto",
+    use_8x4_sf_layout: bool = False,
+    backend: Literal["cutlass", "cute-dsl", "trtllm", "auto"] = "auto",
 ) -> torch.Tensor:
     r"""MM MXFP8 (block size 32)
 
@@ -3088,7 +3113,8 @@ def mm_mxfp8(
     a_descale: torch.Tensor
         Block scale tensor for A. Can be:
         - 2D non-swizzled: shape (m, k // 32)
-        - 1D swizzled: shape (M_padded * K_padded,) where M_padded = round_up(m, 128), K_padded = round_up(k // 32, 4)
+        - 1D swizzled: shape (M_padded * K_padded,)
+          where M_padded = round_up(m, 8 if 8x4 layout else 128), K_padded = round_up(k // 32, 4)
         dtype: uint8.
 
     b_descale: torch.Tensor
@@ -3105,11 +3131,16 @@ def mm_mxfp8(
     out_dtype: torch.dtype
         Output dtype, bf16 or fp16. Defaults to ``torch.bfloat16``.
 
-    backend: Literal["cutlass", "cute-dsl", "auto"]
+    use_8x4_sf_layout: bool
+        Whether the scale tensors for a are in 8x4 layout (vs 128x4).
+
+    backend: Literal["cutlass", "cute-dsl", "trtllm", "auto"]
         The backend to use for the operation. Defaults to ``"auto"``.
         ``"auto"`` selects the CUTLASS backend.
-        The ``"cute-dsl"`` backend currently requires swizzled 1D scales
-        (``mxfp8_quantize(..., is_sf_swizzled_layout=True)``).
+        - The ``"cute-dsl"`` backend currently requires swizzled 1D scales
+          (``mxfp8_quantize(..., is_sf_swizzled_layout=True)``).
+        - The ``"trtllm"`` requires b to be quantized with 128x4 swizzle layout and shuffled.
+          a can be quantized with either 128x4 or 8x4 layout (controlled by `use_8x4_sf_layout`).
 
     Returns
     -------
@@ -3186,6 +3217,9 @@ def mm_mxfp8(
         "cutlass": lambda: get_cutlass_mxfp8_gemm_module(
             major
         ).cutlass_mxfp8_gemm_runner(),
+        "trtllm": lambda: get_trtllm_gemm_module().trtllm_mxfp8_gemm_runner(
+            use_8x4_sf_layout
+        ),
         "cute-dsl": lambda: _cute_dsl_gemm_mxfp8_runner(major, minor, True, out_dtype),
     }
 
@@ -3892,11 +3926,20 @@ def _pad_up(x, y):
     return ((x + y - 1) // y) * y
 
 
-def _mxfp8_swizzled_scale_len(m: int, k: int) -> int:
-    """Return the 1D swizzled scale length for MXFP8 (F8_128x4 layout)."""
-    m_padded = _pad_up(m, 128)
-    num_k_tiles = _pad_up(k, 128) // 128
-    return m_padded * num_k_tiles * 4
+def _mxfp8_swizzled_scale_len(m: int, k: int, swizzle_layout: SfLayout) -> int:
+    """Return the 1D swizzled scale length for MXFP8."""
+    if swizzle_layout == SfLayout.layout_128x4:
+        m_padded = _pad_up(m, 128)
+        num_k_tiles = _pad_up(k, 128) // 128
+        return m_padded * num_k_tiles * 4
+    elif swizzle_layout == SfLayout.layout_8x4:
+        m_padded = _pad_up(m, 8)
+        num_k_tiles = _pad_up(k, 128) // 128
+        return m_padded * num_k_tiles * 4
+    elif swizzle_layout == SfLayout.layout_linear:
+        return m * k
+    else:
+        raise ValueError(f"Unsupported swizzle layout: {swizzle_layout}")
 
 
 _MM_FP4_TUNING_CONFIG_8x4 = TuningConfig(
@@ -3961,7 +4004,9 @@ _MM_MXFP8_TUNING_CONFIG = TuningConfig(
             2,  # a_descale_tensor_index
             0,
             lambda shapes: (
-                _mxfp8_swizzled_scale_len(shapes[0][0], shapes[0][1])
+                _mxfp8_swizzled_scale_len(
+                    shapes[0][0], shapes[0][1], SfLayout.layout_128x4
+                )
                 if len(shapes[2]) == 1
                 else shapes[0][0]
             ),
@@ -4098,7 +4143,7 @@ def mm_fp4(
 
     backend_to_runner_factory = {
         "cudnn": lambda: _cudnn_gemm_fp4_runner(),
-        "trtllm": lambda: get_trtllm_fp4_gemm_module().trtllm_fp4_gemm_runner(
+        "trtllm": lambda: get_trtllm_gemm_module().trtllm_fp4_gemm_runner(
             use_8x4_sf_layout
         ),
         "cutlass": lambda: get_cutlass_fp4_gemm_module(
@@ -4529,6 +4574,8 @@ def gemm_fp8_nt_groupwise(
     elif backend == "trtllm":
         # mma_sm is ignored
         get_trtllm_gemm_module().trtllm_gemm(
+            DtypeTrtllmGen.E4m3,
+            DtypeTrtllmGen.Bfloat16,
             workspace_buffer,
             a,
             b,
@@ -4544,87 +4591,166 @@ def gemm_fp8_nt_groupwise(
 
 
 @functools.cache
-def get_trtllm_fp4_gemm_module():
+def get_trtllm_gemm_module():
     mod = gen_trtllm_gen_gemm_module()
     op = mod.build_and_load()
     setup_cubin_loader(mod.get_library_path())
 
-    def trtllm_fp4_gemm_runner(use_8x4_sf_layout: bool = True):
-        class TrtllmFp4GemmRunner(TunableRunner):
-            def __init__(self, use_8x4_sf_layout: bool = True):
-                self._fp4_gemm_runner = op.trtllm_gemm
-                self._use_8x4_sf_layout = use_8x4_sf_layout
+    class TrtllmGemmRunner(TunableRunner):
+        def __init__(
+            self,
+            input_dtype: DtypeTrtllmGen,
+            output_dtype: DtypeTrtllmGen,
+            use_8x4_sf_layout: bool = True,
+        ):
+            self._gemm_runner = op.trtllm_gemm
+            self._use_8x4_sf_layout = use_8x4_sf_layout
+            self._input_dtype = input_dtype
+            self._output_dtype = output_dtype
 
-            def get_valid_tactics(
-                self,
-                inputs: List[torch.Tensor],
-                profile: OptimizationProfile,
-            ) -> List[int]:
-                a_tensor_index = 1
-                b_tensor_index = 2
+        def unpack_inputs(
+            self,
+            inputs: List[torch.Tensor],
+        ) -> Tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+        ]:
+            (
+                a,
+                b,
+                a_descale,
+                b_descale,
+                alpha,
+                _,
+                out,
+                _,
+                _,
+                workspace_buffer,
+            ) = inputs
+            return a, b, a_descale, b_descale, alpha, out, workspace_buffer
 
-                a = profile.get_opt_shapes()[a_tensor_index]
-                b = profile.get_opt_shapes()[b_tensor_index]
-                m = a[0]
-                n = b[0]
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> List[int]:
+            a_tensor_index = 0
+            b_tensor_index = 1
+
+            a = profile.get_opt_shapes()[a_tensor_index]
+            b = profile.get_opt_shapes()[b_tensor_index]
+            m = a[0]
+            n = b[1]
+            assert a[1] == b[0], (
+                f"The k dimension is inconsistent between A ({a}) and B ({b})"
+            )
+            if self._input_dtype == DtypeTrtllmGen.E2m1:
                 k = a[1] * 2
-                (
-                    a,
-                    b,
-                    a_descale,
-                    b_descale,
-                    alpha,
-                    _,
-                    out,
-                    _,
-                    _,
-                    workspace_buffer,
-                ) = inputs
-                type_e2m1 = 0
-                type_bf16 = 2
-                return list(
-                    op.trtllm_gemm_tactics(
-                        m, n, k, type_e2m1, type_bf16, self._use_8x4_sf_layout
-                    )
+            else:
+                k = a[1]
+            (
+                a,
+                b,
+                a_descale,
+                b_descale,
+                alpha,
+                out,
+                workspace_buffer,
+            ) = self.unpack_inputs(inputs)
+            return list(
+                op.trtllm_gemm_tactics(
+                    m,
+                    n,
+                    k,
+                    self._input_dtype,
+                    self._output_dtype,
+                    self._use_8x4_sf_layout,
                 )
+            )
 
-            def forward(
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic: int = -1,
+            do_preparation: bool = False,
+            **kwargs,
+        ):
+            a, b, a_descale, b_descale, alpha, out, workspace_buffer = (
+                self.unpack_inputs(inputs)
+            )
+            self._gemm_runner(
+                self._input_dtype,
+                self._output_dtype,
+                workspace_buffer,
+                a,
+                b.T,
+                a_descale,
+                b_descale,
+                alpha,
+                out,
+                self._use_8x4_sf_layout,
+                tactic,
+            )
+            return out
+
+    def trtllm_gemm_runner(
+        input_dtype: DtypeTrtllmGen,
+        output_dtype: DtypeTrtllmGen,
+        use_8x4_sf_layout: bool = True,
+    ):
+        return TrtllmGemmRunner(input_dtype, output_dtype, use_8x4_sf_layout)
+
+    def trtllm_fp4_gemm_runner(
+        use_8x4_sf_layout: bool = True,
+    ):
+        return TrtllmGemmRunner(
+            DtypeTrtllmGen.E2m1, DtypeTrtllmGen.Bfloat16, use_8x4_sf_layout
+        )
+
+    def trtllm_mxfp8_gemm_runner(
+        use_8x4_sf_layout: bool = True,
+    ):
+        # monkey patch to align with cutlass runner's input format
+        class TrtllmMxFp8GemmRunner(TrtllmGemmRunner):
+            def unpack_inputs(
                 self,
                 inputs: List[torch.Tensor],
-                tactic: int = -1,
-                do_preparation: bool = False,
-                **kwargs,
-            ):
+            ) -> Tuple[
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+            ]:
                 (
                     a,
                     b,
                     a_descale,
                     b_descale,
-                    alpha,
-                    _,
+                    out_dtype,
                     out,
-                    _,
-                    _,
                     workspace_buffer,
                 ) = inputs
-                self._fp4_gemm_runner(
-                    workspace_buffer,
-                    a,
-                    b.T,
-                    a_descale,
-                    b_descale.T,
-                    alpha,
-                    out,
-                    self._use_8x4_sf_layout,
-                    tactic,
-                )
-                return out
+                assert out_dtype == torch.bfloat16
+                return a, b, a_descale, b_descale, None, out, workspace_buffer
 
-        return TrtllmFp4GemmRunner(use_8x4_sf_layout)
+        return TrtllmMxFp8GemmRunner(
+            DtypeTrtllmGen.MxE4m3, DtypeTrtllmGen.Bfloat16, use_8x4_sf_layout
+        )
 
     # Register the module
     return SimpleNamespace(
+        trtllm_gemm_runner=trtllm_gemm_runner,
         trtllm_fp4_gemm_runner=trtllm_fp4_gemm_runner,
+        trtllm_mxfp8_gemm_runner=trtllm_mxfp8_gemm_runner,
+        trtllm_gemm=op.trtllm_gemm,
     )
 
 
