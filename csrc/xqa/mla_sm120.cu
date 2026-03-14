@@ -41,12 +41,18 @@ __constant__ constexpr XQAKernelType kernelType = XQAKernelType::kSM120_MLA;
 
 inline constexpr bool allowMultipleInputTokens = true;
 
-inline constexpr uint32_t partElemsK = 64;  // @fixme: change this to 128 to save L2 traffic
+using MathElem = CacheElem;
+inline constexpr uint32_t mathElemBytes = sizeof(MathElem);
+inline constexpr bool is_fp8 = (mathElemBytes == 1);
+inline constexpr bool is_bf16 = (mathElemBytes == 2);
+// BF16: partElemsK=64, nbKBufs=2 → ~100KB, under 99KB opt-in (101376).
+inline constexpr uint32_t partElemsK = 64;
 inline constexpr uint32_t nbKParts = exactDiv(validElemsPerKHead, partElemsK);
 inline constexpr uint32_t nbQParts = nbKParts;
 
-inline constexpr uint32_t tokensPerTile = 64;
-inline constexpr uint32_t partElemsV = 128;
+inline constexpr uint32_t tokensPerTile = is_fp8 ? 64 : 32;
+
+inline constexpr uint32_t partElemsV = is_fp8 ? 128 : 64;
 inline constexpr uint32_t nbVSplit = 2;
 inline constexpr uint32_t gemm1V = exactDiv(validElemsPerVHead, nbVSplit);
 inline constexpr uint32_t nbProducerCtasPerCga = nbVSplit;
@@ -54,11 +60,11 @@ inline constexpr uint32_t nbProducerCtasPerCga = nbVSplit;
 inline constexpr uint32_t multiBlockMinNbTilesPerCta = 2;
 inline constexpr uint32_t multiBlockMinNbTiles = multiBlockMinNbTilesPerCta * 2;
 
-using MathElem = CacheElem;
-inline constexpr uint32_t mathElemBytes = sizeof(MathElem);
 inline constexpr uint32_t grainsPerPartK = exactDiv(partElemsK * mathElemBytes, grainBytes);
 
 inline constexpr uint32_t grainElems = exactDiv(grainBytes, mathElemBytes);
+
+inline constexpr mmaShape kernelQmmaShape = is_fp8 ? mmaShape{16, 8, 32} : mmaShape{16, 8, 16};
 
 inline constexpr float xScale = 1.f / kE4M3_MAX;
 __constant__ constexpr float rcpXScale = kE4M3_MAX;
@@ -162,7 +168,7 @@ class Mat16x32Loader {
   __device__ inline Mat16x32Loader(Src const& src, uint32_t baseRow, uint32_t idxInstK,
                                    uint32_t r = laneId() % 16, uint32_t c = laneId() / 16)
       : src{src}, baseRow{baseRow}, idxInstK{idxInstK}, r{r}, c{c}, basePtr{getPtrRef(0)} {
-    static_assert((grainBytes * srcCols * qmmaShape.m) % 1024 == 0);
+    static_assert((grainBytes * srcCols * kernelQmmaShape.m) % 1024 == 0);
   }
 
   __device__ inline Mat16x32 load(uint32_t idxInstM) const {
@@ -170,8 +176,8 @@ class Mat16x32Loader {
   }
 
   template <uint32_t tileM>
-  __device__ inline Vec<Mat16x32, exactDiv(tileM, qmmaShape.m)> loadWholeCol() const {
-    uint32_t const nbInstM = exactDiv(tileM, qmmaShape.m);
+  __device__ inline Vec<Mat16x32, exactDiv(tileM, kernelQmmaShape.m)> loadWholeCol() const {
+    uint32_t const nbInstM = exactDiv(tileM, kernelQmmaShape.m);
     Vec<Mat16x32, nbInstM> ret;
 #pragma unroll
     for (uint32_t i = 0; i < nbInstM; i++) {
@@ -181,13 +187,13 @@ class Mat16x32Loader {
   }
 
   __device__ inline LdGrain const* getPtr(uint32_t idxInstM) const {
-    return checkedVal(basePtr + idxInstM * qmmaShape.m * srcCols, getPtrRef(idxInstM));
+    return checkedVal(basePtr + idxInstM * kernelQmmaShape.m * srcCols, getPtrRef(idxInstM));
   }
 
  private:
   __device__ inline LdGrain const* getPtrRef(uint32_t idxInstM) const {
-    return &src.template at<true>(baseRow + idxInstM * qmmaShape.m + r,
-                                  idxInstK * exactDiv(qmmaShape.k, grainElems) + c);
+    return &src.template at<true>(baseRow + idxInstM * kernelQmmaShape.m + r,
+                                  idxInstK * exactDiv(kernelQmmaShape.k, grainElems) + c);
   }
 
   Src const& src;
@@ -263,7 +269,9 @@ constexpr uint32_t multiBlockMathWarps = 8;
 constexpr bool useRegQ = USE_REG_Q;
 
 struct SharedMemA {
-  static inline constexpr uint32_t nbKBufs = 12;
+  // BF16: 2 K-buffers to fit ≤99KB opt-in (~100096 bytes); 3 buffers would need ~104KB (128KB
+  // arch).
+  static inline constexpr uint32_t nbKBufs = is_fp8 ? 12 : 2;
 
   static inline constexpr uint32_t regQParts = (useRegQ ? 4 : 0);
   static inline constexpr uint32_t shmQParts = nbQParts - regQParts;
@@ -587,12 +595,12 @@ struct Producer {
     uint32_t const tileBaseRow = warpTile.y * warpIdx.x;
     PingPongMutex tensorCoreMutex{smem.tensorCoreMutex, grpIdx};
 
-    constexpr uint32_t partNbInstK = exactDiv(partElemsK, qmmaShape.k);
+    constexpr uint32_t partNbInstK = exactDiv(partElemsK, kernelQmmaShape.k);
     using AtomA = Vec<uint32_t, 4>;  // for 16x32 data, working as mat A of QMMA.16832
-    using RegQPartCol = Vec<AtomA, exactDiv(warpTile.y, qmmaShape.m)>;
+    using RegQPartCol = Vec<AtomA, exactDiv(warpTile.y, kernelQmmaShape.m)>;
     using RegQPart = Vec<RegQPartCol, partNbInstK>;
     using RegQ = Vec<RegQPart, SharedMemA::regQParts>;
-    constexpr uint32_t tileNbAtomBx2 = exactDiv(tokensPerTile, qmmaShape.n * 2);
+    constexpr uint32_t tileNbAtomBx2 = exactDiv(tokensPerTile, kernelQmmaShape.n * 2);
     using AtomBx2 = Vec<uint32_t, 4>;  // one AtomB is 8x32 and AtomBx2 is 16x32
     using RegKPartCol = Vec<AtomBx2, tileNbAtomBx2>;
     using RegKPart = Vec<RegKPartCol, partNbInstK>;
@@ -656,7 +664,7 @@ struct Producer {
       RegKPart regKBuf;
       regKBuf[0] = loadRegKCol(smem.k[kBarWaiter.idxBuf], 0);
 
-      auto shouldTestWait = [](uint32_t idxInstK, uint32_t idxAtomBx2) {
+      auto shouldTestWait = [partNbInstK, tileNbAtomBx2](uint32_t idxInstK, uint32_t idxAtomBx2) {
         return idxInstK == partNbInstK - 1 && idxAtomBx2 == tileNbAtomBx2 - 2;
       };
       BarWaiter kBarWaiterNext = kBarWaiter.next();
@@ -679,9 +687,12 @@ struct Producer {
           }
 
           Mat16x32Loader const loaderK(smem.k[kBarWaiter.idxBuf], 0, idxInstKPrefetch, rB, cB);
+          // Q prefetch index: use min(2, tileNbAtomBx2-1) so BF16 (tileNbAtomBx2=2) triggers at 1,
+          // while FP8 (tileNbAtomBx2=4) still triggers at 2 for optimal overlap.
+          constexpr uint32_t qPrefetchAtomBx2 = mha::min(2u, tileNbAtomBx2 - 1);
 #pragma unroll
           for (uint32_t idxAtomBx2 = 0; idxAtomBx2 < tileNbAtomBx2; idxAtomBx2++) {
-            if (idxAtomBx2 == 2 && prefetch) {
+            if (idxAtomBx2 == qPrefetchAtomBx2 && prefetch) {
               if (idxPartPrefetch < SharedMemA::regQParts) {
                 regQBuf[idxInstKPrefetch] = regQ[idxPartPrefetch][idxInstKPrefetch];
               } else {
@@ -698,9 +709,9 @@ struct Producer {
             for (uint32_t i = 0; i < WarpAcc::rows; i++) {
 #pragma unroll
               for (uint32_t j = 0; j < 2; j++) {
-                mma<__nv_fp8_e4m3>(reinterpret_cast<float(&)[2][2]>(acc(i, 2 * idxAtomBx2 + j)),
-                                   reinterpret_cast<uint32_t const(&)[2][2]>(regQBuf[idxInstK][i]),
-                                   reinterpret_cast<uint32_t const(&)[2][1]>(atomBx2[2 * j]));
+                mma<MathElem>(reinterpret_cast<float(&)[2][2]>(acc(i, 2 * idxAtomBx2 + j)),
+                              reinterpret_cast<uint32_t const(&)[2][2]>(regQBuf[idxInstK][i]),
+                              reinterpret_cast<uint32_t const(&)[2][1]>(atomBx2[2 * j]));
               }
             }
             if (prefetch) {
@@ -735,9 +746,12 @@ struct Producer {
           }
 
           Mat16x32Loader const loaderK(smem.k[kBarWaiter.idxBuf], 0, idxInstKPrefetch, rB, cB);
+          // Q prefetch index: use min(2, tileNbAtomBx2-1) so BF16 (tileNbAtomBx2=2) triggers at 1,
+          // while FP8 (tileNbAtomBx2=4) still triggers at 2 for optimal overlap.
+          constexpr uint32_t qPrefetchAtomBx2_shmQ = mha::min(2u, tileNbAtomBx2 - 1);
 #pragma unroll
           for (uint32_t idxAtomBx2 = 0; idxAtomBx2 < tileNbAtomBx2; idxAtomBx2++) {
-            if (idxAtomBx2 == 2 && prefetch) {
+            if (idxAtomBx2 == qPrefetchAtomBx2_shmQ && prefetch) {
               regQBuf[idxInstKPrefetch] =
                   loadRegQCol(smem.q[idxPartPrefetch - SharedMemA::regQParts], idxInstKPrefetch);
             }
@@ -749,9 +763,9 @@ struct Producer {
             for (uint32_t i = 0; i < WarpAcc::rows; i++) {
 #pragma unroll
               for (uint32_t j = 0; j < 2; j++) {
-                mma<__nv_fp8_e4m3>(reinterpret_cast<float(&)[2][2]>(acc(i, 2 * idxAtomBx2 + j)),
-                                   reinterpret_cast<uint32_t const(&)[2][2]>(regQBuf[idxInstK][i]),
-                                   reinterpret_cast<uint32_t const(&)[2][1]>(atomBx2[2 * j]));
+                mma<MathElem>(reinterpret_cast<float(&)[2][2]>(acc(i, 2 * idxAtomBx2 + j)),
+                              reinterpret_cast<uint32_t const(&)[2][2]>(regQBuf[idxInstK][i]),
+                              reinterpret_cast<uint32_t const(&)[2][1]>(atomBx2[2 * j]));
               }
             }
             if (prefetch) {
@@ -776,34 +790,40 @@ struct Producer {
 
       auto& xBar = smem.xBars[grpIdx];
       bool const skipXBarWait = xBar.consumed.test_wait_parity(toParity<1>(grpIter));
-      // convert to fp8
-      WarpAcc const xF32Quant = xF32 * rcpXScale;
-      // 0, 1, 8, 9,  2, 3, 10, 11,  4, 5, 12, 13,  6, 7, 14, 15
-      Array2D<Array2D<uint32_t, 2, 1>, WarpAcc::rows, exactDiv(WarpAcc::cols, 2)> xF8;
+      ThrdRegRowMax rowSum;
+      if constexpr (is_fp8) {
+        WarpAcc const xF32Quant = xF32 * rcpXScale;
+        Array2D<Array2D<uint32_t, 2, 1>, WarpAcc::rows, exactDiv(WarpAcc::cols, 2)> xF8;
 #pragma unroll
-      for (uint32_t i = 0; i < WarpAcc::rows; i++) {
+        for (uint32_t i = 0; i < WarpAcc::rows; i++) {
 #pragma unroll
-        for (uint32_t m = 0; m < exactDiv(qmmaShape.m, 8); m++) {
+          for (uint32_t m = 0; m < exactDiv(kernelQmmaShape.m, 8); m++) {
 #pragma unroll
-          for (uint32_t j = 0; j < WarpAcc::cols; j += 2) {
-            auto& dst = reinterpret_cast<__nv_fp8x2_e4m3(&)[2]>(xF8(i, j / 2)(m, 0));
-            dst[0] = __nv_fp8x2_e4m3(float2{xF32Quant(i, j)(m, 0), xF32Quant(i, j)(m, 1)});
-            dst[1] = __nv_fp8x2_e4m3(float2{xF32Quant(i, j + 1)(m, 0), xF32Quant(i, j + 1)(m, 1)});
+            for (uint32_t j = 0; j < WarpAcc::cols; j += 2) {
+              auto& dst = reinterpret_cast<__nv_fp8x2_e4m3(&)[2]>(xF8(i, j / 2)(m, 0));
+              dst[0] = __nv_fp8x2_e4m3(float2{xF32Quant(i, j)(m, 0), xF32Quant(i, j)(m, 1)});
+              dst[1] =
+                  __nv_fp8x2_e4m3(float2{xF32Quant(i, j + 1)(m, 0), xF32Quant(i, j + 1)(m, 1)});
+            }
           }
         }
+        rowSum = computeRowSumFromF8 ? computeRowSumF8<warpTile.y, warpTile.x>(this_warp(), xF8)
+                                     : computeRowSumF32<warpTile.y, warpTile.x>(this_warp(), xF32);
+        if (!skipXBarWait) {
+          xBar.consumed.wait_parity(toParity<1>(grpIter));
+        }
+        storeRowMax<warpTile.y>(smem.x.rowMaxLog2e, rowMaxLog2e, tileBaseRow, lane);
+        storeRowMax<warpTile.y>(smem.x.rowSum, rowSum, tileBaseRow, lane);
+        storeOrderedXToShm(smem.x.x, xF8, tileBaseRow, lane);
+      } else {
+        rowSum = computeRowSumF32<warpTile.y, warpTile.x>(this_warp(), xF32);
+        if (!skipXBarWait) {
+          xBar.consumed.wait_parity(toParity<1>(grpIter));
+        }
+        storeRowMax<warpTile.y>(smem.x.rowMaxLog2e, rowMaxLog2e, tileBaseRow, lane);
+        storeRowMax<warpTile.y>(smem.x.rowSum, rowSum, tileBaseRow, lane);
+        storeOrderedXToShmBf16(smem.x.x, xF32, tileBaseRow, lane);
       }
-      // use tensor core to compute rowSum
-      ThrdRegRowMax const rowSum =
-          computeRowSumFromF8 ? computeRowSumF8<warpTile.y, warpTile.x>(this_warp(), xF8)
-                              : computeRowSumF32<warpTile.y, warpTile.x>(this_warp(), xF32);
-
-      // store xF8 and rowSum into L2 scratch buffer
-      if (!skipXBarWait) {
-        xBar.consumed.wait_parity(toParity<1>(grpIter));
-      }
-      storeRowMax<warpTile.y>(smem.x.rowMaxLog2e, rowMaxLog2e, tileBaseRow, lane);
-      storeRowMax<warpTile.y>(smem.x.rowSum, rowSum, tileBaseRow, lane);
-      storeOrderedXToShm(smem.x.x, xF8, tileBaseRow, lane);
       xBar.produced.arrive();
     }
   }
@@ -816,6 +836,9 @@ struct Producer {
       XBuffer& dst,
       Array2D<Array2D<uint32_t, 2, 1>, WarpAcc::rows, exactDiv(WarpAcc::cols, 2)> const& src,
       uint32_t const tileBaseRow, uint32_t const lane = laneId());
+  __device__ inline void storeOrderedXToShmBf16(XBuffer& dst, WarpAcc const& src,
+                                                uint32_t const tileBaseRow,
+                                                uint32_t const lane = laneId());
 };
 
 __device__ inline void Producer::loadK() {
@@ -962,6 +985,36 @@ __device__ inline void Producer::storeOrderedXToShm(
           prmt(i[0], i[1], PermuteOrder{0, 1, 4, 5}), prmt(i[2], i[3], PermuteOrder{0, 1, 4, 5}),
           prmt(i[0], i[1], PermuteOrder{2, 3, 6, 7}), prmt(i[2], i[3], PermuteOrder{2, 3, 6, 7})};
       *p = o;
+    }
+  }
+}
+
+__device__ inline void Producer::storeOrderedXToShmBf16(XBuffer& dst, WarpAcc const& src,
+                                                        uint32_t const tileBaseRow,
+                                                        uint32_t const lane) {
+  // Store BF16 softmax output to SMEM using direct per-element writes.
+  //
+  // WarpAcc(instM, instN)(iM, iN) = X[instM*16 + lane/4 + iM*8, instN*8 + (lane%4)*2 + iN]
+  //
+  // Each thread writes its own MMA accumulator values to the correct SMEM positions.
+  // The consumer's Mat16x32Loader + ldmatrix<false, 4> will read back in MMA A format.
+  //
+  // dst layout: XBuffer = Array2D<LdGrain, headGrpSize, tokensPerTile*sizeof(bf16)/grainBytes>
+  //   row = Q-head index, grain col = token group (8 bf16 per grain)
+  uint32_t const tRowBase = lane / 4;       // 0..7 within 16-row MMA tile
+  uint32_t const tColOff = (lane % 4) * 2;  // 0, 2, 4, 6 within 8-col MMA tile
+#pragma unroll
+  for (uint32_t instM = 0; instM < WarpAcc::rows; instM++) {
+#pragma unroll
+    for (uint32_t iM = 0; iM < 2; iM++) {
+      uint32_t const row = instM * 16 + tRowBase + iM * 8;
+#pragma unroll
+      for (uint32_t instN = 0; instN < WarpAcc::cols; instN++) {
+        __nv_bfloat16* p =
+            reinterpret_cast<__nv_bfloat16*>(&dst.template at<true>(tileBaseRow + row, instN));
+        p[tColOff] = __float2bfloat16(src(instM, instN)(iM, 0));
+        p[tColOff + 1] = __float2bfloat16(src(instM, instN)(iM, 1));
+      }
     }
   }
 }
@@ -1115,8 +1168,8 @@ __device__ inline void Consumer::compute() {
   uint2 const tileIdx = {warpIdx.y, warpIdx.x};
   uint2 const tileBase = {tileIdx.x * warpTile.x, tileIdx.y * warpTile.y};
 
-  constexpr uint32_t tileNbInstK = exactDiv(tokensPerTile, qmmaShape.k);
-  constexpr uint32_t warpTileNbAtomBx2 = exactDiv(warpTile.x, qmmaShape.n * 2);
+  constexpr uint32_t tileNbInstK = exactDiv(tokensPerTile, kernelQmmaShape.k);
+  constexpr uint32_t warpTileNbAtomBx2 = exactDiv(warpTile.x, kernelQmmaShape.n * 2);
 
   uint32_t const lane = laneId();
   uint32_t const idxHalf = lane / 16;
@@ -1195,25 +1248,56 @@ __device__ inline void Consumer::compute() {
 #pragma unroll
     for (uint32_t idxInstK = 0; idxInstK < tileNbInstK; idxInstK++) {
       Mat16x32Loader const loaderX(xBuf, tileBase.y, idxInstK, rA, cA);
-      Vec<Mat16x32, exactDiv(warpTile.y, qmmaShape.m)> const x = loaderX.loadWholeCol<warpTile.y>();
+      Vec<Mat16x32, exactDiv(warpTile.y, kernelQmmaShape.m)> const x =
+          loaderX.loadWholeCol<warpTile.y>();
       using AtomB = Vec<uint32_t, 2>;
+      if constexpr (is_bf16) {
+        // BF16: Use ldmatrix.m8n8.x2.trans.b16 for correct 16-bit element transpose.
+        // ldmatrix_16x16_trans uses .b8 which scrambles 2-byte BF16 values.
+        // x2 loads exactly 2 m8n8 matrices (16 rows) per call = 2 registers = exact MMA B operand.
+        // Row offset = kernelQmmaShape.k * idxInstK selects the 16-row slice for this K iteration.
+        // For x2, only threads 0-15 provide useful addresses; threads 16-31 are ignored but
+        // still need valid addresses, so we use lane % 16 which maps to [0,15] for all threads.
+        constexpr uint32_t nbVPartsPerWarp = exactDiv(warpTile.x, partElemsV);
+        constexpr uint32_t grainsPerVPart = exactDiv(partElemsV, grainElems);
+        uint32_t const rB_v = kernelQmmaShape.k * idxInstK + lane % 16;
 #pragma unroll
-      for (uint32_t idxAtomBx2 = 0; idxAtomBx2 < warpTileNbAtomBx2; idxAtomBx2++) {
-        auto const data = ldmatrix_16x16_trans<2>(
-            &vBuf.template at<true>(qmmaShape.k * idxInstK + rB, idxAtomBx2 + cB));
-        AtomB const v[2] = {data[0], data[2], data[1], data[3]};
+        for (uint32_t idxVPart = 0; idxVPart < nbVPartsPerWarp; idxVPart++) {
+          auto const& vPartBuf = smem.v(idxVBuf)[tileIdx.x * nbVPartsPerWarp + idxVPart];
+#pragma unroll 1
+          for (uint32_t idxGrain = 0; idxGrain < grainsPerVPart; idxGrain++) {
+            auto const vData = ldmatrix<true, 2>(&vPartBuf.template at<true>(rB_v, idxGrain + cB));
+            AtomB const v = {vData[0], vData[1]};
+            uint32_t const accCol = idxVPart * grainsPerVPart + idxGrain;
 #pragma unroll
-        for (uint32_t i = 0; i < WarpAcc::rows; i++) {
+            for (uint32_t i = 0; i < WarpAcc::rows; i++) {
+              mma<MathElem>(reinterpret_cast<float(&)[2][2]>(acc(i, accCol)),
+                            reinterpret_cast<uint32_t const(&)[2][2]>(x[i]),
+                            reinterpret_cast<uint32_t const(&)[2][1]>(v));
+            }
+          }
+        }
+      } else {
+        // FP8: Use ldmatrix_16x16_trans<2> (.m16n16.x2.trans.b8) — byte-level transpose
+        // matches FP8 element size. Interleave matrices for k=32 B operands.
 #pragma unroll
-          for (uint32_t j = 0; j < 2; j++) {
+        for (uint32_t idxAtomBx2 = 0; idxAtomBx2 < warpTileNbAtomBx2; idxAtomBx2++) {
+          auto const data = ldmatrix_16x16_trans<2>(
+              &vBuf.template at<true>(kernelQmmaShape.k * idxInstK + rB, idxAtomBx2 + cB));
+          AtomB const v[2] = {data[0], data[2], data[1], data[3]};
+#pragma unroll
+          for (uint32_t i = 0; i < WarpAcc::rows; i++) {
+#pragma unroll
+            for (uint32_t j = 0; j < 2; j++) {
 #if 1
-            mma<__nv_fp8_e4m3>(
+              mma<MathElem>(
 #else
-            mmaF8_k32_2inst(
+              mmaF8_k32_2inst(
 #endif
-                reinterpret_cast<float(&)[2][2]>(acc(i, 2 * idxAtomBx2 + j)),
-                reinterpret_cast<uint32_t const(&)[2][2]>(x[i]),
-                reinterpret_cast<uint32_t const(&)[2][1]>(v[j]));
+                  reinterpret_cast<float(&)[2][2]>(acc(i, 2 * idxAtomBx2 + j)),
+                  reinterpret_cast<uint32_t const(&)[2][2]>(x[i]),
+                  reinterpret_cast<uint32_t const(&)[2][1]>(v[j]));
+            }
           }
         }
       }
@@ -1630,7 +1714,9 @@ __launch_bounds__(32 * 4 * 3, 1) __cluster_dims__(cgaSize, 1, 1) void kernel_mha
 }
 
 __constant__ constexpr uint32_t smemSize = mha::max(sizeof(SharedMemA), sizeof(SharedMemB));
-static_assert(smemSize <= 99 * 1024, "Shared memory size exceeded");
+// BF16 with nbKBufs=2 uses ~100KB; allow up to 99KB opt-in (101376) for devices that support it.
+static constexpr uint32_t kSmemLimitBytes = is_bf16 ? 101376 : 99 * 1024;
+static_assert(smemSize <= kSmemLimitBytes, "Shared memory size exceeded");
 #endif  // is_MLA
 
 #ifndef GENERATE_CUBIN
@@ -1644,7 +1730,9 @@ CUtensorMap makeTensorMapForQ(void const* addr, CUtensorMapDataType_enum dataTyp
   uint64_t const globalStrides[] = {headBytes};
   uint32_t const boxDims[] = {partElems, headGrpSize};
   uint32_t const elemStrides[] = {1, 1};
-  auto const swizzle = CU_TENSOR_MAP_SWIZZLE_64B;
+  uint32_t const partBytes = partElems * elemBytes;
+  assert(partBytes == 128 || partBytes == 64);
+  auto const swizzle = (partBytes == 128) ? CU_TENSOR_MAP_SWIZZLE_128B : CU_TENSOR_MAP_SWIZZLE_64B;
 
   checkCu(cuTensorMapEncodeTiled(&tensorMap, dataType, 2, const_cast<void*>(addr), globalDims,
                                  globalStrides, boxDims, elemStrides, CU_TENSOR_MAP_INTERLEAVE_NONE,
@@ -1653,6 +1741,8 @@ CUtensorMap makeTensorMapForQ(void const* addr, CUtensorMapDataType_enum dataTyp
   return tensorMap;
 }
 #endif  // IS_MLA
+
+static uint32_t configureKernel();
 
 void launchMLA(
     cudaDeviceProp const& prop,
@@ -1673,13 +1763,6 @@ void launchMLA(
   if (beamWidth != 1) {
     throw std::runtime_error("not implemented");
   }
-  static uint32_t const hostSmemSize = [&]() {
-    // printf("smemSize = %u\n", smemSize);
-    uint32_t size;
-    checkCuda(cudaMemcpyFromSymbol(&size, smemSize, sizeof(smemSize)));
-    checkCuda(cudaFuncSetAttribute(kernel_mha, cudaFuncAttributeMaxDynamicSharedMemorySize, size));
-    return size;
-  }();
   uint32_t const nbKHeads = 1;
   uint32_t const nbVHeads = nbKHeads;
   uint32_t const nbQHeads = nbKHeads * headGrpSize;
@@ -1768,8 +1851,20 @@ void launchMLA(
 
 static uint32_t configureKernel() {
   uint32_t size;
-  cudaMemcpyFromSymbol(&size, smemSize, sizeof(smemSize));
-  cudaFuncSetAttribute(kernel_mha, cudaFuncAttributeMaxDynamicSharedMemorySize, size);
+  checkCuda(cudaMemcpyFromSymbol(&size, smemSize, sizeof(smemSize)));
+  int dev = 0;
+  checkCuda(cudaGetDevice(&dev));
+  int devMaxShmem = 0;
+  checkCuda(cudaDeviceGetAttribute(&devMaxShmem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
+  if (size > (uint32_t)devMaxShmem) {
+    throw std::runtime_error("XQA MLA kernel requires " + std::to_string(size) +
+                             " bytes shared memory per block, but "
+                             "device opt-in max is " +
+                             std::to_string(devMaxShmem) + ". BF16 MLA needs 128 KB (e.g. SM12x).");
+  }
+  checkCuda(cudaFuncSetAttribute(kernel_mha, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                 cudaSharedmemCarveoutMaxShared));
+  checkCuda(cudaFuncSetAttribute(kernel_mha, cudaFuncAttributeMaxDynamicSharedMemorySize, size));
   return size;
 }
 
