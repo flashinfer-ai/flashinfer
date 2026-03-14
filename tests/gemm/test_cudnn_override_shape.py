@@ -98,7 +98,7 @@ class TestCudnnBf16OverrideShape:
             graph.get_workspace_size(), dtype=torch.uint8, device=device
         )
 
-        b = torch.randn(1, k, n, dtype=in_dtype, device=device)
+        b = torch.randn(1, n, k, dtype=in_dtype, device=device).transpose(1, 2)
 
         for m in dynamic_ms:
             a = torch.randn(1, m, k, dtype=in_dtype, device=device)
