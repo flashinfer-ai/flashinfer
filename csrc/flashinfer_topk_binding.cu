@@ -18,7 +18,8 @@
 using tvm::ffi::Optional;
 
 void radix_topk(TensorView input, TensorView output_indices, TensorView output_values,
-                Optional<TensorView> maybe_row_states_buffer, int64_t top_k);
+                Optional<TensorView> maybe_row_states_buffer, int64_t top_k, int64_t sorted_output,
+                int64_t deterministic);
 
 void radix_topk_page_table_transform(TensorView input, TensorView output_page_table,
                                      TensorView src_page_table,

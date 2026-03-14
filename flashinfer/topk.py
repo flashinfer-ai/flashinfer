@@ -37,6 +37,8 @@ def get_topk_module():
         top_k: int,
         row_states_buffer: Optional[torch.Tensor],
         output_values: torch.Tensor,
+        sorted_output: bool = False,
+        deterministic: bool = False,
     ) -> torch.Tensor:
         device = input.device
         # Supports float32, float16, bfloat16
@@ -48,7 +50,13 @@ def get_topk_module():
             batch_size, top_k, dtype=torch.int32, device=device
         )
         module.radix_topk(
-            input, output_indices, output_values, row_states_buffer, top_k
+            input,
+            output_indices,
+            output_values,
+            row_states_buffer,
+            top_k,
+            sorted_output,
+            deterministic,
         )
         return output_indices
 
@@ -58,6 +66,8 @@ def get_topk_module():
         top_k: int,
         row_states_buffer: Optional[torch.Tensor],
         output_values: torch.Tensor,
+        sorted_output: bool = False,
+        deterministic: bool = False,
     ) -> torch.Tensor:
         batch_size = input.size(0)
         return torch.empty(batch_size, top_k, dtype=torch.int32, device=input.device)
@@ -157,6 +167,7 @@ def top_k(
     input: torch.Tensor,
     k: int,
     sorted: bool = False,
+    deterministic: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Radix-based Top-K selection.
 
@@ -177,6 +188,12 @@ def top_k(
     sorted : bool, optional
         If True, the returned top-k elements will be sorted in descending order.
         Default is False (unsorted, which is faster).
+    deterministic : bool, optional
+        If True, guarantees bitwise-reproducible output across calls with the
+        same input. This forces the FilteredTopK algorithm, which requires
+        ``k <= 2048`` and GPU support for 128KB shared memory. Raises
+        ``RuntimeError`` if these conditions are not met.
+        Default is False.
 
     Returns
     -------
@@ -213,6 +230,10 @@ def top_k(
     >>> values_sorted, indices_sorted = flashinfer.top_k(logits, k, sorted=True)
     >>> # Values are now in descending order within each row
 
+    Deterministic mode (bitwise-reproducible output):
+
+    >>> values, indices = flashinfer.top_k(logits, k, deterministic=True)
+
     See Also
     --------
     torch.topk : PyTorch's built-in top-k function
@@ -234,15 +255,16 @@ def top_k(
     # Allocate output_values for kernel to write directly
     output_values = torch.empty(batch_size, k, dtype=input.dtype, device=device)
 
-    # Get indices using radix-based selection
+    # For deterministic + sorted: CUDA handles combined value+index sort in one kernel.
+    sorted_cuda = sorted and deterministic
     indices_int32 = get_topk_module().radix_topk(
-        input, k, row_states_buffer, output_values
+        input, k, row_states_buffer, output_values, sorted_cuda, deterministic
     )
 
     # Convert to int64 for compatibility
     indices = indices_int32.long()
 
-    if sorted:
+    if sorted and not sorted_cuda:
         # Sort within each row by value (descending)
         sorted_values, sort_indices = torch.sort(output_values, dim=-1, descending=True)
         sorted_indices = torch.gather(indices, dim=-1, index=sort_indices)

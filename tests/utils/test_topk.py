@@ -1500,6 +1500,245 @@ def test_fp32_long_seq_pivot_rebuild_transform_regression_filtered(
     _assert_unordered_indices_match(output, ref_indices)
 
 
+def test_top_k_uint32_pointer_overflow():
+    batch_size = 32769
+    vocab_size = 131072
+    k = 256
+    device = "cuda"
+
+    required_bytes = batch_size * vocab_size * 2  # fp16
+    free_mem = torch.cuda.mem_get_info(device)[0]
+    if free_mem < int(required_bytes * 1.15):
+        pytest.skip(
+            f"Insufficient GPU memory: {free_mem / 1e9:.1f}GB free, "
+            f"need ~{required_bytes / 1e9:.1f}GB"
+        )
+
+    torch.manual_seed(42)
+    logits = torch.randn(batch_size, vocab_size, device=device, dtype=torch.float16)
+
+    values, indices = flashinfer.top_k(logits, k)
+
+    row_idx = batch_size - 1
+    gathered = torch.gather(
+        logits[row_idx : row_idx + 1], -1, indices[row_idx : row_idx + 1]
+    )
+    torch.testing.assert_close(values[row_idx : row_idx + 1], gathered)
+
+    _, ref_indices = torch.topk(logits[row_idx : row_idx + 1], k, dim=-1)
+    accuracy = compute_topk_accuracy(
+        indices[row_idx : row_idx + 1].int(), ref_indices.int(), 1, k
+    )
+    assert accuracy >= 0.98, f"Last row accuracy {accuracy:.4f} < 0.98"
+
+    del logits, values, indices
+    torch.cuda.empty_cache()
+
+
+# ===================== FilteredTopK Deterministic Tests =====================
+
+NUM_REPRODUCIBILITY_RUNS = 10
+
+
+@pytest.mark.parametrize("sorted_flag", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_filtered_topk_deterministic_reproducibility(sorted_flag, dtype, set_topk_algo):
+    """Verify FilteredTopK deterministic path produces bitwise identical output."""
+    if dtype == torch.bfloat16:
+        _require_sm80_for_bf16()
+    if not can_implement_filtered_topk():
+        pytest.skip("GPU does not support FilteredTopK (needs 128KB shared memory)")
+
+    set_topk_algo("filtered")
+    batch_size = 64
+    vocab_size = 32000
+    k = 256
+
+    torch.manual_seed(42)
+    logits = torch.randn(batch_size, vocab_size, device="cuda", dtype=dtype)
+
+    ref_values, ref_indices = flashinfer.top_k(
+        logits, k, sorted=sorted_flag, deterministic=True
+    )
+
+    for run in range(1, NUM_REPRODUCIBILITY_RUNS):
+        values, indices = flashinfer.top_k(
+            logits, k, sorted=sorted_flag, deterministic=True
+        )
+        assert torch.equal(values, ref_values), (
+            f"FilteredTopK sorted={sorted_flag}, run {run}: values differ"
+        )
+        assert torch.equal(indices, ref_indices), (
+            f"FilteredTopK sorted={sorted_flag}, run {run}: indices differ"
+        )
+
+
+@pytest.mark.parametrize("sorted_flag", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_filtered_topk_deterministic_tie_breaking(sorted_flag, dtype, set_topk_algo):
+    """Verify FilteredTopK reproducibility when many elements are tied at the pivot.
+
+    Constructs input where 31800 elements share the exact pivot value, forcing
+    the kernel to select only 56 of them. The chosen subset (and its ordering)
+    must be identical across runs.
+    """
+    if dtype == torch.bfloat16:
+        _require_sm80_for_bf16()
+    if not can_implement_filtered_topk():
+        pytest.skip("GPU does not support FilteredTopK (needs 128KB shared memory)")
+
+    set_topk_algo("filtered")
+    batch_size = 64
+    vocab_size = 32000
+    k = 256
+    num_above = 200
+
+    logits = torch.full((batch_size, vocab_size), 0.5, device="cuda", dtype=dtype)
+    logits[:, :num_above] = (
+        torch.arange(num_above, 0, -1, device="cuda", dtype=dtype)
+        .unsqueeze(0)
+        .expand(batch_size, -1)
+        + 1.0
+    )
+
+    ref_values, ref_indices = flashinfer.top_k(
+        logits, k, sorted=sorted_flag, deterministic=True
+    )
+
+    for run in range(1, NUM_REPRODUCIBILITY_RUNS):
+        values, indices = flashinfer.top_k(
+            logits, k, sorted=sorted_flag, deterministic=True
+        )
+        assert torch.equal(values, ref_values), (
+            f"FilteredTopK ties sorted={sorted_flag}, run {run}: values differ"
+        )
+        assert torch.equal(indices, ref_indices), (
+            f"FilteredTopK ties sorted={sorted_flag}, run {run}: indices differ"
+        )
+
+
+@pytest.mark.parametrize("sorted_flag", [False, True])
+@pytest.mark.parametrize("vocab_size", [32000, 128512])
+def test_filtered_topk_heavy_ties_reproducibility(
+    sorted_flag, vocab_size, set_topk_algo
+):
+    """Reproducibility with random-bucketed heavy ties (only 4 distinct values)."""
+    if not can_implement_filtered_topk():
+        pytest.skip("GPU does not support FilteredTopK (needs 128KB shared memory)")
+
+    set_topk_algo("filtered")
+    batch_size = 8
+    k = 512
+
+    values_pool = torch.tensor([1.0, 2.0, 3.0, 4.0], device="cuda")
+    torch.manual_seed(7)
+    bucket_indices = torch.randint(0, 4, (batch_size, vocab_size), device="cuda")
+    logits = values_pool[bucket_indices]
+
+    ref_values, ref_indices = flashinfer.top_k(
+        logits, k, sorted=sorted_flag, deterministic=True
+    )
+
+    for run in range(NUM_REPRODUCIBILITY_RUNS):
+        values, indices = flashinfer.top_k(
+            logits, k, sorted=sorted_flag, deterministic=True
+        )
+        assert torch.equal(values, ref_values), (
+            f"vocab={vocab_size}, sorted={sorted_flag}, run {run}: values differ"
+        )
+        assert torch.equal(indices, ref_indices), (
+            f"vocab={vocab_size}, sorted={sorted_flag}, run {run}: indices differ"
+        )
+
+
+@pytest.mark.parametrize("batch_size", [1, 16, 64])
+@pytest.mark.parametrize("vocab_size", [32000, 128512])
+@pytest.mark.parametrize("k", [256, 1024])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("sorted_flag", [False, True])
+def test_filtered_topk_deterministic_correctness(
+    batch_size, vocab_size, k, dtype, sorted_flag, set_topk_algo
+):
+    """Verify deterministic FilteredTopK produces correct top-k results.
+
+    Checks: values match gathered input, sorted order when requested,
+    accuracy >= 98% vs torch.topk, and all values truly in top-k.
+    """
+    if k > vocab_size:
+        pytest.skip("k should be less than vocab_size")
+    if dtype == torch.bfloat16:
+        _require_sm80_for_bf16()
+    if not can_implement_filtered_topk():
+        pytest.skip("GPU does not support FilteredTopK (needs 128KB shared memory)")
+
+    set_topk_algo("filtered")
+
+    torch.manual_seed(42)
+    logits = torch.randn(batch_size, vocab_size, device="cuda", dtype=dtype)
+
+    values, indices = flashinfer.top_k(
+        logits, k, sorted=sorted_flag, deterministic=True
+    )
+
+    assert values.shape == (batch_size, k)
+    assert indices.shape == (batch_size, k)
+
+    gathered_values = torch.gather(logits, dim=-1, index=indices)
+    torch.testing.assert_close(values, gathered_values)
+
+    if sorted_flag:
+        for i in range(batch_size):
+            assert torch.all(values[i, :-1] >= values[i, 1:]), (
+                f"Row {i}: values not sorted in descending order"
+            )
+
+    ref_values, ref_indices = torch.topk(logits, k, dim=-1, sorted=True)
+    accuracy = compute_topk_accuracy(indices.int(), ref_indices.int(), batch_size, k)
+    assert accuracy >= 0.98, f"Accuracy {accuracy:.4f} < 0.98"
+
+    assert verify_topk_correctness(logits, values, indices, k), (
+        "Some returned values are not truly in the top-k"
+    )
+
+
+@pytest.mark.parametrize("sorted_flag", [False, True])
+def test_filtered_topk_deterministic_k_equals_vocab(sorted_flag):
+    """Deterministic top_k when k == vocab_size."""
+    batch_size = 4
+    vocab_size = 512
+    k = vocab_size
+
+    torch.manual_seed(42)
+    logits = torch.randn(batch_size, vocab_size, device="cuda", dtype=torch.float32)
+
+    ref_values, ref_indices = flashinfer.top_k(
+        logits, k, sorted=sorted_flag, deterministic=True
+    )
+
+    assert ref_values.shape == (batch_size, k)
+    assert ref_indices.shape == (batch_size, k)
+
+    gathered = torch.gather(logits, dim=-1, index=ref_indices)
+    torch.testing.assert_close(ref_values, gathered)
+
+    for run in range(NUM_REPRODUCIBILITY_RUNS):
+        values, indices = flashinfer.top_k(
+            logits, k, sorted=sorted_flag, deterministic=True
+        )
+        assert torch.equal(values, ref_values), (
+            f"k==vocab sorted={sorted_flag}, run {run}: values differ"
+        )
+        assert torch.equal(indices, ref_indices), (
+            f"k==vocab sorted={sorted_flag}, run {run}: indices differ"
+        )
+
+    if sorted_flag:
+        for i in range(batch_size):
+            assert torch.all(ref_values[i, :-1] >= ref_values[i, 1:]), (
+                f"Row {i}: values not sorted in descending order"
+            )
+
+
 if __name__ == "__main__":
     # Basic tests
     test_top_k(4, 32000, 256, torch.float32)
