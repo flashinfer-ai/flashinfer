@@ -60,13 +60,14 @@ struct Sm100FmhaMlaReductionKernel {
     int* ptr_seq = nullptr;
     int* ptr_split_kv = nullptr;
     int tile_shape_s = 128;
+    ElementAcc output_scale = 1.0f;
   };
   using Params = Arguments;
 
   static Params to_underlying_arguments(Arguments const& args, void* workspace) {
     return {args.ptr_oaccum, args.ptr_o,        args.ptr_lseaccum, args.ptr_lse,
             args.scale,      args.num_batches,  args.split_kv,     args.dim_k,
-            args.ptr_seq,    args.ptr_split_kv, args.tile_shape_s};
+            args.ptr_seq,    args.ptr_split_kv, args.tile_shape_s, args.output_scale};
   }
 
   static size_t get_workspace_size(Arguments const& /*args*/) { return 0; }
@@ -187,7 +188,8 @@ struct Sm100FmhaMlaReductionKernel {
 
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < Elements; ++i) {
-      gO(threadIdx.x + MaxThreadsPerBlock * i) = static_cast<ElementOut>(local_val[i]);
+      gO(threadIdx.x + MaxThreadsPerBlock * i) =
+          static_cast<ElementOut>(local_val[i] * params.output_scale);
     }
   }
 };
