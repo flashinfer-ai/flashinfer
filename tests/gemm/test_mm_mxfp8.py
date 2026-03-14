@@ -207,6 +207,34 @@ def test_mm_mxfp8_small_m(m, n, k):
     )
 
 
+def test_mm_mxfp8_cudnn_swizzled_single_gemm():
+    _run_mm_mxfp8(
+        320,
+        384,
+        224,
+        torch.bfloat16,
+        True,  # cuDNN path currently requires swizzled 1D scales
+        torch.bfloat16,
+        "cudnn",
+        auto_tuning=False,
+        provide_out=True,
+    )
+
+
+def test_mm_mxfp8_auto_swizzled_single_gemm():
+    _run_mm_mxfp8(
+        384,
+        512,
+        256,
+        torch.bfloat16,
+        True,  # auto path should select a supported swizzled-scale backend
+        torch.bfloat16,
+        "auto",
+        auto_tuning=False,
+        provide_out=True,
+    )
+
+
 def test_mm_mxfp8_invalid_input_dtype():
     _skip_if_unsupported()
     m, n, k = 128, 128, 128
