@@ -327,6 +327,85 @@ def _fake_rope_quantize_fp8_append_paged_kv_cache(
 
 
 @register_custom_op(
+    "flashinfer::rope_append_paged_kv_cache",
+    mutates_args=("q_rope_out", "q_nope_out", "k_cache", "v_cache"),
+)
+def _rope_append_paged_kv_cache(
+    q_rope_in: torch.Tensor,
+    k_rope_in: torch.Tensor,
+    q_nope_in: torch.Tensor,
+    k_nope_in: torch.Tensor,
+    v_in: torch.Tensor,
+    q_rope_out: torch.Tensor,
+    q_nope_out: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    pos_ids: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_last_page_len: torch.Tensor,
+    batch_indices: torch.Tensor,
+    positions: torch.Tensor,
+    kv_layout_code: int,
+    page_size: int,
+    kv_scale: float,
+    interleave: bool,
+    enable_pdl: bool,
+) -> None:
+    get_rope_module().rope_append_paged_kv_cache(
+        q_rope_in,
+        k_rope_in,
+        q_nope_in,
+        k_nope_in,
+        v_in,
+        q_rope_out,
+        q_nope_out,
+        cos_sin_cache,
+        pos_ids,
+        k_cache,
+        v_cache,
+        kv_indices,
+        kv_indptr,
+        kv_last_page_len,
+        batch_indices,
+        positions,
+        kv_layout_code,
+        page_size,
+        kv_scale,
+        interleave,
+        enable_pdl,
+    )
+
+
+@register_fake_op("flashinfer::rope_append_paged_kv_cache")
+def _fake_rope_append_paged_kv_cache(
+    q_rope_in: torch.Tensor,
+    k_rope_in: torch.Tensor,
+    q_nope_in: torch.Tensor,
+    k_nope_in: torch.Tensor,
+    v_in: torch.Tensor,
+    q_rope_out: torch.Tensor,
+    q_nope_out: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    pos_ids: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_last_page_len: torch.Tensor,
+    batch_indices: torch.Tensor,
+    positions: torch.Tensor,
+    kv_layout_code: int,
+    page_size: int,
+    kv_scale: float,
+    interleave: bool,
+    enable_pdl: bool,
+) -> None:
+    pass
+
+
+@register_custom_op(
     "flashinfer::apply_rope_pos_ids_cos_sin_cache", mutates_args=("q_rope", "k_rope")
 )
 def _apply_rope_pos_ids_cos_sin_cache(
@@ -1670,6 +1749,101 @@ def rope_quantize_fp8_append_paged_kv_cache(
         quant_scale_q,
         quant_scale_kv,
         not is_neox,  # interleave
+        enable_pdl,
+    )
+
+    return q_rope_out, q_nope_out
+
+
+@flashinfer_api
+def rope_append_paged_kv_cache(
+    q_rope: torch.Tensor,
+    k_rope: torch.Tensor,
+    q_nope: Optional[torch.Tensor],
+    k_nope: Optional[torch.Tensor],
+    v: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    pos_ids: torch.Tensor,
+    paged_kv_cache: Tuple[torch.Tensor, torch.Tensor],
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_last_page_len: torch.Tensor,
+    batch_indices: torch.Tensor,
+    positions: torch.Tensor,
+    is_neox: bool = True,
+    kv_scale: float = 1.0,
+    page_size: int = 16,
+    kv_layout: str = "NHD",
+    q_rope_out: Optional[torch.Tensor] = None,
+    q_nope_out: Optional[torch.Tensor] = None,
+    enable_pdl: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Apply RoPE to Q/K and append K/V to paged KV cache.
+
+    This primitive keeps query outputs in the input dtype and only uses
+    ``kv_scale`` for cache-side casting when the cache dtype is FP8.
+    """
+    if cos_sin_cache.dtype != torch.float32:
+        raise ValueError("cos_sin_cache should be float32")
+    if k_rope.ndim != 3:
+        raise ValueError("rope_append_paged_kv_cache only supports GQA/MHA inputs")
+
+    nnz = q_rope.shape[0]
+    num_qo_heads = q_rope.shape[1]
+    num_kv_heads = k_rope.shape[1]
+
+    if q_nope is None:
+        q_nope = torch.empty(
+            nnz, num_qo_heads, 0, dtype=q_rope.dtype, device=q_rope.device
+        )
+    if k_nope is None:
+        k_nope = torch.empty(
+            nnz, num_kv_heads, 0, dtype=k_rope.dtype, device=k_rope.device
+        )
+
+    if q_rope_out is None:
+        q_rope_out = torch.empty_like(q_rope)
+    if q_nope_out is None:
+        q_nope_out = torch.empty_like(q_nope)
+
+    if len(paged_kv_cache) != 2:
+        raise ValueError("paged_kv_cache must be a tuple of (k_cache, v_cache)")
+    k_cache, v_cache = paged_kv_cache
+    if k_cache.ndim != 4 or v_cache.ndim != 4:
+        raise ValueError("rope_append_paged_kv_cache expects 4D GQA/MHA cache tensors")
+    if k_cache.dtype != v_cache.dtype:
+        raise ValueError("k_cache and v_cache must have the same dtype")
+
+    from .utils import TensorLayout
+
+    kv_layout_code = TensorLayout[kv_layout].value
+    batch_indices = batch_indices.int()
+    positions = positions.int()
+    kv_indices = kv_indices.int()
+    kv_indptr = kv_indptr.int()
+    kv_last_page_len = kv_last_page_len.int()
+
+    _rope_append_paged_kv_cache(
+        q_rope,
+        k_rope,
+        q_nope,
+        k_nope,
+        v,
+        q_rope_out,
+        q_nope_out,
+        cos_sin_cache,
+        pos_ids,
+        k_cache,
+        v_cache,
+        kv_indices,
+        kv_indptr,
+        kv_last_page_len,
+        batch_indices,
+        positions,
+        kv_layout_code,
+        page_size,
+        kv_scale,
+        not is_neox,
         enable_pdl,
     )
 
