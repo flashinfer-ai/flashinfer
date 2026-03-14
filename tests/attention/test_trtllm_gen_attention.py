@@ -15,6 +15,7 @@ from tests.test_helpers.utils_fp4 import (
 from tests.test_helpers.test_helpers import assert_close_with_mismatch_tolerance
 import einops
 from tests.test_helpers.sink_attention_reference import sink_attention_unified
+from flashinfer.fp4_quantization import nvfp4_quantize_paged_kv_cache
 
 import flashinfer
 from flashinfer.utils import FP4Tensor, ceil_div, round_up, get_compute_capability
@@ -122,9 +123,9 @@ def create_kv_cache(
     num_pages_per_seq = (max_seq_len + page_size - 1) // page_size
     num_pages = num_pages_per_seq * batch_size
     ref_kv_dtype_torch = DTYPE_MAP[ref_kv_dtype]
-    if kv_dtype != "fp8":  # for fp8, create with high precision to generate scale.
+    if kv_dtype not in ("fp8", "nvfp4"):
         assert kv_dtype == ref_kv_dtype, (
-            "kv_dtype and ref_kv_dtype must be the same for non-fp8 kv_cache"
+            "kv_dtype and ref_kv_dtype must be the same for non-fp8/nvfp4 kv_cache"
         )
 
     # Create cache with appropriate layout
@@ -165,6 +166,8 @@ def create_kv_cache(
             device=GPU_DEVICE,
         )
 
+    kv_block_scales = None
+
     # Convert K and V separately to fp8 if needed
     if kv_dtype == "fp8":
         k_cache, k_scale = to_float8(k_cache)
@@ -177,13 +180,19 @@ def create_kv_cache(
             ],
             dim=1,
         )
+        kv_cache = torch.stack([k_cache, v_cache], dim=1)
+    elif kv_dtype == "nvfp4":
+        # Reference is the unquantized BF16 data
+        ref_kv_cache = torch.stack([k_cache, v_cache], dim=1)
+        kv_cache, kv_block_scales, k_scale, v_scale = nvfp4_quantize_paged_kv_cache(
+            k_cache, v_cache, kv_layout=kv_layout
+        )
     else:
         k_scale = v_scale = 1.0
         ref_kv_cache = torch.stack([k_cache, v_cache], dim=1)
-    # Combine K and V into interleaved format for the API
-    kv_cache = torch.stack([k_cache, v_cache], dim=1)
+        kv_cache = torch.stack([k_cache, v_cache], dim=1)
 
-    return kv_cache, k_scale, v_scale, ref_kv_cache
+    return kv_cache, k_scale, v_scale, ref_kv_cache, kv_block_scales
 
 
 def create_page_table(batch_size: int, seq_lens: torch.Tensor, page_size: int):
@@ -446,6 +455,13 @@ def _test_trtllm_batch_prefill(
             "skips_softmax does not currently support Q and Kv types being different"
         )
 
+    # NVFP4 KV cache constraints
+    if kv_dtype == "nvfp4":
+        if q_dtype != "fp8":
+            pytest.skip("NVFP4 KV cache requires FP8 query")
+        if o_dtype != "fp8":
+            pytest.skip("NVFP4 KV cache only supports FP8 output")
+
     # Set up test parameters
     torch.manual_seed(0)
 
@@ -458,14 +474,14 @@ def _test_trtllm_batch_prefill(
     q_indptr = generate_cumsum_lens(q_lens)
 
     # Create KV cache and related data
-    kv_cache, k_scale, v_scale, ref_kv_cache = create_kv_cache(
+    kv_cache, k_scale, v_scale, ref_kv_cache, kv_block_scales = create_kv_cache(
         batch_size,
         seq_lens,
         page_size,
         num_kv_heads,
         head_dim,
         kv_dtype,
-        "bf16" if q_dtype == "fp8" else q_dtype,
+        "bf16" if q_dtype == "fp8" or kv_dtype == "nvfp4" else q_dtype,
         kv_layout,
     )
     page_table, all_page_ids, page_per_seq = create_page_table(
@@ -580,6 +596,7 @@ def _test_trtllm_batch_prefill(
         kv_layout=kv_layout,
         enable_pdl=enable_pdl,
         sinks=(sink if enable_sink else None),
+        kv_block_scales=kv_block_scales,
         skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
     )
     # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
@@ -599,8 +616,12 @@ def _test_trtllm_batch_prefill(
     else:
         rtol, atol = 1e-2, 1e-2
 
+    # NVFP4 KV cache has significant quantization error
+    if kv_dtype == "nvfp4":
+        rtol, atol = 3e-1, 3e-1
+
     # Arbitary small mismatch rate
-    allowed_mismatch_rate = 1e-7
+    allowed_mismatch_rate = 0.03 if kv_dtype == "nvfp4" else 1e-7
     # Calculate max allowed mismatched elements based on tensor size
     total_elements = (output.float() * o_scale).numel()
     max_mismatched_elements = int(allowed_mismatch_rate * total_elements)
@@ -614,7 +635,9 @@ def _test_trtllm_batch_prefill(
         max_mismatched_elements=max_mismatched_elements,
     )
 
-    if o_dtype != "nvfp4":  # wrapper api does not support fp4 output yet.
+    if (
+        o_dtype != "nvfp4" and kv_dtype != "nvfp4"
+    ):  # wrapper api does not support fp4 output/kv yet.
         # test wrapper with trtllm-gen backend
         wrapper_trtllm_gen = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
             workspace_buffer, kv_layout, backend="trtllm-gen"
@@ -669,6 +692,7 @@ def _test_trtllm_batch_prefill(
         ("fp8", "fp8", "fp16"),
         ("fp8", "fp8", "fp8"),
         ("fp8", "fp8", "nvfp4"),
+        ("fp8", "nvfp4", "fp8"),
     ],
 )
 @pytest.mark.parametrize("enable_pdl", [None])
@@ -710,7 +734,7 @@ def test_trtllm_batch_prefill(
         enable_sink,
         max_q_len,
         max_kv_len,
-        kv_dtype == "fp8",
+        kv_dtype in ("fp8", "nvfp4"),
         head_dim,
         non_contiguous_query=non_contiguous_query,
         skips_softmax=skips_softmax,
@@ -835,6 +859,16 @@ def _test_trtllm_batch_decode(
     if backend == "trtllm-gen" and o_dtype == "fp8" and q_dtype != "fp8":
         pytest.skip("trtllm-gen backend only supports fp8 output for fp8 query")
 
+    # NVFP4 KV cache constraints
+    if kv_dtype == "nvfp4":
+        if backend != "trtllm-gen":
+            pytest.skip("NVFP4 KV cache only supported by trtllm-gen backend")
+        if q_dtype != "fp8":
+            pytest.skip("NVFP4 KV cache requires FP8 query")
+        if o_dtype != "fp8":
+            pytest.skip("NVFP4 KV cache only supports FP8 output")
+        pass
+
     # Set up test parameters
     torch.manual_seed(0)
 
@@ -849,14 +883,14 @@ def _test_trtllm_batch_decode(
     q_indptr = generate_cumsum_lens(q_lens)
 
     # Create KV cache and related data
-    kv_cache, k_scale, v_scale, ref_kv_cache = create_kv_cache(
+    kv_cache, k_scale, v_scale, ref_kv_cache, kv_block_scales = create_kv_cache(
         batch_size,
         seq_lens,
         page_size,
         num_kv_heads,
         head_dim,
         kv_dtype,
-        "bf16" if q_dtype == "fp8" else q_dtype,
+        "bf16" if q_dtype == "fp8" or kv_dtype == "nvfp4" else q_dtype,
         kv_layout,
     )
     page_table, all_page_ids, page_per_seq = create_page_table(
@@ -998,6 +1032,7 @@ def _test_trtllm_batch_decode(
         max_q_len=max_q_len if max_q_len is not None else None,
         cum_seq_lens_q=q_indptr if max_q_len is not None else None,
         skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+        kv_block_scales=kv_block_scales,
     )
     if backend == "trtllm-gen":
         # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
@@ -1021,13 +1056,17 @@ def _test_trtllm_batch_decode(
         atol = 1e-1
         rtol = 1e-1
 
+    # NVFP4 KV cache has significant quantization error
+    if kv_dtype == "nvfp4":
+        rtol, atol = 3e-1, 3e-1
+
     # convert to float32 for fp8 is not supported by assert_close
     # relax rtol and atol for speculative decoding test
     if (q_len_per_req and q_len_per_req > 1) or (max_q_len and max_q_len > 1):
         rtol, atol = rtol * 2, atol * 2
 
     # Arbitary small mismatch rate
-    allowed_mismatch_rate = 5e-5
+    allowed_mismatch_rate = 0.03 if kv_dtype == "nvfp4" else 5e-5
     # Calculate max allowed mismatched elements based on tensor size
     total_elements = (output.float() * o_scale).numel()
     max_mismatched_elements = int(allowed_mismatch_rate * total_elements)
@@ -1043,10 +1082,11 @@ def _test_trtllm_batch_decode(
     # Only test wrapper with trtllm-gen backend
     if (
         o_dtype != "nvfp4"
+        and kv_dtype != "nvfp4"
         and backend == "trtllm-gen"
         and q_len_per_req
         is not None  # only test for the case all requests have the same q_len
-    ):  # wrapper api does not support fp4 output yet.
+    ):  # wrapper api does not support fp4 output/kv yet.
         # test wrapper with trtllm-gen backend
         wrapper_trtllm_gen = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
             workspace_buffer, kv_layout, backend="trtllm-gen"
@@ -1136,6 +1176,7 @@ def _test_trtllm_batch_decode(
         ("fp8", "fp8", "fp16"),
         ("fp8", "fp8", "fp8"),
         ("fp8", "fp8", "nvfp4"),
+        ("fp8", "nvfp4", "fp8"),
     ],
 )
 @pytest.mark.parametrize("enable_pdl", [True, False, None])
@@ -1184,7 +1225,7 @@ def test_trtllm_batch_decode(
         enable_sink,
         max_in_kv_len,
         head_dim,
-        kv_dtype == "fp8",
+        kv_dtype in ("fp8", "nvfp4"),
         non_contiguous_query=non_contiguous_query,
         skips_softmax=skips_softmax,
     )
@@ -1274,6 +1315,7 @@ def test_trtllm_batch_decode_bs1(
         ("fp8", "fp8", "fp16"),
         ("fp8", "fp8", "fp8"),
         ("fp8", "fp8", "nvfp4"),
+        ("fp8", "nvfp4", "fp8"),
     ],
 )
 @pytest.mark.parametrize("enable_pdl", [None])
