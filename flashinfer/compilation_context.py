@@ -30,20 +30,56 @@ class CompilationContext:
         "-DFLASHINFER_ENABLE_FP4_E2M1",
     ]
 
+    @staticmethod
+    def _normalize_cuda_arch(major: int, minor: int) -> tuple[int, str]:
+        """Normalize a (major, minor) capability pair into a (major, minor_str)
+        tuple with the correct architecture suffix for nvcc.
+
+        SM 9.x  -> 'a' suffix (e.g. compute_90a)
+        SM 12.x -> always normalized to SM 120 with 'f' suffix (e.g. compute_120f)
+                    when the installed CUDA toolchain supports it (CUDA >= 13.0),
+                    otherwise 'a'.  This covers both SM 12.0 and SM 12.1 (DGX Spark).
+        SM 10+  -> 'a' suffix (e.g. compute_100a)
+        SM < 9  -> no suffix
+        """
+        if major == 9:
+            return (major, str(minor) + "a")
+        elif major == 12:
+            try:
+                from flashinfer.jit.cpp_ext import is_cuda_version_at_least
+                if is_cuda_version_at_least("13.0"):
+                    return (major, "0f")
+            except (ImportError, RuntimeError, ValueError):
+                logger.debug(
+                    "Could not determine CUDA version; "
+                    "falling back to 'a' suffix for SM %d.%d", major, minor
+                )
+            return (major, "0a")
+        elif major >= 10:
+            return (major, str(minor) + "a")
+        return (major, str(minor))
+
     def __init__(self):
         self.TARGET_CUDA_ARCHS = set()
         if "FLASHINFER_CUDA_ARCH_LIST" in os.environ:
             for arch in os.environ["FLASHINFER_CUDA_ARCH_LIST"].split(" "):
                 major, minor = arch.split(".")
                 major = int(major)
-                self.TARGET_CUDA_ARCHS.add((int(major), str(minor)))
+                # If the user already provided a suffix (e.g. "12.0f"),
+                # respect it as-is; otherwise normalise.
+                if minor[-1].isalpha():
+                    self.TARGET_CUDA_ARCHS.add((major, minor))
+                else:
+                    self.TARGET_CUDA_ARCHS.add(
+                        self._normalize_cuda_arch(major, int(minor))
+                    )
         else:
             try:
                 for device in range(torch.cuda.device_count()):
                     major, minor = torch.cuda.get_device_capability(device)
-                    if major >= 9:
-                        minor = str(minor) + "a"
-                    self.TARGET_CUDA_ARCHS.add((int(major), str(minor)))
+                    self.TARGET_CUDA_ARCHS.add(
+                        self._normalize_cuda_arch(major, minor)
+                    )
             except Exception as e:
                 logger.warning(f"Failed to get device capability: {e}.")
 
