@@ -2904,13 +2904,30 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 logits_soft_cap > 0,  # use_logits_soft_cap
                 use_fp16_qk_reduction,
             )
+            # cute_dsl limitations: no GQA, no CUDA graphs, and seqlen_q must equal
+            # seqlen_k per sequence (full prefill only, not append/chunked).
+            if self._backend == "cute_dsl" and (
+                num_qo_heads != num_kv_heads
+                or self.is_cuda_graph_enabled
+                or not torch.equal(
+                    qo_indptr_host[1:] - qo_indptr_host[:-1],
+                    kv_indptr_host[1:] - kv_indptr_host[:-1],
+                )
+            ):
+                self._backend = "fa2"
+
+            if self._backend == "cute_dsl":
+                # Cache CPU indptrs to avoid GPU→CPU sync on every run() call
+                self._qo_indptr_cpu = qo_indptr_host
+                self._kv_indptr_cpu = kv_indptr_host
+
             if self._backend == "cutlass":
                 # insert qo_indptr.device to 9th position (0-indexed) of get_module_args
                 new_get_module_args = (
                     get_module_args[:9] + (qo_indptr.device,) + get_module_args[9:]
                 )
                 self._cached_module = get_fmha_module(*new_get_module_args)
-            elif self._backend != "cudnn":
+            elif self._backend not in ("cudnn", "cute_dsl"):
                 self._cached_module = get_batch_prefill_module(
                     self._backend, *get_module_args
                 )
@@ -2920,7 +2937,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._cached_module, qo_indptr, kv_indptr, num_qo_heads, causal
             )
             self._max_qo_len = torch.max(qo_indptr[1:] - qo_indptr[:-1]).item()
-        elif self._backend != "cudnn":
+        elif self._backend not in ("cudnn", "cute_dsl"):
             assert self._cached_module is not None, "cached module is not initialized"
             args = [
                 self._float_workspace_buffer,
@@ -3109,7 +3126,32 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 q.device,
                 "out",
             )
-        if self._backend == "cutlass":
+        if self._backend == "cute_dsl":
+            from .cute_dsl_attention import cute_dsl_prefill_sm120
+
+            if return_lse:
+                raise NotImplementedError(
+                    "return_lse is not supported with the cute_dsl backend. "
+                    "The underlying CuTe DSL kernel does not compute log-sum-exp."
+                )
+
+            # cute_dsl expects dense (batch, seqlen, nheads, head_dim) tensors.
+            # Convert from the ragged flat format by slicing each sequence.
+            # Use cached CPU indptrs from plan() to avoid GPU→CPU sync per run().
+            qo_indptr_cpu = self._qo_indptr_cpu
+            kv_indptr_cpu = self._kv_indptr_cpu
+            batch_size = qo_indptr_cpu.numel() - 1
+            for i in range(batch_size):
+                q_i = q[qo_indptr_cpu[i] : qo_indptr_cpu[i + 1]].unsqueeze(0)
+                k_i = k[kv_indptr_cpu[i] : kv_indptr_cpu[i + 1]].unsqueeze(0)
+                v_i = v[kv_indptr_cpu[i] : kv_indptr_cpu[i + 1]].unsqueeze(0)
+                out_slice = out[qo_indptr_cpu[i] : qo_indptr_cpu[i + 1]]
+                out_i = cute_dsl_prefill_sm120(
+                    q_i, k_i, v_i, causal=self._causal, sm_scale=sm_scale
+                ).squeeze(0)
+                out_slice.copy_(out_i)
+            return (out, lse) if return_lse else out
+        elif self._backend == "cutlass":
             out, lse = fmha_varlen(
                 q,
                 k,
