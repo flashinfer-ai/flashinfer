@@ -810,9 +810,21 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
         else:
             act_type, weight_type = dtype, dtype
 
-        # For mixed FP8xFP4 on SM120/SM121, emit 128x128x128 and K=64 shapes
+        # SM120 supported shapes for block-scaled paths
+        _sm120_supported_shapes = {
+            (128, 128, 128), (128, 128, 64),
+            (128, 256, 64), (256, 128, 64),
+        }
+
+        # For mixed FP8xFP4 on SM120/SM121, only emit shapes that fit in 99KB SMEM
         if act_type == DataType.e4m3 and weight_type == e2m1:
-            if cta_shape_mnk not in ([128, 128, 128], [128, 128, 64], [128, 256, 64], [256, 128, 64]):
+            if tuple(cta_shape_mnk) not in _sm120_supported_shapes:
+                continue
+
+        # For e2m1-only (FP4xFP4), apply the same shape filter to avoid
+        # compiling kernels that overflow SMEM or lack dispatch SHAPE_CASEs
+        if act_type == e2m1 and weight_type == e2m1:
+            if tuple(cta_shape_mnk) not in _sm120_supported_shapes:
                 continue
 
         otypes = [act_type]
