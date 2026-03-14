@@ -31,8 +31,6 @@ using namespace flashinfer;
                                    SCALE_GRANULARITY_M, SCALE_GRANULARITY_N, SCALE_GRANULARITY_K, \
                                    ...)                                                           \
   [&]() -> bool {                                                                                 \
-    /* SM120/SM121 Cooperative schedule uses 128x128x128 tile shape */                            \
-    /* TODO (yongwww): PingPong schedule (64x128x128) will need additional dispatch logic */      \
     constexpr int SCALE_GRANULARITY_K = 128;                                                      \
     if (scale_granularity_k != 128) {                                                             \
       TVM_FFI_ICHECK(false)                                                                       \
@@ -41,7 +39,6 @@ using namespace flashinfer;
              "equal tile shape K dimension (128 for both Cooperative and PingPong schedules).";   \
       return false;                                                                               \
     }                                                                                             \
-    /* Support (1,128,128) and (128,128,128) as per SM100's approach */                           \
     if (scale_granularity_m == 1 && scale_granularity_n == 128) {                                 \
       constexpr int SCALE_GRANULARITY_M = 1;                                                      \
       constexpr int SCALE_GRANULARITY_N = 128;                                                    \
