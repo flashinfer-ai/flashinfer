@@ -464,11 +464,13 @@ def get_sampling_module():
 
     # torch library for top_p_renorm_probs
 
-    @register_custom_op("flashinfer::top_p_renorm_probs", mutates_args=())
+    @register_custom_op("flashinfer::top_p_renorm_probs", mutates_args=("workspace",))
     def top_p_renorm_probs(
         probs: torch.Tensor,
         maybe_top_p_arr: Optional[torch.Tensor],
         top_p_val: float,
+        is_deterministic: bool,
+        workspace: torch.Tensor,
     ) -> torch.Tensor:
         probs = probs.float()
         maybe_top_p_arr = (
@@ -480,6 +482,8 @@ def get_sampling_module():
             renorm_probs,
             maybe_top_p_arr,
             top_p_val,
+            is_deterministic,
+            workspace,
         )
         return renorm_probs
 
@@ -488,6 +492,8 @@ def get_sampling_module():
         probs: torch.Tensor,
         maybe_top_p_arr: Optional[torch.Tensor],
         top_p_val: float,
+        is_deterministic: bool,
+        workspace: torch.Tensor,
     ) -> torch.Tensor:
         return torch.empty_like(probs)
 
@@ -1568,8 +1574,11 @@ def top_k_top_p_sampling_from_probs(
 def top_p_renorm_probs(
     probs: torch.Tensor,
     top_p: Union[torch.Tensor, float],
+    is_deterministic: bool = False,
 ) -> torch.Tensor:
     r"""Fused GPU kernel for renormalizing probabilities by top-p thresholding.
+
+    Uses AIR Top-P algorithm (radix-based) for efficient threshold finding.
 
     Parameters
     ----------
@@ -1582,6 +1591,9 @@ def top_p_renorm_probs(
         If a tensor, each request has its own threshold.
         We mask out the probabilities less than `threshold` where the cumulative sum
         of ``probs[probs >= threshold]`` is `top_p`, and renormalize the probabilities.
+    is_deterministic: bool
+        If True, use deterministic integer accumulation for reproducible results. Will affect performance.
+        Default is False.
 
     Returns
     -------
@@ -1622,8 +1634,25 @@ def top_p_renorm_probs(
     sampling_from_probs
     top_k_renorm_probs
     """
+    batch_size = probs.size(0)
+    vocab_size = probs.size(1)
+    # Workspace size for AIR Top-P radix algorithm.
+    # Must match GetAirTopPRenormWorkspaceSize in air_top_p.cuh.
+    align256 = lambda x: ((x + 255) // 256) * 256
+    counter_size = 384  # sizeof(Counter<float>) with alignas(128) members
+    # buf_len = alignTo(vocab_size / (ratio * 8), 256), ratio = 4 for float32
+    buf_len = max(align256(vocab_size // 32), 256)
+    hist_entry_size = 8 if is_deterministic else 4  # uint64 vs float
+    ws_size = (
+        align256(counter_size * batch_size)  # counters
+        + align256(hist_entry_size * 2048 * batch_size)  # histogram
+        + align256(4 * 2048 * batch_size)  # countHistogram
+        + align256(4 * buf_len * batch_size)  # buf1
+        + align256(4 * buf_len * batch_size)  # buf2
+    )
+    workspace = torch.empty(ws_size, dtype=torch.uint8, device=probs.device)
     return get_sampling_module().top_p_renorm_probs(
-        probs, *_to_tensor_scalar_tuple(top_p)
+        probs, *_to_tensor_scalar_tuple(top_p), is_deterministic, workspace
     )
 
 

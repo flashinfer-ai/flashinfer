@@ -448,6 +448,36 @@ def test_top_p_renorm_probs(batch_size, vocab_size, p):
     )
 
 
+@pytest.mark.parametrize("batch_size", [4, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+def test_top_p_renorm_probs_per_request(batch_size, vocab_size):
+    torch.manual_seed(42)
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
+    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+
+    # Per-request top_p values varying across the batch
+    top_p_arr = torch.linspace(0.1, 0.9, batch_size, device="cuda:0")
+
+    # Compute ground truth per row
+    sorted_prob, indices = torch.sort(normalized_prob, descending=False)
+    cdf = torch.cumsum(sorted_prob, dim=-1)
+    mask = torch.zeros(batch_size, vocab_size, dtype=torch.int32, device="cuda:0")
+    mask.scatter_add_(1, indices, (cdf >= (1 - top_p_arr.unsqueeze(1))).int())
+    renorm_prob_ground_truth = normalized_prob.clone()
+    renorm_prob_ground_truth[mask == 0] = 0
+    renorm_prob_ground_truth = renorm_prob_ground_truth / renorm_prob_ground_truth.sum(
+        dim=-1, keepdim=True
+    )
+
+    renorm_prob = flashinfer.sampling.top_p_renorm_probs(normalized_prob, top_p_arr)
+    torch.testing.assert_close(
+        renorm_prob_ground_truth,
+        renorm_prob,
+        rtol=1e-3,
+        atol=1e-3,
+    )
+
+
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("k", [10, 100, 500])
