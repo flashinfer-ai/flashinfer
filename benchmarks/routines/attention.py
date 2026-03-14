@@ -753,7 +753,6 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 False,
                 median_time,
             )
-            bw_kv_dtype = kv_dtype
             tb_per_sec = attention_tb_per_sec_with_actual_seq_lens(
                 actual_seq_lens_q_flat,
                 actual_seq_lens_kv_flat,
@@ -763,7 +762,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 num_kv_heads,
                 median_time,
                 q_dtype=q_dtype,
-                kv_dtype=bw_kv_dtype,
+                kv_dtype=kv_dtype,
                 o_dtype=q_dtype,
             )
             resolved_backend = resolved_backends.get(backend, backend)
