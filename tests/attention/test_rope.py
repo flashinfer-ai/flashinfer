@@ -19,6 +19,11 @@ import torch
 from tests.test_helpers.rope_reference import *
 
 import flashinfer
+from flashinfer.utils import (
+    get_compute_capability,
+    is_sm90a_supported,
+    is_sm100a_supported,
+)
 
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
@@ -1411,6 +1416,15 @@ def test_rope_append_paged_kv_cache_decode(
 ):
     """Test the non-quant fused paged decode append path."""
     device = "cuda:0"
+    if use_fp8_cache:
+        device_obj = torch.device(device)
+        cc = get_compute_capability(device_obj)
+        if cc[0] < 9:
+            pytest.skip(
+                f"FP8 KV cache requires SM90+ or SM100+, but got SM{cc[0]}{cc[1]}"
+            )
+        if not is_sm90a_supported(device_obj) and not is_sm100a_supported(device_obj):
+            pytest.skip("FP8 KV cache requires SM90a or SM100a support on this device")
     torch.manual_seed(43)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(43)
