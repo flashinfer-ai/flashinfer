@@ -2960,7 +2960,8 @@ def execute_cudnn_gemm_bf16_graph(graph, a, b, c_final, workspace, tactic: int =
 
 @functools.cache
 def build_cudnn_gemm_bf16_graph_override_shape(
-    batch, n, k, o_type, device, cache_m: int = _OVERRIDE_SHAPE_CACHE_M
+    batch, n, k, o_type, device, cache_m: int = _OVERRIDE_SHAPE_CACHE_M,
+    is_a_k_major: bool = True, is_b_k_major: bool = True,
 ):
     """Build a cuDNN BF16 GEMM graph with override-shape support.
 
@@ -2972,13 +2973,21 @@ def build_cudnn_gemm_bf16_graph_override_shape(
 
     Caching key is ``(batch, n, k, o_type, device, cache_m)`` — M is **not**
     part of the key.
+
+    Args:
+        is_a_k_major: If True, A has shape (batch, M, K) with row-major strides
+            (K is the contiguous dimension).  If False, A has shape (batch, M, K)
+            with column-major strides (M is the contiguous dimension).
+        is_b_k_major: If True, B has shape (batch, K, N) where K is the leading
+            dimension (stride along N is 1, i.e. N-contiguous within each K row).
+            If False, B is row-major with K-contiguous layout (stride along K is 1).
     """
     _check_cudnn_override_shape_availability()
 
     a_shape = (batch, cache_m, k)
-    a_stride = (cache_m * k, k, 1)
+    a_stride = (cache_m * k, k, 1) if is_a_k_major else (cache_m * k, 1, cache_m)
     b_shape = (batch, k, n)
-    b_stride = (k * n, 1, k)
+    b_stride = (k * n, 1, k) if is_b_k_major else (k * n, n, 1)
 
     stream = torch.cuda.current_stream(device)
     graph = cudnn.pygraph(

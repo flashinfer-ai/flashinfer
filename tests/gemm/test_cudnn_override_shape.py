@@ -92,6 +92,8 @@ class TestCudnnBf16OverrideShape:
             o_type=_torch_data_type_to_cudnn_data_type(out_dtype),
             device=device,
             cache_m=cache_m,
+            is_a_k_major=True,
+            is_b_k_major=True,
         )
 
         workspace = torch.empty(
