@@ -302,7 +302,11 @@ def gen_gemm_sm100_module_cutlass_bf16() -> JitSpec:
     return gen_jit_spec(
         "bf16_gemm_cutlass",
         source_paths,
-        extra_cuda_cflags=nvcc_flags + ["-DENABLE_BF16"],
+        extra_cuda_cflags=nvcc_flags
+        + [
+            "-DENABLE_BF16",
+            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
+        ],
         extra_cflags=[
             "-DFAST_BUILD",
         ],
@@ -431,7 +435,10 @@ def gen_gemm_sm100_module() -> JitSpec:
     return gen_jit_spec(
         "gemm_sm100",
         source_paths,
-        extra_cuda_cflags=nvcc_flags,
+        extra_cuda_cflags=nvcc_flags
+        + [
+            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
+        ],
     )
 
 
@@ -493,10 +500,50 @@ def gen_gemm_sm120_module() -> JitSpec:
         )
         write_if_different(dest_path, source)
 
+    # Generate group gemm kernel instantiations
+    prefix = "group_gemm_mxfp4_groupwise"
+    with open(jit_env.FLASHINFER_CSRC_DIR / f"{prefix}_sm120_kernel_inst.jinja") as f:
+        kernel_inst_templ = jinja2.Template(f.read())
+
+    dtype_a_list = [torch.float8_e4m3fn, torch.float8_e5m2]
+    dtype_d_list = [torch.float16, torch.bfloat16]
+
+    for dtype_a, dtype_d in product(dtype_a_list, dtype_d_list):
+        name_dtype_a = filename_safe_dtype_map[dtype_a]
+        name_dtype_d = filename_safe_dtype_map[dtype_d]
+        dest_path = gen_directory / f"{prefix}_{name_dtype_a}_{name_dtype_d}_sm120.cu"
+        source_paths.append(dest_path)
+        source = kernel_inst_templ.render(
+            dtype_a=dtype_cutlass_map[dtype_a],
+            dtype_b="cutlass::float_e2m1_t",
+            dtype_d=dtype_cutlass_map[dtype_d],
+        )
+        write_if_different(dest_path, source)
+
+    # Generate group gemm kernel instantiations for NVFP4
+    prefix = "group_gemm_nvfp4_groupwise"
+    with open(jit_env.FLASHINFER_CSRC_DIR / f"{prefix}_sm120_kernel_inst.jinja") as f:
+        kernel_inst_templ = jinja2.Template(f.read())
+
+    dtype_d_list = [torch.float16, torch.bfloat16]
+
+    for dtype_d in dtype_d_list:
+        name_dtype_d = filename_safe_dtype_map[dtype_d]
+        dest_path = gen_directory / f"{prefix}_{name_dtype_d}_sm120.cu"
+        source_paths.append(dest_path)
+        source = kernel_inst_templ.render(
+            dtype_a="cutlass::float_e2m1_t",
+            dtype_b="cutlass::float_e2m1_t",
+            dtype_d=dtype_cutlass_map[dtype_d],
+        )
+        write_if_different(dest_path, source)
+
     # Copy source files
     for filename in [
         "gemm_groupwise_sm120.cu",
         "group_gemm_fp8_groupwise_sm120.cu",
+        "group_gemm_mxfp4_groupwise_sm120.cu",
+        "group_gemm_nvfp4_groupwise_sm120.cu",
         "gemm_sm120_binding.cu",
         "group_gemm_sm120_binding.cu",
     ]:
@@ -688,7 +735,10 @@ def gen_gemm_sm90_module() -> JitSpec:
     return gen_jit_spec(
         "gemm_sm90",
         source_paths,
-        extra_cuda_cflags=sm90a_nvcc_flags,
+        extra_cuda_cflags=sm90a_nvcc_flags
+        + [
+            "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
+        ],
     )
 
 
