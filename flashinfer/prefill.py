@@ -1602,6 +1602,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._paged_kv_last_page_len_buf = paged_kv_last_page_len_buf
         self._custom_mask_buf = custom_mask_buf
         self._mask_indptr_buf = mask_indptr_buf
+        self._use_custom_mask = False
         self._max_total_num_rows: Optional[int] = None
         self._backend = backend
         self._plan_info = None
@@ -1830,6 +1831,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 mask_indptr,
                 bitorder="little",
             )
+        self._use_custom_mask = packed_custom_mask is not None
 
         self._prefix_len_ptr = prefix_len_ptr
         self._token_pos_in_items_ptr = token_pos_in_items_ptr
@@ -1944,7 +1946,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     self.device,
                     PosEncodingMode[pos_encoding_mode].value,
                     use_fp16_qk_reduction,
-                    self._custom_mask_buf is not None,  # use_custom_mask
+                    self._use_custom_mask,
                     q_data_type,
                     kv_data_type,
                 )
@@ -2225,7 +2227,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             k_cache = k_cache.transpose(-3, -2)
             v_cache = v_cache.transpose(-3, -2)
 
-        if self._custom_mask_buf is not None:
+        if self._use_custom_mask:
             mask_mode = MaskMode.CUSTOM.value
         else:
             if self._causal:
@@ -2590,6 +2592,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._kv_indptr_buf = kv_indptr_buf
         self._custom_mask_buf = custom_mask_buf
         self._mask_indptr_buf = mask_indptr_buf
+        self._use_custom_mask = False
         self._max_total_num_rows: Optional[int] = None
         self._backend = backend
         self._cached_module = None
@@ -2804,6 +2807,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 mask_indptr,
                 bitorder="little",
             )
+        self._use_custom_mask = packed_custom_mask is not None
 
         # NOTE(Zihao): only required if qo_indptr/paged_kv_indptr are device tensors
         qo_indptr_host = qo_indptr.to("cpu")
@@ -2852,6 +2856,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._mask_indptr_buf = mask_indptr.to(
                     self.device, non_blocking=non_blocking
                 )
+            else:
+                self._custom_mask_buf = None
+                self._mask_indptr_buf = None
 
         self._o_indptr_buf = (
             o_indptr.to(self.device, non_blocking=non_blocking)
@@ -2887,7 +2894,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     self.device,
                     PosEncodingMode[pos_encoding_mode].value,
                     use_fp16_qk_reduction,
-                    self._custom_mask_buf is not None,  # use_custom_mask
+                    self._use_custom_mask,
                     q_data_type,
                     kv_data_type,
                 )
@@ -3174,7 +3181,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             k = k.to(torch.float16)
             v = v.to(torch.float16)
 
-        if self._custom_mask_buf is not None:
+        if self._use_custom_mask:
             mask_mode = MaskMode.CUSTOM.value
         else:
             if self._causal:
