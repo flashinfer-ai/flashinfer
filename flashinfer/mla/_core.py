@@ -527,8 +527,27 @@ class BatchMLAPagedAttentionWrapper:
                     "profiler_buffer does not support cutlass backend for now."
                 )
             self._cached_module = get_mla_module()
-            if out is None:
+            if o_scale is not None:
+                if out is None:
+                    raise ValueError(
+                        "out tensor must be provided when o_scale is used for FP8 output."
+                    )
+                if out.dtype not in (
+                    torch.float8_e4m3fn,
+                    torch.float8_e5m2,
+                ):
+                    raise ValueError(
+                        f"out must be an FP8 tensor when o_scale is provided, got {out.dtype}"
+                    )
+                check_shape_dtype_device(
+                    out, q_nope.shape, None, q_nope.device, "out"
+                )
+            elif out is None:
                 out = torch.empty_like(q_nope)
+            else:
+                check_shape_dtype_device(
+                    out, q_nope.shape, q_nope.dtype, q_nope.device, "out"
+                )
             output_scale = 1.0 if o_scale is None else o_scale
             q_nope_pe = torch.cat([q_nope, q_pe], dim=-1)
             ckv_kpe_cache = torch.cat([ckv_cache, kpe_cache], dim=-1)
