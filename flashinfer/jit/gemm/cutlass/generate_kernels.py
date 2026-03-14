@@ -764,9 +764,9 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
         [128, 128, 128],
         [128, 128, 256],
         [128, 256, 64],
+        [128, 256, 128],
         [256, 128, 64],
         [256, 128, 128],
-        [128, 256, 128],
     ]
 
     warp_shape = [0, 0, 0]  # ignored except for naming
