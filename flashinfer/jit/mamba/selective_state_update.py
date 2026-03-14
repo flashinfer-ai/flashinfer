@@ -169,7 +169,6 @@ def gen_selective_state_update_module(
         dstate,
         ntokens_mtp,
         philox_rounds=philox_rounds,
-        extra_cuda_cflags=["-lineinfo"],
     )
 
 
@@ -205,6 +204,54 @@ def gen_selective_state_update_sm90_module(
         supported_major_versions=[9, 10, 11, 12]
     )
     nvcc_flags += ["-DFLASHINFER_MAMBA_ENABLE_SM90"]
+    return _gen_module(
+        uri,
+        state_dtype,
+        input_dtype,
+        weight_dtype,
+        matrixA_dtype,
+        stateIndex_dtype,
+        state_scale_dtype,
+        dim,
+        dstate,
+        ntokens_mtp,
+        philox_rounds=philox_rounds,
+        extra_cuda_cflags=nvcc_flags,
+    )
+
+
+def gen_selective_state_update_sm100_module(
+    state_dtype: torch.dtype,
+    input_dtype: torch.dtype,
+    weight_dtype: torch.dtype,
+    matrixA_dtype: torch.dtype,
+    stateIndex_dtype: torch.dtype,
+    state_scale_dtype: Optional[torch.dtype],
+    dim: int,
+    dstate: int,
+    ntokens_mtp: int,
+    philox_rounds: int = 0,
+) -> JitSpec:
+    uri = (
+        get_selective_state_update_uri(
+            state_dtype,
+            input_dtype,
+            weight_dtype,
+            matrixA_dtype,
+            stateIndex_dtype,
+            state_scale_dtype,
+            dim,
+            dstate,
+            ntokens_mtp,
+            philox_rounds,
+        )
+        + "_sm100"
+    )
+    compilation_context = CompilationContext()
+    nvcc_flags = compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[10, 11, 12]
+    )
+    nvcc_flags += ["-DFLASHINFER_MAMBA_ENABLE_SM90", "-DFLASHINFER_MAMBA_ENABLE_SM100"]
     return _gen_module(
         uri,
         state_dtype,
