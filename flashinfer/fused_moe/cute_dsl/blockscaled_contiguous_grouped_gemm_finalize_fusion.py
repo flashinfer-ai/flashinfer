@@ -48,7 +48,6 @@ import cuda.bindings.driver as cuda
 import torch
 
 from flashinfer.utils import get_compute_capability
-from flashinfer.api_logging import flashinfer_api
 from flashinfer.cute_dsl.utils import (
     get_cutlass_dtype,
     cutlass_to_torch_dtype,
@@ -188,6 +187,7 @@ def _get_compiled_finalize_kernel(
     mma_tiler_mn: Tuple[int, int],
     cluster_shape_mn: Tuple[int, int],
     raster_along_m: bool,
+    enable_pdl: bool = True,
 ):
     """Get or compile the grouped GEMM with finalize fusion kernel.
 
@@ -201,7 +201,14 @@ def _get_compiled_finalize_kernel(
     global _finalize_kernel_cache
 
     # Cache key only includes tactic parameters, NOT problem dimensions
-    cache_key = (sf_vec_size, tile_size, mma_tiler_mn, cluster_shape_mn, raster_along_m)
+    cache_key = (
+        sf_vec_size,
+        tile_size,
+        mma_tiler_mn,
+        cluster_shape_mn,
+        raster_along_m,
+        enable_pdl,
+    )
 
     if cache_key not in _finalize_kernel_cache:
         # Create kernel instance
@@ -211,6 +218,7 @@ def _get_compiled_finalize_kernel(
             cluster_shape_mn=cluster_shape_mn,
             use_blkred=True,
             raster_along_m=raster_along_m,
+            enable_pdl=enable_pdl,
         )
 
         # Compile with runtime parameters - they can vary across calls
@@ -250,7 +258,6 @@ def _get_compiled_finalize_kernel(
     return _finalize_kernel_cache[cache_key]
 
 
-@flashinfer_api
 def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -272,6 +279,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
     cluster_shape_mn: Tuple[int, int] = (2, 1),
     raster_along_m: bool = False,
     sm_count: Optional[int] = None,
+    enable_pdl: bool = True,
 ) -> torch.Tensor:
     """Blockscaled Contiguous Grouped GEMM with Finalize Fusion for MoE workloads.
 
@@ -368,7 +376,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
     major, minor = get_compute_capability(a.device)
     if major != 10:
         raise ValueError(
-            f"Blockscaled contiguous grouped GEMM with finalize fusion requires SM100 family (Blackwell: SM100, SM103, SM110). "
+            f"Blockscaled contiguous grouped GEMM with finalize fusion requires SM100 family (Blackwell: SM100, SM103). "
             f"Got SM{major}{minor}."
         )
 
@@ -499,6 +507,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         mma_tiler_mn=mma_tiler_mn,
         cluster_shape_mn=cluster_shape_mn,
         raster_along_m=raster_along_m,
+        enable_pdl=enable_pdl,
     )
 
     # Execute kernel with runtime parameters
