@@ -249,7 +249,7 @@ def _tgv_gemm_requirement(
 ):
     if out_dtype != torch.bfloat16:
         raise ValueError(
-            "You cannot provide an output dtype to the TGV backend. Use the CUTLASS backend instead."
+            "You cannot provide an output dtype to the TGV backend. Use the CUTLASS or cuDNN backend instead."
         )
     return True
 
@@ -355,10 +355,12 @@ def mm_bf16(
         Whether to use persistant data loader mode. Enabled for TGV backend. Defaults to ``False``.
 
     out: Optional[torch.Tensor]
-        Out tensor, shape (m, n), bf16 or fp16. Enabled for CUTLASS backend. Defaults to ``None``.
+        Out tensor, shape (m, n), bf16, fp16, or fp32. Enabled for CUTLASS and cuDNN backends.
+        Defaults to ``None``.
 
     out_dtype: torch.dtype
-        Output dtype, bf16 or fp16. Enabled for CUTLASS and cuDNN backends. Defaults to ``torch.bfloat16``.
+        Output dtype, bf16, fp16, or fp32. Enabled for CUTLASS and cuDNN backends.
+        Defaults to ``torch.bfloat16``.
 
     backend: Literal["cudnn", "cutlass", "tgv", "auto"]
         The backend to use for the operation. Defaults to ``"cudnn"``.
@@ -370,7 +372,7 @@ def mm_bf16(
     Returns
     -------
     torch.Tensor
-        Out tensor, shape (m, n), bf16 or fp16 in row-major layout.
+        Out tensor, shape (m, n), bf16, fp16, or fp32 in row-major layout.
 
     Examples
     --------
@@ -534,10 +536,10 @@ def bmm_bf16(
         Weight tensor, shape (b, k, n), bf16 in column-major layout.
 
     out: Optional[torch.Tensor]
-        Out tensor, shape (b, m, n), bf16 or fp16, defaults to ``None``.
+        Out tensor, shape (b, m, n), bf16, fp16, or fp32, defaults to ``None``.
 
     out_dtype: torch.dtype
-        Output dtype, bf16 (default) or fp16.
+        Output dtype, bf16 (default), fp16, or fp32.
 
     backend: Literal["cudnn", "cutlass", "auto"]
         Backend to use, defaults to "cudnn". ``"auto"`` allows selecting the best tactic from all available backends when autotune is enabled.
@@ -545,7 +547,7 @@ def bmm_bf16(
     Returns
     -------
     torch.Tensor
-        Out tensor, shape (b, m, n), bf16 or fp16 in row-major layout.
+        Out tensor, shape (b, m, n), bf16, fp16, or fp32 in row-major layout.
 
     Examples
     --------
@@ -1744,11 +1746,11 @@ def _validate_fp8_output_dtype(dtype: torch.dtype):
 
 
 def _validate_bf16_output_dtype(dtype: torch.dtype):
-    """Validate that the output dtype is either bf16 or fp16."""
-    if dtype not in (torch.bfloat16, torch.float16):
+    """Validate that the output dtype is bf16, fp16, or fp32."""
+    if dtype not in (torch.bfloat16, torch.float16, torch.float32):
         raise ValueError(
             f"Unsupported output dtype: {dtype}. "
-            f"Only torch.bfloat16 and torch.float16 are supported for BF16 GEMM operations."
+            f"Only torch.bfloat16, torch.float16, and torch.float32 are supported for BF16 GEMM operations."
         )
 
 
@@ -2077,6 +2079,8 @@ def _torch_data_type_to_cudnn_data_type(dtype: torch.dtype):
         return cudnn.data_type.BFLOAT16
     elif dtype == torch.float16:
         return cudnn.data_type.HALF
+    elif dtype == torch.float32:
+        return cudnn.data_type.FLOAT
     elif dtype == torch.float8_e4m3fn:
         return cudnn.data_type.FP8_E4M3
     elif dtype == torch.float8_e5m2:
