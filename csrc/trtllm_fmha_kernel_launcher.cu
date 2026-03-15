@@ -44,13 +44,13 @@ enum class TllmPagedAttentionMode {
 
 class TllmGenFmhaRunnerCache {
  public:
-  using Key = std::tuple<Data_type, Data_type, Data_type>;
+  using Key = std::tuple<int, Data_type, Data_type, Data_type>;
 
-  static std::shared_ptr<TllmGenFmhaRunner> get(Data_type q_data_type, Data_type kv_data_type,
-                                                Data_type o_data_type) {
+  static std::shared_ptr<TllmGenFmhaRunner> get(int device_id, Data_type q_data_type,
+                                                Data_type kv_data_type, Data_type o_data_type) {
     static std::unordered_map<Key, std::shared_ptr<TllmGenFmhaRunner>, KeyHash> cache;
     static std::mutex cache_mutex;
-    Key key = std::make_tuple(q_data_type, kv_data_type, o_data_type);
+    Key key = std::make_tuple(device_id, q_data_type, kv_data_type, o_data_type);
 
     std::lock_guard<std::mutex> lock(cache_mutex);
     auto it = cache.find(key);
@@ -66,9 +66,10 @@ class TllmGenFmhaRunnerCache {
  private:
   struct KeyHash {
     std::size_t operator()(const Key& k) const {
-      return std::hash<int>()(static_cast<int>(std::get<0>(k))) ^
+      return std::hash<int>()(std::get<0>(k)) ^
              (std::hash<int>()(static_cast<int>(std::get<1>(k))) << 1) ^
-             (std::hash<int>()(static_cast<int>(std::get<2>(k))) << 2);
+             (std::hash<int>()(static_cast<int>(std::get<2>(k))) << 2) ^
+             (std::hash<int>()(static_cast<int>(std::get<3>(k))) << 3);
     }
   };
 };
@@ -77,7 +78,8 @@ void trtllm_paged_attention_launcher(
     void* out, void* out_scale_factor, void* query, void* key_cache, void* value_cache,
     void* workspace_buffer, int* block_tables, int* seq_lens, int* cum_seq_lens_q,
     int* cum_seq_lens_kv, float* attention_sinks, Data_type q_data_type, Data_type kv_data_type,
-    Data_type o_data_type, TllmPagedAttentionMode mode, int64_t batch_size, int64_t max_q_len,
+    Data_type o_data_type, int device_id, TllmPagedAttentionMode mode, int64_t batch_size,
+    int64_t max_q_len,
     int64_t max_kv_len, int64_t num_pages_in_mem_pool, int64_t num_qo_heads, int64_t num_kv_heads,
     int64_t head_dim_qk, int64_t head_dim_vo, int64_t page_size, int64_t q_stride_tokens,
     int64_t q_stride_heads, int64_t kv_stride_keys_values, int64_t kv_stride_heads,
@@ -86,6 +88,7 @@ void trtllm_paged_attention_launcher(
     int64_t o_sf_vec_size, int64_t o_sf_start_index, int64_t window_left, int64_t sum_seq_q,
     int64_t sparse_mla_top_k, float skip_softmax_threshold_scale_factor, bool skips_softmax,
     int64_t sm_count, bool enable_pdl, int64_t workspace_size, cudaStream_t stream) {
+  ffi::CUDADeviceGuard device_guard(device_id);
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads must be a multiple of num_kv_heads, got num_kv_heads: " << num_kv_heads
@@ -93,7 +96,8 @@ void trtllm_paged_attention_launcher(
     FLASHINFER_ERROR(err_msg.str());
   }
 
-  auto fmha_runner = TllmGenFmhaRunnerCache::get(q_data_type, kv_data_type, o_data_type);
+  auto fmha_runner =
+      TllmGenFmhaRunnerCache::get(device_id, q_data_type, kv_data_type, o_data_type);
   TllmGenFmhaRunnerParams runner_params;
 
   // Common params
@@ -312,7 +316,8 @@ void trtllm_paged_attention_decode(
       workspace_buffer.data_ptr(), static_cast<int*>(block_tables.data_ptr()),
       static_cast<int*>(seq_lens.data_ptr()), cum_seq_lens_q_ptr,
       /*cum_seq_lens_kv*/ nullptr, attention_sinks_ptr, q_data_type, kv_data_type, o_data_type,
-      TllmPagedAttentionMode::ForGen, batch_size, max_q_len, max_kv_len, num_pages_in_mem_pool,
+      query.device().device_id, TllmPagedAttentionMode::ForGen, batch_size, max_q_len,
+      max_kv_len, num_pages_in_mem_pool,
       num_qo_heads, num_kv_heads, head_dim_q, head_dim_o, page_size, q_stride_tokens,
       q_stride_heads, kv_stride_keys_values, kv_stride_heads, kv_stride_batch,
       max_num_blocks_per_seq, bmm1_scale_value, bmm2_scale_value, bmm1_scale_log2_ptr,
@@ -403,9 +408,10 @@ void trtllm_paged_attention_context(
       static_cast<int*>(seq_lens.data_ptr()),
       /*cum_seq_lens_q=*/static_cast<int*>(cum_seq_lens_q.data_ptr()),
       /*cum_seq_lens_kv=*/static_cast<int*>(cum_seq_lens_kv.data_ptr()), attention_sinks_ptr,
-      q_data_type, kv_data_type, o_data_type, TllmPagedAttentionMode::Context, batch_size,
-      max_q_len, max_kv_len, num_pages_in_mem_pool, num_qo_heads, num_kv_heads, head_dim_q,
-      head_dim_o, page_size, q_stride_tokens, q_stride_heads, kv_stride_keys_values,
+      q_data_type, kv_data_type, o_data_type, query.device().device_id,
+      TllmPagedAttentionMode::Context, batch_size, max_q_len, max_kv_len,
+      num_pages_in_mem_pool, num_qo_heads, num_kv_heads, head_dim_q, head_dim_o, page_size,
+      q_stride_tokens, q_stride_heads, kv_stride_keys_values,
       kv_stride_heads, kv_stride_batch, max_num_blocks_per_seq, bmm1_scale_value, bmm2_scale_value,
       bmm1_scale_log2_ptr, bmm2_scale_ptr, o_sf_scale, o_sf_vec_size, o_sf_start_index, window_left,
       sum_seq_q, /*sparse_mla_top_k=*/0, skip_softmax_threshold_scale_factor_value, skips_softmax,
@@ -415,7 +421,8 @@ void trtllm_paged_attention_context(
 void trtllm_ragged_attention_launcher(
     void* out, void* query, void* key, void* value, void* workspace_buffer, int* seq_lens,
     int* cum_seq_lens_q, int* cum_seq_lens_kv, float* attention_sinks, float* lse,
-    Data_type q_data_type, Data_type kv_data_type, Data_type o_data_type, int64_t max_q_len,
+    Data_type q_data_type, Data_type kv_data_type, Data_type o_data_type, int device_id,
+    int64_t max_q_len,
     int64_t max_kv_len, int64_t num_qo_heads, int64_t num_kv_heads, int64_t head_dim_qk,
     int64_t head_dim_v, int64_t sum_seq_q, int64_t sum_seq_kv, double bmm1_scale, double bmm2_scale,
     const float* bmm1_scale_log2_ptr, const float* bmm2_scale_ptr, double o_sf_scale,
@@ -424,13 +431,15 @@ void trtllm_ragged_attention_launcher(
     int64_t v_stride_keys_values, int64_t v_stride_heads, int64_t v_stride_batch,
     float skip_softmax_threshold_scale_factor, bool skips_softmax, int64_t workspace_size,
     cudaStream_t stream) {
+  ffi::CUDADeviceGuard device_guard(device_id);
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads must be a multiple of num_kv_heads, got num_kv_heads: " << num_kv_heads
             << " and num_qo_heads: " << num_qo_heads;
     FLASHINFER_ERROR(err_msg.str());
   }
-  auto fmha_runner = TllmGenFmhaRunnerCache::get(q_data_type, kv_data_type, o_data_type);
+  auto fmha_runner =
+      TllmGenFmhaRunnerCache::get(device_id, q_data_type, kv_data_type, o_data_type);
   TllmGenFmhaRunnerParams runner_params;
 
   runner_params.qPtr = query;
@@ -580,7 +589,8 @@ void trtllm_ragged_attention(TensorView out, TensorView query, TensorView key, T
       out.data_ptr(), query.data_ptr(), key.data_ptr(), value.data_ptr(),
       workspace_buffer.data_ptr(), static_cast<int*>(seq_lens.data_ptr()),
       static_cast<int*>(cum_seq_lens_q.data_ptr()), static_cast<int*>(cum_seq_lens_kv.data_ptr()),
-      attention_sinks_ptr, lse_ptr, q_data_type, kv_data_type, o_data_type, max_q_len, max_kv_len,
+      attention_sinks_ptr, lse_ptr, q_data_type, kv_data_type, o_data_type,
+      query.device().device_id, max_q_len, max_kv_len,
       num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, sum_seq_q, sum_seq_kv, bmm1_scale_value,
       bmm2_scale_value, bmm1_scale_log2_ptr, bmm2_scale_ptr, o_sf_scale, batch_size, window_left,
       sm_count, enable_pdl, is_causal, k_stride_keys_values, k_stride_heads, k_stride_batch,
