@@ -23,7 +23,7 @@ def gen_fp4_kv_quantization_module() -> JitSpec:
         supported_major_versions=[10, 11, 12]
     )
     return gen_jit_spec(
-        "nvfp4_kv_quant",
+        "fp4_kv_quant",
         [jit_env.FLASHINFER_CSRC_DIR / "fp4_kv_quantization.cu"],
         extra_cuda_cflags=nvcc_flags
         + [
