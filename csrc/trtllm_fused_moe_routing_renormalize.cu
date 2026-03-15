@@ -183,10 +183,13 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
   } else {
     numCta = divUpTileN<int32_t>(accExpertCount, params.mTileTokensDim);
   }
+  // Expand from CGA count to CTA count to keep the semantic stable with downstream kernels
+  numCta *= params.mClusterSizeInBatchDim;
   int32_t ctaOffset = 0;
   int32_t numNonExitingCtas;
   Scan(tempStorage).ExclusiveSum(numCta, ctaOffset, numNonExitingCtas);
 
+  // Second scan for token-space padded offsets stays at CGA granularity
   int32_t expertScanCounts = 0;
   int32_t tmpCount;
   if constexpr (KernelParams::isPow2) {
@@ -202,14 +205,17 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
       const int32_t localExpertIdx =
           (expert - params.mLocalExpertsStartIdx) >> params.mLocalExpertsStrideLog2;
       params.mPtrCtaIdxXyToBatchIdx[ctaOffset + cta] = localExpertIdx;
+      // Write CTA-level MnLimits using ctaTile = cgaTile / clusterSize
       int32_t mnLimit1;
       int32_t mnLimit2;
       if constexpr (KernelParams::isPow2) {
-        mnLimit1 = mulLog2<int32_t>(ctaOffset + cta + 1, params.mPaddingLog2);
-        mnLimit2 = mulLog2<int32_t>(ctaOffset, params.mPaddingLog2) + accExpertCount;
+        int32_t ctaPaddingLog2 = params.mPaddingLog2 - params.mClusterSizeLog2;
+        mnLimit1 = mulLog2<int32_t>(ctaOffset + cta + 1, ctaPaddingLog2);
+        mnLimit2 = mulLog2<int32_t>(ctaOffset, ctaPaddingLog2) + accExpertCount;
       } else {
-        mnLimit1 = mulTileN<int32_t>(ctaOffset + cta + 1, params.mTileTokensDim);
-        mnLimit2 = mulTileN<int32_t>(ctaOffset, params.mTileTokensDim) + accExpertCount;
+        int32_t ctaTile = params.mTileTokensDim / params.mClusterSizeInBatchDim;
+        mnLimit1 = (ctaOffset + cta + 1) * ctaTile;
+        mnLimit2 = ctaOffset * ctaTile + accExpertCount;
       }
       params.mPtrCtaIdxXyToMnLimit[ctaOffset + cta] = min(mnLimit1, mnLimit2);
     }
@@ -219,9 +225,10 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
   if (threadIdx.x == 0) {
     int32_t permutedIdxSize;
     if constexpr (KernelParams::isPow2) {
-      permutedIdxSize = mulLog2<int32_t>(numNonExitingCtas, params.mPaddingLog2);
+      permutedIdxSize =
+          mulLog2<int32_t>(numNonExitingCtas >> params.mClusterSizeLog2, params.mPaddingLog2);
     } else {
-      permutedIdxSize = mulTileN<int32_t>(numNonExitingCtas, params.mTileTokensDim);
+      permutedIdxSize = (numNonExitingCtas / params.mClusterSizeInBatchDim) * params.mTileTokensDim;
     }
     params.mPtrPermutedIdxSize[0] = permutedIdxSize;
     params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;

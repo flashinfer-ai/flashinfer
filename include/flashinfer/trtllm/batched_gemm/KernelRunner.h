@@ -63,8 +63,11 @@ enum class EltwiseActType {
 };
 
 struct TrtllmGenBatchedGemmRunnerOptions {
+  // Canonically, A is activation.
   batchedGemm::trtllm::gen::Dtype dtypeA;
+  // B is weight.
   batchedGemm::trtllm::gen::Dtype dtypeB;
+  // C is output.
   batchedGemm::trtllm::gen::Dtype dtypeC;
   ActType actType{ActType::SwiGlu};
   EltwiseActType eltwiseActType{EltwiseActType::None};
@@ -72,6 +75,7 @@ struct TrtllmGenBatchedGemmRunnerOptions {
   bool fusedAct{false};
   bool routeAct{false};
   bool staticBatch{false};
+  // If transposeMmaOutput is true, then A and B are swapped under the hood.
   bool transposeMmaOutput{false};
   int32_t tileSize{8};
   int32_t epilogueTileM{128};
@@ -120,6 +124,9 @@ class TrtllmGenBatchedGemmRunner {
   [[nodiscard]] std::vector<int64_t> getPassingConfigIndices() const {
     return mPassingConfigIndices;
   }
+
+  // Get the cluster size in the batch dimension for the given config index
+  [[nodiscard]] int32_t getConfigClusterSizeInBatchDim(int32_t configIndex) const;
 
   // Get the list of config indices that are valid for the given problem shape
   [[nodiscard]] std::vector<int64_t> getValidConfigIndices(
