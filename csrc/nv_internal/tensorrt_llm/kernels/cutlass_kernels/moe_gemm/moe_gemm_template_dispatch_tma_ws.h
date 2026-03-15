@@ -309,7 +309,10 @@ constexpr bool are_tile_shapes_supported_sm120() {
   return (TileM == 128 && TileN == 128 && TileK == 128) ||
          (TileM == 128 && TileN == 128 && TileK == 256) ||
          (TileM == 128 && TileN == 256 && TileK == 128) ||
-         (TileM == 256 && TileN == 128 && TileK == 128);
+         (TileM == 256 && TileN == 128 && TileK == 128) ||
+         (TileM == 128 && TileN == 128 && TileK == 64) ||
+         (TileM == 128 && TileN == 256 && TileK == 64) ||
+         (TileM == 256 && TileN == 128 && TileK == 64);
 }
 
 /*

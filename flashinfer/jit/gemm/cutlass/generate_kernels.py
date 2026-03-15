@@ -760,10 +760,13 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
     quant_ops = [TrtLlm_QuantOp.none]
     epi_tags = [TrtLlm_EpilogueTag.epilogue_op_default]
     cta_shapes_mnk = [
+        [128, 128, 64],
         [128, 128, 128],
         [128, 128, 256],
-        [256, 128, 128],
+        [128, 256, 64],
         [128, 256, 128],
+        [256, 128, 64],
+        [256, 128, 128],
     ]
 
     warp_shape = [0, 0, 0]  # ignored except for naming
@@ -777,6 +780,14 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
     cga_shapes = [[1, 1, 1]]
 
     swap_ab = [True, False]
+
+    # SM120/SM121 supported shapes for block-scaled paths (99KB SMEM constraint)
+    _sm120_supported_shapes = {
+        (128, 128, 128),
+        (128, 128, 64),
+        (128, 256, 64),
+        (256, 128, 64),
+    }
 
     partial_args = product(
         supported_dtypes,
@@ -807,9 +818,15 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
         else:
             act_type, weight_type = dtype, dtype
 
-        # Minimal filter: for mixed FP8xFP4 on SM120/SM121, only emit 128x128x128
+        # For mixed FP8xFP4 on SM120/SM121, only emit shapes that fit in 99KB SMEM
         if act_type == DataType.e4m3 and weight_type == e2m1:
-            if cta_shape_mnk != [128, 128, 128]:
+            if tuple(cta_shape_mnk) not in _sm120_supported_shapes:
+                continue
+
+        # For e2m1-only (FP4xFP4), apply the same shape filter to avoid
+        # compiling kernels that overflow SMEM or lack dispatch SHAPE_CASEs
+        if act_type == e2m1 and weight_type == e2m1:
+            if tuple(cta_shape_mnk) not in _sm120_supported_shapes:
                 continue
 
         otypes = [act_type]
@@ -992,7 +1009,6 @@ def generate_sm80_fused_grouped_gemm_operations():
         (16, 256, 64),
         (32, 128, 64),
         (64, 128, 64),
-        (128, 128, 64),
     ]
 
     stages = [2, 3, 4]
