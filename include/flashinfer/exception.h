@@ -70,6 +70,17 @@ void write_to_stream(std::ostringstream& oss, T&& val, Args&&... args) {
     flashinfer::Warning(__FUNCTION__, __FILE__, __LINE__, msg).emit(); \
   } while (0)
 
+#define FLASHINFER_LOG(...)                                        \
+  do {                                                             \
+    std::ostringstream oss;                                        \
+    write_to_stream(oss, ##__VA_ARGS__);                           \
+    std::string msg = oss.str();                                   \
+    if (msg.empty()) {                                             \
+      msg = "Log triggered";                                       \
+    }                                                              \
+    flashinfer::Log(__FUNCTION__, __FILE__, __LINE__, msg).emit(); \
+  } while (0)
+
 namespace flashinfer {
 class Error : public std::exception {
  private:
@@ -94,6 +105,21 @@ class Warning {
   Warning(const std::string& func, const std::string& file, int line, const std::string& message) {
     std::ostringstream oss;
     oss << "Warning in function '" << func << "' "
+        << "at " << file << ":" << line << ": " << message;
+    message_ = oss.str();
+  }
+
+  void emit() const { std::cerr << message_ << std::endl; }
+};
+
+class Log {
+ private:
+  std::string message_;
+
+ public:
+  Log(const std::string& func, const std::string& file, int line, const std::string& message) {
+    std::ostringstream oss;
+    oss << "Log in function '" << func << "' "
         << "at " << file << ":" << line << ": " << message;
     message_ = oss.str();
   }
