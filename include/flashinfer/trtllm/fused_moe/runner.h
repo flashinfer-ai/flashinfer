@@ -86,6 +86,8 @@ inline std::string serializeMoeRoutingMethodType(RoutingMethodType routingMethod
   };
 }
 
+// NOTE: The legacy CTA-based name is kept for interface compatibility even though these entries are
+// counted at CGA granularity.
 inline int32_t getMaxNumCtasInBatchDim(int32_t numTokens, int32_t topK, int32_t numExperts,
                                        int32_t tileTokensDim) {
   // For MoE, mNumTokens != 0 and the number of CTAs is known only at runtime.
@@ -347,6 +349,8 @@ struct MoEWorkspace {
   // consumed by permuteGemm1 kernel
   void* token_scales = nullptr;
 
+  // NOTE: The legacy CTA-based name is kept for interface compatibility even though these entries
+  // are counted at CGA granularity.
   int32_t* cta_idx_xy_to_batch_idx = nullptr;
   int32_t* cta_idx_xy_to_mn_limit = nullptr;
   int32_t* num_non_exiting_ctas = nullptr;
@@ -358,7 +362,6 @@ struct MoEWorkspace {
   float* permuted_hidden_states_scale = nullptr;
 
   // Gemm1 intermediate outputs:
-  int32_t ProjUpTileN{0};
   void* gemm1_output = nullptr;
   float* gemm1_output_scale = nullptr;
 
