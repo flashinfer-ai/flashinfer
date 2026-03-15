@@ -54,9 +54,10 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
       reinterpret_cast<stateIndex_t const*>(params.state_batch_indices);
   auto const* __restrict__ intermediate_state_indices =
       reinterpret_cast<stateIndex_t const*>(params.intermediate_state_indices);
-  auto const* __restrict__ cu_seqlens = reinterpret_cast<int32_t const*>(params.cu_seqlens);
+  auto const* __restrict__ cu_seqlens =
+      reinterpret_cast<cuSeqlensIndex_t const*>(params.cu_seqlens);
   auto const* __restrict__ num_accepted_tokens =
-      reinterpret_cast<int32_t const*>(params.num_accepted_tokens);
+      reinterpret_cast<numAcceptedIndex_t const*>(params.num_accepted_tokens);
   auto const* __restrict__ dst_state_batch_indices =
       reinterpret_cast<stateIndex_t const*>(params.dst_state_batch_indices);
   bool const dt_softplus = params.dt_softplus;

@@ -290,7 +290,7 @@ class TestSelectiveStateUpdateVarlen:
             .to(torch.int32)
         )
 
-        num_accepted = torch.ones(n_seqs, device="cuda", dtype=torch.int32)
+        num_accepted = torch.ones(n_seqs, device="cuda", dtype=torch.int64)
         out = torch.empty(
             total_tokens, self.NHEADS, self.DIM, device="cuda", dtype=torch.bfloat16
         )
@@ -387,7 +387,7 @@ class TestSelectiveStateUpdateVarlen:
             ]
             slot_offset += sl
 
-        num_accepted = torch.ones(n_seqs, device="cuda", dtype=torch.int32)
+        num_accepted = torch.ones(n_seqs, device="cuda", dtype=torch.int64)
         out = torch.empty(
             total_tokens, self.NHEADS, self.DIM, device="cuda", dtype=torch.bfloat16
         )
@@ -448,7 +448,8 @@ class TestSelectiveStateUpdateNumAcceptedTokens:
     STATE_CACHE_SIZE = 512
 
     @pytest.mark.parametrize("n_seqs", [4, 8, 16])
-    def test_num_accepted_selects_initial_state(self, n_seqs):
+    @pytest.mark.parametrize("num_accepted_dtype", [torch.int32, torch.int64])
+    def test_num_accepted_selects_initial_state(self, n_seqs, num_accepted_dtype):
         """num_accepted_tokens controls which state slot to read as initial."""
         max_seqlen = 4
         total_tokens = n_seqs * max_seqlen
@@ -468,7 +469,7 @@ class TestSelectiveStateUpdateNumAcceptedTokens:
         )
 
         num_accepted = torch.randint(
-            1, max_seqlen + 1, (n_seqs,), device="cuda", dtype=torch.int32
+            1, max_seqlen + 1, (n_seqs,), device="cuda", dtype=num_accepted_dtype
         )
 
         perm = torch.randperm(self.STATE_CACHE_SIZE, device="cuda").to(torch.int32)

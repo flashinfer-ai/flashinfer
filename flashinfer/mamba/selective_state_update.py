@@ -37,6 +37,8 @@ def _get_module(
     dim: int,
     dstate: int,
     ntokens_mtp: int,
+    cu_seqlens_dtype: torch.dtype,
+    num_accepted_tokens_dtype: torch.dtype,
     sm_major: int,
     state_scale_dtype: Optional[torch.dtype] = None,
     philox_rounds: int = 0,
@@ -51,6 +53,8 @@ def _get_module(
         dim,
         dstate,
         ntokens_mtp,
+        cu_seqlens_dtype,
+        num_accepted_tokens_dtype,
         philox_rounds,
     )
     if sm_major >= 9:
@@ -69,6 +73,8 @@ def get_selective_state_update_module(
     dim: int,
     dstate: int,
     ntokens_mtp: int,
+    cu_seqlens_dtype: torch.dtype,
+    num_accepted_tokens_dtype: torch.dtype,
     state_scale_dtype: Optional[torch.dtype] = None,
     philox_rounds: int = 0,
 ):
@@ -82,6 +88,8 @@ def get_selective_state_update_module(
         dim,
         dstate,
         ntokens_mtp,
+        cu_seqlens_dtype,
+        num_accepted_tokens_dtype,
         major,
         state_scale_dtype,
         philox_rounds,
@@ -174,10 +182,10 @@ def selective_state_update(
         Number of steps/tokens to cache for speculative decoding.
         For varlen mode (cu_seqlens provided), this specifies max_seqlen.
     cu_seqlens : Optional[torch.Tensor]
-        Cumulative sequence lengths, int32 tensor of shape (N + 1,).
+        Cumulative sequence lengths with shape (N + 1,).
         When provided, inputs are in varlen format (tokens flattened into batch dim).
     num_accepted_tokens : Optional[torch.Tensor]
-        Number of accepted tokens per sequence, int32 tensor of shape (N,).
+        Number of accepted tokens per sequence with shape (N,).
         Determines which state to read as initial state for each sequence.
     algorithm : str
         Algorithm to use: "auto", "simple", "vertical", "horizontal"
@@ -387,6 +395,8 @@ def _selective_state_update(
         dim,
         dstate,
         ntokens_mtp,
+        cu_seqlens.dtype if cu_seqlens is not None else torch.int32,
+        num_accepted_tokens.dtype if num_accepted_tokens is not None else torch.int64,
         state_scale_dtype=state_scale.dtype if state_scale is not None else None,
         philox_rounds=philox_rounds,
     ).selective_state_update(

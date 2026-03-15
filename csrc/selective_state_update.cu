@@ -563,8 +563,6 @@ void run_selective_state_update_mtp(
     CHECK_CUDA(cs);
     CHECK_DIM(1, cs);
     CHECK_CONTIGUOUS(cs);
-    FLASHINFER_CHECK(cs.dtype().code == kDLInt && cs.dtype().bits == 32,
-                     "cu_seqlens must be int32");
     FLASHINFER_CHECK(cs.size(0) == batch + 1, "cu_seqlens.size(0) must equal n_sequences + 1 (",
                      batch + 1, ")");
     p.cu_seqlens = const_cast<void*>(cs.data_ptr());
@@ -574,8 +572,6 @@ void run_selective_state_update_mtp(
     CHECK_CUDA(nat);
     CHECK_DIM(1, nat);
     CHECK_CONTIGUOUS(nat);
-    FLASHINFER_CHECK(nat.dtype().code == kDLInt && nat.dtype().bits == 32,
-                     "num_accepted_tokens must be int32");
     FLASHINFER_CHECK(nat.size(0) >= batch, "num_accepted_tokens.size(0) must be >= n_sequences (",
                      batch, ")");
     FLASHINFER_CHECK(state_batch_indices.has_value(),
