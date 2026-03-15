@@ -781,6 +781,14 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
 
     swap_ab = [True, False]
 
+    # SM120/SM121 supported shapes for block-scaled paths (99KB SMEM constraint)
+    _sm120_supported_shapes = {
+        (128, 128, 128),
+        (128, 128, 64),
+        (128, 256, 64),
+        (256, 128, 64),
+    }
+
     partial_args = product(
         supported_dtypes,
         quant_ops,
@@ -809,14 +817,6 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
             act_type, weight_type = dtype
         else:
             act_type, weight_type = dtype, dtype
-
-        # SM120 supported shapes for block-scaled paths
-        _sm120_supported_shapes = {
-            (128, 128, 128),
-            (128, 128, 64),
-            (128, 256, 64),
-            (256, 128, 64),
-        }
 
         # For mixed FP8xFP4 on SM120/SM121, only emit shapes that fit in 99KB SMEM
         if act_type == DataType.e4m3 and weight_type == e2m1:
