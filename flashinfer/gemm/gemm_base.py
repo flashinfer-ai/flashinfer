@@ -2011,20 +2011,14 @@ def build_cudnn_fp4_gemm_graph_override_shape(
 
     a_shape = [batch, cache_m, k * 2]  # FP4 packed: K dimension stores k*2 uint8 values
     a_stride = [cache_m * k * 2, k * 2, 1]
-    # cuDNN expects the real FP4 shape (unpacked); use *2 only when viewed as fp4 dtype
-    # For the cudnn tensor we use the actual fp4 element count
-    a_fp4_shape = [batch, cache_m, k]
-    a_fp4_stride = [cache_m * k, k, 1]
 
-    b_fp4_shape = [batch, k, n]
-    b_fp4_stride = [k * n, 1, k]
+    b_shape = [batch, k * 2, n]
+    b_stride = [k * n * 2, 1, k * 2]
 
     a_descale_shape = [batch, block_scale_dim_m, a_descale_k_dim]
     a_descale_stride = [block_scale_dim_m * a_descale_k_dim, a_descale_k_dim, 1]
     b_descale_shape = [batch, b_descale_k_dim, b_descale_n_dim]
     b_descale_stride = [b_descale_n_dim * b_descale_k_dim, 1, b_descale_k_dim]
-    c_shape = [batch, cache_m, n]
-    c_stride = [cache_m * n, n, 1]
 
     stream = torch.cuda.current_stream(device)
     graph = cudnn.pygraph(
@@ -2036,10 +2030,10 @@ def build_cudnn_fp4_gemm_graph_override_shape(
     )
 
     a_cudnn_tensor = graph.tensor(
-        name="a", dim=a_fp4_shape, stride=a_fp4_stride, data_type=ab_type
+        name="a", dim=a_shape, stride=a_stride, data_type=ab_type
     )
     b_cudnn_tensor = graph.tensor(
-        name="b", dim=b_fp4_shape, stride=b_fp4_stride, data_type=ab_type
+        name="b", dim=b_shape, stride=b_stride, data_type=ab_type
     )
     block_descale_a_cudnn_tensor = graph.tensor(
         name="block_descale_a",
@@ -2269,8 +2263,12 @@ def _cudnn_gemm_fp4_override_shape(
 
     a_3d = a.view(real_a_shape) if a.ndim == 2 else a
     b_3d = b.view(real_b_shape) if b.ndim == 2 else b
-    a_descale_3d = a_descale.view(expanded_a_descale_shape) if a_descale.ndim == 2 else a_descale
-    b_descale_3d = b_descale.view(expanded_b_descale_shape) if b_descale.ndim == 2 else b_descale
+    a_descale_3d = (
+        a_descale.view(expanded_a_descale_shape) if a_descale.ndim == 2 else a_descale
+    )
+    b_descale_3d = (
+        b_descale.view(expanded_b_descale_shape) if b_descale.ndim == 2 else b_descale
+    )
     out_3d = out.unsqueeze(0) if out.ndim == 2 else out
 
     execute_cudnn_fp4_gemm_graph_override_shape(
@@ -2352,8 +2350,8 @@ def build_cudnn_mxfp8_gemm_graph_override_shape(
     if o_type not in [cudnn.data_type.BFLOAT16, cudnn.data_type.HALF]:
         raise ValueError(f"Output type must be BF16 or FP16, got {o_type}")
 
-    block_scale_dim_m, block_scale_dim_n, block_scale_dim_k = _calculate_block_scale_dims(
-        cache_m, n, k, block_size
+    block_scale_dim_m, block_scale_dim_n, block_scale_dim_k = (
+        _calculate_block_scale_dims(cache_m, n, k, block_size)
     )
 
     scale_type = cudnn.data_type.FP8_E8M0
@@ -2516,8 +2514,8 @@ def _cudnn_gemm_mxfp8_override_shape(
     k = a_3d.shape[2]
     n = b_3d.shape[2]
 
-    block_scale_dim_m, block_scale_dim_n, block_scale_dim_k = _calculate_block_scale_dims(
-        a_3d.shape[1], n, k, block_size
+    block_scale_dim_m, block_scale_dim_n, block_scale_dim_k = (
+        _calculate_block_scale_dims(a_3d.shape[1], n, k, block_size)
     )
 
     if a_descale.ndim == 2:
@@ -2663,8 +2661,7 @@ def execute_cudnn_gemm_with_per_tensor_q_graph(
 
 @functools.cache
 def build_cudnn_gemm_with_per_tensor_q_graph_override_shape(
-    batch, n, k, a_type, b_type, o_type, device,
-    cache_m: int = _OVERRIDE_SHAPE_CACHE_M
+    batch, n, k, a_type, b_type, o_type, device, cache_m: int = _OVERRIDE_SHAPE_CACHE_M
 ):
     """Build an FP8 per-tensor-quantized GEMM cuDNN graph with override-shape.
 
@@ -2677,8 +2674,6 @@ def build_cudnn_gemm_with_per_tensor_q_graph_override_shape(
     a_stride = [cache_m * k, k, 1]
     b_shape = [batch, k, n]
     b_stride = [k * n, 1, k]
-    c_shape = [batch, cache_m, n]
-    c_stride = [cache_m * n, n, 1]
 
     stream = torch.cuda.current_stream(device)
     graph = cudnn.pygraph(
@@ -2960,8 +2955,14 @@ def execute_cudnn_gemm_bf16_graph(graph, a, b, c_final, workspace, tactic: int =
 
 @functools.cache
 def build_cudnn_gemm_bf16_graph_override_shape(
-    batch, n, k, o_type, device, cache_m: int = _OVERRIDE_SHAPE_CACHE_M,
-    is_a_k_major: bool = True, is_b_k_major: bool = True,
+    batch,
+    n,
+    k,
+    o_type,
+    device,
+    cache_m: int = _OVERRIDE_SHAPE_CACHE_M,
+    is_a_k_major: bool = True,
+    is_b_k_major: bool = True,
 ):
     """Build a cuDNN BF16 GEMM graph with override-shape support.
 
@@ -2999,11 +3000,15 @@ def build_cudnn_gemm_bf16_graph_override_shape(
     )
 
     a_cudnn_tensor = graph.tensor(
-        name="a", dim=list(a_shape), stride=list(a_stride),
+        name="a",
+        dim=list(a_shape),
+        stride=list(a_stride),
         data_type=cudnn.data_type.BFLOAT16,
     )
     b_cudnn_tensor = graph.tensor(
-        name="b", dim=list(b_shape), stride=list(b_stride),
+        name="b",
+        dim=list(b_shape),
+        stride=list(b_stride),
         data_type=cudnn.data_type.BFLOAT16,
     )
     c_cudnn_tensor = graph.matmul(

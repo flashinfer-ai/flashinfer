@@ -15,9 +15,6 @@ import torch
 
 from flashinfer.gemm.gemm_base import (
     CUDNN_AVAILABLE,
-    _OVERRIDE_SHAPE_CACHE_M,
-    _get_bf16_3d_shape_stride,
-    _cudnn_gemm_bf16_override_shape,
     build_cudnn_gemm_bf16_graph_override_shape,
     execute_cudnn_gemm_bf16_graph_override_shape,
     build_cudnn_fp4_gemm_graph_override_shape,
@@ -27,8 +24,6 @@ from flashinfer.gemm.gemm_base import (
     is_cudnn_override_shape_available,
     CUDNN_MIN_VERSION_OVERRIDE_SHAPE,
     _calculate_block_scale_dims,
-    _get_real_fp4_shape_from_packed_uint8,
-    _expand_block_scale_tensor_shape,
 )
 from flashinfer.utils import get_compute_capability
 
@@ -43,6 +38,7 @@ def _skip_if_override_shape_not_supported():
         pytest.skip("cuDNN not available")
     if not is_cudnn_override_shape_available():
         import cudnn
+
         pytest.skip(
             f"cuDNN override-shape requires backend >= {CUDNN_MIN_VERSION_OVERRIDE_SHAPE} "
             f"(9.21.0), found {cudnn.backend_version()}"
@@ -77,7 +73,6 @@ class TestCudnnBf16OverrideShape:
         _skip_if_override_shape_not_supported()
         _skip_if_not_sm100()
 
-        import cudnn
         from flashinfer.gemm.gemm_base import _torch_data_type_to_cudnn_data_type
 
         device = torch.device("cuda")
@@ -114,8 +109,8 @@ class TestCudnnBf16OverrideShape:
 
             assert torch.allclose(ref, out, rtol=5e-2, atol=5e-2), (
                 f"BF16 override_shape failed for m={m}, n={n}, k={k}: "
-                f"max_abs_err={( ref - out).abs().max().item():.4f}, "
-                f"max_rel_err={(( ref - out).abs() / (ref.abs() + 1e-8)).max().item():.4f}"
+                f"max_abs_err={(ref - out).abs().max().item():.4f}, "
+                f"max_rel_err={((ref - out).abs() / (ref.abs() + 1e-8)).max().item():.4f}"
             )
 
 
@@ -146,6 +141,7 @@ class TestCudnnNVFp4OverrideShape:
         _skip_if_not_sm100()
 
         import cudnn
+
         if cudnn.backend_version() < 91002:
             pytest.skip("FP4 requires cuDNN backend >= 91002")
         from flashinfer.gemm.gemm_base import _torch_data_type_to_cudnn_data_type
@@ -178,28 +174,49 @@ class TestCudnnNVFp4OverrideShape:
         )
 
         workspace = torch.empty(
-            graph.get_workspace_size(), dtype=torch.uint8, device=device,
+            graph.get_workspace_size(),
+            dtype=torch.uint8,
+            device=device,
         )
 
         # B is fixed across all dynamic_ms
-        b_packed = torch.randint(0, 256, (1, n, k // 2), dtype=torch.uint8, device=device).transpose(1, 2)
+        b_packed = torch.randint(
+            0, 256, (1, n, k // 2), dtype=torch.uint8, device=device
+        ).transpose(1, 2)
         b_descale = torch.ones(
-            1, block_scale_dim_n, block_scale_dim_k, dtype=torch.float8_e4m3fn, device=device
+            1,
+            block_scale_dim_n,
+            block_scale_dim_k,
+            dtype=torch.float8_e4m3fn,
+            device=device,
         ).transpose(1, 2)
 
         for m in dynamic_ms:
             block_scale_dim_m, _, _ = _calculate_block_scale_dims(m, n, k, block_size)
 
-            a_packed = torch.randint(0, 256, (1, m, k // 2), dtype=torch.uint8, device=device)
+            a_packed = torch.randint(
+                0, 256, (1, m, k // 2), dtype=torch.uint8, device=device
+            )
             a_descale = torch.ones(
-                1, block_scale_dim_m, block_scale_dim_k, dtype=torch.float8_e4m3fn, device=device
+                1,
+                block_scale_dim_m,
+                block_scale_dim_k,
+                dtype=torch.float8_e4m3fn,
+                device=device,
             )
 
             # Execute with cached graph (override_shape)
             out = torch.empty(1, m, n, dtype=out_dtype, device=device)
             execute_cudnn_fp4_gemm_graph_override_shape(
-                graph, a_packed, b_packed, a_descale, b_descale,
-                alpha=None, c_final=out, workspace_buffer=workspace, tactic=0,
+                graph,
+                a_packed,
+                b_packed,
+                a_descale,
+                b_descale,
+                alpha=None,
+                c_final=out,
+                workspace_buffer=workspace,
+                tactic=0,
             )
             torch.cuda.synchronize()
 
@@ -256,12 +273,20 @@ class TestCudnnMXFp8OverrideShape:
         )
 
         workspace = torch.empty(
-            graph.get_workspace_size(), dtype=torch.uint8, device=device,
+            graph.get_workspace_size(),
+            dtype=torch.uint8,
+            device=device,
         )
 
-        b = torch.randint(0, 256, (1, n, k), dtype=torch.uint8, device=device).transpose(1, 2)
+        b = torch.randint(
+            0, 256, (1, n, k), dtype=torch.uint8, device=device
+        ).transpose(1, 2)
         b_descale = torch.ones(
-            1, block_scale_dim_n, block_scale_dim_k, dtype=torch.float8_e8m0fnu, device=device
+            1,
+            block_scale_dim_n,
+            block_scale_dim_k,
+            dtype=torch.float8_e8m0fnu,
+            device=device,
         ).transpose(1, 2)
 
         for m in dynamic_ms:
@@ -269,13 +294,23 @@ class TestCudnnMXFp8OverrideShape:
 
             a = torch.randint(0, 256, (1, m, k), dtype=torch.uint8, device=device)
             a_descale = torch.ones(
-                1, block_scale_dim_m, block_scale_dim_k, dtype=torch.float8_e8m0fnu, device=device
+                1,
+                block_scale_dim_m,
+                block_scale_dim_k,
+                dtype=torch.float8_e8m0fnu,
+                device=device,
             )
 
             # Execute with cached graph (override_shape)
             out = torch.empty(1, m, n, dtype=out_dtype, device=device)
             execute_cudnn_mxfp8_gemm_graph_override_shape(
-                graph, a, b, a_descale, b_descale,
-                c_final=out, workspace_buffer=workspace, tactic=0,
+                graph,
+                a,
+                b,
+                a_descale,
+                b_descale,
+                c_final=out,
+                workspace_buffer=workspace,
+                tactic=0,
             )
             torch.cuda.synchronize()
