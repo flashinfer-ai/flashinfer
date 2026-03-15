@@ -859,6 +859,11 @@ __global__ void RopeQuantizeAppendPagedKVCacheKernel(
     const uint32_t idx = bx * bdy + ty;
     const RoPEIdType pos = pos_ids[idx];
 
+    // skip padding tokens with batch_indices < 0
+    if (batch_indices[idx] < 0) {
+      return;
+    }
+
     // Compute page location for this token
     uint32_t page_iter, entry_idx;
     paged_kv_like.page_size.divmod(
