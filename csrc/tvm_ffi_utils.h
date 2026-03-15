@@ -166,6 +166,21 @@ constexpr DLDevice cpu = DLDevice{kDLCPU, 0};
     }                                                                                    \
   }()
 
+// Dispatcher for FP16/BF16/FP8 data types
+#define DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16_FP8(dlpack_dtype, c_type, ...)               \
+  [&]() -> bool {                                                                        \
+    switch (encode_dlpack_dtype(dlpack_dtype)) {                                         \
+      _DISPATCH_CASE_F16(c_type, __VA_ARGS__)                                            \
+      _DISPATCH_CASE_BF16(c_type, __VA_ARGS__)                                           \
+      _DISPATCH_CASE_FP8_E4M3(c_type, __VA_ARGS__)                                       \
+      _DISPATCH_CASE_FP8_E5M2(c_type, __VA_ARGS__)                                       \
+      default:                                                                           \
+        TVM_FFI_ICHECK(false) << __PRETTY_FUNCTION__ << " failed to dispatch data type " \
+                              << (dlpack_dtype).code << " " << (dlpack_dtype).bits;      \
+        return false;                                                                    \
+    }                                                                                    \
+  }()
+
 #ifdef FLASHINFER_ENABLE_F32
 #define _DISPATCH_CASE_F32(c_type, ...) \
   case float32_code: {                  \

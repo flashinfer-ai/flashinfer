@@ -447,6 +447,22 @@ __forceinline__ __device__ int get_lane_id() {
 }
 
 /*!
+ * \brief Non-atomic global load for short (2 bytes) with cache streaming hint
+ */
+__forceinline__ __device__ short ld_na_global_v_short(const short* addr) {
+  short val;
+  asm volatile("ld.global.cs.b16 %0, [%1];" : "=h"(val) : "l"(addr));
+  return val;
+}
+
+/*!
+ * \brief Non-atomic global store for short (2 bytes) with cache streaming hint
+ */
+__forceinline__ __device__ void st_na_global_v_short(short* addr, short val) {
+  asm volatile("st.global.cs.b16 [%0], %1;" ::"l"(addr), "h"(val));
+}
+
+/*!
  * \brief Non-atomic global load for int (4 bytes) with cache streaming hint
  */
 __forceinline__ __device__ int ld_na_global_v1(const int* addr) {
