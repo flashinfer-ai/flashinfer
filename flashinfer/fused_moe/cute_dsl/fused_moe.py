@@ -58,7 +58,6 @@ from ...autotuner import AutoTuner
 from .moe_utils import (
     allocate_moe_sort_buffers,
     get_max_num_permuted_tokens,
-    moe_output_memset,
     moe_sort,
 )
 from .blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion import (
@@ -246,30 +245,20 @@ def _moe_core_impl(
         )
     )
 
-    # Step 3: Async moe_output_memset on auxiliary stream
+    # Step 3: Zero output buffer (overlapped with GEMM1 on auxiliary stream)
+    # The finalize kernel uses atomic adds, so the output must be zeroed first.
+    # We zero the full output on the aux stream (overlapping with GEMM1) and
+    # skip the redundant zero inside the finalize kernel wrapper.
     if use_async_memset:
-        max_num_permuted_tokens = get_max_num_permuted_tokens(
-            num_tokens, top_k, num_local_experts, tile_size
-        )
         with torch.cuda.stream(aux_stream):
             main_event.wait()
-            moe_output_memset(
-                output=moe_output,
-                tile_idx_to_mn_limit=tile_idx_to_mn_limit,
-                expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
-                permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
-                num_non_exiting_tiles=num_non_exiting_tiles,
-                max_num_permuted_tokens=max_num_permuted_tokens,
-                top_k=top_k,
-                tile_size=tile_size,
-            )
+            moe_output[:num_tokens].zero_()
             memset_event.record()
         memset_event.wait()
     else:
-        # Simple zero without async
         moe_output[:num_tokens].zero_()
 
-    # Step 4: GEMM2 + Finalize
+    # Step 4: GEMM2 + Finalize (output already zeroed, skip internal zero)
     blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         a=intermediate,
         b=w2_weight,
