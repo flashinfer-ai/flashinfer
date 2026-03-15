@@ -812,8 +812,10 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
 
         # SM120 supported shapes for block-scaled paths
         _sm120_supported_shapes = {
-            (128, 128, 128), (128, 128, 64),
-            (128, 256, 64), (256, 128, 64),
+            (128, 128, 128),
+            (128, 128, 64),
+            (128, 256, 64),
+            (256, 128, 64),
         }
 
         # For mixed FP8xFP4 on SM120/SM121, only emit shapes that fit in 99KB SMEM
