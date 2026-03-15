@@ -56,6 +56,8 @@ from .jit.fp4_quantization import (
     gen_fp4_quantization_sm120f_module,
     gen_fp4_quantization_sm121_module,
 )
+from .jit.fp4_kv_dequantization import gen_fp4_kv_dequantization_module
+from .jit.fp4_kv_quantization import gen_fp4_kv_quantization_module
 from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
 from .jit.fused_moe import (
     gen_cutlass_fused_moe_sm90_module,
@@ -607,6 +609,10 @@ def gen_all_modules(
             jit_specs.append(gen_trtllm_utils_module())
         if has_sm90:
             jit_specs.append(gen_gdn_prefill_sm90_module())
+        # FP4 KV cache quantization/dequantization
+        jit_specs.append(gen_fp4_kv_dequantization_module())
+        if has_sm100 or has_sm103 or has_sm110 or has_sm120:
+            jit_specs.append(gen_fp4_kv_quantization_module())
 
     if (
         add_xqa and get_cuda_version() > Version("12.8")
