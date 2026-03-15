@@ -44,17 +44,25 @@ class BatchAttention:
     @flashinfer_api
     def __init__(
         self,
+        float_workspace_buffer: torch.Tensor = None,
         kv_layout: str = "NHD",
         device: str = "cuda",
+        use_cuda_graph: bool = False,
+        paged_kv_indptr_buffer: Optional[torch.Tensor] = None,
+        paged_kv_indices_buffer: Optional[torch.Tensor] = None,
+        kv_len_arr_buffer: Optional[torch.Tensor] = None,
     ):
         _check_kv_layout(kv_layout)
         self._kv_layout = kv_layout
+        if float_workspace_buffer is None:
+            self.float_workspace_buffer = torch.empty(
+                384 * 1024 * 1024,
+                dtype=torch.uint8,
+                device=torch.device(device),
+            )
+        else:
+            self.float_workspace_buffer = float_workspace_buffer
 
-        self.float_workspace_buffer = torch.empty(
-            384 * 1024 * 1024,
-            dtype=torch.uint8,
-            device=torch.device(device),
-        )
         self.int_workspace_buffer = torch.empty(
             8 * 1024 * 1024,
             dtype=torch.uint8,
@@ -66,6 +74,41 @@ class BatchAttention:
             device=torch.device("cpu"),
             pin_memory=True,
         )
+        self.device = torch.device(device)
+
+        self._use_cuda_graph = use_cuda_graph
+        if use_cuda_graph:
+            buffers_to_check = {
+                "paged_kv_indptr_buffer": paged_kv_indptr_buffer,
+                "paged_kv_indices_buffer": paged_kv_indices_buffer,
+                "kv_len_arr_buffer": kv_len_arr_buffer,
+            }
+            for name, buf in buffers_to_check.items():
+                if not torch.is_tensor(buf):
+                    raise ValueError(
+                        f"{name} should be a torch.Tensor in cudagraph mode"
+                    )
+            self._fixed_batch_size = len(kv_len_arr_buffer)
+            if len(paged_kv_indptr_buffer) != self._fixed_batch_size + 1:
+                raise ValueError(
+                    "The size of paged_kv_indptr_buffer should be batch_size + 1"
+                )
+            self._qo_indptr_buf = torch.arange(
+                self._fixed_batch_size + 1,
+                dtype=torch.int32,
+                device=self.float_workspace_buffer.device,
+            )
+        else:
+            self._fixed_batch_size = 0
+
+        self._paged_kv_indptr_buf = paged_kv_indptr_buffer
+        self._paged_kv_indices_buf = paged_kv_indices_buffer
+        self._kv_len_arr_buf = kv_len_arr_buffer
+        self.begin_forward = self.plan
+
+    @property
+    def is_cuda_graph_enabled(self) -> bool:
+        return self._use_cuda_graph
 
     @flashinfer_api
     def plan(
@@ -104,11 +147,6 @@ class BatchAttention:
         )
         self.module = get_holistic_attention_module(*get_module_args)
 
-        qo_indptr_host = qo_indptr.to(torch.device("cpu"), non_blocking=True)
-        kv_indptr_host = kv_indptr.to(torch.device("cpu"), non_blocking=True)
-        kv_len_arr_host = kv_len_arr.to(torch.device("cpu"), non_blocking=True)
-        torch.cuda.synchronize()
-
         batch_size = kv_len_arr.shape[0]
         self._page_size = page_size
         self._sm_scale = sm_scale
@@ -118,9 +156,35 @@ class BatchAttention:
         self._page_size = page_size
         self._use_profiler = use_profiler
 
-        # No addtional buf allocated for CUDA graph tensor
-        # Allocate outside FlashInfer
-        self._kv_indices = kv_indices
+        if self._use_cuda_graph:
+            if batch_size != self._fixed_batch_size:
+                raise ValueError(
+                    "The batch size should be fixed in cudagraph mode, the runtime batch size {} "
+                    " mismatches the batch size set during initialization {}".format(
+                        batch_size, self._fixed_batch_size
+                    )
+                )
+            if len(qo_indptr) != self._fixed_batch_size + 1:
+                raise ValueError(
+                    "The length of qo_indptr should be batch_size + 1 in cudagraph mode"
+                )
+            if len(kv_indices) > len(self._paged_kv_indices_buf):
+                raise ValueError(
+                    "The size of kv_indices should be less than or equal to the allocated buffer"
+                )
+            self._qo_indptr_buf.copy_(qo_indptr, non_blocking=True)
+            self._paged_kv_indptr_buf.copy_(kv_indptr, non_blocking=True)
+            self._kv_len_arr_buf.copy_(kv_len_arr, non_blocking=True)
+        else:
+            self._qo_indptr_buf = qo_indptr.to(self.device, non_blocking=True)
+            self._paged_kv_indices_buf = kv_indices.to(self.device, non_blocking=True)
+            self._kv_len_arr_buf = kv_len_arr.to(self.device, non_blocking=True)
+
+        qo_indptr_host = qo_indptr.to(torch.device("cpu"), non_blocking=True)
+        kv_indptr_host = kv_indptr.to(torch.device("cpu"), non_blocking=True)
+        kv_len_arr_host = kv_len_arr.to(torch.device("cpu"), non_blocking=True)
+        torch.cuda.synchronize()
+
         self._plan_info = self.module.plan(
             self.float_workspace_buffer,
             self.int_workspace_buffer,
@@ -183,7 +247,7 @@ class BatchAttention:
             q,
             k_cache,
             v_cache,
-            self._kv_indices,
+            self._paged_kv_indices_buf,
             out,
             lse,
             self._mask_mode,
@@ -209,6 +273,7 @@ class BatchAttentionWithAttentionSinkWrapper(BatchPrefillWithPagedKVCacheWrapper
     a convenient interface for using attention sinks during prefill or decode attention.
     """
 
+    @flashinfer_api
     def __init__(
         self,
         float_workspace_buffer: torch.Tensor,
