@@ -1720,21 +1720,29 @@ def _is_cublas_fp4_available_in_cudnn():
     )
 
 
-# Minimum cuDNN backend version required for is_override_shape_enabled support.
-CUDNN_MIN_VERSION_OVERRIDE_SHAPE = 92100
-
-
 def _check_cudnn_override_shape_availability():
     """Raise if the installed cuDNN backend does not support is_override_shape_enabled."""
     _check_cudnn_availability()
     backend_version = cudnn.backend_version()
-    if backend_version < CUDNN_MIN_VERSION_OVERRIDE_SHAPE:
+    if backend_version < 92100:
         raise RuntimeError(
-            f"cuDNN override-shape GEMM requires backend version >= "
-            f"{CUDNN_MIN_VERSION_OVERRIDE_SHAPE} (9.21.0), "
+            f"cuDNN override-shape GEMM requires backend version >= 92100 (9.21.0), "
             f"found {backend_version}. "
             f"Please upgrade cuDNN: pip install --upgrade nvidia-cudnn-cu12 nvidia-cudnn-frontend"
         )
+    try:
+        version_str = cudnn.__version__
+        major, minor = map(int, version_str.split(".")[:2])
+        if (major, minor) < (1, 20):
+            raise RuntimeError(
+                f"cuDNN override-shape GEMM requires cudnn-frontend version >= 1.20, found {version_str}. "
+                f"Please upgrade: pip install --upgrade nvidia-cudnn-frontend"
+            )
+    except (AttributeError, ValueError, IndexError) as e:
+        raise RuntimeError(
+            "Unable to determine cudnn-frontend version. "
+            "Override-shape GEMM requires cudnn-frontend >= 1.20"
+        ) from e
 
 
 def is_cudnn_override_shape_available() -> bool:
@@ -1742,7 +1750,11 @@ def is_cudnn_override_shape_available() -> bool:
     if not CUDNN_AVAILABLE:
         return False
     try:
-        return cudnn.backend_version() >= CUDNN_MIN_VERSION_OVERRIDE_SHAPE
+        if cudnn.backend_version() < 92100:
+            return False
+        version_str = cudnn.__version__
+        major, minor = map(int, version_str.split(".")[:2])
+        return (major, minor) >= (1, 20)
     except Exception:
         return False
 
@@ -1979,10 +1991,6 @@ def build_cudnn_fp4_gemm_graph_override_shape(
     batch,
     n,
     k,
-    a_descale_n_dim,
-    a_descale_k_dim,
-    b_descale_k_dim,
-    b_descale_n_dim,
     ab_type,
     o_type,
     block_size,
@@ -2005,20 +2013,20 @@ def build_cudnn_fp4_gemm_graph_override_shape(
     scale_type = cudnn.data_type.FP8_E4M3 if use_nvfp4 else cudnn.data_type.FP8_E8M0
 
     # Build shapes / strides using cache_m
-    block_scale_dim_m, _, block_scale_dim_k = _calculate_block_scale_dims(
-        cache_m, n, k, block_size
+    block_scale_dim_m, block_scale_dim_n, block_scale_dim_k = (
+        _calculate_block_scale_dims(cache_m, n, k, block_size)
     )
 
-    a_shape = [batch, cache_m, k]  # FP4 packed: K dimension stores k*2 uint8 values
+    a_shape = [batch, cache_m, k]
     a_stride = [cache_m * k, k, 1]
 
     b_shape = [batch, k, n]
     b_stride = [k * n, 1, k]
 
-    a_descale_shape = [batch, block_scale_dim_m, a_descale_k_dim]
-    a_descale_stride = [block_scale_dim_m * a_descale_k_dim, a_descale_k_dim, 1]
-    b_descale_shape = [batch, b_descale_k_dim, b_descale_n_dim]
-    b_descale_stride = [b_descale_n_dim * b_descale_k_dim, 1, b_descale_k_dim]
+    a_descale_shape = [batch, block_scale_dim_m, block_scale_dim_k]
+    a_descale_stride = [block_scale_dim_m * block_scale_dim_k, block_scale_dim_k, 1]
+    b_descale_shape = [batch, block_scale_dim_k, block_scale_dim_n]
+    b_descale_stride = [block_scale_dim_n * block_scale_dim_k, 1, block_scale_dim_k]
 
     stream = torch.cuda.current_stream(device)
     graph = cudnn.pygraph(

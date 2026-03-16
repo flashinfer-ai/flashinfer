@@ -22,7 +22,6 @@ from flashinfer.gemm.gemm_base import (
     build_cudnn_mxfp8_gemm_graph_override_shape,
     execute_cudnn_mxfp8_gemm_graph_override_shape,
     is_cudnn_override_shape_available,
-    CUDNN_MIN_VERSION_OVERRIDE_SHAPE,
     _calculate_block_scale_dims,
 )
 from flashinfer.utils import get_compute_capability
@@ -37,11 +36,8 @@ def _skip_if_override_shape_not_supported():
     if not CUDNN_AVAILABLE:
         pytest.skip("cuDNN not available")
     if not is_cudnn_override_shape_available():
-        import cudnn
-
         pytest.skip(
-            f"cuDNN override-shape requires backend >= {CUDNN_MIN_VERSION_OVERRIDE_SHAPE} "
-            f"(9.21.0), found {cudnn.backend_version()}"
+            "cuDNN override-shape requires higher version of cuDNN backend and frontend"
         )
 
 
@@ -151,8 +147,8 @@ class TestCudnnNVFp4OverrideShape:
         out_dtype = torch.bfloat16
 
         # Compute block scale dims using cache_m
-        block_scale_dim_m_cache, block_scale_dim_n, block_scale_dim_k = (
-            _calculate_block_scale_dims(cache_m, n, k, block_size)
+        _, block_scale_dim_n, block_scale_dim_k = _calculate_block_scale_dims(
+            cache_m, n, k, block_size
         )
 
         # Build graph once with cache_m
@@ -160,10 +156,6 @@ class TestCudnnNVFp4OverrideShape:
             batch=1,
             n=n,
             k=k,
-            a_descale_n_dim=block_scale_dim_m_cache,
-            a_descale_k_dim=block_scale_dim_k,
-            b_descale_k_dim=block_scale_dim_k,
-            b_descale_n_dim=block_scale_dim_n,
             ab_type=cudnn.data_type.FP4_E2M1,
             o_type=_torch_data_type_to_cudnn_data_type(out_dtype),
             block_size=block_size,
