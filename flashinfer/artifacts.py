@@ -140,7 +140,7 @@ class ArtifactPath:
         "b55211623be7f5697c5262ffd8361fc06c147bc9/batched_gemm-b3c1646-c111d7c/"
     )
     TRTLLM_GEN_GEMM: str = (
-        "a6abaccde860f1933d2ac7a2f73f581259e6fd97/gemm-b3c1646-8adb015/"
+        "b117d5a6b2dd2228aa966a938eac398cf336d8c0/gemm-b3c1646-1fddea2/"
     )
     CUDNN_SDPA: str = "a72d85b019dc125b9f711300cb989430f762f5a6/fmha/cudnn/"
     # For DEEPGEMM, we also need to update KernelMap.KERNEL_MAP_HASH in flashinfer/deep_gemm.py
@@ -162,7 +162,7 @@ class CheckSumHash:
     )
     DEEPGEMM: str = "1a2a166839042dbd2a57f48051c82cd1ad032815927c753db269a4ed10d0ffbf"
     TRTLLM_GEN_GEMM: str = (
-        "4c3edda8575aa2ac80ab6164cd83d071897cf70f02f9721737f6a01d931572d8"
+        "18262161e624f7da9d2d04c528c645a5ff7f5efd774024a0b2eb92748ab18bb9"
     )
     map_checksums: dict[str, str] = {
         safe_urljoin(ArtifactPath.TRTLLM_GEN_FMHA, "checksums.txt"): TRTLLM_GEN_FMHA,
