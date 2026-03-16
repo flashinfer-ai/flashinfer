@@ -621,7 +621,7 @@ __device__ __forceinline__ void DeviceSamplingFromProb(
   int max_valid_index =
       BlockReduce<int, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage->block_prim.reduce_int)
           .Reduce(valid_index, MaxReduceOp{});
-  if (tx == 0 && max_valid_index != -1) {
+  if (tx == 0 && max_valid_index != -1 && max_valid_index < (int)d) {
     temp_storage->last_valid_id = max_valid_index;
   }
   __syncthreads();
@@ -755,9 +755,9 @@ __global__ void SamplingFromLogitsKernel(DType* logits, IdType* output, IdType* 
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
-__global__ void SamplingFromProbKernel(DType* probs, IdType* output, IdType* indices, uint32_t d,
-                                       uint64_t* seed_arr, uint64_t seed_val, uint64_t* offset_arr,
-                                       uint64_t offset_val) {
+__global__ void SamplingFromProbKernel(DType* probs, IdType* output, bool* valid, IdType* indices,
+                                       uint32_t d, uint64_t* seed_arr, uint64_t seed_val,
+                                       uint64_t* offset_arr, uint64_t offset_val) {
   curandStatePhilox4_32_10_t state;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
 
@@ -775,6 +775,7 @@ __global__ void SamplingFromProbKernel(DType* probs, IdType* output, IdType* ind
       reinterpret_cast<SamplingTempStorage<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>&>(
           smem_sampling);
   temp_storage.sampled_id = d;
+  temp_storage.last_valid_id = -1;
   __syncthreads();
 
   vec_t<float, VEC_SIZE> probs_vec;
@@ -800,17 +801,27 @@ __global__ void SamplingFromProbKernel(DType* probs, IdType* output, IdType* ind
     // NOTE(Zihao): this would happen when u is very close to 1
     // and the sum of probabilities is smaller than u
     // In this case, we use the last valid index as the sampled id
+    if (temp_storage.last_valid_id == -1) {
+      if (tx == 0) {
+        output[bx] = 0;
+        valid[bx] = false;
+      }
+      return;
+    }
     sampled_id = temp_storage.last_valid_id;
   }
-  output[bx] = sampled_id;
+  if (tx == 0) {
+    output[bx] = sampled_id;
+    valid[bx] = true;
+  }
 }
 
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
-__global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, IdType* indices,
-                                           IdType* top_k_arr, uint32_t top_k_val, uint32_t d,
-                                           uint64_t* seed_arr, uint64_t seed_val,
+__global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, bool* valid,
+                                           IdType* indices, IdType* top_k_arr, uint32_t top_k_val,
+                                           uint32_t d, uint64_t* seed_arr, uint64_t seed_val,
                                            uint64_t* offset_arr, uint64_t offset_val) {
   const uint32_t batch_size = gridDim.x;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
@@ -840,6 +851,7 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, IdType*
   do {
     round += 1;
     temp_storage.sampled_id = d;
+    temp_storage.last_valid_id = -1;
     __syncthreads();
     float u = curand_uniform(&state) * q;
     aggregate = 0;
@@ -863,6 +875,13 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, IdType*
       // NOTE(Zihao): this would happen when u is very close to 1
       // and the sum of probabilities is smaller than u
       // In this case, we use the last valid index as the sampled id
+      if (temp_storage.last_valid_id == -1) {
+        if (tx == 0) {
+          output[bx] = 0;
+          valid[bx] = false;
+        }
+        return;
+      }
       sampled_id = temp_storage.last_valid_id;
     }
     double pivot_0 = probs[row_idx * d + sampled_id];
@@ -925,15 +944,16 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, IdType*
   __syncthreads();
   if (tx == 0) {
     output[bx] = sampled_id;
+    valid[bx] = true;
   }
 }
 
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
-__global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, IdType* indices,
-                                           float* top_p_arr, float top_p_val, uint32_t d,
-                                           uint64_t* seed_arr, uint64_t seed_val,
+__global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, bool* valid,
+                                           IdType* indices, float* top_p_arr, float top_p_val,
+                                           uint32_t d, uint64_t* seed_arr, uint64_t seed_val,
                                            uint64_t* offset_arr, uint64_t offset_val) {
   const uint32_t batch_size = gridDim.x;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
@@ -961,6 +981,7 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, IdType*
   int sampled_id;
   do {
     temp_storage.sampled_id = d;
+    temp_storage.last_valid_id = -1;
     __syncthreads();
     float u = curand_uniform(&state) * q;
     aggregate = 0;
@@ -984,6 +1005,13 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, IdType*
       // NOTE(Zihao): this would happen when u is very close to 1
       // and the sum of probabilities is smaller than u
       // In this case, we use the last valid index as the sampled id
+      if (temp_storage.last_valid_id == -1) {
+        if (tx == 0) {
+          output[bx] = 0;
+          valid[bx] = false;
+        }
+        return;
+      }
       sampled_id = temp_storage.last_valid_id;
     }
     double pivot_0 = probs[row_idx * d + sampled_id];
@@ -1042,6 +1070,7 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, IdType*
   __syncthreads();
   if (tx == 0) {
     output[bx] = sampled_id;
+    valid[bx] = true;
   }
 }
 
@@ -1049,8 +1078,8 @@ template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
 __global__ void MinPSamplingFromProbKernel(DType* probs, float* min_p_arr, IdType* output,
-                                           IdType* indices, float min_p_val, uint32_t d,
-                                           uint64_t* seed_arr, uint64_t seed_val,
+                                           bool* valid, IdType* indices, float min_p_val,
+                                           uint32_t d, uint64_t* seed_arr, uint64_t seed_val,
                                            uint64_t* offset_arr, uint64_t offset_val) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
 
@@ -1105,6 +1134,7 @@ __global__ void MinPSamplingFromProbKernel(DType* probs, float* min_p_arr, IdTyp
 
   int sampled_id;
   temp_storage.sampled_id = d;
+  temp_storage.last_valid_id = -1;
   __syncthreads();
   float u = curand_uniform(&state) * q;
 #pragma unroll 2
@@ -1126,19 +1156,27 @@ __global__ void MinPSamplingFromProbKernel(DType* probs, float* min_p_arr, IdTyp
     // NOTE(Zihao): this would happen when u is very close to 1
     // and the sum of probabilities is smaller than u
     // In this case, we use the last valid index as the sampled id
+    if (temp_storage.last_valid_id == -1) {
+      if (tx == 0) {
+        output[bx] = 0;
+        valid[bx] = false;
+      }
+      return;
+    }
     sampled_id = temp_storage.last_valid_id;
   }
   output[bx] = sampled_id;
+  valid[bx] = true;
 }
 
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
 __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, float* top_p_arr,
-                                               IdType* output, IdType* indices, IdType top_k_val,
-                                               float top_p_val, uint32_t d, uint64_t* seed_arr,
-                                               uint64_t seed_val, uint64_t* offset_arr,
-                                               uint64_t offset_val) {
+                                               IdType* output, bool* valid, IdType* indices,
+                                               IdType top_k_val, float top_p_val, uint32_t d,
+                                               uint64_t* seed_arr, uint64_t seed_val,
+                                               uint64_t* offset_arr, uint64_t offset_val) {
   const uint32_t batch_size = gridDim.x;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
 
@@ -1166,6 +1204,7 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
   int sampled_id;
   do {
     temp_storage.sampled_id = d;
+    temp_storage.last_valid_id = -1;
     __syncthreads();
     float u = curand_uniform(&state) * q;
     aggregate = 0;
@@ -1190,6 +1229,13 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
       // and the sum of probabilities is smaller than u
       // In this case, we use the last valid index as the sampled id
       sampled_id = temp_storage.last_valid_id;
+      if (temp_storage.last_valid_id == -1) {
+        if (tx == 0) {
+          output[bx] = 0;
+          valid[bx] = false;
+        }
+        return;
+      }
     }
     double pivot_0 = probs[row_idx * d + sampled_id];
     double pivot_1 = (pivot_0 + high) / 2;
@@ -1252,6 +1298,7 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
   __syncthreads();
   if (tx == 0) {
     output[bx] = sampled_id;
+    valid[bx] = true;
   }
 }
 
@@ -1425,16 +1472,18 @@ cudaError_t SamplingFromLogits(T* logits, IdType* output, IdType* indices, uint3
 }
 
 template <typename T, typename IdType>
-cudaError_t SamplingFromProb(T* probs, IdType* output, IdType* indices, uint32_t batch_size,
-                             uint32_t d, bool deterministic, uint64_t* seed_arr, uint64_t seed_val,
-                             uint64_t* offset_arr, uint64_t offset_val, cudaStream_t stream = 0) {
+cudaError_t SamplingFromProb(T* probs, IdType* output, bool* valid, IdType* indices,
+                             uint32_t batch_size, uint32_t d, bool deterministic,
+                             uint64_t* seed_arr, uint64_t seed_val, uint64_t* offset_arr,
+                             uint64_t offset_val, cudaStream_t stream = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   auto compute_capacity = GetCudaComputeCapability();
   DISPATCH_COMPUTE_CAP_NUM_THREADS(compute_capacity, BLOCK_THREADS, {
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&probs, &output, &indices, &d, &seed_arr, &seed_val, &offset_arr, &offset_val};
+    void* args[] = {&probs,    &output,   &valid,      &indices,   &d,
+                    &seed_arr, &seed_val, &offset_arr, &offset_val};
     const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
 
     DISPATCH_ALIGNED_VEC_SIZE(
@@ -1449,8 +1498,8 @@ cudaError_t SamplingFromProb(T* probs, IdType* output, IdType* indices, uint32_t
 }
 
 template <typename T, typename IdType>
-cudaError_t TopKSamplingFromProb(T* probs, IdType* output, IdType* indices, T* top_k_arr,
-                                 uint32_t batch_size, uint32_t top_k_val, uint32_t d,
+cudaError_t TopKSamplingFromProb(T* probs, IdType* output, bool* valid, IdType* indices,
+                                 T* top_k_arr, uint32_t batch_size, uint32_t top_k_val, uint32_t d,
                                  bool deterministic, uint64_t* seed_arr, uint64_t seed_val,
                                  uint64_t* offset_arr, uint64_t offset_val,
                                  cudaStream_t stream = 0) {
@@ -1461,7 +1510,7 @@ cudaError_t TopKSamplingFromProb(T* probs, IdType* output, IdType* indices, T* t
     const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&probs, &output,   &indices,  &top_k_arr,  &top_k_val,
+    void* args[] = {&probs, &output,   &valid,    &indices,    &top_k_arr, &top_k_val,
                     &d,     &seed_arr, &seed_val, &offset_arr, &offset_val};
 
     DISPATCH_ALIGNED_VEC_SIZE(
@@ -1478,10 +1527,11 @@ cudaError_t TopKSamplingFromProb(T* probs, IdType* output, IdType* indices, T* t
 }
 
 template <typename T, typename IdType>
-cudaError_t TopPSamplingFromProb(T* probs, IdType* output, IdType* indices, T* top_p_arr,
-                                 uint32_t batch_size, T top_p_val, uint32_t d, bool deterministic,
-                                 uint64_t* seed_arr, uint64_t seed_val, uint64_t* offset_arr,
-                                 uint64_t offset_val, cudaStream_t stream = 0) {
+cudaError_t TopPSamplingFromProb(T* probs, IdType* output, bool* valid, IdType* indices,
+                                 T* top_p_arr, uint32_t batch_size, T top_p_val, uint32_t d,
+                                 bool deterministic, uint64_t* seed_arr, uint64_t seed_val,
+                                 uint64_t* offset_arr, uint64_t offset_val,
+                                 cudaStream_t stream = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   auto compute_capacity = GetCudaComputeCapability();
@@ -1489,7 +1539,7 @@ cudaError_t TopPSamplingFromProb(T* probs, IdType* output, IdType* indices, T* t
     const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&probs, &output,   &indices,  &top_p_arr,  &top_p_val,
+    void* args[] = {&probs, &output,   &valid,    &indices,    &top_p_arr, &top_p_val,
                     &d,     &seed_arr, &seed_val, &offset_arr, &offset_val};
 
     DISPATCH_ALIGNED_VEC_SIZE(
@@ -1506,8 +1556,8 @@ cudaError_t TopPSamplingFromProb(T* probs, IdType* output, IdType* indices, T* t
 }
 
 template <typename T, typename IdType>
-cudaError_t MinPSamplingFromProb(T* probs, T* min_p_arr, IdType* output, IdType* indices,
-                                 uint32_t batch_size, float min_p_val, uint32_t d,
+cudaError_t MinPSamplingFromProb(T* probs, T* min_p_arr, IdType* output, bool* valid,
+                                 IdType* indices, uint32_t batch_size, float min_p_val, uint32_t d,
                                  bool deterministic, uint64_t* seed_arr, uint64_t seed_val,
                                  uint64_t* offset_arr, uint64_t offset_val,
                                  cudaStream_t stream = 0) {
@@ -1518,7 +1568,7 @@ cudaError_t MinPSamplingFromProb(T* probs, T* min_p_arr, IdType* output, IdType*
     const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&probs, &min_p_arr, &output,   &indices,    &min_p_val,
+    void* args[] = {&probs, &min_p_arr, &output,   &valid,      &indices,   &min_p_val,
                     &d,     &seed_arr,  &seed_val, &offset_arr, &offset_val};
 
     DISPATCH_ALIGNED_VEC_SIZE(
@@ -1536,8 +1586,8 @@ cudaError_t MinPSamplingFromProb(T* probs, T* min_p_arr, IdType* output, IdType*
 
 template <typename T, typename IdType>
 cudaError_t TopKTopPSamplingFromProb(T* probs, IdType* top_k_arr, T* top_p_arr, IdType* output,
-                                     IdType* indices, uint32_t batch_size, IdType top_k_val,
-                                     T top_p_val, uint32_t d, bool deterministic,
+                                     bool* valid, IdType* indices, uint32_t batch_size,
+                                     IdType top_k_val, T top_p_val, uint32_t d, bool deterministic,
                                      uint64_t* seed_arr, uint64_t seed_val, uint64_t* offset_arr,
                                      uint64_t offset_val, cudaStream_t stream = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
@@ -1547,8 +1597,9 @@ cudaError_t TopKTopPSamplingFromProb(T* probs, IdType* top_k_arr, T* top_p_arr, 
     const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&probs,     &top_k_arr, &top_p_arr, &output,   &indices,    &top_k_val,
-                    &top_p_val, &d,         &seed_arr,  &seed_val, &offset_arr, &offset_val};
+    void* args[] = {&probs,    &top_k_arr,  &top_p_arr, &output, &valid,
+                    &indices,  &top_k_val,  &top_p_val, &d,      &seed_arr,
+                    &seed_val, &offset_arr, &offset_val};
 
     DISPATCH_ALIGNED_VEC_SIZE(
         vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
