@@ -1111,6 +1111,137 @@ class TestChunkScanCombinedVarlen:
         ref = self._compute_per_sequence_reference(inputs)
         self._run_and_check(inputs, ref, "Varlen variable-seqlen")
 
+    def test_precomputed_seq_chunk_cumsum(
+        self, nheads, headdim, dstate, chunk_size, ngroups
+    ):
+        """Pre-compute seq_chunk_cumsum via public API and pass it to run()."""
+        seq_lengths = [1 * chunk_size, 2 * chunk_size, 1 * chunk_size]
+        inputs = self._make_inputs(
+            nheads, headdim, dstate, chunk_size, ngroups, seq_lengths
+        )
+        ref = self._compute_per_sequence_reference(inputs)
+        out_ref, final_states_ref = ref
+
+        ssd = mamba.SSDCombined(
+            chunk_size=chunk_size,
+            nheads=nheads,
+            headdim=headdim,
+            dstate=dstate,
+            ngroups=ngroups,
+            has_d=True,
+            d_has_hdim=False,
+            has_initial_states=True,
+            has_varlen=True,
+            has_z=False,
+            state_dtype=inputs["initial_states"].dtype,
+            seq_idx_dtype=inputs["seq_idx"].dtype,
+        )
+
+        # Pre-compute seq_chunk_cumsum via the public method
+        seq_chunk_cumsum = ssd.compute_seq_chunk_cumsum(
+            inputs["seq_idx"],
+            inputs["chunk_indices"],
+            inputs["chunk_offsets"],
+            chunk_size,
+            inputs["num_seqs"],
+        )
+
+        # Run the kernel with pre-computed seq_chunk_cumsum
+        out_test, final_states_test = ssd.run(
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            D=inputs["D"],
+            dt_bias=inputs["dt_bias"],
+            dt_softplus=True,
+            initial_states=inputs["initial_states"],
+            seq_idx=inputs["seq_idx"],
+            chunk_indices=inputs["chunk_indices"],
+            chunk_offsets=inputs["chunk_offsets"],
+            seq_chunk_cumsum=seq_chunk_cumsum,
+        )
+
+        self._check_outputs(
+            out_ref,
+            out_test,
+            final_states_ref,
+            final_states_test,
+            "Varlen pre-computed seq_chunk_cumsum",
+        )
+
+    def test_precomputed_seq_chunk_cumsum_with_tile_state(
+        self, nheads, headdim, dstate, chunk_size, ngroups
+    ):
+        """Pre-compute seq_chunk_cumsum with a pre-allocated tile_state buffer."""
+        seq_lengths = [1 * chunk_size, 2 * chunk_size, 1 * chunk_size]
+        inputs = self._make_inputs(
+            nheads, headdim, dstate, chunk_size, ngroups, seq_lengths
+        )
+        ref = self._compute_per_sequence_reference(inputs)
+        out_ref, final_states_ref = ref
+
+        ssd = mamba.SSDCombined(
+            chunk_size=chunk_size,
+            nheads=nheads,
+            headdim=headdim,
+            dstate=dstate,
+            ngroups=ngroups,
+            has_d=True,
+            d_has_hdim=False,
+            has_initial_states=True,
+            has_varlen=True,
+            has_z=False,
+            state_dtype=inputs["initial_states"].dtype,
+            seq_idx_dtype=inputs["seq_idx"].dtype,
+        )
+
+        # Pre-allocate tile_state and output buffers
+        num_seqs = inputs["num_seqs"]
+        tile_state_bytes = mamba.SSDCombined.tile_state_size(num_seqs)
+        tile_state = (
+            torch.empty(tile_state_bytes, dtype=torch.uint8, device="cuda")
+            if tile_state_bytes > 0
+            else None
+        )
+        seq_chunk_cumsum = torch.zeros(num_seqs + 1, dtype=torch.int32, device="cuda")
+
+        # Compute with all buffers pre-allocated
+        ssd.compute_seq_chunk_cumsum(
+            inputs["seq_idx"],
+            inputs["chunk_indices"],
+            inputs["chunk_offsets"],
+            chunk_size,
+            num_seqs,
+            seq_chunk_cumsum=seq_chunk_cumsum,
+            tile_state=tile_state,
+        )
+
+        out_test, final_states_test = ssd.run(
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            D=inputs["D"],
+            dt_bias=inputs["dt_bias"],
+            dt_softplus=True,
+            initial_states=inputs["initial_states"],
+            seq_idx=inputs["seq_idx"],
+            chunk_indices=inputs["chunk_indices"],
+            chunk_offsets=inputs["chunk_offsets"],
+            seq_chunk_cumsum=seq_chunk_cumsum,
+        )
+
+        self._check_outputs(
+            out_ref,
+            out_test,
+            final_states_ref,
+            final_states_test,
+            "Varlen pre-computed seq_chunk_cumsum with tile_state",
+        )
+
 
 class TestChunkScanCombinedVarlenNonAligned:
     """Test CuTe DSL kernel with non-chunk-aligned variable-length sequences."""

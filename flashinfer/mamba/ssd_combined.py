@@ -388,6 +388,66 @@ class SSDCombined:
             self._seq_cumsum_buf.zero_()
         return self._seq_cumsum_buf
 
+    def compute_seq_chunk_cumsum(
+        self,
+        seq_idx: torch.Tensor,
+        chunk_indices: torch.Tensor,
+        chunk_offsets: torch.Tensor,
+        chunk_size: int,
+        num_seqs: int,
+        seq_chunk_cumsum: Optional[torch.Tensor] = None,
+        tile_state: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Compute (or fill) the seq_chunk_cumsum mapping for varlen mode.
+
+        Args:
+            seq_idx: int32/int64 tensor [1, total_seqlen].
+            chunk_indices: int32 tensor [num_logical_chunks].
+            chunk_offsets: int32 tensor [num_logical_chunks].
+            chunk_size: chunk size used by the SSD kernel.
+            num_seqs: number of sequences.
+            seq_chunk_cumsum: Optional output buffer of shape [num_seqs + 1],
+                dtype int32.  Allocated internally if None.
+            tile_state: Optional pre-allocated uint8 workspace for
+                cub::ScanTileState (multi-block path only).  Size must be at
+                least ``tile_state_size(num_seqs)`` bytes.  Allocated
+                internally if None.
+
+        Returns:
+            int32 tensor [num_seqs + 1] with the exclusive prefix sum of
+            per-sequence logical chunk counts.
+        """
+        if seq_chunk_cumsum is None:
+            seq_chunk_cumsum = self._get_or_alloc_seq_cumsum(num_seqs, seq_idx.device)
+        if tile_state is None:
+            module = _get_seq_chunk_cumsum_module()
+            tile_state_bytes = module.seq_chunk_cumsum_tile_state_size(num_seqs)
+            tile_state = (
+                torch.empty(
+                    tile_state_bytes,
+                    dtype=torch.uint8,
+                    device=seq_idx.device,
+                )
+                if tile_state_bytes > 0
+                else None
+            )
+        _get_seq_chunk_cumsum_module().seq_chunk_cumsum(
+            seq_idx,
+            chunk_indices,
+            chunk_offsets,
+            seq_chunk_cumsum,
+            tile_state,
+            chunk_size,
+            len(chunk_indices),
+            num_seqs,
+        )
+        return seq_chunk_cumsum
+
+    @staticmethod
+    def tile_state_size(num_seqs: int) -> int:
+        """Return the tile_state buffer size in bytes for the given num_seqs."""
+        return _get_seq_chunk_cumsum_module().seq_chunk_cumsum_tile_state_size(num_seqs)
+
     # -- main entry point ------------------------------------------------------
 
     def run(
@@ -406,12 +466,24 @@ class SSDCombined:
         seq_idx: Optional[torch.Tensor] = None,
         chunk_indices: Optional[torch.Tensor] = None,
         chunk_offsets: Optional[torch.Tensor] = None,
+        seq_chunk_cumsum: Optional[torch.Tensor] = None,
+        update_seq_chunk_cumsum: bool = False,
         out: Optional[torch.Tensor] = None,
         return_final_states: bool = True,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run SSD combined forward pass.
 
         Parameters match ``ssd_combined_fwd`` — see its docstring for details.
+
+        Args:
+            seq_chunk_cumsum: Optional int32 tensor of shape [num_seqs + 1].
+                If provided with update_seq_chunk_cumsum=False (default), treated
+                as pre-computed and the internal computation is skipped.
+                If provided with update_seq_chunk_cumsum=True, used as the output
+                buffer and filled by the internal computation.
+                If None, an internal buffer is allocated and computed.
+            update_seq_chunk_cumsum: If True, (re)compute seq_chunk_cumsum into
+                the provided tensor.  Defaults to False.
         """
         chunk_size = self.chunk_size
 
@@ -574,8 +646,8 @@ class SSDCombined:
         fstate_torch = self._get_or_alloc_fstate(fstate_batch)
         fstate_permuted = fstate_torch.permute(3, 2, 1, 0)
 
-        # Varlen metadata: seq_chunk_cumsum is output buffer for Triton kernel, passed as input to CUTLASS kernel
-        seq_chunk_cumsum = None
+        # Varlen metadata: seq_chunk_cumsum maps sequence IDs to logical chunk ranges.
+        # It can be pre-computed by the caller via compute_seq_chunk_cumsum().
         num_seqs = 0
 
         if (
@@ -589,21 +661,15 @@ class SSDCombined:
                     "chunk_indices, and chunk_offsets are given) to determine num_seqs"
                 )
             num_seqs = initial_states.shape[0]
-            num_logical_chunks_local = len(chunk_indices)
-            seq_chunk_cumsum = self._get_or_alloc_seq_cumsum(
-                num_seqs,
-                seq_idx.device,
-            )
-            _get_seq_chunk_cumsum_module().seq_chunk_cumsum(
-                seq_idx,
-                chunk_indices,
-                chunk_offsets,
-                seq_chunk_cumsum,
-                None,  # tile_state: let kernel allocate internally
-                chunk_size,
-                num_logical_chunks_local,
-                num_seqs,
-            )
+            if seq_chunk_cumsum is None or update_seq_chunk_cumsum:
+                seq_chunk_cumsum = self.compute_seq_chunk_cumsum(
+                    seq_idx,
+                    chunk_indices,
+                    chunk_offsets,
+                    chunk_size,
+                    num_seqs,
+                    seq_chunk_cumsum,
+                )
 
         num_logical_chunks = (
             len(chunk_indices) if chunk_indices is not None else nchunks

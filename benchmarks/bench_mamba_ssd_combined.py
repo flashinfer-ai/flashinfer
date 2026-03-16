@@ -106,7 +106,8 @@ def make_varlen_inputs(
 ):
     """Create packed varlen inputs. Returns (kwargs, label_dict).
 
-    kwargs includes cu_seqlens (needed by triton only — callers strip it for flashinfer).
+    kwargs includes cu_seqlens (needed by triton only — callers strip it for flashinfer)
+    and seq_chunk_cumsum (pre-computed so ssd.run() does zero allocations).
     """
     seq_len_each = chunks_per_seq * chunk_size
     total_seqlen = num_seqs * seq_len_each
@@ -136,6 +137,28 @@ def make_varlen_inputs(
         cu_seqlens, chunk_size
     )
 
+    # Pre-compute seq_chunk_cumsum so ssd.run() does zero allocations
+    from flashinfer.mamba.ssd_combined import _get_seq_chunk_cumsum_module
+
+    module = _get_seq_chunk_cumsum_module()
+    tile_state_bytes = module.seq_chunk_cumsum_tile_state_size(num_seqs)
+    tile_state = (
+        torch.empty(tile_state_bytes, dtype=torch.uint8, device="cuda")
+        if tile_state_bytes > 0
+        else None
+    )
+    seq_chunk_cumsum = torch.zeros(num_seqs + 1, dtype=torch.int32, device="cuda")
+    module.seq_chunk_cumsum(
+        seq_idx,
+        chunk_indices,
+        chunk_offsets,
+        seq_chunk_cumsum,
+        tile_state,
+        chunk_size,
+        len(chunk_indices),
+        num_seqs,
+    )
+
     kwargs = dict(
         x=x,
         dt=dt,
@@ -151,6 +174,7 @@ def make_varlen_inputs(
         chunk_indices=chunk_indices,
         chunk_offsets=chunk_offsets,
         cu_seqlens=cu_seqlens,
+        seq_chunk_cumsum=seq_chunk_cumsum,
     )
     nchunks = total_seqlen // chunk_size
     label = dict(
@@ -284,12 +308,16 @@ def bench_mode(configs, mode, model_params, bench_params, title=None):
     # - FlashInfer (SSDCombined.run) doesn't accept chunk_size or cu_seqlens
     # - In batched mode, strip initial_states from both: Triton's _chunk_scan_fwd
     #   only supports initial_states with batch==1 + varlen metadata.
+    # - Triton doesn't know about seq_chunk_cumsum
     strip_keys = {
         "batched": {
             "FlashInfer": {"chunk_size", "initial_states"},
             "Triton": {"initial_states"},
         },
-        "varlen": {"FlashInfer": {"cu_seqlens", "chunk_size"}, "Triton": set()},
+        "varlen": {
+            "FlashInfer": {"cu_seqlens", "chunk_size"},
+            "Triton": {"seq_chunk_cumsum"},
+        },
     }
 
     kernels = [

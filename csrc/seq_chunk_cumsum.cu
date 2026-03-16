@@ -52,3 +52,7 @@ void seq_chunk_cumsum(TensorView seq_idx, TensorView chunk_indices, TensorView c
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "SeqChunkCumsumLauncher failed: " << cudaGetErrorString(status);
 }
+
+int64_t seq_chunk_cumsum_tile_state_size(int64_t num_seqs) {
+  return static_cast<int64_t>(SeqChunkCumsumWorkspaceSize(static_cast<int>(num_seqs)));
+}
