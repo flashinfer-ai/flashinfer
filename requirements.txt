@@ -3,7 +3,7 @@ click
 einops
 ninja
 numpy
-nvidia-cudnn-frontend>=1.13.0 # would need to update to 1.19.0 for rmsnorm+silu once it's released, or add a version check in the module.
+nvidia-cudnn-frontend>=1.20.0
 nvidia-cutlass-dsl>=4.3.4
 nvidia-ml-py
 packaging>=24.2
