@@ -33,6 +33,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from flashinfer.testing import bench_gpu_time
+from flashinfer.utils import is_sm100a_supported, is_sm110a_supported
 
 # Blackwell GDN prefill
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
@@ -426,6 +427,11 @@ def main():
     )
 
     args = parser.parse_args()
+
+    device = torch.device("cuda")
+    if not (is_sm100a_supported(device) or is_sm110a_supported(device)):
+        print("Error: bench_blackwell_gdn_prefill.py requires an SM100A/SM110A GPU.")
+        sys.exit(1)
 
     if args.head_dim != 128:
         print(f"Error: head_dim must be 128, got {args.head_dim}")
