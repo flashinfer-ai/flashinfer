@@ -36,12 +36,13 @@ def _build_rmsnorm_silu_graph(
 ):
     """Build and cache a cuDNN graph for fused RMSNorm + SiLU.
 
-    The graph is cached by (num_tokens, C, output_dtype, device_index) since
-    the kernel variant and NVRTC compilation depend on the problem shape and
-    output type.
+    The graph is cached by (num_tokens, C, output_dtype, device_index) because
+    cuDNN binds tensor dimensions at build time.  The compiled cubin (via
+    NVRTC) depends only on C, output_dtype, and GPU arch — not num_tokens.
 
-    First call triggers NVRTC compilation (~2-5 seconds).
-    Subsequent calls with the same key reuse the cached graph.
+    First call for a new (C, output_dtype, device) triggers NVRTC compilation
+    (~2-5 s).  Subsequent calls with a different num_tokens but the same C
+    rebuild only the lightweight graph descriptor, not the cubin.
     """
     # Convert int back to cudnn enum (lru_cache needs hashable args)
     out_dtype = cudnn.data_type(output_cudnn_dtype)
