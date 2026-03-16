@@ -38,6 +38,19 @@ import cutlass.cute as cute
 import cutlass.cute.testing as testing
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
+
+# Compat shim: setmaxregister_{decrease,increase} added in cutlass-dsl 4.4;
+# older versions only have the deprecated warpgroup_reg_{dealloc,alloc}.
+_setmaxregister_decrease = getattr(
+    cute.arch,
+    "setmaxregister_decrease",
+    getattr(cute.arch, "warpgroup_reg_dealloc", None),
+)
+_setmaxregister_increase = getattr(
+    cute.arch,
+    "setmaxregister_increase",
+    getattr(cute.arch, "warpgroup_reg_alloc", None),
+)
 import cutlass.cute.nvgpu.cpasync as cpasync
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
@@ -1027,10 +1040,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         #  Load warps, including page table and data tensors
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx >= self.empty_warp_ids[0] and warp_idx <= self.empty_warp_ids[-1]:
-            cute.arch.setmaxregister_decrease(self.other_reg_num)
+            _setmaxregister_decrease(self.other_reg_num)
 
         if warp_idx == self.load_tma_k_warp_id:
-            cute.arch.setmaxregister_decrease(self.other_reg_num)
+            _setmaxregister_decrease(self.other_reg_num)
             load_q_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.load_q_stage
             )
@@ -1090,7 +1103,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             load_k_pipeline.producer_tail(load_k_producer_state)
 
         if warp_idx == self.load_tma_v_warp_id:
-            cute.arch.setmaxregister_decrease(self.other_reg_num)
+            _setmaxregister_decrease(self.other_reg_num)
             load_v_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.load_v_stage
             )
@@ -1136,7 +1149,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         #  MMA warp
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.mma_warp_id:
-            cute.arch.setmaxregister_decrease(self.other_reg_num)
+            _setmaxregister_decrease(self.other_reg_num)
             # Alloc tensor memory buffer
             tmem.allocate(cute.arch.get_max_tmem_alloc_cols("sm_100"))
             tmem.wait_for_alloc()
@@ -1232,7 +1245,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             warp_idx >= self.compute_warp_ids[0]
             and warp_idx <= self.compute_warp_ids[-1]
         ):
-            cute.arch.setmaxregister_increase(self.softmax_reg_num)
+            _setmaxregister_increase(self.softmax_reg_num)
             mma_s_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.mma_s_stage
             )
@@ -1300,7 +1313,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             warp_idx >= self.correction_warp_ids[0]
             and warp_idx <= self.correction_warp_ids[-1]
         ):
-            cute.arch.setmaxregister_increase(self.correction_reg_num)
+            _setmaxregister_increase(self.correction_reg_num)
             p_cor_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.p_cor_stage
             )
