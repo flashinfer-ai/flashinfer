@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <algorithm>
 #include <iostream>
 
 #include "flashinfer/exception.h"
@@ -47,7 +48,8 @@ inline int32_t computeLog2(int32_t val, std::string const& name = "") {
 
 Runner::Runner() {}
 
-Runner::Runner(int32_t tileTokensDim) : mTileTokensDim(tileTokensDim) {}
+Runner::Runner(int32_t tileTokensDim, int32_t clusterSizeInBatchDim)
+    : mTileTokensDim(tileTokensDim), mClusterSizeInBatchDim(clusterSizeInBatchDim) {}
 
 void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int32_t numExperts,
                  int32_t topK, int32_t nGroup, int32_t topkGroup, int32_t localExpertOffset,
@@ -93,6 +95,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mTopK = topK;
     routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
     routingData.mTileTokensDim = mTileTokensDim;
+    routingData.mClusterSizeInBatchDim = mClusterSizeInBatchDim;
+    routingData.mClusterSizeLog2 = computeLog2(mClusterSizeInBatchDim);
     routingData.mLocalExpertsStartIdx = localExpertOffset;
     routingData.mLocalExpertsStrideLog2 = 0;
     routingData.mNumLocalExperts = localNumExperts;
@@ -129,6 +133,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mTopK = topK;
     routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
     routingData.mTileTokensDim = mTileTokensDim;
+    routingData.mClusterSizeInBatchDim = mClusterSizeInBatchDim;
+    routingData.mClusterSizeLog2 = computeLog2(mClusterSizeInBatchDim);
     routingData.mLocalExpertsStartIdx = localExpertOffset;
     routingData.mLocalExpertsStrideLog2 = 0;
     routingData.mNumLocalExperts = localNumExperts;
@@ -177,6 +183,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mTopK = topK;
     routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
     routingData.mTileTokensDim = mTileTokensDim;
+    routingData.mClusterSizeInBatchDim = mClusterSizeInBatchDim;
+    routingData.mClusterSizeLog2 = computeLog2(mClusterSizeInBatchDim);
     routingData.mLocalExpertsStartIdx = localExpertOffset;
     routingData.mLocalExpertsStrideLog2 = 0;
     routingData.mNumLocalExperts = localNumExperts;
@@ -236,16 +244,14 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
   if (isGatedAct) {
     ActType actType = activationTypeToGatedActType(activationType);
     tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options = {
-        // Swap A and B dtypes because transposeMmaOutput is hardcoded to true
-        .dtypeA = dtypeWeights,
-        .dtypeB = dtypeAct,
+        .dtypeA = dtypeAct,
+        .dtypeB = dtypeWeights,
         .dtypeC = dtypeAct,
         .actType = actType,
         .deepSeekFp8 = useDeepSeekFp8,
         .fusedAct = !useDeepSeekFp8,
         .routeAct = true,
         .staticBatch = false,
-        .transposeMmaOutput = true,
         .tileSize = tileTokensDim,
         .epilogueTileM = useDeepSeekFp8 ? 64 : 128,
         .useShuffledMatrix = useShuffledMatrix,
@@ -254,16 +260,14 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
   } else {
     EltwiseActType actType = activationTypeToEltwiseActType(activationType);
     tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options = {
-        // Swap A and B dtypes because transposeMmaOutput is hardcoded to true
-        .dtypeA = dtypeWeights,
-        .dtypeB = dtypeAct,
+        .dtypeA = dtypeAct,
+        .dtypeB = dtypeWeights,
         .dtypeC = dtypeAct,
         .eltwiseActType = actType,
         .deepSeekFp8 = useDeepSeekFp8,
         .fusedAct = false,
         .routeAct = true,
         .staticBatch = false,
-        .transposeMmaOutput = true,
         .tileSize = tileTokensDim,
         .epilogueTileM = 128,
         .useShuffledMatrix = useShuffledMatrix,
@@ -292,11 +296,11 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
                  int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx,
                  int32_t* ptrCtaIdxXyToMnLimit, void* bmm1Workspace, bool useRoutingScalesOnInput,
                  int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl) {
-  auto maxNumCtasInBatchDim =
-      Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
+  auto maxNumCgasInBatchDim =
+      Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
   int32_t intermediateSizeFactor = (isGatedActivation(mActType) ? 2 : 1);
   mRunner.run(numTokens, intermediateSizeFactor * intermediateSize, hiddenSize, {}, numTokens,
-              numExperts, maxNumCtasInBatchDim, hiddenState, hiddenStateScale, weights,
+              numExperts, maxNumCgasInBatchDim, hiddenState, hiddenStateScale, weights,
               weightsScale, expertWeights, /* perTokensSfB */ nullptr, outputScalesScalar,
               outputScalesGateScalar, ptrBias, ptrAlpha, ptrBeta, ptrClampLimit, output,
               outputScale, permutedIdxToTokenIdx, ptrTotalNumPaddedTokens, ptrCtaIdxXyToBatchIdx,
@@ -307,41 +311,45 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
 size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
                                        int32_t numExperts, int32_t numTokens,
                                        int32_t configIndex) const {
-  auto maxNumCtasInBatchDim =
-      Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
+  auto maxNumCgasInBatchDim =
+      Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
   int32_t intermediateSizeFactor = (isGatedActivation(mActType) ? 2 : 1);
   return mRunner.getWorkspaceSizeInBytes(numTokens, intermediateSizeFactor * intermediateSize,
                                          hiddenSize, {}, numTokens, numExperts,
-                                         maxNumCtasInBatchDim, configIndex);
+                                         maxNumCgasInBatchDim, configIndex);
 }
 
 int32_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize,
                                            int32_t intermediateSize, int32_t numExperts,
                                            int32_t numTokens) const {
-  auto maxNumCtasInBatchDim =
-      Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
+  auto maxNumCgasInBatchDim =
+      Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
   int32_t intermediateSizeFactor = (isGatedActivation(mActType) ? 2 : 1);
   return mRunner.getDefaultValidConfigIndex(numTokens, intermediateSizeFactor * intermediateSize,
                                             hiddenSize, {}, numTokens, numExperts,
-                                            maxNumCtasInBatchDim);
+                                            maxNumCgasInBatchDim);
 }
 
 bool Runner::isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hiddenSize,
                                 int32_t intermediateSize, int32_t numExperts,
                                 int32_t numTokens) const {
-  auto maxNumCtasInBatchDim =
-      Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
+  auto maxNumCgasInBatchDim =
+      Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
 
   int32_t intermediateSizeFactor = (isGatedActivation(mActType) ? 2 : 1);
   auto const isValid =
       mRunner.isValidConfigIndex(configIndex, numTokens, intermediateSizeFactor * intermediateSize,
-                                 hiddenSize, {}, numTokens, numExperts, maxNumCtasInBatchDim);
+                                 hiddenSize, {}, numTokens, numExperts, maxNumCgasInBatchDim);
 
   return isValid;
 }
 
 std::vector<int64_t> Runner::getPassingConfigIndices() const {
   return mRunner.getPassingConfigIndices();
+}
+
+int32_t Runner::getConfigClusterSizeInBatchDim(int32_t configIndex) const {
+  return mRunner.getConfigClusterSizeInBatchDim(configIndex);
 }
 }  // namespace PermuteGemm1
 
@@ -350,16 +358,14 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
     btg::Dtype dtypeAct, btg::Dtype dtypeWeights, btg::Dtype dtypeOut, int32_t tileTokensDim,
     bool useDeepSeekFp8, bool useShuffledMatrix, batchedGemm::gemm::MatrixLayout weightLayout) {
   tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options = {
-      // Swap A and B dtypes because transposeMmaOutput is hardcoded to true
-      .dtypeA = dtypeWeights,
-      .dtypeB = dtypeAct,
+      .dtypeA = dtypeAct,
+      .dtypeB = dtypeWeights,
       .dtypeC = dtypeOut,
       .eltwiseActType = EltwiseActType::None,
       .deepSeekFp8 = useDeepSeekFp8,
       .fusedAct = false,
       .routeAct = false,
       .staticBatch = false,
-      .transposeMmaOutput = true,
       .tileSize = tileTokensDim,
       .epilogueTileM = useDeepSeekFp8 ? 64 : 128,
       .useShuffledMatrix = useShuffledMatrix,
@@ -385,10 +391,10 @@ void Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, void
                  int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx,
                  int32_t* ptrCtaIdxXyToMnLimit, void* bmm2Workspace, int device,
                  cudaStream_t stream, int32_t configIndex, bool enable_pdl) {
-  auto maxNumCtasInBatchDim =
-      Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
+  auto maxNumCgasInBatchDim =
+      Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
   mRunner.run(
-      numTokens, hiddenSize, intermediateSize, {}, numTokens, numExperts, maxNumCtasInBatchDim,
+      numTokens, hiddenSize, intermediateSize, {}, numTokens, numExperts, maxNumCgasInBatchDim,
       permutedHiddenState, permutedHiddenStateScale, weights, weightsScale,
       /* perTokensSfA */ nullptr,
       /* perTokensSfB */ nullptr, outputScalesScalar, /* outputScalesGateScalar */ nullptr, ptrBias,
@@ -401,36 +407,40 @@ void Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, void
 size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
                                        int32_t numExperts, int32_t numTokens,
                                        int32_t configIndex) const {
-  auto maxNumCtasInBatchDim =
-      Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
+  auto maxNumCgasInBatchDim =
+      Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
   return mRunner.getWorkspaceSizeInBytes(numTokens, hiddenSize, intermediateSize, {}, numTokens,
-                                         numExperts, maxNumCtasInBatchDim, configIndex);
+                                         numExperts, maxNumCgasInBatchDim, configIndex);
 }
 
 int32_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize,
                                            int32_t intermediateSize, int32_t numExperts,
                                            int32_t numTokens) const {
-  auto maxNumCtasInBatchDim =
-      Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
+  auto maxNumCgasInBatchDim =
+      Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
   return mRunner.getDefaultValidConfigIndex(numTokens, hiddenSize, intermediateSize, {}, numTokens,
-                                            numExperts, maxNumCtasInBatchDim);
+                                            numExperts, maxNumCgasInBatchDim);
 }
 
 bool Runner::isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hiddenSize,
                                 int32_t intermediateSize, int32_t numExperts,
                                 int32_t numTokens) const {
-  auto const maxNumCtasInBatchDim =
-      Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
+  auto const maxNumCgasInBatchDim =
+      Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
 
   auto const isValid =
       mRunner.isValidConfigIndex(configIndex, numTokens, hiddenSize, intermediateSize, {},
-                                 numTokens, numExperts, maxNumCtasInBatchDim);
+                                 numTokens, numExperts, maxNumCgasInBatchDim);
 
   return isValid;
 }
 
 std::vector<int64_t> Runner::getPassingConfigIndices() const {
   return mRunner.getPassingConfigIndices();
+}
+
+int32_t Runner::getConfigClusterSizeInBatchDim(int32_t configIndex) const {
+  return mRunner.getConfigClusterSizeInBatchDim(configIndex);
 }
 }  // namespace Gemm2
 
@@ -449,7 +459,15 @@ Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8
   mPassingConfigs.reserve(totalPassingIndices);
 
   for (auto const& indexGemm1 : gemm1PassingIndices) {
+    int32_t const gemm1ClusterSize = mPermuteGemm1.getConfigClusterSizeInBatchDim(indexGemm1);
     for (auto const& indexGemm2 : gemm2PassingIndices) {
+      int32_t const gemm2ClusterSize = mGemm2.getConfigClusterSizeInBatchDim(indexGemm2);
+      // Routing emits one shared CTA table for both GEMMs, so FC1 and FC2 must agree on the
+      // batch-dimension cluster size & tile size. Otherwise ctaIdxXyToMnLimit/numNonExitingCtas are
+      // generated at one CTA granularity while one GEMM still consumes a different batch tile size.
+      if (gemm1ClusterSize != gemm2ClusterSize) {
+        continue;
+      }
       mPassingConfigs.push_back(MoEConfig{indexGemm1, indexGemm2});
     }
   }
@@ -569,6 +587,19 @@ int64_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize,
   FLASHINFER_CHECK(it != mPassingConfigs.end(),
                    "No compatible configs found for the block scale MoE runner.");
   return std::distance(mPassingConfigs.begin(), it);
+}
+
+int32_t Runner::getConfigClusterSizeInBatchDim(int64_t configIndex) const {
+  FLASHINFER_CHECK(configIndex >= 0 && configIndex < static_cast<int64_t>(mPassingConfigs.size()),
+                   "Invalid MoE config index ", configIndex, ". Valid range is [0, ",
+                   static_cast<int64_t>(mPassingConfigs.size()) - 1, "].");
+  auto const& config = mPassingConfigs[configIndex];
+  int32_t const gemm1ClusterSize = mPermuteGemm1.getConfigClusterSizeInBatchDim(config.gemm1Config);
+  int32_t const gemm2ClusterSize = mGemm2.getConfigClusterSizeInBatchDim(config.gemm2Config);
+  FLASHINFER_CHECK(gemm1ClusterSize == gemm2ClusterSize,
+                   "Incompatible MoE config pair: gemm1 clusterSizeInBatchDim=", gemm1ClusterSize,
+                   ", gemm2 clusterSizeInBatchDim=", gemm2ClusterSize, ".");
+  return gemm1ClusterSize;
 }
 
 void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int device,
