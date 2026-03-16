@@ -29,6 +29,8 @@ from .utils import (
     is_sm90a_supported,
     is_sm100a_supported,
     is_sm110a_supported,
+    backend_requirement,
+    supported_compute_capability,
 )
 
 from flashinfer.gdn_kernels.blackwell_prefill import (
@@ -173,6 +175,28 @@ def chunk_gated_delta_rule_hopper(
         return output
 
 
+@supported_compute_capability([90, 100, 110])
+def _check_gdn_prefill(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    scale,
+    initial_state,
+    output_final_state,
+    cu_seqlens,
+    use_qk_l2norm_in_kernel,
+    output,
+    output_state,
+):
+    return True
+
+
+@backend_requirement(
+    {},
+    common_check=_check_gdn_prefill,
+)
 @flashinfer_api
 def chunk_gated_delta_rule(
     q: torch.Tensor,
@@ -203,10 +227,10 @@ def chunk_gated_delta_rule(
         g (Optional[torch.Tensor]):
             Forget gate (alpha) of shape ``[total_seq_len, num_sab_heads]`` where
             ``num_sab_heads = max(num_q_heads, num_v_heads)``. Must be float32.
-            If None, defaults to all ones. Default: ``None``.
+            If None, defaults to all ones(hopper). Default: ``None``.
         beta (Optional[torch.Tensor]):
             Update gate (beta) of shape ``[total_seq_len, num_sab_heads]``.
-            Must be float32. If None, defaults to all ones. Default: ``None``.
+            Must be float32. If None, defaults to all ones(hopper). Default: ``None``.
         scale (Optional[float]):
             Scale factor for the attention scores.
             If not provided, defaults to ``1 / sqrt(head_size)``. Default: ``None``.
@@ -256,6 +280,9 @@ def chunk_gated_delta_rule(
     elif is_sm100a_supported(torch.device("cuda")) or is_sm110a_supported(
         torch.device("cuda")
     ):
+        if chunk_gated_delta_rule_blackwell is None:
+            raise NotImplementedError("Blackwell GDN prefill backend is unavailable.")
+
         if g is None or beta is None:
             raise NotImplementedError(
                 "Gate and beta must not be None on sm100a and sm110a."
