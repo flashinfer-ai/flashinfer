@@ -171,6 +171,31 @@ class TestCudnnNVFp4OverrideShape:
             device=device,
         )
 
+        # FP4 E2M1 lookup table: index is the 4-bit pattern (0–15)
+        # Encoding: sign(1) | exp(2) | mantissa(1), bias=1
+        FP4_E2M1_LUT = torch.tensor(
+            [
+                0.0,
+                0.5,
+                1.0,
+                1.5,
+                2.0,
+                3.0,
+                4.0,
+                6.0,
+                -0.0,
+                -0.5,
+                -1.0,
+                -1.5,
+                -2.0,
+                -3.0,
+                -4.0,
+                -6.0,
+            ],
+            dtype=torch.float32,
+            device=device,
+        )
+
         # B is fixed across all dynamic_ms
         b_packed = torch.randint(
             0, 256, (1, n, k // 2), dtype=torch.uint8, device=device
@@ -211,6 +236,25 @@ class TestCudnnNVFp4OverrideShape:
                 tactic=0,
             )
             torch.cuda.synchronize()
+
+            # Correctness check: dequantize FP4 E2M1 via LUT and compare with
+            # FP32 bmm reference. Descales are all 1.0, so no scaling needed.
+            # A packing: a_packed (1, m, k//2), low nibble = even k, high = odd k
+            a_fp32 = torch.empty(1, m, k, dtype=torch.float32, device=device)
+            a_fp32[:, :, 0::2] = FP4_E2M1_LUT[(a_packed & 0x0F).long()]
+            a_fp32[:, :, 1::2] = FP4_E2M1_LUT[((a_packed >> 4) & 0x0F).long()]
+            # B packing: b_packed (1, k//2, n), low nibble = even k, high = odd k
+            b_fp32 = torch.empty(1, k, n, dtype=torch.float32, device=device)
+            b_fp32[:, 0::2, :] = FP4_E2M1_LUT[(b_packed & 0x0F).long()]
+            b_fp32[:, 1::2, :] = FP4_E2M1_LUT[((b_packed >> 4) & 0x0F).long()]
+            ref = torch.bmm(a_fp32, b_fp32).to(out_dtype)
+
+            assert torch.allclose(ref, out, rtol=1e-1, atol=1.0), (
+                f"NVFP4 override_shape failed for m={m}, n={n}, k={k}: "
+                f"max_abs_err={(ref - out).abs().max().item():.4f}, "
+                f"max_rel_err="
+                f"{((ref - out).abs() / (ref.abs() + 1e-8)).max().item():.4f}"
+            )
 
 
 # ============================================================================
@@ -270,8 +314,9 @@ class TestCudnnMXFp8OverrideShape:
             device=device,
         )
 
+        # Use values 0–126 to avoid NaN FP8_E4M3 bit patterns (0x7F, 0xFF).
         b = torch.randint(
-            0, 256, (1, n, k), dtype=torch.uint8, device=device
+            0, 127, (1, n, k), dtype=torch.uint8, device=device
         ).transpose(1, 2)
         b_descale = torch.ones(
             1,
@@ -284,7 +329,8 @@ class TestCudnnMXFp8OverrideShape:
         for m in dynamic_ms:
             block_scale_dim_m, _, _ = _calculate_block_scale_dims(m, n, k, block_size)
 
-            a = torch.randint(0, 256, (1, m, k), dtype=torch.uint8, device=device)
+            # Use values 0–126 to avoid NaN FP8_E4M3 bit patterns (0x7F, 0xFF).
+            a = torch.randint(0, 127, (1, m, k), dtype=torch.uint8, device=device)
             a_descale = torch.ones(
                 1,
                 block_scale_dim_m,
@@ -306,3 +352,19 @@ class TestCudnnMXFp8OverrideShape:
                 tactic=0,
             )
             torch.cuda.synchronize()
+
+            # Correctness check: reinterpret uint8 as FP8_E4M3, compute FP32
+            # bmm reference. Descales are all 1.0 (2^0), so no scaling needed.
+            # A: (1, m, k) contiguous uint8 → float8_e4m3fn → float32
+            a_fp32 = a.view(torch.float8_e4m3fn).to(torch.float32)
+            # B logical shape is (1, k, n) with stride [n*k, 1, k]; make
+            # contiguous before view so dtype reinterpretation is valid.
+            b_fp32 = b.contiguous().view(torch.float8_e4m3fn).to(torch.float32)
+            ref = torch.bmm(a_fp32, b_fp32).to(out_dtype)
+
+            assert torch.allclose(ref, out, rtol=5e-2, atol=5e-2), (
+                f"MXFP8 override_shape failed for m={m}, n={n}, k={k}: "
+                f"max_abs_err={(ref - out).abs().max().item():.4f}, "
+                f"max_rel_err="
+                f"{((ref - out).abs() / (ref.abs() + 1e-8)).max().item():.4f}"
+            )
