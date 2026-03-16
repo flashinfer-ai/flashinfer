@@ -65,21 +65,6 @@ _FP4_E2M1_TABLE = [
 ]
 
 
-def _compute_scale_row_offset(num_tokens):
-    """Compute the byte offset of scale_row within the engine's workspace.
-
-    Workspace layout (128-byte aligned):
-      [0]        rs         : num_tokens * sizeof(float)
-      [aligned]  fp8_scale  : sizeof(float)
-      [aligned]  scale_row  : num_tokens * ceil(C/16) bytes  (NVFP4 only)
-    """
-    off = num_tokens * 4  # rs: num_tokens * sizeof(float32)
-    off = ((off + 127) // 128) * 128
-    off += 4  # fp8_scale slot: sizeof(float32)
-    off = ((off + 127) // 128) * 128
-    return off
-
-
 def _unpack_fp4_nibbles(packed_bytes, num_tokens, C):
     """Unpack FP4 packed bytes into a (num_tokens, C) int tensor of nibble values.
 
@@ -230,17 +215,14 @@ def test_fused_rmsnorm_silu_fp8_output(C, num_tokens):
 def test_fused_rmsnorm_silu_nvfp4_output(C, num_tokens):
     """Test NVFP4 E2M1 output via nibble-level comparison.
 
-    Builds the cuDNN graph directly to retain the workspace tensor, which
-    contains the FP8 block scales (scale_row) needed for dequantization.
-
-    Compares FP4 nibble indices directly: quantize the float32 reference
-    using the same block-scale algorithm as the kernel, then verify every
-    nibble matches within ±1 (one FP4 ULP).  This isolates kernel
+    Calls the public ``fused_rmsnorm_silu`` API with a ``torch.uint8`` output
+    tensor, then compares FP4 nibble indices directly: quantize the float32
+    reference using the same block-scale algorithm as the kernel, then verify
+    every nibble matches within ±1 (one FP4 ULP).  This isolates kernel
     correctness from inherent FP4 quantization error.
 
     Requires 0 mismatches (nibble_diff > 1).
     """
-    cudnn = pytest.importorskip("cudnn", reason="cuDNN frontend not available")
     if _get_sm() < 100:
         pytest.skip("NVFP4 output requires SM100+ (Blackwell)")
 
@@ -249,65 +231,16 @@ def test_fused_rmsnorm_silu_nvfp4_output(C, num_tokens):
     w = torch.rand(C, dtype=torch.bfloat16, device="cuda") * 1.5 + 0.5
     eps = 1e-6
 
-    # Build cuDNN graph directly so we control the workspace
-    graph = cudnn.pygraph(
-        intermediate_data_type=cudnn.data_type.FLOAT,
-        compute_data_type=cudnn.data_type.FLOAT,
-    )
-    X_t = graph.tensor(
-        dim=[num_tokens, C, 1, 1],
-        stride=[C, 1, 1, 1],
-        data_type=cudnn.data_type.BFLOAT16,
-    )
-    scale_t = graph.tensor(
-        dim=[1, C, 1, 1],
-        stride=[C, 1, 1, 1],
-        data_type=cudnn.data_type.BFLOAT16,
-    )
-    eps_t = graph.tensor(
-        dim=[1, 1, 1, 1],
-        stride=[1, 1, 1, 1],
-        data_type=cudnn.data_type.FLOAT,
-        is_pass_by_value=True,
-    )
-
-    Y = graph.rmsnorm(
-        norm_forward_phase=cudnn.norm_forward_phase.INFERENCE,
-        input=X_t,
-        scale=scale_t,
-        epsilon=eps_t,
-    )[0]
-    Y.set_dim([num_tokens, C, 1, 1]).set_stride([C, 1, 1, 1])
-    Y.set_data_type(cudnn.data_type.BFLOAT16)
-
-    Z = graph.swish(input=Y, swish_beta=1.0)
-    Z.set_output(True).set_data_type(cudnn.data_type.FP4_E2M1)
-
-    graph.build([cudnn.heur_mode.OPENSOURCE])
-
-    workspace = torch.empty(
-        graph.get_workspace_size(), dtype=torch.uint8, device="cuda"
-    )
     out_nvfp4 = torch.empty(num_tokens * C // 2, dtype=torch.uint8, device="cuda")
-    eps_cpu = torch.full((1, 1, 1, 1), eps, dtype=torch.float32)
-
-    graph.execute(
-        {
-            X_t: x.view(num_tokens, C, 1, 1),
-            scale_t: w.view(1, C, 1, 1),
-            eps_t: eps_cpu,
-            Z: out_nvfp4,
-        },
-        workspace,
-    )
-    torch.cuda.synchronize()
+    result = flashinfer.fused_rmsnorm_silu(x, w, eps, out=out_nvfp4)
 
     # Basic shape / dtype checks
+    assert result is out_nvfp4
     assert out_nvfp4.dtype == torch.uint8
     assert out_nvfp4.shape == (num_tokens * C // 2,)
     assert out_nvfp4.any(), "NVFP4 output is all zeros — kernel may not have executed"
 
-    # ---- Nibble-level comparison (matches cudnn_frontend test) ----
+    # ---- Nibble-level comparison ----
     ref_f32 = rmsnorm_silu_reference(x, w, eps, output_dtype=torch.float32)
 
     z_packed = out_nvfp4.view(num_tokens, C // 2)
