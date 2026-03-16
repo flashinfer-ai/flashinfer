@@ -15,8 +15,10 @@
  */
 #include "tvm_ffi_utils.h"
 
+using tvm::ffi::Optional;
+
 void seq_chunk_cumsum(TensorView seq_idx, TensorView chunk_indices, TensorView chunk_offsets,
-                      TensorView output, int64_t chunk_size, int64_t num_logical_chunks,
-                      int64_t num_seqs);
+                      TensorView output, Optional<TensorView> tile_state, int64_t chunk_size,
+                      int64_t num_logical_chunks, int64_t num_seqs);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(seq_chunk_cumsum, seq_chunk_cumsum);

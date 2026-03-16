@@ -167,11 +167,33 @@ __global__ void InitTileStateKernel(ScanTileStateT tile_state, int num_tiles) {
 }
 
 /*!
+ * \brief Compute the workspace size needed for the multi-block path.
+ *
+ * Returns 0 if num_seqs <= 1023 (single-block path needs no workspace).
+ */
+inline std::size_t SeqChunkCumsumWorkspaceSize(int num_seqs) {
+  if (num_seqs + 1 <= 1024) {
+    return 0;
+  }
+  using TileState = cub::ScanTileState<int32_t>;
+  int num_tiles = (num_seqs + TILE_SIZE - 1) / TILE_SIZE;
+  std::size_t temp_bytes = 0;
+  TileState::AllocationSize(num_tiles, temp_bytes);
+  return temp_bytes;
+}
+
+/*!
  * \brief Host-side launcher.  Picks single-block or multi-block path.
+ *
+ * \param tile_state_buf  Pre-allocated uint8_t device buffer for cub::ScanTileState.
+ *                        Must have at least SeqChunkCumsumWorkspaceSize(num_seqs) elements.
+ *                        May be nullptr when num_seqs+1 <= 1024 (single-block path).
+ * \param num_tiles       Number of elements in tile_state_buf (= number of bytes).
  */
 template <typename SeqIdxT>
 inline cudaError_t SeqChunkCumsumLauncher(const SeqIdxT* seq_idx, const int32_t* chunk_indices,
                                           const int32_t* chunk_offsets, int32_t* output,
+                                          uint8_t* tile_state_buf, std::size_t num_tiles,
                                           int chunk_size, int num_logical_chunks, int num_seqs,
                                           cudaStream_t stream = nullptr) {
   if (num_seqs + 1 <= 1024) {
@@ -183,29 +205,35 @@ inline cudaError_t SeqChunkCumsumLauncher(const SeqIdxT* seq_idx, const int32_t*
     // Multi-block path with decoupled lookback
     using TileState = cub::ScanTileState<int32_t>;
 
-    int num_tiles = (num_seqs + TILE_SIZE - 1) / TILE_SIZE;
+    int n_tiles = (num_seqs + TILE_SIZE - 1) / TILE_SIZE;
 
-    // Allocate tile state
-    std::size_t temp_bytes = 0;
-    TileState::AllocationSize(num_tiles, temp_bytes);
-    void* d_temp = nullptr;
-    cudaError_t err = cudaMallocAsync(&d_temp, temp_bytes, stream);
-    if (err != cudaSuccess) return err;
+    // Fall back to cudaMallocAsync if no pre-allocated buffer provided
+    bool allocated = false;
+    if (tile_state_buf == nullptr) {
+      std::size_t temp_bytes = 0;
+      TileState::AllocationSize(n_tiles, temp_bytes);
+      cudaError_t err = cudaMallocAsync(&tile_state_buf, temp_bytes, stream);
+      if (err != cudaSuccess) return err;
+      num_tiles = temp_bytes;
+      allocated = true;
+    }
 
     TileState tile_state;
-    tile_state.Init(num_tiles, d_temp, temp_bytes);
+    tile_state.Init(n_tiles, static_cast<void*>(tile_state_buf), num_tiles);
 
     // Initialize tile state
     int init_threads = 256;
-    int init_blocks = (num_tiles + init_threads - 1) / init_threads;
-    InitTileStateKernel<<<init_blocks, init_threads, 0, stream>>>(tile_state, num_tiles);
+    int init_blocks = (n_tiles + init_threads - 1) / init_threads;
+    InitTileStateKernel<<<init_blocks, init_threads, 0, stream>>>(tile_state, n_tiles);
 
     // Launch scan kernel
-    SeqChunkCumsumKernelMultiBlock<<<num_tiles, TILE_SIZE, 0, stream>>>(
+    SeqChunkCumsumKernelMultiBlock<<<n_tiles, TILE_SIZE, 0, stream>>>(
         seq_idx, chunk_indices, chunk_offsets, output, tile_state, chunk_size, num_logical_chunks,
         num_seqs);
 
-    cudaFreeAsync(d_temp, stream);
+    if (allocated) {
+      cudaFreeAsync(tile_state_buf, stream);
+    }
   }
 
   return cudaGetLastError();

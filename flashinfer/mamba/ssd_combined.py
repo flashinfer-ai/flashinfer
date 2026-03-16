@@ -599,6 +599,7 @@ class SSDCombined:
                 chunk_indices,
                 chunk_offsets,
                 seq_chunk_cumsum,
+                None,  # tile_state: let kernel allocate internally
                 chunk_size,
                 num_logical_chunks_local,
                 num_seqs,

@@ -102,6 +102,7 @@ class TestSeqChunkCumsum:
             chunk_indices,
             chunk_offsets,
             output,
+            None,  # tile_state: let kernel allocate internally
             chunk_size,
             num_logical_chunks,
             num_seqs,
@@ -176,5 +177,50 @@ class TestSeqChunkCumsum:
         )
         out = self._call_kernel(
             seq_idx, chunk_indices, chunk_offsets, self.CHUNK_SIZE, 2
+        )
+        torch.testing.assert_close(out, ref)
+
+    def test_multi_block_with_tile_state(self):
+        """2048 sequences (> 1024) with pre-allocated tile_state buffer."""
+        from flashinfer.mamba.ssd_combined import _get_seq_chunk_cumsum_module
+
+        num_seqs = 2048
+        seq_idx, chunk_indices, chunk_offsets = _make_equal_seqs(
+            num_seqs, 1, self.CHUNK_SIZE
+        )
+        ref = seq_chunk_cumsum_reference(
+            seq_idx, chunk_indices, chunk_offsets, self.CHUNK_SIZE, num_seqs
+        )
+
+        module = _get_seq_chunk_cumsum_module()
+        num_logical_chunks = len(chunk_indices)
+        output = torch.zeros(num_seqs + 1, dtype=torch.int32, device="cuda")
+
+        # Allocate a tile_state buffer large enough (1 MB is way more than needed)
+        tile_state = torch.empty(1024 * 1024, dtype=torch.uint8, device="cuda")
+
+        module.seq_chunk_cumsum(
+            seq_idx,
+            chunk_indices,
+            chunk_offsets,
+            output,
+            tile_state,
+            self.CHUNK_SIZE,
+            num_logical_chunks,
+            num_seqs,
+        )
+        torch.testing.assert_close(output, ref)
+
+    def test_multi_block_without_tile_state(self):
+        """2048 sequences (> 1024) with tile_state=None (fallback allocation)."""
+        num_seqs = 2048
+        seq_idx, chunk_indices, chunk_offsets = _make_equal_seqs(
+            num_seqs, 1, self.CHUNK_SIZE
+        )
+        ref = seq_chunk_cumsum_reference(
+            seq_idx, chunk_indices, chunk_offsets, self.CHUNK_SIZE, num_seqs
+        )
+        out = self._call_kernel(
+            seq_idx, chunk_indices, chunk_offsets, self.CHUNK_SIZE, num_seqs
         )
         torch.testing.assert_close(out, ref)
