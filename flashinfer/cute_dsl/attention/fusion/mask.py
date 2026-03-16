@@ -1,0 +1,160 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
+
+"""Mask types and masking helper functions for attention kernels.
+
+All helpers are standalone @cute.jit functions that take mask_type and
+window_left as compile-time parameters, so they can be reused across
+different kernel variants (prefill, decode, MLA).
+"""
+
+import enum
+
+import cutlass
+import cutlass.cute as cute
+from cutlass.cute.typing import Int32, Float32
+
+
+class MaskType(enum.Enum):
+    NO_MASK = enum.auto()
+    RESIDUAL_MASK = enum.auto()
+    CAUSAL_MASK = enum.auto()
+    SLIDING_WINDOW_MASK = enum.auto()
+
+
+def get_trip_count(
+    mask_type: MaskType,
+    window_left: int,
+    blk_coord: cute.Coord,
+    tile_shape: cute.Shape,
+    seqlen_k: Int32,
+) -> Int32:
+    """Number of KV tile blocks to process for this Q tile."""
+    result = 0
+    if mask_type == MaskType.NO_MASK or mask_type == MaskType.RESIDUAL_MASK:
+        result = cute.ceil_div(seqlen_k, tile_shape[1])
+    elif mask_type == MaskType.CAUSAL_MASK:
+        max_blocks_k = cute.ceil_div(seqlen_k, tile_shape[1])
+        max_blocks_q = cute.ceil_div(
+            (blk_coord[0] + 1) * tile_shape[0], tile_shape[1]
+        )
+        result = cutlass.min(max_blocks_k, max_blocks_q)
+    elif mask_type == MaskType.SLIDING_WINDOW_MASK:
+        max_blocks_k = cute.ceil_div(window_left, tile_shape[1]) + 1
+        max_blocks_q = cute.ceil_div(
+            (blk_coord[0] + 1) * tile_shape[0], tile_shape[1]
+        )
+        result = cutlass.min(max_blocks_k, max_blocks_q)
+    return result
+
+
+@cute.jit
+def get_masked_trip_count(
+    mask_type: MaskType,
+    window_left: int,
+    blk_coord: cute.Coord,
+    tile_shape: cute.Shape,
+    seqlen_k: Int32,
+) -> Int32:
+    """Number of masked (boundary) KV tile blocks."""
+    result = 0
+    if mask_type == MaskType.NO_MASK:
+        result = 0
+    elif mask_type == MaskType.RESIDUAL_MASK:
+        if seqlen_k % tile_shape[1] != 0:
+            result = 1
+        else:
+            result = 0
+    elif mask_type == MaskType.CAUSAL_MASK:
+        trip_count = get_trip_count(
+            mask_type, window_left, blk_coord, tile_shape, seqlen_k
+        )
+        result = cutlass.min(
+            trip_count,
+            cute.ceil_div(tile_shape[0], tile_shape[1]),
+        )
+    elif mask_type == MaskType.SLIDING_WINDOW_MASK:
+        trip_count = get_trip_count(
+            mask_type, window_left, blk_coord, tile_shape, seqlen_k
+        )
+        result = trip_count
+    return result
+
+
+@cute.jit
+def get_unmasked_trip_count(
+    mask_type: MaskType,
+    window_left: int,
+    blk_coord: cute.Coord,
+    tile_shape: cute.Shape,
+    seqlen_k: Int32,
+) -> Int32:
+    """Number of fully unmasked KV tile blocks."""
+    result = 0
+    if mask_type == MaskType.NO_MASK:
+        result = get_trip_count(
+            mask_type, window_left, blk_coord, tile_shape, seqlen_k
+        )
+    elif mask_type == MaskType.RESIDUAL_MASK:
+        if seqlen_k % tile_shape[1] != 0:
+            result = get_trip_count(
+                mask_type, window_left, blk_coord, tile_shape, seqlen_k
+            ) - 1
+        else:
+            result = get_trip_count(
+                mask_type, window_left, blk_coord, tile_shape, seqlen_k
+            )
+    elif mask_type == MaskType.CAUSAL_MASK:
+        result = get_trip_count(
+            mask_type, window_left, blk_coord, tile_shape, seqlen_k
+        ) - get_masked_trip_count(
+            mask_type, window_left, blk_coord, tile_shape, seqlen_k
+        )
+    elif mask_type == MaskType.SLIDING_WINDOW_MASK:
+        result = 0
+    return result
+
+
+@cute.jit
+def get_kv_start_block_idx(
+    mask_type: MaskType,
+    window_left: int,
+    blk_coord: cute.Coord,
+    tile_shape: cute.Shape,
+    seqlen_k: Int32,
+) -> Int32:
+    """Starting KV block index (nonzero only for sliding window)."""
+    if cutlass.const_expr(mask_type == MaskType.SLIDING_WINDOW_MASK):
+        num_blocks_k = cute.ceil_div(window_left, tile_shape[1])
+        block_idx = (
+            cute.ceil_div((blk_coord[0] + 1) * tile_shape[0], tile_shape[1]) - 1
+        )
+        return cutlass.max(0, block_idx - num_blocks_k)
+    else:
+        return 0
+
+
+@cute.jit
+def apply_mask(
+    mask_type: MaskType,
+    window_left: int,
+    acc_qk: cute.Tensor,
+    index_qk: cute.Tensor,
+    seqlen_k: Int32,
+):
+    """Apply attention mask (causal, residual, or sliding window) to scores."""
+    if mask_type == MaskType.RESIDUAL_MASK:
+        for i in range(cute.size(acc_qk)):
+            pos = index_qk[i]
+            if pos[1] >= seqlen_k:
+                acc_qk[i] = -Float32.inf
+    elif mask_type == MaskType.CAUSAL_MASK:
+        for i in range(cute.size(acc_qk)):
+            pos = index_qk[i]
+            if pos[0] < pos[1] or pos[1] >= seqlen_k:
+                acc_qk[i] = -Float32.inf
+    elif mask_type == MaskType.SLIDING_WINDOW_MASK:
+        for i in range(cute.size(acc_qk)):
+            pos = index_qk[i]
+            if pos[1] - pos[0] > window_left:
+                acc_qk[i] = -Float32.inf
