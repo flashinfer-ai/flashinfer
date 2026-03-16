@@ -260,6 +260,8 @@ def gdn_verify_kernel_mtp_original(
     )
 
     # Only process valid batch entries (cache_idx >= 0)
+    rows_per_group: cutlass.Constexpr[int] = tile_v // num_groups
+
     if cache_idx >= 0:
         # Compute k_start once (used for shared memory writes)
         k_start = lane_in_group * vec_size
@@ -351,7 +353,6 @@ def gdn_verify_kernel_mtp_original(
         cute.arch.barrier()
 
         # Each group handles tile_v/num_groups V rows
-        rows_per_group: cutlass.Constexpr[int] = tile_v // num_groups
         for row_in_group in cutlass.range_constexpr(rows_per_group):
             v_idx = i_v * tile_v + group_idx * rows_per_group + row_in_group
 
@@ -432,7 +433,6 @@ def gdn_verify_kernel_mtp_original(
                     cute.autovec_copy(r_h, h_tile_out)
     else:
         # Padding slot: zero output for all V rows this group handles
-        rows_per_group: cutlass.Constexpr[int] = tile_v // num_groups
         for row_in_group in cutlass.range_constexpr(rows_per_group):
             v_idx = i_v * tile_v + group_idx * rows_per_group + row_in_group
             if v_idx < V:

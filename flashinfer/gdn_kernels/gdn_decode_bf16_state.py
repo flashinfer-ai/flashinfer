@@ -816,7 +816,9 @@ def gated_delta_rule_decode_kernel_seqlen1(
 
         # Use shared helper for Q/K normalization (only warp 0 does the work)
         if warp_idx == 0:
-            normalize_and_store_qk_to_smem(q_head, k_head, q_sh, k_sh, lane_idx, scale, eps)
+            normalize_and_store_qk_to_smem(
+                q_head, k_head, q_sh, k_sh, lane_idx, scale, eps
+            )
 
         cute.arch.sync_threads()
 
@@ -1625,7 +1627,9 @@ def gated_delta_rule_decode_kernel_seqlen1_lowBS_1chunk(
         k_head = gK[(batch_idx, 0, query_head_idx, None)]
 
         if warp_idx == 0:
-            normalize_and_store_qk_to_smem(q_head, k_head, q_sh, k_sh, lane_idx, scale, eps)
+            normalize_and_store_qk_to_smem(
+                q_head, k_head, q_sh, k_sh, lane_idx, scale, eps
+            )
 
         cute.arch.sync_threads()
 

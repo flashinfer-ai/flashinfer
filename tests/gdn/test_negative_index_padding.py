@@ -23,13 +23,13 @@ import pytest
 import torch
 
 try:
-    from .reference_delta_rule import decode_delta_rule, verify_delta_rule
+    from .reference_delta_rule import decode_delta_rule
 except ImportError:
     import sys
     from pathlib import Path
 
     sys.path.insert(0, str(Path(__file__).parent))
-    from reference_delta_rule import decode_delta_rule, verify_delta_rule
+    from reference_delta_rule import decode_delta_rule
 
 from flashinfer.gdn_decode import gated_delta_rule_mtp
 from flashinfer.utils import get_compute_capability
@@ -133,9 +133,7 @@ def _test_bf16_decode_negative_indices(
     for i in valid_indices_local:
         pool_idx = indices[i].item()
         for t in range(T):
-            ref_state = (
-                pool_snapshot[pool_idx].float().transpose(-2, -1).contiguous()
-            )
+            ref_state = pool_snapshot[pool_idx].float().transpose(-2, -1).contiguous()
             ref_o, ref_s = decode_delta_rule(
                 q[i, t].unsqueeze(0).float(),
                 k[i, t].unsqueeze(0).float(),
@@ -148,8 +146,8 @@ def _test_bf16_decode_negative_indices(
                 scale_factor=scale,
                 use_l2_norm=True,
             )
-            pool_snapshot[pool_idx] = ref_s.squeeze(0).transpose(-2, -1).to(
-                pool_snapshot.dtype
+            pool_snapshot[pool_idx] = (
+                ref_s.squeeze(0).transpose(-2, -1).to(pool_snapshot.dtype)
             )
 
             torch.testing.assert_close(
@@ -227,7 +225,10 @@ def _test_bf16_decode_all_padding(
         f"but got max abs = {output.abs().max().item()}"
     )
     torch.testing.assert_close(
-        pool_under_test, pool, atol=0.0, rtol=0.0,
+        pool_under_test,
+        pool,
+        atol=0.0,
+        rtol=0.0,
         msg="All-padding batch must not modify any pool state",
     )
 
@@ -336,9 +337,7 @@ def _test_mtp_negative_indices(
     for i in valid_indices_local:
         pool_idx = indices[i].item()
         for t in range(T):
-            ref_state = (
-                state_snapshot[pool_idx].float().transpose(-2, -1).contiguous()
-            )
+            ref_state = state_snapshot[pool_idx].float().transpose(-2, -1).contiguous()
             ref_o, ref_s = decode_delta_rule(
                 q[i, t].unsqueeze(0).float(),
                 k[i, t].unsqueeze(0).float(),
@@ -420,7 +419,10 @@ def _test_mtp_all_padding(
         f"but got max abs = {output.abs().max().item()}"
     )
     torch.testing.assert_close(
-        state_under_test, initial_state, atol=0.0, rtol=0.0,
+        state_under_test,
+        initial_state,
+        atol=0.0,
+        rtol=0.0,
         msg="MTP all-padding batch must not modify any pool state",
     )
 
