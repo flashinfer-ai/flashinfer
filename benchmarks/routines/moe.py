@@ -666,6 +666,7 @@ def testTrtllmFp4BlockScaleMoe(args):
     backend = "trtllm"
 
     # Optional autotune warmup (supported for FP4 TRTLlm fused MoE)
+    cache_path = getattr(args, "autotune_cache", None)
     if getattr(args, "autotune", False):
         warmup_iters = (
             args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
@@ -675,7 +676,7 @@ def testTrtllmFp4BlockScaleMoe(args):
             print(
                 f"[INFO] Autotune warmup for FP4 block scale MoE: {warmup_iters} iters"
             )
-        with autotune(True):
+        with autotune(True, cache=cache_path):
             for _ in range(warmup_iters):
                 run_fp4_moe(
                     routing_logits,
@@ -690,6 +691,9 @@ def testTrtllmFp4BlockScaleMoe(args):
                     output1_scale_gate_scalar,
                     output2_scale_scalar,
                 )
+    elif cache_path:
+        with autotune(False, cache=cache_path):
+            pass
 
     # Benchmark timing
     times = bench_gpu_time(
@@ -1059,6 +1063,7 @@ def testCutlassFusedMoe(args):
     backend = "cutlass"
 
     # Optional autotune warmup (supported for CUTLASS fused MoE)
+    cache_path = getattr(args, "autotune_cache", None)
     if getattr(args, "autotune", False):
         warmup_iters = (
             args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
@@ -1066,9 +1071,12 @@ def testCutlassFusedMoe(args):
         backend = "cutlass_autotune"
         if args.verbose >= 1:
             print(f"[INFO] Autotune warmup for CUTLASS fused MoE: {warmup_iters} iters")
-        with autotune(True):
+        with autotune(True, cache=cache_path):
             for _ in range(warmup_iters):
                 run_cutlass(*input_args_for_bench)
+    elif cache_path:
+        with autotune(False, cache=cache_path):
+            pass
 
     # Measure
     times = bench_gpu_time(
