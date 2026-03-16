@@ -789,304 +789,309 @@ def gated_delta_rule_decode_kernel_seqlen1(
         cutlass.Float32, cute.make_layout((32, 4), stride=(1, 32))
     )
 
-    h_global = gH[(pool_batch_idx, value_head_idx, None, None)]
-
-    # Launch first 2 async loads
-    load_h_chunk_async(h_sh_chunk0, h_global, tidx, 0)
-    nvvm.cp_async_commit_group()
-    load_h_chunk_async(h_sh_chunk1, h_global, tidx, 32)
-    nvvm.cp_async_commit_group()
-
-    # L2 normalization
-    q_head = gQ[(batch_idx, 0, query_head_idx, None)]
-    k_head = gK[(batch_idx, 0, query_head_idx, None)]
-
-    warp_idx = tidx // 32
-    lane_idx = tidx % 32
-
-    # Use shared helper for Q/K normalization (only warp 0 does the work)
-    if warp_idx == 0:
-        normalize_and_store_qk_to_smem(q_head, k_head, q_sh, k_sh, lane_idx, scale, eps)
-
-    cute.arch.sync_threads()
-
-    # Load V
-    v_head = gV[(batch_idx, 0, value_head_idx, None)]
+    # Allocations moved before guard (compile-time layout ops / safe batch_idx indexing)
     v_sh = smem.allocate_tensor(cutlass.Float32, 128)
-    v_sh[tidx] = v_head[tidx].to(cutlass.Float32)
-
-    # Registers: h_chunk + k_chunk (persistent) + qk_temp (reused for Q)
     h_chunk = cute.make_rmem_tensor((32,), cutlass.Float32)
     k_chunk = cute.make_rmem_tensor((32,), cutlass.Float32)  # PERSISTENT K!
     qk_temp = cute.make_rmem_tensor((32,), cutlass.Float32)
 
+    warp_idx = tidx // 32
+    lane_idx = tidx % 32
     k_base = warp_idx * 32
-
-    # Load K ONCE - keep for entire kernel
-    for i in cutlass.range_constexpr(32):
-        k_chunk[i] = k_sh[k_base + i]
-
-    h_out = gH[(pool_batch_idx, value_head_idx, None, None)]
     o_head = gO[(batch_idx, 0, value_head_idx, None)]
 
-    # ========================================================================
-    # CHUNK 0
-    # ========================================================================
-    nvvm.cp_async_wait_group(1)
-    cute.arch.sync_threads()
+    # Only process valid batch entries (pool_batch_idx >= 0)
+    if pool_batch_idx >= 0:
+        h_global = gH[(pool_batch_idx, value_head_idx, None, None)]
 
-    pred = cutlass.Float32(0.0)
-    pred2 = cutlass.Float32(0.0)
-    for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = fma_pair_mul(
-            h_sh_chunk0[lane_idx, k_base + i].to(cutlass.Float32),
-            h_sh_chunk0[lane_idx, k_base + i + 1].to(cutlass.Float32),
-            g_exp,
-            g_exp,
-        )
-    for i in cutlass.range_constexpr(0, 32, 2):
-        pred, pred2 = fma_pair(
-            h_chunk[i], h_chunk[i + 1], k_chunk[i], k_chunk[i + 1], pred, pred2
-        )
-    pred = pred + pred2
+        # Launch first 2 async loads
+        load_h_chunk_async(h_sh_chunk0, h_global, tidx, 0)
+        nvvm.cp_async_commit_group()
+        load_h_chunk_async(h_sh_chunk1, h_global, tidx, 32)
+        nvvm.cp_async_commit_group()
 
-    pred_sh[lane_idx, warp_idx] = pred
-    cute.arch.sync_threads()
-    pred_final = (
-        pred_sh[lane_idx, 0]
-        + pred_sh[lane_idx, 1]
-        + pred_sh[lane_idx, 2]
-        + pred_sh[lane_idx, 3]
-    )
+        # L2 normalization
+        q_head = gQ[(batch_idx, 0, query_head_idx, None)]
+        k_head = gK[(batch_idx, 0, query_head_idx, None)]
 
-    v_val = (v_sh[lane_idx] - pred_final) * beta
+        # Use shared helper for Q/K normalization (only warp 0 does the work)
+        if warp_idx == 0:
+            normalize_and_store_qk_to_smem(q_head, k_head, q_sh, k_sh, lane_idx, scale, eps)
 
-    for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = fma_pair(
-            k_chunk[i], k_chunk[i + 1], v_val, v_val, h_chunk[i], h_chunk[i + 1]
-        )
+        cute.arch.sync_threads()
 
-    # Load Q for output computation
-    for i in cutlass.range_constexpr(32):
-        qk_temp[i] = q_sh[k_base + i]
+        # Load V
+        v_head = gV[(batch_idx, 0, value_head_idx, None)]
+        v_sh[tidx] = v_head[tidx].to(cutlass.Float32)
 
-    out = cutlass.Float32(0.0)
-    out2 = cutlass.Float32(0.0)
-    for i in cutlass.range_constexpr(0, 32, 2):
-        out, out2 = fma_pair(
-            h_chunk[i], h_chunk[i + 1], qk_temp[i], qk_temp[i + 1], out, out2
-        )
-    out = out + out2
+        # Load K ONCE - keep for entire kernel
+        for i in cutlass.range_constexpr(32):
+            k_chunk[i] = k_sh[k_base + i]
 
-    out_sh[lane_idx, warp_idx] = out
-    cute.arch.sync_threads()
-    out_final = (
-        out_sh[lane_idx, 0]
-        + out_sh[lane_idx, 1]
-        + out_sh[lane_idx, 2]
-        + out_sh[lane_idx, 3]
-    )
+        h_out = gH[(pool_batch_idx, value_head_idx, None, None)]
 
-    write_h_chunk_to_smem(h_chunk, h_sh_chunk0, lane_idx, k_base)
-    if warp_idx == 0:
-        o_head[lane_idx] = out_final.to(cutlass.BFloat16)
+        # ====================================================================
+        # CHUNK 0
+        # ====================================================================
+        nvvm.cp_async_wait_group(1)
+        cute.arch.sync_threads()
 
-    # ========================================================================
-    # CHUNK 1
-    # ========================================================================
-    nvvm.cp_async_wait_group(0)
-    cute.arch.sync_threads()
+        pred = cutlass.Float32(0.0)
+        pred2 = cutlass.Float32(0.0)
+        for i in cutlass.range_constexpr(0, 32, 2):
+            h_chunk[i], h_chunk[i + 1] = fma_pair_mul(
+                h_sh_chunk0[lane_idx, k_base + i].to(cutlass.Float32),
+                h_sh_chunk0[lane_idx, k_base + i + 1].to(cutlass.Float32),
+                g_exp,
+                g_exp,
+            )
+        for i in cutlass.range_constexpr(0, 32, 2):
+            pred, pred2 = fma_pair(
+                h_chunk[i], h_chunk[i + 1], k_chunk[i], k_chunk[i + 1], pred, pred2
+            )
+        pred = pred + pred2
 
-    load_h_chunk_async(h_sh_chunk2, h_global, tidx, 64)
-    nvvm.cp_async_commit_group()
-    load_h_chunk_async(h_sh_chunk3, h_global, tidx, 96)
-    nvvm.cp_async_commit_group()
-
-    store_h_smem_to_gmem(h_sh_chunk0, h_out, tidx, 0)
-
-    pred = cutlass.Float32(0.0)
-    pred2 = cutlass.Float32(0.0)
-    for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = fma_pair_mul(
-            h_sh_chunk1[lane_idx, k_base + i].to(cutlass.Float32),
-            h_sh_chunk1[lane_idx, k_base + i + 1].to(cutlass.Float32),
-            g_exp,
-            g_exp,
-        )
-    for i in cutlass.range_constexpr(0, 32, 2):
-        pred, pred2 = fma_pair(
-            h_chunk[i], h_chunk[i + 1], k_chunk[i], k_chunk[i + 1], pred, pred2
-        )
-    pred = pred + pred2
-
-    pred_sh[lane_idx, warp_idx] = pred
-    cute.arch.sync_threads()
-    pred_final = (
-        pred_sh[lane_idx, 0]
-        + pred_sh[lane_idx, 1]
-        + pred_sh[lane_idx, 2]
-        + pred_sh[lane_idx, 3]
-    )
-
-    v_val = (v_sh[32 + lane_idx] - pred_final) * beta
-
-    for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = fma_pair(
-            k_chunk[i], k_chunk[i + 1], v_val, v_val, h_chunk[i], h_chunk[i + 1]
+        pred_sh[lane_idx, warp_idx] = pred
+        cute.arch.sync_threads()
+        pred_final = (
+            pred_sh[lane_idx, 0]
+            + pred_sh[lane_idx, 1]
+            + pred_sh[lane_idx, 2]
+            + pred_sh[lane_idx, 3]
         )
 
-    for i in cutlass.range_constexpr(32):
-        qk_temp[i] = q_sh[k_base + i]
+        v_val = (v_sh[lane_idx] - pred_final) * beta
 
-    out = cutlass.Float32(0.0)
-    out2 = cutlass.Float32(0.0)
-    for i in cutlass.range_constexpr(0, 32, 2):
-        out, out2 = fma_pair(
-            h_chunk[i], h_chunk[i + 1], qk_temp[i], qk_temp[i + 1], out, out2
-        )
-    out = out + out2
+        for i in cutlass.range_constexpr(0, 32, 2):
+            h_chunk[i], h_chunk[i + 1] = fma_pair(
+                k_chunk[i], k_chunk[i + 1], v_val, v_val, h_chunk[i], h_chunk[i + 1]
+            )
 
-    out_sh[lane_idx, warp_idx] = out
-    cute.arch.sync_threads()
-    out_final = (
-        out_sh[lane_idx, 0]
-        + out_sh[lane_idx, 1]
-        + out_sh[lane_idx, 2]
-        + out_sh[lane_idx, 3]
-    )
+        # Load Q for output computation
+        for i in cutlass.range_constexpr(32):
+            qk_temp[i] = q_sh[k_base + i]
 
-    write_h_chunk_to_smem(h_chunk, h_sh_chunk1, lane_idx, k_base)
-    if warp_idx == 0:
-        o_head[32 + lane_idx] = out_final.to(cutlass.BFloat16)
+        out = cutlass.Float32(0.0)
+        out2 = cutlass.Float32(0.0)
+        for i in cutlass.range_constexpr(0, 32, 2):
+            out, out2 = fma_pair(
+                h_chunk[i], h_chunk[i + 1], qk_temp[i], qk_temp[i + 1], out, out2
+            )
+        out = out + out2
 
-    # ========================================================================
-    # CHUNK 2
-    # ========================================================================
-    nvvm.cp_async_wait_group(1)
-    cute.arch.sync_threads()
-
-    store_h_smem_to_gmem(h_sh_chunk1, h_out, tidx, 32)
-
-    pred = cutlass.Float32(0.0)
-    pred2 = cutlass.Float32(0.0)
-    for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = fma_pair_mul(
-            h_sh_chunk2[lane_idx, k_base + i].to(cutlass.Float32),
-            h_sh_chunk2[lane_idx, k_base + i + 1].to(cutlass.Float32),
-            g_exp,
-            g_exp,
-        )
-    for i in cutlass.range_constexpr(0, 32, 2):
-        pred, pred2 = fma_pair(
-            h_chunk[i], h_chunk[i + 1], k_chunk[i], k_chunk[i + 1], pred, pred2
-        )
-    pred = pred + pred2
-
-    pred_sh[lane_idx, warp_idx] = pred
-    cute.arch.sync_threads()
-    pred_final = (
-        pred_sh[lane_idx, 0]
-        + pred_sh[lane_idx, 1]
-        + pred_sh[lane_idx, 2]
-        + pred_sh[lane_idx, 3]
-    )
-
-    v_val = (v_sh[64 + lane_idx] - pred_final) * beta
-
-    for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = fma_pair(
-            k_chunk[i], k_chunk[i + 1], v_val, v_val, h_chunk[i], h_chunk[i + 1]
+        out_sh[lane_idx, warp_idx] = out
+        cute.arch.sync_threads()
+        out_final = (
+            out_sh[lane_idx, 0]
+            + out_sh[lane_idx, 1]
+            + out_sh[lane_idx, 2]
+            + out_sh[lane_idx, 3]
         )
 
-    for i in cutlass.range_constexpr(32):
-        qk_temp[i] = q_sh[k_base + i]
+        write_h_chunk_to_smem(h_chunk, h_sh_chunk0, lane_idx, k_base)
+        if warp_idx == 0:
+            o_head[lane_idx] = out_final.to(cutlass.BFloat16)
 
-    out = cutlass.Float32(0.0)
-    out2 = cutlass.Float32(0.0)
-    for i in cutlass.range_constexpr(0, 32, 2):
-        out, out2 = fma_pair(
-            h_chunk[i], h_chunk[i + 1], qk_temp[i], qk_temp[i + 1], out, out2
-        )
-    out = out + out2
+        # ====================================================================
+        # CHUNK 1
+        # ====================================================================
+        nvvm.cp_async_wait_group(0)
+        cute.arch.sync_threads()
 
-    out_sh[lane_idx, warp_idx] = out
-    cute.arch.sync_threads()
-    out_final = (
-        out_sh[lane_idx, 0]
-        + out_sh[lane_idx, 1]
-        + out_sh[lane_idx, 2]
-        + out_sh[lane_idx, 3]
-    )
+        load_h_chunk_async(h_sh_chunk2, h_global, tidx, 64)
+        nvvm.cp_async_commit_group()
+        load_h_chunk_async(h_sh_chunk3, h_global, tidx, 96)
+        nvvm.cp_async_commit_group()
 
-    write_h_chunk_to_smem(h_chunk, h_sh_chunk2, lane_idx, k_base)
-    if warp_idx == 0:
-        o_head[64 + lane_idx] = out_final.to(cutlass.BFloat16)
+        store_h_smem_to_gmem(h_sh_chunk0, h_out, tidx, 0)
 
-    # ========================================================================
-    # CHUNK 3
-    # ========================================================================
-    nvvm.cp_async_wait_group(0)
-    cute.arch.sync_threads()
+        pred = cutlass.Float32(0.0)
+        pred2 = cutlass.Float32(0.0)
+        for i in cutlass.range_constexpr(0, 32, 2):
+            h_chunk[i], h_chunk[i + 1] = fma_pair_mul(
+                h_sh_chunk1[lane_idx, k_base + i].to(cutlass.Float32),
+                h_sh_chunk1[lane_idx, k_base + i + 1].to(cutlass.Float32),
+                g_exp,
+                g_exp,
+            )
+        for i in cutlass.range_constexpr(0, 32, 2):
+            pred, pred2 = fma_pair(
+                h_chunk[i], h_chunk[i + 1], k_chunk[i], k_chunk[i + 1], pred, pred2
+            )
+        pred = pred + pred2
 
-    store_h_smem_to_gmem(h_sh_chunk2, h_out, tidx, 64)
-
-    pred = cutlass.Float32(0.0)
-    pred2 = cutlass.Float32(0.0)
-    for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = fma_pair_mul(
-            h_sh_chunk3[lane_idx, k_base + i].to(cutlass.Float32),
-            h_sh_chunk3[lane_idx, k_base + i + 1].to(cutlass.Float32),
-            g_exp,
-            g_exp,
-        )
-    for i in cutlass.range_constexpr(0, 32, 2):
-        pred, pred2 = fma_pair(
-            h_chunk[i], h_chunk[i + 1], k_chunk[i], k_chunk[i + 1], pred, pred2
-        )
-    pred = pred + pred2
-
-    pred_sh[lane_idx, warp_idx] = pred
-    cute.arch.sync_threads()
-    pred_final = (
-        pred_sh[lane_idx, 0]
-        + pred_sh[lane_idx, 1]
-        + pred_sh[lane_idx, 2]
-        + pred_sh[lane_idx, 3]
-    )
-
-    v_val = (v_sh[96 + lane_idx] - pred_final) * beta
-
-    for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = fma_pair(
-            k_chunk[i], k_chunk[i + 1], v_val, v_val, h_chunk[i], h_chunk[i + 1]
+        pred_sh[lane_idx, warp_idx] = pred
+        cute.arch.sync_threads()
+        pred_final = (
+            pred_sh[lane_idx, 0]
+            + pred_sh[lane_idx, 1]
+            + pred_sh[lane_idx, 2]
+            + pred_sh[lane_idx, 3]
         )
 
-    for i in cutlass.range_constexpr(32):
-        qk_temp[i] = q_sh[k_base + i]
+        v_val = (v_sh[32 + lane_idx] - pred_final) * beta
 
-    out = cutlass.Float32(0.0)
-    out2 = cutlass.Float32(0.0)
-    for i in cutlass.range_constexpr(0, 32, 2):
-        out, out2 = fma_pair(
-            h_chunk[i], h_chunk[i + 1], qk_temp[i], qk_temp[i + 1], out, out2
+        for i in cutlass.range_constexpr(0, 32, 2):
+            h_chunk[i], h_chunk[i + 1] = fma_pair(
+                k_chunk[i], k_chunk[i + 1], v_val, v_val, h_chunk[i], h_chunk[i + 1]
+            )
+
+        for i in cutlass.range_constexpr(32):
+            qk_temp[i] = q_sh[k_base + i]
+
+        out = cutlass.Float32(0.0)
+        out2 = cutlass.Float32(0.0)
+        for i in cutlass.range_constexpr(0, 32, 2):
+            out, out2 = fma_pair(
+                h_chunk[i], h_chunk[i + 1], qk_temp[i], qk_temp[i + 1], out, out2
+            )
+        out = out + out2
+
+        out_sh[lane_idx, warp_idx] = out
+        cute.arch.sync_threads()
+        out_final = (
+            out_sh[lane_idx, 0]
+            + out_sh[lane_idx, 1]
+            + out_sh[lane_idx, 2]
+            + out_sh[lane_idx, 3]
         )
-    out = out + out2
 
-    out_sh[lane_idx, warp_idx] = out
-    cute.arch.sync_threads()
-    out_final = (
-        out_sh[lane_idx, 0]
-        + out_sh[lane_idx, 1]
-        + out_sh[lane_idx, 2]
-        + out_sh[lane_idx, 3]
-    )
+        write_h_chunk_to_smem(h_chunk, h_sh_chunk1, lane_idx, k_base)
+        if warp_idx == 0:
+            o_head[32 + lane_idx] = out_final.to(cutlass.BFloat16)
 
-    write_h_chunk_to_smem(h_chunk, h_sh_chunk3, lane_idx, k_base)
-    if warp_idx == 0:
-        o_head[96 + lane_idx] = out_final.to(cutlass.BFloat16)
+        # ====================================================================
+        # CHUNK 2
+        # ====================================================================
+        nvvm.cp_async_wait_group(1)
+        cute.arch.sync_threads()
 
-    cute.arch.sync_threads()
-    store_h_smem_to_gmem(h_sh_chunk3, h_out, tidx, 96)
+        store_h_smem_to_gmem(h_sh_chunk1, h_out, tidx, 32)
+
+        pred = cutlass.Float32(0.0)
+        pred2 = cutlass.Float32(0.0)
+        for i in cutlass.range_constexpr(0, 32, 2):
+            h_chunk[i], h_chunk[i + 1] = fma_pair_mul(
+                h_sh_chunk2[lane_idx, k_base + i].to(cutlass.Float32),
+                h_sh_chunk2[lane_idx, k_base + i + 1].to(cutlass.Float32),
+                g_exp,
+                g_exp,
+            )
+        for i in cutlass.range_constexpr(0, 32, 2):
+            pred, pred2 = fma_pair(
+                h_chunk[i], h_chunk[i + 1], k_chunk[i], k_chunk[i + 1], pred, pred2
+            )
+        pred = pred + pred2
+
+        pred_sh[lane_idx, warp_idx] = pred
+        cute.arch.sync_threads()
+        pred_final = (
+            pred_sh[lane_idx, 0]
+            + pred_sh[lane_idx, 1]
+            + pred_sh[lane_idx, 2]
+            + pred_sh[lane_idx, 3]
+        )
+
+        v_val = (v_sh[64 + lane_idx] - pred_final) * beta
+
+        for i in cutlass.range_constexpr(0, 32, 2):
+            h_chunk[i], h_chunk[i + 1] = fma_pair(
+                k_chunk[i], k_chunk[i + 1], v_val, v_val, h_chunk[i], h_chunk[i + 1]
+            )
+
+        for i in cutlass.range_constexpr(32):
+            qk_temp[i] = q_sh[k_base + i]
+
+        out = cutlass.Float32(0.0)
+        out2 = cutlass.Float32(0.0)
+        for i in cutlass.range_constexpr(0, 32, 2):
+            out, out2 = fma_pair(
+                h_chunk[i], h_chunk[i + 1], qk_temp[i], qk_temp[i + 1], out, out2
+            )
+        out = out + out2
+
+        out_sh[lane_idx, warp_idx] = out
+        cute.arch.sync_threads()
+        out_final = (
+            out_sh[lane_idx, 0]
+            + out_sh[lane_idx, 1]
+            + out_sh[lane_idx, 2]
+            + out_sh[lane_idx, 3]
+        )
+
+        write_h_chunk_to_smem(h_chunk, h_sh_chunk2, lane_idx, k_base)
+        if warp_idx == 0:
+            o_head[64 + lane_idx] = out_final.to(cutlass.BFloat16)
+
+        # ====================================================================
+        # CHUNK 3
+        # ====================================================================
+        nvvm.cp_async_wait_group(0)
+        cute.arch.sync_threads()
+
+        store_h_smem_to_gmem(h_sh_chunk2, h_out, tidx, 64)
+
+        pred = cutlass.Float32(0.0)
+        pred2 = cutlass.Float32(0.0)
+        for i in cutlass.range_constexpr(0, 32, 2):
+            h_chunk[i], h_chunk[i + 1] = fma_pair_mul(
+                h_sh_chunk3[lane_idx, k_base + i].to(cutlass.Float32),
+                h_sh_chunk3[lane_idx, k_base + i + 1].to(cutlass.Float32),
+                g_exp,
+                g_exp,
+            )
+        for i in cutlass.range_constexpr(0, 32, 2):
+            pred, pred2 = fma_pair(
+                h_chunk[i], h_chunk[i + 1], k_chunk[i], k_chunk[i + 1], pred, pred2
+            )
+        pred = pred + pred2
+
+        pred_sh[lane_idx, warp_idx] = pred
+        cute.arch.sync_threads()
+        pred_final = (
+            pred_sh[lane_idx, 0]
+            + pred_sh[lane_idx, 1]
+            + pred_sh[lane_idx, 2]
+            + pred_sh[lane_idx, 3]
+        )
+
+        v_val = (v_sh[96 + lane_idx] - pred_final) * beta
+
+        for i in cutlass.range_constexpr(0, 32, 2):
+            h_chunk[i], h_chunk[i + 1] = fma_pair(
+                k_chunk[i], k_chunk[i + 1], v_val, v_val, h_chunk[i], h_chunk[i + 1]
+            )
+
+        for i in cutlass.range_constexpr(32):
+            qk_temp[i] = q_sh[k_base + i]
+
+        out = cutlass.Float32(0.0)
+        out2 = cutlass.Float32(0.0)
+        for i in cutlass.range_constexpr(0, 32, 2):
+            out, out2 = fma_pair(
+                h_chunk[i], h_chunk[i + 1], qk_temp[i], qk_temp[i + 1], out, out2
+            )
+        out = out + out2
+
+        out_sh[lane_idx, warp_idx] = out
+        cute.arch.sync_threads()
+        out_final = (
+            out_sh[lane_idx, 0]
+            + out_sh[lane_idx, 1]
+            + out_sh[lane_idx, 2]
+            + out_sh[lane_idx, 3]
+        )
+
+        write_h_chunk_to_smem(h_chunk, h_sh_chunk3, lane_idx, k_base)
+        if warp_idx == 0:
+            o_head[96 + lane_idx] = out_final.to(cutlass.BFloat16)
+
+        cute.arch.sync_threads()
+        store_h_smem_to_gmem(h_sh_chunk3, h_out, tidx, 96)
+
+    else:
+        # Negative index = padding slot. Zero the output, skip all computation.
+        o_head[tidx] = cutlass.BFloat16(0.0)
 
 
 # ==============================================================================
@@ -1216,262 +1221,272 @@ def gated_delta_rule_decode_kernel_seqlen234_unified(
             alpha3, beta_raw3, dt_bias_val, A_log_val, softplus_beta, softplus_threshold
         )
 
-    # Upfront H loading
-    h_global = gH[(pool_batch_idx, value_head_idx, None, None)]
-    load_h_chunk_async(h_sh_chunk0, h_global, tidx, 0)
-    nvvm.cp_async_commit_group()
-    load_h_chunk_async(h_sh_chunk1, h_global, tidx, 32)
-    nvvm.cp_async_commit_group()
-    load_h_chunk_async(h_sh_chunk2, h_global, tidx, 64)
-    nvvm.cp_async_commit_group()
-    load_h_chunk_async(h_sh_chunk3, h_global, tidx, 96)
-    nvvm.cp_async_commit_group()
-
-    # Q/K normalization - tokens 0, 1 always
-    q_head0 = gQ[(batch_idx, 0, query_head_idx, None)]
-    k_head0 = gK[(batch_idx, 0, query_head_idx, None)]
-    q_head1 = gQ[(batch_idx, 1, query_head_idx, None)]
-    k_head1 = gK[(batch_idx, 1, query_head_idx, None)]
-
-    if warp_idx == 0:
-        normalize_and_store_qk_to_smem(
-            q_head0, k_head0, q_sh0, k_sh0, lane_idx, scale, eps
-        )
-    if warp_idx == 1:
-        normalize_and_store_qk_to_smem(
-            q_head1, k_head1, q_sh1, k_sh1, lane_idx, scale, eps
-        )
-
-    # Token 2 Q/K normalization - only for NUM_TOKENS >= 3
-    if NUM_TOKENS >= 3:
-        q_head2 = gQ[(batch_idx, 2, query_head_idx, None)]
-        k_head2 = gK[(batch_idx, 2, query_head_idx, None)]
-        if warp_idx == 2:
-            normalize_and_store_qk_to_smem(
-                q_head2, k_head2, q_sh2, k_sh2, lane_idx, scale, eps
-            )
-
-    # Token 3 Q/K normalization - only for NUM_TOKENS = 4
-    if NUM_TOKENS == 4:
-        q_head3 = gQ[(batch_idx, 3, query_head_idx, None)]
-        k_head3 = gK[(batch_idx, 3, query_head_idx, None)]
-        if warp_idx == 3:
-            normalize_and_store_qk_to_smem(
-                q_head3, k_head3, q_sh3, k_sh3, lane_idx, scale, eps
-            )
-
-    cute.arch.sync_threads()
-
-    # V loading - tokens 0, 1 always
-    v_head0 = gV[(batch_idx, 0, value_head_idx, None)]
-    v_head1 = gV[(batch_idx, 1, value_head_idx, None)]
-    load_v_to_smem(v_head0, v_sh0, tidx)
-    load_v_to_smem(v_head1, v_sh1, tidx)
-
-    # Token 2 V loading - only for NUM_TOKENS >= 3
-    if NUM_TOKENS >= 3:
-        v_head2 = gV[(batch_idx, 2, value_head_idx, None)]
-        load_v_to_smem(v_head2, v_sh2, tidx)
-
-    # Token 3 V loading - only for NUM_TOKENS = 4
-    if NUM_TOKENS == 4:
-        v_head3 = gV[(batch_idx, 3, value_head_idx, None)]
-        load_v_to_smem(v_head3, v_sh3, tidx)
-
-    # Output pointers - tokens 0, 1 always
-    h_out = gH[(pool_batch_idx, value_head_idx, None, None)]
+    # Output pointers moved before guard (safe, uses batch_idx)
     o_head0 = gO[(batch_idx, 0, value_head_idx, None)]
     o_head1 = gO[(batch_idx, 1, value_head_idx, None)]
 
-    # Token 2 output pointer
     o_head2 = o_head1  # Default for T=2
     if NUM_TOKENS >= 3:
         o_head2 = gO[(batch_idx, 2, value_head_idx, None)]
 
-    # Token 3 output pointer
     o_head3 = o_head2  # Default for T=2,3
     if NUM_TOKENS == 4:
         o_head3 = gO[(batch_idx, 3, value_head_idx, None)]
 
-    # Process V-CHUNK 0
-    nvvm.cp_async_wait_group(3)
-    cute.arch.sync_threads()
-    process_vchunk_unified_234(
-        h_sh_chunk0,
-        h_sh_chunk0,
-        h_out,
-        h_chunk,
-        kq_chunk,
-        k_sh0,
-        k_sh1,
-        k_sh2,
-        k_sh3,
-        q_sh0,
-        q_sh1,
-        q_sh2,
-        q_sh3,
-        v_sh0,
-        v_sh1,
-        v_sh2,
-        v_sh3,
-        reduce_sh,
-        o_head0,
-        o_head1,
-        o_head2,
-        o_head3,
-        g_exp0,
-        g_exp1,
-        g_exp2,
-        g_exp3,
-        beta0,
-        beta1,
-        beta2,
-        beta3,
-        0,
-        0,
-        cutlass.Int32(0),
-        tidx,
-        warp_idx,
-        lane_idx,
-        k_base,
-        NUM_TOKENS,
-    )
+    # Only process valid batch entries (pool_batch_idx >= 0)
+    if pool_batch_idx >= 0:
+        # Upfront H loading
+        h_global = gH[(pool_batch_idx, value_head_idx, None, None)]
+        load_h_chunk_async(h_sh_chunk0, h_global, tidx, 0)
+        nvvm.cp_async_commit_group()
+        load_h_chunk_async(h_sh_chunk1, h_global, tidx, 32)
+        nvvm.cp_async_commit_group()
+        load_h_chunk_async(h_sh_chunk2, h_global, tidx, 64)
+        nvvm.cp_async_commit_group()
+        load_h_chunk_async(h_sh_chunk3, h_global, tidx, 96)
+        nvvm.cp_async_commit_group()
 
-    # Process V-CHUNK 1
-    nvvm.cp_async_wait_group(2)
-    cute.arch.sync_threads()
-    process_vchunk_unified_234(
-        h_sh_chunk1,
-        h_sh_chunk0,
-        h_out,
-        h_chunk,
-        kq_chunk,
-        k_sh0,
-        k_sh1,
-        k_sh2,
-        k_sh3,
-        q_sh0,
-        q_sh1,
-        q_sh2,
-        q_sh3,
-        v_sh0,
-        v_sh1,
-        v_sh2,
-        v_sh3,
-        reduce_sh,
-        o_head0,
-        o_head1,
-        o_head2,
-        o_head3,
-        g_exp0,
-        g_exp1,
-        g_exp2,
-        g_exp3,
-        beta0,
-        beta1,
-        beta2,
-        beta3,
-        32,
-        0,
-        cutlass.Int32(1),
-        tidx,
-        warp_idx,
-        lane_idx,
-        k_base,
-        NUM_TOKENS,
-    )
+        # Q/K normalization - tokens 0, 1 always
+        q_head0 = gQ[(batch_idx, 0, query_head_idx, None)]
+        k_head0 = gK[(batch_idx, 0, query_head_idx, None)]
+        q_head1 = gQ[(batch_idx, 1, query_head_idx, None)]
+        k_head1 = gK[(batch_idx, 1, query_head_idx, None)]
 
-    # Process V-CHUNK 2
-    nvvm.cp_async_wait_group(1)
-    cute.arch.sync_threads()
-    process_vchunk_unified_234(
-        h_sh_chunk2,
-        h_sh_chunk1,
-        h_out,
-        h_chunk,
-        kq_chunk,
-        k_sh0,
-        k_sh1,
-        k_sh2,
-        k_sh3,
-        q_sh0,
-        q_sh1,
-        q_sh2,
-        q_sh3,
-        v_sh0,
-        v_sh1,
-        v_sh2,
-        v_sh3,
-        reduce_sh,
-        o_head0,
-        o_head1,
-        o_head2,
-        o_head3,
-        g_exp0,
-        g_exp1,
-        g_exp2,
-        g_exp3,
-        beta0,
-        beta1,
-        beta2,
-        beta3,
-        64,
-        32,
-        cutlass.Int32(1),
-        tidx,
-        warp_idx,
-        lane_idx,
-        k_base,
-        NUM_TOKENS,
-    )
+        if warp_idx == 0:
+            normalize_and_store_qk_to_smem(
+                q_head0, k_head0, q_sh0, k_sh0, lane_idx, scale, eps
+            )
+        if warp_idx == 1:
+            normalize_and_store_qk_to_smem(
+                q_head1, k_head1, q_sh1, k_sh1, lane_idx, scale, eps
+            )
 
-    # Process V-CHUNK 3
-    nvvm.cp_async_wait_group(0)
-    cute.arch.sync_threads()
-    process_vchunk_unified_234(
-        h_sh_chunk3,
-        h_sh_chunk2,
-        h_out,
-        h_chunk,
-        kq_chunk,
-        k_sh0,
-        k_sh1,
-        k_sh2,
-        k_sh3,
-        q_sh0,
-        q_sh1,
-        q_sh2,
-        q_sh3,
-        v_sh0,
-        v_sh1,
-        v_sh2,
-        v_sh3,
-        reduce_sh,
-        o_head0,
-        o_head1,
-        o_head2,
-        o_head3,
-        g_exp0,
-        g_exp1,
-        g_exp2,
-        g_exp3,
-        beta0,
-        beta1,
-        beta2,
-        beta3,
-        96,
-        64,
-        cutlass.Int32(1),
-        tidx,
-        warp_idx,
-        lane_idx,
-        k_base,
-        NUM_TOKENS,
-    )
+        # Token 2 Q/K normalization - only for NUM_TOKENS >= 3
+        if NUM_TOKENS >= 3:
+            q_head2 = gQ[(batch_idx, 2, query_head_idx, None)]
+            k_head2 = gK[(batch_idx, 2, query_head_idx, None)]
+            if warp_idx == 2:
+                normalize_and_store_qk_to_smem(
+                    q_head2, k_head2, q_sh2, k_sh2, lane_idx, scale, eps
+                )
 
-    # Final H store
-    cute.arch.sync_threads()
-    store_h_smem_to_gmem(h_sh_chunk3, h_out, tidx, 96)
+        # Token 3 Q/K normalization - only for NUM_TOKENS = 4
+        if NUM_TOKENS == 4:
+            q_head3 = gQ[(batch_idx, 3, query_head_idx, None)]
+            k_head3 = gK[(batch_idx, 3, query_head_idx, None)]
+            if warp_idx == 3:
+                normalize_and_store_qk_to_smem(
+                    q_head3, k_head3, q_sh3, k_sh3, lane_idx, scale, eps
+                )
+
+        cute.arch.sync_threads()
+
+        # V loading - tokens 0, 1 always
+        v_head0 = gV[(batch_idx, 0, value_head_idx, None)]
+        v_head1 = gV[(batch_idx, 1, value_head_idx, None)]
+        load_v_to_smem(v_head0, v_sh0, tidx)
+        load_v_to_smem(v_head1, v_sh1, tidx)
+
+        # Token 2 V loading - only for NUM_TOKENS >= 3
+        if NUM_TOKENS >= 3:
+            v_head2 = gV[(batch_idx, 2, value_head_idx, None)]
+            load_v_to_smem(v_head2, v_sh2, tidx)
+
+        # Token 3 V loading - only for NUM_TOKENS = 4
+        if NUM_TOKENS == 4:
+            v_head3 = gV[(batch_idx, 3, value_head_idx, None)]
+            load_v_to_smem(v_head3, v_sh3, tidx)
+
+        h_out = gH[(pool_batch_idx, value_head_idx, None, None)]
+
+        # Process V-CHUNK 0
+        nvvm.cp_async_wait_group(3)
+        cute.arch.sync_threads()
+        process_vchunk_unified_234(
+            h_sh_chunk0,
+            h_sh_chunk0,
+            h_out,
+            h_chunk,
+            kq_chunk,
+            k_sh0,
+            k_sh1,
+            k_sh2,
+            k_sh3,
+            q_sh0,
+            q_sh1,
+            q_sh2,
+            q_sh3,
+            v_sh0,
+            v_sh1,
+            v_sh2,
+            v_sh3,
+            reduce_sh,
+            o_head0,
+            o_head1,
+            o_head2,
+            o_head3,
+            g_exp0,
+            g_exp1,
+            g_exp2,
+            g_exp3,
+            beta0,
+            beta1,
+            beta2,
+            beta3,
+            0,
+            0,
+            cutlass.Int32(0),
+            tidx,
+            warp_idx,
+            lane_idx,
+            k_base,
+            NUM_TOKENS,
+        )
+
+        # Process V-CHUNK 1
+        nvvm.cp_async_wait_group(2)
+        cute.arch.sync_threads()
+        process_vchunk_unified_234(
+            h_sh_chunk1,
+            h_sh_chunk0,
+            h_out,
+            h_chunk,
+            kq_chunk,
+            k_sh0,
+            k_sh1,
+            k_sh2,
+            k_sh3,
+            q_sh0,
+            q_sh1,
+            q_sh2,
+            q_sh3,
+            v_sh0,
+            v_sh1,
+            v_sh2,
+            v_sh3,
+            reduce_sh,
+            o_head0,
+            o_head1,
+            o_head2,
+            o_head3,
+            g_exp0,
+            g_exp1,
+            g_exp2,
+            g_exp3,
+            beta0,
+            beta1,
+            beta2,
+            beta3,
+            32,
+            0,
+            cutlass.Int32(1),
+            tidx,
+            warp_idx,
+            lane_idx,
+            k_base,
+            NUM_TOKENS,
+        )
+
+        # Process V-CHUNK 2
+        nvvm.cp_async_wait_group(1)
+        cute.arch.sync_threads()
+        process_vchunk_unified_234(
+            h_sh_chunk2,
+            h_sh_chunk1,
+            h_out,
+            h_chunk,
+            kq_chunk,
+            k_sh0,
+            k_sh1,
+            k_sh2,
+            k_sh3,
+            q_sh0,
+            q_sh1,
+            q_sh2,
+            q_sh3,
+            v_sh0,
+            v_sh1,
+            v_sh2,
+            v_sh3,
+            reduce_sh,
+            o_head0,
+            o_head1,
+            o_head2,
+            o_head3,
+            g_exp0,
+            g_exp1,
+            g_exp2,
+            g_exp3,
+            beta0,
+            beta1,
+            beta2,
+            beta3,
+            64,
+            32,
+            cutlass.Int32(1),
+            tidx,
+            warp_idx,
+            lane_idx,
+            k_base,
+            NUM_TOKENS,
+        )
+
+        # Process V-CHUNK 3
+        nvvm.cp_async_wait_group(0)
+        cute.arch.sync_threads()
+        process_vchunk_unified_234(
+            h_sh_chunk3,
+            h_sh_chunk2,
+            h_out,
+            h_chunk,
+            kq_chunk,
+            k_sh0,
+            k_sh1,
+            k_sh2,
+            k_sh3,
+            q_sh0,
+            q_sh1,
+            q_sh2,
+            q_sh3,
+            v_sh0,
+            v_sh1,
+            v_sh2,
+            v_sh3,
+            reduce_sh,
+            o_head0,
+            o_head1,
+            o_head2,
+            o_head3,
+            g_exp0,
+            g_exp1,
+            g_exp2,
+            g_exp3,
+            beta0,
+            beta1,
+            beta2,
+            beta3,
+            96,
+            64,
+            cutlass.Int32(1),
+            tidx,
+            warp_idx,
+            lane_idx,
+            k_base,
+            NUM_TOKENS,
+        )
+
+        # Final H store
+        cute.arch.sync_threads()
+        store_h_smem_to_gmem(h_sh_chunk3, h_out, tidx, 96)
+
+    else:
+        # Negative index = padding slot. Zero the output for all tokens.
+        o_head0[tidx] = cutlass.BFloat16(0.0)
+        o_head1[tidx] = cutlass.BFloat16(0.0)
+        if NUM_TOKENS >= 3:
+            o_head2[tidx] = cutlass.BFloat16(0.0)
+        if NUM_TOKENS == 4:
+            o_head3[tidx] = cutlass.BFloat16(0.0)
 
 
 # ==============================================================================
@@ -1588,99 +1603,106 @@ def gated_delta_rule_decode_kernel_seqlen1_lowBS_1chunk(
         cutlass.Float32, cute.make_layout((32, 4), stride=(1, 32))
     )
 
-    h_global = gH[(pool_batch_idx, value_head_idx, None, None)]
-
-    load_h_chunk_async(h_sh_chunk, h_global, tidx, v_row_base)
-    nvvm.cp_async_commit_group()
-
-    q_head = gQ[(batch_idx, 0, query_head_idx, None)]
-    k_head = gK[(batch_idx, 0, query_head_idx, None)]
-
-    warp_idx = tidx // 32
-    lane_idx = tidx % 32
-
-    if warp_idx == 0:
-        normalize_and_store_qk_to_smem(q_head, k_head, q_sh, k_sh, lane_idx, scale, eps)
-
-    cute.arch.sync_threads()
-
-    v_head = gV[(batch_idx, 0, value_head_idx, None)]
+    # Allocations moved before guard (compile-time layout ops / safe batch_idx indexing)
     v_sh = smem.allocate_tensor(cutlass.Float32, 32)
-    if tidx < 32:
-        v_sh[tidx] = v_head[v_row_base + tidx].to(cutlass.Float32)
-
     h_chunk = cute.make_rmem_tensor((32,), cutlass.Float32)
     k_chunk = cute.make_rmem_tensor((32,), cutlass.Float32)
     qk_temp = cute.make_rmem_tensor((32,), cutlass.Float32)
 
+    warp_idx = tidx // 32
+    lane_idx = tidx % 32
     k_base = warp_idx * 32
-
-    for i in cutlass.range_constexpr(32):
-        k_chunk[i] = k_sh[k_base + i]
-
-    h_out = gH[(pool_batch_idx, value_head_idx, None, None)]
     o_head = gO[(batch_idx, 0, value_head_idx, None)]
 
-    nvvm.cp_async_wait_group(0)
-    cute.arch.sync_threads()
+    # Only process valid batch entries (pool_batch_idx >= 0)
+    if pool_batch_idx >= 0:
+        h_global = gH[(pool_batch_idx, value_head_idx, None, None)]
 
-    pred = cutlass.Float32(0.0)
-    pred2 = cutlass.Float32(0.0)
-    for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = fma_pair_mul(
-            h_sh_chunk[lane_idx, k_base + i].to(cutlass.Float32),
-            h_sh_chunk[lane_idx, k_base + i + 1].to(cutlass.Float32),
-            g_exp,
-            g_exp,
+        load_h_chunk_async(h_sh_chunk, h_global, tidx, v_row_base)
+        nvvm.cp_async_commit_group()
+
+        q_head = gQ[(batch_idx, 0, query_head_idx, None)]
+        k_head = gK[(batch_idx, 0, query_head_idx, None)]
+
+        if warp_idx == 0:
+            normalize_and_store_qk_to_smem(q_head, k_head, q_sh, k_sh, lane_idx, scale, eps)
+
+        cute.arch.sync_threads()
+
+        v_head = gV[(batch_idx, 0, value_head_idx, None)]
+        if tidx < 32:
+            v_sh[tidx] = v_head[v_row_base + tidx].to(cutlass.Float32)
+
+        for i in cutlass.range_constexpr(32):
+            k_chunk[i] = k_sh[k_base + i]
+
+        h_out = gH[(pool_batch_idx, value_head_idx, None, None)]
+
+        nvvm.cp_async_wait_group(0)
+        cute.arch.sync_threads()
+
+        pred = cutlass.Float32(0.0)
+        pred2 = cutlass.Float32(0.0)
+        for i in cutlass.range_constexpr(0, 32, 2):
+            h_chunk[i], h_chunk[i + 1] = fma_pair_mul(
+                h_sh_chunk[lane_idx, k_base + i].to(cutlass.Float32),
+                h_sh_chunk[lane_idx, k_base + i + 1].to(cutlass.Float32),
+                g_exp,
+                g_exp,
+            )
+        for i in cutlass.range_constexpr(0, 32, 2):
+            pred, pred2 = fma_pair(
+                h_chunk[i], h_chunk[i + 1], k_chunk[i], k_chunk[i + 1], pred, pred2
+            )
+        pred = pred + pred2
+
+        pred_sh[lane_idx, warp_idx] = pred
+        cute.arch.sync_threads()
+        pred_final = (
+            pred_sh[lane_idx, 0]
+            + pred_sh[lane_idx, 1]
+            + pred_sh[lane_idx, 2]
+            + pred_sh[lane_idx, 3]
         )
-    for i in cutlass.range_constexpr(0, 32, 2):
-        pred, pred2 = fma_pair(
-            h_chunk[i], h_chunk[i + 1], k_chunk[i], k_chunk[i + 1], pred, pred2
+
+        v_val = (v_sh[lane_idx] - pred_final) * beta
+
+        for i in cutlass.range_constexpr(0, 32, 2):
+            h_chunk[i], h_chunk[i + 1] = fma_pair(
+                k_chunk[i], k_chunk[i + 1], v_val, v_val, h_chunk[i], h_chunk[i + 1]
+            )
+
+        for i in cutlass.range_constexpr(32):
+            qk_temp[i] = q_sh[k_base + i]
+
+        out = cutlass.Float32(0.0)
+        out2 = cutlass.Float32(0.0)
+        for i in cutlass.range_constexpr(0, 32, 2):
+            out, out2 = fma_pair(
+                h_chunk[i], h_chunk[i + 1], qk_temp[i], qk_temp[i + 1], out, out2
+            )
+        out = out + out2
+
+        out_sh[lane_idx, warp_idx] = out
+        cute.arch.sync_threads()
+        out_final = (
+            out_sh[lane_idx, 0]
+            + out_sh[lane_idx, 1]
+            + out_sh[lane_idx, 2]
+            + out_sh[lane_idx, 3]
         )
-    pred = pred + pred2
 
-    pred_sh[lane_idx, warp_idx] = pred
-    cute.arch.sync_threads()
-    pred_final = (
-        pred_sh[lane_idx, 0]
-        + pred_sh[lane_idx, 1]
-        + pred_sh[lane_idx, 2]
-        + pred_sh[lane_idx, 3]
-    )
+        write_h_chunk_to_smem(h_chunk, h_sh_chunk, lane_idx, k_base)
+        if warp_idx == 0:
+            o_head[v_row_base + lane_idx] = out_final.to(cutlass.BFloat16)
 
-    v_val = (v_sh[lane_idx] - pred_final) * beta
+        cute.arch.sync_threads()
+        store_h_smem_to_gmem(h_sh_chunk, h_out, tidx, v_row_base)
 
-    for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = fma_pair(
-            k_chunk[i], k_chunk[i + 1], v_val, v_val, h_chunk[i], h_chunk[i + 1]
-        )
-
-    for i in cutlass.range_constexpr(32):
-        qk_temp[i] = q_sh[k_base + i]
-
-    out = cutlass.Float32(0.0)
-    out2 = cutlass.Float32(0.0)
-    for i in cutlass.range_constexpr(0, 32, 2):
-        out, out2 = fma_pair(
-            h_chunk[i], h_chunk[i + 1], qk_temp[i], qk_temp[i + 1], out, out2
-        )
-    out = out + out2
-
-    out_sh[lane_idx, warp_idx] = out
-    cute.arch.sync_threads()
-    out_final = (
-        out_sh[lane_idx, 0]
-        + out_sh[lane_idx, 1]
-        + out_sh[lane_idx, 2]
-        + out_sh[lane_idx, 3]
-    )
-
-    write_h_chunk_to_smem(h_chunk, h_sh_chunk, lane_idx, k_base)
-    if warp_idx == 0:
-        o_head[v_row_base + lane_idx] = out_final.to(cutlass.BFloat16)
-
-    cute.arch.sync_threads()
-    store_h_smem_to_gmem(h_sh_chunk, h_out, tidx, v_row_base)
+    else:
+        # Negative index = padding slot. Zero the output for this V-chunk.
+        if tidx < 32:
+            o_head[v_row_base + tidx] = cutlass.BFloat16(0.0)
 
 
 @cute.jit
@@ -1994,7 +2016,7 @@ def gated_delta_rule(
     else:
         h_slot_indices = initial_state_indices
 
-    output = torch.empty(B, T, HV, V, device=q.device, dtype=q.dtype)
+    output = torch.zeros(B, T, HV, V, device=q.device, dtype=q.dtype)
 
     q_ = from_dlpack(q, assumed_align=32, enable_tvm_ffi=True)
     k_ = from_dlpack(k, assumed_align=32, enable_tvm_ffi=True)
