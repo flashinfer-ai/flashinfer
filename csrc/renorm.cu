@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <flashinfer/air_top_p.cuh>
 #include <flashinfer/sampling.cuh>
 
 #include "sampling_utils.h"
@@ -23,7 +24,8 @@ using namespace flashinfer;
 using tvm::ffi::Optional;
 
 void top_p_renorm_probs(TensorView probs, TensorView renorm_probs,
-                        Optional<TensorView> maybe_top_p_arr, double top_p_val) {
+                        Optional<TensorView> maybe_top_p_arr, double top_p_val,
+                        bool is_deterministic, TensorView workspace) {
   CHECK_INPUT(probs);
   CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
   unsigned int batch_size = probs.size(0);
@@ -33,10 +35,25 @@ void top_p_renorm_probs(TensorView probs, TensorView renorm_probs,
 
   ffi::CUDADeviceGuard device_guard(probs.device().device_id);
   auto stream = get_stream(probs.device());
-  cudaError_t status = sampling::TopPRenormProb<float>(
-      static_cast<float*>(probs.data_ptr()), static_cast<float*>(renorm_probs.data_ptr()),
-      has_top_p_arr ? static_cast<float*>(maybe_top_p_arr.value().data_ptr()) : nullptr, batch_size,
-      top_p_val, vocab_size, stream);
+
+  float* top_p_arr_ptr =
+      has_top_p_arr ? static_cast<float*>(maybe_top_p_arr.value().data_ptr()) : nullptr;
+
+  cudaError_t status;
+  // Fallback to ternary search for small vocab where radix precision is insufficient
+  if (vocab_size < sampling::air_top_p::NUM_BUCKETS) {
+    status = sampling::TopPRenormProb<float>(
+        static_cast<float*>(probs.data_ptr()), static_cast<float*>(renorm_probs.data_ptr()),
+        top_p_arr_ptr, batch_size, top_p_val, vocab_size, stream);
+  } else if (is_deterministic) {
+    status = sampling::air_top_p::AirTopPRenormProb<true, float>(
+        static_cast<float*>(probs.data_ptr()), static_cast<float*>(renorm_probs.data_ptr()),
+        top_p_arr_ptr, batch_size, top_p_val, vocab_size, workspace.data_ptr(), stream);
+  } else {
+    status = sampling::air_top_p::AirTopPRenormProb<false, float>(
+        static_cast<float*>(probs.data_ptr()), static_cast<float*>(renorm_probs.data_ptr()),
+        top_p_arr_ptr, batch_size, top_p_val, vocab_size, workspace.data_ptr(), stream);
+  }
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "TopPRenormProb failed with error code " << cudaGetErrorString(status);
 }
