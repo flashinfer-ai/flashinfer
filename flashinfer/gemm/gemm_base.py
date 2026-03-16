@@ -2009,11 +2009,11 @@ def build_cudnn_fp4_gemm_graph_override_shape(
         cache_m, n, k, block_size
     )
 
-    a_shape = [batch, cache_m, k * 2]  # FP4 packed: K dimension stores k*2 uint8 values
-    a_stride = [cache_m * k * 2, k * 2, 1]
+    a_shape = [batch, cache_m, k]  # FP4 packed: K dimension stores k*2 uint8 values
+    a_stride = [cache_m * k, k, 1]
 
-    b_shape = [batch, k * 2, n]
-    b_stride = [k * n * 2, 1, k * 2]
+    b_shape = [batch, k, n]
+    b_stride = [k * n, 1, k]
 
     a_descale_shape = [batch, block_scale_dim_m, a_descale_k_dim]
     a_descale_stride = [block_scale_dim_m * a_descale_k_dim, a_descale_k_dim, 1]
@@ -2157,11 +2157,6 @@ def execute_cudnn_fp4_gemm_graph_override_shape(
         b_descale.stride(),
         c_final.stride(),
     ]
-
-    if workspace_buffer.numel() < graph.get_workspace_size():
-        workspace_buffer = torch.empty(
-            graph.get_workspace_size(), device=a.device, dtype=torch.uint8
-        )
 
     stream = torch.cuda.current_stream(a.device)
 
@@ -2474,12 +2469,6 @@ def execute_cudnn_mxfp8_gemm_graph_override_shape(
         list(b_descale.stride()),
         list(c_final.stride()),
     ]
-
-    workspace_size = graph.get_workspace_size()
-    if workspace_buffer.numel() < workspace_size:
-        workspace_buffer = torch.empty(
-            workspace_size, device=a.device, dtype=torch.uint8
-        )
 
     stream = torch.cuda.current_stream(a.device)
     graph.execute_plan_at_index(
