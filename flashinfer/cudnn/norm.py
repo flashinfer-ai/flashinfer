@@ -93,11 +93,22 @@ def _build_rmsnorm_silu_graph(
 
 def cudnn_fused_rmsnorm_silu(
     input: torch.Tensor,
-    weight: torch.Tensor,
+    scale: torch.Tensor,
     eps: float = 1e-6,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Execute fused RMSNorm + SiLU via the cuDNN OSS engine.
+    r"""Execute fused RMSNorm + SiLU via the cuDNN OSS engine.
+
+    Computes:
+
+    .. math::
+
+        \text{out} = \text{SiLU}\!\Big(\frac{x}{\sqrt{\text{mean}(x^2) + \varepsilon}}
+        \;\cdot\; \gamma\Big)
+
+    where :math:`x` is the input, :math:`\gamma` is the per-channel scale,
+    :math:`\varepsilon` is the epsilon, and
+    :math:`\text{SiLU}(y) = y \cdot \sigma(y)`.
 
     The output dtype is determined by the ``out`` tensor dtype:
       - bf16: standard output
@@ -108,8 +119,8 @@ def cudnn_fused_rmsnorm_silu(
     ----------
     input : torch.Tensor
         Input tensor, shape (num_tokens, hidden_size). Must be bf16.
-    weight : torch.Tensor
-        Weight tensor, shape (hidden_size,). Must be bf16.
+    scale : torch.Tensor
+        Per-channel scale (gamma), shape (hidden_size,). Must be bf16.
     eps : float
         RMSNorm epsilon.
     out : Optional[torch.Tensor]
@@ -135,8 +146,8 @@ def cudnn_fused_rmsnorm_silu(
 
     is_nvfp4 = out_torch_dtype == torch.uint8
 
-    graph, X, scale, epsilon, Z, workspace_size = _build_rmsnorm_silu_graph(
-        num_tokens, C, int(cudnn_out_dtype), device_index
+    graph, X_desc, scale_desc, eps_desc, Z_desc, workspace_size = (
+        _build_rmsnorm_silu_graph(num_tokens, C, int(cudnn_out_dtype), device_index)
     )
 
     if out is None:
@@ -158,10 +169,10 @@ def cudnn_fused_rmsnorm_silu(
 
     graph.execute(
         {
-            X: input.view(num_tokens, C, 1, 1),
-            scale: weight.view(1, C, 1, 1),
-            epsilon: epsilon_cpu,
-            Z: out_for_graph,
+            X_desc: input.view(num_tokens, C, 1, 1),
+            scale_desc: scale.view(1, C, 1, 1),
+            eps_desc: epsilon_cpu,
+            Z_desc: out_for_graph,
         },
         workspace,
     )
