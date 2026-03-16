@@ -151,7 +151,7 @@ def cudnn_fused_rmsnorm_silu(
     if cudnn_out_dtype is None:
         raise ValueError(f"Unsupported output dtype: {out_torch_dtype}")
 
-    is_nvfp4 = out_torch_dtype == torch.uint8
+    is_nvfp4 = cudnn_out_dtype == cudnn.data_type.FP4_E2M1
 
     graph, X_desc, scale_desc, eps_desc, Z_desc, workspace_size = (
         _build_rmsnorm_silu_graph(num_tokens, C, int(cudnn_out_dtype), device_index)
@@ -161,7 +161,7 @@ def cudnn_fused_rmsnorm_silu(
         if is_nvfp4:
             # NVFP4: 2 FP4 values per byte → half the elements
             out = torch.empty(
-                num_tokens * C // 2, dtype=torch.uint8, device=input.device
+                num_tokens * C // 2, dtype=out_torch_dtype, device=input.device
             )
         else:
             out = torch.empty_like(input)
