@@ -556,7 +556,7 @@ def fused_rmsnorm_silu(
     The output dtype is determined by the ``out`` tensor:
       - ``out.dtype == bfloat16``: standard bf16 output (default)
       - ``out.dtype == float8_e4m3fn``: FP8 quantized output (SM89+)
-      - ``out.dtype == uint8``: NVFP4 E2M1 packed output (SM100+)
+      - ``out.dtype == uint8`` or ``float4_e2m1fn_x2``: NVFP4 E2M1 packed output (SM100+)
 
     Parameters
     ----------
@@ -609,16 +609,21 @@ def fused_rmsnorm_silu(
     if out is None:
         out = torch.empty_like(input)
 
-    if out.dtype not in (torch.bfloat16, torch.float8_e4m3fn, torch.uint8):
+    _NVFP4_DTYPES = {torch.uint8}
+    if hasattr(torch, "float4_e2m1fn_x2"):
+        _NVFP4_DTYPES.add(torch.float4_e2m1fn_x2)
+
+    _SUPPORTED_OUT_DTYPES = {torch.bfloat16, torch.float8_e4m3fn} | _NVFP4_DTYPES
+    if out.dtype not in _SUPPORTED_OUT_DTYPES:
         raise RuntimeError(
             f"fused_rmsnorm_silu output dtype must be bfloat16, float8_e4m3fn, "
-            f"or uint8 (NVFP4), got {out.dtype}"
+            f"or uint8/float4_e2m1fn_x2 (NVFP4), got {out.dtype}"
         )
 
     if out.dtype == torch.float8_e4m3fn and sm < 89:
         raise RuntimeError(f"FP8 E4M3 output requires SM89+ (Ada/Hopper), got SM{sm}")
 
-    if out.dtype == torch.uint8 and sm < 100:
+    if out.dtype in _NVFP4_DTYPES and sm < 100:
         raise RuntimeError(f"NVFP4 E2M1 output requires SM100+ (Blackwell), got SM{sm}")
 
     # Warn once if the problem size or GPU is outside the tuned regime.
@@ -635,7 +640,7 @@ def fused_rmsnorm_silu(
             stacklevel=2,
         )
 
-    _cudnn_fused_rmsnorm_silu(input, weight, eps, out)
+    _cudnn_fused_rmsnorm_silu(input, weight, eps, out=out)
     return out
 
 

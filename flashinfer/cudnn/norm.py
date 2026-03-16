@@ -20,8 +20,14 @@ import cudnn
 _TORCH_TO_CUDNN_OUTPUT_DTYPE = {
     torch.bfloat16: cudnn.data_type.BFLOAT16,
     torch.float8_e4m3fn: cudnn.data_type.FP8_E4M3,
-    torch.uint8: cudnn.data_type.FP4_E2M1,  # packed FP4: 2 elements per byte
+    torch.uint8: cudnn.data_type.FP4_E2M1,  # packed NVFP4: 2 elements per byte
 }
+
+# torch.float4_e2m1fn_x2 is the native PyTorch packed FP4 dtype (same physical
+# layout as uint8, 2 FP4 values per byte).  Accept it as an alias when available.
+# See: https://github.com/pytorch/ao/blob/main/torchao/prototype/qat/nvfp4.py
+if hasattr(torch, "float4_e2m1fn_x2"):
+    _TORCH_TO_CUDNN_OUTPUT_DTYPE[torch.float4_e2m1fn_x2] = cudnn.data_type.FP4_E2M1
 
 
 @functools.lru_cache(maxsize=128)
