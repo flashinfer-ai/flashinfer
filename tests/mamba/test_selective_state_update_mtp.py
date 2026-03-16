@@ -210,8 +210,8 @@ class TestSelectiveStateUpdateMTP:
                 "Returned tensor should be the same object as the provided output tensor"
             )
 
-        self.assert_outputs_match(y_ref, y_test)
         self.assert_states_match(state_ref, inputs["state_cache"], inputs["slot_idx"])
+        self.assert_outputs_match(y_ref, y_test)
 
 
 class TestSelectiveStateUpdateMTPWithZ(TestSelectiveStateUpdateMTP):

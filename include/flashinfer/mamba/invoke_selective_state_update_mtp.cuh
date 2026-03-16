@@ -91,9 +91,10 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
               SharedStorageVertical<input_t, state_t, NTOKENS_MTP, DIM, DSTATE, NUM_IN_STAGES>;
           constexpr size_t smem_size = sizeof(sram_t);
 
+          constexpr bool kHorizontal = true;
           auto func = selective_state_update_kernel_vertical_mtp<
               input_t, weight_t, matrixA_t, state_t, stateIndex_t, NTOKENS_MTP, DIM, DSTATE,
-              HEADS_PER_GROUP, PHILOX_ROUNDS, NUM_IN_STAGES>;
+              HEADS_PER_GROUP, PHILOX_ROUNDS, NUM_IN_STAGES, kHorizontal>;
 
           int const total_heads = params.nheads;
           int const num_chunks = (total_heads + NUM_COMPUTE_GROUPS - 1) / NUM_COMPUTE_GROUPS;
