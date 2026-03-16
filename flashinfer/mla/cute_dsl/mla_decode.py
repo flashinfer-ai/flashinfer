@@ -30,7 +30,11 @@ from cutlass import Float32, Int32
 
 from .mla_decode_fp16 import BlackwellMultiHeadLatentAttentionForwardFP16
 from .mla_decode_fp8 import BlackwellMultiHeadLatentAttentionForwardFP8
-from .utils import get_max_active_clusters, get_num_sm, torch_to_cutlass_dtype
+from flashinfer.cute_dsl.utils import (
+    get_max_active_clusters,
+    get_num_sm,
+    torch_to_cutlass_dtype,
+)
 
 
 @functools.cache

@@ -54,7 +54,6 @@ if is_cute_dsl_available():
         add_rmsnorm_fp4quant,
         AddRMSNormFP4QuantKernel,
     )
-    from .mla_decode import cute_dsl_mla_decode
 
     # Backwards-compatible re-exports from flashinfer.norm.kernels submodule
     from ..norm.kernels import (
@@ -100,8 +99,6 @@ if is_cute_dsl_available():
         # Add + RMSNorm + FP4 Quantization
         "add_rmsnorm_fp4quant",
         "AddRMSNormFP4QuantKernel",
-        # MLA Decode
-        "cute_dsl_mla_decode",
         # Norm kernels (CuTe DSL) - backwards-compatible re-exports
         "RMSNormKernel",
         "QKRMSNormKernel",

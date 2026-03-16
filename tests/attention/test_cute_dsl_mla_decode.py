@@ -104,7 +104,7 @@ def test_cute_dsl_mla_decode_fp16(batch_size, seq_len_k, page_size, dtype, q_len
     """Test FP16/BF16 MLA decode kernel."""
     skip_if_unsupported()
 
-    from flashinfer.cute_dsl.mla_decode import cute_dsl_mla_decode
+    from flashinfer.mla.cute_dsl import cute_dsl_mla_decode
 
     torch.manual_seed(42)
     device = torch.device("cuda")
@@ -190,7 +190,7 @@ def test_cute_dsl_mla_decode_variable_seq_len(batch_size, seq_len_k, page_size=1
     """Test MLA decode with variable sequence lengths across the batch."""
     skip_if_unsupported()
 
-    from flashinfer.cute_dsl.mla_decode import cute_dsl_mla_decode
+    from flashinfer.mla.cute_dsl import cute_dsl_mla_decode
 
     torch.manual_seed(42)
     device = torch.device("cuda")
@@ -397,7 +397,7 @@ def test_cute_dsl_mla_decode_fp8(batch_size, seq_len_k, page_size):
     """Test FP8 MLA decode kernel against FP32 reference."""
     skip_if_unsupported()
 
-    from flashinfer.cute_dsl.mla_decode import cute_dsl_mla_decode
+    from flashinfer.mla.cute_dsl import cute_dsl_mla_decode
 
     torch.manual_seed(42)
     device = torch.device("cuda")

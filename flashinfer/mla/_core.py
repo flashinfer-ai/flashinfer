@@ -20,10 +20,10 @@ from typing import List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
-from .api_logging import flashinfer_api
-from .jit import gen_batch_mla_module, gen_trtllm_gen_fmha_module, setup_cubin_loader
-from .jit.mla import gen_mla_module
-from .utils import (
+from ..api_logging import flashinfer_api
+from ..jit import gen_batch_mla_module, gen_trtllm_gen_fmha_module, setup_cubin_loader
+from ..jit.mla import gen_mla_module
+from ..utils import (
     MaskMode,
     check_shape_dtype_device,
     determine_mla_backend,
@@ -32,7 +32,7 @@ from .utils import (
     get_device_sm_count,
     log2e,
 )
-from .xqa import xqa_mla
+from ..xqa import xqa_mla
 
 
 def _check_cutlass_shape(q_nope_pe, ckv_kpe_cache, kv_len, page_table):
@@ -779,7 +779,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
             raise RuntimeError(
                 f"cute-dsl backend (MLA decode kernel) requires SM100+, got SM{cc[0]}{cc[1]}"
             )
-        from .cute_dsl.mla_decode import cute_dsl_mla_decode
+        from .cute_dsl import cute_dsl_mla_decode
 
         if isinstance(bmm1_scale, torch.Tensor):
             raise ValueError(
