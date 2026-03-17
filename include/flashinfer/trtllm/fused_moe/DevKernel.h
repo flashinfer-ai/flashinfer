@@ -178,61 +178,76 @@ namespace moe::dev {
 
 #define LAUNCH_ROUTING_WITH_NUM_EXPERTS(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, \
                                         stream, extraFlag1, numExperts, numTopExperts)             \
-  if (data.mDtypeExpW == tg::Dtype::Fp32 && extraFlag1) {                                          \
+  if (data.mDtypeScore == tg::Dtype::Fp32 && data.mDtypeExpW == tg::Dtype::Fp32 && extraFlag1) {   \
+    LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(float, float, numExperts, numTopExperts, true),      \
+                 kernel, numBlocks, numThreads, smemSize, stream);                                 \
+  } else if (data.mDtypeScore == tg::Dtype::Fp32 && data.mDtypeExpW == tg::Dtype::Fp32 &&          \
+             !extraFlag1) {                                                                        \
+    LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(float, float, numExperts, numTopExperts, false),     \
+                 kernel, numBlocks, numThreads, smemSize, stream);                                 \
+  } else if (data.mDtypeScore == tg::Dtype::Fp32 && data.mDtypeExpW == tg::Dtype::Bfloat16 &&      \
+             extraFlag1) {                                                                         \
+    LAUNCH_TILEN(data, coopLaunch,                                                                 \
+                 LAUNCH_ESC(float, __nv_bfloat16, numExperts, numTopExperts, true), kernel,        \
+                 numBlocks, numThreads, smemSize, stream);                                         \
+  } else if (data.mDtypeScore == tg::Dtype::Fp32 && data.mDtypeExpW == tg::Dtype::Bfloat16 &&      \
+             !extraFlag1) {                                                                        \
+    LAUNCH_TILEN(data, coopLaunch,                                                                 \
+                 LAUNCH_ESC(float, __nv_bfloat16, numExperts, numTopExperts, false), kernel,       \
+                 numBlocks, numThreads, smemSize, stream);                                         \
+  } else if (data.mDtypeScore == tg::Dtype::Bfloat16 && data.mDtypeExpW == tg::Dtype::Fp32 &&      \
+             extraFlag1) {                                                                         \
+    LAUNCH_TILEN(data, coopLaunch,                                                                 \
+                 LAUNCH_ESC(__nv_bfloat16, float, numExperts, numTopExperts, true), kernel,        \
+                 numBlocks, numThreads, smemSize, stream);                                         \
+  } else if (data.mDtypeScore == tg::Dtype::Bfloat16 && data.mDtypeExpW == tg::Dtype::Fp32 &&      \
+             !extraFlag1) {                                                                        \
+    LAUNCH_TILEN(data, coopLaunch,                                                                 \
+                 LAUNCH_ESC(__nv_bfloat16, float, numExperts, numTopExperts, false), kernel,       \
+                 numBlocks, numThreads, smemSize, stream);                                         \
+  } else if (data.mDtypeScore == tg::Dtype::Bfloat16 && data.mDtypeExpW == tg::Dtype::Bfloat16 &&  \
+             extraFlag1) {                                                                         \
+    LAUNCH_TILEN(data, coopLaunch,                                                                 \
+                 LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16, numExperts, numTopExperts, true),        \
+                 kernel, numBlocks, numThreads, smemSize, stream);                                 \
+  } else if (data.mDtypeScore == tg::Dtype::Bfloat16 && data.mDtypeExpW == tg::Dtype::Bfloat16 &&  \
+             !extraFlag1) {                                                                        \
+    LAUNCH_TILEN(data, coopLaunch,                                                                 \
+                 LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16, numExperts, numTopExperts, false),       \
+                 kernel, numBlocks, numThreads, smemSize, stream);                                 \
+  } else {                                                                                         \
+    FLASHINFER_WARN("Unsupported combination of mDtypeScore and mDtypeExpW");                      \
+  }
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#define LAUNCH_ROUTING_WITH_NUM_EXPERTS_FORCE_FLOAT_INPUT(                                         \
+    data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, extraFlag, forceFloatInput, \
+    numExperts, numTopExperts)                                                                     \
+  if (data.mDtypeExpW == tg::Dtype::Fp32 && extraFlag) {                                           \
     LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(float, float, numExperts, numTopExperts, true),      \
                  kernel, numBlocks, numThreads, smemSize, stream);                                 \
   } else if (data.mDtypeExpW == tg::Dtype::Fp32) {                                                 \
     LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(float, float, numExperts, numTopExperts, false),     \
                  kernel, numBlocks, numThreads, smemSize, stream);                                 \
-  } else if (data.mDtypeExpW == tg::Dtype::Bfloat16 && extraFlag1) {                               \
+  } else if (data.mDtypeExpW == tg::Dtype::Bfloat16 && extraFlag && forceFloatInput) {             \
+    LAUNCH_TILEN(data, coopLaunch,                                                                 \
+                 LAUNCH_ESC(float, __nv_bfloat16, numExperts, numTopExperts, true), kernel,        \
+                 numBlocks, numThreads, smemSize, stream);                                         \
+  } else if (data.mDtypeExpW == tg::Dtype::Bfloat16 && extraFlag) {                                \
     LAUNCH_TILEN(data, coopLaunch,                                                                 \
                  LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16, numExperts, numTopExperts, true),        \
                  kernel, numBlocks, numThreads, smemSize, stream);                                 \
+  } else if (data.mDtypeExpW == tg::Dtype::Bfloat16 && forceFloatInput) {                          \
+    LAUNCH_TILEN(data, coopLaunch,                                                                 \
+                 LAUNCH_ESC(float, __nv_bfloat16, numExperts, numTopExperts, false), kernel,       \
+                 numBlocks, numThreads, smemSize, stream);                                         \
   } else if (data.mDtypeExpW == tg::Dtype::Bfloat16) {                                             \
     LAUNCH_TILEN(data, coopLaunch,                                                                 \
                  LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16, numExperts, numTopExperts, false),       \
                  kernel, numBlocks, numThreads, smemSize, stream);                                 \
   } else {                                                                                         \
     FLASHINFER_WARN("Unsupported dtypeExpW");                                                      \
-  }
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-#define LAUNCH_ROUTING_WITH_NUM_EXPERTS(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, \
-                                        stream, extraFlag, numExperts)                             \
-  if (data.mDtypeScore == tg::Dtype::Fp32 && data.mDtypeExpW == tg::Dtype::Fp32 && extraFlag) {    \
-    LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(float, float, numExperts, true), kernel, numBlocks,  \
-                 numThreads, smemSize, stream);                                                    \
-  } else if (data.mDtypeScore == tg::Dtype::Fp32 && data.mDtypeExpW == tg::Dtype::Fp32 &&          \
-             !extraFlag) {                                                                         \
-    LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(float, float, numExperts, false), kernel, numBlocks, \
-                 numThreads, smemSize, stream);                                                    \
-  } else if (data.mDtypeScore == tg::Dtype::Fp32 && data.mDtypeExpW == tg::Dtype::Bfloat16 &&      \
-             extraFlag) {                                                                          \
-    LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(float, __nv_bfloat16, numExperts, true), kernel,     \
-                 numBlocks, numThreads, smemSize, stream);                                         \
-  } else if (data.mDtypeScore == tg::Dtype::Fp32 && data.mDtypeExpW == tg::Dtype::Bfloat16 &&      \
-             !extraFlag) {                                                                         \
-    LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(float, __nv_bfloat16, numExperts, false), kernel,    \
-                 numBlocks, numThreads, smemSize, stream);                                         \
-  } else if (data.mDtypeScore == tg::Dtype::Bfloat16 && data.mDtypeExpW == tg::Dtype::Fp32 &&      \
-             extraFlag) {                                                                          \
-    LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(__nv_bfloat16, float, numExperts, true), kernel,     \
-                 numBlocks, numThreads, smemSize, stream);                                         \
-  } else if (data.mDtypeScore == tg::Dtype::Bfloat16 && data.mDtypeExpW == tg::Dtype::Fp32 &&      \
-             !extraFlag) {                                                                         \
-    LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(__nv_bfloat16, float, numExperts, false), kernel,    \
-                 numBlocks, numThreads, smemSize, stream);                                         \
-  } else if (data.mDtypeScore == tg::Dtype::Bfloat16 && data.mDtypeExpW == tg::Dtype::Bfloat16 &&  \
-             extraFlag) {                                                                          \
-    LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16, numExperts, true),     \
-                 kernel, numBlocks, numThreads, smemSize, stream);                                 \
-  } else if (data.mDtypeScore == tg::Dtype::Bfloat16 && data.mDtypeExpW == tg::Dtype::Bfloat16 &&  \
-             !extraFlag) {                                                                         \
-    LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16, numExperts, false),    \
-                 kernel, numBlocks, numThreads, smemSize, stream);                                 \
-  } else {                                                                                         \
-    FLASHINFER_WARN("Unsupported combination of mDtypeScore and mDtypeExpW");                      \
   }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
