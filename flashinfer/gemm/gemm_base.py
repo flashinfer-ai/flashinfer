@@ -125,11 +125,8 @@ def get_gemm_module():
                 do_preparation: bool = False,
                 **kwargs,
             ) -> torch.Tensor:
-                cublas_handle = torch.cuda.current_blas_handle()
                 a, b, scale_a, scale_b, out, workspace_buffer = inputs
-                module.bmm_fp8(
-                    a, b, out, scale_a, scale_b, workspace_buffer, cublas_handle
-                )
+                module.bmm_fp8(a, b, out, scale_a, scale_b, workspace_buffer)
                 return out
 
         return CublasFp8GemmRunner()
