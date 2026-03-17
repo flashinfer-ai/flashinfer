@@ -8,8 +8,8 @@ RUN apt-get update && apt-get install -y \
     git \
     wget
 
-# ---- prod target ----
-FROM base AS prod
+# ---- test target ----
+FROM base AS test
 
 # Install python
 COPY docker/install/install_python.sh /install/install_python.sh

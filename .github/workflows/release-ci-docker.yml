@@ -79,7 +79,7 @@ jobs:
         with:
           context: .
           file: docker/Dockerfile
-          target: prod
+          target: test
           build-args: |
             CUDA_BASE_IMAGE=${{ matrix.base_image }}
             CUDA_VERSION=${{ matrix.cuda }}
