@@ -1670,9 +1670,10 @@ Array<Tensor> trtllm_bf16_moe(Optional<TensorView> const& routing_logits,
   int64_t tile_N = moe_tactic[0];
   int64_t config = moe_tactic[1];
 
-  // Handle default case
-  if (tile_N == -1 || config == -1) {
+  // Handle default case or stale autotuner cache (tile_N not in current selected set)
+  if (tile_N == -1 || config == -1 || launchers_map.find(tile_N) == launchers_map.end()) {
     tile_N = *selected_tile_nums.begin();
+    config = -1;  // Let the runner choose default
   }
 
   // Get the launcher for the selected tile_N
@@ -1762,9 +1763,10 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
   int64_t tile_N = config_index[0];
   int64_t config = config_index[1];
 
-  // Handle default case
-  if (tile_N == -1 || config == -1) {
+  // Handle default case or stale autotuner cache (tile_N not in current selected set)
+  if (tile_N == -1 || config == -1 || launchers_map.find(tile_N) == launchers_map.end()) {
     tile_N = *selected_tile_nums.begin();
+    config = -1;  // Let the runner choose default
   }
 
   // Get the launcher for the selected tile_N
@@ -1883,9 +1885,10 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
   int64_t tile_N = config_index[0];
   int64_t config = config_index[1];
 
-  // Handle default case
-  if (tile_N == -1 || config == -1) {
+  // Handle default case or stale autotuner cache (tile_N not in current selected set)
+  if (tile_N == -1 || config == -1 || launchers_map.find(tile_N) == launchers_map.end()) {
     tile_N = *selected_tile_nums.begin();
+    config = -1;  // Let the runner choose default
   }
 
   // Get the launcher for the selected tile_N
@@ -2027,8 +2030,8 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
   int64_t tile_N = config_index[0];
   int64_t config = config_index[1];
 
-  // Handle default case
-  if (tile_N == -1 || config == -1) {
+  // Handle default case or stale autotuner cache (tile_N not in current selected set)
+  if (tile_N == -1 || config == -1 || launchers_map.find(tile_N) == launchers_map.end()) {
     tile_N = *selected_tile_nums.begin();
     config = -1;  // Let the runner choose default
   }
@@ -2116,8 +2119,8 @@ Array<Tensor> trtllm_mxint4_block_scale_moe(
   int64_t tile_N = config_index[0];
   int64_t config = config_index[1];
 
-  // Handle default case
-  if (tile_N == -1 || config == -1) {
+  // Handle default case or stale autotuner cache (tile_N not in current selected set)
+  if (tile_N == -1 || config == -1 || launchers_map.find(tile_N) == launchers_map.end()) {
     tile_N = *selected_tile_nums.begin();
     config = -1;  // Let the runner choose default
   }
