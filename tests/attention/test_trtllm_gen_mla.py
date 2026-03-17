@@ -728,6 +728,8 @@ def test_trtllm_batch_decode_mla(
 ):
     if backend == "xqa" and layer_dimensions.head_dimensions == smaller_mla_dimensions:
         pytest.skip("XQA MLA does not support smaller MLA dimensions yet.")
+    if backend == "xqa" and layer_dimensions.num_heads != 128:
+        pytest.skip("XQA MLA only supports 128 query heads (head_group_ratio=128)")
 
     trtllm_batch_decode_mla(
         layer_dimensions,

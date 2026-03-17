@@ -516,9 +516,15 @@ def xqa_mla(
     # Infer parameters from tensors
     batch_size = q.shape[0]
     head_dim = q.shape[-1]
+    num_q_heads = q.shape[-2]
 
-    # Calculate head_group_ratio
-    head_group_ratio = 128
+    # Calculate head_group_ratio (MLA has 1 KV head, so ratio = num_q_heads)
+    head_group_ratio = num_q_heads
+    if head_group_ratio != 128:
+        raise ValueError(
+            f"XQA MLA only supports 128 query heads (head_group_ratio=128), "
+            f"got {num_q_heads} query heads"
+        )
 
     # Calculate max_seq_len from page_table and page_size
     num_pages_per_seq = page_table.shape[-1]
