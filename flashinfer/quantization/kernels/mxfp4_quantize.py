@@ -31,6 +31,7 @@ from cutlass import Int32, Uint8
 
 from ...api_logging import flashinfer_api
 from ...cute_dsl.fp4_common import get_ptr_as_int64, st_global_u64
+from ...cute_dsl.utils import get_num_sm
 from ..quantization_cute_dsl_utils import (
     # MXFP4 Constants
     MXFP4_SF_VEC_SIZE,
@@ -53,22 +54,6 @@ _MAX_THREADS_PER_BLOCK = 1024
 _MIN_THREADS = 128  # Minimum for reasonable occupancy
 _MAX_THREADS = 512  # Maximum to avoid register pressure
 _DEFAULT_THREADS = 256  # Default thread count
-
-
-def _get_target_grid(device: torch.device = None) -> int:
-    """
-    Compute target grid size based on device SM count.
-
-    Args:
-        device: CUDA device. If None, uses current device.
-
-    Returns:
-        Target number of blocks for good occupancy (SM_count * _BLOCKS_PER_SM)
-    """
-    if device is None:
-        device = torch.cuda.current_device()
-    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
-    return sm_count * _BLOCKS_PER_SM
 
 
 def _compute_optimal_threads_for_k(K: int) -> int:
@@ -157,15 +142,11 @@ class MXFP4QuantizeSwizzledKernel:
         dtype: cutlass.Numeric,
         K: int,
         enable_pdl: bool = False,
-        target_grid: int = None,
     ):
         self.dtype = dtype
         self.K = K
         self.is_bfloat16 = dtype == cutlass.BFloat16
         self.enable_pdl = enable_pdl
-        self.target_grid = (
-            target_grid if target_grid is not None else _get_target_grid()
-        )
 
         assert K % MXFP4_SF_VEC_SIZE == 0
         self.num_sf_blocks_per_row = K // MXFP4_SF_VEC_SIZE
@@ -196,15 +177,10 @@ class MXFP4QuantizeSwizzledKernel:
         mScales: cute.Tensor,
         M: Int32,
         padded_M: Int32,
+        num_blocks: Int32,
         stream,
     ):
         threads_per_block = self.num_threads
-        rows_per_block = self.rows_per_block
-
-        # Compute grid size at runtime
-        # Grid covers row batches, not individual rows
-        total_row_batches = cute.ceil_div(padded_M, rows_per_block)
-        num_blocks = cutlass.min(total_row_batches, self.target_grid)
 
         self.kernel(mInput, mOutput, mScales, M, padded_M).launch(
             grid=[num_blocks, 1, 1],
@@ -246,6 +222,9 @@ class MXFP4QuantizeSwizzledKernel:
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         grid_dim_x, _, _ = cute.arch.grid_dim()
+
+        if cutlass.const_expr(self.enable_pdl):
+            cute.arch.griddepcontrol_wait()
 
         num_sf_blocks_per_row = self.num_sf_blocks_per_row
         padded_sf_cols = self.padded_sf_cols
@@ -416,31 +395,29 @@ def _get_compiled_kernel_mxfp4(
     is_bfloat16: bool,
     K: int,
     enable_pdl: bool = False,
-    target_grid: int = None,
-) -> Callable:
+) -> Tuple[Callable, int]:
     """
     Get or compile MXFP4 kernel with TVM-FFI.
 
-    Cached by (K, dtype, pdl, target_grid) - M-agnostic compilation.
+    Cached by (K, dtype, pdl) - M-agnostic, device-independent compilation.
+
+    Returns:
+        Tuple of (compiled_kernel, rows_per_block) where rows_per_block
+        is used by the caller to compute num_blocks at runtime.
     """
     cutlass_dtype = cutlass.BFloat16 if is_bfloat16 else cutlass.Float16
-    kernel_obj = MXFP4QuantizeSwizzledKernel(
-        cutlass_dtype, K, enable_pdl, target_grid=target_grid
-    )
+    kernel_obj = MXFP4QuantizeSwizzledKernel(cutlass_dtype, K, enable_pdl)
 
     # Use symbolic M for dynamic batch sizes
     sym_m = cute.sym_int()
 
     # Create fake tensors for compilation
-    # Input: [M, K] in fp16/bf16
     input_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype, (sym_m, K), stride_order=(1, 0), assumed_align=16
     )
-    # Output: [M, K/2] in uint8 (2 FP4 values per byte)
     output_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Uint8, (sym_m, K // 2), stride_order=(1, 0), assumed_align=16
     )
-    # Scales: 1D swizzled buffer
     sym_scale_size = cute.sym_int()
     scales_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Uint8, (sym_scale_size,), assumed_align=16
@@ -452,13 +429,14 @@ def _get_compiled_kernel_mxfp4(
         input_fake,
         output_fake,
         scales_fake,
-        Int32(1),  # Dummy M - actual value passed at runtime
-        Int32(128),  # Dummy padded_M - actual value passed at runtime
+        Int32(1),  # Dummy M
+        Int32(128),  # Dummy padded_M
+        Int32(1),  # Dummy num_blocks
         stream_fake,
         options="--enable-tvm-ffi",
     )
 
-    return compiled_kernel
+    return compiled_kernel, kernel_obj.rows_per_block
 
 
 @flashinfer_api
@@ -513,8 +491,8 @@ def mxfp4_quantize_cute_dsl(
     input = input.contiguous()
     is_bfloat16 = input.dtype == torch.bfloat16
 
-    # Compute device-specific target grid for kernel compilation
-    target_grid = _get_target_grid(input.device)
+    # Cached device-specific target grid for grid size computation
+    target_grid = get_num_sm(input.device) * _BLOCKS_PER_SM
 
     # Compute M-dependent values
     num_sf_blocks_per_row = k // MXFP4_SF_VEC_SIZE
@@ -522,18 +500,20 @@ def mxfp4_quantize_cute_dsl(
     padded_sf_cols = ((num_sf_blocks_per_row + 3) // 4) * 4
     scale_output_size = padded_m * padded_sf_cols
 
-    # Get or compile kernel
-    kernel_fn = _get_compiled_kernel_mxfp4(is_bfloat16, k, enable_pdl, target_grid)
+    # Get or compile kernel (device-independent)
+    kernel_fn, rows_per_block = _get_compiled_kernel_mxfp4(is_bfloat16, k, enable_pdl)
+
+    # Compute grid size in Python (runtime, device-specific)
+    num_blocks = min((padded_m + rows_per_block - 1) // rows_per_block, target_grid)
 
     # Allocate outputs
-    # Output: [M, K/2] uint8 (2 FP4 values per byte)
     fp4_output = torch.empty(m, k // 2, dtype=torch.uint8, device=input.device)
     scale_output = torch.empty(
         scale_output_size, dtype=torch.uint8, device=input.device
     )
 
     # Launch kernel
-    kernel_fn(input, fp4_output, scale_output, m, padded_m)
+    kernel_fn(input, fp4_output, scale_output, m, padded_m, num_blocks)
 
     # Reshape scale output to match CUDA backend format: [padded_total, num_sf_per_row]
     scale_output = scale_output.reshape(-1, num_sf_blocks_per_row)
