@@ -39,6 +39,7 @@ import cutlass.cute as cute
 import cutlass.cute.testing as testing
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 
+# TODO: Remove this hook helper function after nvidia-cutlass-dsl 4.3.x is no longer supported.
 # Compat shim: setmaxregister_{decrease,increase} added in cutlass-dsl 4.4;
 # older versions only have the deprecated warpgroup_reg_{dealloc,alloc}.
 _setmaxregister_decrease = getattr(
@@ -51,6 +52,21 @@ _setmaxregister_increase = getattr(
     "setmaxregister_increase",
     getattr(cute.arch, "warpgroup_reg_alloc", None),
 )
+
+# Compat shim: get_max_tmem_alloc_cols added in cutlass-dsl 4.4;
+# older versions don't have it, so we provide a fallback implementation.
+_TMEM_MAX_ALLOC_COLUMNS_MAP = {"sm_100": 512, "sm_103": 512, "sm_120": 512}
+
+
+# TODO: Remove this hook helper function after nvidia-cutlass-dsl 4.3.x is no longer supported.
+def _get_max_tmem_alloc_cols(compute_capability: str) -> int:
+    if hasattr(cute.arch, "get_max_tmem_alloc_cols"):
+        return cute.arch.get_max_tmem_alloc_cols(compute_capability)
+    if compute_capability not in _TMEM_MAX_ALLOC_COLUMNS_MAP:
+        raise ValueError(f"Unsupported compute capability: {compute_capability}")
+    return _TMEM_MAX_ALLOC_COLUMNS_MAP[compute_capability]
+
+
 from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
 import cutlass.cute.nvgpu.cpasync as cpasync
 import cutlass.utils as utils
@@ -1092,7 +1108,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         if warp_idx == self.mma_warp_id:
             _setmaxregister_decrease(self.other_reg_num)
             # Alloc tensor memory buffer
-            tmem.allocate(cute.arch.get_max_tmem_alloc_cols("sm_100"))
+            tmem.allocate(_get_max_tmem_alloc_cols("sm_100"))
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
 

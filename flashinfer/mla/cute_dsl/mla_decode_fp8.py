@@ -51,6 +51,20 @@ _setmaxregister_increase = getattr(
     "setmaxregister_increase",
     getattr(cute.arch, "warpgroup_reg_alloc", None),
 )
+
+# Compat shim: get_max_tmem_alloc_cols added in cutlass-dsl 4.4;
+# older versions don't have it, so we provide a fallback implementation.
+_TMEM_MAX_ALLOC_COLUMNS_MAP = {"sm_100": 512, "sm_103": 512, "sm_120": 512}
+
+
+def _get_max_tmem_alloc_cols(compute_capability: str) -> int:
+    if hasattr(cute.arch, "get_max_tmem_alloc_cols"):
+        return cute.arch.get_max_tmem_alloc_cols(compute_capability)
+    if compute_capability not in _TMEM_MAX_ALLOC_COLUMNS_MAP:
+        raise ValueError(f"Unsupported compute capability: {compute_capability}")
+    return _TMEM_MAX_ALLOC_COLUMNS_MAP[compute_capability]
+
+
 import cutlass.cute.nvgpu.cpasync as cpasync
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
@@ -1151,7 +1165,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         if warp_idx == self.mma_warp_id:
             _setmaxregister_decrease(self.other_reg_num)
             # Alloc tensor memory buffer
-            tmem.allocate(cute.arch.get_max_tmem_alloc_cols("sm_100"))
+            tmem.allocate(_get_max_tmem_alloc_cols("sm_100"))
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
 
