@@ -401,13 +401,14 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
                  int32_t* permutedIdxToTokenIdx, int32_t* ptrNumNonExitingCtas,
                  int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx,
                  int32_t* ptrCtaIdxXyToMnLimit, void* bmm1Workspace, bool useRoutingScalesOnInput,
-                 int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl) {
+                 int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl,
+                 float* perChannelWeightScale) {
   auto maxNumCtasInBatchDim =
       Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
   int32_t intermediateSizeFactor = (isGatedActivation(mActType) ? 2 : 1);
   mRunner.run(numTokens, intermediateSizeFactor * intermediateSize, hiddenSize, {}, numTokens,
               numExperts, maxNumCtasInBatchDim, hiddenState, hiddenStateScale, weights,
-              weightsScale, expertWeights, /* perTokensSfB */ nullptr, outputScalesScalar,
+              weightsScale, expertWeights, perChannelWeightScale, outputScalesScalar,
               outputScalesGateScalar, ptrBias, ptrAlpha, ptrBeta, ptrClampLimit, output,
               outputScale, permutedIdxToTokenIdx, ptrTotalNumPaddedTokens, ptrCtaIdxXyToBatchIdx,
               ptrCtaIdxXyToMnLimit, ptrNumNonExitingCtas, bmm1Workspace, stream, device,
@@ -494,14 +495,16 @@ void Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, void
                  int32_t numExperts, int32_t numTokens, int32_t* ptrNumNonExitingCtas,
                  int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx,
                  int32_t* ptrCtaIdxXyToMnLimit, void* bmm2Workspace, int device,
-                 cudaStream_t stream, int32_t configIndex, bool enable_pdl) {
+                 cudaStream_t stream, int32_t configIndex, bool enable_pdl,
+                 float* perChannelWeightScale) {
   auto maxNumCtasInBatchDim =
       Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
   mRunner.run(
       numTokens, hiddenSize, intermediateSize, {}, numTokens, numExperts, maxNumCtasInBatchDim,
       permutedHiddenState, permutedHiddenStateScale, weights, weightsScale,
       /* perTokensSfA */ nullptr,
-      /* perTokensSfB */ nullptr, outputScalesScalar, /* outputScalesGateScalar */ nullptr, ptrBias,
+      /* perTokensSfB */ perChannelWeightScale, outputScalesScalar,
+      /* outputScalesGateScalar */ nullptr, ptrBias,
       /* ptrAlpha */ nullptr, /* ptrBeta */ nullptr, /* clampLimit */ nullptr, output, outputScale,
       /* permutedIdxToTokenIdx */ nullptr, ptrTotalNumPaddedTokens, ptrCtaIdxXyToBatchIdx,
       ptrCtaIdxXyToMnLimit, ptrNumNonExitingCtas, bmm2Workspace, stream, device, configIndex,
@@ -697,16 +700,16 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
 
   auto const& config = mPassingConfigs[configIndex];
 
-  mPermuteGemm1.run(args.hidden_states, hidden_states_scale_linear, args.gemm1_weights,
-                    args.gemm1_weights_scale, workspace.token_scales, args.output1_scales_scalar,
-                    args.output1_scales_gate_scalar, args.gemm1_bias, args.gemm1_alpha,
-                    args.gemm1_beta, args.gemm1_clamp_limit, workspace.gemm1_output,
-                    workspace.gemm1_output_scale, args.top_k, args.hidden_size,
-                    args.intermediate_size, args.local_num_experts, args.num_tokens,
-                    workspace.permuted_idx_to_token_idx, workspace.num_non_exiting_ctas,
-                    workspace.total_num_padded_tokens, workspace.cta_idx_xy_to_batch_idx,
-                    workspace.cta_idx_xy_to_mn_limit, workspace.bmm1_workspace,
-                    args.mUseRoutingScalesOnInput, device, stream, config.gemm1Config, enable_pdl);
+  mPermuteGemm1.run(
+      args.hidden_states, hidden_states_scale_linear, args.gemm1_weights, args.gemm1_weights_scale,
+      workspace.token_scales, args.output1_scales_scalar, args.output1_scales_gate_scalar,
+      args.gemm1_bias, args.gemm1_alpha, args.gemm1_beta, args.gemm1_clamp_limit,
+      workspace.gemm1_output, workspace.gemm1_output_scale, args.top_k, args.hidden_size,
+      args.intermediate_size, args.local_num_experts, args.num_tokens,
+      workspace.permuted_idx_to_token_idx, workspace.num_non_exiting_ctas,
+      workspace.total_num_padded_tokens, workspace.cta_idx_xy_to_batch_idx,
+      workspace.cta_idx_xy_to_mn_limit, workspace.bmm1_workspace, args.mUseRoutingScalesOnInput,
+      device, stream, config.gemm1Config, enable_pdl, args.gemm1_per_channel_weight_scale);
 
   // We do not fuse activation with FC1 for DeepSeek FP8 due to the weights shuffling constraint.
   void* gemm2_input = workspace.gemm1_output;
@@ -726,7 +729,7 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
              args.local_num_experts, args.num_tokens, workspace.num_non_exiting_ctas,
              workspace.total_num_padded_tokens, workspace.cta_idx_xy_to_batch_idx,
              workspace.cta_idx_xy_to_mn_limit, workspace.bmm2_workspace, device, stream,
-             config.gemm2Config, enable_pdl);
+             config.gemm2Config, enable_pdl, args.gemm2_per_channel_weight_scale);
 
   // Run finalize
   if (args.do_finalize) {
