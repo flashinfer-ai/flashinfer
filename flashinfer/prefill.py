@@ -1855,7 +1855,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 )
             else:
                 kv_lens_arr_host = seq_lens.cpu().flatten()
-            self._kv_lens_buffer[: len(kv_lens_arr_host)].copy_(
+            required_size = len(kv_lens_arr_host)
+            if required_size > self._kv_lens_buffer.shape[0]:
+                self._kv_lens_buffer = torch.empty(
+                    (required_size,), dtype=torch.int32, device=self.device
+                )
+            self._kv_lens_buffer[:required_size].copy_(
                 kv_lens_arr_host, non_blocking=non_blocking
             )
             self._max_kv_len = max(kv_lens_arr_host).item()
