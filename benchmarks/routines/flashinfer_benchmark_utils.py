@@ -322,12 +322,13 @@ routine_cc_to_supported_backends = {
     },
     "BatchMLAPagedAttentionWrapper": {
         # NOTE: trtllm-native calls trtllm_batch_decode_with_kv_cache_mla
+        # NOTE: cute-dsl calls trtllm_batch_decode_with_kv_cache_mla(backend="cute-dsl")
         "7.5": [],
         "8.0": ["fa2"],
         "8.6": ["fa2"],
         "8.9": ["fa2"],
         "9.0": ["fa2", "fa3"],
-        "10.0": ["fa2", "cutlass", "trtllm-native"],
+        "10.0": ["fa2", "cutlass", "trtllm-native", "cute-dsl"],
         "10.3": ["fa2", "cutlass", "trtllm-native"],
         "12.0": ["fa2"],
     },

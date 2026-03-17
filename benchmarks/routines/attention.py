@@ -110,6 +110,7 @@ def parse_attention_args(line, parser):
             "trtllm-gen",
             "trtllm-native",
             "trtllm-gen-native",  # Deprecated, will be removed in future
+            "cute-dsl",
         ],
         help="Kernel backends to test. Default: fa2. backend=auto is only supported for BatchDecodeWithPagedKVCacheWrapper and BatchPrefillWithPagedKVCacheWrapper.",
     )
@@ -2122,6 +2123,13 @@ def testBatchMLAPagedAttentionWrapper(args):
             remove_trtllm_native = True
         if remove_trtllm_native:
             backends.remove("trtllm-native")
+    if "cute-dsl" in backends:
+        remove_cute_dsl = False
+        if num_qo_heads < 128:
+            print("[INFO] cute-dsl MLA backend requires num_heads >= 128. Skipping.")
+            remove_cute_dsl = True
+        if remove_cute_dsl:
+            backends.remove("cute-dsl")
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
         return res
@@ -2306,6 +2314,21 @@ def testBatchMLAPagedAttentionWrapper(args):
                 max_seq_len=s_kv,
                 bmm1_scale=sm_scale,
                 bmm2_scale=1.0,
+            ).squeeze(1)
+        elif backend == "cute-dsl":
+            return flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(
+                query=q.unsqueeze(1),
+                kv_cache=kv_cache.unsqueeze(1),
+                workspace_buffer=workspace_buffer,
+                qk_nope_head_dim=128,
+                kv_lora_rank=head_dim_ckv,
+                qk_rope_head_dim=head_dim_kpe,
+                block_tables=block_tables,
+                seq_lens=actual_seq_lens_kv.flatten(),
+                max_seq_len=s_kv,
+                bmm1_scale=sm_scale,
+                bmm2_scale=1.0,
+                backend="cute-dsl",
             ).squeeze(1)
         else:
             print(f"[ERROR] Unsupported backend: {backend}")
