@@ -1157,7 +1157,20 @@ def get_trtllm_moe_sm100_module():
                         )
                     elif self.fp8_quantization_type == Fp8QuantizationType.MxFp8:
                         current_hidden_states_scale = extra_inputs[0]
-
+                        # During autotuner profiling, DynamicTensorSpec
+                        # creates an undersized 1D scale tensor (it
+                        # replaces dim 0 with the bucket value, but the
+                        # MXFP8 scale is 1D with size num_tokens *
+                        # hidden_size // 32). Recreate with correct size
+                        # to avoid OOB reads in the MoE GEMM kernel.
+                        padded_k = (current_hidden_size + 31) // 32 * 32
+                        sf_size = current_num_tokens * padded_k // 32
+                        if current_hidden_states_scale.numel() < sf_size:
+                            current_hidden_states_scale = torch.ones(
+                                (sf_size,),
+                                dtype=torch.uint8,
+                                device=hidden_states.device,
+                            )
                     else:
                         raise ValueError(
                             f"Unsupported FP8 quantization type: {self.fp8_quantization_type}"
@@ -1734,7 +1747,7 @@ def get_trtllm_moe_sm100_module():
         _, tactic = tuner.choose_one(
             "flashinfer::trtllm_fp8_block_scale_moe",
             [moe_runner],
-            MoERunner.tuning_config_with_hidden_states_scales,  # FP8 block-scale uses hidden_states_scale
+            MoERunner.tuning_config_with_hidden_states_scales,
             inputs,
             routing_bias=routing_bias,
             gemm1_weights=gemm1_weights,
