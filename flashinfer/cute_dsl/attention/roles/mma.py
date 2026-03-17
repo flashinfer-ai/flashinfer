@@ -133,6 +133,7 @@ class MmaRole:
         tOrP0: cute.Tensor,
         tOrP1: cute.Tensor,
         tOrV: cute.Tensor,
+        seqlen_q_global: Int32,
         seqlen_k_global: Int32,
         cum_seqlen_q: cute.Tensor | None,
         cum_seqlen_k: cute.Tensor | None,
@@ -159,15 +160,16 @@ class MmaRole:
         while work_tile.is_valid_tile:
             curr_block_coord = work_tile.tile_idx
             batch_coord = curr_block_coord[2][1]
+            seqlen_q_ = seqlen_q_global
             continue_cond = False
             if cutlass.const_expr(cum_seqlen_q is not None):
                 cuseqlen_q = cum_seqlen_q[batch_coord]
-                seqlen_q = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
+                seqlen_q_ = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
                 continue_cond = (
                     not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
                         self.cta_tiler[0],
                         curr_block_coord[0],
-                        seqlen_q,
+                        seqlen_q_,
                     )
                 )
 
@@ -203,7 +205,7 @@ class MmaRole:
                 o0_handle_producer.commit()
 
                 seqlen_kv_loop_steps = (
-                    get_trip_count(self.mask_type, self.window_left, curr_block_coord, self.cta_tiler, seqlen_k)
+                    get_trip_count(self.mask_type, self.window_left, curr_block_coord, self.cta_tiler, seqlen_k, seqlen_q_)
                     - 1
                 )
 
@@ -243,7 +245,7 @@ class MmaRole:
                 # GEMM_PV1(end)
                 o1_handle = mma_corr_producer.acquire_and_advance()
                 s1_handle_producer = mma_s1_producer.acquire_and_advance()
-                self.gemm_pv(pv_tiled_mma, tOtO1, tOrP1, tOrVi, True)
+                self.gemm_pv(pv_tiled_mma, tOtO1, tOrP1, tOrVi, pv_whether_acc)
                 o1_handle.commit()
                 v_handle_consumer.release()
 

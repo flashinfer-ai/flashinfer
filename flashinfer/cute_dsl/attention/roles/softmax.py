@@ -123,7 +123,7 @@ class SoftmaxRole:
         kv_head_idx = qo_head_idx // self.num_repeat_kv_heads
         kv_tile_idx = cS[0][1] // self.qk_mma_tiler[1]
 
-        seqlen_k, scale_softmax_log2 = value_args
+        seqlen_q, seqlen_k, scale_softmax_log2 = value_args
         (
             mma_si_consumer,
             si_corr_producer,
@@ -174,7 +174,7 @@ class SoftmaxRole:
         tTMEM_LOADrS = cute.make_fragment(tTMEM_LOADcS.shape, self.qk_acc_dtype)
         cute.copy(tiled_tmem_load, tTMEM_LOADtS, tTMEM_LOADrS)
         if need_apply_mask:
-            apply_mask(self.mask_type, self.window_left, tTMEM_LOADrS, tTMEM_LOADcS, seqlen_k)
+            apply_mask(self.mask_type, self.window_left, tTMEM_LOADrS, tTMEM_LOADcS, seqlen_k, seqlen_k - seqlen_q)
 
         old_row_max = row_max
         row_max = tTMEM_LOADrS.load().reduce(cute.ReductionOp.MAX, row_max, 0)
@@ -298,6 +298,7 @@ class SoftmaxRole:
     def run(
         self,
         stage: int,
+        seqlen_q: Int32,
         seqlen_k: Int32,
         cum_seqlen_q: cute.Tensor | None,
         cum_seqlen_k: cute.Tensor | None,
@@ -382,17 +383,18 @@ class SoftmaxRole:
         while work_tile.is_valid_tile:
             curr_block_coord = work_tile.tile_idx
             batch_coord = curr_block_coord[2][1]
+            seqlen_q_ = seqlen_q
             seqlen_k_ = seqlen_k
             continue_cond = False
 
             if cutlass.const_expr(cum_seqlen_q is not None):
                 cuseqlen_q = cum_seqlen_q[batch_coord]
-                seqlen_q = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
+                seqlen_q_ = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
                 continue_cond = (
                     not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
                         self.cta_tiler[0],
                         curr_block_coord[0],
-                        seqlen_q,
+                        seqlen_q_,
                     )
                 )
 
@@ -402,7 +404,7 @@ class SoftmaxRole:
                     seqlen_k_ = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
                 row_max = -Float32.inf
                 row_sum = 0.0
-                value_args = (seqlen_k_, scale_softmax_log2)
+                value_args = (seqlen_q_, seqlen_k_, scale_softmax_log2)
                 atom_args = (
                     qk_thr_mma,
                     tiled_tmem_load,
@@ -430,6 +432,7 @@ class SoftmaxRole:
                     curr_block_coord,
                     self.cta_tiler,
                     seqlen_k_,
+                    seqlen_q_,
                 )
                 batch_coord = curr_block_coord[2][1]
                 head_coord = curr_block_coord[2][0]
@@ -473,6 +476,7 @@ class SoftmaxRole:
                     curr_block_coord,
                     self.cta_tiler,
                     seqlen_k_,
+                    seqlen_q_,
                 )
 
                 for i in cutlass.range(

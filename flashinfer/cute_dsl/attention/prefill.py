@@ -490,7 +490,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                 qk_tiled_mma, pv_tiled_mma,
                 tStS0, tStS1, tOtO0, tOtO1,
                 tSrQ, tSrK, tOrP0, tOrP1, tOrV,
-                mK_kdl.shape[0],
+                mQ_qdl.shape[0], mK_kdl.shape[0],
                 cum_seqlen_q, cum_seqlen_k,
                 load_q_consumer, load_kv_consumer,
                 mma_s0_producer, mma_s1_producer,
@@ -519,6 +519,7 @@ class BlackwellFusedMultiHeadAttentionForward:
 
             self.softmax_role.run(
                 stage=0,
+                seqlen_q=mQ_qdl.shape[0],
                 seqlen_k=mK_kdl.shape[0],
                 cum_seqlen_q=cum_seqlen_q,
                 cum_seqlen_k=cum_seqlen_k,
@@ -547,6 +548,7 @@ class BlackwellFusedMultiHeadAttentionForward:
 
             self.softmax_role.run(
                 stage=1,
+                seqlen_q=mQ_qdl.shape[0],
                 seqlen_k=mK_kdl.shape[0],
                 cum_seqlen_q=cum_seqlen_q,
                 cum_seqlen_k=cum_seqlen_k,
@@ -571,7 +573,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             self.correction_role.run(
                 qk_thr_mma, pv_thr_mma,
                 tStS, tOtO0, tOtO1, sO,
-                mK_kdl.shape[0],
+                mQ_qdl.shape[0], mK_kdl.shape[0],
                 cum_seqlen_q, cum_seqlen_k,
                 scale_softmax_log2, scale_output,
                 s0_corr_consumer, s1_corr_consumer,

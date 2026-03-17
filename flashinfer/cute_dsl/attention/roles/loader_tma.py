@@ -261,7 +261,7 @@ class LoaderRole:
                 # K0
                 kv_coord = get_kv_start_block_idx(
                     self.mask_type, self.window_left,
-                    curr_block_coord, self.cta_tiler, seqlen_k
+                    curr_block_coord, self.cta_tiler, seqlen_k, seqlen_q
                 )
                 k_handle_producer = load_kv_producer.acquire_and_advance()
                 cute.copy(
@@ -290,7 +290,7 @@ class LoaderRole:
                 kv_coord += 1
 
                 seqlen_kv_loop_steps = (
-                    get_trip_count(self.mask_type, self.window_left, curr_block_coord, self.cta_tiler, seqlen_k)
+                    get_trip_count(self.mask_type, self.window_left, curr_block_coord, self.cta_tiler, seqlen_k, seqlen_q)
                     - 1
                 )
                 for _i in cutlass.range(0, seqlen_kv_loop_steps, 1, unroll=1):
