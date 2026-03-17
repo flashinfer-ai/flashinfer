@@ -48,8 +48,10 @@ enum class RoutingMethodType : int64_t {
   RenormalizeNaive = 4,
   // TopK only (no softmax)
   TopK = 5,
+  // SigmoidRenorm: Sigmoid -> TopK -> Renormalize (divide by sum of top-K weights)
+  SigmoidRenorm = 6,
   // Unspecified
-  Unspecified = 6,
+  Unspecified = 7,
 };
 
 inline int32_t maybeGetMinTokenCount(int32_t numPaddedTokens, int32_t hiddenSize,
@@ -73,6 +75,8 @@ inline std::string serializeMoeRoutingMethodType(RoutingMethodType routingMethod
       return "RenormalizeNaive";
     case RoutingMethodType::TopK:
       return "TopK";
+    case RoutingMethodType::SigmoidRenorm:
+      return "SigmoidRenorm";
     default:
       return "InvalidRountingMethod";  // TODO throw error
   };
@@ -128,7 +132,8 @@ class Runner {
            int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit, int32_t* numNonExitingCtas,
            batchedGemm::trtllm::gen::Dtype dtypeElt, batchedGemm::trtllm::gen::Dtype dtypeBias,
            bool useRoutingScalesOnInput, bool useDeepSeekFp8, RoutingMethodType routingMethodType,
-           cudaStream_t stream);
+           cudaStream_t stream,
+           batchedGemm::trtllm::gen::Dtype dtypeLogits, bool normTopkProb = true);
 
  private:
   int32_t mTileTokensDim{8};

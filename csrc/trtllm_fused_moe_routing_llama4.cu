@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,7 +25,8 @@ namespace routingLlama4 {
 static constexpr int NumThreads = 1024;
 static constexpr int NumWarps = NumThreads / WarpSize;
 static constexpr int MaxNumTopExperts = 1;
-static constexpr int NumExpertsLimit = 128;
+// static constexpr int MaxNumExperts = 128;
+static constexpr int MaxSupportedExperts = 128;
 static constexpr int MaxNumTokensSingleCluster = NumBlocksPerCluster * NumThreads;
 static constexpr int MaxNumTokensSingleClusterScores = NumBlocksPerCluster * NumWarps;
 static constexpr int WarpKernelSmemStride = 33;
@@ -101,7 +102,7 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   // then wait on primary grid
-  if constexpr (KernelParams::UsePdl) {
+  if (params.mUsePdl) {
     cudaGridDependencySynchronize();
   }
 #endif
@@ -150,9 +151,9 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
         scoreIdx = TypePacked{static_cast<OutputT>(params.mPtrTopKPacked[threadIdx.x].score),
                               static_cast<int16_t>(params.mPtrTopKPacked[threadIdx.x].idx)};
         if (params.mPtrTopKWeights != nullptr) {
-          // we also compute the final score here and write it out if required
-          auto finalScore = OutputT{sigmoid_accurate(float{scoreIdx.score})};
-          params.mPtrTopKWeights[threadIdx.x] = finalScore;
+          // mPtrTopKPacked already contains sigmoid scores (produced by the scores-path
+          // kernels), so we just pass them through — no need to apply sigmoid again.
+          params.mPtrTopKWeights[threadIdx.x] = scoreIdx.score;
         }
       }
     }
@@ -190,13 +191,15 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
   for (int ii = 0; ii < ExpertsPerThread; ++ii) {
     auto count = getBits(expertCount, ii);
     int32_t num;
-    if constexpr (KernelParams::isPow2) {
+    if (params.mIsPow2) {
       num = divUpLog2<int32_t>(count, params.mPaddingLog2);
     } else {
       num = divUpTileN<int32_t>(count, params.mTileTokensDim);
     }
     numCta += num;
   }
+  // Expand from CGA count to CTA count to keep the semantic stable with downstream kernels
+  numCta *= params.mClusterSizeInBatchDim;
   // second, we perform the exclusive sum across the warp
   int32_t ctaOffset;
   int32_t numNonExitingCtas;
@@ -209,24 +212,28 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
   for (int ii = 0; ii < ExpertsPerThread; ++ii) {
     auto count = getBits(expertCount, ii);
     int32_t finalNumCta;
-    if constexpr (KernelParams::isPow2) {
+    if (params.mIsPow2) {
       finalNumCta = divUpLog2<int32_t>(count, params.mPaddingLog2);
     } else {
       finalNumCta = divUpTileN<int32_t>(count, params.mTileTokensDim);
     }
+    finalNumCta *= params.mClusterSizeInBatchDim;
     auto expertIdx = threadIdx.x * ExpertsPerThread + ii;
     // during the scan for expert offsets, we can already write out
     // both `mPtrCtaIdxXyToBatchIdx` and `mPtrCtaIdxXyToMnLimit`
     for (int cta = 0; cta < finalNumCta; ++cta) {
       params.mPtrCtaIdxXyToBatchIdx[ctaOffsetExp + cta] = expertIdx;
+      // Write CTA-level MnLimits using ctaTile = cgaTile / clusterSize
       int32_t mnLimit1;
       int32_t mnLimit2;
-      if constexpr (KernelParams::isPow2) {
-        mnLimit1 = mulLog2<int32_t>(ctaOffsetExp + cta + 1, params.mPaddingLog2);
-        mnLimit2 = mulLog2<int32_t>(ctaOffsetExp, params.mPaddingLog2) + count;
+      if (params.mIsPow2) {
+        int32_t ctaPaddingLog2 = params.mPaddingLog2 - params.mClusterSizeLog2;
+        mnLimit1 = mulLog2<int32_t>(ctaOffsetExp + cta + 1, ctaPaddingLog2);
+        mnLimit2 = mulLog2<int32_t>(ctaOffsetExp, ctaPaddingLog2) + count;
       } else {
-        mnLimit1 = mulTileN<int32_t>(ctaOffsetExp + cta + 1, params.mTileTokensDim);
-        mnLimit2 = mulTileN<int32_t>(ctaOffsetExp, params.mTileTokensDim) + count;
+        int32_t ctaTile = params.mTileTokensDim / params.mClusterSizeInBatchDim;
+        mnLimit1 = (ctaOffsetExp + cta + 1) * ctaTile;
+        mnLimit2 = ctaOffsetExp * ctaTile + count;
       }
       params.mPtrCtaIdxXyToMnLimit[ctaOffsetExp + cta] = min(mnLimit1, mnLimit2);
     }
@@ -236,18 +243,20 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
   // at this point, we can write out padded count from the warp-aggregate
   if (cute::elect_one_sync()) {
     int32_t permutedIdxSize;
-    if constexpr (KernelParams::isPow2) {
-      permutedIdxSize = mulLog2<int32_t>(numNonExitingCtas, params.mPaddingLog2);
+    if (params.mIsPow2) {
+      permutedIdxSize =
+          mulLog2<int32_t>(numNonExitingCtas >> params.mClusterSizeLog2, params.mPaddingLog2);
     } else {
-      permutedIdxSize = mulTileN<int32_t>(numNonExitingCtas, params.mTileTokensDim);
+      permutedIdxSize = (numNonExitingCtas / params.mClusterSizeInBatchDim) * params.mTileTokensDim;
     }
+
     params.mPtrPermutedIdxSize[0] = permutedIdxSize;
     params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
   }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   // we can trigger the next kernel at this point
-  if constexpr (KernelParams::UsePdl) {
+  if (params.mUsePdl) {
     cudaTriggerProgrammaticLaunchCompletion();
   }
 #endif
@@ -258,16 +267,18 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
   // here, we keep the local offset for each of the thread's experts in a field
   // of registers
   auto localExpertExtent = params.mNumLocalExperts << params.mLocalExpertsStrideLog2;
+  // Convert CTA-level ctaOffset back to token-space (CGA granularity)
   int32_t finalExpertOffset[ExpertsPerThread];
-  if constexpr (KernelParams::isPow2) {
-    finalExpertOffset[0] = mulLog2<int32_t>(ctaOffset, params.mPaddingLog2);
+  if (params.mIsPow2) {
+    finalExpertOffset[0] =
+        mulLog2<int32_t>(ctaOffset >> params.mClusterSizeLog2, params.mPaddingLog2);
   } else {
-    finalExpertOffset[0] = mulTileN<int32_t>(ctaOffset, params.mTileTokensDim);
+    finalExpertOffset[0] = (ctaOffset / params.mClusterSizeInBatchDim) * params.mTileTokensDim;
   }
 #pragma unroll
   for (int ii = 1; ii < ExpertsPerThread; ++ii) {
     int32_t tmp;
-    if constexpr (KernelParams::isPow2) {
+    if (params.mIsPow2) {
       tmp = divUpMulLog2<int32_t>(getBits(expertCount, ii - 1), params.mPaddingLog2);
     } else {
       tmp = divUpMulTileN<int32_t>(getBits(expertCount, ii - 1), params.mTileTokensDim);
@@ -294,7 +305,7 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
       auto expertIdx = threadIdx.x * ExpertsPerThread + ii;
       auto localExpertIdx = static_cast<int32_t>(expertIdx) - params.mLocalExpertsStartIdx;
       auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent &&
-                           (localExpertIdx & params.mLocalExpertsStrideLog2) == 0;
+                           (localExpertIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
       // the permuted index: we add the local offset relative to this expert and token
       // to the global offset from the scan for this expert
       auto permutedIdx = isLocalExpert ? finalExpertOffset[ii] + localOffsetToken : int32_t{-1};
@@ -338,7 +349,7 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
   auto warp = cg::tiled_partition<WarpSize>(block);
 
   // then wait on primary grid
-  if constexpr (KernelParams::UsePdl) {
+  if (params.mUsePdl) {
     cudaGridDependencySynchronize();
   }
 
@@ -420,7 +431,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   // Wait on primary grid and trigger secondary kernel.
-  if constexpr (KernelParams::UsePdl) {
+  if (params.mUsePdl) {
     cudaGridDependencySynchronize();
     cudaTriggerProgrammaticLaunchCompletion();
   }
@@ -458,25 +469,38 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-int constexpr getMaxNumExperts(int32_t numExperts) {
+int getMaxNumExperts(int32_t numExperts) {
   if (numExperts <= topk::MaxNumExpertsUnit) {
     return topk::MaxNumExpertsUnit;
   } else {
-    TLLM_LOG_ERROR("Unsupported numExperts");
+    FLASHINFER_WARN("Unsupported numExperts");
     return 0;
   }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-void runImpl(Data const& data, void* stream) {
+void run(Data const& data, void* stream) {
   FLASHINFER_CHECK(
       data.mPtrTopKPacked != nullptr || data.mPtrScores != nullptr || data.mPtrTopKIds != nullptr,
       "Routing kernel requires at least one input parameter");
-  if (data.mPtrTopKIds != nullptr) {
-    FLASHINFER_CHECK(
-        data.mPtrTopKWeights != nullptr,
-        "When mPtrTopKIds is provided, mPtrTopKWeights must also be provided for Llama4 routing.");
+  // When topK is already computed (mPtrTopKIds or mPtrTopKPacked without scores),
+  // delegate to the shared post-topK pipeline. This avoids Llama4-specific issues:
+  // - The Llama4 cluster kernel loads one token per warp but useSingleCluster uses
+  //   the thread-based capacity, causing unprocessed tokens for medium token counts.
+  // - The Llama4 device kernel applies sigmoid to packed scores that may already
+  //   contain sigmoid values (produced by the scores-path kernels).
+  if (data.mPtrTopKIds != nullptr ||
+      (data.mPtrTopKPacked != nullptr && data.mPtrScores == nullptr)) {
+    if (data.mPtrTopKIds != nullptr) {
+      FLASHINFER_CHECK(
+          data.mPtrTopKWeights != nullptr,
+          "When mPtrTopKIds is provided, mPtrTopKWeights must also be provided for Llama4 "
+          "routing.");
+    }
+    int const numThreadsHist = getMaxNumExperts(data.mNumExperts);
+    runPostTopKPipeline(data, numThreadsHist, stream);
+    return;
   }
   FLASHINFER_CHECK(
       data.mPtrPermutedIdxSize != nullptr && data.mPtrCtaIdxXyToBatchIdx != nullptr &&
@@ -485,23 +509,26 @@ void runImpl(Data const& data, void* stream) {
   FLASHINFER_CHECK(data.mTopK <= MaxNumTopExperts,
                    "Routing kernel expects topK experts <= %d, got %d", MaxNumTopExperts,
                    data.mTopK);
-  FLASHINFER_CHECK(data.mNumExperts <= NumExpertsLimit,
+  FLASHINFER_CHECK(data.mNumExperts <= MaxSupportedExperts,
                    "Routing kernel expects #experts %d to be no more than %d", data.mNumExperts,
-                   NumExpertsLimit);
+                   MaxSupportedExperts);
+  // static_assert(MaxNumExperts <= NumThreads, "#experts must be bounded by #threads");
+  // static_assert(MaxNumExperts <= numThreadsHist, "#experts must be bounded by #threads");
   FLASHINFER_CHECK(data.mNumExperts % 4 == 0,
                    "Routing kernel expects #experts %d to be a multiple of 4.", data.mNumExperts);
 
+  // After this point, mPtrTopKIds is guaranteed to be nullptr.
+  // Input is either mPtrScores (raw logits) or mPtrTopKPacked (topK already computed, needs
+  // sigmoid).
   bool const useSingleWarp =
       (data.mPtrScores == nullptr && data.mNumTokens <= WarpKernelMaxNumTokens) ||
       data.mNumTokens < WarpKernelMaxNumTokens;
-  bool const useSingleCluster =
-      data.mNumTokens <= ((data.mPtrScores != nullptr || data.mPtrTopKIds != nullptr)
-                              ? MaxNumTokensSingleClusterScores
-                              : MaxNumTokensSingleCluster);
+  bool const useSingleCluster = data.mNumTokens <= ((data.mPtrScores != nullptr)
+                                                        ? MaxNumTokensSingleClusterScores
+                                                        : MaxNumTokensSingleCluster);
   if (!useSingleCluster) {
-    FLASHINFER_CHECK(
-        (data.mPtrTopKPacked != nullptr || data.mPtrTopKIds != nullptr),
-        "When #tokens is large, `mPtrTopKPacked` or `mPtrTopKIds` is a required input.");
+    FLASHINFER_CHECK(data.mPtrTopKPacked != nullptr,
+                     "When #tokens is large, `mPtrTopKPacked` is a required input.");
     FLASHINFER_CHECK(data.mPtrExpertCounts != nullptr,
                      "When #tokens is large, `mPtrExpertCounts` is a required input.");
   }
@@ -532,7 +559,7 @@ void runImpl(Data const& data, void* stream) {
     int const numBlocksOffsets =
         std::min((expandedIdxSize + offsetEltsPerBlock - 1) / offsetEltsPerBlock, maxNumBlocks);
 
-    if (data.mPtrScores != nullptr && data.mPtrTopKIds == nullptr) {
+    if (data.mPtrScores != nullptr) {
       LAUNCH_ROUTING_LLAMA4(data,
                             /*coopLaunch=*/false, routingIndicesHistogramScoresKernel, maxNumBlocks,
                             numThreadsHist,
@@ -556,23 +583,6 @@ void runImpl(Data const& data, void* stream) {
                           /*smemSize=*/0,  // No dynamic smem
                           stream);
   }
-}
-
-void run(Data const& data, void* stream) {
-  FLASHINFER_CHECK(
-      data.mPtrTopKPacked != nullptr || data.mPtrScores != nullptr || data.mPtrTopKIds != nullptr,
-      "Routing kernel requires at least one input parameter");
-  FLASHINFER_CHECK(
-      data.mPtrPermutedIdxSize != nullptr && data.mPtrCtaIdxXyToBatchIdx != nullptr &&
-          data.mPtrCtaIdxXyToMnLimit != nullptr && data.mPtrNumNonExitingCtas != nullptr,
-      "Llama4 routing kernel expects permuted idx and grouped Gemm launch config buffers");
-  FLASHINFER_CHECK(data.mTopK <= MaxNumTopExperts,
-                   "Routing kernel expects topK experts <= ", MaxNumTopExperts, ", got ",
-                   data.mTopK);
-  FLASHINFER_CHECK(data.mPaddingLog2 < 8, "Routing kernel expects padding log2 < 8, got ",
-                   data.mPaddingLog2);
-
-  runImpl(data, stream);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

@@ -269,4 +269,26 @@ inline __device__ float2 operator*(float2 a, float b) { return make_float2(a.x *
 inline __device__ float2 operator+(float2 a, float b) { return make_float2(a.x + b, a.y + b); }
 inline __device__ float2 operator-(float2 a, float b) { return make_float2(a.x - b, a.y - b); }
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Device query helpers — thin wrappers around CUDA runtime queries.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline int getSMVersion() {
+  int device{-1};
+  cudaGetDevice(&device);
+  int sm_major = 0;
+  int sm_minor = 0;
+  cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, device);
+  cudaDeviceGetAttribute(&sm_minor, cudaDevAttrComputeCapabilityMinor, device);
+  return sm_major * 10 + sm_minor;
+}
+
+inline int getMultiProcessorCount() {
+  int device{-1};
+  cudaGetDevice(&device);
+  int count = 0;
+  cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device);
+  return count;
+}
+
 }  // namespace tensorrt_llm::common

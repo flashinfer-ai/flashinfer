@@ -71,8 +71,10 @@ class RoutingMethodType(IntEnum):
     RenormalizeNaive = (4,)
     # TopK only (no softmax)
     TopK = (5,)
+    # SigmoidRenorm: Sigmoid -> TopK -> Renormalize (divide by sum of top-K weights)
+    SigmoidRenorm = (6,)
     # Unspecified
-    Unspecified = 6
+    Unspecified = (7,)
 
 
 # Copied from csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/common.h
@@ -1132,6 +1134,7 @@ def get_trtllm_moe_sm100_module():
                     kwargs["do_finalize"],
                     kwargs["enable_pdl"],
                     [-1, -1] if tactic == -1 else tactic,
+                    kwargs.get("norm_topk_prob", True),
                 )
             elif (
                 self.dtype_act == DtypeTrtllmGen.E4m3
@@ -1190,6 +1193,7 @@ def get_trtllm_moe_sm100_module():
                         kwargs["enable_pdl"],
                         [-1, -1] if tactic == -1 else tactic,
                         self.fp8_quantization_type,
+                        kwargs.get("norm_topk_prob", True),
                     )
                 else:
                     # FP8 per tensor scale
@@ -1217,6 +1221,7 @@ def get_trtllm_moe_sm100_module():
                         kwargs["enable_pdl"],
                         [-1, -1] if tactic == -1 else tactic,
                         self.activation_type,
+                        kwargs.get("norm_topk_prob", True),
                     )
             elif (
                 self.dtype_act == DtypeTrtllmGen.Bfloat16
@@ -1246,6 +1251,7 @@ def get_trtllm_moe_sm100_module():
                     kwargs["enable_pdl"],
                     output,
                     [-1, -1] if tactic == -1 else tactic,
+                    kwargs.get("norm_topk_prob", True),
                 )
             else:
                 moe_op.trtllm_fp4_block_scale_moe(
@@ -1281,6 +1287,7 @@ def get_trtllm_moe_sm100_module():
                     self.activation_type,
                     output,
                     [-1, -1] if tactic == -1 else tactic,
+                    kwargs.get("norm_topk_prob", True),
                 )
 
         @classmethod
@@ -1337,6 +1344,7 @@ def get_trtllm_moe_sm100_module():
         do_finalize: bool = True,
         enable_pdl: Optional[bool] = None,
         tune_max_num_tokens: int = 8192,
+        norm_topk_prob: bool = True,
     ) -> List[torch.Tensor]:
         assert routing_logits is not None or topk_ids is not None, (
             "either routing_logits or topk_ids must be provided"
@@ -1435,6 +1443,7 @@ def get_trtllm_moe_sm100_module():
             do_finalize,
             enable_pdl,
             [-1, -1] if tactic == -1 else tactic,
+            norm_topk_prob,
         )
         if do_finalize:
             return [output]
@@ -1500,6 +1509,7 @@ def get_trtllm_moe_sm100_module():
         enable_pdl: Optional[bool] = None,
         tune_max_num_tokens: int = 8192,
         activation_type: int = ActivationType.Swiglu.value,
+        norm_topk_prob: bool = True,
     ) -> List[torch.Tensor]:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
@@ -1587,6 +1597,7 @@ def get_trtllm_moe_sm100_module():
             enable_pdl,
             [-1, -1] if tactic == -1 else tactic,
             activation_type,
+            norm_topk_prob,
         )
         if do_finalize:
             return [output]
@@ -1657,6 +1668,7 @@ def get_trtllm_moe_sm100_module():
         enable_pdl: Optional[bool] = None,
         tune_max_num_tokens: int = 8192,
         fp8_quantization_type: Fp8QuantizationType = Fp8QuantizationType.DeepSeekFp8,
+        norm_topk_prob: bool = True,
     ) -> List[torch.Tensor]:
         # Determine routing mode: compute from logits or use pre-computed
         if routing_logits is None:
@@ -1781,6 +1793,7 @@ def get_trtllm_moe_sm100_module():
             enable_pdl,
             [-1, -1] if tactic == -1 else tactic,
             fp8_quantization_type,
+            norm_topk_prob,
         )
 
         if do_finalize:
@@ -1867,6 +1880,7 @@ def get_trtllm_moe_sm100_module():
         activation_type: int = ActivationType.Swiglu.value,
         output: Optional[torch.Tensor] = None,
         tune_max_num_tokens: int = 8192,
+        norm_topk_prob: bool = True,
     ) -> List[torch.Tensor]:
         if routing_logits is None:
             assert topk_ids is not None, (
@@ -2010,6 +2024,7 @@ def get_trtllm_moe_sm100_module():
             activation_type,
             output,
             [-1, -1] if tactic == -1 else tactic,
+            norm_topk_prob,
         )
         if do_finalize:
             return [output]
@@ -2088,6 +2103,7 @@ def get_trtllm_moe_sm100_module():
         enable_pdl: Optional[bool] = None,
         output: Optional[torch.Tensor] = None,
         tune_max_num_tokens: int = 8192,
+        norm_topk_prob: bool = True,
     ) -> List[torch.Tensor]:
         routing_dtype = routing_logits.dtype
         hidden_size = hidden_states.shape[-1]
@@ -2185,6 +2201,7 @@ def get_trtllm_moe_sm100_module():
             enable_pdl,
             output,
             [-1, -1] if tactic == -1 else tactic,
+            norm_topk_prob,
         )
         if do_finalize:
             return [output]
@@ -2255,6 +2272,7 @@ def trtllm_bf16_moe(
     do_finalize: bool = True,
     enable_pdl: bool = True,
     tune_max_num_tokens: int = 8192,
+    norm_topk_prob: bool = True,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     """BF16 MoE operation with autotuning support.
 
@@ -2319,6 +2337,7 @@ def trtllm_bf16_moe(
         do_finalize,
         enable_pdl,
         tune_max_num_tokens,
+        norm_topk_prob,
     )
 
     if do_finalize:
@@ -2413,6 +2432,7 @@ def trtllm_bf16_routed_moe(
         do_finalize,
         enable_pdl,
         tune_max_num_tokens,
+        True,  # norm_topk_prob: not used for pre-computed routing
     )
 
     if do_finalize:
@@ -2448,6 +2468,7 @@ def trtllm_fp8_per_tensor_scale_moe(
     enable_pdl: Optional[bool] = None,
     tune_max_num_tokens: int = 8192,
     activation_type: int = ActivationType.Swiglu.value,
+    norm_topk_prob: bool = True,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     """FP8 per tensor scale MoE operation.
 
@@ -2507,6 +2528,7 @@ def trtllm_fp8_per_tensor_scale_moe(
         enable_pdl,
         tune_max_num_tokens,
         activation_type,
+        norm_topk_prob,
     )
 
     if do_finalize:
@@ -2543,6 +2565,7 @@ def trtllm_fp8_block_scale_moe(
     enable_pdl: Optional[bool] = None,
     tune_max_num_tokens: int = 8192,
     fp8_quantization_type: Fp8QuantizationType = Fp8QuantizationType.DeepSeekFp8,
+    norm_topk_prob: bool = True,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     """FP8 block scale MoE operation.
 
@@ -2609,6 +2632,7 @@ def trtllm_fp8_block_scale_moe(
         enable_pdl,
         tune_max_num_tokens,
         fp8_quantization_type,
+        norm_topk_prob,
     )
 
     if do_finalize:
@@ -2713,6 +2737,7 @@ def trtllm_fp8_block_scale_routed_moe(
         enable_pdl,
         tune_max_num_tokens,
         fp8_quantization_type,
+        True,  # norm_topk_prob: not used for pre-computed routing
     )
 
     if do_finalize:
@@ -2756,6 +2781,7 @@ def trtllm_fp4_block_scale_moe(
     activation_type: int = ActivationType.Swiglu.value,
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
+    norm_topk_prob: bool = True,
 ) -> List[torch.Tensor]:
     """FP4 block scale MoE operation.
 
@@ -2853,6 +2879,7 @@ def trtllm_fp4_block_scale_moe(
         activation_type,
         output,
         tune_max_num_tokens,
+        norm_topk_prob,
     )
 
 
@@ -2987,6 +3014,7 @@ def trtllm_fp4_block_scale_routed_moe(
         activation_type,
         output,
         tune_max_num_tokens,
+        True,  # norm_topk_prob: not used for pre-computed routing
     )
 
 
@@ -3015,6 +3043,7 @@ def trtllm_mxint4_block_scale_moe(
     enable_pdl: Optional[bool] = None,
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
+    norm_topk_prob: bool = True,
 ) -> List[torch.Tensor]:
     """MxInt4 block scale MoE operation.
 
@@ -3086,4 +3115,5 @@ def trtllm_mxint4_block_scale_moe(
         enable_pdl,
         output,
         tune_max_num_tokens,
+        norm_topk_prob,
     )
