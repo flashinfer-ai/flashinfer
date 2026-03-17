@@ -20,7 +20,7 @@ import torch
 import flashinfer
 from flashinfer.testing.utils import bench_gpu_time
 
-from flashinfer.cute_dsl.prefill import BatchPrefillCuteDSLWrapper
+from flashinfer.cute_dsl.attention import BatchPrefillCuteDSLWrapper
 
 
 def bench_fmha_blackwell(
@@ -164,22 +164,11 @@ def bench_fmha_cutedsl(
 
 
 if __name__ == "__main__":
-    # bench_fmha_blackwell(128, 512, 32, 128, False, torch.bfloat16)
-    # bench_fmha_blackwell(64, 1024, 32, 128, False, torch.bfloat16)
-    # bench_fmha_blackwell(32, 2048, 32, 128, False, torch.bfloat16)
-    # bench_fmha_blackwell(16, 4096, 32, 128, False, torch.bfloat16)
-    # bench_fmha_blackwell(8, 8192, 32, 128, False, torch.bfloat16)
-    # bench_fmha_blackwell(4, 16384, 32, 128, False, torch.bfloat16)
-    # bench_fmha_blackwell(2, 32768, 32, 128, False, torch.bfloat16)
-    # bench_fmha_blackwell(1, 65536, 32, 128, False, torch.bfloat16)
-
-    # bench_fmha_blackwell(128, 512, 32, 128, True, torch.bfloat16)
-    # bench_fmha_blackwell(64, 1024, 32, 128, True, torch.bfloat16)
-    # bench_fmha_blackwell(32, 2048, 32, 128, True, torch.bfloat16)
-    # bench_fmha_blackwell(16, 4096, 32, 128, True, torch.bfloat16)
-    # bench_fmha_blackwell(8, 8192, 32, 128, True, torch.bfloat16)
-    # bench_fmha_blackwell(4, 16384, 32, 128, True, torch.bfloat16)
-    # bench_fmha_blackwell(2, 32768, 32, 128, True, torch.bfloat16)
-    # bench_fmha_blackwell(1, 65536, 32, 128, True, torch.bfloat16)
-
     bench_fmha_cutedsl(128, 512, 32, 128, True, torch.bfloat16)
+    bench_fmha_cutedsl(64, 1024, 32, 128, True, torch.bfloat16)
+    bench_fmha_cutedsl(32, 2048, 32, 128, True, torch.bfloat16)
+    bench_fmha_cutedsl(16, 4096, 32, 128, True, torch.bfloat16)
+    bench_fmha_cutedsl(8, 8192, 32, 128, True, torch.bfloat16)
+    bench_fmha_cutedsl(4, 16384, 32, 128, True, torch.bfloat16)
+    bench_fmha_cutedsl(2, 32768, 32, 128, True, torch.bfloat16)
+    bench_fmha_cutedsl(1, 65536, 32, 128, True, torch.bfloat16)
