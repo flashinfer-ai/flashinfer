@@ -155,7 +155,7 @@ class BatchPrefillCuteDSLWrapper:
         )
 
         if use_attention_sink:
-            sink = torch.randn(num_qo_heads, dtype=torch.float16, device=self._device)
+            sink = torch.randn(num_qo_heads, dtype=q_data_type, device=self._device)
             sink_cute = from_dlpack(sink, assumed_align=16)
 
         self._mma_tiler_mn = (128, 128)
