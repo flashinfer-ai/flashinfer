@@ -1978,7 +1978,8 @@ def execute_cudnn_gemm_fp4_graph(
 # ---------------------------------------------------------------------------
 
 # Sentinel value used as "cache M" when building override-shape graphs.
-# Any sufficiently large M will work; 8192 covers typical LLM inference shapes.
+# Any M value will work in general.
+# 8192 covers typical LLM inference shapes and set as default value.
 _OVERRIDE_SHAPE_CACHE_M = 8192
 
 # ---------------------------------------------------------------------------
@@ -2131,7 +2132,7 @@ def execute_cudnn_fp4_gemm_graph_override_shape(
 ):
     """Execute FP4 GEMM cuDNN graph with dynamic-shape overrides."""
 
-    assert a.stride()[2] == 1 and b.stride()[1] == 1
+    assert a.stride()[2] == 1 and b.stride()[1] == 1, "a and b must be k-major"
 
     variant_pack = {
         UIDs.A_UID.value: a,
@@ -2225,65 +2226,6 @@ def _get_cudnn_fp4_gemm_graph_override_shape(
         device=a.device,
         alpha_is_not_none=alpha is not None,
         use_nvfp4=use_nvfp4,
-    )
-
-
-def _cudnn_gemm_fp4_override_shape(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    a_descale: torch.Tensor,
-    b_descale: torch.Tensor,
-    alpha: Optional[torch.Tensor] = None,
-    out_dtype: torch.dtype = torch.bfloat16,
-    out: Optional[torch.Tensor] = None,
-    block_size: int = 16,
-    use_nvfp4: bool = True,
-    workspace_buffer: torch.Tensor = None,
-    tactic: int = 0,
-):
-    """FP4 GEMM via cuDNN using override-shape for dynamic M dimension."""
-    graph = _get_cudnn_fp4_gemm_graph_override_shape(
-        a=a,
-        b=b,
-        a_descale=a_descale,
-        b_descale=b_descale,
-        alpha=alpha,
-        out_dtype=out_dtype,
-        out=out,
-        block_size=block_size,
-        use_nvfp4=use_nvfp4,
-    )
-
-    real_a_shape, real_a_stride = _get_real_fp4_shape_from_packed_uint8(a)
-    real_b_shape, real_b_stride = _get_real_fp4_shape_from_packed_uint8(b)
-    batch = real_a_shape[0]
-    expanded_a_descale_shape, expanded_a_descale_stride = (
-        _expand_block_scale_tensor_shape(a_descale, batch)
-    )
-    expanded_b_descale_shape, expanded_b_descale_stride = (
-        _expand_block_scale_tensor_shape(b_descale, batch)
-    )
-
-    a_3d = a.view(real_a_shape) if a.ndim == 2 else a
-    b_3d = b.view(real_b_shape) if b.ndim == 2 else b
-    a_descale_3d = (
-        a_descale.view(expanded_a_descale_shape) if a_descale.ndim == 2 else a_descale
-    )
-    b_descale_3d = (
-        b_descale.view(expanded_b_descale_shape) if b_descale.ndim == 2 else b_descale
-    )
-    out_3d = out.unsqueeze(0) if out.ndim == 2 else out
-
-    execute_cudnn_fp4_gemm_graph_override_shape(
-        graph,
-        a_3d,
-        b_3d,
-        a_descale_3d,
-        b_descale_3d,
-        alpha,
-        out_3d,
-        workspace_buffer,
-        tactic=tactic,
     )
 
 
@@ -2770,48 +2712,6 @@ def execute_cudnn_gemm_with_per_tensor_q_graph_override_shape(
     )
 
 
-def _cudnn_gemm_fp8_override_shape(
-    workspace: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    a_scale: torch.Tensor,
-    b_scale: torch.Tensor,
-    out: Optional[torch.Tensor],
-    torch_out_dtype: torch.dtype,
-    tactic: int = 0,
-):
-    """FP8 per-tensor GEMM via cuDNN using override-shape for dynamic M."""
-    _check_cudnn_availability()
-
-    # Expand 2-D tensors to 3-D for cuDNN
-    a_3d_shape, _ = _get_bf16_3d_shape_stride(a)
-    b_3d_shape, _ = _get_bf16_3d_shape_stride(b)
-    out_3d_shape, _ = _get_bf16_3d_shape_stride(out)
-
-    batch = a_3d_shape[0]
-    n = b_3d_shape[2]
-    k = a_3d_shape[2]
-
-    a_3d = a.view(a_3d_shape) if a.ndim == 2 else a
-    b_3d = b.view(b_3d_shape) if b.ndim == 2 else b
-    out_3d = out.view(out_3d_shape) if out.ndim == 2 else out
-
-    graph = build_cudnn_gemm_with_per_tensor_q_graph_override_shape(
-        batch,
-        n,
-        k,
-        _torch_data_type_to_cudnn_data_type(a.dtype),
-        _torch_data_type_to_cudnn_data_type(b.dtype),
-        _torch_data_type_to_cudnn_data_type(torch_out_dtype),
-        a.device,
-    )
-
-    execute_cudnn_gemm_with_per_tensor_q_graph_override_shape(
-        graph, a_3d, b_3d, a_scale, b_scale, out_3d, workspace, tactic=tactic
-    )
-    return out
-
-
 def _torch_data_type_to_cudnn_data_type(dtype: torch.dtype):
     if dtype == torch.bfloat16:
         return cudnn.data_type.BFLOAT16
@@ -3065,49 +2965,6 @@ def execute_cudnn_gemm_bf16_graph_override_shape(
         override_shapes=override_shapes,
         override_strides=override_strides,
     )
-
-
-def _cudnn_gemm_bf16_override_shape(
-    workspace: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    out: torch.Tensor,
-    tactic: int = 0,
-):
-    """BF16 GEMM via cuDNN using override-shape for dynamic M dimension.
-
-    A single plan compiled with ``_OVERRIDE_SHAPE_CACHE_M`` as M is reused
-    for all M values without triggering a graph rebuild.
-    """
-    _check_cudnn_availability()
-
-    # Both mm (2-D) and bmm (3-D) are supported via the existing
-    # _get_bf16_3d_shape_stride helper which pads 2-D inputs to 3-D.
-    a_3d_shape, _ = _get_bf16_3d_shape_stride(a)
-    b_3d_shape, _ = _get_bf16_3d_shape_stride(b)
-    out_3d_shape, _ = _get_bf16_3d_shape_stride(out)
-
-    batch = a_3d_shape[0]
-    n = b_3d_shape[2]
-    k = a_3d_shape[2]
-
-    # Ensure 3-D contiguous views for the cuDNN call
-    a_3d = a.view(a_3d_shape) if a.ndim == 2 else a
-    b_3d = b.view(b_3d_shape) if b.ndim == 2 else b
-    out_3d = out.view(out_3d_shape) if out.ndim == 2 else out
-
-    graph = build_cudnn_gemm_bf16_graph_override_shape(
-        batch,
-        n,
-        k,
-        _torch_data_type_to_cudnn_data_type(out.dtype),
-        a.device,
-    )
-
-    execute_cudnn_gemm_bf16_graph_override_shape(
-        graph, a_3d, b_3d, out_3d, workspace, tactic=tactic
-    )
-    return out
 
 
 def _cudnn_gemm_bf16(

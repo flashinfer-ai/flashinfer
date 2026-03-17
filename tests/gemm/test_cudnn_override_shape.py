@@ -41,10 +41,10 @@ def _skip_if_override_shape_not_supported():
         )
 
 
-def _skip_if_not_sm100():
+def _skip_if_not_sm100_or_sm103():
     major, minor = get_compute_capability(torch.device("cuda"))
-    if major * 10 + minor < 100:
-        pytest.skip("override-shape GEMM requires SM100+ (Blackwell)")
+    if major * 10 + minor not in [100, 103]:
+        pytest.skip("override-shape GEMM requires SM100 or SM103")
 
 
 # ============================================================================
@@ -55,6 +55,10 @@ def _skip_if_not_sm100():
 class TestCudnnBf16OverrideShape:
     """Single compiled plan handles multiple M dimensions for BF16 GEMM."""
 
+    @pytest.mark.skipif(
+        not CUDNN_AVAILABLE,
+        reason="cuDNN not available",
+    )
     @pytest.mark.parametrize(
         "cache_m,dynamic_ms",
         [
@@ -67,7 +71,7 @@ class TestCudnnBf16OverrideShape:
     def test_bf16_override_shape_dynamic_m(self, cache_m, dynamic_ms, n, k):
         _skip_if_no_cudnn()
         _skip_if_override_shape_not_supported()
-        _skip_if_not_sm100()
+        _skip_if_not_sm100_or_sm103()
 
         from flashinfer.gemm.gemm_base import _torch_data_type_to_cudnn_data_type
 
@@ -134,7 +138,7 @@ class TestCudnnNVFp4OverrideShape:
     def test_nvfp4_override_shape_dynamic_m(self, cache_m, dynamic_ms, n, k):
         _skip_if_no_cudnn()
         _skip_if_override_shape_not_supported()
-        _skip_if_not_sm100()
+        _skip_if_not_sm100_or_sm103()
 
         import cudnn
 
@@ -281,7 +285,7 @@ class TestCudnnMXFp8OverrideShape:
     def test_mxfp8_override_shape_dynamic_m(self, cache_m, dynamic_ms, n, k):
         _skip_if_no_cudnn()
         _skip_if_override_shape_not_supported()
-        _skip_if_not_sm100()
+        _skip_if_not_sm100_or_sm103()
 
         import cudnn
         from flashinfer.gemm.gemm_base import _torch_data_type_to_cudnn_data_type
@@ -291,8 +295,8 @@ class TestCudnnMXFp8OverrideShape:
         out_dtype = torch.bfloat16
 
         # Compute block scale dims using cache_m
-        block_scale_dim_m_cache, block_scale_dim_n, block_scale_dim_k = (
-            _calculate_block_scale_dims(cache_m, n, k, block_size)
+        _, block_scale_dim_n, block_scale_dim_k = _calculate_block_scale_dims(
+            cache_m, n, k, block_size
         )
 
         # Build graph once with cache_m
@@ -314,10 +318,10 @@ class TestCudnnMXFp8OverrideShape:
             device=device,
         )
 
-        # Use values 0–126 to avoid NaN FP8_E4M3 bit patterns (0x7F, 0xFF).
-        b = torch.randint(
-            0, 127, (1, n, k), dtype=torch.uint8, device=device
-        ).transpose(1, 2)
+        # Use all possible values 0–255, but reset NaN FP8_E4M3 bit patterns (0x7F, 0xFF) to 0.
+        b = torch.randint(0, 256, (1, n, k), dtype=torch.uint8, device=device)
+        b[(b == 0x7F) | (b == 0xFF)] = 0
+        b = b.transpose(1, 2)
         b_descale = torch.ones(
             1,
             block_scale_dim_n,
@@ -329,8 +333,9 @@ class TestCudnnMXFp8OverrideShape:
         for m in dynamic_ms:
             block_scale_dim_m, _, _ = _calculate_block_scale_dims(m, n, k, block_size)
 
-            # Use values 0–126 to avoid NaN FP8_E4M3 bit patterns (0x7F, 0xFF).
-            a = torch.randint(0, 127, (1, m, k), dtype=torch.uint8, device=device)
+            # Use all possible values 0–255, but reset NaN FP8_E4M3 bit patterns (0x7F, 0xFF) to 0.
+            a = torch.randint(0, 256, (1, m, k), dtype=torch.uint8, device=device)
+            a[(a == 0x7F) | (a == 0xFF)] = 0
             a_descale = torch.ones(
                 1,
                 block_scale_dim_m,
