@@ -758,8 +758,6 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
   FLASHINFER_CHECK(configIndex >= 0 && configIndex < static_cast<int64_t>(mPassingConfigs.size()),
                    "Invalid MoE config index ", configIndex, ", valid range is [0, ",
                    static_cast<int64_t>(mPassingConfigs.size()) - 1, "].");
-  FLASHINFER_CHECK(!mUsePerChannelScalingGemm1 && !mUsePerChannelScalingGemm2,
-                   "Per-channel scaling is currently not supported.");
   // Setup all operation data
   moe::dev::activation::Data activationData;
   moe::dev::finalize::Data finalizeData;
@@ -776,7 +774,7 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
                                          : nullptr;
   mPermuteGemm1.run(
       args.hidden_states, hidden_states_scale_linear, args.gemm1_weights, args.gemm1_weights_scale,
-      workspace.token_scales, /* perChannelScales */ nullptr, args.output1_scales_scalar,
+      workspace.token_scales, args.gemm1_per_channel_weight_scale, args.output1_scales_scalar,
       args.output1_scales_gate_scalar, args.gemm1_bias, args.gemm1_alpha, args.gemm1_beta,
       args.gemm1_clamp_limit, permutedIdxToBiasRowIdx, workspace.gemm1_output,
       workspace.gemm1_output_scale, args.top_k, args.hidden_size, args.intermediate_size,
@@ -827,12 +825,13 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
 
   // Run gemm2
   mGemm2.run(gemm2_input, gemm2_input_scale, args.gemm2_weights, args.gemm2_weights_scale,
-             workspace.token_scales_fc2, /*perChannelScales*/ nullptr, args.output2_scales_scalar,
-             args.gemm2_bias, workspace.gemm2_output, workspace.gemm2_output_scale, args.top_k,
-             args.hidden_size, args.intermediate_size, args.local_num_experts, args.num_tokens,
-             workspace.num_non_exiting_ctas, workspace.total_num_padded_tokens,
-             workspace.cta_idx_xy_to_batch_idx, workspace.cta_idx_xy_to_mn_limit,
-             workspace.bmm2_workspace, device, stream, config.gemm2Config, enable_pdl);
+             workspace.token_scales_fc2, args.gemm2_per_channel_weight_scale,
+             args.output2_scales_scalar, args.gemm2_bias, workspace.gemm2_output,
+             workspace.gemm2_output_scale, args.top_k, args.hidden_size, args.intermediate_size,
+             args.local_num_experts, args.num_tokens, workspace.num_non_exiting_ctas,
+             workspace.total_num_padded_tokens, workspace.cta_idx_xy_to_batch_idx,
+             workspace.cta_idx_xy_to_mn_limit, workspace.bmm2_workspace, device, stream,
+             config.gemm2Config, enable_pdl);
 
   // Run finalize
   if (args.do_finalize) {
