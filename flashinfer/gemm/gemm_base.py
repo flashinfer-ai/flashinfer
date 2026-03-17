@@ -236,8 +236,6 @@ def get_gemm_module():
                     dtype=torch.uint8,
                     device="cpu",
                 )
-                with torch.cuda.device(a.device):
-                    cublas_handle = torch.cuda.current_blas_handle()
                 count = module.bmm_fp8_get_algos(
                     a,
                     b,
@@ -245,7 +243,6 @@ def get_gemm_module():
                     scale_a,
                     scale_b,
                     workspace_buffer,
-                    cublas_handle,
                     algo_buf,
                 )
                 result = (algo_buf, count)
@@ -268,8 +265,6 @@ def get_gemm_module():
                 **kwargs,
             ) -> torch.Tensor:
                 a, b, scale_a, scale_b, out, workspace_buffer = inputs
-                with torch.cuda.device(a.device):
-                    cublas_handle = torch.cuda.current_blas_handle()
                 # The cuBLASLt algo list is enumerated per-shape, so a tactic
                 # tuned at a different (bucketed) M may be out of range here.
                 # Fall back to the heuristic default (the tactic==-1 path) on an
@@ -284,14 +279,11 @@ def get_gemm_module():
                             scale_a,
                             scale_b,
                             workspace_buffer,
-                            cublas_handle,
                             algo_buf,
                             tactic,
                         )
                         return out
-                module.bmm_fp8(
-                    a, b, out, scale_a, scale_b, workspace_buffer, cublas_handle
-                )
+                module.bmm_fp8(a, b, out, scale_a, scale_b, workspace_buffer)
                 return out
 
         return CublasFp8GemmRunner()

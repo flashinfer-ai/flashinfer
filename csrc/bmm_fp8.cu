@@ -17,11 +17,43 @@
 #include <driver_types.h>
 
 #include <flashinfer/gemm/bmm_fp8.cuh>
+#include <unordered_map>
 
 #include "tvm_ffi_utils.h"
 
+namespace {
+
+struct ThreadLocalCublasLtHandles {
+  ~ThreadLocalCublasLtHandles() {
+    // Best-effort cleanup during thread teardown.
+    for (auto& [_, handle] : handles) {
+      if (handle != nullptr) {
+        (void)cublasLtDestroy(handle);
+      }
+    }
+  }
+
+  std::unordered_map<int, cublasLtHandle_t> handles;
+};
+
+cublasLtHandle_t get_cublaslt_handle(int device_id) {
+  static thread_local ThreadLocalCublasLtHandles cache;
+
+  if (auto it = cache.handles.find(device_id); it != cache.handles.end()) {
+    return it->second;
+  }
+
+  ffi::CUDADeviceGuard device_guard(device_id);
+  cublasLtHandle_t handle = nullptr;
+  FLASHINFER_CUBLAS_CHECK(cublasLtCreate(&handle));
+  cache.handles.emplace(device_id, handle);
+  return handle;
+}
+
+}  // namespace
+
 void bmm_fp8(TensorView A, TensorView B, TensorView D, TensorView A_scale, TensorView B_scale,
-             TensorView workspace_buffer, int64_t cublas_handle) {
+             TensorView workspace_buffer) {
   CHECK_CUDA(A);
   CHECK_CUDA(B);
   CHECK_CUDA(D);
@@ -44,9 +76,9 @@ void bmm_fp8(TensorView A, TensorView B, TensorView D, TensorView A_scale, Tenso
         auto k = A.size(2);
         auto n = B.size(2);
 
-        auto lt_handle = reinterpret_cast<cublasLtHandle_t>(cublas_handle);
         ffi::CUDADeviceGuard device_guard(A.device().device_id);
         auto stream = get_stream(A.device());
+        auto lt_handle = get_cublaslt_handle(A.device().device_id);
 
         auto status = flashinfer::bmm_fp8::bmm_fp8_internal_cublaslt(
             workspace_buffer.data_ptr(),
@@ -64,8 +96,7 @@ void bmm_fp8(TensorView A, TensorView B, TensorView D, TensorView A_scale, Tenso
 }
 
 int64_t bmm_fp8_get_algos(TensorView A, TensorView B, TensorView D, TensorView A_scale,
-                          TensorView B_scale, TensorView workspace_buffer, int64_t cublas_handle,
-                          TensorView algo_buffer) {
+                          TensorView B_scale, TensorView workspace_buffer, TensorView algo_buffer) {
   CHECK_CUDA(A);
   CHECK_CUDA(B);
   CHECK_CUDA(D);
@@ -87,8 +118,8 @@ int64_t bmm_fp8_get_algos(TensorView A, TensorView B, TensorView D, TensorView A
         auto k = A.size(2);
         auto n = B.size(2);
 
-        auto lt_handle = reinterpret_cast<cublasLtHandle_t>(cublas_handle);
         ffi::CUDADeviceGuard device_guard(A.device().device_id);
+        auto lt_handle = get_cublaslt_handle(A.device().device_id);
 
         int max_algos = static_cast<int>(algo_buffer.numel() * get_element_size(algo_buffer) /
                                          flashinfer::bmm_fp8::kAlgoBytes);
@@ -105,8 +136,8 @@ int64_t bmm_fp8_get_algos(TensorView A, TensorView B, TensorView D, TensorView A
 }
 
 void bmm_fp8_run_with_algo(TensorView A, TensorView B, TensorView D, TensorView A_scale,
-                           TensorView B_scale, TensorView workspace_buffer, int64_t cublas_handle,
-                           TensorView algo_buffer, int64_t algo_idx) {
+                           TensorView B_scale, TensorView workspace_buffer, TensorView algo_buffer,
+                           int64_t algo_idx) {
   CHECK_CUDA(A);
   CHECK_CUDA(B);
   CHECK_CUDA(D);
@@ -132,9 +163,9 @@ void bmm_fp8_run_with_algo(TensorView A, TensorView B, TensorView D, TensorView 
         auto k = A.size(2);
         auto n = B.size(2);
 
-        auto lt_handle = reinterpret_cast<cublasLtHandle_t>(cublas_handle);
         ffi::CUDADeviceGuard device_guard(A.device().device_id);
         auto stream = get_stream(A.device());
+        auto lt_handle = get_cublaslt_handle(A.device().device_id);
 
         auto status = flashinfer::bmm_fp8::bmm_fp8_run_with_algo<b_type, a_type, d_type>(
             workspace_buffer.data_ptr(),
