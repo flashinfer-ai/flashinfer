@@ -37,17 +37,18 @@ from ..jit import (
 from ..jit.cpp_ext import is_cuda_version_at_least
 from ..utils import (
     device_support_pdl,
+    get_compute_capability,
     get_shuffle_matrix_a_row_indices,
     get_shuffle_matrix_sf_a_row_indices,
     register_custom_op,
     register_fake_op,
-    get_compute_capability,
+    round_up,
 )
 
 
 def _compute_swizzled_layout_sf_size(total_row, total_column, row_size=128):
-    padded_row = (total_row + row_size - 1) // row_size * row_size
-    padded_column = (total_column + 3) // 4 * 4
+    padded_row = round_up(total_row, row_size)
+    padded_column = round_up(total_column, 4)
     return padded_row * padded_column
 
 
@@ -66,8 +67,8 @@ def _pad_scale_factors(
         torch.Tensor: Padded scale factors tensor.
     """
     factor = sf_vec_size * 4
-    padded_row = ((m + 128 - 1) // 128) * 128  # Next multiple of 128
-    padded_col = ((n + factor - 1) // factor) * factor  # Next multiple of 64
+    padded_row = round_up(m, 128)
+    padded_col = round_up(n, factor)
 
     # Pad the input tensor to [padded_row, padded_col // scaling_vector_size]
     pad_rows = padded_row - m
@@ -209,9 +210,13 @@ def get_fp4_quantization_module(backend: str = "100"):
             out_sf_size = _compute_swizzled_layout_sf_size(
                 m, k // sf_vec_size, 8 if is_sf_8x4_layout else 128
             )
+            out_sf_size_padded = out_sf_size
         else:
             out_sf_size = m * k // sf_vec_size
-        out_sf = torch.empty((out_sf_size,), dtype=torch.uint8, device=input.device)
+            out_sf_size_padded = round_up(m, 16) * k // sf_vec_size
+        out_sf = torch.empty(
+            (out_sf_size_padded,), dtype=torch.uint8, device=input.device
+        )
         module.fp4_quantize(
             input,
             global_scale,
@@ -223,7 +228,7 @@ def get_fp4_quantization_module(backend: str = "100"):
             is_sf_8x4_layout,
             enable_pdl,
         )
-        return out_val, out_sf
+        return out_val, out_sf[:out_sf_size]
 
     @register_fake_op("flashinfer::fp4_quantize_sm100")
     def _fake_fp4_quantize_sm100(
@@ -433,9 +438,9 @@ def get_fp4_quantization_module(backend: str = "100"):
         assert k % sf_vec_size == 0, f"k must be multiple of 16, but got {k}."
 
         scale_k = k // sf_vec_size
-        padded_k = (scale_k + (4 - 1)) // 4 * 4
+        padded_k = round_up(scale_k, 4)
         padded_k_int32 = padded_k // 4
-        padded_m = (m + (128 - 1)) // 128 * 128
+        padded_m = round_up(m, 128)
         output = torch.empty(l, m, k // 2, device=device, dtype=torch.uint8)
         output_scales = torch.empty(
             l, padded_m, padded_k_int32, device=device, dtype=torch.int32
@@ -469,9 +474,9 @@ def get_fp4_quantization_module(backend: str = "100"):
         assert k % sf_vec_size == 0, f"k must be multiple of 16, but got {k}."
 
         scale_k = k // sf_vec_size
-        padded_k = (scale_k + (4 - 1)) // 4 * 4
+        padded_k = round_up(scale_k, 4)
         padded_k_int32 = padded_k // 4
-        padded_m = (m + (128 - 1)) // 128 * 128
+        padded_m = round_up(m, 128)
         output = torch.empty(l, m, k // 2, device=device, dtype=torch.uint8)
         output_scales = torch.empty(
             l, padded_m, padded_k_int32, device=device, dtype=torch.int32
@@ -517,9 +522,9 @@ def get_fp4_quantization_module(backend: str = "100"):
         assert k % sf_vec_size == 0, f"k must be multiple of 16, but got {k}."
 
         scale_k = k // sf_vec_size
-        padded_k = (scale_k + (4 - 1)) // 4 * 4
+        padded_k = round_up(scale_k, 4)
         padded_k_int32 = padded_k // 4
-        padded_m = (m + (128 - 1)) // 128 * 128
+        padded_m = round_up(m, 128)
         output = torch.empty(l, m, k // 2, device=device, dtype=torch.uint8)
         output_scales = torch.empty(
             l, padded_m, padded_k_int32, device=device, dtype=torch.int32
@@ -557,9 +562,9 @@ def get_fp4_quantization_module(backend: str = "100"):
         assert k % sf_vec_size == 0, f"k must be multiple of 16, but got {k}."
 
         scale_k = k // sf_vec_size
-        padded_k = (scale_k + (4 - 1)) // 4 * 4
+        padded_k = round_up(scale_k, 4)
         padded_k_int32 = padded_k // 4
-        padded_m = (m + (128 - 1)) // 128 * 128
+        padded_m = round_up(m, 128)
         output = torch.empty(l, m, k // 2, device=device, dtype=torch.uint8)
         output_scales = torch.empty(
             l, padded_m, padded_k_int32, device=device, dtype=torch.int32
