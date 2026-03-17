@@ -333,6 +333,13 @@ struct MoERunnerArgs {
   float* output1_scales_gate_scalar = nullptr;
   float* output2_scales_scalar = nullptr;
 
+  // Per-channel weight scales
+  // Passed to TrtllmGenBatchedGemmRunner as perTokensSfB (which maps to kernel mPtrPerTokenSfA
+  // due to transposeMmaOutput=true)
+  float* gemm1_per_channel_weight_scale = nullptr;       // [2*intermediate_size] for gated acts
+  float* gemm1_per_channel_gate_weight_scale = nullptr;  // [2*intermediate_size] for gated acts
+  float* gemm2_per_channel_weight_scale = nullptr;       // [hidden_size]
+
   // Output:
   void* output = nullptr;
   float* output_scale = nullptr;
