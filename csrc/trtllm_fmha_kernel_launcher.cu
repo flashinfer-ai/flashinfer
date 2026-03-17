@@ -146,7 +146,8 @@ void trtllm_paged_attention_launcher(
   // The sparse MLA parameters.
   runner_params.mSparseMla = sparse_mla_top_k > 0;
   runner_params.mSparseMlaTopK = sparse_mla_top_k;
-  TVM_FFI_ICHECK((head_dim_qk == 576 && head_dim_vo == 512) || sparse_mla_top_k <= 0)
+  TVM_FFI_ICHECK((head_dim_qk == 576 && head_dim_vo == 512) ||
+                 (head_dim_qk == 320 && head_dim_vo == 256) || sparse_mla_top_k <= 0)
       << "Only decode MLA supports sparse MLA";
 
   AlignedAllocator float_allocator(workspace_buffer, workspace_size);
@@ -251,8 +252,10 @@ void trtllm_paged_attention_decode(
   TVM_FFI_ICHECK_EQ(head_dim_k, head_dim_q)
       << "head_dim_k and head_dim_q must be the same, got " << std::to_string(head_dim_k) << " and "
       << std::to_string(head_dim_q);
-  TVM_FFI_ICHECK((head_dim_v == 576 && head_dim_o == 512) || head_dim_v == head_dim_o)
-      << "head_dim_v and head_dim_o must be the same for non-MLA attention, got "
+  TVM_FFI_ICHECK((head_dim_v == 576 && head_dim_o == 512) ||
+                 (head_dim_v == 320 && head_dim_o == 256) || head_dim_v == head_dim_o)
+      << "head_dim_v and head_dim_o must be the same for non-MLA attention, or equal to (576, 512) "
+         "or (320, 256) for MLA attention, got "
       << std::to_string(head_dim_v) << " and " << std::to_string(head_dim_o);
   int max_num_blocks_per_seq = block_tables.size(-1);
   bool is_shared_kv = key_cache.data_ptr() == value_cache.data_ptr();
@@ -299,9 +302,10 @@ void trtllm_paged_attention_decode(
                               ? static_cast<float*>(maybe_bmm2_scale_tensor.value().data_ptr())
                               : nullptr;
 
-  bool const skips_softmax = skip_softmax_threshold_scale_factor.has_value();
+  // If threshold is zero we can fall back to standard attention to reduce overheads.
   float const skip_softmax_threshold_scale_factor_value =
       skip_softmax_threshold_scale_factor.value_or(0.0f);
+  bool const skips_softmax = skip_softmax_threshold_scale_factor_value != 0.0f;
 
   trtllm_paged_attention_launcher(
       out.data_ptr(), output_sf_ptr, query.data_ptr(), key_cache.data_ptr(), value_cache.data_ptr(),
@@ -388,9 +392,10 @@ void trtllm_paged_attention_context(
                               ? static_cast<float*>(maybe_bmm2_scale_tensor.value().data_ptr())
                               : nullptr;
 
-  bool const skips_softmax = skip_softmax_threshold_scale_factor.has_value();
+  // If threshold is zero we can fall back to standard attention to reduce overheads.
   float const skip_softmax_threshold_scale_factor_value =
       skip_softmax_threshold_scale_factor.value_or(0.0f);
+  bool const skips_softmax = skip_softmax_threshold_scale_factor_value != 0.0f;
 
   trtllm_paged_attention_launcher(
       out.data_ptr(), output_sf_ptr, query.data_ptr(), key_cache.data_ptr(), value_cache.data_ptr(),
@@ -417,7 +422,8 @@ void trtllm_ragged_attention_launcher(
     int64_t batch_size, int64_t window_left, int64_t sm_count, bool enable_pdl, bool is_causal,
     int64_t k_stride_keys_values, int64_t k_stride_heads, int64_t k_stride_batch,
     int64_t v_stride_keys_values, int64_t v_stride_heads, int64_t v_stride_batch,
-    int64_t workspace_size, cudaStream_t stream) {
+    float skip_softmax_threshold_scale_factor, bool skips_softmax, int64_t workspace_size,
+    cudaStream_t stream) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads must be a multiple of num_kv_heads, got num_kv_heads: " << num_kv_heads
@@ -489,6 +495,9 @@ void trtllm_ragged_attention_launcher(
   runner_params.multiCtasKvScratchPtr =
       float_allocator.aligned_alloc<void>(0, 16, "trtllm_gen_scratch_workspace");
 
+  runner_params.mSkipsSoftmaxWhenPossible = skips_softmax;
+  runner_params.mSkipSoftmaxThresholdScaleFactor = skip_softmax_threshold_scale_factor;
+
   auto [foundKernels, kinfo] = fmha_runner->isSupportedWithInfo(runner_params);
   if (!foundKernels) {
     std::ostringstream err_msg;
@@ -506,7 +515,9 @@ void trtllm_ragged_attention(TensorView out, TensorView query, TensorView key, T
                              int64_t batch_size, int64_t window_left, TensorView cum_seq_lens_q,
                              TensorView cum_seq_lens_kv, int64_t sm_count, bool enable_pdl,
                              bool is_causal, int64_t workspace_size,
-                             Optional<TensorView> attention_sinks, Optional<TensorView> lse) {
+                             Optional<TensorView> attention_sinks,
+                             Optional<float> skip_softmax_threshold_scale_factor,
+                             Optional<TensorView> lse) {
   float* attention_sinks_ptr = nullptr;
   if (attention_sinks.has_value()) {
     TVM_FFI_ICHECK_EQ(attention_sinks.value().dtype(), dl_float32)
@@ -559,6 +570,12 @@ void trtllm_ragged_attention(TensorView out, TensorView query, TensorView key, T
   float* bmm2_scale_ptr = maybe_bmm2_scale_tensor.has_value()
                               ? static_cast<float*>(maybe_bmm2_scale_tensor.value().data_ptr())
                               : nullptr;
+
+  // If threshold is zero we can fall back to standard attention to reduce overheads.
+  float const skip_softmax_threshold_scale_factor_value =
+      skip_softmax_threshold_scale_factor.value_or(0.0f);
+  bool const skips_softmax = skip_softmax_threshold_scale_factor_value != 0.0f;
+
   trtllm_ragged_attention_launcher(
       out.data_ptr(), query.data_ptr(), key.data_ptr(), value.data_ptr(),
       workspace_buffer.data_ptr(), static_cast<int*>(seq_lens.data_ptr()),
@@ -567,7 +584,8 @@ void trtllm_ragged_attention(TensorView out, TensorView query, TensorView key, T
       num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, sum_seq_q, sum_seq_kv, bmm1_scale_value,
       bmm2_scale_value, bmm1_scale_log2_ptr, bmm2_scale_ptr, o_sf_scale, batch_size, window_left,
       sm_count, enable_pdl, is_causal, k_stride_keys_values, k_stride_heads, k_stride_batch,
-      v_stride_keys_values, v_stride_heads, v_stride_batch, workspace_size, stream);
+      v_stride_keys_values, v_stride_heads, v_stride_batch,
+      skip_softmax_threshold_scale_factor_value, skips_softmax, workspace_size, stream);
 }
 
 namespace trtllm_cubin_loader {

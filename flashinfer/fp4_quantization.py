@@ -28,6 +28,7 @@ from .jit import (
     gen_jit_spec,
     sm121a_nvcc_flags,
     sm120a_nvcc_flags,
+    sm120f_nvcc_flags,
     sm110a_nvcc_flags,
     sm103a_nvcc_flags,
     sm100a_nvcc_flags,
@@ -36,17 +37,18 @@ from .jit import (
 from .jit.cpp_ext import is_cuda_version_at_least
 from .utils import (
     device_support_pdl,
+    get_compute_capability,
     get_shuffle_matrix_a_row_indices,
     get_shuffle_matrix_sf_a_row_indices,
     register_custom_op,
     register_fake_op,
-    get_compute_capability,
+    round_up,
 )
 
 
 def _compute_swizzled_layout_sf_size(total_row, total_column, row_size=128):
-    padded_row = (total_row + row_size - 1) // row_size * row_size
-    padded_column = (total_column + 3) // 4 * 4
+    padded_row = round_up(total_row, row_size)
+    padded_column = round_up(total_column, 4)
     return padded_row * padded_column
 
 
@@ -65,8 +67,8 @@ def _pad_scale_factors(
         torch.Tensor: Padded scale factors tensor.
     """
     factor = sf_vec_size * 4
-    padded_row = ((m + 128 - 1) // 128) * 128  # Next multiple of 128
-    padded_col = ((n + factor - 1) // factor) * factor  # Next multiple of 64
+    padded_row = round_up(m, 128)
+    padded_col = round_up(n, factor)
 
     # Pad the input tensor to [padded_row, padded_col // scaling_vector_size]
     pad_rows = padded_row - m
@@ -97,6 +99,10 @@ def gen_fp4_quantization_sm110_module() -> JitSpec:
 
 def gen_fp4_quantization_sm120_module() -> JitSpec:
     return gen_fp4_quantization_module(sm120a_nvcc_flags, "120")
+
+
+def gen_fp4_quantization_sm120f_module() -> JitSpec:
+    return gen_fp4_quantization_module(sm120f_nvcc_flags, "120f")
 
 
 def gen_fp4_quantization_sm121_module() -> JitSpec:
@@ -138,12 +144,23 @@ def gen_fp4_quantization_module(nvcc_flags: List[str], device_arch: str) -> JitS
 def get_fp4_quantization_module(backend: str = "100"):
     backend_modules = {
         "121": gen_fp4_quantization_sm121_module,
+        "120f": gen_fp4_quantization_sm120f_module,
         "120": gen_fp4_quantization_sm120_module,
         "110": gen_fp4_quantization_sm110_module,
         "103": gen_fp4_quantization_sm103_module,
         "100": gen_fp4_quantization_sm100_module,
         "90": gen_fp4_quantization_sm90_module,
     }
+
+    # Prefer 'f' (family / feature-set) variant for SM12x when CUDA >= 12.9,
+    # as it enables native FP4 conversion instructions (cvt.rn.satfinite.e2m1x2.f32).
+    # sm_120f covers the entire SM12x family (both SM120 and SM121).
+    # See: https://developer.nvidia.com/blog/nvidia-blackwell-and-nvidia-cuda-12-9-introduce-family-specific-architecture-features/
+    if backend in ("120", "121"):
+        from .utils import version_at_least
+
+        if version_at_least(torch.version.cuda, "12.9"):
+            backend = "120f"
 
     if backend not in backend_modules:
         raise ValueError(f"Invalid backend: {backend}")
@@ -193,9 +210,13 @@ def get_fp4_quantization_module(backend: str = "100"):
             out_sf_size = _compute_swizzled_layout_sf_size(
                 m, k // sf_vec_size, 8 if is_sf_8x4_layout else 128
             )
+            out_sf_size_padded = out_sf_size
         else:
             out_sf_size = m * k // sf_vec_size
-        out_sf = torch.empty((out_sf_size,), dtype=torch.uint8, device=input.device)
+            out_sf_size_padded = round_up(m, 16) * k // sf_vec_size
+        out_sf = torch.empty(
+            (out_sf_size_padded,), dtype=torch.uint8, device=input.device
+        )
         module.fp4_quantize(
             input,
             global_scale,
@@ -207,7 +228,7 @@ def get_fp4_quantization_module(backend: str = "100"):
             is_sf_8x4_layout,
             enable_pdl,
         )
-        return out_val, out_sf
+        return out_val, out_sf[:out_sf_size]
 
     @register_fake_op("flashinfer::fp4_quantize_sm100")
     def _fake_fp4_quantize_sm100(
@@ -417,9 +438,9 @@ def get_fp4_quantization_module(backend: str = "100"):
         assert k % sf_vec_size == 0, f"k must be multiple of 16, but got {k}."
 
         scale_k = k // sf_vec_size
-        padded_k = (scale_k + (4 - 1)) // 4 * 4
+        padded_k = round_up(scale_k, 4)
         padded_k_int32 = padded_k // 4
-        padded_m = (m + (128 - 1)) // 128 * 128
+        padded_m = round_up(m, 128)
         output = torch.empty(l, m, k // 2, device=device, dtype=torch.uint8)
         output_scales = torch.empty(
             l, padded_m, padded_k_int32, device=device, dtype=torch.int32
@@ -453,9 +474,9 @@ def get_fp4_quantization_module(backend: str = "100"):
         assert k % sf_vec_size == 0, f"k must be multiple of 16, but got {k}."
 
         scale_k = k // sf_vec_size
-        padded_k = (scale_k + (4 - 1)) // 4 * 4
+        padded_k = round_up(scale_k, 4)
         padded_k_int32 = padded_k // 4
-        padded_m = (m + (128 - 1)) // 128 * 128
+        padded_m = round_up(m, 128)
         output = torch.empty(l, m, k // 2, device=device, dtype=torch.uint8)
         output_scales = torch.empty(
             l, padded_m, padded_k_int32, device=device, dtype=torch.int32
@@ -501,9 +522,9 @@ def get_fp4_quantization_module(backend: str = "100"):
         assert k % sf_vec_size == 0, f"k must be multiple of 16, but got {k}."
 
         scale_k = k // sf_vec_size
-        padded_k = (scale_k + (4 - 1)) // 4 * 4
+        padded_k = round_up(scale_k, 4)
         padded_k_int32 = padded_k // 4
-        padded_m = (m + (128 - 1)) // 128 * 128
+        padded_m = round_up(m, 128)
         output = torch.empty(l, m, k // 2, device=device, dtype=torch.uint8)
         output_scales = torch.empty(
             l, padded_m, padded_k_int32, device=device, dtype=torch.int32
@@ -541,9 +562,9 @@ def get_fp4_quantization_module(backend: str = "100"):
         assert k % sf_vec_size == 0, f"k must be multiple of 16, but got {k}."
 
         scale_k = k // sf_vec_size
-        padded_k = (scale_k + (4 - 1)) // 4 * 4
+        padded_k = round_up(scale_k, 4)
         padded_k_int32 = padded_k // 4
-        padded_m = (m + (128 - 1)) // 128 * 128
+        padded_m = round_up(m, 128)
         output = torch.empty(l, m, k // 2, device=device, dtype=torch.uint8)
         output_scales = torch.empty(
             l, padded_m, padded_k_int32, device=device, dtype=torch.int32
@@ -865,7 +886,7 @@ def nvfp4_quantize(
             a_global_sf.cuda(),
             sf_vec_size,
             sf_use_ue8m0=False,
-            is_sf_swizzled_layout=True,
+            is_sf_swizzled_layout=sfLayout != SfLayout.layout_linear,
             is_sf_8x4_layout=sfLayout == SfLayout.layout_8x4,
             enable_pdl=enable_pdl,
         )

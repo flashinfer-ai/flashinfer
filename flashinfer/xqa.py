@@ -74,6 +74,8 @@ def get_xqa_module(
         sinks: Optional[torch.Tensor],
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
+        k_sf_cache: Optional[torch.Tensor],
+        v_sf_cache: Optional[torch.Tensor],
         page_table: torch.Tensor,
         max_seq_len: int,
         seq_lens: torch.Tensor,
@@ -98,6 +100,8 @@ def get_xqa_module(
             sinks,
             k_cache,
             v_cache,
+            k_sf_cache,
+            v_sf_cache,
             page_table,
             max_seq_len,
             seq_lens,
@@ -126,6 +130,8 @@ def get_xqa_module(
         sinks: Optional[torch.Tensor],
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
+        k_sf_cache: Optional[torch.Tensor],
+        v_sf_cache: Optional[torch.Tensor],
         page_table: torch.Tensor,
         max_seq_len: int,
         seq_lens: torch.Tensor,
@@ -149,6 +155,8 @@ def xqa(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
+    k_sf_cache: Optional[torch.Tensor],
+    v_sf_cache: Optional[torch.Tensor],
     page_table: torch.Tensor,
     seq_lens: torch.Tensor,
     output: torch.Tensor,
@@ -179,12 +187,18 @@ def xqa(
         Paged K cache tensor with shape ``[num_pages, page_size, num_kv_heads, head_dim]`` if :attr:`kv_layout` is ``NHD``,
         or ``[num_pages, num_kv_heads, page_size, head_dim]`` if :attr:`kv_layout` is ``HND``.
         Data type should match query tensor or be torch.float8_e4m3fn, in which case xqa will run fp8 calculation.
-        Should be the same data type as v_cache.
+        Should be the same data type as v_cache. When using NVFP4 KV, the data type is torch.uint8, and the last dimension should be `head_dim / 2`.
     v_cache: torch.Tensor
         Paged V cache tensor with shape ``[num_pages, page_size, num_kv_heads, head_dim]`` if :attr:`kv_layout` is ``NHD``,
         or ``[num_pages, num_kv_heads, page_size, head_dim]`` if :attr:`kv_layout` is ``HND``.
         Data type should match query tensor or be torch.float8_e4m3fn, in which case xqa will run fp8 calculation.
-        Should be the same data type as k_cache.
+        Should be the same data type as k_cache. When using NVFP4 KV, the data type is torch.uint8, and the last dimension should be `head_dim / 2`.
+    k_sf_cache: Optional[torch.Tensor]
+        Optional scale factor cache tensor for the K cache. Use when NVFP4 KV is used. Expected shape is ``[num_pages, page_size, num_kv_heads, head_dim / 16]`` if :attr:`kv_layout` is ``NHD``,
+        or ``[num_pages, num_kv_heads, page_size, head_dim / 16]`` if :attr:`kv_layout` is ``HND``. Should be the same data type as v_sf_cache. Data type should be torch.uint8.
+    v_sf_cache: Optional[torch.Tensor]
+        Optional scale factor cache tensor for the V cache. Use when NVFP4 KV is used. Expected shape is ``[num_pages, page_size, num_kv_heads, head_dim / 16]`` if :attr:`kv_layout` is ``NHD``,
+        or ``[num_pages, num_kv_heads, page_size, head_dim / 16]`` if :attr:`kv_layout` is ``HND``. Should be the same data type as k_sf_cache. Data type should be torch.uint8.
     page_table : torch.Tensor
         Page table tensor with shape ``batch_size, nb_pages_per_seq``.
         Data type should be torch.int32.
@@ -279,7 +293,10 @@ def xqa(
         # For HND: [..., H, N, D] -> NHD: [..., N, H, D]
         k_cache = k_cache.transpose(-3, -2)
         v_cache = v_cache.transpose(-3, -2)
-
+        if k_sf_cache is not None:
+            k_sf_cache = k_sf_cache.transpose(-3, -2)
+        if v_sf_cache is not None:
+            v_sf_cache = v_sf_cache.transpose(-3, -2)
     if (
         k_cache.dtype == torch.float8_e4m3fn
         and get_compute_capability(torch.device(device="cuda"))[0] == 9
@@ -288,8 +305,15 @@ def xqa(
     else:
         run_sm90_fp8_mha = False
 
+    if k_cache.dtype == torch.uint8:
+        assert get_compute_capability(torch.device(device="cuda"))[0] in [12], (
+            "XQA NVFP4 KV is only supported on SM120 GPUs"
+        )
+        assert k_sf_cache is not None, "K SF cache is required when NVFP4 KV is used"
+        assert v_sf_cache is not None, "V SF cache is required when NVFP4 KV is used"
+
     if get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12]:
-        raise RuntimeError("XQA is only supported on SM90, SM100, SM120 GPUs")
+        raise RuntimeError("XQA is only supported on SM90, SM100, SM120/SM121 GPUs")
 
     xqa_module = get_xqa_module(
         q.dtype,
@@ -319,6 +343,8 @@ def xqa(
         sinks,
         k_cache,
         v_cache,
+        k_sf_cache,
+        v_sf_cache,
         page_table,
         max_seq_len,
         seq_lens,
@@ -490,9 +516,15 @@ def xqa_mla(
     # Infer parameters from tensors
     batch_size = q.shape[0]
     head_dim = q.shape[-1]
+    num_q_heads = q.shape[-2]
 
-    # Calculate head_group_ratio
-    head_group_ratio = 128
+    # Calculate head_group_ratio (MLA has 1 KV head, so ratio = num_q_heads)
+    head_group_ratio = num_q_heads
+    if head_group_ratio != 128:
+        raise ValueError(
+            f"XQA MLA only supports 128 query heads (head_group_ratio=128), "
+            f"got {num_q_heads} query heads"
+        )
 
     # Calculate max_seq_len from page_table and page_size
     num_pages_per_seq = page_table.shape[-1]
@@ -501,7 +533,7 @@ def xqa_mla(
     assert k_cache.dtype == v_cache.dtype, "K and V cache must have the same dtype"
 
     if get_compute_capability(torch.device(device="cuda"))[0] not in [12]:
-        raise RuntimeError("XQA MLA is only supported on SM120 GPUs")
+        raise RuntimeError("XQA MLA is only supported on SM120/SM121 GPUs")
 
     xqa_module = get_xqa_module_mla(
         q.dtype,

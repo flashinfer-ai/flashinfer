@@ -38,11 +38,15 @@ void selective_state_update(
     bool dt_softplus,
     Optional<TensorView> state_batch_indices,  // (batch,)
     int64_t pad_slot_id,
-    TensorView output,  // same as x
+    Optional<TensorView> state_scale,  // float32: (state_cache_size, nheads, dim)
+    TensorView output,                 // same as x
     bool disable_state_update,
     Optional<TensorView> intermediate_states_buffer,  // (batch, cache_steps, nheads, dim, dstate)
     Optional<TensorView> intermediate_state_indices,  // (batch,)
-    int64_t cache_steps);
+    Optional<TensorView> intermediate_state_scales,   // float32: (batch, cache_steps, nheads, dim)
+    Optional<TensorView> rand_seed,  // device-side int64 tensor for Philox rounding
+    int64_t cache_steps,
+    int64_t algorithm);  // SSUAlgorithm: 0=auto, 1=simple, 2=vertical, 3=horizontal
 
 }  // namespace flashinfer::mamba
 

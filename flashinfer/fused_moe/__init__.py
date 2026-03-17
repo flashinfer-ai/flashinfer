@@ -16,6 +16,7 @@ limitations under the License.
 
 from .core import (
     ActivationType,
+    Fp8QuantizationType,
     RoutingMethodType,
     WeightLayout,
     convert_to_block_layout,
@@ -32,6 +33,7 @@ from .core import (
     trtllm_fp8_block_scale_routed_moe,
     trtllm_fp8_per_tensor_scale_moe,
     trtllm_bf16_moe,
+    trtllm_bf16_routed_moe,
     trtllm_mxint4_block_scale_moe,
 )
 
@@ -52,6 +54,7 @@ except ImportError:
 
 __all__ = [
     "ActivationType",
+    "Fp8QuantizationType",
     "RoutingMethodType",
     "WeightLayout",
     "convert_to_block_layout",
@@ -63,6 +66,7 @@ __all__ = [
     "gen_trtllm_gen_fused_moe_sm100_module",
     "reorder_rows_for_gated_act_gemm",
     "trtllm_bf16_moe",
+    "trtllm_bf16_routed_moe",
     "trtllm_fp4_block_scale_moe",
     "trtllm_fp4_block_scale_routed_moe",
     "trtllm_fp8_block_scale_moe",

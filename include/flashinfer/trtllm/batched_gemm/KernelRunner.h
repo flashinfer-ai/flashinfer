@@ -21,8 +21,8 @@
 #include <cstdint>
 #include <vector>
 
-#include "trtllmGen_bmm_export/Enums.h"
-#include "trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
+#include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/Enums.h"
+#include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
 
 namespace tensorrt_llm {
 namespace kernels {

@@ -5,14 +5,15 @@ The aim of `flashinfer_benchmark.py` is to provide a single framework for benchm
 ## Overview
 
 This framework provides tools to:
-- Benchmark FlashInfer's Attention, GEMM, MOE, Norm, Quantization, Sampling, and RoPE API performance from different kernel backends such as FlashAttention2/3, cuDNN, cuBLAS, CUTLASS, CuTe-DSL, and TensorRT-LLM
+- Benchmark FlashInfer's Attention, GEMM, MOE, Norm, Quantization, Sampling, RoPE, and Mamba API performance from different kernel backends such as FlashAttention2/3, cuDNN, cuBLAS, CUTLASS, CuTe-DSL, TensorRT-LLM, and Triton
 - Compare performance across different configurations
 - Batch performance test multiple test cases
 
-Currently supports testing attention, gemm, fused MOE, normalization, quantization, sampling, and RoPE APIs:
+Currently supports testing attention, gemm, fused MOE, normalization, quantization, sampling, RoPE, and Mamba APIs:
 - Attention:
     - `BatchDecodeWithPagedKVCacheWrapper` - Decode attention with paged KV cache.
         - Also supports computationally similar `cudnn_batch_decode_with_kv_cache` and `trtllm_batch_decode_with_kv_cache`.
+        - Speculative decode is supported by setting `--s_qo > 1` (subject to backend limitations noted below).
     - `BatchPrefillWithPagedKVCacheWrapper` - Prefill attention with paged KV cache.
         - Also supports computationally similar `cudnn_batch_prefill_with_kv_cache` and  `trtllm_batch_context_with_kv_cache`.
     - `BatchPrefillWithRaggedKVCacheWrapper` - Prefill attention with ragged KV cache.
@@ -24,6 +25,8 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
     - `group_gemm_fp8_nt_groupwise` - Group GEMM with FP8 data types using groupwise scaling.
     - `bmm_fp8` - Batched matrix multiplication with FP8 inputs.
     - `mm_fp4` - Matrix multiplication with NVFP4 inputs.
+    - `mm_bf16` - Matrix multiplication with BF16 inputs (Blackwell SM10.0+).
+    - `bmm_bf16` - Batched matrix multiplication with BF16 inputs (Blackwell SM10.0+).
 - MOE:
     - `trtllm_fp4_block_scale_moe` - MOE with FP4 quantized weights and block-wise scaling.
     - `trtllm_fp8_block_scale_moe` - MOE with FP8 quantized weights and block-wise scaling.
@@ -31,6 +34,8 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
     - `cutlass_fused_moe` - CUTLASS fused MoE (base/fp8/nvfp4 variants with optional TP/EP)
 - MOE Communication:
     - `moe_a2a_dispatch_combine` - MoE All-to-All dispatch + combine benchmark for multi-GPU expert-parallel inference. Requires `mpirun` for multi-GPU execution. Supports optional quantization (FP8, NVFP4, FP8 block-scale) and real MoE kernel computation.
+- AllReduce Communication:
+    - `allreduce_fusion` - AllReduce fusion benchmark for multi-GPU inference. Requires `mpirun` for multi-GPU execution. Supports TRTLLM and TRTLLM MNNVL backends with multiple fusion patterns (plain allreduce, allreduce + residual + RMSNorm).
 - Norm:
     - `rmsnorm` - Root Mean Square Layer Normalization.
     - `rmsnorm_quant` - RMSNorm with FP8 quantized output.
@@ -67,6 +72,8 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
     - `mla_rope_quantize_fp8` - MLA RoPE with FP8 quantization (SM8.9+).
     - `rope_quantize_fp8` - RoPE with FP8 quantization (SM8.9+).
     - `rope_quantize_fp8_append_paged_kv_cache` - RoPE with FP8 quantization and paged KV cache append (SM8.9+).
+- Mamba (Selective State Space Models):
+    - `selective_state_update` - Selective state update for Mamba layers (generation phase). Supports both single-token prediction (STP) and multi-token prediction (MTP) via `--cache_steps`. Backends: `flashinfer` (CUDA, architecture-specific kernels for base/SM90/SM100+) and `triton` (reference).
 
 ## Quick Start
 ### Single Test Run
@@ -184,14 +191,14 @@ The output CSV will contain detailed metrics including:
 | `--verbose`, `-v`        | Print additional information (can be used multiple times for more verbosity, e.g. `-vv`)                   |
 | `--case_tag`              | Optional tag for the test case, useful for annotating or filtering results in the output CSV.              |
 | `--generate_repro_command`| If set, prints a reproducer command for the test case and stores it in the output CSV.                     |
-| `--backends`             | Space-separated list of backends to test, e.g. fa2, fa2_tc, fa3, cudnn, cudnn-native, cutlass, trtllm, trtllm-gen, trtllm-native, cublas|
+| `--backends`             | Space-separated list of backends to test, e.g. fa2, fa2_tc, fa3, auto, cudnn, cudnn-native, cutlass, trtllm, trtllm-gen, trtllm-native, cublas. (`auto` currently supported for `BatchDecodeWithPagedKVCacheWrapper` and `BatchPrefillWithPagedKVCacheWrapper`.)|
 
 ### Attention Flags
 | Flag                     | Description                                                                                                 |
 |--------------------------|-------------------------------------------------------------------------------------------------------------|
 | `--page_size`            | Page size for paged attention. Required for paged attention tests.                                          |
 | `--batch_size`           | Number of sequences to process in parallel                                                                  |
-| `--s_qo`                 | Query/output sequence length. Should be 1 for decode tests.                                                 |
+| `--s_qo`                 | Query/output sequence length. For decode, `1` is standard decode and `>1` enables speculative decode on supported backends. |
 | `--s_kv`                 | Key/value sequence length (context length)                                                                  |
 | `--num_qo_heads`         | Number of query/output attention heads                                                                      |
 | `--num_kv_heads`         | Number of key/value attention heads                                                                         |
@@ -199,8 +206,9 @@ The output CSV will contain detailed metrics including:
 | `--head_dim_vo`          | Head dimension for V/O. Usually equals head_dim_qk.                                                        |
 | `--head_dim_ckv`         | Head dimension for C/K/V (MLA attention).                                                                  |
 | `--head_dim_kpe`         | Head dimension for KPE (MLA attention).                                                                    |
-| `--q_dtype`              | Data type for the query tensor. Default: bfloat16. Currently only bfloat16 is supported.                   |
-| `--kv_dtype`             | Data type for the key and value tensors. Default: bfloat16. Currently only bfloat16 is supported.          |
+| `--q_dtype`              | Data type for the query tensor. Default: bfloat16. Supports bfloat16, fp8_e4m3, fp8_e5m2.                  |
+| `--kv_dtype`             | Data type for the key and value tensors. Default: bfloat16. Supports bfloat16, fp8_e4m3, fp8_e5m2.         |
+| `--out_dtype`            | Data type for the output tensor. Default: same as q_dtype. Supports bfloat16, float16. Required when q_dtype is FP8. |
 | `--causal`               | Use causal attention masking (prefill only)                                                                |
 | `--random_actual_seq_len`| Use random sequence lengths up to max length. If False, use max length.                                    |
 
@@ -219,7 +227,8 @@ The output CSV will contain detailed metrics including:
 | `--mat2_dtype`           | Data type for second matrix (for FP8 GEMM, e.g. `fp8_e4m3`)                                                |
 | `--use_128x4_sf_layout`  | Use 128x4 scale/format layout for FP4 GEMM (for `mm_fp4` routine)                                          |
 | `--use_nvfp4`            | Whether to use nvfp4 quantization or mxfp4 quantization, defaults to False.(for `mm_fp4` routine)          |
-| `--autotune`             | Enable autotune for supported operation (`trtllm` and `cutlass` backends for `mm_fp4` and `bmm_fp8` routines)|
+| `--autotune`             | Enable autotune for supported operation (`mm_fp4`, `bmm_fp8`, `mm_bf16`, `bmm_bf16` routines)              |
+| `--bias`                 | Use bias for `mm_bf16` (Enabled for TGV backend)                                                           |
 
 ### MOE Flags
 | Flag                     | Description                                                                                                 |
@@ -309,6 +318,44 @@ mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
     --validate --per_phase_timing
 ```
 
+### AllReduce Communication Flags (allreduce_fusion)
+The `allreduce_fusion` routine benchmarks AllReduce fusion operations for multi-GPU inference. It must be launched with `mpirun`. Both oneshot and twoshot strategies are benchmarked automatically and reported side by side.
+
+| Flag                     | Description                                                                                                 |
+|--------------------------|-------------------------------------------------------------------------------------------------------------|
+| `--num_tokens`           | Number of tokens (rows) in the input tensor. Default: 64                                                   |
+| `--hidden_size`          | Hidden dimension size. Default: 4096                                                                       |
+| `--input_dtype`          | Data type for input tensors: `bfloat16` (default) or `float16`                                             |
+| `--ar_backend`           | AllReduce backend: `auto` (default), `trtllm`, or `mnnvl`. `auto` uses heuristic                          |
+| `--pattern`              | Fusion pattern: `allreduce` (default) or `ar_residual_rmsnorm` (AllReduce + Residual + RMSNorm)            |
+| `--validate`             | Run correctness validation before benchmarking                                                             |
+
+**Launch Examples:**
+```bash
+# Basic allreduce with auto backend
+mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
+    --routine allreduce_fusion \
+    --num_tokens 64 --hidden_size 4096
+
+# With specific backend
+mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
+    --routine allreduce_fusion \
+    --num_tokens 64 --hidden_size 4096 \
+    --ar_backend mnnvl
+
+# AllReduce + Residual + RMSNorm fusion
+mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
+    --routine allreduce_fusion \
+    --num_tokens 64 --hidden_size 4096 \
+    --pattern ar_residual_rmsnorm
+
+# With validation
+mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
+    --routine allreduce_fusion \
+    --num_tokens 64 --hidden_size 4096 \
+    --validate
+```
+
 ### Norm Flags
 | Flag                     | Description                                                                                                 |
 |--------------------------|-------------------------------------------------------------------------------------------------------------|
@@ -379,6 +426,22 @@ mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
 | `--old_context_len`      | Old context length for Llama 3.1 RoPE. Default: 8192                                                       |
 | `--backends`             | Backend to test: `cuda` (default)                                                                          |
 
+### Mamba Flags
+| Flag                     | Description                                                                                                 |
+|--------------------------|-------------------------------------------------------------------------------------------------------------|
+| `--batch_size`           | Batch size (number of sequences)                                                                           |
+| `--nheads`               | Number of SSM heads                                                                                        |
+| `--dim`                  | Head dimension (headdim)                                                                                   |
+| `--dstate`               | SSM state size                                                                                             |
+| `--ngroups`              | Number of groups for B and C matrices. `nheads` must be divisible by `ngroups`, and `nheads/ngroups` must be 1, 8, or 16. Default: 8 |
+| `--cache_steps`          | Number of steps/tokens for multi-token prediction (MTP). 0 = single-token prediction (STP). Default: 0    |
+| `--input_dtype`          | Data type for input tensors (x, B, C, z): `bfloat16` (default). Only `bfloat16` is supported.             |
+| `--state_dtype`          | Data type for the SSM state cache: `bfloat16` (default), `float16`, or `float32`                           |
+| `--weight_dtype`         | Data type for weight tensors (dt, D, dt_bias): `float32` (default) or `bfloat16`                           |
+| `--has_z`                | Include z tensor for gating (`z * sigmoid(z)` applied to output)                                           |
+| `--dt_softplus`          | Apply softplus to dt before use                                                                            |
+| `--backends`             | Backends to test: `flashinfer` (default), `triton` (reference). Refcheck compares against Triton reference |
+
 ## `flashinfer_benchmark.py` Routine & Backend Support Matrix
 The following table summarizes the support surface of each routine & backend's on various [CUDA Compute Capabilities](https://developer.nvidia.com/cuda-gpus).
 
@@ -406,11 +469,14 @@ Legend:
 | **group_gemm_fp8_nt_groupwise** |  |  |  |  |  | cutlass | cutlass |  |
 | **bmm_fp8** |  |  |  | cudnn, cublas | cudnn, cublas | cudnn, cublas, cutlass | cudnn, cublas, cutlass | cudnn, cublas |
 | **mm_fp4** |  |  |  |  |  | cudnn, trtllm, cutlass | cudnn, trtllm, cutlass | cudnn |
+| **mm_bf16** |  |  |  |  |  | cudnn, cutlass, tgv | cudnn, cutlass, tgv |  |
+| **bmm_bf16** |  |  |  |  |  | cudnn, cutlass | cudnn, cutlass |  |
 | **trtllm_fp4_block_scale_moe** |  |  |  |  |  | trtllm | trtllm |  |
 | **trtllm_fp8_block_scale_moe** |  |  |  |  |  | trtllm | trtllm |  |
 | **trtllm_fp8_per_tensor_scale_moe** |  |  |  |  |  | trtllm | trtllm |  |
 | **cutlass_fused_moe** |  |  |  |  |  | cutlass | cutlass |  |
 | **moe_a2a_dispatch_combine** |  |  |  |  |  | moe_a2a | moe_a2a |  |
+| **allreduce_fusion** |  |  |  |  |  | allreduce | allreduce |  |
 | **rmsnorm** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
 | **rmsnorm_quant** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
 | **fused_add_rmsnorm_quant** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
@@ -443,6 +509,7 @@ Legend:
 | **mla_rope_quantize_fp8** |  |  |  | cuda | cuda | cuda | cuda | cuda |
 | **rope_quantize_fp8** |  |  |  | cuda | cuda | cuda | cuda | cuda |
 | **rope_quantize_fp8_append_paged_kv_cache** |  |  |  | cuda | cuda | cuda | cuda | cuda |
+| **selective_state_update** | flashinfer, triton | flashinfer, triton | flashinfer, triton | flashinfer, triton | flashinfer, triton | flashinfer, triton | flashinfer, triton | flashinfer, triton |
 
 Backend Legend:
 - fa2: FlashAttention2
@@ -452,9 +519,12 @@ Backend Legend:
 - cudnn: cuDNN (via wrapper API)
 - cudnn-native: cuDNN (direct API call)
 - cutlass: CUTLASS
+- tgv: TGV
 - trtllm: TensorRT-LLM
 - trtllm-gen: TensorRT-LLM
 - trtllm-native: TensorRT-LLM (out-of-wrapper)
 - cuda: FlashInfer CUDA kernels
 - cute-dsl: FlashInfer CuTe-DSL kernels (Blackwell SM10.0+)
 - moe_a2a: MoE All-to-All communication (requires mpirun, Blackwell SM10.0+ with MNNVL)
+- allreduce: AllReduce fusion communication (requires mpirun, Blackwell SM10.0+ with MNNVL)
+- triton: Triton reference kernels (used for Mamba selective_state_update)

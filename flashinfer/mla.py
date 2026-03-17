@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from dataclasses import dataclass
 import functools
 from typing import List, Literal, Optional, Tuple, Union, overload
 
@@ -63,16 +64,77 @@ def _check_cutlass_shape(q_nope_pe, ckv_kpe_cache, kv_len, page_table):
         )
 
 
+@dataclass(frozen=True)
+class MLAHeadDimensions:
+    """
+    The dimensions of a single MLA head.
+
+    Args:
+        qk_nope_head_dim (int): The number of input channels without positional information in non-absorb mode.
+        qk_rope_head_dim (int): The number of channels carrying positional information for both absorb and non-absorb modes.
+        v_head_dim (int): The number of value channels, which is also the output head dimension in non-absorb mode.
+        kv_lora_rank (int): The dimension of the compressed key-value representation across heads.
+    """
+
+    qk_nope_head_dim: int
+    qk_rope_head_dim: int
+    v_head_dim: int
+    kv_lora_rank: int
+
+
+deepseek_mla_dimensions = MLAHeadDimensions(
+    qk_nope_head_dim=128,
+    qk_rope_head_dim=64,
+    v_head_dim=128,
+    kv_lora_rank=512,
+)
+
+smaller_mla_dimensions = MLAHeadDimensions(
+    qk_nope_head_dim=64,
+    qk_rope_head_dim=64,
+    v_head_dim=128,
+    kv_lora_rank=256,
+)
+
+supported_mla_head_dimensions = [deepseek_mla_dimensions, smaller_mla_dimensions]
+
+
+@dataclass(frozen=True)
+class MLALayerDimensions:
+    """
+    The dimensions of an MLA layer.
+
+    Args:
+        head_dimensions (MLAHeadDimensions): The dimensions of a single MLA head.
+        num_heads (int): The number of heads in the MLA layer.
+    """
+
+    head_dimensions: MLAHeadDimensions
+    num_heads: int
+
+
+supported_mla_layer_dimensions = [
+    MLALayerDimensions(
+        head_dimensions=deepseek_mla_dimensions, num_heads=128
+    ),  # DSR1 dimensions
+    MLALayerDimensions(
+        head_dimensions=deepseek_mla_dimensions, num_heads=64
+    ),  # GLM-5 dimensions
+    MLALayerDimensions(
+        head_dimensions=smaller_mla_dimensions, num_heads=32
+    ),  # Smaller model dimensions
+]
+
+
 def _check_trtllm_gen_mla_shape(
-    query,
-    kv_cache,
-    qk_nope_head_dim,
-    kv_lora_rank,
-    qk_rope_head_dim,
-    sparse_mla_top_k,
-    page_table,
-    page_size,
-):
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    sparse_mla_top_k: int,
+    page_table: torch.Tensor,
+    page_size: int,
+) -> torch.Tensor:
     if query.ndim != 4:
         raise ValueError(f"Expected query.ndim == 4, got {query.ndim}")
 
@@ -83,35 +145,39 @@ def _check_trtllm_gen_mla_shape(
     elif kv_cache.ndim != 4:
         raise ValueError(f"Expected kv_cache.ndim == 3 or 4, got {kv_cache.ndim}")
 
-    if qk_nope_head_dim != 128:
-        raise ValueError(f"Expected qk_nope_head_dim == 128, got {qk_nope_head_dim}")
-    if kv_lora_rank != 512:
-        raise ValueError(f"Expected kv_lora_rank == 512, got {kv_lora_rank}")
-    if qk_rope_head_dim != 64:
-        raise ValueError(f"Expected qk_rope_head_dim == 64, got {qk_rope_head_dim}")
-
-    B_q, Q_len, H, D_q = query.shape
-    D_ckv = kv_cache.shape[3]
-    # if H != 128:
-    #     raise ValueError(f"Expected 128 heads for query, got {H}")
-    # todo(Yingyi): should we check num_heads == 128? Is this deepseek only?
-    if D_q != D_ckv or D_q != 576:
+    is_deepseek_dimensions = (
+        kv_lora_rank == deepseek_mla_dimensions.kv_lora_rank
+        and qk_rope_head_dim == deepseek_mla_dimensions.qk_rope_head_dim
+    )
+    is_smaller_mla_dimensions = (
+        kv_lora_rank == smaller_mla_dimensions.kv_lora_rank
+        and qk_rope_head_dim == smaller_mla_dimensions.qk_rope_head_dim
+    )
+    if not (is_deepseek_dimensions or is_smaller_mla_dimensions):
         raise ValueError(
-            f"Expected head dim 576 for query and kv_cache, got {D_q} and {D_ckv}"
+            f"Unsupported MLA dimensions, got kv_lora_rank={kv_lora_rank} and qk_rope_head_dim={qk_rope_head_dim}, supported dimensions are: {supported_mla_head_dimensions}"
+        )
+
+    num_seqs, num_tokens, _, qk_head_dim = query.shape
+    ckv_dim = kv_cache.shape[3]
+    expected_qk_head_dim = kv_lora_rank + qk_rope_head_dim
+    if qk_head_dim != expected_qk_head_dim or ckv_dim != expected_qk_head_dim:
+        raise ValueError(
+            f"Expected head dim {expected_qk_head_dim} for query and kv_cache, got {qk_head_dim} and {ckv_dim}"
         )
 
     if sparse_mla_top_k > 0:
         page_table_shape = page_table.shape
-        if page_table_shape != (B_q, Q_len, sparse_mla_top_k):
+        if page_table_shape != (num_seqs, num_tokens, sparse_mla_top_k):
             raise ValueError(
-                f"Expected page_table.shape == (B_q, Q_len, sparse_mla_top_k), got {page_table_shape}"
+                f"Expected page_table.shape == (num_seqs, num_tokens, sparse_mla_top_k), got {page_table_shape}"
             )
     else:
         B_block_table, block_num = page_table.shape
         block_size = page_size
-        if B_q != B_block_table:
+        if num_seqs != B_block_table:
             raise ValueError(
-                f"Expected batch size {B_q} for query and block_table, got {B_q} and {B_block_table}"
+                f"Expected batch size {num_seqs} for query and block_table, got {num_seqs} and {B_block_table}"
             )
         if block_num % (128 / block_size) != 0:
             raise ValueError(
@@ -523,7 +589,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     query: torch.Tensor,
     kv_cache: torch.Tensor,
     workspace_buffer: torch.Tensor,
-    qk_nope_head_dim: int,
+    qk_nope_head_dim: int,  # TODO: remove in 1.0?
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     block_tables: torch.Tensor,
@@ -534,7 +600,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
     bmm1_scale: Union[float, torch.Tensor] = 1.0,
     bmm2_scale: Union[float, torch.Tensor] = 1.0,
     sinks: Optional[List[torch.Tensor]] = None,
-    enable_pdl: bool = None,
+    skip_softmax_threshold_scale_factor: Optional[float] = None,
+    enable_pdl: bool | None = None,
     backend: str = "auto",
 ) -> torch.Tensor:
     """
@@ -543,8 +610,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
     query: [batch_size, q_len_per_request, num_heads, head_dim_qk], head_dim_qk = qk_nope_head_dim (kv_lora_rank) + qk_rope_head_dim, should be concated q_nope + q_rope; q_len_per_request is the MTP query length.
     kv_cache: [num_pages, page_size, head_dim_ckv + head_dim_kpe] or [num_pages, 1, page_size, head_dim_ckv + head_dim_kpe], should be concated ckv_cache + kpe_cache. Both 3D and 4D formats are supported for backward compatibility.
     workspace_buffer: [num_semaphores, 4], used for multi_block mode. Must be initialized to 0 for its first use.
-    qk_nope_head_dim: qk_nope_head_dim, must be 128
-    kv_lora_rank: kv_lora_rank, must be 512
+    qk_nope_head_dim: qk_nope_head_dim, must be 128 or 64
+    kv_lora_rank: kv_lora_rank, must be 512 or 256
     qk_rope_head_dim: qk_rope_head_dim, must be 64
     sparse_mla_top_k: sparse MLA top k, must be 0 for non-sparse MLA.
     block_tables: page_table of kv cache, [batch_size, num_pages]
@@ -556,6 +623,11 @@ def trtllm_batch_decode_with_kv_cache_mla(
     bmm2_scale: fused scale for mla bmm2 input.
         when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32.
     sinks: additional value per head in the denominator of the softmax.
+    skip_softmax_threshold_scale_factor: threshold scale factor for skipping softmax operations.
+        Providing a value for this parameter enables skip-softmax sparsity as described in: https://arxiv.org/abs/2512.12087
+        If no value is provided, then standard attention is used.
+        Setting the threshold to a higher value generally increases kernel performance at the cost of accuracy degradation.
+        The actual threshold value equals the provided threshold_scale_factor divided by the context length.
     backend : str = "auto"
         The implementation backend, could be ``auto``/``xqa`` or ``trtllm-gen``. Defaults to ``auto``.
         When set to ``auto``, the backend will be chosen based on the device architecture and kernel availability.
@@ -597,7 +669,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
             or kv_cache.dtype != torch.float8_e4m3fn
         ):
             raise ValueError(
-                f"XQA MLA only supports fp8 operation on SM120 GPUs, got {query.dtype} and {kv_cache.dtype}"
+                f"XQA MLA only supports fp8 operation on SM120/SM121 GPUs, got {query.dtype} and {kv_cache.dtype}"
             )
         if sinks is not None:
             raise ValueError("XQA MLA does not support sinks")
@@ -605,11 +677,13 @@ def trtllm_batch_decode_with_kv_cache_mla(
             raise ValueError(
                 f"XQA MLA only supports q_len_per_request == 1, got {query.size(1)}"
             )
+        if skip_softmax_threshold_scale_factor is not None:
+            raise ValueError("skip_softmax is not supported for XQA backend")
         return xqa_batch_decode_with_kv_cache_mla(
             query,
             kv_cache,
             workspace_buffer,
-            qk_nope_head_dim,
+            -1,  # Unused, marked for removal.
             kv_lora_rank,
             qk_rope_head_dim,
             block_tables,
@@ -635,11 +709,13 @@ def trtllm_batch_decode_with_kv_cache_mla(
         ):  # todo(Yingyi): add support for more block sizes?
             raise ValueError(f"Supported block_size are 32 and 64, got {block_size}")
 
+        if skip_softmax_threshold_scale_factor is not None and sparse_mla_top_k != 0:
+            raise ValueError("skip_softmax is not supported for sparse MLA")
+
         # Validate and normalize to 4D
         kv_cache = _check_trtllm_gen_mla_shape(
             query,
             kv_cache,
-            qk_nope_head_dim,
             kv_lora_rank,
             qk_rope_head_dim,
             sparse_mla_top_k,
@@ -688,7 +764,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
             workspace_buffer.numel() * workspace_buffer.element_size(),
             sinks,
             None,  # cum_seq_lens_q
-            None,  # skip_softmax_threshold_scale_factor
+            skip_softmax_threshold_scale_factor,
         )
 
         return out
@@ -701,17 +777,17 @@ def xqa_batch_decode_with_kv_cache_mla(
     query: torch.Tensor,
     kv_cache: torch.Tensor,
     workspace_buffer: torch.Tensor,
-    qk_nope_head_dim: int,
+    qk_nope_head_dim: int,  # TODO: remove in 1.0?
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
-    max_seq_len: int,
+    max_seq_len: int,  # TODO: remove in 1.0?
     out: Optional[torch.Tensor] = None,
     bmm1_scale: Union[float, torch.Tensor] = 1.0,
     bmm2_scale: Union[float, torch.Tensor] = 1.0,
     sinks: Optional[List[torch.Tensor]] = None,
-    enable_pdl: bool = None,
+    enable_pdl: bool | None = None,
 ) -> torch.Tensor:
     """
     Parameters:
@@ -765,7 +841,6 @@ def xqa_batch_decode_with_kv_cache_mla(
     kv_cache = _check_trtllm_gen_mla_shape(
         query,
         kv_cache,
-        qk_nope_head_dim,
         kv_lora_rank,
         qk_rope_head_dim,
         0,  # sparse_mla_top_k

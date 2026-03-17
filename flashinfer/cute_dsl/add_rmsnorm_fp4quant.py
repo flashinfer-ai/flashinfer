@@ -536,6 +536,14 @@ class AddRMSNormFP4QuantKernel:
         if row_in_bounds:
             cute.copy(copy_atom_store, tRrO, tRgO, pred=tXpX)
 
+        # In cluster mode, Phase 3 reads from mR across the FULL hidden dimension,
+        # including slices written by other CTAs.  We must ensure all CTAs' global
+        # memory writes are visible before any CTA proceeds to Phase 3.
+        if cutlass.const_expr(cluster_n > 1):
+            cute.arch.fence_acq_rel_cluster()
+            cute.arch.cluster_arrive_relaxed()
+            cute.arch.cluster_wait()
+
         actual_row_idx = bidx * rows_per_block + row_in_block
 
         # Phase 3: RMSNorm + Quantize
@@ -1004,8 +1012,8 @@ def _get_compiled_kernel(
             s_tensor,
             s_unswizzled.contiguous(),
             global_scale,
-            Int32(M),
-            Float32(eps),
+            M,
+            eps,
         )
 
     return tensor_api
