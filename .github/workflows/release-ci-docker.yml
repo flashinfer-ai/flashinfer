@@ -40,22 +40,27 @@ jobs:
           - cuda: cu126
             base_image: nvidia/cuda:12.6.0-devel-ubuntu24.04
             nvidia_lib_path: nvidia/cublas/lib
+            pytorch_index: cu126
             install_tilelang: "false"
           - cuda: cu128
             base_image: nvidia/cuda:12.8.0-devel-ubuntu24.04
             nvidia_lib_path: nvidia/cublas/lib
+            pytorch_index: cu128
             install_tilelang: "false"
           - cuda: cu129
             base_image: nvidia/cuda:12.9.0-devel-ubuntu24.04
             nvidia_lib_path: nvidia/cublas/lib
+            pytorch_index: cu129
             install_tilelang: "false"
           - cuda: cu130
             base_image: nvidia/cuda:13.0.1-devel-ubuntu24.04
             nvidia_lib_path: nvidia/cu13/lib
+            pytorch_index: cu130
             install_tilelang: "false"
           - cuda: cu131
             base_image: nvidia/cuda:13.1.1-cudnn-devel-ubuntu24.04
             nvidia_lib_path: nvidia/cu13/lib
+            pytorch_index: cu130  # TODO: update to cu131 when PyTorch publishes cu131 wheels
             install_tilelang: "true"
         arch: [amd64, arm64]
     steps:
@@ -83,6 +88,7 @@ jobs:
           build-args: |
             CUDA_BASE_IMAGE=${{ matrix.base_image }}
             CUDA_VERSION=${{ matrix.cuda }}
+            PYTORCH_INDEX=${{ matrix.pytorch_index }}
             NVIDIA_LIB_PATH=${{ matrix.nvidia_lib_path }}
             INSTALL_TILELANG=${{ matrix.install_tilelang }}
           platforms: linux/${{ matrix.arch }}

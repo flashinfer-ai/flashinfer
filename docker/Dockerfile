@@ -32,7 +32,8 @@ ENV TRITON_PTXAS_PATH="/usr/local/cuda/bin/ptxas"
 COPY requirements.txt /install/requirements.txt
 COPY docker/install/install_python_packages.sh /install/install_python_packages.sh
 ARG CUDA_VERSION
-RUN bash /install/install_python_packages.sh ${CUDA_VERSION}
+ARG PYTORCH_INDEX=${CUDA_VERSION}
+RUN bash /install/install_python_packages.sh ${PYTORCH_INDEX}
 
 ARG INSTALL_TILELANG=false
 RUN if [ "$INSTALL_TILELANG" = "true" ]; then pip install tilelang cuda-tile; fi
@@ -91,8 +92,9 @@ ENV PATH="/home/$USERNAME/conda/envs/py312/bin:$PATH"
 COPY requirements.txt /install/requirements.txt
 COPY docker/install/install_python_packages.sh /install/install_python_packages.sh
 ARG CUDA_VERSION
+ARG PYTORCH_INDEX=${CUDA_VERSION}
 ARG INSTALL_TILELANG=false
-RUN bash /install/install_python_packages.sh ${CUDA_VERSION} && pip3 install pre-commit && \
+RUN bash /install/install_python_packages.sh ${PYTORCH_INDEX} && pip3 install pre-commit && \
     if [ "$INSTALL_TILELANG" = "true" ]; then pip install tilelang cuda-tile; fi
 
 # Install mpi4py in the conda environment
