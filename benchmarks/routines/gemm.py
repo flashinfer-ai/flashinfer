@@ -680,6 +680,7 @@ def testBmmFp8(args):
         reference_output = torch.bmm(input, mat2)
         has_reference_output = True
 
+    cache_path = getattr(args, "autotune_cache", None)
     if getattr(args, "autotune", False):
         warmup_iters = (
             args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
@@ -688,11 +689,14 @@ def testBmmFp8(args):
             if cur_backend in autotune_supported_backends:
                 if args.verbose >= 1:
                     print(f"[INFO] Autotune warmup for bmm_fp8: {warmup_iters} iters")
-                with autotune(True):
+                with autotune(True, cache=cache_path):
                     for _ in range(warmup_iters):
                         run_backend(
                             cur_backend, input_fp8, mat2_fp8, input_inv_s, mat2_inv_s
                         )
+    elif cache_path:
+        with autotune(False, cache=cache_path):
+            pass
 
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
@@ -885,6 +889,7 @@ def testBmmMxfp8(args):
         reference_output = torch.bmm(input, mat2)
         has_reference_output = True
 
+    cache_path = getattr(args, "autotune_cache", None)
     if getattr(args, "autotune", False):
         warmup_iters = (
             args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
@@ -893,7 +898,7 @@ def testBmmMxfp8(args):
             if cur_backend in autotune_supported_backends:
                 if args.verbose >= 1:
                     print(f"[INFO] Autotune warmup for bmm_mxfp8: {warmup_iters} iters")
-                with autotune(True):
+                with autotune(True, cache=cache_path):
                     for _ in range(warmup_iters):
                         run_backend(
                             cur_backend,
@@ -902,6 +907,9 @@ def testBmmMxfp8(args):
                             input_scale,
                             mat2_scale,
                         )
+    elif cache_path:
+        with autotune(False, cache=cache_path):
+            pass
 
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
@@ -1151,6 +1159,7 @@ def testMmFp4(args):
         reference_output = torch.mm(input, mat2.T)
         has_reference_output = True
 
+    cache_path = getattr(args, "autotune_cache", None)
     if getattr(args, "autotune", False):
         warmup_iters = (
             args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
@@ -1158,7 +1167,7 @@ def testMmFp4(args):
         for cur_backend in backends:
             if args.verbose >= 1:
                 print(f"[INFO] Autotune warmup for mm_fp4: {warmup_iters} iters")
-            with autotune(True):
+            with autotune(True, cache=cache_path):
                 for _ in range(warmup_iters):
                     run_backend(
                         cur_backend,
@@ -1169,6 +1178,9 @@ def testMmFp4(args):
                         mat2_inv_s,
                         mat2_inv_s_trtllm,
                     )
+    elif cache_path:
+        with autotune(False, cache=cache_path):
+            pass
 
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
@@ -1366,6 +1378,7 @@ def testMmMxfp8(args):
         reference_output = torch.mm(input, mat2.t())
         has_reference_output = True
 
+    cache_path = getattr(args, "autotune_cache", None)
     if getattr(args, "autotune", False):
         warmup_iters = (
             args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
@@ -1374,7 +1387,7 @@ def testMmMxfp8(args):
             if cur_backend in autotune_supported_backends:
                 if args.verbose >= 1:
                     print(f"[INFO] Autotune warmup for mm_mxfp8: {warmup_iters} iters")
-                with autotune(True):
+                with autotune(True, cache=cache_path):
                     for _ in range(warmup_iters):
                         run_backend(
                             cur_backend,
@@ -1383,6 +1396,9 @@ def testMmMxfp8(args):
                             input_scale,
                             mat2_scale,
                         )
+    elif cache_path:
+        with autotune(False, cache=cache_path):
+            pass
 
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
