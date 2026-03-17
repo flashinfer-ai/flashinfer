@@ -148,3 +148,7 @@ class Fp8QuantizationType(IntEnum):
     DeepSeekFp8 = 1
     # MxFp8 x MxFp8
     MxFp8 = 2
+    # Per-tensor FP8
+    PerTensorFp8 = 3
+    # Per-channel FP8
+    PerChannelFp8 = 4
