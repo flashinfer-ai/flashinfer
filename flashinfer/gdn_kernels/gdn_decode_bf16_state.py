@@ -1994,6 +1994,7 @@ def gated_delta_rule(
     else:
         h_slot_indices = initial_state_indices
 
+    h_slot_indices = h_slot_indices.clamp(min=0)  # guard -1 padding
     output = torch.empty(B, T, HV, V, device=q.device, dtype=q.dtype)
 
     q_ = from_dlpack(q, assumed_align=32, enable_tvm_ffi=True)
