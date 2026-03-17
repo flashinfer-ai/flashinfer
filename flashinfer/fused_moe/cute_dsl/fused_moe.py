@@ -193,8 +193,7 @@ def _moe_core_impl(
         )
     else:
         assert moe_output.size(0) == num_tokens, (
-            "moe_output must be sliced to num_tokens rows before calling "
-            "_moe_core_impl"
+            "moe_output must be sliced to num_tokens rows before calling _moe_core_impl"
         )
 
     # Get stream resources if using async memset
@@ -498,12 +497,8 @@ class CuteDslMoEWrapper:
             gemm1_out_scale=self._gemm1_output_scale if self.use_cuda_graph else None,
             moe_output=moe_output
             if moe_output is not None
-            else (
-                # Slice the CUDA-graph buffer to the active batch.
-                self._moe_output[: x.shape[0]]
-                if self.use_cuda_graph
-                else None
-            ),
+            # Slice the CUDA-graph buffer to the active batch.
+            else (self._moe_output[: x.shape[0]] if self.use_cuda_graph else None),
             aux_stream=self._aux_stream,
             main_event=self._main_event,
             memset_event=self._memset_event,
