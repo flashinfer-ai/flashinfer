@@ -212,6 +212,7 @@ def test_sigmoid_routing(
     "moe_impl",
     [
         pytest.param(FP8PerTensorMoe(), id="FP8_PerTensor"),
+        pytest.param(FP8PerChannelMoe(), id="FP8_PerChannel"),
         pytest.param(
             FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_DEEPSEEK),
             id="FP8_Block_DeepSeek",
@@ -560,6 +561,7 @@ def test_topk_routing(
     [
         pytest.param(FP8PerTensorMoe(), id="FP8_Tensor"),
         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4), id="FP4_MoE"),
+        pytest.param(FP8PerChannelMoe(), id="FP8_PerChannel"),
     ],
 )
 @pytest.mark.parametrize(

@@ -5645,6 +5645,95 @@ def trtllm_fp8_per_tensor_scale_routed_moe(
         return result
 
 
+@flashinfer_api
+def trtllm_fp8_per_channel_scale_moe(
+    routing_logits: torch.Tensor,
+    routing_bias: Optional[torch.Tensor],
+    hidden_states: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm1_per_channel_weight_scale: torch.Tensor,
+    gemm1_per_channel_gate_weight_scale: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    gemm2_per_channel_weight_scale: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
+    intermediate_size: int,
+    local_expert_offset: int,
+    local_num_experts: int,
+    routed_scaling_factor: Optional[float],
+    use_routing_scales_on_input: bool,
+    routing_method_type: int = 0,
+    do_finalize: bool = True,
+    enable_pdl: Optional[bool] = None,
+    tune_max_num_tokens: int = 8192,
+    activation_type: int = ActivationType.Swiglu.value,
+) -> Union[List[torch.Tensor], torch.Tensor]:
+    """FP8 per-channel scale MoE operation.
+
+    Args:
+        routing_logits: [seq_len, num_experts] tensor of routing logits
+        routing_bias: [num_experts] tensor of routing bias
+        hidden_states: [seq_len, hidden_size] tensor of input hidden states
+        gemm1_weights: [num_experts, 2*intermediate_size, hidden_size] FP8 first layer weights
+        gemm1_per_channel_weight_scale: [local_num_experts, 2*intermediate_size] per-channel scales for gemm1
+        gemm1_per_channel_gate_weight_scale: [local_num_experts, 2*intermediate_size] per-channel gate scales for gemm1
+        gemm2_weights: [num_experts, hidden_size, intermediate_size] FP8 second layer weights
+        gemm2_per_channel_weight_scale: [local_num_experts, hidden_size] per-channel scales for gemm2
+        num_experts: Total number of experts
+        top_k: Number of experts to route to per token
+        n_group: Number of expert groups
+        topk_group: Number of groups to consider for top-k routing
+        intermediate_size: Size of intermediate layer
+        local_expert_offset: Offset of local experts in global expert space
+        local_num_experts: Number of experts handled by this device
+        routed_scaling_factor: Scaling factor for routing
+        use_routing_scales_on_input: Whether to use routing scales on input
+        routing_method_type: Type of routing method to use (default: 0)
+        do_finalize: Whether to finalize the output (default: True).
+        enable_pdl: Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
+        tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
+        activation_type (int): Type of activation function (default: 3 - Swiglu)
+
+    Returns:
+        when do_finalize=True, returns the final MoE output.
+        otherwise, returns the intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx).
+    """
+    result = get_trtllm_moe_sm100_module().trtllm_fp8_per_channel_scale_moe(
+        routing_logits,
+        routing_bias,
+        hidden_states,
+        gemm1_weights,
+        gemm1_per_channel_weight_scale,
+        gemm1_per_channel_gate_weight_scale,
+        gemm2_weights,
+        gemm2_per_channel_weight_scale,
+        num_experts,
+        top_k,
+        n_group,
+        topk_group,
+        intermediate_size,
+        local_expert_offset,
+        local_num_experts,
+        routed_scaling_factor,
+        use_routing_scales_on_input,
+        routing_method_type,
+        do_finalize,
+        enable_pdl,
+        tune_max_num_tokens,
+        activation_type,
+    )
+
+    if do_finalize:
+        logger.warning_once(
+            "the single torch.Tensor return type is deprecated and will be replaced with List[torch.Tensor] in the v0.8.0."
+        )
+        return result[0]
+    else:
+        return result
+
+
 @flashinfer_api(trace=trtllm_fp8_block_scale_moe_trace_dispatch)
 def trtllm_fp8_block_scale_moe(
     routing_logits: torch.Tensor,
