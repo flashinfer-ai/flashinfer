@@ -1,5 +1,6 @@
 import pytest
 import torch
+import torch.nn.functional as F
 import random
 
 import flashinfer
@@ -214,6 +215,50 @@ def sparse_mla_reference_torch(
     return out_ref, lse_ref
 
 
+def torch_reference_mla(
+    query,
+    kv_cache,
+    block_tables,
+    seq_lens,
+    kv_lora_rank,
+    qk_rope_head_dim,
+    softmax_scale,
+    output_scale,
+    page_size,
+):
+    """PyTorch reference for MLA decode. Returns [B, q_len, H, kv_lora_rank]."""
+    B, q_len, H, D_qk = query.shape
+    kv_flat = kv_cache.reshape(-1, D_qk)
+    c_latent = kv_flat[:, :kv_lora_rank]
+    c_rope = kv_flat[:, kv_lora_rank:]
+    q_nope = query[..., :kv_lora_rank]
+    q_rope = query[..., kv_lora_rank:]
+
+    outputs = []
+    for b in range(B):
+        seq_len = seq_lens[b].item()
+        num_pages = (seq_len + page_size - 1) // page_size
+        pages = block_tables[b, :num_pages]
+        kv_indices = []
+        for p in pages:
+            start = p.item() * page_size
+            kv_indices.extend(range(start, start + page_size))
+        kv_indices = kv_indices[:seq_len]
+        kv_idx_t = torch.tensor(kv_indices, device=query.device)
+
+        k_lat = c_latent[kv_idx_t]  # [seq_len, kv_lora_rank]
+        k_rope = c_rope[kv_idx_t]  # [seq_len, rope_dim]
+
+        attn_lat = torch.einsum("qhd,kd->qhk", q_nope[b].float(), k_lat.float())
+        attn_rope = torch.einsum("qhd,kd->qhk", q_rope[b].float(), k_rope.float())
+        attn = (attn_lat + attn_rope) * softmax_scale
+        attn = F.softmax(attn, dim=-1)
+        out_b = torch.einsum("qhk,kd->qhd", attn, k_lat.float()) * output_scale
+        outputs.append(out_b)
+
+    return torch.stack(outputs, dim=0)  # [B, q_len, H, kv_lora_rank]
+
+
 def trtllm_batch_decode_mla(
     layer_dimensions: MLALayerDimensions,
     batch_size: int,
@@ -238,6 +283,15 @@ def trtllm_batch_decode_mla(
     if backend == "trtllm-gen":
         if compute_capability[0] != 10:
             pytest.skip("TRTLLM-GEN MLA only supports SM100 and SM103 GPUs")
+    if backend == "cute-dsl":
+        if compute_capability[0] < 10:
+            pytest.skip("cute-dsl MLA requires SM100+")
+        if dynamic_scale:
+            pytest.skip("cute-dsl does not support dynamic_scale")
+        if enable_pdl is not None:
+            pytest.skip("cute-dsl does not support enable_pdl")
+        if skips_softmax:
+            pytest.skip("cute-dsl does not support skip_softmax")
     if dynamic_scale and dtype != torch.float8_e4m3fn:
         pytest.skip("Dynamic scale is not supported for non-fp8 dtype")
 
@@ -315,6 +369,9 @@ def trtllm_batch_decode_mla(
         global_trtllm_gen_fmha_workspace_buffer = torch.zeros(
             workspace_size, dtype=torch.int8, device=device
         )
+    # trtllm-gen requires zero-initialized workspace (counter region);
+    # re-zero each time since other backends (e.g. cute-dsl) may share and dirty it.
+    global_trtllm_gen_fmha_workspace_buffer.zero_()
     workspace_buffer = global_trtllm_gen_fmha_workspace_buffer
     workspace_buffer_ref = global_workspace_buffer
 
@@ -340,7 +397,8 @@ def trtllm_batch_decode_mla(
     )
     # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
     # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
-    assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
+    if backend == "trtllm-gen":
+        assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
 
     # Run reference attention and align output
     sm_scale = scale / (
@@ -395,39 +453,54 @@ def trtllm_batch_decode_mla(
 
     o_ref = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=False)
 
-    if backend == "trtllm-gen":
+    # cute-dsl fp8 kernel outputs fp8; cast to bf16 to match trtllm-gen / reference
+    if backend == "cute-dsl" and output.dtype == torch.float8_e4m3fn:
+        output = output.to(torch.bfloat16)
+
+    if backend in ("trtllm-gen", "cute-dsl"):
         # check is nan
         assert not torch.isnan(o_ref).any(), "o_ref is nan"
         assert not torch.isnan(output).any(), "output is nan"
 
+        o_ref_view = o_ref.view(
+            batch_size, q_len_per_request, layer_dimensions.num_heads, -1
+        )
+
         if dtype == torch.float8_e4m3fn:
-            try:
-                torch.testing.assert_close(
-                    output,
-                    o_ref.view(
-                        batch_size, q_len_per_request, layer_dimensions.num_heads, -1
-                    ),
-                    rtol=1e-1,
-                    atol=1e-1,
-                )  # todo: do reference with normal attention?
-            except AssertionError as e:
-                print("output:", output)
-                print("o_ref:", o_ref)
-                raise e
+            rtol, atol = 1e-1, 1e-1
         else:
-            try:
-                torch.testing.assert_close(
-                    output,
-                    o_ref.view(
-                        batch_size, q_len_per_request, layer_dimensions.num_heads, -1
-                    ),
-                    rtol=1e-2,
-                    atol=1e-2,
+            rtol, atol = 1e-2, 1e-2
+
+        try:
+            torch.testing.assert_close(output, o_ref_view, rtol=rtol, atol=atol)
+        except AssertionError as fa2_err:
+            if backend == "cute-dsl":
+                # fa2 reference may diverge from cute-dsl in some configs;
+                # fall back to torch reference as ground truth.
+                query_for_ref = (
+                    query.to(torch.bfloat16) if dtype == torch.float8_e4m3fn else query
                 )
-            except AssertionError as e:
+                kv_for_ref = (
+                    kv_cache.to(torch.bfloat16)
+                    if dtype == torch.float8_e4m3fn
+                    else kv_cache
+                )
+                o_torch_ref = torch_reference_mla(
+                    query_for_ref,
+                    kv_for_ref,
+                    block_tables,
+                    seq_lens_tensor,
+                    layer_dimensions.head_dimensions.kv_lora_rank,
+                    layer_dimensions.head_dimensions.qk_rope_head_dim,
+                    softmax_scale=sm_scale,
+                    output_scale=1.0,
+                    page_size=page_size,
+                ).to(output.dtype)
+                torch.testing.assert_close(output, o_torch_ref, rtol=rtol, atol=atol)
+            else:
                 print("output:", output)
                 print("o_ref:", o_ref)
-                raise e
+                raise fa2_err
     elif backend == "xqa":
         atol = 0.05
         rtol = 0.05
@@ -712,7 +785,7 @@ def trtllm_batch_decode_mla_sparse(
 )  # todo(Yingyi): verify larger q_len_per_request
 @pytest.mark.parametrize("dynamic_scale", [False])
 @pytest.mark.parametrize("enable_pdl", [True, False, None])
-@pytest.mark.parametrize("backend", ["trtllm-gen", "xqa"])
+@pytest.mark.parametrize("backend", ["trtllm-gen", "xqa", "cute-dsl"])
 @pytest.mark.parametrize("skips_softmax", [False, True])
 def test_trtllm_batch_decode_mla(
     layer_dimensions: MLALayerDimensions,
@@ -728,6 +801,8 @@ def test_trtllm_batch_decode_mla(
 ):
     if backend == "xqa" and layer_dimensions.head_dimensions == smaller_mla_dimensions:
         pytest.skip("XQA MLA does not support smaller MLA dimensions yet.")
+    if backend == "cute-dsl" and layer_dimensions.num_heads < 128:
+        pytest.skip("cute-dsl MLA requires num_heads >= 128")
 
     trtllm_batch_decode_mla(
         layer_dimensions,

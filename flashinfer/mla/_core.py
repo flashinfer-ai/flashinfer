@@ -620,9 +620,11 @@ def trtllm_batch_decode_with_kv_cache_mla(
     max_seq_len: max sequence length for kv_cache
     out: output tensor, if not provided, will be allocated internally
     bmm1_scale: fused scale for mla bmm1 input.
-        when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32.
+        When using ``trtllm-gen`` backend, it can be a ``torch.Tensor`` with dtype ``torch.float32``.
+        When using ``cute-dsl`` backend, only ``float`` values are supported.
     bmm2_scale: fused scale for mla bmm2 input.
-        when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32.
+        When using ``trtllm-gen`` backend, it can be a ``torch.Tensor`` with dtype ``torch.float32``.
+        When using ``cute-dsl`` backend, only ``float`` values are supported.
     sinks: additional value per head in the denominator of the softmax.
     skip_softmax_threshold_scale_factor: threshold scale factor for skipping softmax operations.
         Providing a value for this parameter enables skip-softmax sparsity as described in: https://arxiv.org/abs/2512.12087
@@ -630,7 +632,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         Setting the threshold to a higher value generally increases kernel performance at the cost of accuracy degradation.
         The actual threshold value equals the provided threshold_scale_factor divided by the context length.
     backend : str = "auto"
-        The implementation backend, could be ``auto``/``xqa`` or ``trtllm-gen``. Defaults to ``auto``.
+        The implementation backend, could be ``auto``/``xqa``, ``trtllm-gen``, or ``cute-dsl``. Defaults to ``auto``.
         When set to ``auto``, the backend will be chosen based on the device architecture and kernel availability.
         For sm_100 and sm_103 (blackwell architecture), ``auto`` will choose ``trtllm-gen`` backend.
         For sm_120 (blackwell architecture), ``auto`` will choose ``xqa`` backend.
