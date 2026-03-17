@@ -1300,6 +1300,7 @@ def testMmMxfp8(args):
         "cutlass",
         "cute-dsl",
         "trtllm",
+        "auto",
     ]
     res = []
 
@@ -1341,10 +1342,14 @@ def testMmMxfp8(args):
         elif backend == "cutlass" or args.use_128x4_sf_layout:
             sf_layout_input = flashinfer.SfLayout.layout_128x4
         elif backend == "trtllm":
-            sf_layout_input = flashinfer.SfLayout.layout_8x4
+            if not args.use_128x4_sf_layout:
+                sf_layout_input = flashinfer.SfLayout.layout_8x4
+            else:
+                sf_layout_input = flashinfer.SfLayout.layout_128x4
         input_mxfp8, input_scale = mxfp8_quantize(
             input, sf_swizzle_layout=sf_layout_input
         )
+        # when using trtllm, the shuffle_matrix_sf_a will swizzle the layout.
         mat2_mxfp8, mat2_scale = mxfp8_quantize(
             mat2,
             is_sf_swizzled_layout=False
@@ -1363,6 +1368,15 @@ def testMmMxfp8(args):
             )
             mat2_scale = mat2_scale.t()
 
+        if args.verbose >= 2:
+            print(f"[VERBOSE] {backend}: {input_mxfp8.shape = }")
+            print(f"[VERBOSE] {backend}: {input_mxfp8.dtype = }")
+            print(f"[VERBOSE] {backend}: {mat2_mxfp8.shape = }")
+            print(f"[VERBOSE] {backend}: {mat2_mxfp8.dtype = }")
+            print(f"[VERBOSE] {backend}: {input_scale.shape = }")
+            print(f"[VERBOSE] {backend}: {input_scale.dtype = }")
+            print(f"[VERBOSE] {backend}: {mat2_scale.shape = }")
+            print(f"[VERBOSE] {backend}: {mat2_scale.dtype = }")
         inputs[backend] = (input_mxfp8, mat2_mxfp8, input_scale, mat2_scale)
 
     def run_backend(
