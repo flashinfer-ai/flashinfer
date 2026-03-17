@@ -290,7 +290,7 @@ def generate_ninja_build_for_op(
         is_cuda = source.suffix == ".cu"
         object_suffix = ".cuda.o" if is_cuda else ".o"
         cmd = "cuda_compile" if is_cuda else "compile"
-        obj_name = source.with_suffix(object_suffix).name
+        obj_name = f"{source.parent.name}_{source.stem}{object_suffix}"
         obj = str((output_dir / obj_name).resolve())
         objects.append(obj)
         lines.append(f"build {obj}: {cmd} {source.resolve()}")

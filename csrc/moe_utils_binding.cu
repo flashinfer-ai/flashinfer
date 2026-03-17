@@ -291,8 +291,6 @@ void moe_sort(
 
   // Configure dtypes
   routingData.mDtypeExpW = batchedGemm::trtllm::gen::Dtype::Bfloat16;
-  routingData.mDtypeBias = batchedGemm::trtllm::gen::Dtype::Bfloat16;
-  routingData.mDtypeScore = batchedGemm::trtllm::gen::Dtype::Fp32;
   routingData.mUsePdl = use_pdl;
 
   // Input tensors (pre-computed expert selections)
