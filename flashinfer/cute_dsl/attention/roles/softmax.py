@@ -30,6 +30,7 @@ from ..fusion.mask import (
     apply_mask,
     get_unmasked_trip_count,
     get_masked_trip_count,
+    get_kv_start_block_idx,
 )
 from ..scheduler.persistent import (
     FmhaStaticTileScheduler,
@@ -420,10 +421,14 @@ class SoftmaxRole:
                     tTMEM_STOREtS_x4,
                 )
 
+                kv_start_offset = get_kv_start_block_idx(
+                    self.mask_type, self.window_left,
+                    curr_block_coord, self.cta_tiler, seqlen_k_, seqlen_q_,
+                ) * self.qk_mma_tiler[1]
                 logical_offset = (
                     curr_block_coord[0] * self.cta_tiler[0]
                     + stage * self.qk_mma_tiler[0],
-                    0,
+                    kv_start_offset,
                 )
                 cS = cute.domain_offset(logical_offset, cS_base)
                 vec_i_handle = si_corr_producer.acquire_and_advance()

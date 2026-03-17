@@ -42,11 +42,13 @@ def get_trip_count(
         )
         result = cutlass.min(max_blocks_k, max_blocks_q)
     elif mask_type == MaskType.SLIDING_WINDOW_MASK:
-        max_blocks_k = cute.ceil_div(window_left, tile_shape[1]) + 1
-        max_blocks_q = cute.ceil_div(
-            (blk_coord[0] + 1) * tile_shape[0], tile_shape[1]
-        )
-        result = cutlass.min(max_blocks_k, max_blocks_q)
+        first_q = blk_coord[0] * tile_shape[0]
+        last_q = (blk_coord[0] + 1) * tile_shape[0] - 1
+        min_kv = cutlass.max(0, first_q - window_left)
+        max_kv = cutlass.min(seqlen_k - 1, last_q + window_left)
+        start_block = min_kv // tile_shape[1]
+        end_block = cute.ceil_div(max_kv + 1, tile_shape[1])
+        result = end_block - start_block
     return result
 
 
@@ -133,11 +135,9 @@ def get_kv_start_block_idx(
 ) -> Int32:
     """Starting KV block index (nonzero only for sliding window)."""
     if cutlass.const_expr(mask_type == MaskType.SLIDING_WINDOW_MASK):
-        num_blocks_k = cute.ceil_div(window_left, tile_shape[1])
-        block_idx = (
-            cute.ceil_div((blk_coord[0] + 1) * tile_shape[0], tile_shape[1]) - 1
-        )
-        return cutlass.max(0, block_idx - num_blocks_k)
+        first_q = blk_coord[0] * tile_shape[0]
+        min_kv = cutlass.max(0, first_q - window_left)
+        return min_kv // tile_shape[1]
     else:
         return 0
 
@@ -165,5 +165,5 @@ def apply_mask(
     elif mask_type == MaskType.SLIDING_WINDOW_MASK:
         for i in range(cute.size(acc_qk)):
             pos = index_qk[i]
-            if pos[1] - pos[0] > window_left:
+            if pos[1] - pos[0] > window_left or pos[0] - pos[1] > window_left or pos[1] >= seqlen_k:
                 acc_qk[i] = -Float32.inf

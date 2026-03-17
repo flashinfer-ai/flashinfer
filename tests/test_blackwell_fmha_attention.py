@@ -415,11 +415,12 @@ def test_attention_prefill_attention_sink(
 
     @cute.jit
     def sink_M_D_update(params, kv_tile_idx, qo_head_idx, m, d, scale):
+        # m is in the RAW (unscaled) domain; convert sink from scaled-logit to RAW
         log2_e = math.log2(math.exp(1.0))
         sink_raw = params.sink[qo_head_idx] * log2_e / scale if (kv_tile_idx == 0 and qo_head_idx < NUM_QO_HEADS) else -math.inf
         m_new = sink_raw if sink_raw > m else m
-        rescale = cute.arch.exp2(m - m_new)
-        d_new = cute.arch.exp2(sink_raw - m_new) + d * rescale
+        rescale = cute.arch.exp2((m - m_new) * scale)
+        d_new = cute.arch.exp2((sink_raw - m_new) * scale) + d * rescale
         return m_new, d_new
 
     @cute.jit
@@ -441,7 +442,7 @@ def test_attention_prefill_attention_sink(
     )
     wrapper.plan(
         qo_indptr, kv_indptr, NUM_QO_HEADS, num_kv_heads, HEAD_DIM,
-        head_dim_vo=HEAD_DIM, causal=causal, sm_scale=1.0,
+        head_dim_vo=HEAD_DIM, causal=causal, sm_scale=SM_SCALE,
         q_data_type=DTYPE, kv_data_type=DTYPE,
         output_transform=sink_output_transform,
         M_D_update=sink_M_D_update,
@@ -450,7 +451,394 @@ def test_attention_prefill_attention_sink(
     o = wrapper.run(q, k, v, sink=sink)
 
     o_ref, _ = attention_ref(
-        batch_size, q, k, v, causal, 1.0, sink=sink
+        batch_size, q, k, v, causal, SM_SCALE, sink=sink
+    )
+
+    torch.testing.assert_close(o, o_ref, rtol=RTOL, atol=ATOL)
+
+
+# ---------------------------------------------------------------------------
+#  6. Float16 dtype
+# ---------------------------------------------------------------------------
+
+FP16_SHAPE_PARAMS = [
+    (1, 128, 128),
+    (9, 256, 256),
+    (1, 177, 977),
+]
+
+
+@pytest.mark.parametrize("batch_size,qo_len,kv_len", FP16_SHAPE_PARAMS)
+@pytest.mark.parametrize("causal", [False, True])
+def test_attention_prefill_fp16(
+    batch_size, qo_len, kv_len, causal,
+):
+    _skip_if_unsupported(qo_len, kv_len, causal)
+    num_kv_heads = 8
+    dtype = torch.float16
+
+    torch.manual_seed(42)
+    q = torch.randn(batch_size * qo_len, NUM_QO_HEADS, HEAD_DIM, dtype=dtype, device="cuda")
+    k = torch.randn(batch_size * kv_len, num_kv_heads, HEAD_DIM, dtype=dtype, device="cuda")
+    v = torch.randn(batch_size * kv_len, num_kv_heads, HEAD_DIM, dtype=dtype, device="cuda")
+    qo_indptr = torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+    kv_indptr = torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * kv_len
+
+    wrapper = BatchPrefillCuteDSLWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+    )
+    wrapper.plan(
+        qo_indptr, kv_indptr, NUM_QO_HEADS, num_kv_heads, HEAD_DIM,
+        head_dim_vo=HEAD_DIM, causal=causal, sm_scale=SM_SCALE,
+        q_data_type=dtype, kv_data_type=dtype,
+    )
+    o = wrapper.run(q, k, v)
+    o_ref, _ = attention_ref(batch_size, q, k, v, causal, SM_SCALE)
+
+    torch.testing.assert_close(o, o_ref, rtol=RTOL, atol=ATOL)
+
+
+# ---------------------------------------------------------------------------
+#  7. Sliding window mask
+# ---------------------------------------------------------------------------
+
+def attention_sliding_window_ref(
+    batch_size, q, k, v, window_left, sm_scale,
+):
+    """Reference for symmetric sliding window: |kv_idx - q_idx| <= window_left."""
+    qo_len = q.shape[0] // batch_size
+    kv_len = k.shape[0] // batch_size
+    num_qo_heads = q.shape[1]
+    num_kv_heads = k.shape[1]
+    head_dim_qk = q.shape[2]
+    head_dim_vo = v.shape[2]
+
+    if num_qo_heads > num_kv_heads:
+        group_size = num_qo_heads // num_kv_heads
+        k = torch.repeat_interleave(k, group_size, dim=1)
+        v = torch.repeat_interleave(v, group_size, dim=1)
+
+    logits = (
+        torch.einsum(
+            "bmhd,bnhd->bhmn",
+            q.view(batch_size, qo_len, num_qo_heads, head_dim_qk).float(),
+            k.view(batch_size, kv_len, num_qo_heads, head_dim_qk).float(),
+        )
+        * sm_scale
+    )
+
+    q_idx = torch.arange(qo_len, device=q.device).unsqueeze(1)
+    k_idx = torch.arange(kv_len, device=q.device).unsqueeze(0)
+    mask = torch.abs(k_idx - q_idx) <= window_left
+    logits = logits.masked_fill(mask.unsqueeze(0).unsqueeze(0) == 0, float("-inf"))
+
+    p = torch.softmax(logits, dim=-1)
+    o_ref = (
+        torch.einsum(
+            "bhmn,bnhd->bmhd",
+            p,
+            v.view(batch_size, kv_len, num_qo_heads, head_dim_vo).float(),
+        )
+        .contiguous()
+        .view(batch_size * qo_len, num_qo_heads, head_dim_vo)
+        .to(q)
+    )
+    return o_ref
+
+
+SLIDING_WINDOW_PARAMS = [
+    # (batch, qo_len, kv_len, window_left)
+    (1, 256, 256, 64),
+    (1, 256, 256, 128),
+    (9, 256, 256, 100),
+    (1, 512, 512, 200),
+]
+
+
+@pytest.mark.parametrize("batch_size,qo_len,kv_len,window_left", SLIDING_WINDOW_PARAMS)
+def test_attention_prefill_sliding_window(
+    batch_size, qo_len, kv_len, window_left,
+):
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("SM100A is not supported on this device")
+    num_kv_heads = 8
+
+    torch.manual_seed(42)
+    q = torch.randn(batch_size * qo_len, NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda")
+    k = torch.randn(batch_size * kv_len, num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda")
+    v = torch.randn(batch_size * kv_len, num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda")
+    qo_indptr = torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+    kv_indptr = torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * kv_len
+
+    wrapper = BatchPrefillCuteDSLWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+    )
+    wrapper.plan(
+        qo_indptr, kv_indptr, NUM_QO_HEADS, num_kv_heads, HEAD_DIM,
+        head_dim_vo=HEAD_DIM, causal=False, sm_scale=SM_SCALE,
+        q_data_type=DTYPE, kv_data_type=DTYPE,
+        window_left=window_left,
+    )
+    o = wrapper.run(q, k, v)
+    o_ref = attention_sliding_window_ref(batch_size, q, k, v, window_left, SM_SCALE)
+
+    torch.testing.assert_close(o, o_ref, rtol=RTOL, atol=ATOL)
+
+
+# ---------------------------------------------------------------------------
+#  8. Head dimension 64
+# ---------------------------------------------------------------------------
+
+HEAD64_SHAPE_PARAMS = [
+    (1, 128, 128),
+    (9, 256, 256),
+    (1, 177, 977),
+]
+
+
+@pytest.mark.parametrize("batch_size,qo_len,kv_len", HEAD64_SHAPE_PARAMS)
+@pytest.mark.parametrize("causal", [False, True])
+def test_attention_prefill_head_dim_64(
+    batch_size, qo_len, kv_len, causal,
+):
+    _skip_if_unsupported(qo_len, kv_len, causal)
+    head_dim = 64
+    num_kv_heads = 8
+    sm_scale = 1.0 / math.sqrt(head_dim)
+
+    torch.manual_seed(42)
+    q = torch.randn(batch_size * qo_len, NUM_QO_HEADS, head_dim, dtype=DTYPE, device="cuda")
+    k = torch.randn(batch_size * kv_len, num_kv_heads, head_dim, dtype=DTYPE, device="cuda")
+    v = torch.randn(batch_size * kv_len, num_kv_heads, head_dim, dtype=DTYPE, device="cuda")
+    qo_indptr = torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+    kv_indptr = torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * kv_len
+
+    wrapper = BatchPrefillCuteDSLWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+    )
+    wrapper.plan(
+        qo_indptr, kv_indptr, NUM_QO_HEADS, num_kv_heads, head_dim,
+        head_dim_vo=head_dim, causal=causal, sm_scale=sm_scale,
+        q_data_type=DTYPE, kv_data_type=DTYPE,
+    )
+    o = wrapper.run(q, k, v)
+    o_ref, _ = attention_ref(batch_size, q, k, v, causal, sm_scale)
+
+    torch.testing.assert_close(o, o_ref, rtol=RTOL, atol=ATOL)
+
+
+# ---------------------------------------------------------------------------
+#  9. Variable-length + logits transform (sigmoid)
+# ---------------------------------------------------------------------------
+
+VARLEN_FUSION_INDPTRS = [
+    [0, 1298, 2638],
+    [0, 1350, 2667, 4003, 5347, 6631, 7919, 9208, 10524],
+]
+
+
+def attention_varlen_sigmoid_ref(
+    q, k, v, qo_indptr, kv_indptr, causal, sigmoid_scale, sigmoid_bias=0.0,
+):
+    batch_size = qo_indptr.shape[0] - 1
+    nnz_qo = qo_indptr[-1].item()
+    o = torch.empty(nnz_qo, *q.shape[1:-1], v.shape[-1], device=q.device, dtype=q.dtype)
+    for i in range(batch_size):
+        o_i = attention_sigmoid_ref(
+            1,
+            q[qo_indptr[i]:qo_indptr[i + 1]],
+            k[kv_indptr[i]:kv_indptr[i + 1]],
+            v[kv_indptr[i]:kv_indptr[i + 1]],
+            causal,
+            sigmoid_scale,
+            sigmoid_bias,
+        )
+        o[qo_indptr[i]:qo_indptr[i + 1]] = o_i
+    return o
+
+
+@pytest.mark.parametrize("indptr", VARLEN_FUSION_INDPTRS)
+def test_attention_prefill_varlen_logits_transform(indptr):
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("SM100A is not supported on this device")
+    num_kv_heads = 8
+
+    params = SimpleNamespace(
+        scale=1.0 * math.log2(math.exp(1.0)),
+        bias=0.0,
+    )
+
+    @cute.jit
+    def sigmoid_logits_transform(
+        params, x, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx
+    ):
+        scale = params.scale
+        bias = params.bias
+        return cute.arch.rcp_approx(1 + cute.arch.exp2(-(x * scale + bias)))
+
+    torch.manual_seed(42)
+    q = torch.randn(indptr[-1], NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda")
+    k = torch.randn(indptr[-1], num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda")
+    v = torch.randn(indptr[-1], num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda")
+
+    qo_indptr = torch.tensor(indptr, device="cuda", dtype=torch.int32)
+    kv_indptr = qo_indptr
+
+    wrapper = BatchPrefillCuteDSLWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+    )
+    wrapper.plan(
+        qo_indptr, kv_indptr, NUM_QO_HEADS, num_kv_heads, HEAD_DIM,
+        head_dim_vo=HEAD_DIM, causal=False, sm_scale=1.0,
+        q_data_type=DTYPE, kv_data_type=DTYPE,
+        custom_params=params,
+        logits_transform=sigmoid_logits_transform,
+    )
+    o = wrapper.run(q, k, v)
+
+    gqa_group_ratio = NUM_QO_HEADS // num_kv_heads
+    k_repeated = torch.repeat_interleave(k, gqa_group_ratio, dim=1)
+    v_repeated = torch.repeat_interleave(v, gqa_group_ratio, dim=1)
+    o_ref = attention_varlen_sigmoid_ref(
+        q, k_repeated, v_repeated, qo_indptr, kv_indptr, False, 1.0, 0.0,
+    )
+
+    torch.testing.assert_close(o, o_ref, rtol=0.15, atol=0.15)
+
+
+# ---------------------------------------------------------------------------
+#  10. Variable-length + attention sink
+# ---------------------------------------------------------------------------
+
+def attention_varlen_sink_ref(
+    q, k, v, qo_indptr, kv_indptr, causal, sm_scale, sink,
+):
+    batch_size = qo_indptr.shape[0] - 1
+    nnz_qo = qo_indptr[-1].item()
+    o = torch.empty(nnz_qo, *q.shape[1:-1], v.shape[-1], device=q.device, dtype=q.dtype)
+    for i in range(batch_size):
+        o_i, _ = attention_ref(
+            1,
+            q[qo_indptr[i]:qo_indptr[i + 1]],
+            k[kv_indptr[i]:kv_indptr[i + 1]],
+            v[kv_indptr[i]:kv_indptr[i + 1]],
+            causal,
+            sm_scale,
+            sink=sink,
+        )
+        o[qo_indptr[i]:qo_indptr[i + 1]] = o_i
+    return o
+
+
+@pytest.mark.parametrize("indptr", VARLEN_FUSION_INDPTRS)
+def test_attention_prefill_varlen_attention_sink(indptr):
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("SM100A is not supported on this device")
+    num_kv_heads = 8
+
+    @cute.jit
+    def sink_M_D_update(params, kv_tile_idx, qo_head_idx, m, d, scale):
+        log2_e = math.log2(math.exp(1.0))
+        sink_raw = params.sink[qo_head_idx] * log2_e / scale if (kv_tile_idx == 0 and qo_head_idx < NUM_QO_HEADS) else -math.inf
+        m_new = sink_raw if sink_raw > m else m
+        rescale = cute.arch.exp2((m - m_new) * scale)
+        d_new = cute.arch.exp2((sink_raw - m_new) * scale) + d * rescale
+        return m_new, d_new
+
+    @cute.jit
+    def sink_output_transform(
+        params, output, batch_idx, qo_idx, qo_head_idx, m, rcp_d, scale
+    ):
+        return output * scale * rcp_d
+
+    torch.manual_seed(42)
+    q = torch.randn(indptr[-1], NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda")
+    k = torch.randn(indptr[-1], num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda")
+    v = torch.randn(indptr[-1], num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda")
+    sink = torch.randn((NUM_QO_HEADS,), dtype=DTYPE, device="cuda")
+
+    qo_indptr = torch.tensor(indptr, device="cuda", dtype=torch.int32)
+    kv_indptr = qo_indptr
+
+    wrapper = BatchPrefillCuteDSLWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+    )
+    wrapper.plan(
+        qo_indptr, kv_indptr, NUM_QO_HEADS, num_kv_heads, HEAD_DIM,
+        head_dim_vo=HEAD_DIM, causal=False, sm_scale=SM_SCALE,
+        q_data_type=DTYPE, kv_data_type=DTYPE,
+        output_transform=sink_output_transform,
+        M_D_update=sink_M_D_update,
+        use_attention_sink=True,
+    )
+    o = wrapper.run(q, k, v, sink=sink)
+
+    gqa_group_ratio = NUM_QO_HEADS // num_kv_heads
+    k_repeated = torch.repeat_interleave(k, gqa_group_ratio, dim=1)
+    v_repeated = torch.repeat_interleave(v, gqa_group_ratio, dim=1)
+    o_ref = attention_varlen_sink_ref(
+        q, k_repeated, v_repeated, qo_indptr, kv_indptr, False, SM_SCALE, sink,
+    )
+
+    torch.testing.assert_close(o, o_ref, rtol=RTOL, atol=ATOL)
+
+
+# ---------------------------------------------------------------------------
+#  11. Attention sink with MHA (num_kv_heads == NUM_QO_HEADS)
+# ---------------------------------------------------------------------------
+
+SINK_MHA_SHAPE_PARAMS = [
+    (9, 256, 256),
+    (1, 177, 977),
+]
+
+
+@pytest.mark.parametrize("batch_size,qo_len,kv_len", SINK_MHA_SHAPE_PARAMS)
+@pytest.mark.parametrize("causal", [False, True])
+def test_attention_prefill_attention_sink_mha(
+    batch_size, qo_len, kv_len, causal,
+):
+    _skip_if_unsupported(qo_len, kv_len, causal)
+    num_kv_heads = NUM_QO_HEADS
+
+    @cute.jit
+    def sink_M_D_update(params, kv_tile_idx, qo_head_idx, m, d, scale):
+        log2_e = math.log2(math.exp(1.0))
+        sink_raw = params.sink[qo_head_idx] * log2_e / scale if (kv_tile_idx == 0 and qo_head_idx < NUM_QO_HEADS) else -math.inf
+        m_new = sink_raw if sink_raw > m else m
+        rescale = cute.arch.exp2((m - m_new) * scale)
+        d_new = cute.arch.exp2((sink_raw - m_new) * scale) + d * rescale
+        return m_new, d_new
+
+    @cute.jit
+    def sink_output_transform(
+        params, output, batch_idx, qo_idx, qo_head_idx, m, rcp_d, scale
+    ):
+        return output * scale * rcp_d
+
+    torch.manual_seed(42)
+    q = torch.randn(batch_size * qo_len, NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda")
+    k = torch.randn(batch_size * kv_len, num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda")
+    v = torch.randn(batch_size * kv_len, num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda")
+    qo_indptr = torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+    kv_indptr = torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * kv_len
+    sink = torch.randn((NUM_QO_HEADS,), dtype=DTYPE, device="cuda")
+
+    wrapper = BatchPrefillCuteDSLWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+    )
+    wrapper.plan(
+        qo_indptr, kv_indptr, NUM_QO_HEADS, num_kv_heads, HEAD_DIM,
+        head_dim_vo=HEAD_DIM, causal=causal, sm_scale=SM_SCALE,
+        q_data_type=DTYPE, kv_data_type=DTYPE,
+        output_transform=sink_output_transform,
+        M_D_update=sink_M_D_update,
+        use_attention_sink=True,
+    )
+    o = wrapper.run(q, k, v, sink=sink)
+
+    o_ref, _ = attention_ref(
+        batch_size, q, k, v, causal, SM_SCALE, sink=sink
     )
 
     torch.testing.assert_close(o, o_ref, rtol=RTOL, atol=ATOL)
