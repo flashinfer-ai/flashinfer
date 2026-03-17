@@ -348,6 +348,8 @@ static constexpr int MaxNumTokensSingleCluster = NumBlocksPerCluster * NumThread
 static constexpr int MaxNumTokensSingleClusterScores = NumBlocksPerCluster * NumWarps;
 
 static constexpr int BlockKernelMaxNumTokens = 4;
+static constexpr int DynBlockKernelMaxNumTokens = 16;
+static constexpr int DynBlockKernelMaxNumExperts = 512;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -431,6 +433,7 @@ struct PolicyTraits {
 };
 
 /// Softmax + None (Default: Softmax -> TopK).
+/// NOTE: Currently only covers ≤256 experts. If a model requires more, add a larger Tier here.
 template <>
 struct PolicyTraits<SoftmaxPreprocess, NoOpPostprocess> {
   using Pairs = TierList<Tier<128, 8>,  // Small expert counts (≤128 experts)
@@ -456,6 +459,7 @@ struct PolicyTraits<NoOpPreprocess, SoftmaxPostprocess> {
 };
 
 /// Sigmoid + SumNormalize (SigmoidRenorm: Sigmoid -> TopK -> Renormalize).
+/// NOTE: Currently only covers ≤256 experts. If a model requires more, add a larger Tier here.
 template <>
 struct PolicyTraits<SigmoidPreprocess, SumNormalizePostprocess> {
   using Pairs = TierList<Tier<128, 8>,  // Small expert counts (≤128 experts)
@@ -470,11 +474,13 @@ struct PolicyTraits<SigmoidBiasPreprocess, ScaledSumNormalizePostprocess> {
                          Tier<256, 8>,  // MiniMax M2 (256 experts, topK=6)
                          Tier<384, 8>,  // Kimi K2 (384 experts)
                          Tier<512, 8>,  // DeepSeek nGroup≤1 (256 experts → E512 fallback)
-                         Tier<512, 22>  // Nemotron Super V3 (512 experts, topK=22, nGroup≤1)
+                         Tier<512, 22>,  // Nemotron Super V3 (512 experts, topK=22, nGroup≤1)
+                         Tier<1024, 32>  // Default fallback (expert count may grow beyond 512)
                          >;
 };
 
 /// None + None (TopK only: no softmax or renormalize).
+/// NOTE: Currently only covers ≤256 experts. If a model requires more, add a larger Tier here.
 template <>
 struct PolicyTraits<NoOpPreprocess, NoOpPostprocess> {
   using Pairs = TierList<Tier<128, 8>,  // Small expert counts (≤128 experts)
@@ -507,7 +513,10 @@ struct PolicyTraits<NoOpPreprocess, NoOpPostprocess> {
                                        decltype(eTag_)::value, decltype(kTag_)::value);        \
         });                                                                                    \
     if (!dispatched_) {                                                                        \
-      FLASHINFER_WARN("No tier covers numExperts=%d topK=%d", data.mNumExperts, data.mTopK);   \
+      FLASHINFER_WARN(                                                                         \
+          "No compiled tier covers numExperts=%d topK=%d for policy %s+%s. "                   \
+          "Add a Tier<%d, %d> to the corresponding PolicyTraits in RoutingCustomPolicy.cuh.",  \
+          data.mNumExperts, data.mTopK, #PreProc, #PostProc, data.mNumExperts, data.mTopK);    \
     }                                                                                          \
   }(PolicyTraits<PreProc, PostProc>{})
 
@@ -531,7 +540,11 @@ struct PolicyTraits<NoOpPreprocess, NoOpPostprocess> {
                                             decltype(eTag_)::value, decltype(kTag_)::value);   \
         });                                                                                    \
     if (!dispatched_) {                                                                        \
-      FLASHINFER_WARN("No tier covers numExperts=%d topK=%d", data.mNumExperts, data.mTopK);   \
+      FLASHINFER_WARN(                                                                         \
+          "No compiled tier covers numExperts=%d topK=%d for ExpertSelect policy %s. "         \
+          "Add a Tier<%d, %d> to PolicyTraits<%s, void> in RoutingCustomPolicy.cuh.",          \
+          data.mNumExperts, data.mTopK, #ExpertSelect, data.mNumExperts, data.mTopK,           \
+          #ExpertSelect);                                                                      \
     }                                                                                          \
   }(PolicyTraits<ExpertSelect, void>{})
 
@@ -582,31 +595,47 @@ struct PolicyTraits<NoOpPreprocess, NoOpPostprocess> {
     FLASHINFER_WARN("Unsupported numExperts");                                                     \
   }
 
+// Single source of truth for runtime → compile-time policy dispatch.
+// Maps (mPreprocessType, mPostprocessType) to compile-time (PreProc, PostProc) policy types.
+// Both LAUNCH_ROUTING_CUSTOM and queryDispatchedMaxExperts use this function,
+// so they are always in sync.
+template <typename Fn>
+inline void dispatchRoutingPolicy(Data const& data, Fn&& fn) {
+  if (data.mPreprocessType == RoutingPreprocessType::SigmoidBias)
+    fn(SigmoidBiasPreprocess{}, ScaledSumNormalizePostprocess{});
+  else if (data.mPreprocessType == RoutingPreprocessType::Sigmoid)
+    fn(SigmoidPreprocess{}, SumNormalizePostprocess{});
+  else if (data.mPreprocessType == RoutingPreprocessType::Softmax &&
+           data.mPostprocessType == RoutingPostprocessType::None)
+    fn(SoftmaxPreprocess{}, NoOpPostprocess{});
+  else if (data.mPreprocessType == RoutingPreprocessType::Softmax)
+    fn(SoftmaxPreprocess{}, SumNormalizePostprocess{});
+  else if (data.mPostprocessType == RoutingPostprocessType::Softmax)
+    fn(NoOpPreprocess{}, SoftmaxPostprocess{});
+  else
+    fn(NoOpPreprocess{}, NoOpPostprocess{});
+}
+
+// Query the MaxNumExperts that the policy tier dispatch would select for the given data.
+inline int32_t queryDispatchedMaxExperts(Data const& data) {
+  int32_t result = getMaxNumExperts(data.mNumExperts);
+  dispatchRoutingPolicy(data, [&](auto preProc, auto postProc) {
+    using Pairs = typename PolicyTraits<decltype(preProc), decltype(postProc)>::Pairs;
+    dispatchTierPairs(static_cast<Pairs*>(nullptr), data,
+                      [&](auto eTag, auto /*kTag*/) { result = decltype(eTag)::value; });
+  });
+  return result;
+}
+
 // Top-level dispatch: maps runtime preprocess/postprocess enums to compile-time policy types,
 // then delegates to LAUNCH_ROUTING_FOR_POLICY which reads PolicyTraits for tier support.
-// Use this ONLY for kernels that call ExpertSelectPolicy::apply (block, cluster, histogramScores).
 #define LAUNCH_ROUTING_CUSTOM(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream) \
-  if (data.mPreprocessType == RoutingPreprocessType::SigmoidBias) {                              \
+  dispatchRoutingPolicy(data, [&](auto preProc_, auto postProc_) {                               \
     LAUNCH_ROUTING_FOR_POLICY(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, \
-                              SigmoidBiasPreprocess, ScaledSumNormalizePostprocess);             \
-  } else if (data.mPreprocessType == RoutingPreprocessType::Sigmoid) {                           \
-    LAUNCH_ROUTING_FOR_POLICY(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, \
-                              SigmoidPreprocess, SumNormalizePostprocess);                       \
-  } else if (data.mPreprocessType == RoutingPreprocessType::Softmax &&                           \
-             data.mPostprocessType == RoutingPostprocessType::None) {                            \
-    LAUNCH_ROUTING_FOR_POLICY(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, \
-                              SoftmaxPreprocess, NoOpPostprocess);                               \
-  } else if (data.mPreprocessType == RoutingPreprocessType::Softmax) {                           \
-    LAUNCH_ROUTING_FOR_POLICY(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, \
-                              SoftmaxPreprocess, SumNormalizePostprocess);                       \
-  } else if (data.mPostprocessType == RoutingPostprocessType::Softmax) {                         \
-    LAUNCH_ROUTING_FOR_POLICY(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, \
-                              NoOpPreprocess, SoftmaxPostprocess);                               \
-  } else {                                                                                       \
-    LAUNCH_ROUTING_FOR_POLICY(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, \
-                              NoOpPreprocess, NoOpPostprocess);                                  \
-  }                                                                                              \
-  ////////////////////////////////////////////////////////////////////////////////////////////////////
+                              decltype(preProc_), decltype(postProc_));                          \
+  })
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 }  // namespace routingCustom
 }  // namespace moe::dev::routing

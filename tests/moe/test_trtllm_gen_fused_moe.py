@@ -3772,6 +3772,283 @@ def test_fp8_per_tensor_autotune_valid_configs_nonefp8(
     )
 
 
+@pytest.mark.parametrize(
+    "num_tokens",
+    [5, 8, 12, 16],
+    ids=lambda t: f"T{t}",
+)
+@pytest.mark.parametrize("hidden_size", [512])
+@pytest.mark.parametrize("intermediate_size", [512])
+@pytest.mark.parametrize(
+    "moe_impl",
+    [
+        pytest.param(
+            FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_DEEPSEEK),
+            id="FP8_Block_DeepSeek",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "routing_config",
+    [
+        pytest.param(
+            {
+                "num_experts": 64,
+                "top_k": 4,
+                "padding": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.Renormalize,
+                "compatible_moe_impls": [FP8BlockScaleMoe],
+                "compatible_intermediate_size": [512],
+                "enable_autotune": False,
+            },
+            id="Renormalize_64e_top4",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "weight_processing",
+    [
+        pytest.param(
+            {
+                "use_shuffled_weight": False,
+                "layout": WeightLayout.MajorK,
+                "compatible_moe_impls": [FP8BlockScaleMoe],
+            },
+            id="NoShuffle_MajorK",
+        ),
+    ],
+)
+@pytest.mark.parametrize("activation_type", [ActivationType.Swiglu])
+def test_dyn_block_kernel_routing(
+    num_tokens,
+    hidden_size,
+    intermediate_size,
+    moe_impl,
+    routing_config,
+    weight_processing,
+    activation_type,
+):
+    """Test token counts 5-16 that exercise the dynamic block kernel path (BlockKernelMaxNumTokens < tokens <= DynBlockKernelMaxNumTokens)."""
+    run_moe_test(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        moe_impl,
+        routing_config,
+        weight_processing,
+        activation_type,
+        cache_permute_indices=False,
+    )
+
+
+@pytest.mark.parametrize("num_tokens", [8])
+@pytest.mark.parametrize("hidden_size", [512])
+@pytest.mark.parametrize("intermediate_size", [512])
+@pytest.mark.parametrize(
+    "moe_impl",
+    [
+        pytest.param(
+            FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_DEEPSEEK),
+            id="FP8_Block_DeepSeek",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "routing_config",
+    [
+        pytest.param(
+            {
+                "num_experts": 1024,
+                "top_k": 8,
+                "padding": 8,
+                "n_groups": 1,
+                "top_k_groups": 1,
+                "routed_scaling": 1.0,
+                "has_routing_bias": True,
+                "routing_method_type": RoutingMethodType.DeepSeekV3,
+                "compatible_moe_impls": [FP8BlockScaleMoe],
+                "compatible_intermediate_size": [512],
+                "enable_autotune": False,
+            },
+            id="DeepSeekV3_1024e_top8",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "weight_processing",
+    [
+        pytest.param(
+            {
+                "use_shuffled_weight": False,
+                "layout": WeightLayout.MajorK,
+                "compatible_moe_impls": [FP8BlockScaleMoe],
+            },
+            id="NoShuffle_MajorK",
+        ),
+    ],
+)
+@pytest.mark.parametrize("activation_type", [ActivationType.Swiglu])
+def test_tier_1024_experts_routing(
+    num_tokens,
+    hidden_size,
+    intermediate_size,
+    moe_impl,
+    routing_config,
+    weight_processing,
+    activation_type,
+):
+    """Test 1024-expert routing to exercise Tier<1024, 32> in SigmoidBias+ScaledSumNormalize policy."""
+    run_moe_test(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        moe_impl,
+        routing_config,
+        weight_processing,
+        activation_type,
+        cache_permute_indices=False,
+    )
+
+
+@pytest.mark.parametrize("num_tokens", [8])
+@pytest.mark.parametrize("hidden_size", [512])
+@pytest.mark.parametrize("intermediate_size", [512])
+@pytest.mark.parametrize(
+    "moe_impl",
+    [
+        pytest.param(
+            FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_DEEPSEEK),
+            id="FP8_Block_DeepSeek",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "routing_config",
+    [
+        pytest.param(
+            {
+                "num_experts": 256,
+                "top_k": 6,
+                "padding": 8,
+                "n_groups": 8,
+                "top_k_groups": 4,
+                "routed_scaling": 2.5,
+                "has_routing_bias": True,
+                "routing_method_type": RoutingMethodType.DeepSeekV3,
+                "compatible_moe_impls": [FP8BlockScaleMoe],
+                "compatible_intermediate_size": [512],
+                "enable_autotune": False,
+            },
+            id="DeepSeekV3_256e",
+        ),
+        pytest.param(
+            {
+                "num_experts": 128,
+                "top_k": 8,
+                "padding": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.Renormalize,
+                "compatible_moe_impls": [FP8BlockScaleMoe],
+                "compatible_intermediate_size": [512],
+                "enable_autotune": False,
+            },
+            id="Renormalize_128e",
+        ),
+        pytest.param(
+            {
+                "num_experts": 128,
+                "top_k": 8,
+                "padding": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.Default,
+                "compatible_moe_impls": [FP8BlockScaleMoe],
+                "compatible_intermediate_size": [512],
+                "enable_autotune": False,
+            },
+            id="Default_128e",
+        ),
+        pytest.param(
+            {
+                "num_experts": 128,
+                "top_k": 8,
+                "padding": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.SigmoidRenorm,
+                "compatible_moe_impls": [FP8BlockScaleMoe],
+                "compatible_intermediate_size": [512],
+                "enable_autotune": False,
+            },
+            id="SigmoidRenorm_128e",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "weight_processing",
+    [
+        pytest.param(
+            {
+                "use_shuffled_weight": False,
+                "layout": WeightLayout.MajorK,
+                "compatible_moe_impls": [FP8BlockScaleMoe],
+            },
+            id="NoShuffle_MajorK",
+        ),
+    ],
+)
+@pytest.mark.parametrize("activation_type", [ActivationType.Swiglu])
+@pytest.mark.parametrize(
+    "routing_logits_dtype",
+    [
+        pytest.param(torch.bfloat16, id="BF16_logits"),
+        pytest.param(torch.float32, id="FP32_logits"),
+    ],
+)
+@pytest.mark.parametrize(
+    "routing_bias_dtype",
+    [
+        pytest.param(None, id="default_bias"),
+        pytest.param(torch.float32, id="FP32_bias"),
+    ],
+)
+def test_routing_dtype_flexibility(
+    num_tokens,
+    hidden_size,
+    intermediate_size,
+    moe_impl,
+    routing_config,
+    weight_processing,
+    activation_type,
+    routing_logits_dtype,
+    routing_bias_dtype,
+):
+    """Test that routing works with both bfloat16 and float32 logits/bias across all routing methods."""
+    run_moe_test(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        moe_impl,
+        routing_config,
+        weight_processing,
+        activation_type,
+        cache_permute_indices=False,
+        routing_logits_dtype=routing_logits_dtype,
+        routing_bias_dtype=routing_bias_dtype,
+    )
+
+
 def test_fp8_block_scale_routed_activation_type_relu2_smoke():
     """Smoke test routed FP8 block-scale call path with explicit non-gated activation_type."""
     compute_capability = get_compute_capability(torch.device(device="cuda"))

@@ -506,8 +506,7 @@ void run(Data const& data, void* stream) {
           "When mPtrTopKIds is provided, mPtrTopKWeights must also be provided for Llama4 "
           "routing.");
     }
-    int const numThreadsHist = routingCustom::getMaxNumExperts(data.mNumExperts);
-    runPostTopKPipeline(data, numThreadsHist, stream);
+    runPostTopKPipeline(data, stream);
     return;
   }
   FLASHINFER_CHECK(
