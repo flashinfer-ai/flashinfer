@@ -5,7 +5,7 @@
 
 Mirrors C++ CUTLASS's KernelSchedule concept (e.g. Sm100FmhaCtxKernelWarpspecializedSchedule).
 Separates warp-to-role mapping and register allocation from the kernel and config,
-making it swappable between FMHA, MLA, and future attention variants.
+making it swappable between FMHA and future attention variants.
 """
 
 from __future__ import annotations
@@ -83,8 +83,3 @@ class WarpSchedule:
 
 
 PREFILL_SCHEDULE = WarpSchedule()
-
-MLA_SCHEDULE = WarpSchedule(
-    num_regs_softmax=184,
-    num_regs_other=48,
-)

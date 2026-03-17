@@ -5,7 +5,7 @@
 
 All helpers are standalone @cute.jit functions that take mask_type and
 window_left as compile-time parameters, so they can be reused across
-different kernel variants (prefill, decode, MLA).
+different kernel variants (prefill, decode).
 """
 
 import enum

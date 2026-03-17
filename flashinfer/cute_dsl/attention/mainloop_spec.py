@@ -9,22 +9,17 @@ Sm100FmhaFwdMainloopTmaWarpspecialized), this bundles:
 - TmemLayout (TMEM allocation map)
 - WarpSchedule (warp role assignment and register budgets)
 - Stage counts and buffer sizes
-
-Different MainloopSpec instances enable different kernel variants
-(FMHA prefill, MLA decode) to share the same kernel dispatcher.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Tuple
+from typing import Dict
 
 from .config import AttentionConfig
 from .tmem_layout import TmemLayout
 from .warp_schedule import WarpSchedule, PREFILL_SCHEDULE
-from .pipeline_topology import PipelineTopology, make_prefill_topology, make_mla_topology
-from .mla_config import MLAConfig
-from .mla_warp_schedule import MLAWarpSchedule, MLA_DECODE_SCHEDULE
+from .pipeline_topology import PipelineTopology, make_prefill_topology
 
 
 @dataclass
@@ -100,74 +95,5 @@ def make_prefill_mainloop_spec(
         config=config,
         warp_schedule=sched,
         tmem_layout=tmem,
-        pipeline_topology=topo,
-    )
-
-
-@dataclass
-class MLAMainloopSpec:
-    """Bundles MLA config, warp schedule, pipeline topology, and stage counts.
-
-    Stage counts that depend on input dtype (load_kv_stages) are resolved
-    by calling resolve(dtype_width) after input types are known.
-    """
-
-    config: MLAConfig
-    warp_schedule: MLAWarpSchedule
-    pipeline_topology: PipelineTopology
-
-    load_q_stages: int = 0
-    load_kv_stages: int = 0
-    mma_s_stages: int = 2
-    p_mma_stages: int = 2
-    mma_o_stages: int = 1
-    load_pt_stages: int = 1
-
-    def resolve(self, dtype_width: int) -> None:
-        """Resolve dtype-dependent stage counts and rebuild the topology.
-
-        :param dtype_width: Bit width of the input element type (e.g. 16 for fp16).
-        """
-        dtype_bytes = dtype_width // 8
-        self.load_q_stages = self.config.iterations_qk
-        self.load_kv_stages = 24 // dtype_bytes
-        self.load_pt_stages = self.load_kv_stages if self.config.is_cpasync else 1
-
-        self.pipeline_topology = make_mla_topology(
-            self.warp_schedule,
-            load_q_stages=self.load_q_stages,
-            load_kv_stages=self.load_kv_stages,
-            mma_s_stages=self.mma_s_stages,
-            p_mma_stages=self.p_mma_stages,
-            mma_o_stages=self.mma_o_stages,
-            cluster_scale=self.config.cluster_shape_mnk[0],
-        )
-
-    @property
-    def tmem_o_offset(self) -> int:
-        return self.mma_s_stages * self.config.mma_qk_tiler[1] // self.config.warps_in_n
-
-    def barrier_stage_counts(self) -> Dict[str, int]:
-        result = {}
-        for edge in self.pipeline_topology.edges:
-            result[edge.name] = edge.barrier_stages
-        return result
-
-
-def make_mla_mainloop_spec(
-    config: MLAConfig,
-    warp_schedule: MLAWarpSchedule | None = None,
-) -> MLAMainloopSpec:
-    """Create an MLAMainloopSpec for MLA decode.
-
-    :param config: MLA configuration.
-    :param warp_schedule: Optional warp schedule override (defaults to MLA_DECODE_SCHEDULE).
-    """
-    sched = warp_schedule if warp_schedule is not None else MLA_DECODE_SCHEDULE
-    topo = make_mla_topology(sched, load_q_stages=1, load_kv_stages=1)
-
-    return MLAMainloopSpec(
-        config=config,
-        warp_schedule=sched,
         pipeline_topology=topo,
     )

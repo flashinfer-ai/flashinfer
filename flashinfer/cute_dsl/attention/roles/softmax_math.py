@@ -3,7 +3,7 @@
 
 """Shared softmax math primitives for attention kernels.
 
-Used by both FMHA (SoftmaxRole) and MLA (MLASoftmaxRole) to avoid
+Used by FMHA (SoftmaxRole) to avoid
 duplicating the core exp2-scale and packed row-sum reduction logic.
 """
 

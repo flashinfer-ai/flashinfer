@@ -26,7 +26,7 @@ class HeadMapping(enum.Enum):
     """How attention heads map to MMA tile dimensions.
 
     GRID: Heads in grid/loop dimension (prefill, training). Any head count works.
-    MMA_M: All heads packed into MMA M-dimension (MLA decode).
+    MMA_M: All heads packed into MMA M-dimension (decode).
     MMA_N: GQA group packed into MMA N-dimension (standard GQA decode).
     """
 
@@ -39,7 +39,7 @@ class HeadMapping(enum.Enum):
 class TileBounds:
     """Handles partial MMA tile filling when logical data < physical tile size.
 
-    Most critical for MLA decode where num_heads < 128 (the MMA M-tile width).
+    Most critical for decode where num_heads < 128 (the MMA M-tile width).
     Compiles away via cutlass.const_expr when no masking is needed.
     """
 
@@ -71,7 +71,7 @@ class AttentionConfig:
     num_repeat_kv_heads: int = 1
     window_left: int = -1
 
-    # Future extensions for decode/MLA
+    # Future extensions for decode
     head_mapping: HeadMapping = HeadMapping.GRID
     num_heads: int = 0
     num_kv_heads: int = 0

@@ -1,7 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Shared TMEM utilities for MLA compute roles.
+"""Shared TMEM utilities for compute roles.
 
 Provides tmem_load_partition() — partitions TMEM output accumulator for
 load/store by the rescale and epilogue roles.
