@@ -118,3 +118,47 @@ def test_kv_scale_forwarding_math_property(dtype: torch.dtype):
     )
     out3_ref, _ = wrapper.forward_return_lse(q * k_scale, paged_kv_cache)
     torch.testing.assert_close(out3, out3_ref * v_scale, rtol=1e-2, atol=1e-3)
+
+
+def test_batch_prefill_invalid_fixed_cta_tile_q():
+    batch_size = 2
+    qo_len = 8
+    kv_len = 128
+    page_size = 16
+    num_kv_heads = 2
+    group_size = 2
+    num_qo_heads = num_kv_heads * group_size
+    head_dim = 64
+
+    q_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda:0", dtype=torch.int32) * qo_len
+    )
+    num_pages_per_seq = (kv_len + page_size - 1) // page_size
+    total_num_pages = num_pages_per_seq * batch_size
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda:0", dtype=torch.int32)
+        * num_pages_per_seq
+    )
+    kv_indices = torch.arange(0, total_num_pages, device="cuda:0", dtype=torch.int32)
+    kv_last_page_len = torch.full(
+        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32, device="cuda:0"
+    )
+
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
+    wrapper = BatchPrefillWithPagedKVCacheWrapper(workspace_buffer, "NHD")
+    with pytest.raises(ValueError, match="fixed_cta_tile_q should be one of"):
+        wrapper.plan(
+            q_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            q_data_type=torch.float16,
+            kv_data_type=torch.float16,
+            fixed_split_size=2048,
+            disable_split_kv=True,
+            fixed_cta_tile_q=32,
+        )

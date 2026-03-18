@@ -2230,7 +2230,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             (or ``bf16`` on SM80+), and the ``fa2`` tensor-core backend is forced.
             Defaults to ``False``.
         fixed_cta_tile_q : Optional[int]
-            Fixed CTA tile size for FA2 prefill planning. Supported values are ``16``, ``64``, and
+            Fixed CTA tile size for FA2 attention planning. Supported values are ``16``, ``64``, and
             ``128``. Defaults to ``None`` (auto heuristic).
         Note
         ----
