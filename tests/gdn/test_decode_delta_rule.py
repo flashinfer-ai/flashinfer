@@ -23,7 +23,6 @@ import random
 import torch
 import pytest
 
-pytestmark = pytest.mark.skip(reason="Temporarily skipped due to CI failures.")
 
 try:
     from .reference_delta_rule import decode_delta_rule, verify_delta_rule
@@ -203,6 +202,7 @@ def _test_decode_kernel_pretranspose(
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 32)],
 )
+@pytest.mark.skip(reason="Temporarily skipped due to CI failures.")
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64, 128, 256, 512])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_decode_kernel_basic_pretranspose(
@@ -368,6 +368,7 @@ def _test_decode_kernel_nontranspose(
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 32)],
 )
+@pytest.mark.skip(reason="Temporarily skipped due to CI failures.")
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64, 128, 256, 512])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_decode_kernel_basic_nontranspose(
@@ -512,6 +513,7 @@ def _test_decode_kernel_pretranspose_pool(
 @pytest.mark.parametrize("scale", [1.0])
 @pytest.mark.parametrize("head_size", [128])
 @pytest.mark.parametrize("num_q_heads, num_k_heads, num_v_heads", [(16, 16, 32)])
+@pytest.mark.skip(reason="Temporarily skipped due to CI failures.")
 @pytest.mark.parametrize("batch_size", [1, 4, 16, 32])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_decode_kernel_pretranspose_pool(
@@ -768,6 +770,7 @@ def _test_decode_kernel_pretranspose_pool_all_padding(
 @pytest.mark.parametrize("scale", [1.0])
 @pytest.mark.parametrize("head_size", [128])
 @pytest.mark.parametrize("num_q_heads, num_k_heads, num_v_heads", [(16, 16, 32)])
+@pytest.mark.skip(reason="Temporarily skipped due to CI failures.")
 @pytest.mark.parametrize("batch_size", [1, 4, 8, 32, 127])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_decode_kernel_pretranspose_pool_negative_indices(
@@ -795,6 +798,7 @@ def test_decode_kernel_pretranspose_pool_negative_indices(
 @pytest.mark.parametrize("scale", [1.0])
 @pytest.mark.parametrize("head_size", [128])
 @pytest.mark.parametrize("num_q_heads, num_k_heads, num_v_heads", [(16, 16, 32)])
+@pytest.mark.skip(reason="Temporarily skipped due to CI failures.")
 @pytest.mark.parametrize("batch_size", [1, 4, 16, 32])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_decode_kernel_pretranspose_pool_all_padding(
@@ -931,6 +935,15 @@ def _test_decode_kernel_bf16_padding_indices(
     torch.testing.assert_close(
         pool_under_test[unused_mask], pool[unused_mask], atol=0.0, rtol=0.0
     )
+
+    # Slot 0 (null buffer) must have been written by padding slots.
+    # Without the kernel-level fix, padding slots do an OOB write to gH[-1]
+    # (before the pool base) leaving slot 0 untouched — this assertion catches that.
+    if mask.any():
+        assert not torch.equal(pool_under_test[0], pool[0]), (
+            "Slot 0 (null buffer) should have been updated by padding slots; "
+            "if it is unchanged the kernel fix is missing"
+        )
 
     print(
         f"✓ bf16 padding indices test passed "
@@ -1152,6 +1165,7 @@ def _test_verify_kernel_mtp(
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 32)],
 )
+@pytest.mark.skip(reason="Temporarily skipped due to CI failures.")
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_verify_kernel_mtp(
@@ -1192,6 +1206,7 @@ def test_verify_kernel_mtp(
 
 
 @pytest.mark.parametrize("seq_len", [2, 3, 4, 5, 6, 7, 8])
+@pytest.mark.skip(reason="Temporarily skipped due to CI failures.")
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64, 128, 256, 512])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_mtp_fp32_state_with_cache_and_state_update(
@@ -1404,6 +1419,7 @@ def _test_gdn_decode_klast_bf16_state_kernel(
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 32)],
 )
+@pytest.mark.skip(reason="Temporarily skipped due to CI failures.")
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64, 128])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_gdn_decode_klast_bf16_state_kernel(
@@ -1435,6 +1451,7 @@ def test_gdn_decode_klast_bf16_state_kernel(
     )
 
 
+@pytest.mark.skip(reason="Temporarily skipped due to CI failures.")
 @pytest.mark.parametrize("seq_len", [1, 2, 3, 4])
 @pytest.mark.parametrize("batch_size", [1, 2, 4])
 @pytest.mark.parametrize("head_size", [128])
