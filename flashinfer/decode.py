@@ -1280,11 +1280,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
         )
-        expected_q_len = self._batch_size * q_len_per_req
+        actual_batch_size = self._paged_kv_last_page_len_buf.size(0)
+        expected_q_len = actual_batch_size * q_len_per_req
         if q.size(0) != expected_q_len:
             raise ValueError(
                 f"q.shape[0] ({q.size(0)}) does not match batch_size * q_len_per_req "
-                f"({self._batch_size} * {q_len_per_req} = {expected_q_len}). "
+                f"({actual_batch_size} * {q_len_per_req} = {expected_q_len}). "
                 f"For batch decode, q must have shape [batch_size * q_len_per_req, num_heads, head_dim]."
             )
 

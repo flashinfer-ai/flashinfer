@@ -2165,13 +2165,23 @@ class BatchPrefillWithPagedKVCacheWrapper:
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
         )
-        expected_qo_len = self._qo_indptr_buf[-1].item()
-        if q.size(0) != expected_qo_len:
-            raise ValueError(
-                f"q.shape[0] ({q.size(0)}) does not match qo_indptr[-1] ({expected_qo_len}). "
-                f"For paged prefill, q must have shape [total_tokens, num_heads, head_dim] "
-                f"where total_tokens = qo_indptr[-1]."
-            )
+        # Validate q shape matches qo_indptr
+        expected_qo_indptr_last = self._qo_indptr_buf[-1].item()
+        if self._backend == "cudnn":
+            # cudnn uses element-offset indptr: qo_indptr[-1] = total_tokens * num_heads * head_dim
+            if q.numel() != expected_qo_indptr_last:
+                raise ValueError(
+                    f"q.numel() ({q.numel()}) does not match qo_indptr[-1] ({expected_qo_indptr_last}). "
+                    f"For cudnn paged prefill, qo_indptr uses element offsets "
+                    f"(total_tokens * num_heads * head_dim)."
+                )
+        else:
+            if q.size(0) != expected_qo_indptr_last:
+                raise ValueError(
+                    f"q.shape[0] ({q.size(0)}) does not match qo_indptr[-1] ({expected_qo_indptr_last}). "
+                    f"For paged prefill, q must have shape [total_tokens, num_heads, head_dim] "
+                    f"where total_tokens = qo_indptr[-1]."
+                )
         o_dtype = self._cached_o_data_type
         if out is not None and out.dtype != o_dtype:
             raise ValueError(
@@ -3078,13 +3088,22 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             q, k, self._cached_q_data_type, self._cached_kv_data_type
         )
         # Validate q shape matches qo_indptr
-        expected_qo_len = self._qo_indptr_buf[-1].item()
-        if q.size(0) != expected_qo_len:
-            raise ValueError(
-                f"q.shape[0] ({q.size(0)}) does not match qo_indptr[-1] ({expected_qo_len}). "
-                f"For ragged prefill, q must have shape [total_tokens, num_heads, head_dim] "
-                f"where total_tokens = qo_indptr[-1]."
-            )
+        expected_qo_indptr_last = self._qo_indptr_buf[-1].item()
+        if self._backend == "cudnn":
+            # cudnn uses element-offset indptr: qo_indptr[-1] = total_tokens * num_heads * head_dim
+            if q.numel() != expected_qo_indptr_last:
+                raise ValueError(
+                    f"q.numel() ({q.numel()}) does not match qo_indptr[-1] ({expected_qo_indptr_last}). "
+                    f"For cudnn ragged prefill, qo_indptr uses element offsets "
+                    f"(total_tokens * num_heads * head_dim)."
+                )
+        else:
+            if q.size(0) != expected_qo_indptr_last:
+                raise ValueError(
+                    f"q.shape[0] ({q.size(0)}) does not match qo_indptr[-1] ({expected_qo_indptr_last}). "
+                    f"For ragged prefill, q must have shape [total_tokens, num_heads, head_dim] "
+                    f"where total_tokens = qo_indptr[-1]."
+                )
 
         window_left = self._window_left
         logits_soft_cap = self._logits_soft_cap
