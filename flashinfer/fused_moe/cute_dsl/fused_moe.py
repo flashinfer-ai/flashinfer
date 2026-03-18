@@ -193,7 +193,8 @@ def _moe_core_impl(
         )
     else:
         assert moe_output.size(0) == num_tokens, (
-            "moe_output must be sliced to num_tokens rows before calling _moe_core_impl"
+            f"moe_output must be sliced to num_tokens rows before calling "
+            f"_moe_core_impl (got {moe_output.size(0)}, expected {num_tokens})"
         )
 
     # Get stream resources if using async memset
