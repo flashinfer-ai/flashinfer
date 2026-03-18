@@ -167,9 +167,10 @@ def skip_checks(
             f"Incompatible: logits_dtype={logits_dtype} with DeepSeekV3 routing"
         )
 
-    if logits_dtype == torch.float32 and type(moe_impl) not in [
+    if logits_dtype == torch.float32 and moe_impl.quant_mode not in [
         QuantMode.FP8_PER_TENSOR,
-        QuantMode.FP8_BLOCK_SCALE,
+        QuantMode.FP8_BLOCK_SCALE_DEEPSEEK,
+        QuantMode.FP8_BLOCK_SCALE_MXFP8,
         QuantMode.BF16,
     ]:
         pytest.skip(

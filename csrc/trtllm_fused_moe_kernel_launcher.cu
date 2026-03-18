@@ -310,11 +310,13 @@ class FusedMoeLauncher {
     workspace.cta_idx_xy_to_mn_limit = static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr());
     workspace.num_non_exiting_ctas = static_cast<int*>(num_non_exiting_ctas.data_ptr());
 
-    // Set dtype of score
+    // Set dtype of score based on actual routing_logits dtype
     if (routing_logits.has_value()) {
       if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3) {
         TVM_FFI_ICHECK_EQ(routing_logits.value().dtype(), dl_float32)
             << "routing_logits must be float.";
+        mDtypeScore = btg::Dtype::Fp32;
+      } else if (routing_logits.value().dtype() == dl_float32) {
         mDtypeScore = btg::Dtype::Fp32;
       } else {
         mDtypeScore = btg::Dtype::Bfloat16;
@@ -516,8 +518,9 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
     if (has_precomputed_weights) {
       workspace.expert_weights = const_cast<void*>(expert_weights.data_ptr());
     } else {
+      auto ew_dtype = mDtypeScore == btg::Dtype::Fp32 ? dl_float32 : dl_bfloat16;
       FusedMoeLauncher::expert_weights =
-          alloc_tensor({args->num_tokens, args->top_k}, dl_bfloat16, hidden_states.device());
+          alloc_tensor({args->num_tokens, args->top_k}, ew_dtype, hidden_states.device());
       workspace.expert_weights = FusedMoeLauncher::expert_weights.data_ptr();
     }
   }
@@ -656,8 +659,9 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
         routing_bias.has_value() ? routing_bias.value().dtype() : dl_bfloat16;
     mRoutingBiasDtype = routing_bias_dtype == dl_bfloat16 ? btg::Dtype::Bfloat16 : btg::Dtype::Fp32;
 
+    auto expert_weights_dtype = mDtypeScore == btg::Dtype::Fp32 ? dl_float32 : dl_bfloat16;
     expert_weights =
-        alloc_tensor({args->num_tokens, args->top_k}, dl_bfloat16, hidden_states.device());
+        alloc_tensor({args->num_tokens, args->top_k}, expert_weights_dtype, hidden_states.device());
 
     workspace.expert_weights = expert_weights.data_ptr();
     if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4) {
@@ -931,9 +935,9 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     // Check ndim==2 and size>0 because empty placeholder tensors may have non-null data_ptr
     bool has_precomputed_weights = expert_weights.ndim() == 2 && expert_weights.size(0) > 0;
     if (!has_precomputed_weights) {
-      // Allocate expert_weights buffer for routing output
+      auto ew_dtype = mDtypeScore == btg::Dtype::Fp32 ? dl_float32 : dl_bfloat16;
       FusedMoeLauncher::expert_weights =
-          alloc_tensor({args->num_tokens, args->top_k}, dl_bfloat16, hidden_states.device());
+          alloc_tensor({args->num_tokens, args->top_k}, ew_dtype, hidden_states.device());
       workspace.expert_weights = FusedMoeLauncher::expert_weights.data_ptr();
     } else {
       workspace.expert_weights = const_cast<void*>(expert_weights.data_ptr());
@@ -1206,8 +1210,9 @@ class MxInt4BlockScaleLauncher : public FusedMoeLauncher {
         routing_bias.has_value() ? routing_bias.value().dtype() : dl_bfloat16;
     mRoutingBiasDtype = routing_bias_dtype == dl_bfloat16 ? btg::Dtype::Bfloat16 : btg::Dtype::Fp32;
 
+    auto expert_weights_dtype = mDtypeScore == btg::Dtype::Fp32 ? dl_float32 : dl_bfloat16;
     expert_weights =
-        alloc_tensor({args->num_tokens, args->top_k}, dl_bfloat16, hidden_states.device());
+        alloc_tensor({args->num_tokens, args->top_k}, expert_weights_dtype, hidden_states.device());
 
     workspace.expert_weights = expert_weights.data_ptr();
   }

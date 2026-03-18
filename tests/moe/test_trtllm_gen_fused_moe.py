@@ -3156,8 +3156,8 @@ def test_deepseekv3_routing(
         routing_config,
         weight_processing,
         activation_type,
-        logits_dtype,
         cache_permute_indices,
+        logits_dtype,
     )
 
 
@@ -3374,6 +3374,7 @@ def test_nvfp4_moe_gemm_bias(
         },
         activation_type=ActivationType.Swiglu,
         cache_permute_indices=cache_permute_indices,
+        logits_dtype=torch.bfloat16,
         gemm1_bias=gemm1_bias,
         gemm2_bias=gemm2_bias,
     )
