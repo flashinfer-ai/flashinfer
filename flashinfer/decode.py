@@ -905,7 +905,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         disable_split_kv : bool,
             Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
         fixed_cta_tile_q : Optional[int]
-            Fixed CTA tile size for FA2 prefill planning. Supported values are ``16``, ``64``, and
+            Fixed CTA tile size for FA2 attention planning. Supported values are ``16``, ``64``, and
             ``128``. Defaults to ``None`` (auto heuristic).
         Note
         ----
