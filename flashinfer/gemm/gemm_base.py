@@ -249,7 +249,7 @@ def _tgv_gemm_requirement(
 ):
     if out_dtype != torch.bfloat16:
         raise ValueError(
-            "You cannot provide an output dtype to the TGV backend. Use the CUTLASS backend instead."
+            "You cannot provide an output dtype to the TGV backend. Use the CUTLASS or cuDNN backend instead."
         )
     return True
 
@@ -355,10 +355,12 @@ def mm_bf16(
         Whether to use persistant data loader mode. Enabled for TGV backend. Defaults to ``False``.
 
     out: Optional[torch.Tensor]
-        Out tensor, shape (m, n), bf16 or fp16. Enabled for CUTLASS backend. Defaults to ``None``.
+        Out tensor, shape (m, n), bf16, fp16, or fp32. Enabled for CUTLASS and cuDNN backends.
+        Defaults to ``None``.
 
     out_dtype: torch.dtype
-        Output dtype, bf16 or fp16. Enabled for CUTLASS and cuDNN backends. Defaults to ``torch.bfloat16``.
+        Output dtype, bf16, fp16, or fp32. Enabled for CUTLASS and cuDNN backends.
+        Defaults to ``torch.bfloat16``.
 
     backend: Literal["cudnn", "cutlass", "tgv", "auto"]
         The backend to use for the operation. Defaults to ``"cudnn"``.
@@ -370,7 +372,7 @@ def mm_bf16(
     Returns
     -------
     torch.Tensor
-        Out tensor, shape (m, n), bf16 or fp16 in row-major layout.
+        Out tensor, shape (m, n), bf16, fp16, or fp32 in row-major layout.
 
     Examples
     --------
@@ -534,10 +536,10 @@ def bmm_bf16(
         Weight tensor, shape (b, k, n), bf16 in column-major layout.
 
     out: Optional[torch.Tensor]
-        Out tensor, shape (b, m, n), bf16 or fp16, defaults to ``None``.
+        Out tensor, shape (b, m, n), bf16, fp16, or fp32, defaults to ``None``.
 
     out_dtype: torch.dtype
-        Output dtype, bf16 (default) or fp16.
+        Output dtype, bf16 (default), fp16, or fp32.
 
     backend: Literal["cudnn", "cutlass", "auto"]
         Backend to use, defaults to "cudnn". ``"auto"`` allows selecting the best tactic from all available backends when autotune is enabled.
@@ -545,7 +547,7 @@ def bmm_bf16(
     Returns
     -------
     torch.Tensor
-        Out tensor, shape (b, m, n), bf16 or fp16 in row-major layout.
+        Out tensor, shape (b, m, n), bf16, fp16, or fp32 in row-major layout.
 
     Examples
     --------
@@ -1720,18 +1722,22 @@ def _is_cublas_fp4_available_in_cudnn():
     )
 
 
-# Global cudnn handle. need to make it per device in future
-_cudnn_handle = None
+# One cudnn handle per each GPU
+_cudnn_handles: dict[int, int] = {}
 
 
-def _get_cudnn_handle(stream: torch.cuda.Stream):
+def _get_cudnn_handle(device, stream: torch.cuda.Stream):
     """Create and return a cached cuDNN handle."""
-    global _cudnn_handle
-    if _cudnn_handle is None:
+    global _cudnn_handles
+    device_id = device.index
+
+    if _cudnn_handles.get(device_id) is None:
         _check_cudnn_availability()
-        _cudnn_handle = cudnn.create_handle()
-    cudnn.set_stream(_cudnn_handle, stream.cuda_stream)
-    return _cudnn_handle
+        _cudnn_handles[device_id] = cudnn.create_handle()
+        print("cudnn_handle created for device_id = {}\n".format(device_id))
+    cudnn.set_stream(_cudnn_handles[device_id], stream.cuda_stream)
+
+    return _cudnn_handles[device_id]
 
 
 def _validate_fp8_output_dtype(dtype: torch.dtype):
@@ -1744,15 +1750,15 @@ def _validate_fp8_output_dtype(dtype: torch.dtype):
 
 
 def _validate_bf16_output_dtype(dtype: torch.dtype):
-    """Validate that the output dtype is either bf16 or fp16."""
-    if dtype not in (torch.bfloat16, torch.float16):
+    """Validate that the output dtype is bf16, fp16, or fp32."""
+    if dtype not in (torch.bfloat16, torch.float16, torch.float32):
         raise ValueError(
             f"Unsupported output dtype: {dtype}. "
-            f"Only torch.bfloat16 and torch.float16 are supported for BF16 GEMM operations."
+            f"Only torch.bfloat16, torch.float16, and torch.float32 are supported for BF16 GEMM operations."
         )
 
 
-@functools.cache
+@functools.lru_cache(maxsize=1024)
 def create_cudnn_execution_plans_fp4_gemm(
     a_shape,
     a_stride,
@@ -1770,7 +1776,7 @@ def create_cudnn_execution_plans_fp4_gemm(
     use_nvfp4,
 ):
     stream = torch.cuda.current_stream(device)
-    with cudnn.graph(_get_cudnn_handle(stream)) as (graph, _):
+    with cudnn.graph(_get_cudnn_handle(device, stream)) as (graph, _):
         scale_type = cudnn.data_type.FP8_E4M3 if use_nvfp4 else cudnn.data_type.FP8_E8M0
 
         a_cudnn_tensor = graph.tensor(
@@ -1853,7 +1859,7 @@ def create_cudnn_execution_plans_fp4_gemm(
         return graph
 
 
-@functools.cache
+@functools.lru_cache(maxsize=1024)
 def build_plans_cudnn_fp4_gemm_graph(
     a_shape,
     a_stride,
@@ -1927,10 +1933,15 @@ def execute_cudnn_gemm_fp4_graph(
     stream = torch.cuda.current_stream(a.device)
 
     if tactic == -1:
-        graph.execute(variant_pack, workspace_buffer, handle=_get_cudnn_handle(stream))
+        graph.execute(
+            variant_pack, workspace_buffer, handle=_get_cudnn_handle(a.device, stream)
+        )
     else:
         graph.execute_plan_at_index(
-            variant_pack, workspace_buffer, tactic, handle=_get_cudnn_handle(stream)
+            variant_pack,
+            workspace_buffer,
+            tactic,
+            handle=_get_cudnn_handle(a.device, stream),
         )
 
 
@@ -1962,14 +1973,19 @@ def execute_cudnn_gemm_mxfp8_graph(
     stream = torch.cuda.current_stream(a.device)
 
     if tactic == -1:
-        graph.execute(variant_pack, workspace_buffer, handle=_get_cudnn_handle(stream))
+        graph.execute(
+            variant_pack, workspace_buffer, handle=_get_cudnn_handle(a.device, stream)
+        )
     else:
         graph.execute_plan_at_index(
-            variant_pack, workspace_buffer, tactic, handle=_get_cudnn_handle(stream)
+            variant_pack,
+            workspace_buffer,
+            tactic,
+            handle=_get_cudnn_handle(a.device, stream),
         )
 
 
-@functools.cache
+@functools.lru_cache(maxsize=1024)
 def build_cudnn_gemm_with_per_tensor_q_graph(
     a_shape, a_stride, b_shape, b_stride, a_type, b_type, o_type, device
 ):
@@ -1992,7 +2008,7 @@ def build_cudnn_gemm_with_per_tensor_q_graph(
     _check_cudnn_availability()
 
     stream = torch.cuda.current_stream(device)
-    with cudnn.graph(_get_cudnn_handle(stream)) as (graph, _):
+    with cudnn.graph(_get_cudnn_handle(device, stream)) as (graph, _):
         a_cudnn_tensor = graph.tensor(
             name="a", dim=a_shape, stride=a_stride, data_type=a_type
         )
@@ -2062,7 +2078,7 @@ def execute_cudnn_gemm_with_per_tensor_q_graph(
     }
 
     stream = torch.cuda.current_stream(a.device)
-    cudnn_handle = _get_cudnn_handle(stream)
+    cudnn_handle = _get_cudnn_handle(a.device, stream)
 
     if workspace.numel() < graph.get_workspace_size():
         workspace = torch.empty(
@@ -2077,6 +2093,8 @@ def _torch_data_type_to_cudnn_data_type(dtype: torch.dtype):
         return cudnn.data_type.BFLOAT16
     elif dtype == torch.float16:
         return cudnn.data_type.HALF
+    elif dtype == torch.float32:
+        return cudnn.data_type.FLOAT
     elif dtype == torch.float8_e4m3fn:
         return cudnn.data_type.FP8_E4M3
     elif dtype == torch.float8_e5m2:
@@ -2154,7 +2172,7 @@ def build_cudnn_gemm_bf16_graph(a_shape, a_stride, b_shape, b_stride, o_type, de
     _check_cudnn_availability()
 
     stream = torch.cuda.current_stream(device)
-    with cudnn.graph(_get_cudnn_handle(stream)) as (graph, _):
+    with cudnn.graph(_get_cudnn_handle(device, stream)) as (graph, _):
         a_cudnn_tensor = graph.tensor(
             name="a", dim=a_shape, stride=a_stride, data_type=cudnn.data_type.BFLOAT16
         )
@@ -2190,7 +2208,7 @@ def execute_cudnn_gemm_bf16_graph(graph, a, b, c_final, workspace, tactic: int =
     }
 
     stream = torch.cuda.current_stream(a.device)
-    cudnn_handle = _get_cudnn_handle(stream)
+    cudnn_handle = _get_cudnn_handle(a.device, stream)
 
     if workspace.numel() < graph.get_workspace_size():
         workspace = torch.empty(
@@ -5696,7 +5714,7 @@ def _calculate_block_scale_dims(
     return block_scale_dim_m, block_scale_dim_n, block_scale_dim_k
 
 
-@functools.cache
+@functools.lru_cache(maxsize=1024)
 def create_cudnn_execution_plans_mxfp8_gemm(
     a_shape,
     a_stride,
@@ -5755,7 +5773,7 @@ def create_cudnn_execution_plans_mxfp8_gemm(
     scale_type = cudnn.data_type.FP8_E8M0
 
     stream = torch.cuda.current_stream(device)
-    with cudnn.graph(_get_cudnn_handle(stream)) as (graph, _):
+    with cudnn.graph(_get_cudnn_handle(device, stream)) as (graph, _):
         a_cudnn_tensor = graph.tensor(
             name="a",
             dim=tuple(a_shape),  # [b, m, k]
