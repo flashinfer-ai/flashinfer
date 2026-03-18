@@ -45,4 +45,36 @@ __device__ __forceinline__ int xor_swizzle(int address) {
   return cycle * cycle_length + new_bank_idx * bank_size + intra_bank;
 }
 
+// ── SM100 f32x2 packed SIMD helpers ──────────────────────────────────────────
+// On Blackwell (SM100+), {mul,fma}.f32x2 pack two fp32 operations into one
+// instruction and issue on the dedicated FMUL2 pipeline, which runs in parallel
+// with the regular FMA pipe.  This halves instruction count for element-wise
+// fp32 math on independent pairs (e.g. adjacent state-vector components).
+// On older architectures the fallback is two scalar ops — zero overhead.
+// See: https://github.com/NVIDIA/cutlass/blob/main/include/cute/arch/simd_sm100.hpp
+
+__device__ __forceinline__ void mul_f32x2(float2& c, float2 const& a, float2 const& b) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+  asm("mul.f32x2 %0, %1, %2;\n"
+      : "=l"(reinterpret_cast<uint64_t&>(c))
+      : "l"(reinterpret_cast<uint64_t const&>(a)), "l"(reinterpret_cast<uint64_t const&>(b)));
+#else
+  c.x = a.x * b.x;
+  c.y = a.y * b.y;
+#endif
+}
+
+__device__ __forceinline__ void fma_f32x2(float2& d, float2 const& a, float2 const& b,
+                                          float2 const& c) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+  asm("fma.rn.f32x2 %0, %1, %2, %3;\n"
+      : "=l"(reinterpret_cast<uint64_t&>(d))
+      : "l"(reinterpret_cast<uint64_t const&>(a)), "l"(reinterpret_cast<uint64_t const&>(b)),
+        "l"(reinterpret_cast<uint64_t const&>(c)));
+#else
+  d.x = a.x * b.x + c.x;
+  d.y = a.y * b.y + c.y;
+#endif
+}
+
 }  // namespace flashinfer::mamba::mtp
