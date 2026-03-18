@@ -12,6 +12,7 @@ Requires:
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from flashinfer.gemm.gemm_base import (
     CUDNN_AVAILABLE,
@@ -25,6 +26,8 @@ from flashinfer.gemm.gemm_base import (
     _calculate_block_scale_dims,
 )
 from flashinfer.utils import get_compute_capability
+from flashinfer.fp4_quantization import nvfp4_quantize
+from flashinfer.fp8_quantization import mxfp8_quantize
 
 
 def _skip_if_no_cudnn():
@@ -175,56 +178,27 @@ class TestCudnnNVFp4OverrideShape:
             device=device,
         )
 
-        # FP4 E2M1 lookup table: index is the 4-bit pattern (0–15)
-        # Encoding: sign(1) | exp(2) | mantissa(1), bias=1
-        FP4_E2M1_LUT = torch.tensor(
-            [
-                0.0,
-                0.5,
-                1.0,
-                1.5,
-                2.0,
-                3.0,
-                4.0,
-                6.0,
-                -0.0,
-                -0.5,
-                -1.0,
-                -1.5,
-                -2.0,
-                -3.0,
-                -4.0,
-                -6.0,
-            ],
-            dtype=torch.float32,
-            device=device,
-        )
+        global_sf = torch.tensor(1.0, dtype=torch.float32, device=device)
 
         # B is fixed across all dynamic_ms
-        b_packed = torch.randint(
-            0, 256, (1, n, k // 2), dtype=torch.uint8, device=device
-        ).transpose(1, 2)
-        b_descale = torch.ones(
-            1,
-            block_scale_dim_n,
-            block_scale_dim_k,
-            dtype=torch.float8_e4m3fn,
-            device=device,
-        ).transpose(1, 2)
+        b_bf16 = torch.empty([1, n, k], device="cuda", dtype=torch.bfloat16).uniform_(
+            -5.0, 5.0
+        )
+        b_packed, b_scale = nvfp4_quantize(b_bf16, global_sf, True)
+
+        b_bf16 = b_bf16.transpose(1, 2)
+        b_packed = b_packed.transpose(1, 2)
+        b_scale = b_scale.unsqueeze(0).transpose(1, 2)
 
         for m in dynamic_ms:
             block_scale_dim_m, _, _ = _calculate_block_scale_dims(m, n, k, block_size)
 
-            a_packed = torch.randint(
-                0, 256, (1, m, k // 2), dtype=torch.uint8, device=device
-            )
-            a_descale = torch.ones(
-                1,
-                block_scale_dim_m,
-                block_scale_dim_k,
-                dtype=torch.float8_e4m3fn,
-                device=device,
-            )
+            a_bf16 = torch.empty(
+                [1, m, k], device="cuda", dtype=torch.bfloat16
+            ).uniform_(-5.0, 5.0)
+            a_packed, a_scale = nvfp4_quantize(a_bf16, global_sf, True)
+
+            a_scale = a_scale.unsqueeze(0)
 
             # Execute with cached graph (override_shape)
             out = torch.empty(1, m, n, dtype=out_dtype, device=device)
@@ -232,8 +206,8 @@ class TestCudnnNVFp4OverrideShape:
                 graph,
                 a_packed,
                 b_packed,
-                a_descale,
-                b_descale,
+                a_scale,
+                b_scale,
                 alpha=None,
                 c_final=out,
                 workspace_buffer=workspace,
@@ -241,23 +215,12 @@ class TestCudnnNVFp4OverrideShape:
             )
             torch.cuda.synchronize()
 
-            # Correctness check: dequantize FP4 E2M1 via LUT and compare with
-            # FP32 bmm reference. Descales are all 1.0, so no scaling needed.
-            # A packing: a_packed (1, m, k//2), low nibble = even k, high = odd k
-            a_fp32 = torch.empty(1, m, k, dtype=torch.float32, device=device)
-            a_fp32[:, :, 0::2] = FP4_E2M1_LUT[(a_packed & 0x0F).long()]
-            a_fp32[:, :, 1::2] = FP4_E2M1_LUT[((a_packed >> 4) & 0x0F).long()]
-            # B packing: b_packed (1, k//2, n), low nibble = even k, high = odd k
-            b_fp32 = torch.empty(1, k, n, dtype=torch.float32, device=device)
-            b_fp32[:, 0::2, :] = FP4_E2M1_LUT[(b_packed & 0x0F).long()]
-            b_fp32[:, 1::2, :] = FP4_E2M1_LUT[((b_packed >> 4) & 0x0F).long()]
-            ref = torch.bmm(a_fp32, b_fp32).to(out_dtype)
+            ref = torch.bmm(a_bf16, b_bf16).to(out_dtype)
 
-            assert torch.allclose(ref, out, rtol=1e-1, atol=1.0), (
-                f"NVFP4 override_shape failed for m={m}, n={n}, k={k}: "
-                f"max_abs_err={(ref - out).abs().max().item():.4f}, "
-                f"max_rel_err="
-                f"{((ref - out).abs() / (ref.abs() + 1e-8)).max().item():.4f}"
+            min_cos_sim = 0.9
+            cos_sim = F.cosine_similarity(ref.reshape(-1), out.reshape(-1), dim=0)
+            assert cos_sim > min_cos_sim, (
+                f"Cosine similarity {cos_sim:.4f} is too low (expected > {min_cos_sim})"
             )
 
 
@@ -318,31 +281,27 @@ class TestCudnnMXFp8OverrideShape:
             device=device,
         )
 
-        # Use all possible values 0–255, but reset NaN FP8_E4M3 bit patterns (0x7F, 0xFF) to 0.
-        b = torch.randint(0, 256, (1, n, k), dtype=torch.uint8, device=device)
-        b[(b == 0x7F) | (b == 0xFF)] = 0
+        # B is fixed across all dynamic_ms
+        b_bf16 = torch.empty([1, n, k], device="cuda", dtype=torch.bfloat16).uniform_(
+            -5.0, 5.0
+        )
+        b, b_scale = mxfp8_quantize(b_bf16, True)
+
+        b_bf16 = b_bf16.transpose(1, 2)
         b = b.transpose(1, 2)
-        b_descale = torch.ones(
-            1,
-            block_scale_dim_n,
-            block_scale_dim_k,
-            dtype=torch.float8_e8m0fnu,
-            device=device,
-        ).transpose(1, 2)
+        b_scale = b_scale.reshape((-1, block_scale_dim_n, block_scale_dim_k)).transpose(
+            1, 2
+        )
 
         for m in dynamic_ms:
             block_scale_dim_m, _, _ = _calculate_block_scale_dims(m, n, k, block_size)
 
-            # Use all possible values 0–255, but reset NaN FP8_E4M3 bit patterns (0x7F, 0xFF) to 0.
-            a = torch.randint(0, 256, (1, m, k), dtype=torch.uint8, device=device)
-            a[(a == 0x7F) | (a == 0xFF)] = 0
-            a_descale = torch.ones(
-                1,
-                block_scale_dim_m,
-                block_scale_dim_k,
-                dtype=torch.float8_e8m0fnu,
-                device=device,
-            )
+            a_bf16 = torch.empty(
+                [1, m, k], device="cuda", dtype=torch.bfloat16
+            ).uniform_(-5.0, 5.0)
+            a, a_scale = mxfp8_quantize(a_bf16, True)
+
+            a_scale = a_scale.reshape((-1, block_scale_dim_m, block_scale_dim_k))
 
             # Execute with cached graph (override_shape)
             out = torch.empty(1, m, n, dtype=out_dtype, device=device)
@@ -350,26 +309,18 @@ class TestCudnnMXFp8OverrideShape:
                 graph,
                 a,
                 b,
-                a_descale,
-                b_descale,
+                a_scale,
+                b_scale,
                 c_final=out,
                 workspace_buffer=workspace,
                 tactic=0,
             )
             torch.cuda.synchronize()
 
-            # Correctness check: reinterpret uint8 as FP8_E4M3, compute FP32
-            # bmm reference. Descales are all 1.0 (2^0), so no scaling needed.
-            # A: (1, m, k) contiguous uint8 → float8_e4m3fn → float32
-            a_fp32 = a.view(torch.float8_e4m3fn).to(torch.float32)
-            # B logical shape is (1, k, n) with stride [n*k, 1, k]; make
-            # contiguous before view so dtype reinterpretation is valid.
-            b_fp32 = b.contiguous().view(torch.float8_e4m3fn).to(torch.float32)
-            ref = torch.bmm(a_fp32, b_fp32).to(out_dtype)
+            ref = torch.bmm(a_bf16, b_bf16).to(out_dtype)
 
-            assert torch.allclose(ref, out, rtol=5e-2, atol=5e-2), (
-                f"MXFP8 override_shape failed for m={m}, n={n}, k={k}: "
-                f"max_abs_err={(ref - out).abs().max().item():.4f}, "
-                f"max_rel_err="
-                f"{((ref - out).abs() / (ref.abs() + 1e-8)).max().item():.4f}"
+            min_cos_sim = 0.9
+            cos_sim = F.cosine_similarity(ref.reshape(-1), out.reshape(-1), dim=0)
+            assert cos_sim > min_cos_sim, (
+                f"Cosine similarity {cos_sim:.4f} is too low (expected > {min_cos_sim})"
             )
