@@ -259,6 +259,7 @@ def _moe_core_impl(
     # TRT-LLM dispatch that falls back to cudaMemsetAsync (dense zero)
     # when !enable_alltoall || ep_size <= top_k. A dense zero of the
     # active slice is correct for all configurations.
+    # TODO: add the TRTLLM all-to-all and `moe_output_memset` behavior
     if use_async_memset:
         with torch.cuda.stream(aux_stream):
             main_event.wait()
