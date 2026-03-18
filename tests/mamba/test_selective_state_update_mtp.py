@@ -1382,13 +1382,13 @@ class TestSelectiveStateUpdateMTPStochasticRoundingWithIntermediateStates(
 
 @_requires_sm100
 class TestSelectiveStateUpdateMTPVertical(TestSelectiveStateUpdateMTP):
-    """Test multi-token selective_state_update with the vertical algorithm.
+    """Test multi-token selective_state_update with vertical and horizontal algorithms."""
 
-    This forces algorithm="vertical" to exercise the MTP vertical kernel path.
-    """
+    @pytest.fixture(autouse=True, params=["vertical", "horizontal"])
+    def _algorithm(self, request):
+        self._algo = request.param
 
     def run_kernel(self, inputs, out=None, disable_state_update=False):
-        """Run the flashinfer kernel with algorithm='vertical'."""
         return flashinfer.mamba.selective_state_update(
             inputs["state_cache"],
             inputs["x"],
@@ -1404,7 +1404,7 @@ class TestSelectiveStateUpdateMTPVertical(TestSelectiveStateUpdateMTP):
             pad_slot_id=-1,
             out=out,
             disable_state_update=disable_state_update,
-            algorithm="vertical",
+            algorithm=self._algo,
         )
 
 
@@ -1412,10 +1412,13 @@ class TestSelectiveStateUpdateMTPVertical(TestSelectiveStateUpdateMTP):
 class TestSelectiveStateUpdateMTPVerticalWithIntermediateStates(
     TestSelectiveStateUpdateMTPWithIntermediateStates
 ):
-    """Test vertical algorithm with intermediate states (TMA store path)."""
+    """Test vertical/horizontal algorithms with intermediate states."""
+
+    @pytest.fixture(autouse=True, params=["vertical", "horizontal"])
+    def _algorithm(self, request):
+        self._algo = request.param
 
     def run_kernel_with_intermediate_states(self, inputs, out=None):
-        """Run the flashinfer kernel with algorithm='vertical' and intermediate states."""
         return flashinfer.mamba.selective_state_update(
             inputs["state_cache"],
             inputs["x"],
@@ -1434,7 +1437,7 @@ class TestSelectiveStateUpdateMTPVerticalWithIntermediateStates(
             intermediate_states_buffer=inputs["intermediate_states_buffer"],
             intermediate_state_indices=inputs["intermediate_slot_idx"],
             cache_steps=inputs["cache_steps"],
-            algorithm="vertical",
+            algorithm=self._algo,
         )
 
 
@@ -1487,7 +1490,11 @@ class TestSelectiveStateUpdateMTPVerticalInt16RejectsScaleState(
 class TestSelectiveStateUpdateMTPVerticalStochasticRounding(
     TestSelectiveStateUpdateMTPStochasticRounding
 ):
-    """Test vertical algorithm with stochastic rounding (PHILOX_ROUNDS > 0)."""
+    """Test vertical/horizontal algorithms with stochastic rounding."""
+
+    @pytest.fixture(autouse=True, params=["vertical", "horizontal"])
+    def _algorithm(self, request):
+        self._algo = request.param
 
     def run_kernel(self, inputs, out=None, disable_state_update=False):
         return flashinfer.mamba.selective_state_update(
@@ -1506,7 +1513,7 @@ class TestSelectiveStateUpdateMTPVerticalStochasticRounding(
             out=out,
             disable_state_update=disable_state_update,
             rand_seed=self.RAND_SEED,
-            algorithm="vertical",
+            algorithm=self._algo,
         )
 
 
@@ -1514,7 +1521,11 @@ class TestSelectiveStateUpdateMTPVerticalStochasticRounding(
 class TestSelectiveStateUpdateMTPVerticalDisableStateUpdate(
     TestSelectiveStateUpdateMTPDisableStateUpdate
 ):
-    """Test vertical algorithm with disable_state_update=True."""
+    """Test vertical/horizontal algorithms with disable_state_update=True."""
+
+    @pytest.fixture(autouse=True, params=["vertical", "horizontal"])
+    def _algorithm(self, request):
+        self._algo = request.param
 
     def run_kernel(self, inputs, out=None, disable_state_update=False):
         return flashinfer.mamba.selective_state_update(
@@ -1532,7 +1543,7 @@ class TestSelectiveStateUpdateMTPVerticalDisableStateUpdate(
             pad_slot_id=-1,
             out=out,
             disable_state_update=disable_state_update,
-            algorithm="vertical",
+            algorithm=self._algo,
         )
 
 
@@ -1540,7 +1551,11 @@ class TestSelectiveStateUpdateMTPVerticalDisableStateUpdate(
 class TestSelectiveStateUpdateMTPVerticalNonContiguous(
     TestSelectiveStateUpdateMTPNonContiguous
 ):
-    """Test vertical algorithm with non-contiguous state cache."""
+    """Test vertical/horizontal algorithms with non-contiguous state cache."""
+
+    @pytest.fixture(autouse=True, params=["vertical", "horizontal"])
+    def _algorithm(self, request):
+        self._algo = request.param
 
     def run_kernel(self, inputs, out=None, disable_state_update=False):
         return flashinfer.mamba.selective_state_update(
@@ -1558,7 +1573,7 @@ class TestSelectiveStateUpdateMTPVerticalNonContiguous(
             pad_slot_id=-1,
             out=out,
             disable_state_update=disable_state_update,
-            algorithm="vertical",
+            algorithm=self._algo,
         )
 
 
@@ -1566,7 +1581,11 @@ class TestSelectiveStateUpdateMTPVerticalNonContiguous(
 class TestSelectiveStateUpdateMTPVerticalInt32Indices(
     TestSelectiveStateUpdateMTPInt32Indices
 ):
-    """Test vertical algorithm with int32 state_batch_indices."""
+    """Test vertical/horizontal algorithms with int32 state_batch_indices."""
+
+    @pytest.fixture(autouse=True, params=["vertical", "horizontal"])
+    def _algorithm(self, request):
+        self._algo = request.param
 
     def run_kernel(self, inputs, out=None, disable_state_update=False):
         slot_idx_int32 = inputs["slot_idx"].to(torch.int32)
@@ -1585,7 +1604,7 @@ class TestSelectiveStateUpdateMTPVerticalInt32Indices(
             pad_slot_id=-1,
             out=out,
             disable_state_update=disable_state_update,
-            algorithm="vertical",
+            algorithm=self._algo,
         )
 
 
@@ -1593,7 +1612,11 @@ class TestSelectiveStateUpdateMTPVerticalInt32Indices(
 class TestSelectiveStateUpdateMTPVerticalVariousNgroups(
     TestSelectiveStateUpdateMTPVariousNgroups
 ):
-    """Test vertical algorithm with various ngroups values."""
+    """Test vertical/horizontal algorithms with various ngroups values."""
+
+    @pytest.fixture(autouse=True, params=["vertical", "horizontal"])
+    def _algorithm(self, request):
+        self._algo = request.param
 
     def run_kernel(self, inputs, out=None, disable_state_update=False):
         return flashinfer.mamba.selective_state_update(
@@ -1611,7 +1634,7 @@ class TestSelectiveStateUpdateMTPVerticalVariousNgroups(
             pad_slot_id=-1,
             out=out,
             disable_state_update=disable_state_update,
-            algorithm="vertical",
+            algorithm=self._algo,
         )
 
 
@@ -1619,7 +1642,11 @@ class TestSelectiveStateUpdateMTPVerticalVariousNgroups(
 class TestSelectiveStateUpdateMTPVerticalLargeBatch(
     TestSelectiveStateUpdateMTPLargeBatch
 ):
-    """Test vertical algorithm with larger batch sizes."""
+    """Test vertical/horizontal algorithms with larger batch sizes."""
+
+    @pytest.fixture(autouse=True, params=["vertical", "horizontal"])
+    def _algorithm(self, request):
+        self._algo = request.param
 
     def run_kernel(self, inputs, out=None, disable_state_update=False):
         return flashinfer.mamba.selective_state_update(
@@ -1637,5 +1664,5 @@ class TestSelectiveStateUpdateMTPVerticalLargeBatch(
             pad_slot_id=-1,
             out=out,
             disable_state_update=disable_state_update,
-            algorithm="vertical",
+            algorithm=self._algo,
         )

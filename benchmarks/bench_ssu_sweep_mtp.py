@@ -221,6 +221,7 @@ def run_measurement(
         "triton_reference": make_triton_wrapper(),
         "flashinfer_simple": make_flashinfer_wrapper(algorithm="simple"),
         "flashinfer_vertical": make_flashinfer_wrapper(algorithm="vertical"),
+        "flashinfer_horizontal": make_flashinfer_wrapper(algorithm="horizontal"),
         "flashinfer_auto": make_flashinfer_wrapper(algorithm="auto"),
     }
 

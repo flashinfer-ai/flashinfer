@@ -57,13 +57,17 @@ static constexpr int NUM_WARPS = 16;  // 12 compute + 3 TMA + 1 epilogue
 // Warp  14:     TMA load for group 2
 // Warp  15:     epilogue (shared across all 3 groups)
 
-// Bank-conflict-free column swizzle for horizontal state traversal.
-// See kernel_selective_state_update_stp.cuh for the original.
-template <int colsPerStage, int stateValuesPerBank, int numBanks>
-__device__ __forceinline__ int conflict_free_column(int group, int baseCol) {
-  auto const seq_index = group * colsPerStage + baseCol;
-  auto const bankCycle = (seq_index / stateValuesPerBank) / numBanks;
-  return (baseCol + stateValuesPerBank * bankCycle) % colsPerStage;
+// XOR-based bank-conflict-free swizzle for horizontal state traversal.
+// Operates on flat byte addresses: XORs the bank index with the row (cycle) index.
+// cycle_length = row stride in bytes, bank_size = sizeof(uint32_t).
+template <int cycle_length, int bank_size>
+__device__ __forceinline__ int xor_swizzle(int address) {
+  int const cycle = address / cycle_length;
+  int const delta = address % cycle_length;
+  int const bank_idx = delta / bank_size;
+  int const intra_bank = delta % bank_size;
+  int const new_bank_idx = bank_idx ^ cycle;
+  return cycle * cycle_length + new_bank_idx * bank_size + intra_bank;
 }
 
 enum class WarpRole { kCompute, kTMALoad, kEpilogue };
@@ -359,11 +363,16 @@ __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int la
   constexpr int bankSize = sizeof(uint32_t);
   constexpr int stateValuesPerBank = bankSize / sizeof(state_t);
   constexpr int numBanks = 32;
+  constexpr int sramReadsPerThreadPerTile = numBanks / lanesPerRow;                   // 8
+  constexpr int elemsPerTileMember = sramReadsPerThreadPerTile * stateValuesPerBank;  // 16
+  constexpr int elemsPerTile = elemsPerTileMember * lanesPerRow;                      // 64
+  constexpr int numTiles = stateValuesPerThread / elemsPerTileMember;                 // 2
+  constexpr int sizeof_dtype = sizeof(state_t);
+  constexpr int cycle_length = DSTATE * sizeof_dtype;  // row stride in bytes
+  using packed_tile_t = PackedAligned<state_t, elemsPerTileMember>;
 
-  using packed_state_t = PackedAligned<state_t, stateValuesPerThread>;
-
-  int const group = lane % rowsPerWarp;   // which row within current 4 active rows
-  int const member = lane / rowsPerWarp;  // which position along DSTATE (0..7)
+  int const member = lane % lanesPerRow;  // which position along DSTATE (0..3)
+  int const group = lane / lanesPerRow;   // which row within current 8 active rows
 
   auto const* __restrict__ dt_ptr = reinterpret_cast<weight_t const*>(params.dt);
   auto const* __restrict__ A_ptr = reinterpret_cast<matrixA_t const*>(params.A);
@@ -419,30 +428,31 @@ __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int la
   for (int pass = 0; pass < numPasses; pass++) {
     int const dd = compute_warp * totalRowsPerWarp + pass * rowsPerWarp + group;
 
-    // Precompute swizzled column indices for this lane's DSTATE elements.
-    // conflict_free_column remaps baseCol so that lanes in different rows
-    // (same warp) don't hit the same bank when loading state from smem.
-    // The swizzled columns are still contiguous in chunks of stateValuesPerBank.
-    int col[stateValuesPerThread];
-#pragma unroll
-    for (int item = 0; item < stateValuesPerThread; item += stateValuesPerBank) {
-      int const baseCol = item + member * stateValuesPerThread;
-      int const ii = conflict_free_column<DSTATE, stateValuesPerBank, numBanks>(group, baseCol);
-      for (int e = 0; e < stateValuesPerBank; e++) {
-        col[item + e] = ii + e;
-      }
-    }
+    // XOR swizzle: given logical column c, return physical smem column for
+    // bank-conflict-free access at row dd.  Mask dd to tile's bank range so
+    // the permutation stays within each tile (low 3 bits = group index).
+    int const dd_eff = dd & (sramReadsPerThreadPerTile - 1);
+    auto smem_col = [&](int c) -> int {
+      int const bank = c / stateValuesPerBank;
+      int const intra = c % stateValuesPerBank;
+      return (bank ^ dd_eff) * stateValuesPerBank + intra;
+    };
 
-    // Load state with bank-conflict-free swizzle
-    float rState[stateValuesPerThread];
+    // Logical base column for tile t, element e
+    auto baseCol = [&](int t, int e) -> int {
+      return t * elemsPerTile + member * elemsPerTileMember + e;
+    };
+
+    // Load state — simple linear load (no swizzle), matching vertical kernel style.
+    // rState[t][e] = state[dd][baseCol(t,e)]  with compile-time dest index.
+    // TODO: re-add bank-conflict-free swizzle on the *source* address side
+    float rState[numTiles][elemsPerTileMember];
 #pragma unroll
-    for (int item = 0; item < stateValuesPerThread; item += stateValuesPerBank) {
-      auto* sState_ptr =
-          reinterpret_cast<uint32_t const*>(&sram.state_in[in_slot][dd * DSTATE + col[item]]);
-      uint32_t packed = *sState_ptr;
-      auto* vals = reinterpret_cast<state_t const*>(&packed);
-      for (int e = 0; e < stateValuesPerBank; e++) {
-        rState[item + e] = toFloat(vals[e]);
+    for (int t = 0; t < numTiles; t++) {
+#pragma unroll
+      for (int e = 0; e < elemsPerTileMember; e++) {
+        int const c = baseCol(t, e);
+        rState[t][e] = toFloat(sram.state_in[in_slot][dd * DSTATE + c]);
       }
     }
 
@@ -454,55 +464,53 @@ __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int la
       float out_value = 0.f;
 
 #pragma unroll
-      for (int item = 0; item < stateValuesPerThread; item++) {
-        float dB = toFloat(sram.B[step][col[item]]) * dt_value;
-        rState[item] = rState[item] * dA + dB * x_value;
-        out_value += rState[item] * toFloat(sram.C[step][col[item]]);
+      for (int t = 0; t < numTiles; t++) {
+#pragma unroll
+        for (int e = 0; e < elemsPerTileMember; e++) {
+          int const c = baseCol(t, e);
+          float dB = toFloat(sram.B[step][c]) * dt_value;
+          rState[t][e] = rState[t][e] * dA + dB * x_value;
+          out_value += rState[t][e] * toFloat(sram.C[step][c]);
+        }
       }
 
-      // Reduce across lanesPerRow=8 lanes (spaced by rowsPerWarp=4)
-      out_value += __shfl_down_sync(UINT32_MAX, out_value, 16);
-      out_value += __shfl_down_sync(UINT32_MAX, out_value, 8);
-      out_value += __shfl_down_sync(UINT32_MAX, out_value, 4);
+      // Reduce across lanesPerRow adjacent lanes
+#pragma unroll
+      for (int offset = lanesPerRow / 2; offset >= 1; offset /= 2) {
+        out_value += __shfl_down_sync(UINT32_MAX, out_value, offset);
+      }
 
       if (member == 0) {
         sram.out[step][dd] = out_value + D_val * x_value;
       }
 
-      // Write intermediate state directly to gmem via vectorized STG.
-      // col[] gives the swizzled DSTATE indices — contiguous in chunks of
-      // stateValuesPerBank, so we write stateValuesPerBank elements at a time.
+      // Write intermediate state — vectorized packed_tile_t at logical baseCol (always aligned)
       if (istate_ptr && !is_pad) {
         auto const istate_base = icache_idx * params.intermediate_state_stride_batch +
                                  step * params.nheads * DIM * DSTATE + head * DIM * DSTATE +
                                  dd * DSTATE;
 #pragma unroll
-        for (int k = 0; k < stateValuesPerThread; k += stateValuesPerBank) {
-          using packed_bank_t = PackedAligned<state_t, stateValuesPerBank>;
-          packed_bank_t rOut;
-          if constexpr (PHILOX_ROUNDS > 0) {
-            [[maybe_unused]] uint32_t rand_ints[4];
-            if (k % 4 == 0)
-              philox_randint4x<PHILOX_ROUNDS>(rand_seed, state_ptr_offset + dd * DSTATE + col[k],
-                                              rand_ints[0], rand_ints[1], rand_ints[2],
-                                              rand_ints[3]);
-            for (int e = 0; e < stateValuesPerBank; e++) {
-              if constexpr (stateValuesPerBank == 2) {
-                uint32_t packed =
-                    cvt_rs_f16x2_f32(rState[k], rState[k + 1], rand_ints[(k + e) / 2]);
-                rOut.val[0] = __ushort_as_half(static_cast<uint16_t>(packed & 0xFFFFu));
-                rOut.val[1] = __ushort_as_half(static_cast<uint16_t>(packed >> 16));
-                break;  // both elements handled
-              } else {
-                rOut.val[e] = cvt_rs_f16_f32(rState[k + e], rand_ints[(k + e) % 4] & 0x1FFFu);
-              }
-            }
-          } else {
-            for (int e = 0; e < stateValuesPerBank; e++) {
-              convertAndStore(&rOut.val[e], rState[k + e]);
+        for (int t = 0; t < numTiles; t++) {
+          packed_tile_t rOut;
+          int const col0 = baseCol(t, 0);
+#pragma unroll
+          for (int e = 0; e < elemsPerTileMember; e += stateValuesPerBank) {
+            if constexpr (PHILOX_ROUNDS > 0) {
+              [[maybe_unused]] uint32_t rand_ints[4];
+              if (e % 4 == 0)
+                philox_randint4x<PHILOX_ROUNDS>(
+                    rand_seed, state_ptr_offset + dd * DSTATE + col0 + e, rand_ints[0],
+                    rand_ints[1], rand_ints[2], rand_ints[3]);
+              uint32_t packed =
+                  cvt_rs_f16x2_f32(rState[t][e], rState[t][e + 1], rand_ints[e / 2 % 2]);
+              rOut.val[e] = __ushort_as_half(static_cast<uint16_t>(packed & 0xFFFFu));
+              rOut.val[e + 1] = __ushort_as_half(static_cast<uint16_t>(packed >> 16));
+            } else {
+              convertAndStore(&rOut.val[e], rState[t][e]);
+              convertAndStore(&rOut.val[e + 1], rState[t][e + 1]);
             }
           }
-          *reinterpret_cast<packed_bank_t*>(&istate_ptr[istate_base + col[k]]) = rOut;
+          *reinterpret_cast<packed_tile_t*>(&istate_ptr[istate_base + col0]) = rOut;
         }
       }
 
@@ -511,32 +519,27 @@ __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int la
         auto const state_base =
             state_batch * params.state_stride_batch + head * DIM * DSTATE + dd * DSTATE;
 #pragma unroll
-        for (int k = 0; k < stateValuesPerThread; k += stateValuesPerBank) {
-          using packed_bank_t = PackedAligned<state_t, stateValuesPerBank>;
-          packed_bank_t rOut;
-          if constexpr (PHILOX_ROUNDS > 0) {
-            [[maybe_unused]] uint32_t rand_ints[4];
-            if (k % 4 == 0)
-              philox_randint4x<PHILOX_ROUNDS>(rand_seed, state_ptr_offset + dd * DSTATE + col[k],
-                                              rand_ints[0], rand_ints[1], rand_ints[2],
-                                              rand_ints[3]);
-            for (int e = 0; e < stateValuesPerBank; e++) {
-              if constexpr (stateValuesPerBank == 2) {
-                uint32_t packed =
-                    cvt_rs_f16x2_f32(rState[k], rState[k + 1], rand_ints[(k + e) / 2]);
-                rOut.val[0] = __ushort_as_half(static_cast<uint16_t>(packed & 0xFFFFu));
-                rOut.val[1] = __ushort_as_half(static_cast<uint16_t>(packed >> 16));
-                break;
-              } else {
-                rOut.val[e] = cvt_rs_f16_f32(rState[k + e], rand_ints[(k + e) % 4] & 0x1FFFu);
-              }
-            }
-          } else {
-            for (int e = 0; e < stateValuesPerBank; e++) {
-              convertAndStore(&rOut.val[e], rState[k + e]);
+        for (int t = 0; t < numTiles; t++) {
+          packed_tile_t rOut;
+          int const col0 = baseCol(t, 0);
+#pragma unroll
+          for (int e = 0; e < elemsPerTileMember; e += stateValuesPerBank) {
+            if constexpr (PHILOX_ROUNDS > 0) {
+              [[maybe_unused]] uint32_t rand_ints[4];
+              if (e % 4 == 0)
+                philox_randint4x<PHILOX_ROUNDS>(
+                    rand_seed, state_ptr_offset + dd * DSTATE + col0 + e, rand_ints[0],
+                    rand_ints[1], rand_ints[2], rand_ints[3]);
+              uint32_t packed =
+                  cvt_rs_f16x2_f32(rState[t][e], rState[t][e + 1], rand_ints[e / 2 % 2]);
+              rOut.val[e] = __ushort_as_half(static_cast<uint16_t>(packed & 0xFFFFu));
+              rOut.val[e + 1] = __ushort_as_half(static_cast<uint16_t>(packed >> 16));
+            } else {
+              convertAndStore(&rOut.val[e], rState[t][e]);
+              convertAndStore(&rOut.val[e + 1], rState[t][e + 1]);
             }
           }
-          *reinterpret_cast<packed_bank_t*>(&state_ptr[state_base + col[k]]) = rOut;
+          *reinterpret_cast<packed_tile_t*>(&state_ptr[state_base + col0]) = rOut;
         }
       }
     }  // step loop
