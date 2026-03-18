@@ -32,6 +32,8 @@ from .quantization.fp4_quantization import (
     gen_fp4_quantization_sm120_module,
     gen_fp4_quantization_sm120f_module,
     gen_fp4_quantization_sm121_module,
+    nvfp4_kv_dequantize,
+    nvfp4_kv_quantize,
     # Private functions needed by some tests
     _pad_scale_factors,
     _compute_swizzled_layout_sf_size,
@@ -60,6 +62,8 @@ __all__ = [
     "gen_fp4_quantization_sm120_module",
     "gen_fp4_quantization_sm120f_module",
     "gen_fp4_quantization_sm121_module",
+    "nvfp4_kv_dequantize",
+    "nvfp4_kv_quantize",
     "_pad_scale_factors",
     "_compute_swizzled_layout_sf_size",
 ]
