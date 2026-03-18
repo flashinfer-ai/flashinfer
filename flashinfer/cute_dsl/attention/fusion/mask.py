@@ -22,6 +22,7 @@ class MaskType(enum.Enum):
     SLIDING_WINDOW_MASK = enum.auto()
 
 
+@cute.jit
 def get_trip_count(
     mask_type: MaskType,
     window_left: int,
