@@ -132,50 +132,23 @@ int64_t selectDefaultTileN(std::vector<int32_t> const& supported_tile_nums,
   return *selected.begin();
 }
 
-// Resolve the (tile_N, config) pair passed from Python into a launcher-safe pair.
-//
-// Interaction with Python AutoTuner:
-// - Python AutoTuner stores and returns "tactics" as a 2-int payload [tile_N, config].
-// - Tuning/profiling uses bucketed num_tokens (power-of-2 buckets), while runtime uses actual
-//   num_tokens. Therefore, a cached tile_N chosen for the bucket may be suboptimal or unsupported
-//   for the runtime shape.
-// - Tactics may also come from persisted config files and can be stale/malformed across versions.
-//
-// This resolver makes C++ robust to those mismatches:
-// 1) malformed/missing tactic payload -> fallback to runtime-selected default tile/config
-// 2) fallback marker from Python (-1, -1) -> runtime-selected default tile/config
-// 3) stale tile_N not in current supported set -> runtime-selected default tile/config
-//
-// We intentionally do not fully validate `config` here because config validity depends on the
-// concrete Runner instance and current shape. That validation/fallback happens later in
-// FusedMoeLauncher::prepare_moe_common().
+// Resolve the (tile_N, config) pair passed from Python side, applying fallback logic
+// when tile_N is -1.
 std::pair<int64_t, int64_t> resolveMoeTileAndConfig(Array<int64_t> const& config_index,
                                                     std::vector<int32_t> const& supported_tile_nums,
                                                     int64_t const num_tokens, int64_t const top_k,
                                                     int64_t const num_local_experts) {
-  int64_t tile_N = -1;
-  int64_t config = -1;
-
   // Python side convention: tactic is [tile_N, config]
-  if (config_index.size() >= 2) {
-    tile_N = config_index[0];
-    config = config_index[1];
-  }
+  TVM_FFI_ICHECK(config_index.size() == 2)
+      << "Invalid tactic, expected to be [tile_N, config], but got array of size "
+      << config_index.size();
+  const int64_t tile_N = config_index[0];
+  const int64_t config = config_index[1];
 
-  // Runtime default is selected from actual shape stats (num_tokens/top_k/local_num_experts),
-  // which may differ from the bucketed shape that produced the cached tactic.
-  auto const default_tile_N =
-      selectDefaultTileN(supported_tile_nums, num_tokens, top_k, num_local_experts);
   if (tile_N == -1 || config == -1) {
     // Use fallback tactic
-    return {default_tile_N, -1};
-  }
-
-  bool const tile_supported = std::find(supported_tile_nums.begin(), supported_tile_nums.end(),
-                                        static_cast<int32_t>(tile_N)) != supported_tile_nums.end();
-  if (!tile_supported) {
-    // Tactic can be stale due to cache/file mismatch across versions or shape bucketing mismatch.
-    // Fall back to a runtime-selected tile and default config instead of crashing.
+    auto const default_tile_N =
+        selectDefaultTileN(supported_tile_nums, num_tokens, top_k, num_local_experts);
     return {default_tile_N, -1};
   }
 
@@ -410,38 +383,19 @@ class FusedMoeLauncher {
           this->activation_type, this->use_shuffled_weight, this->weight_layout);
     }
 
+    if (moe_tactic == -1) {
+      moe_tactic = moe_runner->getDefaultValidConfigIndex(
+          args->top_k, args->hidden_size, args->intermediate_size, args->local_num_experts,
+          args->num_tokens);
+    }
     auto valid_cfgs =
         moe_runner->getValidConfigIndices(args->top_k, args->hidden_size, args->intermediate_size,
                                           args->local_num_experts, args->num_tokens);
-    FLASHINFER_CHECK(!valid_cfgs.empty(), "No valid MoE tactics for tile_N=", tile_tokens_dim,
-                     " with shape (num_tokens=", args->num_tokens,
-                     ", hidden_size=", args->hidden_size,
-                     ", intermediate_size=", args->intermediate_size, ", top_k=", args->top_k,
-                     ", local_num_experts=", args->local_num_experts, ").");
-    int64_t default_tactic = -1;
-    if (moe_tactic == -1) {
-      default_tactic = moe_runner->getDefaultValidConfigIndex(
-          args->top_k, args->hidden_size, args->intermediate_size, args->local_num_experts,
-          args->num_tokens);
-      moe_tactic = default_tactic;
-    }
     auto valid_it = std::find(valid_cfgs.begin(), valid_cfgs.end(), moe_tactic);
-    if (valid_it == valid_cfgs.end()) {
-      if (default_tactic == -1) {
-        default_tactic = moe_runner->getDefaultValidConfigIndex(
-            args->top_k, args->hidden_size, args->intermediate_size, args->local_num_experts,
-            args->num_tokens);
-      }
-      auto default_it = std::find(valid_cfgs.begin(), valid_cfgs.end(), default_tactic);
-      FLASHINFER_CHECK(
-          default_it != valid_cfgs.end(), "Invalid MoE tactic ", moe_tactic,
-          " for tile_N=", tile_tokens_dim,
-          ". No valid fallback default tactic found for shape (num_tokens=", args->num_tokens,
-          ", hidden_size=", args->hidden_size, ", intermediate_size=", args->intermediate_size,
-          ", top_k=", args->top_k, ", local_num_experts=", args->local_num_experts,
-          "). This indicates a deeper kernel/config mismatch.");
-      moe_tactic = default_tactic;
-    }
+    FLASHINFER_CHECK(valid_it != valid_cfgs.end(), "Invalid MoE tactic ", moe_tactic,
+                     " for tile_N=", tile_tokens_dim, ". Number of valid tactics for this tile is ",
+                     valid_cfgs.size(),
+                     ". This often indicates a stale or mismatched autotuner cache entry.");
     this->moe_tactic = moe_tactic;
 
     auto workspace_sizes = moe_runner->getWorkspaceSizeInBytes(*args, moe_tactic);
