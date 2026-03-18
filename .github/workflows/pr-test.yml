@@ -46,7 +46,7 @@ permissions:
 
 env:
   EXECUTOR_NUMBER: "0"
-  SKIP_CI_PATTERNS: '\.md$|\.txt$|^docs/|^docker/|^licenses/|^LICENSE$|^NOTICE$|^benchmarks/'
+  SKIP_CI_PATTERNS: '\.md$|\.txt$|^docs/|^docker/|^licenses/|^LICENSE$|^NOTICE$|^benchmarks/|^\.github/CODEOWNERS$'
 
 jobs:
   # ---------------------------------------------------------------------------
