@@ -168,13 +168,8 @@ class BatchPrefillCuteDSLWrapper:
         elif window_left > 0:
             self._mask_type = MaskType.SLIDING_WINDOW_MASK
         else:
-            if s_k.shape[0] > 1:
-                for i in range(len(s_k)):
-                    if s_k[i] % self._mma_tiler_mn[1] != 0:
-                        self._mask_type = MaskType.RESIDUAL_MASK
-            else:
-                if s_k % self._mma_tiler_mn[1] != 0:
-                    self._mask_type = MaskType.RESIDUAL_MASK
+            if torch.any(s_k % self._mma_tiler_mn[1] != 0).item():
+                self._mask_type = MaskType.RESIDUAL_MASK
 
         # Build AttentionConfig and AttentionFusion, then create the kernel
         config = AttentionConfig(

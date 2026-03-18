@@ -417,7 +417,7 @@ def test_attention_prefill_attention_sink(
     def sink_M_D_update(params, kv_tile_idx, qo_head_idx, m, d, scale):
         # m is in the RAW (unscaled) domain; convert sink from scaled-logit to RAW
         log2_e = math.log2(math.exp(1.0))
-        sink_raw = params.sink[qo_head_idx] * log2_e / scale if (kv_tile_idx == 0 and qo_head_idx < NUM_QO_HEADS) else -math.inf
+        sink_raw = params.sink[qo_head_idx] * log2_e / scale if kv_tile_idx == 0 else -math.inf
         m_new = sink_raw if sink_raw > m else m
         rescale = cute.arch.exp2((m - m_new) * scale)
         d_new = cute.arch.exp2((sink_raw - m_new) * scale) + d * rescale
@@ -739,7 +739,7 @@ def test_attention_prefill_varlen_attention_sink(indptr):
     @cute.jit
     def sink_M_D_update(params, kv_tile_idx, qo_head_idx, m, d, scale):
         log2_e = math.log2(math.exp(1.0))
-        sink_raw = params.sink[qo_head_idx] * log2_e / scale if (kv_tile_idx == 0 and qo_head_idx < NUM_QO_HEADS) else -math.inf
+        sink_raw = params.sink[qo_head_idx] * log2_e / scale if kv_tile_idx == 0 else -math.inf
         m_new = sink_raw if sink_raw > m else m
         rescale = cute.arch.exp2((m - m_new) * scale)
         d_new = cute.arch.exp2((sink_raw - m_new) * scale) + d * rescale
@@ -804,7 +804,7 @@ def test_attention_prefill_attention_sink_mha(
     @cute.jit
     def sink_M_D_update(params, kv_tile_idx, qo_head_idx, m, d, scale):
         log2_e = math.log2(math.exp(1.0))
-        sink_raw = params.sink[qo_head_idx] * log2_e / scale if (kv_tile_idx == 0 and qo_head_idx < NUM_QO_HEADS) else -math.inf
+        sink_raw = params.sink[qo_head_idx] * log2_e / scale if kv_tile_idx == 0 else -math.inf
         m_new = sink_raw if sink_raw > m else m
         rescale = cute.arch.exp2((m - m_new) * scale)
         d_new = cute.arch.exp2((sink_raw - m_new) * scale) + d * rescale
