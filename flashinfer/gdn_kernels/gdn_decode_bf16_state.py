@@ -751,6 +751,8 @@ def gated_delta_rule_decode_kernel_seqlen1(
     value_head_idx = bidx % HV
     query_head_idx = value_head_idx // (HV // H)
     pool_batch_idx = gH_slot_indices[batch_idx]
+    if pool_batch_idx < 0:
+        pool_batch_idx = cutlass.Int32(0)
 
     smem = utils.SmemAllocator()
 
@@ -1130,6 +1132,8 @@ def gated_delta_rule_decode_kernel_seqlen234_unified(
     value_head_idx = bidx % HV
     query_head_idx = value_head_idx // (HV // H)
     pool_batch_idx = gH_slot_indices[batch_idx]
+    if pool_batch_idx < 0:
+        pool_batch_idx = cutlass.Int32(0)
 
     warp_idx = tidx // 32
     lane_idx = tidx % 32
@@ -1563,6 +1567,8 @@ def gated_delta_rule_decode_kernel_seqlen1_lowBS_1chunk(
     query_head_idx = value_head_idx // (HV // H)
     v_row_base = v_chunk_idx * 32
     pool_batch_idx = gH_slot_indices[batch_idx]
+    if pool_batch_idx < 0:
+        pool_batch_idx = cutlass.Int32(0)
 
     smem = utils.SmemAllocator()
 
@@ -1994,7 +2000,6 @@ def gated_delta_rule(
     else:
         h_slot_indices = initial_state_indices
 
-    h_slot_indices = h_slot_indices.clamp(min=0)  # guard -1 padding
     output = torch.empty(B, T, HV, V, device=q.device, dtype=q.dtype)
 
     q_ = from_dlpack(q, assumed_align=32, enable_tvm_ffi=True)
