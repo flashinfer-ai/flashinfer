@@ -20,7 +20,7 @@ import cutlass.cute as cute
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 from cutlass.cute.typing import Int32, Float32
 
-from ...patch import pipeline as pipeline_patch
+from cutlass.pipeline import PipelineProducer, PipelineConsumer
 
 from .softmax_math import exp2_scale, packed_row_sum
 from ..config import AttentionConfig, AttentionFusion
@@ -98,11 +98,11 @@ class SoftmaxRole:
     ) -> Tuple[
         Float32,
         Float32,
-        pipeline_patch.PipelineProducer.ImmutableResourceHandle,
-        pipeline_patch.PipelineConsumer,
-        pipeline_patch.PipelineProducer,
-        pipeline_patch.PipelineConsumer,
-        pipeline_patch.PipelineProducer,
+        PipelineProducer.ImmutableResourceHandle,
+        PipelineConsumer,
+        PipelineProducer,
+        PipelineConsumer,
+        PipelineProducer,
     ]:
         """Perform a single step of the softmax computation on a block of attention scores.
 
@@ -308,10 +308,10 @@ class SoftmaxRole:
         tStS: cute.Tensor,
         tStSi: cute.Tensor,
         sink: cute.Tensor | None,
-        mma_si_consumer: pipeline_patch.PipelineConsumer,
-        si_corr_producer: pipeline_patch.PipelineProducer,
-        s0_s1_sequence_consumer: pipeline_patch.PipelineConsumer,
-        s0_s1_sequence_producer: pipeline_patch.PipelineProducer,
+        mma_si_consumer: PipelineConsumer,
+        si_corr_producer: PipelineProducer,
+        s0_s1_sequence_consumer: PipelineConsumer,
+        s0_s1_sequence_producer: PipelineProducer,
         tile_sched_params: FmhaStaticTileSchedulerParams,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.

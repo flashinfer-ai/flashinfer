@@ -17,7 +17,7 @@ import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.typing import Int32, Float32
 
-from ...patch import pipeline as pipeline_patch
+from cutlass.pipeline import PipelineProducer, PipelineConsumer
 
 from ..config import AttentionConfig, AttentionFusion
 from ..tmem_layout import TmemLayout
@@ -275,10 +275,10 @@ class CorrectionRole:
         cum_seqlen_k: cute.Tensor | None,
         scale_softmax_log2: Float32,
         scale_output: Float32,
-        s0_corr_consumer: pipeline_patch.PipelineConsumer,
-        s1_corr_consumer: pipeline_patch.PipelineConsumer,
-        mma_corr_consumer: pipeline_patch.PipelineConsumer,
-        corr_epi_producer: pipeline_patch.PipelineProducer,
+        s0_corr_consumer: PipelineConsumer,
+        s1_corr_consumer: PipelineConsumer,
+        mma_corr_consumer: PipelineConsumer,
+        corr_epi_producer: PipelineProducer,
         tile_sched_params: FmhaStaticTileSchedulerParams,
         tmem_dealloc_mbar_ptr: Int32,
     ):

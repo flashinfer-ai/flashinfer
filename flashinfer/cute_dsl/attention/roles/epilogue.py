@@ -15,7 +15,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.typing import Int32, Float32
 
-from ...patch import pipeline as pipeline_patch
+from cutlass.pipeline import PipelineConsumer
 
 from ..config import AttentionConfig
 from ..scheduler.persistent import (
@@ -87,7 +87,7 @@ class EpilogueRole:
         mO_qdl: cute.Tensor,
         sO: cute.Tensor,
         cum_seqlen_q: cute.Tensor | None,
-        corr_epi_consumer: pipeline_patch.PipelineConsumer,
+        corr_epi_consumer: PipelineConsumer,
         tile_sched_params: FmhaStaticTileSchedulerParams,
     ):
         """Epilogue warp orchestration loop (prefill-specific).

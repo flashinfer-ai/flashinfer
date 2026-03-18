@@ -17,7 +17,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.typing import Int32
 
-from ...patch import pipeline as pipeline_patch
+from cutlass.pipeline import PipelineProducer
 
 from ..config import AttentionConfig
 from ..fusion.mask import get_trip_count, get_kv_start_block_idx
@@ -126,7 +126,7 @@ class LoaderRole:
         tma_atom: cute.CopyAtom,
         src_global: cute.Tensor,
         dst_smem: cute.Tensor,
-        producer: pipeline_patch.PipelineProducer,
+        producer: PipelineProducer,
     ):
         """Issue a single TMA load into SMEM with pipeline barrier."""
         handle = producer.acquire_and_advance()
@@ -156,8 +156,8 @@ class LoaderRole:
         sV: cute.Tensor,
         cum_seqlen_q: cute.Tensor | None,
         cum_seqlen_k: cute.Tensor | None,
-        load_q_producer: pipeline_patch.PipelineProducer,
-        load_kv_producer: pipeline_patch.PipelineProducer,
+        load_q_producer: PipelineProducer,
+        load_kv_producer: PipelineProducer,
         tile_sched_params: FmhaStaticTileSchedulerParams,
     ):
         """Loader warp orchestration loop (prefill-specific).

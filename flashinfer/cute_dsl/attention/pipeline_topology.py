@@ -18,8 +18,8 @@ from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Any
 
 import cutlass.pipeline as pipeline
+from cutlass.pipeline import Agent, CooperativeGroup, PipelineProducer, PipelineConsumer
 
-from ..patch import pipeline as pipeline_patch
 from .warp_schedule import WarpSchedule
 
 
@@ -115,10 +115,8 @@ class PipelineTopology:
         barrier_ptrs: Dict[str, Any],
         tx_counts: Dict[str, int],
         threads_per_warp: int,
-    ) -> Dict[str, Tuple]:
+    ) -> Dict[str, Tuple[PipelineProducer, PipelineConsumer]]:
         """Create all pipeline producer/consumer pairs from the topology.
-
-        Uses the FlashInfer pipeline_patch API (for FMHA prefill).
 
         :param barrier_ptrs: Map from edge name to barrier storage pointer.
         :param tx_counts: Map from tx_count_key to byte count (for TMA pipelines).
@@ -127,10 +125,6 @@ class PipelineTopology:
         """
         result = {}
         for edge in self.edges:
-            tx = None
-            if edge.tx_count_key is not None:
-                tx = tx_counts[edge.tx_count_key]
-
             prod_threads = edge.pipeline_type.producer_thread_count(
                 len(edge.producer_warp_ids), threads_per_warp
             )
@@ -138,15 +132,18 @@ class PipelineTopology:
                 len(edge.consumer_warp_ids), threads_per_warp
             )
 
-            producer, consumer = pipeline_patch.make_pipeline_participants(
-                pipeline_type=edge.pipeline_type.cutlass_type,
-                barrier_storage=barrier_ptrs[edge.name],
-                num_stages=edge.stages,
-                producer_thread_count=prod_threads,
-                consumer_thread_count=cons_threads,
-                tx_count=tx,
-            )
-            result[edge.name] = (producer, consumer)
+            create_kwargs = {
+                "barrier_storage": barrier_ptrs[edge.name],
+                "num_stages": edge.stages,
+                "producer_group": CooperativeGroup(Agent.Thread, prod_threads),
+                "consumer_group": CooperativeGroup(Agent.Thread, cons_threads),
+                "defer_sync": True,
+            }
+            if edge.tx_count_key is not None:
+                create_kwargs["tx_count"] = tx_counts[edge.tx_count_key]
+
+            pipe = edge.pipeline_type.cutlass_type.create(**create_kwargs)
+            result[edge.name] = pipe.make_participants()
         return result
 
 

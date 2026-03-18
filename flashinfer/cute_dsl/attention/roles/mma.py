@@ -18,7 +18,7 @@ import cutlass.cute as cute
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 from cutlass.cute.typing import Int32, Float32
 
-from ...patch import pipeline as pipeline_patch
+from cutlass.pipeline import PipelineProducer, PipelineConsumer
 
 from ..config import AttentionConfig
 from ..fusion.mask import get_trip_count
@@ -137,11 +137,11 @@ class MmaRole:
         seqlen_k_global: Int32,
         cum_seqlen_q: cute.Tensor | None,
         cum_seqlen_k: cute.Tensor | None,
-        load_q_consumer: pipeline_patch.PipelineConsumer,
-        load_kv_consumer: pipeline_patch.PipelineConsumer,
-        mma_s0_producer: pipeline_patch.PipelineProducer,
-        mma_s1_producer: pipeline_patch.PipelineProducer,
-        mma_corr_producer: pipeline_patch.PipelineProducer,
+        load_q_consumer: PipelineConsumer,
+        load_kv_consumer: PipelineConsumer,
+        mma_s0_producer: PipelineProducer,
+        mma_s1_producer: PipelineProducer,
+        mma_corr_producer: PipelineProducer,
         tile_sched_params: FmhaStaticTileSchedulerParams,
         storage: cute.Tensor,
         tmem_dealloc_mbar_ptr: Int32,
