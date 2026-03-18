@@ -269,4 +269,11 @@ inline __device__ float2 operator*(float2 a, float b) { return make_float2(a.x *
 inline __device__ float2 operator+(float2 a, float b) { return make_float2(a.x + b, a.y + b); }
 inline __device__ float2 operator-(float2 a, float b) { return make_float2(a.x - b, a.y - b); }
 
+inline int getMultiProcessorCount() {
+  int device, count;
+  cudaGetDevice(&device);
+  cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device);
+  return count;
+}
+
 }  // namespace tensorrt_llm::common

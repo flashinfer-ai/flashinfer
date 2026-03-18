@@ -11,7 +11,7 @@ from flashinfer.utils import get_compute_capability
 @pytest.mark.parametrize("m", [48, 128])
 @pytest.mark.parametrize("n", [80, 64])
 @pytest.mark.parametrize("k", [64, 256])
-@pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("backend", ["cutlass", "cudnn"])
 def test_bmm_bf16(b, m, n, k, res_dtype, backend):
     compute_capability = get_compute_capability(torch.device(device="cuda"))

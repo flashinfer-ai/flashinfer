@@ -218,8 +218,13 @@ class TopPOp(ParameterizedOp):
         if maybe_top_p_arr is None and not (0 < top_p_val <= 1):
             raise ValueError("top_p must be float in (0, 1] or a tensor array")
 
-        renorm_probs = get_sampling_module().top_p_renorm_probs(
-            tensor.data, maybe_top_p_arr, top_p_val
+        # Use the public API instead of calling the custom op directly,
+        # so that workspace allocation and small-vocab fallback are handled uniformly.
+        from ..sampling import top_p_renorm_probs
+
+        is_deterministic = kwargs.get("is_deterministic", False)
+        renorm_probs = top_p_renorm_probs(
+            tensor.data, top_p, is_deterministic=is_deterministic
         )
 
         return TaggedTensor(renorm_probs, output_type)
