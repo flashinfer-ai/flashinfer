@@ -2045,7 +2045,7 @@ def build_cudnn_fp4_gemm_graph_override_shape(
         io_data_type=cudnn.data_type.FLOAT,
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
-        handle=_get_cudnn_handle(stream),
+        handle=_get_cudnn_handle(device, stream),
         is_override_shape_enabled=True,
     )
 
@@ -2184,7 +2184,7 @@ def execute_cudnn_fp4_gemm_graph_override_shape(
         variant_pack,
         workspace_buffer,
         tactic,
-        handle=_get_cudnn_handle(stream),
+        handle=_get_cudnn_handle(a.device, stream),
         override_uids=override_uids,
         override_shapes=override_shapes,
         override_strides=override_strides,
@@ -2331,7 +2331,7 @@ def build_cudnn_mxfp8_gemm_graph_override_shape(
         io_data_type=cudnn.data_type.FLOAT,
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
-        handle=_get_cudnn_handle(stream),
+        handle=_get_cudnn_handle(device, stream),
         is_override_shape_enabled=True,
     )
 
@@ -2441,7 +2441,7 @@ def execute_cudnn_mxfp8_gemm_graph_override_shape(
         variant_pack,
         workspace_buffer,
         tactic,
-        handle=_get_cudnn_handle(stream),
+        handle=_get_cudnn_handle(a.device, stream),
         override_uids=override_uids,
         override_shapes=override_shapes,
         override_strides=override_strides,
@@ -2635,7 +2635,7 @@ def build_cudnn_gemm_with_per_tensor_q_graph_override_shape(
         io_data_type=cudnn.data_type.FLOAT,
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
-        handle=_get_cudnn_handle(stream),
+        handle=_get_cudnn_handle(device, stream),
         is_override_shape_enabled=True,
     )
 
@@ -2710,7 +2710,7 @@ def execute_cudnn_gemm_with_per_tensor_q_graph_override_shape(
     override_strides = [list(a.stride()), list(b.stride()), list(c_final.stride())]
 
     stream = torch.cuda.current_stream(a.device)
-    cudnn_handle = _get_cudnn_handle(stream)
+    cudnn_handle = _get_cudnn_handle(a.device, stream)
 
     if workspace.numel() < graph.get_workspace_size():
         workspace = torch.empty(
@@ -2910,7 +2910,7 @@ def build_cudnn_gemm_bf16_graph_override_shape(
         io_data_type=cudnn.data_type.BFLOAT16,
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
-        handle=_get_cudnn_handle(stream),
+        handle=_get_cudnn_handle(device, stream),
         is_override_shape_enabled=True,
     )
 
@@ -2967,7 +2967,7 @@ def execute_cudnn_gemm_bf16_graph_override_shape(
     override_strides = [list(a.stride()), list(b.stride()), list(c_final.stride())]
 
     stream = torch.cuda.current_stream(a.device)
-    cudnn_handle = _get_cudnn_handle(stream)
+    cudnn_handle = _get_cudnn_handle(a.device, stream)
 
     if workspace.numel() < graph.get_workspace_size():
         workspace = torch.empty(
