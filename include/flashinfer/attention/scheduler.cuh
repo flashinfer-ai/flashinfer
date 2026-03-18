@@ -531,8 +531,7 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
   if (fixed_cta_tile_q > 0) {
     if (fixed_cta_tile_q != 16 && fixed_cta_tile_q != 64 && fixed_cta_tile_q != 128) {
       std::ostringstream err_msg;
-      err_msg << "fixed_cta_tile_q should be one of {16, 64, 128}, but got "
-              << fixed_cta_tile_q;
+      err_msg << "fixed_cta_tile_q should be one of {16, 64, 128}, but got " << fixed_cta_tile_q;
       FLASHINFER_ERROR(err_msg.str());
     }
     cta_tile_q = fixed_cta_tile_q;

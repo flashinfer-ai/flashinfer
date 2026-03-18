@@ -343,9 +343,9 @@ def test_batch_prefill_tensor_cores_mixed_qo_len_invariance_with_fixed_cta_tile_
     page_size = 16
     pos_encoding_mode = "NONE"
 
-    q_indptr = torch.tensor([0] + list(torch.cumsum(torch.tensor(qo_lens), dim=0).tolist())).to(
-        dtype=torch.int32, device="cuda:0"
-    )
+    q_indptr = torch.tensor(
+        [0] + list(torch.cumsum(torch.tensor(qo_lens), dim=0).tolist())
+    ).to(dtype=torch.int32, device="cuda:0")
     total_qo_len = int(q_indptr[-1].item())
     q = torch.randn(
         total_qo_len, num_qo_heads, head_dim, device="cuda:0", dtype=torch.float16
@@ -388,7 +388,9 @@ def test_batch_prefill_tensor_cores_mixed_qo_len_invariance_with_fixed_cta_tile_
     workspace_buffer = torch.empty(
         1024 * 1024 * 1024, dtype=torch.int8, device="cuda:0"
     )
-    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(workspace_buffer, kv_layout)
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace_buffer, kv_layout
+    )
     wrapper.plan(
         q_indptr,
         kv_indptr,
@@ -408,7 +410,9 @@ def test_batch_prefill_tensor_cores_mixed_qo_len_invariance_with_fixed_cta_tile_
     o_batched, lse_batched = wrapper.run(q, kv_data, return_lse=True)
 
     q_indptr_single = torch.tensor([0, long_qo_len], dtype=torch.int32, device="cuda:0")
-    kv_indptr_single = torch.tensor([0, num_pages_per_seq], dtype=torch.int32, device="cuda:0")
+    kv_indptr_single = torch.tensor(
+        [0, num_pages_per_seq], dtype=torch.int32, device="cuda:0"
+    )
     kv_indices_single = kv_indices[:num_pages_per_seq]
     kv_last_page_len_single = kv_last_page_len[:1]
     wrapper.plan(
@@ -448,25 +452,67 @@ def test_batch_prefill_ragged_kv_mixed_qo_len_invariance_with_fixed_cta_tile_q(
     head_dim = 128
     kv_len = 4096
 
-    q_indptr = torch.tensor([0] + list(torch.cumsum(torch.tensor(qo_lens), dim=0).tolist())).to(
-        dtype=torch.int32, device="cuda:0"
-    )
+    q_indptr = torch.tensor(
+        [0] + list(torch.cumsum(torch.tensor(qo_lens), dim=0).tolist())
+    ).to(dtype=torch.int32, device="cuda:0")
     total_qo_len = int(q_indptr[-1].item())
-    q = torch.randn(total_qo_len, num_qo_heads, head_dim, device="cuda:0", dtype=torch.float16)
+    q = torch.randn(
+        total_qo_len, num_qo_heads, head_dim, device="cuda:0", dtype=torch.float16
+    )
 
     kv_indptr = (
         torch.arange(0, batch_size + 1, device="cuda:0", dtype=torch.int32) * kv_len
     )
     total_kv_len = kv_len * batch_size
     if kv_layout == "HND":
-        k = torch.randn(total_kv_len, num_kv_heads, head_dim, device="cuda:0", dtype=torch.float16) / 10
-        v = torch.randn(total_kv_len, num_kv_heads, head_dim, device="cuda:0", dtype=torch.float16) / 10
+        k = (
+            torch.randn(
+                total_kv_len,
+                num_kv_heads,
+                head_dim,
+                device="cuda:0",
+                dtype=torch.float16,
+            )
+            / 10
+        )
+        v = (
+            torch.randn(
+                total_kv_len,
+                num_kv_heads,
+                head_dim,
+                device="cuda:0",
+                dtype=torch.float16,
+            )
+            / 10
+        )
     else:
-        k = torch.randn(total_kv_len, num_kv_heads, head_dim, device="cuda:0", dtype=torch.float16) / 10
-        v = torch.randn(total_kv_len, num_kv_heads, head_dim, device="cuda:0", dtype=torch.float16) / 10
+        k = (
+            torch.randn(
+                total_kv_len,
+                num_kv_heads,
+                head_dim,
+                device="cuda:0",
+                dtype=torch.float16,
+            )
+            / 10
+        )
+        v = (
+            torch.randn(
+                total_kv_len,
+                num_kv_heads,
+                head_dim,
+                device="cuda:0",
+                dtype=torch.float16,
+            )
+            / 10
+        )
 
-    workspace_buffer = torch.empty(1024 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
-    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(workspace_buffer, kv_layout)
+    workspace_buffer = torch.empty(
+        1024 * 1024 * 1024, dtype=torch.int8, device="cuda:0"
+    )
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace_buffer, kv_layout
+    )
     wrapper.plan(
         q_indptr,
         kv_indptr,
@@ -493,7 +539,9 @@ def test_batch_prefill_ragged_kv_mixed_qo_len_invariance_with_fixed_cta_tile_q(
         disable_split_kv=True,
         fixed_cta_tile_q=fixed_cta_tile_q,
     )
-    o_single, lse_single = wrapper.run(q[:long_qo_len], k[:kv_len], v[:kv_len], return_lse=True)
+    o_single, lse_single = wrapper.run(
+        q[:long_qo_len], k[:kv_len], v[:kv_len], return_lse=True
+    )
 
     assert torch.equal(o_batched[:long_qo_len], o_single)
     assert torch.equal(lse_batched[:long_qo_len], lse_single)
