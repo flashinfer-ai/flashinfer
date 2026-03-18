@@ -59,7 +59,7 @@ from .decode import (
 )
 from .decode import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .decode import single_decode_with_kv_cache as single_decode_with_kv_cache
-from .fp4_quantization import (
+from .quantization.fp4_quantization import (
     SfLayout,
     block_scale_interleave,
     nvfp4_block_scale_interleave,
@@ -73,8 +73,11 @@ from .fp4_quantization import (
     shuffle_matrix_a,
     shuffle_matrix_sf_a,
     scaled_fp4_grouped_quantize,
+    get_fp4_quantization_module,
+    nvfp4_kv_dequantize,
+    nvfp4_kv_quantize,
 )
-from .fp8_quantization import mxfp8_dequantize_host, mxfp8_quantize
+from .quantization.fp8_quantization import mxfp8_dequantize_host, mxfp8_quantize
 from .fused_moe import (
     ActivationType,
     RoutingMethodType,
@@ -112,8 +115,11 @@ from .norm import gemma_fused_add_rmsnorm as gemma_fused_add_rmsnorm
 from .norm import gemma_rmsnorm as gemma_rmsnorm
 from .norm import rmsnorm as rmsnorm
 
-from .norm import rmsnorm_fp4quant as rmsnorm_fp4quant
-from .norm import add_rmsnorm_fp4quant as add_rmsnorm_fp4quant
+try:
+    from .norm import rmsnorm_fp4quant as rmsnorm_fp4quant
+    from .norm import add_rmsnorm_fp4quant as add_rmsnorm_fp4quant
+except (ImportError, AttributeError):
+    pass  # nvidia-cutlass-dsl not installed
 from .page import append_paged_kv_cache as append_paged_kv_cache
 from .page import append_paged_mla_kv_cache as append_paged_mla_kv_cache
 from .page import get_batch_indices_positions as get_batch_indices_positions
@@ -130,6 +136,7 @@ from .prefill import single_prefill_with_kv_cache as single_prefill_with_kv_cach
 from .prefill import (
     single_prefill_with_kv_cache_return_lse as single_prefill_with_kv_cache_return_lse,
 )
+from .prefill import trtllm_fmha_v2_prefill as trtllm_fmha_v2_prefill
 from .quantization import packbits as packbits
 from .quantization import segment_packbits as segment_packbits
 from .rope import apply_llama31_rope as apply_llama31_rope

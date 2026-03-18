@@ -680,6 +680,7 @@ def testBmmFp8(args):
         reference_output = torch.bmm(input, mat2)
         has_reference_output = True
 
+    cache_path = getattr(args, "autotune_cache", None)
     if getattr(args, "autotune", False):
         warmup_iters = (
             args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
@@ -688,11 +689,14 @@ def testBmmFp8(args):
             if cur_backend in autotune_supported_backends:
                 if args.verbose >= 1:
                     print(f"[INFO] Autotune warmup for bmm_fp8: {warmup_iters} iters")
-                with autotune(True):
+                with autotune(True, cache=cache_path):
                     for _ in range(warmup_iters):
                         run_backend(
                             cur_backend, input_fp8, mat2_fp8, input_inv_s, mat2_inv_s
                         )
+    elif cache_path:
+        with autotune(False, cache=cache_path):
+            pass
 
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
@@ -885,6 +889,7 @@ def testBmmMxfp8(args):
         reference_output = torch.bmm(input, mat2)
         has_reference_output = True
 
+    cache_path = getattr(args, "autotune_cache", None)
     if getattr(args, "autotune", False):
         warmup_iters = (
             args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
@@ -893,7 +898,7 @@ def testBmmMxfp8(args):
             if cur_backend in autotune_supported_backends:
                 if args.verbose >= 1:
                     print(f"[INFO] Autotune warmup for bmm_mxfp8: {warmup_iters} iters")
-                with autotune(True):
+                with autotune(True, cache=cache_path):
                     for _ in range(warmup_iters):
                         run_backend(
                             cur_backend,
@@ -902,6 +907,9 @@ def testBmmMxfp8(args):
                             input_scale,
                             mat2_scale,
                         )
+    elif cache_path:
+        with autotune(False, cache=cache_path):
+            pass
 
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
@@ -1071,6 +1079,13 @@ def testMmFp4(args):
         print(f"[VVERBOSE] {mat2_fp4.dtype = }")
 
     alpha = 1.0 / (global_sf_input * global_sf_mat2) if use_nvfp4 else None
+    # TODO: for MXFP4, we don't need a global scale, we should change the compile interface to make
+    # alpha optional.
+    alpha_for_cute_dsl_mxfp4 = (
+        torch.tensor([1.0], dtype=torch.float32, device=device)
+        if not use_nvfp4
+        else None
+    )
     # Completed preparing inputs. Now programmatically filter backends
     block_size = 16 if use_nvfp4 else 32
     backends_to_remove = []
@@ -1091,7 +1106,7 @@ def testMmFp4(args):
                 b=mat2_fp4.T if backend != "trtllm" else mat2_fp4_trtllm.T,
                 a_descale=input_inv_s,
                 b_descale=mat2_inv_s.T if backend != "trtllm" else mat2_inv_s_trtllm.T,
-                alpha=alpha,
+                alpha=(alpha_for_cute_dsl_mxfp4 if (backend == "cute-dsl") else alpha),
                 out_dtype=res_dtype,
                 block_size=16
                 if use_nvfp4
@@ -1129,7 +1144,7 @@ def testMmFp4(args):
                 b=mat2_fp4.T if backend != "trtllm" else mat2_fp4_trtllm.T,
                 a_descale=input_inv_s,
                 b_descale=mat2_inv_s.T if backend != "trtllm" else mat2_inv_s_trtllm.T,
-                alpha=alpha,
+                alpha=(alpha_for_cute_dsl_mxfp4 if (backend == "cute-dsl") else alpha),
                 out_dtype=res_dtype,
                 block_size=block_size,
                 use_8x4_sf_layout=not use_128x4_sf_layout,
@@ -1144,6 +1159,7 @@ def testMmFp4(args):
         reference_output = torch.mm(input, mat2.T)
         has_reference_output = True
 
+    cache_path = getattr(args, "autotune_cache", None)
     if getattr(args, "autotune", False):
         warmup_iters = (
             args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
@@ -1151,7 +1167,7 @@ def testMmFp4(args):
         for cur_backend in backends:
             if args.verbose >= 1:
                 print(f"[INFO] Autotune warmup for mm_fp4: {warmup_iters} iters")
-            with autotune(True):
+            with autotune(True, cache=cache_path):
                 for _ in range(warmup_iters):
                     run_backend(
                         cur_backend,
@@ -1162,6 +1178,9 @@ def testMmFp4(args):
                         mat2_inv_s,
                         mat2_inv_s_trtllm,
                     )
+    elif cache_path:
+        with autotune(False, cache=cache_path):
+            pass
 
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
@@ -1289,9 +1308,7 @@ def testMmMxfp8(args):
     res_dtype = args.out_dtype
     is_cuda_graph_compatible = not args.no_cuda_graph
     run_refcheck = args.refcheck
-    autotune_supported_backends = [
-        "cutlass",
-    ]
+    autotune_supported_backends = ["cutlass", "cute-dsl", "auto"]
     res = []
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
@@ -1344,7 +1361,7 @@ def testMmMxfp8(args):
         print(f"[VVERBOSE] {mat2_scale.dtype = }")
 
     def run_backend(backend, input_mxfp8, mat2_mxfp8, input_scale, mat2_scale):
-        if backend == "cutlass":
+        if backend in ["cutlass", "cute-dsl", "auto"]:
             return flashinfer.gemm.mm_mxfp8(
                 a=input_mxfp8,
                 b=mat2_mxfp8.t(),  # mm_mxfp8 expects b.t()
@@ -1361,6 +1378,7 @@ def testMmMxfp8(args):
         reference_output = torch.mm(input, mat2.t())
         has_reference_output = True
 
+    cache_path = getattr(args, "autotune_cache", None)
     if getattr(args, "autotune", False):
         warmup_iters = (
             args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
@@ -1369,7 +1387,7 @@ def testMmMxfp8(args):
             if cur_backend in autotune_supported_backends:
                 if args.verbose >= 1:
                     print(f"[INFO] Autotune warmup for mm_mxfp8: {warmup_iters} iters")
-                with autotune(True):
+                with autotune(True, cache=cache_path):
                     for _ in range(warmup_iters):
                         run_backend(
                             cur_backend,
@@ -1378,6 +1396,9 @@ def testMmMxfp8(args):
                             input_scale,
                             mat2_scale,
                         )
+    elif cache_path:
+        with autotune(False, cache=cache_path):
+            pass
 
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
@@ -1503,9 +1524,9 @@ def testMmBf16(args):
     res = []
 
     out_dtype = dtype_str_to_torch_dtype(args.out_dtype)
-    if out_dtype not in [torch.bfloat16, torch.float16]:
+    if out_dtype not in [torch.bfloat16, torch.float16, torch.float32]:
         raise ValueError(
-            f"Unsupported output dtype: {args.out_dtype}. Supported dtypes are bfloat16 and float16."
+            f"Unsupported output dtype: {args.out_dtype}. Supported dtypes are bfloat16, float16, and float32."
         )
 
     ## Prepare input tensors
@@ -1723,9 +1744,9 @@ def testBmmBf16(args):
     res = []
 
     out_dtype = dtype_str_to_torch_dtype(args.out_dtype)
-    if out_dtype not in [torch.bfloat16, torch.float16]:
+    if out_dtype not in [torch.bfloat16, torch.float16, torch.float32]:
         raise ValueError(
-            f"Unsupported output dtype: {args.out_dtype}. Supported dtypes are bfloat16 and float16."
+            f"Unsupported output dtype: {args.out_dtype}. Supported dtypes are bfloat16, float16, and float32."
         )
 
     ## Prepare input tensors

@@ -30,16 +30,14 @@ def _test_mm_fp4(
         if compute_capability[0] in [11, 12]:
             pytest.skip("trtllm gemm does not support SM110/SM120/SM121 GPUs.")
     if backend == "cute-dsl":
-        if not use_nvfp4:
-            pytest.skip("cute_dsl backend only supports nvfp4")
         if not use_128x4_sf_layout:
             pytest.skip("cute_dsl backend only supports 128x4 SF layout")
         if compute_capability[0] not in [10]:
             pytest.skip("cute_dsl backend only supports SM100/SM103 GPUs.")
     if not use_128x4_sf_layout and backend != "trtllm":
         pytest.skip("Skipping test for non-trtllm fp4 with use_128x4_sf_layout=False")
-    if not use_nvfp4 and backend not in ["cudnn", "auto"]:
-        pytest.skip("mx_fp4 is only supported for cudnn and auto backends")
+    if not use_nvfp4 and backend not in ["cudnn", "auto", "cute-dsl"]:
+        pytest.skip("mx_fp4 is only supported for cudnn, cute-dsl, and auto backends")
 
     input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
     mat2 = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
