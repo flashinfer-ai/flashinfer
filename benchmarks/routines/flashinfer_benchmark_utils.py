@@ -54,7 +54,8 @@ output_column_dict = {
         "use_routing_bias",
         "use_routing_scales_on_input",
         "weight_dtype",
-        "gated_act",
+        "activation_type",
+        "fp4_mode",
         # CUTLASS fused MoE specific
         "cutlass_variant",
         "quantized_input",
@@ -69,6 +70,12 @@ output_column_dict = {
         "top_k",
         "ep_size",
         "max_num_tokens",
+    ],
+    "allreduce_comm": [
+        "num_tokens",
+        "ar_backend",
+        "pattern",
+        "layout_code",
     ],
     "norm": [
         "num_heads",
@@ -145,6 +152,7 @@ full_output_columns = (
     + output_column_dict["gemm"]
     + output_column_dict["moe"]
     + output_column_dict["moe_comm"]
+    + output_column_dict["allreduce_comm"]
     + output_column_dict["norm"]
     + output_column_dict["quantization"]
     + output_column_dict["sampling"]
@@ -178,6 +186,9 @@ benchmark_apis = {
     ],
     "moe_comm": [
         "moe_a2a_dispatch_combine",
+    ],
+    "allreduce_comm": [
+        "allreduce_fusion",
     ],
     "norm": [
         "rmsnorm",
@@ -226,9 +237,9 @@ benchmark_apis = {
 
 
 def print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec):
-    output_backend_width = 15
+    output_backend_width = max(15, len(backend))
     print(
-        f"[PERF] {backend.ljust(output_backend_width)[:output_backend_width]}:: median time {median_time:.3f} ms; std {std_time:.3f} ms; achieved tflops {tflops:.3f} TFLOPs/sec; achieved tb_per_sec {tb_per_sec:.3f} TB/sec"
+        f"[PERF] {backend.ljust(output_backend_width)}:: median time {median_time:.3f} ms; std {std_time:.3f} ms; achieved tflops {tflops:.3f} TFLOPs/sec; achieved tb_per_sec {tb_per_sec:.3f} TB/sec"
     )
 
 
@@ -367,8 +378,8 @@ routine_cc_to_supported_backends = {
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["cutlass"],
-        "10.3": ["cutlass"],
+        "10.0": ["cutlass", "cute-dsl"],
+        "10.3": ["cutlass", "cute-dsl"],
         "11.0": ["cutlass"],
         "12.0": [],
     },

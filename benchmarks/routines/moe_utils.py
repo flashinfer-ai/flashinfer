@@ -39,6 +39,12 @@ from flashinfer.fused_moe import WeightLayout, convert_to_block_layout
 FLOAT8_E4M3_MAX = 448.0
 FLOAT4_E2M1_MAX = 6.0
 
+SF_VEC_SIZE = {
+    "nvfp4": 16,
+    "mxfp4": 32,
+    "mxfp8": 32,
+}
+
 
 def generate_moe_weights(
     num_experts: int,
@@ -113,7 +119,7 @@ def quantize_fp4(
         - block_scale_factors: float8_e4m3fn tensor
         - global_scale_factor: float32 scalar tensor
     """
-    sf_vec_size = 16
+    sf_vec_size = SF_VEC_SIZE["mxfp4" if use_ue8m0 else "nvfp4"]
 
     if global_scale is None:
         global_scale = calculate_fp4_global_scale(tensor)
@@ -537,11 +543,11 @@ def calculate_moe_kernel_bandwidth(
         dtype: torch.dtype, fmt: Optional[str], is_weight: bool = False
     ) -> float:
         if fmt == "nvfp4":
-            # 1 e4m3 + 1 e4m3 scale per 16-element block
-            return 0.5 + 1 / 16
+            return 0.5 + 1 / SF_VEC_SIZE["nvfp4"]
         elif fmt == "mxfp4":
-            # 1 e2m1 + 1 ue8m0 scale per 32-element block
-            return 0.5 + 1 / 32
+            return 0.5 + 1 / SF_VEC_SIZE["mxfp4"]
+        elif fmt == "mxfp8":
+            return 1.0 + 1 / SF_VEC_SIZE["mxfp8"]
         elif fmt == "fp8":
             # 1 e4m3
             return 1.0

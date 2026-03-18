@@ -115,7 +115,7 @@ def _test_decode_kernel_pretranspose(
         A_log = torch.randn(num_sab_heads, dtype=torch.float32, device=device) * 0.1
 
         # dt_bias: decay bias [HV]
-        dt_bias = torch.randn(num_sab_heads, dtype=dtype_torch, device=device) * 0.1
+        dt_bias = torch.randn(num_sab_heads, dtype=torch.float32, device=device) * 0.1
 
         # a: input-dependent decay [B, 1, HV]
         # Convert alpha to a: alpha = exp(-exp(A_log) * softplus(a + dt_bias))
@@ -283,7 +283,7 @@ def _test_decode_kernel_nontranspose(
         A_log = torch.randn(num_sab_heads, dtype=torch.float32, device=device) * 0.1
 
         # dt_bias: decay bias [HV]
-        dt_bias = torch.randn(num_sab_heads, dtype=dtype_torch, device=device) * 0.1
+        dt_bias = torch.randn(num_sab_heads, dtype=torch.float32, device=device) * 0.1
 
         # a: input-dependent decay [B, 1, HV]
         a = (
@@ -397,6 +397,428 @@ def test_decode_kernel_basic_nontranspose(
 
 
 # ============================================================================
+# Test pretranspose kernel with pool + indices path
+# Verifies that passing initial_state=[pool,HV,V,K] + initial_state_indices=[B]
+# produces identical output and in-place state updates as the gather-run-scatter
+# direct-state path, and that unselected pool slots are untouched.
+# ============================================================================
+
+
+def _test_decode_kernel_pretranspose_pool(
+    dtype: str,
+    batch_size: int,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_size: int,
+    scale: float,
+    pool_multiplier: int = 3,
+    state_dtype: str = "bfloat16",
+    seed: int | None = None,
+):
+    """Pool+indices path must match gather → direct-state → scatter reference."""
+    _skip_if_not_sm90_or_later()
+
+    random.seed(seed)
+    torch.random.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+    num_sab_heads = num_v_heads
+    pool_size = batch_size * pool_multiplier
+    dtype_torch = getattr(torch, dtype)
+    kv_dtype = getattr(torch, state_dtype)
+    device = torch.device("cuda")
+
+    with device:
+        q = torch.randn(batch_size, 1, num_q_heads, head_size, dtype=dtype_torch)
+        k = torch.nn.functional.normalize(
+            torch.randn(batch_size, 1, num_k_heads, head_size, dtype=dtype_torch),
+            p=2.0,
+            dim=-1,
+        )
+        v = torch.randn(batch_size, 1, num_v_heads, head_size, dtype=dtype_torch)
+
+        A_log = torch.randn(num_sab_heads, dtype=torch.float32) * 0.1
+        dt_bias = torch.randn(num_sab_heads, dtype=torch.float32) * 0.1
+        a = torch.randn(batch_size, 1, num_sab_heads, dtype=dtype_torch) * 0.1
+        b = torch.randn(batch_size, 1, num_sab_heads, dtype=dtype_torch)
+
+        # Pool in [pool, HV, V, K] K-last layout (same as the direct-state layout)
+        pool = torch.randn(
+            pool_size, num_sab_heads, head_size, head_size, dtype=kv_dtype
+        )
+
+        # Non-trivial indices: every pool_multiplier-th slot (non-contiguous)
+        indices = (
+            torch.arange(batch_size, dtype=torch.int32, device=device) * pool_multiplier
+        )
+
+    # ── Pool path (what we're testing) ──────────────────────────────────────
+    pool_under_test = pool.clone()
+    out_pool, _ = gated_delta_rule_decode_pretranspose(
+        q=q,
+        k=k,
+        v=v,
+        state=None,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b,
+        scale=scale,
+        use_qk_l2norm=True,
+        initial_state=pool_under_test,
+        initial_state_indices=indices,
+    )
+
+    # ── Direct-state reference (gather → kernel) ─────────────────────────────
+    gathered_state = pool[indices].clone()  # [B, HV, V, K]
+    out_direct, updated_state = gated_delta_rule_decode_pretranspose(
+        q=q,
+        k=k,
+        v=v,
+        state=gathered_state,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b,
+        scale=scale,
+        use_qk_l2norm=True,
+    )
+
+    atol = 5e-3
+    rtol = 5e-3
+
+    # Outputs must match
+    torch.testing.assert_close(out_pool, out_direct, atol=atol, rtol=rtol)
+
+    # Selected pool slots must match the state updated by the direct path
+    torch.testing.assert_close(
+        pool_under_test[indices], updated_state, atol=atol, rtol=rtol
+    )
+
+    # Non-selected pool slots must be exactly unchanged
+    mask = torch.ones(pool_size, dtype=torch.bool, device=device)
+    mask[indices] = False
+    torch.testing.assert_close(pool_under_test[mask], pool[mask], atol=0.0, rtol=0.0)
+
+    print(
+        f"✓ Pool+indices pretranspose test passed "
+        f"(batch={batch_size}, pool={pool_size}, dtype={dtype})"
+    )
+
+
+@pytest.mark.parametrize("state_dtype", ["bfloat16", "float32"])
+@pytest.mark.parametrize("scale", [1.0])
+@pytest.mark.parametrize("head_size", [128])
+@pytest.mark.parametrize("num_q_heads, num_k_heads, num_v_heads", [(16, 16, 32)])
+@pytest.mark.parametrize("batch_size", [1, 4, 16, 32])
+@pytest.mark.parametrize("dtype", ["bfloat16"])
+def test_decode_kernel_pretranspose_pool(
+    dtype: str,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_size: int,
+    batch_size: int,
+    scale: float,
+    state_dtype: str,
+    seed: int = int(os.environ.get("SEED", "0")),
+):
+    _test_decode_kernel_pretranspose_pool(
+        dtype,
+        batch_size,
+        num_q_heads,
+        num_k_heads,
+        num_v_heads,
+        head_size,
+        scale,
+        state_dtype=state_dtype,
+        seed=seed,
+    )
+
+
+# ============================================================================
+# Test pretranspose kernel pool + indices with negative indices (padding)
+#
+# Negative pool indices signal padding slots: the kernel must write zeros to
+# output for those batch elements and leave the pool untouched.  The gather →
+# direct-state reference cannot handle negative indices, so we compare valid
+# slots against the Python reference and verify padding semantics directly.
+#
+# Only float32 state is tested because the bf16 fast-path kernel does not
+# support negative indices.
+# ============================================================================
+
+
+def _test_decode_kernel_pretranspose_pool_negative_indices(
+    dtype: str,
+    batch_size: int,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_size: int,
+    scale: float,
+    pool_multiplier: int = 2,
+    padding_fraction: float = 0.2,
+    seed: int | None = None,
+):
+    """Pool+indices with negative indices must zero output for padding slots
+    and match the Python reference for valid slots."""
+    _skip_if_not_sm90_or_later()
+
+    random.seed(seed)
+    torch.random.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+    num_sab_heads = num_v_heads
+    pool_size = batch_size * pool_multiplier
+    dtype_torch = getattr(torch, dtype)
+    device = torch.device("cuda")
+
+    with device:
+        q = torch.randn(batch_size, 1, num_q_heads, head_size, dtype=dtype_torch)
+        k = torch.nn.functional.normalize(
+            torch.randn(batch_size, 1, num_k_heads, head_size, dtype=dtype_torch),
+            p=2.0,
+            dim=-1,
+        )
+        v = torch.randn(batch_size, 1, num_v_heads, head_size, dtype=dtype_torch)
+
+        A_log = torch.randn(num_sab_heads, dtype=torch.float32) * 0.1
+        dt_bias = torch.randn(num_sab_heads, dtype=torch.float32) * 0.1
+        a = torch.randn(batch_size, 1, num_sab_heads, dtype=dtype_torch) * 0.1
+        b = torch.randn(batch_size, 1, num_sab_heads, dtype=dtype_torch)
+
+        # Float32 state pool (only f32 CuTe DSL kernel supports negative indices)
+        pool = torch.randn(
+            pool_size, num_sab_heads, head_size, head_size, dtype=torch.float32
+        )
+
+        # Build indices with ~padding_fraction padding slots
+        indices = torch.arange(batch_size, dtype=torch.int32, device=device)
+        mask = torch.rand(batch_size, device=device) < padding_fraction
+        # Ensure at least one valid and one padding slot when batch_size >= 2
+        if batch_size >= 2:
+            mask[0] = False  # first slot valid
+            mask[-1] = True  # last slot padding
+        indices[mask] = -1
+
+        # Map valid indices to random non-contiguous pool slots
+        valid_mask = indices >= 0
+        num_valid = valid_mask.sum().item()
+        if num_valid > 0:
+            valid_slots = torch.randperm(pool_size, device=device)[:num_valid].to(
+                torch.int32
+            )
+            indices[valid_mask] = valid_slots
+
+    pool_under_test = pool.clone()
+    out_pool, _ = gated_delta_rule_decode_pretranspose(
+        q=q,
+        k=k,
+        v=v,
+        state=None,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b,
+        scale=scale,
+        use_qk_l2norm=True,
+        initial_state=pool_under_test,
+        initial_state_indices=indices,
+    )
+    torch.cuda.synchronize()
+
+    # ── Padding slots must produce zero output ────────────────────────────────
+    invalid_mask = indices < 0
+    if invalid_mask.any():
+        padded_output = out_pool[invalid_mask]
+        assert torch.all(padded_output == 0), (
+            f"Padding slots must produce zero output, "
+            f"but got max abs = {padded_output.abs().max().item()}"
+        )
+
+    # ── Valid slots: compare per-sample against Python reference ──────────────
+    valid_indices_local = torch.where(valid_mask)[0].cpu().numpy()
+    pool_snapshot = pool.clone()  # original pool before kernel
+
+    for i in valid_indices_local:
+        pool_idx = indices[i].item()
+        ref_o, ref_s = decode_delta_rule(
+            q[i].squeeze(0).unsqueeze(0).float(),  # [1, H, K]
+            k[i].squeeze(0).unsqueeze(0).float(),
+            v[i].squeeze(0).unsqueeze(0).float(),
+            pool_snapshot[pool_idx]
+            .float()
+            .transpose(-2, -1)
+            .contiguous()
+            .unsqueeze(0),  # [1, HV, K, V]
+            A_log=A_log,
+            a=a[i].squeeze(0).unsqueeze(0),  # [1, HV]
+            dt_bias=dt_bias.float(),
+            b=b[i].squeeze(0).unsqueeze(0),
+            scale_factor=scale,
+            use_l2_norm=True,
+        )
+        # Output
+        torch.testing.assert_close(
+            out_pool[i].float().squeeze(0),
+            ref_o.squeeze(0).to(device),
+            atol=1e-2,
+            rtol=1e-2,
+        )
+        # State update (kernel: [HV, V, K], ref: [1, HV, K, V])
+        torch.testing.assert_close(
+            pool_under_test[pool_idx].float(),
+            ref_s.squeeze(0).transpose(-2, -1).to(device),
+            atol=1e-2,
+            rtol=1e-2,
+        )
+
+    # ── Untouched pool slots must remain unchanged ────────────────────────────
+    used_pool_indices = indices[valid_mask].unique()
+    touched = torch.zeros(pool_size, dtype=torch.bool, device=device)
+    if len(used_pool_indices) > 0:
+        touched[used_pool_indices.long()] = True
+    torch.testing.assert_close(
+        pool_under_test[~touched], pool[~touched], atol=0.0, rtol=0.0
+    )
+
+    print(
+        f"✓ Pool+indices negative-index test passed "
+        f"(batch={batch_size}, pool={pool_size}, dtype={dtype})"
+    )
+
+
+def _test_decode_kernel_pretranspose_pool_all_padding(
+    dtype: str,
+    batch_size: int,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_size: int,
+    scale: float,
+    pool_multiplier: int = 2,
+    seed: int | None = None,
+):
+    """When ALL indices are negative (entire batch is padding), output must be
+    all zeros and the pool must remain completely unchanged."""
+    _skip_if_not_sm90_or_later()
+
+    random.seed(seed)
+    torch.random.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+    num_sab_heads = num_v_heads
+    pool_size = batch_size * pool_multiplier
+    dtype_torch = getattr(torch, dtype)
+    device = torch.device("cuda")
+
+    with device:
+        q = torch.randn(batch_size, 1, num_q_heads, head_size, dtype=dtype_torch)
+        k = torch.randn(batch_size, 1, num_k_heads, head_size, dtype=dtype_torch)
+        v = torch.randn(batch_size, 1, num_v_heads, head_size, dtype=dtype_torch)
+
+        A_log = torch.randn(num_sab_heads, dtype=torch.float32) * 0.1
+        dt_bias = torch.randn(num_sab_heads, dtype=torch.float32) * 0.1
+        a = torch.randn(batch_size, 1, num_sab_heads, dtype=dtype_torch) * 0.1
+        b = torch.randn(batch_size, 1, num_sab_heads, dtype=dtype_torch)
+
+        pool = torch.randn(
+            pool_size, num_sab_heads, head_size, head_size, dtype=torch.float32
+        )
+        indices = torch.full((batch_size,), -1, dtype=torch.int32, device=device)
+
+    pool_under_test = pool.clone()
+    out, _ = gated_delta_rule_decode_pretranspose(
+        q=q,
+        k=k,
+        v=v,
+        state=None,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b,
+        scale=scale,
+        use_qk_l2norm=True,
+        initial_state=pool_under_test,
+        initial_state_indices=indices,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.all(out == 0), (
+        f"All-padding batch must produce zero output, "
+        f"but got max abs = {out.abs().max().item()}"
+    )
+    torch.testing.assert_close(
+        pool_under_test,
+        pool,
+        atol=0.0,
+        rtol=0.0,
+        msg="All-padding batch must not modify any pool state",
+    )
+
+    print(
+        f"✓ Pool+indices all-padding test passed "
+        f"(batch={batch_size}, pool={pool_size}, dtype={dtype})"
+    )
+
+
+@pytest.mark.parametrize("scale", [1.0])
+@pytest.mark.parametrize("head_size", [128])
+@pytest.mark.parametrize("num_q_heads, num_k_heads, num_v_heads", [(16, 16, 32)])
+@pytest.mark.parametrize("batch_size", [1, 4, 8, 32, 127])
+@pytest.mark.parametrize("dtype", ["bfloat16"])
+def test_decode_kernel_pretranspose_pool_negative_indices(
+    dtype: str,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_size: int,
+    batch_size: int,
+    scale: float,
+    seed: int = int(os.environ.get("SEED", "0")),
+):
+    _test_decode_kernel_pretranspose_pool_negative_indices(
+        dtype,
+        batch_size,
+        num_q_heads,
+        num_k_heads,
+        num_v_heads,
+        head_size,
+        scale,
+        seed=seed,
+    )
+
+
+@pytest.mark.parametrize("scale", [1.0])
+@pytest.mark.parametrize("head_size", [128])
+@pytest.mark.parametrize("num_q_heads, num_k_heads, num_v_heads", [(16, 16, 32)])
+@pytest.mark.parametrize("batch_size", [1, 4, 16, 32])
+@pytest.mark.parametrize("dtype", ["bfloat16"])
+def test_decode_kernel_pretranspose_pool_all_padding(
+    dtype: str,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_size: int,
+    batch_size: int,
+    scale: float,
+    seed: int = int(os.environ.get("SEED", "0")),
+):
+    _test_decode_kernel_pretranspose_pool_all_padding(
+        dtype,
+        batch_size,
+        num_q_heads,
+        num_k_heads,
+        num_v_heads,
+        head_size,
+        scale,
+        seed=seed,
+    )
+
+
+# ============================================================================
 # Test verify kernel with MTP version (Multiple Token Processing)
 # Reference: fp32 h state (default).
 # ============================================================================
@@ -414,6 +836,7 @@ def _test_verify_kernel_mtp(
     alpha: bool,
     beta: bool,
     cache_intermediate_states: bool = True,
+    disable_state_update: bool = True,
     seed: int = 0,
 ):
     """Test gated_delta_rule_mtp API (MTP version) against reference."""
@@ -499,7 +922,7 @@ def _test_verify_kernel_mtp(
         scale=scale_val,
         output=None,
         intermediate_states_buffer=intermediate_states_buffer,
-        disable_state_update=True,  # Don't update state for testing
+        disable_state_update=disable_state_update,
         use_qk_l2norm=True,
     )
 
@@ -567,6 +990,18 @@ def _test_verify_kernel_mtp(
             msg=f"Intermediate states mismatch for MTP kernel (B={B}, T={T}, dtype={dtype})",
         )
 
+    # Compare final state if state update is enabled
+    if not disable_state_update:
+        # Kernel returns [pool_size, HV, V, K], reference returns [B, HV, K, V]
+        final_state_ref_transposed = final_state_ref.transpose(-2, -1).contiguous()
+        torch.testing.assert_close(
+            final_state_kernel.float(),
+            final_state_ref_transposed.float(),
+            atol=atol_s,
+            rtol=rtol_s,
+            msg=f"Final state mismatch for MTP kernel (B={B}, T={T}, dtype={dtype})",
+        )
+
     print(f"✓ MTP kernel test passed (batch={B}, seq_len={T}, dtype={dtype})")
 
 
@@ -610,6 +1045,49 @@ def test_verify_kernel_mtp(
         beta,
         cache_intermediate_states,
         seed,
+    )
+
+
+# ============================================================================
+# Test MTP kernel with FP32 state, cache ON, state update ON (comprehensive)
+# This tests the full production configuration: all BS and T values
+# ============================================================================
+
+
+@pytest.mark.parametrize("seq_len", [2, 3, 4, 5, 6, 7, 8])
+@pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64, 128, 256, 512])
+@pytest.mark.parametrize("dtype", ["bfloat16"])
+def test_mtp_fp32_state_with_cache_and_state_update(
+    dtype: str,
+    batch_size: int,
+    seq_len: int,
+    seed: int = int(os.environ.get("SEED", "0")),
+):
+    """
+    Comprehensive MTP test with FP32 state, intermediate caching ON, state update ON.
+
+    This tests the production configuration:
+    - FP32 h state (not bf16)
+    - cache_intermediate_states=True
+    - disable_state_update=False (h is updated)
+    - All batch sizes: 1, 2, 4, 8, 16, 32, 64, 128, 256, 512
+    - All sequence lengths: 2, 3, 4, 5, 6, 7, 8
+    """
+    scale_val = 1.0 / math.sqrt(128)  # head_size=128
+    _test_verify_kernel_mtp(
+        dtype=dtype,
+        batch_size=batch_size,
+        num_q_heads=16,
+        num_k_heads=16,
+        num_v_heads=32,
+        head_size=128,
+        seq_len=seq_len,
+        scale=scale_val,
+        alpha=True,
+        beta=True,
+        cache_intermediate_states=True,
+        disable_state_update=False,  # State update ON
+        seed=seed,
     )
 
 
@@ -752,7 +1230,7 @@ def _test_gdn_decode_bf16_state_kernel(
     # Tolerances for bf16 h state comparison
     atol_o = 0.001
     rtol_o = 0.005
-    atol_kv = 0.005
+    atol_kv = 0.016  # Accommodates 1 ULP for BF16 (~2.0) from parallel reductions
     rtol_kv = 0.005
 
     # Compare outputs
@@ -1309,6 +1787,30 @@ if __name__ == "__main__":
         alpha=True,
         beta=True,
         cache_intermediate_states=True,
+        seed=42,
+    )
+
+    print("\n=== Testing Pool+indices with negative indices ===")
+    _test_decode_kernel_pretranspose_pool_negative_indices(
+        dtype="bfloat16",
+        batch_size=8,
+        num_q_heads=16,
+        num_k_heads=16,
+        num_v_heads=32,
+        head_size=128,
+        scale=1.0,
+        seed=42,
+    )
+
+    print("\n=== Testing Pool+indices all-padding ===")
+    _test_decode_kernel_pretranspose_pool_all_padding(
+        dtype="bfloat16",
+        batch_size=8,
+        num_q_heads=16,
+        num_k_heads=16,
+        num_v_heads=32,
+        head_size=128,
+        scale=1.0,
         seed=42,
     )
 

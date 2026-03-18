@@ -664,9 +664,11 @@ __device__ __forceinline__ vec_t<DType, VEC_SIZE> GenerateGumbelNoise(uint64_t p
     //     and including 1.0. kSCALE is used to exclude 1.0, s.t.
     //         1.18e-38 <= x * kSCALE <= 1.0f - epsilon
     //      => -4.47    <= -log(-log(...))       <= 15.9
+    // log2f maps to a single PTX LG2 instruction on NVIDIA GPUs, while logf
+    // internally computes log2f * ln(2). Using log2f with a single kLOG2
+    // multiplication is more efficient (3 ops vs 4 ops).
     return -kLOG2 * log2f(-log2f((x * kSCALE)));
   };
-// TODO: compare the speed of log2 and log
 #pragma unroll
   for (uint32_t i = 0; i + 4 <= VEC_SIZE; i += 4) {
     curand_init(philox_seed, subsequence + i, philox_offset, &state);

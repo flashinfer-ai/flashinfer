@@ -30,6 +30,7 @@ Reference: TensorRT-LLM/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py
 """
 
 import itertools
+import logging
 from typing import Any, Callable, Dict, List, Tuple
 
 import torch
@@ -44,6 +45,8 @@ from ..utils import (
     get_last_power_of_2_num_tokens_buckets,
     last_positive_power_of_2,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # =============================================================================
@@ -411,16 +414,17 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
 
 def print_all_tactics():
     """Print all valid MoE tactics for debugging."""
-    print(f"Total MoE tactics: {len(ALL_MOE_TACTICS)}")
-    print()
+    logger.info("Total MoE tactics: %d", len(ALL_MOE_TACTICS))
     for i, tactic in enumerate(ALL_MOE_TACTICS):
         tile_size, gemm1_tactic, gemm2_tactic = tactic
-        print(f"Tactic {i}:")
-        print(f"  tile_size: {tile_size}")
-        print(
-            f"  gemm1: mma_tiler_mn={gemm1_tactic[0]}, cluster_shape_mn={gemm1_tactic[1]}, raster_along_m={gemm1_tactic[2]}"
+        logger.info(
+            "Tactic %d:\n  tile_size: %s\n  gemm1: mma_tiler_mn=%s, cluster_shape_mn=%s, raster_along_m=%s\n  gemm2: mma_tiler_mn=%s, cluster_shape_mn=%s, raster_along_m=%s",
+            i,
+            tile_size,
+            gemm1_tactic[0],
+            gemm1_tactic[1],
+            gemm1_tactic[2],
+            gemm2_tactic[0],
+            gemm2_tactic[1],
+            gemm2_tactic[2],
         )
-        print(
-            f"  gemm2: mma_tiler_mn={gemm2_tactic[0]}, cluster_shape_mn={gemm2_tactic[1]}, raster_along_m={gemm2_tactic[2]}"
-        )
-        print()

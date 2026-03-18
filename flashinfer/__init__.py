@@ -80,9 +80,12 @@ from .fused_moe import (
     RoutingMethodType,
     cutlass_fused_moe,
     reorder_rows_for_gated_act_gemm,
+    trtllm_bf16_moe,
+    trtllm_bf16_routed_moe,
     trtllm_fp4_block_scale_moe,
     trtllm_fp4_block_scale_routed_moe,
     trtllm_fp8_block_scale_moe,
+    trtllm_fp8_block_scale_routed_moe,
     trtllm_fp8_per_tensor_scale_moe,
 )
 
@@ -127,6 +130,7 @@ from .prefill import single_prefill_with_kv_cache as single_prefill_with_kv_cach
 from .prefill import (
     single_prefill_with_kv_cache_return_lse as single_prefill_with_kv_cache_return_lse,
 )
+from .prefill import trtllm_fmha_v2_prefill as trtllm_fmha_v2_prefill
 from .quantization import packbits as packbits
 from .quantization import segment_packbits as segment_packbits
 from .rope import apply_llama31_rope as apply_llama31_rope

@@ -122,7 +122,7 @@ def ref_attention(
 
 @pytest.mark.skipif(
     get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12],
-    reason="XQA is only supported on SM90, SM100, SM120 GPUs",
+    reason="XQA is only supported on SM90, SM100, SM120/SM121 GPUs",
 )
 @pytest.mark.parametrize("enable_pdl", [True, False])
 @pytest.mark.parametrize("use_sliding_window", [True, False])
@@ -346,6 +346,8 @@ def test_xqa(
         q_heads,
         cache_k_heads.to(torch.float8_e4m3fn) if fp8_kv_cache else cache_k_heads,
         cache_v_heads.to(torch.float8_e4m3fn) if fp8_kv_cache else cache_v_heads,
+        None,
+        None,
         page_list_arg,
         seq_len_list,
         output,
@@ -467,7 +469,7 @@ def test_xqa(
 
 @pytest.mark.skipif(
     get_compute_capability(torch.device(device="cuda"))[0] not in [12],
-    reason="XQA mla is only supported on SM120 GPUs",
+    reason="XQA mla is only supported on SM120/SM121 GPUs",
 )
 @pytest.mark.parametrize("kv_scale", [1.0, 0.5])
 @pytest.mark.parametrize("q_scale", [1.0, 0.5])
