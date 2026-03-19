@@ -378,9 +378,10 @@ class NVFP4QuantizeSwizzledKernel:
 # =============================================================================
 
 _TMA_ROW_TILE = 16
-_TMA_COL_TILE = 64
-_TMA_NUM_CONSUMER_WARPS = 2
+_TMA_COL_TILE = 64  # Per-warp column tile
+_TMA_NUM_CONSUMER_WARPS = 8
 _TMA_NUM_STAGES = 4
+_TMA_COLS_PER_STAGE = _TMA_NUM_CONSUMER_WARPS * _TMA_COL_TILE  # 512
 
 
 def _round_up(x: int, d: int) -> int:
@@ -390,17 +391,18 @@ def _round_up(x: int, d: int) -> int:
 class NVFP4QuantizeTMAKernel:
     """
     TMA-based NVFP4 quantization kernel with pipelined producer-consumer
-    warp specialization.
+    warp specialization, matching the CUDA TMA kernel architecture.
 
-    Architecture:
-    - 1 producer warp issues TMA G2S loads into staged SMEM buffers
-    - 2 consumer warps read from SMEM, quantize, and write to global memory
+    Architecture (matches csrc/nv_internal/.../quantization.cuh):
+    - 1 producer warp (warp 0) issues TMA G2S loads into staged SMEM buffers
+    - 8 consumer warps (warps 1-8) read from SMEM, quantize, write to GMEM
     - PipelineTmaAsync manages multi-stage buffering (4 stages)
-    - Each TMA tile: [16, 64] for fp16/bf16
-    - Grid-stride loop over row tiles, inner while loop over column tiles
-    - Each consumer thread processes one SF block (16 elements) per tile
+    - Each TMA tile: [16, 512] = 16 rows x 8 warps x 64 cols per warp
+    - Each consumer warp: 4 threads/row x 8 rows/warp, 2 row iterations
+    - Each thread: 16 elements (1 SF block) via 2 x ld.shared.v4.u32
+    - Grid-stride loop over row tiles, inner loop over K/512 col chunks
 
-    Effective when M >= 1024 and K is a multiple of 64.
+    Effective when M >= 1024 and K is a multiple of 512.
     """
 
     def __init__(
@@ -420,13 +422,12 @@ class NVFP4QuantizeTMAKernel:
         self.sf_is_8x4 = sf_layout == SF_LAYOUT_8x4
 
         assert not self.is_fp8, "FP8 input not yet supported for TMA kernel"
-        assert K % _TMA_COL_TILE == 0, (
-            f"K ({K}) must be a multiple of {_TMA_COL_TILE} for TMA kernel"
+        assert K % _TMA_COLS_PER_STAGE == 0, (
+            f"K ({K}) must be a multiple of {_TMA_COLS_PER_STAGE} for TMA kernel"
         )
 
         self.num_sf_blocks_per_row = K // NVFP4_SF_VEC_SIZE
-        self.num_col_tiles = K // _TMA_COL_TILE
-        self.sf_blocks_per_tile = _TMA_COL_TILE // NVFP4_SF_VEC_SIZE  # 4
+        self.num_col_chunks = K // _TMA_COLS_PER_STAGE
 
         if sf_layout == SF_LAYOUT_LINEAR:
             self.padded_sf_cols = self.num_sf_blocks_per_row
@@ -438,15 +439,20 @@ class NVFP4QuantizeTMAKernel:
             self.padded_sf_cols = ((self.num_sf_blocks_per_row + 3) // 4) * 4
             self.row_tile_size = ROW_TILE_SIZE
 
-        self.num_consumer_warps = _TMA_NUM_CONSUMER_WARPS
+        self.num_consumer_warps = _TMA_NUM_CONSUMER_WARPS  # 8
         self.num_stages = _TMA_NUM_STAGES
-        self.producer_warp_id = self.num_consumer_warps
-        self.threads_per_cta = 32 * (self.num_consumer_warps + 1)
-        self.num_consumer_threads = 32 * self.num_consumer_warps
+        self.producer_warp_id = 0  # Warp 0 is producer (matches CUDA kernel)
+        self.threads_per_cta = 32 * (self.num_consumer_warps + 1)  # 288
         self.rows_per_block = _TMA_ROW_TILE
         self.buffer_align_bytes = 1024
         self.cluster_shape_mn = (1, 1)
-        self.elems_per_stage = _TMA_ROW_TILE * _TMA_COL_TILE
+        self.elems_per_stage = _TMA_ROW_TILE * _TMA_COLS_PER_STAGE  # 8192
+
+        # Thread indexing constants (matches CUDA TmaKernelTraitsTwoBytes)
+        self.THREADS_PER_ROW = 4  # laneIdx % 4
+        self.ROWS_PER_WARP = 8  # 32 / 4
+        self.ROW_ITERATIONS = _TMA_ROW_TILE // self.ROWS_PER_WARP  # 2
+        self.ELTS_PER_THREAD = NVFP4_SF_VEC_SIZE  # 16
 
     @cute.jit
     def _compute_sf_offset(
@@ -477,9 +483,10 @@ class NVFP4QuantizeTMAKernel:
             cute.make_layout((padded_M, self.K), stride=(self.K, 1)),
         )
 
+        # TMA tile covers the full 512-column stage
         smem_layout_single = cute.make_layout(
-            (_TMA_ROW_TILE, _TMA_COL_TILE),
-            stride=(_TMA_COL_TILE, 1),
+            (_TMA_ROW_TILE, _TMA_COLS_PER_STAGE),
+            stride=(_TMA_COLS_PER_STAGE, 1),
         )
 
         cta_tiler = cute.product_each(smem_layout_single.shape)
@@ -492,8 +499,8 @@ class NVFP4QuantizeTMAKernel:
 
         total_smem_elems = self.elems_per_stage * self.num_stages
         smem_layout_staged = cute.make_layout(
-            (_TMA_ROW_TILE, _TMA_COL_TILE, self.num_stages),
-            stride=(_TMA_COL_TILE, 1, self.elems_per_stage),
+            (_TMA_ROW_TILE, _TMA_COLS_PER_STAGE, self.num_stages),
+            stride=(_TMA_COLS_PER_STAGE, 1, self.elems_per_stage),
         )
 
         self.num_tma_load_bytes = cute.size_in_bytes(self.dtype, smem_layout_single)
@@ -546,8 +553,9 @@ class NVFP4QuantizeTMAKernel:
     ):
         from ...cute_dsl.fp4_common import (
             cvt_f32_to_e4m3,
+            get_smem_ptr_as_int32,
+            ld_shared_v4_u32,
             nvfp4_compute_output_scale,
-            pack_16bit_to_u32,
             rcp_approx_ftz,
         )
 
@@ -565,8 +573,8 @@ class NVFP4QuantizeTMAKernel:
         global_scale = Float32(mGlobalScale[Int32(0)])
         padded_sf_cols = self.padded_sf_cols
         num_sf_blocks_per_row = self.num_sf_blocks_per_row
-        num_col_tiles = self.num_col_tiles
-        sf_blocks_per_tile = self.sf_blocks_per_tile
+        num_col_chunks = self.num_col_chunks
+        elems_per_stage = self.elems_per_stage
 
         # ---- SMEM allocation ----
         smem = cutlass.utils.SmemAllocator()
@@ -596,7 +604,7 @@ class NVFP4QuantizeTMAKernel:
 
         # ---- TMA partition ----
         gSrc_tiled = cute.local_tile(
-            gInput_tma, (_TMA_ROW_TILE, _TMA_COL_TILE), (None, None)
+            gInput_tma, (_TMA_ROW_TILE, _TMA_COLS_PER_STAGE), (None, None)
         )
         tAsA, tAgA = cpasync.tma_partition(
             tma_atom,
@@ -608,12 +616,12 @@ class NVFP4QuantizeTMAKernel:
 
         num_row_tiles = cute.ceil_div(padded_M, _TMA_ROW_TILE)
 
-        # Consumer thread mapping: 64 threads → 16 rows × 4 SF blocks
-        consumer_tid = warp_idx * Int32(32) + lane_idx
-        row_in_tile = consumer_tid // Int32(sf_blocks_per_tile)
-        sf_col_in_tile = consumer_tid % Int32(sf_blocks_per_tile)
+        # ---- Consumer thread indexing (matches CUDA TmaKernelTraitsTwoBytes) ----
+        # 4 threads per row, 8 rows per warp, 2 row iterations per stage
+        col_idx_local = lane_idx % Int32(self.THREADS_PER_ROW)
+        row_idx_local = lane_idx // Int32(self.THREADS_PER_ROW)
 
-        # ======== Producer warp ========
+        # ======== Producer warp (warp 0) ========
         if warp_idx == self.producer_warp_id:
             producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_stages
@@ -621,154 +629,143 @@ class NVFP4QuantizeTMAKernel:
 
             row_tile_idx = bidx
             while row_tile_idx < num_row_tiles:
-                col_tile = Int32(0)
-                while col_tile < num_col_tiles:
+                col_chunk = Int32(0)
+                while col_chunk < num_col_chunks:
                     load_pipeline.producer_acquire(producer_state)
 
                     cute.copy(
                         tma_atom,
-                        tAgA[(None, row_tile_idx, col_tile)],
+                        tAgA[(None, row_tile_idx, col_chunk)],
                         tAsA[(None, producer_state.index)],
                         tma_bar_ptr=load_pipeline.producer_get_barrier(producer_state),
                     )
 
                     producer_state.advance()
-                    col_tile = col_tile + Int32(1)
+                    col_chunk = col_chunk + Int32(1)
 
                 row_tile_idx = row_tile_idx + grid_dim_x
 
             load_pipeline.producer_tail(producer_state)
 
-        # ======== Consumer warps ========
-        if warp_idx < self.num_consumer_warps:
+        # ======== Consumer warps (warps 1-8) ========
+        if warp_idx > 0:
             consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_stages
             )
+
+            # 0-indexed consumer warp id
+            consumer_warp_idx = warp_idx - Int32(1)
+
+            # Base column within the 512-col stage for this thread
+            base_col_in_stage = consumer_warp_idx * Int32(
+                _TMA_COL_TILE
+            ) + col_idx_local * Int32(self.ELTS_PER_THREAD)
 
             row_tile_idx = bidx
             while row_tile_idx < num_row_tiles:
                 base_row = row_tile_idx * Int32(_TMA_ROW_TILE)
 
-                col_tile = Int32(0)
-                while col_tile < num_col_tiles:
+                col_chunk = Int32(0)
+                while col_chunk < num_col_chunks:
                     load_pipeline.consumer_wait(consumer_state)
-
                     stage = consumer_state.index
-                    row_idx = base_row + row_in_tile
-                    sf_col = col_tile * Int32(sf_blocks_per_tile) + sf_col_in_tile
 
-                    # ---- Read from SMEM into registers ----
-                    # Use CuTe tensor indexing (address-space-aware) instead
-                    # of raw PTX loads which break on SMEM due to ptrtoint
-                    # stripping the address space. Pack consecutive fp16/bf16
-                    # pairs into Uint32 (half2/bfloat2) for SIMD quant math.
-                    cb = sf_col_in_tile * Int32(NVFP4_SF_VEC_SIZE)
-                    h0 = pack_16bit_to_u32(
-                        sData_staged[row_in_tile, cb, stage],
-                        sData_staged[row_in_tile, cb + Int32(1), stage],
-                    )
-                    h1 = pack_16bit_to_u32(
-                        sData_staged[row_in_tile, cb + Int32(2), stage],
-                        sData_staged[row_in_tile, cb + Int32(3), stage],
-                    )
-                    h2 = pack_16bit_to_u32(
-                        sData_staged[row_in_tile, cb + Int32(4), stage],
-                        sData_staged[row_in_tile, cb + Int32(5), stage],
-                    )
-                    h3 = pack_16bit_to_u32(
-                        sData_staged[row_in_tile, cb + Int32(6), stage],
-                        sData_staged[row_in_tile, cb + Int32(7), stage],
-                    )
-                    h4 = pack_16bit_to_u32(
-                        sData_staged[row_in_tile, cb + Int32(8), stage],
-                        sData_staged[row_in_tile, cb + Int32(9), stage],
-                    )
-                    h5 = pack_16bit_to_u32(
-                        sData_staged[row_in_tile, cb + Int32(10), stage],
-                        sData_staged[row_in_tile, cb + Int32(11), stage],
-                    )
-                    h6 = pack_16bit_to_u32(
-                        sData_staged[row_in_tile, cb + Int32(12), stage],
-                        sData_staged[row_in_tile, cb + Int32(13), stage],
-                    )
-                    h7 = pack_16bit_to_u32(
-                        sData_staged[row_in_tile, cb + Int32(14), stage],
-                        sData_staged[row_in_tile, cb + Int32(15), stage],
-                    )
+                    # Global column base for this col_chunk
+                    global_col_base = col_chunk * Int32(_TMA_COLS_PER_STAGE)
 
-                    # ---- Release pipeline early (data is in registers) ----
+                    # Process ROW_ITERATIONS row batches (compile-time unrolled)
+                    for row_iter in range(self.ROW_ITERATIONS):
+                        cur_row_in_tile = row_idx_local + Int32(
+                            row_iter * self.ROWS_PER_WARP
+                        )
+                        global_row = base_row + cur_row_in_tile
+
+                        # ---- Vectorized SMEM read: 2 x ld.shared.v4.u32 ----
+                        smem_elem_off = (
+                            stage * Int32(elems_per_stage)
+                            + cur_row_in_tile * Int32(_TMA_COLS_PER_STAGE)
+                            + base_col_in_stage
+                        )
+                        smem_addr = get_smem_ptr_as_int32(sData_staged, smem_elem_off)
+                        h0, h1, h2, h3 = ld_shared_v4_u32(smem_addr)
+                        h4, h5, h6, h7 = ld_shared_v4_u32(smem_addr + Int32(16))
+
+                        # ---- Quantize and write ----
+                        if global_row < padded_M:
+                            # SF column index for this thread
+                            sf_col = (global_col_base + base_col_in_stage) // Int32(
+                                NVFP4_SF_VEC_SIZE
+                            )
+                            is_padding_row = global_row >= M
+
+                            if is_padding_row:
+                                sf_offset = self._compute_sf_offset(
+                                    global_row, sf_col, padded_sf_cols
+                                )
+                                mScales[sf_offset] = Uint8(0)
+                            else:
+                                if cutlass.const_expr(self.is_bfloat16):
+                                    block_max_h2 = bfloat2_max_abs_8_fn(
+                                        h0, h1, h2, h3, h4, h5, h6, h7
+                                    )
+                                    block_max = bfloat2_hmax_reduce_to_f32(block_max_h2)
+                                else:
+                                    block_max_h2 = half2_max_abs_8_fn(
+                                        h0, h1, h2, h3, h4, h5, h6, h7
+                                    )
+                                    block_max = hmax_reduce_to_f32(block_max_h2)
+
+                                fp4_max_rcp = rcp_approx_ftz(Float32(6.0))
+                                scale_float = global_scale * (block_max * fp4_max_rcp)
+                                scale_fp8_u32 = cvt_f32_to_e4m3(scale_float)
+                                scale_fp8 = Uint8(scale_fp8_u32 & cutlass.Uint32(0xFF))
+
+                                output_scale = nvfp4_compute_output_scale(
+                                    scale_fp8_u32, global_scale
+                                )
+
+                                if cutlass.const_expr(self.is_bfloat16):
+                                    packed64 = bfloat2x8_to_e2m1x16_packed(
+                                        h0,
+                                        h1,
+                                        h2,
+                                        h3,
+                                        h4,
+                                        h5,
+                                        h6,
+                                        h7,
+                                        output_scale,
+                                    )
+                                else:
+                                    packed64 = half2x8_to_e2m1x16_packed(
+                                        h0,
+                                        h1,
+                                        h2,
+                                        h3,
+                                        h4,
+                                        h5,
+                                        h6,
+                                        h7,
+                                        output_scale,
+                                    )
+
+                                sf_offset = self._compute_sf_offset(
+                                    global_row, sf_col, padded_sf_cols
+                                )
+                                mScales[sf_offset] = scale_fp8
+
+                                row_output = mOutput[global_row, None]
+                                out_base = sf_col * Int32(NVFP4_SF_VEC_SIZE // 2)
+                                out_ptr = get_ptr_as_int64(row_output, out_base)
+                                st_global_u64(out_ptr, packed64)
+
                     load_pipeline.consumer_release(consumer_state)
                     consumer_state.advance()
-
-                    # ---- Quantize and write (operates on register data) ----
-                    if row_idx < padded_M:
-                        is_padding_row = row_idx >= M
-
-                        if is_padding_row:
-                            sf_offset = self._compute_sf_offset(
-                                row_idx, sf_col, padded_sf_cols
-                            )
-                            mScales[sf_offset] = Uint8(0)
-                        else:
-                            if cutlass.const_expr(self.is_bfloat16):
-                                block_max_h2 = bfloat2_max_abs_8_fn(
-                                    h0, h1, h2, h3, h4, h5, h6, h7
-                                )
-                                block_max = bfloat2_hmax_reduce_to_f32(block_max_h2)
-                            else:
-                                block_max_h2 = half2_max_abs_8_fn(
-                                    h0, h1, h2, h3, h4, h5, h6, h7
-                                )
-                                block_max = hmax_reduce_to_f32(block_max_h2)
-
-                            fp4_max_rcp = rcp_approx_ftz(Float32(6.0))
-                            scale_float = global_scale * (block_max * fp4_max_rcp)
-                            scale_fp8_u32 = cvt_f32_to_e4m3(scale_float)
-                            scale_fp8 = Uint8(scale_fp8_u32 & cutlass.Uint32(0xFF))
-
-                            output_scale = nvfp4_compute_output_scale(
-                                scale_fp8_u32, global_scale
-                            )
-
-                            if cutlass.const_expr(self.is_bfloat16):
-                                packed64 = bfloat2x8_to_e2m1x16_packed(
-                                    h0,
-                                    h1,
-                                    h2,
-                                    h3,
-                                    h4,
-                                    h5,
-                                    h6,
-                                    h7,
-                                    output_scale,
-                                )
-                            else:
-                                packed64 = half2x8_to_e2m1x16_packed(
-                                    h0,
-                                    h1,
-                                    h2,
-                                    h3,
-                                    h4,
-                                    h5,
-                                    h6,
-                                    h7,
-                                    output_scale,
-                                )
-
-                            sf_offset = self._compute_sf_offset(
-                                row_idx, sf_col, padded_sf_cols
-                            )
-                            mScales[sf_offset] = scale_fp8
-
-                            row_output = mOutput[row_idx, None]
-                            out_base = sf_col * Int32(NVFP4_SF_VEC_SIZE // 2)
-                            out_ptr = get_ptr_as_int64(row_output, out_base)
-                            st_global_u64(out_ptr, packed64)
-
-                    col_tile = col_tile + Int32(1)
+                    col_chunk = col_chunk + Int32(1)
 
                 # Zero padding SF columns for swizzled layouts
                 if cutlass.const_expr(self.sf_layout != SF_LAYOUT_LINEAR):
+                    consumer_tid = (warp_idx - Int32(1)) * Int32(32) + lane_idx
                     if consumer_tid < _TMA_ROW_TILE:
                         pad_row_idx = base_row + consumer_tid
                         if pad_row_idx < padded_M:
@@ -861,7 +858,7 @@ def _should_use_tma(m: int, k: int, dtype: torch.dtype) -> bool:
     """Determine if TMA kernel should be used based on problem dimensions."""
     if dtype == torch.float8_e4m3fn:
         return False
-    return m >= _TMA_MIN_M and k % _TMA_COL_TILE == 0
+    return m >= _TMA_MIN_M and k % _TMA_COLS_PER_STAGE == 0
 
 
 @functools.cache

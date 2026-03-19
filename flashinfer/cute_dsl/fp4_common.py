@@ -211,6 +211,49 @@ def get_ptr_as_int64(tensor: cute.Tensor, offset: Int32, *, loc=None, ip=None) -
 
 
 @dsl_user_op
+def get_smem_ptr_as_int32(
+    tensor: cute.Tensor, offset: Int32, *, loc=None, ip=None
+) -> Int32:
+    """Get the shared-memory byte address of tensor[offset] as Int32.
+
+    Uses Pointer.toint() which preserves the SMEM address space (addrspace 3),
+    returning a 32-bit SMEM address suitable for ld.shared.* instructions.
+    """
+    elem_ptr = tensor.iterator + Int32(offset)
+    return elem_ptr.toint(loc=loc, ip=ip)
+
+
+@dsl_user_op
+def ld_shared_v4_u32(
+    smem_addr: Int32, *, loc=None, ip=None
+) -> Tuple[Uint32, Uint32, Uint32, Uint32]:
+    """Load 128 bits (4 x uint32) from shared memory via ld.shared.v4.u32.
+
+    Args:
+        smem_addr: 32-bit shared memory address (from get_smem_ptr_as_int32).
+
+    Returns:
+        4 Uint32 values (16 bytes total, e.g. 8 packed fp16 elements).
+    """
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+        "ld.shared.v4.u32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    v0 = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
+    v1 = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
+    v2 = llvm.extractvalue(T.i32(), result, [2], loc=loc, ip=ip)
+    v3 = llvm.extractvalue(T.i32(), result, [3], loc=loc, ip=ip)
+    return Uint32(v0), Uint32(v1), Uint32(v2), Uint32(v3)
+
+
+@dsl_user_op
 def pack_16bit_to_u32(lo, hi, *, loc=None, ip=None) -> Uint32:
     """Pack two 16-bit scalar values (fp16 or bf16) into one Uint32 (half2/bfloat2).
 
