@@ -155,6 +155,22 @@ def _check_kv_layout(kv_layout: str) -> None:
         raise KeyError("Invalid kv_layout {}".format(kv_layout))
 
 
+def _validate_fixed_cta_tile_q(fixed_cta_tile_q: Optional[int], head_dim: int) -> int:
+    """Validate fixed_cta_tile_q and return the integer value to pass to the kernel
+    (-1 means auto-select)."""
+    if fixed_cta_tile_q is None:
+        return -1
+    if fixed_cta_tile_q not in (16, 64, 128):
+        raise ValueError(
+            f"fixed_cta_tile_q should be one of {{16, 64, 128}}, got {fixed_cta_tile_q}"
+        )
+    if fixed_cta_tile_q == 128 and head_dim >= 256:
+        raise ValueError(
+            f"fixed_cta_tile_q=128 is not supported with head_dim={head_dim} (requires head_dim < 256)"
+        )
+    return fixed_cta_tile_q
+
+
 def is_float8(x: torch.Tensor) -> bool:
     return x.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
 

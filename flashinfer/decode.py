@@ -55,6 +55,7 @@ from .utils import (
     PosEncodingMode,
     TensorLayout,
     _check_cached_qkv_data_type,
+    _validate_fixed_cta_tile_q,
     _check_kv_layout,
     _check_pos_encoding_mode,
     check_shape_dtype_device,
@@ -985,16 +986,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             )
         if fixed_split_size is None:
             fixed_split_size = -1
-        if fixed_cta_tile_q is None:
-            fixed_cta_tile_q = -1
-        elif fixed_cta_tile_q not in (16, 64, 128):
-            raise ValueError(
-                f"fixed_cta_tile_q should be one of {{16, 64, 128}}, got {fixed_cta_tile_q}"
-            )
-        elif fixed_cta_tile_q == 128 and head_dim >= 256:
-            raise ValueError(
-                f"fixed_cta_tile_q=128 is not supported with head_dim={head_dim} (requires head_dim < 256)"
-            )
+        fixed_cta_tile_q = _validate_fixed_cta_tile_q(fixed_cta_tile_q, head_dim)
 
         self._cached_q_data_type = q_data_type
         self._cached_kv_data_type = kv_data_type
@@ -2672,16 +2664,7 @@ def fast_decode_plan(
         # Here we set fixed_split_size to -1 to avoid the assertion error in flashinfer's plan function
         if fixed_split_size is None:
             fixed_split_size = -1
-        if fixed_cta_tile_q is None:
-            fixed_cta_tile_q = -1
-        elif fixed_cta_tile_q not in (16, 64, 128):
-            raise ValueError(
-                f"fixed_cta_tile_q should be one of {{16, 64, 128}}, got {fixed_cta_tile_q}"
-            )
-        elif fixed_cta_tile_q == 128 and head_dim >= 256:
-            raise ValueError(
-                f"fixed_cta_tile_q=128 is not supported with head_dim={head_dim} (requires head_dim < 256)"
-            )
+        fixed_cta_tile_q = _validate_fixed_cta_tile_q(fixed_cta_tile_q, head_dim)
 
     if self.is_cuda_graph_enabled:
         if batch_size != self._fixed_batch_size:
