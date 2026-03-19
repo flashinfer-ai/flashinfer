@@ -1821,6 +1821,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
             raise ValueError(
                 f"fixed_cta_tile_q should be one of {{16, 64, 128}}, got {fixed_cta_tile_q}"
             )
+        elif fixed_cta_tile_q == 128 and head_dim_vo >= 256:
+            raise ValueError(
+                f"fixed_cta_tile_q=128 is not supported with head_dim={head_dim_vo} (requires head_dim < 256)"
+            )
 
         batch_size = len(qo_indptr) - 1
         self._batch_size = batch_size
@@ -2807,6 +2811,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         elif fixed_cta_tile_q not in (16, 64, 128):
             raise ValueError(
                 f"fixed_cta_tile_q should be one of {{16, 64, 128}}, got {fixed_cta_tile_q}"
+            )
+        elif fixed_cta_tile_q == 128 and head_dim_vo >= 256:
+            raise ValueError(
+                f"fixed_cta_tile_q=128 is not supported with head_dim={head_dim_vo} (requires head_dim < 256)"
             )
         if logits_soft_cap is None:
             logits_soft_cap = 0.0

@@ -991,6 +991,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
             raise ValueError(
                 f"fixed_cta_tile_q should be one of {{16, 64, 128}}, got {fixed_cta_tile_q}"
             )
+        elif fixed_cta_tile_q == 128 and head_dim >= 256:
+            raise ValueError(
+                f"fixed_cta_tile_q=128 is not supported with head_dim={head_dim} (requires head_dim < 256)"
+            )
 
         self._cached_q_data_type = q_data_type
         self._cached_kv_data_type = kv_data_type
@@ -2673,6 +2677,10 @@ def fast_decode_plan(
         elif fixed_cta_tile_q not in (16, 64, 128):
             raise ValueError(
                 f"fixed_cta_tile_q should be one of {{16, 64, 128}}, got {fixed_cta_tile_q}"
+            )
+        elif fixed_cta_tile_q == 128 and head_dim >= 256:
+            raise ValueError(
+                f"fixed_cta_tile_q=128 is not supported with head_dim={head_dim} (requires head_dim < 256)"
             )
 
     if self.is_cuda_graph_enabled:

@@ -534,6 +534,12 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
       err_msg << "fixed_cta_tile_q should be one of {16, 64, 128}, but got " << fixed_cta_tile_q;
       FLASHINFER_ERROR(err_msg.str());
     }
+    if (fixed_cta_tile_q == 128 && head_dim >= 256) {
+      std::ostringstream err_msg;
+      err_msg << "fixed_cta_tile_q=128 is not supported with head_dim=" << head_dim
+              << " (requires head_dim < 256)";
+      FLASHINFER_ERROR(err_msg.str());
+    }
     cta_tile_q = fixed_cta_tile_q;
   } else if (enable_cuda_graph) {
     // When CUDA graphs are enabled, the lengths of sequences determined by
