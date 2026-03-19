@@ -510,6 +510,10 @@ def nvfp4_quantize_cute_dsl(
 
     if sf_layout == SF_LAYOUT_LINEAR:
         row_tile_size = 1
+        # NOTE: When adding a TMA-based kernel, padded_m must be rounded up to the
+        # TMA tile row dimension (e.g. round_up(m, tma_tile_rows)) and scale_output
+        # must be trimmed to m * num_sf_blocks_per_row before returning.
+        # See PR f4d10d9 for the analogous CUDA fix.
         padded_m = m
         padded_sf_cols = num_sf_blocks_per_row
     elif sf_layout == SF_LAYOUT_8x4:
