@@ -1,10 +1,9 @@
 # CODEOWNERS — manually maintained, not auto-generated.
-# See CODEOWNER_MIGRATION_PLAN.md for rationale.
 #
 # Rules:
 #   - Last matching pattern wins (GitHub semantics).
 #   - Catch-all ensures every PR gets at least one core-maintainer review.
-#   - Prefer @flashinfer-ai/<team> over individual users.
+#   - Prefer @flashinfer-ai/<team> over individual users. (currently working around this)
 #   - Keep entries sorted alphabetically within each section.
 
 # ── Catch-all: core maintainers review everything not covered below ──
