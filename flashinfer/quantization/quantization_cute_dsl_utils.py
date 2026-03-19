@@ -48,6 +48,13 @@ ROW_TILE_SIZE = 128
 
 
 # =============================================================================
+# NVFP4 Constants
+# =============================================================================
+
+# Scale factor vector size for NVFP4: each scale factor covers 16 elements
+NVFP4_SF_VEC_SIZE = 16
+
+# =============================================================================
 # MXFP4 Constants
 # =============================================================================
 
@@ -961,7 +968,194 @@ def bfloat2x16_to_e2m1x32_packed(
     return packed64_0, packed64_1
 
 
+# =============================================================================
+# NVFP4 High-Level Helper Functions (sf_vec_size=16, E4M3 scale factors)
+# =============================================================================
+
+
+@cute.jit
+def half2x8_to_e2m1x16_packed(
+    h0: Uint32,
+    h1: Uint32,
+    h2: Uint32,
+    h3: Uint32,
+    h4: Uint32,
+    h5: Uint32,
+    h6: Uint32,
+    h7: Uint32,
+    inv_scale: Float32,
+) -> Uint64:
+    """
+    Convert 8 half2 values (16 FP16) to 16 E2M1 and pack into u64.
+
+    Returns:
+        Uint64 containing 16 E2M1 values (8 bytes)
+    """
+    s0, s1 = half2_to_float2_scaled(h0, inv_scale)
+    s2, s3 = half2_to_float2_scaled(h1, inv_scale)
+    s4, s5 = half2_to_float2_scaled(h2, inv_scale)
+    s6, s7 = half2_to_float2_scaled(h3, inv_scale)
+    s8, s9 = half2_to_float2_scaled(h4, inv_scale)
+    s10, s11 = half2_to_float2_scaled(h5, inv_scale)
+    s12, s13 = half2_to_float2_scaled(h6, inv_scale)
+    s14, s15 = half2_to_float2_scaled(h7, inv_scale)
+
+    packed_lo = cvt_e2m1x8_f32(s0, s1, s2, s3, s4, s5, s6, s7)
+    packed_hi = cvt_e2m1x8_f32(s8, s9, s10, s11, s12, s13, s14, s15)
+
+    return (Uint64(packed_hi) << Uint64(32)) | Uint64(packed_lo)
+
+
+@cute.jit
+def bfloat2x8_to_e2m1x16_packed(
+    h0: Uint32,
+    h1: Uint32,
+    h2: Uint32,
+    h3: Uint32,
+    h4: Uint32,
+    h5: Uint32,
+    h6: Uint32,
+    h7: Uint32,
+    inv_scale: Float32,
+) -> Uint64:
+    """
+    Convert 8 bfloat2 values (16 BF16) to 16 E2M1 and pack into u64.
+
+    Returns:
+        Uint64 containing 16 E2M1 values (8 bytes)
+    """
+    s0, s1 = bfloat2_to_float2_scaled(h0, inv_scale)
+    s2, s3 = bfloat2_to_float2_scaled(h1, inv_scale)
+    s4, s5 = bfloat2_to_float2_scaled(h2, inv_scale)
+    s6, s7 = bfloat2_to_float2_scaled(h3, inv_scale)
+    s8, s9 = bfloat2_to_float2_scaled(h4, inv_scale)
+    s10, s11 = bfloat2_to_float2_scaled(h5, inv_scale)
+    s12, s13 = bfloat2_to_float2_scaled(h6, inv_scale)
+    s14, s15 = bfloat2_to_float2_scaled(h7, inv_scale)
+
+    packed_lo = cvt_e2m1x8_f32(s0, s1, s2, s3, s4, s5, s6, s7)
+    packed_hi = cvt_e2m1x8_f32(s8, s9, s10, s11, s12, s13, s14, s15)
+
+    return (Uint64(packed_hi) << Uint64(32)) | Uint64(packed_lo)
+
+
+@cute.jit
+def process_nvfp4_block_half(
+    row_tensor, elem_base: Int32, global_scale: Float32
+) -> tuple:
+    """
+    Process a 16-element NVFP4 block for half precision input.
+
+    Loads 16 FP16 elements, computes the E4M3 scale factor using global_scale,
+    converts to E2M1, and packs the result into a u64 value.
+
+    Args:
+        row_tensor: Row tensor slice (mInput[row_idx, None])
+        elem_base: Starting element index
+        global_scale: User-provided global scale factor
+
+    Returns:
+        (scale_e4m3_u8, packed64):
+        - scale_e4m3_u8: E4M3 scale factor as Uint8
+        - packed64: Uint64 containing 16 E2M1 values
+    """
+    from cutlass import Uint8
+
+    from ..cute_dsl.fp4_common import (
+        cvt_f32_to_e4m3,
+        fp8_e4m3_to_f32_and_rcp,
+        get_ptr_as_int64,
+        ld_global_v4_u32,
+        rcp_approx_ftz,
+    )
+
+    # Load 16 elements (2 x 128-bit = 8 half2 values)
+    ptr0 = get_ptr_as_int64(row_tensor, elem_base)
+    ptr1 = get_ptr_as_int64(row_tensor, elem_base + Int32(8))
+
+    h0, h1, h2, h3 = ld_global_v4_u32(ptr0)
+    h4, h5, h6, h7 = ld_global_v4_u32(ptr1)
+
+    # Compute max absolute value across 16 elements
+    block_max_h2 = half2_max_abs_8(h0, h1, h2, h3, h4, h5, h6, h7)
+    block_max = hmax_reduce_to_f32(block_max_h2)
+
+    # E4M3 scale factor computation
+    fp4_max_rcp = rcp_approx_ftz(Float32(6.0))
+    scale_float = global_scale * (block_max * fp4_max_rcp)
+    scale_fp8_u32 = cvt_f32_to_e4m3(scale_float)
+    scale_fp8 = Uint8(scale_fp8_u32 & Uint32(0xFF))
+
+    # Back-convert E4M3 to float and compute output_scale = global_scale / scale_back
+    inv_scale_back = fp8_e4m3_to_f32_and_rcp(scale_fp8_u32)
+    output_scale = global_scale * inv_scale_back
+
+    # Convert to E2M1 and pack
+    packed64 = half2x8_to_e2m1x16_packed(h0, h1, h2, h3, h4, h5, h6, h7, output_scale)
+
+    return scale_fp8, packed64
+
+
+@cute.jit
+def process_nvfp4_block_bfloat(
+    row_tensor, elem_base: Int32, global_scale: Float32
+) -> tuple:
+    """
+    Process a 16-element NVFP4 block for bfloat16 precision input.
+
+    Loads 16 BF16 elements, computes the E4M3 scale factor using global_scale,
+    converts to E2M1, and packs the result into a u64 value.
+
+    Args:
+        row_tensor: Row tensor slice (mInput[row_idx, None])
+        elem_base: Starting element index
+        global_scale: User-provided global scale factor
+
+    Returns:
+        (scale_e4m3_u8, packed64):
+        - scale_e4m3_u8: E4M3 scale factor as Uint8
+        - packed64: Uint64 containing 16 E2M1 values
+    """
+    from cutlass import Uint8
+
+    from ..cute_dsl.fp4_common import (
+        cvt_f32_to_e4m3,
+        fp8_e4m3_to_f32_and_rcp,
+        get_ptr_as_int64,
+        ld_global_v4_u32,
+        rcp_approx_ftz,
+    )
+
+    # Load 16 elements (2 x 128-bit = 8 bfloat2 values)
+    ptr0 = get_ptr_as_int64(row_tensor, elem_base)
+    ptr1 = get_ptr_as_int64(row_tensor, elem_base + Int32(8))
+
+    h0, h1, h2, h3 = ld_global_v4_u32(ptr0)
+    h4, h5, h6, h7 = ld_global_v4_u32(ptr1)
+
+    # Compute max absolute value across 16 elements
+    block_max_h2 = bfloat2_max_abs_8(h0, h1, h2, h3, h4, h5, h6, h7)
+    block_max = bfloat2_hmax_reduce_to_f32(block_max_h2)
+
+    # E4M3 scale factor computation
+    fp4_max_rcp = rcp_approx_ftz(Float32(6.0))
+    scale_float = global_scale * (block_max * fp4_max_rcp)
+    scale_fp8_u32 = cvt_f32_to_e4m3(scale_float)
+    scale_fp8 = Uint8(scale_fp8_u32 & Uint32(0xFF))
+
+    # Back-convert E4M3 to float and compute output_scale = global_scale / scale_back
+    inv_scale_back = fp8_e4m3_to_f32_and_rcp(scale_fp8_u32)
+    output_scale = global_scale * inv_scale_back
+
+    # Convert to E2M1 and pack
+    packed64 = bfloat2x8_to_e2m1x16_packed(h0, h1, h2, h3, h4, h5, h6, h7, output_scale)
+
+    return scale_fp8, packed64
+
+
 __all__ = [
+    # NVFP4 Constants
+    "NVFP4_SF_VEC_SIZE",
     # MXFP8 Constants
     "SF_VEC_SIZE",
     "INV_FLOAT8_E4M3_MAX",
@@ -999,4 +1193,9 @@ __all__ = [
     "ld_32_elements",
     "half2x16_to_e2m1x32_packed",
     "bfloat2x16_to_e2m1x32_packed",
+    # High-level helper functions (NVFP4)
+    "half2x8_to_e2m1x16_packed",
+    "bfloat2x8_to_e2m1x16_packed",
+    "process_nvfp4_block_half",
+    "process_nvfp4_block_bfloat",
 ]

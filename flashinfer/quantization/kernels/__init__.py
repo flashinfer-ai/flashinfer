@@ -35,6 +35,10 @@ from .mxfp8_quantize import (
     MXFP8QuantizeSwizzledKernel,
     mxfp8_quantize_cute_dsl,
 )
+from .nvfp4_quantize import (
+    NVFP4QuantizeSwizzledKernel,
+    nvfp4_quantize_cute_dsl,
+)
 
 __all__ = [
     "MXFP4QuantizeSwizzledKernel",
@@ -42,4 +46,6 @@ __all__ = [
     "MXFP8QuantizeLinearKernel",
     "MXFP8QuantizeSwizzledKernel",
     "mxfp8_quantize_cute_dsl",
+    "NVFP4QuantizeSwizzledKernel",
+    "nvfp4_quantize_cute_dsl",
 ]

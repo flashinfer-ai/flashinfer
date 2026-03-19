@@ -10,6 +10,7 @@ from flashinfer import (
     fp4_quantize,
     mxfp4_quantize,
     mxfp4_dequantize,
+    nvfp4_quantize,
     nvfp4_batched_quantize,
     scaled_fp4_grouped_quantize,
     silu_and_mul_scaled_nvfp4_experts_quantize,
@@ -461,6 +462,171 @@ def test_mxfp4_quantize_backend_parity(
         dq_cute_f32,
         rtol=0.2,
         atol=0.5,  # Allow one FP4 quantization step difference
+        msg=error_msg,
+    )
+
+
+# =============================================================================
+# NVFP4 Quantization Tests (Both Backends)
+# =============================================================================
+
+NVFP4_SHAPES = [(128, 64), (256, 128), (512, 256), (128, 1024), (1024, 2048)]
+NVFP4_BACKENDS = ["cuda", "cute-dsl"]
+
+
+@pytest.mark.parametrize("backend", NVFP4_BACKENDS)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("shape", NVFP4_SHAPES)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_nvfp4_quantize_roundtrip(
+    backend: str,
+    dtype: torch.dtype,
+    shape: tuple[int, int],
+    device: str,
+) -> None:
+    """Test NVFP4 quantization roundtrip for both backends."""
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    if backend == "cute-dsl" and not _is_cute_dsl_available():
+        pytest.skip("CuTe-DSL not available")
+
+    torch.set_default_device(device)
+    torch.manual_seed(42)
+
+    m, n = shape
+    x = torch.randn((m, n), dtype=dtype)
+
+    tensor_amax = torch.abs(x).max().to(torch.float32)
+    global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
+
+    quant_out, scale_out = nvfp4_quantize(x, global_scale, backend=backend)
+
+    # Basic shape checks
+    assert quant_out.shape == (m, n // 2), (
+        f"Expected shape ({m}, {n // 2}), got {quant_out.shape}"
+    )
+    assert quant_out.dtype == torch.uint8, f"Expected uint8, got {quant_out.dtype}"
+    assert scale_out.dtype == torch.uint8, f"Expected uint8, got {scale_out.dtype}"
+
+    # Dequantize round-trip
+    dq_out = e2m1_and_ufp8sf_scale_to_float(
+        quant_out,
+        scale_out,
+        1 / global_scale,
+        sf_vec_size=16,
+        ufp8_type=1,
+        is_sf_swizzled_layout=True,
+    )
+    dq_out = dq_out.to(device)
+
+    # Verify no NaN/Inf
+    assert not torch.isnan(dq_out).any(), "Dequantized tensor contains NaN"
+    assert not torch.isinf(dq_out).any(), "Dequantized tensor contains Inf"
+
+    # Verify roundtrip is reasonably accurate
+    torch.testing.assert_close(
+        dq_out.to(torch.float32),
+        x.to(torch.float32),
+        rtol=0.3,
+        atol=0.5,
+        msg=f"{backend} NVFP4 quantize -> dequantize roundtrip failed",
+    )
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("shape", NVFP4_SHAPES)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_nvfp4_quantize_backend_parity(
+    dtype: torch.dtype,
+    shape: tuple[int, int],
+    device: str,
+) -> None:
+    """Test that CUDA and CuTe-DSL backends produce matching results for NVFP4."""
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    if not _is_cute_dsl_available():
+        pytest.skip("CuTe-DSL not available")
+
+    torch.set_default_device(device)
+    torch.manual_seed(42)
+
+    m, n = shape
+    x = torch.randn((m, n), dtype=dtype)
+
+    tensor_amax = torch.abs(x).max().to(torch.float32)
+    global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
+
+    # Get results from both backends
+    quant_cuda, scale_cuda = nvfp4_quantize(x, global_scale, backend="cuda")
+    quant_cute, scale_cute = nvfp4_quantize(x, global_scale, backend="cute-dsl")
+
+    # Shape should match
+    assert quant_cuda.shape == quant_cute.shape, "Quantized output shape mismatch"
+    assert scale_cuda.shape == scale_cute.shape, "Scale output shape mismatch"
+
+    # Dequantize both and compare
+    dq_cuda = (
+        e2m1_and_ufp8sf_scale_to_float(
+            quant_cuda,
+            scale_cuda,
+            1 / global_scale,
+            sf_vec_size=16,
+            ufp8_type=1,
+            is_sf_swizzled_layout=True,
+        )
+        .to(device)
+        .to(torch.float32)
+    )
+    dq_cute = (
+        e2m1_and_ufp8sf_scale_to_float(
+            quant_cute,
+            scale_cute,
+            1 / global_scale,
+            sf_vec_size=16,
+            ufp8_type=1,
+            is_sf_swizzled_layout=True,
+        )
+        .to(device)
+        .to(torch.float32)
+    )
+
+    # Compute detailed error statistics
+    abs_diff = (dq_cuda - dq_cute).abs()
+    rel_diff = abs_diff / (dq_cuda.abs() + 1e-8)
+
+    max_abs_diff = abs_diff.max().item()
+    mean_abs_diff = abs_diff.mean().item()
+    max_rel_diff = rel_diff.max().item()
+    mean_rel_diff = rel_diff.mean().item()
+
+    quant_match_pct = (quant_cuda == quant_cute).float().mean().item() * 100
+    scale_match_pct = (scale_cuda == scale_cute).float().mean().item() * 100
+
+    error_msg = (
+        f"CUDA and CuTe-DSL backends differ after dequantization:\n"
+        f"  Shape: {shape}, dtype: {dtype}\n"
+        f"  Quantized match: {quant_match_pct:.1f}%, Scale match: {scale_match_pct:.1f}%\n"
+        f"  Abs diff - max: {max_abs_diff:.6f}, mean: {mean_abs_diff:.6f}\n"
+        f"  Rel diff - max: {max_rel_diff:.6f}, mean: {mean_rel_diff:.6f}\n"
+        f"  CUDA dq range: [{dq_cuda.min().item():.4f}, {dq_cuda.max().item():.4f}]\n"
+        f"  CuTe dq range: [{dq_cute.min().item():.4f}, {dq_cute.max().item():.4f}]"
+    )
+
+    # Verify high agreement between backends
+    assert quant_match_pct > 95.0, (
+        f"Quantized values should match >95%, got {quant_match_pct:.1f}%"
+    )
+    assert scale_match_pct > 95.0, (
+        f"Scale factors should match >95%, got {scale_match_pct:.1f}%"
+    )
+
+    torch.testing.assert_close(
+        dq_cuda,
+        dq_cute,
+        rtol=0.2,
+        atol=0.5,
         msg=error_msg,
     )
 

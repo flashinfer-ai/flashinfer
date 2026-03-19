@@ -843,6 +843,7 @@ def nvfp4_quantize(
     do_shuffle=False,
     sf_vec_size=16,
     enable_pdl=None,
+    backend: str = "cuda",
 ):
     """
     Quantize input tensor to NVFP4 format.
@@ -855,45 +856,76 @@ def nvfp4_quantize(
         sf_vec_size (int, optional): Scale factor vector size. Defaults to 16.
         enable_pdl (Optional[bool], optional): Whether to enable PDL (Programmatic Dependent Launch).
             If None, automatically detects based on device capability. Defaults to None.
+        backend (str, optional): Backend to use for quantization.
+            - "cuda": Use CUDA kernel (default, stable)
+            - "cute-dsl": Use CuTe-DSL kernel (requires SM100+, **experimental**).
+              Only supports sfLayout=layout_128x4.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
             - Quantized tensor of shape [M, K/2] with dtype FLOAT4_E2M1X2
             - Scale factors tensor with shape determined by layout and sf_vec_size
+
+    Warning:
+        The "cute-dsl" backend is **experimental** and not part of the stable API.
+        It may change or be removed in future versions without notice.
     """
+    if backend == "cute-dsl":
+        from ..cute_dsl import is_cute_dsl_available
 
-    if do_shuffle:
-        # Weights 128x4 + shuffle. It is done during the model load and we do not care much about the perf
-        assert sfLayout == SfLayout.layout_128x4
-        a_fp4, a_sf = fp4_quantize(
-            a.cuda(),
-            a_global_sf.cuda(),
-            sf_vec_size,
-            sf_use_ue8m0=False,
-            is_sf_swizzled_layout=False,
-            is_sf_8x4_layout=False,
-            enable_pdl=enable_pdl,
-        )
+        if not is_cute_dsl_available():
+            raise RuntimeError(
+                "CuTe-DSL backend requested but CuTe-DSL is not available. "
+                "Please install the required dependencies."
+            )
+        if sfLayout not in (SfLayout.layout_128x4,):
+            raise ValueError(
+                f"CuTe-DSL backend only supports sfLayout=layout_128x4, got {sfLayout}"
+            )
+        from .kernels.nvfp4_quantize import nvfp4_quantize_cute_dsl
 
-        epilogue_tile_m = 128
-        a_fp4 = shuffle_matrix_a(a_fp4.view(torch.uint8), epilogue_tile_m)
-        a_sf = shuffle_matrix_sf_a(a_sf.view(torch.uint8), epilogue_tile_m).reshape(
-            a_sf.shape
-        )
+        a_fp4, a_sf = nvfp4_quantize_cute_dsl(a, a_global_sf, enable_pdl=enable_pdl)
+
+        if do_shuffle:
+            epilogue_tile_m = 128
+            a_fp4 = shuffle_matrix_a(a_fp4.view(torch.uint8), epilogue_tile_m)
+            a_sf = shuffle_matrix_sf_a(a_sf.view(torch.uint8), epilogue_tile_m).reshape(
+                a_sf.shape
+            )
+
+        return a_fp4, a_sf
+    elif backend == "cuda":
+        if do_shuffle:
+            assert sfLayout == SfLayout.layout_128x4
+            a_fp4, a_sf = fp4_quantize(
+                a.cuda(),
+                a_global_sf.cuda(),
+                sf_vec_size,
+                sf_use_ue8m0=False,
+                is_sf_swizzled_layout=False,
+                is_sf_8x4_layout=False,
+                enable_pdl=enable_pdl,
+            )
+
+            epilogue_tile_m = 128
+            a_fp4 = shuffle_matrix_a(a_fp4.view(torch.uint8), epilogue_tile_m)
+            a_sf = shuffle_matrix_sf_a(a_sf.view(torch.uint8), epilogue_tile_m).reshape(
+                a_sf.shape
+            )
+        else:
+            a_fp4, a_sf = fp4_quantize(
+                a.cuda(),
+                a_global_sf.cuda(),
+                sf_vec_size,
+                sf_use_ue8m0=False,
+                is_sf_swizzled_layout=sfLayout != SfLayout.layout_linear,
+                is_sf_8x4_layout=sfLayout == SfLayout.layout_8x4,
+                enable_pdl=enable_pdl,
+            )
+
+        return a_fp4, a_sf
     else:
-        # Activations with 8x4 layout for SFs (GEMM with small tileN)
-        # Activations with 128x4 layout for SFs (GEMM with large tileN)
-        a_fp4, a_sf = fp4_quantize(
-            a.cuda(),
-            a_global_sf.cuda(),
-            sf_vec_size,
-            sf_use_ue8m0=False,
-            is_sf_swizzled_layout=sfLayout != SfLayout.layout_linear,
-            is_sf_8x4_layout=sfLayout == SfLayout.layout_8x4,
-            enable_pdl=enable_pdl,
-        )
-
-    return a_fp4, a_sf
+        raise ValueError(f"Unknown backend: {backend}. Must be 'cuda' or 'cute-dsl'.")
 
 
 @flashinfer_api
