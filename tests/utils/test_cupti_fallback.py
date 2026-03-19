@@ -25,9 +25,7 @@ def test_cupti_fallback_on_activity_enable_error():
     fake_module = MagicMock()
     fake_module.cupti = fake_cupti
 
-    real_import = (
-        __builtins__.__import__ if hasattr(__builtins__, "__import__") else __import__
-    )
+    real_import = __import__
 
     def _patched_import(name, *args, **kwargs):
         """Route 'cupti' imports to the fake module."""
