@@ -1,3 +1,6 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
+
 """Tests for the refactored flashinfer.cute_dsl.attention package.
 
 Covers: basic prefill (various q/kv/batch combos, GQA vs MHA, causal),
