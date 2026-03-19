@@ -377,7 +377,7 @@ void run(Data const& data, void* stream) {
                       DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA, 0, stream);
   } else {
     int const numThreads = 256;
-    const dim3 grid(data.innerDim / 128, data.topK, data.numTokens);
+    const dim3 grid(data.innerDim / 128, data.topK, std::min(8192, data.numTokens));
 
     LAUNCH_ACTIVATION(data, activationKernel, 1, grid, numThreads, 0, stream);
   }
@@ -540,7 +540,7 @@ void run(Data const& data, void* stream) {
   constexpr int VecSize = 4;
   int const numThreads = 128;
   int const numBlocksX = (data.hiddenDimSf / VecSize - 1 + numThreads) / numThreads;
-  int const numBlocksY = data.numTokens;
+  int const numBlocksY = std::min(8192, data.numTokens);
   dim3 numBlocks(numBlocksX, numBlocksY);
 #define CONVERT_FP4_SF_LAUNCH(LayoutSrc, LayoutDst)                                             \
   if (data.sfLayoutSrc == tg::SfLayout::LayoutSrc &&                                            \
@@ -615,7 +615,7 @@ __global__ void permuteKernel(KernelParams params) {
 void run(Data const& data, void* stream) {
   int const numThreads = 256;
   int const numBlocksX = (data.hiddenDim - 1 + numThreads) / numThreads;
-  int const numBlocksY = data.numTokens;
+  int const numBlocksY = std::min(8192, data.numTokens);
   dim3 numBlocks(numBlocksX, numBlocksY);
 
   LAUNCH(data, permuteKernel, numBlocks, numThreads, 0, stream);

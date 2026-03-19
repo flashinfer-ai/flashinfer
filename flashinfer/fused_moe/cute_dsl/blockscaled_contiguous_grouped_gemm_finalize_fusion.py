@@ -298,7 +298,11 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
             expanded_idx = token_idx * topk + topk_idx. Invalid rows have -1.
         token_final_scales: Router scaling factors, shape (seq_len, topk), float32/bf16/fp16
         out: Optional output tensor, shape (seq_len, n). Created if None.
-             This tensor is used for atomic accumulation, so it should be zero-initialized.
+             This tensor is used for atomic accumulation. If `out` is
+             provided, it must already be zero-initialized by the caller.
+             If `out` is None, this function allocates a zero-initialized
+             output tensor. Passing a non-zeroed `out` buffer will silently
+             produce incorrect results.
         ab_dtype: Data type for A and B matrices. Default: "float4_e2m1fn"
         sf_dtype: Data type for scale factors. Default: "float8_e4m3fn"
         out_dtype: Data type for output matrix. Default: "bfloat16"
@@ -314,6 +318,11 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
 
     Notes:
         - The output tensor is modified in-place using atomic adds for scatter-reduction.
+        - When out is provided it is NOT zeroed internally; the caller
+          must ensure the buffer is zeroed before each invocation.
+          In the main CuteDSL MoE path, _moe_core_impl handles this by
+          zeroing the active output slice before GEMM2, typically on an
+          auxiliary stream overlapped with GEMM1.
         - Call create_finalize_fusion_tensors() to create permuted_idx_to_expanded_idx and token_final_scales.
         - Requires SM100 (Blackwell) GPU architecture
         - The finalize fusion eliminates the need for a separate moe_unpermute kernel
@@ -398,16 +407,17 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
             f"cluster_shape_mn={cluster_shape_mn}, shape=({permuted_m}, {n}, {k}, {num_experts})"
         )
 
-    # Create output tensor if not provided (zero-initialized for atomic adds)
+    # Create output tensor if not provided (zero-initialized for atomic adds).
+    # If out is provided, the caller is responsible for zeroing it before
+    # this call. The GEMM2 epilogue uses atomic scatter-add
+    # (out[token_idx] += ...), so any non-zero residual would corrupt
+    # results.
     if out is None:
         out = torch.zeros(
             (seq_len, n),
             dtype=cutlass_to_torch_dtype(out_dtype_cutlass),
             device=a.device,
         )
-    else:
-        # Ensure output is zero for proper accumulation
-        out.zero_()
 
     # Get SM count
     if sm_count is None:
