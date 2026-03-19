@@ -13,7 +13,6 @@ DeepSeek-V3 sparse MLA config:
 
 import csv
 import math
-import os
 import random
 import sys
 from datetime import datetime
@@ -41,7 +40,7 @@ BATCH_SIZES = [1, 32, 128, 512]
 SEQLEN_KVS = [1024, 2048, 4096, 8192, 32768]
 NUM_HEADS_Q_LIST = [16, 32, 64, 128]
 DTYPES = [
-    ("bf16", torch.bfloat16, torch.bfloat16),   # (tag, q_dtype, kv_dtype)
+    ("bf16", torch.bfloat16, torch.bfloat16),  # (tag, q_dtype, kv_dtype)
     ("e4m3", torch.float8_e4m3fn, torch.float8_e4m3fn),
 ]
 
@@ -52,23 +51,29 @@ DRY_RUN_ITERS = 5
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def generate_sparse_indices(batch_size, q_len, seq_lens, topk, page_size, block_tables, device):
+def generate_sparse_indices(
+    batch_size, q_len, seq_lens, topk, page_size, block_tables, device
+):
     """Returns indices_in_kvcache: [batch_size, q_len, topk] pointing into the flat KV pool."""
     block_tables_cpu = block_tables.cpu()
     seq_lens_cpu = seq_lens.cpu()
 
-    indices_in_kvcache = torch.empty(batch_size, q_len, topk, dtype=torch.int32, device="cpu")
+    indices_in_kvcache = torch.empty(
+        batch_size, q_len, topk, dtype=torch.int32, device="cpu"
+    )
 
     for i in range(batch_size):
         cur_seq_len = int(seq_lens_cpu[i].item())
         actual_topk = min(topk, cur_seq_len)
         for j in range(q_len):
             cur_abs = torch.arange(0, actual_topk, device="cpu")
-            cur_blocked = (
-                block_tables_cpu[i, cur_abs // page_size] * page_size + (cur_abs % page_size)
+            cur_blocked = block_tables_cpu[i, cur_abs // page_size] * page_size + (
+                cur_abs % page_size
             )
             if actual_topk < topk:
-                pad = torch.full((topk - actual_topk,), -1, dtype=torch.int32, device="cpu")
+                pad = torch.full(
+                    (topk - actual_topk,), -1, dtype=torch.int32, device="cpu"
+                )
                 cur_blocked = torch.cat([cur_blocked, pad])
             indices_in_kvcache[i, j, :] = cur_blocked
 
@@ -116,7 +121,7 @@ def setup_inputs(batch_size, seqlen_kv, num_heads_q, q_dtype, kv_dtype, device):
 
     return dict(
         query=query,
-        kv_cache=kv_cache.unsqueeze(1),   # [blocks, 1, page_size, head_dim]
+        kv_cache=kv_cache.unsqueeze(1),  # [blocks, 1, page_size, head_dim]
         workspace_buffer=workspace,
         qk_nope_head_dim=QK_NOPE_HEAD_DIM,
         kv_lora_rank=KV_LORA_RANK,
@@ -178,15 +183,23 @@ def main():
     device = torch.device("cuda:0")
     cc = get_compute_capability(device)
     if cc[0] != 10:
-        print(f"ERROR: trtllm-gen sparse MLA requires SM100/SM103, got SM{cc[0]}{cc[1]}")
+        print(
+            f"ERROR: trtllm-gen sparse MLA requires SM100/SM103, got SM{cc[0]}{cc[1]}"
+        )
         sys.exit(1)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path = f"bench_sparse_mla_{timestamp}.csv"
 
     fieldnames = [
-        "batch_size", "seqlen_kv", "num_heads_q", "dtype",
-        "sparse_top_k", "median_ms", "std_ms", "bw_tbs",
+        "batch_size",
+        "seqlen_kv",
+        "num_heads_q",
+        "dtype",
+        "sparse_top_k",
+        "median_ms",
+        "std_ms",
+        "bw_tbs",
     ]
 
     results = []
@@ -194,8 +207,10 @@ def main():
     done = 0
 
     print(f"Running {total} configurations. Results -> {csv_path}\n")
-    print(f"{'bs':>5} {'seqkv':>7} {'H':>4} {'dtype':>5} {'topk':>6} "
-          f"{'median_ms':>10} {'std_ms':>8} {'bw_TB/s':>9}")
+    print(
+        f"{'bs':>5} {'seqkv':>7} {'H':>4} {'dtype':>5} {'topk':>6} "
+        f"{'median_ms':>10} {'std_ms':>8} {'bw_TB/s':>9}"
+    )
     print("-" * 65)
 
     with open(csv_path, "w", newline="") as f:
@@ -208,8 +223,13 @@ def main():
                     for batch_size in BATCH_SIZES:
                         try:
                             row = run_one(
-                                batch_size, seqlen_kv, num_heads_q,
-                                dtype_tag, q_dtype, kv_dtype, device,
+                                batch_size,
+                                seqlen_kv,
+                                num_heads_q,
+                                dtype_tag,
+                                q_dtype,
+                                kv_dtype,
+                                device,
                             )
                             results.append(row)
                             writer.writerow(row)
