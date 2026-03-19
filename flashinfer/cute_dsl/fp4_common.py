@@ -155,6 +155,31 @@ def ld_global_v4_u32(
 
 
 @dsl_user_op
+def ld_v4_u32(
+    base_ptr: Int64, *, loc=None, ip=None
+) -> Tuple[Uint32, Uint32, Uint32, Uint32]:
+    """Load 128 bits (4 x uint32) using generic addressing (works for GMEM and SMEM)."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [Int64(base_ptr).ir_value(loc=loc, ip=ip)],
+        "ld.v4.u32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+    v0 = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
+    v1 = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
+    v2 = llvm.extractvalue(T.i32(), result, [2], loc=loc, ip=ip)
+    v3 = llvm.extractvalue(T.i32(), result, [3], loc=loc, ip=ip)
+
+    return Uint32(v0), Uint32(v1), Uint32(v2), Uint32(v3)
+
+
+@dsl_user_op
 def st_global_u64(base_ptr: Int64, value: Uint64, *, loc=None, ip=None):
     """Store 64 bits to global memory."""
     llvm.inline_asm(
@@ -173,10 +198,42 @@ def st_global_u64(base_ptr: Int64, value: Uint64, *, loc=None, ip=None):
 
 @dsl_user_op
 def get_ptr_as_int64(tensor: cute.Tensor, offset: Int32, *, loc=None, ip=None) -> Int64:
-    """Get the memory address of tensor[offset] as Int64."""
+    """Get the memory address of tensor[offset] as Int64.
+
+    WARNING: This uses ptrtoint which strips address space information.
+    For SMEM tensors, the resulting Int64 is a raw SMEM offset that does NOT
+    work with generic-addressing loads (ld.v4.u32). Use only with explicit
+    address-space loads (ld.global.*) or for global memory tensors.
+    """
     elem_ptr = tensor.iterator + Int32(offset)
     ptr_int = llvm.ptrtoint(T.i64(), elem_ptr.llvm_ptr, loc=loc, ip=ip)
     return Int64(ptr_int)
+
+
+@dsl_user_op
+def pack_16bit_to_u32(lo, hi, *, loc=None, ip=None) -> Uint32:
+    """Pack two 16-bit scalar values (fp16 or bf16) into one Uint32 (half2/bfloat2).
+
+    Uses PTX mov.b32 to bitwise-pack two 16-bit register values into a single
+    32-bit register, suitable for half2/bfloat2 SIMD operations.
+    """
+    lo_ir = lo.ir_value(loc=loc, ip=ip)
+    hi_ir = hi.ir_value(loc=loc, ip=ip)
+    lo_i16 = llvm.bitcast(T.i16(), lo_ir, loc=loc, ip=ip)
+    hi_i16 = llvm.bitcast(T.i16(), hi_ir, loc=loc, ip=ip)
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [lo_i16, hi_i16],
+            "mov.b32 $0, {$1, $2};",
+            "=r,h,h",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 # =============================================================================

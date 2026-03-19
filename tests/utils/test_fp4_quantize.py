@@ -797,6 +797,73 @@ def test_nvfp4_quantize_fp8_backend_parity(
     )
 
 
+# =============================================================================
+# NVFP4 TMA Kernel Tests
+# =============================================================================
+
+NVFP4_TMA_SHAPES = [
+    (1024, 512),
+    (1024, 1024),
+    (1024, 2048),
+    (2048, 512),
+    (2048, 2048),
+    (4096, 1024),
+]
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("shape", NVFP4_TMA_SHAPES)
+@pytest.mark.parametrize("sf_layout", NVFP4_SF_LAYOUTS)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_nvfp4_quantize_tma_backend_parity(
+    dtype: torch.dtype,
+    shape: tuple[int, int],
+    sf_layout: SfLayout,
+    device: str,
+) -> None:
+    """Test that TMA-based CuTe-DSL kernel matches the CUDA backend for large problems."""
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    if not _is_cute_dsl_available():
+        pytest.skip("CuTe-DSL not available")
+
+    torch.set_default_device(device)
+    torch.manual_seed(42)
+
+    m, n = shape
+    x = torch.randn((m, n), dtype=dtype)
+
+    tensor_amax = torch.abs(x).max().to(torch.float32)
+    global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
+
+    quant_cuda, scale_cuda = nvfp4_quantize(
+        x, global_scale, sfLayout=sf_layout, backend="cuda"
+    )
+    quant_cute, scale_cute = nvfp4_quantize(
+        x, global_scale, sfLayout=sf_layout, backend="cute-dsl"
+    )
+
+    assert quant_cuda.shape == quant_cute.shape, (
+        f"TMA quantized output shape mismatch for {sf_layout.name}"
+    )
+    assert scale_cuda.shape == scale_cute.shape, (
+        f"TMA scale output shape mismatch for {sf_layout.name}"
+    )
+
+    quant_match_pct = (quant_cuda == quant_cute).float().mean().item() * 100
+    assert quant_match_pct > 95.0, (
+        f"TMA quantized values should match >95%, got {quant_match_pct:.1f}% "
+        f"(shape={shape}, layout={sf_layout.name})"
+    )
+
+    scale_match_pct = (scale_cuda == scale_cute).float().mean().item() * 100
+    assert scale_match_pct > 95.0, (
+        f"TMA scale factors should match >95%, got {scale_match_pct:.1f}% "
+        f"(shape={shape}, layout={sf_layout.name})"
+    )
+
+
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("batch_shape", BATCH_SHAPES)
 @pytest.mark.parametrize("seed", SEEDS)

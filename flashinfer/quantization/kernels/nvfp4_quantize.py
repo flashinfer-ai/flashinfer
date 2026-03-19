@@ -30,6 +30,9 @@ from typing import Callable, Tuple
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.cute.nvgpu.cpasync as cpasync
+import cutlass.pipeline as pipeline
+from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import torch
 from cutlass import Float32, Int32, Uint8
 
@@ -42,6 +45,12 @@ from ..quantization_cute_dsl_utils import (
     compute_sf_index_swizzled_128x4_gpu,
     compute_sf_index_swizzled_8x4_gpu,
     compute_sf_index_linear_gpu,
+    half2_max_abs_8 as half2_max_abs_8_fn,
+    bfloat2_max_abs_8 as bfloat2_max_abs_8_fn,
+    hmax_reduce_to_f32,
+    bfloat2_hmax_reduce_to_f32,
+    half2x8_to_e2m1x16_packed,
+    bfloat2x8_to_e2m1x16_packed,
     process_nvfp4_block_half,
     process_nvfp4_block_bfloat,
     process_nvfp4_block_fp8,
@@ -365,6 +374,419 @@ class NVFP4QuantizeSwizzledKernel:
 
 
 # =============================================================================
+# CuTe-DSL TMA Kernel Class for NVFP4
+# =============================================================================
+
+_TMA_ROW_TILE = 16
+_TMA_COL_TILE = 64
+_TMA_NUM_CONSUMER_WARPS = 2
+_TMA_NUM_STAGES = 4
+
+
+def _round_up(x: int, d: int) -> int:
+    return ((x + d - 1) // d) * d
+
+
+class NVFP4QuantizeTMAKernel:
+    """
+    TMA-based NVFP4 quantization kernel with pipelined producer-consumer
+    warp specialization.
+
+    Architecture:
+    - 1 producer warp issues TMA G2S loads into staged SMEM buffers
+    - 2 consumer warps read from SMEM, quantize, and write to global memory
+    - PipelineTmaAsync manages multi-stage buffering (4 stages)
+    - Each TMA tile: [16, 64] for fp16/bf16
+    - Grid-stride loop over row tiles, inner while loop over column tiles
+    - Each consumer thread processes one SF block (16 elements) per tile
+
+    Effective when M >= 1024 and K is a multiple of 64.
+    """
+
+    def __init__(
+        self,
+        dtype: cutlass.Numeric,
+        K: int,
+        sf_layout: int = SF_LAYOUT_128x4,
+        enable_pdl: bool = False,
+    ):
+        self.dtype = dtype
+        self.K = K
+        self.is_bfloat16 = dtype == cutlass.BFloat16
+        self.is_fp8 = dtype == cutlass.Float8E4M3FN
+        self.enable_pdl = enable_pdl
+        self.sf_layout = sf_layout
+        self.sf_is_128x4 = sf_layout == SF_LAYOUT_128x4
+        self.sf_is_8x4 = sf_layout == SF_LAYOUT_8x4
+
+        assert not self.is_fp8, "FP8 input not yet supported for TMA kernel"
+        assert K % _TMA_COL_TILE == 0, (
+            f"K ({K}) must be a multiple of {_TMA_COL_TILE} for TMA kernel"
+        )
+
+        self.num_sf_blocks_per_row = K // NVFP4_SF_VEC_SIZE
+        self.num_col_tiles = K // _TMA_COL_TILE
+        self.sf_blocks_per_tile = _TMA_COL_TILE // NVFP4_SF_VEC_SIZE  # 4
+
+        if sf_layout == SF_LAYOUT_LINEAR:
+            self.padded_sf_cols = self.num_sf_blocks_per_row
+            self.row_tile_size = 1
+        elif sf_layout == SF_LAYOUT_8x4:
+            self.padded_sf_cols = ((self.num_sf_blocks_per_row + 3) // 4) * 4
+            self.row_tile_size = 8
+        else:
+            self.padded_sf_cols = ((self.num_sf_blocks_per_row + 3) // 4) * 4
+            self.row_tile_size = ROW_TILE_SIZE
+
+        self.num_consumer_warps = _TMA_NUM_CONSUMER_WARPS
+        self.num_stages = _TMA_NUM_STAGES
+        self.producer_warp_id = self.num_consumer_warps
+        self.threads_per_cta = 32 * (self.num_consumer_warps + 1)
+        self.num_consumer_threads = 32 * self.num_consumer_warps
+        self.rows_per_block = _TMA_ROW_TILE
+        self.buffer_align_bytes = 1024
+        self.cluster_shape_mn = (1, 1)
+        self.elems_per_stage = _TMA_ROW_TILE * _TMA_COL_TILE
+
+    @cute.jit
+    def _compute_sf_offset(
+        self, row_idx: Int32, col_idx: Int32, padded_cols: Int32
+    ) -> Int32:
+        if cutlass.const_expr(self.sf_is_128x4):
+            return compute_sf_index_swizzled_128x4_gpu(row_idx, col_idx, padded_cols)
+        else:
+            if cutlass.const_expr(self.sf_is_8x4):
+                return compute_sf_index_swizzled_8x4_gpu(row_idx, col_idx, padded_cols)
+            else:
+                return compute_sf_index_linear_gpu(row_idx, col_idx, padded_cols)
+
+    @cute.jit
+    def __call__(
+        self,
+        mInput: cute.Tensor,
+        mOutput: cute.Tensor,
+        mScales: cute.Tensor,
+        M: Int32,
+        padded_M: Int32,
+        num_blocks: Int32,
+        mGlobalScale: cute.Tensor,
+        stream,
+    ):
+        gInput = cute.make_tensor(
+            mInput.iterator,
+            cute.make_layout((padded_M, self.K), stride=(self.K, 1)),
+        )
+
+        smem_layout_single = cute.make_layout(
+            (_TMA_ROW_TILE, _TMA_COL_TILE),
+            stride=(_TMA_COL_TILE, 1),
+        )
+
+        cta_tiler = cute.product_each(smem_layout_single.shape)
+        tma_atom, tma_tensor = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileG2SOp(),
+            gInput,
+            smem_layout_single,
+            cta_tiler,
+        )
+
+        total_smem_elems = self.elems_per_stage * self.num_stages
+        smem_layout_staged = cute.make_layout(
+            (_TMA_ROW_TILE, _TMA_COL_TILE, self.num_stages),
+            stride=(_TMA_COL_TILE, 1, self.elems_per_stage),
+        )
+
+        self.num_tma_load_bytes = cute.size_in_bytes(self.dtype, smem_layout_single)
+
+        @cute.struct
+        class SharedStorage:
+            load_full_mbar: cute.struct.MemRange[cutlass.Int64, self.num_stages]
+            load_empty_mbar: cute.struct.MemRange[cutlass.Int64, self.num_stages]
+            smem_data: cute.struct.Align[
+                cute.struct.MemRange[self.dtype, total_smem_elems],
+                self.buffer_align_bytes,
+            ]
+
+        self.shared_storage = SharedStorage
+
+        cluster_layout_vmnk = cute.tiled_divide(
+            cute.make_layout((*self.cluster_shape_mn, 1)), (1,)
+        )
+
+        self.kernel(
+            tma_atom,
+            tma_tensor,
+            mOutput,
+            mScales,
+            M,
+            padded_M,
+            mGlobalScale,
+            smem_layout_staged,
+            cluster_layout_vmnk,
+        ).launch(
+            grid=[num_blocks, 1, 1],
+            block=[self.threads_per_cta, 1, 1],
+            cluster=(*self.cluster_shape_mn, 1),
+            stream=stream,
+            use_pdl=self.enable_pdl,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        tma_atom: cute.CopyAtom,
+        gInput_tma: cute.Tensor,
+        mOutput: cute.Tensor,
+        mScales: cute.Tensor,
+        M: Int32,
+        padded_M: Int32,
+        mGlobalScale: cute.Tensor,
+        smem_layout_staged: cute.Layout,
+        cluster_layout_vmnk: cute.Layout,
+    ):
+        from ...cute_dsl.fp4_common import (
+            cvt_f32_to_e4m3,
+            nvfp4_compute_output_scale,
+            pack_16bit_to_u32,
+            rcp_approx_ftz,
+        )
+
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        grid_dim_x, _, _ = cute.arch.grid_dim()
+
+        if cutlass.const_expr(self.enable_pdl):
+            cute.arch.griddepcontrol_wait()
+
+        warp_idx = cute.arch.warp_idx()
+        warp_idx = cute.arch.make_warp_uniform(warp_idx)
+        lane_idx = tidx % 32
+
+        global_scale = Float32(mGlobalScale[Int32(0)])
+        padded_sf_cols = self.padded_sf_cols
+        num_sf_blocks_per_row = self.num_sf_blocks_per_row
+        num_col_tiles = self.num_col_tiles
+        sf_blocks_per_tile = self.sf_blocks_per_tile
+
+        # ---- SMEM allocation ----
+        smem = cutlass.utils.SmemAllocator()
+        storage = smem.allocate(self.shared_storage)
+
+        load_mbar_ptr = storage.load_full_mbar.data_ptr()
+        sData_staged = storage.smem_data.get_tensor(smem_layout_staged)
+
+        # ---- Pipeline setup ----
+        load_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 1)
+        load_consumer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread, self.num_consumer_warps
+        )
+
+        load_pipeline = pipeline.PipelineTmaAsync.create(
+            barrier_storage=load_mbar_ptr,
+            num_stages=self.num_stages,
+            producer_group=load_producer_group,
+            consumer_group=load_consumer_group,
+            tx_count=self.num_tma_load_bytes,
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
+        )
+
+        pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
+        pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
+
+        # ---- TMA partition ----
+        gSrc_tiled = cute.local_tile(
+            gInput_tma, (_TMA_ROW_TILE, _TMA_COL_TILE), (None, None)
+        )
+        tAsA, tAgA = cpasync.tma_partition(
+            tma_atom,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(sData_staged, 0, 2),
+            cute.group_modes(gSrc_tiled, 0, 2),
+        )
+
+        num_row_tiles = cute.ceil_div(padded_M, _TMA_ROW_TILE)
+
+        # Consumer thread mapping: 64 threads → 16 rows × 4 SF blocks
+        consumer_tid = warp_idx * Int32(32) + lane_idx
+        row_in_tile = consumer_tid // Int32(sf_blocks_per_tile)
+        sf_col_in_tile = consumer_tid % Int32(sf_blocks_per_tile)
+
+        # ======== Producer warp ========
+        if warp_idx == self.producer_warp_id:
+            producer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.num_stages
+            )
+
+            row_tile_idx = bidx
+            while row_tile_idx < num_row_tiles:
+                col_tile = Int32(0)
+                while col_tile < num_col_tiles:
+                    load_pipeline.producer_acquire(producer_state)
+
+                    cute.copy(
+                        tma_atom,
+                        tAgA[(None, row_tile_idx, col_tile)],
+                        tAsA[(None, producer_state.index)],
+                        tma_bar_ptr=load_pipeline.producer_get_barrier(producer_state),
+                    )
+
+                    producer_state.advance()
+                    col_tile = col_tile + Int32(1)
+
+                row_tile_idx = row_tile_idx + grid_dim_x
+
+            load_pipeline.producer_tail(producer_state)
+
+        # ======== Consumer warps ========
+        if warp_idx < self.num_consumer_warps:
+            consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.num_stages
+            )
+
+            row_tile_idx = bidx
+            while row_tile_idx < num_row_tiles:
+                base_row = row_tile_idx * Int32(_TMA_ROW_TILE)
+
+                col_tile = Int32(0)
+                while col_tile < num_col_tiles:
+                    load_pipeline.consumer_wait(consumer_state)
+
+                    stage = consumer_state.index
+                    row_idx = base_row + row_in_tile
+                    sf_col = col_tile * Int32(sf_blocks_per_tile) + sf_col_in_tile
+
+                    # ---- Read from SMEM into registers ----
+                    # Use CuTe tensor indexing (address-space-aware) instead
+                    # of raw PTX loads which break on SMEM due to ptrtoint
+                    # stripping the address space. Pack consecutive fp16/bf16
+                    # pairs into Uint32 (half2/bfloat2) for SIMD quant math.
+                    cb = sf_col_in_tile * Int32(NVFP4_SF_VEC_SIZE)
+                    h0 = pack_16bit_to_u32(
+                        sData_staged[row_in_tile, cb, stage],
+                        sData_staged[row_in_tile, cb + Int32(1), stage],
+                    )
+                    h1 = pack_16bit_to_u32(
+                        sData_staged[row_in_tile, cb + Int32(2), stage],
+                        sData_staged[row_in_tile, cb + Int32(3), stage],
+                    )
+                    h2 = pack_16bit_to_u32(
+                        sData_staged[row_in_tile, cb + Int32(4), stage],
+                        sData_staged[row_in_tile, cb + Int32(5), stage],
+                    )
+                    h3 = pack_16bit_to_u32(
+                        sData_staged[row_in_tile, cb + Int32(6), stage],
+                        sData_staged[row_in_tile, cb + Int32(7), stage],
+                    )
+                    h4 = pack_16bit_to_u32(
+                        sData_staged[row_in_tile, cb + Int32(8), stage],
+                        sData_staged[row_in_tile, cb + Int32(9), stage],
+                    )
+                    h5 = pack_16bit_to_u32(
+                        sData_staged[row_in_tile, cb + Int32(10), stage],
+                        sData_staged[row_in_tile, cb + Int32(11), stage],
+                    )
+                    h6 = pack_16bit_to_u32(
+                        sData_staged[row_in_tile, cb + Int32(12), stage],
+                        sData_staged[row_in_tile, cb + Int32(13), stage],
+                    )
+                    h7 = pack_16bit_to_u32(
+                        sData_staged[row_in_tile, cb + Int32(14), stage],
+                        sData_staged[row_in_tile, cb + Int32(15), stage],
+                    )
+
+                    # ---- Release pipeline early (data is in registers) ----
+                    load_pipeline.consumer_release(consumer_state)
+                    consumer_state.advance()
+
+                    # ---- Quantize and write (operates on register data) ----
+                    if row_idx < padded_M:
+                        is_padding_row = row_idx >= M
+
+                        if is_padding_row:
+                            sf_offset = self._compute_sf_offset(
+                                row_idx, sf_col, padded_sf_cols
+                            )
+                            mScales[sf_offset] = Uint8(0)
+                        else:
+                            if cutlass.const_expr(self.is_bfloat16):
+                                block_max_h2 = bfloat2_max_abs_8_fn(
+                                    h0, h1, h2, h3, h4, h5, h6, h7
+                                )
+                                block_max = bfloat2_hmax_reduce_to_f32(block_max_h2)
+                            else:
+                                block_max_h2 = half2_max_abs_8_fn(
+                                    h0, h1, h2, h3, h4, h5, h6, h7
+                                )
+                                block_max = hmax_reduce_to_f32(block_max_h2)
+
+                            fp4_max_rcp = rcp_approx_ftz(Float32(6.0))
+                            scale_float = global_scale * (block_max * fp4_max_rcp)
+                            scale_fp8_u32 = cvt_f32_to_e4m3(scale_float)
+                            scale_fp8 = Uint8(scale_fp8_u32 & cutlass.Uint32(0xFF))
+
+                            output_scale = nvfp4_compute_output_scale(
+                                scale_fp8_u32, global_scale
+                            )
+
+                            if cutlass.const_expr(self.is_bfloat16):
+                                packed64 = bfloat2x8_to_e2m1x16_packed(
+                                    h0,
+                                    h1,
+                                    h2,
+                                    h3,
+                                    h4,
+                                    h5,
+                                    h6,
+                                    h7,
+                                    output_scale,
+                                )
+                            else:
+                                packed64 = half2x8_to_e2m1x16_packed(
+                                    h0,
+                                    h1,
+                                    h2,
+                                    h3,
+                                    h4,
+                                    h5,
+                                    h6,
+                                    h7,
+                                    output_scale,
+                                )
+
+                            sf_offset = self._compute_sf_offset(
+                                row_idx, sf_col, padded_sf_cols
+                            )
+                            mScales[sf_offset] = scale_fp8
+
+                            row_output = mOutput[row_idx, None]
+                            out_base = sf_col * Int32(NVFP4_SF_VEC_SIZE // 2)
+                            out_ptr = get_ptr_as_int64(row_output, out_base)
+                            st_global_u64(out_ptr, packed64)
+
+                    col_tile = col_tile + Int32(1)
+
+                # Zero padding SF columns for swizzled layouts
+                if cutlass.const_expr(self.sf_layout != SF_LAYOUT_LINEAR):
+                    if consumer_tid < _TMA_ROW_TILE:
+                        pad_row_idx = base_row + consumer_tid
+                        if pad_row_idx < padded_M:
+                            padding_sf = Int32(num_sf_blocks_per_row)
+                            while padding_sf < padded_sf_cols:
+                                sf_offset = self._compute_sf_offset(
+                                    pad_row_idx, padding_sf, padded_sf_cols
+                                )
+                                mScales[sf_offset] = Uint8(0)
+                                padding_sf = padding_sf + Int32(1)
+
+                row_tile_idx = row_tile_idx + grid_dim_x
+
+        if cutlass.const_expr(self.enable_pdl):
+            cute.arch.griddepcontrol_launch_dependents()
+
+
+# =============================================================================
 # PyTorch Integration with TVM-FFI
 # =============================================================================
 
@@ -423,6 +845,71 @@ def _get_compiled_kernel_nvfp4(
         scales_fake,
         Int32(1),  # Dummy M
         Int32(128),  # Dummy padded_M
+        Int32(1),  # Dummy num_blocks
+        global_scale_fake,
+        stream_fake,
+        options="--enable-tvm-ffi",
+    )
+
+    return compiled_kernel, kernel_obj.rows_per_block
+
+
+_TMA_MIN_M = 1024
+
+
+def _should_use_tma(m: int, k: int, dtype: torch.dtype) -> bool:
+    """Determine if TMA kernel should be used based on problem dimensions."""
+    if dtype == torch.float8_e4m3fn:
+        return False
+    return m >= _TMA_MIN_M and k % _TMA_COL_TILE == 0
+
+
+@functools.cache
+def _get_compiled_kernel_nvfp4_tma(
+    dtype_key: str,
+    K: int,
+    sf_layout: int = SF_LAYOUT_128x4,
+    enable_pdl: bool = False,
+) -> Tuple[Callable, int]:
+    """
+    Get or compile TMA-based NVFP4 kernel with TVM-FFI.
+
+    Cached by (K, dtype_key, sf_layout, pdl).
+    """
+    _dtype_map = {
+        "float16": cutlass.Float16,
+        "bfloat16": cutlass.BFloat16,
+    }
+    cutlass_dtype = _dtype_map[dtype_key]
+    kernel_obj = NVFP4QuantizeTMAKernel(
+        cutlass_dtype, K, sf_layout=sf_layout, enable_pdl=enable_pdl
+    )
+
+    sym_m = cute.sym_int()
+    sym_padded_m = cute.sym_int()
+
+    input_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass_dtype, (sym_padded_m, K), stride_order=(1, 0), assumed_align=16
+    )
+    output_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Uint8, (sym_m, K // 2), stride_order=(1, 0), assumed_align=16
+    )
+    sym_scale_size = cute.sym_int()
+    scales_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Uint8, (sym_scale_size,), assumed_align=16
+    )
+    global_scale_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32, (1,), assumed_align=4
+    )
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
+    compiled_kernel = cute.compile(
+        kernel_obj,
+        input_fake,
+        output_fake,
+        scales_fake,
+        Int32(1),  # Dummy M
+        Int32(1024),  # Dummy padded_M
         Int32(1),  # Dummy num_blocks
         global_scale_fake,
         stream_fake,
@@ -508,12 +995,60 @@ def nvfp4_quantize_cute_dsl(
 
     num_sf_blocks_per_row = k // NVFP4_SF_VEC_SIZE
 
+    use_tma = _should_use_tma(m, k, input.dtype)
+
+    if use_tma:
+        tma_row_tile = _TMA_ROW_TILE
+        if sf_layout == SF_LAYOUT_LINEAR:
+            padded_m = _round_up(m, tma_row_tile)
+            padded_sf_cols = num_sf_blocks_per_row
+        elif sf_layout == SF_LAYOUT_8x4:
+            padded_m = _round_up(m, max(tma_row_tile, 8))
+            padded_sf_cols = ((num_sf_blocks_per_row + 3) // 4) * 4
+        else:
+            padded_m = _round_up(m, max(tma_row_tile, ROW_TILE_SIZE))
+            padded_sf_cols = ((num_sf_blocks_per_row + 3) // 4) * 4
+
+        scale_output_size = padded_m * padded_sf_cols
+
+        kernel_fn, rows_per_block = _get_compiled_kernel_nvfp4_tma(
+            dtype_key, k, sf_layout, enable_pdl
+        )
+
+        num_blocks = min((padded_m + rows_per_block - 1) // rows_per_block, target_grid)
+
+        input_padded = input
+        if padded_m > m:
+            input_padded = torch.zeros(
+                padded_m, k, dtype=input.dtype, device=input.device
+            )
+            input_padded[:m, :] = input
+
+        fp4_output = torch.empty(m, k // 2, dtype=torch.uint8, device=input.device)
+        scale_output = torch.empty(
+            scale_output_size, dtype=torch.uint8, device=input.device
+        )
+
+        kernel_fn(
+            input_padded,
+            fp4_output,
+            scale_output,
+            m,
+            padded_m,
+            num_blocks,
+            global_scale_tensor,
+        )
+
+        if sf_layout == SF_LAYOUT_LINEAR:
+            scale_output = scale_output[: m * num_sf_blocks_per_row]
+
+        scale_output = scale_output.reshape(-1, num_sf_blocks_per_row)
+
+        return fp4_output, scale_output
+
+    # Non-TMA path
     if sf_layout == SF_LAYOUT_LINEAR:
         row_tile_size = 1
-        # NOTE: When adding a TMA-based kernel, padded_m must be rounded up to the
-        # TMA tile row dimension (e.g. round_up(m, tma_tile_rows)) and scale_output
-        # must be trimmed to m * num_sf_blocks_per_row before returning.
-        # See PR f4d10d9 for the analogous CUDA fix.
         padded_m = m
         padded_sf_cols = num_sf_blocks_per_row
     elif sf_layout == SF_LAYOUT_8x4:
@@ -552,6 +1087,8 @@ __all__ = [
     "SF_LAYOUT_8x4",
     "SF_LAYOUT_LINEAR",
     "NVFP4QuantizeSwizzledKernel",
+    "NVFP4QuantizeTMAKernel",
     "nvfp4_quantize_cute_dsl",
     "_get_compiled_kernel_nvfp4",
+    "_get_compiled_kernel_nvfp4_tma",
 ]
