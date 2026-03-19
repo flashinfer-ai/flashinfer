@@ -39,6 +39,7 @@ namespace flashinfer {
 namespace gemm {
 template class CutlassBf16GemmRunner<__nv_bfloat16>;
 template class CutlassBf16GemmRunner<half>;
+template class CutlassBf16GemmRunner<float>;
 }  // namespace gemm
 }  // namespace flashinfer
 
@@ -134,8 +135,11 @@ void bf16_bmm_impl(TensorView mat1, TensorView mat2, TensorView out, TensorView 
     case bfloat16_code:
       runGemm<__nv_bfloat16>(out, mat1, mat2, m, n, k, b, config, workspace_buffer);
       break;
+    case float32_code:
+      runGemm<float>(out, mat1, mat2, m, n, k, b, config, workspace_buffer);
+      break;
     default:
-      TVM_FFI_LOG_AND_THROW(NotImplementedError) << "out_dtype must be one of fp16/bf16.";
+      TVM_FFI_LOG_AND_THROW(NotImplementedError) << "out_dtype must be one of fp16/bf16/fp32.";
   }
 }
 
