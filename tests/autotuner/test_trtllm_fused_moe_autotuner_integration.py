@@ -1,22 +1,15 @@
-"""Integration tests for TRTLLM MoE launcher fallback and wrapper contracts."""
+"""Integration tests for TRTLLM fused MoE launcher with autotuner."""
 
+import contextlib
 import pytest
 import torch
 
 from flashinfer import autotune, RoutingMethodType
 from flashinfer.autotuner import AutoTuner
 from flashinfer.utils import get_compute_capability
-import contextlib
+from .utils import reset_autotuner
 
 TUNE_MAX = 8192
-
-
-def _reset_autotuner() -> AutoTuner:
-    tuner = AutoTuner.get()
-    tuner.clear_cache()
-    tuner.reset_statistics()
-    tuner.is_tuning_mode = False
-    return tuner
 
 
 def _prepare_bf16_moe_weights(num_experts, intermediate_size, hidden_size, device):
@@ -154,7 +147,7 @@ def _compute_selected_tile_n_base_element(
     """Compute the base element used by computeSelectedTileN(num_tokens) to filter tile_N candidates."""
     from flashinfer.fused_moe.utils import next_positive_power_of_2
 
-    return next_positive_power_of_2(int(num_tokens * top_k / num_experts))
+    return min(next_positive_power_of_2(int(num_tokens * top_k / num_experts)), 256)
 
 
 def _make_tile_bias(target_tile_n: int):
@@ -167,20 +160,6 @@ def _make_tile_bias(target_tile_n: int):
         return 1.0 if tile_n == target_tile_n else 5.0
 
     return _bias
-
-
-def _make_tile_bias_min_tile_n(num_tokens: int, top_k: int, num_experts: int):
-    """Return a profiling stub that favours the minimum tile_N in computeSelectedTileN(num_tokens)."""
-
-    # The values computeSelectedTileN keeps from a sorted supported tileN list:
-    #  - "base element": roundUpToPowerOf2(num_tokens*top_k/num_experts)
-    #  - its previous element
-    #  - its next two elements
-    # So the min tileN is the "base element" divided by 2, with a minimum of 1.
-    target_tile_n = max(
-        1, _compute_selected_tile_n_base_element(num_tokens, top_k, num_experts) // 2
-    )
-    return _make_tile_bias(target_tile_n)
 
 
 def _require_sm100():
@@ -204,20 +183,20 @@ def _require_sm100():
         (256, 500),
     ],
 )
-def test_bf16_moe_cached_tile_excluded_at_inference_succeeds(
+def test_bf16_moe_all_supported_tile_n_inference_succeed(
     monkeypatch,
     top_k: int,
     num_experts: int,
     tune_num_tokens: int,
     infer_num_tokens: int,
 ):
-    """SM100 BF16 integration: Test that MoE works when given by the autotuner a cached
-    tileN that's filtered out by computeSelectedTileN for the given inference num tokens.
+    """SM100 BF16 integration: Test that MoE works when given any supported tileN value,
+    including values filtered out by computeSelectedTileN for the given inference num tokens.
     """
     from flashinfer.fused_moe.utils import last_positive_power_of_2
 
     _require_sm100()
-    _reset_autotuner()
+    reset_autotuner()
     torch.manual_seed(42)
     device = torch.device("cuda:0")
 
@@ -239,38 +218,39 @@ def test_bf16_moe_cached_tile_excluded_at_inference_succeeds(
     )
     assert last_positive_power_of_2(infer_num_tokens) == tune_num_tokens
 
-    min_tile_n_bias_function = _make_tile_bias_min_tile_n(
-        tune_num_tokens, top_k, num_experts
-    )
-    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", min_tile_n_bias_function)
-    _tune_bf16_moe_once(
-        device=device,
-        tune_num_tokens=tune_num_tokens,
-        num_experts=num_experts,
-        top_k=top_k,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        gemm1_weights=gemm1_weights,
-        gemm2_weights=gemm2_weights,
-        tune_max=TUNE_MAX,
-    )
+    supported_tile_n_values = [8, 16, 32, 64, 128]
+    for tile_n in supported_tile_n_values:
+        monkeypatch.setattr(
+            AutoTuner, "_profile_single_kernel", _make_tile_bias(tile_n)
+        )
+        _tune_bf16_moe_once(
+            device=device,
+            tune_num_tokens=tune_num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            gemm1_weights=gemm1_weights,
+            gemm2_weights=gemm2_weights,
+            tune_max=TUNE_MAX,
+        )
 
-    tuner = AutoTuner.get()
-    assert len(tuner.profiling_cache) > 0, (
-        "Autotuner cache should be populated after tuning"
-    )
+        tuner = AutoTuner.get()
+        assert len(tuner.profiling_cache) > 0, (
+            "Autotuner cache should be populated after tuning"
+        )
 
-    _run_bf16_moe_infer(
-        device=device,
-        infer_num_tokens=infer_num_tokens,
-        num_experts=num_experts,
-        top_k=top_k,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        gemm1_weights=gemm1_weights,
-        gemm2_weights=gemm2_weights,
-        tune_max=TUNE_MAX,
-    )
+        _run_bf16_moe_infer(
+            device=device,
+            infer_num_tokens=infer_num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            gemm1_weights=gemm1_weights,
+            gemm2_weights=gemm2_weights,
+            tune_max=TUNE_MAX,
+        )
 
 
 @pytest.mark.parametrize(
@@ -284,7 +264,7 @@ def test_bf16_moe_cached_tile_excluded_at_inference_succeeds(
 def test_bf16_moe_invalid_tactic_raises_runtime_error(monkeypatch, invalid_tactic):
     """SM100 integration: invalid tactics should fail."""
     _require_sm100()
-    _reset_autotuner()
+    reset_autotuner()
     device = torch.device("cuda:0")
 
     hidden_size, intermediate_size = 1024, 1024
