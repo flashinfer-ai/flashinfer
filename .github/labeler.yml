@@ -1,0 +1,94 @@
+# Configuration for actions/labeler
+# Docs: https://github.com/actions/labeler
+
+"op: attention":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "flashinfer/attention.py"
+          - "flashinfer/decode.py"
+          - "flashinfer/prefill.py"
+          - "flashinfer/mla/**"
+          - "flashinfer/xqa.py"
+          - "flashinfer/dllm/**"
+          - "flashinfer/jit/attention/**"
+          - "include/flashinfer/attention/**"
+          - "csrc/fmha_v2/**"
+          - "csrc/xqa/**"
+          - "csrc/cutlass_mla*"
+          - "tests/attention/**"
+
+"op: moe":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "flashinfer/fused_moe/**"
+          - "flashinfer/jit/fused_moe.py"
+          - "flashinfer/jit/moe_utils.py"
+          - "csrc/fused_moe/**"
+          - "csrc/trtllm_fused_moe*"
+          - "csrc/moe_utils*"
+          - "include/flashinfer/trtllm/fused_moe/**"
+          - "tests/moe/**"
+
+"op: comm":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "flashinfer/comm/**"
+          - "flashinfer/jit/comm.py"
+          - "include/flashinfer/comm/**"
+          - "tests/comm/**"
+
+"op: gemm":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "flashinfer/gemm/**"
+          - "flashinfer/jit/gemm/**"
+          - "include/flashinfer/gemm/**"
+          - "csrc/gemm_*"
+          - "csrc/group_gemm_*"
+          - "csrc/bmm_*"
+          - "tests/gemm/**"
+
+"op: norm":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "flashinfer/norm/**"
+          - "flashinfer/norm.py"
+          - "include/flashinfer/norm*"
+          - "tests/norm/**"
+
+"op: misc":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "flashinfer/rope.py"
+          - "flashinfer/sampling.py"
+          - "flashinfer/topk.py"
+          - "flashinfer/fp4_quantization.py"
+          - "flashinfer/logits_processor/**"
+          - "include/flashinfer/sampling.cuh"
+          - "include/flashinfer/topk.cuh"
+          - "include/flashinfer/pos_enc.cuh"
+
+"cute-dsl":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "flashinfer/cute_dsl/**"
+          - "flashinfer/fused_moe/cute_dsl/**"
+          - "flashinfer/gdn_kernels/**"
+          - "flashinfer/norm/kernels/**"
+
+"benchmark":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "benchmarks/**"
+
+"docker":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "docker/**"
+          - ".devcontainer/**"
+
+"documentation":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "docs/**"
+          - "*.md"
