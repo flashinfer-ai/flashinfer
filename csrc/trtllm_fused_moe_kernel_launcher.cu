@@ -86,8 +86,6 @@ std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& supported_til
                                        int64_t const num_tokens, int64_t const top_k,
                                        int64_t const num_local_experts) {
   TVM_FFI_ICHECK(!supported_tile_nums.empty()) << "supported_tile_nums must not be empty.";
-  TVM_FFI_ICHECK(std::is_sorted(supported_tile_nums.begin(), supported_tile_nums.end()))
-      << "supported_tile_nums must be sorted in ascending order.";
   float const avg_tokens_per_expert = static_cast<float>(num_tokens * top_k) / num_local_experts;
   // NOTE: This differs from Python AutoTuner bucketing:
   // - AutoTuner maps raw num_tokens with last_positive_power_of_2 (round-down).
@@ -110,14 +108,12 @@ std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& supported_til
   std::set<int32_t> selected_tile_nums;
   selected_tile_nums.insert(tile_tokens_dim);
   if (std::next(it) != supported_tile_nums.end()) {
-    // Prefer exploring larger tiles too because they can win for dense routing/shape regimes.
     selected_tile_nums.insert(*std::next(it));
     if (std::next(std::next(it)) != supported_tile_nums.end()) {
       selected_tile_nums.insert(*std::next(std::next(it)));
     }
   }
   if (it != supported_tile_nums.begin()) {
-    // Keep one smaller neighbor to avoid over-committing to an oversized center tile.
     selected_tile_nums.insert(*std::prev(it));
   }
 
