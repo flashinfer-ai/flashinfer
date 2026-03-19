@@ -111,6 +111,7 @@ __device__ __forceinline__ void role_load_horizontal_v2(
   }
 
   // ── Pipeline state_in loads across heads and passes ───────────────────
+  uint32_t parity_empty[NUM_IN_STAGES] = {};  // all start at phase 0
 #pragma unroll
   for (int h = 0; h < HEADS_PER_CTA; h++) {
     int const head = base_head + h;
@@ -118,8 +119,8 @@ __device__ __forceinline__ void role_load_horizontal_v2(
       int const slot = pass % NUM_IN_STAGES;
       constexpr int bytesChunk = horiz_v2::ROWS_PER_PASS * DSTATE * (int)sizeof(state_t);
 
-      // Wait for compute to release this slot
-      sram.bar_state_in_empty[slot].wait(sram.bar_state_in_empty[slot].arrive());
+      // Wait for compute to release this slot (tight spin, no NANOSLEEP)
+      arrive_and_wait_parity(sram.bar_state_in_empty[slot], parity_empty[slot]);
 
       if (lane == 0) {
         cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.state_in[slot][0], &tensorState, 0,
@@ -202,8 +203,13 @@ __device__ __forceinline__ void role_update_state_horizontal_v2(
     sram.bar_state_in_empty[s].arrive();
   }
 
+  // Parity trackers for tight-spin barrier waits
+  uint32_t parity_input_full = 0;
+  uint32_t parity_full[NUM_IN_STAGES] = {};
+  uint32_t parity_out_ready = 0;
+
   // Wait for B/C/x (all heads) to be loaded
-  sram.bar_input_full.wait(sram.bar_input_full.arrive());
+  arrive_and_wait_parity(sram.bar_input_full, parity_input_full);
 
   // ═══════════════════════════════════════════════════════════════════════
   // Head loop: process HEADS_PER_CTA heads sequentially.
@@ -237,8 +243,8 @@ __device__ __forceinline__ void role_update_state_horizontal_v2(
       int const sram_row = compute_warp * rowsPerWarp + group;   // row within ROWS_PER_PASS chunk
       int const dd = pass * horiz_v2::ROWS_PER_PASS + sram_row;  // global DIM row
 
-      // Wait for state_in chunk to be loaded by TMA
-      sram.bar_state_in_full[slot].wait(sram.bar_state_in_full[slot].arrive());
+      // Wait for state_in chunk to be loaded by TMA (tight spin, no NANOSLEEP)
+      arrive_and_wait_parity(sram.bar_state_in_full[slot], parity_full[slot]);
 
       // Load state from smem (pass-local smem, not full DIM)
       float2 rState[numTiles][pairsPerTileMember];
@@ -358,7 +364,7 @@ __device__ __forceinline__ void role_update_state_horizontal_v2(
     }  // pass loop
 
     // ── Epilogue: sync all 4 compute warps, z-gate + vectorized store ───
-    sram.bar_out_ready.wait(sram.bar_out_ready.arrive());
+    arrive_and_wait_parity(sram.bar_out_ready, parity_out_ready);
 
     for (int step = compute_warp; step < NTOKENS; step += horiz_v2::NUM_COMPUTE_WARPS_PER_GROUP) {
       int const out_offset =
@@ -388,7 +394,7 @@ __device__ __forceinline__ void role_update_state_horizontal_v2(
 
     // Sync compute warps after epilogue before next head's dt load
     if (h < HEADS_PER_CTA - 1) {
-      sram.bar_out_ready.wait(sram.bar_out_ready.arrive());
+      arrive_and_wait_parity(sram.bar_out_ready, parity_out_ready);
     }
   }  // head loop
 }

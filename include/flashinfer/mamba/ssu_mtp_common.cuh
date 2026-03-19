@@ -45,6 +45,31 @@ __device__ __forceinline__ int xor_swizzle(int address) {
   return cycle * cycle_length + new_bank_idx * bank_size + intra_bank;
 }
 
+// ── Parity-based barrier helpers (tight spin, no NANOSLEEP) ─────────────────
+// More efficient than cuda::barrier::wait() for latency-sensitive pipelines.
+// The standard cuda::barrier::wait() adds a NANOSLEEP backoff loop between
+// try_wait attempts, which can overshoot and waste cycles. The raw
+// mbarrier.try_wait.parity instruction does a tight spin instead.
+// See CUDA Programming Guide §4.9.3 "Explicit Phase Tracking".
+
+__device__ __forceinline__ void arrive_and_wait_parity(barrier_t& bar, uint32_t& parity) {
+  uint32_t const smem_addr =
+      static_cast<uint32_t>(__cvta_generic_to_shared(cuda::device::barrier_native_handle(bar)));
+  asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(smem_addr) : "memory");
+  uint32_t ready = 0;
+  while (!ready) {
+    asm volatile(
+        "{\n"
+        ".reg .pred p;\n"
+        "mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2;\n"
+        "selp.b32 %0, 1, 0, p;\n"
+        "}\n"
+        : "=r"(ready)
+        : "r"(smem_addr), "r"(parity));
+  }
+  parity ^= 1;
+}
+
 // ── SM100 f32x2 packed SIMD helpers ──────────────────────────────────────────
 // On Blackwell (SM100+), {mul,fma}.f32x2 pack two fp32 operations into one
 // instruction and issue on the dedicated FMUL2 pipeline, which runs in parallel

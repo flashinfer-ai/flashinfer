@@ -219,7 +219,7 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
     FLASHINFER_CHECK(!scaleState,
                      "horizontal_v2 algorithm does not support scaled (quantized) state");
 
-    constexpr int NUM_IN_STAGES = 2;
+    constexpr int NUM_IN_STAGES = 4;
 
     dispatchRatio(
         params, std::integer_sequence<int, 1, 2, 4, 8, 16, 32, 64>{}, [&]<int HEADS_PER_GROUP>() {
