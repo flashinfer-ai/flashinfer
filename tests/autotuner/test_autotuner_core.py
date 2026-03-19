@@ -126,16 +126,13 @@ def test_find_nearest_profile_single_tensor_bucketization_exact_powers(
     "num_tokens,expected_bucket",
     [
         (1000, 512),
+        (1024, 1024),
         (4000, 2048),
+        (4096, 4096),
         (8000, 4096),
-        (12000, 8192),
+        (8192, 8192),
+        (10000, 8192),
     ],
-)
-@pytest.mark.skip(
-    reason=(
-        "_find_nearest_profile linked-dimension mapping was reverted; "
-        "re-enable when linked-dim bucket propagation is restored."
-    )
 )
 def test_find_nearest_profile_moe_shared_num_tokens_axis(num_tokens, expected_bucket):
     """MoE linked tensors should all map num_tokens together to one bucket."""
@@ -161,12 +158,6 @@ def test_find_nearest_profile_moe_shared_num_tokens_axis(num_tokens, expected_bu
         assert nearest_shape[1:] == original_shape[1:]
 
 
-@pytest.mark.skip(
-    reason=(
-        "_find_nearest_profile linked-dimension mapping was reverted; "
-        "re-enable when linked-dim bucket propagation is restored."
-    )
-)
 def test_find_nearest_profile_moe_same_bucket_same_profile():
     """MoE inputs mapping to the same bucket should share an identical profile."""
     config = TuningConfig(
@@ -185,12 +176,6 @@ def test_find_nearest_profile_moe_same_bucket_same_profile():
     assert p1 == p2
 
 
-@pytest.mark.skip(
-    reason=(
-        "_find_nearest_profile linked-dimension mapping was reverted; "
-        "re-enable when linked-dim bucket propagation is restored."
-    )
-)
 def test_find_nearest_profile_maps_all_linked_dims():
     """One logical dynamic axis should update every linked tensor/dimension."""
     tuning_config = TuningConfig(
