@@ -206,7 +206,7 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
     return;
   }
 
-  // ── Horizontal V2 MTP kernel (SM100+ only, 1 head/CTA, pipelined) ────
+  // ── Horizontal V2 MTP kernel (SM100+ only, HEADS_PER_CTA heads/CTA, pipelined) ──
   if (algorithm == SSUAlgorithm::kHorizontalV2) {
     FLASHINFER_CHECK(params.nheads % params.ngroups == 0, "nheads (", params.nheads,
                      ") must be divisible by ngroups (", params.ngroups,
@@ -223,16 +223,23 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
 
     dispatchRatio(
         params, std::integer_sequence<int, 1, 2, 4, 8, 16, 32, 64>{}, [&]<int HEADS_PER_GROUP>() {
-          using sram_t =
-              GroupStorageHorizontalV2<input_t, state_t, NTOKENS_MTP, DIM, DSTATE, NUM_IN_STAGES>;
+          // 2 heads per CTA when possible, fall back to 1 when HEADS_PER_GROUP == 1
+          constexpr int HEADS_PER_CTA = (HEADS_PER_GROUP >= 2) ? 2 : 1;
+          static_assert(HEADS_PER_GROUP % HEADS_PER_CTA == 0);
+
+          using sram_t = GroupStorageHorizontalV2<input_t, state_t, NTOKENS_MTP, DIM, DSTATE,
+                                                  NUM_IN_STAGES, HEADS_PER_CTA>;
           constexpr size_t smem_size = sizeof(sram_t);
 
           auto func = selective_state_update_kernel_horizontal_v2_mtp<
               input_t, weight_t, matrixA_t, state_t, stateIndex_t, NTOKENS_MTP, DIM, DSTATE,
-              HEADS_PER_GROUP, PHILOX_ROUNDS, NUM_IN_STAGES>;
+              HEADS_PER_GROUP, PHILOX_ROUNDS, NUM_IN_STAGES, HEADS_PER_CTA>;
 
-          // 1 head per CTA — grid.y = nheads (not ceil(nheads/3))
-          dim3 grid(params.batch, params.nheads);
+          FLASHINFER_CHECK(params.nheads % HEADS_PER_CTA == 0, "nheads (", params.nheads,
+                           ") must be divisible by HEADS_PER_CTA (", HEADS_PER_CTA,
+                           ") for horizontal_v2 algorithm");
+
+          dim3 grid(params.batch, params.nheads / HEADS_PER_CTA);
           dim3 block(warpSize, horiz_v2::NUM_WARPS);
 
           // TMA state descriptor: tile by ROWS_PER_PASS instead of full DIM
