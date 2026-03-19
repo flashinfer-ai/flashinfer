@@ -523,6 +523,48 @@ def compute_sf_index_swizzled_128x4_gpu(
     return offset
 
 
+@cute.jit
+def compute_sf_index_swizzled_8x4_gpu(
+    row_idx: Int32,
+    col_idx: Int32,
+    padded_cols: Int32,
+) -> Int32:
+    """Compute swizzled 8x4 scale factor index on GPU.
+
+    Layout: [numMTiles, numKTiles, 8 (mTile), 4 (kTile)]
+    Tile size: 32 elements (8 rows x 4 cols).
+    """
+    kMTileSize = Int32(8)
+    kKTileSize = Int32(4)
+    kTileElements = Int32(32)
+
+    innerKIdx = col_idx % kKTileSize
+    innerMIdx = row_idx % kMTileSize
+    kTileIdx = col_idx // kKTileSize
+    mTileIdx = row_idx // kMTileSize
+
+    numKTiles = (padded_cols + kKTileSize - Int32(1)) // kKTileSize
+
+    offset = (
+        mTileIdx * (numKTiles * kTileElements)
+        + kTileIdx * kTileElements
+        + innerMIdx * kKTileSize
+        + innerKIdx
+    )
+
+    return offset
+
+
+@cute.jit
+def compute_sf_index_linear_gpu(
+    row_idx: Int32,
+    col_idx: Int32,
+    num_cols: Int32,
+) -> Int32:
+    """Compute linear (row-major) scale factor index on GPU."""
+    return row_idx * num_cols + col_idx
+
+
 # =============================================================================
 # High-Level Helper Functions for MXFP8 Quantization
 # =============================================================================
@@ -1176,6 +1218,8 @@ __all__ = [
     "ue8m0_to_inv_scale_fast",
     "reduce_max_4threads",
     "compute_sf_index_swizzled_128x4_gpu",
+    "compute_sf_index_swizzled_8x4_gpu",
+    "compute_sf_index_linear_gpu",
     # Low-level intrinsics (MXFP4 - E2M1 conversion)
     "half2_to_float2_scaled",
     "bfloat2_to_float2_scaled",

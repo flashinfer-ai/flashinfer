@@ -859,7 +859,8 @@ def nvfp4_quantize(
         backend (str, optional): Backend to use for quantization.
             - "cuda": Use CUDA kernel (default, stable)
             - "cute-dsl": Use CuTe-DSL kernel (requires SM100+, **experimental**).
-              Only supports sfLayout=layout_128x4.
+              Supports all sfLayout values (layout_128x4, layout_8x4, layout_linear).
+              Only supports sf_vec_size=16.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
@@ -878,13 +879,27 @@ def nvfp4_quantize(
                 "CuTe-DSL backend requested but CuTe-DSL is not available. "
                 "Please install the required dependencies."
             )
-        if sfLayout not in (SfLayout.layout_128x4,):
+        if sf_vec_size != 16:
             raise ValueError(
-                f"CuTe-DSL backend only supports sfLayout=layout_128x4, got {sfLayout}"
+                f"CuTe-DSL backend only supports sf_vec_size=16, got {sf_vec_size}"
             )
-        from .kernels.nvfp4_quantize import nvfp4_quantize_cute_dsl
+        from .kernels.nvfp4_quantize import (
+            SF_LAYOUT_128x4,
+            SF_LAYOUT_8x4,
+            SF_LAYOUT_LINEAR,
+            nvfp4_quantize_cute_dsl,
+        )
 
-        a_fp4, a_sf = nvfp4_quantize_cute_dsl(a, a_global_sf, enable_pdl=enable_pdl)
+        _sf_layout_map = {
+            SfLayout.layout_128x4: SF_LAYOUT_128x4,
+            SfLayout.layout_8x4: SF_LAYOUT_8x4,
+            SfLayout.layout_linear: SF_LAYOUT_LINEAR,
+        }
+        sf_layout_int = _sf_layout_map[sfLayout]
+
+        a_fp4, a_sf = nvfp4_quantize_cute_dsl(
+            a, a_global_sf, sf_layout=sf_layout_int, enable_pdl=enable_pdl
+        )
 
         if do_shuffle:
             epilogue_tile_m = 128
