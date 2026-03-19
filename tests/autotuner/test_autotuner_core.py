@@ -435,7 +435,11 @@ def test_choose_one_different_infer_tokens_same_bucket_get_same_cached_tactic(
 
     monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
 
-    tune_inputs = [torch.empty((bucket_start, hidden_size), dtype=torch.float32)]
+    tune_inputs = [
+        [torch.empty((bucket_start // 2, hidden_size), dtype=torch.float32)],
+        [torch.empty((bucket_start, hidden_size), dtype=torch.float32)],
+        [torch.empty((bucket_end, hidden_size), dtype=torch.float32)],
+    ]
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(
             DynamicTensorSpec(
@@ -449,7 +453,8 @@ def test_choose_one_different_infer_tokens_same_bucket_get_same_cached_tactic(
         ),
     )
     with autotune(tune_mode=True):
-        tuner.choose_one("test_same_bucket", [runner], tuning_config, tune_inputs)
+        for inputs in tune_inputs:
+            tuner.choose_one("test_same_bucket", [runner], tuning_config, inputs)
 
     num_tokens_with_expected_tactic_list = [
         (random.randrange(bucket_start, bucket_end), [32, 1]) for _ in range(3)
