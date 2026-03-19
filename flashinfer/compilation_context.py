@@ -47,12 +47,15 @@ class CompilationContext:
         elif major == 12:
             try:
                 from flashinfer.jit.cpp_ext import is_cuda_version_at_least
+
                 if is_cuda_version_at_least("13.0"):
                     return (major, "0f")
             except (ImportError, RuntimeError, ValueError):
                 logger.debug(
                     "Could not determine CUDA version; "
-                    "falling back to 'a' suffix for SM %d.%d", major, minor
+                    "falling back to 'a' suffix for SM %d.%d",
+                    major,
+                    minor,
                 )
             return (major, "0a")
         elif major >= 10:
@@ -77,9 +80,7 @@ class CompilationContext:
             try:
                 for device in range(torch.cuda.device_count()):
                     major, minor = torch.cuda.get_device_capability(device)
-                    self.TARGET_CUDA_ARCHS.add(
-                        self._normalize_cuda_arch(major, minor)
-                    )
+                    self.TARGET_CUDA_ARCHS.add(self._normalize_cuda_arch(major, minor))
             except Exception as e:
                 logger.warning(f"Failed to get device capability: {e}.")
 

@@ -414,8 +414,9 @@ void FusedMoeLauncher::init_common(
   int major = 0, minor = 0;
   cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
   cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
-  TVM_FFI_ICHECK(major == 10 || major == 12) << "MoE kernel requires SM 10.x or SM 12.x architecture. Current device has SM "
-                               << major << minor;
+  TVM_FFI_ICHECK(major == 10 || major == 12)
+      << "MoE kernel requires SM 10.x or SM 12.x architecture. Current device has SM " << major
+      << minor;
   this->device_version = std::make_tuple(major, minor);
 
   args->routing_logits = routing_logits.has_value() ? routing_logits.value().data_ptr() : nullptr;
