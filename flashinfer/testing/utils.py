@@ -1006,7 +1006,7 @@ def bench_gpu_time_with_cupti(
         # Use 2x L2 size to ensure complete flush
         _l2_flush_size_mb = (l2_size * 2) // (1024 * 1024)
 
-    # check if CUPTI is installed and its version is >= 13.0.0
+    # check if CUPTI is installed, version >= 13, and the driver supports it
     try:
         from cupti import cupti
         from importlib.metadata import version as importlib_metadata_version
@@ -1016,6 +1016,9 @@ def bench_gpu_time_with_cupti(
             raise Exception(
                 "CUPTI needs to be >= 13.0.0. Try 'pip install -U cupti-python'."
             )
+        # Probe driver support (raises NotSupportedError on CUDA < 13.0 drivers)
+        cupti.activity_enable(cupti.ActivityKind.RUNTIME)
+        cupti.activity_disable(cupti.ActivityKind.RUNTIME)
         from functools import partial
     except (ModuleNotFoundError, Exception) as e:
         if isinstance(e, ModuleNotFoundError):
