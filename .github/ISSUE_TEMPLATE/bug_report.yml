@@ -1,0 +1,86 @@
+name: Bug Report
+description: Report a bug in FlashInfer
+labels: ["bug", "needs-triage"]
+body:
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Attention
+        - GEMM
+        - MoE
+        - MoE Routing
+        - Communication (allreduce, alltoall)
+        - Norm (RMSNorm, etc.)
+        - Sampling / TopK
+        - Quantization (FP4, FP8, etc.)
+        - JIT Compilation
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: framework
+    attributes:
+      label: Framework (if applicable)
+      options:
+        - None (direct FlashInfer API)
+        - vLLM
+        - SGLang
+        - TensorRT-LLM
+        - Other
+    validations:
+      required: false
+
+  - type: input
+    id: model
+    attributes:
+      label: Model (if applicable)
+      placeholder: e.g., DeepSeek-V3, Qwen3-Coder-480B, Llama-4-Maverick
+    validations:
+      required: false
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happened and what did you expect?
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      render: python
+    validations:
+      required: false
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      value: |
+        - FlashInfer version:
+        - PyTorch version:
+        - GPU device (e.g., H100, A100, RTX 5090):
+        - CUDA toolkit version:
+        - NVIDIA driver version:
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Tip — enable API logging to capture inputs before a crash:
+        ```
+        export FLASHINFER_LOGLEVEL=3          # detailed input/output logging
+        export FLASHINFER_LOGDEST=debug.log   # save to file (or "stdout"/"stderr")
+        ```
+        Level 5 adds tensor statistics (min/max/mean, NaN/Inf detection). For JIT issues, also set FLASHINFER_JIT_VERBOSE=1.
+      render: shell
+    validations:
+      required: false
