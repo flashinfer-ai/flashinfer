@@ -1641,7 +1641,7 @@ def get_trtllm_moe_sm100_module():
         gemm1_weights_scale: torch.Tensor,
         gemm2_weights: torch.Tensor,
         gemm2_weights_scale: torch.Tensor,
-        output: torch.Tensor,
+        output: Optional[torch.Tensor],
         num_experts: int,
         top_k: int,
         n_group: Optional[int],
