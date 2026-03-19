@@ -432,10 +432,13 @@ class TllmGenFmhaKernel {
 
       // Enable the CgaSmemReduction if the numCtasPerSeqKv <= 16 as the maximum cluster dimension
       // is 16. Only the swapsMmaAbForGeneration kernel supports the CgaSmemReduction for now.
+      // CgaSmemReduction exceeds the shared memory limit for MLA decode with tileSizeQ >= 32
+      // (headDimQk=576 requires more smem than the device allows for that tile size).
       if (!isDsv3MinLatencyMode && numCtasPerSeqKv > 1 && numCtasPerSeqKv <= 16 &&
           isSwapsMmaAbForGenerationKernel(selectKernelParams.mKernelType) &&
           isGmemReduction(selectKernelParams.mMultiCtasKvMode) &&
-          !selectKernelParams.mForceGmemReduction) {
+          !selectKernelParams.mForceGmemReduction &&
+          (!isMlaGenKernel(params) || selectKernelParams.mTileSizeQ < 32)) {
         selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::CgaSmemReduction;
         // Need to select a different kernel.
         selectKernelParams.mSelectNewKernel = true;
@@ -514,49 +517,113 @@ class TllmGenFmhaKernel {
     return seqLenPerCtaKv <= 1024 && numCtas <= params.mMultiProcessorCount;
   }
 
+  // Select the sparse MLA generation kernel.
+  // Heuristics benchmarked on B200 (SM=148, sparseMlaTopK=2048).
+  void selectSparseMlaGenerationKernel(RunnerParams const& params,
+                                       SelectKernelParams& selectKernelParams) const {
+    // numHeadsQ <= 32 : SwapsMmaAbForGeneration
+    //   tileSizeQ = numHeadsQPerKv/2 at batch=1 (GPU under-utilized with full tile; halving creates
+    //               2x more head-splitting CTAs), or numHeadsQPerKv at batch>=2.
+    //   Threshold: batchSize * maxNumCtasPerSeqKv <= MP/8  (crossover at batch=1->2 on B200).
+    //   Benchmarks (seqLen=8192, topK=2048): half tileSizeQ wins by 2-6% at batch=1;
+    //     full tileSizeQ wins by 2-11% at batch>=2.
+    // numHeadsQ >= 64 : KeepsMmaAbForGeneration, tileSizeQ = 64
+    //   numHeadsQ=128 at large batch : 2CTA (clusterDimX=2, headDimPerCtaV=256)
+    //   otherwise                    : 1CTA, headDimPerCtaV fine-tuned later
+    //   Note: at small batch e4m3 prefers SwapsMmaAb tileSizeQ=32 (+10%), but fp16 prefers
+    //   KeepsMmaAb tileSizeQ=64 (+19% at numHeadsQ=128). We keep KeepsMmaAb for numHeadsQ>=64
+    //   to avoid penalizing fp16.
+
+    FmhaKernelType& kernelType = selectKernelParams.mKernelType;
+    int& tileSizeQ = selectKernelParams.mTileSizeQ;
+
+    if (params.mNumHeadsQPerKv <= 32) {
+      kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
+      selectKernelParams.mTileSizeKv = 128;
+      // Only set GmemReduction on the first selection pass.
+      // computeCtaAndClusterConfig may upgrade it to CgaSmemReduction and set mSelectNewKernel=true;
+      // preserving the updated mode on re-selection avoids an infinite loop.
+      if (!selectKernelParams.mSelectNewKernel) {
+        selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::GmemReduction;
+      }
+      // The base tileSizeQ is numHeadsQPerKv (one CTA covers all Q heads per token). At batch=1
+      // the GPU is under-utilized, so we halve tileSizeQ to create 2x more head-splitting CTAs.
+      // Threshold: batchSize * maxNumCtasPerSeqKv <= MP/8.
+      //   effectiveSeqLenKv = min(seqLen, topK) = 2048 -> maxNumCtasPerSeqKv = 16.
+      //   Condition: batchSize * 16 <= MP/8 -> batchSize <= 1 (crossover at batch=1->2).
+      // Only halve when half tileSizeQ >= 8 (no valid SwapsMmaAb kernel below tileSizeQ=8).
+      int const fullTileSizeQ = params.mNumHeadsQPerKv;
+      int const halfTileSizeQ = fullTileSizeQ / 2;
+      int const effectiveSeqLenKv = std::min(params.mMaxSeqLenKv, params.mSparseMlaTopK);
+      int const maxNumCtasPerSeqKv =
+          flashinfer::ceil_div(effectiveSeqLenKv, selectKernelParams.mTileSizeKv);
+      bool const useHalfTileSizeQ =
+          halfTileSizeQ >= 8 &&
+          params.mBatchSize * maxNumCtasPerSeqKv <= params.mMultiProcessorCount / 8;
+      tileSizeQ = useHalfTileSizeQ ? halfTileSizeQ : fullTileSizeQ;
+    } else {
+      // numHeadsQ >= 64: use KeepsMmaAbForGeneration.
+      kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
+      tileSizeQ = 64;
+      selectKernelParams.mTileSizeKv = 128;
+      // Only set GmemReductionWithSeparateKernel on the first selection pass.
+      // computeCtaAndClusterConfig may disable it (numCtasPerSeqKv==1) and set mSelectNewKernel=true;
+      // preserving the updated Disabled mode on re-selection avoids an infinite loop.
+      if (!selectKernelParams.mSelectNewKernel) {
+        selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::GmemReductionWithSeparateKernel;
+      }
+      // For numHeadsQ=128, use 2CTA when there are enough CTAs to amortize 2CTA overhead.
+      // numCtasPerToken = numHeadsQPerKv / tileSizeQ (number of CTAs per token per batch item).
+      // Benchmarks (fp16/e4m3, sparseMlaTopK=2048):
+      //   batch=1  : 1CTA wins by ~20%;  batch=8  : 1CTA wins by 3-8%
+      //   batch=16 : 2CTA wins by 8-16%; batch=32+: 2CTA wins by 12-20%
+      // Threshold: batchSize * numCtasPerToken * 8 > MP -> crossover at batch ~ MP/16 ~ 9.
+      int const numCtasPerToken = params.mNumHeadsQPerKv / 64;
+      bool const use2Cta = params.mNumHeadsQPerKv == 128 &&
+                           params.mBatchSize * numCtasPerToken * 8 > params.mMultiProcessorCount;
+      if (use2Cta) {
+        selectKernelParams.mUses2CtaMma = true;
+        selectKernelParams.mHeadDimPerCtaV = 256;
+      } else if (!selectKernelParams.mSelectNewKernel) {
+        // Only set headDimPerCtaV on the first selection pass.
+        // computeCtaAndClusterConfig may reduce it and set mSelectNewKernel=true;
+        // preserving the updated value on re-selection avoids an infinite loop.
+        selectKernelParams.mHeadDimPerCtaV = 512;
+      }
+    }
+  }
+
   // Select the MLA generation kernel.
   void selectMlaGenerationKernel(RunnerParams const& params,
                                  SelectKernelParams& selectKernelParams) const {
-    // We use the low-latency kernel (SwapsMmaAbForGeneration with tileSizeQ = 16) when any of the
-    // following conditions are met:
-    // 1. The number of headsQPerKv is <= 32.
-    // 2. The number of headsQPerKv is < 128 for sparseMla.
-    // 3. The seqLenPerCtaKv <= 1024 based on the benchmark results (this might be fine-tuned later)
-    // and
-    //    the numCtas (after splitting the heads across multiple CTAs) <=
-    //    params.mMultiProcessorCount.
-    // The sparseMla kernel will always use the 2CTA high-throughput kernel.
-
     // The kernel type.
     FmhaKernelType& kernelType = selectKernelParams.mKernelType;
     // The tile size for Q.
     int& tileSizeQ = selectKernelParams.mTileSizeQ;
 
-    // Check the conditions.
-    if (params.mNumHeadsQPerKv <= 32 || (params.mSparseMla && params.mNumHeadsQPerKv < 128) ||
-        useSwapsMmaAbMlaGenKernel(params)) {
-      kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
-      // Currently, only tileSizeQ = 8 or 16 are supported.
-      tileSizeQ = params.mNumHeadsQPerKv <= 8 ? 8 : 16;
+    if (params.mSparseMla) {
+      selectSparseMlaGenerationKernel(params, selectKernelParams);
     } else {
-      // Otherwise, we use the high-throughput kernel.
-      kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
-      // Use the tileSizeQ = 64 for MLA high-throughput generation kernels.
-      tileSizeQ = 64;
-      // Always use the separate reduction kernel.
-      if (isMultiCtasKvEnabled(selectKernelParams.mMultiCtasKvMode)) {
-        selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::GmemReductionWithSeparateKernel;
-      }
-      // The keepsMmaAbForGeneration sparseMla kernels only support numHeadsQPerKv = 128.
-      FLASHINFER_CHECK(
-          !params.mSparseMla || params.mNumHeadsQPerKv == 128,
-          "The keepsMmaAbForGeneration sparseMla kernels only support numHeadsQPerKv = 128, got %d",
-          params.mNumHeadsQPerKv);
-      // The 2CTA keepsMmaAbForGeneration kernel is used when the numHeadsQPerKv is 128.
-      if (params.mNumHeadsQPerKv == 128) {
-        selectKernelParams.mUses2CtaMma = true;
-        // Each Cta only handles 256 headDimV.
-        selectKernelParams.mHeadDimPerCtaV = 256;
+      // Non-sparse MLA: use SwapsMmaAb when numHeadsQPerKv <= 32 or seqLenPerCtaKv is small.
+      bool const useSwapsMmaAb =
+          params.mNumHeadsQPerKv <= 32 || useSwapsMmaAbMlaGenKernel(params);
+
+      if (useSwapsMmaAb) {
+        kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
+        // Non-sparse MLA (legacy): tileSizeQ capped at 16.
+        tileSizeQ = params.mNumHeadsQPerKv <= 8 ? 8 : 16;
+      } else {
+        kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
+        tileSizeQ = 64;
+        // Always use the separate reduction kernel.
+        if (isMultiCtasKvEnabled(selectKernelParams.mMultiCtasKvMode)) {
+          selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::GmemReductionWithSeparateKernel;
+        }
+        // For non-sparse MLA, always use 2CTA for numHeadsQPerKv=128 (legacy behavior).
+        if (params.mNumHeadsQPerKv == 128) {
+          selectKernelParams.mUses2CtaMma = true;
+          selectKernelParams.mHeadDimPerCtaV = 256;
+        }
       }
     }
   }

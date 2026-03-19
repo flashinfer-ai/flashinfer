@@ -203,6 +203,8 @@ struct KernelParams {
   int32_t mSparseMlaTopK;
   // The flag to use block sparse attention.
   bool mUseBlockSparseAttention;
+  // Whether the indices for K & V pages are shared as unified index (vLLM/FlashInfer).
+  bool mUsesSharedPagedKvIdx;
 
   // Create the TMA shape/stride for Q.
   template <class FmhaOptions>
@@ -828,6 +830,8 @@ struct KernelParams {
     params.mSparseMlaTopK = options.mSparseMlaTopK;
     // TODO: Integrate trtllm block-sparse attention kernels when needed.
     params.mUseBlockSparseAttention = false;
+    // Whether the indices for K & V pages are shared as unified index (vLLM/FlashInfer).
+    params.mUsesSharedPagedKvIdx = true;
     return params;
   }
 };
