@@ -279,6 +279,8 @@ def dtype_str_to_torch_dtype(dtype_str):
         return torch.float8_e4m3fn
     elif dtype_str == "fp8_e5m2":
         return torch.float8_e5m2
+    elif dtype_str == "nvfp4":
+        return torch.uint8
     else:
         raise ValueError(f"Unsupported dtype: {dtype_str}")
 
