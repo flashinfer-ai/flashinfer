@@ -1846,6 +1846,9 @@ def gdn_decode_bf16_state_wrapper(
     use_qk_l2norm: bool = True,
     softplus_beta: float = 1.0,
     softplus_threshold: float = 20.0,
+    intermediate_states_buffer=None,
+    disable_state_update: bool = False,
+    initial_state_indices=None,
 ):
     """
     Wrapper for gdn_decode_bf16_state GDN kernel.
@@ -1886,8 +1889,12 @@ def gdn_decode_bf16_state_wrapper(
             v=v,
             b=b,
             initial_state_source=state,
+            initial_state_indices=initial_state_indices,
+            intermediate_states_buffer=intermediate_states_buffer,
+            disable_state_update=disable_state_update,
             use_qk_l2norm_in_kernel=use_qk_l2norm,
             scale=scale,
+            output=output,
         )
 
 
@@ -2235,6 +2242,8 @@ def bench_gdn_decode_bf16_state(
     head_size: int,
     dtype: torch.dtype,
     use_qk_l2norm: bool = True,
+    cache_intermediate_states: bool = False,
+    disable_state_update: bool = False,
     warmup_iters: int = 10,
     bench_iters: int = 100,
 ):
@@ -2269,10 +2278,24 @@ def bench_gdn_decode_bf16_state(
         device="cuda",
     )
 
-    # Pre-allocate output
+    # Intermediate states buffer (MTP only, when caching is enabled)
+    intermediate_states_buffer = None
+    if cache_intermediate_states and T > 1:
+        intermediate_states_buffer = torch.zeros(
+            batch_size,
+            T,
+            num_sab_heads,
+            head_size,
+            head_size,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+
+    # Pre-allocate output and state indices (avoid per-call torch.arange overhead in CUPTI)
     output = torch.empty(
         batch_size, T, num_o_heads, head_size, dtype=dtype, device="cuda"
     )
+    initial_state_indices = torch.arange(batch_size, dtype=torch.int32, device="cuda")
 
     # Scale factor
     scale = 1.0 / (head_size**0.5)
@@ -2280,7 +2303,20 @@ def bench_gdn_decode_bf16_state(
     # Benchmark with bench_gpu_time (CUPTI for accurate kernel timing)
     kernel_times_ms = bench_gpu_time(
         lambda: gdn_decode_bf16_state_wrapper(
-            q, k, v, state, A_log, a, dt_bias, b, scale, output, use_qk_l2norm
+            q,
+            k,
+            v,
+            state,
+            A_log,
+            a,
+            dt_bias,
+            b,
+            scale,
+            output,
+            use_qk_l2norm,
+            intermediate_states_buffer=intermediate_states_buffer,
+            disable_state_update=disable_state_update,
+            initial_state_indices=initial_state_indices,
         ),
         enable_cupti=True,
         dry_run_iters=warmup_iters,
@@ -2301,7 +2337,7 @@ def bench_gdn_decode_bf16_state(
         head_size,
         dtype,
         seq_len,
-        disable_state_update=False,
+        disable_state_update=disable_state_update,
         state_dtype_bytes=2,  # BF16 state for gdn_decode_bf16_state
     )
 
@@ -2331,12 +2367,17 @@ def run_gdn_decode_bf16_state_benchmark(args, dtype, use_qk_l2norm):
         print("Error: --seq-len must include values >= 1")
         return
 
+    cache_intermediate = getattr(args, "cache_intermediate_states", False)
+    disable_state_update = not getattr(args, "update_state", False)
+
     print("\n" + "=" * 100)
     print(f"BF16 State GDN Benchmark (T={valid_seq_lens})")
     print(
         f"Config: q_heads={args.num_q_heads}, k_heads={args.num_k_heads}, "
         f"v_heads={args.num_v_heads}, head_size={args.head_size}, "
-        f"dtype={args.dtype}, qk_l2norm={'ON' if use_qk_l2norm else 'OFF'}"
+        f"dtype={args.dtype}, qk_l2norm={'ON' if use_qk_l2norm else 'OFF'}, "
+        f"cache_intermediate={'ON' if cache_intermediate else 'OFF'}, "
+        f"update_state={'ON' if not disable_state_update else 'OFF'}"
     )
     print("=" * 100)
     print()
@@ -2356,6 +2397,8 @@ def run_gdn_decode_bf16_state_benchmark(args, dtype, use_qk_l2norm):
                     head_size=args.head_size,
                     dtype=dtype,
                     use_qk_l2norm=use_qk_l2norm,
+                    cache_intermediate_states=cache_intermediate,
+                    disable_state_update=disable_state_update,
                     warmup_iters=args.warmup,
                     bench_iters=args.iters,
                 )
