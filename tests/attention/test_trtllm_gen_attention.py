@@ -251,9 +251,7 @@ def prepare_paged_kv_for_kernel(
 
     def _interleave_kv(k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         """Stack [num_pages,...] K and V along dim-1 then flatten to [2*num_pages,...]."""
-        return torch.stack([k, v], dim=1).reshape(
-            k.shape[0] * 2, *k.shape[1:]
-        )
+        return torch.stack([k, v], dim=1).reshape(k.shape[0] * 2, *k.shape[1:])
 
     if isinstance(kv_cache, tuple):
         k_cache, v_cache = kv_cache
@@ -542,10 +540,11 @@ def _test_trtllm_batch_prefill(
     kv_indptr = generate_cumsum_lens(page_per_seq)
     kv_last_page_len = get_last_page_len(seq_lens, page_size)
 
-    kv_cache_kernel, page_table_kernel, kv_block_scales_kernel = \
+    kv_cache_kernel, page_table_kernel, kv_block_scales_kernel = (
         prepare_paged_kv_for_kernel(
             kv_cache, page_table, uses_shared_paged_kv_idx, kv_block_scales
         )
+    )
 
     workspace_buffer, workspace_buffer_ref = create_workspace_buffers(GPU_DEVICE)
 
@@ -694,9 +693,7 @@ def _test_trtllm_batch_prefill(
     )
 
     if (
-        o_dtype != "nvfp4"
-        and kv_dtype != "nvfp4"
-        and uses_shared_paged_kv_idx
+        o_dtype != "nvfp4" and kv_dtype != "nvfp4" and uses_shared_paged_kv_idx
     ):  # wrapper api does not support fp4 output/kv or separate KV page indices yet.
         # test wrapper with trtllm-gen backend
         wrapper_trtllm_gen = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
@@ -970,10 +967,11 @@ def _test_trtllm_batch_decode(
     kv_indptr = generate_cumsum_lens(page_per_seq)
     kv_last_page_len = get_last_page_len(seq_lens, page_size)
 
-    kv_cache_arg, page_table_kernel, kv_block_scales_kernel = \
+    kv_cache_arg, page_table_kernel, kv_block_scales_kernel = (
         prepare_paged_kv_for_kernel(
             kv_cache, page_table, uses_shared_paged_kv_idx, kv_block_scales
         )
+    )
 
     workspace_buffer, workspace_buffer_ref = create_workspace_buffers(GPU_DEVICE)
 
