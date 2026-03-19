@@ -222,6 +222,7 @@ def run_measurement(
         "flashinfer_simple": make_flashinfer_wrapper(algorithm="simple"),
         "flashinfer_vertical": make_flashinfer_wrapper(algorithm="vertical"),
         "flashinfer_horizontal": make_flashinfer_wrapper(algorithm="horizontal"),
+        "flashinfer_horizontal_v2": make_flashinfer_wrapper(algorithm="horizontal_v2"),
         "flashinfer_auto": make_flashinfer_wrapper(algorithm="auto"),
     }
 

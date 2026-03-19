@@ -14,6 +14,7 @@
 #include "kernel_selective_state_update_mtp_simple.cuh"
 #ifdef FLASHINFER_MAMBA_ENABLE_SM100
 #include "kernel_selective_state_update_mtp_horizontal.cuh"
+#include "kernel_selective_state_update_mtp_horizontal_v2.cuh"
 #include "kernel_selective_state_update_mtp_vertical.cuh"
 #endif
 
@@ -33,9 +34,10 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
   }
   FLASHINFER_CHECK(algorithm == SSUAlgorithm::kAuto || algorithm == SSUAlgorithm::kSimple ||
                        algorithm == SSUAlgorithm::kVertical ||
-                       algorithm == SSUAlgorithm::kHorizontal,
-                   "MTP selective_state_update only supports 'auto', 'simple', 'vertical', or "
-                   "'horizontal' algorithm, got ",
+                       algorithm == SSUAlgorithm::kHorizontal ||
+                       algorithm == SSUAlgorithm::kHorizontalV2,
+                   "MTP selective_state_update only supports 'auto', 'simple', 'vertical', "
+                   "'horizontal', or 'horizontal_v2' algorithm, got ",
                    static_cast<int32_t>(algorithm));
   // ── Auto algorithm selection ──────────────────────────────────────────────
   if (algorithm == SSUAlgorithm::kAuto) {
@@ -203,9 +205,77 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
         });
     return;
   }
+
+  // ── Horizontal V2 MTP kernel (SM100+ only, 1 head/CTA, pipelined) ────
+  if (algorithm == SSUAlgorithm::kHorizontalV2) {
+    FLASHINFER_CHECK(params.nheads % params.ngroups == 0, "nheads (", params.nheads,
+                     ") must be divisible by ngroups (", params.ngroups,
+                     ") for horizontal_v2 algorithm");
+    constexpr int kHorizV2DimAlignment =
+        horiz_v2::NUM_COMPUTE_WARPS_PER_GROUP * horiz_v2::ROWS_PER_WARP;
+    FLASHINFER_CHECK(DIM % kHorizV2DimAlignment == 0,
+                     "horizontal_v2 kernel requires DIM divisible by ", kHorizV2DimAlignment,
+                     " (NUM_COMPUTE_WARPS_PER_GROUP * ROWS_PER_WARP), got DIM=", DIM);
+    FLASHINFER_CHECK(!scaleState,
+                     "horizontal_v2 algorithm does not support scaled (quantized) state");
+
+    constexpr int NUM_IN_STAGES = 2;
+
+    dispatchRatio(
+        params, std::integer_sequence<int, 1, 2, 4, 8, 16, 32, 64>{}, [&]<int HEADS_PER_GROUP>() {
+          using sram_t =
+              GroupStorageHorizontalV2<input_t, state_t, NTOKENS_MTP, DIM, DSTATE, NUM_IN_STAGES>;
+          constexpr size_t smem_size = sizeof(sram_t);
+
+          auto func = selective_state_update_kernel_horizontal_v2_mtp<
+              input_t, weight_t, matrixA_t, state_t, stateIndex_t, NTOKENS_MTP, DIM, DSTATE,
+              HEADS_PER_GROUP, PHILOX_ROUNDS, NUM_IN_STAGES>;
+
+          // 1 head per CTA — grid.y = nheads (not ceil(nheads/3))
+          dim3 grid(params.batch, params.nheads);
+          dim3 block(warpSize, horiz_v2::NUM_WARPS);
+
+          // TMA state descriptor: tile by ROWS_PER_PASS instead of full DIM
+          auto state_tensor = tma::buildNdDescriptor(
+              typeid(state_t),
+              /*shapes*/ {DSTATE, DIM, params.nheads, params.state_cache_size},
+              /*strides*/ {1, DSTATE, DSTATE * DIM, params.state_stride_batch},
+              /*tiles*/ {DSTATE, horiz_v2::ROWS_PER_PASS, 1, 1}, params.state);
+
+          auto B_tensor = tma::buildNdDescriptor(
+              typeid(input_t),
+              {(uint64_t)DSTATE, (uint64_t)params.ngroups, (uint64_t)params.ntokens_mtp,
+               (uint64_t)params.batch},
+              {1, (uint64_t)DSTATE, (uint64_t)params.B_stride_mtp, (uint64_t)params.B_stride_batch},
+              {DSTATE, 1, NTOKENS_MTP, 1}, params.B);
+
+          auto C_tensor = tma::buildNdDescriptor(
+              typeid(input_t),
+              {(uint64_t)DSTATE, (uint64_t)params.ngroups, (uint64_t)params.ntokens_mtp,
+               (uint64_t)params.batch},
+              {1, (uint64_t)DSTATE, (uint64_t)params.C_stride_mtp, (uint64_t)params.C_stride_batch},
+              {DSTATE, 1, NTOKENS_MTP, 1}, params.C);
+
+          auto x_tensor = tma::buildNdDescriptor(
+              typeid(input_t),
+              /*shapes*/
+              {(uint64_t)DIM, (uint64_t)params.nheads, (uint64_t)params.ntokens_mtp,
+               (uint64_t)params.batch},
+              /*strides*/
+              {1, (uint64_t)DIM, (uint64_t)params.x_stride_mtp, (uint64_t)params.x_stride_batch},
+              /*tiles*/ {DIM, 1, NTOKENS_MTP, 1}, params.x);
+
+          FLASHINFER_CUDA_CHECK(
+              cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+          func<<<grid, block, smem_size, stream>>>(params, state_tensor, B_tensor, C_tensor,
+                                                   x_tensor);
+        });
+    return;
+  }
 #else
-  FLASHINFER_CHECK(algorithm != SSUAlgorithm::kVertical && algorithm != SSUAlgorithm::kHorizontal,
-                   "vertical/horizontal MTP algorithm requires SM100+ (Blackwell); "
+  FLASHINFER_CHECK(algorithm != SSUAlgorithm::kVertical && algorithm != SSUAlgorithm::kHorizontal &&
+                       algorithm != SSUAlgorithm::kHorizontalV2,
+                   "vertical/horizontal/horizontal_v2 MTP algorithm requires SM100+ (Blackwell); "
                    "recompile with FLASHINFER_MAMBA_ENABLE_SM100");
 #endif
 

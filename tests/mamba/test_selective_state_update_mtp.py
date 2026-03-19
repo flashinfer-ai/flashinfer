@@ -1384,7 +1384,7 @@ class TestSelectiveStateUpdateMTPStochasticRoundingWithIntermediateStates(
 class TestSelectiveStateUpdateMTPVertical(TestSelectiveStateUpdateMTP):
     """Test multi-token selective_state_update with vertical and horizontal algorithms."""
 
-    @pytest.fixture(autouse=True, params=["vertical", "horizontal"])
+    @pytest.fixture(autouse=True, params=["vertical", "horizontal", "horizontal_v2"])
     def _algorithm(self, request):
         self._algo = request.param
 
@@ -1414,7 +1414,7 @@ class TestSelectiveStateUpdateMTPVerticalWithIntermediateStates(
 ):
     """Test vertical/horizontal algorithms with intermediate states."""
 
-    @pytest.fixture(autouse=True, params=["vertical", "horizontal"])
+    @pytest.fixture(autouse=True, params=["vertical", "horizontal", "horizontal_v2"])
     def _algorithm(self, request):
         self._algo = request.param
 
@@ -1492,7 +1492,7 @@ class TestSelectiveStateUpdateMTPVerticalStochasticRounding(
 ):
     """Test vertical/horizontal algorithms with stochastic rounding."""
 
-    @pytest.fixture(autouse=True, params=["vertical", "horizontal"])
+    @pytest.fixture(autouse=True, params=["vertical", "horizontal", "horizontal_v2"])
     def _algorithm(self, request):
         self._algo = request.param
 
@@ -1523,7 +1523,7 @@ class TestSelectiveStateUpdateMTPVerticalDisableStateUpdate(
 ):
     """Test vertical/horizontal algorithms with disable_state_update=True."""
 
-    @pytest.fixture(autouse=True, params=["vertical", "horizontal"])
+    @pytest.fixture(autouse=True, params=["vertical", "horizontal", "horizontal_v2"])
     def _algorithm(self, request):
         self._algo = request.param
 
@@ -1553,7 +1553,7 @@ class TestSelectiveStateUpdateMTPVerticalNonContiguous(
 ):
     """Test vertical/horizontal algorithms with non-contiguous state cache."""
 
-    @pytest.fixture(autouse=True, params=["vertical", "horizontal"])
+    @pytest.fixture(autouse=True, params=["vertical", "horizontal", "horizontal_v2"])
     def _algorithm(self, request):
         self._algo = request.param
 
@@ -1583,7 +1583,7 @@ class TestSelectiveStateUpdateMTPVerticalInt32Indices(
 ):
     """Test vertical/horizontal algorithms with int32 state_batch_indices."""
 
-    @pytest.fixture(autouse=True, params=["vertical", "horizontal"])
+    @pytest.fixture(autouse=True, params=["vertical", "horizontal", "horizontal_v2"])
     def _algorithm(self, request):
         self._algo = request.param
 
@@ -1614,7 +1614,7 @@ class TestSelectiveStateUpdateMTPVerticalVariousNgroups(
 ):
     """Test vertical/horizontal algorithms with various ngroups values."""
 
-    @pytest.fixture(autouse=True, params=["vertical", "horizontal"])
+    @pytest.fixture(autouse=True, params=["vertical", "horizontal", "horizontal_v2"])
     def _algorithm(self, request):
         self._algo = request.param
 
@@ -1644,7 +1644,7 @@ class TestSelectiveStateUpdateMTPVerticalLargeBatch(
 ):
     """Test vertical/horizontal algorithms with larger batch sizes."""
 
-    @pytest.fixture(autouse=True, params=["vertical", "horizontal"])
+    @pytest.fixture(autouse=True, params=["vertical", "horizontal", "horizontal_v2"])
     def _algorithm(self, request):
         self._algo = request.param
 
