@@ -196,7 +196,6 @@ def test_bf16_moe_all_supported_tile_n_inference_succeed(
     from flashinfer.fused_moe.utils import last_positive_power_of_2
 
     _require_sm100()
-    reset_autotuner()
     torch.manual_seed(42)
     device = torch.device("cuda:0")
 
@@ -220,6 +219,7 @@ def test_bf16_moe_all_supported_tile_n_inference_succeed(
 
     supported_tile_n_values = [8, 16, 32, 64, 128]
     for tile_n in supported_tile_n_values:
+        reset_autotuner()
         monkeypatch.setattr(
             AutoTuner, "_profile_single_kernel", _make_tile_bias(tile_n)
         )
