@@ -280,6 +280,8 @@ def dtype_str_to_torch_dtype(dtype_str):
         return torch.float8_e4m3fn
     elif dtype_str == "fp8_e5m2":
         return torch.float8_e5m2
+    elif dtype_str == "nvfp4":
+        return torch.uint8
     else:
         raise ValueError(f"Unsupported dtype: {dtype_str}")
 
@@ -495,9 +497,9 @@ routine_cc_to_supported_backends = {
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["cuda"],
-        "10.3": ["cuda"],
-        "12.0": ["cuda"],
+        "10.0": ["cuda", "cute-dsl"],
+        "10.3": ["cuda", "cute-dsl"],
+        "12.0": ["cuda", "cute-dsl"],
     },
     "mxfp4_quantize": {
         "7.5": [],
@@ -505,9 +507,9 @@ routine_cc_to_supported_backends = {
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["cuda"],
-        "10.3": ["cuda"],
-        "12.0": ["cuda"],
+        "10.0": ["cuda", "cute-dsl"],
+        "10.3": ["cuda", "cute-dsl"],
+        "12.0": ["cuda", "cute-dsl"],
     },
     "nvfp4_quantize": {
         "7.5": [],

@@ -272,7 +272,7 @@ def gen_gemm_sm100_module_cutlass_bf16() -> JitSpec:
 
     with open(jit_env.FLASHINFER_CSRC_DIR / "bf16_gemm_cutlass.jinja") as f:
         kernel_inst_templ = jinja2.Template(f.read())
-        dtype_list = ["__nv_bfloat16", "half"]
+        dtype_list = ["__nv_bfloat16", "half", "float"]
         cta_m_n_k_list = [
             (64, 64, 128),
             (64, 128, 128),

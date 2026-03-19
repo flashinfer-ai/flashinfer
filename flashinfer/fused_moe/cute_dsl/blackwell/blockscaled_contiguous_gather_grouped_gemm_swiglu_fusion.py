@@ -28,6 +28,7 @@
 
 from typing import Optional, Tuple, Type, Union
 
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -154,7 +155,7 @@ CUDA Graph Support:
 """
 
 
-# TODO: Remove this hook helper function after nvidia-cutlass-dsl 4.4 is released.
+# TODO: Remove this hook helper function after nvidia-cutlass-dsl 4.3.x is no longer supported.
 def hooked_PersistentTileSchedulerParams_init(
     self,
     problem_shape_ntile_mnl: cute.Shape,
@@ -300,12 +301,14 @@ def hooked_get_cluster_work_idx_with_fastdivmod(
     return (cluster_m, cluster_n, batch_l)
 
 
-cutlass.utils.PersistentTileSchedulerParams.__init__ = (
-    hooked_PersistentTileSchedulerParams_init
-)
-cutlass.utils.StaticPersistentTileScheduler._get_cluster_work_idx_with_fastdivmod = (
-    hooked_get_cluster_work_idx_with_fastdivmod
-)
+# Only apply monkey-patches for cutlass < 4.4.0 which lacks swizzle_size/raster_along_m
+# support and FastDivmod in PersistentTileSchedulerParams.
+# cutlass.__version__ was added in 4.4.0, so its absence indicates an older version.
+if not hasattr(cutlass, "__version__"):
+    cutlass.utils.PersistentTileSchedulerParams.__init__ = (
+        hooked_PersistentTileSchedulerParams_init
+    )
+    cutlass.utils.StaticPersistentTileScheduler._get_cluster_work_idx_with_fastdivmod = hooked_get_cluster_work_idx_with_fastdivmod
 
 
 class BlockScaledContiguousGatherGroupedGemmKernel:
