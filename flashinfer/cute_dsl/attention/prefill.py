@@ -158,46 +158,22 @@ class BlackwellFusedMultiHeadAttentionForward:
         s_k_all: Int32,
         scale_softmax_log2: Float32,
         scale_output: Float32,
-        sink_iter: cute.Pointer | None,
+        params_iter: cute.Pointer | None,
         stream: cuda.CUstream,
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
 
-        This method prepares the input tensors for processing, validates their shapes and types,
-        configures the computation parameters, and launches the CUDA kernel.
-
-        The method handles:
-        1. Tensor layout transformations for specific memory access patterns
-        2. Validation of tensor shapes and data types
-        3. Initialization of hardware-specific parameters and memory layouts
-        4. Configuration of TMA (Tensor Memory Access) operations
-        5. Grid and work scheduling computation
-        6. Kernel launch with appropriate parameters
-
         :param q_iter: The query tensor pointer
-        :type q_iter: cute.Pointer
         :param k_iter: The key tensor pointer
-        :type k_iter: cute.Pointer
         :param v_iter: The value tensor pointer
-        :type v_iter: cute.Pointer
         :param o_iter: The output tensor pointer
-        :type o_iter: cute.Pointer
-        :param problem_size: The problem size with shape [b, s_q, s_k, h_q, h_k, d]. If cum_seqlen_q or cum_seqlen_k is not None, s_q and s_k are the max of the cumulative sequence length respectively.
-        :type problem_size: Tuple[Int32, Int32, Int32, Int32, Int32, Int32]
-        :param cum_seqlen_q: The cumulative sequence length tensor for query
-        :type cum_seqlen_q: cute.Tensor | None
-        :param cum_seqlen_k: The cumulative sequence length tensor for key
-        :type cum_seqlen_k: cute.Tensor | None
-        :param scale_softmax_log2: The log2 scale factor for softmax
-        :type scale_softmax_log2: Float32
-        :param scale_output: The scale factor for the output
-        :type scale_output: Float32
-        :param sink_iter: The sink tensor pointer
-        :type sink_iter: cute.Pointer | None
-        :param stream: The CUDA stream to execute the kernel on
-        :type stream: cuda.CUstream
-        :raises TypeError: If tensor data types don't match or aren't supported
-        :raises RuntimeError: If tensor layouts aren't in supported formats
+        :param problem_size: ``(b, s_q, s_k, h_q, h_k, d)``
+        :param cum_seqlen_q: Cumulative query sequence lengths, or None
+        :param cum_seqlen_k: Cumulative KV sequence lengths, or None
+        :param scale_softmax_log2: ``log2(e) * sm_scale``
+        :param scale_output: Output scaling factor
+        :param params_iter: Variant runtime data pointer, or None
+        :param stream: CUDA stream
         """
         b, s_q, s_k, h_q, h_k, d = problem_size
         h_r = h_q // h_k
@@ -237,9 +213,15 @@ class BlackwellFusedMultiHeadAttentionForward:
         )
         o = cute.make_tensor(o_iter + o_offset, o_layout)
 
-        sink = (
-            cute.make_tensor(sink_iter, cute.make_layout((h_q,)))
-            if self.fusion.use_attention_sink
+        params = (
+            cute.make_tensor(
+                params_iter,
+                cute.make_layout(
+                    self.fusion.params_shape,
+                    stride=self.fusion.params_strides,
+                ),
+            )
+            if self.fusion.has_params
             else None
         )
 
@@ -321,7 +303,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             cum_seqlen_k,
             scale_softmax_log2,
             scale_output,
-            sink,
+            params,
             lp.q_smem_layout_staged,
             lp.k_smem_layout_staged,
             lp.p_tmem_layout_staged,
@@ -402,7 +384,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         cum_seqlen_k: cute.Tensor | None,
         scale_softmax_log2: Float32,
         scale_output: Float32,
-        sink: cute.Tensor | None,
+        params: cute.Tensor | None,
         q_smem_layout_staged: cute.ComposedLayout,
         k_smem_layout_staged: cute.ComposedLayout,
         p_tmem_layout_staged: cute.ComposedLayout,
@@ -527,7 +509,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                 qk_thr_mma=qk_thr_mma,
                 tStS=tStS,
                 tStSi=tStS0,
-                sink=sink,
+                params=params,
                 mma_si_consumer=mma_s0_consumer,
                 si_corr_producer=s0_corr_producer,
                 s0_s1_sequence_consumer=s0_s1_sequence_consumer,
@@ -556,7 +538,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                 qk_thr_mma=qk_thr_mma,
                 tStS=tStS,
                 tStSi=tStS1,
-                sink=sink,
+                params=params,
                 mma_si_consumer=mma_s1_consumer,
                 si_corr_producer=s1_corr_producer,
                 s0_s1_sequence_consumer=s0_s1_sequence_consumer,

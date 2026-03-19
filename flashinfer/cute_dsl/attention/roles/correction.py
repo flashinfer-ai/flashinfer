@@ -52,11 +52,10 @@ class CorrectionRole:
         self.tmem_vec0_offset = tmem.vec0_offset
         self.tmem_vec1_offset = tmem.vec1_offset
 
-        # From fusion
-        self.custom_logits_transform = fusion.logits_transform is not None
-        self.custom_output_transform = fusion.output_transform is not None
-        self.output_transform = fusion.output_transform
-        self.custom_params = fusion.custom_params
+        # From fusion variant
+        self.variant = fusion.variant
+        self.has_logits_transform = fusion.variant.has_logits_transform
+        self.has_output_transform = fusion.variant.has_output_transform
 
         # Warp config
         self.correction_warp_ids = correction_warp_ids
@@ -220,7 +219,7 @@ class CorrectionRole:
             tOcO_custom_i[(None, None), None]
         )
 
-        scale_rcp_d = scale / d if not self.custom_logits_transform else scale
+        scale_rcp_d = scale / d if not self.has_logits_transform else scale
         rcp_d = 1 / d if m != -Float32.inf else 0.0
         for i in range(self.cta_tiler[2] // corr_tile_size):
             tTMEM_LOADtO_i = tTMEM_LOADtO[None, 0, 0, i]
@@ -229,7 +228,7 @@ class CorrectionRole:
                 tTMEM_LOADoO[None, 0, 0, i].shape, self.pv_acc_dtype
             )
             cute.copy(tiled_tmem_load, tTMEM_LOADtO_i, tTMrO)
-            if cutlass.const_expr(not self.custom_output_transform):
+            if cutlass.const_expr(not self.has_output_transform):
                 for j in range(0, cute.size(tTMrO), 2):
                     tTMrO[j], tTMrO[j + 1] = cute.arch.mul_packed_f32x2(
                         (tTMrO[j], tTMrO[j + 1]),
@@ -239,8 +238,7 @@ class CorrectionRole:
                 tTMcO_custom = tTMEM_LOADcO_custom[None, 0, 0, i]
                 for j in range(0, cute.size(tTMrO)):
                     qo_idx = qo_idx_offset + tTMcO_custom[j][0]
-                    tTMrO[j] = self.output_transform(
-                        self.custom_params,
+                    tTMrO[j] = self.variant.transform_output(
                         tTMrO[j],
                         batch_coord,
                         qo_idx,
@@ -373,7 +371,7 @@ class CorrectionRole:
 
                     # wait for o0
                     o0_handle_consumer = mma_corr_consumer.wait_and_advance()
-                    if cutlass.const_expr(not self.custom_logits_transform):
+                    if cutlass.const_expr(not self.has_logits_transform):
                         self.rescale(pv_thr_mma, tOtO0, scale)
                     # release vec1 & o0
                     vec1_handle.release()
@@ -391,7 +389,7 @@ class CorrectionRole:
                     scale = cute.arch.exp2(scale_)
 
                     o1_handle_consumer = mma_corr_consumer.wait_and_advance()
-                    if cutlass.const_expr(not self.custom_logits_transform):
+                    if cutlass.const_expr(not self.has_logits_transform):
                         self.rescale(pv_thr_mma, tOtO1, scale)
                     vec0_handle.release()
                     cute.arch.fence_view_async_tmem_store()

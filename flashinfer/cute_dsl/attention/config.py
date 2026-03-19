@@ -7,19 +7,19 @@ AttentionConfig holds all the configuration needed by the kernel: dtypes, tile s
 execution mode, and feature flags. Derived properties (cta_tiler, pv_mma_tiler) are
 computed from the base parameters.
 
-AttentionFusion bundles the optional customization callbacks (logits transform, output
-transform, attention sinks) into a single object.
+AttentionFusion bundles an AttentionVariant (the customization point for logits
+transform, softmax statistics, and output normalization) into a single object
+that the kernel consumes.
 """
 
 from __future__ import annotations
 
 import enum
 from dataclasses import dataclass, field
-from typing import Callable, Tuple, Type, Any
-
-from types import SimpleNamespace
+from typing import Tuple, Type, Any
 
 from .fusion.mask import MaskType
+from .fusion.variant import AttentionVariant, StandardAttention
 
 
 class HeadMapping(enum.Enum):
@@ -114,21 +114,41 @@ class AttentionConfig:
 
 @dataclass
 class AttentionFusion:
-    """Bundles optional customization callbacks for attention variants.
+    """Bundles an AttentionVariant with the kernel.
 
-    Each field resolves at JIT time — None values compile away to zero overhead.
+    The variant object defines all customization hooks (logits transform,
+    statistics update, output transform) as co-defined methods.  Compile-time
+    flags on the variant drive dead-code elimination via ``cutlass.const_expr``.
+
+    See :class:`~flashinfer.cute_dsl.attention.fusion.variant.AttentionVariant`
+    for the full API and execution-order documentation.
     """
 
-    logits_transform: Callable | None = None
-    output_transform: Callable | None = None
-    M_D_update: Callable | None = None
-    use_attention_sink: bool = False
-    custom_params: SimpleNamespace | None = None
+    variant: AttentionVariant = None  # type: ignore[assignment]
 
     def __post_init__(self):
-        if self.use_attention_sink and self.M_D_update is None:
-            raise ValueError(
-                "M_D_update is required when use_attention_sink is True"
-            )
-        if self.custom_params is None:
-            self.custom_params = SimpleNamespace()
+        if self.variant is None:
+            self.variant = StandardAttention()
+
+    @property
+    def has_params(self) -> bool:
+        """Whether the variant needs runtime tensor data."""
+        return self.variant.extra_params is not None
+
+    @property
+    def params_shape(self) -> tuple | None:
+        """Shape of the variant's runtime tensor, or None."""
+        ep = self.variant.extra_params
+        return tuple(ep.shape) if ep is not None else None
+
+    @property
+    def params_strides(self) -> tuple | None:
+        """Element strides of the variant's runtime tensor, or None.
+
+        Derived from the PyTorch tensor's actual strides so the CuTe layout
+        in the kernel matches the source memory layout.  CuTe defaults to
+        column-major; PyTorch is row-major — using explicit strides avoids
+        a silent layout mismatch.
+        """
+        ep = self.variant.extra_params
+        return tuple(ep.stride()) if ep is not None else None

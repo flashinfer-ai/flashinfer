@@ -62,13 +62,12 @@ class SoftmaxRole:
         self.tmem_p0_offset = tmem.p0_offset
         self.tmem_p1_offset = tmem.p1_offset
 
-        # From fusion
-        self.custom_logits_transform = fusion.logits_transform is not None
-        self.logits_transform = fusion.logits_transform
-        self.custom_M_D_update = fusion.M_D_update is not None
-        self.M_D_update = fusion.M_D_update
-        self.custom_params = fusion.custom_params
-        self.use_attention_sink = fusion.use_attention_sink
+        # From fusion variant
+        self.variant = fusion.variant
+        self.has_score_mod = fusion.variant.has_score_mod
+        self.has_logits_transform = fusion.variant.has_logits_transform
+        self.has_statistics_update = fusion.variant.has_statistics_update
+        self.has_params = fusion.has_params
 
         # Warp config
         self.softmax0_warp_ids = softmax0_warp_ids
@@ -94,7 +93,7 @@ class SoftmaxRole:
         pipeline_args: tuple,
         atom_args: tuple,
         tensor_args: tuple,
-        sink: cute.Tensor | None,
+        params: cute.Tensor | None,
     ) -> Tuple[
         Float32,
         Float32,
@@ -146,10 +145,9 @@ class SoftmaxRole:
             tTMEM_STOREtS_x4,
         ) = tensor_args
 
-        if cutlass.const_expr(self.custom_M_D_update):
-            self.custom_params.sink = sink
-            row_max, row_sum = self.M_D_update(
-                self.custom_params,
+        if cutlass.const_expr(self.has_statistics_update):
+            self.variant.params = params
+            row_max, row_sum = self.variant.update_statistics(
                 kv_tile_idx,
                 qo_head_idx,
                 row_max,
@@ -176,6 +174,26 @@ class SoftmaxRole:
         cute.copy(tiled_tmem_load, tTMEM_LOADtS, tTMEM_LOADrS)
         if need_apply_mask:
             apply_mask(self.mask_type, self.window_left, tTMEM_LOADrS, tTMEM_LOADcS, seqlen_k, seqlen_k - seqlen_q)
+
+        frg_cnt = 4
+        frg_tile = cute.size(tTMEM_LOADrS) // frg_cnt
+        tTMEM_LOADrS_frg = cute.logical_divide(tTMEM_LOADrS, cute.make_layout(frg_tile))
+        tTMEM_LOADcS_frg = cute.logical_divide(tTMEM_LOADcS, cute.make_layout(frg_tile))
+
+        if cutlass.const_expr(self.has_score_mod):
+            if cutlass.const_expr(self.has_params):
+                self.variant.params = params
+            for j in range(frg_cnt):
+                for k in range(cute.size(tTMEM_LOADrS_frg, mode=[0])):
+                    qo_idx, kv_idx = tTMEM_LOADcS_frg[k, j]
+                    tTMEM_LOADrS_frg[k, j] = self.variant.score_mod(
+                        tTMEM_LOADrS_frg[k, j],
+                        batch_coord,
+                        qo_idx,
+                        kv_idx,
+                        qo_head_idx,
+                        kv_head_idx,
+                    )
 
         old_row_max = row_max
         row_max = tTMEM_LOADrS.load().reduce(cute.ReductionOp.MAX, row_max, 0)
@@ -207,15 +225,11 @@ class SoftmaxRole:
             sequence_producer_handle = s0_s1_sequence_producer.acquire_and_advance()
         else:
             sequence_consumer_handle = s0_s1_sequence_consumer.wait_and_advance()
-        frg_cnt = 4
-        frg_tile = cute.size(tTMEM_LOADrS) // frg_cnt
-        tTMEM_LOADrS_frg = cute.logical_divide(tTMEM_LOADrS, cute.make_layout(frg_tile))
         tTMEM_STORErS_x4_e_frg = cute.logical_divide(
             tTMEM_STORErS_x4_e, cute.make_layout(frg_tile)
         )
-        tTMEM_LOADcS_frg = cute.logical_divide(tTMEM_LOADcS, cute.make_layout(frg_tile))
         ### the softmax computation part ### e^(xi*scale - mi*scale)
-        if cutlass.const_expr(not self.custom_logits_transform):
+        if cutlass.const_expr(not self.has_logits_transform):
             for j in range(frg_cnt):
                 exp2_scale(tTMEM_LOADrS_frg[None, j], scale, row_max_safe)
                 s_vec = tTMEM_LOADrS_frg[None, j].load()
@@ -225,8 +239,7 @@ class SoftmaxRole:
             for j in range(frg_cnt):
                 for k in range(cute.size(tTMEM_LOADrS_frg, mode=[0])):
                     qo_idx, kv_idx = tTMEM_LOADcS_frg[k, j]
-                    tTMEM_LOADrS_frg[k, j] = self.logits_transform(
-                        self.custom_params,
+                    tTMEM_LOADrS_frg[k, j] = self.variant.transform_logits(
                         tTMEM_LOADrS_frg[k, j],
                         batch_coord,
                         qo_idx,
@@ -307,7 +320,7 @@ class SoftmaxRole:
         qk_thr_mma: cute.core.ThrMma,
         tStS: cute.Tensor,
         tStSi: cute.Tensor,
-        sink: cute.Tensor | None,
+        params: cute.Tensor | None,
         mma_si_consumer: PipelineConsumer,
         si_corr_producer: PipelineProducer,
         s0_s1_sequence_consumer: PipelineConsumer,
@@ -473,7 +486,7 @@ class SoftmaxRole:
                         pipeline_args,
                         atom_args,
                         tensor_args,
-                        sink,
+                        params,
                     )
 
                 mask_count = get_masked_trip_count(
@@ -518,7 +531,7 @@ class SoftmaxRole:
                         pipeline_args,
                         atom_args,
                         tensor_args,
-                        sink,
+                        params,
                     )
                 si_handle = mma_si_consumer.wait_and_advance()
                 tTMEM_STORE_VECrS = cute.make_fragment(

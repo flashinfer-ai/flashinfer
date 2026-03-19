@@ -17,10 +17,16 @@ import torch
 from flashinfer.utils import is_sm100a_supported
 
 from tests.test_helpers.sink_attention_reference import sink_softmax
-from types import SimpleNamespace
 import cutlass.cute as cute
 
-from flashinfer.cute_dsl.attention import BatchPrefillCuteDSLWrapper
+from flashinfer.cute_dsl.attention import (
+    BatchPrefillCuteDSLWrapper,
+    AttentionVariant,
+    AttentionWithSink,
+    SigmoidAttention,
+    ALiBiAttention,
+    RPEAttention,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -312,6 +318,16 @@ FUSION_SHAPE_PARAMS = [
 ]
 
 
+class _ScaleBy2TestVariant(AttentionVariant):
+    """Test-only: multiply output by 2x to verify output_transform hook."""
+    has_output_transform = True
+
+    @cute.jit
+    def transform_output(self, output, batch_idx, qo_idx, qo_head_idx,
+                         m, rcp_d, scale):
+        return output * scale * 2.0 * rcp_d
+
+
 @pytest.mark.parametrize("batch_size,qo_len,kv_len", FUSION_SHAPE_PARAMS)
 @pytest.mark.parametrize("causal", [False, True])
 def test_attention_prefill_output_transform(
@@ -319,12 +335,6 @@ def test_attention_prefill_output_transform(
 ):
     _skip_if_unsupported(qo_len, kv_len, causal)
     num_kv_heads = 8
-
-    @cute.jit
-    def dumb_output_transform(
-        params, output, batch_idx, qo_idx, qo_head_idx, m, rcp_d, scale
-    ):
-        return output * scale * 2.0 * rcp_d
 
     torch.manual_seed(42)
     q = torch.randn(batch_size * qo_len, NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda")
@@ -340,7 +350,7 @@ def test_attention_prefill_output_transform(
         qo_indptr, kv_indptr, NUM_QO_HEADS, num_kv_heads, HEAD_DIM,
         head_dim_vo=HEAD_DIM, causal=causal, sm_scale=1.0,
         q_data_type=DTYPE, kv_data_type=DTYPE,
-        output_transform=dumb_output_transform,
+        variant=_ScaleBy2TestVariant(),
     )
     o = wrapper.run(q, k, v)
 
@@ -362,19 +372,6 @@ def test_attention_prefill_logits_transform(
     _skip_if_unsupported(qo_len, kv_len, causal)
     num_kv_heads = 8
 
-    params = SimpleNamespace(
-        scale=1.0 * math.log2(math.exp(1.0)),
-        bias=0.0,
-    )
-
-    @cute.jit
-    def sigmoid_logits_transform(
-        params, x, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx
-    ):
-        scale = params.scale
-        bias = params.bias
-        return cute.arch.rcp_approx(1 + cute.arch.exp2(-(x * scale + bias)))
-
     torch.manual_seed(42)
     q = torch.randn(batch_size * qo_len, NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda")
     k = torch.randn(batch_size * kv_len, num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda")
@@ -389,8 +386,7 @@ def test_attention_prefill_logits_transform(
         qo_indptr, kv_indptr, NUM_QO_HEADS, num_kv_heads, HEAD_DIM,
         head_dim_vo=HEAD_DIM, causal=causal, sm_scale=1.0,
         q_data_type=DTYPE, kv_data_type=DTYPE,
-        custom_params=params,
-        logits_transform=sigmoid_logits_transform,
+        variant=SigmoidAttention(scale=1.0, bias=0.0),
     )
     o = wrapper.run(q, k, v)
 
@@ -413,22 +409,6 @@ def test_attention_prefill_attention_sink(
     _skip_if_unsupported(qo_len, kv_len, causal)
     num_kv_heads = 8
 
-    @cute.jit
-    def sink_M_D_update(params, kv_tile_idx, qo_head_idx, m, d, scale):
-        # m is in the RAW (unscaled) domain; convert sink from scaled-logit to RAW
-        log2_e = math.log2(math.exp(1.0))
-        sink_raw = params.sink[qo_head_idx] * log2_e / scale if kv_tile_idx == 0 else -math.inf
-        m_new = sink_raw if sink_raw > m else m
-        rescale = cute.arch.exp2((m - m_new) * scale)
-        d_new = cute.arch.exp2((sink_raw - m_new) * scale) + d * rescale
-        return m_new, d_new
-
-    @cute.jit
-    def sink_output_transform(
-        params, output, batch_idx, qo_idx, qo_head_idx, m, rcp_d, scale
-    ):
-        return output * scale * rcp_d
-
     torch.manual_seed(42)
     q = torch.randn(batch_size * qo_len, NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda")
     k = torch.randn(batch_size * kv_len, num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda")
@@ -444,11 +424,9 @@ def test_attention_prefill_attention_sink(
         qo_indptr, kv_indptr, NUM_QO_HEADS, num_kv_heads, HEAD_DIM,
         head_dim_vo=HEAD_DIM, causal=causal, sm_scale=SM_SCALE,
         q_data_type=DTYPE, kv_data_type=DTYPE,
-        output_transform=sink_output_transform,
-        M_D_update=sink_M_D_update,
-        use_attention_sink=True,
+        variant=AttentionWithSink(sink),
     )
-    o = wrapper.run(q, k, v, sink=sink)
+    o = wrapper.run(q, k, v)
 
     o_ref, _ = attention_ref(
         batch_size, q, k, v, causal, SM_SCALE, sink=sink
@@ -663,19 +641,6 @@ def test_attention_prefill_varlen_logits_transform(indptr):
         pytest.skip("SM100A is not supported on this device")
     num_kv_heads = 8
 
-    params = SimpleNamespace(
-        scale=1.0 * math.log2(math.exp(1.0)),
-        bias=0.0,
-    )
-
-    @cute.jit
-    def sigmoid_logits_transform(
-        params, x, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx
-    ):
-        scale = params.scale
-        bias = params.bias
-        return cute.arch.rcp_approx(1 + cute.arch.exp2(-(x * scale + bias)))
-
     torch.manual_seed(42)
     q = torch.randn(indptr[-1], NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda")
     k = torch.randn(indptr[-1], num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda")
@@ -691,8 +656,7 @@ def test_attention_prefill_varlen_logits_transform(indptr):
         qo_indptr, kv_indptr, NUM_QO_HEADS, num_kv_heads, HEAD_DIM,
         head_dim_vo=HEAD_DIM, causal=False, sm_scale=1.0,
         q_data_type=DTYPE, kv_data_type=DTYPE,
-        custom_params=params,
-        logits_transform=sigmoid_logits_transform,
+        variant=SigmoidAttention(scale=1.0, bias=0.0),
     )
     o = wrapper.run(q, k, v)
 
@@ -736,21 +700,6 @@ def test_attention_prefill_varlen_attention_sink(indptr):
         pytest.skip("SM100A is not supported on this device")
     num_kv_heads = 8
 
-    @cute.jit
-    def sink_M_D_update(params, kv_tile_idx, qo_head_idx, m, d, scale):
-        log2_e = math.log2(math.exp(1.0))
-        sink_raw = params.sink[qo_head_idx] * log2_e / scale if kv_tile_idx == 0 else -math.inf
-        m_new = sink_raw if sink_raw > m else m
-        rescale = cute.arch.exp2((m - m_new) * scale)
-        d_new = cute.arch.exp2((sink_raw - m_new) * scale) + d * rescale
-        return m_new, d_new
-
-    @cute.jit
-    def sink_output_transform(
-        params, output, batch_idx, qo_idx, qo_head_idx, m, rcp_d, scale
-    ):
-        return output * scale * rcp_d
-
     torch.manual_seed(42)
     q = torch.randn(indptr[-1], NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda")
     k = torch.randn(indptr[-1], num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda")
@@ -767,11 +716,9 @@ def test_attention_prefill_varlen_attention_sink(indptr):
         qo_indptr, kv_indptr, NUM_QO_HEADS, num_kv_heads, HEAD_DIM,
         head_dim_vo=HEAD_DIM, causal=False, sm_scale=SM_SCALE,
         q_data_type=DTYPE, kv_data_type=DTYPE,
-        output_transform=sink_output_transform,
-        M_D_update=sink_M_D_update,
-        use_attention_sink=True,
+        variant=AttentionWithSink(sink),
     )
-    o = wrapper.run(q, k, v, sink=sink)
+    o = wrapper.run(q, k, v)
 
     gqa_group_ratio = NUM_QO_HEADS // num_kv_heads
     k_repeated = torch.repeat_interleave(k, gqa_group_ratio, dim=1)
@@ -801,21 +748,6 @@ def test_attention_prefill_attention_sink_mha(
     _skip_if_unsupported(qo_len, kv_len, causal)
     num_kv_heads = NUM_QO_HEADS
 
-    @cute.jit
-    def sink_M_D_update(params, kv_tile_idx, qo_head_idx, m, d, scale):
-        log2_e = math.log2(math.exp(1.0))
-        sink_raw = params.sink[qo_head_idx] * log2_e / scale if kv_tile_idx == 0 else -math.inf
-        m_new = sink_raw if sink_raw > m else m
-        rescale = cute.arch.exp2((m - m_new) * scale)
-        d_new = cute.arch.exp2((sink_raw - m_new) * scale) + d * rescale
-        return m_new, d_new
-
-    @cute.jit
-    def sink_output_transform(
-        params, output, batch_idx, qo_idx, qo_head_idx, m, rcp_d, scale
-    ):
-        return output * scale * rcp_d
-
     torch.manual_seed(42)
     q = torch.randn(batch_size * qo_len, NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda")
     k = torch.randn(batch_size * kv_len, num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda")
@@ -831,14 +763,224 @@ def test_attention_prefill_attention_sink_mha(
         qo_indptr, kv_indptr, NUM_QO_HEADS, num_kv_heads, HEAD_DIM,
         head_dim_vo=HEAD_DIM, causal=causal, sm_scale=SM_SCALE,
         q_data_type=DTYPE, kv_data_type=DTYPE,
-        output_transform=sink_output_transform,
-        M_D_update=sink_M_D_update,
-        use_attention_sink=True,
+        variant=AttentionWithSink(sink),
     )
-    o = wrapper.run(q, k, v, sink=sink)
+    o = wrapper.run(q, k, v)
 
     o_ref, _ = attention_ref(
         batch_size, q, k, v, causal, SM_SCALE, sink=sink
+    )
+
+    torch.testing.assert_close(o, o_ref, rtol=RTOL, atol=ATOL)
+
+
+# ---------------------------------------------------------------------------
+#  12. ALiBi (score_mod hook)
+# ---------------------------------------------------------------------------
+
+def attention_alibi_ref(
+    batch_size,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    causal: bool,
+    sm_scale: float,
+    alibi_slopes: torch.Tensor,
+) -> torch.Tensor:
+    """Reference ALiBi attention: adds slope * (kv_pos - qo_pos) before softmax."""
+    qo_len = q.shape[0] // batch_size
+    kv_len = k.shape[0] // batch_size
+    num_qo_heads = q.shape[1]
+    num_kv_heads = k.shape[1]
+    head_dim_qk = q.shape[2]
+    head_dim_vo = v.shape[2]
+
+    if num_qo_heads > num_kv_heads:
+        group_size = num_qo_heads // num_kv_heads
+        k = torch.repeat_interleave(k, group_size, dim=1)
+        v = torch.repeat_interleave(v, group_size, dim=1)
+
+    logits = torch.einsum(
+        "bmhd,bnhd->bhmn",
+        q.view(batch_size, qo_len, num_qo_heads, head_dim_qk).float(),
+        k.view(batch_size, kv_len, num_qo_heads, head_dim_qk).float(),
+    )
+
+    qo_pos = torch.arange(qo_len, device=q.device).view(1, 1, -1, 1)
+    kv_pos = torch.arange(kv_len, device=q.device).view(1, 1, 1, -1)
+    alibi_bias = alibi_slopes.view(1, -1, 1, 1) * (kv_pos - qo_pos)
+    logits = (logits + alibi_bias) * sm_scale
+
+    if causal:
+        mask = torch.arange(kv_len - qo_len, kv_len, device=q.device).unsqueeze(
+            1
+        ) >= torch.arange(0, kv_len, device=q.device).unsqueeze(0)
+    else:
+        mask = torch.ones(qo_len, kv_len, device=q.device)
+
+    logits = logits.masked_fill(mask.unsqueeze(0).unsqueeze(0) == 0, float("-inf"))
+
+    p = torch.softmax(logits, dim=-1)
+    o_ref = (
+        torch.einsum(
+            "bhmn,bnhd->bmhd",
+            p,
+            v.view(batch_size, kv_len, num_qo_heads, head_dim_vo).float(),
+        )
+        .contiguous()
+        .view(batch_size * qo_len, num_qo_heads, head_dim_vo)
+        .to(q)
+    )
+
+    return o_ref
+
+
+ALIBI_SHAPE_PARAMS = [
+    (1, 128, 128),
+    (1, 177, 977),
+    (9, 256, 256),
+    (9, 177, 544),
+]
+
+
+@pytest.mark.parametrize("batch_size,qo_len,kv_len", ALIBI_SHAPE_PARAMS)
+@pytest.mark.parametrize("causal", [False, True])
+def test_attention_prefill_alibi(
+    batch_size, qo_len, kv_len, causal,
+):
+    _skip_if_unsupported(qo_len, kv_len, causal)
+    num_kv_heads = 8
+
+    torch.manual_seed(42)
+    q = torch.randn(batch_size * qo_len, NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda")
+    k = torch.randn(batch_size * kv_len, num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda")
+    v = torch.randn(batch_size * kv_len, num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda")
+    qo_indptr = torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+    kv_indptr = torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * kv_len
+
+    alibi_slopes = ALiBiAttention.get_slopes(NUM_QO_HEADS).cuda()
+
+    wrapper = BatchPrefillCuteDSLWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+    )
+    wrapper.plan(
+        qo_indptr, kv_indptr, NUM_QO_HEADS, num_kv_heads, HEAD_DIM,
+        head_dim_vo=HEAD_DIM, causal=causal, sm_scale=SM_SCALE,
+        q_data_type=DTYPE, kv_data_type=DTYPE,
+        variant=ALiBiAttention(alibi_slopes),
+    )
+    o = wrapper.run(q, k, v)
+
+    o_ref = attention_alibi_ref(
+        batch_size, q, k, v, causal, SM_SCALE, alibi_slopes,
+    )
+
+    torch.testing.assert_close(o, o_ref, rtol=RTOL, atol=ATOL)
+
+
+# ---------------------------------------------------------------------------
+#  13. RPE (Relative Positional Encoding — 2-D params)
+# ---------------------------------------------------------------------------
+
+def attention_rpe_ref(
+    batch_size,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    causal: bool,
+    sm_scale: float,
+    rpe_table: torch.Tensor,
+    max_rel_dist: int,
+) -> torch.Tensor:
+    """Reference RPE attention: adds rpe_table[head, clamp(kv-qo+offset)] before softmax."""
+    qo_len = q.shape[0] // batch_size
+    kv_len = k.shape[0] // batch_size
+    num_qo_heads = q.shape[1]
+    num_kv_heads = k.shape[1]
+    head_dim_qk = q.shape[2]
+    head_dim_vo = v.shape[2]
+
+    if num_qo_heads > num_kv_heads:
+        group_size = num_qo_heads // num_kv_heads
+        k = torch.repeat_interleave(k, group_size, dim=1)
+        v = torch.repeat_interleave(v, group_size, dim=1)
+
+    logits = torch.einsum(
+        "bmhd,bnhd->bhmn",
+        q.view(batch_size, qo_len, num_qo_heads, head_dim_qk).float(),
+        k.view(batch_size, kv_len, num_qo_heads, head_dim_qk).float(),
+    )
+
+    qo_pos = torch.arange(qo_len, device=q.device).view(1, 1, -1, 1)
+    kv_pos = torch.arange(kv_len, device=q.device).view(1, 1, 1, -1)
+    rel_pos = (kv_pos - qo_pos + max_rel_dist).clamp(0, 2 * max_rel_dist)
+    rpe_bias = rpe_table[:, rel_pos.squeeze(0).squeeze(0).long()].unsqueeze(0)
+    logits = (logits + rpe_bias) * sm_scale
+
+    if causal:
+        mask = torch.arange(kv_len - qo_len, kv_len, device=q.device).unsqueeze(
+            1
+        ) >= torch.arange(0, kv_len, device=q.device).unsqueeze(0)
+    else:
+        mask = torch.ones(qo_len, kv_len, device=q.device)
+
+    logits = logits.masked_fill(mask.unsqueeze(0).unsqueeze(0) == 0, float("-inf"))
+
+    p = torch.softmax(logits, dim=-1)
+    o_ref = (
+        torch.einsum(
+            "bhmn,bnhd->bmhd",
+            p,
+            v.view(batch_size, kv_len, num_qo_heads, head_dim_vo).float(),
+        )
+        .contiguous()
+        .view(batch_size * qo_len, num_qo_heads, head_dim_vo)
+        .to(q)
+    )
+
+    return o_ref
+
+
+RPE_SHAPE_PARAMS = [
+    (1, 128, 128),
+    (1, 177, 977),
+    (9, 256, 256),
+]
+
+
+@pytest.mark.parametrize("batch_size,qo_len,kv_len", RPE_SHAPE_PARAMS)
+@pytest.mark.parametrize("causal", [False, True])
+def test_attention_prefill_rpe(
+    batch_size, qo_len, kv_len, causal,
+):
+    _skip_if_unsupported(qo_len, kv_len, causal)
+    num_kv_heads = 8
+    max_rel_dist = 64
+
+    torch.manual_seed(42)
+    q = torch.randn(batch_size * qo_len, NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda")
+    k = torch.randn(batch_size * kv_len, num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda")
+    v = torch.randn(batch_size * kv_len, num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda")
+    qo_indptr = torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+    kv_indptr = torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * kv_len
+
+    rpe_table = torch.randn(
+        NUM_QO_HEADS, 2 * max_rel_dist + 1, dtype=torch.float32, device="cuda"
+    ) * 0.1
+
+    wrapper = BatchPrefillCuteDSLWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+    )
+    wrapper.plan(
+        qo_indptr, kv_indptr, NUM_QO_HEADS, num_kv_heads, HEAD_DIM,
+        head_dim_vo=HEAD_DIM, causal=causal, sm_scale=SM_SCALE,
+        q_data_type=DTYPE, kv_data_type=DTYPE,
+        variant=RPEAttention(rpe_table, max_rel_dist),
+    )
+    o = wrapper.run(q, k, v)
+
+    o_ref = attention_rpe_ref(
+        batch_size, q, k, v, causal, SM_SCALE, rpe_table, max_rel_dist,
     )
 
     torch.testing.assert_close(o, o_ref, rtol=RTOL, atol=ATOL)

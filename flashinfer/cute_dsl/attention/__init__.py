@@ -26,8 +26,15 @@ from .mainloop_spec import (
     make_prefill_mainloop_spec,
 )
 from .fusion.mask import MaskType
-from .fusion.logits_transform import sigmoid_logits_transform
-from .fusion.output_transform import dumb_output_transform
+from .fusion.variant import (
+    AttentionVariant,
+    StandardAttention,
+    AttentionWithSink,
+    SigmoidAttention,
+    ALiBiAttention,
+    RPEAttention,
+    SoftCappingAttention,
+)
 from .scheduler.persistent import (
     FmhaStaticTileScheduler,
     FmhaStaticTileSchedulerParams,

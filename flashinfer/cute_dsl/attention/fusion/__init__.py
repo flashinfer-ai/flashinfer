@@ -9,5 +9,12 @@ from .mask import (
     get_unmasked_trip_count,
     get_kv_start_block_idx,
 )
-from .logits_transform import sigmoid_logits_transform
-from .output_transform import dumb_output_transform
+from .variant import (
+    AttentionVariant,
+    StandardAttention,
+    AttentionWithSink,
+    SigmoidAttention,
+    ALiBiAttention,
+    RPEAttention,
+    SoftCappingAttention,
+)

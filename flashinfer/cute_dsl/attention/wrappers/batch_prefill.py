@@ -8,7 +8,7 @@ creates the kernel, compiles it, and provides the run() interface.
 """
 
 import math
-from typing import Optional, Callable
+from typing import Optional
 
 import torch
 import cuda.bindings.driver as cuda
@@ -19,10 +19,9 @@ import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Int32
 
-from types import SimpleNamespace
-
 from ..config import AttentionConfig, AttentionFusion
 from ..fusion.mask import MaskType
+from ..fusion.variant import AttentionVariant, StandardAttention
 from ..prefill import BlackwellFusedMultiHeadAttentionForward
 
 
@@ -55,12 +54,8 @@ class BatchPrefillCuteDSLWrapper:
         sm_scale=1.0,
         q_data_type=torch.float16,
         kv_data_type=torch.float16,
-        custom_params: SimpleNamespace | None = None,
-        logits_transform: Callable | None = None,
-        output_transform: Callable | None = None,
         window_left: int = -1,
-        M_D_update: Callable | None = None,
-        use_attention_sink: bool = False,
+        variant: AttentionVariant | None = None,
     ) -> None:
         if not torch.cuda.is_available():
             raise RuntimeError("GPU is required to run this example!")
@@ -82,7 +77,9 @@ class BatchPrefillCuteDSLWrapper:
 
         h_r = num_qo_heads // num_kv_heads
 
-        self._use_attention_sink = use_attention_sink
+        if variant is None:
+            variant = StandardAttention()
+        self._variant = variant
 
         # Set data types based on input parameters
         if q_data_type == torch.bfloat16:
@@ -154,9 +151,17 @@ class BatchPrefillCuteDSLWrapper:
             is_dynamic_layout=True,
         )
 
-        if use_attention_sink:
-            sink = torch.randn(num_qo_heads, dtype=q_data_type, device=self._device)
-            sink_cute = from_dlpack(sink, assumed_align=16)
+        self._has_params = self._variant.extra_params is not None
+        if self._has_params:
+            ep = self._variant.extra_params.to(torch.float32).to(self._device)
+            if not ep.is_contiguous():
+                raise ValueError(
+                    f"AttentionVariant.extra_params must be contiguous, "
+                    f"got strides {ep.stride()} for shape {ep.shape}. "
+                    f"Call .contiguous() before returning from extra_params."
+                )
+            self._params_torch = ep
+            params_cute = from_dlpack(ep, assumed_align=16)
 
         self._mma_tiler_mn = (128, 128)
         self._mma_tiler = (128, 128, self._head_dim)
@@ -181,13 +186,7 @@ class BatchPrefillCuteDSLWrapper:
             num_repeat_kv_heads=h_r,
             window_left=window_left,
         )
-        fusion = AttentionFusion(
-            logits_transform=logits_transform,
-            output_transform=output_transform,
-            M_D_update=M_D_update,
-            use_attention_sink=use_attention_sink,
-            custom_params=custom_params,
-        )
+        fusion = AttentionFusion(variant=self._variant)
         fmha = BlackwellFusedMultiHeadAttentionForward(config, fusion)
 
         problem_size = (
@@ -231,7 +230,7 @@ class BatchPrefillCuteDSLWrapper:
             self._s_k_all,
             self._scale_softmax_log2,
             self._scale_output,
-            sink_cute.iterator if self._use_attention_sink else None,
+            params_cute.iterator if self._has_params else None,
             stream,
         )
 
@@ -243,7 +242,6 @@ class BatchPrefillCuteDSLWrapper:
         k: torch.Tensor,
         v: torch.Tensor,
         out: Optional[torch.Tensor] = None,
-        sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         r"""Run the prefill attention computation.
 
@@ -257,8 +255,7 @@ class BatchPrefillCuteDSLWrapper:
             The value tensor with shape [batch_size, seq_len, num_heads, head_dim].
         out : Optional[torch.Tensor], optional
             The output tensor. If None, a new tensor will be created.
-        sink : Optional[torch.Tensor], optional
-            The sink tensor with shape [num_heads].
+
         Returns
         -------
         torch.Tensor
@@ -268,21 +265,16 @@ class BatchPrefillCuteDSLWrapper:
         if self._compiled_fmha is None:
             raise RuntimeError("Plan the prefill attention computation first!")
 
-        # Create output tensor if not provided
         if out is None:
             out = torch.empty_like(q, device=q.device)
 
-        # Convert tensors to cute format
-        # Create dtype cute tensor with offset (gpu)
         q_cute = from_dlpack(q, assumed_align=16)
         k_cute = from_dlpack(k, assumed_align=16)
         v_cute = from_dlpack(v, assumed_align=16)
         o_cute, o_torch = qkv_torch_2_cute(out, self._o_padding, self._out_dtype)
 
-        if self._use_attention_sink:
-            assert sink is not None, "sink is required when use_attention_sink is True"
-            assert sink.dtype == q.dtype, "sink must have the same dtype as q"
-            sink_cute = from_dlpack(sink, assumed_align=16)
+        if self._has_params:
+            params_cute = from_dlpack(self._params_torch, assumed_align=16)
 
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
@@ -298,7 +290,7 @@ class BatchPrefillCuteDSLWrapper:
             self._s_k_all,
             self._scale_softmax_log2,
             self._scale_output,
-            sink_cute.iterator if self._use_attention_sink else None,
+            params_cute.iterator if self._has_params else None,
             stream,
         )
 
