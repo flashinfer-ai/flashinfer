@@ -657,6 +657,7 @@ def fp4_quantize(
     is_sf_swizzled_layout: bool = True,
     is_sf_8x4_layout: bool = False,
     enable_pdl: Optional[bool] = None,
+    backend: str = "cuda",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize input tensor to FP4 format.
 
@@ -672,6 +673,12 @@ def fp4_quantize(
         is_sf_8x4_layout (bool, optional): Whether to use 8x4 layout or 128x4 layout for scale factors. Defaults to False.
         enable_pdl (Optional[bool], optional): Whether to enable PDL (Programmatic Dependent Launch).
             If None, automatically detects based on device capability. Defaults to None.
+        backend (str, optional): Backend to use for quantization.
+            - "cuda": Use CUDA kernel (default, stable).
+            - "cute-dsl": Use CuTe-DSL kernel (requires SM100+, **experimental**).
+              Supported combinations:
+              * sf_vec_size=16, sf_use_ue8m0=False: all layouts, fp16/bf16/fp8 (NVFP4)
+              * sf_vec_size=32, sf_use_ue8m0=True: 128x4 swizzled and linear, fp16/bf16 (MXFP4)
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
@@ -683,9 +690,27 @@ def fp4_quantize(
             - BFloat16 input when BFloat16 is not enabled
             - FP8 input when FP8 is not enabled
             - sf_vec_size other than 16 or 32
+        ValueError: If the "cute-dsl" backend is requested for an unsupported parameter combination.
+
+    Warning:
+        The "cute-dsl" backend is **experimental** and not part of the stable API.
+        It may change or be removed in future versions without notice.
     """
     if sf_vec_size != 16 and sf_vec_size != 32:
         raise NotImplementedError("sf_vec_size can only be 16 or 32")
+
+    if backend == "cute-dsl":
+        return _fp4_quantize_cute_dsl(
+            input,
+            global_scale,
+            sf_vec_size,
+            sf_use_ue8m0,
+            is_sf_swizzled_layout,
+            is_sf_8x4_layout,
+            enable_pdl,
+        )
+    elif backend != "cuda":
+        raise ValueError(f"Unknown backend: {backend}. Must be 'cuda' or 'cute-dsl'.")
 
     # for column major input, we need to transpose the input
     is_column_major = input.stride(-2) == 1
@@ -712,6 +737,71 @@ def fp4_quantize(
         sf = sf.transpose(-2, -1)
 
     return x_q, sf
+
+
+def _fp4_quantize_cute_dsl(
+    input: torch.Tensor,
+    global_scale: Optional[torch.Tensor],
+    sf_vec_size: int,
+    sf_use_ue8m0: bool,
+    is_sf_swizzled_layout: bool,
+    is_sf_8x4_layout: bool,
+    enable_pdl: Optional[bool],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """CuTe-DSL dispatch for fp4_quantize. Maps parameters to the appropriate kernel."""
+    from ..cute_dsl import is_cute_dsl_available
+
+    if not is_cute_dsl_available():
+        raise RuntimeError(
+            "CuTe-DSL backend requested but CuTe-DSL is not available. "
+            "Please install the required dependencies."
+        )
+
+    if sf_vec_size == 16 and not sf_use_ue8m0:
+        # NVFP4 path: E4M3 scale factors, sf_vec_size=16, all layouts
+        from .kernels.nvfp4_quantize import (
+            SF_LAYOUT_128x4,
+            SF_LAYOUT_8x4,
+            SF_LAYOUT_LINEAR,
+            nvfp4_quantize_cute_dsl,
+        )
+
+        if not is_sf_swizzled_layout:
+            sf_layout = SF_LAYOUT_LINEAR
+        elif is_sf_8x4_layout:
+            sf_layout = SF_LAYOUT_8x4
+        else:
+            sf_layout = SF_LAYOUT_128x4
+
+        return nvfp4_quantize_cute_dsl(
+            input, global_scale, sf_layout=sf_layout, enable_pdl=enable_pdl
+        )
+
+    elif sf_vec_size == 32 and sf_use_ue8m0:
+        # MXFP4 path: UE8M0 scale factors, sf_vec_size=32
+        if is_sf_8x4_layout:
+            raise ValueError(
+                "CuTe-DSL MXFP4 kernel does not support 8x4 layout. "
+                "Supported: swizzled 128x4 and linear."
+            )
+        from .kernels.mxfp4_quantize import (
+            SF_LAYOUT_128x4,
+            SF_LAYOUT_LINEAR,
+            mxfp4_quantize_cute_dsl,
+        )
+
+        sf_layout = SF_LAYOUT_128x4 if is_sf_swizzled_layout else SF_LAYOUT_LINEAR
+        return mxfp4_quantize_cute_dsl(
+            input, sf_layout=sf_layout, enable_pdl=enable_pdl
+        )
+
+    else:
+        raise ValueError(
+            f"CuTe-DSL backend does not support sf_vec_size={sf_vec_size} with "
+            f"sf_use_ue8m0={sf_use_ue8m0}. Supported: "
+            f"(sf_vec_size=16, sf_use_ue8m0=False) for NVFP4, "
+            f"(sf_vec_size=32, sf_use_ue8m0=True) for MXFP4."
+        )
 
 
 @flashinfer_api
@@ -849,7 +939,7 @@ def nvfp4_quantize(
     Quantize input tensor to NVFP4 format.
 
     Parameters:
-        a (torch.Tensor): Input tensor of shape [M, K] with dtype fp16/bf16.
+        a (torch.Tensor): Input tensor of shape [M, K] with dtype fp16/bf16/float8_e4m3fn.
         a_global_sf (torch.Tensor): Global scale factor of shape [1] with dtype float32.
         sfLayout (SfLayout, optional): Scale factor layout. Defaults to SfLayout.layout_128x4.
         do_shuffle (bool, optional): Whether to shuffle the scale factors. Defaults to False. Only TRTLLM backend needs to shuffle the tensor B scale factors.
@@ -860,6 +950,7 @@ def nvfp4_quantize(
             - "cuda": Use CUDA kernel (default, stable)
             - "cute-dsl": Use CuTe-DSL kernel (requires SM100+, **experimental**).
               Supports all sfLayout values (layout_128x4, layout_8x4, layout_linear).
+              Supports input dtypes: fp16, bf16, float8_e4m3fn.
               Only supports sf_vec_size=16.
 
     Returns:

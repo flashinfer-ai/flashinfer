@@ -44,6 +44,7 @@ from ..quantization_cute_dsl_utils import (
     compute_sf_index_linear_gpu,
     process_nvfp4_block_half,
     process_nvfp4_block_bfloat,
+    process_nvfp4_block_fp8,
 )
 
 SF_LAYOUT_128x4 = 0
@@ -130,6 +131,7 @@ class NVFP4QuantizeSwizzledKernel:
         self.dtype = dtype
         self.K = K
         self.is_bfloat16 = dtype == cutlass.BFloat16
+        self.is_fp8 = dtype == cutlass.Float8E4M3FN
         self.enable_pdl = enable_pdl
         self.sf_layout = sf_layout
         self.sf_is_128x4 = sf_layout == SF_LAYOUT_128x4
@@ -168,9 +170,7 @@ class NVFP4QuantizeSwizzledKernel:
             return compute_sf_index_swizzled_128x4_gpu(row_idx, col_idx, padded_cols)
         else:
             if cutlass.const_expr(self.sf_is_8x4):
-                return compute_sf_index_swizzled_8x4_gpu(
-                    row_idx, col_idx, padded_cols
-                )
+                return compute_sf_index_swizzled_8x4_gpu(row_idx, col_idx, padded_cols)
             else:
                 return compute_sf_index_linear_gpu(row_idx, col_idx, padded_cols)
 
@@ -215,7 +215,7 @@ class NVFP4QuantizeSwizzledKernel:
         - Large K path: Single row with column loop
 
         Each thread processes one SF block (16 elements):
-        1. Load 16 fp16/bf16 elements (2 x 128-bit loads)
+        1. Load 16 elements (2 x 128-bit for fp16/bf16, 1 x 128-bit for fp8)
         2. Compute max absolute value using SIMD reduction
         3. Compute E4M3 scale: cvt_f32_to_e4m3(global_scale * max / 6.0)
         4. Store scale factor using layout-specific indexing
@@ -267,7 +267,11 @@ class NVFP4QuantizeSwizzledKernel:
                             elem_base = sf_idx_in_row * NVFP4_SF_VEC_SIZE
                             row_input = mInput[row_idx, None]
 
-                            if cutlass.const_expr(self.is_bfloat16):
+                            if cutlass.const_expr(self.is_fp8):
+                                scale_fp8, packed64 = process_nvfp4_block_fp8(
+                                    row_input, elem_base, global_scale
+                                )
+                            elif cutlass.const_expr(self.is_bfloat16):
                                 scale_fp8, packed64 = process_nvfp4_block_bfloat(
                                     row_input, elem_base, global_scale
                                 )
@@ -323,7 +327,11 @@ class NVFP4QuantizeSwizzledKernel:
                             elem_base = local_sf_idx * NVFP4_SF_VEC_SIZE
                             row_input = mInput[row_idx, None]
 
-                            if cutlass.const_expr(self.is_bfloat16):
+                            if cutlass.const_expr(self.is_fp8):
+                                scale_fp8, packed64 = process_nvfp4_block_fp8(
+                                    row_input, elem_base, global_scale
+                                )
+                            elif cutlass.const_expr(self.is_bfloat16):
                                 scale_fp8, packed64 = process_nvfp4_block_bfloat(
                                     row_input, elem_base, global_scale
                                 )
@@ -363,7 +371,7 @@ class NVFP4QuantizeSwizzledKernel:
 
 @functools.cache
 def _get_compiled_kernel_nvfp4(
-    is_bfloat16: bool,
+    dtype_key: str,
     K: int,
     sf_layout: int = SF_LAYOUT_128x4,
     enable_pdl: bool = False,
@@ -371,14 +379,22 @@ def _get_compiled_kernel_nvfp4(
     """
     Get or compile NVFP4 kernel with TVM-FFI.
 
-    Cached by (K, dtype, sf_layout, pdl) - M-agnostic, device-independent
+    Cached by (K, dtype_key, sf_layout, pdl) - M-agnostic, device-independent
     compilation.
+
+    Args:
+        dtype_key: One of "float16", "bfloat16", "float8_e4m3fn".
 
     Returns:
         Tuple of (compiled_kernel, rows_per_block) where rows_per_block
         is used by the caller to compute num_blocks at runtime.
     """
-    cutlass_dtype = cutlass.BFloat16 if is_bfloat16 else cutlass.Float16
+    _dtype_map = {
+        "float16": cutlass.Float16,
+        "bfloat16": cutlass.BFloat16,
+        "float8_e4m3fn": cutlass.Float8E4M3FN,
+    }
+    cutlass_dtype = _dtype_map[dtype_key]
     kernel_obj = NVFP4QuantizeSwizzledKernel(
         cutlass_dtype, K, sf_layout=sf_layout, enable_pdl=enable_pdl
     )
@@ -436,7 +452,7 @@ def nvfp4_quantize_cute_dsl(
     handles varying M (batch size) at runtime without recompilation.
 
     Args:
-        input: Input tensor of shape [M, K] with dtype fp16/bf16
+        input: Input tensor of shape [M, K] with dtype fp16/bf16/float8_e4m3fn
         global_scale: Scalar tensor (float32) for NVFP4 global scale factor
         sf_layout: Scale factor layout (0=128x4, 1=8x4, 2=linear).
         enable_pdl: Whether to enable PDL (Programmatic Dependent Launch).
@@ -450,8 +466,9 @@ def nvfp4_quantize_cute_dsl(
     """
     from ...utils import device_support_pdl
 
-    assert input.dtype in (torch.float16, torch.bfloat16), (
-        f"Input dtype must be float16 or bfloat16, got {input.dtype}"
+    _supported_dtypes = (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
+    assert input.dtype in _supported_dtypes, (
+        f"Input dtype must be one of {_supported_dtypes}, got {input.dtype}"
     )
     assert input.is_cuda, "Input must be on CUDA device"
 
@@ -470,7 +487,13 @@ def nvfp4_quantize_cute_dsl(
     )
 
     input = input.contiguous()
-    is_bfloat16 = input.dtype == torch.bfloat16
+
+    _torch_to_dtype_key = {
+        torch.float16: "float16",
+        torch.bfloat16: "bfloat16",
+        torch.float8_e4m3fn: "float8_e4m3fn",
+    }
+    dtype_key = _torch_to_dtype_key[input.dtype]
 
     if isinstance(global_scale, torch.Tensor):
         global_scale_tensor = global_scale.float().reshape(1).contiguous()
@@ -501,12 +524,10 @@ def nvfp4_quantize_cute_dsl(
     scale_output_size = padded_m * padded_sf_cols
 
     kernel_fn, rows_per_block = _get_compiled_kernel_nvfp4(
-        is_bfloat16, k, sf_layout, enable_pdl
+        dtype_key, k, sf_layout, enable_pdl
     )
 
-    num_blocks = min(
-        (padded_m + rows_per_block - 1) // rows_per_block, target_grid
-    )
+    num_blocks = min((padded_m + rows_per_block - 1) // rows_per_block, target_grid)
 
     fp4_output = torch.empty(m, k // 2, dtype=torch.uint8, device=input.device)
     scale_output = torch.empty(

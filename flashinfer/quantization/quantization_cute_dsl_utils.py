@@ -141,9 +141,13 @@ def bfloat2_hmax_reduce_to_f32(x: Uint32, *, loc=None, ip=None) -> Float32:
 @dsl_user_op
 def float_to_ue8m0_fast(value: Float32, *, loc=None, ip=None) -> Uint32:
     """
-    Convert float to UE8M0 format using fast log2 approximation.
+    Convert float to UE8M0 format using exact IEEE 754 bit manipulation.
 
-    UE8M0 = ceil(log2(value)) + 127, clamped to [0, 255]
+    Matches the hardware __nv_cvt_float_to_e8m0(value, __NV_SATFINITE, cudaRoundPosInf):
+    - Extract biased exponent from IEEE 754 float
+    - If mantissa is nonzero, add 1 (round towards +inf / ceil behavior)
+    - Clamp to [0, 254] (255 = NaN in E8M0)
+    - Return 0 for zero/negative input
     """
     return Uint32(
         llvm.inline_asm(
@@ -151,19 +155,23 @@ def float_to_ue8m0_fast(value: Float32, *, loc=None, ip=None) -> Uint32:
             [Float32(value).ir_value(loc=loc, ip=ip)],
             """
             {
-                .reg .pred p_zero, p_neg, p_ovf;
-                .reg .f32 log2_val;
-                .reg .s32 exp_int, result;
+                .reg .pred p_zero, p_has_mant, p_ovf;
+                .reg .u32 bits, exp_biased, mantissa, bump, result;
 
                 setp.le.f32 p_zero, $1, 0f00000000;
-                lg2.approx.f32 log2_val, $1;
-                cvt.rpi.s32.f32 exp_int, log2_val;
-                add.s32 result, exp_int, 127;
-                setp.lt.s32 p_neg, result, 0;
-                setp.gt.s32 p_ovf, result, 255;
-                selp.s32 result, 0, result, p_neg;
-                selp.s32 result, 255, result, p_ovf;
-                selp.s32 $0, 0, result, p_zero;
+
+                mov.b32 bits, $1;
+                shr.b32 exp_biased, bits, 23;
+                and.b32 exp_biased, exp_biased, 255;
+                and.b32 mantissa, bits, 0x7FFFFF;
+
+                setp.ne.u32 p_has_mant, mantissa, 0;
+                selp.u32 bump, 1, 0, p_has_mant;
+                add.u32 result, exp_biased, bump;
+
+                setp.gt.u32 p_ovf, result, 254;
+                selp.u32 result, 254, result, p_ovf;
+                selp.u32 $0, 0, result, p_zero;
             }
             """,
             "=r,f",
@@ -739,7 +747,12 @@ def process_mxfp4_block_half(row_tensor, elem_base: Int32) -> tuple:
     """
     from cutlass import Uint8
 
-    from ..cute_dsl.fp4_common import get_ptr_as_int64, hmax2, ld_global_v4_u32
+    from ..cute_dsl.fp4_common import (
+        get_ptr_as_int64,
+        hmax2,
+        ld_global_v4_u32,
+        rcp_approx_ftz,
+    )
 
     # Load 32 elements (4 x 128-bit = 16 half2 values)
     ptr0 = get_ptr_as_int64(row_tensor, elem_base)
@@ -758,9 +771,8 @@ def process_mxfp4_block_half(row_tensor, elem_base: Int32) -> tuple:
     block_max_h2 = hmax2(max_first, max_second)
     block_max = hmax_reduce_to_f32(block_max_h2)
 
-    # Compute UE8M0 scale factor
-    inv_e2m1_max = Float32(INV_FLOAT4_E2M1_MAX)
-    normalized_max = block_max * inv_e2m1_max
+    # Compute UE8M0 scale factor (rcp_approx matches CUDA's rcp.approx.ftz(6.0f))
+    normalized_max = block_max * rcp_approx_ftz(Float32(6.0))
     scale_ue8m0_u32 = float_to_ue8m0_fast(normalized_max)
     scale_ue8m0_u8 = scale_ue8m0_u32.to(Uint8)
 
@@ -809,7 +821,12 @@ def process_mxfp4_block_bfloat(row_tensor, elem_base: Int32) -> tuple:
     """
     from cutlass import Uint8
 
-    from ..cute_dsl.fp4_common import bfloat2_hmax2, get_ptr_as_int64, ld_global_v4_u32
+    from ..cute_dsl.fp4_common import (
+        bfloat2_hmax2,
+        get_ptr_as_int64,
+        ld_global_v4_u32,
+        rcp_approx_ftz,
+    )
 
     # Load 32 elements (4 x 128-bit = 16 bfloat2 values)
     ptr0 = get_ptr_as_int64(row_tensor, elem_base)
@@ -828,9 +845,8 @@ def process_mxfp4_block_bfloat(row_tensor, elem_base: Int32) -> tuple:
     block_max_h2 = bfloat2_hmax2(max_first, max_second)
     block_max = bfloat2_hmax_reduce_to_f32(block_max_h2)
 
-    # Compute UE8M0 scale factor
-    inv_e2m1_max = Float32(INV_FLOAT4_E2M1_MAX)
-    normalized_max = block_max * inv_e2m1_max
+    # Compute UE8M0 scale factor (rcp_approx matches CUDA's rcp.approx.ftz(6.0f))
+    normalized_max = block_max * rcp_approx_ftz(Float32(6.0))
     scale_ue8m0_u32 = float_to_ue8m0_fast(normalized_max)
     scale_ue8m0_u8 = scale_ue8m0_u32.to(Uint8)
 
@@ -1105,9 +1121,9 @@ def process_nvfp4_block_half(
 
     from ..cute_dsl.fp4_common import (
         cvt_f32_to_e4m3,
-        fp8_e4m3_to_f32_and_rcp,
         get_ptr_as_int64,
         ld_global_v4_u32,
+        nvfp4_compute_output_scale,
         rcp_approx_ftz,
     )
 
@@ -1128,9 +1144,8 @@ def process_nvfp4_block_half(
     scale_fp8_u32 = cvt_f32_to_e4m3(scale_float)
     scale_fp8 = Uint8(scale_fp8_u32 & Uint32(0xFF))
 
-    # Back-convert E4M3 to float and compute output_scale = global_scale / scale_back
-    inv_scale_back = fp8_e4m3_to_f32_and_rcp(scale_fp8_u32)
-    output_scale = global_scale * inv_scale_back
+    # output_scale = rcp(float(E4M3(scale)) * rcp(global_scale)), matching CUDA
+    output_scale = nvfp4_compute_output_scale(scale_fp8_u32, global_scale)
 
     # Convert to E2M1 and pack
     packed64 = half2x8_to_e2m1x16_packed(h0, h1, h2, h3, h4, h5, h6, h7, output_scale)
@@ -1162,9 +1177,9 @@ def process_nvfp4_block_bfloat(
 
     from ..cute_dsl.fp4_common import (
         cvt_f32_to_e4m3,
-        fp8_e4m3_to_f32_and_rcp,
         get_ptr_as_int64,
         ld_global_v4_u32,
+        nvfp4_compute_output_scale,
         rcp_approx_ftz,
     )
 
@@ -1185,12 +1200,180 @@ def process_nvfp4_block_bfloat(
     scale_fp8_u32 = cvt_f32_to_e4m3(scale_float)
     scale_fp8 = Uint8(scale_fp8_u32 & Uint32(0xFF))
 
-    # Back-convert E4M3 to float and compute output_scale = global_scale / scale_back
-    inv_scale_back = fp8_e4m3_to_f32_and_rcp(scale_fp8_u32)
-    output_scale = global_scale * inv_scale_back
+    # output_scale = rcp(float(E4M3(scale)) * rcp(global_scale)), matching CUDA
+    output_scale = nvfp4_compute_output_scale(scale_fp8_u32, global_scale)
 
     # Convert to E2M1 and pack
     packed64 = bfloat2x8_to_e2m1x16_packed(h0, h1, h2, h3, h4, h5, h6, h7, output_scale)
+
+    return scale_fp8, packed64
+
+
+@cute.jit
+def fp8x16_to_e2m1x16_packed(
+    w0: Uint32,
+    w1: Uint32,
+    w2: Uint32,
+    w3: Uint32,
+    output_scale: Float32,
+) -> Uint64:
+    """Convert 16 packed FP8 E4M3 values (4 x uint32) to 16 E2M1 values packed as Uint64.
+
+    Each uint32 contains 4 E4M3 bytes. Output is 16 E2M1 nibbles packed into 8 bytes.
+    """
+    from ..cute_dsl.fp4_common import cvt_e4m3x4_to_f32x4
+
+    f0, f1, f2, f3 = cvt_e4m3x4_to_f32x4(w0)
+    f4, f5, f6, f7 = cvt_e4m3x4_to_f32x4(w1)
+    f8, f9, f10, f11 = cvt_e4m3x4_to_f32x4(w2)
+    f12, f13, f14, f15 = cvt_e4m3x4_to_f32x4(w3)
+
+    s0 = f0 * output_scale
+    s1 = f1 * output_scale
+    s2 = f2 * output_scale
+    s3 = f3 * output_scale
+    s4 = f4 * output_scale
+    s5 = f5 * output_scale
+    s6 = f6 * output_scale
+    s7 = f7 * output_scale
+    s8 = f8 * output_scale
+    s9 = f9 * output_scale
+    s10 = f10 * output_scale
+    s11 = f11 * output_scale
+    s12 = f12 * output_scale
+    s13 = f13 * output_scale
+    s14 = f14 * output_scale
+    s15 = f15 * output_scale
+
+    packed_lo = cvt_e2m1x8_f32(s0, s1, s2, s3, s4, s5, s6, s7)
+    packed_hi = cvt_e2m1x8_f32(s8, s9, s10, s11, s12, s13, s14, s15)
+
+    return (Uint64(packed_hi) << Uint64(32)) | Uint64(packed_lo)
+
+
+@cute.jit
+def fp8_max_abs_16(w0: Uint32, w1: Uint32, w2: Uint32, w3: Uint32) -> Float32:
+    """Compute max absolute value across 16 FP8 E4M3 values (4 x uint32).
+
+    Converts all 16 values to float32, takes abs, and reduces to a single max.
+    """
+    from ..cute_dsl.fp4_common import cvt_e4m3x4_to_f32x4
+
+    f0, f1, f2, f3 = cvt_e4m3x4_to_f32x4(w0)
+    f4, f5, f6, f7 = cvt_e4m3x4_to_f32x4(w1)
+    f8, f9, f10, f11 = cvt_e4m3x4_to_f32x4(w2)
+    f12, f13, f14, f15 = cvt_e4m3x4_to_f32x4(w3)
+
+    from ..cute_dsl.fp4_common import fabs_f32, fmax_f32
+
+    a0 = fabs_f32(f0)
+    a1 = fabs_f32(f1)
+    a2 = fabs_f32(f2)
+    a3 = fabs_f32(f3)
+    a4 = fabs_f32(f4)
+    a5 = fabs_f32(f5)
+    a6 = fabs_f32(f6)
+    a7 = fabs_f32(f7)
+    a8 = fabs_f32(f8)
+    a9 = fabs_f32(f9)
+    a10 = fabs_f32(f10)
+    a11 = fabs_f32(f11)
+    a12 = fabs_f32(f12)
+    a13 = fabs_f32(f13)
+    a14 = fabs_f32(f14)
+    a15 = fabs_f32(f15)
+
+    m01 = fmax_f32(a0, a1)
+    m23 = fmax_f32(a2, a3)
+    m45 = fmax_f32(a4, a5)
+    m67 = fmax_f32(a6, a7)
+    m89 = fmax_f32(a8, a9)
+    m1011 = fmax_f32(a10, a11)
+    m1213 = fmax_f32(a12, a13)
+    m1415 = fmax_f32(a14, a15)
+
+    m0123 = fmax_f32(m01, m23)
+    m4567 = fmax_f32(m45, m67)
+    m891011 = fmax_f32(m89, m1011)
+    m12131415 = fmax_f32(m1213, m1415)
+
+    m_lo = fmax_f32(m0123, m4567)
+    m_hi = fmax_f32(m891011, m12131415)
+
+    return fmax_f32(m_lo, m_hi)
+
+
+@cute.jit
+def process_nvfp4_block_fp8(
+    row_tensor, elem_base: Int32, global_scale: Float32
+) -> tuple:
+    """
+    Process a 16-element NVFP4 block for FP8 E4M3 input.
+
+    Matches the CUDA cvt_warp_fp8_to_fp4 behavior: FP8 values are first converted
+    to float32, pre-scaled by 6/global_scale, and converted to half2. From there,
+    the standard half2 pipeline is used for max-abs reduction, scale factor
+    computation, and E2M1 conversion.
+
+    Args:
+        row_tensor: Row tensor slice (mInput[row_idx, None])
+        elem_base: Starting element index
+        global_scale: User-provided global scale factor
+
+    Returns:
+        (scale_e4m3_u8, packed64):
+        - scale_e4m3_u8: E4M3 scale factor as Uint8
+        - packed64: Uint64 containing 16 E2M1 values
+    """
+    from cutlass import Uint8
+
+    from ..cute_dsl.fp4_common import (
+        cvt_e4m3x4_to_f32x4,
+        cvt_f32_to_e4m3,
+        cvt_f32x2_to_half2,
+        get_ptr_as_int64,
+        ld_global_v4_u32,
+        nvfp4_compute_output_scale,
+        rcp_approx_ftz,
+    )
+
+    # Load 16 FP8 elements (1 x 128-bit = 4 x uint32 = 16 bytes)
+    ptr = get_ptr_as_int64(row_tensor, elem_base)
+    w0, w1, w2, w3 = ld_global_v4_u32(ptr)
+
+    # Convert FP8 to float32 and pre-scale by 6/global_scale (matching CUDA)
+    prescale = Float32(6.0) * rcp_approx_ftz(global_scale)
+
+    f0, f1, f2, f3 = cvt_e4m3x4_to_f32x4(w0)
+    f4, f5, f6, f7 = cvt_e4m3x4_to_f32x4(w1)
+    f8, f9, f10, f11 = cvt_e4m3x4_to_f32x4(w2)
+    f12, f13, f14, f15 = cvt_e4m3x4_to_f32x4(w3)
+
+    # Pack pre-scaled float pairs into half2 (matching __float22half2_rn in CUDA)
+    h0 = cvt_f32x2_to_half2(f0 * prescale, f1 * prescale)
+    h1 = cvt_f32x2_to_half2(f2 * prescale, f3 * prescale)
+    h2 = cvt_f32x2_to_half2(f4 * prescale, f5 * prescale)
+    h3 = cvt_f32x2_to_half2(f6 * prescale, f7 * prescale)
+    h4 = cvt_f32x2_to_half2(f8 * prescale, f9 * prescale)
+    h5 = cvt_f32x2_to_half2(f10 * prescale, f11 * prescale)
+    h6 = cvt_f32x2_to_half2(f12 * prescale, f13 * prescale)
+    h7 = cvt_f32x2_to_half2(f14 * prescale, f15 * prescale)
+
+    # From here, use the same half2 pipeline as process_nvfp4_block_half
+    block_max_h2 = half2_max_abs_8(h0, h1, h2, h3, h4, h5, h6, h7)
+    block_max = hmax_reduce_to_f32(block_max_h2)
+
+    # E4M3 scale factor computation
+    fp4_max_rcp = rcp_approx_ftz(Float32(6.0))
+    scale_float = global_scale * (block_max * fp4_max_rcp)
+    scale_fp8_u32 = cvt_f32_to_e4m3(scale_float)
+    scale_fp8 = Uint8(scale_fp8_u32 & Uint32(0xFF))
+
+    # output_scale = rcp(float(E4M3(scale)) * rcp(global_scale)), matching CUDA
+    output_scale = nvfp4_compute_output_scale(scale_fp8_u32, global_scale)
+
+    # Convert pre-scaled half2 values to E2M1 and pack
+    packed64 = half2x8_to_e2m1x16_packed(h0, h1, h2, h3, h4, h5, h6, h7, output_scale)
 
     return scale_fp8, packed64
 
@@ -1242,4 +1425,8 @@ __all__ = [
     "bfloat2x8_to_e2m1x16_packed",
     "process_nvfp4_block_half",
     "process_nvfp4_block_bfloat",
+    # High-level helper functions (NVFP4 - FP8 input)
+    "fp8x16_to_e2m1x16_packed",
+    "fp8_max_abs_16",
+    "process_nvfp4_block_fp8",
 ]
