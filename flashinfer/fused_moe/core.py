@@ -1299,11 +1299,7 @@ def get_trtllm_moe_sm100_module():
                 num_local_experts,
                 tune_max_num_tokens,
             )
-            bucket_mapper = make_trtllm_moe_bucket_mapper(
-                top_k,
-                num_local_experts,
-                tune_max_num_tokens,
-            )
+            bucket_mapper = make_trtllm_moe_bucket_mapper(buckets)
             cls.tuning_config_with_hidden_states_scales = TuningConfig(
                 dynamic_tensor_specs=(
                     DynamicTensorSpec(

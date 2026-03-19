@@ -1,3 +1,4 @@
+import bisect
 import contextlib
 import math
 import threading
@@ -258,21 +259,17 @@ def get_trtllm_moe_num_tokens_buckets(
     return tuple(sorted(set(tile_reps + above + below)))
 
 
-def make_trtllm_moe_bucket_mapper(
-    top_k: int,
-    num_local_experts: int,
-    tune_max_num_tokens: int,
-):
-    """Create a map_to_tuning_buckets function aligned with C++ computeSelectedTileN."""
-    import bisect
+def make_trtllm_moe_bucket_mapper(buckets: Tuple[int, ...]):
+    """Create a map_to_tuning_buckets function aligned with C++ computeSelectedTileN.
 
-    buckets = get_trtllm_moe_num_tokens_buckets(
-        top_k, num_local_experts, tune_max_num_tokens
-    )
+    Accepts the pre-computed bucket tuple from get_trtllm_moe_num_tokens_buckets.
+    Uses bisect to find the largest bucket <= num_tokens.
+    """
+    sorted_buckets = tuple(sorted(buckets))
 
     def _map(num_tokens: int) -> int:
-        idx = bisect.bisect_right(buckets, num_tokens) - 1
-        return buckets[max(0, idx)]
+        idx = bisect.bisect_right(sorted_buckets, num_tokens) - 1
+        return sorted_buckets[max(0, idx)]
 
     return _map
 
