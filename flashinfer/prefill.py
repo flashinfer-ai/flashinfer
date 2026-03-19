@@ -93,6 +93,7 @@ from .utils import (
     TensorLayout,
     _check_block_tables_shape,
     _check_cached_qkv_data_type,
+    _validate_fixed_cta_tile_q,
     _check_kv_layout,
     _check_pos_encoding_mode,
     _check_workspace_buffer_alignment,
@@ -3804,16 +3805,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         paged_kv_last_page_len = paged_kv_last_page_len.contiguous()
         if seq_lens is not None:
             seq_lens = seq_lens.contiguous()
-        if fixed_cta_tile_q is None:
-            fixed_cta_tile_q = -1
-        elif fixed_cta_tile_q not in (16, 64, 128):
-            raise ValueError(
-                f"fixed_cta_tile_q should be one of {{16, 64, 128}}, got {fixed_cta_tile_q}"
-            )
-        elif fixed_cta_tile_q == 128 and head_dim_vo >= 256:
-            raise ValueError(
-                f"fixed_cta_tile_q=128 is not supported with head_dim={head_dim_vo} (requires head_dim < 256)"
-            )
+        fixed_cta_tile_q = _validate_fixed_cta_tile_q(fixed_cta_tile_q, head_dim_vo)
 
         batch_size = len(qo_indptr) - 1
         self._batch_size = batch_size
@@ -5903,16 +5895,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             head_dim_vo = head_dim_qk
         if fixed_split_size is None:
             fixed_split_size = -1
-        if fixed_cta_tile_q is None:
-            fixed_cta_tile_q = -1
-        elif fixed_cta_tile_q not in (16, 64, 128):
-            raise ValueError(
-                f"fixed_cta_tile_q should be one of {{16, 64, 128}}, got {fixed_cta_tile_q}"
-            )
-        elif fixed_cta_tile_q == 128 and head_dim_vo >= 256:
-            raise ValueError(
-                f"fixed_cta_tile_q=128 is not supported with head_dim={head_dim_vo} (requires head_dim < 256)"
-            )
+        fixed_cta_tile_q = _validate_fixed_cta_tile_q(fixed_cta_tile_q, head_dim_vo)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
         self._head_dim_qk = head_dim_qk
