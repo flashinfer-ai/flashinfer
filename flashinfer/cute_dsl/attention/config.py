@@ -39,8 +39,9 @@ class HeadMapping(enum.Enum):
 class TileBounds:
     """Handles partial MMA tile filling when logical data < physical tile size.
 
-    Most critical for decode where num_heads < 128 (the MMA M-tile width).
-    Compiles away via cutlass.const_expr when no masking is needed.
+    Reserved for decode — unused by prefill. Most critical for decode where
+    num_heads < 128 (the MMA M-tile width). Compiles away via
+    cutlass.const_expr when no masking is needed.
     """
 
     m_bound: int | None = None
@@ -71,10 +72,41 @@ class AttentionConfig:
     num_repeat_kv_heads: int = 1
     window_left: int = -1
 
-    # Future extensions for decode
+    # Reserved for decode — unused by prefill. Decode kernels pack heads into
+    # MMA M/N dimensions; prefill maps heads via the grid (HeadMapping.GRID).
     head_mapping: HeadMapping = HeadMapping.GRID
     num_heads: int = 0
     num_kv_heads: int = 0
+
+    SUPPORTED_MMA_TILE_MN = (128, 128)
+    MMA_K_GRANULARITY = {16: 16, 8: 32}  # {dtype_width_bits: K-tile element granularity}
+
+    def can_implement(self, dtype_width: int = 16) -> None:
+        """Validate that this config is implementable on Blackwell SM100.
+
+        Checks hardware-level constraints that are independent of the target GPU's
+        SMEM capacity. SMEM overruns are caught at kernel launch time by CUDA.
+
+        :param dtype_width: Bit width of the input element type (16 for fp16/bf16, 8 for fp8).
+        :raises ValueError: If validation fails, with a descriptive message.
+        """
+        mma_mn = self.mma_tiler[:2]
+        if mma_mn != self.SUPPORTED_MMA_TILE_MN:
+            raise ValueError(
+                f"mma_tiler_mn={mma_mn} is not supported. "
+                f"Must be {self.SUPPORTED_MMA_TILE_MN} for Blackwell SM100 tcgen05"
+            )
+        head_dim = self.mma_tiler[2]
+        k_gran = self.MMA_K_GRANULARITY.get(dtype_width, 16)
+        if head_dim == 0 or head_dim % k_gran != 0:
+            raise ValueError(
+                f"head_dim={head_dim} must be a positive multiple of {k_gran} "
+                f"(MMA K-dimension granularity for {dtype_width}-bit dtype)"
+            )
+        if self.num_repeat_kv_heads < 1:
+            raise ValueError(
+                f"num_repeat_kv_heads={self.num_repeat_kv_heads} must be >= 1"
+            )
 
     @property
     def cta_tiler(self) -> Tuple[int, int, int]:

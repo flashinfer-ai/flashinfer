@@ -13,7 +13,7 @@ Sm100FmhaFwdMainloopTmaWarpspecialized), this bundles:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict
 
 from .config import AttentionConfig
@@ -48,24 +48,26 @@ class MainloopSpec:
     epi_stage: int = 2
     buffer_align_bytes: int = 1024
 
-    def resolve(self, dtype_width: int) -> None:
-        """Resolve dtype-dependent stage counts.
+    def resolve(self, dtype_width: int) -> MainloopSpec:
+        """Return a new MainloopSpec with dtype-dependent stage counts resolved.
 
         Called after input dtype is known (inside __call__) but before
-        SharedStorage or pipeline creation.
+        SharedStorage or pipeline creation. The original spec is not modified.
 
         :param dtype_width: Bit width of the input element type.
+        :returns: A new MainloopSpec with resolved kv_stages and pipeline_topology.
         """
-        self.kv_stages = 4 if dtype_width == 8 else 3
-        self.pipeline_topology = make_prefill_topology(
+        kv_stages = 4 if dtype_width == 8 else 3
+        topology = make_prefill_topology(
             self.warp_schedule,
             q_stages=self.q_stages,
-            kv_stages=self.kv_stages,
+            kv_stages=kv_stages,
             mma_softmax_stages=self.mma_softmax_stage,
             softmax_corr_stages=self.softmax_corr_stage,
             mma_corr_stages=self.mma_corr_stage,
             epi_stages=self.epi_stage,
         )
+        return replace(self, kv_stages=kv_stages, pipeline_topology=topology)
 
     def barrier_stage_counts(self) -> Dict[str, int]:
         """Return {edge_name: barrier_slot_count} for SharedStorage definition.

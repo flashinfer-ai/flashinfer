@@ -81,6 +81,8 @@ class BatchPrefillCuteDSLWrapper:
             variant = StandardAttention()
         self._variant = variant
 
+        self._q_data_type = q_data_type
+
         # Set data types based on input parameters
         if q_data_type == torch.bfloat16:
             self._in_dtype = cutlass.BFloat16
@@ -121,6 +123,9 @@ class BatchPrefillCuteDSLWrapper:
         self._o_padding = o_padding[1]
         self._kv_padding = 0
 
+        # CuTe DSL tracing: cute.compile() traces the kernel with concrete CuTe
+        # tensors to infer types, layouts, and TMA descriptors. These dummy tensors
+        # are allocated on GPU solely for tracing and are not used at run() time.
         q_ref, q_cute, q_torch = create_and_pad_tensor(
             qo_shape,
             (0, 0, 0, 0, 0),
@@ -186,6 +191,8 @@ class BatchPrefillCuteDSLWrapper:
             num_repeat_kv_heads=h_r,
             window_left=window_left,
         )
+        _torch_dtype_width = {torch.float16: 16, torch.bfloat16: 16, torch.float8_e4m3fn: 8}
+        config.can_implement(dtype_width=_torch_dtype_width[q_data_type])
         fusion = AttentionFusion(variant=self._variant)
         fmha = BlackwellFusedMultiHeadAttentionForward(config, fusion)
 
@@ -236,6 +243,47 @@ class BatchPrefillCuteDSLWrapper:
 
         self._compiled_fmha = compiled_fmha
 
+    def _validate_run_inputs(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        out: Optional[torch.Tensor],
+    ) -> None:
+        """Check that run() inputs are consistent with the plan() configuration."""
+        for name, tensor in [("q", q), ("k", k), ("v", v)]:
+            if tensor.dtype != self._q_data_type:
+                raise ValueError(
+                    f"{name}.dtype={tensor.dtype} does not match the planned "
+                    f"q_data_type={self._q_data_type}"
+                )
+            if tensor.device != self._device:
+                raise ValueError(
+                    f"{name}.device={tensor.device} does not match the planned "
+                    f"device={self._device}"
+                )
+        if q.shape[-1] != self._head_dim:
+            raise ValueError(
+                f"q.shape[-1]={q.shape[-1]} does not match the planned "
+                f"head_dim={self._head_dim}"
+            )
+        if q.shape[-2] != self._num_qo_heads:
+            raise ValueError(
+                f"q.shape[-2]={q.shape[-2]} does not match the planned "
+                f"num_qo_heads={self._num_qo_heads}"
+            )
+        if k.shape[-2] != self._num_kv_heads:
+            raise ValueError(
+                f"k.shape[-2]={k.shape[-2]} does not match the planned "
+                f"num_kv_heads={self._num_kv_heads}"
+            )
+        if out is not None:
+            if out.device != self._device:
+                raise ValueError(
+                    f"out.device={out.device} does not match the planned "
+                    f"device={self._device}"
+                )
+
     def run(
         self,
         q: torch.Tensor,
@@ -264,6 +312,8 @@ class BatchPrefillCuteDSLWrapper:
 
         if self._compiled_fmha is None:
             raise RuntimeError("Plan the prefill attention computation first!")
+
+        self._validate_run_inputs(q, k, v, out)
 
         if out is None:
             out = torch.empty_like(q, device=q.device)

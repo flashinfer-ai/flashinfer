@@ -196,6 +196,9 @@ def make_prefill_topology(
                      producer_warp_ids=corr, consumer_warp_ids=epi),
         PipelineEdge("mma_corr", PipelineType.UMMA_ASYNC, stages=mma_corr_stages,
                      producer_warp_ids=mma, consumer_warp_ids=corr),
+        # Softmax1 must wait for softmax0's row-max update before processing
+        # its KV tile — online softmax requires sequential row-max propagation
+        # between the two softmax warpgroups.
         PipelineEdge("s0_s1_sequence", PipelineType.ASYNC, stages=1,
                      producer_warp_ids=s0, consumer_warp_ids=s1),
     ])

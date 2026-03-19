@@ -89,10 +89,12 @@ To collect performance with NCU profiler:
       --is_persistent --warmup_iterations 10                              \
       --iterations 10 --skip_ref_check
 
-Constraints for this example:
-* Supported head dimensions: 32, 64, and 128
+Constraints:
+* head_dim must be a multiple of 16 (fp16/bf16) or 32 (fp8)
+* head_dim is further limited by shared memory capacity (head_dim <= 128 with
+  mma_tiler_mn=(128,128) on SM100; larger values require different tile configs)
 * Number of heads in Q must be divisible by number of heads in K
-* mma_tiler_mn must be 128,128
+* mma_tiler_mn must be (128, 128)
 * Batch size must be the same for Q, K, and V tensors
 * For causal masking, use --is_causal (note: specify without =True/False)
 * For persistent scheduling, use --is_persistent (note: specify without =True/False)
@@ -229,7 +231,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.k_dtype}")
         if cutlass.const_expr(self.q_dtype != self.v_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
-        self.mainloop.resolve(self.q_dtype.width)
+        self.mainloop = self.mainloop.resolve(self.q_dtype.width)
 
         self.softmax_role = SoftmaxRole(
             self.config, self.fusion, self.tmem,
@@ -258,6 +260,17 @@ class BlackwellFusedMultiHeadAttentionForward:
             self.q_major_mode, self.k_major_mode, self.v_major_mode, self.o_layout,
         )
         self.shared_storage = lp.SharedStorage
+
+        smem_bytes = lp.SharedStorage.size_in_bytes()
+        smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+        if cutlass.const_expr(smem_bytes > smem_capacity):
+            head_dim = self.config.mma_tiler[2]
+            raise ValueError(
+                f"SharedStorage requires {smem_bytes} bytes but SM100 provides "
+                f"{smem_capacity} bytes. Reduce head_dim (currently {head_dim}) "
+                f"or tile size."
+            )
+
         self.tma_copy_q_bytes = lp.tma_copy_q_bytes
         self.tma_copy_kv_bytes = lp.tma_copy_kv_bytes
 
