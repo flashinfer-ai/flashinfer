@@ -53,12 +53,12 @@ def get_mxfp8_quantization_sm100_module():
                 out_sf_size = _compute_swizzled_layout_sf_size(
                     input.shape[0], input.shape[1] // 32, 128
                 )
-            elif sf_swizzle_layout == SfLayout.layout_8x4:
-                out_sf_size = _compute_swizzled_layout_sf_size(
-                    input.shape[0], input.shape[1] // 32, 8
-                )
             elif sf_swizzle_layout == SfLayout.layout_linear:
                 out_sf_size = input.numel() // 32
+            elif sf_swizzle_layout == SfLayout.layout_8x4:
+                raise ValueError(
+                    f"{sf_swizzle_layout} is not supported for mxfp8 quantization on CPU."
+                )
             else:
                 raise ValueError(
                     f"Invalid sf_swizzle_layout value: {sf_swizzle_layout}"
@@ -68,7 +68,7 @@ def get_mxfp8_quantization_sm100_module():
                 input,
                 out_val,
                 out_sf,
-                sf_swizzle_layout,
+                sf_swizzle_layout.value,
             )
             return out_val, out_sf
         else:
@@ -97,7 +97,7 @@ def get_mxfp8_quantization_sm100_module():
                 input,
                 out_val,
                 out_sf,
-                sf_swizzle_layout,
+                sf_swizzle_layout.value,
                 alignment,
                 enable_pdl,
             )
@@ -139,7 +139,7 @@ def get_mxfp8_quantization_sm100_module():
             input,
             scale_tensor,
             out,
-            sf_swizzle_layout,
+            sf_swizzle_layout.value,
         )
         return out
 
@@ -244,7 +244,8 @@ def mxfp8_quantize(
 def mxfp8_dequantize_host(
     input: torch.Tensor,
     scale_tensor: torch.Tensor,
-    sf_swizzle_layout: SfLayout = SfLayout.layout_linear,
+    is_sf_swizzled_layout: bool = True,
+    sf_swizzle_layout: Optional[SfLayout] = None,
 ) -> torch.Tensor:
     """Dequantize input tensor from MxFP8 format.
 
@@ -254,13 +255,20 @@ def mxfp8_dequantize_host(
     Args:
         input (torch.Tensor): Packed FP8 tensor in MxFP8 format of shape [M, K] with dtype FLOAT8_E4M3.
         scale_tensor (torch.Tensor): Scale factors tensor with shape determined by layout and sf_vec_size.
-        sf_swizzle_layout (int, optional): Swizzle layout for scale factors. Defaults to SfLayout.layout_linear.value.
+        is_sf_swizzled_layout (bool, optional): Whether to use swizzled layout for scale factors. Defaults to True.
+        sf_swizzle_layout (Optional[SfLayout], optional): Swizzle layout for scale factors.
+            If provided,it overrides is_sf_swizzled_layout. Defaults to None.
+            Available options are 1. SfLayout.layout_128x4; 2. SfLayout.layout_linear.
 
     Returns:
         torch.Tensor: Dequantized float tensor of shape [M, K] with dtype float32.
 
     """
 
+    if sf_swizzle_layout is None:
+        sf_swizzle_layout = (
+            SfLayout.layout_128x4 if is_sf_swizzled_layout else SfLayout.layout_linear
+        )
     return get_mxfp8_quantization_sm100_module().mxfp8_dequantize_host_sm100(
         input,
         scale_tensor,
