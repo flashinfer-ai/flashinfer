@@ -418,7 +418,12 @@ class BlockSparseAttentionWrapper:
             )
 
             kv_lens_arr_host = (kv_indptr_host[1:] - kv_indptr_host[:-1]) * self.C
-            self._kv_lens_buffer[: len(kv_lens_arr_host)].copy_(
+            required_size = len(kv_lens_arr_host)
+            if required_size > self._kv_lens_buffer.shape[0]:
+                self._kv_lens_buffer = torch.empty(
+                    (required_size,), dtype=torch.int32, device=self.device
+                )
+            self._kv_lens_buffer[:required_size].copy_(
                 kv_lens_arr_host,
             )
 
@@ -961,7 +966,12 @@ class VariableBlockSparseAttentionWrapper:
         self._cached_module = get_batch_prefill_module(self._backend, *get_module_args)
 
         kv_lens_arr_host = kv_indptr_host[1:] - kv_indptr_host[:-1]  # page_size == 1
-        self._kv_lens_buffer[: len(kv_lens_arr_host)].copy_(
+        required_size = len(kv_lens_arr_host)
+        if required_size > self._kv_lens_buffer.shape[0]:
+            self._kv_lens_buffer = torch.empty(
+                (required_size,), dtype=torch.int32, device=self.device
+            )
+        self._kv_lens_buffer[:required_size].copy_(
             kv_lens_arr_host,
         )
 

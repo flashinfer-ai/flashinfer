@@ -92,7 +92,6 @@ def gen_gemm_sm100_module_cutlass_fp4() -> JitSpec:
             "-DENABLE_BF16",
             "-DENABLE_FP4",
             "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
-            "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
         ],
         extra_cflags=[
             "-DFAST_BUILD",
@@ -161,7 +160,6 @@ def gen_gemm_sm103_module_cutlass_fp4() -> JitSpec:
             "-DENABLE_BF16",
             "-DENABLE_FP4",
             "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
-            "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
         ],
         extra_cflags=[
             "-DFAST_BUILD",
@@ -211,7 +209,6 @@ def gen_gemm_sm120_module_cutlass_fp4() -> JitSpec:
             "-DENABLE_BF16",
             "-DENABLE_FP4",
             "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
-            "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
         ],
         extra_cflags=[
             "-DFAST_BUILD",
@@ -263,7 +260,6 @@ def gen_gemm_sm100_module_cutlass_fp8() -> JitSpec:
         + [
             "-DENABLE_BF16",
             "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
-            "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
         ],
         extra_cflags=[
             "-DFAST_BUILD",
@@ -280,7 +276,7 @@ def gen_gemm_sm100_module_cutlass_bf16() -> JitSpec:
 
     with open(jit_env.FLASHINFER_CSRC_DIR / "bf16_gemm_cutlass.jinja") as f:
         kernel_inst_templ = jinja2.Template(f.read())
-        dtype_list = ["__nv_bfloat16", "half"]
+        dtype_list = ["__nv_bfloat16", "half", "float"]
         cta_m_n_k_list = [
             (64, 64, 128),
             (64, 128, 128),
@@ -358,7 +354,6 @@ def gen_gemm_sm100_module_cutlass_mxfp8() -> JitSpec:
         + [
             "-DENABLE_BF16",
             "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
-            "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
         ],
         extra_cflags=[
             "-DFAST_BUILD",
@@ -441,7 +436,10 @@ def gen_gemm_sm100_module() -> JitSpec:
     return gen_jit_spec(
         "gemm_sm100",
         source_paths,
-        extra_cuda_cflags=nvcc_flags,
+        extra_cuda_cflags=nvcc_flags
+        + [
+            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
+        ],
     )
 
 
@@ -529,7 +527,6 @@ def gen_gemm_sm120_module() -> JitSpec:
         extra_cuda_cflags=nvcc_flags
         + [
             "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
-            "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
         ],
     )
 

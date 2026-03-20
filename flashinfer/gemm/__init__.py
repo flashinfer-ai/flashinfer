@@ -18,6 +18,17 @@ from .gemm_base import gemm_fp8_nt_blockscaled as gemm_fp8_nt_blockscaled
 from .gemm_base import gemm_fp8_nt_groupwise as gemm_fp8_nt_groupwise
 from .gemm_base import group_gemm_fp8_nt_groupwise as group_gemm_fp8_nt_groupwise
 from .gemm_base import fp8_blockscale_gemm_sm90 as fp8_blockscale_gemm_sm90
+from .gemm_base import (
+    is_cudnn_override_shape_available as is_cudnn_override_shape_available,
+    build_cudnn_gemm_bf16_graph_override_shape as build_cudnn_gemm_bf16_graph_override_shape,
+    execute_cudnn_gemm_bf16_graph_override_shape as execute_cudnn_gemm_bf16_graph_override_shape,
+    build_cudnn_fp4_gemm_graph_override_shape as build_cudnn_fp4_gemm_graph_override_shape,
+    execute_cudnn_fp4_gemm_graph_override_shape as execute_cudnn_fp4_gemm_graph_override_shape,
+    build_cudnn_mxfp8_gemm_graph_override_shape as build_cudnn_mxfp8_gemm_graph_override_shape,
+    execute_cudnn_mxfp8_gemm_graph_override_shape as execute_cudnn_mxfp8_gemm_graph_override_shape,
+    build_cudnn_gemm_with_per_tensor_q_graph_override_shape as build_cudnn_gemm_with_per_tensor_q_graph_override_shape,
+    execute_cudnn_gemm_with_per_tensor_q_graph_override_shape as execute_cudnn_gemm_with_per_tensor_q_graph_override_shape,
+)
 
 from .routergemm import (
     mm_M1_16_K7168_N128 as mm_M1_16_K7168_N128,
@@ -65,4 +76,13 @@ __all__ = [
     "mm_M1_16_K7168_N128",
     "mm_M1_16_K7168_N256",
     "tinygemm_bf16",
+    "is_cudnn_override_shape_available",
+    "build_cudnn_gemm_bf16_graph_override_shape",
+    "execute_cudnn_gemm_bf16_graph_override_shape",
+    "build_cudnn_fp4_gemm_graph_override_shape",
+    "execute_cudnn_fp4_gemm_graph_override_shape",
+    "build_cudnn_mxfp8_gemm_graph_override_shape",
+    "execute_cudnn_mxfp8_gemm_graph_override_shape",
+    "build_cudnn_gemm_with_per_tensor_q_graph_override_shape",
+    "execute_cudnn_gemm_with_per_tensor_q_graph_override_shape",
 ] + _cute_dsl_kernels

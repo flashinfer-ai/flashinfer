@@ -61,7 +61,7 @@ def gen_moe_utils_module() -> JitSpec:
     ]
 
     nvcc_flags += current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[9, 10, 11, 12]
+        supported_major_versions=[10]
     )
 
     return gen_jit_spec(
@@ -76,7 +76,20 @@ def gen_moe_utils_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/tllmException.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/memoryUtils.cu",
             # Routing kernels for moe_sort
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_routing_deepseek.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_deepseek.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "fused_moe/trtllm_backend/routingDeepSeek/launchMainKernel.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "fused_moe/trtllm_backend/routingDeepSeek/launchClusterKernel.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "fused_moe/trtllm_backend/routingDeepSeek/launchCoopKernel.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "fused_moe/trtllm_backend/routingDeepSeek/launchHistogramKernel.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "fused_moe/trtllm_backend/routingDeepSeek/launchInitExpertCounts.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "fused_moe/trtllm_backend/routingDeepSeek/launchOffsetsKernel.cu",
         ],
         extra_cuda_cflags=nvcc_flags,
         extra_include_paths=[

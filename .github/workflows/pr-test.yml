@@ -46,6 +46,7 @@ permissions:
 
 env:
   EXECUTOR_NUMBER: "0"
+  SKIP_CI_PATTERNS: '\.md$|\.txt$|^docs/|^docker/|^licenses/|^LICENSE$|^NOTICE$|^benchmarks/|^\.github/CODEOWNERS$'
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -157,7 +158,7 @@ jobs:
           HEAD_SHA="${{ github.event.pull_request.head.sha }}"
           CHANGED=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
           # TODO (yongwww): Add back ^\.github/ before merging to main
-          SKIP_PATTERNS="\.md$|\.txt$|^docs/|^docker/|^licenses/|^LICENSE$|^NOTICE$|^benchmarks/"
+          SKIP_PATTERNS="$SKIP_CI_PATTERNS"
 
           SKIP=true
           while IFS= read -r file; do
@@ -602,16 +603,56 @@ jobs:
       - gpu-tests-h100
     runs-on: ubuntu-latest
     steps:
-      - name: Check Results
+      - name: Check Authorization
+        if: needs.gate.outputs.authorized != 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check skip patterns for unauthorized PRs
+        if: needs.gate.outputs.authorized != 'true'
+        id: skip-check
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          CHANGED=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
+          SKIP_PATTERNS="$SKIP_CI_PATTERNS"
+
+          SKIP=true
+          while IFS= read -r file; do
+            if [ -n "$file" ] && ! echo "$file" | grep -qE "$SKIP_PATTERNS"; then
+              SKIP=false
+              break
+            fi
+          done <<< "$CHANGED"
+
+          echo "skip=$SKIP" >> "$GITHUB_OUTPUT"
+
+      - name: Report unauthorized PR status
+        if: needs.gate.outputs.authorized != 'true'
         run: |
           echo "## Test Results Summary" >> $GITHUB_STEP_SUMMARY
 
-          # Check if CI was skipped due to permissions
-          if [ "${{ needs.gate.outputs.authorized }}" != "true" ]; then
-            echo "CI skipped (pending authorization)" >> $GITHUB_STEP_SUMMARY
-            echo "A contributor in @flashinfer-ai/ci-users can comment \`@flashinfer-bot run\` to approve." >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.skip-check.outputs.skip }}" == "true" ]; then
+            echo "CI not required (docs/config only changes)" >> $GITHUB_STEP_SUMMARY
+            echo "::notice::Docs-only PR — no CI needed"
             exit 0
           fi
+
+          echo "CI skipped (pending authorization)" >> $GITHUB_STEP_SUMMARY
+          echo "A contributor in @flashinfer-ai/ci-users can comment \`@flashinfer-bot run\` to approve." >> $GITHUB_STEP_SUMMARY
+          echo "::warning::CI skipped — pending authorization"
+          exit 1
+
+      - name: Check Results
+        if: needs.gate.outputs.authorized == 'true'
+        run: |
+          echo "## Test Results Summary" >> $GITHUB_STEP_SUMMARY
           # Helper function to check job status
           check_status() {
             local name=$1 skip=$2 spot=$3 spot_term=$4 rerun=$5

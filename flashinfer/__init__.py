@@ -59,7 +59,7 @@ from .decode import (
 )
 from .decode import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .decode import single_decode_with_kv_cache as single_decode_with_kv_cache
-from .fp4_quantization import (
+from .quantization.fp4_quantization import (
     SfLayout,
     block_scale_interleave,
     nvfp4_block_scale_interleave,
@@ -69,12 +69,16 @@ from .fp4_quantization import (
     mxfp4_dequantize,
     mxfp4_quantize,
     nvfp4_quantize,
+    nvfp4_quantize_paged_kv_cache,
     nvfp4_batched_quantize,
     shuffle_matrix_a,
     shuffle_matrix_sf_a,
     scaled_fp4_grouped_quantize,
+    get_fp4_quantization_module,
+    nvfp4_kv_dequantize,
+    nvfp4_kv_quantize,
 )
-from .fp8_quantization import mxfp8_dequantize_host, mxfp8_quantize
+from .quantization.fp8_quantization import mxfp8_dequantize_host, mxfp8_quantize
 from .fused_moe import (
     ActivationType,
     RoutingMethodType,
@@ -107,13 +111,18 @@ from .gemm import mm_mxfp8 as mm_mxfp8
 from .gemm import tgv_gemm_sm100 as tgv_gemm_sm100
 from .mla import BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper
 from .norm import fused_add_rmsnorm as fused_add_rmsnorm
+from .norm import fused_add_rmsnorm_quant as fused_add_rmsnorm_quant
 from .norm import layernorm as layernorm
 from .norm import gemma_fused_add_rmsnorm as gemma_fused_add_rmsnorm
 from .norm import gemma_rmsnorm as gemma_rmsnorm
 from .norm import rmsnorm as rmsnorm
+from .norm import rmsnorm_quant as rmsnorm_quant
 
-from .norm import rmsnorm_fp4quant as rmsnorm_fp4quant
-from .norm import add_rmsnorm_fp4quant as add_rmsnorm_fp4quant
+try:
+    from .norm import rmsnorm_fp4quant as rmsnorm_fp4quant
+    from .norm import add_rmsnorm_fp4quant as add_rmsnorm_fp4quant
+except (ImportError, AttributeError):
+    pass  # nvidia-cutlass-dsl not installed
 from .page import append_paged_kv_cache as append_paged_kv_cache
 from .page import append_paged_mla_kv_cache as append_paged_mla_kv_cache
 from .page import get_batch_indices_positions as get_batch_indices_positions
