@@ -29,7 +29,7 @@ if [ -n "${CUTLASS_DSL_VERSION:-}" ]; then
   echo "========================================"
   echo "Overriding nvidia-cutlass-dsl with version: ${CUTLASS_DSL_VERSION}"
   echo "========================================"
-  pip install --force-reinstall "nvidia-cutlass-dsl==${CUTLASS_DSL_VERSION}"
+  pip install --force-reinstall "nvidia-cutlass-dsl[cu13]==${CUTLASS_DSL_VERSION}"
   echo "nvidia-cutlass-dsl override complete."
   echo ""
 fi
