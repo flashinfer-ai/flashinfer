@@ -26,6 +26,7 @@ This package provides high-performance normalization kernels:
 
 import functools
 import os
+import warnings
 from typing import Optional, Union
 
 import torch
@@ -66,8 +67,6 @@ def _normalize_scale_tensor(
 ) -> torch.Tensor:
     """Normalize quantization scale to 1D tensor of shape (1,) on target device."""
     if not isinstance(scale, torch.Tensor):
-        import warnings
-
         warnings.warn(
             "Passing scale as a float is deprecated and will be removed in a future "
             "release. Use a torch.Tensor of shape (1,) instead.",
