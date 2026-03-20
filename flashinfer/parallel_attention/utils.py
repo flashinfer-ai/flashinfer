@@ -375,8 +375,6 @@ def get_parallel_groups(
         - **ulysses_group** (*Optional[ProcessGroup]*): The Ulysses
           process group, or ``None`` if ``ulysses_size == 1``.
 
-        Returns ``None`` (not a tuple) when ``ulysses_size == ring_size == 1``.
-
     Raises:
         ValueError: If ``world_size`` is not divisible by
             ``ulysses_size * ring_size``.
@@ -401,7 +399,7 @@ def get_parallel_groups(
 
     if total_parallel_size == 1:
         logger.debug("No parallelism needed, skipping device mesh setup")
-        return None
+        return None, None
 
     mesh_dims = []
     mesh_sizes = []
@@ -427,7 +425,7 @@ def get_parallel_groups(
 
     if not mesh_dims:
         logger.debug("No mesh dimensions needed")
-        return None
+        return None, None
     else:
         logger.info(f"Creating device mesh: dims={mesh_dims}, sizes={mesh_sizes}")
         device_mesh = init_device_mesh(
