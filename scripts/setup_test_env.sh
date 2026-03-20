@@ -23,3 +23,13 @@ if [ -n "${TVM_FFI_REF:-}" ]; then
   echo "TVM-FFI override complete."
   echo ""
 fi
+
+# Override nvidia-cutlass-dsl if specified
+if [ -n "${CUTLASS_DSL_VERSION:-}" ]; then
+  echo "========================================"
+  echo "Overriding nvidia-cutlass-dsl with version: ${CUTLASS_DSL_VERSION}"
+  echo "========================================"
+  pip install --force-reinstall "nvidia-cutlass-dsl==${CUTLASS_DSL_VERSION}"
+  echo "nvidia-cutlass-dsl override complete."
+  echo ""
+fi
