@@ -1847,12 +1847,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._max_item_len_ptr = max_item_len_ptr
 
         # NOTE(Zihao): only required if qo_indptr/paged_kv_indptr are device tensors
+        qo_indptr_host = qo_indptr.to("cpu")
+        self._qo_indptr_last = int(qo_indptr_host[-1])
+        total_num_rows = self._qo_indptr_last
         if max_token_per_sequence is not None:
             self._max_q_len = max_token_per_sequence
         else:
-            qo_indptr_host = qo_indptr.to("cpu")
             self._max_q_len = max(qo_indptr_host[1:] - qo_indptr_host[:-1]).item()
-            total_num_rows = int(qo_indptr_host[-1])
 
         if max_sequence_kv is not None:
             self._max_kv_len = max_sequence_kv
@@ -2184,20 +2185,18 @@ class BatchPrefillWithPagedKVCacheWrapper:
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
         )
-        # Validate q shape matches qo_indptr
-        expected_qo_indptr_last = self._qo_indptr_buf[-1].item()
+        # Validate q shape matches qo_indptr (using value cached in plan() to avoid GPU sync)
         if self._backend == "cudnn":
-            # cudnn uses element-offset indptr: qo_indptr[-1] = total_tokens * num_heads * head_dim
-            if q.numel() != expected_qo_indptr_last:
+            if q.numel() != self._qo_indptr_last:
                 raise ValueError(
-                    f"q.numel() ({q.numel()}) does not match qo_indptr[-1] ({expected_qo_indptr_last}). "
+                    f"q.numel() ({q.numel()}) does not match qo_indptr[-1] ({self._qo_indptr_last}). "
                     f"For cudnn paged prefill, qo_indptr uses element offsets "
                     f"(total_tokens * num_heads * head_dim)."
                 )
         else:
-            if q.size(0) != expected_qo_indptr_last:
+            if q.size(0) != self._qo_indptr_last:
                 raise ValueError(
-                    f"q.shape[0] ({q.size(0)}) does not match qo_indptr[-1] ({expected_qo_indptr_last}). "
+                    f"q.shape[0] ({q.size(0)}) does not match qo_indptr[-1] ({self._qo_indptr_last}). "
                     f"For paged prefill, q must have shape [total_tokens, num_heads, head_dim] "
                     f"where total_tokens = qo_indptr[-1]."
                 )
@@ -2869,7 +2868,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         qo_indptr_host = qo_indptr.to("cpu")
         kv_indptr_host = kv_indptr.to("cpu")
 
-        total_num_rows = int(qo_indptr_host[-1])
+        self._qo_indptr_last = int(qo_indptr_host[-1])
+        total_num_rows = self._qo_indptr_last
 
         if self.is_cuda_graph_enabled:
             if self._max_total_num_rows is None:
@@ -3130,20 +3130,18 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         _check_cached_qkv_data_type(
             q, k, self._cached_q_data_type, self._cached_kv_data_type
         )
-        # Validate q shape matches qo_indptr
-        expected_qo_indptr_last = self._qo_indptr_buf[-1].item()
+        # Validate q shape matches qo_indptr (using value cached in plan() to avoid GPU sync)
         if self._backend == "cudnn":
-            # cudnn uses element-offset indptr: qo_indptr[-1] = total_tokens * num_heads * head_dim
-            if q.numel() != expected_qo_indptr_last:
+            if q.numel() != self._qo_indptr_last:
                 raise ValueError(
-                    f"q.numel() ({q.numel()}) does not match qo_indptr[-1] ({expected_qo_indptr_last}). "
+                    f"q.numel() ({q.numel()}) does not match qo_indptr[-1] ({self._qo_indptr_last}). "
                     f"For cudnn ragged prefill, qo_indptr uses element offsets "
                     f"(total_tokens * num_heads * head_dim)."
                 )
         else:
-            if q.size(0) != expected_qo_indptr_last:
+            if q.size(0) != self._qo_indptr_last:
                 raise ValueError(
-                    f"q.shape[0] ({q.size(0)}) does not match qo_indptr[-1] ({expected_qo_indptr_last}). "
+                    f"q.shape[0] ({q.size(0)}) does not match qo_indptr[-1] ({self._qo_indptr_last}). "
                     f"For ragged prefill, q must have shape [total_tokens, num_heads, head_dim] "
                     f"where total_tokens = qo_indptr[-1]."
                 )
