@@ -984,6 +984,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
             raise ValueError(
                 "fixed_split_size is only supported by tensor core decode for now."
             )
+        if fixed_cta_tile_q is not None and not self.use_tensor_cores:
+            raise ValueError(
+                "fixed_cta_tile_q is only supported by tensor core decode for now."
+            )
         if fixed_split_size is None:
             fixed_split_size = -1
         fixed_cta_tile_q = _validate_fixed_cta_tile_q(fixed_cta_tile_q, head_dim)
@@ -1060,6 +1064,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
                         )
                     else:
                         self._backend = "fa2"
+                if fixed_cta_tile_q != -1 and self._backend != "fa2":
+                    raise ValueError(
+                        f"fixed_cta_tile_q is only supported for the fa2 backend, "
+                        f"got backend={self._backend!r}"
+                    )
                 self._cached_module = get_batch_prefill_module(
                     self._backend,
                     q_data_type,
@@ -2659,12 +2668,21 @@ def fast_decode_plan(
     if kv_data_type is None:
         kv_data_type = q_data_type
 
+    if fixed_cta_tile_q is not None and not self.use_tensor_cores:
+        raise ValueError(
+            "fixed_cta_tile_q is only supported by tensor core decode for now."
+        )
     if self.use_tensor_cores:
         qo_indptr_host = _get_range_buf(batch_size + 1, "cpu")
         # Here we set fixed_split_size to -1 to avoid the assertion error in flashinfer's plan function
         if fixed_split_size is None:
             fixed_split_size = -1
         fixed_cta_tile_q = _validate_fixed_cta_tile_q(fixed_cta_tile_q, head_dim)
+        if fixed_cta_tile_q != -1 and self._backend != "fa2":
+            raise ValueError(
+                f"fixed_cta_tile_q is only supported for the fa2 backend, "
+                f"got backend={self._backend!r}"
+            )
 
     if self.is_cuda_graph_enabled:
         if batch_size != self._fixed_batch_size:

@@ -208,3 +208,47 @@ def test_batch_prefill_fixed_cta_tile_q_incompatible_head_dim():
             disable_split_kv=True,
             fixed_cta_tile_q=128,
         )
+
+
+def test_batch_prefill_fixed_cta_tile_q_rejected_for_non_fa2_backend():
+    """fixed_cta_tile_q must raise when the resolved backend is not fa2."""
+    batch_size, qo_len, kv_len, page_size, num_kv_heads, head_dim = (
+        2,
+        64,
+        512,
+        16,
+        4,
+        128,
+    )
+    num_pages_per_seq = (kv_len + page_size - 1) // page_size
+    total_num_pages = num_pages_per_seq * batch_size
+    q_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda:0", dtype=torch.int32) * qo_len
+    )
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda:0", dtype=torch.int32)
+        * num_pages_per_seq
+    )
+    kv_indices = torch.arange(0, total_num_pages, device="cuda:0", dtype=torch.int32)
+    kv_last_page_len = torch.full(
+        (batch_size,), page_size, dtype=torch.int32, device="cuda:0"
+    )
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
+    wrapper = BatchPrefillWithPagedKVCacheWrapper(workspace_buffer, "NHD")
+    wrapper._backend = "fa3"
+    with pytest.raises(
+        ValueError, match="fixed_cta_tile_q is only supported for the fa2 backend"
+    ):
+        wrapper.plan(
+            q_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            num_kv_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            q_data_type=torch.float16,
+            kv_data_type=torch.float16,
+            fixed_cta_tile_q=64,
+        )

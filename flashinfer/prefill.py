@@ -1954,6 +1954,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     q_data_type,
                     kv_data_type,
                 )
+            if fixed_cta_tile_q != -1 and self._backend != "fa2":
+                raise ValueError(
+                    f"fixed_cta_tile_q is only supported for the fa2 backend, "
+                    f"got backend={self._backend!r}"
+                )
             if self._backend != "cudnn":
                 get_module_args = (
                     q_data_type,
@@ -2902,6 +2907,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     self._custom_mask_buf is not None,  # use_custom_mask
                     q_data_type,
                     kv_data_type,
+                )
+            if fixed_cta_tile_q != -1 and self._backend != "fa2":
+                raise ValueError(
+                    f"fixed_cta_tile_q is only supported for the fa2 backend, "
+                    f"got backend={self._backend!r}"
                 )
 
             get_module_args = (
