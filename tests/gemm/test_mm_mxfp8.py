@@ -102,11 +102,20 @@ def _run_mm_mxfp8(
     input = torch.randn([m, k], device="cuda", dtype=input_dtype)
     mat2 = torch.randn([n, k], device="cuda", dtype=input_dtype)
 
+    if is_sf_swizzled_layout:
+        sflayout_a = SfLayout.layout_128x4
+        sflayout_b = SfLayout.layout_128x4
+    else:
+        sflayout_a = SfLayout.layout_linear
+        sflayout_b = SfLayout.layout_linear
+    if is_sf_swizzled_layout and use_8x4_sf_layout_for_a:
+        sflayout_a = SfLayout.layout_8x4
+
     input_mxfp8, mat2_mxfp8, input_descale, mat2_descale = _prepare_mxfp8_tensors(
         input,
         mat2,
-        SfLayout.layout_8x4 if use_8x4_sf_layout_for_a else SfLayout.layout_128x4,
-        SfLayout.layout_128x4,
+        sflayout_a,
+        sflayout_b,
         backend,
     )
 
@@ -146,7 +155,6 @@ def _prepare_mxfp8_tensors(
     input_mxfp8, input_scale = mxfp8_quantize(
         input_bf16, sf_swizzle_layout=sf_layout_input
     )
-    # the shuffle_matrix_sf_a expects linear layout and will swizzle the scales to 128x4 afterwards
     weight_mxfp8, weight_scale = mxfp8_quantize(
         weight_bf16,
         sf_swizzle_layout=SfLayout.layout_linear
@@ -154,10 +162,11 @@ def _prepare_mxfp8_tensors(
         else sf_layout_weight,
     )
     if backend == "trtllm":
-        weight_mxfp8 = shuffle_matrix_a(weight_mxfp8, 128).reshape(n, k)
         assert sf_layout_weight == SfLayout.layout_128x4, (
             "shuffle_matrix_sf_a only supports 128x4 swizzling now"
         )
+        # the shuffle_matrix_sf_a expects linear layout and will swizzle the scales to 128x4 afterwards
+        weight_mxfp8 = shuffle_matrix_a(weight_mxfp8, 128).reshape(n, k)
         weight_scale = shuffle_matrix_sf_a(
             weight_scale.reshape(n, k // 32), 128, num_elts_per_sf=32
         ).reshape(-1)

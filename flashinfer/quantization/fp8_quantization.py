@@ -174,7 +174,6 @@ def mxfp8_quantize(
 
     Args:
         input (torch.Tensor): Input tensor of shape [M, K] with dtype fp16/bf16/fp8_quantized.
-        sf_swizzle_layout (int, optional): Swizzle layout for scale factors. Defaults to SfLayout.layout_linear.value.
         is_sf_swizzled_layout (bool, optional): Whether to use swizzled layout for scale factors. Defaults to True.
         alignment (int, optional): sfVecSize. Defaults to 32.
         enable_pdl (Optional[bool], optional): Whether to enable PDL (Programmatic Dependent Launch).
