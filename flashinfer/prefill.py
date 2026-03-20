@@ -4180,6 +4180,20 @@ class BatchPrefillWithPagedKVCacheWrapper:
         elif self._jit_module is not None:
             self._cached_module = self._jit_module
         else:
+            if self._backend == "auto":
+                self._backend = determine_attention_backend(
+                    self.device,
+                    PosEncodingMode[pos_encoding_mode].value,
+                    use_fp16_qk_reduction,
+                    self._custom_mask_buf is not None,  # use_custom_mask
+                    q_data_type,
+                    kv_data_type,
+                )
+            if fixed_cta_tile_q != -1 and self._backend != "fa2":
+                raise ValueError(
+                    f"fixed_cta_tile_q is only supported for the fa2 backend, "
+                    f"got backend={self._backend!r}"
+                )
             if self._backend != "cudnn":
                 get_module_args = (
                     q_data_type,
@@ -6418,6 +6432,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     )
                     if upgraded is not None:
                         self._backend = upgraded
+            if fixed_cta_tile_q != -1 and self._backend != "fa2":
+                raise ValueError(
+                    f"fixed_cta_tile_q is only supported for the fa2 backend, "
+                    f"got backend={self._backend!r}"
+                )
 
             get_module_args = (
                 q_data_type,

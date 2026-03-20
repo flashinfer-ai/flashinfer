@@ -2515,6 +2515,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
             raise ValueError(
                 "fixed_split_size is only supported by tensor core decode for now."
             )
+        if fixed_cta_tile_q is not None and not self.use_tensor_cores:
+            raise ValueError(
+                "fixed_cta_tile_q is only supported by tensor core decode for now."
+            )
         if fixed_split_size is None:
             fixed_split_size = -1
         fixed_cta_tile_q = _validate_fixed_cta_tile_q(fixed_cta_tile_q, head_dim)
@@ -2840,6 +2844,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
                         "for single-token requests with an e4m3 KV cache, bfloat16 "
                         "output, head_dim 256, no RoPE or soft cap, and 1, 2, 4 or 8 "
                         "query heads per KV head."
+                    )
+                if fixed_cta_tile_q != -1 and self._backend != "fa2":
+                    raise ValueError(
+                        f"fixed_cta_tile_q is only supported for the fa2 backend, "
+                        f"got backend={self._backend!r}"
                     )
                 self._cached_module = get_batch_prefill_module(
                     self._backend,
@@ -5713,6 +5722,10 @@ def fast_decode_plan(
     if kv_data_type is None:
         kv_data_type = q_data_type
 
+    if fixed_cta_tile_q is not None and not self.use_tensor_cores:
+        raise ValueError(
+            "fixed_cta_tile_q is only supported by tensor core decode for now."
+        )
     if self.use_tensor_cores:
         qo_indptr_host = _get_range_buf(batch_size + 1, "cpu")
         if q_len_per_req > 1:
@@ -5721,6 +5734,11 @@ def fast_decode_plan(
         if fixed_split_size is None:
             fixed_split_size = -1
         fixed_cta_tile_q = _validate_fixed_cta_tile_q(fixed_cta_tile_q, head_dim)
+        if fixed_cta_tile_q != -1 and self._backend != "fa2":
+            raise ValueError(
+                f"fixed_cta_tile_q is only supported for the fa2 backend, "
+                f"got backend={self._backend!r}"
+            )
 
     if self.is_cuda_graph_enabled:
         if batch_size != self._fixed_batch_size:
