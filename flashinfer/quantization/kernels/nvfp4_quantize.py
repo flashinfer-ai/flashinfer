@@ -602,10 +602,6 @@ class NVFP4QuantizeTMAKernel:
 
         self.shared_storage = SharedStorage
 
-        cluster_layout_vmnk = cute.tiled_divide(
-            cute.make_layout((*self.cluster_shape_mn, 1)), (1,)
-        )
-
         self.kernel(
             tma_atom,
             tma_tensor,
@@ -617,7 +613,6 @@ class NVFP4QuantizeTMAKernel:
             smem_outer_staged,
             smem_swizzle,
             smem_layout_flat,
-            cluster_layout_vmnk,
         ).launch(
             grid=[num_blocks, 1, 1],
             block=[self.threads_per_cta, 1, 1],
@@ -645,7 +640,6 @@ class NVFP4QuantizeTMAKernel:
         smem_outer_staged: cute.Layout,
         smem_swizzle: cute.Swizzle,
         smem_layout_flat: cute.Layout,
-        cluster_layout_vmnk: cute.Layout,
     ):
         from ...cute_dsl.fp4_common import (
             get_smem_ptr_as_int32,
@@ -682,18 +676,17 @@ class NVFP4QuantizeTMAKernel:
         sData_flat = storage.smem_data.get_tensor(smem_layout_flat)
 
         # ---- Pipeline setup ----
-        load_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 1)
-        load_consumer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, self.num_consumer_warps
-        )
-
         load_pipeline = pipeline.PipelineTmaAsync.create(
             barrier_storage=load_mbar_ptr,
             num_stages=self.num_stages,
-            producer_group=load_producer_group,
-            consumer_group=load_consumer_group,
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
+            consumer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, self.num_consumer_warps
+            ),
             tx_count=self.num_tma_load_bytes,
-            cta_layout_vmnk=cluster_layout_vmnk,
+            cta_layout_vmnk=cute.tiled_divide(
+                cute.make_layout((*self.cluster_shape_mn, 1)), (1,)
+            ),
             defer_sync=True,
         )
 
@@ -821,10 +814,6 @@ class NVFP4QuantizeTMAKernel:
                     r1_h0, r1_h1, r1_h2, r1_h3 = ld_shared_v4_u32(r1_addr_0)
                     r1_h4, r1_h5, r1_h6, r1_h7 = ld_shared_v4_u32(r1_addr_1)
 
-                    # ---- Release pipeline early (all data in registers) ----
-                    load_pipeline.consumer_release(consumer_state)
-                    consumer_state.advance()
-
                     # ---- Quantize and write: both row iterations ----
                     # Global column base for SF index computation
                     global_col_base = col_chunk * Int32(_TMA_COLS_PER_STAGE)
@@ -873,6 +862,10 @@ class NVFP4QuantizeTMAKernel:
                         mOutput,
                         mScales,
                     )
+
+                    # ---- Release pipeline after all work (matches CUDA pattern) ----
+                    load_pipeline.consumer_release(consumer_state)
+                    consumer_state.advance()
 
                     col_chunk = col_chunk + Int32(1)
 
