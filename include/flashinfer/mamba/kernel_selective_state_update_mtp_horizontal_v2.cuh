@@ -54,11 +54,15 @@ static constexpr int NUM_WARPS = NUM_COMPUTE_WARPS_PER_GROUP + NUM_TMA_WARPS;  /
 static constexpr int LANES_PER_ROW = 8;
 static constexpr int ROWS_PER_WARP = 32 / LANES_PER_ROW;                           // 4
 static constexpr int ROWS_PER_PASS = NUM_COMPUTE_WARPS_PER_GROUP * ROWS_PER_WARP;  // 16
+// Rows per TMA transaction. Must be a multiple of ROWS_PER_PASS.
+// Larger values = fewer barrier syncs but more smem per pipeline stage.
+// Compute processes TMA_STATE_ROWS in sub-passes of ROWS_PER_PASS each.
+static constexpr int TMA_STATE_ROWS = 2 * ROWS_PER_PASS;  // 32 rows per TMA transaction
 }  // namespace horiz_v2
 
 // =============================================================================
-// Shared memory layout — pass-level pipelining.
-// B/C/x loaded once. state_in pipelined across passes (ROWS_PER_PASS chunks).
+// Shared memory layout — TMA-level pipelining.
+// B/C/x loaded once. state_in pipelined across TMA loads (TMA_STATE_ROWS chunks).
 // =============================================================================
 
 template <typename input_t, typename state_t, int TOKENS_MTP, int DIM, int DSTATE,
@@ -66,9 +70,9 @@ template <typename input_t, typename state_t, int TOKENS_MTP, int DIM, int DSTAT
 struct GroupStorageHorizontalV2 {
   alignas(128) input_t B[TOKENS_MTP][DSTATE];
   alignas(128) input_t C[TOKENS_MTP][DSTATE];
-  alignas(128) state_t state_in[NUM_IN_STAGES][horiz_v2::ROWS_PER_PASS * DSTATE];
+  alignas(128) state_t state_in[NUM_IN_STAGES][horiz_v2::TMA_STATE_ROWS * DSTATE];
   alignas(128) input_t x[HEADS_PER_CTA][TOKENS_MTP][DIM];
-  float dt[TOKENS_MTP];
+  float dt[HEADS_PER_CTA][TOKENS_MTP];
   float out[TOKENS_MTP][DIM];
 
   barrier_t bar_input_full;  // B + C + x (all heads) loaded
@@ -78,7 +82,7 @@ struct GroupStorageHorizontalV2 {
 };
 
 // =============================================================================
-// TMA warp: loads B, C, x (once), then pipelines state_in across passes.
+// TMA warp: loads B, C, x (once), then pipelines state_in in TMA_STATE_ROWS chunks.
 // =============================================================================
 
 template <typename input_t, typename state_t, typename stateIndex_t, int NTOKENS, int DIM,
@@ -92,7 +96,8 @@ __device__ __forceinline__ void role_load_horizontal_v2(
       reinterpret_cast<stateIndex_t const*>(params.state_batch_indices);
   auto const state_batch = state_batch_indices ? (int)state_batch_indices[batch] : batch;
 
-  constexpr int numPasses = (DIM / horiz_v2::NUM_COMPUTE_WARPS_PER_GROUP) / horiz_v2::ROWS_PER_WARP;
+  constexpr int numTmaLoads = DIM / horiz_v2::TMA_STATE_ROWS;
+  static_assert(DIM % horiz_v2::TMA_STATE_ROWS == 0, "DIM must be divisible by TMA_STATE_ROWS");
 
   // ── Load B, C (once), and x for all heads ─────────────────────────────
   if (lane == 0) {
@@ -110,21 +115,21 @@ __device__ __forceinline__ void role_load_horizontal_v2(
     cuda::device::barrier_arrive_tx(sram.bar_input_full, warpSize, bytesBCX);
   }
 
-  // ── Pipeline state_in loads across heads and passes ───────────────────
+  // ── Pipeline state_in loads (TMA_STATE_ROWS per transaction) ──────────
   uint32_t parity_empty[NUM_IN_STAGES] = {};  // all start at phase 0
 #pragma unroll
   for (int h = 0; h < HEADS_PER_CTA; h++) {
     int const head = base_head + h;
-    for (int pass = 0; pass < numPasses; pass++) {
-      int const slot = pass % NUM_IN_STAGES;
-      constexpr int bytesChunk = horiz_v2::ROWS_PER_PASS * DSTATE * (int)sizeof(state_t);
+    for (int tl = 0; tl < numTmaLoads; tl++) {
+      int const slot = tl % NUM_IN_STAGES;
+      constexpr int bytesChunk = horiz_v2::TMA_STATE_ROWS * DSTATE * (int)sizeof(state_t);
 
       // Wait for compute to release this slot (tight spin, no NANOSLEEP)
       arrive_and_wait_parity(sram.bar_state_in_empty[slot], parity_empty[slot]);
 
       if (lane == 0) {
         cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.state_in[slot][0], &tensorState, 0,
-                                                      pass * horiz_v2::ROWS_PER_PASS, head,
+                                                      tl * horiz_v2::TMA_STATE_ROWS, head,
                                                       state_batch, sram.bar_state_in_full[slot]);
         cuda::device::barrier_arrive_tx(sram.bar_state_in_full[slot], 1, bytesChunk);
       }
@@ -133,7 +138,8 @@ __device__ __forceinline__ void role_load_horizontal_v2(
 }
 
 // =============================================================================
-// Compute warp: processes one head with pass-level pipelining.
+// Compute warp: processes one head with TMA-level pipelining.
+// Each TMA chunk (TMA_STATE_ROWS) is processed in sub-passes of ROWS_PER_PASS.
 // Same horizontal DSTATE traversal + f32x2 packed SIMD as the v1 kernel.
 // =============================================================================
 
@@ -145,11 +151,13 @@ __device__ __forceinline__ void role_update_state_horizontal_v2(
     int base_head, bool is_pad) {
   constexpr int lanesPerRow = horiz_v2::LANES_PER_ROW;
   constexpr int rowsPerWarp = horiz_v2::ROWS_PER_WARP;
-  constexpr int totalRowsPerWarp = DIM / horiz_v2::NUM_COMPUTE_WARPS_PER_GROUP;
-  constexpr int numPasses = totalRowsPerWarp / rowsPerWarp;
+  constexpr int numTmaLoads = DIM / horiz_v2::TMA_STATE_ROWS;
+  constexpr int subPassesPerTma = horiz_v2::TMA_STATE_ROWS / horiz_v2::ROWS_PER_PASS;
   constexpr int stateValuesPerThread = DSTATE / lanesPerRow;
   static_assert(DSTATE % lanesPerRow == 0, "DSTATE must be divisible by lanesPerRow");
-  static_assert(DIM % horiz_v2::ROWS_PER_PASS == 0, "DIM must be divisible by ROWS_PER_PASS");
+  static_assert(DIM % horiz_v2::TMA_STATE_ROWS == 0, "DIM must be divisible by TMA_STATE_ROWS");
+  static_assert(horiz_v2::TMA_STATE_ROWS % horiz_v2::ROWS_PER_PASS == 0,
+                "TMA_STATE_ROWS must be a multiple of ROWS_PER_PASS");
 
   constexpr int bankSize = sizeof(uint32_t);
   constexpr int stateValuesPerBank = bankSize / sizeof(state_t);
@@ -208,6 +216,25 @@ __device__ __forceinline__ void role_update_state_horizontal_v2(
   uint32_t parity_full[NUM_IN_STAGES] = {};
   uint32_t parity_out_ready = 0;
 
+  // Cooperatively load dt for all heads before waiting on B/C/x.
+  // 4 compute warps × 32 lanes = 128 threads cover HEADS_PER_CTA * NTOKENS values.
+  {
+    constexpr int totalDtValues = HEADS_PER_CTA * NTOKENS;
+    constexpr int numComputeThreads = horiz_v2::NUM_COMPUTE_WARPS_PER_GROUP * warpSize;  // 128
+    int const flatThread = compute_warp * warpSize + lane;
+    for (int idx = flatThread; idx < totalDtValues; idx += numComputeThreads) {
+      int const h = idx / NTOKENS;
+      int const step = idx % NTOKENS;
+      int const head = base_head + h;
+      float dt_bias_val = dt_bias_ptr ? toFloat(dt_bias_ptr[head]) : 0.f;
+      float dt_val =
+          toFloat(dt_ptr[batch * params.dt_stride_batch + step * params.dt_stride_mtp + head]) +
+          dt_bias_val;
+      if (params.dt_softplus) dt_val = thresholded_softplus(dt_val);
+      sram.dt[h][step] = dt_val;
+    }
+  }
+
   // Wait for B/C/x (all heads) to be loaded
   arrive_and_wait_parity(sram.bar_input_full, parity_input_full);
 
@@ -224,144 +251,157 @@ __device__ __forceinline__ void role_update_state_horizontal_v2(
     auto const state_ptr_offset = state_batch * params.state_stride_batch + head * DIM * DSTATE;
     float const A_val = toFloat(A_ptr[head]);
     float const D_val = D_ptr ? toFloat(D_ptr[head]) : 0.f;
-    float const dt_bias_val = dt_bias_ptr ? toFloat(dt_bias_ptr[head]) : 0.f;
 
-    // Load dt into smem (distributed across warps)
-    for (int step = compute_warp; step < NTOKENS; step += horiz_v2::NUM_COMPUTE_WARPS_PER_GROUP) {
-      if (lane == 0) {
-        float dt_val =
-            toFloat(dt_ptr[batch * params.dt_stride_batch + step * params.dt_stride_mtp + head]) +
-            dt_bias_val;
-        if (params.dt_softplus) dt_val = thresholded_softplus(dt_val);
-        sram.dt[step] = dt_val;
-      }
-    }
+    // ── TMA load loop: each iteration processes TMA_STATE_ROWS rows of DIM ─
+    // Within each TMA chunk, sub-passes of ROWS_PER_PASS are processed
+    // without barrier sync (data already in smem). #pragma unroll 1 prevents
+    // register pressure increase from unrolling the sub-pass loop.
+    for (int tl = 0; tl < numTmaLoads; tl++) {
+      int const slot = tl % NUM_IN_STAGES;
 
-    // ── Pass loop: each iteration processes ROWS_PER_PASS rows of DIM ───
-    for (int pass = 0; pass < numPasses; pass++) {
-      int const slot = pass % NUM_IN_STAGES;
-      int const sram_row = compute_warp * rowsPerWarp + group;   // row within ROWS_PER_PASS chunk
-      int const dd = pass * horiz_v2::ROWS_PER_PASS + sram_row;  // global DIM row
-
-      // Wait for state_in chunk to be loaded by TMA (tight spin, no NANOSLEEP)
+      // Wait for TMA to deliver this chunk (tight spin, no NANOSLEEP)
       arrive_and_wait_parity(sram.bar_state_in_full[slot], parity_full[slot]);
 
-      // Load state from smem (pass-local smem, not full DIM)
-      float2 rState[numTiles][pairsPerTileMember];
-#pragma unroll
-      for (int t = 0; t < numTiles; t++) {
-#pragma unroll
-        for (int p = 0; p < pairsPerTileMember; p++) {
-          int const c0 = baseCol(t, p * 2);
-          int const c1 = baseCol(t, p * 2 + 1);
-          // Index into pass-local smem: sram_row within the ROWS_PER_PASS chunk
-          rState[t][p] = {toFloat(sram.state_in[slot][sram_row * DSTATE + c0]),
-                          toFloat(sram.state_in[slot][sram_row * DSTATE + c1])};
-        }
-      }
+      // Process sub-passes within the TMA chunk (NO unroll to avoid register bloat)
+#pragma unroll 1
+      for (int sp = 0; sp < subPassesPerTma; sp++) {
+        int const sram_row = sp * horiz_v2::ROWS_PER_PASS + compute_warp * rowsPerWarp + group;
+        int const dd = tl * horiz_v2::TMA_STATE_ROWS + sram_row;  // global DIM row
 
-      for (int step = 0; step < NTOKENS; step++) {
-        float const dt_value = sram.dt[step];
-        float const dA = __expf(A_val * dt_value);
-        float const x_value = toFloat(sram.x[h][step][dd]);
-
-        // f32x2 packed recurrence
-        float2 out2 = {0.f, 0.f};
-        float2 const dA2 = {dA, dA};
-        float const dtx_value = dt_value * x_value;
-        float2 const dtx2 = {dtx_value, dtx_value};
-
+        // Load state from smem
+        float2 rState[numTiles][pairsPerTileMember];
 #pragma unroll
         for (int t = 0; t < numTiles; t++) {
 #pragma unroll
           for (int p = 0; p < pairsPerTileMember; p++) {
             int const c0 = baseCol(t, p * 2);
-            int const c1 = baseCol(t, p * 2 + 1);
-            float2 B2 = {toFloat(sram.B[step][c0]), toFloat(sram.B[step][c1])};
-            float2 dBx;
-            mul_f32x2(dBx, B2, dtx2);                         // dBx = B * (dt * x)
-            fma_f32x2(rState[t][p], dA2, rState[t][p], dBx);  // state = dA * state + dBx
-            float2 C2 = {toFloat(sram.C[step][c0]), toFloat(sram.C[step][c1])};
-            fma_f32x2(out2, rState[t][p], C2, out2);  // out += state * C
+            if constexpr (sizeof(state_t) == 2) {
+              uint32_t raw =
+                  *reinterpret_cast<uint32_t const*>(&sram.state_in[slot][sram_row * DSTATE + c0]);
+              auto const* ptr = reinterpret_cast<state_t const*>(&raw);
+              rState[t][p] = {toFloat(ptr[0]), toFloat(ptr[1])};
+            } else {
+              int const c1 = baseCol(t, p * 2 + 1);
+              rState[t][p] = {toFloat(sram.state_in[slot][sram_row * DSTATE + c0]),
+                              toFloat(sram.state_in[slot][sram_row * DSTATE + c1])};
+            }
           }
         }
-        float out_value = out2.x + out2.y;
 
-        // Reduce across lanesPerRow adjacent lanes
-#pragma unroll
-        for (int offset = lanesPerRow / 2; offset >= 1; offset /= 2) {
-          out_value += __shfl_down_sync(UINT32_MAX, out_value, offset);
-        }
+        for (int step = 0; step < NTOKENS; step++) {
+          float const dt_value = sram.dt[h][step];
+          float const dA = __expf(A_val * dt_value);
+          float const x_value = toFloat(sram.x[h][step][dd]);
 
-        if (member == 0) {
-          sram.out[step][dd] = out_value + D_val * x_value;
-        }
+          // f32x2 packed recurrence
+          float2 out2 = {0.f, 0.f};
+          float2 const dA2 = {dA, dA};
+          float const dtx_value = dt_value * x_value;
+          float2 const dtx2 = {dtx_value, dtx_value};
 
-        // Write intermediate state
-        if (istate_ptr && !is_pad) {
-          auto const istate_base = icache_idx * params.intermediate_state_stride_batch +
-                                   step * params.nheads * DIM * DSTATE + head * DIM * DSTATE +
-                                   dd * DSTATE;
 #pragma unroll
           for (int t = 0; t < numTiles; t++) {
-            packed_tile_t rOut;
-            int const col0 = baseCol(t, 0);
 #pragma unroll
-            for (int e = 0; e < elemsPerTileMember; e += 2) {
-              float const s0 = rState[t][e / 2].x;
-              float const s1 = rState[t][e / 2].y;
-              if constexpr (PHILOX_ROUNDS > 0) {
-                [[maybe_unused]] uint32_t rand_ints[4];
-                if (e % 4 == 0)
-                  philox_randint4x<PHILOX_ROUNDS>(
-                      rand_seed, state_ptr_offset + dd * DSTATE + col0 + e, rand_ints[0],
-                      rand_ints[1], rand_ints[2], rand_ints[3]);
-                uint32_t packed = cvt_rs_f16x2_f32(s0, s1, rand_ints[e / 2 % 2]);
-                rOut.val[e] = __ushort_as_half(static_cast<uint16_t>(packed & 0xFFFFu));
-                rOut.val[e + 1] = __ushort_as_half(static_cast<uint16_t>(packed >> 16));
+            for (int p = 0; p < pairsPerTileMember; p++) {
+              int const c0 = baseCol(t, p * 2);
+              float2 B2, C2;
+              if constexpr (sizeof(input_t) == 2) {
+                // Coalesce two 16-bit loads into one 32-bit shared memory load
+                uint32_t B2_raw = *reinterpret_cast<uint32_t const*>(&sram.B[step][c0]);
+                auto const* B2_ptr = reinterpret_cast<input_t const*>(&B2_raw);
+                B2 = {toFloat(B2_ptr[0]), toFloat(B2_ptr[1])};
+                uint32_t C2_raw = *reinterpret_cast<uint32_t const*>(&sram.C[step][c0]);
+                auto const* C2_ptr = reinterpret_cast<input_t const*>(&C2_raw);
+                C2 = {toFloat(C2_ptr[0]), toFloat(C2_ptr[1])};
               } else {
-                convertAndStore(&rOut.val[e], s0);
-                convertAndStore(&rOut.val[e + 1], s1);
+                int const c1 = baseCol(t, p * 2 + 1);
+                B2 = {toFloat(sram.B[step][c0]), toFloat(sram.B[step][c1])};
+                C2 = {toFloat(sram.C[step][c0]), toFloat(sram.C[step][c1])};
               }
+              float2 dBx;
+              mul_f32x2(dBx, B2, dtx2);                         // dBx = B * (dt * x)
+              fma_f32x2(rState[t][p], dA2, rState[t][p], dBx);  // state = dA * state + dBx
+              fma_f32x2(out2, rState[t][p], C2, out2);          // out += state * C
             }
-            *reinterpret_cast<packed_tile_t*>(&istate_ptr[istate_base + col0]) = rOut;
           }
-        }
+          float out_value = out2.x + out2.y;
 
-        // Write final state at last step
-        if (step == NTOKENS - 1 && params.update_state && !is_pad) {
-          auto const state_base =
-              state_batch * params.state_stride_batch + head * DIM * DSTATE + dd * DSTATE;
+          // Reduce across lanesPerRow adjacent lanes
 #pragma unroll
-          for (int t = 0; t < numTiles; t++) {
-            packed_tile_t rOut;
-            int const col0 = baseCol(t, 0);
+          for (int offset = lanesPerRow / 2; offset >= 1; offset /= 2) {
+            out_value += __shfl_down_sync(UINT32_MAX, out_value, offset);
+          }
+
+          if (member == 0) {
+            sram.out[step][dd] = out_value + D_val * x_value;
+          }
+
+          // Write intermediate state
+          if (istate_ptr && !is_pad) {
+            auto const istate_base = icache_idx * params.intermediate_state_stride_batch +
+                                     step * params.nheads * DIM * DSTATE + head * DIM * DSTATE +
+                                     dd * DSTATE;
 #pragma unroll
-            for (int e = 0; e < elemsPerTileMember; e += 2) {
-              float const s0 = rState[t][e / 2].x;
-              float const s1 = rState[t][e / 2].y;
-              if constexpr (PHILOX_ROUNDS > 0) {
-                [[maybe_unused]] uint32_t rand_ints[4];
-                if (e % 4 == 0)
-                  philox_randint4x<PHILOX_ROUNDS>(
-                      rand_seed, state_ptr_offset + dd * DSTATE + col0 + e, rand_ints[0],
-                      rand_ints[1], rand_ints[2], rand_ints[3]);
-                uint32_t packed = cvt_rs_f16x2_f32(s0, s1, rand_ints[e / 2 % 2]);
-                rOut.val[e] = __ushort_as_half(static_cast<uint16_t>(packed & 0xFFFFu));
-                rOut.val[e + 1] = __ushort_as_half(static_cast<uint16_t>(packed >> 16));
-              } else {
-                convertAndStore(&rOut.val[e], s0);
-                convertAndStore(&rOut.val[e + 1], s1);
+            for (int t = 0; t < numTiles; t++) {
+              packed_tile_t rOut;
+              int const col0 = baseCol(t, 0);
+#pragma unroll
+              for (int e = 0; e < elemsPerTileMember; e += 2) {
+                float const s0 = rState[t][e / 2].x;
+                float const s1 = rState[t][e / 2].y;
+                if constexpr (PHILOX_ROUNDS > 0) {
+                  [[maybe_unused]] uint32_t rand_ints[4];
+                  if (e % 4 == 0)
+                    philox_randint4x<PHILOX_ROUNDS>(
+                        rand_seed, state_ptr_offset + dd * DSTATE + col0 + e, rand_ints[0],
+                        rand_ints[1], rand_ints[2], rand_ints[3]);
+                  uint32_t packed = cvt_rs_f16x2_f32(s0, s1, rand_ints[e / 2 % 2]);
+                  rOut.val[e] = __ushort_as_half(static_cast<uint16_t>(packed & 0xFFFFu));
+                  rOut.val[e + 1] = __ushort_as_half(static_cast<uint16_t>(packed >> 16));
+                } else {
+                  convertAndStore(&rOut.val[e], s0);
+                  convertAndStore(&rOut.val[e + 1], s1);
+                }
               }
+              *reinterpret_cast<packed_tile_t*>(&istate_ptr[istate_base + col0]) = rOut;
             }
-            *reinterpret_cast<packed_tile_t*>(&state_ptr[state_base + col0]) = rOut;
           }
-        }
-      }  // step loop
 
-      // Release state_in slot for TMA to reuse
+          // Write final state at last step
+          if (step == NTOKENS - 1 && params.update_state && !is_pad) {
+            auto const state_base =
+                state_batch * params.state_stride_batch + head * DIM * DSTATE + dd * DSTATE;
+#pragma unroll
+            for (int t = 0; t < numTiles; t++) {
+              packed_tile_t rOut;
+              int const col0 = baseCol(t, 0);
+#pragma unroll
+              for (int e = 0; e < elemsPerTileMember; e += 2) {
+                float const s0 = rState[t][e / 2].x;
+                float const s1 = rState[t][e / 2].y;
+                if constexpr (PHILOX_ROUNDS > 0) {
+                  [[maybe_unused]] uint32_t rand_ints[4];
+                  if (e % 4 == 0)
+                    philox_randint4x<PHILOX_ROUNDS>(
+                        rand_seed, state_ptr_offset + dd * DSTATE + col0 + e, rand_ints[0],
+                        rand_ints[1], rand_ints[2], rand_ints[3]);
+                  uint32_t packed = cvt_rs_f16x2_f32(s0, s1, rand_ints[e / 2 % 2]);
+                  rOut.val[e] = __ushort_as_half(static_cast<uint16_t>(packed & 0xFFFFu));
+                  rOut.val[e + 1] = __ushort_as_half(static_cast<uint16_t>(packed >> 16));
+                } else {
+                  convertAndStore(&rOut.val[e], s0);
+                  convertAndStore(&rOut.val[e + 1], s1);
+                }
+              }
+              *reinterpret_cast<packed_tile_t*>(&state_ptr[state_base + col0]) = rOut;
+            }
+          }
+        }  // step loop
+      }  // sub-pass loop
+
+      // Release state_in slot for TMA to reuse (after all sub-passes done)
       sram.bar_state_in_empty[slot].arrive();
-    }  // pass loop
+    }  // TMA load loop
 
     // ── Epilogue: sync all 4 compute warps, z-gate + vectorized store ───
     arrive_and_wait_parity(sram.bar_out_ready, parity_out_ready);
@@ -392,7 +432,7 @@ __device__ __forceinline__ void role_update_state_horizontal_v2(
       }
     }
 
-    // Sync compute warps after epilogue before next head's dt load
+    // Sync compute warps after epilogue before next head reuses sram.out
     if (h < HEADS_PER_CTA - 1) {
       arrive_and_wait_parity(sram.bar_out_ready, parity_out_ready);
     }

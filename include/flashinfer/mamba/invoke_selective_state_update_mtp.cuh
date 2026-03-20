@@ -219,7 +219,7 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
     FLASHINFER_CHECK(!scaleState,
                      "horizontal_v2 algorithm does not support scaled (quantized) state");
 
-    constexpr int NUM_IN_STAGES = 4;
+    constexpr int NUM_IN_STAGES = 2;
 
     dispatchRatio(
         params, std::integer_sequence<int, 1, 2, 4, 8, 16, 32, 64>{}, [&]<int HEADS_PER_GROUP>() {
@@ -242,12 +242,12 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
           dim3 grid(params.batch, params.nheads / HEADS_PER_CTA);
           dim3 block(warpSize, horiz_v2::NUM_WARPS);
 
-          // TMA state descriptor: tile by ROWS_PER_PASS instead of full DIM
+          // TMA state descriptor: tile by TMA_STATE_ROWS
           auto state_tensor = tma::buildNdDescriptor(
               typeid(state_t),
               /*shapes*/ {DSTATE, DIM, params.nheads, params.state_cache_size},
               /*strides*/ {1, DSTATE, DSTATE * DIM, params.state_stride_batch},
-              /*tiles*/ {DSTATE, horiz_v2::ROWS_PER_PASS, 1, 1}, params.state);
+              /*tiles*/ {DSTATE, horiz_v2::TMA_STATE_ROWS, 1, 1}, params.state);
 
           auto B_tensor = tma::buildNdDescriptor(
               typeid(input_t),
