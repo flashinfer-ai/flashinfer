@@ -26,7 +26,12 @@ from .core import (
     sm89_nvcc_flags,
 )
 from .cpp_ext import is_cuda_version_at_least
-from .cubin_loader import get_cubin, get_meta_hash, download_trtllm_headers
+from .cubin_loader import (
+    get_cubin,
+    get_meta_hash,
+    download_trtllm_headers,
+    compile_source_cubins,
+)
 from .gemm.cutlass.generate_kernels import generate_gemm_operations
 
 
@@ -244,6 +249,51 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
 
     download_trtllm_headers(
         "bmm", header_dest_dir, header_path, ArtifactPath.TRTLLM_GEN_BMM, checksum
+    )
+
+    bundle_header_dir = jit_env.FLASHINFER_CSRC_DIR / "trtllm_kernels"
+
+    # Directory containing the bundled trtllmGen export (includes trtllm/dev/*.h headers)
+    bundled_export_dir = (
+        jit_env.FLASHINFER_CSRC_DIR
+        / "trtllm_kernels"
+        / "batched_gemm"
+        / "trtllmGen_bmm_export"
+    )
+
+    # Compile .cu source files to .cubin for kernels with mUseSource=true.
+    # The .cu files are shipped in the repo; their .cubin outputs are placed
+    # in the cubin cache directory where getCubin() will find them at runtime.
+    source_kernel_dir = bundled_export_dir / "src"
+
+    compile_source_cubins(
+        source_dir=source_kernel_dir,
+        artifact_path=ArtifactPath.TRTLLM_GEN_BMM,
+        include_paths=[
+            jit_env.FLASHINFER_CUBIN_DIR / include_path,
+            header_dest_dir,
+            bundle_header_dir,
+            bundled_export_dir,  # for trtllm/dev/*.h headers
+            source_kernel_dir,
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include",
+            *jit_env.CUTLASS_INCLUDE_DIRS,
+        ],
+        nvcc_flags=[
+            "--expt-relaxed-constexpr",
+            "--use_fast_math",
+            "-std=c++17",
+            "-arch=sm_100a",
+            "-DTLLM_ENABLE_CUDA",
+            "-DNDEBUG=1",
+            "-DCUTLASS_ARCH_MMA_SM100A_ENABLED",
+            "-DTLLM_PUBLIC_RELEASE=1",
+            "-diag-suppress=177",
+            "-diag-suppress=2361",
+            "-diag-suppress=550",
+            "-O3",
+            "-cubin",
+        ],
     )
 
     # currently only support Blackwell
