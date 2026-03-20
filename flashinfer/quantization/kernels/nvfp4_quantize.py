@@ -467,6 +467,71 @@ class NVFP4QuantizeTMAKernel:
                 return compute_sf_index_linear_gpu(row_idx, col_idx, padded_cols)
 
     @cute.jit
+    def _quantize_sf_block(
+        self,
+        h0: cutlass.Uint32,
+        h1: cutlass.Uint32,
+        h2: cutlass.Uint32,
+        h3: cutlass.Uint32,
+        h4: cutlass.Uint32,
+        h5: cutlass.Uint32,
+        h6: cutlass.Uint32,
+        h7: cutlass.Uint32,
+        global_row: Int32,
+        sf_col: Int32,
+        global_scale: Float32,
+        M: Int32,
+        padded_M: Int32,
+        padded_sf_cols: Int32,
+        mOutput: cute.Tensor,
+        mScales: cute.Tensor,
+    ):
+        """Quantize one 16-element SF block and write results to GMEM."""
+        from ...cute_dsl.fp4_common import (
+            cvt_f32_to_e4m3,
+            nvfp4_compute_output_scale,
+            rcp_approx_ftz,
+        )
+
+        if global_row < padded_M:
+            is_padding_row = global_row >= M
+
+            if is_padding_row:
+                sf_offset = self._compute_sf_offset(global_row, sf_col, padded_sf_cols)
+                mScales[sf_offset] = Uint8(0)
+            else:
+                if cutlass.const_expr(self.is_bfloat16):
+                    block_max_h2 = bfloat2_max_abs_8_fn(h0, h1, h2, h3, h4, h5, h6, h7)
+                    block_max = bfloat2_hmax_reduce_to_f32(block_max_h2)
+                else:
+                    block_max_h2 = half2_max_abs_8_fn(h0, h1, h2, h3, h4, h5, h6, h7)
+                    block_max = hmax_reduce_to_f32(block_max_h2)
+
+                fp4_max_rcp = rcp_approx_ftz(Float32(6.0))
+                scale_float = global_scale * (block_max * fp4_max_rcp)
+                scale_fp8_u32 = cvt_f32_to_e4m3(scale_float)
+                scale_fp8 = Uint8(scale_fp8_u32 & cutlass.Uint32(0xFF))
+
+                output_scale = nvfp4_compute_output_scale(scale_fp8_u32, global_scale)
+
+                if cutlass.const_expr(self.is_bfloat16):
+                    packed64 = bfloat2x8_to_e2m1x16_packed(
+                        h0, h1, h2, h3, h4, h5, h6, h7, output_scale
+                    )
+                else:
+                    packed64 = half2x8_to_e2m1x16_packed(
+                        h0, h1, h2, h3, h4, h5, h6, h7, output_scale
+                    )
+
+                sf_offset = self._compute_sf_offset(global_row, sf_col, padded_sf_cols)
+                mScales[sf_offset] = scale_fp8
+
+                row_output = mOutput[global_row, None]
+                out_base = sf_col * Int32(NVFP4_SF_VEC_SIZE // 2)
+                out_ptr = get_ptr_as_int64(row_output, out_base)
+                st_global_u64(out_ptr, packed64)
+
+    @cute.jit
     def __call__(
         self,
         mInput: cute.Tensor,
@@ -478,32 +543,53 @@ class NVFP4QuantizeTMAKernel:
         mGlobalScale: cute.Tensor,
         stream,
     ):
+        # 3D global tensor: [padded_M, K/64, 64] so each warp's 64-col
+        # stripe is the contiguous innermost dimension, matching the CUDA
+        # TMA kernel's 3D tensor map.
         gInput = cute.make_tensor(
             mInput.iterator,
-            cute.make_layout((padded_M, self.K), stride=(self.K, 1)),
+            cute.make_layout(
+                (padded_M, self.K // _TMA_COL_TILE, _TMA_COL_TILE),
+                stride=(self.K, _TMA_COL_TILE, 1),
+            ),
         )
 
-        # TMA tile covers the full 512-column stage
-        smem_layout_single = cute.make_layout(
-            (_TMA_ROW_TILE, _TMA_COLS_PER_STAGE),
-            stride=(_TMA_COLS_PER_STAGE, 1),
+        # SMEM layout per stage: [rows=16, warps=8, cols_per_warp=64]
+        # with SWIZZLE_128B applied.  Within each warp's [16, 64] tile the
+        # row stride is 64 elems = 128 bytes, putting row bits in the S=3
+        # range of the swizzle so different rows map to different banks.
+        smem_swizzle = cute.make_swizzle(3, 4, 3)  # SWIZZLE_128B for 2B types
+        smem_outer_single = cute.make_layout(
+            (_TMA_ROW_TILE, _TMA_NUM_CONSUMER_WARPS, _TMA_COL_TILE),
+            stride=(_TMA_COL_TILE, _TMA_ROW_TILE * _TMA_COL_TILE, 1),
+        )
+        smem_single_composed = cute.make_composed_layout(
+            smem_swizzle, 0, smem_outer_single
         )
 
-        cta_tiler = cute.product_each(smem_layout_single.shape)
+        cta_tiler = (_TMA_ROW_TILE, _TMA_NUM_CONSUMER_WARPS, _TMA_COL_TILE)
         tma_atom, tma_tensor = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileG2SOp(),
             gInput,
-            smem_layout_single,
+            smem_single_composed,
             cta_tiler,
         )
 
         total_smem_elems = self.elems_per_stage * self.num_stages
-        smem_layout_staged = cute.make_layout(
-            (_TMA_ROW_TILE, _TMA_COLS_PER_STAGE, self.num_stages),
-            stride=(_TMA_COLS_PER_STAGE, 1, self.elems_per_stage),
+        # Staged outer layout (no swizzle — swizzle passed separately)
+        smem_outer_staged = cute.make_layout(
+            (_TMA_ROW_TILE, _TMA_NUM_CONSUMER_WARPS, _TMA_COL_TILE, self.num_stages),
+            stride=(
+                _TMA_COL_TILE,
+                _TMA_ROW_TILE * _TMA_COL_TILE,
+                1,
+                self.elems_per_stage,
+            ),
         )
+        # Flat layout for manual-swizzle consumer reads
+        smem_layout_flat = cute.make_layout((total_smem_elems,))
 
-        self.num_tma_load_bytes = cute.size_in_bytes(self.dtype, smem_layout_single)
+        self.num_tma_load_bytes = cute.size_in_bytes(self.dtype, smem_outer_single)
 
         @cute.struct
         class SharedStorage:
@@ -528,11 +614,19 @@ class NVFP4QuantizeTMAKernel:
             M,
             padded_M,
             mGlobalScale,
-            smem_layout_staged,
+            smem_outer_staged,
+            smem_swizzle,
+            smem_layout_flat,
             cluster_layout_vmnk,
         ).launch(
             grid=[num_blocks, 1, 1],
             block=[self.threads_per_cta, 1, 1],
+            max_number_threads=[
+                self.threads_per_cta,
+                1,
+                1,
+            ],  # __launch_bounds__(288, 2)
+            min_blocks_per_mp=2,
             cluster=(*self.cluster_shape_mn, 1),
             stream=stream,
             use_pdl=self.enable_pdl,
@@ -548,15 +642,14 @@ class NVFP4QuantizeTMAKernel:
         M: Int32,
         padded_M: Int32,
         mGlobalScale: cute.Tensor,
-        smem_layout_staged: cute.Layout,
+        smem_outer_staged: cute.Layout,
+        smem_swizzle: cute.Swizzle,
+        smem_layout_flat: cute.Layout,
         cluster_layout_vmnk: cute.Layout,
     ):
         from ...cute_dsl.fp4_common import (
-            cvt_f32_to_e4m3,
             get_smem_ptr_as_int32,
             ld_shared_v4_u32,
-            nvfp4_compute_output_scale,
-            rcp_approx_ftz,
         )
 
         tidx, _, _ = cute.arch.thread_idx()
@@ -581,7 +674,12 @@ class NVFP4QuantizeTMAKernel:
         storage = smem.allocate(self.shared_storage)
 
         load_mbar_ptr = storage.load_full_mbar.data_ptr()
-        sData_staged = storage.smem_data.get_tensor(smem_layout_staged)
+        # Swizzled tensor for TMA partition (address-space-correct writes)
+        sData_staged = storage.smem_data.get_tensor(
+            smem_outer_staged, swizzle=smem_swizzle
+        )
+        # Flat tensor for manual-swizzle consumer reads
+        sData_flat = storage.smem_data.get_tensor(smem_layout_flat)
 
         # ---- Pipeline setup ----
         load_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 1)
@@ -602,16 +700,18 @@ class NVFP4QuantizeTMAKernel:
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
 
-        # ---- TMA partition ----
+        # ---- TMA partition (3D: rows × warps × cols_per_warp) ----
         gSrc_tiled = cute.local_tile(
-            gInput_tma, (_TMA_ROW_TILE, _TMA_COLS_PER_STAGE), (None, None)
+            gInput_tma,
+            (_TMA_ROW_TILE, _TMA_NUM_CONSUMER_WARPS, _TMA_COL_TILE),
+            (None, None, None),
         )
         tAsA, tAgA = cpasync.tma_partition(
             tma_atom,
             0,
             cute.make_layout(1),
-            cute.group_modes(sData_staged, 0, 2),
-            cute.group_modes(gSrc_tiled, 0, 2),
+            cute.group_modes(sData_staged, 0, 3),  # Group 3 tile modes
+            cute.group_modes(gSrc_tiled, 0, 3),
         )
 
         num_row_tiles = cute.ceil_div(padded_M, _TMA_ROW_TILE)
@@ -635,7 +735,7 @@ class NVFP4QuantizeTMAKernel:
 
                     cute.copy(
                         tma_atom,
-                        tAgA[(None, row_tile_idx, col_chunk)],
+                        tAgA[(None, row_tile_idx, col_chunk, 0)],
                         tAsA[(None, producer_state.index)],
                         tma_bar_ptr=load_pipeline.producer_get_barrier(producer_state),
                     )
@@ -656,7 +756,16 @@ class NVFP4QuantizeTMAKernel:
             # 0-indexed consumer warp id
             consumer_warp_idx = warp_idx - Int32(1)
 
-            # Base column within the 512-col stage for this thread
+            # Pre-compute warp tile base offset (constant per warp)
+            # SMEM 3D layout: [rows=16, warps=8, cols=64] per stage
+            # stride: [64, 1024, 1] → warp tile base = warp * 1024
+            warp_tile_elems = _TMA_ROW_TILE * _TMA_COL_TILE  # 1024
+            warp_tile_base = consumer_warp_idx * Int32(warp_tile_elems)
+
+            # Float4 base position for this thread (0, 2, 4, 6)
+            f4_base = col_idx_local * Int32(2)
+
+            # Global column offset for SF index: warp's column within K
             base_col_in_stage = consumer_warp_idx * Int32(
                 _TMA_COL_TILE
             ) + col_idx_local * Int32(self.ELTS_PER_THREAD)
@@ -670,97 +779,101 @@ class NVFP4QuantizeTMAKernel:
                     load_pipeline.consumer_wait(consumer_state)
                     stage = consumer_state.index
 
-                    # Global column base for this col_chunk
-                    global_col_base = col_chunk * Int32(_TMA_COLS_PER_STAGE)
+                    # ---- Read ALL SMEM data with SWIZZLE_128B addressing ----
+                    # Within each warp's [16,64] tile, the XOR pattern matches
+                    # CUDA's load_input_vec: float4_idx ^= row & 7
+                    # Physical elem offset in warp tile for (row, float4 f):
+                    #   row * 64 + (f ^ (row & 7)) * 8
+                    stage_base = stage * Int32(elems_per_stage)
 
-                    # Process ROW_ITERATIONS row batches (compile-time unrolled)
-                    for row_iter in range(self.ROW_ITERATIONS):
-                        cur_row_in_tile = row_idx_local + Int32(
-                            row_iter * self.ROWS_PER_WARP
-                        )
-                        global_row = base_row + cur_row_in_tile
+                    # Row iteration 0 (row_idx_local = 0..7)
+                    r0_xor = row_idx_local & Int32(7)
+                    r0_f4_0 = f4_base ^ r0_xor
+                    r0_f4_1 = (f4_base + Int32(1)) ^ r0_xor
+                    r0_row_base = (
+                        stage_base
+                        + warp_tile_base
+                        + row_idx_local * Int32(_TMA_COL_TILE)
+                    )
+                    r0_addr_0 = get_smem_ptr_as_int32(
+                        sData_flat, r0_row_base + r0_f4_0 * Int32(8)
+                    )
+                    r0_addr_1 = get_smem_ptr_as_int32(
+                        sData_flat, r0_row_base + r0_f4_1 * Int32(8)
+                    )
+                    r0_h0, r0_h1, r0_h2, r0_h3 = ld_shared_v4_u32(r0_addr_0)
+                    r0_h4, r0_h5, r0_h6, r0_h7 = ld_shared_v4_u32(r0_addr_1)
 
-                        # ---- Vectorized SMEM read: 2 x ld.shared.v4.u32 ----
-                        smem_elem_off = (
-                            stage * Int32(elems_per_stage)
-                            + cur_row_in_tile * Int32(_TMA_COLS_PER_STAGE)
-                            + base_col_in_stage
-                        )
-                        smem_addr = get_smem_ptr_as_int32(sData_staged, smem_elem_off)
-                        h0, h1, h2, h3 = ld_shared_v4_u32(smem_addr)
-                        h4, h5, h6, h7 = ld_shared_v4_u32(smem_addr + Int32(16))
+                    # Row iteration 1 (row = row_idx_local + 8)
+                    r1_row = row_idx_local + Int32(self.ROWS_PER_WARP)
+                    r1_xor = r1_row & Int32(7)
+                    r1_f4_0 = f4_base ^ r1_xor
+                    r1_f4_1 = (f4_base + Int32(1)) ^ r1_xor
+                    r1_row_base = (
+                        stage_base + warp_tile_base + r1_row * Int32(_TMA_COL_TILE)
+                    )
+                    r1_addr_0 = get_smem_ptr_as_int32(
+                        sData_flat, r1_row_base + r1_f4_0 * Int32(8)
+                    )
+                    r1_addr_1 = get_smem_ptr_as_int32(
+                        sData_flat, r1_row_base + r1_f4_1 * Int32(8)
+                    )
+                    r1_h0, r1_h1, r1_h2, r1_h3 = ld_shared_v4_u32(r1_addr_0)
+                    r1_h4, r1_h5, r1_h6, r1_h7 = ld_shared_v4_u32(r1_addr_1)
 
-                        # ---- Quantize and write ----
-                        if global_row < padded_M:
-                            # SF column index for this thread
-                            sf_col = (global_col_base + base_col_in_stage) // Int32(
-                                NVFP4_SF_VEC_SIZE
-                            )
-                            is_padding_row = global_row >= M
-
-                            if is_padding_row:
-                                sf_offset = self._compute_sf_offset(
-                                    global_row, sf_col, padded_sf_cols
-                                )
-                                mScales[sf_offset] = Uint8(0)
-                            else:
-                                if cutlass.const_expr(self.is_bfloat16):
-                                    block_max_h2 = bfloat2_max_abs_8_fn(
-                                        h0, h1, h2, h3, h4, h5, h6, h7
-                                    )
-                                    block_max = bfloat2_hmax_reduce_to_f32(block_max_h2)
-                                else:
-                                    block_max_h2 = half2_max_abs_8_fn(
-                                        h0, h1, h2, h3, h4, h5, h6, h7
-                                    )
-                                    block_max = hmax_reduce_to_f32(block_max_h2)
-
-                                fp4_max_rcp = rcp_approx_ftz(Float32(6.0))
-                                scale_float = global_scale * (block_max * fp4_max_rcp)
-                                scale_fp8_u32 = cvt_f32_to_e4m3(scale_float)
-                                scale_fp8 = Uint8(scale_fp8_u32 & cutlass.Uint32(0xFF))
-
-                                output_scale = nvfp4_compute_output_scale(
-                                    scale_fp8_u32, global_scale
-                                )
-
-                                if cutlass.const_expr(self.is_bfloat16):
-                                    packed64 = bfloat2x8_to_e2m1x16_packed(
-                                        h0,
-                                        h1,
-                                        h2,
-                                        h3,
-                                        h4,
-                                        h5,
-                                        h6,
-                                        h7,
-                                        output_scale,
-                                    )
-                                else:
-                                    packed64 = half2x8_to_e2m1x16_packed(
-                                        h0,
-                                        h1,
-                                        h2,
-                                        h3,
-                                        h4,
-                                        h5,
-                                        h6,
-                                        h7,
-                                        output_scale,
-                                    )
-
-                                sf_offset = self._compute_sf_offset(
-                                    global_row, sf_col, padded_sf_cols
-                                )
-                                mScales[sf_offset] = scale_fp8
-
-                                row_output = mOutput[global_row, None]
-                                out_base = sf_col * Int32(NVFP4_SF_VEC_SIZE // 2)
-                                out_ptr = get_ptr_as_int64(row_output, out_base)
-                                st_global_u64(out_ptr, packed64)
-
+                    # ---- Release pipeline early (all data in registers) ----
                     load_pipeline.consumer_release(consumer_state)
                     consumer_state.advance()
+
+                    # ---- Quantize and write: both row iterations ----
+                    # Global column base for SF index computation
+                    global_col_base = col_chunk * Int32(_TMA_COLS_PER_STAGE)
+                    sf_col = (global_col_base + base_col_in_stage) // Int32(
+                        NVFP4_SF_VEC_SIZE
+                    )
+
+                    # Row iteration 0
+                    global_row_0 = base_row + row_idx_local
+                    self._quantize_sf_block(
+                        r0_h0,
+                        r0_h1,
+                        r0_h2,
+                        r0_h3,
+                        r0_h4,
+                        r0_h5,
+                        r0_h6,
+                        r0_h7,
+                        global_row_0,
+                        sf_col,
+                        global_scale,
+                        M,
+                        padded_M,
+                        padded_sf_cols,
+                        mOutput,
+                        mScales,
+                    )
+
+                    # Row iteration 1
+                    global_row_1 = base_row + row_idx_local + Int32(self.ROWS_PER_WARP)
+                    self._quantize_sf_block(
+                        r1_h0,
+                        r1_h1,
+                        r1_h2,
+                        r1_h3,
+                        r1_h4,
+                        r1_h5,
+                        r1_h6,
+                        r1_h7,
+                        global_row_1,
+                        sf_col,
+                        global_scale,
+                        M,
+                        padded_M,
+                        padded_sf_cols,
+                        mOutput,
+                        mScales,
+                    )
+
                     col_chunk = col_chunk + Int32(1)
 
                 # Zero padding SF columns for swizzled layouts
@@ -988,7 +1101,7 @@ def nvfp4_quantize_cute_dsl(
             [float(global_scale)], dtype=torch.float32, device=input.device
         )
 
-    target_grid = get_num_sm(input.device) * _BLOCKS_PER_SM
+    num_sm = get_num_sm(input.device)
 
     num_sf_blocks_per_row = k // NVFP4_SF_VEC_SIZE
 
@@ -1012,7 +1125,11 @@ def nvfp4_quantize_cute_dsl(
             dtype_key, k, sf_layout, enable_pdl
         )
 
-        num_blocks = min((padded_m + rows_per_block - 1) // rows_per_block, target_grid)
+        # Match CUDA TMA kernel: grid = min(row_tiles, SM_count * 2)
+        tma_target_grid = num_sm * 2
+        num_blocks = min(
+            (padded_m + rows_per_block - 1) // rows_per_block, tma_target_grid
+        )
 
         input_padded = input
         if padded_m > m:
@@ -1063,7 +1180,10 @@ def nvfp4_quantize_cute_dsl(
         dtype_key, k, sf_layout, enable_pdl
     )
 
-    num_blocks = min((padded_m + rows_per_block - 1) // rows_per_block, target_grid)
+    default_target_grid = num_sm * _BLOCKS_PER_SM
+    num_blocks = min(
+        (padded_m + rows_per_block - 1) // rows_per_block, default_target_grid
+    )
 
     fp4_output = torch.empty(m, k // 2, dtype=torch.uint8, device=input.device)
     scale_output = torch.empty(
