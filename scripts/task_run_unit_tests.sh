@@ -11,9 +11,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091  # File exists, checked separately
 source "${SCRIPT_DIR}/test_utils.sh"
 
-# Source test environment setup (handles package overrides like TVM-FFI)
-source "${SCRIPT_DIR}/setup_test_env.sh"
-
 # Find and filter test files based on pytest.ini exclusions
 find_test_files() {
     echo "Reading pytest.ini for excluded directories..."
