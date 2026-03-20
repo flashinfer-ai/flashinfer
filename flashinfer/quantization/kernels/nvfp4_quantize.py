@@ -958,13 +958,22 @@ def _get_compiled_kernel_nvfp4(
 
 
 _TMA_MIN_M = 1024
+# TMA wins when the total problem is large enough to amortize pipeline overhead.
+# Empirically, log2(M) + log2(K) >= 25 (i.e., M*K >= ~33M elements) is the
+# crossover where TMA outperforms the default vectorized-load kernel on B200.
+_TMA_LOG2_MK_THRESHOLD = 25
 
 
 def _should_use_tma(m: int, k: int, dtype: torch.dtype) -> bool:
     """Determine if TMA kernel should be used based on problem dimensions."""
     if dtype == torch.float8_e4m3fn:
         return False
-    return m >= _TMA_MIN_M and k % _TMA_COLS_PER_STAGE == 0
+    if k % _TMA_COLS_PER_STAGE != 0:
+        return False
+    if m < _TMA_MIN_M:
+        return False
+    # Use log2(M) + log2(K) threshold for the crossover point
+    return m.bit_length() - 1 + k.bit_length() - 1 >= _TMA_LOG2_MK_THRESHOLD
 
 
 @functools.cache
