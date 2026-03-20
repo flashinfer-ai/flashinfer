@@ -104,8 +104,7 @@ class MLA {
                               K,
                               args.mainloop.ptr_seq,
                               args.ptr_split_kv,
-                              Kernel::TileShapeS::value,
-                              args.epilogue.output_scale};
+                              Kernel::TileShapeS::value};
   }
 
  public:
