@@ -62,12 +62,8 @@ static constexpr int NUM_COMPUTE_WARPS_PER_GROUP = 4;
 static constexpr int NUM_TMA_WARPS = 1;
 static constexpr int NUM_WARPS = NUM_COMPUTE_WARPS_PER_GROUP + NUM_TMA_WARPS;  // 5
 static constexpr int LANES_PER_ROW = 8;
-static constexpr int ROWS_PER_WARP = 32 / LANES_PER_ROW;                           // 4
+static constexpr int ROWS_PER_WARP = warpSize / LANES_PER_ROW;                     // 4
 static constexpr int ROWS_PER_PASS = NUM_COMPUTE_WARPS_PER_GROUP * ROWS_PER_WARP;  // 16
-// Rows per TMA transaction. Must be a multiple of ROWS_PER_PASS.
-// Larger values = fewer barrier syncs but more smem per pipeline stage.
-// Compute processes TMA_STATE_ROWS in sub-passes of ROWS_PER_PASS each.
-static constexpr int TMA_STATE_ROWS = 2 * ROWS_PER_PASS;  // 32 rows per TMA transaction
 }  // namespace horiz
 
 // =============================================================================
@@ -76,11 +72,11 @@ static constexpr int TMA_STATE_ROWS = 2 * ROWS_PER_PASS;  // 32 rows per TMA tra
 // =============================================================================
 
 template <typename input_t, typename state_t, int TOKENS_MTP, int DIM, int DSTATE,
-          int NUM_IN_STAGES, int HEADS_PER_CTA = 1>
+          int NUM_IN_STAGES, int TMA_STATE_ROWS, int HEADS_PER_CTA = 1>
 struct GroupStorageHorizontal {
   alignas(128) input_t B[TOKENS_MTP][DSTATE];
   alignas(128) input_t C[TOKENS_MTP][DSTATE];
-  alignas(128) state_t state_in[NUM_IN_STAGES][horiz::TMA_STATE_ROWS * DSTATE];
+  alignas(128) state_t state_in[NUM_IN_STAGES][TMA_STATE_ROWS * DSTATE];
   alignas(128) input_t x[HEADS_PER_CTA][TOKENS_MTP][DIM];
   float dt[HEADS_PER_CTA][TOKENS_MTP];
   float out[TOKENS_MTP][DIM];
@@ -96,7 +92,7 @@ struct GroupStorageHorizontal {
 // =============================================================================
 
 template <typename input_t, typename state_t, typename stateIndex_t, int NTOKENS, int DIM,
-          int DSTATE, int NUM_IN_STAGES, int HEADS_PER_CTA, typename SramT>
+          int DSTATE, int NUM_IN_STAGES, int TMA_STATE_ROWS, int HEADS_PER_CTA, typename SramT>
 __device__ __forceinline__ void role_load_horizontal(
     SramT& sram, int lane, SelectiveStateMTPParams const& params, int batch, int base_head,
     int kv_group, CUtensorMap const& tensorState, CUtensorMap const& tensorX,
@@ -106,8 +102,8 @@ __device__ __forceinline__ void role_load_horizontal(
       reinterpret_cast<stateIndex_t const*>(params.state_batch_indices);
   auto const state_batch = state_batch_indices ? (int)state_batch_indices[batch] : batch;
 
-  constexpr int numTmaLoads = DIM / horiz::TMA_STATE_ROWS;
-  static_assert(DIM % horiz::TMA_STATE_ROWS == 0, "DIM must be divisible by TMA_STATE_ROWS");
+  constexpr int numTmaLoads = DIM / TMA_STATE_ROWS;
+  static_assert(DIM % TMA_STATE_ROWS == 0, "DIM must be divisible by TMA_STATE_ROWS");
 
   // ── Load B, C (once), and x for all heads ─────────────────────────────
   if (lane == 0) {
@@ -132,14 +128,14 @@ __device__ __forceinline__ void role_load_horizontal(
     int const head = base_head + h;
     for (int tl = 0; tl < numTmaLoads; tl++) {
       int const slot = tl % NUM_IN_STAGES;
-      constexpr int bytesChunk = horiz::TMA_STATE_ROWS * DSTATE * (int)sizeof(state_t);
+      constexpr int bytesChunk = TMA_STATE_ROWS * DSTATE * (int)sizeof(state_t);
 
       // Wait for compute to release this slot (tight spin, no NANOSLEEP)
       arrive_and_wait_parity(sram.bar_state_in_empty[slot], parity_empty[slot]);
 
       if (lane == 0) {
         cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.state_in[slot][0], &tensorState, 0,
-                                                      tl * horiz::TMA_STATE_ROWS, head, state_batch,
+                                                      tl * TMA_STATE_ROWS, head, state_batch,
                                                       sram.bar_state_in_full[slot]);
         cuda::device::barrier_arrive_tx(sram.bar_state_in_full[slot], 1, bytesChunk);
       }
@@ -155,7 +151,7 @@ __device__ __forceinline__ void role_load_horizontal(
 
 template <typename input_t, typename state_t, typename matrixA_t, typename weight_t,
           typename stateIndex_t, int NTOKENS, int DIM, int DSTATE, int PHILOX_ROUNDS,
-          int NUM_IN_STAGES, int HEADS_PER_CTA, typename SramT>
+          int NUM_IN_STAGES, int TMA_STATE_ROWS, int HEADS_PER_CTA, typename SramT>
 __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int lane,
                                                              int compute_warp,
                                                              SelectiveStateMTPParams const& params,
@@ -163,13 +159,13 @@ __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int la
                                                              bool is_pad) {
   constexpr int lanesPerRow = horiz::LANES_PER_ROW;
   constexpr int rowsPerWarp = horiz::ROWS_PER_WARP;
-  constexpr int numTmaLoads = DIM / horiz::TMA_STATE_ROWS;
-  constexpr int subPassesPerTma = horiz::TMA_STATE_ROWS / horiz::ROWS_PER_PASS;
+  constexpr int numTmaLoads = DIM / TMA_STATE_ROWS;
+  constexpr int subPassesPerTma = TMA_STATE_ROWS / horiz::ROWS_PER_PASS;
   constexpr int DSTATE_PADDED = nextPow2(DSTATE);
   constexpr int stateValuesPerThread = DSTATE_PADDED / lanesPerRow;
   static_assert(DSTATE % lanesPerRow == 0, "DSTATE must be divisible by lanesPerRow");
-  static_assert(DIM % horiz::TMA_STATE_ROWS == 0, "DIM must be divisible by TMA_STATE_ROWS");
-  static_assert(horiz::TMA_STATE_ROWS % horiz::ROWS_PER_PASS == 0,
+  static_assert(DIM % TMA_STATE_ROWS == 0, "DIM must be divisible by TMA_STATE_ROWS");
+  static_assert(TMA_STATE_ROWS % horiz::ROWS_PER_PASS == 0,
                 "TMA_STATE_ROWS must be a multiple of ROWS_PER_PASS");
 
   constexpr int bankSize = sizeof(uint32_t);
@@ -279,7 +275,7 @@ __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int la
 #pragma unroll 1
       for (int sp = 0; sp < subPassesPerTma; sp++) {
         int const sram_row = sp * horiz::ROWS_PER_PASS + compute_warp * rowsPerWarp + group;
-        int const dd = tl * horiz::TMA_STATE_ROWS + sram_row;  // global DIM row
+        int const dd = tl * TMA_STATE_ROWS + sram_row;  // global DIM row
 
         // Load state from smem (zero-fill columns beyond DSTATE)
         float2 rState[numTiles][pairsPerTileMember];
@@ -468,7 +464,7 @@ __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int la
 
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t,
           typename stateIndex_t, int NTOKENS, int DIM, int DSTATE, int HEADS_PER_GROUP,
-          int PHILOX_ROUNDS, int NUM_IN_STAGES, int HEADS_PER_CTA>
+          int PHILOX_ROUNDS, int NUM_IN_STAGES, int TMA_STATE_ROWS, int HEADS_PER_CTA>
 __global__ void __launch_bounds__(horiz::NUM_WARPS * 32, 6)
     selective_state_update_kernel_horizontal_mtp(SelectiveStateMTPParams params,
                                                  __grid_constant__ CUtensorMap const tensorState,
@@ -479,8 +475,8 @@ __global__ void __launch_bounds__(horiz::NUM_WARPS * 32, 6)
                 "HEADS_PER_GROUP must be divisible by HEADS_PER_CTA");
 
   extern __shared__ __align__(128) char smem[];
-  using sram_t =
-      GroupStorageHorizontal<input_t, state_t, NTOKENS, DIM, DSTATE, NUM_IN_STAGES, HEADS_PER_CTA>;
+  using sram_t = GroupStorageHorizontal<input_t, state_t, NTOKENS, DIM, DSTATE, NUM_IN_STAGES,
+                                        TMA_STATE_ROWS, HEADS_PER_CTA>;
   auto& sram = *reinterpret_cast<sram_t*>(smem);
 
   int const batch = blockIdx.x;
@@ -514,13 +510,13 @@ __global__ void __launch_bounds__(horiz::NUM_WARPS * 32, 6)
   // ── Warp role dispatch ─────────────────────────────────────────────────
   if (warp < horiz::NUM_COMPUTE_WARPS_PER_GROUP) {
     role_update_state_horizontal<input_t, state_t, matrixA_t, weight_t, stateIndex_t, NTOKENS, DIM,
-                                 DSTATE, PHILOX_ROUNDS, NUM_IN_STAGES, HEADS_PER_CTA>(
-        sram, lane, warp, params, batch, base_head, is_pad);
+                                 DSTATE, PHILOX_ROUNDS, NUM_IN_STAGES, TMA_STATE_ROWS,
+                                 HEADS_PER_CTA>(sram, lane, warp, params, batch, base_head, is_pad);
   } else {
     int const kv_group = base_head / HEADS_PER_GROUP;
     role_load_horizontal<input_t, state_t, stateIndex_t, NTOKENS, DIM, DSTATE, NUM_IN_STAGES,
-                         HEADS_PER_CTA>(sram, lane, params, batch, base_head, kv_group, tensorState,
-                                        tensorX, tensorB, tensorC);
+                         TMA_STATE_ROWS, HEADS_PER_CTA>(
+        sram, lane, params, batch, base_head, kv_group, tensorState, tensorX, tensorB, tensorC);
   }
 }
 

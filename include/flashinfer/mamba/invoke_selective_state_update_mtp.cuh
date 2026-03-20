@@ -150,6 +150,9 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
     FLASHINFER_CHECK(!scaleState, "horizontal algorithm does not support scaled (quantized) state");
 
     constexpr int NUM_IN_STAGES = 2;
+    // TMA_STATE_ROWS: rows of DIM per TMA transaction. Must be a multiple of ROWS_PER_PASS.
+    // Larger values = fewer barrier syncs but more smem per pipeline stage.
+    constexpr int TMA_STATE_ROWS = 2 * horiz::ROWS_PER_PASS;
 
     dispatchRatio(
         params, std::integer_sequence<int, 1, 2, 4, 8, 16, 32, 64>{}, [&]<int HEADS_PER_GROUP>() {
@@ -157,12 +160,12 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
           static_assert(HEADS_PER_GROUP % HEADS_PER_CTA == 0);
 
           using sram_t = GroupStorageHorizontal<input_t, state_t, NTOKENS_MTP, DIM, DSTATE,
-                                                NUM_IN_STAGES, HEADS_PER_CTA>;
+                                                NUM_IN_STAGES, TMA_STATE_ROWS, HEADS_PER_CTA>;
           constexpr size_t smem_size = sizeof(sram_t);
 
           auto func = selective_state_update_kernel_horizontal_mtp<
               input_t, weight_t, matrixA_t, state_t, stateIndex_t, NTOKENS_MTP, DIM, DSTATE,
-              HEADS_PER_GROUP, PHILOX_ROUNDS, NUM_IN_STAGES, HEADS_PER_CTA>;
+              HEADS_PER_GROUP, PHILOX_ROUNDS, NUM_IN_STAGES, TMA_STATE_ROWS, HEADS_PER_CTA>;
 
           FLASHINFER_CHECK(params.nheads % HEADS_PER_CTA == 0, "nheads (", params.nheads,
                            ") must be divisible by HEADS_PER_CTA (", HEADS_PER_CTA,
@@ -176,7 +179,7 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
               typeid(state_t),
               /*shapes*/ {DSTATE, DIM, params.nheads, params.state_cache_size},
               /*strides*/ {1, DSTATE, DSTATE * DIM, params.state_stride_batch},
-              /*tiles*/ {DSTATE, horiz::TMA_STATE_ROWS, 1, 1}, params.state);
+              /*tiles*/ {DSTATE, TMA_STATE_ROWS, 1, 1}, params.state);
 
           auto B_tensor = tma::buildNdDescriptor(
               typeid(input_t),
