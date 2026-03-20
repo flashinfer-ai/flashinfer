@@ -14,7 +14,7 @@ from flashinfer.utils import is_cvt_rs_supported, is_sm100a_supported
 
 _requires_sm100 = pytest.mark.skipif(
     not is_sm100a_supported(torch.device("cuda")),
-    reason="Vertical MTP kernel requires SM100+ (Blackwell)",
+    reason="Vertical/horizontal MTP kernel requires SM100+ (Blackwell)",
 )
 
 from .triton_reference.selective_state_update import selective_state_update_triton
@@ -51,6 +51,17 @@ class TestSelectiveStateUpdateMTP:
     NGROUPS = 8
     INPUT_DTYPE = torch.bfloat16
     MATRIX_A_DTYPE = torch.float32
+
+    @pytest.fixture(
+        autouse=True,
+        params=[
+            "simple",
+            pytest.param("vertical", marks=_requires_sm100),
+            pytest.param("horizontal", marks=_requires_sm100),
+        ],
+    )
+    def _algorithm(self, request):
+        self._algo = request.param
 
     def make_inputs(
         self, batch, nheads, dim, dstate, cache_steps, state_dtype, weight_dtype
@@ -108,7 +119,7 @@ class TestSelectiveStateUpdateMTP:
             pad_slot_id=-1,
             out=out,
             disable_state_update=disable_state_update,
-            algorithm="simple",
+            algorithm=self._algo,
         )
 
     def assert_outputs_match(self, y_ref, y_test, msg_prefix=""):
@@ -210,8 +221,11 @@ class TestSelectiveStateUpdateMTP:
                 "Returned tensor should be the same object as the provided output tensor"
             )
 
-        self.assert_states_match(state_ref, inputs["state_cache"], inputs["slot_idx"])
-        self.assert_outputs_match(y_ref, y_test)
+        prefix = f"[{self._algo}] "
+        self.assert_states_match(
+            state_ref, inputs["state_cache"], inputs["slot_idx"], msg_prefix=prefix
+        )
+        self.assert_outputs_match(y_ref, y_test, msg_prefix=prefix)
 
 
 class TestSelectiveStateUpdateMTPWithZ(TestSelectiveStateUpdateMTP):
@@ -404,7 +418,7 @@ class TestSelectiveStateUpdateMTPWithIntermediateStates(TestSelectiveStateUpdate
             intermediate_states_buffer=inputs["intermediate_states_buffer"],
             intermediate_state_indices=inputs["intermediate_slot_idx"],
             cache_steps=inputs["cache_steps"],
-            algorithm="simple",
+            algorithm=self._algo,
         )
 
     # fmt: off
@@ -577,6 +591,7 @@ class TestSelectiveStateUpdateMTPInt32Indices(TestSelectiveStateUpdateMTP):
             pad_slot_id=-1,
             out=out,
             disable_state_update=disable_state_update,
+            algorithm=self._algo,
         )
 
     @pytest.mark.parametrize(
@@ -782,6 +797,7 @@ class TestSelectiveStateUpdateMTPInt16(TestSelectiveStateUpdateMTP):
             out=out,
             disable_state_update=disable_state_update,
             state_scale=inputs["state_scale"],
+            algorithm=self._algo,
         )
 
     def assert_states_match(
@@ -847,6 +863,13 @@ class TestSelectiveStateUpdateMTPInt16(TestSelectiveStateUpdateMTP):
         inputs = self.make_inputs(
             batch, nheads, dim, dstate, cache_steps, state_dtype, weight_dtype
         )
+
+        # Vertical/horizontal don't support scaled (quantized) state
+        if self._algo in ("vertical", "horizontal"):
+            with pytest.raises(RuntimeError, match="does not support scaled"):
+                self.run_kernel(inputs)
+            return
+
         y_ref, state_ref, state_scale_ref = self.make_reference_output(inputs)
 
         if use_out_tensor:
@@ -948,6 +971,7 @@ class TestSelectiveStateUpdateMTPInt16IntermediateStates(
             cache_steps=inputs["cache_steps"],
             state_scale=inputs["state_scale"],
             intermediate_state_scales=inputs["intermediate_state_scales"],
+            algorithm=self._algo,
         )
 
     # fmt: off
@@ -978,6 +1002,13 @@ class TestSelectiveStateUpdateMTPInt16IntermediateStates(
         inputs = self.make_inputs(
             batch, nheads, dim, dstate, cache_steps, state_dtype, weight_dtype
         )
+
+        # Vertical/horizontal don't support scaled (quantized) state
+        if self._algo in ("vertical", "horizontal"):
+            with pytest.raises(RuntimeError, match="does not support scaled"):
+                self.run_kernel_with_intermediate_states(inputs)
+            return
+
         y_ref, _state_ref, intermediate_states_ref, iscales_ref = (
             self.make_reference_output(inputs)
         )
@@ -1162,6 +1193,7 @@ class TestSelectiveStateUpdateMTPStochasticRounding(TestSelectiveStateUpdateMTP)
             out=out,
             disable_state_update=disable_state_update,
             rand_seed=self.RAND_SEED,
+            algorithm=self._algo,
         )
 
     def assert_states_match(self, state_ref, state_test, slot_idx, msg_prefix=""):
@@ -1305,6 +1337,7 @@ class TestSelectiveStateUpdateMTPStochasticRoundingWithIntermediateStates(
             intermediate_state_indices=inputs["intermediate_slot_idx"],
             cache_steps=inputs["cache_steps"],
             rand_seed=self.RAND_SEED,
+            algorithm=self._algo,
         )
 
     # fmt: off
@@ -1378,291 +1411,3 @@ class TestSelectiveStateUpdateMTPStochasticRoundingWithIntermediateStates(
                 )
 
             assert states_match, f"Intermediate state at step {t} mismatch"
-
-
-@_requires_sm100
-class TestSelectiveStateUpdateMTPVertical(TestSelectiveStateUpdateMTP):
-    """Test multi-token selective_state_update with vertical and horizontal algorithms."""
-
-    @pytest.fixture(autouse=True, params=["vertical", "horizontal"])
-    def _algorithm(self, request):
-        self._algo = request.param
-
-    def run_kernel(self, inputs, out=None, disable_state_update=False):
-        return flashinfer.mamba.selective_state_update(
-            inputs["state_cache"],
-            inputs["x"],
-            inputs["dt"],
-            inputs["A"],
-            inputs["B"],
-            inputs["C"],
-            D=inputs["D"],
-            z=inputs.get("z"),
-            dt_bias=inputs["dt_bias"],
-            dt_softplus=True,
-            state_batch_indices=inputs["slot_idx"],
-            pad_slot_id=-1,
-            out=out,
-            disable_state_update=disable_state_update,
-            algorithm=self._algo,
-        )
-
-
-@_requires_sm100
-class TestSelectiveStateUpdateMTPVerticalWithIntermediateStates(
-    TestSelectiveStateUpdateMTPWithIntermediateStates
-):
-    """Test vertical/horizontal algorithms with intermediate states."""
-
-    @pytest.fixture(autouse=True, params=["vertical", "horizontal"])
-    def _algorithm(self, request):
-        self._algo = request.param
-
-    def run_kernel_with_intermediate_states(self, inputs, out=None):
-        return flashinfer.mamba.selective_state_update(
-            inputs["state_cache"],
-            inputs["x"],
-            inputs["dt"],
-            inputs["A"],
-            inputs["B"],
-            inputs["C"],
-            D=inputs["D"],
-            z=inputs.get("z"),
-            dt_bias=inputs["dt_bias"],
-            dt_softplus=True,
-            state_batch_indices=inputs["slot_idx"],
-            pad_slot_id=-1,
-            out=out,
-            disable_state_update=True,
-            intermediate_states_buffer=inputs["intermediate_states_buffer"],
-            intermediate_state_indices=inputs["intermediate_slot_idx"],
-            cache_steps=inputs["cache_steps"],
-            algorithm=self._algo,
-        )
-
-
-@_requires_sm100
-class TestSelectiveStateUpdateMTPVerticalInt16RejectsScaleState(
-    TestSelectiveStateUpdateMTPInt16
-):
-    """Test that vertical algorithm rejects int16 quantized state (scaleState) with a clear error."""
-
-    @pytest.mark.parametrize(
-        "batch,nheads,dim,dstate,cache_steps,state_dtype,weight_dtype,use_out_tensor",
-        [(64, 64, 64, 128, 4, torch.bfloat16, torch.float32, True)],
-    )
-    def test_output_correctness(
-        self,
-        batch,
-        nheads,
-        dim,
-        dstate,
-        cache_steps,
-        state_dtype,
-        weight_dtype,
-        use_out_tensor,
-    ):
-        """Verify that vertical algorithm raises RuntimeError for scaleState."""
-        inputs = self.make_inputs(
-            batch, nheads, dim, dstate, cache_steps, state_dtype, weight_dtype
-        )
-        with pytest.raises(
-            RuntimeError, match="vertical algorithm does not support scaled"
-        ):
-            flashinfer.mamba.selective_state_update(
-                inputs["state_cache"],
-                inputs["x"],
-                inputs["dt"],
-                inputs["A"],
-                inputs["B"],
-                inputs["C"],
-                D=inputs["D"],
-                dt_bias=inputs["dt_bias"],
-                dt_softplus=True,
-                state_batch_indices=inputs["slot_idx"],
-                pad_slot_id=-1,
-                state_scale=inputs["state_scale"],
-                algorithm="vertical",
-            )
-
-
-@_requires_sm100
-class TestSelectiveStateUpdateMTPVerticalStochasticRounding(
-    TestSelectiveStateUpdateMTPStochasticRounding
-):
-    """Test vertical/horizontal algorithms with stochastic rounding."""
-
-    @pytest.fixture(autouse=True, params=["vertical", "horizontal"])
-    def _algorithm(self, request):
-        self._algo = request.param
-
-    def run_kernel(self, inputs, out=None, disable_state_update=False):
-        return flashinfer.mamba.selective_state_update(
-            inputs["state_cache"],
-            inputs["x"],
-            inputs["dt"],
-            inputs["A"],
-            inputs["B"],
-            inputs["C"],
-            D=inputs["D"],
-            z=inputs.get("z"),
-            dt_bias=inputs["dt_bias"],
-            dt_softplus=True,
-            state_batch_indices=inputs["slot_idx"],
-            pad_slot_id=-1,
-            out=out,
-            disable_state_update=disable_state_update,
-            rand_seed=self.RAND_SEED,
-            algorithm=self._algo,
-        )
-
-
-@_requires_sm100
-class TestSelectiveStateUpdateMTPVerticalDisableStateUpdate(
-    TestSelectiveStateUpdateMTPDisableStateUpdate
-):
-    """Test vertical/horizontal algorithms with disable_state_update=True."""
-
-    @pytest.fixture(autouse=True, params=["vertical", "horizontal"])
-    def _algorithm(self, request):
-        self._algo = request.param
-
-    def run_kernel(self, inputs, out=None, disable_state_update=False):
-        return flashinfer.mamba.selective_state_update(
-            inputs["state_cache"],
-            inputs["x"],
-            inputs["dt"],
-            inputs["A"],
-            inputs["B"],
-            inputs["C"],
-            D=inputs["D"],
-            z=inputs.get("z"),
-            dt_bias=inputs["dt_bias"],
-            dt_softplus=True,
-            state_batch_indices=inputs["slot_idx"],
-            pad_slot_id=-1,
-            out=out,
-            disable_state_update=disable_state_update,
-            algorithm=self._algo,
-        )
-
-
-@_requires_sm100
-class TestSelectiveStateUpdateMTPVerticalNonContiguous(
-    TestSelectiveStateUpdateMTPNonContiguous
-):
-    """Test vertical/horizontal algorithms with non-contiguous state cache."""
-
-    @pytest.fixture(autouse=True, params=["vertical", "horizontal"])
-    def _algorithm(self, request):
-        self._algo = request.param
-
-    def run_kernel(self, inputs, out=None, disable_state_update=False):
-        return flashinfer.mamba.selective_state_update(
-            inputs["state_cache"],
-            inputs["x"],
-            inputs["dt"],
-            inputs["A"],
-            inputs["B"],
-            inputs["C"],
-            D=inputs["D"],
-            z=inputs.get("z"),
-            dt_bias=inputs["dt_bias"],
-            dt_softplus=True,
-            state_batch_indices=inputs["slot_idx"],
-            pad_slot_id=-1,
-            out=out,
-            disable_state_update=disable_state_update,
-            algorithm=self._algo,
-        )
-
-
-@_requires_sm100
-class TestSelectiveStateUpdateMTPVerticalInt32Indices(
-    TestSelectiveStateUpdateMTPInt32Indices
-):
-    """Test vertical/horizontal algorithms with int32 state_batch_indices."""
-
-    @pytest.fixture(autouse=True, params=["vertical", "horizontal"])
-    def _algorithm(self, request):
-        self._algo = request.param
-
-    def run_kernel(self, inputs, out=None, disable_state_update=False):
-        slot_idx_int32 = inputs["slot_idx"].to(torch.int32)
-        return flashinfer.mamba.selective_state_update(
-            inputs["state_cache"],
-            inputs["x"],
-            inputs["dt"],
-            inputs["A"],
-            inputs["B"],
-            inputs["C"],
-            D=inputs["D"],
-            z=inputs.get("z"),
-            dt_bias=inputs["dt_bias"],
-            dt_softplus=True,
-            state_batch_indices=slot_idx_int32,
-            pad_slot_id=-1,
-            out=out,
-            disable_state_update=disable_state_update,
-            algorithm=self._algo,
-        )
-
-
-@_requires_sm100
-class TestSelectiveStateUpdateMTPVerticalVariousNgroups(
-    TestSelectiveStateUpdateMTPVariousNgroups
-):
-    """Test vertical/horizontal algorithms with various ngroups values."""
-
-    @pytest.fixture(autouse=True, params=["vertical", "horizontal"])
-    def _algorithm(self, request):
-        self._algo = request.param
-
-    def run_kernel(self, inputs, out=None, disable_state_update=False):
-        return flashinfer.mamba.selective_state_update(
-            inputs["state_cache"],
-            inputs["x"],
-            inputs["dt"],
-            inputs["A"],
-            inputs["B"],
-            inputs["C"],
-            D=inputs["D"],
-            z=inputs.get("z"),
-            dt_bias=inputs["dt_bias"],
-            dt_softplus=True,
-            state_batch_indices=inputs["slot_idx"],
-            pad_slot_id=-1,
-            out=out,
-            disable_state_update=disable_state_update,
-            algorithm=self._algo,
-        )
-
-
-@_requires_sm100
-class TestSelectiveStateUpdateMTPVerticalLargeBatch(
-    TestSelectiveStateUpdateMTPLargeBatch
-):
-    """Test vertical/horizontal algorithms with larger batch sizes."""
-
-    @pytest.fixture(autouse=True, params=["vertical", "horizontal"])
-    def _algorithm(self, request):
-        self._algo = request.param
-
-    def run_kernel(self, inputs, out=None, disable_state_update=False):
-        return flashinfer.mamba.selective_state_update(
-            inputs["state_cache"],
-            inputs["x"],
-            inputs["dt"],
-            inputs["A"],
-            inputs["B"],
-            inputs["C"],
-            D=inputs["D"],
-            z=inputs.get("z"),
-            dt_bias=inputs["dt_bias"],
-            dt_softplus=True,
-            state_batch_indices=inputs["slot_idx"],
-            pad_slot_id=-1,
-            out=out,
-            disable_state_update=disable_state_update,
-            algorithm=self._algo,
-        )
