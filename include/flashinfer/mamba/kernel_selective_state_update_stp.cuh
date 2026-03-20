@@ -1198,7 +1198,7 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, SSUAlgorithm
     constexpr auto stateLoadSize = getVectorLoadSizeForFullUtilization<state_t, DSTATE>();
     using load_state_t = PackedAligned<state_t, stateLoadSize>;
 
-    FLASHINFER_CHECK_ALIGNMENT(params.state, sizeof(load_state_t));
+    FLASHINFER_CHECK_ALIGNMENT(params.state, alignof(load_state_t));
     FLASHINFER_CHECK((params.dim * params.dstate * sizeof(state_t)) % sizeof(load_state_t) == 0,
                      "state head stride must be aligned to ", sizeof(load_state_t), " bytes");
 
@@ -1299,7 +1299,7 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, SSUAlgorithm
       scan_func<<<grid, block, smem_size, stream>>>(params, state_tensor);
     };
 
-    dispatchRatio(params, std::integer_sequence<int, 1, 8, 16>{}, ratio_launcher);
+    dispatchRatio(params, std::integer_sequence<int, 1, 2, 4, 8, 16, 32, 64>{}, ratio_launcher);
   }
 #endif
   else {
