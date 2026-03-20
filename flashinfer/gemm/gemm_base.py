@@ -3298,7 +3298,7 @@ def _check_mm_mxfp8_problem_size(
     b_descale: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cutlass", "cute-dsl", "auto"] = "auto",  # unused
+    backend: Literal["cudnn", "cutlass", "cute-dsl", "auto"] = "auto",  # unused
 ) -> bool:
     # Generic checks
     ## pre-check the input tensors and block scale tensors
@@ -3412,8 +3412,27 @@ def _cutlass_gemm_mxfp8_requirement(
     b_descale: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cutlass", "cute-dsl", "auto"] = "auto",
+    backend: Literal["cudnn", "cutlass", "cute-dsl", "auto"] = "auto",
 ):
+    return True
+
+
+@supported_compute_capability([100, 103])
+def _cudnn_mm_mxfp8_requirement(
+    a: torch.Tensor,  # unused
+    b: torch.Tensor,  # unused
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    out: Optional[torch.Tensor] = None,  # unused
+    out_dtype: torch.dtype = torch.bfloat16,  # unused
+    backend: Literal["cudnn", "cutlass", "cute-dsl", "auto"] = "auto",  # unused
+):
+    # cuDNN MXFP8 path currently expects swizzled 1D scale tensors.
+    if a_descale.ndim != 1 or b_descale.ndim != 1:
+        raise ValueError(
+            "cudnn mm_mxfp8 requires swizzled 1D scale tensors for a_descale and b_descale."
+        )
+    _check_cudnn_availability()
     return True
 
 
@@ -3425,7 +3444,7 @@ def _cute_dsl_gemm_mxfp8_requirement(
     b_descale: torch.Tensor,
     out: Optional[torch.Tensor] = None,  # unused
     out_dtype: torch.dtype = torch.bfloat16,  # unused
-    backend: Literal["cutlass", "cute-dsl", "auto"] = "auto",  # unused
+    backend: Literal["cudnn", "cutlass", "cute-dsl", "auto"] = "auto",  # unused
 ):
     # CuTe DSL MXFP8 path currently expects swizzled 1D block scales
     # in F8_128x4 layout for both A and B.
@@ -3830,8 +3849,10 @@ def _heuristic_func_mm_mxfp8(
     b_descale: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cutlass", "cute-dsl", "auto"] = "auto",
+    backend: Literal["cudnn", "cutlass", "cute-dsl", "auto"] = "auto",
 ) -> List[str]:
+    if CUDNN_AVAILABLE and "cudnn" in suitable_backends:
+        return ["cudnn"]
     if "cutlass" in suitable_backends:
         return ["cutlass"]
     return []
@@ -3839,6 +3860,7 @@ def _heuristic_func_mm_mxfp8(
 
 @backend_requirement(
     {
+        "cudnn": _cudnn_mm_mxfp8_requirement,
         "cutlass": _cutlass_gemm_mxfp8_requirement,
         "cute-dsl": _cute_dsl_gemm_mxfp8_requirement,
     },
@@ -3853,7 +3875,7 @@ def mm_mxfp8(
     b_descale: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cutlass", "cute-dsl", "auto"] = "auto",
+    backend: Literal["cudnn", "cutlass", "cute-dsl", "auto"] = "auto",
 ) -> torch.Tensor:
     r"""MM MXFP8 (block size 32)
 
@@ -3880,14 +3902,16 @@ def mm_mxfp8(
         For 1D swizzled format, it's flattened from (N_padded, K_padded) layout.
 
     out: Optional[torch.Tensor]
-        Out tensor, shape (m, n), bf16 or fp16. If provided, can only be used with the CUTLASS backend. Defaults to ``None``.
+        Out tensor, shape (m, n), bf16 or fp16. Defaults to ``None``.
 
     out_dtype: torch.dtype
         Output dtype, bf16 or fp16. Defaults to ``torch.bfloat16``.
 
-    backend: Literal["cutlass", "cute-dsl", "auto"]
+    backend: Literal["cudnn", "cutlass", "cute-dsl", "auto"]
         The backend to use for the operation. Defaults to ``"auto"``.
-        ``"auto"`` selects the CUTLASS backend.
+        ``"auto"`` selects a supported backend (currently cuDNN or CUTLASS).
+        ``"cudnn"`` requires swizzled 1D scales produced by
+        ``mxfp8_quantize(..., is_sf_swizzled_layout=True)``.
         The ``"cute-dsl"`` backend currently requires swizzled 1D scales
         (``mxfp8_quantize(..., is_sf_swizzled_layout=True)``).
 
@@ -3963,6 +3987,7 @@ def mm_mxfp8(
     major, minor = get_compute_capability(a.device)
 
     backend_to_runner_factory = {
+        "cudnn": lambda: _cudnn_mm_mxfp8_runner(),
         "cutlass": lambda: get_cutlass_mxfp8_gemm_module(
             major
         ).cutlass_mxfp8_gemm_runner(),
@@ -6700,6 +6725,42 @@ def _cudnn_gemm_mxfp8_runner():
             return out
 
     return CudnnMxfp8GemmRunner()
+
+
+def _cudnn_mm_mxfp8_runner():
+    class CudnnMmMxfp8GemmRunner(TunableRunner):
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> List[int]:
+            # cuDNN provides internal heuristics; use the default tactic entry.
+            return [0]
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic: int = -1,
+            do_preparation: bool = False,
+            **kwargs,
+        ) -> torch.Tensor:
+            a, b, scale_a, scale_b, _, out, workspace_buffer = inputs
+            a_3d = a.unsqueeze(0)
+            b_3d = b.unsqueeze(0)
+            out_3d = out.unsqueeze(0)
+            _cudnn_gemm_mxfp8(
+                a=a_3d,
+                b=b_3d,
+                a_descale=scale_a,
+                b_descale=scale_b,
+                out=out_3d,
+                out_dtype=out.dtype,
+                workspace_buffer=workspace_buffer,
+                tactic=tactic,
+            )
+            return out
+
+    return CudnnMmMxfp8GemmRunner()
 
 
 def mxfp8_gemm_sm100(

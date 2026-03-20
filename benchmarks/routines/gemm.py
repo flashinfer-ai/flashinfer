@@ -1308,7 +1308,7 @@ def testMmMxfp8(args):
     res_dtype = args.out_dtype
     is_cuda_graph_compatible = not args.no_cuda_graph
     run_refcheck = args.refcheck
-    autotune_supported_backends = ["cutlass", "cute-dsl", "auto"]
+    autotune_supported_backends = ["cudnn", "cutlass", "cute-dsl", "auto"]
     res = []
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
@@ -1361,7 +1361,7 @@ def testMmMxfp8(args):
         print(f"[VVERBOSE] {mat2_scale.dtype = }")
 
     def run_backend(backend, input_mxfp8, mat2_mxfp8, input_scale, mat2_scale):
-        if backend in ["cutlass", "cute-dsl", "auto"]:
+        if backend in ["cudnn", "cutlass", "cute-dsl", "auto"]:
             return flashinfer.gemm.mm_mxfp8(
                 a=input_mxfp8,
                 b=mat2_mxfp8.t(),  # mm_mxfp8 expects b.t()
