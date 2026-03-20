@@ -41,6 +41,7 @@ from cutlass.cutlass_dsl import Int32
 
 from .custom_pipeline import PipelineCpAsyncUmma
 from .utils import (
+    get_blackwell_smem_arch,
     TRTLLM_ENABLE_PDL,
     fmin,
     griddepcontrol_launch_dependents,
@@ -514,7 +515,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             num_threads=self.threads_per_warp,
         )
 
-        self.num_smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+        self.num_smem_capacity = utils.get_smem_capacity_in_bytes(
+            get_blackwell_smem_arch()
+        )
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 

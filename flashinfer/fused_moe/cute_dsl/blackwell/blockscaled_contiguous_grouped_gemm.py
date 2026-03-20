@@ -53,6 +53,7 @@ import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
 from .utils import (
+    get_blackwell_smem_arch,
     TRTLLM_ENABLE_PDL,
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
@@ -177,7 +178,9 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
             barrier_id=4,
             num_threads=self.threads_per_warp,
         )
-        self.num_smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+        self.num_smem_capacity = utils.get_smem_capacity_in_bytes(
+            get_blackwell_smem_arch()
+        )
         # TMEM offset for final accumulator
         self.tmem_final_offset = 384
 

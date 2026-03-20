@@ -58,6 +58,25 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 TRTLLM_ENABLE_PDL = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
 
 
+def get_blackwell_smem_arch() -> str:
+    """Return the correct SM architecture string for SMEM capacity lookup.
+
+    SM100 (B200/B300 data center) has 227KB shared memory.
+    SM120/SM121 (RTX PRO 6000/RTX 5090 consumer) has 99KB shared memory.
+
+    Using the wrong capacity causes _compute_stages to over-allocate pipeline
+    stages that don't fit in physical SMEM, degrading performance on SM120.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        return "sm_100"  # fallback
+    major, minor = torch.cuda.get_device_capability()
+    if major == 12:
+        return "sm_120"
+    return "sm_100"
+
+
 # WAR for CuTeDSL make_ptr implementation
 class _Pointer(Pointer):
     """Represents a runtime pointer that can interoperate with various data structures,
