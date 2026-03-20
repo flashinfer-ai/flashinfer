@@ -427,8 +427,9 @@ void FusedMoeLauncher::init_common(
   int major = 0, minor = 0;
   cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
   cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
-  TVM_FFI_ICHECK_EQ(major, 10) << "MoE kernel requires 10.x architecture. Current device has SM "
-                               << major << minor;
+  TVM_FFI_ICHECK(major == 10 || major == 12)
+      << "MoE kernel requires SM 10.x or SM 12.x architecture. Current device has SM " << major
+      << minor;
   this->device_version = std::make_tuple(major, minor);
 
   args->routing_logits = routing_logits.has_value() ? routing_logits.value().data_ptr() : nullptr;
@@ -1369,19 +1370,6 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
             int64_t tile_tokens_dim, int64_t routing_method_type, bool use_shuffled_weight,
             int64_t weight_layout, ActivationType activation_type, btg::Dtype dtype_act,
             btg::Dtype dtype_weights) {
-    static const std::tuple<int, int> device_props = [this] {
-      int major, minor;
-      cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
-                             hidden_states.device().device_id);
-      cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor,
-                             hidden_states.device().device_id);
-      return std::make_tuple(major, minor);
-    }();
-
-    TVM_FFI_ICHECK_EQ(std::get<0>(device_props), 10)
-        << "This kernel requires 10.x architecture. Current device has SM "
-        << std::get<0>(device_props) << std::get<1>(device_props);
-
     // Set data types
     args->mDtypeElt = dtype_act;
     args->mDtypeOut = btg::Dtype::Bfloat16;  // Output is always BF16 for FP4
