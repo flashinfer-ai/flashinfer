@@ -901,8 +901,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                   TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize ==
               TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
                   hidden_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX))
-          << "fc1 weight block size must be (num_experts_on_rank, inter_size * "
-          << fc1_n_mult << ", hidden_size // 4"
+          << "fc1 weight block size must be (num_experts_on_rank, inter_size * " << fc1_n_mult
+          << ", hidden_size // 4"
              " // block_scale_vector_size)";
       TVM_FFI_ICHECK_EQ(fc1_global.size(0), num_experts_on_rank)
           << "fc1 global size must be (num_experts_on_rank,)";
@@ -1010,8 +1010,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                   TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize ==
               TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
                   hidden_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX))
-          << "fc1 weight block size must be (num_experts_on_rank, inter_size * "
-          << fc1_n_mult << ", hidden_size // 4"
+          << "fc1 weight block size must be (num_experts_on_rank, inter_size * " << fc1_n_mult
+          << ", hidden_size // 4"
              " // block_scale_vector_size)";
       TVM_FFI_ICHECK_EQ(fc1_global.size(0), num_experts_on_rank)
           << "fc1 global size must be (num_experts_on_rank,)";
@@ -1071,8 +1071,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                   TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize ==
               TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
                   hidden_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX))
-          << "fc1 weight block size must be (num_experts_on_rank, inter_size * "
-          << fc1_n_mult << ", hidden_size // 4"
+          << "fc1 weight block size must be (num_experts_on_rank, inter_size * " << fc1_n_mult
+          << ", hidden_size // 4"
              " // block_scale_vector_size)";
       TVM_FFI_ICHECK_EQ(fc1_global.size(0), num_experts_on_rank)
           << "fc1 global size must be (num_experts_on_rank,)";
