@@ -20,7 +20,6 @@ Global compilation context management for FlashInfer.
 import os
 import torch
 import logging
-from flashinfer.jit.cpp_ext import is_cuda_version_at_least
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +44,8 @@ class CompilationContext:
         if major == 9:
             return (major, str(minor) + "a")
         elif major == 12:
+            from flashinfer.jit.cpp_ext import is_cuda_version_at_least
+
             if is_cuda_version_at_least("12.9"):
                 return (major, "0f")
             else:
