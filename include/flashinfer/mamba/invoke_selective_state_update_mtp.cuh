@@ -153,8 +153,7 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
 
     dispatchRatio(
         params, std::integer_sequence<int, 1, 2, 4, 8, 16, 32, 64>{}, [&]<int HEADS_PER_GROUP>() {
-          // 2 heads per CTA when possible, fall back to 1 when HEADS_PER_GROUP == 1
-          constexpr int HEADS_PER_CTA = (HEADS_PER_GROUP >= 2) ? 2 : 1;
+          constexpr int HEADS_PER_CTA = 1;
           static_assert(HEADS_PER_GROUP % HEADS_PER_CTA == 0);
 
           using sram_t = GroupStorageHorizontal<input_t, state_t, NTOKENS_MTP, DIM, DSTATE,

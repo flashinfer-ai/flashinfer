@@ -297,6 +297,12 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--dstate",
+    type=int,
+    default=128,
+    help="State dimension (default: 128)",
+)
+parser.add_argument(
     "--mtp",
     type=int,
     default=6,
@@ -343,7 +349,7 @@ print("COLLECTING BENCHMARK RESULTS (MTP ENABLED)")
 print("=" * 80)
 print(f"Batch sizes to test: {batch_sizes}")
 print(f"State dtypes: {[name for name, _, _ in state_dtypes]}")
-print(f"MTP (cache_steps): {mtp_value}")
+print(f"MTP (cache_steps): {mtp_value}, dstate: {args.dstate}")
 if args.ncu:
     print("NCU mode: single invocation, no warmup/timing")
 print("=" * 80)
@@ -351,7 +357,7 @@ print("=" * 80)
 for state_dtype_name, state_dtype_torch, philox_rounds in state_dtypes:
     for batch_size in batch_sizes:
         print(
-            f"\n  Running benchmark for batch_size={batch_size}, state_dtype={state_dtype_name}, mtp={mtp_value}"
+            f"\n  Running benchmark for batch_size={batch_size}, state_dtype={state_dtype_name}, mtp={mtp_value}, dstate={args.dstate}"
         )
 
         results = run_measurement(
@@ -359,7 +365,7 @@ for state_dtype_name, state_dtype_torch, philox_rounds in state_dtypes:
             nheads=64,
             dim=64,
             ngroups=8,
-            dstate=128,
+            dstate=args.dstate,
             state_dtype=state_dtype_torch,
             mtp=mtp_value,
             generate_intermediate_states_buffer=True,
@@ -465,14 +471,16 @@ else:
         ax.set_xticks(x_positions)
         ax.set_xticklabels(x_tick_labels)
         ax.grid(True, alpha=0.3, axis="y")
+        dstate_subtitle = f", dstate={args.dstate}" if args.dstate != 128 else ""
         ax.set_title(
-            rf"State dtype: {dtype_name}, MTP={mtp_value} — Speedup = Runtime$_{{triton}}$ / Runtime$_{{flashinfer}}$"
+            rf"State dtype: {dtype_name}, MTP={mtp_value}{dstate_subtitle} — Speedup = Runtime$_{{triton}}$ / Runtime$_{{flashinfer}}$"
         )
         ax.set_ylim([0, None])
         ax.legend(loc="best", fontsize=8)
 
+    dstate_title = f", dstate={args.dstate}" if args.dstate != 128 else ""
     fig.suptitle(
-        f"Selective State Update Benchmark (MTP={mtp_value}) [{gpu_name}]",
+        f"Selective State Update Benchmark (MTP={mtp_value}{dstate_title}) [{gpu_name}]",
         fontsize=14,
         fontweight="bold",
     )

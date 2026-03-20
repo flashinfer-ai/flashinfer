@@ -33,6 +33,7 @@ _BASE_PARAMS = (
     (  64,     8,     64,  128,    4,           torch.bfloat16,     torch.float32,  True ),  # nheads=8
     (  64,    64,    128,  128,    4,           torch.bfloat16,     torch.float32,  True ),  # dim=128
     (  64,    64,     64,   64,    4,           torch.bfloat16,     torch.float32,  True ),  # dstate=64
+    (  64,    64,     64,   96,    4,           torch.bfloat16,     torch.float32,  True ),  # dstate=96
     (  64,    64,     64,  128,    1,           torch.bfloat16,     torch.float32,  True ),  # cache_steps=1
     (  64,    64,     64,  128,    8,           torch.bfloat16,     torch.float32,  True ),  # cache_steps=8
     (  64,    64,     64,  128,    4,           torch.float32,      torch.float32,  True ),  # state_dtype=f32

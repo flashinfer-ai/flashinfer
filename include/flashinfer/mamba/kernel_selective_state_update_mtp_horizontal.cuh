@@ -45,6 +45,17 @@ namespace flashinfer::mamba::mtp {
 
 using namespace conversion;
 
+// Round up to next power of 2 (compile-time).
+constexpr int nextPow2(int v) {
+  v--;
+  v |= v >> 1;
+  v |= v >> 2;
+  v |= v >> 4;
+  v |= v >> 8;
+  v |= v >> 16;
+  return v + 1;
+}
+
 // Horizontal kernel constants: 5 warps per CTA.
 namespace horiz {
 static constexpr int NUM_COMPUTE_WARPS_PER_GROUP = 4;
@@ -154,7 +165,8 @@ __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int la
   constexpr int rowsPerWarp = horiz::ROWS_PER_WARP;
   constexpr int numTmaLoads = DIM / horiz::TMA_STATE_ROWS;
   constexpr int subPassesPerTma = horiz::TMA_STATE_ROWS / horiz::ROWS_PER_PASS;
-  constexpr int stateValuesPerThread = DSTATE / lanesPerRow;
+  constexpr int DSTATE_PADDED = nextPow2(DSTATE);
+  constexpr int stateValuesPerThread = DSTATE_PADDED / lanesPerRow;
   static_assert(DSTATE % lanesPerRow == 0, "DSTATE must be divisible by lanesPerRow");
   static_assert(DIM % horiz::TMA_STATE_ROWS == 0, "DIM must be divisible by TMA_STATE_ROWS");
   static_assert(horiz::TMA_STATE_ROWS % horiz::ROWS_PER_PASS == 0,
@@ -269,14 +281,16 @@ __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int la
         int const sram_row = sp * horiz::ROWS_PER_PASS + compute_warp * rowsPerWarp + group;
         int const dd = tl * horiz::TMA_STATE_ROWS + sram_row;  // global DIM row
 
-        // Load state from smem
+        // Load state from smem (zero-fill columns beyond DSTATE)
         float2 rState[numTiles][pairsPerTileMember];
 #pragma unroll
         for (int t = 0; t < numTiles; t++) {
 #pragma unroll
           for (int p = 0; p < pairsPerTileMember; p++) {
             int const c0 = baseCol(t, p * 2);
-            if constexpr (sizeof(state_t) == 2) {
+            if (c0 >= DSTATE) {
+              rState[t][p] = {0.f, 0.f};
+            } else if constexpr (sizeof(state_t) == 2) {
               uint32_t raw =
                   *reinterpret_cast<uint32_t const*>(&sram.state_in[slot][sram_row * DSTATE + c0]);
               auto const* ptr = reinterpret_cast<state_t const*>(&raw);
@@ -305,6 +319,10 @@ __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int la
 #pragma unroll
             for (int p = 0; p < pairsPerTileMember; p++) {
               int const c0 = baseCol(t, p * 2);
+              if (c0 >= DSTATE) {
+                // OOB padding columns — no state update or output contribution
+                continue;
+              }
               float2 B2, C2;
               if constexpr (sizeof(input_t) == 2) {
                 // Coalesce two 16-bit loads into one 32-bit shared memory load
@@ -344,8 +362,9 @@ __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int la
                                      dd * DSTATE;
 #pragma unroll
             for (int t = 0; t < numTiles; t++) {
-              packed_tile_t rOut;
               int const col0 = baseCol(t, 0);
+              if (col0 >= DSTATE) continue;  // skip OOB padding columns
+              packed_tile_t rOut;
 #pragma unroll
               for (int e = 0; e < elemsPerTileMember; e += 2) {
                 float const s0 = rState[t][e / 2].x;
@@ -374,8 +393,9 @@ __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int la
                 state_batch * params.state_stride_batch + head * DIM * DSTATE + dd * DSTATE;
 #pragma unroll
             for (int t = 0; t < numTiles; t++) {
-              packed_tile_t rOut;
               int const col0 = baseCol(t, 0);
+              if (col0 >= DSTATE) continue;  // skip OOB padding columns
+              packed_tile_t rOut;
 #pragma unroll
               for (int e = 0; e < elemsPerTileMember; e += 2) {
                 float const s0 = rState[t][e / 2].x;
