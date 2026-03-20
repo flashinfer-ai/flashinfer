@@ -179,8 +179,8 @@ def selective_state_update(
         Number of steps/tokens to cache for speculative decoding
     algorithm : str
         Algorithm to use: "auto" (default, picks the best kernel based on GPU arch,
-        data types, and problem size), "simple" (all GPUs), "vertical", "horizontal",
-        and "horizontal_v2" (SM100+ only). MTP mode only supports "auto" or "simple".
+        data types, and problem size), "simple" (all GPUs), "vertical", "horizontal"
+        (SM100+ only). MTP mode only supports "auto" or "simple".
 
     Returns
     -------
@@ -282,8 +282,6 @@ def selective_state_update(
         algorithm_int = 2
     elif algorithm == "horizontal":
         algorithm_int = 3
-    elif algorithm == "horizontal_v2":
-        algorithm_int = 4
     else:
         raise ValueError(f"Unknown algorithm: {algorithm}")
 

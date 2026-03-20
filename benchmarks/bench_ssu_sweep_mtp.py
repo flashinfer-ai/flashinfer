@@ -55,7 +55,9 @@ def create_benchmark_inputs(
     )
 
 
-def benchmark_kernel(name, kernel_fn, inputs, cache_steps=0, ncu=False):
+def benchmark_kernel(
+    name, kernel_fn, inputs, cache_steps=0, ncu=False, rand_seed=None, philox_rounds=10
+):
     """Benchmark a single kernel and return median time in ms."""
     print(f"\n  Benchmarking {name}...")
 
@@ -82,6 +84,8 @@ def benchmark_kernel(name, kernel_fn, inputs, cache_steps=0, ncu=False):
         intermediate_states_buffer=intermediate_states_buffer,
         intermediate_state_indices=intermediate_slot_idx,
         cache_steps=cache_steps,
+        rand_seed=rand_seed,
+        philox_rounds=philox_rounds,
     )
 
     if ncu:
@@ -125,6 +129,8 @@ def make_triton_wrapper():
         intermediate_states_buffer,
         intermediate_state_indices,
         cache_steps,
+        rand_seed,
+        philox_rounds,
     ):
         selective_state_update_triton(
             state=state,
@@ -143,6 +149,7 @@ def make_triton_wrapper():
             intermediate_states_buffer=intermediate_states_buffer,
             cache_steps=cache_steps,
             intermediate_state_indices=intermediate_state_indices,
+            rand_seed=rand_seed,
         )
 
     return wrapper
@@ -168,6 +175,8 @@ def make_flashinfer_wrapper(algorithm="auto"):
         intermediate_states_buffer,
         intermediate_state_indices,
         cache_steps,
+        rand_seed,
+        philox_rounds,
     ):
         flashinfer_selective_state_update(
             state=state,
@@ -187,6 +196,8 @@ def make_flashinfer_wrapper(algorithm="auto"):
             cache_steps=cache_steps,
             intermediate_state_indices=intermediate_state_indices,
             algorithm=algorithm,
+            rand_seed=rand_seed,
+            philox_rounds=philox_rounds,
         )
 
     return wrapper
@@ -202,6 +213,7 @@ def run_measurement(
     mtp=0,
     generate_intermediate_states_buffer=False,
     ncu=False,
+    philox_rounds=None,
 ):
     """Run benchmarks on all kernels and return results dict."""
     inputs = create_benchmark_inputs(
@@ -217,19 +229,31 @@ def run_measurement(
 
     cache_steps = inputs.get("cache_steps", 0)
 
+    # Stochastic rounding: create rand_seed tensor when philox_rounds is set
+    rand_seed = None
+    effective_philox_rounds = 10
+    if philox_rounds is not None:
+        rand_seed = torch.tensor(42, dtype=torch.int64, device="cuda")
+        effective_philox_rounds = philox_rounds
+
     kernels = {
         "triton_reference": make_triton_wrapper(),
         "flashinfer_simple": make_flashinfer_wrapper(algorithm="simple"),
         "flashinfer_vertical": make_flashinfer_wrapper(algorithm="vertical"),
         "flashinfer_horizontal": make_flashinfer_wrapper(algorithm="horizontal"),
-        "flashinfer_horizontal_v2": make_flashinfer_wrapper(algorithm="horizontal_v2"),
         "flashinfer_auto": make_flashinfer_wrapper(algorithm="auto"),
     }
 
     results = {}
     for name, fn in kernels.items():
         median_time = benchmark_kernel(
-            name, fn, inputs, cache_steps=cache_steps, ncu=ncu
+            name,
+            fn,
+            inputs,
+            cache_steps=cache_steps,
+            ncu=ncu,
+            rand_seed=rand_seed,
+            philox_rounds=effective_philox_rounds,
         )
         results[name] = median_time
 
@@ -266,8 +290,17 @@ parser.add_argument(
     type=str,
     nargs="+",
     default=["bf16", "f32"],
-    choices=["bf16", "f16", "f32"],
-    help="State dtype(s) to benchmark (default: bf16 f32)",
+    help=(
+        "State dtype(s) to benchmark (default: bf16 f32). "
+        "Supported: bf16, f16, f32, or f16-philox-N for stochastic rounding "
+        "with N philox rounds (e.g. f16-philox-5)"
+    ),
+)
+parser.add_argument(
+    "--mtp",
+    type=int,
+    default=6,
+    help="Number of MTP (cache) steps (default: 6)",
 )
 args = parser.parse_args()
 
@@ -279,8 +312,29 @@ _dtype_name_to_torch = {
     "f16": torch.float16,
     "f32": torch.float32,
 }
-state_dtypes = [(name, _dtype_name_to_torch[name]) for name in args.dtype]
-mtp_value = 6
+
+
+def parse_dtype_spec(spec):
+    """Parse a dtype spec like 'bf16', 'f16', or 'f16-philox-5'.
+
+    Returns (display_name, torch_dtype, philox_rounds_or_None).
+    """
+    import re
+
+    m = re.match(r"^(bf16|f16|f32)-philox-(\d+)$", spec)
+    if m:
+        base, rounds = m.group(1), int(m.group(2))
+        return spec, _dtype_name_to_torch[base], rounds
+    if spec not in _dtype_name_to_torch:
+        raise ValueError(
+            f"Unknown dtype spec '{spec}'. "
+            "Expected bf16, f16, f32, or <dtype>-philox-<rounds>"
+        )
+    return spec, _dtype_name_to_torch[spec], None
+
+
+state_dtypes = [parse_dtype_spec(s) for s in args.dtype]
+mtp_value = args.mtp
 
 all_results = []
 
@@ -288,13 +342,13 @@ print("=" * 80)
 print("COLLECTING BENCHMARK RESULTS (MTP ENABLED)")
 print("=" * 80)
 print(f"Batch sizes to test: {batch_sizes}")
-print(f"State dtypes: {[name for name, _ in state_dtypes]}")
+print(f"State dtypes: {[name for name, _, _ in state_dtypes]}")
 print(f"MTP (cache_steps): {mtp_value}")
 if args.ncu:
     print("NCU mode: single invocation, no warmup/timing")
 print("=" * 80)
 
-for state_dtype_name, state_dtype_torch in state_dtypes:
+for state_dtype_name, state_dtype_torch, philox_rounds in state_dtypes:
     for batch_size in batch_sizes:
         print(
             f"\n  Running benchmark for batch_size={batch_size}, state_dtype={state_dtype_name}, mtp={mtp_value}"
@@ -310,6 +364,7 @@ for state_dtype_name, state_dtype_torch in state_dtypes:
             mtp=mtp_value,
             generate_intermediate_states_buffer=True,
             ncu=args.ncu,
+            philox_rounds=philox_rounds,
         )
 
         if not results:
@@ -342,7 +397,7 @@ else:
         torch.cuda.get_device_name(0) if torch.cuda.is_available() else "Unknown GPU"
     )
     print(f"\nGPU: {gpu_name}")
-    print(f"State dtypes: {[name for name, _ in state_dtypes]}")
+    print(f"State dtypes: {[name for name, _, _ in state_dtypes]}")
     print(f"MTP (cache_steps): {mtp_value}")
 
     unique_dtypes = df["state_dtype"].unique()
@@ -428,7 +483,7 @@ else:
         output_path.parent.mkdir(parents=True, exist_ok=True)
     else:
         gpu_name_clean = gpu_name.replace(" ", "_").replace("/", "_")
-        dtype_str = "_".join(name for name, _ in state_dtypes)
+        dtype_str = "_".join(name for name, _, _ in state_dtypes)
         output_filename = (
             f"runtime_vs_batch_size_mtp{mtp_value}_{dtype_str}_{gpu_name_clean}.png"
         )
