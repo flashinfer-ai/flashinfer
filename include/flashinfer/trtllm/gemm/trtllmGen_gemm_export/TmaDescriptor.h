@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
  * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,8 +23,6 @@
 
 #ifdef TLLM_ENABLE_CUDA
 #include <cuda.h>
-#include <cutlass/cutlass.h>
-#include <cutlass/half.h>
 #endif
 
 namespace gemm {
@@ -39,17 +37,17 @@ namespace tg = trtllm::gen;
 
 #ifdef TLLM_ENABLE_CUDA
 
-inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, tg::MmaKind mmaKind,
-                                        std::vector<uint64_t> const& shapes,
+inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, std::vector<uint64_t> const& shapes,
                                         std::vector<uint64_t> const& strides,
                                         std::vector<int32_t> const& tileShapes, void* gmemAddr,
-                                        bool doSwizzle = true) {
+                                        bool doPad, bool doSwizzle = true) {
   // The multiplication factor of the data padding in SMEM.
   int32_t padMultiplier = 1;
   CUtensorMap desc{};
   // The data type.
   CUtensorMapDataType tmaDataFormat{CU_TENSOR_MAP_DATA_TYPE_FLOAT32};
-  if (dtype == tg::Dtype::E4m3 || dtype == tg::Dtype::MxE4m3 || dtype == tg::Dtype::UE8m0) {
+  if (dtype == tg::Dtype::E4m3 || dtype == tg::Dtype::MxE4m3 || dtype == tg::Dtype::UE8m0 ||
+      dtype == tg::Dtype::UInt8) {
     tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_UINT8;
   } else if (dtype == tg::Dtype::Fp16) {
     tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_FLOAT16;
@@ -57,13 +55,11 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, tg::MmaKind mmaKind,
     tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
   } else if (dtype == tg::Dtype::E2m1) {
     tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B;
-  } else if (dtype == tg::Dtype::MxE2m1) {
-    if (mmaKind == tg::MmaKind::MxFp8Fp6Fp4) {
+  } else if (dtype == tg::Dtype::MxE2m1 || dtype == tg::Dtype::MxInt4) {
+    if (doPad) {
       padMultiplier = 2;
       tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B;
     } else {
-      // Note: this is used with the MMA kind MxFp4NvFp4 and also when casting to a higher-precision
-      // type such as Bfloat16 before the MMA.
       tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B;
     }
   } else if (dtype == tg::Dtype::Fp32) {
@@ -75,8 +71,8 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, tg::MmaKind mmaKind,
 
   // The swizzle type.
   CUtensorMapSwizzle swizzleType{CU_TENSOR_MAP_SWIZZLE_NONE};
-  int32_t fastestDimTileSizeBytes =
-      (tileShapes[0] * tg::dtypeGetNumBits(dtype) * padMultiplier) / /* bits */ 8;
+  int32_t fastestDimTileSizeBytes = (tileShapes[0] * tg::dtypeGetNumBits(dtype) * padMultiplier) /
+                                    /* bits */ 8;
   if (doSwizzle) {
     if ((fastestDimTileSizeBytes % 128) == 0) {
       swizzleType = CU_TENSOR_MAP_SWIZZLE_128B;
@@ -84,9 +80,9 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, tg::MmaKind mmaKind,
       swizzleType = CU_TENSOR_MAP_SWIZZLE_64B;
     } else if ((fastestDimTileSizeBytes % 32) == 0) {
       swizzleType = CU_TENSOR_MAP_SWIZZLE_32B;
-      // This path is only for the scaling factors.
     } else if ((fastestDimTileSizeBytes % 16) == 0 &&
-               (dtype == tg::Dtype::UE8m0 || dtype == tg::Dtype::E4m3)) {
+               (dtype == tg::Dtype::UE8m0 || dtype == tg::Dtype::E4m3 || dtype == tg::Dtype::E2m1 ||
+                dtype == tg::Dtype::UInt8)) {
       swizzleType = CU_TENSOR_MAP_SWIZZLE_NONE;
     } else {
       std::cerr << "buildNdTmaDescriptor: unexpected fastestDimTileSizeBytes "
@@ -100,8 +96,8 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, tg::MmaKind mmaKind,
 
   // Check shape must be in range [1, 2^32]
   int32_t dim = shapes.size();
-  // Expect 2 dimensions for regular gemm, 3 dimensions for batched gemm or blocked layout, and 4
-  // dimensions for batched gemm with blocked layout.
+  // Expect 2 dimensions for regular gemm, 3 dimensions for batched gemm or
+  // blocked layout, and 4 dimensions for batched gemm with blocked layout.
   assert(dim == 2 || dim == 3 || dim == 4);
   // Check shape range.
   for (int32_t ii = 0; ii < dim; ++ii) {
@@ -114,7 +110,8 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, tg::MmaKind mmaKind,
   assert(strides[0] == 1);
 
   // Build strides in bytes.
-  // cuTensorMapEncodeTiled ignores the stride of the first dimension (implicitly 1).
+  // cuTensorMapEncodeTiled ignores the stride of the first dimension
+  // (implicitly 1).
   std::vector<uint64_t> stridesInBytes(dim - 1);
   for (int32_t ii = 0; ii < dim - 1; ++ii) {
     stridesInBytes[ii] = (strides[ii + 1] * tg::dtypeGetNumBits(dtype)) / /* bits */ 8;
@@ -124,7 +121,8 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, tg::MmaKind mmaKind,
   auto const numEltsPerUInt32 = 4 * /* bits */ 8 / (tg::dtypeGetNumBits(dtype) * padMultiplier);
   // The number of elements in 128B.
   auto const numEltsIn128B = numEltsPerUInt32 /*4B*/ * 32;
-  // The number of tile K hidden size (per token) in each block of shared memory.
+  // The number of tile K hidden size (per token) in each block of shared
+  // memory.
   auto const numEltsInClampedFastestTileSize = std::min(numEltsIn128B, tileShapes[0]);
 
   // Build box dim array. If tileShapes is smaller than dim, just fill with 1s.
@@ -197,9 +195,11 @@ inline CUtensorMap buildSfTmaDescriptor(tg::Dtype dtype, std::vector<uint64_t> c
                                         std::vector<uint64_t> const& strides,
                                         const std::vector<uint32_t>& tileShapes, void* gmemAddr) {
   CUtensorMap desc{};
-  CUtensorMapDataType tmaDataFormat;
+  CUtensorMapDataType tmaDataFormat{};
   if (dtype == tg::Dtype::E4m3 || dtype == tg::Dtype::UE8m0) {
     tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_UINT8;
+  } else if (dtype == tg::Dtype::Bfloat16) {
+    tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
   } else {
     std::cerr << "buildSfTmaDescriptor: unexpected dtype " << tg::dtypeToString(dtype) << std::endl;
     assert(false);
@@ -224,7 +224,8 @@ inline CUtensorMap buildSfTmaDescriptor(tg::Dtype dtype, std::vector<uint64_t> c
   assert(strides[0] == 1);
 
   // Build strides in bytes.
-  // cuTensorMapEncodeTiled ignores the stride of the first dimension (implicitly 1).
+  // cuTensorMapEncodeTiled ignores the stride of the first dimension
+  // (implicitly 1).
   std::vector<uint64_t> stridesInBytes(dim - 1);
   for (int32_t ii = 0; ii < dim - 1; ++ii) {
     stridesInBytes[ii] = (strides[ii + 1] * tg::dtypeGetNumBits(dtype)) / /* bits */ 8;
