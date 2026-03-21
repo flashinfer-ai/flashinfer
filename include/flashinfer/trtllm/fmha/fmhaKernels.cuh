@@ -18,6 +18,7 @@
 
 #include <cuda.h>
 
+#include <cfloat>
 #include <cstdint>
 #include <cuda/std/cfloat>
 #include <iterator>
@@ -301,6 +302,7 @@ class TllmGenFmhaKernel {
           continue;
         }
       }
+
       cuErrCheck(cuLaunchKernelEx(&launch_config, func, kernelParamsList, nullptr));
 
       // Run the separate reduction kernel if needed.

@@ -31,9 +31,9 @@ class TllmGenFmhaRunner {
     FLASHINFER_CHECK(
         mDtypeQ == DATA_TYPE_E4M3 || mDtypeQ == DATA_TYPE_FP16 || mDtypeQ == DATA_TYPE_BF16,
         "Unsupported Q data type: " + std::string(toStr(mDtypeQ)));
-    FLASHINFER_CHECK(
-        mDtypeKv == DATA_TYPE_E4M3 || mDtypeKv == DATA_TYPE_FP16 || mDtypeKv == DATA_TYPE_BF16,
-        "Unsupported Kv data type: " + std::string(toStr(mDtypeKv)));
+    FLASHINFER_CHECK(mDtypeKv == DATA_TYPE_E4M3 || mDtypeKv == DATA_TYPE_E2M1 ||
+                         mDtypeKv == DATA_TYPE_FP16 || mDtypeKv == DATA_TYPE_BF16,
+                     "Unsupported Kv data type: " + std::string(toStr(mDtypeKv)));
     FLASHINFER_CHECK(mDtypeOut == DATA_TYPE_E4M3 || mDtypeOut == DATA_TYPE_FP16 ||
                          mDtypeOut == DATA_TYPE_BF16 || mDtypeOut == DATA_TYPE_E2M1,
                      "Unsupported Output data type: " + std::string(toStr(mDtypeOut)));

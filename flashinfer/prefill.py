@@ -261,6 +261,8 @@ def get_trtllm_gen_prefill_module():
         window_left: int = -1,
         out: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        key_block_scales: Optional[torch.Tensor] = None,
+        value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> torch.Tensor:
         sm_count = get_device_sm_count(query.device)
@@ -295,6 +297,8 @@ def get_trtllm_gen_prefill_module():
             enable_pdl,
             workspace_size,
             sinks,
+            key_block_scales,
+            value_block_scales,
             skip_softmax_threshold_scale_factor,
         )
         return out
@@ -663,6 +667,8 @@ def get_batch_prefill_module(backend, *args):
         cum_seq_lens_q: Optional[torch.Tensor] = None,
         cum_seq_lens_kv: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        key_block_scales: Optional[torch.Tensor] = None,
+        value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> None:
         if backend == "trtllm-gen":
@@ -697,6 +703,8 @@ def get_batch_prefill_module(backend, *args):
                 window_left,
                 out=o,
                 sinks=sinks,
+                key_block_scales=key_block_scales,
+                value_block_scales=value_block_scales,
                 skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
             )
         elif backend == "fa2":
@@ -833,6 +841,8 @@ def get_batch_prefill_module(backend, *args):
         cum_seq_lens_q: Optional[torch.Tensor] = None,
         cum_seq_lens_kv: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        key_block_scales: Optional[torch.Tensor] = None,
+        value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> None:
         pass
@@ -1855,7 +1865,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 )
             else:
                 kv_lens_arr_host = seq_lens.cpu().flatten()
-            self._kv_lens_buffer[: len(kv_lens_arr_host)].copy_(
+            required_size = len(kv_lens_arr_host)
+            if required_size > self._kv_lens_buffer.shape[0]:
+                self._kv_lens_buffer = torch.empty(
+                    (required_size,), dtype=torch.int32, device=self.device
+                )
+            self._kv_lens_buffer[:required_size].copy_(
                 kv_lens_arr_host, non_blocking=non_blocking
             )
             self._max_kv_len = max(kv_lens_arr_host).item()
@@ -2076,6 +2091,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
+        kv_block_scales: Optional[
+            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        ] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> torch.Tensor: ...
 
@@ -2093,6 +2111,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
+        kv_block_scales: Optional[
+            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        ] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
@@ -2111,6 +2132,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
+        kv_block_scales: Optional[
+            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        ] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch prefill/append attention between query and paged kv-cache.
@@ -2165,6 +2189,16 @@ class BatchPrefillWithPagedKVCacheWrapper:
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
         )
+
+        # Unpack kv_block_scales
+        key_block_scales = None
+        value_block_scales = None
+        if kv_block_scales is not None:
+            if isinstance(kv_block_scales, tuple):
+                key_block_scales, value_block_scales = kv_block_scales
+            else:
+                key_block_scales, value_block_scales = kv_block_scales.unbind(dim=1)
+
         o_dtype = self._cached_o_data_type
         if out is not None and out.dtype != o_dtype:
             raise ValueError(
@@ -2207,23 +2241,35 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
                 )
 
+        # For NVFP4 KV (uint8 packed), v_cache last dim is head_dim//2;
+        # use q's head_dim for output instead
+        out_head_dim = q.shape[-1] if kv_block_scales is not None else v_cache.shape[-1]
         if out is None:
             # Use cached output data type if available (for FP8 attention with FP16 output)
             out_dtype = getattr(self, "_cached_o_data_type", None) or q.dtype
             out = torch.zeros(
-                q.shape[:-1] + v_cache.shape[-1:], dtype=out_dtype, device=q.device
+                q.shape[:-1] + (out_head_dim,), dtype=out_dtype, device=q.device
             )
         else:
             out_dtype = getattr(self, "_cached_o_data_type", None) or q.dtype
             check_shape_dtype_device(
-                out, q.shape[:-1] + v_cache.shape[-1:], out_dtype, q.device, "out"
+                out, q.shape[:-1] + (out_head_dim,), out_dtype, q.device, "out"
             )
 
         # Convert NHD layout to HND for trtllm-gen backend
         if self._backend == "trtllm-gen" and self._kv_layout == "NHD":
-            # For NHD: [..., N, H, D] -> HND: [..., H, N, D]
             k_cache = k_cache.transpose(-3, -2)
             v_cache = v_cache.transpose(-3, -2)
+            if key_block_scales is not None:
+                print(
+                    "[WARNING] NVFP4 KV cache with NHD layout will be converted to HND, "
+                    "incurring extra transpose and contiguous copy overhead. "
+                    "Use kv_layout='HND' for better performance."
+                )
+                k_cache = k_cache.contiguous()
+                v_cache = v_cache.contiguous()
+                key_block_scales = key_block_scales.transpose(-3, -2).contiguous()
+                value_block_scales = value_block_scales.transpose(-3, -2).contiguous()
 
         if self._custom_mask_buf is not None:
             mask_mode = MaskMode.CUSTOM.value
@@ -2324,6 +2370,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     self._qo_indptr_buf,
                     self._paged_kv_indptr_buf,
                     sinks,
+                    key_block_scales,
+                    value_block_scales,
                     skip_softmax_threshold_scale_factor,
                 ]
 
@@ -3644,6 +3692,9 @@ def trtllm_batch_context_with_kv_cache(
     kv_layout: str = "HND",
     enable_pdl: Optional[bool] = None,
     sinks: Optional[List[torch.Tensor]] = None,
+    kv_block_scales: Optional[
+        Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+    ] = None,
     skip_softmax_threshold_scale_factor: Optional[float] = None,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
@@ -3697,6 +3748,9 @@ def trtllm_batch_context_with_kv_cache(
         Layout of kv-cache, can be "HND" or "NHD", default is "HND".
     sinks : Optional[List[torch.Tensor]] = None
         additional value per head in the denominator of the softmax.
+    kv_block_scales : Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]] = None
+        Per-block scale factors for NVFP4 KV cache. Either a tuple of (k_scales, v_scales) or
+        a single tensor with shape [num_pages, 2, ...] that will be unbound along dim=1.
     skip_softmax_threshold_scale_factor: Optional[float] = None
         threshold scale factor for skipping softmax operations.
         Providing a value for this parameter enables skip-softmax sparsity as described in: https://arxiv.org/abs/2512.12087
@@ -3725,11 +3779,35 @@ def trtllm_batch_context_with_kv_cache(
             # it doesn't change underlying storage
             k_cache, v_cache = kv_cache.unbind(dim=1)
 
-    # Convert NHD layout to HND if necessary (transpose only changes stride, not data)
+    # Unpack kv_block_scales
+    key_block_scales = None
+    value_block_scales = None
+    if kv_block_scales is not None:
+        if isinstance(kv_block_scales, tuple):
+            key_block_scales, value_block_scales = kv_block_scales
+        else:
+            if kv_block_scales.shape[1] == 1:
+                key_block_scales, value_block_scales = kv_block_scales, kv_block_scales
+            else:
+                assert kv_block_scales.shape[1] == 2, (
+                    "When kv_block_scales is a single tensor, the second dimension must be 1 or 2"
+                )
+                key_block_scales, value_block_scales = kv_block_scales.unbind(dim=1)
+
+    # Convert NHD layout to HND if necessary
     if kv_layout == "NHD":
-        # For NHD: [..., N, H, D] -> HND: [..., H, N, D]
         k_cache = k_cache.transpose(-3, -2)
         v_cache = v_cache.transpose(-3, -2)
+        if key_block_scales is not None:
+            print(
+                "[WARNING] NVFP4 KV cache with NHD layout will be converted to HND, "
+                "incurring extra transpose and contiguous copy overhead. "
+                "Use kv_layout='HND' for better performance."
+            )
+            k_cache = k_cache.contiguous()
+            v_cache = v_cache.contiguous()
+            key_block_scales = key_block_scales.transpose(-3, -2).contiguous()
+            value_block_scales = value_block_scales.transpose(-3, -2).contiguous()
 
     run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_context
     sm_count = get_device_sm_count(query.device)
@@ -3836,6 +3914,8 @@ def trtllm_batch_context_with_kv_cache(
         enable_pdl,
         workspace_size,
         sinks,
+        key_block_scales,
+        value_block_scales,
         skip_softmax_threshold_scale_factor,
     )
     return (
