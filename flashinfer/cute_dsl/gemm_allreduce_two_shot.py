@@ -31,7 +31,6 @@ def spin_lock_multimem_arrive(lock_ptr: Pointer, loc=None, ip=None) -> None:
 
 # HACK https://github.com/NVIDIA/cutlass/issues/2845
 from cutlass._mlir.dialects import nvvm
-from cutlass.cutlass_dsl import T
 from cutlass._mlir.dialects.nvvm import (
     MemOrderKind,
     MemScopeKind,
@@ -56,7 +55,6 @@ def spin_lock_atom_cas_acquire_wait(
         result = 0
         while result != expected_val:
             result = nvvm.atomicrmw(
-                T.i32(),
                 AtomicOpKind.CAS,
                 lock_ptr.llvm_ptr,
                 Int32(reset_val).ir_value(loc=loc, ip=ip),
@@ -70,7 +68,6 @@ def spin_lock_atom_cas_acquire_wait(
         result = 0
         while result != expected_val:
             result = nvvm.atomicrmw(
-                T.i32(),
                 AtomicOpKind.CAS,
                 lock_ptr.llvm_ptr,
                 Int32(reset_val).ir_value(loc=loc, ip=ip),
@@ -92,7 +89,7 @@ def sm_wise_inter_gpu_multimem_barrier(
     bdimx, bdimy, _ = cute.arch.grid_dim()
     pid = bidx + bidy * bdimx + bidz * bdimx * bdimy
     distributed.multimem_red_release_sys_add1(barrier_mc + pid, loc=loc, ip=ip)
-    cute.arch.fence_proxy(cute.arch.ProxyKind.alias)
+    cute.arch.fence_proxy("alias")
 
     # v4.3.1 does not have mem_order="acquire" variant in `distributed` module
     # filed issue https://github.com/NVIDIA/cutlass/issues/2845
@@ -1251,8 +1248,8 @@ class PersistentDenseGemmKernel:
                         )
                         # Fence and barrier to make sure shared memory store is visible to TMA store
                         cute.arch.fence_proxy(
-                            cute.arch.ProxyKind.async_shared,
-                            space=cute.arch.SharedSpace.shared_cta,
+                            "async.shared",
+                            space="cta",
                         )
                         epilog_threads = 32 * len(self.epilog_warp_id)
                         cute.arch.barrier(
@@ -1312,7 +1309,7 @@ class PersistentDenseGemmKernel:
                             flag = barrier_flag_mc.iterator + tile_id
                             cute.arch.fence_acq_rel_gpu()
                             spin_lock_multimem_arrive(flag)
-                            cute.arch.fence_proxy(cute.arch.ProxyKind.alias)
+                            cute.arch.fence_proxy("alias")
 
                 #
                 # Advance to next tile
