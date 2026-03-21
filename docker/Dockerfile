@@ -1,12 +1,56 @@
-FROM nvidia/cuda:12.8.0-devel-ubuntu24.04
+ARG CUDA_BASE_IMAGE
+FROM ${CUDA_BASE_IMAGE} AS base
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Update package lists and install system dependencies
 RUN apt-get update && apt-get install -y \
     curl \
     git \
-    wget \
+    wget
+
+# ---- test target ----
+FROM base AS test
+
+# Install python
+COPY docker/install/install_python.sh /install/install_python.sh
+RUN bash /install/install_python.sh /opt/conda py312
+
+WORKDIR /workspace
+
+RUN echo "source activate py312" >> ~/.bashrc
+ENV PATH="/opt/conda/bin:$PATH"
+ENV PATH="/opt/conda/envs/py312/bin:$PATH"
+
+# Set LD_LIBRARY_PATH to ensure pip-installed nvidia libs take precedence over system libraries
+ARG NVIDIA_LIB_PATH
+ENV LD_LIBRARY_PATH="/opt/conda/envs/py312/lib/python3.12/site-packages/${NVIDIA_LIB_PATH}/:$LD_LIBRARY_PATH"
+
+# Triton
+ENV TRITON_PTXAS_PATH="/usr/local/cuda/bin/ptxas"
+
+# Install torch and other python packages
+COPY requirements.txt /install/requirements.txt
+COPY docker/install/install_python_packages.sh /install/install_python_packages.sh
+ARG CUDA_VERSION
+ARG PYTORCH_INDEX=${CUDA_VERSION}
+RUN bash /install/install_python_packages.sh ${PYTORCH_INDEX}
+
+ARG INSTALL_TILELANG=false
+RUN if [ "$INSTALL_TILELANG" = "true" ]; then pip install tilelang cuda-tile; fi
+
+# Install mpi4py in the conda environment
+RUN conda install -n py312 -y mpi4py mpich
+
+# Configure pip for user-site installations (allows arbitrary users to install packages)
+# This enables 'pip install --user' and 'pip install -e .' to work for any user
+RUN mkdir -p /opt/pip-user && chmod 1777 /opt/pip-user
+ENV PYTHONUSERBASE=/opt/pip-user
+ENV PATH="/opt/pip-user/bin:$PATH"
+
+# ---- dev target ----
+FROM base AS dev
+
+RUN apt-get update && apt-get install -y \
     clang-format \
     clangd-19 \
     vim \
@@ -47,7 +91,11 @@ ENV PATH="/home/$USERNAME/conda/envs/py312/bin:$PATH"
 # Install torch and other python packages
 COPY requirements.txt /install/requirements.txt
 COPY docker/install/install_python_packages.sh /install/install_python_packages.sh
-RUN bash /install/install_python_packages.sh cu128 && pip3 install pre-commit
+ARG CUDA_VERSION
+ARG PYTORCH_INDEX=${CUDA_VERSION}
+ARG INSTALL_TILELANG=false
+RUN bash /install/install_python_packages.sh ${PYTORCH_INDEX} && pip3 install pre-commit && \
+    if [ "$INSTALL_TILELANG" = "true" ]; then pip install tilelang cuda-tile; fi
 
 # Install mpi4py in the conda environment
 RUN conda install -n py312 -y mpi4py mpich

@@ -1,8 +1,14 @@
 {
     "name": "CUDA Development Container",
     "build": {
-        "dockerfile": "../../docker/Dockerfile.cu129.dev",
-        "context": "../../"
+        "dockerfile": "../../docker/Dockerfile",
+        "context": "../../",
+        "target": "dev",
+        "args": {
+            "CUDA_BASE_IMAGE": "nvidia/cuda:12.9.0-devel-ubuntu24.04",
+            "CUDA_VERSION": "cu129",
+            "PYTORCH_INDEX": "cu129"
+        }
     },
     "runArgs": [
         "--gpus=all"
