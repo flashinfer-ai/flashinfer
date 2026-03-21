@@ -1009,6 +1009,7 @@ def generate_sm80_fused_grouped_gemm_operations():
         (16, 256, 64),
         (32, 128, 64),
         (64, 128, 64),
+        (128, 128, 64),
     ]
 
     stages = [2, 3, 4]
