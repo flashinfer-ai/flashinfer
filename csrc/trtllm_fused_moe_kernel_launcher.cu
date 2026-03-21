@@ -1996,8 +1996,8 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
       (local_num_experts * intermediate_size * intermediate_size_factor * hidden_size) /
       gemm1_weights_scale.numel();
 
-  TVM_FFI_ICHECK(weight_scale_vec_size == 16 || weight_scale_vec_size == 32)
-      << "unsupported weight_scale_vec_size.";
+  TVM_FFI_ICHECK(weight_scale_vec_size >= 14 && weight_scale_vec_size <= 32)
+      << "unsupported weight_scale_vec_size: " << weight_scale_vec_size;
   auto mDtypeWeights = weight_scale_vec_size == 16 ? btg::Dtype::E2m1 : btg::Dtype::MxE2m1;
 
   if (routing_logits.has_value()) {
@@ -2122,7 +2122,7 @@ Array<Tensor> trtllm_mxint4_block_scale_moe(
   int weight_scale_vec_size =
       (local_num_experts * intermediate_size * 2 * hidden_size) / gemm1_weights_scale.numel();
 
-  TVM_FFI_ICHECK(weight_scale_vec_size == 32) << "unsupported weight_scale_vec_size.";
+  TVM_FFI_ICHECK(weight_scale_vec_size == 32) << "unsupported weight_scale_vec_size: " << weight_scale_vec_size;
 
   TVM_FFI_ICHECK(routing_logits.dtype() == dl_float32 || routing_logits.dtype() == dl_bfloat16)
       << "routing_logits must be float or bfloat16.";
