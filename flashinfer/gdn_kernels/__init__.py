@@ -13,7 +13,7 @@ Exported Kernels:
 - run_pretranspose_decode: Pretranspose (V-major) decode kernel
 - run_nontranspose_decode: Nontranspose (K-major) decode kernel
 - run_mtp_decode: Multi-token processing decode kernel
-- get_tile_v_mtp, get_vec_size_mtp: MTP hyperparameter helpers
+- get_mtp_config, get_tile_v_mtp, get_vec_size_mtp: MTP hyperparameter helpers
 """
 
 from typing import Optional, Type
@@ -41,11 +41,17 @@ except ImportError:
     run_nontranspose_decode = None  # type: ignore
 
 try:
-    from .gdn_decode_mtp import run_mtp_decode, get_tile_v_mtp, get_vec_size_mtp
+    from .gdn_decode_mtp import (
+        run_mtp_decode,
+        get_tile_v_mtp,
+        get_vec_size_mtp,
+        get_mtp_config,
+    )
 except ImportError:
     run_mtp_decode = None  # type: ignore
     get_tile_v_mtp = None  # type: ignore
     get_vec_size_mtp = None  # type: ignore
+    get_mtp_config = None  # type: ignore
 
 __all__ = [
     "gated_delta_rule",
@@ -55,4 +61,5 @@ __all__ = [
     "run_mtp_decode",
     "get_tile_v_mtp",
     "get_vec_size_mtp",
+    "get_mtp_config",
 ]

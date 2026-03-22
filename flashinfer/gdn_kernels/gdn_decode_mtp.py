@@ -60,6 +60,62 @@ TILE_K_MTP = 128  # Full K dimension (shared across all configs)
 NUM_THREADS_MTP = 128  # 4 warps
 
 
+def get_mtp_config(
+    batch_size: int,
+    seq_len: int,
+    num_v_heads: int = 64,
+    v_dim: int = 128,
+    disable_state_update: bool = False,
+) -> tuple:
+    """Unified MTP config selection based on CTA work units.
+
+    Returns (tile_v, vec_size, ilp_rows, use_smem_v) for the MTP kernel.
+
+    Uses work_units = batch_size * num_v_heads (the tile_v-independent CTA factor)
+    as the decision variable so the selection is model-independent. Thresholds
+    derived from Qwen3.5 (HV=64) grid search on B200.
+
+    | work_units | Qwen3.5 BS equiv | tile_v | ilp | smem_v |
+    |-----------:|------------------:|-------:|----:|:------:|
+    | ≤64        | BS≤1              | 8      | 2   | False  |
+    | ≤128       | BS≤2              | 16     | 4   | False  |
+    | ≤448, T≤2  | BS≤7              | 16     | 2   | False  |
+    | ≤448, T≥3  | BS≤7              | 32     | 4   | False  |
+    | ≤1024      | BS≤16             | 32     | 4   | False  |
+    | >1024      | BS≥17             | 64     | 4/8 | True*  |
+
+    *smem_v=False if state_update ON + T≤2; ilp=8 if tile_v≥64 + state_update ON + T≤2.
+    """
+    work_units = batch_size * num_v_heads
+    vec_size = 4  # Always 4 (full warp shuffle)
+
+    if work_units <= 64:
+        tile_v, ilp_rows, use_smem_v = 8, 2, False
+    elif work_units <= 128:
+        tile_v, ilp_rows, use_smem_v = 16, 4, False
+    elif work_units <= 448:
+        if seq_len <= 2:
+            tile_v, ilp_rows, use_smem_v = 16, 2, False
+        else:
+            tile_v, ilp_rows, use_smem_v = 32, 4, False
+    elif work_units <= 1024:
+        tile_v, ilp_rows, use_smem_v = 32, 4, False
+    else:
+        # Large batches: tile_v=64, smem_v on by default
+        tile_v = 64
+        use_smem_v = True
+        ilp_rows = 4
+        # State update ON + low T: ilp=8 helps, smem_v provides no benefit
+        if not disable_state_update and seq_len <= 2:
+            ilp_rows = 8
+            use_smem_v = False
+
+    # Clamp tile_v to v_dim (e.g. v_dim=64 models shouldn't use tile_v=128)
+    tile_v = min(tile_v, v_dim)
+
+    return tile_v, vec_size, ilp_rows, use_smem_v
+
+
 def get_vec_size_mtp(batch_size: int, seq_len: int = 1) -> int:
     """Select vec_size for MTP kernel.
 
@@ -69,101 +125,46 @@ def get_vec_size_mtp(batch_size: int, seq_len: int = 1) -> int:
     return 4
 
 
-def get_tile_v_mtp(batch_size: int, seq_len: int = 1) -> int:
-    """Select optimal TILE_V for MTP kernel based on batch size and sequence length.
-
-    With vec_size=4, num_groups=4, rows_per_group = tile_v / 4.
-    Tuned via grid search for optimal performance.
-
-    v9: All batch sizes use the ILP kernel. BS<8 winners from grid search
-    (bench_gdn_mtp_ilp_grid.py on B200, Qwen3.5 dims HV=64 K=128 V=128).
-    """
-    if batch_size < 8:
-        # v9 grid-search winners for small batches (ILP kernel, not original)
-        if batch_size <= 1:
-            return 8  # BS=1: tile_v=8, ilp=2 wins across all T
-        elif batch_size <= 2:
-            return 16  # BS=2: tile_v=16, ilp=4 wins across all T
-        else:
-            # BS=3-7: tile_v=16 for T=2, tile_v=32 for T>=3
-            if seq_len <= 2:
-                return 16
-            return 32
-    # v15: BS=8-16 always use tile_v=32, ilp=4 for all T values.
-    # v14 used tile_v=64 for T>=4 which halved block count (4096→2048 at BS=16),
-    # causing a ~7pp SOL dip at the T=3→4 boundary. tile_v=32 ilp=4 maintains
-    # 4096 blocks at BS=16 (2048 at BS=8). The "register pressure" claim for
-    # tile_v=32 ilp=4 at T>=4 was never tested — v14 proved ilp=4 works at
-    # tile_v=64 for the same T values, so tile_v=32 should be fine too.
-    elif batch_size <= 16:
-        return 32  # BS=8-16: always tile_v=32, ilp=4
-    else:
-        return 64  # BS>=17: always tile_v=64
+def get_tile_v_mtp(
+    batch_size: int,
+    seq_len: int = 1,
+    *,
+    num_v_heads: int = 64,
+    v_dim: int = 128,
+) -> int:
+    """Select optimal TILE_V for MTP kernel. Delegates to get_mtp_config()."""
+    tile_v, _, _, _ = get_mtp_config(batch_size, seq_len, num_v_heads, v_dim)
+    return tile_v
 
 
 def get_ilp_rows(
-    batch_size: int, seq_len: int, disable_state_update: bool = False
+    batch_size: int,
+    seq_len: int,
+    disable_state_update: bool = False,
+    *,
+    num_v_heads: int = 64,
+    v_dim: int = 128,
 ) -> int:
-    """Select number of ILP rows (1, 2, 4, or 8) for the MTP kernel.
-
-    Higher ILP rows process more V-rows simultaneously, providing more memory
-    request parallelism and instruction-level parallelism to hide latency.
-
-    When state update is enabled (disable_state_update=False), the kernel is
-    more memory-bound due to the 1.07GB state writeback. Higher ILP (8-row)
-    provides 3-5% improvement by maximizing outstanding memory requests:
-    - T=1 BS=512: ilp=8 → 323us vs ilp=4 → 325us (0.7%)
-    - T=2 BS=512: ilp=8 → 368us vs ilp=4 → 381us (3.4%)
-
-    Selection logic (v14):
-    - BS < 8: Grid-search-optimal ilp per batch size
-    - BS >= 8 (tile_v=64): Always ilp=4, or ilp=8 if state_update ON + T<=2
-    """
-    # v9: Small batch sizes now use ILP kernel with grid-search-optimal ilp_rows
-    if batch_size < 8:
-        if batch_size <= 1:
-            return 2  # BS=1: tile_v=8, ilp=2 wins across all T
-        elif batch_size <= 2:
-            return 4  # BS=2: tile_v=16, ilp=4 wins across all T
-        else:
-            # BS=3-7: ilp=2 for T=2, ilp=4 for T>=3
-            if seq_len <= 2:
-                return 2
-            return 4
-
-    # v15: BS>=8 always ilp=4 (or 8 for state_update + low T with tile_v>=64).
-    tile_v = get_tile_v_mtp(batch_size, seq_len)
-    if tile_v >= 64 and not disable_state_update and seq_len <= 2:
-        return 8
-    return 4
+    """Select number of ILP rows for the MTP kernel. Delegates to get_mtp_config()."""
+    _, _, ilp_rows, _ = get_mtp_config(
+        batch_size, seq_len, num_v_heads, v_dim, disable_state_update
+    )
+    return ilp_rows
 
 
 def get_use_smem_v(
-    batch_size: int, seq_len: int, disable_state_update: bool = False
+    batch_size: int,
+    seq_len: int,
+    disable_state_update: bool = False,
+    *,
+    num_v_heads: int = 64,
+    v_dim: int = 128,
 ) -> bool:
-    """Decide whether to preload v values into SMEM.
-
-    SMEM v preloading eliminates repeated GMEM scalar loads of v values during
-    the inner T-loop, replacing them with fast SMEM reads. This provides 4-7%
-    speedup at large batch sizes (BS>=32, tile_v>=64).
-
-    For small batch sizes (BS<8), ILP optimizations cause regression, so we
-    disable SMEM v along with ILP rows to use the simpler kernel path.
-
-    When state update is enabled with low T (T<=2), SMEM v provides no benefit
-    (measured 0-1us difference) because the kernel is fully memory-bound from
-    the state read/write. Disabling SMEM v reduces shared memory usage slightly.
-    """
-    # Small batch sizes: disable SMEM v along with ILP to avoid regression
-    if batch_size < 8:
-        return False
-    tile_v = get_tile_v_mtp(batch_size, seq_len)
-    if tile_v < 64:
-        return False
-    # State update ON + low T: SMEM v provides no benefit (memory-bound)
-    if not disable_state_update and seq_len <= 2:
-        return False
-    return True
+    """Decide whether to preload v values into SMEM. Delegates to get_mtp_config()."""
+    _, _, _, use_smem_v = get_mtp_config(
+        batch_size, seq_len, num_v_heads, v_dim, disable_state_update
+    )
+    return use_smem_v
 
 
 # Optimized MTP kernel with ILP rows and SMEM v caching - used for BS >= 8
@@ -2224,11 +2225,9 @@ def run_mtp_decode(
         disable_state_update: If True, do not write back updated state.
         cache_intermediate_states: If True, cache intermediate states.
     """
-    # Dispatch between inline kernel (BS<=2) and warp-specialized kernel (BS>=3)
-    use_inline_kernel = B <= 2
-
-    ilp_rows = get_ilp_rows(B, T, disable_state_update)
-    use_smem_v = get_use_smem_v(B, T, disable_state_update)
+    # Dispatch between inline kernel and warp-specialized kernel based on CTA work units
+    _, _, ilp_rows, use_smem_v = get_mtp_config(B, T, HV, V, disable_state_update)
+    use_inline_kernel = (B * HV) <= 128
     num_warps = 4  # 128 threads, 4 warps
 
     if use_inline_kernel:
