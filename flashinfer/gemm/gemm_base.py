@@ -1790,8 +1790,8 @@ def _validate_bf16_output_dtype(dtype: torch.dtype):
         )
 
 
-@functools.lru_cache(maxsize=1024)
-def create_cudnn_execution_plans_fp4_gemm(
+@functools.cache
+def build_cudnn_gemm_fp4_graph(
     a_shape,
     a_stride,
     b_shape,
@@ -1806,7 +1806,10 @@ def create_cudnn_execution_plans_fp4_gemm(
     device,
     alpha_is_not_none,
     use_nvfp4,
+    policy: cudnn.build_plan_policy = cudnn.build_plan_policy.HEURISTICS_CHOICE,
 ):
+    _check_cudnn_availability()
+
     stream = torch.cuda.current_stream(device)
     with cudnn.graph(_get_cudnn_handle(device, stream)) as (graph, _):
         scale_type = cudnn.data_type.FP8_E4M3 if use_nvfp4 else cudnn.data_type.FP8_E8M0
@@ -1888,51 +1891,10 @@ def create_cudnn_execution_plans_fp4_gemm(
         if (alpha_is_not_none) and (not _is_cublas_fp4_available_in_cudnn()):
             graph.deselect_engines(["eng0"])
 
+        graph.check_support()
+        graph.build_plans(policy)
+
         return graph
-
-
-@functools.lru_cache(maxsize=1024)
-def build_plans_cudnn_fp4_gemm_graph(
-    a_shape,
-    a_stride,
-    b_shape,
-    b_stride,
-    a_descale_shape,
-    a_descale_stride,
-    b_descale_shape,
-    b_descale_stride,
-    ab_type,
-    o_type,
-    block_size,
-    device,
-    alpha,
-    use_nvfp4,
-    tactic: int = -1,
-):
-    # Graph should have been already cached, when we ran _cudnn_gemm_fp4_requirement
-    graph = create_cudnn_execution_plans_fp4_gemm(
-        a_shape,
-        a_stride,
-        b_shape,
-        b_stride,
-        a_descale_shape,
-        a_descale_stride,
-        b_descale_shape,
-        b_descale_stride,
-        ab_type,
-        o_type,
-        block_size,
-        device,
-        alpha,
-        use_nvfp4,
-    )
-
-    graph.check_support()
-    if tactic != -1:
-        graph.build_plan_at_index(tactic)
-    else:
-        graph.build_plans()
-    return graph
 
 
 def execute_cudnn_gemm_fp4_graph(
@@ -2999,6 +2961,11 @@ def _cudnn_gemm_bf16(
     a_shape, a_stride = _get_bf16_3d_shape_stride(a)
     b_shape, b_stride = _get_bf16_3d_shape_stride(b)
 
+    if tactic == -1:
+        policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
+    else:
+        policy = cudnn.build_plan_policy.ALL
+
     graph = build_cudnn_gemm_bf16_graph(
         a_shape,
         a_stride,
@@ -3006,7 +2973,7 @@ def _cudnn_gemm_bf16(
         b_stride,
         _torch_data_type_to_cudnn_data_type(out.dtype),
         a.device,
-        policy=cudnn.build_plan_policy.ALL,
+        policy=policy,
     )
     execute_cudnn_gemm_bf16_graph(graph, a, b, out, workspace, tactic=tactic)
     return out
@@ -4073,9 +4040,14 @@ def _get_cudnn_fp4_gemm_graph(
         _expand_block_scale_tensor_shape(b_descale, batch)
     )
 
+    if tactic == -1:
+        policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
+    else:
+        policy = cudnn.build_plan_policy.ALL
+
     # build the fp4 cudnn graph
     # Constructed graph is cached, via @functools.cache decorator.
-    graph = build_plans_cudnn_fp4_gemm_graph(
+    graph = build_cudnn_gemm_fp4_graph(
         real_a_shape,
         real_a_stride,
         real_b_shape,
@@ -4090,7 +4062,7 @@ def _get_cudnn_fp4_gemm_graph(
         a.device,
         alpha is not None,
         use_nvfp4,
-        tactic=tactic,
+        policy=policy,
     )
     return graph
 
@@ -4294,39 +4266,6 @@ def _cudnn_gemm_fp4_requirement(
         raise LibraryError(CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR)
 
     _check_cudnn_fp4_availability()
-
-    # the fp4 cudnn graph will be shared for both mm and bmm, so
-    # here we need to get the 3d shape and stride including the
-    # batch dimension for both input and block scale tensors.
-    real_a_shape, real_a_stride = _get_real_fp4_shape_from_packed_uint8(a)
-    real_b_shape, real_b_stride = _get_real_fp4_shape_from_packed_uint8(b)
-    batch = real_a_shape[0]
-    expanded_a_descale_shape, expanded_a_descale_stride = (
-        _expand_block_scale_tensor_shape(a_descale, batch)
-    )
-    expanded_b_descale_shape, expanded_b_descale_stride = (
-        _expand_block_scale_tensor_shape(b_descale, batch)
-    )
-
-    # build the fp4 cudnn graph. This graph will be cached & reused in mm_fp4()
-    # because the graph is constructed with @functools.cache decorator
-    graph = create_cudnn_execution_plans_fp4_gemm(
-        real_a_shape,
-        real_a_stride,
-        real_b_shape,
-        real_b_stride,
-        expanded_a_descale_shape,
-        expanded_a_descale_stride,
-        expanded_b_descale_shape,
-        expanded_b_descale_stride,
-        cudnn.data_type.FP4_E2M1,
-        _torch_data_type_to_cudnn_data_type(out_dtype),
-        block_size,
-        a.device,
-        alpha is not None,
-        use_nvfp4,
-    )
-    graph.check_support()
 
     return True
 
