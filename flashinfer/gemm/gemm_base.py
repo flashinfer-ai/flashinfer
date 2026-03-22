@@ -2801,7 +2801,15 @@ def _get_bf16_3d_shape_stride(tensor: torch.Tensor):
 
 
 @functools.cache
-def build_cudnn_gemm_bf16_graph(a_shape, a_stride, b_shape, b_stride, o_type, device):
+def build_cudnn_gemm_bf16_graph(
+    a_shape,
+    a_stride,
+    b_shape,
+    b_stride,
+    o_type,
+    device,
+    policy: cudnn.build_plan_policy = cudnn.build_plan_policy.HEURISTICS_CHOICE,
+):
     _check_cudnn_availability()
 
     stream = torch.cuda.current_stream(device)
@@ -2828,7 +2836,7 @@ def build_cudnn_gemm_bf16_graph(a_shape, a_stride, b_shape, b_stride, o_type, de
         graph.build_operation_graph()
         graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
         graph.check_support()
-        graph.build_plans()
+        graph.build_plans(policy)
 
         return graph
 
@@ -2998,6 +3006,7 @@ def _cudnn_gemm_bf16(
         b_stride,
         _torch_data_type_to_cudnn_data_type(out.dtype),
         a.device,
+        policy=cudnn.build_plan_policy.ALL,
     )
     execute_cudnn_gemm_bf16_graph(graph, a, b, out, workspace, tactic=tactic)
     return out
@@ -3005,6 +3014,12 @@ def _cudnn_gemm_bf16(
 
 def _cudnn_gemm_bf16_runner():
     class CudnnBf16GemmRunner(TunableRunner):
+        def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+            # inputs layout: a, b, bias, pdl, out, workspace_buffer
+            # out.dtype distinguishes bfloat16 / float16 / float32 output graphs
+            _, _, _, _, out, _ = inputs
+            return (out.dtype,)
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
@@ -3021,6 +3036,7 @@ def _cudnn_gemm_bf16_runner():
                 b_stride,
                 _torch_data_type_to_cudnn_data_type(out.dtype),
                 a.device,
+                policy=cudnn.build_plan_policy.ALL,
             )
             return list(range(graph.get_execution_plan_count()))
 
@@ -4118,6 +4134,13 @@ def _cudnn_gemm_fp4(
 
 def _cudnn_gemm_fp4_runner():
     class CudnnFp4GemmRunner(TunableRunner):
+        def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+            # inputs layout: a, b, a_descale, b_descale, alpha, out_dtype,
+            #                out, block_size, use_nvfp4, workspace_buffer
+            # All four values affect which cuDNN graph is built.
+            _, _, _, _, alpha, out_dtype, out, block_size, use_nvfp4, _ = inputs
+            return (out.dtype, block_size, use_nvfp4, alpha is not None)
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
