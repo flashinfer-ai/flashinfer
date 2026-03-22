@@ -190,7 +190,6 @@ def ulysses_a2a_out(output, tensor_layout, ulysses_size=1, ulysses_group=None):
     return output
 
 
-@torch.compile
 def ring_fwd_out_correction(
     out: torch.Tensor,
     out_per_step: torch.Tensor,
@@ -204,7 +203,6 @@ def ring_fwd_out_correction(
     out.copy_(new_out)
 
 
-@torch.compile
 def ring_fwd_softmax_lse_correction(
     softmax_lse: torch.Tensor,
     softmax_lse_per_step: torch.Tensor,
