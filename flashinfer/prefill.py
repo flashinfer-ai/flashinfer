@@ -1539,8 +1539,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 jit_args[0],
                 get_customize_batch_prefill_module(backend, *jit_args, **jit_kwargs),
             )
+            self._jit_additional_tensor_names = list(jit_args[7])
         else:
             self._jit_module = None
+            self._jit_additional_tensor_names = []
 
         self._kv_layout = kv_layout
         if backend == "cudnn":
@@ -2287,7 +2289,22 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 enable_pdl,
             ]
             if self._jit_module is not None:
-                run_args.extend(list(args))
+                _known_bufs = {
+                    "maybe_custom_mask": self._custom_mask_buf,
+                    "maybe_mask_indptr": self._mask_indptr_buf,
+                    "maybe_alibi_slopes": _get_cache_alibi_slopes_buf(
+                        q.shape[1], q.device
+                    ),
+                }
+                user_args = list(args)
+                for name in self._jit_additional_tensor_names:
+                    if name in _known_bufs:
+                        run_args.append(_known_bufs[name])
+                    elif user_args:
+                        run_args.append(user_args.pop(0))
+                    else:
+                        run_args.append(None)
+                run_args.extend(user_args)
             else:
                 # Extract FP8 scale tensors from *args if q is FP8
                 fp8_scale_q = None
@@ -2551,8 +2568,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 jit_args[0],
                 get_customize_batch_prefill_module(backend, *jit_args, **jit_kwargs),
             )
+            self._jit_additional_tensor_names = list(jit_args[7])
         else:
             self._jit_module = None
+            self._jit_additional_tensor_names = []
 
         self._kv_layout = kv_layout
         self._float_workspace_buffer = float_workspace_buffer
@@ -3199,7 +3218,22 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             enable_pdl,
         ]
         if self._jit_module is not None:
-            run_args.extend(list(args))
+            _known_bufs = {
+                "maybe_custom_mask": self._custom_mask_buf,
+                "maybe_mask_indptr": self._mask_indptr_buf,
+                "maybe_alibi_slopes": _get_cache_alibi_slopes_buf(
+                    q.shape[1], self.device
+                ),
+            }
+            user_args = list(args)
+            for name in self._jit_additional_tensor_names:
+                if name in _known_bufs:
+                    run_args.append(_known_bufs[name])
+                elif user_args:
+                    run_args.append(user_args.pop(0))
+                else:
+                    run_args.append(None)
+            run_args.extend(user_args)
         else:
             run_args += [
                 self._custom_mask_buf,
