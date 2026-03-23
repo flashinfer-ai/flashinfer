@@ -113,12 +113,27 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
   auto lane = threadIdx.x % warpSize;
   auto warp = threadIdx.y;
 
-  auto const state_batch = (state_batch_indices) ? state_batch_indices[batch] : batch;
+  auto const state_batch =
+      state_batch_indices
+          ? static_cast<int64_t>(
+                state_batch_indices[batch * params.state_batch_indices_stride_batch])
+          : static_cast<int64_t>(batch);
+  auto const* __restrict__ dst_sbi =
+      reinterpret_cast<stateIndex_t const*>(params.dst_state_batch_indices);
+  auto const dst_state_batch =
+      dst_sbi ? static_cast<int64_t>(dst_sbi[batch * params.dst_state_batch_indices_stride_batch])
+              : state_batch;
   auto const state_ptr_offset = state_batch * params.state_stride_batch + head * DIM * DSTATE;
   state += state_ptr_offset;
+  auto* __restrict__ dst_state = reinterpret_cast<state_t*>(params.state) +
+                                 dst_state_batch * params.state_stride_batch + head * DIM * DSTATE;
   if constexpr (scaleState) {
     state_scale += state_batch * params.state_scale_stride_batch + head * DIM;
   }
+  [[maybe_unused]] auto* __restrict__ dst_state_scale =
+      scaleState ? reinterpret_cast<state_scale_t*>(params.state_scale) +
+                       dst_state_batch * params.state_scale_stride_batch + head * DIM
+                 : nullptr;
 
   __shared__ SharedStorageSimple<input_t, state_scale_t, ROWS_PER_BLOCK, DSTATE> sram;
 
@@ -227,7 +242,7 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
         out_value += new_state * C_value;
       }
       if (!scaleState && params.update_state && state_batch != params.pad_slot_id) {
-        *reinterpret_cast<load_state_t*>(&state[d * DSTATE + i]) = rState;
+        *reinterpret_cast<load_state_t*>(&dst_state[d * DSTATE + i]) = rState;
       }
     }
     out_value = warpReduceSum(out_value);
@@ -252,7 +267,7 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
             convertAndStore(&rState.val[ii],
                             rNewState[iter * load_state_t::count + ii] * new_state_encode_scale);
           }
-          *reinterpret_cast<load_state_t*>(&state[d * DSTATE + i]) = rState;
+          *reinterpret_cast<load_state_t*>(&dst_state[d * DSTATE + i]) = rState;
         }
 
         if (lane == 0) {
@@ -284,7 +299,7 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
         auto _d = warp * rowsPerWarp + l;
         auto d = dim_offset + _d;
         if (d < DIM) {
-          state_scale[d] = sram.state_scale[_d];
+          dst_state_scale[d] = sram.state_scale[_d];
         }
       }
     }
@@ -315,7 +330,7 @@ template <typename input_t, typename state_t, typename state_scale_t, int DIM, i
 __device__ __forceinline__ void producer_func_vertical(
     SramT& sram, CUtensorMap const& tensorState, input_t const* x_global_ptr,
     input_t const* B_global_ptr, input_t const* C_global_ptr, input_t const* z_global_ptr,
-    [[maybe_unused]] void const* state_scale_ptr, int batch, int head) {
+    [[maybe_unused]] void const* state_scale_ptr, int batch, int dst_batch, int head) {
   constexpr bool scaleState = !std::is_same_v<state_scale_t, void>;
 #ifdef FLASHINFER_MAMBA_ENABLE_SM90
   namespace cde = cuda::device::experimental;
@@ -402,7 +417,7 @@ __device__ __forceinline__ void producer_func_vertical(
       cde::fence_proxy_async_shared_cta();
       // Writeback
       if constexpr (writeState) {
-        cde::cp_async_bulk_tensor_4d_shared_to_global(&tensorState, 0, d_write, head, batch,
+        cde::cp_async_bulk_tensor_4d_shared_to_global(&tensorState, 0, d_write, head, dst_batch,
                                                       &sram.state[stage][0]);
 
         cde::cp_async_bulk_commit_group();
@@ -433,7 +448,7 @@ __device__ __forceinline__ void producer_func_vertical(
     if constexpr (writeState) {
       // Unblock async proxy for writeback
       cde::fence_proxy_async_shared_cta();
-      cde::cp_async_bulk_tensor_4d_shared_to_global(&tensorState, 0, d_write, head, batch,
+      cde::cp_async_bulk_tensor_4d_shared_to_global(&tensorState, 0, d_write, head, dst_batch,
                                                     &sram.state[stage][0]);
 
       cde::cp_async_bulk_commit_group();
@@ -652,9 +667,21 @@ __global__ void selective_state_update_kernel_producer_consumer_vertical(
   auto lane = threadIdx.x % warpSize;
   auto warp = threadIdx.y;
 
-  auto const state_batch = (state_batch_indices) ? __ldg(&state_batch_indices[batch]) : batch;
+  auto const state_batch =
+      state_batch_indices
+          ? static_cast<int64_t>(
+                __ldg(&state_batch_indices[batch * params.state_batch_indices_stride_batch]))
+          : static_cast<int64_t>(batch);
+  auto const* __restrict__ dst_sbi =
+      reinterpret_cast<stateIndex_t const*>(params.dst_state_batch_indices);
+  auto const dst_state_batch =
+      dst_sbi ? static_cast<int64_t>(
+                    __ldg(&dst_sbi[batch * params.dst_state_batch_indices_stride_batch]))
+              : state_batch;
   auto const state_ptr_offset =
       static_cast<int64_t>(state_batch) * params.state_stride_batch + head * DIM * DSTATE;
+  auto const dst_state_ptr_offset =
+      static_cast<int64_t>(dst_state_batch) * params.state_stride_batch + head * DIM * DSTATE;
 
   extern __shared__ uint8_t sbuffer[];
   using sram_t = SharedStorageVertical<input_t, weight_t, matrixA_t, state_t, state_scale_t,
@@ -696,7 +723,7 @@ __global__ void selective_state_update_kernel_producer_consumer_vertical(
         producer_func_vertical<input_t, state_t, state_scale_t, DIM, DSTATE, rowsPerStage,
                                numStages, readState, writeState, hasZ>(
             sram, tensorState, x_global_ptr, B_global_ptr, C_global_ptr,
-            hasZ ? z_global_ptr : nullptr, state_scale_ptr, state_batch, head);
+            hasZ ? z_global_ptr : nullptr, state_scale_ptr, state_batch, dst_state_batch, head);
       };
       auto const dispatch_state = [&]<bool hasZ>() {
         if (read_state && write_state)
@@ -760,7 +787,7 @@ __global__ void selective_state_update_kernel_producer_consumer_vertical(
     if constexpr (scaleState) {
       if (params.update_state && state_batch != params.pad_slot_id) {
         if (d < DIM) {
-          state_scale[state_batch * params.state_scale_stride_batch + head * DIM + d] =
+          state_scale[dst_state_batch * params.state_scale_stride_batch + head * DIM + d] =
               sram.state_scale[d];
         }
       }
@@ -789,7 +816,7 @@ template <typename state_t, int DIM, int DSTATE, int colsPerStage, int numStages
           bool writeState, typename SramT>
 __device__ __forceinline__ void producer_func_horizontal(SramT& sram,
                                                          CUtensorMap const& tensorState, int batch,
-                                                         int head) {
+                                                         int dst_batch, int head) {
   namespace cde = cuda::device::experimental;
 
   auto constexpr stagesReadOnly = numStages;
@@ -830,7 +857,7 @@ __device__ __forceinline__ void producer_func_horizontal(SramT& sram,
       cde::fence_proxy_async_shared_cta();
       // Writeback
       if constexpr (writeState) {
-        cde::cp_async_bulk_tensor_4d_shared_to_global(&tensorState, i_write, 0, head, batch,
+        cde::cp_async_bulk_tensor_4d_shared_to_global(&tensorState, i_write, 0, head, dst_batch,
                                                       &sram.state[stage][0]);
         cde::cp_async_bulk_commit_group();
         cde::cp_async_bulk_wait_group_read<0>();
@@ -860,7 +887,7 @@ __device__ __forceinline__ void producer_func_horizontal(SramT& sram,
     if constexpr (writeState) {
       // Unblock async proxy for writeback
       cde::fence_proxy_async_shared_cta();
-      cde::cp_async_bulk_tensor_4d_shared_to_global(&tensorState, i_write, 0, head, batch,
+      cde::cp_async_bulk_tensor_4d_shared_to_global(&tensorState, i_write, 0, head, dst_batch,
                                                     &sram.state[stage][0]);
       cde::cp_async_bulk_commit_group();
       cde::cp_async_bulk_wait_group_read<0>();
@@ -1028,7 +1055,16 @@ __global__ void selective_state_update_kernel_producer_consumer_horizontal(
   auto lane = threadIdx.x % warpSize;
   auto warp = threadIdx.y;
 
-  auto const state_batch = (state_batch_indices) ? state_batch_indices[batch] : batch;
+  auto const state_batch =
+      state_batch_indices
+          ? static_cast<int64_t>(
+                state_batch_indices[batch * params.state_batch_indices_stride_batch])
+          : static_cast<int64_t>(batch);
+  auto const* __restrict__ dst_sbi =
+      reinterpret_cast<stateIndex_t const*>(params.dst_state_batch_indices);
+  auto const dst_state_batch =
+      dst_sbi ? static_cast<int64_t>(dst_sbi[batch * params.dst_state_batch_indices_stride_batch])
+              : state_batch;
   auto const state_ptr_offset =
       static_cast<int64_t>(state_batch) * params.state_stride_batch + head * DIM * DSTATE;
 
@@ -1061,13 +1097,13 @@ __global__ void selective_state_update_kernel_producer_consumer_horizontal(
     cg::invoke_one(cg::coalesced_threads(), [&]() {
       if (read_state && write_state)
         producer_func_horizontal<state_t, DIM, DSTATE, colsPerStage, numStages, true, true>(
-            sram, tensorState, state_batch, head);
+            sram, tensorState, state_batch, dst_state_batch, head);
       else if (read_state && !write_state)
         producer_func_horizontal<state_t, DIM, DSTATE, colsPerStage, numStages, true, false>(
-            sram, tensorState, state_batch, head);
+            sram, tensorState, state_batch, dst_state_batch, head);
       else
         producer_func_horizontal<state_t, DIM, DSTATE, colsPerStage, numStages, false, false>(
-            sram, tensorState, state_batch, head);
+            sram, tensorState, state_batch, dst_state_batch, head);
     });
   } else {  // consumers
 

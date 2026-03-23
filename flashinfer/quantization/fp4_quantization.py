@@ -15,7 +15,6 @@ limitations under the License.
 """
 
 import functools
-from enum import Enum
 from types import SimpleNamespace
 from typing import List, Optional, Tuple
 
@@ -46,6 +45,7 @@ from ..utils import (
     supported_compute_capability,
     round_up,
 )
+from ..tllm_enums import SfLayout
 
 
 def _compute_swizzled_layout_sf_size(total_row, total_column, row_size=128):
@@ -823,16 +823,6 @@ def shuffle_matrix_sf_a(
 
     # 128x4
     return block_scale_interleave(w_shuffled)
-
-
-class SfLayout(Enum):
-    """
-    Layout of scale factors for NVFP4.
-    """
-
-    layout_128x4 = 0
-    layout_8x4 = 1
-    layout_linear = 2
 
 
 @flashinfer_api

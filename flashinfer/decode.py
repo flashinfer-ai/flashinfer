@@ -1303,6 +1303,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
         )
+        actual_batch_size = self._paged_kv_last_page_len_buf.size(0)
+        expected_q_len = actual_batch_size * q_len_per_req
+        if q.size(0) != expected_q_len:
+            raise ValueError(
+                f"q.shape[0] ({q.size(0)}) does not match batch_size * q_len_per_req "
+                f"({actual_batch_size} * {q_len_per_req} = {expected_q_len}). "
+                f"For batch decode, q must have shape [batch_size * q_len_per_req, num_heads, head_dim]."
+            )
 
         # Convert NHD layout to HND for trtllm-gen backend
         if self._backend == "trtllm-gen" and self._kv_layout == "NHD":
@@ -1877,6 +1885,18 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
             * attention output, shape: ``[batch_size, num_qo_heads, head_dim]``
             * logsumexp of attention scores, shape: ``[batch_size, num_qo_heads]``.
         """
+
+        expected_batch_size = self._paged_kv_last_page_len_buf.size(0)
+        if q_nope.size(0) != expected_batch_size:
+            raise ValueError(
+                f"q_nope.shape[0] ({q_nope.size(0)}) does not match batch_size ({expected_batch_size}). "
+                f"For MLA batch decode, q_nope must have shape [batch_size, num_heads, head_dim]."
+            )
+        if q_pe.size(0) != expected_batch_size:
+            raise ValueError(
+                f"q_pe.shape[0] ({q_pe.size(0)}) does not match batch_size ({expected_batch_size}). "
+                f"For MLA batch decode, q_pe must have shape [batch_size, num_heads, head_dim]."
+            )
 
         # MLA decode kernel supports SM80 only
         major, minor = get_compute_capability(q_nope.device)
