@@ -121,7 +121,7 @@ def _create_scale_bmm2_d_tensor(
         return result
     else:
         # FP8, INT8, etc. use FP32 accumulation - create FP32 tensor and view as int32
-        return torch.tensor([scale_bmm2], dtype=torch.float32, device=device).view(
+        return torch.full((1,), scale_bmm2, dtype=torch.float32, device=device).view(
             torch.int32
         )
 
