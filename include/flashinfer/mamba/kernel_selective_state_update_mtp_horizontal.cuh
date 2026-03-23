@@ -116,16 +116,14 @@ __device__ __forceinline__ void convertAndStoreSRHorizontal(state_t& out0, state
 // TMA warp: loads B, C, x (once), then pipelines state_in in TMA_STATE_ROWS chunks.
 // =============================================================================
 
-template <typename input_t, typename state_t, typename stateIndex_t, int NTOKENS, int DIM,
-          int DSTATE, int NUM_IN_STAGES, int TMA_STATE_ROWS, int HEADS_PER_CTA, typename SramT>
+template <typename input_t, typename state_t, typename stateIndex_t, bool IS_PAD, int NTOKENS,
+          int DIM, int DSTATE, int NUM_IN_STAGES, int TMA_STATE_ROWS, int HEADS_PER_CTA,
+          typename SramT>
 __device__ __forceinline__ void role_load_horizontal(
     SramT& sram, int lane, SelectiveStateMTPParams const& params, int batch, int base_head,
-    int kv_group, CUtensorMap const& tensorState, CUtensorMap const& tensorX,
+    int kv_group, int64_t state_batch, CUtensorMap const& tensorState, CUtensorMap const& tensorX,
     CUtensorMap const& tensorB, CUtensorMap const& tensorC) {
   namespace cde = cuda::device::experimental;
-  auto const* __restrict__ state_batch_indices =
-      reinterpret_cast<stateIndex_t const*>(params.state_batch_indices);
-  auto const state_batch = state_batch_indices ? (int)state_batch_indices[batch] : batch;
 
   constexpr int numTmaLoads = DIM / TMA_STATE_ROWS;
   static_assert(DIM % TMA_STATE_ROWS == 0, "DIM must be divisible by TMA_STATE_ROWS");
@@ -134,16 +132,20 @@ __device__ __forceinline__ void role_load_horizontal(
   if (lane == 0) {
     constexpr int bytesBCX = 2 * NTOKENS * DSTATE * (int)sizeof(input_t) +
                              HEADS_PER_CTA * NTOKENS * DIM * (int)sizeof(input_t);
-    cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.B[0][0], &tensorB, 0, kv_group, 0, batch,
-                                                  sram.bar_input_full);
-    cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.C[0][0], &tensorC, 0, kv_group, 0, batch,
-                                                  sram.bar_input_full);
+    if constexpr (!IS_PAD) {
+      cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.B[0][0], &tensorB, 0, kv_group, 0, batch,
+                                                    sram.bar_input_full);
+      cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.C[0][0], &tensorC, 0, kv_group, 0, batch,
+                                                    sram.bar_input_full);
 #pragma unroll
-    for (int h = 0; h < HEADS_PER_CTA; h++) {
-      cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.x[h][0][0], &tensorX, 0, base_head + h, 0,
-                                                    batch, sram.bar_input_full);
+      for (int h = 0; h < HEADS_PER_CTA; h++) {
+        cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.x[h][0][0], &tensorX, 0, base_head + h,
+                                                      0, batch, sram.bar_input_full);
+      }
+      cuda::device::barrier_arrive_tx(sram.bar_input_full, warpSize, bytesBCX);
+    } else {
+      cuda::device::barrier_arrive_tx(sram.bar_input_full, warpSize, 0);
     }
-    cuda::device::barrier_arrive_tx(sram.bar_input_full, warpSize, bytesBCX);
   }
 
   // ── Pipeline state_in loads (TMA_STATE_ROWS per transaction) ──────────
@@ -159,10 +161,14 @@ __device__ __forceinline__ void role_load_horizontal(
       arrive_and_wait_parity(sram.bar_state_in_empty[slot], parity_empty[slot]);
 
       if (lane == 0) {
-        cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.state_in[slot][0], &tensorState, 0,
-                                                      tl * TMA_STATE_ROWS, head, state_batch,
-                                                      sram.bar_state_in_full[slot]);
-        cuda::device::barrier_arrive_tx(sram.bar_state_in_full[slot], 1, bytesChunk);
+        if constexpr (!IS_PAD) {
+          cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.state_in[slot][0], &tensorState, 0,
+                                                        tl * TMA_STATE_ROWS, head, state_batch,
+                                                        sram.bar_state_in_full[slot]);
+          cuda::device::barrier_arrive_tx(sram.bar_state_in_full[slot], 1, bytesChunk);
+        } else {
+          cuda::device::barrier_arrive_tx(sram.bar_state_in_full[slot], 1, 0);
+        }
       }
     }
   }
@@ -175,13 +181,13 @@ __device__ __forceinline__ void role_load_horizontal(
 // =============================================================================
 
 template <typename input_t, typename state_t, typename matrixA_t, typename weight_t,
-          typename stateIndex_t, int NTOKENS, int DIM, int DSTATE, int PHILOX_ROUNDS,
+          typename stateIndex_t, bool IS_PAD, int NTOKENS, int DIM, int DSTATE, int PHILOX_ROUNDS,
           int NUM_IN_STAGES, int TMA_STATE_ROWS, int HEADS_PER_CTA, typename SramT>
 __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int lane,
                                                              int compute_warp,
                                                              SelectiveStateMTPParams const& params,
                                                              int batch, int base_head,
-                                                             bool is_pad) {
+                                                             int64_t state_batch) {
   constexpr int lanesPerRow = horiz::LANES_PER_ROW;
   constexpr int rowsPerWarp = horiz::ROWS_PER_WARP;
   constexpr int numTmaLoads = DIM / TMA_STATE_ROWS;
@@ -218,13 +224,8 @@ __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int la
   auto* __restrict__ state_ptr = reinterpret_cast<state_t*>(params.state);
   auto* __restrict__ istate_ptr = reinterpret_cast<state_t*>(params.intermediate_states);
 
-  auto const* __restrict__ state_batch_indices =
-      reinterpret_cast<stateIndex_t const*>(params.state_batch_indices);
   auto const* __restrict__ intermediate_state_indices =
       reinterpret_cast<stateIndex_t const*>(params.intermediate_state_indices);
-
-  auto const state_batch =
-      state_batch_indices ? (int64_t)state_batch_indices[batch] : (int64_t)batch;
   auto const icache_idx =
       intermediate_state_indices ? (int64_t)intermediate_state_indices[batch] : state_batch;
 
@@ -377,7 +378,7 @@ __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int la
           }
 
           // Write intermediate state
-          if (istate_ptr && !is_pad) {
+          if (istate_ptr && !IS_PAD) {
             auto const istate_base = icache_idx * params.intermediate_state_stride_batch +
                                      step * params.nheads * DIM * DSTATE + head * DIM * DSTATE +
                                      dd * DSTATE;
@@ -400,7 +401,7 @@ __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int la
           }
 
           // Write final state at last step
-          if (step == NTOKENS - 1 && params.update_state && !is_pad) {
+          if (step == NTOKENS - 1 && params.update_state && !IS_PAD) {
             auto const state_base =
                 state_batch * params.state_stride_batch + head * DIM * DSTATE + dd * DSTATE;
 #pragma unroll
@@ -515,16 +516,24 @@ __global__ void __launch_bounds__(horiz::NUM_WARPS * 32, 6)
   __syncthreads();
 
   // ── Warp role dispatch ─────────────────────────────────────────────────
-  if (warp < horiz::NUM_COMPUTE_WARPS_PER_GROUP) {
-    role_update_state_horizontal<input_t, state_t, matrixA_t, weight_t, stateIndex_t, NTOKENS, DIM,
-                                 DSTATE, PHILOX_ROUNDS, NUM_IN_STAGES, TMA_STATE_ROWS,
-                                 HEADS_PER_CTA>(sram, lane, warp, params, batch, base_head, is_pad);
-  } else {
-    int const kv_group = base_head / HEADS_PER_GROUP;
-    role_load_horizontal<input_t, state_t, stateIndex_t, NTOKENS, DIM, DSTATE, NUM_IN_STAGES,
-                         TMA_STATE_ROWS, HEADS_PER_CTA>(
-        sram, lane, params, batch, base_head, kv_group, tensorState, tensorX, tensorB, tensorC);
-  }
+  auto dispatch = [&]<bool IS_PAD>() {
+    if (warp < horiz::NUM_COMPUTE_WARPS_PER_GROUP) {
+      role_update_state_horizontal<input_t, state_t, matrixA_t, weight_t, stateIndex_t, IS_PAD,
+                                   NTOKENS, DIM, DSTATE, PHILOX_ROUNDS, NUM_IN_STAGES,
+                                   TMA_STATE_ROWS, HEADS_PER_CTA>(sram, lane, warp, params, batch,
+                                                                  base_head, state_batch);
+    } else {
+      int const kv_group = base_head / HEADS_PER_GROUP;
+      role_load_horizontal<input_t, state_t, stateIndex_t, IS_PAD, NTOKENS, DIM, DSTATE,
+                           NUM_IN_STAGES, TMA_STATE_ROWS, HEADS_PER_CTA>(
+          sram, lane, params, batch, base_head, kv_group, state_batch, tensorState, tensorX,
+          tensorB, tensorC);
+    }
+  };
+  if (is_pad)
+    dispatch.template operator()<true>();
+  else
+    dispatch.template operator()<false>();
 }
 
 }  // namespace flashinfer::mamba::mtp

@@ -89,26 +89,28 @@ struct SharedStorageVertical {
 // role_load — one TMA warp per group: loads BC + state_in + x for a single head
 // =============================================================================
 
-template <typename input_t, typename state_t, typename stateIndex_t, int NTOKENS, int DIM,
-          int DSTATE, int NUM_IN_STAGES, typename SramT>
+template <typename input_t, typename state_t, typename stateIndex_t, bool IS_PAD, int NTOKENS,
+          int DIM, int DSTATE, int NUM_IN_STAGES, typename SramT>
 __device__ __forceinline__ void role_load(SramT& sram, int lane,
                                           SelectiveStateMTPParams const& params, int batch,
-                                          int head, int kv_group, CUtensorMap const& tensorState,
+                                          int head, int kv_group, int64_t state_batch,
+                                          CUtensorMap const& tensorState,
                                           CUtensorMap const& tensorX, CUtensorMap const& tensorB,
                                           CUtensorMap const& tensorC) {
   namespace cde = cuda::device::experimental;
-  auto const* __restrict__ state_batch_indices =
-      reinterpret_cast<stateIndex_t const*>(params.state_batch_indices);
-  auto const state_batch = state_batch_indices ? (int)state_batch_indices[batch] : batch;
 
   // ── Load B and C ──────────────────────────────────────────────────────
   if (lane == 0) {
     constexpr int bytesBC = 2 * NTOKENS * DSTATE * (int)sizeof(input_t);
-    cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.B[0][0], &tensorB, 0, kv_group, 0, batch,
-                                                  sram.bar_BC_full);
-    cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.C[0][0], &tensorC, 0, kv_group, 0, batch,
-                                                  sram.bar_BC_full);
-    cuda::device::barrier_arrive_tx(sram.bar_BC_full, warpSize, bytesBC);
+    if constexpr (!IS_PAD) {
+      cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.B[0][0], &tensorB, 0, kv_group, 0, batch,
+                                                    sram.bar_BC_full);
+      cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.C[0][0], &tensorC, 0, kv_group, 0, batch,
+                                                    sram.bar_BC_full);
+      cuda::device::barrier_arrive_tx(sram.bar_BC_full, warpSize, bytesBC);
+    } else {
+      cuda::device::barrier_arrive_tx(sram.bar_BC_full, warpSize, 0);
+    }
   }
 
   // ── Load state_in + x ────────────────────────────────────────────────
@@ -120,15 +122,19 @@ __device__ __forceinline__ void role_load(SramT& sram, int lane,
   sram.bar_state_in_empty[in_slot].wait(sram.bar_state_in_empty[in_slot].arrive());
 
   if (lane == 0) {
-    cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.state_in[in_slot][0], &tensorState, 0, 0,
-                                                  head, state_batch,
-                                                  sram.bar_state_in_full[in_slot]);
+    if constexpr (!IS_PAD) {
+      cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.state_in[in_slot][0], &tensorState, 0, 0,
+                                                    head, state_batch,
+                                                    sram.bar_state_in_full[in_slot]);
 
-    cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.x[in_slot][0][0], &tensorX, 0, head, 0,
-                                                  batch, sram.bar_state_in_full[in_slot]);
+      cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.x[in_slot][0][0], &tensorX, 0, head, 0,
+                                                    batch, sram.bar_state_in_full[in_slot]);
 
-    auto const _ =
-        cuda::device::barrier_arrive_tx(sram.bar_state_in_full[in_slot], 1, bytesState + bytesX);
+      auto const _ =
+          cuda::device::barrier_arrive_tx(sram.bar_state_in_full[in_slot], 1, bytesState + bytesX);
+    } else {
+      cuda::device::barrier_arrive_tx(sram.bar_state_in_full[in_slot], 1, 0);
+    }
   }
 }
 
@@ -178,11 +184,11 @@ __device__ __forceinline__ void convertAndStoreSRVertical(
 // =============================================================================
 
 template <typename input_t, typename state_t, typename matrixA_t, typename weight_t,
-          typename stateIndex_t, int NTOKENS, int DIM, int DSTATE, int PHILOX_ROUNDS,
+          typename stateIndex_t, bool IS_PAD, int NTOKENS, int DIM, int DSTATE, int PHILOX_ROUNDS,
           int NUM_IN_STAGES, typename SramT>
 __device__ __forceinline__ void role_update_state(SramT& sram, int lane, int compute_warp,
                                                   SelectiveStateMTPParams const& params, int batch,
-                                                  int head, bool is_pad) {
+                                                  int head, int64_t state_batch) {
   constexpr int rowsPerWarp = DIM / NUM_COMPUTE_WARPS_PER_GROUP;
   constexpr int rowsPerWarpPerPass = 4;
   static_assert(rowsPerWarp % rowsPerWarpPerPass == 0,
@@ -202,13 +208,8 @@ __device__ __forceinline__ void role_update_state(SramT& sram, int lane, int com
   auto* __restrict__ state_ptr = reinterpret_cast<state_t*>(params.state);
   auto* __restrict__ istate_ptr = reinterpret_cast<state_t*>(params.intermediate_states);
 
-  auto const* __restrict__ state_batch_indices =
-      reinterpret_cast<stateIndex_t const*>(params.state_batch_indices);
   auto const* __restrict__ intermediate_state_indices =
       reinterpret_cast<stateIndex_t const*>(params.intermediate_state_indices);
-
-  auto const state_batch =
-      state_batch_indices ? (int64_t)state_batch_indices[batch] : (int64_t)batch;
   auto const icache_idx =
       intermediate_state_indices ? (int64_t)intermediate_state_indices[batch] : state_batch;
   auto const state_ptr_offset = state_batch * params.state_stride_batch + head * DIM * DSTATE;
@@ -286,7 +287,7 @@ __device__ __forceinline__ void role_update_state(SramT& sram, int lane, int com
         }
 
         // Write intermediate state directly to gmem via vectorized STG
-        if (istate_ptr && !is_pad) {
+        if (istate_ptr && !IS_PAD) {
           packed_state_t rStateOut;
           convertAndStoreSRVertical<state_t, DSTATE, stateValuesPerThread, PHILOX_ROUNDS>(
               rStateOut, rState[wr], rand_seed, state_ptr_offset, dd, lane);
@@ -297,7 +298,7 @@ __device__ __forceinline__ void role_update_state(SramT& sram, int lane, int com
         }
 
         // Write final state directly to gmem at last step
-        if (step == NTOKENS - 1 && params.update_state && !is_pad) {
+        if (step == NTOKENS - 1 && params.update_state && !IS_PAD) {
           packed_state_t rStateOut;
           convertAndStoreSRVertical<state_t, DSTATE, stateValuesPerThread, PHILOX_ROUNDS>(
               rStateOut, rState[wr], rand_seed, state_ptr_offset, dd, lane);
@@ -427,27 +428,33 @@ __global__ void __launch_bounds__(NUM_WARPS * 32, 2)
   // ── Warp role dispatch (no setmaxnreg) ─────────────────────────────────
   auto const role = get_warp_role(warp);
 
-  if (role == WarpRole::kCompute) {
-    int const g = warp / NUM_COMPUTE_WARPS_PER_GROUP;  // 0, 1, or 2
-    int const compute_warp = warp % NUM_COMPUTE_WARPS_PER_GROUP;
-    if (g < num_active_groups) {
-      role_update_state<input_t, state_t, matrixA_t, weight_t, stateIndex_t, NTOKENS, DIM, DSTATE,
-                        PHILOX_ROUNDS, NUM_IN_STAGES>(sram.group[g], lane, compute_warp, params,
-                                                      batch, heads[g], is_pad);
-    }
+  auto dispatch = [&]<bool IS_PAD>() {
+    if (role == WarpRole::kCompute) {
+      int const g = warp / NUM_COMPUTE_WARPS_PER_GROUP;  // 0, 1, or 2
+      int const compute_warp = warp % NUM_COMPUTE_WARPS_PER_GROUP;
+      if (g < num_active_groups) {
+        role_update_state<input_t, state_t, matrixA_t, weight_t, stateIndex_t, IS_PAD, NTOKENS, DIM,
+                          DSTATE, PHILOX_ROUNDS, NUM_IN_STAGES>(
+            sram.group[g], lane, compute_warp, params, batch, heads[g], state_batch);
+      }
 
-  } else if (role == WarpRole::kTMALoad) {
-    int const g = warp - 12;  // 0, 1, or 2
-    if (g < num_active_groups) {
-      int const kv_group = heads[g] / HEADS_PER_GROUP;
-      role_load<input_t, state_t, stateIndex_t, NTOKENS, DIM, DSTATE, NUM_IN_STAGES>(
-          sram.group[g], lane, params, batch, heads[g], kv_group, tensorState, tensorX, tensorB,
-          tensorC);
-    }
+    } else if (role == WarpRole::kTMALoad) {
+      int const g = warp - 12;  // 0, 1, or 2
+      if (g < num_active_groups) {
+        int const kv_group = heads[g] / HEADS_PER_GROUP;
+        role_load<input_t, state_t, stateIndex_t, IS_PAD, NTOKENS, DIM, DSTATE, NUM_IN_STAGES>(
+            sram.group[g], lane, params, batch, heads[g], kv_group, state_batch, tensorState,
+            tensorX, tensorB, tensorC);
+      }
 
-  } else /* role == WarpRole::kEpilogue */ {
-    role_epilogue<input_t, NTOKENS, DIM>(sram, lane, params, batch, heads, num_active_groups);
-  }
+    } else /* role == WarpRole::kEpilogue */ {
+      role_epilogue<input_t, NTOKENS, DIM>(sram, lane, params, batch, heads, num_active_groups);
+    }
+  };
+  if (is_pad)
+    dispatch.template operator()<true>();
+  else
+    dispatch.template operator()<false>();
 }
 
 }  // namespace flashinfer::mamba::mtp
