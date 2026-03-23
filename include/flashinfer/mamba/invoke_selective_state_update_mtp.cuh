@@ -80,6 +80,8 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
     FLASHINFER_CHECK(DIM % kVerticalDimAlignment == 0,
                      "Vertical kernel requires DIM divisible by 32 (warpSize), got DIM=", DIM);
     FLASHINFER_CHECK(!scaleState, "vertical algorithm does not support scaled (quantized) state");
+    FLASHINFER_CHECK(params.cu_seqlens == nullptr,
+                     "vertical algorithm does not support varlen (cu_seqlens)");
 
     constexpr int NUM_IN_STAGES = 1;
 
@@ -146,6 +148,8 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
                      "Horizontal kernel requires DIM divisible by ", kHorizontalDimAlignment,
                      " (NUM_COMPUTE_WARPS_PER_GROUP * ROWS_PER_WARP), got DIM=", DIM);
     FLASHINFER_CHECK(!scaleState, "horizontal algorithm does not support scaled (quantized) state");
+    FLASHINFER_CHECK(params.cu_seqlens == nullptr,
+                     "horizontal algorithm does not support varlen (cu_seqlens)");
 
     constexpr int NUM_IN_STAGES = 2;
     // TMA_STATE_ROWS: rows of DIM per TMA transaction. Must be a multiple of ROWS_PER_PASS.
