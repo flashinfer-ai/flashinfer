@@ -408,7 +408,7 @@ else:
 
     unique_dtypes = df["state_dtype"].unique()
     num_dtypes = len(unique_dtypes)
-    fig, axes = plt.subplots(1, num_dtypes, figsize=(10 * num_dtypes, 5), squeeze=False)
+    fig, axes = plt.subplots(num_dtypes, 1, figsize=(10, 5 * num_dtypes), squeeze=False)
 
     for dtype_idx, dtype_name in enumerate(unique_dtypes):
         df_dtype = df[df["state_dtype"] == dtype_name]
@@ -421,7 +421,7 @@ else:
         )
         print(df_pivot.to_csv())
 
-        ax = axes[0, dtype_idx]
+        ax = axes[dtype_idx, 0]
         baseline_col = "triton_reference"
 
         prop_cycle = plt.rcParams["axes.prop_cycle"]

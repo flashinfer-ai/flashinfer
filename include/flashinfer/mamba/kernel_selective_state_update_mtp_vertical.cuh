@@ -133,6 +133,45 @@ __device__ __forceinline__ void role_load(SramT& sram, int lane,
 }
 
 // =============================================================================
+// convertAndStoreSRVertical — convert float state registers to packed half.
+// When PHILOX_ROUNDS > 0: stochastic rounding via f16x2 pairs + scalar tail.
+// When PHILOX_ROUNDS == 0: plain nearest-even conversion.
+// =============================================================================
+
+template <typename state_t, int DSTATE, int stateValuesPerThread, int PHILOX_ROUNDS>
+__device__ __forceinline__ void convertAndStoreSRVertical(
+    PackedAligned<state_t, stateValuesPerThread>& rStateOut, float const* rStateRow,
+    int64_t rand_seed, int state_ptr_offset, int dd, int lane) {
+  if constexpr (PHILOX_ROUNDS > 0) {
+    constexpr int pairedEnd = (stateValuesPerThread / 2) * 2;
+    [[maybe_unused]] uint32_t rand_ints[4];
+#pragma unroll
+    for (int k = 0; k < pairedEnd; k += 2) {
+      if (k % 4 == 0)
+        philox_randint4x<PHILOX_ROUNDS>(
+            rand_seed, state_ptr_offset + dd * DSTATE + lane * stateValuesPerThread + k,
+            rand_ints[0], rand_ints[1], rand_ints[2], rand_ints[3]);
+      uint32_t packed = cvt_rs_f16x2_f32(rStateRow[k], rStateRow[k + 1], rand_ints[k / 2]);
+      rStateOut.val[k] = __ushort_as_half(static_cast<uint16_t>(packed & 0xFFFFu));
+      rStateOut.val[k + 1] = __ushort_as_half(static_cast<uint16_t>(packed >> 16));
+    }
+    if constexpr (stateValuesPerThread % 2 == 1) {
+      constexpr int k = pairedEnd;
+      if (k % 4 == 0)
+        philox_randint4x<PHILOX_ROUNDS>(
+            rand_seed, state_ptr_offset + dd * DSTATE + lane * stateValuesPerThread + k,
+            rand_ints[0], rand_ints[1], rand_ints[2], rand_ints[3]);
+      rStateOut.val[k] = cvt_rs_f16_f32(rStateRow[k], rand_ints[k / 2] & 0x1FFFu);
+    }
+  } else {
+#pragma unroll
+    for (int k = 0; k < stateValuesPerThread; k++) {
+      convertAndStore(&rStateOut.val[k], rStateRow[k]);
+    }
+  }
+}
+
+// =============================================================================
 // role_update_state — 4 state update warps per group process a single head
 // State update warps write intermediate_states and final state directly to gmem
 // using vectorized STG (contiguous-per-thread DSTATE layout).
@@ -249,27 +288,8 @@ __device__ __forceinline__ void role_update_state(SramT& sram, int lane, int com
         // Write intermediate state directly to gmem via vectorized STG
         if (istate_ptr && !is_pad) {
           packed_state_t rStateOut;
-          if constexpr (PHILOX_ROUNDS > 0) {
-            static_assert(stateValuesPerThread % 2 == 0,
-                          "SR requires even stateValuesPerThread for f16x2 packing");
-            [[maybe_unused]] uint32_t rand_ints[4];
-#pragma unroll
-            for (int k = 0; k < stateValuesPerThread; k += 2) {
-              if (k % 4 == 0)
-                philox_randint4x<PHILOX_ROUNDS>(
-                    rand_seed, state_ptr_offset + dd * DSTATE + lane * stateValuesPerThread + k,
-                    rand_ints[0], rand_ints[1], rand_ints[2], rand_ints[3]);
-              uint32_t packed =
-                  cvt_rs_f16x2_f32(rState[wr][k], rState[wr][k + 1], rand_ints[k / 2]);
-              rStateOut.val[k] = __ushort_as_half(static_cast<uint16_t>(packed & 0xFFFFu));
-              rStateOut.val[k + 1] = __ushort_as_half(static_cast<uint16_t>(packed >> 16));
-            }
-          } else {
-#pragma unroll
-            for (int k = 0; k < stateValuesPerThread; k++) {
-              convertAndStore(&rStateOut.val[k], rState[wr][k]);
-            }
-          }
+          convertAndStoreSRVertical<state_t, DSTATE, stateValuesPerThread, PHILOX_ROUNDS>(
+              rStateOut, rState[wr], rand_seed, state_ptr_offset, dd, lane);
           *reinterpret_cast<packed_state_t*>(
               &istate_ptr[icache_idx * params.intermediate_state_stride_batch +
                           step * params.nheads * DIM * DSTATE + head * DIM * DSTATE + dd * DSTATE +
@@ -279,25 +299,8 @@ __device__ __forceinline__ void role_update_state(SramT& sram, int lane, int com
         // Write final state directly to gmem at last step
         if (step == NTOKENS - 1 && params.update_state && !is_pad) {
           packed_state_t rStateOut;
-          if constexpr (PHILOX_ROUNDS > 0) {
-            [[maybe_unused]] uint32_t rand_ints[4];
-#pragma unroll
-            for (int k = 0; k < stateValuesPerThread; k += 2) {
-              if (k % 4 == 0)
-                philox_randint4x<PHILOX_ROUNDS>(
-                    rand_seed, state_ptr_offset + dd * DSTATE + lane * stateValuesPerThread + k,
-                    rand_ints[0], rand_ints[1], rand_ints[2], rand_ints[3]);
-              uint32_t packed =
-                  cvt_rs_f16x2_f32(rState[wr][k], rState[wr][k + 1], rand_ints[k / 2]);
-              rStateOut.val[k] = __ushort_as_half(static_cast<uint16_t>(packed & 0xFFFFu));
-              rStateOut.val[k + 1] = __ushort_as_half(static_cast<uint16_t>(packed >> 16));
-            }
-          } else {
-#pragma unroll
-            for (int k = 0; k < stateValuesPerThread; k++) {
-              convertAndStore(&rStateOut.val[k], rState[wr][k]);
-            }
-          }
+          convertAndStoreSRVertical<state_t, DSTATE, stateValuesPerThread, PHILOX_ROUNDS>(
+              rStateOut, rState[wr], rand_seed, state_ptr_offset, dd, lane);
           *reinterpret_cast<packed_state_t*>(
               &state_ptr[state_batch * params.state_stride_batch + head * DIM * DSTATE +
                          dd * DSTATE + lane * stateValuesPerThread]) = rStateOut;

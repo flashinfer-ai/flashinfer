@@ -1226,6 +1226,7 @@ class TestSelectiveStateUpdateMTPStochasticRounding(TestSelectiveStateUpdateMTP)
         # (batch, nheads, dim, dstate, cache_steps, state_dtype,    weight_dtype,   use_out_tensor)
         (  64,    64,     64,  128,    4,           torch.float16,  torch.float32,  True ),  # base
         (  64,    64,     64,   64,    4,           torch.float16,  torch.float32,  True ),  # dstate=64
+        (  64,    64,     64,   96,    4,           torch.float16,  torch.float32,  True ),  # dstate=96 (odd stateValuesPerThread)
     )
     # fmt: on
 
@@ -1346,6 +1347,7 @@ class TestSelectiveStateUpdateMTPStochasticRoundingWithIntermediateStates(
         # (batch, nheads, dim, dstate, cache_steps, state_dtype,    weight_dtype,   use_out_tensor)
         (  64,    64,     64,  128,    4,           torch.float16,  torch.float32,  True ),  # base
         (  64,    64,     64,   64,    4,           torch.float16,  torch.float32,  True ),  # dstate=64
+        (  64,    64,     64,   96,    4,           torch.float16,  torch.float32,  True ),  # dstate=96 (odd stateValuesPerThread)
     )
     # fmt: on
 
