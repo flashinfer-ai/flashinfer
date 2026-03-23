@@ -3104,6 +3104,7 @@ def run_moe_test(
                 "routing_method_type": RoutingMethodType.Renormalize,
                 "compatible_moe_impls": [
                     FP8PerTensorMoe,
+                    FP8PerChannelMoe,
                     FP8BlockScaleMoe,
                     FP4Moe,
                     BF16Moe,
@@ -3126,6 +3127,7 @@ def run_moe_test(
                 "routing_method_type": RoutingMethodType.Renormalize,
                 "compatible_moe_impls": [
                     FP8PerTensorMoe,
+                    FP8PerChannelMoe,
                     FP8BlockScaleMoe,
                     FP4Moe,
                     BF16Moe,
@@ -3148,6 +3150,7 @@ def run_moe_test(
                 "routing_method_type": RoutingMethodType.Renormalize,
                 "compatible_moe_impls": [
                     FP8PerTensorMoe,
+                    FP8PerChannelMoe,
                     FP8BlockScaleMoe,
                     FP4Moe,
                     BF16Moe,
@@ -3196,7 +3199,12 @@ def run_moe_test(
             {
                 "use_shuffled_weight": True,
                 "layout": WeightLayout.MajorK,
-                "compatible_moe_impls": [FP4Moe, FP8PerTensorMoe, FP8BlockScaleMoe],
+                "compatible_moe_impls": [
+                    FP4Moe,
+                    FP8PerTensorMoe,
+                    FP8PerChannelMoe,
+                    FP8BlockScaleMoe,
+                ],
             },
             id="Shuffled_MajorK",
         ),
@@ -3283,7 +3291,7 @@ def test_renormalize_routing(
                 "routed_scaling": 2.5,
                 "has_routing_bias": True,
                 "routing_method_type": RoutingMethodType.DeepSeekV3,
-                "compatible_moe_impls": [FP8PerTensorMoe, FP4Moe],
+                "compatible_moe_impls": [FP8PerTensorMoe, FP8PerChannelMoe, FP4Moe],
                 "compatible_intermediate_size": [2944],
                 "compatible_activation_types": [ActivationType.Relu2],
                 "enable_autotune": True,
@@ -3392,7 +3400,12 @@ def test_renormalize_routing(
             {
                 "use_shuffled_weight": True,
                 "layout": WeightLayout.MajorK,
-                "compatible_moe_impls": [FP4Moe, FP8PerTensorMoe, FP8BlockScaleMoe],
+                "compatible_moe_impls": [
+                    FP4Moe,
+                    FP8PerTensorMoe,
+                    FP8PerChannelMoe,
+                    FP8BlockScaleMoe,
+                ],
             },
             id="Shuffled_MajorK",
         ),
@@ -3540,7 +3553,7 @@ def test_topk_routing(
                 "routed_scaling": 2.5,
                 "has_routing_bias": True,
                 "routing_method_type": RoutingMethodType.Llama4,
-                "compatible_moe_impls": [FP8PerTensorMoe],
+                "compatible_moe_impls": [FP8PerTensorMoe, FP8PerChannelMoe],
                 "compatible_intermediate_size": [1024, 2048],
                 "enable_autotune": True,
             },
@@ -3555,7 +3568,12 @@ def test_topk_routing(
             {
                 "use_shuffled_weight": True,
                 "layout": WeightLayout.MajorK,
-                "compatible_moe_impls": [FP4Moe, FP8PerTensorMoe, FP8BlockScaleMoe],
+                "compatible_moe_impls": [
+                    FP4Moe,
+                    FP8PerTensorMoe,
+                    FP8PerChannelMoe,
+                    FP8BlockScaleMoe,
+                ],
             },
             id="Shuffled_MajorK",
         ),
