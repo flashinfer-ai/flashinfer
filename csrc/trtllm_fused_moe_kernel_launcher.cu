@@ -1986,7 +1986,7 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
   int hidden_size = hidden_states.size(1);
   if (hidden_states.dtype() == dl_uint8) hidden_size *= 2;
 
-  int hidden_states_scale_vec_size = -1;
+  int64_t hidden_states_scale_vec_size = -1;
   if (hidden_states_scale.has_value()) {
     hidden_states_scale_vec_size = (static_cast<int64_t>(num_tokens) * hidden_size) / hidden_states_scale.value().numel();
   }
