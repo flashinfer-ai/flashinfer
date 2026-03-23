@@ -962,7 +962,7 @@ def get_trtllm_moe_sm100_module():
                 )
             # topk_ids/expert_weights can be empty(0) when routing_logits is provided,
             # or real tensors when pre-computed routing is used.
-            if topk_ids.numel() > 0:
+            if topk_ids is not None and topk_ids.numel() > 0:
                 assert topk_ids.shape[0] == num_tokens, (
                     "topk_ids's first dimension must be batch size."
                 )
