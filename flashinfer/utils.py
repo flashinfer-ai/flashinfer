@@ -1229,3 +1229,29 @@ def backend_requirement(
 def get_default_generators(device: torch.device):
     torch.cuda.init()
     return torch.cuda.default_generators[device.index]
+
+
+def prepare_jit_additional_args(
+    jit_additional_tensor_names: list,
+    known_bufs: dict,
+    user_args: tuple,
+) -> list:
+    """Map well-known JIT additional tensor names to internal buffers.
+
+    For each name in jit_additional_tensor_names:
+      - If the name is in known_bufs, use the corresponding buffer.
+      - Otherwise, consume the next value from user_args.
+      - If user_args is exhausted, use None.
+    Any remaining user_args are appended at the end.
+    """
+    result = []
+    user_args_list = list(user_args)
+    for name in jit_additional_tensor_names:
+        if name in known_bufs:
+            result.append(known_bufs[name])
+        elif user_args_list:
+            result.append(user_args_list.pop(0))
+        else:
+            result.append(None)
+    result.extend(user_args_list)
+    return result

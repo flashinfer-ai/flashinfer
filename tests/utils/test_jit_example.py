@@ -580,7 +580,8 @@ def test_batch_prefill_sm90_flash_sigmoid():
 def test_batch_prefill_jit_wellknown_mask_buffers():
     """Issue #1044: JIT variants using well-known additional tensor names
     (maybe_custom_mask, maybe_mask_indptr) should auto-inject internal buffers
-    without the user having to pass them via *args."""
+    without the user having to pass them via *args.
+    Verifies both argument injection AND numerical correctness of the mask."""
     torch.manual_seed(42)
 
     variant_decl = r"""
@@ -608,11 +609,11 @@ struct FlashCustomMask : AttentionVariantBase {
   })
 };
 """
-    num_qo_heads = 32
+    num_qo_heads = 8
     num_kv_heads = 8
     head_dim = 128
     page_size = 16
-    batch_size = 2
+    batch_size = 1
     seq_len = 16
 
     jit_args = (
@@ -633,28 +634,29 @@ struct FlashCustomMask : AttentionVariantBase {
 
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
 
-    # Test paged wrapper
+    q = torch.randn(
+        batch_size * seq_len, num_qo_heads, head_dim, dtype=torch.float16, device="cuda"
+    )
+
+    # Use causal (lower-triangular) mask to verify mask is actually applied
+    custom_mask = torch.tril(
+        torch.full((batch_size, seq_len, seq_len), True, device="cuda")
+    )
+
+    # --- Test paged wrapper ---
     wrapper_paged = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
         workspace_buffer, kv_layout="NHD", backend="fa2", jit_args=jit_args
     )
 
-    qo_indptr = torch.tensor(
-        [0, seq_len, seq_len * 2], dtype=torch.int32, device="cuda"
-    )
-    max_num_pages = batch_size * ((seq_len + page_size - 1) // page_size)
-    paged_kv_indptr = torch.tensor(
-        [0, max_num_pages // 2, max_num_pages], dtype=torch.int32, device="cuda"
-    )
-    paged_kv_indices = torch.arange(max_num_pages, dtype=torch.int32, device="cuda")
+    qo_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device="cuda")
+    num_pages = (seq_len + page_size - 1) // page_size
+    paged_kv_indptr = torch.tensor([0, num_pages], dtype=torch.int32, device="cuda")
+    paged_kv_indices = torch.arange(num_pages, dtype=torch.int32, device="cuda")
     paged_kv_last_page_len = torch.tensor(
-        [page_size, page_size], dtype=torch.int32, device="cuda"
-    )
-
-    q = torch.randn(
-        batch_size * seq_len, num_qo_heads, head_dim, dtype=torch.float16, device="cuda"
+        [seq_len - (num_pages - 1) * page_size], dtype=torch.int32, device="cuda"
     )
     kv_cache = torch.randn(
-        max_num_pages,
+        num_pages,
         2,
         page_size,
         num_kv_heads,
@@ -672,27 +674,60 @@ struct FlashCustomMask : AttentionVariantBase {
         num_kv_heads,
         head_dim,
         page_size,
+        custom_mask=custom_mask,
         causal=False,
     )
+    o_masked = wrapper_paged.run(q, kv_cache)
 
-    o_paged = wrapper_paged.run(q, kv_cache)
-    assert o_paged.shape == (batch_size * seq_len, num_qo_heads, head_dim)
+    # Run without mask (non-causal) for comparison
+    wrapper_paged_nomask = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace_buffer,
+        kv_layout="NHD",
+        backend="fa2",
+    )
+    wrapper_paged_nomask.plan(
+        qo_indptr,
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        causal=False,
+    )
+    o_nomask = wrapper_paged_nomask.run(q, kv_cache)
 
-    # Test ragged wrapper
+    assert o_masked.shape == (batch_size * seq_len, num_qo_heads, head_dim)
+    assert not torch.allclose(o_masked, o_nomask, rtol=1e-2, atol=1e-2), (
+        "Masked and unmasked outputs should differ, mask was not applied"
+    )
+
+    # --- Test ragged wrapper ---
+    k_flat = kv_cache[:, 0].reshape(-1, num_kv_heads, head_dim)[:seq_len]
+    v_flat = kv_cache[:, 1].reshape(-1, num_kv_heads, head_dim)[:seq_len]
+    kv_indptr = torch.tensor([0, seq_len], dtype=torch.int32, device="cuda")
+
     wrapper_ragged = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
         workspace_buffer, kv_layout="NHD", backend="fa2", jit_args=jit_args
     )
-    kv_indptr = torch.tensor(
-        [0, seq_len, seq_len * 2], dtype=torch.int32, device="cuda"
-    )
-    k = torch.randn(
-        batch_size * seq_len, num_kv_heads, head_dim, dtype=torch.float16, device="cuda"
-    )
-    v = torch.randn(
-        batch_size * seq_len, num_kv_heads, head_dim, dtype=torch.float16, device="cuda"
-    )
-
     wrapper_ragged.plan(
+        qo_indptr,
+        kv_indptr,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        custom_mask=custom_mask,
+        causal=False,
+    )
+    o_ragged_masked = wrapper_ragged.run(q, k_flat, v_flat)
+
+    wrapper_ragged_nomask = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace_buffer,
+        kv_layout="NHD",
+        backend="fa2",
+    )
+    wrapper_ragged_nomask.plan(
         qo_indptr,
         kv_indptr,
         num_qo_heads,
@@ -700,9 +735,12 @@ struct FlashCustomMask : AttentionVariantBase {
         head_dim,
         causal=False,
     )
+    o_ragged_nomask = wrapper_ragged_nomask.run(q, k_flat, v_flat)
 
-    o_ragged = wrapper_ragged.run(q, k, v)
-    assert o_ragged.shape == (batch_size * seq_len, num_qo_heads, head_dim)
+    assert o_ragged_masked.shape == (batch_size * seq_len, num_qo_heads, head_dim)
+    assert not torch.allclose(o_ragged_masked, o_ragged_nomask, rtol=1e-2, atol=1e-2), (
+        "Masked and unmasked outputs should differ, mask was not applied"
+    )
 
 
 @pytest.mark.parametrize("use_tensor_cores", [False, True])

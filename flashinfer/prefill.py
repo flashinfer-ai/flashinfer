@@ -63,6 +63,7 @@ from .utils import (
     register_fake_op,
     ceil_div,
     round_up,
+    prepare_jit_additional_args,
 )
 
 
@@ -2289,22 +2290,19 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 enable_pdl,
             ]
             if self._jit_module is not None:
-                _known_bufs = {
-                    "maybe_custom_mask": self._custom_mask_buf,
-                    "maybe_mask_indptr": self._mask_indptr_buf,
-                    "maybe_alibi_slopes": _get_cache_alibi_slopes_buf(
-                        q.shape[1], q.device
-                    ),
-                }
-                user_args = list(args)
-                for name in self._jit_additional_tensor_names:
-                    if name in _known_bufs:
-                        run_args.append(_known_bufs[name])
-                    elif user_args:
-                        run_args.append(user_args.pop(0))
-                    else:
-                        run_args.append(None)
-                run_args.extend(user_args)
+                run_args.extend(
+                    prepare_jit_additional_args(
+                        self._jit_additional_tensor_names,
+                        {
+                            "maybe_custom_mask": self._custom_mask_buf,
+                            "maybe_mask_indptr": self._mask_indptr_buf,
+                            "maybe_alibi_slopes": _get_cache_alibi_slopes_buf(
+                                q.shape[1], q.device
+                            ),
+                        },
+                        args,
+                    )
+                )
             else:
                 # Extract FP8 scale tensors from *args if q is FP8
                 fp8_scale_q = None
@@ -3218,22 +3216,19 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             enable_pdl,
         ]
         if self._jit_module is not None:
-            _known_bufs = {
-                "maybe_custom_mask": self._custom_mask_buf,
-                "maybe_mask_indptr": self._mask_indptr_buf,
-                "maybe_alibi_slopes": _get_cache_alibi_slopes_buf(
-                    q.shape[1], self.device
-                ),
-            }
-            user_args = list(args)
-            for name in self._jit_additional_tensor_names:
-                if name in _known_bufs:
-                    run_args.append(_known_bufs[name])
-                elif user_args:
-                    run_args.append(user_args.pop(0))
-                else:
-                    run_args.append(None)
-            run_args.extend(user_args)
+            run_args.extend(
+                prepare_jit_additional_args(
+                    self._jit_additional_tensor_names,
+                    {
+                        "maybe_custom_mask": self._custom_mask_buf,
+                        "maybe_mask_indptr": self._mask_indptr_buf,
+                        "maybe_alibi_slopes": _get_cache_alibi_slopes_buf(
+                            q.shape[1], self.device
+                        ),
+                    },
+                    args,
+                )
+            )
         else:
             run_args += [
                 self._custom_mask_buf,
