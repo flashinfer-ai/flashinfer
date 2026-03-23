@@ -809,7 +809,10 @@ def test_single_decode_torch_compile_cuda_graph():
     """)
     result = subprocess.run(
         [sys.executable, "-c", script],
-        capture_output=True, text=True, timeout=300,
+        capture_output=True,
+        text=True,
+        timeout=300,
     )
-    assert result.returncode == 0 and "PASS" in result.stdout, \
+    assert result.returncode == 0 and "PASS" in result.stdout, (
         f"Test failed:\nstdout: {result.stdout[-500:]}\nstderr: {result.stderr[-500:]}"
+    )
