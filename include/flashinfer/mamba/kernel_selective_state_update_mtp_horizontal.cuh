@@ -434,6 +434,7 @@ __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int la
     for (int step = compute_warp; step < NTOKENS; step += horiz::NUM_COMPUTE_WARPS_PER_GROUP) {
       int const out_offset =
           batch * params.out_stride_batch + step * params.out_stride_mtp + head * DIM;
+      int const z_offset = batch * params.z_stride_batch + step * params.z_stride_mtp + head * DIM;
 
       for (int ii = 0; ii < elemsPerThreadEpilogue; ii += load_output_t::count) {
         int const d = lane * load_output_t::count +
@@ -441,7 +442,7 @@ __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int la
         load_output_t packed_out;
         load_output_t packed_z;
         if (z_ptr) {
-          packed_z = *reinterpret_cast<load_output_t const*>(&z_ptr[out_offset + d]);
+          packed_z = *reinterpret_cast<load_output_t const*>(&z_ptr[z_offset + d]);
         }
 #pragma unroll
         for (int k = 0; k < load_output_t::count; k++) {

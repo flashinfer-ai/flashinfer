@@ -343,13 +343,15 @@ __device__ __forceinline__ void role_epilogue(SharedSramT& sram, int lane,
     for (int step = 0; step < NTOKENS; step++) {
       int const base_offset =
           batch * params.out_stride_batch + step * params.out_stride_mtp + head * DIM;
+      int const z_base_offset =
+          batch * params.z_stride_batch + step * params.z_stride_mtp + head * DIM;
       for (int ii = 0; ii < elemsPerThread; ii += load_output_t::count) {
         int const d = lane * load_output_t::count +
                       (ii / load_output_t::count) * warpSize * load_output_t::count;
         load_output_t packed_out;
         load_output_t packed_z;
         if (z_ptr) {
-          packed_z = *reinterpret_cast<load_output_t const*>(&z_ptr[base_offset + d]);
+          packed_z = *reinterpret_cast<load_output_t const*>(&z_ptr[z_base_offset + d]);
         }
 #pragma unroll
         for (int k = 0; k < load_output_t::count; k++) {
