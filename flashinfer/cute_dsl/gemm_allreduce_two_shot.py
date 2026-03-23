@@ -30,12 +30,45 @@ def spin_lock_multimem_arrive(lock_ptr: Pointer, loc=None, ip=None) -> None:
 
 
 # HACK https://github.com/NVIDIA/cutlass/issues/2845
+import functools
+import inspect
+
 from cutlass._mlir.dialects import nvvm
+from cutlass.cutlass_dsl import T
 from cutlass._mlir.dialects.nvvm import (
     MemOrderKind,
     MemScopeKind,
     AtomicOpKind,
 )
+
+
+@functools.lru_cache(maxsize=None)
+def _nvvm_atomicrmw_has_res_param():
+    return "res" in inspect.signature(nvvm.atomicrmw).parameters
+
+
+def _nvvm_atomicrmw_compat(
+    res_type, op, ptr, a, *, b=None, mem_order=None, syncscope=None, loc=None, ip=None
+):
+    """Call nvvm.atomicrmw compatible with both CUDA 12 and CUDA 13."""
+    if _nvvm_atomicrmw_has_res_param():
+        # CUDA 12: nvvm.atomicrmw(res, op, ptr, a, ...)
+        return nvvm.atomicrmw(
+            res_type,
+            op,
+            ptr,
+            a,
+            b=b,
+            mem_order=mem_order,
+            syncscope=syncscope,
+            loc=loc,
+            ip=ip,
+        )
+    else:
+        # CUDA 13: nvvm.atomicrmw(op, ptr, a, ...) — res removed
+        return nvvm.atomicrmw(
+            op, ptr, a, b=b, mem_order=mem_order, syncscope=syncscope, loc=loc, ip=ip
+        )
 
 
 @cute.jit
@@ -54,7 +87,8 @@ def spin_lock_atom_cas_acquire_wait(
     if scope == "gpu":
         result = 0
         while result != expected_val:
-            result = nvvm.atomicrmw(
+            result = _nvvm_atomicrmw_compat(
+                T.i32(),
                 AtomicOpKind.CAS,
                 lock_ptr.llvm_ptr,
                 Int32(reset_val).ir_value(loc=loc, ip=ip),
@@ -67,7 +101,8 @@ def spin_lock_atom_cas_acquire_wait(
     elif scope == "sys":
         result = 0
         while result != expected_val:
-            result = nvvm.atomicrmw(
+            result = _nvvm_atomicrmw_compat(
+                T.i32(),
                 AtomicOpKind.CAS,
                 lock_ptr.llvm_ptr,
                 Int32(reset_val).ir_value(loc=loc, ip=ip),
