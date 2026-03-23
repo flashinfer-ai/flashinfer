@@ -202,10 +202,10 @@ __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int la
   constexpr int bankSize = sizeof(uint32_t);
   constexpr int stateValuesPerBank = bankSize / sizeof(state_t);
   constexpr int numBanks = 32;
-  constexpr int sramReadsPerThreadPerTile = numBanks / lanesPerRow;                   // 8
-  constexpr int elemsPerTileMember = sramReadsPerThreadPerTile * stateValuesPerBank;  // 16
-  constexpr int elemsPerTile = elemsPerTileMember * lanesPerRow;                      // 64
-  constexpr int numTiles = stateValuesPerThread / elemsPerTileMember;                 // 2
+  constexpr int sramReadsPerThreadPerTile = numBanks / lanesPerRow;
+  constexpr int elemsPerTileMember = sramReadsPerThreadPerTile * stateValuesPerBank;
+  constexpr int elemsPerTile = elemsPerTileMember * lanesPerRow;
+  constexpr int numTiles = stateValuesPerThread / elemsPerTileMember;
   using packed_tile_t = PackedAligned<state_t, elemsPerTileMember>;
 
   static_assert(elemsPerTileMember % 2 == 0, "elemsPerTileMember must be even for f32x2");
