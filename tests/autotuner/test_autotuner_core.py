@@ -460,7 +460,7 @@ def test_choose_one_different_infer_tokens_same_bucket_get_same_cached_tactic(
         (random.randrange(bucket_start, bucket_end), [32, 1]) for _ in range(3)
     ]
     num_tokens_with_expected_tactic_list += [
-        (random.randrange(0, bucket_start), [16, 1]) for _ in range(3)
+        (random.randrange(1, bucket_start), [16, 1]) for _ in range(3)
     ]
     num_tokens_with_expected_tactic_list += [
         (random.randrange(bucket_end, bucket_end * 2), [64, 1]) for _ in range(3)
