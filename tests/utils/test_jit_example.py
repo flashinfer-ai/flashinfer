@@ -705,6 +705,101 @@ struct FlashCustomMask : AttentionVariantBase {
     assert o_ragged.shape == (batch_size * seq_len, num_qo_heads, head_dim)
 
 
+@pytest.mark.parametrize("use_tensor_cores", [False, True])
+def test_batch_decode_jit_wellknown_alibi_buffer(use_tensor_cores):
+    """Issue #1044 (decode): JIT variants using well-known additional tensor name
+    (maybe_alibi_slopes) should auto-inject the internal buffer without the user
+    having to pass it via *args."""
+    torch.manual_seed(42)
+
+    variant_decl = r"""
+struct FlashAlibiDecode : AttentionVariantBase {
+  static constexpr bool use_softmax = true;
+
+  uint32_t window_left, qo_len, kv_len;
+  float sm_scale_log2;
+
+  template <typename Params>
+  __device__ __host__ FlashAlibiDecode(const Params& params, uint32_t batch_idx,
+                                       uint8_t* smem_ptr) {
+    qo_len = params.get_qo_len(batch_idx);
+    kv_len = params.get_kv_len(batch_idx);
+    window_left = kv_len;
+    sm_scale_log2 = params.sm_scale * math::log2e;
+  }
+
+  REGISTER_LOGITS_TRANSFORM(params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
+    float bias = 0.f;
+    if (params.maybe_alibi_slopes != nullptr) {
+      bias = params.maybe_alibi_slopes[qo_head_idx] * float(int(kv_idx) - int(kv_len) + 1);
+    }
+    return logits + bias;
+  });
+};
+"""
+    num_qo_heads = 32
+    num_kv_heads = 32
+    head_dim = 128
+    batch_size = 4
+    seq_len = 128
+    page_size = 1
+
+    jit_args = (
+        f"batch_decode_alibi_wellknown_{use_tensor_cores}",
+        torch.float16,
+        torch.float16,
+        torch.float16,
+        torch.int32,
+        head_dim,
+        head_dim,
+        ["maybe_alibi_slopes"],
+        ["float"],
+        ["sm_scale"],
+        ["double"],
+        "FlashAlibiDecode",
+        variant_decl,
+    )
+
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace_buffer,
+        kv_layout="NHD",
+        use_tensor_cores=use_tensor_cores,
+        jit_args=jit_args,
+        backend="fa2",
+    )
+
+    kv_indptr = torch.arange(0, batch_size * seq_len + 1, seq_len, dtype=torch.int32)
+    kv_indices = torch.arange(0, batch_size * seq_len, dtype=torch.int32)
+    last_page_len = torch.full((batch_size,), 1, dtype=torch.int32)
+
+    wrapper.plan(
+        kv_indptr,
+        kv_indices,
+        last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        q_data_type=torch.float16,
+        kv_data_type=torch.float16,
+    )
+
+    q = torch.randn(
+        batch_size, num_qo_heads, head_dim, dtype=torch.float16, device="cuda"
+    )
+    k_cache = torch.randn(
+        batch_size * seq_len, num_kv_heads, head_dim, dtype=torch.float16, device="cuda"
+    )
+    v_cache = torch.randn(
+        batch_size * seq_len, num_kv_heads, head_dim, dtype=torch.float16, device="cuda"
+    )
+
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    o = wrapper.run(q, (k_cache, v_cache), sm_scale)
+    assert o.shape == (batch_size, num_qo_heads, head_dim)
+
+
 if __name__ == "__main__":
     test_single_decode_mask()
     test_flash_sigmoid()
@@ -714,3 +809,5 @@ if __name__ == "__main__":
     test_batch_prefill_flash_sigmoid()
     test_batch_prefill_sm90_flash_sigmoid()
     test_batch_prefill_jit_wellknown_mask_buffers()
+    test_batch_decode_jit_wellknown_alibi_buffer(False)
+    test_batch_decode_jit_wellknown_alibi_buffer(True)
