@@ -76,11 +76,9 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
     FLASHINFER_CHECK(params.nheads % params.ngroups == 0, "nheads (", params.nheads,
                      ") must be divisible by ngroups (", params.ngroups,
                      ") for vertical algorithm");
-    constexpr int kVerticalDimAlignment = NUM_COMPUTE_WARPS_PER_GROUP * 4;
+    constexpr int kVerticalDimAlignment = warpSize;  // epilogue: elemsPerThread = DIM / warpSize
     FLASHINFER_CHECK(DIM % kVerticalDimAlignment == 0,
-                     "Vertical kernel requires DIM divisible by 16 "
-                     "(NUM_COMPUTE_WARPS_PER_GROUP * 4), got DIM=",
-                     DIM);
+                     "Vertical kernel requires DIM divisible by 32 (warpSize), got DIM=", DIM);
     FLASHINFER_CHECK(!scaleState, "vertical algorithm does not support scaled (quantized) state");
 
     constexpr int NUM_IN_STAGES = 1;
