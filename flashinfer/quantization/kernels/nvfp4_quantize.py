@@ -959,8 +959,10 @@ def _get_compiled_kernel_nvfp4(
 
 _TMA_MIN_M = 1024
 # TMA wins when the total problem is large enough to amortize pipeline overhead.
-# Empirically, log2(M) + log2(K) >= 25 (i.e., M*K >= ~33M elements) is the
-# crossover where TMA outperforms the default vectorized-load kernel on B200.
+# Empirically, floor(log2(M)) + floor(log2(K)) >= 25 is the crossover where TMA
+# outperforms the default vectorized-load kernel, validated on B200 and SM120.
+# We use bit_length()-1 (i.e., floor(log2)) rather than m*k to keep the boundary
+# aligned with the power-of-2 grid it was tuned on.
 _TMA_LOG2_MK_THRESHOLD = 25
 
 
@@ -1065,6 +1067,10 @@ def nvfp4_quantize_cute_dsl(
     """
     from ...utils import device_support_pdl
 
+    _valid_sf_layouts = (SF_LAYOUT_128x4, SF_LAYOUT_8x4, SF_LAYOUT_LINEAR)
+    assert sf_layout in _valid_sf_layouts, (
+        f"sf_layout must be one of {_valid_sf_layouts}, got {sf_layout}"
+    )
     _supported_dtypes = (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
     assert input.dtype in _supported_dtypes, (
         f"Input dtype must be one of {_supported_dtypes}, got {input.dtype}"
@@ -1095,9 +1101,9 @@ def nvfp4_quantize_cute_dsl(
     dtype_key = _torch_to_dtype_key[input.dtype]
 
     if isinstance(global_scale, torch.Tensor):
-        global_scale_tensor = global_scale.float().reshape(1).contiguous()
-        if not global_scale_tensor.is_cuda:
-            global_scale_tensor = global_scale_tensor.to(input.device)
+        global_scale_tensor = (
+            global_scale.float().reshape(1).contiguous().to(input.device)
+        )
     else:
         global_scale_tensor = torch.tensor(
             [float(global_scale)], dtype=torch.float32, device=input.device
@@ -1158,7 +1164,10 @@ def nvfp4_quantize_cute_dsl(
         if sf_layout == SF_LAYOUT_LINEAR:
             scale_output = scale_output[: m * num_sf_blocks_per_row]
 
-        scale_output = scale_output.reshape(-1, num_sf_blocks_per_row)
+        # Reshape using padded_sf_cols for swizzled layouts (the buffer is
+        # physically padded and stores data in swizzled order).  For linear
+        # layout the padding is already trimmed above.
+        scale_output = scale_output.reshape(-1, padded_sf_cols)
 
         return fp4_output, scale_output
 
@@ -1196,7 +1205,9 @@ def nvfp4_quantize_cute_dsl(
         input, fp4_output, scale_output, m, padded_m, num_blocks, global_scale_tensor
     )
 
-    scale_output = scale_output.reshape(-1, num_sf_blocks_per_row)
+    # Reshape using padded_sf_cols: for swizzled layouts the buffer includes
+    # column padding; for linear layout padded_sf_cols == num_sf_blocks_per_row.
+    scale_output = scale_output.reshape(-1, padded_sf_cols)
 
     return fp4_output, scale_output
 

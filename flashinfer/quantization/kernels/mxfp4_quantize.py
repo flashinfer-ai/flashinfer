@@ -474,6 +474,10 @@ def mxfp4_quantize_cute_dsl(
     """
     from ...utils import device_support_pdl
 
+    _valid_sf_layouts = (SF_LAYOUT_128x4, SF_LAYOUT_LINEAR)
+    assert sf_layout in _valid_sf_layouts, (
+        f"sf_layout must be one of {_valid_sf_layouts}, got {sf_layout}"
+    )
     assert input.dtype in (torch.float16, torch.bfloat16), (
         f"Input dtype must be float16 or bfloat16, got {input.dtype}"
     )

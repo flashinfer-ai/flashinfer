@@ -962,7 +962,25 @@ def nvfp4_quantize(
         The "cute-dsl" backend is **experimental** and not part of the stable API.
         It may change or be removed in future versions without notice.
     """
-    if backend == "cute-dsl":
+    if backend == "cuda":
+        if do_shuffle:
+            assert sfLayout == SfLayout.layout_128x4
+            is_sf_swizzled_layout = False
+            is_sf_8x4_layout = False
+        else:
+            is_sf_swizzled_layout = sfLayout != SfLayout.layout_linear
+            is_sf_8x4_layout = sfLayout == SfLayout.layout_8x4
+
+        a_fp4, a_sf = fp4_quantize(
+            a.cuda(),
+            a_global_sf.cuda(),
+            sf_vec_size,
+            sf_use_ue8m0=False,
+            is_sf_swizzled_layout=is_sf_swizzled_layout,
+            is_sf_8x4_layout=is_sf_8x4_layout,
+            enable_pdl=enable_pdl,
+        )
+    elif backend == "cute-dsl":
         from ..cute_dsl import is_cute_dsl_available
 
         if not is_cute_dsl_available():
@@ -986,52 +1004,26 @@ def nvfp4_quantize(
             SfLayout.layout_8x4: SF_LAYOUT_8x4,
             SfLayout.layout_linear: SF_LAYOUT_LINEAR,
         }
-        sf_layout_int = _sf_layout_map[sfLayout]
-
-        a_fp4, a_sf = nvfp4_quantize_cute_dsl(
-            a, a_global_sf, sf_layout=sf_layout_int, enable_pdl=enable_pdl
-        )
-
-        if do_shuffle:
-            epilogue_tile_m = 128
-            a_fp4 = shuffle_matrix_a(a_fp4.view(torch.uint8), epilogue_tile_m)
-            a_sf = shuffle_matrix_sf_a(a_sf.view(torch.uint8), epilogue_tile_m).reshape(
-                a_sf.shape
-            )
-
-        return a_fp4, a_sf
-    elif backend == "cuda":
         if do_shuffle:
             assert sfLayout == SfLayout.layout_128x4
-            a_fp4, a_sf = fp4_quantize(
-                a.cuda(),
-                a_global_sf.cuda(),
-                sf_vec_size,
-                sf_use_ue8m0=False,
-                is_sf_swizzled_layout=False,
-                is_sf_8x4_layout=False,
-                enable_pdl=enable_pdl,
-            )
-
-            epilogue_tile_m = 128
-            a_fp4 = shuffle_matrix_a(a_fp4.view(torch.uint8), epilogue_tile_m)
-            a_sf = shuffle_matrix_sf_a(a_sf.view(torch.uint8), epilogue_tile_m).reshape(
-                a_sf.shape
-            )
+            sf_layout_int = SF_LAYOUT_LINEAR
         else:
-            a_fp4, a_sf = fp4_quantize(
-                a.cuda(),
-                a_global_sf.cuda(),
-                sf_vec_size,
-                sf_use_ue8m0=False,
-                is_sf_swizzled_layout=sfLayout != SfLayout.layout_linear,
-                is_sf_8x4_layout=sfLayout == SfLayout.layout_8x4,
-                enable_pdl=enable_pdl,
-            )
+            sf_layout_int = _sf_layout_map[sfLayout]
 
-        return a_fp4, a_sf
+        a_fp4, a_sf = nvfp4_quantize_cute_dsl(
+            a.cuda(), a_global_sf.cuda(), sf_layout=sf_layout_int, enable_pdl=enable_pdl
+        )
     else:
         raise ValueError(f"Unknown backend: {backend}. Must be 'cuda' or 'cute-dsl'.")
+
+    if do_shuffle:
+        epilogue_tile_m = 128
+        a_fp4 = shuffle_matrix_a(a_fp4.view(torch.uint8), epilogue_tile_m)
+        a_sf = shuffle_matrix_sf_a(a_sf.view(torch.uint8), epilogue_tile_m).reshape(
+            a_sf.shape
+        )
+
+    return a_fp4, a_sf
 
 
 @flashinfer_api
