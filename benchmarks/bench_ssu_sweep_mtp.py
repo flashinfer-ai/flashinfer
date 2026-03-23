@@ -7,6 +7,7 @@ Runs with fixed state dtype (bf16) and mtp=6, collecting results into a pandas d
 """
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -325,8 +326,6 @@ def parse_dtype_spec(spec):
 
     Returns (display_name, torch_dtype, philox_rounds_or_None).
     """
-    import re
-
     m = re.match(r"^(bf16|f16|f32)-philox-(\d+)$", spec)
     if m:
         base, rounds = m.group(1), int(m.group(2))
