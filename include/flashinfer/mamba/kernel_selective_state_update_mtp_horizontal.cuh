@@ -98,9 +98,8 @@ template <typename state_t, int DSTATE, int PHILOX_ROUNDS>
 __device__ __forceinline__ void convertAndStoreSRHorizontal(state_t& out0, state_t& out1, float s0,
                                                             float s1, int64_t rand_seed,
                                                             int state_ptr_offset, int dd, int col0,
-                                                            int e) {
+                                                            int e, uint32_t (&rand_ints)[4]) {
   if constexpr (PHILOX_ROUNDS > 0) {
-    [[maybe_unused]] uint32_t rand_ints[4];
     if (e % 4 == 0)
       philox_randint4x<PHILOX_ROUNDS>(rand_seed, state_ptr_offset + dd * DSTATE + col0 + e,
                                       rand_ints[0], rand_ints[1], rand_ints[2], rand_ints[3]);
@@ -387,12 +386,14 @@ __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int la
               int const col0 = baseCol(t, 0);
               if (col0 >= DSTATE) continue;  // skip OOB padding columns
               packed_tile_t rOut;
+              [[maybe_unused]] uint32_t rand_ints[4];
 #pragma unroll
               for (int e = 0; e < elemsPerTileMember; e += 2) {
                 float const s0 = rState[t][e / 2].x;
                 float const s1 = rState[t][e / 2].y;
                 convertAndStoreSRHorizontal<state_t, DSTATE, PHILOX_ROUNDS>(
-                    rOut.val[e], rOut.val[e + 1], s0, s1, rand_seed, state_ptr_offset, dd, col0, e);
+                    rOut.val[e], rOut.val[e + 1], s0, s1, rand_seed, state_ptr_offset, dd, col0, e,
+                    rand_ints);
               }
               *reinterpret_cast<packed_tile_t*>(&istate_ptr[istate_base + col0]) = rOut;
             }
@@ -407,12 +408,14 @@ __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int la
               int const col0 = baseCol(t, 0);
               if (col0 >= DSTATE) continue;  // skip OOB padding columns
               packed_tile_t rOut;
+              [[maybe_unused]] uint32_t rand_ints[4];
 #pragma unroll
               for (int e = 0; e < elemsPerTileMember; e += 2) {
                 float const s0 = rState[t][e / 2].x;
                 float const s1 = rState[t][e / 2].y;
                 convertAndStoreSRHorizontal<state_t, DSTATE, PHILOX_ROUNDS>(
-                    rOut.val[e], rOut.val[e + 1], s0, s1, rand_seed, state_ptr_offset, dd, col0, e);
+                    rOut.val[e], rOut.val[e + 1], s0, s1, rand_seed, state_ptr_offset, dd, col0, e,
+                    rand_ints);
               }
               *reinterpret_cast<packed_tile_t*>(&state_ptr[state_base + col0]) = rOut;
             }
