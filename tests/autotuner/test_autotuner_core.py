@@ -1,3 +1,5 @@
+import random
+
 import pytest
 import torch
 
@@ -10,6 +12,7 @@ from flashinfer.autotuner import (
     TunableRunner,
 )
 from flashinfer.fused_moe.utils import last_positive_power_of_2
+from .utils import reset_autotuner
 
 
 def _moe_input_shapes(
@@ -39,14 +42,6 @@ class DummyRunner(TunableRunner):
 
     def forward(self, inputs, tactic: int = -1, do_preparation: bool = False, **kwargs):
         return inputs[0]
-
-
-def _reset_autotuner() -> AutoTuner:
-    tuner = AutoTuner.get()
-    tuner.clear_cache()
-    tuner.reset_statistics()
-    tuner.is_tuning_mode = False
-    return tuner
 
 
 def test_find_nearest_profile_passthrough_without_specs():
@@ -126,16 +121,13 @@ def test_find_nearest_profile_single_tensor_bucketization_exact_powers(
     "num_tokens,expected_bucket",
     [
         (1000, 512),
+        (1024, 1024),
         (4000, 2048),
+        (4096, 4096),
         (8000, 4096),
-        (12000, 8192),
+        (8192, 8192),
+        (10000, 8192),
     ],
-)
-@pytest.mark.skip(
-    reason=(
-        "_find_nearest_profile linked-dimension mapping was reverted; "
-        "re-enable when linked-dim bucket propagation is restored."
-    )
 )
 def test_find_nearest_profile_moe_shared_num_tokens_axis(num_tokens, expected_bucket):
     """MoE linked tensors should all map num_tokens together to one bucket."""
@@ -161,12 +153,6 @@ def test_find_nearest_profile_moe_shared_num_tokens_axis(num_tokens, expected_bu
         assert nearest_shape[1:] == original_shape[1:]
 
 
-@pytest.mark.skip(
-    reason=(
-        "_find_nearest_profile linked-dimension mapping was reverted; "
-        "re-enable when linked-dim bucket propagation is restored."
-    )
-)
 def test_find_nearest_profile_moe_same_bucket_same_profile():
     """MoE inputs mapping to the same bucket should share an identical profile."""
     config = TuningConfig(
@@ -185,12 +171,6 @@ def test_find_nearest_profile_moe_same_bucket_same_profile():
     assert p1 == p2
 
 
-@pytest.mark.skip(
-    reason=(
-        "_find_nearest_profile linked-dimension mapping was reverted; "
-        "re-enable when linked-dim bucket propagation is restored."
-    )
-)
 def test_find_nearest_profile_maps_all_linked_dims():
     """One logical dynamic axis should update every linked tensor/dimension."""
     tuning_config = TuningConfig(
@@ -238,7 +218,7 @@ def test_get_cache_key_bucketization(shape_a, shape_b, expected_equal):
 
 def test_search_cache_hit_and_miss():
     """search_cache should report miss before seeding and hit after seeding."""
-    tuner = _reset_autotuner()
+    tuner = reset_autotuner()
     config = TuningConfig()
     runner = DummyRunner()
     shapes = (torch.Size([8, 16]),)
@@ -254,7 +234,7 @@ def test_search_cache_hit_and_miss():
 
 def test_search_cache_preserving_leading_dims_hits_while_flattened_misses(monkeypatch):
     """Shape-preserving reshape keeps cache-hit behavior; full flatten can change bucket/key."""
-    tuner = _reset_autotuner()
+    tuner = reset_autotuner()
     runner = DummyRunner()
     config = TuningConfig(
         dynamic_tensor_specs=(
@@ -310,7 +290,7 @@ def test_search_cache_preserving_leading_dims_hits_while_flattened_misses(monkey
 
 def test_choose_one_inference_uses_cache_or_fallback():
     """Inference path should use cached tactic when present, else fallback -1."""
-    tuner = _reset_autotuner()
+    tuner = reset_autotuner()
     runner = DummyRunner()
     inputs = [torch.empty((4, 8), dtype=torch.float32)]
     config = TuningConfig()
@@ -330,7 +310,7 @@ def test_choose_one_inference_uses_cache_or_fallback():
 
 def test_choose_one_tuning_selects_best_tactic_and_populates_cache(monkeypatch):
     """Tuning path should select lowest-profile-time tactic and cache result."""
-    tuner = _reset_autotuner()
+    tuner = reset_autotuner()
     runner = DummyRunner(valid_tactics=(0, 1, 2))
     inputs = [torch.empty((16, 32), dtype=torch.float32)]
     config = TuningConfig()
@@ -353,7 +333,7 @@ def test_choose_one_tuning_selects_best_tactic_and_populates_cache(monkeypatch):
 
 def test_prepare_input_tensors_reuses_static_and_recreates_dynamic():
     """Profiles apply constraints, dynamic inputs are recreated, static inputs are reused."""
-    tuner = _reset_autotuner()
+    tuner = reset_autotuner()
     config = TuningConfig(
         dynamic_tensor_specs=(
             DynamicTensorSpec(
@@ -385,3 +365,111 @@ def test_prepare_input_tensors_reuses_static_and_recreates_dynamic():
     assert tuple(prepared[0].shape) == (8, 4)
     assert prepared[0] is not inputs[0]
     assert prepared[1] is inputs[1]
+
+
+class TileTacticDummyRunner(TunableRunner):
+    def __init__(self, supported_tiles: tuple[int, ...], num_tactics_per_tile: int = 2):
+        self.supported_tiles = supported_tiles
+        self.num_tactics_per_tile = num_tactics_per_tile
+
+    def get_valid_tactics(self, inputs, profile):
+        tactics = []
+        for tile in sorted(self.supported_tiles):
+            for cfg in range(self.num_tactics_per_tile):
+                tactics.append([tile, cfg])
+        return tactics
+
+    def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
+        return inputs[0]
+
+
+def test_choose_one_different_infer_tokens_same_bucket_get_same_cached_tactic(
+    monkeypatch,
+):
+    """Multiple actual num_tokens that map to the same bucket should all
+    receive the same cached tactic - confirming the autotuner uses the
+    bucketed profile, not the actual shapes, for cache lookup."""
+    tuner = reset_autotuner()
+    runner = TileTacticDummyRunner(supported_tiles=(8, 16, 32, 64))
+    hidden_size = 128
+    bucket_start = 512
+    bucket_end = 1024
+    tuning_buckets = (
+        1,
+        2,
+        4,
+        8,
+        16,
+        32,
+        64,
+        128,
+        256,
+        512,
+        1024,
+    )
+    tune_max = max(tuning_buckets)
+
+    def fake_profile(self, runner_obj, prof_inputs, tactic, tuning_config=None, **kw):
+        """When num_tokens is in the bucket [512, 1024):
+            return a low score (indicating good performance) if tile_n=32 and cfg=1
+        When num_tokens < 512:
+            return a low score if tile_n=16 and cfg=1
+        When num_tokens >= 1024:
+            return a low score if tile_n=64 and cfg=1
+         For all other tile_n and cfg combinations, return a high score (indicating bad performance).
+        """
+        if isinstance(tactic, list):
+            tile_n = tactic[0]
+            tactic_cfg = tactic[1]
+        else:
+            tile_n = -1
+            tactic_cfg = -1
+        num_tokens = prof_inputs[0].shape[0]
+        if num_tokens < bucket_start:
+            target_tile_n = 16
+        elif bucket_start <= num_tokens < bucket_end:
+            target_tile_n = 32
+        else:
+            target_tile_n = 64
+        return 1.0 if tile_n == target_tile_n and tactic_cfg == 1 else 5.0
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+
+    tune_inputs = [
+        [torch.empty((bucket_start // 2, hidden_size), dtype=torch.float32)],
+        [torch.empty((bucket_start, hidden_size), dtype=torch.float32)],
+        [torch.empty((bucket_end, hidden_size), dtype=torch.float32)],
+    ]
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=tuning_buckets,
+                map_to_tuning_buckets=lambda x: min(
+                    last_positive_power_of_2(x), tune_max
+                ),
+            ),
+        ),
+    )
+    with autotune(tune_mode=True):
+        for inputs in tune_inputs:
+            tuner.choose_one("test_same_bucket", [runner], tuning_config, inputs)
+
+    num_tokens_with_expected_tactic_list = [
+        (random.randrange(bucket_start, bucket_end), [32, 1]) for _ in range(3)
+    ]
+    num_tokens_with_expected_tactic_list += [
+        (random.randrange(0, bucket_start), [16, 1]) for _ in range(3)
+    ]
+    num_tokens_with_expected_tactic_list += [
+        (random.randrange(bucket_end, bucket_end * 2), [64, 1]) for _ in range(3)
+    ]
+    for actual, expected_tactic in num_tokens_with_expected_tactic_list:
+        infer_inputs = [torch.empty((actual, hidden_size), dtype=torch.float32)]
+        _, tactic = tuner.choose_one(
+            "test_same_bucket", [runner], tuning_config, infer_inputs
+        )
+        assert tactic == expected_tactic, (
+            f"Expected cached tactic {expected_tactic} for num_tokens={actual}, got {tactic}"
+        )

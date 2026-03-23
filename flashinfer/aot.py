@@ -588,22 +588,36 @@ def gen_all_modules(
         _ssu_dims = [64]
         _ssu_dstates = [128]
         _ssu_ntokens = [1, 4, 6, 8]
-        for dtype_combo, dim, dstate, ntokens in product(
-            _ssu_dtype_combos, _ssu_dims, _ssu_dstates, _ssu_ntokens
+        _ssu_cu_seqlens_dtypes = [torch.int32, torch.int64]
+        _ssu_num_accepted_dtypes = [torch.int32, torch.int64]
+        for dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype in product(
+            _ssu_dtype_combos,
+            _ssu_dims,
+            _ssu_dstates,
+            _ssu_ntokens,
+            _ssu_cu_seqlens_dtypes,
+            _ssu_num_accepted_dtypes,
         ):
             jit_specs.append(
                 # false positive: mypy can't resolve the signature because flashinfer.jit deps (filelock etc.)
                 # are absent in mypy's isolated env, causing it to infer an incorrect function signature
-                gen_selective_state_update_module(*dtype_combo, dim, dstate, ntokens)  # type: ignore[call-arg]
+                gen_selective_state_update_module(
+                    *dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype
+                )  # type: ignore[call-arg]
             )
         if has_sm90 or has_sm100:
-            for dtype_combo, dim, dstate, ntokens in product(
-                _ssu_dtype_combos, _ssu_dims, _ssu_dstates, _ssu_ntokens
+            for dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype in product(
+                _ssu_dtype_combos,
+                _ssu_dims,
+                _ssu_dstates,
+                _ssu_ntokens,
+                _ssu_cu_seqlens_dtypes,
+                _ssu_num_accepted_dtypes,
             ):
                 jit_specs.append(
                     # same false positive as above
                     gen_selective_state_update_sm90_module(  # type: ignore[call-arg]
-                        *dtype_combo, dim, dstate, ntokens
+                        *dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype
                     )
                 )
             jit_specs.append(gen_trtllm_utils_module())

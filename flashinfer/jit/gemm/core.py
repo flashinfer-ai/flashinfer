@@ -91,6 +91,7 @@ def gen_gemm_sm100_module_cutlass_fp4() -> JitSpec:
         + [
             "-DENABLE_BF16",
             "-DENABLE_FP4",
+            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
         ],
         extra_cflags=[
             "-DFAST_BUILD",
@@ -158,6 +159,7 @@ def gen_gemm_sm103_module_cutlass_fp4() -> JitSpec:
         + [
             "-DENABLE_BF16",
             "-DENABLE_FP4",
+            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
         ],
         extra_cflags=[
             "-DFAST_BUILD",
@@ -206,6 +208,7 @@ def gen_gemm_sm120_module_cutlass_fp4() -> JitSpec:
         + [
             "-DENABLE_BF16",
             "-DENABLE_FP4",
+            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
         ],
         extra_cflags=[
             "-DFAST_BUILD",
@@ -256,6 +259,7 @@ def gen_gemm_sm100_module_cutlass_fp8() -> JitSpec:
         extra_cuda_cflags=nvcc_flags
         + [
             "-DENABLE_BF16",
+            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
         ],
         extra_cflags=[
             "-DFAST_BUILD",
@@ -349,6 +353,7 @@ def gen_gemm_sm100_module_cutlass_mxfp8() -> JitSpec:
         extra_cuda_cflags=nvcc_flags
         + [
             "-DENABLE_BF16",
+            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
         ],
         extra_cflags=[
             "-DFAST_BUILD",
@@ -431,7 +436,10 @@ def gen_gemm_sm100_module() -> JitSpec:
     return gen_jit_spec(
         "gemm_sm100",
         source_paths,
-        extra_cuda_cflags=nvcc_flags,
+        extra_cuda_cflags=nvcc_flags
+        + [
+            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
+        ],
     )
 
 
@@ -516,7 +524,10 @@ def gen_gemm_sm120_module() -> JitSpec:
     return gen_jit_spec(
         "gemm_sm120",
         source_paths,
-        extra_cuda_cflags=nvcc_flags,
+        extra_cuda_cflags=nvcc_flags
+        + [
+            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
+        ],
     )
 
 
