@@ -999,8 +999,8 @@ def gen_batch_prefill_module(
             "maybe_mask_indptr",
             "maybe_alibi_slopes",
             "maybe_prefix_len_ptr",
-            "maybe_token_pos_in_items_ptr",
             "maybe_max_item_len_ptr",
+            "maybe_item_start_ptr",
         ]
         additional_tensor_dtypes = [
             "uint8_t",
@@ -1008,14 +1008,14 @@ def gen_batch_prefill_module(
             "float",
             "uint32_t",
             "uint16_t",
-            "uint16_t",
+            "uint32_t",
         ]  # NOTE(Zihao): int32_t should follow dtype_idx
         additional_scalar_names = [
             "logits_soft_cap",
             "sm_scale",
             "rope_rcp_scale",
             "rope_rcp_theta",
-            "token_pos_in_items_len",
+            "item_start_len",
         ]
         additional_scalar_dtypes = ["double", "double", "double", "double", "int64_t"]
         variant_name = f"DefaultAttention<use_custom_mask, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>"
@@ -1024,16 +1024,16 @@ def gen_batch_prefill_module(
         if not fp8_enabled:
             additional_tensor_names = [
                 "maybe_prefix_len_ptr",
-                "maybe_token_pos_in_items_ptr",
                 "maybe_max_item_len_ptr",
+                "maybe_item_start_ptr",
                 "maybe_scale_v",
             ]
-            additional_tensor_dtypes = ["uint32_t", "uint16_t", "uint16_t", "float"]
+            additional_tensor_dtypes = ["uint32_t", "uint16_t", "uint32_t", "float"]
             additional_scalar_names = [
                 "logits_soft_cap",
                 "sm_scale",
                 "scale_v_scalar",
-                "token_pos_in_items_len",
+                "item_start_len",
             ]
             additional_scalar_dtypes = ["double", "double", "double", "int64_t"]
             variant_name = f"DefaultAttention<{str(use_logits_soft_cap).lower()}>"
