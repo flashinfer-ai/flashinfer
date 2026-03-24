@@ -976,5 +976,8 @@ def test_trtllm_batch_decode_mla_preallocated_out(
         bmm2_scale=1.0,
         backend="trtllm-gen",
     )
+    assert result_pre.data_ptr() == out.data_ptr(), (
+        "Expected kernel to write into provided out tensor"
+    )
     assert result_pre.shape == expected_shape
     torch.testing.assert_close(result_none, result_pre, rtol=1e-3, atol=1e-3)
