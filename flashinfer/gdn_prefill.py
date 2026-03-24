@@ -28,6 +28,7 @@ from .utils import (
     _get_cache_buf,
     is_sm90a_supported,
     is_sm100a_supported,
+    is_sm103a_supported,
     is_sm110a_supported,
     backend_requirement,
     supported_compute_capability,
@@ -175,7 +176,7 @@ def chunk_gated_delta_rule_hopper(
         return output
 
 
-@supported_compute_capability([90, 100, 110])
+@supported_compute_capability([90, 100, 103, 110])
 def _check_gdn_prefill(
     q,
     k,
@@ -277,15 +278,17 @@ def chunk_gated_delta_rule(
             output_state,
         )
 
-    elif is_sm100a_supported(torch.device("cuda")) or is_sm110a_supported(
-        torch.device("cuda")
+    elif (
+        is_sm100a_supported(torch.device("cuda"))
+        or is_sm103a_supported(torch.device("cuda"))
+        or is_sm110a_supported(torch.device("cuda"))
     ):
         if chunk_gated_delta_rule_blackwell is None:
             raise NotImplementedError("Blackwell GDN prefill backend is unavailable.")
 
         if g is None or beta is None:
             raise NotImplementedError(
-                "Gate and beta must not be None on sm100a and sm110a."
+                "Gate and beta must not be None on sm100a, sm103a and sm110a."
             )
 
         return chunk_gated_delta_rule_blackwell(
@@ -304,5 +307,5 @@ def chunk_gated_delta_rule(
         )
     else:
         raise NotImplementedError(
-            "chunk_gated_delta_rule only support sm90a, sm100a, sm110a."
+            "chunk_gated_delta_rule only support sm90a, sm100a, sm103a, sm110a."
         )
