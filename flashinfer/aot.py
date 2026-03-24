@@ -44,6 +44,7 @@ from .jit.attention import (
     gen_single_decode_module,
     gen_single_prefill_module,
     gen_trtllm_gen_fmha_module,
+    gen_trtllm_fmha_v2_sm120_module,
 )
 from .jit.cascade import gen_cascade_module
 from .jit.cpp_ext import get_cuda_version
@@ -529,6 +530,7 @@ def gen_all_modules(
             jit_specs.append(gen_gemm_sm120_module())
             jit_specs.append(gen_gemm_sm120_module_cutlass_fp4())
             jit_specs.append(gen_gemm_sm120_module_cutlass_mxfp8())
+            jit_specs.append(gen_trtllm_fmha_v2_sm120_module())
         if has_sm120f:
             jit_specs.append(gen_fp4_quantization_sm120f_module())
 
