@@ -3830,9 +3830,7 @@ def _cute_dsl_gemm_mxfp8_runner(
             alpha_for_launch = _prepare_alpha_for_launch(None, a.device)
 
             launch_out = (
-                out.as_strided(out.shape, (1, out.shape[0]))
-                if swap_ab
-                else out
+                out.as_strided(out.shape, (1, out.shape[0])) if swap_ab else out
             )
             compiled_gemm(
                 kernel_a,
@@ -4650,9 +4648,7 @@ def _cute_dsl_gemm_fp4_runner(
             # The kernel reconstructs C's layout from the raw pointer,
             # so the view's strides don't affect computation.
             launch_out = (
-                out.as_strided(out.shape, (1, out.shape[0]))
-                if swap_ab
-                else out
+                out.as_strided(out.shape, (1, out.shape[0])) if swap_ab else out
             )
             compiled_gemm(
                 kernel_a,
