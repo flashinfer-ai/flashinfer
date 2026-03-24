@@ -216,8 +216,8 @@ def _rmsnorm_quant_fake(
     scale: torch.Tensor,
     eps: float,
     enable_pdl: Optional[bool],
-) -> None:
-    pass
+) -> torch.Tensor:
+    return out
 
 
 @flashinfer_api
