@@ -555,7 +555,7 @@ def testNvfp4Quantize(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
-    from flashinfer.fp4_quantization import SfLayout
+    from flashinfer import SfLayout
 
     if args.verbose >= 1:
         print("[INFO] Running testNvfp4Quantize")

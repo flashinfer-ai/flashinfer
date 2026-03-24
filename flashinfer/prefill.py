@@ -44,6 +44,7 @@ from .utils import (
     MaskMode,
     PosEncodingMode,
     TensorLayout,
+    _check_block_tables_shape,
     _check_cached_qkv_data_type,
     _check_kv_layout,
     _check_pos_encoding_mode,
@@ -264,6 +265,7 @@ def get_trtllm_gen_prefill_module():
         key_block_scales: Optional[torch.Tensor] = None,
         value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        uses_shared_paged_kv_idx: bool = True,
     ) -> torch.Tensor:
         sm_count = get_device_sm_count(query.device)
         if out is None:
@@ -300,6 +302,7 @@ def get_trtllm_gen_prefill_module():
             key_block_scales,
             value_block_scales,
             skip_softmax_threshold_scale_factor,
+            uses_shared_paged_kv_idx,
         )
         return out
 
@@ -670,6 +673,7 @@ def get_batch_prefill_module(backend, *args):
         key_block_scales: Optional[torch.Tensor] = None,
         value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        uses_shared_paged_kv_idx: bool = True,
     ) -> None:
         if backend == "trtllm-gen":
             assert maybe_lse is None
@@ -706,6 +710,7 @@ def get_batch_prefill_module(backend, *args):
                 key_block_scales=key_block_scales,
                 value_block_scales=value_block_scales,
                 skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+                uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
             )
         elif backend == "fa2":
             assert not is_float8(q)
@@ -844,6 +849,7 @@ def get_batch_prefill_module(backend, *args):
         key_block_scales: Optional[torch.Tensor] = None,
         value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        uses_shared_paged_kv_idx: bool = True,
     ) -> None:
         pass
 
@@ -1847,12 +1853,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._max_item_len_ptr = max_item_len_ptr
 
         # NOTE(Zihao): only required if qo_indptr/paged_kv_indptr are device tensors
+        qo_indptr_host = qo_indptr.to("cpu")
+        self._qo_indptr_last = int(qo_indptr_host[-1])
+        total_num_rows = self._qo_indptr_last
         if max_token_per_sequence is not None:
             self._max_q_len = max_token_per_sequence
         else:
-            qo_indptr_host = qo_indptr.to("cpu")
             self._max_q_len = max(qo_indptr_host[1:] - qo_indptr_host[:-1]).item()
-            total_num_rows = int(qo_indptr_host[-1])
 
         if max_sequence_kv is not None:
             self._max_kv_len = max_sequence_kv
@@ -2189,6 +2196,21 @@ class BatchPrefillWithPagedKVCacheWrapper:
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
         )
+        # Validate q shape matches qo_indptr (using value cached in plan() to avoid GPU sync)
+        if self._backend == "cudnn":
+            if q.numel() != self._qo_indptr_last:
+                raise ValueError(
+                    f"q.numel() ({q.numel()}) does not match qo_indptr[-1] ({self._qo_indptr_last}). "
+                    f"For cudnn paged prefill, qo_indptr uses element offsets "
+                    f"(total_tokens * num_heads * head_dim)."
+                )
+        else:
+            if q.size(0) != self._qo_indptr_last:
+                raise ValueError(
+                    f"q.shape[0] ({q.size(0)}) does not match qo_indptr[-1] ({self._qo_indptr_last}). "
+                    f"For paged prefill, q must have shape [total_tokens, num_heads, head_dim] "
+                    f"where total_tokens = qo_indptr[-1]."
+                )
 
         # Unpack kv_block_scales
         key_block_scales = None
@@ -2373,6 +2395,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     key_block_scales,
                     value_block_scales,
                     skip_softmax_threshold_scale_factor,
+                    True,  # uses_shared_paged_kv_idx
                 ]
 
             assert self._cached_module is not None, "cached module is not initialized"
@@ -2857,7 +2880,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         qo_indptr_host = qo_indptr.to("cpu")
         kv_indptr_host = kv_indptr.to("cpu")
 
-        total_num_rows = int(qo_indptr_host[-1])
+        self._qo_indptr_last = int(qo_indptr_host[-1])
+        total_num_rows = self._qo_indptr_last
 
         if self.is_cuda_graph_enabled:
             if self._max_total_num_rows is None:
@@ -3118,6 +3142,21 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         _check_cached_qkv_data_type(
             q, k, self._cached_q_data_type, self._cached_kv_data_type
         )
+        # Validate q shape matches qo_indptr (using value cached in plan() to avoid GPU sync)
+        if self._backend == "cudnn":
+            if q.numel() != self._qo_indptr_last:
+                raise ValueError(
+                    f"q.numel() ({q.numel()}) does not match qo_indptr[-1] ({self._qo_indptr_last}). "
+                    f"For cudnn ragged prefill, qo_indptr uses element offsets "
+                    f"(total_tokens * num_heads * head_dim)."
+                )
+        else:
+            if q.size(0) != self._qo_indptr_last:
+                raise ValueError(
+                    f"q.shape[0] ({q.size(0)}) does not match qo_indptr[-1] ({self._qo_indptr_last}). "
+                    f"For ragged prefill, q must have shape [total_tokens, num_heads, head_dim] "
+                    f"where total_tokens = qo_indptr[-1]."
+                )
 
         window_left = self._window_left
         logits_soft_cap = self._logits_soft_cap
@@ -3696,6 +3735,7 @@ def trtllm_batch_context_with_kv_cache(
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
     ] = None,
     skip_softmax_threshold_scale_factor: Optional[float] = None,
+    uses_shared_paged_kv_idx: bool = True,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
     Parameters
@@ -3711,7 +3751,10 @@ def trtllm_batch_context_with_kv_cache(
     workspace_buffer : torch.Tensor. Must be initialized to 0 for its first use.
         workspace
     block_tables : torch.Tensor
-        page_table of kv cache, [batch_size, num_pages]
+        Page table of kv cache.
+        When ``uses_shared_paged_kv_idx`` is True (default): shape ``[batch_size, max_num_pages_per_seq]``.
+        When ``uses_shared_paged_kv_idx`` is False: shape ``[batch_size, 2, max_num_pages_per_seq]``
+        where dim 1 distinguishes K (0) and V (1) page indices.
     seq_lens : torch.Tensor
         A uint32 1D tensor indicating the kv sequence length of each prompt. shape: ``[batch_size]``
     max_q_len : int
@@ -3757,6 +3800,10 @@ def trtllm_batch_context_with_kv_cache(
         If no value is provided, then standard attention is used.
         Setting the threshold to a higher value generally increases kernel performance at the cost of accuracy degradation.
         The actual threshold value equals the provided threshold_scale_factor divided by the context length.
+    uses_shared_paged_kv_idx : bool = True
+        Whether the K and V page indices are shared as a unified index.
+        True (default) uses vLLM/FlashInfer layout with a 2D page table.
+        False uses TRT-LLM layout with a 3D page table ``[batch_size, 2, max_num_pages_per_seq]``.
     Returns
     -------
     out: Union[torch.Tensor, FP4Tensor]
@@ -3889,6 +3936,7 @@ def trtllm_batch_context_with_kv_cache(
         bmm1_scale = bmm1_scale * log2e
     if isinstance(bmm2_scale, torch.Tensor):
         assert bmm2_scale.dtype == torch.float32
+    _check_block_tables_shape(block_tables, uses_shared_paged_kv_idx)
     workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
     run_func(
         out,
@@ -3917,6 +3965,7 @@ def trtllm_batch_context_with_kv_cache(
         key_block_scales,
         value_block_scales,
         skip_softmax_threshold_scale_factor,
+        uses_shared_paged_kv_idx,
     )
     return (
         out

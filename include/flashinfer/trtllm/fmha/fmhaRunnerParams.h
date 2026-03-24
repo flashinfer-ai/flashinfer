@@ -300,6 +300,9 @@ struct TllmGenFmhaRunnerParams {
   bool mSparseMla;
   // The top k value for sparse MLA.
   int mSparseMlaTopK;
+  // Whether the indices for K & V pages are shared as unified index.
+  // true -> vLLM/FlashInfer; false -> TRT-LLM.
+  bool mUsesSharedPagedKvIdx;
   // The cuda stream.
   cudaStream_t stream;
   // Whether to enable PDL (Programmatic Dependent Launch).
