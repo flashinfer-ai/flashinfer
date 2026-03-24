@@ -301,6 +301,8 @@ def selective_state_update(
         algorithm_int = 2
     elif algorithm == "horizontal":
         algorithm_int = 3
+    elif algorithm == "async_horizontal":
+        algorithm_int = 4
     else:
         raise ValueError(f"Unknown algorithm: {algorithm}")
 

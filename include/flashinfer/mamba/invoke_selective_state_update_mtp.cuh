@@ -11,6 +11,7 @@
 #include "common.cuh"
 #include "conversion.cuh"
 #include "create_tensor_map.cuh"
+#include "kernel_selective_state_update_mtp_async_horizontal.cuh"
 #include "kernel_selective_state_update_mtp_simple.cuh"
 #ifdef FLASHINFER_MAMBA_ENABLE_SM100
 #include "kernel_selective_state_update_mtp_horizontal.cuh"
@@ -33,9 +34,10 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
   }
   FLASHINFER_CHECK(algorithm == SSUAlgorithm::kAuto || algorithm == SSUAlgorithm::kSimple ||
                        algorithm == SSUAlgorithm::kVertical ||
-                       algorithm == SSUAlgorithm::kHorizontal,
+                       algorithm == SSUAlgorithm::kHorizontal ||
+                       algorithm == SSUAlgorithm::kAsyncHorizontal,
                    "MTP selective_state_update only supports 'auto', 'simple', 'vertical', "
-                   "or 'horizontal' algorithm, got ",
+                   "'horizontal', or 'async_horizontal' algorithm, got ",
                    static_cast<int32_t>(algorithm));
   // ── Auto algorithm selection ──────────────────────────────────────────────
   if (algorithm == SSUAlgorithm::kAuto) {
@@ -68,6 +70,74 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
   // Intermediate states pointer alignment (vectorized stores in both kernels)
   if (params.intermediate_states) {
     FLASHINFER_CHECK_ALIGNMENT(params.intermediate_states, alignof(load_state_t));
+  }
+
+  // ── Async Horizontal MTP kernel (SM80+, no TMA) ─────────────────────────
+  if (algorithm == SSUAlgorithm::kAsyncHorizontal) {
+    constexpr int NUM_WARPS = 4;
+    constexpr int kRowsPerPass = NUM_WARPS * async_horiz::ROWS_PER_WARP;
+
+    FLASHINFER_CHECK(params.nheads % params.ngroups == 0, "nheads (", params.nheads,
+                     ") must be divisible by ngroups (", params.ngroups,
+                     ") for async_horizontal algorithm");
+    FLASHINFER_CHECK(!scaleState,
+                     "async_horizontal algorithm does not support scaled (quantized) state");
+    FLASHINFER_CHECK(params.cu_seqlens == nullptr,
+                     "async_horizontal algorithm does not support varlen (cu_seqlens)");
+
+    // Determine CTAS_PER_HEAD: split DIM across grid.z for more parallelism at small batch
+    int const total_tiles = params.batch * params.nheads;
+    int const num_sms = GetCudaMultiProcessorCount();
+
+    // Pick CTAS_PER_HEAD so we have enough CTAs to fill the GPU.
+    // DIM_PER_CTA must be >= warpSize (epilogue needs at least 1 elem/thread)
+    // and >= ROWS_PER_PASS (compute needs at least 1 pass).
+    constexpr int kMinDimPerCta = kRowsPerPass > warpSize ? kRowsPerPass : warpSize;
+    int ctas_per_head = 1;
+    if (total_tiles * 2 < num_sms && DIM / 2 >= kMinDimPerCta) ctas_per_head = 2;
+    if (total_tiles * 4 < num_sms && DIM / 4 >= kMinDimPerCta) ctas_per_head = 4;
+
+    auto launch = [&]<int CTAS_PER_HEAD>() {
+      constexpr int DIM_PER_CTA = DIM / CTAS_PER_HEAD;
+      static_assert(DIM % CTAS_PER_HEAD == 0);
+      static_assert(DIM_PER_CTA >= warpSize, "DIM_PER_CTA must be >= warpSize for epilogue");
+      static_assert(DIM_PER_CTA % kRowsPerPass == 0);
+
+      dispatchRatio(
+          params, std::integer_sequence<int, 1, 2, 4, 8, 16, 32, 64>{}, [&]<int HEADS_PER_GROUP>() {
+            constexpr int DSTATE_PAD = padDstate<input_t>(DSTATE);
+            using sram_t = AsyncHorizontalStorage<input_t, NTOKENS_MTP, DIM_PER_CTA, DSTATE_PAD>;
+            constexpr size_t smem_size = sizeof(sram_t);
+
+            auto func = selective_state_update_kernel_async_horizontal_mtp<
+                input_t, weight_t, matrixA_t, state_t, stateIndex_t, NTOKENS_MTP, DIM, DSTATE,
+                HEADS_PER_GROUP, PHILOX_ROUNDS, NUM_WARPS, CTAS_PER_HEAD>;
+
+            dim3 grid(params.batch, params.nheads, CTAS_PER_HEAD);
+            dim3 block(warpSize, NUM_WARPS);
+
+            FLASHINFER_CUDA_CHECK(
+                cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+            func<<<grid, block, smem_size, stream>>>(params);
+          });
+    };
+
+    // Only instantiate CTAS_PER_HEAD values where DIM_PER_CTA >= kMinDimPerCta.
+    // Use if constexpr to avoid compiling invalid template instantiations.
+    if constexpr (DIM / 4 >= kMinDimPerCta) {
+      if (ctas_per_head == 4) {
+        launch.template operator()<4>();
+        return;
+      }
+    }
+    if constexpr (DIM / 2 >= kMinDimPerCta) {
+      if (ctas_per_head == 2) {
+        launch.template operator()<2>();
+        return;
+      }
+    }
+    launch.template operator()<1>();
+    return;
   }
 
   // ── Vertical MTP kernel (SM100+ only) ────────────────────────────────────
