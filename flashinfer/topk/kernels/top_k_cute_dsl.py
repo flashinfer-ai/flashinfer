@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+import logging
 import math
 from typing import Optional, Tuple
 
@@ -23,11 +24,18 @@ import cutlass.cute as cute
 import torch
 
 from ...cute_dsl.utils import get_num_sm
-from ...utils import _get_cache_buf, get_compute_capability
+from ...utils import get_compute_capability
 from .single_pass_multi_cta_radix_topk import (
-    STATE_SIZE,
+    STATE_SIZE as DISTRIBUTED_STATE_SIZE,
     SinglePassMultiCTARadixTopKKernel,
 )
+from .single_pass_multi_cta_radix_topk_cluster import (
+    STATE_SIZE as CLUSTER_STATE_SIZE,
+    SinglePassMultiCTARadixTopKClusterKernel,
+    _query_max_cluster_size,
+)
+
+logger = logging.getLogger(__name__)
 
 _TORCH_TO_CUTLASS_DTYPE = {
     torch.float16: cutlass.Float16,
@@ -41,6 +49,7 @@ _TORCH_TO_CUTLASS_DTYPE = {
 # ---------------------------------------------------------------------------
 @functools.cache
 def _get_compiled_kernel(
+    kernel_variant: str,
     cutlass_dtype,
     chunk_size: int,
     top_k: int,
@@ -50,7 +59,12 @@ def _get_compiled_kernel(
     num_sms: int,
     return_val: bool,
 ):
-    """Compile and cache a single-pass multi-CTA radix top-k kernel."""
+    """Compile and cache a single-pass multi-CTA radix top-k kernel.
+
+    kernel_variant: "cluster" or "distributed"
+    """
+    state_size = CLUSTER_STATE_SIZE if kernel_variant == "cluster" else DISTRIBUTED_STATE_SIZE
+
     n_rows = cute.sym_int()
     n_cols = cute.sym_int()
     n_batch = cute.sym_int()
@@ -64,7 +78,7 @@ def _get_compiled_kernel(
     )
     row_states_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (n_groups, STATE_SIZE),
+        (n_groups, state_size),
         stride_order=(1, 0),
         assumed_align=32,
     )
@@ -88,7 +102,12 @@ def _get_compiled_kernel(
         output_values_fake = None
     fake_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
-    kernel_obj = SinglePassMultiCTARadixTopKKernel(
+    if kernel_variant == "cluster":
+        kernel_cls = SinglePassMultiCTARadixTopKClusterKernel
+    else:
+        kernel_cls = SinglePassMultiCTARadixTopKKernel
+
+    kernel_obj = kernel_cls(
         dtype=cutlass_dtype,
         chunk_size=chunk_size,
         top_k=top_k,
@@ -137,11 +156,6 @@ def _get_chunk_config(
 ):
     """Resolve chunk_size and ctas_per_group.
 
-    If chunk_size is provided, use it (clamped and aligned).
-    Otherwise use an SM-aware heuristic that targets
-    total_ctas ≈ num_sms by balancing parallelism against
-    per-CTA reduce overhead.
-
     Returns (chunk_size, ctas_per_group, vec_size).
     """
     max_chunk, vec_size = _compute_max_chunk(cutlass_dtype, num_copy_bits)
@@ -179,6 +193,41 @@ def _get_chunk_config(
     return chunk_size, ctas_per_group, vec_size
 
 
+def _get_cluster_chunk_config(
+    cutlass_dtype,
+    num_cols: int,
+    chunk_size: Optional[int] = None,
+    num_copy_bits: int = 256,
+    num_rows: int = 1,
+    num_sms: int = 148,
+):
+    """Resolve chunk_size and ctas_per_group, clamped to hw max cluster size.
+
+    Returns (chunk_size, ctas_per_group, vec_size) or (None, None, None)
+    if the problem cannot be handled by the cluster kernel.
+    """
+    chunk_size, ctas_per_group, vec_size = _get_chunk_config(
+        cutlass_dtype, num_cols, chunk_size, num_copy_bits, num_rows, num_sms
+    )
+
+    hw_max_cluster = _query_max_cluster_size()
+    if ctas_per_group > hw_max_cluster:
+        max_chunk, vec_size = _compute_max_chunk(cutlass_dtype, num_copy_bits)
+        chunk_size = math.ceil(num_cols / hw_max_cluster)
+        chunk_size = ((chunk_size + vec_size - 1) // vec_size) * vec_size
+        if chunk_size > max_chunk:
+            logger.warning(
+                f"Cluster top-k: num_cols={num_cols} requires "
+                f"chunk_size={chunk_size} which exceeds max shared "
+                f"memory capacity ({max_chunk}). Falling back to "
+                f"non-cluster variant."
+            )
+            return None, None, None
+        ctas_per_group = math.ceil(num_cols / chunk_size)
+
+    return chunk_size, ctas_per_group, vec_size
+
+
 # ---------------------------------------------------------------------------
 # Public entrypoint
 # ---------------------------------------------------------------------------
@@ -188,6 +237,10 @@ def top_k_cute_dsl(
     sorted: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """CuTe-DSL Top-K backend using single-pass multi-CTA radix top-k.
+
+    Uses the cluster-accelerated variant (DSMEM + cluster barriers) as
+    the primary path, falling back to the non-cluster variant (global
+    memory atomics) when the problem size exceeds cluster capacity.
 
     Requires Blackwell (SM100+) and nvidia-cutlass-dsl.
     Supports k <= 2048, dtypes float16/bfloat16/float32.
@@ -226,7 +279,7 @@ def top_k_cute_dsl(
     is_fp32 = (torch_dtype == torch.float32)
 
     if is_fp32 and num_cols < 65536:
-        use_single_pass_multi_cta = False
+        use_multi_cta = False
     else:
         chunk_size, ctas_per_group, _ = _get_chunk_config(
             cutlass_dtype, num_cols,
@@ -235,15 +288,49 @@ def top_k_cute_dsl(
         )
 
         if ctas_per_group >= 2:
-            use_single_pass_multi_cta = (num_rows * ctas_per_group <= num_sms)
+            use_multi_cta = (num_rows * ctas_per_group <= num_sms)
             if is_fp32:
-                use_single_pass_multi_cta = (
-                    use_single_pass_multi_cta and num_cols >= 65536
+                use_multi_cta = use_multi_cta and num_cols >= 65536
+        else:
+            use_multi_cta = (not is_fp32 and num_rows <= num_sms)
+
+    # --- Select kernel variant ---
+    if use_multi_cta:
+        # Try cluster first (primary path for DSv3.2)
+        cluster_config = _get_cluster_chunk_config(
+            cutlass_dtype, num_cols,
+            num_copy_bits=num_copy_bits, num_rows=num_rows,
+            num_sms=num_sms,
+        )
+        if cluster_config[0] is not None:
+            chunk_size, ctas_per_group, _ = cluster_config
+            # Check max supported cols for cluster
+            max_chunk, _ = _compute_max_chunk(cutlass_dtype, num_copy_bits)
+            hw_max_cluster = _query_max_cluster_size()
+            if num_cols <= max_chunk * hw_max_cluster:
+                kernel_variant = "cluster"
+                state_size = CLUSTER_STATE_SIZE
+            else:
+                kernel_variant = "distributed"
+                state_size = DISTRIBUTED_STATE_SIZE
+                chunk_size, ctas_per_group, _ = _get_chunk_config(
+                    cutlass_dtype, num_cols,
+                    num_copy_bits=num_copy_bits, num_rows=num_rows,
+                    num_sms=num_sms,
                 )
         else:
-            use_single_pass_multi_cta = (not is_fp32 and num_rows <= num_sms)
-
-    if not use_single_pass_multi_cta:
+            # Cluster can't handle this size, fall back to distributed
+            kernel_variant = "distributed"
+            state_size = DISTRIBUTED_STATE_SIZE
+            chunk_size, ctas_per_group, _ = _get_chunk_config(
+                cutlass_dtype, num_cols,
+                num_copy_bits=num_copy_bits, num_rows=num_rows,
+                num_sms=num_sms,
+            )
+    else:
+        # Single-CTA path (still uses the kernel class with ctas_per_group=1)
+        kernel_variant = "cluster"
+        state_size = CLUSTER_STATE_SIZE
         chunk_size, ctas_per_group, _ = _get_chunk_config(
             cutlass_dtype, num_cols,
             num_copy_bits=num_copy_bits, num_rows=num_rows,
@@ -251,23 +338,18 @@ def top_k_cute_dsl(
         )
 
     # --- Compile kernel ---
-    key = (cutlass_dtype, chunk_size, k, next_n, num_copy_bits,
-           ctas_per_group, num_sms, return_val)
-    compiled_kernel = _get_compiled_kernel(*key)
+    compiled_kernel = _get_compiled_kernel(
+        kernel_variant, cutlass_dtype, chunk_size, k, next_n,
+        num_copy_bits, ctas_per_group, num_sms, return_val,
+    )
 
     # --- Allocate buffers ---
     num_groups = min(num_sms // ctas_per_group, num_rows)
     if num_groups < 1:
         num_groups = 1
 
-    row_states = _get_cache_buf(
-        f"cute_dsl_topk_row_states_{device}",
-        num_sms * STATE_SIZE * 4,
-        device,
-        zero_init=True,
-    )
     row_states_2d = torch.zeros(
-        (num_sms, STATE_SIZE), dtype=torch.int32, device=device
+        (num_sms, state_size), dtype=torch.int32, device=device
     )
 
     seq_lens = torch.full((num_rows,), num_cols, dtype=torch.int32, device=device)
