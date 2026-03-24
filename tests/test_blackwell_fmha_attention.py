@@ -400,6 +400,46 @@ def test_attention_prefill_logits_transform(
     torch.testing.assert_close(o, o_ref, rtol=0.15, atol=0.15)
 
 
+@pytest.mark.parametrize("batch_size,qo_len,kv_len", [
+    (1, 128, 128),
+    (9, 256, 256),
+])
+@pytest.mark.parametrize("bias", [-5.0, -2.0, 1.0])
+def test_attention_prefill_sigmoid_bias(batch_size, qo_len, kv_len, bias):
+    """Regression test: SigmoidAttention bias must match torch.sigmoid semantics.
+
+    The bias parameter should produce σ(score * scale + bias), matching
+    the C++ FlashSigmoid which converts both scale and bias to log-base-2
+    via multiplication by log2(e).  A previous implementation only converted
+    scale, effectively attenuating the bias by ln(2) ≈ 0.693.
+    """
+    _skip_if_unsupported(qo_len, kv_len, causal=False)
+    num_kv_heads = 8
+    scale = 1.0
+
+    torch.manual_seed(42)
+    q = torch.randn(batch_size * qo_len, NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda")
+    k = torch.randn(batch_size * kv_len, num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda")
+    v = torch.randn(batch_size * kv_len, num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda")
+    qo_indptr = torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+    kv_indptr = torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * kv_len
+
+    wrapper = BatchPrefillCuteDSLWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+    )
+    wrapper.plan(
+        qo_indptr, kv_indptr, NUM_QO_HEADS, num_kv_heads, HEAD_DIM,
+        head_dim_vo=HEAD_DIM, causal=False, sm_scale=1.0,
+        q_data_type=DTYPE, kv_data_type=DTYPE,
+        variant=SigmoidAttention(scale=scale, bias=bias),
+    )
+    o = wrapper.run(q, k, v)
+
+    o_ref = attention_sigmoid_ref(batch_size, q, k, v, False, scale, bias)
+
+    torch.testing.assert_close(o, o_ref, rtol=0.15, atol=0.15)
+
+
 # ---------------------------------------------------------------------------
 #  5. Attention sink
 # ---------------------------------------------------------------------------

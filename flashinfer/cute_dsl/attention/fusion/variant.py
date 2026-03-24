@@ -406,7 +406,7 @@ class SigmoidAttention(AttentionVariant):
 
     def __init__(self, scale: float = 1.0, bias: float = 0.0):
         self.scale = scale * math.log2(math.exp(1.0))
-        self.bias = bias
+        self.bias = bias * math.log2(math.exp(1.0))
 
     @cute.jit
     def transform_logits(self, x, batch_idx, qo_idx, kv_idx,
