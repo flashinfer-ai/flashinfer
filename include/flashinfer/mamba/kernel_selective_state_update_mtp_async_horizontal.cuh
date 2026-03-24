@@ -190,7 +190,9 @@ __device__ __forceinline__ void update_state_async_horizontal(SramT& sram, int l
   // Output pointers (for epilogue)
   auto* __restrict__ output = reinterpret_cast<input_t*>(params.output);
   auto const* __restrict__ z_ptr = reinterpret_cast<input_t const*>(params.z);
-  constexpr auto outputLoadSize = getVectorLoadSizeForFullUtilization<input_t, DIM_PER_CTA>();
+  // Guard: outputLoadSize is only meaningful when DIM_PER_CTA >= warpSize
+  constexpr auto outputLoadSize =
+      DIM_PER_CTA >= warpSize ? getVectorLoadSizeForFullUtilization<input_t, DIM_PER_CTA>() : 1;
   using load_output_t = PackedAligned<input_t, outputLoadSize>;
 
   auto const state_ptr_offset = state_batch * params.state_stride_batch + head * DIM * DSTATE;
@@ -323,33 +325,53 @@ __device__ __forceinline__ void update_state_async_horizontal(SramT& sram, int l
   // ── Epilogue: sync all warps, z-gate + vectorized store ───
   __syncthreads();
 
-  constexpr int elemsPerThreadEpilogue = DIM_PER_CTA / warpSize;
+  if constexpr (DIM_PER_CTA >= warpSize) {
+    // Fast path: each lane handles >= 1 element, use vectorized loads/stores
+    constexpr int elemsPerThreadEpilogue = DIM_PER_CTA / warpSize;
 
-  for (int step = warp; step < NTOKENS; step += NUM_WARPS) {
-    int const out_offset =
-        batch * params.out_stride_batch + step * params.out_stride_mtp + head * DIM + dim_offset;
-    int const z_offset =
-        batch * params.z_stride_batch + step * params.z_stride_mtp + head * DIM + dim_offset;
+    for (int step = warp; step < NTOKENS; step += NUM_WARPS) {
+      int const out_offset =
+          batch * params.out_stride_batch + step * params.out_stride_mtp + head * DIM + dim_offset;
+      int const z_offset =
+          batch * params.z_stride_batch + step * params.z_stride_mtp + head * DIM + dim_offset;
 
-    for (int ii = 0; ii < elemsPerThreadEpilogue; ii += load_output_t::count) {
-      int const d = lane * load_output_t::count +
-                    (ii / load_output_t::count) * warpSize * load_output_t::count;
-      load_output_t packed_out;
-      load_output_t packed_z;
-      if (z_ptr) {
-        packed_z = *reinterpret_cast<load_output_t const*>(&z_ptr[z_offset + d]);
-      }
-#pragma unroll
-      for (int k = 0; k < load_output_t::count; k++) {
-        float out_value = sram.out[step][d + k];
+      for (int ii = 0; ii < elemsPerThreadEpilogue; ii += load_output_t::count) {
+        int const d = lane * load_output_t::count +
+                      (ii / load_output_t::count) * warpSize * load_output_t::count;
+        load_output_t packed_out;
+        load_output_t packed_z;
         if (z_ptr) {
-          float z_value = toFloat(packed_z.val[k]);
+          packed_z = *reinterpret_cast<load_output_t const*>(&z_ptr[z_offset + d]);
+        }
+#pragma unroll
+        for (int k = 0; k < load_output_t::count; k++) {
+          float out_value = sram.out[step][d + k];
+          if (z_ptr) {
+            float z_value = toFloat(packed_z.val[k]);
+            float sig_z = __fdividef(1.f, (1.f + __expf(0.f - z_value)));
+            out_value *= z_value * sig_z;
+          }
+          convertAndStore(&packed_out.val[k], out_value);
+        }
+        *reinterpret_cast<load_output_t*>(&output[out_offset + d]) = packed_out;
+      }
+    }
+  } else {
+    // Narrow path: DIM_PER_CTA < warpSize, only first DIM_PER_CTA lanes participate
+    for (int step = warp; step < NTOKENS; step += NUM_WARPS) {
+      if (lane < DIM_PER_CTA) {
+        int const out_offset = batch * params.out_stride_batch + step * params.out_stride_mtp +
+                               head * DIM + dim_offset;
+        float out_value = sram.out[step][lane];
+        if (z_ptr) {
+          int const z_offset =
+              batch * params.z_stride_batch + step * params.z_stride_mtp + head * DIM + dim_offset;
+          float z_value = toFloat(z_ptr[z_offset + lane]);
           float sig_z = __fdividef(1.f, (1.f + __expf(0.f - z_value)));
           out_value *= z_value * sig_z;
         }
-        convertAndStore(&packed_out.val[k], out_value);
+        convertAndStore(&output[out_offset + lane], out_value);
       }
-      *reinterpret_cast<load_output_t*>(&output[out_offset + d]) = packed_out;
     }
   }
 }

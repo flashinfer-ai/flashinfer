@@ -3,6 +3,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <algorithm>
 #include <iostream>
 #include <type_traits>
 
@@ -89,18 +90,17 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
     int const total_tiles = params.batch * params.nheads;
     int const num_sms = GetCudaMultiProcessorCount();
 
-    // Pick CTAS_PER_HEAD so we have enough CTAs to fill the GPU.
-    // DIM_PER_CTA must be >= warpSize (epilogue needs at least 1 elem/thread)
-    // and >= ROWS_PER_PASS (compute needs at least 1 pass).
-    constexpr int kMinDimPerCta = kRowsPerPass > warpSize ? kRowsPerPass : warpSize;
-    int ctas_per_head = 1;
-    if (total_tiles * 2 < num_sms && DIM / 2 >= kMinDimPerCta) ctas_per_head = 2;
-    if (total_tiles * 4 < num_sms && DIM / 4 >= kMinDimPerCta) ctas_per_head = 4;
+    // Pick CTAS_PER_HEAD to saturate the GPU: ratio = target_ctas / total_tiles,
+    // clamped to [1, max_ctas]. DIM_PER_CTA must be >= ROWS_PER_PASS.
+    // With 128 threads and 48 regs/thread, registers limit to 10 blocks/SM.
+    constexpr int kBlocksPerSM = 10;
+    constexpr int kMaxCtas = DIM / kRowsPerPass;
+    int const target_ctas = num_sms * kBlocksPerSM;
+    int const ctas_per_head = std::clamp(target_ctas / max(total_tiles, 1), 1, kMaxCtas);
 
     auto launch = [&]<int CTAS_PER_HEAD>() {
       constexpr int DIM_PER_CTA = DIM / CTAS_PER_HEAD;
       static_assert(DIM % CTAS_PER_HEAD == 0);
-      static_assert(DIM_PER_CTA >= warpSize, "DIM_PER_CTA must be >= warpSize for epilogue");
       static_assert(DIM_PER_CTA % kRowsPerPass == 0);
 
       dispatchRatio(
@@ -122,16 +122,16 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
           });
     };
 
-    // Only instantiate CTAS_PER_HEAD values where DIM_PER_CTA >= kMinDimPerCta.
+    // Dispatch to the largest instantiated CTAS_PER_HEAD <= ctas_per_head.
     // Use if constexpr to avoid compiling invalid template instantiations.
-    if constexpr (DIM / 4 >= kMinDimPerCta) {
-      if (ctas_per_head == 4) {
+    if constexpr (DIM / 4 >= kRowsPerPass) {
+      if (ctas_per_head >= 4) {
         launch.template operator()<4>();
         return;
       }
     }
-    if constexpr (DIM / 2 >= kMinDimPerCta) {
-      if (ctas_per_head == 2) {
+    if constexpr (DIM / 2 >= kRowsPerPass) {
+      if (ctas_per_head >= 2) {
         launch.template operator()<2>();
         return;
       }
