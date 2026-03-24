@@ -46,4 +46,3 @@
           - "csrc/group_gemm_*"
           - "csrc/bmm_*"
           - "tests/gemm/**"
-
