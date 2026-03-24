@@ -54,6 +54,7 @@ from .utils import (
     MaskMode,
     PosEncodingMode,
     TensorLayout,
+    _check_block_tables_shape,
     _check_cached_qkv_data_type,
     _check_kv_layout,
     _check_pos_encoding_mode,
@@ -1437,6 +1438,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     key_block_scales,
                     value_block_scales,
                     skip_softmax_threshold_scale_factor,
+                    True,  # uses_shared_paged_kv_idx
                 ]
 
             self._cached_module.paged_run(*run_args)
@@ -2002,6 +2004,7 @@ class TrtllmGenDecodeModule:
         key_block_scales: Optional[torch.Tensor] = None,
         value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        uses_shared_paged_kv_idx: bool = True,
     ) -> torch.Tensor:
         if out is None:
             out = torch.empty_like(query)
@@ -2046,6 +2049,7 @@ class TrtllmGenDecodeModule:
             key_block_scales,
             value_block_scales,
             skip_softmax_threshold_scale_factor,
+            uses_shared_paged_kv_idx,
         )
         return out
 
@@ -2110,6 +2114,7 @@ def get_trtllm_gen_decode_module(*args):
         key_block_scales: Optional[torch.Tensor] = None,
         value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        uses_shared_paged_kv_idx: bool = True,
     ) -> None:
         assert maybe_lse is None
         assert paged_kv_cache is not None
@@ -2139,6 +2144,7 @@ def get_trtllm_gen_decode_module(*args):
             key_block_scales=key_block_scales,
             value_block_scales=value_block_scales,
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+            uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
         )
 
     @register_fake_op(f"flashinfer::{uri}_paged_run")
@@ -2181,6 +2187,7 @@ def get_trtllm_gen_decode_module(*args):
         key_block_scales: Optional[torch.Tensor] = None,
         value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        uses_shared_paged_kv_idx: bool = True,
     ) -> None:
         pass
 
@@ -2223,6 +2230,7 @@ def trtllm_batch_decode_with_kv_cache(
     ] = None,
     skip_softmax_threshold_scale_factor: Optional[float] = None,
     kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    uses_shared_paged_kv_idx: bool = True,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
     Parameters
@@ -2241,7 +2249,10 @@ def trtllm_batch_decode_with_kv_cache(
         workspace
 
     block_tables : torch.Tensor
-        page_table of kv cache, [batch_size, num_pages]
+        Page table of kv cache.
+        When ``uses_shared_paged_kv_idx`` is True (default): shape ``[batch_size, max_num_pages_per_seq]``.
+        When ``uses_shared_paged_kv_idx`` is False: shape ``[batch_size, 2, max_num_pages_per_seq]``
+        where dim 1 distinguishes K (0) and V (1) page indices.
 
     seq_lens : torch.Tensor
         A uint32 1D tensor indicating the kv sequence length of each prompt. shape: ``[batch_size]``
@@ -2313,6 +2324,11 @@ def trtllm_batch_decode_with_kv_cache(
         Setting the threshold to a higher value generally increases kernel performance at the cost of accuracy degradation.
         The actual threshold value equals the provided threshold_scale_factor divided by the context length.
 
+    uses_shared_paged_kv_idx : bool = True
+        Whether the K and V page indices are shared as a unified index.
+        True (default) uses vLLM/FlashInfer layout with a 2D page table.
+        False uses TRT-LLM layout with a 3D page table ``[batch_size, 2, max_num_pages_per_seq]``.
+
     Returns
     -------
     out : Union[torch.Tensor, FP4Tensor]
@@ -2373,6 +2389,10 @@ def trtllm_batch_decode_with_kv_cache(
             raise ValueError("xqa backend does not support o_sf_scale or o_sf_vec_size")
         if max_q_len is not None or cum_seq_lens_q is not None:
             raise ValueError("xqa backend does not support cum_seq_lens_q")
+        if not uses_shared_paged_kv_idx:
+            raise ValueError(
+                "xqa backend does not support uses_shared_paged_kv_idx=False"
+            )
 
         # Handle out and out_dtype
         if out_dtype is None:
@@ -2506,6 +2526,8 @@ def trtllm_batch_decode_with_kv_cache(
             assert max_q_len is not None
             batch_size = cum_seq_lens_q.size(0) - 1
 
+        _check_block_tables_shape(block_tables, uses_shared_paged_kv_idx)
+
         run_func(
             out,
             out_scale_factor,
@@ -2533,6 +2555,7 @@ def trtllm_batch_decode_with_kv_cache(
             k_block_scales,
             v_block_scales,
             skip_softmax_threshold_scale_factor,
+            uses_shared_paged_kv_idx,
         )
 
         return (
@@ -2692,8 +2715,6 @@ def xqa_batch_decode_with_kv_cache(
         query_new,
         k_cache,
         v_cache,
-        k_cache_sf,
-        v_cache_sf,
         block_tables,
         seq_lens_new,
         out_4d,
@@ -2701,6 +2722,8 @@ def xqa_batch_decode_with_kv_cache(
         semaphore,
         num_kv_heads,
         page_size,
+        k_sf_cache=k_cache_sf,
+        v_sf_cache=v_cache_sf,
         sinks=sinks_new,
         q_scale=q_scale_value,
         kv_scale=kv_scale_value,

@@ -1,4 +1,5 @@
 import math
+from typing import Union
 
 import pytest
 import torch
@@ -218,6 +219,55 @@ def create_page_table(batch_size: int, seq_lens: torch.Tensor, page_size: int):
         ]
         page_id += num_pages_needed
     return page_tables, all_page_ids, page_per_seq
+
+
+def prepare_paged_kv_for_kernel(
+    kv_cache: Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]],
+    page_table: torch.Tensor,
+    uses_shared_paged_kv_idx: bool,
+    kv_block_scales: Union[tuple[torch.Tensor, torch.Tensor], None] = None,
+) -> tuple[
+    Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]],
+    torch.Tensor,
+    Union[tuple[torch.Tensor, torch.Tensor], None],
+]:
+    """Convert shared-page KV cache layout to separate-page layout for TRT-LLM.
+
+    When uses_shared_paged_kv_idx is True (FlashInfer/vLLM style), returns the
+    original tensors unchanged.
+
+    When False (TRT-LLM style), interleaves K and V pages so original page p
+    becomes K at index 2*p and V at 2*p+1, and builds a
+    [batch_size, 2, maxPages] page table where dim 1 distinguishes K (0) and V (1).
+    Returns the reshaped cache as a (cache, cache) tuple so both K and V share
+    the same base pointer.  Block scales, if provided, are interleaved the same
+    way since the kernel uses the same page indices to access them.
+
+    Returns:
+        (kv_cache_arg, page_table, kv_block_scales) ready to pass to the kernel.
+    """
+    if uses_shared_paged_kv_idx:
+        return kv_cache, page_table, kv_block_scales
+
+    def _interleave_kv(k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """Stack [num_pages,...] K and V along dim-1 then flatten to [2*num_pages,...]."""
+        return torch.stack([k, v], dim=1).reshape(k.shape[0] * 2, *k.shape[1:])
+
+    if isinstance(kv_cache, tuple):
+        k_cache, v_cache = kv_cache
+        interleaved = _interleave_kv(k_cache, v_cache)
+    else:
+        num_pages = kv_cache.shape[0]
+        interleaved = kv_cache.reshape(num_pages * 2, *kv_cache.shape[2:])
+
+    trtllm_page_table = torch.stack([2 * page_table, 2 * page_table + 1], dim=1)
+
+    if kv_block_scales is not None:
+        k_sf, v_sf = kv_block_scales
+        interleaved_sf = _interleave_kv(k_sf, v_sf)
+        kv_block_scales = (interleaved_sf, interleaved_sf)
+
+    return (interleaved, interleaved), trtllm_page_table, kv_block_scales
 
 
 def flatten_paged_kv(
@@ -444,6 +494,7 @@ def _test_trtllm_batch_prefill(
     head_dim: int,
     non_contiguous_query: bool = False,
     skips_softmax: bool = False,
+    uses_shared_paged_kv_idx: bool = True,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] != 10:
@@ -488,6 +539,12 @@ def _test_trtllm_batch_prefill(
     )
     kv_indptr = generate_cumsum_lens(page_per_seq)
     kv_last_page_len = get_last_page_len(seq_lens, page_size)
+
+    kv_cache_kernel, page_table_kernel, kv_block_scales_kernel = (
+        prepare_paged_kv_for_kernel(
+            kv_cache, page_table, uses_shared_paged_kv_idx, kv_block_scales
+        )
+    )
 
     workspace_buffer, workspace_buffer_ref = create_workspace_buffers(GPU_DEVICE)
 
@@ -576,9 +633,9 @@ def _test_trtllm_batch_prefill(
 
     output = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
         q_input,
-        kv_cache,
+        kv_cache_kernel,
         workspace_buffer,
-        page_table,
+        page_table_kernel,
         seq_lens.to(GPU_DEVICE),
         torch.max(q_lens).item(),
         torch.max(seq_lens).item(),
@@ -595,8 +652,9 @@ def _test_trtllm_batch_prefill(
         kv_layout=kv_layout,
         enable_pdl=enable_pdl,
         sinks=(sink if enable_sink else None),
-        kv_block_scales=kv_block_scales,
+        kv_block_scales=kv_block_scales_kernel,
         skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+        uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
     )
     # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
     # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
@@ -635,8 +693,8 @@ def _test_trtllm_batch_prefill(
     )
 
     if (
-        o_dtype != "nvfp4" and kv_dtype != "nvfp4"
-    ):  # wrapper api does not support fp4 output/kv yet.
+        o_dtype != "nvfp4" and kv_dtype != "nvfp4" and uses_shared_paged_kv_idx
+    ):  # wrapper api does not support fp4 output/kv or separate KV page indices yet.
         # test wrapper with trtllm-gen backend
         wrapper_trtllm_gen = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
             workspace_buffer, kv_layout, backend="trtllm-gen"
@@ -701,6 +759,7 @@ def _test_trtllm_batch_prefill(
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("non_contiguous_query", [False, True])
 @pytest.mark.parametrize("skips_softmax", [False, True])
+@pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
 def test_trtllm_batch_prefill(
     kv_layout: str,
     batch_size: int,
@@ -718,6 +777,7 @@ def test_trtllm_batch_prefill(
     head_dim: int,
     non_contiguous_query: bool,
     skips_softmax: bool,
+    uses_shared_paged_kv_idx: bool,
 ):
     _test_trtllm_batch_prefill(
         kv_layout,
@@ -737,6 +797,7 @@ def test_trtllm_batch_prefill(
         head_dim,
         non_contiguous_query=non_contiguous_query,
         skips_softmax=skips_softmax,
+        uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
     )
 
 
@@ -760,6 +821,7 @@ def test_trtllm_batch_prefill(
 @pytest.mark.parametrize("max_kv_len", [8192])
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("skips_softmax", [False, True])
+@pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
 def test_trtllm_batch_prefill_bs1(
     kv_layout: str,
     batch_size: int,
@@ -776,6 +838,7 @@ def test_trtllm_batch_prefill_bs1(
     max_kv_len: int,
     head_dim: int,
     skips_softmax: bool,
+    uses_shared_paged_kv_idx: bool,
 ):
     _test_trtllm_batch_prefill(
         kv_layout,
@@ -794,6 +857,7 @@ def test_trtllm_batch_prefill_bs1(
         False,
         head_dim,
         skips_softmax=skips_softmax,
+        uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
     )
 
 
@@ -817,6 +881,7 @@ def _test_trtllm_batch_decode(
     max_q_len: int | None = None,
     non_contiguous_query: bool = False,
     skips_softmax: bool = False,
+    uses_shared_paged_kv_idx: bool = True,
 ) -> None:
     """
     Common function for testing trtllm-gen decode.
@@ -845,6 +910,10 @@ def _test_trtllm_batch_decode(
 
     if backend == "xqa" and q_dtype == "fp8":
         pytest.skip("xqa backend only supports fp16 and bf16 query")
+
+    # XQA backend doesn't support non-shared page indices
+    if backend == "xqa" and not uses_shared_paged_kv_idx:
+        pytest.skip("xqa backend does not support non-shared page indices")
 
     if o_dtype == "nvfp4" and (
         q_len_per_req is not None
@@ -897,6 +966,12 @@ def _test_trtllm_batch_decode(
     )
     kv_indptr = generate_cumsum_lens(page_per_seq)
     kv_last_page_len = get_last_page_len(seq_lens, page_size)
+
+    kv_cache_arg, page_table_kernel, kv_block_scales_kernel = (
+        prepare_paged_kv_for_kernel(
+            kv_cache, page_table, uses_shared_paged_kv_idx, kv_block_scales
+        )
+    )
 
     workspace_buffer, workspace_buffer_ref = create_workspace_buffers(GPU_DEVICE)
 
@@ -1009,9 +1084,9 @@ def _test_trtllm_batch_decode(
 
     output = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
         q_input,
-        kv_cache,
+        kv_cache_arg,
         workspace_buffer,
-        page_table,
+        page_table_kernel,
         seq_lens.to(GPU_DEVICE),
         torch.max(seq_lens).item(),
         bmm1_scale,
@@ -1031,7 +1106,8 @@ def _test_trtllm_batch_decode(
         max_q_len=max_q_len if max_q_len is not None else None,
         cum_seq_lens_q=q_indptr if max_q_len is not None else None,
         skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
-        kv_block_scales=kv_block_scales,
+        kv_block_scales=kv_block_scales_kernel,
+        uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
     )
     if backend == "trtllm-gen":
         # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
@@ -1085,7 +1161,8 @@ def _test_trtllm_batch_decode(
         and backend == "trtllm-gen"
         and q_len_per_req
         is not None  # only test for the case all requests have the same q_len
-    ):  # wrapper api does not support fp4 output/kv yet.
+        and uses_shared_paged_kv_idx
+    ):  # wrapper api does not support fp4 output/kv or separate KV page indices yet.
         # test wrapper with trtllm-gen backend
         wrapper_trtllm_gen = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
             workspace_buffer, kv_layout, backend="trtllm-gen"
@@ -1184,6 +1261,7 @@ def _test_trtllm_batch_decode(
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("non_contiguous_query", [False, True])
 @pytest.mark.parametrize("skips_softmax", [False, True])
+@pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
 def test_trtllm_batch_decode(
     backend: str,
     kv_layout: str,
@@ -1202,6 +1280,7 @@ def test_trtllm_batch_decode(
     head_dim: int,
     non_contiguous_query: bool,
     skips_softmax: bool,
+    uses_shared_paged_kv_idx: bool,
 ):
     # xqa backend does not support non-contiguous query yet
     if backend == "xqa" and non_contiguous_query:
@@ -1227,6 +1306,7 @@ def test_trtllm_batch_decode(
         kv_dtype in ("fp8", "nvfp4"),
         non_contiguous_query=non_contiguous_query,
         skips_softmax=skips_softmax,
+        uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
     )
 
 
@@ -1251,6 +1331,7 @@ def test_trtllm_batch_decode(
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("device_scale", [True, False])
 @pytest.mark.parametrize("skips_softmax", [False, True])
+@pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
 def test_trtllm_batch_decode_bs1(
     kv_layout: str,
     batch_size: int,
@@ -1268,6 +1349,7 @@ def test_trtllm_batch_decode_bs1(
     head_dim: int,
     device_scale: bool,
     skips_softmax: bool,
+    uses_shared_paged_kv_idx: bool,
 ) -> None:
     # Small number of test cases for batch size 1
     _test_trtllm_batch_decode(
@@ -1288,6 +1370,7 @@ def test_trtllm_batch_decode_bs1(
         head_dim,
         device_scale,
         skips_softmax=skips_softmax,
+        uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
     )
 
 
@@ -1323,6 +1406,7 @@ def test_trtllm_batch_decode_bs1(
 @pytest.mark.parametrize("head_dim", [256])
 @pytest.mark.parametrize("device_scale", [True, False])
 @pytest.mark.parametrize("skips_softmax", [False, True])
+@pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
 def test_trtllm_batch_decode_head_dim_256(
     kv_layout: str,
     batch_size: int,
@@ -1340,6 +1424,7 @@ def test_trtllm_batch_decode_head_dim_256(
     head_dim: int,
     device_scale: bool,
     skips_softmax: bool,
+    uses_shared_paged_kv_idx: bool,
 ):
     # Small number of test cases for head_dim = 256
     _test_trtllm_batch_decode(
@@ -1360,6 +1445,7 @@ def test_trtllm_batch_decode_head_dim_256(
         head_dim,
         device_scale,
         skips_softmax=skips_softmax,
+        uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
     )
 
 
@@ -1390,6 +1476,7 @@ def test_trtllm_batch_decode_head_dim_256(
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("device_scale", [True, False])
 @pytest.mark.parametrize("skips_softmax", [False])
+@pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
 def test_trtllm_batch_decode_long_sequence_length(
     kv_layout: str,
     batch_size: int,
@@ -1407,6 +1494,7 @@ def test_trtllm_batch_decode_long_sequence_length(
     head_dim: int,
     device_scale: bool,
     skips_softmax: bool,
+    uses_shared_paged_kv_idx: bool,
 ) -> None:
     # Small number of test cases for long sequence length
     _test_trtllm_batch_decode(
@@ -1427,6 +1515,7 @@ def test_trtllm_batch_decode_long_sequence_length(
         head_dim,
         device_scale,
         skips_softmax=skips_softmax,
+        uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
     )
 
 
@@ -1674,6 +1763,7 @@ def make_query_non_contiguous(
 @pytest.mark.parametrize("max_in_kv_len", [110])
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("skips_softmax", [False, True])
+@pytest.mark.parametrize("uses_shared_paged_kv_idx", [False, True])
 def test_trtllm_batch_decode_spec(
     backend: str,
     kv_layout: str,
@@ -1691,6 +1781,7 @@ def test_trtllm_batch_decode_spec(
     max_in_kv_len: int,
     head_dim: int,
     skips_softmax: bool,
+    uses_shared_paged_kv_idx: bool,
 ) -> None:
     _test_trtllm_batch_decode(
         backend,
@@ -1710,4 +1801,5 @@ def test_trtllm_batch_decode_spec(
         head_dim,
         max_q_len=max_q_len,
         skips_softmax=skips_softmax,
+        uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
     )
