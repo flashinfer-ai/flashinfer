@@ -1045,7 +1045,11 @@ def gdn_decode_bf16state_mtp_kernel(
         cute.make_layout((MTP_ILP_ROWS,), stride=(1,)), cutlass.BFloat16
     )
 
-    # Only process valid batch entries
+    # Redirect padding entries (cache_idx < 0) to null buffer (slot 0)
+    if cache_idx < 0:
+        cache_idx = cutlass.Int32(0)
+
+    # Process all batch entries (padding slots redirected to slot 0 above)
     if cache_idx >= 0:
         k_start = lane_in_group * vec_size
 
@@ -2023,7 +2027,7 @@ def gated_delta_rule(
     Returns:
         output: [B, 1, HV, V] bf16
     """
-    global _compiled_kernels, _compiled_kernels_ilp
+    global _compiled_kernels_ilp
 
     assert q is not None and k is not None and v is not None
     assert b is not None and initial_state_source is not None
@@ -2037,6 +2041,25 @@ def gated_delta_rule(
 
     if scale is None:
         scale = 1.0 / math.sqrt(K)
+
+    # Small batch: route through MTP kernel (T=1 path) with identity indices.
+    # The cooprow kernel has known correctness issues at small batch sizes (e.g. B=2).
+    # The MTP kernel's T=1 path uses the same ILP-style computation and is well-tested.
+    if B < ILP_BATCH_THRESHOLD:
+        return gated_delta_rule_mtp(
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            softplus_beta=softplus_beta,
+            softplus_threshold=softplus_threshold,
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            initial_state_source=initial_state_source,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            scale=scale,
+        )
 
     output = torch.empty(B, T, HV, V, device=q.device, dtype=q.dtype)
 
@@ -2055,44 +2078,18 @@ def gated_delta_rule(
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-    use_ilp = B >= ILP_BATCH_THRESHOLD
-
-    if use_ilp:
-        tile_v = _select_tile_v_for_batch(B, HV, V)
-        cache_key = ("ilp", B, H, HV, K, V, tile_v)
-        if cache_key not in _compiled_kernels_ilp:
-            # Use maxrregcount=64 for smaller tile_v to improve occupancy
-            # when grid size is small (fewer waves)
-            if tile_v < 128:
-                compile_opts = "--enable-tvm-ffi --generate-line-info --opt-level 3 --ptxas-options=-maxrregcount=64"
-            else:
-                compile_opts = "--enable-tvm-ffi --generate-line-info --opt-level 3"
-            _compiled_kernels_ilp[cache_key] = cute.compile(
-                run_gdn_decode_bf16state_ilp,
-                h_,
-                A_log_,
-                a_,
-                dt_bias_,
-                q_,
-                k_,
-                v_,
-                b_,
-                o_,
-                softplus_beta,
-                softplus_threshold,
-                scale,
-                HV,
-                B,
-                H,
-                K,
-                V,
-                use_qk_l2norm_in_kernel,
-                tile_v,
-                stream,
-                options=compile_opts,
-            )
-
-        _compiled_kernels_ilp[cache_key](
+    # B >= ILP_BATCH_THRESHOLD (small B handled by MTP path above)
+    tile_v = _select_tile_v_for_batch(B, HV, V)
+    cache_key = ("ilp", B, H, HV, K, V, tile_v)
+    if cache_key not in _compiled_kernels_ilp:
+        # Use maxrregcount=64 for smaller tile_v to improve occupancy
+        # when grid size is small (fewer waves)
+        if tile_v < 128:
+            compile_opts = "--enable-tvm-ffi --generate-line-info --opt-level 3 --ptxas-options=-maxrregcount=64"
+        else:
+            compile_opts = "--enable-tvm-ffi --generate-line-info --opt-level 3"
+        _compiled_kernels_ilp[cache_key] = cute.compile(
+            run_gdn_decode_bf16state_ilp,
             h_,
             A_log_,
             a_,
@@ -2102,46 +2099,32 @@ def gated_delta_rule(
             v_,
             b_,
             o_,
+            softplus_beta,
+            softplus_threshold,
+            scale,
+            HV,
+            B,
+            H,
+            K,
+            V,
+            use_qk_l2norm_in_kernel,
+            tile_v,
             stream,
+            options=compile_opts,
         )
-    else:
-        cache_key = ("cooprow", B, H, HV, K, V)  # type: ignore[assignment]
-        if cache_key not in _compiled_kernels:
-            _compiled_kernels[cache_key] = cute.compile(
-                run_gdn_decode_bf16state_cooprow,
-                h_,
-                A_log_,
-                a_,
-                dt_bias_,
-                q_,
-                k_,
-                v_,
-                b_,
-                o_,
-                softplus_beta,
-                softplus_threshold,
-                scale,
-                HV,
-                H,
-                K,
-                V,
-                use_qk_l2norm_in_kernel,
-                stream,
-                options="--enable-tvm-ffi --generate-line-info",
-            )
 
-        _compiled_kernels[cache_key](
-            h_,
-            A_log_,
-            a_,
-            dt_bias_,
-            q_,
-            k_,
-            v_,
-            b_,
-            o_,
-            stream,
-        )
+    _compiled_kernels_ilp[cache_key](
+        h_,
+        A_log_,
+        a_,
+        dt_bias_,
+        q_,
+        k_,
+        v_,
+        b_,
+        o_,
+        stream,
+    )
 
     return output
 
