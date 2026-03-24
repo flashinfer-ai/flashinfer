@@ -27,8 +27,7 @@ from .utils import (
     get_device_sm_count,
     _get_cache_buf,
     is_sm90a_supported,
-    is_sm100a_supported,
-    is_sm103a_supported,
+    is_sm100f_supported,
     is_sm110a_supported,
     backend_requirement,
     supported_compute_capability,
@@ -278,10 +277,8 @@ def chunk_gated_delta_rule(
             output_state,
         )
 
-    elif (
-        is_sm100a_supported(torch.device("cuda"))
-        or is_sm103a_supported(torch.device("cuda"))
-        or is_sm110a_supported(torch.device("cuda"))
+    elif is_sm100f_supported(torch.device("cuda")) or is_sm110a_supported(
+        torch.device("cuda")
     ):
         if chunk_gated_delta_rule_blackwell is None:
             raise NotImplementedError("Blackwell GDN prefill backend is unavailable.")
