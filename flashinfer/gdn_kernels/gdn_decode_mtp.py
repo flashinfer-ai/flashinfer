@@ -167,6 +167,30 @@ def get_use_smem_v(
     return use_smem_v
 
 
+# ==============================================================================
+# FMA WRAPPER FUNCTIONS (SM90 Compatibility)
+# ==============================================================================
+# cute.arch.fma_packed_f32x2() generates F32x2 intrinsics NOT supported on SM90.
+# These wrappers use scalar FMA operations that work on all SM90+ architectures.
+# On SM100+ (Blackwell), use_packed_fma=True selects the native packed path.
+
+
+@cute.jit
+def fma_pair_mul(a1, a2, b1, b2):
+    """Multiply two pairs: (a1*b1, a2*b2). SM90-compatible."""
+    result1 = a1 * b1
+    result2 = a2 * b2
+    return result1, result2
+
+
+@cute.jit
+def fma_pair(a1, a2, b1, b2, c1, c2):
+    """FMA two pairs: (a1*b1+c1, a2*b2+c2). SM90-compatible."""
+    result1 = a1 * b1 + c1
+    result2 = a2 * b2 + c2
+    return result1, result2
+
+
 # Optimized MTP kernel with ILP rows and SMEM v caching - used for BS >= 8
 @cute.kernel
 def gdn_verify_kernel_mtp(
@@ -205,6 +229,7 @@ def gdn_verify_kernel_mtp(
     use_smem_v: cutlass.Constexpr[
         bool
     ],  # True: preload v into SMEM (large BS), False: GMEM reads
+    use_packed_fma: cutlass.Constexpr[bool],
 ):
     """
     Parallel MTP kernel - each block handles one [TILE_V, TILE_K] tile.
@@ -856,26 +881,60 @@ def gdn_verify_kernel_mtp(
                             r_h[2, i + 1] = r_h[2, i + 1] * r_g
                             r_h[3, i] = r_h[3, i] * r_g
                             r_h[3, i + 1] = r_h[3, i + 1] * r_g
-                            sum_hk_a, sum_hk_a2 = cute.arch.fma_packed_f32x2(
-                                src_a=(r_h[0, i], r_h[0, i + 1]),
-                                src_b=(r_k[i], r_k[i + 1]),
-                                src_c=(sum_hk_a, sum_hk_a2),
-                            )
-                            sum_hk_b, sum_hk_b2 = cute.arch.fma_packed_f32x2(
-                                src_a=(r_h[1, i], r_h[1, i + 1]),
-                                src_b=(r_k[i], r_k[i + 1]),
-                                src_c=(sum_hk_b, sum_hk_b2),
-                            )
-                            sum_hk_c, sum_hk_c2 = cute.arch.fma_packed_f32x2(
-                                src_a=(r_h[2, i], r_h[2, i + 1]),
-                                src_b=(r_k[i], r_k[i + 1]),
-                                src_c=(sum_hk_c, sum_hk_c2),
-                            )
-                            sum_hk_d, sum_hk_d2 = cute.arch.fma_packed_f32x2(
-                                src_a=(r_h[3, i], r_h[3, i + 1]),
-                                src_b=(r_k[i], r_k[i + 1]),
-                                src_c=(sum_hk_d, sum_hk_d2),
-                            )
+                            if cutlass.const_expr(use_packed_fma):
+                                sum_hk_a, sum_hk_a2 = cute.arch.fma_packed_f32x2(
+                                    src_a=(r_h[0, i], r_h[0, i + 1]),
+                                    src_b=(r_k[i], r_k[i + 1]),
+                                    src_c=(sum_hk_a, sum_hk_a2),
+                                )
+                                sum_hk_b, sum_hk_b2 = cute.arch.fma_packed_f32x2(
+                                    src_a=(r_h[1, i], r_h[1, i + 1]),
+                                    src_b=(r_k[i], r_k[i + 1]),
+                                    src_c=(sum_hk_b, sum_hk_b2),
+                                )
+                                sum_hk_c, sum_hk_c2 = cute.arch.fma_packed_f32x2(
+                                    src_a=(r_h[2, i], r_h[2, i + 1]),
+                                    src_b=(r_k[i], r_k[i + 1]),
+                                    src_c=(sum_hk_c, sum_hk_c2),
+                                )
+                                sum_hk_d, sum_hk_d2 = cute.arch.fma_packed_f32x2(
+                                    src_a=(r_h[3, i], r_h[3, i + 1]),
+                                    src_b=(r_k[i], r_k[i + 1]),
+                                    src_c=(sum_hk_d, sum_hk_d2),
+                                )
+                            else:
+                                sum_hk_a, sum_hk_a2 = fma_pair(
+                                    r_h[0, i],
+                                    r_h[0, i + 1],
+                                    r_k[i],
+                                    r_k[i + 1],
+                                    sum_hk_a,
+                                    sum_hk_a2,
+                                )
+                                sum_hk_b, sum_hk_b2 = fma_pair(
+                                    r_h[1, i],
+                                    r_h[1, i + 1],
+                                    r_k[i],
+                                    r_k[i + 1],
+                                    sum_hk_b,
+                                    sum_hk_b2,
+                                )
+                                sum_hk_c, sum_hk_c2 = fma_pair(
+                                    r_h[2, i],
+                                    r_h[2, i + 1],
+                                    r_k[i],
+                                    r_k[i + 1],
+                                    sum_hk_c,
+                                    sum_hk_c2,
+                                )
+                                sum_hk_d, sum_hk_d2 = fma_pair(
+                                    r_h[3, i],
+                                    r_h[3, i + 1],
+                                    r_k[i],
+                                    r_k[i + 1],
+                                    sum_hk_d,
+                                    sum_hk_d2,
+                                )
                         sum_hk_a = sum_hk_a + sum_hk_a2
                         sum_hk_b = sum_hk_b + sum_hk_b2
                         sum_hk_c = sum_hk_c + sum_hk_c2
@@ -923,46 +982,112 @@ def gdn_verify_kernel_mtp(
                         sum_hq_d = cutlass.Float32(0.0)
                         sum_hq_d2 = cutlass.Float32(0.0)
                         for i in cutlass.range_constexpr(0, vec_size, 2):
-                            r_h[0, i], r_h[0, i + 1] = cute.arch.fma_packed_f32x2(
-                                src_a=(r_k[i], r_k[i + 1]),
-                                src_b=(v_new_a, v_new_a),
-                                src_c=(r_h[0, i], r_h[0, i + 1]),
-                            )
-                            r_h[1, i], r_h[1, i + 1] = cute.arch.fma_packed_f32x2(
-                                src_a=(r_k[i], r_k[i + 1]),
-                                src_b=(v_new_b, v_new_b),
-                                src_c=(r_h[1, i], r_h[1, i + 1]),
-                            )
-                            r_h[2, i], r_h[2, i + 1] = cute.arch.fma_packed_f32x2(
-                                src_a=(r_k[i], r_k[i + 1]),
-                                src_b=(v_new_c, v_new_c),
-                                src_c=(r_h[2, i], r_h[2, i + 1]),
-                            )
-                            r_h[3, i], r_h[3, i + 1] = cute.arch.fma_packed_f32x2(
-                                src_a=(r_k[i], r_k[i + 1]),
-                                src_b=(v_new_d, v_new_d),
-                                src_c=(r_h[3, i], r_h[3, i + 1]),
-                            )
-                            sum_hq_a, sum_hq_a2 = cute.arch.fma_packed_f32x2(
-                                src_a=(r_h[0, i], r_h[0, i + 1]),
-                                src_b=(r_q[i], r_q[i + 1]),
-                                src_c=(sum_hq_a, sum_hq_a2),
-                            )
-                            sum_hq_b, sum_hq_b2 = cute.arch.fma_packed_f32x2(
-                                src_a=(r_h[1, i], r_h[1, i + 1]),
-                                src_b=(r_q[i], r_q[i + 1]),
-                                src_c=(sum_hq_b, sum_hq_b2),
-                            )
-                            sum_hq_c, sum_hq_c2 = cute.arch.fma_packed_f32x2(
-                                src_a=(r_h[2, i], r_h[2, i + 1]),
-                                src_b=(r_q[i], r_q[i + 1]),
-                                src_c=(sum_hq_c, sum_hq_c2),
-                            )
-                            sum_hq_d, sum_hq_d2 = cute.arch.fma_packed_f32x2(
-                                src_a=(r_h[3, i], r_h[3, i + 1]),
-                                src_b=(r_q[i], r_q[i + 1]),
-                                src_c=(sum_hq_d, sum_hq_d2),
-                            )
+                            if cutlass.const_expr(use_packed_fma):
+                                r_h[0, i], r_h[0, i + 1] = cute.arch.fma_packed_f32x2(
+                                    src_a=(r_k[i], r_k[i + 1]),
+                                    src_b=(v_new_a, v_new_a),
+                                    src_c=(r_h[0, i], r_h[0, i + 1]),
+                                )
+                                r_h[1, i], r_h[1, i + 1] = cute.arch.fma_packed_f32x2(
+                                    src_a=(r_k[i], r_k[i + 1]),
+                                    src_b=(v_new_b, v_new_b),
+                                    src_c=(r_h[1, i], r_h[1, i + 1]),
+                                )
+                                r_h[2, i], r_h[2, i + 1] = cute.arch.fma_packed_f32x2(
+                                    src_a=(r_k[i], r_k[i + 1]),
+                                    src_b=(v_new_c, v_new_c),
+                                    src_c=(r_h[2, i], r_h[2, i + 1]),
+                                )
+                                r_h[3, i], r_h[3, i + 1] = cute.arch.fma_packed_f32x2(
+                                    src_a=(r_k[i], r_k[i + 1]),
+                                    src_b=(v_new_d, v_new_d),
+                                    src_c=(r_h[3, i], r_h[3, i + 1]),
+                                )
+                                sum_hq_a, sum_hq_a2 = cute.arch.fma_packed_f32x2(
+                                    src_a=(r_h[0, i], r_h[0, i + 1]),
+                                    src_b=(r_q[i], r_q[i + 1]),
+                                    src_c=(sum_hq_a, sum_hq_a2),
+                                )
+                                sum_hq_b, sum_hq_b2 = cute.arch.fma_packed_f32x2(
+                                    src_a=(r_h[1, i], r_h[1, i + 1]),
+                                    src_b=(r_q[i], r_q[i + 1]),
+                                    src_c=(sum_hq_b, sum_hq_b2),
+                                )
+                                sum_hq_c, sum_hq_c2 = cute.arch.fma_packed_f32x2(
+                                    src_a=(r_h[2, i], r_h[2, i + 1]),
+                                    src_b=(r_q[i], r_q[i + 1]),
+                                    src_c=(sum_hq_c, sum_hq_c2),
+                                )
+                                sum_hq_d, sum_hq_d2 = cute.arch.fma_packed_f32x2(
+                                    src_a=(r_h[3, i], r_h[3, i + 1]),
+                                    src_b=(r_q[i], r_q[i + 1]),
+                                    src_c=(sum_hq_d, sum_hq_d2),
+                                )
+                            else:
+                                r_h[0, i], r_h[0, i + 1] = fma_pair(
+                                    r_k[i],
+                                    r_k[i + 1],
+                                    v_new_a,
+                                    v_new_a,
+                                    r_h[0, i],
+                                    r_h[0, i + 1],
+                                )
+                                r_h[1, i], r_h[1, i + 1] = fma_pair(
+                                    r_k[i],
+                                    r_k[i + 1],
+                                    v_new_b,
+                                    v_new_b,
+                                    r_h[1, i],
+                                    r_h[1, i + 1],
+                                )
+                                r_h[2, i], r_h[2, i + 1] = fma_pair(
+                                    r_k[i],
+                                    r_k[i + 1],
+                                    v_new_c,
+                                    v_new_c,
+                                    r_h[2, i],
+                                    r_h[2, i + 1],
+                                )
+                                r_h[3, i], r_h[3, i + 1] = fma_pair(
+                                    r_k[i],
+                                    r_k[i + 1],
+                                    v_new_d,
+                                    v_new_d,
+                                    r_h[3, i],
+                                    r_h[3, i + 1],
+                                )
+                                sum_hq_a, sum_hq_a2 = fma_pair(
+                                    r_h[0, i],
+                                    r_h[0, i + 1],
+                                    r_q[i],
+                                    r_q[i + 1],
+                                    sum_hq_a,
+                                    sum_hq_a2,
+                                )
+                                sum_hq_b, sum_hq_b2 = fma_pair(
+                                    r_h[1, i],
+                                    r_h[1, i + 1],
+                                    r_q[i],
+                                    r_q[i + 1],
+                                    sum_hq_b,
+                                    sum_hq_b2,
+                                )
+                                sum_hq_c, sum_hq_c2 = fma_pair(
+                                    r_h[2, i],
+                                    r_h[2, i + 1],
+                                    r_q[i],
+                                    r_q[i + 1],
+                                    sum_hq_c,
+                                    sum_hq_c2,
+                                )
+                                sum_hq_d, sum_hq_d2 = fma_pair(
+                                    r_h[3, i],
+                                    r_h[3, i + 1],
+                                    r_q[i],
+                                    r_q[i + 1],
+                                    sum_hq_d,
+                                    sum_hq_d2,
+                                )
                         sum_hq_a = sum_hq_a + sum_hq_a2
                         sum_hq_b = sum_hq_b + sum_hq_b2
                         sum_hq_c = sum_hq_c + sum_hq_c2
@@ -1241,6 +1366,7 @@ def run_gdn_verify_kernel_mtp(
     cache_intermediate_states: cutlass.Constexpr[bool],
     ilp_rows: cutlass.Constexpr[int],
     use_smem_v: cutlass.Constexpr[bool],
+    use_packed_fma: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     _, v_dim, k_dim = (
@@ -1297,6 +1423,7 @@ def run_gdn_verify_kernel_mtp(
         cache_intermediate_states,
         ilp_rows,
         use_smem_v,
+        use_packed_fma,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[NUM_THREADS_MTP, 1, 1],
@@ -1344,6 +1471,7 @@ def gdn_verify_kernel_mtp_inline(
     use_smem_v: cutlass.Constexpr[
         bool
     ],  # True: preload v into SMEM (large BS), False: GMEM reads
+    use_packed_fma: cutlass.Constexpr[bool],
 ):
     """
     Parallel MTP kernel - each block handles one [TILE_V, TILE_K] tile.
@@ -2013,6 +2141,7 @@ def run_gdn_verify_kernel_mtp_inline(
     cache_intermediate_states: cutlass.Constexpr[bool],
     ilp_rows: cutlass.Constexpr[int],
     use_smem_v: cutlass.Constexpr[bool],
+    use_packed_fma: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     _, v_dim, _ = (
@@ -2065,6 +2194,7 @@ def run_gdn_verify_kernel_mtp_inline(
         cache_intermediate_states,
         ilp_rows,
         use_smem_v,
+        use_packed_fma,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[NUM_THREADS_MTP, 1, 1],
@@ -2091,6 +2221,7 @@ def _get_compiled_mtp_kernel(
     vec_size: int,
     ilp_rows: int = 4,
     use_smem_v: bool = False,
+    use_packed_fma: bool = True,
 ):
     """Cache compiled optimized MTP kernel for given configuration."""
     return {}
@@ -2114,6 +2245,7 @@ def _get_compiled_mtp_kernel_inline(
     vec_size: int,
     ilp_rows: int = 4,
     use_smem_v: bool = False,
+    use_packed_fma: bool = True,
 ):
     """Cache compiled inline MTP kernel (BS <= 2) for given configuration."""
     return {}
@@ -2177,6 +2309,8 @@ def run_mtp_decode(
     # Dispatch between inline kernel and warp-specialized kernel based on CTA work units
     _, _, ilp_rows, use_smem_v = get_mtp_config(B, T, HV, V, disable_state_update)
     use_inline_kernel = (B * HV) <= 128
+    major, _ = torch.cuda.get_device_capability(q.device)
+    use_packed_fma = major >= 10  # SM100+ (Blackwell) supports packed F32x2
 
     if use_inline_kernel:
         inline_cache_key = (
@@ -2196,6 +2330,7 @@ def run_mtp_decode(
             vec_size,
             ilp_rows,
             use_smem_v,
+            use_packed_fma,
         )
         cache = _get_compiled_mtp_kernel_inline(*inline_cache_key)
     else:
@@ -2216,6 +2351,7 @@ def run_mtp_decode(
             vec_size,
             ilp_rows,
             use_smem_v,
+            use_packed_fma,
         )
         cache = _get_compiled_mtp_kernel(*warp_cache_key)
 
@@ -2272,6 +2408,7 @@ def run_mtp_decode(
                 cache_intermediate_states=cache_intermediate_states,
                 ilp_rows=ilp_rows,
                 use_smem_v=use_smem_v,
+                use_packed_fma=use_packed_fma,
                 stream=stream,
                 options="--enable-tvm-ffi --generate-line-info",
             )
@@ -2308,6 +2445,7 @@ def run_mtp_decode(
                 cache_intermediate_states=cache_intermediate_states,
                 ilp_rows=ilp_rows,
                 use_smem_v=use_smem_v,
+                use_packed_fma=use_packed_fma,
                 stream=stream,
                 options="--enable-tvm-ffi --generate-line-info",
             )
