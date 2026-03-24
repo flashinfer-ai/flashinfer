@@ -205,9 +205,6 @@ def gdn_verify_kernel_mtp(
     use_smem_v: cutlass.Constexpr[
         bool
     ],  # True: preload v into SMEM (large BS), False: GMEM reads
-    num_warps: cutlass.Constexpr[
-        int
-    ],  # 4 or 8: number of warps per block (128 or 256 threads)
 ):
     """
     Parallel MTP kernel - each block handles one [TILE_V, TILE_K] tile.
@@ -225,12 +222,10 @@ def gdn_verify_kernel_mtp(
     warp_idx = cute.arch.warp_idx()
     warp_idx = cute.arch.make_warp_uniform(warp_idx)
 
-    # Compute thread grouping based on vec_size and num_warps:
-    # vec_size=8: 16 threads per group (half-warp), 8 groups per block
-    # vec_size=4: 32 threads per group (full warp), 4 groups per block
-    threads_per_group: cutlass.Constexpr[int] = K // vec_size  # 16 or 32
-    groups_per_warp: cutlass.Constexpr[int] = 32 // threads_per_group  # 2 or 1
-    num_groups: cutlass.Constexpr[int] = num_warps * groups_per_warp  # configurable
+    # Thread grouping: vec_size=4, so 32 threads/group (full warp), 4 groups/block
+    threads_per_group: cutlass.Constexpr[int] = K // vec_size  # 32
+    groups_per_warp: cutlass.Constexpr[int] = 32 // threads_per_group  # 1
+    num_groups: cutlass.Constexpr[int] = 4 * groups_per_warp  # 4
 
     # Lane position within group and group index
     lane_in_group = lane_id % threads_per_group
@@ -327,23 +322,14 @@ def gdn_verify_kernel_mtp(
                         sum_q += r_q[i] * r_q[i]
                         sum_k += r_k[i] * r_k[i]
 
-                    # Reduce within threads_per_group (handles both vec_size=4 and 8)
-                    if cutlass.const_expr(threads_per_group == 32):
-                        for offset in [16, 8, 4, 2, 1]:
-                            sum_q += cute.arch.shuffle_sync_bfly(
-                                sum_q, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            sum_k += cute.arch.shuffle_sync_bfly(
-                                sum_k, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                    else:
-                        for offset in [8, 4, 2, 1]:
-                            sum_q += cute.arch.shuffle_sync_bfly(
-                                sum_q, offset=offset, mask=-1, mask_and_clamp=15
-                            )
-                            sum_k += cute.arch.shuffle_sync_bfly(
-                                sum_k, offset=offset, mask=-1, mask_and_clamp=15
-                            )
+                    # Full warp reduction (threads_per_group=32, vec_size=4)
+                    for offset in [16, 8, 4, 2, 1]:
+                        sum_q += cute.arch.shuffle_sync_bfly(
+                            sum_q, offset=offset, mask=-1, mask_and_clamp=31
+                        )
+                        sum_k += cute.arch.shuffle_sync_bfly(
+                            sum_k, offset=offset, mask=-1, mask_and_clamp=31
+                        )
 
                     inv_norm_q_scaled = cute.rsqrt(sum_q + 1e-6, fastmath=True) * scale
                     inv_norm_k = cute.rsqrt(sum_k + 1e-6, fastmath=True)
@@ -895,35 +881,20 @@ def gdn_verify_kernel_mtp(
                         sum_hk_c = sum_hk_c + sum_hk_c2
                         sum_hk_d = sum_hk_d + sum_hk_d2
 
-                        # Warp-level reduction for ALL 4 (parameterized by threads_per_group)
-                        if cutlass.const_expr(threads_per_group == 32):
-                            for offset in [16, 8, 4, 2, 1]:
-                                sum_hk_a += cute.arch.shuffle_sync_bfly(
-                                    sum_hk_a, offset=offset, mask=-1, mask_and_clamp=31
-                                )
-                                sum_hk_b += cute.arch.shuffle_sync_bfly(
-                                    sum_hk_b, offset=offset, mask=-1, mask_and_clamp=31
-                                )
-                                sum_hk_c += cute.arch.shuffle_sync_bfly(
-                                    sum_hk_c, offset=offset, mask=-1, mask_and_clamp=31
-                                )
-                                sum_hk_d += cute.arch.shuffle_sync_bfly(
-                                    sum_hk_d, offset=offset, mask=-1, mask_and_clamp=31
-                                )
-                        else:
-                            for offset in [8, 4, 2, 1]:
-                                sum_hk_a += cute.arch.shuffle_sync_bfly(
-                                    sum_hk_a, offset=offset, mask=-1, mask_and_clamp=15
-                                )
-                                sum_hk_b += cute.arch.shuffle_sync_bfly(
-                                    sum_hk_b, offset=offset, mask=-1, mask_and_clamp=15
-                                )
-                                sum_hk_c += cute.arch.shuffle_sync_bfly(
-                                    sum_hk_c, offset=offset, mask=-1, mask_and_clamp=15
-                                )
-                                sum_hk_d += cute.arch.shuffle_sync_bfly(
-                                    sum_hk_d, offset=offset, mask=-1, mask_and_clamp=15
-                                )
+                        # Full warp reduction for ALL 4 h@k dot products
+                        for offset in [16, 8, 4, 2, 1]:
+                            sum_hk_a += cute.arch.shuffle_sync_bfly(
+                                sum_hk_a, offset=offset, mask=-1, mask_and_clamp=31
+                            )
+                            sum_hk_b += cute.arch.shuffle_sync_bfly(
+                                sum_hk_b, offset=offset, mask=-1, mask_and_clamp=31
+                            )
+                            sum_hk_c += cute.arch.shuffle_sync_bfly(
+                                sum_hk_c, offset=offset, mask=-1, mask_and_clamp=31
+                            )
+                            sum_hk_d += cute.arch.shuffle_sync_bfly(
+                                sum_hk_d, offset=offset, mask=-1, mask_and_clamp=31
+                            )
 
                         # Step 3: Load v for ALL 4 rows, apply delta rule
                         if cutlass.const_expr(use_smem_v):
@@ -997,35 +968,20 @@ def gdn_verify_kernel_mtp(
                         sum_hq_c = sum_hq_c + sum_hq_c2
                         sum_hq_d = sum_hq_d + sum_hq_d2
 
-                        # Warp-level reduction for ALL 4 (parameterized by threads_per_group)
-                        if cutlass.const_expr(threads_per_group == 32):
-                            for offset in [16, 8, 4, 2, 1]:
-                                sum_hq_a += cute.arch.shuffle_sync_bfly(
-                                    sum_hq_a, offset=offset, mask=-1, mask_and_clamp=31
-                                )
-                                sum_hq_b += cute.arch.shuffle_sync_bfly(
-                                    sum_hq_b, offset=offset, mask=-1, mask_and_clamp=31
-                                )
-                                sum_hq_c += cute.arch.shuffle_sync_bfly(
-                                    sum_hq_c, offset=offset, mask=-1, mask_and_clamp=31
-                                )
-                                sum_hq_d += cute.arch.shuffle_sync_bfly(
-                                    sum_hq_d, offset=offset, mask=-1, mask_and_clamp=31
-                                )
-                        else:
-                            for offset in [8, 4, 2, 1]:
-                                sum_hq_a += cute.arch.shuffle_sync_bfly(
-                                    sum_hq_a, offset=offset, mask=-1, mask_and_clamp=15
-                                )
-                                sum_hq_b += cute.arch.shuffle_sync_bfly(
-                                    sum_hq_b, offset=offset, mask=-1, mask_and_clamp=15
-                                )
-                                sum_hq_c += cute.arch.shuffle_sync_bfly(
-                                    sum_hq_c, offset=offset, mask=-1, mask_and_clamp=15
-                                )
-                                sum_hq_d += cute.arch.shuffle_sync_bfly(
-                                    sum_hq_d, offset=offset, mask=-1, mask_and_clamp=15
-                                )
+                        # Full warp reduction for ALL 4 h@q dot products
+                        for offset in [16, 8, 4, 2, 1]:
+                            sum_hq_a += cute.arch.shuffle_sync_bfly(
+                                sum_hq_a, offset=offset, mask=-1, mask_and_clamp=31
+                            )
+                            sum_hq_b += cute.arch.shuffle_sync_bfly(
+                                sum_hq_b, offset=offset, mask=-1, mask_and_clamp=31
+                            )
+                            sum_hq_c += cute.arch.shuffle_sync_bfly(
+                                sum_hq_c, offset=offset, mask=-1, mask_and_clamp=31
+                            )
+                            sum_hq_d += cute.arch.shuffle_sync_bfly(
+                                sum_hq_d, offset=offset, mask=-1, mask_and_clamp=31
+                            )
 
                         # Write output for ALL 4 rows
                         if lane_in_group == 0:
@@ -1285,7 +1241,6 @@ def run_gdn_verify_kernel_mtp(
     cache_intermediate_states: cutlass.Constexpr[bool],
     ilp_rows: cutlass.Constexpr[int],
     use_smem_v: cutlass.Constexpr[bool],
-    num_warps: cutlass.Constexpr[int],
     stream: cuda.CUstream,
 ):
     _, v_dim, k_dim = (
@@ -1309,8 +1264,6 @@ def run_gdn_verify_kernel_mtp(
         + 2 * T * tile_v  # sOutput (output accumulation in BF16)
         + 128  # alignment
     )
-
-    num_threads = num_warps * 32
 
     gdn_verify_kernel_mtp(
         h0_source,
@@ -1344,10 +1297,9 @@ def run_gdn_verify_kernel_mtp(
         cache_intermediate_states,
         ilp_rows,
         use_smem_v,
-        num_warps,
     ).launch(
         grid=(grid_size, 1, 1),
-        block=[num_threads, 1, 1],
+        block=[NUM_THREADS_MTP, 1, 1],
         smem=smem_bytes,
         stream=stream,
     )
@@ -1409,12 +1361,10 @@ def gdn_verify_kernel_mtp_inline(
     warp_idx = cute.arch.warp_idx()
     warp_idx = cute.arch.make_warp_uniform(warp_idx)
 
-    # Compute thread grouping based on vec_size:
-    # vec_size=8: 16 threads per group (half-warp), 8 groups per block
-    # vec_size=4: 32 threads per group (full warp), 4 groups per block
-    threads_per_group: cutlass.Constexpr[int] = K // vec_size  # 16 or 32
-    groups_per_warp: cutlass.Constexpr[int] = 32 // threads_per_group  # 2 or 1
-    num_groups: cutlass.Constexpr[int] = 4 * groups_per_warp  # 8 or 4
+    # Thread grouping: vec_size=4, so 32 threads/group (full warp), 4 groups/block
+    threads_per_group: cutlass.Constexpr[int] = K // vec_size  # 32
+    groups_per_warp: cutlass.Constexpr[int] = 32 // threads_per_group  # 1
+    num_groups: cutlass.Constexpr[int] = 4 * groups_per_warp  # 4
 
     # Lane position within group and group index
     lane_in_group = lane_id % threads_per_group
@@ -2141,7 +2091,6 @@ def _get_compiled_mtp_kernel(
     vec_size: int,
     ilp_rows: int = 4,
     use_smem_v: bool = False,
-    num_warps: int = 4,
 ):
     """Cache compiled optimized MTP kernel for given configuration."""
     return {}
@@ -2228,7 +2177,6 @@ def run_mtp_decode(
     # Dispatch between inline kernel and warp-specialized kernel based on CTA work units
     _, _, ilp_rows, use_smem_v = get_mtp_config(B, T, HV, V, disable_state_update)
     use_inline_kernel = (B * HV) <= 128
-    num_warps = 4  # 128 threads, 4 warps
 
     if use_inline_kernel:
         inline_cache_key = (
@@ -2268,7 +2216,6 @@ def run_mtp_decode(
             vec_size,
             ilp_rows,
             use_smem_v,
-            num_warps,
         )
         cache = _get_compiled_mtp_kernel(*warp_cache_key)
 
@@ -2361,7 +2308,6 @@ def run_mtp_decode(
                 cache_intermediate_states=cache_intermediate_states,
                 ilp_rows=ilp_rows,
                 use_smem_v=use_smem_v,
-                num_warps=num_warps,
                 stream=stream,
                 options="--enable-tvm-ffi --generate-line-info",
             )
