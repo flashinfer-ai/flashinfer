@@ -313,18 +313,17 @@ __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int la
             int const c0 = baseCol(t, p * 2);
             if (c0 >= DSTATE) {
               rState[t][p] = {0.f, 0.f};
-            } else if constexpr (sizeof(state_t) == 2) {
-              uint32_t raw =
-                  *reinterpret_cast<uint32_t const*>(&sram.state_in[slot][sram_row * DSTATE + c0]);
-              auto const* ptr = reinterpret_cast<state_t const*>(&raw);
-              rState[t][p] = {toFloat(ptr[0]), toFloat(ptr[1])};
             } else {
-              int const c1 = baseCol(t, p * 2 + 1);
-              rState[t][p] = {toFloat(sram.state_in[slot][sram_row * DSTATE + c0]),
-                              toFloat(sram.state_in[slot][sram_row * DSTATE + c1])};
+              rState[t][p] = toFloat2(&sram.state_in[slot][sram_row * DSTATE + c0]);
             }
           }
         }
+
+        // Precompute intermediate-state base address (step=0) and per-step stride
+        // to replace a 64-bit multiply per step with an addition.
+        int64_t istate_base_dd = icache_idx * params.intermediate_state_stride_batch +
+                                 (int64_t)head * DIM * DSTATE + (int64_t)dd * DSTATE;
+        int64_t const istate_step_stride = (int64_t)params.nheads * DIM * DSTATE;
 
         for (int step = 0; step < NTOKENS; step++) {
           float const dt_value = sram.dt[h][step];
@@ -346,20 +345,8 @@ __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int la
                 // OOB padding columns — no state update or output contribution
                 continue;
               }
-              float2 B2, C2;
-              if constexpr (sizeof(input_t) == 2) {
-                // Coalesce two 16-bit loads into one 32-bit shared memory load
-                uint32_t B2_raw = *reinterpret_cast<uint32_t const*>(&sram.B[step][c0]);
-                auto const* B2_ptr = reinterpret_cast<input_t const*>(&B2_raw);
-                B2 = {toFloat(B2_ptr[0]), toFloat(B2_ptr[1])};
-                uint32_t C2_raw = *reinterpret_cast<uint32_t const*>(&sram.C[step][c0]);
-                auto const* C2_ptr = reinterpret_cast<input_t const*>(&C2_raw);
-                C2 = {toFloat(C2_ptr[0]), toFloat(C2_ptr[1])};
-              } else {
-                int const c1 = baseCol(t, p * 2 + 1);
-                B2 = {toFloat(sram.B[step][c0]), toFloat(sram.B[step][c1])};
-                C2 = {toFloat(sram.C[step][c0]), toFloat(sram.C[step][c1])};
-              }
+              float2 const B2 ]);
+              float2 const C2 = toFloat2(&sram.C[step][c0]);
               float2 dBx;
               mul_f32x2(dBx, B2, dtx2);                         // dBx = B * (dt * x)
               fma_f32x2(rState[t][p], dA2, rState[t][p], dBx);  // state = dA * state + dBx
@@ -380,9 +367,6 @@ __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int la
 
           // Write intermediate state
           if (istate_ptr && !IS_PAD) {
-            auto const istate_base = icache_idx * params.intermediate_state_stride_batch +
-                                     step * params.nheads * DIM * DSTATE + head * DIM * DSTATE +
-                                     dd * DSTATE;
 #pragma unroll
             for (int t = 0; t < numTiles; t++) {
               int const col0 = baseCol(t, 0);
@@ -397,8 +381,9 @@ __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int la
                     rOut.val[e], rOut.val[e + 1], s0, s1, rand_seed, state_ptr_offset, dd, col0, e,
                     rand_ints);
               }
-              *reinterpret_cast<packed_tile_t*>(&istate_ptr[istate_base + col0]) = rOut;
+              *reinterpret_cast<packed_tile_t*>(&istate_ptr[istate_base_dd + col0]) = rOut;
             }
+            istate_base_dd += istate_step_stride;
           }
 
           // Write final state at last step
