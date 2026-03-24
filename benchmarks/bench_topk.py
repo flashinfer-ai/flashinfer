@@ -190,6 +190,69 @@ def bench_ragged_transform(
     return result
 
 
+# NOTE: based on @AllenLin's benchmarking function here: https://github.com/flashinfer-ai/flashinfer/pull/2814 to compare. 
+def bench_dsv3_topk(
+    batch_size: int,
+    seq_len: int,
+    compare_sglang: bool = False,
+) -> dict:
+    """Benchmark top-K for DeepSeek v3.2 sparse-attention shapes (k=2048).
+
+    Compares three implementations:
+    - flashinfer.top_k with backend='cute-dsl' (single-pass multi-CTA radix, SM100+)
+    - flashinfer.top_k with backend='cuda' (default CUDA radix top-k)
+    - SGLang's fast_topk_v2 (optional)
+
+    Inputs match the DSv3.2 indexer: logits [batch, seq_len] float32.
+    """
+    k = 2048
+
+    logits = torch.empty(batch_size, seq_len, device="cuda", dtype=torch.float32)
+    logits.uniform_(-1.0, 1.0)
+
+    result = {
+        "batch_size": batch_size,
+        "seq_len": seq_len,
+        "k": k,
+    }
+
+    # flashinfer top_k backend='cute-dsl': single-pass multi-CTA radix (cluster)
+    measurements = bench_gpu_time(
+        lambda: flashinfer.top_k(logits, k, backend="cute-dsl"),
+        enable_cupti=True,
+        dry_run_iters=10,
+        repeat_iters=100,
+    )
+    cute_dsl_ms = np.median(measurements)
+    result["cute_dsl_us"] = cute_dsl_ms * 1e3
+
+    # flashinfer top_k backend='cuda': default CUDA radix top-k
+    measurements = bench_gpu_time(
+        lambda: flashinfer.top_k(logits, k, backend="cuda"),
+        enable_cupti=True,
+        dry_run_iters=10,
+        repeat_iters=100,
+    )
+    cuda_ms = np.median(measurements)
+    result["cuda_us"] = cuda_ms * 1e3
+    result["speedup_vs_cuda"] = cuda_ms / cute_dsl_ms
+
+    # SGLang fast_topk_v2
+    if compare_sglang and HAS_SGL_KERNEL:
+        seq_lens = torch.full((batch_size,), seq_len, dtype=torch.int32, device="cuda")
+        measurements = bench_gpu_time(
+            lambda: sgl_kernel.fast_topk_v2(logits, seq_lens, k, row_starts=None),
+            enable_cupti=True,
+            dry_run_iters=10,
+            repeat_iters=100,
+        )
+        sg_ms = np.median(measurements)
+        result["sglang_us"] = sg_ms * 1e3
+        result["speedup_vs_sglang"] = sg_ms / cute_dsl_ms
+
+    return result
+
+
 def parse_dtype(dtype_str: str) -> torch.dtype:
     """Parse dtype string to torch.dtype."""
     dtype_map = {
@@ -214,7 +277,7 @@ def main():
     )
     parser.add_argument(
         "--op",
-        choices=["all", "top_k", "page_table", "ragged"],
+        choices=["all", "top_k", "page_table", "ragged", "dsv3_topk"],
         default="all",
         help="Which operation to benchmark",
     )
@@ -422,6 +485,52 @@ def main():
                             torch.cuda.empty_cache()
                         else:
                             raise
+
+    if args.op in ["all", "dsv3_topk"]:
+        dsv3_batch_sizes = [1, 2, 4, 32, 64]
+        dsv3_seq_lens = [1024, 4096, 8192, 32768, 40960, 65536, 131072]
+
+        print("\n" + "=" * 100)
+        print("dsv3_topk: DeepSeek v3.2 sparse-attention top-K shapes (k=2048, float32)")
+        print(
+            "  cute-dsl:          CuTe-DSL single-pass multi-CTA radix top-K (cluster)"
+        )
+        print(
+            "  cuda:              FlashInfer default CUDA radix top-K"
+        )
+        if args.compare_sglang:
+            print("  SGLang fast_topk_v2: variable-length aware (requires sgl_kernel)")
+        print("=" * 100)
+
+        header = f"{'batch':>6} {'seq_len':>10} | {'cute-dsl':>12} {'cuda':>12} {'vs cuda':>10}"
+        if args.compare_sglang:
+            header += f" {'SGLang':>12} {'vs sglang':>10}"
+        print(header)
+        print("-" * (60 if not args.compare_sglang else 85))
+
+        for batch_size in dsv3_batch_sizes:
+            for seq_len in dsv3_seq_lens:
+                try:
+                    result = bench_dsv3_topk(
+                        batch_size,
+                        seq_len,
+                        compare_sglang=args.compare_sglang,
+                    )
+                    line = (
+                        f"{result['batch_size']:>6} {result['seq_len']:>10} | "
+                        f"{result['cute_dsl_us']:>10.2f}us "
+                        f"{result['cuda_us']:>10.2f}us "
+                        f"{result['speedup_vs_cuda']:>9.2f}x"
+                    )
+                    if "sglang_us" in result:
+                        line += f" {result['sglang_us']:>10.2f}us {result['speedup_vs_sglang']:>9.2f}x"
+                    print(line)
+                except RuntimeError as e:
+                    if "out of memory" in str(e):
+                        print(f"{batch_size:>6} {seq_len:>10} | OOM")
+                        torch.cuda.empty_cache()
+                    else:
+                        raise
 
 
 if __name__ == "__main__":
