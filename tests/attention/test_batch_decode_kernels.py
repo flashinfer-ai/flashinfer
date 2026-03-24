@@ -805,6 +805,7 @@ def test_single_decode_torch_compile_cuda_graph():
             v = torch.randn(KV_LEN, KH, D, device="cuda", dtype=torch.float16)
             o = compiled_fn(q, k, v)
             assert o.shape == (QH, D)
+        torch.cuda.synchronize()
         print("PASS")
     """)
     result = subprocess.run(

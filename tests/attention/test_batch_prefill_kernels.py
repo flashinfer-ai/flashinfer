@@ -1089,6 +1089,7 @@ def test_single_prefill_torch_compile_cuda_graph():
             v = torch.randn(S, KH, D, device="cuda", dtype=torch.float16)
             o = compiled_fn(q, k, v)
             assert o.shape == (S, QH, D)
+        torch.cuda.synchronize()
         print("PASS")
     """)
     result = subprocess.run(

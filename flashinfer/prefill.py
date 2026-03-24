@@ -64,6 +64,7 @@ from .utils import (
     register_fake_op,
     ceil_div,
     round_up,
+    SINGLE_KERNEL_TMP_SIZE,
 )
 
 
@@ -1011,7 +1012,7 @@ def single_prefill_with_kv_cache_with_jit_module(
     return_lse: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     device = q.device
-    tmp = torch.empty(32 * 1024 * 1024, dtype=torch.uint8, device=device)
+    tmp = torch.empty(SINGLE_KERNEL_TMP_SIZE, dtype=torch.uint8, device=device)
     o = torch.empty(q.shape[:-1] + v.shape[-1:], dtype=q.dtype, device=device)
     lse = None
     if return_lse:
@@ -1227,7 +1228,7 @@ def single_prefill_with_kv_cache(
     """
     _check_pos_encoding_mode(pos_encoding_mode)
     _check_kv_layout(kv_layout)
-    tmp = torch.empty(32 * 1024 * 1024, dtype=torch.uint8, device=q.device)
+    tmp = torch.empty(SINGLE_KERNEL_TMP_SIZE, dtype=torch.uint8, device=q.device)
     if logits_soft_cap is None:
         logits_soft_cap = 0.0
     if sm_scale is None:

@@ -73,6 +73,7 @@ from .utils import (
     round_up,
     get_compute_capability,
     GPUArchitectureError,
+    SINGLE_KERNEL_TMP_SIZE,
 )
 
 
@@ -332,7 +333,7 @@ def single_decode_with_kv_cache_with_jit_module(
     return_lse: bool = False,
 ):
     device = q.device
-    tmp = torch.empty(32 * 1024 * 1024, dtype=torch.uint8, device=device)
+    tmp = torch.empty(SINGLE_KERNEL_TMP_SIZE, dtype=torch.uint8, device=device)
     o = torch.empty_like(q)
     if return_lse:
         lse = torch.empty((q.size(0)), dtype=torch.float32, device=device)
@@ -495,7 +496,7 @@ def single_decode_with_kv_cache(
     """
     _check_pos_encoding_mode(pos_encoding_mode)
     _check_kv_layout(kv_layout)
-    tmp = torch.empty(32 * 1024 * 1024, dtype=torch.uint8, device=q.device)
+    tmp = torch.empty(SINGLE_KERNEL_TMP_SIZE, dtype=torch.uint8, device=q.device)
     head_dim = q.shape[-1]
     if logits_soft_cap is None:
         logits_soft_cap = 0.0
