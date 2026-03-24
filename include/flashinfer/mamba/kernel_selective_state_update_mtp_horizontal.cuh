@@ -81,7 +81,6 @@ struct GroupStorageHorizontal {
   float dt[HEADS_PER_CTA][TOKENS_MTP];
   float out[TOKENS_MTP][DIM];
 
-  barrier_t bar_input_full;  // B + C + x (all heads) loaded
   barrier_t bar_state_in_empty[NUM_IN_STAGES];
   barrier_t bar_state_in_full[NUM_IN_STAGES];
   barrier_t bar_out_ready;  // sync compute warps before/after epilogue
@@ -128,34 +127,36 @@ __device__ __forceinline__ void role_load_horizontal(
   constexpr int numTmaLoads = DIM / TMA_STATE_ROWS;
   static_assert(DIM % TMA_STATE_ROWS == 0, "DIM must be divisible by TMA_STATE_ROWS");
 
-  // ── Load B, C (once), and x for all heads ─────────────────────────────
+  // ── Issue B/C/X TMA loads targeting bar_state_in_full[0] ─────────────
+  // These are merged with the first state tile into a single barrier transaction,
+  // eliminating a separate bar_input_full barrier and letting TMA instructions
+  // stream back-to-back without serialization.
+  constexpr int bytesBCX = 2 * NTOKENS * DSTATE * (int)sizeof(input_t) +
+                           HEADS_PER_CTA * NTOKENS * DIM * (int)sizeof(input_t);
   if (lane == 0) {
-    constexpr int bytesBCX = 2 * NTOKENS * DSTATE * (int)sizeof(input_t) +
-                             HEADS_PER_CTA * NTOKENS * DIM * (int)sizeof(input_t);
     if constexpr (!IS_PAD) {
       cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.B[0][0], &tensorB, 0, kv_group, 0, batch,
-                                                    sram.bar_input_full);
+                                                    sram.bar_state_in_full[0]);
       cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.C[0][0], &tensorC, 0, kv_group, 0, batch,
-                                                    sram.bar_input_full);
+                                                    sram.bar_state_in_full[0]);
 #pragma unroll
       for (int h = 0; h < HEADS_PER_CTA; h++) {
         cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.x[h][0][0], &tensorX, 0, base_head + h,
-                                                      0, batch, sram.bar_input_full);
+                                                      0, batch, sram.bar_state_in_full[0]);
       }
-      cuda::device::barrier_arrive_tx(sram.bar_input_full, warpSize, bytesBCX);
-    } else {
-      cuda::device::barrier_arrive_tx(sram.bar_input_full, warpSize, 0);
     }
   }
 
   // ── Pipeline state_in loads (TMA_STATE_ROWS per transaction) ──────────
+  // The first tile (h=0, tl=0) shares bar_state_in_full[0] with B/C/X above,
+  // so its arrive_tx includes the combined byte count.
+  constexpr int bytesChunk = TMA_STATE_ROWS * DSTATE * (int)sizeof(state_t);
   uint32_t parity_empty[NUM_IN_STAGES] = {};  // all start at phase 0
 #pragma unroll
   for (int h = 0; h < HEADS_PER_CTA; h++) {
     int const head = base_head + h;
     for (int tl = 0; tl < numTmaLoads; tl++) {
       int const slot = tl % NUM_IN_STAGES;
-      constexpr int bytesChunk = TMA_STATE_ROWS * DSTATE * (int)sizeof(state_t);
 
       // Wait for compute to release this slot (tight spin, no NANOSLEEP)
       arrive_and_wait_parity(sram.bar_state_in_empty[slot], parity_empty[slot]);
@@ -165,7 +166,8 @@ __device__ __forceinline__ void role_load_horizontal(
           cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.state_in[slot][0], &tensorState, 0,
                                                         tl * TMA_STATE_ROWS, head, state_batch,
                                                         sram.bar_state_in_full[slot]);
-          cuda::device::barrier_arrive_tx(sram.bar_state_in_full[slot], 1, bytesChunk);
+          int const bytes = (h == 0 && tl == 0) ? bytesBCX + bytesChunk : bytesChunk;
+          cuda::device::barrier_arrive_tx(sram.bar_state_in_full[slot], 1, bytes);
         } else {
           cuda::device::barrier_arrive_tx(sram.bar_state_in_full[slot], 1, 0);
         }
@@ -247,11 +249,10 @@ __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int la
   }
 
   // Parity trackers for tight-spin barrier waits
-  uint32_t parity_input_full = 0;
   uint32_t parity_full[NUM_IN_STAGES] = {};
   uint32_t parity_out_ready = 0;
 
-  // Cooperatively load dt for all heads before waiting on B/C/x.
+  // Cooperatively load dt for all heads (global mem, no barrier needed).
   // 4 compute warps × 32 lanes = 128 threads cover HEADS_PER_CTA * NTOKENS values.
   {
     constexpr int totalDtValues = HEADS_PER_CTA * NTOKENS;
@@ -270,8 +271,8 @@ __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int la
     }
   }
 
-  // Wait for B/C/x (all heads) to be loaded
-  arrive_and_wait_parity(sram.bar_input_full, parity_input_full);
+  // B/C/X are merged into bar_state_in_full[0] — no separate wait needed.
+  // The first arrive_and_wait(bar_state_in_full[0]) at h=0, tl=0 delivers everything.
 
   // ═══════════════════════════════════════════════════════════════════════
   // Head loop: process HEADS_PER_CTA heads sequentially.
@@ -501,9 +502,6 @@ __global__ void __launch_bounds__(horiz::NUM_WARPS * 32, 6)
 
   // ── Init barriers (warp 0, lane 0) ──────────────────────────────────────
   if (warp == 0 && lane == 0) {
-    // bar_input_full: 1 TMA warp (arrive_tx for warpSize) + 4 compute warps
-    init(&sram.bar_input_full,
-         (horiz::NUM_TMA_WARPS + horiz::NUM_COMPUTE_WARPS_PER_GROUP) * warpSize);
     for (int s = 0; s < NUM_IN_STAGES; s++) {
       // bar_state_in_empty: 4 compute warps + 1 TMA warp
       init(&sram.bar_state_in_empty[s],
