@@ -3781,7 +3781,10 @@ def _cute_dsl_gemm_mxfp8_runner(
 
             if swap_ab:
                 kernel_m, kernel_n = n, m
-                kernel_a, kernel_b = b.T, a.T
+                # Swap A/B: kernel expects both mA and mB with shape (*, K).
+                # b is (k, n) col-major → b.T is (n, k) row-major.
+                # a is already (m, k) row-major — no transpose needed.
+                kernel_a, kernel_b = b.T, a
                 kernel_a_sf, kernel_b_sf = b_descale, a_descale
             else:
                 kernel_m, kernel_n = m, n
@@ -3824,9 +3827,11 @@ def _cute_dsl_gemm_mxfp8_runner(
                 batch_size=batch_size,
             )
 
-            launch_out = out.T if swap_ab else out
             alpha_for_launch = _prepare_alpha_for_launch(None, a.device)
 
+            launch_out = (
+                out.as_strided(out.shape, (1, out.shape[0])) if swap_ab else out
+            )
             compiled_gemm(
                 kernel_a,
                 kernel_b,
@@ -4574,9 +4579,11 @@ def _cute_dsl_gemm_fp4_runner(
 
             if swap_ab:
                 kernel_m, kernel_n = n, m
-                # Swap A/B tensors and their scale factors
-                kernel_a, kernel_b = b.T, a.T
-                kernel_a_sf, kernel_b_sf = b_descale.T, a_descale.T
+                # Swap A/B: kernel expects both mA and mB with shape (*, K).
+                # b is (k_packed, n) col-major → b.T is (n, k_packed) row-major.
+                # a is already (m, k_packed) row-major — no transpose needed.
+                kernel_a, kernel_b = b.T, a
+                kernel_a_sf, kernel_b_sf = b_descale.T, a_descale
             else:
                 kernel_m, kernel_n = m, n
                 # b comes in as (k_packed, n), need (n, k_packed) for the kernel
@@ -4633,9 +4640,16 @@ def _cute_dsl_gemm_fp4_runner(
                 batch_size=batch_size,
             )
 
-            launch_out = out.T if swap_ab else out
             alpha_for_launch = _prepare_alpha_for_launch(alpha_tensor, a.device)
 
+            # swap_ab compiled kernel expects column-major mC with shape
+            # (sym_n, sym_m) = (m, n).  Reinterpret out's storage as
+            # column-major so the runtime shape+stride checks pass.
+            # The kernel reconstructs C's layout from the raw pointer,
+            # so the view's strides don't affect computation.
+            launch_out = (
+                out.as_strided(out.shape, (1, out.shape[0])) if swap_ab else out
+            )
             compiled_gemm(
                 kernel_a,
                 kernel_b,
