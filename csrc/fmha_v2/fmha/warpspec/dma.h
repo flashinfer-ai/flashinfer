@@ -331,11 +331,24 @@ struct DMA {
           bidh = tile_id_ % params.h;
           bidb = tile_id_ / params.h;
         } else if (SCHEDULING_MODE == 1) {
-          bidb = tile_id_ / (params.h * params.num_tiles_per_head);
-          tmp = tile_id_ % (params.h * params.num_tiles_per_head);
-          bidh = tmp / params.num_tiles_per_head;
-          local_q_tile_offset = (tmp % params.num_tiles_per_head) * NUM_COMPUTE_GROUPS * STEP_Q;
-          q_steps = NUM_COMPUTE_GROUPS;
+          // Balanced scheduling: heaviest Q tiles first, interleaved across heads.
+          // Mirrors run_packed_qkv's use_balanced_scheduling logic.
+          // Benefit: last wave consists of lightest tiles, minimising SM idle at tail.
+          if (CAUSAL_MASK && !SLIDING_OR_CHUNKED_ATTENTION && params.use_balanced_scheduling) {
+            local_q_tile_offset =
+                (params.num_tiles_per_head - 1 - tile_id_ / (params.b * params.h)) *
+                NUM_COMPUTE_GROUPS * STEP_Q;
+            tmp = tile_id_ % (params.b * params.h);
+            bidh = tmp / params.b;
+            bidb = tmp % params.b;
+            q_steps = NUM_COMPUTE_GROUPS;
+          } else {
+            bidb = tile_id_ / (params.h * params.num_tiles_per_head);
+            tmp = tile_id_ % (params.h * params.num_tiles_per_head);
+            bidh = tmp / params.num_tiles_per_head;
+            local_q_tile_offset = (tmp % params.num_tiles_per_head) * NUM_COMPUTE_GROUPS * STEP_Q;
+            q_steps = NUM_COMPUTE_GROUPS;
+          }
         } else {  // SCHEDULING_MODE == 2
           local_q_tile_offset = (params.num_tiles_per_head - 1 - tile_id_ / (params.b * params.h)) *
                                 NUM_COMPUTE_GROUPS * STEP_Q;

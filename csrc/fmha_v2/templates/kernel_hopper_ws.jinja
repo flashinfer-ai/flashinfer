@@ -345,9 +345,14 @@ void {{ launcher_name }}(
         params.num_tiles_per_head = static_cast<uint32_t>(m_steps);
         params.num_tiles = static_cast<uint32_t>(m_steps * params.b * params.h);
         if (launch_params.attention_mask_type == Attention_mask_type::CAUSAL) {
-            // 2 * {{ bytes_per_elt }} stands for kv cache and {{ bytes_per_elt }} bytes per element.
-            size_t size_in_bytes = params.b * params.h * params.s * params.d * 2 * {{ bytes_per_elt }};
-            params.use_balanced_scheduling = (size_in_bytes <= launch_params.device_l2_cache_size);
+            // Always use balanced scheduling for causal attention with dynamic tile assignment.
+            // Balanced mode processes heaviest Q tiles (large q_step_offset) first so that the
+            // "last wave" consists of the lightest tiles (1–2 KV iterations), minimising SM idle
+            // time at the tail.  The original heuristic (enable only when KV fits in L2) was
+            // intended to avoid cache-thrashing overhead, but for long sequences the load-balance
+            // benefit dominates: the unbalanced tail can leave 131/132 SMs idle while the single
+            // heaviest tile (157 KV iters for seq=20K) completes, costing ~20% efficiency.
+            params.use_balanced_scheduling = true;
         }
 
         block_size.x = 1;
