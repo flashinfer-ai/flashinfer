@@ -603,6 +603,31 @@ def determine_mla_backend(device: torch.device) -> str:
     return "fa3" if is_sm90a_supported(device) else "fa2"
 
 
+def _check_block_tables_shape(
+    block_tables: torch.Tensor,
+    uses_shared_paged_kv_idx: bool,
+) -> None:
+    """Validate ``block_tables`` rank against the paged KV index layout.
+
+    Shared layout (``uses_shared_paged_kv_idx=True``) expects a 2-D tensor
+    ``[batch_size, max_num_pages_per_seq]``.  Separate layout expects a 3-D
+    tensor ``[batch_size, 2, max_num_pages_per_seq]`` where dim1 distinguishes
+    K (0) and V (1) page indices.
+    """
+    expected_ndim = 2 if uses_shared_paged_kv_idx else 3
+    if block_tables.ndim != expected_ndim:
+        layout = "shared" if uses_shared_paged_kv_idx else "separate"
+        raise ValueError(
+            f"block_tables must be {expected_ndim}D for {layout} paged KV layout, "
+            f"got ndim={block_tables.ndim}"
+        )
+    if not uses_shared_paged_kv_idx and block_tables.shape[1] != 2:
+        raise ValueError(
+            f"block_tables must have shape[1]==2 for separate KV indices, "
+            f"got shape={block_tables.shape}"
+        )
+
+
 def check_shape_dtype_device(
     x: torch.Tensor,
     expected_shape: Optional[Sequence[int]],

@@ -155,8 +155,6 @@ def xqa(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
-    k_sf_cache: Optional[torch.Tensor],
-    v_sf_cache: Optional[torch.Tensor],
     page_table: torch.Tensor,
     seq_lens: torch.Tensor,
     output: torch.Tensor,
@@ -174,6 +172,9 @@ def xqa(
     rcp_out_scale: float = 1.0,
     q_seq_len: int = 1,
     mask: Optional[torch.Tensor] = None,
+    *,
+    k_sf_cache: Optional[torch.Tensor] = None,
+    v_sf_cache: Optional[torch.Tensor] = None,
 ) -> None:
     r"""Apply attention with paged KV cache using XQA kernel.
     Parameters
