@@ -428,6 +428,39 @@ struct Softmax_base {
     }
   }
 
+  // Apply correction to ctile_o only (without filling frag_p), for on-the-fly BMM2.
+  // Separating this from pack() avoids allocating frag_p[MMAS_K] (32 regs) simultaneously
+  // with elt_ (64 regs) and ctile_o (64 regs), reducing peak register pressure.
+  template <bool IS_FIRST_COL>
+  inline __device__ void apply_o_correction(Compute_tile_o& ctile_o) {
+    if constexpr (!IS_FIRST_COL) {
+#pragma unroll
+      for (int mi = 0; mi < Mma_tile_o::CORES_M; mi++) {
+        const uint32_t scale = float_to_half2(correction_[mi]);
+#pragma unroll
+        for (int mma_ni = 0; mma_ni < Mma_tile_o::MMAS_N; mma_ni++) {
+#pragma unroll
+          for (int ni = 0; ni < Mma_tile_o::CORES_N; ni++) {
+            uint32_t& reg = ctile_o.acc_[0][mma_ni].reg(ni * Mma_tile_o::CORES_M + mi);
+            reg = hmul2(reg, scale);
+          }
+        }
+      }
+    } else {
+      ctile_o.clear();
+    }
+  }
+
+  // Convert a single BMM2 K-group (ni) from elt_ to frag_p format (fp16 half2).
+  // Called per-iteration inside the BMM2 WGMMA loop; only 4 regs live at a time vs 32 for
+  // frag_p[MMAS_K].
+  inline __device__ void pack_single(int ni, Fragment_p& frag_p_temp) {
+    frag_p_temp.reg(0) = float2_to_half2(elt_[0][4 * ni + 0], elt_[0][4 * ni + 1]);
+    frag_p_temp.reg(1) = float2_to_half2(elt_[1][4 * ni + 0], elt_[1][4 * ni + 1]);
+    frag_p_temp.reg(2) = float2_to_half2(elt_[0][4 * ni + 2], elt_[0][4 * ni + 3]);
+    frag_p_temp.reg(3) = float2_to_half2(elt_[1][4 * ni + 2], elt_[1][4 * ni + 3]);
+  }
+
   // BMM1 scale.
   const uint32_t scale_bmm1_;
   // BMM1 softcapping scale.
@@ -540,6 +573,10 @@ struct Softmax_fp32_base : public Softmax_base<Traits, Kernel_traits> {
   // Whether we need to check if local_max could be -inf or not.
   enum { CHECK_IF_NEG_INF_EXISTS = Base::CHECK_IF_NEG_INF_EXISTS };
 
+  // Default: uses elt_[] intermediate buffer for softmax (not the direct-acc path).
+  // BF16 Softmax with SAGE_BLOCK_SIZE_K==0 overrides this to true.
+  static constexpr bool USE_DIRECT_ACC = false;
+
   // Ctor.
   template <typename Params>
   inline __device__ Softmax_fp32_base(Params const& params, int tidx) : Base(params, tidx) {}
@@ -561,6 +598,29 @@ struct Softmax_fp32_base : public Softmax_base<Traits, Kernel_traits> {
         // Store to elt array.
         reinterpret_cast<float2*>(&this->elt_[mi][2 * ni])[0] = f2;
       }
+    }
+  }
+
+  // Apply fp32 correction to ctile_o (overrides Softmax_base's fp16 version for fp32/bf16/e4m3).
+  template <bool IS_FIRST_COL>
+  inline __device__ void apply_o_correction(Compute_tile_o& ctile_o) {
+    if constexpr (!IS_FIRST_COL) {
+#pragma unroll
+      for (int mi = 0; mi < Mma_tile_o::CORES_M; mi++) {
+        float correction = this->correction_[mi];
+#pragma unroll
+        for (int mma_ni = 0; mma_ni < Mma_tile_o::MMAS_N; mma_ni++) {
+#pragma unroll
+          for (int ni = 0; ni < Mma_tile_o::CORES_N; ni++) {
+            uint32_t& reg0 = ctile_o.acc_[0][mma_ni].reg(2 * ni * Mma_tile_o::CORES_M + 2 * mi);
+            uint32_t& reg1 = ctile_o.acc_[0][mma_ni].reg(2 * ni * Mma_tile_o::CORES_M + 2 * mi + 1);
+            asm volatile("mul.f32 %0, %0, %1;\n" : "+r"(reg0) : "f"(correction));
+            asm volatile("mul.f32 %0, %0, %1;\n" : "+r"(reg1) : "f"(correction));
+          }
+        }
+      }
+    } else {
+      ctile_o.clear();
     }
   }
 };
@@ -626,44 +686,301 @@ struct Softmax<Hopper_hgmma_fp32_traits, Kernel_traits>
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Hopper_hgmma_bf16_traits
+//
+// When SAGE_BLOCK_SIZE_K == 0 (the common BF16 prefill/decode case), all softmax operations are
+// performed directly on ctile_p.acc_[], bypassing the elt_[2][32] intermediate buffer entirely.
+//
+// Motivation: The inherited elt_[2][32] (64 FP32 values) in Softmax_base causes register spilling
+// because peak simultaneous register demand is 64(ctile_p) + 64(ctile_o) + 32(frag_p) + 64(elt_)
+// = 224, which exceeds the 168-register hardware limit. FA3 avoids this by operating softmax
+// in-place on the FP32 accumulator; we replicate that approach here.
+//
+// With the direct-acc path, peak pressure drops to ~164 registers (no elt_ spill), which matches
+// FA3's zero-local-memory-sector behavior.
+//
+// Index mapping (derived from Softmax_fp32_base::unpack):
+//   elt_[mi][2*ni + k] = acc_[0][0].elt(4*ni + 2*mi + k)  for k in {0,1}
+//   pack() mapping: frag_p[ni] covers acc_ regs [8*ni .. 8*ni+7]
 template <typename Kernel_traits>
 struct Softmax<Hopper_hgmma_bf16_traits, Kernel_traits>
     : public Softmax_fp32_base<Hopper_hgmma_bf16_traits, Kernel_traits> {
   // The Base class.
   using Base = Softmax_fp32_base<Hopper_hgmma_bf16_traits, Kernel_traits>;
 
+  // The GMMA compute tile for BMM1.
+  using Compute_tile_p = typename Base::Compute_tile_p;
   // The GMMA compute tile for BMM2.
   using Compute_tile_o = typename Base::Compute_tile_o;
 
+  // The MMA tile for the BMM1.
+  using Mma_tile_p = typename Base::Mma_tile_p;
   // The MMA tile for the BMM2.
   using Mma_tile_o = typename Base::Mma_tile_o;
 
   // The fragment of BMM1 output.
   using Fragment_p = typename Compute_tile_o::Fragment;
 
+  // Override USE_DIRECT_ACC: bypass elt_[] and operate directly on ctile_p.acc_ registers.
+  // Only active when SAGE_BLOCK_SIZE_K == 0 (the common BF16 prefill/decode case).
+  // ctile_p is NEVER stored as a pointer — it is always passed as a direct reference parameter
+  // to prevent CUDA from forcing ctile_p.acc_ into local memory via pointer-escape analysis.
+  static constexpr bool USE_DIRECT_ACC = (Kernel_traits::SAGE_BLOCK_SIZE_K == 0);
+
   // Ctor.
   template <typename Params>
   inline __device__ Softmax(Params const& params, int tidx) : Base(params, tidx) {}
 
-  // Update flash attention scales and pack elements for BMM2.
-  template <bool IS_FIRST_COL>
-  inline __device__ void pack(Compute_tile_o& ctile_o, Fragment_p (&frag_p)[Mma_tile_o::MMAS_K]) {
-// Pack 4 cols for BMM2 A tile.
+  // Override unpack: for the direct-acc path this is a no-op — scale is applied in-place
+  // inside compute_and_update_scale (which receives ctile_p directly).
+  // For the SAGE path (USE_DIRECT_ACC=false), delegate to base which populates elt_[].
+  inline __device__ void unpack(Compute_tile_p& ctile_p) {
+    if constexpr (!USE_DIRECT_ACC) {
+      // SAGE case: delegate to base class which populates elt_[].
+      Base::unpack(ctile_p);
+    }
+    // Direct-acc path: no-op.  Scale is handled at the start of compute_and_update_scale
+    // when !EXP2F_OPTIMIZATION; nothing to do here when EXP2F_OPTIMIZATION=true.
+  }
+
+  // Override apply_alibi_and_mask: for non-SAGE BF16, read/write acc_ directly (no elt_ I/O).
+  template <bool APPLY_MASK, typename AlibiParams>
+  inline __device__ void apply_alibi_and_mask(Compute_tile_p& ctile_p,
+                                              AlibiParams const& alibi_params,
+                                              float const alibi_head_scale, int actual_seqlen,
+                                              int row_offset, int col_offset) {
+    if constexpr (Kernel_traits::SAGE_BLOCK_SIZE_K == 0) {
 #pragma unroll
-    for (int ni = 0; ni < Mma_tile_o::MMAS_K; ni++) {
-      frag_p[ni].reg(0) = float2_to_bf16_x2(this->elt_[0][4 * ni + 0], this->elt_[0][4 * ni + 1]);
-      frag_p[ni].reg(1) = float2_to_bf16_x2(this->elt_[1][4 * ni + 0], this->elt_[1][4 * ni + 1]);
-      frag_p[ni].reg(2) = float2_to_bf16_x2(this->elt_[0][4 * ni + 2], this->elt_[0][4 * ni + 3]);
-      frag_p[ni].reg(3) = float2_to_bf16_x2(this->elt_[1][4 * ni + 2], this->elt_[1][4 * ni + 3]);
+      for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++) {
+#pragma unroll
+        for (int ni = 0; ni < Mma_tile_p::CORES_N; ni++) {
+          bool v0 = true, v1 = true;
+          int col = 0;
+          if constexpr (APPLY_MASK) {
+            if constexpr (Base::USE_CUSTOM_MASK) {
+              this->valid_positions(mi, ni, v0, v1);
+            } else if constexpr (Base::CAUSAL_MASK) {
+              int row = row_offset + this->quad_row_ + mi * 8;
+              col = col_offset + this->quad_col_ * 2 + ni * 8;
+              v0 = (col <= row);
+              v1 = (col + 1 <= row);
+              if constexpr (Base::SLIDING_OR_CHUNKED_ATTENTION) {
+                int sw_start = this->compute_sliding_window_or_chunk_start(row);
+                v0 &= (col >= sw_start);
+                v1 &= (col + 1 >= sw_start);
+              }
+            } else {
+              col = col_offset + this->quad_col_ * 2 + ni * 8;
+              v0 = (col < actual_seqlen);
+              v1 = (col + 1 < actual_seqlen);
+            }
+          }
+
+          float& f0 = ctile_p.acc_[0][0].elt(4 * ni + 2 * mi);
+          float& f1 = ctile_p.acc_[0][0].elt(4 * ni + 2 * mi + 1);
+
+          if constexpr (Base::ENABLE_BMM1_SOFTCAPPING_SCALE) {
+            f0 = this->softcapping_scale_bmm1_ * fmha::__tanhf(f0);
+            f1 = this->softcapping_scale_bmm1_ * fmha::__tanhf(f1);
+          }
+
+          if constexpr (Base::APPLY_ALIBI) {
+            f0 = v0 ? (f0 * alibi_params.scale_after_alibi +
+                       (col + alibi_params.sequence_pos_offset) * alibi_head_scale)
+                    : -FLT_MAX;
+            f1 = v1 ? (f1 * alibi_params.scale_after_alibi +
+                       (col + 1 + alibi_params.sequence_pos_offset) * alibi_head_scale)
+                    : -FLT_MAX;
+          } else {
+            f0 = v0 ? f0 : -FLT_MAX;
+            f1 = v1 ? f1 : -FLT_MAX;
+          }
+        }
+      }
+    } else {
+      // SAGE case: delegate to base class which uses elt_[].
+      Base::template apply_alibi_and_mask<APPLY_MASK>(ctile_p, alibi_params, alibi_head_scale,
+                                                      actual_seqlen, row_offset, col_offset);
+    }
+  }
+
+  // Override compute_and_update_scale: for the direct-acc path (USE_DIRECT_ACC=true), ctile_p is
+  // passed by direct reference so its acc_ registers are never pointer-escaped into local memory.
+  // For the SAGE path (USE_DIRECT_ACC=false), ctile_p is unused and base class (elt_[]) is called.
+  template <bool IS_FIRST_COL>
+  inline __device__ bool compute_and_update_scale(Compute_tile_p& ctile_p,
+                                                  float (&global_max)[Mma_tile_p::CORES_M],
+                                                  float (&global_sum)[Mma_tile_p::CORES_M],
+                                                  uint32_t* skip_softmax_vote) {
+    if constexpr (USE_DIRECT_ACC) {
+      auto& acc = ctile_p.acc_[0][0];
+      float const scale = reinterpret_cast<float const&>(this->scale_bmm1_);
+
+      // Apply bmm1 scale in-place if not fused into exp2f (EXP2F_OPTIMIZATION=false).
+      // When EXP2F_OPTIMIZATION=true the scale is folded into custom_exp2f below.
+      if constexpr (!Base::EXP2F_OPTIMIZATION) {
+#pragma unroll
+        for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++) {
+#pragma unroll
+          for (int ni = 0; ni < Mma_tile_p::CORES_N; ni++) {
+            acc.elt(4 * ni + 2 * mi) *= scale;
+            acc.elt(4 * ni + 2 * mi + 1) *= scale;
+          }
+        }
+      }
+
+      constexpr bool may_skip = Kernel_traits::ENABLE_SKIP_SOFTMAX && !IS_FIRST_COL;
+      bool skip = may_skip;
+
+      // Row-wise max, computed directly from acc_.
+#pragma unroll
+      for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++) {
+        this->local_max_[mi] = acc.elt(2 * mi);
+#pragma unroll
+        for (int ni = 0; ni < Mma_tile_p::CORES_N; ni++) {
+          this->local_max_[mi] = fmaxf(this->local_max_[mi], acc.elt(4 * ni + 2 * mi));
+          this->local_max_[mi] = fmaxf(this->local_max_[mi], acc.elt(4 * ni + 2 * mi + 1));
+        }
+        this->local_max_[mi] =
+            fmaxf(__shfl_xor_sync(uint32_t(-1), this->local_max_[mi], 1), this->local_max_[mi]);
+        this->local_max_[mi] =
+            fmaxf(__shfl_xor_sync(uint32_t(-1), this->local_max_[mi], 2), this->local_max_[mi]);
+
+        if constexpr (may_skip) {
+          if constexpr (!Base::EXP2F_OPTIMIZATION) {
+            skip &= expf(this->local_max_[mi] - global_max[mi]) < this->skip_softmax_threshold;
+          } else {
+            skip &= exp2f((this->local_max_[mi] - global_max[mi]) * scale) <
+                    this->skip_softmax_threshold;
+          }
+        }
+
+        if (!IS_FIRST_COL) {
+          this->local_max_[mi] = fmaxf(this->local_max_[mi], global_max[mi]);
+        }
+      }
+
+      if constexpr (Kernel_traits::ENABLE_SKIP_SOFTMAX) {
+#ifdef SKIP_SOFTMAX_STAT
+        this->total_blocks++;
+#endif
+        if constexpr (may_skip) {
+          skip = __all_sync(0xffffffff, skip);
+          if (threadIdx.x % 32 == 0) {
+            atomicAnd(skip_softmax_vote, uint32_t(skip));
+          }
+          named_barrier_wait(Base::SKIP_SOFTMAX_BARRIER + threadIdx.x / 128, 128);
+          skip = *((uint32_t volatile*)skip_softmax_vote);
+          if (skip) {
+#ifdef SKIP_SOFTMAX_STAT
+            this->skipped_blocks++;
+#endif
+            return false;
+          }
+        }
+      }
+
+      // Softmax exp in-place on acc_.
+#pragma unroll
+      for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++) {
+#pragma unroll
+        for (int ni = 0; ni < Mma_tile_p::CORES_N; ni++) {
+          float& f0 = acc.elt(4 * ni + 2 * mi);
+          float& f1 = acc.elt(4 * ni + 2 * mi + 1);
+          if constexpr (!Base::EXP2F_OPTIMIZATION) {
+            float const masked_max =
+                (!Base::CHECK_IF_NEG_INF_EXISTS || this->local_max_[mi] != -FLT_MAX)
+                    ? this->local_max_[mi]
+                    : 0.f;
+            f0 = expf(f0 - masked_max);
+            f1 = expf(f1 - masked_max);
+          } else {
+            float const masked_max =
+                (!Base::CHECK_IF_NEG_INF_EXISTS || this->local_max_[mi] != -FLT_MAX)
+                    ? this->local_max_[mi] * scale
+                    : 0.f;
+            f0 = custom_exp2f(f0, scale, masked_max);
+            f1 = custom_exp2f(f1, scale, masked_max);
+          }
+        }
+      }
+
+      // Row-wise sum of current tile.
+#pragma unroll
+      for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++) {
+        this->local_sum_[mi] = 0.f;
+#pragma unroll
+        for (int ni = 0; ni < Mma_tile_p::CORES_N; ni++) {
+          this->local_sum_[mi] += acc.elt(4 * ni + 2 * mi);
+          this->local_sum_[mi] += acc.elt(4 * ni + 2 * mi + 1);
+        }
+        this->local_sum_[mi] += __shfl_xor_sync(uint32_t(-1), this->local_sum_[mi], 1);
+        this->local_sum_[mi] += __shfl_xor_sync(uint32_t(-1), this->local_sum_[mi], 2);
+      }
+
+      // Initialize or update the global sum and max.
+      if (IS_FIRST_COL) {
+#pragma unroll
+        for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++) {
+          global_sum[mi] = this->local_sum_[mi];
+          global_max[mi] = this->local_max_[mi];
+        }
+      } else {
+#pragma unroll
+        for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++) {
+          float const max_old = global_max[mi];
+          float const max_new = this->local_max_[mi];
+          float const sum_old = global_sum[mi];
+          float const sum_new = this->local_sum_[mi];
+          if constexpr (!Base::EXP2F_OPTIMIZATION) {
+            this->correction_[mi] = expf(max_old - max_new);
+          } else {
+            this->correction_[mi] = exp2f((max_old - max_new) * scale);
+          }
+          global_sum[mi] = sum_old * this->correction_[mi] + sum_new;
+          global_max[mi] = max_new;
+        }
+      }
+      return true;
+    } else {
+      // SAGE case: delegate to base class which uses elt_[].
+      return Base::template compute_and_update_scale<IS_FIRST_COL>(global_max, global_sum,
+                                                                   skip_softmax_vote);
+    }
+  }
+
+  // Override pack: for direct-acc path, convert acc_ directly to frag_p (no elt_[] intermediate).
+  // ctile_p passed by direct reference — never stored as a pointer.
+  // Index mapping: frag_p[ni] covers acc_ registers [8*ni .. 8*ni+7].
+  template <bool IS_FIRST_COL>
+  inline __device__ void pack(Compute_tile_p& ctile_p, Compute_tile_o& ctile_o,
+                              Fragment_p (&frag_p)[Mma_tile_o::MMAS_K]) {
+    if constexpr (USE_DIRECT_ACC) {
+      auto& acc = ctile_p.acc_[0][0];
+#pragma unroll
+      for (int ni = 0; ni < Mma_tile_o::MMAS_K; ni++) {
+        frag_p[ni].reg(0) = float2_to_bf16_x2(acc.elt(8 * ni + 0), acc.elt(8 * ni + 1));
+        frag_p[ni].reg(1) = float2_to_bf16_x2(acc.elt(8 * ni + 2), acc.elt(8 * ni + 3));
+        frag_p[ni].reg(2) = float2_to_bf16_x2(acc.elt(8 * ni + 4), acc.elt(8 * ni + 5));
+        frag_p[ni].reg(3) = float2_to_bf16_x2(acc.elt(8 * ni + 6), acc.elt(8 * ni + 7));
+      }
+    } else {
+      // SAGE case: fall back to original elt_[]-based pack.
+#pragma unroll
+      for (int ni = 0; ni < Mma_tile_o::MMAS_K; ni++) {
+        frag_p[ni].reg(0) = float2_to_bf16_x2(this->elt_[0][4 * ni + 0], this->elt_[0][4 * ni + 1]);
+        frag_p[ni].reg(1) = float2_to_bf16_x2(this->elt_[1][4 * ni + 0], this->elt_[1][4 * ni + 1]);
+        frag_p[ni].reg(2) = float2_to_bf16_x2(this->elt_[0][4 * ni + 2], this->elt_[0][4 * ni + 3]);
+        frag_p[ni].reg(3) = float2_to_bf16_x2(this->elt_[1][4 * ni + 2], this->elt_[1][4 * ni + 3]);
+      }
     }
 
-    if (!IS_FIRST_COL) {
-// Correct accumulators to current max.
+    if constexpr (!IS_FIRST_COL) {
+// Correct ctile_o accumulators to current max.
 #pragma unroll
       for (int mi = 0; mi < Mma_tile_o::CORES_M; mi++) {
         // Assume only N has multiple MMAs (MMAS_M = 1).
         // MMAS_N > 1 when N dimension is split.
-        float correction = this->correction_[mi];
+        float const correction = this->correction_[mi];
 #pragma unroll
         for (int mma_ni = 0; mma_ni < Mma_tile_o::MMAS_N; mma_ni++) {
 #pragma unroll
@@ -677,6 +994,23 @@ struct Softmax<Hopper_hgmma_bf16_traits, Kernel_traits>
       }
     } else {
       ctile_o.clear();
+    }
+  }
+
+  // Pack a single group ni from acc_ into frag_p_temp (bf16 format, for on-the-fly BMM2).
+  // ctile_p passed by direct reference for the direct-acc path (never stored as a pointer).
+  inline __device__ void pack_single(Compute_tile_p& ctile_p, int ni, Fragment_p& frag_p_temp) {
+    if constexpr (USE_DIRECT_ACC) {
+      auto& acc = ctile_p.acc_[0][0];
+      frag_p_temp.reg(0) = float2_to_bf16_x2(acc.elt(8 * ni + 0), acc.elt(8 * ni + 1));
+      frag_p_temp.reg(1) = float2_to_bf16_x2(acc.elt(8 * ni + 2), acc.elt(8 * ni + 3));
+      frag_p_temp.reg(2) = float2_to_bf16_x2(acc.elt(8 * ni + 4), acc.elt(8 * ni + 5));
+      frag_p_temp.reg(3) = float2_to_bf16_x2(acc.elt(8 * ni + 6), acc.elt(8 * ni + 7));
+    } else {
+      frag_p_temp.reg(0) = float2_to_bf16_x2(this->elt_[0][4 * ni + 0], this->elt_[0][4 * ni + 1]);
+      frag_p_temp.reg(1) = float2_to_bf16_x2(this->elt_[1][4 * ni + 0], this->elt_[1][4 * ni + 1]);
+      frag_p_temp.reg(2) = float2_to_bf16_x2(this->elt_[0][4 * ni + 2], this->elt_[0][4 * ni + 3]);
+      frag_p_temp.reg(3) = float2_to_bf16_x2(this->elt_[1][4 * ni + 2], this->elt_[1][4 * ni + 3]);
     }
   }
 };
@@ -938,6 +1272,22 @@ struct Softmax<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
     } else {
       ctile_o.clear();
     }
+  }
+
+  // Pack a single group ni from elt_ into frag_p_temp (fp8 format, for on-the-fly BMM2).
+  inline __device__ void pack_single(int ni, Fragment_p& frag_p_temp) {
+    frag_p_temp.reg(0) = fmha::float4_to_fp8x4<Kernel_traits::Element_data_type>(
+        this->elt_[0][8 * ni + 0], this->elt_[0][8 * ni + 1], this->elt_[0][8 * ni + 2],
+        this->elt_[0][8 * ni + 3]);
+    frag_p_temp.reg(1) = fmha::float4_to_fp8x4<Kernel_traits::Element_data_type>(
+        this->elt_[1][8 * ni + 0], this->elt_[1][8 * ni + 1], this->elt_[1][8 * ni + 2],
+        this->elt_[1][8 * ni + 3]);
+    frag_p_temp.reg(2) = fmha::float4_to_fp8x4<Kernel_traits::Element_data_type>(
+        this->elt_[0][8 * ni + 4], this->elt_[0][8 * ni + 5], this->elt_[0][8 * ni + 6],
+        this->elt_[0][8 * ni + 7]);
+    frag_p_temp.reg(3) = fmha::float4_to_fp8x4<Kernel_traits::Element_data_type>(
+        this->elt_[1][8 * ni + 4], this->elt_[1][8 * ni + 5], this->elt_[1][8 * ni + 6],
+        this->elt_[1][8 * ni + 7]);
   }
 
   static constexpr float q_scale_s_ = Traits_o::SOFTMAX_FP_QUANT_SCALE;
