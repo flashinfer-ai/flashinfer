@@ -455,7 +455,8 @@ struct PolicyTraits<NoOpPreprocess, SoftmaxPostprocess> {
                          >;
 };
 
-/// Sigmoid + SumNormalize (SigmoidRenorm: Sigmoid -> TopK -> Renormalize).
+/// Sigmoid + SumNormalize (SigmoidRenorm: Sigmoid -> TopK -> Renormalize,
+///                          Sigmoid: Sigmoid -> TopK with normTopkProb=false).
 template <>
 struct PolicyTraits<SigmoidPreprocess, SumNormalizePostprocess> {
   using Pairs = TierList<Tier<128, 8>,  // Small expert counts (≤128 experts)
