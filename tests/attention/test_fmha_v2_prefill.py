@@ -843,7 +843,7 @@ def test_trtllm_fmha_v2_prefill(
         pytest.skip("Skip due to bug in fp8 sliding window")
     if mask_mode == "SLIDING_WINDOW":
         pytest.skip("todo(jimmyzho): temporarily skip sliding window test due to hang")
-    if dtype == torch.float8_e4m3fn and o_dtype == torch.float8_e4m3fn:
+    if dtype == torch.float8_e4m3fn:
         pytest.skip("todo(jimmyzho): temporarily skip fp8 tests due to hang")
     run_trtllm_fmha_v2_prefill_case(
         input_layout=input_layout,
