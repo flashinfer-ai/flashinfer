@@ -319,16 +319,25 @@ __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int la
           }
         }
 
-        // Precompute intermediate-state base address (step=0) and per-step stride
-        // to replace a 64-bit multiply per step with an addition.
-        int64_t istate_base_dd = icache_idx * params.intermediate_state_stride_batch +
-                                 (int64_t)head * DIM * DSTATE + (int64_t)dd * DSTATE;
+        // Precompute intermediate-state pointer (step=0) and per-step stride.
+        // Using a direct pointer avoids 64-bit index add + shift-to-bytes per store.
+        int64_t const istate_base_dd = icache_idx * params.intermediate_state_stride_batch +
+                                       (int64_t)head * DIM * DSTATE + (int64_t)dd * DSTATE;
         int64_t const istate_step_stride = (int64_t)params.nheads * DIM * DSTATE;
+        state_t* __restrict__ istate_dd_ptr = istate_ptr + istate_base_dd;
+
+        // Strength-reduce step-dependent shared memory indexing:
+        // replace step * stride multiplies with pointer increments.
+        auto const* __restrict__ B_step = &sram.B[0][0];
+        auto const* __restrict__ C_step = &sram.C[0][0];
+        auto const* __restrict__ x_step = &sram.x[h][0][0];
+        float const* __restrict__ dt_step = &sram.dt[h][0];
+        float* __restrict__ out_step = &sram.out[0][0];
 
         for (int step = 0; step < NTOKENS; step++) {
-          float const dt_value = sram.dt[h][step];
+          float const dt_value = *dt_step;
           float const dA = __expf(A_val * dt_value);
-          float const x_value = toFloat(sram.x[h][step][dd]);
+          float const x_value = toFloat(x_step[dd]);
 
           // f32x2 packed recurrence
           float2 out2 = {0.f, 0.f};
@@ -345,8 +354,8 @@ __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int la
                 // OOB padding columns — no state update or output contribution
                 continue;
               }
-              float2 const B2 ]);
-              float2 const C2 = toFloat2(&sram.C[step][c0]);
+              float2 const B2 = toFloat2(&B_step[c0]);
+              float2 const C2 = toFloat2(&C_step[c0]);
               float2 dBx;
               mul_f32x2(dBx, B2, dtx2);                         // dBx = B * (dt * x)
               fma_f32x2(rState[t][p], dA2, rState[t][p], dBx);  // state = dA * state + dBx
@@ -362,8 +371,15 @@ __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int la
           }
 
           if (member == 0) {
-            sram.out[step][dd] = out_value + D_val * x_value;
+            out_step[dd] = out_value + D_val * x_value;
           }
+
+          // Advance step pointers (addition instead of multiply)
+          B_step += DSTATE;
+          C_step += DSTATE;
+          x_step += DIM;
+          dt_step += 1;
+          out_step += DIM;
 
           // Write intermediate state
           if (istate_ptr && !IS_PAD) {
@@ -381,9 +397,9 @@ __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int la
                     rOut.val[e], rOut.val[e + 1], s0, s1, rand_seed, state_ptr_offset, dd, col0, e,
                     rand_ints);
               }
-              *reinterpret_cast<packed_tile_t*>(&istate_ptr[istate_base_dd + col0]) = rOut;
+              *reinterpret_cast<packed_tile_t*>(&istate_dd_ptr[col0]) = rOut;
             }
-            istate_base_dd += istate_step_stride;
+            istate_dd_ptr += istate_step_stride;
           }
 
           // Write final state at last step
