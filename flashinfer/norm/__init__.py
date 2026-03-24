@@ -169,7 +169,7 @@ def rmsnorm_quant(
     scale: Union[float, torch.Tensor],
     eps: float = 1e-6,
     enable_pdl: Optional[bool] = None,
-) -> None:
+) -> torch.Tensor:
     r"""Root mean square normalization + fp8 quantization.
 
     ``out[i] = ((input[i] / RMS(input)) * weight[i]).to(fp8)``
@@ -190,6 +190,10 @@ def rmsnorm_quant(
         Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
 
+    Returns
+    -------
+    out: torch.Tensor
+        The output tensor.
     """
     scale = _normalize_scale_tensor(scale, input)
     if enable_pdl is None:
@@ -200,6 +204,8 @@ def rmsnorm_quant(
         rmsnorm_quant_cute(
             out, input, weight, scale, eps, weight_bias=0.0, enable_pdl=enable_pdl
         )
+    # NOTE: return out for backwards compatibility with v0.6.6 API
+    return out
 
 
 @register_fake_op("flashinfer::rmsnorm_quant")
