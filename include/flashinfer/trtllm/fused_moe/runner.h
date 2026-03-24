@@ -50,8 +50,10 @@ enum class RoutingMethodType : int64_t {
   TopK = 5,
   // SigmoidRenorm: Sigmoid -> TopK -> Renormalize (divide by sum of top-K weights)
   SigmoidRenorm = 6,
+  // Sigmoid: Sigmoid -> TopK (no renormalization)
+  Sigmoid = 7,
   // Unspecified
-  Unspecified = 7,
+  Unspecified = 8,
 };
 
 inline int32_t maybeGetMinTokenCount(int32_t numPaddedTokens, int32_t hiddenSize,
@@ -77,6 +79,8 @@ inline std::string serializeMoeRoutingMethodType(RoutingMethodType routingMethod
       return "TopK";
     case RoutingMethodType::SigmoidRenorm:
       return "SigmoidRenorm";
+    case RoutingMethodType::Sigmoid:
+      return "Sigmoid";
     default:
       return "InvalidRountingMethod";  // TODO throw error
   };
