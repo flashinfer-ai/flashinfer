@@ -31,6 +31,8 @@ from typing import Optional, Tuple
 
 import torch
 
+from .jit.core import logger
+
 try:
     from .api_logging import flashinfer_api
 
@@ -172,8 +174,9 @@ def gated_delta_rule_decode_pretranspose(
         - State layout is v-major (K-last): [B, HV, V, K]. When state is bfloat16
           and T in 1..4 with K=V=128, the gdn_decode_klast_bf16_state kernel is used
           (supports both the direct ``state`` path and the pool+indices path).
-        - pool+indices (``initial_state``/``initial_state_indices``) only supported
-          via the bf16 fast path; float32 state raises an error.
+        - pool+indices (``initial_state``/``initial_state_indices``) supported on
+          both the bf16 fast path (T in 1..4, K=V=128) and the float32 legacy path
+          (T=1). The float32 path also supports negative indices for padding.
         - Legacy path (float32 state, T=1): K and V must be multiples of 4.
     """
     # Validate input shapes
@@ -239,13 +242,17 @@ def gated_delta_rule_decode_pretranspose(
         return_state = initial_state if use_pool else state
         return output, return_state
 
-    # Legacy path: T=1 only, float32 state (no pool+indices support)
-    assert not use_pool, (
-        "pool+indices (initial_state/initial_state_indices) requires bfloat16 state "
-        "with T in 1..4 and K=V=128 (the gdn_decode_klast_bf16_state fast path)"
-    )
+    # Legacy path: T=1 only, float32 state (supports pool+indices via CuTe DSL kernel)
+    use_pool_indexing = initial_state_indices is not None
     assert T == 1, f"Decode only supports T=1, got T={T}"
-    assert state.dtype == torch.float32, f"state must be float32, got {state.dtype}"
+
+    if use_pool:
+        assert initial_state.dtype == torch.float32, (
+            f"initial_state must be float32 for legacy path, got {initial_state.dtype}"
+        )
+    else:
+        assert state is not None, "Either state or initial_state must be provided"
+        assert state.dtype == torch.float32, f"state must be float32, got {state.dtype}"
 
     # Validate K and V constraints
     assert K >= 128, f"K must be at least 128, got K={K}"
@@ -273,8 +280,18 @@ def gated_delta_rule_decode_pretranspose(
         # Kernel outputs bfloat16, allocate in that dtype first
         output = torch.zeros((B, T, HV, V), dtype=torch.bfloat16, device=q.device)
 
-    # Convert state from [B, HV, V, K] to [B*HV, V, K] for kernel
-    h0_source = state.reshape(B * HV, V, K)
+    # Build h0_source: [pool_size*HV, V, K] for kernel
+    if use_pool:
+        pool_size = initial_state.shape[0]
+        assert initial_state.is_contiguous(), (
+            "initial_state (pool) must be contiguous for correct kernel pointer arithmetic"
+        )
+        h0_source = initial_state.reshape(pool_size * HV, V, K)
+        return_state = initial_state
+    else:
+        pool_size = B
+        h0_source = state.reshape(pool_size * HV, V, K)
+        return_state = state
 
     # Execute kernel
     run_pretranspose_decode(
@@ -295,18 +312,21 @@ def gated_delta_rule_decode_pretranspose(
         V,
         scale,
         use_qk_l2norm,
+        use_pool_indexing=use_pool_indexing,
+        initial_state_indices=initial_state_indices,
     )
 
-    # Copy state back only if state was not contiguous
+    # Copy state back only if not using pool and state was not contiguous
     # (if contiguous, reshape returns a view and kernel updated state in-place)
-    if not state.is_contiguous():
+    # Pool path: kernel writes directly into initial_state via pool indices
+    if not use_pool and not state.is_contiguous():
         state.copy_(h0_source.reshape(B, HV, V, K))
 
     # Convert output to target dtype if needed (kernel outputs bfloat16)
     if output.dtype != target_dtype:
         output = output.to(target_dtype)
 
-    return output, state
+    return output, return_state
 
 
 # ============================================================================
@@ -469,7 +489,7 @@ def gated_delta_rule_mtp(
     scale: Optional[float] = None,
     output: Optional[torch.Tensor] = None,
     intermediate_states_buffer: Optional[torch.Tensor] = None,
-    disable_state_update: bool = False,
+    disable_state_update: Optional[bool] = None,
     use_qk_l2norm: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -505,8 +525,15 @@ def gated_delta_rule_mtp(
         intermediate_states_buffer (Optional[torch.Tensor]):
             Buffer for caching intermediate states, shape ``[pool_size, T, HV, V, K]``.
             If None, intermediate states are not cached.
-        disable_state_update (bool):
-            If True, the initial state is not updated. Default: ``True``.
+        disable_state_update (Optional[bool]):
+            If True, the initial state is not updated. Currently defaults to ``True``.
+            Please pass this argument explicitly — the default will change to ``False``
+            in FlashInfer 0.7.0.
+
+            .. deprecated::
+                The implicit default of ``True`` is deprecated and will change to
+                ``False`` in version 0.7.0. Pass ``disable_state_update=True`` or
+                ``disable_state_update=False`` explicitly to silence the warning.
         use_qk_l2norm (bool):
             Whether to apply L2 normalization to q and k. Default: ``True``.
 
@@ -521,6 +548,16 @@ def gated_delta_rule_mtp(
         - State layout is K-last: [pool_size, HV, V, K]
         - Optimized for speculative decoding verification scenarios
     """
+    # Handle deprecation of disable_state_update default value
+    if disable_state_update is None:
+        logger.warning_once(
+            "gated_delta_rule_mtp(): the 'disable_state_update' parameter currently "
+            "defaults to True, but this default will change to False in FlashInfer "
+            "0.7.0. Please pass disable_state_update=True or "
+            "disable_state_update=False explicitly to suppress this warning."
+        )
+        disable_state_update = True
+
     # Validate input shapes
     B, T, H, K = q.shape
     _, _, HV, V = v.shape
