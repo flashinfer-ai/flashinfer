@@ -501,8 +501,7 @@ def allreduce_fusion(
                      True: signal completion after the kernel finishes (safe, no overlap).
                      False: signal completion early, allowing the next PDL-aware kernel
                      to overlap with this one. Only safe when the subsequent kernel also
-                     uses cudaGridDependencySynchronize(). Can yield 4%+ E2E speedup
-                     for models like DeepSeek.
+                     uses cudaGridDependencySynchronize().
 
         # ===== OUTPUT tensors (pre-allocated, filled by function) =====
         output: AllReduce output [token_num, hidden_dim]
