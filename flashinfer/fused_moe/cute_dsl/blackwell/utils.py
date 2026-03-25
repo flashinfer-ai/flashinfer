@@ -44,6 +44,7 @@
 # This file is copied and modified from cutlass https://github.com/NVIDIA/cutlass/blob/main/python/CuTeDSL/cutlass/cute/core.py
 
 import ctypes
+import functools
 from typing import Union
 
 import cutlass
@@ -197,6 +198,13 @@ def is_power_of_2(x: int) -> bool:
     return x > 0 and (x & (x - 1)) == 0
 
 
+@functools.lru_cache(maxsize=None)
+def _nvvm_fmin_needs_res():
+    import inspect
+
+    return "res" in inspect.signature(nvvm.fmin).parameters
+
+
 @dsl_user_op
 def fmin(
     a: Union[float, cutlass.Float32],
@@ -206,16 +214,15 @@ def fmin(
     loc=None,
     ip=None,
 ) -> cutlass.Float32:
-    return cutlass.Float32(
-        nvvm.fmin(
-            T.f32(),
-            cutlass.Float32(a).ir_value(loc=loc, ip=ip),
-            cutlass.Float32(b).ir_value(loc=loc, ip=ip),
-            nan=nan,
-            loc=loc,
-            ip=ip,
-        )
-    )
+    a_val = cutlass.Float32(a).ir_value(loc=loc, ip=ip)
+    b_val = cutlass.Float32(b).ir_value(loc=loc, ip=ip)
+    if _nvvm_fmin_needs_res():
+        # CUDA 12: nvvm.fmin(res, a, b, ...)
+        result = nvvm.fmin(T.f32(), a_val, b_val, nan=nan, loc=loc, ip=ip)
+    else:
+        # CUDA 13: nvvm.fmin(a, b, ...)
+        result = nvvm.fmin(a_val, b_val, nan=nan, loc=loc, ip=ip)
+    return cutlass.Float32(result)
 
 
 def sigmoid_f32(
