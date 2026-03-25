@@ -176,26 +176,34 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
           dim3 grid(params.batch, params.nheads / HEADS_PER_CTA);
           dim3 block(warpSize, horiz::NUM_WARPS);
 
-          // TMA state descriptor: tile by TMA_STATE_ROWS
+          // TMA state descriptor: tile by (BANK_CYCLE_ELEMS, TMA_STATE_ROWS).
+          // Sub-tile-major smem layout eliminates bank conflicts for non-power-of-2 DSTATE.
+          // TMA's OOB fill zeros out partial tiles (e.g. cols 96–127 when DSTATE=96).
+          constexpr int BANK_CYCLE_ELEMS =
+              32 * (int)sizeof(uint32_t) / (int)sizeof(state_t);  // 64 for f16/bf16
+          constexpr int DSTATE_SMEM = sram_t::DSTATE_SMEM;
+          // State/B/C tensor maps use FILL_NONE: OOB elements are NOT written
+          // to smem, so pre-zeroed padding columns remain zero.
           auto state_tensor = tma::buildNdDescriptor(
               typeid(state_t),
               /*shapes*/ {DSTATE, DIM, params.nheads, params.state_cache_size},
               /*strides*/ {1, DSTATE, DSTATE * DIM, params.state_stride_batch},
-              /*tiles*/ {DSTATE, TMA_STATE_ROWS, 1, 1}, params.state);
+              /*tiles*/ {BANK_CYCLE_ELEMS, TMA_STATE_ROWS, 1, 1}, params.state);
 
+          // B/C: tile by DSTATE_SMEM to match padded smem layout.
           auto B_tensor = tma::buildNdDescriptor(
               typeid(input_t),
               {(uint64_t)DSTATE, (uint64_t)params.ngroups, (uint64_t)params.ntokens_mtp,
                (uint64_t)params.batch},
               {1, (uint64_t)DSTATE, (uint64_t)params.B_stride_mtp, (uint64_t)params.B_stride_batch},
-              {DSTATE, 1, NTOKENS_MTP, 1}, params.B);
+              {DSTATE_SMEM, 1, NTOKENS_MTP, 1}, params.B);
 
           auto C_tensor = tma::buildNdDescriptor(
               typeid(input_t),
               {(uint64_t)DSTATE, (uint64_t)params.ngroups, (uint64_t)params.ntokens_mtp,
                (uint64_t)params.batch},
               {1, (uint64_t)DSTATE, (uint64_t)params.C_stride_mtp, (uint64_t)params.C_stride_batch},
-              {DSTATE, 1, NTOKENS_MTP, 1}, params.C);
+              {DSTATE_SMEM, 1, NTOKENS_MTP, 1}, params.C);
 
           auto x_tensor = tma::buildNdDescriptor(
               typeid(input_t),
