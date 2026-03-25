@@ -2,14 +2,12 @@
 End-to-end benchmark for the DeepSeek v3 sparse-attention indexer.
 
 Compares:
-  - mqa_topk_indexer        : fused logits + histogram top-K (FlashInfer, SM100a)
-  - mqa_topk_indexer_non_fused: separate logits + radix top-K (FlashInfer, SM100a)
+  - dsv3_topk_indexer        : fused logits + histogram top-K (FlashInfer, SM100a)
   - deep_gemm reference     : fp8_paged_mqa_logits + flashinfer.top_k
                               (optional, requires deep_gemm)
 
 Usage:
   python benchmarks/bench_dsv3_sparse_indexer.py
-  python benchmarks/bench_dsv3_sparse_indexer.py --pdl
   python benchmarks/bench_dsv3_sparse_indexer.py --batch-sizes 1 4 64 --seq-lens 4096 32768
 """
 
@@ -20,8 +18,8 @@ import torch
 
 import flashinfer
 from flashinfer.dsv3_ops import (
-    get_mqa_metadata,
-    mqa_topk_indexer,
+    get_indexer_metadata,
+    dsv3_topk_indexer,
 )
 from flashinfer.testing.utils import bench_gpu_time
 
@@ -113,12 +111,12 @@ def bench_dsv3_sparse_indexer(
     Returns:
         dict with keys:
           batch_size, seq_len,
-          mqa_fused_us, mqa_non_fused_us,
+          dsv3_indexer_fused_us
           [deepgemm_ref_us, speedup_vs_deepgemm]
     """
     q, k_cache, weights, seq_lens, block_table = _make_test_data(batch_size, seq_len)
     max_model_len = block_table.shape[1] * 64
-    sm_map = get_mqa_metadata(seq_lens)
+    sm_map = get_indexer_metadata(seq_lens)
 
     # for multiple kernels best use cuda graph with or without cupti
     enable_cupti = True
@@ -126,7 +124,7 @@ def bench_dsv3_sparse_indexer(
 
     # -- fused: logits + histogram top-K in one pass --------------------------
     measurements = bench_gpu_time(
-        lambda: mqa_topk_indexer(
+        lambda: dsv3_topk_indexer(
             q,
             k_cache,
             weights,
@@ -145,7 +143,7 @@ def bench_dsv3_sparse_indexer(
     result = {
         "batch_size": batch_size,
         "seq_len": seq_len,
-        "mqa_fused_us": fused_ms * 1e3,
+        "dsv3_indexer_fused_us": fused_ms * 1e3,
     }
 
     # -- deep_gemm reference: fp8_paged_mqa_logits + flashinfer top_k --------
@@ -206,7 +204,7 @@ def main():
         "--seq-lens",
         type=int,
         nargs="+",
-        default=[1024, 4096, 8192, 32768, 40960],
+        default=[1024, 4096, 8192, 32768, 40960, 1 << 17, 1 << 18, 1 << 19],
         metavar="L",
         help="Sequence lengths to benchmark (default: 1024 4096 8192 32768 40960)",
     )
@@ -214,8 +212,7 @@ def main():
 
     print("=" * 100)
     print("dsv3_sparse_indexer: DeepSeek v3 sparse-attention end-to-end (k=2048, fp8)")
-    print("  mqa_fused:     FlashInfer fused logits + histogram top-K")
-    print("  mqa_non_fused: FlashInfer separate logits + radix top-K")
+    print("  dsv3_indexer_fused:     FlashInfer fused logits + histogram top-K")
     if HAS_DEEP_GEMM:
         print("  deepgemm_ref:  deep_gemm fp8_paged_mqa_logits + flashinfer top_k")
     print("=" * 100)
@@ -223,13 +220,11 @@ def main():
     if HAS_DEEP_GEMM:
         header = (
             f"{'batch':>6} {'seq_len':>10} |"
-            f" {'mqa_fused':>12} {'mqa_non_fused':>15}"
+            f" {'dsv3_indexer_fused':>12} "
             f" {'deepgemm_ref':>14} {'speedup':>10}"
         )
     else:
-        header = (
-            f"{'batch':>6} {'seq_len':>10} | {'mqa_fused':>12} {'mqa_non_fused':>15}"
-        )
+        header = f"{'batch':>6} {'seq_len':>10} | {'dsv3_indexer_fused':>12}"
     print(header)
     print("-" * (60 if not HAS_DEEP_GEMM else 82))
 
@@ -243,8 +238,7 @@ def main():
                 )
                 line = (
                     f"{result['batch_size']:>6} {result['seq_len']:>10} |"
-                    f" {result['mqa_fused_us']:>10.2f}us"
-                    f" {result['mqa_non_fused_us']:>13.2f}us"
+                    f" {result['dsv3_indexer_fused_us']:>10.2f}us"
                 )
                 if "deepgemm_ref_us" in result:
                     line += (

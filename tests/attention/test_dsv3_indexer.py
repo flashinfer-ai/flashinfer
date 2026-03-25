@@ -10,7 +10,7 @@ Requires SM100a (Blackwell) GPU.
 import pytest
 import torch
 
-from flashinfer.dsv3_ops import mqa_topk_indexer
+from flashinfer.dsv3_ops import dsv3_topk_indexer
 from flashinfer.utils import is_sm100a_supported
 
 torch.manual_seed(0)
@@ -140,7 +140,7 @@ def _dsa_topk_indexer(q_fp8, k_cache_fp8, weights, seq_lens, block_table):
 @pytest.mark.parametrize(
     "L", [31, 1024, 4096, 8192, 4096 * 8, 4096 * 10, 1 << 17, 1 << 18]
 )
-def test_mqa_topk_indexer(B, L):
+def test_dsv3_topk_indexer(B, L):
     if not is_sm100a_supported(torch.device("cuda")):
         pytest.skip("Requires SM100a (Blackwell)")
 
@@ -150,7 +150,7 @@ def test_mqa_topk_indexer(B, L):
 
     q, kv_cache, weights, seq_lens, block_table = test_data
     indices_ref, logits_ref = _dsa_topk_indexer(*test_data)
-    indices_1, logits_1 = mqa_topk_indexer(
+    indices_1, logits_1 = dsv3_topk_indexer(
         q, kv_cache, weights, seq_lens, block_table, max_model_len=hi
     )
 

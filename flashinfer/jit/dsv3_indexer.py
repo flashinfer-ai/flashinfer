@@ -18,11 +18,11 @@ from . import env as jit_env
 from .core import JitSpec, gen_jit_spec, sm100a_nvcc_flags
 
 
-def gen_mqa_histogram_module() -> JitSpec:
+def gen_dsv3_indexer_histogram_module() -> JitSpec:
     # Kernels use SM100a-specific instructions: TMA, tcgen05 tensor cores.
     nvcc_flags = sm100a_nvcc_flags + ["-lineinfo"]
     return gen_jit_spec(
-        "mqa_histogram",
+        "dsv3_indexer_histogram",
         [
             jit_env.FLASHINFER_CSRC_DIR / "dsv3_ops" / "indexer_metadata.cu",
             jit_env.FLASHINFER_CSRC_DIR / "dsv3_ops" / "indexer_paged_logits.cu",
