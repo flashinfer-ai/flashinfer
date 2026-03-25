@@ -453,7 +453,7 @@ def allreduce_fusion(
     workspace: AllReduceFusionWorkspace,
     pattern: int,
     launch_with_pdl: bool = False,
-    trigger_completion_at_end: Optional[bool] = None,
+    trigger_completion_at_end: bool = True,
     # ===== OUTPUT tensors (pre-allocated, will be filled) =====
     output: Optional[torch.Tensor] = None,
     residual_out: Optional[torch.Tensor] = None,
@@ -496,12 +496,11 @@ def allreduce_fusion(
                  - kARResidualRMSNormOutFP4Quant = 5
                  Note: MNNVL only supports patterns 0 and 1
         launch_with_pdl: Use Programmatic Dependent Launch
-        trigger_completion_at_end: Controls when PDL completion is signaled.
-                     None (default): follows launch_with_pdl for backward compatibility.
-                     True: signal completion after the kernel finishes (safe, no overlap).
+        trigger_completion_at_end: [trtllm only] Controls when PDL completion is signaled.
+                     True (default): signal completion after the kernel finishes (safe, no overlap).
                      False: signal completion early, allowing the next PDL-aware kernel
                      to overlap with this one. Only safe when the subsequent kernel also
-                     uses cudaGridDependencySynchronize().
+                     uses cudaGridDependencySynchronize(). Ignored by MNNVL backend.
 
         # ===== OUTPUT tensors (pre-allocated, filled by function) =====
         output: AllReduce output [token_num, hidden_dim]
@@ -618,9 +617,7 @@ def allreduce_fusion(
             hidden_dim=hidden_dim,
             workspace_ptrs=workspace.workspace_tensor,
             launch_with_pdl=launch_with_pdl,
-            trigger_completion_at_end=trigger_completion_at_end
-            if trigger_completion_at_end is not None
-            else launch_with_pdl,
+            trigger_completion_at_end=trigger_completion_at_end,
             fp32_acc=fp32_acc,
             pattern_code=pattern,  # type: ignore[arg-type]
             use_oneshot=use_oneshot,
