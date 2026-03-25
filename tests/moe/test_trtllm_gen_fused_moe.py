@@ -3169,7 +3169,6 @@ def run_moe_test(
             id="FP8_Block_MxFp8",
         ),
         pytest.param(FP8PerTensorMoe(), id="FP8_Tensor"),
-        pytest.param(FP8PerChannelMoe(), id="FP8_PerChannel"),
         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4), id="NvFP4xNvFP4"),
         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_MXFP8), id="MxFP4xMxFP8"),
         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_Bf16), id="MxFP4xBf16"),
@@ -3191,7 +3190,6 @@ def run_moe_test(
                 "routing_method_type": RoutingMethodType.Renormalize,
                 "compatible_moe_impls": [
                     FP8PerTensorMoe,
-                    FP8PerChannelMoe,
                     FP8BlockScaleMoe,
                     FP4Moe,
                     BF16Moe,
@@ -3214,7 +3212,6 @@ def run_moe_test(
                 "routing_method_type": RoutingMethodType.Renormalize,
                 "compatible_moe_impls": [
                     FP8PerTensorMoe,
-                    FP8PerChannelMoe,
                     FP8BlockScaleMoe,
                     FP4Moe,
                     BF16Moe,
@@ -3237,7 +3234,6 @@ def run_moe_test(
                 "routing_method_type": RoutingMethodType.Renormalize,
                 "compatible_moe_impls": [
                     FP8PerTensorMoe,
-                    FP8PerChannelMoe,
                     FP8BlockScaleMoe,
                     FP4Moe,
                     BF16Moe,
@@ -3355,7 +3351,6 @@ def run_moe_test(
                 "compatible_moe_impls": [
                     FP4Moe,
                     FP8PerTensorMoe,
-                    FP8PerChannelMoe,
                     FP8BlockScaleMoe,
                 ],
             },
@@ -3424,7 +3419,6 @@ def test_renormalize_routing(
     "moe_impl",
     [
         pytest.param(FP8PerTensorMoe(), id="FP8_PerTensor"),
-        pytest.param(FP8PerChannelMoe(), id="FP8_PerChannel"),
         pytest.param(
             FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_DEEPSEEK),
             id="FP8_Block_DeepSeek",
@@ -3565,7 +3559,6 @@ def test_renormalize_routing(
                 "compatible_moe_impls": [
                     FP4Moe,
                     FP8PerTensorMoe,
-                    FP8PerChannelMoe,
                     FP8BlockScaleMoe,
                 ],
             },
@@ -3716,7 +3709,6 @@ def test_topk_routing(
     "moe_impl",
     [
         pytest.param(FP8PerTensorMoe(), id="FP8_Tensor"),
-        pytest.param(FP8PerChannelMoe(), id="FP8_PerChannel"),
     ],
 )
 @pytest.mark.parametrize(
@@ -3732,7 +3724,7 @@ def test_topk_routing(
                 "routed_scaling": 2.5,
                 "has_routing_bias": True,
                 "routing_method_type": RoutingMethodType.Llama4,
-                "compatible_moe_impls": [FP8PerTensorMoe, FP8PerChannelMoe],
+                "compatible_moe_impls": [FP8PerTensorMoe],
                 "compatible_intermediate_size": [1024, 2048],
                 "enable_autotune": True,
             },
@@ -3750,7 +3742,6 @@ def test_topk_routing(
                 "compatible_moe_impls": [
                     FP4Moe,
                     FP8PerTensorMoe,
-                    FP8PerChannelMoe,
                     FP8BlockScaleMoe,
                 ],
             },
@@ -4522,3 +4513,183 @@ def test_fp8_block_scale_routed_activation_type_relu2_smoke():
     close = torch.isclose(output_ref, output_routed, atol=1e-2, rtol=1e-2)
     mismatch_pct = (~close).float().mean().item() * 100
     assert mismatch_pct < 10, f"Mismatch percentage is {mismatch_pct:.2f}%"
+
+
+# ====================================================================================
+# Dedicated FP8 Per-Channel Tests
+# ====================================================================================
+# These tests use only parameter combinations that are compatible with FP8PerChannelMoe,
+# avoiding the skip conditions in the general parametrized tests.
+
+
+@pytest.mark.parametrize("num_tokens", [8, 768, 3072])
+@pytest.mark.parametrize("hidden_size", [1024])
+@pytest.mark.parametrize("intermediate_size", [384, 512, 768, 1024])
+@pytest.mark.parametrize(
+    "routing_config",
+    [
+        pytest.param(
+            {
+                "num_experts": 128,
+                "top_k": 8,
+                "padding": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.Renormalize,
+                "compatible_moe_impls": [FP8PerChannelMoe],
+                "compatible_intermediate_size": [384, 512, 768, 1024],
+                "enable_autotune": True,
+            },
+            id="Renorm_128e",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "activation_type",
+    [
+        pytest.param(ActivationType.Swiglu.value, id="Swiglu"),
+        pytest.param(ActivationType.Relu2.value, id="Relu2"),
+    ],
+)
+def test_fp8_per_channel_renormalize(
+    num_tokens,
+    hidden_size,
+    intermediate_size,
+    routing_config,
+    activation_type,
+    cache_permute_indices,
+):
+    """Dedicated test for FP8 per-channel MoE with Renormalize routing."""
+    moe_impl = FP8PerChannelMoe()
+    weight_processing = {
+        "use_shuffled_weight": True,
+        "layout": WeightLayout.MajorK,
+        "compatible_moe_impls": [FP8PerChannelMoe],
+    }
+    run_moe_test(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        moe_impl,
+        routing_config,
+        weight_processing,
+        activation_type,
+        cache_permute_indices,
+    )
+
+
+@pytest.mark.parametrize("num_tokens", [8, 768, 3072])
+@pytest.mark.parametrize("hidden_size", [1024])
+@pytest.mark.parametrize("intermediate_size", [1024])
+@pytest.mark.parametrize(
+    "routing_config",
+    [
+        pytest.param(
+            {
+                "num_experts": 128,
+                "top_k": 1,
+                "padding": 8,
+                "n_groups": 0,
+                "top_k_groups": 0,
+                "routed_scaling": 2.5,
+                "has_routing_bias": True,
+                "routing_method_type": RoutingMethodType.Llama4,
+                "compatible_moe_impls": [FP8PerChannelMoe],
+                "compatible_intermediate_size": [1024],
+                "enable_autotune": True,
+            },
+            id="Llama4",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "activation_type",
+    [
+        pytest.param(ActivationType.Swiglu.value, id="Swiglu"),
+    ],
+)
+def test_fp8_per_channel_llama4(
+    num_tokens,
+    hidden_size,
+    intermediate_size,
+    routing_config,
+    activation_type,
+    cache_permute_indices,
+):
+    """Dedicated test for FP8 per-channel MoE with Llama4 routing."""
+    moe_impl = FP8PerChannelMoe()
+    weight_processing = {
+        "use_shuffled_weight": True,
+        "layout": WeightLayout.MajorK,
+        "compatible_moe_impls": [FP8PerChannelMoe],
+    }
+    run_moe_test(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        moe_impl,
+        routing_config,
+        weight_processing,
+        activation_type,
+        cache_permute_indices,
+    )
+
+
+@pytest.mark.parametrize("num_tokens", [8, 768, 3072])
+@pytest.mark.parametrize("hidden_size", [1024])
+@pytest.mark.parametrize("intermediate_size", [1024])
+@pytest.mark.parametrize(
+    "routing_config",
+    [
+        pytest.param(
+            {
+                "num_experts": 512,
+                "top_k": 22,
+                "padding": 8,
+                "n_groups": 1,
+                "top_k_groups": 1,
+                "routed_scaling": 2.5,
+                "has_routing_bias": True,
+                "routing_method_type": RoutingMethodType.DeepSeekV3,
+                "compatible_moe_impls": [FP8PerChannelMoe],
+                "compatible_intermediate_size": [1024],
+                "compatible_activation_types": [ActivationType.Relu2],
+                "enable_autotune": True,
+            },
+            id="DeepSeekV3_Relu2",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "activation_type",
+    [
+        pytest.param(ActivationType.Relu2.value, id="Relu2"),
+    ],
+)
+def test_fp8_per_channel_deepseekv3(
+    num_tokens,
+    hidden_size,
+    intermediate_size,
+    routing_config,
+    activation_type,
+    cache_permute_indices,
+):
+    """Dedicated test for FP8 per-channel MoE with DeepSeekV3 routing and Relu2."""
+    moe_impl = FP8PerChannelMoe()
+    weight_processing = {
+        "use_shuffled_weight": True,
+        "layout": WeightLayout.MajorK,
+        "compatible_moe_impls": [FP8PerChannelMoe],
+    }
+    run_moe_test(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        moe_impl,
+        routing_config,
+        weight_processing,
+        activation_type,
+        cache_permute_indices,
+    )
