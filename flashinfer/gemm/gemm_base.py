@@ -1905,7 +1905,7 @@ def build_plans_cudnn_fp4_gemm_graph(
     o_type,
     block_size,
     device,
-    alpha,
+    alpha_is_not_none,
     use_nvfp4,
     tactic: int = -1,
 ):
@@ -1923,7 +1923,7 @@ def build_plans_cudnn_fp4_gemm_graph(
         o_type,
         block_size,
         device,
-        alpha,
+        alpha_is_not_none,
         use_nvfp4,
     )
 
