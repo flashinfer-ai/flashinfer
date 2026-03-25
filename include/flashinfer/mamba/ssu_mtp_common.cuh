@@ -20,7 +20,20 @@
 
 #include <cuda/barrier>
 
+#include "conversion.cuh"
+
 namespace flashinfer::mamba::mtp {
+
+// Round up to next power of 2 (compile-time).
+constexpr int nextPow2(int v) {
+  v--;
+  v |= v >> 1;
+  v |= v >> 2;
+  v |= v >> 4;
+  v |= v >> 8;
+  v |= v >> 16;
+  return v + 1;
+}
 
 using barrier_t = cuda::barrier<cuda::thread_scope_block>;
 
@@ -100,6 +113,32 @@ __device__ __forceinline__ void fma_f32x2(float2& d, float2 const& a, float2 con
   d.x = a.x * b.x + c.x;
   d.y = a.y * b.y + c.y;
 #endif
+}
+
+// =============================================================================
+// convertAndStoreSRHorizontal — convert a pair of f32 state values to half.
+// When PHILOX_ROUNDS > 0: stochastic rounding via f16x2.
+// When PHILOX_ROUNDS == 0: plain nearest-even conversion.
+// e is the pair-aligned index within the tile (must be even).
+// =============================================================================
+
+template <typename state_t, int DSTATE, int PHILOX_ROUNDS>
+__device__ __forceinline__ void convertAndStoreSRHorizontal(state_t& out0, state_t& out1, float s0,
+                                                            float s1, int64_t rand_seed,
+                                                            int state_ptr_offset, int dd, int col0,
+                                                            int e, uint32_t (&rand_ints)[4]) {
+  using namespace conversion;
+  if constexpr (PHILOX_ROUNDS > 0) {
+    if (e % 4 == 0)
+      philox_randint4x<PHILOX_ROUNDS>(rand_seed, state_ptr_offset + dd * DSTATE + col0 + e,
+                                      rand_ints[0], rand_ints[1], rand_ints[2], rand_ints[3]);
+    uint32_t packed = cvt_rs_f16x2_f32(s0, s1, rand_ints[e / 2 % 2]);
+    out0 = __ushort_as_half(static_cast<uint16_t>(packed & 0xFFFFu));
+    out1 = __ushort_as_half(static_cast<uint16_t>(packed >> 16));
+  } else {
+    convertAndStore(&out0, s0);
+    convertAndStore(&out1, s1);
+  }
 }
 
 }  // namespace flashinfer::mamba::mtp

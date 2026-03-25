@@ -28,6 +28,7 @@ enum class SSUAlgorithm : int32_t {
   kSimple = 1,
   kVertical = 2,
   kHorizontal = 3,
+  kAsyncHorizontal = 4,
 };
 
 inline const char* SSUAlgorithmToString(SSUAlgorithm algo) {
@@ -40,6 +41,8 @@ inline const char* SSUAlgorithmToString(SSUAlgorithm algo) {
       return "Vertical";
     case SSUAlgorithm::kHorizontal:
       return "Horizontal";
+    case SSUAlgorithm::kAsyncHorizontal:
+      return "AsyncHorizontal";
     default:
       return "Unknown";
   }
