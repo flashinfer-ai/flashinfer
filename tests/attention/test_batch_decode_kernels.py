@@ -808,11 +808,18 @@ def test_single_decode_torch_compile_cuda_graph():
         torch.cuda.synchronize()
         print("PASS")
     """)
+    import os
+
+    # torch.compile's inductor calls getpass.getuser() for cache dir, which fails
+    # in CI containers where the uid has no /etc/passwd entry. Setting USER avoids this.
+    env = os.environ.copy()
+    env.setdefault("USER", "ci")
     result = subprocess.run(
         [sys.executable, "-c", script],
         capture_output=True,
         text=True,
         timeout=300,
+        env=env,
     )
     assert result.returncode == 0 and "PASS" in result.stdout, (
         f"Test failed:\nstdout: {result.stdout[-500:]}\nstderr: {result.stderr[-500:]}"
