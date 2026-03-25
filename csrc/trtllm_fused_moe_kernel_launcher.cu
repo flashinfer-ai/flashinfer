@@ -907,24 +907,29 @@ class Fp8PerChannelLauncher : public FusedMoeLauncher {
   void check_moe() const override {
     FusedMoeLauncher::check_moe_common();
 
+    auto gemm1_scale_dim1 = intermediate_size_factor * args->intermediate_size;
+
     TVM_FFI_ICHECK_EQ(gemm1_per_channel_weight_scale_.dtype(), dl_float32)
         << "gemm1_per_channel_weight_scale must be float32.";
     TVM_FFI_ICHECK_EQ(gemm1_per_channel_weight_scale_.ndim(), 2)
-        << "gemm1_per_channel_weight_scale must be 2D [local_num_experts, 2*intermediate_size].";
+        << "gemm1_per_channel_weight_scale must be 2D [local_num_experts, "
+           "intermediate_size_factor*intermediate_size].";
     TVM_FFI_ICHECK_EQ(gemm1_per_channel_weight_scale_.size(0), args->local_num_experts)
         << "gemm1_per_channel_weight_scale dim 0 must match local_num_experts.";
-    TVM_FFI_ICHECK_EQ(gemm1_per_channel_weight_scale_.size(1), 2 * args->intermediate_size)
-        << "gemm1_per_channel_weight_scale dim 1 must be 2*intermediate_size.";
+    TVM_FFI_ICHECK_EQ(gemm1_per_channel_weight_scale_.size(1), gemm1_scale_dim1)
+        << "gemm1_per_channel_weight_scale dim 1 must be " << intermediate_size_factor
+        << "*intermediate_size=" << gemm1_scale_dim1 << ".";
 
     TVM_FFI_ICHECK_EQ(gemm1_per_channel_gate_weight_scale_.dtype(), dl_float32)
         << "gemm1_per_channel_gate_weight_scale must be float32.";
     TVM_FFI_ICHECK_EQ(gemm1_per_channel_gate_weight_scale_.ndim(), 2)
         << "gemm1_per_channel_gate_weight_scale must be 2D [local_num_experts, "
-           "2*intermediate_size].";
+           "intermediate_size_factor*intermediate_size].";
     TVM_FFI_ICHECK_EQ(gemm1_per_channel_gate_weight_scale_.size(0), args->local_num_experts)
         << "gemm1_per_channel_gate_weight_scale dim 0 must match local_num_experts.";
-    TVM_FFI_ICHECK_EQ(gemm1_per_channel_gate_weight_scale_.size(1), 2 * args->intermediate_size)
-        << "gemm1_per_channel_gate_weight_scale dim 1 must be 2*intermediate_size.";
+    TVM_FFI_ICHECK_EQ(gemm1_per_channel_gate_weight_scale_.size(1), gemm1_scale_dim1)
+        << "gemm1_per_channel_gate_weight_scale dim 1 must be " << intermediate_size_factor
+        << "*intermediate_size=" << gemm1_scale_dim1 << ".";
 
     TVM_FFI_ICHECK_EQ(gemm2_per_channel_weight_scale_.dtype(), dl_float32)
         << "gemm2_per_channel_weight_scale must be float32.";
@@ -950,11 +955,12 @@ class Fp8PerChannelLauncher : public FusedMoeLauncher {
     int32_t max_num_padded_tokens_gemm1 = workspace.total_max_padded_tokens + args->num_experts;
     int32_t max_num_padded_tokens_gemm2 = workspace.total_max_padded_tokens;
 
-    gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, 2 * args->intermediate_size},
-                                dl_uint8, hidden_states.device());
-    gemm1_output_scale =
-        alloc_tensor({2 * args->intermediate_size / 128, max_num_padded_tokens_gemm1}, dl_float32,
-                     hidden_states.device());
+    gemm1_output = alloc_tensor(
+        {max_num_padded_tokens_gemm1, intermediate_size_factor * args->intermediate_size}, dl_uint8,
+        hidden_states.device());
+    gemm1_output_scale = alloc_tensor(
+        {intermediate_size_factor * args->intermediate_size / 128, max_num_padded_tokens_gemm1},
+        dl_float32, hidden_states.device());
 
     activation_output = alloc_tensor({max_num_padded_tokens_gemm1, args->intermediate_size},
                                      dl_uint8, hidden_states.device());
@@ -2510,9 +2516,8 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
       }
       // FP8 block scale (DeepSeek)
       return Fp8BlockScaleLauncher::getValidConfigs(
-          top_k, hidden_size, intermediate_size, num_local_experts, num_tokens,
-          use_shuffled_weight, weight_layout, dtype_act, dtype_weights, quantization_type,
-          act_type);
+          top_k, hidden_size, intermediate_size, num_local_experts, num_tokens, use_shuffled_weight,
+          weight_layout, dtype_act, dtype_weights, quantization_type, act_type);
     } else if (quantization_type == Fp8QuantizationType::PerChannelFp8) {
       // FP8 per-channel scale
       return Fp8PerChannelLauncher::getValidConfigs(
