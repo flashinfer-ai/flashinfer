@@ -1806,9 +1806,11 @@ def build_cudnn_gemm_fp4_graph(
     device,
     alpha_is_not_none,
     use_nvfp4,
-    policy: cudnn.build_plan_policy = cudnn.build_plan_policy.HEURISTICS_CHOICE,
+    policy=None,
 ):
     _check_cudnn_availability()
+    if policy is None:
+        policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
 
     stream = torch.cuda.current_stream(device)
     with cudnn.graph(_get_cudnn_handle(device, stream)) as (graph, _):
@@ -2770,9 +2772,11 @@ def build_cudnn_gemm_bf16_graph(
     b_stride,
     o_type,
     device,
-    policy: cudnn.build_plan_policy = cudnn.build_plan_policy.HEURISTICS_CHOICE,
+    policy=None,
 ):
     _check_cudnn_availability()
+    if policy is None:
+        policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
 
     stream = torch.cuda.current_stream(device)
     with cudnn.graph(_get_cudnn_handle(device, stream)) as (graph, _):
