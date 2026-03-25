@@ -34,7 +34,7 @@ __forceinline__ __device__ void routingTopKExperts(
     int32_t (&idx)[VecSize], DataType (&warpTopKScore)[MaxNumTopExperts],
     int32_t (&warpTopKExpertIdx)[MaxNumTopExperts], int32_t const laneIdx, int32_t const numExperts,
     int32_t topK, InputType const* ptrScores, bool const normTopkProb,
-    bool const applySoftmaxAfterTopK) {
+    bool const applySoftmaxAfterTopK, bool const doSigmoidBeforeTopK = false) {
   DataType minScore = DataType{-INFINITY};
 
   for (int i = 0; i < VecSize; i++) {
@@ -44,7 +44,15 @@ __forceinline__ __device__ void routingTopKExperts(
     idx[i] = expertIdx;
   }
   if constexpr (DoSoftmaxBeforeTopK) {
-    calcSoftmax(warp, score);
+    if (doSigmoidBeforeTopK) {
+      // Sigmoid applied element-wise; invalid entries remain at -INFINITY (sigmoid never
+      // returns negative, so they stay below any valid score after the gate).
+      for (int i = 0; i < VecSize; i++) {
+        if (idx[i] < numExperts) score[i] = DataType{sigmoid_accurate(float{score[i]})};
+      }
+    } else {
+      calcSoftmax(warp, score);
+    }
   }
 
   // Get the top-k scores and their corresponding expert indices
@@ -132,7 +140,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
       routingTopKExperts<BaseType, InputT, VecSize, KernelParams::DoSoftmaxBeforeTopK>(
           warp, score, idx, warpTopKScore, warpTopKExpertIdx, laneIdx, params.mNumExperts,
           params.mTopK, params.mPtrScores + scoreOffset, params.mNormTopkProb,
-          params.mApplySoftmaxAfterTopK);
+          params.mApplySoftmaxAfterTopK, params.mDoSigmoidBeforeTopK);
 
       if (laneIdx < params.mTopK) {
         int offset = warpIdx * MaxNumExperts + warpTopKExpertIdx[laneIdx];
@@ -298,7 +306,7 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
       routingTopKExperts<BaseType, InputT, VecSize, KernelParams::DoSoftmaxBeforeTopK>(
           warp, score, idx, warpTopKScore, warpTopKExpertIdx, laneIdx, params.mNumExperts,
           params.mTopK, params.mPtrScores + scoreOffset, params.mNormTopkProb,
-          params.mApplySoftmaxAfterTopK);
+          params.mApplySoftmaxAfterTopK, params.mDoSigmoidBeforeTopK);
 
       if (laneIdx < params.mTopK) {
         smemPackedScoreIdx[warpIdx * params.mTopK + laneIdx] =
@@ -379,7 +387,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
     routingTopKExperts<BaseType, InputT, VecSize, KernelParams::DoSoftmaxBeforeTopK>(
         warp, allScores, allExpertIdx, warpTopKScore, warpTopKExpertIdx, laneIdx,
         params.mNumExperts, params.mTopK, params.mPtrScores + scoreOffset, params.mNormTopkProb,
-        params.mApplySoftmaxAfterTopK);
+        params.mApplySoftmaxAfterTopK, params.mDoSigmoidBeforeTopK);
 
     if (laneIdx < params.mTopK) {
       PackedScoreIdx<OutputT> packedScore{static_cast<OutputT>(warpTopKScore[laneIdx]),

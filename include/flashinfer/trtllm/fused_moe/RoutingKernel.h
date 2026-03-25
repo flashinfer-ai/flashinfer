@@ -275,6 +275,9 @@ struct Data : public DataBase {
   bool mDoSoftmaxBeforeTopK{false};
   bool mNormTopkProb{true};  // Default value is true for Qwen3 model
   bool mApplySoftmaxAfterTopK{false};
+  // When true, apply sigmoid instead of softmax before top-K (used for SigmoidRenorm routing).
+  // Must be paired with mDoSoftmaxBeforeTopK=true so the sum-normalize post-step also runs.
+  bool mDoSigmoidBeforeTopK{false};
 };
 
 template <typename InputT_, typename OutputT_, int MaxNumExperts_, bool DoSoftmaxBeforeTopK_,
@@ -291,6 +294,7 @@ struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_,
 
   bool mNormTopkProb = true;
   bool mApplySoftmaxAfterTopK = false;
+  bool mDoSigmoidBeforeTopK = false;
 
   static KernelParams setKernelParams(Data const& data) {
     KernelParams params;
@@ -299,6 +303,7 @@ struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_,
     params.mPtrTopKPacked = (PackedScoreIdx<OutputT>*)data.mPtrTopKPacked;
     params.mNormTopkProb = data.mNormTopkProb;
     params.mApplySoftmaxAfterTopK = data.mApplySoftmaxAfterTopK;
+    params.mDoSigmoidBeforeTopK = data.mDoSigmoidBeforeTopK;
     params.mTopK = data.mTopK;
     return params;
   }

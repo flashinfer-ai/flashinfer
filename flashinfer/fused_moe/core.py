@@ -71,8 +71,10 @@ class RoutingMethodType(IntEnum):
     RenormalizeNaive = (4,)
     # TopK only (no softmax)
     TopK = (5,)
+    # SigmoidRenorm: Sigmoid -> TopK -> SumNormalize (used by Qwen3-MoE)
+    SigmoidRenorm = (6,)
     # Unspecified
-    Unspecified = 6
+    Unspecified = (7,)
 
 
 # Copied from csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/common.h
@@ -2255,6 +2257,7 @@ def trtllm_bf16_moe(
     do_finalize: bool = True,
     enable_pdl: bool = True,
     tune_max_num_tokens: int = 8192,
+    norm_topk_prob: bool = True,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     """BF16 MoE operation with autotuning support.
 
@@ -2319,6 +2322,7 @@ def trtllm_bf16_moe(
         do_finalize,
         enable_pdl,
         tune_max_num_tokens,
+        norm_topk_prob,
     )
 
     if do_finalize:
@@ -2447,6 +2451,7 @@ def trtllm_fp8_per_tensor_scale_moe(
     do_finalize: bool = True,
     enable_pdl: Optional[bool] = None,
     tune_max_num_tokens: int = 8192,
+    norm_topk_prob: bool = True,
     activation_type: int = ActivationType.Swiglu.value,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     """FP8 per tensor scale MoE operation.
@@ -2853,6 +2858,7 @@ def trtllm_fp4_block_scale_moe(
         activation_type,
         output,
         tune_max_num_tokens,
+        norm_topk_prob,
     )
 
 

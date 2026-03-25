@@ -58,7 +58,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
                  int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit,
                  int32_t* numNonExitingCtas, btg::Dtype dtypeElt, btg::Dtype dtypeBias,
                  bool useRoutingScalesOnInput, bool useDeepSeekFp8,
-                 RoutingMethodType routingMethodType, cudaStream_t stream) {
+                 RoutingMethodType routingMethodType, cudaStream_t stream,
+                 btg::Dtype dtypeLogits, bool normTopkProb) {
   if (routingMethodType == RoutingMethodType::DeepSeekV3) {
     FLASHINFER_CHECK(topK <= 22, "For DeepSeek routing method, must have topK <= 22");
     FLASHINFER_CHECK(topkGroup <= 4, "For DeepSeek routing method, must have topkGroup <= 4");
@@ -67,7 +68,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         btg::Dtype::Bfloat16;            // for DeepSeek, the expW is currently always bfloat16
     routingData.mDtypeBias = dtypeBias;  // for DeepSeek, the bias can be bfloat16 or fp32
 
-    routingData.mDtypeScore = btg::Dtype::Fp32;  // for DeepSeek, the score is currently always fp32
+    routingData.mDtypeScore = dtypeLogits;  // respect caller's logit dtype (bf16 or fp32)
     routingData.mUsePdl = true;
 
     // output:
@@ -85,7 +86,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
 
     // input:
     routingData.mPtrRoutingBias = routingBias;
-    routingData.mPtrScores = reinterpret_cast<float*>(routingLogits);
+    routingData.mPtrScores = routingLogits;  // type-erased; template selected by mDtypeScore
     routingData.mNumTokens = numTokens;
     routingData.mNumExperts = numExperts;
     routingData.mNumExpertGroups = nGroup;
@@ -133,9 +134,11 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mLocalExpertsStrideLog2 = 0;
     routingData.mNumLocalExperts = localNumExperts;
     moe::dev::routing::routingLlama4::run(routingData, stream);
-  } else if (routingMethodType == RoutingMethodType::Renormalize         /* default */
-             || routingMethodType == RoutingMethodType::RenormalizeNaive /* Softmax -> TopK */
-             || routingMethodType == RoutingMethodType::TopK /* TopK only (no softmax) */) {
+  } else if (routingMethodType == RoutingMethodType::Default              /* Softmax -> TopK */
+             || routingMethodType == RoutingMethodType::Renormalize      /* TopK -> Softmax */
+             || routingMethodType == RoutingMethodType::RenormalizeNaive /* Softmax -> TopK -> SumNorm */
+             || routingMethodType == RoutingMethodType::TopK             /* TopK only */
+             || routingMethodType == RoutingMethodType::SigmoidRenorm    /* Sigmoid -> TopK -> SumNorm */) {
     moe::dev::routing::routingRenormalize::Data routingData;
 
     //
@@ -145,9 +148,34 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mDtypeExpW = btg::Dtype::Bfloat16;
     // routingData.mDtypeElt = dtypeElt; // no-op for now as hidden_state is not input
     routingData.mUsePdl = true;
-    routingData.mDoSoftmaxBeforeTopK = routingMethodType == RoutingMethodType::RenormalizeNaive;
-    routingData.mNormTopkProb = routingMethodType == RoutingMethodType::RenormalizeNaive;
-    routingData.mApplySoftmaxAfterTopK = routingMethodType == RoutingMethodType::Renormalize;
+
+    if (routingMethodType == RoutingMethodType::Default) {
+      // Softmax -> TopK (no post-normalization)
+      routingData.mDoSoftmaxBeforeTopK = true;
+      routingData.mNormTopkProb = false;
+      routingData.mApplySoftmaxAfterTopK = false;
+    } else if (routingMethodType == RoutingMethodType::RenormalizeNaive) {
+      // Softmax -> TopK -> SumNorm
+      routingData.mDoSoftmaxBeforeTopK = true;
+      routingData.mNormTopkProb = normTopkProb;
+      routingData.mApplySoftmaxAfterTopK = false;
+    } else if (routingMethodType == RoutingMethodType::Renormalize) {
+      // TopK -> Softmax
+      routingData.mDoSoftmaxBeforeTopK = false;
+      routingData.mNormTopkProb = false;
+      routingData.mApplySoftmaxAfterTopK = true;
+    } else if (routingMethodType == RoutingMethodType::SigmoidRenorm) {
+      // Sigmoid -> TopK -> SumNorm (e.g. Qwen3-MoE)
+      routingData.mDoSoftmaxBeforeTopK = true;   // enables sum-normalize post-step
+      routingData.mDoSigmoidBeforeTopK = true;   // replaces softmax with sigmoid in pre-step
+      routingData.mNormTopkProb = normTopkProb;
+      routingData.mApplySoftmaxAfterTopK = false;
+    } else {
+      // TopK only — no pre/post processing
+      routingData.mDoSoftmaxBeforeTopK = false;
+      routingData.mNormTopkProb = false;
+      routingData.mApplySoftmaxAfterTopK = false;
+    }
 
     routingData.mPtrScores = routingLogits;
 
