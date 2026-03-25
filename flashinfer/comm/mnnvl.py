@@ -861,12 +861,11 @@ def is_mnnvl_fabric_supported(device_idx: int) -> bool:
         handle = pynvml.nvmlDeviceGetHandleByIndex(device_idx)
         fabric_info = pynvml.c_nvmlGpuFabricInfoV_t()
         pynvml.nvmlDeviceGetGpuFabricInfoV(handle, ctypes.byref(fabric_info))
-        if (
+        return (
             fabric_info.state >= pynvml.NVML_GPU_FABRIC_STATE_COMPLETED
+            and fabric_info.clusterUuid
             and fabric_info.clusterUuid[0] != 0
-        ):
-            return True
-        return False
+        )
     finally:
         pynvml.nvmlShutdown()
 

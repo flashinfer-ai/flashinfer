@@ -25,6 +25,7 @@ from ..jit import gen_batch_mla_module, gen_trtllm_gen_fmha_module, setup_cubin_
 from ..jit.mla import gen_mla_module
 from ..utils import (
     MaskMode,
+    _check_block_tables_shape,
     check_shape_dtype_device,
     determine_mla_backend,
     device_support_pdl,
@@ -134,6 +135,7 @@ def _check_trtllm_gen_mla_shape(
     sparse_mla_top_k: int,
     page_table: torch.Tensor,
     page_size: int,
+    uses_shared_paged_kv_idx: bool = True,
 ) -> torch.Tensor:
     if query.ndim != 4:
         raise ValueError(f"Expected query.ndim == 4, got {query.ndim}")
@@ -173,7 +175,9 @@ def _check_trtllm_gen_mla_shape(
                 f"Expected page_table.shape == (num_seqs, num_tokens, sparse_mla_top_k), got {page_table_shape}"
             )
     else:
-        B_block_table, block_num = page_table.shape
+        _check_block_tables_shape(page_table, uses_shared_paged_kv_idx)
+        B_block_table = page_table.shape[0]
+        block_num = page_table.shape[-1]
         block_size = page_size
         if num_seqs != B_block_table:
             raise ValueError(
@@ -604,6 +608,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     enable_pdl: bool | None = None,
     backend: str = "auto",
     is_var_seq: bool = True,
+    uses_shared_paged_kv_idx: bool = True,
 ) -> torch.Tensor:
     """
     Parameters
@@ -615,7 +620,11 @@ def trtllm_batch_decode_with_kv_cache_mla(
     kv_lora_rank: kv_lora_rank, must be 512 or 256
     qk_rope_head_dim: qk_rope_head_dim, must be 64
     sparse_mla_top_k: sparse MLA top k, must be 0 for non-sparse MLA.
-    block_tables: page_table of kv cache, [batch_size, num_pages]
+    block_tables: page table of kv cache.
+        When ``uses_shared_paged_kv_idx`` is True (default): shape ``[batch_size, max_num_pages_per_seq]``.
+        When ``uses_shared_paged_kv_idx`` is False: shape ``[batch_size, 2, max_num_pages_per_seq]``
+        where dim 1 distinguishes K (0) and V (1) page indices. For MLA both rows will
+        typically be identical since K and V share the same compressed representation.
     seq_lens: query_len
     max_seq_len: max sequence length for kv_cache
     out: output tensor, if not provided, will be allocated internally
@@ -640,6 +649,11 @@ def trtllm_batch_decode_with_kv_cache_mla(
         Whether the sequence length is variable.
         If True, the sequence length is variable.
         Otherwise,the sequence length is fixed for all the requests in the batch.
+    uses_shared_paged_kv_idx : bool = True
+        Whether the K and V page indices are shared as a unified index.
+        True (default) uses vLLM/FlashInfer layout with a 2D page table.
+        False uses TRT-LLM layout with a 3D page table ``[batch_size, 2, max_num_pages_per_seq]``.
+        False is only supported for trtllm-gen backend.
 
     Note
     ----
@@ -686,6 +700,10 @@ def trtllm_batch_decode_with_kv_cache_mla(
             )
         if skip_softmax_threshold_scale_factor is not None:
             raise ValueError("skip_softmax is not supported for XQA backend")
+        if not uses_shared_paged_kv_idx:
+            raise ValueError(
+                "XQA MLA does not support separate KV page indices (uses_shared_paged_kv_idx=False)"
+            )
         return xqa_batch_decode_with_kv_cache_mla(
             query,
             kv_cache,
@@ -728,6 +746,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
             sparse_mla_top_k,
             block_tables,
             block_size,
+            uses_shared_paged_kv_idx,
         )
 
         if out is None:
@@ -771,7 +790,10 @@ def trtllm_batch_decode_with_kv_cache_mla(
             workspace_buffer.numel() * workspace_buffer.element_size(),
             sinks,
             None,  # cum_seq_lens_q
+            None,  # key_block_scales
+            None,  # value_block_scales
             skip_softmax_threshold_scale_factor,
+            uses_shared_paged_kv_idx,
         )
 
         return out
@@ -902,6 +924,7 @@ def xqa_batch_decode_with_kv_cache_mla(
         0,  # sparse_mla_top_k
         block_tables,
         block_size,
+        True,  # XQA always uses shared paged KV index layout
     )
 
     if out is None:

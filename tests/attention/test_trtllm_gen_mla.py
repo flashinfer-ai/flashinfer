@@ -271,6 +271,7 @@ def trtllm_batch_decode_mla(
     backend: str,
     MAX_SEQ_LEN: int,
     skips_softmax: bool,
+    uses_shared_paged_kv_idx: bool = True,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if backend == "xqa":
@@ -280,6 +281,8 @@ def trtllm_batch_decode_mla(
             pytest.skip(
                 "XQA MLA only supports q_len_per_request == 1 and dtype == torch.float8_e4m3fn"
             )
+        if not uses_shared_paged_kv_idx:
+            pytest.skip("xqa backend does not support separate KV page indices")
     if backend == "trtllm-gen":
         if compute_capability[0] != 10:
             pytest.skip("TRTLLM-GEN MLA only supports SM100 and SM103 GPUs")
@@ -346,6 +349,13 @@ def trtllm_batch_decode_mla(
         ]
         block_id += num_blocks_needed
 
+    # For separate KV page indices, duplicate the page table rows since
+    # MLA K and V share the same compressed representation.
+    if not uses_shared_paged_kv_idx:
+        block_tables_kernel = torch.stack([block_tables, block_tables], dim=1)
+    else:
+        block_tables_kernel = block_tables
+
     # Create interleaved KV cache
     # Allocate more than needed blocks, block_id is just enough, to mimick real-world cases
     kv_cache = torch.randn(
@@ -386,7 +396,7 @@ def trtllm_batch_decode_mla(
         qk_nope_head_dim=layer_dimensions.head_dimensions.qk_nope_head_dim,
         kv_lora_rank=layer_dimensions.head_dimensions.kv_lora_rank,
         qk_rope_head_dim=layer_dimensions.head_dimensions.qk_rope_head_dim,
-        block_tables=block_tables,
+        block_tables=block_tables_kernel,
         seq_lens=seq_lens_tensor,
         max_seq_len=max_seq_len,
         bmm1_scale=scale / ((128 + 64) ** 0.5),
@@ -394,6 +404,7 @@ def trtllm_batch_decode_mla(
         skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         enable_pdl=enable_pdl,
         backend=backend,
+        uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
     )
     # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
     # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
@@ -787,6 +798,7 @@ def trtllm_batch_decode_mla_sparse(
 @pytest.mark.parametrize("enable_pdl", [True, False, None])
 @pytest.mark.parametrize("backend", ["trtllm-gen", "xqa", "cute-dsl"])
 @pytest.mark.parametrize("skips_softmax", [False, True])
+@pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
 def test_trtllm_batch_decode_mla(
     layer_dimensions: MLALayerDimensions,
     batch_size: int,
@@ -798,6 +810,7 @@ def test_trtllm_batch_decode_mla(
     enable_pdl: bool,
     backend: str,
     skips_softmax: bool,
+    uses_shared_paged_kv_idx: bool,
 ):
     if backend == "xqa" and layer_dimensions.head_dimensions == smaller_mla_dimensions:
         pytest.skip("XQA MLA does not support smaller MLA dimensions yet.")
@@ -818,6 +831,7 @@ def test_trtllm_batch_decode_mla(
         backend,
         1024,
         skips_softmax,
+        uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
     )
 
 
