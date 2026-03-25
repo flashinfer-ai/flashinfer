@@ -1174,7 +1174,7 @@ class AutoTuner:
 
             # Overlay in-memory profiling results (take priority over loaded configs)
             for cache_key, cache_value in self.profiling_cache.items():
-                custom_op, runner_class_name, _runner_hash, profile = cache_key
+                custom_op, runner_class_name, _runner_hash, profile, _extras = cache_key
                 runner_id, tactic, _opt_profile = cache_value
 
                 # Use hash-free key: (custom_op, runner_class_name, profile)
