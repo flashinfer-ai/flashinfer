@@ -76,6 +76,12 @@ struct Softmax_base {
   // There are 2 warpgroups so 0x3 and 0x4 are used
   enum { SKIP_SOFTMAX_BARRIER = Kernel_traits::SKIP_SOFTMAX_BARRIER_ID };
 
+  // Whether to bypass elt_[] and operate directly on ctile_p.acc_ registers.
+  // Defaults to false; overridden to true in the BF16 Softmax specialization
+  // when SAGE_BLOCK_SIZE_K == 0. Defined here in the base so that all
+  // specializations (including FP16) expose this member to compute.h.
+  static constexpr bool USE_DIRECT_ACC = false;
+
   // Ctor.
   template <typename Params>
   inline __device__ Softmax_base(Params params, int tidx)
