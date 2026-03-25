@@ -2979,6 +2979,7 @@ def _cudnn_gemm_bf16(
         a.device,
         policy=policy,
     )
+
     execute_cudnn_gemm_bf16_graph(graph, a, b, out, workspace, tactic=tactic)
     return out
 
@@ -3009,6 +3010,7 @@ def _cudnn_gemm_bf16_runner():
                 a.device,
                 policy=cudnn.build_plan_policy.ALL,
             )
+
             return list(range(graph.get_execution_plan_count()))
 
         def forward(
@@ -3019,11 +3021,14 @@ def _cudnn_gemm_bf16_runner():
             **kwargs,
         ) -> torch.Tensor:
             a, b, bias, pdl, out, workspace_buffer = inputs
+
             if bias is not None:
                 raise ValueError("cudnn bf16 gemm does not support bias.")
             if pdl:
                 raise ValueError("cudnn bf16 gemm does not support pdl.")
+
             _cudnn_gemm_bf16(workspace_buffer, a, b, out, tactic=tactic)
+
             return out
 
     return CudnnBf16GemmRunner()
@@ -4024,7 +4029,7 @@ def mm_mxfp8(
     return out
 
 
-def _get_cudnn_fp4_gemm_graph(
+def _cudnn_gemm_fp4(
     a: torch.Tensor,
     b: torch.Tensor,
     a_descale: torch.Tensor,
@@ -4034,8 +4039,11 @@ def _get_cudnn_fp4_gemm_graph(
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
     use_nvfp4: bool = True,
+    workspace_buffer: torch.Tensor = None,
     tactic: int = -1,
 ):
+    _check_cudnn_availability()
+
     # the fp4 cudnn graph will be shared for both mm and bmm, so
     # here we need to get the 3d shape and stride including the
     # batch dimension for both input and block scale tensors.
@@ -4073,39 +4081,13 @@ def _get_cudnn_fp4_gemm_graph(
         use_nvfp4,
         policy=policy,
     )
-    return graph
 
-
-def _cudnn_gemm_fp4(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    a_descale: torch.Tensor,
-    b_descale: torch.Tensor,
-    alpha: Optional[torch.Tensor] = None,
-    out_dtype: torch.dtype = torch.bfloat16,
-    out: Optional[torch.Tensor] = None,
-    block_size: int = 16,
-    use_nvfp4: bool = True,
-    workspace_buffer: torch.Tensor = None,
-    tactic: int = -1,
-):
-    # Graph should have been already cached, when we ran _cudnn_gemm_fp4_requirement
-    graph = _get_cudnn_fp4_gemm_graph(
-        a=a,
-        b=b,
-        a_descale=a_descale,
-        b_descale=b_descale,
-        alpha=alpha,
-        out_dtype=out_dtype,
-        out=out,
-        block_size=block_size,
-        use_nvfp4=use_nvfp4,
-        tactic=tactic,
-    )
     # execute the fp4 cudnn graph
     execute_cudnn_gemm_fp4_graph(
         graph, a, b, a_descale, b_descale, alpha, out, workspace_buffer, tactic=tactic
     )
+
+    return out
 
 
 def _cudnn_gemm_fp4_runner():
@@ -4136,22 +4118,38 @@ def _cudnn_gemm_fp4_runner():
                 workspace_buffer,
             ) = inputs
 
-            # Graph should have been already cached, when we ran _cudnn_gemm_fp4_requirement
-            graph = _get_cudnn_fp4_gemm_graph(
-                a=a,
-                b=b,
-                a_descale=a_descale,
-                b_descale=b_descale,
-                alpha=alpha,
-                out_dtype=out_dtype,
-                out=out,
-                block_size=block_size,
-                use_nvfp4=use_nvfp4,
-                tactic=-1,
+            # the fp4 cudnn graph will be shared for both mm and bmm, so
+            # here we need to get the 3d shape and stride including the
+            # batch dimension for both input and block scale tensors.
+            real_a_shape, real_a_stride = _get_real_fp4_shape_from_packed_uint8(a)
+            real_b_shape, real_b_stride = _get_real_fp4_shape_from_packed_uint8(b)
+            batch = real_a_shape[0]
+            expanded_a_descale_shape, expanded_a_descale_stride = (
+                _expand_block_scale_tensor_shape(a_descale, batch)
+            )
+            expanded_b_descale_shape, expanded_b_descale_stride = (
+                _expand_block_scale_tensor_shape(b_descale, batch)
             )
 
-            num_plans = graph.get_execution_plan_count()
-            return list(range(num_plans))
+            graph = build_cudnn_gemm_fp4_graph(
+                real_a_shape,
+                real_a_stride,
+                real_b_shape,
+                real_b_stride,
+                expanded_a_descale_shape,
+                expanded_a_descale_stride,
+                expanded_b_descale_shape,
+                expanded_b_descale_stride,
+                cudnn.data_type.FP4_E2M1,
+                _torch_data_type_to_cudnn_data_type(out_dtype),
+                block_size,
+                a.device,
+                alpha is not None,
+                use_nvfp4,
+                policy=cudnn.build_plan_policy.ALL,
+            )
+
+            return list(range(graph.get_execution_plan_count()))
 
         def forward(
             self,
@@ -4172,6 +4170,7 @@ def _cudnn_gemm_fp4_runner():
                 use_nvfp4,
                 workspace_buffer,
             ) = inputs
+
             _cudnn_gemm_fp4(
                 a,
                 b,
@@ -4185,6 +4184,8 @@ def _cudnn_gemm_fp4_runner():
                 workspace_buffer,
                 tactic=tactic,
             )
+
+            return out
 
     return CudnnFp4GemmRunner()
 
