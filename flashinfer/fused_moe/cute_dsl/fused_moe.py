@@ -485,10 +485,16 @@ class CuteDslMoEWrapper:
         **kwargs,
     ) -> torch.Tensor:
         """Forward implementation called by auto-tuner."""
-        # Pre-allocated buffers are sized for self.tile_size. When the tactic
-        # uses a different tile_size (e.g. during autotune), fall back to
-        # dynamic allocation to avoid buffer overflow in moe_sort.
-        use_prealloc = self.use_cuda_graph and tile_size == self.tile_size
+        # Pre-allocated buffers are sized for self.max_num_tokens and
+        # self.tile_size. When the tactic uses a different tile_size or the
+        # autotuner profiles a larger batch, fall back to dynamic allocation
+        # to avoid buffer overflow.
+        num_tokens = x.shape[0]
+        use_prealloc = (
+            self.use_cuda_graph
+            and tile_size == self.tile_size
+            and num_tokens <= self.max_num_tokens
+        )
         return _moe_core_impl(
             x=x,
             x_sf=x_sf,
