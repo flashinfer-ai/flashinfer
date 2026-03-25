@@ -295,6 +295,8 @@ def trtllm_batch_decode_mla(
             pytest.skip("cute-dsl does not support enable_pdl")
         if skips_softmax:
             pytest.skip("cute-dsl does not support skip_softmax")
+        if not uses_shared_paged_kv_idx:
+            pytest.skip("cute-dsl does not support separate KV page indices")
     if dynamic_scale and dtype != torch.float8_e4m3fn:
         pytest.skip("Dynamic scale is not supported for non-fp8 dtype")
 

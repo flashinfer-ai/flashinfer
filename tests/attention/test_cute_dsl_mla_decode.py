@@ -448,7 +448,7 @@ def test_cute_dsl_mla_decode_fp8(batch_size, seq_len_k, page_size):
         output_scale=output_scale,
     )
 
-    assert out.dtype == torch.float8_e4m3fn
+    assert out.dtype == torch.bfloat16
     assert out.shape == (batch_size, q_len, num_heads, latent_dim)
 
     # Reference: compute in FP32 using FP8 values dequantized to FP32

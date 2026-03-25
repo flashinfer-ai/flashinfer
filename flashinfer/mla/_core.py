@@ -831,6 +831,11 @@ def trtllm_batch_decode_with_kv_cache_mla(
             raise ValueError(
                 "cute-dsl backend (MLA decode kernel) does not support skip_softmax_threshold_scale_factor"
             )
+        if not uses_shared_paged_kv_idx:
+            raise ValueError(
+                "cute-dsl backend (MLA decode kernel) does not support separate KV page indices "
+                "(uses_shared_paged_kv_idx=False)"
+            )
 
         return cute_dsl_mla_decode(
             query=query,

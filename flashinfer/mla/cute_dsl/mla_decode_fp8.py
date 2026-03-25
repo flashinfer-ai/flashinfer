@@ -3489,7 +3489,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             return False
         if in_dtype not in [cutlass.Float8E4M3FN]:
             return False
-        if out_dtype not in [cutlass.Float8E4M3FN]:
+        if out_dtype not in [cutlass.Float8E4M3FN, cutlass.BFloat16]:
             return False
         if acc_dtype != cutlass.Float32 or lse_dtype != cutlass.Float32:
             return False

@@ -58,6 +58,7 @@ def _get_split_kv_and_workspace_size(
 @functools.cache
 def _check_can_implement(
     torch_dtype: torch.dtype,
+    torch_out_dtype: torch.dtype,
     page_size: int,
     num_heads: int,
     seq_len_q: int,
@@ -77,7 +78,8 @@ def _check_can_implement(
         if is_fp8
         else BlackwellMultiHeadLatentAttentionForwardFP16
     )
-    cutlass_dtype = torch_to_cutlass_dtype(torch_dtype)
+    cutlass_in_dtype = torch_to_cutlass_dtype(torch_dtype)
+    cutlass_out_dtype = torch_to_cutlass_dtype(torch_out_dtype)
     if not KernelClass.can_implement(
         1,  # B (runtime, use placeholder)
         seq_len_q,
@@ -85,8 +87,8 @@ def _check_can_implement(
         num_heads,
         kv_lora_rank,
         qk_rope_head_dim,
-        cutlass_dtype,
-        cutlass_dtype,
+        cutlass_in_dtype,
+        cutlass_out_dtype,
         cutlass.Float32,
         cutlass.Float32,
         mma_qk_tiler_mn,
@@ -100,13 +102,14 @@ def _check_can_implement(
         raise ValueError(
             f"cute_dsl_mla_decode: unsupported configuration "
             f"(q_len={seq_len_q}, num_heads={num_heads}, page_size={page_size}, "
-            f"dtype={torch_dtype})"
+            f"in_dtype={torch_dtype}, out_dtype={torch_out_dtype})"
         )
 
 
 @functools.cache
 def _get_compiled_mla_kernel(
     torch_dtype: torch.dtype,
+    torch_out_dtype: torch.dtype,
     page_size: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
@@ -138,6 +141,7 @@ def _get_compiled_mla_kernel(
         else BlackwellMultiHeadLatentAttentionForwardFP16
     )
     cutlass_dtype = torch_to_cutlass_dtype(torch_dtype)
+    cutlass_out_dtype = torch_to_cutlass_dtype(torch_out_dtype)
 
     kernel_obj = KernelClass(
         acc_dtype=cutlass.Float32,
@@ -213,7 +217,7 @@ def _get_compiled_mla_kernel(
     )
     # o: [batch_size, seq_len_q, num_heads, latent_dim] — contiguous
     o_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass_dtype,
+        cutlass_out_dtype,
         (sym_batch, sym_seq_q, sym_heads, sym_latent),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
@@ -288,6 +292,7 @@ def cute_dsl_mla_decode(
     softmax_scale: float,
     output_scale: float = 1.0,
     out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
     is_var_seq: bool = True,
 ) -> torch.Tensor:
     """CuTe DSL MLA decode kernel for Blackwell SM100.
@@ -322,6 +327,10 @@ def cute_dsl_mla_decode(
         Scale factor applied to the output.
     out : Optional[torch.Tensor]
         Pre-allocated output tensor [B, q_len, H, kv_lora_rank].
+    out_dtype : Optional[torch.dtype]
+        Output data type. If None, defaults to torch.bfloat16 (matching trtllm-gen backend).
+        Supported values: torch.bfloat16, torch.float8_e4m3fn (FP8 input only),
+        torch.float16, torch.bfloat16 (FP16/BF16 input).
     is_var_seq : bool
         Whether the sequence length is variable.
         If True, the sequence length is variable.
@@ -343,6 +352,16 @@ def cute_dsl_mla_decode(
     assert D_qk == kv_lora_rank + qk_rope_head_dim
 
     q_dtype = query.dtype
+    # Resolve output dtype: for FP8 input, default to bfloat16 (matching trtllm-gen backend);
+    # for FP16/BF16 input, default to same as input. Allow override via out_dtype or out tensor.
+    if out is not None:
+        o_dtype = out.dtype
+    elif out_dtype is not None:
+        o_dtype = out_dtype
+    elif q_dtype == torch.float8_e4m3fn:
+        o_dtype = torch.bfloat16
+    else:
+        o_dtype = q_dtype
 
     # Handle 3D vs 4D kv_cache: normalize to 3D [num_pages, page_size, D_total]
     if kv_cache.dim() == 4:
@@ -399,12 +418,11 @@ def cute_dsl_mla_decode(
         workspace_bytes = workspace_buffer[:workspace_size]
     # Output buffer: contiguous [B, q_len, H, D].
     # Kernel reinterprets to [H, D, q_len, B] internally via zero-cost make_tensor.
-    out_dtype = q_dtype
     if out is not None:
         o_k = out
     else:
         o_k = torch.empty(
-            (B, q_len, H, kv_lora_rank), dtype=out_dtype, device=query.device
+            (B, q_len, H, kv_lora_rank), dtype=o_dtype, device=query.device
         )
 
     # LSE: contiguous [B, q_len, H]. Kernel reinterprets to [H, q_len, B].
@@ -423,6 +441,7 @@ def cute_dsl_mla_decode(
     # Validate configuration (cached, negligible overhead after first call)
     _check_can_implement(
         torch_dtype=q_dtype,
+        torch_out_dtype=o_dtype,
         page_size=page_size,
         num_heads=H,
         seq_len_q=q_len,
@@ -438,6 +457,7 @@ def cute_dsl_mla_decode(
     # Otherwise, workspace_bytes is not None and it will launch two kernels.
     compiled_kernel = _get_compiled_mla_kernel(
         torch_dtype=q_dtype,
+        torch_out_dtype=o_dtype,
         page_size=page_size,
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
