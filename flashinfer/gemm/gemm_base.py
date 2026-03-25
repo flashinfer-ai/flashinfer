@@ -4115,7 +4115,7 @@ def _cudnn_gemm_fp4_runner():
             #                out, block_size, use_nvfp4, workspace_buffer
             # All four values affect which cuDNN graph is built.
             _, _, _, _, alpha, out_dtype, out, block_size, use_nvfp4, _ = inputs
-            return (out.dtype, block_size, use_nvfp4, alpha is not None)
+            return (out_dtype, block_size, use_nvfp4, alpha is not None)
 
         def get_valid_tactics(
             self,

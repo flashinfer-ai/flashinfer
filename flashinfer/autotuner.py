@@ -837,7 +837,7 @@ class AutoTuner:
             # Get the best runner and tactic from cache
             # If no valid tactic is found, the fallback runner and tactic will be used
             _, runner_id, tactic, _ = self.search_cache(
-                custom_op, runners, input_shapes, tuning_config
+                custom_op, runners, input_shapes, tuning_config, inputs=inputs
             )
 
             return runners[runner_id], tactic
