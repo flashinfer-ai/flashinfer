@@ -131,18 +131,25 @@ def gdn_decode_kernel_small_batch_pretranspose(
 
     cute.arch.barrier()
 
-    # Compute state index: use pool indexing if enabled
+    # Compute state index: use pool indexing if enabled.
     if cutlass.const_expr(use_pool_indexing):
         pool_idx = h0_indices[i_n]
-        state_idx = pool_idx * HV + i_hv
     else:
         pool_idx = 0
-        state_idx = batch_idx
 
     if pool_idx >= 0:
-        # Get current batch
-        gSrc_batch = h0_source[(state_idx, None, None)]  # (V, K)
-        gDst = cute.local_tile(h0_source, (1, TILE_V, TILE_K), (state_idx, None, 0))
+        # Get current state slice.
+        if cutlass.const_expr(use_pool_indexing):
+            # h0_source layout: [pool_size, HV, V, K] (supports non-contiguous page stride)
+            gSrc_batch = h0_source[(pool_idx, i_hv, None, None)]  # (V, K)
+            gDst = cute.local_tile(
+                h0_source, (1, 1, TILE_V, TILE_K), (pool_idx, i_hv, None, 0)
+            )
+        else:
+            # h0_source layout: [B*HV, V, K]
+            state_idx = batch_idx
+            gSrc_batch = h0_source[(state_idx, None, None)]  # (V, K)
+            gDst = cute.local_tile(h0_source, (1, TILE_V, TILE_K), (state_idx, None, 0))
         # Tile along V dimension
         gSrc = cute.local_tile(
             gSrc_batch, (TILE_V, TILE_K), (None, 0)
@@ -300,10 +307,19 @@ def gdn_decode_kernel_small_batch_pretranspose(
                     r_h[i] += r_k[i] * v_new
                     sum_hq += r_h[i] * r_q[i]
 
-                # Write h to gDst using 4D local_tile + autovec_copy (contiguous in K)
-                gDst_tile = cute.local_tile(
-                    gDst, (1, 1, vec_size, 1), (0, row + row_offset, lane_id, v_tiles)
-                )
+                # Write h back to state.
+                if cutlass.const_expr(use_pool_indexing):
+                    gDst_tile = cute.local_tile(
+                        gDst,
+                        (1, 1, 1, vec_size, 1),
+                        (0, 0, row + row_offset, lane_id, v_tiles),
+                    )
+                else:
+                    gDst_tile = cute.local_tile(
+                        gDst,
+                        (1, 1, vec_size, 1),
+                        (0, row + row_offset, lane_id, v_tiles),
+                    )
                 cute.autovec_copy(r_h, gDst_tile)
 
                 for offset in [16, 8, 4, 2, 1]:
@@ -417,18 +433,25 @@ def gdn_decode_kernel_big_batch_pretranspose(
 
     cute.arch.barrier()
 
-    # Compute state index: use pool indexing if enabled
+    # Compute state index: use pool indexing if enabled.
     if cutlass.const_expr(use_pool_indexing):
         pool_idx = h0_indices[i_n]
-        state_idx = pool_idx * HV + i_hv
     else:
         pool_idx = 0
-        state_idx = batch_idx
 
     if pool_idx >= 0:
-        # Get current batch
-        gSrc_batch = h0_source[(state_idx, None, None)]  # (V, K)
-        gDst = cute.local_tile(h0_source, (1, TILE_V, TILE_K), (state_idx, None, 0))
+        # Get current state slice.
+        if cutlass.const_expr(use_pool_indexing):
+            # h0_source layout: [pool_size, HV, V, K] (supports non-contiguous page stride)
+            gSrc_batch = h0_source[(pool_idx, i_hv, None, None)]  # (V, K)
+            gDst = cute.local_tile(
+                h0_source, (1, 1, TILE_V, TILE_K), (pool_idx, i_hv, None, 0)
+            )
+        else:
+            # h0_source layout: [B*HV, V, K]
+            state_idx = batch_idx
+            gSrc_batch = h0_source[(state_idx, None, None)]  # (V, K)
+            gDst = cute.local_tile(h0_source, (1, TILE_V, TILE_K), (state_idx, None, 0))
         # Tile along V dimension
         gSrc = cute.local_tile(
             gSrc_batch, (TILE_V, TILE_K), (None, 0)
@@ -584,10 +607,19 @@ def gdn_decode_kernel_big_batch_pretranspose(
                     r_h[i] += r_k[i] * v_new
                     sum_hq += r_h[i] * r_q[i]
 
-                # Write h to gDst using 4D local_tile + autovec_copy (contiguous in K)
-                gDst_tile = cute.local_tile(
-                    gDst, (1, 1, vec_size, 1), (0, row + row_offset, lane_id, v_tiles)
-                )
+                # Write h back to state.
+                if cutlass.const_expr(use_pool_indexing):
+                    gDst_tile = cute.local_tile(
+                        gDst,
+                        (1, 1, 1, vec_size, 1),
+                        (0, 0, row + row_offset, lane_id, v_tiles),
+                    )
+                else:
+                    gDst_tile = cute.local_tile(
+                        gDst,
+                        (1, 1, vec_size, 1),
+                        (0, row + row_offset, lane_id, v_tiles),
+                    )
                 cute.autovec_copy(r_h, gDst_tile)
 
                 for offset in [16, 8, 4, 2, 1]:
@@ -642,12 +674,15 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
     stream: cuda.CUstream = None,
 ):
     """Launch original pipelined kernel for small batch pretranspose."""
-    # h0_source: (B*HV, V, K) or (pool_size*HV, V, K) when use_pool_indexing=True
-    batch_size, v_dim, k_dim = (
-        h0_source.layout.shape[0],
-        h0_source.layout.shape[1],
-        h0_source.layout.shape[2],
-    )
+    # h0_source:
+    # - non-pool: (B*HV, V, K)
+    # - pool: (pool_size, HV, V, K)
+    if cutlass.const_expr(use_pool_indexing):
+        v_dim = h0_source.layout.shape[2]
+        k_dim = h0_source.layout.shape[3]
+    else:
+        v_dim = h0_source.layout.shape[1]
+        k_dim = h0_source.layout.shape[2]
     # Grid size: use B*HV (actual batch) not h0_source.shape[0] (which may be pool_size*HV)
     grid_batch = B * HV
 
@@ -668,7 +703,7 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
     tiled_copy_load = cute.make_tiled_copy_tv(copy_atom, thread_layout, val_layout)
 
     num_v_tiles = cute.ceil_div(v_dim, TILE_V)
-    v_dim * k_dim * batch_size * 4 / 1024 / 1024
+    v_dim * k_dim * 4 / 1024 / 1024
 
     vec_size = (
         TILE_K // 32
@@ -749,11 +784,12 @@ def run_gdn_decode_kernel_big_batch_pretranspose(
     use_pool_indexing: cutlass.Constexpr[bool] = False,
     stream: cuda.CUstream = None,
 ):
-    batch_size, v_dim, k_dim = (
-        h0_source.layout.shape[0],
-        h0_source.layout.shape[1],
-        h0_source.layout.shape[2],
-    )
+    if cutlass.const_expr(use_pool_indexing):
+        v_dim = h0_source.layout.shape[2]
+        k_dim = h0_source.layout.shape[3]
+    else:
+        v_dim = h0_source.layout.shape[1]
+        k_dim = h0_source.layout.shape[2]
     grid_batch = B * HV
 
     # Create cp.async copy with cache-global mode (bypass L1)
@@ -773,7 +809,7 @@ def run_gdn_decode_kernel_big_batch_pretranspose(
     tiled_copy_load = cute.make_tiled_copy_tv(copy_atom, thread_layout, val_layout)
 
     num_v_tiles = cute.ceil_div(v_dim, TILE_V)
-    v_dim * k_dim * batch_size * 4 / 1024 / 1024
+    v_dim * k_dim * 4 / 1024 / 1024
 
     vec_size = (
         TILE_K // 32
@@ -843,6 +879,11 @@ def _get_compiled_decode_kernel(
     scale: float,
     use_qk_l2norm: bool,
     use_pool_indexing: bool = False,
+    pool_size: int = 0,
+    stride0: int = 0,
+    stride1: int = 0,
+    stride2: int = 0,
+    stride3: int = 0,
 ):
     """Cache compiled kernel for given configuration (pretranspose version)."""
     # This will be populated on first call
@@ -873,7 +914,7 @@ def run_pretranspose_decode(
     """Compile and execute the pretranspose decode kernel.
 
     Args:
-        h0_source: State tensor reshaped to [B*HV, V, K], or [pool_size*HV, V, K]
+        h0_source: State tensor of shape [B*HV, V, K], or [pool_size, HV, V, K]
                    when use_pool_indexing=True.
         A_log, a, dt_bias, q, k, v, b: Input tensors.
         output: Pre-allocated output tensor [B, T, HV, V].
@@ -885,7 +926,28 @@ def run_pretranspose_decode(
             Negative values indicate padding (kernel writes zeros).
     """
     # Compile kernel with TVM FFI (cached)
-    cache_key = (B, T, H, HV, K, V, q.dtype, scale, use_qk_l2norm, use_pool_indexing)
+    if use_pool_indexing:
+        pool_size = int(h0_source.shape[0])
+        stride0, stride1, stride2, stride3 = tuple(int(x) for x in h0_source.stride())
+    else:
+        pool_size = stride0 = stride1 = stride2 = stride3 = 0
+    cache_key = (
+        B,
+        T,
+        H,
+        HV,
+        K,
+        V,
+        q.dtype,
+        scale,
+        use_qk_l2norm,
+        use_pool_indexing,
+        pool_size,
+        stride0,
+        stride1,
+        stride2,
+        stride3,
+    )
     cache = _get_compiled_decode_kernel(*cache_key)
 
     # Get or create h0_indices and cu_seqlens (cached per config)
@@ -903,17 +965,8 @@ def run_pretranspose_decode(
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
         # Convert tensors to CuTe format for compilation only
-        if use_pool_indexing:
-            # Use symbolic pool dimension so kernel compiles with dynamic pool_size
-            sym_pool_batch = cute.sym_int()
-            h0_source_tensor = cute.runtime.make_fake_compact_tensor(
-                cutlass.Float32,
-                (sym_pool_batch, V, K),
-                stride_order=(2, 1, 0),
-                assumed_align=16,
-            )
-        else:
-            h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
+        # Use the actual tensor view so strided pool layouts are preserved.
+        h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
         A_log_tensor = from_dlpack(A_log, assumed_align=16)
         a_tensor = from_dlpack(a, assumed_align=16)
         dt_bias_tensor = from_dlpack(dt_bias, assumed_align=16)
