@@ -86,40 +86,60 @@ __device__ __forceinline__ void load_async_horizontal(SramT& sram, int lane, int
                                                       int batch, int head, int kv_group,
                                                       int dim_offset) {
   int const flat_tid = warp * warpSize + lane;
-  int const num_threads = NUM_WARPS * warpSize;
+  constexpr auto num_threads = NUM_WARPS * warpSize;
 
   auto const* __restrict__ dt_ptr = reinterpret_cast<weight_t const*>(params.dt);
   auto const* __restrict__ dt_bias_ptr = reinterpret_cast<weight_t const*>(params.dt_bias);
 
   if constexpr (!IS_PAD) {
-    // Load B[step][dstate] → sram.B[step][dstate_pad] (contiguous DSTATE, skip padding)
-    auto const* __restrict__ B_ptr = reinterpret_cast<input_t const*>(params.B);
-    for (int idx = flat_tid; idx < NTOKENS * DSTATE; idx += num_threads) {
-      int const step = idx / DSTATE;
-      int const col = idx % DSTATE;
-      int64_t const src = (int64_t)batch * params.B_stride_batch + step * params.B_stride_mtp +
-                          kv_group * DSTATE + col;
-      sram.B[step][col] = B_ptr[src];
+    using load_input_t = PackedAligned<input_t>;
+    constexpr int PACK = load_input_t::count;
+    static_assert(DSTATE % PACK == 0, "DSTATE must be divisible by vector pack size");
+    static_assert(DIM_PER_CTA % PACK == 0, "DIM_PER_CTA must be divisible by vector pack size");
+
+    // Load B[step][dstate] → sram.B[step][dstate_pad] (vectorized)
+    {
+      auto const* __restrict__ B_ptr = reinterpret_cast<input_t const*>(params.B);
+      constexpr int total_packs = NTOKENS * DSTATE / PACK;
+      constexpr int packs_per_row = DSTATE / PACK;
+      for (int pidx = flat_tid; pidx < total_packs; pidx += num_threads) {
+        int const step = pidx / packs_per_row;
+        int const col = (pidx % packs_per_row) * PACK;
+        int64_t const src = (int64_t)batch * params.B_stride_batch + step * params.B_stride_mtp +
+                            kv_group * DSTATE + col;
+        *reinterpret_cast<load_input_t*>(&sram.B[step][col]) =
+            *reinterpret_cast<load_input_t const*>(&B_ptr[src]);
+      }
     }
 
-    // Load C[step][dstate] → sram.C[step][dstate_pad]
-    auto const* __restrict__ C_ptr = reinterpret_cast<input_t const*>(params.C);
-    for (int idx = flat_tid; idx < NTOKENS * DSTATE; idx += num_threads) {
-      int const step = idx / DSTATE;
-      int const col = idx % DSTATE;
-      int64_t const src = (int64_t)batch * params.C_stride_batch + step * params.C_stride_mtp +
-                          kv_group * DSTATE + col;
-      sram.C[step][col] = C_ptr[src];
+    // Load C[step][dstate] → sram.C[step][dstate_pad] (vectorized)
+    {
+      auto const* __restrict__ C_ptr = reinterpret_cast<input_t const*>(params.C);
+      constexpr int total_packs = NTOKENS * DSTATE / PACK;
+      constexpr int packs_per_row = DSTATE / PACK;
+      for (int pidx = flat_tid; pidx < total_packs; pidx += num_threads) {
+        int const step = pidx / packs_per_row;
+        int const col = (pidx % packs_per_row) * PACK;
+        int64_t const src = (int64_t)batch * params.C_stride_batch + step * params.C_stride_mtp +
+                            kv_group * DSTATE + col;
+        *reinterpret_cast<load_input_t*>(&sram.C[step][col]) =
+            *reinterpret_cast<load_input_t const*>(&C_ptr[src]);
+      }
     }
 
-    // Load x[step][dim_per_cta] → sram.x[step][dim_per_cta]
-    auto const* __restrict__ x_ptr = reinterpret_cast<input_t const*>(params.x);
-    for (int idx = flat_tid; idx < NTOKENS * DIM_PER_CTA; idx += num_threads) {
-      int const step = idx / DIM_PER_CTA;
-      int const col = idx % DIM_PER_CTA;
-      int64_t const src = (int64_t)batch * params.x_stride_batch + step * params.x_stride_mtp +
-                          head * DIM + dim_offset + col;
-      sram.x[step][col] = x_ptr[src];
+    // Load x[step][dim_per_cta] → sram.x[step][dim_per_cta] (vectorized)
+    {
+      auto const* __restrict__ x_ptr = reinterpret_cast<input_t const*>(params.x);
+      constexpr int total_packs = NTOKENS * DIM_PER_CTA / PACK;
+      constexpr int packs_per_row = DIM_PER_CTA / PACK;
+      for (int pidx = flat_tid; pidx < total_packs; pidx += num_threads) {
+        int const step = pidx / packs_per_row;
+        int const col = (pidx % packs_per_row) * PACK;
+        int64_t const src = (int64_t)batch * params.x_stride_batch + step * params.x_stride_mtp +
+                            head * DIM + dim_offset + col;
+        *reinterpret_cast<load_input_t*>(&sram.x[step][col]) =
+            *reinterpret_cast<load_input_t const*>(&x_ptr[src]);
+      }
     }
 
     // Load dt[step] (scalar per step) — only a few values, single thread suffices
