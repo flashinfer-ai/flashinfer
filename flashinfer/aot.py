@@ -92,7 +92,7 @@ from .jit.sampling import gen_sampling_module
 from .jit.spdlog import gen_spdlog_module
 from .jit.tllm_utils import gen_trtllm_utils_module
 from .jit.topk import gen_topk_module
-from .jit.dsv3_indexer import gen_mqa_histogram_module
+from .jit.dsv3_indexer import gen_dsv3_indexer_histogram_module
 from .jit.xqa import gen_xqa_module, gen_xqa_module_mla
 
 
@@ -556,7 +556,7 @@ def gen_all_modules(
             gen_topk_module(),
         ]
         if has_sm100:
-            jit_specs.append(gen_mqa_histogram_module())
+            jit_specs.append(gen_dsv3_indexer_histogram_module())
         # selective_state_update: one module per dtype combo per GPU arch
         _ssu_dtype_combos = [
             # (state,        input,          weight,         matrixA,      stateIndex, state_scale_dtype)

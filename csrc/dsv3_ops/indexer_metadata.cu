@@ -8,7 +8,7 @@
 namespace cg = cooperative_groups;
 
 template <int tile_size>
-__global__ void mqa_kernel_metadata(
+__global__ void indexer_kernel_metadata(
     const int* __restrict__ seq_lens,  // [batch_size]
     const int batch_size,
     int4* __restrict__ sm_mapping,  // [gridDim.x * num_physical_sms]
@@ -83,22 +83,22 @@ __global__ void mqa_kernel_metadata(
   }
 }
 
-void launch_mqa_kernel_metadata(int* seq_lens, int batch_size, int num_physical_sms,
-                                int* sm_mapping, cudaStream_t stream) {
+void launch_indexer_kernel_metadata(int* seq_lens, int batch_size, int num_physical_sms,
+                                    int* sm_mapping, cudaStream_t stream) {
   int num_blocks = (batch_size + num_physical_sms - 1) / num_physical_sms;
 
   int warps = (num_physical_sms + 31) / 32;
   int shared_size = sizeof(int) * 4 * num_physical_sms;
   if (warps <= 4) {
-    mqa_kernel_metadata<128><<<num_blocks, 128, shared_size, stream>>>(
+    indexer_kernel_metadata<128><<<num_blocks, 128, shared_size, stream>>>(
         seq_lens, batch_size, (int4*)sm_mapping, num_physical_sms);
   } else if (warps <= 8) {
-    mqa_kernel_metadata<256><<<num_blocks, 256, shared_size, stream>>>(
+    indexer_kernel_metadata<256><<<num_blocks, 256, shared_size, stream>>>(
         seq_lens, batch_size, (int4*)sm_mapping, num_physical_sms);
   } else if (warps <= 16) {
-    mqa_kernel_metadata<512><<<num_blocks, 512, shared_size, stream>>>(
+    indexer_kernel_metadata<512><<<num_blocks, 512, shared_size, stream>>>(
         seq_lens, batch_size, (int4*)sm_mapping, num_physical_sms);
   } else {
-    assert(false && "too mnay physical sms");
+    assert(false && "too many physical sms");
   }
 }

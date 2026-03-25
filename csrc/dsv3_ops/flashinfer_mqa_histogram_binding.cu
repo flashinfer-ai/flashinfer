@@ -17,14 +17,15 @@
 
 #include "tvm_ffi_utils.h"
 
-void launch_mqa_kernel_metadata(int* seq_lens, int batch_size, int num_physical_sms,
-                                int* sm_mapping, cudaStream_t stream);
+void launch_indexer_kernel_metadata(int* seq_lens, int batch_size, int num_physical_sms,
+                                    int* sm_mapping, cudaStream_t stream);
 
-void launch_mqa_v3_fused_epilogue(uint8_t* q_ptr, uint8_t* k_ptr, float* weights, int* seq_lens,
-                                  int* block_table, float* logits, uint32_t* histogram,
-                                  int4* sm_map, int max_num_pages, int num_pages, int batch_size,
-                                  int num_sms, int sm_multiple, int logit_batch_stride,
-                                  bool pdl_enabled, cudaStream_t stream);
+void launch_dsv3_indexer_fused_epilogue(uint8_t* q_ptr, uint8_t* k_ptr, float* weights,
+                                        int* seq_lens, int* block_table, float* logits,
+                                        uint32_t* histogram, int4* sm_map, int max_num_pages,
+                                        int num_pages, int batch_size, int num_sms, int sm_multiple,
+                                        int logit_batch_stride, bool pdl_enabled,
+                                        cudaStream_t stream);
 
 void launch_fast_topk_clusters(const float* logits, int* indices, int* seq_lens, int* pre_hist,
                                int batch_size, int logit_stride, int indices_stride, int num_cached,
@@ -77,7 +78,7 @@ static void check_weights(const TensorView& t, int64_t batch_size, const char* f
 }
 
 // seq_lens: [batch]  int32
-// Pass batch_size = -1 to skip the size(0) check (used by get_mqa_metadata).
+// Pass batch_size = -1 to skip the size(0) check (used by get_indexer_metadata).
 static void check_seq_lens(const TensorView& t, const char* fn, int64_t batch_size = -1) {
   TVM_FFI_ICHECK_EQ(t.ndim(), 1) << fn << ": seq_lens must be 1D [batch]";
   if (batch_size >= 0) {
@@ -223,14 +224,14 @@ void fast_topk_clusters_exact(TensorView logits, TensorView indices, TensorView 
       << "launch_fast_topk_clusters_exact failed: " << cudaGetErrorString(err);
 }
 
-// mqa_topk_indexer:
+// dsv3_topk_indexer:
 //   q:           [batch, 64, 128]              fp8/uint8
 //   k_cache:     [num_pages, 64, 1, 132]       fp8/uint8
 //   weights:     [batch, 64]                   float32
 //   seq_lens:    [batch]                       int32
 //   block_table: [batch, max_num_pages]        int32
 //   histogram:   [batch, 256]                  int32, contiguous, zeroed by caller
-//   sm_map:      [num_sms, 4]                  int32, from get_mqa_metadata()
+//   sm_map:      [num_sms, 4]                  int32, from get_indexer_metadata()
 //   logits:      [batch, max_num_pages * 64]   float32, may be non-contiguous
 //   indices:     [batch, 2048]                 int32, may be non-contiguous
 //   pdl_enabled: bool
@@ -239,20 +240,20 @@ void fast_topk_clusters_exact(TensorView logits, TensorView indices, TensorView 
 //   num_clusters: int64_t (number of cooperative thread block clusters)
 //   global_topk_overflow: int64_t (number of cached items in global memory for topk)
 // Fills logits and indices in-place.
-void mqa_topk_indexer(TensorView q, TensorView k_cache, TensorView weights, TensorView seq_lens,
-                      TensorView block_table, TensorView histogram, TensorView sm_map,
-                      TensorView logits, TensorView indices, bool pdl_enabled, int64_t sm_multiple,
-                      int64_t num_cached, int64_t num_clusters, int64_t global_topk_overflow) {
+void dsv3_topk_indexer(TensorView q, TensorView k_cache, TensorView weights, TensorView seq_lens,
+                       TensorView block_table, TensorView histogram, TensorView sm_map,
+                       TensorView logits, TensorView indices, bool pdl_enabled, int64_t sm_multiple,
+                       int64_t num_cached, int64_t num_clusters, int64_t global_topk_overflow) {
   const int64_t batch_size = q.size(0);
-  check_q(q, batch_size, "mqa_topk_indexer");
-  check_k_cache(k_cache, "mqa_topk_indexer");
-  check_weights(weights, batch_size, "mqa_topk_indexer");
-  check_seq_lens(seq_lens, "mqa_topk_indexer", batch_size);
-  check_block_table(block_table, batch_size, "mqa_topk_indexer");
-  check_histogram(histogram, batch_size, "mqa_topk_indexer");
-  check_sm_map(sm_map, "mqa_topk_indexer");
-  check_logits(logits, batch_size, "mqa_topk_indexer");
-  check_indices(indices, batch_size, "mqa_topk_indexer");
+  check_q(q, batch_size, "dsv3_topk_indexer");
+  check_k_cache(k_cache, "dsv3_topk_indexer");
+  check_weights(weights, batch_size, "dsv3_topk_indexer");
+  check_seq_lens(seq_lens, "dsv3_topk_indexer", batch_size);
+  check_block_table(block_table, batch_size, "dsv3_topk_indexer");
+  check_histogram(histogram, batch_size, "dsv3_topk_indexer");
+  check_sm_map(sm_map, "dsv3_topk_indexer");
+  check_logits(logits, batch_size, "dsv3_topk_indexer");
+  check_indices(indices, batch_size, "dsv3_topk_indexer");
 
   const int num_pages = static_cast<int>(k_cache.size(0));
   const int max_num_pages = static_cast<int>(block_table.size(1));
@@ -262,7 +263,7 @@ void mqa_topk_indexer(TensorView q, TensorView k_cache, TensorView weights, Tens
 
   cudaStream_t stream = get_current_stream();
 
-  launch_mqa_v3_fused_epilogue(
+  launch_dsv3_indexer_fused_epilogue(
       reinterpret_cast<uint8_t*>(q.data_ptr()), reinterpret_cast<uint8_t*>(k_cache.data_ptr()),
       static_cast<float*>(weights.data_ptr()), static_cast<int*>(seq_lens.data_ptr()),
       static_cast<int*>(block_table.data_ptr()), static_cast<float*>(logits.data_ptr()),
@@ -272,7 +273,7 @@ void mqa_topk_indexer(TensorView q, TensorView k_cache, TensorView weights, Tens
   {
     auto err = cudaGetLastError();
     TVM_FFI_ICHECK(err == cudaSuccess)
-        << "launch_mqa_v3_fused_epilogue failed: " << cudaGetErrorString(err);
+        << "launch_dsv3_indexer_fused_epilogue failed: " << cudaGetErrorString(err);
   }
 
   if (global_topk_overflow == 0) {
@@ -289,12 +290,12 @@ void mqa_topk_indexer(TensorView q, TensorView k_cache, TensorView weights, Tens
   }
 }
 
-// get_mqa_metadata:
+// get_indexer_metadata:
 //   seq_lens:         [batch]  int32
 //   num_physical_sms: int64_t  (pass 0 to auto-detect)
 // Returns: sm_map [num_sms, 4] int32
-ffi::Tensor get_mqa_metadata(TensorView seq_lens, int64_t num_physical_sms) {
-  check_seq_lens(seq_lens, "get_mqa_metadata");
+ffi::Tensor get_indexer_metadata(TensorView seq_lens, int64_t num_physical_sms) {
+  check_seq_lens(seq_lens, "get_indexer_metadata");
 
   if (num_physical_sms <= 0) {
     cudaDeviceProp prop;
@@ -308,14 +309,14 @@ ffi::Tensor get_mqa_metadata(TensorView seq_lens, int64_t num_physical_sms) {
   auto sm_map = alloc_tensor({num_logical_sms, 4}, dl_int32, seq_lens.device());
 
   cudaStream_t stream = get_current_stream();
-  launch_mqa_kernel_metadata(static_cast<int*>(seq_lens.data_ptr()), batch_size,
-                             static_cast<int>(num_physical_sms),
-                             static_cast<int*>(sm_map.data_ptr()), stream);
+  launch_indexer_kernel_metadata(static_cast<int*>(seq_lens.data_ptr()), batch_size,
+                                 static_cast<int>(num_physical_sms),
+                                 static_cast<int*>(sm_map.data_ptr()), stream);
   auto err = cudaGetLastError();
   TVM_FFI_ICHECK(err == cudaSuccess)
-      << "launch_mqa_kernel_metadata failed: " << cudaGetErrorString(err);
+      << "launch_indexer_kernel_metadata failed: " << cudaGetErrorString(err);
   return sm_map;
 }
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(mqa_topk_indexer, mqa_topk_indexer);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_mqa_metadata, get_mqa_metadata);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(dsv3_topk_indexer, dsv3_topk_indexer);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_indexer_metadata, get_indexer_metadata);

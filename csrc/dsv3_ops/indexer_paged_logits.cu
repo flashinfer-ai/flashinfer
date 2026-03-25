@@ -21,7 +21,7 @@
 
 template <bool PDL_ENABLED, int K_LDG_STAGES, int K_LDG_SCALES_STAGES, int K_MMA_STAGES,
           int EPILOGUE_WARPGRPS, int VECTORIZE_TCGEN_LD, int PRELOAD_TCGEN_REGS, int Q_NEXT>
-__device__ void mqa_v2_kernel(
+__device__ void dsv3_paged_logits_kernel(
     const CUtensorMap* Q_tmap,          // f8[BatchSize, q_next * 64, 128],
                                         // strides=[q_next * 64 * 128, 128]
     const CUtensorMap* K_tmap,          // f8[page_table_pages, 64, 128], strides=[64 * 132, 128, 1]
@@ -442,7 +442,7 @@ __device__ void mqa_v2_kernel(
 
 template <bool PDL_ENABLED, int K_LDG_STAGES, int K_LDG_SCALES_STAGES, int K_MMA_STAGES,
           int EPILOGUE_WARPGRPS, int VECTORIZE_TCGEN_LD, int PRELOAD_TCGEN_REGS, int Q_NEXT>
-__global__ __launch_bounds__(EPILOGUE_WARPGRPS * 7 * 32, 1) void mqa_v3_fused_epilogue_kernel(
+__global__ __launch_bounds__(EPILOGUE_WARPGRPS * 7 * 32, 1) void dsv3_indexer_fused_epilogue_kernel(
     const __grid_constant__ CUtensorMap
         Q_tmap,  // f8[BatchSize, q_next * 64, 128], strides=[64 * 128, 128]
     const __grid_constant__ CUtensorMap K_tmap,  // f8[Pages, 64, 128], strides=[64 * 132, 128, 1]
@@ -475,8 +475,8 @@ __global__ __launch_bounds__(EPILOGUE_WARPGRPS * 7 * 32, 1) void mqa_v3_fused_ep
   if (num_pages > 0) {
     int seq_len = seq_lens[batch_idx];
 
-    mqa_v2_kernel<PDL_ENABLED, K_LDG_STAGES, K_LDG_SCALES_STAGES, K_MMA_STAGES, EPILOGUE_WARPGRPS,
-                  VECTORIZE_TCGEN_LD, PRELOAD_TCGEN_REGS, Q_NEXT>(
+    dsv3_paged_logits_kernel<PDL_ENABLED, K_LDG_STAGES, K_LDG_SCALES_STAGES, K_MMA_STAGES,
+                             EPILOGUE_WARPGRPS, VECTORIZE_TCGEN_LD, PRELOAD_TCGEN_REGS, Q_NEXT>(
         &Q_tmap, &K_tmap, K_ptr, weights + Q_NEXT * 64 * batch_idx, batch_idx, seq_len, page_offset,
         num_pages, max_num_pages, page_table_pages, block_table + batch_idx * max_num_pages,
         out_logits + batch_idx * logit_batch_stride, global_histogram + batch_idx * Q_NEXT * 256);
@@ -489,11 +489,12 @@ __global__ __launch_bounds__(EPILOGUE_WARPGRPS * 7 * 32, 1) void mqa_v3_fused_ep
 
 // launches the fused epilogue kernel, where we compute the histogram of logits
 // bits [0-8) for the first instance of the topK kernel
-void launch_mqa_v3_fused_epilogue(uint8_t* q_ptr, uint8_t* k_ptr, float* weights, int* seq_lens,
-                                  int* block_table, float* logits, uint32_t* histogram,
-                                  int4* sm_map, int max_num_pages, int num_pages, int batch_size,
-                                  int num_sms, int sm_multiple, int logit_batch_stride,
-                                  bool pdl_enabled, cudaStream_t stream) {
+void launch_dsv3_indexer_fused_epilogue(uint8_t* q_ptr, uint8_t* k_ptr, float* weights,
+                                        int* seq_lens, int* block_table, float* logits,
+                                        uint32_t* histogram, int4* sm_map, int max_num_pages,
+                                        int num_pages, int batch_size, int num_sms, int sm_multiple,
+                                        int logit_batch_stride, bool pdl_enabled,
+                                        cudaStream_t stream) {
   constexpr int Q_NEXT = 1;
   constexpr int EPILOGUE_WARPGRPS = 2;
   constexpr int VECTORIZE_TCGEN_LD = 16;
@@ -512,24 +513,26 @@ void launch_mqa_v3_fused_epilogue(uint8_t* q_ptr, uint8_t* k_ptr, float* weights
       (128 * 128 * EPILOGUE_WARPGRPS * K_LDG_STAGES + Q_NEXT * 64 * 128)  // K + Q
       + sizeof(float) * 128 * K_LDG_SCALES_STAGES * EPILOGUE_WARPGRPS;
   if (pdl_enabled) {
-    setup_kernel_smem_once<mqa_v3_fused_epilogue_kernel<
+    setup_kernel_smem_once<dsv3_indexer_fused_epilogue_kernel<
                                true, K_LDG_STAGES, K_LDG_SCALES_STAGES, K_MMA_STAGES,
                                EPILOGUE_WARPGRPS, VECTORIZE_TCGEN_LD, PRELOAD_TCGEN_REGS, Q_NEXT>,
                            131 * 1000>();
 
-    mqa_v3_fused_epilogue_kernel<true, K_LDG_STAGES, K_LDG_SCALES_STAGES, K_MMA_STAGES,
-                                 EPILOGUE_WARPGRPS, VECTORIZE_TCGEN_LD, PRELOAD_TCGEN_REGS, Q_NEXT>
+    dsv3_indexer_fused_epilogue_kernel<true, K_LDG_STAGES, K_LDG_SCALES_STAGES, K_MMA_STAGES,
+                                       EPILOGUE_WARPGRPS, VECTORIZE_TCGEN_LD, PRELOAD_TCGEN_REGS,
+                                       Q_NEXT>
         <<<sm_multiple * num_sms, THREADS, smem_bytes, stream>>>(
             q_tmap, k_tmap, k_ptr, weights, seq_lens, block_table, sm_map, max_num_pages, num_pages,
             sm_multiple, logit_batch_stride, logits, histogram);
   } else {
-    setup_kernel_smem_once<mqa_v3_fused_epilogue_kernel<
+    setup_kernel_smem_once<dsv3_indexer_fused_epilogue_kernel<
                                false, K_LDG_STAGES, K_LDG_SCALES_STAGES, K_MMA_STAGES,
                                EPILOGUE_WARPGRPS, VECTORIZE_TCGEN_LD, PRELOAD_TCGEN_REGS, Q_NEXT>,
                            131 * 1000>();
 
-    mqa_v3_fused_epilogue_kernel<false, K_LDG_STAGES, K_LDG_SCALES_STAGES, K_MMA_STAGES,
-                                 EPILOGUE_WARPGRPS, VECTORIZE_TCGEN_LD, PRELOAD_TCGEN_REGS, Q_NEXT>
+    dsv3_indexer_fused_epilogue_kernel<false, K_LDG_STAGES, K_LDG_SCALES_STAGES, K_MMA_STAGES,
+                                       EPILOGUE_WARPGRPS, VECTORIZE_TCGEN_LD, PRELOAD_TCGEN_REGS,
+                                       Q_NEXT>
         <<<sm_multiple * num_sms, THREADS, smem_bytes, stream>>>(
             q_tmap, k_tmap, k_ptr, weights, seq_lens, block_table, sm_map, max_num_pages, num_pages,
             sm_multiple, logit_batch_stride, logits, histogram);
