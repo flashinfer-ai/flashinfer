@@ -885,6 +885,14 @@ def bench_gpu_time_with_cuda_event(
         call_fn()
     torch.cuda.synchronize()
 
+    # Determine how many iterations can run back-to-back before GPU power
+    # throttling degrades clock frequency. Sustained full-utilization compute
+    # causes throttling after ~5ms on modern GPUs (e.g. B200), leading to
+    # artificially lower benchmark numbers. Insert sync+sleep cooldown gaps
+    # to let clocks recover.
+    max_sustained_ms = 5.0
+    iters_per_burst = max(1, int(max_sustained_ms / estimated_kernel_execution_time))
+
     # Actual run
     start_events = [torch.cuda.Event(enable_timing=True) for _ in range(repeat_iters)]
     end_events = [torch.cuda.Event(enable_timing=True) for _ in range(repeat_iters)]
@@ -898,6 +906,9 @@ def bench_gpu_time_with_cuda_event(
 
         if sleep_after_run:
             sleep_after_kernel_run(estimated_kernel_execution_time)
+        elif (iter_idx + 1) % iters_per_burst == 0:
+            torch.cuda.synchronize()
+            time.sleep(estimated_kernel_execution_time / 1000)
 
     # Synchronize once outside of the loop to avoid synchronization overhead
     torch.cuda.synchronize()
