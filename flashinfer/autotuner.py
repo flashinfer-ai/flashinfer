@@ -765,6 +765,13 @@ class AutoTuner:
                                         f"[Autotuner]: Failed when profiling {r} {tac}, shapes={shapes}. Error occurred: {e}"
                                     )
 
+                                    # Clear any pending async CUDA errors (e.g.
+                                    # cudaErrorIllegalInstruction from a failed
+                                    # kernel warmup run) so they don't surface
+                                    # later during CUDA graph capture.
+                                    with contextlib.suppress(Exception):
+                                        torch.cuda.synchronize()
+
                                     # Record the failed profiling combinations
                                     if (
                                         custom_op
