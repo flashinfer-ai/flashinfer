@@ -6,8 +6,6 @@ export PARALLEL_TESTS=true  # Enable parallel test execution for unit tests (aut
 
 # Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Source test environment setup (handles package overrides like TVM-FFI)
-source "${SCRIPT_DIR}/setup_test_env.sh"
 
 # Source common test functions
 # shellcheck disable=SC1091  # File exists, checked separately
@@ -79,6 +77,9 @@ main() {
 
     # Install and verify (includes precompiled kernels)
     install_and_verify
+
+    # apply dependency overrides after installation since pip may overwrite
+    source "${SCRIPT_DIR}/setup_test_env.sh"
 
     # Find test files (unique to unit tests - auto-discovery)
     find_test_files
