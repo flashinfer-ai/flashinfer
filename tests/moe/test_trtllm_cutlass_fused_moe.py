@@ -1920,5 +1920,289 @@ def test_moe_nvfp4_unswizzled_input_sf():
     torch.testing.assert_close(output_swizzled, output_linear, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize("batch_size", [1])
+@pytest.mark.parametrize(
+    "hidden_size, intermediate_size",
+    [
+        # hidden_size=2880: 2880/32=90 scale cols, round_up(90,4)=92 → padding
+        # This is the gpt-oss-120b config that triggers the weight_scale_vec_size bug.
+        (2880, 128),
+    ],
+)
+@pytest.mark.parametrize("num_experts", [2])
+@pytest.mark.parametrize("top_k", [2])
+@pytest.mark.parametrize(
+    "otype, wtype",
+    [(torch.bfloat16, torch.float8_e4m3fn)],
+)
+@pytest.mark.parametrize("quantized_input", [False])
+@pytest.mark.parametrize(
+    "activation_type",
+    [ActivationType.Swiglu],
+    ids=["swiglu"],
+)
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] not in [10, 11, 12],
+    reason="NVFP4 is only supported on SM100, SM110 and SM120/SM121",
+)
+def test_moe_nvfp4_unaligned_hidden_size(
+    batch_size,
+    hidden_size,
+    num_experts,
+    top_k,
+    intermediate_size,
+    otype,
+    wtype,
+    quantized_input,
+    activation_type,
+):
+    """Test NVFP4 MoE with hidden_size not aligned to sf_block_size * 4.
+
+    When hidden_size/sf_block_size is not a multiple of 4, block_scale_interleave
+    pads the scale columns, inflating numel(). This caused weight_scale_vec_size
+    to be computed incorrectly (e.g. 31 instead of 32). See issue #2847.
+    """
+    if top_k > num_experts:
+        pytest.skip(
+            f"top_k ({top_k}) cannot be greater than num_experts ({num_experts})"
+        )
+
+    torch.manual_seed(42)
+    quant_blocksize = 16
+    round_up = lambda x, y: (x + y - 1) // y * y
+    e = num_experts
+    m = batch_size
+    n = intermediate_size
+    k = hidden_size
+
+    w1_n = 2 * n if activation_type == ActivationType.Swiglu else n
+    w1 = torch.randn((e, w1_n, k), device="cuda", dtype=otype) / 10
+
+    sf_w1_2n = round_up(w1_n, 128)
+    sf_w1_k = round_up(k // quant_blocksize, 4)
+    w1_blockscale = torch.empty(
+        (e, sf_w1_2n, sf_w1_k), device="cuda", dtype=torch.float8_e4m3fn
+    )
+
+    w2 = torch.randn((e, k, n), device="cuda", dtype=otype) / 10
+    sf_w2_k = round_up(k, 128)
+    sf_w2_n = round_up(n // quant_blocksize, 4)
+    w2_blockscale = torch.empty(
+        (e, sf_w2_k, sf_w2_n), device="cuda", dtype=torch.float8_e4m3fn
+    )
+    w1_q = torch.empty((e, w1_n, k // 2), device="cuda", dtype=torch.uint8)
+    w2_q = torch.empty((e, k, n // 2), device="cuda", dtype=torch.uint8)
+    w1_gs = torch.empty((e,), device="cuda", dtype=torch.float32)
+    w2_gs = torch.empty((e,), device="cuda", dtype=torch.float32)
+
+    for expert in range(e):
+        w1_amax = torch.abs(w1[expert]).max().to(torch.float32)
+        w2_amax = torch.abs(w2[expert]).max().to(torch.float32)
+        w1_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w1_amax
+        w2_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w2_amax
+
+        w1_q[expert], w1_blockscale[expert] = fp4_quantize(w1[expert], w1_gs[expert])
+        w2_q[expert], w2_blockscale[expert] = fp4_quantize(w2[expert], w2_gs[expert])
+
+    x = torch.randn(m, k, dtype=otype).cuda()
+    a1_gs = torch.tensor(1.0, device="cuda", dtype=torch.float32)
+    a2_gs = torch.tensor(1.0, device="cuda", dtype=torch.float32)
+    router_logits = torch.randn(m, e, dtype=otype).cuda()
+    routing_weights, selected_experts = compute_routing(router_logits, top_k)
+
+    quant_scales = [
+        a1_gs,
+        w1_blockscale.view(torch.int32),
+        1.0 / (a1_gs * w1_gs),
+        a2_gs,
+        w2_blockscale.view(torch.int32),
+        1.0 / (a2_gs * w2_gs),
+    ]
+
+    hidden_states = x
+    input_sf = None
+    if quantized_input:
+        hidden_states, input_sf = fp4_quantize(x, a1_gs)
+    flash_output = torch.zeros_like(x)
+    _ = fused_moe.cutlass_fused_moe(
+        hidden_states,
+        selected_experts.to(torch.int),
+        routing_weights,
+        w1_q.contiguous().view(torch.long),
+        w2_q.contiguous().view(torch.long),
+        otype,
+        quant_scales=quant_scales,
+        input_sf=input_sf,
+        output=flash_output,
+        activation_type=activation_type,
+    )
+
+    # Ref check
+    a_fp4, a_scale_interleaved = fp4_quantize(x, a1_gs)
+    a_in_dtype = dequantize_nvfp4_to_dtype(
+        a_fp4,
+        a_scale_interleaved,
+        a1_gs,
+        dtype=otype,
+        device=x.device,
+        block_size=quant_blocksize,
+    )
+
+    w1_d = torch.empty((e, w1_n, k), device="cuda", dtype=otype)
+    w2_d = torch.empty((e, k, n), device="cuda", dtype=otype)
+
+    for idx in range(0, e):
+        w1_d[idx] = dequantize_nvfp4_to_dtype(
+            w1_q[idx],
+            w1_blockscale[idx],
+            w1_gs[idx],
+            dtype=w1.dtype,
+            device=w1.device,
+            block_size=quant_blocksize,
+        )
+        w2_d[idx] = dequantize_nvfp4_to_dtype(
+            w2_q[idx],
+            w2_blockscale[idx],
+            w2_gs[idx],
+            dtype=w2.dtype,
+            device=w2.device,
+            block_size=quant_blocksize,
+        )
+
+    ref_output = torch_moe_nvfp4(
+        a_in_dtype,
+        w1_d,
+        w2_d,
+        top_k,
+        routing_weights,
+        selected_experts,
+        activation_type,
+    )
+    torch.testing.assert_close(ref_output, flash_output, rtol=2e-1, atol=2e-1)
+
+
+@pytest.mark.parametrize("batch_size", [1])
+@pytest.mark.parametrize(
+    "hidden_size, intermediate_size",
+    [
+        # hidden_size=2880: 2880/32=90 scale cols, round_up(90,4)=92 → padding
+        (2880, 128),
+    ],
+)
+@pytest.mark.parametrize("num_experts", [2])
+@pytest.mark.parametrize("top_k", [2])
+@pytest.mark.parametrize("otype", [torch.bfloat16])
+@pytest.mark.parametrize(("alpha", "beta", "limit"), [(None, None, None)])
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] not in [10, 11, 12],
+    reason="MXFP8xMXFP4 is only supported on SM100, SM110 and SM120/SM121",
+)
+def test_moe_mxfp8_mxfp4_unaligned_hidden_size(
+    batch_size,
+    hidden_size,
+    num_experts,
+    top_k,
+    intermediate_size,
+    otype,
+    alpha,
+    beta,
+    limit,
+):
+    """Test MXFP8xMXFP4 MoE with hidden_size not aligned to sf_block_size * 4.
+
+    When hidden_size/32 is not a multiple of 4, block_scale_interleave pads
+    the scale columns, causing weight_scale_vec_size to be reverse-computed
+    incorrectly (e.g. 31 instead of 32). See issue #2847.
+    """
+    if top_k > num_experts:
+        pytest.skip(
+            f"top_k ({top_k}) cannot be greater than num_experts ({num_experts})"
+        )
+
+    torch.manual_seed(42)
+    e = num_experts
+    m = batch_size
+    n = intermediate_size
+    k = hidden_size
+
+    x = torch.randn(m, k, dtype=otype).cuda()
+    w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=otype) / 10
+    w2 = torch.randn((e, k, n), device="cuda", dtype=otype) / 10
+
+    mxfp8_x, mxfp8_x_sf = mxfp8_quantize(x, True, 32)
+
+    mxfp4_w1, mxfp4_w1_scale = quant_mxfp4_batches(w1, e)
+    mxfp4_w2, mxfp4_w2_scale = quant_mxfp4_batches(w2, e)
+
+    router_logits = torch.randn(m, e, dtype=otype).cuda()
+    routing_weights, selected_experts = compute_routing(router_logits, top_k)
+
+    fake_input_scale = torch.ones(e, device=x.device)
+
+    quant_scales = [
+        mxfp4_w1_scale.view(torch.int32),
+        fake_input_scale,
+        mxfp4_w2_scale.view(torch.int32),
+        fake_input_scale,
+    ]
+
+    flash_output = torch.zeros_like(x)
+
+    _ = fused_moe.cutlass_fused_moe(
+        mxfp8_x,
+        selected_experts.to(torch.int),
+        routing_weights,
+        mxfp4_w1.contiguous().view(torch.long),
+        mxfp4_w2.contiguous().view(torch.long),
+        otype,
+        quant_scales=quant_scales,
+        input_sf=mxfp8_x_sf,
+        use_mxfp8_act_scaling=True,
+        output=flash_output,
+    )
+
+    dq_mxfp8_x = (
+        mxfp8_dequantize_host(
+            mxfp8_x.cpu().view(torch.uint8),
+            mxfp8_x_sf.cpu().view(torch.uint8).reshape(-1),
+            True,
+        )
+        .cuda()
+        .to(otype)
+    )
+
+    dq_mfxp4_w1 = (
+        dequant_mxfp4_batches(
+            mxfp4_w1.cpu().view(torch.uint8),
+            mxfp4_w1_scale.cpu().view(torch.uint8).reshape(-1),
+        )
+        .cuda()
+        .to(otype)
+    )
+
+    dq_mfxp4_w2 = (
+        dequant_mxfp4_batches(
+            mxfp4_w2.cpu().view(torch.uint8),
+            mxfp4_w2_scale.cpu().view(torch.uint8).reshape(-1),
+        )
+        .cuda()
+        .to(otype)
+    )
+
+    ref_output = compute_with_experts(
+        e,
+        dq_mxfp8_x,
+        dq_mfxp4_w1,
+        dq_mfxp4_w2,
+        selected_experts,
+        routing_weights,
+        alpha,
+        beta,
+        limit,
+    )
+
+    torch.testing.assert_close(ref_output, flash_output, rtol=1e-1, atol=1e-1)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
