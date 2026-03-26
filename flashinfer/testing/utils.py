@@ -1445,7 +1445,31 @@ def bench_gpu_time_with_cudagraph(
             call_fn()
     torch.cuda.current_stream().wait_stream(s)
 
-    # Capture kernel in graph
+    # Estimate single-kernel time to detect when num_iters_within_graph would
+    # cause GPU power throttling. Running many kernels back-to-back within a
+    # single graph replay causes sustained peak power draw, which forces the GPU
+    # to throttle clock frequency (up to 20% on B200), producing artificially
+    # lower benchmark numbers.
+    g_probe = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g_probe):
+        call_fn()
+    torch.cuda.synchronize()
+    probe_iters = 5
+    start_event.record()
+    for _ in range(probe_iters):
+        g_probe.replay()
+    end_event.record()
+    torch.cuda.synchronize()
+    single_kernel_ms = start_event.elapsed_time(end_event) / probe_iters
+    del g_probe
+
+    # Cap num_iters_within_graph so total graph duration stays under the
+    # power throttling threshold (~5ms empirically on B200).
+    max_sustained_ms = 5.0
+    if single_kernel_ms * num_iters_within_graph > max_sustained_ms:
+        num_iters_within_graph = max(1, int(max_sustained_ms / single_kernel_ms))
+
+    # Capture kernel in graph with the (possibly reduced) num_iters_within_graph
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
         if _do_rotate and num_rotations > 1:
@@ -1459,7 +1483,7 @@ def bench_gpu_time_with_cudagraph(
                 call_fn()
     torch.cuda.synchronize()
 
-    ## Estimate kernel execution time by running the kernel 5 times
+    ## Estimate kernel execution time by running the graph 5 times
     measurement_iters = 5
     start_event.record()
     for _ in range(measurement_iters):
@@ -1482,6 +1506,11 @@ def bench_gpu_time_with_cudagraph(
         g.replay()
     torch.cuda.synchronize()
 
+    # Determine how many graph replays can run back-to-back before triggering
+    # inter-replay power throttling (separate from intra-graph throttling above).
+    graph_duration_ms = estimated_kernel_execution_time
+    replays_per_burst = max(1, int(max_sustained_ms / graph_duration_ms))
+
     # Actual run
     start_events = [torch.cuda.Event(enable_timing=True) for _ in range(repeat_iters)]
     end_events = [torch.cuda.Event(enable_timing=True) for _ in range(repeat_iters)]
@@ -1493,8 +1522,11 @@ def bench_gpu_time_with_cudagraph(
 
         if sleep_after_run:
             sleep_after_kernel_run(estimated_kernel_execution_time)
+        elif (iter_idx + 1) % replays_per_burst == 0:
+            # Cooldown gap to prevent clock throttling from sustained compute.
+            torch.cuda.synchronize()
+            time.sleep(graph_duration_ms / 1000)
 
-    # Synchronize once outside of the loop to avoid synchronization overhead
     torch.cuda.synchronize()
     measured_times = []
     for iter_idx in range(repeat_iters):
