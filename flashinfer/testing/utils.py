@@ -1230,7 +1230,12 @@ def bench_gpu_time_with_cupti(
     cupti.activity_register_callbacks(
         func_buffer_requested, partial(func_buffer_completed, launches, kernels)
     )
-    for _ in range(repeat_iters):
+    # Cooldown interval to prevent GPU power throttling (same as event/graph paths).
+    # CUPTI measures pure GPU time, but throttled clocks still produce longer durations.
+    iters_per_burst = max(
+        1, int(GPU_POWER_THROTTLE_THRESHOLD_MS / estimated_kernel_execution_time)
+    )
+    for iter_idx in range(repeat_iters):
         if _do_l2_flush:
             buffer.zero_()
         start_cpu = cupti.get_timestamp()
@@ -1240,6 +1245,8 @@ def bench_gpu_time_with_cupti(
         iter_timestamps.append((start_cpu, end_cpu))
         if sleep_after_run:
             sleep_after_kernel_run(estimated_kernel_execution_time)
+        elif (iter_idx + 1) % iters_per_burst == 0:
+            time.sleep(estimated_kernel_execution_time / 1000)
     cupti.activity_flush_all(0)
     cupti.activity_disable(cupti.ActivityKind.RUNTIME)
     cupti.activity_disable(cupti.ActivityKind.CONCURRENT_KERNEL)
