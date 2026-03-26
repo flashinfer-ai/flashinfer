@@ -31,6 +31,7 @@ from .utils import (
     device_support_pdl,
     get_compute_capability,
     get_device_sm_count,
+    is_sm12x_supported,
     log2e,
 )
 from .xqa import xqa_mla
@@ -677,13 +678,17 @@ def trtllm_batch_decode_with_kv_cache_mla(
     if isinstance(bmm2_scale, torch.Tensor):
         assert bmm2_scale.dtype == torch.float32
     if backend == "xqa":
-        if (
-            get_compute_capability(query.device)[0] != 12
-            or query.dtype != torch.float8_e4m3fn
-            or kv_cache.dtype != torch.float8_e4m3fn
-        ):
+        if not is_sm12x_supported(query.device):
             raise ValueError(
-                f"XQA MLA only supports fp8 operation on SM120/SM121 GPUs, got {query.dtype} and {kv_cache.dtype}"
+                "XQA MLA requires SM120a (CUDA >= 12.8) or SM121a (CUDA >= 13.0)"
+            )
+        fp8_ok = (
+            query.dtype == torch.float8_e4m3fn and kv_cache.dtype == torch.float8_e4m3fn
+        )
+        bf16_ok = query.dtype == torch.bfloat16 and kv_cache.dtype == torch.bfloat16
+        if not (fp8_ok or bf16_ok):
+            raise ValueError(
+                f"XQA MLA on SM120/SM121 supports (fp8, fp8) or (bfloat16, bfloat16) only, got {query.dtype} and {kv_cache.dtype}"
             )
         if sinks is not None:
             raise ValueError("XQA MLA does not support sinks")
@@ -852,9 +857,17 @@ def xqa_batch_decode_with_kv_cache_mla(
         raise ValueError(
             f"XQA MLA only supports q_len_per_request == 1, got {q_len_per_request}"
         )
-    if query.dtype != torch.float8_e4m3fn or kv_cache.dtype != torch.float8_e4m3fn:
+    if not is_sm12x_supported(query.device):
         raise ValueError(
-            f"XQA MLA only supports fp8 tensor core operation, got {query.dtype} and {kv_cache.dtype}"
+            "XQA MLA requires SM120a (CUDA >= 12.8) or SM121a (CUDA >= 13.0)"
+        )
+    fp8_ok = (
+        query.dtype == torch.float8_e4m3fn and kv_cache.dtype == torch.float8_e4m3fn
+    )
+    bf16_ok = query.dtype == torch.bfloat16 and kv_cache.dtype == torch.bfloat16
+    if not (fp8_ok or bf16_ok):
+        raise ValueError(
+            f"XQA MLA supports (fp8, fp8) or (bfloat16, bfloat16) only, got {query.dtype} and {kv_cache.dtype}"
         )
     if sinks is not None:
         raise ValueError("XQA MLA does not support sinks")
