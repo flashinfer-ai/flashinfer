@@ -1993,12 +1993,23 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
   }
   int64_t intermediate_size_factor =
       isGatedActivation(static_cast<ActivationType>(act_type)) ? 2 : 1;
-  int64_t weight_scale_vec_size = (static_cast<int64_t>(local_num_experts) * intermediate_size *
-                                   intermediate_size_factor * hidden_size) /
-                                  gemm1_weights_scale.numel();
+  int64_t logical_scale_count = static_cast<int64_t>(local_num_experts) * intermediate_size *
+                                intermediate_size_factor * hidden_size;
+  int64_t weight_scale_vec_size_raw = logical_scale_count / gemm1_weights_scale.numel();
 
-  TVM_FFI_ICHECK(weight_scale_vec_size == 16 || weight_scale_vec_size == 32)
-      << "unsupported weight_scale_vec_size.";
+  // Snap to nearest valid sf_vec_size (16 or 32).
+  // The raw value may be slightly smaller than the true vec_size because
+  // block_scale_interleave pads scale columns to a multiple of 4, inflating numel().
+  int64_t weight_scale_vec_size = weight_scale_vec_size_raw > 16 ? 32 : 16;
+
+  // Round-trip validation: the unpadded scale count must not exceed actual numel
+  // (padding only adds elements, never removes them).
+  int64_t expected_unpadded = logical_scale_count / weight_scale_vec_size;
+  TVM_FFI_ICHECK(gemm1_weights_scale.numel() >= expected_unpadded)
+      << "weight scale tensor too small: numel=" << gemm1_weights_scale.numel()
+      << " but expected at least " << expected_unpadded
+      << " for sf_vec_size=" << weight_scale_vec_size;
+
   auto mDtypeWeights = weight_scale_vec_size == 16 ? btg::Dtype::E2m1 : btg::Dtype::MxE2m1;
 
   if (routing_logits.has_value()) {
