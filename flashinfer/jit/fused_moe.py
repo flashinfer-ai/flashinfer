@@ -38,6 +38,7 @@ def gen_cutlass_fused_moe_sm120_module(use_fast_build: bool = False) -> JitSpec:
         "-DENABLE_FP8",
         "-DENABLE_FP4",
         "-DUSING_OSS_CUTLASS_MOE_GEMM",
+        "-DCUTLASS_ENABLE_GDC_FOR_SM100=1"
     ]
 
     nvcc_flags += current_compilation_context.get_nvcc_flags_list(
@@ -56,6 +57,7 @@ def gen_cutlass_fused_moe_sm103_module(use_fast_build: bool = False) -> JitSpec:
         "-DENABLE_FP4",
         "-DUSING_OSS_CUTLASS_MOE_GEMM",
         "-DCOMPILE_BLACKWELL_SM103_TMA_GROUPED_GEMMS",
+        "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
     ]
 
     nvcc_flags += current_compilation_context.get_nvcc_flags_list(
@@ -73,6 +75,7 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
         "-DENABLE_FP8",
         "-DENABLE_FP4",
         "-DUSING_OSS_CUTLASS_MOE_GEMM",
+        "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
     ]
 
     nvcc_flags += current_compilation_context.get_nvcc_flags_list(
