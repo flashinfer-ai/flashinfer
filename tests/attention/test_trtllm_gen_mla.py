@@ -287,8 +287,8 @@ def trtllm_batch_decode_mla(
         if compute_capability[0] != 10:
             pytest.skip("TRTLLM-GEN MLA only supports SM100 and SM103 GPUs")
     if backend == "cute-dsl":
-        if compute_capability[0] < 10:
-            pytest.skip("cute-dsl MLA requires SM100+")
+        if compute_capability[0] not in (10, 11):
+            pytest.skip("cute-dsl MLA requires SM100-SM110 (tcgen05)")
         if dynamic_scale:
             pytest.skip("cute-dsl does not support dynamic_scale")
         if enable_pdl is not None:

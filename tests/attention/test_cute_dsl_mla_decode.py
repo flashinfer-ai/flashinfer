@@ -18,13 +18,14 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from flashinfer.utils import is_sm100a_supported
+from flashinfer.utils import is_sm100a_supported, is_sm110a_supported
 from flashinfer.cute_dsl import is_cute_dsl_available
 
 
 def skip_if_unsupported():
-    if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("Requires SM100a (Blackwell)")
+    device = torch.device("cuda")
+    if not (is_sm100a_supported(device) or is_sm110a_supported(device)):
+        pytest.skip("Requires SM100-SM110 (tcgen05)")
     if not is_cute_dsl_available():
         pytest.skip("CuTe DSL not available")
 
