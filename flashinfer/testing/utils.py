@@ -31,6 +31,18 @@ from flashinfer.utils import round_up
 
 
 # =============================================================================
+# Power Throttling Prevention
+# =============================================================================
+
+# Maximum duration (ms) of sustained back-to-back GPU compute before inserting
+# a cooldown gap. Modern GPUs (e.g. B200) throttle SM clocks by up to 20% when
+# power draw is sustained at peak for >5ms. Benchmarking loops that exceed this
+# produce artificially lower throughput numbers. We insert sync+sleep gaps at
+# this interval to let GPU clocks recover between measurement bursts.
+GPU_POWER_THROTTLE_THRESHOLD_MS = 5.0
+
+
+# =============================================================================
 # Rotating Buffer Utilities for Cold-L2 Benchmarking
 # =============================================================================
 
@@ -890,7 +902,7 @@ def bench_gpu_time_with_cuda_event(
     # causes throttling after ~5ms on modern GPUs (e.g. B200), leading to
     # artificially lower benchmark numbers. Insert sync+sleep cooldown gaps
     # to let clocks recover.
-    max_sustained_ms = 5.0
+    max_sustained_ms = GPU_POWER_THROTTLE_THRESHOLD_MS
     iters_per_burst = max(1, int(max_sustained_ms / estimated_kernel_execution_time))
 
     # Actual run
@@ -1476,7 +1488,7 @@ def bench_gpu_time_with_cudagraph(
 
     # Cap num_iters_within_graph so total graph duration stays under the
     # power throttling threshold (~5ms empirically on B200).
-    max_sustained_ms = 5.0
+    max_sustained_ms = GPU_POWER_THROTTLE_THRESHOLD_MS
     if single_kernel_ms * num_iters_within_graph > max_sustained_ms:
         num_iters_within_graph = max(1, int(max_sustained_ms / single_kernel_ms))
 
