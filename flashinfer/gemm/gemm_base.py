@@ -2845,6 +2845,7 @@ def build_cudnn_gemm_bf16_graph_override_shape(
     cache_m: int = _OVERRIDE_SHAPE_CACHE_M,
     is_a_k_major: bool = True,
     is_b_k_major: bool = True,
+    policy=None,
 ):
     """Build a cuDNN BF16 GEMM graph with override-shape support.
 
@@ -2866,6 +2867,8 @@ def build_cudnn_gemm_bf16_graph_override_shape(
             If False, B is row-major with K-contiguous layout (stride along K is 1).
     """
     _check_cudnn_override_shape_availability()
+    if policy is None:
+        policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
 
     a_shape = (batch, cache_m, k)
     a_stride = (cache_m * k, k, 1) if is_a_k_major else (cache_m * k, 1, cache_m)
@@ -2909,7 +2912,7 @@ def build_cudnn_gemm_bf16_graph_override_shape(
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
     graph.check_support()
-    graph.build_plans()
+    graph.build_plans(policy)
 
     return graph
 
@@ -2929,9 +2932,13 @@ def execute_cudnn_gemm_bf16_graph_override_shape(
         UIDs.O_UID.value: c_final,
     }
 
+    a_shape, a_stride = _get_bf16_3d_shape_stride(a)
+    b_shape, b_stride = _get_bf16_3d_shape_stride(b)
+    c_shape, c_stride = _get_bf16_3d_shape_stride(c_final)
+
     override_uids = [UIDs.A_UID.value, UIDs.B_UID.value, UIDs.O_UID.value]
-    override_shapes = [list(a.shape), list(b.shape), list(c_final.shape)]
-    override_strides = [list(a.stride()), list(b.stride()), list(c_final.stride())]
+    override_shapes = [list(a_shape), list(b_shape), list(c_shape)]
+    override_strides = [list(a_stride), list(b_stride), list(c_stride)]
 
     stream = torch.cuda.current_stream(a.device)
     cudnn_handle = _get_cudnn_handle(a.device, stream)
@@ -2986,6 +2993,36 @@ def _cudnn_gemm_bf16(
 
 def _cudnn_gemm_bf16_runner():
     class CudnnBf16GemmRunner(TunableRunner):
+        @staticmethod
+        def _get_override_graph(a, b, out):
+            a_shape, a_stride = _get_bf16_3d_shape_stride(a)
+            b_shape, b_stride = _get_bf16_3d_shape_stride(b)
+
+            batch = a_shape[0]
+            actual_m = a_shape[-2]
+            k = a_shape[-1]
+            n = b_shape[-1]
+            o_type = _torch_data_type_to_cudnn_data_type(out.dtype)
+
+            # Ceiling power-of-2 ensures cache_m >= actual_M.
+            cache_m = last_positive_power_of_2(actual_m)
+
+            is_a_k_major = a_stride[-1] == 1
+            is_b_k_major = b_stride[-2] == 1
+
+            graph = build_cudnn_gemm_bf16_graph_override_shape(
+                batch=batch,
+                n=n,
+                k=k,
+                o_type=o_type,
+                device=a.device,
+                cache_m=cache_m,
+                is_a_k_major=is_a_k_major,
+                is_b_k_major=is_b_k_major,
+                policy=cudnn.build_plan_policy.ALL,
+            )
+            return graph
+
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
             # inputs layout: a, b, bias, pdl, out, workspace_buffer
             # out.dtype distinguishes bfloat16 / float16 / float32 output graphs
@@ -2998,18 +3035,22 @@ def _cudnn_gemm_bf16_runner():
             profile: OptimizationProfile,
         ) -> List[int]:
             a, b, _, _, out, _ = inputs
-            a_shape, a_stride = _get_bf16_3d_shape_stride(a)
-            b_shape, b_stride = _get_bf16_3d_shape_stride(b)
 
-            graph = build_cudnn_gemm_bf16_graph(
-                a_shape,
-                a_stride,
-                b_shape,
-                b_stride,
-                _torch_data_type_to_cudnn_data_type(out.dtype),
-                a.device,
-                policy=cudnn.build_plan_policy.ALL,
-            )
+            if is_cudnn_override_shape_available():
+                graph = self._get_override_graph(a, b, out)
+            else:
+                a_shape, a_stride = _get_bf16_3d_shape_stride(a)
+                b_shape, b_stride = _get_bf16_3d_shape_stride(b)
+
+                graph = build_cudnn_gemm_bf16_graph(
+                    a_shape,
+                    a_stride,
+                    b_shape,
+                    b_stride,
+                    _torch_data_type_to_cudnn_data_type(out.dtype),
+                    a.device,
+                    policy=cudnn.build_plan_policy.ALL,
+                )
 
             return list(range(graph.get_execution_plan_count()))
 
@@ -3027,7 +3068,19 @@ def _cudnn_gemm_bf16_runner():
             if pdl:
                 raise ValueError("cudnn bf16 gemm does not support pdl.")
 
-            _cudnn_gemm_bf16(workspace_buffer, a, b, out, tactic=tactic)
+            if is_cudnn_override_shape_available():
+                graph = self._get_override_graph(a, b, out)
+
+                execute_cudnn_gemm_bf16_graph_override_shape(
+                    graph,
+                    a,
+                    b,
+                    out,
+                    workspace_buffer,
+                    tactic=max(tactic, 0),
+                )
+            else:
+                _cudnn_gemm_bf16(workspace_buffer, a, b, out, tactic=tactic)
 
             return out
 
