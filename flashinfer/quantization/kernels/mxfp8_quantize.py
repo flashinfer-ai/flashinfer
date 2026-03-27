@@ -86,12 +86,12 @@ _MAX_WARPS = 32  # Maximum to avoid register pressure (1024 threads)
 _DEFAULT_WARPS = 16  # Default when no optimization needed
 
 
-def _compute_optimal_warps_for_k(K: int) -> int:
+def _compute_optimal_warps(K: int, sf_blocks_per_warp: int = SF_BLOCKS_PER_WARP) -> int:
     """
     Compute optimal WARPS_PER_BLOCK for 100% thread utilization.
 
     For the swizzled kernel, we need:
-        (WARPS × SF_BLOCKS_PER_WARP) % num_sf_blocks == 0
+        (WARPS × sf_blocks_per_warp) % num_sf_blocks == 0
 
     where num_sf_blocks = K / 32.
 
@@ -103,6 +103,8 @@ def _compute_optimal_warps_for_k(K: int) -> int:
 
     Args:
         K: Number of columns (must be divisible by 32)
+        sf_blocks_per_warp: SF blocks per warp for the selected thread
+            configuration (16 for 2T/SF, 8 for 4T/SF)
 
     Returns:
         Optimal number of warps per block
@@ -111,9 +113,9 @@ def _compute_optimal_warps_for_k(K: int) -> int:
 
     num_sf_blocks = K // SF_VEC_SIZE  # K / 32
 
-    # For 100% utilization: (WARPS * SF_BLOCKS_PER_WARP) % num_sf_blocks == 0
-    # WARPS must be a multiple of: num_sf_blocks / gcd(num_sf_blocks, SF_BLOCKS_PER_WARP)
-    gcd_val = math.gcd(num_sf_blocks, SF_BLOCKS_PER_WARP)
+    # For 100% utilization: (WARPS * sf_blocks_per_warp) % num_sf_blocks == 0
+    # WARPS must be a multiple of: num_sf_blocks / gcd(num_sf_blocks, sf_blocks_per_warp)
+    gcd_val = math.gcd(num_sf_blocks, sf_blocks_per_warp)
     warp_multiple = num_sf_blocks // gcd_val
 
     # Find LARGEST valid WARPS in range [_MIN_WARPS, _MAX_WARPS]
@@ -136,23 +138,29 @@ def _compute_optimal_warps_for_k(K: int) -> int:
 
 
 # =============================================================================
-# CuTe-DSL Kernel Class for Linear Layout
+# CuTe-DSL Kernel Class for Linear Layout — Flat SF-Block Iteration
 # =============================================================================
 
 
 class MXFP8QuantizeLinearKernel:
     """
     MXFP8 quantization kernel optimized for LINEAR layout.
-    Uses SF-block based iteration for efficient memory access.
+
+    Uses flat SF-block iteration for efficient memory access. Row and
+    column indices are derived from the flat SF index via integer division.
+
+    No padding passes are needed since for linear layout:
+    - padded_m == m (no row padding)
+    - padded_sf_cols == num_sf_blocks_per_row (no column padding)
+
+    Adaptive thread configuration (compile-time selected via use_2t_per_sf):
+    - 2T/SF (large problems): 2 threads per SF block, 16 elements per thread,
+      1 shuffle reduction, 16 SF blocks per warp
+    - 4T/SF (small problems): 4 threads per SF block, 8 elements per thread,
+      2 shuffle reductions, 8 SF blocks per warp
 
     This kernel is M-agnostic: compiled once per (K, dtype, pdl, use_2t)
-    combination. M-dependent values (total_sf_blocks, num_blocks) are
-    passed at runtime.
-
-    When use_2t_per_sf=True (large problems): 2 threads per SF block,
-    16 elements per thread, 1 shuffle reduction, 16 SF blocks per warp.
-    When use_2t_per_sf=False (small problems): 4 threads per SF block,
-    8 elements per thread, 2 shuffle reductions, 8 SF blocks per warp.
+    combination.
     """
 
     WARPS_PER_BLOCK = 16  # 16 warps = 512 threads per block
@@ -317,7 +325,7 @@ class MXFP8QuantizeLinearKernel:
 
 
 # =============================================================================
-# CuTe-DSL Kernel Class for Swizzled Layout
+# CuTe-DSL Kernel Class for Swizzled Layout — Row-Based Iteration
 # =============================================================================
 
 
@@ -334,6 +342,9 @@ class MXFP8QuantizeSwizzledKernel:
     - Dynamic WARPS_PER_BLOCK based on K for 100% thread utilization
     - For small K: Multiple rows processed per block iteration
     - For large K: Single row with column loop
+
+    For MXFP8, each SF block (32 elements) is processed by _threads_per_sf
+    threads (2 or 4), so threads_per_row = num_sf_blocks_per_row * _threads_per_sf.
 
     This kernel is M-agnostic: compiled once per (K, dtype, pdl, use_2t)
     combination. M-dependent values (M, padded_M) are passed at runtime.
@@ -364,7 +375,7 @@ class MXFP8QuantizeSwizzledKernel:
         self.padded_sf_cols = ((self.num_sf_blocks_per_row + 3) // 4) * 4
 
         # Compute optimal warps for 100% thread utilization
-        self.warps_per_block = _compute_optimal_warps_for_k(K)
+        self.warps_per_block = _compute_optimal_warps(K, self._sf_blocks_per_warp)
 
         # Multi-row processing constants (compile-time)
         threads_per_block = self.warps_per_block * WARP_SIZE
@@ -700,7 +711,7 @@ class MXFP8QuantizeSwizzledKernel:
 
 
 @functools.cache
-def _get_compiled_kernel_linear(
+def _get_compiled_kernel_mxfp8_linear(
     is_bfloat16: bool,
     K: int,
     enable_pdl: bool = False,
@@ -750,7 +761,7 @@ def _get_compiled_kernel_linear(
 
 
 @functools.cache
-def _get_compiled_kernel_swizzled(
+def _get_compiled_kernel_mxfp8_swizzled(
     is_bfloat16: bool,
     K: int,
     enable_pdl: bool = False,
@@ -885,7 +896,7 @@ def mxfp8_quantize_cute_dsl(
         padded_sf_cols = ((num_sf_blocks_per_row + 3) // 4) * 4
         scale_output_size = padded_m * padded_sf_cols
 
-        kernel_fn, rows_per_block = _get_compiled_kernel_swizzled(
+        kernel_fn, rows_per_block = _get_compiled_kernel_mxfp8_swizzled(
             is_bfloat16, padded_k, enable_pdl, use_2t
         )
 
@@ -902,7 +913,7 @@ def mxfp8_quantize_cute_dsl(
         total_sf_blocks = m * num_sf_blocks_per_row
         scale_output_size = total_sf_blocks
 
-        kernel_fn, sf_blocks_per_tb = _get_compiled_kernel_linear(
+        kernel_fn, sf_blocks_per_tb = _get_compiled_kernel_mxfp8_linear(
             is_bfloat16, padded_k, enable_pdl, use_2t
         )
 
@@ -926,6 +937,6 @@ __all__ = [
     "MXFP8QuantizeLinearKernel",
     "MXFP8QuantizeSwizzledKernel",
     "mxfp8_quantize_cute_dsl",
-    "_get_compiled_kernel_linear",
-    "_get_compiled_kernel_swizzled",
+    "_get_compiled_kernel_mxfp8_linear",
+    "_get_compiled_kernel_mxfp8_swizzled",
 ]

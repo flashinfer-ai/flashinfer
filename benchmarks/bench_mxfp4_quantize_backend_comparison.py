@@ -313,7 +313,6 @@ def run_benchmark_sweep(
         k_values: List of K dimensions to benchmark
         dtype: Input dtype
         is_sf_swizzled_layout: Whether to use swizzled scale factor layout
-        no_verify: Skip correctness verification for pure timing runs
 
     Returns:
         Tuple of (cuda_times, cute_dsl_times) dictionaries

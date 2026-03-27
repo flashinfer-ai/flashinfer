@@ -343,15 +343,15 @@ def test_cute_dsl_compilation_cache_m_agnostic(is_sf_swizzled_layout):
         pytest.skip("CuTe-DSL is not available")
 
     from flashinfer.quantization.kernels.mxfp8_quantize import (
-        _get_compiled_kernel_linear,
-        _get_compiled_kernel_swizzled,
+        _get_compiled_kernel_mxfp8_linear,
+        _get_compiled_kernel_mxfp8_swizzled,
     )
 
     # Get the appropriate cache based on layout
     if is_sf_swizzled_layout:
-        cache_fn = _get_compiled_kernel_swizzled
+        cache_fn = _get_compiled_kernel_mxfp8_swizzled
     else:
-        cache_fn = _get_compiled_kernel_linear
+        cache_fn = _get_compiled_kernel_mxfp8_linear
 
     # Clear the cache to start fresh
     cache_fn.cache_clear()
@@ -409,15 +409,15 @@ def test_cute_dsl_compilation_cache_k_specific(is_sf_swizzled_layout):
         pytest.skip("CuTe-DSL is not available")
 
     from flashinfer.quantization.kernels.mxfp8_quantize import (
-        _get_compiled_kernel_linear,
-        _get_compiled_kernel_swizzled,
+        _get_compiled_kernel_mxfp8_linear,
+        _get_compiled_kernel_mxfp8_swizzled,
     )
 
     # Get the appropriate cache based on layout
     if is_sf_swizzled_layout:
-        cache_fn = _get_compiled_kernel_swizzled
+        cache_fn = _get_compiled_kernel_mxfp8_swizzled
     else:
-        cache_fn = _get_compiled_kernel_linear
+        cache_fn = _get_compiled_kernel_mxfp8_linear
 
     # Clear the cache to start fresh
     cache_fn.cache_clear()
@@ -469,15 +469,15 @@ def test_cute_dsl_compilation_cache_dtype_specific(is_sf_swizzled_layout):
         pytest.skip("CuTe-DSL is not available")
 
     from flashinfer.quantization.kernels.mxfp8_quantize import (
-        _get_compiled_kernel_linear,
-        _get_compiled_kernel_swizzled,
+        _get_compiled_kernel_mxfp8_linear,
+        _get_compiled_kernel_mxfp8_swizzled,
     )
 
     # Get the appropriate cache based on layout
     if is_sf_swizzled_layout:
-        cache_fn = _get_compiled_kernel_swizzled
+        cache_fn = _get_compiled_kernel_mxfp8_swizzled
     else:
-        cache_fn = _get_compiled_kernel_linear
+        cache_fn = _get_compiled_kernel_mxfp8_linear
 
     # Clear the cache to start fresh
     cache_fn.cache_clear()

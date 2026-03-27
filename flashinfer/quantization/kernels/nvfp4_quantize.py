@@ -141,20 +141,15 @@ class NVFP4QuantizeLinearKernel:
     """
     NVFP4 quantization kernel optimized for LINEAR layout.
 
-    Uses flat SF-block iteration for efficient memory access. Each thread
-    processes one SF block (16 elements) from a global flat pool. Row and
+    Uses flat SF-block iteration for efficient memory access. Row and
     column indices are derived from the flat SF index via integer division.
 
     No padding passes are needed since for linear layout:
     - padded_m == m (no row padding)
     - padded_sf_cols == num_sf_blocks_per_row (no column padding)
 
-    Key features:
-    - E4M3 scale factors (FP8 format) with user-provided global_scale
-    - sf_vec_size=16 (each thread processes 16 elements)
-    - Supports fp16, bf16, and fp8 input dtypes
-
     This kernel is M-agnostic: compiled once per (K, dtype, pdl) combination.
+    Each thread handles one SF block (16 elements).
     """
 
     WARPS_PER_BLOCK = _LINEAR_WARPS_PER_BLOCK
@@ -292,12 +287,6 @@ class NVFP4QuantizeSwizzledKernel:
 
     For NVFP4, each thread processes 1 SF block (16 elements) independently,
     so threads_per_row = num_sf_blocks_per_row = K/16.
-
-    Key features:
-    - E4M3 scale factors (FP8 format) with user-provided global_scale
-    - sf_vec_size=16 (each thread processes 16 elements)
-    - Layout-specific SF writes via _compute_sf_offset (128x4 or 8x4)
-    - Supports fp16, bf16, and fp8 input dtypes
 
     This kernel is M-agnostic: compiled once per (K, dtype, sf_layout, pdl)
     combination. M-dependent values (M, padded_M) are passed at runtime.
