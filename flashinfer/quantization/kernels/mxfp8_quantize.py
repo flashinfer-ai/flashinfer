@@ -587,13 +587,17 @@ class MXFP8QuantizeSwizzledKernel:
                     is_padding_row = row_idx >= M
 
                     if is_padding_row:
-                        # Fast path: padding row - zero out scale factors
-                        # Each thread handles one SF column (no column loop needed)
-                        if sf_col_idx < padded_sf_cols and thread_in_unit == Int32(0):
-                            sf_offset = compute_sf_index_swizzled_128x4_gpu(
-                                row_idx, sf_col_idx, padded_sf_cols
-                            )
-                            mScales[sf_offset] = Uint8(0)
+                        # Fast path: padding row - zero out ALL scale factors
+                        # Thread-stride loop since padded_sf_cols may exceed
+                        # num_sf_blocks_per_row (when K/32 is not a multiple of 4)
+                        if thread_in_unit == Int32(0):
+                            pad_col = sf_col_idx
+                            while pad_col < padded_sf_cols:
+                                sf_offset = compute_sf_index_swizzled_128x4_gpu(
+                                    row_idx, pad_col, padded_sf_cols
+                                )
+                                mScales[sf_offset] = Uint8(0)
+                                pad_col = pad_col + num_sf_blocks_per_row
                     else:
                         # Normal path: process actual data
                         if sf_col_idx < num_sf_blocks_per_row:
@@ -684,17 +688,19 @@ class MXFP8QuantizeSwizzledKernel:
                                 )
                                 mScales[sf_offset] = scale_ue8m0
 
-                        # Handle padding SF columns (for this row)
-                        # Threads with sf_col_idx in [num_sf_blocks_per_row, padded_sf_cols)
-                        if (
-                            sf_col_idx >= num_sf_blocks_per_row
-                            and sf_col_idx < padded_sf_cols
-                            and thread_in_unit == Int32(0)
+                        # Handle padding SF columns for this row
+                        # Thread-stride loop starting from first padding column
+                        if cutlass.const_expr(
+                            self.num_sf_blocks_per_row != self.padded_sf_cols
                         ):
-                            sf_offset = compute_sf_index_swizzled_128x4_gpu(
-                                row_idx, sf_col_idx, padded_sf_cols
-                            )
-                            mScales[sf_offset] = Uint8(0)
+                            if thread_in_unit == Int32(0):
+                                pad_col = num_sf_blocks_per_row + sf_col_idx
+                                while pad_col < padded_sf_cols:
+                                    sf_offset = compute_sf_index_swizzled_128x4_gpu(
+                                        row_idx, pad_col, padded_sf_cols
+                                    )
+                                    mScales[sf_offset] = Uint8(0)
+                                    pad_col = pad_col + num_sf_blocks_per_row
 
                 row_batch_idx = row_batch_idx + grid_dim_x
                 # Update row_idx for next iteration
