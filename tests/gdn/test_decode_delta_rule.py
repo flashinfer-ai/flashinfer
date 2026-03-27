@@ -203,7 +203,6 @@ def _test_decode_kernel_pretranspose(
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 32)],
 )
-@pytest.mark.skip(reason="Temporarily skipped due to CI failures.")
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64, 128, 256, 512])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_decode_kernel_basic_pretranspose(
@@ -369,7 +368,6 @@ def _test_decode_kernel_nontranspose(
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 32)],
 )
-@pytest.mark.skip(reason="Temporarily skipped due to CI failures.")
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64, 128, 256, 512])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_decode_kernel_basic_nontranspose(
@@ -514,7 +512,6 @@ def _test_decode_kernel_pretranspose_pool(
 @pytest.mark.parametrize("scale", [1.0])
 @pytest.mark.parametrize("head_size", [128])
 @pytest.mark.parametrize("num_q_heads, num_k_heads, num_v_heads", [(16, 16, 32)])
-@pytest.mark.skip(reason="Temporarily skipped due to CI failures.")
 @pytest.mark.parametrize("batch_size", [1, 4, 16, 32])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_decode_kernel_pretranspose_pool(
@@ -771,7 +768,6 @@ def _test_decode_kernel_pretranspose_pool_all_padding(
 @pytest.mark.parametrize("scale", [1.0])
 @pytest.mark.parametrize("head_size", [128])
 @pytest.mark.parametrize("num_q_heads, num_k_heads, num_v_heads", [(16, 16, 32)])
-@pytest.mark.skip(reason="Temporarily skipped due to CI failures.")
 @pytest.mark.parametrize("batch_size", [1, 4, 8, 32, 127])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_decode_kernel_pretranspose_pool_negative_indices(
@@ -799,7 +795,6 @@ def test_decode_kernel_pretranspose_pool_negative_indices(
 @pytest.mark.parametrize("scale", [1.0])
 @pytest.mark.parametrize("head_size", [128])
 @pytest.mark.parametrize("num_q_heads, num_k_heads, num_v_heads", [(16, 16, 32)])
-@pytest.mark.skip(reason="Temporarily skipped due to CI failures.")
 @pytest.mark.parametrize("batch_size", [1, 4, 16, 32])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_decode_kernel_pretranspose_pool_all_padding(
@@ -1166,7 +1161,6 @@ def _test_verify_kernel_mtp(
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 32)],
 )
-@pytest.mark.skip(reason="Temporarily skipped due to CI failures.")
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_verify_kernel_mtp(
@@ -1207,7 +1201,6 @@ def test_verify_kernel_mtp(
 
 
 @pytest.mark.parametrize("seq_len", [2, 3, 4, 5, 6, 7, 8])
-@pytest.mark.skip(reason="Temporarily skipped due to CI failures.")
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64, 128, 256, 512])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_mtp_fp32_state_with_cache_and_state_update(
@@ -1419,7 +1412,6 @@ def _test_gdn_decode_bf16_state_kernel(
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 32)],
 )
-@pytest.mark.skip(reason="Temporarily skipped due to CI failures.")
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64, 128])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_gdn_decode_bf16_state_kernel(
@@ -1451,7 +1443,6 @@ def test_gdn_decode_bf16_state_kernel(
     )
 
 
-@pytest.mark.skip(reason="Temporarily skipped due to CI failures.")
 @pytest.mark.parametrize("seq_len", [1, 2, 3, 4])
 @pytest.mark.parametrize("batch_size", [1, 2, 4])
 @pytest.mark.parametrize("head_size", [128])
@@ -1815,6 +1806,7 @@ def _test_gdn_decode_bf16_state_mtp_kernel(
     # Reference: step through tokens with bf16 state
     ref_state = input_state_ref_bf16.clone()
     ref_outputs = []
+    ref_intermediate_states = []
 
     for t in range(seq_len):
         ref_o_t, ref_state = decode_delta_rule(
@@ -1833,6 +1825,8 @@ def _test_gdn_decode_bf16_state_mtp_kernel(
             state_dtype=torch.bfloat16,
         )
         ref_outputs.append(ref_o_t)
+        if cache_intermediate_states:
+            ref_intermediate_states.append(ref_state.clone())
 
     ref_o = torch.stack(ref_outputs, dim=1).to(dtype_torch)
 
@@ -1855,6 +1849,24 @@ def _test_gdn_decode_bf16_state_mtp_kernel(
         rtol=0,
         msg=f"State should be unchanged with disable_state_update=True (B={batch_size}, T={seq_len})",
     )
+
+    # Check intermediate states buffer contents against reference
+    if cache_intermediate_states and intermediate_states_buffer is not None:
+        # intermediate_states_buffer: [pool_size, T, HV, V, K] (K-last layout, bf16)
+        # ref intermediate states: [B, HV, K, V] per step (K-major layout, bf16)
+        # Stack ref: [B, T, HV, K, V], transpose to [B, T, HV, V, K] for comparison
+        ref_inter = torch.stack(ref_intermediate_states, dim=1)  # [B, T, HV, K, V]
+        ref_inter_transposed = ref_inter.transpose(-2, -1).contiguous()  # [B, T, HV, V, K]
+
+        atol_s = 0.02
+        rtol_s = 0.01
+        torch.testing.assert_close(
+            intermediate_states_buffer.float(),
+            ref_inter_transposed.float(),
+            atol=atol_s,
+            rtol=rtol_s,
+            msg=f"Intermediate states mismatch for MTP BF16 state kernel (B={batch_size}, T={seq_len})",
+        )
 
     print(
         f"  BF16 state MTP PASS (batch={batch_size}, T={seq_len}, "

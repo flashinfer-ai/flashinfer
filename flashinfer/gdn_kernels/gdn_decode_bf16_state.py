@@ -2080,7 +2080,7 @@ def gated_delta_rule(
 
     # B >= ILP_BATCH_THRESHOLD (small B handled by MTP path above)
     tile_v = _select_tile_v_for_batch(B, HV, V)
-    cache_key = ("ilp", B, H, HV, K, V, tile_v)
+    cache_key = ("ilp", B, H, HV, K, V, tile_v, scale, softplus_beta, softplus_threshold)
     if cache_key not in _compiled_kernels_ilp:
         # Use maxrregcount=64 for smaller tile_v to improve occupancy
         # when grid size is small (fewer waves)
@@ -2266,6 +2266,9 @@ def gated_delta_rule_mtp(
         disable_state_update,
         cache_intermediate_states,
         use_qk_l2norm_in_kernel,
+        scale,
+        softplus_beta,
+        softplus_threshold,
     )
     if cache_key not in _compiled_kernels_mtp:
         _compiled_kernels_mtp[cache_key] = cute.compile(
