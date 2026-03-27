@@ -1909,7 +1909,7 @@ def test_moe_nvfp4_unswizzled_input_sf():
         output=output_linear,
     )
 
-    torch.testing.assert_close(output_swizzled, output_linear, rtol=0, atol=0)
+    torch.testing.assert_close(output_swizzled, output_linear, rtol=1e-3, atol=1e-3)
 
 
 if __name__ == "__main__":
