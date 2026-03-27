@@ -31,6 +31,8 @@ from typing import Optional, Tuple
 
 import torch
 
+from .jit.core import logger
+
 try:
     from .api_logging import flashinfer_api
 
@@ -192,6 +194,10 @@ def gated_delta_rule_decode_pretranspose(
             f"Expected initial_state shape [pool_size={pool_size}, HV={HV}, V={V}, K={K}], "
             f"got {initial_state.shape}"
         )
+        assert initial_state.stride(-1) == 1, (
+            "initial_state must be K-contiguous (stride[-1] == 1) for pretranspose decode, "
+            f"got stride={initial_state.stride()}"
+        )
     else:
         assert state is not None, "Either state or initial_state must be provided"
         # Validate state shape (K-last: [B, HV, V, K])
@@ -278,13 +284,13 @@ def gated_delta_rule_decode_pretranspose(
         # Kernel outputs bfloat16, allocate in that dtype first
         output = torch.zeros((B, T, HV, V), dtype=torch.bfloat16, device=q.device)
 
-    # Build h0_source: [pool_size*HV, V, K] for kernel
+    # Build h0_source for kernel.
+    # - pool path: keep original [pool_size, HV, V, K] view so non-contiguous
+    #   page-strided pools are supported.
+    # - direct path: flatten to [B*HV, V, K].
     if use_pool:
         pool_size = initial_state.shape[0]
-        assert initial_state.is_contiguous(), (
-            "initial_state (pool) must be contiguous for correct kernel pointer arithmetic"
-        )
-        h0_source = initial_state.reshape(pool_size * HV, V, K)
+        h0_source = initial_state
         return_state = initial_state
     else:
         pool_size = B
@@ -487,7 +493,7 @@ def gated_delta_rule_mtp(
     scale: Optional[float] = None,
     output: Optional[torch.Tensor] = None,
     intermediate_states_buffer: Optional[torch.Tensor] = None,
-    disable_state_update: bool = False,
+    disable_state_update: Optional[bool] = None,
     use_qk_l2norm: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -523,8 +529,15 @@ def gated_delta_rule_mtp(
         intermediate_states_buffer (Optional[torch.Tensor]):
             Buffer for caching intermediate states, shape ``[pool_size, T, HV, V, K]``.
             If None, intermediate states are not cached.
-        disable_state_update (bool):
-            If True, the initial state is not updated. Default: ``True``.
+        disable_state_update (Optional[bool]):
+            If True, the initial state is not updated. Currently defaults to ``True``.
+            Please pass this argument explicitly — the default will change to ``False``
+            in FlashInfer 0.7.0.
+
+            .. deprecated::
+                The implicit default of ``True`` is deprecated and will change to
+                ``False`` in version 0.7.0. Pass ``disable_state_update=True`` or
+                ``disable_state_update=False`` explicitly to silence the warning.
         use_qk_l2norm (bool):
             Whether to apply L2 normalization to q and k. Default: ``True``.
 
@@ -539,6 +552,16 @@ def gated_delta_rule_mtp(
         - State layout is K-last: [pool_size, HV, V, K]
         - Optimized for speculative decoding verification scenarios
     """
+    # Handle deprecation of disable_state_update default value
+    if disable_state_update is None:
+        logger.warning_once(
+            "gated_delta_rule_mtp(): the 'disable_state_update' parameter currently "
+            "defaults to True, but this default will change to False in FlashInfer "
+            "0.7.0. Please pass disable_state_update=True or "
+            "disable_state_update=False explicitly to suppress this warning."
+        )
+        disable_state_update = True
+
     # Validate input shapes
     B, T, H, K = q.shape
     _, _, HV, V = v.shape
