@@ -118,6 +118,7 @@ def _get_compiled_mla_kernel(
     is_var_split_kv: bool,
     skip_correction_threshold: float = 0.0,
     is_workspace_size_zero: bool = False,
+    enable_pdl: bool = False,
 ) -> Callable:
     """Compile and cache an MLA decode kernel.
 
@@ -156,6 +157,7 @@ def _get_compiled_mla_kernel(
         is_persistent=is_persistent,
         is_var_seq=is_var_seq,
         is_var_split_kv=is_var_split_kv,
+        enable_pdl=enable_pdl,
     )
 
     # All dimensions as sym_int — this matches the original kernel's use of
@@ -294,6 +296,7 @@ def cute_dsl_mla_decode(
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
     is_var_seq: bool = True,
+    enable_pdl: bool = False,
 ) -> torch.Tensor:
     """CuTe DSL MLA decode kernel for Blackwell SM100.
 
@@ -335,6 +338,8 @@ def cute_dsl_mla_decode(
         Whether the sequence length is variable.
         If True, the sequence length is variable.
         Otherwise,the sequence length is fixed for all the requests in the batch.
+    enable_pdl : bool
+        Whether to use PDL.
 
     Returns
     -------
@@ -466,6 +471,7 @@ def cute_dsl_mla_decode(
         is_var_split_kv=is_var_split_kv,
         skip_correction_threshold=skip_correction_threshold,
         is_workspace_size_zero=is_workspace_size_zero,
+        enable_pdl=enable_pdl,
     )
 
     # Call the kernel

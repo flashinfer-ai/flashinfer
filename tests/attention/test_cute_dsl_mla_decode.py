@@ -101,7 +101,8 @@ def torch_reference_mla(
 @pytest.mark.parametrize("page_size", [128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("q_len", [1, 2])
-def test_cute_dsl_mla_decode_fp16(batch_size, seq_len_k, page_size, dtype, q_len):
+@pytest.mark.parametrize("enable_pdl", [True, False])
+def test_cute_dsl_mla_decode_fp16(batch_size, seq_len_k, page_size, dtype, q_len, enable_pdl):
     """Test FP16/BF16 MLA decode kernel."""
     skip_if_unsupported()
 
@@ -158,6 +159,7 @@ def test_cute_dsl_mla_decode_fp16(batch_size, seq_len_k, page_size, dtype, q_len
         softmax_scale=softmax_scale,
         output_scale=output_scale,
         is_var_seq=False,
+        enable_pdl=enable_pdl,
     )
 
     # Reference
@@ -187,7 +189,7 @@ def test_cute_dsl_mla_decode_fp16(batch_size, seq_len_k, page_size, dtype, q_len
 
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("seq_len_k", [128, 512])
-def test_cute_dsl_mla_decode_variable_seq_len(batch_size, seq_len_k, page_size=128):
+def test_cute_dsl_mla_decode_variable_seq_len(batch_size, seq_len_k, page_size=128, enable_pdl=False):
     """Test MLA decode with variable sequence lengths across the batch."""
     skip_if_unsupported()
 
@@ -241,6 +243,7 @@ def test_cute_dsl_mla_decode_variable_seq_len(batch_size, seq_len_k, page_size=1
         softmax_scale=softmax_scale,
         output_scale=output_scale,
         is_var_seq=True,
+        enable_pdl=enable_pdl,
     )
 
     # Reference
@@ -268,7 +271,7 @@ def test_cute_dsl_mla_decode_variable_seq_len(batch_size, seq_len_k, page_size=1
 
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("seq_len_k", [128, 512])
-def test_cute_dsl_mla_decode_via_api(batch_size, seq_len_k, page_size=128):
+def test_cute_dsl_mla_decode_via_api(batch_size, seq_len_k, page_size=128, enable_pdl=False):
     """Test MLA decode via the trtllm_batch_decode_with_kv_cache_mla API with cute-dsl backend."""
     skip_if_unsupported()
 
@@ -318,6 +321,7 @@ def test_cute_dsl_mla_decode_via_api(batch_size, seq_len_k, page_size=128):
         bmm2_scale=1.0,
         backend="cute-dsl",
         is_var_seq=False,
+        enable_pdl=enable_pdl,
     )
 
     assert out.shape == (batch_size, q_len, num_heads, latent_dim)
@@ -325,7 +329,8 @@ def test_cute_dsl_mla_decode_via_api(batch_size, seq_len_k, page_size=128):
 
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("seq_len_k", [128, 512])
-def test_cute_dsl_vs_trtllm_gen(batch_size, seq_len_k, page_size=64):
+@pytest.mark.parametrize("enable_pdl", [True, False])
+def test_cute_dsl_vs_trtllm_gen(batch_size, seq_len_k, enable_pdl, page_size=64):
     """Test cute-dsl backend output matches trtllm-gen backend output."""
     skip_if_unsupported()
 
@@ -394,7 +399,8 @@ def test_cute_dsl_vs_trtllm_gen(batch_size, seq_len_k, page_size=64):
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("seq_len_k", [128, 512])
 @pytest.mark.parametrize("page_size", [128])
-def test_cute_dsl_mla_decode_fp8(batch_size, seq_len_k, page_size):
+@pytest.mark.parametrize("enable_pdl", [True, False])
+def test_cute_dsl_mla_decode_fp8(batch_size, seq_len_k, page_size, enable_pdl):
     """Test FP8 MLA decode kernel against FP32 reference."""
     skip_if_unsupported()
 
@@ -447,6 +453,7 @@ def test_cute_dsl_mla_decode_fp8(batch_size, seq_len_k, page_size):
         max_seq_len=seq_len_k,
         softmax_scale=softmax_scale,
         output_scale=output_scale,
+        enable_pdl=enable_pdl,
     )
 
     assert out.dtype == torch.bfloat16

@@ -166,6 +166,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         is_persistent: bool,
         is_var_seq: bool,
         is_var_split_kv: bool,
+        enable_pdl: bool,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -189,6 +190,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :type is_var_seq: bool
         :param is_var_split_kv: Whether to use variable split KV
         :type is_var_split_kv: bool
+        :param enable_pdl: Whether to use PDL
+        :type enable_pdl: bool
         """
 
         self.latent_dim = 512
@@ -203,6 +206,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.page_size = page_size
         self.is_var_seq = is_var_seq
         self.is_var_split_kv = is_var_split_kv
+        self.enable_pdl = enable_pdl
         self.cluster_shape_mnk = (2, 1, 1)
         self.use_2cta_instrs = True
         # When using 2 CTAs with m=128: warps 0-1 handle accumulation for first half [0, n/2),
@@ -771,6 +775,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             smem=SplitKVKernelSharedStorage.size_in_bytes(),  # type: ignore[attr-defined]
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=self.enable_pdl,
         )
         if cutlass.const_expr(acc_o is not None):
             self.reduction_kernel(
@@ -787,6 +792,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 smem=MAX_SPLITS * self.acc_dtype.width // 8,
                 stream=stream,
                 min_blocks_per_mp=1,
+                use_pdl=self.enable_pdl,
             )
 
     @cute.jit
@@ -1050,6 +1056,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         #
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mnk)
 
+        if cutlass.const_expr(self.enable_pdl):
+            cute.arch.griddepcontrol_wait()
+
         # ///////////////////////////////////////////////////////////////////////////////
         #  Load warps, including page table and data tensors
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1251,6 +1260,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
             tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)
+            if cutlass.const_expr(self.enable_pdl):
+                cute.arch.griddepcontrol_launch_dependents()
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Compute warp
@@ -1428,6 +1439,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         lse_scale_ptr = cute.recast_ptr(storage, dtype=self.acc_dtype)
         smem_lse_scale = cute.make_tensor(lse_scale_ptr, cute.make_layout(MAX_SPLITS))
 
+        if cutlass.const_expr(self.enable_pdl):
+            cute.arch.griddepcontrol_wait()
         gLSE = mAccLSE[blk_coord[0], None, blk_coord[1], blk_coord[2]]
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         if warp_idx == 0:
@@ -1490,6 +1503,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         for j in cutlass.range_constexpr(elements_per_thread):
             element_idx = tidx + j * self.threads_per_warp * self.num_compute_warps
             mO[blk_coord[0], element_idx, blk_coord[1], blk_coord[2]] = rO[j]
+        if cutlass.const_expr(self.enable_pdl):
+            cute.arch.griddepcontrol_launch_dependents()
         return
 
     @staticmethod
