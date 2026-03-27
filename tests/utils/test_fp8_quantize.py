@@ -15,8 +15,8 @@ def is_cute_dsl_available():
         return False
 
 
-@pytest.mark.parametrize("m", [1, 1024])
-@pytest.mark.parametrize("k", [1024])
+@pytest.mark.parametrize("m", [1, 3, 16, 64, 1024])
+@pytest.mark.parametrize("k", [128, 1024, 8192])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
 @pytest.mark.parametrize("device", ["cuda", "cpu"])
@@ -111,8 +111,8 @@ def test_mxfp8_quantize_torch_host(m, k, dtype, is_sf_swizzled_layout):
     mxfp8_quantize_check_accuracy(a_pt, a, 8, 0, 0.999)
 
 
-@pytest.mark.parametrize("m", [1, 2, 16, 1024])
-@pytest.mark.parametrize("k", [512, 1024])
+@pytest.mark.parametrize("m", [1, 2, 3, 16, 64, 1024])
+@pytest.mark.parametrize("k", [128, 512, 1024, 8192])
 @pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
 @pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
@@ -182,8 +182,8 @@ def test_mxfp8_quantize_alignment_torch_device(
     )
 
 
-@pytest.mark.parametrize("m", [1, 128, 2048])
-@pytest.mark.parametrize("k", [1024])
+@pytest.mark.parametrize("m", [1, 3, 128, 2048])
+@pytest.mark.parametrize("k", [128, 1024])
 @pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
 @pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
