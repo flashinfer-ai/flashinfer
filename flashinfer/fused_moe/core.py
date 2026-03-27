@@ -681,6 +681,12 @@ def cutlass_fused_moe(
     swiglu_limit : Optional[torch.Tensor]
         Swiglu limit for swiglu activation.
 
+    swizzled_input_sf : bool = True
+        Whether the input scaling factor (input_sf) is in swizzled layout. Defaults to True.
+        Set to False when input_sf is in linear layout, e.g. after FP4 allgather/alltoall
+        communication where the scaling factors are received in linear (non-swizzled) format.
+        Only relevant when input_sf is not None.
+
     tp_size : int = 1
         Tensor parallelism size. Defaults to 1.
 

@@ -1796,5 +1796,121 @@ def test_moe_w4a8(
     torch.testing.assert_close(ref_output, flash_output, rtol=1e-2, atol=1e-1)
 
 
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] not in [10, 11, 12],
+    reason="NVFP4 is only supported on SM100, SM110 and SM120/SM121",
+)
+def test_moe_nvfp4_unswizzled_input_sf():
+    """Test cutlass_fused_moe with swizzled_input_sf=False (linear layout input_sf).
+
+    In FP4 allgather/alltoall scenarios, the input scaling factors received after
+    communication are in linear layout (not swizzled). This test verifies that
+    passing swizzled_input_sf=False produces the same output as first swizzling
+    the input_sf and passing swizzled_input_sf=True.
+    """
+    torch.manual_seed(42)
+    batch_size = 32
+    hidden_size = 128
+    intermediate_size = 128
+    num_experts = 4
+    top_k = 2
+    otype = torch.float16
+    quant_blocksize = 16
+    round_up = lambda x, y: (x + y - 1) // y * y
+
+    e = num_experts
+    m = batch_size
+    n = intermediate_size
+    k = hidden_size
+    w1_n = 2 * n  # Swiglu
+
+    w1 = torch.randn((e, w1_n, k), device="cuda", dtype=otype) / 10
+    w2 = torch.randn((e, k, n), device="cuda", dtype=otype) / 10
+
+    sf_w1_2n = round_up(w1_n, 128)
+    sf_w1_k = round_up(k // quant_blocksize, 4)
+    sf_w2_k = round_up(k, 128)
+    sf_w2_n = round_up(n // quant_blocksize, 4)
+
+    w1_blockscale = torch.empty(
+        (e, sf_w1_2n, sf_w1_k), device="cuda", dtype=torch.float8_e4m3fn
+    )
+    w2_blockscale = torch.empty(
+        (e, sf_w2_k, sf_w2_n), device="cuda", dtype=torch.float8_e4m3fn
+    )
+    w1_q = torch.empty((e, w1_n, k // 2), device="cuda", dtype=torch.uint8)
+    w2_q = torch.empty((e, k, n // 2), device="cuda", dtype=torch.uint8)
+    w1_gs = torch.empty((e,), device="cuda", dtype=torch.float32)
+    w2_gs = torch.empty((e,), device="cuda", dtype=torch.float32)
+
+    for expert in range(e):
+        w1_amax = torch.abs(w1[expert]).max().to(torch.float32)
+        w2_amax = torch.abs(w2[expert]).max().to(torch.float32)
+        w1_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w1_amax
+        w2_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w2_amax
+        w1_q[expert], w1_blockscale[expert] = fp4_quantize(w1[expert], w1_gs[expert])
+        w2_q[expert], w2_blockscale[expert] = fp4_quantize(w2[expert], w2_gs[expert])
+
+    x = torch.randn(m, k, dtype=otype).cuda()
+    a1_gs = torch.tensor(1.0, device="cuda", dtype=torch.float32)
+    a2_gs = torch.tensor(1.0, device="cuda", dtype=torch.float32)
+    router_logits = torch.randn(m, e, dtype=otype).cuda()
+    routing_weights, selected_experts = compute_routing(router_logits, top_k)
+
+    quant_scales = [
+        a1_gs,
+        w1_blockscale.view(torch.int32),
+        1.0 / (a1_gs * w1_gs),
+        a2_gs,
+        w2_blockscale.view(torch.int32),
+        1.0 / (a2_gs * w2_gs),
+    ]
+
+    # Quantize input with swizzled layout (default)
+    hidden_states_swizzled, input_sf_swizzled = fp4_quantize(
+        x, a1_gs, is_sf_swizzled_layout=True
+    )
+    # Quantize input with linear layout (as received after allgather/alltoall)
+    hidden_states_linear, input_sf_linear = fp4_quantize(
+        x, a1_gs, is_sf_swizzled_layout=False
+    )
+
+    # Both quantizations should produce the same quantized values
+    assert torch.equal(hidden_states_swizzled, hidden_states_linear)
+
+    output_swizzled = torch.zeros(m, k, dtype=otype, device="cuda")
+    output_linear = torch.zeros(m, k, dtype=otype, device="cuda")
+
+    # swizzled_input_sf=True with swizzled input_sf (default behavior)
+    fused_moe.cutlass_fused_moe(
+        hidden_states_swizzled,
+        selected_experts.to(torch.int),
+        routing_weights,
+        w1_q.contiguous().view(torch.long),
+        w2_q.contiguous().view(torch.long),
+        otype,
+        quant_scales=quant_scales,
+        input_sf=input_sf_swizzled,
+        swizzled_input_sf=True,
+        output=output_swizzled,
+    )
+
+    # swizzled_input_sf=False with linear input_sf (post-allgather scenario)
+    fused_moe.cutlass_fused_moe(
+        hidden_states_linear,
+        selected_experts.to(torch.int),
+        routing_weights,
+        w1_q.contiguous().view(torch.long),
+        w2_q.contiguous().view(torch.long),
+        otype,
+        quant_scales=quant_scales,
+        input_sf=input_sf_linear,
+        swizzled_input_sf=False,
+        output=output_linear,
+    )
+
+    torch.testing.assert_close(output_swizzled, output_linear, rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
