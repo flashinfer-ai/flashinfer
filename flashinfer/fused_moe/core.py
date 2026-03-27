@@ -599,7 +599,6 @@ def cutlass_fused_moe(
     swiglu_alpha: Optional[torch.Tensor] = None,
     swiglu_beta: Optional[torch.Tensor] = None,
     swiglu_limit: Optional[torch.Tensor] = None,
-    swizzled_input_sf: bool = True,
     tp_size: int = 1,
     tp_rank: int = 0,
     ep_size: int = 1,
@@ -616,6 +615,7 @@ def cutlass_fused_moe(
     tune_max_num_tokens: int = 8192,
     enable_pdl: Optional[bool] = None,
     activation_type: ActivationType = ActivationType.Swiglu,
+    swizzled_input_sf: bool = True,
 ) -> torch.Tensor:
     """Compute a Mixture of Experts (MoE) layer using CUTLASS backend.
 
@@ -681,12 +681,6 @@ def cutlass_fused_moe(
     swiglu_limit : Optional[torch.Tensor]
         Swiglu limit for swiglu activation.
 
-    swizzled_input_sf : bool = True
-        Whether the input scaling factor (input_sf) is in swizzled layout. Defaults to True.
-        Set to False when input_sf is in linear layout, e.g. after FP4 allgather/alltoall
-        communication where the scaling factors are received in linear (non-swizzled) format.
-        Only relevant when input_sf is not None.
-
     tp_size : int = 1
         Tensor parallelism size. Defaults to 1.
 
@@ -731,6 +725,12 @@ def cutlass_fused_moe(
 
     activation_type: ActivationType = ActivationType.Swiglu
         Activation to apply on for GEMM1, note that Relu2 means non-gated GEMM1
+
+    swizzled_input_sf : bool = True
+        Whether the input scaling factor (input_sf) is in swizzled layout. Defaults to True.
+        Set to False when input_sf is in linear layout, e.g. after FP4 allgather/alltoall
+        communication where the scaling factors are received in linear (non-swizzled) format.
+        Only relevant when input_sf is not None.
 
     Returns
     -------
@@ -798,7 +798,6 @@ def cutlass_fused_moe(
         swiglu_alpha,
         swiglu_beta,
         swiglu_limit,
-        swizzled_input_sf,
         tp_size,
         tp_rank,
         ep_size,
@@ -814,6 +813,7 @@ def cutlass_fused_moe(
         tune_max_num_tokens=tune_max_num_tokens,
         enable_pdl=enable_pdl,
         activation_type=activation_type,
+        swizzled_input_sf=swizzled_input_sf,
     )
 
 
