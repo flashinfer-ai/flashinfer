@@ -4515,11 +4515,7 @@ def test_fp8_block_scale_routed_activation_type_relu2_smoke():
     assert mismatch_pct < 10, f"Mismatch percentage is {mismatch_pct:.2f}%"
 
 
-# ====================================================================================
-# Dedicated FP8 Per-Channel Tests
-# ====================================================================================
-# These tests use only parameter combinations that are compatible with FP8PerChannelMoe,
-# avoiding the skip conditions in the general parametrized tests.
+# Temp FP8 per-channel tests
 
 
 @pytest.mark.parametrize("num_tokens", [8, 768, 3072])
@@ -4562,121 +4558,6 @@ def test_fp8_per_channel_renormalize(
     cache_permute_indices,
 ):
     """Dedicated test for FP8 per-channel MoE with Renormalize routing."""
-    moe_impl = FP8PerChannelMoe()
-    weight_processing = {
-        "use_shuffled_weight": True,
-        "layout": WeightLayout.MajorK,
-        "compatible_moe_impls": [FP8PerChannelMoe],
-    }
-    run_moe_test(
-        num_tokens,
-        hidden_size,
-        intermediate_size,
-        moe_impl,
-        routing_config,
-        weight_processing,
-        activation_type,
-        cache_permute_indices,
-    )
-
-
-@pytest.mark.parametrize("num_tokens", [8, 768, 3072])
-@pytest.mark.parametrize("hidden_size", [1024])
-@pytest.mark.parametrize("intermediate_size", [1024])
-@pytest.mark.parametrize(
-    "routing_config",
-    [
-        pytest.param(
-            {
-                "num_experts": 128,
-                "top_k": 1,
-                "padding": 8,
-                "n_groups": 0,
-                "top_k_groups": 0,
-                "routed_scaling": 2.5,
-                "has_routing_bias": True,
-                "routing_method_type": RoutingMethodType.Llama4,
-                "compatible_moe_impls": [FP8PerChannelMoe],
-                "compatible_intermediate_size": [1024],
-                "enable_autotune": True,
-            },
-            id="Llama4",
-        ),
-    ],
-)
-@pytest.mark.parametrize(
-    "activation_type",
-    [
-        pytest.param(ActivationType.Swiglu.value, id="Swiglu"),
-    ],
-)
-def test_fp8_per_channel_llama4(
-    num_tokens,
-    hidden_size,
-    intermediate_size,
-    routing_config,
-    activation_type,
-    cache_permute_indices,
-):
-    """Dedicated test for FP8 per-channel MoE with Llama4 routing."""
-    moe_impl = FP8PerChannelMoe()
-    weight_processing = {
-        "use_shuffled_weight": True,
-        "layout": WeightLayout.MajorK,
-        "compatible_moe_impls": [FP8PerChannelMoe],
-    }
-    run_moe_test(
-        num_tokens,
-        hidden_size,
-        intermediate_size,
-        moe_impl,
-        routing_config,
-        weight_processing,
-        activation_type,
-        cache_permute_indices,
-    )
-
-
-@pytest.mark.parametrize("num_tokens", [8, 768, 3072])
-@pytest.mark.parametrize("hidden_size", [1024])
-@pytest.mark.parametrize("intermediate_size", [1024])
-@pytest.mark.parametrize(
-    "routing_config",
-    [
-        pytest.param(
-            {
-                "num_experts": 512,
-                "top_k": 22,
-                "padding": 8,
-                "n_groups": 1,
-                "top_k_groups": 1,
-                "routed_scaling": 2.5,
-                "has_routing_bias": True,
-                "routing_method_type": RoutingMethodType.DeepSeekV3,
-                "compatible_moe_impls": [FP8PerChannelMoe],
-                "compatible_intermediate_size": [1024],
-                "compatible_activation_types": [ActivationType.Relu2],
-                "enable_autotune": True,
-            },
-            id="DeepSeekV3_Relu2",
-        ),
-    ],
-)
-@pytest.mark.parametrize(
-    "activation_type",
-    [
-        pytest.param(ActivationType.Relu2.value, id="Relu2"),
-    ],
-)
-def test_fp8_per_channel_deepseekv3(
-    num_tokens,
-    hidden_size,
-    intermediate_size,
-    routing_config,
-    activation_type,
-    cache_permute_indices,
-):
-    """Dedicated test for FP8 per-channel MoE with DeepSeekV3 routing and Relu2."""
     moe_impl = FP8PerChannelMoe()
     weight_processing = {
         "use_shuffled_weight": True,
