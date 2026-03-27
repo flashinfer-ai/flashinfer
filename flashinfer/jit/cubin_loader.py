@@ -26,7 +26,6 @@ import uuid
 
 import filelock
 
-from .utils import write_if_different
 from .core import logger
 from .env import FLASHINFER_CUBIN_DIR
 
@@ -198,121 +197,51 @@ def load_cubin(cubin_path: str, sha256: str) -> bytes:
     return b""
 
 
-def get_file(
-    uri_path: str,
-    sha256: str,
-    file_path: str,
-    session=None,
-) -> bytes:
+def get_artifact(file_name: str, sha256: str, session=None) -> bytes:
+    """Load an artifact (cubin, header, checksum, etc.) from the local cache.
+
+    Checks ``FLASHINFER_CUBIN_DIR / file_name`` first.  If the file is missing
+    or its SHA-256 doesn't match, it is downloaded from
+    ``FLASHINFER_CUBINS_REPOSITORY``.
+
+    Returns the file contents as bytes, or empty bytes on failure.
     """
-    Load a file from local cache directory {file_path}, ensure that the sha256 signature matches.
-    Otherwise, download the file from {uri_path} and write to {file_path}.
-    """
-
-    file = load_cubin(file_path, sha256)
-    if file:
-        return file
-    os.makedirs(os.path.dirname(file_path), exist_ok=True)
-    uri = safe_urljoin(FLASHINFER_CUBINS_REPOSITORY, uri_path)
-    logger.info(f"Fetching file from {uri}")
-    download_file(uri, file_path, session=session)
-    return load_cubin(file_path, sha256)
-
-
-def get_cubin(file_name: str, sha256: str, session=None) -> bytes:
-    """
-    Load a cubin from the local cache directory with {file_name} and
-    ensure that the sha256 signature matches.
-
-    If the kernel does not exist in the cache, it will downloaded.
-
-    Returns:
-    None on failure.
-    """
-    cubin_path = str(FLASHINFER_CUBIN_DIR / file_name)
-    cubin = load_cubin(cubin_path, sha256)
-    if cubin:
-        return cubin
-    # either the file does not exist or it is corrupted, we'll download a new one.
+    local_path = str(FLASHINFER_CUBIN_DIR / file_name)
+    data = load_cubin(local_path, sha256)
+    if data:
+        return data
 
     uri = safe_urljoin(FLASHINFER_CUBINS_REPOSITORY, file_name)
-    logger.info(f"Fetching cubin {file_name} from {uri}")
-    download_file(uri, cubin_path, session=session)
-    return load_cubin(cubin_path, sha256)
+    logger.info(f"Fetching {file_name} from {uri}")
+    download_file(uri, local_path, session=session)
+    return load_cubin(local_path, sha256)
 
 
-def download_trtllm_headers(
-    op: str,
-    header_dest_dir: Union[str, pathlib.Path],
-    header_path: str,
-    artifact_path: str,
-    checksum: bytes,
-):
-    header_dest_dir = pathlib.Path(header_dest_dir)
+# Backward-compatible alias
+get_cubin = get_artifact
 
-    if op == "bmm":
-        header_files = [
-            "BatchedGemmEnums.h",
-            "BatchedGemmInterface.h",
-            "BatchedGemmOptions.h",
-            "Enums.h",
-            "GemmGatedActOptions.h",
-            "GemmOptions.h",
-            "KernelParams.h",
-            "KernelParamsDecl.h",
-            "KernelTraits.h",
-            "TmaDescriptor.h",
-            "trtllm/gen/CommonUtils.h",
-            "trtllm/gen/CudaArchDecl.h",
-            "trtllm/gen/CudaKernelLauncher.h",
-            "trtllm/gen/DtypeDecl.h",
-            "trtllm/gen/MmaDecl.h",
-            "trtllm/gen/SfLayoutDecl.h",
-            "trtllm/gen/SparsityDecl.h",
-        ]
 
-    else:
-        header_files = [
-            "GemmInterface.h",
-            "GemmOptions.h",
-            "Enums.h",
-            "KernelTraits.h",
-            "KernelParams.h",
-            "KernelParamsDecl.h",
-            "TmaDescriptor.h",
-            "trtllm/gen/CommonUtils.h",
-            "trtllm/gen/CudaKernelLauncher.h",
-            "trtllm/gen/DtypeDecl.h",
-            "trtllm/gen/MmaDecl.h",
-            "trtllm/gen/SfLayoutDecl.h",
-            "trtllm/gen/CudaArchDecl.h",
-        ]
+def ensure_symlink(
+    link: Union[str, pathlib.Path], target: Union[str, pathlib.Path]
+) -> None:
+    """Create or update a symlink, removing any stale file/directory at *link*.
 
-    artifact_hash_path = header_dest_dir / ".artifact_hash"
-
-    # Check if cached headers are from a different artifact version (e.g. after git checkout)
-    if artifact_hash_path.exists():
-        with open(artifact_hash_path, "r") as f:
-            cached_hash = f.read().strip()
-        if cached_hash != artifact_path:
-            raise RuntimeError(
-                f"Detected inconsistent cached artifacts. "
-                f"(Cached trtllm headers were downloaded for artifact "
-                f"'{cached_hash}', but current code expects "
-                f"'{artifact_path}'). "
-                f"Please clear the cache to confirm and allow the new headers to be downloaded: "
-                f"rm -rf {header_dest_dir}."
-            )
-
-    for file in header_files:
-        uri_path = f"{header_path}/{file}"
-        file_hash = get_meta_hash(checksum, file)
-        file_path = str(header_dest_dir / file)
-        result = get_file(uri_path, file_hash, file_path)
-        assert result, f"{file} not found"
-
-    # Record which artifact version these headers belong to
-    write_if_different(artifact_hash_path, artifact_path)
+    This is used to map C++ include paths (e.g.
+    ``CUBIN_DIR/flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export``) to the
+    canonical artifact directory where ``get_artifact()`` stores downloaded files.
+    """
+    link = pathlib.Path(link)
+    target = pathlib.Path(target)
+    if link.is_symlink() or link.exists():
+        if link.is_symlink() and link.resolve() == target.resolve():
+            return  # already correct
+        # Stale symlink or directory from a previous version; remove it.
+        if link.is_symlink() or link.is_file():
+            link.unlink()
+        else:
+            shutil.rmtree(link)
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(target)
 
 
 def convert_to_ctypes_char_p(data: bytes):
@@ -334,7 +263,7 @@ def setup_cubin_loader(dll_path: str) -> None:
 
     def get_cubin_callback(name: bytes, sha256: bytes):
         # Both name and sha256 are bytes (c_char_p)
-        cubin = get_cubin(name.decode("utf-8"), sha256.decode("utf-8"))
+        cubin = get_artifact(name.decode("utf-8"), sha256.decode("utf-8"))
         _LIB.FlashInferSetCurrentCubin(
             convert_to_ctypes_char_p(cubin), ctypes.c_int(len(cubin))
         )

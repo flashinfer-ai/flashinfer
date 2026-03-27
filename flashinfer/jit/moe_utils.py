@@ -37,21 +37,24 @@ def gen_moe_utils_module() -> JitSpec:
     # artifacts.py imports from jit.cubin_loader, which triggers jit/__init__.py,
     # which imports this module — so ArtifactPath/CheckSumHash aren't defined yet
     # at module load time if these imports are at the top level.
-    from .cubin_loader import download_trtllm_headers, get_cubin
+    from .cubin_loader import get_artifact, get_meta_hash, ensure_symlink
+    from .fused_moe import BMM_EXPORT_HEADERS
     from ..artifacts import ArtifactPath, CheckSumHash
 
-    download_trtllm_headers(
-        "bmm",
+    checksum = get_artifact(
+        f"{ArtifactPath.TRTLLM_GEN_BMM}/checksums.txt", CheckSumHash.TRTLLM_GEN_BMM
+    )
+    bmm_export_path = f"{ArtifactPath.TRTLLM_GEN_BMM}/include/trtllmGen_bmm_export"
+    for header in BMM_EXPORT_HEADERS:
+        h = get_artifact(f"{bmm_export_path}/{header}", get_meta_hash(checksum, header))
+        assert h, f"{header} not found"
+    ensure_symlink(
         jit_env.FLASHINFER_CUBIN_DIR
         / "flashinfer"
         / "trtllm"
         / "batched_gemm"
         / "trtllmGen_bmm_export",
-        f"{ArtifactPath.TRTLLM_GEN_BMM}/include/trtllmGen_bmm_export",
-        ArtifactPath.TRTLLM_GEN_BMM,
-        get_cubin(
-            f"{ArtifactPath.TRTLLM_GEN_BMM}/checksums.txt", CheckSumHash.TRTLLM_GEN_BMM
-        ),
+        jit_env.FLASHINFER_CUBIN_DIR / bmm_export_path,
     )
     nvcc_flags = [
         "-DTLLM_GEN_EXPORT_INTERFACE",  # Use relative includes in downloaded headers
