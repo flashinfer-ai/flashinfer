@@ -164,8 +164,6 @@ class MXFP8QuantizeLinearKernel:
         enable_pdl: bool = False,
         use_2t_per_sf: bool = True,
     ):
-        self.dtype = dtype
-        self.K = K
         self.is_bfloat16 = dtype == cutlass.BFloat16
         self.enable_pdl = enable_pdl
         self.use_2t_per_sf = use_2t_per_sf
@@ -348,8 +346,6 @@ class MXFP8QuantizeSwizzledKernel:
         enable_pdl: bool = False,
         use_2t_per_sf: bool = True,
     ):
-        self.dtype = dtype
-        self.K = K
         self.is_bfloat16 = dtype == cutlass.BFloat16
         self.enable_pdl = enable_pdl
         self.use_2t_per_sf = use_2t_per_sf

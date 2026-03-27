@@ -600,13 +600,10 @@ class NVFP4QuantizeTMAKernel:
 
         if sf_layout == SF_LAYOUT_LINEAR:
             self.padded_sf_cols = self.num_sf_blocks_per_row
-            self.row_tile_size = 1
         elif sf_layout == SF_LAYOUT_8x4:
             self.padded_sf_cols = ((self.num_sf_blocks_per_row + 3) // 4) * 4
-            self.row_tile_size = 8
         else:
             self.padded_sf_cols = ((self.num_sf_blocks_per_row + 3) // 4) * 4
-            self.row_tile_size = ROW_TILE_SIZE
 
         self.num_consumer_warps = _TMA_NUM_CONSUMER_WARPS  # 8
         self.num_stages = _TMA_NUM_STAGES
@@ -620,7 +617,6 @@ class NVFP4QuantizeTMAKernel:
         # Thread indexing constants (matches CUDA TmaKernelTraitsTwoBytes)
         self.THREADS_PER_ROW = 4  # laneIdx % 4
         self.ROWS_PER_WARP = 8  # 32 / 4
-        self.ROW_ITERATIONS = _TMA_ROW_TILE // self.ROWS_PER_WARP  # 2
         self.ELTS_PER_THREAD = NVFP4_SF_VEC_SIZE  # 16
 
     @cute.jit

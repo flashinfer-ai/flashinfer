@@ -22,9 +22,6 @@ Supports multiple scale factor layouts: swizzled 128x4 and linear.
 Dual-path optimization following the MXFP8 pattern:
 - Linear layout: flat SF-block iteration for 100% thread utilization
 - Swizzled layout: row-based iteration with multi-row / column-loop paths
-
-Each thread processes one SF block (32 elements) independently (unlike MXFP8
-which uses 2 or 4 threads per SF block).
 """
 
 import functools
@@ -36,7 +33,10 @@ import torch
 from cutlass import Int32, Uint8
 
 from ...api_logging import flashinfer_api
-from ...cute_dsl.fp4_common import get_ptr_as_int64, st_global_u64
+from ...cute_dsl.fp4_common import (
+    get_ptr_as_int64,
+    st_global_u64,
+)
 from ...cute_dsl.utils import get_num_sm
 from ..quantization_cute_dsl_utils import (
     # MXFP4 Constants
@@ -130,8 +130,7 @@ class MXFP4QuantizeLinearKernel:
     """
     MXFP4 quantization kernel optimized for LINEAR layout.
 
-    Uses flat SF-block iteration for efficient memory access. Each thread
-    processes one SF block (32 elements) from a global flat pool. Row and
+    Uses flat SF-block iteration for efficient memory access. Row and
     column indices are derived from the flat SF index via integer division.
 
     No padding passes are needed since for linear layout:
@@ -139,10 +138,11 @@ class MXFP4QuantizeLinearKernel:
     - padded_sf_cols == num_sf_blocks_per_row (no column padding)
 
     This kernel is M-agnostic: compiled once per (K, dtype, pdl) combination.
+    Each thread handles one SF block (32 elements).
     """
 
     WARPS_PER_BLOCK = _LINEAR_WARPS_PER_BLOCK
-    SF_BLOCKS_PER_TB = _LINEAR_SF_BLOCKS_PER_TB
+    SF_BLOCKS_PER_TB = _LINEAR_SF_BLOCKS_PER_TB  # 512
 
     def __init__(
         self,
@@ -192,8 +192,8 @@ class MXFP4QuantizeLinearKernel:
         """
         MXFP4 quantization with flat SF-block iteration for linear layout.
 
-        Each thread handles one SF block (32 elements). Row and column
-        indices are derived from the flat SF index.
+        Each thread handles one SF block (32 elements).
+        Row and column indices are derived from the flat SF index.
         """
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -204,6 +204,7 @@ class MXFP4QuantizeLinearKernel:
 
         num_sf_blocks_per_row = self.num_sf_blocks_per_row
         sf_blocks_per_tb = self.SF_BLOCKS_PER_TB
+
         stride = grid_dim_x * sf_blocks_per_tb
 
         # Flat SF-block iteration
@@ -593,8 +594,8 @@ def mxfp4_quantize_cute_dsl(
     - LINEAR layout: flat SF-block based iteration (fast)
     - SWIZZLED layout: row-based iteration with padding fast path (optimized)
 
-    The kernel is compiled once per (K, dtype, sf_layout, pdl) combination and
-    handles varying M (batch size) at runtime without recompilation.
+    The kernel is compiled once per (K, dtype, sf_layout, pdl) combination
+    and handles varying M (batch size) at runtime without recompilation.
 
     Args:
         input: Input tensor of shape [M, K] with dtype fp16/bf16

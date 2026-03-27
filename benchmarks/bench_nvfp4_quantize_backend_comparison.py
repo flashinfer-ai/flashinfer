@@ -80,26 +80,38 @@ def verify_nvfp4_correctness(
     try:
         # Test CUDA backend
         quant_cuda, scale_cuda = fp4_quantize(
-            x, global_sf, sf_vec_size=16, sf_use_ue8m0=False,
-            is_sf_swizzled_layout=is_sf_swizzled_layout, backend="cuda",
+            x,
+            global_sf,
+            sf_vec_size=16,
+            sf_use_ue8m0=False,
+            is_sf_swizzled_layout=is_sf_swizzled_layout,
+            backend="cuda",
         )
         dq_cuda = e2m1_and_ufp8sf_scale_to_float(
             quant_cuda.cpu().view(torch.uint8),
             scale_cuda.cpu().view(torch.uint8).reshape(-1),
             torch.tensor([1.0]),
-            16, 1, is_sf_swizzled_layout,
+            16,
+            1,
+            is_sf_swizzled_layout,
         )
 
         # Test CuTe-DSL backend
         quant_cute, scale_cute = fp4_quantize(
-            x, global_sf, sf_vec_size=16, sf_use_ue8m0=False,
-            is_sf_swizzled_layout=is_sf_swizzled_layout, backend="cute-dsl",
+            x,
+            global_sf,
+            sf_vec_size=16,
+            sf_use_ue8m0=False,
+            is_sf_swizzled_layout=is_sf_swizzled_layout,
+            backend="cute-dsl",
         )
         dq_cute = e2m1_and_ufp8sf_scale_to_float(
             quant_cute.cpu().view(torch.uint8),
             scale_cute.cpu().view(torch.uint8).reshape(-1),
             torch.tensor([1.0]),
-            16, 1, is_sf_swizzled_layout,
+            16,
+            1,
+            is_sf_swizzled_layout,
         )
 
         # Check shapes match
@@ -173,14 +185,22 @@ def bench_nvfp4_quantize(
 
     # Warmup
     _ = fp4_quantize(
-        x, global_sf, sf_vec_size=16, sf_use_ue8m0=False,
-        is_sf_swizzled_layout=is_sf_swizzled_layout, backend=backend,
+        x,
+        global_sf,
+        sf_vec_size=16,
+        sf_use_ue8m0=False,
+        is_sf_swizzled_layout=is_sf_swizzled_layout,
+        backend=backend,
     )
 
     def run_kernel():
         fp4_quantize(
-            x, global_sf, sf_vec_size=16, sf_use_ue8m0=False,
-            is_sf_swizzled_layout=is_sf_swizzled_layout, backend=backend,
+            x,
+            global_sf,
+            sf_vec_size=16,
+            sf_use_ue8m0=False,
+            is_sf_swizzled_layout=is_sf_swizzled_layout,
+            backend=backend,
         )
 
     times = bench_gpu_time(
@@ -234,7 +254,9 @@ def run_bandwidth_sweep(
     current = 0
 
     layout_str = "swizzled" if is_sf_swizzled_layout else "linear"
-    print(f"\nBenchmarking NVFP4 {layout_str} layout, dtype={dtype} (CuTe-DSL bandwidth)")
+    print(
+        f"\nBenchmarking NVFP4 {layout_str} layout, dtype={dtype} (CuTe-DSL bandwidth)"
+    )
     print("=" * 60)
 
     for m in m_values:
@@ -377,8 +399,15 @@ def create_heatmap(
             value = speedup_matrix[i, j]
             if not np.isnan(value):
                 text_color = "white" if value < 0.7 or value > 1.5 else "black"
-                ax.text(j, i, f"{value:.2f}", ha="center", va="center",
-                        color=text_color, fontsize=8)
+                ax.text(
+                    j,
+                    i,
+                    f"{value:.2f}",
+                    ha="center",
+                    va="center",
+                    color=text_color,
+                    fontsize=8,
+                )
 
     ax.set_xlabel("K (columns)")
     ax.set_ylabel("M (rows)")
@@ -433,8 +462,15 @@ def create_bandwidth_heatmap(
             if not np.isnan(value):
                 normalized = (value - vmin) / (vmax - vmin) if vmax > vmin else 0.5
                 text_color = "white" if normalized > 0.6 else "black"
-                ax.text(j, i, f"{value:.1f}", ha="center", va="center",
-                        color=text_color, fontsize=8)
+                ax.text(
+                    j,
+                    i,
+                    f"{value:.1f}",
+                    ha="center",
+                    va="center",
+                    color=text_color,
+                    fontsize=8,
+                )
 
     ax.set_xlabel("K (columns)")
     ax.set_ylabel("M (rows)")
@@ -572,12 +608,45 @@ def main():
     #   per row) must be a multiple of 4 for the swizzled padding
     # We use K values that satisfy both constraints (multiples of 64)
     m_values = [
-        1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 768,
-        1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384, 32768,
+        1,
+        2,
+        4,
+        8,
+        16,
+        32,
+        64,
+        128,
+        256,
+        384,
+        512,
+        768,
+        1024,
+        1536,
+        2048,
+        3072,
+        4096,
+        6144,
+        8192,
+        12288,
+        16384,
+        32768,
     ]
     k_values = [
-        128, 256, 384, 512, 768, 1024, 1536, 2048,
-        3072, 4096, 5120, 6144, 8192, 12288, 16384,
+        128,
+        256,
+        384,
+        512,
+        768,
+        1024,
+        1536,
+        2048,
+        3072,
+        4096,
+        5120,
+        6144,
+        8192,
+        12288,
+        16384,
     ]
 
     print(f"\nM values: {m_values}")
@@ -633,10 +702,16 @@ def main():
         print("=" * 80)
 
         cuda_times_linear, cute_dsl_times_linear = run_benchmark_sweep(
-            m_values, k_values, dtype, is_sf_swizzled_layout=False,
+            m_values,
+            k_values,
+            dtype,
+            is_sf_swizzled_layout=False,
         )
         print_summary_table(
-            m_values, k_values, cuda_times_linear, cute_dsl_times_linear,
+            m_values,
+            k_values,
+            cuda_times_linear,
+            cute_dsl_times_linear,
             "Linear Layout",
         )
         create_heatmap(
@@ -654,10 +729,16 @@ def main():
         print("=" * 80)
 
         cuda_times_swizzled, cute_dsl_times_swizzled = run_benchmark_sweep(
-            m_values, k_values, dtype, is_sf_swizzled_layout=True,
+            m_values,
+            k_values,
+            dtype,
+            is_sf_swizzled_layout=True,
         )
         print_summary_table(
-            m_values, k_values, cuda_times_swizzled, cute_dsl_times_swizzled,
+            m_values,
+            k_values,
+            cuda_times_swizzled,
+            cute_dsl_times_swizzled,
             "Swizzled Layout",
         )
         create_heatmap(
