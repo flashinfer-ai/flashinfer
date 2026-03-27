@@ -22,6 +22,7 @@ import torch
 from torch.nn import functional as F
 
 import flashinfer.fused_moe as fused_moe
+from flashinfer.utils import is_sm100a_supported
 from flashinfer import (
     autotune,
     fp4_quantize,
@@ -1797,8 +1798,8 @@ def test_moe_w4a8(
 
 
 @pytest.mark.skipif(
-    torch.cuda.get_device_capability()[0] not in [10, 11, 12],
-    reason="NVFP4 is only supported on SM100, SM110 and SM120/SM121",
+    not is_sm100a_supported(torch.device("cuda")),
+    reason="NVFP4 is only supported on SM100+",
 )
 def test_moe_nvfp4_unswizzled_input_sf():
     """Test cutlass_fused_moe with swizzled_input_sf=False (linear layout input_sf).
@@ -1816,7 +1817,9 @@ def test_moe_nvfp4_unswizzled_input_sf():
     top_k = 2
     otype = torch.float16
     quant_blocksize = 16
-    round_up = lambda x, y: (x + y - 1) // y * y
+
+    def round_up(x, y):
+        return (x + y - 1) // y * y
 
     e = num_experts
     m = batch_size
@@ -1877,6 +1880,11 @@ def test_moe_nvfp4_unswizzled_input_sf():
 
     # Both quantizations should produce the same quantized values
     assert torch.equal(hidden_states_swizzled, hidden_states_linear)
+    # The SF buffers must differ — otherwise the test would pass trivially
+    # even if fp4_quantize ignored is_sf_swizzled_layout
+    assert not torch.equal(input_sf_swizzled, input_sf_linear), (
+        "input_sf_swizzled and input_sf_linear should have different layouts"
+    )
 
     output_swizzled = torch.zeros(m, k, dtype=otype, device="cuda")
     output_linear = torch.zeros(m, k, dtype=otype, device="cuda")
