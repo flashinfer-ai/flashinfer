@@ -428,12 +428,11 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                          Optional<Array<Tensor>> quant_scales, Optional<TensorView> input_sf,
                          Optional<TensorView> swiglu_alpha, Optional<TensorView> swiglu_beta,
                          Optional<TensorView> swiglu_limit, bool swizzled_input_sf,
-                         TensorView num_active_experts_per_node,
-                         TensorView experts_to_token_score, TensorView active_expert_global_ids,
-                         int64_t tp_size, int64_t tp_rank, int64_t ep_size, int64_t ep_rank,
-                         int64_t cluster_size, int64_t cluster_rank, bool enable_alltoall,
-                         bool min_latency_mode, Optional<Array<int64_t>> profile_ids,
-                         bool enable_pdl,
+                         TensorView num_active_experts_per_node, TensorView experts_to_token_score,
+                         TensorView active_expert_global_ids, int64_t tp_size, int64_t tp_rank,
+                         int64_t ep_size, int64_t ep_rank, int64_t cluster_size,
+                         int64_t cluster_rank, bool enable_alltoall, bool min_latency_mode,
+                         Optional<Array<int64_t>> profile_ids, bool enable_pdl,
                          ActivationType base_activation_type = ActivationType::Swiglu) {
     std::lock_guard<std::mutex> lock(mMutex);
 
@@ -753,14 +752,14 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                  int64_t cluster_size, int64_t cluster_rank, bool enable_alltoall,
                  bool min_latency_mode, Optional<Array<int64_t>> profile_ids, bool enable_pdl,
                  int64_t base_activation_type) {
-            runMoeMinLantency(
-                output, input, token_selected_experts, token_final_scales, fc1_expert_weights,
-                fc1_expert_biases, fc2_expert_weights, fc2_expert_biases, quant_scales, input_sf,
-                swiglu_alpha, swiglu_beta, swiglu_limit, swizzled_input_sf,
-                num_active_experts_per_node, experts_to_token_score, active_expert_global_ids,
-                tp_size, tp_rank, ep_size, ep_rank, cluster_size, cluster_rank, enable_alltoall,
-                min_latency_mode, profile_ids, enable_pdl,
-                static_cast<ActivationType>(base_activation_type));
+            runMoeMinLantency(output, input, token_selected_experts, token_final_scales,
+                              fc1_expert_weights, fc1_expert_biases, fc2_expert_weights,
+                              fc2_expert_biases, quant_scales, input_sf, swiglu_alpha, swiglu_beta,
+                              swiglu_limit, swizzled_input_sf, num_active_experts_per_node,
+                              experts_to_token_score, active_expert_global_ids, tp_size, tp_rank,
+                              ep_size, ep_rank, cluster_size, cluster_rank, enable_alltoall,
+                              min_latency_mode, profile_ids, enable_pdl,
+                              static_cast<ActivationType>(base_activation_type));
           });
     } else {
       return Function(nullptr);
