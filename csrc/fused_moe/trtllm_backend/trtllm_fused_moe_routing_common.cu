@@ -80,9 +80,12 @@ void runPostTopKPipeline(DataType const& data, uint32_t /*numThreadsHist*/, void
     routingCustom::launchClusterKernel(lastKernelData, stream);
   } else {
     // Check if we can use the coop path (more efficient for medium token counts)
-    // Coop kernel requires SM90+ (grid-sync) and MaxNumExperts <= 1024.
-    bool const canUseCoop =
-        (smMajor >= 9) && (data.mNumExperts <= 1024) && (data.mPtrPermutedIdxSize != nullptr);
+    // Requires SM90+ (grid-sync), numExperts <= 1024.
+    // Note: NumTop8Experts is used for template instantiation but does NOT limit runtime topK —
+    // the coop kernel uses hardcoded MaxExpandedIdxPerThread=64 and runtime params.mTopK.
+    bool const canUseCoop = (smMajor >= 9) && (data.mNumExperts <= 1024) &&
+                            (data.mPtrPermutedIdxSize != nullptr) &&
+                            (data.mPtrExpertCounts != nullptr);
     bool useCoop = false;
     int numBlocksCoop = 0;
 

@@ -93,7 +93,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
         if (expertIdx > -1 && expertIdx < params.mNumExperts) {
           int offset = warpIdx * MaxNumExperts + expertIdx;
           smemKIdx[offset] = static_cast<int8_t>(laneIdx);
-        } else {
+        } else if (params.mPtrExpandedIdxToPermutedIdx != nullptr) {
           params.mPtrExpandedIdxToPermutedIdx[warpIdx * params.mTopK + laneIdx] = int32_t{-1};
         }
       }
@@ -146,7 +146,8 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
   for (int e = 0; e < ExpertsPerThread; e++) {
     int expert = threadIdx.x * ExpertsPerThread + e;
     auto localExpIdx = expert - params.mLocalExpertsStartIdx;
-    auto isLocal = localExpIdx >= 0 && localExpIdx < params.mNumLocalExperts &&
+    auto localExpertExtent = params.mNumLocalExperts << params.mLocalExpertsStrideLog2;
+    auto isLocal = localExpIdx >= 0 && localExpIdx < localExpertExtent &&
                    (localExpIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
 
     // Get the count of each expert and the offset for each token
@@ -203,7 +204,8 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
   for (int e = 0; e < ExpertsPerThread; e++) {
     int expert = threadIdx.x * ExpertsPerThread + e;
     auto localExpIdx = expert - params.mLocalExpertsStartIdx;
-    auto isLocal = localExpIdx >= 0 && localExpIdx < params.mNumLocalExperts &&
+    auto localExpertExtent = params.mNumLocalExperts << params.mLocalExpertsStrideLog2;
+    auto isLocal = localExpIdx >= 0 && localExpIdx < localExpertExtent &&
                    (localExpIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
 
     if (isLocal) {
@@ -248,7 +250,8 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
       int offset = tokenIdx * MaxNumExperts + expert;
       if (smemKIdx[offset] >= 0) {
         auto localExpIdx = expert - params.mLocalExpertsStartIdx;
-        auto isLocal = localExpIdx >= 0 && localExpIdx < params.mNumLocalExperts &&
+        auto localExpertExtent = params.mNumLocalExperts << params.mLocalExpertsStrideLog2;
+        auto isLocal = localExpIdx >= 0 && localExpIdx < localExpertExtent &&
                        (localExpIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
 
         int const expandedIdx = tokenIdx * params.mTopK + smemKIdx[offset];
@@ -440,6 +443,14 @@ void launchHistogramScoresKernel(Data const& data, uint32_t maxNumBlocks, uint32
 //
 // 4. Coop kernel — cooperative histogram + offsets via grid-sync.
 //
+// The coop kernel only performs the post-topK permutation pipeline (histogram, prefix-scan,
+// index writes). It does NOT compute topK — it reads pre-computed results from mPtrTopKPacked
+// or mPtrTopKIds. Therefore, only the NumExperts template tier matters (it sizes shared memory
+// arrays and determines the thread count). The NumTopExperts tier is fixed at NumTop8Experts
+// because the kernel uses a hardcoded MaxExpandedIdxPerThread=64 and processes all expanded
+// indices (mNumTokens * mTopK) via a grid-stride loop with runtime bounds checking, regardless
+// of the compile-time MaxNumTopExperts value.
+//
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 void launchCoopKernel(Data const& data, int numBlocksCoop, uint32_t numThreadsHist, void* stream) {
@@ -595,7 +606,9 @@ void run(Data const& data, void* stream) {
 
     // Step 2+3: Histogram + Offsets — try coop path first, fall back to multi-kernel.
     // Coop kernel fuses histogram + offsets into a single cooperative launch.
-    // Requires SM90+ (kernel uses grid-sync), numExperts <= 1024, and enough SM capacity.
+    // Requires SM90+ (grid-sync), numExperts <= 1024, and enough SM capacity.
+    // Note: NumTop8Experts is used for template instantiation but does NOT limit runtime topK —
+    // the coop kernel uses hardcoded MaxExpandedIdxPerThread=64 and runtime params.mTopK.
     bool const canUseCoop =
         (smMajor >= 9) && (data.mNumExperts <= 1024) && (data.mPtrPermutedIdxSize != nullptr);
     bool useCoop = false;

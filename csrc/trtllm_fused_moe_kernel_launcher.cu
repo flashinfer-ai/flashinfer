@@ -731,9 +731,9 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
     mRoutingBiasDtype = routing_bias_dtype == dl_bfloat16 ? btg::Dtype::Bfloat16 : btg::Dtype::Fp32;
 
     auto const routing_logits_dtype =
-    routing_logits.has_value() ? routing_logits.value().dtype() : dl_bfloat16;
+        routing_logits.has_value() ? routing_logits.value().dtype() : dl_bfloat16;
     mRoutingLogitsDtype =
-    routing_logits_dtype == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
+        routing_logits_dtype == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
 
     auto expert_weights_dtype = mRoutingLogitsDtype == btg::Dtype::Fp32 ? dl_float32 : dl_bfloat16;
     expert_weights =
@@ -1319,9 +1319,9 @@ class MxInt4BlockScaleLauncher : public FusedMoeLauncher {
     mRoutingBiasDtype = routing_bias_dtype == dl_bfloat16 ? btg::Dtype::Bfloat16 : btg::Dtype::Fp32;
 
     auto const routing_logits_dtype =
-    routing_logits.has_value() ? routing_logits.value().dtype() : dl_bfloat16;
+        routing_logits.has_value() ? routing_logits.value().dtype() : dl_bfloat16;
     mRoutingLogitsDtype =
-    routing_logits_dtype == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
+        routing_logits_dtype == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
 
     auto expert_weights_dtype = mRoutingLogitsDtype == btg::Dtype::Fp32 ? dl_float32 : dl_bfloat16;
     expert_weights =

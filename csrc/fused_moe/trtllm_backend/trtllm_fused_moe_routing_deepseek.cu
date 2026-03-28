@@ -140,13 +140,6 @@ __global__ void routingMainKernel(KernelParams params) {
   // for the final reduction of weight norm, only some lanes need to participate
   int32_t laneIdx = threadIdx.x % WarpSize;
   int32_t warpIdx = __shfl_sync(0xffffffff, threadIdx.x / WarpSize, 0);
-  // warps outside the range of expert groups do not participate
-  if constexpr (KernelParams::UseGroups) {
-    if (warpIdx >= params.mNumExpertGroups) {
-      return;
-    }
-  }
-
   // note that for invalid scores, we use negative infinity,
   // needed for GLM-style routing where bias can be negative
   static constexpr float invalidScoreFloat = float{-INFINITY};
@@ -157,12 +150,16 @@ __global__ void routingMainKernel(KernelParams params) {
   bool expertSelected = threadExpert < params.mNumExperts;
   if constexpr (KernelParams::UseGroups) {
     threadExpert = warpIdx * params.mNumExpertsPerGroup + laneIdx;
-    expertSelected = laneIdx < params.mNumExpertsPerGroup;
+    // Inactive warps (warpIdx >= mNumExpertGroups) must NOT return early because they
+    // still need to reach the __syncthreads() barriers below.  Setting expertSelected
+    // to false is enough to keep them from doing any out-of-bounds reads or smem writes.
+    expertSelected = (warpIdx < params.mNumExpertGroups) && (laneIdx < params.mNumExpertsPerGroup);
   }
   auto scoreIdx = int64_t{blockIdx.x} * int64_t{params.mNumExperts} + threadExpert;
-  auto biasVal = expertSelected ? static_cast<OutputT>(loadScalar(params.mPtrRoutingBias,
-                                                                  threadExpert, params.mDtypeBias))
-                                : invalidScore;
+  auto biasVal = (expertSelected && params.mPtrRoutingBias != nullptr)
+                     ? static_cast<OutputT>(
+                           loadScalar(params.mPtrRoutingBias, threadExpert, params.mDtypeBias))
+                     : (expertSelected ? OutputT{0} : invalidScore);
 
   // initialize the mPtrExpertCounts
   if (params.mPtrExpertCounts) {
@@ -173,9 +170,9 @@ __global__ void routingMainKernel(KernelParams params) {
   }
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-  // trigger the secondary kernel when using PDL, then wait on primary
+  // Wait on primary kernel before reading its outputs.
+  // The trigger is deferred to after mPtrTopKPacked is fully written (see below).
   if (params.mUsePdl) {
-    cudaTriggerProgrammaticLaunchCompletion();
     cudaGridDependencySynchronize();
   }
 #endif
@@ -350,6 +347,14 @@ __global__ void routingMainKernel(KernelParams params) {
       }
     }
   }
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  // Trigger secondary kernel AFTER all mPtrTopKPacked/mPtrTopKWeights writes are complete,
+  // so the next kernel (cluster/coop/histogram) sees the final data.
+  if (params.mUsePdl) {
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
+#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -435,13 +440,6 @@ static void launchCoopKernel(Data& data, int numBlocksCoop, int /*numThreadsHist
   routingCustom::launchCoopKernel(customData, numBlocksCoop, customNumThreadsHist, stream);
 }
 
-static void launchInitExpertCounts(Data& data, int numThreadsHist, void* stream) {
-  LAUNCH_ROUTING_DEEPSEEK(data, false, routingInitExpertCounts,
-                          (2 * data.mNumExperts - 1) / numThreadsHist + 1, numThreadsHist,
-                          /*smemSize=*/0,  // No dynamic smem
-                          stream, data.mNumExpertGroups > 1, /*forceFloatInput=*/false);
-}
-
 static void launchHistogramKernel(Data& data, int numBlocksHistogram, int numThreadsHist,
                                   void* stream) {
   LAUNCH_ROUTING_DEEPSEEK(data,
@@ -466,6 +464,7 @@ void run(Data& data, void* stream) {
   FLASHINFER_CHECK(
       data.mPtrTopKPacked != nullptr || data.mPtrScores != nullptr || data.mPtrTopKIds != nullptr,
       "Routing kernel requires at least one input parameter");
+  FLASHINFER_CHECK(data.mTopK > 0, "mTopK must be positive");
 
   // When topK is already computed (mPtrTopKIds or mPtrTopKPacked without scores),
   // delegate to the shared post-topK pipeline which handles all path selection
@@ -478,7 +477,7 @@ void run(Data& data, void* stream) {
                        "When mPtrTopKIds is provided, mPtrTopKWeights must also be provided for "
                        "DeepSeek routing.");
     }
-    int const numThreadsHist = getMaxNumExperts(data.mNumExperts);
+    int const numThreadsHist = routingCustom::getMaxNumExperts(data.mNumExperts);
     runPostTopKPipeline(data, numThreadsHist, stream);
     return;
   }
@@ -530,7 +529,7 @@ void run(Data& data, void* stream) {
 
   // Step 1: Run DeepSeek-specific topK computation (writes to mPtrTopKPacked)
   int const numThreadsMain =
-      max(data.mNumExpertGroups * WarpSize, getMaxNumExperts(data.mNumExperts));
+      std::max(data.mNumExpertGroups * WarpSize, getMaxNumExperts(data.mNumExperts));
   data.mPdlOverlapWithNext = pdl;  // Intermediate — allow permutation pipeline to overlap
   launchMainKernel(data, numBlocks, numThreadsMain, stream);
 

@@ -15,6 +15,7 @@
  */
 
 #include "flashinfer/exception.h"
+#include "flashinfer/trtllm/fused_moe/RoutingCustomPolicy.cuh"
 #include "flashinfer/trtllm/fused_moe/RoutingKernel.cuh"
 
 namespace moe::dev::routing {
@@ -52,7 +53,6 @@ __forceinline__ __device__ void routingTopKExperts(cg::thread_block_tile<WarpSiz
   for (int i = 0; i < VecSize; ++i) {
     auto expertIdx = i * WarpSize + laneIdx;
     auto newScore = expertIdx < numExperts ? ptrScores[expertIdx] : minScore;
-    // note: use `>=` s.t. highest index always wins, just like in `reduceTopK`
     if (newScore > maxScore) {
       maxScore = newScore;
       maxExpertIdx = expertIdx;
@@ -254,13 +254,6 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
     params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
   }
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  // we can trigger the next kernel at this point
-  if (params.mUsePdl) {
-    cudaTriggerProgrammaticLaunchCompletion();
-  }
-#endif
-
   // at this point, all values for offsets are ready, except the final offsets
   // within the padded index (`permutedIdx`)
   // for this, we perform a scan similar to the one directly after the warp-scan:
@@ -323,6 +316,13 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
       }
     }
   }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  // Trigger secondary kernel AFTER all permutation index writes are complete.
+  if (params.mUsePdl) {
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
+#endif
 }
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 template <typename KernelParams>
@@ -430,10 +430,10 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
   initArr(globalThreadIdx, expertCountsNum, globalThreadStride, params.mPtrExpertCounts, 0);
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  // Wait on primary grid and trigger secondary kernel.
+  // Wait on primary kernel before reading its outputs.
+  // The trigger is deferred to after mPtrTopKPacked is fully written (see below).
   if (params.mUsePdl) {
     cudaGridDependencySynchronize();
-    cudaTriggerProgrammaticLaunchCompletion();
   }
 #endif
 
@@ -466,6 +466,14 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
       params.mPtrTopKPacked[tokenIdx] = packedScore;
     }
   }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  // Trigger secondary kernel AFTER all mPtrTopKPacked writes are complete,
+  // so the next kernel (histogram/offsets) sees the final data.
+  if (params.mUsePdl) {
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
+#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -498,7 +506,7 @@ void run(Data const& data, void* stream) {
           "When mPtrTopKIds is provided, mPtrTopKWeights must also be provided for Llama4 "
           "routing.");
     }
-    int const numThreadsHist = getMaxNumExperts(data.mNumExperts);
+    int const numThreadsHist = routingCustom::getMaxNumExperts(data.mNumExperts);
     runPostTopKPipeline(data, numThreadsHist, stream);
     return;
   }
