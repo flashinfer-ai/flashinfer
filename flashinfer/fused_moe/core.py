@@ -798,6 +798,7 @@ def cutlass_fused_moe(
         swiglu_alpha,
         swiglu_beta,
         swiglu_limit,
+        swizzled_input_sf,
         tp_size,
         tp_rank,
         ep_size,
@@ -813,7 +814,6 @@ def cutlass_fused_moe(
         tune_max_num_tokens=tune_max_num_tokens,
         enable_pdl=enable_pdl,
         activation_type=activation_type,
-        swizzled_input_sf=swizzled_input_sf,
     )
 
 
