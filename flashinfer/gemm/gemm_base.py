@@ -3278,7 +3278,9 @@ def _load_gemm_sm120_mxfp8_module():
 def get_gemm_sm120_module_cutlass_mxfp8():
     """Get the SM120/121 MXFP8 GEMM module."""
     return _create_cutlass_mxfp8_gemm_module(
-        _load_gemm_sm120_mxfp8_module(), "flashinfer::cutlass_mxfp8_gemm", "cutlass_mxfp8_gemm"
+        _load_gemm_sm120_mxfp8_module(),
+        "flashinfer::cutlass_mxfp8_gemm",
+        "cutlass_mxfp8_gemm",
     )
 
 
@@ -6985,9 +6987,8 @@ def bmm_mxfp8(
     backend: Literal["cudnn", "cutlass", "auto"]
         The backend to use for the operation. Defaults to ``"auto"``.
         On SM120/121 GPUs, ``"auto"`` selects the CUTLASS backend; scales must
-        be 1D swizzled (``SfLayout.layout_128x4``), and B must be provided as
-        ``[b, n, k]`` (i.e., column-major ``[b, k, n]`` transposed to ``[b, n, k]``).
-        On SM100/103 GPUs, ``"auto"`` selects the cuDNN backend.
+        be 1D swizzled (``SfLayout.layout_128x4``). Pass ``B`` in the standard
+        shape ``[b, k, n]`` (column-major); the CUTLASS path transposes internally.
 
     Returns
     -------
