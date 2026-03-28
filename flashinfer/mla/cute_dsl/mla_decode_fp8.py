@@ -3550,6 +3550,7 @@ def run(
     iterations: int,
     skip_ref_check: bool,
     use_cold_l2: bool,
+    enable_pdl: bool = False,
     **kwargs,
 ):
     """Execute Multi-Head Latent Attention (MLA) on Blackwell architecture and validate results.
@@ -3929,6 +3930,7 @@ def run(
         is_persistent,
         is_var_seq,
         is_var_split_kv,
+        enable_pdl,
     )
 
     # Get current CUDA stream from PyTorch
@@ -4403,6 +4405,12 @@ if __name__ == "__main__":
         help="Use cold L2 cache",
     )
 
+    parser.add_argument(
+        "--enable_pdl",
+        action="store_true",
+        help="Enable PDL",
+    )
+
     args = parser.parse_args()
 
     run(
@@ -4431,6 +4439,7 @@ if __name__ == "__main__":
         args.iterations,
         args.skip_ref_check,
         args.use_cold_l2,
+        args.enable_pdl,
     )
 
     print("PASS")

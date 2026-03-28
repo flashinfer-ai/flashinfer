@@ -28,6 +28,8 @@ import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32
 
+from ...utils import device_support_pdl
+
 from .mla_decode_fp16 import BlackwellMultiHeadLatentAttentionForwardFP16
 from .mla_decode_fp8 import BlackwellMultiHeadLatentAttentionForwardFP8
 from flashinfer.cute_dsl.utils import (
@@ -296,7 +298,7 @@ def cute_dsl_mla_decode(
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
     is_var_seq: bool = True,
-    enable_pdl: bool = False,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     """CuTe DSL MLA decode kernel for Blackwell SM100.
 
@@ -338,8 +340,9 @@ def cute_dsl_mla_decode(
         Whether the sequence length is variable.
         If True, the sequence length is variable.
         Otherwise,the sequence length is fixed for all the requests in the batch.
-    enable_pdl : bool
-        Whether to use PDL.
+    enable_pdl : Optional[bool], default=None
+        Whether to enable Programmatic Dependent Launch (PDL).
+        If None, auto-detects based on device capability.
 
     Returns
     -------
@@ -456,6 +459,8 @@ def cute_dsl_mla_decode(
         is_var_seq=is_var_seq,
         is_var_split_kv=is_var_split_kv,
     )
+
+    enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
 
     # Get compiled kernel (cached after first compile)
     # Note: when is_workspace_size_zero is True, workspace_bytes is None and it will launch one kernel without workspace.
