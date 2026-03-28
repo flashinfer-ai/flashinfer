@@ -18,10 +18,10 @@ from flashinfer.gemm.gemm_base import (
     CUDNN_AVAILABLE,
     build_cudnn_gemm_bf16_graph_override_shape,
     execute_cudnn_gemm_bf16_graph_override_shape,
-    build_cudnn_fp4_gemm_graph_override_shape,
-    execute_cudnn_fp4_gemm_graph_override_shape,
-    build_cudnn_mxfp8_gemm_graph_override_shape,
-    execute_cudnn_mxfp8_gemm_graph_override_shape,
+    build_cudnn_gemm_fp4_graph_override_shape,
+    execute_cudnn_gemm_fp4_graph_override_shape,
+    build_cudnn_gemm_mxfp8_graph_override_shape,
+    execute_cudnn_gemm_mxfp8_graph_override_shape,
     is_cudnn_override_shape_available,
     _calculate_block_scale_dims,
 )
@@ -159,7 +159,7 @@ class TestCudnnNVFp4OverrideShape:
         )
 
         # Build graph once with cache_m
-        graph = build_cudnn_fp4_gemm_graph_override_shape(
+        graph = build_cudnn_gemm_fp4_graph_override_shape(
             batch=1,
             n=n,
             k=k,
@@ -202,7 +202,7 @@ class TestCudnnNVFp4OverrideShape:
 
             # Execute with cached graph (override_shape)
             out = torch.empty(1, m, n, dtype=out_dtype, device=device)
-            execute_cudnn_fp4_gemm_graph_override_shape(
+            execute_cudnn_gemm_fp4_graph_override_shape(
                 graph,
                 a_packed,
                 b_packed,
@@ -263,7 +263,7 @@ class TestCudnnMXFp8OverrideShape:
         )
 
         # Build graph once with cache_m
-        graph = build_cudnn_mxfp8_gemm_graph_override_shape(
+        graph = build_cudnn_gemm_mxfp8_graph_override_shape(
             batch=1,
             n=n,
             k=k,
@@ -305,7 +305,7 @@ class TestCudnnMXFp8OverrideShape:
 
             # Execute with cached graph (override_shape)
             out = torch.empty(1, m, n, dtype=out_dtype, device=device)
-            execute_cudnn_mxfp8_gemm_graph_override_shape(
+            execute_cudnn_gemm_mxfp8_graph_override_shape(
                 graph,
                 a,
                 b,
