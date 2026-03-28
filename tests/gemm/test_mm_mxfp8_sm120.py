@@ -51,7 +51,9 @@ def test_mm_mxfp8_sm120_swizzled(m, n, k, out_dtype):
     a_fp8, b_fp8, a_sf, b_sf = _prepare_mxfp8(a, b, swizzled=True)
     reference = torch.mm(a, b.T)
 
-    result = mm_mxfp8(a_fp8, b_fp8.T, a_sf, b_sf, out_dtype=out_dtype, backend="cutlass")
+    result = mm_mxfp8(
+        a_fp8, b_fp8.T, a_sf, b_sf, out_dtype=out_dtype, backend="cutlass"
+    )
 
     assert result.shape == (m, n)
     assert result.dtype == out_dtype
@@ -61,9 +63,6 @@ def test_mm_mxfp8_sm120_swizzled(m, n, k, out_dtype):
         reference.reshape(-1).float(), result.reshape(-1).float(), dim=0
     ).item()
     assert cos_sim > 0.99, f"cos_sim={cos_sim:.4f} < 0.99 for M={m},N={n},K={k}"
-
-
-
 
 
 def test_mm_mxfp8_sm120_tactic_num():
