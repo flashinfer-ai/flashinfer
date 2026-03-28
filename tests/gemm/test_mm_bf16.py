@@ -13,7 +13,7 @@ from flashinfer.utils import get_compute_capability
 @pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("enable_bias", [True, False])
 @pytest.mark.parametrize("pdl", [True, False])
-@pytest.mark.parametrize("backend", ["cudnn", "cutlass", "tgv"])
+@pytest.mark.parametrize("backend", ["cudnn", "cutlass", "tgv", "cublaslt"])
 def test_mm_bf16(
     m: int,
     n: int,
@@ -44,6 +44,12 @@ def test_mm_bf16(
         pytest.skip(
             "mm_bf16 with CUTLASS backend does not support bias or pdl arguments."
         )
+    if backend == "cublaslt" and (enable_bias or pdl):
+        pytest.skip(
+            "mm_bf16 with cuBLASLt backend does not support bias or pdl arguments."
+        )
+    if backend == "cublaslt" and res_dtype == torch.float16:
+        pytest.skip("mm_bf16 with cuBLASLt backend does not support float16 output.")
     if res_dtype != torch.bfloat16 and backend == "tgv":
         pytest.skip(
             "mm_bf16 with TGV backend does not support specifying non-bfloat16 result dtypes."
