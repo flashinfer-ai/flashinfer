@@ -731,7 +731,10 @@ def fp4_quantize(
         is_sf_8x4_layout,
         enable_pdl,
     )
-    sf = sf.reshape((-1, input.shape[-1] // sf_vec_size))
+    # Use input.shape[-2] (rows) as the fixed dimension so that the -1 infers
+    # the actual scale column count, which may be padded to a multiple of 4 by
+    # block_scale_interleave (e.g. hidden_size=2880: 90 cols padded to 92).
+    sf = sf.reshape((input.shape[-2], -1))
     if is_column_major:
         x_q = x_q.transpose(-2, -1)
         sf = sf.transpose(-2, -1)
