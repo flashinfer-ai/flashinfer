@@ -1840,7 +1840,6 @@ def get_trtllm_moe_sm100_module():
         expert_weights: Optional[torch.Tensor],
         routing_bias: Optional[torch.Tensor],
         hidden_states: torch.Tensor,
-        hidden_states_scale: Optional[torch.Tensor],
         gemm1_weights: torch.Tensor,
         gemm1_weights_scale: torch.Tensor,
         gemm1_bias: Optional[torch.Tensor],
@@ -1867,6 +1866,7 @@ def get_trtllm_moe_sm100_module():
         activation_type: int = ActivationType.Swiglu.value,
         output: Optional[torch.Tensor] = None,
         tune_max_num_tokens: int = 8192,
+        hidden_states_scale: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         if routing_logits is None:
             assert topk_ids is not None, (
@@ -1918,6 +1918,12 @@ def get_trtllm_moe_sm100_module():
         dtype_weights = deduce_trtllm_gen_tensor_dtype(
             gemm1_weights, gemm1_weights_scale
         )
+        if dtype_act == DtypeTrtllmGen.Bfloat16 and dtype_weights != DtypeTrtllmGen.MxE2m1:
+            raise ValueError(
+                f"trtllm_fp4_block_scale_moe with bf16 hidden_states requires MxE2m1 "
+                f"(MXFP4) weights, but got weights dtype {dtype_weights.name}. "
+                f"For BF16 weights, use trtllm_bf16_moe instead."
+            )
         moe_runner = MoERunner(
             top_k=top_k,
             num_local_experts=num_local_experts,
@@ -2729,7 +2735,6 @@ def trtllm_fp4_block_scale_moe(
     routing_logits: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
     hidden_states: torch.Tensor,
-    hidden_states_scale: Optional[torch.Tensor],
     gemm1_weights: torch.Tensor,
     gemm1_weights_scale: torch.Tensor,
     gemm1_bias: Optional[torch.Tensor],
@@ -2756,6 +2761,7 @@ def trtllm_fp4_block_scale_moe(
     activation_type: int = ActivationType.Swiglu.value,
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
+    hidden_states_scale: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     """FP4 block scale MoE operation.
 
@@ -2816,6 +2822,10 @@ def trtllm_fp4_block_scale_moe(
         tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
         output (Optional[torch.Tensor]): shape [seq_len, hidden_size]
             Optional inplace output tensor.
+        hidden_states_scale (Optional[torch.Tensor]): shape [seq_len, hidden_size // (32 if mxfp8, 16 if mxfp4)]
+            Scale tensor for mxfp8 / nvfp4 hidden states. Required when hidden_states dtype is
+            mxfp8 or nvfp4 (uint8). Must be None when hidden_states dtype is bfloat16, in which
+            case gemm1_weights must be MxE2m1 (MXFP4) format.
     Returns:
         List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
             Otherwise, returns intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
@@ -2826,7 +2836,6 @@ def trtllm_fp4_block_scale_moe(
         None,
         routing_bias,
         hidden_states,
-        hidden_states_scale,
         gemm1_weights,
         gemm1_weights_scale,
         gemm1_bias,
@@ -2853,6 +2862,7 @@ def trtllm_fp4_block_scale_moe(
         activation_type,
         output,
         tune_max_num_tokens,
+        hidden_states_scale=hidden_states_scale,
     )
 
 
