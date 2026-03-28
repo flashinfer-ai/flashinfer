@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025 by FlashInfer team.
+ * Copyright (c) 2026 by FlashInfer team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,9 +18,8 @@
 
 #include <cublasLt.h>
 #include <cuda_bf16.h>
-#include <cuda_fp16.h>
 
-#include <vector>
+#include <array>
 
 #include "bmm_fp8.cuh"
 
@@ -75,7 +74,7 @@ inline int get_algorithm_count(int m, int n, int k, cudaDataType_t d_type,
   CuBlasLtMatmulPreference preference;
   preference.setAttribute(CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, workspace_size_in_bytes);
 
-  std::vector<cublasLtMatmulHeuristicResult_t> results(kMaxAlgorithms);
+  std::array<cublasLtMatmulHeuristicResult_t, kMaxAlgorithms> results;
   int returned_count = 0;
   cublasStatus_t status = cublasLtMatmulAlgoGetHeuristic(
       lt_handle, desc.matmul_desc.descriptor(), desc.a_layout.descriptor(),
@@ -110,7 +109,7 @@ inline cublasStatus_t run(const __nv_bfloat16* mat1, const __nv_bfloat16* mat2, 
     request_count = kMaxAlgorithms;
   }
 
-  std::vector<cublasLtMatmulHeuristicResult_t> results(request_count);
+  std::array<cublasLtMatmulHeuristicResult_t, kMaxAlgorithms> results;
   int returned_count = 0;
   cublasStatus_t heur_status = cublasLtMatmulAlgoGetHeuristic(
       lt_handle, desc.matmul_desc.descriptor(), desc.a_layout.descriptor(),
