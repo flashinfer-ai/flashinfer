@@ -3344,7 +3344,6 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         topk_weights: Optional[torch.Tensor],
         routing_bias: Optional[torch.Tensor],
         hidden_states: torch.Tensor,
-        hidden_states_scale: Optional[torch.Tensor],
         gemm1_weights: torch.Tensor,
         gemm1_weights_scale: torch.Tensor,
         gemm1_bias: Optional[torch.Tensor],
@@ -3383,6 +3382,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         # routing_method_type -- which stay schema-expressible if
         # register_custom_op is ever re-enabled.
         hidden_states_scale_layout: Optional[int] = None,
+        hidden_states_scale: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         if routing_logits is None:
             assert topk_ids is not None, (
@@ -3471,6 +3471,16 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         dtype_weights = deduce_trtllm_gen_tensor_dtype(
             gemm1_weights, gemm1_weights_scale
         )
+        if (
+            dtype_act == DtypeTrtllmGen.Bfloat16
+            and dtype_weights != DtypeTrtllmGen.MxE2m1
+        ):
+            raise ValueError(
+                "trtllm_fp4_block_scale_moe with bf16 hidden_states requires MxE2m1 "
+                f"(MXFP4) weights, but got weights dtype {dtype_weights.name}. "
+                "For BF16 weights, use trtllm_bf16_moe instead; for NVFP4 weights, "
+                "pass NVFP4-quantized hidden_states with hidden_states_scale."
+            )
         moe_runner = TrtllmMoERunner(
             moe_op,
             top_k=top_k,
@@ -3674,7 +3684,6 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         topk_weights: Optional[torch.Tensor],
         routing_bias: Optional[torch.Tensor],
         hidden_states: torch.Tensor,
-        hidden_states_scale: Optional[torch.Tensor],
         gemm1_weights: torch.Tensor,
         gemm1_weights_scale: torch.Tensor,
         gemm1_bias: Optional[torch.Tensor],
@@ -3708,6 +3717,8 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         routing_replay_out: Optional[torch.Tensor] = None,
         valid_hidden_size: Optional[int] = None,
         valid_intermediate_size: Optional[int] = None,
+        hidden_states_scale_layout: Optional[int] = None,
+        hidden_states_scale: Optional[torch.Tensor] = None,
     ):
         # Acknowledge mutation-only and fallback-only controls without executing the native op.
         _ = routing_replay_out, valid_intermediate_size
@@ -6164,7 +6175,6 @@ def trtllm_fp4_block_scale_moe(
     routing_logits: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
     hidden_states: torch.Tensor,
-    hidden_states_scale: Optional[torch.Tensor],
     gemm1_weights: torch.Tensor,
     gemm1_weights_scale: torch.Tensor,
     gemm1_bias: Optional[torch.Tensor],
@@ -6198,6 +6208,7 @@ def trtllm_fp4_block_scale_moe(
     valid_hidden_size: Optional[int] = None,
     valid_intermediate_size: Optional[int] = None,
     hidden_states_scale_layout: Optional[SfLayout] = None,
+    hidden_states_scale: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     r"""FP4 block-scaled MoE operation.
 
@@ -6214,14 +6225,6 @@ def trtllm_fp4_block_scale_moe(
         Hidden states of shape ``[seq_len, hidden_size // 2]`` (NVFP4) or
         ``[seq_len, hidden_size]`` (MXFP8 / bfloat16).  Supports bfloat16,
         MXFP8, and NVFP4 (packed into uint8).
-    hidden_states_scale : Optional[torch.Tensor]
-        Block scales for MXFP8 / NVFP4 hidden states of shape
-        ``[seq_len, hidden_size // (32 if mxfp8 else 16)]``.  Dtype is float8.
-        The equivalent flat ``[seq_len * hidden_size // (32 if mxfp8 else 16)]``
-        buffer returned by :func:`~flashinfer.mxfp8_quantize` with
-        ``is_sf_swizzled_layout=False`` (the linear layout) is also accepted.
-        Declare which layout the buffer is in with
-        ``hidden_states_scale_layout``; only the linear layout is supported.
     gemm1_weights : torch.Tensor
         ``[num_experts, M, hidden_size // 2]`` packed FP4 FC1 weights, dtype
         ``uint8``.  ``M`` is ``2 * intermediate_size`` for gated activations and
@@ -6362,6 +6365,18 @@ def trtllm_fp4_block_scale_moe(
         Valid (unpadded) intermediate dimension.  When provided,
         ``intermediate_size`` is treated as padded and only the valid region is
         computed.  Default ``None`` (use the full ``intermediate_size``).
+    hidden_states_scale : Optional[torch.Tensor]
+        Block scales for MXFP8 / NVFP4 hidden states of shape
+        ``[seq_len, hidden_size // (32 if mxfp8 else 16)]``.  Dtype is float8.
+        The equivalent flat ``[seq_len * hidden_size // (32 if mxfp8 else 16)]``
+        buffer returned by :func:`~flashinfer.mxfp8_quantize` with
+        ``is_sf_swizzled_layout=False`` (the linear layout) is also accepted.
+        Declare which layout the buffer is in with
+        ``hidden_states_scale_layout``; only the linear layout is supported.
+        Must be ``None`` (the default) for bfloat16 ``hidden_states``, which
+        carry no block scales; bfloat16 activations require MXFP4
+        (``MxE2m1``) weights.
+
     Returns
     -------
     List[torch.Tensor]
@@ -6392,7 +6407,6 @@ def trtllm_fp4_block_scale_moe(
         None,
         routing_bias,
         hidden_states,
-        hidden_states_scale,
         gemm1_weights,
         gemm1_weights_scale,
         gemm1_bias,
@@ -6427,6 +6441,7 @@ def trtllm_fp4_block_scale_moe(
         valid_hidden_size,
         valid_intermediate_size,
         hidden_states_scale_layout,
+        hidden_states_scale=hidden_states_scale,
     )
 
 
@@ -6676,7 +6691,6 @@ def trtllm_fp4_block_scale_routed_moe(
         topk_weights,
         routing_bias,
         hidden_states,
-        hidden_states_scale,
         gemm1_weights,
         gemm1_weights_scale,
         gemm1_bias,
@@ -6711,6 +6725,7 @@ def trtllm_fp4_block_scale_routed_moe(
         valid_hidden_size,
         valid_intermediate_size,
         hidden_states_scale_layout,
+        hidden_states_scale=hidden_states_scale,
     )
 
 

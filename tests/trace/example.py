@@ -1349,6 +1349,7 @@ try:
     out2_scale = torch.full((E_loc_fp4,), scale_val**2, device=device)
 
     _fp4_moe_common = dict(
+        hidden_states_scale=hs_fp4_scale,
         num_experts=E_tot_fp4,
         intermediate_size=I_fp4,
         local_expert_offset=0,
@@ -1359,7 +1360,6 @@ try:
         routing_logits_fp4,
         None,  # routing_bias
         hs_fp4,
-        hs_fp4_scale,
         w13_fp4,
         w13_fp4_scale,
         None,  # gemm1_bias
