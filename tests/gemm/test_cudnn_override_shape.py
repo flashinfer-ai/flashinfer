@@ -26,7 +26,7 @@ from flashinfer.gemm.gemm_base import (
     _calculate_block_scale_dims,
 )
 from flashinfer.utils import get_compute_capability
-from flashinfer.fp4_quantization import nvfp4_quantize
+from flashinfer.fp4_quantization import fp4_quantize
 from flashinfer.fp8_quantization import mxfp8_quantize
 
 
@@ -184,7 +184,7 @@ class TestCudnnNVFp4OverrideShape:
         b_bf16 = torch.empty([1, n, k], device="cuda", dtype=torch.bfloat16).uniform_(
             -5.0, 5.0
         )
-        b_packed, b_scale = nvfp4_quantize(b_bf16, global_sf, True)
+        b_packed, b_scale = fp4_quantize(b_bf16, global_sf)
 
         b_bf16 = b_bf16.transpose(1, 2)
         b_packed = b_packed.transpose(1, 2)
@@ -196,7 +196,7 @@ class TestCudnnNVFp4OverrideShape:
             a_bf16 = torch.empty(
                 [1, m, k], device="cuda", dtype=torch.bfloat16
             ).uniform_(-5.0, 5.0)
-            a_packed, a_scale = nvfp4_quantize(a_bf16, global_sf, True)
+            a_packed, a_scale = fp4_quantize(a_bf16, global_sf)
 
             a_scale = a_scale.unsqueeze(0)
 
