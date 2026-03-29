@@ -384,7 +384,7 @@ def mm_bf16(
         Optional bias tensor, shape (n,). Enabled for TGV backend. Defaults to ``None``.
 
     pdl: bool
-        Whether to use persistant data loader mode. Enabled for TGV backend. Defaults to ``False``.
+        Whether to enable Programmatic Dependent Launch (PDL). Enabled for TGV backend. Defaults to ``False``.
 
     out: Optional[torch.Tensor]
         Out tensor, shape (m, n), bf16, fp16, or fp32. Enabled for CUTLASS, cuDNN, and cuBLASLt
