@@ -60,7 +60,7 @@ void run(Data& data, void* stream) {
   int const numBlocksCoop = smCount - 8;
 
   int const maxTokensCoop = (numBlocksCoop * numThreadsHist * 64) / data.mTopK;
-  if (data.mPtrTopKIds == nullptr) {
+  if (data.mPtrScores != nullptr) {
     FLASHINFER_CHECK(data.mNumExperts >= MaxSupportedTopExperts,
                      "Routing kernel expects %d to be at most #experts %d", MaxSupportedTopExperts,
                      data.mNumExperts);
