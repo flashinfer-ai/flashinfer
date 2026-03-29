@@ -43,6 +43,7 @@ from flashinfer.fused_moe import (
     trtllm_fp8_per_tensor_scale_moe,
     trtllm_bf16_moe,
     trtllm_mxint4_block_scale_moe,
+    trtllm_mxint4_fp8_block_scale_moe,
 )
 from flashinfer.fused_moe.core import (
     get_w2_permute_indices_with_cache,
@@ -828,6 +829,159 @@ class MxInt4BlockScaleMoe(Moe):
     def get_tolerances(self):
         """Get MXINT4-specific accuracy tolerances."""
         return {"atol": 0.1, "rtol": 0.85, "percent": 0.925}
+
+
+class MxInt4Fp8BlockScaleMoe(MxInt4BlockScaleMoe):
+    """MxInt4 weight x FP8 activation MoE with per-tensor scaling."""
+
+    @property
+    def quant_mode(self) -> QuantMode:
+        return QuantMode.MXINT4_FP8_BF16
+
+    def quantize_weights(self, gemm1_weights, gemm2_weights, hidden_states_sample):
+        """Quantize weights to MxInt4 (same as BF16 variant) and compute FP8 input scale."""
+        result = super().quantize_weights(
+            gemm1_weights, gemm2_weights, hidden_states_sample
+        )
+        result["hidden_states_scale_global"] = calculate_fp8_global_scale_factor(
+            hidden_states_sample
+        )
+        return result
+
+    def quantize_inputs(self, hidden_states, hidden_states_scale_global):
+        """Quantize hidden states to FP8 E4M3 with per-tensor scale."""
+        hidden_states_fp8, _ = quant_fp8_per_tensor(
+            hidden_states, hidden_states_scale_global
+        )
+        return {
+            "hidden_states": hidden_states_fp8,
+            "hidden_states_scale": torch.tensor(
+                [1.0 / hidden_states_scale_global],
+                dtype=torch.float32,
+                device=hidden_states.device,
+            ),
+        }
+
+    def prepare_static_weights_for_kernel(
+        self,
+        args_dequant,
+        args,
+        gemm1_weights_orig,
+        gemm2_weights_orig,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        weight_processing,
+    ):
+        result = super().prepare_static_weights_for_kernel(
+            args_dequant,
+            args,
+            gemm1_weights_orig,
+            gemm2_weights_orig,
+            hidden_size,
+            intermediate_size,
+            num_experts,
+            weight_processing,
+        )
+        result["c_global_sf"] = args_dequant.c_global_sf
+        return result
+
+    def call_moe(
+        self, static_data, hidden_states_orig, hidden_states_scale_global, **kwargs
+    ):
+        """Call MoE with FP8 input quantization + MxInt4 weights."""
+        expert_logits = kwargs["expert_logits"]
+        routing_bias = kwargs["routing_bias"]
+        num_experts = kwargs["num_experts"]
+        top_k = kwargs["top_k"]
+        n_groups = kwargs["n_groups"]
+        top_k_groups = kwargs["top_k_groups"]
+        intermediate_size = kwargs["intermediate_size"]
+        routing_method_type = kwargs["routing_method_type"]
+        enable_autotune = kwargs.get("enable_autotune", True)
+        routed_scaling = kwargs.get("routed_scaling", 1.0)
+
+        hidden_states_fp8, _ = quant_fp8_per_tensor(
+            hidden_states_orig, hidden_states_scale_global
+        )
+        hidden_states_scale = torch.tensor(
+            [1.0 / hidden_states_scale_global],
+            dtype=torch.float32,
+            device=hidden_states_orig.device,
+        )
+
+        c_sf = static_data["c_global_sf"]
+        hs_dequant = 1.0 / hidden_states_scale_global
+        output1_scales = torch.full(
+            (num_experts,),
+            c_sf * hs_dequant,
+            dtype=torch.float32,
+            device=hidden_states_orig.device,
+        )
+        output1_gate_scales = torch.full(
+            (num_experts,),
+            hs_dequant,
+            dtype=torch.float32,
+            device=hidden_states_orig.device,
+        )
+        output2_scales = torch.full(
+            (num_experts,),
+            1.0 / c_sf,
+            dtype=torch.float32,
+            device=hidden_states_orig.device,
+        )
+
+        with autotune(enable_autotune):
+            output = trtllm_mxint4_fp8_block_scale_moe(
+                expert_logits,
+                routing_bias,
+                hidden_states_fp8,
+                hidden_states_scale,
+                static_data["gemm1_weights"],
+                static_data["gemm1_scales"],
+                None,
+                None,
+                None,
+                static_data["gemm2_weights"],
+                static_data["gemm2_scales"],
+                output1_scales,
+                output1_gate_scales,
+                output2_scales,
+                num_experts,
+                top_k,
+                n_groups,
+                top_k_groups,
+                intermediate_size,
+                0,
+                num_experts,
+                routed_scaling,
+                routing_method_type=routing_method_type,
+                tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
+            )
+        return output[0].to(torch.float)
+
+    def compute_reference(self, args):
+        """Override to dequantize FP8 hidden states and simulate FP8 intermediate.
+
+        Two corrections vs. the base MxInt4 reference:
+        1. Dequantize FP8 hidden_states using scale_global before the reference
+           GEMM (the base does .to(bf16).to(float) which keeps raw FP8 magnitudes).
+        2. Pass MXINT4_FP8_BF16 quant_mode so run_moe_dequant simulates the FP8
+           quant/dequant round-trip on the FC1 intermediate (computes c_global_sf).
+        """
+        import copy
+
+        args_dequant_hs = copy.copy(args)
+        args_dequant_hs.hidden_states = (
+            args.hidden_states.to(torch.float) / args.hidden_states_scale_global
+        ).to(torch.bfloat16)
+        return run_moe_reference_mxint4(
+            args_dequant_hs, QuantMode.MXINT4_FP8_BF16
+        )
+
+    def get_tolerances(self):
+        """Get MxInt4 x FP8 accuracy tolerances (slightly relaxed due to double quantization)."""
+        return {"atol": 0.15, "rtol": 0.80, "percent": 0.90}
 
 
 # ====================================================================================
@@ -2190,6 +2344,12 @@ def run_moe_dequant(args, quant_mode: QuantMode):
             .to(torch.float)
         )
         args.c_global_sf = 1.0
+    elif quant_mode == QuantMode.MXINT4_FP8_BF16:
+        activation_output, c_global_sf = quant_dequant_per_tensor_fp8(
+            activation_output.to(torch.bfloat16)
+        )
+        activation_output = activation_output.to(torch.float)
+        args.c_global_sf = c_global_sf
     else:  # Bf16, MxFp4xBf16, MxInt4xBf16
         activation_output = activation_output.to(torch.bfloat16).to(torch.float)
         args.c_global_sf = 1.0
@@ -2476,7 +2636,7 @@ def run_moe_reference_bf16(args):
     return run_moe_dequant(args_dequant, QuantMode.BF16), args_dequant
 
 
-def run_moe_reference_mxint4(args):
+def run_moe_reference_mxint4(args, quant_mode=QuantMode.MXINT4_BF16_BF16):
     sf_vec_size = 32
 
     hidden_states_dequant = args.hidden_states.to(torch.bfloat16).to(torch.float)
@@ -2526,7 +2686,7 @@ def run_moe_reference_mxint4(args):
         gemm2_bias=args.gemm2_bias,
     )
 
-    return run_moe_dequant(args_dequant, QuantMode.MXINT4_BF16_BF16), args_dequant
+    return run_moe_dequant(args_dequant, quant_mode), args_dequant
 
 
 def _compute_moe_actual_unified(moe_impl, args_dequant, args, **kwargs):
@@ -2810,6 +2970,7 @@ def run_moe_test(
         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_MXFP8), id="MxFP4xMxFP8"),
         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_Bf16), id="MxFP4xBf16"),
         pytest.param(MxInt4BlockScaleMoe(), id="MxInt4xBf16"),
+        pytest.param(MxInt4Fp8BlockScaleMoe(), id="MxInt4xFP8"),
     ],
 )
 @pytest.mark.parametrize(
@@ -2831,6 +2992,7 @@ def run_moe_test(
                     FP4Moe,
                     BF16Moe,
                     MxInt4BlockScaleMoe,
+                    MxInt4Fp8BlockScaleMoe,
                 ],
                 "compatible_intermediate_size": [384, 768, 1024],
                 "enable_autotune": True,
@@ -2853,6 +3015,7 @@ def run_moe_test(
                     FP4Moe,
                     BF16Moe,
                     MxInt4BlockScaleMoe,
+                    MxInt4Fp8BlockScaleMoe,
                 ],
                 "compatible_intermediate_size": [384, 1024],
                 "enable_autotune": False,
@@ -2875,6 +3038,7 @@ def run_moe_test(
                     FP4Moe,
                     BF16Moe,
                     MxInt4BlockScaleMoe,
+                    MxInt4Fp8BlockScaleMoe,
                 ],
                 "compatible_intermediate_size": [512],
                 "enable_autotune": True,
@@ -2896,6 +3060,7 @@ def run_moe_test(
                     FP4Moe,
                     BF16Moe,
                     MxInt4BlockScaleMoe,
+                    MxInt4Fp8BlockScaleMoe,
                 ],
                 "compatible_intermediate_size": [384],
                 "enable_autotune": True,
@@ -2931,6 +3096,7 @@ def run_moe_test(
                     FP8BlockScaleMoe,
                     BF16Moe,
                     MxInt4BlockScaleMoe,
+                    MxInt4Fp8BlockScaleMoe,
                 ],
             },
             id="Shuffled_BlockMajorK",
@@ -2989,6 +3155,7 @@ def test_renormalize_routing(
         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_MXFP8), id="MxFP4xMxFP8"),
         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_Bf16), id="MxFP4xBf16"),
         pytest.param(MxInt4BlockScaleMoe(), id="MxInt4xBf16"),
+        pytest.param(MxInt4Fp8BlockScaleMoe(), id="MxInt4xFP8"),
         pytest.param(BF16Moe(), id="Bf16xBf16"),
     ],
 )
@@ -3046,6 +3213,7 @@ def test_renormalize_routing(
                     FP4Moe,
                     FP8BlockScaleMoe,
                     MxInt4BlockScaleMoe,
+                    MxInt4Fp8BlockScaleMoe,
                     BF16Moe,
                 ],
                 "compatible_intermediate_size": [512, 1024, 2048],
@@ -3125,6 +3293,7 @@ def test_renormalize_routing(
                 "compatible_moe_impls": [
                     FP8BlockScaleMoe,
                     MxInt4BlockScaleMoe,
+                    MxInt4Fp8BlockScaleMoe,
                     BF16Moe,
                 ],
             },
