@@ -86,5 +86,34 @@ def test_mm_bf16(
     assert cos_sim > 0.99
 
 
+def test_cublaslt_bf16_runner_zero_algos():
+    """CublasltBf16GemmRunner.forward() must raise when heuristic returns 0 algorithms."""
+    from flashinfer.gemm.gemm_base import get_mm_bf16_cublaslt_module
+    from flashinfer.utils import get_compute_capability
+
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    cc_num = compute_capability[0] * 10 + compute_capability[1]
+    if not mm_bf16.is_backend_supported("cublaslt", cc_num):
+        pytest.skip("cublaslt backend not supported on this GPU")
+
+    runner = get_mm_bf16_cublaslt_module().cublaslt_bf16_gemm_runner()
+
+    m, n, k = 16, 1024, 1024
+    a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
+    workspace = torch.empty(32 * 1024 * 1024, device="cuda", dtype=torch.uint8)
+    inputs = [a, b, None, None, out, workspace]
+
+    zero_algo_buf = torch.empty(0, dtype=torch.uint8, device="cpu")
+    original_get_algos = runner._get_algos
+    runner._get_algos = lambda _inputs: (zero_algo_buf, 0)
+    try:
+        with pytest.raises(RuntimeError, match="zero algorithms"):
+            runner.forward(inputs)
+    finally:
+        runner._get_algos = original_get_algos
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

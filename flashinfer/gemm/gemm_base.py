@@ -1033,6 +1033,13 @@ def get_mm_bf16_cublaslt_module():
                     compute_out = out
 
                 algo_buf, count = self._get_algos(inputs)
+                if count == 0:
+                    raise RuntimeError(
+                        "cuBLASLt heuristic returned zero algorithms for "
+                        f"M={a.shape[0]}, N={b.shape[0]}, K={a.shape[1]}, "
+                        f"dtype={compute_out.dtype}. "
+                        "This shape/dtype combination may not be supported."
+                    )
                 if tactic < 0 or tactic >= count:
                     tactic = 0
                 module.mm_bf16_cublaslt_run_with_algo(
