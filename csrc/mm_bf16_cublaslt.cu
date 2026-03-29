@@ -76,29 +76,30 @@ void mm_bf16_cublaslt(TensorView mat1, TensorView mat2, TensorView out, TensorVi
       << "mm_bf16_cublaslt failed: " << cublasGetStatusString(status);
 }
 
-int64_t mm_bf16_cublaslt_tactic_num(TensorView mat1, TensorView mat2, TensorView out,
-                                    TensorView workspace_buffer, int64_t cublas_handle) {
-  int64_t m = mat1.size(0);
-  int64_t k = mat1.size(1);
-  int64_t n = mat2.size(0);
-  cudaDataType_t d_type = get_d_type(out.dtype());
-
-  ffi::CUDADeviceGuard device_guard(mat1.device().device_id);
-  auto lt_handle = reinterpret_cast<cublasLtHandle_t>(cublas_handle);
-  return static_cast<int64_t>(flashinfer::mm_bf16_cublaslt::get_algorithm_count(
-      static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), d_type,
-      workspace_buffer.numel() * get_element_size(workspace_buffer), lt_handle));
-}
-
 // Serialize all heuristic algorithms into a CPU uint8 tensor for caching.
 // algo_buffer: CPU uint8 tensor of size >= kMaxAlgorithms * kAlgoBytes.
 // Returns number of algorithms written.
 int64_t mm_bf16_cublaslt_get_algos(TensorView mat1, TensorView mat2, TensorView out,
                                    TensorView workspace_buffer, int64_t cublas_handle,
                                    TensorView algo_buffer) {
+  CHECK_CUDA(mat1);
+  CHECK_CUDA(mat2);
+  CHECK_CUDA(out);
+  CHECK_INPUT_AND_TYPE(mat1, dl_bfloat16);
+  CHECK_INPUT_AND_TYPE(mat2, dl_bfloat16);
+  CHECK_DIM(2, mat1);
+  CHECK_DIM(2, mat2);
+  CHECK_DIM(2, out);
+
   int64_t m = mat1.size(0);
   int64_t k = mat1.size(1);
   int64_t n = mat2.size(0);
+
+  TVM_FFI_ICHECK_EQ(mat2.size(1), k)
+      << "mat2 K dimension mismatch: expected " << k << ", got " << mat2.size(1);
+  TVM_FFI_ICHECK_EQ(out.size(0), m) << "out M dimension mismatch";
+  TVM_FFI_ICHECK_EQ(out.size(1), n) << "out N dimension mismatch";
+
   cudaDataType_t d_type = get_d_type(out.dtype());
 
   ffi::CUDADeviceGuard device_guard(mat1.device().device_id);
@@ -133,6 +134,11 @@ void mm_bf16_cublaslt_run_with_algo(TensorView mat1, TensorView mat2, TensorView
   TVM_FFI_ICHECK_EQ(out.size(0), m) << "out M dimension mismatch";
   TVM_FFI_ICHECK_EQ(out.size(1), n) << "out N dimension mismatch";
 
+  int64_t max_algos = algo_buffer.numel() * get_element_size(algo_buffer) /
+                      flashinfer::mm_bf16_cublaslt::kAlgoBytes;
+  TVM_FFI_ICHECK(algo_idx >= 0 && algo_idx < max_algos)
+      << "algo_idx " << algo_idx << " out of range [0, " << max_algos << ")";
+
   auto lt_handle = reinterpret_cast<cublasLtHandle_t>(cublas_handle);
   ffi::CUDADeviceGuard device_guard(mat1.device().device_id);
   auto stream = get_stream(mat1.device());
@@ -148,6 +154,5 @@ void mm_bf16_cublaslt_run_with_algo(TensorView mat1, TensorView mat2, TensorView
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(mm_bf16_cublaslt, mm_bf16_cublaslt);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(mm_bf16_cublaslt_tactic_num, mm_bf16_cublaslt_tactic_num);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(mm_bf16_cublaslt_get_algos, mm_bf16_cublaslt_get_algos);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(mm_bf16_cublaslt_run_with_algo, mm_bf16_cublaslt_run_with_algo);

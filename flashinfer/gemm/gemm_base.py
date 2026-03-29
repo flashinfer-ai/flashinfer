@@ -118,7 +118,7 @@ def get_gemm_module():
                 self._algo_cache: dict = {}
 
             def _get_algos(self, inputs):
-                a, b, _, _, out, workspace_buffer = inputs
+                a, b, scale_a, scale_b, out, workspace_buffer = inputs
                 key = (a.shape, b.shape, a.dtype, b.dtype, out.dtype)
                 cached = self._algo_cache.get(key)
                 if cached is not None:
@@ -131,8 +131,8 @@ def get_gemm_module():
                     a,
                     b,
                     out,
-                    inputs[2],
-                    inputs[3],
+                    scale_a,
+                    scale_b,
                     workspace_buffer,
                     cublas_handle,
                     algo_buf,
@@ -259,6 +259,8 @@ def _cutlass_mm_bf16_requirement(
     return True
 
 
+# Gated to Blackwell (SM100/SM103) for the initial scope of this backend.
+# cuBLASLt supports BF16 GEMM on SM80+; the gate can be widened in a follow-up.
 @supported_compute_capability([100, 103])
 def _cublaslt_mm_bf16_requirement(
     a: torch.Tensor,
@@ -1008,28 +1010,18 @@ def get_mm_bf16_cublaslt_module():
                 a, b, _, _, out, workspace_buffer = inputs
                 cublas_handle = torch.cuda.current_blas_handle()
                 b_t = b.transpose(-2, -1)
-                if tactic >= 0:
-                    algo_buf, count = self._get_algos(inputs)
-                    if tactic >= count:
-                        tactic = 0
-                    module.mm_bf16_cublaslt_run_with_algo(
-                        a,
-                        b_t,
-                        out,
-                        workspace_buffer,
-                        cublas_handle,
-                        algo_buf,
-                        tactic,
-                    )
-                else:
-                    module.mm_bf16_cublaslt(
-                        a,
-                        b_t,
-                        out,
-                        workspace_buffer,
-                        cublas_handle,
-                        tactic,
-                    )
+                algo_buf, count = self._get_algos(inputs)
+                if tactic < 0 or tactic >= count:
+                    tactic = 0
+                module.mm_bf16_cublaslt_run_with_algo(
+                    a,
+                    b_t,
+                    out,
+                    workspace_buffer,
+                    cublas_handle,
+                    algo_buf,
+                    tactic,
+                )
                 return out
 
         return CublasltBf16GemmRunner()
