@@ -1224,18 +1224,16 @@ class MxInt4BlockScaleLauncher : public FusedMoeLauncher {
  public:
   static constexpr std::array<int32_t, 5> mSupportedTileNums = {8, 16, 32, 64, 128};
 
-  MxInt4BlockScaleLauncher(TensorView const& routing_logits,
-                           Optional<TensorView> const& routing_bias,
-                           TensorView const& hidden_states, TensorView const& gemm1_weights,
-                           TensorView const& gemm1_weights_scale,
-                           Optional<TensorView> const& gemm1_alpha,
-                           Optional<TensorView> const& gemm1_beta,
-                           Optional<TensorView> const& gemm1_clamp_limit,
-                           TensorView const& gemm2_weights, TensorView const& gemm2_weights_scale,
-                           Optional<TensorView> const& hidden_states_scale = Optional<TensorView>(),
-                           Optional<TensorView> const& output1_scales_scalar = Optional<TensorView>(),
-                           Optional<TensorView> const& output1_scales_gate_scalar = Optional<TensorView>(),
-                           Optional<TensorView> const& output2_scales_scalar = Optional<TensorView>())
+  MxInt4BlockScaleLauncher(
+      TensorView const& routing_logits, Optional<TensorView> const& routing_bias,
+      TensorView const& hidden_states, TensorView const& gemm1_weights,
+      TensorView const& gemm1_weights_scale, Optional<TensorView> const& gemm1_alpha,
+      Optional<TensorView> const& gemm1_beta, Optional<TensorView> const& gemm1_clamp_limit,
+      TensorView const& gemm2_weights, TensorView const& gemm2_weights_scale,
+      Optional<TensorView> const& hidden_states_scale = Optional<TensorView>(),
+      Optional<TensorView> const& output1_scales_scalar = Optional<TensorView>(),
+      Optional<TensorView> const& output1_scales_gate_scalar = Optional<TensorView>(),
+      Optional<TensorView> const& output2_scales_scalar = Optional<TensorView>())
       : FusedMoeLauncher(Optional<TensorView>(routing_logits), routing_bias, hidden_states,
                          gemm1_weights, output1_scales_scalar, output1_scales_gate_scalar,
                          gemm2_weights, output2_scales_scalar),
@@ -2293,9 +2291,9 @@ Array<Tensor> trtllm_mxint4_fp8_block_scale_moe(
       resolveMoeTileAndConfig(config_index, mSupportedTileN, num_tokens, top_k, local_num_experts);
 
   auto launcher_it = launchers_map.find(static_cast<int32_t>(tile_N));
-  FLASHINFER_CHECK(launcher_it != launchers_map.end(),
-                   "Internal error: missing MXINT4 FP8 block-scale MoE launcher for tile_N=",
-                   tile_N);
+  FLASHINFER_CHECK(
+      launcher_it != launchers_map.end(),
+      "Internal error: missing MXINT4 FP8 block-scale MoE launcher for tile_N=", tile_N);
   auto& selected_launcher = launcher_it->second;
 
   return selected_launcher->run(config, enable_pdl);
@@ -2377,8 +2375,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_fp8_per_tensor_scale_moe, trtllm_fp8_per_te
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_fp8_block_scale_moe, trtllm_fp8_block_scale_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_fp4_block_scale_moe, trtllm_fp4_block_scale_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_mxint4_block_scale_moe, trtllm_mxint4_block_scale_moe);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_mxint4_fp8_block_scale_moe,
-                               trtllm_mxint4_fp8_block_scale_moe);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_mxint4_fp8_block_scale_moe, trtllm_mxint4_fp8_block_scale_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_get_valid_moe_configs, trtllm_get_valid_moe_configs);
 
 }  // namespace flashinfer

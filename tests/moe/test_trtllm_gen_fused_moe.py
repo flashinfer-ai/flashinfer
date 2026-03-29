@@ -975,9 +975,7 @@ class MxInt4Fp8BlockScaleMoe(MxInt4BlockScaleMoe):
         args_dequant_hs.hidden_states = (
             args.hidden_states.to(torch.float) / args.hidden_states_scale_global
         ).to(torch.bfloat16)
-        return run_moe_reference_mxint4(
-            args_dequant_hs, QuantMode.MXINT4_FP8_BF16
-        )
+        return run_moe_reference_mxint4(args_dequant_hs, QuantMode.MXINT4_FP8_BF16)
 
     def get_tolerances(self):
         """Get MxInt4 x FP8 accuracy tolerances (slightly relaxed due to double quantization)."""
