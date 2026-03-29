@@ -68,28 +68,6 @@ struct GemmDescriptors {
 };
 
 /*!
- * \brief Get the number of available cuBLASLt algorithms for a BF16 GEMM.
- */
-inline int get_algorithm_count(int m, int n, int k, cudaDataType_t d_type,
-                               size_t workspace_size_in_bytes, cublasLtHandle_t lt_handle) {
-  GemmDescriptors desc(m, n, k, d_type);
-
-  CuBlasLtMatmulPreference preference;
-  preference.setAttribute(CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, workspace_size_in_bytes);
-
-  std::array<cublasLtMatmulHeuristicResult_t, kMaxAlgorithms> results;
-  int returned_count = 0;
-  cublasStatus_t status = cublasLtMatmulAlgoGetHeuristic(
-      lt_handle, desc.matmul_desc.descriptor(), desc.a_layout.descriptor(),
-      desc.b_layout.descriptor(), desc.d_layout.descriptor(), desc.d_layout.descriptor(),
-      preference.descriptor(), kMaxAlgorithms, results.data(), &returned_count);
-  if (status != CUBLAS_STATUS_SUCCESS) {
-    return 0;
-  }
-  return returned_count;
-}
-
-/*!
  * \brief Query heuristics once and serialize all cublasLtMatmulAlgo_t structs into a buffer.
  *
  * Each algo occupies kAlgoBytes (64) contiguous bytes.  The buffer can be cached
@@ -144,50 +122,6 @@ inline cublasStatus_t run_with_algo(const __nv_bfloat16* mat1, const __nv_bfloat
       lt_handle, desc.matmul_desc.descriptor(), &alpha, mat2, desc.a_layout.descriptor(), mat1,
       desc.b_layout.descriptor(), &beta, nullptr, desc.d_layout.descriptor(), out,
       desc.d_layout.descriptor(), &algo, workspace, workspace_size_in_bytes, stream));
-  return CUBLAS_STATUS_SUCCESS;
-}
-
-/*!
- * \brief Run a BF16 GEMM using a specific cuBLASLt algorithm (tactic).
- *
- * \param mat1  Pointer to mat1 data, row-major (m, k)
- * \param mat2  Pointer to mat2 data, row-major (n, k) — after b.transpose(-2,-1) in Python
- * \param out   Pointer to output data, row-major (m, n)
- * \param tactic  Algorithm index; -1 means use the top heuristic (index 0).
- */
-inline cublasStatus_t run(const __nv_bfloat16* mat1, const __nv_bfloat16* mat2, void* out, int m,
-                          int n, int k, cudaDataType_t d_type, void* workspace,
-                          size_t workspace_size_in_bytes, cublasLtHandle_t lt_handle,
-                          cudaStream_t stream, int tactic) {
-  GemmDescriptors desc(m, n, k, d_type);
-
-  CuBlasLtMatmulPreference preference;
-  preference.setAttribute(CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, workspace_size_in_bytes);
-
-  int algo_idx = (tactic < 0) ? 0 : tactic;
-  int request_count = algo_idx + 1;
-  if (request_count > kMaxAlgorithms) {
-    request_count = kMaxAlgorithms;
-  }
-
-  std::array<cublasLtMatmulHeuristicResult_t, kMaxAlgorithms> results;
-  int returned_count = 0;
-  cublasStatus_t heur_status = cublasLtMatmulAlgoGetHeuristic(
-      lt_handle, desc.matmul_desc.descriptor(), desc.a_layout.descriptor(),
-      desc.b_layout.descriptor(), desc.d_layout.descriptor(), desc.d_layout.descriptor(),
-      preference.descriptor(), request_count, results.data(), &returned_count);
-  if (heur_status != CUBLAS_STATUS_SUCCESS || returned_count <= algo_idx) {
-    return CUBLAS_STATUS_NOT_SUPPORTED;
-  }
-
-  const float alpha = 1.0f;
-  const float beta = 0.0f;
-  // Note: mat2 is cuBLASLt "A", mat1 is cuBLASLt "B" (swap for row-major output)
-  FLASHINFER_CUBLAS_CALL(
-      cublasLtMatmul(lt_handle, desc.matmul_desc.descriptor(), &alpha, mat2,
-                     desc.a_layout.descriptor(), mat1, desc.b_layout.descriptor(), &beta, nullptr,
-                     desc.d_layout.descriptor(), out, desc.d_layout.descriptor(),
-                     &results[algo_idx].algo, workspace, workspace_size_in_bytes, stream));
   return CUBLAS_STATUS_SUCCESS;
 }
 

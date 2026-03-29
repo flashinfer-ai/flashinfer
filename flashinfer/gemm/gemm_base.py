@@ -279,11 +279,6 @@ def _cublaslt_mm_bf16_requirement(
         raise ValueError(
             "The cuBLASLt backend does not support PDL. Use the TGV backend instead."
         )
-    if out_dtype == torch.float16:
-        raise ValueError(
-            "cuBLASLt BF16 GEMM does not support float16 output. "
-            "Use bfloat16 or float32, or use the CUTLASS/cuDNN backend for float16 output."
-        )
     _validate_bf16_output_dtype(out_dtype)
 
     return True
@@ -972,18 +967,32 @@ def get_mm_bf16_cublaslt_module():
             def __init__(self):
                 self._algo_cache: dict = {}
 
+            @staticmethod
+            def _compute_dtype(out_dtype):
+                # cuBLASLt with BF16 inputs supports BF16 or FP32 output natively.
+                # FP16 output is achieved via BF16 compute + cast.
+                if out_dtype == torch.float16:
+                    return torch.bfloat16
+                return out_dtype
+
             def _get_algos(self, inputs):
                 a, b, _, _, out, workspace_buffer = inputs
-                key = (a.shape[0], b.shape[0], a.shape[1], out.dtype)
+                compute_dt = self._compute_dtype(out.dtype)
+                key = (a.shape[0], b.shape[0], a.shape[1], compute_dt)
                 cached = self._algo_cache.get(key)
                 if cached is not None:
                     return cached
                 algo_buf = torch.empty(_MAX_ALGOS * _ALGO_BYTES, dtype=torch.uint8)
                 cublas_handle = torch.cuda.current_blas_handle()
+                proxy_out = (
+                    out
+                    if out.dtype == compute_dt
+                    else torch.empty_like(out, dtype=compute_dt)
+                )
                 count = module.mm_bf16_cublaslt_get_algos(
                     a,
                     b.transpose(-2, -1),
-                    out,
+                    proxy_out,
                     workspace_buffer,
                     cublas_handle,
                     algo_buf,
@@ -1010,18 +1019,27 @@ def get_mm_bf16_cublaslt_module():
                 a, b, _, _, out, workspace_buffer = inputs
                 cublas_handle = torch.cuda.current_blas_handle()
                 b_t = b.transpose(-2, -1)
+
+                need_cast = out.dtype == torch.float16
+                if need_cast:
+                    compute_out = torch.empty_like(out, dtype=torch.bfloat16)
+                else:
+                    compute_out = out
+
                 algo_buf, count = self._get_algos(inputs)
                 if tactic < 0 or tactic >= count:
                     tactic = 0
                 module.mm_bf16_cublaslt_run_with_algo(
                     a,
                     b_t,
-                    out,
+                    compute_out,
                     workspace_buffer,
                     cublas_handle,
                     algo_buf,
                     tactic,
                 )
+                if need_cast:
+                    out.copy_(compute_out)
                 return out
 
         return CublasltBf16GemmRunner()
@@ -2626,7 +2644,7 @@ def _cudnn_gemm_mxfp8_override_shape(
     )
 
 
-@functools.lru_cache(maxsize=1024)
+@functools.lru_cache(maxsize=2048)
 def build_cudnn_gemm_with_per_tensor_q_graph(
     a_shape,
     a_stride,

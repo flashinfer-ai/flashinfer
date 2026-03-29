@@ -39,43 +39,6 @@ cudaDataType_t get_d_type(DLDataType dtype) {
 
 }  // namespace
 
-// mat1: (m, k) bf16 contiguous row-major
-// mat2: (n, k) bf16 contiguous row-major (Python passes b.transpose(-2,-1))
-// out:  (m, n) bf16/fp16/fp32 contiguous row-major
-void mm_bf16_cublaslt(TensorView mat1, TensorView mat2, TensorView out, TensorView workspace_buffer,
-                      int64_t cublas_handle, int64_t tactic) {
-  CHECK_CUDA(mat1);
-  CHECK_CUDA(mat2);
-  CHECK_CUDA(out);
-  CHECK_INPUT_AND_TYPE(mat1, dl_bfloat16);
-  CHECK_INPUT_AND_TYPE(mat2, dl_bfloat16);
-  CHECK_DIM(2, mat1);
-  CHECK_DIM(2, mat2);
-  CHECK_DIM(2, out);
-
-  int64_t m = mat1.size(0);
-  int64_t k = mat1.size(1);
-  int64_t n = mat2.size(0);
-
-  TVM_FFI_ICHECK_EQ(mat2.size(1), k)
-      << "mat2 K dimension mismatch: expected " << k << ", got " << mat2.size(1);
-  TVM_FFI_ICHECK_EQ(out.size(0), m) << "out M dimension mismatch";
-  TVM_FFI_ICHECK_EQ(out.size(1), n) << "out N dimension mismatch";
-
-  auto lt_handle = reinterpret_cast<cublasLtHandle_t>(cublas_handle);
-  ffi::CUDADeviceGuard device_guard(mat1.device().device_id);
-  auto stream = get_stream(mat1.device());
-  cudaDataType_t d_type = get_d_type(out.dtype());
-
-  auto status = flashinfer::mm_bf16_cublaslt::run(
-      static_cast<__nv_bfloat16*>(mat1.data_ptr()), static_cast<__nv_bfloat16*>(mat2.data_ptr()),
-      out.data_ptr(), static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), d_type,
-      workspace_buffer.data_ptr(), workspace_buffer.numel() * get_element_size(workspace_buffer),
-      lt_handle, stream, static_cast<int>(tactic));
-  TVM_FFI_ICHECK(status == CUBLAS_STATUS_SUCCESS)
-      << "mm_bf16_cublaslt failed: " << cublasGetStatusString(status);
-}
-
 // Serialize all heuristic algorithms into a CPU uint8 tensor for caching.
 // algo_buffer: CPU uint8 tensor of size >= kMaxAlgorithms * kAlgoBytes.
 // Returns number of algorithms written.
@@ -153,6 +116,5 @@ void mm_bf16_cublaslt_run_with_algo(TensorView mat1, TensorView mat2, TensorView
       << "mm_bf16_cublaslt_run_with_algo failed: " << cublasGetStatusString(status);
 }
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(mm_bf16_cublaslt, mm_bf16_cublaslt);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(mm_bf16_cublaslt_get_algos, mm_bf16_cublaslt_get_algos);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(mm_bf16_cublaslt_run_with_algo, mm_bf16_cublaslt_run_with_algo);

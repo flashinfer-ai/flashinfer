@@ -55,8 +55,6 @@ def test_mm_bf16(
         pytest.skip(
             "mm_bf16 with cuBLASLt backend does not support bias or pdl arguments."
         )
-    if backend == "cublaslt" and res_dtype == torch.float16:
-        pytest.skip("mm_bf16 with cuBLASLt backend does not support float16 output.")
     if res_dtype != torch.bfloat16 and backend == "tgv":
         pytest.skip(
             "mm_bf16 with TGV backend does not support specifying non-bfloat16 result dtypes."
