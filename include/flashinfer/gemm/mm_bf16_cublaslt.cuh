@@ -20,6 +20,7 @@
 #include <cuda_bf16.h>
 
 #include <array>
+#include <cstring>
 
 #include "bmm_fp8.cuh"
 
@@ -31,6 +32,8 @@ using bmm_fp8::CuBlasLtMatmulPreference;
 using bmm_fp8::CuBlasLtMatrixLayout;
 
 static constexpr int kMaxAlgorithms = 100;
+// cublasLtMatmulAlgo_t is { uint64_t data[8]; } — 64 bytes, trivially serializable per NVIDIA docs
+static constexpr size_t kAlgoBytes = sizeof(cublasLtMatmulAlgo_t);
 
 /*!
  * \brief Set up cuBLASLt descriptors for BF16 GEMM in row-major convention.
@@ -84,6 +87,64 @@ inline int get_algorithm_count(int m, int n, int k, cudaDataType_t d_type,
     return 0;
   }
   return returned_count;
+}
+
+/*!
+ * \brief Query heuristics once and serialize all cublasLtMatmulAlgo_t structs into a buffer.
+ *
+ * Each algo occupies kAlgoBytes (64) contiguous bytes.  The buffer can be cached
+ * and later passed to run_with_algo() to skip the heuristic lookup entirely.
+ *
+ * \param algo_buf  Output buffer, must hold at least max_algos * kAlgoBytes bytes.
+ * \param max_algos Maximum number of algorithms to retrieve.
+ * \return Number of algorithms written to algo_buf.
+ */
+inline int get_algorithms(int m, int n, int k, cudaDataType_t d_type,
+                          size_t workspace_size_in_bytes, cublasLtHandle_t lt_handle,
+                          void* algo_buf, int max_algos) {
+  GemmDescriptors desc(m, n, k, d_type);
+
+  CuBlasLtMatmulPreference preference;
+  preference.setAttribute(CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, workspace_size_in_bytes);
+
+  int request_count = (max_algos > kMaxAlgorithms) ? kMaxAlgorithms : max_algos;
+  std::array<cublasLtMatmulHeuristicResult_t, kMaxAlgorithms> results;
+  int returned_count = 0;
+  cublasStatus_t status = cublasLtMatmulAlgoGetHeuristic(
+      lt_handle, desc.matmul_desc.descriptor(), desc.a_layout.descriptor(),
+      desc.b_layout.descriptor(), desc.d_layout.descriptor(), desc.d_layout.descriptor(),
+      preference.descriptor(), request_count, results.data(), &returned_count);
+  if (status != CUBLAS_STATUS_SUCCESS) return 0;
+
+  auto* out = static_cast<uint8_t*>(algo_buf);
+  for (int i = 0; i < returned_count; ++i) {
+    std::memcpy(out + i * kAlgoBytes, &results[i].algo, kAlgoBytes);
+  }
+  return returned_count;
+}
+
+/*!
+ * \brief Run a BF16 GEMM using a pre-resolved algorithm — zero heuristic overhead.
+ *
+ * \param algo_buf  Buffer of serialized cublasLtMatmulAlgo_t structs (from get_algorithms).
+ * \param algo_idx  Index into algo_buf selecting which algorithm to use.
+ */
+inline cublasStatus_t run_with_algo(const __nv_bfloat16* mat1, const __nv_bfloat16* mat2, void* out,
+                                    int m, int n, int k, cudaDataType_t d_type, void* workspace,
+                                    size_t workspace_size_in_bytes, cublasLtHandle_t lt_handle,
+                                    cudaStream_t stream, const void* algo_buf, int algo_idx) {
+  GemmDescriptors desc(m, n, k, d_type);
+
+  cublasLtMatmulAlgo_t algo;
+  std::memcpy(&algo, static_cast<const uint8_t*>(algo_buf) + algo_idx * kAlgoBytes, kAlgoBytes);
+
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  FLASHINFER_CUBLAS_CALL(cublasLtMatmul(
+      lt_handle, desc.matmul_desc.descriptor(), &alpha, mat2, desc.a_layout.descriptor(), mat1,
+      desc.b_layout.descriptor(), &beta, nullptr, desc.d_layout.descriptor(), out,
+      desc.d_layout.descriptor(), &algo, workspace, workspace_size_in_bytes, stream));
+  return CUBLAS_STATUS_SUCCESS;
 }
 
 /*!

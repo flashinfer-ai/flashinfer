@@ -916,23 +916,41 @@ def get_gemm_sm100_module_cutlass_bf16():
 def get_mm_bf16_cublaslt_module():
     module = gen_mm_bf16_cublaslt_module().build_and_load()
 
+    _ALGO_BYTES = 64  # sizeof(cublasLtMatmulAlgo_t) = uint64_t[8]
+    _MAX_ALGOS = 100
+
     def cublaslt_bf16_gemm_runner():
         class CublasltBf16GemmRunner(TunableRunner):
-            def get_valid_tactics(
-                self,
-                inputs: List[torch.Tensor],
-                profile: OptimizationProfile,
-            ) -> List[int]:
+            def __init__(self):
+                self._algo_cache: dict = {}
+
+            def _get_algos(self, inputs):
                 a, b, _, _, out, workspace_buffer = inputs
+                key = (a.shape[0], b.shape[0], a.shape[1], out.dtype)
+                cached = self._algo_cache.get(key)
+                if cached is not None:
+                    return cached
+                algo_buf = torch.empty(_MAX_ALGOS * _ALGO_BYTES, dtype=torch.uint8)
                 cublas_handle = torch.cuda.current_blas_handle()
-                num_tactics = module.mm_bf16_cublaslt_tactic_num(
+                count = module.mm_bf16_cublaslt_get_algos(
                     a,
                     b.transpose(-2, -1),
                     out,
                     workspace_buffer,
                     cublas_handle,
+                    algo_buf,
                 )
-                return list(range(num_tactics))
+                result = (algo_buf, count)
+                self._algo_cache[key] = result
+                return result
+
+            def get_valid_tactics(
+                self,
+                inputs: List[torch.Tensor],
+                profile: OptimizationProfile,
+            ) -> List[int]:
+                _, count = self._get_algos(inputs)
+                return list(range(count))
 
             def forward(
                 self,
@@ -945,23 +963,27 @@ def get_mm_bf16_cublaslt_module():
                 cublas_handle = torch.cuda.current_blas_handle()
                 b_t = b.transpose(-2, -1)
                 if tactic >= 0:
-                    num_available = module.mm_bf16_cublaslt_tactic_num(
+                    algo_buf, count = self._get_algos(inputs)
+                    if tactic >= count:
+                        tactic = 0
+                    module.mm_bf16_cublaslt_run_with_algo(
                         a,
                         b_t,
                         out,
                         workspace_buffer,
                         cublas_handle,
+                        algo_buf,
+                        tactic,
                     )
-                    if tactic >= num_available:
-                        tactic = 0
-                module.mm_bf16_cublaslt(
-                    a,
-                    b_t,
-                    out,
-                    workspace_buffer,
-                    cublas_handle,
-                    tactic,
-                )
+                else:
+                    module.mm_bf16_cublaslt(
+                        a,
+                        b_t,
+                        out,
+                        workspace_buffer,
+                        cublas_handle,
+                        tactic,
+                    )
                 return out
 
         return CublasltBf16GemmRunner()

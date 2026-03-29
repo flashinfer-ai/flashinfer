@@ -90,5 +90,64 @@ int64_t mm_bf16_cublaslt_tactic_num(TensorView mat1, TensorView mat2, TensorView
       workspace_buffer.numel() * get_element_size(workspace_buffer), lt_handle));
 }
 
+// Serialize all heuristic algorithms into a CPU uint8 tensor for caching.
+// algo_buffer: CPU uint8 tensor of size >= kMaxAlgorithms * kAlgoBytes.
+// Returns number of algorithms written.
+int64_t mm_bf16_cublaslt_get_algos(TensorView mat1, TensorView mat2, TensorView out,
+                                   TensorView workspace_buffer, int64_t cublas_handle,
+                                   TensorView algo_buffer) {
+  int64_t m = mat1.size(0);
+  int64_t k = mat1.size(1);
+  int64_t n = mat2.size(0);
+  cudaDataType_t d_type = get_d_type(out.dtype());
+
+  ffi::CUDADeviceGuard device_guard(mat1.device().device_id);
+  auto lt_handle = reinterpret_cast<cublasLtHandle_t>(cublas_handle);
+  int max_algos = static_cast<int>(algo_buffer.numel() * get_element_size(algo_buffer) /
+                                   flashinfer::mm_bf16_cublaslt::kAlgoBytes);
+  return static_cast<int64_t>(flashinfer::mm_bf16_cublaslt::get_algorithms(
+      static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), d_type,
+      workspace_buffer.numel() * get_element_size(workspace_buffer), lt_handle,
+      algo_buffer.data_ptr(), max_algos));
+}
+
+// Run matmul using a pre-cached algorithm — zero heuristic overhead.
+void mm_bf16_cublaslt_run_with_algo(TensorView mat1, TensorView mat2, TensorView out,
+                                    TensorView workspace_buffer, int64_t cublas_handle,
+                                    TensorView algo_buffer, int64_t algo_idx) {
+  CHECK_CUDA(mat1);
+  CHECK_CUDA(mat2);
+  CHECK_CUDA(out);
+  CHECK_INPUT_AND_TYPE(mat1, dl_bfloat16);
+  CHECK_INPUT_AND_TYPE(mat2, dl_bfloat16);
+  CHECK_DIM(2, mat1);
+  CHECK_DIM(2, mat2);
+  CHECK_DIM(2, out);
+
+  int64_t m = mat1.size(0);
+  int64_t k = mat1.size(1);
+  int64_t n = mat2.size(0);
+
+  TVM_FFI_ICHECK_EQ(mat2.size(1), k)
+      << "mat2 K dimension mismatch: expected " << k << ", got " << mat2.size(1);
+  TVM_FFI_ICHECK_EQ(out.size(0), m) << "out M dimension mismatch";
+  TVM_FFI_ICHECK_EQ(out.size(1), n) << "out N dimension mismatch";
+
+  auto lt_handle = reinterpret_cast<cublasLtHandle_t>(cublas_handle);
+  ffi::CUDADeviceGuard device_guard(mat1.device().device_id);
+  auto stream = get_stream(mat1.device());
+  cudaDataType_t d_type = get_d_type(out.dtype());
+
+  auto status = flashinfer::mm_bf16_cublaslt::run_with_algo(
+      static_cast<__nv_bfloat16*>(mat1.data_ptr()), static_cast<__nv_bfloat16*>(mat2.data_ptr()),
+      out.data_ptr(), static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), d_type,
+      workspace_buffer.data_ptr(), workspace_buffer.numel() * get_element_size(workspace_buffer),
+      lt_handle, stream, algo_buffer.data_ptr(), static_cast<int>(algo_idx));
+  TVM_FFI_ICHECK(status == CUBLAS_STATUS_SUCCESS)
+      << "mm_bf16_cublaslt_run_with_algo failed: " << cublasGetStatusString(status);
+}
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(mm_bf16_cublaslt, mm_bf16_cublaslt);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(mm_bf16_cublaslt_tactic_num, mm_bf16_cublaslt_tactic_num);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(mm_bf16_cublaslt_get_algos, mm_bf16_cublaslt_get_algos);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(mm_bf16_cublaslt_run_with_algo, mm_bf16_cublaslt_run_with_algo);
