@@ -26,7 +26,7 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-import argparse
+
 import math
 from typing import Type, Tuple, Optional
 from types import SimpleNamespace
@@ -166,6 +166,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         is_persistent: bool,
         is_var_seq: bool,
         is_var_split_kv: bool,
+        enable_pdl: bool,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -189,6 +190,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :type is_var_seq: bool
         :param is_var_split_kv: Whether to use variable split KV
         :type is_var_split_kv: bool
+        :param enable_pdl: Whether to use PDL
+        :type enable_pdl: bool
         """
 
         self.latent_dim = 512
@@ -203,6 +206,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.page_size = page_size
         self.is_var_seq = is_var_seq
         self.is_var_split_kv = is_var_split_kv
+        self.enable_pdl = enable_pdl
         self.cluster_shape_mnk = (2, 1, 1)
         self.use_2cta_instrs = True
         # When using 2 CTAs with m=128: warps 0-1 handle accumulation for first half [0, n/2),
@@ -771,6 +775,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             smem=SplitKVKernelSharedStorage.size_in_bytes(),  # type: ignore[attr-defined]
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=self.enable_pdl,
         )
         if cutlass.const_expr(acc_o is not None):
             self.reduction_kernel(
@@ -787,6 +792,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 smem=MAX_SPLITS * self.acc_dtype.width // 8,
                 stream=stream,
                 min_blocks_per_mp=1,
+                use_pdl=self.enable_pdl,
             )
 
     @cute.jit
@@ -1050,6 +1056,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         #
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mnk)
 
+        if cutlass.const_expr(self.enable_pdl):
+            cute.arch.griddepcontrol_wait()
+
         # ///////////////////////////////////////////////////////////////////////////////
         #  Load warps, including page table and data tensors
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1251,6 +1260,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
             tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)
+            if cutlass.const_expr(self.enable_pdl):
+                cute.arch.griddepcontrol_launch_dependents()
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Compute warp
@@ -1428,6 +1439,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         lse_scale_ptr = cute.recast_ptr(storage, dtype=self.acc_dtype)
         smem_lse_scale = cute.make_tensor(lse_scale_ptr, cute.make_layout(MAX_SPLITS))
 
+        if cutlass.const_expr(self.enable_pdl):
+            cute.arch.griddepcontrol_wait()
         gLSE = mAccLSE[blk_coord[0], None, blk_coord[1], blk_coord[2]]
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         if warp_idx == 0:
@@ -1490,6 +1503,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         for j in cutlass.range_constexpr(elements_per_thread):
             element_idx = tidx + j * self.threads_per_warp * self.num_compute_warps
             mO[blk_coord[0], element_idx, blk_coord[1], blk_coord[2]] = rO[j]
+        if cutlass.const_expr(self.enable_pdl):
+            cute.arch.griddepcontrol_launch_dependents()
         return
 
     @staticmethod
@@ -3535,6 +3550,7 @@ def run(
     iterations: int,
     skip_ref_check: bool,
     use_cold_l2: bool,
+    enable_pdl: bool = False,
     **kwargs,
 ):
     """Execute Multi-Head Latent Attention (MLA) on Blackwell architecture and validate results.
@@ -3914,6 +3930,7 @@ def run(
         is_persistent,
         is_var_seq,
         is_var_split_kv,
+        enable_pdl,
     )
 
     # Get current CUDA stream from PyTorch
@@ -4202,220 +4219,3 @@ def run(
     )
 
     return avg_time_us  # Return execution time in microseconds
-
-
-if __name__ == "__main__":
-
-    def parse_comma_separated_ints(s: str) -> Tuple[int, ...]:
-        try:
-            return tuple(int(x.strip()) for x in s.split(","))
-        except ValueError:
-            raise argparse.ArgumentTypeError(  # noqa: B904
-                "Invalid format. Expected comma-separated integers."
-            )
-
-    def parse_mma_tiler(s: str) -> Tuple[int, int, Tuple[int, int]]:
-        ret = parse_comma_separated_ints(s)
-        if len(ret) != 2:
-            raise argparse.ArgumentTypeError(
-                "Invalid format. Expected 2 comma-separated integers."
-            )
-        return (ret[0], ret[1])  # type: ignore[return-value]
-
-    parser = argparse.ArgumentParser(description="Example of MLA on Blackwell.")
-
-    parser.add_argument(
-        "--in_dtype",
-        type=cutlass.dtype,
-        default=cutlass.Float8E4M3FN,
-        help="Input data type",
-    )
-
-    parser.add_argument(
-        "--out_dtype",
-        type=cutlass.dtype,
-        default=cutlass.Float8E4M3FN,
-        help="Output data type",
-    )
-
-    parser.add_argument(
-        "--acc_dtype",
-        type=cutlass.dtype,
-        default=cutlass.Float32,
-        help="Accumulator data type",
-    )
-
-    parser.add_argument(
-        "--lse_dtype",
-        type=cutlass.dtype,
-        default=cutlass.Float32,
-        help="LSE data type",
-    )
-    parser.add_argument(
-        "--mma_qk_tiler_mn",
-        type=parse_mma_tiler,
-        default=(128, 128),
-        help="MMA tile shape (H, K)",
-    )
-    parser.add_argument(
-        "--mma_pv_tiler_mn",
-        type=parse_mma_tiler,
-        default=(128, 256),
-        help="MMA tile shape (H, D)",
-    )
-
-    parser.add_argument(
-        "--is_persistent",
-        action="store_true",
-        help="Is persistent",
-    )
-
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=1,
-        help="Batch size",
-    )
-
-    parser.add_argument(
-        "--seq_len_q",
-        type=int,
-        default=1,
-        help="Sequence length of Q",
-    )
-
-    parser.add_argument(
-        "--seq_len_k",
-        type=int,
-        default=128,
-        help="Sequence length of K/V",
-    )
-
-    parser.add_argument(
-        "--num_heads",
-        type=int,
-        default=128,
-        help="Number of heads of Q",
-    )
-
-    parser.add_argument(
-        "--latent_dim",
-        type=int,
-        default=512,
-        help="Latent dimension of Q/C",
-    )
-
-    parser.add_argument(
-        "--rope_dim",
-        type=int,
-        default=64,
-        help="Rope dimension of Q/C",
-    )
-
-    parser.add_argument(
-        "--is_var_seq",
-        action="store_true",
-        help="Use variable length of sequence length or not",
-    )
-
-    parser.add_argument(
-        "--is_var_split_kv",
-        action="store_true",
-        help="Use variable length of split kv or not",
-    )
-
-    parser.add_argument(
-        "--page_size",
-        type=int,
-        default=128,
-        help="Page size of page table",
-    )
-
-    parser.add_argument(
-        "--split_kv",
-        type=int,
-        default=-1,
-        help="Split KV setting",
-    )
-
-    parser.add_argument(
-        "--softmax_scale",
-        type=float,
-        default=0.0416,
-        help="Scaling factor to scale softmax",
-    )
-
-    parser.add_argument(
-        "--output_scale",
-        type=float,
-        default=1.0,
-        help="Scaling factor to scale output",
-    )
-    parser.add_argument(
-        "--skip_correction_threshold",
-        type=float,
-        default=0.0,
-        help="Threshold to skip correction",
-    )
-
-    parser.add_argument(
-        "--tolerance", type=float, default=1e-02, help="Tolerance for validation"
-    )
-
-    parser.add_argument(
-        "--warmup_iterations",
-        type=int,
-        default=0,
-        help="Number of iterations for warmup",
-    )
-
-    parser.add_argument(
-        "--iterations",
-        type=int,
-        default=1,
-        help="Number of iterations after warmup",
-    )
-
-    parser.add_argument(
-        "--skip_ref_check",
-        action="store_true",
-        help="Skip reference check",
-    )
-
-    parser.add_argument(
-        "--use_cold_l2",
-        action="store_true",
-        help="Use cold L2 cache",
-    )
-
-    args = parser.parse_args()
-
-    run(
-        args.batch_size,
-        args.seq_len_q,
-        args.seq_len_k,
-        args.num_heads,
-        args.latent_dim,
-        args.rope_dim,
-        args.in_dtype,
-        args.out_dtype,
-        args.acc_dtype,
-        args.lse_dtype,
-        args.mma_qk_tiler_mn,
-        args.mma_pv_tiler_mn,
-        args.split_kv,
-        args.is_persistent,
-        args.is_var_seq,
-        args.is_var_split_kv,
-        args.page_size,
-        args.softmax_scale,
-        args.output_scale,
-        args.skip_correction_threshold,
-        args.tolerance,
-        args.warmup_iterations,
-        args.iterations,
-        args.skip_ref_check,
-        args.use_cold_l2,
-    )
-
-    print("PASS")

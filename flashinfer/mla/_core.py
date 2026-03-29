@@ -798,6 +798,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
 
         return out
     elif backend == "cute-dsl":
+        enable_pdl = (
+            device_support_pdl(query.device) if enable_pdl is None else enable_pdl
+        )
         cc = get_compute_capability(query.device)
         if cc[0] < 10:
             raise RuntimeError(
@@ -823,10 +826,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
             raise ValueError(
                 "cute-dsl backend (MLA decode kernel) does not support sparse_mla_top_k"
             )
-        if enable_pdl is not None:
-            raise ValueError(
-                "cute-dsl backend (MLA decode kernel) does not support enable_pdl"
-            )
         if skip_softmax_threshold_scale_factor is not None:
             raise ValueError(
                 "cute-dsl backend (MLA decode kernel) does not support skip_softmax_threshold_scale_factor"
@@ -850,6 +849,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
             output_scale=bmm2_scale,
             out=out,
             is_var_seq=is_var_seq,
+            enable_pdl=enable_pdl,
         )
     else:
         raise ValueError(f"Backend {backend} not supported")
