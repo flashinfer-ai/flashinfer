@@ -1974,6 +1974,11 @@ def build_cudnn_gemm_fp4_graph_override_shape(
 
     Caching key contains ``(batch, n, k, ...)`` but **not** M.
     """
+
+    # TODO: enable alpha for dynamic-shape once cudnn suppport it
+    if alpha_is_not_none:
+        raise ValueError("Alpha is not supported for dynamic-shape")
+
     _check_cudnn_override_shape_availability()
     if policy is None:
         policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
@@ -2098,6 +2103,10 @@ def execute_cudnn_gemm_fp4_graph_override_shape(
     tactic: int = 0,
 ):
     """Execute FP4 GEMM cuDNN graph with dynamic-shape overrides."""
+
+    # TODO: enable alpha for dynamic-shape once cudnn suppport it
+    if alpha is not None:
+        raise ValueError("Alpha is not supported for dynamic-shape")
 
     real_a_shape, real_a_stride = _get_real_fp4_shape_from_packed_uint8(a)
     real_b_shape, real_b_stride = _get_real_fp4_shape_from_packed_uint8(b)
@@ -4111,7 +4120,9 @@ def _cudnn_gemm_fp4_runner():
                 workspace_buffer,
             ) = inputs
 
-            if is_cudnn_override_shape_available():
+            # currently cudnn backend does not support alpha for dynamic-shape
+            # remove this restriction once cudnn suppport it
+            if is_cudnn_override_shape_available() and alpha is None:
                 graph = self._get_override_graph(
                     a, b, alpha, out_dtype, block_size, use_nvfp4
                 )
@@ -4169,7 +4180,9 @@ def _cudnn_gemm_fp4_runner():
                 workspace_buffer,
             ) = inputs
 
-            if is_cudnn_override_shape_available():
+            # currently cudnn backend does not support alpha for dynamic-shape
+            # remove this restriction once cudnn suppport it
+            if is_cudnn_override_shape_available() and alpha is None:
                 graph = self._get_override_graph(
                     a, b, alpha, out_dtype, block_size, use_nvfp4
                 )
