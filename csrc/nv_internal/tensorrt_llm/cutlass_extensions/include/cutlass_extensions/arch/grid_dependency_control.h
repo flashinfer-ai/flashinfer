@@ -34,21 +34,19 @@
 #endif
 
 #ifndef CUTLASS_GDC_ENABLED
-#if(CUDA_BARRIER_ENABLED && \
-    defined(CUTLASS_ENABLE_GDC_FOR_SM100) && \
-    defined(__CUDA_ARCH__) && \
-    ((__CUDA_ARCH__ == 1000 && \
-        (defined(__CUDA_ARCH_FEAT_SM100_ALL) || CUDA_ARCH_FAMILY(1000))) || \
-     (__CUDA_ARCH__ == 1010 && \
-        (defined(__CUDA_ARCH_FEAT_SM101_ALL) || CUDA_ARCH_FAMILY(1010))) || \
-     (__CUDA_ARCH__ == 1100 && \
-        (defined(__CUDA_ARCH_FEAT_SM110_ALL) || CUDA_ARCH_FAMILY(1100))) || \
-     (__CUDA_ARCH__ == 1030 && \
-        (defined(__CUDA_ARCH_FEAT_SM103_ALL) || CUDA_ARCH_FAMILY(1030))) || \
-     (__CUDA_ARCH__ == 1200 && \
-        (defined(__CUDA_ARCH_FEAT_SM120_ALL) || CUDA_ARCH_FAMILY(1200))) || \
-     (__CUDA_ARCH__ == 1210 && \
-        (defined(__CUDA_ARCH_FEAT_SM121_ALL) || CUDA_ARCH_CONDITIONAL_OR_FAMILY(1210)))))
+#if (CUDA_BARRIER_ENABLED && defined(CUTLASS_ENABLE_GDC_FOR_SM100) && defined(__CUDA_ARCH__) && \
+     ((__CUDA_ARCH__ == 1000 &&                                                                 \
+       (defined(__CUDA_ARCH_FEAT_SM100_ALL) || CUDA_ARCH_FAMILY(1000))) ||                      \
+      (__CUDA_ARCH__ == 1010 &&                                                                 \
+       (defined(__CUDA_ARCH_FEAT_SM101_ALL) || CUDA_ARCH_FAMILY(1010))) ||                      \
+      (__CUDA_ARCH__ == 1100 &&                                                                 \
+       (defined(__CUDA_ARCH_FEAT_SM110_ALL) || CUDA_ARCH_FAMILY(1100))) ||                      \
+      (__CUDA_ARCH__ == 1030 &&                                                                 \
+       (defined(__CUDA_ARCH_FEAT_SM103_ALL) || CUDA_ARCH_FAMILY(1030))) ||                      \
+      (__CUDA_ARCH__ == 1200 &&                                                                 \
+       (defined(__CUDA_ARCH_FEAT_SM120_ALL) || CUDA_ARCH_FAMILY(1200))) ||                      \
+      (__CUDA_ARCH__ == 1210 &&                                                                 \
+       (defined(__CUDA_ARCH_FEAT_SM121_ALL) || CUDA_ARCH_CONDITIONAL_OR_FAMILY(1210)))))
 #define CUTLASS_GDC_ENABLED
 #endif
 #endif
