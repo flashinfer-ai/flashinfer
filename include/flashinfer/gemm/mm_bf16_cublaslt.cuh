@@ -32,8 +32,7 @@ using bmm_fp8::CuBlasLtMatmulPreference;
 using bmm_fp8::CuBlasLtMatrixLayout;
 
 static constexpr int kMaxAlgorithms = 100;
-// cublasLtMatmulAlgo_t is { uint64_t data[8]; } — 64 bytes, trivially serializable per NVIDIA docs
-static constexpr size_t kAlgoBytes = sizeof(cublasLtMatmulAlgo_t);
+using bmm_fp8::kAlgoBytes;
 
 /*!
  * \brief Set up cuBLASLt descriptors for BF16 GEMM in row-major convention.

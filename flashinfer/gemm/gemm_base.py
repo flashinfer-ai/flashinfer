@@ -90,6 +90,11 @@ from ..utils import (
 
 DEFAULT_WORKSPACE_SIZE = 32 * 1024 * 1024
 
+# sizeof(cublasLtMatmulAlgo_t) = uint64_t[8] = 64 bytes.
+# Shared by cuBLAS FP8, cuBLASLt BF16, and any other cuBLASLt-based runners.
+_CUBLASLT_ALGO_BYTES = 64
+_CUBLASLT_MAX_ALGOS = 100
+
 # Error messages
 CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR = "cudnn FP4 GEMM with mxfp4 quantization is not supported on SM120/SM121 with cuDNN backend version < 9.14.0."
 
@@ -109,9 +114,6 @@ def _match_sm_version(device: torch.device, sm_version: list[str]):
 def get_gemm_module():
     module = gen_gemm_module().build_and_load()
 
-    _FP8_ALGO_BYTES = 64  # sizeof(cublasLtMatmulAlgo_t)
-    _FP8_MAX_ALGOS = 100
-
     def cublas_fp8_gemm_runner():
         class CublasFp8GemmRunner(TunableRunner):
             def __init__(self):
@@ -124,7 +126,9 @@ def get_gemm_module():
                 if cached is not None:
                     return cached
                 algo_buf = torch.empty(
-                    _FP8_MAX_ALGOS * _FP8_ALGO_BYTES, dtype=torch.uint8
+                    _CUBLASLT_MAX_ALGOS * _CUBLASLT_ALGO_BYTES,
+                    dtype=torch.uint8,
+                    device="cpu",
                 )
                 cublas_handle = torch.cuda.current_blas_handle()
                 count = module.bmm_fp8_get_algos(
@@ -378,6 +382,7 @@ def _heuristic_func_mm_bf16(
 ):
     heuristic_backends = []
     if bias is not None or pdl:
+        # cuDNN, CUTLASS, and cuBLASLt don't support bias/pdl, only TGV does
         if "tgv" in suitable_backends:
             heuristic_backends.append("tgv")
     else:
@@ -959,9 +964,6 @@ def get_gemm_sm100_module_cutlass_bf16():
 def get_mm_bf16_cublaslt_module():
     module = gen_mm_bf16_cublaslt_module().build_and_load()
 
-    _ALGO_BYTES = 64  # sizeof(cublasLtMatmulAlgo_t) = uint64_t[8]
-    _MAX_ALGOS = 100
-
     def cublaslt_bf16_gemm_runner():
         class CublasltBf16GemmRunner(TunableRunner):
             def __init__(self):
@@ -982,7 +984,11 @@ def get_mm_bf16_cublaslt_module():
                 cached = self._algo_cache.get(key)
                 if cached is not None:
                     return cached
-                algo_buf = torch.empty(_MAX_ALGOS * _ALGO_BYTES, dtype=torch.uint8)
+                algo_buf = torch.empty(
+                    _CUBLASLT_MAX_ALGOS * _CUBLASLT_ALGO_BYTES,
+                    dtype=torch.uint8,
+                    device="cpu",
+                )
                 cublas_handle = torch.cuda.current_blas_handle()
                 proxy_out = (
                     out

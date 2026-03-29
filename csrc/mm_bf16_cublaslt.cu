@@ -53,6 +53,7 @@ int64_t mm_bf16_cublaslt_get_algos(TensorView mat1, TensorView mat2, TensorView 
   CHECK_DIM(2, mat1);
   CHECK_DIM(2, mat2);
   CHECK_DIM(2, out);
+  CHECK_CONTIGUOUS(algo_buffer);
 
   int64_t m = mat1.size(0);
   int64_t k = mat1.size(1);
@@ -87,6 +88,7 @@ void mm_bf16_cublaslt_run_with_algo(TensorView mat1, TensorView mat2, TensorView
   CHECK_DIM(2, mat1);
   CHECK_DIM(2, mat2);
   CHECK_DIM(2, out);
+  CHECK_CONTIGUOUS(algo_buffer);
 
   int64_t m = mat1.size(0);
   int64_t k = mat1.size(1);

@@ -72,6 +72,7 @@ int64_t bmm_fp8_get_algos(TensorView A, TensorView B, TensorView D, TensorView A
   CHECK_DIM(3, A);
   CHECK_DIM(3, B);
   CHECK_DIM(3, D);
+  CHECK_CONTIGUOUS(algo_buffer);
   TVM_FFI_ICHECK(A.size(0) == B.size(0) && A.size(0) == D.size(0)) << "Batch sizes must match";
   TVM_FFI_ICHECK(A.size(2) == B.size(1)) << "Incompatible matrix sizes";
   TVM_FFI_ICHECK(A.size(1) == D.size(1) && B.size(2) == D.size(2))
@@ -112,6 +113,7 @@ void bmm_fp8_run_with_algo(TensorView A, TensorView B, TensorView D, TensorView 
   CHECK_DIM(3, A);
   CHECK_DIM(3, B);
   CHECK_DIM(3, D);
+  CHECK_CONTIGUOUS(algo_buffer);
   TVM_FFI_ICHECK(A.size(0) == B.size(0) && A.size(0) == D.size(0)) << "Batch sizes must match";
   TVM_FFI_ICHECK(A.size(2) == B.size(1)) << "Incompatible matrix sizes";
   TVM_FFI_ICHECK(A.size(1) == D.size(1) && B.size(2) == D.size(2))
