@@ -14,6 +14,7 @@ from flashinfer.utils import get_compute_capability
 @pytest.mark.parametrize("enable_bias", [True, False])
 @pytest.mark.parametrize("pdl", [True, False])
 @pytest.mark.parametrize("backend", ["cudnn", "cutlass", "tgv", "cublaslt"])
+@pytest.mark.parametrize("auto_tuning", [False, True])
 def test_mm_bf16(
     m: int,
     n: int,
@@ -22,6 +23,7 @@ def test_mm_bf16(
     enable_bias: bool,
     pdl: bool,
     backend: str,
+    auto_tuning: bool,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     compute_capability_number = compute_capability[0] * 10 + compute_capability[1]
@@ -74,7 +76,7 @@ def test_mm_bf16(
         reference = torch.mm(input, mat2.T)
 
     out = torch.empty([m, n], device="cuda", dtype=res_dtype)
-    with autotune():
+    with autotune(auto_tuning):
         mm_bf16(input, mat2.T, bias, pdl, out, res_dtype, backend)
 
     cos_sim = F.cosine_similarity(reference.reshape(-1), out.reshape(-1), dim=0)
