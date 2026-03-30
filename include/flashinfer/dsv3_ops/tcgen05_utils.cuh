@@ -42,10 +42,6 @@ __device__ inline void tma_2d_gmem2smem(int dst, const void* tmap_ptr, int x, in
 template <typename T>
 __device__ inline void tma_3d_gmem2smem(T* dst, const void* tmap_ptr, int x, int y, int z,
                                         uint64_t* mbar_addr) {
-  // when CTA_GROUP=1, we can use .shared::cta instead.
-  // but .shared::cluster doesn't seem to be slower, so always use it
-  // unconditionally here. .cta_group::2 allows mbar_addr and dst to be in
-  // different CTA's smem.
   asm volatile(
       "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_"
       "tx::bytes.cta_group::1 "

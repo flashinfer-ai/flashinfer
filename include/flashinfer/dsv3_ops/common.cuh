@@ -25,13 +25,11 @@ __device__ inline int ld_acquire(const int32_t* __restrict__ addr) {
   return res;
 }
 
-// topk kernel v2
 template <typename T>
 __host__ __device__ __forceinline__ T divup(T a, T b) {
   return (a + b - 1) / b;
 }
 
-// PTX functions
 __device__ __forceinline__ uint32_t getLaneId() {
   uint32_t laneId;
   asm("mov.u32 %0, %%laneid;" : "=r"(laneId));

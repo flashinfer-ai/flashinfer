@@ -68,12 +68,6 @@ def _make_dsa_test_data(batch_size: int, seq_len_range):
     return q, k_cache, weights, seq_lens, block_table
 
 
-# ---------------------------------------------------------------------------
-# Reference implementation (pure PyTorch)
-# Inlined from kernels_exp/indexer_ref.py
-# ---------------------------------------------------------------------------
-
-
 def _dequant_fp8_kv_cache(k_index_cache_fp8: torch.Tensor) -> torch.Tensor:
     """Dequantize FP8 KV cache [num_pages, 64, 1, 132] → [num_pages, 64, 128] float32."""
     k = k_index_cache_fp8.view(torch.uint8)
