@@ -337,15 +337,18 @@ __device__ __forceinline__ void update_state_async_horizontal(SramT& sram, int l
       dt_step += 1;
       out_step += DIM_PER_CTA;
 
+      // Compute encode scale once for all state writes this step
+      [[maybe_unused]] float encode_scale = 1.f;
+      if constexpr (scaleState) {
+        if (!IS_PAD) {
+          encode_scale = computeBlockScaleEncode<state_t, numTiles, pairsPerTileMember, lanesPerRow,
+                                                 elemsPerTile, elemsPerTileMember, DSTATE>(
+              rState, lane, member);
+        }
+      }
+
       // Write intermediate state
       if (istate_ptr && !IS_PAD) {
-        [[maybe_unused]] float istate_encode_scale = 1.f;
-        if constexpr (scaleState) {
-          istate_encode_scale =
-              computeBlockScaleEncode<state_t, numTiles, pairsPerTileMember, lanesPerRow,
-                                      elemsPerTile, elemsPerTileMember, DSTATE>(rState, lane,
-                                                                                member);
-        }
 #pragma unroll
         for (int t = 0; t < numTiles; t++) {
           int const col0 = baseCol(t, 0);
@@ -357,8 +360,8 @@ __device__ __forceinline__ void update_state_async_horizontal(SramT& sram, int l
             float s0 = rState[t][e / 2].x;
             float s1 = rState[t][e / 2].y;
             if constexpr (scaleState) {
-              s0 *= istate_encode_scale;
-              s1 *= istate_encode_scale;
+              s0 *= encode_scale;
+              s1 *= encode_scale;
             }
             convertAndStoreSRHorizontal<state_t, DSTATE, PHILOX_ROUNDS>(
                 rOut.val[e], rOut.val[e + 1], s0, s1, rand_seed, state_ptr_offset, dd, col0, e,
@@ -371,7 +374,7 @@ __device__ __forceinline__ void update_state_async_horizontal(SramT& sram, int l
           if (member == 0) {
             auto* __restrict__ iscales = reinterpret_cast<float*>(params.intermediate_state_scales);
             iscales[icache_idx * params.intermediate_state_scales_stride_batch +
-                    step * params.nheads * DIM + head * DIM + dd] = 1.f / istate_encode_scale;
+                    step * params.nheads * DIM + head * DIM + dd] = 1.f / encode_scale;
           }
         }
         istate_dd_ptr += istate_step_stride;
@@ -383,13 +386,6 @@ __device__ __forceinline__ void update_state_async_horizontal(SramT& sram, int l
             dst_state_batch_indices[seq_idx * params.dst_state_batch_indices_stride_batch +
                                     step * params.dst_state_batch_indices_stride_T]);
         if (dst_idx != params.pad_slot_id) {
-          [[maybe_unused]] float dst_encode_scale = 1.f;
-          if constexpr (scaleState) {
-            dst_encode_scale =
-                computeBlockScaleEncode<state_t, numTiles, pairsPerTileMember, lanesPerRow,
-                                        elemsPerTile, elemsPerTileMember, DSTATE>(rState, lane,
-                                                                                  member);
-          }
           auto const dst_base =
               dst_idx * params.state_stride_batch + head * DIM * DSTATE + dd * DSTATE;
 #pragma unroll
@@ -403,8 +399,8 @@ __device__ __forceinline__ void update_state_async_horizontal(SramT& sram, int l
               float s0 = rState[t][e / 2].x;
               float s1 = rState[t][e / 2].y;
               if constexpr (scaleState) {
-                s0 *= dst_encode_scale;
-                s1 *= dst_encode_scale;
+                s0 *= encode_scale;
+                s1 *= encode_scale;
               }
               convertAndStoreSRHorizontal<state_t, DSTATE, PHILOX_ROUNDS>(
                   rOut.val[e], rOut.val[e + 1], s0, s1, rand_seed, state_ptr_offset, dd, col0, e,
@@ -416,7 +412,7 @@ __device__ __forceinline__ void update_state_async_horizontal(SramT& sram, int l
           if constexpr (scaleState) {
             if (member == 0) {
               state_scale_ptr[dst_idx * params.state_scale_stride_batch + head * DIM + dd] =
-                  1.f / dst_encode_scale;
+                  1.f / encode_scale;
             }
           }
         }
@@ -424,13 +420,6 @@ __device__ __forceinline__ void update_state_async_horizontal(SramT& sram, int l
 
       // Write final state at last step (only when dst_state_batch_indices is not used)
       if (step == seq_len - 1 && params.update_state && !IS_PAD && !has_dst_indices) {
-        [[maybe_unused]] float final_encode_scale = 1.f;
-        if constexpr (scaleState) {
-          final_encode_scale =
-              computeBlockScaleEncode<state_t, numTiles, pairsPerTileMember, lanesPerRow,
-                                      elemsPerTile, elemsPerTileMember, DSTATE>(rState, lane,
-                                                                                member);
-        }
         auto const state_base =
             state_batch * params.state_stride_batch + head * DIM * DSTATE + dd * DSTATE;
 #pragma unroll
@@ -444,8 +433,8 @@ __device__ __forceinline__ void update_state_async_horizontal(SramT& sram, int l
             float s0 = rState[t][e / 2].x;
             float s1 = rState[t][e / 2].y;
             if constexpr (scaleState) {
-              s0 *= final_encode_scale;
-              s1 *= final_encode_scale;
+              s0 *= encode_scale;
+              s1 *= encode_scale;
             }
             convertAndStoreSRHorizontal<state_t, DSTATE, PHILOX_ROUNDS>(
                 rOut.val[e], rOut.val[e + 1], s0, s1, rand_seed, state_ptr_offset, dd, col0, e,
@@ -457,7 +446,7 @@ __device__ __forceinline__ void update_state_async_horizontal(SramT& sram, int l
         if constexpr (scaleState) {
           if (member == 0) {
             state_scale_ptr[state_batch * params.state_scale_stride_batch + head * DIM + dd] =
-                1.f / final_encode_scale;
+                1.f / encode_scale;
           }
         }
       }
