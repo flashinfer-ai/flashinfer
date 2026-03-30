@@ -100,7 +100,7 @@ def test_cublaslt_bf16_runner_zero_algos():
 
     m, n, k = 16, 1024, 1024
     a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
-    b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16).transpose(-2, -1)
     out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
     workspace = torch.empty(32 * 1024 * 1024, device="cuda", dtype=torch.uint8)
     inputs = [a, b, None, None, out, workspace]

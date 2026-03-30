@@ -980,7 +980,7 @@ def get_mm_bf16_cublaslt_module():
             def _get_algos(self, inputs):
                 a, b, _, _, out, workspace_buffer = inputs
                 compute_dt = self._compute_dtype(out.dtype)
-                key = (a.shape[0], b.shape[0], a.shape[1], compute_dt)
+                key = (a.shape[0], b.shape[1], a.shape[1], compute_dt)
                 cached = self._algo_cache.get(key)
                 if cached is not None:
                     return cached
