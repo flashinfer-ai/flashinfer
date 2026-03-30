@@ -2112,7 +2112,11 @@ def execute_cudnn_gemm_fp4_graph_override_shape(
 
     c_shape, c_stride = _get_bf16_3d_shape_stride(c_final)
 
-    assert real_a_stride[2] == 1 and real_b_stride[1] == 1, "a and b must be k-major"
+    if real_a_stride[2] != 1 or real_b_stride[1] != 1:
+        raise ValueError(
+            f"a and b must be k-major (contiguous along the K dimension), "
+            f"got a stride={tuple(real_a_stride)}, b stride={tuple(real_b_stride)}"
+        )
 
     variant_pack = {
         UIDs.A_UID.value: a,
