@@ -119,6 +119,10 @@ def get_gemm_module():
             def __init__(self):
                 self._algo_cache: dict = {}
 
+            def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+                a, b, _, _, out, _ = inputs
+                return (a.dtype, b.dtype, out.dtype)
+
             def _get_algos(self, inputs):
                 a, b, scale_a, scale_b, out, workspace_buffer = inputs
                 key = (a.shape, b.shape, a.dtype, b.dtype, out.dtype)
@@ -441,8 +445,9 @@ def mm_bf16(
         Whether to enable Programmatic Dependent Launch (PDL). Enabled for TGV backend. Defaults to ``False``.
 
     out: Optional[torch.Tensor]
-        Out tensor, shape (m, n), bf16, fp16, or fp32. Enabled for CUTLASS, cuDNN, and cuBLASLt
-        backends. Defaults to ``None``.
+        Out tensor, shape (m, n). Preallocated output is supported by all backends.
+        TGV requires ``torch.bfloat16``; CUTLASS, cuDNN, and cuBLASLt also support fp16/fp32.
+        Defaults to ``None``.
 
     out_dtype: torch.dtype
         Output dtype, bf16, fp16, or fp32. Enabled for CUTLASS, cuDNN, and cuBLASLt backends.
@@ -975,6 +980,10 @@ def get_mm_bf16_cublaslt_module():
         class CublasltBf16GemmRunner(TunableRunner):
             def __init__(self):
                 self._algo_cache: dict = {}
+
+            def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+                _, _, _, _, out, _ = inputs
+                return (self._compute_dtype(out.dtype),)
 
             @staticmethod
             def _compute_dtype(out_dtype):
@@ -2971,6 +2980,10 @@ def _cudnn_gemm_fp8(
 
 def _cudnn_gemm_fp8_runner():
     class CudnnFp8GemmRunner(TunableRunner):
+        def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+            a, b, _, _, out, _ = inputs
+            return (a.dtype, b.dtype, out.dtype)
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
@@ -7041,6 +7054,10 @@ def _cudnn_gemm_mxfp8(
 
 def _cudnn_gemm_mxfp8_runner():
     class CudnnMxfp8GemmRunner(TunableRunner):
+        def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+            a, b, _, _, out, _ = inputs
+            return (a.dtype, b.dtype, out.dtype)
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
