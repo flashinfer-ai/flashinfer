@@ -731,10 +731,15 @@ def fp4_quantize(
         is_sf_8x4_layout,
         enable_pdl,
     )
-    # Use input.shape[-2] (rows) as the fixed dimension so that the -1 infers
-    # the actual scale column count, which may be padded to a multiple of 4 by
-    # block_scale_interleave (e.g. hidden_size=2880: 90 cols padded to 92).
-    sf = sf.reshape((input.shape[-2], -1))
+    # Use the padded column count as the fixed dimension so that -1 infers the
+    # padded row count.  block_scale_interleave pads K/sf_vec_size up to the
+    # next multiple of 4 (e.g. hidden_size=2880: 90 cols -> 92) and pads M up
+    # to the next multiple of 128 (e.g. 48 rows -> 128).  Using input.shape[-1]
+    # for columns and input.shape[-2] for rows both fail when the other
+    # dimension has been padded, so we always compute the padded column count
+    # and let -1 absorb the padded row count.
+    sf_cols = round_up(input.shape[-1] // sf_vec_size, 4)
+    sf = sf.reshape((-1, sf_cols))
     if is_column_major:
         x_q = x_q.transpose(-2, -1)
         sf = sf.transpose(-2, -1)
