@@ -3486,6 +3486,53 @@ _SM100_DEFAULT_MMA_TILER_MN = (128, 128)
 _SM100_DEFAULT_CLUSTER_SHAPE_MN = (1, 1)
 
 
+def _rank_sm100_block_scaled_tactics(valid_tactics, m, n, real_k, device):
+    """Rank valid tactics by minimizing tile and wave quantization effects.
+
+    For each tactic (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch, ...),
+    we compute:
+      - Tile quantization efficiency: ratio of actual work to padded work
+        given the tile sizes.
+      - Wave quantization efficiency: ratio of ideal CTA occupancy to actual
+        CTA occupancy when mapped onto the available SMs.
+
+    The combined score is tile_efficiency * wave_efficiency. Higher is better.
+    Returns the tactic list sorted best-first.
+    """
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+
+    def _score(tactic):
+        mma_tiler_mn = tactic[0]
+        cluster_shape_mn = tactic[1]
+        swap_ab = tactic[2]
+
+        tile_m, tile_n = mma_tiler_mn
+        cluster_m, cluster_n = cluster_shape_mn
+
+        if swap_ab:
+            prob_m, prob_n = n, m
+        else:
+            prob_m, prob_n = m, n
+
+        # Tile quantization: how much of the tiled work is useful
+        padded_m = ((prob_m + tile_m - 1) // tile_m) * tile_m
+        padded_n = ((prob_n + tile_n - 1) // tile_n) * tile_n
+        tile_efficiency = (prob_m * prob_n) / (padded_m * padded_n)
+
+        # Wave quantization: how well CTAs fill the SMs
+        ctas_m = ((prob_m + tile_m - 1) // tile_m + cluster_m - 1) // cluster_m * cluster_m
+        ctas_n = ((prob_n + tile_n - 1) // tile_n + cluster_n - 1) // cluster_n * cluster_n
+        total_ctas = ctas_m * ctas_n
+        if total_ctas == 0:
+            return 0.0
+        num_waves = (total_ctas + sm_count - 1) // sm_count
+        wave_efficiency = total_ctas / (num_waves * sm_count)
+
+        return tile_efficiency * wave_efficiency
+
+    return sorted(valid_tactics, key=_score, reverse=True)
+
+
 def _get_approximate_cta_nums(m, n, tile_mn, cluster_shape_mn):
     tile_m, tile_n = tile_mn
     cluster_m, cluster_n = cluster_shape_mn
@@ -4559,14 +4606,23 @@ def _cute_dsl_gemm_fp4_runner(
             batch_size = 1
 
             if tactic is None or tactic == -1:
-                tactic = (
-                    _SM100_DEFAULT_MMA_TILER_MN,
-                    _SM100_DEFAULT_CLUSTER_SHAPE_MN,
-                    False,
-                    False,
-                    "sm100",
-                    None,
-                )
+                # Use heuristic to pick the best tactic based on
+                # tile and wave quantization efficiency.
+                valid = self.get_valid_tactics(inputs, None)
+                if valid:
+                    ranked = _rank_sm100_block_scaled_tactics(
+                        valid, m, n, real_k, a.device
+                    )
+                    tactic = ranked[0]
+                else:
+                    tactic = (
+                        _SM100_DEFAULT_MMA_TILER_MN,
+                        _SM100_DEFAULT_CLUSTER_SHAPE_MN,
+                        False,
+                        False,
+                        "sm100",
+                        None,
+                    )
 
             (
                 mma_tiler_mn,
