@@ -898,10 +898,7 @@ def bench_gpu_time_with_cuda_event(
     torch.cuda.synchronize()
 
     # Determine how many iterations can run back-to-back before GPU power
-    # throttling degrades clock frequency. Sustained full-utilization compute
-    # causes throttling after ~5ms on modern GPUs (e.g. B200), leading to
-    # artificially lower benchmark numbers. Insert sync+sleep cooldown gaps
-    # to let clocks recover.
+    # throttling degrades clock frequency.
     max_sustained_ms = GPU_POWER_THROTTLE_THRESHOLD_MS
     iters_per_burst = max(1, int(max_sustained_ms / estimated_kernel_execution_time))
 
@@ -1597,7 +1594,7 @@ def bench_gpu_time(
        time via hardware profiling. Requires cupti-python >= 13.
     2. **CUDA Graphs** (``use_cuda_graph=True``): Amortizes launch overhead by
        capturing and replaying multiple kernel calls. Good balance of accuracy
-       and availability.
+       and availability. Can be used with CUPTI if the function launches multiple kernels.
     3. **CUDA Events** (default): Simplest method, measures launch + execution.
        Available everywhere but includes CPU overhead.
 
