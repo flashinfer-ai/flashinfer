@@ -1524,7 +1524,7 @@ def get_trtllm_moe_sm100_module():
         gemm1_weights_scale: torch.Tensor,
         gemm2_weights: torch.Tensor,
         gemm2_weights_scale: torch.Tensor,
-        output: torch.Tensor,
+        output: Optional[torch.Tensor],
         num_experts: int,
         top_k: int,
         n_group: Optional[int],
@@ -1562,10 +1562,22 @@ def get_trtllm_moe_sm100_module():
         num_tokens = hidden_states.shape[0]
         hidden_size = hidden_states.shape[-1]
 
-        # Create workspace buffers
-        output = torch.empty(
-            num_tokens, hidden_size, dtype=torch.bfloat16, device=hidden_states.device
-        )
+        if output is None:
+            output = torch.empty(
+                num_tokens,
+                hidden_size,
+                dtype=torch.bfloat16,
+                device=hidden_states.device,
+            )
+        else:
+            check_shape_dtype_device(
+                output,
+                (num_tokens, hidden_size),
+                torch.bfloat16,
+                hidden_states.device,
+                "output",
+            )
+
         if routing_logits is not None:
             # When routing_logits is provided, we must pass topk_ids/expert_weights with no allocation
             topk_ids = torch.empty(0, dtype=torch.int32, device=hidden_states.device)
