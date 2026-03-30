@@ -164,6 +164,11 @@ def get_gemm_module():
                 a, b, scale_a, scale_b, out, workspace_buffer = inputs
                 if tactic >= 0:
                     algo_buf, count = self._get_algos(inputs)
+                    if count == 0:
+                        raise RuntimeError(
+                            "cuBLASLt heuristic returned zero FP8 algorithms for "
+                            f"A={tuple(a.shape)}, B={tuple(b.shape)}, out={tuple(out.shape)}."
+                        )
                     if tactic >= count:
                         tactic = 0
                     module.bmm_fp8_run_with_algo(
@@ -1036,7 +1041,7 @@ def get_mm_bf16_cublaslt_module():
                 if count == 0:
                     raise RuntimeError(
                         "cuBLASLt heuristic returned zero algorithms for "
-                        f"M={a.shape[0]}, N={b.shape[0]}, K={a.shape[1]}, "
+                        f"M={a.shape[0]}, N={b.shape[1]}, K={a.shape[1]}, "
                         f"dtype={compute_out.dtype}. "
                         "This shape/dtype combination may not be supported."
                     )

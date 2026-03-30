@@ -51,11 +51,15 @@ def gen_gemm_module() -> JitSpec:
 
 
 def gen_mm_bf16_cublaslt_module() -> JitSpec:
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[10]
+    )
     return gen_jit_spec(
         "mm_bf16_cublaslt",
         [
             jit_env.FLASHINFER_CSRC_DIR / "mm_bf16_cublaslt.cu",
         ],
+        extra_cuda_cflags=nvcc_flags,
         extra_ldflags=["-lcublas", "-lcublasLt"],
     )
 

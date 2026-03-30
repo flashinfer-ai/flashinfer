@@ -398,7 +398,9 @@ class TunableRunner(ABC):
 
     def __hash__(self):
         hashable_vals = []
-        for v in self.__dict__.values():
+        for k, v in self.__dict__.items():
+            if k.endswith("_cache"):
+                continue
             try:
                 hash(v)
                 hashable_vals.append(v)
