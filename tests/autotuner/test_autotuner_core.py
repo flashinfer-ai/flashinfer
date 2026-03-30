@@ -473,3 +473,48 @@ def test_choose_one_different_infer_tokens_same_bucket_get_same_cached_tactic(
         assert tactic == expected_tactic, (
             f"Expected cached tactic {expected_tactic} for num_tokens={actual}, got {tactic}"
         )
+
+
+def test_prepare_input_tensors_none_input_preserved():
+    """None inputs (e.g. routing_logits in non-routed MoE) should pass through without crashing."""
+    tuner = reset_autotuner()
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(8, 16),
+                map_to_tuning_buckets=lambda x: x,
+            ),
+        ),
+    )
+    # Second input is None -- this used to blow up with AttributeError on .dtype/.shape
+    inputs = [
+        torch.empty((12, 64), dtype=torch.float32),
+        None,
+    ]
+    profiles = tuner._generate_optimization_profiles(config, inputs)
+    assert len(profiles) == 2
+
+    prepared = tuner._prepare_input_tensors(profiles[0], inputs)
+    assert prepared[0] is not inputs[0]  # dynamic -> recreated
+    assert prepared[1] is None  # None stays None
+
+
+def test_choose_one_with_none_input_no_crash():
+    """choose_one inference path should not crash when an input tensor is None."""
+    tuner = reset_autotuner()
+    runner = DummyRunner()
+    inputs = [
+        torch.empty((4, 8), dtype=torch.float32),
+        None,  # optional tensor, e.g. routing_logits
+        torch.empty((4, 2), dtype=torch.int64),
+    ]
+    config = TuningConfig()
+
+    # Inference path (no tuning) -- should fall through to fallback without blowing up.
+    chosen_runner, tactic = tuner.choose_one(
+        "none_input_smoke", [runner], config, inputs
+    )
+    assert chosen_runner is runner
+    assert tactic == -1
