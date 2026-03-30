@@ -83,13 +83,28 @@ template <typename input_t, typename weight_t, bool IS_PAD, int NTOKENS, int DIM
           int DSTATE_PAD, int DIM_PER_CTA, int NUM_WARPS, typename SramT>
 __device__ __forceinline__ void load_async_horizontal(SramT& sram, int lane, int warp,
                                                       SelectiveStateMTPParams const& params,
-                                                      int batch, int head, int kv_group,
-                                                      int dim_offset) {
+                                                      int seq_idx, int head, int kv_group,
+                                                      int dim_offset, int bos, int seq_len) {
   int const flat_tid = warp * warpSize + lane;
   constexpr auto num_threads = NUM_WARPS * warpSize;
 
   auto const* __restrict__ dt_ptr = reinterpret_cast<weight_t const*>(params.dt);
   auto const* __restrict__ dt_bias_ptr = reinterpret_cast<weight_t const*>(params.dt_bias);
+
+  // Varlen: tokens are at (bos + step) with stride_batch; non-varlen: seq_idx with stride_mtp
+  bool const has_cu_seqlens = (params.cu_seqlens != nullptr);
+  int64_t const B_base = has_cu_seqlens ? (int64_t)bos * params.B_stride_batch
+                                        : (int64_t)seq_idx * params.B_stride_batch;
+  int64_t const B_tstride = has_cu_seqlens ? params.B_stride_batch : params.B_stride_mtp;
+  int64_t const C_base = has_cu_seqlens ? (int64_t)bos * params.C_stride_batch
+                                        : (int64_t)seq_idx * params.C_stride_batch;
+  int64_t const C_tstride = has_cu_seqlens ? params.C_stride_batch : params.C_stride_mtp;
+  int64_t const x_base = has_cu_seqlens ? (int64_t)bos * params.x_stride_batch
+                                        : (int64_t)seq_idx * params.x_stride_batch;
+  int64_t const x_tstride = has_cu_seqlens ? params.x_stride_batch : params.x_stride_mtp;
+  int64_t const dt_base = has_cu_seqlens ? (int64_t)bos * params.dt_stride_batch
+                                         : (int64_t)seq_idx * params.dt_stride_batch;
+  int64_t const dt_tstride = has_cu_seqlens ? params.dt_stride_batch : params.dt_stride_mtp;
 
   if constexpr (!IS_PAD) {
     using load_input_t = PackedAligned<input_t>;
@@ -100,13 +115,12 @@ __device__ __forceinline__ void load_async_horizontal(SramT& sram, int lane, int
     // Load B[step][dstate] → sram.B[step][dstate_pad] (vectorized)
     {
       auto const* __restrict__ B_ptr = reinterpret_cast<input_t const*>(params.B);
-      constexpr int total_packs = NTOKENS * DSTATE / PACK;
+      int const total_packs = seq_len * DSTATE / PACK;
       constexpr int packs_per_row = DSTATE / PACK;
       for (int pidx = flat_tid; pidx < total_packs; pidx += num_threads) {
         int const step = pidx / packs_per_row;
         int const col = (pidx % packs_per_row) * PACK;
-        int64_t const src = (int64_t)batch * params.B_stride_batch + step * params.B_stride_mtp +
-                            kv_group * DSTATE + col;
+        int64_t const src = B_base + step * B_tstride + kv_group * DSTATE + col;
         *reinterpret_cast<load_input_t*>(&sram.B[step][col]) =
             *reinterpret_cast<load_input_t const*>(&B_ptr[src]);
       }
@@ -115,13 +129,12 @@ __device__ __forceinline__ void load_async_horizontal(SramT& sram, int lane, int
     // Load C[step][dstate] → sram.C[step][dstate_pad] (vectorized)
     {
       auto const* __restrict__ C_ptr = reinterpret_cast<input_t const*>(params.C);
-      constexpr int total_packs = NTOKENS * DSTATE / PACK;
+      int const total_packs = seq_len * DSTATE / PACK;
       constexpr int packs_per_row = DSTATE / PACK;
       for (int pidx = flat_tid; pidx < total_packs; pidx += num_threads) {
         int const step = pidx / packs_per_row;
         int const col = (pidx % packs_per_row) * PACK;
-        int64_t const src = (int64_t)batch * params.C_stride_batch + step * params.C_stride_mtp +
-                            kv_group * DSTATE + col;
+        int64_t const src = C_base + step * C_tstride + kv_group * DSTATE + col;
         *reinterpret_cast<load_input_t*>(&sram.C[step][col]) =
             *reinterpret_cast<load_input_t const*>(&C_ptr[src]);
       }
@@ -130,24 +143,22 @@ __device__ __forceinline__ void load_async_horizontal(SramT& sram, int lane, int
     // Load x[step][dim_per_cta] → sram.x[step][dim_per_cta] (vectorized)
     {
       auto const* __restrict__ x_ptr = reinterpret_cast<input_t const*>(params.x);
-      constexpr int total_packs = NTOKENS * DIM_PER_CTA / PACK;
+      int const total_packs = seq_len * DIM_PER_CTA / PACK;
       constexpr int packs_per_row = DIM_PER_CTA / PACK;
       for (int pidx = flat_tid; pidx < total_packs; pidx += num_threads) {
         int const step = pidx / packs_per_row;
         int const col = (pidx % packs_per_row) * PACK;
-        int64_t const src = (int64_t)batch * params.x_stride_batch + step * params.x_stride_mtp +
-                            head * DIM + dim_offset + col;
+        int64_t const src = x_base + step * x_tstride + head * DIM + dim_offset + col;
         *reinterpret_cast<load_input_t*>(&sram.x[step][col]) =
             *reinterpret_cast<load_input_t const*>(&x_ptr[src]);
       }
     }
 
     // Load dt[step] (scalar per step) — only a few values, single thread suffices
-    if (flat_tid < NTOKENS) {
+    if (flat_tid < seq_len) {
       int const step = flat_tid;
       float dt_bias_val = dt_bias_ptr ? toFloat(dt_bias_ptr[head]) : 0.f;
-      float dt_val =
-          toFloat(dt_ptr[batch * params.dt_stride_batch + step * params.dt_stride_mtp + head]);
+      float dt_val = toFloat(dt_ptr[dt_base + step * dt_tstride + head]);
       dt_val += dt_bias_val;
       if (params.dt_softplus) dt_val = thresholded_softplus(dt_val);
       sram.dt[step] = dt_val;
@@ -160,12 +171,15 @@ __device__ __forceinline__ void load_async_horizontal(SramT& sram, int lane, int
 // =============================================================================
 
 template <typename input_t, typename state_t, typename matrixA_t, typename weight_t,
-          typename stateIndex_t, bool IS_PAD, int NTOKENS, int DIM, int DSTATE, int DSTATE_PAD,
-          int DIM_PER_CTA, int PHILOX_ROUNDS, int NUM_WARPS, typename SramT>
+          typename stateIndex_t, typename state_scale_t, bool IS_PAD, int NTOKENS, int DIM,
+          int DSTATE, int DSTATE_PAD, int DIM_PER_CTA, int PHILOX_ROUNDS, int NUM_WARPS,
+          typename SramT>
 __device__ __forceinline__ void update_state_async_horizontal(SramT& sram, int lane, int warp,
                                                               SelectiveStateMTPParams const& params,
-                                                              int batch, int head, int dim_offset,
-                                                              int64_t state_batch) {
+                                                              int seq_idx, int head, int dim_offset,
+                                                              int64_t state_batch, int bos,
+                                                              int seq_len) {
+  constexpr bool scaleState = !std::is_same_v<state_scale_t, void>;
   constexpr int lanesPerRow = async_horiz::LANES_PER_ROW;
   constexpr int rowsPerWarp = async_horiz::ROWS_PER_WARP;
   constexpr int ROWS_PER_PASS = NUM_WARPS * rowsPerWarp;
@@ -200,7 +214,12 @@ __device__ __forceinline__ void update_state_async_horizontal(SramT& sram, int l
   auto const* __restrict__ intermediate_state_indices =
       reinterpret_cast<stateIndex_t const*>(params.intermediate_state_indices);
   auto const icache_idx =
-      intermediate_state_indices ? (int64_t)intermediate_state_indices[batch] : state_batch;
+      intermediate_state_indices ? (int64_t)intermediate_state_indices[seq_idx] : state_batch;
+
+  // dst_state_batch_indices for per-step state writes
+  auto const* __restrict__ dst_state_batch_indices =
+      reinterpret_cast<stateIndex_t const*>(params.dst_state_batch_indices);
+  bool const has_dst_indices = (dst_state_batch_indices != nullptr);
 
   // Logical column helpers (same as TMA horizontal kernel)
   auto baseCol = [&](int t, int e) -> int {
@@ -215,6 +234,10 @@ __device__ __forceinline__ void update_state_async_horizontal(SramT& sram, int l
       DIM_PER_CTA >= warpSize ? getVectorLoadSizeForFullUtilization<input_t, DIM_PER_CTA>() : 1;
   using load_output_t = PackedAligned<input_t, outputLoadSize>;
 
+  // State scale pointer (only used when scaleState == true)
+  [[maybe_unused]] auto* __restrict__ state_scale_ptr =
+      reinterpret_cast<state_scale_t*>(params.state_scale);
+
   auto const state_ptr_offset = state_batch * params.state_stride_batch + head * DIM * DSTATE;
   float const A_val = toFloat(A_ptr[head]);
   float const D_val = D_ptr ? toFloat(D_ptr[head]) : 0.f;
@@ -227,6 +250,16 @@ __device__ __forceinline__ void update_state_async_horizontal(SramT& sram, int l
 
     // Load state directly from global memory into registers
     float2 rState[numTiles][pairsPerTileMember];
+
+    // Load decode scale for this DIM row (scaleState only)
+    [[maybe_unused]] float state_decode_scale = 1.f;
+    if constexpr (scaleState) {
+      if constexpr (!IS_PAD) {
+        state_decode_scale = toFloat(
+            state_scale_ptr[state_batch * params.state_scale_stride_batch + head * DIM + dd]);
+      }
+    }
+
 #pragma unroll
     for (int t = 0; t < numTiles; t++) {
 #pragma unroll
@@ -236,6 +269,10 @@ __device__ __forceinline__ void update_state_async_horizontal(SramT& sram, int l
           rState[t][p] = {0.f, 0.f};
         } else {
           rState[t][p] = toFloat2(&state_ptr[state_ptr_offset + dd * DSTATE + c0]);
+          if constexpr (scaleState) {
+            rState[t][p].x *= state_decode_scale;
+            rState[t][p].y *= state_decode_scale;
+          }
         }
       }
     }
@@ -253,7 +290,10 @@ __device__ __forceinline__ void update_state_async_horizontal(SramT& sram, int l
     float const* __restrict__ dt_step = &sram.dt[0];
     float* __restrict__ out_step = &sram.out[0][0];
 
+    // Helper: compute block-scaling encode_scale from rState (8-lane reduce-max).
+    // Returns encode_scale; caller computes decode_scale = 1/encode_scale.
     for (int step = 0; step < NTOKENS; step++) {
+      if (step >= seq_len) break;
       float const dt_value = *dt_step;
       float const dA = __expf(A_val * dt_value);
       float const x_value = toFloat(x_step[local_row]);
@@ -299,6 +339,13 @@ __device__ __forceinline__ void update_state_async_horizontal(SramT& sram, int l
 
       // Write intermediate state
       if (istate_ptr && !IS_PAD) {
+        [[maybe_unused]] float istate_encode_scale = 1.f;
+        if constexpr (scaleState) {
+          istate_encode_scale =
+              computeBlockScaleEncode<state_t, numTiles, pairsPerTileMember, lanesPerRow,
+                                      elemsPerTile, elemsPerTileMember, DSTATE>(rState, lane,
+                                                                                member);
+        }
 #pragma unroll
         for (int t = 0; t < numTiles; t++) {
           int const col0 = baseCol(t, 0);
@@ -307,19 +354,83 @@ __device__ __forceinline__ void update_state_async_horizontal(SramT& sram, int l
           [[maybe_unused]] uint32_t rand_ints[4];
 #pragma unroll
           for (int e = 0; e < elemsPerTileMember; e += 2) {
-            float const s0 = rState[t][e / 2].x;
-            float const s1 = rState[t][e / 2].y;
+            float s0 = rState[t][e / 2].x;
+            float s1 = rState[t][e / 2].y;
+            if constexpr (scaleState) {
+              s0 *= istate_encode_scale;
+              s1 *= istate_encode_scale;
+            }
             convertAndStoreSRHorizontal<state_t, DSTATE, PHILOX_ROUNDS>(
                 rOut.val[e], rOut.val[e + 1], s0, s1, rand_seed, state_ptr_offset, dd, col0, e,
                 rand_ints);
           }
           *reinterpret_cast<packed_tile_t*>(&istate_dd_ptr[col0]) = rOut;
         }
+        // Write intermediate state decode scale
+        if constexpr (scaleState) {
+          if (member == 0) {
+            auto* __restrict__ iscales = reinterpret_cast<float*>(params.intermediate_state_scales);
+            iscales[icache_idx * params.intermediate_state_scales_stride_batch +
+                    step * params.nheads * DIM + head * DIM + dd] = 1.f / istate_encode_scale;
+          }
+        }
         istate_dd_ptr += istate_step_stride;
       }
 
-      // Write final state at last step
-      if (step == NTOKENS - 1 && params.update_state && !IS_PAD) {
+      // Write state to per-step dst slot (varlen / speculative decoding)
+      if (has_dst_indices && !IS_PAD) {
+        auto const dst_idx = static_cast<int64_t>(
+            dst_state_batch_indices[seq_idx * params.dst_state_batch_indices_stride_batch +
+                                    step * params.dst_state_batch_indices_stride_T]);
+        if (dst_idx != params.pad_slot_id) {
+          [[maybe_unused]] float dst_encode_scale = 1.f;
+          if constexpr (scaleState) {
+            dst_encode_scale =
+                computeBlockScaleEncode<state_t, numTiles, pairsPerTileMember, lanesPerRow,
+                                        elemsPerTile, elemsPerTileMember, DSTATE>(rState, lane,
+                                                                                  member);
+          }
+          auto const dst_base =
+              dst_idx * params.state_stride_batch + head * DIM * DSTATE + dd * DSTATE;
+#pragma unroll
+          for (int t = 0; t < numTiles; t++) {
+            int const col0 = baseCol(t, 0);
+            if (col0 >= DSTATE) continue;
+            packed_tile_t rOut;
+            [[maybe_unused]] uint32_t rand_ints[4];
+#pragma unroll
+            for (int e = 0; e < elemsPerTileMember; e += 2) {
+              float s0 = rState[t][e / 2].x;
+              float s1 = rState[t][e / 2].y;
+              if constexpr (scaleState) {
+                s0 *= dst_encode_scale;
+                s1 *= dst_encode_scale;
+              }
+              convertAndStoreSRHorizontal<state_t, DSTATE, PHILOX_ROUNDS>(
+                  rOut.val[e], rOut.val[e + 1], s0, s1, rand_seed, state_ptr_offset, dd, col0, e,
+                  rand_ints);
+            }
+            *reinterpret_cast<packed_tile_t*>(&state_ptr[dst_base + col0]) = rOut;
+          }
+          // Write decode scale to dst slot
+          if constexpr (scaleState) {
+            if (member == 0) {
+              state_scale_ptr[dst_idx * params.state_scale_stride_batch + head * DIM + dd] =
+                  1.f / dst_encode_scale;
+            }
+          }
+        }
+      }
+
+      // Write final state at last step (only when dst_state_batch_indices is not used)
+      if (step == seq_len - 1 && params.update_state && !IS_PAD && !has_dst_indices) {
+        [[maybe_unused]] float final_encode_scale = 1.f;
+        if constexpr (scaleState) {
+          final_encode_scale =
+              computeBlockScaleEncode<state_t, numTiles, pairsPerTileMember, lanesPerRow,
+                                      elemsPerTile, elemsPerTileMember, DSTATE>(rState, lane,
+                                                                                member);
+        }
         auto const state_base =
             state_batch * params.state_stride_batch + head * DIM * DSTATE + dd * DSTATE;
 #pragma unroll
@@ -330,13 +441,24 @@ __device__ __forceinline__ void update_state_async_horizontal(SramT& sram, int l
           [[maybe_unused]] uint32_t rand_ints[4];
 #pragma unroll
           for (int e = 0; e < elemsPerTileMember; e += 2) {
-            float const s0 = rState[t][e / 2].x;
-            float const s1 = rState[t][e / 2].y;
+            float s0 = rState[t][e / 2].x;
+            float s1 = rState[t][e / 2].y;
+            if constexpr (scaleState) {
+              s0 *= final_encode_scale;
+              s1 *= final_encode_scale;
+            }
             convertAndStoreSRHorizontal<state_t, DSTATE, PHILOX_ROUNDS>(
                 rOut.val[e], rOut.val[e + 1], s0, s1, rand_seed, state_ptr_offset, dd, col0, e,
                 rand_ints);
           }
           *reinterpret_cast<packed_tile_t*>(&state_ptr[state_base + col0]) = rOut;
+        }
+        // Write decode scale
+        if constexpr (scaleState) {
+          if (member == 0) {
+            state_scale_ptr[state_batch * params.state_scale_stride_batch + head * DIM + dd] =
+                1.f / final_encode_scale;
+          }
         }
       }
     }  // step loop
@@ -345,15 +467,28 @@ __device__ __forceinline__ void update_state_async_horizontal(SramT& sram, int l
   // ── Epilogue: sync all warps, z-gate + vectorized store ───
   __syncthreads();
 
+  // Varlen output indexing: (bos + step) * stride_batch; non-varlen: seq_idx * stride_batch + step
+  // * stride_mtp
+  bool const has_cu_seqlens = (params.cu_seqlens != nullptr);
+  auto out_addr = [&](int step) -> int64_t {
+    return has_cu_seqlens
+               ? (int64_t)(bos + step) * params.out_stride_batch + head * DIM + dim_offset
+               : (int64_t)seq_idx * params.out_stride_batch + step * params.out_stride_mtp +
+                     head * DIM + dim_offset;
+  };
+  auto z_addr = [&](int step) -> int64_t {
+    return has_cu_seqlens ? (int64_t)(bos + step) * params.z_stride_batch + head * DIM + dim_offset
+                          : (int64_t)seq_idx * params.z_stride_batch + step * params.z_stride_mtp +
+                                head * DIM + dim_offset;
+  };
+
   if constexpr (DIM_PER_CTA >= warpSize) {
     // Fast path: each lane handles >= 1 element, use vectorized loads/stores
     constexpr int elemsPerThreadEpilogue = DIM_PER_CTA / warpSize;
 
-    for (int step = warp; step < NTOKENS; step += NUM_WARPS) {
-      int const out_offset =
-          batch * params.out_stride_batch + step * params.out_stride_mtp + head * DIM + dim_offset;
-      int const z_offset =
-          batch * params.z_stride_batch + step * params.z_stride_mtp + head * DIM + dim_offset;
+    for (int step = warp; step < seq_len; step += NUM_WARPS) {
+      int64_t const out_offset = out_addr(step);
+      int64_t const z_offset = z_addr(step);
 
       for (int ii = 0; ii < elemsPerThreadEpilogue; ii += load_output_t::count) {
         int const d = lane * load_output_t::count +
@@ -378,14 +513,12 @@ __device__ __forceinline__ void update_state_async_horizontal(SramT& sram, int l
     }
   } else {
     // Narrow path: DIM_PER_CTA < warpSize, only first DIM_PER_CTA lanes participate
-    for (int step = warp; step < NTOKENS; step += NUM_WARPS) {
+    for (int step = warp; step < seq_len; step += NUM_WARPS) {
       if (lane < DIM_PER_CTA) {
-        int const out_offset = batch * params.out_stride_batch + step * params.out_stride_mtp +
-                               head * DIM + dim_offset;
+        int64_t const out_offset = out_addr(step);
         float out_value = sram.out[step][lane];
         if (z_ptr) {
-          int const z_offset =
-              batch * params.z_stride_batch + step * params.z_stride_mtp + head * DIM + dim_offset;
+          int64_t const z_offset = z_addr(step);
           float z_value = toFloat(z_ptr[z_offset + lane]);
           float sig_z = __fdividef(1.f, (1.f + __expf(0.f - z_value)));
           out_value *= z_value * sig_z;
@@ -398,13 +531,13 @@ __device__ __forceinline__ void update_state_async_horizontal(SramT& sram, int l
 
 // =============================================================================
 // Kernel entry point
-// Grid: (batch, nheads, CTAS_PER_HEAD)
+// Grid: (batch_or_n_sequences, nheads, CTAS_PER_HEAD)
 // Block: (32, NUM_WARPS)
 // =============================================================================
 
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t,
-          typename stateIndex_t, int NTOKENS, int DIM, int DSTATE, int HEADS_PER_GROUP,
-          int PHILOX_ROUNDS, int NUM_WARPS, int CTAS_PER_HEAD>
+          typename stateIndex_t, typename state_scale_t, int NTOKENS, int DIM, int DSTATE,
+          int HEADS_PER_GROUP, int PHILOX_ROUNDS, int NUM_WARPS, int CTAS_PER_HEAD>
 __global__ void __launch_bounds__(NUM_WARPS * 32)
     selective_state_update_kernel_async_horizontal_mtp(SelectiveStateMTPParams params) {
   constexpr int DSTATE_PAD = padDstate<input_t>(DSTATE);
@@ -418,17 +551,48 @@ __global__ void __launch_bounds__(NUM_WARPS * 32)
   using sram_t = AsyncHorizontalStorage<input_t, NTOKENS, DIM_PER_CTA, DSTATE_PAD>;
   auto& sram = *reinterpret_cast<sram_t*>(smem);
 
-  int const batch = blockIdx.x;
+  int const seq_idx = blockIdx.x;
   int const head = blockIdx.y;
   int const cta_z = blockIdx.z;
   int const dim_offset = cta_z * DIM_PER_CTA;
   int const lane = threadIdx.x;
   int const warp = threadIdx.y;
 
+  // ── Varlen: compute bos, seq_len ──
+  auto const* __restrict__ cu_seqlens =
+      reinterpret_cast<cuSeqlensIndex_t const*>(params.cu_seqlens);
+  int bos;
+  int seq_len;
+  if (cu_seqlens) {
+    bos = __ldg(&cu_seqlens[seq_idx]);
+    int const eos = __ldg(&cu_seqlens[seq_idx + 1]);
+    seq_len = eos - bos;
+    if (seq_len <= 0) return;
+  } else {
+    bos = 0;
+    seq_len = NTOKENS;
+  }
+
+  // ── num_accepted_tokens → init_token_idx ──
+  auto const* __restrict__ num_accepted_tokens =
+      reinterpret_cast<numAcceptedIndex_t const*>(params.num_accepted_tokens);
+  int init_token_idx = 0;
+  if (num_accepted_tokens) {
+    int num_accepted = __ldg(&num_accepted_tokens[seq_idx]);
+    init_token_idx = max(num_accepted - 1, 0);
+  }
+
+  // ── State batch index: 2D (seq_idx, init_token_idx) or 1D ──
   auto const* __restrict__ state_batch_indices =
       reinterpret_cast<stateIndex_t const*>(params.state_batch_indices);
-  auto const state_batch =
-      state_batch_indices ? (int64_t)state_batch_indices[batch] : (int64_t)batch;
+  int64_t state_batch;
+  if (state_batch_indices) {
+    state_batch = static_cast<int64_t>(
+        state_batch_indices[seq_idx * params.state_batch_indices_stride_batch +
+                            init_token_idx * params.state_batch_indices_stride_T]);
+  } else {
+    state_batch = static_cast<int64_t>(seq_idx);
+  }
   bool const is_pad = (state_batch == (int64_t)params.pad_slot_id);
 
   int const kv_group = head / HEADS_PER_GROUP;
@@ -436,16 +600,17 @@ __global__ void __launch_bounds__(NUM_WARPS * 32)
   auto run = [&]<bool IS_PAD>() {
     // Phase 1: cooperative async load of B/C/x/dt into smem
     load_async_horizontal<input_t, weight_t, IS_PAD, NTOKENS, DIM, DSTATE, DSTATE_PAD, DIM_PER_CTA,
-                          NUM_WARPS>(sram, lane, warp, params, batch, head, kv_group, dim_offset);
+                          NUM_WARPS>(sram, lane, warp, params, seq_idx, head, kv_group, dim_offset,
+                                     bos, seq_len);
 
     // Phase 2: single sync — ensures all smem writes are visible
     __syncthreads();
 
     // Phase 3: compute (state in registers, B/C/x from smem)
-    update_state_async_horizontal<input_t, state_t, matrixA_t, weight_t, stateIndex_t, IS_PAD,
-                                  NTOKENS, DIM, DSTATE, DSTATE_PAD, DIM_PER_CTA, PHILOX_ROUNDS,
-                                  NUM_WARPS>(sram, lane, warp, params, batch, head, dim_offset,
-                                             state_batch);
+    update_state_async_horizontal<input_t, state_t, matrixA_t, weight_t, stateIndex_t,
+                                  state_scale_t, IS_PAD, NTOKENS, DIM, DSTATE, DSTATE_PAD,
+                                  DIM_PER_CTA, PHILOX_ROUNDS, NUM_WARPS>(
+        sram, lane, warp, params, seq_idx, head, dim_offset, state_batch, bos, seq_len);
   };
 
   if (is_pad)

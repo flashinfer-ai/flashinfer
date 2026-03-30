@@ -81,11 +81,6 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
     FLASHINFER_CHECK(params.nheads % params.ngroups == 0, "nheads (", params.nheads,
                      ") must be divisible by ngroups (", params.ngroups,
                      ") for async_horizontal algorithm");
-    FLASHINFER_CHECK(!scaleState,
-                     "async_horizontal algorithm does not support scaled (quantized) state");
-    FLASHINFER_CHECK(params.cu_seqlens == nullptr,
-                     "async_horizontal algorithm does not support varlen (cu_seqlens)");
-
     // Determine CTAS_PER_HEAD: split DIM across grid.z for more parallelism at small batch
     int const total_tiles = params.batch * params.nheads;
     int const num_sms = GetCudaMultiProcessorCount();
@@ -110,8 +105,8 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
             constexpr size_t smem_size = sizeof(sram_t);
 
             auto func = selective_state_update_kernel_async_horizontal_mtp<
-                input_t, weight_t, matrixA_t, state_t, stateIndex_t, NTOKENS_MTP, DIM, DSTATE,
-                HEADS_PER_GROUP, PHILOX_ROUNDS, NUM_WARPS, CTAS_PER_HEAD>;
+                input_t, weight_t, matrixA_t, state_t, stateIndex_t, state_scale_t, NTOKENS_MTP,
+                DIM, DSTATE, HEADS_PER_GROUP, PHILOX_ROUNDS, NUM_WARPS, CTAS_PER_HEAD>;
 
             dim3 grid(params.batch, params.nheads, CTAS_PER_HEAD);
             dim3 block(warpSize, NUM_WARPS);
@@ -246,34 +241,30 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
           dim3 grid(params.batch, params.nheads / HEADS_PER_CTA);
           dim3 block(warpSize, horiz::NUM_WARPS);
 
-          // TMA state descriptor: tile by (BANK_CYCLE_ELEMS, TMA_STATE_ROWS).
-          // Sub-tile-major smem layout eliminates bank conflicts for non-power-of-2 DSTATE.
-          // TMA's OOB fill zeros out partial tiles (e.g. cols 96–127 when DSTATE=96).
-          constexpr int BANK_CYCLE_ELEMS =
-              32 * (int)sizeof(uint32_t) / (int)sizeof(state_t);  // 64 for f16/bf16
-          constexpr int DSTATE_SMEM = sram_t::DSTATE_SMEM;
-          // State/B/C tensor maps use FILL_NONE: OOB elements are NOT written
-          // to smem, so pre-zeroed padding columns remain zero.
+          // TMA state descriptor: single wide tile of DSTATE_PAD columns.
+          // DSTATE_PAD is DSTATE rounded up to 128 bytes (32 banks), eliminating
+          // bank conflicts. TMA FILL_NONE leaves pre-zeroed padding untouched.
+          constexpr int DSTATE_PAD = sram_t::DSTATE_PAD;
           auto state_tensor = tma::buildNdDescriptor(
               typeid(state_t),
               /*shapes*/ {DSTATE, DIM, params.nheads, params.state_cache_size},
               /*strides*/ {1, DSTATE, DSTATE * DIM, params.state_stride_batch},
-              /*tiles*/ {BANK_CYCLE_ELEMS, TMA_STATE_ROWS, 1, 1}, params.state);
+              /*tiles*/ {DSTATE_PAD, TMA_STATE_ROWS, 1, 1}, params.state);
 
-          // B/C: tile by DSTATE_SMEM to match padded smem layout.
+          // B/C: tile by DSTATE_PAD to match padded smem layout.
           auto B_tensor = tma::buildNdDescriptor(
               typeid(input_t),
               {(uint64_t)DSTATE, (uint64_t)params.ngroups, (uint64_t)params.ntokens_mtp,
                (uint64_t)params.batch},
               {1, (uint64_t)DSTATE, (uint64_t)params.B_stride_mtp, (uint64_t)params.B_stride_batch},
-              {DSTATE_SMEM, 1, NTOKENS_MTP, 1}, params.B);
+              {DSTATE_PAD, 1, NTOKENS_MTP, 1}, params.B);
 
           auto C_tensor = tma::buildNdDescriptor(
               typeid(input_t),
               {(uint64_t)DSTATE, (uint64_t)params.ngroups, (uint64_t)params.ntokens_mtp,
                (uint64_t)params.batch},
               {1, (uint64_t)DSTATE, (uint64_t)params.C_stride_mtp, (uint64_t)params.C_stride_batch},
-              {DSTATE_SMEM, 1, NTOKENS_MTP, 1}, params.C);
+              {DSTATE_PAD, 1, NTOKENS_MTP, 1}, params.C);
 
           auto x_tensor = tma::buildNdDescriptor(
               typeid(input_t),

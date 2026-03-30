@@ -141,4 +141,57 @@ __device__ __forceinline__ void convertAndStoreSRHorizontal(state_t& out0, state
   }
 }
 
+// =============================================================================
+// computeBlockScaleEncode — compute block-scaling encode_scale for a DIM row.
+//
+// Finds the max absolute value across all rState pairs held by lanesPerRow
+// lanes (sub-warp reduce-max), then returns encode_scale = INT_MAX / max_val.
+// The caller writes quantized state as: state_int = round(rState * encode_scale)
+// and stores decode_scale = 1 / encode_scale alongside.
+//
+// Template args:
+//   state_t        — quantized state type (e.g. int16_t)
+//   numTiles       — number of tiles per thread
+//   pairsPerTileMember — float2 pairs per tile member
+//   lanesPerRow    — lanes cooperating on one DIM row
+//   elemsPerTile   — logical elements per tile
+//   elemsPerTileMember — elements per tile member
+//
+// rState          — register array of float2[numTiles][pairsPerTileMember]
+// lane            — threadIdx.x
+// baseCol         — lambda(t, e) -> logical column index
+// =============================================================================
+
+template <typename state_t, int numTiles, int pairsPerTileMember, int lanesPerRow, int elemsPerTile,
+          int elemsPerTileMember, int DSTATE>
+__device__ __forceinline__ float computeBlockScaleEncode(
+    float2 const (&rState)[numTiles][pairsPerTileMember], int lane, int member) {
+  float local_max = std::numeric_limits<float>::lowest();
+  int const lane_member_0 = lane & ~(lanesPerRow - 1);
+
+  auto baseCol = [&](int t, int e) -> int {
+    return t * elemsPerTile + member * elemsPerTileMember + e;
+  };
+
+#pragma unroll
+  for (int t = 0; t < numTiles; t++) {
+#pragma unroll
+    for (int p = 0; p < pairsPerTileMember; p++) {
+      int const c0 = baseCol(t, p * 2);
+      if (c0 < DSTATE) {
+        local_max = fmaxf(local_max, fmaxf(fabsf(rState[t][p].x), fabsf(rState[t][p].y)));
+      }
+    }
+  }
+  // Reduce max across lanesPerRow lanes
+#pragma unroll
+  for (int offset = lanesPerRow / 2; offset >= 1; offset /= 2) {
+    local_max = fmaxf(local_max, __shfl_down_sync(UINT32_MAX, local_max, offset));
+  }
+  // Broadcast from member 0 of each group
+  local_max = __shfl_sync(UINT32_MAX, local_max, lane_member_0);
+  return (local_max == 0.f) ? 1.f
+                            : static_cast<float>(std::numeric_limits<state_t>::max()) / local_max;
+}
+
 }  // namespace flashinfer::mamba::mtp
