@@ -3559,18 +3559,24 @@ def _rank_sm100_block_scaled_tactics(valid_tactics, m, n, real_k, device):
         # Prefer no prefetch as a tiebreaker
         prefetch_penalty = 0.99 if use_prefetch else 1.0
 
-        # Cluster tiebreaker: among tactics with the same quantization score,
-        # prefer larger clusters for hardware multicast benefits. This is a
-        # tiny epsilon so it only breaks ties, never overrides real efficiency.
         # Cluster tiebreaker: when the problem M is very small (fits in a
         # small fraction of the tile) and the cluster divides evenly, prefer
         # larger clusters for hardware multicast benefits.
+        cluster_size = cluster_m * cluster_n
         if prob_m <= tile_m // 4 and cluster_efficiency > 0.99:
-            cluster_bonus = 1.0 + 0.001 * (cluster_m * cluster_n)
+            cluster_bonus = 1.0 + 0.001 * cluster_size
         else:
             cluster_bonus = 1.0
 
-        return tile_efficiency * wave_efficiency * cluster_efficiency * tile_throughput * prefetch_penalty * cluster_bonus
+        # swap_ab bonus: for small M (8-16) with large N, swapping puts
+        # the large dimension along the M-axis, enabling more CTAs and
+        # better cluster multicast utilization along M.
+        swap_bonus = 1.0
+        if swap_ab and 8 <= m <= 16 and n >= 4096:
+            swap_bonus = 1.08
+
+        return (tile_efficiency * wave_efficiency * cluster_efficiency
+                * tile_throughput * prefetch_penalty * cluster_bonus * swap_bonus)
 
     return sorted(valid_tactics, key=_score, reverse=True)
 
