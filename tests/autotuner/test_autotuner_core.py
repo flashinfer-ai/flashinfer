@@ -513,6 +513,8 @@ def test_choose_one_with_none_input_no_crash():
     config = TuningConfig()
 
     # Inference path (no tuning) -- should fall through to fallback without blowing up.
-    chosen_runner, tactic = tuner.choose_one("none_input_smoke", [runner], config, inputs)
+    chosen_runner, tactic = tuner.choose_one(
+        "none_input_smoke", [runner], config, inputs
+    )
     assert chosen_runner is runner
     assert tactic == -1
