@@ -3495,11 +3495,11 @@ def _rank_sm100_block_scaled_tactics(valid_tactics, m, n, real_k, device):
         given the tile sizes.
       - Wave quantization efficiency: ratio of ideal CTA occupancy to actual
         CTA occupancy when mapped onto the available SMs.
-      - Cluster efficiency: penalize clusters that are too large relative to
-        the number of CTAs (under-occupied clusters waste resources).
+      - Tile throughput: bias toward larger tiles for better per-CTA throughput.
+      - Prefetch bonus: favor prefetch when the CTA-to-SM ratio is in a
+        sub-wave regime (more CTAs than SMs but not a full 2nd wave).
 
-    The combined score is tile_efficiency * wave_efficiency * cluster_efficiency.
-    Higher is better. Returns the tactic list sorted best-first.
+    Higher score is better. Returns the tactic list sorted best-first.
     """
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
 
@@ -3533,24 +3533,32 @@ def _rank_sm100_block_scaled_tactics(valid_tactics, m, n, real_k, device):
         wave_efficiency = total_ctas / (num_waves * sm_count)
 
         # Cluster efficiency: penalize clusters with partially-filled dimensions.
-        # E.g., if we only need 3 CTA columns but cluster_n=4, one slot is wasted.
         raw_ctas_m = (prob_m + tile_m - 1) // tile_m
         raw_ctas_n = (prob_n + tile_n - 1) // tile_n
         cluster_ctas_m = ((raw_ctas_m + cluster_m - 1) // cluster_m) * cluster_m
         cluster_ctas_n = ((raw_ctas_n + cluster_n - 1) // cluster_n) * cluster_n
         cluster_efficiency = (raw_ctas_m * raw_ctas_n) / (cluster_ctas_m * cluster_ctas_n)
 
-        # Prefer no prefetch as a tiebreaker (prefetch adds overhead for
-        # small problems and is only beneficial in specific wave regimes)
-        prefetch_penalty = 0.99 if use_prefetch else 1.0
-
         # Tile throughput bias: larger tiles have higher per-CTA throughput
         # due to better instruction amortization and shared memory utilization.
-        # Use sqrt to balance throughput vs quantization effects.
         max_tile_area = 256 * 256  # largest candidate tile
         tile_throughput = ((tile_m * tile_n) / max_tile_area) ** 0.5
 
-        return tile_efficiency * wave_efficiency * cluster_efficiency * tile_throughput * prefetch_penalty
+        # Prefer no prefetch as a tiebreaker
+        prefetch_penalty = 0.99 if use_prefetch else 1.0
+
+        # Cluster tiebreaker: among tactics with the same quantization score,
+        # prefer larger clusters for hardware multicast benefits. This is a
+        # tiny epsilon so it only breaks ties, never overrides real efficiency.
+        # Cluster tiebreaker: only for small problems (few CTA rows) where
+        # hardware multicast benefits of larger clusters are significant.
+        raw_cta_rows = raw_ctas_m  # CTAs along the M dimension
+        if raw_cta_rows <= 1:
+            cluster_bonus = 1.0 + 0.001 * (cluster_m * cluster_n)
+        else:
+            cluster_bonus = 1.0
+
+        return tile_efficiency * wave_efficiency * cluster_efficiency * tile_throughput * prefetch_penalty * cluster_bonus
 
     return sorted(valid_tactics, key=_score, reverse=True)
 
