@@ -448,7 +448,7 @@ __device__ __forceinline__ void LoadToSharedOrdered(const DType* input,
   for (uint32_t i = tx * VEC_SIZE; i < aligned_size; i += STRIDE) {
     // Prefetch next chunk to L2
     if (i + 2 * STRIDE < aligned_size) {
-      asm volatile("prefetch.global.L2 [%0];" :: "l"(input + chunk_start + i + 2 * STRIDE));
+      asm volatile("prefetch.global.L2 [%0];" ::"l"(input + chunk_start + i + 2 * STRIDE));
     }
     input_vec.cast_load(input + chunk_start + i);
 #pragma unroll
@@ -2082,13 +2082,13 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
   const int aligned_length = (length / VEC_SIZE) * VEC_SIZE;
   // Full-row scan helper (vectorized body + tail). Overflow fallback reuses this traversal.
   auto for_each_score_full = [&](auto&& fn) {
-  // vectorized body with L2 prefetch 2 strides ahead for better latency hiding
-  constexpr int STRIDE = BLOCK_SIZE * VEC_SIZE;
+    // vectorized body with L2 prefetch 2 strides ahead for better latency hiding
+    constexpr int STRIDE = BLOCK_SIZE * VEC_SIZE;
 #pragma unroll 2
     for (int base = tx * VEC_SIZE; base < aligned_length; base += STRIDE) {
       // Prefetch 2 chunks ahead to L2 — gives more time for prefetch to complete
       if (base + 2 * STRIDE < aligned_length) {
-        asm volatile("prefetch.global.L2 [%0];" :: "l"(&score[base + 2 * STRIDE]));
+        asm volatile("prefetch.global.L2 [%0];" ::"l"(&score[base + 2 * STRIDE]));
       }
       score_vec.cast_load(&score[base]);
 #pragma unroll
@@ -2208,7 +2208,8 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
             s_input_idx[0][HALF_BUF + pos] = static_cast<int>(ordered);
             // For fp32: coarse pass (fp16 high 8 bits) already captures bits 24-31 info,
             // so start refinement at bit 16 to skip redundant round 0.
-            constexpr int EFFECTIVE_FIRST_SHIFT = (FIRST_SHIFT >= 16) ? FIRST_SHIFT - 8 : FIRST_SHIFT;
+            constexpr int EFFECTIVE_FIRST_SHIFT =
+                (FIRST_SHIFT >= 16) ? FIRST_SHIFT - 8 : FIRST_SHIFT;
             const auto sub_bin = (ordered >> EFFECTIVE_FIRST_SHIFT) & 0xFF;
             atomicAdd(&s_histogram[sub_bin], 1);
           } else {
