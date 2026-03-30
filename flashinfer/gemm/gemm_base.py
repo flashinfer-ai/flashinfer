@@ -3539,10 +3539,22 @@ def _rank_sm100_block_scaled_tactics(valid_tactics, m, n, real_k, device):
         cluster_ctas_n = ((raw_ctas_n + cluster_n - 1) // cluster_n) * cluster_n
         cluster_efficiency = (raw_ctas_m * raw_ctas_n) / (cluster_ctas_m * cluster_ctas_n)
 
-        # Tile throughput bias: larger tiles have higher per-CTA throughput
-        # due to better instruction amortization and shared memory utilization.
-        max_tile_area = 256 * 256  # largest candidate tile
-        tile_throughput = ((tile_m * tile_n) / max_tile_area) ** 0.5
+        # Tile throughput bias: larger tiles have higher per-CTA throughput.
+        # Also prefer balanced (square-ish) tiles over elongated ones —
+        # balanced tiles have better memory access patterns and locality.
+        max_tile_area = 256 * 256
+        tile_area_factor = ((tile_m * tile_n) / max_tile_area) ** 0.5
+        # Balance factor: ratio of min/max tile dims. 1.0 for square, <1 for elongated.
+        tile_balance = min(tile_m, tile_n) / max(tile_m, tile_n)
+        tile_throughput = tile_area_factor * (tile_balance ** 0.25)
+
+        # For small K, penalize oversized tiles — the K-pipeline can't hide
+        # the latency of large tile launches when there's little K-work.
+        if tile_m * tile_n > 128 * 128:
+            if real_k <= 1024:
+                tile_throughput *= 0.50
+            elif real_k <= 2048:
+                tile_throughput *= 0.80
 
         # Prefer no prefetch as a tiebreaker
         prefetch_penalty = 0.99 if use_prefetch else 1.0
@@ -3550,10 +3562,10 @@ def _rank_sm100_block_scaled_tactics(valid_tactics, m, n, real_k, device):
         # Cluster tiebreaker: among tactics with the same quantization score,
         # prefer larger clusters for hardware multicast benefits. This is a
         # tiny epsilon so it only breaks ties, never overrides real efficiency.
-        # Cluster tiebreaker: only for small problems (few CTA rows) where
-        # hardware multicast benefits of larger clusters are significant.
-        raw_cta_rows = raw_ctas_m  # CTAs along the M dimension
-        if raw_cta_rows <= 1:
+        # Cluster tiebreaker: when the problem M is very small (fits in a
+        # small fraction of the tile) and the cluster divides evenly, prefer
+        # larger clusters for hardware multicast benefits.
+        if prob_m <= tile_m // 4 and cluster_efficiency > 0.99:
             cluster_bonus = 1.0 + 0.001 * (cluster_m * cluster_n)
         else:
             cluster_bonus = 1.0
