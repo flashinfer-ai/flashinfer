@@ -1331,8 +1331,8 @@ class MxInt4BlockScaleLauncher : public FusedMoeLauncher {
     } else {
       // Allocate expert_weights buffer for routing output
       auto expert_weights_dtype = mDtypeScore == btg::Dtype::Fp32 ? dl_float32 : dl_bfloat16;
-      expert_weights =
-          alloc_tensor({args->num_tokens, args->top_k}, expert_weights_dtype, hidden_states.device());
+      expert_weights = alloc_tensor({args->num_tokens, args->top_k}, expert_weights_dtype,
+                                    hidden_states.device());
       workspace.expert_weights = expert_weights.data_ptr();
     }
   }
