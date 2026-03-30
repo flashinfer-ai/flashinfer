@@ -31,6 +31,7 @@ from .cubin_loader import (
     get_meta_hash,
     download_trtllm_headers,
     compile_source_cubins,
+    download_cuda_ptx_header,
 )
 from .gemm.cutlass.generate_kernels import generate_gemm_operations
 
@@ -251,6 +252,13 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
         "bmm", header_dest_dir, header_path, ArtifactPath.TRTLLM_GEN_BMM, checksum
     )
 
+    # Download cuda_ptx.h (~2MB header excluded from the repo) into the cubin
+    # cache so that ``#include <cuda_ptx/cuda_ptx.h>`` resolves during
+    # compile_source_cubins() and the subsequent JIT compilation.
+    cuda_ptx_include_dir = download_cuda_ptx_header(
+        ArtifactPath.CUDA_PTX, CheckSumHash.CUDA_PTX
+    )
+
     bundle_header_dir = jit_env.FLASHINFER_CSRC_DIR / "trtllm_kernels"
 
     # Directory containing the bundled trtllmGen export (includes trtllm/dev/*.h headers)
@@ -275,6 +283,7 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
             bundle_header_dir,
             bundled_export_dir,  # for trtllm/dev/*.h headers
             source_kernel_dir,
+            cuda_ptx_include_dir,  # for cuda_ptx/cuda_ptx.h
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include",
             *jit_env.CUTLASS_INCLUDE_DIRS,
@@ -298,7 +307,7 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
 
     # currently only support Blackwell
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10]
+        supported_major_versions=[10, 12]
     )
 
     return gen_jit_spec(

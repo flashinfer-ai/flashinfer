@@ -503,6 +503,38 @@ def download_trtllm_headers(
     write_if_different(artifact_hash_path, artifact_path)
 
 
+def download_cuda_ptx_header(artifact_path: str, sha256: str) -> pathlib.Path:
+    """
+    Download cuda_ptx.h from artifactory into the cubin cache directory.
+
+    The file is downloaded via ``get_file()`` (same as other artifacts) and
+    then symlinked so that ``#include <cuda_ptx/cuda_ptx.h>`` resolves when
+    FLASHINFER_CUBIN_DIR is on the include path.
+
+    Returns the include-root directory (FLASHINFER_CUBIN_DIR).
+    """
+    uri_path = safe_urljoin(artifact_path, "cuda_ptx.h")
+    file_path = str(FLASHINFER_CUBIN_DIR / uri_path)
+
+    result = get_file(uri_path, sha256, file_path)
+    assert result, "cuda_ptx.h not found"
+
+    # ``#include <cuda_ptx/cuda_ptx.h>`` needs a ``cuda_ptx/`` directory
+    # under the include root.  The downloaded file lives under the
+    # artifact_path subdirectory (e.g. ``<hash>/cuda_ptx-<hash>/``),
+    # so create a symlink ``cuda_ptx -> <artifact_path>`` if needed.
+    canonical_dir = FLASHINFER_CUBIN_DIR / "cuda_ptx"
+    source_dir = FLASHINFER_CUBIN_DIR / artifact_path
+    if canonical_dir.resolve() != source_dir.resolve():
+        if canonical_dir.is_symlink():
+            canonical_dir.unlink()
+        elif canonical_dir.exists():
+            shutil.rmtree(canonical_dir)
+        canonical_dir.symlink_to(source_dir)
+
+    return FLASHINFER_CUBIN_DIR
+
+
 def convert_to_ctypes_char_p(data: bytes):
     return ctypes.c_char_p(data)
 
