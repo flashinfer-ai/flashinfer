@@ -307,7 +307,7 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
 
     # currently only support Blackwell
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10, 12]
+        supported_major_versions=[10]
     )
 
     return gen_jit_spec(
