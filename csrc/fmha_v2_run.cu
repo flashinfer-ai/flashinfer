@@ -265,7 +265,9 @@ static inline void determine_launch_params(
   // threshold for adopting flash attention or warp_specialized kernels.
   launch_params.flash_attention =
       (data_type == DATA_TYPE_FP16 || data_type == DATA_TYPE_BF16 || data_type == DATA_TYPE_E4M3) &&
-      (s >= 16 && d >= 16) && !force_non_flash_attention;
+      // when s < 16, non-flash attention is faster,
+      // but in flashinfer only flash attention kernels are generated
+      (/*s >= 16 &&*/ d >= 16) && !force_non_flash_attention;
 
   // enable warp_speialized kernels when s >= 512 on hopper
   // note that warp_speialized kernels need flash attention + tma
