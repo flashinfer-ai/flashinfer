@@ -262,12 +262,15 @@ static inline void determine_launch_params(
   launch_params.multi_processor_count = props.multiProcessorCount;
   launch_params.device_l2_cache_size = props.l2CacheSize;
 
+#if 0
   // threshold for adopting flash attention or warp_specialized kernels.
   launch_params.flash_attention =
       (data_type == DATA_TYPE_FP16 || data_type == DATA_TYPE_BF16 || data_type == DATA_TYPE_E4M3) &&
-      // when s < 16, non-flash attention is faster,
-      // but in flashinfer only flash attention kernels are generated
-      (/*s >= 16 &&*/ d >= 16) && !force_non_flash_attention;
+      (s >= 16 && d >= 16) && !force_non_flash_attention;
+#else
+  // Currently only flash attention kernels are generated in FlashInfer
+  launch_params.flash_attention = true;
+#endif
 
   // enable warp_speialized kernels when s >= 512 on hopper
   // note that warp_speialized kernels need flash attention + tma
@@ -323,10 +326,10 @@ static inline Attention_mask_type string_to_mask_type(const std::string& s) {
 
 static inline Attention_input_layout string_to_input_layout(const std::string& s,
                                                             bool& is_paged_hnd) {
+  is_paged_hnd = false;
   if (s == "packed_qkv") return Attention_input_layout::PACKED_QKV;
   if (s == "contiguous_q_kv") return Attention_input_layout::CONTIGUOUS_Q_KV;
   if (s == "q_paged_kv_nhd") {
-    is_paged_hnd = false;
     return Attention_input_layout::Q_PAGED_KV;
   }
   if (s == "q_paged_kv_hnd") {
