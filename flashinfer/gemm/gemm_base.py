@@ -130,7 +130,8 @@ def get_gemm_module():
                     dtype=torch.uint8,
                     device="cpu",
                 )
-                cublas_handle = torch.cuda.current_blas_handle()
+                with torch.cuda.device(a.device):
+                    cublas_handle = torch.cuda.current_blas_handle()
                 count = module.bmm_fp8_get_algos(
                     a,
                     b,
@@ -160,8 +161,9 @@ def get_gemm_module():
                 do_preparation: bool = False,
                 **kwargs,
             ) -> torch.Tensor:
-                cublas_handle = torch.cuda.current_blas_handle()
                 a, b, scale_a, scale_b, out, workspace_buffer = inputs
+                with torch.cuda.device(a.device):
+                    cublas_handle = torch.cuda.current_blas_handle()
                 if tactic >= 0:
                     algo_buf, count = self._get_algos(inputs)
                     if count == 0:
@@ -994,7 +996,8 @@ def get_mm_bf16_cublaslt_module():
                     dtype=torch.uint8,
                     device="cpu",
                 )
-                cublas_handle = torch.cuda.current_blas_handle()
+                with torch.cuda.device(a.device):
+                    cublas_handle = torch.cuda.current_blas_handle()
                 proxy_out = (
                     out
                     if out.dtype == compute_dt
@@ -1028,7 +1031,8 @@ def get_mm_bf16_cublaslt_module():
                 **kwargs,
             ) -> torch.Tensor:
                 a, b, _, _, out, workspace_buffer = inputs
-                cublas_handle = torch.cuda.current_blas_handle()
+                with torch.cuda.device(a.device):
+                    cublas_handle = torch.cuda.current_blas_handle()
                 b_t = b.transpose(-2, -1)
 
                 need_cast = out.dtype == torch.float16
