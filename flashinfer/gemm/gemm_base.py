@@ -3495,9 +3495,11 @@ def _rank_sm100_block_scaled_tactics(valid_tactics, m, n, real_k, device):
         given the tile sizes.
       - Wave quantization efficiency: ratio of ideal CTA occupancy to actual
         CTA occupancy when mapped onto the available SMs.
+      - Cluster efficiency: penalize clusters that are too large relative to
+        the number of CTAs (under-occupied clusters waste resources).
 
-    The combined score is tile_efficiency * wave_efficiency. Higher is better.
-    Returns the tactic list sorted best-first.
+    The combined score is tile_efficiency * wave_efficiency * cluster_efficiency.
+    Higher is better. Returns the tactic list sorted best-first.
     """
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
 
@@ -3505,6 +3507,7 @@ def _rank_sm100_block_scaled_tactics(valid_tactics, m, n, real_k, device):
         mma_tiler_mn = tactic[0]
         cluster_shape_mn = tactic[1]
         swap_ab = tactic[2]
+        use_prefetch = tactic[3]
 
         tile_m, tile_n = mma_tiler_mn
         cluster_m, cluster_n = cluster_shape_mn
@@ -3520,6 +3523,7 @@ def _rank_sm100_block_scaled_tactics(valid_tactics, m, n, real_k, device):
         tile_efficiency = (prob_m * prob_n) / (padded_m * padded_n)
 
         # Wave quantization: how well CTAs fill the SMs
+        # Use ceil-div aligned to cluster shape for accurate CTA count
         ctas_m = ((prob_m + tile_m - 1) // tile_m + cluster_m - 1) // cluster_m * cluster_m
         ctas_n = ((prob_n + tile_n - 1) // tile_n + cluster_n - 1) // cluster_n * cluster_n
         total_ctas = ctas_m * ctas_n
@@ -3528,7 +3532,25 @@ def _rank_sm100_block_scaled_tactics(valid_tactics, m, n, real_k, device):
         num_waves = (total_ctas + sm_count - 1) // sm_count
         wave_efficiency = total_ctas / (num_waves * sm_count)
 
-        return tile_efficiency * wave_efficiency
+        # Cluster efficiency: penalize clusters with partially-filled dimensions.
+        # E.g., if we only need 3 CTA columns but cluster_n=4, one slot is wasted.
+        raw_ctas_m = (prob_m + tile_m - 1) // tile_m
+        raw_ctas_n = (prob_n + tile_n - 1) // tile_n
+        cluster_ctas_m = ((raw_ctas_m + cluster_m - 1) // cluster_m) * cluster_m
+        cluster_ctas_n = ((raw_ctas_n + cluster_n - 1) // cluster_n) * cluster_n
+        cluster_efficiency = (raw_ctas_m * raw_ctas_n) / (cluster_ctas_m * cluster_ctas_n)
+
+        # Prefer no prefetch as a tiebreaker (prefetch adds overhead for
+        # small problems and is only beneficial in specific wave regimes)
+        prefetch_penalty = 0.99 if use_prefetch else 1.0
+
+        # Tile throughput bias: larger tiles have higher per-CTA throughput
+        # due to better instruction amortization and shared memory utilization.
+        # Use sqrt to balance throughput vs quantization effects.
+        max_tile_area = 256 * 256  # largest candidate tile
+        tile_throughput = ((tile_m * tile_n) / max_tile_area) ** 0.5
+
+        return tile_efficiency * wave_efficiency * cluster_efficiency * tile_throughput * prefetch_penalty
 
     return sorted(valid_tactics, key=_score, reverse=True)
 
