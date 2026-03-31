@@ -34,6 +34,7 @@ from ..jit import (
 )
 from ..jit.fused_moe import (
     gen_cutlass_fused_moe_sm120_module,
+    gen_cutlass_fused_moe_sm121_module,
     gen_cutlass_fused_moe_sm103_module,
     gen_cutlass_fused_moe_sm100_module,
     gen_cutlass_fused_moe_sm90_module,
@@ -195,8 +196,10 @@ def convert_to_block_layout(input_tensor: torch.Tensor, blockK: int) -> torch.Te
 
 @functools.cache
 def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = False):
-    if backend in ("120", "121"):
+    if backend == "120":
         module = gen_cutlass_fused_moe_sm120_module(use_fast_build).build_and_load()
+    elif backend == "121":
+        module = gen_cutlass_fused_moe_sm121_module(use_fast_build).build_and_load()
     elif backend == "103":
         module = gen_cutlass_fused_moe_sm103_module(use_fast_build).build_and_load()
     elif backend in ("100", "110"):
