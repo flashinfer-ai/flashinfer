@@ -94,15 +94,6 @@ _4T_SF_BLOCKS_PER_TB = _LINEAR_WARPS_PER_BLOCK * _4T_SF_PER_WARP  # 128
 _LOW_SM_THRESHOLD = 80
 
 
-def _compute_swizzled_layout_sf_size(
-    total_row: int, total_column: int, row_size: int = 128
-) -> int:
-    """Compute size of swizzled scale factor buffer."""
-    padded_row = (total_row + row_size - 1) // row_size * row_size
-    padded_column = (total_column + 3) // 4 * 4
-    return padded_row * padded_column
-
-
 def _compute_optimal_threads(K: int, threads_per_sf: int = 1) -> int:
     """
     Compute optimal thread count for 100% utilization in the swizzled kernel.
@@ -249,7 +240,7 @@ class MXFP4QuantizeLinearKernel:
         if cutlass.const_expr(self.use_4t_per_sf):
             # =============================================================
             # 4T/SF path: 4 threads cooperate per SF block
-            # Each thread loads 8 elements (1×128-bit) — coalesced
+            # Each thread loads 8 elements (1x128-bit) -- coalesced
             # 2-shuffle reduction for cross-thread max
             # Each thread converts 8 elements and stores 4 bytes (u32)
             # =============================================================
@@ -266,7 +257,7 @@ class MXFP4QuantizeLinearKernel:
                 row_idx = sf_idx // num_sf_blocks_per_row
                 col_idx = sf_idx % num_sf_blocks_per_row
 
-                # Each thread loads 8 elements (1 × 128-bit load)
+                # Each thread loads 8 elements (1x128-bit load)
                 # thread_in_sf 0: [0..7], 1: [8..15], 2: [16..23], 3: [24..31]
                 # Adjacent threads load adjacent 16-byte chunks → COALESCED
                 elem_base = col_idx * MXFP4_SF_VEC_SIZE + thread_in_sf * Int32(8)
@@ -319,7 +310,7 @@ class MXFP4QuantizeLinearKernel:
         else:
             # =============================================================
             # 1T/SF path: 1 thread per SF block (original path)
-            # Each thread loads 32 elements (4×128-bit) independently
+            # Each thread loads 32 elements (4x128-bit) independently
             # =============================================================
             stride = grid_dim_x * sf_blocks_per_tb
 
@@ -948,6 +939,13 @@ def mxfp4_quantize_cute_dsl(
 
         kernel_fn(input, fp4_output, scale_output, m, total_sf_blocks, num_blocks)
     else:
+        # Swizzled 128x4 layout requires K to be a multiple of 128 so that
+        # K/32 (SF blocks per row) is a multiple of 4 and no column padding
+        # is needed in the scale factor buffer.
+        assert k % 128 == 0, (
+            f"SF_LAYOUT_128x4 requires K to be a multiple of 128 "
+            f"(K/32 must be a multiple of 4), got K={k}"
+        )
         padded_m = ((m + ROW_TILE_SIZE - 1) // ROW_TILE_SIZE) * ROW_TILE_SIZE
         padded_sf_cols = ((num_sf_blocks_per_row + 3) // 4) * 4
         scale_output_size = padded_m * padded_sf_cols

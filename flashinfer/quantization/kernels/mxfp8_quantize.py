@@ -91,7 +91,7 @@ def _compute_optimal_warps(K: int, sf_blocks_per_warp: int = SF_BLOCKS_PER_WARP)
     Compute optimal WARPS_PER_BLOCK for 100% thread utilization.
 
     For the swizzled kernel, we need:
-        (WARPS × sf_blocks_per_warp) % num_sf_blocks == 0
+        (WARPS x sf_blocks_per_warp) % num_sf_blocks == 0
 
     where num_sf_blocks = K / 32.
 
@@ -255,7 +255,7 @@ class MXFP8QuantizeLinearKernel:
             row_input = mInput[row_idx, None]
 
             if cutlass.const_expr(self.use_2t_per_sf):
-                # 2T/SF path: load 16 elements (2 × 128-bit), 1-shuffle reduction
+                # 2T/SF path: load 16 elements (2x128-bit), 1-shuffle reduction
                 input_ptr_lo = get_ptr_as_int64(row_input, elem_idx)
                 input_ptr_hi = get_ptr_as_int64(row_input, elem_idx + Int32(8))
                 v0, v1, v2, v3 = ld_global_v4_u32(input_ptr_lo)
@@ -270,7 +270,7 @@ class MXFP8QuantizeLinearKernel:
 
                 global_max = reduce_max_2threads(local_max)
             else:
-                # 4T/SF path: load 8 elements (1 × 128-bit), 2-shuffle reduction
+                # 4T/SF path: load 8 elements (1x128-bit), 2-shuffle reduction
                 input_ptr_i64 = get_ptr_as_int64(row_input, elem_idx)
                 v0, v1, v2, v3 = ld_global_v4_u32(input_ptr_i64)
 

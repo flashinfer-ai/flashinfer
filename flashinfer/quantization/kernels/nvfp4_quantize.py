@@ -81,15 +81,6 @@ _LINEAR_WARPS_PER_BLOCK = 16
 _LINEAR_SF_BLOCKS_PER_TB = _LINEAR_WARPS_PER_BLOCK * WARP_SIZE  # 512
 
 
-def _compute_swizzled_layout_sf_size(
-    total_row: int, total_column: int, row_size: int = 128
-) -> int:
-    """Compute size of swizzled scale factor buffer."""
-    padded_row = (total_row + row_size - 1) // row_size * row_size
-    padded_column = (total_column + 3) // 4 * 4
-    return padded_row * padded_column
-
-
 def _compute_optimal_threads(K: int) -> int:
     """
     Compute optimal thread count for 100% utilization in the swizzled kernel.
@@ -847,7 +838,7 @@ class NVFP4QuantizeTMAKernel:
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
 
-        # ---- TMA partition (3D: rows × warps × cols_per_warp) ----
+        # ---- TMA partition (3D: rows x warps x cols_per_warp) ----
         gSrc_tiled = cute.local_tile(
             gInput_tma,
             (_TMA_ROW_TILE, _TMA_NUM_CONSUMER_WARPS, _TMA_COL_TILE),
