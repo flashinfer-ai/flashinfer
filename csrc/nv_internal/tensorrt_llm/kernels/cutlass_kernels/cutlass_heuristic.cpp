@@ -638,13 +638,9 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm120(
 std::vector<CutlassGemmConfig> get_candidate_configs_sm121(
     CutlassGemmConfig::CandidateConfigTypeParam const config) {
 #ifdef FAST_BUILD
-  if (config & CutlassGemmConfig::GROUPED_GEMM) {
-    return {CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x64B,
-                              MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
-                              ClusterShape::ClusterShape_1x1x1}};
-  } else {
-    return get_candidate_configs_sm120(config);
-  }
+  return {CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x64B,
+                            MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
+                            ClusterShape::ClusterShape_1x1x1}};
 #else
   if (config & CutlassGemmConfig::GROUPED_GEMM) {
     if ((config & CutlassGemmConfig::FP4_ONLY) != 0) {
