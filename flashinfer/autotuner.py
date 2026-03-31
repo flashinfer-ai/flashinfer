@@ -1113,22 +1113,26 @@ class AutoTuner:
         return initializer(shapes, dtype, device)
 
     def _prepare_input_tensors(
-        self, profile: OptimizationProfile, inputs: List[torch.Tensor]
-    ) -> List[torch.Tensor]:
+        self, profile: OptimizationProfile, inputs: List[Optional[torch.Tensor]]
+    ) -> List[Optional[torch.Tensor]]:
         default_initializer = lambda shapes, dtype, device: (
             torch.rand(shapes, device=device) * 10 - 5
         ).to(dtype)
-        tensors = []
+        tensors: List[Optional[torch.Tensor]] = []
         for i, p in enumerate(profile.shapes):
-            if any(isinstance(d, DynamicDim) for d in p):
+            if inputs[i] is None:
+                # Some callers pass None for optional tensors (e.g. routing_logits
+                # in non-routed MoE). Preserve None as-is.
+                tensors.append(None)
+            elif any(isinstance(d, DynamicDim) for d in p):
                 tensor = self._create_tensor_like(
                     inputs[i],
                     p,
                     profile.tensor_initializers[i] or default_initializer,
                 )
+                tensors.append(tensor)
             else:
-                tensor = inputs[i]
-            tensors.append(tensor)
+                tensors.append(inputs[i])
         return tensors
 
     def save_configs(self, path: str) -> None:

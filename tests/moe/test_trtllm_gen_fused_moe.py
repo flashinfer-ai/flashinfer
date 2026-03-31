@@ -1341,11 +1341,7 @@ class FP8PerTensorMoe(Moe):
         # Use autotuner for optimal kernel selection
         with autotune(enable_autotune):
             output = trtllm_fp8_per_tensor_scale_moe(
-                (
-                    expert_logits.to(torch.bfloat16)
-                    if routing_method_type == RoutingMethodType.Llama4
-                    else expert_logits
-                ),
+                expert_logits,
                 routing_bias,
                 hidden_states_fp8,
                 static_data["gemm1_weights"],
@@ -2589,6 +2585,7 @@ def run_moe_test(
     weight_processing,
     activation_type,
     cache_permute_indices,
+    logits_dtype,
     zero_hidden_states=False,
     gemm1_bias=None,
     gemm2_bias=None,
@@ -2602,6 +2599,7 @@ def run_moe_test(
         num_tokens,
         hidden_size,
         intermediate_size,
+        logits_dtype,
         zero_hidden_states=zero_hidden_states,
     )
 
@@ -2631,14 +2629,9 @@ def run_moe_test(
         assert top_k < (top_k_groups * num_experts / n_groups)
 
     # Create test data based on routing method
-    if routing_method_type == RoutingMethodType.DeepSeekV3:
-        expert_logits = torch.randn((num_tokens, num_experts), device="cuda").to(
-            torch.float
-        )
-    else:
-        expert_logits = torch.randn((num_tokens, num_experts), device="cuda").to(
-            torch.bfloat16
-        )
+    expert_logits = torch.randn((num_tokens, num_experts), device="cuda").to(
+        logits_dtype
+    )
 
     if routing_config["has_routing_bias"]:
         routing_bias = torch.randn(num_experts, device="cuda", dtype=torch.bfloat16)
@@ -2944,6 +2937,13 @@ def run_moe_test(
         pytest.param(ActivationType.Geglu.value, id="Geglu"),
     ],
 )
+@pytest.mark.parametrize(
+    "logits_dtype",
+    [
+        pytest.param(torch.float32, id="FP32_logits"),
+        pytest.param(torch.bfloat16, id="BF16_logits"),
+    ],
+)
 def test_renormalize_routing(
     num_tokens,
     hidden_size,
@@ -2953,6 +2953,7 @@ def test_renormalize_routing(
     weight_processing,
     activation_type,
     cache_permute_indices,
+    logits_dtype,
     zero_hidden_states,
 ):
     """Test Renormalize routing configurations."""
@@ -2965,6 +2966,7 @@ def test_renormalize_routing(
         weight_processing,
         activation_type,
         cache_permute_indices,
+        logits_dtype,
         zero_hidden_states=zero_hidden_states,
     )
 
@@ -3140,6 +3142,12 @@ def test_renormalize_routing(
         pytest.param(ActivationType.Relu2.value, id="Relu2"),
     ],
 )
+@pytest.mark.parametrize(
+    "logits_dtype",
+    [
+        pytest.param(torch.float32, id="FP32_logits"),
+    ],
+)
 def test_deepseekv3_routing(
     num_tokens,
     hidden_size,
@@ -3148,6 +3156,7 @@ def test_deepseekv3_routing(
     routing_config,
     weight_processing,
     activation_type,
+    logits_dtype,
     cache_permute_indices,
 ):
     """Test DeepSeekV3 routing configurations."""
@@ -3160,6 +3169,7 @@ def test_deepseekv3_routing(
         weight_processing,
         activation_type,
         cache_permute_indices,
+        logits_dtype,
     )
 
 
@@ -3215,6 +3225,13 @@ def test_deepseekv3_routing(
         pytest.param(ActivationType.Geglu.value, id="Geglu"),
     ],
 )
+@pytest.mark.parametrize(
+    "logits_dtype",
+    [
+        pytest.param(torch.float32, id="FP32_logits"),
+        pytest.param(torch.bfloat16, id="BF16_logits"),
+    ],
+)
 def test_topk_routing(
     num_tokens,
     hidden_size,
@@ -3223,6 +3240,7 @@ def test_topk_routing(
     routing_config,
     weight_processing,
     activation_type,
+    logits_dtype,
     cache_permute_indices,
 ):
     """Test TopK routing configuration."""
@@ -3235,6 +3253,7 @@ def test_topk_routing(
         weight_processing,
         activation_type,
         cache_permute_indices,
+        logits_dtype,
     )
 
 
@@ -3288,6 +3307,12 @@ def test_topk_routing(
         pytest.param(ActivationType.Swiglu.value, id="Swiglu"),
     ],
 )
+@pytest.mark.parametrize(
+    "logits_dtype",
+    [
+        pytest.param(torch.bfloat16, id="BF16_logits"),
+    ],
+)
 def test_llama4_routing(
     num_tokens,
     hidden_size,
@@ -3296,6 +3321,7 @@ def test_llama4_routing(
     routing_config,
     weight_processing,
     activation_type,
+    logits_dtype,
     cache_permute_indices,
 ):
     """Test Llama4 routing configuration with FP8 per-tensor."""
@@ -3308,6 +3334,7 @@ def test_llama4_routing(
         weight_processing,
         activation_type,
         cache_permute_indices,
+        logits_dtype,
     )
 
 
@@ -3359,6 +3386,7 @@ def test_nvfp4_moe_gemm_bias(
         },
         activation_type=ActivationType.Swiglu,
         cache_permute_indices=cache_permute_indices,
+        logits_dtype=torch.bfloat16,
         gemm1_bias=gemm1_bias,
         gemm2_bias=gemm2_bias,
     )
