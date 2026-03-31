@@ -3475,6 +3475,7 @@ def test_mxfp8_block_scale_moe_relu2_non_gated(
         weight_processing=weight_processing,
         activation_type=ActivationType.Relu2,
         cache_permute_indices=cache_permute_indices,
+        logits_dtype=torch.bfloat16,
         zero_hidden_states=zero_hidden_states,
     )
 
@@ -3510,6 +3511,7 @@ def test_mxfp8_block_scale_moe_relu2_deepseekv3_topk22(cache_permute_indices):
         },
         activation_type=ActivationType.Relu2,
         cache_permute_indices=cache_permute_indices,
+        logits_dtype=torch.float32,
     )
 
 
@@ -3598,6 +3600,7 @@ def test_fp8_block_scale_autotune_valid_configs(autotune_case, cache_permute_ind
         },
         activation_type=autotune_case["activation_type"],
         cache_permute_indices=cache_permute_indices,
+        logits_dtype=torch.float32,
         zero_hidden_states=False,
     )
 
@@ -3659,6 +3662,7 @@ def test_fp8_per_tensor_autotune_valid_configs_nonefp8(
         },
         activation_type=autotune_case["activation_type"],
         cache_permute_indices=cache_permute_indices,
+        logits_dtype=torch.bfloat16,
         zero_hidden_states=False,
     )
 
