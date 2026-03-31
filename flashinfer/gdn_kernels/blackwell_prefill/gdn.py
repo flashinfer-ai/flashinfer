@@ -45,7 +45,6 @@ from cutlass._mlir.dialects import nvvm
 
 import cuda.bindings.driver as cuda
 
-
 from .gdn_tile_scheduler import (
     GdnStaticTileScheduler,
     GdnStaticTileSchedulerParams,
