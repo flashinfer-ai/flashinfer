@@ -756,11 +756,11 @@ class AutoTuner:
                                     raise
                                 except Exception as e:
                                     shapes = self._get_input_sizes(tensors)
-                                    logger.warning(
+                                    # Log stacktrace as debug to not spam log
+                                    logger.debug(
                                         f"[Autotuner]: Skipping tactic {r} {tac}, due to failure while profiling: {e}"
                                     )
 
-                                    # Log stacktrace as debug to not spam log
                                     logger.debug(
                                         f"[Autotuner]: Failed when profiling {r} {tac}, shapes={shapes}. Error occurred: {e}"
                                     )
