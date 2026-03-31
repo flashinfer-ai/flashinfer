@@ -76,7 +76,7 @@ def test_mm_mxfp8_sm120_tactic_num():
     assert num_tactics == 3, f"Expected 3 tactics, got {num_tactics}"
 
 
-def test_mm_mxfp8_sm120_all_tactics():
+def test_mm_mxfp8_sm120_auto_tactic():
     """Verify SM120 MXFP8 produces correct results (tactic auto-selected)."""
     _skip_if_not_sm120()
     from flashinfer.jit.gemm import gen_gemm_sm120_module_cutlass_mxfp8
@@ -105,3 +105,18 @@ def test_mm_mxfp8_sm120_all_tactics():
         reference.reshape(-1).float(), result.reshape(-1).float(), dim=0
     ).item()
     assert cos_sim > 0.98, f"cos_sim={cos_sim:.4f}"
+
+
+def test_mm_mxfp8_sm120_rejects_linear_scales():
+    """SM120 CUTLASS MXFP8 must reject non-swizzled (2D) scale tensors."""
+    _skip_if_not_sm120()
+
+    m, n, k = 128, 128, 128
+    a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    b = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    a_fp8, b_fp8, a_sf, b_sf = _prepare_mxfp8(a, b, swizzled=False)
+
+    with pytest.raises((RuntimeError, ValueError)):
+        mm_mxfp8(
+            a_fp8, b_fp8.T, a_sf, b_sf, out_dtype=torch.bfloat16, backend="cutlass"
+        )

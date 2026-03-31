@@ -109,6 +109,8 @@ class CutlassMxfp8GemmRunnerSm120 : public virtual CutlassMxfp8GemmRunnerInterfa
                                        batch_count, gemmConfig, nullptr, 0, nullptr, nullptr);
           workspace_size = std::max(workspace_size, curr);
         } catch (std::runtime_error&) {
+          // Some tile configs may fail for certain problem sizes (e.g. exceeding
+          // SMEM capacity).  Swallow the error and try the next config.
           continue;
         }
       }

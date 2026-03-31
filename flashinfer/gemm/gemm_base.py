@@ -3426,6 +3426,8 @@ def _cutlass_gemm_mxfp8_requirement(
 ):
     if is_sm12x_supported(a.device):
         # SM120/121 CUTLASS MXFP8 only supports 1D swizzled scales (SfLayout.layout_128x4).
+        if use_8x4_sf_layout:
+            return False
         if a_descale.ndim != 1 or b_descale.ndim != 1:
             return False
         # K and N must be multiples of 32.
@@ -7007,10 +7009,11 @@ def bmm_mxfp8(
         "bmm_mxfp8_workspace", DEFAULT_WORKSPACE_SIZE, A.device
     )
 
-    major, _ = get_compute_capability(A.device)
     resolved_backend = backend
     if resolved_backend == "auto":
-        resolved_backend = "cutlass" if major == 12 else "cudnn"
+        if not bmm_mxfp8.suitable_auto_backends:
+            raise ValueError("No suitable backend found for bmm_mxfp8")
+        resolved_backend = bmm_mxfp8.suitable_auto_backends[0]
 
     if resolved_backend == "cutlass":
         # SM120/121 CUTLASS path.

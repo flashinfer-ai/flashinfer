@@ -225,12 +225,13 @@ size_t genericMxfp8GemmKernelLauncherSm120(void* D, void const* A, void const* B
     auto args = prepareGemmArgsSm120_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_<Mxfp8GemmOperator>(        \
         D, A, B, input_sf, weight_sf, m, n, k, batch_count);                                         \
     /* Return workspace size */                                                                      \
+    size_t required_workspace = gemm.get_workspace_size(args);                                       \
     if (!A && !B && !D) {                                                                            \
-      return gemm.get_workspace_size(args);                                                          \
+      return required_workspace;                                                                     \
     }                                                                                                \
-    if (gemm.get_workspace_size(args) > workspaceBytes) {                                            \
+    if (required_workspace > workspaceBytes) {                                                       \
       std::string errMsg("Requested workspace size insufficient. Required " +                        \
-                         std::to_string(gemm.get_workspace_size(args)) + ", got " +                  \
+                         std::to_string(required_workspace) + ", got " +                             \
                          std::to_string(workspaceBytes));                                            \
       throw std::runtime_error("[MXFP8 SM120 gemm Runner] " + errMsg);                               \
     }                                                                                                \
@@ -252,7 +253,7 @@ size_t genericMxfp8GemmKernelLauncherSm120(void* D, void const* A, void const* B
                            std::string(cutlassGetStatusString(runStatus));                           \
       throw std::runtime_error("[MXFP8 SM120 gemm Runner] " + errMsg);                               \
     }                                                                                                \
-    return gemm.get_workspace_size(args);                                                            \
+    return required_workspace;                                                                       \
   }
 
 #endif  // PLACEHOLDER_KERNELS
