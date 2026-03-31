@@ -1331,9 +1331,7 @@ def test_mis_v1_v2_output_parity(
     v1_item_indices_t = torch.tensor(v1_item_indices, device="cuda")
     o_v1_items = o_v1[v1_item_indices_t]
 
-    numpy.testing.assert_allclose(
-        o_v2.cpu().numpy(), o_v1_items.cpu().numpy(), rtol=1e-3, atol=1e-3
-    )
+    torch.testing.assert_close(o_v2, o_v1_items, rtol=1e-3, atol=1e-3)
 
 
 if __name__ == "__main__":
