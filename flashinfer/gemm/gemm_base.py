@@ -1790,8 +1790,8 @@ def _validate_bf16_output_dtype(dtype: torch.dtype):
         )
 
 
-@functools.lru_cache(maxsize=1024)
-def create_cudnn_execution_plans_fp4_gemm(
+@functools.cache
+def build_cudnn_gemm_fp4_graph(
     a_shape,
     a_stride,
     b_shape,
@@ -1806,7 +1806,12 @@ def create_cudnn_execution_plans_fp4_gemm(
     device,
     alpha_is_not_none,
     use_nvfp4,
+    policy=None,
 ):
+    _check_cudnn_availability()
+    if policy is None:
+        policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
+
     stream = torch.cuda.current_stream(device)
     with cudnn.graph(_get_cudnn_handle(device, stream)) as (graph, _):
         scale_type = cudnn.data_type.FP8_E4M3 if use_nvfp4 else cudnn.data_type.FP8_E8M0
@@ -1888,51 +1893,10 @@ def create_cudnn_execution_plans_fp4_gemm(
         if (alpha_is_not_none) and (not _is_cublas_fp4_available_in_cudnn()):
             graph.deselect_engines(["eng0"])
 
+        graph.check_support()
+        graph.build_plans(policy)
+
         return graph
-
-
-@functools.lru_cache(maxsize=1024)
-def build_plans_cudnn_fp4_gemm_graph(
-    a_shape,
-    a_stride,
-    b_shape,
-    b_stride,
-    a_descale_shape,
-    a_descale_stride,
-    b_descale_shape,
-    b_descale_stride,
-    ab_type,
-    o_type,
-    block_size,
-    device,
-    alpha,
-    use_nvfp4,
-    tactic: int = -1,
-):
-    # Graph should have been already cached, when we ran _cudnn_gemm_fp4_requirement
-    graph = create_cudnn_execution_plans_fp4_gemm(
-        a_shape,
-        a_stride,
-        b_shape,
-        b_stride,
-        a_descale_shape,
-        a_descale_stride,
-        b_descale_shape,
-        b_descale_stride,
-        ab_type,
-        o_type,
-        block_size,
-        device,
-        alpha,
-        use_nvfp4,
-    )
-
-    graph.check_support()
-    if tactic != -1:
-        graph.build_plan_at_index(tactic)
-    else:
-        graph.build_plans()
-    return graph
 
 
 def execute_cudnn_gemm_fp4_graph(
@@ -2801,8 +2765,18 @@ def _get_bf16_3d_shape_stride(tensor: torch.Tensor):
 
 
 @functools.cache
-def build_cudnn_gemm_bf16_graph(a_shape, a_stride, b_shape, b_stride, o_type, device):
+def build_cudnn_gemm_bf16_graph(
+    a_shape,
+    a_stride,
+    b_shape,
+    b_stride,
+    o_type,
+    device,
+    policy=None,
+):
     _check_cudnn_availability()
+    if policy is None:
+        policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
 
     stream = torch.cuda.current_stream(device)
     with cudnn.graph(_get_cudnn_handle(device, stream)) as (graph, _):
@@ -2828,7 +2802,7 @@ def build_cudnn_gemm_bf16_graph(a_shape, a_stride, b_shape, b_stride, o_type, de
         graph.build_operation_graph()
         graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
         graph.check_support()
-        graph.build_plans()
+        graph.build_plans(policy)
 
         return graph
 
@@ -2991,6 +2965,11 @@ def _cudnn_gemm_bf16(
     a_shape, a_stride = _get_bf16_3d_shape_stride(a)
     b_shape, b_stride = _get_bf16_3d_shape_stride(b)
 
+    if tactic == -1:
+        policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
+    else:
+        policy = cudnn.build_plan_policy.ALL
+
     graph = build_cudnn_gemm_bf16_graph(
         a_shape,
         a_stride,
@@ -2998,13 +2977,21 @@ def _cudnn_gemm_bf16(
         b_stride,
         _torch_data_type_to_cudnn_data_type(out.dtype),
         a.device,
+        policy=policy,
     )
+
     execute_cudnn_gemm_bf16_graph(graph, a, b, out, workspace, tactic=tactic)
     return out
 
 
 def _cudnn_gemm_bf16_runner():
     class CudnnBf16GemmRunner(TunableRunner):
+        def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+            # inputs layout: a, b, bias, pdl, out, workspace_buffer
+            # out.dtype distinguishes bfloat16 / float16 / float32 output graphs
+            _, _, _, _, out, _ = inputs
+            return (out.dtype,)
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
@@ -3021,7 +3008,9 @@ def _cudnn_gemm_bf16_runner():
                 b_stride,
                 _torch_data_type_to_cudnn_data_type(out.dtype),
                 a.device,
+                policy=cudnn.build_plan_policy.ALL,
             )
+
             return list(range(graph.get_execution_plan_count()))
 
         def forward(
@@ -3032,11 +3021,14 @@ def _cudnn_gemm_bf16_runner():
             **kwargs,
         ) -> torch.Tensor:
             a, b, bias, pdl, out, workspace_buffer = inputs
+
             if bias is not None:
                 raise ValueError("cudnn bf16 gemm does not support bias.")
             if pdl:
                 raise ValueError("cudnn bf16 gemm does not support pdl.")
+
             _cudnn_gemm_bf16(workspace_buffer, a, b, out, tactic=tactic)
+
             return out
 
     return CudnnBf16GemmRunner()
@@ -3781,7 +3773,10 @@ def _cute_dsl_gemm_mxfp8_runner(
 
             if swap_ab:
                 kernel_m, kernel_n = n, m
-                kernel_a, kernel_b = b.T, a.T
+                # Swap A/B: kernel expects both mA and mB with shape (*, K).
+                # b is (k, n) col-major → b.T is (n, k) row-major.
+                # a is already (m, k) row-major — no transpose needed.
+                kernel_a, kernel_b = b.T, a
                 kernel_a_sf, kernel_b_sf = b_descale, a_descale
             else:
                 kernel_m, kernel_n = m, n
@@ -3824,9 +3819,11 @@ def _cute_dsl_gemm_mxfp8_runner(
                 batch_size=batch_size,
             )
 
-            launch_out = out.T if swap_ab else out
             alpha_for_launch = _prepare_alpha_for_launch(None, a.device)
 
+            launch_out = (
+                out.as_strided(out.shape, (1, out.shape[0])) if swap_ab else out
+            )
             compiled_gemm(
                 kernel_a,
                 kernel_b,
@@ -4032,7 +4029,7 @@ def mm_mxfp8(
     return out
 
 
-def _get_cudnn_fp4_gemm_graph(
+def _cudnn_gemm_fp4(
     a: torch.Tensor,
     b: torch.Tensor,
     a_descale: torch.Tensor,
@@ -4042,8 +4039,11 @@ def _get_cudnn_fp4_gemm_graph(
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
     use_nvfp4: bool = True,
+    workspace_buffer: torch.Tensor = None,
     tactic: int = -1,
 ):
+    _check_cudnn_availability()
+
     # the fp4 cudnn graph will be shared for both mm and bmm, so
     # here we need to get the 3d shape and stride including the
     # batch dimension for both input and block scale tensors.
@@ -4057,9 +4057,14 @@ def _get_cudnn_fp4_gemm_graph(
         _expand_block_scale_tensor_shape(b_descale, batch)
     )
 
+    if tactic == -1:
+        policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
+    else:
+        policy = cudnn.build_plan_policy.ALL
+
     # build the fp4 cudnn graph
     # Constructed graph is cached, via @functools.cache decorator.
-    graph = build_plans_cudnn_fp4_gemm_graph(
+    graph = build_cudnn_gemm_fp4_graph(
         real_a_shape,
         real_a_stride,
         real_b_shape,
@@ -4074,45 +4079,26 @@ def _get_cudnn_fp4_gemm_graph(
         a.device,
         alpha is not None,
         use_nvfp4,
-        tactic=tactic,
+        policy=policy,
     )
-    return graph
 
-
-def _cudnn_gemm_fp4(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    a_descale: torch.Tensor,
-    b_descale: torch.Tensor,
-    alpha: Optional[torch.Tensor] = None,
-    out_dtype: torch.dtype = torch.bfloat16,
-    out: Optional[torch.Tensor] = None,
-    block_size: int = 16,
-    use_nvfp4: bool = True,
-    workspace_buffer: torch.Tensor = None,
-    tactic: int = -1,
-):
-    # Graph should have been already cached, when we ran _cudnn_gemm_fp4_requirement
-    graph = _get_cudnn_fp4_gemm_graph(
-        a=a,
-        b=b,
-        a_descale=a_descale,
-        b_descale=b_descale,
-        alpha=alpha,
-        out_dtype=out_dtype,
-        out=out,
-        block_size=block_size,
-        use_nvfp4=use_nvfp4,
-        tactic=tactic,
-    )
     # execute the fp4 cudnn graph
     execute_cudnn_gemm_fp4_graph(
         graph, a, b, a_descale, b_descale, alpha, out, workspace_buffer, tactic=tactic
     )
 
+    return out
+
 
 def _cudnn_gemm_fp4_runner():
     class CudnnFp4GemmRunner(TunableRunner):
+        def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+            # inputs layout: a, b, a_descale, b_descale, alpha, out_dtype,
+            #                out, block_size, use_nvfp4, workspace_buffer
+            # All four values affect which cuDNN graph is built.
+            _, _, _, _, alpha, out_dtype, out, block_size, use_nvfp4, _ = inputs
+            return (out_dtype, block_size, use_nvfp4, alpha is not None)
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
@@ -4132,22 +4118,38 @@ def _cudnn_gemm_fp4_runner():
                 workspace_buffer,
             ) = inputs
 
-            # Graph should have been already cached, when we ran _cudnn_gemm_fp4_requirement
-            graph = _get_cudnn_fp4_gemm_graph(
-                a=a,
-                b=b,
-                a_descale=a_descale,
-                b_descale=b_descale,
-                alpha=alpha,
-                out_dtype=out_dtype,
-                out=out,
-                block_size=block_size,
-                use_nvfp4=use_nvfp4,
-                tactic=-1,
+            # the fp4 cudnn graph will be shared for both mm and bmm, so
+            # here we need to get the 3d shape and stride including the
+            # batch dimension for both input and block scale tensors.
+            real_a_shape, real_a_stride = _get_real_fp4_shape_from_packed_uint8(a)
+            real_b_shape, real_b_stride = _get_real_fp4_shape_from_packed_uint8(b)
+            batch = real_a_shape[0]
+            expanded_a_descale_shape, expanded_a_descale_stride = (
+                _expand_block_scale_tensor_shape(a_descale, batch)
+            )
+            expanded_b_descale_shape, expanded_b_descale_stride = (
+                _expand_block_scale_tensor_shape(b_descale, batch)
             )
 
-            num_plans = graph.get_execution_plan_count()
-            return list(range(num_plans))
+            graph = build_cudnn_gemm_fp4_graph(
+                real_a_shape,
+                real_a_stride,
+                real_b_shape,
+                real_b_stride,
+                expanded_a_descale_shape,
+                expanded_a_descale_stride,
+                expanded_b_descale_shape,
+                expanded_b_descale_stride,
+                cudnn.data_type.FP4_E2M1,
+                _torch_data_type_to_cudnn_data_type(out_dtype),
+                block_size,
+                a.device,
+                alpha is not None,
+                use_nvfp4,
+                policy=cudnn.build_plan_policy.ALL,
+            )
+
+            return list(range(graph.get_execution_plan_count()))
 
         def forward(
             self,
@@ -4168,6 +4170,7 @@ def _cudnn_gemm_fp4_runner():
                 use_nvfp4,
                 workspace_buffer,
             ) = inputs
+
             _cudnn_gemm_fp4(
                 a,
                 b,
@@ -4181,6 +4184,8 @@ def _cudnn_gemm_fp4_runner():
                 workspace_buffer,
                 tactic=tactic,
             )
+
+            return out
 
     return CudnnFp4GemmRunner()
 
@@ -4271,39 +4276,6 @@ def _cudnn_gemm_fp4_requirement(
         raise LibraryError(CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR)
 
     _check_cudnn_fp4_availability()
-
-    # the fp4 cudnn graph will be shared for both mm and bmm, so
-    # here we need to get the 3d shape and stride including the
-    # batch dimension for both input and block scale tensors.
-    real_a_shape, real_a_stride = _get_real_fp4_shape_from_packed_uint8(a)
-    real_b_shape, real_b_stride = _get_real_fp4_shape_from_packed_uint8(b)
-    batch = real_a_shape[0]
-    expanded_a_descale_shape, expanded_a_descale_stride = (
-        _expand_block_scale_tensor_shape(a_descale, batch)
-    )
-    expanded_b_descale_shape, expanded_b_descale_stride = (
-        _expand_block_scale_tensor_shape(b_descale, batch)
-    )
-
-    # build the fp4 cudnn graph. This graph will be cached & reused in mm_fp4()
-    # because the graph is constructed with @functools.cache decorator
-    graph = create_cudnn_execution_plans_fp4_gemm(
-        real_a_shape,
-        real_a_stride,
-        real_b_shape,
-        real_b_stride,
-        expanded_a_descale_shape,
-        expanded_a_descale_stride,
-        expanded_b_descale_shape,
-        expanded_b_descale_stride,
-        cudnn.data_type.FP4_E2M1,
-        _torch_data_type_to_cudnn_data_type(out_dtype),
-        block_size,
-        a.device,
-        alpha is not None,
-        use_nvfp4,
-    )
-    graph.check_support()
 
     return True
 
@@ -4574,9 +4546,11 @@ def _cute_dsl_gemm_fp4_runner(
 
             if swap_ab:
                 kernel_m, kernel_n = n, m
-                # Swap A/B tensors and their scale factors
-                kernel_a, kernel_b = b.T, a.T
-                kernel_a_sf, kernel_b_sf = b_descale.T, a_descale.T
+                # Swap A/B: kernel expects both mA and mB with shape (*, K).
+                # b is (k_packed, n) col-major → b.T is (n, k_packed) row-major.
+                # a is already (m, k_packed) row-major — no transpose needed.
+                kernel_a, kernel_b = b.T, a
+                kernel_a_sf, kernel_b_sf = b_descale.T, a_descale
             else:
                 kernel_m, kernel_n = m, n
                 # b comes in as (k_packed, n), need (n, k_packed) for the kernel
@@ -4633,9 +4607,16 @@ def _cute_dsl_gemm_fp4_runner(
                 batch_size=batch_size,
             )
 
-            launch_out = out.T if swap_ab else out
             alpha_for_launch = _prepare_alpha_for_launch(alpha_tensor, a.device)
 
+            # swap_ab compiled kernel expects column-major mC with shape
+            # (sym_n, sym_m) = (m, n).  Reinterpret out's storage as
+            # column-major so the runtime shape+stride checks pass.
+            # The kernel reconstructs C's layout from the raw pointer,
+            # so the view's strides don't affect computation.
+            launch_out = (
+                out.as_strided(out.shape, (1, out.shape[0])) if swap_ab else out
+            )
             compiled_gemm(
                 kernel_a,
                 kernel_b,
@@ -5828,16 +5809,29 @@ def _check_group_gemm_mxfp8_mxfp4_nt_groupwise_problem_size(
         raise ValueError(f"b_scale must be a uint8 tensor, but got {b_scale.dtype}")
     if m_indptr.dtype != torch.int32:
         raise ValueError(f"m_indptr must be a int32 tensor, but got {m_indptr.dtype}")
-    if mma_sm not in [1, 2]:
-        raise ValueError(f"mma_sm must be either 1 or 2, but got {mma_sm}")
-    if tile_m not in [128]:
-        raise ValueError(f"tile_m must be 128, but got {tile_m}")
-    if tile_n not in [64, 128, 192, 256]:
-        raise ValueError(f"tile_n must be one of [64, 128, 192, 256], but got {tile_n}")
-    if tile_k not in [128, 256]:
-        raise ValueError(f"tile_k must be either 128 or 256, but got {tile_k}")
     if swap_ab not in [True, False]:
         raise ValueError(f"swap_ab must be a boolean value, but got {swap_ab}")
+
+    if is_sm12x_supported(a.device):
+        if mma_sm not in [1]:
+            raise ValueError(f"mma_sm must be 1, but got {mma_sm}")
+        if tile_m not in [128]:
+            raise ValueError(f"tile_m must be 128, but got {tile_m}")
+        if tile_n not in [128]:
+            raise ValueError(f"tile_n must be 128, but got {tile_n}")
+        if tile_k not in [128]:
+            raise ValueError(f"tile_k must be 128, but got {tile_k}")
+    else:
+        if mma_sm not in [1, 2]:
+            raise ValueError(f"mma_sm must be either 1 or 2, but got {mma_sm}")
+        if tile_m not in [128]:
+            raise ValueError(f"tile_m must be 128, but got {tile_m}")
+        if tile_n not in [64, 128, 192, 256]:
+            raise ValueError(
+                f"tile_n must be one of [64, 128, 192, 256], but got {tile_n}"
+            )
+        if tile_k not in [128, 256]:
+            raise ValueError(f"tile_k must be either 128 or 256, but got {tile_k}")
 
     # Determine out_dtype if not specified
     if out is None:
@@ -5904,7 +5898,7 @@ def group_gemm_mxfp8_mxfp4_nt_groupwise(
     out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     r"""Perform group GEMM with MXFP4 data types using groupwise scaling. Currently only supported on NVIDIA
-    Blackwell architecture.
+    Blackwell, Blackwell Geforce, and DGX Spark architectures.
 
     Parameters
     ----------
@@ -5926,17 +5920,17 @@ def group_gemm_mxfp8_mxfp4_nt_groupwise(
         Element element in ``m_indptr`` must be a multiple of 4.
 
     mma_sm: int
-        How many SMs to use for the MMA operation, must be 1 or 2.
+        How many SMs to use for the MMA operation, must be 1 or 2. 2 is not supported on SM120/121.
         2 is faster when number of rows (M) per group is large (>= 256).
 
     tile_m: int
         The tile size for the M dimension, must be 128.
 
     tile_n: int
-        The tile size for the N dimension, must be 64, 128, 192, or 256.
+        The tile size for the N dimension, must be 64, 128, 192, or 256. Only 128 is supported on SM120/121.
 
     tile_k: int
-        The tile size for the K dimension, must be 128 or 256.
+        The tile size for the K dimension, must be 128 or 256. Only 128 is supported on SM120/121.
 
     swap_ab: bool
         Whether to swap the A and B tensors.
@@ -5980,7 +5974,254 @@ def group_gemm_mxfp8_mxfp4_nt_groupwise(
     if out is None:
         out = torch.empty(out_shape, dtype=out_dtype, device=a.device)
 
-    get_gemm_sm100_module().group_gemm_mxfp4_nt_groupwise(
+    if is_sm12x_supported(a.device):
+        # SM120/121 doesn't use mma_sm parameter or swap_ab
+        get_gemm_sm120_module().group_gemm_mxfp4_nt_groupwise(
+            int_workspace_buffer,
+            float_workspace_buffer,
+            a,
+            b,
+            a_scale,
+            b_scale,
+            out,
+            m_indptr,
+            n,
+            k,
+            tile_m,
+            tile_n,
+            tile_k,
+        )
+    elif is_sm100a_supported(a.device):
+        get_gemm_sm100_module().group_gemm_mxfp4_nt_groupwise(
+            int_workspace_buffer,
+            float_workspace_buffer,
+            a,
+            b,
+            a_scale,
+            b_scale,
+            out,
+            m_indptr,
+            n,
+            k,
+            mma_sm,
+            tile_m,
+            tile_n,
+            tile_k,
+            swap_ab,
+        )
+    else:
+        raise ValueError(f"Unsupported device for MXFP4 group GEMM: {a.device}")
+    return out
+
+
+# NOTE(Zihao): keep the old name for backward compatibility
+group_gemm_mxfp4_nt_groupwise = group_gemm_mxfp8_mxfp4_nt_groupwise
+
+
+# NOTE: Just 120/121 support has been added, but it is trivial to generalize
+@supported_compute_capability([120, 121])
+def _check_group_gemm_nvfp4_nt_groupwise_problem_size(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    m_indptr: torch.Tensor,
+    alpha: Optional[torch.Tensor] = None,
+    tile_m: int = 128,
+    tile_n: int = 128,
+    tile_k: int = 128,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+):
+    if a.dtype not in [torch.uint8]:
+        raise ValueError(f"a must be a uint8 tensor, but got {a.dtype}")
+    if b.dtype != torch.uint8:
+        raise ValueError(f"b must be a uint8 tensor, but got {b.dtype}")
+    if a_scale.dtype != torch.uint8:
+        raise ValueError(f"a_scale must be a uint8 tensor, but got {a_scale.dtype}")
+    if b_scale.dtype != torch.uint8:
+        raise ValueError(f"b_scale must be a uint8 tensor, but got {b_scale.dtype}")
+    if m_indptr.dtype != torch.int32:
+        raise ValueError(f"m_indptr must be a int32 tensor, but got {m_indptr.dtype}")
+    if alpha is not None and alpha.dtype != torch.float32:
+        raise ValueError(
+            f"alpha must be a float32 tensor or None, but got {alpha.dtype}"
+        )
+    if tile_m not in [128]:
+        raise ValueError(f"tile_m must be 128, but got {tile_m}")
+    if tile_n not in [128]:
+        raise ValueError(f"tile_n must be one of 128, but got {tile_n}")
+    if tile_k not in [128, 256]:
+        raise ValueError(f"tile_k must be either 128 or 256, but got {tile_k}")
+
+    # Determine out_dtype if not specified
+    if out is None:
+        if out_dtype is None:
+            out_dtype = torch.bfloat16
+    else:
+        if out_dtype is None:
+            out_dtype = out.dtype
+
+    if out_dtype not in [torch.bfloat16, torch.float16]:
+        raise ValueError(
+            f"out_dtype must be either torch.bfloat16 or torch.float16, but got {out_dtype}"
+        )
+
+    num_groups = m_indptr.shape[0] - 1
+
+    if alpha is not None:
+        if alpha.dtype != torch.float32:
+            raise ValueError(f"alpha must be a float32 tensor, but got {alpha.dtype}")
+        if alpha.device != a.device:
+            raise ValueError(
+                f"alpha must be on the same device as a, but got alpha.device={alpha.device}, a.device={a.device}"
+            )
+        if alpha.numel() != 0 and alpha.shape != (num_groups,):
+            raise ValueError(
+                f"alpha must be a empty or have shape {(num_groups,)}, but got alpha.shape={alpha.shape}"
+            )
+
+    if b.shape[0] != num_groups:
+        raise ValueError(
+            f"b.shape[0] must equal num_groups (m_indptr.shape[0] - 1), but got b.shape[0]={b.shape[0]}, num_groups={num_groups}"
+        )
+
+    # Check b, a_scale, and b_scale are all on the same device
+    if b.device != a.device:
+        raise ValueError(
+            f"b must be on the same device as a, but got b.device={b.device}, a.device={a.device}"
+        )
+    if a_scale.device != a.device:
+        raise ValueError(
+            f"a_scale must be on the same device as a, but got a_scale.device={a_scale.device}, a.device={a.device}"
+        )
+    if b_scale.device != b.device:
+        raise ValueError(
+            f"b_scale must be on the same device as b, but got b_scale.device={b_scale.device}, b.device={b.device}"
+        )
+
+    n = b.shape[1]
+    k = b.shape[2] * 2  # Multiply by 2 because b is e2m1 packed as uint8
+
+    # assert a.shape[0] == m_indptr[-1].item()  # Not enabled in consideration of performance
+    if a.shape[1] * 2 != k:
+        raise ValueError(
+            f"a.shape[1] * 2 must equal k, but got a.shape[1]={a.shape[1]}, k={k}"
+        )
+
+    align_n = 8
+    align_k = 128
+    if n % align_n != 0:
+        raise ValueError(f"n must be a multiple of {align_n}, but got n={n}")
+    if k % align_k != 0:
+        raise ValueError(f"k must be a multiple of {align_k}, but got k={k}")
+
+    out_shape = (a.shape[0], n)
+    if out is not None:
+        if out.shape != out_shape:
+            raise ValueError(f"out.shape must be {out_shape}, but got {out.shape}")
+        if out.dtype != out_dtype:
+            raise ValueError(f"out.dtype must be {out_dtype}, but got {out.dtype}")
+
+    return True
+
+
+@backend_requirement(
+    {},
+    common_check=_check_group_gemm_nvfp4_nt_groupwise_problem_size,
+)
+@flashinfer_api
+def group_gemm_nvfp4_nt_groupwise(
+    a: torch.Tensor,  # (cum_m, k)
+    b: torch.Tensor,  # (batch_size, n, k // 2)
+    a_scale: torch.Tensor,  # (cum_m_padded, k // 16)
+    b_scale: torch.Tensor,  # (batch_size, n_padded, k // 16)
+    m_indptr: torch.Tensor,  # (batch_size + 1, )
+    alpha: Optional[torch.Tensor] = None,  # (batch_size, )
+    tile_m: int = 128,
+    tile_n: int = 128,
+    tile_k: int = 128,
+    out: Optional[torch.Tensor] = None,  # (cum_m, n)
+    out_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    r"""Perform group GEMM with NVFP4 data types using groupwise scaling. Currently only implemented on NVIDIA
+    Blackwell Geforce, and DGX Spark architectures.
+
+    Parameters
+    ----------
+    a: torch.Tensor
+        Row-major input tensor, shape ``(cum_m, k // 2)``, data type is ``torch.uint8`` (packed NVFP4).
+        ``cum_m`` is the cumulative sum of the segment lengths.
+
+    b: torch.Tensor
+        Column-major input tensor, shape ``(batch_size, n, k // 2)``, data type is ``torch.uint8``.
+
+    a_scale: torch.Tensor
+        Column-major scale tensor for a, shape ``(cum_m_padded, k // 16)``, data type is ``torch.uint8``.
+
+    b_scale: torch.Tensor
+        Row-major scale tensor for b, shape ``(batch_size, n_padded, k // 16)``, data type is ``torch.uint8``.
+
+    m_indptr: torch.Tensor
+        The indptr of the segment lengths, shape ``(batch_size + 1,)``, data type is ``torch.int32``.
+        Element element in ``m_indptr`` must be a multiple of 4.
+
+    alpha: Optional[torch.Tensor] = None, # (batch_size, )
+        The alpha tensor, shape ``(batch_size, )``, data type is ``torch.float32``.
+
+    tile_m: int
+        The tile size for the M dimension, must be 128.
+
+    tile_n: int
+        The tile size for the N dimension, must be 128.
+
+    tile_k: int
+        The tile size for the K dimension, must be 128 or 256.
+
+    out: Optional[torch.Tensor]
+        The output tensor, shape ``(cum_m, n)``. If not specified, we will create an output tensor explicitly.
+
+    out_dtype: Optional[torch.dtype]
+        The data type of the output tensor, must be ``torch.bfloat16`` or ``torch.float16``.
+
+    Returns
+    -------
+    out: torch.Tensor
+        The output tensor, shape ``(cum_m, n)``.
+
+    Notes
+    -----
+    Each value in ``m_indptr`` should be padded to a multiple of 4 before calling this function,
+    to accommodate the kernel's requirement.
+    """
+    int_workspace_buffer = _get_cache_buf(
+        "group_gemm_nvfp4_nt_groupwise_int_workspace", DEFAULT_WORKSPACE_SIZE, a.device
+    )
+    float_workspace_buffer = _get_cache_buf(
+        "group_gemm_nvfp4_nt_groupwise_float_workspace",
+        DEFAULT_WORKSPACE_SIZE,
+        a.device,
+    )
+    # Determine out_dtype if not specified
+    if out is None:
+        if out_dtype is None:
+            out_dtype = torch.bfloat16
+    else:
+        if out_dtype is None:
+            out_dtype = out.dtype
+
+    n = b.shape[1]
+    k = b.shape[2] * 2  # Multiply by 2 because b is e2m1 packed as uint8
+
+    out_shape = (a.shape[0], n)
+    if out is None:
+        out = torch.empty(out_shape, dtype=out_dtype, device=a.device)
+
+    if alpha is None:
+        # empty torch tensor
+        alpha = torch.tensor([], dtype=torch.float32, device=a.device)
+
+    get_gemm_sm120_module().group_gemm_nvfp4_nt_groupwise(
         int_workspace_buffer,
         float_workspace_buffer,
         a,
@@ -5988,20 +6229,16 @@ def group_gemm_mxfp8_mxfp4_nt_groupwise(
         a_scale,
         b_scale,
         out,
+        alpha,
         m_indptr,
         n,
         k,
-        mma_sm,
         tile_m,
         tile_n,
         tile_k,
-        swap_ab,
     )
+
     return out
-
-
-# NOTE(Zihao): keep the old name for backward compatibility
-group_gemm_mxfp4_nt_groupwise = group_gemm_mxfp8_mxfp4_nt_groupwise
 
 
 def pad_indptr_to_multiple_of_4(
