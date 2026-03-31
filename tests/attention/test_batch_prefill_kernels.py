@@ -1159,6 +1159,183 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_v2(
     )
 
 
+@pytest.mark.parametrize("batch_size", [1])
+@pytest.mark.parametrize(
+    "prefix_len, item_lens",
+    [
+        (17, [3, 2, 4]),
+        (16, [40, 40]),
+        (32, [16, 8, 16]),
+    ],
+)
+@pytest.mark.parametrize("page_size", [1, 16])
+@pytest.mark.parametrize("num_kv_heads", [4])
+@pytest.mark.parametrize("num_qo_heads", [4])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("kv_layout", ["NHD"])
+@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
+def test_mis_v1_v2_output_parity(
+    batch_size,
+    prefix_len,
+    item_lens,
+    page_size,
+    num_kv_heads,
+    num_qo_heads,
+    head_dim,
+    kv_layout,
+    logits_soft_cap,
+):
+    """Verify MIS v2 item-token outputs match MIS v1 item-token outputs for equivalent inputs.
+
+    Both modes encode the same logical attention pattern: each item token attends
+    to all prefix KV tokens plus same-item KV tokens causally. V1 has delimiter
+    tokens interspersed (masked to -inf); V2 has no delimiters.
+
+    Uses pos_encoding_mode=NONE to avoid RoPE position-index differences between V1/V2.
+    Shares Q, K, V tensors at item and prefix positions so the only differences are
+    the delimiter tokens in V1 (which are masked out and don't affect output).
+    """
+    import torch
+
+    total_item_tokens = sum(item_lens)
+    num_items = len(item_lens)
+
+    # Shared Q for item tokens (used by both V1 and V2)
+    q_items = torch.randn(
+        batch_size * total_item_tokens, num_qo_heads, head_dim, dtype=torch.float16, device="cuda"
+    )
+
+    # Shared K/V for prefix and item tokens
+    prefix_k = torch.randn(prefix_len, num_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+    prefix_v = torch.randn(prefix_len, num_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+    item_k = torch.randn(total_item_tokens, num_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+    item_v = torch.randn(total_item_tokens, num_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+
+    def pack_flat_kv_to_pages(k_flat, v_flat, kv_len, page_size):
+        """Pack flat [kv_len, nh, hd] K and V into paged format [num_pages, 2, page_size, nh, hd]."""
+        num_pages = (kv_len + page_size - 1) // page_size
+        kv_pages = torch.zeros(num_pages, 2, page_size, num_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+        for pos in range(kv_len):
+            kv_pages[pos // page_size, 0, pos % page_size] = k_flat[pos]
+            kv_pages[pos // page_size, 1, pos % page_size] = v_flat[pos]
+        return kv_pages
+
+    # ---- V2 ----
+    qo_len_v2 = total_item_tokens
+    kv_len_v2 = prefix_len + total_item_tokens
+
+    k_flat_v2 = torch.cat([prefix_k, item_k], dim=0)
+    v_flat_v2 = torch.cat([prefix_v, item_v], dim=0)
+    kv_data_v2 = pack_flat_kv_to_pages(k_flat_v2, v_flat_v2, kv_len_v2, page_size)
+
+    num_pages_v2 = (kv_len_v2 + page_size - 1) // page_size
+    q_indptr_v2 = (torch.arange(batch_size + 1) * qo_len_v2).int().cuda()
+    kv_indptr_v2 = (torch.arange(batch_size + 1) * num_pages_v2).int().cuda()
+    kv_indices_v2 = torch.arange(num_pages_v2 * batch_size).int().cuda()
+    kv_last_page_len_v2 = torch.full(
+        (batch_size,), (kv_len_v2 - 1) % page_size + 1, dtype=torch.int32, device="cuda"
+    )
+
+    offsets = [0]
+    for l in item_lens:
+        offsets.append(offsets[-1] + l)
+    item_offsets_tensor = torch.tensor(offsets, dtype=torch.uint32).cuda()
+
+    workspace_v2 = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda")
+    wrapper_v2 = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(workspace_v2, kv_layout)
+    wrapper_v2.plan(
+        q_indptr_v2, kv_indptr_v2, kv_indices_v2, kv_last_page_len_v2,
+        num_qo_heads, num_kv_heads, head_dim, page_size,
+        causal=True,
+        pos_encoding_mode="NONE",
+        logits_soft_cap=logits_soft_cap,
+        prefix_len_ptr=torch.tensor([prefix_len], dtype=torch.uint32).cuda(),
+        item_offsets=item_offsets_tensor,
+        item_offsets_len=len(offsets),
+    )
+    o_v2 = wrapper_v2.run(q_items, kv_data_v2)
+
+    # ---- V1 ----
+    # V1 qo/kv includes prefix + (delimiter + item_tokens) per item
+    qo_len_v1 = prefix_len + sum(1 + l for l in item_lens)
+    kv_len_v1 = qo_len_v1
+
+    # Q: prefix (random) + [delimiter (random) + shared item tokens] per item
+    q_prefix = torch.randn(prefix_len, num_qo_heads, head_dim, dtype=torch.float16, device="cuda")
+    q_delims = torch.randn(num_items, num_qo_heads, head_dim, dtype=torch.float16, device="cuda")
+    q_parts = [q_prefix]
+    item_offset = 0
+    for i, l in enumerate(item_lens):
+        q_parts.append(q_delims[i : i + 1])
+        q_parts.append(q_items[item_offset : item_offset + l])
+        item_offset += l
+    q_v1 = torch.cat(q_parts, dim=0)
+
+    # K/V: [prefix || (delimiter_kv (random) + item_kv) per item]
+    # Delimiter KV is random — it gets masked to -inf by V1's mask logic
+    k_delims = torch.randn(num_items, num_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+    v_delims = torch.randn(num_items, num_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+    k_parts = [prefix_k]
+    v_parts = [prefix_v]
+    item_offset = 0
+    for i, l in enumerate(item_lens):
+        k_parts.append(k_delims[i : i + 1])
+        v_parts.append(v_delims[i : i + 1])
+        k_parts.append(item_k[item_offset : item_offset + l])
+        v_parts.append(item_v[item_offset : item_offset + l])
+        item_offset += l
+    k_flat_v1 = torch.cat(k_parts, dim=0)
+    v_flat_v1 = torch.cat(v_parts, dim=0)
+    kv_data_v1 = pack_flat_kv_to_pages(k_flat_v1, v_flat_v1, kv_len_v1, page_size)
+
+    num_pages_v1 = (kv_len_v1 + page_size - 1) // page_size
+    q_indptr_v1 = (torch.arange(batch_size + 1) * qo_len_v1).int().cuda()
+    kv_indptr_v1 = (torch.arange(batch_size + 1) * num_pages_v1).int().cuda()
+    kv_indices_v1 = torch.arange(num_pages_v1 * batch_size).int().cuda()
+    kv_last_page_len_v1 = torch.full(
+        (batch_size,), (kv_len_v1 - 1) % page_size + 1, dtype=torch.int32, device="cuda"
+    )
+
+    # token_pos_in_items: sequential indices for prefix, 0=delim then 1..l for each item
+    token_pos = list(range(prefix_len))
+    for l in item_lens:
+        token_pos.append(0)
+        for j in range(1, l + 1):
+            token_pos.append(j)
+    token_pos_tensor = torch.tensor(token_pos, dtype=torch.uint16).cuda()
+    max_item_len = max(item_lens)
+
+    workspace_v1 = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda")
+    wrapper_v1 = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(workspace_v1, kv_layout)
+    wrapper_v1.plan(
+        q_indptr_v1, kv_indptr_v1, kv_indices_v1, kv_last_page_len_v1,
+        num_qo_heads, num_kv_heads, head_dim, page_size,
+        causal=True,
+        pos_encoding_mode="NONE",
+        logits_soft_cap=logits_soft_cap,
+        prefix_len_ptr=torch.tensor([prefix_len], dtype=torch.uint32).cuda(),
+        token_pos_in_items_ptr=token_pos_tensor,
+        token_pos_in_items_len=len(token_pos),
+        max_item_len_ptr=torch.tensor([max_item_len], dtype=torch.uint16).cuda(),
+    )
+    o_v1 = wrapper_v1.run(q_v1, kv_data_v1)
+
+    # Extract item-token outputs from V1 (skip prefix and delimiter positions)
+    v1_item_indices = []
+    pos = prefix_len
+    for l in item_lens:
+        pos += 1  # skip delimiter
+        for _ in range(l):
+            v1_item_indices.append(pos)
+            pos += 1
+    v1_item_indices_t = torch.tensor(v1_item_indices, device="cuda")
+    o_v1_items = o_v1[v1_item_indices_t]
+
+    numpy.testing.assert_allclose(
+        o_v2.cpu().numpy(), o_v1_items.cpu().numpy(), rtol=1e-3, atol=1e-3
+    )
+
+
 if __name__ == "__main__":
     test_batch_prefill_with_paged_kv_cache(
         12, 54, 37, 1, 4, 4, 128, False, "NHD", "NONE", False, 0.0, True, True
