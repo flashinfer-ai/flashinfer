@@ -45,7 +45,7 @@ FlashInfer has two CI systems: a public CI running on GitHub Actions and an NVID
 
 ## Public CI (GitHub Actions)
 
-Public CI runs AOT build tests (x64/arm64) and GPU unit tests across different hardwares on AWS self-hosted runners.
+Public CI runs AOT build tests (x64/arm64) and GPU unit tests across different hardware on AWS self-hosted runners.
 
 **For org members (`ci-users` team):** CI triggers automatically when you open or update a PR.
 
@@ -66,27 +66,29 @@ Internal CI runs an extended test matrix across NVIDIA GPU architectures. It is 
 
 | Command | Who can use | Description |
 |---------|-------------|-------------|
-| `/bot run` | Whitelisted users | Mirror PR to GitLab and run CI pipeline |
-| `/bot status` | Whitelisted users | Check current pipeline status |
-| `/bot stop` | Whitelisted users | Cancel a running pipeline |
+| `/bot run` | Allowed users | Mirror PR to GitLab and run CI pipeline |
+| `/bot status` | Allowed users | Check current pipeline status |
+| `/bot stop` | Allowed users | Cancel a running pipeline |
+
+> **Note:** Access to the NVIDIA internal CI is limited to NVIDIA employees and approved collaborators. To request access, please reach out to @yongwww, @dierksen, @yzh119, or @sricketts.
 
 **Internal CI test matrix:**
 
-| Test | GPU | CUDA |
-|------|-----|------|
-| `unit_test_h100` | H100 | cu129, cu130 |
-| `unit_test_b200` | B200 | cu129, cu130 |
-| `unit_test_b300` | B300 | cu129, cu130 |
-| `unit_test_gb200` | GB200 | cu129, cu130 |
-| `unit_test_gb300` | GB300 | cu129, cu130 |
-| `unit_test_5090` | RTX 5090 | cu129, cu130 |
-| `unit_test_rtx_pro_6000` | RTX PRO 6000 Blackwell | cu129, cu130 |
-| `unit_test_spark` | Spark | cu129, cu130 |
-| `unit_test_thor` | Thor | cu130 |
-| `multi_gpu_test_b300` | B300 (multi-GPU) | cu129, cu130 |
-| `multi_node_test_b300` | B300 (multi-node) | cu129, cu130 |
-| `multi_node_test_gb200` | GB200 (multi-node) | cu129, cu130 |
-| `multi_node_test_gb300` | GB300 (multi-node) | cu129, cu130 |
+| Test | GPU | CUDA | Notes |
+|------|-----|------|-------|
+| `unit_test_h100` | H100 | cu129, cu130 | |
+| `unit_test_b200` | B200 | cu129, cu130 | |
+| `unit_test_b300` | B300 | cu129, cu130 | |
+| `unit_test_gb200` | GB200 | cu129, cu130 | |
+| `unit_test_gb300` | GB300 | cu129, cu130 | |
+| `unit_test_5090` | RTX 5090 | cu129, cu130 | |
+| `unit_test_rtx_pro_6000` | RTX PRO 6000 Blackwell | cu129, cu130 | |
+| `unit_test_spark` | Spark | cu129, cu130 | manual-trigger only |
+| `unit_test_thor` | Thor | cu130 | manual-trigger only |
+| `multi_gpu_test_b300` | B300 (multi-GPU) | cu129, cu130 | |
+| `multi_node_test_b300` | B300 (multi-node) | cu129, cu130 | |
+| `multi_node_test_gb200` | GB200 (multi-node) | cu129, cu130 | |
+| `multi_node_test_gb300` | GB300 (multi-node) | cu129, cu130 | |
 
 # Claiming Issues
 
