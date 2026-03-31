@@ -1252,8 +1252,7 @@ def nvfp4_quantize_cute_dsl(
     )
     assert input.is_cuda, "Input must be on CUDA device"
 
-    if enable_pdl is None:
-        enable_pdl = device_support_pdl(input.device)
+    enable_pdl = device_support_pdl(input.device) if enable_pdl is not False else False
 
     if input.dim() > 2:
         m = input.numel() // input.shape[-1]

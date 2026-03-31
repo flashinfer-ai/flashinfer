@@ -858,9 +858,9 @@ def mxfp8_quantize_cute_dsl(
         f"alignment must be divisible by SF_VEC_SIZE={SF_VEC_SIZE}"
     )
 
-    # Auto-detect PDL support based on device capability
-    if enable_pdl is None:
-        enable_pdl = device_support_pdl(input.device)
+    # Auto-detect PDL support based on device capability.
+    # If caller passes True explicitly, still check hardware support.
+    enable_pdl = device_support_pdl(input.device) if enable_pdl is not False else False
 
     if input.dim() > 2:
         m = input.numel() // input.shape[-1]
