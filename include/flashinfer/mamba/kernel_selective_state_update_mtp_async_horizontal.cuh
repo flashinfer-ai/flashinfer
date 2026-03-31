@@ -84,7 +84,7 @@ struct AsyncHorizontalStorage {
 };
 
 // =============================================================================
-// cp.async helper: issues a 16-byte async copy from global to shared memory.
+// cp.async helpers: 8-byte and 16-byte async copy from global to shared memory.
 // =============================================================================
 
 __device__ __forceinline__ void cp_async_16B(void* __restrict__ smem_dst,
@@ -92,6 +92,30 @@ __device__ __forceinline__ void cp_async_16B(void* __restrict__ smem_dst,
   unsigned int smem_addr = __cvta_generic_to_shared(smem_dst);
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(smem_addr), "l"(gmem_src)
                : "memory");
+}
+
+// =============================================================================
+// Cooperative state cp.async: all threads load state via flat 16-byte chunks.
+// =============================================================================
+
+template <typename state_t, int DSTATE, int DSTATE_PAD, int ROWS_PER_PASS, int NUM_WARPS,
+          typename SramT>
+__device__ __forceinline__ void cp_async_state_cooperative(SramT& sram, int lane, int warp,
+                                                           int state_stage, int dim_offset,
+                                                           state_t const* __restrict__ state_ptr,
+                                                           int64_t state_base) {
+  constexpr int STATE_PACK = 16 / sizeof(state_t);
+  constexpr int state_packs_per_row = DSTATE / STATE_PACK;
+  constexpr int num_state_chunks = ROWS_PER_PASS * DSTATE / STATE_PACK;
+  int const flat_tid = warp * warpSize + lane;
+  constexpr int num_threads = NUM_WARPS * warpSize;
+
+  for (int i = flat_tid; i < num_state_chunks; i += num_threads) {
+    int const row = i / state_packs_per_row;
+    int const col = (i % state_packs_per_row) * STATE_PACK;
+    int const dd = dim_offset + row;
+    cp_async_16B(&sram.state_in[state_stage][row][col], &state_ptr[state_base + dd * DSTATE + col]);
+  }
 }
 
 // =============================================================================
@@ -129,7 +153,8 @@ __device__ __forceinline__ void load_async_horizontal(SramT& sram, int lane, int
   int64_t const dt_tstride = has_cu_seqlens ? params.dt_stride_batch : params.dt_stride_mtp;
 
   if constexpr (!IS_PAD) {
-    // ── cp.async flat loop: B, C, x, state into smem (all 16-byte chunks) ──
+    // ── Per-warp cp.async loads to avoid cross-array bank conflicts ──
+    // Warps 0/1/2 load B/C/x respectively; all 4 warps cooperatively load state.
     constexpr int INPUT_PACK = 16 / sizeof(input_t);  // 8 for bf16
     constexpr int STATE_PACK = 16 / sizeof(state_t);  // 4 for f32, 8 for f16/bf16
     static_assert(DSTATE % INPUT_PACK == 0, "DSTATE must be divisible by input pack size");
@@ -137,60 +162,58 @@ __device__ __forceinline__ void load_async_horizontal(SramT& sram, int lane, int
     static_assert(DIM_PER_CTA % INPUT_PACK == 0,
                   "DIM_PER_CTA must be divisible by input pack size");
 
-    constexpr int num_B_chunks = NTOKENS * DSTATE / INPUT_PACK;
-    constexpr int num_C_chunks = NTOKENS * DSTATE / INPUT_PACK;
-    constexpr int num_x_chunks = NTOKENS * DIM_PER_CTA / INPUT_PACK;
-    constexpr int num_state_chunks = ROWS_PER_PASS * DSTATE / STATE_PACK;
-    constexpr int TOTAL_CHUNKS = num_B_chunks + num_C_chunks + num_x_chunks + num_state_chunks;
-
     constexpr int B_packs_per_row = DSTATE / INPUT_PACK;
     constexpr int C_packs_per_row = DSTATE / INPUT_PACK;
     constexpr int x_packs_per_row = DIM_PER_CTA / INPUT_PACK;
     constexpr int state_packs_per_row = DSTATE / STATE_PACK;
 
-    auto const* __restrict__ B_ptr = reinterpret_cast<input_t const*>(params.B);
-    auto const* __restrict__ C_ptr = reinterpret_cast<input_t const*>(params.C);
-    auto const* __restrict__ x_ptr = reinterpret_cast<input_t const*>(params.x);
-    auto const* __restrict__ state_ptr = reinterpret_cast<state_t const*>(params.state);
-    auto const state_base = state_batch * params.state_stride_batch + head * DIM * DSTATE;
-
-    for (int i = flat_tid; i < TOTAL_CHUNKS; i += num_threads) {
-      if (i < num_B_chunks) {
-        // B: [step][DSTATE] in global → [step][DSTATE_PAD] in smem
-        int const local = i;
-        int const step = local / B_packs_per_row;
-        int const col = (local % B_packs_per_row) * INPUT_PACK;
+    // Warp 0: load B[step][DSTATE] → sram.B[step][DSTATE_PAD]
+    if (warp == 0) {
+      auto const* __restrict__ B_ptr = reinterpret_cast<input_t const*>(params.B);
+      constexpr int num_B_chunks = NTOKENS * DSTATE / INPUT_PACK;
+      for (int i = lane; i < num_B_chunks; i += warpSize) {
+        int const step = i / B_packs_per_row;
+        int const col = (i % B_packs_per_row) * INPUT_PACK;
         if (step < seq_len) {
           cp_async_16B(&sram.B[step][col],
                        &B_ptr[B_base + step * B_tstride + kv_group * DSTATE + col]);
         }
-      } else if (i < num_B_chunks + num_C_chunks) {
-        // C: [step][DSTATE] in global → [step][DSTATE_PAD] in smem
-        int const local = i - num_B_chunks;
-        int const step = local / C_packs_per_row;
-        int const col = (local % C_packs_per_row) * INPUT_PACK;
+      }
+    }
+
+    // Warp 1: load C[step][DSTATE] → sram.C[step][DSTATE_PAD]
+    if (warp == 1) {
+      auto const* __restrict__ C_ptr = reinterpret_cast<input_t const*>(params.C);
+      constexpr int num_C_chunks = NTOKENS * DSTATE / INPUT_PACK;
+      for (int i = lane; i < num_C_chunks; i += warpSize) {
+        int const step = i / C_packs_per_row;
+        int const col = (i % C_packs_per_row) * INPUT_PACK;
         if (step < seq_len) {
           cp_async_16B(&sram.C[step][col],
                        &C_ptr[C_base + step * C_tstride + kv_group * DSTATE + col]);
         }
-      } else if (i < num_B_chunks + num_C_chunks + num_x_chunks) {
-        // x: [step][DIM_PER_CTA] in global → [step][DIM_PER_CTA] in smem
-        int const local = i - (num_B_chunks + num_C_chunks);
-        int const step = local / x_packs_per_row;
-        int const col = (local % x_packs_per_row) * INPUT_PACK;
-        if (step < seq_len) {
+      }
+    }
+
+    // All warps load x: each warp handles different tokens to avoid bank conflicts.
+    // With DPC=16 bf16, each row is 32 bytes (8 banks). One row per warp per iteration
+    // means zero bank aliasing within any warp-wide cp.async instruction.
+    {
+      auto const* __restrict__ x_ptr = reinterpret_cast<input_t const*>(params.x);
+      for (int step = warp; step < seq_len; step += NUM_WARPS) {
+        for (int col = lane * INPUT_PACK; col < DIM_PER_CTA; col += warpSize * INPUT_PACK) {
           cp_async_16B(&sram.x[step][col],
                        &x_ptr[x_base + step * x_tstride + head * DIM + dim_offset + col]);
         }
-      } else {
-        // state: [ROWS_PER_PASS][DSTATE] in global → [stage][ROWS_PER_PASS][DSTATE_PAD] in smem
-        int const local = i - (num_B_chunks + num_C_chunks + num_x_chunks);
-        int const row = local / state_packs_per_row;
-        int const col = (local % state_packs_per_row) * STATE_PACK;
-        int const dd = dim_offset + row;  // global DIM index
-        cp_async_16B(&sram.state_in[state_stage][row][col],
-                     &state_ptr[state_base + dd * DSTATE + col]);
       }
+    }
+
+    // All 4 warps: tiled state load (bank-conflict-free, 8-byte cp.async)
+    {
+      auto const* __restrict__ state_ptr = reinterpret_cast<state_t const*>(params.state);
+      auto const state_base = state_batch * params.state_stride_batch + head * DIM * DSTATE;
+      cp_async_state_cooperative<state_t, DSTATE, DSTATE_PAD, ROWS_PER_PASS, NUM_WARPS>(
+          sram, lane, warp, state_stage, dim_offset, state_ptr, state_base);
     }
 
     // Load dt[step] via LDG (needs softplus computation, can't use cp.async)
@@ -453,23 +476,13 @@ __device__ __forceinline__ void update_state_async_horizontal(
     if constexpr (numPasses > 1) {
       if (pass < numPasses - 1) {
         int const next_stage = (pass + 1) % STATE_STAGES;
-        constexpr int STATE_PACK = 16 / sizeof(state_t);
-        constexpr int state_packs_per_row = DSTATE / STATE_PACK;
-        constexpr int num_state_chunks = ROWS_PER_PASS * DSTATE / STATE_PACK;
-        int const flat_tid = warp * warpSize + lane;
-        constexpr int num_threads = NUM_WARPS * warpSize;
         int const next_dim_base = dim_offset + (pass + 1) * ROWS_PER_PASS;
 
         if constexpr (!IS_PAD) {
           auto const* __restrict__ state_ptr_r = reinterpret_cast<state_t const*>(params.state);
           auto const state_base = state_batch * params.state_stride_batch + head * DIM * DSTATE;
-          for (int i = flat_tid; i < num_state_chunks; i += num_threads) {
-            int const row = i / state_packs_per_row;
-            int const col = (i % state_packs_per_row) * STATE_PACK;
-            int const global_dd = next_dim_base + row;
-            cp_async_16B(&sram.state_in[next_stage][row][col],
-                         &state_ptr_r[state_base + global_dd * DSTATE + col]);
-          }
+          cp_async_state_cooperative<state_t, DSTATE, DSTATE_PAD, ROWS_PER_PASS, NUM_WARPS>(
+              sram, lane, warp, next_stage, next_dim_base, state_ptr_r, state_base);
         }
         asm volatile("cp.async.commit_group;\n" ::: "memory");
         asm volatile("cp.async.wait_group 0;\n" ::: "memory");
