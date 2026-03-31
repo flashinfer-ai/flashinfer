@@ -635,6 +635,41 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm120(
 
 }  // namespace kernels
 
+std::vector<CutlassGemmConfig> get_candidate_configs_sm121(
+    CutlassGemmConfig::CandidateConfigTypeParam const config) {
+#ifdef FAST_BUILD
+  if (config & CutlassGemmConfig::GROUPED_GEMM) {
+    return {CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x64B,
+                              MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
+                              ClusterShape::ClusterShape_1x1x1}};
+  } else {
+    return get_candidate_configs_sm120(config);
+  }
+#else
+  if (config & CutlassGemmConfig::GROUPED_GEMM) {
+    if ((config & CutlassGemmConfig::FP4_ONLY) != 0) {
+      // SM121 (GB10) has ~99 KB SMEM per block (vs ~228 KB on SM120/GB200).
+      // FP4 is stored unpacked in SMEM (1 byte per 4-bit element), so the per-stage
+      // footprint is doubled compared to packed storage.
+      //   CtaShape128x128x64B: ~32 KB/stage x 2 stages + ~9 KB epilogue = 73 KB (fits)
+      //   CtaShape128x128x128B: ~64 KB/stage -> 1 stage violates Stages>=2 constraint
+      //   CtaShape256x128x64B, CtaShape128x256x64B: ~48 KB/stage x 2 = 105 KB > 99 KB
+      return {CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x64B,
+                                MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
+                                ClusterShape::ClusterShape_1x1x1}};
+    } else {
+      TLLM_THROW("Not Implemented: SM121 group GEMM only supports nvfp4.");
+    }
+  } else {
+    if ((config & CutlassGemmConfig::FP4_ONLY) != 0) {
+      return get_candidate_configs_sm120(config);
+    } else {
+      TLLM_THROW("Not Implemented: SM121 GEMM only supports nvfp4.");
+    }
+  }
+#endif
+}  // get_candidate_configs_sm121
+
 std::vector<CutlassGemmConfig> get_candidate_configs(
     int sm, int const max_split_k,
     CutlassGemmConfig::CandidateConfigTypeParam const config_type_param) {
@@ -653,8 +688,12 @@ std::vector<CutlassGemmConfig> get_candidate_configs(
   if (sm >= 100 && sm < 120 && (config_type_param & CutlassGemmConfig::BLACKWELL)) {
     return get_candidate_configs_sm100(config_type_param, sm);
   }
-  if (sm >= 120 && (config_type_param & CutlassGemmConfig::BLACKWELL)) {
+  if (sm == 120 && (config_type_param & CutlassGemmConfig::BLACKWELL)) {
     return get_candidate_configs_sm120(config_type_param);
+  }
+  if (sm == 121 && (config_type_param & CutlassGemmConfig::BLACKWELL)) {
+    // SM121 = GB10: same ISA as SM120 but ~99 KB SMEM; only 128x128 CTA tile fits.
+    return get_candidate_configs_sm121(config_type_param);
   }
 
   std::vector<CutlassTileConfig> tiles = get_candidate_tiles(sm, config_type_param);
