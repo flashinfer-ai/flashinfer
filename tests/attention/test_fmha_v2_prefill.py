@@ -492,6 +492,12 @@ def run_trtllm_fmha_v2_prefill_case(
     is_sm120_plus = is_sm120a_supported(torch.device("cuda"))
     if dtype == torch.float8_e4m3fn and is_sm120_plus:
         pytest.skip("FP8 FMHAv2 not yet supported on SM120+")
+    if dtype == torch.float8_e4m3fn and head_dim == 256:
+        pytest.skip(
+            "todo(bobboli): fp8 with head_dim=256 hangs on SM90 tma_ws kernel due to "
+            "barrier deadlock in transpose_v_tile "
+            "(fmha_v2_flash_attention_e4m3_*_S_qkv_256_*_tma_ws_sm90_kernel+0xedf0)"
+        )
     if input_layout == "SEPARATE_Q_K_V" and dtype == torch.float8_e4m3fn:
         pytest.skip("FP8 not supported for SEPARATE_Q_K_V layout")
     if input_layout == "SEPARATE_Q_K_V" and is_sm120_plus:
@@ -841,11 +847,6 @@ def test_trtllm_fmha_v2_prefill(
         pytest.skip("todo(jimmyzho): temporarily skip sliding window test due to hang")
     if dtype == torch.float8_e4m3fn and o_dtype == torch.float8_e4m3fn:
         pytest.skip("todo(jimmyzho): temporarily skip fp8 tests due to hang")
-    if dtype == torch.float8_e4m3fn and head_dim == 256:
-        pytest.skip(
-            "todo: fp8 with head_dim=256 hangs on SM90 tma_ws kernel due to barrier "
-            "deadlock (fmha_v2_flash_attention_e4m3_*_S_qkv_256_*_tma_ws_sm90_kernel+0xedf0)"
-        )
     run_trtllm_fmha_v2_prefill_case(
         input_layout=input_layout,
         batch_size=batch_size,
@@ -906,11 +907,6 @@ def test_trtllm_fmha_v2_prefill_skip_softmax(
     rtol: float,
     atol: float,
 ) -> None:
-    if dtype == torch.float8_e4m3fn and head_dim == 256:
-        pytest.skip(
-            "todo: fp8 with head_dim=256 hangs on SM90 tma_ws kernel due to barrier "
-            "deadlock (fmha_v2_flash_attention_e4m3_*_S_qkv_256_*_tma_ws_sm90_kernel+0xedf0)"
-        )
     run_trtllm_fmha_v2_prefill_case(
         input_layout=input_layout,
         batch_size=batch_size,
