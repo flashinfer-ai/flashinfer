@@ -50,6 +50,7 @@ using namespace conversion;
 namespace async_horiz {
 static constexpr int LANES_PER_ROW = 8;
 static constexpr int ROWS_PER_WARP = warpSize / LANES_PER_ROW;  // 4
+static constexpr int64_t SKIP_WRITE_STATE = -1;
 }  // namespace async_horiz
 
 // Pad DSTATE to next multiple of 32 banks (128 bytes) to avoid bank conflicts.
@@ -73,18 +74,22 @@ struct AsyncHorizontalStorage {
   alignas(128) input_t x[NTOKENS][DIM_PER_CTA];
   float dt[NTOKENS];
   float out[NTOKENS][DIM_PER_CTA];
+  // Precomputed per-step destination batch indices for state writes.
+  // -1 means "skip this step".
+  int64_t state_dst_slots[NTOKENS];
 };
 
 // =============================================================================
 // Cooperative async load: all warps load B, C, x, dt into smem.
 // =============================================================================
 
-template <typename input_t, typename weight_t, bool IS_PAD, int NTOKENS, int DIM, int DSTATE,
-          int DSTATE_PAD, int DIM_PER_CTA, int NUM_WARPS, typename SramT>
+template <typename input_t, typename weight_t, typename stateIndex_t, bool IS_PAD, int NTOKENS,
+          int DIM, int DSTATE, int DSTATE_PAD, int DIM_PER_CTA, int NUM_WARPS, typename SramT>
 __device__ __forceinline__ void load_async_horizontal(SramT& sram, int lane, int warp,
                                                       SelectiveStateMTPParams const& params,
                                                       int seq_idx, int head, int kv_group,
-                                                      int dim_offset, int bos, int seq_len) {
+                                                      int dim_offset, int bos, int seq_len,
+                                                      int64_t state_batch) {
   int const flat_tid = warp * warpSize + lane;
   constexpr auto num_threads = NUM_WARPS * warpSize;
 
@@ -164,6 +169,39 @@ __device__ __forceinline__ void load_async_horizontal(SramT& sram, int lane, int
       sram.dt[step] = dt_val;
     }
   }
+
+  // Precompute per-step destination slot indices for state writes.
+  // Three mutually exclusive modes:
+  //   1. dst_state_batch_indices → varlen: prefetch per-step indices (or -1 for pad_slot_id)
+  //   2. intermediate_states    → MTP cache: consecutive slots within icache entry
+  //   3. neither                → only write final state at last step
+  if (flat_tid < NTOKENS) {
+    int const step = flat_tid;
+    constexpr int64_t SKIP = async_horiz::SKIP_WRITE_STATE;
+    auto const* __restrict__ dst_state_batch_indices =
+        reinterpret_cast<stateIndex_t const*>(params.dst_state_batch_indices);
+    if (IS_PAD || step >= seq_len) {
+      sram.state_dst_slots[step] = SKIP;
+    } else if (dst_state_batch_indices) {
+      // Varlen: read per-step destination index, mark pad slots as SKIP
+      auto const dst_idx = static_cast<int64_t>(
+          dst_state_batch_indices[seq_idx * params.dst_state_batch_indices_stride_batch +
+                                  step * params.dst_state_batch_indices_stride_T]);
+      sram.state_dst_slots[step] = (dst_idx == params.pad_slot_id) ? SKIP : dst_idx;
+    } else if (params.intermediate_states) {
+      // MTP cache: consecutive step slots within the icache entry
+      auto const* __restrict__ intermediate_state_indices =
+          reinterpret_cast<stateIndex_t const*>(params.intermediate_state_indices);
+      auto const icache_idx = intermediate_state_indices
+                                  ? static_cast<int64_t>(intermediate_state_indices[seq_idx])
+                                  : state_batch;
+      sram.state_dst_slots[step] = icache_idx * params.cache_steps + step;
+    } else {
+      // Final-state only: write at last step
+      sram.state_dst_slots[step] =
+          (step == seq_len - 1 && params.update_state) ? state_batch : SKIP;
+    }
+  }
 }
 
 // =============================================================================
@@ -174,11 +212,9 @@ template <typename input_t, typename state_t, typename matrixA_t, typename weigh
           typename stateIndex_t, typename state_scale_t, bool IS_PAD, int NTOKENS, int DIM,
           int DSTATE, int DSTATE_PAD, int DIM_PER_CTA, int PHILOX_ROUNDS, int NUM_WARPS,
           typename SramT>
-__device__ __forceinline__ void update_state_async_horizontal(SramT& sram, int lane, int warp,
-                                                              SelectiveStateMTPParams const& params,
-                                                              int seq_idx, int head, int dim_offset,
-                                                              int64_t state_batch, int bos,
-                                                              int seq_len) {
+__device__ __forceinline__ void update_state_async_horizontal(
+    SramT& sram, int lane, int warp, SelectiveStateMTPParams const& params, int seq_idx, int head,
+    int dim_offset, int64_t state_batch, int bos, int seq_len, float A_val, float D_val) {
   constexpr bool scaleState = !std::is_same_v<state_scale_t, void>;
   constexpr int lanesPerRow = async_horiz::LANES_PER_ROW;
   constexpr int rowsPerWarp = async_horiz::ROWS_PER_WARP;
@@ -203,23 +239,25 @@ __device__ __forceinline__ void update_state_async_horizontal(SramT& sram, int l
   int const member = lane % lanesPerRow;
   int const group = lane / lanesPerRow;
 
-  auto const* __restrict__ A_ptr = reinterpret_cast<matrixA_t const*>(params.A);
-  auto const* __restrict__ D_ptr = reinterpret_cast<weight_t const*>(params.D);
-
   [[maybe_unused]] int64_t const rand_seed = params.rand_seed ? *params.rand_seed : 0;
 
   auto* __restrict__ state_ptr = reinterpret_cast<state_t*>(params.state);
-  auto* __restrict__ istate_ptr = reinterpret_cast<state_t*>(params.intermediate_states);
 
-  auto const* __restrict__ intermediate_state_indices =
-      reinterpret_cast<stateIndex_t const*>(params.intermediate_state_indices);
-  auto const icache_idx =
-      intermediate_state_indices ? (int64_t)intermediate_state_indices[seq_idx] : state_batch;
-
-  // dst_state_batch_indices for per-step state writes
-  auto const* __restrict__ dst_state_batch_indices =
-      reinterpret_cast<stateIndex_t const*>(params.dst_state_batch_indices);
-  bool const has_dst_indices = (dst_state_batch_indices != nullptr);
+  // Unified state write path: pick destination pointer and stride based on mode.
+  // The per-step slot indices are precomputed in sram.state_dst_slots[].
+  // For istate: dst_slot = icache_idx * cache_steps + step, so the flat slot
+  // index works with both state stride (nheads*DIM*DSTATE) and scale stride (nheads*DIM).
+  auto* __restrict__ write_state_ptr = state_ptr;
+  int64_t write_state_stride = params.state_stride_batch;
+  [[maybe_unused]] auto* __restrict__ write_scale_ptr =
+      reinterpret_cast<float*>(params.state_scale);
+  [[maybe_unused]] int64_t write_scale_stride = params.state_scale_stride_batch;
+  if (params.intermediate_states) {
+    write_state_ptr = reinterpret_cast<state_t*>(params.intermediate_states);
+    write_state_stride = (int64_t)params.nheads * DIM * DSTATE;
+    write_scale_ptr = reinterpret_cast<float*>(params.intermediate_state_scales);
+    write_scale_stride = (int64_t)params.nheads * DIM;
+  }
 
   // Logical column helpers (same as TMA horizontal kernel)
   auto baseCol = [&](int t, int e) -> int {
@@ -239,8 +277,6 @@ __device__ __forceinline__ void update_state_async_horizontal(SramT& sram, int l
       reinterpret_cast<state_scale_t*>(params.state_scale);
 
   auto const state_ptr_offset = state_batch * params.state_stride_batch + head * DIM * DSTATE;
-  float const A_val = toFloat(A_ptr[head]);
-  float const D_val = D_ptr ? toFloat(D_ptr[head]) : 0.f;
 
   constexpr int numPasses = DIM_PER_CTA / ROWS_PER_PASS;
 
@@ -277,12 +313,6 @@ __device__ __forceinline__ void update_state_async_horizontal(SramT& sram, int l
       }
     }
 
-    // Precompute intermediate-state pointer and stride
-    int64_t const istate_base_dd = icache_idx * params.intermediate_state_stride_batch +
-                                   (int64_t)head * DIM * DSTATE + (int64_t)dd * DSTATE;
-    int64_t const istate_step_stride = (int64_t)params.nheads * DIM * DSTATE;
-    state_t* __restrict__ istate_dd_ptr = istate_ptr + istate_base_dd;
-
     // Strength-reduce step-dependent shared memory indexing
     auto const* __restrict__ B_step = &sram.B[0][0];
     auto const* __restrict__ C_step = &sram.C[0][0];
@@ -290,8 +320,6 @@ __device__ __forceinline__ void update_state_async_horizontal(SramT& sram, int l
     float const* __restrict__ dt_step = &sram.dt[0];
     float* __restrict__ out_step = &sram.out[0][0];
 
-    // Helper: compute block-scaling encode_scale from rState (8-lane reduce-max).
-    // Returns encode_scale; caller computes decode_scale = 1/encode_scale.
     for (int step = 0; step < NTOKENS; step++) {
       if (step >= seq_len) break;
       float const dt_value = *dt_step;
@@ -337,57 +365,19 @@ __device__ __forceinline__ void update_state_async_horizontal(SramT& sram, int l
       dt_step += 1;
       out_step += DIM_PER_CTA;
 
-      // Compute encode scale once for all state writes this step
-      [[maybe_unused]] float encode_scale = 1.f;
-      if constexpr (scaleState) {
-        if (!IS_PAD) {
-          encode_scale = computeBlockScaleEncode<state_t, numTiles, pairsPerTileMember, lanesPerRow,
-                                                 elemsPerTile, elemsPerTileMember, DSTATE>(
-              rState, lane, member);
-        }
-      }
-
-      // Write intermediate state
-      if (istate_ptr && !IS_PAD) {
-#pragma unroll
-        for (int t = 0; t < numTiles; t++) {
-          int const col0 = baseCol(t, 0);
-          if (col0 >= DSTATE) continue;
-          packed_tile_t rOut;
-          [[maybe_unused]] uint32_t rand_ints[4];
-#pragma unroll
-          for (int e = 0; e < elemsPerTileMember; e += 2) {
-            float s0 = rState[t][e / 2].x;
-            float s1 = rState[t][e / 2].y;
-            if constexpr (scaleState) {
-              s0 *= encode_scale;
-              s1 *= encode_scale;
-            }
-            convertAndStoreSRHorizontal<state_t, DSTATE, PHILOX_ROUNDS>(
-                rOut.val[e], rOut.val[e + 1], s0, s1, rand_seed, state_ptr_offset, dd, col0, e,
-                rand_ints);
+      // Unified state write: use precomputed slot index from sram
+      {
+        int64_t const dst_slot = sram.state_dst_slots[step];
+        if (dst_slot != async_horiz::SKIP_WRITE_STATE) {
+          [[maybe_unused]] float encode_scale = 1.f;
+          if constexpr (scaleState) {
+            encode_scale =
+                computeBlockScaleEncode<state_t, numTiles, pairsPerTileMember, lanesPerRow,
+                                        elemsPerTile, elemsPerTileMember, DSTATE>(rState, lane,
+                                                                                  member);
           }
-          *reinterpret_cast<packed_tile_t*>(&istate_dd_ptr[col0]) = rOut;
-        }
-        // Write intermediate state decode scale
-        if constexpr (scaleState) {
-          if (member == 0) {
-            auto* __restrict__ iscales = reinterpret_cast<float*>(params.intermediate_state_scales);
-            iscales[icache_idx * params.intermediate_state_scales_stride_batch +
-                    step * params.nheads * DIM + head * DIM + dd] = 1.f / encode_scale;
-          }
-        }
-        istate_dd_ptr += istate_step_stride;
-      }
-
-      // Write state to per-step dst slot (varlen / speculative decoding)
-      if (has_dst_indices && !IS_PAD) {
-        auto const dst_idx = static_cast<int64_t>(
-            dst_state_batch_indices[seq_idx * params.dst_state_batch_indices_stride_batch +
-                                    step * params.dst_state_batch_indices_stride_T]);
-        if (dst_idx != params.pad_slot_id) {
           auto const dst_base =
-              dst_idx * params.state_stride_batch + head * DIM * DSTATE + dd * DSTATE;
+              dst_slot * write_state_stride + (int64_t)head * DIM * DSTATE + (int64_t)dd * DSTATE;
 #pragma unroll
           for (int t = 0; t < numTiles; t++) {
             int const col0 = baseCol(t, 0);
@@ -396,57 +386,22 @@ __device__ __forceinline__ void update_state_async_horizontal(SramT& sram, int l
             [[maybe_unused]] uint32_t rand_ints[4];
 #pragma unroll
             for (int e = 0; e < elemsPerTileMember; e += 2) {
-              float s0 = rState[t][e / 2].x;
-              float s1 = rState[t][e / 2].y;
+              float2 s2 = rState[t][e / 2];
               if constexpr (scaleState) {
-                s0 *= encode_scale;
-                s1 *= encode_scale;
+                float2 const scale2 = {encode_scale, encode_scale};
+                mul_f32x2(s2, s2, scale2);
               }
               convertAndStoreSRHorizontal<state_t, DSTATE, PHILOX_ROUNDS>(
-                  rOut.val[e], rOut.val[e + 1], s0, s1, rand_seed, state_ptr_offset, dd, col0, e,
-                  rand_ints);
+                  rOut.val[e], rOut.val[e + 1], s2.x, s2.y, rand_seed, state_ptr_offset, dd, col0,
+                  e, rand_ints);
             }
-            *reinterpret_cast<packed_tile_t*>(&state_ptr[dst_base + col0]) = rOut;
+            *reinterpret_cast<packed_tile_t*>(&write_state_ptr[dst_base + col0]) = rOut;
           }
-          // Write decode scale to dst slot
+          // Write decode scale
           if constexpr (scaleState) {
             if (member == 0) {
-              state_scale_ptr[dst_idx * params.state_scale_stride_batch + head * DIM + dd] =
-                  1.f / encode_scale;
+              write_scale_ptr[dst_slot * write_scale_stride + head * DIM + dd] = 1.f / encode_scale;
             }
-          }
-        }
-      }
-
-      // Write final state at last step (only when dst_state_batch_indices is not used)
-      if (step == seq_len - 1 && params.update_state && !IS_PAD && !has_dst_indices) {
-        auto const state_base =
-            state_batch * params.state_stride_batch + head * DIM * DSTATE + dd * DSTATE;
-#pragma unroll
-        for (int t = 0; t < numTiles; t++) {
-          int const col0 = baseCol(t, 0);
-          if (col0 >= DSTATE) continue;
-          packed_tile_t rOut;
-          [[maybe_unused]] uint32_t rand_ints[4];
-#pragma unroll
-          for (int e = 0; e < elemsPerTileMember; e += 2) {
-            float s0 = rState[t][e / 2].x;
-            float s1 = rState[t][e / 2].y;
-            if constexpr (scaleState) {
-              s0 *= encode_scale;
-              s1 *= encode_scale;
-            }
-            convertAndStoreSRHorizontal<state_t, DSTATE, PHILOX_ROUNDS>(
-                rOut.val[e], rOut.val[e + 1], s0, s1, rand_seed, state_ptr_offset, dd, col0, e,
-                rand_ints);
-          }
-          *reinterpret_cast<packed_tile_t*>(&state_ptr[state_base + col0]) = rOut;
-        }
-        // Write decode scale
-        if constexpr (scaleState) {
-          if (member == 0) {
-            state_scale_ptr[state_batch * params.state_scale_stride_batch + head * DIM + dd] =
-                1.f / encode_scale;
           }
         }
       }
@@ -586,11 +541,17 @@ __global__ void __launch_bounds__(NUM_WARPS * 32)
 
   int const kv_group = head / HEADS_PER_GROUP;
 
+  // Load A and D before the barrier so global memory latency overlaps with barrier wait
+  auto const* __restrict__ A_ptr = reinterpret_cast<matrixA_t const*>(params.A);
+  auto const* __restrict__ D_ptr = reinterpret_cast<weight_t const*>(params.D);
+  float const A_val = toFloat(A_ptr[head]);
+  float const D_val = D_ptr ? toFloat(D_ptr[head]) : 0.f;
+
   auto run = [&]<bool IS_PAD>() {
     // Phase 1: cooperative async load of B/C/x/dt into smem
-    load_async_horizontal<input_t, weight_t, IS_PAD, NTOKENS, DIM, DSTATE, DSTATE_PAD, DIM_PER_CTA,
-                          NUM_WARPS>(sram, lane, warp, params, seq_idx, head, kv_group, dim_offset,
-                                     bos, seq_len);
+    load_async_horizontal<input_t, weight_t, stateIndex_t, IS_PAD, NTOKENS, DIM, DSTATE, DSTATE_PAD,
+                          DIM_PER_CTA, NUM_WARPS>(sram, lane, warp, params, seq_idx, head, kv_group,
+                                                  dim_offset, bos, seq_len, state_batch);
 
     // Phase 2: single sync — ensures all smem writes are visible
     __syncthreads();
@@ -599,7 +560,8 @@ __global__ void __launch_bounds__(NUM_WARPS * 32)
     update_state_async_horizontal<input_t, state_t, matrixA_t, weight_t, stateIndex_t,
                                   state_scale_t, IS_PAD, NTOKENS, DIM, DSTATE, DSTATE_PAD,
                                   DIM_PER_CTA, PHILOX_ROUNDS, NUM_WARPS>(
-        sram, lane, warp, params, seq_idx, head, dim_offset, state_batch, bos, seq_len);
+        sram, lane, warp, params, seq_idx, head, dim_offset, state_batch, bos, seq_len, A_val,
+        D_val);
   };
 
   if (is_pad)

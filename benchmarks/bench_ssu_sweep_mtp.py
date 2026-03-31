@@ -57,7 +57,14 @@ def create_benchmark_inputs(
 
 
 def benchmark_kernel(
-    name, kernel_fn, inputs, cache_steps=0, ncu=False, rand_seed=None, philox_rounds=10
+    name,
+    kernel_fn,
+    inputs,
+    cache_steps=0,
+    ncu=False,
+    rand_seed=None,
+    philox_rounds=10,
+    repeat_time_ms=1000,
 ):
     """Benchmark a single kernel and return median time in ms."""
     print(f"\n  Benchmarking {name}...")
@@ -99,7 +106,7 @@ def benchmark_kernel(
         measurements = bench_gpu_time(
             lambda: kernel_fn(**kwargs),
             dry_run_time_ms=100,
-            repeat_time_ms=1000,
+            repeat_time_ms=repeat_time_ms,
         )
     except RuntimeError as e:
         print(f"    Kernel failed: {e}")
@@ -215,6 +222,7 @@ def run_measurement(
     generate_intermediate_states_buffer=False,
     ncu=False,
     philox_rounds=None,
+    repeat_time_ms=1000,
 ):
     """Run benchmarks on all kernels and return results dict."""
     inputs = create_benchmark_inputs(
@@ -258,6 +266,7 @@ def run_measurement(
             ncu=ncu,
             rand_seed=rand_seed,
             philox_rounds=effective_philox_rounds,
+            repeat_time_ms=repeat_time_ms,
         )
         results[name] = median_time
 
@@ -311,6 +320,13 @@ parser.add_argument(
     type=int,
     default=6,
     help="Number of MTP (cache) steps (default: 6)",
+)
+parser.add_argument(
+    "-r",
+    "--repeat",
+    type=int,
+    default=1000,
+    help="Repeat time in milliseconds for benchmarking (default: 1000)",
 )
 args = parser.parse_args()
 
@@ -373,6 +389,7 @@ for state_dtype_name, state_dtype_torch, philox_rounds in state_dtypes:
             generate_intermediate_states_buffer=True,
             ncu=args.ncu,
             philox_rounds=philox_rounds,
+            repeat_time_ms=args.repeat,
         )
 
         if not results:
