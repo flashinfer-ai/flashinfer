@@ -99,7 +99,7 @@ struct DMA {
   static_assert(STEP_KV % K_ == 0);
   using Transposer =
       Transposer<typename Kernel_traits::Traits_o, typename Kernel_traits::Cta_tile_o, K_,
-                 (STEP_KV > 128 || SLIDING_OR_CHUNKED_ATTENTION) ? 1 : 2 /* UNROLL */>;
+                 (STEP_KV >= 128 || SLIDING_OR_CHUNKED_ATTENTION) ? 1 : 2 /* UNROLL */>;
 
   struct Device {
     // Only the warpgroup leader initiates mbarriers & TMA operations.
