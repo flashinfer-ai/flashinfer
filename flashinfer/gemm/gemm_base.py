@@ -1441,6 +1441,7 @@ class SegmentGEMMWrapper:
     True
     """
 
+    @flashinfer_api
     def __init__(
         self, float_workspace_buffer: torch.Tensor, backend: str = "auto"
     ) -> None:
@@ -2087,6 +2088,7 @@ def build_cudnn_fp4_gemm_graph_override_shape(
     return graph
 
 
+@flashinfer_api
 def execute_cudnn_fp4_gemm_graph_override_shape(
     graph,
     a,
@@ -2352,6 +2354,7 @@ def build_cudnn_mxfp8_gemm_graph_override_shape(
     return graph
 
 
+@flashinfer_api
 def execute_cudnn_mxfp8_gemm_graph_override_shape(
     graph,
     a,
@@ -2650,6 +2653,7 @@ def build_cudnn_gemm_with_per_tensor_q_graph_override_shape(
     return graph
 
 
+@flashinfer_api
 def execute_cudnn_gemm_with_per_tensor_q_graph_override_shape(
     graph, a, b, a_scale, b_scale, c_final, workspace, tactic: int = 0
 ):
@@ -2914,6 +2918,7 @@ def build_cudnn_gemm_bf16_graph_override_shape(
     return graph
 
 
+@flashinfer_api
 def execute_cudnn_gemm_bf16_graph_override_shape(
     graph, a, b, c_final, workspace, tactic: int = 0
 ):

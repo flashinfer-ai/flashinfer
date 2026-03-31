@@ -1546,6 +1546,7 @@ class CUDAGraphBatchDecodeWithPagedKVCacheWrapper(BatchDecodeWithPagedKVCacheWra
     :class:`BatchDecodeWithPagedKVCacheWrapper`
     """
 
+    @flashinfer_api
     def __init__(
         self,
         workspace_buffer: torch.Tensor,
