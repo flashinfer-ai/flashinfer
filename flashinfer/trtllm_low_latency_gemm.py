@@ -116,6 +116,7 @@ def get_trtllm_low_latency_gemm_module():
     )
 
 
+@flashinfer_api
 def trtllm_low_latency_gemm(
     A: torch.Tensor,
     B: torch.Tensor,
