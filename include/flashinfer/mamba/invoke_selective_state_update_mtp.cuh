@@ -101,7 +101,11 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
       dispatchRatio(
           params, std::integer_sequence<int, 1, 2, 4, 8, 16, 32, 64>{}, [&]<int HEADS_PER_GROUP>() {
             constexpr int DSTATE_PAD = padDstate<input_t>(DSTATE);
-            using sram_t = AsyncHorizontalStorage<input_t, NTOKENS_MTP, DIM_PER_CTA, DSTATE_PAD>;
+            constexpr int kRowsPerPassLocal = NUM_WARPS * async_horiz::ROWS_PER_WARP;
+            constexpr int kNumPasses = DIM_PER_CTA / kRowsPerPassLocal;
+            constexpr int kStateStages = (kNumPasses == 1) ? 1 : 2;
+            using sram_t = AsyncHorizontalStorage<input_t, state_t, NTOKENS_MTP, DIM_PER_CTA,
+                                                  DSTATE_PAD, kRowsPerPassLocal, kStateStages>;
             constexpr size_t smem_size = sizeof(sram_t);
 
             auto func = selective_state_update_kernel_async_horizontal_mtp<
