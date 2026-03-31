@@ -939,13 +939,6 @@ def mxfp4_quantize_cute_dsl(
 
         kernel_fn(input, fp4_output, scale_output, m, total_sf_blocks, num_blocks)
     else:
-        # Swizzled 128x4 layout requires K to be a multiple of 128 so that
-        # K/32 (SF blocks per row) is a multiple of 4 and no column padding
-        # is needed in the scale factor buffer.
-        assert k % 128 == 0, (
-            f"SF_LAYOUT_128x4 requires K to be a multiple of 128 "
-            f"(K/32 must be a multiple of 4), got K={k}"
-        )
         padded_m = ((m + ROW_TILE_SIZE - 1) // ROW_TILE_SIZE) * ROW_TILE_SIZE
         padded_sf_cols = ((num_sf_blocks_per_row + 3) // 4) * 4
         scale_output_size = padded_m * padded_sf_cols
