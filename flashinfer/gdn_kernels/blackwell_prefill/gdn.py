@@ -1592,8 +1592,22 @@ class GDN:
             beta_val = sBeta0[tidx]
             gb_handle.release()
 
+            # Barrier to ensure cumsum visible, then save gate_tail before overwrite
+            cute.arch.barrier(
+                barrier_id=self.wg_sync_bar_id,
+                number_of_threads=len(self.cudacore_warp_ids) * 32,
+            )
+            gate_tail = (
+                sGateCumsum[tail_count - 1]
+                if cutlass.const_expr(need_mask)
+                else sGateCumsum[127]
+            )
+
+            # Precompute exp(cumsum_i) for factored gamma
+            tval_exp_gamma = cute.math.exp(tval, fastmath=True)
+
             self.compute_gamma_tmem(
-                tval,
+                tval_exp_gamma,
                 sGateCumsum,
                 kkt_thr_mma,
                 tGamma,
@@ -1610,12 +1624,6 @@ class GDN:
                 beta_val,
                 tGamma,
             )
-
-            gate_tail = (
-                sGateCumsum[tail_count - 1]
-                if cutlass.const_expr(need_mask)
-                else sGateCumsum[127]
-            )
             w0_handle = epi_w0_consumer.wait_and_advance()
             self.load_state_apply_gate(
                 kst_thr_mma,
@@ -1623,10 +1631,7 @@ class GDN:
                 sStateInput,
                 gate_tail,
             )
-            cute.arch.fence_proxy(
-                cute.arch.ProxyKind.async_shared,
-                space=cute.arch.SharedSpace.shared_cta,
-            )
+            cute.arch.fence_view_async_shared()
 
             qk_handle1 = mma_qk_consumer0.wait_and_advance()
             self.load_qk_epi(
@@ -1654,21 +1659,22 @@ class GDN:
                 sInvertSubSSL0B,
             )
 
-            c0_handle = mma_cudacore_consumer0.wait_and_advance()
-            c0_handle.release()
-            v_handle0 = load_v_consumer.wait_and_advance()
-
-            tval_exp = cute.math.exp(tval)
-            self.get_uw_b(
-                kst_thr_mma, tKStKS, tval_exp, beta_val, sV, need_mask, tail_count
-            )
             self.store_ivt_p1(
                 sInvertSubReg,
                 sInvertSubTSL0B,
             )
 
             c0_handle = mma_cudacore_consumer0.wait_and_advance()
-            self.load_ivt_ss_l0(tItSSL0, tInrDCL0A)  # debug
+            c0_handle.release()
+            v_handle0 = load_v_consumer.wait_and_advance()
+
+            tval_exp = cute.math.exp(tval, fastmath=True)
+            self.get_uw_b(
+                kst_thr_mma, tKStKS, tval_exp, beta_val, sV, need_mask, tail_count
+            )
+
+            c0_handle = mma_cudacore_consumer0.wait_and_advance()
+            self.load_ivt_ss_l0(tItSSL0, tInrDCL0A)
             c0_handle.release()
             self.store_ivt_smem_l1_ss_b(
                 kkt_thr_mma,
@@ -1708,10 +1714,6 @@ class GDN:
             c0_handle.release()
 
             self.load_q_epi(qk_thr_mma, sQ, tQgate, tval_exp, need_mask, tail_count)
-            cute.arch.fence_proxy(
-                cute.arch.ProxyKind.async_shared,
-                space=cute.arch.SharedSpace.shared_cta,
-            )
 
             c0_handle = mma_cudacore_consumer0.wait_and_advance()
             v_handle0.release()
@@ -1829,13 +1831,12 @@ class GDN:
             cute.arch.fence_view_async_tmem_load()
 
             # Load V from smem
-            temp_regs = cute.make_rmem_tensor(tTMEM_LOADrS_frag.shape, self.acc_dtype)
             for it in cutlass.range_constexpr(each_iter):
                 for inner_idx in cutlass.range_constexpr(0, frg_tile, 2):
                     # mul2
                     (
-                        temp_regs[inner_idx + 0, it],
-                        temp_regs[inner_idx + 1, it],
+                        tTMEM_LOADrS_frag[inner_idx + 0, it],
+                        tTMEM_LOADrS_frag[inner_idx + 1, it],
                     ) = cute.arch.mul_packed_f32x2(
                         (
                             tTMEM_LOADrS_frag[inner_idx + 0, it],
@@ -1846,8 +1847,8 @@ class GDN:
 
                     # fma2
                     (
-                        temp_regs[inner_idx + 0, it],
-                        temp_regs[inner_idx + 1, it],
+                        tTMEM_LOADrS_frag[inner_idx + 0, it],
+                        tTMEM_LOADrS_frag[inner_idx + 1, it],
                     ) = cute.arch.fma_packed_f32x2(
                         (
                             beta_val,
@@ -1862,12 +1863,12 @@ class GDN:
                             ),
                         ),
                         (
-                            temp_regs[inner_idx + 0, it],
-                            temp_regs[inner_idx + 1, it],
+                            tTMEM_LOADrS_frag[inner_idx + 0, it],
+                            tTMEM_LOADrS_frag[inner_idx + 1, it],
                         ),
                     )
                 sV_frg[None, (i * each_iter + it, thread_idx)].store(
-                    temp_regs[None, it].load().to(self.i_dtype)
+                    tTMEM_LOADrS_frag[None, it].load().to(self.i_dtype)
                 )
 
     @cute.jit
@@ -1935,10 +1936,7 @@ class GDN:
             cute.copy(tiled_smem_store, tTMEM_LOADrS, tTMEM_STOREsO_i)
 
         # fence view async shared
-        cute.arch.fence_proxy(
-            cute.arch.ProxyKind.async_shared,
-            space=cute.arch.SharedSpace.shared_cta,
-        )
+        cute.arch.fence_view_async_shared()
 
     @cute.jit
     def store_o_smem(
@@ -2016,13 +2014,12 @@ class GDN:
                 tTMEM_STORErS_x4_e, cute.make_layout(frg_tile)
             )
 
-            temp_regs = cute.make_rmem_tensor(tTMEM_LOADrS_frg.shape, self.acc_dtype)
             for j in cutlass.range_constexpr(frg_cnt):
                 for inner_idx in cutlass.range_constexpr(0, frg_tile, 2):
                     # mul2
                     (
-                        temp_regs[inner_idx + 0, j],
-                        temp_regs[inner_idx + 1, j],
+                        tTMEM_LOADrS_frg[inner_idx + 0, j],
+                        tTMEM_LOADrS_frg[inner_idx + 1, j],
                     ) = cute.arch.mul_packed_f32x2(
                         (
                             tTMEM_LOADrS_frg[inner_idx + 0, j],
@@ -2031,7 +2028,7 @@ class GDN:
                         (scale, scale),
                     )
                 tTMEM_STORErS_x4_e_frg[None, j].store(
-                    temp_regs[None, j].load().to(self.i_dtype)
+                    tTMEM_LOADrS_frg[None, j].load().to(self.i_dtype)
                 )
 
             # store
@@ -2042,10 +2039,7 @@ class GDN:
             cute.copy(tiled_smem_store, tTMEM_STORErS_x4_e, tTMEM_STOREsO_i)
 
         # fence view async shared
-        cute.arch.fence_proxy(
-            cute.arch.ProxyKind.async_shared,
-            space=cute.arch.SharedSpace.shared_cta,
-        )
+        cute.arch.fence_view_async_shared()
 
     @cute.jit
     def load_k(
@@ -2059,7 +2053,7 @@ class GDN:
         tidx, _, _ = cute.arch.thread_idx()
         thread_idx = tidx % (self.threads_per_warp * (len(self.cudacore_warp_ids)))
 
-        gate_val = cute.math.exp((gate - val))
+        gate_val = cute.math.exp((gate - val), fastmath=True)
 
         k = self.read_tmem_128(tIn)
 
@@ -2084,10 +2078,7 @@ class GDN:
                     (k_f16_frag[None, store_col].load() * gate_val).to(self.i_dtype)
                 )
 
-        cute.arch.fence_proxy(
-            cute.arch.ProxyKind.async_shared,
-            space=cute.arch.SharedSpace.shared_cta,
-        )
+        cute.arch.fence_view_async_shared()
 
     @cute.jit
     def init_state_zeros(
@@ -2233,8 +2224,7 @@ class GDN:
         cIn = cute.make_identity_tensor((128, 128))
         tOcO = thr_mma.partition_C(cIn)
 
-        corr_tile_size = 16
-        # corr_tile_size_f32 = corr_tile_size // 2
+        corr_tile_size = 32
 
         tIn_i_layout = cute.composition(
             tIn.layout, cute.make_layout((128, corr_tile_size))
@@ -2281,7 +2271,7 @@ class GDN:
             tTMEM_LOADrS.layout,
         )
 
-        gate_val = cute.math.exp(gate)
+        gate_val = cute.math.exp(gate, fastmath=True)
         for i in cutlass.range_constexpr(128 // corr_tile_size):
             tTMEM_LOADtO_i = cute.make_tensor(
                 tTMEM_LOADtO.iterator + i * corr_tile_size, tTMEM_LOADtO.layout
@@ -2759,10 +2749,7 @@ class GDN:
                         ((None, (col_true, 1)), lane_id % 8), 0, lane_id // 8, 0
                     ].store(tmem_frag[((None, j), 0), 0, 0].load())
 
-        cute.arch.fence_proxy(
-            cute.arch.ProxyKind.async_shared,
-            space=cute.arch.SharedSpace.shared_cta,
-        )
+        cute.arch.fence_view_async_shared()
 
     @cute.jit
     def store_ivt_smem_l1_ss_b(
@@ -2783,7 +2770,7 @@ class GDN:
         cIn = cute.make_identity_tensor((128, 128))
         tOcO = thr_mma.partition_C(cIn)
 
-        corr_tile_size = 8
+        corr_tile_size = 32
         tIn_i_layout = cute.composition(
             tIn.layout, cute.make_layout((128, corr_tile_size))
         )
@@ -2807,27 +2794,12 @@ class GDN:
 
         tTMEM_LOADrS = cute.make_rmem_tensor(tTMEM_LOADcO.shape, self.acc_dtype)
 
-        # tile 0
-        tTMEM_LOADtO_i = cute.make_tensor(tTMEM_LOADtO.iterator, tTMEM_LOADtO.layout)
-
-        cute.copy(tiled_tmem_load, tTMEM_LOADtO_i, tTMEM_LOADrS)
-        cute.arch.fence_view_async_tmem_load()
         sub_tile_size = 8
         tmem_frag = cute.logical_divide(tTMEM_LOADrS, ((sub_tile_size, None), None))
         sInvertSubSSL1B_frag = cute.logical_divide(
             sInvertSubSSL1B, ((sub_tile_size, None), None)
         )
         tile_frags = corr_tile_size // sub_tile_size
-        if sub_widx == 2 or sub_widx == 3:
-            sub_id_row = sub_widx - 2
-            for col in cutlass.range_constexpr(tile_frags):
-                col_true = (lane_id + col) % (tile_frags)
-                sInvertSubSSL1B_frag[
-                    ((None, (col_true, 0)), lane_id % 8),
-                    0,
-                    lane_id // 8 + sub_id_row * 4,
-                    0,
-                ].store(tmem_frag[((None, col_true), 0), 0, 0].load())
 
         # tile 0
         for i in cutlass.range_constexpr(32 // corr_tile_size):
@@ -2892,10 +2864,7 @@ class GDN:
                     ((None, (col_true, sub_id_row)), lane_id % 8), 0, lane_id // 8, 0
                 ].store(sReg[(None, tidx % 128), col_true].load())
 
-        cute.arch.fence_proxy(
-            cute.arch.ProxyKind.async_shared,
-            space=cute.arch.SharedSpace.shared_cta,
-        )
+        cute.arch.fence_view_async_shared()
 
     @cute.jit
     def store_ivt_p2(
@@ -2927,10 +2896,7 @@ class GDN:
                 sInvertSubSSL1A_frag[
                     (lane_id, (None, col_true % 2)), 0, (col_true // 2, 1), 0
                 ].store(zeros)
-        cute.arch.fence_proxy(
-            cute.arch.ProxyKind.async_shared,
-            space=cute.arch.SharedSpace.shared_cta,
-        )
+        cute.arch.fence_view_async_shared()
 
     @cute.jit
     def store_ivt_p3(
@@ -2964,10 +2930,7 @@ class GDN:
                 sInvertSubTSL1B_frag[
                     ((None, (col_true, 1)), lane_id % 8), 0, lane_id // 8 + 0, 0
                 ].store(zeros)
-        cute.arch.fence_proxy(
-            cute.arch.ProxyKind.async_shared,
-            space=cute.arch.SharedSpace.shared_cta,
-        )
+        cute.arch.fence_view_async_shared()
 
     @cute.jit
     def load_store_tmem_tune(
@@ -3113,23 +3076,17 @@ class GDN:
         cute.copy(tiled_copy_t2r, tTR_tO, tTR_rO)
         cute.arch.fence_view_async_tmem_load()
 
-        tTR_rO_e = cute.make_rmem_tensor(tTR_cO.shape, self.i_dtype)
         frg_cnt = 16
         frg_tile = cute.size(tTR_rO) // frg_cnt
         tTR_rO_frg = cute.logical_divide(tTR_rO, cute.make_layout(frg_tile))
-        tTR_rO_e_frg = cute.logical_divide(tTR_rO_e, cute.make_layout(frg_tile))
-        for j in cutlass.range_constexpr(frg_cnt):
-            r_vec = tTR_rO_frg[None, j].load()
-            tTR_rO_e_frg[None, j].store(r_vec.to(self.i_dtype))
 
         sNewV_frg = cute.logical_divide(sNewV, cute.make_layout(frg_tile))
         for it in cutlass.range_constexpr(0, 16):
-            sNewV_frg[None, (it, thread_idx)].store(tTR_rO_e_frg[None, it].load())
+            sNewV_frg[None, (it, thread_idx)].store(
+                tTR_rO_frg[None, it].load().to(self.i_dtype)
+            )
 
-        cute.arch.fence_proxy(
-            cute.arch.ProxyKind.async_shared,
-            space=cute.arch.SharedSpace.shared_cta,
-        )
+        cute.arch.fence_view_async_shared()
 
     @cute.jit
     def load_ivt_result(
@@ -3186,10 +3143,7 @@ class GDN:
                 it // 2,
             ] = tTR_rO_e_f32[it * 2 + 1]
 
-        cute.arch.fence_proxy(
-            cute.arch.ProxyKind.async_shared,
-            space=cute.arch.SharedSpace.shared_cta,
-        )
+        cute.arch.fence_view_async_shared()
 
     @cute.jit
     def apply_gamma_beta(
@@ -3210,7 +3164,7 @@ class GDN:
         cIn = cute.make_identity_tensor((128, 128))
         tOcO = thr_mma.partition_C(cIn)
 
-        corr_tile_size = 32  # only 8  or 32
+        corr_tile_size = 32  # 32
         tIn_i_layout = cute.composition(
             tIn.layout, cute.make_layout((128, corr_tile_size))
         )
@@ -3282,6 +3236,8 @@ class GDN:
             )
 
             cute.copy(tiled_tmem_load_gamma, tTMEM_LOADtG_i, tTMEM_LOADrG)
+            cute.copy(tiled_tmem_load, tTMEM_LOADtO_i, tTMEM_LOADrS)
+            cute.arch.fence_view_async_tmem_load()
             each_iter = corr_tile_size // frg_tile
             tTMEM_LOADrG_frg = cute.logical_divide(
                 tTMEM_LOADrG, ((frg_tile, None), None)
@@ -3301,8 +3257,6 @@ class GDN:
                             beta_val,
                         ),
                     )
-            cute.copy(tiled_tmem_load, tTMEM_LOADtO_i, tTMEM_LOADrS)
-            cute.arch.fence_view_async_tmem_load()
 
             tTMEM_LOADrS_frg = cute.logical_divide(
                 tTMEM_LOADrS, ((frg_tile, None), None)
@@ -3348,9 +3302,20 @@ class GDN:
         mask: cutlass.Constexpr[cutlass.Boolean] = False,
         tail_count: Int32 = 128,
     ):
-        """Build the 128x128 causal gamma matrix in TMEM: gamma[i,j] = exp(cumsum[i] - cumsum[j]) for j <= i."""
+        """Build the 128x128 causal gamma matrix in TMEM: gamma[i,j] = exp(cumsum[i]) * exp(-cumsum[j]) for j <= i."""
         tidx, _, _ = cute.arch.thread_idx()
         thread_idx = tidx % 128
+
+        cute.arch.barrier(
+            barrier_id=bar_id,
+            number_of_threads=len(self.cudacore_warp_ids) * 32,
+        )
+
+        # Precompute exp(-cumsum[j]) cooperatively and store to sGateCumsum
+        # Save gate_tail first (needed later, before we overwrite)
+        tidx_in_group = tidx % 128
+        neg_exp_val = cute.math.exp(-sGateCumsum[tidx_in_group], fastmath=True)
+        sGateCumsum[tidx_in_group] = neg_exp_val
 
         cute.arch.barrier(
             barrier_id=bar_id,
@@ -3403,6 +3368,7 @@ class GDN:
             )
             for it in cutlass.range_constexpr(corr_tile_size // frg_tile):
                 tile_offset = i * corr_tile_size + it * frg_tile
+                tile_end = tile_offset + frg_tile - 1
 
                 if (
                     (
@@ -3413,18 +3379,24 @@ class GDN:
                     if cutlass.const_expr(mask)
                     else (tile_offset <= thread_idx)
                 ):
-                    curr_val_frag_ssa = sGateCumsum_frag[(None, it), i].load()
+                    # Load precomputed exp(-cumsum[j]) from smem
+                    neg_exp_frag = sGateCumsum_frag[(None, it), i].load()
 
-                    new_val_frag = cute.math.exp(val - curr_val_frag_ssa, fastmath=True)
+                    # gamma[i,j] = exp(cumsum_i) * exp(-cumsum_j) — mul instead of exp
+                    new_val_frag = val * neg_exp_frag
 
-                    for inner_idx in cutlass.range_constexpr(0, frg_tile):
-                        offset = tile_offset + inner_idx
-                        curr_val = new_val_frag[inner_idx]
+                    if tile_end <= thread_idx:
+                        # Fast path: entire tile below diagonal
+                        tTMEM_STORErS_frag[None, it].store(new_val_frag)
+                    else:
+                        for inner_idx in cutlass.range_constexpr(0, frg_tile):
+                            offset = tile_offset + inner_idx
+                            curr_val = new_val_frag[inner_idx]
 
-                        if offset <= thread_idx:
-                            tTMEM_STORErS_frag[inner_idx, it] = curr_val
-                        else:
-                            tTMEM_STORErS_frag[inner_idx, it] = cutlass.Float32(0)
+                            if offset <= thread_idx:
+                                tTMEM_STORErS_frag[inner_idx, it] = curr_val
+                            else:
+                                tTMEM_STORErS_frag[inner_idx, it] = cutlass.Float32(0)
                 else:
                     tTMEM_STORErS_frag[None, it].store(zeros)
 
@@ -3446,19 +3418,16 @@ class GDN:
         tidx_in_group = tidx % 128
 
         val = sGate[tidx_in_group]
-        stride = 1
-        clamp_value = 0
-        while stride < 32:
+        for step in cutlass.range_constexpr(5):
+            stride = 1 << step
             shfl_value = cute.arch.shuffle_sync_op(
                 value=val,
                 offset=stride,
-                mask_and_clamp=clamp_value,
+                mask_and_clamp=0,
                 kind=nvvm.ShflKind.up,
             )
             if lane_id >= stride:
                 val += shfl_value
-
-            stride = stride << 1
         if lane_id == 31:
             sGateCumsum[warp_id] = val
 
@@ -3643,8 +3612,7 @@ class GDN:
                     sInvertSubTSL1B, ((4, None), None)
                 )
                 sub_id_row = sub_widx
-                for col in cutlass.range_constexpr(0, 8):
-                    col_true = (lane_id // 4 + col) % 8
+                for col_true in cutlass.range_constexpr(0, 8):
                     sInvertSubTSL1B_frag[
                         ((lane_id % 4, (col_true, 0)), lane_id // 4),
                         0,
@@ -3686,10 +3654,7 @@ class GDN:
                         0,
                     ].store(-tTR_rO_s_frag_f1[(None, 1), it].load())
 
-        cute.arch.fence_proxy(
-            cute.arch.ProxyKind.async_shared,
-            space=cute.arch.SharedSpace.shared_cta,
-        )
+        cute.arch.fence_view_async_shared()
 
     @cute.jit
     def store_ivt_c(
