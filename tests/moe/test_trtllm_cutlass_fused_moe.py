@@ -22,7 +22,7 @@ import torch
 from torch.nn import functional as F
 
 import flashinfer.fused_moe as fused_moe
-from flashinfer.utils import is_sm100a_supported
+from flashinfer.utils import is_sm100a_supported, is_sm12x_supported
 from flashinfer import (
     autotune,
     fp4_quantize,
@@ -1942,8 +1942,9 @@ def test_moe_nvfp4_unswizzled_input_sf():
     ids=["swiglu"],
 )
 @pytest.mark.skipif(
-    torch.cuda.get_device_capability()[0] not in [10, 11, 12],
-    reason="NVFP4 is only supported on SM100, SM110 and SM120/SM121",
+    not is_sm100a_supported(torch.device("cuda"))
+    and not is_sm12x_supported(torch.device("cuda")),
+    reason="NVFP4 is only supported on SM100+",
 )
 def test_moe_nvfp4_unaligned_hidden_size(
     batch_size,
@@ -1969,7 +1970,8 @@ def test_moe_nvfp4_unaligned_hidden_size(
 
     torch.manual_seed(42)
     quant_blocksize = 16
-    round_up = lambda x, y: (x + y - 1) // y * y
+    def round_up(x, y):
+        return (x + y - 1) // y * y
     e = num_experts
     m = batch_size
     n = intermediate_size
@@ -2081,7 +2083,7 @@ def test_moe_nvfp4_unaligned_hidden_size(
     torch.testing.assert_close(ref_output, flash_output, rtol=2e-1, atol=2e-1)
 
 
-# NOTE: No MXFP8×MXFP4 unaligned-hidden_size test here because the MXFP4 MoE
+# NOTE: No MXFP8xMXFP4 unaligned-hidden_size test here because the MXFP4 MoE
 # kernel requires hidden_size % 128 == 0, and when that holds, hidden_size / 32
 # is always a multiple of 4, so the block_scale_interleave column-padding that
 # triggers the weight_scale_vec_size bug cannot occur.
