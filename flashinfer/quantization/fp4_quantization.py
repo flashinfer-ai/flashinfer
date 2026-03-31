@@ -731,15 +731,15 @@ def fp4_quantize(
         is_sf_8x4_layout,
         enable_pdl,
     )
-    # Use the padded column count as the fixed dimension so that -1 infers the
-    # padded row count.  block_scale_interleave pads K/sf_vec_size up to the
-    # next multiple of 4 (e.g. hidden_size=2880: 90 cols -> 92) and pads M up
-    # to the next multiple of 128 (e.g. 48 rows -> 128).  Using input.shape[-1]
-    # for columns and input.shape[-2] for rows both fail when the other
-    # dimension has been padded, so we always compute the padded column count
-    # and let -1 absorb the padded row count.
-    sf_cols = round_up(input.shape[-1] // sf_vec_size, 4)
-    sf = sf.reshape((-1, sf_cols))
+    # Swizzled sf includes row/column padding from block_scale_interleave
+    # (rows to multiple of 128, cols to multiple of 4), so we use the padded
+    # column count and let -1 absorb the padded row count.
+    # Non-swizzled sf has exactly m * (k // sf_vec_size) elements, no padding.
+    if is_sf_swizzled_layout:
+        sf_cols = round_up(input.shape[-1] // sf_vec_size, 4)
+        sf = sf.reshape((-1, sf_cols))
+    else:
+        sf = sf.reshape((-1, input.shape[-1] // sf_vec_size))
     if is_column_major:
         x_q = x_q.transpose(-2, -1)
         sf = sf.transpose(-2, -1)
