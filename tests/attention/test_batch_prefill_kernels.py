@@ -1334,6 +1334,85 @@ def test_mis_v1_v2_output_parity(
     torch.testing.assert_close(o_v2, o_v1_items, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize("batch_size", [1])
+@pytest.mark.parametrize("prefix_len, item_len", [(17, 9), (16, 40), (0, 32), (64, 64)])
+@pytest.mark.parametrize("page_size", [1, 16])
+@pytest.mark.parametrize("num_kv_heads", [4])
+@pytest.mark.parametrize("num_qo_heads", [4])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("kv_layout", ["NHD"])
+@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
+def test_mis_v2_single_item_equals_causal(
+    batch_size,
+    prefix_len,
+    item_len,
+    page_size,
+    num_kv_heads,
+    num_qo_heads,
+    head_dim,
+    kv_layout,
+    logits_soft_cap,
+):
+    """MIS v2 with a single item must equal standard causal prefill (ground truth).
+
+    With one item, the V2 mask is: each Q token attends to all prefix KV tokens
+    plus same-item tokens causally. This is identical to causal attention where
+    KV = [prefix | item_tokens]. No special mask mode involved in the reference.
+    """
+    import torch
+
+    q = torch.randn(item_len, num_qo_heads, head_dim, dtype=torch.float16, device="cuda")
+    kv_len = prefix_len + item_len
+
+    prefix_k = torch.randn(prefix_len, num_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+    prefix_v = torch.randn(prefix_len, num_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+    item_k = torch.randn(item_len, num_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+    item_v = torch.randn(item_len, num_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+
+    k_full = torch.cat([prefix_k, item_k], dim=0)
+    v_full = torch.cat([prefix_v, item_v], dim=0)
+
+    # Pack flat KV into paged format
+    num_pages = (kv_len + page_size - 1) // page_size
+    kv_data = torch.zeros(
+        num_pages, 2, page_size, num_kv_heads, head_dim, dtype=torch.float16, device="cuda"
+    )
+    for pos in range(kv_len):
+        kv_data[pos // page_size, 0, pos % page_size] = k_full[pos]
+        kv_data[pos // page_size, 1, pos % page_size] = v_full[pos]
+
+    q_indptr = torch.tensor([0, item_len], dtype=torch.int32, device="cuda")
+    kv_indptr = torch.tensor([0, num_pages], dtype=torch.int32, device="cuda")
+    kv_indices = torch.arange(num_pages, dtype=torch.int32, device="cuda")
+    kv_last_page_len = torch.tensor(
+        [(kv_len - 1) % page_size + 1], dtype=torch.int32, device="cuda"
+    )
+
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda")
+    wrapper = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(workspace, kv_layout)
+    wrapper.plan(
+        q_indptr, kv_indptr, kv_indices, kv_last_page_len,
+        num_qo_heads, num_kv_heads, head_dim, page_size,
+        causal=True,
+        pos_encoding_mode="NONE",
+        logits_soft_cap=logits_soft_cap,
+        prefix_len_ptr=torch.tensor([prefix_len], dtype=torch.uint32, device="cuda"),
+        item_offsets=torch.tensor([0, item_len], dtype=torch.uint32, device="cuda"),
+        item_offsets_len=2,
+    )
+    o_mis = wrapper.run(q, kv_data)
+
+    # Ground truth: standard causal single_prefill with full KV (prefix + item)
+    o_ref = flashinfer.prefill.single_prefill_with_kv_cache(
+        q, k_full, v_full,
+        causal=True,
+        pos_encoding_mode="NONE",
+        logits_soft_cap=logits_soft_cap,
+    )
+
+    torch.testing.assert_close(o_mis, o_ref, rtol=1e-3, atol=1e-3)
+
+
 if __name__ == "__main__":
     test_batch_prefill_with_paged_kv_cache(
         12, 54, 37, 1, 4, 4, 128, False, "NHD", "NONE", False, 0.0, True, True
