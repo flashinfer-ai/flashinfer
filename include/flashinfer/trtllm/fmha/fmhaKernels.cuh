@@ -747,7 +747,7 @@ class TllmGenFmhaKernel {
     int& tileSizeQ = selectKernelParams.mTileSizeQ;
 
     // Mixed precision kernels don't work with groupsTokensHeadsQ = true for now.
-    if (mDtypeQ != mDtypeKv || mDtypeOut == DATA_TYPE_E2M1) {
+    if (mDtypeQ != mDtypeKv) {
       tileSizeQ = params.mNumHeadsQPerKv <= 8 ? 8 : 16;
       kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
       return;
@@ -773,11 +773,8 @@ class TllmGenFmhaKernel {
       kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
     }
 
-    // When maxSeqLenQ > 1, use an experimental kernel-timing model to select the best kernel that
-    // groups both tokensQ and headsQ into one CTA.
-    if (params.mMaxSeqLenQ > 1) {
-      selectTileSizeQForGqaGeneration(params, selectKernelParams);
-    }
+    // Use an experimental kernel-timing model to select the best tileSizeQ.
+    selectTileSizeQForGqaGeneration(params, selectKernelParams);
   }
 
   // Select a kernel based on the heuristic.
