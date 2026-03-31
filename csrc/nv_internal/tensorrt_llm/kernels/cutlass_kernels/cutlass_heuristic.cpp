@@ -128,6 +128,20 @@ std::vector<CutlassTileConfig> get_candidate_tiles(
     gemm_type = CutlassGemmType::Fp8;
   }
 
+  // SM121 (GB10) has ~99 KB SMEM — Ampere-style tiles where both M>=128 and N>=128
+  // exceed the SMEM budget. Filter them out so the autotuner doesn't waste time on
+  // known-bad configs.
+  auto filter_sm121 = [sm](std::vector<CutlassTileConfig> configs) {
+    if (sm != 121) return configs;
+    std::vector<CutlassTileConfig> filtered;
+    for (auto const& c : configs) {
+      TileShape ts = get_cta_shape_for_config(c);
+      if (ts.m >= 128 && ts.n >= 128) continue;
+      filtered.push_back(c);
+    }
+    return filtered;
+  };
+
   std::vector<CutlassTileConfig> base_configs{
       CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
       CutlassTileConfig::CtaShape64x128x64_WarpShape32x64x64};
@@ -137,42 +151,42 @@ std::vector<CutlassTileConfig> get_candidate_tiles(
 
   switch (gemm_type) {
     case CutlassGemmType::Simt:
-      return {CutlassTileConfig::CtaShape128x128x8_WarpShape64x64x8};
+      return filter_sm121({CutlassTileConfig::CtaShape128x128x8_WarpShape64x64x8});
     case CutlassGemmType::WeightOnly:
       if (sm >= 75) {
-        return {CutlassTileConfig::CtaShape16x128x64_WarpShape16x32x64,
+        return filter_sm121({CutlassTileConfig::CtaShape16x128x64_WarpShape16x32x64,
                 CutlassTileConfig::CtaShape16x256x64_WarpShape16x64x64,
                 CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
                 CutlassTileConfig::CtaShape64x128x64_WarpShape64x32x64,
-                CutlassTileConfig::CtaShape128x128x64_WarpShape128x32x64};
+                CutlassTileConfig::CtaShape128x128x64_WarpShape128x32x64});
       } else {
         return {CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
                 CutlassTileConfig::CtaShape64x128x64_WarpShape64x32x64};
       }
     case CutlassGemmType::Int8:
-      return {CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
+      return filter_sm121({CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
               CutlassTileConfig::CtaShape64x128x64_WarpShape64x32x64,
               CutlassTileConfig::CtaShape128x64x64_WarpShape64x32x64,
               CutlassTileConfig::CtaShape64x64x128_WarpShape32x64x64,
               CutlassTileConfig::CtaShape128x256x64_WarpShape64x64x64,
-              CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64};
+              CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64});
     case CutlassGemmType::Fp8:
       if (config_type_param & CutlassGemmConfig::GROUPED_GEMM) {
         if (sm == 89 || sm == 120 || sm == 121) {
-          return {CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
+          return filter_sm121({CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
                   CutlassTileConfig::CtaShape64x128x64_WarpShape64x32x64,
                   CutlassTileConfig::CtaShape64x64x128_WarpShape32x64x64,
                   CutlassTileConfig::CtaShape128x64x64_WarpShape64x32x64,
                   CutlassTileConfig::CtaShape128x256x64_WarpShape64x64x64,
                   CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64,
-                  CutlassTileConfig::CtaShape16x256x128_WarpShape16x64x128};
+                  CutlassTileConfig::CtaShape16x256x128_WarpShape16x64x128});
         } else {
           // no valid ampere style fp8 configs for sm90
           return {};
         }
       } else {
         if (sm == 89 || sm >= 120) {
-          return {CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
+          return filter_sm121({CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
                   CutlassTileConfig::CtaShape64x128x64_WarpShape32x64x64,
                   CutlassTileConfig::CtaShape64x64x128_WarpShape32x64x64,
                   CutlassTileConfig::CtaShape64x128x64_WarpShape64x32x64,
@@ -183,13 +197,13 @@ std::vector<CutlassTileConfig> get_candidate_tiles(
                   CutlassTileConfig::CtaShape128x256x64_WarpShape64x64x64,
                   CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64,
                   CutlassTileConfig::CtaShape128x64x128_WarpShape64x32x128,
-                  CutlassTileConfig::CtaShape16x256x128_WarpShape16x64x128};
+                  CutlassTileConfig::CtaShape16x256x128_WarpShape16x64x128});
         } else {
           return {};
         }
       }
     default:
-      return base_configs;
+      return filter_sm121(base_configs);
   }
 }
 
