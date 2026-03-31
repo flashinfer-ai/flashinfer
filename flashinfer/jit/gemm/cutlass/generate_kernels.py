@@ -752,23 +752,19 @@ def calc_shape_mnk_sm100_grouped_gemm(cta_shape_mn, dtype):
     return cta_shape_mn + (cta_shape_k,)
 
 
-def generate_sm120_grouped_gemm_operations(is_arch_enabled, is_sm121=False):
+def generate_sm120_grouped_gemm_operations(is_arch_enabled):
     if not is_arch_enabled:
         return []
     arch = 120
     supported_dtypes = [e2m1, (DataType.e4m3, e2m1)]
     quant_ops = [TrtLlm_QuantOp.none]
     epi_tags = [TrtLlm_EpilogueTag.epilogue_op_default]
-    if is_sm121:
-        # SM121 (GB10) has ~99 KB SMEM; only 128x128x64B fits
-        cta_shapes_mnk = [[128, 128, 128]]
-    else:
-        cta_shapes_mnk = [
-            [128, 128, 128],
-            [128, 128, 256],
-            [256, 128, 128],
-            [128, 256, 128],
-        ]
+    cta_shapes_mnk = [
+        [128, 128, 128],
+        [128, 128, 256],
+        [256, 128, 128],
+        [128, 256, 128],
+    ]
 
     warp_shape = [0, 0, 0]  # ignored except for naming
     stages = 0  # auto
@@ -849,11 +845,6 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled, is_sm121=False):
 def generate_sm120_operations(is_arch_enabled):
     operations = generate_sm120_grouped_gemm_operations(is_arch_enabled)
     return operations
-
-
-def generate_sm121_operations(is_arch_enabled):
-    """SM121 (GB10): only the 128x128x64B FP4 grouped GEMM tile fits in ~99 KB SMEM."""
-    return generate_sm120_grouped_gemm_operations(is_arch_enabled, is_sm121=True)
 
 
 def generate_sm100_grouped_gemm_operations(is_arch_enabled, arch):
@@ -1041,7 +1032,6 @@ def generate_gemm_operations(output_dir, architectures):
         (GemmKind.Grouped, 100): [moe_gemm_inl],
         (GemmKind.Grouped, 103): [moe_gemm_inl],
         (GemmKind.Grouped, 120): [moe_gemm_inl],
-        (GemmKind.Grouped, 121): [moe_gemm_inl],  # SM121 uses SM120 binaries
         (GemmKind.Grouped, 80): [sm80_moe_gemm_inl],
     }
 
@@ -1056,10 +1046,7 @@ def generate_gemm_operations(output_dir, architectures):
     # The goal here is to group kernels with common instantiations together in order to reduce template instantiation overheads.
     # Template instantiation dominates the time in a compilation unit, so it is the most important factor to improve.
     operations = []
-    operations += generate_sm120_operations(has_arch(120))
-    # SM121 (GB10): separate reduced tile set; only needed for SM121-only deployments.
-    if has_arch(121) and not has_arch(120):
-        operations += generate_sm121_operations(True)
+    operations += generate_sm120_operations(has_arch(120) or has_arch(121))
     operations += generate_sm103_operations(has_arch(103))
     operations += generate_sm100_operations(has_arch(100) or has_arch(103))
     operations += generate_sm90_operations(has_arch(90))
