@@ -3,17 +3,62 @@ import torch
 import math
 from typing import Optional, Tuple, Union
 
-# pytestmark = pytest.mark.skip(
-#     reason="todo(jimmyzho): temporarily skip this test due to hangs"
-# )
-
 import flashinfer
 from flashinfer.prefill import fmha_v2_prefill_deepseek
 from tests.utils_fp8 import to_float8
-from flashinfer.utils import is_sm12x_supported, is_sm120a_supported
+from flashinfer.jit import build_jit_specs
+from flashinfer.jit.attention import gen_fmha_v2_module, gen_trtllm_fmha_v2_sm120_module
+from flashinfer.utils import (
+    has_flashinfer_jit_cache,
+    is_sm12x_supported,
+    is_sm90a_supported,
+    is_sm120a_supported,
+)
 
 _WORKSPACE_BUFFER_SIZE = 128 * 1024 * 1024
 _workspace_buffer: Optional[torch.Tensor] = None
+
+
+@pytest.fixture(
+    autouse=not has_flashinfer_jit_cache(),
+    scope="module",
+)
+def warmup_jit():
+    try:
+        modules = []
+        device = torch.device("cuda")
+        has_sm90 = is_sm90a_supported(device)
+        has_sm120 = is_sm120a_supported(device)
+
+        if has_sm90 or has_sm120:
+            input_layouts = [
+                "packed_qkv",
+                "contiguous_q_kv",
+                "q_paged_kv_hnd",
+                "q_paged_kv_nhd",
+                "separate_q_k_v",
+            ]
+            f16_dtypes = [torch.float16, torch.bfloat16]
+
+            for layout in input_layouts:
+                for dtype in f16_dtypes:
+                    modules.append(gen_fmha_v2_module(layout, dtype))
+                # FP8 with various output dtypes (not supported for separate_q_k_v)
+                if layout != "separate_q_k_v":
+                    for o_dtype in [torch.float8_e4m3fn] + f16_dtypes:
+                        modules.append(
+                            gen_fmha_v2_module(layout, torch.float8_e4m3fn, o_dtype)
+                        )
+
+        if has_sm120:
+            modules.append(gen_trtllm_fmha_v2_sm120_module())
+
+        build_jit_specs(modules, verbose=False)
+    except Exception as e:
+        # abort the test session if warmup fails
+        pytest.exit(str(e))
+    finally:
+        yield
 
 
 def _get_workspace_buffer() -> torch.Tensor:
@@ -832,19 +877,19 @@ def test_trtllm_fmha_v2_prefill(
     save_softmax_stats: bool,
 ) -> None:
     # skip bs=16, q_heads=4, kv_heads=4, head_dim=256, dtype=float8_e4m3fn if packed/contiguous and sliding window due to bug
-    if (
-        batch_size == 16
-        and num_kv_heads == 4
-        and head_dim == 256
-        and dtype == torch.float8_e4m3fn
-        and input_layout in ["PACKED_QKV", "CONTIGUOUS_Q_KV"]
-        and mask_mode == "SLIDING_WINDOW"
-    ):
-        pytest.skip("Skip due to bug in fp8 sliding window")
-    if mask_mode == "SLIDING_WINDOW":
-        pytest.skip("todo(jimmyzho): temporarily skip sliding window test due to hang")
-    if dtype == torch.float8_e4m3fn:
-        pytest.skip("todo(jimmyzho): temporarily skip fp8 tests due to hang")
+    # if (
+    #     batch_size == 16
+    #     and num_kv_heads == 4
+    #     and head_dim == 256
+    #     and dtype == torch.float8_e4m3fn
+    #     and input_layout in ["PACKED_QKV", "CONTIGUOUS_Q_KV"]
+    #     and mask_mode == "SLIDING_WINDOW"
+    # ):
+    #     pytest.skip("Skip due to bug in fp8 sliding window")
+    # if mask_mode == "SLIDING_WINDOW":
+    #     pytest.skip("todo(jimmyzho): temporarily skip sliding window test due to hang")
+    # if dtype == torch.float8_e4m3fn:
+    #     pytest.skip("todo(jimmyzho): temporarily skip fp8 tests due to hang")
     run_trtllm_fmha_v2_prefill_case(
         input_layout=input_layout,
         batch_size=batch_size,
