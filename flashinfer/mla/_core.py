@@ -749,14 +749,15 @@ def trtllm_batch_decode_with_kv_cache_mla(
             uses_shared_paged_kv_idx,
         )
 
+        expected_out_shape = query.shape[:-1] + (kv_lora_rank,)
         if out is None:
-            out_shape = query.shape[:-1] + (kv_lora_rank,)
-            out = torch.empty(out_shape, dtype=torch.bfloat16, device=query.device)
+            out = torch.empty(
+                expected_out_shape, dtype=torch.bfloat16, device=query.device
+            )
         else:
-            batch_size, _, num_q_heads, _ = query.shape
             check_shape_dtype_device(
                 out,
-                [batch_size, num_q_heads, kv_lora_rank],
+                expected_out_shape,
                 torch.bfloat16,
                 query.device,
                 "out",
@@ -798,6 +799,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
 
         return out
     elif backend == "cute-dsl":
+        enable_pdl = (
+            device_support_pdl(query.device) if enable_pdl is None else enable_pdl
+        )
         cc = get_compute_capability(query.device)
         if cc[0] < 10:
             raise RuntimeError(
@@ -823,10 +827,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
             raise ValueError(
                 "cute-dsl backend (MLA decode kernel) does not support sparse_mla_top_k"
             )
-        if enable_pdl is not None:
-            raise ValueError(
-                "cute-dsl backend (MLA decode kernel) does not support enable_pdl"
-            )
         if skip_softmax_threshold_scale_factor is not None:
             raise ValueError(
                 "cute-dsl backend (MLA decode kernel) does not support skip_softmax_threshold_scale_factor"
@@ -850,6 +850,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
             output_scale=bmm2_scale,
             out=out,
             is_var_seq=is_var_seq,
+            enable_pdl=enable_pdl,
         )
     else:
         raise ValueError(f"Backend {backend} not supported")
