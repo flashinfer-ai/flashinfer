@@ -3,10 +3,6 @@ import torch
 import math
 from typing import Optional, Tuple, Union
 
-pytestmark = pytest.mark.skip(
-    reason="todo(jimmyzho): temporarily skip this test due to hangs"
-)
-
 import flashinfer
 from flashinfer.prefill import fmha_v2_prefill_deepseek
 from tests.utils_fp8 import to_float8
@@ -845,6 +841,11 @@ def test_trtllm_fmha_v2_prefill(
         pytest.skip("todo(jimmyzho): temporarily skip sliding window test due to hang")
     if dtype == torch.float8_e4m3fn and o_dtype == torch.float8_e4m3fn:
         pytest.skip("todo(jimmyzho): temporarily skip fp8 tests due to hang")
+    if dtype == torch.float8_e4m3fn and head_dim == 256:
+        pytest.skip(
+            "todo: fp8 with head_dim=256 hangs on SM90 tma_ws kernel due to barrier "
+            "deadlock (fmha_v2_flash_attention_e4m3_*_S_qkv_256_*_tma_ws_sm90_kernel+0xedf0)"
+        )
     run_trtllm_fmha_v2_prefill_case(
         input_layout=input_layout,
         batch_size=batch_size,
@@ -905,6 +906,11 @@ def test_trtllm_fmha_v2_prefill_skip_softmax(
     rtol: float,
     atol: float,
 ) -> None:
+    if dtype == torch.float8_e4m3fn and head_dim == 256:
+        pytest.skip(
+            "todo: fp8 with head_dim=256 hangs on SM90 tma_ws kernel due to barrier "
+            "deadlock (fmha_v2_flash_attention_e4m3_*_S_qkv_256_*_tma_ws_sm90_kernel+0xedf0)"
+        )
     run_trtllm_fmha_v2_prefill_case(
         input_layout=input_layout,
         batch_size=batch_size,
