@@ -1256,23 +1256,23 @@ def test_mis_v1_v2_output_parity(
     o_v2 = wrapper_v2.run(q_items, kv_data_v2)
 
     # ---- V1 ----
-    # V1 qo/kv includes prefix + (delimiter + item_tokens) per item
-    qo_len_v1 = prefix_len + sum(1 + l for l in item_lens)
-    kv_len_v1 = qo_len_v1
+    # V1: prefix lives ONLY in KV cache (not in Q). Q = [delim + items] per item.
+    # kv_len = prefix_len (cache) + qo_len (Q tokens mirrored into KV)
+    qo_len_v1 = sum(1 + l for l in item_lens)  # delimiter per item + item tokens
+    kv_len_v1 = prefix_len + qo_len_v1
 
-    # Q: prefix (random) + [delimiter (random) + shared item tokens] per item
-    q_prefix = torch.randn(prefix_len, num_qo_heads, head_dim, dtype=torch.float16, device="cuda")
+    # Q: [delimiter (random) + shared item tokens] per item — NO prefix tokens in Q
     q_delims = torch.randn(num_items, num_qo_heads, head_dim, dtype=torch.float16, device="cuda")
-    q_parts = [q_prefix]
+    q_parts = []
     item_offset = 0
     for i, l in enumerate(item_lens):
         q_parts.append(q_delims[i : i + 1])
         q_parts.append(q_items[item_offset : item_offset + l])
         item_offset += l
-    q_v1 = torch.cat(q_parts, dim=0)
+    q_v1 = torch.cat(q_parts, dim=0)  # shape [qo_len_v1, ...]
 
-    # K/V: [prefix || (delimiter_kv (random) + item_kv) per item]
-    # Delimiter KV is random — it gets masked to -inf by V1's mask logic
+    # KV: [prefix_kv || (delimiter_kv (random) + item_kv) per item]
+    # Delimiter KV is random — masked to -inf by V1's mask logic, doesn't affect output.
     k_delims = torch.randn(num_items, num_kv_heads, head_dim, dtype=torch.float16, device="cuda")
     v_delims = torch.randn(num_items, num_kv_heads, head_dim, dtype=torch.float16, device="cuda")
     k_parts = [prefix_k]
@@ -1284,7 +1284,7 @@ def test_mis_v1_v2_output_parity(
         k_parts.append(item_k[item_offset : item_offset + l])
         v_parts.append(item_v[item_offset : item_offset + l])
         item_offset += l
-    k_flat_v1 = torch.cat(k_parts, dim=0)
+    k_flat_v1 = torch.cat(k_parts, dim=0)  # shape [kv_len_v1, ...]
     v_flat_v1 = torch.cat(v_parts, dim=0)
     kv_data_v1 = pack_flat_kv_to_pages(k_flat_v1, v_flat_v1, kv_len_v1, page_size)
 
@@ -1296,8 +1296,8 @@ def test_mis_v1_v2_output_parity(
         (batch_size,), (kv_len_v1 - 1) % page_size + 1, dtype=torch.int32, device="cuda"
     )
 
-    # token_pos_in_items: sequential indices for prefix, 0=delim then 1..l for each item
-    token_pos = list(range(prefix_len))
+    # token_pos_in_items: 0=delimiter, 1..l=item tokens (for each item)
+    token_pos = []
     for l in item_lens:
         token_pos.append(0)
         for j in range(1, l + 1):
@@ -1320,9 +1320,9 @@ def test_mis_v1_v2_output_parity(
     )
     o_v1 = wrapper_v1.run(q_v1, kv_data_v1)
 
-    # Extract item-token outputs from V1 (skip prefix and delimiter positions)
+    # Extract item-token outputs from V1 (skip delimiter at start of each item)
     v1_item_indices = []
-    pos = prefix_len
+    pos = 0
     for l in item_lens:
         pos += 1  # skip delimiter
         for _ in range(l):
