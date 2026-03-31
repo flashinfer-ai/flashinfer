@@ -71,6 +71,30 @@ ILP_ROWS = (
 
 
 # ==============================================================================
+# FMA WRAPPER FUNCTIONS (SM90 Compatibility)
+# ==============================================================================
+# cute.arch.fma_packed_f32x2() generates F32x2 intrinsics NOT supported on SM90.
+# These wrappers use scalar FMA operations that work on all SM90+ architectures.
+# On SM100+ (Blackwell), use_packed_fma=True selects the native packed path.
+
+
+@cute.jit
+def fma_pair_mul(a1, a2, b1, b2):
+    """Multiply two pairs: (a1*b1, a2*b2). SM90-compatible."""
+    result1 = a1 * b1
+    result2 = a2 * b2
+    return result1, result2
+
+
+@cute.jit
+def fma_pair(a1, a2, b1, b2, c1, c2):
+    """FMA two pairs: (a1*b1+c1, a2*b2+c2). SM90-compatible."""
+    result1 = a1 * b1 + c1
+    result2 = a2 * b2 + c2
+    return result1, result2
+
+
+# ==============================================================================
 # KERNEL: T=1 with gdn_decode approach but BF16 state
 # ==============================================================================
 
@@ -381,6 +405,7 @@ def gdn_decode_bf16state_ilp_kernel(
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
     use_qk_l2norm: cutlass.Constexpr[bool],
+    use_packed_fma: cutlass.Constexpr[bool],
 ):
     """
     ILP-optimized T=1 GDN decode kernel with BF16 state.
@@ -594,87 +619,187 @@ def gdn_decode_bf16state_ilp_kernel(
             s7b = 0.0
             for i in cutlass.range_constexpr(0, vec_size, 2):
                 # Convert + decay for pairs of elements
-                r_h[0, i], r_h[0, i + 1] = cute.arch.fma_packed_f32x2(
-                    src_a=(cutlass.Float32(r_hb0[i]), cutlass.Float32(r_hb0[i + 1])),
-                    src_b=(r_g, r_g),
-                    src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
-                )
-                r_h[1, i], r_h[1, i + 1] = cute.arch.fma_packed_f32x2(
-                    src_a=(cutlass.Float32(r_hb1[i]), cutlass.Float32(r_hb1[i + 1])),
-                    src_b=(r_g, r_g),
-                    src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
-                )
-                r_h[2, i], r_h[2, i + 1] = cute.arch.fma_packed_f32x2(
-                    src_a=(cutlass.Float32(r_hb2[i]), cutlass.Float32(r_hb2[i + 1])),
-                    src_b=(r_g, r_g),
-                    src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
-                )
-                r_h[3, i], r_h[3, i + 1] = cute.arch.fma_packed_f32x2(
-                    src_a=(cutlass.Float32(r_hb3[i]), cutlass.Float32(r_hb3[i + 1])),
-                    src_b=(r_g, r_g),
-                    src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
-                )
-                r_h[4, i], r_h[4, i + 1] = cute.arch.fma_packed_f32x2(
-                    src_a=(cutlass.Float32(r_hb4[i]), cutlass.Float32(r_hb4[i + 1])),
-                    src_b=(r_g, r_g),
-                    src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
-                )
-                r_h[5, i], r_h[5, i + 1] = cute.arch.fma_packed_f32x2(
-                    src_a=(cutlass.Float32(r_hb5[i]), cutlass.Float32(r_hb5[i + 1])),
-                    src_b=(r_g, r_g),
-                    src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
-                )
-                r_h[6, i], r_h[6, i + 1] = cute.arch.fma_packed_f32x2(
-                    src_a=(cutlass.Float32(r_hb6[i]), cutlass.Float32(r_hb6[i + 1])),
-                    src_b=(r_g, r_g),
-                    src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
-                )
-                r_h[7, i], r_h[7, i + 1] = cute.arch.fma_packed_f32x2(
-                    src_a=(cutlass.Float32(r_hb7[i]), cutlass.Float32(r_hb7[i + 1])),
-                    src_b=(r_g, r_g),
-                    src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
-                )
+                if cutlass.const_expr(use_packed_fma):
+                    r_h[0, i], r_h[0, i + 1] = cute.arch.fma_packed_f32x2(
+                        src_a=(
+                            cutlass.Float32(r_hb0[i]),
+                            cutlass.Float32(r_hb0[i + 1]),
+                        ),
+                        src_b=(r_g, r_g),
+                        src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
+                    )
+                    r_h[1, i], r_h[1, i + 1] = cute.arch.fma_packed_f32x2(
+                        src_a=(
+                            cutlass.Float32(r_hb1[i]),
+                            cutlass.Float32(r_hb1[i + 1]),
+                        ),
+                        src_b=(r_g, r_g),
+                        src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
+                    )
+                    r_h[2, i], r_h[2, i + 1] = cute.arch.fma_packed_f32x2(
+                        src_a=(
+                            cutlass.Float32(r_hb2[i]),
+                            cutlass.Float32(r_hb2[i + 1]),
+                        ),
+                        src_b=(r_g, r_g),
+                        src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
+                    )
+                    r_h[3, i], r_h[3, i + 1] = cute.arch.fma_packed_f32x2(
+                        src_a=(
+                            cutlass.Float32(r_hb3[i]),
+                            cutlass.Float32(r_hb3[i + 1]),
+                        ),
+                        src_b=(r_g, r_g),
+                        src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
+                    )
+                    r_h[4, i], r_h[4, i + 1] = cute.arch.fma_packed_f32x2(
+                        src_a=(
+                            cutlass.Float32(r_hb4[i]),
+                            cutlass.Float32(r_hb4[i + 1]),
+                        ),
+                        src_b=(r_g, r_g),
+                        src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
+                    )
+                    r_h[5, i], r_h[5, i + 1] = cute.arch.fma_packed_f32x2(
+                        src_a=(
+                            cutlass.Float32(r_hb5[i]),
+                            cutlass.Float32(r_hb5[i + 1]),
+                        ),
+                        src_b=(r_g, r_g),
+                        src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
+                    )
+                    r_h[6, i], r_h[6, i + 1] = cute.arch.fma_packed_f32x2(
+                        src_a=(
+                            cutlass.Float32(r_hb6[i]),
+                            cutlass.Float32(r_hb6[i + 1]),
+                        ),
+                        src_b=(r_g, r_g),
+                        src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
+                    )
+                    r_h[7, i], r_h[7, i + 1] = cute.arch.fma_packed_f32x2(
+                        src_a=(
+                            cutlass.Float32(r_hb7[i]),
+                            cutlass.Float32(r_hb7[i + 1]),
+                        ),
+                        src_b=(r_g, r_g),
+                        src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
+                    )
+                else:
+                    r_h[0, i], r_h[0, i + 1] = fma_pair_mul(
+                        cutlass.Float32(r_hb0[i]),
+                        cutlass.Float32(r_hb0[i + 1]),
+                        r_g,
+                        r_g,
+                    )
+                    r_h[1, i], r_h[1, i + 1] = fma_pair_mul(
+                        cutlass.Float32(r_hb1[i]),
+                        cutlass.Float32(r_hb1[i + 1]),
+                        r_g,
+                        r_g,
+                    )
+                    r_h[2, i], r_h[2, i + 1] = fma_pair_mul(
+                        cutlass.Float32(r_hb2[i]),
+                        cutlass.Float32(r_hb2[i + 1]),
+                        r_g,
+                        r_g,
+                    )
+                    r_h[3, i], r_h[3, i + 1] = fma_pair_mul(
+                        cutlass.Float32(r_hb3[i]),
+                        cutlass.Float32(r_hb3[i + 1]),
+                        r_g,
+                        r_g,
+                    )
+                    r_h[4, i], r_h[4, i + 1] = fma_pair_mul(
+                        cutlass.Float32(r_hb4[i]),
+                        cutlass.Float32(r_hb4[i + 1]),
+                        r_g,
+                        r_g,
+                    )
+                    r_h[5, i], r_h[5, i + 1] = fma_pair_mul(
+                        cutlass.Float32(r_hb5[i]),
+                        cutlass.Float32(r_hb5[i + 1]),
+                        r_g,
+                        r_g,
+                    )
+                    r_h[6, i], r_h[6, i + 1] = fma_pair_mul(
+                        cutlass.Float32(r_hb6[i]),
+                        cutlass.Float32(r_hb6[i + 1]),
+                        r_g,
+                        r_g,
+                    )
+                    r_h[7, i], r_h[7, i + 1] = fma_pair_mul(
+                        cutlass.Float32(r_hb7[i]),
+                        cutlass.Float32(r_hb7[i + 1]),
+                        r_g,
+                        r_g,
+                    )
                 # Dot product h@k using paired FMA
-                s0, s0b = cute.arch.fma_packed_f32x2(
-                    src_a=(r_h[0, i], r_h[0, i + 1]),
-                    src_b=(r_k[i], r_k[i + 1]),
-                    src_c=(s0, s0b),
-                )
-                s1, s1b = cute.arch.fma_packed_f32x2(
-                    src_a=(r_h[1, i], r_h[1, i + 1]),
-                    src_b=(r_k[i], r_k[i + 1]),
-                    src_c=(s1, s1b),
-                )
-                s2, s2b = cute.arch.fma_packed_f32x2(
-                    src_a=(r_h[2, i], r_h[2, i + 1]),
-                    src_b=(r_k[i], r_k[i + 1]),
-                    src_c=(s2, s2b),
-                )
-                s3, s3b = cute.arch.fma_packed_f32x2(
-                    src_a=(r_h[3, i], r_h[3, i + 1]),
-                    src_b=(r_k[i], r_k[i + 1]),
-                    src_c=(s3, s3b),
-                )
-                s4, s4b = cute.arch.fma_packed_f32x2(
-                    src_a=(r_h[4, i], r_h[4, i + 1]),
-                    src_b=(r_k[i], r_k[i + 1]),
-                    src_c=(s4, s4b),
-                )
-                s5, s5b = cute.arch.fma_packed_f32x2(
-                    src_a=(r_h[5, i], r_h[5, i + 1]),
-                    src_b=(r_k[i], r_k[i + 1]),
-                    src_c=(s5, s5b),
-                )
-                s6, s6b = cute.arch.fma_packed_f32x2(
-                    src_a=(r_h[6, i], r_h[6, i + 1]),
-                    src_b=(r_k[i], r_k[i + 1]),
-                    src_c=(s6, s6b),
-                )
-                s7, s7b = cute.arch.fma_packed_f32x2(
-                    src_a=(r_h[7, i], r_h[7, i + 1]),
-                    src_b=(r_k[i], r_k[i + 1]),
-                    src_c=(s7, s7b),
-                )
+                if cutlass.const_expr(use_packed_fma):
+                    s0, s0b = cute.arch.fma_packed_f32x2(
+                        src_a=(r_h[0, i], r_h[0, i + 1]),
+                        src_b=(r_k[i], r_k[i + 1]),
+                        src_c=(s0, s0b),
+                    )
+                    s1, s1b = cute.arch.fma_packed_f32x2(
+                        src_a=(r_h[1, i], r_h[1, i + 1]),
+                        src_b=(r_k[i], r_k[i + 1]),
+                        src_c=(s1, s1b),
+                    )
+                    s2, s2b = cute.arch.fma_packed_f32x2(
+                        src_a=(r_h[2, i], r_h[2, i + 1]),
+                        src_b=(r_k[i], r_k[i + 1]),
+                        src_c=(s2, s2b),
+                    )
+                    s3, s3b = cute.arch.fma_packed_f32x2(
+                        src_a=(r_h[3, i], r_h[3, i + 1]),
+                        src_b=(r_k[i], r_k[i + 1]),
+                        src_c=(s3, s3b),
+                    )
+                    s4, s4b = cute.arch.fma_packed_f32x2(
+                        src_a=(r_h[4, i], r_h[4, i + 1]),
+                        src_b=(r_k[i], r_k[i + 1]),
+                        src_c=(s4, s4b),
+                    )
+                    s5, s5b = cute.arch.fma_packed_f32x2(
+                        src_a=(r_h[5, i], r_h[5, i + 1]),
+                        src_b=(r_k[i], r_k[i + 1]),
+                        src_c=(s5, s5b),
+                    )
+                    s6, s6b = cute.arch.fma_packed_f32x2(
+                        src_a=(r_h[6, i], r_h[6, i + 1]),
+                        src_b=(r_k[i], r_k[i + 1]),
+                        src_c=(s6, s6b),
+                    )
+                    s7, s7b = cute.arch.fma_packed_f32x2(
+                        src_a=(r_h[7, i], r_h[7, i + 1]),
+                        src_b=(r_k[i], r_k[i + 1]),
+                        src_c=(s7, s7b),
+                    )
+                else:
+                    s0, s0b = fma_pair(
+                        r_h[0, i], r_h[0, i + 1], r_k[i], r_k[i + 1], s0, s0b
+                    )
+                    s1, s1b = fma_pair(
+                        r_h[1, i], r_h[1, i + 1], r_k[i], r_k[i + 1], s1, s1b
+                    )
+                    s2, s2b = fma_pair(
+                        r_h[2, i], r_h[2, i + 1], r_k[i], r_k[i + 1], s2, s2b
+                    )
+                    s3, s3b = fma_pair(
+                        r_h[3, i], r_h[3, i + 1], r_k[i], r_k[i + 1], s3, s3b
+                    )
+                    s4, s4b = fma_pair(
+                        r_h[4, i], r_h[4, i + 1], r_k[i], r_k[i + 1], s4, s4b
+                    )
+                    s5, s5b = fma_pair(
+                        r_h[5, i], r_h[5, i + 1], r_k[i], r_k[i + 1], s5, s5b
+                    )
+                    s6, s6b = fma_pair(
+                        r_h[6, i], r_h[6, i + 1], r_k[i], r_k[i + 1], s6, s6b
+                    )
+                    s7, s7b = fma_pair(
+                        r_h[7, i], r_h[7, i + 1], r_k[i], r_k[i + 1], s7, s7b
+                    )
             # Combine paired accumulators
             s0 = s0 + s0b
             s1 = s1 + s1b
@@ -745,87 +870,139 @@ def gdn_decode_bf16state_ilp_kernel(
             o7b = 0.0
             for i in cutlass.range_constexpr(0, vec_size, 2):
                 # Rank-1 update: h += k * vn (paired FMA)
-                r_h[0, i], r_h[0, i + 1] = cute.arch.fma_packed_f32x2(
-                    src_a=(r_k[i], r_k[i + 1]),
-                    src_b=(vn0, vn0),
-                    src_c=(r_h[0, i], r_h[0, i + 1]),
-                )
-                r_h[1, i], r_h[1, i + 1] = cute.arch.fma_packed_f32x2(
-                    src_a=(r_k[i], r_k[i + 1]),
-                    src_b=(vn1, vn1),
-                    src_c=(r_h[1, i], r_h[1, i + 1]),
-                )
-                r_h[2, i], r_h[2, i + 1] = cute.arch.fma_packed_f32x2(
-                    src_a=(r_k[i], r_k[i + 1]),
-                    src_b=(vn2, vn2),
-                    src_c=(r_h[2, i], r_h[2, i + 1]),
-                )
-                r_h[3, i], r_h[3, i + 1] = cute.arch.fma_packed_f32x2(
-                    src_a=(r_k[i], r_k[i + 1]),
-                    src_b=(vn3, vn3),
-                    src_c=(r_h[3, i], r_h[3, i + 1]),
-                )
-                r_h[4, i], r_h[4, i + 1] = cute.arch.fma_packed_f32x2(
-                    src_a=(r_k[i], r_k[i + 1]),
-                    src_b=(vn4, vn4),
-                    src_c=(r_h[4, i], r_h[4, i + 1]),
-                )
-                r_h[5, i], r_h[5, i + 1] = cute.arch.fma_packed_f32x2(
-                    src_a=(r_k[i], r_k[i + 1]),
-                    src_b=(vn5, vn5),
-                    src_c=(r_h[5, i], r_h[5, i + 1]),
-                )
-                r_h[6, i], r_h[6, i + 1] = cute.arch.fma_packed_f32x2(
-                    src_a=(r_k[i], r_k[i + 1]),
-                    src_b=(vn6, vn6),
-                    src_c=(r_h[6, i], r_h[6, i + 1]),
-                )
-                r_h[7, i], r_h[7, i + 1] = cute.arch.fma_packed_f32x2(
-                    src_a=(r_k[i], r_k[i + 1]),
-                    src_b=(vn7, vn7),
-                    src_c=(r_h[7, i], r_h[7, i + 1]),
-                )
+                if cutlass.const_expr(use_packed_fma):
+                    r_h[0, i], r_h[0, i + 1] = cute.arch.fma_packed_f32x2(
+                        src_a=(r_k[i], r_k[i + 1]),
+                        src_b=(vn0, vn0),
+                        src_c=(r_h[0, i], r_h[0, i + 1]),
+                    )
+                    r_h[1, i], r_h[1, i + 1] = cute.arch.fma_packed_f32x2(
+                        src_a=(r_k[i], r_k[i + 1]),
+                        src_b=(vn1, vn1),
+                        src_c=(r_h[1, i], r_h[1, i + 1]),
+                    )
+                    r_h[2, i], r_h[2, i + 1] = cute.arch.fma_packed_f32x2(
+                        src_a=(r_k[i], r_k[i + 1]),
+                        src_b=(vn2, vn2),
+                        src_c=(r_h[2, i], r_h[2, i + 1]),
+                    )
+                    r_h[3, i], r_h[3, i + 1] = cute.arch.fma_packed_f32x2(
+                        src_a=(r_k[i], r_k[i + 1]),
+                        src_b=(vn3, vn3),
+                        src_c=(r_h[3, i], r_h[3, i + 1]),
+                    )
+                    r_h[4, i], r_h[4, i + 1] = cute.arch.fma_packed_f32x2(
+                        src_a=(r_k[i], r_k[i + 1]),
+                        src_b=(vn4, vn4),
+                        src_c=(r_h[4, i], r_h[4, i + 1]),
+                    )
+                    r_h[5, i], r_h[5, i + 1] = cute.arch.fma_packed_f32x2(
+                        src_a=(r_k[i], r_k[i + 1]),
+                        src_b=(vn5, vn5),
+                        src_c=(r_h[5, i], r_h[5, i + 1]),
+                    )
+                    r_h[6, i], r_h[6, i + 1] = cute.arch.fma_packed_f32x2(
+                        src_a=(r_k[i], r_k[i + 1]),
+                        src_b=(vn6, vn6),
+                        src_c=(r_h[6, i], r_h[6, i + 1]),
+                    )
+                    r_h[7, i], r_h[7, i + 1] = cute.arch.fma_packed_f32x2(
+                        src_a=(r_k[i], r_k[i + 1]),
+                        src_b=(vn7, vn7),
+                        src_c=(r_h[7, i], r_h[7, i + 1]),
+                    )
+                else:
+                    r_h[0, i], r_h[0, i + 1] = fma_pair(
+                        r_k[i], r_k[i + 1], vn0, vn0, r_h[0, i], r_h[0, i + 1]
+                    )
+                    r_h[1, i], r_h[1, i + 1] = fma_pair(
+                        r_k[i], r_k[i + 1], vn1, vn1, r_h[1, i], r_h[1, i + 1]
+                    )
+                    r_h[2, i], r_h[2, i + 1] = fma_pair(
+                        r_k[i], r_k[i + 1], vn2, vn2, r_h[2, i], r_h[2, i + 1]
+                    )
+                    r_h[3, i], r_h[3, i + 1] = fma_pair(
+                        r_k[i], r_k[i + 1], vn3, vn3, r_h[3, i], r_h[3, i + 1]
+                    )
+                    r_h[4, i], r_h[4, i + 1] = fma_pair(
+                        r_k[i], r_k[i + 1], vn4, vn4, r_h[4, i], r_h[4, i + 1]
+                    )
+                    r_h[5, i], r_h[5, i + 1] = fma_pair(
+                        r_k[i], r_k[i + 1], vn5, vn5, r_h[5, i], r_h[5, i + 1]
+                    )
+                    r_h[6, i], r_h[6, i + 1] = fma_pair(
+                        r_k[i], r_k[i + 1], vn6, vn6, r_h[6, i], r_h[6, i + 1]
+                    )
+                    r_h[7, i], r_h[7, i + 1] = fma_pair(
+                        r_k[i], r_k[i + 1], vn7, vn7, r_h[7, i], r_h[7, i + 1]
+                    )
                 # Output dot product: o += h * q (paired FMA)
-                o0, o0b = cute.arch.fma_packed_f32x2(
-                    src_a=(r_h[0, i], r_h[0, i + 1]),
-                    src_b=(r_q[i], r_q[i + 1]),
-                    src_c=(o0, o0b),
-                )
-                o1, o1b = cute.arch.fma_packed_f32x2(
-                    src_a=(r_h[1, i], r_h[1, i + 1]),
-                    src_b=(r_q[i], r_q[i + 1]),
-                    src_c=(o1, o1b),
-                )
-                o2, o2b = cute.arch.fma_packed_f32x2(
-                    src_a=(r_h[2, i], r_h[2, i + 1]),
-                    src_b=(r_q[i], r_q[i + 1]),
-                    src_c=(o2, o2b),
-                )
-                o3, o3b = cute.arch.fma_packed_f32x2(
-                    src_a=(r_h[3, i], r_h[3, i + 1]),
-                    src_b=(r_q[i], r_q[i + 1]),
-                    src_c=(o3, o3b),
-                )
-                o4, o4b = cute.arch.fma_packed_f32x2(
-                    src_a=(r_h[4, i], r_h[4, i + 1]),
-                    src_b=(r_q[i], r_q[i + 1]),
-                    src_c=(o4, o4b),
-                )
-                o5, o5b = cute.arch.fma_packed_f32x2(
-                    src_a=(r_h[5, i], r_h[5, i + 1]),
-                    src_b=(r_q[i], r_q[i + 1]),
-                    src_c=(o5, o5b),
-                )
-                o6, o6b = cute.arch.fma_packed_f32x2(
-                    src_a=(r_h[6, i], r_h[6, i + 1]),
-                    src_b=(r_q[i], r_q[i + 1]),
-                    src_c=(o6, o6b),
-                )
-                o7, o7b = cute.arch.fma_packed_f32x2(
-                    src_a=(r_h[7, i], r_h[7, i + 1]),
-                    src_b=(r_q[i], r_q[i + 1]),
-                    src_c=(o7, o7b),
-                )
+                if cutlass.const_expr(use_packed_fma):
+                    o0, o0b = cute.arch.fma_packed_f32x2(
+                        src_a=(r_h[0, i], r_h[0, i + 1]),
+                        src_b=(r_q[i], r_q[i + 1]),
+                        src_c=(o0, o0b),
+                    )
+                    o1, o1b = cute.arch.fma_packed_f32x2(
+                        src_a=(r_h[1, i], r_h[1, i + 1]),
+                        src_b=(r_q[i], r_q[i + 1]),
+                        src_c=(o1, o1b),
+                    )
+                    o2, o2b = cute.arch.fma_packed_f32x2(
+                        src_a=(r_h[2, i], r_h[2, i + 1]),
+                        src_b=(r_q[i], r_q[i + 1]),
+                        src_c=(o2, o2b),
+                    )
+                    o3, o3b = cute.arch.fma_packed_f32x2(
+                        src_a=(r_h[3, i], r_h[3, i + 1]),
+                        src_b=(r_q[i], r_q[i + 1]),
+                        src_c=(o3, o3b),
+                    )
+                    o4, o4b = cute.arch.fma_packed_f32x2(
+                        src_a=(r_h[4, i], r_h[4, i + 1]),
+                        src_b=(r_q[i], r_q[i + 1]),
+                        src_c=(o4, o4b),
+                    )
+                    o5, o5b = cute.arch.fma_packed_f32x2(
+                        src_a=(r_h[5, i], r_h[5, i + 1]),
+                        src_b=(r_q[i], r_q[i + 1]),
+                        src_c=(o5, o5b),
+                    )
+                    o6, o6b = cute.arch.fma_packed_f32x2(
+                        src_a=(r_h[6, i], r_h[6, i + 1]),
+                        src_b=(r_q[i], r_q[i + 1]),
+                        src_c=(o6, o6b),
+                    )
+                    o7, o7b = cute.arch.fma_packed_f32x2(
+                        src_a=(r_h[7, i], r_h[7, i + 1]),
+                        src_b=(r_q[i], r_q[i + 1]),
+                        src_c=(o7, o7b),
+                    )
+                else:
+                    o0, o0b = fma_pair(
+                        r_h[0, i], r_h[0, i + 1], r_q[i], r_q[i + 1], o0, o0b
+                    )
+                    o1, o1b = fma_pair(
+                        r_h[1, i], r_h[1, i + 1], r_q[i], r_q[i + 1], o1, o1b
+                    )
+                    o2, o2b = fma_pair(
+                        r_h[2, i], r_h[2, i + 1], r_q[i], r_q[i + 1], o2, o2b
+                    )
+                    o3, o3b = fma_pair(
+                        r_h[3, i], r_h[3, i + 1], r_q[i], r_q[i + 1], o3, o3b
+                    )
+                    o4, o4b = fma_pair(
+                        r_h[4, i], r_h[4, i + 1], r_q[i], r_q[i + 1], o4, o4b
+                    )
+                    o5, o5b = fma_pair(
+                        r_h[5, i], r_h[5, i + 1], r_q[i], r_q[i + 1], o5, o5b
+                    )
+                    o6, o6b = fma_pair(
+                        r_h[6, i], r_h[6, i + 1], r_q[i], r_q[i + 1], o6, o6b
+                    )
+                    o7, o7b = fma_pair(
+                        r_h[7, i], r_h[7, i + 1], r_q[i], r_q[i + 1], o7, o7b
+                    )
             # Combine paired accumulators
             o0 = o0 + o0b
             o1 = o1 + o1b
@@ -943,12 +1120,13 @@ def gdn_decode_bf16state_mtp_kernel(
     use_qk_l2norm: cutlass.Constexpr[bool],
     disable_state_update: cutlass.Constexpr[bool],
     cache_intermediate_states: cutlass.Constexpr[bool],
+    use_packed_fma: cutlass.Constexpr[bool],
 ):
     """
     ILP-optimized MTP kernel for BF16 state: processes T tokens sequentially.
     Each block handles one tile_v chunk of V rows.
     H is loaded as BF16, computed in FP32, stored back as BF16.
-    Uses 8-row ILP with fma_packed_f32x2 and interleaved butterfly shuffles.
+    Uses 8-row ILP with fma_packed_f32x2 (Blackwell) / scalar FMA (Hopper) with compile-time dispatch.
     """
     tidx, _, _ = cute.arch.thread_idx()
     lane_id = tidx % 32
@@ -1312,7 +1490,7 @@ def gdn_decode_bf16state_mtp_kernel(
                     )
                     r_g = cute.exp(r_g_value_v, fastmath=True)
 
-                # Fused: decay h, dot product h@k using fma_packed_f32x2
+                # Fused: decay h, dot product h@k with conditional dispatch
                 s0 = 0.0
                 s1 = 0.0
                 s2 = 0.0
@@ -1330,88 +1508,140 @@ def gdn_decode_bf16state_mtp_kernel(
                 s6b = 0.0
                 s7b = 0.0
                 for i in cutlass.range_constexpr(0, vec_size, 2):
-                    # Decay: h *= g (paired)
-                    r_h[0, i], r_h[0, i + 1] = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[0, i], r_h[0, i + 1]),
-                        src_b=(r_g, r_g),
-                        src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
-                    )
-                    r_h[1, i], r_h[1, i + 1] = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[1, i], r_h[1, i + 1]),
-                        src_b=(r_g, r_g),
-                        src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
-                    )
-                    r_h[2, i], r_h[2, i + 1] = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[2, i], r_h[2, i + 1]),
-                        src_b=(r_g, r_g),
-                        src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
-                    )
-                    r_h[3, i], r_h[3, i + 1] = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[3, i], r_h[3, i + 1]),
-                        src_b=(r_g, r_g),
-                        src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
-                    )
-                    r_h[4, i], r_h[4, i + 1] = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[4, i], r_h[4, i + 1]),
-                        src_b=(r_g, r_g),
-                        src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
-                    )
-                    r_h[5, i], r_h[5, i + 1] = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[5, i], r_h[5, i + 1]),
-                        src_b=(r_g, r_g),
-                        src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
-                    )
-                    r_h[6, i], r_h[6, i + 1] = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[6, i], r_h[6, i + 1]),
-                        src_b=(r_g, r_g),
-                        src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
-                    )
-                    r_h[7, i], r_h[7, i + 1] = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[7, i], r_h[7, i + 1]),
-                        src_b=(r_g, r_g),
-                        src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
-                    )
-                    # Dot product h@k (paired FMA)
-                    s0, s0b = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[0, i], r_h[0, i + 1]),
-                        src_b=(r_k[i], r_k[i + 1]),
-                        src_c=(s0, s0b),
-                    )
-                    s1, s1b = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[1, i], r_h[1, i + 1]),
-                        src_b=(r_k[i], r_k[i + 1]),
-                        src_c=(s1, s1b),
-                    )
-                    s2, s2b = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[2, i], r_h[2, i + 1]),
-                        src_b=(r_k[i], r_k[i + 1]),
-                        src_c=(s2, s2b),
-                    )
-                    s3, s3b = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[3, i], r_h[3, i + 1]),
-                        src_b=(r_k[i], r_k[i + 1]),
-                        src_c=(s3, s3b),
-                    )
-                    s4, s4b = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[4, i], r_h[4, i + 1]),
-                        src_b=(r_k[i], r_k[i + 1]),
-                        src_c=(s4, s4b),
-                    )
-                    s5, s5b = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[5, i], r_h[5, i + 1]),
-                        src_b=(r_k[i], r_k[i + 1]),
-                        src_c=(s5, s5b),
-                    )
-                    s6, s6b = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[6, i], r_h[6, i + 1]),
-                        src_b=(r_k[i], r_k[i + 1]),
-                        src_c=(s6, s6b),
-                    )
-                    s7, s7b = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[7, i], r_h[7, i + 1]),
-                        src_b=(r_k[i], r_k[i + 1]),
-                        src_c=(s7, s7b),
-                    )
+                    # Convert + decay for pairs of elements
+                    if cutlass.const_expr(use_packed_fma):
+                        r_h[0, i], r_h[0, i + 1] = cute.arch.fma_packed_f32x2(
+                            src_a=(r_h[0, i], r_h[0, i + 1]),
+                            src_b=(r_g, r_g),
+                            src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
+                        )
+                        r_h[1, i], r_h[1, i + 1] = cute.arch.fma_packed_f32x2(
+                            src_a=(r_h[1, i], r_h[1, i + 1]),
+                            src_b=(r_g, r_g),
+                            src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
+                        )
+                        r_h[2, i], r_h[2, i + 1] = cute.arch.fma_packed_f32x2(
+                            src_a=(r_h[2, i], r_h[2, i + 1]),
+                            src_b=(r_g, r_g),
+                            src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
+                        )
+                        r_h[3, i], r_h[3, i + 1] = cute.arch.fma_packed_f32x2(
+                            src_a=(r_h[3, i], r_h[3, i + 1]),
+                            src_b=(r_g, r_g),
+                            src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
+                        )
+                        r_h[4, i], r_h[4, i + 1] = cute.arch.fma_packed_f32x2(
+                            src_a=(r_h[4, i], r_h[4, i + 1]),
+                            src_b=(r_g, r_g),
+                            src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
+                        )
+                        r_h[5, i], r_h[5, i + 1] = cute.arch.fma_packed_f32x2(
+                            src_a=(r_h[5, i], r_h[5, i + 1]),
+                            src_b=(r_g, r_g),
+                            src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
+                        )
+                        r_h[6, i], r_h[6, i + 1] = cute.arch.fma_packed_f32x2(
+                            src_a=(r_h[6, i], r_h[6, i + 1]),
+                            src_b=(r_g, r_g),
+                            src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
+                        )
+                        r_h[7, i], r_h[7, i + 1] = cute.arch.fma_packed_f32x2(
+                            src_a=(r_h[7, i], r_h[7, i + 1]),
+                            src_b=(r_g, r_g),
+                            src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
+                        )
+                    else:
+                        r_h[0, i], r_h[0, i + 1] = fma_pair_mul(
+                            r_h[0, i], r_h[0, i + 1], r_g, r_g
+                        )
+                        r_h[1, i], r_h[1, i + 1] = fma_pair_mul(
+                            r_h[1, i], r_h[1, i + 1], r_g, r_g
+                        )
+                        r_h[2, i], r_h[2, i + 1] = fma_pair_mul(
+                            r_h[2, i], r_h[2, i + 1], r_g, r_g
+                        )
+                        r_h[3, i], r_h[3, i + 1] = fma_pair_mul(
+                            r_h[3, i], r_h[3, i + 1], r_g, r_g
+                        )
+                        r_h[4, i], r_h[4, i + 1] = fma_pair_mul(
+                            r_h[4, i], r_h[4, i + 1], r_g, r_g
+                        )
+                        r_h[5, i], r_h[5, i + 1] = fma_pair_mul(
+                            r_h[5, i], r_h[5, i + 1], r_g, r_g
+                        )
+                        r_h[6, i], r_h[6, i + 1] = fma_pair_mul(
+                            r_h[6, i], r_h[6, i + 1], r_g, r_g
+                        )
+                        r_h[7, i], r_h[7, i + 1] = fma_pair_mul(
+                            r_h[7, i], r_h[7, i + 1], r_g, r_g
+                        )
+                    # Dot product h@k using paired FMA
+                    if cutlass.const_expr(use_packed_fma):
+                        s0, s0b = cute.arch.fma_packed_f32x2(
+                            src_a=(r_h[0, i], r_h[0, i + 1]),
+                            src_b=(r_k[i], r_k[i + 1]),
+                            src_c=(s0, s0b),
+                        )
+                        s1, s1b = cute.arch.fma_packed_f32x2(
+                            src_a=(r_h[1, i], r_h[1, i + 1]),
+                            src_b=(r_k[i], r_k[i + 1]),
+                            src_c=(s1, s1b),
+                        )
+                        s2, s2b = cute.arch.fma_packed_f32x2(
+                            src_a=(r_h[2, i], r_h[2, i + 1]),
+                            src_b=(r_k[i], r_k[i + 1]),
+                            src_c=(s2, s2b),
+                        )
+                        s3, s3b = cute.arch.fma_packed_f32x2(
+                            src_a=(r_h[3, i], r_h[3, i + 1]),
+                            src_b=(r_k[i], r_k[i + 1]),
+                            src_c=(s3, s3b),
+                        )
+                        s4, s4b = cute.arch.fma_packed_f32x2(
+                            src_a=(r_h[4, i], r_h[4, i + 1]),
+                            src_b=(r_k[i], r_k[i + 1]),
+                            src_c=(s4, s4b),
+                        )
+                        s5, s5b = cute.arch.fma_packed_f32x2(
+                            src_a=(r_h[5, i], r_h[5, i + 1]),
+                            src_b=(r_k[i], r_k[i + 1]),
+                            src_c=(s5, s5b),
+                        )
+                        s6, s6b = cute.arch.fma_packed_f32x2(
+                            src_a=(r_h[6, i], r_h[6, i + 1]),
+                            src_b=(r_k[i], r_k[i + 1]),
+                            src_c=(s6, s6b),
+                        )
+                        s7, s7b = cute.arch.fma_packed_f32x2(
+                            src_a=(r_h[7, i], r_h[7, i + 1]),
+                            src_b=(r_k[i], r_k[i + 1]),
+                            src_c=(s7, s7b),
+                        )
+                    else:
+                        s0, s0b = fma_pair(
+                            r_h[0, i], r_h[0, i + 1], r_k[i], r_k[i + 1], s0, s0b
+                        )
+                        s1, s1b = fma_pair(
+                            r_h[1, i], r_h[1, i + 1], r_k[i], r_k[i + 1], s1, s1b
+                        )
+                        s2, s2b = fma_pair(
+                            r_h[2, i], r_h[2, i + 1], r_k[i], r_k[i + 1], s2, s2b
+                        )
+                        s3, s3b = fma_pair(
+                            r_h[3, i], r_h[3, i + 1], r_k[i], r_k[i + 1], s3, s3b
+                        )
+                        s4, s4b = fma_pair(
+                            r_h[4, i], r_h[4, i + 1], r_k[i], r_k[i + 1], s4, s4b
+                        )
+                        s5, s5b = fma_pair(
+                            r_h[5, i], r_h[5, i + 1], r_k[i], r_k[i + 1], s5, s5b
+                        )
+                        s6, s6b = fma_pair(
+                            r_h[6, i], r_h[6, i + 1], r_k[i], r_k[i + 1], s6, s6b
+                        )
+                        s7, s7b = fma_pair(
+                            r_h[7, i], r_h[7, i + 1], r_k[i], r_k[i + 1], s7, s7b
+                        )
                 # Combine paired accumulators
                 s0 = s0 + s0b
                 s1 = s1 + s1b
@@ -1463,7 +1693,7 @@ def gdn_decode_bf16state_mtp_kernel(
                 vn6 = (cutlass.Float32(r_v_bf16_vec[6]) - s6) * r_beta
                 vn7 = (cutlass.Float32(r_v_bf16_vec[7]) - s7) * r_beta
 
-                # Rank-1 update + output dot product h@q using fma_packed_f32x2
+                # Rank-1 update + output dot product h@q with conditional dispatch
                 o0 = 0.0
                 o1 = 0.0
                 o2 = 0.0
@@ -1482,87 +1712,139 @@ def gdn_decode_bf16state_mtp_kernel(
                 o7b = 0.0
                 for i in cutlass.range_constexpr(0, vec_size, 2):
                     # Rank-1 update: h += k * vn (paired FMA)
-                    r_h[0, i], r_h[0, i + 1] = cute.arch.fma_packed_f32x2(
-                        src_a=(r_k[i], r_k[i + 1]),
-                        src_b=(vn0, vn0),
-                        src_c=(r_h[0, i], r_h[0, i + 1]),
-                    )
-                    r_h[1, i], r_h[1, i + 1] = cute.arch.fma_packed_f32x2(
-                        src_a=(r_k[i], r_k[i + 1]),
-                        src_b=(vn1, vn1),
-                        src_c=(r_h[1, i], r_h[1, i + 1]),
-                    )
-                    r_h[2, i], r_h[2, i + 1] = cute.arch.fma_packed_f32x2(
-                        src_a=(r_k[i], r_k[i + 1]),
-                        src_b=(vn2, vn2),
-                        src_c=(r_h[2, i], r_h[2, i + 1]),
-                    )
-                    r_h[3, i], r_h[3, i + 1] = cute.arch.fma_packed_f32x2(
-                        src_a=(r_k[i], r_k[i + 1]),
-                        src_b=(vn3, vn3),
-                        src_c=(r_h[3, i], r_h[3, i + 1]),
-                    )
-                    r_h[4, i], r_h[4, i + 1] = cute.arch.fma_packed_f32x2(
-                        src_a=(r_k[i], r_k[i + 1]),
-                        src_b=(vn4, vn4),
-                        src_c=(r_h[4, i], r_h[4, i + 1]),
-                    )
-                    r_h[5, i], r_h[5, i + 1] = cute.arch.fma_packed_f32x2(
-                        src_a=(r_k[i], r_k[i + 1]),
-                        src_b=(vn5, vn5),
-                        src_c=(r_h[5, i], r_h[5, i + 1]),
-                    )
-                    r_h[6, i], r_h[6, i + 1] = cute.arch.fma_packed_f32x2(
-                        src_a=(r_k[i], r_k[i + 1]),
-                        src_b=(vn6, vn6),
-                        src_c=(r_h[6, i], r_h[6, i + 1]),
-                    )
-                    r_h[7, i], r_h[7, i + 1] = cute.arch.fma_packed_f32x2(
-                        src_a=(r_k[i], r_k[i + 1]),
-                        src_b=(vn7, vn7),
-                        src_c=(r_h[7, i], r_h[7, i + 1]),
-                    )
+                    if cutlass.const_expr(use_packed_fma):
+                        r_h[0, i], r_h[0, i + 1] = cute.arch.fma_packed_f32x2(
+                            src_a=(r_k[i], r_k[i + 1]),
+                            src_b=(vn0, vn0),
+                            src_c=(r_h[0, i], r_h[0, i + 1]),
+                        )
+                        r_h[1, i], r_h[1, i + 1] = cute.arch.fma_packed_f32x2(
+                            src_a=(r_k[i], r_k[i + 1]),
+                            src_b=(vn1, vn1),
+                            src_c=(r_h[1, i], r_h[1, i + 1]),
+                        )
+                        r_h[2, i], r_h[2, i + 1] = cute.arch.fma_packed_f32x2(
+                            src_a=(r_k[i], r_k[i + 1]),
+                            src_b=(vn2, vn2),
+                            src_c=(r_h[2, i], r_h[2, i + 1]),
+                        )
+                        r_h[3, i], r_h[3, i + 1] = cute.arch.fma_packed_f32x2(
+                            src_a=(r_k[i], r_k[i + 1]),
+                            src_b=(vn3, vn3),
+                            src_c=(r_h[3, i], r_h[3, i + 1]),
+                        )
+                        r_h[4, i], r_h[4, i + 1] = cute.arch.fma_packed_f32x2(
+                            src_a=(r_k[i], r_k[i + 1]),
+                            src_b=(vn4, vn4),
+                            src_c=(r_h[4, i], r_h[4, i + 1]),
+                        )
+                        r_h[5, i], r_h[5, i + 1] = cute.arch.fma_packed_f32x2(
+                            src_a=(r_k[i], r_k[i + 1]),
+                            src_b=(vn5, vn5),
+                            src_c=(r_h[5, i], r_h[5, i + 1]),
+                        )
+                        r_h[6, i], r_h[6, i + 1] = cute.arch.fma_packed_f32x2(
+                            src_a=(r_k[i], r_k[i + 1]),
+                            src_b=(vn6, vn6),
+                            src_c=(r_h[6, i], r_h[6, i + 1]),
+                        )
+                        r_h[7, i], r_h[7, i + 1] = cute.arch.fma_packed_f32x2(
+                            src_a=(r_k[i], r_k[i + 1]),
+                            src_b=(vn7, vn7),
+                            src_c=(r_h[7, i], r_h[7, i + 1]),
+                        )
+                    else:
+                        r_h[0, i], r_h[0, i + 1] = fma_pair(
+                            r_k[i], r_k[i + 1], vn0, vn0, r_h[0, i], r_h[0, i + 1]
+                        )
+                        r_h[1, i], r_h[1, i + 1] = fma_pair(
+                            r_k[i], r_k[i + 1], vn1, vn1, r_h[1, i], r_h[1, i + 1]
+                        )
+                        r_h[2, i], r_h[2, i + 1] = fma_pair(
+                            r_k[i], r_k[i + 1], vn2, vn2, r_h[2, i], r_h[2, i + 1]
+                        )
+                        r_h[3, i], r_h[3, i + 1] = fma_pair(
+                            r_k[i], r_k[i + 1], vn3, vn3, r_h[3, i], r_h[3, i + 1]
+                        )
+                        r_h[4, i], r_h[4, i + 1] = fma_pair(
+                            r_k[i], r_k[i + 1], vn4, vn4, r_h[4, i], r_h[4, i + 1]
+                        )
+                        r_h[5, i], r_h[5, i + 1] = fma_pair(
+                            r_k[i], r_k[i + 1], vn5, vn5, r_h[5, i], r_h[5, i + 1]
+                        )
+                        r_h[6, i], r_h[6, i + 1] = fma_pair(
+                            r_k[i], r_k[i + 1], vn6, vn6, r_h[6, i], r_h[6, i + 1]
+                        )
+                        r_h[7, i], r_h[7, i + 1] = fma_pair(
+                            r_k[i], r_k[i + 1], vn7, vn7, r_h[7, i], r_h[7, i + 1]
+                        )
                     # Output dot product: o += h * q (paired FMA)
-                    o0, o0b = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[0, i], r_h[0, i + 1]),
-                        src_b=(r_q[i], r_q[i + 1]),
-                        src_c=(o0, o0b),
-                    )
-                    o1, o1b = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[1, i], r_h[1, i + 1]),
-                        src_b=(r_q[i], r_q[i + 1]),
-                        src_c=(o1, o1b),
-                    )
-                    o2, o2b = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[2, i], r_h[2, i + 1]),
-                        src_b=(r_q[i], r_q[i + 1]),
-                        src_c=(o2, o2b),
-                    )
-                    o3, o3b = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[3, i], r_h[3, i + 1]),
-                        src_b=(r_q[i], r_q[i + 1]),
-                        src_c=(o3, o3b),
-                    )
-                    o4, o4b = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[4, i], r_h[4, i + 1]),
-                        src_b=(r_q[i], r_q[i + 1]),
-                        src_c=(o4, o4b),
-                    )
-                    o5, o5b = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[5, i], r_h[5, i + 1]),
-                        src_b=(r_q[i], r_q[i + 1]),
-                        src_c=(o5, o5b),
-                    )
-                    o6, o6b = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[6, i], r_h[6, i + 1]),
-                        src_b=(r_q[i], r_q[i + 1]),
-                        src_c=(o6, o6b),
-                    )
-                    o7, o7b = cute.arch.fma_packed_f32x2(
-                        src_a=(r_h[7, i], r_h[7, i + 1]),
-                        src_b=(r_q[i], r_q[i + 1]),
-                        src_c=(o7, o7b),
-                    )
+                    if cutlass.const_expr(use_packed_fma):
+                        o0, o0b = cute.arch.fma_packed_f32x2(
+                            src_a=(r_h[0, i], r_h[0, i + 1]),
+                            src_b=(r_q[i], r_q[i + 1]),
+                            src_c=(o0, o0b),
+                        )
+                        o1, o1b = cute.arch.fma_packed_f32x2(
+                            src_a=(r_h[1, i], r_h[1, i + 1]),
+                            src_b=(r_q[i], r_q[i + 1]),
+                            src_c=(o1, o1b),
+                        )
+                        o2, o2b = cute.arch.fma_packed_f32x2(
+                            src_a=(r_h[2, i], r_h[2, i + 1]),
+                            src_b=(r_q[i], r_q[i + 1]),
+                            src_c=(o2, o2b),
+                        )
+                        o3, o3b = cute.arch.fma_packed_f32x2(
+                            src_a=(r_h[3, i], r_h[3, i + 1]),
+                            src_b=(r_q[i], r_q[i + 1]),
+                            src_c=(o3, o3b),
+                        )
+                        o4, o4b = cute.arch.fma_packed_f32x2(
+                            src_a=(r_h[4, i], r_h[4, i + 1]),
+                            src_b=(r_q[i], r_q[i + 1]),
+                            src_c=(o4, o4b),
+                        )
+                        o5, o5b = cute.arch.fma_packed_f32x2(
+                            src_a=(r_h[5, i], r_h[5, i + 1]),
+                            src_b=(r_q[i], r_q[i + 1]),
+                            src_c=(o5, o5b),
+                        )
+                        o6, o6b = cute.arch.fma_packed_f32x2(
+                            src_a=(r_h[6, i], r_h[6, i + 1]),
+                            src_b=(r_q[i], r_q[i + 1]),
+                            src_c=(o6, o6b),
+                        )
+                        o7, o7b = cute.arch.fma_packed_f32x2(
+                            src_a=(r_h[7, i], r_h[7, i + 1]),
+                            src_b=(r_q[i], r_q[i + 1]),
+                            src_c=(o7, o7b),
+                        )
+                    else:
+                        o0, o0b = fma_pair(
+                            r_h[0, i], r_h[0, i + 1], r_q[i], r_q[i + 1], o0, o0b
+                        )
+                        o1, o1b = fma_pair(
+                            r_h[1, i], r_h[1, i + 1], r_q[i], r_q[i + 1], o1, o1b
+                        )
+                        o2, o2b = fma_pair(
+                            r_h[2, i], r_h[2, i + 1], r_q[i], r_q[i + 1], o2, o2b
+                        )
+                        o3, o3b = fma_pair(
+                            r_h[3, i], r_h[3, i + 1], r_q[i], r_q[i + 1], o3, o3b
+                        )
+                        o4, o4b = fma_pair(
+                            r_h[4, i], r_h[4, i + 1], r_q[i], r_q[i + 1], o4, o4b
+                        )
+                        o5, o5b = fma_pair(
+                            r_h[5, i], r_h[5, i + 1], r_q[i], r_q[i + 1], o5, o5b
+                        )
+                        o6, o6b = fma_pair(
+                            r_h[6, i], r_h[6, i + 1], r_q[i], r_q[i + 1], o6, o6b
+                        )
+                        o7, o7b = fma_pair(
+                            r_h[7, i], r_h[7, i + 1], r_q[i], r_q[i + 1], o7, o7b
+                        )
                 # Combine paired accumulators
                 o0 = o0 + o0b
                 o1 = o1 + o1b
@@ -1734,6 +2016,7 @@ def run_gdn_decode_bf16state_mtp(
     use_qk_l2norm: cutlass.Constexpr[bool],
     disable_state_update: cutlass.Constexpr[bool],
     cache_intermediate_states: cutlass.Constexpr[bool],
+    use_packed_fma: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     """Launch the MTP kernel for BF16 state."""
@@ -1785,6 +2068,7 @@ def run_gdn_decode_bf16state_mtp(
         use_qk_l2norm,
         disable_state_update,
         cache_intermediate_states,
+        use_packed_fma,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[MTP_NUM_THREADS, 1, 1],
@@ -1818,6 +2102,7 @@ def run_gdn_decode_bf16state_ilp(
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
     use_qk_l2norm: cutlass.Constexpr[bool],
+    use_packed_fma: cutlass.Constexpr[bool],
     tile_v_param: cutlass.Constexpr[int],
     stream: cuda.CUstream,
 ):
@@ -1857,6 +2142,7 @@ def run_gdn_decode_bf16state_ilp(
         K,
         V,
         use_qk_l2norm,
+        use_packed_fma,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[NUM_THREADS_ILP, 1, 1],
@@ -2078,9 +2364,24 @@ def gated_delta_rule(
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
+    major, _ = torch.cuda.get_device_capability(q.device)
+    use_packed_fma = major >= 10
+
     # B >= ILP_BATCH_THRESHOLD (small B handled by MTP path above)
     tile_v = _select_tile_v_for_batch(B, HV, V)
-    cache_key = ("ilp", B, H, HV, K, V, tile_v, scale, softplus_beta, softplus_threshold)
+    cache_key = (
+        "ilp",
+        B,
+        H,
+        HV,
+        K,
+        V,
+        tile_v,
+        scale,
+        softplus_beta,
+        softplus_threshold,
+        use_packed_fma,
+    )
     if cache_key not in _compiled_kernels_ilp:
         # Use maxrregcount=64 for smaller tile_v to improve occupancy
         # when grid size is small (fewer waves)
@@ -2108,6 +2409,7 @@ def gated_delta_rule(
             K,
             V,
             use_qk_l2norm_in_kernel,
+            use_packed_fma,
             tile_v,
             stream,
             options=compile_opts,
@@ -2253,6 +2555,9 @@ def gated_delta_rule_mtp(
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
+    major, _ = torch.cuda.get_device_capability(q.device)
+    use_packed_fma = major >= 10
+
     cache_key = (
         "mtp_bf16",
         B,
@@ -2269,6 +2574,7 @@ def gated_delta_rule_mtp(
         scale,
         softplus_beta,
         softplus_threshold,
+        use_packed_fma,
     )
     if cache_key not in _compiled_kernels_mtp:
         _compiled_kernels_mtp[cache_key] = cute.compile(
@@ -2297,6 +2603,7 @@ def gated_delta_rule_mtp(
             use_qk_l2norm_in_kernel,
             disable_state_update,
             cache_intermediate_states,
+            use_packed_fma,
             stream,
             options="--enable-tvm-ffi --generate-line-info --opt-level 3",
         )
