@@ -31,7 +31,7 @@ from ..utils import register_custom_op, round_up
 
 logger = logging.getLogger(__name__)
 from .cuda_ipc import create_shared_buffer, cudart, free_shared_buffer
-
+from .torch_symmetric_memory import _alloc_symm_buffer_bytes
 
 class AllReduceStrategyType:
     # NOTE: for trtllm_custom_all_reduce
@@ -399,6 +399,7 @@ OneShotMaxToken = 128
 MAX_ALL_REDUCE_BLOCKS = 24
 LamportTokenNumThreshold = 16
 
+_symm_workspace_refs: dict[int, list[torch.Tensor]] = {}
 
 @deprecated(
     "trtllm_create_ipc_workspace_for_all_reduce and trtllm_custom_all_reduce are deprecated and will be removed in the next major bump, use allreduce.py instead."
@@ -451,26 +452,40 @@ def trtllm_create_ipc_workspace_for_all_reduce(
     flag_size = FLAG_SIZE * tp_size * 2
     lamport_buffer_size = tp_size * LamportTokenNumThreshold * tp_size * hidden_dim * 2
 
+    # TODO(asamani): check this device and group
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    group_name = group.group_name
+    symm_refs: list[torch.Tensor] = []
     ipc_handles = list()
 
-    for size in [
-        buffer_size,
-        buffer_size,
-        flag_size,
-        flag_size,
-        lamport_buffer_size,
-        lamport_buffer_size,
-        lamport_buffer_size,
+    for size, dtype in [
+        (buffer_size, torch.float32),
+        (buffer_size, torch.float32),
+        (flag_size, torch.int32),
+        (flag_size, torch.int32),
+        (lamport_buffer_size, torch.float16),
+        (lamport_buffer_size, torch.float16),
+        (lamport_buffer_size, torch.float16),
     ]:
         # all sizes should be aligned to 1LU << 21 bytes (2MB)
         aligned_size = round_up(size, 1 << 21)
-        ipc_handles.append(create_shared_buffer(aligned_size, group))
+        ptrs, tensor, handle = _alloc_symm_buffer_bytes(
+            aligned_size,
+            tp_size,
+            dtype,
+            device,
+            group_name,
+        )
+        symm_refs.append((tensor, handle))
+        ipc_handles.append(ptrs)
 
     logger.debug(
         "rank %s allocated ipc_handles: %s",
         rank,
         [[hex(handle) for handle in sublist] for sublist in ipc_handles],
     )
+
+    _symm_workspace_refs[id(ipc_handles)] = symm_refs
 
     trtllm_lamport_initialize_all(
         ipc_handles[4][rank],
@@ -496,8 +511,7 @@ def trtllm_destroy_ipc_workspace_for_all_reduce(
     The workspace can be reused for multiple all reduce calls under the same configuration.
     """
 
-    for ipc_handle in workspace:
-        free_shared_buffer(ipc_handle, group)
+    _ = _symm_workspace_refs.pop(id(workspace), None)
 
 
 BarrierFlagCount = 256
@@ -588,39 +602,44 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
 
     lamport_buffer_size = lamport_comm_size * 3
 
+    # TODO(asamani): check this device and group
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    group_name = group.group_name if group is not None else torch.distributed.group.WORLD.group_name
+    symm_refs: list[torch.Tensor] = []
+
     # we should init 3 buffers for all reduce fusion:
     # [buffer_size, flag_size, lamport_buffer_size]
 
     ipc_handles: List[List[int]] = list()
     mem_handles: List[SymmDeviceMemory] = list()
-    for size in [buffer_size, flag_size, lamport_buffer_size]:
+    lamport_buffer_dtype = torch.float16 if not use_fp32_lamport else torch.float32
+    for size, dtype in [
+        (buffer_size, torch.float32),
+        (flag_size, torch.int32),
+        (lamport_buffer_size, lamport_buffer_dtype),
+    ]:
         # todo(review): confirm we need this alignment
         # all sizes should be aligned to 1LU << 21 bytes (2MB)
         aligned_size = round_up(size, 1 << 21)
 
-        if not use_symm_dev_mem:
-            ipc_handles.append(create_shared_buffer(aligned_size, group))
-        else:
-            # Use torch.cuda.current_device() instead of tp_rank to support
-            # base_gpu_id != 0 scenarios where the actual CUDA device index
-            # differs from the TP rank.
-            symm_mem = SymmDeviceMemory(
-                aligned_size,
-                tp_size,
-                tp_rank,
-                torch.cuda.current_device(),
-                comm_backend,
-                enable_multicast=False,
-                allocate_signal_pads=False,
-            )
-            ipc_handles.append(symm_mem.uc_ptrs)
-            mem_handles.append(symm_mem)
+        ptrs, tensor, handle = _alloc_symm_buffer_bytes(
+            aligned_size,
+            tp_size,
+            dtype,
+            device,
+            group_name,
+        )
+        symm_refs.append((tensor, handle))
+        ipc_handles.append(ptrs)
+        mem_handles.append(handle)
 
     logger.debug(
         "rank %s allocated ipc_handles: %s",
         tp_rank,
         [[hex(handle) for handle in sublist] for sublist in ipc_handles],
     )
+
+    _symm_workspace_refs[id(ipc_handles)] = symm_refs
 
     # Initialize lamport buffer
     aligned_lamport_buffer_size = round_up(lamport_buffer_size, 1 << 21)
@@ -712,8 +731,8 @@ def trtllm_destroy_ipc_workspace_for_all_reduce_fusion(
     The workspace can be reused for multiple all reduce fusion calls under the same configuration.
     """
 
-    for ipc_handle in workspace:
-        free_shared_buffer(ipc_handle, group)
+    # TODO(asamani): is this the correct way to destroy the workspace?
+    _ = _symm_workspace_refs.pop(id(workspace), None)
 
 
 # allReduce fused quant utils
