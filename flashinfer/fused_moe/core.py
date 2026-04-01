@@ -844,14 +844,16 @@ class MoEInputs:
         "hidden_states_scale",
     )
 
-    # Index of the dynamic dimension for each field.
+    # Index of the dynamic dimension (num_tokens axis) for each field.
+    # hidden_states_scale is excluded: its layout differs by op (fp8 DeepSeekFp8
+    # uses [hidden_size//128, num_tokens] while fp4/MxFp8 uses [num_tokens, ...]),
+    # so _make_tuning_config infers it from the actual tensor at runtime.
     _DYNAMIC_DIM = {
         "output": 0,
         "routing_logits": 0,
         "topk_ids": 0,
         "expert_weights": 0,
         "hidden_states": 0,
-        "hidden_states_scale": 1,
     }
 
     def to_list(self) -> List[Optional[torch.Tensor]]:
@@ -945,7 +947,7 @@ def get_trtllm_moe_sm100_module():
             if moe_inputs.topk_ids is not None:
                 spec["topk_ids"] = _init_packed_topk_ids
             if moe_inputs.expert_weights is not None:
-                spec["expert_weights"] = lambda shapes, dtype, device: torch.empty(
+                spec["expert_weights"] = lambda shapes, dtype, device: torch.ones(
                     shapes, dtype=dtype, device=device
                 )
             if moe_inputs.hidden_states_scale is not None:
@@ -957,9 +959,17 @@ def get_trtllm_moe_sm100_module():
                 (MoEInputs.idx(name), name, init) for name, init in spec.items()
             )
             input_idx = tuple(i for i, _, _ in sorted_inputs)
-            dim_idx = tuple(
-                MoEInputs._DYNAMIC_DIM[name] for _, name, _ in sorted_inputs
-            )
+
+            num_tokens = moe_inputs.hidden_states.shape[0]
+
+            def _dynamic_dim(name: str) -> int:
+                if name == "hidden_states_scale":
+                    # Layout varies by op: find which dim equals num_tokens.
+                    t = moe_inputs.hidden_states_scale
+                    return next(i for i, s in enumerate(t.shape) if s == num_tokens)
+                return MoEInputs._DYNAMIC_DIM[name]
+
+            dim_idx = tuple(_dynamic_dim(name) for _, name, _ in sorted_inputs)
             initializers = [init for _, _, init in sorted_inputs]
 
             return TuningConfig(
