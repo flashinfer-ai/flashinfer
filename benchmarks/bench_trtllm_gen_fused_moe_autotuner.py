@@ -269,7 +269,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
 
     # measure untuned
     ms_no_autotune = []
-    for batch_size, fn, input_kwargs in setups:
+    for _batch_size, fn, input_kwargs in setups:
         ms_no_autotune.append(_measure(fn, input_kwargs))
 
     # tune once — covers all buckets up to tune_max
@@ -279,7 +279,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
 
     # measure tuned
     results = []
-    for (batch_size, fn, input_kwargs), ms in zip(setups, ms_no_autotune):
+    for (batch_size, fn, input_kwargs), ms in zip(setups, ms_no_autotune, strict=True):
         results.append((batch_size, ms, _measure(fn, input_kwargs)))
 
     mode_str = "routed" if routed else "non_routed"
@@ -461,7 +461,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
         setups.append((batch_size, fn, input_kwargs))
 
     ms_no_autotune = []
-    for batch_size, fn, input_kwargs in setups:
+    for _batch_size, fn, input_kwargs in setups:
         ms_no_autotune.append(_measure(fn, input_kwargs))
 
     # Phase 2: tune once — covers all buckets up to tune_max
@@ -471,7 +471,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
 
     # Phase 3: measure all tuned
     results = []
-    for (batch_size, fn, input_kwargs), ms in zip(setups, ms_no_autotune):
+    for (batch_size, fn, input_kwargs), ms in zip(setups, ms_no_autotune, strict=True):
         results.append((batch_size, ms, _measure(fn, input_kwargs)))
 
     mode_str = "routed" if routed else "non_routed"
@@ -571,7 +571,7 @@ def bench_trtllm_gen_fused_moe_autotuner_mxint4(
         setups.append((batch_size, fn, input_kwargs))
 
     ms_no_autotune = []
-    for batch_size, fn, input_kwargs in setups:
+    for _batch_size, fn, input_kwargs in setups:
         ms_no_autotune.append(_measure(fn, input_kwargs))
 
     # Phase 2: tune once — covers all buckets up to tune_max
@@ -581,7 +581,7 @@ def bench_trtllm_gen_fused_moe_autotuner_mxint4(
 
     # Phase 3: measure all tuned
     results = []
-    for (batch_size, fn, input_kwargs), ms in zip(setups, ms_no_autotune):
+    for (batch_size, fn, input_kwargs), ms in zip(setups, ms_no_autotune, strict=True):
         results.append((batch_size, ms, _measure(fn, input_kwargs)))
 
     _print_table(
