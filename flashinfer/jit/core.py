@@ -433,6 +433,7 @@ def gen_jit_spec(
     cuda_cflags = [
         f"--threads={os.environ.get('FLASHINFER_NVCC_THREADS', '1')}",
         "-use_fast_math",
+        "--compress-mode=size",  # Ensure all device binaries are compressed
         "-DFLASHINFER_ENABLE_F16",
         "-DFLASHINFER_ENABLE_BF16",
         "-DFLASHINFER_ENABLE_FP8_E4M3",
