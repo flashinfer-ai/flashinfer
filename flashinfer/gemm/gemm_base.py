@@ -3486,8 +3486,8 @@ _SM100_DEFAULT_MMA_TILER_MN = (128, 128)
 _SM100_DEFAULT_CLUSTER_SHAPE_MN = (1, 1)
 
 
-def _rank_sm100_block_scaled_tactics(valid_tactics, m, n, real_k, device):
-    """Rank valid tactics by minimizing tile and wave quantization effects.
+def _rank_sm100_mm_fp4_cute_dsl_tactics(valid_tactics, m, n, real_k, device):
+    """Rank valid tactics for mm_fp4(backend='cute-dsl') by minimizing tile and wave quantization effects.
 
     For each tactic (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch, ...),
     we compute:
@@ -4658,7 +4658,7 @@ def _cute_dsl_gemm_fp4_runner(
                 # tile and wave quantization efficiency.
                 valid = self.get_valid_tactics(inputs, None)
                 if valid:
-                    ranked = _rank_sm100_block_scaled_tactics(
+                    ranked = _rank_sm100_mm_fp4_cute_dsl_tactics(
                         valid, m, n, real_k, a.device
                     )
                     tactic = ranked[0]
