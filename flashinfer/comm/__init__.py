@@ -65,4 +65,12 @@ from .trtllm_moe_alltoall import (
     moe_a2a_wrap_payload_tensor_in_workspace as moe_a2a_wrap_payload_tensor_in_workspace,
 )
 
+# DCP A2A (Decode Context Parallel Attention Reduction)
+from .dcp_alltoall import dcp_a2a_alltoall as dcp_a2a_alltoall
+from .dcp_alltoall import (
+    dcp_a2a_allocate_workspace as dcp_a2a_allocate_workspace,
+)
+from .dcp_alltoall import dcp_a2a_init_workspace as dcp_a2a_init_workspace
+from .dcp_alltoall import dcp_a2a_workspace_size as dcp_a2a_workspace_size
+
 # from .mnnvl import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
