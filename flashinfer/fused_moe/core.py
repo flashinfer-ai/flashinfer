@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
@@ -820,6 +821,51 @@ def cutlass_fused_moe(
 # trtllmgen-moe-fp8
 
 
+@dataclass
+class MoEInputs:
+    """MoERunner inputs.
+
+    Field order defines the flat-list index used by the autotuner.
+    """
+
+    output: torch.Tensor
+    routing_logits: Optional[torch.Tensor]
+    topk_ids: Optional[torch.Tensor]
+    expert_weights: Optional[torch.Tensor]
+    hidden_states: torch.Tensor
+    hidden_states_scale: Optional[torch.Tensor]
+
+    _FIELDS = (
+        "output",
+        "routing_logits",
+        "topk_ids",
+        "expert_weights",
+        "hidden_states",
+        "hidden_states_scale",
+    )
+
+    # Index of the dynamic dimension for each field.
+    _DYNAMIC_DIM = {
+        "output": 0,
+        "routing_logits": 0,
+        "topk_ids": 0,
+        "expert_weights": 0,
+        "hidden_states": 0,
+        "hidden_states_scale": 1,
+    }
+
+    def to_list(self) -> List[Optional[torch.Tensor]]:
+        return [getattr(self, name) for name in MoEInputs._FIELDS]
+
+    @classmethod
+    def from_list(cls, lst: List) -> "MoEInputs":
+        return cls(**{name: lst[i] for i, name in enumerate(cls._FIELDS)})
+
+    @classmethod
+    def idx(cls, name: str) -> int:
+        return cls._FIELDS.index(name)
+
+
 @functools.cache
 def get_trtllm_moe_sm100_module():
     module = gen_trtllm_gen_fused_moe_sm100_module()
@@ -827,50 +873,7 @@ def get_trtllm_moe_sm100_module():
     setup_cubin_loader(str(module.get_library_path()))
 
     class MoERunner(TunableRunner):
-        dynamic_tensor_initializers = [
-            lambda shapes, dtype, device: torch.empty(
-                shapes, device=device, dtype=dtype
-            ),  # output buffer, [num_tokens, hidden_size]
-            lambda shapes, dtype, device: torch.rand(
-                shapes, device=device, dtype=dtype
-            ),  # routing_logits, [num_tokens, num_experts]
-            lambda shapes, dtype, device: torch.empty(
-                shapes, device=device, dtype=dtype
-            ),  # topk_ids buffer. empty since routing_logits is used. [num_tokens, topk]
-            lambda shapes, dtype, device: torch.empty(
-                shapes, device=device, dtype=dtype
-            ),  # expert_weights buffer. empty since routing_logits is used. [num_tokens, topk]
-            lambda shapes, dtype, device: torch.randn(shapes, device=device).to(
-                dtype
-            ),  # hidden_states, [num_tokens, hidden_size]
-            lambda shapes, dtype, device: torch.ones(shapes, device=device).to(
-                dtype
-            ),  # hidden_states_scale, [num_tokens, hidden_size // sf_vec_size]
-        ]
-        # their first dimension is num_tokens which will be tuned
-        tuning_config_with_hidden_states_scales = TuningConfig(
-            dynamic_tensor_specs=(
-                DynamicTensorSpec(
-                    (0, 1, 2, 3, 4, 5),
-                    (0, 0, 0, 0, 0, 0),
-                    get_last_power_of_2_num_tokens_buckets(8192, 1),
-                    lambda x: min(last_positive_power_of_2(x), 8192),
-                    dynamic_tensor_initializers,
-                ),
-            )
-        )
-        tuning_config_no_hidden_states_scales = TuningConfig(
-            dynamic_tensor_specs=(
-                DynamicTensorSpec(
-                    (0, 1, 2, 3, 4),
-                    (0, 0, 0, 0, 0),
-                    get_last_power_of_2_num_tokens_buckets(8192, 1),
-                    lambda x: min(last_positive_power_of_2(x), 8192),
-                    dynamic_tensor_initializers[:5],
-                ),
-            ),
-        )
-        # cache the valid tactics to reduce the overhead of instantiating the runner
+        # Cache valid tactics to reduce the overhead of re-querying the kernel.
         # TODO(siyuan): directly cache the runners
         valid_tactics_dict = dict()
 
@@ -893,7 +896,6 @@ def get_trtllm_moe_sm100_module():
             self.dtype_act = dtype_act
             self.dtype_weights = dtype_weights
             self.fp8_quantization_type = fp8_quantization_type
-            self.top_k = top_k
             self.hidden_size = hidden_size
             self.intermediate_size = intermediate_size
             self.activation_type = ActivationType(activation_type)
@@ -901,20 +903,80 @@ def get_trtllm_moe_sm100_module():
             self.weight_layout = WeightLayout(weight_layout)
             self.use_packed_weights = use_packed_weights
 
+        def _make_tuning_config(
+            self,
+            tune_max_num_tokens: int = 8192,
+            **kwargs,
+        ) -> TuningConfig:
+            """Build a TuningConfig for this runner instance.
+
+            Routing mode and which tensors are dynamic are inferred directly from
+            the actual input tensors in moe_inputs: a tensor with numel()==0 is a
+            sentinel and passed through unchanged; a real tensor is included in the
+            DynamicTensorSpec so the autotuner synthesizes it at each bucket size.
+
+            Args:
+                tune_max_num_tokens: Upper bound for the num_tokens tuning buckets.
+                **kwargs: Extra TuningConfig kwargs (e.g. use_cold_l2_cache).
+            """
+            num_local_experts = self.num_local_experts
+
+            def _init_packed_topk_ids(shapes, dtype, device):
+                expert_ids = torch.randint(
+                    0, num_local_experts, shapes, dtype=torch.int32, device=device
+                )
+                expert_weights = torch.ones(
+                    shapes, dtype=torch.bfloat16, device=device
+                ).view(torch.int16)
+                return (expert_ids << 16) | expert_weights
+
+            spec = {}
+            spec["output"] = lambda shapes, dtype, device: torch.empty(
+                shapes, dtype=dtype, device=device
+            )
+            spec["hidden_states"] = lambda shapes, dtype, device: torch.randn(
+                shapes, device=device
+            ).to(dtype)
+            spec["routing_logits"] = lambda shapes, dtype, device: torch.rand(
+                shapes, dtype=dtype, device=device
+            )
+            spec["topk_ids"] = _init_packed_topk_ids
+            spec["expert_weights"] = lambda shapes, dtype, device: torch.empty(
+                shapes, dtype=dtype, device=device
+            )
+            spec["hidden_states_scale"] = lambda shapes, dtype, device: torch.ones(
+                shapes, device=device
+            ).to(dtype)
+
+            sorted_inputs = sorted(
+                (MoEInputs.idx(name), name, init) for name, init in spec.items()
+            )
+            input_idx = tuple(i for i, _, _ in sorted_inputs)
+            dim_idx = tuple(
+                MoEInputs._DYNAMIC_DIM[name] for _, name, _ in sorted_inputs
+            )
+            initializers = [init for _, _, init in sorted_inputs]
+
+            return TuningConfig(
+                dynamic_tensor_specs=(
+                    DynamicTensorSpec(
+                        input_idx,
+                        dim_idx,
+                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens, 1),
+                        lambda x: min(last_positive_power_of_2(x), tune_max_num_tokens),
+                        initializers,
+                    ),
+                ),
+                **kwargs,
+            )
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
         ) -> List[int]:
-            (
-                output,
-                routing_logits,
-                topk_ids,
-                expert_weights,
-                hidden_states,
-                *extra_inputs,
-            ) = inputs
-            num_tokens = hidden_states.shape[0]
+            moe_inputs = MoEInputs.from_list(inputs)
+            num_tokens = moe_inputs.hidden_states.shape[0]
 
             instance_key = (
                 self.dtype_act,
@@ -947,24 +1009,19 @@ def get_trtllm_moe_sm100_module():
             do_preparation: bool = False,
             **kwargs,
         ):
-            (
-                output,
-                routing_logits,
-                topk_ids,
-                expert_weights,
-                hidden_states,
-                *extra_inputs,
-            ) = inputs
-            if kwargs.get("skip_routing", False):
-                routing_logits = None
-            num_tokens = hidden_states.shape[0]
+            moe_inputs = MoEInputs.from_list(inputs)
+            output = moe_inputs.output
+            routing_logits = moe_inputs.routing_logits
+            topk_ids = moe_inputs.topk_ids
+            expert_weights = moe_inputs.expert_weights
+            hidden_states = moe_inputs.hidden_states
+            hidden_states_scale = (
+                moe_inputs.hidden_states_scale
+                if trtllm_gen_dtype_has_scale(self.dtype_act)
+                else None
+            )
 
-            extra_input_idx = 0
-            if trtllm_gen_dtype_has_scale(self.dtype_act):
-                hidden_states_scale = extra_inputs[extra_input_idx]
-                extra_input_idx += 1
-            else:
-                hidden_states_scale = None
+            num_tokens = hidden_states.shape[0]
             # sanity checks to ensure that dynamic tensors have the correct shapes
             assert output.shape[0] == num_tokens, (
                 "output's first dimension must be batch size."
@@ -1040,7 +1097,7 @@ def get_trtllm_moe_sm100_module():
                             device=hidden_states.device,
                         )
                     elif self.fp8_quantization_type == Fp8QuantizationType.MxFp8:
-                        current_hidden_states_scale = extra_inputs[0]
+                        current_hidden_states_scale = hidden_states_scale
 
                     else:
                         raise ValueError(
@@ -1168,34 +1225,6 @@ def get_trtllm_moe_sm100_module():
                     [-1, -1] if tactic == -1 else tactic,
                 )
 
-        @classmethod
-        @functools.lru_cache(maxsize=None)
-        def refine_tuning_config(cls, tune_max_num_tokens: int, **kwargs):
-            cls.tuning_config_with_hidden_states_scales = TuningConfig(
-                dynamic_tensor_specs=(
-                    DynamicTensorSpec(
-                        (0, 1, 2, 3, 4, 5),
-                        (0, 0, 0, 0, 0, 0),
-                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens, 1),
-                        lambda x: min(last_positive_power_of_2(x), tune_max_num_tokens),
-                        cls.dynamic_tensor_initializers,
-                    ),
-                ),
-                **kwargs,
-            )
-            cls.tuning_config_no_hidden_states_scales = TuningConfig(
-                dynamic_tensor_specs=(
-                    DynamicTensorSpec(
-                        (0, 1, 2, 3, 4),
-                        (0, 0, 0, 0, 0),
-                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens, 1),
-                        lambda x: min(last_positive_power_of_2(x), tune_max_num_tokens),
-                        cls.dynamic_tensor_initializers[:5],
-                    ),
-                ),
-                **kwargs,
-            )
-
     @register_custom_op(
         "flashinfer::trtllm_bf16_moe",
         mutates_args=(""),
@@ -1231,7 +1260,6 @@ def get_trtllm_moe_sm100_module():
 
         # Use AutoTuner to select the best tactic
         tuner = AutoTuner.get()
-        MoERunner.refine_tuning_config(tune_max_num_tokens)
 
         num_tokens = hidden_states.shape[0]
         hidden_size = hidden_states.shape[-1]
@@ -1247,9 +1275,8 @@ def get_trtllm_moe_sm100_module():
                 0, dtype=routing_logits.dtype, device=hidden_states.device
             )
         else:
-            # When routing_logits is provided, we either have topk_ids/expert_weights,
-            # packed into a single tensor as topk_id
-            # or have them individually as topk_ids and expert_weights respectively
+            # Pre-computed routing: topk_ids contains packed expert IDs, expert_weights
+            # may be provided separately or left empty (packed format encodes both).
             topk_ids = topk_ids
             expert_weights = (
                 expert_weights
@@ -1273,13 +1300,25 @@ def get_trtllm_moe_sm100_module():
             activation_type=ActivationType.Swiglu,  # Default for BF16
         )
 
-        inputs = [output, routing_logits, topk_ids, expert_weights, hidden_states]
+        moe_inputs = MoEInputs(
+            output=output,
+            routing_logits=routing_logits,
+            topk_ids=topk_ids,
+            expert_weights=expert_weights,
+            hidden_states=hidden_states,
+            hidden_states_scale=None,
+        )
+        tuning_config = moe_runner._make_tuning_config(
+            tune_max_num_tokens=tune_max_num_tokens,
+            use_cuda_graph=True,
+            use_cold_l2_cache=True,
+        )
 
         _, tactic = tuner.choose_one(
             "flashinfer::trtllm_bf16_moe",
             [moe_runner],
-            MoERunner.tuning_config_no_hidden_states_scales,
-            inputs,
+            tuning_config,
+            moe_inputs.to_list(),
             routing_bias=routing_bias,
             gemm1_weights=gemm1_weights,
             gemm2_weights=gemm2_weights,
@@ -1390,7 +1429,6 @@ def get_trtllm_moe_sm100_module():
             enable_pdl = device_support_pdl(hidden_states.device)
         # Use AutoTuner to select the best tactic
         tuner = AutoTuner.get()
-        MoERunner.refine_tuning_config(tune_max_num_tokens)
 
         num_tokens = hidden_states.shape[0]
         hidden_size = hidden_states.shape[-1]
@@ -1422,13 +1460,27 @@ def get_trtllm_moe_sm100_module():
             activation_type=activation_type,
         )
 
-        inputs = [output, routing_logits, topk_ids, expert_weights, hidden_states]
+        # topk_ids and expert_weights are 2D write-only workspace buffers here;
+        # the kernel fills them during the routing phase, so torch.empty is correct.
+        moe_inputs = MoEInputs(
+            output=output,
+            routing_logits=routing_logits,
+            topk_ids=topk_ids,
+            expert_weights=expert_weights,
+            hidden_states=hidden_states,
+            hidden_states_scale=None,
+        )
+        tuning_config = moe_runner._make_tuning_config(
+            tune_max_num_tokens=tune_max_num_tokens,
+            use_cuda_graph=True,
+            use_cold_l2_cache=True,
+        )
 
         _, tactic = tuner.choose_one(
             "flashinfer::trtllm_fp8_per_tensor_scale_moe",
             [moe_runner],
-            MoERunner.tuning_config_no_hidden_states_scales,  # FP8 per-tensor doesn't use hidden_states_scale
-            inputs,
+            tuning_config,
+            moe_inputs.to_list(),
             routing_bias=routing_bias,
             gemm1_weights=gemm1_weights,
             output1_scales_scalar=output1_scales_scalar,
@@ -1557,9 +1609,8 @@ def get_trtllm_moe_sm100_module():
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
 
-        # Use AutoTuner to select the best tactic - follow FP4 pattern exactly
+        # Use AutoTuner to select the best tactic
         tuner = AutoTuner.get()
-        MoERunner.refine_tuning_config(tune_max_num_tokens)
 
         num_tokens = hidden_states.shape[0]
         hidden_size = hidden_states.shape[-1]
@@ -1621,20 +1672,25 @@ def get_trtllm_moe_sm100_module():
             use_shuffled_weight=use_shuffled_weight,
         )
 
-        inputs = [
-            output,
-            routing_logits,
-            topk_ids,
-            expert_weights,
-            hidden_states,
-            hidden_states_scale,
-        ]
+        moe_inputs = MoEInputs(
+            output=output,
+            routing_logits=routing_logits,
+            topk_ids=topk_ids,
+            expert_weights=expert_weights,
+            hidden_states=hidden_states,
+            hidden_states_scale=hidden_states_scale,
+        )
+        tuning_config = moe_runner._make_tuning_config(
+            tune_max_num_tokens=tune_max_num_tokens,
+            use_cuda_graph=True,
+            use_cold_l2_cache=True,
+        )
 
         _, tactic = tuner.choose_one(
             "flashinfer::trtllm_fp8_block_scale_moe",
             [moe_runner],
-            MoERunner.tuning_config_with_hidden_states_scales,  # FP8 block-scale uses hidden_states_scale
-            inputs,
+            tuning_config,
+            moe_inputs.to_list(),
             routing_bias=routing_bias,
             gemm1_weights=gemm1_weights,
             gemm1_weights_scale=gemm1_weights_scale,
@@ -1812,9 +1868,6 @@ def get_trtllm_moe_sm100_module():
             )
 
         tuner = AutoTuner.get()
-        MoERunner.refine_tuning_config(
-            tune_max_num_tokens, use_cold_l2_cache=True, use_cuda_graph=True
-        )
         dtype_act = deduce_trtllm_gen_tensor_dtype(hidden_states, hidden_states_scale)
         dtype_weights = deduce_trtllm_gen_tensor_dtype(
             gemm1_weights, gemm1_weights_scale
@@ -1831,34 +1884,25 @@ def get_trtllm_moe_sm100_module():
             weight_layout=WeightLayout.MajorK,
             use_shuffled_weight=True,
         )
-        tunning_config = (
-            MoERunner.tuning_config_no_hidden_states_scales
-            if hidden_states_scale is None
-            else MoERunner.tuning_config_with_hidden_states_scales
+        moe_inputs = MoEInputs(
+            output=output,
+            routing_logits=routing_logits,
+            topk_ids=topk_ids,
+            expert_weights=expert_weights,
+            hidden_states=hidden_states,
+            hidden_states_scale=hidden_states_scale,
         )
-        inputs = [
-            output,
-            torch.empty(
-                num_tokens,
-                num_experts,
-                dtype=routing_dtype,
-                device=hidden_states.device,
-            )
-            if routing_logits is None
-            else routing_logits,
-            topk_ids,
-            expert_weights,
-            hidden_states,
-        ]
-        if hidden_states_scale is not None:
-            inputs.append(hidden_states_scale)
+        tuning_config = moe_runner._make_tuning_config(
+            tune_max_num_tokens=tune_max_num_tokens,
+            use_cold_l2_cache=True,
+            use_cuda_graph=True,
+        )
 
         _, tactic = tuner.choose_one(
             "flashinfer::trtllm_fp4_block_scale_moe",
             [moe_runner],
-            tunning_config,
-            inputs,
-            skip_routing=(routing_logits is None),
+            tuning_config,
+            moe_inputs.to_list(),
             num_experts=num_experts,
             routing_bias=routing_bias,
             gemm1_weights=gemm1_weights,
@@ -2020,7 +2064,6 @@ def get_trtllm_moe_sm100_module():
             )
 
         tuner = AutoTuner.get()
-        MoERunner.refine_tuning_config(tune_max_num_tokens)
         dtype_act = DtypeTrtllmGen.Bfloat16
         dtype_weights = DtypeTrtllmGen.MxInt4
         moe_runner = MoERunner(
@@ -2035,20 +2078,26 @@ def get_trtllm_moe_sm100_module():
             weight_layout=WeightLayout.BlockMajorK,
             use_shuffled_weight=True,
         )
-        tunning_config = MoERunner.tuning_config_no_hidden_states_scales
-        inputs = [
-            output,
-            routing_logits,
-            topk_ids,
-            expert_weights,
-            hidden_states,
-        ]
+        # topk_ids and expert_weights are 2D write-only workspace buffers here.
+        moe_inputs = MoEInputs(
+            output=output,
+            routing_logits=routing_logits,
+            topk_ids=topk_ids,
+            expert_weights=expert_weights,
+            hidden_states=hidden_states,
+            hidden_states_scale=None,
+        )
+        tuning_config = moe_runner._make_tuning_config(
+            tune_max_num_tokens=tune_max_num_tokens,
+            use_cuda_graph=True,
+            use_cold_l2_cache=True,
+        )
 
         _, tactic = tuner.choose_one(
             "flashinfer::trtllm_mxint4_block_scale_moe",
             [moe_runner],
-            tunning_config,
-            inputs,
+            tuning_config,
+            moe_inputs.to_list(),
             num_experts=num_experts,
             routing_bias=routing_bias,
             gemm1_weights=gemm1_weights,
