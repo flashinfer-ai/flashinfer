@@ -1,5 +1,5 @@
 """
-Copyright (c) 2023 by FlashInfer team.
+Copyright (c) 2026 by FlashInfer team.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,10 +20,10 @@ from typing import List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
-from .api_logging import flashinfer_api
-from .jit import gen_batch_mla_module, gen_trtllm_gen_fmha_module, setup_cubin_loader
-from .jit.mla import gen_mla_module
-from .utils import (
+from ..api_logging import flashinfer_api
+from ..jit import gen_batch_mla_module, gen_trtllm_gen_fmha_module, setup_cubin_loader
+from ..jit.mla import gen_mla_module
+from ..utils import (
     MaskMode,
     _check_block_tables_shape,
     check_shape_dtype_device,
@@ -33,7 +33,7 @@ from .utils import (
     get_device_sm_count,
     log2e,
 )
-from .xqa import xqa_mla
+from ..xqa import xqa_mla
 
 
 def _check_cutlass_shape(q_nope_pe, ckv_kpe_cache, kv_len, page_table):
@@ -607,6 +607,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     skip_softmax_threshold_scale_factor: Optional[float] = None,
     enable_pdl: bool | None = None,
     backend: str = "auto",
+    is_var_seq: bool = True,
     uses_shared_paged_kv_idx: bool = True,
 ) -> torch.Tensor:
     """
@@ -628,9 +629,11 @@ def trtllm_batch_decode_with_kv_cache_mla(
     max_seq_len: max sequence length for kv_cache
     out: output tensor, if not provided, will be allocated internally
     bmm1_scale: fused scale for mla bmm1 input.
-        when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32.
+        When using ``trtllm-gen`` backend, it can be a ``torch.Tensor`` with dtype ``torch.float32``.
+        When using ``cute-dsl`` backend, only ``float`` values are supported.
     bmm2_scale: fused scale for mla bmm2 input.
-        when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32.
+        When using ``trtllm-gen`` backend, it can be a ``torch.Tensor`` with dtype ``torch.float32``.
+        When using ``cute-dsl`` backend, only ``float`` values are supported.
     sinks: additional value per head in the denominator of the softmax.
     skip_softmax_threshold_scale_factor: threshold scale factor for skipping softmax operations.
         Providing a value for this parameter enables skip-softmax sparsity as described in: https://arxiv.org/abs/2512.12087
@@ -638,10 +641,14 @@ def trtllm_batch_decode_with_kv_cache_mla(
         Setting the threshold to a higher value generally increases kernel performance at the cost of accuracy degradation.
         The actual threshold value equals the provided threshold_scale_factor divided by the context length.
     backend : str = "auto"
-        The implementation backend, could be ``auto``/``xqa`` or ``trtllm-gen``. Defaults to ``auto``.
+        The implementation backend, could be ``auto``/``xqa``, ``trtllm-gen``, or ``cute-dsl``. Defaults to ``auto``.
         When set to ``auto``, the backend will be chosen based on the device architecture and kernel availability.
         For sm_100 and sm_103 (blackwell architecture), ``auto`` will choose ``trtllm-gen`` backend.
         For sm_120 (blackwell architecture), ``auto`` will choose ``xqa`` backend.
+    is_var_seq : bool
+        Whether the sequence length is variable.
+        If True, the sequence length is variable.
+        Otherwise,the sequence length is fixed for all the requests in the batch.
     uses_shared_paged_kv_idx : bool = True
         Whether the K and V page indices are shared as a unified index.
         True (default) uses vLLM/FlashInfer layout with a 2D page table.
@@ -742,14 +749,15 @@ def trtllm_batch_decode_with_kv_cache_mla(
             uses_shared_paged_kv_idx,
         )
 
+        expected_out_shape = query.shape[:-1] + (kv_lora_rank,)
         if out is None:
-            out_shape = query.shape[:-1] + (kv_lora_rank,)
-            out = torch.empty(out_shape, dtype=torch.bfloat16, device=query.device)
+            out = torch.empty(
+                expected_out_shape, dtype=torch.bfloat16, device=query.device
+            )
         else:
-            batch_size, _, num_q_heads, _ = query.shape
             check_shape_dtype_device(
                 out,
-                [batch_size, num_q_heads, kv_lora_rank],
+                expected_out_shape,
                 torch.bfloat16,
                 query.device,
                 "out",
@@ -790,6 +798,60 @@ def trtllm_batch_decode_with_kv_cache_mla(
         )
 
         return out
+    elif backend == "cute-dsl":
+        enable_pdl = (
+            device_support_pdl(query.device) if enable_pdl is None else enable_pdl
+        )
+        cc = get_compute_capability(query.device)
+        if cc[0] < 10:
+            raise RuntimeError(
+                f"cute-dsl backend (MLA decode kernel) requires SM100+, got SM{cc[0]}{cc[1]}"
+            )
+        from .cute_dsl import cute_dsl_mla_decode
+
+        if isinstance(bmm1_scale, torch.Tensor):
+            raise ValueError(
+                "cute-dsl backend (MLA decode kernel) does not support tensor bmm1_scale, "
+                "please pass a float value"
+            )
+        if isinstance(bmm2_scale, torch.Tensor):
+            raise ValueError(
+                "cute-dsl backend (MLA decode kernel) does not support tensor bmm2_scale, "
+                "please pass a float value"
+            )
+        if sinks is not None:
+            raise ValueError(
+                "cute-dsl backend (MLA decode kernel) does not support sinks"
+            )
+        if sparse_mla_top_k > 0:
+            raise ValueError(
+                "cute-dsl backend (MLA decode kernel) does not support sparse_mla_top_k"
+            )
+        if skip_softmax_threshold_scale_factor is not None:
+            raise ValueError(
+                "cute-dsl backend (MLA decode kernel) does not support skip_softmax_threshold_scale_factor"
+            )
+        if not uses_shared_paged_kv_idx:
+            raise ValueError(
+                "cute-dsl backend (MLA decode kernel) does not support separate KV page indices "
+                "(uses_shared_paged_kv_idx=False)"
+            )
+
+        return cute_dsl_mla_decode(
+            query=query,
+            kv_cache=kv_cache,
+            workspace_buffer=workspace_buffer,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=max_seq_len,
+            softmax_scale=bmm1_scale,
+            output_scale=bmm2_scale,
+            out=out,
+            is_var_seq=is_var_seq,
+            enable_pdl=enable_pdl,
+        )
     else:
         raise ValueError(f"Backend {backend} not supported")
 
