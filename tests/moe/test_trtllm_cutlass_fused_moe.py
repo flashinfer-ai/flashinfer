@@ -1924,9 +1924,9 @@ def test_moe_nvfp4_unswizzled_input_sf():
 @pytest.mark.parametrize(
     "hidden_size, intermediate_size",
     [
-        # hidden_size=2880: 2880/32=90 scale cols, round_up(90,4)=92 → padding
-        # This is the gpt-oss-120b config that triggers the weight_scale_vec_size bug.
-        (2880, 128),
+        # hidden_size=288: 288/16=18 scale cols, round_up(18,4)=20 -> padding.
+        # Exercises the weight_scale_vec_size snap fix (issue #2847).
+        (288, 128),
     ],
 )
 @pytest.mark.parametrize("num_experts", [2])
@@ -1970,8 +1970,10 @@ def test_moe_nvfp4_unaligned_hidden_size(
 
     torch.manual_seed(42)
     quant_blocksize = 16
+
     def round_up(x, y):
         return (x + y - 1) // y * y
+
     e = num_experts
     m = batch_size
     n = intermediate_size
