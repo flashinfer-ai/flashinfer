@@ -591,14 +591,10 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm110(
 
 // Returns true if the given (tile, stage) pair fits within the device SMEM limit.
 // Formula: stages * (M * K * sizeof_a + N * K * sizeof_b) <= smem_limit
-// Source: https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/compute-capabilities.html
-//   SM 8.6 / 8.9 / 12.x:  102,400 bytes (100 KB)
-//   SM 8.0 / 8.7:         167,936 bytes (164 KB) -- no restriction needed
-// SM 7.5 (65,536 bytes) is already capped at max_stages=2 by the caller.
 static bool tile_fits_smem(int const sm, int const m, int const n, int const k_elem,
                            CutlassGemmConfig::CandidateConfigTypeParam const config_type_param,
                            int const stages = 2) {
-  int const smem_limit = (sm == 86 || sm == 89 || sm == 120 || sm == 121) ? 102400 : INT_MAX;
+  int const smem_limit = (sm == 86 || sm == 89 || sm == 120 || sm == 121) ? 101376 : INT_MAX;
   // FP4 is stored unpacked in SMEM (1 byte per 4-bit element), same cost as FP8/INT8.
   bool const small_dtype = (config_type_param & CutlassGemmConfig::FP8_ONLY) ||
                            (config_type_param & CutlassGemmConfig::INT8_ONLY) ||
@@ -613,9 +609,8 @@ static bool tile_fits_smem(int const sm, int const m, int const n, int const k_e
 std::vector<CutlassGemmConfig> get_candidate_configs_sm120(
     int const sm, CutlassGemmConfig::CandidateConfigTypeParam const config) {
 #ifdef FAST_BUILD
-  return {CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x64B,
-                            MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
-                            ClusterShape::ClusterShape_1x1x1}};
+  return {CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x64B, MainloopScheduleType::AUTO,
+                            EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1}};
 #else
   if ((config & CutlassGemmConfig::FP4_ONLY) == 0) {
     if (config & CutlassGemmConfig::GROUPED_GEMM) {
@@ -628,17 +623,17 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm120(
   // {tile_enum, M, N, K_elem}
   static constexpr std::pair<CutlassTileConfigSM120, std::array<int, 3>> all_tiles[] = {
       {CutlassTileConfigSM120::CtaShape128x128x128B, {128, 128, 256}},
-      {CutlassTileConfigSM120::CtaShape128x128x64B,  {128, 128, 128}},
-      {CutlassTileConfigSM120::CtaShape256x128x64B,  {256, 128, 128}},
-      {CutlassTileConfigSM120::CtaShape128x256x64B,  {128, 256, 128}},
+      {CutlassTileConfigSM120::CtaShape128x128x64B, {128, 128, 128}},
+      {CutlassTileConfigSM120::CtaShape256x128x64B, {256, 128, 128}},
+      {CutlassTileConfigSM120::CtaShape128x256x64B, {128, 256, 128}},
       {CutlassTileConfigSM120::CtaShape128x128x256B, {128, 128, 512}},
       {CutlassTileConfigSM120::CtaShape256x128x128B, {256, 128, 256}},
   };
   std::vector<CutlassGemmConfig> result;
   for (auto const& [tile_enum, mnk] : all_tiles) {
     if (!tile_fits_smem(sm, mnk[0], mnk[1], mnk[2], config)) {
-      TLLM_LOG_DEBUG("SM%d: skipping SM120 FP4 tile M=%d N=%d K_elem=%d: exceeds SMEM limit",
-                     sm, mnk[0], mnk[1], mnk[2]);
+      TLLM_LOG_DEBUG("SM%d: skipping SM120 FP4 tile M=%d N=%d K_elem=%d: exceeds SMEM limit", sm,
+                     mnk[0], mnk[1], mnk[2]);
       continue;
     }
     result.push_back(CutlassGemmConfig{tile_enum, MainloopScheduleType::AUTO,
@@ -683,8 +678,8 @@ std::vector<CutlassGemmConfig> get_candidate_configs(
     TileShape const ts = get_cta_shape_for_config(tile_config);
     for (int stages = min_stages; stages <= max_stages; ++stages) {
       if (!tile_fits_smem(sm, ts.m, ts.n, ts.k, config_type_param, stages)) {
-        TLLM_LOG_DEBUG("SM%d: skipping tile M=%d N=%d K=%d stages=%d: exceeds SMEM limit",
-                       sm, ts.m, ts.n, ts.k, stages);
+        TLLM_LOG_DEBUG("SM%d: skipping tile M=%d N=%d K=%d stages=%d: exceeds SMEM limit", sm, ts.m,
+                       ts.n, ts.k, stages);
         continue;
       }
       CutlassGemmConfig config(tile_config, SplitKStyle::NO_SPLIT_K, 1, stages);
