@@ -61,6 +61,68 @@ def _skip_if_not_sm90_or_later():
         pytest.skip(f"GDN decode requires SM90+ or SM100+, but got SM{cc[0]}{cc[1]}")
 
 
+def _assert_close_large_tensor(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    atol: float,
+    rtol: float,
+    msg: str,
+    timestep_dim: int | None = None,
+):
+    """Manual assert_close for large tensors that avoids RuntimeError in error formatting.
+
+    torch.testing.assert_close crashes with RuntimeError when trying to format
+    error messages for tensors with >1B elements. This function computes the
+    comparison manually and reports per-timestep error diagnostics on failure.
+    """
+    # Compare per-slice to avoid allocating huge temporary tensors
+    if timestep_dim is not None and actual.ndim > timestep_dim:
+        T = actual.shape[timestep_dim]
+        per_t_stats = []
+        any_violation = False
+        for t in range(T):
+            diff_t = (
+                actual.select(timestep_dim, t).float()
+                - expected.select(timestep_dim, t).float()
+            ).abs()
+            tol_t = atol + rtol * expected.select(timestep_dim, t).float().abs()
+            violations_t = diff_t > tol_t
+            count = violations_t.sum().item()
+            total = violations_t.numel()
+            per_t_stats.append(
+                (t, diff_t.max().item(), diff_t.mean().item(), count, total)
+            )
+            if count > 0:
+                any_violation = True
+            del diff_t, tol_t, violations_t
+
+        if not any_violation:
+            return
+
+        lines = [msg]
+        for t, t_max, t_mean, t_count, t_total in per_t_stats:
+            lines.append(
+                f"  t={t}: max_abs={t_max:.6f}, mean={t_mean:.6f}, "
+                f"violations={t_count}/{t_total} ({100 * t_count / t_total:.4f}%)"
+            )
+        lines.append(f"  Tolerances: atol={atol}, rtol={rtol}")
+        raise AssertionError("\n".join(lines))
+    else:
+        diff = (actual.float() - expected.float()).abs()
+        tol = atol + rtol * expected.float().abs()
+        violations = diff > tol
+        if not violations.any():
+            return
+        num_violations = violations.sum().item()
+        total = violations.numel()
+        raise AssertionError(
+            f"{msg}\n"
+            f"  Max abs error: {diff.max().item():.6f}, "
+            f"Violations: {num_violations}/{total} ({100 * num_violations / total:.4f}%), "
+            f"Tolerances: atol={atol}, rtol={rtol}"
+        )
+
+
 # ============================================================================
 # Test decode kernel with pretranspose version ([B*HV, V, K])
 # Reference: fp32 h state (default); bf16 h state used only for gdn_decode_bf16_state.
@@ -1128,12 +1190,15 @@ def _test_verify_kernel_mtp(
             -2, -1
         )  # [pool_size, T, HV, K, V]
 
-        torch.testing.assert_close(
+        # Use manual comparison to avoid RuntimeError from torch.testing.assert_close
+        # when formatting error messages for tensors with >1B elements (e.g. [512, 5, 32, 128, 128])
+        _assert_close_large_tensor(
             intermediate_states_kernel.float(),
             intermediate_states_ref.float(),
             atol=atol_s,
             rtol=rtol_s,
             msg=f"Intermediate states mismatch for MTP kernel (B={B}, T={T}, dtype={dtype})",
+            timestep_dim=1,
         )
 
     # Compare final state if state update is enabled
@@ -1856,7 +1921,9 @@ def _test_gdn_decode_bf16_state_mtp_kernel(
         # ref intermediate states: [B, HV, K, V] per step (K-major layout, bf16)
         # Stack ref: [B, T, HV, K, V], transpose to [B, T, HV, V, K] for comparison
         ref_inter = torch.stack(ref_intermediate_states, dim=1)  # [B, T, HV, K, V]
-        ref_inter_transposed = ref_inter.transpose(-2, -1).contiguous()  # [B, T, HV, V, K]
+        ref_inter_transposed = ref_inter.transpose(
+            -2, -1
+        ).contiguous()  # [B, T, HV, V, K]
 
         atol_s = 0.02
         rtol_s = 0.01
