@@ -317,7 +317,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
         torch.bfloat16
     )
     bias13 = torch.randn(num_experts, intermediate_size * 2, device=device) * 10
-    bias2 = torch.randn(num_experts, intermediate_size * 2, device=device) * 10
+    bias2 = torch.randn(num_experts, hidden_size, device=device) * 10
 
     if quant_mode == "NvFP4xNvFP4":
         w13, w13_scale = fp4_quantize(
