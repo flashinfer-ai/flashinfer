@@ -65,7 +65,7 @@ template <typename input_t, typename state_t, int TOKENS_MTP, int DIM, int DSTAT
 struct GroupStorageHorizontal {
   // Pad DSTATE to next multiple of 32 banks (128 bytes) to eliminate bank conflicts.
   // TMA loads a single wide tile of DSTATE_PAD columns; OOB columns (DSTATE..DSTATE_PAD-1)
-  // are pre-zeroed and left untouched by TMA (FILL_NONE).
+  // are skipped by TMA (FILL_NONE) and zeroed in registers at load time.
   static constexpr int BANK_CYCLE_BYTES = 32 * sizeof(uint32_t);  // 128 bytes
   static constexpr int DSTATE_PAD = (DSTATE * (int)sizeof(state_t) + BANK_CYCLE_BYTES - 1) /
                                     BANK_CYCLE_BYTES * BANK_CYCLE_BYTES / (int)sizeof(state_t);
@@ -121,7 +121,7 @@ __device__ __forceinline__ void role_load_horizontal(
 
   // ── Pipeline state_in loads (TMA_STATE_ROWS per transaction) ──────────
   // Single wide TMA load of DSTATE_PAD columns per chunk.
-  // TMA's FILL_NONE leaves pre-zeroed padding untouched.
+  // OOB padding columns are handled in registers, not smem.
   constexpr int bytesChunk = TMA_STATE_ROWS * DSTATE_PAD * (int)sizeof(state_t);
   uint32_t parity_empty[NUM_IN_STAGES] = {};  // all start at phase 0
 #pragma unroll
@@ -276,14 +276,18 @@ __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int la
         int const sram_row = sp * horiz::ROWS_PER_PASS + compute_warp * rowsPerWarp + group;
         int const dd = tl * TMA_STATE_ROWS + sram_row;  // global DIM row
 
-        // Load state from smem (pre-zeroed padding beyond DSTATE)
+        // Load state from smem; zero padding beyond DSTATE in registers
         float2 rState[numTiles][pairsPerTileMember];
 #pragma unroll
         for (int t = 0; t < numTiles; t++) {
 #pragma unroll
           for (int p = 0; p < pairsPerTileMember; p++) {
             int const c0 = baseCol(t, p * 2);
-            rState[t][p] = toFloat2(&sram.state_in[slot][sram_row * DSTATE_PAD + c0]);
+            if (c0 >= DSTATE || IS_PAD) {
+              rState[t][p] = {0.f, 0.f};
+            } else {
+              rState[t][p] = toFloat2(&sram.state_in[slot][sram_row * DSTATE_PAD + c0]);
+            }
           }
         }
 
@@ -318,6 +322,7 @@ __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int la
 #pragma unroll
             for (int p = 0; p < pairsPerTileMember; p++) {
               int const c0 = baseCol(t, p * 2);
+              if (c0 >= DSTATE) continue;
               float2 const B2 = toFloat2(&B_step[c0]);
               float2 const C2 = toFloat2(&C_step[c0]);
               float2 dBx;
@@ -478,35 +483,6 @@ __global__ void __launch_bounds__(horiz::NUM_WARPS * 32, 6)
     }
     // bar_out_ready: 4 compute warps only
     init(&sram.bar_out_ready, horiz::NUM_COMPUTE_WARPS_PER_GROUP * warpSize);
-  }
-  __syncthreads();
-
-  // ── Zero-fill smem padding for DSTATE < DSTATE_PAD ────────────────────
-  // TMA uses FILL_NONE: OOB elements are NOT written to smem. Pre-zeroing
-  // the padding columns ensures they read as zero, eliminating OOB divergence.
-  if constexpr (sram_t::DSTATE_PAD > DSTATE) {
-    constexpr int PAD = sram_t::DSTATE_PAD - DSTATE;
-    int const tid = warp * warpSize + lane;
-    int const numThreads = horiz::NUM_WARPS * warpSize;
-
-    // Zero B/C padding: B[step][DSTATE..DSTATE_PAD-1], same for C
-    constexpr int bc_pad_total = NTOKENS * PAD;
-    for (int i = tid; i < bc_pad_total; i += numThreads) {
-      int const step = i / PAD;
-      int const col = DSTATE + i % PAD;
-      sram.B[step][col] = input_t(0);
-      sram.C[step][col] = input_t(0);
-    }
-
-    // Zero state_in padding: row-major layout [slot][row][DSTATE..DSTATE_PAD-1]
-    constexpr int state_pad_total = NUM_IN_STAGES * TMA_STATE_ROWS * PAD;
-    for (int i = tid; i < state_pad_total; i += numThreads) {
-      int const slot = i / (TMA_STATE_ROWS * PAD);
-      int const rem = i % (TMA_STATE_ROWS * PAD);
-      int const row = rem / PAD;
-      int const col = DSTATE + rem % PAD;
-      sram.state_in[slot][row * sram_t::DSTATE_PAD + col] = state_t(0);
-    }
   }
   __syncthreads();
 

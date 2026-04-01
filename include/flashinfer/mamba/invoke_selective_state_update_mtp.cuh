@@ -247,7 +247,7 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
 
           // TMA state descriptor: single wide tile of DSTATE_PAD columns.
           // DSTATE_PAD is DSTATE rounded up to 128 bytes (32 banks), eliminating
-          // bank conflicts. TMA FILL_NONE leaves pre-zeroed padding untouched.
+          // bank conflicts. OOB padding is handled in registers, not smem.
           constexpr int DSTATE_PAD = sram_t::DSTATE_PAD;
           auto state_tensor = tma::buildNdDescriptor(
               typeid(state_t),
