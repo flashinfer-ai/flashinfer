@@ -955,6 +955,8 @@ def get_trtllm_moe_sm100_module():
                 hidden_states,
                 *extra_inputs,
             ) = inputs
+            if kwargs.get("skip_routing", False):
+                routing_logits = None
             num_tokens = hidden_states.shape[0]
 
             extra_input_idx = 0
@@ -1836,7 +1838,12 @@ def get_trtllm_moe_sm100_module():
         )
         inputs = [
             output,
-            torch.empty(num_tokens, num_experts, dtype=routing_dtype, device="meta")
+            torch.empty(
+                num_tokens,
+                num_experts,
+                dtype=routing_dtype,
+                device=hidden_states.device,
+            )
             if routing_logits is None
             else routing_logits,
             topk_ids,
@@ -1851,6 +1858,7 @@ def get_trtllm_moe_sm100_module():
             [moe_runner],
             tunning_config,
             inputs,
+            skip_routing=(routing_logits is None),
             num_experts=num_experts,
             routing_bias=routing_bias,
             gemm1_weights=gemm1_weights,
