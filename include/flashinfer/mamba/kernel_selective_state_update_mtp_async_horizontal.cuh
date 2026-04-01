@@ -387,6 +387,8 @@ __device__ __forceinline__ void update_state_async_horizontal(
 
     for (int step = 0; step < NTOKENS; step++) {
       if (step >= seq_len) break;
+      // Prefetch dst_slot early so the LDS latency is hidden by the compute below
+      int64_t const dst_slot = sram.state_dst_slots[step];
       float const dt_value = *dt_step;
       float const dA = __expf(A_val * dt_value);
       float const x_value = toFloat(x_step[local_row]);
@@ -432,7 +434,6 @@ __device__ __forceinline__ void update_state_async_horizontal(
 
       // Unified state write: use precomputed slot index from sram
       {
-        int64_t const dst_slot = sram.state_dst_slots[step];
         if (dst_slot != async_horiz::SKIP_WRITE_STATE) {
           [[maybe_unused]] float encode_scale = 1.f;
           if constexpr (scaleState) {
