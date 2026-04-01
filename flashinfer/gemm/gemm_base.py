@@ -3524,8 +3524,12 @@ def _rank_sm100_mm_fp4_cute_dsl_tactics(valid_tactics, m, n, real_k, device):
 
         # Wave quantization: how well CTAs fill the SMs
         # Use ceil-div aligned to cluster shape for accurate CTA count
-        ctas_m = ((prob_m + tile_m - 1) // tile_m + cluster_m - 1) // cluster_m * cluster_m
-        ctas_n = ((prob_n + tile_n - 1) // tile_n + cluster_n - 1) // cluster_n * cluster_n
+        ctas_m = (
+            ((prob_m + tile_m - 1) // tile_m + cluster_m - 1) // cluster_m * cluster_m
+        )
+        ctas_n = (
+            ((prob_n + tile_n - 1) // tile_n + cluster_n - 1) // cluster_n * cluster_n
+        )
         total_ctas = ctas_m * ctas_n
         if total_ctas == 0:
             return 0.0
@@ -3537,7 +3541,9 @@ def _rank_sm100_mm_fp4_cute_dsl_tactics(valid_tactics, m, n, real_k, device):
         raw_ctas_n = (prob_n + tile_n - 1) // tile_n
         cluster_ctas_m = ((raw_ctas_m + cluster_m - 1) // cluster_m) * cluster_m
         cluster_ctas_n = ((raw_ctas_n + cluster_n - 1) // cluster_n) * cluster_n
-        cluster_efficiency = (raw_ctas_m * raw_ctas_n) / (cluster_ctas_m * cluster_ctas_n)
+        cluster_efficiency = (raw_ctas_m * raw_ctas_n) / (
+            cluster_ctas_m * cluster_ctas_n
+        )
 
         # Tile throughput bias: larger tiles have higher per-CTA throughput.
         # Also prefer balanced (square-ish) tiles over elongated ones —
@@ -3546,7 +3552,7 @@ def _rank_sm100_mm_fp4_cute_dsl_tactics(valid_tactics, m, n, real_k, device):
         tile_area_factor = ((tile_m * tile_n) / max_tile_area) ** 0.5
         # Balance factor: ratio of min/max tile dims. 1.0 for square, <1 for elongated.
         tile_balance = min(tile_m, tile_n) / max(tile_m, tile_n)
-        tile_throughput = tile_area_factor * (tile_balance ** 0.25)
+        tile_throughput = tile_area_factor * (tile_balance**0.25)
 
         # For small K, penalize oversized tiles — the K-pipeline can't hide
         # the latency of large tile launches when there's little K-work.
@@ -3575,8 +3581,15 @@ def _rank_sm100_mm_fp4_cute_dsl_tactics(valid_tactics, m, n, real_k, device):
         if swap_ab and 8 <= m <= 16 and n >= 4096:
             swap_bonus = 1.08
 
-        return (tile_efficiency * wave_efficiency * cluster_efficiency
-                * tile_throughput * prefetch_penalty * cluster_bonus * swap_bonus)
+        return (
+            tile_efficiency
+            * wave_efficiency
+            * cluster_efficiency
+            * tile_throughput
+            * prefetch_penalty
+            * cluster_bonus
+            * swap_bonus
+        )
 
     return sorted(valid_tactics, key=_score, reverse=True)
 
