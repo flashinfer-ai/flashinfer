@@ -260,6 +260,8 @@ def gdn_verify_kernel_mtp_original(
     )
 
     # Only process valid batch entries (cache_idx >= 0)
+    rows_per_group: cutlass.Constexpr[int] = tile_v // num_groups
+
     if cache_idx >= 0:
         # Compute k_start once (used for shared memory writes)
         k_start = lane_in_group * vec_size
@@ -351,7 +353,6 @@ def gdn_verify_kernel_mtp_original(
         cute.arch.barrier()
 
         # Each group handles tile_v/num_groups V rows
-        rows_per_group: cutlass.Constexpr[int] = tile_v // num_groups
         for row_in_group in cutlass.range_constexpr(rows_per_group):
             v_idx = i_v * tile_v + group_idx * rows_per_group + row_in_group
 
@@ -430,6 +431,14 @@ def gdn_verify_kernel_mtp_original(
                         (flat_state_idx, v_idx, lane_in_group),
                     )
                     cute.autovec_copy(r_h, h_tile_out)
+    else:
+        # Padding slot: zero output for all V rows this group handles
+        for row_in_group in cutlass.range_constexpr(rows_per_group):
+            v_idx = i_v * tile_v + group_idx * rows_per_group + row_in_group
+            if v_idx < V:
+                for i_t in cutlass.range_constexpr(T):
+                    if lane_in_group == 0:
+                        o[(i_n, i_t, i_hv, v_idx)] = cutlass.BFloat16(0.0)
 
 
 @cute.jit
@@ -1524,6 +1533,14 @@ def gdn_verify_kernel_mtp(
                     v_global = v_tile_base + tidx
                     if v_global < V:
                         o[(i_n, t_idx, i_hv, v_global)] = sOutput[(t_idx, tidx)]
+    else:
+        # Padding slot: zero output using cooperative writeback pattern
+        v_tile_base = i_v * tile_v
+        for t_idx in cutlass.range_constexpr(T):
+            if tidx < tile_v:
+                v_global = v_tile_base + tidx
+                if v_global < V:
+                    o[(i_n, t_idx, i_hv, v_global)] = cutlass.BFloat16(0.0)
 
 
 @cute.jit
