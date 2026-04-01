@@ -1711,7 +1711,7 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
                               RenormTempStorage<BLOCK_THREADS, REDUCE_ALGORITHM>>(probs, row_idx, d,
                                                                                   temp_storage);
 
-  double low = 0, high = max_val;
+  float low = 0, high = max_val;
   float min_gt_low, max_le_high;
   float sum_low = 1;
   // f(x) = sum(probs[probs > x]), f(x) is non-increasing
@@ -1722,8 +1722,11 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
   // stopping condition
   // - f(low) >= p, f(min_gt_low) == f(max_le_high) == f(high) < p
   do {
-    double pivot_0 = (high + 2 * low) / 3;
-    double pivot_1 = (2 * high + low) / 3;
+    float pivot_0 = (high + 2 * low) / 3.f;
+    float pivot_1 = (2 * high + low) / 3.f;
+    // Guard against -use_fast_math FTZ: if div.approx.ftz.f32 flushed a pivot
+    // into low/high (e.g. subnormal result → 0), the search can't progress.
+    if (pivot_0 <= low || pivot_1 >= high) break;
 
     float aggregate_gt_pivot_0 = 0, aggregate_gt_pivot_1 = 0;
     min_gt_low = high;
