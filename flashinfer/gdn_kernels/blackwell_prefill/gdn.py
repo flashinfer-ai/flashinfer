@@ -3782,12 +3782,18 @@ class GDN:
         initial_state_f32_iter: Optional[cute.Pointer],
         state_output: Optional[cute.Pointer],
         scale: Optional[float],
-        cum_seqlen_q: Optional[cute.Tensor] = None,
+        cum_seqlen: Optional[cute.Pointer] = None,
         stream: cuda.CUstream = None,
     ):
         """Host-side entry: build tensor layouts, TMA descriptors, smem storage, and launch the kernel."""
 
         b, s_q, s_sum, h_q, h_v, d = problem_size
+
+        cum_seqlen_q = (
+            None
+            if cum_seqlen is None
+            else cute.make_tensor(cum_seqlen, cute.make_layout((b)))
+        )
 
         h_r = h_v // h_q
         o_offset = 0 if cum_seqlen_q is None else (-s_q * d * h_r * h_q)
@@ -4570,8 +4576,9 @@ def chunk_gated_delta_rule(
     # Compile kernel with TVM FFI (cached)
     is_varlen = cu_seqlens is not None
     is_initial_state = initial_state is not None
+    cache_problem_size = problem_size[5]
     cache_key = (
-        problem_size,
+        cache_problem_size,
         q.dtype,
         is_varlen,
         is_initial_state,
@@ -4621,7 +4628,7 @@ def chunk_gated_delta_rule(
             state_tensor.iterator if state_tensor is not None else None,
             state_output_tensor.iterator if output_final_state else None,
             scale,
-            cu_seqlens_tensor,
+            cu_seqlens_tensor.iterator if cu_seqlens_tensor is not None else None,
             stream=current_stream,
         )
         cache["compiled_gdn"] = compiled_gdn
@@ -4640,7 +4647,7 @@ def chunk_gated_delta_rule(
         initial_state.data_ptr() if initial_state is not None else None,
         output_state.data_ptr() if output_final_state else None,
         scale,
-        cu_seqlens,
+        cu_seqlens.data_ptr() if is_varlen else None,
         stream=current_stream,
     )
 
