@@ -26,6 +26,7 @@
 #include "cutlass/gemm/gemm.h"
 #include "cutlass/numeric_types.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/logger.h"
 
 #ifdef __GNUC__  // Check if the compiler is GCC or Clang
 #pragma GCC diagnostic pop
@@ -588,41 +589,65 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm110(
 #endif
 }
 
+// Returns true if the given (tile, stage) pair fits within the device SMEM limit.
+// Formula: stages * (M * K * sizeof_a + N * K * sizeof_b) <= smem_limit
+// Source: https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/compute-capabilities.html
+//   SM 8.6 / 8.9 / 12.x:  102,400 bytes (100 KB)
+//   SM 8.0 / 8.7:         167,936 bytes (164 KB) -- no restriction needed
+// SM 7.5 (65,536 bytes) is already capped at max_stages=2 by the caller.
+static bool tile_fits_smem(int const sm, int const m, int const n, int const k_elem,
+                           CutlassGemmConfig::CandidateConfigTypeParam const config_type_param,
+                           int const stages = 2) {
+  int const smem_limit = (sm == 86 || sm == 89 || sm == 120 || sm == 121) ? 102400 : INT_MAX;
+  // FP4 is stored unpacked in SMEM (1 byte per 4-bit element), same cost as FP8/INT8.
+  bool const small_dtype = (config_type_param & CutlassGemmConfig::FP8_ONLY) ||
+                           (config_type_param & CutlassGemmConfig::INT8_ONLY) ||
+                           (config_type_param & CutlassGemmConfig::FP4_ONLY);
+  // Weight-only: activations are FP16 (2 B), weights are at most INT8 (1 B).
+  int const sizeof_a = small_dtype ? 1 : 2;
+  int const sizeof_b =
+      (small_dtype || (config_type_param & CutlassGemmConfig::WEIGHT_ONLY)) ? 1 : 2;
+  return stages * (m * k_elem * sizeof_a + n * k_elem * sizeof_b) <= smem_limit;
+}
+
 std::vector<CutlassGemmConfig> get_candidate_configs_sm120(
-    CutlassGemmConfig::CandidateConfigTypeParam const config) {
-  // SM12x has ~100 KB SMEM (optin max: 101376 bytes).
-  // FP4 is stored unpacked in SMEM (1 byte per 4-bit element), doubling per-stage cost.
-  // Only CtaShape128x128x64B (~73 KB with 2 stages) fits for grouped GEMM.
-  // For non-grouped, CtaShape128x128x256B and CtaShape256x128x128B may exceed the
-  // budget but are the only SM120 non-grouped tiles available — let the autotuner
-  // handle failures.
+    int const sm, CutlassGemmConfig::CandidateConfigTypeParam const config) {
 #ifdef FAST_BUILD
   return {CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x64B,
                             MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
                             ClusterShape::ClusterShape_1x1x1}};
 #else
-  if (config & CutlassGemmConfig::GROUPED_GEMM) {
-    if ((config & CutlassGemmConfig::FP4_ONLY) != 0) {
-      return {CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x64B,
-                                MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
-                                ClusterShape::ClusterShape_1x1x1}};
-    } else {
+  if ((config & CutlassGemmConfig::FP4_ONLY) == 0) {
+    if (config & CutlassGemmConfig::GROUPED_GEMM) {
       TLLM_THROW("Not Implemented: SM120 group GEMM only supports nvfp4.");
     }
-  } else {
-    if ((config & CutlassGemmConfig::FP4_ONLY) != 0) {
-      return {CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x256B,
-                                MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
-                                ClusterShape::ClusterShape_1x1x1},
-              CutlassGemmConfig{CutlassTileConfigSM120::CtaShape256x128x128B,
-                                MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
-                                ClusterShape::ClusterShape_1x1x1}};
-    } else {
-      TLLM_THROW("Not Implemented: SM120 GEMM only supports nvfp4.");
-    }
+    TLLM_THROW("Not Implemented: SM120 GEMM only supports nvfp4.");
   }
+  // K values are in SMEM elements (FP4 unpacked as uint8: 2 elements per packed byte,
+  // so K_elem = tile_name_K_bytes * 2). Minimum pipeline depth is 2 (default in tile_fits_smem).
+  // {tile_enum, M, N, K_elem}
+  static constexpr std::pair<CutlassTileConfigSM120, std::array<int, 3>> all_tiles[] = {
+      {CutlassTileConfigSM120::CtaShape128x128x128B, {128, 128, 256}},
+      {CutlassTileConfigSM120::CtaShape128x128x64B,  {128, 128, 128}},
+      {CutlassTileConfigSM120::CtaShape256x128x64B,  {256, 128, 128}},
+      {CutlassTileConfigSM120::CtaShape128x256x64B,  {128, 256, 128}},
+      {CutlassTileConfigSM120::CtaShape128x128x256B, {128, 128, 512}},
+      {CutlassTileConfigSM120::CtaShape256x128x128B, {256, 128, 256}},
+  };
+  std::vector<CutlassGemmConfig> result;
+  for (auto const& [tile_enum, mnk] : all_tiles) {
+    if (!tile_fits_smem(sm, mnk[0], mnk[1], mnk[2], config)) {
+      TLLM_LOG_DEBUG("SM%d: skipping SM120 FP4 tile M=%d N=%d K_elem=%d: exceeds SMEM limit",
+                     sm, mnk[0], mnk[1], mnk[2]);
+      continue;
+    }
+    result.push_back(CutlassGemmConfig{tile_enum, MainloopScheduleType::AUTO,
+                                       EpilogueScheduleType::AUTO,
+                                       ClusterShape::ClusterShape_1x1x1});
+  }
+  return result;
 #endif
-}  // namespace kernels
+}
 
 std::vector<CutlassGemmConfig> get_candidate_configs(
     int sm, int const max_split_k,
@@ -643,7 +668,7 @@ std::vector<CutlassGemmConfig> get_candidate_configs(
     return get_candidate_configs_sm100(config_type_param, sm);
   }
   if (sm >= 120 && (config_type_param & CutlassGemmConfig::BLACKWELL)) {
-    return get_candidate_configs_sm120(config_type_param);
+    return get_candidate_configs_sm120(sm, config_type_param);
   }
 
   std::vector<CutlassTileConfig> tiles = get_candidate_tiles(sm, config_type_param);
@@ -654,26 +679,14 @@ std::vector<CutlassGemmConfig> get_candidate_configs(
   int const min_stages = (sm == 89) ? 3 : int8_configs_only ? 3 : 2;
   int const max_stages = int8_configs_only ? 6 : (sm >= 80 ? 4 : 2);
 
-  // Filter (tile, stage) pairs whose Ampere mainloop SMEM exceeds the device limit.
-  // Formula: stages * (M * K * sizeof_a + N * K * sizeof_b)
-  // Source: https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/compute-capabilities.html
-  //   SM 8.6 / 8.9 / 12.x:  102,400 bytes (100 KB)
-  //   SM 8.0 / 8.7:         167,936 bytes (164 KB) -- no restriction needed
-  // SM 7.5 (65,536 bytes) is already capped at max_stages=2 by the logic above.
-  int const smem_limit = (sm == 86 || sm == 89 || sm == 120 || sm == 121) ? 102400 : INT_MAX;
-  // FP4 is stored unpacked in SMEM (1 byte per 4-bit element), same cost as FP8/INT8.
-  bool const small_dtype = (config_type_param & CutlassGemmConfig::FP8_ONLY) ||
-                            (config_type_param & CutlassGemmConfig::INT8_ONLY) ||
-                            (config_type_param & CutlassGemmConfig::FP4_ONLY);
-  // Weight-only: activations are FP16 (2 B), weights are at most INT8 (1 B).
-  int const sizeof_a = small_dtype ? 1 : 2;
-  int const sizeof_b =
-      (small_dtype || (config_type_param & CutlassGemmConfig::WEIGHT_ONLY)) ? 1 : 2;
-
   for (auto const& tile_config : tiles) {
     TileShape const ts = get_cta_shape_for_config(tile_config);
     for (int stages = min_stages; stages <= max_stages; ++stages) {
-      if (stages * (ts.m * ts.k * sizeof_a + ts.n * ts.k * sizeof_b) > smem_limit) continue;
+      if (!tile_fits_smem(sm, ts.m, ts.n, ts.k, config_type_param, stages)) {
+        TLLM_LOG_DEBUG("SM%d: skipping tile M=%d N=%d K=%d stages=%d: exceeds SMEM limit",
+                       sm, ts.m, ts.n, ts.k, stages);
+        continue;
+      }
       CutlassGemmConfig config(tile_config, SplitKStyle::NO_SPLIT_K, 1, stages);
       candidate_configs.push_back(config);
       if (sm >= 75) {

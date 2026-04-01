@@ -37,7 +37,7 @@ class CompilationContext:
 
         SM 9.x  -> 'a' suffix (e.g. compute_90a)
         SM 12.x -> always normalized to SM 120 with 'f' suffix (e.g. compute_120f).
-        SM 12.0 and SM 12.1 share the same ~100 KB SMEM budget and kernel set.
+        This covers both SM 12.0 and SM 12.1 (DGX Spark) when the installed CUDA toolchain supports it (CUDA >= 12.9).
         SM 10+  -> 'a' suffix (e.g. compute_100a)
         SM < 9  -> no suffix
         """
