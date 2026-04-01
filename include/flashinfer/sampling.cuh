@@ -1711,7 +1711,7 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
                               RenormTempStorage<BLOCK_THREADS, REDUCE_ALGORITHM>>(probs, row_idx, d,
                                                                                   temp_storage);
 
-  float low = 0, high = max_val;
+  double low = 0, high = max_val;
   float min_gt_low, max_le_high;
   float sum_low = 1;
   // f(x) = sum(probs[probs > x]), f(x) is non-increasing
@@ -1722,8 +1722,8 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
   // stopping condition
   // - f(low) >= p, f(min_gt_low) == f(max_le_high) == f(high) < p
   do {
-    float pivot_0 = (high + 2 * low) / 3.f;
-    float pivot_1 = (2 * high + low) / 3.f;
+    double pivot_0 = (high + 2 * low) / 3;
+    double pivot_1 = (2 * high + low) / 3;
 
     float aggregate_gt_pivot_0 = 0, aggregate_gt_pivot_1 = 0;
     min_gt_low = high;
