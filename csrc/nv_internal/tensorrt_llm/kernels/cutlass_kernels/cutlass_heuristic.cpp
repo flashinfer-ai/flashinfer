@@ -594,7 +594,7 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm110(
 static bool tile_fits_smem(int const sm, int const m, int const n, int const k_elem,
                            CutlassGemmConfig::CandidateConfigTypeParam const config_type_param,
                            int const stages = 2) {
-  int const smem_limit = (sm == 86 || sm == 89 || sm == 120 || sm == 121) ? 101376 : INT_MAX;
+  int const smem_limit = (sm == 86 || sm == 89 || sm == 120 || sm == 121) ? (99 * 1024) : INT_MAX;
   // FP4 is stored unpacked in SMEM (1 byte per 4-bit element), same cost as FP8/INT8.
   bool const small_dtype = (config_type_param & CutlassGemmConfig::FP8_ONLY) ||
                            (config_type_param & CutlassGemmConfig::INT8_ONLY) ||
