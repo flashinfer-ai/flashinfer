@@ -964,9 +964,21 @@ def get_trtllm_moe_sm100_module():
 
             def _dynamic_dim(name: str) -> int:
                 if name == "hidden_states_scale":
-                    # Layout varies by op: find which dim equals num_tokens.
+                    # DeepSeekFp8 uses [hidden_size//128, num_tokens];
+                    # all others (MxFp8, fp4, …) use [num_tokens, ...].
                     t = moe_inputs.hidden_states_scale
-                    return next(i for i, s in enumerate(t.shape) if s == num_tokens)
+                    if self.fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8:
+                        assert t.shape == (self.hidden_size // 128, num_tokens), (
+                            f"hidden_states_scale shape {tuple(t.shape)} does not match "
+                            f"expected DeepSeekFp8 layout "
+                            f"(hidden_size//128={self.hidden_size // 128}, num_tokens={num_tokens})"
+                        )
+                        return 1
+                    assert t.shape[0] == num_tokens, (
+                        f"hidden_states_scale shape {tuple(t.shape)} does not match "
+                        f"expected layout (num_tokens={num_tokens}, ...)"
+                    )
+                    return 0
                 return MoEInputs._DYNAMIC_DIM[name]
 
             dim_idx = tuple(_dynamic_dim(name) for _, name, _ in sorted_inputs)
