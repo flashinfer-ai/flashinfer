@@ -905,17 +905,17 @@ def get_trtllm_moe_sm100_module():
 
         def _make_tuning_config(
             self,
+            moe_inputs: "MoEInputs",
             tune_max_num_tokens: int = 8192,
             **kwargs,
         ) -> TuningConfig:
             """Build a TuningConfig for this runner instance.
 
-            Routing mode and which tensors are dynamic are inferred directly from
-            the actual input tensors in moe_inputs: a tensor with numel()==0 is a
-            sentinel and passed through unchanged; a real tensor is included in the
-            DynamicTensorSpec so the autotuner synthesizes it at each bucket size.
+            Only fields that are non-None in moe_inputs are included in the
+            DynamicTensorSpec, so the autotuner synthesizes them at each bucket size.
 
             Args:
+                moe_inputs: The actual inputs for this invocation; None fields are excluded.
                 tune_max_num_tokens: Upper bound for the num_tokens tuning buckets.
                 **kwargs: Extra TuningConfig kwargs (e.g. use_cold_l2_cache).
             """
@@ -930,23 +930,28 @@ def get_trtllm_moe_sm100_module():
                 ).view(torch.int16)
                 return (expert_ids << 16) | expert_weights
 
-            spec = {}
-            spec["output"] = lambda shapes, dtype, device: torch.empty(
-                shapes, dtype=dtype, device=device
-            )
-            spec["hidden_states"] = lambda shapes, dtype, device: torch.randn(
-                shapes, device=device
-            ).to(dtype)
-            spec["routing_logits"] = lambda shapes, dtype, device: torch.rand(
-                shapes, dtype=dtype, device=device
-            )
-            spec["topk_ids"] = _init_packed_topk_ids
-            spec["expert_weights"] = lambda shapes, dtype, device: torch.empty(
-                shapes, dtype=dtype, device=device
-            )
-            spec["hidden_states_scale"] = lambda shapes, dtype, device: torch.ones(
-                shapes, device=device
-            ).to(dtype)
+            spec = {
+                "output": lambda shapes, dtype, device: torch.empty(
+                    shapes, dtype=dtype, device=device
+                ),
+                "hidden_states": lambda shapes, dtype, device: torch.randn(
+                    shapes, device=device
+                ).to(dtype),
+            }
+            if moe_inputs.routing_logits is not None:
+                spec["routing_logits"] = lambda shapes, dtype, device: torch.rand(
+                    shapes, dtype=dtype, device=device
+                )
+            if moe_inputs.topk_ids is not None:
+                spec["topk_ids"] = _init_packed_topk_ids
+            if moe_inputs.expert_weights is not None:
+                spec["expert_weights"] = lambda shapes, dtype, device: torch.empty(
+                    shapes, dtype=dtype, device=device
+                )
+            if moe_inputs.hidden_states_scale is not None:
+                spec["hidden_states_scale"] = lambda shapes, dtype, device: torch.ones(
+                    shapes, device=device
+                ).to(dtype)
 
             sorted_inputs = sorted(
                 (MoEInputs.idx(name), name, init) for name, init in spec.items()
@@ -1309,6 +1314,7 @@ def get_trtllm_moe_sm100_module():
             hidden_states_scale=None,
         )
         tuning_config = moe_runner._make_tuning_config(
+            moe_inputs,
             tune_max_num_tokens=tune_max_num_tokens,
             use_cuda_graph=True,
             use_cold_l2_cache=True,
@@ -1471,6 +1477,7 @@ def get_trtllm_moe_sm100_module():
             hidden_states_scale=None,
         )
         tuning_config = moe_runner._make_tuning_config(
+            moe_inputs,
             tune_max_num_tokens=tune_max_num_tokens,
             use_cuda_graph=True,
             use_cold_l2_cache=True,
@@ -1681,6 +1688,7 @@ def get_trtllm_moe_sm100_module():
             hidden_states_scale=hidden_states_scale,
         )
         tuning_config = moe_runner._make_tuning_config(
+            moe_inputs,
             tune_max_num_tokens=tune_max_num_tokens,
             use_cuda_graph=True,
             use_cold_l2_cache=True,
@@ -1893,6 +1901,7 @@ def get_trtllm_moe_sm100_module():
             hidden_states_scale=hidden_states_scale,
         )
         tuning_config = moe_runner._make_tuning_config(
+            moe_inputs,
             tune_max_num_tokens=tune_max_num_tokens,
             use_cold_l2_cache=True,
             use_cuda_graph=True,
@@ -2088,6 +2097,7 @@ def get_trtllm_moe_sm100_module():
             hidden_states_scale=None,
         )
         tuning_config = moe_runner._make_tuning_config(
+            moe_inputs,
             tune_max_num_tokens=tune_max_num_tokens,
             use_cuda_graph=True,
             use_cold_l2_cache=True,
