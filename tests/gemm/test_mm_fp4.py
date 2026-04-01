@@ -132,5 +132,24 @@ def test_mm_fp4_backend_auto(
     _test_mm_fp4(m, n, k, res_dtype, "auto", use_128x4_sf_layout, auto_tuning, fp4_type)
 
 
+# Production-sized shapes from DeepSeek-R1 and Llama-3 workloads to exercise
+# the cute-dsl heuristic's tactic selection (tile sizes, cluster shapes, swap_ab)
+# at scales beyond the small parametrized tests above.
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        (1, 7168, 4608),  # small-M decode shape
+        (8, 5120, 16384),  # small-M, large-K
+        (64, 5120, 8192),  # medium-M
+        (256, 9216, 7168),  # medium-M, large-N
+        (1024, 9216, 7168),  # large-M
+        (512, 8192, 28672),  # large-M, large-K
+    ],
+)
+@pytest.mark.parametrize("auto_tuning", [False, True])
+def test_mm_fp4_cute_dsl_production_shapes(m, n, k, auto_tuning):
+    _test_mm_fp4(m, n, k, torch.bfloat16, "cute-dsl", True, auto_tuning, "nvfp4")
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
