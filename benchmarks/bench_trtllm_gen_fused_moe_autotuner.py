@@ -175,7 +175,6 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
         )
         return np.median(ms_list)
 
-    # Phase 1: measure all untuned (cache is empty)
     setups = []
     for batch_size in num_tokens_list:
         hidden_states_bf16 = torch.randn(batch_size, hidden_size, device=device).to(
@@ -266,16 +265,21 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
                 "gemm2_weights": w2,
                 "gemm2_weights_scale": w2_scale,
             }
-        setups.append((batch_size, fn, input_kwargs, _measure(fn, input_kwargs)))
+        setups.append((batch_size, fn, input_kwargs))
 
-    # Phase 2: tune once — covers all buckets up to tune_max
-    _, first_fn, first_kw, _ = setups[0]
+    # measure untuned
+    ms_no_autotune = []
+    for batch_size, fn, input_kwargs in setups:
+        ms_no_autotune.append(_measure(fn, input_kwargs))
+
+    # tune once — covers all buckets up to tune_max
+    _, first_fn, first_kw = setups[0]
     with autotune(True):
         first_fn(**first_kw)
 
-    # Phase 3: measure all tuned
+    # measure tuned
     results = []
-    for batch_size, fn, input_kwargs, ms in setups:
+    for (batch_size, fn, input_kwargs), ms in zip(setups, ms_no_autotune):
         results.append((batch_size, ms, _measure(fn, input_kwargs)))
 
     mode_str = "routed" if routed else "non_routed"
@@ -454,16 +458,20 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
             "gemm1_bias": bias13,
             "gemm2_bias": bias2,
         }
-        setups.append((batch_size, fn, input_kwargs, _measure(fn, input_kwargs)))
+        setups.append((batch_size, fn, input_kwargs))
+
+    ms_no_autotune = []
+    for batch_size, fn, input_kwargs in setups:
+        ms_no_autotune.append(_measure(fn, input_kwargs))
 
     # Phase 2: tune once — covers all buckets up to tune_max
-    _, first_fn, first_kw, _ = setups[0]
+    _, first_fn, first_kw = setups[0]
     with autotune(True):
         first_fn(**first_kw)
 
     # Phase 3: measure all tuned
     results = []
-    for batch_size, fn, input_kwargs, ms in setups:
+    for (batch_size, fn, input_kwargs), ms in zip(setups, ms_no_autotune):
         results.append((batch_size, ms, _measure(fn, input_kwargs)))
 
     mode_str = "routed" if routed else "non_routed"
@@ -560,16 +568,20 @@ def bench_trtllm_gen_fused_moe_autotuner_mxint4(
             "gemm2_weights": w2,
             "gemm2_weights_scale": w2_scale,
         }
-        setups.append((batch_size, fn, input_kwargs, _measure(fn, input_kwargs)))
+        setups.append((batch_size, fn, input_kwargs))
+
+    ms_no_autotune = []
+    for batch_size, fn, input_kwargs in setups:
+        ms_no_autotune.append(_measure(fn, input_kwargs))
 
     # Phase 2: tune once — covers all buckets up to tune_max
-    _, first_fn, first_kw, _ = setups[0]
+    _, first_fn, first_kw = setups[0]
     with autotune(True):
         first_fn(**first_kw)
 
     # Phase 3: measure all tuned
     results = []
-    for batch_size, fn, input_kwargs, ms in setups:
+    for (batch_size, fn, input_kwargs), ms in zip(setups, ms_no_autotune):
         results.append((batch_size, ms, _measure(fn, input_kwargs)))
 
     _print_table(
