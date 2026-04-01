@@ -60,6 +60,16 @@ def _require_sm80_for_bf16():
         pytest.skip("BF16 requires SM80+")
 
 
+def _is_cute_dsl_available():
+    """Check if CuTe-DSL is available."""
+    try:
+        from flashinfer.cute_dsl import is_cute_dsl_available as _is_available
+
+        return _is_available()
+    except ImportError:
+        return False
+
+
 def verify_topk_correctness(logits, values, indices, k):
     """Verify that all returned values are truly in the top-k.
 
@@ -81,8 +91,17 @@ def verify_topk_correctness(logits, values, indices, k):
 @pytest.mark.parametrize("vocab_size", [32000, 65536, 128512])
 @pytest.mark.parametrize("k", [256, 512, 1024])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_top_k(batch_size, vocab_size, k, dtype):
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
+def test_top_k(batch_size, vocab_size, k, dtype, backend):
     """Test top_k returns correct values and indices."""
+    if backend == "cute-dsl":
+        if not _is_cute_dsl_available():
+            pytest.skip("CuTe-DSL is not available")
+        major, minor = get_compute_capability(torch.device("cuda"))
+        if major * 10 + minor < 100:
+            pytest.skip("CuTe-DSL top-k requires SM100+")
+        if k > 2048:
+            pytest.skip("cute-dsl backend supports k <= 2048")
     if k > vocab_size:
         pytest.skip("k should be less than vocab_size")
 
@@ -90,7 +109,7 @@ def test_top_k(batch_size, vocab_size, k, dtype):
     logits = torch.randn(batch_size, vocab_size, device="cuda", dtype=dtype)
 
     # flashinfer top_k
-    values, indices = flashinfer.top_k(logits, k)
+    values, indices = flashinfer.top_k(logits, k, backend=backend)
 
     # Reference: torch.topk
     ref_values, ref_indices = torch.topk(logits, k, dim=-1)
@@ -109,8 +128,6 @@ def test_top_k(batch_size, vocab_size, k, dtype):
 
     # Check accuracy of indices
     accuracy = compute_topk_accuracy(indices.int(), ref_indices.int(), batch_size, k)
-    # Accuracy depends on vocab size, k, and data distribution
-    # Random Gaussian data can have many values close to each other at boundaries
     min_accuracy = 0.98
     assert accuracy >= min_accuracy, f"Accuracy {accuracy:.4f} < {min_accuracy}"
 
@@ -119,8 +136,17 @@ def test_top_k(batch_size, vocab_size, k, dtype):
 @pytest.mark.parametrize("vocab_size", [32000, 65536])
 @pytest.mark.parametrize("k", [256, 512])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
-def test_top_k_sorted(batch_size, vocab_size, k, dtype):
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
+def test_top_k_sorted(batch_size, vocab_size, k, dtype, backend):
     """Test top_k with sorted=True returns sorted values."""
+    if backend == "cute-dsl":
+        if not _is_cute_dsl_available():
+            pytest.skip("CuTe-DSL is not available")
+        major, minor = get_compute_capability(torch.device("cuda"))
+        if major * 10 + minor < 100:
+            pytest.skip("CuTe-DSL top-k requires SM100+")
+        if k > 2048:
+            pytest.skip("cute-dsl backend supports k <= 2048")
     if k > vocab_size:
         pytest.skip("k should be less than vocab_size")
 
@@ -128,7 +154,7 @@ def test_top_k_sorted(batch_size, vocab_size, k, dtype):
     logits = torch.randn(batch_size, vocab_size, device="cuda", dtype=dtype)
 
     # flashinfer top_k with sorted=True
-    values, indices = flashinfer.top_k(logits, k, sorted=True)
+    values, indices = flashinfer.top_k(logits, k, sorted=True, backend=backend)
 
     # Reference: torch.topk with sorted=True
     ref_values, ref_indices = torch.topk(logits, k, dim=-1, sorted=True)
