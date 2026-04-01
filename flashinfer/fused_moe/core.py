@@ -914,7 +914,7 @@ def get_trtllm_moe_sm100_module():
                 hidden_states,
                 *extra_inputs,
             ) = inputs
-            num_tokens = routing_logits.shape[0]
+            num_tokens = hidden_states.shape[0]
 
             instance_key = (
                 self.dtype_act,
@@ -955,7 +955,7 @@ def get_trtllm_moe_sm100_module():
                 hidden_states,
                 *extra_inputs,
             ) = inputs
-            num_tokens = routing_logits.shape[0]
+            num_tokens = hidden_states.shape[0]
 
             extra_input_idx = 0
             if trtllm_gen_dtype_has_scale(self.dtype_act):
@@ -967,12 +967,20 @@ def get_trtllm_moe_sm100_module():
             assert output.shape[0] == num_tokens, (
                 "output's first dimension must be batch size."
             )
-            assert topk_ids.shape[0] == num_tokens, (
-                "topk_ids's first dimension must be batch size."
-            )
-            assert expert_weights.shape[0] == num_tokens, (
-                "expert_weights's first dimension must be batch size."
-            )
+            if routing_logits is not None:
+                assert routing_logits.shape[0] == num_tokens, (
+                    "routing_logits's first dimension must be batch size."
+                )
+            # topk_ids/expert_weights can be empty(0) when routing_logits is provided,
+            # or real tensors when pre-computed routing is used.
+            if topk_ids is not None and topk_ids.numel() > 0:
+                assert topk_ids.shape[0] == num_tokens, (
+                    "topk_ids's first dimension must be batch size."
+                )
+            if expert_weights is not None and expert_weights.numel() > 0:
+                assert expert_weights.shape[0] == num_tokens, (
+                    "expert_weights's first dimension must be batch size."
+                )
             assert hidden_states.shape[0] == num_tokens, (
                 "hidden_states's first dimension must be batch size."
             )
@@ -1516,7 +1524,7 @@ def get_trtllm_moe_sm100_module():
         gemm1_weights_scale: torch.Tensor,
         gemm2_weights: torch.Tensor,
         gemm2_weights_scale: torch.Tensor,
-        output: torch.Tensor,
+        output: Optional[torch.Tensor],
         num_experts: int,
         top_k: int,
         n_group: Optional[int],
@@ -1554,10 +1562,22 @@ def get_trtllm_moe_sm100_module():
         num_tokens = hidden_states.shape[0]
         hidden_size = hidden_states.shape[-1]
 
-        # Create workspace buffers
-        output = torch.empty(
-            num_tokens, hidden_size, dtype=torch.bfloat16, device=hidden_states.device
-        )
+        if output is None:
+            output = torch.empty(
+                num_tokens,
+                hidden_size,
+                dtype=torch.bfloat16,
+                device=hidden_states.device,
+            )
+        else:
+            check_shape_dtype_device(
+                output,
+                (num_tokens, hidden_size),
+                torch.bfloat16,
+                hidden_states.device,
+                "output",
+            )
+
         if routing_logits is not None:
             # When routing_logits is provided, we must pass topk_ids/expert_weights with no allocation
             topk_ids = torch.empty(0, dtype=torch.int32, device=hidden_states.device)
