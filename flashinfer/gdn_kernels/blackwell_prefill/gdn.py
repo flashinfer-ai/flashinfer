@@ -1591,22 +1591,8 @@ class GDN:
             beta_val = sBeta0[tidx]
             gb_handle.release()
 
-            # Barrier to ensure cumsum visible, then save gate_tail before overwrite
-            cute.arch.barrier(
-                barrier_id=self.wg_sync_bar_id,
-                number_of_threads=len(self.cudacore_warp_ids) * 32,
-            )
-            gate_tail = (
-                sGateCumsum[tail_count - 1]
-                if cutlass.const_expr(need_mask)
-                else sGateCumsum[127]
-            )
-
-            # Precompute exp(cumsum_i) for factored gamma
-            tval_exp_gamma = cute.math.exp(tval, fastmath=True)
-
             self.compute_gamma_tmem(
-                tval_exp_gamma,
+                tval,
                 sGateCumsum,
                 kkt_thr_mma,
                 tGamma,
@@ -1622,6 +1608,12 @@ class GDN:
                 tKKTtKKT,
                 beta_val,
                 tGamma,
+            )
+
+            gate_tail = (
+                sGateCumsum[tail_count - 1]
+                if cutlass.const_expr(need_mask)
+                else sGateCumsum[127]
             )
             w0_handle = epi_w0_consumer.wait_and_advance()
             self.load_state_apply_gate(
@@ -2769,7 +2761,7 @@ class GDN:
         cIn = cute.make_identity_tensor((128, 128))
         tOcO = thr_mma.partition_C(cIn)
 
-        corr_tile_size = 32
+        corr_tile_size = 8
         tIn_i_layout = cute.composition(
             tIn.layout, cute.make_layout((128, corr_tile_size))
         )
@@ -3301,20 +3293,9 @@ class GDN:
         mask: cutlass.Constexpr[cutlass.Boolean] = False,
         tail_count: Int32 = 128,
     ):
-        """Build the 128x128 causal gamma matrix in TMEM: gamma[i,j] = exp(cumsum[i]) * exp(-cumsum[j]) for j <= i."""
+        """Build the 128x128 causal gamma matrix in TMEM: gamma[i,j] = exp(cumsum[i] - cumsum[j]) for j <= i."""
         tidx, _, _ = cute.arch.thread_idx()
         thread_idx = tidx % 128
-
-        cute.arch.barrier(
-            barrier_id=bar_id,
-            number_of_threads=len(self.cudacore_warp_ids) * 32,
-        )
-
-        # Precompute exp(-cumsum[j]) cooperatively and store to sGateCumsum
-        # Save gate_tail first (needed later, before we overwrite)
-        tidx_in_group = tidx % 128
-        neg_exp_val = cute.math.exp(-sGateCumsum[tidx_in_group], fastmath=True)
-        sGateCumsum[tidx_in_group] = neg_exp_val
 
         cute.arch.barrier(
             barrier_id=bar_id,
@@ -3367,7 +3348,6 @@ class GDN:
             )
             for it in cutlass.range_constexpr(corr_tile_size // frg_tile):
                 tile_offset = i * corr_tile_size + it * frg_tile
-                tile_end = tile_offset + frg_tile - 1
 
                 if (
                     (
@@ -3378,24 +3358,18 @@ class GDN:
                     if cutlass.const_expr(mask)
                     else (tile_offset <= thread_idx)
                 ):
-                    # Load precomputed exp(-cumsum[j]) from smem
-                    neg_exp_frag = sGateCumsum_frag[(None, it), i].load()
+                    curr_val_frag_ssa = sGateCumsum_frag[(None, it), i].load()
 
-                    # gamma[i,j] = exp(cumsum_i) * exp(-cumsum_j) — mul instead of exp
-                    new_val_frag = val * neg_exp_frag
+                    new_val_frag = cute.math.exp(val - curr_val_frag_ssa, fastmath=True)
 
-                    if tile_end <= thread_idx:
-                        # Fast path: entire tile below diagonal
-                        tTMEM_STORErS_frag[None, it].store(new_val_frag)
-                    else:
-                        for inner_idx in cutlass.range_constexpr(0, frg_tile):
-                            offset = tile_offset + inner_idx
-                            curr_val = new_val_frag[inner_idx]
+                    for inner_idx in cutlass.range_constexpr(0, frg_tile):
+                        offset = tile_offset + inner_idx
+                        curr_val = new_val_frag[inner_idx]
 
-                            if offset <= thread_idx:
-                                tTMEM_STORErS_frag[inner_idx, it] = curr_val
-                            else:
-                                tTMEM_STORErS_frag[inner_idx, it] = cutlass.Float32(0)
+                        if offset <= thread_idx:
+                            tTMEM_STORErS_frag[inner_idx, it] = curr_val
+                        else:
+                            tTMEM_STORErS_frag[inner_idx, it] = cutlass.Float32(0)
                 else:
                     tTMEM_STORErS_frag[None, it].store(zeros)
 

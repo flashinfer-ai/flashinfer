@@ -33,13 +33,18 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from flashinfer.testing import bench_gpu_time
-from flashinfer.utils import is_sm100a_supported, is_sm110a_supported
+from flashinfer.utils import get_compute_capability
 
 # Blackwell GDN prefill
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
 
 # FLA baseline
 from fla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_fwd as fla_base
+
+
+def check_compute_capability(device: torch.device) -> bool:
+    major, minor = get_compute_capability(device)
+    return (major, minor) in ((10, 0), (10, 3), (11, 0))
 
 
 def benchmark_gdn_fixlen(
@@ -429,8 +434,11 @@ def main():
     args = parser.parse_args()
 
     device = torch.device("cuda")
-    if not (is_sm100a_supported(device) or is_sm110a_supported(device)):
-        print("Error: bench_blackwell_gdn_prefill.py requires an SM100A/SM110A GPU.")
+    is_device_support = check_compute_capability(device)
+    if not is_device_support:
+        print(
+            "Error: bench_blackwell_gdn_prefill.py requires an SM100/SM103/SM110 GPU."
+        )
         sys.exit(1)
 
     if args.head_dim != 128:
