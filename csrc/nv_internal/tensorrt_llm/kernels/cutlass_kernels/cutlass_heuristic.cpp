@@ -45,34 +45,38 @@ namespace cutlass_kernels {
 struct TileShape {
   int m;
   int n;
+  int k;
 };
 
 TileShape get_cta_shape_for_config(CutlassTileConfig tile_config) {
   switch (tile_config) {
     case CutlassTileConfig::CtaShape16x128x64_WarpShape16x32x64:
-      return TileShape{16, 128};
+      return TileShape{16, 128, 64};
     case CutlassTileConfig::CtaShape16x256x64_WarpShape16x64x64:
-      return TileShape{16, 256};
+      return TileShape{16, 256, 64};
     case CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64:
-      return TileShape{32, 128};
+      return TileShape{32, 128, 64};
     case CutlassTileConfig::CtaShape64x64x128_WarpShape32x64x64:
-      return TileShape{64, 64};
+      return TileShape{64, 64, 128};
     case CutlassTileConfig::CtaShape64x128x64_WarpShape32x64x64:
     case CutlassTileConfig::CtaShape64x128x64_WarpShape64x32x64:
-      return TileShape{64, 128};
+      return TileShape{64, 128, 64};
     case CutlassTileConfig::CtaShape128x64x64_WarpShape64x32x64:
-      return TileShape{128, 64};
+      return TileShape{128, 64, 64};
+    case CutlassTileConfig::CtaShape128x64x128_WarpShape64x32x128:
+      return TileShape{128, 64, 128};
     case CutlassTileConfig::CtaShape128x128x8_WarpShape64x64x8:
+      return TileShape{128, 128, 8};
     case CutlassTileConfig::CtaShape128x128x64_WarpShape64x32x64:
     case CutlassTileConfig::CtaShape128x128x64_WarpShape64x64x64:
     case CutlassTileConfig::CtaShape128x128x64_WarpShape128x32x64:
-      return TileShape{128, 128};
+      return TileShape{128, 128, 64};
     case CutlassTileConfig::CtaShape128x256x64_WarpShape64x64x64:
-      return TileShape{128, 256};
+      return TileShape{128, 256, 64};
     case CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64:
-      return TileShape{256, 128};
+      return TileShape{256, 128, 64};
     case CutlassTileConfig::CtaShape16x256x128_WarpShape16x64x128:
-      return TileShape{16, 256};
+      return TileShape{16, 256, 128};
     default:
       TLLM_THROW("[get_grid_shape_for_config] Invalid config");
   }
@@ -128,20 +132,6 @@ std::vector<CutlassTileConfig> get_candidate_tiles(
     gemm_type = CutlassGemmType::Fp8;
   }
 
-  // SM121 (GB10) has ~99 KB SMEM — Ampere-style tiles where both M>=128 and N>=128
-  // exceed the SMEM budget. Filter them out so the autotuner doesn't waste time on
-  // known-bad configs.
-  auto filter_sm121 = [sm](std::vector<CutlassTileConfig> configs) {
-    if (sm != 121) return configs;
-    std::vector<CutlassTileConfig> filtered;
-    for (auto const& c : configs) {
-      TileShape ts = get_cta_shape_for_config(c);
-      if (ts.m >= 128 && ts.n >= 128) continue;
-      filtered.push_back(c);
-    }
-    return filtered;
-  };
-
   std::vector<CutlassTileConfig> base_configs{
       CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
       CutlassTileConfig::CtaShape64x128x64_WarpShape32x64x64};
@@ -151,42 +141,42 @@ std::vector<CutlassTileConfig> get_candidate_tiles(
 
   switch (gemm_type) {
     case CutlassGemmType::Simt:
-      return filter_sm121({CutlassTileConfig::CtaShape128x128x8_WarpShape64x64x8});
+      return {CutlassTileConfig::CtaShape128x128x8_WarpShape64x64x8};
     case CutlassGemmType::WeightOnly:
       if (sm >= 75) {
-        return filter_sm121({CutlassTileConfig::CtaShape16x128x64_WarpShape16x32x64,
+        return {CutlassTileConfig::CtaShape16x128x64_WarpShape16x32x64,
                 CutlassTileConfig::CtaShape16x256x64_WarpShape16x64x64,
                 CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
                 CutlassTileConfig::CtaShape64x128x64_WarpShape64x32x64,
-                CutlassTileConfig::CtaShape128x128x64_WarpShape128x32x64});
+                CutlassTileConfig::CtaShape128x128x64_WarpShape128x32x64};
       } else {
         return {CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
                 CutlassTileConfig::CtaShape64x128x64_WarpShape64x32x64};
       }
     case CutlassGemmType::Int8:
-      return filter_sm121({CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
+      return {CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
               CutlassTileConfig::CtaShape64x128x64_WarpShape64x32x64,
               CutlassTileConfig::CtaShape128x64x64_WarpShape64x32x64,
               CutlassTileConfig::CtaShape64x64x128_WarpShape32x64x64,
               CutlassTileConfig::CtaShape128x256x64_WarpShape64x64x64,
-              CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64});
+              CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64};
     case CutlassGemmType::Fp8:
       if (config_type_param & CutlassGemmConfig::GROUPED_GEMM) {
         if (sm == 89 || sm == 120 || sm == 121) {
-          return filter_sm121({CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
+          return {CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
                   CutlassTileConfig::CtaShape64x128x64_WarpShape64x32x64,
                   CutlassTileConfig::CtaShape64x64x128_WarpShape32x64x64,
                   CutlassTileConfig::CtaShape128x64x64_WarpShape64x32x64,
                   CutlassTileConfig::CtaShape128x256x64_WarpShape64x64x64,
                   CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64,
-                  CutlassTileConfig::CtaShape16x256x128_WarpShape16x64x128});
+                  CutlassTileConfig::CtaShape16x256x128_WarpShape16x64x128};
         } else {
           // no valid ampere style fp8 configs for sm90
           return {};
         }
       } else {
         if (sm == 89 || sm >= 120) {
-          return filter_sm121({CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
+          return {CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
                   CutlassTileConfig::CtaShape64x128x64_WarpShape32x64x64,
                   CutlassTileConfig::CtaShape64x64x128_WarpShape32x64x64,
                   CutlassTileConfig::CtaShape64x128x64_WarpShape64x32x64,
@@ -197,13 +187,13 @@ std::vector<CutlassTileConfig> get_candidate_tiles(
                   CutlassTileConfig::CtaShape128x256x64_WarpShape64x64x64,
                   CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64,
                   CutlassTileConfig::CtaShape128x64x128_WarpShape64x32x128,
-                  CutlassTileConfig::CtaShape16x256x128_WarpShape16x64x128});
+                  CutlassTileConfig::CtaShape16x256x128_WarpShape16x64x128};
         } else {
           return {};
         }
       }
     default:
-      return filter_sm121(base_configs);
+      return base_configs;
   }
 }
 
@@ -600,57 +590,12 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm110(
 
 std::vector<CutlassGemmConfig> get_candidate_configs_sm120(
     CutlassGemmConfig::CandidateConfigTypeParam const config) {
-#ifdef FAST_BUILD
-  // Fast build disables all configs except this
-  if (config & CutlassGemmConfig::GROUPED_GEMM) {
-    return {CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x128B,
-                              MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
-                              ClusterShape::ClusterShape_1x1x1}};
-  } else {
-    return {CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x256B,
-                              MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
-                              ClusterShape::ClusterShape_1x1x1}};
-  }
-#else
-  if (config & CutlassGemmConfig::GROUPED_GEMM) {
-    std::vector<CutlassGemmConfig> candidate_configs;
-    if ((config & CutlassGemmConfig::FP4_ONLY) != 0) {
-      candidate_configs.push_back(CutlassGemmConfig{
-          CutlassTileConfigSM120::CtaShape128x128x128B, MainloopScheduleType::AUTO,
-          EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
-      candidate_configs.push_back(
-          CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x64B, MainloopScheduleType::AUTO,
-                            EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
-      candidate_configs.push_back(
-          CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x256x64B, MainloopScheduleType::AUTO,
-                            EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
-      candidate_configs.push_back(
-          CutlassGemmConfig{CutlassTileConfigSM120::CtaShape256x128x64B, MainloopScheduleType::AUTO,
-                            EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
-      return candidate_configs;
-    } else {
-      TLLM_THROW("Not Implemented: SM120 group GEMM only supports nvfp4.");
-    }
-  } else {
-    std::vector<CutlassGemmConfig> candidate_configs;
-    if ((config & CutlassGemmConfig::FP4_ONLY) != 0) {
-      candidate_configs.push_back(CutlassGemmConfig{
-          CutlassTileConfigSM120::CtaShape128x128x256B, MainloopScheduleType::AUTO,
-          EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
-      candidate_configs.push_back(CutlassGemmConfig{
-          CutlassTileConfigSM120::CtaShape256x128x128B, MainloopScheduleType::AUTO,
-          EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
-      return candidate_configs;
-    } else {
-      TLLM_THROW("Not Implemented: SM120 GEMM only supports nvfp4.");
-    }
-  }
-#endif
-
-}  // namespace kernels
-
-std::vector<CutlassGemmConfig> get_candidate_configs_sm121(
-    CutlassGemmConfig::CandidateConfigTypeParam const config) {
+  // SM12x has ~100 KB SMEM (optin max: 101376 bytes).
+  // FP4 is stored unpacked in SMEM (1 byte per 4-bit element), doubling per-stage cost.
+  // Only CtaShape128x128x64B (~73 KB with 2 stages) fits for grouped GEMM.
+  // For non-grouped, CtaShape128x128x256B and CtaShape256x128x128B may exceed the
+  // budget but are the only SM120 non-grouped tiles available — let the autotuner
+  // handle failures.
 #ifdef FAST_BUILD
   return {CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x64B,
                             MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
@@ -658,27 +603,26 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm121(
 #else
   if (config & CutlassGemmConfig::GROUPED_GEMM) {
     if ((config & CutlassGemmConfig::FP4_ONLY) != 0) {
-      // SM121 (GB10) has ~99 KB SMEM per block (vs ~228 KB on SM120/GB200).
-      // FP4 is stored unpacked in SMEM (1 byte per 4-bit element), so the per-stage
-      // footprint is doubled compared to packed storage.
-      //   CtaShape128x128x64B: ~32 KB/stage x 2 stages + ~9 KB epilogue = 73 KB (fits)
-      //   CtaShape128x128x128B: ~64 KB/stage -> 1 stage violates Stages>=2 constraint
-      //   CtaShape256x128x64B, CtaShape128x256x64B: ~48 KB/stage x 2 = 105 KB > 99 KB
       return {CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x64B,
                                 MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
                                 ClusterShape::ClusterShape_1x1x1}};
     } else {
-      TLLM_THROW("Not Implemented: SM121 group GEMM only supports nvfp4.");
+      TLLM_THROW("Not Implemented: SM120 group GEMM only supports nvfp4.");
     }
   } else {
     if ((config & CutlassGemmConfig::FP4_ONLY) != 0) {
-      return get_candidate_configs_sm120(config);
+      return {CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x256B,
+                                MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
+                                ClusterShape::ClusterShape_1x1x1},
+              CutlassGemmConfig{CutlassTileConfigSM120::CtaShape256x128x128B,
+                                MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
+                                ClusterShape::ClusterShape_1x1x1}};
     } else {
-      TLLM_THROW("Not Implemented: SM121 GEMM only supports nvfp4.");
+      TLLM_THROW("Not Implemented: SM120 GEMM only supports nvfp4.");
     }
   }
 #endif
-}  // get_candidate_configs_sm121
+}  // namespace kernels
 
 std::vector<CutlassGemmConfig> get_candidate_configs(
     int sm, int const max_split_k,
@@ -698,12 +642,8 @@ std::vector<CutlassGemmConfig> get_candidate_configs(
   if (sm >= 100 && sm < 120 && (config_type_param & CutlassGemmConfig::BLACKWELL)) {
     return get_candidate_configs_sm100(config_type_param, sm);
   }
-  if (sm == 120 && (config_type_param & CutlassGemmConfig::BLACKWELL)) {
+  if (sm >= 120 && (config_type_param & CutlassGemmConfig::BLACKWELL)) {
     return get_candidate_configs_sm120(config_type_param);
-  }
-  if (sm == 121 && (config_type_param & CutlassGemmConfig::BLACKWELL)) {
-    // SM121 = GB10: same ISA as SM120 but ~99 KB SMEM; only 128x128 CTA tile fits.
-    return get_candidate_configs_sm121(config_type_param);
   }
 
   std::vector<CutlassTileConfig> tiles = get_candidate_tiles(sm, config_type_param);
@@ -713,8 +653,27 @@ std::vector<CutlassGemmConfig> get_candidate_configs(
   bool const int8_configs_only = config_type_param & CutlassGemmConfig::INT8_ONLY;
   int const min_stages = (sm == 89) ? 3 : int8_configs_only ? 3 : 2;
   int const max_stages = int8_configs_only ? 6 : (sm >= 80 ? 4 : 2);
+
+  // Filter (tile, stage) pairs whose Ampere mainloop SMEM exceeds the device limit.
+  // Formula: stages * (M * K * sizeof_a + N * K * sizeof_b)
+  // Source: https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/compute-capabilities.html
+  //   SM 8.6 / 8.9 / 12.x:  102,400 bytes (100 KB)
+  //   SM 8.0 / 8.7:         167,936 bytes (164 KB) -- no restriction needed
+  // SM 7.5 (65,536 bytes) is already capped at max_stages=2 by the logic above.
+  int const smem_limit = (sm == 86 || sm == 89 || sm == 120 || sm == 121) ? 102400 : INT_MAX;
+  // FP4 is stored unpacked in SMEM (1 byte per 4-bit element), same cost as FP8/INT8.
+  bool const small_dtype = (config_type_param & CutlassGemmConfig::FP8_ONLY) ||
+                            (config_type_param & CutlassGemmConfig::INT8_ONLY) ||
+                            (config_type_param & CutlassGemmConfig::FP4_ONLY);
+  // Weight-only: activations are FP16 (2 B), weights are at most INT8 (1 B).
+  int const sizeof_a = small_dtype ? 1 : 2;
+  int const sizeof_b =
+      (small_dtype || (config_type_param & CutlassGemmConfig::WEIGHT_ONLY)) ? 1 : 2;
+
   for (auto const& tile_config : tiles) {
+    TileShape const ts = get_cta_shape_for_config(tile_config);
     for (int stages = min_stages; stages <= max_stages; ++stages) {
+      if (stages * (ts.m * ts.k * sizeof_a + ts.n * ts.k * sizeof_b) > smem_limit) continue;
       CutlassGemmConfig config(tile_config, SplitKStyle::NO_SPLIT_K, 1, stages);
       candidate_configs.push_back(config);
       if (sm >= 75) {

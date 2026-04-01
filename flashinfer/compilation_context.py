@@ -36,8 +36,8 @@ class CompilationContext:
         tuple with the correct architecture suffix for nvcc.
 
         SM 9.x  -> 'a' suffix (e.g. compute_90a)
-        SM 12.0 -> 'f' suffix (compute_120f), SM 12.1 -> 'f' suffix (compute_121f).
-        SM 12.1 gets a distinct key so its reduced SMEM budget is respected in the JIT cache.
+        SM 12.x -> always normalized to SM 120 with 'f' suffix (e.g. compute_120f).
+        SM 12.0 and SM 12.1 share the same ~100 KB SMEM budget and kernel set.
         SM 10+  -> 'a' suffix (e.g. compute_100a)
         SM < 9  -> no suffix
         """
@@ -47,12 +47,7 @@ class CompilationContext:
             from flashinfer.jit.cpp_ext import is_cuda_version_at_least
 
             if is_cuda_version_at_least("12.9"):
-                if minor == 0:
-                    return (major, "0f")
-                else:
-                    # SM12.1 (GB10) — keep minor to distinguish from SM12.0 (GB200)
-                    # in the JIT cache; GB10 has only ~99 KB SMEM vs ~228 KB on GB200.
-                    return (major, f"{minor}f")
+                return (major, "0f")
             else:
                 raise RuntimeError("SM 12.x requires CUDA >= 12.9")
         elif major >= 10:
