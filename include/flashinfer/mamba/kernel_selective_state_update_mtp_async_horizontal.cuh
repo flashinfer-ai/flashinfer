@@ -49,7 +49,7 @@ using namespace conversion;
 // Async horizontal kernel constants.
 namespace async_horiz {
 static constexpr int LANES_PER_ROW = 8;
-static constexpr int ROWS_PER_WARP = warpSize / LANES_PER_ROW;  // 4
+static constexpr int ROWS_PER_WARP = warpSize / LANES_PER_ROW;
 static constexpr int64_t SKIP_WRITE_STATE = -1;
 }  // namespace async_horiz
 
@@ -371,8 +371,8 @@ __device__ __forceinline__ void update_state_async_horizontal(
         } else {
           rState[t][p] = toFloat2(&sram.state_in[stage][pass_row][c0]);
           if constexpr (scaleState) {
-            rState[t][p].x *= state_decode_scale;
-            rState[t][p].y *= state_decode_scale;
+            float2 const decode_scale2 = {state_decode_scale, state_decode_scale};
+            mul_f32x2(rState[t][p], rState[t][p], decode_scale2);
           }
         }
       }

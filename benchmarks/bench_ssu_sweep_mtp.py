@@ -94,6 +94,7 @@ def benchmark_kernel(
         cache_steps=cache_steps,
         rand_seed=rand_seed,
         philox_rounds=philox_rounds,
+        disable_state_update=True,
     )
 
     if ncu:
@@ -139,6 +140,7 @@ def make_triton_wrapper():
         cache_steps,
         rand_seed,
         philox_rounds,
+        disable_state_update,
     ):
         selective_state_update_triton(
             state=state,
@@ -158,6 +160,8 @@ def make_triton_wrapper():
             cache_steps=cache_steps,
             intermediate_state_indices=intermediate_state_indices,
             rand_seed=rand_seed,
+            philox_rounds=philox_rounds,
+            disable_state_update=disable_state_update,
         )
 
     return wrapper
@@ -185,6 +189,7 @@ def make_flashinfer_wrapper(algorithm="auto"):
         cache_steps,
         rand_seed,
         philox_rounds,
+        disable_state_update,
     ):
         flashinfer_selective_state_update(
             state=state,
@@ -206,6 +211,7 @@ def make_flashinfer_wrapper(algorithm="auto"):
             algorithm=algorithm,
             rand_seed=rand_seed,
             philox_rounds=philox_rounds,
+            disable_state_update=disable_state_update,
         )
 
     return wrapper
