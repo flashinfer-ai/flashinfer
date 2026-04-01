@@ -7,6 +7,8 @@ import json
 import os
 import tempfile
 import threading
+
+import tqdm
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -740,7 +742,8 @@ class AutoTuner:
                     for param in inspect.signature(r.forward).parameters.values()
                 }
 
-            for p in profiles:
+            pbar = None
+            for _step, p in enumerate(profiles):
                 try:
                     tensors = self._prepare_input_tensors(p, inputs)
                     is_cache_hit, runner_id, tactic, _ = self.search_cache(
@@ -751,6 +754,14 @@ class AutoTuner:
                         inputs=tensors,
                     )
                     if not is_cache_hit:
+                        if pbar is None:
+                            pbar = tqdm.tqdm(
+                                total=len(profiles),
+                                initial=_step,
+                                desc=f"[AutoTunner]: Tuning {custom_op}",
+                                unit="profile",
+                                leave=True,
+                            )
                         min_time = float("inf")
                         # Initialize runner and tactic as None in case of no valid tactic or runners are found
                         runner_id, tactic = None, None
@@ -833,6 +844,12 @@ class AutoTuner:
                         "[Autotuner]: OOM detected, falling back to default tactic"
                     )
                     return runners[0], -1
+
+                if pbar is not None:
+                    pbar.update(1)
+
+            if pbar is not None:
+                pbar.close()
 
             # Get the best runner and tactic from cache
             # If no valid tactic is found, the fallback runner and tactic will be used
