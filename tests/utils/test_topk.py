@@ -2225,6 +2225,43 @@ def test_top_k_transform_deterministic_k1_remap(transform_mode):
     assert torch.equal(out, ref)
 
 
+def test_top_k_uint32_pointer_overflow():
+    """Test top_k with batch*vocab > 2^32 bytes"""
+    batch_size = 32769
+    vocab_size = 131072
+    k = 256
+
+    required_bytes = batch_size * vocab_size * 2  # fp16
+    free_mem = torch.cuda.mem_get_info("cuda")[0]
+    if free_mem < int(required_bytes * 1.15):
+        pytest.skip(
+            f"Insufficient GPU memory: {free_mem / 1e9:.1f}GB free, "
+            f"need ~{required_bytes / 1e9:.1f}GB"
+        )
+
+    torch.manual_seed(42)
+    logits = torch.randn(batch_size, vocab_size, device="cuda", dtype=torch.float16)
+
+    values, indices = flashinfer.top_k(logits, k)
+
+    assert values.shape == (batch_size, k)
+    assert indices.shape == (batch_size, k)
+
+    # Only check the last row: its element offset (row_idx * vocab_size)
+    # exceeds 2^32, so a uint32 overflow bug would corrupt this region.
+    row_idx = batch_size - 1
+    gathered = torch.gather(
+        logits[row_idx : row_idx + 1], -1, indices[row_idx : row_idx + 1]
+    )
+    torch.testing.assert_close(values[row_idx : row_idx + 1], gathered)
+
+    _, ref_indices = torch.topk(logits[row_idx : row_idx + 1], k, dim=-1)
+    accuracy = compute_topk_accuracy(
+        indices[row_idx : row_idx + 1].int(), ref_indices.int(), 1, k
+    )
+    assert accuracy >= 0.98, f"Last row accuracy {accuracy:.4f} < 0.98"
+
+
 if __name__ == "__main__":
     # Basic tests
     test_top_k(4, 32000, 256, torch.float32)

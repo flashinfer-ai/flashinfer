@@ -1154,7 +1154,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKKernel_Unified(
           if (chunk_start + i < k) {
             row_output[chunk_start + i] = static_cast<IdType>(chunk_start + i);
             output_values[row_idx * top_k_val + chunk_start + i] =
-                input[row_idx * stride + chunk_start + i];
+                input[static_cast<size_t>(row_idx) * stride + chunk_start + i];
           }
         }
         // Clear histogram for next iteration (in case it's k < length)
@@ -1217,9 +1217,9 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKKernel_Unified(
     uint32_t cta_local_eq_count = 0;
     OrderedType ordered_pivot =
         RadixSelectFindPivot<BLOCK_THREADS, VEC_SIZE, SINGLE_CTA, DETERMINISTIC, DType>(
-            input + row_idx * stride, shared_ordered, local_histogram, suffix_sum, shared_scalars,
-            state, chunk_start, actual_chunk_size, k, barrier_phase, ctas_per_group, cta_in_group,
-            tx, iter, cta_local_gt_count, cta_local_eq_count);
+            input + static_cast<size_t>(row_idx) * stride, shared_ordered, local_histogram,
+            suffix_sum, shared_scalars, state, chunk_start, actual_chunk_size, k, barrier_phase,
+            ctas_per_group, cta_in_group, tx, iter, cta_local_gt_count, cta_local_eq_count);
 
     auto collect_indices = [&](auto&& output_func) {
       if constexpr (DETERMINISTIC) {
@@ -2284,7 +2284,7 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
   if (bid >= num_rows) return;
 
   const int length = (lengths != nullptr) ? lengths[bid] : static_cast<int>(max_len);
-  const DType* score = input + bid * max_len;
+  const DType* score = input + static_cast<size_t>(bid) * max_len;
   IdType* dst = output + bid * top_k;
 
   // Mode-specific setup
