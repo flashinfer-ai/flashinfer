@@ -10,10 +10,12 @@ from .mask import (
     get_kv_start_block_idx,
 )
 from .variant import (
+    tanh_approx,
     AttentionVariant,
     StandardAttention,
     AttentionWithSink,
     SigmoidAttention,
+    SigmoidTanhAttention,
     ALiBiAttention,
     RPEAttention,
     SoftCappingAttention,

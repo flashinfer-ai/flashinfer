@@ -42,6 +42,13 @@ class WarpSchedule:
     tmem_alloc_sync_bar_id: int = 1
 
     @property
+    def softmax1_upper_warp_id(self) -> int:
+        """Upper bound warp ID for softmax1 dispatch (exclusive)."""
+        if self.correction_warp_ids:
+            return self.correction_warp_ids[0]
+        return self.mma_warp_id
+
+    @property
     def all_warp_ids(self) -> Tuple[int, ...]:
         return (
             *self.softmax0_warp_ids,
@@ -83,3 +90,20 @@ class WarpSchedule:
 
 
 PREFILL_SCHEDULE = WarpSchedule()
+
+# Schedule for has_logits_transform variants (e.g. sigmoid attention):
+# correction warps removed, freeing 4 warps and their registers.
+# Softmax warps take over the epilog (TMEM→scale→SMEM) after their KV loop.
+PREFILL_TRANSFORM_SCHEDULE = WarpSchedule(
+    softmax0_warp_ids=(0, 1, 2, 3),
+    softmax1_warp_ids=(4, 5, 6, 7),
+    correction_warp_ids=(),
+    mma_warp_id=8,
+    load_warp_id=9,
+    epilogue_warp_id=10,
+    empty_warp_id=11,
+    num_regs_softmax=192,
+    num_regs_correction=96,
+    num_regs_other=32,
+    num_regs_empty=24,
+)

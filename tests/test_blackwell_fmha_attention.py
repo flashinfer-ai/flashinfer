@@ -27,6 +27,7 @@ from flashinfer.cute_dsl.attention import (
     AttentionVariant,
     AttentionWithSink,
     SigmoidAttention,
+    SigmoidTanhAttention,
     ALiBiAttention,
     RPEAttention,
 )
@@ -441,6 +442,75 @@ def test_attention_prefill_sigmoid_bias(batch_size, qo_len, kv_len, bias):
 
 
 # ---------------------------------------------------------------------------
+#  4b. Logits transform (sigmoid via tanh)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("batch_size,qo_len,kv_len", FUSION_SHAPE_PARAMS)
+@pytest.mark.parametrize("causal", [False, True])
+def test_attention_prefill_sigmoid_tanh(
+    batch_size, qo_len, kv_len, causal,
+):
+    _skip_if_unsupported(qo_len, kv_len, causal)
+    num_kv_heads = 8
+
+    torch.manual_seed(42)
+    q = torch.randn(batch_size * qo_len, NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda")
+    k = torch.randn(batch_size * kv_len, num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda")
+    v = torch.randn(batch_size * kv_len, num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda")
+    qo_indptr = torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+    kv_indptr = torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * kv_len
+
+    wrapper = BatchPrefillCuteDSLWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+    )
+    wrapper.plan(
+        qo_indptr, kv_indptr, NUM_QO_HEADS, num_kv_heads, HEAD_DIM,
+        head_dim_vo=HEAD_DIM, causal=causal, sm_scale=1.0,
+        q_data_type=DTYPE, kv_data_type=DTYPE,
+        variant=SigmoidTanhAttention(scale=1.0, bias=0.0),
+    )
+    o = wrapper.run(q, k, v)
+
+    o_ref = attention_sigmoid_ref(batch_size, q, k, v, causal, 1.0, 0.0)
+
+    torch.testing.assert_close(o, o_ref, rtol=0.15, atol=0.15)
+
+
+@pytest.mark.parametrize("batch_size,qo_len,kv_len", [
+    (1, 128, 128),
+    (9, 256, 256),
+])
+@pytest.mark.parametrize("bias", [-5.0, -2.0, 1.0])
+def test_attention_prefill_sigmoid_tanh_bias(batch_size, qo_len, kv_len, bias):
+    """Regression test: SigmoidTanhAttention bias must match torch.sigmoid semantics."""
+    _skip_if_unsupported(qo_len, kv_len, causal=False)
+    num_kv_heads = 8
+    scale = 1.0
+
+    torch.manual_seed(42)
+    q = torch.randn(batch_size * qo_len, NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda")
+    k = torch.randn(batch_size * kv_len, num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda")
+    v = torch.randn(batch_size * kv_len, num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda")
+    qo_indptr = torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+    kv_indptr = torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * kv_len
+
+    wrapper = BatchPrefillCuteDSLWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+    )
+    wrapper.plan(
+        qo_indptr, kv_indptr, NUM_QO_HEADS, num_kv_heads, HEAD_DIM,
+        head_dim_vo=HEAD_DIM, causal=False, sm_scale=1.0,
+        q_data_type=DTYPE, kv_data_type=DTYPE,
+        variant=SigmoidTanhAttention(scale=scale, bias=bias),
+    )
+    o = wrapper.run(q, k, v)
+
+    o_ref = attention_sigmoid_ref(batch_size, q, k, v, False, scale, bias)
+
+    torch.testing.assert_close(o, o_ref, rtol=0.15, atol=0.15)
+
+
+# ---------------------------------------------------------------------------
 #  5. Attention sink
 # ---------------------------------------------------------------------------
 
@@ -700,6 +770,45 @@ def test_attention_prefill_varlen_logits_transform(indptr):
         head_dim_vo=HEAD_DIM, causal=False, sm_scale=1.0,
         q_data_type=DTYPE, kv_data_type=DTYPE,
         variant=SigmoidAttention(scale=1.0, bias=0.0),
+    )
+    o = wrapper.run(q, k, v)
+
+    gqa_group_ratio = NUM_QO_HEADS // num_kv_heads
+    k_repeated = torch.repeat_interleave(k, gqa_group_ratio, dim=1)
+    v_repeated = torch.repeat_interleave(v, gqa_group_ratio, dim=1)
+    o_ref = attention_varlen_sigmoid_ref(
+        q, k_repeated, v_repeated, qo_indptr, kv_indptr, False, 1.0, 0.0,
+    )
+
+    torch.testing.assert_close(o, o_ref, rtol=0.15, atol=0.15)
+
+
+# ---------------------------------------------------------------------------
+#  9b. Variable-length + logits transform (sigmoid via tanh)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("indptr", VARLEN_FUSION_INDPTRS)
+def test_attention_prefill_varlen_sigmoid_tanh(indptr):
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("SM100A is not supported on this device")
+    num_kv_heads = 8
+
+    torch.manual_seed(42)
+    q = torch.randn(indptr[-1], NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda")
+    k = torch.randn(indptr[-1], num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda")
+    v = torch.randn(indptr[-1], num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda")
+
+    qo_indptr = torch.tensor(indptr, device="cuda", dtype=torch.int32)
+    kv_indptr = qo_indptr
+
+    wrapper = BatchPrefillCuteDSLWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+    )
+    wrapper.plan(
+        qo_indptr, kv_indptr, NUM_QO_HEADS, num_kv_heads, HEAD_DIM,
+        head_dim_vo=HEAD_DIM, causal=False, sm_scale=1.0,
+        q_data_type=DTYPE, kv_data_type=DTYPE,
+        variant=SigmoidTanhAttention(scale=1.0, bias=0.0),
     )
     o = wrapper.run(q, k, v)
 

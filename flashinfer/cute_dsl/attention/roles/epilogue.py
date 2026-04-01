@@ -87,12 +87,17 @@ class EpilogueRole:
         mO_qdl: cute.Tensor,
         sO: cute.Tensor,
         cum_seqlen_q: cute.Tensor | None,
-        corr_epi_consumer: PipelineConsumer,
+        corr_epi_consumer: PipelineConsumer | None,
+        s0_epi_consumer: PipelineConsumer | None,
+        s1_epi_consumer: PipelineConsumer | None,
         tile_sched_params: FmhaStaticTileSchedulerParams,
     ):
         """Epilogue warp orchestration loop (prefill-specific).
 
         O0/O1 double-buffered TMA stores with pipeline synchronization.
+
+        Standard path: consumes from corr_epi (correction -> epilogue).
+        Transform path: consumes from s0_epi/s1_epi (softmax -> epilogue).
         """
         tile_sched = create_fmha_static_tile_scheduler(
             tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
@@ -144,19 +149,30 @@ class EpilogueRole:
                     cute.group_modes(gO, 0, 2),
                 )
 
-                # O0: wait from correction, store to GMEM
-                o0_handle_consumer = corr_epi_consumer.wait_and_advance()
-                self.store_tile(tma_atom_o, tOsO[None, 0], tOgO[None, o0_coord])
+                if cutlass.const_expr(corr_epi_consumer is not None):
+                    # Standard path: O0/O1 from correction warp
+                    o0_handle_consumer = corr_epi_consumer.wait_and_advance()
+                    self.store_tile(tma_atom_o, tOsO[None, 0], tOgO[None, o0_coord])
 
-                # O1: wait from correction, store to GMEM
-                o1_handle_consumer = corr_epi_consumer.wait_and_advance()
-                self.store_tile(tma_atom_o, tOsO[None, 1], tOgO[None, o1_coord])
+                    o1_handle_consumer = corr_epi_consumer.wait_and_advance()
+                    self.store_tile(tma_atom_o, tOsO[None, 1], tOgO[None, o1_coord])
 
-                # Wait for stores to complete before releasing pipeline
-                cute.arch.cp_async_bulk_wait_group(1, read=True)
-                o0_handle_consumer.release()
-                cute.arch.cp_async_bulk_wait_group(0, read=True)
-                o1_handle_consumer.release()
+                    cute.arch.cp_async_bulk_wait_group(1, read=True)
+                    o0_handle_consumer.release()
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+                    o1_handle_consumer.release()
+                else:
+                    # Transform path: O0 from softmax0, O1 from softmax1
+                    o0_handle_consumer = s0_epi_consumer.wait_and_advance()
+                    self.store_tile(tma_atom_o, tOsO[None, 0], tOgO[None, o0_coord])
+
+                    o1_handle_consumer = s1_epi_consumer.wait_and_advance()
+                    self.store_tile(tma_atom_o, tOsO[None, 1], tOgO[None, o1_coord])
+
+                    cute.arch.cp_async_bulk_wait_group(1, read=True)
+                    o0_handle_consumer.release()
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+                    o1_handle_consumer.release()
 
             # Advance to next tile
             tile_sched.advance_to_next_work()

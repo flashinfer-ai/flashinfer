@@ -18,6 +18,7 @@ from typing import Tuple
 import cutlass
 import cutlass.cute as cute
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
+import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.typing import Int32, Float32
 
 from cutlass.pipeline import PipelineProducer, PipelineConsumer
@@ -51,6 +52,8 @@ class SoftmaxRole:
         # From config
         self.qk_acc_dtype = config.qk_acc_dtype
         self.qk_mma_tiler = config.qk_mma_tiler
+        self.pv_mma_tiler = config.pv_mma_tiler
+        self.pv_acc_dtype = config.pv_acc_dtype
         self.cta_tiler = config.cta_tiler
         self.mask_type = config.mask_type
         self.window_left = config.window_left
@@ -66,7 +69,9 @@ class SoftmaxRole:
         self.variant = fusion.variant
         self.has_score_mod = fusion.variant.has_score_mod
         self.has_logits_transform = fusion.variant.has_logits_transform
+        self.has_vectorized_logits_transform = fusion.variant.has_vectorized_logits_transform
         self.has_statistics_update = fusion.variant.has_statistics_update
+        self.has_output_transform = fusion.variant.has_output_transform
         self.has_params = fusion.has_params
 
         # Warp config
@@ -74,14 +79,21 @@ class SoftmaxRole:
         self.softmax1_warp_ids = softmax1_warp_ids
         self.threads_per_warp = threads_per_warp
 
-        # Set later via set_dtypes()
+        # Set later via set_dtypes() / set_call_attrs()
         self.q_dtype = None
         self.o_dtype = None
+        self.o_layout = None
+        self.epi_tile = None
 
     def set_dtypes(self, q_dtype, o_dtype):
         """Set tensor-type attributes known only at call time."""
         self.q_dtype = q_dtype
         self.o_dtype = o_dtype
+
+    def set_call_attrs(self, o_layout, epi_tile):
+        """Set epilog attributes for transform path (replaces CorrectionRole)."""
+        self.o_layout = o_layout
+        self.epi_tile = epi_tile
 
     @cute.jit
     def step(
@@ -195,22 +207,22 @@ class SoftmaxRole:
                         kv_head_idx,
                     )
 
-        old_row_max = row_max
-        row_max = tTMEM_LOADrS.load().reduce(cute.ReductionOp.MAX, row_max, 0)
-        row_max_safe = row_max
+        if cutlass.const_expr(not self.has_logits_transform):
+            old_row_max = row_max
+            row_max = tTMEM_LOADrS.load().reduce(cute.ReductionOp.MAX, row_max, 0)
+            row_max_safe = row_max
 
-        if row_max == -cutlass.Float32.inf:
-            row_max_safe = 0.0
-        tTMEM_STORE_VECrS = cute.make_fragment(
-            tTMEM_STORE_VECcS.shape, self.qk_acc_dtype
-        )
+            if row_max == -cutlass.Float32.inf:
+                row_max_safe = 0.0
+            tTMEM_STORE_VECrS = cute.make_fragment(
+                tTMEM_STORE_VECcS.shape, self.qk_acc_dtype
+            )
 
-        tTMEM_STORE_VECrS[0] = old_row_max
-        tTMEM_STORE_VECrS[1] = row_max_safe
-        cute.copy(tiled_tmem_store_vec, tTMEM_STORE_VECrS, tTMEM_STORE_VECtS)
-        cute.arch.fence_view_async_tmem_store()
-        # Notify correction wg that row_max is ready
-        vec_i_handle.commit()
+            tTMEM_STORE_VECrS[0] = old_row_max
+            tTMEM_STORE_VECrS[1] = row_max_safe
+            cute.copy(tiled_tmem_store_vec, tTMEM_STORE_VECrS, tTMEM_STORE_VECtS)
+            cute.arch.fence_view_async_tmem_store()
+            vec_i_handle.commit()
 
         tTMEM_STORErS_x4 = cute.make_fragment(tTMEM_STOREcS.shape, self.qk_acc_dtype)
         tTMEM_STORErS_x4_e = cute.make_tensor(
@@ -220,82 +232,87 @@ class SoftmaxRole:
 
         scale = scale_softmax_log2
 
-        # Sequence barrier wait
-        if cutlass.const_expr(stage == 0):
-            sequence_producer_handle = s0_s1_sequence_producer.acquire_and_advance()
-        else:
-            sequence_consumer_handle = s0_s1_sequence_consumer.wait_and_advance()
+        if cutlass.const_expr(not self.has_logits_transform):
+            if cutlass.const_expr(stage == 0):
+                sequence_producer_handle = s0_s1_sequence_producer.acquire_and_advance()
+            else:
+                sequence_consumer_handle = s0_s1_sequence_consumer.wait_and_advance()
         tTMEM_STORErS_x4_e_frg = cute.logical_divide(
             tTMEM_STORErS_x4_e, cute.make_layout(frg_tile)
         )
         ### the softmax computation part ### e^(xi*scale - mi*scale)
-        if cutlass.const_expr(not self.has_logits_transform):
+        if cutlass.const_expr(self.has_vectorized_logits_transform):
+            if cutlass.const_expr(self.has_params and not self.has_score_mod):
+                self.variant.params = params
+            for j in range(frg_cnt):
+                self.variant.transform_logits_vec(tTMEM_LOADrS_frg[None, j])
+                s_vec = tTMEM_LOADrS_frg[None, j].load()
+                tTMEM_STORErS_x4_e_frg[None, j].store(s_vec.to(self.q_dtype))
+
+        elif cutlass.const_expr(self.has_logits_transform):
+            if cutlass.const_expr(self.has_params and not self.has_score_mod):
+                self.variant.params = params
+            for j in range(frg_cnt):
+                for k in range(cute.size(tTMEM_LOADrS_frg, mode=[0])):
+                    tTMEM_LOADrS_frg[k, j] = self.variant.transform_logits(
+                        tTMEM_LOADrS_frg[k, j],
+                    )
+                s_vec = tTMEM_LOADrS_frg[None, j].load()
+                tTMEM_STORErS_x4_e_frg[None, j].store(s_vec.to(self.q_dtype))
+
+        else:
             for j in range(frg_cnt):
                 exp2_scale(tTMEM_LOADrS_frg[None, j], scale, row_max_safe)
                 s_vec = tTMEM_LOADrS_frg[None, j].load()
                 tTMEM_STORErS_x4_e_frg[None, j].store(s_vec.to(self.q_dtype))
 
-        else:
-            for j in range(frg_cnt):
-                for k in range(cute.size(tTMEM_LOADrS_frg, mode=[0])):
-                    qo_idx, kv_idx = tTMEM_LOADcS_frg[k, j]
-                    tTMEM_LOADrS_frg[k, j] = self.variant.transform_logits(
-                        tTMEM_LOADrS_frg[k, j],
-                        batch_coord,
-                        qo_idx,
-                        kv_idx,
-                        qo_head_idx,
-                        kv_head_idx,
-                    )
-                s_vec = tTMEM_LOADrS_frg[None, j].load()
-                tTMEM_STORErS_x4_e_frg[None, j].store(s_vec.to(self.q_dtype))
-
-        # Sequence barrier arrive
-        if cutlass.const_expr(stage == 0):
-            sequence_producer_handle.commit()
-        else:
-            sequence_consumer_handle.release()
+        if cutlass.const_expr(not self.has_logits_transform):
+            if cutlass.const_expr(stage == 0):
+                sequence_producer_handle.commit()
+            else:
+                sequence_consumer_handle.release()
         cute.copy(tiled_tmem_store, tTMEM_STORErS_x4, tTMEM_STOREtS_x4)
         cute.arch.fence_view_async_tmem_store()
         # Notify tensor core warp that softmax(S->P) is ready
         si_handle.release()
 
-        ### di = di-1 * (e^(mi-1 - mi) * scale) + sum e^(xi*scale - mi*scale)
-        vec_i_handle = si_corr_producer.acquire_and_advance()
-        acc_scale_ = scale * (old_row_max - row_max_safe)
-        # * 0.5 compensates for initializing both packed elements with row_sum below
-        acc_scale = cute.arch.exp2(acc_scale_) * 0.5
-        row_sum *= acc_scale
-        # 4-way unrolled reduction for ILP: 4 independent accumulator chains
-        # run in parallel, then tree-reduce. local_row_sum_0 is seeded with
-        # (row_sum, row_sum) so the old running sum folds into the reduction.
-        local_row_sum_0 = (row_sum, row_sum)
-        local_row_sum_1 = (0.0, 0.0)
-        local_row_sum_2 = (0.0, 0.0)
-        local_row_sum_3 = (0.0, 0.0)
+        if cutlass.const_expr(not self.has_logits_transform):
+            vec_i_handle = si_corr_producer.acquire_and_advance()
+            ### di = di-1 * (e^(mi-1 - mi) * scale) + sum e^(xi*scale - mi*scale)
+            acc_scale_ = scale * (old_row_max - row_max_safe)
+            # * 0.5 compensates for initializing both packed elements with row_sum below
+            acc_scale = cute.arch.exp2(acc_scale_) * 0.5
+            row_sum *= acc_scale
+            # 4-way unrolled reduction for ILP: 4 independent accumulator chains
+            # run in parallel, then tree-reduce. local_row_sum_0 is seeded with
+            # (row_sum, row_sum) so the old running sum folds into the reduction.
+            local_row_sum_0 = (row_sum, row_sum)
+            local_row_sum_1 = (0.0, 0.0)
+            local_row_sum_2 = (0.0, 0.0)
+            local_row_sum_3 = (0.0, 0.0)
 
-        reduction_unroll = 4
-        frg_tile_r = cute.size(tTMEM_LOADrS) // reduction_unroll
-        tTMEM_LOADrS_frg_r = cute.logical_divide(tTMEM_LOADrS, cute.make_layout(frg_tile_r))
+            reduction_unroll = 4
+            frg_tile_r = cute.size(tTMEM_LOADrS) // reduction_unroll
+            tTMEM_LOADrS_frg_r = cute.logical_divide(tTMEM_LOADrS, cute.make_layout(frg_tile_r))
 
-        for j in cutlass.range_constexpr(0, cute.size(tTMEM_LOADrS_frg_r, mode=[0]), 2):
-            local_row_sum_0 = cute.arch.add_packed_f32x2(
-                local_row_sum_0, (tTMEM_LOADrS_frg_r[j, 0], tTMEM_LOADrS_frg_r[j + 1, 0])
-            )
-            local_row_sum_1 = cute.arch.add_packed_f32x2(
-                local_row_sum_1, (tTMEM_LOADrS_frg_r[j, 1], tTMEM_LOADrS_frg_r[j + 1, 1])
-            )
-            local_row_sum_2 = cute.arch.add_packed_f32x2(
-                local_row_sum_2, (tTMEM_LOADrS_frg_r[j, 2], tTMEM_LOADrS_frg_r[j + 1, 2])
-            )
-            local_row_sum_3 = cute.arch.add_packed_f32x2(
-                local_row_sum_3, (tTMEM_LOADrS_frg_r[j, 3], tTMEM_LOADrS_frg_r[j + 1, 3])
-            )
+            for j in cutlass.range_constexpr(0, cute.size(tTMEM_LOADrS_frg_r, mode=[0]), 2):
+                local_row_sum_0 = cute.arch.add_packed_f32x2(
+                    local_row_sum_0, (tTMEM_LOADrS_frg_r[j, 0], tTMEM_LOADrS_frg_r[j + 1, 0])
+                )
+                local_row_sum_1 = cute.arch.add_packed_f32x2(
+                    local_row_sum_1, (tTMEM_LOADrS_frg_r[j, 1], tTMEM_LOADrS_frg_r[j + 1, 1])
+                )
+                local_row_sum_2 = cute.arch.add_packed_f32x2(
+                    local_row_sum_2, (tTMEM_LOADrS_frg_r[j, 2], tTMEM_LOADrS_frg_r[j + 1, 2])
+                )
+                local_row_sum_3 = cute.arch.add_packed_f32x2(
+                    local_row_sum_3, (tTMEM_LOADrS_frg_r[j, 3], tTMEM_LOADrS_frg_r[j + 1, 3])
+                )
 
-        local_row_sum_0 = cute.arch.add_packed_f32x2(local_row_sum_0, local_row_sum_1)
-        local_row_sum_2 = cute.arch.add_packed_f32x2(local_row_sum_2, local_row_sum_3)
-        local_row_sum_0 = cute.arch.add_packed_f32x2(local_row_sum_0, local_row_sum_2)
-        row_sum = local_row_sum_0[0] + local_row_sum_0[1]
+            local_row_sum_0 = cute.arch.add_packed_f32x2(local_row_sum_0, local_row_sum_1)
+            local_row_sum_2 = cute.arch.add_packed_f32x2(local_row_sum_2, local_row_sum_3)
+            local_row_sum_0 = cute.arch.add_packed_f32x2(local_row_sum_0, local_row_sum_2)
+            row_sum = local_row_sum_0[0] + local_row_sum_0[1]
 
         return (
             row_max,
@@ -305,6 +322,89 @@ class SoftmaxRole:
             si_corr_producer,
             s0_s1_sequence_consumer,
             s0_s1_sequence_producer,
+        )
+
+    @cute.jit
+    def softmax_epilog(
+        self,
+        stage: int,
+        pv_thr_mma: cute.core.ThrMma,
+        tOtO: cute.Tensor,
+        scale: Float32,
+        sO: cute.Tensor,
+    ):
+        """Final O scaling and SMEM write (transform path only).
+
+        Mirrors CorrectionRole.epilog() but runs inside the softmax warpgroup
+        when there is no correction warp (has_logits_transform=True).
+        """
+        pv_tiled_mma_shape = (self.pv_mma_tiler[0], self.pv_mma_tiler[1])
+        cO = cute.make_identity_tensor(pv_tiled_mma_shape)
+        cO_custom = cute.make_identity_tensor(pv_tiled_mma_shape)
+
+        corr_tile_size = 32 * 8 // self.o_dtype.width
+        tOsO = pv_thr_mma.partition_C(sO)
+        tOcO = pv_thr_mma.partition_C(cO)
+        tOcO_custom = pv_thr_mma.partition_C(cO_custom)
+
+        tOtO_i = cute.logical_divide(tOtO, cute.make_layout((128, corr_tile_size)))
+        tOcO_i = cute.logical_divide(tOcO, cute.make_layout((128, corr_tile_size)))
+        tOsO_i = cute.logical_divide(tOsO, cute.make_layout((128, corr_tile_size)))
+        tOcO_custom_i = cute.logical_divide(
+            tOcO_custom, cute.make_layout((128, corr_tile_size))
+        )
+
+        tidx, _, _ = cute.arch.thread_idx()
+        num_warps = (
+            len(self.softmax0_warp_ids) if stage == 0
+            else len(self.softmax1_warp_ids)
+        )
+        thread_idx = tidx % (self.threads_per_warp * num_warps)
+
+        epi_subtile = (self.epi_tile[0], corr_tile_size)
+        tmem_copy_atom = sm100_utils.get_tmem_load_op(
+            self.pv_mma_tiler,
+            self.o_layout,
+            self.o_dtype,
+            self.pv_acc_dtype,
+            epi_subtile,
+            use_2cta_instrs=False,
+        )
+
+        tiled_tmem_load = tcgen05.make_tmem_copy(
+            tmem_copy_atom, tOtO_i[(None, None), 0]
+        )
+
+        thr_tmem_load = tiled_tmem_load.get_slice(thread_idx)
+        smem_copy_atom = sm100_utils.get_smem_store_op(
+            self.o_layout, self.o_dtype, self.pv_acc_dtype, tiled_tmem_load
+        )
+        tiled_smem_store = cute.make_tiled_copy_D(smem_copy_atom, tiled_tmem_load)
+
+        tTMEM_LOADtO = thr_tmem_load.partition_S(tOtO_i[(None, None), None])
+        tTMEM_LOADsO = thr_tmem_load.partition_D(tOsO_i[(None, None), None])
+        tTMEM_LOADoO = thr_tmem_load.partition_D(tOcO_i[(None, None), None])
+
+        for i in range(self.cta_tiler[2] // corr_tile_size):
+            tTMEM_LOADtO_i = tTMEM_LOADtO[None, 0, 0, i]
+            tTMEM_LOADsO_i = tTMEM_LOADsO[None, 0, 0, i]
+            tTMrO = cute.make_fragment(
+                tTMEM_LOADoO[None, 0, 0, i].shape, self.pv_acc_dtype
+            )
+            cute.copy(tiled_tmem_load, tTMEM_LOADtO_i, tTMrO)
+            for j in range(0, cute.size(tTMrO), 2):
+                tTMrO[j], tTMrO[j + 1] = cute.arch.mul_packed_f32x2(
+                    (tTMrO[j], tTMrO[j + 1]),
+                    (scale, scale),
+                )
+            tSMrO = cute.make_fragment(tTMrO.shape, self.o_dtype)
+            o_vec = tTMrO.load()
+            tSMrO.store(o_vec.to(self.o_dtype))
+            cute.copy(tiled_smem_store, tSMrO, tTMEM_LOADsO_i)
+
+        cute.arch.fence_proxy(
+            cute.arch.ProxyKind.async_shared,
+            space=cute.arch.SharedSpace.shared_cta,
         )
 
     # For both softmax0 and softmax1 warp group
@@ -317,12 +417,17 @@ class SoftmaxRole:
         cum_seqlen_q: cute.Tensor | None,
         cum_seqlen_k: cute.Tensor | None,
         scale_softmax_log2: Float32,
+        scale_output: Float32,
         qk_thr_mma: cute.core.ThrMma,
+        pv_thr_mma: cute.core.ThrMma | None,
         tStS: cute.Tensor,
         tStSi: cute.Tensor,
+        tOtO: cute.Tensor | None,
+        sO: cute.Tensor | None,
         params: cute.Tensor | None,
         mma_si_consumer: PipelineConsumer,
-        si_corr_producer: PipelineProducer,
+        si_corr_producer: PipelineProducer | None,
+        si_epi_producer: PipelineProducer | None,
         s0_s1_sequence_consumer: PipelineConsumer,
         s0_s1_sequence_producer: PipelineProducer,
         tile_sched_params: FmhaStaticTileSchedulerParams,
@@ -444,7 +549,9 @@ class SoftmaxRole:
                     kv_start_offset,
                 )
                 cS = cute.domain_offset(logical_offset, cS_base)
-                vec_i_handle = si_corr_producer.acquire_and_advance()
+                vec_i_handle = None
+                if cutlass.const_expr(not self.has_logits_transform):
+                    vec_i_handle = si_corr_producer.acquire_and_advance()
                 unmask_count = get_unmasked_trip_count(
                     self.mask_type, self.window_left,
                     curr_block_coord,
@@ -534,17 +641,28 @@ class SoftmaxRole:
                         params,
                     )
                 si_handle = mma_si_consumer.wait_and_advance()
-                tTMEM_STORE_VECrS = cute.make_fragment(
-                    tTMEM_STORE_VECcS.shape, self.qk_acc_dtype
-                )
-                tTMEM_STORE_VECrS[0] = row_sum
-                tTMEM_STORE_VECrS[1] = row_max
-                cute.copy(tiled_tmem_store_vec, tTMEM_STORE_VECrS, tTMEM_STORE_VECtS)
-                cute.arch.fence_view_async_tmem_store()
-                vec_i_handle.commit()
-                si_corr_producer.acquire()
-                # Empty step to sync against pipe s
-                si_handle.release()
+                if cutlass.const_expr(not self.has_logits_transform):
+                    tTMEM_STORE_VECrS = cute.make_fragment(
+                        tTMEM_STORE_VECcS.shape, self.qk_acc_dtype
+                    )
+                    tTMEM_STORE_VECrS[0] = row_sum
+                    tTMEM_STORE_VECrS[1] = row_max
+                    cute.copy(tiled_tmem_store_vec, tTMEM_STORE_VECrS, tTMEM_STORE_VECtS)
+                    cute.arch.fence_view_async_tmem_store()
+                    vec_i_handle.commit()
+                    si_corr_producer.acquire()
+                    si_handle.release()
+                else:
+                    qo_idx_offset = (
+                        curr_block_coord[0] * self.cta_tiler[0]
+                        + stage * self.qk_mma_tiler[0]
+                    )
+                    epi_handle = si_epi_producer.acquire_and_advance()
+                    self.softmax_epilog(
+                        stage, pv_thr_mma, tOtO, scale_output, sO,
+                    )
+                    epi_handle.commit()
+                    si_handle.release()
 
             # Advance to next tile
             tile_sched.advance_to_next_work()

@@ -15,8 +15,8 @@ from cutlass.cute.typing import Int32, Float32, Boolean
 
 from .config import AttentionConfig, AttentionFusion
 from .tmem_layout import TmemLayout
-from .warp_schedule import WarpSchedule, PREFILL_SCHEDULE
-from .pipeline_topology import PipelineTopology, make_prefill_topology
+from .warp_schedule import WarpSchedule, PREFILL_SCHEDULE, PREFILL_TRANSFORM_SCHEDULE
+from .pipeline_topology import PipelineTopology, make_prefill_topology, make_prefill_topology_transform
 from .mainloop_spec import MainloopSpec, make_prefill_mainloop_spec
 from .collective_builder import build_fmha_launch_params
 from .fusion.mask import (
@@ -117,8 +117,18 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         self.config = config
         self.fusion = fusion if fusion is not None else AttentionFusion()
-        self.schedule = warp_schedule if warp_schedule is not None else PREFILL_SCHEDULE
-        self.mainloop = make_prefill_mainloop_spec(config, self.schedule)
+        self.has_logits_transform = self.fusion.variant.has_logits_transform
+
+        if warp_schedule is not None:
+            self.schedule = warp_schedule
+        elif self.has_logits_transform:
+            self.schedule = PREFILL_TRANSFORM_SCHEDULE
+        else:
+            self.schedule = PREFILL_SCHEDULE
+
+        self.mainloop = make_prefill_mainloop_spec(
+            config, self.schedule, self.has_logits_transform,
+        )
         self.tmem = self.mainloop.tmem_layout
 
     @cute.jit
@@ -239,11 +249,12 @@ class BlackwellFusedMultiHeadAttentionForward:
             softmax1_warp_ids=self.schedule.softmax1_warp_ids,
             threads_per_warp=self.schedule.threads_per_warp,
         )
-        self.correction_role = CorrectionRole(
-            self.config, self.fusion, self.tmem,
-            correction_warp_ids=self.schedule.correction_warp_ids,
-            threads_per_warp=self.schedule.threads_per_warp,
-        )
+        if cutlass.const_expr(not self.has_logits_transform):
+            self.correction_role = CorrectionRole(
+                self.config, self.fusion, self.tmem,
+                correction_warp_ids=self.schedule.correction_warp_ids,
+                threads_per_warp=self.schedule.threads_per_warp,
+            )
         self.epilogue_role = EpilogueRole(self.config)
         self.loader_role = LoaderRole(self.config)
         self.mma_role = MmaRole(
@@ -251,6 +262,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             tmem_alloc_cols=self.tmem.alloc_cols,
             tmem_alloc_sync_bar_id=self.schedule.tmem_alloc_sync_bar_id,
             threads_per_warp=self.schedule.threads_per_warp,
+            has_logits_transform=self.has_logits_transform,
         )
         self.softmax_role.set_dtypes(self.q_dtype, self.o_dtype)
 
@@ -274,7 +286,10 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.tma_copy_q_bytes = lp.tma_copy_q_bytes
         self.tma_copy_kv_bytes = lp.tma_copy_kv_bytes
 
-        self.correction_role.set_call_attrs(self.o_dtype, lp.o_layout, lp.epi_tile)
+        if cutlass.const_expr(not self.has_logits_transform):
+            self.correction_role.set_call_attrs(self.o_dtype, lp.o_layout, lp.epi_tile)
+        else:
+            self.softmax_role.set_call_attrs(lp.o_layout, lp.epi_tile)
 
         self.kernel(
             lp.qk_tiled_mma,
@@ -399,12 +414,26 @@ class BlackwellFusedMultiHeadAttentionForward:
         load_kv_producer, load_kv_consumer = pipes["load_kv"]
         mma_s0_producer, mma_s0_consumer = pipes["mma_s0"]
         mma_s1_producer, mma_s1_consumer = pipes["mma_s1"]
-        s0_corr_producer, s0_corr_consumer = pipes["s0_corr"]
-        s1_corr_producer, s1_corr_consumer = pipes["s1_corr"]
-        corr_epi_producer, corr_epi_consumer = pipes["corr_epi"]
-        mma_corr_producer, mma_corr_consumer = pipes["mma_corr"]
         s0_s1_sequence_producer, s0_s1_sequence_consumer = pipes["s0_s1_sequence"]
         tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr.data_ptr()
+
+        # Standard path pipelines (correction warp)
+        s0_corr_producer = s0_corr_consumer = None
+        s1_corr_producer = s1_corr_consumer = None
+        corr_epi_producer = corr_epi_consumer = None
+        mma_corr_producer = mma_corr_consumer = None
+        if cutlass.const_expr(not self.has_logits_transform):
+            s0_corr_producer, s0_corr_consumer = pipes["s0_corr"]
+            s1_corr_producer, s1_corr_consumer = pipes["s1_corr"]
+            corr_epi_producer, corr_epi_consumer = pipes["corr_epi"]
+            mma_corr_producer, mma_corr_consumer = pipes["mma_corr"]
+
+        # Transform path pipelines (softmax -> epilogue)
+        s0_epi_producer = s0_epi_consumer = None
+        s1_epi_producer = s1_epi_consumer = None
+        if cutlass.const_expr(self.has_logits_transform):
+            s0_epi_producer, s0_epi_consumer = pipes["s0_epi"]
+            s1_epi_producer, s1_epi_consumer = pipes["s1_epi"]
 
         if warp_idx == self.schedule.empty_warp_id:
             cute.arch.mbarrier_init(
@@ -464,7 +493,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                 cum_seqlen_q, cum_seqlen_k,
                 load_q_consumer, load_kv_consumer,
                 mma_s0_producer, mma_s1_producer,
-                mma_corr_producer,
+                mma_corr_producer,  # None for transform path
                 tile_sched_params, storage, tmem_dealloc_mbar_ptr,
             )
 
@@ -476,7 +505,9 @@ class BlackwellFusedMultiHeadAttentionForward:
             self.epilogue_role.run(
                 tma_atom_o, mO_qdl, sO,
                 cum_seqlen_q,
-                corr_epi_consumer,
+                corr_epi_consumer,  # None for transform path
+                s0_epi_consumer,    # None for standard path
+                s1_epi_consumer,    # None for standard path
                 tile_sched_params,
             )
 
@@ -494,12 +525,17 @@ class BlackwellFusedMultiHeadAttentionForward:
                 cum_seqlen_q=cum_seqlen_q,
                 cum_seqlen_k=cum_seqlen_k,
                 scale_softmax_log2=scale_softmax_log2,
+                scale_output=scale_output,
                 qk_thr_mma=qk_thr_mma,
+                pv_thr_mma=pv_thr_mma,
                 tStS=tStS,
                 tStSi=tStS0,
+                tOtO=tOtO0,
+                sO=sO[None, None, 0] if self.has_logits_transform else None,
                 params=params,
                 mma_si_consumer=mma_s0_consumer,
                 si_corr_producer=s0_corr_producer,
+                si_epi_producer=s0_epi_producer,
                 s0_s1_sequence_consumer=s0_s1_sequence_consumer,
                 s0_s1_sequence_producer=s0_s1_sequence_producer,
                 tile_sched_params=tile_sched_params,
@@ -510,8 +546,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         #  Softmax1
         # ///////////////////////////////////////////////////////////////////////////////
         if (
-            warp_idx < self.schedule.correction_warp_ids[0]
-            and warp_idx >= self.schedule.softmax1_warp_ids[0]
+            warp_idx >= self.schedule.softmax1_warp_ids[0]
+            and warp_idx < self.schedule.softmax1_upper_warp_id
         ):
             # increase register after decreasing
             cute.arch.warpgroup_reg_alloc(self.schedule.num_regs_softmax)
@@ -523,12 +559,17 @@ class BlackwellFusedMultiHeadAttentionForward:
                 cum_seqlen_q=cum_seqlen_q,
                 cum_seqlen_k=cum_seqlen_k,
                 scale_softmax_log2=scale_softmax_log2,
+                scale_output=scale_output,
                 qk_thr_mma=qk_thr_mma,
+                pv_thr_mma=pv_thr_mma,
                 tStS=tStS,
                 tStSi=tStS1,
+                tOtO=tOtO1,
+                sO=sO[None, None, 1] if self.has_logits_transform else None,
                 params=params,
                 mma_si_consumer=mma_s1_consumer,
                 si_corr_producer=s1_corr_producer,
+                si_epi_producer=s1_epi_producer,
                 s0_s1_sequence_consumer=s0_s1_sequence_consumer,
                 s0_s1_sequence_producer=s0_s1_sequence_producer,
                 tile_sched_params=tile_sched_params,
@@ -538,18 +579,19 @@ class BlackwellFusedMultiHeadAttentionForward:
         # ///////////////////////////////////////////////////////////////////////////////
         #  Correction
         # ///////////////////////////////////////////////////////////////////////////////
-        if warp_idx >= self.schedule.correction_warp_ids[0] and warp_idx < self.schedule.mma_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.schedule.num_regs_correction)
-            self.correction_role.run(
-                qk_thr_mma, pv_thr_mma,
-                tStS, tOtO0, tOtO1, sO,
-                mQ_qdl.shape[0], mK_kdl.shape[0],
-                cum_seqlen_q, cum_seqlen_k,
-                scale_softmax_log2, scale_output,
-                s0_corr_consumer, s1_corr_consumer,
-                mma_corr_consumer, corr_epi_producer,
-                tile_sched_params, tmem_dealloc_mbar_ptr,
-            )
+        if cutlass.const_expr(not self.has_logits_transform):
+            if warp_idx >= self.schedule.softmax1_upper_warp_id and warp_idx < self.schedule.mma_warp_id:
+                cute.arch.warpgroup_reg_dealloc(self.schedule.num_regs_correction)
+                self.correction_role.run(
+                    qk_thr_mma, pv_thr_mma,
+                    tStS, tOtO0, tOtO1, sO,
+                    mQ_qdl.shape[0], mK_kdl.shape[0],
+                    cum_seqlen_q, cum_seqlen_k,
+                    scale_softmax_log2, scale_output,
+                    s0_corr_consumer, s1_corr_consumer,
+                    mma_corr_consumer, corr_epi_producer,
+                    tile_sched_params, tmem_dealloc_mbar_ptr,
+                )
         return
 
     @staticmethod

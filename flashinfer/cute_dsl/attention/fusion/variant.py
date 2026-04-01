@@ -21,32 +21,38 @@ For each query row, the kernel iterates over KV tiles. Within each tile:
 
   3. ``score_mod(score, batch, qo, kv, qo_head, kv_head)`` — optional
      element-wise modification of QK scores (e.g. ALiBi bias, soft-capping,
-     relative positional encoding).  Runs *before* row-max and softmax.
-     **Composes with** standard softmax — the modified scores feed into the
-     normal exp2 path.
+     relative positional encoding).  Runs *before* the score-to-weight
+     conversion. **Composes with both** standard softmax and custom
+     ``transform_logits``.
 
-  4. Row-max reduction: ``m = max(m, max(scores))``.
-
-  5. Score-to-weight conversion:
+  4. Score-to-weight conversion:
      - Default (``has_logits_transform = False``):
-       ``weights = exp2(score * scale - m * scale)``
+       Row-max reduction, then ``weights = exp2(score * scale - m * scale)``,
+       row-sum accumulation, correction warp rescaling.
      - Custom (``has_logits_transform = True``):
-       ``weights = transform_logits(score, batch, qo, kv, qo_head, kv_head)``
-       Your transform **replaces** the entire exp2 computation.
-
-  6. Row-sum accumulation: ``d += sum(weights)``.
-
-  7. Correction warp: rescale partial output by ``exp2((old_m - new_m) * scale)``.
-     **Skipped** when ``has_logits_transform = True`` (the transform is assumed
-     to handle its own normalization).
+       ``weights = transform_logits(score)``
+       Your transform **replaces** the entire softmax machinery (row-max,
+       exp2, row-sum, correction).  Must produce non-negative values.
 
 After all KV tiles (final epilogue):
 
-  8. Output normalization:
+  5. Output normalization:
      - Default (``has_output_transform = False``):
        ``output *= scale_output / d``
      - Custom (``has_output_transform = True``):
        ``output = transform_output(output, batch, qo, qo_head, m, rcp_d, scale)``
+
+Composability
+=============
+
+``score_mod`` and ``transform_logits`` are **composable**:
+
+- ``score_mod`` modifies scores (position-dependent bias, capping, etc.)
+- ``transform_logits`` replaces the activation function (sigmoid, relu, etc.)
+
+When both are set, scores flow through ``score_mod`` first, then
+``transform_logits``.  When only ``score_mod`` is set, scores flow into
+the standard softmax (exp2) path.
 
 Variable Domains
 ================
@@ -73,10 +79,6 @@ Variable Domains
 
 Coupling Rules
 ==============
-
-- ``score_mod`` and ``transform_logits`` are **mutually exclusive**.
-  ``score_mod`` adds a bias/transform *before* standard softmax;
-  ``transform_logits`` *replaces* softmax entirely.
 
 - If ``update_statistics`` modifies ``d`` (adds virtual tokens), then
   ``transform_output`` **must** account for the modified denominator.
@@ -111,8 +113,45 @@ variant accesses it as ``self.params`` inside ``@cute.jit`` methods.
 Compile-time scalars (set in ``__init__``, e.g. ``self.cap = 50.0``)
 are traced directly by the JIT compiler — no ``extra_params`` needed.
 
+Hardware Primitives
+===================
+
+The following hardware-mapped primitives are available for use in
+``transform_logits`` and ``score_mod``::
+
+    cute.arch.exp2(x)       # MUFU.EX2  — base-2 exponential (approx)
+    cute.arch.rcp_approx(x) # MUFU.RCP  — reciprocal (approx)
+    tanh_approx(x)          # MUFU.TANH — hyperbolic tangent (approx)
+
+Each maps to a single-cycle MUFU instruction. Import ``tanh_approx``
+from this module.
+
 Examples
 ========
+
+Sigmoid attention (exp2 + rcp, 2 MUFU ops/element)::
+
+    class SigmoidAttention(AttentionVariant):
+        has_logits_transform = True
+        def __init__(self, scale=1.0, bias=0.0):
+            self.scale = scale * math.log2(math.exp(1.0))
+            self.bias = bias * math.log2(math.exp(1.0))
+        @cute.jit
+        def transform_logits(self, score):
+            return cute.arch.rcp_approx(
+                1 + cute.arch.exp2(-(score * self.scale + self.bias)))
+
+Sigmoid attention via tanh (1 MUFU op/element)::
+
+    class SigmoidTanhAttention(AttentionVariant):
+        has_logits_transform = True
+        def __init__(self, scale=1.0, bias=0.0):
+            self.half_scale = scale / 2.0
+            self.half_bias = bias / 2.0
+        @cute.jit
+        def transform_logits(self, score):
+            return 0.5 + 0.5 * tanh_approx(
+                score * self.half_scale + self.half_bias)
 
 ALiBi (score_mod with 1-D per-head slopes)::
 
@@ -128,36 +167,6 @@ ALiBi (score_mod with 1-D per-head slopes)::
                       qo_head_idx, kv_head_idx):
             return score + self.params[qo_head_idx] * (kv_idx - qo_idx)
 
-Attention sink (update_statistics + transform_output)::
-
-    class AttentionWithSink(AttentionVariant):
-        has_statistics_update = True
-        has_output_transform = True
-        def __init__(self, sink):
-            self._sink = sink
-        @property
-        def extra_params(self):
-            return self._sink                        # (H,)
-        @cute.jit
-        def update_statistics(self, kv_tile_idx, qo_head_idx, m, d, scale):
-            sink_val = self.params[qo_head_idx]
-            ...
-
-RPE (score_mod with 2-D per-head lookup table)::
-
-    class RPEAttention(AttentionVariant):
-        has_score_mod = True
-        def __init__(self, rpe_table, max_rel_dist):
-            self._rpe = rpe_table
-            self._offset = max_rel_dist
-        @property
-        def extra_params(self):
-            return self._rpe                         # (H, 2W+1)
-        @cute.jit
-        def score_mod(self, score, batch_idx, qo_idx, kv_idx,
-                      qo_head_idx, kv_head_idx):
-            return score + self.params[qo_head_idx, kv_idx - qo_idx + self._offset]
-
 Soft-capping (compile-time scalars only, no extra_params)::
 
     class SoftCappingAttention(AttentionVariant):
@@ -167,12 +176,32 @@ Soft-capping (compile-time scalars only, no extra_params)::
             self.rcp_cap = 1.0 / cap
         @cute.jit
         def score_mod(self, score, ...):
-            return self.cap * cute.arch.tanh(score * self.rcp_cap)
+            return self.cap * tanh_approx(score * self.rcp_cap)
 """
 
 import math
 
+import cutlass
 import cutlass.cute as cute
+from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass._mlir.dialects import llvm
+from cutlass.cute.typing import Float32
+
+
+@dsl_user_op
+def tanh_approx(a, *, loc=None, ip=None):
+    """Hardware tanh via MUFU.TANH — single-cycle approximation (SM75+)."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip)],
+            "tanh.approx.f32 $0, $1;",
+            "=f,f",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
 
 
 class AttentionVariant:
@@ -185,11 +214,17 @@ class AttentionVariant:
     Attributes
     ----------
     has_score_mod : bool
-        ``True`` when ``score_mod`` is overridden. Mutually exclusive with
-        ``has_logits_transform``.
+        ``True`` when ``score_mod`` is overridden.  Composes with both
+        standard softmax and custom ``transform_logits``.
     has_logits_transform : bool
-        ``True`` when ``transform_logits`` is overridden. Mutually exclusive
-        with ``has_score_mod``.
+        ``True`` when ``transform_logits`` is overridden.  Replaces the
+        entire softmax machinery (row-max, exp2, row-sum, correction).
+    has_vectorized_logits_transform : bool
+        ``True`` when ``transform_logits_vec`` is overridden.  Implies
+        ``has_logits_transform = True``.  The kernel calls
+        ``transform_logits_vec`` instead of the per-element
+        ``transform_logits``, enabling stride-2 iteration and packed
+        f32x2 operations for higher throughput.
     has_statistics_update : bool
         ``True`` when ``update_statistics`` is overridden.
     has_output_transform : bool
@@ -198,17 +233,9 @@ class AttentionVariant:
 
     has_score_mod: bool = False
     has_logits_transform: bool = False
+    has_vectorized_logits_transform: bool = False
     has_statistics_update: bool = False
     has_output_transform: bool = False
-
-    def __init_subclass__(cls, **kwargs):
-        super().__init_subclass__(**kwargs)
-        if cls.has_score_mod and cls.has_logits_transform:
-            raise TypeError(
-                f"{cls.__name__} sets both has_score_mod and has_logits_transform. "
-                "These are mutually exclusive: score_mod composes with standard "
-                "softmax, while transform_logits replaces it entirely."
-            )
 
     @property
     def extra_params(self):
@@ -225,11 +252,11 @@ class AttentionVariant:
     @cute.jit
     def score_mod(self, score, batch_idx, qo_idx, kv_idx,
                   qo_head_idx, kv_head_idx):
-        """Element-wise modification of QK scores before softmax.
+        """Element-wise modification of QK scores.
 
-        Unlike ``transform_logits``, this **composes with** the standard
-        softmax path.  The modified score feeds into the normal
-        ``exp2(score * scale - m * scale)`` computation.
+        Composes with both standard softmax and custom ``transform_logits``.
+        The modified score feeds into whichever score-to-weight conversion
+        is active.
 
         Typical uses: ALiBi bias, relative positional encoding, soft-capping.
 
@@ -243,27 +270,26 @@ class AttentionVariant:
         Returns
         -------
         float32
-            Modified score (will flow into standard exp2 softmax).
+            Modified score.
         """
         return score
 
     @cute.jit
-    def transform_logits(self, score, batch_idx, qo_idx, kv_idx,
-                         qo_head_idx, kv_head_idx):
-        """Element-wise transform on raw QK dot-product scores.
+    def transform_logits(self, score):
+        """Coordinate-free activation replacing softmax.
 
         When overridden (with ``has_logits_transform = True``), this replaces
-        the standard ``exp2(score * scale - max * scale)`` computation. Your
-        function **is** the complete score-to-weight conversion.
+        the standard ``exp2(score * scale - max * scale)`` computation and
+        the entire online softmax machinery (row-max, row-sum, correction).
 
-        Mutually exclusive with ``score_mod``.
+        The kernel calls this in a tight loop over register elements without
+        coordinate lookups.  Position-dependent modifications belong in
+        ``score_mod``, which runs before this and composes naturally.
 
         Parameters
         ----------
         score : float32
-            Raw QK dot product for one (query, key) pair.
-        batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx : int32
-            Position and head indices.
+            QK dot product (possibly modified by ``score_mod``).
 
         Returns
         -------
@@ -271,6 +297,33 @@ class AttentionVariant:
             Transformed score (must be non-negative for correct accumulation).
         """
         return score
+
+    @cute.jit
+    def transform_logits_vec(self, scores):
+        """Vectorized logits transform over a register fragment.
+
+        Optional performance override.  When provided (with
+        ``has_vectorized_logits_transform = True``), the kernel calls this
+        instead of the per-element ``transform_logits``, enabling stride-2
+        iteration and packed f32x2 operations.
+
+        Like ``transform_logits``, this is coordinate-free: the fragment
+        contains raw scores (possibly already modified by ``score_mod``).
+
+        **Why this exists:** The CuTe DSL compiler (as of v4.3.5) does not
+        auto-pack adjacent scalar ``fma.rn.f32`` instructions into
+        ``fma.rz.ftz.f32x2`` packed ALU ops.  This override lets you
+        explicitly use ``cute.arch.fma_packed_f32x2`` for ~2x ALU
+        throughput on the arithmetic surrounding MUFU calls.  Once the
+        compiler learns to pack scalar FMAs automatically, this override
+        will become unnecessary and can be deprecated.
+
+        Parameters
+        ----------
+        scores : cute.Tensor (register fragment)
+            Mutable fragment of scores. Modify elements in-place.
+        """
+        pass
 
     @cute.jit
     def update_statistics(self, kv_tile_idx, qo_head_idx, m, d, scale):
@@ -386,8 +439,12 @@ class AttentionWithSink(AttentionVariant):
 class SigmoidAttention(AttentionVariant):
     """Sigmoid logits transform — replaces softmax with element-wise sigmoid.
 
-    Useful for quiet-attention / sigmoid-attention variants where each
-    position attends independently rather than competing via softmax.
+    Uses ``rcp_approx(1 + exp2(-x))`` (2 MUFU ops per element).
+    For a faster variant using tanh (1 MUFU op), see ``SigmoidTanhAttention``.
+
+    Composes with ``score_mod`` — set both ``has_score_mod`` and
+    ``has_logits_transform`` on a subclass to combine position-dependent
+    score modification with sigmoid activation.
 
     Parameters
     ----------
@@ -403,17 +460,75 @@ class SigmoidAttention(AttentionVariant):
     """
 
     has_logits_transform = True
+    has_vectorized_logits_transform = True
 
     def __init__(self, scale: float = 1.0, bias: float = 0.0):
         self.scale = scale * math.log2(math.exp(1.0))
         self.bias = bias * math.log2(math.exp(1.0))
 
     @cute.jit
-    def transform_logits(self, x, batch_idx, qo_idx, kv_idx,
-                         qo_head_idx, kv_head_idx):
+    def transform_logits(self, score):
         return cute.arch.rcp_approx(
-            1 + cute.arch.exp2(-(x * self.scale + self.bias))
+            1 + cute.arch.exp2(-(score * self.scale + self.bias))
         )
+
+    @cute.jit
+    def transform_logits_vec(self, scores):
+        for i in cutlass.range_constexpr(0, cute.size(scores), 2):
+            scores[i] = cute.arch.rcp_approx(
+                1 + cute.arch.exp2(-(scores[i] * self.scale + self.bias))
+            )
+            scores[i + 1] = cute.arch.rcp_approx(
+                1 + cute.arch.exp2(-(scores[i + 1] * self.scale + self.bias))
+            )
+
+
+class SigmoidTanhAttention(AttentionVariant):
+    """Sigmoid via tanh — MUFU-efficient sigmoid that replaces softmax.
+
+    Uses the identity ``sigmoid(x) = 0.5 + 0.5 * tanh(x / 2)`` to replace
+    the exp2 + rcp_approx pair (2 MUFU ops/element) with a single tanh_approx
+    (1 MUFU op/element), matching softmax's MUFU budget.
+
+    Parameters
+    ----------
+    scale : float
+        Multiplicative scale applied to QK scores before sigmoid.
+        Typically ``1.0`` (or ``sm_scale`` if you want to bake it in).
+    bias : float
+        Additive bias applied to scaled scores before sigmoid.
+
+    Usage::
+
+        wrapper.plan(..., sm_scale=1.0, variant=SigmoidTanhAttention(scale=1.0))
+    """
+
+    has_logits_transform = True
+    has_vectorized_logits_transform = True
+
+    def __init__(self, scale: float = 1.0, bias: float = 0.0):
+        self.half_scale = scale / 2.0
+        self.half_bias = bias / 2.0
+
+    @cute.jit
+    def transform_logits(self, score):
+        return 0.5 + 0.5 * tanh_approx(score * self.half_scale + self.half_bias)
+
+    @cute.jit
+    def transform_logits_vec(self, scores):
+        for i in cutlass.range_constexpr(0, cute.size(scores), 2):
+            scores[i], scores[i + 1] = cute.arch.fma_packed_f32x2(
+                (scores[i], scores[i + 1]),
+                (self.half_scale, self.half_scale),
+                (self.half_bias, self.half_bias),
+            )
+            scores[i] = tanh_approx(scores[i])
+            scores[i + 1] = tanh_approx(scores[i + 1])
+            scores[i], scores[i + 1] = cute.arch.fma_packed_f32x2(
+                (scores[i], scores[i + 1]),
+                (0.5, 0.5),
+                (0.5, 0.5),
+            )
 
 
 class ALiBiAttention(AttentionVariant):
@@ -551,4 +666,4 @@ class SoftCappingAttention(AttentionVariant):
     @cute.jit
     def score_mod(self, score, batch_idx, qo_idx, kv_idx,
                   qo_head_idx, kv_head_idx):
-        return self.cap * cute.arch.tanh(score * self.rcp_cap)
+        return self.cap * tanh_approx(score * self.rcp_cap)

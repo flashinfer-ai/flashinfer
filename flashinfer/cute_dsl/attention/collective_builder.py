@@ -134,17 +134,24 @@ def build_fmha_launch_params(
     align = mainloop.buffer_align_bytes
     sched = mainloop.warp_schedule
 
+    # Minimize barrier storage for unused paths
+    s0_corr_stages = mainloop.softmax_corr_stage if not mainloop.has_logits_transform else 1
+    mma_corr_stages = mainloop.mma_corr_stage if not mainloop.has_logits_transform else 1
+    s0_epi_stages = mainloop.epi_stage if mainloop.has_logits_transform else 1
+
     @cute.struct
     class SharedStorage:
         load_q_mbar_ptr: cute.struct.MemRange[Int64, mainloop.q_stages * 2]
         load_kv_mbar_ptr: cute.struct.MemRange[Int64, mainloop.kv_stages * 2]
         mma_s0_mbar_ptr: cute.struct.MemRange[Int64, mainloop.mma_softmax_stage * 2]
         mma_s1_mbar_ptr: cute.struct.MemRange[Int64, mainloop.mma_softmax_stage * 2]
-        s0_corr_mbar_ptr: cute.struct.MemRange[Int64, mainloop.softmax_corr_stage * 2]
-        s1_corr_mbar_ptr: cute.struct.MemRange[Int64, mainloop.softmax_corr_stage * 2]
+        s0_corr_mbar_ptr: cute.struct.MemRange[Int64, s0_corr_stages * 2]
+        s1_corr_mbar_ptr: cute.struct.MemRange[Int64, s0_corr_stages * 2]
         s0_s1_sequence_mbar_ptr: cute.struct.MemRange[Int64, sched.softmax_warpgroup_count]
         corr_epi_mbar_ptr: cute.struct.MemRange[Int64, mainloop.epi_stage * 2]
-        mma_corr_mbar_ptr: cute.struct.MemRange[Int64, mainloop.mma_corr_stage * 2]
+        mma_corr_mbar_ptr: cute.struct.MemRange[Int64, mma_corr_stages * 2]
+        s0_epi_mbar_ptr: cute.struct.MemRange[Int64, s0_epi_stages * 2]
+        s1_epi_mbar_ptr: cute.struct.MemRange[Int64, s0_epi_stages * 2]
         tmem_dealloc_mbar_ptr: cute.struct.MemRange[Int64, 1]
         tmem_holding_buf: cutlass.Int32
         sO: cute.struct.Align[

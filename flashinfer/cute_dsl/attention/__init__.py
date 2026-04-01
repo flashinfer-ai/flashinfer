@@ -27,10 +27,12 @@ from .mainloop_spec import (
 )
 from .fusion.mask import MaskType
 from .fusion.variant import (
+    tanh_approx,
     AttentionVariant,
     StandardAttention,
     AttentionWithSink,
     SigmoidAttention,
+    SigmoidTanhAttention,
     ALiBiAttention,
     RPEAttention,
     SoftCappingAttention,

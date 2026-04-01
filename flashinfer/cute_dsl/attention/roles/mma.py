@@ -36,13 +36,15 @@ class MmaRole:
     """
 
     def __init__(self, config: AttentionConfig, tmem_alloc_cols,
-                 tmem_alloc_sync_bar_id, threads_per_warp):
+                 tmem_alloc_sync_bar_id, threads_per_warp,
+                 has_logits_transform: bool = False):
         self.cta_tiler = config.cta_tiler
         self.mask_type = config.mask_type
         self.window_left = config.window_left
         self.tmem_alloc_cols = tmem_alloc_cols
         self.tmem_alloc_sync_bar_id = tmem_alloc_sync_bar_id
         self.threads_per_warp = threads_per_warp
+        self.has_logits_transform = has_logits_transform
 
     # =========================================================================
     #  Reusable primitives — no pipeline awareness, for composing new kernels
@@ -141,7 +143,7 @@ class MmaRole:
         load_kv_consumer: PipelineConsumer,
         mma_s0_producer: PipelineProducer,
         mma_s1_producer: PipelineProducer,
-        mma_corr_producer: PipelineProducer,
+        mma_corr_producer: PipelineProducer | None,
         tile_sched_params: FmhaStaticTileSchedulerParams,
         storage: cute.Tensor,
         tmem_dealloc_mbar_ptr: Int32,
@@ -149,6 +151,10 @@ class MmaRole:
         """MMA warp orchestration loop (prefill-specific).
 
         Double-buffered interleaved QK/PV GEMMs with pipeline synchronization.
+
+        For has_logits_transform variants, mma_corr_producer is None. PV GEMM
+        results piggyback on subsequent QK tcgen05.commit() calls to mma_s0/s1,
+        which makes all prior TMEM writes visible to softmax warps.
         """
         # Alloc tmem buffer
         self.alloc_tmem(storage)
@@ -199,10 +205,12 @@ class MmaRole:
                 # GEMM_PV00 (P0 * V0 -> O0_partial)
                 v_handle_consumer = load_kv_consumer.wait_and_advance()
                 tOrVi = tOrV[None, None, None, v_handle_consumer.index]
-                o0_handle_producer = mma_corr_producer.acquire_and_advance()
+                if cutlass.const_expr(not self.has_logits_transform):
+                    o0_handle_producer = mma_corr_producer.acquire_and_advance()
                 s0_handle_producer = mma_s0_producer.acquire_and_advance()
                 self.gemm_pv(pv_tiled_mma, tOtO0, tOrP0, tOrVi, False)
-                o0_handle_producer.commit()
+                if cutlass.const_expr(not self.has_logits_transform):
+                    o0_handle_producer.commit()
 
                 seqlen_kv_loop_steps = (
                     get_trip_count(self.mask_type, self.window_left, curr_block_coord, self.cta_tiler, seqlen_k, seqlen_q_)
@@ -218,11 +226,13 @@ class MmaRole:
                     s0_handle_producer.commit()
 
                     # GEMM_PV1(i-1)
-                    o1_handle_producer = mma_corr_producer.acquire_and_advance()
+                    if cutlass.const_expr(not self.has_logits_transform):
+                        o1_handle_producer = mma_corr_producer.acquire_and_advance()
                     s1_handle_producer = mma_s1_producer.acquire_and_advance()
                     self.gemm_pv(pv_tiled_mma, tOtO1, tOrP1, tOrVi, pv_whether_acc)
                     pv_whether_acc = True
-                    o1_handle_producer.commit()
+                    if cutlass.const_expr(not self.has_logits_transform):
+                        o1_handle_producer.commit()
                     v_handle_consumer.release()
 
                     # GEMM_QK1i
@@ -233,20 +243,24 @@ class MmaRole:
                     # GEMM_PV0i
                     v_handle_consumer = load_kv_consumer.wait_and_advance()
                     tOrVi = tOrV[None, None, None, v_handle_consumer.index]
-                    o0_handle_producer = mma_corr_producer.acquire_and_advance()
+                    if cutlass.const_expr(not self.has_logits_transform):
+                        o0_handle_producer = mma_corr_producer.acquire_and_advance()
                     s0_handle_producer = mma_s0_producer.acquire_and_advance()
                     self.gemm_pv(pv_tiled_mma, tOtO0, tOrP0, tOrVi, True)
-                    o0_handle_producer.commit()
+                    if cutlass.const_expr(not self.has_logits_transform):
+                        o0_handle_producer.commit()
 
                 # release Q0 & Q1
                 q0_handle_consumer.release()
                 q1_handle_consumer.release()
 
                 # GEMM_PV1(end)
-                o1_handle = mma_corr_producer.acquire_and_advance()
+                if cutlass.const_expr(not self.has_logits_transform):
+                    o1_handle = mma_corr_producer.acquire_and_advance()
                 s1_handle_producer = mma_s1_producer.acquire_and_advance()
                 self.gemm_pv(pv_tiled_mma, tOtO1, tOrP1, tOrVi, pv_whether_acc)
-                o1_handle.commit()
+                if cutlass.const_expr(not self.has_logits_transform):
+                    o1_handle.commit()
                 v_handle_consumer.release()
 
                 s0_handle_producer.commit()

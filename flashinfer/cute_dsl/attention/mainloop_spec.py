@@ -19,7 +19,7 @@ from typing import Dict
 from .config import AttentionConfig
 from .tmem_layout import TmemLayout
 from .warp_schedule import WarpSchedule, PREFILL_SCHEDULE
-from .pipeline_topology import PipelineTopology, make_prefill_topology
+from .pipeline_topology import PipelineTopology, make_prefill_topology, make_prefill_topology_transform
 
 
 @dataclass
@@ -38,6 +38,8 @@ class MainloopSpec:
     warp_schedule: WarpSchedule
     tmem_layout: TmemLayout
     pipeline_topology: PipelineTopology
+
+    has_logits_transform: bool = False
 
     q_stages: int = 2
     kv_stages: int = 3
@@ -58,15 +60,24 @@ class MainloopSpec:
         :returns: A new MainloopSpec with resolved kv_stages and pipeline_topology.
         """
         kv_stages = 4 if dtype_width == 8 else 3
-        topology = make_prefill_topology(
-            self.warp_schedule,
-            q_stages=self.q_stages,
-            kv_stages=kv_stages,
-            mma_softmax_stages=self.mma_softmax_stage,
-            softmax_corr_stages=self.softmax_corr_stage,
-            mma_corr_stages=self.mma_corr_stage,
-            epi_stages=self.epi_stage,
-        )
+        if self.has_logits_transform:
+            topology = make_prefill_topology_transform(
+                self.warp_schedule,
+                q_stages=self.q_stages,
+                kv_stages=kv_stages,
+                mma_softmax_stages=self.mma_softmax_stage,
+                epi_stages=self.epi_stage,
+            )
+        else:
+            topology = make_prefill_topology(
+                self.warp_schedule,
+                q_stages=self.q_stages,
+                kv_stages=kv_stages,
+                mma_softmax_stages=self.mma_softmax_stage,
+                softmax_corr_stages=self.softmax_corr_stage,
+                mma_corr_stages=self.mma_corr_stage,
+                epi_stages=self.epi_stage,
+            )
         return replace(self, kv_stages=kv_stages, pipeline_topology=topology)
 
     def barrier_stage_counts(self) -> Dict[str, int]:
@@ -83,19 +94,25 @@ class MainloopSpec:
 def make_prefill_mainloop_spec(
     config: AttentionConfig,
     warp_schedule: WarpSchedule | None = None,
+    has_logits_transform: bool = False,
 ) -> MainloopSpec:
     """Create a MainloopSpec for FMHA prefill.
 
     :param config: Core attention configuration.
     :param warp_schedule: Optional warp schedule override (defaults to PREFILL_SCHEDULE).
+    :param has_logits_transform: If True, uses transform topology (no correction warp).
     """
     sched = warp_schedule if warp_schedule is not None else PREFILL_SCHEDULE
     tmem = TmemLayout.from_config(config)
-    topo = make_prefill_topology(sched)
+    if has_logits_transform:
+        topo = make_prefill_topology_transform(sched)
+    else:
+        topo = make_prefill_topology(sched)
 
     return MainloopSpec(
         config=config,
         warp_schedule=sched,
         tmem_layout=tmem,
         pipeline_topology=topo,
+        has_logits_transform=has_logits_transform,
     )

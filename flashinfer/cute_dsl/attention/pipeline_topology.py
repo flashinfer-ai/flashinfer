@@ -202,3 +202,51 @@ def make_prefill_topology(
         PipelineEdge("s0_s1_sequence", PipelineType.ASYNC, stages=1,
                      producer_warp_ids=s0, consumer_warp_ids=s1),
     ])
+
+
+def make_prefill_topology_transform(
+    schedule: WarpSchedule,
+    q_stages: int = 2,
+    kv_stages: int = 3,
+    mma_softmax_stages: int = 1,
+    epi_stages: int = 2,
+) -> PipelineTopology:
+    """Build the pipeline topology for FMHA prefill with logits_transform variants.
+
+    No correction warp: softmax warps perform the epilog (TMEM->scale->SMEM)
+    after their KV loop, then signal the epilogue warp directly.
+
+    7 pipelines connecting 5 warp roles::
+
+        Load --[load_q]--> MMA --[mma_s0]--> Softmax0 --[s0_epi]--> Epilogue
+              --[load_kv]->     --[mma_s1]--> Softmax1 --[s1_epi]-->
+                                Softmax0 --[s0_s1_seq]--> Softmax1
+
+    :param schedule: Warp schedule defining warp role assignments.
+    :param kv_stages: Stage count for KV pipeline (3 for fp16/bf16, 4 for fp8).
+    """
+    s = schedule
+    load = (s.load_warp_id,)
+    mma = (s.mma_warp_id,)
+    s0 = s.softmax0_warp_ids
+    s1 = s.softmax1_warp_ids
+    epi = (s.epilogue_warp_id,)
+
+    return PipelineTopology(edges=[
+        PipelineEdge("load_q", PipelineType.TMA_UMMA, stages=q_stages,
+                     producer_warp_ids=load, consumer_warp_ids=mma,
+                     tx_count_key="q"),
+        PipelineEdge("load_kv", PipelineType.TMA_UMMA, stages=kv_stages,
+                     producer_warp_ids=load, consumer_warp_ids=mma,
+                     tx_count_key="kv"),
+        PipelineEdge("mma_s0", PipelineType.UMMA_ASYNC, stages=mma_softmax_stages,
+                     producer_warp_ids=mma, consumer_warp_ids=s0),
+        PipelineEdge("mma_s1", PipelineType.UMMA_ASYNC, stages=mma_softmax_stages,
+                     producer_warp_ids=mma, consumer_warp_ids=s1),
+        PipelineEdge("s0_epi", PipelineType.ASYNC, stages=epi_stages,
+                     producer_warp_ids=s0, consumer_warp_ids=epi),
+        PipelineEdge("s1_epi", PipelineType.ASYNC, stages=epi_stages,
+                     producer_warp_ids=s1, consumer_warp_ids=epi),
+        PipelineEdge("s0_s1_sequence", PipelineType.ASYNC, stages=1,
+                     producer_warp_ids=s0, consumer_warp_ids=s1),
+    ])
