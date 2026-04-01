@@ -51,6 +51,7 @@ def gen_nvshmem_module() -> JitSpec:
         "nvshmem",
         [jit_env.FLASHINFER_CSRC_DIR / "nvshmem_binding.cu"],
         extra_include_paths=[str(p) for p in jit_env.get_nvshmem_include_dirs()],
+        extra_cuda_cflags=["-rdc=true"],
         extra_ldflags=ldflags,
         needs_device_linking=True,
     )
