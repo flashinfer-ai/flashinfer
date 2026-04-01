@@ -844,7 +844,7 @@ class MoEInputs:
         "hidden_states_scale",
     )
 
-    # Index of the dynamic dimension (num_tokens axis) for each field.
+    # Index of the dynamic dimension for each field.
     # hidden_states_scale is excluded: its layout differs by op (fp8 DeepSeekFp8
     # uses [hidden_size//128, num_tokens] while fp4/MxFp8 uses [num_tokens, ...]),
     # so _make_tuning_config infers it from the actual tensor at runtime.
@@ -913,11 +913,8 @@ def get_trtllm_moe_sm100_module():
         ) -> TuningConfig:
             """Build a TuningConfig for this runner instance.
 
-            Only fields that are non-None in moe_inputs are included in the
-            DynamicTensorSpec, so the autotuner synthesizes them at each bucket size.
-
             Args:
-                moe_inputs: The actual inputs for this invocation; None fields are excluded.
+                moe_inputs: Input parameters for this call.
                 tune_max_num_tokens: Upper bound for the num_tokens tuning buckets.
                 **kwargs: Extra TuningConfig kwargs (e.g. use_cold_l2_cache).
             """
@@ -1302,8 +1299,9 @@ def get_trtllm_moe_sm100_module():
                 0, dtype=routing_logits.dtype, device=hidden_states.device
             )
         else:
-            # Pre-computed routing: topk_ids contains packed expert IDs, expert_weights
-            # may be provided separately or left empty (packed format encodes both).
+            # When routing_logits is provided, we either have topk_ids/expert_weights,
+            # packed into a single tensor as topk_id
+            # or have them individually as topk_ids and expert_weights respectively
             topk_ids = topk_ids
             expert_weights = (
                 expert_weights
@@ -1488,8 +1486,6 @@ def get_trtllm_moe_sm100_module():
             activation_type=activation_type,
         )
 
-        # topk_ids and expert_weights are 2D write-only workspace buffers here;
-        # the kernel fills them during the routing phase, so torch.empty is correct.
         moe_inputs = MoEInputs(
             output=output,
             routing_logits=routing_logits,
@@ -2109,7 +2105,7 @@ def get_trtllm_moe_sm100_module():
             weight_layout=WeightLayout.BlockMajorK,
             use_shuffled_weight=True,
         )
-        # topk_ids and expert_weights are 2D write-only workspace buffers here.
+
         moe_inputs = MoEInputs(
             output=output,
             routing_logits=routing_logits,

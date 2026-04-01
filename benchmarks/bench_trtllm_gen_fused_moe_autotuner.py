@@ -407,7 +407,6 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
         )
         return np.median(ms_list)
 
-    # Phase 1: measure all untuned (cache is empty)
     setups = []
     for batch_size in num_tokens_list:
         hidden_states = torch.randn(batch_size, hidden_size, device=device).to(
@@ -460,16 +459,17 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
         }
         setups.append((batch_size, fn, input_kwargs))
 
+    # measure untuned
     ms_no_autotune = []
     for _batch_size, fn, input_kwargs in setups:
         ms_no_autotune.append(_measure(fn, input_kwargs))
 
-    # Phase 2: tune once — covers all buckets up to tune_max
+    # tune once — covers all buckets up to tune_max
     _, first_fn, first_kw = setups[0]
     with autotune(True):
         first_fn(**first_kw)
 
-    # Phase 3: measure all tuned
+    # measure tuned
     results = []
     for (batch_size, fn, input_kwargs), ms in zip(setups, ms_no_autotune, strict=True):
         results.append((batch_size, ms, _measure(fn, input_kwargs)))
@@ -535,7 +535,6 @@ def bench_trtllm_gen_fused_moe_autotuner_mxint4(
         )
         return np.median(ms_list)
 
-    # Phase 1: measure all untuned (cache is empty)
     setups = []
     for batch_size in num_tokens_list:
         hidden_states = torch.randn(batch_size, hidden_size, device=device).to(
@@ -570,16 +569,17 @@ def bench_trtllm_gen_fused_moe_autotuner_mxint4(
         }
         setups.append((batch_size, fn, input_kwargs))
 
+    # measure untuned
     ms_no_autotune = []
     for _batch_size, fn, input_kwargs in setups:
         ms_no_autotune.append(_measure(fn, input_kwargs))
 
-    # Phase 2: tune once — covers all buckets up to tune_max
+    # tune once — covers all buckets up to tune_max
     _, first_fn, first_kw = setups[0]
     with autotune(True):
         first_fn(**first_kw)
 
-    # Phase 3: measure all tuned
+    # measure tuned
     results = []
     for (batch_size, fn, input_kwargs), ms in zip(setups, ms_no_autotune, strict=True):
         results.append((batch_size, ms, _measure(fn, input_kwargs)))
