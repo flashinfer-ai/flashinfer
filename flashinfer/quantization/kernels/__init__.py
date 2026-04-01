@@ -27,7 +27,7 @@ SM100+ (Blackwell) GPUs and the nvidia-cutlass-dsl package.
 """
 
 from .mxfp4_quantize import (
-    MXFP4QuantizeSwizzledKernel,
+    MXFP4QuantizeKernel,
     mxfp4_quantize_cute_dsl,
 )
 from .mxfp8_quantize import (
@@ -35,11 +35,17 @@ from .mxfp8_quantize import (
     MXFP8QuantizeSwizzledKernel,
     mxfp8_quantize_cute_dsl,
 )
+from .nvfp4_quantize import (
+    NVFP4QuantizeSwizzledKernel,
+    nvfp4_quantize_cute_dsl,
+)
 
 __all__ = [
-    "MXFP4QuantizeSwizzledKernel",
+    "MXFP4QuantizeKernel",
     "mxfp4_quantize_cute_dsl",
     "MXFP8QuantizeLinearKernel",
     "MXFP8QuantizeSwizzledKernel",
     "mxfp8_quantize_cute_dsl",
+    "NVFP4QuantizeSwizzledKernel",
+    "nvfp4_quantize_cute_dsl",
 ]
