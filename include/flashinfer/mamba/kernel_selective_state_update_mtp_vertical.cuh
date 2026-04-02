@@ -19,7 +19,8 @@
 // 3 TMA load warps (one per group), and 1 shared epilogue warp.
 // Each CTA processes up to 3 heads from the flattened head list (across all KV groups).
 //
-// See .plans/three_compute_groups.md for the full design document.
+
+#pragma once
 
 #include <cooperative_groups.h>
 #include <cooperative_groups/memcpy_async.h>
