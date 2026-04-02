@@ -63,8 +63,10 @@ void runPostTopKPipeline(DataType const& data, uint32_t /*numThreadsHist*/, void
   // Determine which path to use based on token count
   static int const smMajor = tensorrt_llm::common::getSMVersion() / 10;
   bool const useSingleBlock = data.mNumTokens <= routingCustom::BlockKernelMaxNumTokens;
+  // Use the larger threshold (MaxNumTokensSingleCluster) since runPostTopKPipeline
+  // processes pre-computed topK data (mPtrTopKPacked/mPtrTopKIds), not raw scores.
   bool const useSingleCluster =
-      (smMajor >= 9) && (data.mNumTokens <= routingCustom::MaxNumTokensSingleClusterScores);
+      (smMajor >= 9) && (data.mNumTokens <= routingCustom::MaxNumTokensSingleCluster);
 
   // PDL overlap control: the LAST routing kernel must disable overlap so the consumer
   // GEMM (which may lack cudaGridDependencySynchronize) can't start early.
