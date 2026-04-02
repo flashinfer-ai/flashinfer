@@ -211,6 +211,7 @@ def get_artifact(file_name: str, sha256: str, session=None) -> bytes:
     if data:
         return data
 
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
     uri = safe_urljoin(FLASHINFER_CUBINS_REPOSITORY, file_name)
     logger.info(f"Fetching {file_name} from {uri}")
     download_file(uri, local_path, session=session)
