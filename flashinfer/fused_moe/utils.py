@@ -2,7 +2,7 @@ import contextlib
 import threading
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import torch
 
@@ -213,6 +213,46 @@ def get_last_power_of_2_num_tokens_buckets(
         num_token_buckets.append(m)
         m //= 2
     return tuple(num_token_buckets)
+
+
+def round_to_nearest_bucket(
+    x: int, buckets: Sequence[int], round_map: bool = False
+) -> int:
+    """Map x to the nearest bucket, rounding up or down.
+
+    Args:
+        x: The value to map.
+        buckets: Sorted list of bucket values (ascending).
+        round_map: If False (default), return the largest bucket <= x.
+            If True, return the smallest bucket >= x.
+
+    Returns:
+        The matched bucket value.
+    """
+    if round_map:
+        for b in buckets:
+            if b >= x:
+                return b
+        return buckets[-1]
+    else:
+        for b in reversed(buckets):
+            if b <= x:
+                return b
+        return buckets[0]
+
+
+def make_bucket_mapper(buckets: Tuple[int, ...], round_map: bool = False):
+    """Return a closure suitable for DynamicTensorSpec.map_to_tuning_buckets.
+
+    The returned function maps any integer x to the nearest bucket value,
+    rounding up or down according to ``round_map``.
+    """
+    sorted_buckets = tuple(sorted(set(buckets)))
+
+    def _mapper(x: int) -> int:
+        return round_to_nearest_bucket(x, sorted_buckets, round_map)
+
+    return _mapper
 
 
 def get_fp4_shape(input_shape, sf_vec_size, is_swizzled_layout=True):

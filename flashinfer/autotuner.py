@@ -401,7 +401,12 @@ class TunableRunner(ABC):
 
 
 @contextlib.contextmanager
-def autotune(tune_mode: bool = True, cache: Optional[str] = None):
+def autotune(
+    tune_mode: bool = True,
+    cache: Optional[str] = None,
+    tuning_buckets: Optional[Tuple[int, ...]] = None,
+    round_up: bool = False,
+):
     """Context manager for autotuning with optional file-based caching.
 
     .. note::
@@ -417,6 +422,15 @@ def autotune(tune_mode: bool = True, cache: Optional[str] = None):
             On entry, configs are loaded from this file (if it exists).
             On exit, configs are saved back to this file (only when
             ``tune_mode=True``).
+        tuning_buckets: Optional sequence of integer measurement points.
+            When provided, replaces the default power-of-2 buckets for all
+            operations within this context.  For example,
+            ``tuning_buckets=(64, 128, 256, 512, 1024)`` profiles exactly
+            those batch sizes.
+        round_up: If True, runtime batch sizes are rounded **up** to the next
+            measurement bucket instead of **down** (the default).  For example,
+            with buckets ``(128, 256, 512)`` and a runtime batch of 200,
+            ``round_up=False`` maps to 128 while ``round_up=True`` maps to 256.
 
     Examples::
 
@@ -424,8 +438,12 @@ def autotune(tune_mode: bool = True, cache: Optional[str] = None):
         with autotune(True, cache="my_configs.json"):
             model(inputs)
 
-        # Load cached configs for inference (no profiling, no save)
-        with autotune(False, cache="my_configs.json"):
+        # Use custom measurement points
+        with autotune(True, tuning_buckets=(64, 128, 256, 512)):
+            model(inputs)
+
+        # Round up to next bucket during inference
+        with autotune(False, cache="my_configs.json", round_up=True):
             model(inputs)
     """
     tuner = AutoTuner.get()
@@ -441,6 +459,15 @@ def autotune(tune_mode: bool = True, cache: Optional[str] = None):
             tuner._logged_file_hits.clear()
         if os.path.isfile(cache):
             cache_valid = tuner.load_configs(cache)
+
+    # Save and install tuning bucket overrides.
+    with tuner._lock:
+        prev_buckets = tuner._override_tuning_buckets
+        prev_round_up = tuner._override_round_up
+        if tuning_buckets is not None:
+            tuner._override_tuning_buckets = tuple(sorted(set(tuning_buckets)))
+        if round_up:
+            tuner._override_round_up = True
 
     # Reference-counted tuning mode: is_tuning_mode stays True as long as
     # at least one autotune(True) context is active, even if an
@@ -460,6 +487,11 @@ def autotune(tune_mode: bool = True, cache: Optional[str] = None):
             if tune_mode:
                 tuner._active_tuning_contexts -= 1
             tuner.is_tuning_mode = tuner._active_tuning_contexts > 0
+
+            # Restore previous override state.
+            tuner._override_tuning_buckets = prev_buckets
+            tuner._override_round_up = prev_round_up
+
         if autotune_enabled:
             logger.info("[Autotuner]: Autotuning process ends")
 
@@ -581,6 +613,13 @@ class AutoTuner:
         self._dirty = False
         self._dirty_seq = 0
 
+        # Tuning bucket overrides set by autotune() context manager.
+        self._override_tuning_buckets: Optional[Tuple[int, ...]] = None
+        self._override_round_up: bool = False
+        # Cache overridden TuningConfig objects to keep stable object identity
+        # for _find_nearest_profile's LRU cache.
+        self._override_config_cache: Dict[Tuple, "TuningConfig"] = {}
+
     @classmethod
     def get(cls):
         # Double-checked locking for thread-safe singleton creation
@@ -665,6 +704,61 @@ class AutoTuner:
             # 4. Fallback
             return False, 0, -1, None
 
+    def _apply_tuning_overrides(self, tuning_config: TuningConfig) -> TuningConfig:
+        """Return a TuningConfig with overridden buckets/rounding if overrides are active.
+
+        The result is cached so the same logical override produces the same
+        object, keeping ``_find_nearest_profile``'s LRU cache effective.
+        """
+        buckets = self._override_tuning_buckets
+        round_up_flag = self._override_round_up
+
+        cache_key = (id(tuning_config), buckets, round_up_flag)
+        if cache_key in self._override_config_cache:
+            return self._override_config_cache[cache_key]
+
+        from .fused_moe.utils import make_bucket_mapper, next_positive_power_of_2
+
+        new_specs = []
+        for spec in tuning_config.dynamic_tensor_specs:
+            new_gen: Union[Tuple[int, ...], Callable]
+            new_map: Callable
+            if buckets is not None:
+                new_gen = tuple(sorted(set(buckets)))
+                new_map = make_bucket_mapper(new_gen, round_map=round_up_flag)
+            elif round_up_flag:
+                if isinstance(spec.gen_tuning_buckets, (list, tuple)):
+                    sorted_gen = tuple(sorted(set(spec.gen_tuning_buckets)))
+                    new_gen = sorted_gen
+                    new_map = make_bucket_mapper(sorted_gen, round_map=True)
+                else:
+                    # gen_tuning_buckets is a callable — keep it, override mapper
+                    # to use next_positive_power_of_2 (ceil to power-of-2).
+                    new_gen = spec.gen_tuning_buckets
+                    new_map = next_positive_power_of_2
+            else:
+                new_specs.append(spec)
+                continue
+
+            new_specs.append(
+                DynamicTensorSpec(
+                    input_idx=spec.input_idx,
+                    dim_idx=spec.dim_idx,
+                    gen_tuning_buckets=new_gen,
+                    map_to_tuning_buckets=new_map,
+                    tensor_initializers=spec.tensor_initializers,
+                )
+            )
+
+        new_config = TuningConfig(
+            dynamic_tensor_specs=tuple(new_specs),
+            constraint_specs=tuning_config.constraint_specs,
+            use_cold_l2_cache=tuning_config.use_cold_l2_cache,
+            use_cuda_graph=tuning_config.use_cuda_graph,
+        )
+        self._override_config_cache[cache_key] = new_config
+        return new_config
+
     def choose_one(
         self,
         custom_op: str,
@@ -701,6 +795,10 @@ class AutoTuner:
         # separate GPUs is serialized.  Use multi-process (one per GPU) for
         # parallel multi-GPU tuning.
         with self._lock:
+            # Apply tuning bucket / rounding overrides from autotune() context.
+            if self._override_tuning_buckets is not None or self._override_round_up:
+                tuning_config = self._apply_tuning_overrides(tuning_config)
+
             input_shapes = tuple(self._get_input_sizes(inputs))
 
             # Early return if it's not tuning, use cache found one or fallback one
