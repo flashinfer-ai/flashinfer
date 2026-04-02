@@ -57,7 +57,6 @@ class TestSelectiveStateUpdateMTP:
         autouse=True,
         params=[
             "simple",
-            "async_horizontal",
             pytest.param("vertical", marks=_requires_sm100),
             pytest.param("horizontal", marks=_requires_sm100),
         ],

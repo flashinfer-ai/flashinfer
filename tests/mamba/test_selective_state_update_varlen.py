@@ -255,7 +255,7 @@ class TestSelectiveStateUpdateVarlen:
     NGROUPS = 8
     STATE_CACHE_SIZE = 512
 
-    @pytest.mark.parametrize("algorithm", ["simple", "async_horizontal"])
+    @pytest.mark.parametrize("algorithm", ["simple"])
     @pytest.mark.parametrize(
         "n_seqs,max_seqlen",
         [
@@ -355,7 +355,7 @@ class TestSelectiveStateUpdateVarlen:
                     self.RTOL,
                 )
 
-    @pytest.mark.parametrize("algorithm", ["simple", "async_horizontal"])
+    @pytest.mark.parametrize("algorithm", ["simple"])
     @pytest.mark.parametrize("n_seqs", [4, 8])
     def test_varlen_variable_lengths(self, n_seqs, algorithm):
         """Sequences have different lengths (padded with PAD_SLOT_ID)."""
@@ -455,7 +455,7 @@ class TestSelectiveStateUpdateNumAcceptedTokens:
     NGROUPS = 8
     STATE_CACHE_SIZE = 512
 
-    @pytest.mark.parametrize("algorithm", ["simple", "async_horizontal"])
+    @pytest.mark.parametrize("algorithm", ["simple"])
     @pytest.mark.parametrize("n_seqs", [4, 8, 16])
     @pytest.mark.parametrize("num_accepted_dtype", [torch.int32, torch.int64])
     def test_num_accepted_selects_initial_state(

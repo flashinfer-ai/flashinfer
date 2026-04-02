@@ -307,7 +307,8 @@ def selective_state_update(
     elif algorithm == "horizontal":
         algorithm_int = 3
     elif algorithm == "async_horizontal":
-        algorithm_int = 4
+        # Backward compat: async_horizontal is now merged into simple
+        algorithm_int = 1
     else:
         raise ValueError(f"Unknown algorithm: {algorithm}")
 
