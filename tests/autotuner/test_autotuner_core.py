@@ -11,7 +11,11 @@ from flashinfer.autotuner import (
     TuningConfig,
     TunableRunner,
 )
-from flashinfer.fused_moe.utils import last_positive_power_of_2
+from flashinfer.fused_moe.utils import (
+    last_positive_power_of_2,
+    make_bucket_mapper,
+    round_to_nearest_bucket,
+)
 from .utils import reset_autotuner
 
 
@@ -478,8 +482,6 @@ def test_choose_one_different_infer_tokens_same_bucket_get_same_cached_tactic(
 # ---------------------------------------------------------------------------
 # Tests for custom tuning buckets and round_up
 # ---------------------------------------------------------------------------
-
-from flashinfer.fused_moe.utils import round_to_nearest_bucket, make_bucket_mapper
 
 
 @pytest.mark.parametrize(
