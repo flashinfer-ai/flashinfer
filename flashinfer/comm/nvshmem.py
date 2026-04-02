@@ -72,6 +72,18 @@ def malloc(
     Returns:
         A tensor allocated using NVSHMEM collective malloc.
     """
+    if isinstance(device, torch.device):
+        device_index = (
+            device.index if device.index is not None else torch.cuda.current_device()
+        )
+    else:
+        device_index = torch.cuda.current_device()
+    if device_index != torch.cuda.current_device():
+        raise ValueError(
+            f"NVSHMEM malloc requested on device {device_index}, "
+            f"but current CUDA device is {torch.cuda.current_device()}. "
+            "NVSHMEM allocates on the current device."
+        )
     return nvshmem.core.tensor(tuple(shape), dtype=dtype)
 
 
@@ -83,6 +95,7 @@ def free_tensor(tensor: torch.Tensor) -> None:
 def barrier_all() -> None:
     stream = torch.cuda.current_stream()
     nvshmem.core.barrier_all(stream=stream)
+    stream.synchronize()
 
 
 def barrier_all_on_current_stream() -> None:
