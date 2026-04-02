@@ -4582,18 +4582,6 @@ def trtllm_fmha_v2_prefill(
             [block_tables * 2, block_tables * 2 + 1], dim=1
         ).contiguous()  # [B, 2, M]
 
-    # If warp-specialized, scale_bmm2 is a tensor on device. Otherwise it is a float.
-
-    # scale_bmm2_d = _create_scale_bmm2_d_tensor(scale_bmm2, query.dtype, query.device)
-    # scale_bmm2_d = torch.tensor([scale_bmm2], dtype=torch.float32, device=query.device)
-    # if isinstance(bmm2_scale, float):
-    #     bmm2_scale_d = torch.tensor([bmm2_scale], dtype=torch.float32, device=query.device)
-    # else:
-    #     bmm2_scale_d = bmm2_scale.to(device=query.device, dtype=torch.float32)
-    # scale_bmm2 = bmm2_scale_d.view(torch.float32)
-    # bmm2_scale_d = torch.empty(1, dtype=torch.float32, device=query.device)
-    # bmm2_scale_d.fill_(bmm2_scale)
-
     module.run(
         query,  # Q tensor
         k_cache,  # K tensor
