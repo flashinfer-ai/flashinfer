@@ -31,8 +31,8 @@ pip3 install responses pytest scipy build cuda-python nvidia-nvshmem-cu12
 # Install cudnn package based on CUDA version
 if [[ "$CUDA_VERSION" == *"cu13"* ]]; then
   pip3 install --upgrade cuda-python==13.0
-  pip3 install "nvidia-cudnn-cu13>=9.14.0.64"
+  pip3 install --upgrade nvidia-cudnn-cu13
 else
   pip3 install --upgrade cuda-python==12.*
-  pip3 install "nvidia-cudnn-cu12>=9.14.0.64"
+  pip3 install --upgrade nvidia-cudnn-cu12
 fi
