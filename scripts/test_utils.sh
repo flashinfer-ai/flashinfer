@@ -537,7 +537,7 @@ run_tests_parallel() {
             for pid in "${!test_pid_map[@]}"; do
                 if ! kill -0 "$pid" 2>/dev/null; then
                     # Job finished, reclaim its GPU
-                    wait "$pid" 2>/dev/null; test_exit_codes[$pid]=$?
+                    test_exit_codes[$pid]=0; wait "$pid" 2>/dev/null || test_exit_codes[$pid]=$?
                     local freed_gpu="${test_gpu_map[$pid]}"
                     available_gpus+=("$freed_gpu")
                     unset "test_pid_map[$pid]"
@@ -573,7 +573,7 @@ run_tests_parallel() {
     echo "Waiting for all tests to complete..."
     for pid in "${!test_result_files[@]}"; do
         if [ -z "${test_exit_codes[$pid]+x}" ]; then
-            wait "$pid" 2>/dev/null; test_exit_codes[$pid]=$?
+            test_exit_codes[$pid]=0; wait "$pid" 2>/dev/null || test_exit_codes[$pid]=$?
         fi
     done
 
