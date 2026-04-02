@@ -166,19 +166,15 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
     FLASHINFER_CHECK(params.nheads % params.ngroups == 0, "nheads (", params.nheads,
                      ") must be divisible by ngroups (", params.ngroups,
                      ") for horizontal algorithm");
-    constexpr int kHorizontalDimAlignment =
-        horiz::NUM_COMPUTE_WARPS_PER_GROUP * horiz::ROWS_PER_WARP;
-    FLASHINFER_CHECK(DIM % kHorizontalDimAlignment == 0,
-                     "Horizontal kernel requires DIM divisible by ", kHorizontalDimAlignment,
-                     " (NUM_COMPUTE_WARPS_PER_GROUP * ROWS_PER_WARP), got DIM=", DIM);
-    FLASHINFER_CHECK(!scaleState, "horizontal algorithm does not support scaled (quantized) state");
-    FLASHINFER_CHECK(params.cu_seqlens == nullptr,
-                     "horizontal algorithm does not support varlen (cu_seqlens)");
-
     constexpr int NUM_IN_STAGES = 2;
     // TMA_STATE_ROWS: rows of DIM per TMA transaction. Must be a multiple of ROWS_PER_PASS.
     // Larger values = fewer barrier syncs but more smem per pipeline stage.
     constexpr int TMA_STATE_ROWS = 2 * horiz::ROWS_PER_PASS;
+    FLASHINFER_CHECK(DIM % TMA_STATE_ROWS == 0, "Horizontal kernel requires DIM divisible by ",
+                     TMA_STATE_ROWS, " (TMA_STATE_ROWS = 2 * ROWS_PER_PASS), got DIM=", DIM);
+    FLASHINFER_CHECK(!scaleState, "horizontal algorithm does not support scaled (quantized) state");
+    FLASHINFER_CHECK(params.cu_seqlens == nullptr,
+                     "horizontal algorithm does not support varlen (cu_seqlens)");
 
     dispatchRatio(
         params, std::integer_sequence<int, 1, 2, 4, 8, 16, 32, 64>{}, [&]<int HEADS_PER_GROUP>() {
