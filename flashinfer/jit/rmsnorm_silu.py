@@ -181,10 +181,15 @@ def _compute_default_knobs(C: int, dtype: str):
     return None
 
 
-def select_knobs(C: int, num_tokens: int, dtype: str):
-    """Select knobs from LUT or fallback heuristic. Returns (warps_m, split_cols, kernel_cfg, occupancy, bytes_per_ldg)."""
+def select_knobs(C: int, num_tokens: int, dtype: str, sm_version: int = 100):
+    """Select knobs from LUT or fallback heuristic.
+
+    For parity with the original integration:
+    - SM100+: use sweep-tuned LUT for known shapes.
+    - non-SM100 or non-LUT shapes: use conservative fallback heuristic.
+    """
     key = (C, num_tokens, dtype)
-    if key in _KNOB_LUT:
+    if sm_version >= 100 and key in _KNOB_LUT:
         return _KNOB_LUT[key]
     return _compute_default_knobs(C, dtype)
 

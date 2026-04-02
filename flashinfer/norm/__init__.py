@@ -32,7 +32,12 @@ from typing import Optional, Union
 import torch
 
 from ..api_logging import flashinfer_api
-from ..utils import device_support_pdl, register_custom_op, register_fake_op
+from ..utils import (
+    device_support_pdl,
+    get_compute_capability,
+    register_custom_op,
+    register_fake_op,
+)
 
 # Always import gen_norm_module for JIT warmup and CUDA fallback
 from ..jit.norm import gen_norm_module
@@ -583,7 +588,10 @@ def _torch_dtype_to_str(dtype):
         return "fp8"
     elif hasattr(torch, "float4_e2m1fn_x2") and dtype == torch.float4_e2m1fn_x2:
         return "nvfp4"
-    return "bf16"
+    raise ValueError(
+        "Unsupported output dtype for fused_rmsnorm_silu: "
+        f"{dtype}. Supported dtypes: bfloat16, float8_e4m3fn, float4_e2m1fn_x2"
+    )
 
 
 @flashinfer_api
@@ -618,14 +626,58 @@ def fused_rmsnorm_silu(
     output: torch.Tensor
         Normalized + SiLU activated tensor, shape ``(num_tokens, hidden_size)``.
     """
+    if input.device.type != "cuda":
+        raise ValueError("fused_rmsnorm_silu requires CUDA tensors")
+    if input.dtype != torch.bfloat16:
+        raise ValueError(f"input must be torch.bfloat16, got {input.dtype}")
+    if weight.dtype != torch.bfloat16:
+        raise ValueError(f"weight must be torch.bfloat16, got {weight.dtype}")
+    if input.ndim != 2:
+        raise ValueError(
+            f"input must be 2D [num_tokens, hidden_size], got ndim={input.ndim}"
+        )
+    if weight.ndim != 1:
+        raise ValueError(f"weight must be 1D [hidden_size], got ndim={weight.ndim}")
+    if weight.device != input.device:
+        raise ValueError("weight must be on the same device as input")
+
     if out is None:
         out = torch.empty_like(input)
+    if out.device != input.device:
+        raise ValueError("out must be on the same device as input")
 
     num_tokens = input.size(0)
     C = input.size(1)
+    if weight.size(0) != C:
+        raise ValueError(
+            f"weight shape mismatch: expected [{C}], got {tuple(weight.shape)}"
+        )
     output_dtype_str = _torch_dtype_to_str(out.dtype)
 
-    knobs = select_knobs(C, num_tokens, output_dtype_str)
+    if output_dtype_str in ("bf16", "fp8"):
+        if tuple(out.shape) != tuple(input.shape):
+            raise ValueError(
+                f"out shape mismatch for {output_dtype_str}: expected {tuple(input.shape)}, got {tuple(out.shape)}"
+            )
+    elif output_dtype_str == "nvfp4":
+        expected_shape = (num_tokens, C // 2)
+        if C % 2 != 0:
+            raise ValueError(f"nvfp4 output requires even hidden size, got C={C}")
+        if tuple(out.shape) != expected_shape:
+            raise ValueError(
+                f"out shape mismatch for nvfp4: expected {expected_shape}, got {tuple(out.shape)}"
+            )
+
+    major, minor = get_compute_capability(input.device)
+    sm_version = major * 10 + minor
+    if sm_version < 80:
+        raise RuntimeError("fused_rmsnorm_silu requires SM80+")
+    if output_dtype_str == "fp8" and sm_version < 89:
+        raise RuntimeError("FP8 output requires SM89+ (Ada/Hopper)")
+    if output_dtype_str == "nvfp4" and sm_version < 100:
+        raise RuntimeError("NVFP4 output requires SM100+ (Blackwell)")
+
+    knobs = select_knobs(C, num_tokens, output_dtype_str, sm_version)
     if knobs is None:
         raise ValueError(
             f"Unsupported problem size for fused_rmsnorm_silu: "
