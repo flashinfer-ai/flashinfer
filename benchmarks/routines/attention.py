@@ -697,11 +697,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             repeat_iters=args.num_iters,
             sleep_after_run=False,
             enable_cupti=args.use_cupti,
-            use_cuda_graph=(
-                is_cuda_graph_compatible
-                and cur_backend
-                not in ("fa2", "trtllm-fmha-v2", "trtllm-native", "cudnn-native")
-            ),
+            use_cuda_graph=(is_cuda_graph_compatible and cur_backend != "fa2"),
             cold_l2_cache=True,
             input_args=(
                 cur_backend,
@@ -1392,7 +1388,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             repeat_iters=args.num_iters,
             sleep_after_run=False,
             enable_cupti=args.use_cupti,
-            use_cuda_graph=(is_cuda_graph_compatible and cur_backend not in ("fa2")),
+            use_cuda_graph=(is_cuda_graph_compatible and cur_backend != "fa2"),
             cold_l2_cache=True,
             input_args=(
                 cur_backend,
@@ -2057,11 +2053,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             repeat_iters=args.num_iters,
             sleep_after_run=True,
             enable_cupti=args.use_cupti,
-            use_cuda_graph=(
-                is_cuda_graph_compatible
-                and cur_backend
-                not in ("fa2", "trtllm-fmha-v2", "trtllm-native", "cudnn-native")
-            ),
+            use_cuda_graph=(is_cuda_graph_compatible and cur_backend != "fa2"),
             cold_l2_cache=True,
             input_args=(
                 cur_backend,
@@ -2523,11 +2515,7 @@ def testBatchMLAPagedAttentionWrapper(args):
             repeat_iters=args.num_iters,
             sleep_after_run=False,
             enable_cupti=args.use_cupti,
-            use_cuda_graph=(
-                is_cuda_graph_compatible
-                and cur_backend
-                not in ("fa2", "trtllm-fmha-v2", "trtllm-native", "cudnn-native")
-            ),
+            use_cuda_graph=(is_cuda_graph_compatible and cur_backend != "fa2"),
             cold_l2_cache=True,
             input_args=(
                 cur_backend,
