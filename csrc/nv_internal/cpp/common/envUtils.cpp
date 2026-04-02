@@ -356,4 +356,23 @@ int getEnvMoeA2ACombineBlockSize() {
 
 bool getEnvEplbForceGdrcopy() { return getBoolEnv("TRTLLM_EPLB_FORCE_GDRCOPY"); }
 
+bool getEnvEnablePDL() {
+  static std::once_flag flag;
+  static bool enablePDL = true;
+
+  std::call_once(flag, [&]() {
+    if (getSMVersion() >= 90) {
+      char const* env = std::getenv("TRTLLM_ENABLE_PDL");
+      if (env) {
+        if (env[0] == '1' && env[1] == '\0') {
+          enablePDL = true;
+        } else if (env[0] == '0' && env[1] == '\0') {
+          enablePDL = false;
+        }
+      };
+    }
+  });
+  return enablePDL;
+}
+
 }  // namespace tensorrt_llm::common
