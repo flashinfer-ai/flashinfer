@@ -2245,6 +2245,11 @@ def trtllm_batch_decode_with_kv_cache(
         or [num_pages, page_size, num_kv_heads, head_dim] if :attr:`kv_layout` is ``NHD``.
         The first tensor is the key cache, and the second tensor is the value cache.
 
+        **Contiguity requirements (trtllm-gen backend):**
+
+        - The ``head_dim`` (last dim) **must** have stride 1. This is a TMA hardware constraint
+        - The head and batch/page dims can have arbitrary strides.
+
     workspace_buffer : torch.Tensor. Must be initialized to 0 for its first use.
         workspace
 
@@ -2290,6 +2295,10 @@ def trtllm_batch_decode_with_kv_cache(
     kv_layout : str = "HND"
         The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
         Defaults to ``HND``.
+        For the trtllm-gen backend with NVFP4 KV cache, using ``NHD`` will trigger an
+        automatic transpose and ``.contiguous()`` copy of both the KV data and block scale
+        tensors to convert them to HND layout. This incurs extra memory allocation and
+        data copy overhead. Use ``HND`` for better performance.
 
     enable_pdl : Optional[bool] = None
         Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
@@ -2316,6 +2325,20 @@ def trtllm_batch_decode_with_kv_cache(
         Cumulative query sequence lengths for variable-length query support, shape: ``[batch_size + 1]``, dtype: ``torch.int32``.
         Only supported by trtllm-gen backend. Must be provided together with ``max_q_len``.
         When None, all requests use uniform query length specified by ``q_len_per_req``.
+
+    kv_block_scales : Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]] = None
+        Per-block scale factors for NVFP4 KV cache. Either a tuple of (k_scales, v_scales) or
+        a single tensor with shape ``[num_pages, 2, ...]`` that will be unbound along dim=1.
+        Each scale tensor has shape ``[num_pages, num_kv_heads, page_size, head_dim // 16]``
+        in HND layout, with dtype ``torch.float8_e4m3fn``.
+
+        **Contiguity requirements (trtllm-gen backend):**
+
+        - The last two dims (``page_size``, ``head_dim // 16``) **must** be contiguous
+          (i.e., ``stride[-1] == 1`` and ``stride[-2] == head_dim // 16``). This is because
+          the kernel reshapes them into ``(16, page_size * head_dim / 16 / 16)`` to satisfy
+          TMA's 16-byte box width minimum.
+        - The head and batch/page dims can have arbitrary strides.
 
     skip_softmax_threshold_scale_factor: Optional[float] = None
         threshold scale factor for skipping softmax operations.

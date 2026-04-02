@@ -346,7 +346,24 @@ def test_e2m1_dequantization(
 # MXFP4 Quantization Tests (Both Backends)
 # =============================================================================
 
-MXFP4_SHAPES = [(128, 64), (256, 128), (512, 256), (128, 1024), (1024, 2048)]
+MXFP4_SHAPES = [
+    # K must be a multiple of 128 so K/32 is a multiple of 4 (CUDA reshape
+    # constraint for swizzled layout).
+    # Small M with swizzled layout: padded_M >> M (row padding dominance)
+    (1, 128),  # padded_M=128, 127 padding rows
+    (1, 1024),  # padded_M=128, large K
+    (3, 256),  # padded_M=128, odd M
+    (16, 128),  # padded_M=128, 112 padding rows
+    (64, 128),  # padded_M=128, 64 padding rows
+    # Standard sizes
+    (128, 128),
+    (256, 128),
+    (512, 256),
+    (128, 1024),
+    (1024, 2048),
+    # Large K (column loop path in swizzled kernel)
+    (128, 16384),
+]
 MXFP4_BACKENDS = ["cuda", "cute-dsl"]
 
 
@@ -491,7 +508,24 @@ def test_mxfp4_quantize_backend_parity(
 # NVFP4 Quantization Tests (Both Backends)
 # =============================================================================
 
-NVFP4_SHAPES = [(128, 64), (256, 128), (512, 256), (128, 1024), (1024, 2048)]
+NVFP4_SHAPES = [
+    # K must be a multiple of 64 so K/16 is a multiple of 4 (CUDA reshape
+    # constraint for swizzled layout).
+    # Small M with swizzled layout: padded_M >> M (row padding dominance)
+    (1, 64),  # padded_M=128, 127 padding rows
+    (1, 1024),  # padded_M=128, large K
+    (3, 128),  # padded_M=128 (128x4) or 8 (8x4), odd M
+    (16, 64),  # padded_M=128, 112 padding rows
+    (64, 128),  # padded_M=128, 64 padding rows
+    # Standard sizes
+    (128, 64),
+    (256, 128),
+    (512, 256),
+    (128, 1024),
+    (1024, 2048),
+    # Large K (column loop path in swizzled kernel)
+    (128, 16384),
+]
 NVFP4_BACKENDS = ["cuda", "cute-dsl"]
 NVFP4_SF_LAYOUTS = [SfLayout.layout_128x4, SfLayout.layout_8x4, SfLayout.layout_linear]
 # Roundtrip test only for layouts the dequantizer supports (128x4 and linear)
