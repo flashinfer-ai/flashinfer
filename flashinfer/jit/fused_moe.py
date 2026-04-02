@@ -26,7 +26,12 @@ from .core import (
     sm89_nvcc_flags,
 )
 from .cpp_ext import is_cuda_version_at_least
-from .cubin_loader import get_artifact, get_meta_hash, ensure_symlink
+from .cubin_loader import (
+    get_artifact,
+    get_meta_hash,
+    ensure_symlink,
+    verify_symlinked_headers,
+)
 from .gemm.cutlass.generate_kernels import generate_gemm_operations
 
 BMM_EXPORT_HEADERS = [
@@ -258,14 +263,15 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
     for header in BMM_EXPORT_HEADERS:
         h = get_artifact(f"{bmm_export_path}/{header}", get_meta_hash(checksum, header))
         assert h, f"{header} not found"
-    ensure_symlink(
+    symlink_path = (
         jit_env.FLASHINFER_CUBIN_DIR
         / "flashinfer"
         / "trtllm"
         / "batched_gemm"
-        / "trtllmGen_bmm_export",
-        jit_env.FLASHINFER_CUBIN_DIR / bmm_export_path,
+        / "trtllmGen_bmm_export"
     )
+    ensure_symlink(symlink_path, jit_env.FLASHINFER_CUBIN_DIR / bmm_export_path)
+    verify_symlinked_headers(symlink_path, BMM_EXPORT_HEADERS, checksum)
 
     # currently only support Blackwell
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(

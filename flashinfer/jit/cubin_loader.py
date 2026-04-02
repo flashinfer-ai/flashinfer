@@ -244,6 +244,36 @@ def ensure_symlink(
     link.symlink_to(target)
 
 
+def verify_symlinked_headers(
+    symlink_path: Union[str, pathlib.Path],
+    headers: list,
+    checksums: bytes,
+) -> None:
+    """Verify that headers accessible through the symlink match expected checksums.
+
+    This catches stale cached headers after e.g. ``git checkout`` to a branch
+    with a different artifact version.  Each header file is read through the
+    symlink and its SHA-256 is compared against the hash from ``checksums.txt``.
+    """
+    symlink_path = pathlib.Path(symlink_path)
+    for header in headers:
+        header_path = symlink_path / header
+        expected_hash = get_meta_hash(checksums, header)
+        if not header_path.exists():
+            raise RuntimeError(
+                f"Header {header} not found at {header_path}. "
+                f"Try clearing the cache: rm -rf {FLASHINFER_CUBIN_DIR}"
+            )
+        actual_hash = hashlib.sha256(header_path.read_bytes()).hexdigest()
+        if actual_hash != expected_hash:
+            raise RuntimeError(
+                f"Header {header} at {header_path} has wrong checksum "
+                f"(expected {expected_hash}, got {actual_hash}). "
+                f"This can happen after switching branches. "
+                f"Try clearing the cache: rm -rf {FLASHINFER_CUBIN_DIR}"
+            )
+
+
 def convert_to_ctypes_char_p(data: bytes):
     return ctypes.c_char_p(data)
 
