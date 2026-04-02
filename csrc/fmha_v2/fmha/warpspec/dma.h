@@ -613,6 +613,13 @@ struct DMA {
 
       // Dst buffer available
       int v_barrier_id = cbw_v.threadReserve();
+      // NOTE(bobboli): Sync all DMA threads after consumer-bar wait to prevent phase-flip race.
+      // Without this, thread 0 can race ahead, commit V (triggering compute to consume the slot
+      // and flip the consumed-barrier phase), then wrap around in threadReserve() with a new
+      // expected phase, while slow DMA warps are still waiting on the old expected phase of the
+      // now-flipped barrier -> deadlock at bar.sync 1, 128 in transpose_v_tile. Same hazard as
+      // described for push_with_sync (see comment near run_packed_qkv).
+      named_barrier_wait(SYNC_BARRIER, NUM_THREADS_IN_DMA_GROUP);
       uint32_t smem_v_dst = __cvta_generic_to_shared(&shared->smem_v[v_barrier_id * TILE_SIZE_V]);
 
 // Explicitly transpose the v buffer in smem for fp8.
