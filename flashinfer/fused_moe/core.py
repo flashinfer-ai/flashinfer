@@ -1109,6 +1109,8 @@ def get_trtllm_moe_sm100_module():
             ):
                 moe_op.trtllm_mxint4_block_scale_moe(
                     routing_logits,
+                    topk_ids,
+                    expert_weights,
                     kwargs["routing_bias"],
                     hidden_states,
                     kwargs["gemm1_weights"],
