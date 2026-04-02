@@ -519,6 +519,143 @@ except ImportError:
     pass
 
 
+# ============================================================
+# Fused RMSNorm + SiLU (ported from cuDNN frontend OSS engine)
+# ============================================================
+
+from ..jit.rmsnorm_silu import (
+    gen_rmsnorm_silu_module,
+    select_knobs,
+    _estimate_ctas_per_row,
+)
+
+
+@functools.cache
+def _get_rmsnorm_silu_sm_count():
+    """Cache the SM count for the current device."""
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    return props.multi_processor_count
+
+
+@functools.cache
+def _get_rmsnorm_silu_module(
+    C, output_dtype, warps_m, ctas_per_row, bytes_per_ldg, kernel_cfg, occupancy
+):
+    return gen_rmsnorm_silu_module(
+        C, output_dtype, warps_m, ctas_per_row, bytes_per_ldg, kernel_cfg, occupancy
+    ).build_and_load()
+
+
+def _compute_rmsnorm_silu_workspace_size(
+    rows, cols, output_dtype, warps_m, ctas_per_row, kernel_cfg, occupancy, sm_count
+):
+    """Compute workspace size matching the engine's layout."""
+    # rs
+    ws = rows * 4  # sizeof(float)
+    ws = ((ws + 127) // 128) * 128
+    # fp8_scale
+    ws += 4
+    ws = ((ws + 127) // 128) * 128
+    # scale_row (NVFP4 only)
+    if output_dtype == "nvfp4":
+        ws += rows * ((cols + 15) // 16)
+        ws = ((ws + 127) // 128) * 128
+    # cooperative workspace (multi-CTA)
+    if ctas_per_row > 1:
+        ctas_per_col_max = (rows + warps_m - 1) // warps_m
+        if kernel_cfg == 2:
+            ctas_per_col = ctas_per_col_max
+        else:
+            ctas_per_col = min(sm_count * occupancy // ctas_per_row, ctas_per_col_max)
+        ctas_per_col = max(ctas_per_col, 1)
+        ws += ctas_per_col * warps_m * ctas_per_row * 8 * 2  # sizeof(float2) * 2
+        ws = ((ws + 127) // 128) * 128
+        ws += 2 * ctas_per_col * 4  # sizeof(int32_t)
+        ws = ((ws + 127) // 128) * 128
+    ws += 128  # final alignment padding
+    return ws
+
+
+def _torch_dtype_to_str(dtype):
+    if dtype == torch.bfloat16:
+        return "bf16"
+    elif dtype == torch.float8_e4m3fn:
+        return "fp8"
+    elif hasattr(torch, "float4_e2m1fn_x2") and dtype == torch.float4_e2m1fn_x2:
+        return "nvfp4"
+    return "bf16"
+
+
+@flashinfer_api
+def fused_rmsnorm_silu(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Fused RMSNorm + SiLU activation.
+
+    ``out[i] = SiLU(RMSNorm(input[i], weight, eps))``
+
+    where ``SiLU(x) = x / (1 + exp(-x))``
+
+    This kernel is ported from the cuDNN frontend OSS Sm100RmsNormSiluEngine
+    and is optimized for WAN VAE decoder workloads on B200.
+
+    Parameters
+    ----------
+    input: torch.Tensor
+        Input tensor, shape ``(num_tokens, hidden_size)``, dtype ``bfloat16``.
+    weight: torch.Tensor
+        Scale (gamma) tensor, shape ``(hidden_size,)``, dtype ``bfloat16``.
+    eps: float
+        Epsilon for numerical stability.
+    out: Optional[torch.Tensor]
+        Output tensor. If None, allocated as same shape/dtype as input.
+
+    Returns
+    -------
+    output: torch.Tensor
+        Normalized + SiLU activated tensor, shape ``(num_tokens, hidden_size)``.
+    """
+    if out is None:
+        out = torch.empty_like(input)
+
+    num_tokens = input.size(0)
+    C = input.size(1)
+    output_dtype_str = _torch_dtype_to_str(out.dtype)
+
+    knobs = select_knobs(C, num_tokens, output_dtype_str)
+    if knobs is None:
+        raise ValueError(
+            f"Unsupported problem size for fused_rmsnorm_silu: "
+            f"C={C}, num_tokens={num_tokens}, dtype={output_dtype_str}"
+        )
+
+    warps_m, split_cols, kernel_cfg, occupancy, bytes_per_ldg = knobs
+    ctas_per_row = _estimate_ctas_per_row(C, split_cols, kernel_cfg, bytes_per_ldg)
+    sm_count = _get_rmsnorm_silu_sm_count()
+
+    module = _get_rmsnorm_silu_module(
+        C, output_dtype_str, warps_m, ctas_per_row, bytes_per_ldg, kernel_cfg, occupancy
+    )
+
+    ws_size = _compute_rmsnorm_silu_workspace_size(
+        num_tokens,
+        C,
+        output_dtype_str,
+        warps_m,
+        ctas_per_row,
+        kernel_cfg,
+        occupancy,
+        sm_count,
+    )
+    workspace = torch.empty(ws_size, dtype=torch.uint8, device=input.device)
+
+    module.rmsnorm_silu(out, input, weight, eps, workspace, sm_count)
+    return out
+
+
 # Public API exports
 __all__ = [
     # JIT module generator (always available)
@@ -531,4 +668,5 @@ __all__ = [
     "gemma_rmsnorm",
     "gemma_fused_add_rmsnorm",
     "layernorm",
+    "fused_rmsnorm_silu",
 ]
