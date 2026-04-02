@@ -152,5 +152,3 @@ CUTLASS_INCLUDE_DIRS: list[pathlib.Path] = [
     _package_root / "data" / "cutlass" / "tools" / "util" / "include",
 ]
 SPDLOG_INCLUDE_DIR: pathlib.Path = _package_root / "data" / "spdlog" / "include"
-
-

@@ -21,9 +21,7 @@ def alloc_empty_unique_id() -> "nvshmem.bindings.nvshmem.uniqueid":
     return nvshmem.core.get_unique_id(empty=True)
 
 
-def init(
-    uid: "nvshmem.bindings.nvshmem.uniqueid", rank: int, world_size: int
-) -> None:
+def init(uid: "nvshmem.bindings.nvshmem.uniqueid", rank: int, world_size: int) -> None:
     device = Device(torch.cuda.current_device())
     nvshmem.core.init(
         device=device,
@@ -37,9 +35,7 @@ def init(
 
 def alltoall(dest: torch.Tensor, source: torch.Tensor) -> None:
     stream = torch.cuda.current_stream()
-    nvshmem.core.alltoall(
-        nvshmem.core.Teams.TEAM_WORLD, dest, source, stream=stream
-    )
+    nvshmem.core.alltoall(nvshmem.core.Teams.TEAM_WORLD, dest, source, stream=stream)
 
 
 def finalize() -> None:
