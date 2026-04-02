@@ -618,7 +618,7 @@ class AutoTuner:
         self._override_round_up: bool = False
         # Cache overridden TuningConfig objects to keep stable object identity
         # for _find_nearest_profile's LRU cache.
-        self._override_config_cache: Dict[Tuple, "TuningConfig"] = {}
+        self._override_config_cache: Dict[Any, "TuningConfig"] = weakref.WeakValueDictionary()
 
     @classmethod
     def get(cls):
