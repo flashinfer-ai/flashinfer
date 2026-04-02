@@ -2098,9 +2098,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
-        kv_block_scales: Optional[
-            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-        ] = None,
+        kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> torch.Tensor: ...
 
@@ -2118,9 +2116,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
-        kv_block_scales: Optional[
-            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-        ] = None,
+        kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
@@ -2139,9 +2135,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
-        kv_block_scales: Optional[
-            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-        ] = None,
+        kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch prefill/append attention between query and paged kv-cache.
@@ -2181,6 +2175,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
         enable_pdl : bool
             Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
             Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
+        kv_cache_sf : Optional[Tuple[torch.Tensor, torch.Tensor]]
+            Per-block scale factors for NVFP4 KV cache, as a tuple of ``(k_scales, v_scales)``.
+            Each scale tensor has shape ``[num_pages, num_kv_heads, page_size, head_dim // 16]``
+            in HND layout, with dtype ``torch.float8_e4m3fn``.
+            The V scale factors must be in the SM100 interleaved layout (token dimension
+            swizzled by groups of 4). Use :func:`flashinfer.fp4_quantization.nvfp4_quantize_paged_kv_cache`
+            to produce correctly formatted scale factors.
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -2212,14 +2213,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     f"where total_tokens = qo_indptr[-1]."
                 )
 
-        # Unpack kv_block_scales
         key_block_scales = None
         value_block_scales = None
-        if kv_block_scales is not None:
-            if isinstance(kv_block_scales, tuple):
-                key_block_scales, value_block_scales = kv_block_scales
-            else:
-                key_block_scales, value_block_scales = kv_block_scales.unbind(dim=1)
+        if kv_cache_sf is not None:
+            key_block_scales, value_block_scales = kv_cache_sf
 
         o_dtype = self._cached_o_data_type
         if out is not None and out.dtype != o_dtype:
@@ -2265,7 +2262,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         # For NVFP4 KV (uint8 packed), v_cache last dim is head_dim//2;
         # use q's head_dim for output instead
-        out_head_dim = q.shape[-1] if kv_block_scales is not None else v_cache.shape[-1]
+        out_head_dim = q.shape[-1] if kv_cache_sf is not None else v_cache.shape[-1]
         if out is None:
             # Use cached output data type if available (for FP8 attention with FP16 output)
             out_dtype = getattr(self, "_cached_o_data_type", None) or q.dtype
@@ -3731,9 +3728,7 @@ def trtllm_batch_context_with_kv_cache(
     kv_layout: str = "HND",
     enable_pdl: Optional[bool] = None,
     sinks: Optional[List[torch.Tensor]] = None,
-    kv_block_scales: Optional[
-        Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-    ] = None,
+    kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     skip_softmax_threshold_scale_factor: Optional[float] = None,
     uses_shared_paged_kv_idx: bool = True,
 ) -> Union[torch.Tensor, FP4Tensor]:
@@ -3800,9 +3795,8 @@ def trtllm_batch_context_with_kv_cache(
         data copy overhead. Use ``HND`` for better performance.
     sinks : Optional[List[torch.Tensor]] = None
         additional value per head in the denominator of the softmax.
-    kv_block_scales : Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]] = None
-        Per-block scale factors for NVFP4 KV cache. Either a tuple of (k_scales, v_scales) or
-        a single tensor with shape ``[num_pages, 2, ...]`` that will be unbound along dim=1.
+    kv_cache_sf : Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        Per-block scale factors for NVFP4 KV cache, as a tuple of ``(k_scales, v_scales)``.
         Each scale tensor has shape ``[num_pages, num_kv_heads, page_size, head_dim // 16]``
         in HND layout, with dtype ``torch.float8_e4m3fn``.
 
@@ -3845,20 +3839,10 @@ def trtllm_batch_context_with_kv_cache(
             # it doesn't change underlying storage
             k_cache, v_cache = kv_cache.unbind(dim=1)
 
-    # Unpack kv_block_scales
     key_block_scales = None
     value_block_scales = None
-    if kv_block_scales is not None:
-        if isinstance(kv_block_scales, tuple):
-            key_block_scales, value_block_scales = kv_block_scales
-        else:
-            if kv_block_scales.shape[1] == 1:
-                key_block_scales, value_block_scales = kv_block_scales, kv_block_scales
-            else:
-                assert kv_block_scales.shape[1] == 2, (
-                    "When kv_block_scales is a single tensor, the second dimension must be 1 or 2"
-                )
-                key_block_scales, value_block_scales = kv_block_scales.unbind(dim=1)
+    if kv_cache_sf is not None:
+        key_block_scales, value_block_scales = kv_cache_sf
 
     # Convert NHD layout to HND if necessary
     if kv_layout == "NHD":
