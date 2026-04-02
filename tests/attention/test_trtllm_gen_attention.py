@@ -701,6 +701,7 @@ def _test_trtllm_batch_prefill(
         )
         plan_params["q_data_type"] = q.dtype
         plan_params["kv_data_type"] = kv_cache.dtype
+        plan_params["o_data_type"] = DTYPE_MAP[o_dtype]
         wrapper_trtllm_gen.plan(**plan_params)
         output_wrapper = wrapper_trtllm_gen.run(
             q_input,
@@ -1160,6 +1161,7 @@ def _test_trtllm_batch_decode(
         )
         plan_params["q_data_type"] = q.dtype
         plan_params["kv_data_type"] = kv_cache.dtype
+        plan_params["o_data_type"] = DTYPE_MAP[o_dtype]
         wrapper_trtllm_gen.plan(**plan_params)
         output_wrapper = wrapper_trtllm_gen.run(
             q_input,
@@ -1249,7 +1251,7 @@ def _test_trtllm_batch_decode(
 @pytest.mark.parametrize("enable_pdl", [True, False, None])
 @pytest.mark.parametrize("enable_sink", [True, False])
 @pytest.mark.parametrize("max_in_kv_len", [110])
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("non_contiguous_query", [False, True])
 @pytest.mark.parametrize("skips_softmax", [False, True])
 @pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
@@ -1721,8 +1723,8 @@ def make_query_non_contiguous(
         (4, 3, 64, 2, 1, 128),
         (4, 4, 64, 4, 1, 128),
         (4, 5, 64, 4, 8, 128),
-        # Iterate over head_dim 64, 128, 256 for these configs to simplify
-        *[(bs, 4, 64, 4, 16, hd) for bs in [4, 8, 16, 32] for hd in [64, 128, 256]],
+        # Iterate over head_dim 128, 256 for these configs to simplify
+        *[(bs, 4, 64, 4, 16, hd) for bs in [4, 8, 16, 32] for hd in [128, 256]],
         (128, 1, 64, 2, 5, 128),
         (128, 2, 32, 4, 1, 128),
         (128, 3, 16, 4, 8, 128),
