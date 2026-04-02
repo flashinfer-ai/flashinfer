@@ -142,7 +142,7 @@ class NVSHMEMAllReduce:
         )
         # Copy result back to local output
         out.copy_(self.symm_buffer_output[:nelems])
-        torch.cuda.synchronize()
+        stream.synchronize()
 
     def shutdown(self):
         nvshmem.core.free_tensor(self.symm_buffer_input)
