@@ -713,7 +713,7 @@ class AutoTuner:
         buckets = self._override_tuning_buckets
         round_up_flag = self._override_round_up
 
-        cache_key = (id(tuning_config), buckets, round_up_flag)
+        cache_key = (hash(tuning_config), buckets, round_up_flag)
         if cache_key in self._override_config_cache:
             return self._override_config_cache[cache_key]
 
