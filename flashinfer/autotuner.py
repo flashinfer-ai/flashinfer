@@ -785,8 +785,13 @@ class AutoTuner:
                                     # cudaErrorIllegalInstruction from a failed
                                     # kernel warmup run) so they don't surface
                                     # later during CUDA graph capture.
+                                    # torch.cuda.synchronize() surfaces the error
+                                    # but does NOT clear the sticky CUDA error flag;
+                                    # only cudaGetLastError() resets it.
                                     with contextlib.suppress(Exception):
                                         torch.cuda.synchronize()
+                                    with contextlib.suppress(Exception):
+                                        torch.cuda.cudart().cudaGetLastError()
 
                                     # Record the failed profiling combinations
                                     if (
