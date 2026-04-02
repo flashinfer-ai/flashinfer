@@ -631,6 +631,14 @@ run_tests_parallel() {
                 # Don't count skipped tests as passed
                 TOTAL_TESTS=$((TOTAL_TESTS - 1))
             fi
+        else
+            # No result file means the subprocess was killed (OOM, timeout, etc.)
+            # before it could write a result — treat as failure
+            echo "❌ KILLED/TIMED OUT: $test_file (no result produced)"
+            TOTAL_TESTS=$((TOTAL_TESTS + 1))
+            FAILED_TESTS="$FAILED_TESTS\n  - $test_file (killed/timed out)"
+            # shellcheck disable=SC2034  # EXIT_CODE is used by calling scripts
+            EXIT_CODE=1
         fi
     done
 }
