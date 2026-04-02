@@ -150,20 +150,11 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         # Use torch.cuda.current_device() instead of mapping.local_rank to
         # support base_gpu_id != 0 scenarios where the actual CUDA device
         # index differs from the TP rank / local_rank.
-        # self.mcast_buffer_handle = McastGPUBuffer(
-        #     requested_workspace_size,
-        #     mapping.tp_size,
-        #     mapping.tp_rank,
-        #     torch.device("cuda", torch.cuda.current_device()),
-        #     comm_backend,
-        # )
         device = torch.device("cuda", torch.cuda.current_device())
-        # device = torch.device("cuda", mapping.local_rank)
         if isinstance(comm_backend, TorchDistBackend):
             group = comm_backend._group if comm_backend._group is not None else torch.distributed.group.WORLD
             group_name = group.group_name
         else:
-            # MPIBackend or other — fall back to WORLD
             group_name = torch.distributed.group.WORLD.group_name
         self.ptrs, self.tensor, self.handle = _alloc_symm_buffer_bytes(
             requested_workspace_size,
