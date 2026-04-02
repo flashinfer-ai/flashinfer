@@ -1185,8 +1185,10 @@ def nvfp4_quantize_paged_kv_cache(
     Returns:
         kv_cache_fp4: Tuple of (k_fp4, v_fp4) in the same layout as input,
             with head_dim replaced by head_dim//2, dtype=uint8.
-        kv_cache_sf: Tuple of (k_scales, v_scales) in the same layout as input,
-            with head_dim replaced by head_dim//16, dtype=float8_e4m3fn.
+        kv_cache_sf: Tuple of (k_scales, v_scales). `k_scales` keeps the linear
+            input layout, while `v_scales` uses TRT-LLM's 4-token interleaved
+            layout. Both tensors replace `head_dim` with `head_dim//16` and use
+            dtype=float8_e4m3fn.
         k_global_scale: Global scale for K (float), equal to ``1 / k_global_sf``.
         v_global_scale: Global scale for V (float), equal to ``1 / v_global_sf``.
     """
@@ -1255,6 +1257,11 @@ def nvfp4_quantize_paged_kv_cache(
     #   output[..., (t//4)*4*S + s*4 + t%4] = input[..., t*S + s]
     # This matches TRT-LLM's quantizeAndWriteFP4KVCache() V swizzle pattern.
     # K scale factors do NOT need swizzling — the kernel reads them with real strides.
+    if page_size % 4 != 0 or head_dim % 64 != 0:
+        raise ValueError(
+            "V-scale swizzling requires page_size % 4 == 0 and head_dim % 64 == 0, "
+            f"got page_size={page_size}, head_dim={head_dim}."
+        )
     if kv_layout == "NHD":
         swizzle_shape = (
             num_pages,

@@ -2177,11 +2177,19 @@ class BatchPrefillWithPagedKVCacheWrapper:
             Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
         kv_cache_sf : Optional[Tuple[torch.Tensor, torch.Tensor]]
             Per-block scale factors for NVFP4 KV cache, as a tuple of ``(k_scales, v_scales)``.
-            Each scale tensor has shape ``[num_pages, num_kv_heads, page_size, head_dim // 16]``
-            in HND layout, with dtype ``torch.float8_e4m3fn``.
-            The V scale factors must be in the SM100 interleaved layout (token dimension
-            swizzled by groups of 4). Use :func:`flashinfer.fp4_quantization.nvfp4_quantize_paged_kv_cache`
-            to produce correctly formatted scale factors.
+            Scale tensors must follow the same :attr:`kv_layout` as the KV cache:
+
+            * **HND**: ``[num_pages, num_kv_heads, page_size, head_dim // 16]``
+            * **NHD**: ``[num_pages, page_size, num_kv_heads, head_dim // 16]``
+
+            Both tensors have dtype ``torch.float8_e4m3fn``. ``k_scales`` uses a linear
+            (row-major) layout, while ``v_scales`` must use TRT-LLM's 4-token interleaved
+            layout within each ``[page_size, head_dim // 16]`` tile. Use
+            :func:`flashinfer.fp4_quantization.nvfp4_quantize_paged_kv_cache` to produce
+            correctly formatted scale factors.
+
+            For the trtllm-gen backend with ``NHD`` layout, scale tensors are transposed
+            to HND internally (incurring a copy). Use ``HND`` for better performance.
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -2216,6 +2224,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
         key_block_scales = None
         value_block_scales = None
         if kv_cache_sf is not None:
+            if (
+                not isinstance(kv_cache_sf, (tuple, list))
+                or len(kv_cache_sf) != 2
+                or not all(torch.is_tensor(x) for x in kv_cache_sf)
+            ):
+                raise TypeError(
+                    "kv_cache_sf must be a tuple/list of two tensors: (k_scales, v_scales)."
+                )
             key_block_scales, value_block_scales = kv_cache_sf
 
         o_dtype = self._cached_o_data_type
@@ -3797,8 +3813,19 @@ def trtllm_batch_context_with_kv_cache(
         additional value per head in the denominator of the softmax.
     kv_cache_sf : Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         Per-block scale factors for NVFP4 KV cache, as a tuple of ``(k_scales, v_scales)``.
-        Each scale tensor has shape ``[num_pages, num_kv_heads, page_size, head_dim // 16]``
-        in HND layout, with dtype ``torch.float8_e4m3fn``.
+        Scale tensors must follow the same :attr:`kv_layout` as the KV cache:
+
+        * **HND**: ``[num_pages, num_kv_heads, page_size, head_dim // 16]``
+        * **NHD**: ``[num_pages, page_size, num_kv_heads, head_dim // 16]``
+
+        Both tensors have dtype ``torch.float8_e4m3fn``. ``k_scales`` uses a linear
+        (row-major) layout, while ``v_scales`` must use TRT-LLM's 4-token interleaved
+        layout within each ``[page_size, head_dim // 16]`` tile. Use
+        :func:`flashinfer.fp4_quantization.nvfp4_quantize_paged_kv_cache` to produce
+        correctly formatted scale factors.
+
+        When :attr:`kv_layout` is ``NHD``, scale tensors are transposed to HND internally
+        (incurring a ``.contiguous()`` copy). Use ``HND`` for better performance.
 
         **Contiguity requirements (trtllm-gen backend):**
 
@@ -3842,6 +3869,14 @@ def trtllm_batch_context_with_kv_cache(
     key_block_scales = None
     value_block_scales = None
     if kv_cache_sf is not None:
+        if (
+            not isinstance(kv_cache_sf, (tuple, list))
+            or len(kv_cache_sf) != 2
+            or not all(torch.is_tensor(x) for x in kv_cache_sf)
+        ):
+            raise TypeError(
+                "kv_cache_sf must be a tuple/list of two tensors: (k_scales, v_scales)."
+            )
         key_block_scales, value_block_scales = kv_cache_sf
 
     # Convert NHD layout to HND if necessary
