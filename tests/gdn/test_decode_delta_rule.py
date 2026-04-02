@@ -42,15 +42,16 @@ from flashinfer.gdn_decode import (
 )
 from flashinfer.utils import get_compute_capability
 
-# Import the gdn_decode_klast_bf16_state kernel (T=1..4, bf16 state, K-last layout)
+# Import BF16 state kernels (T=1 and MTP)
 try:
     from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
-        gated_delta_rule as gdn_decode_klast_bf16_state,
+        gated_delta_rule as gdn_decode_bf16_state,
+        gated_delta_rule_mtp as gdn_decode_bf16_state_mtp,
     )
 
-    GDN_DECODE_KLAST_BF16_STATE_AVAILABLE = True
+    GDN_DECODE_BF16_STATE_AVAILABLE = True
 except ImportError:
-    GDN_DECODE_KLAST_BF16_STATE_AVAILABLE = False
+    GDN_DECODE_BF16_STATE_AVAILABLE = False
 
 
 def _skip_if_not_sm90_or_later():
@@ -60,9 +61,71 @@ def _skip_if_not_sm90_or_later():
         pytest.skip(f"GDN decode requires SM90+ or SM100+, but got SM{cc[0]}{cc[1]}")
 
 
+def _assert_close_large_tensor(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    atol: float,
+    rtol: float,
+    msg: str,
+    timestep_dim: int | None = None,
+):
+    """Manual assert_close for large tensors that avoids RuntimeError in error formatting.
+
+    torch.testing.assert_close crashes with RuntimeError when trying to format
+    error messages for tensors with >1B elements. This function computes the
+    comparison manually and reports per-timestep error diagnostics on failure.
+    """
+    # Compare per-slice to avoid allocating huge temporary tensors
+    if timestep_dim is not None and actual.ndim > timestep_dim:
+        T = actual.shape[timestep_dim]
+        per_t_stats = []
+        any_violation = False
+        for t in range(T):
+            diff_t = (
+                actual.select(timestep_dim, t).float()
+                - expected.select(timestep_dim, t).float()
+            ).abs()
+            tol_t = atol + rtol * expected.select(timestep_dim, t).float().abs()
+            violations_t = diff_t > tol_t
+            count = violations_t.sum().item()
+            total = violations_t.numel()
+            per_t_stats.append(
+                (t, diff_t.max().item(), diff_t.mean().item(), count, total)
+            )
+            if count > 0:
+                any_violation = True
+            del diff_t, tol_t, violations_t
+
+        if not any_violation:
+            return
+
+        lines = [msg]
+        for t, t_max, t_mean, t_count, t_total in per_t_stats:
+            lines.append(
+                f"  t={t}: max_abs={t_max:.6f}, mean={t_mean:.6f}, "
+                f"violations={t_count}/{t_total} ({100 * t_count / t_total:.4f}%)"
+            )
+        lines.append(f"  Tolerances: atol={atol}, rtol={rtol}")
+        raise AssertionError("\n".join(lines))
+    else:
+        diff = (actual.float() - expected.float()).abs()
+        tol = atol + rtol * expected.float().abs()
+        violations = diff > tol
+        if not violations.any():
+            return
+        num_violations = violations.sum().item()
+        total = violations.numel()
+        raise AssertionError(
+            f"{msg}\n"
+            f"  Max abs error: {diff.max().item():.6f}, "
+            f"Violations: {num_violations}/{total} ({100 * num_violations / total:.4f}%), "
+            f"Tolerances: atol={atol}, rtol={rtol}"
+        )
+
+
 # ============================================================================
 # Test decode kernel with pretranspose version ([B*HV, V, K])
-# Reference: fp32 h state (default); bf16 h state used only for gdn_decode_klast_bf16_state.
+# Reference: fp32 h state (default); bf16 h state used only for gdn_decode_bf16_state.
 # ============================================================================
 
 
@@ -202,7 +265,6 @@ def _test_decode_kernel_pretranspose(
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 32)],
 )
-@pytest.mark.skip(reason="Temporarily skipped due to CI failures.")
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64, 128, 256, 512])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_decode_kernel_basic_pretranspose(
@@ -368,7 +430,6 @@ def _test_decode_kernel_nontranspose(
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 32)],
 )
-@pytest.mark.skip(reason="Temporarily skipped due to CI failures.")
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64, 128, 256, 512])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_decode_kernel_basic_nontranspose(
@@ -513,7 +574,6 @@ def _test_decode_kernel_pretranspose_pool(
 @pytest.mark.parametrize("scale", [1.0])
 @pytest.mark.parametrize("head_size", [128])
 @pytest.mark.parametrize("num_q_heads, num_k_heads, num_v_heads", [(16, 16, 32)])
-@pytest.mark.skip(reason="Temporarily skipped due to CI failures.")
 @pytest.mark.parametrize("batch_size", [1, 4, 16, 32])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_decode_kernel_pretranspose_pool(
@@ -770,7 +830,6 @@ def _test_decode_kernel_pretranspose_pool_all_padding(
 @pytest.mark.parametrize("scale", [1.0])
 @pytest.mark.parametrize("head_size", [128])
 @pytest.mark.parametrize("num_q_heads, num_k_heads, num_v_heads", [(16, 16, 32)])
-@pytest.mark.skip(reason="Temporarily skipped due to CI failures.")
 @pytest.mark.parametrize("batch_size", [1, 4, 8, 32, 127])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_decode_kernel_pretranspose_pool_negative_indices(
@@ -798,7 +857,6 @@ def test_decode_kernel_pretranspose_pool_negative_indices(
 @pytest.mark.parametrize("scale", [1.0])
 @pytest.mark.parametrize("head_size", [128])
 @pytest.mark.parametrize("num_q_heads, num_k_heads, num_v_heads", [(16, 16, 32)])
-@pytest.mark.skip(reason="Temporarily skipped due to CI failures.")
 @pytest.mark.parametrize("batch_size", [1, 4, 16, 32])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_decode_kernel_pretranspose_pool_all_padding(
@@ -1132,12 +1190,15 @@ def _test_verify_kernel_mtp(
             -2, -1
         )  # [pool_size, T, HV, K, V]
 
-        torch.testing.assert_close(
+        # Use manual comparison to avoid RuntimeError from torch.testing.assert_close
+        # when formatting error messages for tensors with >1B elements (e.g. [512, 5, 32, 128, 128])
+        _assert_close_large_tensor(
             intermediate_states_kernel.float(),
             intermediate_states_ref.float(),
             atol=atol_s,
             rtol=rtol_s,
             msg=f"Intermediate states mismatch for MTP kernel (B={B}, T={T}, dtype={dtype})",
+            timestep_dim=1,
         )
 
     # Compare final state if state update is enabled
@@ -1165,7 +1226,6 @@ def _test_verify_kernel_mtp(
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 32)],
 )
-@pytest.mark.skip(reason="Temporarily skipped due to CI failures.")
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_verify_kernel_mtp(
@@ -1206,7 +1266,6 @@ def test_verify_kernel_mtp(
 
 
 @pytest.mark.parametrize("seq_len", [2, 3, 4, 5, 6, 7, 8])
-@pytest.mark.skip(reason="Temporarily skipped due to CI failures.")
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64, 128, 256, 512])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_mtp_fp32_state_with_cache_and_state_update(
@@ -1244,43 +1303,41 @@ def test_mtp_fp32_state_with_cache_and_state_update(
 
 
 # ============================================================================
-# Test gdn_decode_klast_bf16_state kernel (T=1..4, bf16 state, K-last)
+# Test BF16 state kernel (T=1..4, bf16 state, K-last)
 # Reference: bf16 h state only here (state_dtype=torch.bfloat16). Other kernels
 # above use fp32 h state reference.
 # ============================================================================
 
 
-def _test_gdn_decode_klast_bf16_state_kernel(
+def _test_gdn_decode_bf16_state_kernel(
     dtype: str,
     batch_size: int,
     num_q_heads: int,
     num_k_heads: int,
     num_v_heads: int,
     head_size: int,
-    seq_len: int,  # T=1,2,3,4
+    seq_len: int,
     scale: float,
     alpha: bool,
     beta: bool,
     seed: int | None = None,
 ):
-    """Test gdn_decode_klast_bf16_state kernel for T=1,2,3,4 with bf16 h state.
+    """Test BF16 state kernel with bf16 h state.
 
     Both kernel and reference use bf16 h state: reference runs with
     state_dtype=torch.bfloat16 (read h as fp32, compute in fp32, store h in bf16)
-    so the comparison is apples-to-apples with the gdn_decode_klast_bf16_state kernel.
+    so the comparison is apples-to-apples with the BF16 state kernel.
     """
     _skip_if_not_sm90_or_later()
 
-    if not GDN_DECODE_KLAST_BF16_STATE_AVAILABLE:
-        pytest.skip("gdn_decode_klast_bf16_state kernel not available")
+    if not GDN_DECODE_BF16_STATE_AVAILABLE:
+        pytest.skip("BF16 state kernel not available")
 
     random.seed(seed)
     torch.random.manual_seed(seed)
     torch.cuda.manual_seed(seed)
 
-    assert seq_len in [1, 2, 3, 4], (
-        f"gdn_decode_klast_bf16_state supports T=1,2,3,4, got T={seq_len}"
-    )
+    assert seq_len >= 1, f"seq_len must be >= 1, got T={seq_len}"
 
     # State and GDN parameters are based on num_v_heads (HV in kernel API)
     num_sab_heads = num_v_heads
@@ -1297,7 +1354,7 @@ def _test_gdn_decode_klast_bf16_state_kernel(
         # NOTE: Do NOT pre-normalize K here. Both the kernel (use_qk_l2norm_in_kernel=True)
         # and reference will apply L2 normalization internally after GQA expansion.
 
-        # gdn_decode_klast_bf16_state kernel expects [B, HV, V, K] (K-fast layout) in BF16.
+        # BF16 state kernel expects [B, HV, V, K] (K-fast layout) in BF16.
         # Use the same bf16 initial state for both kernel and reference so we
         # compare the bf16 h state path.
         input_state_kernel = torch.randn(
@@ -1311,7 +1368,7 @@ def _test_gdn_decode_klast_bf16_state_kernel(
         # A_log: log decay parameter [HV] - must be float32
         A_log = torch.randn(num_sab_heads, dtype=torch.float32, device=device) * 0.1
 
-        # dt_bias: decay bias [HV] - must be float32 for gdn_decode_klast_bf16_state kernel
+        # dt_bias: decay bias [HV] - must be float32 for BF16 state kernel
         dt_bias = torch.randn(num_sab_heads, dtype=torch.float32, device=device) * 0.1
 
         # a: input-dependent decay [B, T, HV]
@@ -1335,9 +1392,10 @@ def _test_gdn_decode_klast_bf16_state_kernel(
                 * 10.0
             )
 
-    # Call gdn_decode_klast_bf16_state kernel
+    # Call BF16 state kernel (T=1 uses gated_delta_rule, T>1 uses MTP)
     our_state = input_state_kernel.clone()
-    our_o = gdn_decode_klast_bf16_state(
+    kernel_fn = gdn_decode_bf16_state if seq_len == 1 else gdn_decode_bf16_state_mtp
+    our_o = kernel_fn(
         A_log=A_log,
         a=a,
         dt_bias=dt_bias,
@@ -1392,7 +1450,7 @@ def _test_gdn_decode_klast_bf16_state_kernel(
         ref_o.float(),
         atol=atol_o,
         rtol=rtol_o,
-        msg=f"Output mismatch for gdn_decode_klast_bf16_state kernel (B={batch_size}, T={seq_len})",
+        msg=f"Output mismatch for BF16 state kernel (B={batch_size}, T={seq_len})",
     )
 
     # Compare states: both in bf16 (kernel [B, HV, V, K], ref [B, HV, K, V])
@@ -1402,11 +1460,11 @@ def _test_gdn_decode_klast_bf16_state_kernel(
         ref_state_transposed.float(),
         atol=atol_kv,
         rtol=rtol_kv,
-        msg=f"State mismatch for gdn_decode_klast_bf16_state kernel (B={batch_size}, T={seq_len})",
+        msg=f"State mismatch for BF16 state kernel (B={batch_size}, T={seq_len})",
     )
 
     print(
-        f"✓ gdn_decode_klast_bf16_state kernel test passed (batch={batch_size}, T={seq_len}, dtype={dtype}, h_state=bf16)"
+        f"✓ BF16 state kernel test passed (batch={batch_size}, T={seq_len}, dtype={dtype}, h_state=bf16)"
     )
 
 
@@ -1419,10 +1477,9 @@ def _test_gdn_decode_klast_bf16_state_kernel(
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 32)],
 )
-@pytest.mark.skip(reason="Temporarily skipped due to CI failures.")
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64, 128])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
-def test_gdn_decode_klast_bf16_state_kernel(
+def test_gdn_decode_bf16_state_kernel(
     dtype: str,
     num_q_heads: int,
     num_k_heads: int,
@@ -1436,7 +1493,7 @@ def test_gdn_decode_klast_bf16_state_kernel(
     seed: int = int(os.environ.get("SEED", "0")),
 ):
     scale_val = 1.0 / math.sqrt(head_size) if scale == "auto" else scale
-    _test_gdn_decode_klast_bf16_state_kernel(
+    _test_gdn_decode_bf16_state_kernel(
         dtype,
         batch_size,
         num_q_heads,
@@ -1451,7 +1508,6 @@ def test_gdn_decode_klast_bf16_state_kernel(
     )
 
 
-@pytest.mark.skip(reason="Temporarily skipped due to CI failures.")
 @pytest.mark.parametrize("seq_len", [1, 2, 3, 4])
 @pytest.mark.parametrize("batch_size", [1, 2, 4])
 @pytest.mark.parametrize("head_size", [128])
@@ -1459,7 +1515,7 @@ def test_gdn_decode_klast_bf16_state_kernel(
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 32)],
 )
-def test_pretranspose_api_uses_gdn_decode_klast_bf16_state(
+def test_pretranspose_api_uses_gdn_decode_bf16_state(
     num_q_heads: int,
     num_k_heads: int,
     num_v_heads: int,
@@ -1468,13 +1524,13 @@ def test_pretranspose_api_uses_gdn_decode_klast_bf16_state(
     seq_len: int,
     seed: int = int(os.environ.get("SEED", "0")),
 ):
-    """Verify gated_delta_rule_decode_pretranspose dispatches to gdn_decode_klast_bf16_state when state is bf16 and T<=4, K=V=128.
+    """Verify gated_delta_rule_decode_pretranspose dispatches to BF16 state kernel when state is bf16 and K=V=128.
 
-    Calls the API with bf16 state and checks output/state match the direct gdn_decode_klast_bf16_state call.
+    Calls the API with bf16 state and checks output/state match the direct kernel call.
     """
     _skip_if_not_sm90_or_later()
-    if not GDN_DECODE_KLAST_BF16_STATE_AVAILABLE:
-        pytest.skip("gdn_decode_klast_bf16_state kernel not available")
+    if not GDN_DECODE_BF16_STATE_AVAILABLE:
+        pytest.skip("BF16 state kernel not available")
 
     random.seed(seed)
     torch.random.manual_seed(seed)
@@ -1515,7 +1571,7 @@ def test_pretranspose_api_uses_gdn_decode_klast_bf16_state(
     )
     state_direct = state_api.clone()
 
-    # Via API (should dispatch to gdn_decode_klast_bf16_state)
+    # Via API (should dispatch to gdn_decode_bf16_state)
     out_api, state_api = gated_delta_rule_decode_pretranspose(
         q=q,
         k=k,
@@ -1529,8 +1585,9 @@ def test_pretranspose_api_uses_gdn_decode_klast_bf16_state(
         use_qk_l2norm=True,
     )
 
-    # Direct improved kernel
-    out_direct = gdn_decode_klast_bf16_state(
+    # Direct improved kernel (T=1 uses gdn_decode_bf16_state, T>1 uses MTP variant)
+    kernel_fn = gdn_decode_bf16_state if seq_len == 1 else gdn_decode_bf16_state_mtp
+    out_direct = kernel_fn(
         A_log=A_log,
         a=a,
         dt_bias=dt_bias,
@@ -1548,7 +1605,376 @@ def test_pretranspose_api_uses_gdn_decode_klast_bf16_state(
     torch.testing.assert_close(out_api, out_direct, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(state_api, state_direct, atol=1e-2, rtol=1e-2)
     print(
-        f"✓ API gdn_decode_klast_bf16_state backend verified (batch={batch_size}, T={seq_len})"
+        f"✓ API gdn_decode_bf16_state backend verified (batch={batch_size}, T={seq_len})"
+    )
+
+
+# ============================================================================
+# Test BF16 state kernel (T=1)
+# ============================================================================
+
+
+def _test_gdn_decode_bf16_state_t1_kernel(
+    dtype: str,
+    batch_size: int,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_size: int,
+    scale: float,
+    alpha: bool,
+    beta: bool,
+    seed: int | None = None,
+):
+    """Test BF16 state kernel for T=1.
+
+    Both kernel and reference use bf16 h state so the comparison is apples-to-apples.
+    """
+    _skip_if_not_sm90_or_later()
+
+    if not GDN_DECODE_BF16_STATE_AVAILABLE:
+        pytest.skip("BF16 state kernel not available")
+
+    random.seed(seed)
+    torch.random.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+    num_sab_heads = num_v_heads
+    dtype_torch = getattr(torch, dtype)
+    device = torch.device("cuda")
+
+    with device:
+        q = torch.randn(batch_size, 1, num_q_heads, head_size, dtype=dtype_torch)
+        k = torch.randn(batch_size, 1, num_k_heads, head_size, dtype=dtype_torch)
+        v = torch.randn(batch_size, 1, num_v_heads, head_size, dtype=dtype_torch)
+
+        input_state_kernel = torch.randn(
+            batch_size, num_sab_heads, head_size, head_size, dtype=torch.bfloat16
+        )
+        input_state_ref_bf16 = input_state_kernel.transpose(-2, -1).contiguous()
+
+        A_log = torch.randn(num_sab_heads, dtype=torch.float32, device=device) * 0.1
+        dt_bias = torch.randn(num_sab_heads, dtype=torch.float32, device=device) * 0.1
+        a = (
+            torch.randn(batch_size, 1, num_sab_heads, dtype=dtype_torch, device=device)
+            * 0.1
+        )
+
+        if beta:
+            b_tensor = torch.randn(
+                batch_size, 1, num_sab_heads, dtype=dtype_torch, device=device
+            )
+        else:
+            b_tensor = (
+                torch.ones(
+                    batch_size, 1, num_sab_heads, dtype=dtype_torch, device=device
+                )
+                * 10.0
+            )
+
+    our_state = input_state_kernel.clone()
+    our_o = gdn_decode_bf16_state(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        softplus_beta=1.0,
+        softplus_threshold=20.0,
+        q=q,
+        k=k,
+        v=v,
+        b=b_tensor,
+        initial_state_source=our_state,
+        use_qk_l2norm_in_kernel=True,
+        scale=scale,
+    )
+
+    torch.cuda.synchronize()
+
+    ref_state = input_state_ref_bf16.clone()
+    ref_o_t, ref_state = decode_delta_rule(
+        q[:, 0].float(),
+        k[:, 0].float(),
+        v[:, 0].float(),
+        ref_state,
+        A_log=A_log,
+        a=a[:, 0],
+        dt_bias=dt_bias,
+        b=b_tensor[:, 0],
+        scale_factor=scale,
+        softplus_beta=1.0,
+        softplus_threshold=20.0,
+        use_l2_norm=True,
+        state_dtype=torch.bfloat16,
+    )
+    ref_o = ref_o_t.unsqueeze(1).to(dtype_torch)
+
+    atol_o = 0.001
+    rtol_o = 0.005
+    # State tolerances slightly higher: BF16 state accumulation at large batch
+    # sizes can produce diffs up to ~0.016 (1 BF16 ULP at magnitude ~2)
+    atol_kv = 0.02
+    rtol_kv = 0.01
+
+    torch.testing.assert_close(
+        our_o.float(),
+        ref_o.float(),
+        atol=atol_o,
+        rtol=rtol_o,
+        msg=f"Output mismatch for BF16 state kernel (B={batch_size})",
+    )
+
+    ref_state_transposed = ref_state.transpose(-2, -1).contiguous()
+    torch.testing.assert_close(
+        our_state.float(),
+        ref_state_transposed.float(),
+        atol=atol_kv,
+        rtol=rtol_kv,
+        msg=f"State mismatch for BF16 state kernel (B={batch_size})",
+    )
+
+    print(f"  BF16 state T=1 PASS (batch={batch_size}, dtype={dtype})")
+
+
+@pytest.mark.parametrize("beta", [True])
+@pytest.mark.parametrize("alpha", [True])
+@pytest.mark.parametrize("scale", ["auto"])
+@pytest.mark.parametrize("head_size", [128])
+@pytest.mark.parametrize(
+    "num_q_heads, num_k_heads, num_v_heads",
+    [(16, 16, 32)],
+)
+@pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64, 128, 256, 512])
+@pytest.mark.parametrize("dtype", ["bfloat16"])
+def test_gdn_decode_bf16_state_t1_kernel(
+    dtype: str,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_size: int,
+    batch_size: int,
+    scale: float | str,
+    alpha: bool,
+    beta: bool,
+    seed: int = int(os.environ.get("SEED", "0")),
+):
+    scale_val = 1.0 / math.sqrt(head_size) if scale == "auto" else scale
+    _test_gdn_decode_bf16_state_t1_kernel(
+        dtype,
+        batch_size,
+        num_q_heads,
+        num_k_heads,
+        num_v_heads,
+        head_size,
+        scale_val,
+        alpha,
+        beta,
+        seed,
+    )
+
+
+# ============================================================================
+# Test BF16 state MTP kernel (T>=2)
+# ============================================================================
+
+
+def _test_gdn_decode_bf16_state_mtp_kernel(
+    dtype: str,
+    batch_size: int,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_size: int,
+    seq_len: int,
+    scale: float,
+    cache_intermediate_states: bool,
+    seed: int | None = None,
+):
+    """Test MTP BF16 state kernel for T>=2.
+
+    Both kernel and reference use bf16 h state.
+    Tests cache_intermediate_states and disable_state_update=True.
+    """
+    _skip_if_not_sm90_or_later()
+
+    if not GDN_DECODE_BF16_STATE_AVAILABLE:
+        pytest.skip("BF16 state kernel not available")
+
+    random.seed(seed)
+    torch.random.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+    num_sab_heads = num_v_heads
+    dtype_torch = getattr(torch, dtype)
+    device = torch.device("cuda")
+
+    with device:
+        q = torch.randn(batch_size, seq_len, num_q_heads, head_size, dtype=dtype_torch)
+        k = torch.randn(batch_size, seq_len, num_k_heads, head_size, dtype=dtype_torch)
+        v = torch.randn(batch_size, seq_len, num_v_heads, head_size, dtype=dtype_torch)
+
+        pool_size = batch_size
+        input_state_kernel = torch.randn(
+            pool_size, num_sab_heads, head_size, head_size, dtype=torch.bfloat16
+        )
+        input_state_ref_bf16 = input_state_kernel.transpose(-2, -1).contiguous()
+
+        A_log = torch.randn(num_sab_heads, dtype=torch.float32, device=device) * 0.1
+        dt_bias = torch.randn(num_sab_heads, dtype=torch.float32, device=device) * 0.1
+        a = (
+            torch.randn(
+                batch_size, seq_len, num_sab_heads, dtype=dtype_torch, device=device
+            )
+            * 0.1
+        )
+        b_tensor = torch.randn(
+            batch_size, seq_len, num_sab_heads, dtype=dtype_torch, device=device
+        )
+        initial_state_indices = torch.arange(
+            batch_size, dtype=torch.int32, device=device
+        )
+
+    if cache_intermediate_states:
+        intermediate_states_buffer = torch.zeros(
+            pool_size,
+            seq_len,
+            num_sab_heads,
+            head_size,
+            head_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+    else:
+        intermediate_states_buffer = None
+
+    # Test with disable_state_update=True (MTP verify mode)
+    our_state = input_state_kernel.clone()
+    our_o = gdn_decode_bf16_state_mtp(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        softplus_beta=1.0,
+        softplus_threshold=20.0,
+        q=q,
+        k=k,
+        v=v,
+        b=b_tensor,
+        initial_state_source=our_state,
+        initial_state_indices=initial_state_indices,
+        intermediate_states_buffer=intermediate_states_buffer,
+        disable_state_update=True,
+        use_qk_l2norm_in_kernel=True,
+        scale=scale,
+    )
+
+    torch.cuda.synchronize()
+
+    # Reference: step through tokens with bf16 state
+    ref_state = input_state_ref_bf16.clone()
+    ref_outputs = []
+    ref_intermediate_states = []
+
+    for t in range(seq_len):
+        ref_o_t, ref_state = decode_delta_rule(
+            q[:, t].float(),
+            k[:, t].float(),
+            v[:, t].float(),
+            ref_state,
+            A_log=A_log,
+            a=a[:, t],
+            dt_bias=dt_bias,
+            b=b_tensor[:, t],
+            scale_factor=scale,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+            use_l2_norm=True,
+            state_dtype=torch.bfloat16,
+        )
+        ref_outputs.append(ref_o_t)
+        if cache_intermediate_states:
+            ref_intermediate_states.append(ref_state.clone())
+
+    ref_o = torch.stack(ref_outputs, dim=1).to(dtype_torch)
+
+    atol_o = 0.001
+    rtol_o = 0.005
+
+    torch.testing.assert_close(
+        our_o.float(),
+        ref_o.float(),
+        atol=atol_o,
+        rtol=rtol_o,
+        msg=f"Output mismatch for MTP BF16 state kernel (B={batch_size}, T={seq_len})",
+    )
+
+    # With disable_state_update=True, initial state should be unchanged
+    torch.testing.assert_close(
+        our_state.float(),
+        input_state_kernel.float(),
+        atol=0,
+        rtol=0,
+        msg=f"State should be unchanged with disable_state_update=True (B={batch_size}, T={seq_len})",
+    )
+
+    # Check intermediate states buffer contents against reference
+    if cache_intermediate_states and intermediate_states_buffer is not None:
+        # intermediate_states_buffer: [pool_size, T, HV, V, K] (K-last layout, bf16)
+        # ref intermediate states: [B, HV, K, V] per step (K-major layout, bf16)
+        # Stack ref: [B, T, HV, K, V], transpose to [B, T, HV, V, K] for comparison
+        ref_inter = torch.stack(ref_intermediate_states, dim=1)  # [B, T, HV, K, V]
+        ref_inter_transposed = ref_inter.transpose(
+            -2, -1
+        ).contiguous()  # [B, T, HV, V, K]
+
+        atol_s = 0.02
+        rtol_s = 0.01
+        torch.testing.assert_close(
+            intermediate_states_buffer.float(),
+            ref_inter_transposed.float(),
+            atol=atol_s,
+            rtol=rtol_s,
+            msg=f"Intermediate states mismatch for MTP BF16 state kernel (B={batch_size}, T={seq_len})",
+        )
+
+    print(
+        f"  BF16 state MTP PASS (batch={batch_size}, T={seq_len}, "
+        f"cache_intermediate={cache_intermediate_states})"
+    )
+
+
+@pytest.mark.parametrize("cache_intermediate_states", [True, False])
+@pytest.mark.parametrize("seq_len", [2, 4, 8])
+@pytest.mark.parametrize("scale", ["auto"])
+@pytest.mark.parametrize("head_size", [128])
+@pytest.mark.parametrize(
+    "num_q_heads, num_k_heads, num_v_heads",
+    [(16, 16, 32)],
+)
+@pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("dtype", ["bfloat16"])
+def test_gdn_decode_bf16_state_mtp_kernel(
+    dtype: str,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_size: int,
+    batch_size: int,
+    seq_len: int,
+    scale: float | str,
+    cache_intermediate_states: bool,
+    seed: int = int(os.environ.get("SEED", "0")),
+):
+    scale_val = 1.0 / math.sqrt(head_size) if scale == "auto" else scale
+    _test_gdn_decode_bf16_state_mtp_kernel(
+        dtype,
+        batch_size,
+        num_q_heads,
+        num_k_heads,
+        num_v_heads,
+        head_size,
+        seq_len,
+        scale_val,
+        cache_intermediate_states,
+        seed,
     )
 
 
@@ -1622,10 +2048,10 @@ if __name__ == "__main__":
         seed=42,
     )
 
-    print("\n=== Testing IMPROVED CuTe-DSL version (T=1,2,3,4) ===")
-    if GDN_DECODE_KLAST_BF16_STATE_AVAILABLE:
+    print("\n=== Testing BF16 state kernel (T=1,2,3,4) ===")
+    if GDN_DECODE_BF16_STATE_AVAILABLE:
         for t in [1, 2, 3, 4]:
-            _test_gdn_decode_klast_bf16_state_kernel(
+            _test_gdn_decode_bf16_state_kernel(
                 dtype="bfloat16",
                 batch_size=4,
                 num_q_heads=16,
@@ -1639,7 +2065,7 @@ if __name__ == "__main__":
                 seed=42,
             )
     else:
-        print("⚠ gdn_decode_klast_bf16_state kernel not available, skipping...")
+        print("⚠ BF16 state kernel not available, skipping...")
 
     print("\n✅ All smoke tests passed!")
     print("\nTo run full test suite:")
@@ -1653,6 +2079,6 @@ if __name__ == "__main__":
         "  MTP (VERIFY):       pytest test_decode_delta_rule.py::test_verify_kernel_mtp -v"
     )
     print(
-        "  gdn_decode_klast_bf16_state:  pytest test_decode_delta_rule.py::test_gdn_decode_klast_bf16_state_kernel -v"
+        "  gdn_decode_bf16_state:  pytest test_decode_delta_rule.py::test_gdn_decode_bf16_state_kernel -v"
     )
     print("  ALL: pytest test_decode_delta_rule.py -v")
