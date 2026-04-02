@@ -397,7 +397,16 @@ class TunableRunner(ABC):
         raise NotImplementedError
 
     def __hash__(self):
-        return hash(tuple(self.__dict__.values()))
+        hashable_vals = []
+        for k, v in self.__dict__.items():
+            if k.endswith("_cache"):
+                continue
+            try:
+                hash(v)
+                hashable_vals.append(v)
+            except TypeError:
+                hashable_vals.append(id(v))
+        return hash(tuple(hashable_vals))
 
 
 @contextlib.contextmanager
