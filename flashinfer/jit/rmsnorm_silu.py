@@ -21,7 +21,7 @@ from .core import JitSpec, gen_jit_spec
 from .utils import write_if_different
 
 
-# Knob LUT ported from sm100_rms_norm_silu_knobs.h
+# Sweep-tuned knob LUT for SM100 (B200) VAE problem sizes.
 # Format: (warps_m, split_cols, kernel_cfg, occupancy, bytes_per_ldg)
 _KNOB_LUT = {
     # C=64
