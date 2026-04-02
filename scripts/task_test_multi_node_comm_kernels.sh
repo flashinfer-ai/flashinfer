@@ -14,6 +14,14 @@ source "${SCRIPT_DIR}/setup_test_env.sh"
 # echo "Cache cleaned."
 # echo ""
 
+# Ensure we're actually running on multiple nodes
+SLURM_NODES="${SLURM_NNODES:-1}"
+if [ "$SLURM_NODES" -lt 2 ]; then
+    echo "ERROR: Multi-node tests require at least 2 nodes, but SLURM_NNODES=${SLURM_NODES}."
+    echo "Check that the CI job sets SLURM_NODES >= 2."
+    exit 1
+fi
+
 # Disable sanity testing for multi-node tests (always run full suite)
 # shellcheck disable=SC2034  # Used by common_test_functions.sh
 DISABLE_SANITY_TEST=true
