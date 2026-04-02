@@ -14,6 +14,7 @@ import torch
 from typing_extensions import deprecated
 
 from flashinfer.comm.mapping import Mapping
+from flashinfer.comm.mnnvl import TorchDistBackend
 
 from ..jit import gen_trtllm_mnnvl_comm_module
 from ..utils import register_custom_op
@@ -156,14 +157,18 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         #     torch.device("cuda", torch.cuda.current_device()),
         #     comm_backend,
         # )
-        device=torch.device("cuda", mapping.local_rank)
-        #TODO (asamani): fix group based on comm_backend?
-        group = torch.distributed.group.WORLD
-        group_name = group.group_name if group is not None else torch.distributed.group.WORLD.group_name
+        device = torch.device("cuda", torch.cuda.current_device())
+        # device = torch.device("cuda", mapping.local_rank)
+        if isinstance(comm_backend, TorchDistBackend):
+            group = comm_backend._group if comm_backend._group is not None else torch.distributed.group.WORLD
+            group_name = group.group_name
+        else:
+            # MPIBackend or other — fall back to WORLD
+            group_name = torch.distributed.group.WORLD.group_name
         self.ptrs, self.tensor, self.handle = _alloc_symm_buffer_bytes(
             requested_workspace_size,
             mapping.tp_size,
-            torch.float32, # TODO(asamani): should this always be f32 or dtype?
+            torch.float32,
             device,
             group_name,
         )
