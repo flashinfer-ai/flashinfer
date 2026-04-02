@@ -263,7 +263,7 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
     constexpr int kBlocksPerSM = 10;
     constexpr int kMaxCtas = DIM / kRowsPerPass;
     int const target_ctas = num_sms * kBlocksPerSM;
-    int const ctas_per_head = std::clamp(target_ctas / max(total_tiles, 1), 1, kMaxCtas);
+    int const ctas_per_head = std::clamp(target_ctas / std::max(total_tiles, 1), 1, kMaxCtas);
 
     auto launch = [&]<int CTAS_PER_HEAD>() {
       constexpr int DIM_PER_CTA = DIM / CTAS_PER_HEAD;
