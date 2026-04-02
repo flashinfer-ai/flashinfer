@@ -461,14 +461,20 @@ def autotune(
         if os.path.isfile(cache):
             cache_valid = tuner.load_configs(cache)
 
-    # Save and install tuning bucket overrides.
-    with tuner._lock:
-        prev_buckets = tuner._override_tuning_buckets
-        prev_round_up = tuner._override_round_up
-        if tuning_buckets is not None:
-            tuner._override_tuning_buckets = tuple(sorted(set(tuning_buckets)))
-        if round_up is not None:
-            tuner._override_round_up = round_up
+    # Push tuning bucket overrides onto per-thread stack.  Inherits from the
+    # current top-of-stack when a parameter is not explicitly supplied.
+    override_stack = tuner._get_override_stack()
+    current_buckets = override_stack[-1][0] if override_stack else None
+    current_round_up = override_stack[-1][1] if override_stack else False
+    new_buckets = (
+        tuple(sorted(set(tuning_buckets)))
+        if tuning_buckets is not None
+        else current_buckets
+    )
+    new_round_up = round_up if round_up is not None else current_round_up
+    pushed = new_buckets is not None or new_round_up
+    if pushed:
+        override_stack.append((new_buckets, new_round_up))
 
     # Reference-counted tuning mode: is_tuning_mode stays True as long as
     # at least one autotune(True) context is active, even if an
@@ -489,9 +495,9 @@ def autotune(
                 tuner._active_tuning_contexts -= 1
             tuner.is_tuning_mode = tuner._active_tuning_contexts > 0
 
-            # Restore previous override state.
-            tuner._override_tuning_buckets = prev_buckets
-            tuner._override_round_up = prev_round_up
+        # Pop the override we pushed (thread-local, no lock needed).
+        if pushed:
+            override_stack.pop()
 
         if autotune_enabled:
             logger.info("[Autotuner]: Autotuning process ends")
@@ -614,14 +620,36 @@ class AutoTuner:
         self._dirty = False
         self._dirty_seq = 0
 
-        # Tuning bucket overrides set by autotune() context manager.
-        self._override_tuning_buckets: Optional[Tuple[int, ...]] = None
-        self._override_round_up: bool = False
+        # Per-thread stack of (tuning_buckets, round_up) overrides set by
+        # autotune() context manager.  Using threading.local ensures concurrent
+        # autotune() contexts on different threads don't clobber each other.
+        self._override_local = threading.local()
         # Cache overridden TuningConfig objects to keep stable object identity
         # for _find_nearest_profile's LRU cache.
         self._override_config_cache: Dict[Any, "TuningConfig"] = (
             weakref.WeakValueDictionary()
         )
+
+    def _get_override_stack(self) -> List:
+        """Return the per-thread override stack, creating it on first access."""
+        local = self._override_local
+        if not hasattr(local, "stack"):
+            local.stack = []
+        return local.stack
+
+    @property
+    def _override_tuning_buckets(self) -> Optional[Tuple[int, ...]]:
+        stack = self._get_override_stack()
+        if stack:
+            return stack[-1][0]
+        return None
+
+    @property
+    def _override_round_up(self) -> bool:
+        stack = self._get_override_stack()
+        if stack:
+            return stack[-1][1]
+        return False
 
     @classmethod
     def get(cls):
