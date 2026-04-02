@@ -1,12 +1,12 @@
 #pragma once
-// Extracted from cudnn_frontend ln_headers.h for RmsNorm+SiLU kernel.
-// Original: cudnn_frontend/include/.../generated/rms_norm_silu/sm100/ln_headers.h
+// LayerNorm kernel headers for RmsNorm+SiLU (SM100 optimized).
+// Kernel_traits, Reducer, Stats, PersistentLnFwdParams, reduced_divisor, etc.
 
 #pragma once
 // Auto-generated lightweight LN kernel header.
 // Replaces the 151K-line persistent_ln_headers_13.0.h with:
 //   - Standard CUDA TK #include directives (resolved via --include-path at NVRTC compile time)
-//   - ~2900 lines of cuDNN-authored LN-specific code extracted from the original
+//   - ~2900 lines of LN-specific code extracted from the original
 //
 // CGA/cluster support (USE_CLUSTER) is disabled:
 //   - #include <cuda/ptx> and cooperative_groups are NOT included
@@ -116,17 +116,16 @@ typedef unsigned long long uint64_t;
 #endif
 
 // ============================================================
-// cuDNN-authored LN kernel utilities
-// Extracted from persistent_ln_headers_13.0.h
+// LN kernel utilities
 // ============================================================
 
-// cuDNN type aliases for FP8 types (from after inlined cuda_fp8.h)
+// Type aliases for FP8 types
 typedef __nv_fp8_e4m3 nv_fp8_e4m3;
 typedef __nv_fp8x2_e4m3 nv_fp8x2_e4m3;
 typedef __nv_fp8_e5m2 nv_fp8_e5m2;
 typedef __nv_fp8x2_e5m2 nv_fp8x2_e5m2;
 
-// cuDNN type aliases for FP4 types (from after inlined cuda_fp4.h)
+// Type aliases for FP4 types
 typedef __nv_fp4_e2m1 nv_fp4_e2m1;
 typedef __nv_fp4x2_e2m1 nv_fp4x2_e2m1;
 typedef __nv_fp4x4_e2m1 nv_fp4x4_e2m1;
@@ -1458,7 +1457,7 @@ struct Kernel_traits : public Base {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-constexpr float CUDNN_FLT_MIN =
+constexpr float LN_FLT_MIN =
     1.17549435082228750796873653722224568e-38F;  // Minimum positive normalized float value
 /**
  * Base class to provide common block scaling utilities, private to `BlockScaleHelper`
@@ -1489,8 +1488,8 @@ class BlockScaleHelperBase<Cvec, Ovec, 16> {
   static __device__ compute_t scale(const compute_t value) {
     constexpr compute_t nvfp4_max = 6.0f;
     compute_t result = value / nvfp4_max;
-    // Clamp to CUDNN_FLT_MIN to match reference implementation and avoid 0 scaling factors
-    return fmaxf(result, CUDNN_FLT_MIN);
+    // Clamp to LN_FLT_MIN to match reference implementation and avoid 0 scaling factors
+    return fmaxf(result, LN_FLT_MIN);
   }
 
   static __device__ scale_t fp32ToE4M3(float value) { return scale_t(value); }
@@ -1538,8 +1537,8 @@ class BlockScaleHelperBase<Cvec, Ovec, 32> {
   static __device__ compute_t scale(const compute_t value) {
     static constexpr float FP8_MAX = std::is_same<output_t, nv_fp8_e5m2>::value ? 57344.f : 448.f;
     compute_t result = value / FP8_MAX;
-    // Clamp to CUDNN_FLT_MIN to match reference implementation and avoid 0 scaling factors
-    return fmaxf(result, CUDNN_FLT_MIN);
+    // Clamp to LN_FLT_MIN to match reference implementation and avoid 0 scaling factors
+    return fmaxf(result, LN_FLT_MIN);
   }
 
   template <typename IOvec>

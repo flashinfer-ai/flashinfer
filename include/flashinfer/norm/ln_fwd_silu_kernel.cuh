@@ -1,6 +1,5 @@
 #pragma once
-// Extracted from cudnn_frontend ln_fwd_silu_kernel.h for RmsNorm+SiLU kernel.
-// Original: cudnn_frontend/include/.../generated/rms_norm_silu/sm100/ln_fwd_silu_kernel.h
+// Fused RmsNorm+SiLU forward kernel (SM100 optimized).
 //
 // IMPORTANT: Include ln_silu_headers.cuh and the config .inc BEFORE this file.
 // The config must define Ktraits, DESIRED_OCCUPANCY, and all constexpr flags.

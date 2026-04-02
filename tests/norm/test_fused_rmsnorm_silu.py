@@ -13,8 +13,7 @@
 # limitations under the License.
 """
 Unit tests for Fused RMSNorm + SiLU kernel.
-Tolerance and reference methodology matches the cuDNN frontend OSS test suite
-(test_sm100_rms_norm_silu_graph_api.py).
+Tests cover bf16, FP8, and NVFP4 output for all 40 LUT shapes plus fallback knobs.
 """
 
 import pytest
@@ -30,7 +29,7 @@ def get_cc():
 def rmsnorm_silu_reference(x, weight, eps, output_dtype=None):
     """Reference: RMSNorm + SiLU.
 
-    Matches the cuDNN test reference: compute entirely in float32.
+    Compute entirely in float32 for maximum reference accuracy.
     If output_dtype is specified, cast the result to that dtype.
     """
     rms = torch.sqrt(torch.mean(x.float() ** 2, dim=-1, keepdim=True) + eps)
@@ -75,7 +74,7 @@ def _unpack_fp4_nibbles(packed_bytes, num_tokens, C):
 def _quantize_to_fp4_reference(values_f32, C):
     """Quantize float32 values to FP4 E2M1 nibbles matching the kernel's algorithm.
 
-    Matches cuDNN BlockScaleRowHelper:
+    Matches the kernel's block-scale quantization:
       1. amax = max(|block of 16 elements|)
       2. scale = max(amax / 6.0, FLT_MIN)
       3. quantized = nv_fp4x2_e2m1(value / scale)
@@ -144,7 +143,7 @@ ALL_LUT_SHAPES = [(tokens, C) for C in SUPPORTED_C for tokens in SUPPORTED_TOKEN
 
 # ============================================================
 # bf16 output — atol=2e-2, rtol=2e-2, zero mismatches
-# (matches cuDNN test _run_rmsnorm_silu_test)
+# atol=2e-2, rtol=2e-2, zero mismatches required
 # ============================================================
 
 
@@ -179,7 +178,7 @@ def test_lut_bf16(num_tokens, hidden_size):
 # ============================================================
 # FP8 output — atol=0.125, rtol=0.125, zero mismatches
 # Reference in float32, then cast to FP8 (avoids bf16 double-rounding)
-# (matches cuDNN test _run_fp8_rmsnorm_silu_test)
+# atol=0.125, rtol=0.125, zero mismatches; reference in float32 then cast to FP8
 # ============================================================
 
 
@@ -218,7 +217,7 @@ def test_lut_fp8(num_tokens, hidden_size):
 
 # ============================================================
 # NVFP4 output — nibble-level comparison, <=1 ULP allowed
-# (matches cuDNN test _run_nvfp4_rmsnorm_silu_test)
+# Nibble-level comparison, <=1 ULP allowed
 # ============================================================
 
 has_fp4_dtype = hasattr(torch, "float4_e2m1fn_x2")

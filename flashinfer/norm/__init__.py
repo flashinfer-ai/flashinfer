@@ -520,7 +520,7 @@ except ImportError:
 
 
 # ============================================================
-# Fused RMSNorm + SiLU (ported from cuDNN frontend OSS engine)
+# Fused RMSNorm + SiLU kernel (SM100 optimized)
 # ============================================================
 
 from ..jit.rmsnorm_silu import (
@@ -599,8 +599,8 @@ def fused_rmsnorm_silu(
 
     where ``SiLU(x) = x / (1 + exp(-x))``
 
-    This kernel is ported from the cuDNN frontend OSS Sm100RmsNormSiluEngine
-    and is optimized for WAN VAE decoder workloads on B200.
+    Optimized for WAN VAE decoder workloads on SM100 (B200).
+    Uses sweep-tuned knobs for all standard VAE problem sizes.
 
     Parameters
     ----------

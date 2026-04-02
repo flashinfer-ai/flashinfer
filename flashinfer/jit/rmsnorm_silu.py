@@ -192,7 +192,7 @@ def select_knobs(C: int, num_tokens: int, dtype: str):
 def _estimate_ctas_per_row(
     C: int, split_cols: int, kernel_cfg: int, bytes_per_ldg: int, warps_n: int = 1
 ) -> int:
-    """Estimate CTAS_PER_ROW from knobs (matches cuDNN's estimate_ctas_per_row)."""
+    """Estimate CTAS_PER_ROW from knobs."""
     if split_cols != 4 or kernel_cfg == 2:
         return 1
     input_size = 2  # bf16

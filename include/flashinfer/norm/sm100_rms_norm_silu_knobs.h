@@ -6,8 +6,8 @@
 
 #include <cstdint>
 
-namespace cudnn_frontend {
-namespace experimental {
+namespace flashinfer {
+namespace norm {
 
 enum class RmsNormSiluDtype : uint8_t {
   BF16 = 0,
@@ -212,5 +212,5 @@ inline const RmsNormSiluKnobs* lookup_rms_norm_silu_knobs(int C, int num_tokens,
   return nullptr;  // fundamentally unsupported (C not divisible by any valid config)
 }
 
-}  // namespace experimental
-}  // namespace cudnn_frontend
+}  // namespace norm
+}  // namespace flashinfer
