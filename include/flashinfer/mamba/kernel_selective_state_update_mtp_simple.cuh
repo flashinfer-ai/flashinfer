@@ -151,9 +151,10 @@ __device__ __forceinline__ void load_simple(SramT& sram, int lane, int warp,
                                          : (int64_t)seq_idx * params.dt_stride_batch;
   int64_t const dt_tstride = has_cu_seqlens ? params.dt_stride_batch : params.dt_stride_mtp;
 
-  if constexpr (!IS_PAD) {
+  {
     // ── Per-warp cp.async loads to avoid cross-array bank conflicts ──
-    // Warps 0/1/2 load B/C/x respectively; all 4 warps cooperatively load state.
+    // B/C/x/dt are always loaded (even for pad slots — output must be valid).
+    // State is only loaded for non-pad slots; pad slots use zero state.
     constexpr int INPUT_PACK = 16 / sizeof(input_t);  // 8 for bf16
     constexpr int STATE_PACK = 16 / sizeof(state_t);  // 4 for f32, 8 for f16/bf16
     static_assert(DSTATE % INPUT_PACK == 0, "DSTATE must be divisible by input pack size");
@@ -208,7 +209,9 @@ __device__ __forceinline__ void load_simple(SramT& sram, int lane, int warp,
     }
 
     // All 4 warps: tiled state load (bank-conflict-free, 8-byte cp.async)
-    {
+    // Only load state for non-pad slots; pad slots leave state uninitialized
+    // (zeroed in registers by update_state_simple).
+    if constexpr (!IS_PAD) {
       auto const* __restrict__ state_ptr = reinterpret_cast<state_t const*>(params.state);
       auto const state_base = state_batch * params.state_stride_batch + head * DIM * DSTATE;
       cp_async_state_cooperative<state_t, DSTATE, DSTATE_PAD, ROWS_PER_PASS, NUM_WARPS>(

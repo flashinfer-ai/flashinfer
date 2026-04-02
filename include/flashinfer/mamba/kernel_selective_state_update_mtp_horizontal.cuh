@@ -105,23 +105,24 @@ __device__ __forceinline__ void role_load_horizontal(
   constexpr int DSTATE_PAD = SramT::DSTATE_PAD;
   constexpr int bytesBCX = 2 * NTOKENS * DSTATE_PAD * (int)sizeof(input_t) +
                            HEADS_PER_CTA * NTOKENS * DIM * (int)sizeof(input_t);
+  // B/C/x TMA loads are always issued (even for pad slots — output must be valid).
+  // They are merged into bar_state_in_full[0] alongside the first state tile.
   if (lane == 0) {
-    if constexpr (!IS_PAD) {
-      cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.B[0][0], &tensorB, 0, kv_group, 0, batch,
-                                                    sram.bar_state_in_full[0]);
-      cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.C[0][0], &tensorC, 0, kv_group, 0, batch,
-                                                    sram.bar_state_in_full[0]);
+    cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.B[0][0], &tensorB, 0, kv_group, 0, batch,
+                                                  sram.bar_state_in_full[0]);
+    cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.C[0][0], &tensorC, 0, kv_group, 0, batch,
+                                                  sram.bar_state_in_full[0]);
 #pragma unroll
-      for (int h = 0; h < HEADS_PER_CTA; h++) {
-        cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.x[h][0][0], &tensorX, 0, base_head + h,
-                                                      0, batch, sram.bar_state_in_full[0]);
-      }
+    for (int h = 0; h < HEADS_PER_CTA; h++) {
+      cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.x[h][0][0], &tensorX, 0, base_head + h, 0,
+                                                    batch, sram.bar_state_in_full[0]);
     }
   }
 
   // ── Pipeline state_in loads (TMA_STATE_ROWS per transaction) ──────────
   // Single wide TMA load of DSTATE_PAD columns per chunk.
   // OOB padding columns are handled in registers, not smem.
+  // State is only loaded for non-pad slots; pad slots use zero state in registers.
   constexpr int bytesChunk = TMA_STATE_ROWS * DSTATE_PAD * (int)sizeof(state_t);
   uint32_t parity_empty[NUM_IN_STAGES] = {};  // all start at phase 0
 #pragma unroll
@@ -141,7 +142,9 @@ __device__ __forceinline__ void role_load_horizontal(
           int const bytes = (h == 0 && tl == 0) ? bytesBCX + bytesChunk : bytesChunk;
           cuda::device::barrier_arrive_tx(sram.bar_state_in_full[slot], 1, bytes);
         } else {
-          cuda::device::barrier_arrive_tx(sram.bar_state_in_full[slot], 1, 0);
+          // Pad slot: no state TMA, but first iteration includes the B/C/x bytes
+          int const bytes = (h == 0 && tl == 0) ? bytesBCX : 0;
+          cuda::device::barrier_arrive_tx(sram.bar_state_in_full[slot], 1, bytes);
         }
       }
     }
