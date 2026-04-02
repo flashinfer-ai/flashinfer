@@ -214,7 +214,7 @@ def _cutlass_mm_bf16_requirement(
     return True
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([80, 86, 89, 90, 100, 103])
 def _cudnn_mm_bf16_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -224,15 +224,6 @@ def _cudnn_mm_bf16_requirement(
     pdl: bool = False,
     backend: Literal["cudnn", "cutlass", "tgv", "auto"] = "cudnn",
 ):
-    if bias is not None:
-        raise ValueError(
-            "You cannot use the cuDNN backend with a bias. Use the TGV backend instead."
-        )
-    if pdl:
-        raise ValueError(
-            "The cuDNN backend does not support PDL. Use the TGV backend instead."
-        )
-
     _validate_bf16_output_dtype(out_dtype)
     _check_cudnn_availability()
 
@@ -308,16 +299,18 @@ def _heuristic_func_mm_bf16(
 ):
     heuristic_backends = []
     if bias is not None or pdl:
-        # cuDNN and CUTLASS don't support bias/pdl, only TGV does
+        # CUTLASS doesn't support bias/pdl, only TGV and cuDNN do
         if "tgv" in suitable_backends:
             heuristic_backends.append("tgv")
-    else:
         if "cudnn" in suitable_backends:
             heuristic_backends.append("cudnn")
+    else:
         if "cutlass" in suitable_backends:
             heuristic_backends.append("cutlass")
         if "tgv" in suitable_backends:
             heuristic_backends.append("tgv")
+        if "cudnn" in suitable_backends:
+            heuristic_backends.append("cudnn")
     return heuristic_backends
 
 
@@ -3042,8 +3035,8 @@ def _cudnn_gemm_bf16_runner():
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
             # inputs layout: a, b, bias, pdl, out, workspace_buffer
             # out.dtype distinguishes bfloat16 / float16 / float32 output graphs
-            _, _, _, _, out, _ = inputs
-            return (out.dtype,)
+            _, _, bias, _, out, _ = inputs
+            return (out.dtype, bias is not None)
 
         def get_valid_tactics(
             self,
