@@ -85,6 +85,7 @@ class NVSHMEMAllReduce:
         should_init: bool = True,
     ):
         self.local_rank = local_rank
+        self.global_rank = torch.distributed.get_rank(group)
         self.world_size = world_size
         self.dtype = dtype
         self.device = device
@@ -98,17 +99,17 @@ class NVSHMEMAllReduce:
         # assert PE and world size match
         pe = nvshmem.core.my_pe()
         num_pes = nvshmem.core.n_pes()
-        if pe != local_rank:
+        if pe != self.global_rank:
             logger.warning(
                 "Rank %d: PE mismatch! Expected PE %d, got PE %d",
-                local_rank,
-                local_rank,
+                self.global_rank,
+                self.global_rank,
                 pe,
             )
         if num_pes != world_size:
             logger.warning(
                 "Rank %d: World size mismatch! Expected %d, got %d",
-                local_rank,
+                self.global_rank,
                 world_size,
                 num_pes,
             )
@@ -123,7 +124,7 @@ class NVSHMEMAllReduce:
         torch.distributed.barrier(self.group)
 
     def init_nvshmem(self):
-        if self.local_rank == 0:
+        if self.global_rank == 0:
             uid = nvshmem.core.get_unique_id(empty=False)
         else:
             uid = nvshmem.core.get_unique_id(empty=True)
@@ -131,7 +132,7 @@ class NVSHMEMAllReduce:
         # Broadcast uid._data across ranks via torch.distributed
         uid_bytes = np.frombuffer(uid._data.tobytes(), dtype=np.uint8)
         uid_tensor = torch.from_numpy(uid_bytes.copy()).to(dtype=torch.uint8)
-        torch.distributed.broadcast(uid_tensor, src=0)
+        torch.distributed.broadcast(uid_tensor, src=0, group=self.group)
 
         # Reconstruct uid from broadcasted bytes
         uid._data[:] = np.frombuffer(
@@ -140,11 +141,12 @@ class NVSHMEMAllReduce:
 
         torch.distributed.barrier(self.group)
 
+        # local_rank selects the GPU; global_rank identifies the PE
         device = Device(self.local_rank)
         nvshmem.core.init(
             device=device,
             uid=uid,
-            rank=self.local_rank,
+            rank=self.global_rank,
             nranks=self.world_size,
             initializer_method="uid",
         )
