@@ -2252,8 +2252,8 @@ def run_gdn_decode_bf16state_cooprow(
 # ==============================================================================
 # PUBLIC API
 # ==============================================================================
-_compiled_kernels = {}
-_compiled_kernels_ilp = {}
+_compiled_kernels: dict = {}
+_compiled_kernels_ilp: dict = {}
 
 # Batch size threshold for ILP kernel dispatch
 ILP_BATCH_THRESHOLD = 16  # Use ILP kernel for B >= 16
@@ -2434,7 +2434,7 @@ def gated_delta_rule(
 # ==============================================================================
 # MTP PUBLIC API
 # ==============================================================================
-_compiled_kernels_mtp = {}
+_compiled_kernels_mtp: dict = {}
 
 
 def _select_tile_v_for_mtp(B: int, HV: int, V: int, T: int = 1) -> int:
