@@ -845,7 +845,7 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, bool* v
   vec_t<float, VEC_SIZE> probs_vec;
   float aggregate;
   float q = 1;
-  double low = 0, high = 1.f;
+  float low = 0, high = 1.f;
   int sampled_id;
   int round = 0;
   do {
@@ -884,8 +884,12 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, bool* v
       }
       sampled_id = temp_storage.last_valid_id;
     }
-    double pivot_0 = probs[row_idx * d + sampled_id];
-    double pivot_1 = (pivot_0 + high) / 2;
+    // float is safe here: pivot_0 is loaded from the probs array (always a normal
+    // float), *0.5f is exact (power-of-2, no division instruction), and the
+    // count-based break above provides a second termination path independent of
+    // float convergence.  See #769 / #774 for the FTZ context.
+    float pivot_0 = probs[row_idx * d + sampled_id];
+    float pivot_1 = (pivot_0 + high) * 0.5f;
 
     ValueCount<float> aggregate_gt_pivot_0{0, 0}, aggregate_gt_pivot_1{0, 0};
     ValueCount<float> threadlocal_gt_pivot_0{0, 0}, threadlocal_gt_pivot_1{0, 0};
@@ -977,7 +981,7 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, bool* v
   vec_t<float, VEC_SIZE> probs_vec;
   float aggregate;
   float q = 1;
-  double low = 0, high = 1.f;
+  float low = 0, high = 1.f;
   int sampled_id;
   do {
     temp_storage.sampled_id = d;
@@ -1014,8 +1018,12 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, bool* v
       }
       sampled_id = temp_storage.last_valid_id;
     }
-    double pivot_0 = probs[row_idx * d + sampled_id];
-    double pivot_1 = (pivot_0 + high) / 2;
+    // float is safe here: pivot_0 is loaded from the probs array (always a normal
+    // float), *0.5f is exact (power-of-2, no division instruction), and the
+    // count-based break above provides a second termination path independent of
+    // float convergence.  See #769 / #774 for the FTZ context.
+    float pivot_0 = probs[row_idx * d + sampled_id];
+    float pivot_1 = (pivot_0 + high) * 0.5f;
 
     float aggregate_gt_pivot_0 = 0, aggregate_gt_pivot_1 = 0;
     float threadlocal_aggregate_gt_pivot_0 = 0;
@@ -1200,7 +1208,7 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
   vec_t<float, VEC_SIZE> probs_vec;
   float aggregate;
   float q = 1;
-  double low = 0, high = 1.f;
+  float low = 0, high = 1.f;
   int sampled_id;
   do {
     temp_storage.sampled_id = d;
@@ -1237,8 +1245,12 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
         return;
       }
     }
-    double pivot_0 = probs[row_idx * d + sampled_id];
-    double pivot_1 = (pivot_0 + high) / 2;
+    // float is safe here: pivot_0 is loaded from the probs array (always a normal
+    // float), *0.5f is exact (power-of-2, no division instruction), and the
+    // count-based break above provides a second termination path independent of
+    // float convergence.  See #769 / #774 for the FTZ context.
+    float pivot_0 = probs[row_idx * d + sampled_id];
+    float pivot_1 = (pivot_0 + high) * 0.5f;
 
     ValueCount<float> aggregate_gt_pivot_0{0, 0}, aggregate_gt_pivot_1{0, 0};
     ValueCount<float> threadlocal_aggregate_gt_pivot_0{0, 0};
@@ -1711,7 +1723,7 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
                               RenormTempStorage<BLOCK_THREADS, REDUCE_ALGORITHM>>(probs, row_idx, d,
                                                                                   temp_storage);
 
-  double low = 0, high = max_val;
+  float low = 0, high = max_val;
   float min_gt_low, max_le_high;
   float sum_low = 1;
   // f(x) = sum(probs[probs > x]), f(x) is non-increasing
@@ -1722,8 +1734,11 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
   // stopping condition
   // - f(low) >= p, f(min_gt_low) == f(max_le_high) == f(high) < p
   do {
-    double pivot_0 = (high + 2 * low) / 3;
-    double pivot_1 = (2 * high + low) / 3;
+    float pivot_0 = (high + 2 * low) / 3.f;
+    float pivot_1 = (2 * high + low) / 3.f;
+    // Guard against -use_fast_math FTZ: if div.approx.ftz.f32 flushed a pivot
+    // into low/high (e.g. subnormal result → 0), the search can't progress.
+    if (pivot_0 <= low || pivot_1 >= high) break;
 
     float aggregate_gt_pivot_0 = 0, aggregate_gt_pivot_1 = 0;
     min_gt_low = high;
