@@ -168,7 +168,9 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             group_name,
         )
 
-        allocated_size = self.handle.buffer_size - self.handle.signal_pad_size
+        # handle.buffer_size is the usable data size. torch symmetric memory
+        # allocator places signal_pad on top of it, not carved from within.
+        allocated_size = self.handle.buffer_size
         # We want the buffer size to be aligned to 16B which is the granularity for buffer management.
         self.buffer_size_bytes = (
             math.floor(allocated_size / self.NUM_LAMPORT_BUFFERS) // 16 * 16
