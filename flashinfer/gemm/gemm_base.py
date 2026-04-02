@@ -2671,6 +2671,16 @@ def _cudnn_gemm_fp8_runner():
     return CudnnFp8GemmRunner()
 
 
+def _get_3d_shape_stride_from_vector(vector: torch.Tensor, dim: int = 0):
+    n = vector.shape[0]
+    p = vector.stride(0)
+    shape = [1, 1, 1]
+    stride = [1, 1, 1]
+    shape[dim] = n
+    stride[dim] = p
+    return (tuple(shape), tuple(stride))
+
+
 def _get_bf16_3d_shape_stride(tensor: torch.Tensor):
     """Expand 2d tensor to 3d tensor for cuDNN"""
     shape = list(tensor.shape)
@@ -2819,8 +2829,8 @@ def build_cudnn_gemm_bf16_graph_override_shape(
     a_stride = (cache_m * k, k, 1) if is_a_k_major else (cache_m * k, 1, cache_m)
     b_shape = (batch, k, n)
     b_stride = (k * n, 1, k) if is_b_k_major else (k * n, n, 1)
-    bias_shape = (batch, 1, n)
-    bias_stride = (n, 1, 1)
+    bias_shape = (1, 1, n)
+    bias_stride = (n, n, 1)
 
     stream = torch.cuda.current_stream(device)
     graph = cudnn.pygraph(
@@ -2903,7 +2913,7 @@ def execute_cudnn_gemm_bf16_graph_override_shape(
             UIDs.O_UID.value: c_final,
         }
 
-        bias_shape, bias_stride = _get_bf16_3d_shape_stride(bias)
+        bias_shape, bias_stride = _get_3d_shape_stride_from_vector(bias, 2)
 
         override_uids = [
             UIDs.A_UID.value,
@@ -2968,7 +2978,7 @@ def _cudnn_gemm_bf16(
     b_shape, b_stride = _get_bf16_3d_shape_stride(b)
 
     if bias is not None:
-        bias_shape, bias_stride = _get_bf16_3d_shape_stride(bias)
+        bias_shape, bias_stride = _get_3d_shape_stride_from_vector(bias, 2)
     else:
         bias_shape = (1, 1, 1)
         bias_stride = (1, 1, 1)
@@ -3048,7 +3058,7 @@ def _cudnn_gemm_bf16_runner():
                 b_shape, b_stride = _get_bf16_3d_shape_stride(b)
 
                 if bias is not None:
-                    bias_shape, bias_stride = _get_bf16_3d_shape_stride(bias)
+                    bias_shape, bias_stride = _get_3d_shape_stride_from_vector(bias, 2)
                 else:
                     bias_shape = (1, 1, 1)
                     bias_stride = (1, 1, 1)
@@ -3075,7 +3085,7 @@ def _cudnn_gemm_bf16_runner():
             do_preparation: bool = False,
             **kwargs,
         ) -> torch.Tensor:
-            a, b, bias, pdl, out, workspace_buffer = inputs
+            a, b, bias, _, out, workspace_buffer = inputs
 
             if is_cudnn_override_shape_available():
                 graph = self._get_override_graph(a, b, bias, out)
