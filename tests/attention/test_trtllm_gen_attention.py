@@ -861,6 +861,78 @@ def test_trtllm_batch_prefill_bs1(
     )
 
 
+@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
+@pytest.mark.parametrize(
+    "batch_size,page_size,num_kv_heads,head_grp_size",
+    [
+        (1, 16, 8, 8),
+        (32, 16, 8, 8),
+    ],
+)
+@pytest.mark.parametrize("window_left", [-1])
+@pytest.mark.parametrize(
+    "q_dtype,kv_dtype,o_dtype",
+    [
+        ("bf16", "bf16", "bf16"),
+    ],
+)
+@pytest.mark.parametrize("enable_pdl", [None])
+@pytest.mark.parametrize("enable_sink", [False])
+@pytest.mark.parametrize(
+    "max_q_len,max_kv_len",
+    [
+        (1024, 0),
+        (1024, 1024),
+        (2048, 0),
+        (4096, 0),
+    ],
+)
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("skips_softmax", [False, True])
+@pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
+def test_trtllm_batch_prefill_full_seqlen(
+    kv_layout: str,
+    batch_size: int,
+    page_size: int,
+    num_kv_heads: int,
+    head_grp_size: int,
+    window_left: int,
+    q_dtype: str,
+    o_dtype: str,
+    kv_dtype: str,
+    enable_pdl: bool,
+    enable_sink: bool,
+    max_q_len: int,
+    max_kv_len: int,
+    head_dim: int,
+    skips_softmax: bool,
+    uses_shared_paged_kv_idx: bool,
+):
+    # Covers the sequence-length gap between test_trtllm_batch_prefill (max_q_len=511)
+    # and test_trtllm_batch_prefill_bs1 (max_q_len=8192).  The (1024, 0) case reproduces
+    # a trtllm-native hang found in benchmarks with s_qo=1024, s_kv=1024 (pure prefill,
+    # total KV = query length, no prior cached tokens).
+    _test_trtllm_batch_prefill(
+        kv_layout,
+        batch_size,
+        page_size,
+        num_kv_heads,
+        head_grp_size,
+        window_left,
+        q_dtype,
+        o_dtype,
+        kv_dtype,
+        enable_pdl,
+        enable_sink,
+        max_q_len,
+        max_kv_len,
+        False,
+        head_dim,
+        skips_softmax=skips_softmax,
+        uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+    )
+
+
 def _test_trtllm_batch_decode(
     backend: str,
     kv_layout: str,
