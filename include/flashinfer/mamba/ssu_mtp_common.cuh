@@ -18,7 +18,10 @@
 
 #pragma once
 
+#include <cmath>
+#include <cstdint>
 #include <cuda/barrier>
+#include <limits>
 
 #include "conversion.cuh"
 
