@@ -466,8 +466,8 @@ def autotune(
         prev_round_up = tuner._override_round_up
         if tuning_buckets is not None:
             tuner._override_tuning_buckets = tuple(sorted(set(tuning_buckets)))
-        if round_up:
-            tuner._override_round_up = True
+        if round_up is not None:
+            tuner._override_round_up = round_up
 
     # Reference-counted tuning mode: is_tuning_mode stays True as long as
     # at least one autotune(True) context is active, even if an
