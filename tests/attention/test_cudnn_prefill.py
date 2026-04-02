@@ -1,6 +1,10 @@
 import pytest
 import torch
 
+pytestmark = pytest.mark.skip(
+    reason="todo: cudnnGraphNotSupportedError on some hardware/CUDA version combinations"
+)
+
 import flashinfer
 import cudnn
 
