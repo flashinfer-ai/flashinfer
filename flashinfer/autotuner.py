@@ -405,7 +405,7 @@ def autotune(
     tune_mode: bool = True,
     cache: Optional[str] = None,
     tuning_buckets: Optional[Tuple[int, ...]] = None,
-    round_up: bool = False,
+    round_up: Optional[bool] = None,
 ):
     """Context manager for autotuning with optional file-based caching.
 
