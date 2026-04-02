@@ -476,6 +476,100 @@ def generate_causal_mask(
     return mask_uint16
 
 
+def sdpa_paged_reference(
+    ref_q: torch.Tensor,
+    ref_kv_cache: torch.Tensor,
+    q_lens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    page_size: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    kv_layout: str,
+    window_left: int,
+):
+    """Pure PyTorch SDPA reference for head dims unsupported by FlashInfer kernels.
+
+    ref_kv_cache layout:
+      HND: [num_pages, 2, num_kv_heads, page_size, head_dim]
+      NHD: [num_pages, 2, page_size, num_kv_heads, head_dim]
+    """
+    sm_scale = 1.0 / (head_dim**0.5)
+    batch_size = q_lens.shape[0]
+    q_indptr = torch.cat([torch.tensor([0]), torch.cumsum(q_lens, dim=0)])
+    outputs = []
+    for b in range(batch_size):
+        q_start = q_indptr[b].item()
+        q_end = q_indptr[b + 1].item()
+        q_b = ref_q[q_start:q_end]  # [q_len, num_qo_heads, head_dim]
+        s_len = seq_lens[b].item()
+        num_pages = (s_len + page_size - 1) // page_size
+
+        # Gather KV from paged cache
+        page_ids = page_table[b, :num_pages]
+        kv_pages = ref_kv_cache[page_ids]
+        k_pages = kv_pages[:, 0]  # K half
+        v_pages = kv_pages[:, 1]  # V half
+
+        if kv_layout == "HND":
+            # k_pages: [num_pages, num_kv_heads, page_size, head_dim]
+            # transpose to [num_pages, page_size, num_kv_heads, head_dim] then flatten pages
+            k_flat = k_pages.permute(0, 2, 1, 3).reshape(-1, num_kv_heads, head_dim)[
+                :s_len
+            ]
+            v_flat = v_pages.permute(0, 2, 1, 3).reshape(-1, num_kv_heads, head_dim)[
+                :s_len
+            ]
+        else:  # NHD
+            # k_pages: [num_pages, page_size, num_kv_heads, head_dim]
+            k_flat = k_pages.reshape(-1, num_kv_heads, head_dim)[:s_len]
+            v_flat = v_pages.reshape(-1, num_kv_heads, head_dim)[:s_len]
+
+        # k_flat, v_flat: [s_len, num_kv_heads, head_dim]
+        q_len = q_b.shape[0]
+        head_grp = num_qo_heads // num_kv_heads
+
+        # Expand KV for GQA: [s_len, num_qo_heads, head_dim]
+        k_exp = (
+            k_flat.unsqueeze(2)
+            .expand(-1, num_kv_heads, head_grp, -1)
+            .reshape(s_len, num_qo_heads, head_dim)
+        )
+        v_exp = (
+            v_flat.unsqueeze(2)
+            .expand(-1, num_kv_heads, head_grp, -1)
+            .reshape(s_len, num_qo_heads, head_dim)
+        )
+
+        # Transpose to [num_qo_heads, seq_len, head_dim] for SDPA
+        q_t = q_b.transpose(0, 1).float()  # [num_qo_heads, q_len, head_dim]
+        k_t = k_exp.transpose(0, 1).float()  # [num_qo_heads, s_len, head_dim]
+        v_t = v_exp.transpose(0, 1).float()  # [num_qo_heads, s_len, head_dim]
+
+        # Build causal mask: query position i can attend to kv position j if j <= (s_len - q_len) + i
+        kv_offset = s_len - q_len
+        q_pos = torch.arange(q_len, device=q_b.device).unsqueeze(1) + kv_offset
+        k_pos = torch.arange(s_len, device=q_b.device).unsqueeze(0)
+        causal_mask = k_pos <= q_pos  # [q_len, s_len]
+        if window_left > 0:
+            causal_mask = causal_mask & (q_pos - k_pos <= window_left)
+        attn_mask = causal_mask.unsqueeze(0).expand(num_qo_heads, -1, -1)
+
+        out_b = torch.nn.functional.scaled_dot_product_attention(
+            q_t,
+            k_t,
+            v_t,
+            attn_mask=attn_mask,
+            scale=sm_scale,
+        )
+        outputs.append(
+            out_b.transpose(0, 1).to(ref_q.dtype)
+        )  # [q_len, num_qo_heads, head_dim]
+
+    return torch.cat(outputs, dim=0)
+
+
 def _test_trtllm_batch_prefill(
     kv_layout: str,
     batch_size: int,
@@ -579,7 +673,24 @@ def _test_trtllm_batch_prefill(
         "kv_data_type": ref_kv_cache.dtype,
         "window_left": window_left,
     }
-    if not enable_sink:
+    sink = torch.rand(num_qo_heads, device=GPU_DEVICE, dtype=torch.float32) * 5
+    if head_dim > 256:
+        # FlashInfer's own FA2/FA3 kernels don't support head_dim > 256;
+        # fall back to a PyTorch SDPA reference.
+        output_ref = sdpa_paged_reference(
+            ref_q,
+            ref_kv_cache,
+            q_lens,
+            seq_lens,
+            page_table,
+            page_size,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            kv_layout,
+            window_left,
+        )
+    elif not enable_sink:
         wrapper_ref = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
             workspace_buffer_ref, kv_layout
         )
@@ -595,7 +706,6 @@ def _test_trtllm_batch_prefill(
             kv_last_page_len,
             kv_layout,
         )
-        sink = torch.rand(num_qo_heads, device=GPU_DEVICE, dtype=torch.float32) * 5
         output_ref = sink_attention_unified(
             ref_q,
             k_flat,
@@ -1003,7 +1113,24 @@ def _test_trtllm_batch_decode(
         "q_data_type": ref_q.dtype,
         "window_left": window_left,
     }
-    if not enable_sink:
+    sink = torch.rand(num_qo_heads, device=GPU_DEVICE, dtype=torch.float32) * 5
+    if head_dim > 256:
+        # FlashInfer's own FA2/FA3 kernels don't support head_dim > 256;
+        # fall back to a PyTorch SDPA reference.
+        output_ref = sdpa_paged_reference(
+            ref_q,
+            ref_kv_cache,
+            q_lens,
+            seq_lens,
+            page_table,
+            page_size,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            kv_layout,
+            window_left,
+        )
+    elif not enable_sink:
         if q_len_per_req is not None and q_len_per_req == 1:
             wrapper_ref = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
                 workspace_buffer_ref, kv_layout, use_tensor_cores=True
@@ -1040,7 +1167,6 @@ def _test_trtllm_batch_decode(
             kv_last_page_len,
             kv_layout,
         )
-        sink = torch.rand(num_qo_heads, device=GPU_DEVICE, dtype=torch.float32) * 5
         output_ref = sink_attention_unified(
             ref_q,
             k_flat,
@@ -1497,6 +1623,142 @@ def test_trtllm_batch_decode_long_sequence_length(
     uses_shared_paged_kv_idx: bool,
 ) -> None:
     # Small number of test cases for long sequence length
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
+        kv_layout,
+        batch_size,
+        q_len_per_req,
+        page_size,
+        num_kv_heads,
+        head_grp_size,
+        window_left,
+        q_dtype,
+        o_dtype,
+        kv_dtype,
+        enable_pdl,
+        enable_sink,
+        max_in_kv_len,
+        head_dim,
+        device_scale,
+        skips_softmax=skips_softmax,
+        uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+    )
+
+
+@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
+@pytest.mark.parametrize(
+    "batch_size,page_size,num_kv_heads,head_grp_size",
+    [
+        (4, 16, 2, 1),
+        (4, 32, 4, 5),
+        (128, 16, 2, 8),
+    ],
+)
+@pytest.mark.parametrize("window_left", [-1])
+@pytest.mark.parametrize(
+    "q_dtype,kv_dtype,o_dtype",
+    [
+        ("bf16", "bf16", "bf16"),
+        ("fp16", "fp16", "fp16"),
+        ("fp8", "fp8", "fp8"),
+        ("fp8", "fp8", "bf16"),
+    ],
+)
+@pytest.mark.parametrize("enable_pdl", [None])
+@pytest.mark.parametrize("enable_sink", [False])
+@pytest.mark.parametrize("max_q_len", [255])
+@pytest.mark.parametrize("max_kv_len", [511])
+@pytest.mark.parametrize("head_dim", [512])
+@pytest.mark.parametrize("non_contiguous_query", [False])
+@pytest.mark.parametrize("skips_softmax", [False, True])
+@pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
+def test_trtllm_batch_prefill_head_dim_512(
+    kv_layout: str,
+    batch_size: int,
+    page_size: int,
+    num_kv_heads: int,
+    head_grp_size: int,
+    window_left: int,
+    q_dtype: str,
+    o_dtype: str,
+    kv_dtype: str,
+    enable_pdl: bool,
+    enable_sink: bool,
+    max_q_len: int,
+    max_kv_len: int,
+    head_dim: int,
+    non_contiguous_query: bool,
+    skips_softmax: bool,
+    uses_shared_paged_kv_idx: bool,
+):
+    _test_trtllm_batch_prefill(
+        kv_layout,
+        batch_size,
+        page_size,
+        num_kv_heads,
+        head_grp_size,
+        window_left,
+        q_dtype,
+        o_dtype,
+        kv_dtype,
+        enable_pdl,
+        enable_sink,
+        max_q_len,
+        max_kv_len,
+        kv_dtype in ("fp8", "nvfp4"),
+        head_dim,
+        non_contiguous_query=non_contiguous_query,
+        skips_softmax=skips_softmax,
+        uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+    )
+
+
+@pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
+@pytest.mark.parametrize(
+    "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
+    [
+        (4, 1, 16, 2, 1),
+        (4, 1, 32, 2, 5),
+        (4, 3, 64, 4, 1),
+        (128, 3, 16, 4, 8),
+    ],
+)
+@pytest.mark.parametrize("window_left", [-1])
+@pytest.mark.parametrize(
+    "q_dtype,kv_dtype,o_dtype",
+    [
+        ("bf16", "bf16", "bf16"),
+        ("fp16", "fp16", "fp16"),
+        ("fp8", "fp8", "fp8"),
+        ("fp8", "fp8", "bf16"),
+    ],
+)
+@pytest.mark.parametrize("enable_pdl", [None])
+@pytest.mark.parametrize("enable_sink", [False])
+@pytest.mark.parametrize("max_in_kv_len", [110])
+@pytest.mark.parametrize("head_dim", [512])
+@pytest.mark.parametrize("device_scale", [True, False])
+@pytest.mark.parametrize("skips_softmax", [False, True])
+@pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
+def test_trtllm_batch_decode_head_dim_512(
+    kv_layout: str,
+    batch_size: int,
+    q_len_per_req: int,
+    page_size: int,
+    num_kv_heads: int,
+    head_grp_size: int,
+    window_left: int,
+    q_dtype: str,
+    o_dtype: str,
+    kv_dtype: str,
+    enable_pdl: bool,
+    enable_sink: bool,
+    max_in_kv_len: int,
+    head_dim: int,
+    device_scale: bool,
+    skips_softmax: bool,
+    uses_shared_paged_kv_idx: bool,
+):
     _test_trtllm_batch_decode(
         "trtllm-gen",
         kv_layout,
