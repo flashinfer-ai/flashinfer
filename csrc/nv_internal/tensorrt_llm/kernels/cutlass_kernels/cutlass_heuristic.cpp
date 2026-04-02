@@ -601,16 +601,14 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm120(
     }
     TLLM_THROW("Not Implemented: SM120 GEMM only supports nvfp4.");
   }
-  // K values are in SMEM elements (FP4 unpacked as uint8: 2 elements per packed byte,
-  // so K_elem = tile_name_K_bytes * 2). Minimum pipeline depth is 2 (default in tile_fits_smem).
-  // {tile_enum, M, N, K_elem}
-  static constexpr std::pair<CutlassTileConfigSM120, std::array<int, 3>> all_tiles[] = {
-      {CutlassTileConfigSM120::CtaShape128x256x64B, {128, 256, 128}},
-      {CutlassTileConfigSM120::CtaShape128x128x256B, {128, 128, 512}},
-      {CutlassTileConfigSM120::CtaShape256x128x128B, {256, 128, 256}},
+  // {tile_enum, M, N}
+  static constexpr std::pair<CutlassTileConfigSM120, std::array<int, 2>> all_tiles[] = {
+      {CutlassTileConfigSM120::CtaShape128x256x64B, {128, 256}},
+      {CutlassTileConfigSM120::CtaShape128x128x256B, {128, 128}},
+      {CutlassTileConfigSM120::CtaShape256x128x128B, {256, 128}},
   };
   std::vector<CutlassGemmConfig> result;
-  for (auto const& [tile_enum, mnk] : all_tiles) {
+  for (auto const& [tile_enum, mn] : all_tiles) {
     result.push_back(CutlassGemmConfig{tile_enum, MainloopScheduleType::AUTO,
                                        EpilogueScheduleType::AUTO,
                                        ClusterShape::ClusterShape_1x1x1});
