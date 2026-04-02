@@ -22,6 +22,24 @@ namespace flashinfer::mamba::mtp {
 
 using namespace conversion;
 
+// Dispatch to the largest CTAS_PER_HEAD in the sequence where
+// (a) kDim / CTAS >= kMinRows (compile-time) and (b) ctas_per_head >= CTAS (runtime).
+// The sequence must be in descending order and end with 1 to guarantee a match.
+template <int kDim, int kMinRows, int CTAS, int... Rest, typename F>
+__host__ void dispatchCtasPerHead(int ctas_per_head, F&& launch,
+                                  std::integer_sequence<int, CTAS, Rest...>) {
+  if constexpr (kDim / CTAS >= kMinRows) {
+    if (ctas_per_head >= CTAS) {
+      launch.template operator()<CTAS>();
+      return;
+    }
+  }
+  if constexpr (sizeof...(Rest) > 0) {
+    dispatchCtasPerHead<kDim, kMinRows>(ctas_per_head, std::forward<F>(launch),
+                                        std::integer_sequence<int, Rest...>{});
+  }
+}
+
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t,
           typename stateIndex_t, typename state_scale_t>
 void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm algorithm,
@@ -277,20 +295,9 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
     };
 
     // Dispatch to the largest instantiated CTAS_PER_HEAD <= ctas_per_head.
-    // Use if constexpr to avoid compiling invalid template instantiations.
-    if constexpr (DIM / 4 >= kRowsPerPass) {
-      if (ctas_per_head >= 4) {
-        launch.template operator()<4>();
-        return;
-      }
-    }
-    if constexpr (DIM / 2 >= kRowsPerPass) {
-      if (ctas_per_head >= 2) {
-        launch.template operator()<2>();
-        return;
-      }
-    }
-    launch.template operator()<1>();
+    // if constexpr inside dispatchCtasPerHead avoids compiling invalid instantiations.
+    dispatchCtasPerHead<DIM, kRowsPerPass>(ctas_per_head, launch,
+                                           std::integer_sequence<int, 4, 2, 1>{});
   }
 }
 
