@@ -26,7 +26,8 @@ This package provides high-performance normalization kernels:
 
 import functools
 import os
-from typing import Optional
+import warnings
+from typing import Optional, Union
 
 import torch
 
@@ -62,11 +63,17 @@ if _USE_CUDA_NORM:
 
 
 def _normalize_scale_tensor(
-    scale: torch.Tensor, ref_tensor: torch.Tensor
+    scale: Union[float, torch.Tensor], ref_tensor: torch.Tensor
 ) -> torch.Tensor:
-    """Normalize quantization scale tensor to 1D shape (1,) on target device."""
+    """Normalize quantization scale to 1D tensor of shape (1,) on target device."""
     if not isinstance(scale, torch.Tensor):
-        raise TypeError(f"scale must be torch.Tensor, got {type(scale)}")
+        warnings.warn(
+            "Passing scale as a float is deprecated and will be removed in a future "
+            "release. Use a torch.Tensor of shape (1,) instead.",
+            FutureWarning,
+            stacklevel=3,
+        )
+        scale = torch.tensor([scale], dtype=torch.float32, device=ref_tensor.device)
     if scale.device != ref_tensor.device:
         scale = scale.to(ref_tensor.device)
     if scale.dtype != torch.float32:
@@ -127,7 +134,7 @@ def _rmsnorm_impl(
     eps: float,
     enable_pdl: Optional[bool],
 ) -> None:
-    if enable_pdl is None:
+    if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
     if _USE_CUDA_NORM:
         get_norm_module().rmsnorm(out, input, weight, eps, enable_pdl)
@@ -159,7 +166,7 @@ def rmsnorm_quant(
     out: torch.Tensor,
     input: torch.Tensor,
     weight: torch.Tensor,
-    scale: torch.Tensor,
+    scale: Union[float, torch.Tensor],
     eps: float = 1e-6,
     enable_pdl: Optional[bool] = None,
 ) -> None:
@@ -185,7 +192,7 @@ def rmsnorm_quant(
 
     """
     scale = _normalize_scale_tensor(scale, input)
-    if enable_pdl is None:
+    if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
     if _USE_CUDA_NORM:
         get_norm_module().rmsnorm_quant(out, input, weight, scale, eps, enable_pdl)
@@ -238,7 +245,7 @@ def fused_add_rmsnorm(
         Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
     """
-    if enable_pdl is None:
+    if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
     if _USE_CUDA_NORM:
         get_norm_module().fused_add_rmsnorm(input, residual, weight, eps, enable_pdl)
@@ -268,7 +275,7 @@ def fused_add_rmsnorm_quant(
     input: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
-    scale: torch.Tensor,
+    scale: Union[float, torch.Tensor],
     eps: float = 1e-6,
     enable_pdl: Optional[bool] = None,
 ) -> None:
@@ -299,7 +306,7 @@ def fused_add_rmsnorm_quant(
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
     """
     scale = _normalize_scale_tensor(scale, input)
-    if enable_pdl is None:
+    if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
     if _USE_CUDA_NORM:
         get_norm_module().fused_add_rmsnorm_quant(
@@ -376,7 +383,7 @@ def _gemma_rmsnorm_impl(
     eps: float,
     enable_pdl: Optional[bool],
 ) -> None:
-    if enable_pdl is None:
+    if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
     if _USE_CUDA_NORM:
         get_norm_module().gemma_rmsnorm(out, input, weight, eps, enable_pdl)
@@ -435,7 +442,7 @@ def gemma_fused_add_rmsnorm(
         Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
     """
-    if enable_pdl is None:
+    if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
     if _USE_CUDA_NORM:
         get_norm_module().gemma_fused_add_rmsnorm(

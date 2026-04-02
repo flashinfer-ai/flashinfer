@@ -10,7 +10,6 @@ New code should import from flashinfer.quantization.fp4_quantization directly.
 
 # Re-export everything from the new location
 from .quantization.fp4_quantization import (
-    SfLayout,
     block_scale_interleave,
     nvfp4_block_scale_interleave,
     e2m1_and_ufp8sf_scale_to_float,
@@ -20,6 +19,7 @@ from .quantization.fp4_quantization import (
     mxfp4_quantize,
     nvfp4_quantize,
     nvfp4_batched_quantize,
+    nvfp4_quantize_paged_kv_cache,
     shuffle_matrix_a,
     shuffle_matrix_sf_a,
     scaled_fp4_grouped_quantize,
@@ -40,7 +40,6 @@ from .quantization.fp4_quantization import (
 )
 
 __all__ = [
-    "SfLayout",
     "block_scale_interleave",
     "nvfp4_block_scale_interleave",
     "e2m1_and_ufp8sf_scale_to_float",
@@ -50,6 +49,7 @@ __all__ = [
     "mxfp4_quantize",
     "nvfp4_quantize",
     "nvfp4_batched_quantize",
+    "nvfp4_quantize_paged_kv_cache",
     "shuffle_matrix_a",
     "shuffle_matrix_sf_a",
     "scaled_fp4_grouped_quantize",

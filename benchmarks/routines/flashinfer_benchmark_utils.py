@@ -183,6 +183,7 @@ benchmark_apis = {
         "trtllm_fp8_block_scale_moe",
         "trtllm_fp8_per_tensor_scale_moe",
         "cutlass_fused_moe",
+        "cute_dsl_fp4_block_scale_moe",
     ],
     "moe_comm": [
         "moe_a2a_dispatch_combine",
@@ -279,6 +280,8 @@ def dtype_str_to_torch_dtype(dtype_str):
         return torch.float8_e4m3fn
     elif dtype_str == "fp8_e5m2":
         return torch.float8_e5m2
+    elif dtype_str == "nvfp4":
+        return torch.uint8
     else:
         raise ValueError(f"Unsupported dtype: {dtype_str}")
 
@@ -324,12 +327,13 @@ routine_cc_to_supported_backends = {
     },
     "BatchMLAPagedAttentionWrapper": {
         # NOTE: trtllm-native calls trtllm_batch_decode_with_kv_cache_mla
+        # NOTE: cute-dsl calls trtllm_batch_decode_with_kv_cache_mla(backend="cute-dsl")
         "7.5": [],
         "8.0": ["fa2"],
         "8.6": ["fa2"],
         "8.9": ["fa2"],
         "9.0": ["fa2", "fa3"],
-        "10.0": ["fa2", "cutlass", "trtllm-native"],
+        "10.0": ["fa2", "cutlass", "trtllm-native", "cute-dsl"],
         "10.3": ["fa2", "cutlass", "trtllm-native"],
         "12.0": ["fa2"],
     },
@@ -380,8 +384,8 @@ routine_cc_to_supported_backends = {
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["cutlass", "cute-dsl"],
-        "10.3": ["cutlass", "cute-dsl"],
+        "10.0": ["cutlass", "cute-dsl", "trtllm"],
+        "10.3": ["cutlass", "cute-dsl", "trtllm"],
         "11.0": ["cutlass"],
         "12.0": [],
     },
@@ -425,6 +429,16 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["cutlass"],
         "10.3": ["cutlass"],
+        "12.0": [],
+    },
+    "cute_dsl_fp4_block_scale_moe": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["cute-dsl"],
+        "10.3": ["cute-dsl"],
         "12.0": [],
     },
     # NORM
@@ -506,9 +520,9 @@ routine_cc_to_supported_backends = {
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["cuda"],
-        "10.3": ["cuda"],
-        "12.0": ["cuda"],
+        "10.0": ["cuda", "cute-dsl"],
+        "10.3": ["cuda", "cute-dsl"],
+        "12.0": ["cuda", "cute-dsl"],
     },
     "nvfp4_batched_quantize": {
         "7.5": [],

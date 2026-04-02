@@ -255,10 +255,9 @@ def test_mxfp8_mxfp4_groupwise_group_gemm(
     out_dtype,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
-    # TODO: We need to add gemm_mxfp4_nt_groupwise support for sm120/121 at some point.
-    if compute_capability[0] not in [10]:
+    if compute_capability[0] not in [10, 12]:
         pytest.skip(
-            "gemm_mxfp4_nt_groupwise is only supported on SM100 and SM103 GPUs."
+            "gemm_mxfp4_nt_groupwise is only supported on SM100, SM103, and SM120/121 GPUs."
         )
     torch.random.manual_seed(0)
     tile_size = 32
@@ -329,11 +328,19 @@ def test_mxfp8_mxfp4_groupwise_group_gemm(
             out_dtype,
         )
 
-    mma_sm_list = [1, 2]
-    tile_m_list = [128]
-    tile_n_list = [64, 128, 192, 256]
-    tile_k_list = [128, 256]
-    swap_ab_list = [True, False]
+    if compute_capability[0] == 12:
+        mma_sm_list = [1]
+        tile_m_list = [128]
+        tile_n_list = [128]
+        tile_k_list = [128]
+        swap_ab_list = [False]
+    else:
+        mma_sm_list = [1, 2]
+        tile_m_list = [128]
+        tile_n_list = [64, 128, 192, 256]
+        tile_k_list = [128, 256]
+        swap_ab_list = [True, False]
+
     for mma_sm, tile_m, tile_n, tile_k, swap_ab in product(
         mma_sm_list, tile_m_list, tile_n_list, tile_k_list, swap_ab_list
     ):

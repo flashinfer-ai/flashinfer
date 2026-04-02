@@ -194,17 +194,17 @@ struct genericMoeGemmKernelLauncher {
       auto can_implement = gemm.can_implement(args);
       TLLM_CHECK_WITH_INFO(can_implement == cutlass::Status::kSuccess,
                            "MoE FC kernel will fail for params. Error: " +
-                               std::string(cutlassGetStatusString(can_implement)));
+                               std::string(cutlass::cutlassGetStatusString(can_implement)));
 
       auto init_status = gemm.initialize(args);
       TLLM_CHECK_WITH_INFO(init_status == cutlass::Status::kSuccess,
                            "Failed to initialize cutlass grouped gemm. Error: " +
-                               std::string(cutlassGetStatusString(init_status)));
+                               std::string(cutlass::cutlassGetStatusString(init_status)));
 
       auto run_status = gemm.run(inputs.stream);
       TLLM_CHECK_WITH_INFO(run_status == cutlass::Status::kSuccess,
                            "Failed to run cutlass grouped gemm. Error: " +
-                               std::string(cutlassGetStatusString(run_status)));
+                               std::string(cutlass::cutlassGetStatusString(run_status)));
     } else if constexpr (sizeof(ElementType) == 2 && sizeof(CutlassWeightType) == 2 &&
                          (std::is_same_v<EpilogueTag, cutlass_extensions::EpilogueOpDefaultSilu> ||
                           std::is_same_v<
@@ -1034,6 +1034,9 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::moeGemmBi
       break;
     case ActivationType::Geglu:
       runGemm<cutlass_extensions::EpilogueOpDefaultFtGelu>(inputs, hopper_inputs);
+      break;
+    case ActivationType::Relu2:
+      runGemm<cutlass_extensions::EpilogueOpDefaultRelu2>(inputs, hopper_inputs);
       break;
     case ActivationType::InvalidType:
       TLLM_THROW("Activation type for fpA_intB must be valid.");
