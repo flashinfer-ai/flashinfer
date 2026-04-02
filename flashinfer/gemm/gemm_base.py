@@ -2680,7 +2680,7 @@ def _get_3d_shape_stride_from_vector(vector: torch.Tensor, dim: int = 0):
 
 def _get_bf16_3d_shape_stride(tensor: torch.Tensor):
     """Expand 2d tensor to 3d tensor for cuDNN"""
-    if tensor.dim() != 2 and tensor.shape.dim() != 3:
+    if tensor.dim() != 2 and tensor.dim() != 3:
         raise ValueError(f"Expected 2D or 3D tensor, got {tensor.dim()}D tensor")
     shape = list(tensor.shape)
     stride = list(tensor.stride())
