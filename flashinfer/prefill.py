@@ -3748,6 +3748,11 @@ def trtllm_batch_context_with_kv_cache(
         If kv_cache is a tuple of two tensors, it should be a tuple of two tensors with shape [num_pages, num_kv_heads, page_size, head_dim] if :attr:`kv_layout` is "HND",
         or [num_pages, page_size, num_kv_heads, head_dim] if :attr:`kv_layout` is "NHD".
         The first tensor is the key cache, the second tensor is the value cache.
+
+        **Contiguity requirements (trtllm-gen backend):**
+
+        - The ``head_dim`` (last dim) **must** have stride 1. This is a TMA hardware constraint
+        - The head and batch/page dims can have arbitrary strides.
     workspace_buffer : torch.Tensor. Must be initialized to 0 for its first use.
         workspace
     block_tables : torch.Tensor
@@ -3789,11 +3794,25 @@ def trtllm_batch_context_with_kv_cache(
         Defaults to ``None``, which means it will be enabled if the device supports PDL.
     kv_layout : str = "HND"
         Layout of kv-cache, can be "HND" or "NHD", default is "HND".
+        For the trtllm-gen backend with NVFP4 KV cache, using ``NHD`` will trigger an
+        automatic transpose and ``.contiguous()`` copy of both the KV data and block scale
+        tensors to convert them to HND layout. This incurs extra memory allocation and
+        data copy overhead. Use ``HND`` for better performance.
     sinks : Optional[List[torch.Tensor]] = None
         additional value per head in the denominator of the softmax.
     kv_block_scales : Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]] = None
         Per-block scale factors for NVFP4 KV cache. Either a tuple of (k_scales, v_scales) or
-        a single tensor with shape [num_pages, 2, ...] that will be unbound along dim=1.
+        a single tensor with shape ``[num_pages, 2, ...]`` that will be unbound along dim=1.
+        Each scale tensor has shape ``[num_pages, num_kv_heads, page_size, head_dim // 16]``
+        in HND layout, with dtype ``torch.float8_e4m3fn``.
+
+        **Contiguity requirements (trtllm-gen backend):**
+
+        - The last two dims (``page_size``, ``head_dim // 16``) **must** be contiguous
+          (i.e., ``stride[-1] == 1`` and ``stride[-2] == head_dim // 16``). This is because
+          the kernel reshapes them into ``(16, page_size * head_dim / 16 / 16)`` to satisfy
+          TMA's 16-byte box width minimum.
+        - The head and batch/page dims can have arbitrary strides.
     skip_softmax_threshold_scale_factor: Optional[float] = None
         threshold scale factor for skipping softmax operations.
         Providing a value for this parameter enables skip-softmax sparsity as described in: https://arxiv.org/abs/2512.12087
