@@ -22,9 +22,35 @@ import torch
 from torch.distributed import ProcessGroup
 
 import nvshmem.core
-from cuda.core import Device
+from cuda.core import Buffer, Device
 
 logger = logging.getLogger(__name__)
+
+_TORCH_TO_NVSHMEM_DTYPE = {
+    torch.float16: "half",
+    torch.bfloat16: "bfloat16",
+    torch.float32: "float",
+}
+
+
+def _buffer_view(tensor: torch.Tensor, nelems: int) -> Buffer:
+    """Create a Buffer view over the first ``nelems`` elements of an NVSHMEM tensor.
+
+    nvshmem.core.reduce() determines element count from Buffer.size, so passing
+    a full pre-allocated symmetric buffer wastes bandwidth when only a prefix is
+    needed. This creates a Buffer with the correct size while reusing the same
+    pointer (which is already tracked by nvshmem4py's memory manager).
+
+    TODO(flashinfer): Remove this once nvshmem4py exposes register_external_buffer
+    with call_register=False through its public API, allowing proper buffer views.
+    See: https://github.com/NVIDIA/nvshmem/blob/devel/nvshmem4py/nvshmem/core/nvshmem_types.py
+    """
+    buf, _, _ = nvshmem.core.tensor_get_buffer(tensor)
+    return Buffer.from_handle(
+        ptr=int(buf.handle),
+        size=nelems * tensor.element_size(),
+        mr=buf.memory_resource,
+    )
 
 
 class NVSHMEMAllReduce:
@@ -132,12 +158,16 @@ class NVSHMEMAllReduce:
         self.symm_buffer_input[:nelems].copy_(inp)
         # Barrier before reduce
         nvshmem.core.barrier_all(stream=stream)
-        # Sum reduce across all PEs (operates on full symmetric buffers)
-        nvshmem.core.reduce(
+        # Sum reduce across all PEs (only the first nelems elements)
+        src_view = _buffer_view(self.symm_buffer_input, nelems)
+        dst_view = _buffer_view(self.symm_buffer_output, nelems)
+        nvshmem.core.collective_on_buffer(
+            "reduce",
             nvshmem.core.Teams.TEAM_WORLD,
-            self.symm_buffer_output,
-            self.symm_buffer_input,
-            "sum",
+            dst_view,
+            src_view,
+            dtype=_TORCH_TO_NVSHMEM_DTYPE[self.dtype],
+            op="sum",
             stream=stream,
         )
         # Copy result back to local output
