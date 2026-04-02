@@ -356,7 +356,7 @@ class TllmGenFmhaKernel {
       } else {
         // Compute numTokensPerCtaQ where each CTA must process complete numGroupedHeadsQ.
         // Note that each CTA must process complete numHeadsQPerKv.
-        int numTokensPerCtaQ = kernelMeta.mStepQ / params.mNumHeadsQPerKv;
+        int numTokensPerCtaQ = std::max(1, kernelMeta.mStepQ / params.mNumHeadsQPerKv);
         // Group both headsQ and tokensQ into one CTA.
         numCtasPerSeqQ = flashinfer::ceil_div(params.mMaxSeqLenQ, numTokensPerCtaQ);
       }
@@ -773,8 +773,11 @@ class TllmGenFmhaKernel {
       kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
     }
 
-    // Use an experimental kernel-timing model to select the best tileSizeQ.
-    selectTileSizeQForGqaGeneration(params, selectKernelParams);
+    // When maxSeqLenQ > 1, use an experimental kernel-timing model to select the best kernel that
+    // groups both tokensQ and headsQ into one CTA.
+    if (params.mMaxSeqLenQ > 1) {
+      selectTileSizeQForGqaGeneration(params, selectKernelParams);
+    }
   }
 
   // Select a kernel based on the heuristic.
