@@ -444,6 +444,7 @@ run_tests_parallel() {
 
     # Create a results file for each test
     declare -A test_result_files
+    declare -A test_exit_codes
     declare -A test_pid_map
     declare -A test_gpu_map
 
@@ -536,7 +537,7 @@ run_tests_parallel() {
             for pid in "${!test_pid_map[@]}"; do
                 if ! kill -0 "$pid" 2>/dev/null; then
                     # Job finished, reclaim its GPU
-                    wait "$pid" 2>/dev/null || true
+                    wait "$pid" 2>/dev/null; test_exit_codes[$pid]=$?
                     local freed_gpu="${test_gpu_map[$pid]}"
                     available_gpus+=("$freed_gpu")
                     unset "test_pid_map[$pid]"
@@ -571,7 +572,9 @@ run_tests_parallel() {
     echo ""
     echo "Waiting for all tests to complete..."
     for pid in "${!test_result_files[@]}"; do
-        wait "$pid" 2>/dev/null || true
+        if [ -z "${test_exit_codes[$pid]+x}" ]; then
+            wait "$pid" 2>/dev/null; test_exit_codes[$pid]=$?
+        fi
     done
 
     echo ""
@@ -632,11 +635,24 @@ run_tests_parallel() {
                 TOTAL_TESTS=$((TOTAL_TESTS - 1))
             fi
         else
-            # No result file means the subprocess was killed (OOM, timeout, etc.)
-            # before it could write a result — treat as failure
-            echo "❌ KILLED/TIMED OUT: $test_file (no result produced)"
+            # No result file means the subprocess was killed before it could
+            # write a result. Decode the exit code to identify the signal.
+            local exit_code="${test_exit_codes[$pid]:-unknown}"
+            local kill_reason="exit code $exit_code"
+            if [ "$exit_code" -gt 128 ] 2>/dev/null; then
+                local sig=$((exit_code - 128))
+                local sig_name
+                sig_name=$(kill -l "$sig" 2>/dev/null || echo "SIG$sig")
+                kill_reason="signal $sig ($sig_name)"
+                if [ "$sig" -eq 9 ]; then
+                    kill_reason="signal 9 (SIGKILL) — likely OOM killed"
+                elif [ "$sig" -eq 15 ]; then
+                    kill_reason="signal 15 (SIGTERM) — likely Slurm/container timeout"
+                fi
+            fi
+            echo "❌ KILLED: $test_file (no result produced, $kill_reason)"
             TOTAL_TESTS=$((TOTAL_TESTS + 1))
-            FAILED_TESTS="$FAILED_TESTS\n  - $test_file (killed/timed out)"
+            FAILED_TESTS="$FAILED_TESTS\n  - $test_file (killed: $kill_reason)"
             # shellcheck disable=SC2034  # EXIT_CODE is used by calling scripts
             EXIT_CODE=1
         fi
