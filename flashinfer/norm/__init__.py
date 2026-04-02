@@ -134,7 +134,7 @@ def _rmsnorm_impl(
     eps: float,
     enable_pdl: Optional[bool],
 ) -> None:
-    if enable_pdl is None:
+    if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
     if _USE_CUDA_NORM:
         get_norm_module().rmsnorm(out, input, weight, eps, enable_pdl)
@@ -192,7 +192,7 @@ def rmsnorm_quant(
 
     """
     scale = _normalize_scale_tensor(scale, input)
-    if enable_pdl is None:
+    if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
     if _USE_CUDA_NORM:
         get_norm_module().rmsnorm_quant(out, input, weight, scale, eps, enable_pdl)
@@ -245,7 +245,7 @@ def fused_add_rmsnorm(
         Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
     """
-    if enable_pdl is None:
+    if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
     if _USE_CUDA_NORM:
         get_norm_module().fused_add_rmsnorm(input, residual, weight, eps, enable_pdl)
@@ -306,7 +306,7 @@ def fused_add_rmsnorm_quant(
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
     """
     scale = _normalize_scale_tensor(scale, input)
-    if enable_pdl is None:
+    if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
     if _USE_CUDA_NORM:
         get_norm_module().fused_add_rmsnorm_quant(
@@ -383,7 +383,7 @@ def _gemma_rmsnorm_impl(
     eps: float,
     enable_pdl: Optional[bool],
 ) -> None:
-    if enable_pdl is None:
+    if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
     if _USE_CUDA_NORM:
         get_norm_module().gemma_rmsnorm(out, input, weight, eps, enable_pdl)
@@ -442,7 +442,7 @@ def gemma_fused_add_rmsnorm(
         Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
     """
-    if enable_pdl is None:
+    if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
     if _USE_CUDA_NORM:
         get_norm_module().gemma_fused_add_rmsnorm(
