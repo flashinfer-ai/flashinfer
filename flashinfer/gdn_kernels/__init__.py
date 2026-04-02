@@ -51,6 +51,11 @@ except ImportError:
     get_tile_v_mtp = None  # type: ignore
     get_vec_size_mtp = None  # type: ignore
 
+try:
+    from .cutile_gdn_prefill import chunk_gated_delta_rule_cutile
+except ImportError:
+    chunk_gated_delta_rule_cutile = None  # type: ignore
+
 __all__ = [
     "gated_delta_rule",
     "gated_delta_rule_mtp",
@@ -61,4 +66,5 @@ __all__ = [
     "run_mtp_decode",
     "get_tile_v_mtp",
     "get_vec_size_mtp",
+    "chunk_gated_delta_rule_cutile",
 ]
