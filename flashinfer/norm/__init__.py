@@ -536,9 +536,9 @@ from ..jit.rmsnorm_silu import (
 
 
 @functools.cache
-def _get_rmsnorm_silu_sm_count():
-    """Cache the SM count for the current device."""
-    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+def _get_rmsnorm_silu_sm_count(device_id: int):
+    """Cache the SM count per device."""
+    props = torch.cuda.get_device_properties(device_id)
     return props.multi_processor_count
 
 
@@ -686,7 +686,7 @@ def fused_rmsnorm_silu(
 
     warps_m, split_cols, kernel_cfg, occupancy, bytes_per_ldg = knobs
     ctas_per_row = _estimate_ctas_per_row(C, split_cols, kernel_cfg, bytes_per_ldg)
-    sm_count = _get_rmsnorm_silu_sm_count()
+    sm_count = _get_rmsnorm_silu_sm_count(input.device.index)
 
     module = _get_rmsnorm_silu_module(
         C, output_dtype_str, warps_m, ctas_per_row, bytes_per_ldg, kernel_cfg, occupancy
