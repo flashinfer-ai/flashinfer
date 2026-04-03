@@ -203,7 +203,10 @@ def test_gqa_paged_decode_fi_trace():
     assert "k_cache" in defn["inputs"]
     assert "v_cache" in defn["inputs"]
     assert defn["inputs"]["k_cache"]["shape"] == [
-        "num_pages", "page_size", "num_kv_heads", "head_dim"
+        "num_pages",
+        "page_size",
+        "num_kv_heads",
+        "head_dim",
     ]
 
 
@@ -358,8 +361,12 @@ def test_usecase_llama31_decode_step(tmp_path):
     page_size = 16
 
     q = torch.randn(batch_size, num_qo_heads, head_dim, dtype=torch.bfloat16)
-    k_cache = torch.randn(num_pages, page_size, num_kv_heads, head_dim, dtype=torch.bfloat16)
-    v_cache = torch.randn(num_pages, page_size, num_kv_heads, head_dim, dtype=torch.bfloat16)
+    k_cache = torch.randn(
+        num_pages, page_size, num_kv_heads, head_dim, dtype=torch.bfloat16
+    )
+    v_cache = torch.randn(
+        num_pages, page_size, num_kv_heads, head_dim, dtype=torch.bfloat16
+    )
 
     # ── Generate the definition and write it to disk in one call ─────────────
     traces_dir = tmp_path / "benchmark_traces"
@@ -377,18 +384,25 @@ def test_usecase_llama31_decode_step(tmp_path):
     assert defn["axes"]["num_pages"]["type"] == "var"
     assert defn["axes"]["num_qo_heads"] == {"type": "const", "value": num_qo_heads}
     assert defn["axes"]["num_kv_heads"] == {"type": "const", "value": num_kv_heads}
-    assert defn["axes"]["head_dim"]     == {"type": "const", "value": head_dim}
-    assert defn["axes"]["page_size"]    == {"type": "const", "value": page_size}
+    assert defn["axes"]["head_dim"] == {"type": "const", "value": head_dim}
+    assert defn["axes"]["page_size"] == {"type": "const", "value": page_size}
 
     # Input shapes use axis names, not raw integers.
     assert defn["inputs"]["q"]["shape"] == ["batch_size", "num_qo_heads", "head_dim"]
     assert defn["inputs"]["k_cache"]["shape"] == [
-        "num_pages", "page_size", "num_kv_heads", "head_dim"
+        "num_pages",
+        "page_size",
+        "num_kv_heads",
+        "head_dim",
     ]
     assert defn["inputs"]["k_cache"]["dtype"] == "bfloat16"
 
     # Output mirrors the query shape.
-    assert defn["outputs"]["output"]["shape"] == ["batch_size", "num_qo_heads", "head_dim"]
+    assert defn["outputs"]["output"]["shape"] == [
+        "batch_size",
+        "num_qo_heads",
+        "head_dim",
+    ]
     assert defn["outputs"]["output"]["dtype"] == "bfloat16"
     assert defn["outputs"]["lse"]["shape"] == ["batch_size", "num_qo_heads"]
     assert defn["outputs"]["lse"]["dtype"] == "float32"
@@ -411,17 +425,17 @@ def test_usecase_deepseek_mla_decode():
     """
     from flashinfer.mla import BatchMLAPagedAttentionWrapper
 
-    batch_size = 128      # tokens in the decode batch
-    num_qo_heads = 16     # after TP=8 split
+    batch_size = 128  # tokens in the decode batch
+    num_qo_heads = 16  # after TP=8 split
     head_dim_ckv = 512
     head_dim_kpe = 64
     num_pages = 4096
     page_size = 64
 
     q_nope = torch.randn(batch_size, num_qo_heads, head_dim_ckv, dtype=torch.bfloat16)
-    q_pe   = torch.randn(batch_size, num_qo_heads, head_dim_kpe,  dtype=torch.bfloat16)
+    q_pe = torch.randn(batch_size, num_qo_heads, head_dim_kpe, dtype=torch.bfloat16)
     ckv_cache = torch.randn(num_pages, page_size, head_dim_ckv, dtype=torch.bfloat16)
-    kpe_cache = torch.randn(num_pages, page_size, head_dim_kpe,  dtype=torch.bfloat16)
+    kpe_cache = torch.randn(num_pages, page_size, head_dim_kpe, dtype=torch.bfloat16)
 
     defn = BatchMLAPagedAttentionWrapper.run.fi_trace(
         q_nope=q_nope,
@@ -440,7 +454,9 @@ def test_usecase_deepseek_mla_decode():
 
     # The output uses the CKV head dimension (not KPE).
     assert defn["outputs"]["output"]["shape"] == [
-        "batch_size", "num_qo_heads", "head_dim_ckv"
+        "batch_size",
+        "num_qo_heads",
+        "head_dim_ckv",
     ]
 
     # Enrich with model metadata, then round-trip through JSON.

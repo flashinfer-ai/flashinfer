@@ -74,7 +74,9 @@ def _gdn_decode_reference(q, k, v, state, A_log, a, dt_bias, b, scale):
             q_h = q_exp[b_idx, h_idx]
             k_h = k_exp[b_idx, h_idx]
             v_h = v_f32[b_idx, h_idx]
-            h_state = state_f32[b_idx, h_idx].clone().transpose(-1, -2)  # [V,K] -> [K,V]
+            h_state = (
+                state_f32[b_idx, h_idx].clone().transpose(-1, -2)
+            )  # [V,K] -> [K,V]
             g_val = g_f32[b_idx, h_idx]
             beta_val = beta_f32[b_idx, h_idx]
 
@@ -100,11 +102,21 @@ gated_delta_rule_decode_trace = TraceTemplate(
         "Single-token generation with recurrent state update."
     ),
     axes={
-        "batch_size": Var(description="Number of sequences being decoded concurrently."),
-        "seq_len": Const(description="Sequence length (always 1 for single-token decode).", abbrev=""),
-        "num_q_heads": Const(description="Number of query heads (same as key heads in GVA mode).", abbrev="qk"),
+        "batch_size": Var(
+            description="Number of sequences being decoded concurrently."
+        ),
+        "seq_len": Const(
+            description="Sequence length (always 1 for single-token decode).", abbrev=""
+        ),
+        "num_q_heads": Const(
+            description="Number of query heads (same as key heads in GVA mode).",
+            abbrev="qk",
+        ),
         "num_k_heads": Const(description="Number of key heads.", abbrev=""),
-        "num_v_heads": Const(description="Number of value heads (GVA: more value heads than query heads).", abbrev="v"),
+        "num_v_heads": Const(
+            description="Number of value heads (GVA: more value heads than query heads).",
+            abbrev="v",
+        ),
         "head_size": Const(
             description="Dimension of each attention head (K dimension in query/key space, V dimension in value space).",
             abbrev="d",
@@ -209,7 +221,9 @@ def _gdn_prefill_reference(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, sca
         (total_seq_len, num_sab_heads, head_size), dtype=torch.bfloat16, device=device
     )
     new_state = torch.zeros(
-        (num_seqs, num_sab_heads, head_size, head_size), dtype=torch.float32, device=device
+        (num_seqs, num_sab_heads, head_size, head_size),
+        dtype=torch.float32,
+        device=device,
     )
 
     for seq_idx in range(num_seqs):
@@ -220,10 +234,14 @@ def _gdn_prefill_reference(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, sca
             continue
 
         if state is not None:
-            state_HKV = state[seq_idx].clone().float().transpose(-1, -2)  # [H,V,K] -> [H,K,V]
+            state_HKV = (
+                state[seq_idx].clone().float().transpose(-1, -2)
+            )  # [H,V,K] -> [H,K,V]
         else:
             state_HKV = torch.zeros(
-                (num_sab_heads, head_size, head_size), dtype=torch.float32, device=device
+                (num_sab_heads, head_size, head_size),
+                dtype=torch.float32,
+                device=device,
             )
 
         for i in range(seq_len):
@@ -238,8 +256,12 @@ def _gdn_prefill_reference(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, sca
             old_v_H1V = q_H1K.float() @ old_state_HKV  # reuse shape pattern
             old_v_H1V = k_H1K @ old_state_HKV
             new_v_H1V = beta_H11 * v_H1V + (1 - beta_H11) * old_v_H1V
-            state_remove = torch.einsum("hkl,hlv->hkv", k_H1K.transpose(-1, -2), old_v_H1V)
-            state_update = torch.einsum("hkl,hlv->hkv", k_H1K.transpose(-1, -2), new_v_H1V)
+            state_remove = torch.einsum(
+                "hkl,hlv->hkv", k_H1K.transpose(-1, -2), old_v_H1V
+            )
+            state_update = torch.einsum(
+                "hkl,hlv->hkv", k_H1K.transpose(-1, -2), new_v_H1V
+            )
             state_HKV = old_state_HKV - state_remove + state_update
 
             o_H1V = scale * (q_H1K @ state_HKV)
@@ -258,11 +280,19 @@ gdn_prefill_trace = TraceTemplate(
         "The state is in k-last layout [N, H, V, K]."
     ),
     axes={
-        "total_seq_len": Var(description="Total number of tokens across all sequences in the batch."),
+        "total_seq_len": Var(
+            description="Total number of tokens across all sequences in the batch."
+        ),
         "num_seqs": Var(description="Number of sequences in the batch."),
-        "num_q_heads": Const(description="Number of query heads (same as key heads in GVA mode).", abbrev="qk"),
+        "num_q_heads": Const(
+            description="Number of query heads (same as key heads in GVA mode).",
+            abbrev="qk",
+        ),
         "num_k_heads": Const(description="Number of key heads.", abbrev=""),
-        "num_v_heads": Const(description="Number of value heads (GVA: more value heads than query heads).", abbrev="v"),
+        "num_v_heads": Const(
+            description="Number of value heads (GVA: more value heads than query heads).",
+            abbrev="v",
+        ),
         "head_size": Const(
             description="Dimension of each attention head (K dimension in query/key space, V dimension in value space).",
             abbrev="d",
@@ -342,7 +372,16 @@ gdn_prefill_trace = TraceTemplate(
 
 @torch.no_grad()
 def _gdn_mtp_reference(
-    q, k, v, initial_state, initial_state_indices, A_log, a, dt_bias, b, scale,
+    q,
+    k,
+    v,
+    initial_state,
+    initial_state_indices,
+    A_log,
+    a,
+    dt_bias,
+    b,
+    scale,
     intermediate_states_buffer=None,
 ):
     """
@@ -381,14 +420,16 @@ def _gdn_mtp_reference(
 
     for b_idx in range(B):
         state_idx = int(initial_state_indices[b_idx].item())
-        state_HVK = initial_state[state_idx].clone().float().transpose(-1, -2)  # [H,V,K] -> [H,K,V]
+        state_HVK = (
+            initial_state[state_idx].clone().float().transpose(-1, -2)
+        )  # [H,V,K] -> [H,K,V]
 
         for t in range(T):
             q_HK = q_exp[b_idx, t].float()  # [HV, K]
             k_HK = k_exp[b_idx, t].float()  # [HV, K]
-            v_HV = v[b_idx, t].float()       # [HV, V]
-            g_H = g[b_idx, t]                # [HV]
-            beta_H = beta[b_idx, t]          # [HV]
+            v_HV = v[b_idx, t].float()  # [HV, V]
+            g_H = g[b_idx, t]  # [HV]
+            beta_H = beta[b_idx, t]  # [HV]
 
             for h_idx in range(num_v_heads):
                 q_h = q_HK[h_idx]
@@ -409,7 +450,9 @@ def _gdn_mtp_reference(
                 state_HVK[h_idx] = h_state
 
             if cache_intermediate:
-                intermediate_states_buffer[state_idx, t] = state_HVK.transpose(-1, -2)  # [H,K,V] -> [H,V,K]
+                intermediate_states_buffer[state_idx, t] = state_HVK.transpose(
+                    -1, -2
+                )  # [H,K,V] -> [H,V,K]
 
     final_state = initial_state.clone()
     return output, final_state
@@ -424,11 +467,19 @@ gdn_mtp_trace = TraceTemplate(
         "need to be processed in sequence. State layout is k-last [pool_size, H, V, K]."
     ),
     axes={
-        "batch_size": Var(description="Number of sequences being verified concurrently."),
+        "batch_size": Var(
+            description="Number of sequences being verified concurrently."
+        ),
         "seq_len": Var(description="Number of tokens to process (T > 1 for MTP)."),
-        "num_q_heads": Const(description="Number of query heads (same as key heads in GVA mode).", abbrev="qk"),
+        "num_q_heads": Const(
+            description="Number of query heads (same as key heads in GVA mode).",
+            abbrev="qk",
+        ),
         "num_k_heads": Const(description="Number of key heads.", abbrev=""),
-        "num_v_heads": Const(description="Number of value heads (GVA: more value heads than query heads).", abbrev="v"),
+        "num_v_heads": Const(
+            description="Number of value heads (GVA: more value heads than query heads).",
+            abbrev="v",
+        ),
         "head_size": Const(
             description="Dimension of each attention head (K dimension in query/key space, V dimension in value space).",
             abbrev="d",

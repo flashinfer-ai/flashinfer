@@ -61,6 +61,7 @@ def _mm_fp4_reference(A, B, a_descale, b_descale, block_size=16):
     a_descale: [M, K//block_size], b_descale: [K, N//block_size].
     The reference unpacks the nibbles and applies the block scales.
     """
+
     def _unpack_fp4(packed, rows, cols):
         # Each byte holds two fp4 nibbles (low nibble = first element).
         lo = (packed & 0x0F).to(torch.float32)
@@ -186,7 +187,9 @@ mm_fp4_trace = TraceTemplate(
         "M": Var(),
         "N": Const(),
         "K": Const(),
-        "block_size": Const(description="FP4 quantization block size (16 for nvfp4, 32 for mxfp4)."),
+        "block_size": Const(
+            description="FP4 quantization block size (16 for nvfp4, 32 for mxfp4)."
+        ),
     },
     inputs={
         "A": Tensor(

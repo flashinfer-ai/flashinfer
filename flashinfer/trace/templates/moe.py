@@ -50,8 +50,8 @@ def _fp8_moe_run_experts(
     device = hidden_states.device
 
     A_fp32 = hidden_states.to(torch.float32)
-    A_scale = hidden_states_scale.to(torch.float32)           # [H/128, T]
-    A_scale_TH = A_scale.permute(1, 0).contiguous()          # [T, H/128]
+    A_scale = hidden_states_scale.to(torch.float32)  # [H/128, T]
+    A_scale_TH = A_scale.permute(1, 0).contiguous()  # [T, H/128]
     A_scale_expanded = (
         A_scale_TH.unsqueeze(-1).repeat(1, 1, BLOCK).reshape(T, H).contiguous()
     )
@@ -140,10 +140,14 @@ def _trtllm_fp8_block_scale_moe_ds_routing_reference(
     top2_vals, _ = torch.topk(s_wb_grouped, k=2, dim=2, largest=True, sorted=False)
     group_scores = top2_vals.sum(dim=2)
 
-    _, group_idx = torch.topk(group_scores, k=TOPK_GROUP, dim=1, largest=True, sorted=False)
+    _, group_idx = torch.topk(
+        group_scores, k=TOPK_GROUP, dim=1, largest=True, sorted=False
+    )
     group_mask = torch.zeros_like(group_scores)
     group_mask.scatter_(1, group_idx, 1.0)
-    score_mask = group_mask.unsqueeze(2).expand(T, N_GROUP, group_size).reshape(T, E_global)
+    score_mask = (
+        group_mask.unsqueeze(2).expand(T, N_GROUP, group_size).reshape(T, E_global)
+    )
 
     neg_inf = torch.finfo(torch.float32).min
     scores_pruned = s_with_bias.masked_fill(score_mask == 0, neg_inf)
@@ -159,10 +163,16 @@ def _trtllm_fp8_block_scale_moe_ds_routing_reference(
     w_topk = weights.gather(1, topk_idx)
 
     return _fp8_moe_run_experts(
-        hidden_states, hidden_states_scale,
-        gemm1_weights, gemm1_weights_scale,
-        gemm2_weights, gemm2_weights_scale,
-        w_topk, topk_idx, local_expert_offset, E_global,
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights,
+        gemm2_weights_scale,
+        w_topk,
+        topk_idx,
+        local_expert_offset,
+        E_global,
     )
 
 
@@ -192,10 +202,16 @@ def _trtllm_fp8_block_scale_moe_default_routing_reference(
     _, topk_idx = torch.topk(s, k=TOP_K, dim=1, largest=True, sorted=False)
     weights = s.gather(1, topk_idx) * routed_scaling_factor
     return _fp8_moe_run_experts(
-        hidden_states, hidden_states_scale,
-        gemm1_weights, gemm1_weights_scale,
-        gemm2_weights, gemm2_weights_scale,
-        weights, topk_idx, local_expert_offset, E_global,
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights,
+        gemm2_weights_scale,
+        weights,
+        topk_idx,
+        local_expert_offset,
+        E_global,
     )
 
 
@@ -226,10 +242,16 @@ def _trtllm_fp8_block_scale_moe_renormalize_routing_reference(
     gathered = logits.gather(1, topk_idx)
     weights = torch.softmax(gathered, dim=-1) * routed_scaling_factor
     return _fp8_moe_run_experts(
-        hidden_states, hidden_states_scale,
-        gemm1_weights, gemm1_weights_scale,
-        gemm2_weights, gemm2_weights_scale,
-        weights, topk_idx, local_expert_offset, E_global,
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights,
+        gemm2_weights_scale,
+        weights,
+        topk_idx,
+        local_expert_offset,
+        E_global,
     )
 
 
@@ -254,14 +276,20 @@ def _trtllm_fp8_block_scale_moe_llama4_routing_reference(
     logits = routing_logits.to(torch.float32)
     if routing_bias is not None:
         logits = logits + routing_bias.to(torch.float32).reshape(-1)
-    topk_idx = logits.argmax(dim=-1, keepdim=True)          # [T, 1]
+    topk_idx = logits.argmax(dim=-1, keepdim=True)  # [T, 1]
     top1_logit = logits.gather(1, topk_idx)
     weights = (1.0 / (1.0 + torch.exp(-top1_logit))) * routed_scaling_factor
     return _fp8_moe_run_experts(
-        hidden_states, hidden_states_scale,
-        gemm1_weights, gemm1_weights_scale,
-        gemm2_weights, gemm2_weights_scale,
-        weights, topk_idx, local_expert_offset, E_global,
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights,
+        gemm2_weights_scale,
+        weights,
+        topk_idx,
+        local_expert_offset,
+        E_global,
     )
 
 
@@ -293,10 +321,16 @@ def _trtllm_fp8_block_scale_moe_renormalize_naive_routing_reference(
     weights = gathered / (gathered.sum(dim=1, keepdim=True) + 1e-20)
     weights = weights * routed_scaling_factor
     return _fp8_moe_run_experts(
-        hidden_states, hidden_states_scale,
-        gemm1_weights, gemm1_weights_scale,
-        gemm2_weights, gemm2_weights_scale,
-        weights, topk_idx, local_expert_offset, E_global,
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights,
+        gemm2_weights_scale,
+        weights,
+        topk_idx,
+        local_expert_offset,
+        E_global,
     )
 
 
@@ -324,13 +358,23 @@ def _trtllm_fp8_block_scale_moe_topk_routing_reference(
         logits = logits + routing_bias.to(torch.float32).reshape(-1)
     _, topk_idx = torch.topk(logits, k=TOP_K, dim=1, largest=True, sorted=False)
     T = logits.shape[0]
-    weights = torch.full((T, TOP_K), routed_scaling_factor / TOP_K,
-                         dtype=torch.float32, device=logits.device)
+    weights = torch.full(
+        (T, TOP_K),
+        routed_scaling_factor / TOP_K,
+        dtype=torch.float32,
+        device=logits.device,
+    )
     return _fp8_moe_run_experts(
-        hidden_states, hidden_states_scale,
-        gemm1_weights, gemm1_weights_scale,
-        gemm2_weights, gemm2_weights_scale,
-        weights, topk_idx, local_expert_offset, E_global,
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights,
+        gemm2_weights_scale,
+        weights,
+        topk_idx,
+        local_expert_offset,
+        E_global,
     )
 
 
@@ -341,7 +385,9 @@ def _trtllm_fp8_block_scale_moe_topk_routing_reference(
 _STANDARD_AXES = {
     "seq_len": Var(description="Sequence length (number of tokens)"),
     "num_experts": Const(description="Total number of experts.", abbrev=""),
-    "top_k": Const(description="Number of experts to route to per token.", abbrev="topk"),
+    "top_k": Const(
+        description="Number of experts to route to per token.", abbrev="topk"
+    ),
     "num_local_experts": Const(description="Number of local experts.", abbrev="e"),
     "hidden_size": Const(description="Hidden dimension size.", abbrev="h"),
     "intermediate_size": Const(description="MoE intermediate layer size.", abbrev="i"),
@@ -445,12 +491,20 @@ trtllm_fp8_block_scale_moe_ds_routing_trace = TraceTemplate(
     axes={
         "seq_len": Var(description="Sequence length (number of tokens)"),
         "num_experts": Const(description="Total number of experts.", abbrev=""),
-        "top_k": Const(description="Number of experts to route to per token.", abbrev="topk"),
-        "n_group": Const(description="Number of expert groups for group routing.", abbrev="ng"),
-        "topk_group": Const(description="Number of groups to select for top-k routing.", abbrev="kg"),
+        "top_k": Const(
+            description="Number of experts to route to per token.", abbrev="topk"
+        ),
+        "n_group": Const(
+            description="Number of expert groups for group routing.", abbrev="ng"
+        ),
+        "topk_group": Const(
+            description="Number of groups to select for top-k routing.", abbrev="kg"
+        ),
         "num_local_experts": Const(description="Number of local experts.", abbrev="e"),
         "hidden_size": Const(description="Hidden dimension size.", abbrev="h"),
-        "intermediate_size": Const(description="MoE intermediate layer size.", abbrev="i"),
+        "intermediate_size": Const(
+            description="MoE intermediate layer size.", abbrev="i"
+        ),
         "gemm1_out_size": Const(
             description="Output size of the first GEMM (W13). Should be 2 * intermediate_size.",
             abbrev="",
@@ -564,12 +618,12 @@ trtllm_fp8_block_scale_moe_topk_routing_trace = _make_standard_moe_trace(
 # ---------------------------------------------------------------------------
 
 _MOE_TRACE_BY_ROUTING_TYPE = {
-    0: trtllm_fp8_block_scale_moe_default_routing_trace,       # Default
-    1: trtllm_fp8_block_scale_moe_renormalize_routing_trace,   # Renormalize
-    2: trtllm_fp8_block_scale_moe_ds_routing_trace,            # DeepSeekV3
-    3: trtllm_fp8_block_scale_moe_llama4_routing_trace,        # Llama4
+    0: trtllm_fp8_block_scale_moe_default_routing_trace,  # Default
+    1: trtllm_fp8_block_scale_moe_renormalize_routing_trace,  # Renormalize
+    2: trtllm_fp8_block_scale_moe_ds_routing_trace,  # DeepSeekV3
+    3: trtllm_fp8_block_scale_moe_llama4_routing_trace,  # Llama4
     4: trtllm_fp8_block_scale_moe_renormalize_naive_routing_trace,  # RenormalizeNaive
-    5: trtllm_fp8_block_scale_moe_topk_routing_trace,          # TopK
+    5: trtllm_fp8_block_scale_moe_topk_routing_trace,  # TopK
     # 6 = Unspecified: no trace
 }
 

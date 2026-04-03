@@ -76,26 +76,30 @@
         "len_indptr"
       ],
       "dtype": "unknown",
-      "description": "Query offsets for each sequence."
+      "optional": true,
+      "description": "Query offsets for each sequence. Set during plan(), not run()."
     },
     "kv_indptr": {
       "shape": [
         "len_indptr"
       ],
       "dtype": "unknown",
-      "description": "KV page offsets for each sequence."
+      "optional": true,
+      "description": "KV page offsets for each sequence. Set during plan(), not run()."
     },
     "kv_indices": {
       "shape": [
         "num_kv_indices"
       ],
       "dtype": "unknown",
-      "description": "Page IDs for KV cache lookups."
+      "optional": true,
+      "description": "Page IDs for KV cache lookups. Set during plan(), not run()."
     },
     "sm_scale": {
       "shape": null,
       "dtype": "float32",
-      "description": "Softmax scale. Default is (1/sqrt(head_dim))."
+      "optional": true,
+      "description": "Softmax scale. Default is (1/sqrt(head_dim)). Set during plan(), not run()."
     }
   },
   "outputs": {

@@ -1543,6 +1543,7 @@ def _attach_fi_trace(
         # confusing AttributeError when calling func.fi_trace(...).
         _func_name = getattr(original, "__qualname__", repr(original))
         import warnings  # noqa: PLC0415
+
         warnings.warn(
             f"[flashinfer] Failed to attach fi_trace to '{_func_name}': "
             f"{type(_exc).__name__}: {_exc}\n"

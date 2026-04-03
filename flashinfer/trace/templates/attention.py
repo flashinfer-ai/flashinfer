@@ -25,9 +25,7 @@ from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 
 
 @torch.no_grad()
-def _gqa_paged_decode_reference(
-    q, k_cache, v_cache, kv_indptr, kv_indices, sm_scale
-):
+def _gqa_paged_decode_reference(q, k_cache, v_cache, kv_indptr, kv_indices, sm_scale):
     batch_size, num_qo_heads, head_dim = q.shape
     _, page_size, num_kv_heads, _ = k_cache.shape
 
@@ -268,8 +266,8 @@ def _gqa_ragged_prefill_reference(q, k, v, qo_indptr, kv_indptr, sm_scale):
         kv_end = int(kv_indptr[b + 1].item())
         if q_start >= q_end or kv_start >= kv_end:
             continue
-        q_b = q_f32[q_start:q_end]     # [S, num_qo_heads, head_dim]
-        k_b = k_f32[kv_start:kv_end]   # [T, num_kv_heads, head_dim]
+        q_b = q_f32[q_start:q_end]  # [S, num_qo_heads, head_dim]
+        k_b = k_f32[kv_start:kv_end]  # [T, num_kv_heads, head_dim]
         v_b = v_f32[kv_start:kv_end]
         num_q_tokens = q_b.shape[0]
         num_kv_tokens = k_b.shape[0]
@@ -360,10 +358,15 @@ def _mla_paged_decode_reference(
     Kp_all = kpe_cache.squeeze(1).to(torch.float32)  # [num_pages, head_dim_kpe]
 
     output = torch.zeros(
-        (batch_size, num_qo_heads, head_dim_ckv), dtype=torch.bfloat16, device=q_nope.device
+        (batch_size, num_qo_heads, head_dim_ckv),
+        dtype=torch.bfloat16,
+        device=q_nope.device,
     )
     lse = torch.full(
-        (batch_size, num_qo_heads), -float("inf"), dtype=torch.float32, device=q_nope.device
+        (batch_size, num_qo_heads),
+        -float("inf"),
+        dtype=torch.float32,
+        device=q_nope.device,
     )
 
     for b in range(batch_size):
@@ -373,10 +376,10 @@ def _mla_paged_decode_reference(
             output[b].zero_()
             continue
         tok_idx = kv_indices[page_beg:page_end].to(torch.long)
-        Kc = Kc_all[tok_idx]   # [L, head_dim_ckv]
-        Kp = Kp_all[tok_idx]   # [L, head_dim_kpe]
+        Kc = Kc_all[tok_idx]  # [L, head_dim_ckv]
+        Kp = Kp_all[tok_idx]  # [L, head_dim_kpe]
         qn = q_nope[b].to(torch.float32)  # [num_qo_heads, head_dim_ckv]
-        qp = q_pe[b].to(torch.float32)    # [num_qo_heads, head_dim_kpe]
+        qp = q_pe[b].to(torch.float32)  # [num_qo_heads, head_dim_kpe]
         logits = ((qn @ Kc.T) + (qp @ Kp.T)) * sm_scale  # [num_qo_heads, L]
         lse[b] = torch.logsumexp(logits, dim=-1) / math.log(2.0)
         output[b] = (torch.softmax(logits, dim=-1) @ Kc).to(torch.bfloat16)
@@ -400,7 +403,9 @@ mla_paged_decode_trace = TraceTemplate(
         "head_dim_ckv": Const(abbrev="ckv"),
         "head_dim_kpe": Const(abbrev="kpe"),
         "page_size": Const(abbrev="ps"),
-        "num_pages": Var(description="Total number of allocated pages in the KV cache."),
+        "num_pages": Var(
+            description="Total number of allocated pages in the KV cache."
+        ),
         "len_indptr": Var(description="Length of kv_indptr array."),
         "num_kv_indices": Var(description="Total number of KV page indices."),
     },
@@ -472,10 +477,15 @@ def _mla_paged_prefill_reference(
     Kp_all = kpe_cache.squeeze(1).to(torch.float32)  # [num_pages, head_dim_kpe]
 
     output = torch.zeros(
-        (total_q, num_qo_heads, head_dim_ckv), dtype=torch.bfloat16, device=q_nope.device
+        (total_q, num_qo_heads, head_dim_ckv),
+        dtype=torch.bfloat16,
+        device=q_nope.device,
     )
     lse = torch.full(
-        (total_q, num_qo_heads), -float("inf"), dtype=torch.float32, device=q_nope.device
+        (total_q, num_qo_heads),
+        -float("inf"),
+        dtype=torch.float32,
+        device=q_nope.device,
     )
 
     for b in range(len_indptr - 1):
@@ -489,8 +499,10 @@ def _mla_paged_prefill_reference(
         Kc = Kc_all[tok_idx]  # [L, head_dim_ckv]
         Kp = Kp_all[tok_idx]  # [L, head_dim_kpe]
         num_kv_tokens = tok_idx.shape[0]
-        qn_b = q_nope[q_start:q_end].to(torch.float32)  # [S, num_qo_heads, head_dim_ckv]
-        qp_b = q_pe[q_start:q_end].to(torch.float32)    # [S, num_qo_heads, head_dim_kpe]
+        qn_b = q_nope[q_start:q_end].to(
+            torch.float32
+        )  # [S, num_qo_heads, head_dim_ckv]
+        qp_b = q_pe[q_start:q_end].to(torch.float32)  # [S, num_qo_heads, head_dim_kpe]
         seq_len = q_end - q_start
         delta = num_kv_tokens - seq_len
         for q_idx in range(seq_len):
@@ -502,7 +514,9 @@ def _mla_paged_prefill_reference(
             qp = qp_b[q_idx]  # [num_qo_heads, head_dim_kpe]
             logits = ((qn @ Kc[:max_kv].T) + (qp @ Kp[:max_kv].T)) * sm_scale
             lse[global_q] = torch.logsumexp(logits, dim=-1) / math.log(2.0)
-            output[global_q] = (torch.softmax(logits, dim=-1) @ Kc[:max_kv]).to(torch.bfloat16)
+            output[global_q] = (torch.softmax(logits, dim=-1) @ Kc[:max_kv]).to(
+                torch.bfloat16
+            )
 
     return output, lse
 
@@ -523,7 +537,9 @@ mla_paged_prefill_trace = TraceTemplate(
         "head_dim_kpe": Const(abbrev="kpe"),
         "page_size": Const(abbrev="ps"),
         "total_q": Var(description="Total number of query tokens."),
-        "num_pages": Var(description="Total number of allocated pages in the KV cache."),
+        "num_pages": Var(
+            description="Total number of allocated pages in the KV cache."
+        ),
         "len_indptr": Var(description="Length of indptr arrays (batch_size + 1)."),
         "num_kv_indices": Var(description="Total number of KV page indices."),
     },
@@ -662,7 +678,9 @@ dsa_paged_trace = TraceTemplate(
             description="Page size for KV cache.",
             abbrev="ps",
         ),
-        "num_pages": Var(description="Total number of allocated pages in the KV cache."),
+        "num_pages": Var(
+            description="Total number of allocated pages in the KV cache."
+        ),
     },
     inputs={
         "q_nope": Tensor(

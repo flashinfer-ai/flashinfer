@@ -70,11 +70,7 @@ def _get_sig_params(func: Callable) -> Optional[set]:
         sig = inspect.signature(original)
     except (ValueError, TypeError):
         return None
-    return {
-        name
-        for name, p in sig.parameters.items()
-        if name not in ("self", "cls")
-    }
+    return {name for name, p in sig.parameters.items() if name not in ("self", "cls")}
 
 
 def assert_template_signature_consistency(
@@ -267,7 +263,9 @@ def assert_fi_trace_complete(
     unknown_inputs = [
         k
         for k, v in defn.get("inputs", {}).items()
-        if isinstance(v, dict) and v.get("dtype") == "unknown" and not v.get("optional", False)
+        if isinstance(v, dict)
+        and v.get("dtype") == "unknown"
+        and not v.get("optional", False)
     ]
     assert not unknown_inputs, (
         f"{pfx}Template {name_tag}: inputs with unknown dtype: {unknown_inputs}"
@@ -299,6 +297,7 @@ def assert_fi_trace_complete(
 # pick it up automatically.
 # ---------------------------------------------------------------------------
 
+
 def _collect_template_func_pairs() -> List[Tuple[Callable, TraceTemplate, str]]:
     """
     Return all (func, template, label) pairs by reading _TRACE_REGISTRY.
@@ -307,17 +306,18 @@ def _collect_template_func_pairs() -> List[Tuple[Callable, TraceTemplate, str]]:
     the structural tests from running.
     """
     # Trigger @flashinfer_api decorators by importing all modules that use them.
-    import flashinfer.decode        # BatchDecodeWithPagedKVCacheWrapper
-    import flashinfer.fused_moe     # trtllm_fp8_block_scale_moe
-    import flashinfer.gdn_decode    # gated_delta_rule_decode, gated_delta_rule_mtp
-    import flashinfer.gdn_prefill   # chunk_gated_delta_rule
-    import flashinfer.gemm          # mm_bf16, mm_fp8, mm_mxfp8, mm_fp4
-    import flashinfer.mla           # BatchMLAPagedAttentionWrapper
-    import flashinfer.norm          # rmsnorm, fused_add_rmsnorm
-    import flashinfer.prefill       # BatchPrefillWithPagedKVCacheWrapper, Ragged
-    import flashinfer.sampling      # top_k_sampling_from_probs, etc.
+    import flashinfer.decode  # BatchDecodeWithPagedKVCacheWrapper
+    import flashinfer.fused_moe  # trtllm_fp8_block_scale_moe
+    import flashinfer.gdn_decode  # gated_delta_rule_decode, gated_delta_rule_mtp
+    import flashinfer.gdn_prefill  # chunk_gated_delta_rule
+    import flashinfer.gemm  # mm_bf16, mm_fp8, mm_mxfp8, mm_fp4
+    import flashinfer.mla  # BatchMLAPagedAttentionWrapper
+    import flashinfer.norm  # rmsnorm, fused_add_rmsnorm
+    import flashinfer.prefill  # BatchPrefillWithPagedKVCacheWrapper, Ragged
+    import flashinfer.sampling  # top_k_sampling_from_probs, etc.
 
     from flashinfer.api_logging import _TRACE_REGISTRY
+
     return list(_TRACE_REGISTRY)
 
 
@@ -391,25 +391,47 @@ def test_fi_trace_complete_gqa_paged_decode():
     k = torch.zeros(NP, P, KV, D, dtype=torch.bfloat16)
     v = torch.zeros(NP, P, KV, D, dtype=torch.bfloat16)
 
-    defn = BatchDecodeWithPagedKVCacheWrapper.run.fi_trace(
-        q=q, paged_kv_cache=(k, v)
-    )
+    defn = BatchDecodeWithPagedKVCacheWrapper.run.fi_trace(q=q, paged_kv_cache=(k, v))
     assert defn["axes"]["num_qo_heads"]["value"] == H
     assert defn["axes"]["page_size"]["value"] == P
     # Optional plan-phase inputs (kv_indptr, kv_indices, sm_scale) may have "unknown" dtype
     # when not passed to run(); only check non-optional inputs.
     non_optional_unknown = [
-        k for k, v in defn["inputs"].items()
-        if isinstance(v, dict) and v.get("dtype") == "unknown" and not v.get("optional", False)
+        k
+        for k, v in defn["inputs"].items()
+        if isinstance(v, dict)
+        and v.get("dtype") == "unknown"
+        and not v.get("optional", False)
     ]
-    assert not non_optional_unknown, f"Non-optional inputs with unknown dtype: {non_optional_unknown}"
+    assert not non_optional_unknown, (
+        f"Non-optional inputs with unknown dtype: {non_optional_unknown}"
+    )
     assert "unknown" not in str(defn["outputs"])
 
 
-def test_fi_trace_complete_moe_ds_routing():
-    """MoE DS-routing: fp8 + scale tensor shapes handled correctly."""
+@pytest.mark.parametrize(
+    "routing_method_type,top_k,extra_kwargs,expected_name_prefix",
+    [
+        # routing_method_type 0 — Default (softmax top-k)
+        (0, 4, {}, "moe_fp8_block_scale_default_routing"),
+        # routing_method_type 1 — Renormalize (top-k then softmax)
+        (1, 4, {}, "moe_fp8_block_scale_renormalize_routing"),
+        # routing_method_type 2 — DeepSeekV3 (group routing; needs n_group / topk_group)
+        (2, 4, {"n_group": 4, "topk_group": 2}, "moe_fp8_block_scale_ds_routing"),
+        # routing_method_type 3 — Llama4 (top-1 sigmoid)
+        (3, 1, {}, "moe_fp8_block_scale_llama4_routing"),
+        # routing_method_type 4 — RenormalizeNaive (softmax → top-k → renorm)
+        (4, 4, {}, "moe_fp8_block_scale_renormalize_naive_routing"),
+        # routing_method_type 5 — TopK (uniform weights, no score normalisation)
+        (5, 4, {}, "moe_fp8_block_scale_topk_routing"),
+    ],
+    ids=["default", "renormalize", "ds", "llama4", "renormalize_naive", "topk"],
+)
+def test_fi_trace_complete_moe_routing(
+    routing_method_type, top_k, extra_kwargs, expected_name_prefix
+):
+    """MoE routing variants: fp8 + scale tensor shapes handled correctly for each routing type."""
     from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
-    from flashinfer.trace.templates.moe import trtllm_fp8_block_scale_moe_ds_routing_trace
 
     T, E, EL, H, I, BS = 4, 16, 2, 256, 64, 128
     defn = trtllm_fp8_block_scale_moe.fi_trace(
@@ -422,18 +444,19 @@ def test_fi_trace_complete_moe_ds_routing():
         gemm2_weights=torch.zeros(EL, H, I, dtype=torch.float8_e4m3fn),
         gemm2_weights_scale=torch.ones(EL, H // BS, I // BS, dtype=torch.float32),
         num_experts=E,
-        top_k=4,
-        n_group=4,
-        topk_group=2,
+        top_k=top_k,
         intermediate_size=I,
         local_expert_offset=0,
         local_num_experts=EL,
         routed_scaling_factor=1.0,
-        routing_method_type=2,  # DeepSeekV3
+        routing_method_type=routing_method_type,
+        **extra_kwargs,
     )
     assert defn["op_type"] == "moe"
     assert defn["axes"]["num_local_experts"]["value"] == EL
     assert defn["axes"]["hidden_size"]["value"] == H
+    assert defn["axes"]["top_k"]["value"] == top_k
+    assert defn["name"].startswith(expected_name_prefix)
     assert "unknown" not in str(defn["inputs"])
 
 
@@ -449,6 +472,7 @@ def test_fi_trace_complete_moe_ds_routing():
 def _make_gdn_decode_func():
     """Return the real gated_delta_rule_decode for use in meta-tests."""
     import flashinfer.gdn_decode
+
     return flashinfer.gdn_decode.gated_delta_rule_decode
 
 
