@@ -35,6 +35,8 @@ def get_topk_module():
     def radix_topk(
         input: torch.Tensor,
         top_k: int,
+        sorted_output: bool,
+        deterministic: bool,
         row_states_buffer: Optional[torch.Tensor],
         output_values: torch.Tensor,
     ) -> torch.Tensor:
@@ -48,7 +50,13 @@ def get_topk_module():
             batch_size, top_k, dtype=torch.int32, device=device
         )
         module.radix_topk(
-            input, output_indices, output_values, row_states_buffer, top_k
+            input,
+            output_indices,
+            output_values,
+            row_states_buffer,
+            top_k,
+            sorted_output,
+            deterministic,
         )
         return output_indices
 
@@ -56,6 +64,8 @@ def get_topk_module():
     def _fake_radix_topk(
         input: torch.Tensor,
         top_k: int,
+        sorted_output: bool,
+        deterministic: bool,
         row_states_buffer: Optional[torch.Tensor],
         output_values: torch.Tensor,
     ) -> torch.Tensor:
@@ -74,6 +84,7 @@ def get_topk_module():
         lengths: torch.Tensor,
         row_states_buffer: Optional[torch.Tensor],
         top_k: int,
+        deterministic: bool,
     ) -> None:
         assert input.dtype in [torch.float32, torch.float16, torch.bfloat16], (
             f"Unsupported dtype {input.dtype}, expected float32, float16, or bfloat16"
@@ -86,6 +97,7 @@ def get_topk_module():
             lengths,
             row_states_buffer,
             top_k,
+            deterministic,
         )
 
     @register_fake_op("flashinfer::radix_topk_page_table_transform")
@@ -97,6 +109,7 @@ def get_topk_module():
         lengths: torch.Tensor,
         row_states_buffer: Optional[torch.Tensor],
         top_k: int,
+        deterministic: bool,
     ) -> None:
         pass
 
@@ -111,12 +124,19 @@ def get_topk_module():
         lengths: torch.Tensor,
         row_states_buffer: Optional[torch.Tensor],
         top_k: int,
+        deterministic: bool,
     ) -> None:
         assert input.dtype in [torch.float32, torch.float16, torch.bfloat16], (
             f"Unsupported dtype {input.dtype}, expected float32, float16, or bfloat16"
         )
         module.radix_topk_ragged_transform(
-            input, output_indices, offsets, lengths, row_states_buffer, top_k
+            input,
+            output_indices,
+            offsets,
+            lengths,
+            row_states_buffer,
+            top_k,
+            deterministic,
         )
 
     @register_fake_op("flashinfer::radix_topk_ragged_transform")
@@ -127,6 +147,7 @@ def get_topk_module():
         lengths: torch.Tensor,
         row_states_buffer: Optional[torch.Tensor],
         top_k: int,
+        deterministic: bool,
     ) -> None:
         pass
 
@@ -157,6 +178,7 @@ def top_k(
     input: torch.Tensor,
     k: int,
     sorted: bool = False,
+    deterministic: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Radix-based Top-K selection.
 
@@ -177,6 +199,12 @@ def top_k(
     sorted : bool, optional
         If True, the returned top-k elements will be sorted in descending order.
         Default is False (unsorted, which is faster).
+    deterministic : bool, optional
+        If True, uses deterministic mode.
+        Default is False (non-deterministic, which is faster).
+
+        Deterministic mode guarantees repeatable FlashInfer output ordering for
+        the selected top-k set on a fixed input and system.
 
     Returns
     -------
@@ -213,6 +241,10 @@ def top_k(
     >>> values_sorted, indices_sorted = flashinfer.top_k(logits, k, sorted=True)
     >>> # Values are now in descending order within each row
 
+    Deterministic mode (bitwise-reproducible output):
+
+    >>> values, indices = flashinfer.top_k(logits, k, deterministic=True)
+
     See Also
     --------
     torch.topk : PyTorch's built-in top-k function
@@ -223,7 +255,8 @@ def top_k(
     device = input.device
 
     # Allocate row_states buffer for multi-CTA path
-    # 1MB is enough for any reasonable GPU (covers up to ~500 groups)
+    # 1MB is enough for any reasonable GPU (covers up to ~200 groups for deterministic
+    # mode and ~300 groups for non-deterministic mode)
     row_states_buffer: Optional[torch.Tensor] = _get_cache_buf(
         f"radix_topk_row_states_{input.device}",
         1024 * 1024,  # 1MB
@@ -234,17 +267,20 @@ def top_k(
     # Allocate output_values for kernel to write directly
     output_values = torch.empty(batch_size, k, dtype=input.dtype, device=device)
 
-    # Get indices using radix-based selection
+    # For deterministic + sorted + k <= 2048: CUDA handles the stable value sort on device.
+    sorted_cuda = sorted and deterministic and k <= 2048
     indices_int32 = get_topk_module().radix_topk(
-        input, k, row_states_buffer, output_values
+        input, k, sorted_cuda, deterministic, row_states_buffer, output_values
     )
 
     # Convert to int64 for compatibility
     indices = indices_int32.long()
 
-    if sorted:
+    if sorted and not sorted_cuda:
         # Sort within each row by value (descending)
-        sorted_values, sort_indices = torch.sort(output_values, dim=-1, descending=True)
+        sorted_values, sort_indices = torch.sort(
+            output_values, dim=-1, descending=True, stable=deterministic
+        )
         sorted_indices = torch.gather(indices, dim=-1, index=sort_indices)
         return sorted_values, sorted_indices
 
@@ -262,6 +298,7 @@ def top_k_page_table_transform(
     lengths: torch.Tensor,
     k: int,
     row_to_batch: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
 ) -> torch.Tensor:
     r"""Fused Top-K selection + Page Table Transform for sparse attention.
 
@@ -290,6 +327,9 @@ def top_k_page_table_transform(
         Mapping from row index to batch index of shape ``(num_rows,)`` with
         dtype ``int32``. If None, uses 1:1 mapping (row_idx == batch_idx).
         Default is None.
+    deterministic : bool, optional
+        If True, uses deterministic mode.
+        Default is False (non-deterministic, which is faster).
 
     Returns
     -------
@@ -340,6 +380,7 @@ def top_k_page_table_transform(
         lengths,
         row_states_buffer,
         k,
+        deterministic,
     )
 
     return output_page_table
@@ -351,6 +392,7 @@ def top_k_ragged_transform(
     offsets: torch.Tensor,
     lengths: torch.Tensor,
     k: int,
+    deterministic: bool = False,
 ) -> torch.Tensor:
     r"""Fused Top-K selection + Ragged Index Transform for sparse attention.
 
@@ -372,6 +414,9 @@ def top_k_ragged_transform(
         Actual KV lengths per row of shape ``(num_rows,)`` with dtype ``int32``.
     k : int
         Number of top elements to select from each row.
+    deterministic : bool, optional
+        If True, uses deterministic mode.
+        Default is False (non-deterministic, which is faster).
 
     Returns
     -------
@@ -416,7 +461,13 @@ def top_k_ragged_transform(
     output_indices = torch.empty(num_rows, k, dtype=torch.int32, device=device)
 
     get_topk_module().radix_topk_ragged_transform(
-        input, output_indices, offsets, lengths, row_states_buffer, k
+        input,
+        output_indices,
+        offsets,
+        lengths,
+        row_states_buffer,
+        k,
+        deterministic,
     )
 
     return output_indices

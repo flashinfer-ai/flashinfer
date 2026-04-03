@@ -7,7 +7,7 @@
 #   - Keep entries sorted alphabetically within each section.
 
 # ── Catch-all: core maintainers review everything not covered below ──
-* @yzh119 @sricketts @aleozlx @yongwww @cyx-6 @saltyminty @bkryu @yyihuang @kahyunnam @jimmyzho @nv-yunzheq
+* @yzh119 @sricketts @aleozlx @yongwww @cyx-6 @saltyminty @bkryu @yyihuang @kahyunnam @jimmyzho @nv-yunzheq @samuellees
 
 # ── Attention ──
 csrc/fmha_v2/                  @saltyminty @yzh119 @nv-yunzheq @bkryu
@@ -22,9 +22,9 @@ include/flashinfer/gemm/       @dhiraj113 @yzh119 @aleozlx @bkryu
 tests/gemm/                    @dhiraj113 @yzh119 @aleozlx @bkryu
 
 # ── MOE ──
-csrc/fused_moe/                @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq
-flashinfer/fused_moe/          @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq
-tests/moe/                     @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq
+csrc/fused_moe/                @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees
+flashinfer/fused_moe/          @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees
+tests/moe/                     @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees
 
 # ── Communication ──
 flashinfer/comm/               @aleozlx @yzh119 @jimmyzho @bkryu @nv-yunzheq
