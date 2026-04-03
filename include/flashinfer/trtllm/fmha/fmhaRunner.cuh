@@ -25,8 +25,19 @@
 class TllmGenFmhaRunner {
  public:
   // Constructor.
-  explicit TllmGenFmhaRunner(Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut)
-      : mSM(getSMVersion()), mDtypeQ(dtypeQ), mDtypeKv(dtypeKv), mDtypeOut(dtypeOut) {
+  explicit TllmGenFmhaRunner(Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut,
+                             Data_type dtypeQkReinterpret = DATA_TYPE_UNKNOWN,
+                             int numEltsPerSageAttnBlkQ = 0, int numEltsPerSageAttnBlkK = 0,
+                             int numEltsPerSageAttnBlkP = 0, int numEltsPerSageAttnBlkV = 0)
+      : mSM(getSMVersion()),
+        mDtypeQ(dtypeQ),
+        mDtypeKv(dtypeKv),
+        mDtypeOut(dtypeOut),
+        mDtypeQkReinterpret(dtypeQkReinterpret == DATA_TYPE_UNKNOWN ? dtypeQ : dtypeQkReinterpret),
+        mNumEltsPerSageAttnBlkQ(numEltsPerSageAttnBlkQ),
+        mNumEltsPerSageAttnBlkK(numEltsPerSageAttnBlkK),
+        mNumEltsPerSageAttnBlkP(numEltsPerSageAttnBlkP),
+        mNumEltsPerSageAttnBlkV(numEltsPerSageAttnBlkV) {
     FLASHINFER_CHECK(mSM == kSM_100 || mSM == kSM_103, "Unsupported architecture");
     FLASHINFER_CHECK(
         mDtypeQ == DATA_TYPE_E4M3 || mDtypeQ == DATA_TYPE_FP16 || mDtypeQ == DATA_TYPE_BF16,
@@ -37,7 +48,9 @@ class TllmGenFmhaRunner {
     FLASHINFER_CHECK(mDtypeOut == DATA_TYPE_E4M3 || mDtypeOut == DATA_TYPE_FP16 ||
                          mDtypeOut == DATA_TYPE_BF16 || mDtypeOut == DATA_TYPE_E2M1,
                      "Unsupported Output data type: " + std::string(toStr(mDtypeOut)));
-    mKernel = getTllmFmhaKernels(mDtypeQ, mDtypeKv, mDtypeOut, mSM);
+    mKernel = getTllmFmhaKernels(mDtypeQ, mDtypeKv, mDtypeOut, mSM, mDtypeQkReinterpret,
+                                 mNumEltsPerSageAttnBlkQ, mNumEltsPerSageAttnBlkK,
+                                 mNumEltsPerSageAttnBlkP, mNumEltsPerSageAttnBlkV);
   }
 
   TllmGenFmhaRunner() = default;
@@ -59,6 +72,11 @@ class TllmGenFmhaRunner {
  private:
   // The input/output datatype.
   Data_type mDtypeQ, mDtypeKv, mDtypeOut;
+  Data_type mDtypeQkReinterpret;
+  int mNumEltsPerSageAttnBlkQ;
+  int mNumEltsPerSageAttnBlkK;
+  int mNumEltsPerSageAttnBlkP;
+  int mNumEltsPerSageAttnBlkV;
   // The SM version.
   int mSM;
   // The class that stores all the kernels.

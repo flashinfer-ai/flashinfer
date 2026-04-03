@@ -227,6 +227,11 @@ struct TllmGenFmhaRunnerParams {
 
   // Attention sink
   float const* ptrAttentionSinks{nullptr};
+  // SageAttention scaling factors (Q/K/P/V).
+  float const* ptrSageAttnSfsQ;
+  float const* ptrSageAttnSfsK;
+  float const* ptrSageAttnSfsP;
+  float const* ptrSageAttnSfsV;
   // The output buffer.
   void* oPtr;
   // The output scaling factor buffer.
