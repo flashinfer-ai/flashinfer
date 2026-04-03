@@ -16,7 +16,7 @@
 
 import torch
 
-from ..template import Const, Tensor, TraceTemplate, Var
+from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 
 
 def _mm_reference(A, B):
@@ -206,6 +206,10 @@ mm_fp4_trace = TraceTemplate(
         "b_descale": Tensor(
             ["K", "N_div_block_size"],
             description="Block scale for B, shape [K, N//block_size], float8_e4m3fn or uint8.",
+        ),
+        "block_size": Scalar(
+            "int32",
+            description="FP4 quantization block size (16 for nvfp4, 32 for mxfp4).",
         ),
     },
     outputs={

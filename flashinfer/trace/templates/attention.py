@@ -91,15 +91,18 @@ gqa_paged_decode_trace = TraceTemplate(
         ),
         "kv_indptr": Tensor(
             ["len_indptr"],
-            description="KV page offsets for each sequence.",
+            optional=True,
+            description="KV page offsets for each sequence. Set during plan(), not run().",
         ),
         "kv_indices": Tensor(
             ["num_kv_indices"],
-            description="Page IDs for KV cache lookups.",
+            optional=True,
+            description="Page IDs for KV cache lookups. Set during plan(), not run().",
         ),
         "sm_scale": Scalar(
             "float32",
-            description="Softmax scale. Default is (1/sqrt(head_dim)).",
+            optional=True,
+            description="Softmax scale. Default is (1/sqrt(head_dim)). Set during plan(), not run().",
         ),
     },
     outputs={
@@ -202,19 +205,23 @@ gqa_paged_prefill_trace = TraceTemplate(
         ),
         "qo_indptr": Tensor(
             ["len_indptr"],
-            description="Query offsets for each sequence.",
+            optional=True,
+            description="Query offsets for each sequence. Set during plan(), not run().",
         ),
         "kv_indptr": Tensor(
             ["len_indptr"],
-            description="KV page offsets for each sequence.",
+            optional=True,
+            description="KV page offsets for each sequence. Set during plan(), not run().",
         ),
         "kv_indices": Tensor(
             ["num_kv_indices"],
-            description="Page IDs for KV cache lookups.",
+            optional=True,
+            description="Page IDs for KV cache lookups. Set during plan(), not run().",
         ),
         "sm_scale": Scalar(
             "float32",
-            description="Softmax scale. Default is (1/sqrt(head_dim)).",
+            optional=True,
+            description="Softmax scale. Default is (1/sqrt(head_dim)). Set during plan(), not run().",
         ),
     },
     outputs={
@@ -305,15 +312,18 @@ gqa_ragged_prefill_trace = TraceTemplate(
         "v": Tensor(["total_kv", "num_kv_heads", "head_dim"]),
         "qo_indptr": Tensor(
             ["len_indptr"],
-            description="Query offsets for each sequence.",
+            optional=True,
+            description="Query offsets for each sequence. Set during plan(), not run().",
         ),
         "kv_indptr": Tensor(
             ["len_indptr"],
-            description="Key-value offsets for each sequence.",
+            optional=True,
+            description="Key-value offsets for each sequence. Set during plan(), not run().",
         ),
         "sm_scale": Scalar(
             "float32",
-            description="Softmax scale. Default is (1/sqrt(head_dim)).",
+            optional=True,
+            description="Softmax scale. Default is (1/sqrt(head_dim)). Set during plan(), not run().",
         ),
     },
     outputs={
@@ -413,17 +423,20 @@ mla_paged_decode_trace = TraceTemplate(
         ),
         "kv_indptr": Tensor(
             ["len_indptr"],
-            description="KV page offsets for each sequence. For decode (single-query), we don't need qo_indptr.",
+            optional=True,
+            description="KV page offsets for each sequence. Set during plan(), not run().",
         ),
         "kv_indices": Tensor(
             ["num_kv_indices"],
-            description="Page indices for KV cache lookups.",
+            optional=True,
+            description="Page indices for KV cache lookups. Set during plan(), not run().",
         ),
         "sm_scale": Scalar(
             "float32",
+            optional=True,
             description=(
                 "Softmax scale. Default is (1/sqrt(128 + 64) = 1/sqrt(192)), "
-                "based on head dimensions before matrix absorption."
+                "based on head dimensions before matrix absorption. Set during plan(), not run()."
             ),
         ),
     },

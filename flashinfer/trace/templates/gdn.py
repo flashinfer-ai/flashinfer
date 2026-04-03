@@ -284,24 +284,29 @@ gdn_prefill_trace = TraceTemplate(
         ),
         "state": Tensor(
             ["num_seqs", "num_v_heads", "head_size", "head_size"],
+            param="initial_state",
             optional=True,
             description="Recurrent state in k-last layout [N, H, V, K].",
         ),
         "A_log": Tensor(
             ["num_v_heads"],
-            description="Log decay parameter (learnable). Used to compute g = exp(-exp(A_log) * softplus(a + dt_bias)).",
+            optional=True,
+            description="Log decay parameter (conceptual; not passed directly — precomputed into g).",
         ),
         "a": Tensor(
             ["total_seq_len", "num_v_heads"],
-            description="Input-dependent decay from projection.",
+            param="g",
+            description="Precomputed gate values (g = exp(-exp(A_log) * softplus(a + dt_bias))).",
         ),
         "dt_bias": Tensor(
             ["num_v_heads"],
-            description="Decay bias (learnable). Added to 'a' before softplus.",
+            optional=True,
+            description="Decay bias (conceptual; not passed directly — precomputed into g).",
         ),
         "b": Tensor(
             ["total_seq_len", "num_v_heads"],
-            description="Update gate input from projection. beta = sigmoid(b).",
+            param="beta",
+            description="Update gate values (beta = sigmoid(b)).",
         ),
         "cu_seqlens": Tensor(
             ["len_cu_seqlens"],
