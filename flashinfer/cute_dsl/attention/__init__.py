@@ -10,8 +10,9 @@ one level below in subdirectories.
 
 # Kernels
 from .prefill import BlackwellFusedMultiHeadAttentionForward
+from .mla_decode import BlackwellMultiLatentAttentionForward
 
-# Building blocks
+# Building blocks — FMHA prefill
 from .config import AttentionConfig, AttentionFusion, HeadMapping, TileBounds
 from .tmem_layout import TmemLayout
 from .warp_schedule import WarpSchedule, PREFILL_SCHEDULE
@@ -20,10 +21,13 @@ from .pipeline_topology import (
     PipelineType,
     PipelineTopology,
     make_prefill_topology,
+    make_mla_topology,
 )
 from .mainloop_spec import (
     MainloopSpec,
     make_prefill_mainloop_spec,
+    MLAMainloopSpec,
+    make_mla_mainloop_spec,
 )
 from .fusion.mask import MaskType
 from .fusion.variant import (
@@ -44,9 +48,26 @@ from .scheduler.persistent import (
     create_fmha_static_tile_scheduler_params,
 )
 
+# Building blocks — MLA decode
+from .mla_config import MLAConfig
+from .mla_warp_schedule import MLAWarpSchedule, MLA_DECODE_SCHEDULE
+from .scheduler.mla_persistent import (
+    MLAStaticTileScheduler,
+    MLAStaticTileSchedulerParams,
+    create_mla_static_tile_scheduler,
+    create_mla_static_tile_scheduler_params,
+    mla_get_split_kv,
+    mla_get_split_kv_simplified,
+    mla_get_workspace_size,
+)
+
 # Wrappers
 from .wrappers.batch_prefill import (
     BatchPrefillCuteDSLWrapper,
     qkv_torch_2_cute,
     create_and_pad_tensor,
+)
+from .wrappers.batch_mla import (
+    BatchMLADecodeCuteDSLWrapper,
+    cute_dsl_mla_decode,
 )

@@ -21,6 +21,7 @@ import cutlass.pipeline as pipeline
 from cutlass.pipeline import Agent, CooperativeGroup, PipelineProducer, PipelineConsumer
 
 from .warp_schedule import WarpSchedule
+from .mla_warp_schedule import MLAWarpSchedule
 
 
 class PipelineType(enum.Enum):
@@ -31,11 +32,13 @@ class PipelineType(enum.Enum):
     - UMMA_ASYNC: leader-only for producer, all-threads for consumer
     - ASYNC_UMMA: all-threads for producer, leader-only for consumer (reverse of UMMA_ASYNC)
     - ASYNC: all-threads for both producer and consumer
+    - CP_ASYNC: all-threads for both (cpasync-based, no cta_layout_vmnk/tx_count)
     """
     TMA_UMMA = "PipelineTmaUmma"
     UMMA_ASYNC = "PipelineUmmaAsync"
     ASYNC_UMMA = "PipelineAsyncUmma"
     ASYNC = "PipelineAsync"
+    CP_ASYNC = "PipelineCpAsync"
 
     @property
     def cutlass_type(self):
@@ -44,8 +47,14 @@ class PipelineType(enum.Enum):
             PipelineType.UMMA_ASYNC: pipeline.PipelineUmmaAsync,
             PipelineType.ASYNC_UMMA: pipeline.PipelineAsyncUmma,
             PipelineType.ASYNC: pipeline.PipelineAsync,
+            PipelineType.CP_ASYNC: pipeline.PipelineCpAsync,
         }
         return _map[self]
+
+    @property
+    def needs_cta_layout(self) -> bool:
+        """Whether this pipeline type accepts cta_layout_vmnk for multi-CTA clusters."""
+        return self in (PipelineType.TMA_UMMA, PipelineType.UMMA_ASYNC, PipelineType.ASYNC_UMMA)
 
     def producer_thread_count(self, num_warps: int, threads_per_warp: int) -> int:
         if self in (PipelineType.TMA_UMMA, PipelineType.UMMA_ASYNC):
@@ -115,12 +124,15 @@ class PipelineTopology:
         barrier_ptrs: Dict[str, Any],
         tx_counts: Dict[str, int],
         threads_per_warp: int,
+        cta_layout_vmnk: Any = None,
     ) -> Dict[str, Tuple[PipelineProducer, PipelineConsumer]]:
         """Create all pipeline producer/consumer pairs from the topology.
 
         :param barrier_ptrs: Map from edge name to barrier storage pointer.
         :param tx_counts: Map from tx_count_key to byte count (for TMA pipelines).
         :param threads_per_warp: Threads per warp (typically 32).
+        :param cta_layout_vmnk: CTA layout for multi-CTA clusters (None for single-CTA).
+            Required by TMA_UMMA, UMMA_ASYNC, and ASYNC_UMMA when cluster_shape > 1.
         :returns: Dict mapping edge name to (producer, consumer) tuple.
         """
         result = {}
@@ -132,6 +144,17 @@ class PipelineTopology:
                 len(edge.consumer_warp_ids), threads_per_warp
             )
 
+            # Apply cluster_scale to the all-threads side of asymmetric pipelines
+            if edge.cluster_scale > 1:
+                pt = edge.pipeline_type
+                if pt == PipelineType.UMMA_ASYNC:
+                    cons_threads *= edge.cluster_scale
+                elif pt == PipelineType.ASYNC_UMMA:
+                    prod_threads *= edge.cluster_scale
+                elif pt in (PipelineType.ASYNC, PipelineType.CP_ASYNC):
+                    prod_threads *= edge.cluster_scale
+                    cons_threads *= edge.cluster_scale
+
             create_kwargs = {
                 "barrier_storage": barrier_ptrs[edge.name],
                 "num_stages": edge.stages,
@@ -141,6 +164,8 @@ class PipelineTopology:
             }
             if edge.tx_count_key is not None:
                 create_kwargs["tx_count"] = tx_counts[edge.tx_count_key]
+            if cta_layout_vmnk is not None and edge.pipeline_type.needs_cta_layout:
+                create_kwargs["cta_layout_vmnk"] = cta_layout_vmnk
 
             pipe = edge.pipeline_type.cutlass_type.create(**create_kwargs)
             result[edge.name] = pipe.make_participants()
@@ -249,4 +274,56 @@ def make_prefill_topology_transform(
                      producer_warp_ids=s1, consumer_warp_ids=epi),
         PipelineEdge("s0_s1_sequence", PipelineType.ASYNC, stages=1,
                      producer_warp_ids=s0, consumer_warp_ids=s1),
+    ])
+
+
+def make_mla_topology(
+    schedule: MLAWarpSchedule,
+    load_q_stages: int = 1,
+    load_kv_stages: int = 15,
+    mma_s_stages: int = 2,
+    p_mma_stages: int = 2,
+    p_cor_stages: int = 2,
+    mma_o_stages: int = 1,
+    load_pt_stages: int = 4,
+    cluster_scale: int = 2,
+) -> PipelineTopology:
+    """Build the pipeline topology for MLA decode.
+
+    7 pipelines connecting 5 warp roles::
+
+        PT_Load --[load_pt]--> TMA_Load --[load_q]---> MMA --[mma_s]--> Compute --[p_cor]--> Correction
+                                        --[load_kv]-->     <--[p_mma]--
+                                                           --[mma_o]--------------->
+
+    :param schedule: MLA warp schedule defining warp role assignments.
+    :param cluster_scale: Multiplier for cluster-scaled consumer/producer thread counts.
+    """
+    s = schedule
+    load_tma = (s.load_tma_warp_id,)
+    load_pt = (s.load_pt_warp_id,)
+    mma = (s.mma_warp_id,)
+    compute = s.compute_warp_ids
+    correction = s.correction_warp_ids
+
+    return PipelineTopology(edges=[
+        PipelineEdge("load_q", PipelineType.TMA_UMMA, stages=load_q_stages,
+                     producer_warp_ids=load_tma, consumer_warp_ids=mma,
+                     tx_count_key="q"),
+        PipelineEdge("load_kv", PipelineType.TMA_UMMA, stages=load_kv_stages,
+                     producer_warp_ids=load_tma, consumer_warp_ids=mma,
+                     tx_count_key="kv"),
+        PipelineEdge("mma_s", PipelineType.UMMA_ASYNC, stages=mma_s_stages,
+                     producer_warp_ids=mma, consumer_warp_ids=compute,
+                     cluster_scale=cluster_scale),
+        PipelineEdge("p_mma", PipelineType.ASYNC_UMMA, stages=p_mma_stages,
+                     producer_warp_ids=compute, consumer_warp_ids=mma,
+                     cluster_scale=cluster_scale),
+        PipelineEdge("p_cor", PipelineType.ASYNC, stages=p_cor_stages,
+                     producer_warp_ids=compute, consumer_warp_ids=correction),
+        PipelineEdge("mma_o", PipelineType.UMMA_ASYNC, stages=mma_o_stages,
+                     producer_warp_ids=mma, consumer_warp_ids=correction,
+                     cluster_scale=cluster_scale),
+        PipelineEdge("load_pt", PipelineType.CP_ASYNC, stages=load_pt_stages,
+                     producer_warp_ids=load_pt, consumer_warp_ids=load_tma),
     ])
