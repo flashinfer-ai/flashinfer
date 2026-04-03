@@ -1282,7 +1282,7 @@ struct Stats<T, 1, WARPS_M, 1, USE_CLUSTER, WHOLE_CTA> {
 // Count leading zeros - start from most significant bit.
 static int clz(int32_t x) {
   for (int32_t i = 31; i >= 0; --i)
-    if (((1 << i) & x) != 0) {
+    if (((1u << i) & x) != 0) {
       return 31 - i;
     }
   return 32;
