@@ -793,14 +793,14 @@ def run_trtllm_fmha_v2_prefill_case(
 @pytest.mark.parametrize(
     ("input_layout", "page_size", "save_softmax_stats"),
     [
-        # ("PACKED_QKV", None, False),
-        # ("CONTIGUOUS_Q_KV", None, False),
-        # ("CONTIGUOUS_Q_KV", None, True),
-        # ("SEPARATE_Q_K_V", None, False),
+        ("PACKED_QKV", None, False),
+        ("CONTIGUOUS_Q_KV", None, False),
+        ("CONTIGUOUS_Q_KV", None, True),
+        ("SEPARATE_Q_K_V", None, False),
         ("Q_PAGED_KV_NHD", 32, False),
-        # ("Q_PAGED_KV_NHD", 128, False),
+        ("Q_PAGED_KV_NHD", 128, False),
         ("Q_PAGED_KV_HND", 32, False),
-        # ("Q_PAGED_KV_HND", 128, False),
+        ("Q_PAGED_KV_HND", 128, False),
     ],
 )
 @pytest.mark.parametrize(
