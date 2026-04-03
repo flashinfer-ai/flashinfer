@@ -24,7 +24,7 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, Tuple, Optional
+from typing import Any, Callable, Dict, List, Tuple, Optional
 import contextlib
 import importlib
 import torch
@@ -1417,6 +1417,21 @@ def _log_function_outputs(func_name: str, result: Any, level: int) -> None:
     _logger.debug("\n".join(lines))
 
 
+# ---------------------------------------------------------------------------
+# Trace template registry
+# ---------------------------------------------------------------------------
+# Populated automatically by _attach_fi_trace whenever @flashinfer_api is
+# given a trace= argument.  Each entry is (original_func, template, label)
+# where label is the template's name_prefix (or op_type as fallback).
+#
+# For dispatch callables (trace=some_fn), every template listed in
+# some_fn.templates is registered if that attribute exists.
+#
+# Read by tests/trace/test_fi_trace_template_consistency.py to auto-discover
+# all registered templates without requiring manual maintenance.
+_TRACE_REGISTRY: List[Tuple[Callable, Any, str]] = []
+
+
 def _attach_fi_trace(
     wrapped: Callable,
     original: Callable,
@@ -1458,11 +1473,20 @@ def _attach_fi_trace(
             if isinstance(trace_template, TraceTemplate):
                 # Static template: pre-build the fi_trace callable once.
                 fi_trace_fn = trace_template.build_fi_trace_fn(fi_api)
+                # Register for auto-discovery by consistency tests.
+                label = trace_template.name_prefix or trace_template.op_type
+                _TRACE_REGISTRY.append((original, trace_template, label))
             else:
                 # Dispatch callable: *trace_template* is a function
                 # ``(save_dir=None, name=None, **kwargs) -> TraceTemplate``.
                 # Resolve the template at call time and cache per template
                 # instance to avoid rebuilding extractors on every call.
+                # If the dispatch function exposes a .templates iterable,
+                # register each template for auto-discovery.
+                for tpl in getattr(trace_template, "templates", ()):
+                    if isinstance(tpl, TraceTemplate):
+                        _label = tpl.name_prefix or tpl.op_type
+                        _TRACE_REGISTRY.append((original, tpl, _label))
                 _dispatch_fn = trace_template
                 _fi_trace_cache: Dict[int, Callable] = {}
 
@@ -1513,8 +1537,19 @@ def _attach_fi_trace(
             spec = _REGISTRY.get(qualname)
             if spec is not None:
                 wrapped.fi_trace = build_fi_trace_fn(spec)
-    except Exception:
-        pass
+    except Exception as _exc:
+        # Warn instead of silently swallowing: a broken trace template should
+        # be visible to the developer during import, not discovered later as a
+        # confusing AttributeError when calling func.fi_trace(...).
+        _func_name = getattr(original, "__qualname__", repr(original))
+        import warnings  # noqa: PLC0415
+        warnings.warn(
+            f"[flashinfer] Failed to attach fi_trace to '{_func_name}': "
+            f"{type(_exc).__name__}: {_exc}\n"
+            f"The function will work normally but fi_trace will be unavailable. "
+            f"Fix the TraceTemplate passed to @flashinfer_api(trace=...).",
+            stacklevel=3,
+        )
     return wrapped
 
 

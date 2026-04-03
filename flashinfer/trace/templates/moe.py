@@ -589,3 +589,10 @@ def trtllm_fp8_block_scale_moe_trace_dispatch(**kwargs):
     """
     routing_method_type = int(kwargs.get("routing_method_type", 0))
     return _MOE_TRACE_BY_ROUTING_TYPE.get(routing_method_type)
+
+
+# Expose all possible templates so _attach_fi_trace can auto-register them
+# in _TRACE_REGISTRY for consistency testing.
+trtllm_fp8_block_scale_moe_trace_dispatch.templates = list(
+    _MOE_TRACE_BY_ROUTING_TYPE.values()
+)
