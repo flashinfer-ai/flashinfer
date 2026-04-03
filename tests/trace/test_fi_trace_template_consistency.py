@@ -435,3 +435,78 @@ def test_fi_trace_complete_moe_ds_routing():
     assert defn["axes"]["num_local_experts"]["value"] == EL
     assert defn["axes"]["hidden_size"]["value"] == H
     assert "unknown" not in str(defn["inputs"])
+
+
+# ---------------------------------------------------------------------------
+# Meta-tests: verify the checkers themselves catch broken templates
+#
+# These create intentionally wrong templates inline and assert that the
+# checker utilities raise AssertionError.  If a checker ever silently
+# ignores a bug, these tests will fail.
+# ---------------------------------------------------------------------------
+
+
+def _make_gdn_decode_func():
+    """Return the real gated_delta_rule_decode for use in meta-tests."""
+    import flashinfer.gdn_decode
+    return flashinfer.gdn_decode.gated_delta_rule_decode
+
+
+def test_checker_rejects_wrong_param():
+    """Signature checker must catch a param= that doesn't exist in the function."""
+    # 'state' in gated_delta_rule_decode is a required positional arg.
+    # Deliberately map it to a non-existent param name 'hidden_state'.
+    broken = TraceTemplate(
+        op_type="gdn",
+        name_prefix="gdn_decode_broken_param",
+        axes={"batch_size": Var(), "head_size": Const(abbrev="d")},
+        inputs={
+            "q": Tensor(["batch_size", "head_size"]),
+            # 'state' exists in the real function; 'hidden_state' does not.
+            "state": Tensor(["batch_size", "head_size"], param="hidden_state"),
+        },
+        outputs={"output": Tensor(["batch_size", "head_size"], dtype_from="q")},
+    )
+    func = _make_gdn_decode_func()
+    with pytest.raises(AssertionError, match="param=.*hidden_state.*not found"):
+        assert_template_signature_consistency(func, broken, label="meta-test")
+
+
+def test_checker_rejects_uncovered_const_axis():
+    """Axes checker must catch a Const axis that has no tensor or function-param source."""
+    broken = TraceTemplate(
+        op_type="gdn",
+        name_prefix="gdn_decode_broken_axis",
+        axes={
+            "batch_size": Var(),
+            "head_size": Const(abbrev="d"),
+            # 'mystery_dim' is a Const axis but appears in no tensor dim_names,
+            # no Scalar input key, and no parameter of gated_delta_rule_decode.
+            "mystery_dim": Const(abbrev="m"),
+        },
+        inputs={"q": Tensor(["batch_size", "head_size"])},
+        outputs={"output": Tensor(["batch_size", "head_size"], dtype_from="q")},
+    )
+    func = _make_gdn_decode_func()
+    with pytest.raises(AssertionError, match="mystery_dim"):
+        assert_template_axes_covered(broken, label="meta-test", func=func)
+
+
+def test_checker_rejects_unknown_dtype_in_e2e():
+    """End-to-end checker must catch a template whose output dtype resolves to 'unknown'."""
+    # dtype_from="nonexistent_input" refers to an input key that doesn't exist,
+    # so the output dtype will be "unknown" at fi_trace time.
+    broken = TraceTemplate(
+        op_type="gdn",
+        name_prefix="gdn_decode_broken_dtype",
+        axes={"batch_size": Var(), "head_size": Const(abbrev="d")},
+        inputs={"q": Tensor(["batch_size", "head_size"])},
+        outputs={
+            "output": Tensor(
+                ["batch_size", "head_size"], dtype_from="nonexistent_input"
+            )
+        },
+    )
+    func = _make_gdn_decode_func()
+    with pytest.raises(AssertionError, match="unknown dtype"):
+        assert_fi_trace_complete(func, broken, label="meta-test")
