@@ -79,6 +79,46 @@ def _print_table(results: list[tuple[int, float, float]], config_str: str):
         )
 
 
+def _measure(fn, input_kwargs, warmups, iterations):
+    ms_list = bench_gpu_time(
+        fn,
+        dry_run_iters=warmups,
+        repeat_iters=iterations,
+        enable_cupti=True,
+        use_cuda_graph=True,
+        input_kwargs=input_kwargs,
+        cold_l2_cache=True,
+    )
+    return np.median(ms_list)
+
+
+def _run_benchmark(
+    setups: list[tuple[int, callable, dict]],
+    warmups: int,
+    iterations: int,
+    config_str: str,
+):
+    AutoTuner.get().clear_cache()
+
+    measure = partial(_measure, warmups=warmups, iterations=iterations)
+
+    # measure untuned
+    ms_no_autotune = [measure(fn, kw) for _, fn, kw in setups]
+
+    # tune once — covers all buckets up to tune_max
+    _, first_fn, first_kw = setups[0]
+    with autotune(True):
+        first_fn(**first_kw)
+
+    # measure tuned
+    results = [
+        (batch_size, ms, measure(fn, kw))
+        for (batch_size, fn, kw), ms in zip(setups, ms_no_autotune, strict=True)
+    ]
+
+    _print_table(results, config_str)
+
+
 def bench_trtllm_gen_fused_moe_autotuner_fp8(
     tune_max_num_tokens: Optional[int],
     quant_mode: Literal["Fp8-Per-Tensor", "Fp8-Block", "MxFP8xMxFP8"],
@@ -126,10 +166,8 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
             [hidden_states_scale_scalar * w2_scale] * num_experts, device=device
         )
     elif quant_mode == "Fp8-Block":
-        _, w13_scalar = fp8_quantize(w13)
-        _, w2_scalar = fp8_quantize(w2)
-        w13 = w13.to(torch.float8_e4m3fn)
-        w2 = w2.to(torch.float8_e4m3fn)
+        w13, w13_scalar = fp8_quantize(w13)
+        w2, w2_scalar = fp8_quantize(w2)
         w13_scale = torch.full(
             (
                 num_experts,
@@ -160,20 +198,6 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
         assert activation_type == ActivationType.Swiglu.value, (
             "Only Swiglu activation is supported for FP8 block scale MoE."
         )
-
-    AutoTuner.get().clear_cache()
-
-    def _measure(fn, input_kwargs):
-        ms_list = bench_gpu_time(
-            fn,
-            dry_run_iters=warmups,
-            repeat_iters=iterations,
-            enable_cupti=True,
-            use_cuda_graph=True,
-            input_kwargs=input_kwargs,
-            cold_l2_cache=True,
-        )
-        return np.median(ms_list)
 
     setups = []
     for batch_size in num_tokens_list:
@@ -267,24 +291,11 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
             }
         setups.append((batch_size, fn, input_kwargs))
 
-    # measure untuned
-    ms_no_autotune = []
-    for _batch_size, fn, input_kwargs in setups:
-        ms_no_autotune.append(_measure(fn, input_kwargs))
-
-    # tune once — covers all buckets up to tune_max
-    _, first_fn, first_kw = setups[0]
-    with autotune(True):
-        first_fn(**first_kw)
-
-    # measure tuned
-    results = []
-    for (batch_size, fn, input_kwargs), ms in zip(setups, ms_no_autotune, strict=True):
-        results.append((batch_size, ms, _measure(fn, input_kwargs)))
-
     mode_str = "routed" if routed else "non_routed"
-    _print_table(
-        results,
+    _run_benchmark(
+        setups,
+        warmups,
+        iterations,
         f"quant_mode={quant_mode}  routing={mode_str}  experts={num_experts}"
         f"  hidden={hidden_size}  intermediate={intermediate_size}  top_k={top_k}",
     )
@@ -393,20 +404,6 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
         tune_max_num_tokens=tune_max,
     )
 
-    AutoTuner.get().clear_cache()
-
-    def _measure(fn, input_kwargs):
-        ms_list = bench_gpu_time(
-            fn,
-            dry_run_iters=warmups,
-            repeat_iters=iterations,
-            enable_cupti=True,
-            use_cuda_graph=True,
-            input_kwargs=input_kwargs,
-            cold_l2_cache=True,
-        )
-        return np.median(ms_list)
-
     setups = []
     for batch_size in num_tokens_list:
         hidden_states = torch.randn(batch_size, hidden_size, device=device).to(
@@ -459,24 +456,11 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
         }
         setups.append((batch_size, fn, input_kwargs))
 
-    # measure untuned
-    ms_no_autotune = []
-    for _batch_size, fn, input_kwargs in setups:
-        ms_no_autotune.append(_measure(fn, input_kwargs))
-
-    # tune once — covers all buckets up to tune_max
-    _, first_fn, first_kw = setups[0]
-    with autotune(True):
-        first_fn(**first_kw)
-
-    # measure tuned
-    results = []
-    for (batch_size, fn, input_kwargs), ms in zip(setups, ms_no_autotune, strict=True):
-        results.append((batch_size, ms, _measure(fn, input_kwargs)))
-
     mode_str = "routed" if routed else "non_routed"
-    _print_table(
-        results,
+    _run_benchmark(
+        setups,
+        warmups,
+        iterations,
         f"quant_mode={quant_mode}  routing={mode_str}  experts={num_experts}"
         f"  hidden={hidden_size}  intermediate={intermediate_size}  top_k={top_k}",
     )
@@ -521,20 +505,6 @@ def bench_trtllm_gen_fused_moe_autotuner_mxint4(
         "only SwiGlu activation is supported for MxInt4 MoE currently"
     )
 
-    AutoTuner.get().clear_cache()
-
-    def _measure(fn, input_kwargs):
-        ms_list = bench_gpu_time(
-            fn,
-            dry_run_iters=warmups,
-            repeat_iters=iterations,
-            enable_cupti=True,
-            use_cuda_graph=True,
-            input_kwargs=input_kwargs,
-            cold_l2_cache=True,
-        )
-        return np.median(ms_list)
-
     setups = []
     for batch_size in num_tokens_list:
         hidden_states = torch.randn(batch_size, hidden_size, device=device).to(
@@ -569,23 +539,10 @@ def bench_trtllm_gen_fused_moe_autotuner_mxint4(
         }
         setups.append((batch_size, fn, input_kwargs))
 
-    # measure untuned
-    ms_no_autotune = []
-    for _batch_size, fn, input_kwargs in setups:
-        ms_no_autotune.append(_measure(fn, input_kwargs))
-
-    # tune once — covers all buckets up to tune_max
-    _, first_fn, first_kw = setups[0]
-    with autotune(True):
-        first_fn(**first_kw)
-
-    # measure tuned
-    results = []
-    for (batch_size, fn, input_kwargs), ms in zip(setups, ms_no_autotune, strict=True):
-        results.append((batch_size, ms, _measure(fn, input_kwargs)))
-
-    _print_table(
-        results,
+    _run_benchmark(
+        setups,
+        warmups,
+        iterations,
         f"quant_mode={quant_mode}  experts={num_experts}"
         f"  hidden={hidden_size}  intermediate={intermediate_size}  top_k={top_k}",
     )
