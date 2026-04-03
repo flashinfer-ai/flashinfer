@@ -691,6 +691,12 @@ run_tests_parallel() {
                 fi
             fi
             echo "❌ KILLED: $test_file (no result produced, $kill_reason)"
+            # Check dmesg from the parent for OOM kills targeting this test's PID
+            echo "⚠️  DEBUG: Checking dmesg for OOM/kill events (pid was $pid):"
+            dmesg -T 2>/dev/null | grep -i "oom\|killed process\|out of memory" | tail -10 || echo "⚠️  DEBUG: dmesg not available or no OOM events found"
+            # Also check if cgroup killed it
+            echo "⚠️  DEBUG: Memory pressure info:"
+            cat /sys/fs/cgroup/memory.pressure 2>/dev/null || cat /sys/fs/cgroup/memory/memory.oom_control 2>/dev/null || echo "⚠️  DEBUG: cgroup memory info not available"
             TOTAL_TESTS=$((TOTAL_TESTS + 1))
             FAILED_TESTS="$FAILED_TESTS\n  - $test_file (killed: $kill_reason)"
             # shellcheck disable=SC2034  # EXIT_CODE is used by calling scripts
