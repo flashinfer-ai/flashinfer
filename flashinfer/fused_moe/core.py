@@ -1067,10 +1067,20 @@ def get_trtllm_moe_sm100_module():
             assert hidden_states.shape[0] == num_tokens, (
                 "hidden_states's first dimension must be batch size."
             )
-            assert hidden_states_scale is None or (
-                hidden_states_scale.dim() == 2
-                and hidden_states_scale.shape[0] == num_tokens
-            ), "hidden_states_scale's first dimension must be batch size"
+            if hidden_states_scale is not None:
+                assert hidden_states_scale.dim() == 2, (
+                    "hidden_states_scale must be a 2D tensor"
+                )
+                if self.fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8:
+                    assert hidden_states_scale.shape[1] == num_tokens, (
+                        f"DeepSeekFp8 hidden_states_scale shape {tuple(hidden_states_scale.shape)} "
+                        f"expects num_tokens={num_tokens} at dim 1"
+                    )
+                else:
+                    assert hidden_states_scale.shape[0] == num_tokens, (
+                        f"hidden_states_scale shape {tuple(hidden_states_scale.shape)} "
+                        f"expects num_tokens={num_tokens} at dim 0"
+                    )
             # Choose the appropriate operation based on data types
             if self.dtype_weights == DtypeTrtllmGen.Bfloat16:
                 # BF16 operations
