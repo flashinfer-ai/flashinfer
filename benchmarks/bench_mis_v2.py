@@ -32,7 +32,7 @@ def build_mis_v1_inputs(batch_size, prefix_len, item_lens, delimiter=True):
     """Build MIS v1 inputs: sequence includes prefix + [delim item]* tokens."""
     # V1: prefix tokens + (delimiter + item_tokens) for each item
     # token_pos_in_items: 0 for delimiter, 1..N for item tokens, and prefix tokens
-    total_items_with_delim = sum(1 + l for l in item_lens)  # 1 delimiter per item
+    total_items_with_delim = sum(1 + il for il in item_lens)  # 1 delimiter per item
     qo_len = prefix_len + total_items_with_delim
     kv_len = qo_len
 
@@ -67,8 +67,8 @@ def build_mis_v2_inputs(batch_size, prefix_len, item_lens):
 
     # item_offsets: CSR-style [0, len1, len1+len2, ...]
     offsets = [0]
-    for l in item_lens:
-        offsets.append(offsets[-1] + l)
+    for il in item_lens:
+        offsets.append(offsets[-1] + il)
 
     return (
         qo_len,
@@ -82,8 +82,8 @@ def build_mis_v2_inputs(batch_size, prefix_len, item_lens):
 def build_custom_mask_v2(prefix_len, item_lens, qo_len, kv_len):
     """Build a custom mask equivalent to MIS v2 for reference benchmarking."""
     offsets = [0]
-    for l in item_lens:
-        offsets.append(offsets[-1] + l)
+    for il in item_lens:
+        offsets.append(offsets[-1] + il)
 
     custom_mask = torch.zeros(qo_len, kv_len, dtype=torch.bool, device="cuda")
     for q_idx in range(qo_len):

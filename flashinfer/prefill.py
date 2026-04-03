@@ -1384,6 +1384,57 @@ def _compute_page_mask_indptr(
     return mask_indptr
 
 
+def _precompute_item_start(
+    item_offsets: torch.Tensor,
+    item_offsets_len: int,
+    batch_size: int,
+    device: torch.device,
+) -> Tuple[torch.Tensor, int, torch.Tensor]:
+    """Precompute per-token item_start array from CSR-style item_offsets for MIS v2.
+
+    Returns (item_start_ptr, item_start_len, max_item_len_ptr).
+    """
+    item_start_list = []
+    max_items_tokens = 0
+    max_lens = []
+    for b in range(batch_size):
+        offsets_b = item_offsets[b * item_offsets_len:(b + 1) * item_offsets_len].to(torch.int64)
+        # Find the number of valid offsets: last non-zero entry index + 1,
+        # but always include the leading 0.
+        nonzero_mask = offsets_b > 0
+        if nonzero_mask.any():
+            num_offsets = nonzero_mask.nonzero()[-1].item() + 2  # +1 for 0-index, +1 for leading 0
+        else:
+            num_offsets = 1  # only the leading 0
+        valid_offsets = offsets_b[:num_offsets]
+        total_tokens = valid_offsets[-1].item()
+        max_items_tokens = max(max_items_tokens, total_tokens)
+        # Vectorized: use repeat_interleave to build per-token item_start
+        if total_tokens > 0 and num_offsets > 1:
+            item_lens_b = valid_offsets[1:] - valid_offsets[:-1]
+            item_start_b = torch.repeat_interleave(
+                valid_offsets[:-1].to(torch.uint32), item_lens_b.to(torch.int64)
+            )
+        else:
+            item_start_b = torch.zeros(0, dtype=torch.uint32, device=item_offsets.device)
+        item_start_list.append(item_start_b)
+        # Compute max item len for this batch entry
+        if num_offsets > 1:
+            diffs = valid_offsets[1:] - valid_offsets[:-1]
+            max_lens.append(diffs.max().item())
+        else:
+            max_lens.append(0)
+    # Pad and concatenate
+    padded = []
+    for ist in item_start_list:
+        if len(ist) < max_items_tokens:
+            ist = torch.cat([ist, torch.zeros(max_items_tokens - len(ist), dtype=torch.uint32, device=ist.device)])
+        padded.append(ist)
+    item_start_ptr = torch.cat(padded).to(device)
+    max_item_len_ptr = torch.tensor(max_lens, dtype=torch.uint16, device=device)
+    return item_start_ptr, max_items_tokens, max_item_len_ptr
+
+
 class BatchPrefillWithPagedKVCacheWrapper:
     r"""Wrapper class for prefill/append attention with paged kv-cache for batch of
     requests.
@@ -1886,41 +1937,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._item_start_ptr = None
         self._item_start_len = 0
         if item_offsets is not None:
-            batch_size = len(prefix_len_ptr) if prefix_len_ptr is not None else 1
-            item_start_list = []
-            max_items_tokens = 0
-            for b in range(batch_size):
-                offsets_b = item_offsets[b * item_offsets_len:(b + 1) * item_offsets_len]
-                # Filter out padding (zeros after the valid offsets)
-                num_offsets = (offsets_b.to(torch.int64) > 0).sum().item() + 1  # +1 for leading 0
-                valid_offsets = offsets_b[:num_offsets].long()
-                # Build per-token item_start
-                total_tokens = valid_offsets[-1].item()
-                max_items_tokens = max(max_items_tokens, total_tokens)
-                item_start_b = torch.zeros(total_tokens, dtype=torch.uint32, device=item_offsets.device)
-                for i in range(num_offsets - 1):
-                    start = valid_offsets[i].item()
-                    end = valid_offsets[i + 1].item()
-                    item_start_b[start:end] = start
-                item_start_list.append(item_start_b)
-            # Pad and concatenate
-            self._item_start_len = max_items_tokens
-            padded = []
-            for ist in item_start_list:
-                if len(ist) < max_items_tokens:
-                    ist = torch.cat([ist, torch.zeros(max_items_tokens - len(ist), dtype=torch.uint32, device=ist.device)])
-                padded.append(ist)
-            self._item_start_ptr = torch.cat(padded).to(item_offsets.device)
-            # Compute max_item_len from offsets
+            self._item_start_ptr, self._item_start_len, computed_max_item_len = (
+                _precompute_item_start(item_offsets, item_offsets_len, batch_size, self.device)
+            )
             if max_item_len_ptr is None:
-                max_lens = []
-                for b in range(batch_size):
-                    offsets_b = item_offsets[b * item_offsets_len:(b + 1) * item_offsets_len]
-                    num_offsets = (offsets_b.to(torch.int64) > 0).sum().item() + 1
-                    valid_offsets = offsets_b[:num_offsets].long()
-                    diffs = valid_offsets[1:] - valid_offsets[:-1]
-                    max_lens.append(diffs.max().item())
-                self._max_item_len_ptr = torch.tensor(max_lens, dtype=torch.uint16, device=item_offsets.device)
+                self._max_item_len_ptr = computed_max_item_len
 
         # NOTE(Zihao): only required if qo_indptr/paged_kv_indptr are device tensors
         qo_indptr_host = qo_indptr.to("cpu")
@@ -3075,41 +3096,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._item_start_ptr = None
         self._item_start_len = 0
         if item_offsets is not None:
-            batch_size_v2 = len(prefix_len_ptr) if prefix_len_ptr is not None else 1
-            item_start_list = []
-            max_items_tokens = 0
-            for b in range(batch_size_v2):
-                offsets_b = item_offsets[b * item_offsets_len:(b + 1) * item_offsets_len]
-                # Filter out padding (zeros after the valid offsets)
-                num_offsets = (offsets_b.to(torch.int64) > 0).sum().item() + 1  # +1 for leading 0
-                valid_offsets = offsets_b[:num_offsets].long()
-                # Build per-token item_start
-                total_tokens = valid_offsets[-1].item()
-                max_items_tokens = max(max_items_tokens, total_tokens)
-                item_start_b = torch.zeros(total_tokens, dtype=torch.uint32, device=item_offsets.device)
-                for i in range(num_offsets - 1):
-                    start = valid_offsets[i].item()
-                    end = valid_offsets[i + 1].item()
-                    item_start_b[start:end] = start
-                item_start_list.append(item_start_b)
-            # Pad and concatenate
-            self._item_start_len = max_items_tokens
-            padded = []
-            for ist in item_start_list:
-                if len(ist) < max_items_tokens:
-                    ist = torch.cat([ist, torch.zeros(max_items_tokens - len(ist), dtype=torch.uint32, device=ist.device)])
-                padded.append(ist)
-            self._item_start_ptr = torch.cat(padded).to(item_offsets.device)
-            # Compute max_item_len from offsets
+            self._item_start_ptr, self._item_start_len, computed_max_item_len = (
+                _precompute_item_start(item_offsets, item_offsets_len, batch_size, self.device)
+            )
             if max_item_len_ptr is None:
-                max_lens = []
-                for b in range(batch_size_v2):
-                    offsets_b = item_offsets[b * item_offsets_len:(b + 1) * item_offsets_len]
-                    num_offsets = (offsets_b.to(torch.int64) > 0).sum().item() + 1
-                    valid_offsets = offsets_b[:num_offsets].long()
-                    diffs = valid_offsets[1:] - valid_offsets[:-1]
-                    max_lens.append(diffs.max().item())
-                self._max_item_len_ptr = torch.tensor(max_lens, dtype=torch.uint16, device=item_offsets.device)
+                self._max_item_len_ptr = computed_max_item_len
 
         if self._backend == "cute-dsl":
             if custom_mask is not None or packed_custom_mask is not None:
