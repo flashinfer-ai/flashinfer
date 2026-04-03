@@ -2221,6 +2221,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     f"where total_tokens = qo_indptr[-1]."
                 )
 
+        if (
+            k_cache.dtype == torch.uint8 or v_cache.dtype == torch.uint8
+        ) and kv_cache_sf is None:
+            raise ValueError("kv_cache_sf must be provided for NVFP4 KV cache.")
         key_block_scales = None
         value_block_scales = None
         if kv_cache_sf is not None:
@@ -3866,6 +3870,10 @@ def trtllm_batch_context_with_kv_cache(
             # it doesn't change underlying storage
             k_cache, v_cache = kv_cache.unbind(dim=1)
 
+    if (
+        k_cache.dtype == torch.uint8 or v_cache.dtype == torch.uint8
+    ) and kv_cache_sf is None:
+        raise ValueError("kv_cache_sf must be provided for NVFP4 KV cache.")
     key_block_scales = None
     value_block_scales = None
     if kv_cache_sf is not None:
