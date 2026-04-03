@@ -91,6 +91,7 @@ from .jit.rmsnorm_silu import (
     gen_rmsnorm_silu_module,
     select_knobs,
     _estimate_ctas_per_row,
+    _compute_default_knobs,
     _SUPPORTED_C,
     _SUPPORTED_TOKENS,
 )
@@ -578,6 +579,31 @@ def gen_all_modules(
                         jit_specs.append(
                             gen_rmsnorm_silu_module(C, dtype, wm, cpr, bpl, kcfg, occ)
                         )
+            # Fallback configs for common hidden sizes not in the LUT.
+            # Fallback knobs depend only on (C, dtype), not num_tokens,
+            # so one module per (C, dtype) covers all token counts.
+            _FALLBACK_C = [
+                768,
+                1280,
+                1536,
+                2048,
+                2560,
+                3072,
+                4096,
+                5120,
+                6144,
+                8192,
+            ]
+            for C in _FALLBACK_C:
+                for dtype in ["bf16", "fp8", "nvfp4"]:
+                    knobs = _compute_default_knobs(C, dtype)
+                    if knobs is None:
+                        continue
+                    wm, sc, kcfg, occ, bpl = knobs
+                    cpr = _estimate_ctas_per_row(C, sc, kcfg, bpl)
+                    jit_specs.append(
+                        gen_rmsnorm_silu_module(C, dtype, wm, cpr, bpl, kcfg, occ)
+                    )
         # selective_state_update: one module per dtype combo per GPU arch
         _ssu_dtype_combos = [
             # (state,        input,          weight,         matrixA,      stateIndex, state_scale_dtype)
