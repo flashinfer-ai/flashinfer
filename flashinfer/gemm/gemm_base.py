@@ -7281,8 +7281,7 @@ def _get_cudnn_mxfp8_gemm_graph(
     out_dtype: torch.dtype = torch.bfloat16,
     out: Optional[torch.Tensor] = None,
     block_size: int = 32,  # mxfp8 block size is 32
-    tactic: int = -1,
-    build_all: bool = False,
+    policy=None,
 ):
     graph = create_cudnn_execution_plans_mxfp8_gemm(
         a_shape=a.shape,
@@ -7297,12 +7296,9 @@ def _get_cudnn_mxfp8_gemm_graph(
     )
 
     graph.check_support()
-    if build_all:
-        graph.build_plans()
-    elif tactic != -1:
-        graph.build_plan_at_index(tactic)
-    else:
-        graph.build_plans()
+    if policy is None:
+        policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
+    graph.build_plans(policy)
     return graph
 
 
@@ -7319,6 +7315,11 @@ def _cudnn_gemm_mxfp8(
     # mxfp8 block size is 32
     block_size = 32
 
+    if tactic == -1:
+        policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
+    else:
+        policy = cudnn.build_plan_policy.ALL
+
     # Graph should have been already cached, when we ran _cudnn_bmm_mxfp8_requirement
     graph = _get_cudnn_mxfp8_gemm_graph(
         a=a,
@@ -7326,7 +7327,7 @@ def _cudnn_gemm_mxfp8(
         out_dtype=out_dtype,
         out=out,
         block_size=block_size,
-        tactic=tactic,
+        policy=policy,
     )
     # execute the mxfp8 cudnn graph
     execute_cudnn_gemm_mxfp8_graph(
@@ -7358,7 +7359,7 @@ def _cudnn_gemm_mxfp8_runner():
                 b=b,
                 out_dtype=out.dtype,
                 out=out,
-                build_all=True,
+                policy=cudnn.build_plan_policy.ALL,
             )
             return list(range(graph.get_execution_plan_count()))
 
