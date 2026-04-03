@@ -166,7 +166,11 @@ def build_fi_trace_fn(spec: Any) -> Callable[..., Dict[str, Any]]:
         for inp in spec.inputs:
             if inp.is_scalar:
                 val = kwargs.get(inp.func_param)
-                dtype = _dtype_str(val.dtype) if isinstance(val, torch.Tensor) else "float32"
+                dtype = (
+                    _dtype_str(val.dtype)
+                    if isinstance(val, torch.Tensor)
+                    else "float32"
+                )
                 entry = {"shape": None, "dtype": dtype}
             else:
                 t = _get_tensor(kwargs, inp.func_param, inp.tuple_idx)
@@ -184,7 +188,7 @@ def build_fi_trace_fn(spec: Any) -> Callable[..., Dict[str, Any]]:
         for out in spec.outputs:
             dtype = out.dtype
             if dtype.startswith("from_input:"):
-                src_param = dtype[len("from_input:"):]
+                src_param = dtype[len("from_input:") :]
                 t = _get_tensor(kwargs, src_param)
                 dtype = _dtype_str(t.dtype) if t is not None else "unknown"
             entry = {"shape": out.dim_names, "dtype": dtype}

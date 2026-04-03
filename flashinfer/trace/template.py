@@ -53,6 +53,7 @@ import torch
 # These are read lazily at each call so that the caller can set them after
 # importing flashinfer (e.g. in scripts run with ``python -m``).
 
+
 def _get_trace_dump_dir() -> Optional[str]:
     """Return the current FLASHINFER_TRACE_DUMP_DIR value (may be None)."""
     return os.environ.get("FLASHINFER_TRACE_DUMP_DIR")
@@ -393,9 +394,7 @@ class TraceTemplate:
                     entry = {"shape": None, "dtype": descriptor.dtype}
                 else:
                     param = (
-                        descriptor.param
-                        if descriptor.param is not None
-                        else json_key
+                        descriptor.param if descriptor.param is not None else json_key
                     )
                     t = _get_tensor(kwargs, param, descriptor.tuple_idx)
                     entry = {
@@ -420,9 +419,7 @@ class TraceTemplate:
                         ref_param = descriptor.dtype_from
                         ref_t = _get_tensor(kwargs, ref_param)
                         dtype = (
-                            _dtype_str(ref_t.dtype)
-                            if ref_t is not None
-                            else "unknown"
+                            _dtype_str(ref_t.dtype) if ref_t is not None else "unknown"
                         )
                     elif descriptor.dtype is not None:
                         dtype = descriptor.dtype
@@ -440,9 +437,7 @@ class TraceTemplate:
                                     if in_desc.param is not None
                                     else in_key
                                 )
-                                ref_t = _get_tensor(
-                                    kwargs, in_param, in_desc.tuple_idx
-                                )
+                                ref_t = _get_tensor(kwargs, in_param, in_desc.tuple_idx)
                                 if ref_t is not None:
                                     dtype = _dtype_str(ref_t.dtype)
                                     break
@@ -458,7 +453,11 @@ class TraceTemplate:
                 # Use name_prefix from the template when set (preferred: short,
                 # semantic names like "gqa_paged_decode", "gdn_mtp").
                 # Fall back to op_type otherwise.
-                prefix = template.name_prefix if template.name_prefix is not None else template.op_type
+                prefix = (
+                    template.name_prefix
+                    if template.name_prefix is not None
+                    else template.op_type
+                )
                 const_parts = []
                 for n, marker in template.axes.items():
                     if not isinstance(marker, Const) or n not in axis_values:
@@ -486,6 +485,7 @@ class TraceTemplate:
             if template.reference is not None:
                 try:
                     import inspect  # noqa: PLC0415
+
                     result["reference"] = inspect.getsource(template.reference)
                 except (OSError, TypeError):
                     pass
