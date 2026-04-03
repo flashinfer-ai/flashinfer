@@ -46,38 +46,36 @@ namespace cutlass_kernels {
 struct TileShape {
   int m;
   int n;
-  int k;
 };
 
 TileShape get_cta_shape_for_config(CutlassTileConfig tile_config) {
   switch (tile_config) {
     case CutlassTileConfig::CtaShape16x128x64_WarpShape16x32x64:
-      return TileShape{16, 128, 64};
+      return TileShape{16, 128};
     case CutlassTileConfig::CtaShape16x256x64_WarpShape16x64x64:
-      return TileShape{16, 256, 64};
+      return TileShape{16, 256};
     case CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64:
-      return TileShape{32, 128, 64};
+      return TileShape{32, 128};
     case CutlassTileConfig::CtaShape64x64x128_WarpShape32x64x64:
-      return TileShape{64, 64, 128};
+      return TileShape{64, 64};
     case CutlassTileConfig::CtaShape64x128x64_WarpShape32x64x64:
     case CutlassTileConfig::CtaShape64x128x64_WarpShape64x32x64:
-      return TileShape{64, 128, 64};
+      return TileShape{64, 128};
     case CutlassTileConfig::CtaShape128x64x64_WarpShape64x32x64:
-      return TileShape{128, 64, 64};
+      return TileShape{128, 64};
     case CutlassTileConfig::CtaShape128x64x128_WarpShape64x32x128:
-      return TileShape{128, 64, 128};
+      return TileShape{128, 64};
     case CutlassTileConfig::CtaShape128x128x8_WarpShape64x64x8:
-      return TileShape{128, 128, 8};
     case CutlassTileConfig::CtaShape128x128x64_WarpShape64x32x64:
     case CutlassTileConfig::CtaShape128x128x64_WarpShape64x64x64:
     case CutlassTileConfig::CtaShape128x128x64_WarpShape128x32x64:
-      return TileShape{128, 128, 64};
+      return TileShape{128, 128};
     case CutlassTileConfig::CtaShape128x256x64_WarpShape64x64x64:
-      return TileShape{128, 256, 64};
+      return TileShape{128, 256};
     case CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64:
-      return TileShape{256, 128, 64};
+      return TileShape{256, 128};
     case CutlassTileConfig::CtaShape16x256x128_WarpShape16x64x128:
-      return TileShape{16, 256, 128};
+      return TileShape{16, 256};
     default:
       TLLM_THROW("[get_grid_shape_for_config] Invalid config");
   }
@@ -590,7 +588,7 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm110(
 }
 
 std::vector<CutlassGemmConfig> get_candidate_configs_sm120(
-    int const sm, CutlassGemmConfig::CandidateConfigTypeParam const config) {
+    CutlassGemmConfig::CandidateConfigTypeParam const config) {
 #ifdef FAST_BUILD
   return {CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x64B, MainloopScheduleType::AUTO,
                             EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1}};
@@ -636,7 +634,7 @@ std::vector<CutlassGemmConfig> get_candidate_configs(
     return get_candidate_configs_sm100(config_type_param, sm);
   }
   if (sm >= 120 && (config_type_param & CutlassGemmConfig::BLACKWELL)) {
-    return get_candidate_configs_sm120(sm, config_type_param);
+    return get_candidate_configs_sm120(config_type_param);
   }
 
   std::vector<CutlassTileConfig> tiles = get_candidate_tiles(sm, config_type_param);
