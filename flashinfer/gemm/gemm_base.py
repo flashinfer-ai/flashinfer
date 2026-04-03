@@ -121,11 +121,11 @@ def get_gemm_module():
 
             def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
                 a, b, _, _, out, _ = inputs
-                return (a.dtype, b.dtype, out.dtype)
+                return (a.shape, b.shape, a.dtype, b.dtype, out.dtype)
 
             def _get_algos(self, inputs):
                 a, b, scale_a, scale_b, out, workspace_buffer = inputs
-                key = (a.shape, b.shape, a.dtype, b.dtype, out.dtype)
+                key = self.get_cache_key_extras(inputs)
                 cached = self._algo_cache.get(key)
                 if cached is not None:
                     return cached
@@ -985,8 +985,13 @@ def get_mm_bf16_cublaslt_module():
                 self._algo_cache: dict = {}
 
             def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
-                _, _, _, _, out, _ = inputs
-                return (self._compute_dtype(out.dtype),)
+                a, b, _, _, out, _ = inputs
+                return (
+                    a.shape[0],
+                    b.shape[1],
+                    a.shape[1],
+                    self._compute_dtype(out.dtype),
+                )
 
             @staticmethod
             def _compute_dtype(out_dtype):
@@ -999,7 +1004,7 @@ def get_mm_bf16_cublaslt_module():
             def _get_algos(self, inputs):
                 a, b, _, _, out, workspace_buffer = inputs
                 compute_dt = self._compute_dtype(out.dtype)
-                key = (a.shape[0], b.shape[1], a.shape[1], compute_dt)
+                key = self.get_cache_key_extras(inputs)
                 cached = self._algo_cache.get(key)
                 if cached is not None:
                     return cached
