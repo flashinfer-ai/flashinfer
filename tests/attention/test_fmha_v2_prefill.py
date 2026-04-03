@@ -794,14 +794,14 @@ def run_trtllm_fmha_v2_prefill_case(
 @pytest.mark.parametrize(
     ("input_layout", "page_size", "save_softmax_stats"),
     [
-        # ("PACKED_QKV", None, False),
-        # ("CONTIGUOUS_Q_KV", None, False),
-        # ("CONTIGUOUS_Q_KV", None, True),
-        # ("SEPARATE_Q_K_V", None, False),
+        ("PACKED_QKV", None, False),
+        ("CONTIGUOUS_Q_KV", None, False),
+        ("CONTIGUOUS_Q_KV", None, True),
+        ("SEPARATE_Q_K_V", None, False),
         ("Q_PAGED_KV_NHD", 32, False),
-        # ("Q_PAGED_KV_NHD", 128, False),
+        ("Q_PAGED_KV_NHD", 128, False),
         ("Q_PAGED_KV_HND", 32, False),
-        # ("Q_PAGED_KV_HND", 128, False),
+        ("Q_PAGED_KV_HND", 128, False),
     ],
 )
 @pytest.mark.parametrize(
@@ -843,7 +843,7 @@ def test_trtllm_fmha_v2_prefill(
         pytest.skip("Skip due to bug in fp8 sliding window")
     if mask_mode == "SLIDING_WINDOW":
         pytest.skip("todo(jimmyzho): temporarily skip sliding window test due to hang")
-    if dtype == torch.float8_e4m3fn and o_dtype == torch.float8_e4m3fn:
+    if dtype == torch.float8_e4m3fn:
         pytest.skip("todo(jimmyzho): temporarily skip fp8 tests due to hang")
     run_trtllm_fmha_v2_prefill_case(
         input_layout=input_layout,
