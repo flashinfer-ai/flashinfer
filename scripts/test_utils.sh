@@ -466,6 +466,27 @@ run_tests_parallel() {
             # Redirect output to log file
             exec > "$log_file" 2>&1
 
+            # Capture unexpected exits for debugging
+            _test_exit_trap() {
+                local ec=$?
+                if [ ! -f "$result_file" ]; then
+                    echo ""
+                    echo "⚠️  DEBUG: Subshell exiting with code $ec before writing result file"
+                    echo "⚠️  DEBUG: test_file=$test_file gpu=$gpu_id pid=$$"
+                    if [ $ec -eq 137 ]; then
+                        echo "⚠️  DEBUG: Exit code 137 = SIGKILL (likely OOM killer)"
+                    elif [ $ec -eq 127 ]; then
+                        echo "⚠️  DEBUG: Exit code 127 = command not found"
+                        echo "⚠️  DEBUG: Checking if pytest is available: $(command -v pytest 2>&1 || echo 'NOT FOUND')"
+                    elif [ $ec -gt 128 ]; then
+                        echo "⚠️  DEBUG: Exit code $ec = signal $((ec - 128))"
+                    fi
+                    # Check for OOM in dmesg (may not have permission)
+                    dmesg -T 2>/dev/null | tail -5 | grep -i "oom\|kill\|memory" || true
+                fi
+            }
+            trap _test_exit_trap EXIT
+
             echo "=========================================="
             echo "[$file_index/$total_files] Processing: $test_file"
             echo "GPU: $gpu_id"
@@ -513,11 +534,20 @@ run_tests_parallel() {
                 JUNIT_FLAG="--junitxml=${JUNIT_DIR}/${JUNIT_FILENAME}"
 
                 # shellcheck disable=SC2086
-                if ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS "${JUNIT_FLAG}" "${test_file}"; then
+                local pytest_ec=0
+                ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS "${JUNIT_FLAG}" "${test_file}" || pytest_ec=$?
+                if [ $pytest_ec -eq 0 ]; then
                     echo "✅ PASSED: $test_file"
                     echo "PASSED" > "$result_file"
                 else
-                    echo "❌ FAILED: $test_file"
+                    echo "❌ FAILED: $test_file (pytest exit code: $pytest_ec)"
+                    if [ $pytest_ec -eq 127 ]; then
+                        echo "⚠️  DEBUG: pytest exited 127 — likely a subprocess 'command not found'"
+                        echo "⚠️  DEBUG: PATH=$PATH"
+                        echo "⚠️  DEBUG: which pytest=$(command -v pytest 2>&1)"
+                    elif [ $pytest_ec -gt 128 ]; then
+                        echo "⚠️  DEBUG: pytest killed by signal $((pytest_ec - 128))"
+                    fi
                     echo "FAILED" > "$result_file"
                 fi
             fi
