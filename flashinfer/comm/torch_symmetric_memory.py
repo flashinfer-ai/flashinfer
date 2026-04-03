@@ -1,3 +1,5 @@
+from typing import Any
+
 import torch
 import torch.distributed._symmetric_memory as symm_mem
 
@@ -8,7 +10,7 @@ def _alloc_symm_buffer_bytes(
     dtype: torch.dtype,
     device: torch.device,
     group_name: str,
-) -> tuple[list[int], torch.Tensor, symm_mem.SymmetricMemory]:
+) -> tuple[list[int], torch.Tensor, Any]:
     """Allocate a symmetric memory buffer and return per-peer pointers.
 
     Args:
