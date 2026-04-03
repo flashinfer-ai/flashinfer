@@ -1179,7 +1179,10 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
     # trtllm-fmha-v2 expects physically-HND paged KV, but FlashInfer's kv_cache uses
     # as_strided to present HND shape with NHD physical layout. Make a contiguous copy
     # so the kernel reads data in the correct order.
-    _fmha_v2_kv_cache = kv_cache.contiguous()
+    if "trtllm-fmha-v2" in backends:
+        _fmha_v2_kv_cache = kv_cache.contiguous()
+    else:
+        _fmha_v2_kv_cache = kv_cache
 
     # Prepare wrappers (after FP8 conversion so we have correct dtypes)
     backend_wrappers = {}
@@ -1344,6 +1347,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 cum_seq_lens_kv=kv_token_indptr,
                 block_tables=block_tables,
                 mask_mode="causal" if causal else "padding",
+                out_dtype=o_data_type,
             )
         else:
             print(f"[ERROR] Backend {backend} not supported")
@@ -2007,6 +2011,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 cum_seq_lens_q=qo_indptr,
                 cum_seq_lens_kv=kv_indptr,
                 mask_mode="causal" if causal else "padding",
+                out_dtype=out_dtype,
             )
         else:
             print(f"[ERROR] Backend {backend} not supported")
