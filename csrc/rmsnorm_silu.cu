@@ -14,12 +14,14 @@
  * limitations under the License.
  */
 
+// clang-format off
 // Include order matters: headers → config (defines Ktraits) → kernel (uses Ktraits)
 #include <algorithm>
-#include <flashinfer/norm/ln_fwd_silu_kernel.cuh>
 #include <flashinfer/norm/ln_silu_headers.cuh>
-
 #include "rmsnorm_silu_config.inc"
+#include <flashinfer/norm/ln_fwd_silu_kernel.cuh>
+// clang-format on
+
 #include "tvm_ffi_utils.h"
 
 void rmsnorm_silu(TensorView output, TensorView input, TensorView weight, double eps,
