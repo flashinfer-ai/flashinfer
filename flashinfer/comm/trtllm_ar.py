@@ -452,9 +452,8 @@ def trtllm_create_ipc_workspace_for_all_reduce(
     flag_size = FLAG_SIZE * tp_size * 2
     lamport_buffer_size = tp_size * LamportTokenNumThreshold * tp_size * hidden_dim * 2
 
-    # TODO(asamani): check this device and group
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
-    group_name = group.group_name
+    group_name = group.group_name if group is not None else torch.distributed.group.WORLD.group_name
     symm_refs: list[torch.Tensor] = []
     ipc_handles = list()
 
