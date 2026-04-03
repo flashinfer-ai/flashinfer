@@ -1476,8 +1476,8 @@ cudaError_t moefinalize_allreduce_fusion_op(MoeFinalizeAllReduceFusionParams<T> 
   FLASHINFER_CHECK(params.size % params.hidden_dim == 0, "size must be a multiple of hidden_dim");
   FLASHINFER_CHECK(params.hidden_dim % VEC_SIZE == 0, "hidden_dim must be a multiple of VEC_SIZE");
   FLASHINFER_CHECK(
-    params.moe_allreduce_out || params.residual_out || params.norm_out || params.quant_out,
-    "at least one of moe_allreduce_out, residual_out, norm_out, quant_out must be set");
+      params.moe_allreduce_out || params.residual_out || params.norm_out || params.quant_out,
+      "at least one of moe_allreduce_out, residual_out, norm_out, quant_out must be set");
 
   auto status = DISPATCH_MOEFINALIZEREDUCTION(
       params.nranks, params.residual_out, params.rms_gamma, params.quant_out, N_RANKS, RES, RMS,
