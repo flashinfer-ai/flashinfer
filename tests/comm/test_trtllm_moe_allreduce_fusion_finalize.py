@@ -1,5 +1,8 @@
 import multiprocessing as mp
+import os
 import socket
+import sys
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -95,6 +98,14 @@ def _run_correctness_worker(
 
                     norm_out = torch.empty_like(residual)
                     residual_out = torch.empty_like(residual)
+                    seq_len, hidden_size = norm_out.shape
+                    quant_out = torch.empty(
+                        seq_len * hidden_size // 4, dtype=dtype, device=device
+                    )
+                    scale_out = torch.empty(
+                        seq_len * hidden_size // SF_VEC_SIZE, dtype=dtype, device=device
+                    )
+                    routed_scaling_factor = 2.5
 
                     # == Run kernel ==
                     torch.cuda.synchronize()
@@ -117,6 +128,9 @@ def _run_correctness_worker(
                                 expert_scale_factor=scale,
                                 norm_out=norm_out,
                                 residual_out=residual_out,
+                                quant_out=quant_out,
+                                scale_out=scale_out,
+                                routed_scaling_factor=routed_scaling_factor,
                             )
                     torch.cuda.current_stream().wait_stream(s)
 
@@ -138,6 +152,9 @@ def _run_correctness_worker(
                                 expert_scale_factor=scale,
                                 norm_out=norm_out,
                                 residual_out=residual_out,
+                                quant_out=quant_out,
+                                scale_out=scale_out,
+                                routed_scaling_factor=routed_scaling_factor,
                             )
 
                     # replay
@@ -148,7 +165,8 @@ def _run_correctness_worker(
                     # == Calculate reference output ==
                     expert_reduction = torch.sum(
                         fc2_output_clone[expanded_idx_to_permuted_idx]
-                        * scale.unsqueeze(-1),
+                        * scale.unsqueeze(-1)
+                        * routed_scaling_factor,
                         dim=1,
                     )
 
@@ -240,6 +258,26 @@ def _run_correctness_worker(
         dist.destroy_process_group(group=group)
 
 
+def _require_cuda_usable(world_size: int) -> None:
+    """Skip if PyTorch cannot fully initialize CUDA (driver/toolkit skew, etc.)."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    try:
+        torch.cuda.set_device(0)
+        torch.empty(1, device="cuda", dtype=torch.float32)
+        torch.cuda.synchronize()
+    except RuntimeError as exc:
+        pytest.skip(
+            "PyTorch cannot initialize CUDA (match torch CUDA build to your driver, "
+            f"e.g. cu128 wheel for a 12.8-capable driver). Original error: {exc}"
+        )
+    available = torch.cuda.device_count()
+    if world_size > available:
+        pytest.skip(
+            f"world_size {world_size} is greater than available_gpus {available}"
+        )
+
+
 def get_open_port() -> int:
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -255,6 +293,14 @@ def multi_process_parallel(
     world_size: int, dtype: torch.dtype, test_target: Any, target_args: tuple = ()
 ) -> None:
     mp.set_start_method("spawn", force=True)
+    # Spawn copies the parent's sys.path; workers unpickle targets from tests.comm.*.
+    repo_root = str(Path(__file__).resolve().parent.parent.parent)
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    prev_pp = os.environ.get("PYTHONPATH", "")
+    os.environ["PYTHONPATH"] = (
+        repo_root + (os.pathsep + prev_pp if prev_pp else "")
+    )
 
     procs = []
     distributed_init_port = get_open_port()
@@ -276,12 +322,8 @@ def multi_process_parallel(
 def test_trtllm_moe_finalize_allreduce_fusion(world_size, dtype):
     np.random.seed(42)
     torch.manual_seed(42)
+    _require_cuda_usable(world_size)
     torch.cuda.manual_seed_all(42)
-    available_gpus = torch.cuda.device_count()
-    if world_size > available_gpus:
-        pytest.skip(
-            f"world_size {world_size} is greater than available_gpus {available_gpus}"
-        )
     print(f"Running test for world_size={world_size}")
 
     # generate shared random input tensor across all ranks

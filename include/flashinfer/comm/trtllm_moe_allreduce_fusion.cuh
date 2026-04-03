@@ -706,6 +706,7 @@ struct MoeFinalizeAllReduceFusionParams : public AllReduceFusionParams<T> {
   // [num_tokens, top_k]
   int32_t* expanded_idx_to_permuted_idx = nullptr;
   // allreduce_in [maxPermutedPaddedCount, hidden_dim]
+  float routed_scaling_factor = 1.0f;
 };
 
 template <int NRanks>
@@ -1297,9 +1298,9 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(
 
       int thread_offset_across_token =
           permuted_idx * params.hidden_dim + thread_offset_within_token;
-      float block_scale = 1.0;
+      float block_scale = params.routed_scaling_factor;
       if (use_scale_factor) {
-        block_scale =
+        block_scale *=
             static_cast<float>(static_cast<ScaleType*>(params.expert_scale_factor)[expanded_idx]);
       }
 
@@ -1474,6 +1475,9 @@ cudaError_t moefinalize_allreduce_fusion_op(MoeFinalizeAllReduceFusionParams<T> 
                    "allreduce_in, expanded_idx_to_permuted_idx and top_k must be set");
   FLASHINFER_CHECK(params.size % params.hidden_dim == 0, "size must be a multiple of hidden_dim");
   FLASHINFER_CHECK(params.hidden_dim % VEC_SIZE == 0, "hidden_dim must be a multiple of VEC_SIZE");
+  FLASHINFER_CHECK(
+    params.moe_allreduce_out || params.residual_out || params.norm_out || params.quant_out,
+    "at least one of moe_allreduce_out, residual_out, norm_out, quant_out must be set");
 
   auto status = DISPATCH_MOEFINALIZEREDUCTION(
       params.nranks, params.residual_out, params.rms_gamma, params.quant_out, N_RANKS, RES, RMS,
