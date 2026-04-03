@@ -351,7 +351,7 @@ class TunableRunner(ABC):
         tactic==-1 has special meaning, means the fallback kernel which should be able to implement any shapes
         This fallback tactic is needed for 2 reasons:
             * when the autotuner cannot find a valid tactic in it's cache.
-            * in eager mode, w/o autotunning the custom op should have at least one kernel, which makes the autotuning
+            * in eager mode, w/o autotuning the custom op should have at least one kernel, which makes the autotuning
               process an optional process, such that user can opt out.
 
         We choose not to have a standalone can_implement function, the tactics returned by get_valid_tactics should return
@@ -718,10 +718,10 @@ class AutoTuner:
                 # Expect no cache miss in inference. Thus, any cache miss should be recorded.
                 if not is_cache_hit:
                     logger.debug(
-                        f"[AutoTunner]: Using fallback tactic for {custom_op} with input shapes {input_shapes}"
+                        f"[AutoTuner]: Using fallback tactic for {custom_op} with input shapes {input_shapes}"
                     )
                     logger.debug(
-                        f"[AutoTunner]: Generated key{AutoTuner._get_cache_key(custom_op, runners[0], input_shapes, tuning_config, runners[0].get_cache_key_extras(inputs))}"
+                        f"[AutoTuner]: Generated key{AutoTuner._get_cache_key(custom_op, runners[0], input_shapes, tuning_config, runners[0].get_cache_key_extras(inputs))}"
                     )
                 return runner, tactic
 
@@ -758,7 +758,7 @@ class AutoTuner:
                             pbar = tqdm.tqdm(
                                 total=len(profiles),
                                 initial=_step,
-                                desc=f"[AutoTunner]: Tuning {custom_op}",
+                                desc=f"[AutoTuner]: Tuning {custom_op}",
                                 unit="profile",
                                 leave=True,
                             )
