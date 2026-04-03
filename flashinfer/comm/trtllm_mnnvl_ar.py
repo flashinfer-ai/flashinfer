@@ -22,6 +22,7 @@ from .mnnvl import CommBackend, MPIBackend
 from .workspace_base import AllReduceFusionWorkspace
 from .torch_symmetric_memory import _alloc_symm_buffer_bytes
 from ..cuda_utils import checkCudaErrors
+
 try:
     # cuda-python >= 12.9 (has cuda.bindings.driver)
     from cuda.bindings import driver as cuda
@@ -35,6 +36,7 @@ except ImportError:
             "Could not import the 'cuda' module. "
             "Please install cuda-python that matches your CUDA version."
         ) from e
+
 
 def mpi_barrier():
     from mpi4py import MPI
@@ -152,7 +154,11 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         # index differs from the TP rank / local_rank.
         device = torch.device("cuda", torch.cuda.current_device())
         if isinstance(comm_backend, TorchDistBackend):
-            group = comm_backend._group if comm_backend._group is not None else torch.distributed.group.WORLD
+            group = (
+                comm_backend._group
+                if comm_backend._group is not None
+                else torch.distributed.group.WORLD
+            )
             group_name = group.group_name
         else:
             group_name = torch.distributed.group.WORLD.group_name
@@ -212,9 +218,7 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             raise ValueError(f"Unsupported dtype: {dtype}")
 
         num_elements = (allocated_size) // dsize
-        checkCudaErrors(
-            memset_func(int(self.ptrs[rank]), neg_zero, num_elements)
-        )
+        checkCudaErrors(memset_func(int(self.ptrs[rank]), neg_zero, num_elements))
 
     @functools.cache
     def is_buffer_size_sufficient(

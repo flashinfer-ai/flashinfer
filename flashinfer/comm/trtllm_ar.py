@@ -30,8 +30,9 @@ from ..jit.comm import gen_trtllm_comm_module
 from ..utils import register_custom_op, round_up
 
 logger = logging.getLogger(__name__)
-from .cuda_ipc import create_shared_buffer, cudart, free_shared_buffer
+from .cuda_ipc import cudart
 from .torch_symmetric_memory import _alloc_symm_buffer_bytes
+
 
 class AllReduceStrategyType:
     # NOTE: for trtllm_custom_all_reduce
@@ -401,6 +402,7 @@ LamportTokenNumThreshold = 16
 
 _symm_workspace_refs: dict[int, list[torch.Tensor]] = {}
 
+
 @deprecated(
     "trtllm_create_ipc_workspace_for_all_reduce and trtllm_custom_all_reduce are deprecated and will be removed in the next major bump, use allreduce.py instead."
 )
@@ -453,7 +455,11 @@ def trtllm_create_ipc_workspace_for_all_reduce(
     lamport_buffer_size = tp_size * LamportTokenNumThreshold * tp_size * hidden_dim * 2
 
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
-    group_name = group.group_name if group is not None else torch.distributed.group.WORLD.group_name
+    group_name = (
+        group.group_name
+        if group is not None
+        else torch.distributed.group.WORLD.group_name
+    )
     symm_refs: list[torch.Tensor] = []
     ipc_handles = list()
 
@@ -603,7 +609,11 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     lamport_buffer_size = lamport_comm_size * 3
 
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
-    group_name = group.group_name if group is not None else torch.distributed.group.WORLD.group_name
+    group_name = (
+        group.group_name
+        if group is not None
+        else torch.distributed.group.WORLD.group_name
+    )
     symm_refs: list[torch.Tensor] = []
 
     # we should init 3 buffers for all reduce fusion:
