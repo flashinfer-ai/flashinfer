@@ -600,7 +600,7 @@ def fused_rmsnorm_silu(
     weight: torch.Tensor,
     eps: float = 1e-6,
     out: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
+) -> Union[torch.Tensor, tuple]:
     r"""Fused RMSNorm + SiLU activation.
 
     ``out[i] = SiLU(RMSNorm(input[i], weight, eps))``
@@ -620,11 +620,20 @@ def fused_rmsnorm_silu(
         Epsilon for numerical stability.
     out: Optional[torch.Tensor]
         Output tensor. If None, allocated as same shape/dtype as input.
+        For NVFP4 output (``torch.float4_e2m1fn_x2``), shape must be
+        ``(num_tokens, hidden_size // 2)``.
 
     Returns
     -------
-    output: torch.Tensor
-        Normalized + SiLU activated tensor, shape ``(num_tokens, hidden_size)``.
+    output: torch.Tensor or Tuple[torch.Tensor, torch.Tensor]
+        For bf16/fp8: normalized + SiLU activated tensor,
+        shape ``(num_tokens, hidden_size)``.
+
+        For NVFP4: a tuple ``(y_fp4, block_scale)`` following the same
+        convention as :func:`rmsnorm_fp4quant`. ``y_fp4`` has shape
+        ``(num_tokens, hidden_size // 2)`` with dtype ``float4_e2m1fn_x2``,
+        and ``block_scale`` has shape ``(num_tokens, hidden_size // 16)``
+        with dtype ``float8_e4m3fn`` (one E4M3 scale per 16-element block).
     """
     if input.device.type != "cuda":
         raise ValueError("fused_rmsnorm_silu requires CUDA tensors")
@@ -705,6 +714,22 @@ def fused_rmsnorm_silu(
     workspace = torch.empty(ws_size, dtype=torch.uint8, device=input.device)
 
     module.rmsnorm_silu(out, input, weight, eps, workspace, sm_count)
+
+    if output_dtype_str == "nvfp4":
+        # Extract block_scale from workspace (matches C++ layout in rmsnorm_silu.cu).
+        # Layout: [rs: rows*4, align128] [fp8_scale: 4, align128] [scale_row: ...]
+        scale_row_offset = num_tokens * 4  # rs
+        scale_row_offset = ((scale_row_offset + 127) // 128) * 128
+        scale_row_offset += 4  # fp8_scale
+        scale_row_offset = ((scale_row_offset + 127) // 128) * 128
+        num_blocks = (C + 15) // 16
+        scale_row_bytes = num_tokens * num_blocks
+        block_scale = workspace[scale_row_offset : scale_row_offset + scale_row_bytes]
+        block_scale = block_scale.view(torch.float8_e4m3fn).reshape(
+            num_tokens, num_blocks
+        )
+        return out, block_scale
+
     return out
 
 

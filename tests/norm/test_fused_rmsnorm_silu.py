@@ -240,7 +240,11 @@ def test_lut_nvfp4(num_tokens, hidden_size):
 
     # FP4 packs 2 values per byte
     out = torch.empty(num_tokens, C // 2, dtype=torch.float4_e2m1fn_x2, device="cuda")
-    result = flashinfer.fused_rmsnorm_silu(x, weight, eps=1e-6, out=out)
+    result, block_scale = flashinfer.fused_rmsnorm_silu(x, weight, eps=1e-6, out=out)
+
+    assert result.data_ptr() == out.data_ptr()
+    assert block_scale.shape == (num_tokens, C // 16)
+    assert block_scale.dtype == torch.float8_e4m3fn
 
     ref_f32 = rmsnorm_silu_reference(x, weight, eps=1e-6, output_dtype=torch.float32)
 
@@ -386,7 +390,10 @@ def test_fallback_knobs_nvfp4(num_tokens, hidden_size):
     weight = torch.rand(C, dtype=torch.bfloat16, device="cuda") * 1.5 + 0.5
     out = torch.empty(num_tokens, C // 2, dtype=torch.float4_e2m1fn_x2, device="cuda")
 
-    result = flashinfer.fused_rmsnorm_silu(x, weight, eps=1e-6, out=out)
+    result, block_scale = flashinfer.fused_rmsnorm_silu(x, weight, eps=1e-6, out=out)
+
+    assert block_scale.shape == (num_tokens, C // 16)
+    assert block_scale.dtype == torch.float8_e4m3fn
 
     ref_f32 = rmsnorm_silu_reference(x, weight, eps=1e-6, output_dtype=torch.float32)
 
