@@ -98,7 +98,7 @@ inline TllmGenFmhaKernelMetaInfoAdapter toAdapter(
           meta.m2CtaMma,
           meta.mSparseMla,
           meta.mSkipsSoftmaxWhenPossible,
-          meta.mDataTypeQ,
+          DATA_TYPE_E4M3,
           meta.mReserved1,
           meta.mReserved2,
           false,
