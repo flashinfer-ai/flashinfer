@@ -32,6 +32,7 @@ from typing import Optional, Union
 import torch
 
 from ..api_logging import flashinfer_api
+from ..trace.templates.norm import fused_add_rmsnorm_trace, rmsnorm_trace
 from ..utils import (
     device_support_pdl,
     get_compute_capability,
@@ -94,7 +95,7 @@ def _normalize_scale_tensor(
     return scale.contiguous()
 
 
-@flashinfer_api
+@flashinfer_api(trace=rmsnorm_trace)
 def rmsnorm(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -219,7 +220,7 @@ def _rmsnorm_quant_fake(
     pass
 
 
-@flashinfer_api
+@flashinfer_api(trace=fused_add_rmsnorm_trace)
 @register_custom_op("flashinfer::fused_add_rmsnorm", mutates_args=("input", "residual"))
 def fused_add_rmsnorm(
     input: torch.Tensor,

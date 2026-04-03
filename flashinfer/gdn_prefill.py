@@ -21,6 +21,7 @@ from typing import Optional, Union, Tuple
 import torch
 
 from .api_logging import flashinfer_api
+from .trace.templates.gdn import gdn_prefill_trace
 from .jit.gdn import gen_gdn_prefill_sm90_module
 from .utils import (
     register_custom_op,
@@ -95,7 +96,7 @@ def get_gdn_prefill_module():
     return SimpleNamespace(gdn_prefill=gdn_prefill)
 
 
-@flashinfer_api
+@flashinfer_api(trace=gdn_prefill_trace)
 def chunk_gated_delta_rule(
     q: torch.Tensor,
     k: torch.Tensor,
