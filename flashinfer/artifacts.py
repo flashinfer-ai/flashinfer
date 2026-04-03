@@ -284,7 +284,7 @@ def get_artifacts_status() -> tuple[tuple[str, bool], ...]:
     cubin_files = get_subdir_file_list()
 
     def _check_file_status(file_name: str) -> tuple[str, bool]:
-        # get_cubin stores cubins in FLASHINFER_CUBIN_DIR with the same relative path
+        # get_artifact stores files in FLASHINFER_CUBIN_DIR with the same relative path
         # Remove any leading slashes from name
         local_path = os.path.join(FLASHINFER_CUBIN_DIR, file_name)
         exists = os.path.isfile(local_path)
