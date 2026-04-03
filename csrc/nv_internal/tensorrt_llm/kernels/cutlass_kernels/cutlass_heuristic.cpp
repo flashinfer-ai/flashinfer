@@ -26,7 +26,6 @@
 #include "cutlass/gemm/gemm.h"
 #include "cutlass/numeric_types.h"
 #include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/logger.h"
 
 #ifdef __GNUC__  // Check if the compiler is GCC or Clang
 #pragma GCC diagnostic pop
@@ -62,7 +61,6 @@ TileShape get_cta_shape_for_config(CutlassTileConfig tile_config) {
     case CutlassTileConfig::CtaShape64x128x64_WarpShape64x32x64:
       return TileShape{64, 128};
     case CutlassTileConfig::CtaShape128x64x64_WarpShape64x32x64:
-      return TileShape{128, 64};
     case CutlassTileConfig::CtaShape128x64x128_WarpShape64x32x128:
       return TileShape{128, 64};
     case CutlassTileConfig::CtaShape128x128x8_WarpShape64x64x8:
@@ -644,9 +642,7 @@ std::vector<CutlassGemmConfig> get_candidate_configs(
   bool const int8_configs_only = config_type_param & CutlassGemmConfig::INT8_ONLY;
   int const min_stages = (sm == 89) ? 3 : int8_configs_only ? 3 : 2;
   int const max_stages = int8_configs_only ? 6 : (sm >= 80 ? 4 : 2);
-
   for (auto const& tile_config : tiles) {
-    TileShape const ts = get_cta_shape_for_config(tile_config);
     for (int stages = min_stages; stages <= max_stages; ++stages) {
       CutlassGemmConfig config(tile_config, SplitKStyle::NO_SPLIT_K, 1, stages);
       candidate_configs.push_back(config);
