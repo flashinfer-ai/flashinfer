@@ -2,7 +2,7 @@
 fi_trace example: generate flashinfer-bench definition JSON files via auto-dump.
 
 Run:
-    python -m flashinfer.trace.example
+    python tests/trace/example.py
 
 When FLASHINFER_TRACE_DUMP=1 (set below), every @flashinfer_api(trace=...) decorated
 function automatically writes a trace JSON on its first call for each unique input
