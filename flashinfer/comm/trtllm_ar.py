@@ -502,15 +502,16 @@ def trtllm_create_ipc_workspace_for_all_reduce(
 def trtllm_destroy_ipc_workspace_for_all_reduce(
     workspace: List[List[int]], group: Optional[ProcessGroup] = None
 ) -> None:
-    """
-    Note:
-    This function is used to destroy a workspace for all reduce.
-    The workspace is a list of IPC handles.
-    The workspace should be destroyed after calling trtllm_custom_all_reduce.
-    The workspace can be reused for multiple all reduce calls under the same configuration.
-    """
+    """Destroy a workspace created by trtllm_create_ipc_workspace_for_all_reduce.
 
-    _ = _symm_workspace_refs.pop(id(workspace), None)
+    Releases the symmetric memory references held internally. The workspace
+    list should not be used after this call.
+
+    Args:
+        workspace: The ipc_handles list returned by the create function.
+        group: Unused, kept for API compatibility.
+    """
+    _symm_workspace_refs.pop(id(workspace), None)
 
 
 BarrierFlagCount = 256
@@ -601,7 +602,6 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
 
     lamport_buffer_size = lamport_comm_size * 3
 
-    # TODO(asamani): check this device and group
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
     group_name = group.group_name if group is not None else torch.distributed.group.WORLD.group_name
     symm_refs: list[torch.Tensor] = []
@@ -718,20 +718,16 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
 def trtllm_destroy_ipc_workspace_for_all_reduce_fusion(
     workspace: List[List[int]], group: Optional[ProcessGroup] = None
 ) -> None:
-    """
-    Parameters:
-    - workspace: the workspace to destroy.
-    - group: the process group to use.
+    """Destroy a workspace created by trtllm_create_ipc_workspace_for_all_reduce_fusion.
 
-    Note:
-    This function is used to destroy a workspace for all reduce fusion.
-    The workspace is a list of IPC handles.
-    The workspace should be destroyed after calling trtllm_custom_all_reduce_fusion.
-    The workspace can be reused for multiple all reduce fusion calls under the same configuration.
-    """
+    Releases the symmetric memory references held internally. The workspace
+    list should not be used after this call.
 
-    # TODO(asamani): is this the correct way to destroy the workspace?
-    _ = _symm_workspace_refs.pop(id(workspace), None)
+    Args:
+        workspace: The ipc_handles list returned by the create function.
+        group: Unused, kept for API compatibility.
+    """
+    _symm_workspace_refs.pop(id(workspace), None)
 
 
 # allReduce fused quant utils
