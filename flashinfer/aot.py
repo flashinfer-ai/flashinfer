@@ -77,6 +77,7 @@ from .jit.gemm import (
     gen_gemm_sm100_module_cutlass_mxfp8,
     gen_gemm_sm120_module,
     gen_gemm_sm120_module_cutlass_fp4,
+    gen_gemm_sm120_module_cutlass_mxfp8,
     gen_tgv_gemm_sm10x_module,
     gen_trtllm_gen_gemm_module,
     gen_trtllm_low_latency_gemm_module,
@@ -527,6 +528,7 @@ def gen_all_modules(
             jit_specs.append(gen_cutlass_fused_moe_sm120_module())
             jit_specs.append(gen_gemm_sm120_module())
             jit_specs.append(gen_gemm_sm120_module_cutlass_fp4())
+            jit_specs.append(gen_gemm_sm120_module_cutlass_mxfp8())
         if has_sm120f:
             jit_specs.append(gen_fp4_quantization_sm120f_module())
 
