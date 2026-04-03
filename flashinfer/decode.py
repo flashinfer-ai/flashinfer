@@ -1282,6 +1282,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
             enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
 
+        if (
+            k_cache.dtype == torch.uint8 or v_cache.dtype == torch.uint8
+        ) and kv_cache_sf is None:
+            raise ValueError("kv_cache_sf must be provided for NVFP4 KV cache.")
         key_block_scales = None
         value_block_scales = None
         if kv_cache_sf is not None:
