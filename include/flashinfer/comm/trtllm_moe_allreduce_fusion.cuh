@@ -1306,7 +1306,6 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(
       // * acc += scale(data)
       if (use_scale_factor) {
         float block_scale =
-            routed_scaling_factor *
             static_cast<float>(static_cast<ScaleType*>(params.expert_scale_factor)[expanded_idx]);
 #pragma unroll
         for (int i = 0; i < VEC_SIZE; ++i) {
@@ -1318,9 +1317,8 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(
       }
     }
 
-    bool fuse_routed_scaling_with_shared_add =
-        !use_scale_factor && use_routed_scaling_factor && params.shared_expert_output;
-    if (!use_scale_factor && use_routed_scaling_factor && !fuse_routed_scaling_with_shared_add) {
+    // Apply the global routed scaling once after accumulating all routed experts.
+    if (use_routed_scaling_factor) {
 #pragma unroll
       for (int i = 0; i < VEC_SIZE; ++i) {
         accumulator[i] = static_cast<T>(static_cast<float>(accumulator[i]) * routed_scaling_factor);
@@ -1334,17 +1332,8 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(
       vec_t<T, VEC_SIZE> shared_expert_output;
       shared_expert_output.load(reinterpret_cast<T*>(params.shared_expert_output) +
                                 thread_offset_across_token);
-      if (fuse_routed_scaling_with_shared_add) {
 #pragma unroll
-        for (int i = 0; i < VEC_SIZE; ++i) {
-          accumulator[i] =
-              static_cast<T>(static_cast<float>(accumulator[i]) * routed_scaling_factor +
-                             static_cast<float>(shared_expert_output[i]));
-        }
-      } else {
-#pragma unroll
-        accumulator = vec_add<T, VEC_SIZE>(accumulator, shared_expert_output);
-      }
+      accumulator = vec_add<T, VEC_SIZE>(accumulator, shared_expert_output);
     }
 
     // * AR Store
