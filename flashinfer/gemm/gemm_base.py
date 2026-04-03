@@ -53,6 +53,7 @@ from ..jit.gemm import gen_gemm_sm100_module_cutlass_fp4
 from ..jit.gemm import gen_gemm_sm103_module_cutlass_fp4
 from ..jit.gemm import gen_gemm_sm100_module_cutlass_fp8
 from ..jit.gemm import gen_gemm_sm100_module_cutlass_mxfp8
+from ..jit.gemm import gen_gemm_sm120_module_cutlass_mxfp8
 from ..jit.gemm import gen_gemm_sm100_module_cutlass_bf16
 from ..jit.gemm import gen_trtllm_gen_gemm_module
 from ..jit.gemm import gen_tgv_gemm_sm10x_module
@@ -3238,11 +3239,29 @@ def get_gemm_sm100_module_cutlass_mxfp8():
     )
 
 
+@functools.cache
+def _load_gemm_sm120_mxfp8_module():
+    """Load the raw TVM-FFI SM120 MXFP8 module (cached)."""
+    return gen_gemm_sm120_module_cutlass_mxfp8().build_and_load()
+
+
+@functools.cache
+def get_gemm_sm120_module_cutlass_mxfp8():
+    """Get the SM120/121 MXFP8 GEMM module."""
+    return _create_cutlass_mxfp8_gemm_module(
+        _load_gemm_sm120_mxfp8_module(),
+        "flashinfer::cutlass_mxfp8_gemm",
+        "cutlass_mxfp8_gemm",
+    )
+
+
 def get_cutlass_mxfp8_gemm_module(
     sm_major: int,
 ):
     if sm_major in [10, 11]:
         return get_gemm_sm100_module_cutlass_mxfp8()
+    elif sm_major in [12]:
+        return get_gemm_sm120_module_cutlass_mxfp8()
     else:
         raise ValueError(f"Unsupported SM major version: {sm_major}")
 
@@ -3365,7 +3384,7 @@ def _check_mm_mxfp8_problem_size(
     return True
 
 
-@supported_compute_capability([100, 103, 110])
+@supported_compute_capability([100, 103, 110, 120, 121])
 def _cutlass_gemm_mxfp8_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -3376,6 +3395,15 @@ def _cutlass_gemm_mxfp8_requirement(
     use_8x4_sf_layout: bool = True,
     backend: Literal["cutlass", "cute-dsl", "trtllm", "auto"] = "auto",
 ):
+    if is_sm12x_supported(a.device):
+        # SM120/121 CUTLASS MXFP8 only supports 1D swizzled scales (SfLayout.layout_128x4).
+        if use_8x4_sf_layout:
+            return False
+        if a_descale.ndim != 1 or b_descale.ndim != 1:
+            return False
+        # K and N must be multiples of 32.
+        if a.shape[1] % 32 != 0 or b.shape[1] % 32 != 0:
+            return False
     return True
 
 
@@ -3889,6 +3917,9 @@ def mm_mxfp8(
           (``mxfp8_quantize(..., is_sf_swizzled_layout=True)``).
         - The ``"trtllm"`` requires b to be quantized with 128x4 swizzle layout and shuffled.
           a can be quantized with either 128x4 or 8x4 layout (controlled by `use_8x4_sf_layout`).
+        - On SM12x GPUs, the ``"cutlass"`` backend only supports
+          1D swizzled scales (``SfLayout.layout_128x4``). Passing 2D linear scales will raise
+          an error. Use ``mxfp8_quantize(..., sf_swizzle_layout=SfLayout.layout_128x4)``.
 
     Returns
     -------
@@ -7160,6 +7191,22 @@ def _check_bmm_mxfp8_problem_size(
     return True
 
 
+@supported_compute_capability([120, 121])
+def _cutlass_bmm_mxfp8_requirement(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    dtype: torch.dtype,
+    out: Optional[torch.Tensor] = None,
+    backend: Literal["cudnn", "cutlass", "auto"] = "auto",
+):
+    # SM120/121 CUTLASS MXFP8 only supports 1D swizzled scales.
+    if A_scale.ndim != 1 or B_scale.ndim != 1:
+        return False
+    return True
+
+
 def _heuristic_func_bmm_mxfp8(
     suitable_backends: List[str],
     A: torch.Tensor,
@@ -7168,10 +7215,13 @@ def _heuristic_func_bmm_mxfp8(
     B_scale: torch.Tensor,
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
-    backend: Literal["cudnn"] = "cudnn",
+    backend: Literal["cudnn", "cutlass", "auto"] = "auto",
 ):
     heuristic_backends = []
-    if CUDNN_AVAILABLE and "cudnn" in suitable_backends:
+    major, _ = get_compute_capability(A.device)
+    if major == 12 and "cutlass" in suitable_backends:
+        heuristic_backends.append("cutlass")
+    elif CUDNN_AVAILABLE and "cudnn" in suitable_backends:
         heuristic_backends.append("cudnn")
     return heuristic_backends
 
@@ -7179,6 +7229,7 @@ def _heuristic_func_bmm_mxfp8(
 @backend_requirement(
     {
         "cudnn": _cudnn_bmm_mxfp8_requirement,
+        "cutlass": _cutlass_bmm_mxfp8_requirement,
     },
     common_check=_check_bmm_mxfp8_problem_size,
     heuristic_func=_heuristic_func_bmm_mxfp8,
@@ -7191,7 +7242,7 @@ def bmm_mxfp8(
     B_scale: torch.Tensor,
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
-    backend: Literal["cudnn"] = "cudnn",
+    backend: Literal["cudnn", "cutlass", "auto"] = "auto",
 ) -> torch.Tensor:
     r"""BMM MXFP8
 
@@ -7215,20 +7266,17 @@ def bmm_mxfp8(
     out: Optional[torch.Tensor]
         Out tensor, shape (b, m, n), bf16 or fp16, defaults to ``None``.
 
-    backend: Literal["cudnn"]
-        The backend to use for the operation. Defaults to ``"cudnn"``.
+    backend: Literal["cudnn", "cutlass", "auto"]
+        The backend to use for the operation. Defaults to ``"auto"``.
+        On SM120/121 GPUs, ``"auto"`` selects the CUTLASS backend; scales must
+        be 1D swizzled (``SfLayout.layout_128x4``). Pass ``B`` in the standard
+        shape ``[b, k, n]`` (column-major); the CUTLASS path transposes internally.
 
     Returns
     -------
     out: torch.Tensor
         Out tensor, shape (b, m, n), bf16 or fp16.
     """
-
-    if backend != "cudnn":
-        raise ValueError(f"Invalid backend: {backend}")
-
-    if not CUDNN_AVAILABLE:
-        raise ValueError("cudnn is not available")
 
     if out is None:
         out = torch.empty(
@@ -7241,5 +7289,28 @@ def bmm_mxfp8(
         "bmm_mxfp8_workspace", DEFAULT_WORKSPACE_SIZE, A.device
     )
 
-    mxfp8_gemm_sm100(A, B, A_scale, B_scale, out, workspace_buffer, ["cudnn"])
-    return out
+    resolved_backend = backend
+    if resolved_backend == "auto":
+        if not bmm_mxfp8.suitable_auto_backends:
+            raise ValueError("No suitable backend found for bmm_mxfp8")
+        resolved_backend = bmm_mxfp8.suitable_auto_backends[0]
+
+    if resolved_backend == "cutlass":
+        # SM120/121 CUTLASS path.
+        # B is [b, k, n] col-major; CUTLASS expects mat2 as [B, N, K].
+        # col-major [b, k, n] with strides (k*n, 1, k) → .transpose(1,2) → [b, n, k]
+        # with strides (k*n, k, 1), which is contiguous row-major [B, N, K].
+        B_cutlass = B.transpose(1, 2)
+        if not B_cutlass.is_contiguous():
+            B_cutlass = B_cutlass.contiguous()
+        raw_module = _load_gemm_sm120_mxfp8_module()
+        raw_module.mxfp8_gemm(A, B_cutlass, A_scale, B_scale, out, workspace_buffer, -1)
+        return out
+
+    if resolved_backend == "cudnn":
+        if not CUDNN_AVAILABLE:
+            raise ValueError("cudnn is not available")
+        mxfp8_gemm_sm100(A, B, A_scale, B_scale, out, workspace_buffer, ["cudnn"])
+        return out
+
+    raise ValueError(f"Invalid backend: {backend}")

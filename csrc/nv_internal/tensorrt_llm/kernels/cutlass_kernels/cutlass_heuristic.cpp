@@ -61,6 +61,7 @@ TileShape get_cta_shape_for_config(CutlassTileConfig tile_config) {
     case CutlassTileConfig::CtaShape64x128x64_WarpShape64x32x64:
       return TileShape{64, 128};
     case CutlassTileConfig::CtaShape128x64x64_WarpShape64x32x64:
+    case CutlassTileConfig::CtaShape128x64x128_WarpShape64x32x128:
       return TileShape{128, 64};
     case CutlassTileConfig::CtaShape128x128x8_WarpShape64x64x8:
     case CutlassTileConfig::CtaShape128x128x64_WarpShape64x32x64:
@@ -587,53 +588,30 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm110(
 std::vector<CutlassGemmConfig> get_candidate_configs_sm120(
     CutlassGemmConfig::CandidateConfigTypeParam const config) {
 #ifdef FAST_BUILD
-  // Fast build disables all configs except this
-  if (config & CutlassGemmConfig::GROUPED_GEMM) {
-    return {CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x128B,
-                              MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
-                              ClusterShape::ClusterShape_1x1x1}};
-  } else {
-    return {CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x256B,
-                              MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
-                              ClusterShape::ClusterShape_1x1x1}};
-  }
+  return {CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x64B, MainloopScheduleType::AUTO,
+                            EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1}};
 #else
-  if (config & CutlassGemmConfig::GROUPED_GEMM) {
-    std::vector<CutlassGemmConfig> candidate_configs;
-    if ((config & CutlassGemmConfig::FP4_ONLY) != 0) {
-      candidate_configs.push_back(CutlassGemmConfig{
-          CutlassTileConfigSM120::CtaShape128x128x128B, MainloopScheduleType::AUTO,
-          EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
-      candidate_configs.push_back(
-          CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x64B, MainloopScheduleType::AUTO,
-                            EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
-      candidate_configs.push_back(
-          CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x256x64B, MainloopScheduleType::AUTO,
-                            EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
-      candidate_configs.push_back(
-          CutlassGemmConfig{CutlassTileConfigSM120::CtaShape256x128x64B, MainloopScheduleType::AUTO,
-                            EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
-      return candidate_configs;
-    } else {
+  if ((config & CutlassGemmConfig::FP4_ONLY) == 0) {
+    if (config & CutlassGemmConfig::GROUPED_GEMM) {
       TLLM_THROW("Not Implemented: SM120 group GEMM only supports nvfp4.");
     }
-  } else {
-    std::vector<CutlassGemmConfig> candidate_configs;
-    if ((config & CutlassGemmConfig::FP4_ONLY) != 0) {
-      candidate_configs.push_back(CutlassGemmConfig{
-          CutlassTileConfigSM120::CtaShape128x128x256B, MainloopScheduleType::AUTO,
-          EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
-      candidate_configs.push_back(CutlassGemmConfig{
-          CutlassTileConfigSM120::CtaShape256x128x128B, MainloopScheduleType::AUTO,
-          EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
-      return candidate_configs;
-    } else {
-      TLLM_THROW("Not Implemented: SM120 GEMM only supports nvfp4.");
-    }
+    TLLM_THROW("Not Implemented: SM120 GEMM only supports nvfp4.");
   }
+  // {tile_enum, M, N}
+  static constexpr std::pair<CutlassTileConfigSM120, std::array<int, 2>> all_tiles[] = {
+      {CutlassTileConfigSM120::CtaShape128x256x64B, {128, 256}},
+      {CutlassTileConfigSM120::CtaShape128x128x256B, {128, 128}},
+      {CutlassTileConfigSM120::CtaShape256x128x128B, {256, 128}},
+  };
+  std::vector<CutlassGemmConfig> result;
+  for (auto const& [tile_enum, mn] : all_tiles) {
+    result.push_back(CutlassGemmConfig{tile_enum, MainloopScheduleType::AUTO,
+                                       EpilogueScheduleType::AUTO,
+                                       ClusterShape::ClusterShape_1x1x1});
+  }
+  return result;
 #endif
-
-}  // namespace kernels
+}
 
 std::vector<CutlassGemmConfig> get_candidate_configs(
     int sm, int const max_split_k,
