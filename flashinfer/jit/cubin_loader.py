@@ -211,6 +211,14 @@ def get_artifact(file_name: str, sha256: str, session=None) -> bytes:
     if data:
         return data
 
+    if os.getenv("FLASHINFER_NO_DOWNLOAD"):
+        raise RuntimeError(
+            f"Artifact not found locally: {file_name} "
+            f"(looked at {local_path}). "
+            f"FLASHINFER_NO_DOWNLOAD is set — refusing to download. "
+            f"This means flashinfer-cubin is missing this file."
+        )
+
     os.makedirs(os.path.dirname(local_path), exist_ok=True)
     uri = safe_urljoin(FLASHINFER_CUBINS_REPOSITORY, file_name)
     logger.info(f"Fetching {file_name} from {uri}")
