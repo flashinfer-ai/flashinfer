@@ -1050,8 +1050,6 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_v2(
     logits_soft_cap,
 ):
     """Test delimiterless multi-item scoring (V2) against custom mask reference."""
-    import torch
-
     total_items_tokens = sum(item_lens)
     # V2 has no delimiter tokens in the sequence
     qo_len = total_items_tokens  # items region only (prefix is in KV cache)
@@ -1059,8 +1057,8 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_v2(
 
     # Build item_offsets: CSR-style [0, len1, len1+len2, ...]
     offsets = [0]
-    for l in item_lens:
-        offsets.append(offsets[-1] + l)
+    for item_len in item_lens:
+        offsets.append(offsets[-1] + item_len)
     item_offsets_tensor = torch.tensor(offsets, dtype=torch.uint32).to(0)
     item_offsets_len = len(offsets)
 
@@ -1101,7 +1099,6 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_v2(
 
     # Build reference using custom mask
     # Reconstruct full KV from paged format
-    perm_dims_last = [0, 1, 2]
     ki = torch.cat(
         [
             kv_data[kv_indptr_cpu[0] : kv_indptr_cpu[1] - 1, 0]
