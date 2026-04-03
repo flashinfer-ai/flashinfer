@@ -186,22 +186,24 @@ def run_benchmark(
     results["MIS_v1_delimited"] = times_v1
 
     # ---- Custom mask baseline (equivalent to MIS v2 mask, but using generic custom_mask path) ----
-    custom_mask = build_custom_mask_v2(prefix_len, item_lens, qo_len_v2, kv_len_v2)
+    # single_prefill only supports batch_size=1
+    if batch_size == 1:
+        custom_mask = build_custom_mask_v2(prefix_len, item_lens, qo_len_v2, kv_len_v2)
 
-    # For custom mask, we use single_prefill (ragged) which supports custom_mask
-    # Reconstruct full KV from paged format for single_prefill
-    k_full = kv_data_v2[:num_pages_v2, 0].reshape(-1, num_kv_heads, head_dim)[:kv_len_v2]
-    v_full = kv_data_v2[:num_pages_v2, 1].reshape(-1, num_kv_heads, head_dim)[:kv_len_v2]
-    q_cm = q_v2[:qo_len_v2]
+        # For custom mask, we use single_prefill (ragged) which supports custom_mask
+        # Reconstruct full KV from paged format for single_prefill
+        k_full = kv_data_v2[:num_pages_v2, 0].reshape(-1, num_kv_heads, head_dim)[:kv_len_v2]
+        v_full = kv_data_v2[:num_pages_v2, 1].reshape(-1, num_kv_heads, head_dim)[:kv_len_v2]
+        q_cm = q_v2[:qo_len_v2]
 
-    times_cm = bench_gpu_time(
-        lambda: flashinfer.prefill.single_prefill_with_kv_cache(
-            q_cm, k_full, v_full, causal=True, custom_mask=custom_mask,
-        ),
-        warmup=warmup,
-        repeat=repeat,
-    )
-    results["custom_mask_baseline"] = times_cm
+        times_cm = bench_gpu_time(
+            lambda: flashinfer.prefill.single_prefill_with_kv_cache(
+                q_cm, k_full, v_full, causal=True, custom_mask=custom_mask,
+            ),
+            warmup=warmup,
+            repeat=repeat,
+        )
+        results["custom_mask_baseline"] = times_cm
 
     return results, {
         "qo_len_v1": qo_len_v1, "kv_len_v1": kv_len_v1,
@@ -230,48 +232,61 @@ def main():
     num_kv_heads = 8
     head_dim = 128
     page_size = 16
-    batch_size = 1
+    batch_sizes = [1, 10, 100]
     repeat = 100
 
     print(f"Config: {num_qo_heads} QO heads, {num_kv_heads} KV heads, {head_dim} head_dim, page_size={page_size}")
     print()
 
-    header = f"{'Config':<45} {'QO/KV len':<20} {'MIS v1 (ms)':<15} {'MIS v2 (ms)':<15} {'CustomMask (ms)':<18} {'v2 vs v1':<12} {'v2 vs CM':<12}"
-    print(header)
-    print("-" * len(header))
+    for batch_size in batch_sizes:
+        print(f"{'=' * 40} batch_size={batch_size} {'=' * 40}")
+        if batch_size == 1:
+            header = f"{'Config':<45} {'QO/KV len':<20} {'MIS v1 (ms)':<15} {'MIS v2 (ms)':<15} {'CustomMask (ms)':<18} {'v2 vs v1':<12} {'v2 vs CM':<12}"
+        else:
+            header = f"{'Config':<45} {'QO/KV len':<20} {'MIS v1 (ms)':<15} {'MIS v2 (ms)':<15} {'v2 vs v1':<12}"
+        print(header)
+        print("-" * len(header))
 
-    for prefix_len, item_lens, desc in configs:
-        try:
-            results, lens = run_benchmark(
-                batch_size, prefix_len, item_lens,
-                num_qo_heads, num_kv_heads, head_dim, page_size,
-                warmup=10, repeat=repeat,
-            )
+        for prefix_len, item_lens, desc in configs:
+            try:
+                results, lens = run_benchmark(
+                    batch_size, prefix_len, item_lens,
+                    num_qo_heads, num_kv_heads, head_dim, page_size,
+                    warmup=10, repeat=repeat,
+                )
 
-            mean_v1 = np.mean(results["MIS_v1_delimited"])
-            mean_v2 = np.mean(results["MIS_v2_delimiterless"])
-            mean_cm = np.mean(results["custom_mask_baseline"])
+                mean_v1 = np.mean(results["MIS_v1_delimited"])
+                mean_v2 = np.mean(results["MIS_v2_delimiterless"])
 
-            speedup_v2_vs_v1 = mean_v1 / mean_v2
-            speedup_v2_vs_cm = mean_cm / mean_v2
+                speedup_v2_vs_v1 = mean_v1 / mean_v2
 
-            lens_str = f"{lens['qo_len_v2']}/{lens['kv_len_v2']}"
+                lens_str = f"{lens['qo_len_v2']}/{lens['kv_len_v2']}"
 
-            print(
-                f"{desc:<45} {lens_str:<20} "
-                f"{mean_v1:<15.4f} {mean_v2:<15.4f} {mean_cm:<18.4f} "
-                f"{speedup_v2_vs_v1:<12.2f}x {speedup_v2_vs_cm:<12.2f}x"
-            )
-        except Exception as e:
-            import traceback
-            print(f"{desc:<45} ERROR: {e}")
-            traceback.print_exc()
+                if batch_size == 1:
+                    mean_cm = np.mean(results["custom_mask_baseline"])
+                    speedup_v2_vs_cm = mean_cm / mean_v2
+                    print(
+                        f"{desc:<45} {lens_str:<20} "
+                        f"{mean_v1:<15.4f} {mean_v2:<15.4f} {mean_cm:<18.4f} "
+                        f"{speedup_v2_vs_v1:<12.2f}x {speedup_v2_vs_cm:<12.2f}x"
+                    )
+                else:
+                    print(
+                        f"{desc:<45} {lens_str:<20} "
+                        f"{mean_v1:<15.4f} {mean_v2:<15.4f} "
+                        f"{speedup_v2_vs_v1:<12.2f}x"
+                    )
+            except Exception as e:
+                import traceback
+                print(f"{desc:<45} ERROR: {e}")
+                traceback.print_exc()
 
-    print()
+        print()
+
     print("Legend:")
     print("  MIS v1: Multi-item scoring with delimiter tokens (kMultiItemScoring)")
     print("  MIS v2: Delimiterless multi-item scoring (kMultiItemScoringV2)")
-    print("  CustomMask: single_prefill with explicit custom mask (reference baseline)")
+    print("  CustomMask: single_prefill with explicit custom mask (reference baseline, batch_size=1 only)")
     print("  v2 vs v1: speedup of v2 over v1 (>1 = v2 faster)")
     print("  v2 vs CM: speedup of v2 over custom mask (>1 = v2 faster)")
 
