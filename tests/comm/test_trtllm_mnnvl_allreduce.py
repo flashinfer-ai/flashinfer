@@ -343,7 +343,7 @@ def run_mnnvl_ar_full(
 
     try:
         if legacy_api:
-            mcast_buffer_mnnvl, buffer_flags_mnnvl, max_num_elements_mnnvl = (
+            legacy_workspace, buffer_flags_mnnvl, max_num_elements_mnnvl = (
                 trtllm_mnnvl_ar.get_allreduce_mnnvl_workspace(
                     mapping,
                     dtype,
@@ -352,11 +352,9 @@ def run_mnnvl_ar_full(
                 )
             )
 
-            multicast_ptr = mcast_buffer_mnnvl.get_multicast_ptr()
-            buffer_ptrs_dev = mcast_buffer_mnnvl.get_buffer_ptrs_dev()
-            unicast_ptr = mcast_buffer_mnnvl.mcast_device_memory.get_unicast_ptr(
-                mapping.tp_rank
-            )
+            multicast_ptr = legacy_workspace.mc_ptr
+            buffer_ptrs_dev = legacy_workspace.uc_ptrs_dev
+            unicast_ptr = legacy_workspace.handle.buffer_ptrs[mapping.tp_rank]
 
         else:
             workspace = trtllm_mnnvl_ar.MNNVLAllReduceFusionWorkspace(
@@ -440,8 +438,8 @@ def run_mnnvl_ar_full(
         # Explicitly destroy workspace to avoid __del__ issues during Python shutdown
         if "workspace" in locals() and workspace is not None:
             workspace.destroy()
-        if "mcast_buffer_mnnvl" in locals():
-            del mcast_buffer_mnnvl
+        if "legacy_workspace" in locals():
+            legacy_workspace.destroy()
 
     # Final synchronization using torch.distributed barrier
     dist.barrier()

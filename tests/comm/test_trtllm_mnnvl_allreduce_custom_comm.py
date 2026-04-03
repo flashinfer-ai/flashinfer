@@ -140,17 +140,15 @@ def _run_mnnvl_ar(world_size, rank, dtype, distributed_init_port, seq_len, hidde
         # This workspace is sized for the maximum expected sequence length and can be reused within each list
         # Each parameterized list gets its own fresh workspace allocation
         explicit_workspace_bytes = 3 * 2 * dtype.itemsize * hidden_size * seq_len
-        mcast_buffer_mnnvl, buffer_flags_mnnvl, max_num_elements_mnnvl = (
+        legacy_workspace, buffer_flags_mnnvl, max_num_elements_mnnvl = (
             trtllm_mnnvl_ar.get_allreduce_mnnvl_workspace(
                 mapping, dtype, comm, explicit_workspace_bytes
             )
         )
 
-        multicast_ptr = mcast_buffer_mnnvl.get_multicast_ptr()
-        buffer_ptrs_dev = mcast_buffer_mnnvl.get_buffer_ptrs_dev()
-        unicast_ptr = mcast_buffer_mnnvl.mcast_device_memory.get_unicast_ptr(
-            mapping.tp_rank
-        )
+        multicast_ptr = legacy_workspace.mc_ptr
+        buffer_ptrs_dev = legacy_workspace.uc_ptrs_dev
+        unicast_ptr = legacy_workspace.handle.buffer_ptrs[mapping.tp_rank]
 
         # Test each sequence length with the same workspace (reusing allocated buffers within this list)
         if rank == 0:
@@ -228,8 +226,8 @@ def _run_mnnvl_ar(world_size, rank, dtype, distributed_init_port, seq_len, hidde
 
     finally:
         # Ensure cleanup happens for this list's workspace
-        if "mcast_buffer_mnnvl" in locals():
-            del mcast_buffer_mnnvl
+        if "legacy_workspace" in locals():
+            legacy_workspace.destroy()
 
     # Final synchronization and check for failures across all ranks
     comm.barrier()

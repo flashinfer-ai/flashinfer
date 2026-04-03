@@ -18,7 +18,7 @@ from flashinfer.comm.mnnvl import TorchDistBackend
 
 from ..jit import gen_trtllm_mnnvl_comm_module
 from ..utils import register_custom_op
-from .mnnvl import McastGPUBuffer, CommBackend, MPIBackend
+from .mnnvl import CommBackend, MPIBackend
 from .workspace_base import AllReduceFusionWorkspace
 from .torch_symmetric_memory import _alloc_symm_buffer_bytes
 from ..cuda_utils import checkCudaErrors
@@ -547,33 +547,22 @@ def get_allreduce_mnnvl_workspace(
     dtype: torch.dtype,
     comm_backend_for_handle_transfer: Optional[CommBackend] = None,
     buffer_size_in_bytes: Optional[int] = None,
-) -> Tuple[McastGPUBuffer, torch.Tensor, int]:
+) -> Tuple[MNNVLAllReduceFusionWorkspace, torch.Tensor, int]:
     """Get workspace buffers needed for multi-node NVLink all-reduce operation.
-
-    This function allocates and initializes the workspace buffers required for performing
-    multi-node NVLink all-reduce operations. It creates:
-    1. A multicast GPU buffer for communication between nodes
-    2. A flags tensor to track buffer state
-    3. Maximum number of elements that can fit in the buffer
-
-    The buffer size is calculated to efficiently handle common hidden dimensions
-    (2048, 4096, 5120, 7168, 8192) by using their LCM of 286720.
 
     Args:
         mapping: Tensor parallel mapping configuration containing rank info
         dtype: Data type of the tensors being reduced
+        comm_backend_for_handle_transfer: Communication backend for handle transfer
         buffer_size_in_bytes: Optional buffer size. Practically, assign this to 3 * 2 * dtype.itemsize * hidden_dim * max_tokens
 
     Returns:
         Tuple containing:
-        - McastGPUBuffer: Multicast buffer for inter-node communication
+        - MNNVLAllReduceFusionWorkspace: The workspace object backed by torch symmetric memory
         - torch.Tensor: Buffer flags tensor tracking state
         - int: Maximum number of elements that can fit in buffer
     """
-    # buffer shape: [3, 2, buffer_tokens, hidden_dim]
     stride = 3 * 2 * dtype.itemsize
-    # LCM for hidden_dim: 2048, 4096, 5120, 7168, 8192 = 286720
-    # max_num_elements must be a multiple of 286720
     lcm_hidden_dim = 286720
     TARGET_WORKSPACE_SIZE_BYTES = (
         buffer_size_in_bytes if buffer_size_in_bytes is not None else 12_000_000
@@ -582,21 +571,17 @@ def get_allreduce_mnnvl_workspace(
         TARGET_WORKSPACE_SIZE_BYTES / (lcm_hidden_dim * stride)
     ) * (lcm_hidden_dim * stride)
 
-    # Redirect to the new workspace allocation logic. The new kernel needs the new flag buffer layout.
     workspace = MNNVLAllReduceFusionWorkspace(
         mapping,
         buffer_size_in_bytes=buffer_size_in_bytes,
         comm_backend=comm_backend_for_handle_transfer,
     )
 
-    mcast_buffer = workspace.mcast_buffer_handle
-    buffer_flags = workspace.buffer_flags
-    # this is calculated using the legacy behavior. We do not use the actual allocated size.
     max_num_elements = workspace.buffer_size_bytes // stride
 
     return (
-        mcast_buffer,
-        buffer_flags,
+        workspace,
+        workspace.buffer_flags,
         max_num_elements,
     )
 
