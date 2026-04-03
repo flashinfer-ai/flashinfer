@@ -49,13 +49,16 @@ def build_mis_v1_inputs(batch_size, prefix_len, item_lens, delimiter=True):
 
     max_item_len = max(item_lens)
 
+    # Replicate per-batch metadata for batch_size > 1
+    token_pos_tensor = torch.tensor(token_pos * batch_size, dtype=torch.uint16).cuda()
+
     return (
         qo_len,
         kv_len,
-        torch.tensor([prefix_len], dtype=torch.uint32).cuda(),
-        torch.tensor(token_pos, dtype=torch.uint16).cuda(),
+        torch.tensor([prefix_len] * batch_size, dtype=torch.uint32).cuda(),
+        token_pos_tensor,
         len(token_pos),
-        torch.tensor([max_item_len], dtype=torch.uint16).cuda(),
+        torch.tensor([max_item_len] * batch_size, dtype=torch.uint16).cuda(),
     )
 
 
@@ -70,11 +73,14 @@ def build_mis_v2_inputs(batch_size, prefix_len, item_lens):
     for il in item_lens:
         offsets.append(offsets[-1] + il)
 
+    # Replicate per-batch metadata for batch_size > 1
+    offsets_replicated = offsets * batch_size
+
     return (
         qo_len,
         kv_len,
-        torch.tensor([prefix_len], dtype=torch.uint32).cuda(),
-        torch.tensor(offsets, dtype=torch.uint32).cuda(),
+        torch.tensor([prefix_len] * batch_size, dtype=torch.uint32).cuda(),
+        torch.tensor(offsets_replicated, dtype=torch.uint32).cuda(),
         len(offsets),
     )
 
