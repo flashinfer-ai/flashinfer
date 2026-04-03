@@ -314,7 +314,7 @@ def _collect_template_func_pairs() -> List[Tuple[Callable, TraceTemplate, str]]:
     import flashinfer.mla  # BatchMLAPagedAttentionWrapper
     import flashinfer.norm  # rmsnorm, fused_add_rmsnorm
     import flashinfer.prefill  # BatchPrefillWithPagedKVCacheWrapper, Ragged
-    import flashinfer.sampling  # top_k_sampling_from_probs, etc.
+    import flashinfer.sampling  # noqa: F401  # top_k_sampling_from_probs, etc.
 
     from flashinfer.api_logging import _TRACE_REGISTRY
 
@@ -355,15 +355,21 @@ _E2E_SKIP = {
     # Tuple inputs (paged_kv_cache) need manual construction:
     "gqa_paged_decode",
     "gqa_paged_prefill",
-    # MoE fp8 inputs need matching scale tensor shapes — covered by
-    # test_fi_trace_complete_moe_ds_routing below.
-    # Labels are the template name_prefix values set in trace/templates/moe.py.
+    # MoE fp8: top_k / intermediate_size are scalar kwargs (not tensor dims) and
+    # hidden_states_scale is optional — covered by test_fi_trace_complete_moe_routing.
     "moe_fp8_block_scale_ds_routing",
     "moe_fp8_block_scale_default_routing",
     "moe_fp8_block_scale_renormalize_routing",
     "moe_fp8_block_scale_llama4_routing",
     "moe_fp8_block_scale_renormalize_naive_routing",
     "moe_fp8_block_scale_topk_routing",
+    # MoE fp4: same reason — covered by test_fi_trace_complete_moe_fp4_routing.
+    "moe_fp4_block_scale_ds_routing",
+    "moe_fp4_block_scale_default_routing",
+    "moe_fp4_block_scale_renormalize_routing",
+    "moe_fp4_block_scale_llama4_routing",
+    "moe_fp4_block_scale_renormalize_naive_routing",
+    "moe_fp4_block_scale_topk_routing",
 }
 
 _E2E_PAIRS = [(f, t, l) for f, t, l in _ALL_PAIRS if l not in _E2E_SKIP]
@@ -384,7 +390,7 @@ def test_fi_trace_complete(func, template, label):
 def test_fi_trace_complete_gqa_paged_decode():
     """GQA paged decode: tuple paged_kv_cache input handled correctly."""
     from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
-    from flashinfer.trace.templates.attention import gqa_paged_decode_trace
+    from flashinfer.trace.templates.attention import gqa_paged_decode_trace  # noqa: F401
 
     B, H, KV, D, P, NP = 4, 8, 4, 64, 16, 8
     q = torch.zeros(B, H, D, dtype=torch.bfloat16)
@@ -458,6 +464,65 @@ def test_fi_trace_complete_moe_routing(
     assert defn["axes"]["top_k"]["value"] == top_k
     assert defn["name"].startswith(expected_name_prefix)
     assert "unknown" not in str(defn["inputs"])
+
+
+@pytest.mark.parametrize(
+    "routing_method_type,top_k,extra_kwargs,expected_name_prefix",
+    [
+        (0, 4, {}, "moe_fp4_block_scale_default_routing"),
+        (1, 4, {}, "moe_fp4_block_scale_renormalize_routing"),
+        (2, 4, {"n_group": 4, "topk_group": 2}, "moe_fp4_block_scale_ds_routing"),
+        (3, 1, {}, "moe_fp4_block_scale_llama4_routing"),
+        (4, 4, {}, "moe_fp4_block_scale_renormalize_naive_routing"),
+        (5, 4, {}, "moe_fp4_block_scale_topk_routing"),
+    ],
+    ids=["default", "renormalize", "ds", "llama4", "renormalize_naive", "topk"],
+)
+def test_fi_trace_complete_moe_fp4_routing(
+    routing_method_type, top_k, extra_kwargs, expected_name_prefix
+):
+    """MoE routing variants: fp4 + scale tensor shapes handled correctly for each routing type."""
+    from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
+
+    # NvFP4: block_size=16, packed hidden → [T, H//2], scale → [T, H//16]
+    T, E, EL, H, I, BS = 4, 16, 2, 256, 64, 16
+    defn = trtllm_fp4_block_scale_moe.fi_trace(
+        routing_logits=torch.zeros(T, E, dtype=torch.float32),
+        routing_bias=None,
+        hidden_states=torch.zeros(T, H // 2, dtype=torch.uint8),
+        hidden_states_scale=torch.zeros(T, H // BS, dtype=torch.float8_e4m3fn),
+        gemm1_weights=torch.zeros(EL, 2 * I, H // 2, dtype=torch.uint8),
+        gemm1_weights_scale=torch.zeros(EL, 2 * I, H // BS, dtype=torch.float8_e4m3fn),
+        gemm1_bias=None,
+        gemm1_alpha=None,
+        gemm1_beta=None,
+        gemm1_clamp_limit=None,
+        gemm2_weights=torch.zeros(EL, H, I // 2, dtype=torch.uint8),
+        gemm2_weights_scale=torch.zeros(EL, H, I // BS, dtype=torch.float8_e4m3fn),
+        gemm2_bias=None,
+        output1_scale_scalar=torch.ones(EL, dtype=torch.float32),
+        output1_scale_gate_scalar=torch.ones(EL, dtype=torch.float32),
+        output2_scale_scalar=torch.ones(EL, dtype=torch.float32),
+        num_experts=E,
+        top_k=top_k,
+        intermediate_size=I,
+        local_expert_offset=0,
+        local_num_experts=EL,
+        routed_scaling_factor=None,
+        routing_method_type=routing_method_type,
+        **extra_kwargs,
+    )
+    assert defn["op_type"] == "moe"
+    assert defn["axes"]["num_local_experts"]["value"] == EL
+    assert defn["axes"]["hidden_size"]["value"] == H
+    assert defn["axes"]["top_k"]["value"] == top_k
+    assert defn["name"].startswith(expected_name_prefix)
+    non_optional_unknown = [
+        k
+        for k, v in defn["inputs"].items()
+        if isinstance(v, dict) and v.get("dtype") == "unknown" and not v.get("optional")
+    ]
+    assert not non_optional_unknown, f"Non-optional inputs with unknown dtype: {non_optional_unknown}"
 
 
 # ---------------------------------------------------------------------------

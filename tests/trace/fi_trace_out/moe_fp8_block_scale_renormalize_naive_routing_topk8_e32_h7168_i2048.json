@@ -1,6 +1,6 @@
 {
-  "name": "moe_fp8_block_scale_default_routing_topk8_e32_h7168_i2048",
-  "description": "FP8 block scale MoE with Default routing (Softmax \u2192 TopK).",
+  "name": "moe_fp8_block_scale_renormalize_naive_routing_topk8_e32_h7168_i2048",
+  "description": "FP8 block scale MoE with RenormalizeNaive routing (Softmax \u2192 TopK \u2192 Renormalize).",
   "op_type": "moe",
   "tags": [
     "fi_api:flashinfer.fused_moe.core.trtllm_fp8_block_scale_moe",
@@ -148,5 +148,5 @@
       "description": "Final MoE output tensor."
     }
   },
-  "reference": "@torch.no_grad()\ndef _trtllm_fp8_block_scale_moe_default_routing_reference(\n    routing_logits,\n    routing_bias,\n    hidden_states,\n    hidden_states_scale,\n    gemm1_weights,\n    gemm1_weights_scale,\n    gemm2_weights,\n    gemm2_weights_scale,\n    local_expert_offset,\n    routed_scaling_factor,\n):\n    \"\"\"\n    FP8 block-scale MoE with Default routing: Softmax \u2192 TopK.\n    routing_bias is added to logits before softmax when provided.\n    \"\"\"\n    TOP_K = 8\n    E_global = routing_logits.shape[1]\n    logits = routing_logits.to(torch.float32)\n    if routing_bias is not None:\n        logits = logits + routing_bias.to(torch.float32).reshape(-1)\n    s = torch.softmax(logits, dim=-1)\n    _, topk_idx = torch.topk(s, k=TOP_K, dim=1, largest=True, sorted=False)\n    weights = s.gather(1, topk_idx) * routed_scaling_factor\n    return _fp8_moe_run_experts(\n        hidden_states,\n        hidden_states_scale,\n        gemm1_weights,\n        gemm1_weights_scale,\n        gemm2_weights,\n        gemm2_weights_scale,\n        weights,\n        topk_idx,\n        local_expert_offset,\n        E_global,\n    )\n"
+  "reference": "@torch.no_grad()\ndef _trtllm_fp8_block_scale_moe_renormalize_naive_routing_reference(\n    routing_logits,\n    routing_bias,\n    hidden_states,\n    hidden_states_scale,\n    gemm1_weights,\n    gemm1_weights_scale,\n    gemm2_weights,\n    gemm2_weights_scale,\n    local_expert_offset,\n    routed_scaling_factor,\n):\n    \"\"\"\n    FP8 block-scale MoE with RenormalizeNaive routing: Softmax \u2192 TopK \u2192 Renormalize.\n    Same as Default but the selected weights are re-normalised to sum to 1.\n    \"\"\"\n    TOP_K = 8\n    E_global = routing_logits.shape[1]\n    logits = routing_logits.to(torch.float32)\n    if routing_bias is not None:\n        logits = logits + routing_bias.to(torch.float32).reshape(-1)\n    s = torch.softmax(logits, dim=-1)\n    _, topk_idx = torch.topk(s, k=TOP_K, dim=1, largest=True, sorted=False)\n    gathered = s.gather(1, topk_idx)\n    weights = gathered / (gathered.sum(dim=1, keepdim=True) + 1e-20)\n    weights = weights * routed_scaling_factor\n    return _fp8_moe_run_experts(\n        hidden_states,\n        hidden_states_scale,\n        gemm1_weights,\n        gemm1_weights_scale,\n        gemm2_weights,\n        gemm2_weights_scale,\n        weights,\n        topk_idx,\n        local_expert_offset,\n        E_global,\n    )\n"
 }

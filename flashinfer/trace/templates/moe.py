@@ -647,6 +647,242 @@ def trtllm_fp8_block_scale_moe_trace_dispatch(**kwargs):
 
 # Expose all possible templates so _attach_fi_trace can auto-register them
 # in _TRACE_REGISTRY for consistency testing.
-trtllm_fp8_block_scale_moe_trace_dispatch.templates = list(
+trtllm_fp8_block_scale_moe_trace_dispatch.templates = list(  # type: ignore[attr-defined]
     _MOE_TRACE_BY_ROUTING_TYPE.values()
+)
+
+
+# ---------------------------------------------------------------------------
+# FP4 block-scale MoE (trtllm_fp4_block_scale_moe)
+# ---------------------------------------------------------------------------
+# NvFP4: block_size=16, weights packed as uint8 (2 fp4 per byte).
+#   hidden_states       : [seq_len, hidden_size // 2]   uint8
+#   hidden_states_scale : [seq_len, hidden_size // 16]  float8  (optional for bf16 input)
+#   gemm1_weights       : [E_loc, 2*I, hidden_size // 2]         uint8
+#   gemm1_weights_scale : [E_loc, 2*I, hidden_size // 16]        float8
+#   gemm2_weights       : [E_loc, hidden_size, I // 2]            uint8
+#   gemm2_weights_scale : [E_loc, hidden_size, I // 16]           float8
+# ---------------------------------------------------------------------------
+
+_FP4_STANDARD_AXES: dict[str, Var | Const] = {
+    "seq_len": Var(description="Number of tokens."),
+    "num_experts": Const(description="Total number of experts.", abbrev=""),
+    "top_k": Const(description="Number of experts selected per token.", abbrev="topk"),
+    "num_local_experts": Const(description="Number of local experts.", abbrev="e"),
+    "hidden_size": Const(description="Hidden dimension size.", abbrev="h"),
+    "intermediate_size": Const(description="MoE intermediate layer size.", abbrev="i"),
+    # Derived / block-count axes (abbrev="" → omitted from filename)
+    "gemm1_out_size": Const(
+        description="Output size of FC1 (2 × intermediate_size for SwiGLU).",
+        abbrev="",
+    ),
+    "num_packed_hidden": Const(
+        description="Packed hidden dimension (hidden_size // 2 for NvFP4).",
+        abbrev="",
+    ),
+    "num_fp4_hidden_blocks": Const(
+        description="Number of FP4 scale blocks along hidden_size (hidden_size // 16 for NvFP4).",
+        abbrev="",
+    ),
+    "num_packed_intermediate": Const(
+        description="Packed intermediate dimension (intermediate_size // 2 for NvFP4).",
+        abbrev="",
+    ),
+    "num_fp4_intermediate_blocks": Const(
+        description="Number of FP4 scale blocks along intermediate_size (intermediate_size // 16 for NvFP4).",
+        abbrev="",
+    ),
+}
+
+_FP4_STANDARD_INPUTS: dict[str, Tensor | Scalar] = {
+    "routing_logits": Tensor(
+        ["seq_len", "num_experts"],
+        description="Routing logits for expert selection.",
+    ),
+    "routing_bias": Tensor(
+        ["num_experts"],
+        description="Bias added to routing logits. Pass None when not used.",
+        optional=True,
+    ),
+    # Packed NvFP4 hidden states (2 values per uint8 byte).
+    "hidden_states": Tensor(
+        ["seq_len", "num_packed_hidden"],
+        description="Input hidden states, NvFP4-packed (uint8, 2 fp4 per byte).",
+    ),
+    "hidden_states_scale": Tensor(
+        ["seq_len", "num_fp4_hidden_blocks"],
+        description="Block-wise scale factors for hidden_states (float8). None for bf16 input.",
+        optional=True,
+    ),
+    "gemm1_weights": Tensor(
+        ["num_local_experts", "gemm1_out_size", "num_packed_hidden"],
+        description="FC1 weights, NvFP4-packed (uint8). Shape includes gate+up for SwiGLU.",
+    ),
+    "gemm1_weights_scale": Tensor(
+        ["num_local_experts", "gemm1_out_size", "num_fp4_hidden_blocks"],
+        description="Block-wise scale factors for gemm1_weights (float8).",
+    ),
+    "gemm1_bias": Tensor(
+        ["num_local_experts", "gemm1_out_size"],
+        description="FC1 bias (float32). Optional.",
+        optional=True,
+    ),
+    "gemm1_alpha": Tensor(
+        ["num_local_experts"],
+        description="Per-expert SwiGLU alpha (float32). Optional.",
+        optional=True,
+    ),
+    "gemm1_beta": Tensor(
+        ["num_local_experts"],
+        description="Per-expert SwiGLU beta (float32). Optional.",
+        optional=True,
+    ),
+    "gemm1_clamp_limit": Tensor(
+        ["num_local_experts"],
+        description="Per-expert SwiGLU clamp limit (float32). Optional.",
+        optional=True,
+    ),
+    "gemm2_weights": Tensor(
+        ["num_local_experts", "hidden_size", "num_packed_intermediate"],
+        description="FC2 weights, NvFP4-packed (uint8).",
+    ),
+    "gemm2_weights_scale": Tensor(
+        ["num_local_experts", "hidden_size", "num_fp4_intermediate_blocks"],
+        description="Block-wise scale factors for gemm2_weights (float8).",
+    ),
+    "gemm2_bias": Tensor(
+        ["num_local_experts", "hidden_size"],
+        description="FC2 bias (float32). Optional.",
+        optional=True,
+    ),
+    "output1_scale_scalar": Tensor(
+        ["num_local_experts"],
+        description="Per-expert output scale for FC1 activation (float32). Optional.",
+        optional=True,
+    ),
+    "output1_scale_gate_scalar": Tensor(
+        ["num_local_experts"],
+        description="Per-expert output scale for FC1 gate (float32). Optional.",
+        optional=True,
+    ),
+    "output2_scale_scalar": Tensor(
+        ["num_local_experts"],
+        description="Per-expert output scale for FC2 (float32). Optional.",
+        optional=True,
+    ),
+    "local_expert_offset": Scalar(
+        "int32",
+        description="Offset of local experts in the global expert array.",
+    ),
+    "routed_scaling_factor": Scalar(
+        "float32",
+        optional=True,
+        description="Scaling factor applied to routing weights. None for some routing methods.",
+    ),
+}
+
+_FP4_STANDARD_OUTPUTS = {
+    "output": Tensor(
+        ["seq_len", "hidden_size"],
+        dtype="bfloat16",
+        description="Final MoE output tensor.",
+    ),
+}
+
+_FP4_STANDARD_TAGS = ["status:experimental", "quantization:nvfp4"]
+
+
+def _make_standard_fp4_moe_trace(name_prefix, description):
+    """Factory for FP4 MoE templates that share the standard (non-DS) axis set."""
+    return TraceTemplate(
+        op_type="moe",
+        name_prefix=name_prefix,
+        description=description,
+        axes=dict(_FP4_STANDARD_AXES),
+        inputs=dict(_FP4_STANDARD_INPUTS),
+        outputs=dict(_FP4_STANDARD_OUTPUTS),
+        tags=_FP4_STANDARD_TAGS,
+        reference=None,
+    )
+
+
+# RoutingMethodType.Default = 0 — Softmax → TopK
+trtllm_fp4_block_scale_moe_default_routing_trace = _make_standard_fp4_moe_trace(
+    name_prefix="moe_fp4_block_scale_default_routing",
+    description="NvFP4 block-scale MoE with Default routing (Softmax → TopK).",
+)
+
+# RoutingMethodType.Renormalize = 1 — TopK → Softmax
+trtllm_fp4_block_scale_moe_renormalize_routing_trace = _make_standard_fp4_moe_trace(
+    name_prefix="moe_fp4_block_scale_renormalize_routing",
+    description="NvFP4 block-scale MoE with Renormalize routing (TopK → Softmax).",
+)
+
+# RoutingMethodType.DeepSeekV3 = 2 — Sigmoid → group selection → TopK
+trtllm_fp4_block_scale_moe_ds_routing_trace = TraceTemplate(
+    op_type="moe",
+    name_prefix="moe_fp4_block_scale_ds_routing",
+    description="NvFP4 block-scale MoE with DeepSeekV3 routing (Sigmoid → group selection → top_k).",
+    axes={
+        **_FP4_STANDARD_AXES,
+        "n_group": Const(
+            description="Number of expert groups for group routing.", abbrev="ng"
+        ),
+        "topk_group": Const(
+            description="Number of groups selected in top-k routing.", abbrev="kg"
+        ),
+    },
+    inputs=dict(_FP4_STANDARD_INPUTS),
+    outputs=dict(_FP4_STANDARD_OUTPUTS),
+    tags=_FP4_STANDARD_TAGS,
+    reference=None,
+)
+
+# RoutingMethodType.Llama4 = 3 — Top1 → Sigmoid
+trtllm_fp4_block_scale_moe_llama4_routing_trace = _make_standard_fp4_moe_trace(
+    name_prefix="moe_fp4_block_scale_llama4_routing",
+    description="NvFP4 block-scale MoE with Llama4 routing (Top1 → Sigmoid).",
+)
+
+# RoutingMethodType.RenormalizeNaive = 4 — Softmax → TopK → Renormalize
+trtllm_fp4_block_scale_moe_renormalize_naive_routing_trace = _make_standard_fp4_moe_trace(
+    name_prefix="moe_fp4_block_scale_renormalize_naive_routing",
+    description="NvFP4 block-scale MoE with RenormalizeNaive routing (Softmax → TopK → Renormalize).",
+)
+
+# RoutingMethodType.TopK = 5 — plain TopK, uniform weights
+trtllm_fp4_block_scale_moe_topk_routing_trace = _make_standard_fp4_moe_trace(
+    name_prefix="moe_fp4_block_scale_topk_routing",
+    description="NvFP4 block-scale MoE with TopK-only routing (no softmax, uniform weights).",
+)
+
+_FP4_MOE_TRACE_BY_ROUTING_TYPE = {
+    0: trtllm_fp4_block_scale_moe_default_routing_trace,
+    1: trtllm_fp4_block_scale_moe_renormalize_routing_trace,
+    2: trtllm_fp4_block_scale_moe_ds_routing_trace,
+    3: trtllm_fp4_block_scale_moe_llama4_routing_trace,
+    4: trtllm_fp4_block_scale_moe_renormalize_naive_routing_trace,
+    5: trtllm_fp4_block_scale_moe_topk_routing_trace,
+    # 6 = Unspecified: no trace
+}
+
+
+def trtllm_fp4_block_scale_moe_trace_dispatch(**kwargs):
+    """Return the FP4 TraceTemplate for the given ``routing_method_type``.
+
+    Pass this as ``trace=trtllm_fp4_block_scale_moe_trace_dispatch`` to
+    ``@flashinfer_api`` so the correct template is selected at call time::
+
+        @flashinfer_api(trace=trtllm_fp4_block_scale_moe_trace_dispatch)
+        def trtllm_fp4_block_scale_moe(..., routing_method_type: int = 0, ...):
+            ...
+
+    Returns ``None`` for ``RoutingMethodType.Unspecified`` (6).
+    """
+    routing_method_type = int(kwargs.get("routing_method_type", 0))
+    return _FP4_MOE_TRACE_BY_ROUTING_TYPE.get(routing_method_type)
+
+
+trtllm_fp4_block_scale_moe_trace_dispatch.templates = list(  # type: ignore[attr-defined]
+    _FP4_MOE_TRACE_BY_ROUTING_TYPE.values()
 )

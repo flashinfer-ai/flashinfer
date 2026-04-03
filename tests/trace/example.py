@@ -15,18 +15,17 @@ Requires a CUDA-capable GPU.
 Results:
 - We would get these example json files under fi_trace_out directory:
 fused_add_rmsnorm_h5120.json
-gdn_decode_qk4_v8_d128_k_last.json
-gdn_mtp_qk4_v8_d128_k_last.json
-gdn_prefill_qk4_v8_d128_k_last.json
-gemm_bf16_n256_k7168.json
-gemm_bf16_n4096_k4096.json
-gemm_fp4_n2048_k7168.json
-gemm_fp8_n1536_k7168.json
-gemm_mxfp8_n4096_k4096.json
+gdn_decode_qk4_v8_d128.json
+gdn_mtp_qk4_v8_d128.json
+gemm_bf16_N256_K7168.json
+gemm_bf16_N4096_K4096.json
+gemm_fp4_N2048_K7168_block_size16.json
+gemm_fp8_N1536_K7168.json
+gemm_mxfp8_N4096_K4096.json
 gqa_paged_decode_h32_kv8_d128_ps16.json
 gqa_paged_decode_h32_kv8_d128_ps64.json
 gqa_paged_prefill_h32_kv8_d128_ps16.json
-gqa_ragged_prefill_h32_kv8_d128.json
+gqa_ragged_h32_kv8_d128.json
 mla_paged_decode_h16_ckv512_kpe64_ps1.json
 mla_paged_decode_h16_ckv512_kpe64_ps64.json
 moe_fp8_block_scale_default_routing_topk8_e32_h7168_i2048.json
@@ -37,16 +36,17 @@ moe_fp8_block_scale_renormalize_routing_topk8_e32_h7168_i2048.json
 moe_fp8_block_scale_topk_routing_topk8_e32_h7168_i2048.json
 rmsnorm_h4096.json
 rmsnorm_h7168.json
-top_k_sampling_from_probs_v128256.json
-top_k_top_p_sampling_from_probs_v128256.json
-top_k_top_p_sampling_from_probs_v151936.json
-top_p_sampling_from_probs_v128256.json
-top_p_sampling_from_probs_v151936.json
+top_k_sampling_v128256.json
+top_k_top_p_sampling_v128256.json
+top_k_top_p_sampling_v151936.json
+top_p_sampling_v128256.json
+top_p_sampling_v151936.json
 
 Note: top_p_sampling files appear for vocab_size=151936 because
-top_k_top_p_sampling (top_k_first order) calls top_p_sampling internally.
+top_k_top_p_sampling calls top_p_sampling internally.
 """
 
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -295,40 +295,53 @@ flashinfer.gdn_decode.gated_delta_rule_mtp(
 # ── MoE FP8 (256 experts, 32 local, h=7168, i=2048) ─────────────────────────
 # routing_method_type: 0=Default, 1=Renormalize, 2=DeepSeekV3,
 #                      3=Llama4,   4=RenormalizeNaive, 5=TopK
-try:
-    T_moe, H_moe, I_moe, E_tot, E_loc, BS = 128, 7168, 2048, 256, 32, 128
-    routing_logits = torch.randn(T_moe, E_tot, dtype=torch.float32, device=device)
-    routing_bias = torch.zeros(E_tot, dtype=torch.bfloat16, device=device)
-    hs = torch.zeros(T_moe, H_moe, dtype=torch.float8_e4m3fn, device=device)
-    hs_scale = torch.ones(H_moe // BS, T_moe, dtype=torch.float32, device=device)
-    w1 = torch.zeros(E_loc, 2 * I_moe, H_moe, dtype=torch.float8_e4m3fn, device=device)
-    w1s = torch.ones(
-        E_loc, (2 * I_moe) // BS, H_moe // BS, dtype=torch.float32, device=device
-    )
-    w2 = torch.zeros(E_loc, H_moe, I_moe, dtype=torch.float8_e4m3fn, device=device)
-    w2s = torch.ones(
-        E_loc, H_moe // BS, I_moe // BS, dtype=torch.float32, device=device
-    )
-    _moe_common = dict(
-        num_experts=E_tot,
-        intermediate_size=I_moe,
-        local_expert_offset=0,
-        local_num_experts=E_loc,
-        routed_scaling_factor=2.5,
-    )
-    _moe_args = (routing_logits, routing_bias, hs, hs_scale, w1, w1s, w2, w2s)
+T_moe, H_moe, I_moe, E_tot, E_loc, BS = 128, 7168, 2048, 256, 32, 128
+routing_logits = torch.randn(T_moe, E_tot, dtype=torch.float32, device=device)
+routing_bias = torch.zeros(E_tot, dtype=torch.bfloat16, device=device)
+hs = torch.zeros(T_moe, H_moe, dtype=torch.float8_e4m3fn, device=device)
+hs_scale = torch.ones(H_moe // BS, T_moe, dtype=torch.float32, device=device)
+w1 = torch.zeros(E_loc, 2 * I_moe, H_moe, dtype=torch.float8_e4m3fn, device=device)
+w1s = torch.ones(
+    E_loc, (2 * I_moe) // BS, H_moe // BS, dtype=torch.float32, device=device
+)
+w2 = torch.zeros(E_loc, H_moe, I_moe, dtype=torch.float8_e4m3fn, device=device)
+w2s = torch.ones(E_loc, H_moe // BS, I_moe // BS, dtype=torch.float32, device=device)
+_moe_common = dict(
+    num_experts=E_tot,
+    intermediate_size=I_moe,
+    local_expert_offset=0,
+    local_num_experts=E_loc,
+    routed_scaling_factor=2.5,
+)
+_moe_args = (routing_logits, routing_bias, hs, hs_scale, w1, w1s, w2, w2s)
 
-    # 0: Default routing (TopK -> no normalisation)
+# Each routing type in its own try/except so a GPU-support failure on one
+# variant does not prevent the remaining traces from being dumped.
+
+# 0: Default routing (Softmax -> TopK)
+with contextlib.suppress(Exception):
     flashinfer.fused_moe.trtllm_fp8_block_scale_moe(
-        *_moe_args, top_k=8, routing_method_type=0, **_moe_common
+        *_moe_args,
+        top_k=8,
+        n_group=None,
+        topk_group=None,
+        routing_method_type=0,
+        **_moe_common,
     )
 
-    # 1: Renormalize routing (TopK -> Softmax)
+# 1: Renormalize routing (TopK -> Softmax)
+with contextlib.suppress(Exception):
     flashinfer.fused_moe.trtllm_fp8_block_scale_moe(
-        *_moe_args, top_k=8, routing_method_type=1, **_moe_common
+        *_moe_args,
+        top_k=8,
+        n_group=None,
+        topk_group=None,
+        routing_method_type=1,
+        **_moe_common,
     )
 
-    # 2: DeepSeekV3 routing (Sigmoid -> group selection -> top_k=8)
+# 2: DeepSeekV3 routing (Sigmoid -> group selection -> top_k=8)
+with contextlib.suppress(Exception):
     flashinfer.fused_moe.trtllm_fp8_block_scale_moe(
         *_moe_args,
         top_k=8,
@@ -338,22 +351,187 @@ try:
         **_moe_common,
     )
 
-    # 3: Llama4 routing (Top1 -> Sigmoid)
+# 3: Llama4 routing (Top1 -> Sigmoid)
+with contextlib.suppress(Exception):
     flashinfer.fused_moe.trtllm_fp8_block_scale_moe(
-        *_moe_args, top_k=1, routing_method_type=3, **_moe_common
+        *_moe_args,
+        top_k=1,
+        n_group=None,
+        topk_group=None,
+        routing_method_type=3,
+        **_moe_common,
     )
 
-    # 4: RenormalizeNaive routing (Softmax -> TopK -> Renormalize)
+# 4: RenormalizeNaive routing (Softmax -> TopK -> Renormalize)
+with contextlib.suppress(Exception):
     flashinfer.fused_moe.trtllm_fp8_block_scale_moe(
-        *_moe_args, top_k=8, routing_method_type=4, **_moe_common
+        *_moe_args,
+        top_k=8,
+        n_group=None,
+        topk_group=None,
+        routing_method_type=4,
+        **_moe_common,
     )
 
-    # 5: TopK routing (plain TopK, no normalisation)
+# 5: TopK routing (plain TopK, no normalisation)
+with contextlib.suppress(Exception):
     flashinfer.fused_moe.trtllm_fp8_block_scale_moe(
-        *_moe_args, top_k=8, routing_method_type=5, **_moe_common
+        *_moe_args,
+        top_k=8,
+        n_group=None,
+        topk_group=None,
+        routing_method_type=5,
+        **_moe_common,
+    )
+
+# ── MoE FP4 (NvFP4, 256 experts, 32 local, h=7168, i=2048) ──────────────────
+# routing_method_type: 0=Default, 1=Renormalize, 2=DeepSeekV3,
+#                      3=Llama4,   4=RenormalizeNaive, 5=TopK
+# NvFP4: block_size=16; hidden_states packed as [T, H//2] uint8,
+#        scale as [T, H//16] float8.
+try:
+    import flashinfer
+    from flashinfer import fp4_quantize
+
+    T_fp4, H_fp4, I_fp4, E_tot_fp4, E_loc_fp4 = 128, 7168, 2048, 256, 32
+    SF_VEC = 16
+
+    routing_logits_fp4 = torch.randn(
+        T_fp4, E_tot_fp4, dtype=torch.bfloat16, device=device
+    )
+    hs_bf16 = torch.randn(T_fp4, H_fp4, dtype=torch.bfloat16, device=device) * 0.1
+    hs_fp4, hs_fp4_scale = fp4_quantize(
+        hs_bf16,
+        torch.tensor([448.0 * 6.0], device=device),
+        sf_vec_size=SF_VEC,
+        sf_use_ue8m0=False,
+        is_sf_swizzled_layout=False,
+    )
+    hs_fp4_scale = hs_fp4_scale.view(torch.float8_e4m3fn).reshape(T_fp4, -1)
+
+    w13_bf16 = (
+        torch.randn(E_loc_fp4, 2 * I_fp4, H_fp4, dtype=torch.bfloat16, device=device)
+        * 0.1
+    )
+    w13_fp4, w13_fp4_scale = fp4_quantize(
+        w13_bf16,
+        torch.tensor([448.0 * 6.0], device=device),
+        sf_vec_size=SF_VEC,
+        sf_use_ue8m0=False,
+    )
+    w13_fp4_scale = w13_fp4_scale.view(torch.float8_e4m3fn).reshape(
+        E_loc_fp4, 2 * I_fp4, -1
+    )
+    w2_bf16 = (
+        torch.randn(E_loc_fp4, H_fp4, I_fp4, dtype=torch.bfloat16, device=device) * 0.1
+    )
+    w2_fp4, w2_fp4_scale = fp4_quantize(
+        w2_bf16,
+        torch.tensor([448.0 * 6.0], device=device),
+        sf_vec_size=SF_VEC,
+        sf_use_ue8m0=False,
+    )
+    w2_fp4_scale = w2_fp4_scale.view(torch.float8_e4m3fn).reshape(E_loc_fp4, H_fp4, -1)
+
+    scale_val = 1.0 / 448.0 / 6.0
+    out1_scale = torch.full((E_loc_fp4,), scale_val**2, device=device)
+    out1_gate_scale = torch.full((E_loc_fp4,), scale_val**2, device=device)
+    out2_scale = torch.full((E_loc_fp4,), scale_val**2, device=device)
+
+    _fp4_moe_common = dict(
+        num_experts=E_tot_fp4,
+        intermediate_size=I_fp4,
+        local_expert_offset=0,
+        local_num_experts=E_loc_fp4,
+        routed_scaling_factor=None,
+    )
+    _fp4_moe_args = (
+        routing_logits_fp4,
+        None,  # routing_bias
+        hs_fp4,
+        hs_fp4_scale,
+        w13_fp4,
+        w13_fp4_scale,
+        None,  # gemm1_bias
+        None,  # gemm1_alpha
+        None,  # gemm1_beta
+        None,  # gemm1_clamp_limit
+        w2_fp4,
+        w2_fp4_scale,
+        None,  # gemm2_bias
+        out1_scale,
+        out1_gate_scale,
+        out2_scale,
     )
 except Exception:
-    pass  # May require specific GPU/TRT-LLM support
+    _fp4_moe_args = None  # fp4_quantize unavailable
+
+if _fp4_moe_args is not None:
+    # 0: Default routing (Softmax -> TopK)
+    with contextlib.suppress(Exception):
+        flashinfer.fused_moe.trtllm_fp4_block_scale_moe(
+            *_fp4_moe_args,
+            top_k=8,
+            n_group=None,
+            topk_group=None,
+            routing_method_type=0,
+            **_fp4_moe_common,
+        )
+
+    # 1: Renormalize routing (TopK -> Softmax)
+    with contextlib.suppress(Exception):
+        flashinfer.fused_moe.trtllm_fp4_block_scale_moe(
+            *_fp4_moe_args,
+            top_k=8,
+            n_group=None,
+            topk_group=None,
+            routing_method_type=1,
+            **_fp4_moe_common,
+        )
+
+    # 2: DeepSeekV3 routing (Sigmoid -> group selection -> top_k=8)
+    with contextlib.suppress(Exception):
+        flashinfer.fused_moe.trtllm_fp4_block_scale_moe(
+            *_fp4_moe_args,
+            top_k=8,
+            n_group=8,
+            topk_group=4,
+            routing_method_type=2,
+            **_fp4_moe_common,
+        )
+
+    # 3: Llama4 routing (Top1 -> Sigmoid)
+    with contextlib.suppress(Exception):
+        flashinfer.fused_moe.trtllm_fp4_block_scale_moe(
+            *_fp4_moe_args,
+            top_k=1,
+            n_group=None,
+            topk_group=None,
+            routing_method_type=3,
+            **_fp4_moe_common,
+        )
+
+    # 4: RenormalizeNaive routing (Softmax -> TopK -> Renormalize)
+    with contextlib.suppress(Exception):
+        flashinfer.fused_moe.trtllm_fp4_block_scale_moe(
+            *_fp4_moe_args,
+            top_k=8,
+            n_group=None,
+            topk_group=None,
+            routing_method_type=4,
+            **_fp4_moe_common,
+        )
+
+    # 5: TopK routing (plain TopK, no normalisation)
+    with contextlib.suppress(Exception):
+        flashinfer.fused_moe.trtllm_fp4_block_scale_moe(
+            *_fp4_moe_args,
+            top_k=8,
+            n_group=None,
+            topk_group=None,
+            routing_method_type=5,
+            **_fp4_moe_common,
+        )
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 files = sorted(SAVE_DIR.glob("*.json"))

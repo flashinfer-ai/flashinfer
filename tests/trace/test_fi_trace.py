@@ -17,7 +17,6 @@ limitations under the License.
 """Tests for flashinfer.fi_trace: definition JSON generation."""
 
 import json
-import pytest
 import torch
 
 from flashinfer.fi_trace import fi_trace
