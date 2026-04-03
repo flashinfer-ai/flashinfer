@@ -884,10 +884,10 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, bool* v
       }
       sampled_id = temp_storage.last_valid_id;
     }
-    // float is safe here: pivot_0 is loaded from the probs array (always a normal
-    // float), *0.5f is exact (power-of-2, no division instruction), and the
-    // count-based break above provides a second termination path independent of
-    // float convergence.  See #769 / #774 for the FTZ context.
+    // float is safe here: pivot_0 is loaded from the probs array and *0.5f
+    // produces FMUL.FTZ, but both operands are probabilities in [0,1] so the
+    // result is always a normal float (FTZ never activates).  The count-based
+    // break above provides a second termination path.  See #769 / #774.
     float pivot_0 = probs[row_idx * d + sampled_id];
     float pivot_1 = (pivot_0 + high) * 0.5f;
 
@@ -1018,10 +1018,10 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, bool* v
       }
       sampled_id = temp_storage.last_valid_id;
     }
-    // float is safe here: pivot_0 is loaded from the probs array (always a normal
-    // float), *0.5f is exact (power-of-2, no division instruction), and the
-    // count-based break above provides a second termination path independent of
-    // float convergence.  See #769 / #774 for the FTZ context.
+    // float is safe here: pivot_0 is loaded from the probs array and *0.5f
+    // produces FMUL.FTZ, but both operands are probabilities in [0,1] so the
+    // result is always a normal float (FTZ never activates).  The count-based
+    // break above provides a second termination path.  See #769 / #774.
     float pivot_0 = probs[row_idx * d + sampled_id];
     float pivot_1 = (pivot_0 + high) * 0.5f;
 
@@ -1245,10 +1245,10 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
         return;
       }
     }
-    // float is safe here: pivot_0 is loaded from the probs array (always a normal
-    // float), *0.5f is exact (power-of-2, no division instruction), and the
-    // count-based break above provides a second termination path independent of
-    // float convergence.  See #769 / #774 for the FTZ context.
+    // float is safe here: pivot_0 is loaded from the probs array and *0.5f
+    // produces FMUL.FTZ, but both operands are probabilities in [0,1] so the
+    // result is always a normal float (FTZ never activates).  The count-based
+    // break above provides a second termination path.  See #769 / #774.
     float pivot_0 = probs[row_idx * d + sampled_id];
     float pivot_1 = (pivot_0 + high) * 0.5f;
 
