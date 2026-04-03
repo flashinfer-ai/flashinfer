@@ -670,8 +670,10 @@ def fused_rmsnorm_silu(
             )
     elif output_dtype_str == "nvfp4":
         expected_shape = (num_tokens, C // 2)
-        if C % 2 != 0:
-            raise ValueError(f"nvfp4 output requires even hidden size, got C={C}")
+        if C % 16 != 0:
+            raise ValueError(
+                f"nvfp4 output requires hidden_size divisible by 16, got C={C}"
+            )
         if tuple(out.shape) != expected_shape:
             raise ValueError(
                 f"out shape mismatch for nvfp4: expected {expected_shape}, got {tuple(out.shape)}"
@@ -722,7 +724,7 @@ def fused_rmsnorm_silu(
         scale_row_offset = ((scale_row_offset + 127) // 128) * 128
         scale_row_offset += 4  # fp8_scale
         scale_row_offset = ((scale_row_offset + 127) // 128) * 128
-        num_blocks = (C + 15) // 16
+        num_blocks = C // 16
         scale_row_bytes = num_tokens * num_blocks
         block_scale = workspace[scale_row_offset : scale_row_offset + scale_row_bytes]
         block_scale = block_scale.view(torch.float8_e4m3fn).reshape(
