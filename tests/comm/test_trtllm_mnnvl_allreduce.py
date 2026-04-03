@@ -475,6 +475,13 @@ def test_mnnvl_allreduce_legacy(
     monkeypatch, seq_lens: list[int], fusion: bool, dtype: torch.dtype, hidden_size: int
 ):
     """Test MNNVL AllReduce with legacy API."""
+    explicit_workspace_bytes = 3 * 2 * dtype.itemsize * hidden_size * max(seq_lens)
     run_mnnvl_ar_full(
-        monkeypatch, seq_lens, fusion, dtype, hidden_size, legacy_api=True
+        monkeypatch,
+        seq_lens,
+        fusion,
+        dtype,
+        hidden_size,
+        legacy_explicit_workspace_bytes=explicit_workspace_bytes,
+        legacy_api=True,
     )
