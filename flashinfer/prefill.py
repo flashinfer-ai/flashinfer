@@ -3648,7 +3648,7 @@ def trtllm_ragged_attention_deepseek(
     if out is None:
         # FP8 inputs produce bfloat16 output by default (TRT-LLM kernels
         # do not support FP8 output for ragged attention)
-        if query.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        if query.dtype in (torch.float8_e4m3fn, torch.float8_e5m2, torch.int8):
             out_dtype = torch.bfloat16
         else:
             out_dtype = query.dtype
