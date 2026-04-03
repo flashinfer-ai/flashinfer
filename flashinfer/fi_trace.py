@@ -101,7 +101,7 @@ def build_fi_trace_fn(spec: Any) -> Callable[..., Dict[str, Any]]:
         Use ``TraceTemplate.build_fi_trace_fn`` instead.
     """
     # Import the old implementation from the trace package for backwards compat.
-    from .trace.template import (  # noqa: PLC0415
+    from .trace.template import (  # noqa: PLC0415,F401
         Const,
         Scalar,
         Tensor,

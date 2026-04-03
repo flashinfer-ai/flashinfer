@@ -1505,7 +1505,7 @@ def _attach_fi_trace(
                         save_dir=save_dir, name=name, **kwargs
                     )
 
-            wrapped.fi_trace = fi_trace_fn
+            wrapped.fi_trace = fi_trace_fn  # type: ignore[attr-defined]
 
             # Auto-dump wrapper: checked lazily at call time so that callers
             # can set FLASHINFER_TRACE_DUMP after importing flashinfer (e.g.
@@ -1527,7 +1527,7 @@ def _attach_fi_trace(
                         pass
                 return _inner(*args, **kwargs)
 
-            _auto_dump_wrapper.fi_trace = fi_trace_fn
+            _auto_dump_wrapper.fi_trace = fi_trace_fn  # type: ignore[attr-defined]
             return _auto_dump_wrapper
         else:
             # Legacy registry lookup (kept for backwards compatibility).
@@ -1536,7 +1536,7 @@ def _attach_fi_trace(
             qualname = getattr(original, "__qualname__", "")
             spec = _REGISTRY.get(qualname)
             if spec is not None:
-                wrapped.fi_trace = build_fi_trace_fn(spec)
+                wrapped.fi_trace = build_fi_trace_fn(spec)  # type: ignore[attr-defined]
     except Exception as _exc:
         # Warn instead of silently swallowing: a broken trace template should
         # be visible to the developer during import, not discovered later as a

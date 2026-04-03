@@ -352,7 +352,6 @@ def _mla_paged_decode_reference(
     q_nope, q_pe, ckv_cache, kpe_cache, kv_indptr, kv_indices, sm_scale
 ):
     batch_size, num_qo_heads, head_dim_ckv = q_nope.shape
-    len_indptr = kv_indptr.shape[0]
 
     Kc_all = ckv_cache.squeeze(1).to(torch.float32)  # [num_pages, head_dim_ckv]
     Kp_all = kpe_cache.squeeze(1).to(torch.float32)  # [num_pages, head_dim_kpe]
@@ -611,7 +610,6 @@ def _dsa_paged_reference(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_
     """
     num_tokens, num_qo_heads, head_dim_ckv = q_nope.shape
     head_dim_kpe = q_pe.shape[-1]
-    page_size = ckv_cache.shape[1]
     device = q_nope.device
 
     # Squeeze page dimension when page_size=1; otherwise flatten pages.
