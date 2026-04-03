@@ -18,21 +18,20 @@ limitations under the License.
 GDN Decode Benchmark
 
 This benchmark supports:
-1. All layouts comparison (default for decode): FlashInfer/Triton x pretranspose/nontranspose + gdn_decode_klast_bf16_state
+1. All layouts comparison (default for decode): FlashInfer/Triton x pretranspose/nontranspose + bf16_state
 2. Single layout comparison: FlashInfer (CuTe DSL) vs Triton kernel (--compare)
 3. MTP benchmark (--version mtp)
-4. gdn_decode_klast_bf16_state benchmark (--version gdn_decode_klast_bf16_state) for T=1,2,3,4
+4. BF16 state benchmark (--version bf16_state) for T=1 and MTP T>=1
 
 Kernels benchmarked:
 - FlashInfer Pretranspose [B, HV, V, K] (V-major layout)
 - FlashInfer Nontranspose [B, HV, K, V] (K-major layout)
 - Triton Pretranspose [B, HV, V, K]
 - Triton Nontranspose [B, HV, K, V]
-- gdn_decode_klast_bf16_state [B, HV, V, K] (K-fast layout, T=1..4, bf16 state)
-  from flashinfer.cute_dsl.gated_delta_rule
+- BF16 State [B, HV, V, K] (K-fast layout, bf16 state, T=1 + MTP)
 
 Usage:
-    # Default: All layouts comparison (FlashInfer/Triton x pretranspose/nontranspose + gdn_decode_klast_bf16_state)
+    # Default: All layouts comparison
     python benchmarks/bench_gdn_decode.py --batch-size 1 4 8 16 32 64 128 256 512
 
     # Single layout comparison: FlashInfer vs Triton
@@ -44,8 +43,8 @@ Usage:
     # MTP comparison: FlashInfer vs Triton
     python benchmarks/bench_gdn_decode.py --version mtp --compare --batch-size 1 32 128
 
-    # gdn_decode_klast_bf16_state benchmark (T=1,2,3,4)
-    python benchmarks/bench_gdn_decode.py --version gdn_decode_klast_bf16_state --batch-size 1 32 128 512
+    # BF16 state benchmark (T=1 and MTP)
+    python benchmarks/bench_gdn_decode.py --version bf16_state --batch-size 1 32 128 512
 
     # Use Qwen3-Next preset (q=k=16, v=32, d=128)
     python benchmarks/bench_gdn_decode.py --preset qwen3-next --batch-size 1 32 128 512
@@ -62,15 +61,16 @@ from flashinfer.gdn_decode import (
 )
 from flashinfer.testing import bench_gpu_time
 
-# Import the gdn_decode_klast_bf16_state kernel for benchmarking (T=1..4, bf16 state, K-last)
+# Import BF16 state kernels for benchmarking
 try:
     from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
-        gated_delta_rule as gdn_decode_klast_bf16_state,
+        gated_delta_rule as gdn_decode_bf16_state,
+        gated_delta_rule_mtp as gdn_decode_bf16_state_mtp,
     )
 
-    GDN_DECODE_KLAST_BF16_STATE_AVAILABLE = True
+    GDN_DECODE_BF16_STATE_AVAILABLE = True
 except ImportError:
-    GDN_DECODE_KLAST_BF16_STATE_AVAILABLE = False
+    GDN_DECODE_BF16_STATE_AVAILABLE = False
 
 # ============================================================================
 # Utility Functions
@@ -1832,8 +1832,8 @@ def verify_correctness_pretranspose(
 # ============================================================================
 
 
-def gdn_decode_klast_bf16_state_wrapper(
-    q: torch.Tensor,  # [B, T, H_Q, K] where T=1,2,3,4
+def gdn_decode_bf16_state_wrapper(
+    q: torch.Tensor,  # [B, T, H_Q, K]
     k: torch.Tensor,  # [B, T, H_K, K]
     v: torch.Tensor,  # [B, T, HV, V]
     state: torch.Tensor,  # [B, HV, V, K] - K-last layout (pretranspose)
@@ -1846,33 +1846,56 @@ def gdn_decode_klast_bf16_state_wrapper(
     use_qk_l2norm: bool = True,
     softplus_beta: float = 1.0,
     softplus_threshold: float = 20.0,
+    intermediate_states_buffer=None,
+    disable_state_update: bool = False,
+    initial_state_indices=None,
 ):
     """
-    Wrapper for gdn_decode_klast_bf16_state GDN kernel.
-    Supports T=1,2,3,4 (sequence lengths up to 4).
+    Wrapper for gdn_decode_bf16_state GDN kernel.
+    Supports T=1 (calls gated_delta_rule) and T>1 (calls gated_delta_rule_mtp).
     Adapts the interface to match the benchmark's calling convention.
 
     Note: The kernel returns output directly, no copy needed.
     """
-    if not GDN_DECODE_KLAST_BF16_STATE_AVAILABLE:
-        raise RuntimeError("gdn_decode_klast_bf16_state kernel is not available")
+    if not GDN_DECODE_BF16_STATE_AVAILABLE:
+        raise RuntimeError("gdn_decode_bf16_state kernel is not available")
 
-    # Call gdn_decode_klast_bf16_state kernel directly - no wrapper overhead
-    # Kernel modifies state in-place and returns output tensor
-    return gdn_decode_klast_bf16_state(
-        A_log=A_log,
-        a=a,
-        dt_bias=dt_bias,
-        softplus_beta=softplus_beta,
-        softplus_threshold=softplus_threshold,
-        q=q,
-        k=k,
-        v=v,
-        b=b,
-        initial_state_source=state,
-        use_qk_l2norm_in_kernel=use_qk_l2norm,
-        scale=scale,
-    )
+    # Dispatch to T=1 or MTP kernel
+    T = q.shape[1]
+    if T == 1:
+        return gdn_decode_bf16_state(
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            softplus_beta=softplus_beta,
+            softplus_threshold=softplus_threshold,
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            initial_state_source=state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm,
+            scale=scale,
+        )
+    else:
+        return gdn_decode_bf16_state_mtp(
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            softplus_beta=softplus_beta,
+            softplus_threshold=softplus_threshold,
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            initial_state_source=state,
+            initial_state_indices=initial_state_indices,
+            intermediate_states_buffer=intermediate_states_buffer,
+            disable_state_update=disable_state_update,
+            use_qk_l2norm_in_kernel=use_qk_l2norm,
+            scale=scale,
+            output=output,
+        )
 
 
 def format_time(t):
@@ -2030,15 +2053,15 @@ def bench_all_layouts(
         results["tr_pretrans_us"] = None
         results["tr_nontrans_us"] = None
 
-    # ========== gdn_decode_klast_bf16_state Kernel (K-fast/pretranspose layout) ==========
-    if GDN_DECODE_KLAST_BF16_STATE_AVAILABLE:
-        # gdn_decode_klast_bf16_state uses [B, HV, V, K] layout (K-fast, same as pretranspose)
+    # ========== gdn_decode_bf16_state Kernel (K-fast/pretranspose layout) ==========
+    if GDN_DECODE_BF16_STATE_AVAILABLE:
+        # gdn_decode_bf16_state uses [B, HV, V, K] layout (K-fast, same as pretranspose)
         state = torch.randn(
             batch_size,
             num_sab_heads,
             head_size,
             head_size,
-            dtype=torch.bfloat16,  # gdn_decode_klast_bf16_state uses BF16 state
+            dtype=torch.bfloat16,  # gdn_decode_bf16_state uses BF16 state
             device="cuda",
         )
         output = torch.empty(
@@ -2047,21 +2070,19 @@ def bench_all_layouts(
 
         try:
             times = bench_gpu_time(
-                lambda: gdn_decode_klast_bf16_state_wrapper(
+                lambda: gdn_decode_bf16_state_wrapper(
                     q, k, v, state, A_log, a, dt_bias, b, scale, output, use_qk_l2norm
                 ),
                 enable_cupti=True,
                 dry_run_iters=warmup_iters,
                 repeat_iters=bench_iters,
             )
-            results["gdn_decode_klast_bf16_state_us"] = np.median(times) * 1000
+            results["gdn_decode_bf16_state_us"] = np.median(times) * 1000
         except Exception as e:
-            results["gdn_decode_klast_bf16_state_us"] = None
-            print(
-                f"  gdn_decode_klast_bf16_state kernel failed: {type(e).__name__}: {e}"
-            )
+            results["gdn_decode_bf16_state_us"] = None
+            print(f"  gdn_decode_bf16_state kernel failed: {type(e).__name__}: {e}")
     else:
-        results["gdn_decode_klast_bf16_state_us"] = None
+        results["gdn_decode_bf16_state_us"] = None
 
     return results
 
@@ -2104,9 +2125,7 @@ def run_all_layouts_benchmark(args, dtype, use_qk_l2norm):
         print()
 
     print("\n" + "=" * 160)
-    print(
-        "GDN Decode Benchmark (T=1): FlashInfer vs Triton vs gdn_decode_klast_bf16_state"
-    )
+    print("GDN Decode Benchmark (T=1): FlashInfer vs Triton vs gdn_decode_bf16_state")
     print(
         f"Config: q_heads={args.num_q_heads}, k_heads={args.num_k_heads}, "
         f"v_heads={args.num_v_heads}, head_size={args.head_size}, "
@@ -2115,8 +2134,8 @@ def run_all_layouts_benchmark(args, dtype, use_qk_l2norm):
     print("=" * 160)
     print()
     print(
-        f"{'batch':>6} | {'FI-PreTr':>8} {'FI-NonTr':>8} | {'TR-PreTr':>8} {'TR-NonTr':>8} | {'KlastBf16':>9} | "
-        f"{'FI/TR-Pre':>9} {'KlastBf16/FI':>11} {'KlastBf16/TR':>11}"
+        f"{'batch':>6} | {'FI-PreTr':>8} {'FI-NonTr':>8} | {'TR-PreTr':>8} {'TR-NonTr':>8} | {'Bf16State':>9} | "
+        f"{'FI/TR-Pre':>9} {'Bf16State/FI':>11} {'Bf16State/TR':>11}"
     )
     print(
         f"{'':>6} | {'(us)':>8} {'(us)':>8} | {'(us)':>8} {'(us)':>8} | {'(us)':>8} | "
@@ -2143,21 +2162,21 @@ def run_all_layouts_benchmark(args, dtype, use_qk_l2norm):
         fi_non = result.get("fi_nontrans_us")
         tr_pre = result.get("tr_pretrans_us")
         tr_non = result.get("tr_nontrans_us")
-        klast_bf16_us = result.get("gdn_decode_klast_bf16_state_us")
+        bf16_state_us = result.get("gdn_decode_bf16_state_us")
 
         # FI/TR speedup (>1 means FI faster)
         fi_tr_pre = format_speedup(fi_pre, tr_pre)
 
-        # gdn_decode_klast_bf16_state vs FI-PreTr speedup (>1 means klast_bf16 faster)
-        klast_bf16_fi_speedup = format_speedup(klast_bf16_us, fi_pre)
+        # BF16 state vs FI-PreTr speedup (>1 means BF16 state faster)
+        bf16_fi_speedup = format_speedup(bf16_state_us, fi_pre)
 
-        # gdn_decode_klast_bf16_state vs TR-PreTr speedup (>1 means klast_bf16 faster)
-        klast_bf16_tr_speedup = format_speedup(klast_bf16_us, tr_pre)
+        # BF16 state vs TR-PreTr speedup (>1 means BF16 state faster)
+        bf16_tr_speedup = format_speedup(bf16_state_us, tr_pre)
 
         print(
             f"{batch_size:>6} | {format_time(fi_pre)} {format_time(fi_non)} | "
-            f"{format_time(tr_pre)} {format_time(tr_non)} | {format_time(klast_bf16_us)} | "
-            f"{fi_tr_pre} {klast_bf16_fi_speedup:>10} {klast_bf16_tr_speedup:>10}"
+            f"{format_time(tr_pre)} {format_time(tr_non)} | {format_time(bf16_state_us)} | "
+            f"{fi_tr_pre} {bf16_fi_speedup:>10} {bf16_tr_speedup:>10}"
         )
 
     print("-" * 160)
@@ -2167,25 +2186,23 @@ def run_all_layouts_benchmark(args, dtype, use_qk_l2norm):
     print("  FI-NonTr  = FlashInfer Nontranspose [B, HV, K, V]")
     print("  TR-PreTr  = Triton Pretranspose [B, HV, V, K]")
     print("  TR-NonTr  = Triton Nontranspose [B, HV, K, V]")
-    print(
-        "  KlastBf16 = gdn_decode_klast_bf16_state [B, HV, V, K] (K-fast layout, T=1..4, bf16 state)"
-    )
+    print("  Bf16State = BF16 state kernel [B, HV, V, K] (bf16 state, T=1 + MTP)")
     print("  FI/TR speedup > 1.0 means FlashInfer is faster than Triton")
     print(
-        "  KlastBf16/FI speedup > 1.0 means gdn_decode_klast_bf16_state is faster than FlashInfer Pretranspose"
+        "  Bf16State/FI speedup > 1.0 means BF16 state is faster than FlashInfer Pretranspose"
     )
     print(
-        "  KlastBf16/TR speedup > 1.0 means gdn_decode_klast_bf16_state is faster than Triton Pretranspose"
+        "  Bf16State/TR speedup > 1.0 means BF16 state is faster than Triton Pretranspose"
     )
     print()
 
     # Summary statistics
     fi_pre_times = [r["fi_pretrans_us"] for r in all_results if r.get("fi_pretrans_us")]
     tr_pre_times = [r["tr_pretrans_us"] for r in all_results if r.get("tr_pretrans_us")]
-    klast_bf16_times = [
-        r["gdn_decode_klast_bf16_state_us"]
+    bf16_state_times = [
+        r["gdn_decode_bf16_state_us"]
         for r in all_results
-        if r.get("gdn_decode_klast_bf16_state_us")
+        if r.get("gdn_decode_bf16_state_us")
     ]
 
     if fi_pre_times and tr_pre_times:
@@ -2194,47 +2211,47 @@ def run_all_layouts_benchmark(args, dtype, use_qk_l2norm):
             f"FlashInfer vs Triton (Pretranspose) - Average speedup: {np.mean(speedups):.2f}x"
         )
 
-    if klast_bf16_times and fi_pre_times and len(klast_bf16_times) == len(fi_pre_times):
+    if bf16_state_times and fi_pre_times and len(bf16_state_times) == len(fi_pre_times):
         speedups = [
-            fi / t for t, fi in zip(klast_bf16_times, fi_pre_times, strict=False)
+            fi / t for t, fi in zip(bf16_state_times, fi_pre_times, strict=False)
         ]
         print(
-            f"gdn_decode_klast_bf16_state vs FlashInfer (Pretranspose) - Average speedup: {np.mean(speedups):.2f}x"
+            f"BF16 state vs FlashInfer (Pretranspose) - Average speedup: {np.mean(speedups):.2f}x"
         )
 
-    if klast_bf16_times and tr_pre_times and len(klast_bf16_times) == len(tr_pre_times):
+    if bf16_state_times and tr_pre_times and len(bf16_state_times) == len(tr_pre_times):
         speedups = [
-            tr / t for t, tr in zip(klast_bf16_times, tr_pre_times, strict=False)
+            tr / t for t, tr in zip(bf16_state_times, tr_pre_times, strict=False)
         ]
         print(
-            f"gdn_decode_klast_bf16_state vs Triton (Pretranspose) - Average speedup: {np.mean(speedups):.2f}x"
+            f"BF16 state vs Triton (Pretranspose) - Average speedup: {np.mean(speedups):.2f}x"
         )
 
 
 # ============================================================================
-# gdn_decode_klast_bf16_state Multi-Token Benchmark (T=1,2,3,4)
+# BF16 State Multi-Token Benchmark
 # ============================================================================
 
 
-def bench_gdn_decode_klast_bf16_state(
+def bench_gdn_decode_bf16_state(
     batch_size: int,
-    seq_len: int,  # T=1,2,3,4
+    seq_len: int,
     num_q_heads: int,
     num_k_heads: int,
     num_v_heads: int,
     head_size: int,
     dtype: torch.dtype,
     use_qk_l2norm: bool = True,
+    cache_intermediate_states: bool = False,
+    disable_state_update: bool = False,
     warmup_iters: int = 10,
     bench_iters: int = 100,
 ):
-    """Benchmark gdn_decode_klast_bf16_state kernel for T=1,2,3,4."""
-    if not GDN_DECODE_KLAST_BF16_STATE_AVAILABLE:
-        raise RuntimeError("gdn_decode_klast_bf16_state kernel is not available")
+    """Benchmark BF16 state kernel."""
+    if not GDN_DECODE_BF16_STATE_AVAILABLE:
+        raise RuntimeError("gdn_decode_bf16_state kernel is not available")
 
-    assert seq_len in [1, 2, 3, 4], (
-        f"gdn_decode_klast_bf16_state supports T=1,2,3,4, got T={seq_len}"
-    )
+    assert seq_len >= 1, f"seq_len must be >= 1, got T={seq_len}"
 
     num_o_heads = max(num_q_heads, num_v_heads)
     num_sab_heads = num_o_heads
@@ -2261,18 +2278,45 @@ def bench_gdn_decode_klast_bf16_state(
         device="cuda",
     )
 
-    # Pre-allocate output
+    # Intermediate states buffer (MTP only, when caching is enabled)
+    intermediate_states_buffer = None
+    if cache_intermediate_states and T > 1:
+        intermediate_states_buffer = torch.zeros(
+            batch_size,
+            T,
+            num_sab_heads,
+            head_size,
+            head_size,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+
+    # Pre-allocate output and state indices (avoid per-call torch.arange overhead in CUPTI)
     output = torch.empty(
         batch_size, T, num_o_heads, head_size, dtype=dtype, device="cuda"
     )
+    initial_state_indices = torch.arange(batch_size, dtype=torch.int32, device="cuda")
 
     # Scale factor
     scale = 1.0 / (head_size**0.5)
 
     # Benchmark with bench_gpu_time (CUPTI for accurate kernel timing)
     kernel_times_ms = bench_gpu_time(
-        lambda: gdn_decode_klast_bf16_state_wrapper(
-            q, k, v, state, A_log, a, dt_bias, b, scale, output, use_qk_l2norm
+        lambda: gdn_decode_bf16_state_wrapper(
+            q,
+            k,
+            v,
+            state,
+            A_log,
+            a,
+            dt_bias,
+            b,
+            scale,
+            output,
+            use_qk_l2norm,
+            intermediate_states_buffer=intermediate_states_buffer,
+            disable_state_update=disable_state_update,
+            initial_state_indices=initial_state_indices,
         ),
         enable_cupti=True,
         dry_run_iters=warmup_iters,
@@ -2284,7 +2328,7 @@ def bench_gdn_decode_klast_bf16_state(
     flops = gdn_decode_flops(
         batch_size, num_q_heads, num_k_heads, num_v_heads, head_size, seq_len
     )
-    # gdn_decode_klast_bf16_state uses BF16 state (2 bytes), not FP32 (4 bytes)
+    # gdn_decode_bf16_state uses BF16 state (2 bytes), not FP32 (4 bytes)
     bytes_accessed = gdn_decode_bytes(
         batch_size,
         num_q_heads,
@@ -2293,8 +2337,8 @@ def bench_gdn_decode_klast_bf16_state(
         head_size,
         dtype,
         seq_len,
-        disable_state_update=False,
-        state_dtype_bytes=2,  # BF16 state for gdn_decode_klast_bf16_state
+        disable_state_update=disable_state_update,
+        state_dtype_bytes=2,  # BF16 state for gdn_decode_bf16_state
     )
 
     kernel_tflops = flops / kernel_median_ms / 1e9 if kernel_median_ms > 0 else 0
@@ -2311,25 +2355,29 @@ def bench_gdn_decode_klast_bf16_state(
     }
 
 
-def run_gdn_decode_klast_bf16_state_benchmark(args, dtype, use_qk_l2norm):
-    """Run gdn_decode_klast_bf16_state benchmark for T=1,2,3,4."""
-    if not GDN_DECODE_KLAST_BF16_STATE_AVAILABLE:
-        print("Error: gdn_decode_klast_bf16_state kernel is not available.")
-        print("Make sure flashinfer.cute_dsl.gated_delta_rule is importable.")
+def run_gdn_decode_bf16_state_benchmark(args, dtype, use_qk_l2norm):
+    """Run BF16 state benchmark for T=1 and MTP T>=1."""
+    if not GDN_DECODE_BF16_STATE_AVAILABLE:
+        print("Error: BF16 state kernel is not available.")
+        print("Make sure flashinfer.gdn_kernels.gdn_decode_bf16_state is importable.")
         return
 
-    # Filter seq_len to only valid values (1,2,3,4)
-    valid_seq_lens = [t for t in args.seq_len if t in [1, 2, 3, 4]]
+    valid_seq_lens = [t for t in args.seq_len if t >= 1]
     if not valid_seq_lens:
-        print("Error: --seq-len must include values from [1, 2, 3, 4]")
+        print("Error: --seq-len must include values >= 1")
         return
+
+    cache_intermediate = getattr(args, "cache_intermediate_states", False)
+    disable_state_update = not getattr(args, "update_state", False)
 
     print("\n" + "=" * 100)
-    print(f"gdn_decode_klast_bf16_state GDN Benchmark (T={valid_seq_lens})")
+    print(f"BF16 State GDN Benchmark (T={valid_seq_lens})")
     print(
         f"Config: q_heads={args.num_q_heads}, k_heads={args.num_k_heads}, "
         f"v_heads={args.num_v_heads}, head_size={args.head_size}, "
-        f"dtype={args.dtype}, qk_l2norm={'ON' if use_qk_l2norm else 'OFF'}"
+        f"dtype={args.dtype}, qk_l2norm={'ON' if use_qk_l2norm else 'OFF'}, "
+        f"cache_intermediate={'ON' if cache_intermediate else 'OFF'}, "
+        f"update_state={'ON' if not disable_state_update else 'OFF'}"
     )
     print("=" * 100)
     print()
@@ -2340,7 +2388,7 @@ def run_gdn_decode_klast_bf16_state_benchmark(args, dtype, use_qk_l2norm):
     for batch_size in args.batch_size:
         for seq_len in valid_seq_lens:
             try:
-                result = bench_gdn_decode_klast_bf16_state(
+                result = bench_gdn_decode_bf16_state(
                     batch_size=batch_size,
                     seq_len=seq_len,
                     num_q_heads=args.num_q_heads,
@@ -2349,6 +2397,8 @@ def run_gdn_decode_klast_bf16_state_benchmark(args, dtype, use_qk_l2norm):
                     head_size=args.head_size,
                     dtype=dtype,
                     use_qk_l2norm=use_qk_l2norm,
+                    cache_intermediate_states=cache_intermediate,
+                    disable_state_update=disable_state_update,
                     warmup_iters=args.warmup,
                     bench_iters=args.iters,
                 )
@@ -2684,8 +2734,8 @@ Examples:
   # MTP comparison: FlashInfer vs Triton
   python benchmarks/bench_gdn_decode.py --version mtp --compare --batch-size 1 32 128
 
-  # gdn_decode_klast_bf16_state benchmark (T=1,2,3,4)
-  python benchmarks/bench_gdn_decode.py --version gdn_decode_klast_bf16_state --batch-size 1 32 128 512
+  # BF16 state benchmark (T=1 and MTP)
+  python benchmarks/bench_gdn_decode.py --version bf16_state --batch-size 1 32 128 512
 """,
     )
     parser.add_argument(
@@ -2721,18 +2771,18 @@ Examples:
             "pretranspose",
             "nontranspose",
             "mtp",
-            "gdn_decode_klast_bf16_state",
+            "bf16_state",
             "all",
         ],
         default="nontranspose",
-        help="Kernel version: pretranspose (V-major state), nontranspose (K-major state), mtp (Multiple Token Processing), gdn_decode_klast_bf16_state (T=1..4, bf16 state, K-last), or all",
+        help="Kernel version: pretranspose, nontranspose, mtp, bf16_state, or all",
     )
     parser.add_argument(
         "--seq-len",
         type=int,
         nargs="+",
         default=[1, 2, 3, 4],
-        help="Sequence lengths: for MTP use T>1, for gdn_decode_klast_bf16_state use T=1,2,3,4",
+        help="Sequence lengths: for MTP use T>1, for bf16_state use any T>=1",
     )
     parser.add_argument(
         "--cache-intermediate-states",
@@ -2792,11 +2842,11 @@ Examples:
             run_comparison_benchmark(args, dtype, use_qk_l2norm)
         else:
             run_flashinfer_only_benchmark(args, dtype, use_qk_l2norm)
-    elif args.version == "gdn_decode_klast_bf16_state":
-        # gdn_decode_klast_bf16_state benchmark for T=1,2,3,4
-        run_gdn_decode_klast_bf16_state_benchmark(args, dtype, use_qk_l2norm)
+    elif args.version == "bf16_state":
+        # BF16 state benchmark: T=1 and MTP T>=2 vs FP32 MTP
+        run_gdn_decode_bf16_state_benchmark(args, dtype, use_qk_l2norm)
     else:
-        # Non-MTP: always run all layouts comparison (FlashInfer/Triton x pretranspose/nontranspose + gdn_decode_klast_bf16_state)
+        # Non-MTP: always run all layouts comparison (FlashInfer/Triton x pretranspose/nontranspose + gdn_decode_bf16_state)
         run_all_layouts_benchmark(args, dtype, use_qk_l2norm)
 
 

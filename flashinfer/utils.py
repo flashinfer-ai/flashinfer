@@ -840,16 +840,14 @@ def get_shuffle_matrix_a_row_indices(
     # row_indices[new_row] = old_row
     # so row_indices is an array of size M telling us from which old_row
     # the new_row should be taken.
+    # Vectorized: avoids a slow Python for-loop over M rows (CPU contention
+    # when many ranks call this simultaneously on large weight matrices).
+    old_rows = torch.arange(M, dtype=torch.long)
+    row_map_tensor = torch.tensor(row_map, dtype=torch.long)
+    mapped_rows = row_map_tensor[old_rows % shuffle_block_size]
+    new_rows = (old_rows // shuffle_block_size) * shuffle_block_size + mapped_rows
     row_indices = torch.empty(M, dtype=torch.long)
-
-    for old_row in range(M):
-        block_idx = old_row // shuffle_block_size
-        row_in_block = old_row % shuffle_block_size
-        mapped_row_in_block = row_map[row_in_block]
-
-        new_row = block_idx * shuffle_block_size + mapped_row_in_block
-
-        row_indices[new_row] = old_row
+    row_indices[new_rows] = old_rows
 
     return row_indices
 

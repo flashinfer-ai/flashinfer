@@ -39,9 +39,19 @@ INV_FLOAT8_E4M3_MAX = 1.0 / 448.0
 
 # Thread organization constants
 WARP_SIZE = 32
-ELTS_PER_THREAD = 8  # Each thread handles 8 FP16 elements (128 bits)
-THREADS_PER_SF = SF_VEC_SIZE // ELTS_PER_THREAD  # 32 / 8 = 4 threads per SF block
-SF_BLOCKS_PER_WARP = WARP_SIZE // THREADS_PER_SF  # 32 / 4 = 8 SF blocks per warp
+
+# Default: optimized 2-thread-per-SF configuration for large problems
+ELTS_PER_THREAD = 16  # Each thread handles 16 FP16 elements (2 × 128-bit loads)
+THREADS_PER_SF = SF_VEC_SIZE // ELTS_PER_THREAD  # 32 / 16 = 2 threads per SF block
+SF_BLOCKS_PER_WARP = WARP_SIZE // THREADS_PER_SF  # 32 / 2 = 16 SF blocks per warp
+
+# Legacy: 4-thread-per-SF configuration for small problems (better grid occupancy)
+ELTS_PER_THREAD_SMALL = 8
+THREADS_PER_SF_SMALL = SF_VEC_SIZE // ELTS_PER_THREAD_SMALL  # 32 / 8 = 4
+SF_BLOCKS_PER_WARP_SMALL = WARP_SIZE // THREADS_PER_SF_SMALL  # 32 / 4 = 8
+
+# Threshold: use 2T/SF when total_sf_blocks >= this value (M*K >= 2M elements)
+MXFP8_2T_SF_THRESHOLD = 65536
 
 # Row tiling for swizzled layout (128x4 pattern)
 ROW_TILE_SIZE = 128
@@ -187,9 +197,10 @@ def float_to_ue8m0_fast(value: Float32, *, loc=None, ip=None) -> Uint32:
 @dsl_user_op
 def ue8m0_to_inv_scale_fast(ue8m0_val: Uint32, *, loc=None, ip=None) -> Float32:
     """
-    Convert UE8M0 to inverse scale using fast ex2.approx.
+    Convert UE8M0 to inverse scale using integer bit construction.
 
-    Inverse scale = 2^(127 - ue8m0)
+    Constructs a float32 with exponent = (254 - ue8m0) and zero mantissa,
+    which is exactly 2^(127 - ue8m0). No SFU dependency.
     Returns 0 for ue8m0 == 0.
     """
     return Float32(
@@ -198,15 +209,16 @@ def ue8m0_to_inv_scale_fast(ue8m0_val: Uint32, *, loc=None, ip=None) -> Float32:
             [Uint32(ue8m0_val).ir_value(loc=loc, ip=ip)],
             """
             {
+                .reg .s32 new_exp;
+                .reg .b32 float_bits;
                 .reg .pred p_zero;
-                .reg .s32 neg_exp;
-                .reg .f32 neg_exp_f, result;
 
                 setp.eq.u32 p_zero, $1, 0;
-                sub.s32 neg_exp, 127, $1;
-                cvt.rn.f32.s32 neg_exp_f, neg_exp;
-                ex2.approx.f32 result, neg_exp_f;
-                selp.f32 $0, 0f00000000, result, p_zero;
+                sub.s32 new_exp, 254, $1;
+                max.s32 new_exp, new_exp, 0;
+                shl.b32 float_bits, new_exp, 23;
+                mov.b32 $0, float_bits;
+                @p_zero mov.b32 $0, 0;
             }
             """,
             "=f,r",
@@ -481,8 +493,21 @@ def shuffle_xor_f32(val: Float32, offset: int) -> Float32:
 
 
 @cute.jit
+def reduce_max_2threads(val: Float32) -> Float32:
+    """Reduce max across 2 consecutive threads using 1 XOR shuffle."""
+    from ..cute_dsl.fp4_common import fmax_f32
+
+    other = shuffle_xor_f32(val, 1)
+    val = fmax_f32(val, other)
+    return val
+
+
+@cute.jit
 def reduce_max_4threads(val: Float32) -> Float32:
-    """Reduce max across 4 consecutive threads using 2 XOR shuffles."""
+    """Reduce max across 4 consecutive threads using 2 XOR shuffles.
+
+    Kept for backward compatibility with MXFP4 kernels.
+    """
     from ..cute_dsl.fp4_common import fmax_f32
 
     other = shuffle_xor_f32(val, 1)
@@ -1388,6 +1413,10 @@ __all__ = [
     "ELTS_PER_THREAD",
     "THREADS_PER_SF",
     "SF_BLOCKS_PER_WARP",
+    "ELTS_PER_THREAD_SMALL",
+    "THREADS_PER_SF_SMALL",
+    "SF_BLOCKS_PER_WARP_SMALL",
+    "MXFP8_2T_SF_THRESHOLD",
     "ROW_TILE_SIZE",
     # MXFP4 Constants
     "MXFP4_SF_VEC_SIZE",
@@ -1399,6 +1428,7 @@ __all__ = [
     "bfloat2_hmax_reduce_to_f32",
     "float_to_ue8m0_fast",
     "ue8m0_to_inv_scale_fast",
+    "reduce_max_2threads",
     "reduce_max_4threads",
     "compute_sf_index_swizzled_128x4_gpu",
     "compute_sf_index_swizzled_8x4_gpu",

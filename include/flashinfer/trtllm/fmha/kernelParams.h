@@ -407,7 +407,13 @@ struct KernelParams {
     return std::make_tuple(strideKeysVals, strideHeads, strideBatch);
   }
 
-  // Create the TMA shape/stride for K.
+  // Create the TMA shape/stride for K/V data tensors.
+  //
+  // Layout requirement (HND): [num_pages, num_kv_heads, page_size, head_dim]
+  //   - head_dim (last dim) MUST have stride 1. This is a TMA hardware constraint:
+  //     cuTensorMapEncodeTiled does not accept a stride for dim 0 and implicitly assumes 1.
+  //   - Other dimensions (heads, batch/pages) can have arbitrary strides; the actual
+  //     strides are read from the tensor and passed to the TMA descriptor.
   template <class FmhaOptions>
   static auto makeTmaShapeStrideKv(FmhaOptions const& options, KernelParams const& params,
                                    Data_type dtypeKv, bool isK, bool storeTransformedKvInTmem) {
@@ -446,14 +452,23 @@ struct KernelParams {
     return std::make_tuple(shape, stride);
   }
 
-  // Create the TMA shape/stride for KV scaling factors.
+  // Create the TMA shape/stride for KV scaling factors (block scales for NVFP4 KV cache).
+  //
+  // Layout requirement (HND): [num_pages, num_kv_heads, page_size, head_dim // 16]
+  //   - The last two dims (page_size, head_dim // 16) MUST be contiguous (stride[-1] = 1,
+  //     stride[-2] = head_dim // 16). This is because we reshape them into
+  //     (16, page_size * head_dim / 16 / 16) with hardcoded stride[1] = 16 to satisfy TMA's
+  //     16-byte box width requirement. Each scale factor is 1 byte (FP8), and head_dim // 16
+  //     can be < 16 (e.g., 8 for head_dim=128), so we must merge with page_size to reach 16.
+  //   - The head and batch/page strides are read from the actual scale tensors (kSfStrideHeads,
+  //     kSfStrideBatch) and can differ from the KV data strides.
+  //   - cuTensorMapEncodeTiled requires all non-dim0 strides to be multiples of 16 bytes, so
+  //     sfStrideHeads and sfStrideBatch must each be a multiple of 16.
   template <class FmhaOptions>
   static auto makeTmaShapeStrideKvSf(FmhaOptions const& options, KernelParams const& params,
                                      bool isK) {
     // The shape elements.
     auto [numKeys, numHeadsQPerKv, batchSize] = makeShapeKv(options, params);
-    // The stride elements.
-    auto [strideKeys, strideHeads, strideBatch] = makeStrideKv(options, isK);
 
     // The headDim.
     // Note that contiguousKv or pagedKv will pad K and V to maxHeadDimKv.
@@ -463,6 +478,10 @@ struct KernelParams {
     }
     // The number of elements per SF.
     int32_t NumEltsPerSf = 16;
+
+    // Use actual scale factor strides instead of deriving from KV strides.
+    int32_t sfStrideHeads = isK ? options.kSfStrideHeads : options.vSfStrideHeads;
+    int32_t sfStrideBatch = isK ? options.kSfStrideBatch : options.vSfStrideBatch;
 
     // The KV shape is: (headDim, numKeys, numHeadsKv, batchSize)
     // Therefore, the KV SF shape should be (headDim / NumEltsPerSf, numKeys, numHeadsKv,
@@ -476,8 +495,8 @@ struct KernelParams {
     auto shape = std::vector<uint64_t>{
         16, static_cast<uint64_t>(numKeys * headDim / NumEltsPerSf / 16),
         static_cast<uint64_t>(options.mNumHeadsKv), static_cast<uint64_t>(batchSize)};
-    auto stride = std::vector<uint64_t>{1, 16, static_cast<uint64_t>(strideHeads / NumEltsPerSf),
-                                        static_cast<uint64_t>(strideBatch / NumEltsPerSf)};
+    auto stride = std::vector<uint64_t>{1, 16, static_cast<uint64_t>(sfStrideHeads),
+                                        static_cast<uint64_t>(sfStrideBatch)};
 
     return std::make_tuple(shape, stride);
   }
