@@ -522,7 +522,9 @@ def test_fi_trace_complete_moe_fp4_routing(
         for k, v in defn["inputs"].items()
         if isinstance(v, dict) and v.get("dtype") == "unknown" and not v.get("optional")
     ]
-    assert not non_optional_unknown, f"Non-optional inputs with unknown dtype: {non_optional_unknown}"
+    assert not non_optional_unknown, (
+        f"Non-optional inputs with unknown dtype: {non_optional_unknown}"
+    )
 
 
 # ---------------------------------------------------------------------------
