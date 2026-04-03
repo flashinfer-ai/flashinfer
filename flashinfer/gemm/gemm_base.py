@@ -176,7 +176,10 @@ def get_gemm_module():
                             f"A={tuple(a.shape)}, B={tuple(b.shape)}, out={tuple(out.shape)}."
                         )
                     if tactic >= count:
-                        tactic = 0
+                        raise ValueError(
+                            f"Requested tactic {tactic} but only {count} algorithms "
+                            f"available for A={tuple(a.shape)}, B={tuple(b.shape)}."
+                        )
                     module.bmm_fp8_run_with_algo(
                         a,
                         b,
@@ -1058,7 +1061,13 @@ def get_mm_bf16_cublaslt_module():
                         f"dtype={compute_out.dtype}. "
                         "This shape/dtype combination may not be supported."
                     )
-                if tactic < 0 or tactic >= count:
+                if tactic >= count:
+                    raise ValueError(
+                        f"Requested tactic {tactic} but only {count} algorithms "
+                        f"available for M={a.shape[0]}, N={b.shape[1]}, K={a.shape[1]}, "
+                        f"dtype={compute_out.dtype}."
+                    )
+                if tactic < 0:
                     tactic = 0
                 module.mm_bf16_cublaslt_run_with_algo(
                     a,
