@@ -33,6 +33,7 @@ class QuantMode(IntEnum):
     FP8_PER_TENSOR = 6
     BF16 = 7
     MXINT4_BF16_BF16 = 8
+    MXINT4_FP8_BF16 = 9
 
 
 NON_GATED_ACTIVATION_SUPPORTED_QUANT_MODES = [
@@ -142,11 +143,12 @@ def skip_checks(
             f"Incompatible: intermediate_size={intermediate_size} with {routing_config['routing_method_type'].name} routing ({routing_config['num_experts']} experts)"
         )
 
-    if moe_impl.quant_mode == QuantMode.MXINT4_BF16_BF16 and (
-        intermediate_size % 256 != 0 or hidden_size % 256 != 0
-    ):
+    if moe_impl.quant_mode in (
+        QuantMode.MXINT4_BF16_BF16,
+        QuantMode.MXINT4_FP8_BF16,
+    ) and (intermediate_size % 256 != 0 or hidden_size % 256 != 0):
         pytest.skip(
-            f"Incompatible: intermediate_size={intermediate_size} or hidden_size={hidden_size} with MXINT4_BF16_BF16 quantization"
+            f"Incompatible: intermediate_size={intermediate_size} or hidden_size={hidden_size} with {moe_impl.quant_mode.name} quantization"
         )
 
     # TODO(jimmzhou): enable MxFP4xBf16 on SM103
