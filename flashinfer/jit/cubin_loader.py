@@ -242,6 +242,7 @@ def ensure_symlink(
     link = pathlib.Path(link)
     target = pathlib.Path(target)
 
+    link.parent.mkdir(parents=True, exist_ok=True)
     lock_path = str(link) + ".lock"
     lock = filelock.FileLock(lock_path, timeout=60)
     with lock:
@@ -253,7 +254,6 @@ def ensure_symlink(
                 link.unlink()
             else:
                 shutil.rmtree(link)
-        link.parent.mkdir(parents=True, exist_ok=True)
         link.symlink_to(target)
 
 
