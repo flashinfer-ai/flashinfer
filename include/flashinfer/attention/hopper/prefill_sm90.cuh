@@ -36,9 +36,9 @@ namespace flashinfer {
 using namespace cute;
 
 DEFINE_HAS_MEMBER(maybe_prefix_len_ptr)
-DEFINE_HAS_MEMBER(maybe_token_pos_in_items_ptr)
-DEFINE_HAS_MEMBER(token_pos_in_items_len)
 DEFINE_HAS_MEMBER(maybe_max_item_len_ptr)
+DEFINE_HAS_MEMBER(maybe_item_start_ptr)
+DEFINE_HAS_MEMBER(item_start_len)
 
 template <typename CollectiveMainloop, typename CollectiveEpilogue, typename Ktraits,
           bool LEFT_SLIDING_WINDOW, bool CAUSAL, typename TileScheduler,
@@ -132,17 +132,17 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   if constexpr (has_maybe_prefix_len_ptr_v<decltype(mainloop_params.additional_params)>) {
     maybe_prefix_len_ptr = mainloop_params.additional_params.maybe_prefix_len_ptr;
   }
-  uint16_t* maybe_token_pos_in_items_ptr = nullptr;
-  if constexpr (has_maybe_token_pos_in_items_ptr_v<decltype(mainloop_params.additional_params)>) {
-    maybe_token_pos_in_items_ptr = mainloop_params.additional_params.maybe_token_pos_in_items_ptr;
-  }
-  uint32_t token_pos_in_items_len = 0;
-  if constexpr (has_token_pos_in_items_len_v<decltype(mainloop_params.additional_params)>) {
-    token_pos_in_items_len = mainloop_params.additional_params.token_pos_in_items_len;
-  }
   uint16_t* maybe_max_item_len_ptr = nullptr;
   if constexpr (has_maybe_max_item_len_ptr_v<decltype(mainloop_params.additional_params)>) {
     maybe_max_item_len_ptr = mainloop_params.additional_params.maybe_max_item_len_ptr;
+  }
+  uint32_t* maybe_item_start_ptr = nullptr;
+  if constexpr (has_maybe_item_start_ptr_v<decltype(mainloop_params.additional_params)>) {
+    maybe_item_start_ptr = mainloop_params.additional_params.maybe_item_start_ptr;
+  }
+  uint32_t item_start_len = 0;
+  if constexpr (has_item_start_len_v<decltype(mainloop_params.additional_params)>) {
+    item_start_len = mainloop_params.additional_params.item_start_len;
   }
 
   if (warp_group_idx == 0) {  // Producer
@@ -187,6 +187,24 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
               std::max(0, q_tile_idx * CTA_Q + kv_len - qo_len - max_item_len);
           num_kv_tiles_outside_items_window = valid_items_window_len / CTA_KV;
           num_kv_tiles_prefix = cute::ceil_div(prefix_len, CTA_KV);
+          // Tighter skip bound using actual item_start of first Q in tile
+          auto* item_start_local = maybe_item_start_ptr + batch_idx * item_start_len;
+          const int first_q_idx_in_seq = q_tile_idx * CTA_Q + kv_len - qo_len;
+          if (first_q_idx_in_seq >= static_cast<int>(prefix_len)) {
+            const uint32_t tok = first_q_idx_in_seq - prefix_len;
+            uint32_t lo = 0, hi = item_start_len - 1;
+            while (lo < hi) {
+              uint32_t mid = (lo + hi + 1) >> 1;
+              if (__ldg(item_start_local + mid) <= tok)
+                lo = mid;
+              else
+                hi = mid - 1;
+            }
+            uint32_t first_q_item_start = __ldg(item_start_local + lo);
+            num_kv_tiles_outside_items_window = std::max(
+                num_kv_tiles_outside_items_window,
+                static_cast<int>((prefix_len + first_q_item_start) / CTA_KV));
+          }
         }
         if constexpr (MULTIITEMSCORING) {
           collective_mainloop.load<LEFT_SLIDING_WINDOW>(
@@ -258,10 +276,10 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
       }
 
       uint32_t prefix_len = 0;
-      uint16_t* token_pos_in_items = nullptr;
+      uint32_t* item_start = nullptr;
       if constexpr (MULTIITEMSCORING) {
         prefix_len = __ldg(maybe_prefix_len_ptr + batch_idx);
-        token_pos_in_items = maybe_token_pos_in_items_ptr + batch_idx * token_pos_in_items_len;
+        item_start = maybe_item_start_ptr + batch_idx * item_start_len;
       }
       int num_kv_tiles_outside_items_window = 0;
       int num_kv_tiles_prefix = 0;
@@ -272,14 +290,32 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
             std::max(0, q_tile_idx * CTA_Q + kv_len - qo_len - max_item_len);
         num_kv_tiles_outside_items_window = valid_items_window_len / CTA_KV;
         num_kv_tiles_prefix = cute::ceil_div(prefix_len, CTA_KV);
+        // Tighter skip bound — must match producer (above) exactly
+        auto* item_start_local = maybe_item_start_ptr + batch_idx * item_start_len;
+        const int first_q_idx_in_seq = q_tile_idx * CTA_Q + kv_len - qo_len;
+        if (first_q_idx_in_seq >= static_cast<int>(prefix_len)) {
+          const uint32_t tok = first_q_idx_in_seq - prefix_len;
+          uint32_t lo = 0, hi = item_start_len - 1;
+          while (lo < hi) {
+            uint32_t mid = (lo + hi + 1) >> 1;
+            if (__ldg(item_start_local + mid) <= tok)
+              lo = mid;
+            else
+              hi = mid - 1;
+          }
+          uint32_t first_q_item_start = __ldg(item_start_local + lo);
+          num_kv_tiles_outside_items_window = std::max(
+              num_kv_tiles_outside_items_window,
+              static_cast<int>((prefix_len + first_q_item_start) / CTA_KV));
+        }
       }
       mma_f16<Ktraits, /*LEFT_SLIDING_WINDOW=*/LEFT_SLIDING_WINDOW, CAUSAL, MULTIITEMSCORING,
               CollectiveMainloop::WarpScheduler>(
           mainloop_params, variant, pipeline_k, pipeline_v, smem_pipe_read_k, smem_pipe_read_v,
           tOrO, attention_updater, num_kv_tiles, swa_begin_kv_tile_idx, swa_end_kv_tile_idx,
           threadIdx.x - NUM_COPY_THREADS, work_idx, q_tile_idx, shared_storage, qo_len, kv_len,
-          qo_head_idx, kv_head_idx, prefix_len, token_pos_in_items,
-          num_kv_tiles_outside_items_window, num_kv_tiles_prefix);
+          qo_head_idx, kv_head_idx, prefix_len, item_start,
+          num_kv_tiles_outside_items_window, num_kv_tiles_prefix, item_start_len);
       collective_epilogue.store(epilogue_params, tOrO, attention_updater.get_lse(), shared_storage,
                                 tiled_mma_pv, threadIdx.x - NUM_COPY_THREADS, block_coord);
 
@@ -361,7 +397,8 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
   using IdType = typename KernelTraits::IdType;
 
   using CollectiveMainloop = SparseCollectiveMainloop<typename Params::AdditionalParams,
-                                                      KernelTraits, CAUSAL, MULTIITEMSCORING>;
+                                                      KernelTraits, CAUSAL,
+                                                      MULTIITEMSCORING>;
   using CollectiveEpilogue = CollectiveEpilogue<KernelTraits>;
   using Scheduler =
       std::conditional_t<SAME_SCHEDULE_FOR_ALL_HEADS, BatchPrefillTileScheduler<IdType>,
@@ -585,8 +622,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, bool enable_p
                                 /*NUM_STAGES_=*/2, typename Params::DTypeQ,
                                 typename Params::DTypeKV, typename Params::DTypeO,
                                 typename Params::IdType, AttentionVariant>,
-          LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(
-          params, stream);
+          LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(params, stream);
     } else if constexpr (HEAD_DIM_VO == 128) {
       BatchPrefillWithPagedKVCacheKernelTraitsDispatched<
           AttentionKernelTraits</*USE_TMA_LOAD_KV=*/false, HEAD_DIM_QK, HEAD_DIM_VO,
@@ -595,8 +631,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, bool enable_p
                                 /*NUM_STAGES_=*/2, typename Params::DTypeQ,
                                 typename Params::DTypeKV, typename Params::DTypeO,
                                 typename Params::IdType, AttentionVariant>,
-          LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(
-          params, stream);
+          LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(params, stream);
     } else {
       // HEAD_DIM == 256;
       // NOTE(Zihao): CTA_KV not tuned for HEAD_DIM == 256, need to optimize later
@@ -607,8 +642,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, bool enable_p
                                 /*NUM_STAGES_=*/2, typename Params::DTypeQ,
                                 typename Params::DTypeKV, typename Params::DTypeO,
                                 typename Params::IdType, AttentionVariant>,
-          LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(
-          params, stream);
+          LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(params, stream);
     }
   } else {
     return cudaErrorNotSupported;

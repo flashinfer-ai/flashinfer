@@ -17,9 +17,9 @@
 namespace flashinfer {
 
 template <typename Ktraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL, bool MULTIITEMSCORING,
-          typename WarpScheduler, typename AttentionVariant, typename Params,
-          typename MainloopPipeline, typename PipelineState, typename SharedStorage,
-          typename FrgTensorO, typename AttentionUpdater>
+          typename WarpScheduler, typename AttentionVariant,
+          typename Params, typename MainloopPipeline, typename PipelineState,
+          typename SharedStorage, typename FrgTensorO, typename AttentionUpdater>
 CUTLASS_DEVICE void mma_f16(
     const Params& mainloop_params, AttentionVariant& variant, MainloopPipeline pipeline_k,
     MainloopPipeline pipeline_v, PipelineState& smem_pipe_read_k, PipelineState& smem_pipe_read_v,
@@ -27,8 +27,10 @@ CUTLASS_DEVICE void mma_f16(
     int swa_begin_kv_tile_idx, int swa_end_kv_tile_idx, int thread_idx, int work_idx,
     int q_tile_idx, SharedStorage& shared_storage, const int32_t qo_len, const int32_t kv_len,
     const int32_t qo_head_idx, const int32_t kv_head_idx, const uint32_t prefix_len,
-    uint16_t* token_pos_in_items, const int num_kv_tiles_outside_items_window = 0,
-    const int num_kv_tiles_prefix = 0) {
+    uint32_t* item_start,
+    const int num_kv_tiles_outside_items_window = 0,
+    const int num_kv_tiles_prefix = 0,
+    const uint32_t item_start_len = 0) {
   using DTypeQ = typename Ktraits::DTypeQ;
   using DTypeKV = typename Ktraits::DTypeKV;
   using IdType = typename Ktraits::IdType;
@@ -70,6 +72,33 @@ CUTLASS_DEVICE void mma_f16(
     shared_storage.barrier_Q.wait(work_idx % 2);
   }
 
+  // MIS: precompute item_start for each Q position via binary search on the
+  // item_start array (L1/texture cached via __ldg), store results in smem for
+  // O(1) lookup during masking. Single barrier sync, no cooperative smem load.
+  __shared__ uint32_t smem_q_item_start[MULTIITEMSCORING ? CTA_Q : 1];
+  if constexpr (MULTIITEMSCORING) {
+    for (int q = thread_idx; q < CTA_Q; q += NUM_MMA_THREADS) {
+      const int qo_idx = q + q_tile_idx * CTA_Q;
+      const int idx_in_seq = qo_idx + kv_len - qo_len;
+      if (idx_in_seq >= static_cast<int>(prefix_len) && idx_in_seq < kv_len) {
+        const uint32_t tok = idx_in_seq - prefix_len;
+        uint32_t lo = 0, hi = item_start_len - 1;
+        while (lo < hi) {
+          uint32_t mid = (lo + hi + 1) >> 1;
+          if (__ldg(item_start + mid) <= tok)
+            lo = mid;
+          else
+            hi = mid - 1;
+        }
+        smem_q_item_start[q] = __ldg(item_start + lo);
+      } else {
+        smem_q_item_start[q] = 0;
+      }
+    }
+    cutlass::arch::NamedBarrier::sync(
+        NUM_MMA_THREADS, static_cast<int>(NamedBarriers::kItemOffsetsReady));
+  }
+
   Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_QKD{}));
   consumer_wait(pipeline_k, smem_pipe_read_k);
 
@@ -99,17 +128,13 @@ CUTLASS_DEVICE void mma_f16(
     const uint32_t idx_in_original_seq = qo_idx + kv_len - qo_len;
     const bool out_of_boundary =
         kv_idx > idx_in_original_seq || (kv_idx >= std::min(kv_len, col_limit_right(qo_idx)));
-    const bool is_prefix = idx_in_original_seq < prefix_len;
-    uint16_t token_pos_in_items_regs = 0;
-    // Only access idx_in_original_seq >= prefix_len && idx_in_original_seq < kv_len to avoid
-    // out-of-bounds memory access
-    if (idx_in_original_seq >= prefix_len & idx_in_original_seq < kv_len) {
-      token_pos_in_items_regs = __ldca(token_pos_in_items + idx_in_original_seq - prefix_len);
-    }
-    if (out_of_boundary || is_prefix) {
+    const bool is_prefix_q = idx_in_original_seq < prefix_len;
+    if (out_of_boundary || is_prefix_q) {
       tSrS(i) = out_of_boundary ? (AttentionUpdater::fill_value) : tSrS(i);
     } else {
-      tSrS(i) = (kv_idx < prefix_len | (idx_in_original_seq < kv_idx + token_pos_in_items_regs))
+      const uint32_t q_item_start = smem_q_item_start[qo_idx - q_tile_idx * CTA_Q];
+      tSrS(i) = (kv_idx < prefix_len |
+                  (kv_idx >= prefix_len + q_item_start & kv_idx <= idx_in_original_seq))
                     ? tSrS(i)
                     : (AttentionUpdater::fill_value);
     }
@@ -117,18 +142,13 @@ CUTLASS_DEVICE void mma_f16(
   auto mask_multi_item_scoring_assume_in_bound = [&](decltype(tSrS)& tSrS, int i, int qo_idx,
                                                      int kv_idx) {
     const uint32_t idx_in_original_seq = qo_idx + kv_len - qo_len;
-    const bool is_prefix = idx_in_original_seq < prefix_len;
-    if (is_prefix) {
+    const bool is_prefix_q = idx_in_original_seq < prefix_len;
+    if (is_prefix_q) {
       tSrS(i) = AttentionUpdater::fill_value;
     } else {
-      uint16_t token_pos_in_items_regs = 0;
-      // Only access idx_in_original_seq >= prefix_len && idx_in_original_seq < kv_len to avoid
-      // out-of-bounds memory access
-      if (idx_in_original_seq >= prefix_len & idx_in_original_seq < kv_len) {
-        token_pos_in_items_regs = __ldca(token_pos_in_items + idx_in_original_seq - prefix_len);
-      }
-
-      tSrS(i) = (kv_idx < prefix_len | (idx_in_original_seq < kv_idx + token_pos_in_items_regs))
+      const uint32_t q_item_start = smem_q_item_start[qo_idx - q_tile_idx * CTA_Q];
+      tSrS(i) = (kv_idx < prefix_len |
+                  (kv_idx >= prefix_len + q_item_start & kv_idx <= idx_in_original_seq))
                     ? tSrS(i)
                     : (AttentionUpdater::fill_value);
     }
@@ -175,8 +195,9 @@ CUTLASS_DEVICE void mma_f16(
   Tensor tOrP = make_tensor(convert_type<DTypeKV>(tSrS).data(),
                             convert_layout_acc_Aregs<typename Ktraits::TiledMmaPV>(tSrS.layout()));
 
-  constexpr int n_masking_steps = MULTIITEMSCORING ? (cute::ceil_div(CTA_Q, CTA_KV) + 1)
-                                                   : (CAUSAL ? cute::ceil_div(CTA_Q, CTA_KV) : 0);
+  constexpr int n_masking_steps = MULTIITEMSCORING
+                                     ? (cute::ceil_div(CTA_Q, CTA_KV) + 1)
+                                     : (CAUSAL ? cute::ceil_div(CTA_Q, CTA_KV) : 0);
   // masking loops
   // ziangl@nvidia.com: for multi item scoring, we use this loop only to mask along the diagonal
 #pragma unroll
@@ -204,7 +225,7 @@ CUTLASS_DEVICE void mma_f16(
       int kv_idx = get<1>(tScS(i)) + kv_tile_idx_decrement(kv_tile_idx) * CTA_KV;
       tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), /*batch_idx=*/0, qo_idx, kv_idx,
                                         qo_head_idx, kv_head_idx);
-      if (MULTIITEMSCORING) {
+      if constexpr (MULTIITEMSCORING) {
         mask_multi_item_scoring(tSrS, i, qo_idx, kv_idx);
       } else {
         if (kv_idx >= col_limit_right(qo_idx)) {
@@ -252,8 +273,6 @@ CUTLASS_DEVICE void mma_f16(
                                         qo_head_idx, kv_head_idx);
     }
     if constexpr (MULTIITEMSCORING) {
-      // auto nums_tiles_outside_causal_diagonal = kv_tile_idx_count - cute::ceil_div(CTA_Q,
-      // CTA_KV);
       if (kv_tile_idx >= num_kv_tiles_prefix - 1) {
 #pragma unroll
         for (int i = 0; i < size(tSrS); ++i) {
