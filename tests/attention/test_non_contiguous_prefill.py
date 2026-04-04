@@ -16,6 +16,11 @@ limitations under the License.
 
 import pytest
 import torch
+
+pytestmark = pytest.mark.skip(
+    reason="todo: JIT-compiled .so fails to load (file too short) on some hardware combinations"
+)
+
 from tests.test_helpers.jit_utils import gen_prefill_attention_modules
 
 import flashinfer
