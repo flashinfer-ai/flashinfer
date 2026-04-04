@@ -90,8 +90,6 @@ def get_trtllm_low_latency_gemm_module():
                 global_scale,
                 out,
             ) = inputs
-            if tactic < 0:
-                return out
             m = a.shape[0]
             n = b.shape[1]
             k = a.shape[1]

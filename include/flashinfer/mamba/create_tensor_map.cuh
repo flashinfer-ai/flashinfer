@@ -12,10 +12,10 @@
 
 namespace flashinfer::mamba::tma {
 
-inline CUtensorMap buildNdDescriptor(std::type_info const& dtype,
-                                     std::vector<uint64_t> const& shapes,
-                                     std::vector<uint64_t> const& strides,
-                                     std::vector<int32_t> const& tileShapes, void* gmemAddr) {
+inline CUtensorMap buildNdDescriptor(
+    std::type_info const& dtype, std::vector<uint64_t> const& shapes,
+    std::vector<uint64_t> const& strides, std::vector<int32_t> const& tileShapes, void* gmemAddr,
+    CUtensorMapFloatOOBfill oobFill = CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) {
   // The multiplication factor of the data padding in SMEM.
   CUtensorMap desc{};
   CUtensorMapDataType tmaDataFormat;
@@ -85,7 +85,7 @@ inline CUtensorMap buildNdDescriptor(std::type_info const& dtype,
                              boxDim.data(), tileStrides.data(),
                              /*interleave=*/CU_TENSOR_MAP_INTERLEAVE_NONE, swizzleType,
                              /*l2Promotion=*/CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
-                             /*oobFill=*/CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+                             /*oobFill=*/oobFill);
 
   if (result != CUDA_SUCCESS) {
     char const* errorString;

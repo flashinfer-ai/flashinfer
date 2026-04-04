@@ -15,7 +15,6 @@ limitations under the License.
 """
 
 import functools
-from enum import IntEnum
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
@@ -54,143 +53,7 @@ from .utils import (
     get_last_power_of_2_num_tokens_buckets,
     last_positive_power_of_2,
 )
-
-
-# The type of method in top-K routing, for use in torch custom op
-# Please keep this in sync with the counterpart defined in include/flashinfer/trtllm/fused_moe/runner.h
-class RoutingMethodType(IntEnum):
-    # Default: Softmax -> TopK
-    Default = (0,)
-    # Renormalize: TopK -> Softmax
-    Renormalize = (1,)
-    # DeepSeekV3: Sigmoid -> RoutingBiasAdd -> Top2 in group -> Top4 groups -> Top8 experts from the Top4 groups
-    DeepSeekV3 = (2,)
-    # Llama4: Top1 -> Sigmoid
-    Llama4 = (3,)
-    # Qwen3: Softmax -> TopK -> Renormalize
-    RenormalizeNaive = (4,)
-    # TopK only (no softmax)
-    TopK = (5,)
-    # Unspecified
-    Unspecified = 6
-
-
-# Copied from csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/common.h
-class ActivationType(IntEnum):
-    Gelu = 0
-    Relu = 1
-    Silu = 2
-    Swiglu = 3
-    Geglu = 4
-    SwigluBias = 5
-    Relu2 = 6
-    Identity = 7
-    InvalidType = 8
-
-
-class DtypeTrtllmGen(IntEnum):
-    def __new__(cls, block_format_bit, signed_bit, integer_bit, num_bits, uid):
-        value = (
-            (block_format_bit << 24)
-            | (signed_bit << 20)
-            | (integer_bit << 16)
-            | (num_bits << 8)
-            | uid
-        )
-        obj = int.__new__(cls, value)
-        obj._value_ = value
-        return obj
-
-    # keep the values in sync with include/flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h
-    Bfloat16 = (0, 1, 0, 16, 0)
-    Bool = (0, 0, 1, 1, 1)
-    E2m1 = (1, 1, 0, 4, 2)
-    E2m3 = (1, 1, 0, 6, 3)
-    E3m2 = (1, 1, 0, 6, 4)
-    E4m3 = (0, 1, 0, 8, 5)
-    E5m2 = (0, 1, 0, 8, 6)
-    Fp16 = (0, 1, 0, 16, 7)
-    Fp32 = (0, 1, 0, 32, 8)
-    Int8 = (0, 1, 1, 8, 9)
-    Int32 = (0, 1, 1, 32, 10)
-    Int64 = (0, 1, 1, 64, 11)
-    MxE2m1 = (1, 1, 0, 4, 12)
-    MxE4m3 = (1, 1, 0, 8, 13)
-    MxInt4 = (1, 1, 1, 4, 14)
-    UE8m0 = (0, 0, 0, 8, 15)
-    UInt8 = (0, 0, 1, 8, 16)
-    UInt16 = (0, 0, 1, 16, 17)
-    UInt32 = (0, 0, 1, 32, 18)
-    UInt64 = (0, 0, 1, 64, 19)
-    UInt128 = (0, 0, 1, 128, 20)
-    Void = (0, 1, 0, 0, 21)
-
-
-def trtllm_gen_dtype_has_scale(dtype: DtypeTrtllmGen) -> bool:
-    if dtype in [
-        DtypeTrtllmGen.MxE4m3,
-        DtypeTrtllmGen.E2m1,
-        DtypeTrtllmGen.MxE2m1,
-        DtypeTrtllmGen.MxE4m3,
-        DtypeTrtllmGen.MxInt4,
-    ]:
-        return True
-    else:
-        return False
-
-
-def deduce_trtllm_gen_tensor_dtype(
-    x: torch.Tensor, scale: Optional[torch.Tensor]
-) -> DtypeTrtllmGen:
-    hidden_size = x.shape[-1]
-    if x.dtype == torch.uint8:  # FIXME(siyuan): use torch.float4_e2m1x2 after torch 2.8
-        hidden_size *= 2
-    if x.dtype == torch.bfloat16:
-        dtype = DtypeTrtllmGen.Bfloat16
-    elif x.dtype == torch.float8_e4m3fn:
-        dtype = DtypeTrtllmGen.E4m3 if scale is None else DtypeTrtllmGen.MxE4m3
-    elif (
-        x.dtype == torch.uint8
-    ):  # FIXME(siyuan): use torch.float4_e2m1x2 after torch 2.8
-        assert scale is not None, "Scale tensor must be provided for float4x2 input"
-        if scale.shape[-1] == hidden_size // 16:
-            dtype = DtypeTrtllmGen.E2m1
-        else:
-            dtype = DtypeTrtllmGen.MxE2m1
-    else:
-        raise ValueError("Unsupported trtllm-gen input tensor.")
-    return dtype
-
-
-# See MatrixLayout from include/flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/Enums.h
-class WeightLayout(IntEnum):
-    # K-major layout (default). [Mn, K]
-    MajorK = 0
-    # M-major for A and N-major for B. [K, Mn]
-    MajorMn = 1
-    # Layout is blocked along the K dimension. [K / blockK, Mn, blockK]
-    # where blockK is fixed at 128B
-    BlockMajorK = 2
-
-
-# The type of gated activation function
-# Please keep this in sync with the counterpart defined in include/flashinfer/trtllm/fused_moe/runner.h
-class GatedActType(IntEnum):
-    # SwiGlu
-    SwiGlu = 0
-    # GeGlu
-    GeGlu = 1
-
-
-# The type of FP8 quantization
-# Please keep this in sync with the counterpart defined in trtllm_fused_moe_kernel_launcher.cu
-class Fp8QuantizationType(IntEnum):
-    # No FP8 quantization
-    NoneFp8 = 0
-    # DeepSeek FP8
-    DeepSeekFp8 = 1
-    # MxFp8 x MxFp8
-    MxFp8 = 2
+from ..tllm_enums import *
 
 
 @functools.cache
@@ -522,6 +385,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         swiglu_alpha: Optional[torch.Tensor] = None,
         swiglu_beta: Optional[torch.Tensor] = None,
         swiglu_limit: Optional[torch.Tensor] = None,
+        swizzled_input_sf: bool = True,
         tp_size: int = 1,
         tp_rank: int = 0,
         ep_size: int = 1,
@@ -638,6 +502,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             swiglu_alpha,
             swiglu_beta,
             swiglu_limit,
+            swizzled_input_sf,
             *min_latency_output,
             tp_size,
             tp_rank,
@@ -679,6 +544,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         swiglu_alpha: Optional[torch.Tensor] = None,
         swiglu_beta: Optional[torch.Tensor] = None,
         swiglu_limit: Optional[torch.Tensor] = None,
+        swizzled_input_sf: bool = True,
         tp_size: int = 1,
         tp_rank: int = 0,
         ep_size: int = 1,
@@ -749,6 +615,7 @@ def cutlass_fused_moe(
     tune_max_num_tokens: int = 8192,
     enable_pdl: Optional[bool] = None,
     activation_type: ActivationType = ActivationType.Swiglu,
+    swizzled_input_sf: bool = True,
 ) -> torch.Tensor:
     """Compute a Mixture of Experts (MoE) layer using CUTLASS backend.
 
@@ -859,6 +726,12 @@ def cutlass_fused_moe(
     activation_type: ActivationType = ActivationType.Swiglu
         Activation to apply on for GEMM1, note that Relu2 means non-gated GEMM1
 
+    swizzled_input_sf : bool = True
+        Whether the input scaling factor (input_sf) is in swizzled layout. Defaults to True.
+        Set to False when input_sf is in linear layout, e.g. after FP4 allgather/alltoall
+        communication where the scaling factors are received in linear (non-swizzled) format.
+        Only relevant when input_sf is not None.
+
     Returns
     -------
     out: torch.Tensor
@@ -925,6 +798,7 @@ def cutlass_fused_moe(
         swiglu_alpha,
         swiglu_beta,
         swiglu_limit,
+        swizzled_input_sf,
         tp_size,
         tp_rank,
         ep_size,
@@ -1040,7 +914,7 @@ def get_trtllm_moe_sm100_module():
                 hidden_states,
                 *extra_inputs,
             ) = inputs
-            num_tokens = routing_logits.shape[0]
+            num_tokens = hidden_states.shape[0]
 
             instance_key = (
                 self.dtype_act,
@@ -1081,7 +955,9 @@ def get_trtllm_moe_sm100_module():
                 hidden_states,
                 *extra_inputs,
             ) = inputs
-            num_tokens = routing_logits.shape[0]
+            if kwargs.get("skip_routing", False):
+                routing_logits = None
+            num_tokens = hidden_states.shape[0]
 
             extra_input_idx = 0
             if trtllm_gen_dtype_has_scale(self.dtype_act):
@@ -1093,12 +969,20 @@ def get_trtllm_moe_sm100_module():
             assert output.shape[0] == num_tokens, (
                 "output's first dimension must be batch size."
             )
-            assert topk_ids.shape[0] == num_tokens, (
-                "topk_ids's first dimension must be batch size."
-            )
-            assert expert_weights.shape[0] == num_tokens, (
-                "expert_weights's first dimension must be batch size."
-            )
+            if routing_logits is not None:
+                assert routing_logits.shape[0] == num_tokens, (
+                    "routing_logits's first dimension must be batch size."
+                )
+            # topk_ids/expert_weights can be empty(0) when routing_logits is provided,
+            # or real tensors when pre-computed routing is used.
+            if topk_ids is not None and topk_ids.numel() > 0:
+                assert topk_ids.shape[0] == num_tokens, (
+                    "topk_ids's first dimension must be batch size."
+                )
+            if expert_weights is not None and expert_weights.numel() > 0:
+                assert expert_weights.shape[0] == num_tokens, (
+                    "expert_weights's first dimension must be batch size."
+                )
             assert hidden_states.shape[0] == num_tokens, (
                 "hidden_states's first dimension must be batch size."
             )
@@ -1642,7 +1526,7 @@ def get_trtllm_moe_sm100_module():
         gemm1_weights_scale: torch.Tensor,
         gemm2_weights: torch.Tensor,
         gemm2_weights_scale: torch.Tensor,
-        output: torch.Tensor,
+        output: Optional[torch.Tensor],
         num_experts: int,
         top_k: int,
         n_group: Optional[int],
@@ -1680,10 +1564,22 @@ def get_trtllm_moe_sm100_module():
         num_tokens = hidden_states.shape[0]
         hidden_size = hidden_states.shape[-1]
 
-        # Create workspace buffers
-        output = torch.empty(
-            num_tokens, hidden_size, dtype=torch.bfloat16, device=hidden_states.device
-        )
+        if output is None:
+            output = torch.empty(
+                num_tokens,
+                hidden_size,
+                dtype=torch.bfloat16,
+                device=hidden_states.device,
+            )
+        else:
+            check_shape_dtype_device(
+                output,
+                (num_tokens, hidden_size),
+                torch.bfloat16,
+                hidden_states.device,
+                "output",
+            )
+
         if routing_logits is not None:
             # When routing_logits is provided, we must pass topk_ids/expert_weights with no allocation
             topk_ids = torch.empty(0, dtype=torch.int32, device=hidden_states.device)
@@ -1942,7 +1838,12 @@ def get_trtllm_moe_sm100_module():
         )
         inputs = [
             output,
-            torch.empty(num_tokens, num_experts, dtype=routing_dtype, device="meta")
+            torch.empty(
+                num_tokens,
+                num_experts,
+                dtype=routing_dtype,
+                device=hidden_states.device,
+            )
             if routing_logits is None
             else routing_logits,
             topk_ids,
@@ -1957,6 +1858,7 @@ def get_trtllm_moe_sm100_module():
             [moe_runner],
             tunning_config,
             inputs,
+            skip_routing=(routing_logits is None),
             num_experts=num_experts,
             routing_bias=routing_bias,
             gemm1_weights=gemm1_weights,

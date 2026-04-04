@@ -91,12 +91,26 @@ inline int32_t nextPowerOfTwo(float value) {
 std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& supported_tile_nums,
                                        int64_t const num_tokens, int64_t const top_k,
                                        int64_t const num_local_experts) {
+  TVM_FFI_ICHECK(!supported_tile_nums.empty()) << "supported_tile_nums must not be empty.";
   float const avg_tokens_per_expert = static_cast<float>(num_tokens * top_k) / num_local_experts;
+  // NOTE: This differs from Python AutoTuner bucketing:
+  // - AutoTuner maps raw num_tokens with last_positive_power_of_2 (round-down).
+  // - Here we map derived avg_tokens_per_expert and use nextPowerOfTwo (round-up).
+  // Because they round different quantities in different directions, cache bucket and runtime
+  // tile candidates can diverge; launcher-side tactic resolution handles that mismatch.
   // assume supported_tile_nums is sorted
   int32_t tile_tokens_dim = std::clamp(nextPowerOfTwo(avg_tokens_per_expert),
                                        supported_tile_nums.front(), supported_tile_nums.back());
   auto it = std::find(supported_tile_nums.begin(), supported_tile_nums.end(), tile_tokens_dim);
+  FLASHINFER_CHECK(
+      it != supported_tile_nums.end(), "computeSelectedTileN expected exact tile ", tile_tokens_dim,
+      " in supported_tile_nums (size=", supported_tile_nums.size(),
+      "). Please keep supported_tile_nums as a dense power-of-2 ladder for this launcher.");
 
+  // Candidate tile set centered on the heuristic tile.
+  // This function returns nearby candidates (not a single final tile):
+  //   center, +1, +2, and -1 neighbors when available.
+  // Final tile choice is made later (autotuner-provided tile if valid, otherwise fallback policy).
   std::set<int32_t> selected_tile_nums;
   selected_tile_nums.insert(tile_tokens_dim);
   if (std::next(it) != supported_tile_nums.end()) {
@@ -110,6 +124,37 @@ std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& supported_til
   }
 
   return selected_tile_nums;
+}
+
+int64_t selectDefaultTileN(std::vector<int32_t> const& supported_tile_nums,
+                           int64_t const num_tokens, int64_t const top_k,
+                           int64_t const num_local_experts) {
+  auto selected = computeSelectedTileN(supported_tile_nums, num_tokens, top_k, num_local_experts);
+  TVM_FFI_ICHECK(!selected.empty()) << "No selected tile_N candidates for current MoE input.";
+  return *selected.begin();
+}
+
+// Resolve the (tile_N, config) pair passed from Python side, applying fallback logic
+// when tile_N is -1.
+std::pair<int64_t, int64_t> resolveMoeTileAndConfig(Array<int64_t> const& config_index,
+                                                    std::vector<int32_t> const& supported_tile_nums,
+                                                    int64_t const num_tokens, int64_t const top_k,
+                                                    int64_t const num_local_experts) {
+  // Python side convention: tactic is [tile_N, config]
+  TVM_FFI_ICHECK(config_index.size() == 2)
+      << "Invalid tactic, expected to be [tile_N, config], but got array of size "
+      << config_index.size();
+  const int64_t tile_N = config_index[0];
+  const int64_t config = config_index[1];
+
+  if (tile_N == -1 || config == -1) {
+    // Use fallback tactic
+    auto const default_tile_N =
+        selectDefaultTileN(supported_tile_nums, num_tokens, top_k, num_local_experts);
+    return {default_tile_N, -1};
+  }
+
+  return {tile_N, config};
 }
 
 class FusedMoeLauncher {
@@ -137,6 +182,7 @@ class FusedMoeLauncher {
   btg::Dtype mRoutingBiasDtype{
       btg::Dtype::Bfloat16};  // Dtype for expert weights in routing, based on routing bias
   ActivationType activation_type{ActivationType::Swiglu};
+  btg::Dtype mDtypeScore{btg::Dtype::Bfloat16};
 
   int64_t intermediate_size_factor{2};
 
@@ -174,13 +220,19 @@ class FusedMoeLauncher {
                    int64_t weight_layout, ActivationType activation_type);
 
   // Routing logits [num_tokens, num_experts]
-  void check_routing_logits_shape() const {
+  void check_routing_logits() const {
     if (routing_logits.has_value()) {
+      // Check shape
       TVM_FFI_ICHECK_EQ(routing_logits.value().ndim(), 2) << "routing_logits must be 2D.";
       TVM_FFI_ICHECK_EQ(routing_logits.value().size(0), hidden_states.size(0))
           << "routing_logits and hidden_states must have the same number of tokens.";
       TVM_FFI_ICHECK_EQ(routing_logits.value().size(1), args->num_experts)
           << "routing_logits dim1 must match num_experts.";
+
+      // Check dtype
+      TVM_FFI_ICHECK(routing_logits.value().dtype() == dl_float32 ||
+                     routing_logits.value().dtype() == dl_bfloat16)
+          << "routing_logits must be float or bfloat16.";
     }
   }
 
@@ -249,7 +301,7 @@ class FusedMoeLauncher {
                    args->local_expert_offset + args->local_num_experts <= args->num_experts)
         << "expert offset and count must be within valid range";
 
-    check_routing_logits_shape();
+    check_routing_logits();
 
     if (routing_bias.has_value()) {
       check_routing_bias_shape();
@@ -315,6 +367,19 @@ class FusedMoeLauncher {
     workspace.cta_idx_xy_to_batch_idx = static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr());
     workspace.cta_idx_xy_to_mn_limit = static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr());
     workspace.num_non_exiting_ctas = static_cast<int*>(num_non_exiting_ctas.data_ptr());
+
+    // Set dtype of score based on actual routing_logits dtype
+    if (routing_logits.has_value()) {
+      if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3) {
+        TVM_FFI_ICHECK_EQ(routing_logits.value().dtype(), dl_float32)
+            << "routing_logits must be float.";
+        mDtypeScore = btg::Dtype::Fp32;
+      } else if (routing_logits.value().dtype() == dl_float32) {
+        mDtypeScore = btg::Dtype::Fp32;
+      } else {
+        mDtypeScore = btg::Dtype::Bfloat16;
+      }
+    }
   }
 
   void check_moe_common() const {
@@ -400,8 +465,8 @@ class FusedMoeLauncher {
         static_cast<int*>(num_tokens_per_expert.data_ptr()),
         static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
         static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
-        static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
-        use_routing_scales_on_input, use_deep_seek_fp8,
+        static_cast<int*>(num_non_exiting_ctas.data_ptr()), mDtypeScore, args->mDtypeElt,
+        mRoutingBiasDtype, use_routing_scales_on_input, use_deep_seek_fp8,
         static_cast<RoutingMethodType>(routing_method_type), routing_stream);
 
     check_moe();
@@ -427,8 +492,9 @@ void FusedMoeLauncher::init_common(
   int major = 0, minor = 0;
   cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
   cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
-  TVM_FFI_ICHECK_EQ(major, 10) << "MoE kernel requires 10.x architecture. Current device has SM "
-                               << major << minor;
+  TVM_FFI_ICHECK(major == 10 || major == 12)
+      << "MoE kernel requires SM 10.x or SM 12.x architecture. Current device has SM " << major
+      << minor;
   this->device_version = std::make_tuple(major, minor);
 
   args->routing_logits = routing_logits.has_value() ? routing_logits.value().data_ptr() : nullptr;
@@ -511,8 +577,9 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
     if (has_precomputed_weights) {
       workspace.expert_weights = const_cast<void*>(expert_weights.data_ptr());
     } else {
+      auto ew_dtype = mDtypeScore == btg::Dtype::Fp32 ? dl_float32 : dl_bfloat16;
       FusedMoeLauncher::expert_weights =
-          alloc_tensor({args->num_tokens, args->top_k}, dl_bfloat16, hidden_states.device());
+          alloc_tensor({args->num_tokens, args->top_k}, ew_dtype, hidden_states.device());
       workspace.expert_weights = FusedMoeLauncher::expert_weights.data_ptr();
     }
   }
@@ -651,8 +718,9 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
         routing_bias.has_value() ? routing_bias.value().dtype() : dl_bfloat16;
     mRoutingBiasDtype = routing_bias_dtype == dl_bfloat16 ? btg::Dtype::Bfloat16 : btg::Dtype::Fp32;
 
+    auto expert_weights_dtype = mDtypeScore == btg::Dtype::Fp32 ? dl_float32 : dl_bfloat16;
     expert_weights =
-        alloc_tensor({args->num_tokens, args->top_k}, dl_bfloat16, hidden_states.device());
+        alloc_tensor({args->num_tokens, args->top_k}, expert_weights_dtype, hidden_states.device());
 
     workspace.expert_weights = expert_weights.data_ptr();
     if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4) {
@@ -931,9 +999,9 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     // Check ndim==2 and size>0 because empty placeholder tensors may have non-null data_ptr
     bool has_precomputed_weights = expert_weights.ndim() == 2 && expert_weights.size(0) > 0;
     if (!has_precomputed_weights) {
-      // Allocate expert_weights buffer for routing output
+      auto ew_dtype = mDtypeScore == btg::Dtype::Fp32 ? dl_float32 : dl_bfloat16;
       FusedMoeLauncher::expert_weights =
-          alloc_tensor({args->num_tokens, args->top_k}, dl_bfloat16, hidden_states.device());
+          alloc_tensor({args->num_tokens, args->top_k}, ew_dtype, hidden_states.device());
       workspace.expert_weights = FusedMoeLauncher::expert_weights.data_ptr();
     } else {
       workspace.expert_weights = const_cast<void*>(expert_weights.data_ptr());
@@ -1110,8 +1178,8 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
         static_cast<int*>(num_tokens_per_expert.data_ptr()),
         static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
         static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
-        static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
-        use_routing_scales_on_input, use_deep_seek_fp8,
+        static_cast<int*>(num_non_exiting_ctas.data_ptr()), mDtypeScore, args->mDtypeElt,
+        mRoutingBiasDtype, use_routing_scales_on_input, use_deep_seek_fp8,
         static_cast<RoutingMethodType>(routing_method_type), routing_stream);
 
     check_moe();
@@ -1224,8 +1292,9 @@ class MxInt4BlockScaleLauncher : public FusedMoeLauncher {
         routing_bias.has_value() ? routing_bias.value().dtype() : dl_bfloat16;
     mRoutingBiasDtype = routing_bias_dtype == dl_bfloat16 ? btg::Dtype::Bfloat16 : btg::Dtype::Fp32;
 
+    auto expert_weights_dtype = mDtypeScore == btg::Dtype::Fp32 ? dl_float32 : dl_bfloat16;
     expert_weights =
-        alloc_tensor({args->num_tokens, args->top_k}, dl_bfloat16, hidden_states.device());
+        alloc_tensor({args->num_tokens, args->top_k}, expert_weights_dtype, hidden_states.device());
 
     workspace.expert_weights = expert_weights.data_ptr();
   }
@@ -1369,19 +1438,6 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
             int64_t tile_tokens_dim, int64_t routing_method_type, bool use_shuffled_weight,
             int64_t weight_layout, ActivationType activation_type, btg::Dtype dtype_act,
             btg::Dtype dtype_weights) {
-    static const std::tuple<int, int> device_props = [this] {
-      int major, minor;
-      cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
-                             hidden_states.device().device_id);
-      cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor,
-                             hidden_states.device().device_id);
-      return std::make_tuple(major, minor);
-    }();
-
-    TVM_FFI_ICHECK_EQ(std::get<0>(device_props), 10)
-        << "This kernel requires 10.x architecture. Current device has SM "
-        << std::get<0>(device_props) << std::get<1>(device_props);
-
     // Set data types
     args->mDtypeElt = dtype_act;
     args->mDtypeOut = btg::Dtype::Bfloat16;  // Output is always BF16 for FP4
@@ -1591,8 +1647,8 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
         static_cast<int*>(num_tokens_per_expert.data_ptr()),
         static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
         static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
-        static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
-        use_routing_scales_on_input, use_deep_seek_fp8,
+        static_cast<int*>(num_non_exiting_ctas.data_ptr()), mDtypeScore, args->mDtypeElt,
+        mRoutingBiasDtype, use_routing_scales_on_input, use_deep_seek_fp8,
         static_cast<RoutingMethodType>(routing_method_type), routing_stream);
 
     check_moe();
@@ -1668,13 +1724,14 @@ Array<Tensor> trtllm_bf16_moe(Optional<TensorView> const& routing_logits,
   // Calculate supported tile sizes
   std::vector<int32_t> mSupportedTileN(Bf16MoeLauncher::mSupportedTileNums.begin(),
                                        Bf16MoeLauncher::mSupportedTileNums.end());
-  std::set<int32_t> selected_tile_nums =
-      computeSelectedTileN(mSupportedTileN, num_tokens, top_k, local_num_experts);
+  // Build launchers for ALL supported tiles (not just the computeSelectedTileN subset)
+  // so that autotuner-cached tactics always find their tile_N in the map.
+  // Launcher creation is cheap (no GPU allocation until run()), so this is safe.
 
   // Create a map of launchers for each tile size
   std::unordered_map<int32_t, std::unique_ptr<Bf16MoeLauncher>> launchers_map;
 
-  for (int32_t curr_tile_N : selected_tile_nums) {
+  for (int32_t curr_tile_N : mSupportedTileN) {
     // Create MoE arguments for this launcher
     auto args = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs>();
     args->num_tokens = num_tokens;
@@ -1702,17 +1759,14 @@ Array<Tensor> trtllm_bf16_moe(Optional<TensorView> const& routing_logits,
     launchers_map[curr_tile_N] = std::move(launcher);
   }
 
-  // Extract tile_N and config from moe_tactic
-  int64_t tile_N = moe_tactic[0];
-  int64_t config = moe_tactic[1];
-
-  // Handle default case
-  if (tile_N == -1 || config == -1) {
-    tile_N = *selected_tile_nums.begin();
-  }
+  auto const [tile_N, config] =
+      resolveMoeTileAndConfig(moe_tactic, mSupportedTileN, num_tokens, top_k, local_num_experts);
 
   // Get the launcher for the selected tile_N
-  auto& selected_launcher = launchers_map.at(tile_N);
+  auto launcher_it = launchers_map.find(static_cast<int32_t>(tile_N));
+  FLASHINFER_CHECK(launcher_it != launchers_map.end(),
+                   "Internal error: missing BF16 MoE launcher for tile_N=", tile_N);
+  auto& selected_launcher = launcher_it->second;
 
   // Run the launcher - it will create its own runner internally
   return selected_launcher->run(config, enable_pdl);
@@ -1730,13 +1784,12 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
   // Basic type validation
   auto dtype = hidden_states.dtype();
   auto activation = static_cast<ActivationType>(activation_type);
-  if (use_routing_scales_on_input) {
-    TVM_FFI_ICHECK_EQ(routing_logits.dtype(), dl_bfloat16) << "routing_logits must be bfloat16.";
-  } else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3) {
-    TVM_FFI_ICHECK_EQ(routing_logits.dtype(), dl_float32) << "routing_logits must be float.";
-  } else {
-    TVM_FFI_ICHECK_EQ(routing_logits.dtype(), dl_bfloat16) << "routing_logits must be bfloat16.";
+
+  if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3) {
+    TVM_FFI_ICHECK_EQ(routing_logits.dtype(), dl_float32)
+        << "routing_logits must be float for DeepSeekV3.";
   }
+
   TVM_FFI_ICHECK(dtype == dl_float8_e4m3fn || dtype == dl_float16 || dtype == dl_bfloat16)
       << "FP8 MoE: hidden_states must be float8_e4m3fn, float16, or bfloat16.";
   TVM_FFI_ICHECK_EQ(gemm1_weights.dtype(), dl_float8_e4m3fn)
@@ -1760,13 +1813,12 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
   // Calculate supported tile sizes
   std::vector<int32_t> mSupportedTileN(Fp8PerTensorLauncher::mSupportedTileNums.begin(),
                                        Fp8PerTensorLauncher::mSupportedTileNums.end());
-  std::set<int32_t> selected_tile_nums =
-      computeSelectedTileN(mSupportedTileN, num_tokens, top_k, local_num_experts);
+  // Build launchers for ALL supported tiles so autotuner-cached tactics always find their tile_N.
 
   // Create a map of launchers for each tile size
   std::unordered_map<int32_t, std::unique_ptr<Fp8PerTensorLauncher>> launchers_map;
 
-  for (int32_t curr_tile_N : selected_tile_nums) {
+  for (int32_t curr_tile_N : mSupportedTileN) {
     // Create MoE arguments for this launcher
     auto args = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs>();
     args->num_tokens = num_tokens;
@@ -1794,17 +1846,14 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
     launchers_map[curr_tile_N] = std::move(launcher);
   }
 
-  // Extract tile_N and config from config_index
-  int64_t tile_N = config_index[0];
-  int64_t config = config_index[1];
-
-  // Handle default case
-  if (tile_N == -1 || config == -1) {
-    tile_N = *selected_tile_nums.begin();
-  }
+  auto const [tile_N, config] =
+      resolveMoeTileAndConfig(config_index, mSupportedTileN, num_tokens, top_k, local_num_experts);
 
   // Get the launcher for the selected tile_N
-  auto& selected_launcher = launchers_map.at(tile_N);
+  auto launcher_it = launchers_map.find(static_cast<int32_t>(tile_N));
+  FLASHINFER_CHECK(launcher_it != launchers_map.end(),
+                   "Internal error: missing FP8 per-tensor MoE launcher for tile_N=", tile_N);
+  auto& selected_launcher = launcher_it->second;
 
   // Run the launcher - it will create its own runner internally
   return selected_launcher->run(config, enable_pdl, use_routing_scales_on_input);
@@ -1846,9 +1895,6 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
     if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3) {
       TVM_FFI_ICHECK_EQ(routing_logits.value().dtype(), dl_float32)
           << "routing_logits must be float.";
-    } else {
-      TVM_FFI_ICHECK_EQ(routing_logits.value().dtype(), dl_bfloat16)
-          << "routing_logits must be bfloat16.";
     }
   }
   TVM_FFI_ICHECK(dtype == dl_float16 || dtype == dl_bfloat16 || dtype == dl_float8_e4m3fn)
@@ -1891,13 +1937,12 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
   auto const hidden_size = hidden_states.size(1);
 
   auto supported_tile_nums = Fp8BlockScaleLauncher::getSupportedTileNums(quantization_type);
-  std::set<int32_t> selected_tile_nums =
-      computeSelectedTileN(supported_tile_nums, num_tokens, top_k, local_num_experts);
+  // Build launchers for ALL supported tiles so autotuner-cached tactics always find their tile_N.
 
   // Create a map of launchers for each tile size
   std::unordered_map<int32_t, std::unique_ptr<Fp8BlockScaleLauncher>> launchers_map;
 
-  for (int32_t curr_tile_N : selected_tile_nums) {
+  for (int32_t curr_tile_N : supported_tile_nums) {
     // Create MoE arguments for this launcher
     auto args = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs>();
     args->num_tokens = num_tokens;
@@ -1926,17 +1971,14 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
     launchers_map[curr_tile_N] = std::move(launcher);
   }
 
-  // Extract tile_N and config from config_index
-  int64_t tile_N = config_index[0];
-  int64_t config = config_index[1];
-
-  // Handle default case
-  if (tile_N == -1 || config == -1) {
-    tile_N = *selected_tile_nums.begin();
-  }
+  auto const [tile_N, config] = resolveMoeTileAndConfig(config_index, supported_tile_nums,
+                                                        num_tokens, top_k, local_num_experts);
 
   // Get the launcher for the selected tile_N
-  auto& selected_launcher = launchers_map.at(tile_N);
+  auto launcher_it = launchers_map.find(static_cast<int32_t>(tile_N));
+  FLASHINFER_CHECK(launcher_it != launchers_map.end(),
+                   "Internal error: missing FP8 block-scale MoE launcher for tile_N=", tile_N);
+  auto& selected_launcher = launcher_it->second;
 
   // Run the launcher with DeepSeek FP8 enabled - it will create its own runner internally
   return selected_launcher->run(
@@ -1963,32 +2005,21 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
   int hidden_size = hidden_states.size(1);
   if (hidden_states.dtype() == dl_uint8) hidden_size *= 2;
 
-  int hidden_states_scale_vec_size = -1;
+  int64_t hidden_states_scale_vec_size = -1;
   if (hidden_states_scale.has_value()) {
-    hidden_states_scale_vec_size = (num_tokens * hidden_size) / hidden_states_scale.value().numel();
+    hidden_states_scale_vec_size =
+        (static_cast<int64_t>(num_tokens) * hidden_size) / hidden_states_scale.value().numel();
   }
   int64_t intermediate_size_factor =
       isGatedActivation(static_cast<ActivationType>(act_type)) ? 2 : 1;
-  int weight_scale_vec_size =
-      (local_num_experts * intermediate_size * intermediate_size_factor * hidden_size) /
-      gemm1_weights_scale.numel();
+  int64_t weight_scale_vec_size = (static_cast<int64_t>(local_num_experts) * intermediate_size *
+                                   intermediate_size_factor * hidden_size) /
+                                  gemm1_weights_scale.numel();
 
   TVM_FFI_ICHECK(weight_scale_vec_size == 16 || weight_scale_vec_size == 32)
       << "unsupported weight_scale_vec_size.";
   auto mDtypeWeights = weight_scale_vec_size == 16 ? btg::Dtype::E2m1 : btg::Dtype::MxE2m1;
 
-  if (routing_logits.has_value()) {
-    TVM_FFI_ICHECK(routing_logits.value().dtype() == dl_float32 ||
-                   routing_logits.value().dtype() == dl_bfloat16)
-        << "routing_logits must be float or bfloat16.";
-    TVM_FFI_ICHECK_EQ(routing_logits.value().ndim(), 2) << "routing_logits must be 2D.";
-    TVM_FFI_ICHECK_EQ(routing_logits.value().size(1), num_experts)
-        << "routing_logits has incorrect shape.";
-    if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3) {
-      TVM_FFI_ICHECK_EQ(routing_logits.value().dtype(), dl_float32)
-          << "routing_logits must be float.";
-    }
-  }
   if (routing_bias.has_value()) {
     TVM_FFI_ICHECK(routing_bias.value().dtype() == dl_bfloat16 ||
                    routing_bias.value().dtype() == dl_float32)
@@ -2032,13 +2063,12 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
 
   // Determine supported tile sizes
   std::vector<int32_t> mSupportedTileN = FP4BlockScaleLauncher::getSupportedTileNums(mDtypeAct);
-  std::set<int32_t> selected_tile_nums =
-      computeSelectedTileN(mSupportedTileN, num_tokens, top_k, local_num_experts);
+  // Build launchers for ALL supported tiles so autotuner-cached tactics always find their tile_N.
 
   // Create a map of launchers for each tile size
   std::unordered_map<int32_t, std::unique_ptr<FP4BlockScaleLauncher>> launchers_map;
 
-  for (int32_t curr_tile_N : selected_tile_nums) {
+  for (int32_t curr_tile_N : mSupportedTileN) {
     // Create MoE arguments for this launcher
     auto args = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs>();
     args->num_tokens = num_tokens;
@@ -2070,18 +2100,14 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
     launchers_map[curr_tile_N] = std::move(launcher);
   }
 
-  // Extract tile_N and config from config_index
-  int64_t tile_N = config_index[0];
-  int64_t config = config_index[1];
-
-  // Handle default case
-  if (tile_N == -1 || config == -1) {
-    tile_N = *selected_tile_nums.begin();
-    config = -1;  // Let the runner choose default
-  }
+  auto const [tile_N, config] =
+      resolveMoeTileAndConfig(config_index, mSupportedTileN, num_tokens, top_k, local_num_experts);
 
   // Get the launcher for the selected tile_N
-  auto& selected_launcher = launchers_map.at(tile_N);
+  auto launcher_it = launchers_map.find(static_cast<int32_t>(tile_N));
+  FLASHINFER_CHECK(launcher_it != launchers_map.end(),
+                   "Internal error: missing FP4 block-scale MoE launcher for tile_N=", tile_N);
+  auto& selected_launcher = launcher_it->second;
 
   // Run the launcher - it will create its own runner internally
   return selected_launcher->run(config, enable_pdl);
@@ -2125,13 +2151,12 @@ Array<Tensor> trtllm_mxint4_block_scale_moe(
   // Determine supported tile sizes
   std::vector<int32_t> mSupportedTileN(MxInt4BlockScaleLauncher::mSupportedTileNums.begin(),
                                        MxInt4BlockScaleLauncher::mSupportedTileNums.end());
-  std::set<int32_t> selected_tile_nums =
-      computeSelectedTileN(mSupportedTileN, num_tokens, top_k, local_num_experts);
+  // Build launchers for ALL supported tiles so autotuner-cached tactics always find their tile_N.
 
   // Create a map of launchers for each tile size
   std::unordered_map<int32_t, std::unique_ptr<MxInt4BlockScaleLauncher>> launchers_map;
 
-  for (int32_t curr_tile_N : selected_tile_nums) {
+  for (int32_t curr_tile_N : mSupportedTileN) {
     // Create MoE arguments for this launcher
     auto args = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs>();
     args->num_tokens = num_tokens;
@@ -2159,18 +2184,14 @@ Array<Tensor> trtllm_mxint4_block_scale_moe(
     launchers_map[curr_tile_N] = std::move(launcher);
   }
 
-  // Extract tile_N and config from config_index
-  int64_t tile_N = config_index[0];
-  int64_t config = config_index[1];
-
-  // Handle default case
-  if (tile_N == -1 || config == -1) {
-    tile_N = *selected_tile_nums.begin();
-    config = -1;  // Let the runner choose default
-  }
+  auto const [tile_N, config] =
+      resolveMoeTileAndConfig(config_index, mSupportedTileN, num_tokens, top_k, local_num_experts);
 
   // Get the launcher for the selected tile_N
-  auto& selected_launcher = launchers_map.at(tile_N);
+  auto launcher_it = launchers_map.find(static_cast<int32_t>(tile_N));
+  FLASHINFER_CHECK(launcher_it != launchers_map.end(),
+                   "Internal error: missing MXINT4 block-scale MoE launcher for tile_N=", tile_N);
+  auto& selected_launcher = launcher_it->second;
 
   // Run the launcher - it will create its own runner internally
   return selected_launcher->run(config, enable_pdl);

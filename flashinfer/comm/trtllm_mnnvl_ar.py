@@ -132,11 +132,14 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         )
 
         # Allocate the workspace
+        # Use torch.cuda.current_device() instead of mapping.local_rank to
+        # support base_gpu_id != 0 scenarios where the actual CUDA device
+        # index differs from the TP rank / local_rank.
         self.mcast_buffer_handle = McastGPUBuffer(
             requested_workspace_size,
             mapping.tp_size,
             mapping.tp_rank,
-            torch.device("cuda", mapping.local_rank),
+            torch.device("cuda", torch.cuda.current_device()),
             comm_backend,
         )
 
@@ -167,7 +170,7 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         self.buffer_flags = torch.tensor(
             [0, 2, self.buffer_size_bytes, 0, *num_bytes_to_clear, 0],
             dtype=torch.uint32,
-            device=torch.device("cuda", mapping.local_rank),
+            device=torch.device("cuda", torch.cuda.current_device()),
         )
 
         self.uc_ptrs_dev = self.mcast_buffer_handle.get_buffer_ptrs_dev()

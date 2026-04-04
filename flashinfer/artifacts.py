@@ -135,12 +135,12 @@ class ArtifactPath:
     When compiling new cubins for backend directories, update the corresponding path.
     """
 
-    TRTLLM_GEN_FMHA: str = "f1ed60e5666a7620683a8c34a41c850a25029b35/fmha/trtllm-gen/"
+    TRTLLM_GEN_FMHA: str = "55bba55929d4093682e32d817bd11ffb0441c749/fmha/trtllm-gen/"
     TRTLLM_GEN_BMM: str = (
         "b55211623be7f5697c5262ffd8361fc06c147bc9/batched_gemm-b3c1646-c111d7c/"
     )
     TRTLLM_GEN_GEMM: str = (
-        "1fddc48b7b48af33914d040051b3e2ee9ba4701e/gemm-145d1b1-9b113e3/"
+        "b117d5a6b2dd2228aa966a938eac398cf336d8c0/gemm-b3c1646-1fddea2/"
     )
     CUDNN_SDPA: str = "a72d85b019dc125b9f711300cb989430f762f5a6/fmha/cudnn/"
     # For DEEPGEMM, we also need to update KernelMap.KERNEL_MAP_HASH in flashinfer/deep_gemm.py
@@ -157,14 +157,14 @@ class CheckSumHash:
     """
 
     TRTLLM_GEN_FMHA: str = (
-        "10a54e8c3175099481aed2739ae30fa0f782368c40f9ad1b423ed8353315d65b"
+        "f2c0aad1e74391c4267a2f9a20ec819358b59e04588385cffb452ed341500b99"
     )
     TRTLLM_GEN_BMM: str = (
         "0af823880730c4f0b3832d2208fab035946694b83444410b9309db5613d60195"
     )
     DEEPGEMM: str = "1a2a166839042dbd2a57f48051c82cd1ad032815927c753db269a4ed10d0ffbf"
     TRTLLM_GEN_GEMM: str = (
-        "15cb8c85dfb5eddd4f121d64cb5a718321fb55b85aa19df10ddc1329d4a726b9"
+        "18262161e624f7da9d2d04c528c645a5ff7f5efd774024a0b2eb92748ab18bb9"
     )
     CUDA_PTX: str = "0003bb62b07a87881844f40cf19eb8f98a99cb2bfd5a782b0deb7d3a0750df6f"
     map_checksums: dict[str, str] = {
@@ -293,7 +293,7 @@ def get_artifacts_status() -> tuple[tuple[str, bool], ...]:
     cubin_files = get_subdir_file_list()
 
     def _check_file_status(file_name: str) -> tuple[str, bool]:
-        # get_cubin stores cubins in FLASHINFER_CUBIN_DIR with the same relative path
+        # get_artifact stores files in FLASHINFER_CUBIN_DIR with the same relative path
         # Remove any leading slashes from name
         local_path = os.path.join(FLASHINFER_CUBIN_DIR, file_name)
         exists = os.path.isfile(local_path)
