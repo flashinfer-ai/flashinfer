@@ -1,15 +1,3 @@
-/*
-# SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
-# ==============================================================================
-*/
 #include <Bmm_MxE4m3_MxE4m3MxE4m3_Fp32_bA32_bB32_bC32_t128x8x512u2_s3_et128x8_m128x8x32_cga1x1x1_16dp256b_rM_TN_transOut_schPd2x1x2x3_biasM_relu2_bN_tma_ldgstsSf_rgTma_clmp_dynB_sm100f.h>
 namespace batchedGemm {
 
