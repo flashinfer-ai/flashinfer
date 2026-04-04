@@ -209,7 +209,8 @@ class Runner {
            int32_t* permutedIdxToTokenIdx, int32_t* ptrNumNonExitingCtas,
            int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx,
            int32_t* ptrCtaIdxXyToMnLimit, void* bmm1Workspace, bool useRoutingScalesOnInput,
-           int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl);
+           int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl,
+           float* perChannelWeightScale = nullptr);
 
  private:
   batchedGemm::trtllm::gen::Dtype mDtypeAct;
@@ -248,7 +249,7 @@ class Runner {
            int32_t numExperts, int32_t numTokens, int32_t* ptrNumNonExitingCtas,
            int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx,
            int32_t* ptrCtaIdxXyToMnLimit, void* bmm2Workspace, int device, cudaStream_t stream,
-           int32_t configIndex, bool enable_pdl);
+           int32_t configIndex, bool enable_pdl, float* perChannelWeightScale = nullptr);
 
  private:
   batchedGemm::trtllm::gen::Dtype mDtypeAct;
@@ -312,6 +313,13 @@ struct MoERunnerArgs {
   float* output1_scales_scalar = nullptr;
   float* output1_scales_gate_scalar = nullptr;
   float* output2_scales_scalar = nullptr;
+
+  // Per-channel weight scales
+  // Passed to TrtllmGenBatchedGemmRunner as perTokensSfB (which maps to kernel mPtrPerTokenSfA
+  // due to transposeMmaOutput=true)
+  float* gemm1_per_channel_weight_scale = nullptr;       // [2*intermediate_size] for gated acts
+  float* gemm1_per_channel_gate_weight_scale = nullptr;  // [2*intermediate_size] for gated acts
+  float* gemm2_per_channel_weight_scale = nullptr;       // [hidden_size]
 
   // Output:
   void* output = nullptr;
