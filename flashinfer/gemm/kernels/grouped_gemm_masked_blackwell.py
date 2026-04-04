@@ -109,6 +109,7 @@ class MaskedSchedulerParams:
         c: cute.Tensor,
         c_tiler: Tuple[int, int],
         cluster_shape_mnk: cute.Shape,
+        is_swap_ab: bool = False,
         *,
         loc=None,
         ip=None,
@@ -126,6 +127,7 @@ class MaskedSchedulerParams:
         # cluster_shape_mnk is kept for reconstruction
         self._cluster_shape_mnk = cluster_shape_mnk
         self.cluster_shape_mn = cluster_shape_mnk[:2]
+        self.is_swap_ab = is_swap_ab
         self._loc = loc
 
         self.problem_layout_ncluster_mnl = cute.make_layout(
@@ -144,6 +146,7 @@ class MaskedSchedulerParams:
             self.c,
             self.c_tiler,
             self._cluster_shape_mnk,
+            self.is_swap_ab,
         ]:
             obj_values = extract_mlir_values(obj)
             values += obj_values
@@ -159,6 +162,7 @@ class MaskedSchedulerParams:
                 self.c,
                 self.c_tiler,
                 self._cluster_shape_mnk,
+                self.is_swap_ab,
             ],
             self._values_pos,
             strict=True,
@@ -171,7 +175,10 @@ class MaskedSchedulerParams:
     def get_grid_shape(
         self, max_active_clusters: Int32, *, loc=None, ip=None
     ) -> Tuple[Integer, Integer, Integer]:
-        num_persistent_clusters = max_active_clusters
+        total_tile_clusters = cute.size(
+            self.problem_layout_ncluster_mnl, loc=loc, ip=ip
+        )
+        num_persistent_clusters = min(max_active_clusters, total_tile_clusters)
 
         return (*self.cluster_shape_mn, num_persistent_clusters)
 
@@ -299,14 +306,20 @@ class MaskedScheduler:
         # is_valid = current_work_linear_idx < cute.size(
         #     self.params.problem_layout_ncluster_mnl, loc=loc, ip=ip
         # )
-        num_tiles_n = self.params.problem_shape_ntile_mnl[1]
+        is_swap_ab = self.params.is_swap_ab
+        num_tiles_n = self.params.problem_shape_ntile_mnl[
+            0 if cutlass.const_expr(is_swap_ab) else 1
+        ]
         accum_tile_m = self._accum_tile_m
         batch_idx = self._current_batch_idx
 
         while (
             (
                 accum_tile_m
-                + cute.ceil_div(self.params.masked_m[batch_idx], self.params.c_tiler[0])
+                + cute.ceil_div(
+                    self.params.masked_m[batch_idx],
+                    self.params.c_tiler[1 if cutlass.const_expr(is_swap_ab) else 0],
+                )
             )
             * num_tiles_n
             <= current_work_linear_idx
@@ -323,7 +336,8 @@ class MaskedScheduler:
                 )
 
             accum_tile_m += cute.ceil_div(
-                self.params.masked_m[batch_idx], self.params.c_tiler[0]
+                self.params.masked_m[batch_idx],
+                self.params.c_tiler[1 if cutlass.const_expr(is_swap_ab) else 0],
             )
             batch_idx += Int32(1)
 
@@ -336,18 +350,25 @@ class MaskedScheduler:
                 self._accum_tile_m
                 + cute.ceil_div(
                     self.params.masked_m[self._current_batch_idx],
-                    self.params.c_tiler[0],
+                    self.params.c_tiler[1 if cutlass.const_expr(is_swap_ab) else 0],
                 )
             ) * num_tiles_n > current_work_linear_idx
 
         # cur_cluster_coord = self.params.problem_layout_ncluster_mnl.get_hier_coord(
         #     current_work_linear_idx, loc=loc, ip=ip
         # )
-        cur_cluster_coord = (
-            current_work_linear_idx // num_tiles_n - self._accum_tile_m,
-            current_work_linear_idx % num_tiles_n,
-            self._current_batch_idx,
-        )
+        if cutlass.const_expr(is_swap_ab):
+            cur_cluster_coord = (
+                current_work_linear_idx % num_tiles_n,
+                current_work_linear_idx // num_tiles_n - self._accum_tile_m,
+                self._current_batch_idx,
+            )
+        else:
+            cur_cluster_coord = (
+                current_work_linear_idx // num_tiles_n - self._accum_tile_m,
+                current_work_linear_idx % num_tiles_n,
+                self._current_batch_idx,
+            )
 
         # cur_tile_coord is a tuple of i32 values
         cur_tile_coord = tuple(
@@ -394,6 +415,90 @@ class MaskedScheduler:
     @property
     def num_tiles_executed(self) -> Int32:
         return self._num_tiles_executed
+
+
+@dsl_user_op
+def make_fused_smem_layout_epi(
+    epi_dtype: Type[cutlass.Numeric],
+    epi_layout: utils.LayoutEnum,
+    epi_tile: cute.Tile,
+    epi_stage: int,
+    *,
+    loc=None,
+    ip=None,
+) -> Union[cute.Layout, cute.ComposedLayout]:
+    epilog_shape = cute.product_each(
+        cute.shape(epi_tile, loc=loc, ip=ip), loc=loc, ip=ip
+    )
+    pad = 8  # shift each row to a different smem bank
+    c_smem_layout_atom = cute.make_composed_layout(
+        cute.make_swizzle(0, 4, 3),
+        0,
+        cute.make_layout((epi_tile[0].shape, 8), stride=(1, epi_tile[0].shape + pad)),
+        loc=loc,
+        ip=ip,
+    )
+
+    epilog_shape = cute.append(epilog_shape, epi_stage, loc=loc, ip=ip)
+    epi_smem_layout_staged = cute.tile_to_shape(
+        c_smem_layout_atom,
+        epilog_shape,
+        order=((1, 0, 2) if not epi_layout.is_n_major_c() else (0, 1, 2)),
+        loc=loc,
+        ip=ip,
+    )
+
+    return epi_smem_layout_staged
+
+
+def cp_reduce_bf16_add(dst_addr, src_addr, size, *, loc=None, ip=None):
+    """Async bulk copy-reduce (add) from shared memory to global memory.
+
+    PTX instruction: cp.reduce.async.bulk.global.shared::cta.bulk_group.add.bf16.noftz [dstMem], [srcMem], size;
+    """
+    llvm.inline_asm(
+        None,
+        [
+            dst_addr.toint(loc=loc, ip=ip).ir_value(),
+            src_addr.toint(loc=loc, ip=ip).ir_value(),
+            Int32(size).ir_value(loc=loc, ip=ip),
+        ],
+        "cp.reduce.async.bulk.global.shared::cta.bulk_group.add.bf16.noftz [$0], [$1], $2;",
+        "l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+def cp_reduce_f32_add(dst_addr, src_addr, size, *, loc=None, ip=None):
+    """Async bulk copy-reduce (add) from shared memory to global memory.
+
+    PTX instruction: cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f32 [dstMem], [srcMem], size;
+
+    Performs an asynchronous bulk reduction operation that atomically adds f32 values
+    from shared memory (CTA scope) to global memory. The operation is part of a bulk group.
+
+    Args:
+        dst_addr: Destination global memory address (pointer)
+        src_addr: Source shared memory address (pointer)
+        size: Size in bytes of the data to reduce (must be a multiple of 4)
+    """
+    llvm.inline_asm(
+        None,
+        [
+            dst_addr.toint(loc=loc, ip=ip).ir_value(),
+            src_addr.toint(loc=loc, ip=ip).ir_value(),
+            Int32(size).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f32 [$0], [$1], $2;
+        """,
+        "l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
 
 
 """
@@ -516,6 +621,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
         sm_version: str,
+        num_ranks: int = 0,
+        is_combine_fusion: bool = False,
+        is_swap_ab: bool = False,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -547,6 +655,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.cluster_shape_mn = cluster_shape_mn
         # K dimension is deferred in _setup_attributes
         self.mma_tiler = (*mma_tiler_mn, 1)
+        self.num_ranks = num_ranks
+        self.is_combine_fusion = is_combine_fusion
+        self.is_swap_ab = is_swap_ab
 
         self.cta_group = (
             tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
@@ -682,6 +793,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.sf_vec_size,
             self.smem_capacity,
             self.occupancy,
+            self.is_combine_fusion,
         )
 
         # Compute A/B/SFA/SFB/C shared memory layout
@@ -709,12 +821,20 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.sf_vec_size,
             self.num_ab_stage,
         )
-        self.c_smem_layout_staged = sm100_utils.make_smem_layout_epi(
-            self.c_dtype,
-            self.c_layout,
-            self.epi_tile,
-            self.num_c_stage,
-        )
+        if self.is_combine_fusion:
+            self.c_smem_layout_staged = make_fused_smem_layout_epi(
+                self.c_dtype,
+                self.c_layout,
+                self.epi_tile,
+                self.num_c_stage,
+            )
+        else:
+            self.c_smem_layout_staged = sm100_utils.make_smem_layout_epi(
+                self.c_dtype,
+                self.c_layout,
+                self.epi_tile,
+                self.num_c_stage,
+            )
 
     @cute.jit
     def __call__(
@@ -727,6 +847,12 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         masked_m_tensor: cute.Tensor,
         dst_signals: Optional[cute.Pointer],
         alpha_tensor: Optional[cute.Tensor],
+        topk_weights: Optional[cute.Tensor],
+        idx_src_info: Optional[cute.Tensor],
+        rank_src_info: Optional[cute.Tensor],
+        out_ptrs: Optional[cute.Tensor],
+        barrier_flag_local: Optional[cute.Pointer],
+        barrier_flag_multicast: Optional[cute.Pointer],
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
@@ -878,13 +1004,15 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         ) * atom_thr_size
 
         # Setup TMA store for C
-        epi_smem_layout = cute.slice_(self.c_smem_layout_staged, (None, None, 0))
-        tma_atom_c, tma_tensor_c = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileS2GOp(),
-            c_tensor,
-            epi_smem_layout,
-            self.epi_tile,
-        )
+        tma_atom_c = None
+        if cutlass.const_expr(not self.is_combine_fusion):
+            epi_smem_layout = cute.slice_(self.c_smem_layout_staged, (None, None, 0))
+            tma_atom_c, tma_tensor_c = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileS2GOp(),
+                c_tensor,
+                epi_smem_layout,
+                self.epi_tile,
+            )
 
         # Compute grid size
         self.tile_sched_params, grid = self._compute_grid(
@@ -894,6 +1022,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.cta_tile_shape_mnk,
             self.cluster_shape_mn,
             max_active_clusters,
+            self.is_swap_ab,
         )
 
         self.buffer_align_bytes = 1024
@@ -943,6 +1072,23 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 ],
                 self.buffer_align_bytes,
             ]
+            if cutlass.const_expr(self.is_combine_fusion):
+                # Prefetch buffer for out_ptrs (one Int64 per M-row in the MMA tile)
+                combine_out_ptrs: cute.struct.Align[
+                    cute.struct.MemRange[
+                        cutlass.Int64,
+                        self.mma_inst_shape_mnk[1],
+                    ],
+                    16,
+                ]
+                # Prefetch buffer for topk_weights (one Float32 per M-row in the MMA tile)
+                combine_topk: cute.struct.Align[
+                    cute.struct.MemRange[
+                        cutlass.Float32,
+                        self.mma_inst_shape_mnk[1],
+                    ],
+                    16,
+                ]
 
         self.shared_storage = SharedStorage
 
@@ -959,8 +1105,14 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             tma_atom_sfb,
             tma_tensor_sfb,
             tma_atom_c,
-            tma_tensor_c,
+            c_tensor if self.is_combine_fusion else tma_tensor_c,
             alpha_tensor,
+            topk_weights,
+            idx_src_info,
+            rank_src_info,
+            out_ptrs,
+            barrier_flag_local,
+            barrier_flag_multicast,
             self.cluster_layout_vmnk,
             self.cluster_layout_sfb_vmnk,
             self.a_smem_layout_staged,
@@ -976,6 +1128,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             cluster=(*self.cluster_shape_mn, 1),
             smem=self.shared_storage.size_in_bytes(),  # type: ignore[attr-defined]
             stream=stream,
+            min_blocks_per_mp=1,
         )
         return
 
@@ -996,6 +1149,12 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         tma_atom_c: Optional[cute.CopyAtom],
         mC_mnl: cute.Tensor,
         alpha: Optional[cute.Tensor],
+        topk_weights: Optional[cute.Tensor],
+        idx_src_info: Optional[cute.Tensor],
+        rank_src_info: Optional[cute.Tensor],
+        out_ptrs: Optional[cute.Tensor],
+        barrier_flag_local: Optional[cute.Tensor],
+        barrier_flag_multicast: Optional[cute.Tensor],
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -1020,7 +1179,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             cpasync.prefetch_descriptor(tma_atom_b)
             cpasync.prefetch_descriptor(tma_atom_sfa)
             cpasync.prefetch_descriptor(tma_atom_sfb)
-            cpasync.prefetch_descriptor(tma_atom_c)
+            if cutlass.const_expr(tma_atom_c is not None):
+                cpasync.prefetch_descriptor(tma_atom_c)
 
         use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
 
@@ -1106,6 +1266,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sC = storage.sC.get_tensor(
             c_smem_layout_staged.outer, swizzle=c_smem_layout_staged.inner
         )
+        if cutlass.const_expr(self.is_combine_fusion):
+            smem_out_ptrs = storage.combine_out_ptrs.get_tensor(
+                cute.make_layout(self.mma_inst_shape_mnk[1])
+            )
+            smem_topk = storage.combine_topk.get_tensor(
+                cute.make_layout(self.mma_inst_shape_mnk[1])
+            )
         # (MMA, MMA_M, MMA_K, STAGE)
         sA = storage.sA.get_tensor(
             a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner
@@ -1637,6 +1804,16 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 )
             )
 
+            # S2R copy for topk_weights: SMEM → registers with T2R-compatible layout
+            if cutlass.const_expr(self.is_combine_fusion):
+                topk_s2r_atom = cute.make_copy_atom(
+                    cute.nvgpu.CopyUniversalOp(), self.acc_dtype
+                )
+                topk_tiled_s2r = cute.make_tiled_copy_D(topk_s2r_atom, tiled_copy_t2r)
+                topk_thr_s2r = topk_tiled_s2r.get_slice(epi_tidx)
+                topk_rFrag = cute.make_fragment(tTR_rAcc.shape, self.acc_dtype)
+                topk_rRetiled = topk_tiled_s2r.retile(topk_rFrag)
+
             #
             # Persistent tile scheduling loop
             #
@@ -1653,7 +1830,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             c_producer_group = pipeline.CooperativeGroup(
                 pipeline.Agent.Thread,
                 self.threads_per_warp * len(self.epilog_warp_id),
-                self.threads_per_warp * len(self.epilog_warp_id),
             )
             c_pipeline = pipeline.PipelineTmaStore.create(
                 num_stages=self.num_c_stage,
@@ -1667,6 +1843,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             dsm_pending_packed = Uint64(0)
             dsm_pending_idx = Int32(0)
             dsm_counter = Uint8(0)
+            c_dtype_bytes: cutlass.Constexpr = self.c_dtype.width // 8
+            epilog_threads = self.threads_per_warp * len(self.epilog_warp_id)
 
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler
@@ -1690,6 +1868,33 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     )
                 ]
 
+                #
+                # Prefetch out_ptrs and topk_weights for this tile into SMEM
+                # (overlaps GMEM loads with MMA pipeline stall)
+                #
+                if cutlass.const_expr(self.is_combine_fusion):
+                    prefetch_m_base = cur_tile_coord[1] * self.mma_inst_shape_mnk[1]
+                    prefetch_num_m: cutlass.Constexpr = self.mma_inst_shape_mnk[1]
+                    prefetch_l_idx = cur_tile_coord[2]
+                    if tidx < prefetch_num_m:
+                        prefetch_m_idx = prefetch_m_base + tidx
+                        smem_topk[tidx] = topk_weights[prefetch_l_idx, prefetch_m_idx]
+                        if prefetch_m_idx < tile_sched_params.masked_m[prefetch_l_idx]:
+                            src_rank = rank_src_info[prefetch_l_idx, prefetch_m_idx]
+                            src_idx = idx_src_info[prefetch_l_idx, prefetch_m_idx]
+                            col_size = mC_mnl.shape[0]
+                            smem_out_ptrs[tidx] = (
+                                out_ptrs[src_rank]
+                                + (src_idx * col_size) * c_dtype_bytes
+                            )
+                        else:
+                            smem_out_ptrs[tidx] = Int64(0)
+
+                    cute.arch.barrier(
+                        barrier_id=self.epilog_sync_bar_id,
+                        number_of_threads=epilog_threads,
+                    )
+
                 # Set tensor memory buffer for current tile
                 # (T2R, T2R_M, T2R_N, EPI_M, EPI_M)
                 tTR_tAcc = tTR_tAcc_base[
@@ -1704,6 +1909,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
                 bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
 
+                cur_tile_dim0_offset = cur_tile_coord[0] * self.mma_inst_shape_mnk[0]
+                cur_tile_dim1_offset = cur_tile_coord[1] * self.mma_inst_shape_mnk[1]
                 #
                 # Store accumulator to global memory in subtiles
                 #
@@ -1719,9 +1926,37 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     #
                     # Convert to C type
                     #
-                    acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
+                    if cutlass.const_expr(self.is_combine_fusion):
+                        # S2R copy: load topk from SMEM into register fragment
+                        topk_smem_offset = (
+                            subtile_idx
+                            * epi_tile[1].shape
+                            * (self.acc_dtype.width // 8)
+                        )
+                        topk_stride = (0, 1)
+                        subtile_topk_ptr = cute.make_ptr(
+                            self.acc_dtype,
+                            smem_topk.iterator.toint() + topk_smem_offset,
+                            cute.AddressSpace.smem,
+                        )
+                        smem_topk_2d = cute.make_tensor(
+                            subtile_topk_ptr,
+                            cute.make_layout(
+                                (epi_tile[0].shape, epi_tile[1].shape),
+                                stride=topk_stride,
+                            ),
+                        )
+                        tSR_sTopk = topk_thr_s2r.partition_S(smem_topk_2d)
+                        cute.copy(topk_tiled_s2r, tSR_sTopk, topk_rRetiled)
+                        topk_regs_mn = topk_rFrag.load()
+                        acc_vec = tTR_rAcc.load()
+                    else:
+                        acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
                     if cutlass.const_expr(alpha is not None):
                         acc_vec = acc_vec * alpha[work_tile.tile_idx[2]]
+
+                    if cutlass.const_expr(self.is_combine_fusion):
+                        acc_vec = acc_vec * topk_regs_mn
 
                     acc_vec = acc_vec.to(self.c_dtype)
                     tRS_rC.store(acc_vec)
@@ -1737,7 +1972,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     )
                     # Fence and barrier to make sure shared memory store is visible to TMA store
                     cute.arch.fence_proxy("async.shared", space="cta")
-                    epilog_threads = self.threads_per_warp * len(self.epilog_warp_id)
                     cute.arch.barrier(
                         barrier_id=self.epilog_sync_bar_id,
                         number_of_threads=epilog_threads,
@@ -1746,39 +1980,80 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     #
                     # TMA store C to global memory
                     #
-                    if warp_idx == self.epilog_warp_id[0]:
-                        cute.copy(
-                            tma_atom_c,
-                            bSG_sC[(None, c_buffer)],
-                            bSG_gC[(None, subtile_idx)],
-                        )
-
-                        # Fence and barrier to make sure shared memory store is visible to TMA store
+                    if cutlass.const_expr(self.is_combine_fusion):
+                        src_smem_tensor = bSG_sC[(None, c_buffer)]
+                        n_idx = cur_tile_dim0_offset
+                        l_idx = cur_tile_coord[2]
+                        with cute.arch.elect_one():
+                            local_m = subtile_idx * epi_tile[1].shape + warp_idx * 8
+                            smem_out_ptrs_ptr = cute.make_ptr(
+                                Int64,
+                                smem_out_ptrs.iterator.toint() + local_m * 8,
+                                cute.AddressSpace.smem,
+                            )
+                            reg_out_ptrs = cute.make_tensor(
+                                smem_out_ptrs_ptr, (8,)
+                            ).load()
+                            for iter in cutlass.range_constexpr(8):
+                                m_row = warp_idx * 8 + iter
+                                m_idx = (
+                                    cur_tile_dim1_offset
+                                    + subtile_idx * epi_tile[1].shape
+                                    + m_row
+                                )
+                                out_ptr = reg_out_ptrs[iter]
+                                if m_idx < tile_sched_params.masked_m[l_idx]:
+                                    src_ptr = cute.make_ptr(
+                                        self.c_dtype,
+                                        out_ptr + n_idx * c_dtype_bytes,
+                                        cute.AddressSpace.gmem,
+                                        assumed_align=16,
+                                    )
+                                    if cutlass.const_expr(self.c_dtype.width == 16):
+                                        cp_reduce_bf16_add(
+                                            src_ptr,
+                                            src_smem_tensor[((None, m_row),)].iterator,
+                                            epi_tile[0].shape * c_dtype_bytes,
+                                        )
+                                    else:
+                                        cp_reduce_f32_add(
+                                            src_ptr,
+                                            src_smem_tensor[((None, m_row),)].iterator,
+                                            epi_tile[0].shape * c_dtype_bytes,
+                                        )
+                    else:
+                        if warp_idx == self.epilog_warp_id[0]:
+                            cute.copy(
+                                tma_atom_c,
+                                bSG_sC[(None, c_buffer)],
+                                bSG_gC[(None, subtile_idx)],
+                            )
+                    # Fence and barrier to make sure shared memory store is visible to TMA store
+                    with cute.arch.elect_one():
                         c_pipeline.producer_commit()
 
-                        if cutlass.const_expr(
-                            tile_sched_params.dst_signals is not None
-                        ):
-                            dsm_counter = (dsm_counter + 1).to(Uint8)
-                            will_write_signals = (
-                                read_byte(dsm_pending_packed, dsm_pending_idx)
-                                == dsm_counter
+                    if cutlass.const_expr(tile_sched_params.dst_signals is not None):
+                        dsm_counter = (dsm_counter + 1).to(Uint8)
+                        will_write_signals = (
+                            read_byte(dsm_pending_packed, dsm_pending_idx)
+                            == dsm_counter
+                        )
+
+                        if will_write_signals:
+                            # The original c_pipeline.producer_acquire()
+                            #   := PipelineTmaStore.producer_acquire()
+                            #   := TmaStoreFence.wait()
+                            #   := cute.arch.cp_async_bulk_wait_group(self.num_stages - 1, read=True)
+                            cute.arch.cp_async_bulk_wait_group(
+                                self.num_c_stage - 1,
+                                # Change `read` from True to False to also wait writes
+                                read=False,
                             )
-
-                            if will_write_signals:
-                                # The original c_pipeline.producer_acquire()
-                                #   := PipelineTmaStore.producer_acquire()
-                                #   := TmaStoreFence.wait()
-                                #   := cute.arch.cp_async_bulk_wait_group(self.num_stages - 1, read=True)
-                                cute.arch.cp_async_bulk_wait_group(
-                                    self.num_c_stage - 1,
-                                    # Change `read` from True to False to also wait writes
-                                    read=False,
-                                )
-                            else:
-                                c_pipeline.producer_acquire()
-
                         else:
+                            c_pipeline.producer_acquire()
+
+                    else:
+                        with cute.arch.elect_one():
                             c_pipeline.producer_acquire()
 
                     cute.arch.barrier(
@@ -1821,7 +2096,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             #
             if warp_idx == self.epilog_warp_id[0]:
                 cute.arch.relinquish_tmem_alloc_permit(is_two_cta=use_2cta_instrs)
-            epilog_threads = self.threads_per_warp * len(self.epilog_warp_id)
             cute.arch.barrier(
                 barrier_id=self.epilog_sync_bar_id, number_of_threads=epilog_threads
             )
@@ -1858,8 +2132,43 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         )
                         dsm_pending_idx += 1
 
+            elif cutlass.const_expr(self.is_combine_fusion):
+                with cute.arch.elect_one():
+                    cute.arch.cp_async_bulk_wait_group(
+                        0,
+                        # Change `read` from True to False to also wait writes
+                        read=False,
+                    )
+                cute.arch.barrier(
+                    barrier_id=self.epilog_sync_bar_id, number_of_threads=epilog_threads
+                )
             else:
                 c_pipeline.producer_tail()
+
+            if cutlass.const_expr(self.is_combine_fusion):
+                if warp_idx == self.epilog_warp_id[0]:
+                    with cute.arch.elect_one():
+                        # Linear id of current SM.
+                        sm_id_linear = (
+                            cute.arch.block_idx()[0]
+                            + cute.arch.block_idx()[1] * cute.arch.grid_dim()[0]
+                            + cute.arch.block_idx()[2]
+                            * cute.arch.grid_dim()[0]
+                            * cute.arch.grid_dim()[1]
+                        )
+                        # Release flag with sys scope
+                        utils.distributed.multimem_red_add1(
+                            lock_ptr=barrier_flag_multicast.iterator + sm_id_linear,
+                            scope="sys",
+                            order="release",
+                        )
+                        # Relaxed spin-lock wait flag with sys scope
+                        utils.distributed.spin_lock_atom_cas_relaxed_wait(
+                            lock_ptr=barrier_flag_local.iterator + sm_id_linear,
+                            expected_val=self.num_ranks,
+                            reset_val=0,
+                            scope="sys",
+                        )
 
     def mainloop_s2t_copy_and_partition(
         self,
@@ -2040,6 +2349,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         tma_atom_c = atom
         sC_for_tma_partition = cute.group_modes(sC, 0, 2)
         gC_for_tma_partition = cute.group_modes(gC_epi, 0, 2)
+        if cutlass.const_expr(self.is_combine_fusion):
+            return tma_atom_c, sC_for_tma_partition, gC_for_tma_partition
         # ((ATOM_V, REST_V), EPI_M, EPI_N)
         # ((ATOM_V, REST_V), EPI_M, EPI_N, RestM, RestN, RestL)
         bSG_sC, bSG_gC = cpasync.tma_partition(
@@ -2066,6 +2377,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sf_vec_size: int,
         smem_capacity: int,
         occupancy: int,
+        is_combine_fusion: bool = False,
     ) -> Tuple[int, int, int]:
         """Computes the number of stages for A/B/C operands based on heuristics.
 
@@ -2132,12 +2444,20 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             1,  # a tmp 1 stage is provided
         )
 
-        c_smem_layout_staged_one = sm100_utils.make_smem_layout_epi(
-            c_dtype,
-            c_layout,
-            epi_tile,
-            1,
-        )
+        if is_combine_fusion:
+            c_smem_layout_staged_one = make_fused_smem_layout_epi(
+                c_dtype,
+                c_layout,
+                epi_tile,
+                1,
+            )
+        else:
+            c_smem_layout_staged_one = sm100_utils.make_smem_layout_epi(
+                c_dtype,
+                c_layout,
+                epi_tile,
+                1,
+            )
 
         ab_bytes_per_stage = (
             cute.size_in_bytes(a_dtype, a_smem_layout_stage_one)
@@ -2146,6 +2466,14 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             + cute.size_in_bytes(sf_dtype, sfb_smem_layout_staged_one)
         )
         mbar_helpers_bytes = 1024
+        # Account for out_ptrs and topk_weights prefetch buffers
+        if is_combine_fusion:
+            num_m_rows = mma_tiler_mnk[1]
+            combine_prefetch_bytes = (
+                num_m_rows * 8  # sizeof(Int64) for out_ptrs
+                + num_m_rows * 4  # sizeof(Float32) for topk_weights
+            )
+            mbar_helpers_bytes += combine_prefetch_bytes
         c_bytes_per_stage = cute.size_in_bytes(c_dtype, c_smem_layout_staged_one)
         c_bytes = c_bytes_per_stage * num_c_stage
 
@@ -2176,6 +2504,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         cta_tile_shape_mnk: Tuple[int, int, int],
         cluster_shape_mn: Tuple[int, int],
         max_active_clusters: cutlass.Constexpr,
+        is_swap_ab: cutlass.Constexpr,
     ) -> Tuple[MaskedSchedulerParams, Tuple[int, int, int]]:
         """Use persistent tile scheduler to compute the grid size for the output tensor C.
 
@@ -2197,7 +2526,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         cluster_shape_mnl = (*cluster_shape_mn, 1)
 
         tile_sched_params = MaskedSchedulerParams(
-            masked_m_tensor, dst_signals, c, c_tiler, cluster_shape_mnl
+            masked_m_tensor, dst_signals, c, c_tiler, cluster_shape_mnl, is_swap_ab
         )
         grid = MaskedScheduler.get_grid_shape(tile_sched_params, max_active_clusters)
 
@@ -2587,6 +2916,9 @@ class MaskedBatchedMatmulCuteDSL:
         cluster_shape_mn: Tuple[int, int],
         sm_count: int,
         sm_version: str,
+        num_ranks: int = 0,
+        is_combine_fusion: bool = False,
+        is_swap_ab: bool = False,
     ):
         self._m = m
         self._n = n
@@ -2602,7 +2934,10 @@ class MaskedBatchedMatmulCuteDSL:
         self._sf_vec_size = sf_vec_size
         self._mma_tiler_mn = mma_tiler_mn
         self._cluster_shape_mn = cluster_shape_mn
-
+        self._num_ranks = num_ranks
+        self._num_sms = sm_count
+        self._is_combine_fusion = is_combine_fusion
+        self._is_swap_ab = is_swap_ab
         if not Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
             ab_dtype,
             sf_dtype,
@@ -2642,6 +2977,12 @@ class MaskedBatchedMatmulCuteDSL:
         masked_m_ptr: cute.Pointer,
         dst_signals_ptr: Optional[cute.Pointer],
         alpha_ptr: cute.Pointer,
+        topk_weights_ptr: Optional[cute.Pointer],
+        idx_src_info_ptr: Optional[cute.Pointer],
+        rank_src_info_ptr: Optional[cute.Pointer],
+        out_ptrs_ptr: Optional[cute.Pointer],
+        barrier_flag_local_ptr: Optional[cute.Pointer],
+        barrier_flag_multicast_ptr: Optional[cute.Pointer],
         current_stream: cuda.CUstream,
     ):
         a_tensor = cute.make_tensor(
@@ -2665,6 +3006,53 @@ class MaskedBatchedMatmulCuteDSL:
                 order=(0, 1, 2) if self._c_major == "m" else (1, 0, 2),
             ),
         )
+        row_size = self._n if self._c_major == "m" else self._m
+        if cutlass.const_expr(self._num_ranks > 0):
+            topk_weights_tensor = cute.make_tensor(
+                topk_weights_ptr,
+                layout=cute.make_ordered_layout((self._l, row_size), order=(1, 0)),
+            )
+            idx_src_info_tensor = (
+                cute.make_tensor(
+                    idx_src_info_ptr,
+                    layout=cute.make_ordered_layout((self._l, row_size), order=(1, 0)),
+                )
+                if cutlass.const_expr(idx_src_info_ptr is not None)
+                else None
+            )
+            rank_src_info_tensor = (
+                cute.make_tensor(
+                    rank_src_info_ptr,
+                    layout=cute.make_ordered_layout((self._l, row_size), order=(1, 0)),
+                )
+                if cutlass.const_expr(rank_src_info_ptr is not None)
+                else None
+            )
+            if cutlass.const_expr(rank_src_info_ptr is not None):
+                out_ptrs_tensor = cute.make_tensor(
+                    out_ptrs_ptr,
+                    layout=cute.make_ordered_layout((self._num_ranks,), order=(0,)),
+                )
+            else:
+                out_ptrs_tensor = cute.make_tensor(
+                    out_ptrs_ptr,
+                    layout=cute.make_ordered_layout((self._l, row_size), order=(1, 0)),
+                )
+            barrier_flag_local_tensor = cute.make_tensor(
+                barrier_flag_local_ptr,
+                layout=cute.make_ordered_layout((self._num_sms,), order=(0,)),
+            )
+            barrier_flag_multicast_tensor = cute.make_tensor(
+                barrier_flag_multicast_ptr,
+                layout=cute.make_ordered_layout((self._num_sms,), order=(0,)),
+            )
+        else:
+            topk_weights_tensor = None
+            idx_src_info_tensor = None
+            rank_src_info_tensor = None
+            out_ptrs_tensor = None
+            barrier_flag_local_tensor = None
+            barrier_flag_multicast_tensor = None
 
         # calculate sf_tensor shape and order
         def ceil_div(a, b):
@@ -2729,6 +3117,9 @@ class MaskedBatchedMatmulCuteDSL:
             mma_tiler_mn=self._mma_tiler_mn,
             cluster_shape_mn=self._cluster_shape_mn,
             sm_version=self._sm_version,
+            num_ranks=self._num_ranks,
+            is_combine_fusion=self._is_combine_fusion,
+            is_swap_ab=self._is_swap_ab,
         )(
             a_tensor,
             b_tensor,
@@ -2738,6 +3129,12 @@ class MaskedBatchedMatmulCuteDSL:
             masked_m_tensor,
             dst_signals_ptr,
             alpha_tensor,
+            topk_weights_tensor,
+            idx_src_info_tensor,
+            rank_src_info_tensor,
+            out_ptrs_tensor,
+            barrier_flag_local_tensor,
+            barrier_flag_multicast_tensor,
             self._max_active_clusters,
             current_stream,
         )
@@ -2761,7 +3158,11 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
     cluster_shape_mn: Tuple[int, int],
     sm_count: int,
     sm_version: str,
+    num_ranks: int,
     enable_dst_signals: bool,
+    enable_barrier_flag: bool = False,
+    is_combine_fusion: bool = False,
+    is_swap_ab: bool = False,
 ) -> Callable:
     def get_cute_pointers(
         input_tensors: Optional[List[torch.tensor]],
@@ -2776,10 +3177,27 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                 masked_m_data_ptr,
                 dst_signals_data_ptr,
                 alpha_data_ptr,
-            ) = [16 for _ in range(8)]
+                topk_weights_data_ptr,
+                idx_src_info_data_ptr,
+                rank_src_info_data_ptr,
+                out_ptrs_data_ptr,
+                barrier_flag_local_data_ptr,
+                barrier_flag_multicast_data_ptr,
+            ) = [16 for _ in range(14)]
 
             if not enable_dst_signals:
                 dst_signals_data_ptr = None
+
+            # When num_ranks == 0, combine-related pointers should be None
+            if num_ranks == 0:
+                topk_weights_data_ptr = None
+                idx_src_info_data_ptr = None
+                rank_src_info_data_ptr = None
+                out_ptrs_data_ptr = None
+
+            if not enable_barrier_flag:
+                barrier_flag_local_data_ptr = None
+                barrier_flag_multicast_data_ptr = None
 
         else:
             (
@@ -2791,9 +3209,16 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                 masked_m_tensor_gpu,
                 dst_signals_tensor_gpu,
                 alpha_tensor_gpu,
+                topk_weights_tensor_gpu,
+                idx_src_info_tensor_gpu,
+                rank_src_info_tensor_gpu,
+                out_ptrs_tensor_gpu,
+                barrier_flag_local_tensor_gpu,
+                barrier_flag_multicast_tensor_gpu,
             ) = input_tensors
 
             assert enable_dst_signals == (dst_signals_tensor_gpu is not None)
+            assert enable_barrier_flag == (barrier_flag_local_tensor_gpu is not None)
 
             (
                 a_data_ptr,
@@ -2815,6 +3240,36 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                 if dst_signals_tensor_gpu is not None
                 else None,
                 alpha_tensor_gpu.data_ptr() if alpha_tensor_gpu is not None else None,
+            )
+            topk_weights_data_ptr = (
+                topk_weights_tensor_gpu.data_ptr()
+                if topk_weights_tensor_gpu is not None
+                else None
+            )
+            idx_src_info_data_ptr = (
+                idx_src_info_tensor_gpu.data_ptr()
+                if idx_src_info_tensor_gpu is not None
+                else None
+            )
+            rank_src_info_data_ptr = (
+                rank_src_info_tensor_gpu.data_ptr()
+                if rank_src_info_tensor_gpu is not None
+                else None
+            )
+            out_ptrs_data_ptr = (
+                out_ptrs_tensor_gpu.data_ptr()
+                if out_ptrs_tensor_gpu is not None
+                else None
+            )
+            barrier_flag_local_data_ptr = (
+                barrier_flag_local_tensor_gpu.data_ptr()
+                if barrier_flag_local_tensor_gpu is not None
+                else None
+            )
+            barrier_flag_multicast_data_ptr = (
+                barrier_flag_multicast_tensor_gpu.data_ptr()
+                if barrier_flag_multicast_tensor_gpu is not None
+                else None
             )
 
         a_ptr = make_ptr(
@@ -2873,6 +3328,66 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
             if alpha_data_ptr is not None and alpha_dtype is not None
             else None
         )
+        topk_weights_ptr = (
+            make_ptr(
+                cutlass.Float32,
+                topk_weights_data_ptr,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            if topk_weights_data_ptr is not None
+            else None
+        )
+        idx_src_info_ptr = (
+            make_ptr(
+                cutlass.Int32,
+                idx_src_info_data_ptr,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            if idx_src_info_data_ptr is not None
+            else None
+        )
+        rank_src_info_ptr = (
+            make_ptr(
+                cutlass.Int32,
+                rank_src_info_data_ptr,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            if rank_src_info_data_ptr is not None
+            else None
+        )
+        out_ptrs_ptr = (
+            make_ptr(
+                cutlass.Int64,
+                out_ptrs_data_ptr,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            if out_ptrs_data_ptr is not None
+            else None
+        )
+        barrier_flag_local_ptr = (
+            make_ptr(
+                cutlass.Int32,
+                barrier_flag_local_data_ptr,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            if barrier_flag_local_data_ptr is not None
+            else None
+        )
+        barrier_flag_multicast_ptr = (
+            make_ptr(
+                cutlass.Int32,
+                barrier_flag_multicast_data_ptr,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            if barrier_flag_multicast_data_ptr is not None
+            else None
+        )
 
         return [
             a_ptr,
@@ -2883,6 +3398,12 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
             masked_m_ptr,
             dst_signals_ptr,
             alpha_ptr,
+            topk_weights_ptr,
+            idx_src_info_ptr,
+            rank_src_info_ptr,
+            out_ptrs_ptr,
+            barrier_flag_local_ptr,
+            barrier_flag_multicast_ptr,
         ]
 
     kernel = cute.compile(
@@ -2903,6 +3424,9 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
             cluster_shape_mn=cluster_shape_mn,
             sm_count=sm_count,
             sm_version=sm_version,
+            num_ranks=num_ranks,
+            is_combine_fusion=is_combine_fusion,
+            is_swap_ab=is_swap_ab,
         ),
         *get_cute_pointers(None),
         cutlass_torch.current_stream(),
@@ -2917,6 +3441,12 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
         dst_signals_tensor_gpu: torch.Tensor,
         c_tensor_gpu: Optional[torch.Tensor] = None,
         alpha_tensor_gpu: Optional[torch.Tensor] = None,
+        topk_weights_tensor_gpu: Optional[torch.Tensor] = None,
+        idx_src_info_tensor_gpu: Optional[torch.Tensor] = None,
+        rank_src_info_tensor_gpu: Optional[torch.Tensor] = None,
+        out_ptrs_tensor_gpu: Optional[torch.Tensor] = None,
+        barrier_flag_local_tensor_gpu: Optional[torch.Tensor] = None,
+        barrier_flag_multicast_tensor_gpu: Optional[torch.Tensor] = None,
     ):
         if c_tensor_gpu is None:
             # fp4 gemm output is not supported
@@ -2941,6 +3471,12 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                     masked_m_tensor_gpu,
                     dst_signals_tensor_gpu,
                     alpha_tensor_gpu,
+                    topk_weights_tensor_gpu,
+                    idx_src_info_tensor_gpu,
+                    rank_src_info_tensor_gpu,
+                    out_ptrs_tensor_gpu,
+                    barrier_flag_local_tensor_gpu,
+                    barrier_flag_multicast_tensor_gpu,
                 ]
             ),
             current_stream,
@@ -2962,8 +3498,17 @@ def grouped_gemm_nt_masked(
     sf_dtype: str,
     c_dtype: str,
     sf_vec_size: int,
+    topk_weights: Optional[torch.Tensor] = None,
+    idx_src_info: Optional[torch.Tensor] = None,
+    rank_src_info: Optional[torch.Tensor] = None,
+    out_ptrs: Optional[torch.Tensor] = None,
+    num_ranks: int = 0,
     dst_signals: Optional[torch.Tensor] = None,
     sm_count: Optional[int] = None,
+    barrier_flag_local: Optional[torch.Tensor] = None,
+    barrier_flag_multicast: Optional[torch.Tensor] = None,
+    is_combine_fusion: bool = False,
+    is_swap_ab: bool = False,
     **kwargs,
 ):
     """
@@ -2979,6 +3524,11 @@ def grouped_gemm_nt_masked(
         out (torch.Tensor): Output tensor to store the result, with shape (l, m, n).
         masked_m (torch.Tensor): 1D tensor of shape (l,) specifying the valid row count for each batch (used for masking).
         ab_dtype (str): Data type for A and B matrices. Supported: "float4_e2m1fn", "float8_e4m3fn", "float8_e5m2".
+        topk_weights (torch.Tensor, optional): 2D tensor of shape (l, m) containing top-k weights (float32). Default: None.
+        idx_src_info (torch.Tensor, optional): 2D tensor of shape (l, m) containing source index info (int32). Default: None.
+        rank_src_info (torch.Tensor, optional): 2D tensor of shape (l, m) containing rank source info (int32). Default: None.
+        out_ptrs (torch.Tensor, optional): 1D tensor of shape (num_ranks,) containing output pointers (int64). Default: None.
+        num_ranks (int, optional): Number of ranks. Default: 0.
         sf_dtype (str): Data type for scale factors. Supported: "float8_e8m0fnu", "float8_e4m3fn".
         c_dtype (str): Data type for output matrix C. Supported: "float16", "bfloat16", "float32", "float8_e4m3fn", "float8_e5m2".
         sf_vec_size (int): Vector size for scale factors. Typically 16 or 32.
@@ -2987,7 +3537,12 @@ def grouped_gemm_nt_masked(
         cluster_shape_mn (Tuple[int, int], optional): Shape of the CTA cluster (ClusterM, ClusterN). Default: (1, 1).
         alpha_dtype (str, optional): Data type for alpha scaling factors.
         alpha (torch.Tensor, optional): Optional 1D tensor of shape (l,) containing per-batch scaling factors. Perform per-batch scaling out = alpha * out.
-
+        barrier_flag_local (torch.Tensor, optional): 1D tensor of shape (sm_count,) containing int32 flags for local barrier synchronization.
+            Used for spin-lock wait in multi-rank distributed operations. Default: None.
+        barrier_flag_multicast (torch.Tensor, optional): 1D tensor of shape (sm_count,) containing int32 flags for multicast barrier synchronization.
+            Used to release barrier flags across ranks in distributed operations. Default: None.
+        is_combine_fusion (bool): If True, enables fused gemm+combine operation mode. Default: False.
+        is_swap_ab (bool): If True, swaps the AB input tensors. Default: False.
     Notes:
         - Legends of the input tensors:
             * `l` is the batch size, `m/n` is the number of rows, and `k` is the number of columns.
@@ -3000,8 +3555,34 @@ def grouped_gemm_nt_masked(
         - The result is written to c_tensor.
     """
 
-    a_torch, sfa_torch = lhs
-    b_torch, sfb_torch = rhs
+    if is_combine_fusion:
+        required = {
+            "topk_weights": topk_weights,
+            "idx_src_info": idx_src_info,
+            "rank_src_info": rank_src_info,
+            "out_ptrs": out_ptrs,
+            "barrier_flag_local": barrier_flag_local,
+            "barrier_flag_multicast": barrier_flag_multicast,
+        }
+        missing = [name for name, val in required.items() if val is None]
+        if missing:
+            raise ValueError(
+                "is_combine_fusion=True requires non-None values for: "
+                f"{', '.join(missing)}"
+            )
+        if num_ranks <= 0:
+            raise ValueError("is_combine_fusion=True requires num_ranks > 0")
+        # For combine fusion, we always swap the AB input tensors
+        if not is_swap_ab:
+            raise ValueError("is_combine_fusion=True requires is_swap_ab=True")
+
+    if is_swap_ab:
+        a_torch, sfa_torch = rhs
+        b_torch, sfb_torch = lhs
+    else:
+        a_torch, sfa_torch = lhs
+        b_torch, sfb_torch = rhs
+
     c_torch = out
 
     m, k, l = a_torch.shape
@@ -3033,7 +3614,7 @@ def grouped_gemm_nt_masked(
         l=l,
         a_major="k",
         b_major="k",
-        c_major="n",
+        c_major="m" if is_swap_ab else "n",
         ab_dtype=get_cutlass_dtype(ab_dtype),
         sf_dtype=get_cutlass_dtype(sf_dtype),
         c_dtype=get_cutlass_dtype(c_dtype),
@@ -3043,7 +3624,11 @@ def grouped_gemm_nt_masked(
         cluster_shape_mn=cluster_shape_mn,
         sm_count=sm_count,
         sm_version=f"sm_{major}{minor}",
+        num_ranks=num_ranks,
         enable_dst_signals=dst_signals is not None,
+        enable_barrier_flag=barrier_flag_local is not None,
+        is_combine_fusion=is_combine_fusion,
+        is_swap_ab=is_swap_ab,
     )(
         a_tensor_gpu=a_torch,
         b_tensor_gpu=b_torch,
@@ -3053,4 +3638,10 @@ def grouped_gemm_nt_masked(
         masked_m_tensor_gpu=masked_m,
         dst_signals_tensor_gpu=dst_signals,
         alpha_tensor_gpu=alpha,
+        topk_weights_tensor_gpu=topk_weights,
+        idx_src_info_tensor_gpu=idx_src_info,
+        rank_src_info_tensor_gpu=rank_src_info,
+        out_ptrs_tensor_gpu=out_ptrs,
+        barrier_flag_local_tensor_gpu=barrier_flag_local,
+        barrier_flag_multicast_tensor_gpu=barrier_flag_multicast,
     )
