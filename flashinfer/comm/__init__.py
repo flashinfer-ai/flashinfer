@@ -66,3 +66,6 @@ from .trtllm_moe_alltoall import (
 )
 
 # from .mnnvl import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
+
+# AllGatherMatmul
+from .all_gather_matmul import all_gather_matmul as all_gather_matmul
