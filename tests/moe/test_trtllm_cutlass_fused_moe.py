@@ -1279,6 +1279,15 @@ def test_moe_mxfp8_mxfp4(
             f"top_k ({top_k}) cannot be greater than num_experts ({num_experts})"
         )
 
+    if torch.cuda.get_device_capability()[0] == 12:
+        pytest.skip(
+            "todo: CUTLASS MoE MXFP8xMXFP4 has no valid tile config for SM120 "
+            "https://gitlab-master.nvidia.com/dl/flashinfer/flashinfer-ci/-/jobs/292360128 "
+            "https://gitlab-master.nvidia.com/dl/flashinfer/flashinfer-ci/-/jobs/292360127 "
+            "https://gitlab-master.nvidia.com/dl/flashinfer/flashinfer-ci/-/jobs/292360121 "
+            "https://gitlab-master.nvidia.com/dl/flashinfer/flashinfer-ci/-/jobs/292360120"
+        )
+
     torch.manual_seed(42)
     e = num_experts
     m = batch_size
