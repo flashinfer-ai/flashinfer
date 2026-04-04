@@ -69,7 +69,7 @@ def _run_moe_finalize_unified_worker(
         top_k = expanded_idx_to_permuted_idx.shape[1]
         eps = 1e-5
 
-        # Create unified workspace
+        # Create workspace using the unified API constructor.
         workspace = TRTLLMAllReduceFusionWorkspace(
             tp_size=world_size,
             tp_rank=rank,
@@ -146,9 +146,7 @@ def _run_moe_finalize_unified_worker(
 
     finally:
         dist.barrier(group=group)
-        comm.trtllm_destroy_ipc_workspace_for_all_reduce(
-            workspace.ipc_handles, group=group
-        )
+        workspace.destroy()
         dist.destroy_process_group(group=group)
 
 
