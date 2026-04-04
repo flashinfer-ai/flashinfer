@@ -18,7 +18,8 @@ import pytest
 import torch
 
 pytestmark = pytest.mark.skip(
-    reason="todo: JIT-compiled .so fails to load (file too short) on some hardware combinations"
+    reason="todo: JIT-compiled .so fails to load (file too short) on some hardware combinations "
+    "https://gitlab-master.nvidia.com/dl/flashinfer/flashinfer-ci/-/jobs/292022396"
 )
 
 from tests.test_helpers.jit_utils import gen_prefill_attention_modules

@@ -3,7 +3,8 @@ import torch
 import torch.nn.functional as F
 
 pytestmark = pytest.mark.skip(
-    reason="todo: CuteDSL FP4 GEMM cosine similarity too low on some hardware combinations"
+    reason="todo: CuteDSL FP4 GEMM cosine similarity too low on some hardware combinations "
+    "https://gitlab-master.nvidia.com/dl/flashinfer/flashinfer-ci/-/jobs/292022401"
 )
 
 from flashinfer import (

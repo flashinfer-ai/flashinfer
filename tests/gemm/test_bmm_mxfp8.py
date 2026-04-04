@@ -3,7 +3,10 @@ import torch
 import torch.nn.functional as F
 
 pytestmark = pytest.mark.skip(
-    reason="todo: cuDNN MXFP8 BMM cosine similarity too low on some hardware combinations"
+    reason="todo: cuDNN MXFP8 BMM cosine similarity too low on some hardware combinations "
+    "https://gitlab-master.nvidia.com/dl/flashinfer/flashinfer-ci/-/jobs/291775835 "
+    "https://gitlab-master.nvidia.com/dl/flashinfer/flashinfer-ci/-/jobs/291775834 "
+    "https://gitlab-master.nvidia.com/dl/flashinfer/flashinfer-ci/-/jobs/291775833"
 )
 
 from flashinfer import autotune, bmm_mxfp8

@@ -3,7 +3,11 @@ import torch
 import torch.nn.functional as F
 
 pytestmark = pytest.mark.skip(
-    reason="todo: CUTLASS MXFP8 MM cosine similarity too low on some hardware combinations"
+    reason="todo: CUTLASS MXFP8 MM cosine similarity too low on some hardware combinations "
+    "https://gitlab-master.nvidia.com/dl/flashinfer/flashinfer-ci/-/jobs/292022418 "
+    "https://gitlab-master.nvidia.com/dl/flashinfer/flashinfer-ci/-/jobs/292022417 "
+    "https://gitlab-master.nvidia.com/dl/flashinfer/flashinfer-ci/-/jobs/292022411 "
+    "https://gitlab-master.nvidia.com/dl/flashinfer/flashinfer-ci/-/jobs/292022410"
 )
 
 from flashinfer import (

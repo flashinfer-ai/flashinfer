@@ -2,7 +2,10 @@ import pytest
 import torch
 
 pytestmark = pytest.mark.skip(
-    reason="todo: cudnnGraphNotSupportedError on some hardware/CUDA version combinations"
+    reason="todo: cudnnGraphNotSupportedError on some hardware/CUDA version combinations "
+    "https://gitlab-master.nvidia.com/dl/flashinfer/flashinfer-ci/-/jobs/290478328 "
+    "https://gitlab-master.nvidia.com/dl/flashinfer/flashinfer-ci/-/jobs/291103321 "
+    "https://gitlab-master.nvidia.com/dl/flashinfer/flashinfer-ci/-/jobs/291103315"
 )
 
 import flashinfer
