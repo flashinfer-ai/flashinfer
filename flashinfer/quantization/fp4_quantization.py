@@ -1301,16 +1301,17 @@ def scaled_fp4_grouped_quantize(
     Parameters:
         input_tensor (torch.Tensor): Input of shape [num_experts, M, K], dtype fp16/bf16.
         mask (torch.Tensor): Active-expert mask of shape [num_experts], dtype int32.
-        input_global_scale (torch.Tensor): Per-expert scale of shape [num_experts], dtype float32.
+        input_global_scale (torch.Tensor): Global scale of shape [1] or per-expert scales of shape [num_experts], dtype float32.
 
-    Returns:
+            Returns:
         Tuple[torch.Tensor, torch.Tensor]:
-            - Quantized tensor of shape [num_experts, M, K//2], dtype uint8 (FLOAT4_E2M1X2).
-            - Block scale factors tensor.
+            - Quantized tensor of shape [M, K//2, num_experts], dtype uint8 (FLOAT4_E2M1X2).            - Block scale factors tensor.
     """
     num_experts = input_tensor.shape[0]
     if input_global_scale.numel() == 1:
-        input_global_scale = input_global_scale.expand(num_experts).contiguous()
+        input_global_scale = (
+            input_global_scale.view(-1).expand(num_experts).contiguous()
+        )
 
     major, minor = get_compute_capability(input_tensor.device)
     device_arch = f"{major * 10 + minor}"
