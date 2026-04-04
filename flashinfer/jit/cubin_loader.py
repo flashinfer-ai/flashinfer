@@ -238,6 +238,9 @@ def ensure_symlink(
     This is used to map C++ include paths (e.g.
     ``CUBIN_DIR/flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export``) to the
     canonical artifact directory where ``get_artifact()`` stores downloaded files.
+
+    This function is safe to call concurrently from multiple processes (e.g.
+    tensor-parallel workers) that may race to create the same symlink.
     """
     link = pathlib.Path(link)
     target = pathlib.Path(target)
@@ -250,7 +253,13 @@ def ensure_symlink(
         else:
             shutil.rmtree(link)
     link.parent.mkdir(parents=True, exist_ok=True)
-    link.symlink_to(target)
+    try:
+        link.symlink_to(target)
+    except FileExistsError:
+        # Another process created the symlink between our check and create.
+        if link.is_symlink() and link.resolve() == target.resolve():
+            return
+        raise
 
 
 def verify_symlinked_headers(
