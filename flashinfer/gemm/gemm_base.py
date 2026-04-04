@@ -1887,6 +1887,9 @@ def build_cudnn_gemm_fp4_graph(
 
         graph.validate()
         graph.build_operation_graph()
+
+        graph.deselect_behavior_notes({cudnn.behavior_note.RUNTIME_COMPILATION})
+
         graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.B])
 
         # WAR: The alpha (contains the global scale) is not supported by the cuBLAS backend (eng0)
