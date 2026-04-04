@@ -14,41 +14,89 @@
  * limitations under the License.
  */
 
+#pragma once
+
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <vector_types.h>
+#if CUDA_VERSION >= 12080
+#include <cuda_fp4.h>
+#endif
+#include <cuda_fp8.h>
 #include <cuda_pipeline.h>
 #include <cuda_runtime.h>
 
-#include <iostream>
+#include <cuda/std/optional>
 #include <type_traits>
 
 #include "../exception.h"
+#include "../fp4_layout.cuh"
 #include "../logging.h"
 #include "../utils.cuh"
+#include "../vec_dtypes.cuh"
+
 namespace flashinfer {
 namespace trtllm_mnnvl_allreduce {
 
+// ======================= Configuration Constants =======================
+namespace config {
+static constexpr int kMaxBlockSize = 1024;
+static constexpr int kPreferredBlockSize = 128;
+static constexpr int kMaxClusterSize = 8;
+static constexpr int kMaxLoadsPerThread = 8;
+}  // namespace config
+
+// TODO:  This enum definition is duplicated
+enum class QuantType : int {
+  kNone = 0,
+  kFP8 = 1,
+  kFP4 = 2,
+};
+
+/**
+ * @brief Parameters for MNNVL AllReduce fusion operations.
+ *
+ * This structure configures the allreduce kernel for multi-node NVLink
+ * communication with optional RMSNorm and quantization fusion.
+ */
 struct AllReduceFusionParams {
-  int nRanks;
-  int rank;
-  int numTokens;
-  int tokenDim;
-  void** bufferPtrsDev;
-  void* bufferPtrLocal;
-  void* multicastPtr;
-  uint32_t* bufferFlags;
-  bool rmsNormFusion;
-  bool launchWithPdl;
+  // Communication topology
+  int nRanks;  ///< Number of ranks participating in allreduce
+  int rank;    ///< Current rank index (0-based)
 
-  void const* input;
-  void const* residualIn;
-  void const* gamma;
-  double epsilon;
+  // Problem dimensions
+  int numTokens;  ///< Number of tokens to process
+  int tokenDim;   ///< Hidden dimension per token
 
-  void* residualOut;
-  void* output;
-  cudaStream_t stream = nullptr;
+  // Communication buffers
+  void** bufferPtrsDev;   ///< Device array of unicast pointers for each rank
+  void* bufferPtrLocal;   ///< Local rank's buffer pointer
+  void* multicastPtr;     ///< Multicast buffer pointer for broadcast
+  uint32_t* bufferFlags;  ///< Lamport clock flags for synchronization
+
+  // Fusion options
+  bool rmsNormFusion = false;  ///< Enable RMSNorm fusion after allreduce
+  bool launchWithPdl = false;  ///< Enable programmatic dependent launch
+
+  // Input tensors
+  void const* input;                 ///< Input tensor to allreduce
+  void const* residualIn = nullptr;  ///< Residual input for fusion (required if rmsNormFusion=true)
+  void const* gamma = nullptr;       ///< RMSNorm gamma weights (required if rmsNormFusion=true)
+  double epsilon = 1e-5;             ///< RMSNorm epsilon for numerical stability
+  float* outputScale = nullptr;  ///< Pointer to output scale factor for quantization, should be a 4
+                                 ///< byte, float32 value in GPU memory.
+
+  // Quantization options
+  QuantizationSFLayout sfLayout = QuantizationSFLayout::SWIZZLED_128x4;
+  QuantType quantType = QuantType::kNone;
+
+  // Output tensors
+  void* residualOut = nullptr;       ///< Output for residual (pre-norm result)
+  void* output = nullptr;            ///< Output for normalized result
+  void* quantOut = nullptr;          ///< Output for quantized result
+  void* scalingFactorOut = nullptr;  ///< Output for quantization scaling factors (for NVFP4 only)
+  cudaStream_t stream = nullptr;     ///< CUDA stream for kernel execution
 };
 
 namespace utils {
@@ -450,8 +498,8 @@ inline __device__ T blockReduceSum(T val) {
 std::tuple<int, int, int> adjustGridConfig(int numTokens, int dim, int eltsPerThread,
                                            int smVersionMajor) {
   // Start with preferred block_size and cluster_size
-  int clusterSize = smVersionMajor >= 9 ? 8 : 1;
-  int blockSize = 128;
+  int clusterSize = smVersionMajor >= 9 ? config::kMaxClusterSize : 1;
+  int blockSize = config::kPreferredBlockSize;
   // ========================== Adjust the grid configuration ==========================
   int threadsNeeded = ceil_div(dim, eltsPerThread);
   int loadsPerThread = 1;
@@ -462,26 +510,27 @@ std::tuple<int, int, int> adjustGridConfig(int numTokens, int dim, int eltsPerTh
       clusterSize /= 2;
     }
     blockSize = ceil_div(threadsNeeded, clusterSize);
-    while (blockSize < 128 && clusterSize >= 2) {
+    while (blockSize < config::kPreferredBlockSize && clusterSize >= 2) {
       blockSize *= 2;
       clusterSize /= 2;
     }
     int smCount = GetCudaMultiProcessorCount();
-    while (numTokens * clusterSize > smCount && clusterSize > 1 && blockSize <= 512) {
+    while (numTokens * clusterSize > smCount && clusterSize > 1 &&
+           blockSize <= config::kMaxBlockSize / 2) {
       blockSize *= 2;
       clusterSize /= 2;
     }
   }
-  // Trying to scale up use multiple loads or CGA
-  while (blockSize > 1024) {
+  // Trying to scale up using multiple loads or CGA
+  while (blockSize > config::kMaxBlockSize) {
     if (smVersionMajor >= 9) {
-      if (clusterSize < 8) {
+      if (clusterSize < config::kMaxClusterSize) {
         clusterSize = clusterSize << 1;
       } else {
         break;
       }
     } else {
-      if (loadsPerThread < 8) {
+      if (loadsPerThread < config::kMaxLoadsPerThread) {
         loadsPerThread += 1;
       } else {
         break;
@@ -493,21 +542,703 @@ std::tuple<int, int, int> adjustGridConfig(int numTokens, int dim, int eltsPerTh
 }
 };  // namespace utils
 
-using utils::blockReduceSum;
 using utils::fromFloat;
+using utils::PackedVec;
+using utils::toFloat;
+
+// TODO: These code are shared with trtllm_allreduce_fusion.cuh, and moe_allreduce_fusion; Should we
+// move them to a shared header?
+/**
+ * @brief Quantization utilities for FP8 and FP4 output quantization.
+ *
+ * Contains type casting, math operations, and conversion functions used
+ * for post-allreduce quantization fusion.
+ */
+namespace quant {
+
+namespace details {
+
+static constexpr int CVT_FP4_ELTS_PER_THREAD = 8;
+static constexpr int CVT_FP4_SF_VEC_SIZE = 16;
+static constexpr int kBytesPerAccess = 16;
+static constexpr int kOneShotMaxToken = 128;
+static constexpr int kBarrierFlagCount = 256;
+
+}  // namespace details
+
+namespace maths {
+// // ============================== Cast ==============================
+template <typename T_OUT, typename T_IN>
+__device__ inline T_OUT cuda_cast(T_IN val) {
+  return val;
+}
+
+template <>
+__device__ inline float2 cuda_cast<float2, int2>(int2 val) {
+  return make_float2(val.x, val.y);
+}
+
+template <>
+__device__ inline float2 cuda_cast<float2, float>(float val) {
+  return make_float2(val, val);
+}
+
+template <>
+__device__ inline float2 cuda_cast<float2, half2>(half2 val) {
+  return __half22float2(val);
+}
+
+template <>
+__device__ inline half2 cuda_cast<half2, float2>(float2 val) {
+  return __float22half2_rn(val);
+}
+
+template <>
+__device__ inline half2 cuda_cast<half2, float>(float val) {
+  return __float2half2_rn(val);
+}
+
+template <>
+__device__ inline half2 cuda_cast<half2, half>(half val) {
+  return __half2half2(val);
+}
+
+template <>
+__device__ inline int8_t cuda_cast<int8_t, half>(half val) {
+  union {
+    int8_t int8[2];
+    int16_t int16;
+  };
+
+  union {
+    half fp16;
+    int16_t int16_in;
+  };
+
+  fp16 = val;
+  asm volatile("cvt.rni.sat.s8.f16 %0, %1;" : "=h"(int16) : "h"(int16_in));
+  return int8[0];
+}
+
+template <>
+__device__ inline int16_t cuda_cast<int16_t, half2>(half2 val) {
+  union {
+    int8_t int8[2];
+    int16_t int16;
+  };
+
+  int8[0] = cuda_cast<int8_t>(val.x);
+  int8[1] = cuda_cast<int8_t>(val.y);
+  return int16;
+}
+
+template <>
+__device__ inline int8_t cuda_cast<int8_t, float>(float val) {
+  union {
+    int8_t int8[2];
+    int16_t int16;
+  };
+
+  asm volatile("cvt.rni.sat.s8.f32 %0, %1;" : "=h"(int16) : "f"(val));
+  return int8[0];
+}
+
+template <>
+__device__ inline int16_t cuda_cast<int16_t, float2>(float2 val) {
+  union {
+    int8_t int8[2];
+    int16_t int16;
+  };
+
+  int8[0] = cuda_cast<int8_t>(val.x);
+  int8[1] = cuda_cast<int8_t>(val.y);
+  return int16;
+}
+
+template <>
+__device__ inline half2 cuda_cast<half2, int16_t>(int16_t val) {
+  union {
+    int8_t int8[2];
+    int16_t int16;
+  };
+
+  int16 = val;
+  return make_half2(int8[0], int8[1]);
+}
+
+template <>
+__device__ inline float2 cuda_cast<float2, int16_t>(int16_t val) {
+  union {
+    int8_t int8[2];
+    int16_t int16;
+  };
+
+  int16 = val;
+  return make_float2(int8[0], int8[1]);
+}
+
+template <>
+__device__ inline __nv_bfloat16 cuda_cast(int32_t val) {
+  return static_cast<float>(val);
+}
+
+template <>
+__device__ inline __nv_bfloat16 cuda_cast(int8_t val) {
+  return static_cast<float>(val);
+}
+
+template <>
+__device__ inline int8_t cuda_cast(__nv_bfloat16 val) {
+  return static_cast<float>(val);
+}
+
+template <>
+__device__ inline float cuda_cast<float, __nv_bfloat16>(__nv_bfloat16 val) {
+  return __bfloat162float(val);
+}
+
+inline __device__ float2 bf1622float2(const __nv_bfloat162 val) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+  float2 f_val;
+  f_val.x = __low2float(val);
+  f_val.y = __high2float(val);
+  return f_val;
+#else
+  return __bfloat1622float2(val);
+#endif
+}
+
+template <>
+__device__ inline float2 cuda_cast<float2, __nv_bfloat162>(__nv_bfloat162 val) {
+  return bf1622float2(val);
+}
+
+template <>
+__device__ inline half cuda_cast<half, __nv_bfloat16>(__nv_bfloat16 val) {
+  return __float2half(__bfloat162float(val));
+}
+
+inline __device__ int16_t bf1622int16(__nv_bfloat162 val) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+  float2 f_val;
+  f_val.x = max(min(__low2float(val), 127.f), -128.f);
+  f_val.y = max(min(__high2float(val), 127.f), -128.f);
+
+  union {
+    int8_t int8[2];
+    int16_t int16;
+  };
+
+  int8[0] = static_cast<int8_t>(static_cast<short>(f_val.x));
+  int8[1] = static_cast<int8_t>(static_cast<short>(f_val.y));
+  return int16;
+#else
+  val = __hmin2(val, make_bfloat162(127., 127.));
+  val = __hmax2(val, make_bfloat162(-128., -128.));
+
+  union {
+    int8_t int8[2];
+    int16_t int16;
+  };
+
+  int8[0] = static_cast<int8_t>(static_cast<short>(val.x));
+  int8[1] = static_cast<int8_t>(static_cast<short>(val.y));
+  return int16;
+#endif
+}
+
+template <>
+__device__ inline int16_t cuda_cast<int16_t, __nv_bfloat162>(__nv_bfloat162 val) {
+  return bf1622int16(val);
+}
+
+template <>
+__device__ inline __nv_bfloat16 cuda_cast<__nv_bfloat16, float>(float val) {
+  return __float2bfloat16(val);
+}
+
+template <>
+__device__ inline __nv_bfloat16 cuda_cast<__nv_bfloat16, half>(half val) {
+  return __float2bfloat16(__half2float(val));
+}
+
+inline __device__ __nv_bfloat162 bf162bf162(const __nv_bfloat16 val) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+  __nv_bfloat162 val2;
+  val2.x = val;
+  val2.y = val;
+  return val2;
+#else
+  return __bfloat162bfloat162(val);
+#endif
+}
+
+template <>
+__device__ inline __nv_bfloat162 cuda_cast<__nv_bfloat162, __nv_bfloat16>(__nv_bfloat16 val) {
+  return bf162bf162(val);
+}
+
+template <>
+__device__ inline __nv_bfloat162 cuda_cast<__nv_bfloat162, float>(float val) {
+  return __float2bfloat162_rn(val);
+}
+
+inline __device__ __nv_bfloat162 float22bf162(const float2 val) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+  return __floats2bfloat162_rn(val.x, val.y);
+#else
+  return __float22bfloat162_rn(val);
+#endif
+}
+
+template <>
+__device__ inline __nv_bfloat162 cuda_cast<__nv_bfloat162, float2>(float2 val) {
+  return float22bf162(val);
+}
+
+template <>
+__device__ inline __nv_bfloat162 cuda_cast<__nv_bfloat162, int16_t>(int16_t val) {
+  union {
+    int8_t int8[2];
+    int16_t int16;
+  };
+
+  int16 = val;
+  __nv_bfloat162 res;
+  res.x = cuda_cast<__nv_bfloat16>(int8[0]);
+  res.y = cuda_cast<__nv_bfloat16>(int8[1]);
+  return res;
+}
+
+template <>
+__device__ inline __nv_bfloat162 cuda_cast<__nv_bfloat162, half2>(half2 val) {
+  return float22bf162(__half22float2(val));
+}
+
+// // ============================== Abs ==============================
+template <typename T>
+__device__ inline T cuda_abs(T val) {
+  static_assert(sizeof(T) == 0, "cuda_abs not specialized for this type");
+  return {};
+}
+
+template <>
+__device__ inline float cuda_abs(float val) {
+  return fabs(val);
+}
+
+template <>
+__device__ inline float2 cuda_abs(float2 val) {
+  return make_float2(fabs(val.x), fabs(val.y));
+}
+
+template <>
+__device__ inline half cuda_abs(half val) {
+  return __habs(val);
+}
+
+template <>
+__device__ inline half2 cuda_abs(half2 val) {
+  return __habs2(val);
+}
+
+#if __CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__)
+template <>
+__device__ inline __nv_bfloat16 cuda_abs(__nv_bfloat16 val) {
+  return __habs(val);
+}
+
+template <>
+__device__ inline __nv_bfloat162 cuda_abs(__nv_bfloat162 val) {
+  return __habs2(val);
+}
+#endif
+
+// // ============================== Max ==============================
+template <typename To, typename Ti>
+__device__ inline To cuda_max(Ti val) {
+  return cuda_cast<To>(val);
+};
+
+template <>
+__device__ inline float cuda_max(float2 val) {
+  return fmaxf(val.x, val.y);
+}
+
+template <>
+__device__ inline half cuda_max(half2 val) {
+  return __hmax(val.x, val.y);
+}
+
+template <>
+__device__ inline __nv_bfloat16 cuda_max(__nv_bfloat162 val) {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
+  return __hmax(val.x, val.y);
+#else
+  assert(0);
+  asm volatile("brkpt;\n" ::);
+  return __nv_bfloat16(0);
+#endif
+}
+
+// Binary maximum: compute the max of two values.
+template <typename T>
+__device__ inline T cuda_max(T val1, T val2) {
+  return (val1 > val2) ? val1 : val2;
+}
+
+template <>
+__device__ inline float2 cuda_max(float2 val1, float2 val2) {
+  float2 out;
+  out.x = fmaxf(val1.x, val2.x);
+  out.y = fmaxf(val1.y, val2.y);
+  return out;
+}
+
+template <>
+__device__ inline half2 cuda_max(half2 val1, half2 val2) {
+  return __hmax2(val1, val2);
+}
+
+template <>
+__device__ inline __nv_bfloat162 cuda_max(__nv_bfloat162 val1, __nv_bfloat162 val2) {
+  return __hmax2(val1, val2);
+}
+
+// // ============================== Reciprocal ==============================
+// Fast reciprocal.
+inline __device__ float reciprocal_approximate_ftz(float a) {
+  float b;
+  asm volatile("rcp.approx.ftz.f32 %0, %1;\n" : "=f"(b) : "f"(a));
+  return b;
+}
+}  // namespace maths
+
+inline __device__ int64_t get_sf_out_offset_128x4(std::optional<int> batchIdx, int mIdx, int kIdx,
+                                                  std::optional<int> numRows, int numCols) {
+  // SF layout [numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]
+  // --> index [mTileIdx, kTileIdx, outerMIdx, innerMIdx, innerKIdx]
+
+  // batched tensor
+  // SF layout [numBTiles, numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]
+  // --> index [bTileIdx, mTileIdx, kTileIdx, outerMIdx, innerMIdx, innerKIdx]
+
+  int32_t innerKIdx = (kIdx % 4);
+  int64_t innerKStride = 1;
+
+  int32_t innerMIdx = (mIdx % (32 * 4)) / 32;
+  int64_t innerMStride = 4 * innerKStride;  // 4
+
+  // M tile layout [32, 4] is column-major.
+  int32_t outerMIdx = (mIdx % 32);
+  int64_t outerMStride = 4 * innerMStride;  // 16
+
+  int32_t kTileIdx = (kIdx / 4);
+  int64_t kTileStride = 32 * outerMStride;  // 512
+
+  // SF vector size 16. We round the "numCols" up to a multiple of 64.
+  int factor = details::CVT_FP4_SF_VEC_SIZE * 4;
+  int32_t numKTiles = (numCols + factor - 1) / factor;
+  int32_t mTileIdx = mIdx / (32 * 4);
+  int64_t mTileStride = numKTiles * kTileStride;
+
+  // Each SF block has 128 rows so pad rows to the multiple of 128.
+  int32_t numMTiles = (numRows.value_or(0) + 128 - 1) / 128;
+  int64_t bTileStride = numMTiles * mTileStride;
+
+  // Compute the global offset.
+  int64_t SFOffset = batchIdx.value_or(0) * bTileStride + mTileIdx * mTileStride +
+                     kTileIdx * kTileStride + outerMIdx * outerMStride + innerMIdx * innerMStride +
+                     innerKIdx * innerKStride;
+
+  return SFOffset;
+}
+
+template <class SFType, int CVT_FP4_NUM_THREADS_PER_SF>
+__device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(std::optional<int> batchIdx, int rowIdx,
+                                                       int colIdx, std::optional<int> numRows,
+                                                       int numCols, SFType* SFout,
+                                                       QuantizationSFLayout layout) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  static_assert(CVT_FP4_NUM_THREADS_PER_SF == 1 || CVT_FP4_NUM_THREADS_PER_SF == 2);
+
+  // One pair of threads write one SF to global memory.
+  // TODO: stage through smem for packed STG.32
+  // is it better than STG.8 from 4 threads ?
+  if (threadIdx.x % CVT_FP4_NUM_THREADS_PER_SF == 0) {
+    if (layout == QuantizationSFLayout::SWIZZLED_128x4) {
+      // SF vector index (16 elements share one SF in the K dimension).
+      // numRows and numCols are unpadded.
+      int32_t kIdx = colIdx / CVT_FP4_NUM_THREADS_PER_SF;
+      int32_t mIdx = rowIdx;
+
+      auto SFOffset = get_sf_out_offset_128x4(batchIdx, mIdx, kIdx, numRows, numCols);
+      return reinterpret_cast<uint8_t*>(SFout) + SFOffset;
+    } else if (layout == QuantizationSFLayout::LINEAR) {
+      // Linear row-major layout, no padding required.
+      int32_t KTileIdx = colIdx / CVT_FP4_NUM_THREADS_PER_SF;
+
+      int32_t numKTiles = numCols / details::CVT_FP4_SF_VEC_SIZE;
+      int64_t mTileStride = numKTiles;
+
+      int64_t BTileStride = numRows.value_or(0) * mTileStride;
+
+      int64_t SFOffset = batchIdx.value_or(0) * BTileStride + rowIdx * mTileStride + KTileIdx;
+      return reinterpret_cast<uint8_t*>(SFout) + SFOffset;
+    } else {
+      return nullptr;
+    }
+  }
+#endif
+  return nullptr;
+}
+
+__forceinline__ __device__ uint32_t pack_bytes(uint8_t c0, uint8_t c1, uint8_t c2, uint8_t c3) {
+  uint32_t val0 = c0;
+  uint32_t val1 = c1;
+  uint32_t val2 = c2;
+  uint32_t val3 = c3;
+
+  return (val3 << 24) | (val2 << 16) | (val1 << 8) | val0;
+}
+
+// Convert single float2 pair to e2m1 (2 float32 -> 2 e2m1, returns uint8_t)
+// Optimization: allows pipelined processing to reduce register usage
+// Note: "=r" constraint always allocates 32-bit register regardless of variable type
+inline __device__ uint8_t fp32_pair_to_e2m1(float2 pair) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  uint32_t val32;
+  asm volatile(
+      "{\n"
+      ".reg .b8 byte0;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte0, %2, %1;\n"
+      "mov.b32 %0, {byte0, 0, 0, 0};\n"
+      "}"
+      : "=r"(val32)
+      : "f"(pair.x), "f"(pair.y));
+  return static_cast<uint8_t>(val32 & 0xFF);  // Extract low 8 bits
+#else
+  return 0;
+#endif
+}
+
+#if CUDA_VERSION >= 12080
+// Convert 8 float32 values into 8 e2m1 values (represented as one uint32_t).
+// NOTE: bypass sm_100 requirement by __nv_cvt_float2_to_fp4x2
+inline __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8]) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  uint32_t val;
+  asm volatile(
+      "{\n"
+      ".reg .b8 byte0;\n"
+      ".reg .b8 byte1;\n"
+      ".reg .b8 byte2;\n"
+      ".reg .b8 byte3;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte0, %2, %1;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte1, %4, %3;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte2, %6, %5;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte3, %8, %7;\n"
+      "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
+      "}"
+      : "=r"(val)
+      : "f"(array[0]), "f"(array[1]), "f"(array[2]), "f"(array[3]), "f"(array[4]), "f"(array[5]),
+        "f"(array[6]), "f"(array[7]));
+  return val;
+#else
+  uint32_t val;
+  __nv_fp4x2_storage_t vals[4];
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    vals[i] = __nv_cvt_float2_to_fp4x2(*(((float2*)array) + i), __NV_E2M1, cudaRoundNearest);
+  }
+  val = pack_bytes(vals[0], vals[1], vals[2], vals[3]);
+  return val;
+#endif
+}
+
+// Convert 4 float2 values into 8 e2m1 values (represented as one uint32_t).
+inline __device__ uint32_t fp32_vec_to_e2m1(float2 (&array)[4]) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  uint32_t val;
+  asm volatile(
+      "{\n"
+      ".reg .b8 byte0;\n"
+      ".reg .b8 byte1;\n"
+      ".reg .b8 byte2;\n"
+      ".reg .b8 byte3;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte0, %2, %1;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte1, %4, %3;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte2, %6, %5;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte3, %8, %7;\n"
+      "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
+      "}"
+      : "=r"(val)
+      : "f"(array[0].x), "f"(array[0].y), "f"(array[1].x), "f"(array[1].y), "f"(array[2].x),
+        "f"(array[2].y), "f"(array[3].x), "f"(array[3].y));
+  return val;
+#else
+  uint32_t val;
+  __nv_fp4x2_storage_t vals[4];
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    vals[i] = __nv_cvt_float2_to_fp4x2(array[i], __NV_E2M1, cudaRoundNearest);
+  }
+  val = pack_bytes(vals[0], vals[1], vals[2], vals[3]);
+  return val;
+#endif
+}
+
+// Quantizes the provided PackedVec into the uint32_t output
+template <typename T, uint32_t VEC_SIZE, bool UE8M0_SF = false>
+__device__ uint32_t cvt_warp_fp16_to_fp4(vec_t<T, VEC_SIZE>& vec, float SFScaleVal,
+                                         uint8_t* SFout) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  // Pre-compute constant: reciprocal of 6.0 (maximum value of e2m1)
+  static constexpr float RECIPROCAL_6 = 1.0f / 6.0f;
+  // Get absolute maximum values among the local 8 values.
+  auto localMax = maths::cuda_abs(get_vec2_element(vec, 0));
+
+#pragma unroll
+  for (int i = 1; i < details::CVT_FP4_ELTS_PER_THREAD / 2; i++) {
+    localMax = maths::cuda_max(localMax, maths::cuda_abs(get_vec2_element(vec, i)));
+  }
+
+  // Get the absolute maximum among all 16 values (two threads).
+  localMax = maths::cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
+  // Get the final absolute maximum values.
+  float vecMax = float(maths::cuda_max(localMax.x, localMax.y));
+
+  // Get the SF (max value of the vector / max value of e2m1).
+  // maximum value of e2m1 = 6.0.
+  // Optimization: compute quantized SF directly, avoid storing intermediate SFValue
+  uint8_t fp8SFVal;
+  float quantized_sf;
+
+  if constexpr (UE8M0_SF) {
+#if (__CUDACC_VER_MAJOR__ * 1000 + __CUDACC_VER_MINOR__ * 10 >= 12080)
+    __nv_fp8_e8m0 tmp;
+    float sf_value = SFScaleVal * (vecMax * RECIPROCAL_6);
+    tmp.__x = __nv_cvt_float_to_e8m0(sf_value, __NV_SATFINITE, cudaRoundPosInf);
+    quantized_sf = static_cast<float>(tmp);
+    fp8SFVal = tmp.__x;
+#else
+#error "FP8 E8M0 support requires CUDA 12.8 or newer."
+#endif
+  } else {
+    // Here SFValue is always positive, so E4M3 is the same as UE4M3.
+    __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(SFScaleVal * (vecMax * RECIPROCAL_6));
+    fp8SFVal = tmp.__x;
+    quantized_sf = static_cast<float>(tmp);
+  }
+  // Get the output scale directly (optimization: avoid storing intermediate SFValue)
+  // Recipe: final_scale = reciprocal(fp32(fp8(SFValue * SFScaleVal))) * reciprocal(SFScaleVal))
+  // Optimization: mathematically equivalent to SFScaleVal / quantized_sf, but more efficient
+  // (reduces 1 reciprocal call and 1 multiply operation)
+  float outputScale = quantized_sf != 0 ? SFScaleVal / quantized_sf : 0.0f;
+
+  if (SFout) {
+    // Write the SF to global memory (STG.8).
+    *SFout = fp8SFVal;
+  }
+
+  // Convert the input to float and quantize (pipelined to reduce register usage).
+  // Optimization: use single float2 instead of array to reduce register pressure from 32 bytes to 8
+  // bytes
+  uint32_t e2m1Vec = 0;
+
+#pragma unroll
+  for (int i = 0; i < details::CVT_FP4_ELTS_PER_THREAD / 2; i++) {
+    // Reuse single float2 register instead of array
+    float2 fp2Val;
+    if constexpr (std::is_same_v<T, half>) {
+      fp2Val = __half22float2(get_vec2_element(vec, i));
+    } else {
+      fp2Val = __bfloat1622float2(get_vec2_element(vec, i));
+    }
+    fp2Val.x *= outputScale;
+    fp2Val.y *= outputScale;
+
+    // Convert pair immediately and pack into result
+    uint8_t e2m1Pair = fp32_pair_to_e2m1(fp2Val);
+    e2m1Vec |= (static_cast<uint32_t>(e2m1Pair) << (i * 8));
+  }
+
+  // Write the e2m1 values to global memory.
+  return e2m1Vec;
+#else
+  return 0;
+#endif
+}
+
+#endif
+
+// ============================== Quant Device Function ==============================
+template <typename T, typename PackedType, int ELTS_PER_THREAD>
+inline __device__ void quant_fp8(PackedVec<PackedType, T> packedAccum, void* quantOutPtr,
+                                 float invOutputScale, uint32_t threadOffset) {
+  static_assert(ELTS_PER_THREAD == 8 || ELTS_PER_THREAD == 4, "ELTS_PER_THREAD must be 8 or 4");
+  using QuantizedPackedType = std::conditional_t<ELTS_PER_THREAD == 8, float2, float>;
+
+  auto quantOut = reinterpret_cast<__nv_fp8_e4m3*>(quantOutPtr);
+  PackedVec<QuantizedPackedType, __nv_fp8_e4m3> quantizedAccum;
+#pragma unroll
+  for (int i = 0; i < ELTS_PER_THREAD; i++) {
+    quantizedAccum.elements[i] =
+        __nv_fp8_e4m3(toFloat<T>(packedAccum.elements[i]) * invOutputScale);
+  }
+  reinterpret_cast<QuantizedPackedType*>(&quantOut[threadOffset])[0] = quantizedAccum.packed;
+}
+
+template <typename T, typename PackedType, int ELTS_PER_THREAD>
+inline __device__ void quant_nvfp4(PackedVec<PackedType, T> packedAccum, void* quantOutPtr,
+                                   void* sfOutPtr, float* outputScale, uint32_t tokenIdx,
+                                   uint32_t tokenDim, uint32_t packedIdx,
+                                   QuantizationSFLayout sfLayout) {
+#if CUDA_VERSION >= 12080
+  static_assert(
+      ELTS_PER_THREAD == 8 && (std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>),
+      "NVFP4 quantization fusion is only supported for FP16/BF16!");
+
+  // Cast the packed accumulator
+  auto packedAccum_ = *reinterpret_cast<vec_t<T, ELTS_PER_THREAD>*>(&packedAccum);
+  // SFType is only the pointer type; It does not affect the internal logic of offset calculation.
+  // Get the target pointer to the SF output.
+  auto sfOut =
+      cvt_quant_to_fp4_get_sf_out_offset<uint32_t, details::CVT_FP4_SF_VEC_SIZE / ELTS_PER_THREAD>(
+          std::nullopt, tokenIdx, packedIdx, std::nullopt, tokenDim /* numCols, don't divide*/,
+          reinterpret_cast<uint32_t*>(sfOutPtr), sfLayout);
+
+  // Calculate the offset in packed item granularity for the quant output
+  uint32_t quantOutOffset = tokenIdx * tokenDim / ELTS_PER_THREAD + packedIdx;
+  // Each packedvec has 8 elements -> 1 float4 in input -> 1 uint32_t in output
+  reinterpret_cast<uint32_t*>(quantOutPtr)[quantOutOffset] =
+      cvt_warp_fp16_to_fp4<T, ELTS_PER_THREAD, false>(packedAccum_, *outputScale, sfOut);
+#else
+#error "NVFP4 quantization fusion is not supported on CUDA versions older than 12.8."
+#endif
+}
+};  // namespace quant
+
+using utils::blockReduceSum;
 using utils::isNegZero;
 using utils::LamportFlags;
 using utils::loadPacked;
 using utils::loadPackedVolatile;
-using utils::PackedVec;
-using utils::toFloat;
 
-template <uint8_t WorldSize, typename T, bool RMSNormFusion = false, typename PackedType = float4>
-__global__ void __launch_bounds__(1024)
-    oneshotAllreduceFusionKernel(T* outputPtr, T* prenormedPtr, T const* shardPtr,
-                                 T const* residualInPtr, T const* gammaPtr, T** inputPtrs,
-                                 T* mcastPtr, int const numTokens, int const tokenDim,
-                                 float epsilon, int const rank, uint32_t* bufferFlags) {
+template <uint8_t WorldSize, typename T, bool RMSNormFusion = false,
+          QuantType QType = QuantType::kNone, typename PackedType = float4>
+__global__ void __launch_bounds__(config::kMaxBlockSize) oneshotAllreduceFusionKernel(
+    /* output ptrs*/
+    T* outputPtr, T* prenormedPtr, void* quantOutPtr, void* scalingFactorOutPtr,
+    /* input ptrs*/
+    T const* shardPtr, T const* residualInPtr, T const* gammaPtr,
+    /* Comm buffer params */
+    T** inputPtrs, T* mcastPtr, int const rank, uint32_t* bufferFlags,
+    /* problem size parameters*/
+    int const numTokens, int const tokenDim, float epsilon, float* outputScale,
+    QuantizationSFLayout sfLayout) {
+  static_assert(QType == QuantType::kNone || RMSNormFusion,
+                "Quant-only pattern without RMSNorm is not supported!");
   constexpr int kELTS_PER_THREAD = sizeof(PackedType) / sizeof(T);
   constexpr int kLAMPORT_ELTS_PER_PACKED = sizeof(PackedType) / sizeof(float);
   constexpr uint32_t kELT_SIZE = sizeof(T);
@@ -641,7 +1372,22 @@ __global__ void __launch_bounds__(1024)
                                              toFloat<T>(gamma.elements[i]));
     }
   }
-  reinterpret_cast<PackedType*>(&outputPtr[threadOffset])[0] = packedAccum.packed;
+  if (outputPtr != nullptr) {
+    reinterpret_cast<PackedType*>(&outputPtr[threadOffset])[0] = packedAccum.packed;
+  }
+
+  if constexpr (QType == QuantType::kFP8) {
+    float invOutputScale = 1.0f / (*outputScale);  // We need to apply inv_scale to the output
+    quant::quant_fp8<T, PackedType, kELTS_PER_THREAD>(packedAccum, quantOutPtr, invOutputScale,
+                                                      threadOffset);
+  }
+#if CUDA_VERSION >= 12080
+  else if constexpr (QType == QuantType::kFP4) {
+    quant::quant_nvfp4<T, PackedType, kELTS_PER_THREAD>(packedAccum, quantOutPtr,
+                                                        scalingFactorOutPtr, outputScale, token,
+                                                        tokenDim, packedIdx, sfLayout);
+  }
+#endif
   flag.waitAndUpdate(
       {static_cast<uint32_t>(numTokens * tokenDim * WorldSize * kELT_SIZE), 0, 0, 0});
 }
@@ -668,9 +1414,10 @@ cudaError_t oneshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
       numTokens, clusterSize, blockSize, clusterSize, loadsPerThread,
       ceil_div(tokenDim, eltsPerThread));
 
-  FLASHINFER_CHECK(blockSize <= 1024 && loadsPerThread == 1,
-                   "Hidden Dimension %d exceeds the maximum supported hidden dimension (%d)",
-                   tokenDim, 1024 * (kSMVersionMajor >= 9 ? 8 : 1) * eltsPerThread);
+  FLASHINFER_CHECK(
+      blockSize <= config::kMaxBlockSize && loadsPerThread == 1,
+      "Hidden Dimension %d exceeds the maximum supported hidden dimension (%d)", tokenDim,
+      config::kMaxBlockSize * (kSMVersionMajor >= 9 ? config::kMaxClusterSize : 1) * eltsPerThread);
 
   cudaLaunchAttribute attrs[2];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
@@ -689,16 +1436,70 @@ cudaError_t oneshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
       .numAttrs = kSMVersionMajor >= 9 ? 2 : 1,
   };
 
-#define LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, RMSNORM)                                              \
-  FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(                                                        \
-      &config, &oneshotAllreduceFusionKernel<WORLD_SIZE, T, RMSNORM>, output, residualOut, input, \
-      residualIn, gamma, ucPtrs, mcPtr, numTokens, tokenDim, static_cast<float>(params.epsilon),  \
-      params.rank, params.bufferFlags));
-#define DISPATCH_ALLREDUCE_KERNEL(WORLD_SIZE)   \
-  if (params.rmsNormFusion) {                   \
-    LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, true);  \
-  } else {                                      \
-    LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, false); \
+#define LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, RMSNORM, QUANT_TYPE)                               \
+  FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(                                                     \
+      &config, &oneshotAllreduceFusionKernel<WORLD_SIZE, T, RMSNORM, QUANT_TYPE>, output,      \
+      residualOut, params.quantOut, params.scalingFactorOut, input, residualIn, gamma, ucPtrs, \
+      mcPtr, params.rank, params.bufferFlags, numTokens, tokenDim,                             \
+      static_cast<float>(params.epsilon), params.outputScale, params.sfLayout));
+#define DISPATCH_ALLREDUCE_KERNEL(WORLD_SIZE)                                        \
+  if (params.rmsNormFusion) {                                                        \
+    switch (params.quantType) {                                                      \
+      case QuantType::kFP8:                                                          \
+        LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, true, QuantType::kFP8);                  \
+        break;                                                                       \
+      case QuantType::kFP4:                                                          \
+        if constexpr (std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>) { \
+          LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, true, QuantType::kFP4);                \
+        } else {                                                                     \
+          FLASHINFER_ERROR("FP4 quantization is only supported for FP16/BF16!");     \
+          return cudaErrorInvalidValue;                                              \
+        }                                                                            \
+        break;                                                                       \
+      case QuantType::kNone:                                                         \
+        LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, true, QuantType::kNone);                 \
+        break;                                                                       \
+      default:                                                                       \
+        FLASHINFER_ERROR("Unsupported quant type! Got " +                            \
+                         std::to_string(static_cast<int>(params.quantType)));        \
+        return cudaErrorInvalidValue;                                                \
+    }                                                                                \
+  } else {                                                                           \
+    LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, false, QuantType::kNone);                    \
+  }
+
+  // Runtime validation for quantization parameters
+  if (!params.rmsNormFusion && params.quantType != QuantType::kNone) {
+    FLASHINFER_ERROR(
+        "oneshotAllreduceFusionDispatch: Quantization requires RMSNorm fusion. "
+        "params.rmsNormFusion is false but params.quantType is " +
+        std::to_string(static_cast<int>(params.quantType)));
+    return cudaErrorInvalidValue;
+  }
+
+  if (params.quantType != QuantType::kNone) {
+    if (params.quantOut == nullptr) {
+      FLASHINFER_ERROR(
+          "oneshotAllreduceFusionDispatch: params.quantOut must be non-null when "
+          "params.quantType != QuantType::kNone");
+      return cudaErrorInvalidValue;
+    }
+    if (params.outputScale == nullptr) {
+      FLASHINFER_ERROR(
+          "oneshotAllreduceFusionDispatch: params.outputScale must be non-null when "
+          "params.quantType != QuantType::kNone");
+      return cudaErrorInvalidValue;
+    }
+  }
+
+  if (params.quantType == QuantType::kFP4) {
+#if CUDA_VERSION < 12080
+    FLASHINFER_ERROR(
+        "oneshotAllreduceFusionDispatch: FP4 quantization requires CUDA_VERSION >= 12080. "
+        "Current CUDA_VERSION is " +
+        std::to_string(CUDA_VERSION));
+    return cudaErrorInvalidValue;
+#endif
   }
 
   T** ucPtrs = reinterpret_cast<T**>(params.bufferPtrsDev);
@@ -745,7 +1546,7 @@ enum MNNVLTwoShotStage : uint8_t {
 };
 
 template <uint8_t WorldSize, typename T, typename PackedType = float4>
-__global__ __launch_bounds__(128) void twoshotAllreduceKernel(
+__global__ __launch_bounds__(config::kPreferredBlockSize) void twoshotAllreduceKernel(
     T* outputPtr, T const* shardPtr, T** inputPtrs, T* mcastPtr, uint32_t const numTokens,
     uint32_t const tokenDim, uint32_t const rank, uint32_t* bufferFlags,
     bool const wait_for_results) {
@@ -881,14 +1682,18 @@ using utils::copyF4;
 //      1. Use CGA if supported. It expands the hidden dimension to 8k x 8 = 64k.
 //      2. Set loads_per_thread >1. Which can be used if CGA is not supported. Note that this will
 //      be limited by the shared memory size and register count.
-template <typename T_IN, typename T_OUT, int LoadsPerThread = 1>
-__global__ __launch_bounds__(1024) void rmsNormLamport(T_IN* outputPreNorm, T_OUT* outputNorm,
-                                                       T_IN* bufferInput, T_IN const* gamma,
-                                                       float epsilon, T_IN const* residual,
-                                                       uint32_t numTokens, uint32_t dim,
-                                                       uint32_t worldSize, uint32_t* bufferFlags) {
-  static_assert(std::is_same_v<T_IN, T_OUT>, "T_IN and T_OUT must be the same type");
-  static int const kELTS_PER_LOAD = sizeof(float4) / sizeof(T_IN);
+template <typename T, QuantType QType = QuantType::kNone, int LoadsPerThread = 1>
+__global__ __launch_bounds__(config::kMaxBlockSize) void rmsNormLamport_fusion(
+    /* Output ptrs */
+    T* outputPreNorm, T* outputNorm, void* quantOut, void* scalingFactorOut,
+    /* Input ptrs */
+    T* bufferInput, T const* gamma, T const* residual,
+    /* Comm buffer params */
+    uint32_t worldSize, uint32_t* bufferFlags,
+    /* Problem parameters */
+    uint32_t numTokens, uint32_t dim, float epsilon, float* outputScale,
+    QuantizationSFLayout sfLayout) {
+  static int const kELTS_PER_LOAD = sizeof(float4) / sizeof(T);
 
   uint32_t const token = blockIdx.x;
   uint32_t const blockSize = blockDim.x;
@@ -912,13 +1717,13 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(T_IN* outputPreNorm, T_OU
   float rInput[LoadsPerThread * kELTS_PER_LOAD];
   uint32_t offsets[LoadsPerThread * kELTS_PER_LOAD];
 
-  uint32_t const smemBufferSize = blockSize * elemsPerThread * sizeof(T_IN);
-  T_IN* smemInput = (T_IN*)&smem[0];
-  T_IN* smemResidual = (T_IN*)&smem[smemBufferSize];
-  T_IN* smemGamma = (T_IN*)&smem[2 * smemBufferSize];
+  uint32_t const smemBufferSize = blockSize * elemsPerThread * sizeof(T);
+  T* smemInput = (T*)&smem[0];
+  T* smemResidual = (T*)&smem[smemBufferSize];
+  T* smemGamma = (T*)&smem[2 * smemBufferSize];
 
   LamportFlags<float4> flag(bufferFlags, MNNVLTwoShotStage::NUM_STAGES);
-  T_IN* input = reinterpret_cast<T_IN*>(
+  T* input = reinterpret_cast<T*>(
       flag.getCurLamportBuf(reinterpret_cast<void*>(bufferInput), MNNVLTwoShotStage::BROADCAST));
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -982,14 +1787,14 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(T_IN* outputPreNorm, T_OU
   for (int i = 0; i < LoadsPerThread; i++) {
     int threadLoadOffset = (i * loadStride + threadOffset) * kELTS_PER_LOAD;
     if (blockOffset * blockChunkSize + threadLoadOffset < dim) {
-      PackedVec<float4, T_IN> inp{.packed = loadPacked<float4>(&smemInput[threadLoadOffset])};
-      PackedVec<float4, T_IN> res{.packed = loadPacked<float4>(&smemResidual[threadLoadOffset])};
+      PackedVec<float4, T> inp{.packed = loadPacked<float4>(&smemInput[threadLoadOffset])};
+      PackedVec<float4, T> res{.packed = loadPacked<float4>(&smemResidual[threadLoadOffset])};
 
-      PackedVec<float4, T_IN> inp_plus_res = inp + res;
+      PackedVec<float4, T> inp_plus_res = inp + res;
 #pragma unroll
       for (int j = 0; j < kELTS_PER_LOAD; j++) {
-        rInput[i * kELTS_PER_LOAD + j] = toFloat<T_IN>(inp_plus_res.elements[j]);
-        threadSum += toFloat<T_IN>(inp_plus_res.elements[j] * inp_plus_res.elements[j]);
+        rInput[i * kELTS_PER_LOAD + j] = toFloat<T>(inp_plus_res.elements[j]);
+        threadSum += toFloat<T>(inp_plus_res.elements[j] * inp_plus_res.elements[j]);
       }
 
       *reinterpret_cast<float4*>(&outputPreNorm[blockLoadOffset + threadLoadOffset]) =
@@ -1024,21 +1829,35 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(T_IN* outputPreNorm, T_OU
 
 #pragma unroll
   for (int i = 0; i < LoadsPerThread; i++) {
-    PackedVec<float4, T_OUT> r_out;
+    PackedVec<float4, T> rOut;
     uint32_t threadLoadOffset = (i * loadStride + threadOffset) * kELTS_PER_LOAD;
-    if (blockOffset * blockChunkSize + threadLoadOffset < dim) {
-      PackedVec<float4, T_IN> gamma = {.packed = loadPacked<float4>(&smemGamma[threadLoadOffset])};
+    uint32_t tokenOffset = blockOffset * blockChunkSize + threadLoadOffset;
+    if (tokenOffset < dim) {
+      PackedVec<float4, T> gamma = {.packed = loadPacked<float4>(&smemGamma[threadLoadOffset])};
 
 #pragma unroll
       for (uint32_t j = 0; j < kELTS_PER_LOAD; j++) {
-        r_out.elements[j] = fromFloat<T_OUT>(toFloat<T_IN>(gamma.elements[j]) *
-                                             rInput[i * kELTS_PER_LOAD + j] * rcpRms);
+        rOut.elements[j] =
+            fromFloat<T>(toFloat<T>(gamma.elements[j]) * rInput[i * kELTS_PER_LOAD + j] * rcpRms);
       }
-
-      *reinterpret_cast<float4*>(&outputNorm[blockLoadOffset + threadLoadOffset]) = r_out.packed;
+      if (outputNorm != nullptr) {
+        *reinterpret_cast<float4*>(&outputNorm[blockLoadOffset + threadLoadOffset]) = rOut.packed;
+      }
+      if constexpr (QType == QuantType::kFP8) {
+        float invOutputScale = 1.0f / (*outputScale);
+        quant::quant_fp8<T, float4, kELTS_PER_LOAD>(rOut, quantOut, invOutputScale,
+                                                    blockLoadOffset + threadLoadOffset);
+      }
+#if CUDA_VERSION >= 12080
+      else if constexpr (QType == QuantType::kFP4) {
+        quant::quant_nvfp4<T, float4, kELTS_PER_LOAD>(rOut, quantOut, scalingFactorOut, outputScale,
+                                                      token, dim, tokenOffset / kELTS_PER_LOAD,
+                                                      sfLayout);
+      }
+#endif
     }
   }
-  constexpr int kELTS_SIZE = sizeof(T_IN);
+  constexpr int kELTS_SIZE = sizeof(T);
 
   // Assume the previous kernel does not modify the buffer_flags.
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -1058,7 +1877,7 @@ cudaError_t twoshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
                    "[MNNVL AllReduceTwoShot] token_dim must be divisible by %d", numEltsPerThread);
 
   int const arNumThreads = ceil_div(tokenDim, numEltsPerThread);
-  int const arNumBlocksPerToken = ceil_div(arNumThreads, 128);
+  int const arNumBlocksPerToken = ceil_div(arNumThreads, config::kPreferredBlockSize);
 
   dim3 arGrid(numTokens, arNumBlocksPerToken);
 
@@ -1068,15 +1887,15 @@ cudaError_t twoshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
 
   cudaLaunchConfig_t arConfig{
       .gridDim = arGrid,
-      .blockDim = 128,
+      .blockDim = config::kPreferredBlockSize,
       .dynamicSmemBytes = 0,
       .stream = params.stream,
       .attrs = arAttrs,
       .numAttrs = 1,
   };
 
-  FLASHINFER_LOG_DEBUG("[MNNVL AllReduceTwoShot] Dispatch: grid size: (%d, %d, 1), block_size: 128",
-                       numTokens, arNumBlocksPerToken);
+  FLASHINFER_LOG_DEBUG("[MNNVL AllReduceTwoShot] Dispatch: grid size: (%d, %d, 1), block_size: %d",
+                       numTokens, arNumBlocksPerToken, config::kPreferredBlockSize);
 
 #define LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE)                                               \
   FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(                                                \
@@ -1150,15 +1969,39 @@ cudaError_t twoshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
         numTokens, rnClusterSize, rnBlockSize, rnClusterSize, rnLoadsPerThread,
         ceil_div(tokenDim, numEltsPerThread));
 
-#define RUN_RMSNORM_KERNEL(LOADS_PER_THREAD)                                                      \
-  FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(&rmsNormLamport<T, T, LOADS_PER_THREAD>,              \
-                                            cudaFuncAttributeMaxDynamicSharedMemorySize,          \
-                                            smemSize));                                           \
-  rnConfig.dynamicSmemBytes = smemSize;                                                           \
-  FLASHINFER_CUDA_CALL(                                                                           \
-      cudaLaunchKernelEx(&rnConfig, &rmsNormLamport<T, T, LOADS_PER_THREAD>, residualOut, output, \
-                         bufferInput, gamma, static_cast<float>(params.epsilon), residualIn,      \
-                         numTokens, tokenDim, params.nRanks, params.bufferFlags));
+#define RUN_RMSNORM_FUSION_KERNEL_(LOADS_PER_THREAD, QType)                                     \
+  FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(&rmsNormLamport_fusion<T, QType, LOADS_PER_THREAD>, \
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize,        \
+                                            smemSize));                                         \
+  rnConfig.dynamicSmemBytes = smemSize;                                                         \
+  FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(                                                      \
+      &rnConfig, &rmsNormLamport_fusion<T, QType, LOADS_PER_THREAD>, residualOut, output,       \
+      params.quantOut, params.scalingFactorOut, bufferInput, gamma, residualIn, params.nRanks,  \
+      params.bufferFlags, numTokens, tokenDim, static_cast<float>(params.epsilon),              \
+      params.outputScale, params.sfLayout));
+
+#define RUN_RMSNORM_FUSION_KERNEL(LOADS_PER_THREAD)                                \
+  switch (params.quantType) {                                                      \
+    case QuantType::kFP8:                                                          \
+      RUN_RMSNORM_FUSION_KERNEL_(LOADS_PER_THREAD, QuantType::kFP8);               \
+      break;                                                                       \
+    case QuantType::kFP4:                                                          \
+      if constexpr (std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>) { \
+        RUN_RMSNORM_FUSION_KERNEL_(LOADS_PER_THREAD, QuantType::kFP4);             \
+      } else {                                                                     \
+        FLASHINFER_ERROR("FP4 quantization is only supported for FP16/BF16!");     \
+        return cudaErrorInvalidValue;                                              \
+      }                                                                            \
+      break;                                                                       \
+    case QuantType::kNone:                                                         \
+      RUN_RMSNORM_FUSION_KERNEL_(LOADS_PER_THREAD, QuantType::kNone);              \
+      break;                                                                       \
+    default:                                                                       \
+      FLASHINFER_ERROR("[MNNVL AllReduceTwoShotRMSNorm] Unsupported quant type" +  \
+                       std::to_string(static_cast<int>(params.quantType)) +        \
+                       ". Supported types: {kFP8, kFP4, kNone}");                  \
+      return cudaErrorInvalidValue;                                                \
+  }
 
     T* residualOut = reinterpret_cast<T*>(params.residualOut);
     T* output = reinterpret_cast<T*>(params.output);
@@ -1166,32 +2009,32 @@ cudaError_t twoshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
     T const* gamma = reinterpret_cast<T const*>(params.gamma);
     T const* residualIn = reinterpret_cast<T const*>(params.residualIn);
     if (rnUseCGA) {
-      RUN_RMSNORM_KERNEL(1);
+      RUN_RMSNORM_FUSION_KERNEL(1);
     } else {
       switch (rnLoadsPerThread) {
         case 1:
-          RUN_RMSNORM_KERNEL(1);
+          RUN_RMSNORM_FUSION_KERNEL(1);
           break;
         case 2:
-          RUN_RMSNORM_KERNEL(2);
+          RUN_RMSNORM_FUSION_KERNEL(2);
           break;
         case 3:
-          RUN_RMSNORM_KERNEL(3);
+          RUN_RMSNORM_FUSION_KERNEL(3);
           break;
         case 4:
-          RUN_RMSNORM_KERNEL(4);
+          RUN_RMSNORM_FUSION_KERNEL(4);
           break;
         case 5:
-          RUN_RMSNORM_KERNEL(5);
+          RUN_RMSNORM_FUSION_KERNEL(5);
           break;
         case 6:
-          RUN_RMSNORM_KERNEL(6);
+          RUN_RMSNORM_FUSION_KERNEL(6);
           break;
         case 7:
-          RUN_RMSNORM_KERNEL(7);
+          RUN_RMSNORM_FUSION_KERNEL(7);
           break;
         case 8:
-          RUN_RMSNORM_KERNEL(8);
+          RUN_RMSNORM_FUSION_KERNEL(8);
           break;
         default:
           FLASHINFER_ERROR("[MNNVL AllReduceTwoShotRMSNorm] Unsupported loads_per_thread" +
@@ -1200,7 +2043,8 @@ cudaError_t twoshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
           return cudaErrorInvalidValue;
       }  // switch (rnLoadsPerThread)
     }  // if (rnUseCGA)
-#undef RUN_RMSNORM_KERNEL
+#undef RUN_RMSNORM_FUSION_KERNEL
+#undef RUN_RMSNORM_FUSION_KERNEL_
 
   }  // if (params.rmsNormFusion)
   return cudaSuccess;

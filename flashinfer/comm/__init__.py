@@ -1,11 +1,17 @@
 from .cuda_ipc import CudaRTLibrary, create_shared_buffer, free_shared_buffer
 from .dlpack_utils import pack_strided_memory
 from .mapping import Mapping
+
+# Shared type definitions (canonical source: _types.py, re-exported via allreduce.py)
+from .allreduce import AllReduceFusionPattern as AllReduceFusionPattern
+from .allreduce import QuantizationSFLayout as QuantizationSFLayout
+from .allreduce import get_pattern_traits as get_pattern_traits
+from ._types import QuantFusionType as QuantFusionType
+
+# Legacy trtllm types (for backwards compatibility)
 from .trtllm_ar import AllReduceFusionOp as AllReduceFusionOp
-from .trtllm_ar import AllReduceFusionPattern as AllReduceFusionPattern
 from .trtllm_ar import AllReduceStrategyConfig as AllReduceStrategyConfig
 from .trtllm_ar import AllReduceStrategyType as AllReduceStrategyType
-from .trtllm_ar import QuantizationSFLayout as QuantizationSFLayout
 from .trtllm_ar import (
     compute_fp4_swizzled_layout_sf_size as compute_fp4_swizzled_layout_sf_size,
 )
