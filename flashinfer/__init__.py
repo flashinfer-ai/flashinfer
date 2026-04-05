@@ -96,6 +96,9 @@ with contextlib.suppress(ImportError):
         cute_dsl_fused_moe_nvfp4 as cute_dsl_fused_moe_nvfp4,
         CuteDslMoEWrapper as CuteDslMoEWrapper,
     )
+from .gdn_decode import (
+    gated_delta_rule_decode as gated_delta_rule_decode,
+)
 from .gdn_prefill import chunk_gated_delta_rule as chunk_gated_delta_rule
 from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
 from .gemm import bmm_bf16 as bmm_bf16
