@@ -44,20 +44,26 @@ enum class TllmPagedAttentionMode {
 
 class TllmGenFmhaRunnerCache {
  public:
-  using Key = std::tuple<Data_type, Data_type, Data_type>;
+  using Key = std::tuple<Data_type, Data_type, Data_type, Data_type, int, int, int, int>;
 
   static std::shared_ptr<TllmGenFmhaRunner> get(Data_type q_data_type, Data_type kv_data_type,
-                                                Data_type o_data_type) {
+                                                Data_type o_data_type,
+                                                Data_type qk_reinterpret_type = DATA_TYPE_E4M3,
+                                                int num_elts_sage_q = 0, int num_elts_sage_k = 0,
+                                                int num_elts_sage_p = 0, int num_elts_sage_v = 0) {
     static std::unordered_map<Key, std::shared_ptr<TllmGenFmhaRunner>, KeyHash> cache;
     static std::mutex cache_mutex;
-    Key key = std::make_tuple(q_data_type, kv_data_type, o_data_type);
+    Key key = std::make_tuple(q_data_type, kv_data_type, o_data_type, qk_reinterpret_type,
+                              num_elts_sage_q, num_elts_sage_k, num_elts_sage_p, num_elts_sage_v);
 
     std::lock_guard<std::mutex> lock(cache_mutex);
     auto it = cache.find(key);
     if (it != cache.end()) {
       return it->second;
     } else {
-      auto runner = std::make_shared<TllmGenFmhaRunner>(q_data_type, kv_data_type, o_data_type);
+      auto runner = std::make_shared<TllmGenFmhaRunner>(
+          q_data_type, kv_data_type, o_data_type, qk_reinterpret_type, num_elts_sage_q,
+          num_elts_sage_k, num_elts_sage_p, num_elts_sage_v);
       cache.emplace(key, runner);
       return runner;
     }
@@ -68,7 +74,10 @@ class TllmGenFmhaRunnerCache {
     std::size_t operator()(const Key& k) const {
       return std::hash<int>()(static_cast<int>(std::get<0>(k))) ^
              (std::hash<int>()(static_cast<int>(std::get<1>(k))) << 1) ^
-             (std::hash<int>()(static_cast<int>(std::get<2>(k))) << 2);
+             (std::hash<int>()(static_cast<int>(std::get<2>(k))) << 2) ^
+             (std::hash<int>()(static_cast<int>(std::get<3>(k))) << 3) ^
+             (std::hash<int>()(std::get<4>(k)) << 4) ^ (std::hash<int>()(std::get<5>(k)) << 5) ^
+             (std::hash<int>()(std::get<6>(k)) << 6) ^ (std::hash<int>()(std::get<7>(k)) << 7);
     }
   };
 };
@@ -225,6 +234,8 @@ inline Data_type dl_dtype_to_tllm_data_type(const DLDataType dtype) {
     return Data_type::DATA_TYPE_E4M3;
   } else if (dtype == dl_float8_e5m2) {
     return Data_type::DATA_TYPE_E5M2;
+  } else if (dtype == dl_int8) {
+    return Data_type::DATA_TYPE_INT8;
   } else if (dtype == dl_uint8) {
     // fp4 tensor is not supported in torch and use uint8_t as container.
     return Data_type::DATA_TYPE_E2M1;
@@ -500,15 +511,19 @@ void trtllm_ragged_attention_launcher(
     int64_t batch_size, int64_t window_left, int64_t sm_count, bool enable_pdl, bool is_causal,
     int64_t k_stride_keys_values, int64_t k_stride_heads, int64_t k_stride_batch,
     int64_t v_stride_keys_values, int64_t v_stride_heads, int64_t v_stride_batch,
-    float skip_softmax_threshold_scale_factor, bool skips_softmax, int64_t workspace_size,
-    cudaStream_t stream) {
+    float skip_softmax_threshold_scale_factor, bool skips_softmax, Data_type qk_reinterpret_type,
+    float const* sage_attn_sfs_q, float const* sage_attn_sfs_k, float const* sage_attn_sfs_p,
+    float const* sage_attn_sfs_v, int64_t num_elts_sage_q, int64_t num_elts_sage_k,
+    int64_t num_elts_sage_p, int64_t num_elts_sage_v, int64_t workspace_size, cudaStream_t stream) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads must be a multiple of num_kv_heads, got num_kv_heads: " << num_kv_heads
             << " and num_qo_heads: " << num_qo_heads;
     FLASHINFER_ERROR(err_msg.str());
   }
-  auto fmha_runner = TllmGenFmhaRunnerCache::get(q_data_type, kv_data_type, o_data_type);
+  auto fmha_runner = TllmGenFmhaRunnerCache::get(q_data_type, kv_data_type, o_data_type,
+                                                 qk_reinterpret_type, num_elts_sage_q,
+                                                 num_elts_sage_k, num_elts_sage_p, num_elts_sage_v);
   TllmGenFmhaRunnerParams runner_params;
 
   runner_params.qPtr = query;
@@ -543,6 +558,10 @@ void trtllm_ragged_attention_launcher(
   runner_params.cumSeqLensKvPtr = cum_seq_lens_kv;
   runner_params.cumSeqLensQPtr = cum_seq_lens_q;
   runner_params.ptrAttentionSinks = attention_sinks;
+  runner_params.ptrSageAttnSfsQ = sage_attn_sfs_q;
+  runner_params.ptrSageAttnSfsK = sage_attn_sfs_k;
+  runner_params.ptrSageAttnSfsP = sage_attn_sfs_p;
+  runner_params.ptrSageAttnSfsV = sage_attn_sfs_v;
   runner_params.enable_pdl = enable_pdl;
 
   runner_params.kStrideKeysValues = k_stride_keys_values;
@@ -586,16 +605,17 @@ void trtllm_ragged_attention_launcher(
   fmha_runner->run(runner_params);
 }
 
-void trtllm_ragged_attention(TensorView out, TensorView query, TensorView key, TensorView value,
-                             TensorView workspace_buffer, TensorView seq_lens, int64_t max_q_len,
-                             int64_t max_kv_len, Variant<double, ffi::Tensor> bmm1_scale,
-                             Variant<double, ffi::Tensor> bmm2_scale, double o_sf_scale,
-                             int64_t batch_size, int64_t window_left, TensorView cum_seq_lens_q,
-                             TensorView cum_seq_lens_kv, int64_t sm_count, bool enable_pdl,
-                             bool is_causal, int64_t workspace_size,
-                             Optional<TensorView> attention_sinks,
-                             Optional<float> skip_softmax_threshold_scale_factor,
-                             Optional<TensorView> lse) {
+void trtllm_ragged_attention(
+    TensorView out, TensorView query, TensorView key, TensorView value, TensorView workspace_buffer,
+    TensorView seq_lens, int64_t max_q_len, int64_t max_kv_len,
+    Variant<double, ffi::Tensor> bmm1_scale, Variant<double, ffi::Tensor> bmm2_scale,
+    double o_sf_scale, int64_t batch_size, int64_t window_left, TensorView cum_seq_lens_q,
+    TensorView cum_seq_lens_kv, int64_t sm_count, bool enable_pdl, bool is_causal,
+    int64_t workspace_size, Optional<TensorView> attention_sinks,
+    Optional<float> skip_softmax_threshold_scale_factor, Optional<TensorView> sage_attn_sfs_q,
+    Optional<TensorView> sage_attn_sfs_k, Optional<TensorView> sage_attn_sfs_p,
+    Optional<TensorView> sage_attn_sfs_v, int64_t num_elts_sage_q, int64_t num_elts_sage_k,
+    int64_t num_elts_sage_p, int64_t num_elts_sage_v, Optional<TensorView> lse) {
   float* attention_sinks_ptr = nullptr;
   if (attention_sinks.has_value()) {
     TVM_FFI_ICHECK_EQ(attention_sinks.value().dtype(), dl_float32)
@@ -607,13 +627,25 @@ void trtllm_ragged_attention(TensorView out, TensorView query, TensorView key, T
     TVM_FFI_ICHECK_EQ(lse.value().dtype(), dl_float32) << "lse must be a float tensor";
     lse_ptr = static_cast<float*>(lse.value().data_ptr());
   }
+  float const* sage_attn_sfs_q_ptr = sage_attn_sfs_q.has_value()
+                                         ? static_cast<float*>(sage_attn_sfs_q.value().data_ptr())
+                                         : nullptr;
+  float const* sage_attn_sfs_k_ptr = sage_attn_sfs_k.has_value()
+                                         ? static_cast<float*>(sage_attn_sfs_k.value().data_ptr())
+                                         : nullptr;
+  float const* sage_attn_sfs_p_ptr = sage_attn_sfs_p.has_value()
+                                         ? static_cast<float*>(sage_attn_sfs_p.value().data_ptr())
+                                         : nullptr;
+  float const* sage_attn_sfs_v_ptr = sage_attn_sfs_v.has_value()
+                                         ? static_cast<float*>(sage_attn_sfs_v.value().data_ptr())
+                                         : nullptr;
   TVM_FFI_ICHECK_EQ(out.ndim(), 3) << "out must be a 3D tensor";
   TVM_FFI_ICHECK_EQ(query.ndim(), 3) << "query must be a 3D tensor";
   TVM_FFI_ICHECK_EQ(key.ndim(), 3) << "key must be a 3D tensor";
   TVM_FFI_ICHECK_EQ(value.ndim(), 3) << "value must be a 3D tensor";
 
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
-  auto kv_data_type = dl_dtype_to_tllm_data_type(key.dtype());
+  auto kv_data_type = dl_dtype_to_tllm_data_type(value.dtype());
   auto o_data_type = dl_dtype_to_tllm_data_type(out.dtype());
   const auto stream = get_stream(query.device());
   int num_qo_heads = query.size(1);
@@ -629,6 +661,25 @@ void trtllm_ragged_attention(TensorView out, TensorView query, TensorView key, T
   int v_stride_heads = value.stride(1);
   int v_stride_batch = value.numel();
 
+  Data_type qk_reinterpret_type;
+  if (query.dtype() == key.dtype() && key.dtype() != value.dtype() &&
+      kv_data_type == DATA_TYPE_E4M3) {
+    // for DiT, Qk has the same type while V is not. this means that we want to carry out Bmm1 in
+    // dtypeQk and Bmm2 in dtypeV (Pv). currently this is done by reinterpreting from E4m3
+    qk_reinterpret_type = dl_dtype_to_tllm_data_type(query.dtype());
+    // reinterpret dtypes
+    q_data_type = kv_data_type;
+    // reinterpret shapes (for TMA) related to Qk
+    int dtype_size = get_size_in_bits(qk_reinterpret_type) / get_size_in_bits(q_data_type);
+    k_stride_keys_values *= dtype_size;
+    k_stride_heads *= dtype_size;
+    k_stride_batch *= dtype_size;
+    // starting below, head dim only serves kernel meta & TMA desc, bmm1 scale must be caller-given
+    head_dim_qk *= dtype_size;
+  } else {
+    // no reinterpret (ignored when qk_reinterpret_type == E4m3 or q_data_type != E4m3)
+    qk_reinterpret_type = DATA_TYPE_E4M3;
+  }
   auto maybe_bmm1_scale_value = bmm1_scale.as<double>();
   auto maybe_bmm2_scale_value = bmm2_scale.as<double>();
   auto maybe_bmm1_scale_log2_tensor = bmm1_scale.as<ffi::Tensor>();
@@ -663,7 +714,9 @@ void trtllm_ragged_attention(TensorView out, TensorView query, TensorView key, T
       bmm2_scale_value, bmm1_scale_log2_ptr, bmm2_scale_ptr, o_sf_scale, batch_size, window_left,
       sm_count, enable_pdl, is_causal, k_stride_keys_values, k_stride_heads, k_stride_batch,
       v_stride_keys_values, v_stride_heads, v_stride_batch,
-      skip_softmax_threshold_scale_factor_value, skips_softmax, workspace_size, stream);
+      skip_softmax_threshold_scale_factor_value, skips_softmax, qk_reinterpret_type,
+      sage_attn_sfs_q_ptr, sage_attn_sfs_k_ptr, sage_attn_sfs_p_ptr, sage_attn_sfs_v_ptr,
+      num_elts_sage_q, num_elts_sage_k, num_elts_sage_p, num_elts_sage_v, workspace_size, stream);
 }
 
 namespace trtllm_cubin_loader {
