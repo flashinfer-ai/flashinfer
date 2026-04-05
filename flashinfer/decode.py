@@ -59,8 +59,8 @@ from .utils import (
     _check_kv_layout,
     _check_pos_encoding_mode,
     check_shape_dtype_device,
+    get_alibi_slopes,
     _get_cache_alibi_slopes_buf,
-    _get_cache_buf,
     _get_range_buf,
     _unpack_paged_kv_cache,
     canonicalize_torch_dtype,
@@ -74,6 +74,7 @@ from .utils import (
     round_up,
     get_compute_capability,
     GPUArchitectureError,
+    SINGLE_KERNEL_TMP_SIZE,
 )
 
 
@@ -333,7 +334,7 @@ def single_decode_with_kv_cache_with_jit_module(
     return_lse: bool = False,
 ):
     device = q.device
-    tmp = _get_cache_buf("single_decode_with_kv_cache_tmp", 32 * 1024 * 1024, device)
+    tmp = torch.empty(SINGLE_KERNEL_TMP_SIZE, dtype=torch.uint8, device=device)
     o = torch.empty_like(q)
     if return_lse:
         lse = torch.empty((q.size(0)), dtype=torch.float32, device=device)
@@ -496,7 +497,7 @@ def single_decode_with_kv_cache(
     """
     _check_pos_encoding_mode(pos_encoding_mode)
     _check_kv_layout(kv_layout)
-    tmp = _get_cache_buf("single_decode_with_kv_cache_tmp", 32 * 1024 * 1024, q.device)
+    tmp = torch.empty(SINGLE_KERNEL_TMP_SIZE, dtype=torch.uint8, device=q.device)
     head_dim = q.shape[-1]
     if logits_soft_cap is None:
         logits_soft_cap = 0.0
@@ -540,7 +541,9 @@ def single_decode_with_kv_cache(
             TensorLayout[kv_layout].value,
             window_left,
             None,  # packed_custom_mask
-            _get_cache_alibi_slopes_buf(num_qo_heads, q.device),
+            get_alibi_slopes(num_qo_heads).to(q.device)
+            if pos_encoding_mode == "ALIBI"
+            else None,
             logits_soft_cap,
             sm_scale,
             None,  # scale_q, not supported yet
@@ -570,7 +573,9 @@ def single_decode_with_kv_cache(
             tmp,
             out,
             lse,
-            _get_cache_alibi_slopes_buf(num_qo_heads, q.device),
+            get_alibi_slopes(num_qo_heads).to(q.device)
+            if pos_encoding_mode == "ALIBI"
+            else None,
             TensorLayout[kv_layout].value,
             window_left,
             logits_soft_cap,

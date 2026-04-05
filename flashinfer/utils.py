@@ -200,6 +200,8 @@ def get_alibi_slopes(n_heads: int) -> torch.Tensor:
     return m.float()
 
 
+SINGLE_KERNEL_TMP_SIZE = 32 * 1024 * 1024
+
 _cache_buf: Dict[Tuple[str, torch.device], torch.Tensor] = {}
 
 
