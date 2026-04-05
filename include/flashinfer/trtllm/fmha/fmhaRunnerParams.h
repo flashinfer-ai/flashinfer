@@ -251,15 +251,6 @@ struct TllmGenFmhaRunnerParams {
   // The stride between different batches for V.
   int vStrideBatch;
 
-  // The stride between different heads for K scaling factors.
-  int kSfStrideHeads;
-  // The stride between different batches for K scaling factors.
-  int kSfStrideBatch;
-  // The stride between different heads for V scaling factors.
-  int vSfStrideHeads;
-  // The stride between different batches for V scaling factors.
-  int vSfStrideBatch;
-
   // Head dimension for Q and K.
   int mHeadDimQk;
   // Head dimension for V.

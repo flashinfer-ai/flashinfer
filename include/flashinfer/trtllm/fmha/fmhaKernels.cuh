@@ -789,6 +789,14 @@ class TllmGenFmhaKernel {
       selectGqGenerationKernel(params, selectKernelParams);
     }
 
+    // For headDimV > 256, set headDimPerCtaV to 256 for context and keepsMmaAbForGeneration
+    // kernels. swapsMmaAbForGeneration has enough TMEM resources to hold the full headDimV.
+    // Called for context and GQA generation; MLA sets headDimPerCtaV separately.
+    if (params.mHeadDimV > 256 && !isMlaGenKernel(params) &&
+        !isSwapsMmaAbForGenerationKernel(selectKernelParams.mKernelType)) {
+      selectKernelParams.mHeadDimPerCtaV = 256;
+    }
+
     // Enable sliding window or chunked causal if the max kv sequence length exceeds attention
     // window size or chunked attention size. This is supported by causal-mask context kernels and
     // generation-phase kernels.
