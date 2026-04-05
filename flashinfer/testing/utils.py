@@ -31,6 +31,18 @@ from flashinfer.utils import round_up
 
 
 # =============================================================================
+# Power Throttling Prevention
+# =============================================================================
+
+# Maximum duration (ms) of sustained back-to-back GPU compute before inserting
+# a cooldown gap. Modern GPUs (e.g. B200) throttle SM clocks by up to 20% when
+# power draw is sustained at peak for >5ms. Benchmarking loops that exceed this
+# produce artificially lower throughput numbers. We insert sync+sleep gaps at
+# this interval to let GPU clocks recover between measurement bursts.
+GPU_POWER_THROTTLE_THRESHOLD_MS = 5.0
+
+
+# =============================================================================
 # Rotating Buffer Utilities for Cold-L2 Benchmarking
 # =============================================================================
 
@@ -885,6 +897,11 @@ def bench_gpu_time_with_cuda_event(
         call_fn()
     torch.cuda.synchronize()
 
+    # Determine how many iterations can run back-to-back before GPU power
+    # throttling degrades clock frequency.
+    max_sustained_ms = GPU_POWER_THROTTLE_THRESHOLD_MS
+    iters_per_burst = max(1, int(max_sustained_ms / estimated_kernel_execution_time))
+
     # Actual run
     start_events = [torch.cuda.Event(enable_timing=True) for _ in range(repeat_iters)]
     end_events = [torch.cuda.Event(enable_timing=True) for _ in range(repeat_iters)]
@@ -898,6 +915,9 @@ def bench_gpu_time_with_cuda_event(
 
         if sleep_after_run:
             sleep_after_kernel_run(estimated_kernel_execution_time)
+        elif (iter_idx + 1) % iters_per_burst == 0:
+            torch.cuda.synchronize()
+            time.sleep(estimated_kernel_execution_time / 1000)
 
     # Synchronize once outside of the loop to avoid synchronization overhead
     torch.cuda.synchronize()
@@ -1207,7 +1227,12 @@ def bench_gpu_time_with_cupti(
     cupti.activity_register_callbacks(
         func_buffer_requested, partial(func_buffer_completed, launches, kernels)
     )
-    for _ in range(repeat_iters):
+    # Cooldown interval to prevent GPU power throttling (same as event/graph paths).
+    # CUPTI measures pure GPU time, but throttled clocks still produce longer durations.
+    iters_per_burst = max(
+        1, int(GPU_POWER_THROTTLE_THRESHOLD_MS / estimated_kernel_execution_time)
+    )
+    for iter_idx in range(repeat_iters):
         if _do_l2_flush:
             buffer.zero_()
         start_cpu = cupti.get_timestamp()
@@ -1217,6 +1242,8 @@ def bench_gpu_time_with_cupti(
         iter_timestamps.append((start_cpu, end_cpu))
         if sleep_after_run:
             sleep_after_kernel_run(estimated_kernel_execution_time)
+        elif (iter_idx + 1) % iters_per_burst == 0:
+            time.sleep(estimated_kernel_execution_time / 1000)
     cupti.activity_flush_all(0)
     cupti.activity_disable(cupti.ActivityKind.RUNTIME)
     cupti.activity_disable(cupti.ActivityKind.CONCURRENT_KERNEL)
@@ -1445,7 +1472,31 @@ def bench_gpu_time_with_cudagraph(
             call_fn()
     torch.cuda.current_stream().wait_stream(s)
 
-    # Capture kernel in graph
+    # Estimate single-kernel time to detect when num_iters_within_graph would
+    # cause GPU power throttling. Running many kernels back-to-back within a
+    # single graph replay causes sustained peak power draw, which forces the GPU
+    # to throttle clock frequency (up to 20% on B200), producing artificially
+    # lower benchmark numbers.
+    g_probe = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g_probe):
+        call_fn()
+    torch.cuda.synchronize()
+    probe_iters = 5
+    start_event.record()
+    for _ in range(probe_iters):
+        g_probe.replay()
+    end_event.record()
+    torch.cuda.synchronize()
+    single_kernel_ms = start_event.elapsed_time(end_event) / probe_iters
+    del g_probe
+
+    # Cap num_iters_within_graph so total graph duration stays under the
+    # power throttling threshold (~5ms empirically on B200).
+    max_sustained_ms = GPU_POWER_THROTTLE_THRESHOLD_MS
+    if single_kernel_ms * num_iters_within_graph > max_sustained_ms:
+        num_iters_within_graph = max(1, int(max_sustained_ms / single_kernel_ms))
+
+    # Capture kernel in graph with the (possibly reduced) num_iters_within_graph
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
         if _do_rotate and num_rotations > 1:
@@ -1459,7 +1510,7 @@ def bench_gpu_time_with_cudagraph(
                 call_fn()
     torch.cuda.synchronize()
 
-    ## Estimate kernel execution time by running the kernel 5 times
+    ## Estimate kernel execution time by running the graph 5 times
     measurement_iters = 5
     start_event.record()
     for _ in range(measurement_iters):
@@ -1482,6 +1533,11 @@ def bench_gpu_time_with_cudagraph(
         g.replay()
     torch.cuda.synchronize()
 
+    # Determine how many graph replays can run back-to-back before triggering
+    # inter-replay power throttling (separate from intra-graph throttling above).
+    graph_duration_ms = estimated_kernel_execution_time
+    replays_per_burst = max(1, int(max_sustained_ms / graph_duration_ms))
+
     # Actual run
     start_events = [torch.cuda.Event(enable_timing=True) for _ in range(repeat_iters)]
     end_events = [torch.cuda.Event(enable_timing=True) for _ in range(repeat_iters)]
@@ -1493,8 +1549,11 @@ def bench_gpu_time_with_cudagraph(
 
         if sleep_after_run:
             sleep_after_kernel_run(estimated_kernel_execution_time)
+        elif (iter_idx + 1) % replays_per_burst == 0:
+            # Cooldown gap to prevent clock throttling from sustained compute.
+            torch.cuda.synchronize()
+            time.sleep(graph_duration_ms / 1000)
 
-    # Synchronize once outside of the loop to avoid synchronization overhead
     torch.cuda.synchronize()
     measured_times = []
     for iter_idx in range(repeat_iters):
@@ -1535,7 +1594,7 @@ def bench_gpu_time(
        time via hardware profiling. Requires cupti-python >= 13.
     2. **CUDA Graphs** (``use_cuda_graph=True``): Amortizes launch overhead by
        capturing and replaying multiple kernel calls. Good balance of accuracy
-       and availability.
+       and availability. Can be used with CUPTI if the function launches multiple kernels.
     3. **CUDA Events** (default): Simplest method, measures launch + execution.
        Available everywhere but includes CPU overhead.
 
