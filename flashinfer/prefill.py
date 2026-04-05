@@ -4101,7 +4101,7 @@ def trtllm_fmha_v2_prefill(
     max_q_len: int,
     max_kv_len: int,
     bmm1_scale: float,
-    bmm2_scale: float,
+    bmm2_scale: Union[float, torch.Tensor],
     batch_size: int,
     cum_seq_lens_q: torch.Tensor,
     cum_seq_lens_kv: torch.Tensor,
@@ -4308,10 +4308,6 @@ def trtllm_fmha_v2_prefill(
             device=query.device,
         )
 
-    # Handle scale parameters
-    scale_bmm1 = float(bmm1_scale)
-    scale_bmm2 = float(bmm2_scale)
-
     # Softmax scale: 1.0 for FP8, 0.0 (auto-detect) for FP16/BF16
     # C++ kernel auto-sets to 1.0 for FP16/E4M3 when 0.0 is passed
     is_e4m3 = (
@@ -4345,7 +4341,8 @@ def trtllm_fmha_v2_prefill(
     )
 
     # Allocate LSE tensor if saving softmax stats
-    # Kernel writes in ragged (flat) format: [total_q_tokens, num_qo_heads, 2]
+    # Kernel writes in ragged (flat
+    # ) format: [total_q_tokens, num_qo_heads, 2]
     # total_q_tokens == query.shape[0] for all ragged layouts
     lse = None
     if save_softmax_stats:
@@ -4366,8 +4363,6 @@ def trtllm_fmha_v2_prefill(
             [block_tables * 2, block_tables * 2 + 1], dim=1
         ).contiguous()  # [B, 2, M]
 
-    scale_bmm2_d = _create_scale_bmm2_d_tensor(scale_bmm2, query.dtype, query.device)
-
     module.run(
         query,  # Q tensor
         k_cache,  # K tensor
@@ -4387,15 +4382,15 @@ def trtllm_fmha_v2_prefill(
         batch_size,  # Batch size
         mask_mode.lower(),  # Attention mask type
         scale_softmax,  # Softmax scale
-        scale_bmm1,  # BMM1 scale
-        scale_bmm2,  # BMM2 scale (float, still needed for set_alpha in C++)
+        bmm1_scale,  # BMM1 scale
+        bmm2_scale,  # BMM2 scale (float, still needed for set_alpha in C++)
         window_left,  # Window left
         chunked_attention_size,  # Chunked attention size
         pos_encoding_mode is not None
         and pos_encoding_mode.lower() == "alibi",  # Alibi mode
         softcapping_scale,  # Softcapping scale (0.0 = disabled)
         skip_softmax_threshold_scale_factor,  # threshold_scale_factor for skip-softmax (0.0 = disable)
-        scale_bmm2_d,  # Pre-populated scale_bmm2 on device (avoids cudaMemcpy)
+        # bmm2_scale_d,  # Pre-populated scale_bmm2 on device (avoids cudaMemcpy)
         lse,  # Optional LSE tensor (None if not saving softmax stats)
         sinks,  # Optional sinks tensor
     )
