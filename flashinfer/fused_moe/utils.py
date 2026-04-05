@@ -1,4 +1,6 @@
+import bisect
 import contextlib
+import math
 import threading
 from dataclasses import dataclass
 from enum import Enum
@@ -7,6 +9,9 @@ from typing import Dict, List, Tuple
 import torch
 
 from ..utils import ceil_div, round_up
+
+TRTLLM_MOE_MIN_TILE_N = 8
+TRTLLM_MOE_MAX_TILE_N = 256
 
 is_torch_compiling_flag = False
 
@@ -213,6 +218,60 @@ def get_last_power_of_2_num_tokens_buckets(
         num_token_buckets.append(m)
         m //= 2
     return tuple(num_token_buckets)
+
+
+def get_trtllm_moe_num_tokens_buckets(
+    top_k: int,
+    num_local_experts: int,
+    tune_max_num_tokens: int,
+) -> Tuple[int, ...]:
+    """Generate autotuner buckets aligned with C++ tile selection."""
+
+    def geo_range(start, stop_pred, step_fn):
+        result = []
+        n = start
+        while stop_pred(n):
+            result.append(n)
+            n = step_fn(n)
+        return result
+
+    # Mirror C++ computeSelectedTileN: ceil(avg_tokens_per_expert) → next_pow2 → clamp
+    avg = tune_max_num_tokens * top_k / num_local_experts
+    max_tile = max(
+        TRTLLM_MOE_MIN_TILE_N,
+        min(
+            next_positive_power_of_2(max(1, math.ceil(avg))),
+            TRTLLM_MOE_MAX_TILE_N,
+        ),
+    )
+    tile_reps = [
+        max(1, tile * num_local_experts // top_k)
+        for tile in geo_range(
+            TRTLLM_MOE_MIN_TILE_N, lambda t: t <= max_tile, lambda t: t * 2
+        )
+    ]
+
+    above = geo_range(
+        tile_reps[-1] * 2, lambda n: n <= tune_max_num_tokens, lambda n: n * 2
+    )
+    below = geo_range(tile_reps[0] // 2, lambda n: n >= 1, lambda n: n // 2)
+
+    return tuple(sorted(set(tile_reps + above + below)))
+
+
+def make_trtllm_moe_bucket_mapper(buckets: Tuple[int, ...]):
+    """Create a map_to_tuning_buckets function aligned with C++ computeSelectedTileN.
+
+    Accepts the pre-computed bucket tuple from get_trtllm_moe_num_tokens_buckets.
+    Uses bisect to find the largest bucket <= num_tokens.
+    """
+    sorted_buckets = tuple(sorted(buckets))
+
+    def _map(num_tokens: int) -> int:
+        idx = bisect.bisect_right(sorted_buckets, num_tokens) - 1
+        return sorted_buckets[max(0, idx)]
+
+    return _map
 
 
 def get_fp4_shape(input_shape, sf_vec_size, is_swizzled_layout=True):
