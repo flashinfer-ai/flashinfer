@@ -147,6 +147,15 @@
   } else if (group_size == 4) {                              \
     constexpr size_t GROUP_SIZE = 4;                         \
     __VA_ARGS__                                              \
+  } else if (group_size == 5) {                              \
+    constexpr size_t GROUP_SIZE = 5;                         \
+    __VA_ARGS__                                              \
+  } else if (group_size == 6) {                              \
+    constexpr size_t GROUP_SIZE = 6;                         \
+    __VA_ARGS__                                              \
+  } else if (group_size == 7) {                              \
+    constexpr size_t GROUP_SIZE = 7;                         \
+    __VA_ARGS__                                              \
   } else if (group_size == 8) {                              \
     constexpr size_t GROUP_SIZE = 8;                         \
     __VA_ARGS__                                              \
