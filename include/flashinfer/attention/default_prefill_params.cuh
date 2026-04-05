@@ -57,6 +57,9 @@ struct SinglePrefillParams {
   float rope_rcp_theta;
 
   uint32_t partition_kv;
+  uint32_t dllm_block_size;  // DLLM block size for BlockExpanding mask (0 = disabled)
+  uint32_t q_block_expanding_offset;  // Q global offset (for incremental chunk prefill)
+  uint32_t kv_block_expanding_offset; // KV global offset (for Cascade Current Chunk)
 
   __host__ SinglePrefillParams()
       : q(nullptr),
@@ -83,7 +86,10 @@ struct SinglePrefillParams {
         sm_scale(0.0f),
         rope_rcp_scale(0.0f),
         rope_rcp_theta(0.0f),
-        partition_kv(false) {}
+        partition_kv(false),
+        dllm_block_size(0),
+        q_block_expanding_offset(0),
+        kv_block_expanding_offset(0) {}
 
   __host__ SinglePrefillParams(DTypeQ* q, DTypeKV* k, DTypeKV* v, uint8_t* maybe_custom_mask,
                                DTypeO* o, float* lse, float* maybe_alibi_slopes,
@@ -116,7 +122,10 @@ struct SinglePrefillParams {
         sm_scale(sm_scale),
         rope_rcp_scale(1. / rope_scale),
         rope_rcp_theta(1. / rope_theta),
-        partition_kv(false) {}
+        partition_kv(false),
+        dllm_block_size(0),
+        q_block_expanding_offset(0),
+        kv_block_expanding_offset(0) {}
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
     return qo_len;
@@ -124,6 +133,16 @@ struct SinglePrefillParams {
 
   __host__ __device__ __forceinline__ uint32_t get_kv_len(uint32_t batch_idx) const {
     return kv_len;
+  }
+
+  // Single prefill supports incremental chunk prefill
+  __host__ __device__ __forceinline__ uint32_t get_q_block_expanding_offset(uint32_t batch_idx) const {
+    return q_block_expanding_offset;
+  }
+
+  // Single prefill supports Cascade Current Chunk
+  __host__ __device__ __forceinline__ uint32_t get_kv_block_expanding_offset(uint32_t batch_idx) const {
+    return kv_block_expanding_offset;
   }
 };
 
@@ -177,6 +196,11 @@ struct BatchPrefillRaggedParams {
   uint32_t token_pos_in_items_len;
   uint16_t* maybe_max_item_len_ptr;
 
+  // Block Expanding mask supports incremental chunk prefill
+  uint32_t dllm_block_size;                    // DLLM block size (0 = disabled)
+  IdType* maybe_q_block_expanding_offset;      // Q global offset (one value per batch item)
+  IdType* maybe_kv_block_expanding_offset;     // KV global offset (one value per batch item, for Cascade Current Chunk)
+
   __host__ BatchPrefillRaggedParams()
       : q(nullptr),
         k(nullptr),
@@ -218,7 +242,10 @@ struct BatchPrefillRaggedParams {
         maybe_prefix_len_ptr(nullptr),
         maybe_token_pos_in_items_ptr(nullptr),
         token_pos_in_items_len(0),
-        maybe_max_item_len_ptr(nullptr) {}
+        maybe_max_item_len_ptr(nullptr),
+        dllm_block_size(0),
+        maybe_q_block_expanding_offset(nullptr),
+        maybe_kv_block_expanding_offset(nullptr) {}
 
   __host__ BatchPrefillRaggedParams(DTypeQ* q, DTypeKV* k, DTypeKV* v, uint8_t* maybe_custom_mask,
                                     IdType* q_indptr, IdType* kv_indptr, IdType* maybe_mask_indptr,
@@ -269,7 +296,10 @@ struct BatchPrefillRaggedParams {
         maybe_prefix_len_ptr(nullptr),
         maybe_token_pos_in_items_ptr(nullptr),
         token_pos_in_items_len(0),
-        maybe_max_item_len_ptr(nullptr) {}
+        maybe_max_item_len_ptr(nullptr),
+        dllm_block_size(0),
+        maybe_q_block_expanding_offset(nullptr),
+        maybe_kv_block_expanding_offset(nullptr) {}
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
     return q_indptr[batch_idx + 1] - q_indptr[batch_idx];
@@ -277,6 +307,16 @@ struct BatchPrefillRaggedParams {
 
   __host__ __device__ __forceinline__ uint32_t get_kv_len(uint32_t batch_idx) const {
     return kv_indptr[batch_idx + 1] - kv_indptr[batch_idx];
+  }
+
+  // Get batch item's Q global offset (for incremental chunk prefill)
+  __host__ __device__ __forceinline__ uint32_t get_q_block_expanding_offset(uint32_t batch_idx) const {
+    return (maybe_q_block_expanding_offset != nullptr) ? maybe_q_block_expanding_offset[batch_idx] : 0;
+  }
+
+  // Get batch item's KV global offset (for Cascade Current Chunk)
+  __host__ __device__ __forceinline__ uint32_t get_kv_block_expanding_offset(uint32_t batch_idx) const {
+    return (maybe_kv_block_expanding_offset != nullptr) ? maybe_kv_block_expanding_offset[batch_idx] : 0;
   }
 };
 
@@ -322,6 +362,11 @@ struct BatchPrefillPagedParams {
   uint32_t token_pos_in_items_len;
   uint16_t* maybe_max_item_len_ptr;
 
+  // Block Expanding mask supports incremental chunk prefill
+  uint32_t dllm_block_size;                    // DLLM block size (0 = disabled)
+  IdType* maybe_q_block_expanding_offset;      // Q global offset (one value per batch item)
+  IdType* maybe_kv_block_expanding_offset;     // KV global offset (one value per batch item, for Cascade Current Chunk)
+
   __host__ BatchPrefillPagedParams()
       : q(nullptr),
         paged_kv(),
@@ -355,7 +400,10 @@ struct BatchPrefillPagedParams {
         maybe_prefix_len_ptr(nullptr),
         maybe_token_pos_in_items_ptr(nullptr),
         token_pos_in_items_len(0),
-        maybe_max_item_len_ptr(nullptr) {}
+        maybe_max_item_len_ptr(nullptr),
+        dllm_block_size(0),
+        maybe_q_block_expanding_offset(nullptr),
+        maybe_kv_block_expanding_offset(nullptr) {}
 
   __host__ BatchPrefillPagedParams(DTypeQ* q, paged_kv_t<DTypeKV, IdType> paged_kv,
                                    uint8_t* maybe_custom_mask, IdType* q_indptr,
@@ -396,7 +444,10 @@ struct BatchPrefillPagedParams {
         maybe_prefix_len_ptr(nullptr),
         maybe_token_pos_in_items_ptr(nullptr),
         token_pos_in_items_len(0),
-        maybe_max_item_len_ptr(nullptr) {}
+        maybe_max_item_len_ptr(nullptr),
+        dllm_block_size(0),
+        maybe_q_block_expanding_offset(nullptr),
+        maybe_kv_block_expanding_offset(nullptr) {}
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
     return q_indptr[batch_idx + 1] - q_indptr[batch_idx];
@@ -404,6 +455,16 @@ struct BatchPrefillPagedParams {
 
   __host__ __device__ __forceinline__ uint32_t get_kv_len(uint32_t batch_idx) const {
     return paged_kv.get_length(batch_idx);
+  }
+
+  // Get batch item's Q global offset (for incremental chunk prefill)
+  __host__ __device__ __forceinline__ uint32_t get_q_block_expanding_offset(uint32_t batch_idx) const {
+    return (maybe_q_block_expanding_offset != nullptr) ? maybe_q_block_expanding_offset[batch_idx] : 0;
+  }
+
+  // Get batch item's KV global offset (for Cascade Current Chunk)
+  __host__ __device__ __forceinline__ uint32_t get_kv_block_expanding_offset(uint32_t batch_idx) const {
+    return (maybe_kv_block_expanding_offset != nullptr) ? maybe_kv_block_expanding_offset[batch_idx] : 0;
   }
 };
 
