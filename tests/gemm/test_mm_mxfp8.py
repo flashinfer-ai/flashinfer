@@ -10,7 +10,7 @@ from flashinfer import (
     shuffle_matrix_sf_a,
 )
 from flashinfer.fp8_quantization import mxfp8_quantize
-from flashinfer.utils import get_compute_capability, is_sm12x_supported
+from flashinfer.utils import get_compute_capability
 
 
 def _get_min_cosine_sim(
@@ -84,9 +84,15 @@ def _run_mm_mxfp8(
     use_8x4_sf_layout_for_a=False,
 ):
     _skip_if_unsupported(backend)
-    # SM12x only supports swizzled (1D) scale layout across all backends.
-    if is_sm12x_supported(torch.device("cuda")) and not is_sf_swizzled_layout:
-        pytest.skip("SM12x only supports swizzled (1D) scale layout for MXFP8")
+
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    is_sm12x = compute_capability[0] == 12
+
+    if is_sm12x and not is_sf_swizzled_layout:
+        pytest.skip(
+            "SM12x only supports swizzled 1D scales; no backend handles non-swizzled layout."
+        )
+
     if backend == "trtllm":
         if not is_sf_swizzled_layout:
             pytest.skip("trtllm must have swizzled scales")
@@ -301,6 +307,12 @@ def test_mm_mxfp8_find_minimum_cosine_similarity(is_sf_swizzled_layout):
     """Sweep value scales and enforce a minimum cosine similarity."""
     _skip_if_unsupported()
 
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    if compute_capability[0] == 12 and not is_sf_swizzled_layout:
+        pytest.skip(
+            "SM12x only supports swizzled 1D scales; no backend handles non-swizzled layout."
+        )
+
     m, n, k = 256, 4096, 4096
 
     value_scales = [0.001, 0.01, 0.02, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 50.0, 100.0]
@@ -499,6 +511,12 @@ def test_mm_mxfp8_llm_full_layer_simulation():
 def test_mm_mxfp8_scale_contiguity_requirement():
     """Test behavior with non-contiguous scale tensors."""
     _skip_if_unsupported()
+
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    if compute_capability[0] == 12:
+        pytest.skip(
+            "SM12x only supports swizzled 1D scales; this test uses non-swizzled 2D scales."
+        )
 
     m, n, k = 256, 4096, 4096
 
