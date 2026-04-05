@@ -145,6 +145,8 @@ class ArtifactPath:
     CUDNN_SDPA: str = "a72d85b019dc125b9f711300cb989430f762f5a6/fmha/cudnn/"
     # For DEEPGEMM, we also need to update KernelMap.KERNEL_MAP_HASH in flashinfer/deep_gemm.py
     DEEPGEMM: str = "a72d85b019dc125b9f711300cb989430f762f5a6/deep-gemm/"
+    # cuda_ptx.h is a large (~2MB) header excluded from the repo and fetched on demand.
+    CUDA_PTX: str = "5db0eee675e8d8d81aa56853ae0c235f6bca7f55/cuda_ptx-5ee61af/"
 
 
 class CheckSumHash:
@@ -164,6 +166,7 @@ class CheckSumHash:
     TRTLLM_GEN_GEMM: str = (
         "18262161e624f7da9d2d04c528c645a5ff7f5efd774024a0b2eb92748ab18bb9"
     )
+    CUDA_PTX: str = "0003bb62b07a87881844f40cf19eb8f98a99cb2bfd5a782b0deb7d3a0750df6f"
     map_checksums: dict[str, str] = {
         safe_urljoin(ArtifactPath.TRTLLM_GEN_FMHA, "checksums.txt"): TRTLLM_GEN_FMHA,
         safe_urljoin(ArtifactPath.TRTLLM_GEN_BMM, "checksums.txt"): TRTLLM_GEN_BMM,
@@ -222,6 +225,12 @@ def get_subdir_file_list() -> Generator[tuple[str, str], None, None]:
         checksums[
             safe_urljoin(ArtifactPath.TRTLLM_GEN_BMM, "include/flashinferMetaInfo.h")
         ],
+    )
+
+    # cuda_ptx.h: large header fetched as an artifact (not in the repo).
+    yield (
+        safe_urljoin(ArtifactPath.CUDA_PTX, "cuda_ptx.h"),
+        CheckSumHash.CUDA_PTX,
     )
 
     # All the actual kernel cubin's.

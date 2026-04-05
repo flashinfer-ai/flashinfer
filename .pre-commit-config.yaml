@@ -19,6 +19,7 @@ repos:
     rev: v5.0.0
     hooks:
       - id: check-added-large-files
+        exclude: ^csrc/trtllm_kernels/batched_gemm/trtllmGen_bmm_export/
       - id: check-case-conflict
       - id: check-merge-conflict
       - id: check-symlinks
@@ -41,7 +42,12 @@ repos:
       - id: clang-format
         types_or: [c++, c, cuda]
         exclude: |
-          (?x)^(3rdparty/.* flashinfer/jit/aot_config.py)$
+          (?x)^(
+            3rdparty/.*|
+            flashinfer/jit/aot_config.py|
+            csrc/trtllm_kernels/cuda_ptx/cuda_ptx\.h|
+            csrc/trtllm_kernels/batched_gemm/trtllmGen_bmm_export/.*
+          )$
 
   -   repo: https://github.com/pre-commit/mirrors-mypy
       rev: 'v1.17.1'  # Use the sha / tag you want to point at

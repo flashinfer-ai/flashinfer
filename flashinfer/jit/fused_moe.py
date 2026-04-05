@@ -31,6 +31,8 @@ from .cubin_loader import (
     get_meta_hash,
     ensure_symlink,
     verify_symlinked_headers,
+    compile_source_cubins,
+    download_cuda_ptx_header,
 )
 from .gemm.cutlass.generate_kernels import generate_gemm_operations
 
@@ -276,6 +278,59 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
     )
     ensure_symlink(symlink_path, jit_env.FLASHINFER_CUBIN_DIR / bmm_export_path)
     verify_symlinked_headers(symlink_path, BMM_EXPORT_HEADERS, checksum)
+
+    # Download cuda_ptx.h (~2MB header excluded from the repo) into the cubin
+    # cache so that ``#include <cuda_ptx/cuda_ptx.h>`` resolves during
+    # compile_source_cubins() and the subsequent JIT compilation.
+    cuda_ptx_include_dir = download_cuda_ptx_header(
+        ArtifactPath.CUDA_PTX, CheckSumHash.CUDA_PTX
+    )
+
+    bundle_header_dir = jit_env.FLASHINFER_CSRC_DIR / "trtllm_kernels"
+
+    # Directory containing the bundled trtllmGen export (includes trtllm/dev/*.h headers)
+    bundled_export_dir = (
+        jit_env.FLASHINFER_CSRC_DIR
+        / "trtllm_kernels"
+        / "batched_gemm"
+        / "trtllmGen_bmm_export"
+    )
+
+    # Compile .cu source files to .cubin for kernels with mUseSource=true.
+    # The .cu files are shipped in the repo; their .cubin outputs are placed
+    # in the cubin cache directory where getCubin() will find them at runtime.
+    source_kernel_dir = bundled_export_dir / "src"
+
+    compile_source_cubins(
+        source_dir=source_kernel_dir,
+        artifact_path=ArtifactPath.TRTLLM_GEN_BMM,
+        include_paths=[
+            jit_env.FLASHINFER_CUBIN_DIR / include_path,
+            symlink_path,
+            bundle_header_dir,
+            bundled_export_dir,  # for trtllm/dev/*.h headers
+            source_kernel_dir,
+            cuda_ptx_include_dir,  # for cuda_ptx/cuda_ptx.h
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include",
+            *jit_env.CUTLASS_INCLUDE_DIRS,
+        ],
+        nvcc_flags=[
+            "--expt-relaxed-constexpr",
+            "--use_fast_math",
+            "-std=c++17",
+            "-arch=sm_100a",
+            "-DTLLM_ENABLE_CUDA",
+            "-DNDEBUG=1",
+            "-DCUTLASS_ARCH_MMA_SM100A_ENABLED",
+            "-DTLLM_PUBLIC_RELEASE=1",
+            "-diag-suppress=177",
+            "-diag-suppress=2361",
+            "-diag-suppress=550",
+            "-O3",
+            "-cubin",
+        ],
+    )
 
     # currently only support Blackwell
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(

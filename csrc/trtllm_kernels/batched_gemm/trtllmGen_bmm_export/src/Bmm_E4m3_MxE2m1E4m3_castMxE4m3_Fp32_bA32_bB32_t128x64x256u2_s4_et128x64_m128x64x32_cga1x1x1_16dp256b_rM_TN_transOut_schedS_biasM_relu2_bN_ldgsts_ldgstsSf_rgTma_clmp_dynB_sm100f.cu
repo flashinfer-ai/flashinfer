@@ -1,0 +1,4136 @@
+#include <Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_bA32_bB32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_relu2_bN_ldgsts_ldgstsSf_rgTma_clmp_dynB_sm100f.h>
+namespace batchedGemm {
+
+
+struct SmemBufferStack {
+  int8_t* mPtr;
+  inline __device__ SmemBufferStack(SmemBufferSmem& smemBufferSmem,
+                                    int32_t warpId,
+                                    int32_t barInitWarpId,
+                                    int32_t orderedSequenceGroupId)
+    : mPtr{&smemBufferSmem.mArray[int32_t{0}]} {}
+};
+struct SmemAStack {
+  int8_t* mDepSmemPtr0;
+  trtllm::dev::
+    CutlassTmaMultiUmmaAsyncPipeline<4, cute::Shape<cute::Int<1>, cute::Int<1>, cute::Int<1>>>
+      mPipeline;
+  inline __device__ SmemAStack(SmemASmem& smemASmem,
+                               SmemASmemBarrier& smemASmemBarrier,
+                               SmemBufferSmem& smemBufferSmem,
+                               SmemBufferStack& smemBufferStack,
+                               int32_t warpId,
+                               int32_t barInitWarpId,
+                               int32_t orderedSequenceGroupId)
+    : mDepSmemPtr0{&smemBufferSmem.mArray[int32_t{0}]}
+    , mPipeline{smemASmemBarrier.mBarriers,
+                warpId,
+                int32_t{16384},
+                ((warpId) == (barInitWarpId)) && (bool{cute::elect_one_sync()}),
+                int32_t{1},
+                CuteFlatTuple202{},
+                cute::true_type{},
+                cute::true_type{},
+                barInitWarpId} {}
+};
+struct SmemBStack {
+  int8_t* mDepSmemPtr0;
+  trtllm::dev::CutlassUmmaConsumerAsyncPipeline<4, true, false> mPipeline;
+  inline __device__ SmemBStack(SmemBSmem& smemBSmem,
+                               SmemBSmemBarrier& smemBSmemBarrier,
+                               SmemBufferSmem& smemBufferSmem,
+                               SmemBufferStack& smemBufferStack,
+                               int32_t warpId,
+                               int32_t barInitWarpId,
+                               int32_t orderedSequenceGroupId)
+    : mDepSmemPtr0{&smemBufferSmem.mArray[int32_t{0}]}
+    , mPipeline{smemBSmemBarrier.mBarriers,
+                warpId,
+                int32_t{64},
+                CuteFlatTuple324{},
+                cute::true_type{},
+                cute::true_type{},
+                barInitWarpId} {}
+};
+struct SmemSfAStack {
+  trtllm::dev::CutlassTmaUmmaAsyncPipeline<4, cute::Shape<cute::Int<1>, cute::Int<1>, cute::Int<1>>>
+    mPipeline;
+  cutlass::float_ue8m0_t* mPtr;
+  inline __device__ SmemSfAStack(SmemSfASmem& smemSfASmem,
+                                 SmemSfASmemBarrier& smemSfASmemBarrier,
+                                 int32_t warpId,
+                                 int32_t barInitWarpId,
+                                 int32_t orderedSequenceGroupId)
+    : mPipeline{smemSfASmemBarrier.mBarriers,
+                warpId,
+                int32_t{1024},
+                bool{cute::elect_one_sync()},
+                CuteFlatTuple435{},
+                cute::true_type{},
+                cute::true_type{},
+                barInitWarpId}
+    , mPtr{&smemSfASmem.mArray[int32_t{0}][int32_t{0}]} {}
+};
+struct TmemSfAStack {
+  trtllm::dev::CutlassUmmaConsumerAsyncPipeline<4, false, false> mPipeline;
+  inline __device__ TmemSfAStack(TmemSfASmemBarrier& tmemSfASmemBarrier,
+                                 int32_t warpId,
+                                 int32_t barInitWarpId,
+                                 int32_t orderedSequenceGroupId)
+    : mPipeline{tmemSfASmemBarrier.mBarriers,
+                warpId,
+                int32_t{32},
+                CuteFlatTuple551{},
+                cute::true_type{},
+                cute::true_type{},
+                barInitWarpId} {}
+};
+struct TmemConstSfBStack {
+  int8_t* mDepSmemPtr0;
+  inline __device__ TmemConstSfBStack(SmemBufferSmem& smemBufferSmem,
+                                      SmemBufferStack& smemBufferStack,
+                                      int32_t warpId,
+                                      int32_t barInitWarpId,
+                                      int32_t orderedSequenceGroupId)
+    : mDepSmemPtr0{&smemBufferSmem.mArray[int32_t{0}]} {}
+};
+struct TmemStack {
+  inline __device__ TmemStack(int32_t warpId,
+                              int32_t barInitWarpId,
+                              int32_t orderedSequenceGroupId) {}
+};
+struct Mma0Stack {
+  trtllm::dev::CutlassUmmaAsyncPipeline<1, cute::Shape<cute::Int<1>, cute::Int<1>, cute::Int<1>>>
+    mPipeline;
+  inline __device__ Mma0Stack(Mma0SmemBarrier& mma0SmemBarrier,
+                              TmemStack& tmemStack,
+                              int32_t warpId,
+                              int32_t barInitWarpId,
+                              int32_t orderedSequenceGroupId)
+    : mPipeline{mma0SmemBarrier.mBarriers,
+                warpId,
+                int32_t{128},
+                CuteFlatTuple675{},
+                cute::true_type{},
+                cute::true_type{},
+                barInitWarpId} {}
+};
+struct GmemC0Stack {
+  int8_t* mDepSmemPtr0;
+  inline __device__ GmemC0Stack(GmemC0Smem& gmemC0Smem,
+                                SmemBufferSmem& smemBufferSmem,
+                                SmemBufferStack& smemBufferStack,
+                                int32_t warpId,
+                                int32_t barInitWarpId,
+                                int32_t orderedSequenceGroupId)
+    : mDepSmemPtr0{&smemBufferSmem.mArray[int32_t{0}]} {}
+};
+struct KernelState {
+  int32_t const mNumNonExitingCtas;
+  int32_t const mThreadIdx;
+  uint32_t* const mTmemSwStatePtr;
+  int32_t const mWarpIdx;
+  inline __device__ KernelState(KernelParams const& params, uint32_t* tmemSwStatePtr)
+    : mNumNonExitingCtas{params.ptrNumNonExitingCtas[int32_t{0}]}
+    , mThreadIdx{reinterpret_cast<int32_t const&>(threadIdx.x)}
+    , mTmemSwStatePtr{tmemSwStatePtr}
+    , mWarpIdx{
+        __shfl_sync(uint32_t{0xffffffff}, (mThreadIdx) / (int32_t{32}), int32_t{0}, int32_t{32})} {}
+};
+struct LoadTaskA {
+  int32_t mCtaIdxY;
+  int32_t const mBatchIdx;
+  int32_t const mBatchLimit;
+  int32_t mCtaOffsetK;
+  int32_t mCtaIdxX;
+  inline __device__ LoadTaskA(KernelParams const& params,
+                              KernelState const& state,
+                              int32_t warpGrpStart)
+    : mCtaIdxY{reinterpret_cast<int32_t const&>(blockIdx.y)}
+    , mBatchIdx{int32_t{params.ptrCtaIdxXyToBatchIdx[mCtaIdxY]}}
+    , mBatchLimit{int32_t{params.ptrCtaIdxXyToMnLimit[mCtaIdxY]}}
+    , mCtaOffsetK{int32_t{0}}
+    , mCtaIdxX{reinterpret_cast<int32_t const&>(blockIdx.x)} {}
+  static inline __device__ bool isSelected(KernelParams const& params, KernelState const& state) {
+    return ((state.mWarpIdx) >= (int32_t{6})) && ((state.mWarpIdx) < (int32_t{7}));
+  }
+  inline __device__ void execute(KernelParams const& params,
+                                 KernelState const& state,
+                                 SmemASmem& smemADstSmem,
+                                 SmemAStack& smemADstStack) {
+    cuda_ptx::setmaxnreg_dec(cuda_ptx::n32_t<48>{});
+    cudaGridDependencySynchronize();
+    trtllm::dev::CutlassTmaMultiUmmaAsyncPipeline<
+      4,
+      cute::Shape<cute::Int<1>, cute::Int<1>, cute::Int<1>>>::PipelineState smemAProdState{
+      int32_t{0},
+      int32_t{1},
+      int32_t{0}};
+    int32_t smemAProdToken{int32_t{1}};
+    int32_t paddedPerCtaK{(((params.k) + (int32_t{255})) / (int32_t{256})) * (int32_t{256})};
+    int32_t loopEnd{paddedPerCtaK};
+    bool const hasOneLoopIter{(int32_t{0}) < (loopEnd)};
+    //
+    // smemA [HoistProdTryAcquire].
+    //
+    if ((int32_t{0}) < (loopEnd)) {
+      smemAProdToken = smemADstStack.mPipeline.producer_try_acquire(smemAProdState);
+    }
+    //
+    // Hoist the first iter.
+    //
+    //
+    // Loop body.
+    //
+    CUTLASS_PRAGMA_NO_UNROLL
+    for (int32_t loopOffset257 = int32_t{0}; loopOffset257 < loopEnd;
+         loopOffset257 += int32_t{256}) {
+      bool const isLastLoopIter{((loopOffset257) + (int32_t{256})) >= (loopEnd)};
+      //
+      // gmemA [ConsWork (call 0), Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+      int32_t tileOffsetK1;
+      { tileOffsetK1 = loopOffset257; }
+      //
+      // smemA [ProdAcquire, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+      {
+        smemADstStack.mPipeline.producer_acquire(smemAProdState, smemAProdToken);
+        if (((loopOffset257) + (int32_t{256})) < (loopEnd)) {
+          smemAProdToken = smemADstStack.mPipeline.producer_try_acquire(
+            trtllm::dev::makePipelineState(smemAProdState, int32_t{1}));
+        }
+      }
+      //
+      // smemA [ProdWork (call 0), Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+      int32_t tileOffsetK5;
+      tileOffsetK5 = tileOffsetK1;
+      {
+        uint64_t* barrier{smemADstStack.mPipeline.producer_get_barrier(smemAProdState)};
+        int32_t index{smemAProdState.index()};
+        {}
+        {
+          int8_t* smemBytesBasePtrA;
+          int8_t* smemBytesStagePtrA;
+          smemBytesBasePtrA = reinterpret_cast<int8_t*>(smemADstStack.mDepSmemPtr0) + (int32_t{0});
+          smemBytesStagePtrA = smemBytesBasePtrA + ((index) * (int32_t{32768}));
+          int32_t coords[3];
+          coords[int32_t{0}] = tileOffsetK5;
+          coords[int32_t{1}] = (mCtaIdxX) * (int32_t{128});
+          coords[int32_t{2}] = mBatchIdx;
+          if (bool{cute::elect_one_sync()}) {
+            cuda_ptx::cp_async_bulk_tensor(
+              cuda_ptx::space_cluster_t{},
+              cuda_ptx::space_global_t{},
+              &reinterpret_cast<cutlass::float_e4m3_t*>(smemBytesStagePtrA)[int32_t{0}],
+              params.tmaA,
+              coords,
+              barrier);
+          }
+          coords[int32_t{0}] += int32_t{128};
+          if (bool{cute::elect_one_sync()}) {
+            cuda_ptx::cp_async_bulk_tensor(
+              cuda_ptx::space_cluster_t{},
+              cuda_ptx::space_global_t{},
+              &reinterpret_cast<cutlass::float_e4m3_t*>(smemBytesStagePtrA)[int32_t{16384}],
+              params.tmaA,
+              coords,
+              barrier);
+          }
+        }
+      }
+      //
+      // smemA [ProdPreCommit, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+      if ((loopOffset257) >= (int32_t{0})) {
+      }
+      //
+      // smemA [ProdCommit, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+      {
+        { smemADstStack.mPipeline.producer_commit(smemAProdState); }
+        ++smemAProdState;
+      }
+      //
+      // gmemA [ConsTailWork, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+      //
+      // smemA [ProdTailWork, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+    }
+    //
+    // Tail work.
+    //
+    //
+    // gmemA [ConsTailWork, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+    //
+    {}
+    //
+    // smemA [ProdTailWork, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+    //
+    {}
+  ExitTileWithSignalingLabel:
+  ExitTileWithoutSignalingLabel: {}
+  }
+};
+struct LoadTaskB {
+  int32_t mCtaIdxY;
+  int32_t const mBatchIdx;
+  int32_t const mBatchLimit;
+  int32_t const mWarpGrpThreadIdx;
+  int32_t mRoutedIndices[8];
+  int32_t mCtaOffsetK;
+  inline __device__ LoadTaskB(KernelParams const& params,
+                              KernelState const& state,
+                              int32_t warpGrpStart)
+    : mCtaIdxY{reinterpret_cast<int32_t const&>(blockIdx.y)}
+    , mBatchIdx{int32_t{params.ptrCtaIdxXyToBatchIdx[mCtaIdxY]}}
+    , mBatchLimit{int32_t{params.ptrCtaIdxXyToMnLimit[mCtaIdxY]}}
+    , mWarpGrpThreadIdx{min(int32_t{64},
+                            max(int32_t{0}, (state.mThreadIdx) - ((warpGrpStart) * (int32_t{32}))))}
+    , mCtaOffsetK{int32_t{0}} {
+    cudaGridDependencySynchronize();
+    {
+      int32_t const smemOffsetInElts{(mWarpGrpThreadIdx) * (int32_t{16})};
+      int32_t const gmemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+      mRoutedIndices[int32_t{0}] =
+        int32_t{params.ptrRouteMap[(gmemRowIdx) + ((mCtaIdxY) * (int32_t{64}))]};
+    }
+    {
+      int32_t const smemOffsetInElts{((mWarpGrpThreadIdx) * (int32_t{16})) + (int32_t{1024})};
+      int32_t const gmemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+      mRoutedIndices[int32_t{1}] =
+        int32_t{params.ptrRouteMap[(gmemRowIdx) + ((mCtaIdxY) * (int32_t{64}))]};
+    }
+    {
+      int32_t const smemOffsetInElts{((mWarpGrpThreadIdx) * (int32_t{16})) + (int32_t{2048})};
+      int32_t const gmemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+      mRoutedIndices[int32_t{2}] =
+        int32_t{params.ptrRouteMap[(gmemRowIdx) + ((mCtaIdxY) * (int32_t{64}))]};
+    }
+    {
+      int32_t const smemOffsetInElts{((mWarpGrpThreadIdx) * (int32_t{16})) + (int32_t{3072})};
+      int32_t const gmemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+      mRoutedIndices[int32_t{3}] =
+        int32_t{params.ptrRouteMap[(gmemRowIdx) + ((mCtaIdxY) * (int32_t{64}))]};
+    }
+    {
+      int32_t const smemOffsetInElts{((mWarpGrpThreadIdx) * (int32_t{16})) + (int32_t{4096})};
+      int32_t const gmemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+      mRoutedIndices[int32_t{4}] =
+        int32_t{params.ptrRouteMap[(gmemRowIdx) + ((mCtaIdxY) * (int32_t{64}))]};
+    }
+    {
+      int32_t const smemOffsetInElts{((mWarpGrpThreadIdx) * (int32_t{16})) + (int32_t{5120})};
+      int32_t const gmemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+      mRoutedIndices[int32_t{5}] =
+        int32_t{params.ptrRouteMap[(gmemRowIdx) + ((mCtaIdxY) * (int32_t{64}))]};
+    }
+    {
+      int32_t const smemOffsetInElts{((mWarpGrpThreadIdx) * (int32_t{16})) + (int32_t{6144})};
+      int32_t const gmemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+      mRoutedIndices[int32_t{6}] =
+        int32_t{params.ptrRouteMap[(gmemRowIdx) + ((mCtaIdxY) * (int32_t{64}))]};
+    }
+    {
+      int32_t const smemOffsetInElts{((mWarpGrpThreadIdx) * (int32_t{16})) + (int32_t{7168})};
+      int32_t const gmemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+      mRoutedIndices[int32_t{7}] =
+        int32_t{params.ptrRouteMap[(gmemRowIdx) + ((mCtaIdxY) * (int32_t{64}))]};
+    }
+  }
+  static inline __device__ bool isSelected(KernelParams const& params, KernelState const& state) {
+    return ((state.mWarpIdx) >= (int32_t{4})) && ((state.mWarpIdx) < (int32_t{6}));
+  }
+  inline __device__ void execute(KernelParams const& params,
+                                 KernelState const& state,
+                                 SmemBSmem& smemBDstSmem,
+                                 SmemBStack& smemBDstStack) {
+    cuda_ptx::setmaxnreg_dec(cuda_ptx::n32_t<48>{});
+    cudaGridDependencySynchronize();
+    trtllm::dev::CutlassUmmaConsumerAsyncPipeline<4, true, false>::PipelineState smemBProdState{
+      int32_t{0},
+      int32_t{1},
+      int32_t{0}};
+    int32_t smemBProdToken{int32_t{1}};
+    int32_t paddedPerCtaK{(((params.k) + (int32_t{255})) / (int32_t{256})) * (int32_t{256})};
+    int32_t loopEnd{paddedPerCtaK};
+    bool const hasOneLoopIter{(int32_t{0}) < (loopEnd)};
+    //
+    // Hoist the first iter.
+    //
+    //
+    // Loop body.
+    //
+    CUTLASS_PRAGMA_NO_UNROLL
+    for (int32_t loopOffset367 = int32_t{0}; loopOffset367 < loopEnd;
+         loopOffset367 += int32_t{256}) {
+      bool const isLastLoopIter{((loopOffset367) + (int32_t{256})) >= (loopEnd)};
+      //
+      // gmemB [ConsWork (call 0), Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+      int32_t tileOffsetK2;
+      { tileOffsetK2 = loopOffset367; }
+      //
+      // smemB [ProdAcquire, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+      {
+        if ((loopOffset367) >= (int32_t{1024})) {
+          smemBProdToken = smemBDstStack.mPipeline.producer_try_acquire(smemBProdState);
+        }
+      }
+      { smemBDstStack.mPipeline.producer_acquire(smemBProdState, smemBProdToken); }
+      //
+      // smemB [ProdWork (call 0), Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+      int32_t tileOffsetK6;
+      tileOffsetK6 = tileOffsetK2;
+      {
+        int32_t index{smemBProdState.index()};
+        {}
+        {
+          int8_t* smemBytesBasePtrB;
+          int8_t* smemBytesStagePtrB;
+          smemBytesBasePtrB =
+            reinterpret_cast<int8_t*>(smemBDstStack.mDepSmemPtr0) + (int32_t{131072});
+          smemBytesStagePtrB = smemBytesBasePtrB + ((index) * (int32_t{16384}));
+          {
+            int32_t const smemOffsetInElts{(mWarpGrpThreadIdx) * (int32_t{16})};
+            int32_t const smemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+            int32_t const smemOffsetInBytes{((smemOffsetInElts) * (int32_t{8})) / (int32_t{8})};
+            int32_t const swizzleMask{((smemRowIdx) % (int32_t{8})) * (int32_t{16})};
+            int32_t const gmemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+            int32_t const gmemColIdx{(smemOffsetInElts) % (int32_t{128})};
+            if (((gmemRowIdx) + ((mCtaIdxY) * (int32_t{64}))) < (mBatchLimit)) {
+              int64_t gmemOffsetInBytes{
+                (static_cast<int64_t>(mRoutedIndices[int32_t{0}])) *
+                  (static_cast<int64_t>(params.strideInBytesB)) +
+                (static_cast<int64_t>((((gmemColIdx) + (tileOffsetK6)) * (int32_t{8})) /
+                                      (int32_t{8})))};
+              trtllm::dev::cpAsync(
+                reinterpret_cast<int8_t*>(
+                  &reinterpret_cast<cutlass::float_e4m3_t*>(smemBytesStagePtrB)[int32_t{0}]),
+                reinterpret_cast<int8_t const*>(params.ptrB),
+                (smemOffsetInBytes) ^ (swizzleMask),
+                gmemOffsetInBytes,
+                int32_t{16});
+            }
+          }
+          {
+            int32_t const smemOffsetInElts{((mWarpGrpThreadIdx) * (int32_t{16})) + (int32_t{1024})};
+            int32_t const smemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+            int32_t const smemOffsetInBytes{((smemOffsetInElts) * (int32_t{8})) / (int32_t{8})};
+            int32_t const swizzleMask{((smemRowIdx) % (int32_t{8})) * (int32_t{16})};
+            int32_t const gmemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+            int32_t const gmemColIdx{(smemOffsetInElts) % (int32_t{128})};
+            if (((gmemRowIdx) + ((mCtaIdxY) * (int32_t{64}))) < (mBatchLimit)) {
+              int64_t gmemOffsetInBytes{
+                (static_cast<int64_t>(mRoutedIndices[int32_t{1}])) *
+                  (static_cast<int64_t>(params.strideInBytesB)) +
+                (static_cast<int64_t>((((gmemColIdx) + (tileOffsetK6)) * (int32_t{8})) /
+                                      (int32_t{8})))};
+              trtllm::dev::cpAsync(
+                reinterpret_cast<int8_t*>(
+                  &reinterpret_cast<cutlass::float_e4m3_t*>(smemBytesStagePtrB)[int32_t{0}]),
+                reinterpret_cast<int8_t const*>(params.ptrB),
+                (smemOffsetInBytes) ^ (swizzleMask),
+                gmemOffsetInBytes,
+                int32_t{16});
+            }
+          }
+          {
+            int32_t const smemOffsetInElts{((mWarpGrpThreadIdx) * (int32_t{16})) + (int32_t{2048})};
+            int32_t const smemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+            int32_t const smemOffsetInBytes{((smemOffsetInElts) * (int32_t{8})) / (int32_t{8})};
+            int32_t const swizzleMask{((smemRowIdx) % (int32_t{8})) * (int32_t{16})};
+            int32_t const gmemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+            int32_t const gmemColIdx{(smemOffsetInElts) % (int32_t{128})};
+            if (((gmemRowIdx) + ((mCtaIdxY) * (int32_t{64}))) < (mBatchLimit)) {
+              int64_t gmemOffsetInBytes{
+                (static_cast<int64_t>(mRoutedIndices[int32_t{2}])) *
+                  (static_cast<int64_t>(params.strideInBytesB)) +
+                (static_cast<int64_t>((((gmemColIdx) + (tileOffsetK6)) * (int32_t{8})) /
+                                      (int32_t{8})))};
+              trtllm::dev::cpAsync(
+                reinterpret_cast<int8_t*>(
+                  &reinterpret_cast<cutlass::float_e4m3_t*>(smemBytesStagePtrB)[int32_t{0}]),
+                reinterpret_cast<int8_t const*>(params.ptrB),
+                (smemOffsetInBytes) ^ (swizzleMask),
+                gmemOffsetInBytes,
+                int32_t{16});
+            }
+          }
+          {
+            int32_t const smemOffsetInElts{((mWarpGrpThreadIdx) * (int32_t{16})) + (int32_t{3072})};
+            int32_t const smemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+            int32_t const smemOffsetInBytes{((smemOffsetInElts) * (int32_t{8})) / (int32_t{8})};
+            int32_t const swizzleMask{((smemRowIdx) % (int32_t{8})) * (int32_t{16})};
+            int32_t const gmemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+            int32_t const gmemColIdx{(smemOffsetInElts) % (int32_t{128})};
+            if (((gmemRowIdx) + ((mCtaIdxY) * (int32_t{64}))) < (mBatchLimit)) {
+              int64_t gmemOffsetInBytes{
+                (static_cast<int64_t>(mRoutedIndices[int32_t{3}])) *
+                  (static_cast<int64_t>(params.strideInBytesB)) +
+                (static_cast<int64_t>((((gmemColIdx) + (tileOffsetK6)) * (int32_t{8})) /
+                                      (int32_t{8})))};
+              trtllm::dev::cpAsync(
+                reinterpret_cast<int8_t*>(
+                  &reinterpret_cast<cutlass::float_e4m3_t*>(smemBytesStagePtrB)[int32_t{0}]),
+                reinterpret_cast<int8_t const*>(params.ptrB),
+                (smemOffsetInBytes) ^ (swizzleMask),
+                gmemOffsetInBytes,
+                int32_t{16});
+            }
+          }
+          {
+            int32_t const smemOffsetInElts{((mWarpGrpThreadIdx) * (int32_t{16})) + (int32_t{4096})};
+            int32_t const smemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+            int32_t const smemOffsetInBytes{((smemOffsetInElts) * (int32_t{8})) / (int32_t{8})};
+            int32_t const swizzleMask{((smemRowIdx) % (int32_t{8})) * (int32_t{16})};
+            int32_t const gmemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+            int32_t const gmemColIdx{(smemOffsetInElts) % (int32_t{128})};
+            if (((gmemRowIdx) + ((mCtaIdxY) * (int32_t{64}))) < (mBatchLimit)) {
+              int64_t gmemOffsetInBytes{
+                (static_cast<int64_t>(mRoutedIndices[int32_t{4}])) *
+                  (static_cast<int64_t>(params.strideInBytesB)) +
+                (static_cast<int64_t>((((gmemColIdx) + (tileOffsetK6)) * (int32_t{8})) /
+                                      (int32_t{8})))};
+              trtllm::dev::cpAsync(
+                reinterpret_cast<int8_t*>(
+                  &reinterpret_cast<cutlass::float_e4m3_t*>(smemBytesStagePtrB)[int32_t{0}]),
+                reinterpret_cast<int8_t const*>(params.ptrB),
+                (smemOffsetInBytes) ^ (swizzleMask),
+                gmemOffsetInBytes,
+                int32_t{16});
+            }
+          }
+          {
+            int32_t const smemOffsetInElts{((mWarpGrpThreadIdx) * (int32_t{16})) + (int32_t{5120})};
+            int32_t const smemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+            int32_t const smemOffsetInBytes{((smemOffsetInElts) * (int32_t{8})) / (int32_t{8})};
+            int32_t const swizzleMask{((smemRowIdx) % (int32_t{8})) * (int32_t{16})};
+            int32_t const gmemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+            int32_t const gmemColIdx{(smemOffsetInElts) % (int32_t{128})};
+            if (((gmemRowIdx) + ((mCtaIdxY) * (int32_t{64}))) < (mBatchLimit)) {
+              int64_t gmemOffsetInBytes{
+                (static_cast<int64_t>(mRoutedIndices[int32_t{5}])) *
+                  (static_cast<int64_t>(params.strideInBytesB)) +
+                (static_cast<int64_t>((((gmemColIdx) + (tileOffsetK6)) * (int32_t{8})) /
+                                      (int32_t{8})))};
+              trtllm::dev::cpAsync(
+                reinterpret_cast<int8_t*>(
+                  &reinterpret_cast<cutlass::float_e4m3_t*>(smemBytesStagePtrB)[int32_t{0}]),
+                reinterpret_cast<int8_t const*>(params.ptrB),
+                (smemOffsetInBytes) ^ (swizzleMask),
+                gmemOffsetInBytes,
+                int32_t{16});
+            }
+          }
+          {
+            int32_t const smemOffsetInElts{((mWarpGrpThreadIdx) * (int32_t{16})) + (int32_t{6144})};
+            int32_t const smemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+            int32_t const smemOffsetInBytes{((smemOffsetInElts) * (int32_t{8})) / (int32_t{8})};
+            int32_t const swizzleMask{((smemRowIdx) % (int32_t{8})) * (int32_t{16})};
+            int32_t const gmemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+            int32_t const gmemColIdx{(smemOffsetInElts) % (int32_t{128})};
+            if (((gmemRowIdx) + ((mCtaIdxY) * (int32_t{64}))) < (mBatchLimit)) {
+              int64_t gmemOffsetInBytes{
+                (static_cast<int64_t>(mRoutedIndices[int32_t{6}])) *
+                  (static_cast<int64_t>(params.strideInBytesB)) +
+                (static_cast<int64_t>((((gmemColIdx) + (tileOffsetK6)) * (int32_t{8})) /
+                                      (int32_t{8})))};
+              trtllm::dev::cpAsync(
+                reinterpret_cast<int8_t*>(
+                  &reinterpret_cast<cutlass::float_e4m3_t*>(smemBytesStagePtrB)[int32_t{0}]),
+                reinterpret_cast<int8_t const*>(params.ptrB),
+                (smemOffsetInBytes) ^ (swizzleMask),
+                gmemOffsetInBytes,
+                int32_t{16});
+            }
+          }
+          {
+            int32_t const smemOffsetInElts{((mWarpGrpThreadIdx) * (int32_t{16})) + (int32_t{7168})};
+            int32_t const smemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+            int32_t const smemOffsetInBytes{((smemOffsetInElts) * (int32_t{8})) / (int32_t{8})};
+            int32_t const swizzleMask{((smemRowIdx) % (int32_t{8})) * (int32_t{16})};
+            int32_t const gmemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+            int32_t const gmemColIdx{(smemOffsetInElts) % (int32_t{128})};
+            if (((gmemRowIdx) + ((mCtaIdxY) * (int32_t{64}))) < (mBatchLimit)) {
+              int64_t gmemOffsetInBytes{
+                (static_cast<int64_t>(mRoutedIndices[int32_t{7}])) *
+                  (static_cast<int64_t>(params.strideInBytesB)) +
+                (static_cast<int64_t>((((gmemColIdx) + (tileOffsetK6)) * (int32_t{8})) /
+                                      (int32_t{8})))};
+              trtllm::dev::cpAsync(
+                reinterpret_cast<int8_t*>(
+                  &reinterpret_cast<cutlass::float_e4m3_t*>(smemBytesStagePtrB)[int32_t{0}]),
+                reinterpret_cast<int8_t const*>(params.ptrB),
+                (smemOffsetInBytes) ^ (swizzleMask),
+                gmemOffsetInBytes,
+                int32_t{16});
+            }
+          }
+          {
+            int32_t const smemOffsetInElts{(mWarpGrpThreadIdx) * (int32_t{16})};
+            int32_t const smemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+            int32_t const smemOffsetInBytes{((smemOffsetInElts) * (int32_t{8})) / (int32_t{8})};
+            int32_t const swizzleMask{((smemRowIdx) % (int32_t{8})) * (int32_t{16})};
+            int32_t const gmemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+            int32_t const gmemColIdx{(smemOffsetInElts) % (int32_t{128})};
+            if (((gmemRowIdx) + ((mCtaIdxY) * (int32_t{64}))) < (mBatchLimit)) {
+              int64_t gmemOffsetInBytes{
+                (static_cast<int64_t>(mRoutedIndices[int32_t{0}])) *
+                  (static_cast<int64_t>(params.strideInBytesB)) +
+                (static_cast<int64_t>(
+                  (((gmemColIdx) + ((tileOffsetK6) + (int32_t{128}))) * (int32_t{8})) /
+                  (int32_t{8})))};
+              trtllm::dev::cpAsync(
+                reinterpret_cast<int8_t*>(
+                  &reinterpret_cast<cutlass::float_e4m3_t*>(smemBytesStagePtrB)[int32_t{8192}]),
+                reinterpret_cast<int8_t const*>(params.ptrB),
+                (smemOffsetInBytes) ^ (swizzleMask),
+                gmemOffsetInBytes,
+                int32_t{16});
+            }
+          }
+          {
+            int32_t const smemOffsetInElts{((mWarpGrpThreadIdx) * (int32_t{16})) + (int32_t{1024})};
+            int32_t const smemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+            int32_t const smemOffsetInBytes{((smemOffsetInElts) * (int32_t{8})) / (int32_t{8})};
+            int32_t const swizzleMask{((smemRowIdx) % (int32_t{8})) * (int32_t{16})};
+            int32_t const gmemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+            int32_t const gmemColIdx{(smemOffsetInElts) % (int32_t{128})};
+            if (((gmemRowIdx) + ((mCtaIdxY) * (int32_t{64}))) < (mBatchLimit)) {
+              int64_t gmemOffsetInBytes{
+                (static_cast<int64_t>(mRoutedIndices[int32_t{1}])) *
+                  (static_cast<int64_t>(params.strideInBytesB)) +
+                (static_cast<int64_t>(
+                  (((gmemColIdx) + ((tileOffsetK6) + (int32_t{128}))) * (int32_t{8})) /
+                  (int32_t{8})))};
+              trtllm::dev::cpAsync(
+                reinterpret_cast<int8_t*>(
+                  &reinterpret_cast<cutlass::float_e4m3_t*>(smemBytesStagePtrB)[int32_t{8192}]),
+                reinterpret_cast<int8_t const*>(params.ptrB),
+                (smemOffsetInBytes) ^ (swizzleMask),
+                gmemOffsetInBytes,
+                int32_t{16});
+            }
+          }
+          {
+            int32_t const smemOffsetInElts{((mWarpGrpThreadIdx) * (int32_t{16})) + (int32_t{2048})};
+            int32_t const smemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+            int32_t const smemOffsetInBytes{((smemOffsetInElts) * (int32_t{8})) / (int32_t{8})};
+            int32_t const swizzleMask{((smemRowIdx) % (int32_t{8})) * (int32_t{16})};
+            int32_t const gmemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+            int32_t const gmemColIdx{(smemOffsetInElts) % (int32_t{128})};
+            if (((gmemRowIdx) + ((mCtaIdxY) * (int32_t{64}))) < (mBatchLimit)) {
+              int64_t gmemOffsetInBytes{
+                (static_cast<int64_t>(mRoutedIndices[int32_t{2}])) *
+                  (static_cast<int64_t>(params.strideInBytesB)) +
+                (static_cast<int64_t>(
+                  (((gmemColIdx) + ((tileOffsetK6) + (int32_t{128}))) * (int32_t{8})) /
+                  (int32_t{8})))};
+              trtllm::dev::cpAsync(
+                reinterpret_cast<int8_t*>(
+                  &reinterpret_cast<cutlass::float_e4m3_t*>(smemBytesStagePtrB)[int32_t{8192}]),
+                reinterpret_cast<int8_t const*>(params.ptrB),
+                (smemOffsetInBytes) ^ (swizzleMask),
+                gmemOffsetInBytes,
+                int32_t{16});
+            }
+          }
+          {
+            int32_t const smemOffsetInElts{((mWarpGrpThreadIdx) * (int32_t{16})) + (int32_t{3072})};
+            int32_t const smemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+            int32_t const smemOffsetInBytes{((smemOffsetInElts) * (int32_t{8})) / (int32_t{8})};
+            int32_t const swizzleMask{((smemRowIdx) % (int32_t{8})) * (int32_t{16})};
+            int32_t const gmemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+            int32_t const gmemColIdx{(smemOffsetInElts) % (int32_t{128})};
+            if (((gmemRowIdx) + ((mCtaIdxY) * (int32_t{64}))) < (mBatchLimit)) {
+              int64_t gmemOffsetInBytes{
+                (static_cast<int64_t>(mRoutedIndices[int32_t{3}])) *
+                  (static_cast<int64_t>(params.strideInBytesB)) +
+                (static_cast<int64_t>(
+                  (((gmemColIdx) + ((tileOffsetK6) + (int32_t{128}))) * (int32_t{8})) /
+                  (int32_t{8})))};
+              trtllm::dev::cpAsync(
+                reinterpret_cast<int8_t*>(
+                  &reinterpret_cast<cutlass::float_e4m3_t*>(smemBytesStagePtrB)[int32_t{8192}]),
+                reinterpret_cast<int8_t const*>(params.ptrB),
+                (smemOffsetInBytes) ^ (swizzleMask),
+                gmemOffsetInBytes,
+                int32_t{16});
+            }
+          }
+          {
+            int32_t const smemOffsetInElts{((mWarpGrpThreadIdx) * (int32_t{16})) + (int32_t{4096})};
+            int32_t const smemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+            int32_t const smemOffsetInBytes{((smemOffsetInElts) * (int32_t{8})) / (int32_t{8})};
+            int32_t const swizzleMask{((smemRowIdx) % (int32_t{8})) * (int32_t{16})};
+            int32_t const gmemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+            int32_t const gmemColIdx{(smemOffsetInElts) % (int32_t{128})};
+            if (((gmemRowIdx) + ((mCtaIdxY) * (int32_t{64}))) < (mBatchLimit)) {
+              int64_t gmemOffsetInBytes{
+                (static_cast<int64_t>(mRoutedIndices[int32_t{4}])) *
+                  (static_cast<int64_t>(params.strideInBytesB)) +
+                (static_cast<int64_t>(
+                  (((gmemColIdx) + ((tileOffsetK6) + (int32_t{128}))) * (int32_t{8})) /
+                  (int32_t{8})))};
+              trtllm::dev::cpAsync(
+                reinterpret_cast<int8_t*>(
+                  &reinterpret_cast<cutlass::float_e4m3_t*>(smemBytesStagePtrB)[int32_t{8192}]),
+                reinterpret_cast<int8_t const*>(params.ptrB),
+                (smemOffsetInBytes) ^ (swizzleMask),
+                gmemOffsetInBytes,
+                int32_t{16});
+            }
+          }
+          {
+            int32_t const smemOffsetInElts{((mWarpGrpThreadIdx) * (int32_t{16})) + (int32_t{5120})};
+            int32_t const smemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+            int32_t const smemOffsetInBytes{((smemOffsetInElts) * (int32_t{8})) / (int32_t{8})};
+            int32_t const swizzleMask{((smemRowIdx) % (int32_t{8})) * (int32_t{16})};
+            int32_t const gmemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+            int32_t const gmemColIdx{(smemOffsetInElts) % (int32_t{128})};
+            if (((gmemRowIdx) + ((mCtaIdxY) * (int32_t{64}))) < (mBatchLimit)) {
+              int64_t gmemOffsetInBytes{
+                (static_cast<int64_t>(mRoutedIndices[int32_t{5}])) *
+                  (static_cast<int64_t>(params.strideInBytesB)) +
+                (static_cast<int64_t>(
+                  (((gmemColIdx) + ((tileOffsetK6) + (int32_t{128}))) * (int32_t{8})) /
+                  (int32_t{8})))};
+              trtllm::dev::cpAsync(
+                reinterpret_cast<int8_t*>(
+                  &reinterpret_cast<cutlass::float_e4m3_t*>(smemBytesStagePtrB)[int32_t{8192}]),
+                reinterpret_cast<int8_t const*>(params.ptrB),
+                (smemOffsetInBytes) ^ (swizzleMask),
+                gmemOffsetInBytes,
+                int32_t{16});
+            }
+          }
+          {
+            int32_t const smemOffsetInElts{((mWarpGrpThreadIdx) * (int32_t{16})) + (int32_t{6144})};
+            int32_t const smemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+            int32_t const smemOffsetInBytes{((smemOffsetInElts) * (int32_t{8})) / (int32_t{8})};
+            int32_t const swizzleMask{((smemRowIdx) % (int32_t{8})) * (int32_t{16})};
+            int32_t const gmemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+            int32_t const gmemColIdx{(smemOffsetInElts) % (int32_t{128})};
+            if (((gmemRowIdx) + ((mCtaIdxY) * (int32_t{64}))) < (mBatchLimit)) {
+              int64_t gmemOffsetInBytes{
+                (static_cast<int64_t>(mRoutedIndices[int32_t{6}])) *
+                  (static_cast<int64_t>(params.strideInBytesB)) +
+                (static_cast<int64_t>(
+                  (((gmemColIdx) + ((tileOffsetK6) + (int32_t{128}))) * (int32_t{8})) /
+                  (int32_t{8})))};
+              trtllm::dev::cpAsync(
+                reinterpret_cast<int8_t*>(
+                  &reinterpret_cast<cutlass::float_e4m3_t*>(smemBytesStagePtrB)[int32_t{8192}]),
+                reinterpret_cast<int8_t const*>(params.ptrB),
+                (smemOffsetInBytes) ^ (swizzleMask),
+                gmemOffsetInBytes,
+                int32_t{16});
+            }
+          }
+          {
+            int32_t const smemOffsetInElts{((mWarpGrpThreadIdx) * (int32_t{16})) + (int32_t{7168})};
+            int32_t const smemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+            int32_t const smemOffsetInBytes{((smemOffsetInElts) * (int32_t{8})) / (int32_t{8})};
+            int32_t const swizzleMask{((smemRowIdx) % (int32_t{8})) * (int32_t{16})};
+            int32_t const gmemRowIdx{(smemOffsetInElts) / (int32_t{128})};
+            int32_t const gmemColIdx{(smemOffsetInElts) % (int32_t{128})};
+            if (((gmemRowIdx) + ((mCtaIdxY) * (int32_t{64}))) < (mBatchLimit)) {
+              int64_t gmemOffsetInBytes{
+                (static_cast<int64_t>(mRoutedIndices[int32_t{7}])) *
+                  (static_cast<int64_t>(params.strideInBytesB)) +
+                (static_cast<int64_t>(
+                  (((gmemColIdx) + ((tileOffsetK6) + (int32_t{128}))) * (int32_t{8})) /
+                  (int32_t{8})))};
+              trtllm::dev::cpAsync(
+                reinterpret_cast<int8_t*>(
+                  &reinterpret_cast<cutlass::float_e4m3_t*>(smemBytesStagePtrB)[int32_t{8192}]),
+                reinterpret_cast<int8_t const*>(params.ptrB),
+                (smemOffsetInBytes) ^ (swizzleMask),
+                gmemOffsetInBytes,
+                int32_t{16});
+            }
+          }
+        }
+      }
+      //
+      // smemB [ProdPreCommit, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+      if ((loopOffset367) >= (int32_t{0})) {
+      }
+      //
+      // smemB [ProdCommit, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+      {
+        { smemBDstStack.mPipeline.producer_commit(smemBProdState); }
+        ++smemBProdState;
+      }
+      //
+      // gmemB [ConsTailWork, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+      //
+      // smemB [ProdTailWork, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+    }
+    //
+    // Tail work.
+    //
+    //
+    // gmemB [ConsTailWork, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+    //
+    {}
+    //
+    // smemB [ProdTailWork, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+    //
+    {}
+  ExitTileWithSignalingLabel:
+  ExitTileWithoutSignalingLabel: {}
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
+};
+struct LoadSfATask {
+  int32_t mCtaIdxY;
+  int32_t const mBatchIdx;
+  int32_t const mBatchLimit;
+  int32_t mCtaOffsetK;
+  int32_t const mWarpGrpThreadIdx;
+  int32_t mCtaIdxX;
+  inline __device__ LoadSfATask(KernelParams const& params,
+                                KernelState const& state,
+                                int32_t warpGrpStart)
+    : mCtaIdxY{reinterpret_cast<int32_t const&>(blockIdx.y)}
+    , mBatchIdx{int32_t{params.ptrCtaIdxXyToBatchIdx[mCtaIdxY]}}
+    , mBatchLimit{int32_t{params.ptrCtaIdxXyToMnLimit[mCtaIdxY]}}
+    , mCtaOffsetK{int32_t{0}}
+    , mWarpGrpThreadIdx{(state.mThreadIdx) - ((warpGrpStart) * (int32_t{32}))}
+    , mCtaIdxX{reinterpret_cast<int32_t const&>(blockIdx.x)} {}
+  static inline __device__ bool isSelected(KernelParams const& params, KernelState const& state) {
+    return ((state.mWarpIdx) >= (int32_t{7})) && ((state.mWarpIdx) < (int32_t{8}));
+  }
+  inline __device__ void execute(KernelParams const& params,
+                                 KernelState const& state,
+                                 SmemSfASmem& smemSfADstSmem,
+                                 SmemSfAStack& smemSfADstStack) {
+    cuda_ptx::setmaxnreg_dec(cuda_ptx::n32_t<48>{});
+    cudaGridDependencySynchronize();
+    trtllm::dev::CutlassTmaUmmaAsyncPipeline<
+      4,
+      cute::Shape<cute::Int<1>, cute::Int<1>, cute::Int<1>>>::PipelineState smemSfAProdState{
+      int32_t{0},
+      int32_t{1},
+      int32_t{0}};
+    int32_t smemSfAProdToken{int32_t{1}};
+    int32_t paddedPerCtaK{(((params.k) + (int32_t{255})) / (int32_t{256})) * (int32_t{256})};
+    int32_t loopEnd{paddedPerCtaK};
+    //
+    // Unrolled head iter 0.
+    //
+    if ((int32_t{0}) < (loopEnd)) {
+      //
+      // gmemSfA [ConsWork (call 0), Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+      int32_t tileOffsetK3;
+      { tileOffsetK3 = int32_t{0}; }
+      //
+      // smemSfA [ProdAcquire, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+      {}
+      { smemSfADstStack.mPipeline.producer_acquire(smemSfAProdState, smemSfAProdToken); }
+      //
+      // smemSfA [ProdWork (call 0), Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+      int32_t tileOffsetK7;
+      tileOffsetK7 = tileOffsetK3;
+      {
+        uint64_t* barrier{smemSfADstStack.mPipeline.producer_get_barrier(smemSfAProdState)};
+        int32_t index{smemSfAProdState.index()};
+        {}
+        {
+          int32_t coords[4];
+          coords[int32_t{0}] = int32_t{0};
+          coords[int32_t{1}] = int32_t{0};
+          coords[int32_t{2}] = (tileOffsetK7) / (int32_t{128});
+          coords[int32_t{3}] = (mBatchIdx) * (params.tileStridePerBatch) + (mCtaIdxX);
+          if (bool{cute::elect_one_sync()}) {
+            cuda_ptx::cp_async_bulk_tensor(cuda_ptx::space_cluster_t{},
+                                           cuda_ptx::space_global_t{},
+                                           &smemSfADstSmem.mArray[index][int32_t{0}],
+                                           params.tmaSfA,
+                                           coords,
+                                           barrier);
+          }
+        }
+      }
+      //
+      // gmemSfA [ConsTailWork, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+      //
+      // smemSfA [ProdTailWork, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+    }
+    //
+    // Loop body.
+    //
+    CUTLASS_PRAGMA_NO_UNROLL
+    for (int32_t loopOffset657 = int32_t{256}; loopOffset657 < loopEnd;
+         loopOffset657 += int32_t{256}) {
+      bool const isFirstLoopIter{(loopOffset657) == (int32_t{256})};
+      bool const isLastLoopIter{((loopOffset657) + (int32_t{256})) >= (loopEnd)};
+      //
+      // smemSfA [ProdPreCommit, Info{1}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+      if ((loopOffset657) >= (int32_t{256})) {
+      }
+      //
+      // smemSfA [ProdCommit, Info{1}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+      if ((loopOffset657) >= (int32_t{256})) {
+        {
+          smemSfADstStack.mPipeline.producer_commit(smemSfAProdState);
+        }
+        ++smemSfAProdState;
+      }
+      //
+      // gmemSfA [ConsWork (call 0), Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+      int32_t tileOffsetK3;
+      { tileOffsetK3 = loopOffset657; }
+      //
+      // smemSfA [ProdAcquire, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+      {
+        if ((loopOffset657) >= (int32_t{1024})) {
+          smemSfAProdToken = smemSfADstStack.mPipeline.producer_try_acquire(smemSfAProdState);
+        }
+      }
+      { smemSfADstStack.mPipeline.producer_acquire(smemSfAProdState, smemSfAProdToken); }
+      //
+      // smemSfA [ProdWork (call 0), Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+      int32_t tileOffsetK7;
+      tileOffsetK7 = tileOffsetK3;
+      {
+        uint64_t* barrier{smemSfADstStack.mPipeline.producer_get_barrier(smemSfAProdState)};
+        int32_t index{smemSfAProdState.index()};
+        {}
+        {
+          int32_t coords[4];
+          coords[int32_t{0}] = int32_t{0};
+          coords[int32_t{1}] = int32_t{0};
+          coords[int32_t{2}] = (tileOffsetK7) / (int32_t{128});
+          coords[int32_t{3}] = (mBatchIdx) * (params.tileStridePerBatch) + (mCtaIdxX);
+          if (bool{cute::elect_one_sync()}) {
+            cuda_ptx::cp_async_bulk_tensor(cuda_ptx::space_cluster_t{},
+                                           cuda_ptx::space_global_t{},
+                                           &smemSfADstSmem.mArray[index][int32_t{0}],
+                                           params.tmaSfA,
+                                           coords,
+                                           barrier);
+          }
+        }
+      }
+      //
+      // gmemSfA [ConsTailWork, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+      //
+      // smemSfA [ProdTailWork, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+    }
+    //
+    // Unrolled tail iter 0.
+    //
+    if ((loopEnd) > (int32_t{0})) {
+      //
+      // smemSfA [ProdPreCommit, Info{1}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+      {}
+      //
+      // smemSfA [ProdCommit, Info{1}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+      {
+        { smemSfADstStack.mPipeline.producer_commit(smemSfAProdState); }
+        ++smemSfAProdState;
+      }
+    }
+    //
+    // Tail work.
+    //
+    //
+    // gmemSfA [ConsTailWork, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+    //
+    {}
+    //
+    // smemSfA [ProdTailWork, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+    //
+    {}
+  ExitTileWithSignalingLabel:
+  ExitTileWithoutSignalingLabel: {}
+  }
+};
+struct CopySfATask {
+  int32_t mCtaOffsetK;
+  uint32_t const mTmemBaseOffset;
+  inline __device__ CopySfATask(KernelParams const& params,
+                                KernelState const& state,
+                                int32_t warpGrpStart)
+    : mCtaOffsetK{int32_t{0}}
+    , mTmemBaseOffset{uint32_t{
+        __shfl_sync(uint32_t{0xffffffff}, (*state.mTmemSwStatePtr), int32_t{0}, int32_t{32})}} {}
+  static inline __device__ bool isSelected(KernelParams const& params, KernelState const& state) {
+    return ((state.mWarpIdx) >= (int32_t{8})) && ((state.mWarpIdx) < (int32_t{9}));
+  }
+  inline __device__ void execute(KernelParams const& params,
+                                 KernelState const& state,
+                                 TmemSfAStack& tmemSfADstStack,
+                                 SmemSfASmem& smemSfASrcSmem,
+                                 SmemSfAStack& smemSfASrcStack) {
+    cuda_ptx::setmaxnreg_dec(cuda_ptx::n32_t<48>{});
+    trtllm::dev::CutlassTmaUmmaAsyncPipeline<
+      4,
+      cute::Shape<cute::Int<1>, cute::Int<1>, cute::Int<1>>>::PipelineState smemSfAConsState{};
+    trtllm::dev::CutlassTmaUmmaAsyncPipeline<
+      4,
+      cute::Shape<cute::Int<1>, cute::Int<1>, cute::Int<1>>>::PipelineState
+      smemSfAConsReleaseState{};
+    int32_t smemSfAConsToken{int32_t{0}};
+    trtllm::dev::CutlassUmmaConsumerAsyncPipeline<4, false, false>::PipelineState tmemSfAProdState{
+      int32_t{0},
+      int32_t{1},
+      int32_t{0}};
+    int32_t tmemSfAProdToken{int32_t{1}};
+    int32_t paddedPerCtaK{(((params.k) + (int32_t{255})) / (int32_t{256})) * (int32_t{256})};
+    int32_t loopEnd{paddedPerCtaK};
+    //
+    // Loop body.
+    //
+    CUTLASS_PRAGMA_NO_UNROLL
+    for (int32_t loopOffset745 = int32_t{0}; loopOffset745 < loopEnd;
+         loopOffset745 += int32_t{256}) {
+      bool const isFirstLoopIter{(loopOffset745) == (int32_t{0})};
+      bool const isLastLoopIter{((loopOffset745) + (int32_t{256})) >= (loopEnd)};
+      //
+      // tmemSfA [ProdPreCommit, Info{1}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+      if ((loopOffset745) >= (int32_t{256})) {
+      }
+      //
+      // tmemSfA [ProdCommit, Info{1}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+      if ((loopOffset745) >= (int32_t{256})) {
+        {
+          tmemSfADstStack.mPipeline.producer_commit(tmemSfAProdState);
+        }
+        ++tmemSfAProdState;
+      }
+      //
+      // smemSfA [ConsRelease, Info{1}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+      if ((loopOffset745) >= (int32_t{256})) {
+        if ((loopOffset745) < ((loopEnd) - (int32_t{768}))) {
+          smemSfASrcStack.mPipeline.consumer_release(smemSfAConsReleaseState);
+        }
+        ++smemSfAConsReleaseState;
+      }
+      //
+      // smemSfA [ConsWait, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+      {
+        { smemSfAConsToken = smemSfASrcStack.mPipeline.consumer_try_wait(smemSfAConsState); }
+        smemSfASrcStack.mPipeline.consumer_wait(smemSfAConsState, smemSfAConsToken);
+      }
+      //
+      // smemSfA [ConsWork (call 0), Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+      cutlass::float_ue8m0_t* smemPtrSfA7;
+      {
+        int32_t index{smemSfAConsState.index()};
+        smemPtrSfA7 = smemSfASrcStack.mPtr + ((index) * (int32_t{1024}));
+        ++smemSfAConsState;
+      }
+      //
+      // tmemSfA [ProdAcquire, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+      {
+        if ((loopOffset745) >= (int32_t{1024})) {
+          tmemSfAProdToken = tmemSfADstStack.mPipeline.producer_try_acquire(tmemSfAProdState);
+        }
+      }
+      { tmemSfADstStack.mPipeline.producer_acquire(tmemSfAProdState, tmemSfAProdToken); }
+      //
+      // tmemSfA [ProdWork (call 0), Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+      cutlass::float_ue8m0_t* smemPtrSfA8;
+      smemPtrSfA8 = smemPtrSfA7;
+      {
+        int32_t index{tmemSfAProdState.index()};
+        {
+          uint32_t tmemBaseAddr{((mTmemBaseOffset) + (uint32_t{64})) +
+                                ((static_cast<uint32_t>(index)) * (uint32_t{8}))};
+          uint64_t smemDesc{
+            trtllm::dev::createSmemDesc(smemPtrSfA8, uint32_t{65536}, uint32_t{16392})};
+          {
+            {
+              uint32_t tmemAddr{tmemBaseAddr};
+              if (bool{cute::elect_one_sync()}) {
+                cuda_ptx::tcgen05_cp_32x128b_warpx4(cuda_ptx::cta_group_1_t{}, tmemAddr, smemDesc);
+              }
+            }
+          }
+          {
+            trtllm::dev::incrSmemAddr(smemDesc, int32_t{32});
+            {
+              uint32_t tmemAddr{(tmemBaseAddr) + (uint32_t{4})};
+              if (bool{cute::elect_one_sync()}) {
+                cuda_ptx::tcgen05_cp_32x128b_warpx4(cuda_ptx::cta_group_1_t{}, tmemAddr, smemDesc);
+              }
+            }
+          }
+        }
+      }
+      //
+      // smemSfA [ConsTailWork, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+      //
+      // tmemSfA [ProdTailWork, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+    }
+    //
+    // Unrolled tail iter 0.
+    //
+    if ((loopEnd) > (int32_t{0})) {
+      //
+      // tmemSfA [ProdPreCommit, Info{1}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+      if ((loopEnd) >= (int32_t{256})) {
+      }
+      //
+      // tmemSfA [ProdCommit, Info{1}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+      if ((loopEnd) >= (int32_t{256})) {
+        {
+          tmemSfADstStack.mPipeline.producer_commit(tmemSfAProdState);
+        }
+        ++tmemSfAProdState;
+      }
+    }
+    //
+    // Tail work.
+    //
+    //
+    // smemSfA [ConsTailWork, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+    //
+    {}
+    //
+    // tmemSfA [ProdTailWork, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+    //
+    {}
+  ExitTileWithSignalingLabel:
+  ExitTileWithoutSignalingLabel: {}
+  }
+};
+struct MmaTask0 {
+  bool isTmemConstSfBInitialized;
+  int32_t mCtaOffsetK;
+  uint32_t const mTmemBaseOffset;
+  int32_t const mLaneIdx;
+  inline __device__ MmaTask0(KernelParams const& params,
+                             KernelState const& state,
+                             int32_t warpGrpStart)
+    : isTmemConstSfBInitialized{false}
+    , mCtaOffsetK{int32_t{0}}
+    , mTmemBaseOffset{uint32_t{
+        __shfl_sync(uint32_t{0xffffffff}, (*state.mTmemSwStatePtr), int32_t{0}, int32_t{32})}}
+    , mLaneIdx{(state.mThreadIdx) % (int32_t{32})} {}
+  static inline __device__ bool isSelected(KernelParams const& params, KernelState const& state) {
+    return ((state.mWarpIdx) >= (int32_t{9})) && ((state.mWarpIdx) < (int32_t{10}));
+  }
+  inline __device__ void execute(KernelParams const& params,
+                                 KernelState const& state,
+                                 Mma0Stack& mma0DstStack,
+                                 SmemASmem& smemASrcSmem,
+                                 SmemAStack& smemASrcStack,
+                                 SmemBSmem& smemBSrcSmem,
+                                 SmemBStack& smemBSrcStack,
+                                 TmemSfAStack& tmemSfASrcStack,
+                                 TmemConstSfBStack& tmemConstSfBSrcStack) {
+    cuda_ptx::setmaxnreg_dec(cuda_ptx::n32_t<48>{});
+    trtllm::dev::CutlassTmaMultiUmmaAsyncPipeline<
+      4,
+      cute::Shape<cute::Int<1>, cute::Int<1>, cute::Int<1>>>::PipelineState smemAConsState{};
+    trtllm::dev::CutlassTmaMultiUmmaAsyncPipeline<
+      4,
+      cute::Shape<cute::Int<1>, cute::Int<1>, cute::Int<1>>>::PipelineState smemAConsReleaseState{};
+    int32_t smemAConsToken{int32_t{0}};
+    trtllm::dev::CutlassUmmaConsumerAsyncPipeline<4, true, false>::PipelineState smemBConsState{};
+    trtllm::dev::CutlassUmmaConsumerAsyncPipeline<4, true, false>::PipelineState
+      smemBConsReleaseState{};
+    int32_t smemBConsToken{int32_t{0}};
+    trtllm::dev::CutlassUmmaConsumerAsyncPipeline<4, false, false>::PipelineState
+      tmemSfAConsState{};
+    trtllm::dev::CutlassUmmaConsumerAsyncPipeline<4, false, false>::PipelineState
+      tmemSfAConsReleaseState{};
+    int32_t tmemSfAConsToken{int32_t{0}};
+    trtllm::dev::CutlassUmmaAsyncPipeline<1,
+                                          cute::Shape<cute::Int<1>, cute::Int<1>, cute::Int<1>>>::
+      PipelineState mma0ProdState{int32_t{0}, int32_t{1}, int32_t{0}};
+    int32_t mma0ProdToken{int32_t{1}};
+    int32_t paddedPerCtaK{(((params.k) + (int32_t{255})) / (int32_t{256})) * (int32_t{256})};
+    int32_t loopEnd{paddedPerCtaK};
+    //
+    // Loop body.
+    //
+    CUTLASS_PRAGMA_NO_UNROLL
+    for (int32_t loopOffset873 = int32_t{0}; loopOffset873 < loopEnd;
+         loopOffset873 += int32_t{512}) {
+      //
+      // Unrolled iter 0.
+      //
+      {
+        bool const isFirstLoopIter{(loopOffset873) == (int32_t{0})};
+        bool const isLastLoopIter{((loopOffset873) + (int32_t{256})) >= (loopEnd)};
+        //
+        // mma0 [ProdTryAcquire, FirstIter, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+        //
+        if (isFirstLoopIter) {
+          if ((loopOffset873) >= (int32_t{0})) {
+            mma0ProdToken = mma0DstStack.mPipeline.producer_try_acquire(mma0ProdState);
+          }
+        }
+        //
+        // smemA [ConsTryWait, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+        //
+        { smemAConsToken = smemASrcStack.mPipeline.consumer_try_wait(smemAConsState); }
+        //
+        // smemB [ConsTryWait, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+        //
+        { smemBConsToken = smemBSrcStack.mPipeline.consumer_try_wait(smemBConsState); }
+        //
+        // tmemSfA [ConsTryWait, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+        //
+        { tmemSfAConsToken = tmemSfASrcStack.mPipeline.consumer_try_wait(tmemSfAConsState); }
+        //
+        // mma0 [ProdAcquire, FirstIter, FreqInfo{0, 1}, UserTags{0}, Flags{8388608}].
+        //
+        if (isFirstLoopIter) {
+          mma0DstStack.mPipeline.producer_acquire(mma0ProdState, mma0ProdToken);
+        }
+        //
+        // smemA [ConsWait, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{8388608}].
+        //
+        { smemASrcStack.mPipeline.consumer_wait(smemAConsState, smemAConsToken); }
+        //
+        // smemB [ConsWait, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{8388608}].
+        //
+        { smemBSrcStack.mPipeline.consumer_wait(smemBConsState, smemBConsToken); }
+        //
+        // tmemSfA [ConsWait, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{8388608}].
+        //
+        { tmemSfASrcStack.mPipeline.consumer_wait(tmemSfAConsState, tmemSfAConsToken); }
+        //
+        // smemA [ConsWork (call 0), Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+        //
+        cutlass::float_e4m3_t* smemPtrA5;
+        {
+          int32_t index{smemAConsState.index()};
+          int8_t* smemBytesBasePtrA;
+          smemBytesBasePtrA = reinterpret_cast<int8_t*>(smemASrcStack.mDepSmemPtr0) + (int32_t{0});
+          int8_t* smemBytesStagePtrA;
+          smemBytesStagePtrA = smemBytesBasePtrA + ((index) * (int32_t{32768}));
+          smemPtrA5 = reinterpret_cast<cutlass::float_e4m3_t*>(smemBytesStagePtrA) + (int32_t{0});
+          ++smemAConsState;
+        }
+        //
+        // smemB [ConsWork (call 0), Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+        //
+        cutlass::float_e4m3_t* smemPtrB6;
+        {
+          int32_t index{smemBConsState.index()};
+          int8_t* smemBytesBasePtrB;
+          smemBytesBasePtrB =
+            reinterpret_cast<int8_t*>(smemBSrcStack.mDepSmemPtr0) + (int32_t{131072});
+          int8_t* smemBytesStagePtrB;
+          smemBytesStagePtrB = smemBytesBasePtrB + ((index) * (int32_t{16384}));
+          smemPtrB6 = reinterpret_cast<cutlass::float_e4m3_t*>(smemBytesStagePtrB) + (int32_t{0});
+          ++smemBConsState;
+        }
+        //
+        // tmemSfA [ConsWork (call 0), Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+        //
+        uint32_t tmemAddrSfA8;
+        {
+          int32_t index{tmemSfAConsState.index()};
+          tmemAddrSfA8 =
+            ((mTmemBaseOffset) + (uint32_t{64})) + (static_cast<uint32_t>((index) * (int32_t{8})));
+          ++tmemSfAConsState;
+        }
+        //
+        // tmemConstSfB [ConsWork (call 0), Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+        //
+        uint32_t tmemAddrSfB9;
+        {
+          if (!(isTmemConstSfBInitialized)) {
+            cutlass::uint128_t* smemBuffer;
+            smemBuffer = reinterpret_cast<cutlass::uint128_t*>(tmemConstSfBSrcStack.mDepSmemPtr0) +
+                         (int32_t{12896});
+            cutlass::uint128_t sfVecU128;
+            uint32_t* sfVecPtrU32;
+            sfVecPtrU32 = reinterpret_cast<uint32_t*>(&sfVecU128) + (int32_t{0});
+            sfVecPtrU32[int32_t{0}] = uint32_t{2139062143};
+            sfVecPtrU32[int32_t{1}] = uint32_t{2139062143};
+            sfVecPtrU32[int32_t{2}] = uint32_t{2139062143};
+            sfVecPtrU32[int32_t{3}] = uint32_t{2139062143};
+            smemBuffer[mLaneIdx] = sfVecU128;
+            cuda_ptx::fence_proxy_async(cuda_ptx::space_shared_t{});
+            __syncwarp();
+            {
+              cutlass::uint128_t* smemBuffer;
+              smemBuffer =
+                reinterpret_cast<cutlass::uint128_t*>(tmemConstSfBSrcStack.mDepSmemPtr0) +
+                (int32_t{12896});
+              {
+                {
+                  uint32_t tmemAddr{(mTmemBaseOffset) + (uint32_t{96})};
+                  uint64_t smemDesc{
+                    trtllm::dev::createSmemDesc(smemBuffer, uint32_t{65536}, uint32_t{16392})};
+                  if (bool{cute::elect_one_sync()}) {
+                    cuda_ptx::tcgen05_cp_32x128b_warpx4(cuda_ptx::cta_group_1_t{},
+                                                        tmemAddr,
+                                                        smemDesc);
+                  }
+                }
+              }
+              isTmemConstSfBInitialized = true;
+            }
+          }
+          tmemAddrSfB9 = (mTmemBaseOffset) + (uint32_t{96});
+        }
+        //
+        // mma0 [ProdWork (call 0), Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+        //
+        cutlass::float_e4m3_t* smemPtrA11;
+        cutlass::float_e4m3_t* smemPtrB11;
+        uint32_t tmemAddrSfA11;
+        uint32_t tmemAddrSfB11;
+        smemPtrA11 = smemPtrA5;
+        smemPtrB11 = smemPtrB6;
+        tmemAddrSfA11 = tmemAddrSfA8;
+        tmemAddrSfB11 = tmemAddrSfB9;
+        {
+          int32_t index{mma0ProdState.index()};
+          uint32_t ptrTmemD{(mTmemBaseOffset) + (static_cast<uint32_t>((index) * (int32_t{64})))};
+          uint32_t ptrTmemOffsetD{ptrTmemD};
+          cutlass::float_e4m3_t* ptrWithOffsetSmemA{(smemPtrA11 + int32_t{0})};
+          cutlass::float_e4m3_t* ptrWithOffsetSmemB{(smemPtrB11 + int32_t{0})};
+          {
+            uint32_t tmemPtrD{ptrTmemOffsetD};
+            uint32_t tmemPtrSfA{tmemAddrSfA11};
+            uint32_t tmemPtrSfB{tmemAddrSfB11};
+            //
+            // leadingDimInBytes = 16384, strideInBytes = 1024, swizzleMode = 1.
+            //
+            uint64_t smemDescA{
+              trtllm::dev::createSmemDesc(ptrWithOffsetSmemA,
+                                          uint32_t{0x4000000 /*hi=1024, lo=0*/},
+                                          uint32_t{0x40004040 /*hi=16384, lo=16448*/})};
+            //
+            // leadingDimInBytes = 8192, strideInBytes = 1024, swizzleMode = 1.
+            //
+            uint64_t smemDescB{
+              trtllm::dev::createSmemDesc(ptrWithOffsetSmemB,
+                                          uint32_t{0x2000000 /*hi=512, lo=0*/},
+                                          uint32_t{0x40004040 /*hi=16384, lo=16448*/})};
+            //
+            // MMA inst for mi=0 ni=0 ki=0.
+            //
+            uint64_t utcmmaDesc_0_0_0{trtllm::dev::make_utcmma_desc_block(int32_t{1},
+                                                                          int32_t{5},
+                                                                          int32_t{0},
+                                                                          false,
+                                                                          false,
+                                                                          int32_t{128},
+                                                                          int32_t{64},
+                                                                          int32_t{32},
+                                                                          false,
+                                                                          int32_t{0},
+                                                                          int32_t{0},
+                                                                          int32_t{0},
+                                                                          false)};
+            if (bool{cute::elect_one_sync()}) {
+              cuda_ptx::tcgen05_mma_block_scale_block32(cuda_ptx::kind_mxf8f6f4,
+                                                        cuda_ptx::cta_group_1,
+                                                        tmemPtrD,
+                                                        smemDescA,
+                                                        smemDescB,
+                                                        utcmmaDesc_0_0_0,
+                                                        tmemPtrSfA,
+                                                        tmemPtrSfB,
+                                                        bool{(loopOffset873) != (int32_t{0})});
+            }
+            //
+            // MMA inst for mi=0 ni=0 ki=1.
+            //
+            trtllm::dev::incrSmemAddr(smemDescA, int32_t{2});
+            trtllm::dev::incrSmemAddr(smemDescB, int32_t{2});
+            uint64_t utcmmaDesc_0_0_1{trtllm::dev::make_utcmma_desc_block(int32_t{1},
+                                                                          int32_t{5},
+                                                                          int32_t{0},
+                                                                          false,
+                                                                          false,
+                                                                          int32_t{128},
+                                                                          int32_t{64},
+                                                                          int32_t{32},
+                                                                          false,
+                                                                          int32_t{0},
+                                                                          int32_t{1},
+                                                                          int32_t{1},
+                                                                          false)};
+            if (bool{cute::elect_one_sync()}) {
+              cuda_ptx::tcgen05_mma_block_scale_block32(cuda_ptx::kind_mxf8f6f4,
+                                                        cuda_ptx::cta_group_1,
+                                                        tmemPtrD,
+                                                        smemDescA,
+                                                        smemDescB,
+                                                        utcmmaDesc_0_0_1,
+                                                        tmemPtrSfA,
+                                                        tmemPtrSfB,
+                                                        bool{true});
+            }
+            //
+            // MMA inst for mi=0 ni=0 ki=2.
+            //
+            trtllm::dev::incrSmemAddr(smemDescA, int32_t{2});
+            trtllm::dev::incrSmemAddr(smemDescB, int32_t{2});
+            uint64_t utcmmaDesc_0_0_2{trtllm::dev::make_utcmma_desc_block(int32_t{1},
+                                                                          int32_t{5},
+                                                                          int32_t{0},
+                                                                          false,
+                                                                          false,
+                                                                          int32_t{128},
+                                                                          int32_t{64},
+                                                                          int32_t{32},
+                                                                          false,
+                                                                          int32_t{0},
+                                                                          int32_t{2},
+                                                                          int32_t{2},
+                                                                          false)};
+            if (bool{cute::elect_one_sync()}) {
+              cuda_ptx::tcgen05_mma_block_scale_block32(cuda_ptx::kind_mxf8f6f4,
+                                                        cuda_ptx::cta_group_1,
+                                                        tmemPtrD,
+                                                        smemDescA,
+                                                        smemDescB,
+                                                        utcmmaDesc_0_0_2,
+                                                        tmemPtrSfA,
+                                                        tmemPtrSfB,
+                                                        bool{true});
+            }
+            //
+            // MMA inst for mi=0 ni=0 ki=3.
+            //
+            trtllm::dev::incrSmemAddr(smemDescA, int32_t{2});
+            trtllm::dev::incrSmemAddr(smemDescB, int32_t{2});
+            uint64_t utcmmaDesc_0_0_3{trtllm::dev::make_utcmma_desc_block(int32_t{1},
+                                                                          int32_t{5},
+                                                                          int32_t{0},
+                                                                          false,
+                                                                          false,
+                                                                          int32_t{128},
+                                                                          int32_t{64},
+                                                                          int32_t{32},
+                                                                          false,
+                                                                          int32_t{0},
+                                                                          int32_t{3},
+                                                                          int32_t{3},
+                                                                          false)};
+            if (bool{cute::elect_one_sync()}) {
+              cuda_ptx::tcgen05_mma_block_scale_block32(cuda_ptx::kind_mxf8f6f4,
+                                                        cuda_ptx::cta_group_1,
+                                                        tmemPtrD,
+                                                        smemDescA,
+                                                        smemDescB,
+                                                        utcmmaDesc_0_0_3,
+                                                        tmemPtrSfA,
+                                                        tmemPtrSfB,
+                                                        bool{true});
+            }
+            //
+            // MMA inst for mi=0 ni=0 ki=4.
+            //
+            trtllm::dev::incrSmemAddr(smemDescA, int32_t{1018});
+            trtllm::dev::incrSmemAddr(smemDescB, int32_t{506});
+            tmemPtrSfA += uint32_t{0x4 /*hi=0, lo=4*/};
+            tmemPtrSfB += uint32_t{0x2 /*hi=0, lo=2*/};
+            uint64_t utcmmaDesc_0_0_4{trtllm::dev::make_utcmma_desc_block(int32_t{1},
+                                                                          int32_t{5},
+                                                                          int32_t{0},
+                                                                          false,
+                                                                          false,
+                                                                          int32_t{128},
+                                                                          int32_t{64},
+                                                                          int32_t{32},
+                                                                          false,
+                                                                          int32_t{0},
+                                                                          int32_t{0},
+                                                                          int32_t{0},
+                                                                          false)};
+            if (bool{cute::elect_one_sync()}) {
+              cuda_ptx::tcgen05_mma_block_scale_block32(cuda_ptx::kind_mxf8f6f4,
+                                                        cuda_ptx::cta_group_1,
+                                                        tmemPtrD,
+                                                        smemDescA,
+                                                        smemDescB,
+                                                        utcmmaDesc_0_0_4,
+                                                        tmemPtrSfA,
+                                                        tmemPtrSfB,
+                                                        bool{true});
+            }
+            //
+            // MMA inst for mi=0 ni=0 ki=5.
+            //
+            trtllm::dev::incrSmemAddr(smemDescA, int32_t{2});
+            trtllm::dev::incrSmemAddr(smemDescB, int32_t{2});
+            uint64_t utcmmaDesc_0_0_5{trtllm::dev::make_utcmma_desc_block(int32_t{1},
+                                                                          int32_t{5},
+                                                                          int32_t{0},
+                                                                          false,
+                                                                          false,
+                                                                          int32_t{128},
+                                                                          int32_t{64},
+                                                                          int32_t{32},
+                                                                          false,
+                                                                          int32_t{0},
+                                                                          int32_t{1},
+                                                                          int32_t{1},
+                                                                          false)};
+            if (bool{cute::elect_one_sync()}) {
+              cuda_ptx::tcgen05_mma_block_scale_block32(cuda_ptx::kind_mxf8f6f4,
+                                                        cuda_ptx::cta_group_1,
+                                                        tmemPtrD,
+                                                        smemDescA,
+                                                        smemDescB,
+                                                        utcmmaDesc_0_0_5,
+                                                        tmemPtrSfA,
+                                                        tmemPtrSfB,
+                                                        bool{true});
+            }
+            //
+            // MMA inst for mi=0 ni=0 ki=6.
+            //
+            trtllm::dev::incrSmemAddr(smemDescA, int32_t{2});
+            trtllm::dev::incrSmemAddr(smemDescB, int32_t{2});
+            uint64_t utcmmaDesc_0_0_6{trtllm::dev::make_utcmma_desc_block(int32_t{1},
+                                                                          int32_t{5},
+                                                                          int32_t{0},
+                                                                          false,
+                                                                          false,
+                                                                          int32_t{128},
+                                                                          int32_t{64},
+                                                                          int32_t{32},
+                                                                          false,
+                                                                          int32_t{0},
+                                                                          int32_t{2},
+                                                                          int32_t{2},
+                                                                          false)};
+            if (bool{cute::elect_one_sync()}) {
+              cuda_ptx::tcgen05_mma_block_scale_block32(cuda_ptx::kind_mxf8f6f4,
+                                                        cuda_ptx::cta_group_1,
+                                                        tmemPtrD,
+                                                        smemDescA,
+                                                        smemDescB,
+                                                        utcmmaDesc_0_0_6,
+                                                        tmemPtrSfA,
+                                                        tmemPtrSfB,
+                                                        bool{true});
+            }
+            //
+            // MMA inst for mi=0 ni=0 ki=7.
+            //
+            trtllm::dev::incrSmemAddr(smemDescA, int32_t{2});
+            trtllm::dev::incrSmemAddr(smemDescB, int32_t{2});
+            uint64_t utcmmaDesc_0_0_7{trtllm::dev::make_utcmma_desc_block(int32_t{1},
+                                                                          int32_t{5},
+                                                                          int32_t{0},
+                                                                          false,
+                                                                          false,
+                                                                          int32_t{128},
+                                                                          int32_t{64},
+                                                                          int32_t{32},
+                                                                          false,
+                                                                          int32_t{0},
+                                                                          int32_t{3},
+                                                                          int32_t{3},
+                                                                          false)};
+            if (bool{cute::elect_one_sync()}) {
+              cuda_ptx::tcgen05_mma_block_scale_block32(cuda_ptx::kind_mxf8f6f4,
+                                                        cuda_ptx::cta_group_1,
+                                                        tmemPtrD,
+                                                        smemDescA,
+                                                        smemDescB,
+                                                        utcmmaDesc_0_0_7,
+                                                        tmemPtrSfA,
+                                                        tmemPtrSfB,
+                                                        bool{true});
+            }
+          }
+        }
+        //
+        // smemA [ConsRelease, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+        //
+        if ((loopOffset873) >= (int32_t{0})) {
+          {
+            smemASrcStack.mPipeline.consumer_release(smemAConsReleaseState);
+          }
+          ++smemAConsReleaseState;
+        }
+        //
+        // smemB [ConsRelease, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+        //
+        if ((loopOffset873) >= (int32_t{0})) {
+          {
+            smemBSrcStack.mPipeline.consumer_release(smemBConsReleaseState);
+          }
+          ++smemBConsReleaseState;
+        }
+        //
+        // tmemSfA [ConsRelease, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+        //
+        if ((loopOffset873) >= (int32_t{0})) {
+          {
+            tmemSfASrcStack.mPipeline.consumer_release(tmemSfAConsReleaseState);
+          }
+          ++tmemSfAConsReleaseState;
+        }
+        //
+        // mma0 [ProdCommit, LastIter, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+        //
+        if (isLastLoopIter) {
+          {
+            mma0DstStack.mPipeline.producer_commit(mma0ProdState);
+          }
+          ++mma0ProdState;
+        }
+      }
+      //
+      // Unrolled iter 1.
+      //
+      {
+        bool const isFirstLoopIter{((int32_t{256}) + (loopOffset873)) == (int32_t{0})};
+        bool const isLastLoopIter{(((int32_t{256}) + (loopOffset873)) + (int32_t{256})) >=
+                                  (loopEnd)};
+        //
+        // mma0 [ProdTryAcquire, FirstIter, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+        //
+        if (isFirstLoopIter) {
+          if (((int32_t{256}) + (loopOffset873)) >= (int32_t{0})) {
+            mma0ProdToken = mma0DstStack.mPipeline.producer_try_acquire(mma0ProdState);
+          }
+        }
+        //
+        // smemA [ConsTryWait, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+        //
+        { smemAConsToken = smemASrcStack.mPipeline.consumer_try_wait(smemAConsState); }
+        //
+        // smemB [ConsTryWait, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+        //
+        { smemBConsToken = smemBSrcStack.mPipeline.consumer_try_wait(smemBConsState); }
+        //
+        // tmemSfA [ConsTryWait, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+        //
+        { tmemSfAConsToken = tmemSfASrcStack.mPipeline.consumer_try_wait(tmemSfAConsState); }
+        //
+        // mma0 [ProdAcquire, FirstIter, FreqInfo{0, 1}, UserTags{0}, Flags{8388608}].
+        //
+        if (isFirstLoopIter) {
+          mma0DstStack.mPipeline.producer_acquire(mma0ProdState, mma0ProdToken);
+        }
+        //
+        // smemA [ConsWait, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{8388608}].
+        //
+        { smemASrcStack.mPipeline.consumer_wait(smemAConsState, smemAConsToken); }
+        //
+        // smemB [ConsWait, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{8388608}].
+        //
+        { smemBSrcStack.mPipeline.consumer_wait(smemBConsState, smemBConsToken); }
+        //
+        // tmemSfA [ConsWait, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{8388608}].
+        //
+        { tmemSfASrcStack.mPipeline.consumer_wait(tmemSfAConsState, tmemSfAConsToken); }
+        //
+        // smemA [ConsWork (call 0), Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+        //
+        cutlass::float_e4m3_t* smemPtrA5;
+        {
+          int32_t index{smemAConsState.index()};
+          int8_t* smemBytesBasePtrA;
+          smemBytesBasePtrA = reinterpret_cast<int8_t*>(smemASrcStack.mDepSmemPtr0) + (int32_t{0});
+          int8_t* smemBytesStagePtrA;
+          smemBytesStagePtrA = smemBytesBasePtrA + ((index) * (int32_t{32768}));
+          smemPtrA5 = reinterpret_cast<cutlass::float_e4m3_t*>(smemBytesStagePtrA) + (int32_t{0});
+          ++smemAConsState;
+        }
+        //
+        // smemB [ConsWork (call 0), Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+        //
+        cutlass::float_e4m3_t* smemPtrB6;
+        {
+          int32_t index{smemBConsState.index()};
+          int8_t* smemBytesBasePtrB;
+          smemBytesBasePtrB =
+            reinterpret_cast<int8_t*>(smemBSrcStack.mDepSmemPtr0) + (int32_t{131072});
+          int8_t* smemBytesStagePtrB;
+          smemBytesStagePtrB = smemBytesBasePtrB + ((index) * (int32_t{16384}));
+          smemPtrB6 = reinterpret_cast<cutlass::float_e4m3_t*>(smemBytesStagePtrB) + (int32_t{0});
+          ++smemBConsState;
+        }
+        //
+        // tmemSfA [ConsWork (call 0), Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+        //
+        uint32_t tmemAddrSfA8;
+        {
+          int32_t index{tmemSfAConsState.index()};
+          tmemAddrSfA8 =
+            ((mTmemBaseOffset) + (uint32_t{64})) + (static_cast<uint32_t>((index) * (int32_t{8})));
+          ++tmemSfAConsState;
+        }
+        //
+        // tmemConstSfB [ConsWork (call 0), Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+        //
+        uint32_t tmemAddrSfB9;
+        {
+          if (!(isTmemConstSfBInitialized)) {
+            cutlass::uint128_t* smemBuffer;
+            smemBuffer = reinterpret_cast<cutlass::uint128_t*>(tmemConstSfBSrcStack.mDepSmemPtr0) +
+                         (int32_t{12896});
+            cutlass::uint128_t sfVecU128;
+            uint32_t* sfVecPtrU32;
+            sfVecPtrU32 = reinterpret_cast<uint32_t*>(&sfVecU128) + (int32_t{0});
+            sfVecPtrU32[int32_t{0}] = uint32_t{2139062143};
+            sfVecPtrU32[int32_t{1}] = uint32_t{2139062143};
+            sfVecPtrU32[int32_t{2}] = uint32_t{2139062143};
+            sfVecPtrU32[int32_t{3}] = uint32_t{2139062143};
+            smemBuffer[mLaneIdx] = sfVecU128;
+            cuda_ptx::fence_proxy_async(cuda_ptx::space_shared_t{});
+            __syncwarp();
+            {
+              cutlass::uint128_t* smemBuffer;
+              smemBuffer =
+                reinterpret_cast<cutlass::uint128_t*>(tmemConstSfBSrcStack.mDepSmemPtr0) +
+                (int32_t{12896});
+              {
+                {
+                  uint32_t tmemAddr{(mTmemBaseOffset) + (uint32_t{96})};
+                  uint64_t smemDesc{
+                    trtllm::dev::createSmemDesc(smemBuffer, uint32_t{65536}, uint32_t{16392})};
+                  if (bool{cute::elect_one_sync()}) {
+                    cuda_ptx::tcgen05_cp_32x128b_warpx4(cuda_ptx::cta_group_1_t{},
+                                                        tmemAddr,
+                                                        smemDesc);
+                  }
+                }
+              }
+              isTmemConstSfBInitialized = true;
+            }
+          }
+          tmemAddrSfB9 = (mTmemBaseOffset) + (uint32_t{96});
+        }
+        //
+        // mma0 [ProdWork (call 0), Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+        //
+        cutlass::float_e4m3_t* smemPtrA11;
+        cutlass::float_e4m3_t* smemPtrB11;
+        uint32_t tmemAddrSfA11;
+        uint32_t tmemAddrSfB11;
+        smemPtrA11 = smemPtrA5;
+        smemPtrB11 = smemPtrB6;
+        tmemAddrSfA11 = tmemAddrSfA8;
+        tmemAddrSfB11 = tmemAddrSfB9;
+        {
+          int32_t index{mma0ProdState.index()};
+          uint32_t ptrTmemD{(mTmemBaseOffset) + (static_cast<uint32_t>((index) * (int32_t{64})))};
+          uint32_t ptrTmemOffsetD{ptrTmemD};
+          cutlass::float_e4m3_t* ptrWithOffsetSmemA{(smemPtrA11 + int32_t{0})};
+          cutlass::float_e4m3_t* ptrWithOffsetSmemB{(smemPtrB11 + int32_t{0})};
+          {
+            uint32_t tmemPtrD{ptrTmemOffsetD};
+            uint32_t tmemPtrSfA{tmemAddrSfA11};
+            uint32_t tmemPtrSfB{tmemAddrSfB11};
+            //
+            // leadingDimInBytes = 16384, strideInBytes = 1024, swizzleMode = 1.
+            //
+            uint64_t smemDescA{
+              trtllm::dev::createSmemDesc(ptrWithOffsetSmemA,
+                                          uint32_t{0x4000000 /*hi=1024, lo=0*/},
+                                          uint32_t{0x40004040 /*hi=16384, lo=16448*/})};
+            //
+            // leadingDimInBytes = 8192, strideInBytes = 1024, swizzleMode = 1.
+            //
+            uint64_t smemDescB{
+              trtllm::dev::createSmemDesc(ptrWithOffsetSmemB,
+                                          uint32_t{0x2000000 /*hi=512, lo=0*/},
+                                          uint32_t{0x40004040 /*hi=16384, lo=16448*/})};
+            //
+            // MMA inst for mi=0 ni=0 ki=0.
+            //
+            uint64_t utcmmaDesc_0_0_0{trtllm::dev::make_utcmma_desc_block(int32_t{1},
+                                                                          int32_t{5},
+                                                                          int32_t{0},
+                                                                          false,
+                                                                          false,
+                                                                          int32_t{128},
+                                                                          int32_t{64},
+                                                                          int32_t{32},
+                                                                          false,
+                                                                          int32_t{0},
+                                                                          int32_t{0},
+                                                                          int32_t{0},
+                                                                          false)};
+            if (bool{cute::elect_one_sync()}) {
+              cuda_ptx::tcgen05_mma_block_scale_block32(
+                cuda_ptx::kind_mxf8f6f4,
+                cuda_ptx::cta_group_1,
+                tmemPtrD,
+                smemDescA,
+                smemDescB,
+                utcmmaDesc_0_0_0,
+                tmemPtrSfA,
+                tmemPtrSfB,
+                bool{((int32_t{256}) + (loopOffset873)) != (int32_t{0})});
+            }
+            //
+            // MMA inst for mi=0 ni=0 ki=1.
+            //
+            trtllm::dev::incrSmemAddr(smemDescA, int32_t{2});
+            trtllm::dev::incrSmemAddr(smemDescB, int32_t{2});
+            uint64_t utcmmaDesc_0_0_1{trtllm::dev::make_utcmma_desc_block(int32_t{1},
+                                                                          int32_t{5},
+                                                                          int32_t{0},
+                                                                          false,
+                                                                          false,
+                                                                          int32_t{128},
+                                                                          int32_t{64},
+                                                                          int32_t{32},
+                                                                          false,
+                                                                          int32_t{0},
+                                                                          int32_t{1},
+                                                                          int32_t{1},
+                                                                          false)};
+            if (bool{cute::elect_one_sync()}) {
+              cuda_ptx::tcgen05_mma_block_scale_block32(cuda_ptx::kind_mxf8f6f4,
+                                                        cuda_ptx::cta_group_1,
+                                                        tmemPtrD,
+                                                        smemDescA,
+                                                        smemDescB,
+                                                        utcmmaDesc_0_0_1,
+                                                        tmemPtrSfA,
+                                                        tmemPtrSfB,
+                                                        bool{true});
+            }
+            //
+            // MMA inst for mi=0 ni=0 ki=2.
+            //
+            trtllm::dev::incrSmemAddr(smemDescA, int32_t{2});
+            trtllm::dev::incrSmemAddr(smemDescB, int32_t{2});
+            uint64_t utcmmaDesc_0_0_2{trtllm::dev::make_utcmma_desc_block(int32_t{1},
+                                                                          int32_t{5},
+                                                                          int32_t{0},
+                                                                          false,
+                                                                          false,
+                                                                          int32_t{128},
+                                                                          int32_t{64},
+                                                                          int32_t{32},
+                                                                          false,
+                                                                          int32_t{0},
+                                                                          int32_t{2},
+                                                                          int32_t{2},
+                                                                          false)};
+            if (bool{cute::elect_one_sync()}) {
+              cuda_ptx::tcgen05_mma_block_scale_block32(cuda_ptx::kind_mxf8f6f4,
+                                                        cuda_ptx::cta_group_1,
+                                                        tmemPtrD,
+                                                        smemDescA,
+                                                        smemDescB,
+                                                        utcmmaDesc_0_0_2,
+                                                        tmemPtrSfA,
+                                                        tmemPtrSfB,
+                                                        bool{true});
+            }
+            //
+            // MMA inst for mi=0 ni=0 ki=3.
+            //
+            trtllm::dev::incrSmemAddr(smemDescA, int32_t{2});
+            trtllm::dev::incrSmemAddr(smemDescB, int32_t{2});
+            uint64_t utcmmaDesc_0_0_3{trtllm::dev::make_utcmma_desc_block(int32_t{1},
+                                                                          int32_t{5},
+                                                                          int32_t{0},
+                                                                          false,
+                                                                          false,
+                                                                          int32_t{128},
+                                                                          int32_t{64},
+                                                                          int32_t{32},
+                                                                          false,
+                                                                          int32_t{0},
+                                                                          int32_t{3},
+                                                                          int32_t{3},
+                                                                          false)};
+            if (bool{cute::elect_one_sync()}) {
+              cuda_ptx::tcgen05_mma_block_scale_block32(cuda_ptx::kind_mxf8f6f4,
+                                                        cuda_ptx::cta_group_1,
+                                                        tmemPtrD,
+                                                        smemDescA,
+                                                        smemDescB,
+                                                        utcmmaDesc_0_0_3,
+                                                        tmemPtrSfA,
+                                                        tmemPtrSfB,
+                                                        bool{true});
+            }
+            //
+            // MMA inst for mi=0 ni=0 ki=4.
+            //
+            trtllm::dev::incrSmemAddr(smemDescA, int32_t{1018});
+            trtllm::dev::incrSmemAddr(smemDescB, int32_t{506});
+            tmemPtrSfA += uint32_t{0x4 /*hi=0, lo=4*/};
+            tmemPtrSfB += uint32_t{0x2 /*hi=0, lo=2*/};
+            uint64_t utcmmaDesc_0_0_4{trtllm::dev::make_utcmma_desc_block(int32_t{1},
+                                                                          int32_t{5},
+                                                                          int32_t{0},
+                                                                          false,
+                                                                          false,
+                                                                          int32_t{128},
+                                                                          int32_t{64},
+                                                                          int32_t{32},
+                                                                          false,
+                                                                          int32_t{0},
+                                                                          int32_t{0},
+                                                                          int32_t{0},
+                                                                          false)};
+            if (bool{cute::elect_one_sync()}) {
+              cuda_ptx::tcgen05_mma_block_scale_block32(cuda_ptx::kind_mxf8f6f4,
+                                                        cuda_ptx::cta_group_1,
+                                                        tmemPtrD,
+                                                        smemDescA,
+                                                        smemDescB,
+                                                        utcmmaDesc_0_0_4,
+                                                        tmemPtrSfA,
+                                                        tmemPtrSfB,
+                                                        bool{true});
+            }
+            //
+            // MMA inst for mi=0 ni=0 ki=5.
+            //
+            trtllm::dev::incrSmemAddr(smemDescA, int32_t{2});
+            trtllm::dev::incrSmemAddr(smemDescB, int32_t{2});
+            uint64_t utcmmaDesc_0_0_5{trtllm::dev::make_utcmma_desc_block(int32_t{1},
+                                                                          int32_t{5},
+                                                                          int32_t{0},
+                                                                          false,
+                                                                          false,
+                                                                          int32_t{128},
+                                                                          int32_t{64},
+                                                                          int32_t{32},
+                                                                          false,
+                                                                          int32_t{0},
+                                                                          int32_t{1},
+                                                                          int32_t{1},
+                                                                          false)};
+            if (bool{cute::elect_one_sync()}) {
+              cuda_ptx::tcgen05_mma_block_scale_block32(cuda_ptx::kind_mxf8f6f4,
+                                                        cuda_ptx::cta_group_1,
+                                                        tmemPtrD,
+                                                        smemDescA,
+                                                        smemDescB,
+                                                        utcmmaDesc_0_0_5,
+                                                        tmemPtrSfA,
+                                                        tmemPtrSfB,
+                                                        bool{true});
+            }
+            //
+            // MMA inst for mi=0 ni=0 ki=6.
+            //
+            trtllm::dev::incrSmemAddr(smemDescA, int32_t{2});
+            trtllm::dev::incrSmemAddr(smemDescB, int32_t{2});
+            uint64_t utcmmaDesc_0_0_6{trtllm::dev::make_utcmma_desc_block(int32_t{1},
+                                                                          int32_t{5},
+                                                                          int32_t{0},
+                                                                          false,
+                                                                          false,
+                                                                          int32_t{128},
+                                                                          int32_t{64},
+                                                                          int32_t{32},
+                                                                          false,
+                                                                          int32_t{0},
+                                                                          int32_t{2},
+                                                                          int32_t{2},
+                                                                          false)};
+            if (bool{cute::elect_one_sync()}) {
+              cuda_ptx::tcgen05_mma_block_scale_block32(cuda_ptx::kind_mxf8f6f4,
+                                                        cuda_ptx::cta_group_1,
+                                                        tmemPtrD,
+                                                        smemDescA,
+                                                        smemDescB,
+                                                        utcmmaDesc_0_0_6,
+                                                        tmemPtrSfA,
+                                                        tmemPtrSfB,
+                                                        bool{true});
+            }
+            //
+            // MMA inst for mi=0 ni=0 ki=7.
+            //
+            trtllm::dev::incrSmemAddr(smemDescA, int32_t{2});
+            trtllm::dev::incrSmemAddr(smemDescB, int32_t{2});
+            uint64_t utcmmaDesc_0_0_7{trtllm::dev::make_utcmma_desc_block(int32_t{1},
+                                                                          int32_t{5},
+                                                                          int32_t{0},
+                                                                          false,
+                                                                          false,
+                                                                          int32_t{128},
+                                                                          int32_t{64},
+                                                                          int32_t{32},
+                                                                          false,
+                                                                          int32_t{0},
+                                                                          int32_t{3},
+                                                                          int32_t{3},
+                                                                          false)};
+            if (bool{cute::elect_one_sync()}) {
+              cuda_ptx::tcgen05_mma_block_scale_block32(cuda_ptx::kind_mxf8f6f4,
+                                                        cuda_ptx::cta_group_1,
+                                                        tmemPtrD,
+                                                        smemDescA,
+                                                        smemDescB,
+                                                        utcmmaDesc_0_0_7,
+                                                        tmemPtrSfA,
+                                                        tmemPtrSfB,
+                                                        bool{true});
+            }
+          }
+        }
+        //
+        // smemA [ConsRelease, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+        //
+        if (((int32_t{256}) + (loopOffset873)) >= (int32_t{0})) {
+          {
+            smemASrcStack.mPipeline.consumer_release(smemAConsReleaseState);
+          }
+          ++smemAConsReleaseState;
+        }
+        //
+        // smemB [ConsRelease, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+        //
+        if (((int32_t{256}) + (loopOffset873)) >= (int32_t{0})) {
+          {
+            smemBSrcStack.mPipeline.consumer_release(smemBConsReleaseState);
+          }
+          ++smemBConsReleaseState;
+        }
+        //
+        // tmemSfA [ConsRelease, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+        //
+        if (((int32_t{256}) + (loopOffset873)) >= (int32_t{0})) {
+          {
+            tmemSfASrcStack.mPipeline.consumer_release(tmemSfAConsReleaseState);
+          }
+          ++tmemSfAConsReleaseState;
+        }
+        //
+        // mma0 [ProdCommit, LastIter, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+        //
+        if (isLastLoopIter) {
+          {
+            mma0DstStack.mPipeline.producer_commit(mma0ProdState);
+          }
+          ++mma0ProdState;
+        }
+      }
+    }
+  //
+  // Tail work.
+  //
+  ExitTileWithSignalingLabel:
+  ExitTileWithoutSignalingLabel: {}
+  }
+};
+struct EpilogueTask0 {
+  int32_t const mWarpGrpWarpIdx;
+  int32_t const mLaneIdx;
+  int32_t const mWarpGrp4WarpIdx;
+  int32_t const mWarpGrp4Idx;
+  int32_t const mWarpRowIdx;
+  int32_t const mQuadRowIdx;
+  int32_t const mBaseRowIdx;
+  int32_t const mLaneColIdx;
+  int32_t const mBaseTmemCol;
+  int32_t mCtaIdxY;
+  int32_t const mBatchIdx;
+  int32_t const mBatchLimit;
+  float mScaleC;
+  float mScaleAct;
+  int32_t mCtaOffsetK;
+  uint32_t const mTmemBaseOffset;
+  int32_t mCtaIdxX;
+  int32_t const mWarpGrpThreadIdx;
+  cutlass::Array<float, 64> frg12;
+  int32_t const mGridDimX;
+  inline __device__ EpilogueTask0(KernelParams const& params,
+                                  KernelState const& state,
+                                  int32_t warpGrpStart)
+    : mWarpGrpWarpIdx{(state.mWarpIdx) - (warpGrpStart)}
+    , mLaneIdx{(state.mThreadIdx) % (int32_t{32})}
+    , mWarpGrp4WarpIdx{mWarpGrpWarpIdx}
+    , mWarpGrp4Idx{int32_t{0}}
+    , mWarpRowIdx{(mWarpGrp4WarpIdx) * (int32_t{32})}
+    , mQuadRowIdx{((mLaneIdx) / (int32_t{4})) * (int32_t{4})}
+    , mBaseRowIdx{(mWarpRowIdx) + (mQuadRowIdx)}
+    , mLaneColIdx{((mLaneIdx) % (int32_t{4})) * (int32_t{2})}
+    , mBaseTmemCol{mLaneColIdx}
+    , mCtaIdxY{reinterpret_cast<int32_t const&>(blockIdx.y)}
+    , mBatchIdx{int32_t{params.ptrCtaIdxXyToBatchIdx[mCtaIdxY]}}
+    , mBatchLimit{int32_t{params.ptrCtaIdxXyToMnLimit[mCtaIdxY]}}
+    , mScaleC{float{
+        (params.ptrScaleC + int32_t{params.ptrCtaIdxXyToBatchIdx[mCtaIdxY]})[int32_t{0}]}}
+    , mScaleAct{float{
+        (params.ptrScaleAct + int32_t{params.ptrCtaIdxXyToBatchIdx[mCtaIdxY]})[int32_t{0}]}}
+    , mCtaOffsetK{int32_t{0}}
+    , mTmemBaseOffset{uint32_t{
+        __shfl_sync(uint32_t{0xffffffff}, (*state.mTmemSwStatePtr), int32_t{0}, int32_t{32})}}
+    , mCtaIdxX{reinterpret_cast<int32_t const&>(blockIdx.x)}
+    , mWarpGrpThreadIdx{(state.mThreadIdx) - ((warpGrpStart) * (int32_t{32}))}
+    , mGridDimX{reinterpret_cast<int32_t const&>(gridDim.x)} {}
+  static inline __device__ bool isSelected(KernelParams const& params, KernelState const& state) {
+    return ((state.mWarpIdx) >= (int32_t{0})) && ((state.mWarpIdx) < (int32_t{4}));
+  }
+  inline __device__ void execute(KernelParams const& params,
+                                 KernelState const& state,
+                                 GmemC0Smem& gmemC0DstSmem,
+                                 GmemC0Stack& gmemC0DstStack,
+                                 Mma0Stack& mma0SrcStack) {
+    cuda_ptx::setmaxnreg_dec(cuda_ptx::n32_t<160>{});
+    cudaGridDependencySynchronize();
+    trtllm::dev::CutlassUmmaAsyncPipeline<
+      1,
+      cute::Shape<cute::Int<1>, cute::Int<1>, cute::Int<1>>>::PipelineState mma0ConsState{};
+    int32_t mma0ConsToken{int32_t{0}};
+    int32_t paddedPerCtaK{(((params.k) + (int32_t{255})) / (int32_t{256})) * (int32_t{256})};
+    int32_t loopEnd{paddedPerCtaK};
+    bool const hasOneLoopIter{(int32_t{0}) < (loopEnd)};
+    int32_t lastLoopOffset{int32_t{0}};
+    uint32_t tmemBaseWithStageOffset;
+    tmemBaseWithStageOffset = mTmemBaseOffset;
+    //
+    // SmemBias::createFctProdVars.
+    //
+    int8_t* ptrSmemBaseBias;
+    float* ptrSmemBias;
+    ptrSmemBaseBias = reinterpret_cast<int8_t*>(gmemC0DstStack.mDepSmemPtr0) + (int32_t{204800});
+    ptrSmemBias = reinterpret_cast<float*>(ptrSmemBaseBias) + (int32_t{0});
+    //
+    // Loading bias to SMEM.
+    //
+    {
+      if (bool{reinterpret_cast<float const*>(params.ptrBias) != nullptr}) {
+        if ((mWarpGrpThreadIdx) < (int32_t{128})) {
+          int32_t offsetTileM{((mBatchIdx) * (params.tileStridePerBatch) + (mCtaIdxX)) *
+                              (int32_t{128})};
+          if (((offsetTileM) + (mWarpGrpThreadIdx)) < ((params.nm) * (params.numBatches))) {
+            ptrSmemBias[mWarpGrpThreadIdx] = float{
+              reinterpret_cast<float const*>(params.ptrBias)[(offsetTileM) + (mWarpGrpThreadIdx)]};
+          }
+        }
+        trtllm::dev::CutlassNamedBarrier::sync(128, 7);
+      }
+    }
+    //
+    // Hoist the first iter.
+    //
+    //
+    // Loop body.
+    //
+    CUTLASS_PRAGMA_NO_UNROLL
+    for (int32_t loopOffset1346 = int32_t{0}; loopOffset1346 < loopEnd;
+         loopOffset1346 += int32_t{256}) {
+      //
+      // gmemC0 [ProdTailWork, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+      //
+      // mma0 [ConsTailRelease, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+      //
+      lastLoopOffset = loopOffset1346;
+    }
+    //
+    // Pull the last iter down.
+    //
+    //
+    // mma0 [ConsWait, LastIter, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+    //
+    if (hasOneLoopIter) {
+      if (hasOneLoopIter) {
+        mma0ConsToken = mma0SrcStack.mPipeline.consumer_try_wait(mma0ConsState);
+      }
+      mma0SrcStack.mPipeline.consumer_wait(mma0ConsState, mma0ConsToken);
+    }
+    //
+    // mma0 [ConsWork (call 0), LastIter, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+    //
+    uint32_t tmemBaseWithStageOffset11;
+    if (hasOneLoopIter) {
+      int32_t index{mma0ConsState.index()};
+      uint32_t ptrTmemD{(mTmemBaseOffset) + (static_cast<uint32_t>((index) * (int32_t{64})))};
+      uint32_t ptrTmemOffsetD{ptrTmemD};
+      tmemBaseWithStageOffset11 = ptrTmemOffsetD;
+    }
+    //
+    // gmemC0 [ProdWork (call 0), LastIter, FreqInfo{0, 1}, UserTags{1}, Flags{0}].
+    //
+    uint32_t tmemBaseWithStageOffset12;
+    tmemBaseWithStageOffset12 = tmemBaseWithStageOffset11;
+    if (hasOneLoopIter) {
+      tmemBaseWithStageOffset = tmemBaseWithStageOffset12;
+    }
+    //
+    // Tail work.
+    //
+    //
+    // gmemC0 [ProdTailWork, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+    //
+    {
+      //
+      // Epilogue tile idxM=0 idxN=0.
+      //
+      {
+        //
+        // Load from Tmem to fragment.
+        //
+        {
+          uint32_t tmemBasePtr{tmemBaseWithStageOffset};
+          uint32_t(&dstSlice0)[32]{reinterpret_cast<uint32_t(&)[32]>(frg12[int32_t{0}])};
+          cuda_ptx::tcgen05_ld_16x256b(dstSlice0,
+                                       (tmemBasePtr) +
+                                         (static_cast<uint32_t>((mWarpGrp4Idx) * (int32_t{64}))));
+          uint32_t(&dstSlice1)[32]{reinterpret_cast<uint32_t(&)[32]>(frg12[int32_t{32}])};
+          cuda_ptx::tcgen05_ld_16x256b(
+            dstSlice1,
+            (tmemBasePtr) + (static_cast<uint32_t>(((mWarpGrp4Idx) * (int32_t{64})) +
+                                                   (int32_t{0x100000 /*hi=16, lo=0*/}))));
+        }
+        cutlass::arch::fence_view_async_tmem_load();
+        //
+        // Add bias.
+        //
+        if (bool{reinterpret_cast<float const*>(params.ptrBias) != nullptr}) {
+          int32_t const warpRowIdx{(mWarpGrp4WarpIdx) * (int32_t{32})};
+          int32_t const quadRowIdx{(mLaneIdx) / (int32_t{4})};
+          int32_t const laneColIdx{((mLaneIdx) % (int32_t{4})) * (int32_t{2})};
+          //
+          // Add bias (0, 0).
+          //
+          {
+            int32_t const sharedRowIdx{(warpRowIdx) + (quadRowIdx)};
+            int32_t const sharedColIdx{(laneColIdx) + ((mWarpGrp4Idx) * (int32_t{64}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{0}] = (frg12[int32_t{0}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (0, 1).
+          //
+          {
+            int32_t const sharedRowIdx{(warpRowIdx) + (quadRowIdx)};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{1}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{1}] = (frg12[int32_t{1}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (0, 2).
+          //
+          {
+            int32_t const sharedRowIdx{(warpRowIdx) + (quadRowIdx)};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{8}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{4}] = (frg12[int32_t{4}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (0, 3).
+          //
+          {
+            int32_t const sharedRowIdx{(warpRowIdx) + (quadRowIdx)};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{9}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{5}] = (frg12[int32_t{5}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (0, 4).
+          //
+          {
+            int32_t const sharedRowIdx{(warpRowIdx) + (quadRowIdx)};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{16}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{8}] = (frg12[int32_t{8}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (0, 5).
+          //
+          {
+            int32_t const sharedRowIdx{(warpRowIdx) + (quadRowIdx)};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{17}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{9}] = (frg12[int32_t{9}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (0, 6).
+          //
+          {
+            int32_t const sharedRowIdx{(warpRowIdx) + (quadRowIdx)};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{24}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{12}] = (frg12[int32_t{12}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (0, 7).
+          //
+          {
+            int32_t const sharedRowIdx{(warpRowIdx) + (quadRowIdx)};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{25}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{13}] = (frg12[int32_t{13}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (0, 8).
+          //
+          {
+            int32_t const sharedRowIdx{(warpRowIdx) + (quadRowIdx)};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{32}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{16}] = (frg12[int32_t{16}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (0, 9).
+          //
+          {
+            int32_t const sharedRowIdx{(warpRowIdx) + (quadRowIdx)};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{33}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{17}] = (frg12[int32_t{17}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (0, 10).
+          //
+          {
+            int32_t const sharedRowIdx{(warpRowIdx) + (quadRowIdx)};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{40}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{20}] = (frg12[int32_t{20}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (0, 11).
+          //
+          {
+            int32_t const sharedRowIdx{(warpRowIdx) + (quadRowIdx)};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{41}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{21}] = (frg12[int32_t{21}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (0, 12).
+          //
+          {
+            int32_t const sharedRowIdx{(warpRowIdx) + (quadRowIdx)};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{48}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{24}] = (frg12[int32_t{24}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (0, 13).
+          //
+          {
+            int32_t const sharedRowIdx{(warpRowIdx) + (quadRowIdx)};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{49}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{25}] = (frg12[int32_t{25}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (0, 14).
+          //
+          {
+            int32_t const sharedRowIdx{(warpRowIdx) + (quadRowIdx)};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{56}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{28}] = (frg12[int32_t{28}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (0, 15).
+          //
+          {
+            int32_t const sharedRowIdx{(warpRowIdx) + (quadRowIdx)};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{57}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{29}] = (frg12[int32_t{29}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (1, 0).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{8})};
+            int32_t const sharedColIdx{(laneColIdx) + ((mWarpGrp4Idx) * (int32_t{64}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{2}] = (frg12[int32_t{2}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (1, 1).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{8})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{1}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{3}] = (frg12[int32_t{3}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (1, 2).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{8})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{8}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{6}] = (frg12[int32_t{6}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (1, 3).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{8})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{9}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{7}] = (frg12[int32_t{7}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (1, 4).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{8})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{16}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{10}] = (frg12[int32_t{10}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (1, 5).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{8})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{17}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{11}] = (frg12[int32_t{11}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (1, 6).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{8})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{24}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{14}] = (frg12[int32_t{14}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (1, 7).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{8})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{25}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{15}] = (frg12[int32_t{15}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (1, 8).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{8})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{32}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{18}] = (frg12[int32_t{18}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (1, 9).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{8})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{33}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{19}] = (frg12[int32_t{19}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (1, 10).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{8})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{40}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{22}] = (frg12[int32_t{22}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (1, 11).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{8})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{41}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{23}] = (frg12[int32_t{23}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (1, 12).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{8})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{48}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{26}] = (frg12[int32_t{26}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (1, 13).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{8})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{49}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{27}] = (frg12[int32_t{27}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (1, 14).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{8})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{56}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{30}] = (frg12[int32_t{30}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (1, 15).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{8})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{57}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{31}] = (frg12[int32_t{31}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (2, 0).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{16})};
+            int32_t const sharedColIdx{(laneColIdx) + ((mWarpGrp4Idx) * (int32_t{64}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{32}] = (frg12[int32_t{32}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (2, 1).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{16})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{1}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{33}] = (frg12[int32_t{33}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (2, 2).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{16})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{8}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{36}] = (frg12[int32_t{36}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (2, 3).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{16})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{9}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{37}] = (frg12[int32_t{37}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (2, 4).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{16})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{16}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{40}] = (frg12[int32_t{40}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (2, 5).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{16})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{17}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{41}] = (frg12[int32_t{41}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (2, 6).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{16})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{24}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{44}] = (frg12[int32_t{44}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (2, 7).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{16})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{25}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{45}] = (frg12[int32_t{45}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (2, 8).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{16})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{32}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{48}] = (frg12[int32_t{48}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (2, 9).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{16})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{33}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{49}] = (frg12[int32_t{49}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (2, 10).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{16})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{40}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{52}] = (frg12[int32_t{52}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (2, 11).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{16})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{41}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{53}] = (frg12[int32_t{53}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (2, 12).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{16})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{48}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{56}] = (frg12[int32_t{56}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (2, 13).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{16})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{49}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{57}] = (frg12[int32_t{57}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (2, 14).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{16})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{56}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{60}] = (frg12[int32_t{60}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (2, 15).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{16})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{57}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{61}] = (frg12[int32_t{61}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (3, 0).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{24})};
+            int32_t const sharedColIdx{(laneColIdx) + ((mWarpGrp4Idx) * (int32_t{64}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{34}] = (frg12[int32_t{34}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (3, 1).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{24})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{1}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{35}] = (frg12[int32_t{35}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (3, 2).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{24})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{8}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{38}] = (frg12[int32_t{38}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (3, 3).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{24})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{9}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{39}] = (frg12[int32_t{39}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (3, 4).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{24})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{16}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{42}] = (frg12[int32_t{42}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (3, 5).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{24})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{17}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{43}] = (frg12[int32_t{43}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (3, 6).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{24})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{24}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{46}] = (frg12[int32_t{46}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (3, 7).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{24})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{25}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{47}] = (frg12[int32_t{47}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (3, 8).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{24})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{32}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{50}] = (frg12[int32_t{50}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (3, 9).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{24})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{33}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{51}] = (frg12[int32_t{51}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (3, 10).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{24})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{40}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{54}] = (frg12[int32_t{54}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (3, 11).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{24})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{41}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{55}] = (frg12[int32_t{55}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (3, 12).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{24})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{48}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{58}] = (frg12[int32_t{58}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (3, 13).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{24})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{49}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{59}] = (frg12[int32_t{59}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (3, 14).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{24})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{56}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{62}] = (frg12[int32_t{62}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+          //
+          // Add bias (3, 15).
+          //
+          {
+            int32_t const sharedRowIdx{((warpRowIdx) + (quadRowIdx)) + (int32_t{24})};
+            int32_t const sharedColIdx{(laneColIdx) +
+                                       ((mWarpGrp4Idx) * (int32_t{64}) + (int32_t{57}))};
+            //
+            // Loading bias to register.
+            //
+            frg12[int32_t{63}] = (frg12[int32_t{63}]) + (float{ptrSmemBias[sharedRowIdx]});
+          }
+        }
+        //
+        // Apply activation (0, 0).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{0}]) * (mScaleAct))};
+          frg12[int32_t{0}] = (act) * (act);
+        }
+        //
+        // Apply activation (0, 1).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{1}]) * (mScaleAct))};
+          frg12[int32_t{1}] = (act) * (act);
+        }
+        //
+        // Apply activation (0, 2).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{4}]) * (mScaleAct))};
+          frg12[int32_t{4}] = (act) * (act);
+        }
+        //
+        // Apply activation (0, 3).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{5}]) * (mScaleAct))};
+          frg12[int32_t{5}] = (act) * (act);
+        }
+        //
+        // Apply activation (0, 4).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{8}]) * (mScaleAct))};
+          frg12[int32_t{8}] = (act) * (act);
+        }
+        //
+        // Apply activation (0, 5).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{9}]) * (mScaleAct))};
+          frg12[int32_t{9}] = (act) * (act);
+        }
+        //
+        // Apply activation (0, 6).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{12}]) * (mScaleAct))};
+          frg12[int32_t{12}] = (act) * (act);
+        }
+        //
+        // Apply activation (0, 7).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{13}]) * (mScaleAct))};
+          frg12[int32_t{13}] = (act) * (act);
+        }
+        //
+        // Apply activation (0, 8).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{16}]) * (mScaleAct))};
+          frg12[int32_t{16}] = (act) * (act);
+        }
+        //
+        // Apply activation (0, 9).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{17}]) * (mScaleAct))};
+          frg12[int32_t{17}] = (act) * (act);
+        }
+        //
+        // Apply activation (0, 10).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{20}]) * (mScaleAct))};
+          frg12[int32_t{20}] = (act) * (act);
+        }
+        //
+        // Apply activation (0, 11).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{21}]) * (mScaleAct))};
+          frg12[int32_t{21}] = (act) * (act);
+        }
+        //
+        // Apply activation (0, 12).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{24}]) * (mScaleAct))};
+          frg12[int32_t{24}] = (act) * (act);
+        }
+        //
+        // Apply activation (0, 13).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{25}]) * (mScaleAct))};
+          frg12[int32_t{25}] = (act) * (act);
+        }
+        //
+        // Apply activation (0, 14).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{28}]) * (mScaleAct))};
+          frg12[int32_t{28}] = (act) * (act);
+        }
+        //
+        // Apply activation (0, 15).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{29}]) * (mScaleAct))};
+          frg12[int32_t{29}] = (act) * (act);
+        }
+        //
+        // Apply activation (1, 0).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{2}]) * (mScaleAct))};
+          frg12[int32_t{2}] = (act) * (act);
+        }
+        //
+        // Apply activation (1, 1).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{3}]) * (mScaleAct))};
+          frg12[int32_t{3}] = (act) * (act);
+        }
+        //
+        // Apply activation (1, 2).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{6}]) * (mScaleAct))};
+          frg12[int32_t{6}] = (act) * (act);
+        }
+        //
+        // Apply activation (1, 3).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{7}]) * (mScaleAct))};
+          frg12[int32_t{7}] = (act) * (act);
+        }
+        //
+        // Apply activation (1, 4).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{10}]) * (mScaleAct))};
+          frg12[int32_t{10}] = (act) * (act);
+        }
+        //
+        // Apply activation (1, 5).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{11}]) * (mScaleAct))};
+          frg12[int32_t{11}] = (act) * (act);
+        }
+        //
+        // Apply activation (1, 6).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{14}]) * (mScaleAct))};
+          frg12[int32_t{14}] = (act) * (act);
+        }
+        //
+        // Apply activation (1, 7).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{15}]) * (mScaleAct))};
+          frg12[int32_t{15}] = (act) * (act);
+        }
+        //
+        // Apply activation (1, 8).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{18}]) * (mScaleAct))};
+          frg12[int32_t{18}] = (act) * (act);
+        }
+        //
+        // Apply activation (1, 9).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{19}]) * (mScaleAct))};
+          frg12[int32_t{19}] = (act) * (act);
+        }
+        //
+        // Apply activation (1, 10).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{22}]) * (mScaleAct))};
+          frg12[int32_t{22}] = (act) * (act);
+        }
+        //
+        // Apply activation (1, 11).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{23}]) * (mScaleAct))};
+          frg12[int32_t{23}] = (act) * (act);
+        }
+        //
+        // Apply activation (1, 12).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{26}]) * (mScaleAct))};
+          frg12[int32_t{26}] = (act) * (act);
+        }
+        //
+        // Apply activation (1, 13).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{27}]) * (mScaleAct))};
+          frg12[int32_t{27}] = (act) * (act);
+        }
+        //
+        // Apply activation (1, 14).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{30}]) * (mScaleAct))};
+          frg12[int32_t{30}] = (act) * (act);
+        }
+        //
+        // Apply activation (1, 15).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{31}]) * (mScaleAct))};
+          frg12[int32_t{31}] = (act) * (act);
+        }
+        //
+        // Apply activation (2, 0).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{32}]) * (mScaleAct))};
+          frg12[int32_t{32}] = (act) * (act);
+        }
+        //
+        // Apply activation (2, 1).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{33}]) * (mScaleAct))};
+          frg12[int32_t{33}] = (act) * (act);
+        }
+        //
+        // Apply activation (2, 2).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{36}]) * (mScaleAct))};
+          frg12[int32_t{36}] = (act) * (act);
+        }
+        //
+        // Apply activation (2, 3).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{37}]) * (mScaleAct))};
+          frg12[int32_t{37}] = (act) * (act);
+        }
+        //
+        // Apply activation (2, 4).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{40}]) * (mScaleAct))};
+          frg12[int32_t{40}] = (act) * (act);
+        }
+        //
+        // Apply activation (2, 5).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{41}]) * (mScaleAct))};
+          frg12[int32_t{41}] = (act) * (act);
+        }
+        //
+        // Apply activation (2, 6).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{44}]) * (mScaleAct))};
+          frg12[int32_t{44}] = (act) * (act);
+        }
+        //
+        // Apply activation (2, 7).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{45}]) * (mScaleAct))};
+          frg12[int32_t{45}] = (act) * (act);
+        }
+        //
+        // Apply activation (2, 8).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{48}]) * (mScaleAct))};
+          frg12[int32_t{48}] = (act) * (act);
+        }
+        //
+        // Apply activation (2, 9).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{49}]) * (mScaleAct))};
+          frg12[int32_t{49}] = (act) * (act);
+        }
+        //
+        // Apply activation (2, 10).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{52}]) * (mScaleAct))};
+          frg12[int32_t{52}] = (act) * (act);
+        }
+        //
+        // Apply activation (2, 11).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{53}]) * (mScaleAct))};
+          frg12[int32_t{53}] = (act) * (act);
+        }
+        //
+        // Apply activation (2, 12).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{56}]) * (mScaleAct))};
+          frg12[int32_t{56}] = (act) * (act);
+        }
+        //
+        // Apply activation (2, 13).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{57}]) * (mScaleAct))};
+          frg12[int32_t{57}] = (act) * (act);
+        }
+        //
+        // Apply activation (2, 14).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{60}]) * (mScaleAct))};
+          frg12[int32_t{60}] = (act) * (act);
+        }
+        //
+        // Apply activation (2, 15).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{61}]) * (mScaleAct))};
+          frg12[int32_t{61}] = (act) * (act);
+        }
+        //
+        // Apply activation (3, 0).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{34}]) * (mScaleAct))};
+          frg12[int32_t{34}] = (act) * (act);
+        }
+        //
+        // Apply activation (3, 1).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{35}]) * (mScaleAct))};
+          frg12[int32_t{35}] = (act) * (act);
+        }
+        //
+        // Apply activation (3, 2).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{38}]) * (mScaleAct))};
+          frg12[int32_t{38}] = (act) * (act);
+        }
+        //
+        // Apply activation (3, 3).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{39}]) * (mScaleAct))};
+          frg12[int32_t{39}] = (act) * (act);
+        }
+        //
+        // Apply activation (3, 4).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{42}]) * (mScaleAct))};
+          frg12[int32_t{42}] = (act) * (act);
+        }
+        //
+        // Apply activation (3, 5).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{43}]) * (mScaleAct))};
+          frg12[int32_t{43}] = (act) * (act);
+        }
+        //
+        // Apply activation (3, 6).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{46}]) * (mScaleAct))};
+          frg12[int32_t{46}] = (act) * (act);
+        }
+        //
+        // Apply activation (3, 7).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{47}]) * (mScaleAct))};
+          frg12[int32_t{47}] = (act) * (act);
+        }
+        //
+        // Apply activation (3, 8).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{50}]) * (mScaleAct))};
+          frg12[int32_t{50}] = (act) * (act);
+        }
+        //
+        // Apply activation (3, 9).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{51}]) * (mScaleAct))};
+          frg12[int32_t{51}] = (act) * (act);
+        }
+        //
+        // Apply activation (3, 10).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{54}]) * (mScaleAct))};
+          frg12[int32_t{54}] = (act) * (act);
+        }
+        //
+        // Apply activation (3, 11).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{55}]) * (mScaleAct))};
+          frg12[int32_t{55}] = (act) * (act);
+        }
+        //
+        // Apply activation (3, 12).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{58}]) * (mScaleAct))};
+          frg12[int32_t{58}] = (act) * (act);
+        }
+        //
+        // Apply activation (3, 13).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{59}]) * (mScaleAct))};
+          frg12[int32_t{59}] = (act) * (act);
+        }
+        //
+        // Apply activation (3, 14).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{62}]) * (mScaleAct))};
+          frg12[int32_t{62}] = (act) * (act);
+        }
+        //
+        // Apply activation (3, 15).
+        //
+        {
+          float act{trtllm::dev::relu((frg12[int32_t{63}]) * (mScaleAct))};
+          frg12[int32_t{63}] = (act) * (act);
+        }
+        cuda_ptx::cp_async_bulk_wait_group_read(cuda_ptx::n32_t<0>{});
+        trtllm::dev::CutlassNamedBarrier::sync(128, (int32_t{6}) + (mWarpGrp4Idx));
+        //
+        // Store to Smem TmaAsyncGmemC.
+        //
+        int8_t* ptrSmemBase;
+        cutlass::float_e4m3_t* ptrSmem;
+        ptrSmemBase = reinterpret_cast<int8_t*>(gmemC0DstStack.mDepSmemPtr0) +
+                      ((mWarpGrp4Idx) * (int32_t{8192}) + (int32_t{196608}));
+        ptrSmem = reinterpret_cast<cutlass::float_e4m3_t*>(ptrSmemBase) + (int32_t{0});
+        //
+        // Smem store idxM=0 idxN=0.
+        //
+        {
+          int32_t smemOffset0;
+          {
+            int32_t const smemRowIdx{((mBaseTmemCol) * (int32_t{128}) + (mBaseRowIdx)) /
+                                     (int32_t{128})};
+            int32_t const smemOffsetInBytes{
+              (((mBaseTmemCol) * (int32_t{128}) + (mBaseRowIdx)) * (int32_t{8})) / (int32_t{8})};
+            int32_t const swizzleMask{((smemRowIdx) % (int32_t{8})) * (int32_t{16})};
+            smemOffset0 = (((smemOffsetInBytes) ^ (swizzleMask)) * (int32_t{8})) / (int32_t{8});
+          }
+          cutlass::Array<float, 4> scaleF4{mScaleC, mScaleC, mScaleC, mScaleC};
+          cutlass::Array<float, 4> accF4{frg12[int32_t{0}],
+                                         frg12[int32_t{2}],
+                                         frg12[int32_t{32}],
+                                         frg12[int32_t{34}]};
+          cutlass::Array<float, 4> scaledAccF4{trtllm::dev::fmul4(accF4, scaleF4)};
+          cutlass::Array<cutlass::float_e4m3_t, 4> scaledCvtAcc4{
+            trtllm::dev::convert_float4_to_e4m3(scaledAccF4)};
+          {
+            uint32_t convertedElts;
+            convertedElts = reinterpret_cast<uint32_t&>(scaledCvtAcc4);
+            reinterpret_cast<uint32_t*>(ptrSmem)[(smemOffset0) / (int32_t{4})] = convertedElts;
+          }
+        }
+        //
+        // Smem store idxM=0 idxN=1.
+        //
+        {
+          int32_t smemOffset0;
+          {
+            int32_t const smemRowIdx{
+              (((mBaseTmemCol) + (int32_t{1})) * (int32_t{128}) + (mBaseRowIdx)) / (int32_t{128})};
+            int32_t const smemOffsetInBytes{
+              ((((mBaseTmemCol) + (int32_t{1})) * (int32_t{128}) + (mBaseRowIdx)) * (int32_t{8})) /
+              (int32_t{8})};
+            int32_t const swizzleMask{((smemRowIdx) % (int32_t{8})) * (int32_t{16})};
+            smemOffset0 = (((smemOffsetInBytes) ^ (swizzleMask)) * (int32_t{8})) / (int32_t{8});
+          }
+          cutlass::Array<float, 4> scaleF4{mScaleC, mScaleC, mScaleC, mScaleC};
+          cutlass::Array<float, 4> accF4{frg12[int32_t{1}],
+                                         frg12[int32_t{3}],
+                                         frg12[int32_t{33}],
+                                         frg12[int32_t{35}]};
+          cutlass::Array<float, 4> scaledAccF4{trtllm::dev::fmul4(accF4, scaleF4)};
+          cutlass::Array<cutlass::float_e4m3_t, 4> scaledCvtAcc4{
+            trtllm::dev::convert_float4_to_e4m3(scaledAccF4)};
+          {
+            uint32_t convertedElts;
+            convertedElts = reinterpret_cast<uint32_t&>(scaledCvtAcc4);
+            reinterpret_cast<uint32_t*>(ptrSmem)[(smemOffset0) / (int32_t{4})] = convertedElts;
+          }
+        }
+        //
+        // Smem store idxM=0 idxN=2.
+        //
+        {
+          int32_t smemOffset0;
+          {
+            int32_t const smemRowIdx{
+              (((mBaseTmemCol) + (int32_t{8})) * (int32_t{128}) + (mBaseRowIdx)) / (int32_t{128})};
+            int32_t const smemOffsetInBytes{
+              ((((mBaseTmemCol) + (int32_t{8})) * (int32_t{128}) + (mBaseRowIdx)) * (int32_t{8})) /
+              (int32_t{8})};
+            int32_t const swizzleMask{((smemRowIdx) % (int32_t{8})) * (int32_t{16})};
+            smemOffset0 = (((smemOffsetInBytes) ^ (swizzleMask)) * (int32_t{8})) / (int32_t{8});
+          }
+          cutlass::Array<float, 4> scaleF4{mScaleC, mScaleC, mScaleC, mScaleC};
+          cutlass::Array<float, 4> accF4{frg12[int32_t{4}],
+                                         frg12[int32_t{6}],
+                                         frg12[int32_t{36}],
+                                         frg12[int32_t{38}]};
+          cutlass::Array<float, 4> scaledAccF4{trtllm::dev::fmul4(accF4, scaleF4)};
+          cutlass::Array<cutlass::float_e4m3_t, 4> scaledCvtAcc4{
+            trtllm::dev::convert_float4_to_e4m3(scaledAccF4)};
+          {
+            uint32_t convertedElts;
+            convertedElts = reinterpret_cast<uint32_t&>(scaledCvtAcc4);
+            reinterpret_cast<uint32_t*>(ptrSmem)[(smemOffset0) / (int32_t{4})] = convertedElts;
+          }
+        }
+        //
+        // Smem store idxM=0 idxN=3.
+        //
+        {
+          int32_t smemOffset0;
+          {
+            int32_t const smemRowIdx{
+              (((mBaseTmemCol) + (int32_t{9})) * (int32_t{128}) + (mBaseRowIdx)) / (int32_t{128})};
+            int32_t const smemOffsetInBytes{
+              ((((mBaseTmemCol) + (int32_t{9})) * (int32_t{128}) + (mBaseRowIdx)) * (int32_t{8})) /
+              (int32_t{8})};
+            int32_t const swizzleMask{((smemRowIdx) % (int32_t{8})) * (int32_t{16})};
+            smemOffset0 = (((smemOffsetInBytes) ^ (swizzleMask)) * (int32_t{8})) / (int32_t{8});
+          }
+          cutlass::Array<float, 4> scaleF4{mScaleC, mScaleC, mScaleC, mScaleC};
+          cutlass::Array<float, 4> accF4{frg12[int32_t{5}],
+                                         frg12[int32_t{7}],
+                                         frg12[int32_t{37}],
+                                         frg12[int32_t{39}]};
+          cutlass::Array<float, 4> scaledAccF4{trtllm::dev::fmul4(accF4, scaleF4)};
+          cutlass::Array<cutlass::float_e4m3_t, 4> scaledCvtAcc4{
+            trtllm::dev::convert_float4_to_e4m3(scaledAccF4)};
+          {
+            uint32_t convertedElts;
+            convertedElts = reinterpret_cast<uint32_t&>(scaledCvtAcc4);
+            reinterpret_cast<uint32_t*>(ptrSmem)[(smemOffset0) / (int32_t{4})] = convertedElts;
+          }
+        }
+        //
+        // Smem store idxM=0 idxN=4.
+        //
+        {
+          int32_t smemOffset0;
+          {
+            int32_t const smemRowIdx{
+              (((mBaseTmemCol) + (int32_t{16})) * (int32_t{128}) + (mBaseRowIdx)) / (int32_t{128})};
+            int32_t const smemOffsetInBytes{
+              ((((mBaseTmemCol) + (int32_t{16})) * (int32_t{128}) + (mBaseRowIdx)) * (int32_t{8})) /
+              (int32_t{8})};
+            int32_t const swizzleMask{((smemRowIdx) % (int32_t{8})) * (int32_t{16})};
+            smemOffset0 = (((smemOffsetInBytes) ^ (swizzleMask)) * (int32_t{8})) / (int32_t{8});
+          }
+          cutlass::Array<float, 4> scaleF4{mScaleC, mScaleC, mScaleC, mScaleC};
+          cutlass::Array<float, 4> accF4{frg12[int32_t{8}],
+                                         frg12[int32_t{10}],
+                                         frg12[int32_t{40}],
+                                         frg12[int32_t{42}]};
+          cutlass::Array<float, 4> scaledAccF4{trtllm::dev::fmul4(accF4, scaleF4)};
+          cutlass::Array<cutlass::float_e4m3_t, 4> scaledCvtAcc4{
+            trtllm::dev::convert_float4_to_e4m3(scaledAccF4)};
+          {
+            uint32_t convertedElts;
+            convertedElts = reinterpret_cast<uint32_t&>(scaledCvtAcc4);
+            reinterpret_cast<uint32_t*>(ptrSmem)[(smemOffset0) / (int32_t{4})] = convertedElts;
+          }
+        }
+        //
+        // Smem store idxM=0 idxN=5.
+        //
+        {
+          int32_t smemOffset0;
+          {
+            int32_t const smemRowIdx{
+              (((mBaseTmemCol) + (int32_t{17})) * (int32_t{128}) + (mBaseRowIdx)) / (int32_t{128})};
+            int32_t const smemOffsetInBytes{
+              ((((mBaseTmemCol) + (int32_t{17})) * (int32_t{128}) + (mBaseRowIdx)) * (int32_t{8})) /
+              (int32_t{8})};
+            int32_t const swizzleMask{((smemRowIdx) % (int32_t{8})) * (int32_t{16})};
+            smemOffset0 = (((smemOffsetInBytes) ^ (swizzleMask)) * (int32_t{8})) / (int32_t{8});
+          }
+          cutlass::Array<float, 4> scaleF4{mScaleC, mScaleC, mScaleC, mScaleC};
+          cutlass::Array<float, 4> accF4{frg12[int32_t{9}],
+                                         frg12[int32_t{11}],
+                                         frg12[int32_t{41}],
+                                         frg12[int32_t{43}]};
+          cutlass::Array<float, 4> scaledAccF4{trtllm::dev::fmul4(accF4, scaleF4)};
+          cutlass::Array<cutlass::float_e4m3_t, 4> scaledCvtAcc4{
+            trtllm::dev::convert_float4_to_e4m3(scaledAccF4)};
+          {
+            uint32_t convertedElts;
+            convertedElts = reinterpret_cast<uint32_t&>(scaledCvtAcc4);
+            reinterpret_cast<uint32_t*>(ptrSmem)[(smemOffset0) / (int32_t{4})] = convertedElts;
+          }
+        }
+        //
+        // Smem store idxM=0 idxN=6.
+        //
+        {
+          int32_t smemOffset0;
+          {
+            int32_t const smemRowIdx{
+              (((mBaseTmemCol) + (int32_t{24})) * (int32_t{128}) + (mBaseRowIdx)) / (int32_t{128})};
+            int32_t const smemOffsetInBytes{
+              ((((mBaseTmemCol) + (int32_t{24})) * (int32_t{128}) + (mBaseRowIdx)) * (int32_t{8})) /
+              (int32_t{8})};
+            int32_t const swizzleMask{((smemRowIdx) % (int32_t{8})) * (int32_t{16})};
+            smemOffset0 = (((smemOffsetInBytes) ^ (swizzleMask)) * (int32_t{8})) / (int32_t{8});
+          }
+          cutlass::Array<float, 4> scaleF4{mScaleC, mScaleC, mScaleC, mScaleC};
+          cutlass::Array<float, 4> accF4{frg12[int32_t{12}],
+                                         frg12[int32_t{14}],
+                                         frg12[int32_t{44}],
+                                         frg12[int32_t{46}]};
+          cutlass::Array<float, 4> scaledAccF4{trtllm::dev::fmul4(accF4, scaleF4)};
+          cutlass::Array<cutlass::float_e4m3_t, 4> scaledCvtAcc4{
+            trtllm::dev::convert_float4_to_e4m3(scaledAccF4)};
+          {
+            uint32_t convertedElts;
+            convertedElts = reinterpret_cast<uint32_t&>(scaledCvtAcc4);
+            reinterpret_cast<uint32_t*>(ptrSmem)[(smemOffset0) / (int32_t{4})] = convertedElts;
+          }
+        }
+        //
+        // Smem store idxM=0 idxN=7.
+        //
+        {
+          int32_t smemOffset0;
+          {
+            int32_t const smemRowIdx{
+              (((mBaseTmemCol) + (int32_t{25})) * (int32_t{128}) + (mBaseRowIdx)) / (int32_t{128})};
+            int32_t const smemOffsetInBytes{
+              ((((mBaseTmemCol) + (int32_t{25})) * (int32_t{128}) + (mBaseRowIdx)) * (int32_t{8})) /
+              (int32_t{8})};
+            int32_t const swizzleMask{((smemRowIdx) % (int32_t{8})) * (int32_t{16})};
+            smemOffset0 = (((smemOffsetInBytes) ^ (swizzleMask)) * (int32_t{8})) / (int32_t{8});
+          }
+          cutlass::Array<float, 4> scaleF4{mScaleC, mScaleC, mScaleC, mScaleC};
+          cutlass::Array<float, 4> accF4{frg12[int32_t{13}],
+                                         frg12[int32_t{15}],
+                                         frg12[int32_t{45}],
+                                         frg12[int32_t{47}]};
+          cutlass::Array<float, 4> scaledAccF4{trtllm::dev::fmul4(accF4, scaleF4)};
+          cutlass::Array<cutlass::float_e4m3_t, 4> scaledCvtAcc4{
+            trtllm::dev::convert_float4_to_e4m3(scaledAccF4)};
+          {
+            uint32_t convertedElts;
+            convertedElts = reinterpret_cast<uint32_t&>(scaledCvtAcc4);
+            reinterpret_cast<uint32_t*>(ptrSmem)[(smemOffset0) / (int32_t{4})] = convertedElts;
+          }
+        }
+        //
+        // Smem store idxM=0 idxN=8.
+        //
+        {
+          int32_t smemOffset0;
+          {
+            int32_t const smemRowIdx{
+              (((mBaseTmemCol) + (int32_t{32})) * (int32_t{128}) + (mBaseRowIdx)) / (int32_t{128})};
+            int32_t const smemOffsetInBytes{
+              ((((mBaseTmemCol) + (int32_t{32})) * (int32_t{128}) + (mBaseRowIdx)) * (int32_t{8})) /
+              (int32_t{8})};
+            int32_t const swizzleMask{((smemRowIdx) % (int32_t{8})) * (int32_t{16})};
+            smemOffset0 = (((smemOffsetInBytes) ^ (swizzleMask)) * (int32_t{8})) / (int32_t{8});
+          }
+          cutlass::Array<float, 4> scaleF4{mScaleC, mScaleC, mScaleC, mScaleC};
+          cutlass::Array<float, 4> accF4{frg12[int32_t{16}],
+                                         frg12[int32_t{18}],
+                                         frg12[int32_t{48}],
+                                         frg12[int32_t{50}]};
+          cutlass::Array<float, 4> scaledAccF4{trtllm::dev::fmul4(accF4, scaleF4)};
+          cutlass::Array<cutlass::float_e4m3_t, 4> scaledCvtAcc4{
+            trtllm::dev::convert_float4_to_e4m3(scaledAccF4)};
+          {
+            uint32_t convertedElts;
+            convertedElts = reinterpret_cast<uint32_t&>(scaledCvtAcc4);
+            reinterpret_cast<uint32_t*>(ptrSmem)[(smemOffset0) / (int32_t{4})] = convertedElts;
+          }
+        }
+        //
+        // Smem store idxM=0 idxN=9.
+        //
+        {
+          int32_t smemOffset0;
+          {
+            int32_t const smemRowIdx{
+              (((mBaseTmemCol) + (int32_t{33})) * (int32_t{128}) + (mBaseRowIdx)) / (int32_t{128})};
+            int32_t const smemOffsetInBytes{
+              ((((mBaseTmemCol) + (int32_t{33})) * (int32_t{128}) + (mBaseRowIdx)) * (int32_t{8})) /
+              (int32_t{8})};
+            int32_t const swizzleMask{((smemRowIdx) % (int32_t{8})) * (int32_t{16})};
+            smemOffset0 = (((smemOffsetInBytes) ^ (swizzleMask)) * (int32_t{8})) / (int32_t{8});
+          }
+          cutlass::Array<float, 4> scaleF4{mScaleC, mScaleC, mScaleC, mScaleC};
+          cutlass::Array<float, 4> accF4{frg12[int32_t{17}],
+                                         frg12[int32_t{19}],
+                                         frg12[int32_t{49}],
+                                         frg12[int32_t{51}]};
+          cutlass::Array<float, 4> scaledAccF4{trtllm::dev::fmul4(accF4, scaleF4)};
+          cutlass::Array<cutlass::float_e4m3_t, 4> scaledCvtAcc4{
+            trtllm::dev::convert_float4_to_e4m3(scaledAccF4)};
+          {
+            uint32_t convertedElts;
+            convertedElts = reinterpret_cast<uint32_t&>(scaledCvtAcc4);
+            reinterpret_cast<uint32_t*>(ptrSmem)[(smemOffset0) / (int32_t{4})] = convertedElts;
+          }
+        }
+        //
+        // Smem store idxM=0 idxN=10.
+        //
+        {
+          int32_t smemOffset0;
+          {
+            int32_t const smemRowIdx{
+              (((mBaseTmemCol) + (int32_t{40})) * (int32_t{128}) + (mBaseRowIdx)) / (int32_t{128})};
+            int32_t const smemOffsetInBytes{
+              ((((mBaseTmemCol) + (int32_t{40})) * (int32_t{128}) + (mBaseRowIdx)) * (int32_t{8})) /
+              (int32_t{8})};
+            int32_t const swizzleMask{((smemRowIdx) % (int32_t{8})) * (int32_t{16})};
+            smemOffset0 = (((smemOffsetInBytes) ^ (swizzleMask)) * (int32_t{8})) / (int32_t{8});
+          }
+          cutlass::Array<float, 4> scaleF4{mScaleC, mScaleC, mScaleC, mScaleC};
+          cutlass::Array<float, 4> accF4{frg12[int32_t{20}],
+                                         frg12[int32_t{22}],
+                                         frg12[int32_t{52}],
+                                         frg12[int32_t{54}]};
+          cutlass::Array<float, 4> scaledAccF4{trtllm::dev::fmul4(accF4, scaleF4)};
+          cutlass::Array<cutlass::float_e4m3_t, 4> scaledCvtAcc4{
+            trtllm::dev::convert_float4_to_e4m3(scaledAccF4)};
+          {
+            uint32_t convertedElts;
+            convertedElts = reinterpret_cast<uint32_t&>(scaledCvtAcc4);
+            reinterpret_cast<uint32_t*>(ptrSmem)[(smemOffset0) / (int32_t{4})] = convertedElts;
+          }
+        }
+        //
+        // Smem store idxM=0 idxN=11.
+        //
+        {
+          int32_t smemOffset0;
+          {
+            int32_t const smemRowIdx{
+              (((mBaseTmemCol) + (int32_t{41})) * (int32_t{128}) + (mBaseRowIdx)) / (int32_t{128})};
+            int32_t const smemOffsetInBytes{
+              ((((mBaseTmemCol) + (int32_t{41})) * (int32_t{128}) + (mBaseRowIdx)) * (int32_t{8})) /
+              (int32_t{8})};
+            int32_t const swizzleMask{((smemRowIdx) % (int32_t{8})) * (int32_t{16})};
+            smemOffset0 = (((smemOffsetInBytes) ^ (swizzleMask)) * (int32_t{8})) / (int32_t{8});
+          }
+          cutlass::Array<float, 4> scaleF4{mScaleC, mScaleC, mScaleC, mScaleC};
+          cutlass::Array<float, 4> accF4{frg12[int32_t{21}],
+                                         frg12[int32_t{23}],
+                                         frg12[int32_t{53}],
+                                         frg12[int32_t{55}]};
+          cutlass::Array<float, 4> scaledAccF4{trtllm::dev::fmul4(accF4, scaleF4)};
+          cutlass::Array<cutlass::float_e4m3_t, 4> scaledCvtAcc4{
+            trtllm::dev::convert_float4_to_e4m3(scaledAccF4)};
+          {
+            uint32_t convertedElts;
+            convertedElts = reinterpret_cast<uint32_t&>(scaledCvtAcc4);
+            reinterpret_cast<uint32_t*>(ptrSmem)[(smemOffset0) / (int32_t{4})] = convertedElts;
+          }
+        }
+        //
+        // Smem store idxM=0 idxN=12.
+        //
+        {
+          int32_t smemOffset0;
+          {
+            int32_t const smemRowIdx{
+              (((mBaseTmemCol) + (int32_t{48})) * (int32_t{128}) + (mBaseRowIdx)) / (int32_t{128})};
+            int32_t const smemOffsetInBytes{
+              ((((mBaseTmemCol) + (int32_t{48})) * (int32_t{128}) + (mBaseRowIdx)) * (int32_t{8})) /
+              (int32_t{8})};
+            int32_t const swizzleMask{((smemRowIdx) % (int32_t{8})) * (int32_t{16})};
+            smemOffset0 = (((smemOffsetInBytes) ^ (swizzleMask)) * (int32_t{8})) / (int32_t{8});
+          }
+          cutlass::Array<float, 4> scaleF4{mScaleC, mScaleC, mScaleC, mScaleC};
+          cutlass::Array<float, 4> accF4{frg12[int32_t{24}],
+                                         frg12[int32_t{26}],
+                                         frg12[int32_t{56}],
+                                         frg12[int32_t{58}]};
+          cutlass::Array<float, 4> scaledAccF4{trtllm::dev::fmul4(accF4, scaleF4)};
+          cutlass::Array<cutlass::float_e4m3_t, 4> scaledCvtAcc4{
+            trtllm::dev::convert_float4_to_e4m3(scaledAccF4)};
+          {
+            uint32_t convertedElts;
+            convertedElts = reinterpret_cast<uint32_t&>(scaledCvtAcc4);
+            reinterpret_cast<uint32_t*>(ptrSmem)[(smemOffset0) / (int32_t{4})] = convertedElts;
+          }
+        }
+        //
+        // Smem store idxM=0 idxN=13.
+        //
+        {
+          int32_t smemOffset0;
+          {
+            int32_t const smemRowIdx{
+              (((mBaseTmemCol) + (int32_t{49})) * (int32_t{128}) + (mBaseRowIdx)) / (int32_t{128})};
+            int32_t const smemOffsetInBytes{
+              ((((mBaseTmemCol) + (int32_t{49})) * (int32_t{128}) + (mBaseRowIdx)) * (int32_t{8})) /
+              (int32_t{8})};
+            int32_t const swizzleMask{((smemRowIdx) % (int32_t{8})) * (int32_t{16})};
+            smemOffset0 = (((smemOffsetInBytes) ^ (swizzleMask)) * (int32_t{8})) / (int32_t{8});
+          }
+          cutlass::Array<float, 4> scaleF4{mScaleC, mScaleC, mScaleC, mScaleC};
+          cutlass::Array<float, 4> accF4{frg12[int32_t{25}],
+                                         frg12[int32_t{27}],
+                                         frg12[int32_t{57}],
+                                         frg12[int32_t{59}]};
+          cutlass::Array<float, 4> scaledAccF4{trtllm::dev::fmul4(accF4, scaleF4)};
+          cutlass::Array<cutlass::float_e4m3_t, 4> scaledCvtAcc4{
+            trtllm::dev::convert_float4_to_e4m3(scaledAccF4)};
+          {
+            uint32_t convertedElts;
+            convertedElts = reinterpret_cast<uint32_t&>(scaledCvtAcc4);
+            reinterpret_cast<uint32_t*>(ptrSmem)[(smemOffset0) / (int32_t{4})] = convertedElts;
+          }
+        }
+        //
+        // Smem store idxM=0 idxN=14.
+        //
+        {
+          int32_t smemOffset0;
+          {
+            int32_t const smemRowIdx{
+              (((mBaseTmemCol) + (int32_t{56})) * (int32_t{128}) + (mBaseRowIdx)) / (int32_t{128})};
+            int32_t const smemOffsetInBytes{
+              ((((mBaseTmemCol) + (int32_t{56})) * (int32_t{128}) + (mBaseRowIdx)) * (int32_t{8})) /
+              (int32_t{8})};
+            int32_t const swizzleMask{((smemRowIdx) % (int32_t{8})) * (int32_t{16})};
+            smemOffset0 = (((smemOffsetInBytes) ^ (swizzleMask)) * (int32_t{8})) / (int32_t{8});
+          }
+          cutlass::Array<float, 4> scaleF4{mScaleC, mScaleC, mScaleC, mScaleC};
+          cutlass::Array<float, 4> accF4{frg12[int32_t{28}],
+                                         frg12[int32_t{30}],
+                                         frg12[int32_t{60}],
+                                         frg12[int32_t{62}]};
+          cutlass::Array<float, 4> scaledAccF4{trtllm::dev::fmul4(accF4, scaleF4)};
+          cutlass::Array<cutlass::float_e4m3_t, 4> scaledCvtAcc4{
+            trtllm::dev::convert_float4_to_e4m3(scaledAccF4)};
+          {
+            uint32_t convertedElts;
+            convertedElts = reinterpret_cast<uint32_t&>(scaledCvtAcc4);
+            reinterpret_cast<uint32_t*>(ptrSmem)[(smemOffset0) / (int32_t{4})] = convertedElts;
+          }
+        }
+        //
+        // Smem store idxM=0 idxN=15.
+        //
+        {
+          int32_t smemOffset0;
+          {
+            int32_t const smemRowIdx{
+              (((mBaseTmemCol) + (int32_t{57})) * (int32_t{128}) + (mBaseRowIdx)) / (int32_t{128})};
+            int32_t const smemOffsetInBytes{
+              ((((mBaseTmemCol) + (int32_t{57})) * (int32_t{128}) + (mBaseRowIdx)) * (int32_t{8})) /
+              (int32_t{8})};
+            int32_t const swizzleMask{((smemRowIdx) % (int32_t{8})) * (int32_t{16})};
+            smemOffset0 = (((smemOffsetInBytes) ^ (swizzleMask)) * (int32_t{8})) / (int32_t{8});
+          }
+          cutlass::Array<float, 4> scaleF4{mScaleC, mScaleC, mScaleC, mScaleC};
+          cutlass::Array<float, 4> accF4{frg12[int32_t{29}],
+                                         frg12[int32_t{31}],
+                                         frg12[int32_t{61}],
+                                         frg12[int32_t{63}]};
+          cutlass::Array<float, 4> scaledAccF4{trtllm::dev::fmul4(accF4, scaleF4)};
+          cutlass::Array<cutlass::float_e4m3_t, 4> scaledCvtAcc4{
+            trtllm::dev::convert_float4_to_e4m3(scaledAccF4)};
+          {
+            uint32_t convertedElts;
+            convertedElts = reinterpret_cast<uint32_t&>(scaledCvtAcc4);
+            reinterpret_cast<uint32_t*>(ptrSmem)[(smemOffset0) / (int32_t{4})] = convertedElts;
+          }
+        }
+        cuda_ptx::fence_proxy_async(cuda_ptx::space_shared_t{});
+        trtllm::dev::CutlassNamedBarrier::sync(128, (int32_t{6}) + (mWarpGrp4Idx));
+        //
+        // Issue TMA from smem to gmem.
+        //
+        if ((bool{cute::elect_one_sync()}) && ((mWarpGrp4WarpIdx) == (int32_t{0}))) {
+          int8_t* ptrSmemBase;
+          cutlass::float_e4m3_t* ptrSmem;
+          ptrSmemBase = reinterpret_cast<int8_t*>(gmemC0DstStack.mDepSmemPtr0) +
+                        ((mWarpGrp4Idx) * (int32_t{8192}) + (int32_t{196608}));
+          ptrSmem = reinterpret_cast<cutlass::float_e4m3_t*>(ptrSmemBase) + (int32_t{0});
+          int32_t coords[4];
+          coords[int32_t{0}] = (mCtaIdxX) * (int32_t{128});
+          coords[int32_t{1}] = (((int32_t{64}) - ((mBatchLimit) % (int32_t{64}))) % (int32_t{64})) +
+                               ((mWarpGrp4Idx) * (int32_t{64}));
+          coords[int32_t{2}] = int32_t{0x40000000 /*1073741824*/};
+          coords[int32_t{3}] =
+            (((mCtaIdxY) * (int32_t{64})) +
+             ((int32_t{0}) - (((int32_t{64}) - ((mBatchLimit) % (int32_t{64}))) % (int32_t{64})))) +
+            (int32_t{0x40000000 /*1073741824*/});
+          cuda_ptx::cp_async_bulk_tensor(cuda_ptx::space_global_t{},
+                                         cuda_ptx::space_shared_t{},
+                                         params.tmaC,
+                                         coords,
+                                         &ptrSmem[int32_t{0}]);
+        }
+        cuda_ptx::cp_async_bulk_commit_group();
+        trtllm::dev::CutlassNamedBarrier::sync(128, (int32_t{6}) + (mWarpGrp4Idx));
+      }
+      {
+        //
+        // Skip all-reduce if on single device.
+        //
+      }
+    }
+  ExitTileWithSignalingLabel:
+    //
+    // mma0 [ConsTailRelease, Info{0}, FreqInfo{0, 1}, UserTags{0}, Flags{0}].
+    //
+    if (hasOneLoopIter) {
+      {
+        mma0SrcStack.mPipeline.consumer_release(mma0ConsState);
+      }
+      ++mma0ConsState;
+    }
+  ExitTileWithoutSignalingLabel: {}
+  }
+};
+struct PaddingTask {
+  inline __device__ PaddingTask(KernelParams const& params,
+                                KernelState const& state,
+                                int32_t warpGrpStart) {}
+  static inline __device__ bool isSelected(KernelParams const& params, KernelState const& state) {
+    return ((state.mWarpIdx) >= (int32_t{10})) && ((state.mWarpIdx) < (int32_t{12}));
+  }
+  inline __device__ void execute(KernelParams const& params, KernelState const& state) {
+    cuda_ptx::setmaxnreg_dec(cuda_ptx::n32_t<48>{});
+  //
+  // Tail work.
+  //
+  ExitTileWithSignalingLabel:
+  ExitTileWithoutSignalingLabel: {}
+  }
+};
+extern "C" __global__
+__launch_bounds__(384, 1) void bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_bA32_bB32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_relu2_bN_ldgsts_ldgstsSf_rgTma_clmp_dynB_sm100f(
+  CUTE_GRID_CONSTANT KernelParams const params) {
+  extern __shared__ uint8_t smem__[];
+  int32_t smemOffset__{int32_t{0}};
+  smemOffset__ = (((smemOffset__) + (int32_t{1023})) / (int32_t{1024})) * (int32_t{1024});
+  uint8_t* smemBufferSmemPtr{(reinterpret_cast<uint8_t*>(smem__) + smemOffset__)};
+  smemOffset__ += static_cast<int32_t>(uint64_t{sizeof(SmemBufferSmem)});
+  smemOffset__ = (((smemOffset__) + (int32_t{1023})) / (int32_t{1024})) * (int32_t{1024});
+  uint8_t* smemASmemPtr{(reinterpret_cast<uint8_t*>(smem__) + smemOffset__)};
+  smemOffset__ += static_cast<int32_t>(uint64_t{sizeof(SmemASmem)});
+  smemOffset__ = (((smemOffset__) + (int32_t{1023})) / (int32_t{1024})) * (int32_t{1024});
+  uint8_t* smemBSmemPtr{(reinterpret_cast<uint8_t*>(smem__) + smemOffset__)};
+  smemOffset__ += static_cast<int32_t>(uint64_t{sizeof(SmemBSmem)});
+  smemOffset__ = (((smemOffset__) + (int32_t{1023})) / (int32_t{1024})) * (int32_t{1024});
+  uint8_t* smemSfASmemPtr{(reinterpret_cast<uint8_t*>(smem__) + smemOffset__)};
+  smemOffset__ += static_cast<int32_t>(uint64_t{sizeof(SmemSfASmem)});
+  smemOffset__ = (((smemOffset__) + (int32_t{1023})) / (int32_t{1024})) * (int32_t{1024});
+  uint8_t* gmemC0SmemPtr{(reinterpret_cast<uint8_t*>(smem__) + smemOffset__)};
+  smemOffset__ += static_cast<int32_t>(uint64_t{sizeof(GmemC0Smem)});
+  uint32_t* TmemSwStatePtr{
+    reinterpret_cast<uint32_t*>((reinterpret_cast<uint8_t*>(smem__) + smemOffset__))};
+  smemOffset__ += int32_t{16};
+  uint8_t* smemASmemBarrierPtr{(reinterpret_cast<uint8_t*>(smem__) + smemOffset__)};
+  smemOffset__ += static_cast<int32_t>(uint64_t{sizeof(SmemASmemBarrier)});
+  uint8_t* smemBSmemBarrierPtr{(reinterpret_cast<uint8_t*>(smem__) + smemOffset__)};
+  smemOffset__ += static_cast<int32_t>(uint64_t{sizeof(SmemBSmemBarrier)});
+  uint8_t* smemSfASmemBarrierPtr{(reinterpret_cast<uint8_t*>(smem__) + smemOffset__)};
+  smemOffset__ += static_cast<int32_t>(uint64_t{sizeof(SmemSfASmemBarrier)});
+  uint8_t* tmemSfASmemBarrierPtr{(reinterpret_cast<uint8_t*>(smem__) + smemOffset__)};
+  smemOffset__ += static_cast<int32_t>(uint64_t{sizeof(TmemSfASmemBarrier)});
+  uint8_t* mma0SmemBarrierPtr{(reinterpret_cast<uint8_t*>(smem__) + smemOffset__)};
+  smemOffset__ += static_cast<int32_t>(uint64_t{sizeof(Mma0SmemBarrier)});
+  cudaGridDependencySynchronize();
+  KernelState const state{params, TmemSwStatePtr};
+  if ((reinterpret_cast<int32_t const&>(blockIdx.y)) >= (state.mNumNonExitingCtas)) {
+    return;
+  }
+  SmemBufferSmem* smemBufferSmem{reinterpret_cast<SmemBufferSmem*>(smemBufferSmemPtr)};
+  SmemBufferStack smemBufferStack{(*smemBufferSmem), state.mWarpIdx, int32_t{0}, int32_t{-1}};
+  SmemASmem* smemASmem{reinterpret_cast<SmemASmem*>(smemASmemPtr)};
+  SmemASmemBarrier* smemASmemBarrier{reinterpret_cast<SmemASmemBarrier*>(smemASmemBarrierPtr)};
+  SmemAStack smemAStack{(*smemASmem),
+                        (*smemASmemBarrier),
+                        (*smemBufferSmem),
+                        smemBufferStack,
+                        state.mWarpIdx,
+                        int32_t{6},
+                        int32_t{-1}};
+  SmemBSmem* smemBSmem{reinterpret_cast<SmemBSmem*>(smemBSmemPtr)};
+  SmemBSmemBarrier* smemBSmemBarrier{reinterpret_cast<SmemBSmemBarrier*>(smemBSmemBarrierPtr)};
+  SmemBStack smemBStack{(*smemBSmem),
+                        (*smemBSmemBarrier),
+                        (*smemBufferSmem),
+                        smemBufferStack,
+                        state.mWarpIdx,
+                        int32_t{4},
+                        int32_t{-1}};
+  SmemSfASmem* smemSfASmem{reinterpret_cast<SmemSfASmem*>(smemSfASmemPtr)};
+  SmemSfASmemBarrier* smemSfASmemBarrier{
+    reinterpret_cast<SmemSfASmemBarrier*>(smemSfASmemBarrierPtr)};
+  SmemSfAStack smemSfAStack{(*smemSfASmem),
+                            (*smemSfASmemBarrier),
+                            state.mWarpIdx,
+                            int32_t{7},
+                            int32_t{-1}};
+  TmemSfASmemBarrier* tmemSfASmemBarrier{
+    reinterpret_cast<TmemSfASmemBarrier*>(tmemSfASmemBarrierPtr)};
+  TmemSfAStack tmemSfAStack{(*tmemSfASmemBarrier), state.mWarpIdx, int32_t{8}, int32_t{-1}};
+  TmemConstSfBStack tmemConstSfBStack{(*smemBufferSmem),
+                                      smemBufferStack,
+                                      state.mWarpIdx,
+                                      int32_t{0},
+                                      int32_t{-1}};
+  TmemStack tmemStack{state.mWarpIdx, int32_t{0}, int32_t{-1}};
+  Mma0SmemBarrier* mma0SmemBarrier{reinterpret_cast<Mma0SmemBarrier*>(mma0SmemBarrierPtr)};
+  Mma0Stack mma0Stack{(*mma0SmemBarrier), tmemStack, state.mWarpIdx, int32_t{1}, int32_t{-1}};
+  GmemC0Smem* gmemC0Smem{reinterpret_cast<GmemC0Smem*>(gmemC0SmemPtr)};
+  GmemC0Stack gmemC0Stack{(*gmemC0Smem),
+                          (*smemBufferSmem),
+                          smemBufferStack,
+                          state.mWarpIdx,
+                          int32_t{0},
+                          int32_t{-1}};
+  LoadTaskA loadTaskA{params, state, int32_t{6}};
+  LoadTaskB loadTaskB{params, state, int32_t{4}};
+  cutlass::arch::fence_barrier_init();
+  __syncthreads();
+  if ((reinterpret_cast<int32_t const&>(threadIdx.x)) < (int32_t{32})) {
+    cuda_ptx::tcgen05_alloc(cuda_ptx::cta_group_1_t{}, state.mTmemSwStatePtr, int32_t{128});
+    cuda_ptx::tcgen05_relinquish_alloc_permit(cuda_ptx::cta_group_1_t{});
+  }
+  if (((bool{LoadTaskA::isSelected(params, state)}) ||
+       (bool{LoadTaskB::isSelected(params, state)})) ||
+      (bool{LoadSfATask::isSelected(params, state)})) {
+  } else {
+    trtllm::dev::CutlassNamedBarrier::sync(256, 8);
+  }
+  if (bool{LoadTaskA::isSelected(params, state)}) {
+    loadTaskA.execute(params, state, (*smemASmem), smemAStack);
+  } else {
+    if (bool{LoadTaskB::isSelected(params, state)}) {
+      loadTaskB.execute(params, state, (*smemBSmem), smemBStack);
+    } else {
+      if (bool{LoadSfATask::isSelected(params, state)}) {
+        LoadSfATask loadSfATask{params, state, int32_t{7}};
+        loadSfATask.execute(params, state, (*smemSfASmem), smemSfAStack);
+      } else {
+        if (bool{CopySfATask::isSelected(params, state)}) {
+          CopySfATask copySfATask{params, state, int32_t{8}};
+          copySfATask.execute(params, state, tmemSfAStack, (*smemSfASmem), smemSfAStack);
+        } else {
+          if (bool{MmaTask0::isSelected(params, state)}) {
+            MmaTask0 mmaTask0{params, state, int32_t{9}};
+            mmaTask0.execute(params,
+                             state,
+                             mma0Stack,
+                             (*smemASmem),
+                             smemAStack,
+                             (*smemBSmem),
+                             smemBStack,
+                             tmemSfAStack,
+                             tmemConstSfBStack);
+          } else {
+            if (bool{EpilogueTask0::isSelected(params, state)}) {
+              EpilogueTask0 epilogueTask0{params, state, int32_t{0}};
+              epilogueTask0.execute(params, state, (*gmemC0Smem), gmemC0Stack, mma0Stack);
+              trtllm::dev::CutlassNamedBarrier::sync(128, 9);
+              int32_t const warpGrpThreadIdx{state.mThreadIdx};
+              if ((warpGrpThreadIdx) < (int32_t{32})) {
+                cuda_ptx::tcgen05_dealloc(cuda_ptx::cta_group_1_t{},
+                                          uint32_t{__shfl_sync(uint32_t{0xffffffff},
+                                                               (*state.mTmemSwStatePtr),
+                                                               int32_t{0},
+                                                               int32_t{32})},
+                                          int32_t{128});
+              }
+            } else {
+              if (bool{PaddingTask::isSelected(params, state)}) {
+                PaddingTask paddingTask{params, state, int32_t{10}};
+                paddingTask.execute(params, state);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+extern "C" __global__ void
+bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_bA32_bB32_t128x64x256u2_s4_et128x64_m128x64x32_cga1x1x1_16dp256b_rM_TN_transOut_schedS_biasM_relu2_bN_ldgsts_ldgstsSf_rgTma_clmp_dynB_sm100fGetSmemSize(
+  int32_t* outPtr) {
+  int32_t size{0};
+  size = (size + 1023) / 1024 * 1024;
+  size += static_cast<int32_t>(sizeof(SmemBufferSmem));
+  size = (size + 1023) / 1024 * 1024;
+  size += static_cast<int32_t>(sizeof(SmemASmem));
+  size = (size + 1023) / 1024 * 1024;
+  size += static_cast<int32_t>(sizeof(SmemBSmem));
+  size = (size + 1023) / 1024 * 1024;
+  size += static_cast<int32_t>(sizeof(SmemSfASmem));
+  size = (size + 1023) / 1024 * 1024;
+  size += static_cast<int32_t>(sizeof(GmemC0Smem));
+  size += 16;
+  size = (size + 0) / 1 * 1;
+  size += static_cast<int32_t>(sizeof(SmemASmemBarrier));
+  size = (size + 0) / 1 * 1;
+  size += static_cast<int32_t>(sizeof(SmemBSmemBarrier));
+  size = (size + 0) / 1 * 1;
+  size += static_cast<int32_t>(sizeof(SmemSfASmemBarrier));
+  size = (size + 0) / 1 * 1;
+  size += static_cast<int32_t>(sizeof(TmemSfASmemBarrier));
+  size = (size + 0) / 1 * 1;
+  size += static_cast<int32_t>(sizeof(Mma0SmemBarrier));
+  outPtr[0] = size;
+}
+
+} // namespace batchedGemm
