@@ -50,7 +50,11 @@ def gen_fused_moe_worker_process(temp_dir):
     assert symlink_path.is_symlink(), f"Expected {symlink_path} to be a symlink"
 
     # Verify we can read a header through the symlink
-    headers = [p for p in symlink_path.iterdir() if p.is_file()]
+    headers = [
+        p
+        for p in symlink_path.iterdir()
+        if p.is_file() and p.suffix in (".h", ".cuh", ".hpp")
+    ]
     assert len(headers) > 0, f"No headers found through symlink at {symlink_path}"
     for header in headers:
         content = header.read_bytes()
