@@ -621,3 +621,141 @@ void rope_quantize_append_paged_kv_cache(
     });
   });
 }
+
+/*!
+ * TVM FFI binding for fused RoPE + paged KV cache append kernel (GQA/MHA only).
+ */
+void rope_append_paged_kv_cache(TensorView q_rope_in, TensorView k_rope_in, TensorView q_nope_in,
+                                TensorView k_nope_in, TensorView v_in, TensorView q_rope_out,
+                                TensorView q_nope_out, TensorView cos_sin_cache, TensorView pos_ids,
+                                TensorView k_cache, TensorView v_cache, TensorView kv_indices,
+                                TensorView kv_indptr, TensorView kv_last_page_len,
+                                TensorView batch_indices, TensorView positions,
+                                int64_t kv_layout_code, int64_t page_size, double kv_scale,
+                                bool interleave, bool enable_pdl) {
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(q_rope_in);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_rope_in);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(q_nope_in);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_nope_in);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(v_in);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(q_rope_out);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(q_nope_out);
+  CHECK_INPUT(cos_sin_cache);
+  CHECK_INPUT(pos_ids);
+  CHECK_CUDA(k_cache);
+  CHECK_CUDA(v_cache);
+  CHECK_INPUT(kv_indices);
+  CHECK_INPUT(kv_indptr);
+  CHECK_INPUT(kv_last_page_len);
+  CHECK_INPUT(batch_indices);
+  CHECK_INPUT(positions);
+
+  CHECK_DIM(3, q_rope_in);
+  CHECK_DIM(3, k_rope_in);
+  CHECK_DIM(3, q_nope_in);
+  CHECK_DIM(3, k_nope_in);
+  CHECK_DIM(3, v_in);
+  CHECK_DIM(3, q_rope_out);
+  CHECK_DIM(3, q_nope_out);
+  CHECK_DIM(4, k_cache);
+  CHECK_DIM(4, v_cache);
+  CHECK_DIM(1, kv_last_page_len);
+
+  uint32_t rope_dim = q_rope_in.size(-1);
+  uint32_t no_rope_dim = q_nope_in.size(-1);
+  uint32_t head_dim = rope_dim + no_rope_dim;
+  uint32_t nnz = q_rope_in.size(0);
+  uint32_t num_qo_heads = q_rope_in.size(1);
+  uint32_t num_kv_heads = k_rope_in.size(1);
+  uint32_t batch_size = kv_indptr.size(0) - 1;
+  QKVLayout kv_layout = QKVLayout(kv_layout_code);
+
+  TVM_FFI_ICHECK_EQ(k_rope_in.size(-1), rope_dim);
+  TVM_FFI_ICHECK_EQ(k_nope_in.size(-1), no_rope_dim);
+  TVM_FFI_ICHECK_EQ(k_nope_in.size(1), num_kv_heads);
+  TVM_FFI_ICHECK_EQ(v_in.size(0), nnz);
+  TVM_FFI_ICHECK_EQ(v_in.size(1), num_kv_heads);
+  TVM_FFI_ICHECK_EQ(v_in.size(2), head_dim);
+  TVM_FFI_ICHECK_EQ(q_rope_out.size(0), nnz);
+  TVM_FFI_ICHECK_EQ(q_rope_out.size(1), num_qo_heads);
+  TVM_FFI_ICHECK_EQ(q_rope_out.size(2), rope_dim);
+  TVM_FFI_ICHECK_EQ(q_nope_out.size(0), nnz);
+  TVM_FFI_ICHECK_EQ(q_nope_out.size(1), num_qo_heads);
+  TVM_FFI_ICHECK_EQ(q_nope_out.size(2), no_rope_dim);
+  TVM_FFI_ICHECK_EQ(k_cache.size(0), v_cache.size(0));
+  TVM_FFI_ICHECK_EQ(k_cache.size(1), v_cache.size(1));
+  TVM_FFI_ICHECK_EQ(k_cache.size(2), v_cache.size(2));
+  TVM_FFI_ICHECK_EQ(k_cache.size(3), v_cache.size(3));
+  TVM_FFI_ICHECK_EQ(kv_last_page_len.size(0), batch_size);
+
+  TVM_FFI_ICHECK(q_rope_in.dtype() == dl_float16 || q_rope_in.dtype() == dl_bfloat16)
+      << "Input dtype must be float16 or bfloat16";
+  TVM_FFI_ICHECK_EQ(q_rope_in.dtype(), k_rope_in.dtype());
+  TVM_FFI_ICHECK_EQ(q_rope_in.dtype(), q_nope_in.dtype());
+  TVM_FFI_ICHECK_EQ(q_rope_in.dtype(), k_nope_in.dtype());
+  TVM_FFI_ICHECK_EQ(q_rope_in.dtype(), v_in.dtype());
+  TVM_FFI_ICHECK_EQ(q_rope_in.dtype(), q_rope_out.dtype());
+  TVM_FFI_ICHECK_EQ(q_rope_in.dtype(), q_nope_out.dtype());
+  TVM_FFI_ICHECK_EQ(k_cache.dtype(), v_cache.dtype());
+  TVM_FFI_ICHECK(k_cache.dtype() == dl_float16 || k_cache.dtype() == dl_bfloat16 ||
+                 k_cache.dtype() == dl_float8_e4m3fn || k_cache.dtype() == dl_float8_e5m2)
+      << "Cache dtype must be float16, bfloat16, float8_e4m3fn, or float8_e5m2";
+
+  const uint32_t q_rope_in_stride_n = q_rope_in.stride(0);
+  const uint32_t q_rope_in_stride_h = q_rope_in.stride(1);
+  const uint32_t q_nope_in_stride_n = q_nope_in.stride(0);
+  const uint32_t q_nope_in_stride_h = q_nope_in.stride(1);
+  const uint32_t q_rope_out_stride_n = q_rope_out.stride(0);
+  const uint32_t q_rope_out_stride_h = q_rope_out.stride(1);
+  const uint32_t q_nope_out_stride_n = q_nope_out.stride(0);
+  const uint32_t q_nope_out_stride_h = q_nope_out.stride(1);
+  const uint32_t k_rope_in_stride = k_rope_in.stride(0);
+  const uint32_t k_rope_in_stride_h = k_rope_in.stride(1);
+  const uint32_t k_nope_in_stride = k_nope_in.stride(0);
+  const uint32_t k_nope_in_stride_h = k_nope_in.stride(1);
+  const uint32_t v_in_stride = v_in.stride(0);
+  const uint32_t v_in_stride_h = v_in.stride(1);
+
+  ffi::CUDADeviceGuard device_guard(q_rope_in.device().device_id);
+  const cudaStream_t stream = get_stream(q_rope_in.device());
+
+  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(q_rope_in.dtype(), c_type, [&] {
+    return DISPATCH_DLPACK_IDTYPE_TO_CTYPE(pos_ids.dtype(), c_idtype, [&] {
+      auto launch = [&](auto cache_dtype_tag) -> bool {
+        using c_cache_type = decltype(cache_dtype_tag);
+        auto k_strides = k_cache.strides();
+        paged_kv_t<c_cache_type, int32_t> paged_kv(
+            num_kv_heads, page_size, head_dim, batch_size, kv_layout,
+            static_cast<c_cache_type*>(k_cache.data_ptr()),
+            static_cast<c_cache_type*>(v_cache.data_ptr()), k_strides.data(),
+            static_cast<int32_t*>(kv_indices.data_ptr()),
+            static_cast<int32_t*>(kv_indptr.data_ptr()),
+            static_cast<int32_t*>(kv_last_page_len.data_ptr()));
+        cudaError_t status = RopeAppendPagedKVCache(
+            static_cast<c_type*>(q_rope_in.data_ptr()), static_cast<c_type*>(k_rope_in.data_ptr()),
+            static_cast<c_type*>(q_nope_in.data_ptr()), static_cast<c_type*>(k_nope_in.data_ptr()),
+            static_cast<c_type*>(v_in.data_ptr()), static_cast<c_type*>(q_rope_out.data_ptr()),
+            static_cast<c_type*>(q_nope_out.data_ptr()), paged_kv,
+            static_cast<int32_t*>(batch_indices.data_ptr()),
+            static_cast<int32_t*>(positions.data_ptr()),
+            static_cast<float*>(cos_sin_cache.data_ptr()),
+            static_cast<c_idtype*>(pos_ids.data_ptr()), nnz, num_qo_heads, num_kv_heads, rope_dim,
+            no_rope_dim, q_rope_in_stride_n, q_rope_in_stride_h, q_nope_in_stride_n,
+            q_nope_in_stride_h, q_rope_out_stride_n, q_rope_out_stride_h, q_nope_out_stride_n,
+            q_nope_out_stride_h, k_rope_in_stride, k_rope_in_stride_h, k_nope_in_stride,
+            k_nope_in_stride_h, v_in_stride, v_in_stride_h, kv_scale, interleave, enable_pdl,
+            stream);
+        TVM_FFI_ICHECK(status == cudaSuccess)
+            << "RopeAppendPagedKVCache failed with error code " << cudaGetErrorString(status);
+        return true;
+      };
+
+      if (k_cache.dtype() == dl_float16 || k_cache.dtype() == dl_bfloat16) {
+        return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(k_cache.dtype(), c_cache_type,
+                                                   [&] { return launch(c_cache_type{}); });
+      }
+      return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP8(k_cache.dtype(), c_cache_type,
+                                                [&] { return launch(c_cache_type{}); });
+    });
+  });
+}

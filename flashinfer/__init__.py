@@ -149,6 +149,7 @@ from .rope import apply_rope as apply_rope
 from .rope import apply_rope_inplace as apply_rope_inplace
 from .rope import apply_rope_pos_ids as apply_rope_pos_ids
 from .rope import apply_rope_pos_ids_inplace as apply_rope_pos_ids_inplace
+from .rope import rope_append_paged_kv_cache as rope_append_paged_kv_cache
 from .rope import apply_rope_with_cos_sin_cache as apply_rope_with_cos_sin_cache
 from .rope import (
     apply_rope_with_cos_sin_cache_inplace as apply_rope_with_cos_sin_cache_inplace,

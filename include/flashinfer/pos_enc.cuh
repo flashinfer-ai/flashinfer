@@ -54,6 +54,29 @@ struct RopeQuantizeAppendPagedKVCacheParams {
   float quant_scale_kv;
 };
 
+struct RopeAppendPagedKVCacheParams {
+  uint32_t nnz;
+  uint32_t num_qo_heads;
+  uint32_t num_kv_heads;
+  uint32_t rope_dim;
+  uint32_t no_rope_dim;
+  size_t q_rope_in_stride_n;
+  size_t q_rope_in_stride_h;
+  size_t q_nope_in_stride_n;
+  size_t q_nope_in_stride_h;
+  size_t q_rope_out_stride_n;
+  size_t q_rope_out_stride_h;
+  size_t q_nope_out_stride_n;
+  size_t q_nope_out_stride_h;
+  size_t k_rope_in_stride;
+  size_t k_rope_in_stride_h;
+  size_t k_nope_in_stride;
+  size_t k_nope_in_stride_h;
+  size_t v_in_stride;
+  size_t v_in_stride_h;
+  float kv_scale;
+};
+
 /*!
  * \brief An enumeration class that defines different modes for applying RoPE
  *   (Rotary Positional Embeddings).
@@ -1029,6 +1052,194 @@ __global__ void RopeQuantizeAppendPagedKVCacheKernel(
 #endif
 }
 
+/*!
+ * \brief CUDA kernel to apply RoPE to Q/K and append K/V to paged cache.
+ *
+ * This stage-1 kernel keeps Q outputs in the input dtype while allowing the
+ * paged KV cache to use its own dtype (e.g. FP8).
+ */
+template <bool interleave, uint32_t vec_size, uint32_t bdx, typename DType, typename RoPEIdType,
+          typename PagedKVIdType, typename CacheType>
+__global__ void RopeAppendPagedKVCacheKernel(
+    DType* q_rope_in, DType* k_rope_in, DType* q_nope_in, DType* k_nope_in, DType* v_in,
+    DType* q_rope_out, DType* q_nope_out, paged_kv_t<CacheType, PagedKVIdType> paged_kv,
+    PagedKVIdType* __restrict__ batch_indices, PagedKVIdType* __restrict__ positions,
+    float* __restrict__ cos_sin_cache, RoPEIdType* __restrict__ pos_ids,
+    const RopeAppendPagedKVCacheParams params) {
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.wait;");
+#endif
+  uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y;
+  uint32_t by = blockIdx.y;
+  uint32_t bdy = blockDim.y;
+
+  const uint32_t nnz = params.nnz;
+  const uint32_t num_qo_heads = params.num_qo_heads;
+  const uint32_t num_kv_heads = params.num_kv_heads;
+  const uint32_t rope_dim = params.rope_dim;
+  const uint32_t no_rope_dim = params.no_rope_dim;
+  const size_t q_rope_in_stride_n = params.q_rope_in_stride_n;
+  const size_t q_rope_in_stride_h = params.q_rope_in_stride_h;
+  const size_t q_nope_in_stride_n = params.q_nope_in_stride_n;
+  const size_t q_nope_in_stride_h = params.q_nope_in_stride_h;
+  const size_t q_rope_out_stride_n = params.q_rope_out_stride_n;
+  const size_t q_rope_out_stride_h = params.q_rope_out_stride_h;
+  const size_t q_nope_out_stride_n = params.q_nope_out_stride_n;
+  const size_t q_nope_out_stride_h = params.q_nope_out_stride_h;
+  const size_t k_rope_in_stride = params.k_rope_in_stride;
+  const size_t k_rope_in_stride_h = params.k_rope_in_stride_h;
+  const size_t k_nope_in_stride = params.k_nope_in_stride;
+  const size_t k_nope_in_stride_h = params.k_nope_in_stride_h;
+  const size_t v_in_stride = params.v_in_stride;
+  const size_t v_in_stride_h = params.v_in_stride_h;
+  const float kv_scale = params.kv_scale;
+  constexpr bool kNeedsScale =
+      std::is_same_v<CacheType, __nv_fp8_e4m3> || std::is_same_v<CacheType, __nv_fp8_e5m2>;
+
+  uint32_t rope_chunk_size = rope_dim;
+  uint32_t rope_chunks = (rope_dim + rope_chunk_size - 1) / rope_chunk_size;
+  uint32_t no_rope_chunks = (no_rope_dim + rope_chunk_size - 1) / rope_chunk_size;
+
+  uint32_t q_rope_end = num_qo_heads * rope_chunks;
+  uint32_t k_rope_end = q_rope_end + num_kv_heads * rope_chunks;
+  uint32_t k_nope_end = k_rope_end + num_kv_heads * no_rope_chunks;
+
+  vec_t<float, vec_size> cos, sin;
+  if (bx * bdy + ty < nnz) {
+    const uint32_t idx = bx * bdy + ty;
+    const RoPEIdType pos = pos_ids[idx];
+
+    uint32_t page_iter, entry_idx;
+    paged_kv.page_size.divmod(
+        paged_kv.indptr[batch_indices[idx]] * paged_kv.page_size + positions[idx], page_iter,
+        entry_idx);
+
+    const int half_rope_dim = rope_dim / 2;
+    if ((tx * vec_size < rope_dim) && (by < k_rope_end)) {
+      int sin_offset = rope_dim / 2;
+      int vec_idx;
+      if constexpr (interleave) {
+        vec_idx = (tx * vec_size) / 2;
+      } else {
+        vec_idx = (tx * vec_size) % half_rope_dim;
+      }
+      cos.load(cos_sin_cache + (pos * rope_dim) + vec_idx);
+      sin.load(cos_sin_cache + (pos * rope_dim) + (sin_offset + vec_idx));
+    }
+
+    if (by < q_rope_end) {
+      uint32_t q_head_idx = by / rope_chunks;
+      uint32_t rope_chunk_idx = by % rope_chunks;
+      uint32_t elem_offset = rope_chunk_idx * rope_chunk_size;
+
+      DType* q_rope_in_ptr =
+          q_rope_in + get_elem_offset_impl(idx, q_head_idx, elem_offset, q_rope_in_stride_n,
+                                           q_rope_in_stride_h);
+      DType* q_rope_out_ptr =
+          q_rope_out + get_elem_offset_impl(idx, q_head_idx, elem_offset, q_rope_out_stride_n,
+                                            q_rope_out_stride_h);
+
+      vec_t<float, vec_size> q_rope_vec;
+      if constexpr (interleave) {
+        q_rope_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(
+            q_rope_in_ptr, cos, sin, rope_dim);
+      } else {
+        q_rope_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(q_rope_in_ptr, cos, sin, rope_dim);
+      }
+      q_rope_vec.cast_store(q_rope_out_ptr + tx * vec_size);
+
+    } else if (by < k_rope_end) {
+      uint32_t k_head_idx = (by - q_rope_end) / rope_chunks;
+      uint32_t rope_chunk_idx = (by - q_rope_end) % rope_chunks;
+      uint32_t elem_offset = rope_chunk_idx * rope_chunk_size;
+
+      DType* k_rope_in_ptr = k_rope_in + get_elem_offset_impl(idx, k_head_idx, elem_offset,
+                                                              k_rope_in_stride, k_rope_in_stride_h);
+
+      vec_t<float, vec_size> k_rope_vec;
+      if constexpr (interleave) {
+        k_rope_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(
+            k_rope_in_ptr, cos, sin, rope_dim);
+      } else {
+        k_rope_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(k_rope_in_ptr, cos, sin, rope_dim);
+      }
+      if constexpr (kNeedsScale) {
+#pragma unroll
+        for (uint32_t i = 0; i < vec_size; ++i) {
+          k_rope_vec[i] = k_rope_vec[i] * kv_scale;
+        }
+      }
+      CacheType* k_ptr = paged_kv.get_k_ptr(page_iter, k_head_idx, entry_idx, tx * vec_size);
+      k_rope_vec.cast_store(k_ptr);
+
+    } else if (by < k_nope_end) {
+      uint32_t k_head_idx = (by - k_rope_end) / no_rope_chunks;
+      uint32_t nope_chunk_idx = (by - k_rope_end) % no_rope_chunks;
+      uint32_t elem_offset = nope_chunk_idx * rope_chunk_size;
+
+      DType* k_nope_in_ptr = k_nope_in + get_elem_offset_impl(idx, k_head_idx, elem_offset,
+                                                              k_nope_in_stride, k_nope_in_stride_h);
+
+      vec_t<float, vec_size> k_nope_vec;
+      k_nope_vec.cast_load(k_nope_in_ptr + tx * vec_size);
+      if constexpr (kNeedsScale) {
+#pragma unroll
+        for (uint32_t i = 0; i < vec_size; ++i) {
+          k_nope_vec[i] = k_nope_vec[i] * kv_scale;
+        }
+      }
+
+      CacheType* k_ptr = paged_kv.get_k_ptr(page_iter, k_head_idx, entry_idx,
+                                            rope_dim + elem_offset + tx * vec_size);
+      k_nope_vec.cast_store(k_ptr);
+
+    } else if (by < k_nope_end + num_kv_heads) {
+      uint32_t kv_head_idx = by - k_nope_end;
+      DType* v_in_ptr =
+          v_in + get_elem_offset_impl(idx, kv_head_idx, 0, v_in_stride, v_in_stride_h);
+      uint32_t head_dim_total = rope_dim + no_rope_dim;
+      uint32_t v_chunks = (head_dim_total + rope_chunk_size - 1) / rope_chunk_size;
+#pragma unroll 1
+      for (uint32_t j = 0; j < v_chunks; ++j) {
+        uint32_t v_elem_offset = j * rope_chunk_size;
+        if (v_elem_offset + tx * vec_size < head_dim_total) {
+          vec_t<float, vec_size> v_vec;
+          v_vec.cast_load(v_in_ptr + v_elem_offset + tx * vec_size);
+          if constexpr (kNeedsScale) {
+#pragma unroll
+            for (uint32_t i = 0; i < vec_size; ++i) {
+              v_vec[i] = v_vec[i] * kv_scale;
+            }
+          }
+          CacheType* v_ptr =
+              paged_kv.get_v_ptr(page_iter, kv_head_idx, entry_idx, v_elem_offset + tx * vec_size);
+          v_vec.cast_store(v_ptr);
+        }
+      }
+
+    } else {
+      uint32_t q_nope_start = k_nope_end + num_kv_heads;
+      uint32_t q_head_idx = (by - q_nope_start) / no_rope_chunks;
+      uint32_t nope_chunk_idx = (by - q_nope_start) % no_rope_chunks;
+      uint32_t elem_offset = nope_chunk_idx * rope_chunk_size;
+
+      DType* q_nope_in_ptr =
+          q_nope_in + get_elem_offset_impl(idx, q_head_idx, elem_offset, q_nope_in_stride_n,
+                                           q_nope_in_stride_h);
+      DType* q_nope_out_ptr =
+          q_nope_out + get_elem_offset_impl(idx, q_head_idx, elem_offset, q_nope_out_stride_n,
+                                            q_nope_out_stride_h);
+
+      vec_t<float, vec_size> q_nope_vec;
+      q_nope_vec.cast_load(q_nope_in_ptr + tx * vec_size);
+      q_nope_vec.cast_store(q_nope_out_ptr + tx * vec_size);
+    }
+  }
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
+}
+
 template <typename DType, typename IdType, typename QuantType>
 cudaError_t RopeQuantize(
     DType* q_rope_in, DType* k_rope_in, DType* q_nope_in, DType* k_nope_in, QuantType* q_rope_out,
@@ -1188,6 +1399,80 @@ cudaError_t RopeQuantizeAppendPagedKVCache(
     params.v_in_stride_h = v_in_stride_h;
     params.quant_scale_q = quant_scale_q;
     params.quant_scale_kv = quant_scale_kv;
+
+    FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
+        &config, kernel, q_rope_in, k_rope_in, q_nope_in, k_nope_in, v_in, q_rope_out, q_nope_out,
+        paged_kv, batch_indices, positions, cos_sin_cache, pos_ids, params));
+  });
+
+  return cudaSuccess;
+}
+
+/*!
+ * \brief Host function to apply RoPE and append K/V to paged cache (GQA/MHA).
+ */
+template <typename DType, typename RoPEIdType, typename PagedKVIdType, typename CacheType>
+cudaError_t RopeAppendPagedKVCache(
+    DType* q_rope_in, DType* k_rope_in, DType* q_nope_in, DType* k_nope_in, DType* v_in,
+    DType* q_rope_out, DType* q_nope_out, paged_kv_t<CacheType, PagedKVIdType> paged_kv,
+    PagedKVIdType* batch_indices, PagedKVIdType* positions, float* cos_sin_cache,
+    RoPEIdType* pos_ids, uint32_t nnz, uint32_t num_qo_heads, uint32_t num_kv_heads,
+    uint32_t rope_dim, uint32_t no_rope_dim, size_t q_rope_in_stride_n, size_t q_rope_in_stride_h,
+    size_t q_nope_in_stride_n, size_t q_nope_in_stride_h, size_t q_rope_out_stride_n,
+    size_t q_rope_out_stride_h, size_t q_nope_out_stride_n, size_t q_nope_out_stride_h,
+    size_t k_rope_in_stride, size_t k_rope_in_stride_h, size_t k_nope_in_stride,
+    size_t k_nope_in_stride_h, size_t v_in_stride, size_t v_in_stride_h, float kv_scale,
+    bool interleave, bool enable_pdl = false, cudaStream_t stream = nullptr) {
+  DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
+    constexpr uint32_t vec_size = 32 / sizeof(DType);
+    uint32_t bdx = (rope_dim + vec_size - 1) / vec_size;
+    bdx = std::max(1u, bdx);
+    uint32_t num_threads = std::max(128U, bdx);
+    uint32_t bdy = std::max(1u, num_threads / bdx);
+    uint32_t nblks_x = (nnz + bdy - 1) / bdy;
+    uint32_t rope_chunks = 1;
+    uint32_t no_rope_chunks = (no_rope_dim + rope_dim - 1) / rope_dim;
+    uint32_t total_blocks_y = num_qo_heads * rope_chunks + num_kv_heads * rope_chunks +
+                              num_kv_heads * no_rope_chunks + num_kv_heads +
+                              num_qo_heads * no_rope_chunks;
+
+    dim3 nblks(nblks_x, total_blocks_y);
+    dim3 nthrs(bdx, bdy);
+
+    cudaLaunchAttribute attribute[1];
+    attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attribute[0].val.programmaticStreamSerializationAllowed = enable_pdl ? 1 : 0;
+    cudaLaunchConfig_t config;
+    config.gridDim = nblks;
+    config.blockDim = nthrs;
+    config.stream = stream;
+    config.dynamicSmemBytes = 0;
+    config.attrs = attribute;
+    config.numAttrs = 1;
+
+    auto kernel = RopeAppendPagedKVCacheKernel<INTERLEAVE, vec_size, /*bdx=*/1, DType, RoPEIdType,
+                                               PagedKVIdType, CacheType>;
+    RopeAppendPagedKVCacheParams params;
+    params.nnz = nnz;
+    params.num_qo_heads = num_qo_heads;
+    params.num_kv_heads = num_kv_heads;
+    params.rope_dim = rope_dim;
+    params.no_rope_dim = no_rope_dim;
+    params.q_rope_in_stride_n = q_rope_in_stride_n;
+    params.q_rope_in_stride_h = q_rope_in_stride_h;
+    params.q_nope_in_stride_n = q_nope_in_stride_n;
+    params.q_nope_in_stride_h = q_nope_in_stride_h;
+    params.q_rope_out_stride_n = q_rope_out_stride_n;
+    params.q_rope_out_stride_h = q_rope_out_stride_h;
+    params.q_nope_out_stride_n = q_nope_out_stride_n;
+    params.q_nope_out_stride_h = q_nope_out_stride_h;
+    params.k_rope_in_stride = k_rope_in_stride;
+    params.k_rope_in_stride_h = k_rope_in_stride_h;
+    params.k_nope_in_stride = k_nope_in_stride;
+    params.k_nope_in_stride_h = k_nope_in_stride_h;
+    params.v_in_stride = v_in_stride;
+    params.v_in_stride_h = v_in_stride_h;
+    params.kv_scale = kv_scale;
 
     FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
         &config, kernel, q_rope_in, k_rope_in, q_nope_in, k_nope_in, v_in, q_rope_out, q_nope_out,
