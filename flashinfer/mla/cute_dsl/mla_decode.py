@@ -20,6 +20,7 @@ Wraps NVIDIA's CuTe DSL MLA decode kernels (FP16/BF16/FP8) for Blackwell SM100
 and exposes them via a PyTorch API compatible with FlashInfer's MLA backend.
 """
 
+from flashinfer.api_logging import flashinfer_api
 import functools
 from typing import Callable, Optional, Tuple
 
@@ -284,6 +285,7 @@ def _get_compiled_mla_kernel(
 
 
 # TODO: query[..., :kv_lora_rank], do we need to remove such kind of slice and move the logic to call routine in the kernel file.
+@flashinfer_api
 def cute_dsl_mla_decode(
     query: torch.Tensor,
     kv_cache: torch.Tensor,

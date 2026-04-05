@@ -23,6 +23,12 @@ from flashinfer.trtllm_low_latency_gemm import trtllm_low_latency_gemm
 import torch
 
 from ..api_logging import flashinfer_api
+from ..trace.templates.gemm import (
+    mm_bf16_trace,
+    mm_fp8_trace,
+    mm_mxfp8_trace,
+    mm_fp4_trace,
+)
 from ..autotuner import (
     AutoTuner,
     ConstraintSpec,
@@ -330,7 +336,7 @@ def _heuristic_func_mm_bf16(
     common_check=_check_mm_bf16_problem_size,
     heuristic_func=_heuristic_func_mm_bf16,
 )
-@flashinfer_api
+@flashinfer_api(trace=mm_bf16_trace)
 def mm_bf16(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -1442,6 +1448,7 @@ class SegmentGEMMWrapper:
     True
     """
 
+    @flashinfer_api
     def __init__(
         self, float_workspace_buffer: torch.Tensor, backend: str = "auto"
     ) -> None:
@@ -2569,6 +2576,7 @@ def build_cudnn_gemm_with_per_tensor_q_graph_override_shape(
     return graph
 
 
+@flashinfer_api
 def execute_cudnn_gemm_with_per_tensor_q_graph_override_shape(
     graph, a, b, a_scale, b_scale, c_final, workspace, tactic: int = 0
 ):
@@ -2836,6 +2844,7 @@ def build_cudnn_gemm_bf16_graph_override_shape(
     return graph
 
 
+@flashinfer_api
 def execute_cudnn_gemm_bf16_graph_override_shape(
     graph, a, b, c_final, workspace, tactic: int = 0
 ):
@@ -3059,7 +3068,7 @@ def _expand_block_scale_tensor_shape(block_scale_tensor, batch_size):
     return (tuple(block_scale_shape), tuple(block_scale_stride))
 
 
-@flashinfer_api
+@flashinfer_api(trace=mm_fp8_trace)
 def mm_fp8(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -3865,7 +3874,7 @@ def _heuristic_func_mm_mxfp8(
     common_check=_check_mm_mxfp8_problem_size,
     heuristic_func=_heuristic_func_mm_mxfp8,  # result stored in mm_mxfp8.suitable_auto_backends
 )
-@flashinfer_api
+@flashinfer_api(trace=mm_mxfp8_trace)
 def mm_mxfp8(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -4846,7 +4855,7 @@ _MM_MXFP8_TUNING_CONFIG = TuningConfig(
     common_check=_check_mm_fp4_problem_size,
     heuristic_func=_heuristic_func_mm_fp4,  # result stored in mm_fp4.suitable_auto_backends
 )
-@flashinfer_api
+@flashinfer_api(trace=mm_fp4_trace)
 def mm_fp4(
     a: torch.Tensor,
     b: torch.Tensor,
