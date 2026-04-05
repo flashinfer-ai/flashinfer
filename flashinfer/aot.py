@@ -41,9 +41,11 @@ from .jit.attention import (
     gen_batch_prefill_module,
     gen_cudnn_fmha_module,
     gen_fmha_cutlass_sm100a_module,
+    gen_fmha_v2_module,
     gen_single_decode_module,
     gen_single_prefill_module,
     gen_trtllm_gen_fmha_module,
+    gen_trtllm_fmha_v2_sm120_module,
 )
 from .jit.cascade import gen_cascade_module
 from .jit.cpp_ext import get_cuda_version
@@ -208,6 +210,7 @@ def gen_attention(
     has_sm100: bool,
     add_gemma: bool,
     add_oai_oss: bool,
+    has_sm120: bool = False,
 ) -> Iterator[JitSpec]:
     head_dim_ckv = 512
     head_dim_kpe = 64
@@ -368,6 +371,28 @@ def gen_attention(
     if has_sm100:
         yield gen_mla_module()
 
+    # TRT-LLM FMHAv2 (SM90 and SM12x)
+    if has_sm90 or has_sm120:
+        fmha_v2_input_layouts = [
+            "packed_qkv",
+            "contiguous_q_kv",
+            "q_paged_kv_hnd",
+            "q_paged_kv_nhd",
+            "separate_q_k_v",
+        ]
+        for input_layout in fmha_v2_input_layouts:
+            for dtype in f16_dtype_:
+                yield gen_fmha_v2_module(input_layout, dtype)
+            # FP8 with fp16/bf16 output (not supported for separate_q_k_v)
+            if input_layout != "separate_q_k_v":
+                for f8_dtype in f8_dtype_:
+                    for o_dtype in f16_dtype_:
+                        yield gen_fmha_v2_module(input_layout, f8_dtype, o_dtype)
+
+    # TRT-LLM FMHAv2 SM120 (DeepSeek MLA prefill)
+    if has_sm120:
+        yield gen_trtllm_fmha_v2_sm120_module()
+
 
 def gen_xqa(
     input_type_: List[torch.dtype],
@@ -472,6 +497,7 @@ def gen_all_modules(
             has_sm100,
             add_gemma,
             add_oai_oss,
+            has_sm120=has_sm120 or has_sm121,
         )
     )
 
