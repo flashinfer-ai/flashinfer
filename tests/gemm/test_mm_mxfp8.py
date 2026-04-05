@@ -10,7 +10,7 @@ from flashinfer import (
     shuffle_matrix_sf_a,
 )
 from flashinfer.fp8_quantization import mxfp8_quantize
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import get_compute_capability, is_sm12x_supported
 
 
 def _get_min_cosine_sim(
@@ -84,6 +84,9 @@ def _run_mm_mxfp8(
     use_8x4_sf_layout_for_a=False,
 ):
     _skip_if_unsupported(backend)
+    # SM12x only supports swizzled (1D) scale layout across all backends.
+    if is_sm12x_supported(torch.device("cuda")) and not is_sf_swizzled_layout:
+        pytest.skip("SM12x only supports swizzled (1D) scale layout for MXFP8")
     if backend == "trtllm":
         if not is_sf_swizzled_layout:
             pytest.skip("trtllm must have swizzled scales")
