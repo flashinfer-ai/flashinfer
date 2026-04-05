@@ -1755,7 +1755,7 @@ Array<Tensor> trtllm_bf16_moe(Optional<TensorView> const& routing_logits,
 
   auto const num_tokens = hidden_states.size(0);
   auto const hidden_size = hidden_states.size(1);
-  auto const activation = static_cast<ActivationType>(activation_type);
+  auto const activation = validateAndCastActivationType(activation_type);
 
   // Calculate supported tile sizes
   std::vector<int32_t> mSupportedTileN(Bf16MoeLauncher::mSupportedTileNums.begin(),
@@ -1819,7 +1819,7 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
     bool enable_pdl, Array<int64_t> config_index, int64_t activation_type, bool norm_topk_prob) {
   // Basic type validation
   auto dtype = hidden_states.dtype();
-  auto activation = static_cast<ActivationType>(activation_type);
+  auto activation = validateAndCastActivationType(activation_type);
 
   if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3) {
     TVM_FFI_ICHECK_EQ(routing_logits.dtype(), dl_float32)
