@@ -88,17 +88,9 @@ def gen_moe_utils_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR
             / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_deepseek.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/routingDeepSeek/launchMainKernel.cu",
+            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/routingDeepSeek/launchClusterKernel.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/routingDeepSeek/launchCoopKernel.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/routingDeepSeek/launchHistogramKernel.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/routingDeepSeek/launchInitExpertCounts.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/routingDeepSeek/launchOffsetsKernel.cu",
+            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_common.cu",
         ],
         extra_cuda_cflags=nvcc_flags,
         extra_include_paths=[
