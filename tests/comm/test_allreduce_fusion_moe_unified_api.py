@@ -19,7 +19,6 @@ import pytest
 import torch
 import torch.distributed as dist
 
-import flashinfer.comm as comm
 from flashinfer.comm import (
     AllReduceFusionPattern,
     TRTLLMAllReduceFusionWorkspace,
@@ -141,13 +140,14 @@ def _run_moe_finalize_unified_worker(
                 # Reference
                 fc2_f32 = fc2_output.to(torch.float32)
                 expert_reduction = torch.sum(
-                    fc2_f32[expanded_idx_to_permuted_idx]
-                    * scale.unsqueeze(-1).float(),
+                    fc2_f32[expanded_idx_to_permuted_idx] * scale.unsqueeze(-1).float(),
                     dim=1,
                 )
                 torch_before_residual = expert_reduction
                 if has_shared_expert:
-                    torch_before_residual = torch_before_residual + shared_expert_output.float()
+                    torch_before_residual = (
+                        torch_before_residual + shared_expert_output.float()
+                    )
                 torch_before_residual = torch_before_residual * world_size
                 torch_residual = torch_before_residual + residual.float()
                 torch_norm = _rms_norm(
@@ -244,8 +244,8 @@ def _run_moe_finalize_unified_worker(
 @pytest.mark.parametrize(
     "seq_len,top_k,use_shared_expert",
     [
-        (1, 8, True),    # decode: single token
-        (16, 8, True),   # small batch with shared expert (DeepSeek)
+        (1, 8, True),  # decode: single token
+        (16, 8, True),  # small batch with shared expert (DeepSeek)
         (16, 8, False),  # small batch without shared expert
         (128, 4, True),  # larger batch, different top_k
     ],

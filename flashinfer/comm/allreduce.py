@@ -664,12 +664,14 @@ def allreduce_fusion(
                 residual_in=residual_in,
                 rms_gamma=rms_gamma,
                 rms_eps=rms_eps,
-                scale_factor=scale_factor if isinstance(scale_factor, (int, float)) else 1.0,
+                scale_factor=scale_factor
+                if isinstance(scale_factor, (int, float))
+                else 1.0,
                 moe_reduction_device_num_experts=moe_reduction_device_num_experts,
                 moe_reduction_scale_input=moe_reduction_scale_input,
                 moe_reduction_active_experts_token_input=moe_reduction_active_experts_token_input,
                 moe_reduction_token_input=moe_reduction_token_input,
-                layout_code=layout_code,
+                layout_code=layout_code,  # type: ignore[arg-type]
                 moe_allreduce_out=output,
                 residual_out=residual_out,
                 norm_out=norm_out,
