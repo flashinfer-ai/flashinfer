@@ -645,6 +645,10 @@ constexpr uint32_t get_heuristic_num_threads(uint32_t group_size, uint32_t sizeo
     } else {
       return 512U;
     }
+  } else if (group_size == 6U) {
+    // GQA=6 on sm80 otherwise falls back to a 96-thread CTA (bdz=1), which
+    // leaves very little room to hide the decode kernel's memory latency.
+    return 288U;
   } else {
     return 128U;
   }
