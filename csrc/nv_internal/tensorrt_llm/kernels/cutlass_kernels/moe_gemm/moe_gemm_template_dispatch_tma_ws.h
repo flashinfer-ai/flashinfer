@@ -306,9 +306,12 @@ constexpr bool are_tile_shapes_supported_sm120() {
   constexpr auto TileN = size<1>(CtaShape{});
   constexpr auto TileK = size<2>(CtaShape{});
 
-  return (TileM == 128 && TileN == 128 && TileK == 128) ||
+  return (TileM == 128 && TileN == 128 && TileK == 64) ||
+         (TileM == 128 && TileN == 128 && TileK == 128) ||
          (TileM == 128 && TileN == 128 && TileK == 256) ||
+         (TileM == 128 && TileN == 256 && TileK == 64) ||
          (TileM == 128 && TileN == 256 && TileK == 128) ||
+         (TileM == 256 && TileN == 128 && TileK == 64) ||
          (TileM == 256 && TileN == 128 && TileK == 128);
 }
 
