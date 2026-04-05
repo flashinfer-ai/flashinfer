@@ -1729,17 +1729,15 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
   }
 };
 
-Array<Tensor> trtllm_bf16_moe(Optional<TensorView> const& routing_logits,
-                              Optional<TensorView> const& routing_bias,
-                              TensorView const& expert_indices, TensorView const& expert_weights,
-                              TensorView const& hidden_states, TensorView const& gemm1_weights,
-                              TensorView const& gemm2_weights, TensorView output,
-                              int64_t num_experts, int64_t top_k, Optional<int64_t> n_group,
-                              Optional<int64_t> topk_group, int64_t intermediate_size,
-                              int64_t local_expert_offset, int64_t local_num_experts,
-                              Optional<double> routed_scaling_factor, int64_t routing_method_type,
-                              bool use_shuffled_weight, int64_t weight_layout, bool do_finalize,
-                              bool enable_pdl, Array<int64_t> moe_tactic, int64_t activation_type, bool norm_topk_prob) {
+Array<Tensor> trtllm_bf16_moe(
+    Optional<TensorView> const& routing_logits, Optional<TensorView> const& routing_bias,
+    TensorView const& expert_indices, TensorView const& expert_weights,
+    TensorView const& hidden_states, TensorView const& gemm1_weights,
+    TensorView const& gemm2_weights, TensorView output, int64_t num_experts, int64_t top_k,
+    Optional<int64_t> n_group, Optional<int64_t> topk_group, int64_t intermediate_size,
+    int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
+    int64_t routing_method_type, bool use_shuffled_weight, int64_t weight_layout, bool do_finalize,
+    bool enable_pdl, Array<int64_t> moe_tactic, int64_t activation_type, bool norm_topk_prob) {
   // Just some basic type validation first and leave more checks to the launcher
   if (routing_logits.has_value()) {
     TVM_FFI_ICHECK(routing_logits.value().dtype() == dl_float32 ||
