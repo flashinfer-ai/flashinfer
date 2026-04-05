@@ -74,6 +74,7 @@ from .utils import (
     round_up,
     get_compute_capability,
     GPUArchitectureError,
+    prepare_jit_additional_args,
 )
 
 
@@ -731,8 +732,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     jit_args[0],
                     gen_customize_batch_decode_module(*jit_args).build_and_load(),
                 )
+            self._jit_additional_tensor_names = list(jit_args[7])
         else:
             self._jit_module = None
+            self._jit_additional_tensor_names = []
 
         self._kv_layout = kv_layout
         self._float_workspace_buffer = float_workspace_buffer
@@ -1401,7 +1404,19 @@ class BatchDecodeWithPagedKVCacheWrapper:
             ]
 
             if self._jit_module is not None:
-                run_args.extend(list(args))
+                run_args.extend(
+                    prepare_jit_additional_args(
+                        self._jit_additional_tensor_names,
+                        {
+                            "maybe_custom_mask": None,
+                            "maybe_mask_indptr": None,
+                            "maybe_alibi_slopes": _get_cache_alibi_slopes_buf(
+                                q.shape[1], q.device
+                            ),
+                        },
+                        args,
+                    )
+                )
             else:
                 # Extract FP8 scale tensors from *args if q is FP8
                 fp8_scale_q = None
@@ -1468,7 +1483,17 @@ class BatchDecodeWithPagedKVCacheWrapper:
             ]
 
             if self._jit_module is not None:
-                run_args.extend(list(args))
+                run_args.extend(
+                    prepare_jit_additional_args(
+                        self._jit_additional_tensor_names,
+                        {
+                            "maybe_alibi_slopes": _get_cache_alibi_slopes_buf(
+                                q.shape[1], q.device
+                            ),
+                        },
+                        args,
+                    )
+                )
             else:
                 run_args += [
                     _get_cache_alibi_slopes_buf(q.shape[1], q.device),
