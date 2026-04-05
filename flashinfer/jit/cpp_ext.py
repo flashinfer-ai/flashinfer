@@ -235,6 +235,9 @@ def generate_ninja_build_for_op(
 
     cxx = os.environ.get("CXX", "c++")
     nvcc = os.environ.get("FLASHINFER_NVCC", "$cuda_home/bin/nvcc")
+    # Compiler launchers (e.g., sccache, ccache) — empty string when unset
+    cxx_launcher = os.environ.get("FLASHINFER_CXX_LAUNCHER", "")
+    nvcc_launcher = os.environ.get("FLASHINFER_NVCC_LAUNCHER", "")
 
     lines = [
         "ninja_required_version = 1.3",
@@ -242,6 +245,8 @@ def generate_ninja_build_for_op(
         f"cuda_home = {cuda_home}",
         f"cxx = {cxx}",
         f"nvcc = {nvcc}",
+        f"cxx_launcher = {cxx_launcher}",
+        f"nvcc_launcher = {nvcc_launcher}",
         "",
         "common_cflags = " + join_multiline(common_cflags),
         "cflags = " + join_multiline(cflags),
@@ -251,12 +256,12 @@ def generate_ninja_build_for_op(
         "ldflags = " + join_multiline(ldflags),
         "",
         "rule compile",
-        "  command = $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags",
+        "  command = $cxx_launcher $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags",
         "  depfile = $out.d",
         "  deps = gcc",
         "",
         "rule cuda_compile",
-        "  command = $nvcc --generate-dependencies-with-compile --dependency-output $out.d $cuda_cflags -c $in -o $out $cuda_post_cflags",
+        "  command = $nvcc_launcher $nvcc --generate-dependencies-with-compile --dependency-output $out.d $cuda_cflags -c $in -o $out $cuda_post_cflags",
         "  depfile = $out.d",
         "  deps = gcc",
         "",
