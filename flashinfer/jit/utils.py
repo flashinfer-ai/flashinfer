@@ -43,6 +43,14 @@ dtype_map = {
     torch.uint64: "uint64_t",
 }
 
+dtype_map_kv = {
+    torch.float16: "half",
+    torch.bfloat16: "nv_bfloat16",
+    torch.float8_e4m3fn: "__nv_fp8_e4m3",
+    torch.float8_e5m2: "__nv_fp8_e5m2",
+    torch.uint8: "__nv_fp4x2_e2m1",
+}
+
 dtype_cutlass_map = {
     torch.float16: "cutlass::half_t",
     torch.bfloat16: "cutlass::bfloat16_t",
