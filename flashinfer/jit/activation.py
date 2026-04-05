@@ -95,10 +95,17 @@ __device__ __forceinline__ float gelu_tanh(const float& val) {
 }
 """
 
+relu_def_cu_str = r"""
+__device__ __forceinline__ float relu(const float& val) {
+  return val > 0.0f ? val : 0.0f;
+}
+"""
+
 act_func_def_str = {
     "silu": silu_def_cu_str,
     "gelu": gelu_def_cu_str,
     "gelu_tanh": gelu_def_tanh_cu_str,
+    "relu": relu_def_cu_str,
 }
 
 

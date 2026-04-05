@@ -23,6 +23,7 @@ TORCH_COMPILE_FNS = [
     flashinfer.activation.silu_and_mul,
     flashinfer.activation.gelu_and_mul,
     flashinfer.activation.gelu_tanh_and_mul,
+    flashinfer.activation.relu_and_mul,
     flashinfer.cascade.merge_state,
     flashinfer.cascade.merge_state_in_place,
     flashinfer.cascade.merge_states,

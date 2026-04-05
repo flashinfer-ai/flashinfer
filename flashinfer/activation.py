@@ -195,6 +195,47 @@ def gelu_and_mul(
 
 
 @flashinfer_api
+def relu_and_mul(
+    input: torch.Tensor, out: torch.Tensor = None, enable_pdl: Optional[bool] = None
+) -> torch.Tensor:
+    r"""Fused ReLU and Mul operation.
+
+    ``relu(input[..., :hidden_size]) * input[..., hidden_size:]``
+
+    Parameters
+    ----------
+    input: torch.Tensor
+        Input tensor, shape (..., 2 * hidden_size).
+
+    out: Optional[torch.Tensor]
+        The output tensor, if specified, the kernel will update this tensor inplace.
+
+    enable_pdl: bool
+        Whether to enable `programmatic dependent launch
+        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+
+    Returns
+    -------
+    output: torch.Tensor
+        Output tensor, shape (..., hidden_size).
+    """
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(input.device)
+    if input.shape[-1] * input.dtype.itemsize % 16 != 0:
+        raise ValueError("The pointers must be multiple of 16 bytes.")
+    if out is not None:
+        _check_shape(input, out)
+    else:
+        out = torch.empty(
+            input.shape[:-1] + (input.shape[-1] // 2,),
+            device=input.device,
+            dtype=input.dtype,
+        )
+    get_act_and_mul_module("relu").relu_and_mul(out, input, enable_pdl)
+    return out
+
+
+@flashinfer_api
 def silu_and_mul_scaled_nvfp4_experts_quantize(
     a,
     mask,
