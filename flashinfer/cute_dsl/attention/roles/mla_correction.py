@@ -555,20 +555,20 @@ class MLACorrectionRole:
 
                     k_tile_count = k_tile_count - 1
                     if k_tile_count == 0:
-                        tidx = common_params.tidx % (
-                            self.num_compute_warps * self.threads_per_warp
-                        )
-                        if cutlass.const_expr(self.warps_in_n == 2):
-                            common_params.smem_exchange[tidx] = row_sum
-                            self.epilogue_exchange_sync_bar.wait()
-                            row_sum = (
-                                row_sum
-                                + common_params.smem_exchange[
-                                    (tidx + 64)
-                                    % (self.num_compute_warps * self.threads_per_warp)
-                                ]
-                            )
                         if cutlass.const_expr(self.per_iteration_mma_o):
+                            tidx = common_params.tidx % (
+                                self.num_compute_warps * self.threads_per_warp
+                            )
+                            if cutlass.const_expr(self.warps_in_n == 2):
+                                common_params.smem_exchange[tidx] = row_sum
+                                self.epilogue_exchange_sync_bar.wait()
+                                row_sum = (
+                                    row_sum
+                                    + common_params.smem_exchange[
+                                        (tidx + 64)
+                                        % (self.num_compute_warps * self.threads_per_warp)
+                                    ]
+                                )
                             for iter_n in cutlass.range_constexpr(self.iterations_pv_n):
                                 mma_o_handle = mma_o_consumer.wait_and_advance()
                                 self._epilogue_one_iter(
