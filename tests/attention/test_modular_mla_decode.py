@@ -200,6 +200,77 @@ def test_modular_mla_decode_variable_seq_len(batch_size, seq_len_k, page_size, d
     torch.testing.assert_close(out, ref_out_cast, atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("seq_len_k", [128, 512, 2048])
+@pytest.mark.parametrize("page_size", [64, 128])
+@pytest.mark.parametrize("enable_pdl", [False])
+def test_modular_mla_decode_fp8(batch_size, seq_len_k, page_size, enable_pdl):
+    """Test modular FP8 MLA decode kernel against FP32 reference."""
+    skip_if_unsupported()
+
+    from flashinfer.cute_dsl.attention.wrappers.batch_mla import cute_dsl_mla_decode
+
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+
+    num_heads = 128
+    latent_dim = 512
+    rope_dim = 64
+    q_len = 1
+    softmax_scale = 1.0 / (latent_dim**0.5)
+    output_scale = 1.0
+    D_qk = latent_dim + rope_dim
+
+    query = (
+        torch.randn(
+            batch_size, q_len, num_heads, D_qk, dtype=torch.float16, device=device
+        )
+        * 0.1
+    ).to(torch.float8_e4m3fn)
+
+    num_pages_per_batch = (seq_len_k + page_size - 1) // page_size
+    total_pages = num_pages_per_batch * batch_size + 10
+    kv_cache = (
+        torch.randn(total_pages, page_size, D_qk, dtype=torch.float16, device=device)
+        * 0.1
+    ).to(torch.float8_e4m3fn)
+
+    block_tables = torch.zeros(
+        batch_size, num_pages_per_batch, dtype=torch.int32, device=device
+    )
+    for b in range(batch_size):
+        for p in range(num_pages_per_batch):
+            block_tables[b, p] = b * num_pages_per_batch + p
+
+    seq_lens = torch.full((batch_size,), seq_len_k, dtype=torch.int32, device=device)
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device=device)
+
+    out = cute_dsl_mla_decode(
+        query=query, kv_cache=kv_cache, workspace_buffer=workspace_buffer,
+        kv_lora_rank=latent_dim, qk_rope_head_dim=rope_dim,
+        block_tables=block_tables, seq_lens=seq_lens, max_seq_len=seq_len_k,
+        softmax_scale=softmax_scale, output_scale=output_scale,
+        enable_pdl=enable_pdl,
+    )
+
+    assert out.dtype == torch.bfloat16
+    assert out.shape == (batch_size, q_len, num_heads, latent_dim)
+
+    kv_flat = kv_cache.reshape(-1, D_qk).to(torch.float32)
+    c_latent_ref = kv_flat[:, :latent_dim]
+    c_rope_ref = kv_flat[:, latent_dim:]
+    q_nope = query[..., :latent_dim].to(torch.float32)
+    q_rope_q = query[..., latent_dim:].to(torch.float32)
+
+    ref_out = torch_reference_mla(
+        q_nope, q_rope_q, c_latent_ref, c_rope_ref,
+        block_tables, seq_lens, softmax_scale, output_scale, page_size,
+    )
+    torch.testing.assert_close(
+        out.to(torch.float32), ref_out.to(torch.float32), atol=0.1, rtol=0.1
+    )
+
+
 @pytest.mark.parametrize("batch_size", [1, 4, 32])
 @pytest.mark.parametrize("seq_len_k", [128, 512, 2048, 8192])
 @pytest.mark.parametrize("page_size", [32, 128])
@@ -228,6 +299,69 @@ def test_modular_vs_monolithic(batch_size, seq_len_k, page_size, dtype):
     num_pages_per_batch = (seq_len_k + page_size - 1) // page_size
     total_pages = num_pages_per_batch * batch_size + 10
     kv_cache = torch.randn(total_pages, page_size, D_qk, dtype=dtype, device=device)
+
+    block_tables = torch.zeros(
+        batch_size, num_pages_per_batch, dtype=torch.int32, device=device
+    )
+    for b in range(batch_size):
+        for p in range(num_pages_per_batch):
+            block_tables[b, p] = b * num_pages_per_batch + p
+
+    seq_lens = torch.full((batch_size,), seq_len_k, dtype=torch.int32, device=device)
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device=device)
+
+    out_mono = monolithic(
+        query=query, kv_cache=kv_cache, workspace_buffer=workspace_buffer,
+        kv_lora_rank=latent_dim, qk_rope_head_dim=rope_dim,
+        block_tables=block_tables, seq_lens=seq_lens, max_seq_len=seq_len_k,
+        softmax_scale=softmax_scale, is_var_seq=False,
+    )
+    out_mod = modular(
+        query=query, kv_cache=kv_cache, workspace_buffer=workspace_buffer,
+        kv_lora_rank=latent_dim, qk_rope_head_dim=rope_dim,
+        block_tables=block_tables, seq_lens=seq_lens, max_seq_len=seq_len_k,
+        softmax_scale=softmax_scale, is_var_seq=False,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(out_mod, out_mono, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("seq_len_k", [128, 512, 2048])
+@pytest.mark.parametrize("page_size", [64, 128])
+def test_modular_vs_monolithic_fp8(batch_size, seq_len_k, page_size):
+    """Cross-validate modular FP8 MLA decode against the monolithic FP8 kernel."""
+    skip_if_unsupported()
+
+    from flashinfer.cute_dsl.attention.wrappers.batch_mla import (
+        cute_dsl_mla_decode as modular,
+    )
+    from flashinfer.mla.cute_dsl import cute_dsl_mla_decode as monolithic
+
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+
+    num_heads = 128
+    latent_dim = 512
+    rope_dim = 64
+    q_len = 1
+    softmax_scale = 1.0 / (latent_dim**0.5)
+    D_qk = latent_dim + rope_dim
+
+    query = (
+        torch.randn(
+            batch_size, q_len, num_heads, D_qk, dtype=torch.float16, device=device
+        )
+        * 0.1
+    ).to(torch.float8_e4m3fn)
+
+    num_pages_per_batch = (seq_len_k + page_size - 1) // page_size
+    total_pages = num_pages_per_batch * batch_size + 10
+    kv_cache = (
+        torch.randn(total_pages, page_size, D_qk, dtype=torch.float16, device=device)
+        * 0.1
+    ).to(torch.float8_e4m3fn)
 
     block_tables = torch.zeros(
         batch_size, num_pages_per_batch, dtype=torch.int32, device=device
