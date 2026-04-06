@@ -1,37 +1,20 @@
 # Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
-# Redistribution and use in source and binary forms, with or without
-# modification, are permitted provided that the following conditions are met:
+"""Modular FP8 MLA decode kernel — composes role-based building blocks.
 
-# 1. Redistributions of source code must retain the above copyright notice, this
-# list of conditions and the following disclaimer.
+This is the FP8 variant of the MLA decode kernel. It differs from the FP16
+variant (mla_decode.py) in warp assignments, pipeline topology, and MMA loop
+structure, while sharing compute (softmax) and correction roles.
 
-# 2. Redistributions in binary form must reproduce the above copyright notice,
-# this list of conditions and the following disclaimer in the documentation
-# and/or other materials provided with the distribution.
+Key structural differences from FP16:
+- Two TMA loader warps (K and V) instead of TMA + page-table loaders
+- Separate load_k and load_v pipelines instead of unified load_kv + load_pt
+- Separate SMEM buffers for KC-latent, KC-rope, and VC (no aliasing)
+- mma_o_stage=2 with per-iteration pipeline wait/release
+- QK rope tiler K-dim doubled (128 vs 64), iterations_qk_rope=1
 
-# 3. Neither the name of the copyright holder nor the names of its
-# contributors may be used to endorse or promote products derived from
-# this software without specific prior written permission.
-
-# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-
-"""Modular MLA decode kernel — composes role-based building blocks.
-
-This is the top-level kernel that wires together the modular MLA building blocks
-(config, schedule, mainloop spec, collective builder, roles) into a launchable
-attention kernel. It follows the same pattern as the FMHA prefill kernel in
-prefill.py, but for Multi-Head Latent Attention decode with paged KV cache.
+AI-assisted port from monolithic mla_decode_fp8.py to the modular framework.
 """
 
 from typing import Type, Tuple, Optional
@@ -42,16 +25,16 @@ import cutlass.cute as cute
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.cute.nvgpu.cpasync as cpasync
 import cutlass.utils as utils
+import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from .mla_config import MLAConfig
-from .mla_warp_schedule import MLAWarpSchedule, MLA_DECODE_SCHEDULE
-from .mainloop_spec import MLAMainloopSpec, make_mla_mainloop_spec
-from .collective_builder import build_mla_launch_params
-from .roles.mla_pt_loader import MLAPageTableLoaderRole
-from .roles.mla_loader import MLALoaderRole
-from .roles.mla_mma import MLAMmaRole
+from .mla_warp_schedule import MLAWarpScheduleFP8, MLA_DECODE_FP8_SCHEDULE
+from .mainloop_spec import MLAMainloopSpec, make_mla_fp8_mainloop_spec
+from .collective_builder import build_mla_fp8_launch_params
+from .roles.mla_loader_fp8 import MLAFP8LoaderKRole, MLAFP8LoaderVRole
+from .roles.mla_mma_fp8 import MLAMmaFP8Role
 from .roles.mla_compute import MLAComputeRole
 from .roles.mla_correction import MLACorrectionRole
 from .scheduler.mla_persistent import (
@@ -75,7 +58,6 @@ warnings.filterwarnings(
 )
 warnings.filterwarnings("ignore", category=UserWarning)
 
-
 from .compat import (
     setmaxregister_decrease as _setmaxregister_decrease,
     setmaxregister_increase as _setmaxregister_increase,
@@ -83,22 +65,21 @@ from .compat import (
 )
 
 
-class BlackwellMultiLatentAttentionForward:
-    """Modular MLA decode kernel composing role-based building blocks.
+class BlackwellMultiLatentAttentionForwardFP8:
+    """Modular FP8 MLA decode kernel composing role-based building blocks.
 
-    Follows the same compositional pattern as BlackwellFusedMultiHeadAttentionForward
-    in prefill.py, but for Multi-Head Latent Attention decode with paged KV cache
-    and split-KV reduction.
+    Follows the same compositional pattern as the FP16 MLA decode kernel
+    but uses FP8-specific roles, pipeline topology, and warp schedule.
     """
 
     def __init__(
         self,
         config: MLAConfig,
-        schedule: MLAWarpSchedule | None = None,
+        schedule: MLAWarpScheduleFP8 | None = None,
     ):
         self.config = config
-        self.schedule = schedule if schedule is not None else MLA_DECODE_SCHEDULE
-        self.mainloop = make_mla_mainloop_spec(config, self.schedule)
+        self.schedule = schedule if schedule is not None else MLA_DECODE_FP8_SCHEDULE
+        self.mainloop = make_mla_fp8_mainloop_spec(config, self.schedule)
         (
             self.tmem_ptr_sync_bar,
             self.softmax_exchange_sync_bar,
@@ -136,7 +117,6 @@ class BlackwellMultiLatentAttentionForward:
                 f"or {self.q_dtype} != {self.v_dtype}"
             )
 
-        # Reinterpret contiguous [B, S_q, H, D] as [H, D, S_q, B]
         def _reinterpret_4d(t):
             return cute.make_tensor(
                 t.iterator,
@@ -150,7 +130,6 @@ class BlackwellMultiLatentAttentionForward:
         q_rope = _reinterpret_4d(q_rope)
         o = _reinterpret_4d(o)
 
-        # Reinterpret contiguous [num_pages, page_size, D] as [page_size, D, num_pages]
         def _reinterpret_3d_kv(t):
             return cute.make_tensor(
                 t.iterator,
@@ -163,7 +142,6 @@ class BlackwellMultiLatentAttentionForward:
         c_latent = _reinterpret_3d_kv(c_latent)
         c_rope = _reinterpret_3d_kv(c_rope)
 
-        # Reinterpret contiguous [B, page_count] as [page_count, B]
         page_table = cute.make_tensor(
             page_table.iterator,
             cute.make_layout(
@@ -172,7 +150,6 @@ class BlackwellMultiLatentAttentionForward:
             ),
         )
 
-        # Reinterpret contiguous [B, S_q, H] as [H, S_q, B]
         lse = cute.make_tensor(
             lse.iterator,
             cute.make_layout(
@@ -182,13 +159,8 @@ class BlackwellMultiLatentAttentionForward:
         )
 
         acc_o, acc_lse = self.initialize_workspace(
-            q_latent.shape[0],
-            q_latent.shape[1],
-            q_latent.shape[2],
-            q_latent.shape[3],
-            split_kv,
-            self.config.acc_dtype,
-            workspace,
+            q_latent.shape[0], q_latent.shape[1], q_latent.shape[2],
+            q_latent.shape[3], split_kv, self.config.acc_dtype, workspace,
         )
 
         c_latent_transpose_layout = cute.select(c_latent.layout, mode=[1, 0, 2])
@@ -198,40 +170,30 @@ class BlackwellMultiLatentAttentionForward:
 
         self.mainloop = self.mainloop.resolve(self.q_dtype.width)
 
-        self.pt_loader_role = MLAPageTableLoaderRole(self.config)
-        self.loader_role = MLALoaderRole(self.config)
-        self.mma_role = MLAMmaRole(self.config, self.mainloop)
+        self.loader_k_role = MLAFP8LoaderKRole(self.config)
+        self.loader_v_role = MLAFP8LoaderVRole(self.config)
+        self.mma_role = MLAMmaFP8Role(self.config, self.mainloop)
         self.compute_role = MLAComputeRole(self.config)
         self.compute_role.set_dtypes(self.q_dtype)
         self.compute_role.set_barriers(self.softmax_exchange_sync_bar)
-        self.correction_role = MLACorrectionRole(self.config, v_dtype=self.v_dtype, o_dtype=self.o_dtype)
+        self.correction_role = MLACorrectionRole(
+            self.config, v_dtype=self.v_dtype, o_dtype=self.o_dtype
+        )
         self.correction_role.set_barriers(self.epilogue_exchange_sync_bar)
 
-        lp = build_mla_launch_params(
-            self.mainloop,
-            self.schedule,
-            q_latent,
-            q_rope,
-            c_latent,
-            c_rope,
-            c_latent_transpose,
-            page_table,
-            o,
-            lse,
-            acc_o,
-            acc_lse,
-            self.q_dtype,
-            self.k_dtype,
-            self.v_dtype,
-            self.o_dtype,
+        lp = build_mla_fp8_launch_params(
+            self.mainloop, self.schedule,
+            q_latent, q_rope, c_latent, c_rope, c_latent_transpose,
+            page_table, o, lse, acc_o, acc_lse,
+            self.q_dtype, self.k_dtype, self.v_dtype, self.o_dtype,
         )
         self.shared_storage = lp.SharedStorage
         self.tma_copy_q_bytes = lp.tma_copy_q_bytes
         self.tma_copy_kc_bytes = lp.tma_copy_kc_bytes
+        self.tma_copy_vc_bytes = lp.tma_copy_vc_bytes
 
         tile_sched_params, grid = self._compute_grid(
-            o,
-            split_kv,
+            o, split_kv,
             self.config.cluster_shape_mnk,
             self.config.max_active_clusters,
             self.config.is_persistent,
@@ -239,38 +201,21 @@ class BlackwellMultiLatentAttentionForward:
 
         softmax_scale_log2 = softmax_scale * LOG2_E
         self.split_kv_kernel(
-            lp.qk_tiled_mma,
-            lp.pv_tiled_mma,
-            lp.tma_atom_q_latent,
-            lp.tma_tensor_q_latent,
-            lp.tma_atom_q_rope,
-            lp.tma_tensor_q_rope,
-            lp.tma_atom_c_latent,
-            lp.tma_tensor_c_latent,
-            lp.tma_atom_c_rope,
-            lp.tma_tensor_c_rope,
-            lp.tma_atom_c_latent_transpose,
-            lp.tma_tensor_c_latent_transpose,
-            page_table,
-            o,
-            lse,
-            acc_o,
-            acc_lse,
-            split_kv,
-            cache_seqs,
-            block_split_kvs,
-            softmax_scale_log2,
-            output_scale,
-            lp.q_latent_smem_layout_staged,
-            lp.q_rope_smem_layout_staged,
-            lp.kc_smem_layout_staged,
-            lp.p_smem_layout_staged,
-            lp.vc_smem_layout_staged,
-            lp.kc_smem_layout_for_tma,
+            lp.qk_tiled_mma, lp.pv_tiled_mma,
+            lp.tma_atom_q_latent, lp.tma_tensor_q_latent,
+            lp.tma_atom_q_rope, lp.tma_tensor_q_rope,
+            lp.tma_atom_c_latent, lp.tma_tensor_c_latent,
+            lp.tma_atom_c_rope, lp.tma_tensor_c_rope,
+            lp.tma_atom_c_latent_transpose, lp.tma_tensor_c_latent_transpose,
+            page_table, o, lse, acc_o, acc_lse,
+            split_kv, cache_seqs, block_split_kvs,
+            softmax_scale_log2, output_scale,
+            lp.q_latent_smem_layout_staged, lp.q_rope_smem_layout_staged,
+            lp.kc_latent_smem_layout_staged, lp.kc_rope_smem_layout_staged,
+            lp.p_smem_layout_staged, lp.vc_smem_layout_staged,
+            lp.kc_latent_smem_layout_for_tma, lp.kc_rope_smem_layout_for_tma,
             lp.vc_smem_layout_for_tma,
-            lp.cta_layout_vmnk,
-            tile_sched_params,
-            lp.SharedStorage,
+            lp.cta_layout_vmnk, tile_sched_params, lp.SharedStorage,
         ).launch(
             grid=grid,
             block=[self.schedule.threads_per_cta, 1, 1],
@@ -282,23 +227,12 @@ class BlackwellMultiLatentAttentionForward:
         )
         if cutlass.const_expr(acc_o is not None):
             self.reduction_kernel(
-                o,
-                lse,
-                acc_o,
-                acc_lse,
-                split_kv,
-                cache_seqs,
-                block_split_kvs,
+                o, lse, acc_o, acc_lse, split_kv, cache_seqs, block_split_kvs,
             ).launch(
-                grid=(
-                    q_latent.shape[0],
-                    q_latent.shape[2],
-                    q_latent.shape[3],
-                ),
+                grid=(q_latent.shape[0], q_latent.shape[2], q_latent.shape[3]),
                 block=[
                     self.schedule.threads_per_warp * self.config.num_compute_warps,
-                    1,
-                    1,
+                    1, 1,
                 ],
                 smem=MAX_SPLITS * self.config.acc_dtype.width // 8,
                 stream=stream,
@@ -308,12 +242,15 @@ class BlackwellMultiLatentAttentionForward:
 
     @cute.jit
     def _create_pipelines(self, storage, cta_layout_vmnk):
-        """Create all inter-warp pipelines from the topology and storage barriers."""
         barrier_ptrs = {
             edge.name: getattr(storage, edge.barrier_field_name).data_ptr()
             for edge in self.mainloop.pipeline_topology.edges
         }
-        tx_counts = {"q": self.tma_copy_q_bytes, "kv": self.tma_copy_kc_bytes}
+        tx_counts = {
+            "q": self.tma_copy_q_bytes,
+            "kv": self.tma_copy_kc_bytes,
+            "vc": self.tma_copy_vc_bytes,
+        }
         return self.mainloop.pipeline_topology.create_pipelines(
             barrier_ptrs, tx_counts, self.schedule.threads_per_warp, cta_layout_vmnk,
         )
@@ -345,10 +282,12 @@ class BlackwellMultiLatentAttentionForward:
         output_scale: cutlass.Float32,
         q_latent_smem_layout_staged: cute.ComposedLayout,
         q_rope_smem_layout_staged: cute.ComposedLayout,
-        kc_smem_layout_staged: cute.ComposedLayout,
+        kc_latent_smem_layout_staged: cute.ComposedLayout,
+        kc_rope_smem_layout_staged: cute.ComposedLayout,
         p_smem_layout_staged: cute.ComposedLayout,
         vc_smem_layout_staged: cute.ComposedLayout,
-        kc_smem_layout_for_tma: cute.ComposedLayout,
+        kc_latent_smem_layout_for_tma: cute.ComposedLayout,
+        kc_rope_smem_layout_for_tma: cute.ComposedLayout,
         vc_smem_layout_for_tma: cute.ComposedLayout,
         cta_layout_vmnk: cute.Layout,
         tile_sched_params: MLAStaticTileSchedulerParams,
@@ -380,12 +319,12 @@ class BlackwellMultiLatentAttentionForward:
 
         pipes = self._create_pipelines(storage, cta_layout_vmnk)
         load_q_prod, load_q_cons = pipes["load_q"]
-        load_kv_prod, load_kv_cons = pipes["load_kv"]
+        load_k_prod, load_k_cons = pipes["load_k"]
+        load_v_prod, load_v_cons = pipes["load_v"]
         mma_s_prod, mma_s_cons = pipes["mma_s"]
         p_mma_prod, p_mma_cons = pipes["p_mma"]
         p_cor_prod, p_cor_cons = pipes["p_cor"]
         mma_o_prod, mma_o_cons = pipes["mma_o"]
-        load_pt_prod, load_pt_cons = pipes["load_pt"]
 
         pipeline_init_arrive(
             cluster_shape_mn=self.config.cluster_shape_mnk, is_relaxed=True,
@@ -400,25 +339,33 @@ class BlackwellMultiLatentAttentionForward:
             q_rope_smem_layout_staged.outer,
             swizzle=q_rope_smem_layout_staged.inner,
         )
-        sKC = storage.smem_kc.get_tensor(
-            kc_smem_layout_staged.outer,
-            swizzle=kc_smem_layout_staged.inner,
+        sKC = storage.smem_kc_latent.get_tensor(
+            kc_latent_smem_layout_staged.outer,
+            swizzle=kc_latent_smem_layout_staged.inner,
         )
-        sKC_for_tma = storage.smem_kc.get_tensor(
-            kc_smem_layout_for_tma.outer,
-            swizzle=kc_smem_layout_for_tma.inner,
+        sKC_rope = storage.smem_kc_rope.get_tensor(
+            kc_rope_smem_layout_staged.outer,
+            swizzle=kc_rope_smem_layout_staged.inner,
         )
-        sVC_ptr = cute.recast_ptr(sKC.iterator, vc_smem_layout_staged.inner)
-        sVC = cute.make_tensor(sVC_ptr, vc_smem_layout_staged.outer)
-        sVC_for_tma = cute.make_tensor(sVC_ptr, vc_smem_layout_for_tma.outer)
+        sKC_for_tma = storage.smem_kc_latent.get_tensor(
+            kc_latent_smem_layout_for_tma.outer,
+            swizzle=kc_latent_smem_layout_for_tma.inner,
+        )
+        sKC_rope_for_tma = storage.smem_kc_rope.get_tensor(
+            kc_rope_smem_layout_for_tma.outer,
+            swizzle=kc_rope_smem_layout_for_tma.inner,
+        )
+        sVC = storage.smem_vc.get_tensor(
+            vc_smem_layout_staged.outer,
+            swizzle=vc_smem_layout_staged.inner,
+        )
+        sVC_for_tma = storage.smem_vc.get_tensor(
+            vc_smem_layout_for_tma.outer,
+            swizzle=vc_smem_layout_for_tma.inner,
+        )
         sP = storage.smem_p.get_tensor(
             p_smem_layout_staged.outer,
             swizzle=p_smem_layout_staged.inner,
-        )
-        sPT = storage.smem_page_table.get_tensor(
-            cute.make_layout(
-                (self.config.mma_qk_tiler[1] // 2, self.config.load_pt_stage)
-            )
         )
         softmax_smem_exchange = storage.softmax_smem_exchange.get_tensor(
             cute.make_layout(
@@ -446,51 +393,43 @@ class BlackwellMultiLatentAttentionForward:
             _setmaxregister_decrease(self.schedule.other_reg_num)
 
         # /////////////////////////////////////////////////////////////////////
-        #  Page table loader warp
+        #  K loader warp (Q + K loading)
         # /////////////////////////////////////////////////////////////////////
-        if warp_idx == self.schedule.load_pt_warp_id:
+        if warp_idx == self.schedule.load_tma_k_warp_id:
             _setmaxregister_decrease(self.schedule.other_reg_num)
-            self.pt_loader_role.run(
-                split_kv, cache_seqs, block_split_kvs,
-                load_pt_prod, mPT, sPT, tile_sched_params,
-            )
-
-        # /////////////////////////////////////////////////////////////////////
-        #  TMA loader warp
-        # /////////////////////////////////////////////////////////////////////
-        if warp_idx == self.schedule.load_tma_warp_id:
-            _setmaxregister_decrease(self.schedule.other_reg_num)
-            tma_common_params = SimpleNamespace(
-                mPT=mPT,
-                sPT=sPT,
-            )
+            tma_common_params = SimpleNamespace(mPT=mPT)
             tma_qk_params = SimpleNamespace(
                 tiled_mma_qk=tiled_mma_qk,
                 tma_atom_q_latent=tma_atom_q_latent,
                 tma_atom_q_rope=tma_atom_q_rope,
                 tma_atom_c_latent=tma_atom_c_latent,
                 tma_atom_c_rope=tma_atom_c_rope,
-                mQL=mQL,
-                mQR=mQR,
-                mCL=mCL,
-                mKR=mKR,
-                sQ=sQ,
-                sQ_rope=sQ_rope,
-                sKC=sKC_for_tma,
+                mQL=mQL, mQR=mQR, mCL=mCL, mKR=mKR,
+                sQ=sQ, sQ_rope=sQ_rope,
+                sKC=sKC_for_tma, sKC_rope=sKC_rope_for_tma,
             )
+            self.loader_k_role.run(
+                tma_common_params, tma_qk_params,
+                split_kv, cache_seqs, block_split_kvs,
+                load_q_prod, load_k_prod, tile_sched_params,
+            )
+
+        # /////////////////////////////////////////////////////////////////////
+        #  V loader warp
+        # /////////////////////////////////////////////////////////////////////
+        if warp_idx == self.schedule.load_tma_v_warp_id:
+            _setmaxregister_decrease(self.schedule.other_reg_num)
+            tma_common_params = SimpleNamespace(mPT=mPT)
             tma_v_params = SimpleNamespace(
                 tiled_mma_pv=tiled_mma_pv,
                 tma_atom_c_latent_transpose=tma_atom_c_latent_transpose,
-                mCL=mCL,
-                mKR=mKR,
                 mCLT=mCLT,
                 sVC=sVC_for_tma,
             )
-            self.loader_role.run(
-                tma_common_params, tma_qk_params, tma_v_params,
+            self.loader_v_role.run(
+                tma_common_params, tma_v_params,
                 split_kv, cache_seqs, block_split_kvs,
-                load_q_prod, load_kv_prod, load_pt_cons,
-                tile_sched_params,
+                load_v_prod, tile_sched_params,
             )
 
         # /////////////////////////////////////////////////////////////////////
@@ -504,10 +443,10 @@ class BlackwellMultiLatentAttentionForward:
 
             self.mma_role.run(
                 tiled_mma_qk, tiled_mma_pv,
-                load_q_cons, load_kv_cons,
+                load_q_cons, load_k_cons, load_v_cons,
                 mma_s_prod, p_mma_cons, mma_o_prod,
                 split_kv, cache_seqs, block_split_kvs, tile_sched_params,
-                sQ, sQ_rope, sKC, sP, sVC,
+                sQ, sQ_rope, sKC, sKC_rope, sP, sVC,
                 tmem_ptr, is_leader_cta, mCL.shape[1],
             )
 
@@ -523,6 +462,16 @@ class BlackwellMultiLatentAttentionForward:
             warp_idx >= self.schedule.compute_warp_ids[0]
             and warp_idx <= self.schedule.compute_warp_ids[-1]
         ):
+            # Fresh TiledMma avoids SSA dominance conflict with the MMA warp's
+            # .set(ACCUMULATE) mutations on the same tiled_mma_qk variable.
+            compute_tiled_mma_qk = sm100_utils.make_trivial_tiled_mma(
+                self.q_dtype,
+                tcgen05.OperandMajorMode.K,
+                tcgen05.OperandMajorMode.K,
+                self.config.acc_dtype,
+                tcgen05.CtaGroup.TWO,
+                self.config.mma_qk_tiler[:2],
+            )
             self.compute_role.run(
                 split_kv, cache_seqs, block_split_kvs, tile_sched_params,
                 tmem_ptr=None,
@@ -530,12 +479,9 @@ class BlackwellMultiLatentAttentionForward:
                 p_mma_producer=p_mma_prod,
                 p_cor_producer=p_cor_prod,
                 softmax_smem_exchange=softmax_smem_exchange,
-                mAccO=mAccO,
-                mO=mO,
-                mCL=mCL,
-                K=None,
-                L=mCL.shape[1],
-                tiled_mma_qk=tiled_mma_qk,
+                mAccO=mAccO, mO=mO, mCL=mCL,
+                K=None, L=mCL.shape[1],
+                tiled_mma_qk=compute_tiled_mma_qk,
                 sP=sP,
                 softmax_scale_log2=softmax_scale_log2,
                 tmem=tmem,
@@ -554,16 +500,13 @@ class BlackwellMultiLatentAttentionForward:
 
             corr_common_params = SimpleNamespace(
                 smem_exchange=epilogue_smem_exchange,
-                mAccO=mAccO,
-                mO=mO,
-                L=mCL.shape[1],
-                H=mQL.shape[0],
+                mAccO=mAccO, mO=mO,
+                L=mCL.shape[1], H=mQL.shape[0],
             )
             corr_epilogue_params = SimpleNamespace(
                 output_scale=output_scale,
                 softmax_scale_log2=softmax_scale_log2,
-                mAccLSE=mAccLSE,
-                mLSE=mLSE,
+                mAccLSE=mAccLSE, mLSE=mLSE,
             )
             self.correction_role.run(
                 split_kv, cache_seqs, block_split_kvs, tile_sched_params,
@@ -587,7 +530,7 @@ class BlackwellMultiLatentAttentionForward:
         cache_seqs: cute.Tensor,
         block_split_kvs: cute.Tensor,
     ):
-        """Reduction kernel that combines intermediate results from split-KV blocks."""
+        """Reduction kernel — identical to FP16 version."""
         bidx, bidy, bidz = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
         blk_coord = (bidx, bidy, bidz)
@@ -619,7 +562,6 @@ class BlackwellMultiLatentAttentionForward:
             lse_per_thread = cute.ceil_div(
                 MAX_SPLITS, self.schedule.threads_per_warp
             )
-
             local_lse = cute.make_rmem_tensor(
                 cute.make_layout(lse_per_thread), self.config.lse_dtype
             )
@@ -675,8 +617,7 @@ class BlackwellMultiLatentAttentionForward:
             for j in cutlass.range_constexpr(elements_per_thread):
                 element_idx = (
                     tidx
-                    + j
-                    * self.schedule.threads_per_warp
+                    + j * self.schedule.threads_per_warp
                     * self.config.num_compute_warps
                 )
                 rAccO[j] += gAccO[i, element_idx] * smem_lse_scale[i]
@@ -684,8 +625,7 @@ class BlackwellMultiLatentAttentionForward:
         for j in cutlass.range_constexpr(elements_per_thread):
             element_idx = (
                 tidx
-                + j
-                * self.schedule.threads_per_warp
+                + j * self.schedule.threads_per_warp
                 * self.config.num_compute_warps
             )
             mO[blk_coord[0], element_idx, blk_coord[1], blk_coord[2]] = rO[j]
@@ -717,12 +657,8 @@ class BlackwellMultiLatentAttentionForward:
     @cute.jit
     def initialize_workspace(
         self,
-        H: cutlass.Int32,
-        D: cutlass.Int32,
-        S: cutlass.Int32,
-        B: cutlass.Int32,
-        split_kv: cutlass.Int32,
-        acc_dtype: Type[cutlass.Numeric],
+        H: cutlass.Int32, D: cutlass.Int32, S: cutlass.Int32, B: cutlass.Int32,
+        split_kv: cutlass.Int32, acc_dtype: Type[cutlass.Numeric],
         workspace: cute.Tensor,
     ) -> tuple[cute.Tensor, cute.Tensor]:
         """Initialize workspace tensors acc_o and acc_lse for split-KV."""
@@ -765,23 +701,14 @@ class BlackwellMultiLatentAttentionForward:
 
     @staticmethod
     def get_workspace_size(
-        H: int,
-        S: int,
-        D: int,
-        B: int,
-        split_kv: int,
+        H: int, S: int, D: int, B: int, split_kv: int,
         acc_dtype: Type[cutlass.Numeric],
     ) -> int:
         return mla_get_workspace_size(H, S, D, B, split_kv, acc_dtype.width)
 
     @staticmethod
     def can_implement(
-        B: int,
-        S: int,
-        K: int,
-        H: int,
-        L: int,
-        R: int,
+        B: int, S: int, K: int, H: int, L: int, R: int,
         in_dtype: Type[cutlass.Numeric],
         out_dtype: Type[cutlass.Numeric],
         acc_dtype: Type[cutlass.Numeric],
@@ -794,7 +721,7 @@ class BlackwellMultiLatentAttentionForward:
         is_var_split_kv: bool,
         page_size: int,
     ) -> bool:
-        return MLAConfig.can_implement(
+        return MLAConfig.can_implement_fp8(
             B, S, K, H, L, R,
             in_dtype, out_dtype, acc_dtype, lse_dtype,
             mma_qk_tiler_mn, mma_pv_tiler_mn,

@@ -1,49 +1,25 @@
 # Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
-# Redistribution and use in source and binary forms, with or without
-# modification, are permitted provided that the following conditions are met:
+"""MLAMmaFP8Role — MMA warp role for FP8 MLA decode attention kernels.
 
-# 1. Redistributions of source code must retain the above copyright notice, this
-# list of conditions and the following disclaimer.
+FP8 differs from FP16 in three structural ways:
 
-# 2. Redistributions in binary form must reproduce the above copyright notice,
-# this list of conditions and the following disclaimer in the documentation
-# and/or other materials provided with the distribution.
+1. QK GEMM: single load_k wait covers all latent+rope stages, single release.
+   K-rope uses separate tSrKC_rope fragments from sKC_rope SMEM.
+   Fragment indexing: tSrQ[..., (q_stage, 0)], tSrKC[..., (q_stage, kc_stage)].
 
-# 3. Neither the name of the copyright holder nor the names of its
-# contributors may be used to endorse or promote products derived from
-# this software without specific prior written permission.
+2. PV GEMM: loop order is ``for acc_stage -> mma_o_acquire -> for p_stage``.
+   One load_v wait covers all p_stage iterations; mma_o produced per acc_stage.
+   V fragment indexing: tOrVC[..., ((acc_stage, p_stage), vc_stage)].
 
-# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+3. mma_o pipeline: 2 stages (vs 1 for FP16), with acquire/commit per acc_stage.
 
-"""MLAMmaRole — MMA warp role for MLA decode attention kernels.
-
-Extracted from the monolithic mla_decode_fp16.py kernel. Owns:
-- Fragment creation for QK and PV GEMMs
-- Per-stage GEMM helpers for QK latent/rope and PV
-- run(): tile scheduler loop with interleaved QK/PV, pipeline lifecycle
-
-All pipeline acquire/wait/commit/release/tail calls happen directly in run(),
-not in sub-methods, because CuTe DSL compiles Python to MLIR/SSA where the
-JIT boundary acts as pass-by-value for DSL metadata (TiledMma fields,
-PipelineState). Mutations made inside @cute.jit sub-methods create new SSA
-values that are invisible to the caller.
-
-GEMM helpers take an explicit ``accumulate`` parameter following the FMHA
-prefill pattern (roles/mma.py:gemm_pv). The ACCUMULATE flag is set inside
-each helper as ``k_block != 0 or accumulate``, making it deterministic from
-the parameter and inner loop index. Callers compute the parameter from their
-own loop position — never from ``tiled_mma.get()`` after a sub-method return.
+GEMM helpers use explicit ``accumulate`` parameter and ``cutlass.range()``
+(not ``range_constexpr``) for inner k-block loops, matching the FP16 pattern
+in mla_mma.py. ``range()`` generates ``scf.for`` which keeps ``.set()`` SSA
+values properly scoped; ``range_constexpr`` unrolls at compile time and leaks
+SSA values across dynamic loop boundaries.
 """
 
 import cutlass
@@ -60,15 +36,15 @@ from ..scheduler.mla_persistent import (
 )
 
 
-class MLAMmaRole:
-    """MMA warp for MLA decode — computes QK and PV GEMMs in TMEM.
+class MLAMmaFP8Role:
+    """MMA warp for FP8 MLA decode — computes QK and PV GEMMs in TMEM.
 
-    Created from MLAConfig and MLAMainloopSpec in the kernel's __init__.
     Does NOT own TMEM alloc/dealloc (that stays in the kernel for coordination).
     """
 
     def __init__(self, config: MLAConfig, mainloop: MLAMainloopSpec):
         self.mma_qk_tiler = config.mma_qk_tiler
+        self.mma_qk_rope_tiler = config.mma_qk_rope_tiler
         self.mma_pv_tiler = config.mma_pv_tiler
         self.rope_dim = config.rope_dim
         self.latent_dim = config.latent_dim
@@ -82,10 +58,6 @@ class MLAMmaRole:
         self.enable_pdl = config.enable_pdl
         self.is_var_split_kv = config.is_var_split_kv
 
-    # ------------------------------------------------------------------
-    #  Tile count
-    # ------------------------------------------------------------------
-
     @cute.jit
     def _get_k_tile_count(
         self,
@@ -94,18 +66,9 @@ class MLAMmaRole:
         block_split_kvs: cute.Tensor,
         blk_coord: cute.Coord,
     ) -> tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32]:
-        """Get k_index, k_tile_count, and local split_kv for an MLA work tile.
-
-        :param split_kv: Split_kv value
-        :param cache_seqs: Cache sequence lengths tensor
-        :param block_split_kvs: Per-block split_kv values tensor
-        :param blk_coord: Block coordinate
-        :return: k_index, k_tile_count, split_kv
-        """
         K = cache_seqs[blk_coord[2]]
         if cutlass.const_expr(self.is_var_split_kv):
             split_kv = block_split_kvs[blk_coord[2]]
-
         k_tile_total = cute.ceil_div(K, self.mma_qk_tiler[1])
         k_tile_per_cta = cute.ceil_div(k_tile_total, split_kv)
         k_index = blk_coord[3] * k_tile_per_cta
@@ -149,8 +112,8 @@ class MLAMmaRole:
             cute.gemm(
                 tiled_mma_qk,
                 tStS,
-                qk_params.tSrQ[None, None, k_block, q_stage],
-                qk_params.tSrKC[None, None, k_block, kv_stage_index],
+                qk_params.tSrQ[None, None, k_block, (q_stage, 0)],
+                qk_params.tSrKC[None, None, k_block, (q_stage, kv_stage_index)],
                 tStS,
             )
 
@@ -164,7 +127,7 @@ class MLAMmaRole:
         q_stage: int,
         accumulate: bool,
     ):
-        """Compute one QK-rope stage: inner k-block GEMM loop."""
+        """Compute one QK-rope stage using separate tSrKC_rope fragments."""
         tStS = qk_params.tStS_staged[None, None, None, s_stage_index]
         for k_block in cutlass.range(self.rope_dim // tiled_mma_qk.shape_mnk[2]):
             tiled_mma_qk.set(
@@ -174,7 +137,7 @@ class MLAMmaRole:
                 tiled_mma_qk,
                 tStS,
                 qk_params.tSrQ_rope[None, None, k_block, q_stage],
-                qk_params.tSrKC[None, None, k_block, kv_stage_index],
+                qk_params.tSrKC_rope[None, None, k_block, kv_stage_index],
                 tStS,
             )
 
@@ -184,7 +147,7 @@ class MLAMmaRole:
         pv_params: SimpleNamespace,
         tiled_mma_pv: cute.TiledMma,
         p_stage_index: cutlass.Int32,
-        kv_stage_index: cutlass.Int32,
+        vc_stage_index: cutlass.Int32,
         p_stage: int,
         acc_stage: int,
         accumulate: bool,
@@ -199,20 +162,16 @@ class MLAMmaRole:
                 tiled_mma_pv,
                 tOtO,
                 pv_params.tOrP[
-                    None,
-                    None,
-                    k_block,
-                    (p_stage, p_stage_index),
+                    None, None, k_block, (p_stage, p_stage_index),
                 ],
-                pv_params.tOrVC[None, None, k_block, kv_stage_index],
+                pv_params.tOrVC[
+                    None, None, k_block, ((acc_stage, p_stage), vc_stage_index)
+                ],
                 tOtO,
             )
 
     # ------------------------------------------------------------------
-    #  Orchestration loop — tile scheduler + interleaved QK/PV
-    #
-    #  All pipeline acquire/wait/commit/release/tail calls live here.
-    #  Sub-methods only receive stage indices and do pure GEMM computation.
+    #  Orchestration loop
     # ------------------------------------------------------------------
 
     @cute.jit
@@ -221,7 +180,8 @@ class MLAMmaRole:
         tiled_mma_qk: cute.TiledMma,
         tiled_mma_pv: cute.TiledMma,
         load_q_consumer: PipelineConsumer,
-        load_kv_consumer: PipelineConsumer,
+        load_k_consumer: PipelineConsumer,
+        load_v_consumer: PipelineConsumer,
         mma_s_producer: PipelineProducer,
         p_mma_consumer: PipelineConsumer,
         mma_o_producer: PipelineProducer,
@@ -232,24 +192,18 @@ class MLAMmaRole:
         sQ: cute.Tensor,
         sQ_rope: cute.Tensor,
         sKC: cute.Tensor,
+        sKC_rope: cute.Tensor,
         sP: cute.Tensor,
         sVC: cute.Tensor,
         tmem_ptr: cute.Tensor,
         is_leader_cta: cutlass.Boolean,
         L: cutlass.Int32,
     ):
-        """MMA warp orchestration loop for MLA decode.
-
-        Creates MMA fragments, iterates over work tiles via the tile scheduler,
-        and runs interleaved QK/PV GEMMs with pipeline synchronization.
-
-        Does NOT own TMEM alloc/dealloc — that stays in the kernel for
-        coordination with other warps.
-        """
-        # Create MMA fragments
+        """MMA warp orchestration for FP8 MLA decode."""
         tSrQ = tiled_mma_qk.make_fragment_A(sQ)
         tSrQ_rope = tiled_mma_qk.make_fragment_A(sQ_rope)
         tSrKC = tiled_mma_qk.make_fragment_B(sKC)
+        tSrKC_rope = tiled_mma_qk.make_fragment_B(sKC_rope)
         tOrP = tiled_mma_pv.make_fragment_A(sP)
         tOrVC = tiled_mma_pv.make_fragment_B(sVC)
 
@@ -275,58 +229,54 @@ class MLAMmaRole:
             tStS_staged.iterator + self.tmem_o_offset, tOtO_layout
         )
 
-        # Tile scheduler
         tile_sched = create_mla_static_tile_scheduler(
             tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
         )
         work_tile = tile_sched.initial_work_tile_info()
 
+        # Track PV accumulate state as a plain bool instead of
+        # tiled_mma_pv.set/get to avoid carrying TiledMma SSA values
+        # across the dynamic while-loop yield.
+        pv_accumulated = False
+
         while work_tile.is_valid_tile:
-            # Reset PV accumulate for each new work tile
-            tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, False)
+            pv_accumulated = False
             blk_coord = work_tile.tile_idx
             k_index, k_tile_count, local_split_kv = self._get_k_tile_count(
                 split_kv, cache_seqs, block_split_kvs, blk_coord
             )
             if k_tile_count > 0:
                 mma_qk_params = SimpleNamespace(
-                    sQ=sQ,
-                    sQ_rope=sQ_rope,
-                    sKC=sKC,
-                    tSrQ=tSrQ,
-                    tSrQ_rope=tSrQ_rope,
-                    tSrKC=tSrKC,
+                    sQ=sQ, sQ_rope=sQ_rope, sKC=sKC, sKC_rope=sKC_rope,
+                    tSrQ=tSrQ, tSrQ_rope=tSrQ_rope,
+                    tSrKC=tSrKC, tSrKC_rope=tSrKC_rope,
                     tStS_staged=tStS_staged,
                 )
                 mma_pv_params = SimpleNamespace(
-                    sP=sP,
-                    sVC=sVC,
-                    tOrP=tOrP,
-                    tOrVC=tOrVC,
+                    sP=sP, sVC=sVC,
+                    tOrP=tOrP, tOrVC=tOrVC,
                     tOtO_staged=tOtO_staged,
                 )
 
                 if is_leader_cta:
+                    # === First QK tile (with Q wait) ===
                     q_handle = load_q_consumer.wait_and_advance()
 
-                    # === First QK tile ===
                     s_handle = mma_s_producer.acquire_and_advance()
+                    kv_handle = load_k_consumer.wait_and_advance()
                     for q_stage in range(self.iterations_qk_latent):
-                        kv_handle = load_kv_consumer.wait_and_advance()
                         self._gemm_qk_latent_one_stage(
                             mma_qk_params, tiled_mma_qk,
                             s_handle.index, kv_handle.index, q_stage,
                             accumulate=(q_stage > 0),
                         )
-                        kv_handle.release()
                     for q_stage in range(self.iterations_qk_rope):
-                        kv_handle = load_kv_consumer.wait_and_advance()
                         self._gemm_qk_rope_one_stage(
                             mma_qk_params, tiled_mma_qk,
                             s_handle.index, kv_handle.index, q_stage,
                             accumulate=True,
                         )
-                        kv_handle.release()
+                    kv_handle.release()
                     s_handle.commit()
                     k_tile_count -= 1
 
@@ -334,67 +284,61 @@ class MLAMmaRole:
                     while k_tile_count > 0:
                         # QK
                         s_handle = mma_s_producer.acquire_and_advance()
+                        kv_handle = load_k_consumer.wait_and_advance()
                         for q_stage in range(self.iterations_qk_latent):
-                            kv_handle = load_kv_consumer.wait_and_advance()
                             self._gemm_qk_latent_one_stage(
                                 mma_qk_params, tiled_mma_qk,
                                 s_handle.index, kv_handle.index, q_stage,
                                 accumulate=(q_stage > 0),
                             )
-                            kv_handle.release()
                         for q_stage in range(self.iterations_qk_rope):
-                            kv_handle = load_kv_consumer.wait_and_advance()
                             self._gemm_qk_rope_one_stage(
                                 mma_qk_params, tiled_mma_qk,
                                 s_handle.index, kv_handle.index, q_stage,
                                 accumulate=True,
                             )
-                            kv_handle.release()
+                        kv_handle.release()
                         s_handle.commit()
 
-                        # PV — pv_acc is read at run() level (safe), tracks
-                        # whether any PV block has already initialized TMEM O.
-                        o_handle = mma_o_producer.acquire_and_advance()
+                        # PV
                         p_handle = p_mma_consumer.wait_and_advance()
-                        pv_acc = tiled_mma_pv.get(tcgen05.Field.ACCUMULATE)
-                        for p_stage in range(self.iterations_pv_k):
-                            for acc_stage in range(self.iterations_pv_n):
-                                kv_handle = load_kv_consumer.wait_and_advance()
+                        v_handle = load_v_consumer.wait_and_advance()
+                        for acc_stage in range(self.iterations_pv_n):
+                            o_handle = mma_o_producer.acquire_and_advance()
+                            for p_stage in range(self.iterations_pv_k):
                                 self._gemm_pv_one_stage(
                                     mma_pv_params, tiled_mma_pv,
-                                    p_handle.index, kv_handle.index,
+                                    p_handle.index, v_handle.index,
                                     p_stage, acc_stage,
-                                    accumulate=(pv_acc or p_stage > 0),
+                                    accumulate=(pv_accumulated or p_stage > 0),
                                 )
-                                kv_handle.release()
+                            o_handle.commit()
+                        v_handle.release()
                         p_handle.release()
-                        o_handle.commit()
-                        tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, True)
+                        pv_accumulated = True
 
                         k_tile_count -= 1
 
                     q_handle.release()
 
                     # === Final PV tile ===
-                    o_handle = mma_o_producer.acquire_and_advance()
                     p_handle = p_mma_consumer.wait_and_advance()
-                    pv_acc = tiled_mma_pv.get(tcgen05.Field.ACCUMULATE)
-                    for p_stage in range(self.iterations_pv_k):
-                        for acc_stage in range(self.iterations_pv_n):
-                            kv_handle = load_kv_consumer.wait_and_advance()
+                    v_handle = load_v_consumer.wait_and_advance()
+                    for acc_stage in range(self.iterations_pv_n):
+                        o_handle = mma_o_producer.acquire_and_advance()
+                        for p_stage in range(self.iterations_pv_k):
                             self._gemm_pv_one_stage(
                                 mma_pv_params, tiled_mma_pv,
-                                p_handle.index, kv_handle.index,
+                                p_handle.index, v_handle.index,
                                 p_stage, acc_stage,
-                                accumulate=(pv_acc or p_stage > 0),
+                                accumulate=(pv_accumulated or p_stage > 0),
                             )
-                            kv_handle.release()
+                        o_handle.commit()
+                    v_handle.release()
                     p_handle.release()
-                    o_handle.commit()
 
             tile_sched.advance_to_next_work()
             work_tile = tile_sched.get_current_work()
 
-        # Pipeline producer tails
         mma_s_producer.tail()
         mma_o_producer.tail()

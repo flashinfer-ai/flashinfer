@@ -21,7 +21,7 @@ import cutlass.pipeline as pipeline
 from cutlass.pipeline import Agent, CooperativeGroup, PipelineProducer, PipelineConsumer
 
 from .warp_schedule import WarpSchedule
-from .mla_warp_schedule import MLAWarpSchedule
+from .mla_warp_schedule import MLAWarpSchedule, MLAWarpScheduleFP8
 
 
 class PipelineType(enum.Enum):
@@ -326,4 +326,61 @@ def make_mla_topology(
                      cluster_scale=cluster_scale),
         PipelineEdge("load_pt", PipelineType.CP_ASYNC, stages=load_pt_stages,
                      producer_warp_ids=load_pt, consumer_warp_ids=load_tma),
+    ])
+
+
+def make_mla_fp8_topology(
+    schedule: MLAWarpScheduleFP8,
+    load_q_stages: int = 1,
+    load_k_stages: int = 3,
+    load_v_stages: int = 2,
+    mma_s_stages: int = 2,
+    p_mma_stages: int = 2,
+    p_cor_stages: int = 2,
+    mma_o_stages: int = 2,
+    cluster_scale: int = 2,
+) -> PipelineTopology:
+    """Build the pipeline topology for FP8 MLA decode.
+
+    7 pipelines connecting 5 warp roles (no page-table pipeline)::
+
+        TMA_K_Load --[load_q]---> MMA --[mma_s]--> Compute --[p_cor]--> Correction
+                   --[load_k]-->     <--[p_mma]--
+        TMA_V_Load --[load_v]-->     --[mma_o]--------------->
+
+    FP8 splits the unified load_kv into separate load_k and load_v pipelines
+    with dedicated TMA loader warps, and removes the page-table pipeline
+    (page indices are read directly from global memory).
+
+    :param schedule: FP8 MLA warp schedule defining warp role assignments.
+    :param cluster_scale: Multiplier for cluster-scaled consumer/producer thread counts.
+    """
+    s = schedule
+    load_k = (s.load_tma_k_warp_id,)
+    load_v = (s.load_tma_v_warp_id,)
+    mma = (s.mma_warp_id,)
+    compute = s.compute_warp_ids
+    correction = s.correction_warp_ids
+
+    return PipelineTopology(edges=[
+        PipelineEdge("load_q", PipelineType.TMA_UMMA, stages=load_q_stages,
+                     producer_warp_ids=load_k, consumer_warp_ids=mma,
+                     tx_count_key="q"),
+        PipelineEdge("load_k", PipelineType.TMA_UMMA, stages=load_k_stages,
+                     producer_warp_ids=load_k, consumer_warp_ids=mma,
+                     tx_count_key="kv"),
+        PipelineEdge("load_v", PipelineType.TMA_UMMA, stages=load_v_stages,
+                     producer_warp_ids=load_v, consumer_warp_ids=mma,
+                     tx_count_key="vc"),
+        PipelineEdge("mma_s", PipelineType.UMMA_ASYNC, stages=mma_s_stages,
+                     producer_warp_ids=mma, consumer_warp_ids=compute,
+                     cluster_scale=cluster_scale),
+        PipelineEdge("p_mma", PipelineType.ASYNC_UMMA, stages=p_mma_stages,
+                     producer_warp_ids=compute, consumer_warp_ids=mma,
+                     cluster_scale=cluster_scale),
+        PipelineEdge("p_cor", PipelineType.ASYNC, stages=p_cor_stages,
+                     producer_warp_ids=compute, consumer_warp_ids=correction),
+        PipelineEdge("mma_o", PipelineType.UMMA_ASYNC, stages=mma_o_stages,
+                     producer_warp_ids=mma, consumer_warp_ids=correction,
+                     cluster_scale=cluster_scale),
     ])

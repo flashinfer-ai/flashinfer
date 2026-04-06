@@ -37,11 +37,7 @@ from ..scheduler.mla_persistent import (
     MLAStaticTileSchedulerParams,
 )
 
-_setmaxregister_increase = getattr(
-    cute.arch,
-    "setmaxregister_increase",
-    getattr(cute.arch, "warpgroup_reg_alloc", None),
-)
+from ..compat import setmaxregister_increase as _setmaxregister_increase
 
 
 class MLAComputeRole:

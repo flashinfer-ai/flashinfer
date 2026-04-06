@@ -52,6 +52,7 @@ from flashinfer.cute_dsl.utils import (
 )
 
 from ..mla_decode import BlackwellMultiLatentAttentionForward
+from ..mla_decode_fp8 import BlackwellMultiLatentAttentionForwardFP8
 from ..mla_config import MLAConfig
 
 
@@ -95,9 +96,15 @@ def _check_can_implement(
     mma_qk_tiler_mn = (128, 128)
     mma_pv_tiler_mn = (128, 256)
 
+    is_fp8 = torch_dtype == torch.float8_e4m3fn
+    KernelClass = (
+        BlackwellMultiLatentAttentionForwardFP8
+        if is_fp8
+        else BlackwellMultiLatentAttentionForward
+    )
     cutlass_in_dtype = torch_to_cutlass_dtype(torch_dtype)
     cutlass_out_dtype = torch_to_cutlass_dtype(torch_out_dtype)
-    if not BlackwellMultiLatentAttentionForward.can_implement(
+    if not KernelClass.can_implement(
         1,  # B (runtime, use placeholder)
         seq_len_q,
         1,  # K (runtime, use placeholder)
@@ -149,6 +156,7 @@ def _get_compiled_mla_kernel(
     cutlass_dtype = torch_to_cutlass_dtype(torch_dtype)
     cutlass_out_dtype = torch_to_cutlass_dtype(torch_out_dtype)
 
+    is_fp8 = torch_dtype == torch.float8_e4m3fn
     config = MLAConfig(
         latent_dim=kv_lora_rank,
         rope_dim=qk_rope_head_dim,
@@ -165,9 +173,15 @@ def _get_compiled_mla_kernel(
         is_var_seq=is_var_seq,
         is_var_split_kv=is_var_split_kv,
         enable_pdl=enable_pdl,
+        is_fp8=is_fp8,
+        mma_o_stage=2 if is_fp8 else 1,
     )
 
-    kernel_obj = BlackwellMultiLatentAttentionForward(config)
+    kernel_obj = (
+        BlackwellMultiLatentAttentionForwardFP8(config)
+        if is_fp8
+        else BlackwellMultiLatentAttentionForward(config)
+    )
 
     # All dimensions as sym_int — this matches the original kernel's use of
     # mark_compact_shape_dynamic, which makes ALL shapes dynamic CuTe Integers.
@@ -354,7 +368,12 @@ class BatchMLADecodeCuteDSLWrapper:
         self._num_heads = num_heads
         self._page_size = page_size
         self._q_dtype = q_dtype
-        self._o_dtype = out_dtype if out_dtype is not None else q_dtype
+        if out_dtype is not None:
+            self._o_dtype = out_dtype
+        elif q_dtype == torch.float8_e4m3fn:
+            self._o_dtype = torch.bfloat16
+        else:
+            self._o_dtype = q_dtype
         self._is_var_seq = is_var_seq
         self._is_persistent = not is_var_seq
         self._is_var_split_kv = False
@@ -591,7 +610,7 @@ def cute_dsl_mla_decode(
     torch.Tensor
         Output tensor [B, q_len, H, kv_lora_rank].
     """
-    supported_dtypes = {torch.float16, torch.bfloat16}
+    supported_dtypes = {torch.float16, torch.bfloat16, torch.float8_e4m3fn}
     assert query.dtype in supported_dtypes, (
         f"cute_dsl_mla_decode only supports {supported_dtypes}, got {query.dtype}"
     )
@@ -606,6 +625,8 @@ def cute_dsl_mla_decode(
         o_dtype = out.dtype
     elif out_dtype is not None:
         o_dtype = out_dtype
+    elif q_dtype == torch.float8_e4m3fn:
+        o_dtype = torch.bfloat16
     else:
         o_dtype = q_dtype
 

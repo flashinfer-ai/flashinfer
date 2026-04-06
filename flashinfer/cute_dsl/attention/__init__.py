@@ -11,6 +11,7 @@ one level below in subdirectories.
 # Kernels
 from .prefill import BlackwellFusedMultiHeadAttentionForward
 from .mla_decode import BlackwellMultiLatentAttentionForward
+from .mla_decode_fp8 import BlackwellMultiLatentAttentionForwardFP8
 
 # Building blocks — FMHA prefill
 from .config import AttentionConfig, AttentionFusion, HeadMapping, TileBounds
@@ -22,12 +23,14 @@ from .pipeline_topology import (
     PipelineTopology,
     make_prefill_topology,
     make_mla_topology,
+    make_mla_fp8_topology,
 )
 from .mainloop_spec import (
     MainloopSpec,
     make_prefill_mainloop_spec,
     MLAMainloopSpec,
     make_mla_mainloop_spec,
+    make_mla_fp8_mainloop_spec,
 )
 from .fusion.mask import MaskType
 from .fusion.variant import (
@@ -50,7 +53,10 @@ from .scheduler.persistent import (
 
 # Building blocks — MLA decode
 from .mla_config import MLAConfig
-from .mla_warp_schedule import MLAWarpSchedule, MLA_DECODE_SCHEDULE
+from .mla_warp_schedule import (
+    MLAWarpSchedule, MLA_DECODE_SCHEDULE,
+    MLAWarpScheduleFP8, MLA_DECODE_FP8_SCHEDULE,
+)
 from .scheduler.mla_persistent import (
     MLAStaticTileScheduler,
     MLAStaticTileSchedulerParams,

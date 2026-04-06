@@ -20,12 +20,16 @@ from .config import AttentionConfig
 from .mla_config import MLAConfig
 from .tmem_layout import TmemLayout
 from .warp_schedule import WarpSchedule, PREFILL_SCHEDULE
-from .mla_warp_schedule import MLAWarpSchedule, MLA_DECODE_SCHEDULE
+from .mla_warp_schedule import (
+    MLAWarpSchedule, MLA_DECODE_SCHEDULE,
+    MLAWarpScheduleFP8, MLA_DECODE_FP8_SCHEDULE,
+)
 from .pipeline_topology import (
     PipelineTopology,
     make_prefill_topology,
     make_prefill_topology_transform,
     make_mla_topology,
+    make_mla_fp8_topology,
 )
 
 
@@ -180,6 +184,37 @@ def make_mla_mainloop_spec(
         p_cor_stages=config.p_cor_stage,
         mma_o_stages=config.mma_o_stage,
         load_pt_stages=config.load_pt_stage,
+        cluster_scale=config.cluster_shape_mnk[0],
+    )
+    return MLAMainloopSpec(
+        config=config,
+        warp_schedule=sched,
+        pipeline_topology=topo,
+    )
+
+
+def make_mla_fp8_mainloop_spec(
+    config: MLAConfig,
+    warp_schedule: MLAWarpScheduleFP8 | None = None,
+) -> MLAMainloopSpec:
+    """Create an MLAMainloopSpec for FP8 MLA decode.
+
+    Uses the FP8-specific pipeline topology with separate load_k/load_v
+    pipelines and no load_pt pipeline.
+
+    :param config: MLA kernel configuration (must have is_fp8=True).
+    :param warp_schedule: Optional warp schedule override (defaults to MLA_DECODE_FP8_SCHEDULE).
+    """
+    sched = warp_schedule if warp_schedule is not None else MLA_DECODE_FP8_SCHEDULE
+    topo = make_mla_fp8_topology(
+        sched,
+        load_q_stages=config.load_q_stage,
+        load_k_stages=config.load_k_stage,
+        load_v_stages=config.load_v_stage,
+        mma_s_stages=config.mma_s_stage,
+        p_mma_stages=config.p_mma_stage,
+        p_cor_stages=config.p_cor_stage,
+        mma_o_stages=config.mma_o_stage,
         cluster_scale=config.cluster_shape_mnk[0],
     )
     return MLAMainloopSpec(

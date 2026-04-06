@@ -24,7 +24,7 @@ from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
 import cutlass.cute.nvgpu.cpasync as cpasync
 
 from .mainloop_spec import MainloopSpec, MLAMainloopSpec
-from .mla_warp_schedule import MLAWarpSchedule
+from .mla_warp_schedule import MLAWarpSchedule, MLAWarpScheduleFP8
 
 
 def build_fmha_launch_params(
@@ -529,6 +529,314 @@ def build_mla_launch_params(
         tma_copy_q_bytes=tma_copy_q_bytes,
         tma_copy_kc_bytes=tma_copy_kc_bytes,
         SharedStorage=SplitKVKernelSharedStorage,
+        cta_layout_vmnk=cta_layout_vmnk,
+        epi_tile=epi_tile,
+        cluster_shape_mnk=config.cluster_shape_mnk,
+    )
+
+
+def build_mla_fp8_launch_params(
+    mainloop: MLAMainloopSpec,
+    schedule: MLAWarpScheduleFP8,
+    q_latent: cute.Tensor,
+    q_rope: cute.Tensor,
+    c_latent: cute.Tensor,
+    c_rope: cute.Tensor,
+    c_latent_transpose: cute.Tensor,
+    page_table: cute.Tensor,
+    o: cute.Tensor,
+    lse: cute.Tensor,
+    acc_o: cute.Tensor,
+    acc_lse: cute.Tensor,
+    q_dtype,
+    k_dtype,
+    v_dtype,
+    o_dtype,
+) -> SimpleNamespace:
+    """Build MMA atoms, SMEM layouts, TMA atoms, and SharedStorage for FP8 MLA decode.
+
+    FP8 differs from FP16 in:
+    - Separate KC-latent, KC-rope, and VC SMEM buffers (no aliasing)
+    - KC-latent stages use logical_divide for iterations_qk_latent
+    - VC stages use nested logical_divide for iterations_pv_k * iterations_pv_n
+    - No page-table SMEM buffer or load_pt barriers
+    - Separate tma_copy_kc_bytes and tma_copy_vc_bytes
+    """
+    config = mainloop.config
+
+    cta_group = tcgen05.CtaGroup.TWO
+    q_major_mode = OperandMajorMode.K
+    k_major_mode = OperandMajorMode.K
+    v_major_mode = OperandMajorMode.MN
+    p_major_mode = OperandMajorMode.K
+
+    qk_tiled_mma = sm100_utils.make_trivial_tiled_mma(
+        q_dtype, q_major_mode, k_major_mode, config.acc_dtype,
+        cta_group, config.mma_qk_tiler[:2],
+    )
+    pv_tiled_mma = sm100_utils.make_trivial_tiled_mma(
+        v_dtype, p_major_mode, v_major_mode, config.acc_dtype,
+        cta_group, config.mma_pv_tiler[:2],
+    )
+
+    cta_layout_vmnk = cute.tiled_divide(
+        cute.make_layout(config.cluster_shape_mnk),
+        (qk_tiled_mma.thr_id.shape,),
+    )
+    epi_tile = config.mma_pv_tiler[:2]
+
+    # --- Q SMEM layouts (same structure as FP16) ---
+    q_latent_smem_layout_staged = sm100_utils.make_smem_layout_a(
+        qk_tiled_mma, config.mma_qk_tiler, q_dtype,
+        (config.iterations_qk_latent * config.load_q_stage),
+    )
+    q_latent_smem_layout_staged = cute.logical_divide(
+        q_latent_smem_layout_staged, (None, None, None, config.iterations_qk_latent),
+    )
+    q_rope_smem_layout_staged = sm100_utils.make_smem_layout_a(
+        qk_tiled_mma, config.mma_qk_rope_tiler, q_dtype, config.load_q_stage,
+    )
+
+    # --- KC-latent SMEM: separate buffer with logical_divide for latent iterations ---
+    kc_latent_smem_layout_staged = sm100_utils.make_smem_layout_b(
+        qk_tiled_mma, config.mma_qk_tiler, k_dtype,
+        (config.iterations_qk_latent * config.load_k_stage),
+    )
+    kc_page_tile_size = min(
+        config.page_size,
+        qk_tiled_mma.op.shape_mnk[0] // qk_tiled_mma.thr_id.shape,
+    )
+    kc_latent_smem_layout_staged = cute.logical_divide(
+        kc_latent_smem_layout_staged, (None, None, None, config.iterations_qk_latent),
+    )
+
+    kc_latent_smem_layout_for_tma = sm100_utils.make_smem_layout(
+        OperandMajorMode.K,
+        (config.mma_qk_tiler[0] // qk_tiled_mma.thr_id.shape, config.mma_qk_tiler[2]),
+        k_dtype,
+        (config.iterations_qk_latent * config.load_k_stage),
+    )
+    kc_latent_smem_layout_for_tma = cute.tiled_divide(
+        kc_latent_smem_layout_for_tma, (kc_page_tile_size, config.mma_qk_tiler[2]),
+    )
+    kc_latent_smem_layout_for_tma = cute.logical_divide(
+        kc_latent_smem_layout_for_tma, (None, None, None, config.iterations_qk_latent),
+    )
+
+    # --- KC-rope SMEM: separate buffer ---
+    kc_rope_smem_layout_staged = sm100_utils.make_smem_layout_b(
+        qk_tiled_mma, config.mma_qk_rope_tiler, k_dtype, config.load_k_stage,
+    )
+    kc_rope_smem_layout_for_tma = sm100_utils.make_smem_layout(
+        OperandMajorMode.K,
+        (
+            config.mma_qk_rope_tiler[0] // qk_tiled_mma.thr_id.shape,
+            config.mma_qk_rope_tiler[2],
+        ),
+        k_dtype,
+        (config.iterations_qk_rope * config.load_k_stage),
+    )
+    kc_rope_smem_layout_for_tma = cute.tiled_divide(
+        kc_rope_smem_layout_for_tma,
+        (kc_page_tile_size, config.mma_qk_rope_tiler[2]),
+    )
+
+    # --- P SMEM layout ---
+    p_smem_layout_staged = sm100_utils.make_smem_layout_a(
+        pv_tiled_mma, config.mma_pv_tiler, q_dtype,
+        (config.iterations_pv_k * config.p_mma_stage),
+    )
+    p_smem_layout_staged = cute.logical_divide(
+        p_smem_layout_staged, (None, None, None, config.iterations_pv_k),
+    )
+
+    # --- VC SMEM: separate buffer with nested logical_divide ---
+    vc_smem_layout_staged = sm100_utils.make_smem_layout_b(
+        pv_tiled_mma, config.mma_pv_tiler, v_dtype,
+        (config.iterations_pv_k * config.iterations_pv_n * config.load_v_stage),
+    )
+    vc_smem_layout_staged = cute.logical_divide(
+        cute.logical_divide(
+            vc_smem_layout_staged,
+            (None, None, None, config.iterations_pv_k * config.iterations_pv_n),
+        ),
+        (None, None, None, (config.iterations_pv_n, None)),
+    )
+    vc_page_tile_size = min(config.page_size, config.mma_pv_tiler[2])
+    vc_smem_layout_for_tma = sm100_utils.make_smem_layout(
+        OperandMajorMode.MN,
+        (config.mma_pv_tiler[1] // pv_tiled_mma.thr_id.shape, config.mma_pv_tiler[2]),
+        v_dtype,
+        (config.iterations_pv_k * config.iterations_pv_n * config.load_v_stage),
+    )
+    vc_smem_layout_for_tma = cute.tiled_divide(
+        vc_smem_layout_for_tma,
+        (
+            pv_tiled_mma.op.shape_mnk[1] // pv_tiled_mma.thr_id.shape,
+            vc_page_tile_size,
+        ),
+    )
+    vc_smem_layout_for_tma = cute.logical_divide(
+        cute.logical_divide(
+            vc_smem_layout_for_tma,
+            (None, None, None, config.iterations_pv_k * config.iterations_pv_n),
+        ),
+        (None, None, None, (config.iterations_pv_n, None)),
+    )
+
+    # --- TMA atoms ---
+    tma_load_op = cpasync.CopyBulkTensorTileG2SOp(cta_group)
+
+    q_smem_layout = cute.select(q_latent_smem_layout_staged, mode=[0, 1, 2])
+    tma_atom_q_latent, tma_tensor_q_latent = cute.nvgpu.make_tiled_tma_atom_A(
+        tma_load_op, q_latent, q_smem_layout,
+        config.mma_qk_tiler, qk_tiled_mma, cta_layout_vmnk.shape,
+    )
+    q_rope_smem_layout = cute.select(q_rope_smem_layout_staged, mode=[0, 1, 2])
+    tma_atom_q_rope, tma_tensor_q_rope = cute.nvgpu.make_tiled_tma_atom_A(
+        tma_load_op, q_rope, q_rope_smem_layout,
+        config.mma_qk_rope_tiler, qk_tiled_mma, cta_layout_vmnk.shape,
+    )
+
+    kc_smem_layout = cute.select(kc_latent_smem_layout_for_tma, mode=[0])
+    tma_atom_c_latent, tma_tensor_c_latent = make_paged_tiled_tma_atom(
+        tma_load_op, c_latent, kc_smem_layout,
+        (config.mma_qk_tiler[1], config.mma_qk_tiler[2]),
+        qk_tiled_mma, config.page_size, is_k_load=True,
+    )
+    kc_rope_smem_layout = cute.select(kc_rope_smem_layout_for_tma, mode=[0])
+    tma_atom_c_rope, tma_tensor_c_rope = make_paged_tiled_tma_atom(
+        tma_load_op, c_rope, kc_rope_smem_layout,
+        (config.mma_qk_rope_tiler[1], config.mma_qk_rope_tiler[2]),
+        qk_tiled_mma, config.page_size, is_k_load=True,
+    )
+
+    vc_smem_layout = cute.select(vc_smem_layout_for_tma, mode=[0])
+    tma_atom_c_latent_transpose, tma_tensor_c_latent_transpose = (
+        make_paged_tiled_tma_atom(
+            tma_load_op, c_latent_transpose, vc_smem_layout,
+            (config.mma_pv_tiler[1], config.mma_pv_tiler[2]),
+            pv_tiled_mma, config.page_size, is_k_load=False,
+        )
+    )
+
+    # --- Copy sizes ---
+    q_latent_copy_size = (
+        cute.size_in_bytes(q_dtype, q_smem_layout)
+        * cute.size(qk_tiled_mma.thr_id.shape)
+        * config.iterations_qk_latent
+    )
+    q_rope_copy_size = (
+        cute.size_in_bytes(q_dtype, q_rope_smem_layout)
+        * cute.size(qk_tiled_mma.thr_id.shape)
+        * config.iterations_qk_rope
+    )
+    tma_copy_q_bytes = q_latent_copy_size + q_rope_copy_size
+
+    kc_latent_copy_size = (
+        cute.size_in_bytes(
+            k_dtype, cute.select(kc_latent_smem_layout_staged, mode=[0, 1, 2]),
+        )
+        * cute.size(qk_tiled_mma.thr_id.shape)
+        * config.iterations_qk_latent
+    )
+    kc_rope_copy_size = (
+        cute.size_in_bytes(
+            k_dtype, cute.select(kc_rope_smem_layout_staged, mode=[0, 1, 2]),
+        )
+        * cute.size(qk_tiled_mma.thr_id.shape)
+        * config.iterations_qk_rope
+    )
+    tma_copy_kc_bytes = kc_latent_copy_size + kc_rope_copy_size
+
+    tma_copy_vc_bytes = (
+        cute.size_in_bytes(
+            v_dtype, cute.select(vc_smem_layout_staged, mode=[0, 1, 2]),
+        )
+        * cute.size(pv_tiled_mma.thr_id.shape)
+        * config.iterations_pv_n
+        * config.iterations_pv_k
+    )
+
+    # --- SharedStorage struct (no page-table buffer) ---
+    align = mainloop.buffer_align_bytes
+    threads_per_warp = schedule.threads_per_warp
+    num_compute_warps = config.num_compute_warps
+
+    @cute.struct
+    class FP8SplitKVKernelSharedStorage:
+        load_q_mbar_ptr: cute.struct.MemRange[Int64, config.load_q_stage * 2]
+        load_k_mbar_ptr: cute.struct.MemRange[Int64, config.load_k_stage * 2]
+        load_v_mbar_ptr: cute.struct.MemRange[Int64, config.load_v_stage * 2]
+        mma_s_mbar_ptr: cute.struct.MemRange[Int64, config.mma_s_stage * 2]
+        p_mma_mbar_ptr: cute.struct.MemRange[Int64, config.p_mma_stage * 2]
+        p_cor_mbar_ptr: cute.struct.MemRange[Int64, config.p_cor_stage * 2]
+        mma_o_mbar_ptr: cute.struct.MemRange[Int64, config.mma_o_stage * 2]
+
+        smem_p: cute.struct.Align[
+            cute.struct.MemRange[q_dtype, cute.cosize(p_smem_layout_staged)],
+            align,
+        ]
+        smem_kc_latent: cute.struct.Align[
+            cute.struct.MemRange[k_dtype, cute.cosize(kc_latent_smem_layout_staged)],
+            align,
+        ]
+        smem_kc_rope: cute.struct.Align[
+            cute.struct.MemRange[k_dtype, cute.cosize(kc_rope_smem_layout_staged)],
+            align,
+        ]
+        smem_q_latent: cute.struct.Align[
+            cute.struct.MemRange[q_dtype, cute.cosize(q_latent_smem_layout_staged)],
+            align,
+        ]
+        smem_q_rope: cute.struct.Align[
+            cute.struct.MemRange[q_dtype, cute.cosize(q_rope_smem_layout_staged)],
+            align,
+        ]
+        smem_vc: cute.struct.Align[
+            cute.struct.MemRange[v_dtype, cute.cosize(vc_smem_layout_staged)],
+            align,
+        ]
+        softmax_smem_exchange: cute.struct.MemRange[
+            config.acc_dtype, num_compute_warps * threads_per_warp
+        ]
+        epilogue_smem_exchange: cute.struct.MemRange[
+            config.acc_dtype, num_compute_warps * threads_per_warp
+        ]
+        tmem_dealloc_mbar_ptr: Int64
+        tmem_holding_buf: cutlass.Int32
+
+        @classmethod
+        def size_in_bytes(cls) -> int: ...  # noqa: F811
+
+    return SimpleNamespace(
+        qk_tiled_mma=qk_tiled_mma,
+        pv_tiled_mma=pv_tiled_mma,
+        q_latent_smem_layout_staged=q_latent_smem_layout_staged,
+        q_rope_smem_layout_staged=q_rope_smem_layout_staged,
+        kc_latent_smem_layout_staged=kc_latent_smem_layout_staged,
+        kc_rope_smem_layout_staged=kc_rope_smem_layout_staged,
+        p_smem_layout_staged=p_smem_layout_staged,
+        vc_smem_layout_staged=vc_smem_layout_staged,
+        kc_latent_smem_layout_for_tma=kc_latent_smem_layout_for_tma,
+        kc_rope_smem_layout_for_tma=kc_rope_smem_layout_for_tma,
+        vc_smem_layout_for_tma=vc_smem_layout_for_tma,
+        tma_atom_q_latent=tma_atom_q_latent,
+        tma_tensor_q_latent=tma_tensor_q_latent,
+        tma_atom_q_rope=tma_atom_q_rope,
+        tma_tensor_q_rope=tma_tensor_q_rope,
+        tma_atom_c_latent=tma_atom_c_latent,
+        tma_tensor_c_latent=tma_tensor_c_latent,
+        tma_atom_c_rope=tma_atom_c_rope,
+        tma_tensor_c_rope=tma_tensor_c_rope,
+        tma_atom_c_latent_transpose=tma_atom_c_latent_transpose,
+        tma_tensor_c_latent_transpose=tma_tensor_c_latent_transpose,
+        kc_page_tile_size=kc_page_tile_size,
+        vc_page_tile_size=vc_page_tile_size,
+        tma_copy_q_bytes=tma_copy_q_bytes,
+        tma_copy_kc_bytes=tma_copy_kc_bytes,
+        tma_copy_vc_bytes=tma_copy_vc_bytes,
+        SharedStorage=FP8SplitKVKernelSharedStorage,
         cta_layout_vmnk=cta_layout_vmnk,
         epi_tile=epi_tile,
         cluster_shape_mnk=config.cluster_shape_mnk,

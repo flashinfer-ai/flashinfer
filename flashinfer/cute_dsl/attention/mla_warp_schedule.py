@@ -93,3 +93,78 @@ class MLAWarpSchedule:
 
 
 MLA_DECODE_SCHEDULE = MLAWarpSchedule()
+
+
+@dataclass(frozen=True)
+class MLAWarpScheduleFP8:
+    """Warp role assignment and register budgets for FP8 MLA decode kernels.
+
+    FP8 replaces the page-table loader warp with a second TMA loader warp
+    (separate K and V loading), eliminating the load_pt pipeline entirely.
+    """
+
+    compute_warp_ids: Tuple[int, ...] = (0, 1, 2, 3)
+    correction_warp_ids: Tuple[int, ...] = (4, 5, 6, 7)
+    mma_warp_id: int = 8
+    load_tma_k_warp_id: int = 9
+    load_tma_v_warp_id: int = 10
+    empty_warp_ids: Tuple[int, ...] = (11,)
+
+    softmax_reg_num: int = 192
+    correction_reg_num: int = 256
+    other_reg_num: int = 48
+
+    threads_per_warp: int = 32
+
+    # Named barrier IDs (same as FP16)
+    tmem_ptr_sync_bar_id: int = 1
+    softmax_exchange_bar_id: int = 2
+    epilogue_exchange_bar_id: int = 3
+
+    @property
+    def all_warp_ids(self) -> Tuple[int, ...]:
+        return (
+            *self.compute_warp_ids,
+            *self.correction_warp_ids,
+            self.mma_warp_id,
+            self.load_tma_k_warp_id,
+            self.load_tma_v_warp_id,
+            *self.empty_warp_ids,
+        )
+
+    @property
+    def num_warps(self) -> int:
+        return len(self.all_warp_ids)
+
+    @property
+    def threads_per_cta(self) -> int:
+        return self.threads_per_warp * self.num_warps
+
+    @property
+    def num_compute_warps(self) -> int:
+        return len(self.compute_warp_ids)
+
+    def make_named_barriers(self) -> Tuple[pipeline.NamedBarrier, ...]:
+        """Create the named barriers used by the FP8 MLA decode kernel.
+
+        Returns (tmem_ptr_sync_bar, softmax_exchange_sync_bar, epilogue_exchange_sync_bar).
+        """
+        n_compute = self.num_compute_warps
+        tpw = self.threads_per_warp
+
+        tmem_ptr_sync = pipeline.NamedBarrier(
+            barrier_id=self.tmem_ptr_sync_bar_id,
+            num_threads=tpw + tpw * n_compute * 2,
+        )
+        softmax_exchange = pipeline.NamedBarrier(
+            barrier_id=self.softmax_exchange_bar_id,
+            num_threads=tpw * n_compute,
+        )
+        epilogue_exchange = pipeline.NamedBarrier(
+            barrier_id=self.epilogue_exchange_bar_id,
+            num_threads=tpw * n_compute,
+        )
+        return tmem_ptr_sync, softmax_exchange, epilogue_exchange
+
+
+MLA_DECODE_FP8_SCHEDULE = MLAWarpScheduleFP8()

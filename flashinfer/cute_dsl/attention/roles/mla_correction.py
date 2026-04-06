@@ -79,6 +79,7 @@ class MLACorrectionRole:
         self.iterations_pv_n = config.iterations_pv_n
         self.is_var_split_kv = config.is_var_split_kv
         self.enable_pdl = config.enable_pdl
+        self.per_iteration_mma_o = config.per_iteration_mma_o
         self.v_dtype = v_dtype
         self.o_dtype = o_dtype
 
@@ -282,6 +283,37 @@ class MLACorrectionRole:
         return row_sum, row_max, correction_factor, no_correction
 
     @cute.jit
+    def _rescale_one_iter(
+        self,
+        common_params: SimpleNamespace,
+        correction_factor: cutlass.Float32,
+        skip_correction: cutlass.Boolean,
+        iter_n: int,
+    ):
+        """Rescale O accumulator for a single iter_n slice.
+
+        Side-effect-only (TMEM load/store + fence). Pipeline ops stay in caller.
+        """
+        if not skip_correction:
+            tmem_load_tiled_copy, tAcc, tTR_tAcc, tTR_gO, tTR_cO, tTR_rAcc = (
+                self._tmem_load_partition(
+                    common_params, common_params.tiled_mma_pv, iter_n
+                )
+            )
+            tmem_store_atom = cute.make_copy_atom(
+                tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
+            )
+            tmem_store_tiled_copy = tcgen05.make_tmem_copy(tmem_store_atom, tAcc)
+            cute.copy(tmem_load_tiled_copy, tTR_tAcc, tTR_rAcc)
+            for i in cutlass.range(
+                cute.size(tTR_rAcc), vectorize=True, unroll_full=True
+            ):
+                tTR_rAcc[i] = tTR_rAcc[i] * correction_factor
+            cute.copy(tmem_store_tiled_copy, tTR_rAcc, tTR_tAcc)
+
+        cute.arch.fence_view_async_tmem_store()
+
+    @cute.jit
     def rescale(
         self,
         common_params: SimpleNamespace,
@@ -289,36 +321,129 @@ class MLACorrectionRole:
         no_correction: cutlass.Int32,
         mma_o_handle,
     ):
-        """Rescale O accumulator in TMEM by correction_factor.
+        """Rescale O accumulator in TMEM by correction_factor (FP16 single-handle path).
 
         Releases the mma_o handle after fence_view_async_tmem_store,
         co-locating the fence+release pair. Uses vote_all_sync to skip
         rescaling when all threads agree no correction is needed.
         """
         skip_correction = cute.arch.vote_all_sync(no_correction == 1)
-        if not skip_correction:
-            for iter_n in cutlass.range_constexpr(self.iterations_pv_n):
-                tmem_load_tiled_copy, tAcc, tTR_tAcc, tTR_gO, tTR_cO, tTR_rAcc = (
-                    self._tmem_load_partition(
-                        common_params, common_params.tiled_mma_pv, iter_n
-                    )
-                )
-
-                tmem_store_atom = cute.make_copy_atom(
-                    tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
-                )
-                tmem_store_tiled_copy = tcgen05.make_tmem_copy(tmem_store_atom, tAcc)
-
-                cute.copy(tmem_load_tiled_copy, tTR_tAcc, tTR_rAcc)
-                for i in cutlass.range(
-                    cute.size(tTR_rAcc), vectorize=True, unroll_full=True
-                ):
-                    tTR_rAcc[i] = tTR_rAcc[i] * correction_factor
-
-                cute.copy(tmem_store_tiled_copy, tTR_rAcc, tTR_tAcc)
-
-        cute.arch.fence_view_async_tmem_store()
+        for iter_n in cutlass.range_constexpr(self.iterations_pv_n):
+            self._rescale_one_iter(
+                common_params, correction_factor, skip_correction, iter_n
+            )
         mma_o_handle.release()
+
+    @cute.jit
+    def _epilogue_one_iter(
+        self,
+        common_params: SimpleNamespace,
+        epilogue_params: SimpleNamespace,
+        row_sum: cutlass.Float32,
+        row_max: cutlass.Float32,
+        tidx: cutlass.Int32,
+        iter_n: int,
+    ):
+        """Epilogue for a single iter_n slice.
+
+        Side-effect-only (TMEM load, global store, fence). Pipeline ops stay in caller.
+        """
+        tmem_load_tiled_copy, tAcc, tTR_tAcc, tTR_gO, tTR_cO, tTR_rAcc = (
+            self._tmem_load_partition(
+                common_params, common_params.tiled_mma_pv, iter_n
+            )
+        )
+
+        cute.copy(tmem_load_tiled_copy, tTR_tAcc, tTR_rAcc)
+
+        for i in cutlass.range(
+            cute.size(tTR_rAcc), vectorize=True, unroll_full=True
+        ):
+            tTR_rAcc[i] = (
+                tTR_rAcc[i]
+                * epilogue_params.output_scale
+                * cute.arch.rcp_approx(row_sum)
+            )
+
+        tR2G_rO_src = None
+        tR2G_rO_dst = tTR_gO
+        if cutlass.const_expr(common_params.mAccO is None):
+            tR2G_rO_src = cute.make_fragment_like(tTR_gO, self.o_dtype)
+            tR2G_rO_src.store(tTR_rAcc.load().to(self.o_dtype))
+        else:
+            tR2G_rO_src = tTR_rAcc
+
+        if cute.elem_less(tTR_cO[0][0], common_params.H):
+            cute.autovec_copy(
+                tR2G_rO_src,
+                tR2G_rO_dst,
+                l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
+            )
+
+        cta_pv_tiler = (
+            self.mma_pv_tiler[0] // self.cluster_shape_mnk[0],
+            self.mma_pv_tiler[1],
+            self.mma_pv_tiler[2],
+        )
+        gLSE = None
+        cLSE = None
+        if cutlass.const_expr(epilogue_params.mAccLSE is None):
+            gLSE = cute.local_tile(
+                epilogue_params.mLSE,
+                (cta_pv_tiler[0], 1, 1),
+                (
+                    common_params.blk_coord[0],
+                    common_params.blk_coord[1],
+                    common_params.blk_coord[2],
+                ),
+                (1, 1, 1),
+            )
+            cLSE = cute.local_tile(
+                cute.make_identity_tensor(epilogue_params.mLSE.shape),
+                (cta_pv_tiler[0], 1, 1),
+                (
+                    common_params.blk_coord[0],
+                    common_params.blk_coord[1],
+                    common_params.blk_coord[2],
+                ),
+                (1, 1, 1),
+            )
+        else:
+            gLSE = cute.local_tile(
+                epilogue_params.mAccLSE[
+                    None, common_params.blk_coord[3], None, None
+                ],
+                (cta_pv_tiler[0], 1, 1),
+                (
+                    common_params.blk_coord[0],
+                    common_params.blk_coord[1],
+                    common_params.blk_coord[2],
+                ),
+                (1, 1, 1),
+            )
+            cLSE = cute.local_tile(
+                cute.make_identity_tensor(
+                    epilogue_params.mAccLSE[
+                        None, common_params.blk_coord[3], None, None
+                    ].shape
+                ),
+                (cta_pv_tiler[0], 1, 1),
+                (
+                    common_params.blk_coord[0],
+                    common_params.blk_coord[1],
+                    common_params.blk_coord[2],
+                ),
+                (1, 1, 1),
+            )
+        lse = (
+            cute.math.log2(row_sum, fastmath=True)
+            + epilogue_params.softmax_scale_log2 * row_max
+        )
+        if cutlass.const_expr(self.warps_in_n == 2):
+            if cute.elem_less(cLSE[tidx][0], common_params.H):
+                gLSE[tidx] = lse
+
+        cute.arch.fence_view_async_tmem_load()
 
     @cute.jit
     def epilogue(
@@ -329,11 +454,10 @@ class MLACorrectionRole:
         row_max: cutlass.Float32,
         mma_o_handle,
     ):
-        """Final epilogue: normalize O, convert dtype, write O and LSE to global memory.
+        """Final epilogue: normalize O, convert dtype, write O and LSE (FP16 single-handle path).
 
         Releases the mma_o handle after fence_view_async_tmem_load,
-        co-locating the fence+release pair. Handles split-KV (workspace)
-        vs direct output, and head-count boundary masking.
+        co-locating the fence+release pair.
         """
         tidx = common_params.tidx % (self.num_compute_warps * self.threads_per_warp)
 
@@ -347,103 +471,9 @@ class MLACorrectionRole:
                 ]
             )
         for iter_n in cutlass.range_constexpr(self.iterations_pv_n):
-            tmem_load_tiled_copy, tAcc, tTR_tAcc, tTR_gO, tTR_cO, tTR_rAcc = (
-                self._tmem_load_partition(
-                    common_params, common_params.tiled_mma_pv, iter_n
-                )
+            self._epilogue_one_iter(
+                common_params, epilogue_params, row_sum, row_max, tidx, iter_n
             )
-
-            cute.copy(tmem_load_tiled_copy, tTR_tAcc, tTR_rAcc)
-
-            for i in cutlass.range(
-                cute.size(tTR_rAcc), vectorize=True, unroll_full=True
-            ):
-                tTR_rAcc[i] = (
-                    tTR_rAcc[i]
-                    * epilogue_params.output_scale
-                    * cute.arch.rcp_approx(row_sum)
-                )
-
-            tR2G_rO_src = None
-            tR2G_rO_dst = tTR_gO
-            if cutlass.const_expr(common_params.mAccO is None):
-                tR2G_rO_src = cute.make_fragment_like(tTR_gO, self.o_dtype)
-                tR2G_rO_src.store(tTR_rAcc.load().to(self.o_dtype))
-            else:
-                tR2G_rO_src = tTR_rAcc
-
-            if cute.elem_less(tTR_cO[0][0], common_params.H):
-                cute.autovec_copy(
-                    tR2G_rO_src,
-                    tR2G_rO_dst,
-                    l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
-                )
-
-            cta_pv_tiler = (
-                self.mma_pv_tiler[0] // self.cluster_shape_mnk[0],
-                self.mma_pv_tiler[1],
-                self.mma_pv_tiler[2],
-            )
-            gLSE = None
-            cLSE = None
-            if cutlass.const_expr(epilogue_params.mAccLSE is None):
-                gLSE = cute.local_tile(
-                    epilogue_params.mLSE,
-                    (cta_pv_tiler[0], 1, 1),
-                    (
-                        common_params.blk_coord[0],
-                        common_params.blk_coord[1],
-                        common_params.blk_coord[2],
-                    ),
-                    (1, 1, 1),
-                )
-                cLSE = cute.local_tile(
-                    cute.make_identity_tensor(epilogue_params.mLSE.shape),
-                    (cta_pv_tiler[0], 1, 1),
-                    (
-                        common_params.blk_coord[0],
-                        common_params.blk_coord[1],
-                        common_params.blk_coord[2],
-                    ),
-                    (1, 1, 1),
-                )
-
-            else:
-                gLSE = cute.local_tile(
-                    epilogue_params.mAccLSE[
-                        None, common_params.blk_coord[3], None, None
-                    ],
-                    (cta_pv_tiler[0], 1, 1),
-                    (
-                        common_params.blk_coord[0],
-                        common_params.blk_coord[1],
-                        common_params.blk_coord[2],
-                    ),
-                    (1, 1, 1),
-                )
-                cLSE = cute.local_tile(
-                    cute.make_identity_tensor(
-                        epilogue_params.mAccLSE[
-                            None, common_params.blk_coord[3], None, None
-                        ].shape
-                    ),
-                    (cta_pv_tiler[0], 1, 1),
-                    (
-                        common_params.blk_coord[0],
-                        common_params.blk_coord[1],
-                        common_params.blk_coord[2],
-                    ),
-                    (1, 1, 1),
-                )
-            lse = (
-                cute.math.log2(row_sum, fastmath=True)
-                + epilogue_params.softmax_scale_log2 * row_max
-            )
-            if cutlass.const_expr(self.warps_in_n == 2):
-                if cute.elem_less(cLSE[tidx][0], common_params.H):
-                    gLSE[tidx] = lse
-
-        cute.arch.fence_view_async_tmem_load()
         mma_o_handle.release()
 
     @cute.jit
@@ -505,24 +535,56 @@ class MLACorrectionRole:
                     )
 
                     if k_tile_count_init != k_tile_count:
-                        mma_o_handle = mma_o_consumer.wait_and_advance()
-                        self.rescale(
-                            common_params,
-                            correction_factor,
-                            no_correction,
-                            mma_o_handle,
-                        )
+                        if cutlass.const_expr(self.per_iteration_mma_o):
+                            skip_correction = cute.arch.vote_all_sync(no_correction == 1)
+                            for iter_n in cutlass.range_constexpr(self.iterations_pv_n):
+                                mma_o_handle = mma_o_consumer.wait_and_advance()
+                                self._rescale_one_iter(
+                                    common_params, correction_factor,
+                                    skip_correction, iter_n,
+                                )
+                                mma_o_handle.release()
+                        else:
+                            mma_o_handle = mma_o_consumer.wait_and_advance()
+                            self.rescale(
+                                common_params,
+                                correction_factor,
+                                no_correction,
+                                mma_o_handle,
+                            )
 
                     k_tile_count = k_tile_count - 1
                     if k_tile_count == 0:
-                        mma_o_handle = mma_o_consumer.wait_and_advance()
-                        self.epilogue(
-                            common_params,
-                            epilogue_params,
-                            row_sum,
-                            row_max,
-                            mma_o_handle,
+                        tidx = common_params.tidx % (
+                            self.num_compute_warps * self.threads_per_warp
                         )
+                        if cutlass.const_expr(self.warps_in_n == 2):
+                            common_params.smem_exchange[tidx] = row_sum
+                            self.epilogue_exchange_sync_bar.wait()
+                            row_sum = (
+                                row_sum
+                                + common_params.smem_exchange[
+                                    (tidx + 64)
+                                    % (self.num_compute_warps * self.threads_per_warp)
+                                ]
+                            )
+                        if cutlass.const_expr(self.per_iteration_mma_o):
+                            for iter_n in cutlass.range_constexpr(self.iterations_pv_n):
+                                mma_o_handle = mma_o_consumer.wait_and_advance()
+                                self._epilogue_one_iter(
+                                    common_params, epilogue_params,
+                                    row_sum, row_max, tidx, iter_n,
+                                )
+                                mma_o_handle.release()
+                        else:
+                            mma_o_handle = mma_o_consumer.wait_and_advance()
+                            self.epilogue(
+                                common_params,
+                                epilogue_params,
+                                row_sum,
+                                row_max,
+                                mma_o_handle,
+                            )
 
             tile_sched.advance_to_next_work()
             work_tile = tile_sched.get_current_work()
