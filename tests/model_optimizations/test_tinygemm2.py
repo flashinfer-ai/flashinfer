@@ -3,10 +3,6 @@ import pytest
 import torch.nn.functional as F
 from flashinfer.utils import get_compute_capability
 
-pytestmark = pytest.mark.skip(
-    reason="tinygemm2 hangs on CI H100 runners — investigation in progress"
-)
-
 
 def _skip_if_not_sm90():
     cc = get_compute_capability(torch.device("cuda"))
