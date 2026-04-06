@@ -889,6 +889,7 @@ def bench_gpu_time_with_cuda_event(
     start_events = [torch.cuda.Event(enable_timing=True) for _ in range(repeat_iters)]
     end_events = [torch.cuda.Event(enable_timing=True) for _ in range(repeat_iters)]
     torch.cuda.synchronize()
+    torch.cuda._sleep(1_000_000)
     for iter_idx in range(repeat_iters):
         if _do_l2_flush:
             buffer.zero_()
