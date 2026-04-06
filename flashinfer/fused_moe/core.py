@@ -2216,7 +2216,8 @@ def trtllm_bf16_moe(
             - 3: Llama4 (Top1 -> Sigmoid)
             - 4: RenormalizeNaive (Softmax -> TopK -> Renormalize)
             - 6: SigmoidRenorm (Sigmoid -> TopK -> Renormalize)
-            - 7: Sigmoid (Sigmoid -> TopK)
+            - 7: MiniMax2 (Sigmoid + Bias -> TopK -> ScaledSumNormalize)
+            - 8: Sigmoid (Sigmoid -> TopK)
         use_shuffled_weight: Whether to use shuffled weight layout for optimization (default: True).
         weight_layout: Weight layout format (default: WeightLayout.BlockMajorK).
             - 0: MajorK - K-major layout [Mn, K]
@@ -2313,7 +2314,8 @@ def trtllm_bf16_routed_moe(
             - 3: Llama4 (Top1 -> Sigmoid)
             - 4: RenormalizeNaive (Softmax -> TopK -> Renormalize)
             - 6: SigmoidRenorm (Sigmoid -> TopK -> Renormalize)
-            - 7: Sigmoid (Sigmoid -> TopK)
+            - 7: MiniMax2 (Sigmoid + Bias -> TopK -> ScaledSumNormalize)
+            - 8: Sigmoid (Sigmoid -> TopK)
         use_shuffled_weight: Whether to use shuffled weight layout for optimization (default: True).
         weight_layout: Weight layout format (default: WeightLayout.BlockMajorK).
             - 0: MajorK - K-major layout [Mn, K]
@@ -2768,7 +2770,8 @@ def trtllm_fp4_block_scale_moe(
             - 3: Llama4 (Top1 -> Sigmoid)
             - 4: RenormalizeNaive (Softmax -> TopK -> Renormalize)
             - 6: SigmoidRenorm (Sigmoid -> TopK -> Renormalize)
-            - 7: Sigmoid (Sigmoid -> TopK)
+            - 7: MiniMax2 (Sigmoid + Bias -> TopK -> ScaledSumNormalize)
+            - 8: Sigmoid (Sigmoid -> TopK)
         do_finalize (bool): Whether to finalize the output (default: False)
         enable_pdl (Optional[bool]): Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
         activation_type (int): Type of activation function (default: 3 - Swiglu)
@@ -2905,7 +2908,8 @@ def trtllm_fp4_block_scale_routed_moe(
             - 3: Llama4 (Top1 -> Sigmoid)
             - 4: RenormalizeNaive (Softmax -> TopK -> Renormalize)
             - 6: SigmoidRenorm (Sigmoid -> TopK -> Renormalize)
-            - 7: Sigmoid (Sigmoid -> TopK)
+            - 7: MiniMax2 (Sigmoid + Bias -> TopK -> ScaledSumNormalize)
+            - 8: Sigmoid (Sigmoid -> TopK)
         do_finalize (bool): Whether to finalize the output (default: False)
         activation_type (int): Type of activation function (default: 3 - Swiglu)
             - 3: Swiglu
@@ -3022,7 +3026,8 @@ def trtllm_mxint4_block_scale_moe(
             - 3: Llama4 (Top1 -> Sigmoid)
             - 4: RenormalizeNaive (Softmax -> TopK -> Renormalize)
             - 6: SigmoidRenorm (Sigmoid -> TopK -> Renormalize)
-            - 7: Sigmoid (Sigmoid -> TopK)
+            - 7: MiniMax2 (Sigmoid + Bias -> TopK -> ScaledSumNormalize)
+            - 8: Sigmoid (Sigmoid -> TopK)
         do_finalize (bool): Whether to finalize the output (default: False)
         enable_pdl (Optional[bool]): Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
         tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
