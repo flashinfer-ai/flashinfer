@@ -48,7 +48,7 @@ namespace kernels {
 
 template <typename T>
 void invokeQuantization(int8_t* dst, T const* src, int64_t const size, float const* scalePtr,
-                        cudaStream_t stream = 0, int maxGirdSize = 0);
+                        cudaStream_t stream = 0, int maxGridSize = 0);
 
 template <typename T, typename QuantT>
 void invokePerTokenQuantization(QuantT* dst, T const* src, int64_t const numRows,
@@ -58,7 +58,7 @@ void invokePerTokenQuantization(QuantT* dst, T const* src, int64_t const numRows
 
 template <typename T, int SF_VEC_SIZE>
 void invokeFP4Quantization(int b, int m, int n, T const* input, float const* globalScale,
-                           int64_t* output, int32_t* SFOuput, bool useUE8M0,
+                           int64_t* output, int32_t* SFOutput, bool useUE8M0,
                            QuantizationSFLayout layout, int multiProcessorCount,
                            bool enable_pdl = false, cudaStream_t stream = 0);
 
@@ -76,8 +76,9 @@ void invokeBlockScaleInterleaveReverse(int b, int m, int n, uint8_t const* SFIn,
 
 template <typename T>
 void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, int64_t* output,
-                             int32_t* SFOuput, QuantizationSFLayout layout, int multiProcessorCount,
-                             bool enable_pdl = false, cudaStream_t stream = 0);
+                             int32_t* SFOutput, QuantizationSFLayout layout,
+                             int multiProcessorCount, bool enable_pdl = false,
+                             cudaStream_t stream = 0);
 
 }  // namespace kernels
 }  // namespace tensorrt_llm
