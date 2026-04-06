@@ -765,6 +765,7 @@ class AutoTuner:
                         min_time = float("inf")
                         # Initialize runner and tactic as None in case of no valid tactic or runners are found
                         runner_id, tactic = None, None
+                        skipped_count = 0
                         for r_id, r in enumerate(runners):
                             # TODO: use FakeTensor here.
                             valid_tactics = r.get_valid_tactics(tensors, p)
@@ -782,15 +783,26 @@ class AutoTuner:
                                 except torch.cuda.OutOfMemoryError:
                                     raise
                                 except Exception as e:
+                                    skipped_count += 1
                                     shapes = self._get_input_sizes(tensors)
-                                    logger.warning(
+                                    logger.debug(
                                         f"[Autotuner]: Skipping tactic {r} {tac}, due to failure while profiling: {e}"
                                     )
-
-                                    # Log stacktrace as debug to not spam log
                                     logger.debug(
                                         f"[Autotuner]: Failed when profiling {r} {tac}, shapes={shapes}. Error occurred: {e}"
                                     )
+
+                                    # Clear any pending async CUDA errors (e.g.
+                                    # cudaErrorIllegalInstruction from a failed
+                                    # kernel warmup run) so they don't surface
+                                    # later during CUDA graph capture.
+                                    # torch.cuda.synchronize() surfaces the error
+                                    # but does NOT clear the sticky CUDA error flag;
+                                    # only cudaGetLastError() resets it.
+                                    with contextlib.suppress(Exception):
+                                        torch.cuda.synchronize()
+                                    with contextlib.suppress(Exception):
+                                        torch.cuda.cudart().cudaGetLastError()
 
                                     # Record the failed profiling combinations
                                     if (
@@ -816,6 +828,12 @@ class AutoTuner:
                                 if time_measured < min_time:
                                     min_time = time_measured
                                     runner_id, tactic = r_id, tac
+
+                        if skipped_count > 0:
+                            logger.info(
+                                f"[Autotuner]: Skipped {skipped_count} unsupported tactic(s) for {custom_op} "
+                                f"(enable debug logs to see details)"
+                            )
 
                         if runner_id is not None:
                             # At least one valid (runner, tactic) pair is found
