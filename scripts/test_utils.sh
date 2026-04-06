@@ -766,6 +766,29 @@ execute_dry_run() {
 }
 
 # Main execution function for actual test run
+# Tests that are too memory-heavy to run in parallel.
+# These get pulled out and run sequentially (one at a time, full GPU) after
+# the parallel batch finishes.
+SOLO_TEST_PATTERNS=(
+    "test_trtllm_gen_attention.py"
+    "test_trtllm_fused_moe_autotuner_integration.py"
+    "test_mm_fp4.py"
+    "test_trtllm_gen_fused_moe.py"
+    "test_trtllm_gen_routed_fused_moe.py"
+)
+
+is_solo_test() {
+    local test_file=$1
+    local basename
+    basename=$(basename "$test_file")
+    for pattern in "${SOLO_TEST_PATTERNS[@]}"; do
+        if [ "$basename" = "$pattern" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 execute_tests() {
     local test_files=$1
 
@@ -773,11 +796,53 @@ execute_tests() {
 
     # Check if parallel execution is enabled
     if [ "$PARALLEL_TESTS" == "true" ]; then
-        # Run tests in parallel
-        if [ "$SANITY_TEST" == "true" ]; then
-            run_tests_parallel "$test_files" "sanity"
-        else
-            run_tests_parallel "$test_files" "full"
+        # Split tests into parallel-safe and solo (memory-heavy) groups
+        local parallel_files=""
+        local solo_files=""
+        for test_file in $test_files; do
+            if is_solo_test "$test_file"; then
+                solo_files="$solo_files $test_file"
+            else
+                parallel_files="$parallel_files $test_file"
+            fi
+        done
+        # Trim leading spaces
+        parallel_files="${parallel_files# }"
+        solo_files="${solo_files# }"
+
+        # Run parallel-safe tests
+        if [ -n "$parallel_files" ]; then
+            if [ "$SANITY_TEST" == "true" ]; then
+                run_tests_parallel "$parallel_files" "sanity"
+            else
+                run_tests_parallel "$parallel_files" "full"
+            fi
+        fi
+
+        # Run memory-heavy tests sequentially (one at a time, full GPU access)
+        if [ -n "$solo_files" ]; then
+            echo ""
+            echo "=========================================="
+            echo "SEQUENTIAL EXECUTION (memory-heavy tests)"
+            echo "=========================================="
+            local solo_count=0
+            for test_file in $solo_files; do
+                solo_count=$((solo_count + 1))
+            done
+            echo "Running $solo_count test file(s) sequentially to avoid OOM"
+            echo ""
+
+            if [ "$SANITY_TEST" == "true" ]; then
+                FILE_COUNT=$((FILE_COUNT + 0))  # continue from parallel count
+                for test_file in $solo_files; do
+                    FILE_COUNT=$((FILE_COUNT + 1))
+                    run_sanity_test_file "$test_file" "$FILE_COUNT"
+                done
+            else
+                for test_file in $solo_files; do
+                    run_full_test_file "$test_file"
+                done
+            fi
         fi
     else
         # Original sequential execution
