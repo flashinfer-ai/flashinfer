@@ -451,7 +451,8 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
     for (int e = 0; e < ExpertsPerThread; e++) {
       int expert = threadIdx.x * ExpertsPerThread + e;
       auto localExpIdx = expert - params.mLocalExpertsStartIdx;
-      auto isLocal = localExpIdx >= 0 && localExpIdx < params.mNumLocalExperts &&
+      auto isLocal = localExpIdx >= 0 &&
+                     localExpIdx < (params.mNumLocalExperts << params.mLocalExpertsStrideLog2) &&
                      (localExpIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
       accExpertCount[e] = 0;
       if (isLocal) {
@@ -489,6 +490,7 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
           numCtaPerExpert[e] = divUpTileN<int32_t>(accExpertCount[e], params.mTileTokensDim);
           tmpCountPerExpert[e] = divUpMulTileN<int32_t>(accExpertCount[e], params.mTileTokensDim);
         }
+        numCtaPerExpert[e] *= params.mClusterSizeInBatchDim;
       } else {
         numCtaPerExpert[e] = 0;
         tmpCountPerExpert[e] = 0;
@@ -522,7 +524,8 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
     for (int e = 0; e < ExpertsPerThread; e++) {
       int expert = threadIdx.x * ExpertsPerThread + e;
       auto localExpIdx = expert - params.mLocalExpertsStartIdx;
-      auto isLocal = localExpIdx >= 0 && localExpIdx < params.mNumLocalExperts &&
+      auto isLocal = localExpIdx >= 0 &&
+                     localExpIdx < (params.mNumLocalExperts << params.mLocalExpertsStrideLog2) &&
                      (localExpIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
       if (isLocal) {
         for (int cta = 0; cta < numCtaPerExpert[e]; ++cta) {
@@ -531,13 +534,13 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
           params.mPtrCtaIdxXyToBatchIdx[ctaOffsetPerExpert[e] + cta] = mappedLocalIdx;
           int32_t mnLimit1, mnLimit2;
           if (params.mIsPow2) {
-            mnLimit1 = mulLog2<int32_t>(ctaOffsetPerExpert[e] + cta + 1, params.mPaddingLog2);
-            mnLimit2 =
-                mulLog2<int32_t>(ctaOffsetPerExpert[e], params.mPaddingLog2) + accExpertCount[e];
+            int32_t ctaPaddingLog2 = params.mPaddingLog2 - params.mClusterSizeLog2;
+            mnLimit1 = mulLog2<int32_t>(ctaOffsetPerExpert[e] + cta + 1, ctaPaddingLog2);
+            mnLimit2 = mulLog2<int32_t>(ctaOffsetPerExpert[e], ctaPaddingLog2) + accExpertCount[e];
           } else {
-            mnLimit1 = mulTileN<int32_t>(ctaOffsetPerExpert[e] + cta + 1, params.mTileTokensDim);
-            mnLimit2 =
-                mulTileN<int32_t>(ctaOffsetPerExpert[e], params.mTileTokensDim) + accExpertCount[e];
+            int32_t ctaTile = params.mTileTokensDim / params.mClusterSizeInBatchDim;
+            mnLimit1 = (ctaOffsetPerExpert[e] + cta + 1) * ctaTile;
+            mnLimit2 = ctaOffsetPerExpert[e] * ctaTile + accExpertCount[e];
           }
           params.mPtrCtaIdxXyToMnLimit[ctaOffsetPerExpert[e] + cta] = min(mnLimit1, mnLimit2);
         }
@@ -548,19 +551,14 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
   if (threadIdx.x == 0) {
     int32_t permutedIdxSize;
     if (params.mIsPow2) {
-      permutedIdxSize = mulLog2<int32_t>(numNonExitingCtas, params.mPaddingLog2);
+      permutedIdxSize =
+          mulLog2<int32_t>(numNonExitingCtas >> params.mClusterSizeLog2, params.mPaddingLog2);
     } else {
-      permutedIdxSize = mulTileN<int32_t>(numNonExitingCtas, params.mTileTokensDim);
+      permutedIdxSize = (numNonExitingCtas / params.mClusterSizeInBatchDim) * params.mTileTokensDim;
     }
     params.mPtrPermutedIdxSize[0] = permutedIdxSize;
     params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
   }
-
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  if (params.mUsePdl) {
-    cudaTriggerProgrammaticLaunchCompletion();
-  }
-#endif
 
   // Phase 5: Permutation
   if (threadIdx.x < NumThreadsExperts) {
@@ -571,8 +569,10 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
         int offset = tokenIdx * MaxNumExperts + expert;
         if (smemKIdx[offset] >= 0) {
           auto localExpIdx = expert - params.mLocalExpertsStartIdx;
-          auto isLocal = localExpIdx >= 0 && localExpIdx < params.mNumLocalExperts &&
-                         (localExpIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
+          auto isLocal =
+              localExpIdx >= 0 &&
+              localExpIdx < (params.mNumLocalExperts << params.mLocalExpertsStrideLog2) &&
+              (localExpIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
 
           int const expandedIdx = tokenIdx * params.mTopK + smemKIdx[offset];
           int const offsetWithinExpert = static_cast<int>(smemOffset[offset]);
@@ -592,6 +592,12 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
       }
     }
   }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  if (params.mUsePdl) {
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
+#endif
 }
 
 void launchDynBlockKernel(Data const& data, uint32_t numThreadsHist, void* stream) {
