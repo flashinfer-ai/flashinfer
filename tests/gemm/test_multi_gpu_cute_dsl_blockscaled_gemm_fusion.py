@@ -288,7 +288,7 @@ if __name__ == "__main__":
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
     torch.distributed.init_process_group(backend="nccl", device_id=device)
-
+    c_dtype = "bfloat16"
     for BATCH_SIZE in [16, 64, 128, 256]:
         if torch.distributed.get_rank() == 0:
             print(f"\n{'=' * 60}")
@@ -300,7 +300,7 @@ if __name__ == "__main__":
             ab_dtype="float4_e2m1fn",
             sf_dtype="float8_e4m3fn",
             sf_vec_size=16,
-            c_dtype="bfloat16",
+            c_dtype=c_dtype,
             a_major="k",
             b_major="k",
             c_major="n",
@@ -308,7 +308,9 @@ if __name__ == "__main__":
             alpha_dtype="float32",
             mma_tiler_mn=(128, 128),
             cluster_shape_mn=(1, 1),
-            tolerance=10000,
+            tolerance=10000
+            if c_dtype == "bfloat16"
+            else 1e-01,  # Rely on the relative tolerance with bfloat16 accumulation
             iterations=1,
         )
     # WAR for https://github.com/pytorch/pytorch/issues/162429

@@ -455,6 +455,14 @@ def cp_reduce_bf16_add(dst_addr, src_addr, size, *, loc=None, ip=None):
     """Async bulk copy-reduce (add) from shared memory to global memory.
 
     PTX instruction: cp.reduce.async.bulk.global.shared::cta.bulk_group.add.bf16.noftz [dstMem], [srcMem], size;
+
+    Performs an asynchronous bulk reduction operation that atomically adds bf16 values
+    from shared memory (CTA scope) to global memory. The operation is part of a bulk group.
+
+    Args:
+        dst_addr: Destination global memory address (pointer)
+        src_addr: Source shared memory address (pointer)
+        size: Size in bytes of the data to reduce (must be a multiple of 4)
     """
     llvm.inline_asm(
         None,
@@ -1994,14 +2002,15 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                             reg_out_ptrs = cute.make_tensor(
                                 smem_out_ptrs_ptr, (8,)
                             ).load()
-                            for iter in cutlass.range_constexpr(8):
-                                m_row = warp_idx * 8 + iter
+                            # 8 elements per warp for a total of 32 elements per subtile
+                            for idx_in_warp in cutlass.range_constexpr(8):
+                                m_row = warp_idx * 8 + idx_in_warp
                                 m_idx = (
                                     cur_tile_dim1_offset
                                     + subtile_idx * epi_tile[1].shape
                                     + m_row
                                 )
-                                out_ptr = reg_out_ptrs[iter]
+                                out_ptr = reg_out_ptrs[idx_in_warp]
                                 if m_idx < tile_sched_params.masked_m[l_idx]:
                                     src_ptr = cute.make_ptr(
                                         self.c_dtype,
@@ -2021,6 +2030,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                                             src_smem_tensor[((None, m_row),)].iterator,
                                             epi_tile[0].shape * c_dtype_bytes,
                                         )
+                            # Fence and barrier to make sure shared memory store is visible to TMA store
+                            c_pipeline.producer_commit()
+                            c_pipeline.producer_acquire()
                     else:
                         if warp_idx == self.epilog_warp_id[0]:
                             cute.copy(
@@ -2028,33 +2040,33 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                                 bSG_sC[(None, c_buffer)],
                                 bSG_gC[(None, subtile_idx)],
                             )
-                    # Fence and barrier to make sure shared memory store is visible to TMA store
-                    with cute.arch.elect_one():
-                        c_pipeline.producer_commit()
+                            # Fence and barrier to make sure shared memory store is visible to TMA store
+                            c_pipeline.producer_commit()
 
-                    if cutlass.const_expr(tile_sched_params.dst_signals is not None):
-                        dsm_counter = (dsm_counter + 1).to(Uint8)
-                        will_write_signals = (
-                            read_byte(dsm_pending_packed, dsm_pending_idx)
-                            == dsm_counter
-                        )
+                            if cutlass.const_expr(
+                                tile_sched_params.dst_signals is not None
+                            ):
+                                dsm_counter = (dsm_counter + 1).to(Uint8)
+                                will_write_signals = (
+                                    read_byte(dsm_pending_packed, dsm_pending_idx)
+                                    == dsm_counter
+                                )
 
-                        if will_write_signals:
-                            # The original c_pipeline.producer_acquire()
-                            #   := PipelineTmaStore.producer_acquire()
-                            #   := TmaStoreFence.wait()
-                            #   := cute.arch.cp_async_bulk_wait_group(self.num_stages - 1, read=True)
-                            cute.arch.cp_async_bulk_wait_group(
-                                self.num_c_stage - 1,
-                                # Change `read` from True to False to also wait writes
-                                read=False,
-                            )
-                        else:
-                            c_pipeline.producer_acquire()
+                                if will_write_signals:
+                                    # The original c_pipeline.producer_acquire()
+                                    #   := PipelineTmaStore.producer_acquire()
+                                    #   := TmaStoreFence.wait()
+                                    #   := cute.arch.cp_async_bulk_wait_group(self.num_stages - 1, read=True)
+                                    cute.arch.cp_async_bulk_wait_group(
+                                        self.num_c_stage - 1,
+                                        # Change `read` from True to False to also wait writes
+                                        read=False,
+                                    )
+                                else:
+                                    c_pipeline.producer_acquire()
 
-                    else:
-                        with cute.arch.elect_one():
-                            c_pipeline.producer_acquire()
+                            else:
+                                c_pipeline.producer_acquire()
 
                     cute.arch.barrier(
                         barrier_id=self.epilog_sync_bar_id,
@@ -3007,7 +3019,7 @@ class MaskedBatchedMatmulCuteDSL:
             ),
         )
         row_size = self._n if self._c_major == "m" else self._m
-        if cutlass.const_expr(self._num_ranks > 0):
+        if cutlass.const_expr(self._is_combine_fusion):
             topk_weights_tensor = cute.make_tensor(
                 topk_weights_ptr,
                 layout=cute.make_ordered_layout((self._l, row_size), order=(1, 0)),
@@ -3188,8 +3200,8 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
             if not enable_dst_signals:
                 dst_signals_data_ptr = None
 
-            # When num_ranks == 0, combine-related pointers should be None
-            if num_ranks == 0:
+            # When combine fusion is disabled, combine-related pointers should be None
+            if not is_combine_fusion:
                 topk_weights_data_ptr = None
                 idx_src_info_data_ptr = None
                 rank_src_info_data_ptr = None
@@ -3555,27 +3567,6 @@ def grouped_gemm_nt_masked(
         - The result is written to c_tensor.
     """
 
-    if is_combine_fusion:
-        required = {
-            "topk_weights": topk_weights,
-            "idx_src_info": idx_src_info,
-            "rank_src_info": rank_src_info,
-            "out_ptrs": out_ptrs,
-            "barrier_flag_local": barrier_flag_local,
-            "barrier_flag_multicast": barrier_flag_multicast,
-        }
-        missing = [name for name, val in required.items() if val is None]
-        if missing:
-            raise ValueError(
-                "is_combine_fusion=True requires non-None values for: "
-                f"{', '.join(missing)}"
-            )
-        if num_ranks <= 0:
-            raise ValueError("is_combine_fusion=True requires num_ranks > 0")
-        # For combine fusion, we always swap the AB input tensors
-        if not is_swap_ab:
-            raise ValueError("is_combine_fusion=True requires is_swap_ab=True")
-
     if is_swap_ab:
         a_torch, sfa_torch = rhs
         b_torch, sfb_torch = lhs
@@ -3606,6 +3597,29 @@ def grouped_gemm_nt_masked(
     major, minor = get_compute_capability(a_torch.device)
     if major == 11 and minor == 0:
         raise ValueError("SM110 is not supported for cute-dsl backend.")
+
+    if is_combine_fusion:
+        required = {
+            "topk_weights": topk_weights,
+            "idx_src_info": idx_src_info,
+            "rank_src_info": rank_src_info,
+            "out_ptrs": out_ptrs,
+            "barrier_flag_local": barrier_flag_local,
+            "barrier_flag_multicast": barrier_flag_multicast,
+        }
+        missing = [name for name, val in required.items() if val is None]
+        if missing:
+            raise ValueError(
+                "is_combine_fusion=True requires non-None values for: "
+                f"{', '.join(missing)}"
+            )
+        if num_ranks <= 0:
+            raise ValueError("is_combine_fusion=True requires num_ranks > 0")
+        # For combine fusion, we always swap the AB input tensors
+        if not is_swap_ab:
+            raise ValueError("is_combine_fusion=True requires is_swap_ab=True")
+        if mma_tiler_mn != (128, 128):
+            raise ValueError("is_combine_fusion=True requires mma_tiler_mn=(128, 128)")
 
     return get_cute_dsl_compiled_masked_gemm_kernel(
         m=m,
