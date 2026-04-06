@@ -561,10 +561,6 @@ def _compute_rmsnorm_silu_workspace_size(
     # fp8_scale
     ws += 4
     ws = ((ws + 127) // 128) * 128
-    # scale_row (NVFP4 only)
-    if output_dtype == "nvfp4":
-        ws += rows * ((cols + 15) // 16)
-        ws = ((ws + 127) // 128) * 128
     # cooperative workspace (multi-CTA)
     if ctas_per_row > 1:
         ctas_per_col_max = (rows + warps_m - 1) // warps_m
@@ -715,21 +711,17 @@ def fused_rmsnorm_silu(
     )
     workspace = torch.empty(ws_size, dtype=torch.uint8, device=input.device)
 
-    module.rmsnorm_silu(out, input, weight, eps, workspace, sm_count)
+    if output_dtype_str == "nvfp4":
+        num_blocks = C // 16
+        block_scale = torch.empty(
+            num_tokens, num_blocks, dtype=torch.float8_e4m3fn, device=input.device
+        )
+    else:
+        block_scale = torch.empty(0, dtype=torch.uint8, device=input.device)
+
+    module.rmsnorm_silu(out, input, weight, eps, workspace, block_scale, sm_count)
 
     if output_dtype_str == "nvfp4":
-        # Extract block_scale from workspace (matches C++ layout in rmsnorm_silu.cu).
-        # Layout: [rs: rows*4, align128] [fp8_scale: 4, align128] [scale_row: ...]
-        scale_row_offset = num_tokens * 4  # rs
-        scale_row_offset = ((scale_row_offset + 127) // 128) * 128
-        scale_row_offset += 4  # fp8_scale
-        scale_row_offset = ((scale_row_offset + 127) // 128) * 128
-        num_blocks = C // 16
-        scale_row_bytes = num_tokens * num_blocks
-        block_scale = workspace[scale_row_offset : scale_row_offset + scale_row_bytes]
-        block_scale = block_scale.view(torch.float8_e4m3fn).reshape(
-            num_tokens, num_blocks
-        )
         return out, block_scale
 
     return out

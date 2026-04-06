@@ -16,6 +16,6 @@
 #include "tvm_ffi_utils.h"
 
 void rmsnorm_silu(TensorView output, TensorView input, TensorView weight, double eps,
-                  TensorView workspace, int64_t sm_count);
+                  TensorView workspace, TensorView scale_row_out, int64_t sm_count);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(rmsnorm_silu, rmsnorm_silu);

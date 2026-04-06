@@ -25,7 +25,7 @@
 #include "tvm_ffi_utils.h"
 
 void rmsnorm_silu(TensorView output, TensorView input, TensorView weight, double eps,
-                  TensorView workspace, int64_t sm_count) {
+                  TensorView workspace, TensorView scale_row_out, int64_t sm_count) {
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(output);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(weight);
@@ -92,11 +92,9 @@ void rmsnorm_silu(TensorView output, TensorView input, TensorView weight, double
   off += sizeof(float);
   off = ((off + 127) / 128) * 128;
 
-  // [aligned] scale_row: rows * ceil(C/16) bytes (NVFP4 only)
+  // scale_row: passed as separate output tensor (NVFP4 only)
   if (isFP4Out) {
-    params.scale_row = ws_ptr + off;
-    off += static_cast<int64_t>(rows) * ((cols + 15) / 16);
-    off = ((off + 127) / 128) * 128;
+    params.scale_row = scale_row_out.data_ptr();
   }
 
   // [aligned] cooperative workspace + barriers (multi-CTA only)

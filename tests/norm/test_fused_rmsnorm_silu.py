@@ -497,3 +497,53 @@ def test_uniform_weight():
 
     mismatches = ~torch.isclose(out.float(), ref.float(), atol=2e-2, rtol=2e-2)
     assert mismatches.sum().item() == 0
+
+
+# ============================================================
+# NVFP4 round-trip dequantization (verifies block_scale is usable)
+# ============================================================
+
+ROUNDTRIP_SHAPES = [
+    (1560, 256),
+    (6240, 512),
+    (24960, 1024),
+]
+
+
+@pytest.mark.skipif(not has_fp4_dtype, reason="torch.float4_e2m1fn_x2 not available")
+@pytest.mark.parametrize(
+    "num_tokens,hidden_size",
+    ROUNDTRIP_SHAPES,
+    ids=[f"t{t}_C{c}" for t, c in ROUNDTRIP_SHAPES],
+)
+def test_nvfp4_roundtrip_dequantize(num_tokens, hidden_size):
+    """Verify that (y_fp4, block_scale) can round-trip back to float via dequantization."""
+    import flashinfer
+
+    torch.manual_seed(42)
+    C = hidden_size
+    x = torch.randn(num_tokens, C, dtype=torch.bfloat16, device="cuda") * 5.0 + 5.0
+    weight = torch.rand(C, dtype=torch.bfloat16, device="cuda") * 1.5 + 0.5
+
+    out = torch.empty(num_tokens, C // 2, dtype=torch.float4_e2m1fn_x2, device="cuda")
+    y_fp4, block_scale = flashinfer.fused_rmsnorm_silu(x, weight, eps=1e-6, out=out)
+
+    z_packed = y_fp4.view(torch.uint8).reshape(num_tokens, C // 2)
+    dequantized = dequantize_nvfp4(z_packed, block_scale, num_tokens, C)
+
+    ref_f32 = rmsnorm_silu_reference(x, weight, eps=1e-6, output_dtype=torch.float32)
+
+    # FP4 has very limited precision (3-bit mantissa equivalent), so the
+    # dequantized values won't match exactly. We check relative error is
+    # bounded: each FP4 value is within one block-scale quantum of the reference.
+    abs_err = (dequantized - ref_f32).abs()
+    rel_err = abs_err / (ref_f32.abs() + 1e-6)
+    median_rel_err = rel_err.median().item()
+    assert median_rel_err < 0.5, (
+        f"NVFP4 round-trip median relative error too large: {median_rel_err:.4f}"
+    )
+    # Also check no catastrophic outliers (>2x the reference magnitude)
+    max_rel_err = rel_err.max().item()
+    assert max_rel_err < 2.0, (
+        f"NVFP4 round-trip max relative error too large: {max_rel_err:.4f}"
+    )
