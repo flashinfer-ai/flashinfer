@@ -456,6 +456,73 @@ def test_preallocated_output_fp8():
     assert mismatches.sum().item() == 0
 
 
+@pytest.mark.skipif(not has_fp4_dtype, reason="torch.float4_e2m1fn_x2 not available")
+def test_preallocated_output_nvfp4():
+    """Pre-allocated out AND block_scale for NVFP4."""
+    import flashinfer
+
+    num_tokens, hidden_size = 1560, 256
+    C = hidden_size
+    torch.manual_seed(42)
+    x = torch.randn(num_tokens, C, dtype=torch.bfloat16, device="cuda") * 5.0 + 5.0
+    weight = torch.rand(C, dtype=torch.bfloat16, device="cuda") * 1.5 + 0.5
+
+    out = torch.empty(num_tokens, C // 2, dtype=torch.float4_e2m1fn_x2, device="cuda")
+    block_scale = torch.empty(
+        num_tokens, C // 16, dtype=torch.float8_e4m3fn, device="cuda"
+    )
+
+    y_fp4, bs = flashinfer.fused_rmsnorm_silu(
+        x, weight, eps=1e-6, out=out, block_scale=block_scale
+    )
+
+    assert y_fp4.data_ptr() == out.data_ptr()
+    assert bs.data_ptr() == block_scale.data_ptr()
+    assert bs.shape == (num_tokens, C // 16)
+    assert bs.dtype == torch.float8_e4m3fn
+
+    ref_f32 = rmsnorm_silu_reference(x, weight, eps=1e-6, output_dtype=torch.float32)
+    z_packed = y_fp4.view(torch.uint8).reshape(num_tokens, C // 2)
+    kernel_nibbles = _unpack_fp4_nibbles(z_packed, num_tokens, C)
+    ref_nibbles = _quantize_to_fp4_reference(ref_f32, C)
+    nibble_diff = (kernel_nibbles - ref_nibbles).abs()
+    assert (nibble_diff > 1).sum().item() == 0
+
+
+@pytest.mark.skipif(not has_fp4_dtype, reason="torch.float4_e2m1fn_x2 not available")
+def test_preallocated_block_scale_wrong_shape():
+    """block_scale with wrong shape should raise ValueError."""
+    import flashinfer
+
+    num_tokens, C = 1560, 256
+    x = torch.randn(num_tokens, C, dtype=torch.bfloat16, device="cuda")
+    weight = torch.rand(C, dtype=torch.bfloat16, device="cuda")
+    out = torch.empty(num_tokens, C // 2, dtype=torch.float4_e2m1fn_x2, device="cuda")
+    bad_scale = torch.empty(num_tokens, 1, dtype=torch.float8_e4m3fn, device="cuda")
+
+    with pytest.raises(ValueError, match="block_scale shape mismatch"):
+        flashinfer.fused_rmsnorm_silu(
+            x, weight, eps=1e-6, out=out, block_scale=bad_scale
+        )
+
+
+@pytest.mark.skipif(not has_fp4_dtype, reason="torch.float4_e2m1fn_x2 not available")
+def test_preallocated_block_scale_wrong_dtype():
+    """block_scale with wrong dtype should raise ValueError."""
+    import flashinfer
+
+    num_tokens, C = 1560, 256
+    x = torch.randn(num_tokens, C, dtype=torch.bfloat16, device="cuda")
+    weight = torch.rand(C, dtype=torch.bfloat16, device="cuda")
+    out = torch.empty(num_tokens, C // 2, dtype=torch.float4_e2m1fn_x2, device="cuda")
+    bad_scale = torch.empty(num_tokens, C // 16, dtype=torch.float32, device="cuda")
+
+    with pytest.raises(ValueError, match="block_scale must be float8_e4m3fn"):
+        flashinfer.fused_rmsnorm_silu(
+            x, weight, eps=1e-6, out=out, block_scale=bad_scale
+        )
+
+
 # ============================================================
 # Numerical edge cases
 # ============================================================

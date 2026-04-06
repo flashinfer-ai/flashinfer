@@ -596,6 +596,7 @@ def fused_rmsnorm_silu(
     weight: torch.Tensor,
     eps: float = 1e-6,
     out: Optional[torch.Tensor] = None,
+    block_scale: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, tuple]:
     r"""Fused RMSNorm + SiLU activation.
 
@@ -615,9 +616,20 @@ def fused_rmsnorm_silu(
     eps: float
         Epsilon for numerical stability.
     out: Optional[torch.Tensor]
-        Output tensor. If None, allocated as same shape/dtype as input.
-        For NVFP4 output (``torch.float4_e2m1fn_x2``), shape must be
-        ``(num_tokens, hidden_size // 2)``.
+        Output tensor. If ``None``, allocated as ``bfloat16`` matching input.
+        The dtype of ``out`` selects the output format:
+
+        - ``torch.bfloat16``: shape ``(num_tokens, hidden_size)``.
+        - ``torch.float8_e4m3fn``: FP8 E4M3 output, shape ``(num_tokens, hidden_size)``.
+          Requires SM89+ (Ada/Hopper).
+        - ``torch.float4_e2m1fn_x2``: NVFP4 block-scaled output, shape
+          ``(num_tokens, hidden_size // 2)``. Requires SM100+ (Blackwell)
+          and ``hidden_size`` divisible by 16.
+    block_scale: Optional[torch.Tensor]
+        Pre-allocated output tensor for per-block scale factors (NVFP4 only).
+        Shape ``(num_tokens, hidden_size // 16)``, dtype ``torch.float8_e4m3fn``.
+        If ``None``, allocated automatically when ``out`` is NVFP4.
+        Ignored for bf16/fp8 output.
 
     Returns
     -------
@@ -713,13 +725,26 @@ def fused_rmsnorm_silu(
 
     if output_dtype_str == "nvfp4":
         num_blocks = C // 16
-        block_scale = torch.empty(
-            num_tokens, num_blocks, dtype=torch.float8_e4m3fn, device=input.device
-        )
+        if block_scale is None:
+            block_scale = torch.empty(
+                num_tokens, num_blocks, dtype=torch.float8_e4m3fn, device=input.device
+            )
+        else:
+            expected_shape = (num_tokens, num_blocks)
+            if tuple(block_scale.shape) != expected_shape:
+                raise ValueError(
+                    f"block_scale shape mismatch: expected {expected_shape}, "
+                    f"got {tuple(block_scale.shape)}"
+                )
+            if block_scale.dtype != torch.float8_e4m3fn:
+                raise ValueError(
+                    f"block_scale must be float8_e4m3fn, got {block_scale.dtype}"
+                )
+        scale_row_out = block_scale
     else:
-        block_scale = torch.empty(0, dtype=torch.uint8, device=input.device)
+        scale_row_out = torch.empty(0, dtype=torch.uint8, device=input.device)
 
-    module.rmsnorm_silu(out, input, weight, eps, workspace, block_scale, sm_count)
+    module.rmsnorm_silu(out, input, weight, eps, workspace, scale_row_out, sm_count)
 
     if output_dtype_str == "nvfp4":
         return out, block_scale
