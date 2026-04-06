@@ -642,6 +642,15 @@ def fused_rmsnorm_silu(
         ``(num_tokens, hidden_size // 2)`` with dtype ``float4_e2m1fn_x2``,
         and ``block_scale`` has shape ``(num_tokens, hidden_size // 16)``
         with dtype ``float8_e4m3fn`` (one E4M3 scale per 16-element block).
+
+    Notes
+    -----
+    Kernel tuning knobs are sweep-optimized on B200 (SM100) for WAN VAE
+    decoder problem sizes: ``hidden_size`` in {64, 128, 160, 256, 320, 512,
+    640, 1024} and ``num_tokens`` in {1560, 6240, 24960, 99840, 399360}.
+    Other problem sizes use conservative fallback heuristics that are
+    functionally correct but may not achieve peak throughput. Performance
+    on non-SM100 architectures (SM80/SM89) uses the same fallback path.
     """
     if input.device.type != "cuda":
         raise ValueError("fused_rmsnorm_silu requires CUDA tensors")
