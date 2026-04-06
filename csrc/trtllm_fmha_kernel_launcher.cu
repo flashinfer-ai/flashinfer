@@ -305,6 +305,7 @@ void trtllm_paged_attention_decode(
       value_block_scales.has_value() ? value_block_scales.value().data_ptr() : nullptr;
 
   // Read actual scale factor strides from the scale tensors (HND layout: [pages, heads, N, D/16]).
+  // These are passed separately to the kernel instead of being derived from KV data strides.
   int k_sf_stride_heads = 0, k_sf_stride_batch = 0;
   int v_sf_stride_heads = 0, v_sf_stride_batch = 0;
   if (key_block_scales.has_value()) {
