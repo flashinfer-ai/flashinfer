@@ -290,7 +290,7 @@ For Ultra with L_max=10, pool_size=256: ~94 MiB total (vs 24 GiB for SSM state c
 - [x] Same for vertical and horizontal TMA variants
 - [x] C++ dispatch accepts and validates buffer tensors
 - [x] Python API exposes `xab_x`, `xab_dt`, `xab_B` parameters
-- [x] Correctness test: STP with buffer matches fp32 reference (27/27 pass)
+- [x] Correctness test: STP with buffer matches Triton multi-token reference (27/27 pass)
 - [x] Correctness test: state unchanged when `disable_state_update=True`
 - [ ] Correctness test: checkpoint writeback produces correct final state
 - [x] `xab_length=0` (no buffer) is identical to today's behavior
@@ -306,6 +306,21 @@ For Ultra with L_max=10, pool_size=256: ~94 MiB total (vs 24 GiB for SSM state c
 | `csrc/selective_state_update.cu` | Accept buffer tensors in C++ dispatch |
 | `flashinfer/mamba/selective_state_update.py` | Add `xab_x`, `xab_dt`, `xab_B` to Python API |
 | `tests/mamba/test_ssm_cache_checkpointing.py` | Correctness tests |
+
+---
+
+## Environment Setup
+
+```bash
+# Activate the venv (required before running tests or pip install)
+source /my_home/venvs/fi/bin/activate
+
+# Install in editable mode (only needed once, or after git clean)
+pip install --no-build-isolation -e . -v
+
+# Clear JIT cache (when kernel code changes aren't picked up)
+rm -rf ~/.cache/flashinfer/
+```
 
 ---
 
@@ -334,6 +349,26 @@ For Ultra with L_max=10, pool_size=256: ~94 MiB total (vs 24 GiB for SSM state c
   ```
   cd /my_home/flashinfer && /my_home/venvs/fi/bin/python -m pytest --tb=short tests/mamba/test_ssm_cache_checkpointing.py -v
   cd /my_home/flashinfer && /my_home/venvs/fi/bin/python -m pytest --tb=short tests/mamba/test_selective_state_update_stp.py::TestSelectiveStateUpdate::test_output_correctness -v
+  ```
+
+### Session 3 (2026-04-06) — Replaced hand-rolled reference with Triton
+
+- [x] Replaced `_reference_fast_forward` (hand-written fp32 Python loop) with
+  `selective_state_update_triton` called with all K+1 tokens in a single
+  multi-token pass. The Triton kernel processes all T tokens in fp32 registers
+  without intermediate bf16 round-trips — same semantics as our checkpointing
+  kernel. This is a stronger test: it uses the established ground-truth reference
+  instead of a hand-rolled simulation.
+- [x] Removed unused `torch.nn.functional` import and `A_base`/`D_base`/`dt_bias_base`
+  dict entries that were only needed by the old reference.
+- [x] **All 27 checkpointing tests pass** (Triton reference)
+- [x] **All 59 baseline STP tests pass** (no regression)
+- Run commands:
+  ```
+  source /my_home/venvs/fi/bin/activate
+  cd /my_home/flashinfer && rm -rf ~/.cache/flashinfer/
+  python -m pytest tests/mamba/test_ssm_cache_checkpointing.py -v
+  python -m pytest tests/mamba/test_selective_state_update_stp.py -v
   ```
 
 ---
