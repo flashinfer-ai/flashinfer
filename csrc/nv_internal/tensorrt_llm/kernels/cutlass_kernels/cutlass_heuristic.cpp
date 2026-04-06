@@ -589,19 +589,17 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm120(
     CutlassGemmConfig::CandidateConfigTypeParam const config) {
 #ifdef FAST_BUILD
   if (config & CutlassGemmConfig::GROUPED_GEMM) {
-    return {CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x128B,
-                              MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
-                              ClusterShape::ClusterShape_1x1x1},
-            CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x64B,
-                              MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
-                              ClusterShape::ClusterShape_1x1x1}};
+    return {
+        CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x128B, MainloopScheduleType::AUTO,
+                          EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1},
+        CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x64B, MainloopScheduleType::AUTO,
+                          EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1}};
   } else {
-    return {CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x256B,
-                              MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
-                              ClusterShape::ClusterShape_1x1x1},
-            CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x64B,
-                              MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
-                              ClusterShape::ClusterShape_1x1x1}};
+    return {
+        CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x256B, MainloopScheduleType::AUTO,
+                          EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1},
+        CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x64B, MainloopScheduleType::AUTO,
+                          EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1}};
   }
 #else
   if ((config & CutlassGemmConfig::FP4_ONLY) == 0) {

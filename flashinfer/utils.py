@@ -524,7 +524,6 @@ def has_cuda_cudart() -> bool:
 # Re-export from jit.env to avoid circular dependency
 from .jit.env import (
     has_flashinfer_jit_cache as has_flashinfer_jit_cache,
-    has_flashinfer_cubin as has_flashinfer_cubin,
 )
 
 
