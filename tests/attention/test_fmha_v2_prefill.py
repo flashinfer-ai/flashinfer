@@ -492,12 +492,6 @@ def run_trtllm_fmha_v2_prefill_case(
     is_sm120_plus = is_sm120a_supported(torch.device("cuda"))
     if dtype == torch.float8_e4m3fn and is_sm120_plus:
         pytest.skip("FP8 FMHAv2 not yet supported on SM120+")
-    if dtype == torch.float8_e4m3fn and head_dim == 256:
-        pytest.skip(
-            "todo(bobboli): fp8 with head_dim=256 hangs on SM90 tma_ws kernel due to "
-            "barrier deadlock in transpose_v_tile "
-            "(fmha_v2_flash_attention_e4m3_*_S_qkv_256_*_tma_ws_sm90_kernel+0xedf0)"
-        )
     if input_layout == "SEPARATE_Q_K_V" and dtype == torch.float8_e4m3fn:
         pytest.skip("FP8 not supported for SEPARATE_Q_K_V layout")
     if input_layout == "SEPARATE_Q_K_V" and is_sm120_plus:
