@@ -51,12 +51,20 @@ pynvml.nvmlInit()
 
 
 def _sm90_available() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    from flashinfer.utils import get_compute_capability
+
+    major, _ = get_compute_capability(torch.device("cuda"))
+    return major >= 9
+
+
+def _mpi4py_available() -> bool:
     try:
-        if not torch.cuda.is_available():
-            return False
-        major, _ = torch.cuda.get_device_capability(0)
-        return major >= 9
-    except Exception:
+        import mpi4py  # noqa: F401
+
+        return True
+    except ImportError:
         return False
 
 
@@ -68,6 +76,10 @@ pytestmark = [
     pytest.mark.skipif(
         not mnnvl_available(),
         reason="MNNVL not supported on this platform or container lacks SYS_PTRACE",
+    ),
+    pytest.mark.skipif(
+        not _mpi4py_available(),
+        reason="mpi4py not installed (run with: mpirun -np N pytest ...)",
     ),
 ]
 
@@ -100,36 +112,42 @@ def _setup_rank():
 
 # ─── Module-level MNNVL workspace (allocated once, reused across tests) ──
 
-_rank, _cp_size, _comm = _setup_rank()
+# Guard module-level allocation: pytestmark skipif conditions are not
+# enforced during module import (collection phase). If we allocate
+# unconditionally, CI environments without SYS_PTRACE will fail at
+# collection time instead of gracefully skipping.
+if _sm90_available() and mnnvl_available() and _mpi4py_available():
+    _rank, _cp_size, _comm = _setup_rank()
 
+    def _allocate_mnnvl_workspace_once():
+        """Allocate MNNVL workspace once at module level.
 
-def _allocate_mnnvl_workspace_once():
-    """Allocate MNNVL workspace once at module level.
+        MnnvlMemory uses a global bump allocator that doesn't support
+        individual frees. Allocating per-test causes segfaults when
+        workspace tensors from previous tests get GC'd. So we allocate
+        once and reuse.
+        """
+        MnnvlMemory.initialize()
+        MnnvlMemory.comm = _comm
 
-    MnnvlMemory uses a global bump allocator that doesn't support
-    individual frees. Allocating per-test causes segfaults when
-    workspace tensors from previous tests get GC'd. So we allocate
-    once and reuse.
-    """
-    MnnvlMemory.initialize()
-    MnnvlMemory.comm = _comm
+        mapping = Mapping(
+            world_size=_cp_size,
+            rank=_rank,
+            cp_size=_cp_size,
+            tp_size=1,
+            pp_size=1,
+        )
 
-    mapping = Mapping(
-        world_size=_cp_size,
-        rank=_rank,
-        cp_size=_cp_size,
-        tp_size=1,
-        pp_size=1,
-    )
+        ws_bytes = decode_cp_a2a_workspace_size(_cp_size)
+        mnnvl_mem = MnnvlMemory(mapping, ws_bytes)
+        workspace = mnnvl_mem.as_torch_strided_tensor(torch.int64)
+        workspace._mnnvl_mem = mnnvl_mem  # prevent GC
+        return workspace
 
-    ws_bytes = decode_cp_a2a_workspace_size(_cp_size)
-    mnnvl_mem = MnnvlMemory(mapping, ws_bytes)
-    workspace = mnnvl_mem.as_torch_strided_tensor(torch.int64)
-    workspace._mnnvl_mem = mnnvl_mem  # prevent GC
-    return workspace
-
-
-_mnnvl_workspace = _allocate_mnnvl_workspace_once()
+    _mnnvl_workspace = _allocate_mnnvl_workspace_once()
+else:
+    _rank, _cp_size, _comm = 0, 1, None
+    _mnnvl_workspace = None
 
 
 # ─── Tests ───────────────────────────────────────────────────────────────
