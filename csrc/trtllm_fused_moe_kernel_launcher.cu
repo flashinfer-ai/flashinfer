@@ -853,7 +853,9 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
           dtype_act, dtype_weights,
           false,  // useDeepSeekFp8
           tile_N, static_cast<ActivationType>(act_type), use_shuffled_weight,
-          static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout));
+          static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout),
+          true  // usePerTokenScaling. always true for per-tensor fp8 due to llama4 routing
+      );
 
       auto cfgs = moe_runner->getValidConfigIndices(top_k, hidden_size, intermediate_size,
                                                     num_local_experts, num_tokens);
@@ -1449,12 +1451,14 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
       TensorView const& gemm2_weights, TensorView const& gemm2_weights_scale,
       Optional<TensorView> const& gemm2_bias, Optional<TensorView> const& output1_scales_scalar,
       Optional<TensorView> const& output1_scales_gate_scalar,
-      Optional<TensorView> const& output2_scales_scalar, TensorView const& expert_indices,
+      Optional<TensorView> const& output2_scales_scalar,
+      Optional<TensorView> const& per_token_scales, TensorView const& expert_indices,
       TensorView const& expert_weights)
       : FusedMoeLauncher(routing_logits, routing_bias, hidden_states, gemm1_weights,
                          output1_scales_scalar, output1_scales_gate_scalar, gemm2_weights,
                          output2_scales_scalar),
         hidden_states_scale(hidden_states_scale),
+        per_token_scales(per_token_scales),
         gemm1_weights_scale(gemm1_weights_scale),
         gemm1_bias(gemm1_bias),
         gemm1_alpha(gemm1_alpha),
@@ -1620,14 +1624,24 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
 
     auto const gemm1_output_hidden =
         mDtypeAct == btg::Dtype::E2m1 ? args->intermediate_size / 2 : args->intermediate_size;
-    gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, gemm1_output_hidden},
-                                mDtypeAct == btg::Dtype::Bfloat16 ? dl_bfloat16 : dl_uint8,
-                                hidden_states.device());
-
     if (mDtypeAct == btg::Dtype::E2m1 || mDtypeAct == btg::Dtype::MxE4m3) {
       int64_t sf_size = tensorrt_llm::computeSwizzledLayoutSFSize(
           max_num_padded_tokens_gemm1, args->intermediate_size / sf_vec_size);
       gemm1_output_scale = alloc_tensor({sf_size}, dl_uint8, hidden_states.device());
+    }
+    if (!per_token_scales.has_value()) {
+      gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, gemm1_output_hidden},
+                                  mDtypeAct == btg::Dtype::Bfloat16 ? dl_bfloat16 : dl_uint8,
+                                  hidden_states.device());
+    } else {  // FC1 output is Bfloat16
+      TVM_FFI_ICHECK(mDtypeAct == btg::Dtype::E2m1)
+          << "NvFP4 MoE: currently only support NvFP4 x NvFP4 when using per-token scaling.";
+      // When per-token scales are used, the FC1 output is always BF16 and will be quantized
+      gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, args->intermediate_size},
+                                  dl_bfloat16, hidden_states.device());
+
+      activation_output = alloc_tensor({max_num_padded_tokens_gemm1, gemm1_output_hidden}, dl_uint8,
+                                       hidden_states.device());
     }
 
     // Allocate gemm2_output
@@ -1640,14 +1654,18 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     workspace.gemm1_output_scale = gemm1_output_scale.has_value()
                                        ? static_cast<float*>(gemm1_output_scale.value().data_ptr())
                                        : nullptr;
-    // Note: activation_output and activation_output_scale are set by the base class
-    // prepare_moe_common() when gated activation is used
+    if (per_token_scales.has_value()) {
+      workspace.token_scales = per_token_scales.value().data_ptr();
+      workspace.activation_output = activation_output.data_ptr();
+      workspace.activation_output_scale = workspace.gemm1_output_scale;
+    }
     workspace.gemm2_output = gemm2_output.data_ptr();
     workspace.gemm2_output_scale = nullptr;
   }
 
  private:
   Optional<TensorView> hidden_states_scale;
+  Optional<TensorView> per_token_scales;
   TensorView gemm1_weights_scale;
   Optional<TensorView> gemm1_bias;
   Optional<TensorView> gemm1_alpha;
@@ -1706,7 +1724,8 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
   static Array<Array<int64_t>> getValidConfigs(int64_t top_k, int64_t hidden_size,
                                                int64_t intermediate_size, int64_t num_local_experts,
                                                int64_t num_tokens, int64_t act_type,
-                                               btg::Dtype dtype_act, btg::Dtype dtype_weights) {
+                                               btg::Dtype dtype_act, btg::Dtype dtype_weights,
+                                               bool use_per_token_scaling) {
     Array<Array<int64_t>> valid_configs;
 
     std::vector<int32_t> tile_sizes = getSupportedTileNums(dtype_act);
@@ -1718,7 +1737,10 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
           dtype_act, dtype_weights,
           false,  // useDeepSeekFp8
           tile_N, static_cast<ActivationType>(act_type),
-          /*useShuffledMatrix*/ true);  // FP4 uses shuffled weights
+          /*useShuffledMatrix*/ true,
+          /*weight_layout*/ batchedGemm::gemm::MatrixLayout::MajorK,
+          /*usePerTokenScaling*/ use_per_token_scaling,
+          /*useExplicitQuantization*/ use_per_token_scaling);  // FP4 uses shuffled weights
 
       auto cfgs = moe_runner->getValidConfigIndices(top_k, hidden_size, intermediate_size,
                                                     num_local_experts, num_tokens);
@@ -2033,11 +2055,12 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
     Optional<TensorView> gemm1_clamp_limit, TensorView gemm2_weights,
     TensorView gemm2_weights_scale, Optional<TensorView> gemm2_bias,
     Optional<TensorView> output1_scales_scalar, Optional<TensorView> output1_scales_gate_scalar,
-    Optional<TensorView> output2_scales_scalar, int64_t num_experts, int64_t top_k,
-    Optional<int64_t> n_group, Optional<int64_t> topk_group, int64_t intermediate_size,
-    int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
-    int64_t routing_method_type, bool do_finalize, bool enable_pdl, int64_t act_type,
-    TensorView output, Array<int64_t> config_index, bool norm_topk_prob) {
+    Optional<TensorView> output2_scales_scalar, Optional<TensorView> per_token_scales,
+    int64_t num_experts, int64_t top_k, Optional<int64_t> n_group, Optional<int64_t> topk_group,
+    int64_t intermediate_size, int64_t local_expert_offset, int64_t local_num_experts,
+    Optional<double> routed_scaling_factor, int64_t routing_method_type, bool do_finalize,
+    bool enable_pdl, int64_t act_type, TensorView output, Array<int64_t> config_index,
+    bool norm_topk_prob) {
   // Determine data types based on input format
   int const num_tokens = hidden_states.size(0);
   int hidden_size = hidden_states.size(1);
@@ -2141,7 +2164,7 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
         routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,
         gemm1_weights_scale, gemm1_bias, gemm1_alpha, gemm1_beta, gemm1_clamp_limit, gemm2_weights,
         gemm2_weights_scale, gemm2_bias, output1_scales_scalar, output1_scales_gate_scalar,
-        output2_scales_scalar, expert_indices, expert_weights);
+        output2_scales_scalar, per_token_scales, expert_indices, expert_weights);
     launcher->init(std::move(args), curr_tile_N, routing_method_type, /*use_shuffled_weight=*/true,
                    /*weight_layout=*/0, static_cast<ActivationType>(act_type), mDtypeAct,
                    mDtypeWeights, norm_topk_prob);
@@ -2247,10 +2270,11 @@ Array<Tensor> trtllm_mxint4_block_scale_moe(
 }
 
 Array<Array<int64_t>> trtllm_get_valid_moe_configs(
-    int64_t const dtype_act_, int64_t const dtype_weights_, Fp8QuantizationType quantization_type,
-    int64_t const top_k, int64_t const hidden_size, int64_t const intermediate_size,
-    int64_t const num_local_experts, int64_t const act_type, bool const use_shuffled_weight,
-    int64_t const weight_layout, int64_t const num_tokens) {
+    int64_t const dtype_act_, int64_t const dtype_weights_,
+    Fp8QuantizationType fp8_quantization_type, int64_t const top_k, int64_t const hidden_size,
+    int64_t const intermediate_size, int64_t const num_local_experts, int64_t const act_type,
+    bool const use_shuffled_weight, int64_t const weight_layout, bool const use_per_token_scaling,
+    int64_t const num_tokens) {
   auto activation_type = validateAndCastActivationType(act_type);
   auto dtype_act = static_cast<btg::Dtype>(dtype_act_);
   auto dtype_weights = static_cast<btg::Dtype>(dtype_weights_);
@@ -2266,7 +2290,7 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
                                             num_local_experts, num_tokens, act_type,
                                             use_shuffled_weight, weight_layout);
 
-  } else if (quantization_type == Fp8QuantizationType::DeepSeekFp8 &&
+  } else if (fp8_quantization_type == Fp8QuantizationType::DeepSeekFp8 &&
              dtype_act == btg::Dtype::E4m3 && dtype_weights == btg::Dtype::E4m3) {
     if (activation_type != ActivationType::Swiglu) {
       TVM_FFI_LOG_AND_THROW(NotImplementedError)
@@ -2276,15 +2300,15 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
     // FP8 block scale (DeepSeek)
     return Fp8BlockScaleLauncher::getValidConfigs(
         top_k, hidden_size, intermediate_size, num_local_experts, num_tokens, use_shuffled_weight,
-        weight_layout, dtype_act, dtype_weights, quantization_type, act_type);
-  } else if (quantization_type == Fp8QuantizationType::MxFp8 && dtype_act == btg::Dtype::MxE4m3 &&
-             dtype_weights == btg::Dtype::MxE4m3) {
+        weight_layout, dtype_act, dtype_weights, fp8_quantization_type, act_type);
+  } else if (fp8_quantization_type == Fp8QuantizationType::MxFp8 &&
+             dtype_act == btg::Dtype::MxE4m3 && dtype_weights == btg::Dtype::MxE4m3) {
     // FP8 block scale (MxFp8)
     return Fp8BlockScaleLauncher::getValidConfigs(
         top_k, hidden_size, intermediate_size, num_local_experts, num_tokens, use_shuffled_weight,
-        weight_layout, dtype_act, dtype_weights, quantization_type, act_type);
-  } else if ((quantization_type == Fp8QuantizationType::PerTensorFp8 ||
-              quantization_type == Fp8QuantizationType::NoneFp8) &&
+        weight_layout, dtype_act, dtype_weights, fp8_quantization_type, act_type);
+  } else if ((fp8_quantization_type == Fp8QuantizationType::PerTensorFp8 ||
+              fp8_quantization_type == Fp8QuantizationType::NoneFp8) &&
              dtype_weights == btg::Dtype::E4m3) {
     // FP8 per-tensor scale. NoneFp8 is kept for backward compatibility.
     if (!isGatedActivation(activation_type)) {
@@ -2299,14 +2323,14 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
     // FP4 block scale
     return FP4BlockScaleLauncher::getValidConfigs(top_k, hidden_size, intermediate_size,
                                                   num_local_experts, num_tokens, act_type,
-                                                  dtype_act, dtype_weights);
+                                                  dtype_act, dtype_weights, use_per_token_scaling);
   }
 
   TVM_FFI_LOG_AND_THROW(NotImplementedError)
       << "Unsupported data type combination for getValidConfigs: "
       << "dtype_act=" << static_cast<int>(dtype_act)
       << ", dtype_weights=" << static_cast<int>(dtype_weights)
-      << ", quantization_type=" << fp8QuantizationTypeToString(quantization_type);
+      << ", fp8_quantization_type=" << fp8QuantizationTypeToString(fp8_quantization_type);
 
   // Unreachable code - added to suppress compiler warning
   return Array<Array<int64_t>>();

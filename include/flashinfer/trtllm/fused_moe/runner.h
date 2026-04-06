@@ -29,6 +29,10 @@ namespace tensorrt_llm {
 namespace kernels {
 namespace trtllmgen_moe {
 
+namespace MoE {
+class Runner;
+}  // namespace MoE
+
 namespace Routing {
 
 // The type of method in top-K routing, for use in torch custom op
@@ -140,6 +144,7 @@ class Runner {
            bool normTopkProb = true);
 
  private:
+  friend class MoE::Runner;
   int32_t mTileTokensDim{8};
   int32_t mClusterSizeInBatchDim{1};
 };
@@ -194,9 +199,10 @@ namespace PermuteGemm1 {
 class Runner {
  public:
   explicit Runner(batchedGemm::trtllm::gen::Dtype dtypeAct,
-                  batchedGemm::trtllm::gen::Dtype dtypeWeights, bool useDeepSeekFp8,
+                  batchedGemm::trtllm::gen::Dtype dtypeWeights,
+                  batchedGemm::trtllm::gen::Dtype dtypeOutput, bool useDeepSeekFp8,
                   int tileTokensDim, MoE::ActivationType activationType, bool useShuffledMatrix,
-                  batchedGemm::gemm::MatrixLayout weight_layout);
+                  batchedGemm::gemm::MatrixLayout weight_layout, bool usePerTokenScaling);
 
   size_t getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
                                  int32_t numExperts, int32_t numTokens, int32_t configIndex) const;
@@ -222,8 +228,10 @@ class Runner {
            int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl);
 
  private:
+  friend class MoE::Runner;
   batchedGemm::trtllm::gen::Dtype mDtypeAct;
   batchedGemm::trtllm::gen::Dtype mDtypeWeights;
+  batchedGemm::trtllm::gen::Dtype mDtypeOutput;
   int32_t mTileTokensDim;
   tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner mRunner;
   tensorrt_llm::kernels::trtllmgen_moe::MoE::ActivationType mActType;
@@ -237,7 +245,7 @@ class Runner {
                   batchedGemm::trtllm::gen::Dtype dtypeWeights,
                   batchedGemm::trtllm::gen::Dtype outputDtype, bool useDeepSeekFp8,
                   int tileTokensDim, bool useShuffledMatrix,
-                  batchedGemm::gemm::MatrixLayout weight_layout);
+                  batchedGemm::gemm::MatrixLayout weight_layout, bool usePerTokenScaling);
 
   size_t getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
                                  int32_t numExperts, int32_t numTokens, int32_t configIndex) const;
@@ -253,14 +261,15 @@ class Runner {
   [[nodiscard]] std::vector<int64_t> getPassingConfigIndices() const;
 
   void run(void* permutedHiddenState, void* permutedHiddenStateScale, void* weight,
-           void* weightScale, float* outputScalesScalar, float* ptrBias, void* output,
-           void* outputScale, int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
-           int32_t numExperts, int32_t numTokens, int32_t* ptrNumNonExitingCtas,
-           int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx,
-           int32_t* ptrCtaIdxXyToMnLimit, void* bmm2Workspace, int device, cudaStream_t stream,
-           int32_t configIndex, bool enable_pdl);
+           void* weightScale, void* perTokenScales, float* outputScalesScalar, float* ptrBias,
+           void* output, void* outputScale, int32_t topK, int32_t hiddenSize,
+           int32_t intermediateSize, int32_t numExperts, int32_t numTokens,
+           int32_t* ptrNumNonExitingCtas, int32_t* ptrTotalNumPaddedTokens,
+           int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit, void* bmm2Workspace,
+           int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl);
 
  private:
+  friend class MoE::Runner;
   batchedGemm::trtllm::gen::Dtype mDtypeAct;
   batchedGemm::trtllm::gen::Dtype mDtypeWeights;
   batchedGemm::trtllm::gen::Dtype mDtypeOut;
@@ -393,10 +402,12 @@ class Runner {
   Runner(batchedGemm::trtllm::gen::Dtype dtypeAct, batchedGemm::trtllm::gen::Dtype dtypeWeights,
          bool useDeepSeekFp8, int tileTokensDim = 8,
          ActivationType activationType = ActivationType::Swiglu, bool useShuffledMatrix = false,
-         batchedGemm::gemm::MatrixLayout weight_layout = batchedGemm::gemm::MatrixLayout::MajorK);
+         batchedGemm::gemm::MatrixLayout weight_layout = batchedGemm::gemm::MatrixLayout::MajorK,
+         bool usePerTokenScaling = false, bool useExplicitQuantization = false);
   Runner(batchedGemm::trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8, int tileTokensDim = 8,
          bool useShuffledMatrix = false,
-         batchedGemm::gemm::MatrixLayout weight_layout = batchedGemm::gemm::MatrixLayout::MajorK);
+         batchedGemm::gemm::MatrixLayout weight_layout = batchedGemm::gemm::MatrixLayout::MajorK,
+         bool usePerTokenScaling = false, bool useExplicitQuantization = false);
 
   void run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int device,
            cudaStream_t stream, int64_t configIndex, bool enable_pdl);
@@ -421,6 +432,7 @@ class Runner {
                   moe::dev::finalize::Data& finalizeData);
 
  private:
+  bool mUseExplicitQuantization;
   PermuteGemm1::Runner mPermuteGemm1;
   Gemm2::Runner mGemm2;
 
