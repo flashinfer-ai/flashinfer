@@ -236,8 +236,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
              || routingMethodType == RoutingMethodType::TopK /* TopK only (no softmax) */
              || routingMethodType ==
                     RoutingMethodType::SigmoidRenorm /* Sigmoid -> TopK -> Renormalize */
-             || routingMethodType ==
-                    RoutingMethodType::Sigmoid /* Sigmoid -> TopK */) {
+             || routingMethodType == RoutingMethodType::Sigmoid /* Sigmoid -> TopK */) {
     using namespace moe::dev::routing;
     routingCustom::Data routingData;
 
