@@ -464,6 +464,11 @@ struct KernelParams {
     // The number of elements per SF.
     int32_t NumEltsPerSf = 16;
 
+    // Use actual scale factor strides instead of deriving from KV strides.
+    // The SF tensor may have different strides than KV/16 (e.g. due to alignment padding).
+    int32_t sfStrideHeads = isK ? options.kSfStrideHeads : options.vSfStrideHeads;
+    int32_t sfStrideBatch = isK ? options.kSfStrideBatch : options.vSfStrideBatch;
+
     // The KV shape is: (headDim, numKeys, numHeadsKv, batchSize)
     // Therefore, the KV SF shape should be (headDim / NumEltsPerSf, numKeys, numHeadsKv,
     // batchSize). Considering the TMA requires box width to be multiple of 16B, without changing
@@ -476,8 +481,8 @@ struct KernelParams {
     auto shape = std::vector<uint64_t>{
         16, static_cast<uint64_t>(numKeys * headDim / NumEltsPerSf / 16),
         static_cast<uint64_t>(options.mNumHeadsKv), static_cast<uint64_t>(batchSize)};
-    auto stride = std::vector<uint64_t>{1, 16, static_cast<uint64_t>(strideHeads / NumEltsPerSf),
-                                        static_cast<uint64_t>(strideBatch / NumEltsPerSf)};
+    auto stride = std::vector<uint64_t>{1, 16, static_cast<uint64_t>(sfStrideHeads),
+                                        static_cast<uint64_t>(sfStrideBatch)};
 
     return std::make_tuple(shape, stride);
   }
