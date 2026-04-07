@@ -500,12 +500,6 @@ def test_moe_nvfp4(
             f"top_k ({top_k}) cannot be greater than num_experts ({num_experts})"
         )
 
-    if torch.cuda.get_device_capability()[0] == 12:
-        pytest.skip(
-            "CUTLASS MoE NVFP4 has no valid tile config on SM120/121 "
-            "(K=64 tiles in dispatch but missing from are_tile_shapes_supported_sm120)"
-        )
-
     torch.manual_seed(42)
     quant_blocksize = 16
     round_up = lambda x, y: (x + y - 1) // y * y
@@ -1284,9 +1278,6 @@ def test_moe_mxfp8_mxfp4(
         pytest.skip(
             f"top_k ({top_k}) cannot be greater than num_experts ({num_experts})"
         )
-
-    if torch.cuda.get_device_capability()[0] == 12:
-        pytest.skip("CUTLASS MoE MXFP8xMXFP4 has no valid tile config on SM120/121")
 
     torch.manual_seed(42)
     e = num_experts
