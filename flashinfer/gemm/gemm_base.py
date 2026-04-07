@@ -996,9 +996,10 @@ def get_mm_bf16_cublaslt_module():
             @staticmethod
             def _compute_dtype(out_dtype):
                 # cuBLASLt with BF16 inputs supports BF16 or FP32 output natively.
-                # FP16 output is achieved via BF16 compute + cast.
+                # FP16 output is achieved via FP32 compute + cast (FP32→FP16
+                # preserves more precision than BF16→FP16).
                 if out_dtype == torch.float16:
-                    return torch.bfloat16
+                    return torch.float32
                 return out_dtype
 
             def _get_algos(self, inputs):
@@ -1052,9 +1053,10 @@ def get_mm_bf16_cublaslt_module():
                     cublas_handle = torch.cuda.current_blas_handle()
                 b_t = b.transpose(-2, -1)
 
-                need_cast = out.dtype == torch.float16
+                compute_dt = self._compute_dtype(out.dtype)
+                need_cast = out.dtype != compute_dt
                 if need_cast:
-                    compute_out = torch.empty_like(out, dtype=torch.bfloat16)
+                    compute_out = torch.empty_like(out, dtype=compute_dt)
                 else:
                     compute_out = out
 
