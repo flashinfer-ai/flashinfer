@@ -732,6 +732,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     jit_args[0],
                     gen_customize_batch_decode_module(*jit_args).build_and_load(),
                 )
+            # jit_args[7] is additional_tensor_names from gen_customize_batch_decode/prefill_module
             self._jit_additional_tensor_names = list(jit_args[7])
         else:
             self._jit_module = None
@@ -1410,7 +1411,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                         {
                             "maybe_custom_mask": None,
                             "maybe_mask_indptr": None,
-                            "maybe_alibi_slopes": _get_cache_alibi_slopes_buf(
+                            "maybe_alibi_slopes": lambda: _get_cache_alibi_slopes_buf(
                                 q.shape[1], q.device
                             ),
                         },
@@ -1487,7 +1488,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     prepare_jit_additional_args(
                         self._jit_additional_tensor_names,
                         {
-                            "maybe_alibi_slopes": _get_cache_alibi_slopes_buf(
+                            "maybe_alibi_slopes": lambda: _get_cache_alibi_slopes_buf(
                                 q.shape[1], q.device
                             ),
                         },

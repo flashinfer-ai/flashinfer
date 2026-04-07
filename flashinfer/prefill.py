@@ -1556,6 +1556,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 jit_args[0],
                 get_customize_batch_prefill_module(backend, *jit_args, **jit_kwargs),
             )
+            # jit_args[7] is additional_tensor_names from gen_customize_batch_prefill_module
             self._jit_additional_tensor_names = list(jit_args[7])
         else:
             self._jit_module = None
@@ -2364,7 +2365,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                         {
                             "maybe_custom_mask": self._custom_mask_buf,
                             "maybe_mask_indptr": self._mask_indptr_buf,
-                            "maybe_alibi_slopes": _get_cache_alibi_slopes_buf(
+                            "maybe_alibi_slopes": lambda: _get_cache_alibi_slopes_buf(
                                 q.shape[1], q.device
                             ),
                         },
@@ -2637,6 +2638,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 jit_args[0],
                 get_customize_batch_prefill_module(backend, *jit_args, **jit_kwargs),
             )
+            # jit_args[7] is additional_tensor_names from gen_customize_batch_prefill_module
             self._jit_additional_tensor_names = list(jit_args[7])
         else:
             self._jit_module = None
@@ -3309,7 +3311,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     {
                         "maybe_custom_mask": self._custom_mask_buf,
                         "maybe_mask_indptr": self._mask_indptr_buf,
-                        "maybe_alibi_slopes": _get_cache_alibi_slopes_buf(
+                        "maybe_alibi_slopes": lambda: _get_cache_alibi_slopes_buf(
                             q.shape[1], self.device
                         ),
                     },

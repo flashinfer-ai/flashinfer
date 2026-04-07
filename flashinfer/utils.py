@@ -1262,7 +1262,8 @@ def prepare_jit_additional_args(
     """Map well-known JIT additional tensor names to internal buffers.
 
     For each name in jit_additional_tensor_names:
-      - If the name is in known_bufs, use the corresponding buffer.
+      - If the name is in known_bufs, use the corresponding value.
+        Values may be callables (evaluated lazily only when needed).
       - Otherwise, consume the next value from user_args.
       - If user_args is exhausted, use None.
     Any remaining user_args are appended at the end.
@@ -1271,7 +1272,8 @@ def prepare_jit_additional_args(
     user_args_list = list(user_args)
     for name in jit_additional_tensor_names:
         if name in known_bufs:
-            result.append(known_bufs[name])
+            val = known_bufs[name]
+            result.append(val() if callable(val) else val)
         elif user_args_list:
             result.append(user_args_list.pop(0))
         else:
