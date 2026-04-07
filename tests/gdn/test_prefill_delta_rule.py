@@ -30,8 +30,8 @@ from flashinfer.gdn_prefill import chunk_gated_delta_rule
 from flashinfer.gdn_kernels import chunk_gated_delta_rule_sm100, _has_blackwell_prefill
 
 
-def _is_sm100():
-    """Check if we should use the SM100 (Blackwell) path."""
+def _is_sm100a():
+    """Check if we should use the SM100 and SM103 (Blackwell) path."""
     cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
     return (
         _has_blackwell_prefill
@@ -106,7 +106,7 @@ def _test_prefill_kernel(
     our_o.fill_(float("nan"))
     our_state.fill_(float("nan"))
 
-    if _is_sm100():
+    if _is_sm100a():
         # SM100: use dedicated API, state is K-major [N,H,K,V] matching reference
         _alpha = (
             alpha
@@ -153,7 +153,7 @@ def _test_prefill_kernel(
 
     torch.cuda.synchronize()
 
-    if not _is_sm100():
+    if not _is_sm100a():
         # SM90 state is K-last [H,V,K], transpose to match reference [H,K,V]
         our_state = our_state.transpose(-1, -2)
 
@@ -364,7 +364,7 @@ def _test_chunked_prefill(
     our_state1.fill_(float("nan"))
     our_state2.fill_(float("nan"))
 
-    if _is_sm100():
+    if _is_sm100a():
         # SM100: dedicated API, K-major states
         _alpha1 = (
             alpha1
@@ -452,7 +452,7 @@ def _test_chunked_prefill(
 
     torch.cuda.synchronize()
 
-    if not _is_sm100():
+    if not _is_sm100a():
         # SM90 state is K-last [H,V,K], transpose to match reference [H,K,V]
         our_state = our_state.transpose(-1, -2)
 

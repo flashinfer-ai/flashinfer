@@ -24,8 +24,8 @@ from flashinfer.utils import is_sm100a_supported
 from flashinfer.testing.utils import bench_gpu_time
 
 
-def _is_sm100():
-    """Check if we should use the SM100 (Blackwell) path."""
+def _is_sm100a():
+    """Check if we should use the SM100 and SM103 (Blackwell) path."""
     cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
     return (
         _has_blackwell_prefill
@@ -147,7 +147,7 @@ def bench_gdn_prefill(
         device="cuda",
     )
 
-    if _is_sm100():
+    if _is_sm100a():
         cu_seqlens = torch.arange(
             0, batch_size * seq_len + 1, seq_len, dtype=torch.int32, device="cuda"
         )
@@ -285,7 +285,7 @@ def main():
         return
 
     dtype = getattr(torch, args.dtype)
-    backend = "SM100 (Blackwell)" if _is_sm100() else "SM90 (Hopper)"
+    backend = "SM100 (Blackwell)" if _is_sm100a() else "SM90 (Hopper)"
 
     print(
         f"GDN Prefill Benchmark [{backend}] (heads: q={args.num_q_heads}, k={args.num_k_heads}, v={args.num_v_heads}, d={args.head_size}, dtype={args.dtype})"
