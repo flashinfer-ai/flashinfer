@@ -2064,7 +2064,8 @@ void doGatedActivation(ActivationOutputType* output, GemmOutputType const* gemm_
 
 template <class T, class GemmOutputType, class ScaleBiasType, class ActFn,
           TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType BlockScalingType>
-__global__ void doActivationKernel(T* output, GemmOutputType const* gemm_result,
+__global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK)
+void doActivationKernel(T* output, GemmOutputType const* gemm_result,
                                    float const* fp8_quant, ScaleBiasType const* bias_ptr,
                                    bool bias_is_broadcast, int64_t const* expert_first_token_offset,
                                    int num_experts_per_node, int64_t inter_size,
@@ -2161,11 +2162,26 @@ __global__ void doActivationKernel(T* output, GemmOutputType const* gemm_result,
     assert(gated_off % ACTIVATION_ELEM_PER_THREAD == 0);
     int64_t const gated_off_vec = gated_off / ACTIVATION_ELEM_PER_THREAD;
 
+    // For FP4/MXFP8: extend the loop to cover K-dim padding (writes zero SFs for padded columns).
+    // This merges K-dim padding into the main loop for better cache locality.
+    int64_t const loop_elems = (IsNVFP4 || IsMXFP8)
+        ? padded_inter_size / VecSize  // cover both real elements and K-dim padding
+        : num_elems_in_col;
+    bool const do_k_padding = (IsNVFP4 || IsMXFP8) && (padded_inter_size > inter_size);
+
     ActFn fn{};
     fn.alpha = gate_alpha;
     fn.beta = gate_beta;
     fn.limit = gate_limit;
-    for (int64_t elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride) {
+    for (int64_t elem_index = start_offset; elem_index < loop_elems; elem_index += stride) {
+      // K-dim padding region: write zero SF only (no activation compute)
+      if (do_k_padding && elem_index >= num_elems_in_col) {
+        writeSF<VecSize, VecSize>(num_tokens_before_expert, expert, /*source_row*/ -1, token,
+                                  elem_index, padded_inter_size, fc2_act_sf_flat,
+                                  /* input_sf */ nullptr);
+        continue;
+      }
+
       auto fc1_value =
           arrayConvert<GemmResultElem, ComputeElem>(gemm_result_vec[elem_index + gated_off_vec]);
       if (bias_ptr) {
@@ -2202,21 +2218,6 @@ __global__ void doActivationKernel(T* output, GemmOutputType const* gemm_result,
         output_vec[elem_index] = res;
       } else {
         output_vec[elem_index] = arrayConvert<ComputeElem, OutputElem>(post_act_val);
-      }
-    }
-
-    // Pad zeros in the extra SFs along the K dimension, we do this to ensure there are no nan
-    // values in the padded SF atom
-    if constexpr (IsNVFP4 || IsMXFP8) {
-      // Use VecSize per thread since we are just writing out zeros so every thread can process a
-      // whole vector
-      size_t padding_start_offset = inter_size / VecSize + start_offset;
-      size_t padding_elems_in_col = padded_inter_size / VecSize;
-      for (int64_t elem_index = padding_start_offset; elem_index < padding_elems_in_col;
-           elem_index += stride) {
-        writeSF<VecSize, VecSize>(num_tokens_before_expert, expert, /*source_row*/ -1, token,
-                                  elem_index, padded_inter_size, fc2_act_sf_flat,
-                                  /* input_sf */ nullptr);  // Pass nulltpr input_sf so we write 0
       }
     }
   }
