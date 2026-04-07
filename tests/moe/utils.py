@@ -39,6 +39,7 @@ NON_GATED_ACTIVATION_SUPPORTED_QUANT_MODES = [
     QuantMode.FP4_NVFP4_NVFP4,
     QuantMode.FP8_BLOCK_SCALE_MXFP8,
     QuantMode.FP8_PER_TENSOR,
+    QuantMode.BF16,
 ]
 
 
@@ -161,6 +162,7 @@ def skip_checks(
         )
 
     if logits_dtype == torch.float32 and moe_impl.quant_mode not in [
+        QuantMode.FP4_NVFP4_NVFP4,
         QuantMode.FP8_PER_TENSOR,
         QuantMode.FP8_BLOCK_SCALE_DEEPSEEK,
         QuantMode.FP8_BLOCK_SCALE_MXFP8,
