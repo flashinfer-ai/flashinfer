@@ -37,22 +37,31 @@ def gen_moe_utils_module() -> JitSpec:
     # artifacts.py imports from jit.cubin_loader, which triggers jit/__init__.py,
     # which imports this module — so ArtifactPath/CheckSumHash aren't defined yet
     # at module load time if these imports are at the top level.
-    from .cubin_loader import download_trtllm_headers, get_cubin
+    from .cubin_loader import (
+        get_artifact,
+        get_meta_hash,
+        ensure_symlink,
+        verify_symlinked_headers,
+    )
+    from .fused_moe import BMM_EXPORT_HEADERS
     from ..artifacts import ArtifactPath, CheckSumHash
 
-    download_trtllm_headers(
-        "bmm",
+    checksum = get_artifact(
+        f"{ArtifactPath.TRTLLM_GEN_BMM}/checksums.txt", CheckSumHash.TRTLLM_GEN_BMM
+    )
+    bmm_export_path = f"{ArtifactPath.TRTLLM_GEN_BMM}/include/trtllmGen_bmm_export"
+    for header in BMM_EXPORT_HEADERS:
+        h = get_artifact(f"{bmm_export_path}/{header}", get_meta_hash(checksum, header))
+        assert h, f"{header} not found"
+    symlink_path = (
         jit_env.FLASHINFER_CUBIN_DIR
         / "flashinfer"
         / "trtllm"
         / "batched_gemm"
-        / "trtllmGen_bmm_export",
-        f"{ArtifactPath.TRTLLM_GEN_BMM}/include/trtllmGen_bmm_export",
-        ArtifactPath.TRTLLM_GEN_BMM,
-        get_cubin(
-            f"{ArtifactPath.TRTLLM_GEN_BMM}/checksums.txt", CheckSumHash.TRTLLM_GEN_BMM
-        ),
+        / "trtllmGen_bmm_export"
     )
+    ensure_symlink(symlink_path, jit_env.FLASHINFER_CUBIN_DIR / bmm_export_path)
+    verify_symlinked_headers(symlink_path, BMM_EXPORT_HEADERS, checksum)
     nvcc_flags = [
         "-DTLLM_GEN_EXPORT_INTERFACE",  # Use relative includes in downloaded headers
         "-DENABLE_BF16",
@@ -61,7 +70,7 @@ def gen_moe_utils_module() -> JitSpec:
     ]
 
     nvcc_flags += current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[9, 10, 11, 12]
+        supported_major_versions=[10]
     )
 
     return gen_jit_spec(
@@ -76,7 +85,12 @@ def gen_moe_utils_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/tllmException.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/memoryUtils.cu",
             # Routing kernels for moe_sort
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_routing_deepseek.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_deepseek.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_common.cu",
         ],
         extra_cuda_cflags=nvcc_flags,
         extra_include_paths=[

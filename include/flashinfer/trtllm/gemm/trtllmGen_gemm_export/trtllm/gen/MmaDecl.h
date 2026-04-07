@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
  * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -43,7 +43,8 @@ enum class MmaKind : uint32_t {
   // or dtypeA = dtypeB = Bfloat16 and dtypeD = [Fp32]
   // Corresponds to the kind::f16 of tcgen05.mma.
   Fp16 = 1,
-  // Supports dtypeA/B = [E4m3, E5m2, E2m3, E3m2, E2m1] and dtypeD = [Fp16, Fp32]
+  // Supports dtypeA/B = [E4m3, E5m2, E2m3, E3m2, E2m1] and dtypeD = [Fp16,
+  // Fp32]
   // Corresponds to the kind::f8f6f4 of tcgen05.mma.
   Fp8Fp6Fp4 = 2,
   // Supports dtypeA = dtypeB = [Int8, Uint8] and dtypeD = [Int32]
@@ -95,11 +96,13 @@ inline std::string mmaKindToString(MmaKind mmaKind) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// function to get the TMEM column stride per group (i.e., 64 K elements)
-inline int32_t getTmemColStridePerGroup(int32_t tileMn, int32_t mmaK) {
-  // Calculate the stride of TMEM column for every 64 elements in the K dimension
-  int32_t div = 2 * ceilDiv(tileMn, 64);
-  return mmaK == 96 ? std::max(4, div) : div;
+// Get the TMEM column stride per group (i.e. kGroupSize * blockSize K elements)
+inline int32_t getTmemColStridePerGroup(int32_t tileMn, int32_t mmaK, int32_t kGroupSize) {
+  int32_t colStride = 2 * ceilDiv(tileMn, 64);
+  if (mmaK == 96) {
+    colStride = std::max(4, colStride);
+  }
+  return colStride;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

@@ -68,10 +68,9 @@ EP_CONFIGS = {
 
 
 def is_sm100_family():
-    """Check for SM100 family (Blackwell: SM100, SM103, SM110).
+    """Check for SM100 family (Blackwell: SM100, SM103).
 
-    CuteDSL MoE NVFP4 kernels are optimized for SM100 architecture.
-    SM120+ (Rubin) may have different shared memory/TMEM configurations.
+    CuteDSL MoE NVFP4 kernels are optimized for SM10x architecture.
     """
     if not torch.cuda.is_available():
         return False
@@ -1128,7 +1127,7 @@ def main():
     args = parser.parse_args()
 
     if not is_sm100_family():
-        print("ERROR: Requires SM100 family GPU (Blackwell: SM100, SM103, SM110)")
+        print("ERROR: Requires SM100 family GPU (Blackwell: SM100, SM103)")
         return 1
 
     # Determine token counts
