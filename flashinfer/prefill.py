@@ -1324,7 +1324,7 @@ def single_prefill_with_kv_cache(
         TensorLayout[kv_layout].value,
         window_left,
         packed_custom_mask,
-        get_alibi_slopes(q.shape[1]).to(q.device)
+        get_alibi_slopes(q.shape[1], device=q.device)
         if pos_encoding_mode == "ALIBI"
         else None,
         logits_soft_cap,

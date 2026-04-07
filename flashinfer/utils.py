@@ -189,13 +189,17 @@ def _unpack_paged_kv_cache(
         )
 
 
-def get_alibi_slopes(n_heads: int) -> torch.Tensor:
+def get_alibi_slopes(
+    n_heads: int, device: Optional[torch.device] = None
+) -> torch.Tensor:
     n = 2 ** math.floor(math.log2(n_heads))
     m_0 = 2.0 ** (-8.0 / n)
-    m = torch.pow(m_0, torch.arange(1, 1 + n))
+    m = torch.pow(m_0, torch.arange(1, 1 + n, device=device))
     if n < n_heads:
         m_hat_0 = 2.0 ** (-4.0 / n)
-        m_hat = torch.pow(m_hat_0, torch.arange(1, 1 + 2 * (n_heads - n), 2))
+        m_hat = torch.pow(
+            m_hat_0, torch.arange(1, 1 + 2 * (n_heads - n), 2, device=device)
+        )
         m = torch.cat([m, m_hat])
     return m.float()
 
@@ -240,7 +244,7 @@ def _get_cache_alibi_slopes_buf(
     key = (f"alibi_slopes_{num_qo_heads}", device)
     buf = _cache_buf.get(key)
     if buf is None:
-        buf = get_alibi_slopes(num_qo_heads).to(device)
+        buf = get_alibi_slopes(num_qo_heads, device=device)
         _cache_buf[key] = buf
     return buf
 
