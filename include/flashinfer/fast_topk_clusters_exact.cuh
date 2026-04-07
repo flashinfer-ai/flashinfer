@@ -471,11 +471,12 @@ __global__ __launch_bounds__(1024) void __cluster_dims__(NClusters, 1, 1)
         IdxT* __restrict__ output_indices, T* __restrict__ output_values, int seq_len,
         int* __restrict__ pre_hist, int* __restrict__ cached_overflow, int overflow_stride,
         int logit_stride, int indices_stride, int num_cached, const int TopK) {
-  int cluster_id = blockIdx.x / NClusters;
-  int logit_offset = cluster_id * logit_stride;
-  int ind_offset = cluster_id * indices_stride;
+  int64_t cluster_id = blockIdx.x / NClusters;
+  int64_t logit_offset = cluster_id * logit_stride;
+  int64_t ind_offset = cluster_id * indices_stride;
   if (seq_len <= TopK) {
-    for (int i = threadIdx.x + (blockIdx.x % NClusters) * 1024; i < TopK; i += 1024 * NClusters) {
+    for (int64_t i = threadIdx.x + (blockIdx.x % NClusters) * 1024; i < TopK;
+         i += 1024 * NClusters) {
       if (i < seq_len) {
         output_indices[ind_offset + i] = static_cast<IdxT>(i);
       } else {
@@ -491,7 +492,7 @@ __global__ __launch_bounds__(1024) void __cluster_dims__(NClusters, 1, 1)
         logits + logit_offset, (pre_hist == nullptr) ? nullptr : pre_hist + cluster_id * 256,
         (PackedCachedData*)block_overflow, overflow_stride, seq_len, num_cached, TopK);
 
-    for (int i = threadIdx.x; i < topk_res.local_topk_num; i += 1024) {
+    for (int64_t i = threadIdx.x; i < topk_res.local_topk_num; i += 1024) {
       int offs = i + topk_res.local_topk_start;
       if (offs < TopK) {
         auto ind = topk_res.local_topk_inds[i];
@@ -515,13 +516,14 @@ __global__ __launch_bounds__(1024) void __cluster_dims__(NClusters, 1, 1)
         int* __restrict__ cached_overflow,  // [batchsize, 4 * NClusters * overflow_stride]
         int overflow_stride, int logit_stride, int indices_stride, int page_table_stride,
         int num_cached, const int TopK) {
-  int cluster_id = blockIdx.x / NClusters;
-  int logit_offset = cluster_id * logit_stride;
-  int ind_offset = cluster_id * indices_stride;
-  int page_table_offset = cluster_id * page_table_stride;
+  int64_t cluster_id = blockIdx.x / NClusters;
+  int64_t logit_offset = cluster_id * logit_stride;
+  int64_t ind_offset = cluster_id * indices_stride;
+  int64_t page_table_offset = cluster_id * page_table_stride;
   int seq_len = seq_lens[cluster_id];
   if (seq_len <= TopK) {
-    for (int i = threadIdx.x + (blockIdx.x % NClusters) * 1024; i < TopK; i += 1024 * NClusters) {
+    for (int64_t i = threadIdx.x + (blockIdx.x % NClusters) * 1024; i < TopK;
+         i += 1024 * NClusters) {
       if (i < seq_len) {
         output_indices[ind_offset + i] = page_table[page_table_offset + i];
 
@@ -538,7 +540,7 @@ __global__ __launch_bounds__(1024) void __cluster_dims__(NClusters, 1, 1)
         logits + logit_offset, (pre_hist == nullptr) ? nullptr : pre_hist + cluster_id * 256,
         (PackedCachedData*)block_overflow, overflow_stride, seq_len, num_cached, TopK);
 
-    for (int i = threadIdx.x; i < topk_res.local_topk_num; i += 1024) {
+    for (int64_t i = threadIdx.x; i < topk_res.local_topk_num; i += 1024) {
       int offs = i + topk_res.local_topk_start;
       if (offs < TopK) {
         auto ind = topk_res.local_topk_inds[i];
@@ -559,12 +561,13 @@ __global__ __launch_bounds__(1024) void __cluster_dims__(NClusters, 1, 1)
         int* __restrict__ cached_overflow,  // [batchsize, 4 * NClusters * overflow_stride]
         int overflow_stride, int logit_stride, int indices_stride, int num_cached, const int TopK) {
   int cluster_id = blockIdx.x / NClusters;
-  int logit_offset = cluster_id * logit_stride;
-  int ind_offset = cluster_id * indices_stride;
-  int seq_len = seq_lens[cluster_id];
-  int ragged_offset = offsets[cluster_id];
+  int64_t logit_offset = cluster_id * logit_stride;
+  int64_t ind_offset = cluster_id * indices_stride;
+  int64_t seq_len = seq_lens[cluster_id];
+  int64_t ragged_offset = offsets[cluster_id];
   if (seq_len <= TopK) {
-    for (int i = threadIdx.x + (blockIdx.x % NClusters) * 1024; i < TopK; i += 1024 * NClusters) {
+    for (int64_t i = threadIdx.x + (blockIdx.x % NClusters) * 1024; i < TopK;
+         i += 1024 * NClusters) {
       if (i < seq_len) {
         output_indices[ind_offset + i] = i + ragged_offset;
 
@@ -581,7 +584,7 @@ __global__ __launch_bounds__(1024) void __cluster_dims__(NClusters, 1, 1)
         logits + logit_offset, (pre_hist == nullptr) ? nullptr : pre_hist + cluster_id * 256,
         (PackedCachedData*)block_overflow, overflow_stride, seq_len, num_cached, TopK);
 
-    for (int i = threadIdx.x; i < topk_res.local_topk_num; i += 1024) {
+    for (int64_t i = threadIdx.x; i < topk_res.local_topk_num; i += 1024) {
       int offs = i + topk_res.local_topk_start;
       if (offs < TopK) {
         auto ind = topk_res.local_topk_inds[i];
