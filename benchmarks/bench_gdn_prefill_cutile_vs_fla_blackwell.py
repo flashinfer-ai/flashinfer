@@ -15,12 +15,28 @@ limitations under the License.
 
 Benchmark: cuTile GDN prefill vs FLA Triton GDN on Blackwell (SM100, B200).
 
-Compares kernel latency (profiler-based) and wall-clock latency (end-to-end
-Python overhead included) between:
+Compares two timing modes between:
   - cuTile: NVIDIA cuTile-based kernel (Blackwell-optimized, SM100+)
   - FLA:    Flash Linear Attention Triton kernel (upstream baseline)
 
 Both use batch-first [B, T, H, K] tensor format.
+
+Timing modes
+------------
+GPU kernel time  (torch.profiler device_time_total):
+    Sum of individual CUDA kernel GPU execution times.
+    Excludes Python dispatch overhead between kernel launches.
+    FLA Triton launches O(NT) kernels per call (NT = T/64 chunks × ~5 kernels).
+    cuTile launches ~3 kernels per call regardless of sequence length.
+
+Wall-clock time  (CPU-synchronized perf_counter):
+    End-to-end Python-to-GPU latency, CPU-GPU synchronized.
+    Includes Python dispatch overhead between kernel launches.
+    Reflects actual latency seen in production serving.
+
+For small configs (B=1, T≤2048), FLA has ~0.15ms fixed Python overhead
+(~160 kernel launches × ~1μs each), making wall-clock 2–3x worse than
+GPU kernel time.  cuTile's wall-clock ≈ GPU kernel time (few launches).
 
 Usage:
     python benchmarks/bench_gdn_prefill_cutile_vs_fla_blackwell.py
@@ -133,6 +149,24 @@ def _profiler_time_us(fn, warmup: int = 20, reps: int = 50) -> float:
     return sum(e.device_time_total for e in prof.key_averages()) / reps
 
 
+def _wallclock_time_us(fn, warmup: int = 20, reps: int = 50) -> float:
+    """Measure end-to-end wall-clock time per call (μs), CPU-GPU synchronized.
+
+    This includes Python dispatch overhead between kernel launches, which is
+    significant for Triton (many small kernels) but minimal for cuTile (few kernels).
+    """
+    import time
+
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(reps):
+        fn()
+    torch.cuda.synchronize()
+    return (time.perf_counter() - t0) / reps * 1e6
+
+
 def _profiler_breakdown(fn, warmup: int = 10, reps: int = 30) -> dict:
     """Return per-kernel GPU time breakdown (μs) via torch.profiler."""
     for _ in range(warmup):
@@ -191,6 +225,7 @@ def bench_config(B, T, H, K, V, label):
             use_qk_l2norm_in_kernel=False,
         )
         results["ct_prof_us"] = _profiler_time_us(fn_ct)
+        results["ct_wall_us"] = _wallclock_time_us(fn_ct)
 
     # ---- FLA Triton ----
     if FLA_AVAILABLE:
@@ -200,6 +235,7 @@ def bench_config(B, T, H, K, V, label):
             output_final_state=False,
         )
         results["fla_prof_us"] = _profiler_time_us(fn_fla)
+        results["fla_wall_us"] = _wallclock_time_us(fn_fla)
 
     return results
 
@@ -223,26 +259,41 @@ def main():
     is_sm100 = _check_sm100()
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"Device capability: SM{torch.cuda.get_device_capability()}")
+    try:
+        import cuda.tile as _ct
+        print(f"cuda.tile version: {_ct.__version__}")
+    except Exception:
+        pass
+    import triton
+    print(f"triton version: {triton.__version__}")
+    print(f"CT_AVAILABLE: {CT_AVAILABLE}  FLA_AVAILABLE: {FLA_AVAILABLE}")
     print()
 
     configs = CONFIGS_LARGE if args.large_only else CONFIGS_ALL
 
-    # Header
-    print(f"{'Config':<18} {'FLA':>10} {'cuTile':>10} {'speedup':>10}")
-    print("-" * 52)
+    # Header — two timing modes:
+    #   kernel:     GPU kernel time only (torch.profiler device_time_total)
+    #   wall-clock: end-to-end CPU+GPU latency (includes Python dispatch overhead)
+    # FLA (Triton) launches O(NT) kernels per call; wall-clock overhead can be
+    # 2–3x the kernel time for small configs.  cuTile launches ~3 kernels total.
+    print(f"{'':18}  {'-- GPU kernel time --':^33}  {'-- wall-clock time --':^33}")
+    print(f"{'Config':<18}  {'FLA':>10} {'cuTile':>10} {'speedup':>10}  {'FLA':>10} {'cuTile':>10} {'speedup':>10}")
+    print("-" * 88)
 
     for B, T, H, K, V, label in configs:
         r = bench_config(B, T, H, K, V, label)
 
         ct_p = r.get("ct_prof_us", float("nan"))
         fla_p = r.get("fla_prof_us", float("nan"))
-        spd = fla_p / ct_p if ct_p > 0 else float("nan")
+        ct_w = r.get("ct_wall_us", float("nan"))
+        fla_w = r.get("fla_wall_us", float("nan"))
+        spd_p = fla_p / ct_p if ct_p > 0 else float("nan")
+        spd_w = fla_w / ct_w if ct_w > 0 else float("nan")
 
         print(
             f"{label:<18}"
-            f" {fla_p/1000:>9.3f}ms"
-            f" {ct_p/1000:>9.3f}ms"
-            f" {spd:>9.2f}x"
+            f"  {fla_p/1000:>9.3f}ms {ct_p/1000:>9.3f}ms {spd_p:>9.2f}x"
+            f"  {fla_w/1000:>9.3f}ms {ct_w/1000:>9.3f}ms {spd_w:>9.2f}x"
         )
 
         if args.breakdown and CT_AVAILABLE:
@@ -267,7 +318,10 @@ def main():
             print()
 
     print()
-    print("GPU kernel time only (torch.profiler CUDA events). NVIDIA B200 (SM100).")
+    print("Timings on NVIDIA B200 (SM100).")
+    print("  GPU kernel time: torch.profiler CUDA device_time_total (excludes Python dispatch overhead)")
+    print("  Wall-clock time: CPU-synchronized end-to-end latency (includes Python dispatch overhead)")
+    print("  FLA Triton launches O(NT) kernels/call; wall-clock >> kernel time for small configs.")
 
 
 if __name__ == "__main__":
