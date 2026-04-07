@@ -25,6 +25,15 @@ echo "  - MAX_JOBS: ${MAX_JOBS}"
 # Export MAX_JOBS for PyTorch's cpp_extension to use
 export MAX_JOBS
 
+if [ -z "${FLASHINFER_AOT_BUILD_PROFILE:-}" ]; then
+    if [ -n "${CI:-}" ] || [ -n "${GITHUB_ACTIONS:-}" ] || [ -n "${JENKINS_HOME:-}" ] || [ -n "${JENKINS_URL:-}" ]; then
+        export FLASHINFER_AOT_BUILD_PROFILE="full"
+    else
+        export FLASHINFER_AOT_BUILD_PROFILE="edge_fm"
+    fi
+fi
+echo "FLASHINFER_AOT_BUILD_PROFILE: ${FLASHINFER_AOT_BUILD_PROFILE}"
+
 : ${CUDA_VISIBLE_DEVICES:=""}
 echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
 
@@ -36,29 +45,28 @@ echo "Cache cleaned."
 
 echo ""
 echo "Detecting CUDA architecture list..."
-export FLASHINFER_CUDA_ARCH_LIST=$(python3 -c '
+if [ -z "${FLASHINFER_CUDA_ARCH_LIST:-}" ]; then
+    export FLASHINFER_CUDA_ARCH_LIST=$(python3 -c '
 import torch
-cuda_ver = torch.version.cuda
-arches = ["7.5", "8.0", "8.9", "9.0a"]
-if cuda_ver is not None:
-    try:
-        major, minor = map(int, cuda_ver.split(".")[:2])
-        if (major, minor) >= (13, 0):
-            arches.append("10.0a")
-            arches.append("10.3a")
-            arches.append("11.0a")
-            arches.append("12.0f")
-        elif (major, minor) >= (12, 9):
-            arches.append("10.0a")
-            arches.append("10.3a")
-            arches.append("12.0f")
-        elif (major, minor) >= (12, 8):
-            arches.append("10.0a")
-            arches.append("12.0a")
-    except Exception:
-        pass
-print(" ".join(arches))
+
+archs = set()
+try:
+    for device in range(torch.cuda.device_count()):
+        major, minor = torch.cuda.get_device_capability(device)
+        suffix = f"{minor}a" if major >= 9 else str(minor)
+        archs.add((major, suffix))
+except Exception:
+    pass
+
+if archs:
+    print(" ".join(f"{major}.{minor}" for major, minor in sorted(archs)))
+else:
+    print("8.0")
 ')
+    echo "FLASHINFER_CUDA_ARCH_LIST was not set; defaulting to visible GPU archs (fallback: 8.0)."
+else
+    echo "Using pre-set FLASHINFER_CUDA_ARCH_LIST from environment."
+fi
 echo "FLASHINFER_CUDA_ARCH_LIST: ${FLASHINFER_CUDA_ARCH_LIST}"
 
 echo ""

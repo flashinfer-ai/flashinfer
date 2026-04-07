@@ -84,15 +84,28 @@ def _compile_jit_cache(output_dir: Path, verbose: bool = True):
     # Get the project root directory
     project_root = Path(__file__).parent.parent
 
+    build_profile = os.environ.get("FLASHINFER_AOT_BUILD_PROFILE")
+    if not build_profile:
+        if any(
+            os.environ.get(var)
+            for var in ("CI", "GITHUB_ACTIONS", "JENKINS_HOME", "JENKINS_URL")
+        ):
+            build_profile = "full"
+        else:
+            build_profile = "edge_fm"
+        os.environ["FLASHINFER_AOT_BUILD_PROFILE"] = build_profile
+
     # Set up build directory
     build_dir = project_root / "build" / "aot"
 
     # Use the centralized compilation function from aot.py
+    print(f"Using FLASHINFER_AOT_BUILD_PROFILE={build_profile}")
     aot.compile_and_package_modules(
         out_dir=output_dir,
         build_dir=build_dir,
         project_root=project_root,
-        config=None,  # Use default config
+        config=None,
+        profile=build_profile,
         verbose=verbose,
         skip_prebuilt=False,
     )

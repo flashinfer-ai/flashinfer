@@ -21,6 +21,7 @@ NOTE (Zihao): The following modules are intentionally excluded from the AOT buil
 """
 
 import argparse
+import copy
 import os
 import shutil
 from itertools import product
@@ -85,6 +86,90 @@ from .jit import JitSpec, build_jit_specs
 from .jit import env as jit_env
 from .jit.cpp_ext import get_cuda_version
 from .compilation_context import CompilationContext
+
+
+def get_default_config():
+    """Get the full upstream AOT configuration."""
+    return {
+        "fa2_head_dim": [(64, 64), (128, 128), (256, 256)],
+        "fa3_head_dim": [(192, 128), (128, 128), (64, 64), (256, 256)],
+        "f16_dtype": [torch.float16, torch.bfloat16],
+        "f8_dtype": [torch.float8_e4m3fn],
+        "use_sliding_window": [False, True],
+        "use_logits_soft_cap": [False, True],
+        "add_comm": True,
+        "add_gemma": True,
+        "add_oai_oss": True,
+        "add_moe": True,
+        "add_act": True,
+        "add_misc": True,
+        "add_xqa": True,
+    }
+
+
+def get_edge_fm_fast_config():
+    """
+    Get the trimmed AOT configuration used for fast local builds in edge-fm.
+
+    This keeps only the kernels currently exercised in the repo:
+    - single/batch prefill/decode attention on common 64/128 head dims
+    - activation / norm / rope / page / sampling / topk helpers
+
+    It intentionally excludes heavyweight optional families such as XQA, MoE,
+    communication kernels, FP8 attention variants, and large head-dim matrices
+    that are not used in edge-fm today.
+    """
+    return {
+        "fa2_head_dim": [(64, 64), (128, 128)],
+        "fa3_head_dim": [(64, 64), (128, 128)],
+        "f16_dtype": [torch.float16, torch.bfloat16],
+        "f8_dtype": [],
+        "use_sliding_window": [False],
+        "use_logits_soft_cap": [False],
+        "add_comm": False,
+        "add_gemma": False,
+        "add_oai_oss": False,
+        "add_moe": False,
+        "add_act": True,
+        "add_misc": True,
+        "add_xqa": False,
+    }
+
+
+def normalize_build_profile(profile: Optional[str]) -> str:
+    profile_name = (profile or os.environ.get("FLASHINFER_AOT_BUILD_PROFILE") or "full")
+    profile_name = profile_name.strip().lower().replace("-", "_")
+    aliases = {
+        "default": "full",
+        "minimal": "edge_fm",
+        "fast": "edge_fm",
+        "dev": "edge_fm",
+        "edgefm": "edge_fm",
+    }
+    return aliases.get(profile_name, profile_name)
+
+
+def get_config_for_profile(profile: Optional[str]) -> dict:
+    normalized = normalize_build_profile(profile)
+    if normalized == "full":
+        return get_default_config()
+    if normalized == "edge_fm":
+        return get_edge_fm_fast_config()
+    raise ValueError(
+        f"Unknown FLASHINFER AOT build profile: {profile!r}. "
+        "Supported values: full, edge_fm."
+    )
+
+
+def resolve_build_config(
+    config: Optional[dict] = None,
+    profile: Optional[str] = None,
+) -> Tuple[str, dict]:
+    normalized = normalize_build_profile(profile)
+    final_config = copy.deepcopy(get_config_for_profile(normalized))
+    if config is not None:
+        final_config.update(config)
+    return normalized, final_config
 
 
 def gen_fa2(
@@ -593,6 +678,7 @@ def compile_and_package_modules(
     build_dir: Path,
     project_root: Path,
     config: dict = None,
+    profile: Optional[str] = None,
     verbose: bool = False,
     skip_prebuilt: bool = True,
 ) -> None:
@@ -607,11 +693,7 @@ def compile_and_package_modules(
         verbose: Whether to print verbose build output
         skip_prebuilt: Whether to skip pre-built modules
     """
-    # Start with default config and override with user config
-    final_config = get_default_config()
-    if config is not None:
-        final_config.update(config)
-    config = final_config
+    build_profile, config = resolve_build_config(config, profile)
     # Cuda Arch
     if "FLASHINFER_CUDA_ARCH_LIST" not in os.environ:
         raise RuntimeError("Please explicitly set env var FLASHINFER_CUDA_ARCH_LIST.")
@@ -640,6 +722,7 @@ def compile_and_package_modules(
         if out_dir is not None:
             print("  out_dir:", out_dir)
         print("  build_dir:", build_dir)
+        print("  build_profile:", build_profile)
         print("  fa2_head_dim:", config["fa2_head_dim"])
         print("  fa3_head_dim:", config["fa3_head_dim"])
         print("  f16_dtype:", config["f16_dtype"])
@@ -708,25 +791,6 @@ def parse_head_dim(head_dim: str) -> Tuple[int, int]:
     return qo, kv
 
 
-def get_default_config():
-    """Get default AOT configuration"""
-    return {
-        "fa2_head_dim": [(64, 64), (128, 128), (256, 256)],
-        "fa3_head_dim": [(192, 128), (128, 128), (64, 64), (256, 256)],
-        "f16_dtype": [torch.float16, torch.bfloat16],
-        "f8_dtype": [torch.float8_e4m3fn],
-        "use_sliding_window": [False, True],
-        "use_logits_soft_cap": [False, True],
-        "add_comm": True,
-        "add_gemma": True,
-        "add_oai_oss": True,
-        "add_moe": True,
-        "add_act": True,
-        "add_misc": True,
-        "add_xqa": True,
-    }
-
-
 def detect_sm_capabilities():
     """Detect SM capabilities"""
     compilation_context = CompilationContext()
@@ -752,9 +816,9 @@ def detect_sm_capabilities():
     }
 
 
-def register_default_modules() -> int:
+def register_default_modules(profile: Optional[str] = None) -> int:
     """Register the default set of modules"""
-    config = get_default_config()
+    _, config = resolve_build_config(profile=profile)
     sm_capabilities = detect_sm_capabilities()
 
     jit_specs = gen_all_modules(
@@ -779,6 +843,11 @@ def register_default_modules() -> int:
 def main():
     parser = argparse.ArgumentParser(
         description="Ahead-of-Time (AOT) build all modules"
+    )
+    parser.add_argument(
+        "--profile",
+        help="AOT build profile (full or edge_fm). "
+        "Aliases: dev/fast/minimal -> edge_fm",
     )
     parser.add_argument("--out-dir", type=Path, help="Output directory")
     parser.add_argument("--build-dir", type=Path, help="Build directory")
@@ -833,7 +902,7 @@ def main():
 
     # Start with default configuration
     project_root = Path(__file__).resolve().parents[1]
-    config = get_default_config()
+    build_profile, config = resolve_build_config(profile=args.profile)
     build_dir = jit_env.FLASHINFER_WORKSPACE_DIR
     out_dir: Optional[Path] = None
 
@@ -876,6 +945,7 @@ def main():
         build_dir=build_dir,
         project_root=project_root,
         config=config,
+        profile=build_profile,
         verbose=True,
         skip_prebuilt=False,
     )

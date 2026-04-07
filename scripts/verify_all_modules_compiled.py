@@ -6,10 +6,12 @@ This script is used by task_test_jit_cache_package_build_import.sh
 
 import sys
 from flashinfer.jit import jit_spec_registry
-from flashinfer.aot import register_default_modules
+from flashinfer.aot import normalize_build_profile, register_default_modules
 
 
 def main():
+    print(f"AOT build profile: {normalize_build_profile(None)}")
+
     # Register modules if not already registered
     if not jit_spec_registry.get_all_statuses():
         register_default_modules()

@@ -21,12 +21,42 @@ fi
 
 export MAX_JOBS
 
+if [ -z "${FLASHINFER_AOT_BUILD_PROFILE:-}" ]; then
+  if [ -n "${CI:-}" ] || [ -n "${GITHUB_ACTIONS:-}" ] || [ -n "${JENKINS_HOME:-}" ] || [ -n "${JENKINS_URL:-}" ]; then
+    export FLASHINFER_AOT_BUILD_PROFILE="full"
+  else
+    export FLASHINFER_AOT_BUILD_PROFILE="edge_fm"
+  fi
+fi
+
+if [ -z "${FLASHINFER_CUDA_ARCH_LIST:-}" ]; then
+  export FLASHINFER_CUDA_ARCH_LIST=$(python3 -c '
+import torch
+
+archs = set()
+try:
+    for device in range(torch.cuda.device_count()):
+        major, minor = torch.cuda.get_device_capability(device)
+        suffix = f"{minor}a" if major >= 9 else str(minor)
+        archs.add((major, suffix))
+except Exception:
+    pass
+
+if archs:
+    print(" ".join(f"{major}.{minor}" for major, minor in sorted(archs)))
+else:
+    print("8.0")
+')
+  echo "FLASHINFER_CUDA_ARCH_LIST was not set; defaulting to visible GPU archs (fallback: 8.0)."
+fi
+
 # Display build environment info
 echo "CUDA Version: ${CUDA_VERSION}"
 echo "CPU Architecture: ${ARCH}"
 echo "CUDA Major: ${CUDA_MAJOR}"
 echo "CUDA Minor: ${CUDA_MINOR}"
 echo "FlashInfer Local Version: ${FLASHINFER_LOCAL_VERSION}"
+echo "AOT Build Profile: ${FLASHINFER_AOT_BUILD_PROFILE}"
 echo "CUDA Architectures: ${FLASHINFER_CUDA_ARCH_LIST}"
 echo "Dev Release Suffix: ${FLASHINFER_DEV_RELEASE_SUFFIX}"
 echo "MAX_JOBS: ${MAX_JOBS}"
