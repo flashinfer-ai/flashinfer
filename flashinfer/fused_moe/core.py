@@ -51,7 +51,9 @@ from ..utils import (
 )
 from .utils import (
     get_last_power_of_2_num_tokens_buckets,
+    get_trtllm_moe_num_tokens_buckets,
     last_positive_power_of_2,
+    make_trtllm_moe_bucket_mapper,
 )
 from ..tllm_enums import *
 
@@ -1175,14 +1177,26 @@ def get_trtllm_moe_sm100_module():
 
         @classmethod
         @functools.lru_cache(maxsize=None)
-        def refine_tuning_config(cls, tune_max_num_tokens: int, **kwargs):
+        def refine_tuning_config(
+            cls,
+            tune_max_num_tokens: int,
+            top_k: int = 1,
+            num_local_experts: int = 1,
+            **kwargs,
+        ):
+            buckets = get_trtllm_moe_num_tokens_buckets(
+                top_k,
+                num_local_experts,
+                tune_max_num_tokens,
+            )
+            bucket_mapper = make_trtllm_moe_bucket_mapper(buckets)
             cls.tuning_config_with_hidden_states_scales = TuningConfig(
                 dynamic_tensor_specs=(
                     DynamicTensorSpec(
                         (0, 1, 2, 3, 4, 5),
                         (0, 0, 0, 0, 0, 0),
-                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens, 1),
-                        lambda x: min(last_positive_power_of_2(x), tune_max_num_tokens),
+                        buckets,
+                        bucket_mapper,
                         cls.dynamic_tensor_initializers,
                     ),
                 ),
@@ -1193,8 +1207,8 @@ def get_trtllm_moe_sm100_module():
                     DynamicTensorSpec(
                         (0, 1, 2, 3, 4),
                         (0, 0, 0, 0, 0),
-                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens, 1),
-                        lambda x: min(last_positive_power_of_2(x), tune_max_num_tokens),
+                        buckets,
+                        bucket_mapper,
                         cls.dynamic_tensor_initializers[:5],
                     ),
                 ),
@@ -1237,7 +1251,11 @@ def get_trtllm_moe_sm100_module():
 
         # Use AutoTuner to select the best tactic
         tuner = AutoTuner.get()
-        MoERunner.refine_tuning_config(tune_max_num_tokens)
+        MoERunner.refine_tuning_config(
+            tune_max_num_tokens,
+            top_k=top_k,
+            num_local_experts=local_num_experts,
+        )
 
         num_tokens = hidden_states.shape[0]
         hidden_size = hidden_states.shape[-1]
@@ -1400,7 +1418,11 @@ def get_trtllm_moe_sm100_module():
             enable_pdl = device_support_pdl(hidden_states.device)
         # Use AutoTuner to select the best tactic
         tuner = AutoTuner.get()
-        MoERunner.refine_tuning_config(tune_max_num_tokens)
+        MoERunner.refine_tuning_config(
+            tune_max_num_tokens,
+            top_k=top_k,
+            num_local_experts=local_num_experts,
+        )
 
         num_tokens = hidden_states.shape[0]
         hidden_size = hidden_states.shape[-1]
@@ -1573,7 +1595,11 @@ def get_trtllm_moe_sm100_module():
 
         # Use AutoTuner to select the best tactic - follow FP4 pattern exactly
         tuner = AutoTuner.get()
-        MoERunner.refine_tuning_config(tune_max_num_tokens)
+        MoERunner.refine_tuning_config(
+            tune_max_num_tokens,
+            top_k=top_k,
+            num_local_experts=local_num_experts,
+        )
 
         num_tokens = hidden_states.shape[0]
         hidden_size = hidden_states.shape[-1]
@@ -1830,7 +1856,11 @@ def get_trtllm_moe_sm100_module():
 
         tuner = AutoTuner.get()
         MoERunner.refine_tuning_config(
-            tune_max_num_tokens, use_cold_l2_cache=True, use_cuda_graph=True
+            tune_max_num_tokens,
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+            use_cold_l2_cache=True,
+            use_cuda_graph=True,
         )
         dtype_act = deduce_trtllm_gen_tensor_dtype(hidden_states, hidden_states_scale)
         dtype_weights = deduce_trtllm_gen_tensor_dtype(
@@ -2040,7 +2070,11 @@ def get_trtllm_moe_sm100_module():
             )
 
         tuner = AutoTuner.get()
-        MoERunner.refine_tuning_config(tune_max_num_tokens)
+        MoERunner.refine_tuning_config(
+            tune_max_num_tokens,
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+        )
         dtype_act = DtypeTrtllmGen.Bfloat16
         dtype_weights = DtypeTrtllmGen.MxInt4
         moe_runner = MoERunner(
