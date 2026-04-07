@@ -83,10 +83,7 @@ Warp assignments (12 warps = 384 threads):
   warp  11      : epilogue warp   - store O to global memory
 """
 
-import os
-import sys
 import math
-import argparse
 from typing import Optional, Type, Tuple
 
 import cuda.bindings.driver as cuda
@@ -101,9 +98,7 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
 import cutlass.utils.blackwell_helpers as sm100_utils
-import cutlass.torch as cutlass_torch
 import cutlass.cute.testing as testing
-from cutlass.cute.runtime import from_dlpack
 
 # ---------------------------------------------------------------------------
 # cutlass-dsl 4.4.2 compatibility: TmaInfo was removed; make_tiled_tma_atom_*
@@ -119,7 +114,7 @@ except ImportError:
         get_mlir_types as _gmt,
     )
 
-    class TmaInfo:
+    class TmaInfo:  # type: ignore[no-redef]
         """Compatibility shim replacing cpasync.TmaInfo for cutlass-dsl >= 4.4.2."""
 
         def __init__(self, atom, tma_tensor, smem_layout=None):
@@ -571,14 +566,14 @@ class GatedDeltaNetChunkedKernel:
         beta_smem_layout_staged = cute.make_layout((self.b_t, 1, self.smem_beta_stages))
 
         if cutlass.const_expr(s_in is not None):
-            s_in_smem_layout = sm100_utils.make_smem_layout_epi(
+            _s_in_smem_layout = sm100_utils.make_smem_layout_epi(  # noqa: F841
                 self.acc_dtype,
                 utils.LayoutEnum.from_tensor(s_in),
                 self.mma_tiler_kv[:2],
                 self.smem_state_dv_stages,
             )
         else:
-            s_in_smem_layout_staged = None
+            _s_in_smem_layout_staged = None  # noqa: F841
 
         # ------------------------------------------------------------------
         # Shared memory struct  (defined here to capture layout cosizes)
@@ -729,8 +724,8 @@ class GatedDeltaNetChunkedKernel:
             )
         )
 
-        cumsumlog_smem_layout = cute.select(cumsumlog_smem_layout_staged, mode=[0])
-        beta_smem_layout = cute.select(beta_smem_layout_staged, mode=[0])
+        cumsumlog_smem_layout = cute.select(cumsumlog_smem_layout_staged, mode=[0])  # noqa: F841
+        beta_smem_layout = cute.select(beta_smem_layout_staged, mode=[0])  # noqa: F841
 
         o_smem_layout = cute.select(o_smem_layout_staged, mode=[0, 1])
         tma_o = _wrap_tma(
@@ -798,7 +793,7 @@ class GatedDeltaNetChunkedKernel:
             grid=grid_shape,
             block=(self.threads_per_cta, 1, 1),
             cluster=self.cluster_shape_mnk,
-            smem=self.shared_storage.size_in_bytes(),
+            smem=self.shared_storage.size_in_bytes(),  # type: ignore[attr-defined]
             stream=stream,
             min_blocks_per_mp=1,
         )
@@ -1427,7 +1422,7 @@ class GatedDeltaNetChunkedKernel:
                 )
 
                 # Main loop: chunks 1..num_chunks_b-1 with previous state.
-                for chunk_idx in cutlass.range(1, num_chunks_b):
+                for chunk_idx in cutlass.range(1, num_chunks_b):  # noqa: B007
                     (
                         shared_acc_producer,
                         q_state_acc_producer,
@@ -1696,7 +1691,7 @@ class GatedDeltaNetChunkedKernel:
         # Per-thread MMA slices (cta_v=0 for ONE-CTA mode).
         thr_mma_qk = tiled_mma_qk.get_slice(0)
         thr_mma_qkv = tiled_mma_qkv.get_slice(0)
-        thr_mma_kv = tiled_mma_kv.get_slice(0)
+        thr_mma_kv = tiled_mma_kv.get_slice(0)  # noqa: F841
 
         # Tile shapes from the MMA tiler (128, 128, 128):
         #   mode[0,2] = (BT, DK) - M,K tile for A (Q) and for B (K) of tiled_mma_qk
@@ -1883,7 +1878,7 @@ class GatedDeltaNetChunkedKernel:
 
         # --- Predicate (last tile only): compute once, reuse for gate and beta ---
         if cutlass.const_expr(is_last_tile):
-            valid_tokens = batch_end
+            valid_tokens = batch_end  # noqa: F841
             tGcGate = thr_copy_gate_g2r.partition_S(cGate)
             tGpGate = cute.make_rmem_tensor(
                 ((tGcGate.shape[0][1],), tGcGate.shape[1]), cutlass.Boolean
@@ -1909,7 +1904,7 @@ class GatedDeltaNetChunkedKernel:
                 )
                 if lidx >= offset:
                     tGrGate[col] = tGrGate[col] + n
-        sum_v = 0.0
+        sum_v = 0.0  # noqa: F841
         for col in range(1, cute.size(tGrGate)):
             last_v = cute.arch.shuffle_sync(
                 tGrGate[col - 1],
@@ -2293,7 +2288,7 @@ class GatedDeltaNetChunkedKernel:
             atom_cumsumlog_s2r, tiled_shared_t2r
         )
         thr_cumsumlog_s2r = tiled_cumsumlog_s2r.get_slice(cg0_tidx)
-        tGsCumsumlog = thr_cumsumlog_s2r.partition_S(sCumsumlog)
+        tGsCumsumlog = thr_cumsumlog_s2r.partition_S(sCumsumlog)  # noqa: F841
         # SMEM store copies: fp32 registers -> fp16 SMEM (A-operands for GEMM 5 and 6).
         # make_tiled_copy_D mirrors tmem_tiled_copy's thread-value mapping so the
         # register layout from the TMEM load aligns with the SMEM destination partition.
@@ -3459,7 +3454,7 @@ class GatedDeltaNetChunkedKernel:
             cute.arch.fence_view_async_shared()
             ks_acc_handle.release()
         else:
-            group_order_handle = group_order_consumer.wait_and_advance()
+            group_order_handle = group_order_consumer.wait_and_advance()  # noqa: F841
         vks_handle.commit()
 
         # ---- state*q_epi (ALU) ------------------------------------------------
@@ -3521,7 +3516,7 @@ class GatedDeltaNetChunkedKernel:
         tTR_rDv = tTR_rNv
         tTR_rDv_inp = cute.make_rmem_tensor_like(tTR_rDv, self.io_dtype)
         tRS_rDv = tiled_nv_r2s.retile(tTR_rDv_inp)
-        rDecayScale = cute.make_rmem_tensor_like(tTR_rDv, self.acc_dtype)
+        rDecayScale = cute.make_rmem_tensor_like(tTR_rDv, self.acc_dtype)  # noqa: F841
         for sub in cutlass.range(tTR_rDv.shape[2]):
             for k in cutlass.range(sub_tile_size, vectorize=True):
                 tTR_rDv[k, 0, sub] = tTR_rDv[k, 0, sub] * decay_scale
@@ -3735,500 +3730,3 @@ class GatedDeltaNetChunkedKernel:
             ),
         )
         return workspace
-
-
-# ---------------------------------------------------------------------------
-# Test / validation entry point
-# ---------------------------------------------------------------------------
-
-
-def run(
-    io_dtype,
-    acc_dtype,
-    mma_tiler_qk,
-    mma_tiler_qs,
-    mma_tiler_qkv,
-    mma_tiler_kv,
-    B,
-    T,
-    HQ,
-    HV,
-    DK,
-    DV,
-    var_seqlen_ratio=0.0,
-    var_seqlens=None,
-    # attention scale; 0.0 -> 1/sqrt(DK)
-    scale=0.0,
-    initial_state=None,
-    final_state=False,
-    is_persistent=True,
-    warmup_iterations=0,
-    iterations=1,
-    skip_ref_check=False,
-    use_cold_l2=False,
-    tolerance=1e-1,
-):
-    """
-    Run the GDN kernel, validate against the reference, and optionally benchmark.
-
-    T is the per-sequence length (uniform across all batches for testing).
-    HQ: number of query heads; HV: number of value heads.
-    When HQ != HV, GQA/GVA mode is used (HQ > HV -> GQA, HQ < HV -> GVA).
-
-    :param warmup_iterations: Number of warmup iterations before benchmarking
-    :param iterations: Number of timed benchmark iterations
-    :param use_cold_l2: Use circular buffer of workspaces to ensure cold L2 cache
-    """
-    import torch
-
-    if scale == 0.0:
-        scale = 1.0 / math.sqrt(DK)
-
-    device = "cuda"
-    total_tokens = B * T
-    HK = HQ if HV > HQ else HV
-    HO = HQ if HQ >= HV else HV
-
-    if var_seqlens is not None:
-        T = max(var_seqlens)
-        B = len(var_seqlens)
-
-    # cu_seqlens
-    def create_cu_seqlens(B, T):
-        if var_seqlens is not None:
-            seqlens_ref = torch.tensor(var_seqlens, dtype=torch.int32)
-        else:
-            max_seqlen = int(T * (1.0 + var_seqlen_ratio))
-            min_seqlen = max(1, int(T * (1.0 - var_seqlen_ratio)))
-            seqlens_ref = cutlass_torch.create_and_permute_torch_tensor(
-                (B,),
-                torch.int32,
-                init_type=cutlass_torch.TensorInitType.RANDOM,
-                init_config=cutlass_torch.RandomInitConfig(
-                    min_val=min_seqlen, max_val=max_seqlen + 1
-                ),
-            )
-        cu_seqlens_ref = torch.cumsum(seqlens_ref, dim=0).to(torch.int32)
-        cu_seqlens_ref = torch.cat(
-            [torch.tensor([0], dtype=torch.int32), cu_seqlens_ref], dim=0
-        )
-        cu_seqlens_gpu = cu_seqlens_ref.cuda()
-        cu_seqlens = from_dlpack(cu_seqlens_gpu, assumed_align=4).mark_layout_dynamic()
-        return cu_seqlens_ref, cu_seqlens, cu_seqlens_gpu
-
-    def create_tensor(shape, cutlass_dtype, post_init_fn=None):
-        """
-        Allocate a single tensor:
-          1. Creates an f32 reference on CPU via cutlass_torch.create_and_permute_torch_tensor.
-          2. Applies an optional element-wise transform (e.g. sigmoid) on the f32 CPU tensor.
-          3. Creates a typed GPU tensor via cutlass_torch.cute_tensor_like.
-          4. Converts f32 -> dtype using cute.testing.convert for precision preservation.
-
-        Returns (f32_ref_cpu, cute_tensor, torch_tensor_gpu).
-        """
-        # 1. Create f32 reference on CPU
-        f32_cpu = cutlass_torch.create_and_permute_torch_tensor(
-            shape,
-            torch.float32,
-            permute_order=None,
-            init_type=cutlass_torch.TensorInitType.RANDOM,
-        )
-        # 2. Optional post-init transform (e.g. sigmoid for gate/beta)
-        if post_init_fn is not None:
-            f32_cpu = post_init_fn(f32_cpu)
-
-        # 3. Create typed GPU tensor
-        cute_tensor, torch_tensor = cutlass_torch.cute_tensor_like(
-            f32_cpu, cutlass_dtype, is_dynamic_layout=True, assumed_align=16
-        )
-
-        return f32_cpu, cute_tensor, torch_tensor
-
-    torch.manual_seed(42)
-
-    cu_seqlens_ref, cu_seqlens, cu_seqlens_torch = create_cu_seqlens(B, T)
-    total_tokens = cu_seqlens_ref[-1]
-
-    q_ref, q, q_torch = create_tensor(
-        (total_tokens, HQ, DK), io_dtype, post_init_fn=lambda x: x.normal_(0.0, 1.0)
-    )
-    k_ref, k, k_torch = create_tensor(
-        (total_tokens, HK, DK),
-        io_dtype,
-        post_init_fn=lambda x: torch.nn.functional.normalize(
-            x.normal_(0.0, 1.0), p=2.0, dim=-1
-        ),
-    )
-    v_ref, v, v_torch = create_tensor(
-        (total_tokens, HV, DV), io_dtype, post_init_fn=lambda x: x.normal_(0.0, 1.0)
-    )
-    gate_ref, gate, gate_torch = create_tensor(
-        (total_tokens, HO), acc_dtype, post_init_fn=lambda x: x.uniform_(0.0, 1.0)
-    )
-
-    beta_ref, beta, beta_torch = create_tensor(
-        (total_tokens, HO), acc_dtype, post_init_fn=lambda x: x.uniform_(0.0, 1.0)
-    )
-    o_ref, o, o_torch = create_tensor((total_tokens, HO, DV), io_dtype)
-    if initial_state:
-        s_in_ref, s_in, s_in_torch = create_tensor(
-            (B, HO, DK, DV), acc_dtype, post_init_fn=lambda x: x.normal_(0.0, 1.0)
-        )
-        s_in.mark_compact_shape_dynamic(
-            mode=3, stride_order=(0, 1, 2, 3), divisibility=DV
-        )
-    else:
-        s_in_ref, s_in, s_in_torch = None, None, None
-
-    if final_state:
-        _, s_out, s_out_torch = create_tensor((B, HO, DK, DV), acc_dtype)
-        s_out.mark_compact_shape_dynamic(
-            mode=3, stride_order=(0, 1, 2, 3), divisibility=DV
-        )
-    else:
-        s_out, s_out_torch = None, None
-
-    hardware_info = utils.HardwareInfo()
-    num_sm = hardware_info.get_max_active_clusters(1)
-    tensormap_workspace_ref, tensormap_workspace, tensormap_workspace_torch = (
-        create_tensor(
-            (
-                GatedDeltaNetChunkedKernel.get_workspace_size(
-                    num_sm, B, HQ, HV, is_persistent
-                ),
-            ),
-            cutlass.Int8,
-        )
-    )
-
-    # Check supported configuration before allocating resources
-    GatedDeltaNetChunkedKernel.can_implement(
-        io_dtype,
-        acc_dtype,
-        mma_tiler_qk,
-        mma_tiler_qs,
-        mma_tiler_qkv,
-        mma_tiler_kv,
-    )
-
-    # Compile and run kernel
-    cluster_shape_mnk = (1, 1, 1)
-    max_active_clusters = hardware_info.get_max_active_clusters(
-        cluster_shape_mnk[0] * cluster_shape_mnk[1] * cluster_shape_mnk[2]
-    )
-    gdn = GatedDeltaNetChunkedKernel(
-        io_dtype,
-        acc_dtype,
-        mma_tiler_qk,
-        mma_tiler_qs,
-        mma_tiler_qkv,
-        mma_tiler_kv,
-        max_active_clusters,
-        num_sm,
-        HQ >= HV,
-        initial_state,
-        final_state,
-        is_persistent=is_persistent,
-    )
-
-    # Get current CUDA stream from PyTorch
-    torch_stream = torch.cuda.current_stream()
-    # Get the raw stream pointer as a CUstream
-    stream = cuda.CUstream(torch_stream.cuda_stream)
-
-    compiled_gdn = cute.compile(
-        gdn,
-        q,
-        k,
-        v,
-        gate,
-        beta,
-        o,
-        cu_seqlens,
-        s_in,
-        s_out,
-        scale,
-        tensormap_workspace,
-        stream,
-        options="--opt-level 2",
-    )
-    compiled_gdn(
-        q,
-        k,
-        v,
-        gate,
-        beta,
-        o,
-        cu_seqlens,
-        s_in,
-        s_out,
-        scale,
-        tensormap_workspace,
-        stream,
-    )
-
-    torch.cuda.synchronize()
-    if not skip_ref_check:
-        # Reference: chunked batched-matmul impl on GPU - much faster than
-        # the token-by-token naive for large shapes.
-        o_ref, s_final_ref = gdn_reference_chunk_cu_seqlens(
-            q_torch,
-            k_torch,
-            v_torch,
-            gate_torch,
-            beta_torch,
-            cu_seqlens_torch,
-            initial_state=s_in_torch,
-            scale=scale,
-        )
-        torch.testing.assert_close(
-            o_torch.cpu(), o_ref.to(o_torch.dtype).cpu(), atol=tolerance, rtol=1e-2
-        )
-        print("Kernel output validation passed.")
-        if final_state:
-            torch.testing.assert_close(
-                s_out_torch.cpu(),
-                s_final_ref.to(s_out_torch.dtype).cpu(),
-                atol=tolerance,
-                rtol=1e-2,
-            )
-            print("Final state validation passed.")
-
-    if iterations < 1:
-        return
-
-    # Benchmark
-    def generate_workspace():
-        """Create a fresh set of input/output tensors for each workspace slot."""
-        _, _cu_seqlens, _cu_seqlens_torch = create_cu_seqlens(B, T)
-        total_tokens = _cu_seqlens_torch[-1]
-        _, _q, _ = create_tensor(
-            (total_tokens, HQ, DK),
-            io_dtype,
-            post_init_fn=lambda x: x.normal_(0.0, 1.0),
-        )
-        _, _k, _ = create_tensor(
-            (total_tokens, HK, DK),
-            io_dtype,
-            post_init_fn=lambda x: x.normal_(0.0, 1.0),
-        )
-        _, _v, _ = create_tensor(
-            (total_tokens, HV, DV),
-            io_dtype,
-            post_init_fn=lambda x: x.normal_(0.0, 1.0),
-        )
-        _, _gate, _ = create_tensor(
-            (total_tokens, HO), acc_dtype, post_init_fn=lambda x: x.uniform_(0.0, 1.0)
-        )
-        _, _beta, _ = create_tensor(
-            (total_tokens, HO), acc_dtype, post_init_fn=lambda x: x.uniform_(0.0, 1.0)
-        )
-        _, _o, _ = create_tensor((total_tokens, HO, DV), io_dtype)
-        if initial_state:
-            _, _s_in, _ = create_tensor(
-                (B, HO, DK, DV),
-                acc_dtype,
-                post_init_fn=lambda x: x.normal_(0.0, 1.0),
-            )
-        else:
-            _s_in = None
-        if final_state:
-            _, _s_out, _ = create_tensor((B, HO, DK, DV), acc_dtype)
-        else:
-            _s_out = None
-        _, _tensormap_workspace, _ = create_tensor(
-            (
-                GatedDeltaNetChunkedKernel.get_workspace_size(
-                    num_sm, B, HQ, HV, is_persistent
-                ),
-            ),
-            cutlass.Int8,
-        )
-        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-        return testing.JitArguments(
-            _q,
-            _k,
-            _v,
-            _gate,
-            _beta,
-            _o,
-            _cu_seqlens,
-            _s_in,
-            _s_out,
-            scale,
-            _tensormap_workspace,
-            stream,
-        )
-
-    workspace_count = 1
-    if use_cold_l2:
-        one_workspace_bytes = (
-            q_torch.numel() * q_torch.element_size()
-            + k_torch.numel() * k_torch.element_size()
-            + v_torch.numel() * v_torch.element_size()
-            + gate_torch.numel() * gate_torch.element_size()
-            + beta_torch.numel() * beta_torch.element_size()
-            + o_torch.numel() * o_torch.element_size()
-        )
-        if initial_state:
-            one_workspace_bytes += s_in_torch.numel() * s_in_torch.element_size()
-        if final_state:
-            one_workspace_bytes += s_out_torch.numel() * s_out_torch.element_size()
-        one_workspace_bytes += GatedDeltaNetChunkedKernel.get_workspace_size(
-            num_sm, B, HQ, HV, is_persistent
-        )
-        workspace_count = testing.get_workspace_count(
-            one_workspace_bytes, warmup_iterations, iterations
-        )
-
-    exec_time_us = testing.benchmark(
-        compiled_gdn,
-        workspace_generator=generate_workspace,
-        workspace_count=workspace_count,
-        warmup_iterations=warmup_iterations,
-        iterations=iterations,
-    )
-    print(f"Kernel time: {exec_time_us:.3f} us")
-
-
-if __name__ == "__main__":
-    from cuda.bindings import driver as cu_driver
-
-    cu_driver.cuInit(0)
-    err, device_count = cu_driver.cuDeviceGetCount()
-    if err != cu_driver.CUresult.CUDA_SUCCESS or device_count < 1:
-        raise RuntimeError("A GPU is required to run this example")
-
-    parser = argparse.ArgumentParser(description="Chunked Gated Delta Net kernel")
-    parser.add_argument(
-        "--io_dtype",
-        type=cutlass.dtype,
-        default=cutlass.Float16,
-        help="Input/output data type",
-    )
-    parser.add_argument(
-        "--acc_dtype",
-        type=cutlass.dtype,
-        default=cutlass.Float32,
-        help="Accumulator data type",
-    )
-    parser.add_argument(
-        "--mma_tiler_qk",
-        type=tuple,
-        default=(128, 128, 128),
-        help="MMA tile shape for QK",
-    )
-    parser.add_argument(
-        "--mma_tiler_qs",
-        type=tuple,
-        default=(128, 128, 128),
-        help="MMA tile shape for QS",
-    )
-    parser.add_argument(
-        "--mma_tiler_qkv",
-        type=tuple,
-        default=(128, 128, 128),
-        help="MMA tile shape for QKV",
-    )
-    parser.add_argument(
-        "--mma_tiler_kv",
-        type=tuple,
-        default=(128, 128, 128),
-        help="MMA tile shape for KV",
-    )
-    parser.add_argument("--batch", type=int, default=1)
-    parser.add_argument(
-        "--num_heads_q", type=int, default=1, help="number of query/key heads"
-    )
-    parser.add_argument(
-        "--num_heads_v", type=int, default=1, help="number of value heads"
-    )
-    parser.add_argument("--seqlen", type=int, default=128)
-    parser.add_argument("--hidden_dim_k", type=int, default=128)
-    parser.add_argument("--hidden_dim_v", type=int, default=128)
-    parser.add_argument(
-        "--initial_state",
-        action="store_true",
-        default=False,
-        help="Use initial state or not",
-    )
-    parser.add_argument(
-        "--final_state",
-        action="store_true",
-        default=False,
-        help="Store final state to output",
-    )
-    parser.add_argument("--tolerance", type=float, default=1e-2)
-    parser.add_argument(
-        "--warmup_iterations",
-        type=int,
-        default=0,
-        help="Number of warmup iterations before benchmarking",
-    )
-    parser.add_argument(
-        "--iterations", type=int, default=1, help="Number of timed benchmark iterations"
-    )
-    parser.add_argument(
-        "--skip_ref_check",
-        action="store_true",
-        default=False,
-        help="Skip reference check",
-    )
-    parser.add_argument(
-        "--use_cold_l2",
-        action="store_true",
-        default=False,
-        help="Use circular buffer of workspaces to keep L2 cache cold",
-    )
-    parser.add_argument(
-        "--var_seqlen_ratio",
-        type=float,
-        default=0.0,
-        help="Seqlens drawn uniformly from [T*(1-var_seqlen_ratio), T*(1+var_seqlen_ratio)]",
-    )
-    parser.add_argument(
-        "--var_seqlens",
-        type=lambda x: [int(i) for i in x.split(",")],
-        default=None,
-        help="List of sequence lengths",
-    )
-    parser.add_argument(
-        "--scale",
-        type=float,
-        default=0.0,
-        help="Attention scale applied to Q*K and Q*State; 0.0 -> 1/sqrt(DK)",
-    )
-    parser.add_argument(
-        "--is_persistent",
-        dest="is_persistent",
-        action="store_true",
-        default=True,
-        help="Use persistent tile scheduler (default)",
-    )
-    args = parser.parse_args()
-
-    run(
-        args.io_dtype,
-        args.acc_dtype,
-        args.mma_tiler_qk,
-        args.mma_tiler_qs,
-        args.mma_tiler_qkv,
-        args.mma_tiler_kv,
-        args.batch,
-        args.seqlen,
-        args.num_heads_q,
-        args.num_heads_v,
-        args.hidden_dim_k,
-        args.hidden_dim_v,
-        args.var_seqlen_ratio,
-        args.var_seqlens,
-        args.scale,
-        args.initial_state,
-        args.final_state,
-        args.is_persistent,
-        args.warmup_iterations,
-        args.iterations,
-        args.skip_ref_check,
-        args.use_cold_l2,
-        args.tolerance,
-    )

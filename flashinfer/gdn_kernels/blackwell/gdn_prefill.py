@@ -43,6 +43,7 @@ from .gated_delta_net_chunked import GatedDeltaNetChunkedKernel
 # Compilation cache
 # ---------------------------------------------------------------------------
 
+
 # Keyed on static kernel configuration. Head counts (HQ, HV) are part of
 # the key because the tile scheduler and GQA reshape logic bake them in.
 @functools.cache
@@ -64,7 +65,9 @@ def _cutlass_io_dtype(torch_dtype: torch.dtype):
     elif torch_dtype == torch.float16:
         return cutlass.Float16
     else:
-        raise ValueError(f"Unsupported dtype {torch_dtype}, expected bfloat16 or float16")
+        raise ValueError(
+            f"Unsupported dtype {torch_dtype}, expected bfloat16 or float16"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +115,6 @@ def chunk_gated_delta_rule_sm100(
     # States are K-major [N, H, K, V] — pass through directly
     _initial_state = initial_state if use_initial_state else None
     B = cu_seqlens.size(0) - 1
-    HO = max(HQ, HV)
     if store_final_state:
         _output_state = output_state
     else:
@@ -147,17 +149,29 @@ def chunk_gated_delta_rule_sm100(
         # Token dimension (dim 0) must be dynamic to handle varying seq lengths.
         # Head and head_dim dimensions stay static (part of cache key).
         q_cute = from_dlpack(q, assumed_align=16)
-        q_cute.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
+        q_cute.mark_compact_shape_dynamic(
+            mode=0, stride_order=(0, 1, 2), divisibility=1
+        )
         k_cute = from_dlpack(k, assumed_align=16)
-        k_cute.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
+        k_cute.mark_compact_shape_dynamic(
+            mode=0, stride_order=(0, 1, 2), divisibility=1
+        )
         v_cute = from_dlpack(v, assumed_align=16)
-        v_cute.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
+        v_cute.mark_compact_shape_dynamic(
+            mode=0, stride_order=(0, 1, 2), divisibility=1
+        )
         gate_cute = from_dlpack(gate, assumed_align=16)
-        gate_cute.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
+        gate_cute.mark_compact_shape_dynamic(
+            mode=0, stride_order=(0, 1), divisibility=1
+        )
         beta_cute = from_dlpack(beta, assumed_align=16)
-        beta_cute.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
+        beta_cute.mark_compact_shape_dynamic(
+            mode=0, stride_order=(0, 1), divisibility=1
+        )
         o_cute = from_dlpack(output, assumed_align=16)
-        o_cute.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
+        o_cute.mark_compact_shape_dynamic(
+            mode=0, stride_order=(0, 1, 2), divisibility=1
+        )
         cu_seqlens_cute = from_dlpack(cu_seqlens, assumed_align=4).mark_layout_dynamic()
 
         s_in_cute = None

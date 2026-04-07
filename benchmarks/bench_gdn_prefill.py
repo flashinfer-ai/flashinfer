@@ -153,18 +153,14 @@ def bench_gdn_prefill(
         )
         scale = 1.0 / (head_size**0.5)
         alpha = (
-            torch.rand(
-                total_seq_len, num_sab_heads, dtype=torch.float32, device="cuda"
-            )
+            torch.rand(total_seq_len, num_sab_heads, dtype=torch.float32, device="cuda")
             if use_alpha
             else torch.ones(
                 total_seq_len, num_sab_heads, dtype=torch.float32, device="cuda"
             )
         )
         beta = (
-            torch.rand(
-                total_seq_len, num_sab_heads, dtype=torch.float32, device="cuda"
-            )
+            torch.rand(total_seq_len, num_sab_heads, dtype=torch.float32, device="cuda")
             if use_beta
             else torch.ones(
                 total_seq_len, num_sab_heads, dtype=torch.float32, device="cuda"
@@ -180,24 +176,30 @@ def bench_gdn_prefill(
             0, batch_size * seq_len + 1, seq_len, dtype=torch.int64, device="cuda"
         )
         alpha = (
-            torch.rand(
-                total_seq_len, num_sab_heads, dtype=torch.float32, device="cuda"
-            )
+            torch.rand(total_seq_len, num_sab_heads, dtype=torch.float32, device="cuda")
             if use_alpha
             else None
         )
         beta = (
-            torch.rand(
-                total_seq_len, num_sab_heads, dtype=torch.float32, device="cuda"
-            )
+            torch.rand(total_seq_len, num_sab_heads, dtype=torch.float32, device="cuda")
             if use_beta
             else None
         )
 
         def run():
             chunk_gated_delta_rule(
-                q, k, v, alpha, beta, None, None, True, cu_seqlens, False,
-                output=output, output_state=output_state,
+                q,
+                k,
+                v,
+                alpha,
+                beta,
+                None,
+                None,
+                True,
+                cu_seqlens,
+                False,
+                output=output,
+                output_state=output_state,
             )
 
     # Warmup
