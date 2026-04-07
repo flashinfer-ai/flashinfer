@@ -74,7 +74,8 @@ def get_topk_module():
         return torch.empty(batch_size, top_k, dtype=torch.int32, device=input.device)
 
     @register_custom_op(
-        "flashinfer::fast_topk_clusters_exact", mutates_args=("indices",)
+        "flashinfer::fast_topk_clusters_exact",
+        mutates_args=("indices", "output_values", "cached_overflow"),
     )
     def _fast_topk_clusters_exact(
         logits: torch.Tensor,
@@ -114,7 +115,8 @@ def get_topk_module():
         pass
 
     @register_custom_op(
-        "flashinfer::fast_topk_clusters_exact_page_table_transform", mutates_args=("indices",)
+        "flashinfer::fast_topk_clusters_exact_page_table_transform",
+        mutates_args=("indices", "cached_overflow"),
     )
     def _fast_topk_clusters_exact_page_table_transform(
         logits: torch.Tensor,
@@ -157,7 +159,8 @@ def get_topk_module():
         pass
 
     @register_custom_op(
-        "flashinfer::fast_topk_clusters_exact_ragged_transform", mutates_args=("indices",)
+        "flashinfer::fast_topk_clusters_exact_ragged_transform",
+        mutates_args=("indices", "cached_overflow"),
     )
     def _fast_topk_clusters_exact_ragged_transform(
         logits: torch.Tensor,
@@ -316,8 +319,12 @@ def get_fast_topk_clusters(batch_size: int) -> int:
         return 1
 
 
-def topk_clusters_exact(logits, top_k, output_values=False, out_dtype=torch.int32, pdl=False):
-    assert out_dtype in (torch.int32, torch.int64), "out_dtype must be torch.int32 or torch.int64"
+def topk_clusters_exact(
+    logits, top_k, output_values=False, out_dtype=torch.int32, pdl=False
+):
+    assert out_dtype in (torch.int32, torch.int64), (
+        "out_dtype must be torch.int32 or torch.int64"
+    )
     batch_size, max_model_len = logits.shape
     indices = torch.empty(batch_size, top_k, dtype=out_dtype, device=logits.device)
     num_clusters = get_fast_topk_clusters(batch_size)
@@ -339,17 +346,19 @@ def topk_clusters_exact(logits, top_k, output_values=False, out_dtype=torch.int3
         logits,
         indices,
         output_vals,
-        None,   # histogram
+        None,  # histogram
         overflow_buf,
         top_k,
-        4100,   # num_cached
+        4100,  # num_cached
         num_clusters,
         pdl,
     )
     return indices, output_vals
 
 
-def topk_clusters_page_table_transform(logits, seq_lens, src_page_table, top_k, pdl=False):
+def topk_clusters_page_table_transform(
+    logits, seq_lens, src_page_table, top_k, pdl=False
+):
     batch_size, max_model_len = logits.shape
     indices = torch.empty(batch_size, top_k, dtype=torch.int32, device=logits.device)
     num_clusters = get_fast_topk_clusters(batch_size)
@@ -367,10 +376,10 @@ def topk_clusters_page_table_transform(logits, seq_lens, src_page_table, top_k, 
         indices,
         seq_lens,
         src_page_table,
-        None,   # histogram
+        None,  # histogram
         overflow_buf,
         top_k,
-        4196,   # num_cached
+        4196,  # num_cached
         num_clusters,
         pdl,
     )
@@ -395,10 +404,10 @@ def topk_clusters_ragged_transform(logits, seq_lens, offsets, top_k, pdl=False):
         indices,
         seq_lens,
         offsets,
-        None,   # histogram
+        None,  # histogram
         overflow_buf,
         top_k,
-        4196,   # num_cached
+        4196,  # num_cached
         num_clusters,
         pdl,
     )
@@ -492,7 +501,9 @@ def top_k(
             input, k, output_values=True, out_dtype=torch.int64
         )
         if sorted:
-            sorted_values, sort_indices = torch.sort(output_values, dim=-1, descending=True)
+            sorted_values, sort_indices = torch.sort(
+                output_values, dim=-1, descending=True
+            )
             sorted_indices = torch.gather(indices, dim=-1, index=sort_indices)
             return sorted_values, sorted_indices
         return output_values, indices
