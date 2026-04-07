@@ -1574,13 +1574,6 @@ void expandInputRowsKernelLauncher(
       (std::is_same_v<ExpandedActivationsType, __nv_fp4_e2m1> && fc1_act_sf_flat) ||
           !use_per_expert_act_scale,
       "Per-expert act scale for FC1 is only supported for NVFP4 activations");
-  constexpr int64_t min_num_tokens_alignment =
-      std::is_same_v<ExpandedActivationsType, __nv_fp4_e2m1>
-          ? TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentNVFP4
-          : TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX;
-  int64_t num_padding_tokens = min_num_tokens_alignment * num_experts_per_node;
-#else
-  int64_t num_padding_tokens = 0;
 #endif
 
   static int64_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
@@ -2275,15 +2268,6 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
                   QuantParams const& quant_params, bool use_per_expert_act_scale,
                   TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_act_sf_flat, bool enable_pdl,
                   cudaStream_t stream) {
-#ifdef ENABLE_FP4
-  constexpr int64_t min_num_tokens_alignment =
-      std::is_same_v<T, __nv_fp4_e2m1> ? TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentNVFP4
-                                       : TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX;
-  int64_t num_padding_tokens = min_num_tokens_alignment * num_experts_per_node;
-#else
-  int64_t num_padding_tokens = 0;
-#endif
-
   static int64_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
   // Note: Launching 8 blocks per SM can fully leverage the memory bandwidth (tested on B200).
   // The N-dim padding loop is now expert-driven (skipping empty experts), so the grid no longer
