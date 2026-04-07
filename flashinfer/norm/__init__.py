@@ -604,8 +604,8 @@ def fused_rmsnorm_silu(
 
     where ``SiLU(x) = x / (1 + exp(-x))``
 
-    Optimized for WAN VAE decoder workloads on SM100 (B200).
-    Uses sweep-tuned knobs for all standard VAE problem sizes.
+    Optimized for SM100 (B200) for WAN VAE decoder problem sizes.
+    Other shapes and architectures (SM80+) use conservative fallback heuristics.
 
     Parameters
     ----------
@@ -650,7 +650,7 @@ def fused_rmsnorm_silu(
     640, 1024} and ``num_tokens`` in {1560, 6240, 24960, 99840, 399360}.
     Other problem sizes use conservative fallback heuristics that are
     functionally correct but may not achieve peak throughput. Performance
-    on non-SM100 architectures (SM80/SM89) uses the same fallback path.
+    on non-SM100 architectures uses the same fallback path.
     """
     if input.device.type != "cuda":
         raise ValueError("fused_rmsnorm_silu requires CUDA tensors")
