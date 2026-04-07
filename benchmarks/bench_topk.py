@@ -384,7 +384,9 @@ def bench_page_table_transform(
     # FlashInfer clusters
     set_topk_algo("clusters")
     measurements = bench_gpu_time(
-        lambda: flashinfer.top_k_page_table_transform(scores, src_page_table, lengths, k),
+        lambda: flashinfer.top_k_page_table_transform(
+            scores, src_page_table, lengths, k
+        ),
         enable_cupti=enable_cupti,
         dry_run_iters=10,
         repeat_iters=100,

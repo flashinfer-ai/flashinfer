@@ -263,14 +263,14 @@ __device__ __forceinline__ TopkResults fast_topk_cuda_v4(
           s_cached_indices[cached_offset] = i;
           s_cached_logit_bits[cached_offset] =
               static_cast<uint32_t>(bits);  // widen to 32 bits if from half
-          atomicAdd(shared_hist[1] + (( bits >> (LShiftStart - 8) ) & 0xff), 1);
+          atomicAdd(shared_hist[1] + ((bits >> (LShiftStart - 8)) & 0xff), 1);
         } else {
           // Shared buffer full: spill to per-CTA global overflow cache.
           int g_off = atomicAdd(&s_cached_overflow_count[0], 1);
           if (g_off < overflow_stride) {
             PackedCachedData cached_res = {static_cast<uint32_t>(bits), i};
             get_cached_overflow(0)[g_off] = cached_res;
-            atomicAdd(shared_hist[1] + (( bits >> (LShiftStart - 8) ) & 0xff), 1);
+            atomicAdd(shared_hist[1] + ((bits >> (LShiftStart - 8)) & 0xff), 1);
           }
         }
       }
@@ -464,7 +464,6 @@ __device__ __forceinline__ TopkResults fast_topk_cuda_v4(
   }
 }
 
-
 template <typename T, typename IdxT, int NClusters, bool PDL_ENABLED>
 __global__ __launch_bounds__(1024) void __cluster_dims__(NClusters, 1, 1)
     fast_topk_clusters_exact_kernel(
@@ -505,19 +504,16 @@ __global__ __launch_bounds__(1024) void __cluster_dims__(NClusters, 1, 1)
   }
 }
 
-
 template <typename T, int NClusters, bool PDL_ENABLED>
 __global__ __launch_bounds__(1024) void __cluster_dims__(NClusters, 1, 1)
     fast_topk_clusters_exact_page_table_transform_kernel(
-        const T* __restrict__ logits,  // [batchsize, logits_stride]
-        int* __restrict__ output_indices, // [batchsize, indices_stride]
-        int* __restrict__ seq_lens, // [batchsize]
-        int* __restrict__ page_table, // [batchsize, page_table_stride]
-        int* __restrict__ pre_hist, // optional[batchsize, 256]
-        int* __restrict__ cached_overflow, // [batchsize, 4 * NClusters * overflow_stride]
-        int overflow_stride,
-        int logit_stride, int indices_stride, 
-        int page_table_stride,
+        const T* __restrict__ logits,       // [batchsize, logits_stride]
+        int* __restrict__ output_indices,   // [batchsize, indices_stride]
+        int* __restrict__ seq_lens,         // [batchsize]
+        int* __restrict__ page_table,       // [batchsize, page_table_stride]
+        int* __restrict__ pre_hist,         // optional[batchsize, 256]
+        int* __restrict__ cached_overflow,  // [batchsize, 4 * NClusters * overflow_stride]
+        int overflow_stride, int logit_stride, int indices_stride, int page_table_stride,
         int num_cached, const int TopK) {
   int cluster_id = blockIdx.x / NClusters;
   int logit_offset = cluster_id * logit_stride;
@@ -555,15 +551,13 @@ __global__ __launch_bounds__(1024) void __cluster_dims__(NClusters, 1, 1)
 template <typename T, int NClusters, bool PDL_ENABLED>
 __global__ __launch_bounds__(1024) void __cluster_dims__(NClusters, 1, 1)
     fast_topk_clusters_exact_ragged_transform_kernel(
-        const T* __restrict__ logits,  // [batchsize, logits_stride]
-        int* __restrict__ output_indices, // [batchsize, indices_stride]
-        int* __restrict__ seq_lens, // [batchsize]
-        int* __restrict__ offsets, // [batchsize]
-        int* __restrict__ pre_hist, // optional[batchsize, 256]
-        int* __restrict__ cached_overflow, // [batchsize, 4 * NClusters * overflow_stride]
-        int overflow_stride,
-        int logit_stride, int indices_stride, 
-        int num_cached, const int TopK) {
+        const T* __restrict__ logits,       // [batchsize, logits_stride]
+        int* __restrict__ output_indices,   // [batchsize, indices_stride]
+        int* __restrict__ seq_lens,         // [batchsize]
+        int* __restrict__ offsets,          // [batchsize]
+        int* __restrict__ pre_hist,         // optional[batchsize, 256]
+        int* __restrict__ cached_overflow,  // [batchsize, 4 * NClusters * overflow_stride]
+        int overflow_stride, int logit_stride, int indices_stride, int num_cached, const int TopK) {
   int cluster_id = blockIdx.x / NClusters;
   int logit_offset = cluster_id * logit_stride;
   int ind_offset = cluster_id * indices_stride;
@@ -597,24 +591,19 @@ __global__ __launch_bounds__(1024) void __cluster_dims__(NClusters, 1, 1)
   }
 }
 
-
-
-
 constexpr int MAX_SMEM_CARVEOUT = 227 * 1000;
 
-#define DISPATCH_TOPK_EXACT(kernel_name, dtype, CLUSTERS, PDL)                    \
-  if (num_clusters == CLUSTERS && pdl_enabled == PDL) {                           \
-    setup_kernel_smem_once<kernel_name<dtype, CLUSTERS, PDL>,                     \
-                           MAX_SMEM_CARVEOUT>();                                  \
-    kernel = (void*)&kernel_name<dtype, CLUSTERS, PDL>;                           \
+#define DISPATCH_TOPK_EXACT(kernel_name, dtype, CLUSTERS, PDL)                      \
+  if (num_clusters == CLUSTERS && pdl_enabled == PDL) {                             \
+    setup_kernel_smem_once<kernel_name<dtype, CLUSTERS, PDL>, MAX_SMEM_CARVEOUT>(); \
+    kernel = (void*)&kernel_name<dtype, CLUSTERS, PDL>;                             \
   }
 
 // Variant for kernels with an additional IdxT template parameter (index output dtype).
-#define DISPATCH_TOPK_EXACT_IDX(kernel_name, dtype, idx_type, CLUSTERS, PDL)     \
-  if (num_clusters == CLUSTERS && pdl_enabled == PDL) {                           \
-    setup_kernel_smem_once<kernel_name<dtype, idx_type, CLUSTERS, PDL>,           \
-                           MAX_SMEM_CARVEOUT>();                                  \
-    kernel = (void*)&kernel_name<dtype, idx_type, CLUSTERS, PDL>;                 \
+#define DISPATCH_TOPK_EXACT_IDX(kernel_name, dtype, idx_type, CLUSTERS, PDL)                  \
+  if (num_clusters == CLUSTERS && pdl_enabled == PDL) {                                       \
+    setup_kernel_smem_once<kernel_name<dtype, idx_type, CLUSTERS, PDL>, MAX_SMEM_CARVEOUT>(); \
+    kernel = (void*)&kernel_name<dtype, idx_type, CLUSTERS, PDL>;                             \
   }
 
 inline void launch_topk_cluster_kernel(void* kernel, void** args, int grid_dim, int smem_bytes,
@@ -648,7 +637,7 @@ void launch_fast_topk_clusters_exact(const T* logits, IdxT* indices, T* output_v
       (num_cached * 2 * sizeof(float) + num_cached * 2 * sizeof(int) + TopK * sizeof(int));
 
   void* args[11] = {
-      &logits,          &indices,      &output_values,  &seq_len,   &pre_hist, &cached_overflow,
+      &logits,          &indices,      &output_values,  &seq_len,    &pre_hist, &cached_overflow,
       &overflow_stride, &logit_stride, &indices_stride, &num_cached, &TopK};
 
   void* kernel = nullptr;
@@ -676,15 +665,15 @@ void launch_fast_topk_clusters_exact(const T* logits, IdxT* indices, T* output_v
 template <typename T>
 void launch_fast_topk_clusters_exact_page_table_transform(
     const T* logits, int* indices, int* seq_lens, int* page_table, int* pre_hist,
-    int* cached_overflow, int overflow_stride, int batch_size, int logit_stride,
-    int indices_stride, int page_table_stride, int num_cached, int num_clusters,
-    bool pdl_enabled, int TopK, cudaStream_t stream) {
+    int* cached_overflow, int overflow_stride, int batch_size, int logit_stride, int indices_stride,
+    int page_table_stride, int num_cached, int num_clusters, bool pdl_enabled, int TopK,
+    cudaStream_t stream) {
   int extern_shared_mem =
       (num_cached * 2 * sizeof(float) + num_cached * 2 * sizeof(int) + TopK * sizeof(int));
 
-  void* args[12] = {&logits,          &indices,        &seq_lens,          &page_table,
-                    &pre_hist,         &cached_overflow, &overflow_stride,   &logit_stride,
-                    &indices_stride,   &page_table_stride, &num_cached,      &TopK};
+  void* args[12] = {&logits,         &indices,           &seq_lens,        &page_table,
+                    &pre_hist,       &cached_overflow,   &overflow_stride, &logit_stride,
+                    &indices_stride, &page_table_stride, &num_cached,      &TopK};
 
   void* kernel = nullptr;
   DISPATCH_TOPK_EXACT(fast_topk_clusters_exact_page_table_transform_kernel, T, 1, true);
@@ -708,16 +697,15 @@ void launch_fast_topk_clusters_exact_page_table_transform(
 
 template <typename T>
 void launch_fast_topk_clusters_exact_ragged_transform(
-    const T* logits, int* indices, int* seq_lens, int* offsets, int* pre_hist,
-    int* cached_overflow, int overflow_stride, int batch_size, int logit_stride,
-    int indices_stride, int num_cached, int num_clusters, bool pdl_enabled, int TopK,
-    cudaStream_t stream) {
+    const T* logits, int* indices, int* seq_lens, int* offsets, int* pre_hist, int* cached_overflow,
+    int overflow_stride, int batch_size, int logit_stride, int indices_stride, int num_cached,
+    int num_clusters, bool pdl_enabled, int TopK, cudaStream_t stream) {
   int extern_shared_mem =
       (num_cached * 2 * sizeof(float) + num_cached * 2 * sizeof(int) + TopK * sizeof(int));
 
-  void* args[11] = {&logits,    &indices,         &seq_lens,        &offsets,
-                    &pre_hist,  &cached_overflow,  &overflow_stride, &logit_stride,
-                    &indices_stride, &num_cached,  &TopK};
+  void* args[11] = {
+      &logits,          &indices,      &seq_lens,       &offsets,    &pre_hist, &cached_overflow,
+      &overflow_stride, &logit_stride, &indices_stride, &num_cached, &TopK};
 
   void* kernel = nullptr;
   DISPATCH_TOPK_EXACT(fast_topk_clusters_exact_ragged_transform_kernel, T, 1, true);

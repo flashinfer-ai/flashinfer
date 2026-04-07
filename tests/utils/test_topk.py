@@ -2279,7 +2279,9 @@ def _require_sm100_or_sm103():
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output_values", [False, True])
 @pytest.mark.parametrize("out_dtype", [torch.int32, torch.int64])
-def test_topk_clusters_exact_correctness(batch_size, seq_len, k, dtype, output_values, out_dtype):
+def test_topk_clusters_exact_correctness(
+    batch_size, seq_len, k, dtype, output_values, out_dtype
+):
     """Test topk_clusters_exact returns indices (and optionally values) matching torch.topk."""
     _require_sm100_or_sm103()
     if k > seq_len:
@@ -2302,11 +2304,21 @@ def test_topk_clusters_exact_correctness(batch_size, seq_len, k, dtype, output_v
         assert values is not None
         assert values.shape == (batch_size, k)
         assert values.dtype == dtype
-        
+
         abs_err = 0.125 if dtype == torch.bfloat16 else 1e-5
         rel_err = 0.1 if dtype == torch.bfloat16 else 1e-5
-        torch.testing.assert_close(values.min(dim=-1).values, ref_values.min(dim=-1).values, rtol=rel_err, atol=abs_err)
-        torch.testing.assert_close(values.max(dim=-1).values, ref_values.max(dim=-1).values, rtol=rel_err, atol=abs_err)
+        torch.testing.assert_close(
+            values.min(dim=-1).values,
+            ref_values.min(dim=-1).values,
+            rtol=rel_err,
+            atol=abs_err,
+        )
+        torch.testing.assert_close(
+            values.max(dim=-1).values,
+            ref_values.max(dim=-1).values,
+            rtol=rel_err,
+            atol=abs_err,
+        )
     else:
         assert values is None
 
@@ -2334,7 +2346,9 @@ def test_topk_clusters_exact_variable_seq_lens(batch_size, seq_len, k, dtype):
     # Zero offsets: output indices are positions within each row
     offsets = torch.zeros(batch_size, device=device, dtype=torch.int32)
 
-    indices = flashinfer.topk.topk_clusters_ragged_transform(logits, seq_lens, offsets, k)
+    indices = flashinfer.topk.topk_clusters_ragged_transform(
+        logits, seq_lens, offsets, k
+    )
 
     assert indices.shape == (batch_size, k)
     assert indices.dtype == torch.int32
@@ -2385,7 +2399,7 @@ def test_topk_clusters_page_table_transform(num_rows, seq_len, k, dtype):
 
     ref_output = reference_page_table_transform(scores, src_page_table, lengths, k)
     accuracy = compute_transform_accuracy(output, ref_output, num_rows, k)
-    
+
     acc = 0.95 if dtype == torch.bfloat16 else 0.99
     assert accuracy >= acc, f"Accuracy {accuracy:.4f} < {acc}"
 
