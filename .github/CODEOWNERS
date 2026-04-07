@@ -22,9 +22,10 @@ include/flashinfer/gemm/       @dhiraj113 @yzh119 @aleozlx @bkryu
 tests/gemm/                    @dhiraj113 @yzh119 @aleozlx @bkryu
 
 # ── MOE ──
-csrc/fused_moe/                @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees
-flashinfer/fused_moe/          @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees
-tests/moe/                     @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees
+csrc/fused_moe/                       @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees
+flashinfer/fused_moe/                 @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees
+include/flashinfer/trtllm/fused_moe/  @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees
+tests/moe/                            @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees
 
 # ── Communication ──
 flashinfer/comm/               @aleozlx @yzh119 @jimmyzho @bkryu @nv-yunzheq
