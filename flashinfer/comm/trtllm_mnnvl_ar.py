@@ -566,8 +566,11 @@ def get_allreduce_mnnvl_workspace(
         - torch.Tensor: Buffer flags tensor tracking state
         - int: Maximum number of elements that can fit in buffer
     """
+    # buffer shape: [3, 2, buffer_tokens, hidden_dim]
     stride = 3 * 2 * dtype.itemsize
     lcm_hidden_dim = 286720
+    # LCM for hidden_dim: 2048, 4096, 5120, 7168, 8192 = 286720
+    # max_num_elements must be a multiple of 286720
     TARGET_WORKSPACE_SIZE_BYTES = (
         buffer_size_in_bytes if buffer_size_in_bytes is not None else 12_000_000
     )
@@ -575,6 +578,7 @@ def get_allreduce_mnnvl_workspace(
         TARGET_WORKSPACE_SIZE_BYTES / (lcm_hidden_dim * stride)
     ) * (lcm_hidden_dim * stride)
 
+    # Redirect to the new workspace allocation logic. The new kernel needs the new flag buffer layout.
     workspace = MNNVLAllReduceFusionWorkspace(
         mapping,
         buffer_size_in_bytes=buffer_size_in_bytes,
