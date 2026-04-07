@@ -1597,22 +1597,15 @@ void expandInputRowsKernelLauncher(
 
   if (use_skip_sf_padding) {
 #ifdef ENABLE_FP4
-    // Compute SF buffer size for the memset. The SF layout has one scale per VecSize elements,
-    // padded to min_num_tokens_alignment per expert along N and min_k_dim_alignment along K.
-    constexpr int64_t VecSize =
+    // Pre-zero the SF buffer using the same formula that computed the allocation size.
+    // getOffsetActivationSF(num_experts, expanded_tokens, hidden_size, ...) returns the total
+    // number of SF elements, matching the workspace allocation exactly.
+    auto constexpr scaling_type =
         std::is_same_v<ExpandedActivationsType, __nv_fp4_e2m1>
-            ? TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize
-            : TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize;
-    constexpr int64_t min_k_dim_alignment =
-        std::is_same_v<ExpandedActivationsType, __nv_fp4_e2m1>
-            ? TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentNVFP4
-            : TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX;
-    int64_t const padded_hidden =
-        TmaWarpSpecializedGroupedGemmInput::alignToSfDim(hidden_size, min_k_dim_alignment);
-    int64_t const max_padded_tokens_per_expert =
-        TmaWarpSpecializedGroupedGemmInput::alignToSfDim(expanded_tokens, min_num_tokens_alignment);
+            ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4
+            : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
     int64_t const sf_buffer_size =
-        num_experts_per_node * max_padded_tokens_per_expert * (padded_hidden / VecSize) *
+        getOffsetActivationSF(num_experts_per_node, expanded_tokens, hidden_size, scaling_type) *
         sizeof(TmaWarpSpecializedGroupedGemmInput::ElementSF);
     cudaMemsetAsync(fc1_act_sf_flat, 0, sf_buffer_size, stream);
 #endif
@@ -2347,22 +2340,13 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
 
   if (use_skip_sf_padding) {
 #ifdef ENABLE_FP4
-    // Pre-zero the FC2 SF buffer so padding loops can be skipped
-    constexpr int64_t VecSize =
+    // Pre-zero the FC2 SF buffer using the same formula that computed the allocation size.
+    auto constexpr scaling_type =
         std::is_same_v<T, __nv_fp4_e2m1>
-            ? TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize
-            : TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize;
-    constexpr int64_t min_k_dim_alignment =
-        std::is_same_v<T, __nv_fp4_e2m1>
-            ? TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentNVFP4
-            : TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX;
-    int64_t const padded_inter =
-        TmaWarpSpecializedGroupedGemmInput::alignToSfDim(inter_size, min_k_dim_alignment);
-    int64_t const max_padded_tokens_per_expert =
-        TmaWarpSpecializedGroupedGemmInput::alignToSfDim(expanded_num_tokens,
-                                                          min_num_tokens_alignment);
+            ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4
+            : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
     int64_t const sf_buffer_size =
-        num_experts_per_node * max_padded_tokens_per_expert * (padded_inter / VecSize) *
+        getOffsetActivationSF(num_experts_per_node, expanded_num_tokens, inter_size, scaling_type) *
         sizeof(TmaWarpSpecializedGroupedGemmInput::ElementSF);
     cudaMemsetAsync(fc2_act_sf_flat, 0, sf_buffer_size, stream);
 #endif
