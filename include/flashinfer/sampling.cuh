@@ -53,6 +53,26 @@ namespace sampling {
 
 using namespace cub;
 
+// IEEE-754 compliant arithmetic via inline PTX (no .ftz modifier).
+// Under -use_fast_math, the compiler emits .ftz variants that flush subnormal
+// results to zero.  These helpers bypass that for operations where subnormal
+// correctness matters (see #769, #774).
+__device__ __forceinline__ float ieee_mul(float a, float b) {
+  float r;
+  asm("mul.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+  return r;
+}
+__device__ __forceinline__ float ieee_add(float a, float b) {
+  float r;
+  asm("add.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+  return r;
+}
+__device__ __forceinline__ float ieee_div(float a, float b) {
+  float r;
+  asm("div.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+  return r;
+}
+
 #define DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, ...) \
   if (deterministic) {                                            \
     constexpr bool DETERMINISTIC = true;                          \
@@ -845,7 +865,7 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, bool* v
   vec_t<float, VEC_SIZE> probs_vec;
   float aggregate;
   float q = 1;
-  double low = 0, high = 1.f;
+  float low = 0, high = 1.f;
   int sampled_id;
   int round = 0;
   do {
@@ -884,8 +904,9 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, bool* v
       }
       sampled_id = temp_storage.last_valid_id;
     }
-    double pivot_0 = probs[row_idx * d + sampled_id];
-    double pivot_1 = (pivot_0 + high) / 2;
+    // IEEE-754 arithmetic (no FTZ) for pivot computation.  See #769 / #774.
+    float pivot_0 = probs[row_idx * d + sampled_id];
+    float pivot_1 = ieee_mul(ieee_add(pivot_0, high), 0.5f);
 
     ValueCount<float> aggregate_gt_pivot_0{0, 0}, aggregate_gt_pivot_1{0, 0};
     ValueCount<float> threadlocal_gt_pivot_0{0, 0}, threadlocal_gt_pivot_1{0, 0};
@@ -977,7 +998,7 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, bool* v
   vec_t<float, VEC_SIZE> probs_vec;
   float aggregate;
   float q = 1;
-  double low = 0, high = 1.f;
+  float low = 0, high = 1.f;
   int sampled_id;
   do {
     temp_storage.sampled_id = d;
@@ -1014,8 +1035,9 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, bool* v
       }
       sampled_id = temp_storage.last_valid_id;
     }
-    double pivot_0 = probs[row_idx * d + sampled_id];
-    double pivot_1 = (pivot_0 + high) / 2;
+    // IEEE-754 arithmetic (no FTZ) for pivot computation.  See #769 / #774.
+    float pivot_0 = probs[row_idx * d + sampled_id];
+    float pivot_1 = ieee_mul(ieee_add(pivot_0, high), 0.5f);
 
     float aggregate_gt_pivot_0 = 0, aggregate_gt_pivot_1 = 0;
     float threadlocal_aggregate_gt_pivot_0 = 0;
@@ -1200,7 +1222,7 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
   vec_t<float, VEC_SIZE> probs_vec;
   float aggregate;
   float q = 1;
-  double low = 0, high = 1.f;
+  float low = 0, high = 1.f;
   int sampled_id;
   do {
     temp_storage.sampled_id = d;
@@ -1237,8 +1259,9 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
         return;
       }
     }
-    double pivot_0 = probs[row_idx * d + sampled_id];
-    double pivot_1 = (pivot_0 + high) / 2;
+    // IEEE-754 arithmetic (no FTZ) for pivot computation.  See #769 / #774.
+    float pivot_0 = probs[row_idx * d + sampled_id];
+    float pivot_1 = ieee_mul(ieee_add(pivot_0, high), 0.5f);
 
     ValueCount<float> aggregate_gt_pivot_0{0, 0}, aggregate_gt_pivot_1{0, 0};
     ValueCount<float> threadlocal_aggregate_gt_pivot_0{0, 0};
@@ -1711,7 +1734,7 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
                               RenormTempStorage<BLOCK_THREADS, REDUCE_ALGORITHM>>(probs, row_idx, d,
                                                                                   temp_storage);
 
-  double low = 0, high = max_val;
+  float low = 0, high = max_val;
   float min_gt_low, max_le_high;
   float sum_low = 1;
   // f(x) = sum(probs[probs > x]), f(x) is non-increasing
@@ -1722,8 +1745,10 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
   // stopping condition
   // - f(low) >= p, f(min_gt_low) == f(max_le_high) == f(high) < p
   do {
-    double pivot_0 = (high + 2 * low) / 3;
-    double pivot_1 = (2 * high + low) / 3;
+    // Use IEEE-754 arithmetic (no FTZ) to prevent -use_fast_math from flushing
+    // subnormal pivots to zero, which would stall the search (#769, #774).
+    float pivot_0 = ieee_div(ieee_add(high, ieee_mul(2.f, low)), 3.f);
+    float pivot_1 = ieee_div(ieee_add(ieee_mul(2.f, high), low), 3.f);
 
     float aggregate_gt_pivot_0 = 0, aggregate_gt_pivot_1 = 0;
     min_gt_low = high;

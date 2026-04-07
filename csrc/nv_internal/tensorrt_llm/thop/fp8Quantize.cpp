@@ -27,7 +27,7 @@
 // linear layout. See QuantizationSFLayout enum for more details about the two layouts.
 // returns
 void mxfp8_quantize(TensorView input, TensorView valMxFP8, TensorView scaleFP8SF,
-                    bool isSfSwizzledLayout, int64_t alignment, bool enable_pdl) {
+                    int64_t sfSwizzleLayout, int64_t alignment, bool enable_pdl) {
   CHECK_CUDA(input);
   CHECK_CONTIGUOUS(input);
 
@@ -50,8 +50,7 @@ void mxfp8_quantize(TensorView input, TensorView valMxFP8, TensorView scaleFP8SF
 
   const thread_local int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
 
-  auto const layout = isSfSwizzledLayout ? tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4
-                                         : tensorrt_llm::QuantizationSFLayout::LINEAR;
+  auto const layout = static_cast<tensorrt_llm::QuantizationSFLayout>(sfSwizzleLayout);
 
 #define LAUNCH_MXFP8_QUANTIZE_KERNEL(T)                                                            \
   tensorrt_llm::kernels::invokeMxFP8Quantization(                                                  \
@@ -94,7 +93,7 @@ inline uint8_t float_to_ue8m0(float value) {
 
 // Used in tests to quantize mxe4m3 tensors on host.
 void mxfp8_quantize_host(TensorView x_fp32, TensorView fp8_tensor, TensorView scale_tensor,
-                         bool is_sf_swizzled_layout) {
+                         int64_t sfSwizzleLayout) {
   int32_t const sf_vec_size = 32;
   auto fp32_dtype = DLDataType{kDLFloat, 32, 1};
   CHECK_INPUT_TYPE(x_fp32, fp32_dtype);
@@ -104,9 +103,7 @@ void mxfp8_quantize_host(TensorView x_fp32, TensorView fp8_tensor, TensorView sc
   int hidden_dim = data_shape[1];
   int groups_per_hidden_dim = hidden_dim / sf_vec_size;
 
-  tensorrt_llm::QuantizationSFLayout layout =
-      is_sf_swizzled_layout ? tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4
-                            : tensorrt_llm::QuantizationSFLayout::LINEAR;
+  auto const layout = static_cast<tensorrt_llm::QuantizationSFLayout>(sfSwizzleLayout);
 
   for (size_t ti = 0; ti < static_cast<size_t>(data_shape[0]); ++ti) {
     for (int group = 0; group < groups_per_hidden_dim; ++group) {
@@ -141,7 +138,7 @@ void mxfp8_quantize_host(TensorView x_fp32, TensorView fp8_tensor, TensorView sc
 
 // Used in tests to dequantize mxe4m3 tensors on host.
 void mxfp8_dequantize_host(TensorView value_e4m3, TensorView scale_ue8m08sf,
-                           TensorView float_tensor, bool is_sf_swizzled_layout) {
+                           TensorView float_tensor, int64_t sfSwizzleLayout) {
   int32_t const sf_vec_size = 32;
   CHECK_INPUT_TYPE(value_e4m3, dl_uint8);
   CHECK_INPUT_TYPE(scale_ue8m08sf, dl_uint8);
@@ -153,9 +150,7 @@ void mxfp8_dequantize_host(TensorView value_e4m3, TensorView scale_ue8m08sf,
   int hidden_dim = data_shape[1];
   int groups_per_hidden_dim = hidden_dim / sf_vec_size;
 
-  tensorrt_llm::QuantizationSFLayout layout =
-      is_sf_swizzled_layout ? tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4
-                            : tensorrt_llm::QuantizationSFLayout::LINEAR;
+  auto const layout = static_cast<tensorrt_llm::QuantizationSFLayout>(sfSwizzleLayout);
   for (size_t ti = 0; ti < static_cast<size_t>(data_shape[0]); ++ti) {
     for (int group = 0; group < groups_per_hidden_dim; ++group) {
       float* float_ptr =

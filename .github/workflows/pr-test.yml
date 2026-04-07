@@ -23,7 +23,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened, labeled, ready_for_review]
   workflow_dispatch:
     inputs:
       skip_aot:
@@ -46,7 +46,7 @@ permissions:
 
 env:
   EXECUTOR_NUMBER: "0"
-  SKIP_CI_PATTERNS: '\.md$|\.txt$|^docs/|^docker/|^licenses/|^LICENSE$|^NOTICE$|^benchmarks/'
+  SKIP_CI_PATTERNS: '\.md$|\.txt$|^docs/|^docker/|^licenses/|^LICENSE$|^NOTICE$|^benchmarks/|^\.github/CODEOWNERS$'
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -67,6 +67,13 @@ jobs:
           if [[ "${{ github.event_name }}" != "pull_request" ]]; then
             echo "authorized=true" >> "$GITHUB_OUTPUT"
             echo "Not a PR, authorized"
+            exit 0
+          fi
+
+          # Skip draft PRs to save CI capacity
+          if [[ "${{ github.event.pull_request.draft }}" == "true" ]]; then
+            echo "authorized=false" >> "$GITHUB_OUTPUT"
+            echo "Draft PR, skipping CI"
             exit 0
           fi
 
@@ -545,7 +552,7 @@ jobs:
       needs.gate.outputs.authorized == 'true' &&
       needs.setup.outputs.skip_build != 'true' &&
       github.event.inputs.skip_gpu != 'true'
-    runs-on: [self-hosted, linux, x64, gpu, h100, 1gpu]
+    runs-on: [self-hosted, linux, x64, gpu, h100]
     timeout-minutes: 360
     env:
       DOCKER_IMAGE: flashinfer/flashinfer-ci-cu129:${{ needs.setup.outputs.docker_tag }}

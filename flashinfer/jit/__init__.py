@@ -81,7 +81,6 @@ from .comm import gen_comm_alltoall_module as gen_comm_alltoall_module
 from .comm import gen_trtllm_mnnvl_comm_module as gen_trtllm_mnnvl_comm_module
 from .comm import gen_trtllm_comm_module as gen_trtllm_comm_module
 from .comm import gen_vllm_comm_module as gen_vllm_comm_module
-from .comm import gen_nvshmem_module as gen_nvshmem_module
 from .comm import gen_moe_alltoall_module as gen_moe_alltoall_module
 from .dsv3_optimizations import (
     gen_dsv3_router_gemm_module as gen_dsv3_router_gemm_module,
@@ -91,6 +90,12 @@ from .dsv3_optimizations import (
 )
 from .tinygemm2 import gen_tinygemm2_module as gen_tinygemm2_module
 from .moe_utils import gen_moe_utils_module as gen_moe_utils_module
+from .fp4_kv_dequantization import (
+    gen_fp4_kv_dequantization_module as gen_fp4_kv_dequantization_module,
+)
+from .fp4_kv_quantization import (
+    gen_fp4_kv_quantization_module as gen_fp4_kv_quantization_module,
+)
 
 
 cuda_lib_path = os.environ.get(

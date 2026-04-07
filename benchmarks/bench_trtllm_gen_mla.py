@@ -10,7 +10,9 @@ qk_rope_head_dim = 64
 kv_lora_rank = 512
 
 
-def bench_trtllm_mla(batch_size, q_len_per_request, seq_len, page_size, dtype):
+def bench_trtllm_mla(
+    batch_size, q_len_per_request, seq_len, page_size, dtype, backend="auto"
+):
     torch.manual_seed(42)
     device = "cuda:0"
 
@@ -81,6 +83,7 @@ def bench_trtllm_mla(batch_size, q_len_per_request, seq_len, page_size, dtype):
         max_seq_len=max_seq_len,
         bmm1_scale=1.0 / ((128 + 64) ** 0.5),
         bmm2_scale=1.0,
+        backend=backend,
     )
     # benchmark
     measurements = bench_gpu_time(
@@ -96,6 +99,7 @@ def bench_trtllm_mla(batch_size, q_len_per_request, seq_len, page_size, dtype):
             max_seq_len=max_seq_len,
             bmm1_scale=1.0 / ((128 + 64) ** 0.5),
             bmm2_scale=1.0,
+            backend=backend,
         ),
         dry_run_iters=5,
         repeat_iters=30,
@@ -126,7 +130,7 @@ def bench_trtllm_mla(batch_size, q_len_per_request, seq_len, page_size, dtype):
         * q_len_per_request
     )
     print(
-        f"batch_size={batch_size}, q_len_per_request={q_len_per_request}, seq_len={seq_len}, num_q_heads={num_q_heads}, qk_nope_head_dim={qk_nope_head_dim}, qk_rope_head_dim={qk_rope_head_dim}, kv_lora_rank={kv_lora_rank}, page_size={page_size}"
+        f"backend={backend}, batch_size={batch_size}, q_len_per_request={q_len_per_request}, seq_len={seq_len}, num_q_heads={num_q_heads}, qk_nope_head_dim={qk_nope_head_dim}, qk_rope_head_dim={qk_rope_head_dim}, kv_lora_rank={kv_lora_rank}, page_size={page_size}"
     )
     print(f"execution time: {ms:.4f} ms")
     print(f"memory bandwidth: {total_mem_bytes / ms / 1e6:.2f} GB/s")
@@ -134,11 +138,43 @@ def bench_trtllm_mla(batch_size, q_len_per_request, seq_len, page_size, dtype):
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Benchmark trtllm MLA decode")
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default="auto",
+        help="Backend to use (auto, trtllm-gen, cute-dsl)",
+    )
+    args = parser.parse_args()
+
+    if args.backend == "cute-dsl":
+        q_lens = [1, 2, 4]
+    else:
+        q_lens = [1, 2, 4, 8, 16]
+
     for dtype in [torch.bfloat16, torch.float8_e4m3fn]:
         for page_size in [32, 64]:
             for batch_size in [1, 2, 4, 16, 32, 64, 128, 256, 512, 768, 1024]:
                 for seq_len in [1024, 4096, 8192]:
-                    for q_len_per_request in [1, 2, 4, 8, 16]:
-                        bench_trtllm_mla(
-                            batch_size, q_len_per_request, seq_len, page_size, dtype
-                        )
+                    for q_len_per_request in q_lens:
+                        try:
+                            bench_trtllm_mla(
+                                batch_size,
+                                q_len_per_request,
+                                seq_len,
+                                page_size,
+                                dtype,
+                                backend=args.backend,
+                            )
+                        except ValueError as e:
+                            print(f"SKIPPED: {e}")
+                            print()
+                        except Exception as e:
+                            print(
+                                f"ERROR: batch_size={batch_size}, q_len={q_len_per_request}, "
+                                f"seq_len={seq_len}, page_size={page_size}, dtype={dtype}, "
+                                f"backend={args.backend}: {type(e).__name__}: {e}"
+                            )
+                            print()

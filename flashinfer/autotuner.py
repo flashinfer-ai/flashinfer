@@ -357,6 +357,15 @@ class TunableRunner(ABC):
         """
         return [-1]
 
+    def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+        """Return extra values to include in the autotune cache key.
+
+        Override this method to differentiate cache entries that share the same
+        input shapes but differ in other properties (e.g. output dtype).
+        The returned tuple must be hashable.
+        """
+        return ()
+
     def __call__(self, inputs, **kwargs):
         return self.forward(inputs, **kwargs)
 
@@ -587,6 +596,7 @@ class AutoTuner:
         runners: List[TunableRunner],
         input_shapes: Tuple[torch.Size],
         tuning_config: TuningConfig,
+        inputs: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[bool, int, int, OptimizationProfile]:
         """Search for cached profiling results matching the current configuration.
 
@@ -601,6 +611,8 @@ class AutoTuner:
             runners (List[TunableRunner]): List of candidate implementations to profile
             input_shapes (Tuple[torch.Size]): Shapes of the input tensors
             tuning_config (TuningConfig): Tuning configuration
+            inputs (Optional[List[torch.Tensor]]): Raw input tensors, used to compute
+                per-runner cache key extras via get_cache_key_extras().
 
         Returns:
             A tuple containing:
@@ -608,10 +620,10 @@ class AutoTuner:
         """
         with self._lock:
             for r in runners:
+                extras = r.get_cache_key_extras(inputs) if inputs is not None else ()
                 cache_key = AutoTuner._get_cache_key(
-                    custom_op, r, input_shapes, tuning_config
+                    custom_op, r, input_shapes, tuning_config, extras
                 )
-
                 # 1. In-memory cache (from live tuning)
                 if cache_key in self.profiling_cache:
                     return True, *self.profiling_cache[cache_key]
@@ -694,7 +706,7 @@ class AutoTuner:
             # Early return if it's not tuning, use cache found one or fallback one
             if not self.is_tuning_mode:
                 is_cache_hit, runner_id, tactic, stored_profile = self.search_cache(
-                    custom_op, runners, input_shapes, tuning_config
+                    custom_op, runners, input_shapes, tuning_config, inputs=inputs
                 )
                 runner = runners[runner_id]
                 # TODO: check the stored runner and tactic can implement this shape here
@@ -707,7 +719,7 @@ class AutoTuner:
                         f"[AutoTunner]: Using fallback tactic for {custom_op} with input shapes {input_shapes}"
                     )
                     logger.debug(
-                        f"[AutoTunner]: Generated key{AutoTuner._get_cache_key(custom_op, runners[0], input_shapes, tuning_config)}"
+                        f"[AutoTunner]: Generated key{AutoTuner._get_cache_key(custom_op, runners[0], input_shapes, tuning_config, runners[0].get_cache_key_extras(inputs))}"
                     )
                 return runner, tactic
 
@@ -732,12 +744,17 @@ class AutoTuner:
                 try:
                     tensors = self._prepare_input_tensors(p, inputs)
                     is_cache_hit, runner_id, tactic, _ = self.search_cache(
-                        custom_op, runners, p.get_opt_shapes(), tuning_config
+                        custom_op,
+                        runners,
+                        p.get_opt_shapes(),
+                        tuning_config,
+                        inputs=tensors,
                     )
                     if not is_cache_hit:
                         min_time = float("inf")
                         # Initialize runner and tactic as None in case of no valid tactic or runners are found
                         runner_id, tactic = None, None
+                        skipped_count = 0
                         for r_id, r in enumerate(runners):
                             # TODO: use FakeTensor here.
                             valid_tactics = r.get_valid_tactics(tensors, p)
@@ -755,15 +772,26 @@ class AutoTuner:
                                 except torch.cuda.OutOfMemoryError:
                                     raise
                                 except Exception as e:
+                                    skipped_count += 1
                                     shapes = self._get_input_sizes(tensors)
-                                    logger.warning(
+                                    logger.debug(
                                         f"[Autotuner]: Skipping tactic {r} {tac}, due to failure while profiling: {e}"
                                     )
-
-                                    # Log stacktrace as debug to not spam log
                                     logger.debug(
                                         f"[Autotuner]: Failed when profiling {r} {tac}, shapes={shapes}. Error occurred: {e}"
                                     )
+
+                                    # Clear any pending async CUDA errors (e.g.
+                                    # cudaErrorIllegalInstruction from a failed
+                                    # kernel warmup run) so they don't surface
+                                    # later during CUDA graph capture.
+                                    # torch.cuda.synchronize() surfaces the error
+                                    # but does NOT clear the sticky CUDA error flag;
+                                    # only cudaGetLastError() resets it.
+                                    with contextlib.suppress(Exception):
+                                        torch.cuda.synchronize()
+                                    with contextlib.suppress(Exception):
+                                        torch.cuda.cudart().cudaGetLastError()
 
                                     # Record the failed profiling combinations
                                     if (
@@ -779,6 +807,7 @@ class AutoTuner:
                                             r,
                                             p.get_opt_shapes(),
                                             tuning_config,
+                                            r.get_cache_key_extras(tensors),
                                         )
                                     )
 
@@ -789,6 +818,12 @@ class AutoTuner:
                                     min_time = time_measured
                                     runner_id, tactic = r_id, tac
 
+                        if skipped_count > 0:
+                            logger.info(
+                                f"[Autotuner]: Skipped {skipped_count} unsupported tactic(s) for {custom_op} "
+                                f"(enable debug logs to see details)"
+                            )
+
                         if runner_id is not None:
                             # At least one valid (runner, tactic) pair is found
                             cache_key = AutoTuner._get_cache_key(
@@ -796,6 +831,7 @@ class AutoTuner:
                                 runners[runner_id],
                                 p.get_opt_shapes(),
                                 tuning_config,
+                                runners[runner_id].get_cache_key_extras(tensors),
                             )
                             # inspect call stack
                             self.profiling_cache[cache_key] = (runner_id, tactic, p)
@@ -819,7 +855,7 @@ class AutoTuner:
             # Get the best runner and tactic from cache
             # If no valid tactic is found, the fallback runner and tactic will be used
             _, runner_id, tactic, _ = self.search_cache(
-                custom_op, runners, input_shapes, tuning_config
+                custom_op, runners, input_shapes, tuning_config, inputs=inputs
             )
 
             return runners[runner_id], tactic
@@ -1037,11 +1073,12 @@ class AutoTuner:
         base_profile = list(list(shape) for shape in shapes)
 
         for spec in tuning_config.dynamic_tensor_specs:
-            base_profile[spec.input_idx[0]][spec.dim_idx[0]] = (
-                spec.map_to_tuning_buckets(
-                    base_profile[spec.input_idx[0]][spec.dim_idx[0]]
-                )
+            mapped_val = spec.map_to_tuning_buckets(
+                base_profile[spec.input_idx[0]][spec.dim_idx[0]]
             )
+            # Apply the same mapped bucket to all linked dimensions in this spec.
+            for input_i, dim_i in zip(spec.input_idx, spec.dim_idx, strict=True):
+                base_profile[input_i][dim_i] = mapped_val
 
         # associated dimensions dependent on other free dynamic dimensions, so assign -1 in the profile
         for constraint_spec in tuning_config.constraint_specs:
@@ -1055,12 +1092,14 @@ class AutoTuner:
         runner: TunableRunner,
         input_shapes: Tuple[torch.Size],
         tuning_config: TuningConfig,
+        extras: tuple = (),
     ) -> Tuple:
         return (
             custom_op,
             runner.__class__.__name__,
             hash(runner),
             cls._find_nearest_profile(input_shapes, tuning_config),
+            extras,
         )
 
     def _create_tensor_like(
@@ -1092,22 +1131,26 @@ class AutoTuner:
         return initializer(shapes, dtype, device)
 
     def _prepare_input_tensors(
-        self, profile: OptimizationProfile, inputs: List[torch.Tensor]
-    ) -> List[torch.Tensor]:
+        self, profile: OptimizationProfile, inputs: List[Optional[torch.Tensor]]
+    ) -> List[Optional[torch.Tensor]]:
         default_initializer = lambda shapes, dtype, device: (
             torch.rand(shapes, device=device) * 10 - 5
         ).to(dtype)
-        tensors = []
+        tensors: List[Optional[torch.Tensor]] = []
         for i, p in enumerate(profile.shapes):
-            if any(isinstance(d, DynamicDim) for d in p):
+            if inputs[i] is None:
+                # Some callers pass None for optional tensors (e.g. routing_logits
+                # in non-routed MoE). Preserve None as-is.
+                tensors.append(None)
+            elif any(isinstance(d, DynamicDim) for d in p):
                 tensor = self._create_tensor_like(
                     inputs[i],
                     p,
                     profile.tensor_initializers[i] or default_initializer,
                 )
+                tensors.append(tensor)
             else:
-                tensor = inputs[i]
-            tensors.append(tensor)
+                tensors.append(inputs[i])
         return tensors
 
     def save_configs(self, path: str) -> None:
@@ -1153,7 +1196,7 @@ class AutoTuner:
 
             # Overlay in-memory profiling results (take priority over loaded configs)
             for cache_key, cache_value in self.profiling_cache.items():
-                custom_op, runner_class_name, _runner_hash, profile = cache_key
+                custom_op, runner_class_name, _runner_hash, profile, _extras = cache_key
                 runner_id, tactic, _opt_profile = cache_value
 
                 # Use hash-free key: (custom_op, runner_class_name, profile)
