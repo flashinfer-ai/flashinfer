@@ -10,24 +10,6 @@ echo "========================================"
 echo "Starting flashinfer-jit-cache test script"
 echo "========================================"
 
-# MAX_JOBS = min(nproc, max(1, MemAvailable_GB/(8 on aarch64, 4 otherwise)))
-MEM_AVAILABLE_GB=$(free -g | awk '/^Mem:/ {print $7}')
-NPROC=$(nproc)
-MAX_JOBS=$(( MEM_AVAILABLE_GB / $([ "$(uname -m)" = "aarch64" ] && echo 8 || echo 4) ))
-if (( MAX_JOBS < 1 )); then
-  MAX_JOBS=1
-elif (( NPROC < MAX_JOBS )); then
-  MAX_JOBS=$NPROC
-fi
-
-echo "System Information:"
-echo "  - Available Memory: ${MEM_AVAILABLE_GB} GB"
-echo "  - Number of Processors: ${NPROC}"
-echo "  - MAX_JOBS: ${MAX_JOBS}"
-
-# Export MAX_JOBS for PyTorch's cpp_extension to use
-export MAX_JOBS
-
 : ${CUDA_VISIBLE_DEVICES:=""}
 echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
 
@@ -72,6 +54,37 @@ python -c "import torch; print(torch.__version__)"
 CUDA_VERSION=$(python3 -c 'import torch; print(torch.version.cuda)' | cut -d'.' -f1,2 | tr -d '.')
 echo "Detected CUDA version: cu${CUDA_VERSION}"
 
+# Parallelism: coordinate ninja jobs (MAX_JOBS) with nvcc internal threads (FLASHINFER_NVCC_THREADS).
+# Each nvcc invocation compiles multiple -gencode targets; --threads=N parallelizes them.
+MEM_AVAILABLE_GB=$(free -g | awk '/^Mem:/ {print $7}')
+NPROC=$(nproc)
+
+NUM_ARCHS=$(echo "${FLASHINFER_CUDA_ARCH_LIST}" | wc -w)
+NVCC_THREADS=${FLASHINFER_NVCC_THREADS:-${NUM_ARCHS}}
+if (( NVCC_THREADS > 8 )); then NVCC_THREADS=8; fi
+if (( NVCC_THREADS < 1 )); then NVCC_THREADS=1; fi
+
+# Memory budget: ~2GB per nvcc thread
+MEM_PER_JOB=$(( NVCC_THREADS * 2 ))
+MAX_JOBS=$(( MEM_AVAILABLE_GB / MEM_PER_JOB ))
+if (( MAX_JOBS < 1 )); then MAX_JOBS=1; fi
+
+# Cap total threads at available CPUs
+TOTAL_THREADS=$(( MAX_JOBS * NVCC_THREADS ))
+if (( TOTAL_THREADS > NPROC )); then
+  MAX_JOBS=$(( NPROC / NVCC_THREADS ))
+  if (( MAX_JOBS < 1 )); then MAX_JOBS=1; fi
+fi
+
+export MAX_JOBS
+export FLASHINFER_NVCC_THREADS="${NVCC_THREADS}"
+
+echo "System Information:"
+echo "  - Available Memory: ${MEM_AVAILABLE_GB} GB"
+echo "  - Number of Processors: ${NPROC}"
+echo "  - MAX_JOBS: ${MAX_JOBS}"
+echo "  - NVCC_THREADS: ${NVCC_THREADS}"
+
 echo ""
 echo "========================================"
 echo "Installing flashinfer package"
@@ -81,6 +94,30 @@ pip install -e . || {
     exit 1
 }
 echo "✓ Flashinfer package installed successfully"
+
+# Optional: set up sccache for compiler caching with S3 backend
+if [ -n "${SCCACHE_BUCKET:-}" ]; then
+  echo ""
+  echo "========================================"
+  echo "Setting up sccache"
+  echo "========================================"
+  SCCACHE_VERSION="0.9.1"
+  SCCACHE_ARCH=$(uname -m)
+  curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl.tar.gz" | tar xz
+  mv "sccache-v${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl/sccache" /usr/local/bin/
+  rm -rf "sccache-v${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl"
+  chmod +x /usr/local/bin/sccache
+
+  export SCCACHE_S3_KEY_PREFIX="cuda${CUDA_VERSION}-${SCCACHE_ARCH}"
+  export SCCACHE_IDLE_TIMEOUT=0
+  export FLASHINFER_NVCC_LAUNCHER="sccache"
+  export FLASHINFER_CXX_LAUNCHER="sccache"
+
+  sccache --start-server
+  echo "sccache version: $(sccache --version)"
+  echo "sccache bucket: ${SCCACHE_BUCKET}"
+  echo "sccache prefix: ${SCCACHE_S3_KEY_PREFIX}"
+fi
 
 echo ""
 echo "========================================"
@@ -129,6 +166,15 @@ python scripts/verify_all_modules_compiled.py || {
     exit 1
 }
 echo "✓ All modules verified successfully"
+
+# Print sccache stats if enabled
+if [ -n "${SCCACHE_BUCKET:-}" ]; then
+  echo ""
+  echo "========================================"
+  echo "sccache stats"
+  echo "========================================"
+  sccache --show-stats
+fi
 
 echo ""
 echo "========================================"
