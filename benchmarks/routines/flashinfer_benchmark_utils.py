@@ -197,6 +197,7 @@ benchmark_apis = {
         "fused_add_rmsnorm_quant",
         "rmsnorm_fp4quant",
         "add_rmsnorm_fp4quant",
+        "fused_rmsnorm_silu",
     ],
     "quantization": [
         "mxfp8_quantize",
