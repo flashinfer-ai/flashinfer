@@ -496,7 +496,7 @@ def top_k(
     device = input.device
 
     algo = os.environ.get("FLASHINFER_TOPK_ALGO")
-    if algo is None or algo == "clusters" and not deterministic:
+    if (algo is None or algo == "clusters") and not deterministic:
         indices, output_values = topk_clusters_exact(
             input, k, output_values=True, out_dtype=torch.int64
         )
@@ -616,7 +616,11 @@ def top_k_page_table_transform(
     num_rows = input.size(0)
 
     algo = os.environ.get("FLASHINFER_TOPK_ALGO")
-    if (algo is None or algo == "clusters") and row_to_batch is None and not deterministic:
+    if (
+        (algo is None or algo == "clusters")
+        and row_to_batch is None
+        and not deterministic
+    ):
         return topk_clusters_page_table_transform(input, lengths, src_page_table, k)
 
     # Allocate row_states buffer for multi-CTA path
@@ -708,7 +712,7 @@ def top_k_ragged_transform(
     num_rows = input.size(0)
 
     algo = os.environ.get("FLASHINFER_TOPK_ALGO")
-    if algo is None or algo == "clusters" and not deterministic:
+    if (algo is None or algo == "clusters") and not deterministic:
         return topk_clusters_ragged_transform(input, lengths, offsets, k)
 
     # Allocate row_states buffer for multi-CTA path

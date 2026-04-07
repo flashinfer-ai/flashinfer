@@ -870,11 +870,11 @@ def main():
                 f"{'FlashInfer':>12} {'FlashInfer(det)':>14} {'DetSlowdown':>11}"
             )
         else:
-            header = f"{'batch':>6} {'seq_len':>10} {'k':>6} | {'FlashInfer':>12} {'Clusters':>12} {'Speedup':>10}"
+            header = f"{'batch':>6} {'seq_len':>10} {'k':>6} | {'FlashInfer':>12} {'Clusters':>12} {'Speedup Clusters vs. Default':>29}"
         if args.compare_sglang:
             header += f" {'SGLang':>12} {'Speedup':>10}"
         print(header)
-        divider_len = 87 if args.deterministic else 90
+        divider_len = 87 if args.deterministic else 109
         if args.compare_sglang:
             divider_len += 24
         print("-" * divider_len)
@@ -907,7 +907,7 @@ def main():
                                 f"{result['flashinfer_us']:>10.2f}us"
                             )
                             if "fast_topk_us" in result:
-                                line += f" {result['fast_topk_us']:>10.2f}us {result['speedup_vs_flashinfer']:>9.2f}x"
+                                line += f" {result['fast_topk_us']:>10.2f}us {result['speedup_vs_flashinfer']:>28.2f}x"
                         if "sglang_us" in result:
                             line += (
                                 f" {result['sglang_us']:>10.2f}us "
@@ -947,11 +947,11 @@ def main():
                 f"{'FlashInfer':>12} {'FlashInfer(det)':>14} {'DetSlowdown':>11}"
             )
         else:
-            header = f"{'batch':>6} {'seq_len':>10} {'k':>6} | {'FlashInfer':>12} {'Clusters':>12} {'Speedup':>10}"
+            header = f"{'batch':>6} {'seq_len':>10} {'k':>6} | {'FlashInfer':>12} {'Clusters':>12} {'Speedup Clusters vs. Default':>29}"
         if args.compare_sglang:
             header += f" {'SGLang':>12} {'Speedup':>10}"
         print(header)
-        divider_len = 87 if args.deterministic else 90
+        divider_len = 87 if args.deterministic else 109
         if args.compare_sglang:
             divider_len += 24
         print("-" * divider_len)
@@ -984,7 +984,7 @@ def main():
                                 f"{result['flashinfer_us']:>10.2f}us"
                             )
                             if "fast_topk_us" in result:
-                                line += f" {result['fast_topk_us']:>10.2f}us {result['speedup_vs_flashinfer']:>9.2f}x"
+                                line += f" {result['fast_topk_us']:>10.2f}us {result['speedup_vs_flashinfer']:>28.2f}x"
                         if "sglang_us" in result:
                             line += (
                                 f" {result['sglang_us']:>10.2f}us "
