@@ -14,6 +14,33 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+# Unified MoE API
+from .api import (  # noqa: F401
+    Activation,
+    ActivationConfig,
+    BackendOptions,
+    CuteDslConfig,
+    CutlassConfig,
+    ExecutionConfig,
+    ExpertConfig,
+    Fp8Variant,
+    Gemm1Tensors,
+    Gemm2Tensors,
+    MoEConfig,
+    MoETensors,
+    QuantConfig,
+    QuantDtype,
+    QuantGranularity,
+    RoutingConfig,
+    RoutingMethod,
+    TrtllmBf16Config,
+    TrtllmFp4Config,
+    TrtllmFp8BlockConfig,
+    TrtllmFp8PerTensorConfig,
+    TrtllmMxInt4Config,
+)
+
+# Legacy flat-argument APIs (unchanged, not deprecated)
 from .core import (
     ActivationType,
     Fp8QuantizationType,
@@ -53,6 +80,30 @@ except ImportError:
     _cute_dsl_available = False
 
 __all__ = [
+    # Unified API
+    "Activation",
+    "ActivationConfig",
+    "BackendOptions",
+    "CuteDslConfig",
+    "CutlassConfig",
+    "ExecutionConfig",
+    "ExpertConfig",
+    "Fp8Variant",
+    "Gemm1Tensors",
+    "Gemm2Tensors",
+    "MoEConfig",
+    "MoETensors",
+    "QuantConfig",
+    "QuantDtype",
+    "QuantGranularity",
+    "RoutingConfig",
+    "RoutingMethod",
+    "TrtllmBf16Config",
+    "TrtllmFp4Config",
+    "TrtllmFp8BlockConfig",
+    "TrtllmFp8PerTensorConfig",
+    "TrtllmMxInt4Config",
+    # Legacy flat APIs
     "ActivationType",
     "Fp8QuantizationType",
     "RoutingMethodType",
