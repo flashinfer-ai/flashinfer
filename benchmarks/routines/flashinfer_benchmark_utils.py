@@ -439,8 +439,8 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["cutlass"],
         "10.3": ["cutlass"],
-        "12.0": [],
-        "12.1": [],
+        "12.0": ["cutlass"],
+        "12.1": ["cutlass"],
     },
     "cute_dsl_fp4_block_scale_moe": {
         "7.5": [],
