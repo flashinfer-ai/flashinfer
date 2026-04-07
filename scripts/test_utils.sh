@@ -529,6 +529,7 @@ run_tests_parallel() {
     # Launch tests in parallel with GPU queue
     echo "Launching tests in parallel..."
     local test_idx=0
+    local completed=0
     while [ $test_idx -lt $total_files ]; do
         # Wait for a GPU to become available
         while [ ${#available_gpus[@]} -eq 0 ]; do
@@ -538,7 +539,11 @@ run_tests_parallel() {
                     # Job finished, reclaim its GPU
                     wait "$pid" 2>/dev/null || true
                     local freed_gpu="${test_gpu_map[$pid]}"
+                    local finished_test="${test_pid_map[$pid]}"
                     available_gpus+=("$freed_gpu")
+                    completed=$((completed + 1))
+                    local running=$((${#test_pid_map[@]} - 1))
+                    echo "[Progress: ${completed}/${total_files} completed, ${running} running] Finished: $(basename "$finished_test") (GPU ${freed_gpu})"
                     unset "test_pid_map[$pid]"
                     unset "test_gpu_map[$pid]"
                 fi
@@ -554,6 +559,7 @@ run_tests_parallel() {
         # Launch test on this GPU
         local test_file="${test_files_array[$test_idx]}"
         local file_index=$((test_idx + 1))
+        echo "[${file_index}/${total_files}] Launching: $(basename "$test_file") on GPU ${gpu_id}"
         local job_info
         job_info=$(run_single_test_background "$test_file" "$gpu_id" "$file_index")
 
@@ -567,11 +573,15 @@ run_tests_parallel() {
         test_idx=$((test_idx + 1))
     done
 
-    # Wait for all remaining jobs
+    # Wait for all remaining jobs with progress
     echo ""
-    echo "Waiting for all tests to complete..."
-    for pid in "${!test_result_files[@]}"; do
+    echo "All tests launched. Waiting for remaining ${#test_pid_map[@]} tests to complete..."
+    for pid in "${!test_pid_map[@]}"; do
         wait "$pid" 2>/dev/null || true
+        local finished_test="${test_pid_map[$pid]}"
+        local freed_gpu="${test_gpu_map[$pid]}"
+        completed=$((completed + 1))
+        echo "[Progress: ${completed}/${total_files} completed] Finished: $(basename "$finished_test") (GPU ${freed_gpu})"
     done
 
     echo ""

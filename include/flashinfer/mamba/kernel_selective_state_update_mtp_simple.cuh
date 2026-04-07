@@ -1,17 +1,16 @@
+#ifndef FLASHINFER_MAMBA_KERNEL_SELECTIVE_STATE_UPDATE_MTP_SIMPLE_CUH_
+#define FLASHINFER_MAMBA_KERNEL_SELECTIVE_STATE_UPDATE_MTP_SIMPLE_CUH_
+
 #include <cooperative_groups.h>
 #include <cooperative_groups/memcpy_async.h>
-#include <cuda_runtime_api.h>
 
 #include <cmath>
-#include <cuda/barrier>
-#include <iostream>
 #include <type_traits>
 
 #include "../utils.cuh"
 #include "../vec_dtypes.cuh"
 #include "common.cuh"
 #include "conversion.cuh"
-#include "create_tensor_map.cuh"
 
 namespace flashinfer::mamba::mtp {
 
@@ -548,65 +547,6 @@ __global__ void selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams
   }
 }
 
-template <typename input_t, typename weight_t, typename matrixA_t, typename state_t,
-          typename stateIndex_t, typename state_scale_t>
-void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm algorithm,
-                                   cudaStream_t stream) {
-  constexpr bool scaleState = !std::is_same_v<state_scale_t, void>;
-  // Stochastic rounding is only implemented for fp16 state
-  if constexpr (PHILOX_ROUNDS > 0) {
-    static_assert(std::is_same_v<state_t, half>,
-                  "Stochastic rounding (PHILOX_ROUNDS > 0) only supports fp16 state");
-  }
-  // MTP only supports the simple kernel
-  FLASHINFER_CHECK(algorithm == SSUAlgorithm::kAuto || algorithm == SSUAlgorithm::kSimple,
-                   "MTP selective_state_update only supports 'auto' or 'simple' algorithm, got ",
-                   static_cast<int32_t>(algorithm));
-  // Common alignment checks for all kernels
-  check_ptr_alignment_input_vars<input_t>(params);
-
-  constexpr auto stateLoadSize = getVectorLoadSizeForFullUtilization<state_t, DSTATE>();
-  using load_state_t = PackedAligned<state_t, stateLoadSize>;
-
-  FLASHINFER_CHECK_ALIGNMENT(params.state, sizeof(load_state_t));
-  FLASHINFER_CHECK((params.dim * params.dstate * sizeof(state_t)) % sizeof(load_state_t) == 0,
-                   "state head stride must be aligned to ", sizeof(load_state_t), " bytes");
-
-  constexpr int numWarps = 4;
-  constexpr int stateRowsPerWarpPerStage = 4;
-  constexpr int stateRowsPerBlockPerStage = stateRowsPerWarpPerStage * numWarps;
-  int const total_tiles = params.batch * params.nheads;
-  int const num_sms = GetCudaMultiProcessorCount();
-
-  dim3 block(warpSize, numWarps);
-  if (total_tiles < num_sms * 2) {
-    // Small tile per CTA (stateRowsPerBlockPerStage * DSTATE): split dim across grid.z for GPU
-    // occupancy
-    int const dim_tiles = (DIM + stateRowsPerBlockPerStage - 1) / stateRowsPerBlockPerStage;
-    dim3 grid(params.batch, params.nheads, dim_tiles);
-    auto func = selective_state_update_kernel_simple_mtp<
-        input_t, weight_t, matrixA_t, state_t, stateIndex_t, state_scale_t, NTOKENS_MTP, DIM,
-        DSTATE, stateRowsPerBlockPerStage, PHILOX_ROUNDS, numWarps>;
-    using sram_t =
-        SharedStorageSimple<input_t, state_t, state_scale_t, NTOKENS_MTP, stateRowsPerBlockPerStage,
-                            DSTATE, stateRowsPerBlockPerStage>;
-    constexpr size_t smem_size = sizeof(sram_t);
-    FLASHINFER_CUDA_CHECK(
-        cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    func<<<grid, block, smem_size, stream>>>(params);
-  } else {
-    // Full tile per CTA (DIM * DSTATE): enough blocks for occupancy, no dim splitting needed
-    dim3 grid(params.batch, params.nheads);
-    auto func = selective_state_update_kernel_simple_mtp<input_t, weight_t, matrixA_t, state_t,
-                                                         stateIndex_t, state_scale_t, NTOKENS_MTP,
-                                                         DIM, DSTATE, DIM, PHILOX_ROUNDS, numWarps>;
-    using sram_t = SharedStorageSimple<input_t, state_t, state_scale_t, NTOKENS_MTP, DIM, DSTATE,
-                                       stateRowsPerBlockPerStage>;
-    constexpr size_t smem_size = sizeof(sram_t);
-    FLASHINFER_CUDA_CHECK(
-        cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    func<<<grid, block, smem_size, stream>>>(params);
-  }
-}
-
 }  // namespace flashinfer::mamba::mtp
+
+#endif  // FLASHINFER_MAMBA_KERNEL_SELECTIVE_STATE_UPDATE_MTP_SIMPLE_CUH_
