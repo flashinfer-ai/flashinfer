@@ -4028,7 +4028,10 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, 
   layout_info1.fpX_block_scaling_type = getScalingType();
   layout_info2.fpX_block_scaling_type = getScalingType();
 
-  int const threads = std::min(1024, num_experts_per_node);
+  // Use a smaller block size to spread work across multiple SMs. Each thread handles one expert,
+  // so we only need num_experts_per_node threads total. With 1 warp per block, 128 experts
+  // yields 4 blocks across 4 SMs instead of 1 block on 1 SM.
+  int const threads = std::min(32, num_experts_per_node);
   int const blocks = (num_experts_per_node + threads - 1) / threads;
 
   auto* kernel_instance =
