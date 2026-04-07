@@ -609,7 +609,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
     backend: str = "auto",
     is_var_seq: bool = True,
     uses_shared_paged_kv_idx: bool = True,
-) -> torch.Tensor:
+    lse: Optional[torch.Tensor] = None,
+    return_lse: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Parameters
     ----------
@@ -654,6 +656,11 @@ def trtllm_batch_decode_with_kv_cache_mla(
         True (default) uses vLLM/FlashInfer layout with a 2D page table.
         False uses TRT-LLM layout with a 3D page table ``[batch_size, 2, max_num_pages_per_seq]``.
         False is only supported for trtllm-gen backend.
+    lse: Optional[torch.Tensor] = None
+        The log-sum-exp of attention logits, if not provided, will be allocated internally.
+        Only supported by trtllm-gen backend.
+    return_lse: bool = False
+        Whether to return the logsumexp of attention scores, defaults to ``False``.
 
     Note
     ----
@@ -765,6 +772,21 @@ def trtllm_batch_decode_with_kv_cache_mla(
 
         batch_size = query.size(0)
         max_q_len = query.size(1)
+        if return_lse:
+            if lse is None:
+                lse = torch.empty(
+                    (query.size(0), query.size(1)),
+                    dtype=torch.float32,
+                    device=query.device,
+                )
+            else:
+                check_shape_dtype_device(
+                    lse,
+                    (query.size(0), query.size(1)),
+                    torch.float32,
+                    query.device,
+                    "lse",
+                )
         query = query.flatten(0, 1)  # [B*S, H, D]
 
         run_func(
@@ -795,9 +817,13 @@ def trtllm_batch_decode_with_kv_cache_mla(
             None,  # value_block_scales
             skip_softmax_threshold_scale_factor,
             uses_shared_paged_kv_idx,
+            lse,
         )
+        if return_lse:
+            return out, lse
+        else:
+            return out
 
-        return out
     elif backend == "cute-dsl":
         enable_pdl = (
             device_support_pdl(query.device) if enable_pdl is None else enable_pdl
