@@ -151,11 +151,21 @@ def bench_fmha_cutedsl(
 
 
 if __name__ == "__main__":
-    bench_fmha_cutedsl(128, 512, 32, 128, True, torch.bfloat16)
-    bench_fmha_cutedsl(64, 1024, 32, 128, True, torch.bfloat16)
-    bench_fmha_cutedsl(32, 2048, 32, 128, True, torch.bfloat16)
-    bench_fmha_cutedsl(16, 4096, 32, 128, True, torch.bfloat16)
-    bench_fmha_cutedsl(8, 8192, 32, 128, True, torch.bfloat16)
-    bench_fmha_cutedsl(4, 16384, 32, 128, True, torch.bfloat16)
-    bench_fmha_cutedsl(2, 32768, 32, 128, True, torch.bfloat16)
-    bench_fmha_cutedsl(1, 65536, 32, 128, True, torch.bfloat16)
+    configs = [
+        (128, 512, 32, 128, True, torch.bfloat16),
+        (64, 1024, 32, 128, True, torch.bfloat16),
+        (32, 2048, 32, 128, True, torch.bfloat16),
+        (16, 4096, 32, 128, True, torch.bfloat16),
+        (8, 8192, 32, 128, True, torch.bfloat16),
+        (4, 16384, 32, 128, True, torch.bfloat16),
+        (2, 32768, 32, 128, True, torch.bfloat16),
+        (1, 65536, 32, 128, True, torch.bfloat16),
+    ]
+
+    print("=== CUTLASS (via BatchPrefillWithRaggedKVCacheWrapper) ===")
+    for cfg in configs:
+        bench_fmha_blackwell(*cfg)
+    print()
+    print("=== CuTe DSL (via BatchPrefillCuteDSLWrapper) ===")
+    for cfg in configs:
+        bench_fmha_cutedsl(*cfg)
