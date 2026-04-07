@@ -1347,7 +1347,7 @@ constexpr static int EXPAND_THREADS_PER_BLOCK = 256;
 
 template <class InputActivationsType, class ExpandedActivationsType,
           TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType BlockScalingType,
-          bool PRE_QUANT_AWQ>
+          bool PRE_QUANT_AWQ, bool SKIP_SF_PADDING = false>
 __global__ void expandInputRowsKernel(
     InputActivationsType const* unpermuted_input, ExpandedActivationsType* permuted_output,
     float const* unpermuted_scales, float* permuted_scales,
@@ -1471,15 +1471,17 @@ __global__ void expandInputRowsKernel(
       }
 
       // Pad zeros in the extra SFs along the K dimension, we do this to ensure there are no nan
-      // values in the padded SF atom Use VecSize per thread since we are just writing out zeros so
-      // every thread can process a whole vector
-      size_t padding_start_offset = hidden_size / VecSize + start_offset;
-      size_t padding_elems_in_col = padded_hidden_size / VecSize;
-      for (int64_t elem_index = padding_start_offset; elem_index < padding_elems_in_col;
-           elem_index += stride) {
-        writeSF<VecSize, VecSize>(num_tokens_before_expert, expert, /*source_row*/ -1, permuted_row,
-                                  elem_index, padded_hidden_size, fc1_act_sf_flat,
-                                  /* input_sf */ nullptr);  // Pass nulltpr input_sf so we write 0
+      // values in the padded SF atom. Skipped when SKIP_SF_PADDING=true (caller pre-zeroes the
+      // SF buffer via cudaMemsetAsync).
+      if constexpr (!SKIP_SF_PADDING) {
+        size_t padding_start_offset = hidden_size / VecSize + start_offset;
+        size_t padding_elems_in_col = padded_hidden_size / VecSize;
+        for (int64_t elem_index = padding_start_offset; elem_index < padding_elems_in_col;
+             elem_index += stride) {
+          writeSF<VecSize, VecSize>(num_tokens_before_expert, expert, /*source_row*/ -1,
+                                    permuted_row, elem_index, padded_hidden_size, fc1_act_sf_flat,
+                                    /* input_sf */ nullptr);
+        }
       }
     } else if constexpr (PRE_QUANT_AWQ) {
       static_assert(!is_nvfp4 && !is_mxfp8, "NVFP4 and MXFP8 are not supported for AWQ");
@@ -1512,8 +1514,9 @@ __global__ void expandInputRowsKernel(
 #endif
 
   // Pad zeros in the extra SFs along the N dimension, we do this to ensure there are no nan values
-  // in the padded SF atom
-  if constexpr (is_nvfp4 || is_mxfp8) {
+  // in the padded SF atom. Skipped when SKIP_SF_PADDING=true (caller pre-zeroes the SF buffer via
+  // cudaMemsetAsync).
+  if constexpr (!SKIP_SF_PADDING && (is_nvfp4 || is_mxfp8)) {
     int64_t const start_offset = threadIdx.x;
     int64_t const stride = EXPAND_THREADS_PER_BLOCK;
     // Use VecSize per thread since we are just writing out zeros so every thread can process a
@@ -1578,11 +1581,46 @@ void expandInputRowsKernelLauncher(
 #endif
 
   static int64_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
+  int64_t const expanded_tokens = num_rows * k;
+
+  // For small batch (e.g. decode), pre-zero the SF buffer via cudaMemsetAsync and skip the
+  // expensive N-dim/K-dim padding loops. This avoids launching hundreds of blocks just to write
+  // zeros for TMA alignment padding, which dominates kernel time at low token counts.
+  bool const has_block_scaling = (fc1_act_sf_flat != nullptr);
+  bool const use_skip_sf_padding = has_block_scaling && (expanded_tokens < smCount * 4);
+
   // Note: Launching 8 blocks per SM can fully leverage the memory bandwidth (tested on B200).
-  int64_t const blocks = std::min(smCount * 8, std::max(num_rows * k, num_padding_tokens));
+  int64_t const blocks = use_skip_sf_padding
+      ? std::min(smCount * 8, expanded_tokens)
+      : std::min(smCount * 8, std::max(expanded_tokens, num_padding_tokens));
   int64_t const threads = EXPAND_THREADS_PER_BLOCK;
 
-  auto func = [&]() {
+  if (use_skip_sf_padding) {
+#ifdef ENABLE_FP4
+    // Compute SF buffer size for the memset. The SF layout has one scale per VecSize elements,
+    // padded to min_num_tokens_alignment per expert along N and min_k_dim_alignment along K.
+    constexpr int64_t VecSize =
+        std::is_same_v<ExpandedActivationsType, __nv_fp4_e2m1>
+            ? TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize
+            : TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize;
+    constexpr int64_t min_k_dim_alignment =
+        std::is_same_v<ExpandedActivationsType, __nv_fp4_e2m1>
+            ? TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentNVFP4
+            : TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX;
+    int64_t const padded_hidden =
+        TmaWarpSpecializedGroupedGemmInput::alignToSfDim(hidden_size, min_k_dim_alignment);
+    int64_t const max_padded_tokens_per_expert =
+        TmaWarpSpecializedGroupedGemmInput::alignToSfDim(expanded_tokens, min_num_tokens_alignment);
+    int64_t const sf_buffer_size =
+        num_experts_per_node * max_padded_tokens_per_expert * (padded_hidden / VecSize) *
+        sizeof(TmaWarpSpecializedGroupedGemmInput::ElementSF);
+    cudaMemsetAsync(fc1_act_sf_flat, 0, sf_buffer_size, stream);
+#endif
+  }
+
+  // Select kernel with appropriate SKIP_SF_PADDING template parameter
+  auto select_kernel = [&](auto skip_padding_tag) {
+    constexpr bool SkipPad = decltype(skip_padding_tag)::value;
 #ifdef ENABLE_FP8
     // Always MXFP8
     if constexpr (std::is_same_v<ExpandedActivationsType, __nv_fp8_e4m3> &&
@@ -1593,10 +1631,12 @@ void expandInputRowsKernelLauncher(
       return prequant_scales
                  ? &expandInputRowsKernel<
                        InputActivationsType, ExpandedActivationsType,
-                       TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE, true>
+                       TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE, true,
+                       SkipPad>
                  : &expandInputRowsKernel<
                        InputActivationsType, ExpandedActivationsType,
-                       TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX, false>;
+                       TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX, false,
+                       SkipPad>;
     }
     // Could be either regular FP8 or MXFP8
     else if constexpr (std::is_same_v<ExpandedActivationsType, __nv_fp8_e4m3> &&
@@ -1606,10 +1646,12 @@ void expandInputRowsKernelLauncher(
               quant_params.mxfp8_mxfp8.fc1.weight_block_scale)
                  ? &expandInputRowsKernel<
                        InputActivationsType, ExpandedActivationsType,
-                       TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX, false>
+                       TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX, false,
+                       SkipPad>
                  : &expandInputRowsKernel<
                        InputActivationsType, ExpandedActivationsType,
-                       TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE, false>;
+                       TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE, false,
+                       SkipPad>;
     } else
 #endif
 #ifdef ENABLE_FP4
@@ -1619,7 +1661,7 @@ void expandInputRowsKernelLauncher(
       TLLM_CHECK_WITH_INFO(!prequant_scales, "NVFP4 is not supported for AWQ");
       return &expandInputRowsKernel<InputActivationsType, ExpandedActivationsType,
                                     TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4,
-                                    false>;
+                                    false, SkipPad>;
     } else
 #endif
     {
@@ -1627,26 +1669,34 @@ void expandInputRowsKernelLauncher(
                            "w4afp8 Prequant scales provided for non-FP8 data type");
       return &expandInputRowsKernel<InputActivationsType, ExpandedActivationsType,
                                     TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE,
-                                    false>;
+                                    false, SkipPad>;
     }
-  }();
+  };
 
-  cudaLaunchConfig_t config;
-  config.gridDim = blocks;
-  config.blockDim = threads;
-  config.dynamicSmemBytes = 0;
-  config.stream = stream;
-  cudaLaunchAttribute attrs[1];
-  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
-  config.numAttrs = 1;
-  config.attrs = attrs;
-  cudaLaunchKernelEx(&config, func, unpermuted_input, permuted_output, unpermuted_scales,
-                     permuted_scales, permuted_row_to_unpermuted_row, num_rows, hidden_size, k,
-                     quant_params.fp4.fc1.act_global_scale, use_per_expert_act_scale,
-                     expert_first_token_offset, fc1_act_sf_flat, input_sf, swizzled_input_sf,
-                     num_experts_per_node,
-                     reinterpret_cast<InputActivationsType const*>(prequant_scales));
+  auto launch_kernel = [&](auto func) {
+    cudaLaunchConfig_t config;
+    config.gridDim = blocks;
+    config.blockDim = threads;
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+    config.numAttrs = 1;
+    config.attrs = attrs;
+    cudaLaunchKernelEx(&config, func, unpermuted_input, permuted_output, unpermuted_scales,
+                       permuted_scales, permuted_row_to_unpermuted_row, num_rows, hidden_size, k,
+                       quant_params.fp4.fc1.act_global_scale, use_per_expert_act_scale,
+                       expert_first_token_offset, fc1_act_sf_flat, input_sf, swizzled_input_sf,
+                       num_experts_per_node,
+                       reinterpret_cast<InputActivationsType const*>(prequant_scales));
+  };
+
+  if (use_skip_sf_padding) {
+    launch_kernel(select_kernel(std::true_type{}));
+  } else {
+    launch_kernel(select_kernel(std::false_type{}));
+  }
 }
 
 #define INSTANTIATE_EXPAND_INPUT_ROWS(InputActivationsType, ExpandedActivationsType)               \
@@ -2057,7 +2107,8 @@ void doGatedActivation(ActivationOutputType* output, GemmOutputType const* gemm_
 // ============================== Activation =================================
 
 template <class T, class GemmOutputType, class ScaleBiasType, class ActFn,
-          TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType BlockScalingType>
+          TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType BlockScalingType,
+          bool SKIP_SF_PADDING = false>
 __global__ void doActivationKernel(T* output, GemmOutputType const* gemm_result,
                                    float const* fp8_quant, ScaleBiasType const* bias_ptr,
                                    bool bias_is_broadcast, int64_t const* expert_first_token_offset,
@@ -2199,9 +2250,9 @@ __global__ void doActivationKernel(T* output, GemmOutputType const* gemm_result,
       }
     }
 
-    // Pad zeros in the extra SFs along the K dimension, we do this to ensure there are no nan
-    // values in the padded SF atom
-    if constexpr (IsNVFP4 || IsMXFP8) {
+    // Pad zeros in the extra SFs along the K dimension. Skipped when SKIP_SF_PADDING=true
+    // (caller pre-zeroes the SF buffer via cudaMemsetAsync).
+    if constexpr (!SKIP_SF_PADDING && (IsNVFP4 || IsMXFP8)) {
       // Use VecSize per thread since we are just writing out zeros so every thread can process a
       // whole vector
       size_t padding_start_offset = inter_size / VecSize + start_offset;
@@ -2219,9 +2270,9 @@ __global__ void doActivationKernel(T* output, GemmOutputType const* gemm_result,
   asm volatile("griddepcontrol.launch_dependents;");
 #endif
 
-  // Pad zeros in the extra SFs along the N dimension, we do this to ensure there are no nan values
-  // in the padded SF atom
-  if constexpr (IsNVFP4 || IsMXFP8) {
+  // Pad zeros in the extra SFs along the N dimension. Skipped when SKIP_SF_PADDING=true
+  // (caller pre-zeroes the SF buffer via cudaMemsetAsync).
+  if constexpr (!SKIP_SF_PADDING && (IsNVFP4 || IsMXFP8)) {
     int64_t const start_offset = threadIdx.x;
     int64_t const stride = ACTIVATION_THREADS_PER_BLOCK;
     // Use VecSize per thread since we are just writing out zeros so every thread can process a
@@ -2282,36 +2333,69 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
 #endif
 
   static int64_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
+
+  // For small batch (e.g. decode), pre-zero the SF buffer via cudaMemsetAsync and skip the
+  // expensive N-dim/K-dim padding loops in the kernel.
+  bool const has_block_scaling = (fc2_act_sf_flat != nullptr);
+  bool const use_skip_sf_padding = has_block_scaling && (expanded_num_tokens < smCount * 4);
+
   // Note: Launching 8 blocks per SM can fully leverage the memory bandwidth (tested on B200).
-  int64_t const blocks = std::min(smCount * 8, std::max(expanded_num_tokens, num_padding_tokens));
+  int64_t const blocks = use_skip_sf_padding
+      ? std::min(smCount * 8, expanded_num_tokens)
+      : std::min(smCount * 8, std::max(expanded_num_tokens, num_padding_tokens));
   int64_t const threads = ACTIVATION_THREADS_PER_BLOCK;
 
-  auto fn = [&]() {
+  if (use_skip_sf_padding) {
+#ifdef ENABLE_FP4
+    // Pre-zero the FC2 SF buffer so padding loops can be skipped
+    constexpr int64_t VecSize =
+        std::is_same_v<T, __nv_fp4_e2m1>
+            ? TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize
+            : TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize;
+    constexpr int64_t min_k_dim_alignment =
+        std::is_same_v<T, __nv_fp4_e2m1>
+            ? TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentNVFP4
+            : TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX;
+    int64_t const padded_inter =
+        TmaWarpSpecializedGroupedGemmInput::alignToSfDim(inter_size, min_k_dim_alignment);
+    int64_t const max_padded_tokens_per_expert =
+        TmaWarpSpecializedGroupedGemmInput::alignToSfDim(expanded_num_tokens,
+                                                          min_num_tokens_alignment);
+    int64_t const sf_buffer_size =
+        num_experts_per_node * max_padded_tokens_per_expert * (padded_inter / VecSize) *
+        sizeof(TmaWarpSpecializedGroupedGemmInput::ElementSF);
+    cudaMemsetAsync(fc2_act_sf_flat, 0, sf_buffer_size, stream);
+#endif
+  }
+
+  // Select kernel with appropriate SKIP_SF_PADDING template parameter
+  auto select_kernel = [&](auto skip_padding_tag) {
+    constexpr bool SkipPad = decltype(skip_padding_tag)::value;
     auto fn = [&](auto block_scaling_type) {
       auto fn_list = std::array{
           &doActivationKernel<T, GemmOutputType, ScaleBiasType,
                               IdentityAdaptor<cutlass::epilogue::thread::GELU>,
-                              decltype(block_scaling_type)::value>,  // Gelu
+                              decltype(block_scaling_type)::value, SkipPad>,  // Gelu
           &doActivationKernel<T, GemmOutputType, ScaleBiasType,
                               IdentityAdaptor<cutlass::epilogue::thread::ReLu>,
-                              decltype(block_scaling_type)::value>,  // Relu
+                              decltype(block_scaling_type)::value, SkipPad>,  // Relu
           &doActivationKernel<T, GemmOutputType, ScaleBiasType,
                               IdentityAdaptor<cutlass::epilogue::thread::SiLu>,
-                              decltype(block_scaling_type)::value>,  // Silu
+                              decltype(block_scaling_type)::value, SkipPad>,  // Silu
           &doActivationKernel<T, GemmOutputType, ScaleBiasType,
                               GLUAdaptor<cutlass::epilogue::thread::SiLu>,
-                              decltype(block_scaling_type)::value>,  // Swiglu
+                              decltype(block_scaling_type)::value, SkipPad>,  // Swiglu
           &doActivationKernel<T, GemmOutputType, ScaleBiasType,
                               GLUAdaptor<cutlass::epilogue::thread::GELU>,
-                              decltype(block_scaling_type)::value>,  // Geglu
+                              decltype(block_scaling_type)::value, SkipPad>,  // Geglu
           &doActivationKernel<T, GemmOutputType, ScaleBiasType, SwigluBiasAdaptor,
-                              decltype(block_scaling_type)::value>,  // SwigluBias
+                              decltype(block_scaling_type)::value, SkipPad>,  // SwigluBias
           &doActivationKernel<T, GemmOutputType, ScaleBiasType,
                               IdentityAdaptor<cutlass::epilogue::thread::Relu2>,
-                              decltype(block_scaling_type)::value>,  // Relu2
+                              decltype(block_scaling_type)::value, SkipPad>,  // Relu2
           &doActivationKernel<T, GemmOutputType, ScaleBiasType,
                               IdentityAdaptor<cutlass::epilogue::thread::Identity>,
-                              decltype(block_scaling_type)::value>  // Identity
+                              decltype(block_scaling_type)::value, SkipPad>  // Identity
       };
       return fn_list[static_cast<int>(activation_type.activation_type)];
     };
@@ -2341,22 +2425,30 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
     {
       return fn(NONE);
     }
-  }();
+  };
 
-  cudaLaunchConfig_t config;
-  config.gridDim = blocks;
-  config.blockDim = threads;
-  config.dynamicSmemBytes = 0;
-  config.stream = stream;
-  cudaLaunchAttribute attrs[1];
-  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
-  config.numAttrs = 1;
-  config.attrs = attrs;
-  cudaLaunchKernelEx(&config, fn, output, gemm_result, fp8_quant, bias, bias_is_broadcast,
-                     expert_first_token_offset, num_experts_per_node, inter_size,
-                     quant_params.fp4.fc2.act_global_scale, use_per_expert_act_scale,
-                     fc2_act_sf_flat, activation_type);
+  auto launch_kernel = [&](auto kernel_func) {
+    cudaLaunchConfig_t config;
+    config.gridDim = blocks;
+    config.blockDim = threads;
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+    config.numAttrs = 1;
+    config.attrs = attrs;
+    cudaLaunchKernelEx(&config, kernel_func, output, gemm_result, fp8_quant, bias,
+                       bias_is_broadcast, expert_first_token_offset, num_experts_per_node,
+                       inter_size, quant_params.fp4.fc2.act_global_scale, use_per_expert_act_scale,
+                       fc2_act_sf_flat, activation_type);
+  };
+
+  if (use_skip_sf_padding) {
+    launch_kernel(select_kernel(std::true_type{}));
+  } else {
+    launch_kernel(select_kernel(std::false_type{}));
+  }
 }
 
 // ============================== Lora Add Bias =================================
