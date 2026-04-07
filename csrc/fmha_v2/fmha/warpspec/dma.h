@@ -613,6 +613,7 @@ struct DMA {
 
       // Dst buffer available
       int v_barrier_id = cbw_v.threadReserve();
+      named_barrier_wait(SYNC_BARRIER, NUM_THREADS_IN_DMA_GROUP);
       uint32_t smem_v_dst = __cvta_generic_to_shared(&shared->smem_v[v_barrier_id * TILE_SIZE_V]);
 
 // Explicitly transpose the v buffer in smem for fp8.

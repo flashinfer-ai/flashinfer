@@ -4175,16 +4175,6 @@ def trtllm_fmha_v2_prefill(
                 "FP8 (e4m3) is not yet supported for FMHAv2 on SM120 (Blackwell). "
                 "Use fp16 or bf16 instead."
             )
-        if uses_sliding_window and input_layout in ("PACKED_QKV", "CONTIGUOUS_Q_KV"):
-            _num_kv_heads = (
-                num_qo_heads if input_layout == "PACKED_QKV" else k_cache.shape[2]
-            )
-            if batch_size == 16 and _num_kv_heads == 4 and head_dim_v == 256:
-                raise ValueError(
-                    "FP8 (e4m3) sliding window attention with batch_size=16, "
-                    "num_kv_heads=4, head_dim=256 is not supported for "
-                    f"{input_layout} layout due to a known issue."
-                )
     scale_softmax = 1.0 if is_e4m3 else 1.0
     softcapping_scale = (
         logits_soft_cap_scale if logits_soft_cap_scale is not None else 0.0
