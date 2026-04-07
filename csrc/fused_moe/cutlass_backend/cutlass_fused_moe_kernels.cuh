@@ -1539,21 +1539,25 @@ __global__ void expandInputRowsKernel(
     // Iterate over experts (skipping empty ones) instead of over all potential padding slots.
     // For decode with 8 active experts out of 128, this skips 120 experts entirely instead
     // of iterating over 128*128=16384 slots with most being wasted.
+    // The (pad_row x K_element) work is flattened into a 1D loop so all threads participate.
+    // Without flattening, only padded_num_elems_in_col threads (e.g. 64) are active per
+    // pad_row iteration while the rest idle — wasting 75% of threads for hidden_size=2048.
     for (int64_t expert = blockIdx.x; expert < num_experts_per_node; expert += gridDim.x) {
       int64_t num_tokens_before_expert = expert_first_token_offset[expert];
       int64_t num_tokens_after_expert = expert_first_token_offset[expert + 1];
       int64_t tokens_to_expert = num_tokens_after_expert - num_tokens_before_expert;
-      if (tokens_to_expert == 0) continue;  // Skip empty experts
+      if (tokens_to_expert == 0) continue;
       int64_t padded_tokens = TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
                                   tokens_to_expert, min_num_tokens_alignment);
-      for (int64_t pad_idx = tokens_to_expert; pad_idx < padded_tokens; pad_idx++) {
-        for (int64_t elem_index = start_offset; elem_index < padded_num_elems_in_col;
-             elem_index += stride) {
-          writeSF<VecSize, VecSize>(num_tokens_before_expert, expert, /*source_row*/ -1,
-                                    num_tokens_before_expert + pad_idx, elem_index,
-                                    padded_hidden_size, fc1_act_sf_flat,
-                                    /* input_sf */ nullptr);  // Pass nullptr input_sf so we write 0
-        }
+      int64_t num_pad_rows = padded_tokens - tokens_to_expert;
+      int64_t total_sf_writes = num_pad_rows * padded_num_elems_in_col;
+      for (int64_t work_idx = start_offset; work_idx < total_sf_writes; work_idx += stride) {
+        int64_t pad_idx = tokens_to_expert + work_idx / padded_num_elems_in_col;
+        int64_t elem_index = work_idx % padded_num_elems_in_col;
+        writeSF<VecSize, VecSize>(num_tokens_before_expert, expert, /*source_row*/ -1,
+                                  num_tokens_before_expert + pad_idx, elem_index,
+                                  padded_hidden_size, fc1_act_sf_flat,
+                                  /* input_sf */ nullptr);
       }
     }
   }
@@ -2240,21 +2244,25 @@ __global__ void doActivationKernel(T* output, GemmOutputType const* gemm_result,
     // Iterate over experts (skipping empty ones) instead of over all potential padding slots.
     // For decode with 8 active experts out of 128, this skips 120 experts entirely instead
     // of iterating over 128*128=16384 slots with most being wasted.
+    // The (pad_row x K_element) work is flattened into a 1D loop so all threads participate.
+    // Without flattening, only padded_num_elems_in_col threads (e.g. 64) are active per
+    // pad_row iteration while the rest idle — wasting 75% of threads for inter_size=768.
     for (int64_t expert = blockIdx.x; expert < num_experts_per_node; expert += gridDim.x) {
       int64_t num_tokens_before_expert = expert_first_token_offset[expert];
       int64_t num_tokens_after_expert = expert_first_token_offset[expert + 1];
       int64_t tokens_to_expert = num_tokens_after_expert - num_tokens_before_expert;
-      if (tokens_to_expert == 0) continue;  // Skip empty experts
+      if (tokens_to_expert == 0) continue;
       int64_t padded_tokens = TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
                                   tokens_to_expert, min_num_tokens_alignment);
-      for (int64_t pad_idx = tokens_to_expert; pad_idx < padded_tokens; pad_idx++) {
-        for (int64_t elem_index = start_offset; elem_index < padded_num_elems_in_col;
-             elem_index += stride) {
-          writeSF<VecSize, VecSize>(num_tokens_before_expert, expert, /*source_row*/ -1,
-                                    num_tokens_before_expert + pad_idx, elem_index,
-                                    padded_inter_size, fc2_act_sf_flat,
-                                    /* input_sf */ nullptr);  // Pass nullptr input_sf so we write 0
-        }
+      int64_t num_pad_rows = padded_tokens - tokens_to_expert;
+      int64_t total_sf_writes = num_pad_rows * padded_num_elems_in_col;
+      for (int64_t work_idx = start_offset; work_idx < total_sf_writes; work_idx += stride) {
+        int64_t pad_idx = tokens_to_expert + work_idx / padded_num_elems_in_col;
+        int64_t elem_index = work_idx % padded_num_elems_in_col;
+        writeSF<VecSize, VecSize>(num_tokens_before_expert, expert, /*source_row*/ -1,
+                                  num_tokens_before_expert + pad_idx, elem_index,
+                                  padded_inter_size, fc2_act_sf_flat,
+                                  /* input_sf */ nullptr);
       }
     }
   }
