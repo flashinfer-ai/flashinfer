@@ -608,18 +608,19 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm120(
     }
     TLLM_THROW("Not Implemented: SM120 GEMM only supports nvfp4.");
   }
-  // {tile_enum, M, N}
-  static constexpr std::pair<CutlassTileConfigSM120, std::array<int, 2>> all_tiles[] = {
-      {CutlassTileConfigSM120::CtaShape128x128x128B, {128, 128}},
-      {CutlassTileConfigSM120::CtaShape128x128x64B, {128, 128}},
-      {CutlassTileConfigSM120::CtaShape256x128x64B, {256, 128}},
-      {CutlassTileConfigSM120::CtaShape128x256x64B, {128, 256}},
-      {CutlassTileConfigSM120::CtaShape128x128x256B, {128, 128}},
-      {CutlassTileConfigSM120::CtaShape256x128x128B, {256, 128}},
+  // All candidate tiles for SM120 FP4. Invalid tiles for a given path are skipped
+  // gracefully by the try-catch in calcMaxWorkspaceSize.
+  static constexpr CutlassTileConfigSM120 all_tiles[] = {
+      CutlassTileConfigSM120::CtaShape128x128x128B,
+      CutlassTileConfigSM120::CtaShape128x128x64B,
+      CutlassTileConfigSM120::CtaShape256x128x64B,
+      CutlassTileConfigSM120::CtaShape128x256x64B,
+      CutlassTileConfigSM120::CtaShape128x128x256B,
+      CutlassTileConfigSM120::CtaShape256x128x128B,
   };
   std::vector<CutlassGemmConfig> result;
-  for (auto const& [tile_enum, mn] : all_tiles) {
-    result.push_back(CutlassGemmConfig{tile_enum, MainloopScheduleType::AUTO,
+  for (auto tile : all_tiles) {
+    result.push_back(CutlassGemmConfig{tile, MainloopScheduleType::AUTO,
                                        EpilogueScheduleType::AUTO,
                                        ClusterShape::ClusterShape_1x1x1});
   }
