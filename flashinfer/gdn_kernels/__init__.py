@@ -57,6 +57,12 @@ except ImportError:
     get_vec_size_mtp = None  # type: ignore
     get_mtp_config = None  # type: ignore
 
+try:
+    from .blackwell import chunk_gated_delta_rule_sm100, _has_blackwell_prefill
+except ImportError:
+    _has_blackwell_prefill = False
+    chunk_gated_delta_rule_sm100 = None  # type: ignore
+
 __all__ = [
     "gated_delta_rule",
     "gated_delta_rule_mtp",
@@ -68,4 +74,6 @@ __all__ = [
     "get_tile_v_mtp",
     "get_vec_size_mtp",
     "get_mtp_config",
+    "chunk_gated_delta_rule_sm100",
+    "_has_blackwell_prefill",
 ]
