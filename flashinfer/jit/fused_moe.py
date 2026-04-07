@@ -285,6 +285,8 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
     return gen_jit_spec(
         "fused_moe_trtllm_sm100",
         [
+            jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal/cpp/kernels/quantization.cu",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/envUtils.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/logger.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/stringUtils.cpp",

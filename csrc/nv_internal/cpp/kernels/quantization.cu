@@ -18,6 +18,8 @@
 #include <cudaTypedefs.h>
 #include <float.h>
 
+#include <cub/cub.cuh>
+
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -233,6 +235,35 @@ CUtensorMap make_3d_tma_copy_desc(T* global_address, uint64_t gmem_dim[3],
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // FP4/MXFP8 Quantization
+
+static int PER_TOKEN_AMAX_KERNEL_BLOCK_SIZE = 256;
+template <typename T>
+__global__ void perTokenAmaxKernel(int m, int n, T const* input, float* amaxOutput,
+                                   float scale = 1.f / (448 * 6)) {
+  int rowIdx = blockIdx.x;
+  if (rowIdx >= m) return;
+
+  float localMax = 0.f;
+  for (int colIdx = threadIdx.x; colIdx < n; colIdx += blockDim.x) {
+    T element = input[(int64_t)rowIdx * n + colIdx];
+    localMax = fmaxf(localMax, fabsf(static_cast<float>(element) * scale));
+  }
+
+  using BlockReduce = cub::BlockReduce<float, PER_TOKEN_AMAX_KERNEL_BLOCK_SIZE>;
+  __shared__ typename BlockReduce::TempStorage tempStorage;
+  float blockMax = BlockReduce(tempStorage)
+                       .Reduce(localMax,
+#if CUDART_VERSION >= 12090
+                               cuda::maximum<>{}
+#else
+                               cub::Max(),
+#endif
+                       );
+
+  if (threadIdx.x == 0) {
+    amaxOutput[rowIdx] = blockMax;
+  }
+}
 
 // Helper function to launch TMA quantization kernel
 template <BlockScaleQuantizationType quantization_type, typename T, int SF_VEC_SIZE>

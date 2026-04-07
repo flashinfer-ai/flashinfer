@@ -167,6 +167,8 @@ class FusedMoeLauncher {
   Optional<TensorView> output1_scales_gate_scalar;
   TensorView gemm2_weights;
   Optional<TensorView> output2_scales_scalar;
+  Optional<TensorView> per_token_scales;
+  Tensor per_token_scales_fc2;
 
   int64_t tile_tokens_dim{};
   int64_t routing_method_type{};
@@ -196,7 +198,8 @@ class FusedMoeLauncher {
                    const Optional<TensorView>& output1_scales_scalar,
                    const Optional<TensorView>& output1_scales_gate_scalar,
                    const TensorView& gemm2_weights,
-                   const Optional<TensorView>& output2_scales_scalar)
+                   const Optional<TensorView>& output2_scales_scalar,
+                   const Optional<TensorView>& per_token_scales)
       : routing_logits(routing_logits),
         routing_bias(routing_bias),
         hidden_states(hidden_states),
@@ -205,6 +208,7 @@ class FusedMoeLauncher {
         output1_scales_gate_scalar(output1_scales_gate_scalar),
         gemm2_weights(gemm2_weights),
         output2_scales_scalar(output2_scales_scalar),
+        per_token_scales(per_token_scales),
         tile_tokens_dim{},
         routing_method_type{},
         use_shuffled_weight{},
@@ -402,17 +406,24 @@ class FusedMoeLauncher {
 
   void prepare_moe_common(int64_t& moe_tactic) {
     using RunnerType = tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner;
+    bool usePerTokenScaling =
+        per_token_scales.has_value() ||
+        static_cast<RoutingMethodType>(this->routing_method_type) == RoutingMethodType::Llama4;
+    bool useExplicitQuantization =
+        per_token_scales.has_value() && this->mDtypeAct != btg::Dtype::Bfloat16;
     // For FP8 block-scale (E4m3 activations, E4m3 weights) with DeepSeek FP8, use the
     // weights-only Runner constructor to match the original kernel path and numerics.
     if (this->mDtypeAct == btg::Dtype::E4m3 && this->mDtypeWeights == btg::Dtype::E4m3 &&
         args->mUseDeepSeekFp8) {
       moe_runner = std::make_unique<RunnerType>(this->mDtypeWeights, args->mUseDeepSeekFp8,
                                                 (int32_t)tile_tokens_dim, this->use_shuffled_weight,
-                                                this->weight_layout);
+                                                this->weight_layout, usePerTokenScaling,
+                                                useExplicitQuantization);
     } else {
       moe_runner = std::make_unique<RunnerType>(
           this->mDtypeAct, this->mDtypeWeights, args->mUseDeepSeekFp8, (int32_t)tile_tokens_dim,
-          this->activation_type, this->use_shuffled_weight, this->weight_layout);
+          this->activation_type, this->use_shuffled_weight, this->weight_layout, usePerTokenScaling,
+          useExplicitQuantization);
     }
 
     if (moe_tactic == -1) {
@@ -529,7 +540,7 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
                   TensorView const& gemm1_weights, TensorView const& gemm2_weights)
       : FusedMoeLauncher(routing_logits, routing_bias, hidden_states, gemm1_weights,
                          Optional<TensorView>(), Optional<TensorView>(), gemm2_weights,
-                         Optional<TensorView>()),
+                         Optional<TensorView>(), Optional<TensorView>()),
         expert_indices(expert_indices),
         expert_weights(expert_weights) {}
 
@@ -681,7 +692,7 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
       : FusedMoeLauncher(Optional<TensorView>(routing_logits), routing_bias, hidden_states,
                          gemm1_weights, Optional<TensorView>(output1_scales_scalar),
                          Optional<TensorView>(output1_scales_gate_scalar), gemm2_weights,
-                         Optional<TensorView>(output2_scales_scalar)),
+                         Optional<TensorView>(output2_scales_scalar), Optional<TensorView>()),
         use_routing_scales_on_input(false) {}
 
   void init(std::unique_ptr<tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs>&& args,
@@ -889,7 +900,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
                         TensorView const& expert_weights, Fp8QuantizationType quantization_type)
       : FusedMoeLauncher(routing_logits, routing_bias, hidden_states, gemm1_weights,
                          Optional<TensorView>(), Optional<TensorView>(), gemm2_weights,
-                         Optional<TensorView>()),
+                         Optional<TensorView>(), Optional<TensorView>()),
         hidden_states_scale(hidden_states_scale),
         gemm1_weights_scale(gemm1_weights_scale),
         gemm2_weights_scale(gemm2_weights_scale),
@@ -1283,7 +1294,7 @@ class MxInt4BlockScaleLauncher : public FusedMoeLauncher {
                            TensorView const& gemm2_weights, TensorView const& gemm2_weights_scale)
       : FusedMoeLauncher(Optional<TensorView>(routing_logits), routing_bias, hidden_states,
                          gemm1_weights, Optional<TensorView>(), Optional<TensorView>(),
-                         gemm2_weights, Optional<TensorView>()),
+                         gemm2_weights, Optional<TensorView>(), Optional<TensorView>()),
         gemm1_weights_scale(gemm1_weights_scale),
         gemm2_weights_scale(gemm2_weights_scale) {}
 
@@ -1456,9 +1467,8 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
       TensorView const& expert_weights)
       : FusedMoeLauncher(routing_logits, routing_bias, hidden_states, gemm1_weights,
                          output1_scales_scalar, output1_scales_gate_scalar, gemm2_weights,
-                         output2_scales_scalar),
+                         output2_scales_scalar, per_token_scales),
         hidden_states_scale(hidden_states_scale),
-        per_token_scales(per_token_scales),
         gemm1_weights_scale(gemm1_weights_scale),
         gemm1_bias(gemm1_bias),
         gemm1_alpha(gemm1_alpha),
@@ -1639,9 +1649,9 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
       // When per-token scales are used, the FC1 output is always BF16 and will be quantized
       gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, args->intermediate_size},
                                   dl_bfloat16, hidden_states.device());
-
       activation_output = alloc_tensor({max_num_padded_tokens_gemm1, gemm1_output_hidden}, dl_uint8,
                                        hidden_states.device());
+      per_token_scales_fc2 = alloc_tensor({max_num_padded_tokens_gemm1}, dl_float32, hidden_states.device());
     }
 
     // Allocate gemm2_output
@@ -1658,6 +1668,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
       workspace.token_scales = per_token_scales.value().data_ptr();
       workspace.activation_output = activation_output.data_ptr();
       workspace.activation_output_scale = workspace.gemm1_output_scale;
+      workspace.token_scales_fc2 = per_token_scales_fc2.data_ptr();
     }
     workspace.gemm2_output = gemm2_output.data_ptr();
     workspace.gemm2_output_scale = nullptr;
@@ -1665,7 +1676,6 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
 
  private:
   Optional<TensorView> hidden_states_scale;
-  Optional<TensorView> per_token_scales;
   TensorView gemm1_weights_scale;
   Optional<TensorView> gemm1_bias;
   Optional<TensorView> gemm1_alpha;

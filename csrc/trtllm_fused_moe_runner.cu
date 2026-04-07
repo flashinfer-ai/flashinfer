@@ -365,7 +365,7 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
         // Swap A and B dtypes because transposeMmaOutput is hardcoded to true
         .dtypeA = dtypeWeights,
         .dtypeB = dtypeAct,
-        .dtypeC = dtypeAct,
+        .dtypeC = dtypeOutput,
         .actType = actType,
         .deepSeekFp8 = useDeepSeekFp8,
         .fusedAct = !useDeepSeekFp8,
@@ -376,6 +376,7 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
         .epilogueTileM = useDeepSeekFp8 ? 64 : 128,
         .useShuffledMatrix = useShuffledMatrix,
         .weightLayout = weightLayout,
+        .usePerTokenScaling = usePerTokenScaling,
     };
     return options;
   } else {
@@ -384,7 +385,7 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
         // Swap A and B dtypes because transposeMmaOutput is hardcoded to true
         .dtypeA = dtypeWeights,
         .dtypeB = dtypeAct,
-        .dtypeC = dtypeAct,
+        .dtypeC = dtypeOutput,
         .eltwiseActType = actType,
         .deepSeekFp8 = useDeepSeekFp8,
         .fusedAct = false,
@@ -394,7 +395,9 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
         .tileSize = tileTokensDim,
         .epilogueTileM = 128,
         .useShuffledMatrix = useShuffledMatrix,
-        .weightLayout = weightLayout};
+        .weightLayout = weightLayout,
+        .usePerTokenScaling = usePerTokenScaling,
+      };
     return options;
   }
 }
@@ -477,7 +480,7 @@ std::vector<int64_t> Runner::getPassingConfigIndices() const {
 namespace Gemm2 {
 tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
     btg::Dtype dtypeAct, btg::Dtype dtypeWeights, btg::Dtype dtypeOut, int32_t tileTokensDim,
-    bool useDeepSeekFp8, bool useShuffledMatrix, batchedGemm::gemm::MatrixLayout weightLayout) {
+    bool useDeepSeekFp8, bool useShuffledMatrix, batchedGemm::gemm::MatrixLayout weightLayout, bool usePerTokenScaling) {
   tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options = {
       // Swap A and B dtypes because transposeMmaOutput is hardcoded to true
       .dtypeA = dtypeWeights,
@@ -492,7 +495,9 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
       .tileSize = tileTokensDim,
       .epilogueTileM = useDeepSeekFp8 ? 64 : 128,
       .useShuffledMatrix = useShuffledMatrix,
-      .weightLayout = weightLayout};
+      .weightLayout = weightLayout,
+      .usePerTokenScaling = usePerTokenScaling
+    };
   return options;
 }
 
@@ -505,7 +510,7 @@ Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, btg::Dtype dtypeOut
       mTileTokensDim(tileTokensDim),
       mRunner(tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner(
           getOptions(dtypeAct, dtypeWeights, dtypeOut, tileTokensDim, useDeepSeekFp8,
-                     useShuffledMatrix, weightLayout))) {}
+                     useShuffledMatrix, weightLayout, usePerTokenScaling))) {}
 
 void Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, void* weights,
                  void* weightsScale, void* perTokenScales, float* outputScalesScalar,
@@ -754,7 +759,7 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
                                                  : QuantizationSFLayout::SWIZZLED_8x4;
     float* global_scale = nullptr;  // TODO
     invokeFP4Quantization<__nv_bfloat16, 16>(
-        1, workspace.total_max_padded_tokens, args.intermediate_size * intermediate_size_factor,
+        1, workspace.total_max_padded_tokens, args.intermediate_size,
         // inputs
         reinterpret_cast<__nv_bfloat16*>(workspace.gemm1_output), global_scale,
         // outputs
@@ -770,7 +775,7 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
   // Run gemm2
   // TODO: pass the correct per token scale
   mGemm2.run(gemm2_input, gemm2_input_scale, args.gemm2_weights, args.gemm2_weights_scale,
-             /* perTokenScales */ nullptr, args.output2_scales_scalar, args.gemm2_bias,
+             workspace.token_scales_fc2, args.output2_scales_scalar, args.gemm2_bias,
              workspace.gemm2_output, workspace.gemm2_output_scale, args.top_k, args.hidden_size,
              args.intermediate_size, args.local_num_experts, args.num_tokens,
              workspace.num_non_exiting_ctas, workspace.total_num_padded_tokens,

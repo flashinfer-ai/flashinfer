@@ -355,6 +355,8 @@ struct MoEWorkspace {
   void* expert_weights = nullptr;  // [num_tokens, top_k] in bfloat16 = mDtypeExpW
   // consumed by permuteGemm1 kernel
   void* token_scales = nullptr;
+  // consumed by Gemm2 kernel
+  void* token_scales_fc2 = nullptr;
 
   int32_t* cta_idx_xy_to_batch_idx = nullptr;
   int32_t* cta_idx_xy_to_mn_limit = nullptr;
