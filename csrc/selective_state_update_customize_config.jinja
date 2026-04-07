@@ -8,7 +8,15 @@ using input_t = {{ input_dtype }};
 using weight_t = {{ weight_dtype }};
 using matrixA_t = {{ matrixA_dtype }};
 using stateIndex_t = {{ stateIndex_dtype }};
+using cuSeqlensIndex_t = {{ cu_seqlens_dtype }};
+using numAcceptedIndex_t = {{ num_accepted_tokens_dtype }};
+// Type for block-scale decode factors (e.g. float, __half).
+// void = no scaling (state_t is used as-is).
+using state_scale_t = {{ state_scale_type }};
 
 constexpr int DIM = {{ dim }};
 constexpr int DSTATE = {{ dstate }};
 constexpr int NTOKENS_MTP = {{ ntokens_mtp }};
+// Philox PRNG rounds for stochastic rounding of fp16 state stores.
+// 0 = no stochastic rounding; typical value = 10.
+constexpr int PHILOX_ROUNDS = {{ philox_rounds }};

@@ -28,6 +28,8 @@ from torch.distributed import ProcessGroup
 
 from ..jit.comm import gen_trtllm_comm_module
 from ..utils import register_custom_op, round_up
+
+logger = logging.getLogger(__name__)
 from .cuda_ipc import create_shared_buffer, cudart, free_shared_buffer
 
 
@@ -470,8 +472,10 @@ def trtllm_create_ipc_workspace_for_all_reduce(
         aligned_size = round_up(size, 1 << 21)
         ipc_handles.append(create_shared_buffer(aligned_size, group))
 
-    print(
-        f"rank {rank} allocated ipc_handles: {[[hex(handle) for handle in sublist] for sublist in ipc_handles]}"
+    logger.debug(
+        "rank %s allocated ipc_handles: %s",
+        rank,
+        [[hex(handle) for handle in sublist] for sublist in ipc_handles],
     )
 
     trtllm_lamport_initialize_all(
@@ -603,11 +607,14 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
         if not use_symm_dev_mem:
             ipc_handles.append(create_shared_buffer(aligned_size, group))
         else:
+            # Use torch.cuda.current_device() instead of tp_rank to support
+            # base_gpu_id != 0 scenarios where the actual CUDA device index
+            # differs from the TP rank.
             symm_mem = SymmDeviceMemory(
                 aligned_size,
                 tp_size,
                 tp_rank,
-                torch.device("cuda", tp_rank).index,
+                torch.cuda.current_device(),
                 comm_backend,
                 enable_multicast=False,
                 allocate_signal_pads=False,
@@ -615,8 +622,10 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
             ipc_handles.append(symm_mem.uc_ptrs)
             mem_handles.append(symm_mem)
 
-    print(
-        f"rank {tp_rank} allocated ipc_handles: {[[hex(handle) for handle in sublist] for sublist in ipc_handles]}"
+    logger.debug(
+        "rank %s allocated ipc_handles: %s",
+        tp_rank,
+        [[hex(handle) for handle in sublist] for sublist in ipc_handles],
     )
 
     # Initialize lamport buffer
@@ -656,12 +665,12 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     cudart.cudaMemcpy(
         c_void_p(flag_ptr.value + 3 * 4), cast(lamport_comm_size_bytes, c_void_p), 4
     )
-    print("set flag_ptr[3] = lamport_comm_size: ", lamport_comm_size)
+    logger.debug("set flag_ptr[3] = lamport_comm_size: %s", lamport_comm_size)
     # add flag_ptr to workspace
     workspace.append(flag_ptr.value)
 
     for i in range(len(workspace)):
-        print(f"Rank {tp_rank} workspace[{i}] {hex(workspace[i])}")
+        logger.debug("Rank %s workspace[%d] %s", tp_rank, i, hex(workspace[i]))
 
     # Store workspace pointers in device tensor
     workspace_tensor = torch.tensor(
