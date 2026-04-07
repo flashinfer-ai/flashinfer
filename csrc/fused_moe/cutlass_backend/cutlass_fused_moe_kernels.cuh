@@ -1578,10 +1578,9 @@ void expandInputRowsKernelLauncher(
 
   static int64_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
   // Note: Launching 8 blocks per SM can fully leverage the memory bandwidth (tested on B200).
-  // The N-dim padding loop is now expert-driven (skipping empty experts), so the grid no longer
-  // needs to be inflated by num_padding_tokens.
-  int64_t const blocks = std::min(smCount * 8, std::max(num_rows * k,
-      static_cast<int64_t>(num_experts_per_node)));
+  // The N-dim padding loop is now expert-driven and strides over experts with gridDim.x, so it
+  // works correctly with any grid size. No need to inflate the grid for padding work.
+  int64_t const blocks = std::min(smCount * 8, std::max(num_rows * k, int64_t{1}));
   int64_t const threads = EXPAND_THREADS_PER_BLOCK;
 
   auto func = [&]() {
@@ -2270,10 +2269,9 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
                   cudaStream_t stream) {
   static int64_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
   // Note: Launching 8 blocks per SM can fully leverage the memory bandwidth (tested on B200).
-  // The N-dim padding loop is now expert-driven (skipping empty experts), so the grid no longer
-  // needs to be inflated by num_padding_tokens.
-  int64_t const blocks = std::min(smCount * 8, std::max(expanded_num_tokens,
-      static_cast<int64_t>(num_experts_per_node)));
+  // The N-dim padding loop is now expert-driven and strides over experts with gridDim.x, so it
+  // works correctly with any grid size. No need to inflate the grid for padding work.
+  int64_t const blocks = std::min(smCount * 8, std::max(expanded_num_tokens, int64_t{1}));
   int64_t const threads = ACTIVATION_THREADS_PER_BLOCK;
 
   auto fn = [&]() {
