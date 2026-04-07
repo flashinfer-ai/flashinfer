@@ -36,6 +36,7 @@ from ..fused_moe.utils import (
     last_positive_power_of_2,
 )
 from ..utils import (
+    get_device_sm_count,
     get_native_fp4_dtype,
     is_sm100a_supported,
     is_sm100f_supported,
@@ -3486,112 +3487,143 @@ _SM100_DEFAULT_MMA_TILER_MN = (128, 128)
 _SM100_DEFAULT_CLUSTER_SHAPE_MN = (1, 1)
 
 
-def _rank_sm100_mm_fp4_cute_dsl_tactics(valid_tactics, m, n, real_k, device):
-    """Rank valid tactics for mm_fp4(backend='cute-dsl') by minimizing tile and wave quantization effects.
+# Tactic cache: (n, real_k, sm_count) -> dict[m_bucket -> tactic_tuple]
+# Keyed on (N, K, sm_count) to handle multi-GPU with different SM counts.
+# Bounded by the number of unique (N, K) pairs in the model (typically < 50).
+_SM100_MM_FP4_TACTIC_CACHE: dict[tuple, dict] = {}
 
-    For each tactic (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch, ...),
-    we compute:
-      - Tile quantization efficiency: ratio of actual work to padded work
-        given the tile sizes.
-      - Wave quantization efficiency: ratio of ideal CTA occupancy to actual
-        CTA occupancy when mapped onto the available SMs.
-      - Tile throughput: bias toward larger tiles for better per-CTA throughput.
-      - Prefetch bonus: favor prefetch when the CTA-to-SM ratio is in a
-        sub-wave regime (more CTAs than SMs but not a full 2nd wave).
+# M bucket boundaries — powers of 2 for fast bucketing via
+# last_positive_power_of_2 (imported from flashinfer.fused_moe.utils).
+_M_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
 
-    Higher score is better. Returns the tactic list sorted best-first.
+
+def _compute_tactic_for_m(rep_m, n, real_k, sm_count):
+    """Compute the best tactic for a specific (M, N, K) on a GPU with sm_count SMs.
+
+    Selects swap_ab, tile shape, and cluster shape sequentially:
+
+    1. **swap_ab**: Swap A and B operands when M is small (8-16) and
+       8-aligned, putting the larger N dimension on the M-axis to increase
+       the number of CTAs.  Also swaps when N is not 8-aligned (required
+       for memory alignment).
+
+    2. **Tile shape**: Scores all 8 candidates from _SM100_MMA_TILER_MN_CANDIDATES.
+       The score balances three factors:
+         - Tile quantization: M and N padding waste from rounding up to tile
+           boundaries. Smaller tiles waste less for small dimensions.
+         - Wave quantization: How well total CTAs fill the available SMs.
+           Ideal when total_ctas is a multiple of sm_count.
+         - Tile throughput: Larger, balanced tiles have higher per-CTA
+           throughput. Penalized for small K (<=2048) where the K-pipeline
+           can't hide launch latency of large tiles.
+       The combined score is: m_eff * wave_eff * n_eff * tile_throughput.
+
+    3. **Cluster shape**: For narrow GEMMs (prob_m fits in one tile row),
+       clusters in the N dimension (up to 4) for scale-factor multicast.
+       Otherwise uses (1, 1).  tile_m=256 forces cluster_m=2 (HW constraint).
+
+    4. **Prefetch**: Disabled.
     """
-    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    m_aligned = rep_m % 8 == 0
+    n_aligned = n % 8 == 0
 
-    def _score(tactic):
-        mma_tiler_mn = tactic[0]
-        cluster_shape_mn = tactic[1]
-        swap_ab = tactic[2]
-        use_prefetch = tactic[3]
+    swap_ab = False
+    if m_aligned and 8 <= rep_m <= 16 and n > rep_m:
+        swap_ab = True
+    if not swap_ab and not n_aligned and m_aligned:
+        swap_ab = True
 
-        tile_m, tile_n = mma_tiler_mn
-        cluster_m, cluster_n = cluster_shape_mn
+    prob_m = n if swap_ab else rep_m
+    prob_n = rep_m if swap_ab else n
 
-        if swap_ab:
-            prob_m, prob_n = n, m
-        else:
-            prob_m, prob_n = m, n
+    # Small-K penalty factor (loop-invariant).
+    if real_k <= 1024:
+        large_tile_penalty = 0.50
+    elif real_k <= 2048:
+        large_tile_penalty = 0.80
+    else:
+        large_tile_penalty = 1.0
 
-        # Tile quantization: how much of the tiled work is useful
-        padded_m = ((prob_m + tile_m - 1) // tile_m) * tile_m
-        padded_n = ((prob_n + tile_n - 1) // tile_n) * tile_n
-        tile_efficiency = (prob_m * prob_n) / (padded_m * padded_n)
+    # Score all 8 tile candidates.
+    max_tile_area = 256 * 256
+    best_tile_m = 128
+    best_tile_n = 128
+    best_score = -1.0
 
-        # Wave quantization: how well CTAs fill the SMs
-        # Use ceil-div aligned to cluster shape for accurate CTA count
-        ctas_m = (
-            ((prob_m + tile_m - 1) // tile_m + cluster_m - 1) // cluster_m * cluster_m
-        )
-        ctas_n = (
-            ((prob_n + tile_n - 1) // tile_n + cluster_n - 1) // cluster_n * cluster_n
-        )
-        total_ctas = ctas_m * ctas_n
-        if total_ctas == 0:
-            return 0.0
-        num_waves = (total_ctas + sm_count - 1) // sm_count
-        wave_efficiency = total_ctas / (num_waves * sm_count)
-
-        # Cluster efficiency: penalize clusters with partially-filled dimensions.
-        raw_ctas_m = (prob_m + tile_m - 1) // tile_m
-        raw_ctas_n = (prob_n + tile_n - 1) // tile_n
-        cluster_ctas_m = ((raw_ctas_m + cluster_m - 1) // cluster_m) * cluster_m
-        cluster_ctas_n = ((raw_ctas_n + cluster_n - 1) // cluster_n) * cluster_n
-        cluster_efficiency = (raw_ctas_m * raw_ctas_n) / (
-            cluster_ctas_m * cluster_ctas_n
-        )
-
-        # Tile throughput bias: larger tiles have higher per-CTA throughput.
-        # Also prefer balanced (square-ish) tiles over elongated ones —
-        # balanced tiles have better memory access patterns and locality.
-        max_tile_area = 256 * 256
+    for tile_m, tile_n in _SM100_MMA_TILER_MN_CANDIDATES:
+        n_tiles = (prob_n + tile_n - 1) // tile_n
+        n_eff = prob_n / (n_tiles * tile_n)
         tile_area_factor = ((tile_m * tile_n) / max_tile_area) ** 0.5
-        # Balance factor: ratio of min/max tile dims. 1.0 for square, <1 for elongated.
-        tile_balance = min(tile_m, tile_n) / max(tile_m, tile_n)
-        tile_throughput = tile_area_factor * (tile_balance**0.25)
+        tile_bal = min(tile_m, tile_n) / max(tile_m, tile_n)
+        tile_tp = tile_area_factor * (tile_bal**0.25)
+        ns = n_eff * tile_tp
 
-        # For small K, penalize oversized tiles — the K-pipeline can't hide
-        # the latency of large tile launches when there's little K-work.
         if tile_m * tile_n > 128 * 128:
-            if real_k <= 1024:
-                tile_throughput *= 0.50
-            elif real_k <= 2048:
-                tile_throughput *= 0.80
+            ns *= large_tile_penalty
 
-        # Prefer no prefetch as a tiebreaker
-        prefetch_penalty = 0.99 if use_prefetch else 1.0
+        m_tiles = (prob_m + tile_m - 1) // tile_m
+        total_ctas = m_tiles * n_tiles
+        num_waves = (total_ctas + sm_count - 1) // sm_count
+        score = prob_m * total_ctas * ns / (tile_m * num_waves * sm_count)
+        if score > best_score:
+            best_score = score
+            best_tile_m = tile_m
+            best_tile_n = tile_n
 
-        # Cluster tiebreaker: when the problem M is very small (fits in a
-        # small fraction of the tile) and the cluster divides evenly, prefer
-        # larger clusters for hardware multicast benefits.
-        cluster_size = cluster_m * cluster_n
-        if prob_m <= tile_m // 4 and cluster_efficiency > 0.99:
-            cluster_bonus = 1.0 + 0.001 * cluster_size
+    # Cluster: N-only for small prob_m, else (1,1).
+    tiles_on_n = (prob_n + best_tile_n - 1) // best_tile_n
+    if prob_m <= best_tile_m:
+        if tiles_on_n % 4 == 0 or tiles_on_n > 10:
+            cga_n = 4
+        elif tiles_on_n % 2 == 0:
+            cga_n = 2
         else:
-            cluster_bonus = 1.0
+            cga_n = 1
+        cga_m = 1
+    else:
+        cga_m = 1
+        cga_n = 1
 
-        # swap_ab bonus: for small M (8-16) with large N, swapping puts
-        # the large dimension along the M-axis, enabling more CTAs and
-        # better cluster multicast utilization along M.
-        swap_bonus = 1.0
-        if swap_ab and 8 <= m <= 16 and n >= 4096:
-            swap_bonus = 1.08
+    if best_tile_m == 256 and cga_m < 2:
+        cga_m = 2
 
-        return (
-            tile_efficiency
-            * wave_efficiency
-            * cluster_efficiency
-            * tile_throughput
-            * prefetch_penalty
-            * cluster_bonus
-            * swap_bonus
-        )
+    return (
+        (best_tile_m, best_tile_n),
+        (cga_m, cga_n),
+        swap_ab,
+        False,
+        "sm100",
+        None,
+    )
 
-    return sorted(valid_tactics, key=_score, reverse=True)
+
+def _select_sm100_mm_fp4_cute_dsl_tactic(m, n, real_k, sm_count):
+    """Select the best tactic for mm_fp4(backend='cute-dsl').
+
+    On the first call for a given (N, K), precomputes the optimal tactic
+    for each M bucket (~13 buckets, ~55-86 usec).  Subsequent calls with
+    any M just look up the bucket — runs in ~0.2 usec.
+
+    Args:
+        m: M dimension of the GEMM problem.
+        n: N dimension of the GEMM problem.
+        real_k: K dimension (unpacked, i.e. 2x the packed FP4 dimension).
+        sm_count: Number of SMs on the target GPU.
+
+    Returns:
+        Tactic tuple: (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch,
+                        kernel_type, use_tma_store)
+    """
+    cache_key = (n, real_k, sm_count)
+    bucket_tactics = _SM100_MM_FP4_TACTIC_CACHE.get(cache_key)
+    if bucket_tactics is None:
+        bucket_tactics = {
+            rep_m: _compute_tactic_for_m(rep_m, n, real_k, sm_count)
+            for rep_m in _M_BUCKETS
+        }
+        _SM100_MM_FP4_TACTIC_CACHE[cache_key] = bucket_tactics
+
+    return bucket_tactics[last_positive_power_of_2(m)]
 
 
 def _get_approximate_cta_nums(m, n, tile_mn, cluster_shape_mn):
@@ -4667,23 +4699,11 @@ def _cute_dsl_gemm_fp4_runner(
             batch_size = 1
 
             if tactic is None or tactic == -1:
-                # Use heuristic to pick the best tactic based on
+                # Use analytical heuristic to pick the best tactic based on
                 # tile and wave quantization efficiency.
-                valid = self.get_valid_tactics(inputs, None)
-                if valid:
-                    ranked = _rank_sm100_mm_fp4_cute_dsl_tactics(
-                        valid, m, n, real_k, a.device
-                    )
-                    tactic = ranked[0]
-                else:
-                    tactic = (
-                        _SM100_DEFAULT_MMA_TILER_MN,
-                        _SM100_DEFAULT_CLUSTER_SHAPE_MN,
-                        False,
-                        False,
-                        "sm100",
-                        None,
-                    )
+                tactic = _select_sm100_mm_fp4_cute_dsl_tactic(
+                    m, n, real_k, get_device_sm_count(a.device)
+                )
 
             (
                 mma_tiler_mn,
