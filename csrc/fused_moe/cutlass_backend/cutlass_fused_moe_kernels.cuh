@@ -1260,6 +1260,16 @@ __global__ void computeStridesTmaWarpSpecializedKernel(
           layout_info2.swap_ab ? gemm2_n : gemm_m, layout_info2.swap_ab ? gemm_m : gemm2_n,
           gemm2_k);
 
+  // Skip expensive stride/pointer/SF setup for experts with no assigned tokens.
+  // CUTLASS grouped GEMM skips zero-M problems after reading problem_shapes.
+  // For decode (1 token, top_k=8, 128 experts), this skips ~120 of 128 experts.
+  if (gemm_m == 0) {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
+    return;
+  }
+
   if (layout_info1.int4_groupwise_params.enabled) {
     layout_info1.int4_groupwise_params.shape.problem_shapes[expert] =
         TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::ProblemShapeInt::
