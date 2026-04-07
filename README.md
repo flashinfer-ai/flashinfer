@@ -68,8 +68,8 @@ High-Performance GPU Kernels for Inference
 | Ampere | SM 8.0, 8.6 | A100, A10, RTX 30 series |
 | Ada Lovelace | SM 8.9 | L4, L40, RTX 40 series |
 | Hopper | SM 9.0 | H100, H200 |
-| Blackwell | SM 10.0, 10.3 | B200, B300 |
-| Blackwell | SM 12.0, 12.1 | RTX 50 series, DGX Spark, Jetson Thor |
+| Blackwell | SM 10.0, 10.3, 11.0 | B200, B300, Jetson Thor |
+| Blackwell | SM 12.0, 12.1 | RTX 50 series, DGX Spark |
 
 > **Note:** Not all features are supported across all compute capabilities.
 
