@@ -4,6 +4,10 @@ import math
 from typing import Optional, Tuple, Union
 
 import flashinfer
+
+# Apply a per-test timeout to catch GPU kernel hangs (e.g., barrier deadlocks).
+# 300s covers first-run JIT compilation (~30s) plus actual kernel execution (~2s).
+pytestmark = pytest.mark.timeout(300)
 from flashinfer.prefill import fmha_v2_prefill_deepseek
 from tests.utils_fp8 import to_float8
 from flashinfer.utils import is_sm12x_supported, is_sm120a_supported
