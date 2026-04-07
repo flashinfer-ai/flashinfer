@@ -81,13 +81,18 @@ __device__ __forceinline__ float ieee_div(float a, float b) {
 /// Warp-level online softmax merge across all 32 lanes using butterfly reduction.
 /// Each lane holds a partial (max, sum) pair; after return all lanes see the merged result.
 __device__ __forceinline__ float2 WarpOnlineSoftmaxMerge(float m, float s) {
+  // reduce to get max first
+  const float old_m = m;
 #pragma unroll
-  for (uint32_t offset = 16; offset > 0; offset /= 2) {
-    float other_m = __shfl_xor_sync(0xffffffff, m, offset);
-    float other_s = __shfl_xor_sync(0xffffffff, s, offset);
-    float new_max = max(m, other_m);
-    s = s * __expf(m - new_max) + other_s * __expf(other_m - new_max);
-    m = new_max;
+  for (int offset = 16; offset > 0; offset /= 2) {
+    m = max(m, __shfl_xor_sync(0xffffffff, m, offset));
+  }
+
+  // then reduce to get sum, using the max for numerical stability
+  if (m != old_m) s *= __expf(old_m - m);
+#pragma unroll
+  for (int offset = 16; offset > 0; offset /= 2) {
+    s = s + __shfl_xor_sync(0xffffffff, s, offset);
   }
   return make_float2(m, s);
 }
@@ -483,7 +488,8 @@ __global__ void OnlineSoftmaxMapKernel(DType* logits, PartialSoftmaxResult* part
 
   __shared__ float2 smem_ms[32];
 
-  vec_t<DType, VEC_SIZE> logits_vec;
+  const uint32_t slice_vecs = slice_size / VEC_SIZE;
+  DType* slice_ptr = logits + static_cast<uint64_t>(bx) * d + slice_start;
 
   // Thread-local online softmax state
   float m = -FLT_MAX;
@@ -494,12 +500,9 @@ __global__ void OnlineSoftmaxMapKernel(DType* logits, PartialSoftmaxResult* part
 #endif
 
 #pragma unroll 2
-  for (uint32_t i = 0; i < ceil_div(slice_size, BLOCK_THREADS * VEC_SIZE); ++i) {
-    logits_vec.fill(-cuda::std::numeric_limits<DType>::infinity());
-
-    if ((i * BLOCK_THREADS + tx) * VEC_SIZE < slice_size) {
-      logits_vec.cast_load(logits + bx * d + slice_start + (i * BLOCK_THREADS + tx) * VEC_SIZE);
-    }
+  for (uint32_t idx = tx; idx < slice_vecs; idx += BLOCK_THREADS) {
+    vec_t<DType, VEC_SIZE> logits_vec;
+    logits_vec.cast_load(slice_ptr + idx * VEC_SIZE);
 
     float vec_max = -FLT_MAX;
     float cache[VEC_SIZE];
@@ -580,26 +583,22 @@ __global__ void OnlineSoftmaxReduceKernel(DType* logits, DType* output,
   const float inv_denominator = 1.0f / shared_result.y;
 
   // All threads: normalize this slice
+  const uint32_t slice_vecs = slice_size / VEC_SIZE;
   DType* slice_in = logits + static_cast<uint64_t>(bx) * d + slice_start;
   DType* slice_out = output + static_cast<uint64_t>(bx) * d + slice_start;
-  vec_t<DType, VEC_SIZE> logits_vec;
-  vec_t<DType, VEC_SIZE> prob_vec;
 
-  for (uint32_t i = 0; i < ceil_div(slice_size, BLOCK_THREADS * VEC_SIZE); ++i) {
-    logits_vec.fill(-cuda::std::numeric_limits<DType>::infinity());
-    if ((i * BLOCK_THREADS + tx) * VEC_SIZE < slice_size) {
-      logits_vec.cast_load(slice_in + (i * BLOCK_THREADS + tx) * VEC_SIZE);
-    }
+  for (uint32_t idx = tx; idx < slice_vecs; idx += BLOCK_THREADS) {
+    vec_t<DType, VEC_SIZE> logits_vec;
+    logits_vec.cast_load(slice_in + idx * VEC_SIZE);
 
+    vec_t<DType, VEC_SIZE> prob_vec;
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
       float val = static_cast<float>(logits_vec[j]) * inv_temp;
       prob_vec[j] = static_cast<DType>(__expf(val - final_max) * inv_denominator);
     }
 
-    if ((i * BLOCK_THREADS + tx) * VEC_SIZE < slice_size) {
-      prob_vec.cast_store(slice_out + (i * BLOCK_THREADS + tx) * VEC_SIZE);
-    }
+    prob_vec.cast_store(slice_out + idx * VEC_SIZE);
   }
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.launch_dependents;");
