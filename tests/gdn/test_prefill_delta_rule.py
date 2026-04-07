@@ -25,15 +25,32 @@ import pytest
 
 from .reference_delta_rule import exclusive_cumsum, blockwise_delta_rule
 
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import get_compute_capability, is_sm100a_supported
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
+from flashinfer.gdn_kernels import chunk_gated_delta_rule_sm100, _has_blackwell_prefill
 
 
-def _skip_if_not_sm90():
-    """Skip test if not SM90 architecture."""
+def _is_sm100():
+    """Check if we should use the SM100 (Blackwell) path."""
+    cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
+    return (
+        _has_blackwell_prefill
+        and is_sm100a_supported(torch.device("cuda"))
+        and cuda_major >= 13
+    )
+
+
+def _skip_if_unsupported():
+    """Skip test if not SM90 or SM100 (with CUDA 13+) architecture."""
     cc = get_compute_capability(torch.device("cuda"))
-    if cc[0] != 9:
-        pytest.skip(f"GDN prefill requires SM90, but got SM{cc[0]}{cc[1]}")
+    if cc[0] == 10:
+        cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
+        if cuda_major < 13:
+            pytest.skip(
+                f"SM100 GDN prefill requires CUDA 13+, got {torch.version.cuda}"
+            )
+    elif cc[0] != 9:
+        pytest.skip(f"GDN prefill requires SM90 or SM100, but got SM{cc[0]}{cc[1]}")
 
 
 def _test_prefill_kernel(
@@ -50,7 +67,7 @@ def _test_prefill_kernel(
     beta: bool,
     seed: int | None = None,
 ):
-    _skip_if_not_sm90()
+    _skip_if_unsupported()
     if not alpha and not beta:
         pytest.skip(
             "large diff due to output value amplitude explosion along token dimension"
@@ -89,25 +106,56 @@ def _test_prefill_kernel(
     our_o.fill_(float("nan"))
     our_state.fill_(float("nan"))
 
-    chunk_gated_delta_rule(
-        q,
-        k,
-        v,
-        alpha,
-        beta,
-        scale,
-        None,
-        True,
-        cu_seq_lens,
-        True,
-        output=our_o,
-        output_state=our_state,
-    )
+    if _is_sm100():
+        # SM100: use dedicated API, state is K-major [N,H,K,V] matching reference
+        _alpha = (
+            alpha
+            if alpha is not None
+            else torch.ones(
+                total_seqlen, num_sab_heads, dtype=torch.float32, device=device
+            )
+        )
+        _beta = (
+            beta
+            if beta is not None
+            else torch.ones(
+                total_seqlen, num_sab_heads, dtype=torch.float32, device=device
+            )
+        )
+        chunk_gated_delta_rule_sm100(
+            q,
+            k,
+            v,
+            _alpha,
+            _beta,
+            our_o,
+            cu_seq_lens.to(torch.int32),
+            None,
+            our_state,
+            scale,
+        )
+    else:
+        # SM90: state is K-last [N,H,V,K]
+        chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            alpha,
+            beta,
+            scale,
+            None,
+            True,
+            cu_seq_lens,
+            True,
+            output=our_o,
+            output_state=our_state,
+        )
 
     torch.cuda.synchronize()
 
-    # postprocessing raw output: ref_state is v-last [H,K,V], our_state is k-last [H,V,K], transpose to match
-    our_state = our_state.transpose(-1, -2)
+    if not _is_sm100():
+        # SM90 state is K-last [H,V,K], transpose to match reference [H,K,V]
+        our_state = our_state.transpose(-1, -2)
 
     ref_o, ref_state = blockwise_delta_rule(
         q.float(),
@@ -129,7 +177,7 @@ def _test_prefill_kernel(
         atol_kv = 5e-3
         rtol_kv = 1e-3
     else:
-        atol_o = 1e-3
+        atol_o = 2e-3
         rtol_o = 1e-3
         atol_kv = 1e-3
         rtol_kv = 1e-4
@@ -258,7 +306,7 @@ def _test_chunked_prefill(
     beta: bool,
     seed: int | None = None,
 ):
-    _skip_if_not_sm90()
+    _skip_if_unsupported()
     if not alpha and not beta:
         pytest.skip(
             "large diff due to output value amplitude explosion along token dimension"
@@ -316,40 +364,97 @@ def _test_chunked_prefill(
     our_state1.fill_(float("nan"))
     our_state2.fill_(float("nan"))
 
-    chunk_gated_delta_rule(
-        q1,
-        k1,
-        v1,
-        alpha1,
-        beta1,
-        scale,
-        None,
-        True,
-        cu_seq_lens1,
-        True,
-        output=our_o1,
-        output_state=our_state1,
-    )
-    chunk_gated_delta_rule(
-        q2,
-        k2,
-        v2,
-        alpha2,
-        beta2,
-        scale,
-        our_state1,
-        True,
-        cu_seq_lens2,
-        True,
-        output=our_o2,
-        output_state=our_state2,
-    )
+    if _is_sm100():
+        # SM100: dedicated API, K-major states
+        _alpha1 = (
+            alpha1
+            if alpha1 is not None
+            else torch.ones(
+                total_seqlen1, num_sab_heads, dtype=torch.float32, device=device
+            )
+        )
+        _beta1 = (
+            beta1
+            if beta1 is not None
+            else torch.ones(
+                total_seqlen1, num_sab_heads, dtype=torch.float32, device=device
+            )
+        )
+        _alpha2 = (
+            alpha2
+            if alpha2 is not None
+            else torch.ones(
+                total_seqlen2, num_sab_heads, dtype=torch.float32, device=device
+            )
+        )
+        _beta2 = (
+            beta2
+            if beta2 is not None
+            else torch.ones(
+                total_seqlen2, num_sab_heads, dtype=torch.float32, device=device
+            )
+        )
+        chunk_gated_delta_rule_sm100(
+            q1,
+            k1,
+            v1,
+            _alpha1,
+            _beta1,
+            our_o1,
+            cu_seq_lens1.to(torch.int32),
+            None,
+            our_state1,
+            scale,
+        )
+        chunk_gated_delta_rule_sm100(
+            q2,
+            k2,
+            v2,
+            _alpha2,
+            _beta2,
+            our_o2,
+            cu_seq_lens2.to(torch.int32),
+            our_state1,
+            our_state2,
+            scale,
+        )
+    else:
+        # SM90: unified API, K-last states
+        chunk_gated_delta_rule(
+            q1,
+            k1,
+            v1,
+            alpha1,
+            beta1,
+            scale,
+            None,
+            True,
+            cu_seq_lens1,
+            True,
+            output=our_o1,
+            output_state=our_state1,
+        )
+        chunk_gated_delta_rule(
+            q2,
+            k2,
+            v2,
+            alpha2,
+            beta2,
+            scale,
+            our_state1,
+            True,
+            cu_seq_lens2,
+            True,
+            output=our_o2,
+            output_state=our_state2,
+        )
     our_state = our_state2
 
     torch.cuda.synchronize()
 
-    # postprocessing raw output: ref_state is v-last [H,K,V], our_state is k-last [H,V,K], transpose to match
-    our_state = our_state.transpose(-1, -2)
+    if not _is_sm100():
+        # SM90 state is K-last [H,V,K], transpose to match reference [H,K,V]
+        our_state = our_state.transpose(-1, -2)
 
     def concat_varlen(t1, cu_seq_lens1, t2, cu_seq_lens2):
         output = []

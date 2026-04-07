@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+import math
 from types import SimpleNamespace
 from typing import Optional, Union, Tuple
 import torch
@@ -165,8 +166,9 @@ def chunk_gated_delta_rule(
     Note:
         - Supports GQA: ``num_q_heads > num_k_heads = num_v_heads``
         - Supports GVA: ``num_v_heads > num_q_heads = num_k_heads``
-        - The final state is in k-last layout ``[N, H, V, K]``.
+        - The final state is in K-last layout ``[N, H, V, K]``.
         - Requires SM90 (Hopper) architecture.
+        - For SM100 (Blackwell), use ``chunk_gated_delta_rule_sm100`` instead.
     """
     if checkpoint_every_n_tokens < 0:
         raise ValueError(
@@ -264,10 +266,12 @@ def chunk_gated_delta_rule(
             device=q.device,
         )
 
-    # Prepare workspace buffer for TMA Store in kernel
-    # 128B tensormap for each SM on Hopper architecture
-    workspace_size = get_device_sm_count(q.device) * 128
-    workspace_buffer = _get_cache_buf("gdn_prefill_workspace", workspace_size, q.device)
+    device = q.device
+    _scale = scale if scale is not None else 1.0 / math.sqrt(head_size)
+
+    # SM90 Hopper path (C++ JIT kernel)
+    workspace_size = get_device_sm_count(device) * 128
+    workspace_buffer = _get_cache_buf("gdn_prefill_workspace", workspace_size, device)
 
     get_gdn_prefill_module().gdn_prefill(
         output,
@@ -275,7 +279,7 @@ def chunk_gated_delta_rule(
         q,
         k,
         v,
-        cu_seqlens.to(torch.int64),  # C++ kernel expects int64
+        cu_seqlens.to(torch.int64),
         initial_state,
         g,
         beta,
