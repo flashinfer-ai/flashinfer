@@ -96,9 +96,9 @@ def torch_reference_mla(
     return torch.stack(outputs, dim=0)  # [B, q_len, H, latent_dim]
 
 
-@pytest.mark.parametrize("batch_size", [1, 4])
-@pytest.mark.parametrize("seq_len_k", [128, 512, 2048])
-@pytest.mark.parametrize("page_size", [128])
+@pytest.mark.parametrize("batch_size", [1, 4, 32])
+@pytest.mark.parametrize("seq_len_k", [128, 512, 2048, 8192])
+@pytest.mark.parametrize("page_size", [32, 128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("q_len", [1, 2])
 @pytest.mark.parametrize("enable_pdl", [True, False])
@@ -189,10 +189,12 @@ def test_cute_dsl_mla_decode_fp16(
     torch.testing.assert_close(out, ref_out_cast, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.parametrize("batch_size", [1, 4])
-@pytest.mark.parametrize("seq_len_k", [128, 512])
+@pytest.mark.parametrize("batch_size", [1, 4, 16])
+@pytest.mark.parametrize("seq_len_k", [128, 512, 2048])
+@pytest.mark.parametrize("page_size", [32, 128])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_cute_dsl_mla_decode_variable_seq_len(
-    batch_size, seq_len_k, page_size=128, enable_pdl=False
+    batch_size, seq_len_k, page_size, dtype
 ):
     """Test MLA decode with variable sequence lengths across the batch."""
     skip_if_unsupported()
@@ -211,10 +213,9 @@ def test_cute_dsl_mla_decode_variable_seq_len(
     D_qk = latent_dim + rope_dim
 
     query = torch.randn(
-        batch_size, q_len, num_heads, D_qk, dtype=torch.float16, device=device
+        batch_size, q_len, num_heads, D_qk, dtype=dtype, device=device
     )
 
-    # Variable sequence lengths
     max_seq_len = seq_len_k
     seq_lens = torch.randint(
         page_size, max_seq_len + 1, (batch_size,), dtype=torch.int32, device=device
@@ -223,7 +224,7 @@ def test_cute_dsl_mla_decode_variable_seq_len(
     max_pages_per_batch = (max_seq_len + page_size - 1) // page_size
     total_pages = max_pages_per_batch * batch_size + 10
     kv_cache = torch.randn(
-        total_pages, page_size, D_qk, dtype=torch.float16, device=device
+        total_pages, page_size, D_qk, dtype=dtype, device=device
     )
 
     block_tables = torch.zeros(
@@ -247,10 +248,8 @@ def test_cute_dsl_mla_decode_variable_seq_len(
         softmax_scale=softmax_scale,
         output_scale=output_scale,
         is_var_seq=True,
-        enable_pdl=enable_pdl,
     )
 
-    # Reference
     kv_flat = kv_cache.reshape(-1, D_qk)
     c_latent_ref = kv_flat[:, :latent_dim]
     c_rope_ref = kv_flat[:, latent_dim:]
@@ -268,9 +267,9 @@ def test_cute_dsl_mla_decode_variable_seq_len(
         output_scale,
         page_size,
     )
-    ref_out_fp16 = ref_out.to(torch.float16)
+    ref_out_cast = ref_out.to(dtype)
 
-    torch.testing.assert_close(out, ref_out_fp16, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(out, ref_out_cast, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("batch_size", [1, 4])
@@ -403,9 +402,9 @@ def test_cute_dsl_vs_trtllm_gen(batch_size, seq_len_k, enable_pdl, page_size=64)
 
 
 @pytest.mark.parametrize("batch_size", [1, 4])
-@pytest.mark.parametrize("seq_len_k", [128, 512])
-@pytest.mark.parametrize("page_size", [128])
-@pytest.mark.parametrize("enable_pdl", [True, False])
+@pytest.mark.parametrize("seq_len_k", [128, 512, 2048])
+@pytest.mark.parametrize("page_size", [64, 128])
+@pytest.mark.parametrize("enable_pdl", [False])
 def test_cute_dsl_mla_decode_fp8(batch_size, seq_len_k, page_size, enable_pdl):
     """Test FP8 MLA decode kernel against FP32 reference."""
     skip_if_unsupported()

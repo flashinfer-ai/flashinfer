@@ -13,12 +13,14 @@
 # limitations under the License.
 """
 CuTe DSL MLA Decode Kernels for Blackwell SM100.
+
+Backward-compat shim: re-exports from the modular attention framework.
 """
 
 from flashinfer.cute_dsl.utils import is_cute_dsl_available
 
 if is_cute_dsl_available():
-    from .mla_decode import cute_dsl_mla_decode
+    from flashinfer.cute_dsl.attention.wrappers.batch_mla import cute_dsl_mla_decode
 
 __all__ = [
     "is_cute_dsl_available",
