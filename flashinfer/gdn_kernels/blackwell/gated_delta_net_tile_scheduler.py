@@ -122,6 +122,7 @@ class GDNTileSchedulerParams:
                 self.num_heads_fdd,
             ],
             self._values_pos,
+            strict=True,
         ):
             obj_list.append(new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
@@ -188,6 +189,7 @@ class GDNTileScheduler:
                 self.is_valid,
             ],
             self._values_pos,
+            strict=True,
         ):
             obj_list.append(new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
