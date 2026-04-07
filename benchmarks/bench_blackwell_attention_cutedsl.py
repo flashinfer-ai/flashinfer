@@ -1,11 +1,14 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
+import sys
+
 import numpy as np
 import torch
 
 import flashinfer
 from flashinfer.testing.utils import bench_gpu_time
+from flashinfer.utils import is_sm100a_supported
 
 from flashinfer.cute_dsl.attention import BatchPrefillCuteDSLWrapper
 
@@ -55,6 +58,7 @@ def bench_fmha_blackwell(
         lambda: wrapper.run(q, k, v),
         dry_run_time_ms=100,
         repeat_time_ms=1000,
+        enable_cupti=True,
     )
     ms = np.median(measurements)
 
@@ -127,6 +131,7 @@ def bench_fmha_cutedsl(
         lambda: wrapper.run(q, k, v),
         dry_run_time_ms=100,
         repeat_time_ms=1000,
+        enable_cupti=True,
     )
     ms = np.median(measurements)
 
@@ -151,6 +156,10 @@ def bench_fmha_cutedsl(
 
 
 if __name__ == "__main__":
+    if not is_sm100a_supported(torch.device("cuda")):
+        print("Skipping: requires SM100+")
+        sys.exit(0)
+
     configs = [
         (128, 512, 32, 128, True, torch.bfloat16),
         (64, 1024, 32, 128, True, torch.bfloat16),

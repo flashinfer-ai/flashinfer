@@ -70,8 +70,6 @@ from .scheduler.mla_persistent import (
 # Wrappers
 from .wrappers.batch_prefill import (
     BatchPrefillCuteDSLWrapper,
-    qkv_torch_2_cute,
-    create_and_pad_tensor,
 )
 from .wrappers.batch_mla import (
     BatchMLADecodeCuteDSLWrapper,

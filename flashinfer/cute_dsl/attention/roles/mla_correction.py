@@ -463,7 +463,7 @@ class MLACorrectionRole:
 
         if cutlass.const_expr(self.warps_in_n == 2):
             common_params.smem_exchange[tidx] = row_sum
-            self.epilogue_exchange_sync_bar.wait()
+            self.epilogue_exchange_sync_bar.arrive_and_wait()
             row_sum = (
                 row_sum
                 + common_params.smem_exchange[
@@ -561,7 +561,7 @@ class MLACorrectionRole:
                             )
                             if cutlass.const_expr(self.warps_in_n == 2):
                                 common_params.smem_exchange[tidx] = row_sum
-                                self.epilogue_exchange_sync_bar.wait()
+                                self.epilogue_exchange_sync_bar.arrive_and_wait()
                                 row_sum = (
                                     row_sum
                                     + common_params.smem_exchange[

@@ -4,9 +4,6 @@
 import math
 from typing import Type, Tuple, Optional
 
-import torch
-import cuda.bindings.driver as cuda
-
 import cutlass
 import cutlass.cute as cute
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
@@ -41,14 +38,10 @@ from .roles.mma import MmaRole
 
 import warnings
 
-# Ignore this specific warning
 warnings.filterwarnings(
     "ignore",
     message="This loop is no longer unrolled and may cause performance regression",
 )
-
-# Or ignore all UserWarnings (more broad)
-warnings.filterwarnings("ignore", category=UserWarning)
 
 """
 A fused multi-head attention (FMHA) example for the NVIDIA Blackwell SM100 architecture using CUTE DSL
@@ -134,10 +127,10 @@ class BlackwellFusedMultiHeadAttentionForward:
     @cute.jit
     def __call__(
         self,
-        q_iter: cute.Pointer,
-        k_iter: cute.Pointer,
-        v_iter: cute.Pointer,
-        o_iter: cute.Pointer,
+        q_in: cute.Tensor,
+        k_in: cute.Tensor,
+        v_in: cute.Tensor,
+        o_in: cute.Tensor,
         problem_size: Tuple[Int32, Int32, Int32, Int32, Int32, Int32],
         cum_seqlen_q: cute.Tensor | None,
         s_q_all: Int32,
@@ -145,28 +138,26 @@ class BlackwellFusedMultiHeadAttentionForward:
         s_k_all: Int32,
         scale_softmax_log2: Float32,
         scale_output: Float32,
-        params_iter: cute.Pointer | None,
-        stream: cuda.CUstream,
+        params_in: cute.Tensor | None,
+        stream,
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
 
-        :param q_iter: The query tensor pointer
-        :param k_iter: The key tensor pointer
-        :param v_iter: The value tensor pointer
-        :param o_iter: The output tensor pointer
+        :param q_in: The query tensor (NHD layout)
+        :param k_in: The key tensor (NHD layout)
+        :param v_in: The value tensor (NHD layout)
+        :param o_in: The output tensor (NHD layout, with padding before data pointer)
         :param problem_size: ``(b, s_q, s_k, h_q, h_k, d)``
         :param cum_seqlen_q: Cumulative query sequence lengths, or None
         :param cum_seqlen_k: Cumulative KV sequence lengths, or None
         :param scale_softmax_log2: ``log2(e) * sm_scale``
         :param scale_output: Output scaling factor
-        :param params_iter: Variant runtime data pointer, or None
+        :param params_in: Variant runtime data tensor, or None
         :param stream: CUDA stream
         """
         b, s_q, s_k, h_q, h_k, d = problem_size
         h_r = h_q // h_k
 
-        q_offset = 0
-        kv_offset = 0
         o_offset = -s_q * d * h_r * h_k
         b_q = 1
         b_kv = 1
@@ -180,29 +171,29 @@ class BlackwellFusedMultiHeadAttentionForward:
             (s_q_all, d, ((h_r, h_k), b_q)),
             stride=(d * h_r * h_k, 1, ((d, d * h_r), stride_b_q)),
         )
-        q = cute.make_tensor(q_iter + q_offset, q_layout)
+        q = cute.make_tensor(q_in.iterator, q_layout)
         # (s, d, ((h_r, h_k), b)), 0-stride for h_r to broadcast
         k_layout = cute.make_layout(
             (s_k_all, d, ((h_r, h_k), b_kv)),
             stride=(d * h_k, 1, ((0, d), stride_b_kv)),
         )
-        k = cute.make_tensor(k_iter + kv_offset, k_layout)
+        k = cute.make_tensor(k_in.iterator, k_layout)
         # (d, s, ((h_r, h_k), b)), 0-stride for h_r to broadcast
         v_layout = cute.make_layout(
             (d, s_k_all, ((h_r, h_k), b_kv)),
             stride=(1, d * h_k, ((0, d), stride_b_kv)),
         )
-        v = cute.make_tensor(v_iter + kv_offset, v_layout)
+        v = cute.make_tensor(v_in.iterator, v_layout)
         # (s, d, ((h_r, h_k), b))
         o_layout = cute.make_layout(
             (s_q, d, ((h_r, h_k), b_o)),
             stride=(d * h_r * h_k, 1, ((d, d * h_r), stride_b_o)),
         )
-        o = cute.make_tensor(o_iter + o_offset, o_layout)
+        o = cute.make_tensor(o_in.iterator + o_offset, o_layout)
 
         params = (
             cute.make_tensor(
-                params_iter,
+                params_in.iterator,
                 cute.make_layout(
                     self.fusion.params_shape,
                     stride=self.fusion.params_strides,

@@ -56,7 +56,6 @@ warnings.filterwarnings(
     "ignore",
     message="This loop is no longer unrolled and may cause performance regression",
 )
-warnings.filterwarnings("ignore", category=UserWarning)
 
 from .compat import (
     setmaxregister_decrease as _setmaxregister_decrease,
