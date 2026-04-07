@@ -389,6 +389,7 @@ def trtllm_batch_decode_mla(
 
     # Using a tiny threshold should give the same output as standard attention
     skip_softmax_threshold_scale_factor = 1e-30 if skips_softmax else None
+    should_check_lse = backend == "trtllm-gen"
 
     # Run decode-MLA
     output = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
@@ -407,10 +408,15 @@ def trtllm_batch_decode_mla(
         enable_pdl=enable_pdl,
         backend=backend,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
-        return_lse=True,
+        return_lse=should_check_lse,
     )
     # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
     # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
+    if should_check_lse:
+        output, lse = output
+        assert lse.shape == (batch_size * q_len_per_request, layer_dimensions.num_heads)
+        assert lse.dtype == torch.float32
+        assert torch.isfinite(lse).all()
     if backend == "trtllm-gen":
         output, lse = output
         assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
@@ -466,7 +472,11 @@ def trtllm_batch_decode_mla(
     ckv = kv_cache[..., : layer_dimensions.head_dimensions.kv_lora_rank]
     kpe = kv_cache[..., layer_dimensions.head_dimensions.kv_lora_rank :]
 
-    o_ref = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=False)
+    lse_ref = None
+    if should_check_lse:
+        o_ref, lse_ref = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=True)
+    else:
+        o_ref = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=False)
 
     # cute-dsl fp8 kernel outputs fp8; cast to bf16 to match trtllm-gen / reference
     if backend == "cute-dsl" and output.dtype == torch.float8_e4m3fn:
@@ -488,6 +498,8 @@ def trtllm_batch_decode_mla(
 
         try:
             torch.testing.assert_close(output, o_ref_view, rtol=rtol, atol=atol)
+            if lse_ref is not None:
+                torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
         except AssertionError as fa2_err:
             if backend == "cute-dsl":
                 # fa2 reference may diverge from cute-dsl in some configs;

@@ -566,6 +566,7 @@ def _test_trtllm_batch_prefill(
     )
 
     sm_scale = float(1.0 / (head_dim**0.5))
+    lse_ref = None
 
     # Build reference output
     plan_params = {
@@ -589,7 +590,7 @@ def _test_trtllm_batch_prefill(
             workspace_buffer_ref, kv_layout
         )
         wrapper_ref.plan(**plan_params)
-        output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
+        output_ref, lse_ref = wrapper_ref.run(ref_q, ref_kv_cache, return_lse=True)
     else:
         # Construct flat K/V via helper
         k_flat, v_flat, kv_indptr_tokens = flatten_paged_kv(
@@ -712,6 +713,13 @@ def _test_trtllm_batch_prefill(
             f"NVFP4 KV cache attention: cosine similarity {cos:.4f} < 0.86. "
             f"Block scale factors may be mismatched to FP4 data blocks."
         )
+
+    expected_lse_shape = (q_input.size(0), q_input.size(1))
+    assert lse.shape == expected_lse_shape
+    assert lse.dtype == torch.float32
+    assert torch.isfinite(lse).all()
+    if lse_ref is not None:
+        torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
 
     if (
         o_dtype != "nvfp4" and kv_dtype != "nvfp4" and uses_shared_paged_kv_idx
@@ -999,6 +1007,8 @@ def _test_trtllm_batch_decode(
     )
 
     sm_scale = float(1.0 / (head_dim**0.5))
+    should_check_lse = backend == "trtllm-gen"
+    lse_ref = None
 
     # Build reference output
     plan_params = {
@@ -1020,7 +1030,12 @@ def _test_trtllm_batch_decode(
                 workspace_buffer_ref, kv_layout, use_tensor_cores=True
             )
             wrapper_ref.plan(**plan_params)
-            output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
+            if should_check_lse:
+                output_ref, lse_ref = wrapper_ref.run(
+                    ref_q, ref_kv_cache, return_lse=True
+                )
+            else:
+                output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
 
         else:
             # speculative decoding test
@@ -1040,7 +1055,12 @@ def _test_trtllm_batch_decode(
                 }
             )
             wrapper_ref.plan(**plan_params_prefill)
-            output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
+            if should_check_lse:
+                output_ref, lse_ref = wrapper_ref.run(
+                    ref_q, ref_kv_cache, return_lse=True
+                )
+            else:
+                output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
     else:
         # Construct flat K/V via helper
         k_flat, v_flat, kv_indptr_tokens = flatten_paged_kv(
@@ -1119,8 +1139,10 @@ def _test_trtllm_batch_decode(
         skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         kv_cache_sf=kv_cache_sf_kernel,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
-        return_lse=True,
+        return_lse=should_check_lse,
     )
+    if should_check_lse:
+        output, lse = output
     if backend == "trtllm-gen":
         output, lse = output
         # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
@@ -1184,6 +1206,9 @@ def _test_trtllm_batch_decode(
             f"NVFP4 KV cache attention: cosine similarity {cos:.4f} < 0.86. "
             f"Block scale factors may be mismatched to FP4 data blocks."
         )
+    if lse_ref is not None:
+        assert lse is not None, "LSE should be returned when return_lse=True"
+        torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
 
     # Only test wrapper with trtllm-gen backend
     if (

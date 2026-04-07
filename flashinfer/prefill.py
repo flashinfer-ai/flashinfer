@@ -679,7 +679,6 @@ def get_batch_prefill_module(backend, *args):
         uses_shared_paged_kv_idx: bool = True,
     ) -> None:
         if backend == "trtllm-gen":
-            assert maybe_lse is None
             assert num_qo_heads is not None
             assert num_kv_heads is not None
             assert block_tables is not None
@@ -714,6 +713,7 @@ def get_batch_prefill_module(backend, *args):
                 value_block_scales=value_block_scales,
                 skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
                 uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+                lse=maybe_lse,
             )
         elif backend == "fa2":
             assert not is_float8(q)
@@ -4108,15 +4108,12 @@ def trtllm_batch_context_with_kv_cache(
         assert bmm2_scale.dtype == torch.float32
     _check_block_tables_shape(block_tables, uses_shared_paged_kv_idx)
     workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
-    if return_lse:
-        if lse is None:
-            lse = torch.empty(
-                query.size(0), query.size(1), dtype=torch.float32, device=query.device
-            )
-        else:
-            check_shape_dtype_device(
-                lse, (query.size(0), query.size(1)), torch.float32, query.device, "lse"
-            )
+    lse_shape = (query.size(0), query.size(1))
+    if lse is None:
+        if return_lse:
+            lse = torch.empty(lse_shape, dtype=torch.float32, device=query.device)
+    else:
+        check_shape_dtype_device(lse, lse_shape, torch.float32, query.device, "lse")
     run_func(
         out,
         out_scale_factor,

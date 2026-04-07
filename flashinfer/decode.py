@@ -1365,13 +1365,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
             rope_theta = 1e4
 
         if return_lse:
+            lse_shape = (q.size(0), q.size(1))
             if lse is None:
-                lse = torch.empty(
-                    (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
-                )
+                lse = torch.empty(lse_shape, dtype=torch.float32, device=q.device)
             else:
                 check_shape_dtype_device(
-                    lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
+                    lse, lse_shape, torch.float32, q.device, "lse"
                 )
 
         if out is None:
@@ -1964,19 +1963,12 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
             )
 
         if return_lse:
+            lse_shape = (q_nope.size(0), q_nope.size(1))
             if lse is None:
-                lse = torch.empty(
-                    (q_nope.size(0), q_nope.size(1)),
-                    dtype=torch.float32,
-                    device=device,
-                )
+                lse = torch.empty(lse_shape, dtype=torch.float32, device=device)
             else:
                 check_shape_dtype_device(
-                    lse,
-                    (q_nope.size(0), q_nope.size(1)),
-                    q_nope.dtype,
-                    q_nope.device,
-                    "lse",
+                    lse, lse_shape, q_nope.dtype, q_nope.device, "lse"
                 )
         self._cached_module.run(
             self._float_workspace_buffer,
@@ -2445,6 +2437,11 @@ def trtllm_batch_decode_with_kv_cache(
         backend = (
             "trtllm-gen" if get_compute_capability(query.device)[0] == 10 else "xqa"
         )
+    wants_lse = return_lse or lse is not None
+    if wants_lse and backend != "trtllm-gen":
+        raise ValueError(
+            "lse and return_lse are only supported by the trtllm-gen backend"
+        )
 
     if backend == "xqa":
         # xqa backend doesn't support nvfp4 output
@@ -2594,19 +2591,12 @@ def trtllm_batch_decode_with_kv_cache(
         _check_block_tables_shape(block_tables, uses_shared_paged_kv_idx)
 
         if return_lse:
+            lse_shape = (query.size(0), query.size(1))
             if lse is None:
-                lse = torch.empty(
-                    (query.size(0), query.size(1)),
-                    dtype=torch.float32,
-                    device=query.device,
-                )
+                lse = torch.empty(lse_shape, dtype=torch.float32, device=query.device)
             else:
                 check_shape_dtype_device(
-                    lse,
-                    (query.size(0), query.size(1)),
-                    torch.float32,
-                    query.device,
-                    "lse",
+                    lse, lse_shape, torch.float32, query.device, "lse"
                 )
 
         run_func(
