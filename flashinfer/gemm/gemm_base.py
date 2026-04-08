@@ -53,6 +53,7 @@ from ..jit.gemm import gen_gemm_sm100_module_cutlass_fp4
 from ..jit.gemm import gen_gemm_sm103_module_cutlass_fp4
 from ..jit.gemm import gen_gemm_sm100_module_cutlass_fp8
 from ..jit.gemm import gen_gemm_sm100_module_cutlass_mxfp8
+from ..jit.gemm import gen_gemm_sm120_module_cutlass_mxfp8
 from ..jit.gemm import gen_gemm_sm100_module_cutlass_bf16
 from ..jit.gemm import gen_trtllm_gen_gemm_module
 from ..jit.gemm import gen_tgv_gemm_sm10x_module
@@ -213,7 +214,7 @@ def _cutlass_mm_bf16_requirement(
     return True
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([80, 86, 89, 90, 100, 103])
 def _cudnn_mm_bf16_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -223,15 +224,6 @@ def _cudnn_mm_bf16_requirement(
     pdl: bool = False,
     backend: Literal["cudnn", "cutlass", "tgv", "auto"] = "cudnn",
 ):
-    if bias is not None:
-        raise ValueError(
-            "You cannot use the cuDNN backend with a bias. Use the TGV backend instead."
-        )
-    if pdl:
-        raise ValueError(
-            "The cuDNN backend does not support PDL. Use the TGV backend instead."
-        )
-
     _validate_bf16_output_dtype(out_dtype)
     _check_cudnn_availability()
 
@@ -307,16 +299,18 @@ def _heuristic_func_mm_bf16(
 ):
     heuristic_backends = []
     if bias is not None or pdl:
-        # cuDNN and CUTLASS don't support bias/pdl, only TGV does
+        # CUTLASS doesn't support bias/pdl, only TGV and cuDNN do
         if "tgv" in suitable_backends:
             heuristic_backends.append("tgv")
-    else:
         if "cudnn" in suitable_backends:
             heuristic_backends.append("cudnn")
+    else:
         if "cutlass" in suitable_backends:
             heuristic_backends.append("cutlass")
         if "tgv" in suitable_backends:
             heuristic_backends.append("tgv")
+        if "cudnn" in suitable_backends:
+            heuristic_backends.append("cudnn")
     return heuristic_backends
 
 
@@ -1657,7 +1651,8 @@ class UIDs(Enum):
     BLOCK_DESCALE_B_UID = 4
     A_SCALE_UID = 5
     B_SCALE_UID = 6
-    O_UID = 7
+    BIAS_UID = 7
+    O_UID = 8
 
 
 def _check_cudnn_availability():
@@ -2112,7 +2107,7 @@ def execute_cudnn_gemm_fp4_graph_override_shape(
 
     c_shape, c_stride = _get_bf16_3d_shape_stride(c_final)
 
-    if real_a_stride[2] != 1 or real_b_stride[1] != 1:
+    if real_a_stride[-1] != 1 or real_b_stride[-2] != 1:
         raise ValueError(
             f"a and b must be k-major (contiguous along the K dimension), "
             f"got a stride={tuple(real_a_stride)}, b stride={tuple(real_b_stride)}"
@@ -2670,8 +2665,23 @@ def _cudnn_gemm_fp8_runner():
     return CudnnFp8GemmRunner()
 
 
+def _get_3d_shape_stride_from_vector(vector: torch.Tensor, dim: int = 0):
+    """Expand 1d vector to 3d tensor for cuDNN"""
+    if vector.dim() != 1:
+        raise ValueError(f"Expected 1D vector, got {vector.dim()}D tensor")
+    n = vector.shape[0]
+    p = vector.stride(0)
+    shape = [1, 1, 1]
+    stride = [1, 1, 1]
+    shape[dim] = n
+    stride[dim] = p
+    return (tuple(shape), tuple(stride))
+
+
 def _get_bf16_3d_shape_stride(tensor: torch.Tensor):
     """Expand 2d tensor to 3d tensor for cuDNN"""
+    if tensor.dim() != 2 and tensor.dim() != 3:
+        raise ValueError(f"Expected 2D or 3D tensor, got {tensor.dim()}D tensor")
     shape = list(tensor.shape)
     stride = list(tensor.stride())
 
@@ -2690,6 +2700,9 @@ def build_cudnn_gemm_bf16_graph(
     b_stride,
     o_type,
     device,
+    bias_is_not_none,
+    bias_shape,
+    bias_stride,
     policy=None,
 ):
     _check_cudnn_availability()
@@ -2710,11 +2723,29 @@ def build_cudnn_gemm_bf16_graph(
             B=b_cudnn_tensor,
             compute_data_type=cudnn.data_type.FLOAT,
         )
-        c_cudnn_tensor.set_name("c").set_output(True).set_data_type(o_type)
+        c_cudnn_tensor.set_data_type(cudnn.data_type.FLOAT)
+
+        if bias_is_not_none:
+            bias_cudnn_tensor = graph.tensor(
+                name="bias",
+                dim=bias_shape,
+                stride=bias_stride,
+                data_type=cudnn.data_type.BFLOAT16,
+            )
+            c_final_cudnn_tensor = graph.add(
+                name="bias_add",
+                a=c_cudnn_tensor,
+                b=bias_cudnn_tensor,
+            )
+            bias_cudnn_tensor.set_uid(UIDs.BIAS_UID.value)
+        else:
+            c_final_cudnn_tensor = c_cudnn_tensor
+
+        c_final_cudnn_tensor.set_name("c_final").set_output(True).set_data_type(o_type)
 
         a_cudnn_tensor.set_uid(UIDs.A_UID.value)
         b_cudnn_tensor.set_uid(UIDs.B_UID.value)
-        c_cudnn_tensor.set_uid(UIDs.O_UID.value)
+        c_final_cudnn_tensor.set_uid(UIDs.O_UID.value)
 
         graph.validate()
         graph.build_operation_graph()
@@ -2725,12 +2756,22 @@ def build_cudnn_gemm_bf16_graph(
         return graph
 
 
-def execute_cudnn_gemm_bf16_graph(graph, a, b, c_final, workspace, tactic: int = -1):
-    variant_pack = {
-        UIDs.A_UID.value: a,
-        UIDs.B_UID.value: b,
-        UIDs.O_UID.value: c_final,
-    }
+def execute_cudnn_gemm_bf16_graph(
+    graph, a, b, bias, c_final, workspace, tactic: int = -1
+):
+    if bias is not None:
+        variant_pack = {
+            UIDs.A_UID.value: a,
+            UIDs.B_UID.value: b,
+            UIDs.BIAS_UID.value: bias,
+            UIDs.O_UID.value: c_final,
+        }
+    else:
+        variant_pack = {
+            UIDs.A_UID.value: a,
+            UIDs.B_UID.value: b,
+            UIDs.O_UID.value: c_final,
+        }
 
     stream = torch.cuda.current_stream(a.device)
     cudnn_handle = _get_cudnn_handle(a.device, stream)
@@ -2760,18 +2801,13 @@ def build_cudnn_gemm_bf16_graph_override_shape(
     k,
     o_type,
     device,
+    bias_is_not_none,
     cache_m: int = _OVERRIDE_SHAPE_CACHE_M,
     is_a_k_major: bool = True,
     is_b_k_major: bool = True,
     policy=None,
 ):
     """Build a cuDNN BF16 GEMM graph with override-shape support.
-
-    The graph is compiled once with ``cache_m`` as the M dimension.  At
-    execution time the caller supplies the *actual* M via
-    ``execute_cudnn_gemm_bf16_graph_override_shape``, which calls
-    ``execute_plan_at_index`` with ``override_shapes`` / ``override_strides``
-    so no rebuild is needed for different M values.
 
     Caching key is ``(batch, n, k, o_type, device, cache_m)`` — M is **not**
     part of the key.
@@ -2792,6 +2828,8 @@ def build_cudnn_gemm_bf16_graph_override_shape(
     a_stride = (cache_m * k, k, 1) if is_a_k_major else (cache_m * k, 1, cache_m)
     b_shape = (batch, k, n)
     b_stride = (k * n, 1, k) if is_b_k_major else (k * n, n, 1)
+    bias_shape = (1, 1, n)
+    bias_stride = (n, n, 1)
 
     stream = torch.cuda.current_stream(device)
     graph = cudnn.pygraph(
@@ -2820,11 +2858,29 @@ def build_cudnn_gemm_bf16_graph_override_shape(
         B=b_cudnn_tensor,
         compute_data_type=cudnn.data_type.FLOAT,
     )
-    c_cudnn_tensor.set_name("c").set_output(True).set_data_type(o_type)
+    c_cudnn_tensor.set_data_type(cudnn.data_type.FLOAT)
+
+    if bias_is_not_none:
+        bias_cudnn_tensor = graph.tensor(
+            name="bias",
+            dim=bias_shape,
+            stride=bias_stride,
+            data_type=cudnn.data_type.BFLOAT16,
+        )
+        c_final_cudnn_tensor = graph.add(
+            name="bias_add",
+            a=c_cudnn_tensor,
+            b=bias_cudnn_tensor,
+        )
+        bias_cudnn_tensor.set_uid(UIDs.BIAS_UID.value)
+    else:
+        c_final_cudnn_tensor = c_cudnn_tensor
+
+    c_final_cudnn_tensor.set_name("c_final").set_output(True).set_data_type(o_type)
 
     a_cudnn_tensor.set_uid(UIDs.A_UID.value)
     b_cudnn_tensor.set_uid(UIDs.B_UID.value)
-    c_cudnn_tensor.set_uid(UIDs.O_UID.value)
+    c_final_cudnn_tensor.set_uid(UIDs.O_UID.value)
 
     graph.validate()
     graph.build_operation_graph()
@@ -2836,7 +2892,7 @@ def build_cudnn_gemm_bf16_graph_override_shape(
 
 
 def execute_cudnn_gemm_bf16_graph_override_shape(
-    graph, a, b, c_final, workspace, tactic: int = 0
+    graph, a, b, bias, c_final, workspace, tactic: int = 0
 ):
     """Execute a BF16 GEMM cuDNN graph built with override-shape enabled.
 
@@ -2844,19 +2900,48 @@ def execute_cudnn_gemm_bf16_graph_override_shape(
     ``override_shapes`` / ``override_strides`` so a single compiled plan
     handles any M dimension without rebuilding.
     """
-    variant_pack = {
-        UIDs.A_UID.value: a,
-        UIDs.B_UID.value: b,
-        UIDs.O_UID.value: c_final,
-    }
-
     a_shape, a_stride = _get_bf16_3d_shape_stride(a)
     b_shape, b_stride = _get_bf16_3d_shape_stride(b)
     c_shape, c_stride = _get_bf16_3d_shape_stride(c_final)
 
-    override_uids = [UIDs.A_UID.value, UIDs.B_UID.value, UIDs.O_UID.value]
-    override_shapes = [list(a_shape), list(b_shape), list(c_shape)]
-    override_strides = [list(a_stride), list(b_stride), list(c_stride)]
+    if bias is not None:
+        variant_pack = {
+            UIDs.A_UID.value: a,
+            UIDs.B_UID.value: b,
+            UIDs.BIAS_UID.value: bias,
+            UIDs.O_UID.value: c_final,
+        }
+
+        bias_shape, bias_stride = _get_3d_shape_stride_from_vector(bias, 2)
+
+        override_uids = [
+            UIDs.A_UID.value,
+            UIDs.B_UID.value,
+            UIDs.BIAS_UID.value,
+            UIDs.O_UID.value,
+        ]
+        override_shapes = [
+            list(a_shape),
+            list(b_shape),
+            list(bias_shape),
+            list(c_shape),
+        ]
+        override_strides = [
+            list(a_stride),
+            list(b_stride),
+            list(bias_stride),
+            list(c_stride),
+        ]
+    else:
+        variant_pack = {
+            UIDs.A_UID.value: a,
+            UIDs.B_UID.value: b,
+            UIDs.O_UID.value: c_final,
+        }
+
+        override_uids = [UIDs.A_UID.value, UIDs.B_UID.value, UIDs.O_UID.value]
+        override_shapes = [list(a_shape), list(b_shape), list(c_shape)]
+        override_strides = [list(a_stride), list(b_stride), list(c_stride)]
 
     stream = torch.cuda.current_stream(a.device)
     cudnn_handle = _get_cudnn_handle(a.device, stream)
@@ -2881,6 +2966,7 @@ def _cudnn_gemm_bf16(
     workspace: torch.Tensor,
     a: torch.Tensor,
     b: torch.Tensor,
+    bias: torch.Tensor,
     out: torch.Tensor,
     tactic: int = -1,
 ):
@@ -2889,6 +2975,12 @@ def _cudnn_gemm_bf16(
     # This allows the same graph to work for both mm (2D) and bmm (3D)
     a_shape, a_stride = _get_bf16_3d_shape_stride(a)
     b_shape, b_stride = _get_bf16_3d_shape_stride(b)
+
+    if bias is not None:
+        bias_shape, bias_stride = _get_3d_shape_stride_from_vector(bias, 2)
+    else:
+        bias_shape = (1, 1, 1)
+        bias_stride = (1, 1, 1)
 
     if tactic == -1:
         policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
@@ -2902,17 +2994,20 @@ def _cudnn_gemm_bf16(
         b_stride,
         _torch_data_type_to_cudnn_data_type(out.dtype),
         a.device,
+        bias is not None,
+        bias_shape,
+        bias_stride,
         policy=policy,
     )
 
-    execute_cudnn_gemm_bf16_graph(graph, a, b, out, workspace, tactic=tactic)
+    execute_cudnn_gemm_bf16_graph(graph, a, b, bias, out, workspace, tactic=tactic)
     return out
 
 
 def _cudnn_gemm_bf16_runner():
     class CudnnBf16GemmRunner(TunableRunner):
         @staticmethod
-        def _get_override_graph(a, b, out):
+        def _get_override_graph(a, b, bias, out):
             a_shape, a_stride = _get_bf16_3d_shape_stride(a)
             b_shape, b_stride = _get_bf16_3d_shape_stride(b)
 
@@ -2934,6 +3029,7 @@ def _cudnn_gemm_bf16_runner():
                 k=k,
                 o_type=o_type,
                 device=a.device,
+                bias_is_not_none=bias is not None,
                 cache_m=cache_m,
                 is_a_k_major=is_a_k_major,
                 is_b_k_major=is_b_k_major,
@@ -2944,21 +3040,27 @@ def _cudnn_gemm_bf16_runner():
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
             # inputs layout: a, b, bias, pdl, out, workspace_buffer
             # out.dtype distinguishes bfloat16 / float16 / float32 output graphs
-            _, _, _, _, out, _ = inputs
-            return (out.dtype,)
+            _, _, bias, _, out, _ = inputs
+            return (out.dtype, bias is not None)
 
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
         ) -> List[int]:
-            a, b, _, _, out, _ = inputs
+            a, b, bias, _, out, _ = inputs
 
             if is_cudnn_override_shape_available():
-                graph = self._get_override_graph(a, b, out)
+                graph = self._get_override_graph(a, b, bias, out)
             else:
                 a_shape, a_stride = _get_bf16_3d_shape_stride(a)
                 b_shape, b_stride = _get_bf16_3d_shape_stride(b)
+
+                if bias is not None:
+                    bias_shape, bias_stride = _get_3d_shape_stride_from_vector(bias, 2)
+                else:
+                    bias_shape = (1, 1, 1)
+                    bias_stride = (1, 1, 1)
 
                 graph = build_cudnn_gemm_bf16_graph(
                     a_shape,
@@ -2967,6 +3069,9 @@ def _cudnn_gemm_bf16_runner():
                     b_stride,
                     _torch_data_type_to_cudnn_data_type(out.dtype),
                     a.device,
+                    bias is not None,
+                    bias_shape,
+                    bias_stride,
                     policy=cudnn.build_plan_policy.ALL,
                 )
 
@@ -2979,26 +3084,22 @@ def _cudnn_gemm_bf16_runner():
             do_preparation: bool = False,
             **kwargs,
         ) -> torch.Tensor:
-            a, b, bias, pdl, out, workspace_buffer = inputs
-
-            if bias is not None:
-                raise ValueError("cudnn bf16 gemm does not support bias.")
-            if pdl:
-                raise ValueError("cudnn bf16 gemm does not support pdl.")
+            a, b, bias, _, out, workspace_buffer = inputs
 
             if is_cudnn_override_shape_available():
-                graph = self._get_override_graph(a, b, out)
+                graph = self._get_override_graph(a, b, bias, out)
 
                 execute_cudnn_gemm_bf16_graph_override_shape(
                     graph,
                     a,
                     b,
+                    bias,
                     out,
                     workspace_buffer,
                     tactic=max(tactic, 0),
                 )
             else:
-                _cudnn_gemm_bf16(workspace_buffer, a, b, out, tactic=tactic)
+                _cudnn_gemm_bf16(workspace_buffer, a, b, bias, out, tactic=tactic)
 
             return out
 
@@ -3238,11 +3339,29 @@ def get_gemm_sm100_module_cutlass_mxfp8():
     )
 
 
+@functools.cache
+def _load_gemm_sm120_mxfp8_module():
+    """Load the raw TVM-FFI SM120 MXFP8 module (cached)."""
+    return gen_gemm_sm120_module_cutlass_mxfp8().build_and_load()
+
+
+@functools.cache
+def get_gemm_sm120_module_cutlass_mxfp8():
+    """Get the SM120/121 MXFP8 GEMM module."""
+    return _create_cutlass_mxfp8_gemm_module(
+        _load_gemm_sm120_mxfp8_module(),
+        "flashinfer::cutlass_mxfp8_gemm",
+        "cutlass_mxfp8_gemm",
+    )
+
+
 def get_cutlass_mxfp8_gemm_module(
     sm_major: int,
 ):
     if sm_major in [10, 11]:
         return get_gemm_sm100_module_cutlass_mxfp8()
+    elif sm_major in [12]:
+        return get_gemm_sm120_module_cutlass_mxfp8()
     else:
         raise ValueError(f"Unsupported SM major version: {sm_major}")
 
@@ -3365,7 +3484,7 @@ def _check_mm_mxfp8_problem_size(
     return True
 
 
-@supported_compute_capability([100, 103, 110])
+@supported_compute_capability([100, 103, 110, 120, 121])
 def _cutlass_gemm_mxfp8_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -3376,6 +3495,15 @@ def _cutlass_gemm_mxfp8_requirement(
     use_8x4_sf_layout: bool = True,
     backend: Literal["cutlass", "cute-dsl", "trtllm", "auto"] = "auto",
 ):
+    if is_sm12x_supported(a.device):
+        # SM120/121 CUTLASS MXFP8 only supports 1D swizzled scales (SfLayout.layout_128x4).
+        if use_8x4_sf_layout:
+            return False
+        if a_descale.ndim != 1 or b_descale.ndim != 1:
+            return False
+        # K and N must be multiples of 32.
+        if a.shape[1] % 32 != 0 or b.shape[1] % 32 != 0:
+            return False
     return True
 
 
@@ -3889,6 +4017,9 @@ def mm_mxfp8(
           (``mxfp8_quantize(..., is_sf_swizzled_layout=True)``).
         - The ``"trtllm"`` requires b to be quantized with 128x4 swizzle layout and shuffled.
           a can be quantized with either 128x4 or 8x4 layout (controlled by `use_8x4_sf_layout`).
+        - On SM12x GPUs, the ``"cutlass"`` backend only supports
+          1D swizzled scales (``SfLayout.layout_128x4``). Passing 2D linear scales will raise
+          an error. Use ``mxfp8_quantize(..., sf_swizzle_layout=SfLayout.layout_128x4)``.
 
     Returns
     -------
@@ -7160,6 +7291,22 @@ def _check_bmm_mxfp8_problem_size(
     return True
 
 
+@supported_compute_capability([120, 121])
+def _cutlass_bmm_mxfp8_requirement(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    dtype: torch.dtype,
+    out: Optional[torch.Tensor] = None,
+    backend: Literal["cudnn", "cutlass", "auto"] = "auto",
+):
+    # SM120/121 CUTLASS MXFP8 only supports 1D swizzled scales.
+    if A_scale.ndim != 1 or B_scale.ndim != 1:
+        return False
+    return True
+
+
 def _heuristic_func_bmm_mxfp8(
     suitable_backends: List[str],
     A: torch.Tensor,
@@ -7168,10 +7315,13 @@ def _heuristic_func_bmm_mxfp8(
     B_scale: torch.Tensor,
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
-    backend: Literal["cudnn"] = "cudnn",
+    backend: Literal["cudnn", "cutlass", "auto"] = "auto",
 ):
     heuristic_backends = []
-    if CUDNN_AVAILABLE and "cudnn" in suitable_backends:
+    major, _ = get_compute_capability(A.device)
+    if major == 12 and "cutlass" in suitable_backends:
+        heuristic_backends.append("cutlass")
+    elif CUDNN_AVAILABLE and "cudnn" in suitable_backends:
         heuristic_backends.append("cudnn")
     return heuristic_backends
 
@@ -7179,6 +7329,7 @@ def _heuristic_func_bmm_mxfp8(
 @backend_requirement(
     {
         "cudnn": _cudnn_bmm_mxfp8_requirement,
+        "cutlass": _cutlass_bmm_mxfp8_requirement,
     },
     common_check=_check_bmm_mxfp8_problem_size,
     heuristic_func=_heuristic_func_bmm_mxfp8,
@@ -7191,7 +7342,7 @@ def bmm_mxfp8(
     B_scale: torch.Tensor,
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
-    backend: Literal["cudnn"] = "cudnn",
+    backend: Literal["cudnn", "cutlass", "auto"] = "auto",
 ) -> torch.Tensor:
     r"""BMM MXFP8
 
@@ -7215,20 +7366,17 @@ def bmm_mxfp8(
     out: Optional[torch.Tensor]
         Out tensor, shape (b, m, n), bf16 or fp16, defaults to ``None``.
 
-    backend: Literal["cudnn"]
-        The backend to use for the operation. Defaults to ``"cudnn"``.
+    backend: Literal["cudnn", "cutlass", "auto"]
+        The backend to use for the operation. Defaults to ``"auto"``.
+        On SM120/121 GPUs, ``"auto"`` selects the CUTLASS backend; scales must
+        be 1D swizzled (``SfLayout.layout_128x4``). Pass ``B`` in the standard
+        shape ``[b, k, n]`` (column-major); the CUTLASS path transposes internally.
 
     Returns
     -------
     out: torch.Tensor
         Out tensor, shape (b, m, n), bf16 or fp16.
     """
-
-    if backend != "cudnn":
-        raise ValueError(f"Invalid backend: {backend}")
-
-    if not CUDNN_AVAILABLE:
-        raise ValueError("cudnn is not available")
 
     if out is None:
         out = torch.empty(
@@ -7241,5 +7389,28 @@ def bmm_mxfp8(
         "bmm_mxfp8_workspace", DEFAULT_WORKSPACE_SIZE, A.device
     )
 
-    mxfp8_gemm_sm100(A, B, A_scale, B_scale, out, workspace_buffer, ["cudnn"])
-    return out
+    resolved_backend = backend
+    if resolved_backend == "auto":
+        if not bmm_mxfp8.suitable_auto_backends:
+            raise ValueError("No suitable backend found for bmm_mxfp8")
+        resolved_backend = bmm_mxfp8.suitable_auto_backends[0]
+
+    if resolved_backend == "cutlass":
+        # SM120/121 CUTLASS path.
+        # B is [b, k, n] col-major; CUTLASS expects mat2 as [B, N, K].
+        # col-major [b, k, n] with strides (k*n, 1, k) → .transpose(1,2) → [b, n, k]
+        # with strides (k*n, k, 1), which is contiguous row-major [B, N, K].
+        B_cutlass = B.transpose(1, 2)
+        if not B_cutlass.is_contiguous():
+            B_cutlass = B_cutlass.contiguous()
+        raw_module = _load_gemm_sm120_mxfp8_module()
+        raw_module.mxfp8_gemm(A, B_cutlass, A_scale, B_scale, out, workspace_buffer, -1)
+        return out
+
+    if resolved_backend == "cudnn":
+        if not CUDNN_AVAILABLE:
+            raise ValueError("cudnn is not available")
+        mxfp8_gemm_sm100(A, B, A_scale, B_scale, out, workspace_buffer, ["cudnn"])
+        return out
+
+    raise ValueError(f"Invalid backend: {backend}")

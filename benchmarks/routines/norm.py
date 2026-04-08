@@ -768,6 +768,8 @@ def testRmsnormFp4quant(args):
             f"for {out_dtype} quantization."
         )
 
+    enable_pdl = args.enable_pdl
+
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
@@ -803,6 +805,7 @@ def testRmsnormFp4quant(args):
         print(f"[VVERBOSE] {block_size = }")
         print(f"[VVERBOSE] {use_global_scale = }")
         print(f"[VVERBOSE] {is_sf_swizzled_layout = }")
+        print(f"[VVERBOSE] {enable_pdl = }")
 
     # Warn user that refcheck is not supported for FP4 quantization fusion
     if run_refcheck:
@@ -824,6 +827,7 @@ def testRmsnormFp4quant(args):
                 block_size=block_size,
                 global_scale=global_scale,
                 is_sf_swizzled_layout=is_sf_swizzled_layout,
+                enable_pdl=enable_pdl,
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
@@ -929,6 +933,7 @@ def testAddRmsnormFp4quant(args):
     use_global_scale = args.use_global_scale
     is_sf_swizzled_layout = args.is_sf_swizzled_layout
     output_both_sf_layouts = args.output_both_sf_layouts
+    enable_pdl = args.enable_pdl
     is_cuda_graph_compatible = not args.no_cuda_graph
     run_refcheck = args.refcheck
     res = []
@@ -1010,6 +1015,7 @@ def testAddRmsnormFp4quant(args):
                 global_scale=global_scale,
                 is_sf_swizzled_layout=is_sf_swizzled_layout,
                 output_both_sf_layouts=output_both_sf_layouts,
+                enable_pdl=enable_pdl,
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
