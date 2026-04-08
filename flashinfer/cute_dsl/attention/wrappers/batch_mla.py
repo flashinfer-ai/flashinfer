@@ -44,6 +44,7 @@ import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32
 
+from flashinfer.api_logging import flashinfer_api
 from flashinfer.utils import device_support_pdl
 from flashinfer.cute_dsl.utils import (
     get_max_active_clusters,
@@ -323,6 +324,7 @@ class BatchMLADecodeCuteDSLWrapper:
                           softmax_scale=0.125)
     """
 
+    @flashinfer_api
     def __init__(self, workspace_buffer: torch.Tensor) -> None:
         assert workspace_buffer.dtype == torch.int8, (
             f"workspace_buffer must be torch.int8, got {workspace_buffer.dtype}"
@@ -331,6 +333,7 @@ class BatchMLADecodeCuteDSLWrapper:
         self._device = workspace_buffer.device
         self._compiled_kernel: Optional[Callable] = None
 
+    @flashinfer_api
     def plan(
         self,
         kv_lora_rank: int = 512,
@@ -410,6 +413,7 @@ class BatchMLADecodeCuteDSLWrapper:
             enable_pdl=self._enable_pdl,
         )
 
+    @flashinfer_api
     def run(
         self,
         q: torch.Tensor,
