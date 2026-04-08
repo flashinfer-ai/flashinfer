@@ -192,7 +192,7 @@ def chunk_gated_delta_rule_sm100(
         workspace = torch.empty(workspace_size, dtype=torch.int8, device=q.device)
         workspace_cute = from_dlpack(workspace, assumed_align=16)
 
-        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        stream = cuda.CUstream(torch.cuda.current_stream(device=q.device).cuda_stream)
 
         compiled = cute.compile(
             gdn,
@@ -221,13 +221,12 @@ def chunk_gated_delta_rule_sm100(
     workspace_size = GatedDeltaNetChunkedKernel.get_workspace_size(
         num_sm, B, HQ, HV, True
     )
-    if "workspace" not in cache or cache["workspace"].size(0) < workspace_size:
-        cache["workspace"] = torch.empty(
-            workspace_size, dtype=torch.int8, device=q.device
-        )
-    workspace = cache["workspace"]
+    ws_key = f"workspace_{q.device.index}"
+    if ws_key not in cache or cache[ws_key].size(0) < workspace_size:
+        cache[ws_key] = torch.empty(workspace_size, dtype=torch.int8, device=q.device)
+    workspace = cache[ws_key]
 
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    stream = cuda.CUstream(torch.cuda.current_stream(device=q.device).cuda_stream)
     compiled(
         q,
         k,

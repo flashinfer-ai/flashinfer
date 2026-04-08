@@ -25,21 +25,21 @@ import pytest
 
 from .reference_delta_rule import exclusive_cumsum, blockwise_delta_rule
 
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import is_sm90a_supported, is_sm100a_supported
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
 
 
 def _skip_if_unsupported():
     """Skip test if not SM90 or SM100 (with CUDA 13+) architecture."""
-    cc = get_compute_capability(torch.device("cuda"))
-    if cc[0] == 10:
+    device = torch.device("cuda")
+    if is_sm100a_supported(device):
         cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
         if cuda_major < 13:
             pytest.skip(
                 f"SM100 GDN prefill requires CUDA 13+, got {torch.version.cuda}"
             )
-    elif cc[0] != 9:
-        pytest.skip(f"GDN prefill requires SM90 or SM100, but got SM{cc[0]}{cc[1]}")
+    elif not is_sm90a_supported(device):
+        pytest.skip("GDN prefill requires SM90 or SM100")
 
 
 def _test_prefill_kernel(
