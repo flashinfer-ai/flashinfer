@@ -233,13 +233,7 @@ jobs:
           BUILD_NUMBER: ${{ github.run_number }}
 
       - name: Run Test
-        run: >
-          bash ci/bash.sh ${DOCKER_IMAGE} --no-gpu
-          -e SCCACHE_BUCKET "${{ secrets.SCCACHE_BUCKET }}"
-          -e AWS_ACCESS_KEY_ID "${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}"
-          -e AWS_SECRET_ACCESS_KEY "${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}"
-          -e SCCACHE_REGION "${{ secrets.SCCACHE_REGION }}"
-          ./scripts/task_test_jit_cache_package_build_import.sh
+        run: bash ci/bash.sh ${DOCKER_IMAGE} --no-gpu ./scripts/task_test_jit_cache_package_build_import.sh
 
   analyze-aot-failure:
     name: Analyze AOT Failure
@@ -320,13 +314,7 @@ jobs:
           BUILD_NUMBER: ${{ github.run_number }}
 
       - name: Run Test
-        run: >
-          bash ci/bash.sh ${DOCKER_IMAGE} --no-gpu
-          -e SCCACHE_BUCKET "${{ secrets.SCCACHE_BUCKET }}"
-          -e AWS_ACCESS_KEY_ID "${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}"
-          -e AWS_SECRET_ACCESS_KEY "${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}"
-          -e SCCACHE_REGION "${{ secrets.SCCACHE_REGION }}"
-          ./scripts/task_test_jit_cache_package_build_import.sh
+        run: bash ci/bash.sh ${DOCKER_IMAGE} --no-gpu ./scripts/task_test_jit_cache_package_build_import.sh
 
   # ---------------------------------------------------------------------------
   # GPU JIT Tests - SM86 (A10G) - Spot + On-Demand Rerun

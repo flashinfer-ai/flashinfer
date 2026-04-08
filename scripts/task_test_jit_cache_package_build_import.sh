@@ -95,29 +95,43 @@ pip install -e . || {
 }
 echo "✓ Flashinfer package installed successfully"
 
-# Optional: set up sccache for compiler caching with S3 backend
-if [ -n "${SCCACHE_BUCKET:-}" ]; then
-  echo ""
-  echo "========================================"
-  echo "Setting up sccache"
-  echo "========================================"
-  SCCACHE_VERSION="0.9.1"
-  SCCACHE_ARCH=$(uname -m)
-  curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl.tar.gz" | tar xz
-  mv "sccache-v${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl/sccache" /usr/local/bin/
-  rm -rf "sccache-v${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl"
-  chmod +x /usr/local/bin/sccache
+# Set up sccache for compiler caching with S3 backend.
+# Uses read-write mode when AWS credentials are available (nightly/release builds),
+# otherwise falls back to read-only anonymous access to the public cache bucket.
+SCCACHE_BUCKET="${SCCACHE_BUCKET:-flashinfer-sccache}"
+SCCACHE_REGION="${SCCACHE_REGION:-us-east-2}"
 
-  export SCCACHE_S3_KEY_PREFIX="cuda${CUDA_VERSION}-${SCCACHE_ARCH}"
-  export SCCACHE_IDLE_TIMEOUT=0
-  export FLASHINFER_NVCC_LAUNCHER="sccache"
-  export FLASHINFER_CXX_LAUNCHER="sccache"
+echo ""
+echo "========================================"
+echo "Setting up sccache"
+echo "========================================"
+SCCACHE_VERSION="0.9.1"
+SCCACHE_ARCH=$(uname -m)
+curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl.tar.gz" | tar xz
+mv "sccache-v${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl/sccache" /usr/local/bin/
+rm -rf "sccache-v${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl"
+chmod +x /usr/local/bin/sccache
 
-  sccache --start-server
-  echo "sccache version: $(sccache --version)"
-  echo "sccache bucket: ${SCCACHE_BUCKET}"
-  echo "sccache prefix: ${SCCACHE_S3_KEY_PREFIX}"
+export SCCACHE_BUCKET
+export SCCACHE_REGION
+export SCCACHE_S3_KEY_PREFIX="cuda${CUDA_VERSION}-${SCCACHE_ARCH}"
+export SCCACHE_IDLE_TIMEOUT=0
+export FLASHINFER_NVCC_LAUNCHER="sccache"
+export FLASHINFER_CXX_LAUNCHER="sccache"
+
+# If no AWS credentials, use anonymous read-only access to public bucket
+if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
+  export SCCACHE_S3_NO_CREDENTIALS=true
+  echo "sccache mode: read-only (public bucket, no credentials)"
+else
+  echo "sccache mode: read-write"
 fi
+
+sccache --start-server
+echo "sccache version: $(sccache --version)"
+echo "sccache bucket: ${SCCACHE_BUCKET}"
+echo "sccache region: ${SCCACHE_REGION}"
+echo "sccache prefix: ${SCCACHE_S3_KEY_PREFIX}"
 
 echo ""
 echo "========================================"
@@ -167,14 +181,11 @@ python scripts/verify_all_modules_compiled.py || {
 }
 echo "✓ All modules verified successfully"
 
-# Print sccache stats if enabled
-if [ -n "${SCCACHE_BUCKET:-}" ]; then
-  echo ""
-  echo "========================================"
-  echo "sccache stats"
-  echo "========================================"
-  sccache --show-stats
-fi
+echo ""
+echo "========================================"
+echo "sccache stats"
+echo "========================================"
+sccache --show-stats
 
 echo ""
 echo "========================================"
