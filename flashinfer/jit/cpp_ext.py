@@ -319,6 +319,9 @@ def run_ninja(workdir: Path, ninja_file: Path, verbose: bool) -> None:
         str(ninja_file.resolve()),
     ]
     num_workers = _get_num_workers()
+    # If Thor, force set it to = 2
+    if torch.cuda.get_device_capability(torch.device(device="cuda").index)[0] == 11:
+        num_workers = 2
     if num_workers is not None:
         command += ["-j", str(num_workers)]
 
