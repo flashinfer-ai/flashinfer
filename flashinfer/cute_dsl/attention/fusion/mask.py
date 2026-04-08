@@ -43,8 +43,9 @@ def get_trip_count(
         )
         result = cutlass.min(max_blocks_k, max_blocks_q)
     elif mask_type == MaskType.SLIDING_WINDOW_MASK:
-        first_q = blk_coord[0] * tile_shape[0]
-        last_q = (blk_coord[0] + 1) * tile_shape[0] - 1
+        qk_offset = seqlen_k - seqlen_q
+        first_q = blk_coord[0] * tile_shape[0] + qk_offset
+        last_q = (blk_coord[0] + 1) * tile_shape[0] - 1 + qk_offset
         min_kv = cutlass.max(0, first_q - window_left)
         max_kv = cutlass.min(seqlen_k - 1, last_q + window_left)
         start_block = min_kv // tile_shape[1]
@@ -86,7 +87,7 @@ def get_masked_trip_count(
         )
     elif mask_type == MaskType.SLIDING_WINDOW_MASK:
         trip_count = get_trip_count(
-            mask_type, window_left, blk_coord, tile_shape, seqlen_k
+            mask_type, window_left, blk_coord, tile_shape, seqlen_k, seqlen_q
         )
         result = trip_count
     return result
@@ -137,7 +138,8 @@ def get_kv_start_block_idx(
 ) -> Int32:
     """Starting KV block index (nonzero only for sliding window)."""
     if cutlass.const_expr(mask_type == MaskType.SLIDING_WINDOW_MASK):
-        first_q = blk_coord[0] * tile_shape[0]
+        qk_offset = seqlen_k - seqlen_q
+        first_q = blk_coord[0] * tile_shape[0] + qk_offset
         min_kv = cutlass.max(0, first_q - window_left)
         return min_kv // tile_shape[1]
     else:
@@ -168,8 +170,8 @@ def apply_mask(
         for i in range(cute.size(acc_qk)):
             pos = index_qk[i]
             if (
-                pos[1] - pos[0] > window_left
-                or pos[0] - pos[1] > window_left
+                pos[1] - pos[0] - causal_offset > window_left
+                or pos[0] + causal_offset - pos[1] > window_left
                 or pos[1] >= seqlen_k
             ):
                 acc_qk[i] = -Float32.inf

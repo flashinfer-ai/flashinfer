@@ -787,7 +787,11 @@ def attention_sliding_window_ref(
     window_left,
     sm_scale,
 ):
-    """Reference for symmetric sliding window: |kv_idx - q_idx| <= window_left."""
+    """Reference for symmetric sliding window: |kv_idx - (q_idx + offset)| <= window_left.
+
+    When qo_len != kv_len, Q positions are right-aligned to KV: q_idx maps
+    to kv position q_idx + (kv_len - qo_len).
+    """
     qo_len = q.shape[0] // batch_size
     kv_len = k.shape[0] // batch_size
     num_qo_heads = q.shape[1]
@@ -809,9 +813,10 @@ def attention_sliding_window_ref(
         * sm_scale
     )
 
+    qk_offset = kv_len - qo_len
     q_idx = torch.arange(qo_len, device=q.device).unsqueeze(1)
     k_idx = torch.arange(kv_len, device=q.device).unsqueeze(0)
-    mask = torch.abs(k_idx - q_idx) <= window_left
+    mask = torch.abs(k_idx - (q_idx + qk_offset)) <= window_left
     logits = logits.masked_fill(mask.unsqueeze(0).unsqueeze(0) == 0, float("-inf"))
 
     p = torch.softmax(logits, dim=-1)
@@ -834,9 +839,11 @@ SLIDING_WINDOW_PARAMS = [
     (1, 256, 256, 128),
     (9, 256, 256, 100),
     (1, 512, 512, 200),
-    # TODO: sliding window with qo_len != kv_len is not yet supported.
-    # The mask functions account for the Q/K offset but the coordinate
-    # identity tensor and loader need matching fixes. See PR #2805 triage.
+    # qo_len != kv_len (Q right-aligned to KV, as in append/prefill-with-cache)
+    (1, 128, 256, 64),
+    (1, 128, 512, 100),
+    (1, 256, 512, 128),
+    (3, 128, 384, 80),
 ]
 
 
