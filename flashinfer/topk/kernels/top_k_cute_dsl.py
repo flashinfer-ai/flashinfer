@@ -37,6 +37,36 @@ from .single_pass_multi_cta_radix_topk_cluster import (
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Cached buffer management (avoids per-call GPU malloc + memset/fill kernels)
+# ---------------------------------------------------------------------------
+_row_states_cache: dict = {}
+_row_states_initialized: dict = {}
+
+
+def _get_cached_row_states(key: str, num_sms: int, state_size: int, device: torch.device):
+    """Get or create cached row_states buffer. Zeroed once on first use."""
+    if key not in _row_states_cache or _row_states_cache[key].shape != (num_sms, state_size):
+        _row_states_cache[key] = torch.zeros(
+            (num_sms, state_size), dtype=torch.int32, device=device
+        )
+        _row_states_initialized[key] = True
+    return _row_states_cache[key]
+
+
+_seq_lens_cache: dict = {}
+
+
+def _get_cached_seq_lens(num_rows: int, num_cols: int, device: torch.device):
+    """Get or create cached seq_lens tensor. Reused when shape matches."""
+    key = (num_rows, num_cols, device)
+    if key not in _seq_lens_cache:
+        _seq_lens_cache[key] = torch.full(
+            (num_rows,), num_cols, dtype=torch.int32, device=device
+        )
+    return _seq_lens_cache[key]
+
+
 _TORCH_TO_CUTLASS_DTYPE = {
     torch.float16: cutlass.Float16,
     torch.bfloat16: cutlass.BFloat16,
@@ -344,17 +374,18 @@ def top_k_cute_dsl(
     )
 
     # --- Allocate buffers ---
-    num_groups = min(num_sms // ctas_per_group, num_rows)
-    if num_groups < 1:
-        num_groups = 1
-
-    row_states_2d = torch.zeros(
-        (num_sms, state_size), dtype=torch.int32, device=device
+    # row_states: kernel resets its slots at end-of-kernel, so we only zero once.
+    row_states_2d = _get_cached_row_states(
+        f"{kernel_variant}_{device}", num_sms, state_size, device
     )
-
-    seq_lens = torch.full((num_rows,), num_cols, dtype=torch.int32, device=device)
+    # seq_lens: constant per (num_rows, num_cols) — cache to avoid GPU fill kernel.
+    seq_lens = _get_cached_seq_lens(num_rows, num_cols, device)
+    # output: must be fresh each call (kernel writes into it).
     output_indices_i32 = torch.empty(
         (num_rows, k), dtype=torch.int32, device=device
+    )
+    output_values = torch.empty(
+        (num_rows, k), dtype=torch_dtype, device=device
     )
 
     # --- Execute kernel ---
@@ -363,12 +394,17 @@ def top_k_cute_dsl(
         row_states_2d,
         seq_lens,
         output_indices_i32,
-        None,  # output_values (return_val=False)
+        None,  # return_val=False
     )
 
     # --- Gather values and convert indices ---
-    indices = output_indices_i32.long()
-    values = torch.gather(input, dim=-1, index=indices)
+    indices = output_indices_i32.to(torch.int64)
+    if k <= num_cols:
+        values = torch.gather(input, dim=-1, index=indices)
+    else:
+        gather_indices = indices.clamp(min=0)
+        values = torch.gather(input, dim=-1, index=gather_indices)
+        values[indices < 0] = float("-inf")
 
     if sorted:
         values, sort_perm = torch.sort(values, dim=-1, descending=True)
