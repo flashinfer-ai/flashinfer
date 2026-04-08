@@ -2985,14 +2985,26 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 # fmha_v2 outperforms FA2 at longer sequences (S>=256) on SM120
                 # due to optimized tiled flash attention, but has higher CTA
                 # launch overhead for small sequences or high head counts.
-                # Requires MHA (PACKED_QKV layout needs matching head counts).
-                max_seq_in_batch = int(
-                    (kv_indptr_host[1:] - kv_indptr_host[:-1]).max().item()
+                # Only supports: MHA, standard symmetric head dims, no sliding
+                # window, no softcap, equal q/kv segments, NHD layout.
+                max_seq_in_batch = int(kv_len_arr.max().item())
+                max_qo_len = int(
+                    (qo_indptr_host[1:] - qo_indptr_host[:-1]).max().item()
+                )
+                same_qk_segments = torch.equal(qo_indptr_host, kv_indptr_host)
+                is_standard_shape = head_dim_qk == head_dim_vo and head_dim_qk in (
+                    64,
+                    128,
+                    256,
                 )
                 if (
                     self._backend == "fa2"
                     and num_qo_heads == num_kv_heads
+                    and same_qk_segments
+                    and is_standard_shape
                     and max_seq_in_batch >= 256
+                    and window_left < 0
+                    and logits_soft_cap == 0.0
                     and _should_use_fmha_v2_sm120(
                         self.device,
                         PosEncodingMode[pos_encoding_mode].value,
@@ -3016,13 +3028,15 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 use_fp16_qk_reduction,
             )
             if self._backend == "fmha_v2":
-                # fmha_v2 handles its own module loading in run()
-                # Cache plan data needed by trtllm_fmha_v2_prefill
-                self._fmha_v2_workspace = self._float_workspace_buffer
+                # Cache plan data for run() — avoid GPU-CPU sync in hot path
                 self._fmha_v2_seq_lens = kv_len_arr.to(torch.int32).to(
                     self.device, non_blocking=non_blocking
                 )
                 self._fmha_v2_batch_size = batch_size
+                self._fmha_v2_max_q_len = max_qo_len
+                self._fmha_v2_max_kv_len = max_seq_in_batch
+                self._fmha_v2_qo_indptr = self._qo_indptr_buf.to(torch.int32)
+                self._fmha_v2_kv_indptr = self._kv_indptr_buf.to(torch.int32)
             elif self._backend == "cutlass":
                 # insert qo_indptr.device to 9th position (0-indexed) of get_module_args
                 new_get_module_args = (
@@ -3247,35 +3261,33 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 "out",
             )
         if self._backend == "fmha_v2":
-            mask_mode = "causal" if self._causal else "padding"
-            max_q_len = int(
-                (self._qo_indptr_buf[1:] - self._qo_indptr_buf[:-1]).max().item()
-            )
-            max_kv_len = int(
-                (self._kv_indptr_buf[1:] - self._kv_indptr_buf[:-1]).max().item()
-            )
-            # fmha_v2 SM120 standard kernels use PACKED_QKV layout
+            if return_lse:
+                raise NotImplementedError(
+                    "return_lse is not yet supported for backend='fmha_v2'. "
+                    "TRT-LLM fmha_v2 softmax stats have a different format "
+                    "than the expected [total_q_tokens, num_heads] LSE tensor."
+                )
+            fmha_v2_mask_mode = "causal" if self._causal else "padding"
             # Pack separate q, k, v into [num_tokens, 3, num_heads, head_dim]
+            # for PACKED_QKV layout (the only layout with SM120 standard kernels)
             qkv_packed = torch.stack([q, k, v], dim=1)
-            result = trtllm_fmha_v2_prefill(
+            out = trtllm_fmha_v2_prefill(
                 qkv_packed,
                 input_layout="PACKED_QKV",
-                workspace_buffer=self._fmha_v2_workspace,
+                workspace_buffer=self._float_workspace_buffer,
                 seq_lens=self._fmha_v2_seq_lens,
-                max_q_len=max_q_len,
-                max_kv_len=max_kv_len,
+                max_q_len=self._fmha_v2_max_q_len,
+                max_kv_len=self._fmha_v2_max_kv_len,
                 bmm1_scale=sm_scale,
                 bmm2_scale=1.0,
                 batch_size=self._fmha_v2_batch_size,
-                cum_seq_lens_q=self._qo_indptr_buf.to(torch.int32),
-                cum_seq_lens_kv=self._kv_indptr_buf.to(torch.int32),
+                cum_seq_lens_q=self._fmha_v2_qo_indptr,
+                cum_seq_lens_kv=self._fmha_v2_kv_indptr,
                 out=out,
-                mask_mode=mask_mode,
-                save_softmax_stats=return_lse,
+                mask_mode=fmha_v2_mask_mode,
+                save_softmax_stats=False,
             )
-            if return_lse:
-                return result if isinstance(result, tuple) else (result, lse)
-            return result if not isinstance(result, tuple) else result[0]
+            return out
         elif self._backend == "cutlass":
             out, lse = fmha_varlen(
                 q,
