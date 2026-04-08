@@ -3487,8 +3487,7 @@ _SM100_DEFAULT_MMA_TILER_MN = (128, 128)
 _SM100_DEFAULT_CLUSTER_SHAPE_MN = (1, 1)
 
 
-# Tactic cache: (n, real_k, sm_count) -> dict[m_bucket -> tactic_tuple]
-# Keyed on (N, K, sm_count) to handle multi-GPU with different SM counts.
+# Tactic cache: (n, real_k) -> dict[m_bucket -> tactic_tuple]
 # Bounded by the number of unique (N, K) pairs in the model (typically < 50).
 _SM100_MM_FP4_TACTIC_CACHE: dict[tuple, dict] = {}
 
@@ -3614,7 +3613,7 @@ def _select_sm100_mm_fp4_cute_dsl_tactic(m, n, real_k, sm_count):
         Tactic tuple: (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch,
                         kernel_type, use_tma_store)
     """
-    cache_key = (n, real_k, sm_count)
+    cache_key = (n, real_k)
     bucket_tactics = _SM100_MM_FP4_TACTIC_CACHE.get(cache_key)
     if bucket_tactics is None:
         bucket_tactics = {
