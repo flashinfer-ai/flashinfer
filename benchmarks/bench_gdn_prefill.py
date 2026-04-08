@@ -19,19 +19,7 @@ import numpy as np
 import torch
 
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
-from flashinfer.gdn_kernels import chunk_gated_delta_rule_sm100, _has_blackwell_prefill
-from flashinfer.utils import is_sm100a_supported
 from flashinfer.testing.utils import bench_gpu_time
-
-
-def _is_sm100a():
-    """Check if we should use the SM100 and SM103 (Blackwell) path."""
-    cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
-    return (
-        _has_blackwell_prefill
-        and is_sm100a_supported(torch.device("cuda"))
-        and cuda_major >= 13
-    )
 
 
 def gdn_flops(
@@ -147,60 +135,35 @@ def bench_gdn_prefill(
         device="cuda",
     )
 
-    if _is_sm100a():
-        cu_seqlens = torch.arange(
-            0, batch_size * seq_len + 1, seq_len, dtype=torch.int32, device="cuda"
-        )
-        scale = 1.0 / (head_size**0.5)
-        alpha = (
-            torch.rand(total_seq_len, num_sab_heads, dtype=torch.float32, device="cuda")
-            if use_alpha
-            else torch.ones(
-                total_seq_len, num_sab_heads, dtype=torch.float32, device="cuda"
-            )
-        )
-        beta = (
-            torch.rand(total_seq_len, num_sab_heads, dtype=torch.float32, device="cuda")
-            if use_beta
-            else torch.ones(
-                total_seq_len, num_sab_heads, dtype=torch.float32, device="cuda"
-            )
-        )
+    cu_seqlens = torch.arange(
+        0, batch_size * seq_len + 1, seq_len, dtype=torch.int64, device="cuda"
+    )
+    alpha = (
+        torch.rand(total_seq_len, num_sab_heads, dtype=torch.float32, device="cuda")
+        if use_alpha
+        else None
+    )
+    beta = (
+        torch.rand(total_seq_len, num_sab_heads, dtype=torch.float32, device="cuda")
+        if use_beta
+        else None
+    )
 
-        def run():
-            chunk_gated_delta_rule_sm100(
-                q, k, v, alpha, beta, output, cu_seqlens, None, output_state, scale
-            )
-    else:
-        cu_seqlens = torch.arange(
-            0, batch_size * seq_len + 1, seq_len, dtype=torch.int64, device="cuda"
+    def run():
+        chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            alpha,
+            beta,
+            None,
+            None,
+            True,
+            cu_seqlens,
+            False,
+            output=output,
+            output_state=output_state,
         )
-        alpha = (
-            torch.rand(total_seq_len, num_sab_heads, dtype=torch.float32, device="cuda")
-            if use_alpha
-            else None
-        )
-        beta = (
-            torch.rand(total_seq_len, num_sab_heads, dtype=torch.float32, device="cuda")
-            if use_beta
-            else None
-        )
-
-        def run():
-            chunk_gated_delta_rule(
-                q,
-                k,
-                v,
-                alpha,
-                beta,
-                None,
-                None,
-                True,
-                cu_seqlens,
-                False,
-                output=output,
-                output_state=output_state,
-            )
 
     # Warmup
     run()
@@ -287,7 +250,8 @@ def main():
         return
 
     dtype = getattr(torch, args.dtype)
-    backend = "SM100 (Blackwell)" if _is_sm100a() else "SM90 (Hopper)"
+    device_name = torch.cuda.get_device_name(0)
+    backend = device_name
 
     print(
         f"GDN Prefill Benchmark [{backend}] (heads: q={args.num_q_heads}, k={args.num_k_heads}, v={args.num_v_heads}, d={args.head_size}, dtype={args.dtype})"

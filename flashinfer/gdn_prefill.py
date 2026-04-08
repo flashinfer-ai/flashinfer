@@ -26,8 +26,10 @@ from .utils import (
     register_custom_op,
     register_fake_op,
     get_device_sm_count,
+    is_sm100a_supported,
     _get_cache_buf,
 )
+from .gdn_kernels import chunk_gated_delta_rule_sm100, _has_blackwell_prefill
 
 
 @functools.cache
@@ -166,9 +168,11 @@ def chunk_gated_delta_rule(
     Note:
         - Supports GQA: ``num_q_heads > num_k_heads = num_v_heads``
         - Supports GVA: ``num_v_heads > num_q_heads = num_k_heads``
-        - The final state is in K-last layout ``[N, H, V, K]``.
-        - Requires SM90 (Hopper) architecture.
-        - For SM100 (Blackwell), use ``chunk_gated_delta_rule_sm100`` instead.
+        - The final state layout is ``[N, H, V, K]``.
+        - Requires SM90 (Hopper) or SM100 (Blackwell) architecture.
+        - SM100 path requires head_size == 128.
+        - SM100 path requires ``nvidia-cutlass-dsl[cu13]>=4.4.2``
+          (install via ``pip install flashinfer-python[cu13]``).
     """
     if checkpoint_every_n_tokens < 0:
         raise ValueError(
@@ -269,28 +273,65 @@ def chunk_gated_delta_rule(
     device = q.device
     _scale = scale if scale is not None else 1.0 / math.sqrt(head_size)
 
-    # SM90 Hopper path (C++ JIT kernel)
-    workspace_size = get_device_sm_count(device) * 128
-    workspace_buffer = _get_cache_buf("gdn_prefill_workspace", workspace_size, device)
+    _cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
+    if _has_blackwell_prefill and is_sm100a_supported(device) and _cuda_major >= 13:
+        # Blackwell SM100 and SM103 path (CuTe DSL kernel)
+        assert head_size == 128, (
+            f"Blackwell GDN prefill requires head_size=128, got {head_size}"
+        )
 
-    get_gdn_prefill_module().gdn_prefill(
-        output,
-        output_state,
-        q,
-        k,
-        v,
-        cu_seqlens.to(torch.int64),
-        initial_state,
-        g,
-        beta,
-        scale if scale is not None else 0.0,
-        workspace_buffer,
-        state_checkpoints,
-        checkpoint_cu_starts.to(torch.int64)
-        if checkpoint_cu_starts is not None
-        else None,
-        checkpoint_every_n_tokens,
-    )
+        _g = (
+            g
+            if g is not None
+            else torch.ones(
+                total_seq_len, num_sab_heads, dtype=torch.float32, device=device
+            )
+        )
+        _beta = (
+            beta
+            if beta is not None
+            else torch.ones(
+                total_seq_len, num_sab_heads, dtype=torch.float32, device=device
+            )
+        )
+
+        chunk_gated_delta_rule_sm100(
+            q,
+            k,
+            v,
+            _g,
+            _beta,
+            output,
+            cu_seqlens.to(torch.int32),
+            initial_state,
+            output_state if output_final_state else None,
+            _scale,
+        )
+    else:
+        # SM90 Hopper path (C++ JIT kernel)
+        workspace_size = get_device_sm_count(device) * 128
+        workspace_buffer = _get_cache_buf(
+            "gdn_prefill_workspace", workspace_size, device
+        )
+
+        get_gdn_prefill_module().gdn_prefill(
+            output,
+            output_state,
+            q,
+            k,
+            v,
+            cu_seqlens.to(torch.int64),
+            initial_state,
+            g,
+            beta,
+            scale if scale is not None else 0.0,
+            workspace_buffer,
+            state_checkpoints,
+            checkpoint_cu_starts.to(torch.int64)
+            if checkpoint_cu_starts is not None
+            else None,
+            checkpoint_every_n_tokens,
+        )
 
     if output_final_state:
         return output, output_state
