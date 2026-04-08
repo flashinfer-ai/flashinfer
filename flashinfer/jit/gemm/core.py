@@ -31,11 +31,29 @@ from ..core import (
     current_compilation_context,
 )
 from ..cubin_loader import (
-    # download_trtllm_headers,
     get_artifact,
     get_meta_hash,
+    ensure_symlink,
+    verify_symlinked_headers,
 )
 from ..utils import dtype_cutlass_map, filename_safe_dtype_map, write_if_different
+
+GEMM_EXPORT_HEADERS = [
+    "Enums.h",
+    "GemmInterface.h",
+    "GemmOptions.h",
+    "KernelParams.h",
+    "KernelParamsDecl.h",
+    "KernelTraits.h",
+    "TmaDescriptor.h",
+    "trtllm/gen/CommonUtils.h",
+    "trtllm/gen/CudaArchDecl.h",
+    "trtllm/gen/CudaKernelLauncher.h",
+    "trtllm/gen/DtypeDecl.h",
+    "trtllm/gen/MmaDecl.h",
+    "trtllm/gen/SfLayoutDecl.h",
+    "trtllm/gen/SparsityDecl.h",
+]
 
 
 def gen_gemm_module() -> JitSpec:
@@ -645,18 +663,22 @@ def gen_trtllm_gen_gemm_module() -> JitSpec:
     # make sure "flashinferMetaInfo.h" is downloaded or cached
     assert metainfo, f"{header_name}.h not found"
 
-    # TODO(jimmyzho): Re-enable after fixing trtllm-gen cubin generation issues.
-    # header_path = f"{include_path}/trtllmGen_gemm_export"
-    # header_dest_dir = (
-    #     jit_env.FLASHINFER_CUBIN_DIR
-    #     / "flashinfer"
-    #     / "trtllm"
-    #     / "gemm"
-    #     / "trtllmGen_gemm_export"
-    # )
-    # download_trtllm_headers(
-    #     "gemm", header_dest_dir, header_path, ArtifactPath.TRTLLM_GEN_GEMM, checksum
-    # )
+    # Fetch GEMM export headers via get_artifact() and symlink for C++ includes.
+    gemm_export_path = f"{include_path}/trtllmGen_gemm_export"
+    for header in GEMM_EXPORT_HEADERS:
+        h = get_artifact(
+            f"{gemm_export_path}/{header}", get_meta_hash(checksum, header)
+        )
+        assert h, f"{header} not found"
+    symlink_path = (
+        jit_env.FLASHINFER_CUBIN_DIR
+        / "flashinfer"
+        / "trtllm"
+        / "gemm"
+        / "trtllmGen_gemm_export"
+    )
+    ensure_symlink(symlink_path, jit_env.FLASHINFER_CUBIN_DIR / gemm_export_path)
+    verify_symlinked_headers(symlink_path, GEMM_EXPORT_HEADERS, checksum)
 
     return gen_jit_spec(
         "trtllm_gemm",
@@ -670,11 +692,9 @@ def gen_trtllm_gen_gemm_module() -> JitSpec:
             f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_GEMM}\\"',
         ]
         + sm100a_nvcc_flags,
-        # link "include" sub-directory in cache
         extra_include_paths=[
+            jit_env.FLASHINFER_CUBIN_DIR,
             jit_env.FLASHINFER_CUBIN_DIR / include_path,
-            # jit_env.FLASHINFER_CUBIN_DIR,
-            # jit_env.FLASHINFER_CUBIN_DIR / include_path,
         ],
     )
 
@@ -817,18 +837,22 @@ def gen_trtllm_low_latency_gemm_module() -> JitSpec:
     # make sure "flashinferMetaInfo.h" is downloaded or cached
     assert metainfo, f"{header_name}.h not found"
 
-    # TODO(jimmyzho): Re-enable after fixing trtllm-gen cubin generation issues.
-    # header_path = f"{include_path}/trtllmGen_gemm_export"
-    # header_dest_dir = (
-    #     jit_env.FLASHINFER_CUBIN_DIR
-    #     / "flashinfer"
-    #     / "trtllm"
-    #     / "gemm"
-    #     / "trtllmGen_gemm_export"
-    # )
-    # download_trtllm_headers(
-    #     "gemm", header_dest_dir, header_path, ArtifactPath.TRTLLM_GEN_GEMM, checksum
-    # )
+    # Fetch GEMM export headers via get_artifact() and symlink for C++ includes.
+    gemm_export_path = f"{include_path}/trtllmGen_gemm_export"
+    for header in GEMM_EXPORT_HEADERS:
+        h = get_artifact(
+            f"{gemm_export_path}/{header}", get_meta_hash(checksum, header)
+        )
+        assert h, f"{header} not found"
+    symlink_path = (
+        jit_env.FLASHINFER_CUBIN_DIR
+        / "flashinfer"
+        / "trtllm"
+        / "gemm"
+        / "trtllmGen_gemm_export"
+    )
+    ensure_symlink(symlink_path, jit_env.FLASHINFER_CUBIN_DIR / gemm_export_path)
+    verify_symlinked_headers(symlink_path, GEMM_EXPORT_HEADERS, checksum)
 
     return gen_jit_spec(
         "trtllm_low_latency_gemm",
@@ -843,9 +867,8 @@ def gen_trtllm_low_latency_gemm_module() -> JitSpec:
         ]
         + sm100a_nvcc_flags,
         extra_include_paths=[
-            jit_env.FLASHINFER_CUBIN_DIR / include_path
-            # jit_env.FLASHINFER_CUBIN_DIR,
-            # jit_env.FLASHINFER_CUBIN_DIR / include_path,
+            jit_env.FLASHINFER_CUBIN_DIR,
+            jit_env.FLASHINFER_CUBIN_DIR / include_path,
         ],
         extra_ldflags=["-lcuda"],
     )
