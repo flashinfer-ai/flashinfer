@@ -25,6 +25,7 @@ from .api_logging import flashinfer_api
 from .jit.topk import gen_topk_module
 from .utils import (
     _get_cache_buf,
+    get_compute_capability,
     register_custom_op,
     register_fake_op,
     get_shared_bytes_per_block_optin,
@@ -442,6 +443,12 @@ def topk_clusters_ragged_transform(logits, seq_lens, offsets, top_k, pdl=False):
     return indices
 
 
+def can_use_clusters_topk(device, deterministic):
+    algo = os.environ.get("FLASHINFER_TOPK_ALGO")
+    cap = get_compute_capability(device)
+    return (algo is None or algo == "clusters") and not deterministic and cap[0] == 10
+
+
 @flashinfer_api
 def top_k(
     input: torch.Tensor,
@@ -523,8 +530,7 @@ def top_k(
     batch_size = input.size(0)
     device = input.device
 
-    algo = os.environ.get("FLASHINFER_TOPK_ALGO")
-    if (algo is None or algo == "clusters") and not deterministic:
+    if can_use_clusters_topk(input.device, deterministic):
         indices, output_values = topk_clusters_exact(
             input, k, output_values=True, out_dtype=torch.int64
         )
@@ -643,12 +649,7 @@ def top_k_page_table_transform(
     device = input.device
     num_rows = input.size(0)
 
-    algo = os.environ.get("FLASHINFER_TOPK_ALGO")
-    if (
-        (algo is None or algo == "clusters")
-        and row_to_batch is None
-        and not deterministic
-    ):
+    if can_use_clusters_topk(input.device, deterministic) and row_to_batch is None:
         return topk_clusters_page_table_transform(input, lengths, src_page_table, k)
 
     # Allocate row_states buffer for multi-CTA path
@@ -739,8 +740,7 @@ def top_k_ragged_transform(
     device = input.device
     num_rows = input.size(0)
 
-    algo = os.environ.get("FLASHINFER_TOPK_ALGO")
-    if (algo is None or algo == "clusters") and not deterministic:
+    if can_use_clusters_topk(input.device, deterministic):
         return topk_clusters_ragged_transform(input, lengths, offsets, k)
 
     # Allocate row_states buffer for multi-CTA path
