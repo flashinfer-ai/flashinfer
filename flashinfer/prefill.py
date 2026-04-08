@@ -3086,6 +3086,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 )
                 if (
                     self._backend == "fa2"
+                    and self._kv_layout == "NHD"
                     and num_qo_heads == num_kv_heads
                     and same_qk_segments
                     and is_standard_shape
