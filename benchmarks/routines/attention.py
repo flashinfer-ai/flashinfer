@@ -112,6 +112,7 @@ def parse_attention_args(line, parser):
             "trtllm-gen",
             "trtllm-native",
             "trtllm-gen-native",  # Deprecated, will be removed in future
+            "cute-dsl",
         ],
         help="Kernel backends to test. Default: fa2. backend=auto is only supported for BatchDecodeWithPagedKVCacheWrapper and BatchPrefillWithPagedKVCacheWrapper.",
     )
@@ -580,7 +581,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
 
     ## Prepare dtype-specific data
     k_scale, v_scale = None, None
-    kv_block_scales = None
+    kv_cache_sf = None
     kv_cache_nvfp4 = None
     if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
         q = q.to(q_dtype)
@@ -589,8 +590,8 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         if q_dtype != torch.float8_e4m3fn:
             print("[ERROR] NVFP4 KV cache requires --q_dtype fp8_e4m3.")
             return res
-        kv_cache_nvfp4, kv_block_scales, k_scale, v_scale = (
-            nvfp4_quantize_paged_kv_cache(kv_cache[:, 0], kv_cache[:, 1])
+        kv_cache_nvfp4, kv_cache_sf, k_scale, v_scale = nvfp4_quantize_paged_kv_cache(
+            kv_cache[:, 0], kv_cache[:, 1]
         )
     elif kv_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
         k_data, v_data = torch.chunk(kv_cache, 2, dim=1)
@@ -625,7 +626,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 k_scale=k_scale,
                 v_scale=v_scale,
                 q_len_per_req=s_qo,
-                kv_block_scales=kv_block_scales,
+                kv_cache_sf=kv_cache_sf,
             )
         elif backend == "cudnn":
             return flashinfer.decode.cudnn_batch_decode_with_kv_cache(
@@ -656,7 +657,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 backend="auto",
                 q_len_per_req=s_qo,
                 mask=speculative_mask,
-                kv_block_scales=kv_block_scales,
+                kv_cache_sf=kv_cache_sf,
             )
         else:
             print(f"[ERROR] Backend {backend} not supported")
@@ -1126,7 +1127,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
     # Compute scales and convert to FP8 if needed (before creating wrappers)
     q_scale, k_scale, v_scale = None, None, None
     q_scale_tensor, k_scale_tensor, v_scale_tensor = None, None, None
-    kv_block_scales = None
+    kv_cache_sf = None
     o_data_type = q_dtype  # Default output dtype
     # Separate K/V caches for cuDNN (which requires separate tensors, not combined kv_cache)
     k_cache_cudnn, v_cache_cudnn = k_cache, v_cache
@@ -1138,8 +1139,8 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         # o_data_type stays as q_dtype (FP8 output)
 
     if is_nvfp4_kv:
-        kv_cache_nvfp4, kv_block_scales, k_scale, v_scale = (
-            nvfp4_quantize_paged_kv_cache(kv_cache[:, 0], kv_cache[:, 1])
+        kv_cache_nvfp4, kv_cache_sf, k_scale, v_scale = nvfp4_quantize_paged_kv_cache(
+            kv_cache[:, 0], kv_cache[:, 1]
         )
         kv_cache = kv_cache_nvfp4
     elif kv_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
@@ -1246,7 +1247,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
-                kv_block_scales=kv_block_scales,
+                kv_cache_sf=kv_cache_sf,
             )
         elif backend == "cudnn":
             # cuDNN uses wrapper API with tensor scales for FP8
@@ -1278,7 +1279,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 batch_size=batch_size,
                 cum_seq_lens_q=qo_indptr,
                 cum_seq_lens_kv=kv_indptr,
-                kv_block_scales=kv_block_scales,
+                kv_cache_sf=kv_cache_sf,
             )
         elif backend == "cudnn-native":
             # Direct cudnn_batch_prefill_with_kv_cache call (similar to trtllm-native)
@@ -2152,6 +2153,13 @@ def testBatchMLAPagedAttentionWrapper(args):
             remove_trtllm_native = True
         if remove_trtllm_native:
             backends.remove("trtllm-native")
+    if "cute-dsl" in backends:
+        remove_cute_dsl = False
+        if num_qo_heads < 128:
+            print("[INFO] cute-dsl MLA backend requires num_heads >= 128. Skipping.")
+            remove_cute_dsl = True
+        if remove_cute_dsl:
+            backends.remove("cute-dsl")
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
         return res
@@ -2336,6 +2344,21 @@ def testBatchMLAPagedAttentionWrapper(args):
                 max_seq_len=s_kv,
                 bmm1_scale=sm_scale,
                 bmm2_scale=1.0,
+            ).squeeze(1)
+        elif backend == "cute-dsl":
+            return flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(
+                query=q.unsqueeze(1),
+                kv_cache=kv_cache.unsqueeze(1),
+                workspace_buffer=workspace_buffer,
+                qk_nope_head_dim=128,
+                kv_lora_rank=head_dim_ckv,
+                qk_rope_head_dim=head_dim_kpe,
+                block_tables=block_tables,
+                seq_lens=actual_seq_lens_kv.flatten(),
+                max_seq_len=s_kv,
+                bmm1_scale=sm_scale,
+                bmm2_scale=1.0,
+                backend="cute-dsl",
             ).squeeze(1)
         else:
             print(f"[ERROR] Unsupported backend: {backend}")

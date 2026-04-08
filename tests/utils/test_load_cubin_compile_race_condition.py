@@ -27,7 +27,7 @@ def worker_process(temp_dir):
 
     Each process will:
     1. Set FLASHINFER_CUBIN_DIR environment variable
-    2. Import and call get_cubin with the same target file
+    2. Import and call get_artifact with the same target file
     3. Read the file from FLASHINFER_CUBIN_DIR
     4. Return the file content
     """
@@ -54,13 +54,13 @@ def worker_process(temp_dir):
 @pytest.mark.skip(reason="Incompatible with pytest due to multiprocessing usage.")
 def test_load_cubin_race_condition(num_iterations, num_processes):
     """
-    Test race condition when multiple processes concurrently call get_cubin
+    Test race condition when multiple processes concurrently call get_artifact
     for the same file.
 
     Test steps:
     1. Set up a temporary FLASHINFER_CUBIN_DIR
     2. Launch multiple processes
-    3. Each process calls get_cubin for the same target file
+    3. Each process calls get_artifact for the same target file
     4. Each process reads the downloaded file
     5. Verify all processes read the same content
     6. Repeat multiple times to increase chance of detecting race conditions

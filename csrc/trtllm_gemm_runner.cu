@@ -44,20 +44,20 @@ struct TrtllmGenGemmRunnerOptions {
 int64_t select_kernel_fp8(int32_t M, int32_t N, int32_t K,
                           const gemm::gemm::GemmInterface& interface) {
   static constexpr const char* KERNEL_NAME_HIGH_N_K_RATIO =
-      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_s6_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_"
+      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_s6_et64x8_m64x8x32_c1x1x1_16dp256b_rM_TN_"
       "transOut_"
       "noShflA_dsFp8_schPd2x2x1x3_sm100f";
 
   static constexpr const char* KERNEL_NAME_LOW_N_K_RATIO =
-      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_"
+      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_c1x1x1_16dp256b_rM_TN_"
       "transOut_noShflA_dsFp8_schedS_sm100f";
 
   static constexpr const char* KERNEL_NAME_LARGE_N =
-      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_"
+      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_c1x1x1_16dp256b_rM_TN_"
       "transOut_noShflA_dsFp8_schPd2x2x1x3_sm100f";
 
   static constexpr const char* KERNEL_NAME_DEFAULT =
-      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x16x128u2_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_"
+      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x16x128u2_s6_et64x16_m64x16x32_c1x1x1_16dp256b_rM_TN_"
       "transOut_noShflA_dsFp8_schedS_sm100f";
 
   double const n_k_ratio = static_cast<double>(N) / static_cast<double>(K);
@@ -124,10 +124,9 @@ class TrtllmGenGemmRunner {
     gemmData.mProblemDimensions.mM = mOptions.transposeMmaOutput ? n : m;
     gemmData.mProblemDimensions.mN = mOptions.transposeMmaOutput ? m : n;
     gemmData.mProblemDimensions.mK = k;
-    // TODO(jimmyzho) disable until fix trtllm-gen
-    // gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
-    // gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
-    // gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
+    gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
+    gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
+    gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
     gemmData.mProblemDimensions.mRank = 0;
     gemmData.mProblemDimensions.mWorldSize = 1;
 
@@ -148,10 +147,9 @@ class TrtllmGenGemmRunner {
     gemmData.mProblemDimensions.mM = mOptions.transposeMmaOutput ? n : m;
     gemmData.mProblemDimensions.mN = mOptions.transposeMmaOutput ? m : n;
     gemmData.mProblemDimensions.mK = k;
-    // TODO(jimmyzho) disable until fix trtllm-gen
-    // gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
-    // gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
-    // gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
+    gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
+    gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
+    gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
     gemmData.mProblemDimensions.mRank = 0;
     gemmData.mProblemDimensions.mWorldSize = 1;
 
@@ -204,10 +202,9 @@ class TrtllmGenGemmRunner {
     gemmData.mProblemDimensions.mM = mOptions.transposeMmaOutput ? n : m;
     gemmData.mProblemDimensions.mN = mOptions.transposeMmaOutput ? m : n;
     gemmData.mProblemDimensions.mK = k;
-    // TODO(jimmyzho) disable until fix trtllm-gen
-    // gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
-    // gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
-    // gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
+    gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
+    gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
+    gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
     gemmData.mProblemDimensions.mRank = 0;
     gemmData.mProblemDimensions.mWorldSize = 1;
 

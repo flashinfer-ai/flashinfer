@@ -34,7 +34,8 @@ def get_gdn_prefill_module():
     module = gen_gdn_prefill_sm90_module().build_and_load()
 
     @register_custom_op(
-        "flashinfer::gdn_prefill", mutates_args=("output", "output_state")
+        "flashinfer::gdn_prefill",
+        mutates_args=("output", "output_state", "state_checkpoints"),
     )
     def gdn_prefill(
         output: torch.Tensor,
@@ -48,6 +49,9 @@ def get_gdn_prefill_module():
         beta: Optional[torch.Tensor],
         scale: float,
         workspace_buffer: torch.Tensor,
+        state_checkpoints: Optional[torch.Tensor],
+        checkpoint_cu_starts: Optional[torch.Tensor],
+        checkpoint_every_n_tokens: int,
     ) -> None:
         module.gdn_prefill(
             output,
@@ -61,6 +65,9 @@ def get_gdn_prefill_module():
             beta,
             scale,
             workspace_buffer,
+            state_checkpoints,
+            checkpoint_cu_starts,
+            checkpoint_every_n_tokens,
         )
 
     @register_fake_op("flashinfer::gdn_prefill")
@@ -76,6 +83,9 @@ def get_gdn_prefill_module():
         beta: Optional[torch.Tensor],
         scale: float,
         workspace_buffer: torch.Tensor,
+        state_checkpoints: Optional[torch.Tensor],
+        checkpoint_cu_starts: Optional[torch.Tensor],
+        checkpoint_every_n_tokens: int,
     ) -> None:
         pass
 
@@ -96,6 +106,9 @@ def chunk_gated_delta_rule(
     use_qk_l2norm_in_kernel: bool = False,
     output: Optional[torch.Tensor] = None,
     output_state: Optional[torch.Tensor] = None,
+    state_checkpoints: Optional[torch.Tensor] = None,
+    checkpoint_cu_starts: Optional[torch.Tensor] = None,
+    checkpoint_every_n_tokens: int = 0,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Chunked Gated Delta Rule (GDN) attention for prefill.
 
@@ -155,6 +168,30 @@ def chunk_gated_delta_rule(
         - The final state is in k-last layout ``[N, H, V, K]``.
         - Requires SM90 (Hopper) architecture.
     """
+    if checkpoint_every_n_tokens < 0:
+        raise ValueError(
+            f"checkpoint_every_n_tokens must be non-negative, "
+            f"got {checkpoint_every_n_tokens}"
+        )
+    if checkpoint_every_n_tokens > 0:
+        if checkpoint_every_n_tokens % 64 != 0:
+            raise ValueError(
+                f"checkpoint_every_n_tokens must be a multiple of the chunk size (64), "
+                f"got {checkpoint_every_n_tokens}"
+            )
+        if state_checkpoints is None or checkpoint_cu_starts is None:
+            raise ValueError(
+                "state_checkpoints and checkpoint_cu_starts must both be provided "
+                "when checkpoint_every_n_tokens > 0"
+            )
+    if checkpoint_every_n_tokens == 0 and (
+        state_checkpoints is not None or checkpoint_cu_starts is not None
+    ):
+        raise ValueError(
+            "state_checkpoints and checkpoint_cu_starts must be None "
+            "when checkpoint_every_n_tokens == 0"
+        )
+
     assert cu_seqlens is not None, "cu_seqlens is required for varlen mode"
 
     num_seqs = cu_seqlens.size(0) - 1
@@ -164,6 +201,45 @@ def chunk_gated_delta_rule(
     head_size = q.size(2)
     num_o_heads = max(num_q_heads, num_v_heads)
     num_sab_heads = num_o_heads
+
+    if checkpoint_every_n_tokens > 0:
+        assert state_checkpoints is not None and checkpoint_cu_starts is not None
+        if state_checkpoints.dtype != torch.float32:
+            raise ValueError(
+                f"state_checkpoints must be float32, got {state_checkpoints.dtype}"
+            )
+        if state_checkpoints.ndim != 4:
+            raise ValueError(
+                f"state_checkpoints must be 4D "
+                f"[total_checkpoints, num_sab_heads, head_size, head_size], "
+                f"got {state_checkpoints.ndim}D"
+            )
+        if checkpoint_cu_starts.dtype != torch.int64:
+            raise ValueError(
+                f"checkpoint_cu_starts must be int64, got {checkpoint_cu_starts.dtype}"
+            )
+        if checkpoint_cu_starts.ndim != 1:
+            raise ValueError(
+                f"checkpoint_cu_starts must be 1D [num_seqs + 1], "
+                f"got {checkpoint_cu_starts.ndim}D"
+            )
+        if checkpoint_cu_starts.size(0) != num_seqs + 1:
+            raise ValueError(
+                f"checkpoint_cu_starts must have {num_seqs + 1} elements, "
+                f"got {checkpoint_cu_starts.size(0)}"
+            )
+        expected_shape = (
+            state_checkpoints.size(0),
+            num_sab_heads,
+            head_size,
+            head_size,
+        )
+        if tuple(state_checkpoints.shape[1:]) != expected_shape[1:]:
+            raise ValueError(
+                f"state_checkpoints shape mismatch: expected "
+                f"[*, {num_sab_heads}, {head_size}, {head_size}], "
+                f"got {list(state_checkpoints.shape)}"
+            )
 
     # Allocate output if not provided
     if output is None:
@@ -205,6 +281,11 @@ def chunk_gated_delta_rule(
         beta,
         scale if scale is not None else 0.0,
         workspace_buffer,
+        state_checkpoints,
+        checkpoint_cu_starts.to(torch.int64)
+        if checkpoint_cu_starts is not None
+        else None,
+        checkpoint_every_n_tokens,
     )
 
     if output_final_state:

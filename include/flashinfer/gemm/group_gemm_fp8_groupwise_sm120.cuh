@@ -254,7 +254,8 @@ cudaError_t CutlassFP8GroupwiseScaledGroupGEMMSM120(
 
   CUTLASS_CHECK(gemm.can_implement(arguments));
   CUTLASS_CHECK(gemm.initialize(arguments, workspace_ptr));
-  CUTLASS_CHECK(gemm.run(stream, /*cuda_adapter=*/nullptr, /*launch_with_pdl=*/true));
+  // Disable PDL since GDC flag is not set
+  CUTLASS_CHECK(gemm.run(stream, /*cuda_adapter=*/nullptr, /*launch_with_pdl=*/false));
   return cudaSuccess;
 #else
   return cudaErrorNotSupported;

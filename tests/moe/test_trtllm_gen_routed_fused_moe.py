@@ -375,7 +375,10 @@ def test_trtllm_gen_fp8_routed_fused_moe(
     )
 
     # Run with pre-computed routing (packed format)
-    output = trtllm_fp8_block_scale_routed_moe(
+    output = torch.empty(
+        num_tokens, hidden_size, dtype=torch.bfloat16, device=hidden_states.device
+    )
+    trtllm_fp8_block_scale_routed_moe(
         topk_ids=packed_topk_ids,
         routing_bias=None,
         hidden_states=hidden_states,
@@ -396,7 +399,9 @@ def test_trtllm_gen_fp8_routed_fused_moe(
         use_shuffled_weight=False,
         weight_layout=0,
         enable_pdl=enable_pdl,
-    ).to(torch.float)
+        output=output,
+    )
+    output = output.to(torch.float)
 
     mask = torch.isclose(output, reference_output, rtol=1e-2, atol=1e-2)
 
