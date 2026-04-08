@@ -566,7 +566,7 @@ def is_sm120f_supported(device: torch.device) -> bool:
 
 def is_sm121a_supported(device: torch.device) -> bool:
     major, minor = get_compute_capability(device)
-    return major == 12 and minor == 1 and version_at_least(torch.version.cuda, "13.0")
+    return major == 12 and minor == 1 and version_at_least(torch.version.cuda, "12.9")
 
 
 def is_sm12x_supported(device: torch.device) -> bool:
@@ -577,12 +577,12 @@ def is_sm12x_supported(device: torch.device) -> bool:
     pattern used by ``is_sm100a_supported`` (``major == 10``).
 
     The minimum CUDA version depends on the minor variant:
-    SM120a requires CUDA 12.8, SM121a requires CUDA 13.0.
+    SM120a requires CUDA 12.8, SM121a requires CUDA 12.9.
     """
     major, minor = get_compute_capability(device)
     if major != 12:
         return False
-    min_cuda = "13.0" if minor >= 1 else "12.8"
+    min_cuda = "12.9" if minor >= 1 else "12.8"
     return version_at_least(torch.version.cuda, min_cuda)
 
 
@@ -601,6 +601,31 @@ def is_cvt_rs_supported(device: torch.device = None) -> bool:
 
 def determine_mla_backend(device: torch.device) -> str:
     return "fa3" if is_sm90a_supported(device) else "fa2"
+
+
+def _check_block_tables_shape(
+    block_tables: torch.Tensor,
+    uses_shared_paged_kv_idx: bool,
+) -> None:
+    """Validate ``block_tables`` rank against the paged KV index layout.
+
+    Shared layout (``uses_shared_paged_kv_idx=True``) expects a 2-D tensor
+    ``[batch_size, max_num_pages_per_seq]``.  Separate layout expects a 3-D
+    tensor ``[batch_size, 2, max_num_pages_per_seq]`` where dim1 distinguishes
+    K (0) and V (1) page indices.
+    """
+    expected_ndim = 2 if uses_shared_paged_kv_idx else 3
+    if block_tables.ndim != expected_ndim:
+        layout = "shared" if uses_shared_paged_kv_idx else "separate"
+        raise ValueError(
+            f"block_tables must be {expected_ndim}D for {layout} paged KV layout, "
+            f"got ndim={block_tables.ndim}"
+        )
+    if not uses_shared_paged_kv_idx and block_tables.shape[1] != 2:
+        raise ValueError(
+            f"block_tables must have shape[1]==2 for separate KV indices, "
+            f"got shape={block_tables.shape}"
+        )
 
 
 def check_shape_dtype_device(
@@ -815,16 +840,14 @@ def get_shuffle_matrix_a_row_indices(
     # row_indices[new_row] = old_row
     # so row_indices is an array of size M telling us from which old_row
     # the new_row should be taken.
+    # Vectorized: avoids a slow Python for-loop over M rows (CPU contention
+    # when many ranks call this simultaneously on large weight matrices).
+    old_rows = torch.arange(M, dtype=torch.long)
+    row_map_tensor = torch.tensor(row_map, dtype=torch.long)
+    mapped_rows = row_map_tensor[old_rows % shuffle_block_size]
+    new_rows = (old_rows // shuffle_block_size) * shuffle_block_size + mapped_rows
     row_indices = torch.empty(M, dtype=torch.long)
-
-    for old_row in range(M):
-        block_idx = old_row // shuffle_block_size
-        row_in_block = old_row % shuffle_block_size
-        mapped_row_in_block = row_map[row_in_block]
-
-        new_row = block_idx * shuffle_block_size + mapped_row_in_block
-
-        row_indices[new_row] = old_row
+    row_indices[new_rows] = old_rows
 
     return row_indices
 

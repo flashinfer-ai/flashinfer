@@ -28,6 +28,7 @@ enum class SSUAlgorithm : int32_t {
   kSimple = 1,
   kVertical = 2,
   kHorizontal = 3,
+  kAsyncHorizontal = 4,
 };
 
 inline const char* SSUAlgorithmToString(SSUAlgorithm algo) {
@@ -40,6 +41,8 @@ inline const char* SSUAlgorithmToString(SSUAlgorithm algo) {
       return "Vertical";
     case SSUAlgorithm::kHorizontal:
       return "Horizontal";
+    case SSUAlgorithm::kAsyncHorizontal:
+      return "AsyncHorizontal";
     default:
       return "Unknown";
   }
@@ -66,6 +69,14 @@ struct SelectiveStateUpdateParams {
   // Block-scale decode factors for quantized state: float32 (state_cache_size, nheads, dim, 1)
   void* __restrict__ state_scale{nullptr};
 
+  void* __restrict__ dst_state_batch_indices{nullptr};
+
+  // stride_T=0 means 1D (broadcast), stride_T>0 means 2D indexing
+  int64_t state_batch_indices_stride_batch{1};
+  int64_t state_batch_indices_stride_T{0};
+  int64_t dst_state_batch_indices_stride_batch{0};
+  int64_t dst_state_batch_indices_stride_T{0};
+
   bool dt_softplus{false};
   bool update_state{true};
 
@@ -86,16 +97,19 @@ struct SelectiveStateMTPParams : public SelectiveStateUpdateParams {
       z_stride_mtp{};
   int64_t intermediate_state_stride_batch{}, intermediate_state_scales_stride_batch{};
   void* __restrict__ intermediate_states{
-      nullptr};  // state_t: (ntokens_mtp, state_cache_size, nheads, dim, dstate)
+      nullptr};  // state_t: (icache_size, cache_steps, nheads, dim, dstate)
   void* __restrict__ intermediate_state_indices{nullptr};  // (batch,)
   void* __restrict__ intermediate_state_scales{
       nullptr};  // float: (batch, cache_steps, nheads, dim)
+
+  void* __restrict__ cu_seqlens{nullptr};           // (n_sequences + 1,)
+  void* __restrict__ num_accepted_tokens{nullptr};  // (n_sequences,)
 };
 }  // namespace mtp
 
 }  // namespace flashinfer::mamba
 
-#include "kernel_selective_state_update_mtp.cuh"
+#include "invoke_selective_state_update_mtp.cuh"
 #include "kernel_selective_state_update_stp.cuh"
 
 #endif  // FLASHINFER_MAMBA_SELECTIVE_STATE_UPDATE_CUH_

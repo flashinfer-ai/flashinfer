@@ -54,6 +54,7 @@ from .utils import (
     MaskMode,
     PosEncodingMode,
     TensorLayout,
+    _check_block_tables_shape,
     _check_cached_qkv_data_type,
     _check_kv_layout,
     _check_pos_encoding_mode,
@@ -998,7 +999,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if self._backend == "trtllm-gen":
             assert logits_soft_cap == 0.0
             self._max_kv_len = max(kv_lens_arr_host).item()
-            self._kv_lens_buffer[: len(kv_lens_arr_host)].copy_(
+            required_size = len(kv_lens_arr_host)
+            if required_size > self._kv_lens_buffer.shape[0]:
+                self._kv_lens_buffer = torch.empty(
+                    (required_size,), dtype=torch.int32, device=self.device
+                )
+            self._kv_lens_buffer[:required_size].copy_(
                 kv_lens_arr_host, non_blocking=non_blocking
             )
             if self._block_tables is None:
@@ -1177,6 +1183,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         sinks: Optional[torch.Tensor] = None,
         q_len_per_req: Optional[int] = 1,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        kv_block_scales: Optional[
+            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        ] = None,
     ) -> torch.Tensor: ...
 
     @overload
@@ -1196,6 +1205,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         sinks: Optional[torch.Tensor] = None,
         q_len_per_req: Optional[int] = 1,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        kv_block_scales: Optional[
+            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        ] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     @flashinfer_api
@@ -1215,6 +1227,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         sinks: Optional[torch.Tensor] = None,
         q_len_per_req: Optional[int] = 1,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        kv_block_scales: Optional[
+            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        ] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch decode attention between query and paged kv cache.
 
@@ -1273,6 +1288,15 @@ class BatchDecodeWithPagedKVCacheWrapper:
             enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
 
+        # Unpack kv_block_scales
+        key_block_scales = None
+        value_block_scales = None
+        if kv_block_scales is not None:
+            if isinstance(kv_block_scales, tuple):
+                key_block_scales, value_block_scales = kv_block_scales
+            else:
+                key_block_scales, value_block_scales = kv_block_scales.unbind(dim=1)
+
         if self._kv_layout == "NHD":
             page_size = k_cache.shape[1]
         else:
@@ -1280,12 +1304,29 @@ class BatchDecodeWithPagedKVCacheWrapper:
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
         )
+        actual_batch_size = self._paged_kv_last_page_len_buf.size(0)
+        expected_q_len = actual_batch_size * q_len_per_req
+        if q.size(0) != expected_q_len:
+            raise ValueError(
+                f"q.shape[0] ({q.size(0)}) does not match batch_size * q_len_per_req "
+                f"({actual_batch_size} * {q_len_per_req} = {expected_q_len}). "
+                f"For batch decode, q must have shape [batch_size * q_len_per_req, num_heads, head_dim]."
+            )
 
         # Convert NHD layout to HND for trtllm-gen backend
         if self._backend == "trtllm-gen" and self._kv_layout == "NHD":
-            # For NHD: [..., N, H, D] -> HND: [..., H, N, D]
             k_cache = k_cache.transpose(-3, -2)
             v_cache = v_cache.transpose(-3, -2)
+            if key_block_scales is not None:
+                print(
+                    "[WARNING] NVFP4 KV cache with NHD layout will be converted to HND, "
+                    "incurring extra transpose and contiguous copy overhead. "
+                    "Use kv_layout='HND' for better performance."
+                )
+                k_cache = k_cache.contiguous()
+                v_cache = v_cache.contiguous()
+                key_block_scales = key_block_scales.transpose(-3, -2).contiguous()
+                value_block_scales = value_block_scales.transpose(-3, -2).contiguous()
 
         pos_encoding_mode = self._pos_encoding_mode
         window_left = self._window_left if window_left is None else window_left
@@ -1324,8 +1365,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         if out is None:
             out_dtype = getattr(self, "_cached_o_data_type", None) or q.dtype
+            # For NVFP4 KV (uint8 packed), v_cache last dim is head_dim//2;
+            # use q's head_dim for output instead
+            out_head_dim = (
+                q.shape[-1] if kv_block_scales is not None else v_cache.shape[-1]
+            )
             out = torch.empty(
-                q.shape[:-1] + v_cache.shape[-1:], dtype=out_dtype, device=q.device
+                q.shape[:-1] + (out_head_dim,), dtype=out_dtype, device=q.device
             )
         else:
             out_dtype = getattr(self, "_cached_o_data_type", None) or q.dtype
@@ -1389,7 +1435,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     page_size,
                     self._max_kv_len,
                     sinks,
+                    key_block_scales,
+                    value_block_scales,
                     skip_softmax_threshold_scale_factor,
+                    True,  # uses_shared_paged_kv_idx
                 ]
 
             self._cached_module.paged_run(*run_args)
@@ -1839,6 +1888,18 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
             * logsumexp of attention scores, shape: ``[batch_size, num_qo_heads]``.
         """
 
+        expected_batch_size = self._paged_kv_last_page_len_buf.size(0)
+        if q_nope.size(0) != expected_batch_size:
+            raise ValueError(
+                f"q_nope.shape[0] ({q_nope.size(0)}) does not match batch_size ({expected_batch_size}). "
+                f"For MLA batch decode, q_nope must have shape [batch_size, num_heads, head_dim]."
+            )
+        if q_pe.size(0) != expected_batch_size:
+            raise ValueError(
+                f"q_pe.shape[0] ({q_pe.size(0)}) does not match batch_size ({expected_batch_size}). "
+                f"For MLA batch decode, q_pe must have shape [batch_size, num_heads, head_dim]."
+            )
+
         # MLA decode kernel supports SM80 only
         major, minor = get_compute_capability(q_nope.device)
         device_arch = major * 10 + minor
@@ -1940,7 +2001,10 @@ class TrtllmGenDecodeModule:
         enable_pdl: bool = None,
         out: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        key_block_scales: Optional[torch.Tensor] = None,
+        value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        uses_shared_paged_kv_idx: bool = True,
     ) -> torch.Tensor:
         if out is None:
             out = torch.empty_like(query)
@@ -1982,7 +2046,10 @@ class TrtllmGenDecodeModule:
             workspace_size,
             sinks,
             None,  # cum_seq_lens_q
+            key_block_scales,
+            value_block_scales,
             skip_softmax_threshold_scale_factor,
+            uses_shared_paged_kv_idx,
         )
         return out
 
@@ -2044,7 +2111,10 @@ def get_trtllm_gen_decode_module(*args):
         page_size: Optional[int] = None,
         max_kv_len: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
+        key_block_scales: Optional[torch.Tensor] = None,
+        value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        uses_shared_paged_kv_idx: bool = True,
     ) -> None:
         assert maybe_lse is None
         assert paged_kv_cache is not None
@@ -2071,7 +2141,10 @@ def get_trtllm_gen_decode_module(*args):
             enable_pdl,
             out=o,
             sinks=sinks,
+            key_block_scales=key_block_scales,
+            value_block_scales=value_block_scales,
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+            uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
         )
 
     @register_fake_op(f"flashinfer::{uri}_paged_run")
@@ -2111,7 +2184,10 @@ def get_trtllm_gen_decode_module(*args):
         page_size: Optional[int] = None,
         max_kv_len: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
+        key_block_scales: Optional[torch.Tensor] = None,
+        value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        uses_shared_paged_kv_idx: bool = True,
     ) -> None:
         pass
 
@@ -2149,7 +2225,12 @@ def trtllm_batch_decode_with_kv_cache(
     mask: Optional[torch.Tensor] = None,
     max_q_len: Optional[int] = None,
     cum_seq_lens_q: Optional[torch.Tensor] = None,
+    kv_block_scales: Optional[
+        Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+    ] = None,
     skip_softmax_threshold_scale_factor: Optional[float] = None,
+    kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    uses_shared_paged_kv_idx: bool = True,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
     Parameters
@@ -2164,11 +2245,19 @@ def trtllm_batch_decode_with_kv_cache(
         or [num_pages, page_size, num_kv_heads, head_dim] if :attr:`kv_layout` is ``NHD``.
         The first tensor is the key cache, and the second tensor is the value cache.
 
+        **Contiguity requirements (trtllm-gen backend):**
+
+        - The ``head_dim`` (last dim) **must** have stride 1. This is a TMA hardware constraint
+        - The head and batch/page dims can have arbitrary strides.
+
     workspace_buffer : torch.Tensor. Must be initialized to 0 for its first use.
         workspace
 
     block_tables : torch.Tensor
-        page_table of kv cache, [batch_size, num_pages]
+        Page table of kv cache.
+        When ``uses_shared_paged_kv_idx`` is True (default): shape ``[batch_size, max_num_pages_per_seq]``.
+        When ``uses_shared_paged_kv_idx`` is False: shape ``[batch_size, 2, max_num_pages_per_seq]``
+        where dim 1 distinguishes K (0) and V (1) page indices.
 
     seq_lens : torch.Tensor
         A uint32 1D tensor indicating the kv sequence length of each prompt. shape: ``[batch_size]``
@@ -2206,6 +2295,10 @@ def trtllm_batch_decode_with_kv_cache(
     kv_layout : str = "HND"
         The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
         Defaults to ``HND``.
+        For the trtllm-gen backend with NVFP4 KV cache, using ``NHD`` will trigger an
+        automatic transpose and ``.contiguous()`` copy of both the KV data and block scale
+        tensors to convert them to HND layout. This incurs extra memory allocation and
+        data copy overhead. Use ``HND`` for better performance.
 
     enable_pdl : Optional[bool] = None
         Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
@@ -2233,12 +2326,31 @@ def trtllm_batch_decode_with_kv_cache(
         Only supported by trtllm-gen backend. Must be provided together with ``max_q_len``.
         When None, all requests use uniform query length specified by ``q_len_per_req``.
 
+    kv_block_scales : Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]] = None
+        Per-block scale factors for NVFP4 KV cache. Either a tuple of (k_scales, v_scales) or
+        a single tensor with shape ``[num_pages, 2, ...]`` that will be unbound along dim=1.
+        Each scale tensor has shape ``[num_pages, num_kv_heads, page_size, head_dim // 16]``
+        in HND layout, with dtype ``torch.float8_e4m3fn``.
+
+        **Contiguity requirements (trtllm-gen backend):**
+
+        - The last two dims (``page_size``, ``head_dim // 16``) **must** be contiguous
+          (i.e., ``stride[-1] == 1`` and ``stride[-2] == head_dim // 16``). This is because
+          the kernel reshapes them into ``(16, page_size * head_dim / 16 / 16)`` to satisfy
+          TMA's 16-byte box width minimum.
+        - The head and batch/page dims can have arbitrary strides.
+
     skip_softmax_threshold_scale_factor: Optional[float] = None
         threshold scale factor for skipping softmax operations.
         Providing a value for this parameter enables skip-softmax sparsity as described in: https://arxiv.org/abs/2512.12087
         If no value is provided, then standard attention is used.
         Setting the threshold to a higher value generally increases kernel performance at the cost of accuracy degradation.
         The actual threshold value equals the provided threshold_scale_factor divided by the context length.
+
+    uses_shared_paged_kv_idx : bool = True
+        Whether the K and V page indices are shared as a unified index.
+        True (default) uses vLLM/FlashInfer layout with a 2D page table.
+        False uses TRT-LLM layout with a 3D page table ``[batch_size, 2, max_num_pages_per_seq]``.
 
     Returns
     -------
@@ -2260,6 +2372,33 @@ def trtllm_batch_decode_with_kv_cache(
             # it doesn't change underlying storage
             k_cache, v_cache = kv_cache.unbind(dim=1)
 
+    is_nvfp4_kvcache = (
+        k_cache.dtype == torch.uint8
+        and v_cache.dtype == torch.uint8
+        and kv_block_scales is not None
+    )
+
+    k_block_scales = None
+    v_block_scales = None
+    if is_nvfp4_kvcache:
+        if isinstance(kv_block_scales, tuple):
+            k_block_scales, v_block_scales = kv_block_scales
+        else:
+            if kv_block_scales.shape[1] == 1:
+                k_block_scales, v_block_scales = kv_block_scales, kv_block_scales
+            else:
+                assert kv_block_scales.shape[1] == 2, (
+                    "When kv_block_scales is a single tensor, the second dimension must be 1 or 2"
+                )
+                # NOTE(Zihao): unbind transforms [num_pages, 2, ...] to ([num_pages, ...], [num_pages, ...])
+                # it doesn't change underlying storage
+                k_block_scales, v_block_scales = kv_block_scales.unbind(dim=1)
+
+        assert (
+            k_block_scales.dtype == torch.float8_e4m3fn
+            and v_block_scales.dtype == torch.float8_e4m3fn
+        ), "k/v_block_scales should be float8 dtype."
+
     if backend == "auto":
         backend = (
             "trtllm-gen" if get_compute_capability(query.device)[0] == 10 else "xqa"
@@ -2273,6 +2412,10 @@ def trtllm_batch_decode_with_kv_cache(
             raise ValueError("xqa backend does not support o_sf_scale or o_sf_vec_size")
         if max_q_len is not None or cum_seq_lens_q is not None:
             raise ValueError("xqa backend does not support cum_seq_lens_q")
+        if not uses_shared_paged_kv_idx:
+            raise ValueError(
+                "xqa backend does not support uses_shared_paged_kv_idx=False"
+            )
 
         # Handle out and out_dtype
         if out_dtype is None:
@@ -2284,6 +2427,7 @@ def trtllm_batch_decode_with_kv_cache(
         return xqa_batch_decode_with_kv_cache(
             query=query,
             kv_cache=(k_cache, v_cache),
+            kv_cache_sf=kv_cache_sf,
             workspace_buffer=workspace_buffer,
             block_tables=block_tables,
             seq_lens=seq_lens,
@@ -2300,11 +2444,20 @@ def trtllm_batch_decode_with_kv_cache(
             mask=mask,
         )
     elif backend == "trtllm-gen":
-        # Convert NHD layout to HND if necessary (transpose only changes stride, not data)
+        # Convert NHD layout to HND if necessary
         if kv_layout == "NHD":
-            # For NHD: [..., N, H, D] -> HND: [..., H, N, D]
             k_cache = k_cache.transpose(-3, -2)
             v_cache = v_cache.transpose(-3, -2)
+            if is_nvfp4_kvcache:
+                print(
+                    "[WARNING] NVFP4 KV cache with NHD layout will be converted to HND, "
+                    "incurring extra transpose and contiguous copy overhead. "
+                    "Use kv_layout='HND' for better performance."
+                )
+                k_cache = k_cache.contiguous()
+                v_cache = v_cache.contiguous()
+                k_block_scales = k_block_scales.transpose(-3, -2).contiguous()
+                v_block_scales = v_block_scales.transpose(-3, -2).contiguous()
 
         run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
         sm_count = get_device_sm_count(query.device)
@@ -2396,6 +2549,8 @@ def trtllm_batch_decode_with_kv_cache(
             assert max_q_len is not None
             batch_size = cum_seq_lens_q.size(0) - 1
 
+        _check_block_tables_shape(block_tables, uses_shared_paged_kv_idx)
+
         run_func(
             out,
             out_scale_factor,
@@ -2420,7 +2575,10 @@ def trtllm_batch_decode_with_kv_cache(
             workspace_buffer.numel() * workspace_buffer.element_size(),
             sinks,
             cum_seq_lens_q,
+            k_block_scales,
+            v_block_scales,
             skip_softmax_threshold_scale_factor,
+            uses_shared_paged_kv_idx,
         )
 
         return (
@@ -2451,6 +2609,9 @@ def xqa_batch_decode_with_kv_cache(
     q_len_per_req: Optional[int] = 1,
     o_scale: Optional[float] = 1.0,
     mask: Optional[torch.Tensor] = None,
+    kv_cache_sf: Union[
+        torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]
+    ] = None,
 ) -> torch.Tensor:
     """
     Parameters
@@ -2505,6 +2666,9 @@ def xqa_batch_decode_with_kv_cache(
     mask : Optional[torch.Tensor] = None
         causal attention mask for xqa speculative decoding.
 
+    kv_cache_sf : Optional[torch.Tensor] = None
+        KV cache scaling factors. Must provide when NVFP4 KV cache is used.
+
     Returns
     -------
     out : torch.Tensor
@@ -2524,6 +2688,19 @@ def xqa_batch_decode_with_kv_cache(
             # NOTE(Zihao): unbind transforms [num_pages, 2, ...] to ([num_pages, ...], [num_pages, ...])
             # it doesn't change underlying storage
             k_cache, v_cache = kv_cache.unbind(dim=1)
+
+    k_cache_sf = None
+    v_cache_sf = None
+    if kv_cache_sf is not None:
+        if isinstance(kv_cache_sf, tuple):
+            k_cache_sf, v_cache_sf = kv_cache_sf
+        else:
+            assert kv_cache_sf.shape[1] == 2, (
+                "When kv_cache is a single tensor, the second dimension must be 1 or 2"
+            )
+            # NOTE(Zihao): unbind transforms [num_pages, 2, ...] to ([num_pages, ...], [num_pages, ...])
+            # it doesn't change underlying storage
+            k_cache_sf, v_cache_sf = kv_cache_sf.unbind(dim=1)
 
     sm_count = get_device_sm_count(query.device)
 
@@ -2568,6 +2745,8 @@ def xqa_batch_decode_with_kv_cache(
         semaphore,
         num_kv_heads,
         page_size,
+        k_sf_cache=k_cache_sf,
+        v_sf_cache=v_cache_sf,
         sinks=sinks_new,
         q_scale=q_scale_value,
         kv_scale=kv_scale_value,

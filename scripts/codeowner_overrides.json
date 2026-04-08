@@ -11,9 +11,9 @@
   "include/flashinfer/gemm": ["@flashinfer-ai/gemm-owners"],
   "tests/gemm": ["@flashinfer-ai/gemm-owners"],
 
-  "flashinfer/fused_moe": ["@flashinfer-ai/moe-owners"],
-  "csrc/fused_moe": ["@flashinfer-ai/moe-owners"],
-  "tests/moe": ["@flashinfer-ai/moe-owners"],
+  "flashinfer/fused_moe": ["@flashinfer-ai/moe-owners", "@jiahanc"],
+  "csrc/fused_moe": ["@flashinfer-ai/moe-owners", "@jiahanc"],
+  "tests/moe": ["@flashinfer-ai/moe-owners", "@jiahanc"],
 
   "flashinfer/comm": ["@flashinfer-ai/comm-owners"],
   "include/flashinfer/comm": ["@flashinfer-ai/comm-owners"],
