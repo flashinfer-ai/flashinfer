@@ -681,13 +681,14 @@ def main():
             header = (
                 f"{'batch':>6} {'seq_len':>10} {'k':>6} | "
                 f"{'FlashInfer':>12} {'torch.topk':>12} {'Speedup':>10}"
+                f" {'Clusters':>12} {'Speedup Clusters vs. Default':>29}"
             )
         if args.compare_torch_deterministic and not args.deterministic:
             header += f" {'torch.det':>12} {'Speedup':>10}"
         if args.compare_sglang:
             header += f" {'SGLang':>12} {'Speedup':>10}"
         print(header)
-        divider_len = 96 if args.deterministic else 72
+        divider_len = 96 if args.deterministic else 115
         if args.compare_torch_deterministic and not args.deterministic:
             divider_len += 24
         if args.compare_sglang:
@@ -721,6 +722,8 @@ def main():
                         f"{result['flashinfer_us']:>12.2f}us {result['torch_us']:>10.2f}us "
                         f"{result['speedup_vs_torch']:>9.2f}x"
                     )
+                    if "fast_topk_us" in result:
+                        line += f" {result['fast_topk_us']:>10.2f}us {result['speedup_vs_flashinfer']:>28.2f}x"
                 if "torch_deterministic_us" in result:
                     line += (
                         f" {result['torch_deterministic_us']:>10.2f}us "
@@ -777,11 +780,12 @@ def main():
             header = (
                 f"{'case':>24} {'rows':>8} {'seq_len':>10} {'k':>6} | "
                 f"{'FlashInfer':>12} {'torch.topk':>12} {'Speedup':>10}"
+                f" {'Clusters':>12} {'Speedup Clusters vs. Default':>29}"
             )
         if args.compare_torch_deterministic and not args.deterministic:
             header += f" {'torch.det':>12} {'Speedup':>10}"
         print(header)
-        divider_len = 110 if args.deterministic else 86
+        divider_len = 110 if args.deterministic else 129
         if args.compare_torch_deterministic and not args.deterministic:
             divider_len += 24
         print("-" * divider_len)
@@ -832,6 +836,8 @@ def main():
                         f"{result['flashinfer_us']:>10.2f}us {result['torch_us']:>10.2f}us "
                         f"{result['speedup_vs_torch']:>9.2f}x"
                     )
+                    if "fast_topk_us" in result:
+                        line += f" {result['fast_topk_us']:>10.2f}us {result['speedup_vs_flashinfer']:>28.2f}x"
                 if "torch_deterministic_us" in result:
                     line += (
                         f" {result['torch_deterministic_us']:>10.2f}us "
