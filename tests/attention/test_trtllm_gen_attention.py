@@ -487,6 +487,7 @@ def _test_trtllm_batch_prefill(
     page_size: int,
     num_kv_heads: int,
     head_grp_size: int,
+    causal: bool,
     window_left: int,
     q_dtype: str,
     o_dtype: str,
@@ -504,6 +505,8 @@ def _test_trtllm_batch_prefill(
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] != 10:
         pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+    if not causal and window_left >= 0:
+        pytest.skip("Non-causal paged trtllm-gen tests only cover dense attention")
 
     if skips_softmax and q_dtype != kv_dtype:
         pytest.skip(
@@ -577,7 +580,7 @@ def _test_trtllm_batch_prefill(
         "num_kv_heads": num_kv_heads,
         "head_dim_qk": head_dim,
         "page_size": page_size,
-        "causal": True,
+        "causal": causal,
         "pos_encoding_mode": "NONE",
         "logits_soft_cap": 0.0,
         "q_data_type": ref_q.dtype,
@@ -607,7 +610,7 @@ def _test_trtllm_batch_prefill(
             v_flat,
             sink,
             window_left,
-            True,
+            causal,
             sm_scale,
             mode="varlen",
             batch_size=batch_size,
@@ -650,6 +653,7 @@ def _test_trtllm_batch_prefill(
         q_indptr,
         kv_indptr,
         window_left,  # window_left
+        causal=causal,
         out=out,
         out_dtype=out_dtype,
         o_sf_scale=o_sf_scale,
@@ -806,6 +810,7 @@ def test_trtllm_batch_prefill(
         page_size,
         num_kv_heads,
         head_grp_size,
+        True,
         window_left,
         q_dtype,
         o_dtype,
@@ -867,6 +872,7 @@ def test_trtllm_batch_prefill_bs1(
         page_size,
         num_kv_heads,
         head_grp_size,
+        True,
         window_left,
         q_dtype,
         o_dtype,
@@ -876,6 +882,57 @@ def test_trtllm_batch_prefill_bs1(
         max_q_len,
         max_kv_len,
         False,
+        head_dim,
+        skips_softmax=skips_softmax,
+        uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+    )
+
+
+@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
+@pytest.mark.parametrize(
+    "batch_size,page_size,num_kv_heads,head_grp_size", [(4, 32, 4, 5)]
+)
+@pytest.mark.parametrize("q_dtype,kv_dtype,o_dtype", [("bf16", "bf16", "bf16")])
+@pytest.mark.parametrize("enable_pdl", [None, False, True])
+@pytest.mark.parametrize("enable_sink", [False, True])
+@pytest.mark.parametrize("max_q_len", [64])
+@pytest.mark.parametrize("max_kv_len", [64])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("skips_softmax", [False, True])
+@pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
+def test_trtllm_batch_prefill_non_causal(
+    kv_layout: str,
+    batch_size: int,
+    page_size: int,
+    num_kv_heads: int,
+    head_grp_size: int,
+    q_dtype: str,
+    o_dtype: str,
+    kv_dtype: str,
+    enable_pdl: bool,
+    enable_sink: bool,
+    max_q_len: int,
+    max_kv_len: int,
+    head_dim: int,
+    skips_softmax: bool,
+    uses_shared_paged_kv_idx: bool,
+):
+    _test_trtllm_batch_prefill(
+        kv_layout,
+        batch_size,
+        page_size,
+        num_kv_heads,
+        head_grp_size,
+        False,
+        -1,
+        q_dtype,
+        o_dtype,
+        kv_dtype,
+        enable_pdl,
+        enable_sink,
+        max_q_len,
+        max_kv_len,
+        kv_dtype in ("fp8", "nvfp4"),
         head_dim,
         skips_softmax=skips_softmax,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
