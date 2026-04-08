@@ -213,7 +213,8 @@ struct DMA {
 
         // The cumulative packed_mask seqlens.
         // Each sequence length in the batch has to be padded to multiple of 128.
-        int sum_mask_s = params.cu_mask_rows[bidb];
+        // cu_mask_rows is NULL when not using a custom mask; guard to avoid illegal access.
+        int sum_mask_s = params.cu_mask_rows ? params.cu_mask_rows[bidb] : 0;
 
         if (SCHEDULING_MODE == 0) {
           // split work across M
@@ -357,7 +358,8 @@ struct DMA {
 
         // The cumulative packed_mask seqlens.
         // Each sequence length in the batch has to be padded to multiple of 128.
-        int sum_mask_s = params.cu_mask_rows[bidb];
+        // cu_mask_rows is NULL when not using a custom mask; guard to avoid illegal access.
+        int sum_mask_s = params.cu_mask_rows ? params.cu_mask_rows[bidb] : 0;
 
         // Prepare the tma descriptors.
         cudaTmaDesc const* desc_q = &params.tma_desc_q;
