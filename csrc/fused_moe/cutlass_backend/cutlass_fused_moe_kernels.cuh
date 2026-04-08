@@ -1486,8 +1486,8 @@ __global__ void expandInputRowsKernel(
       size_t padding_elems_in_col = padded_hidden_size / VecSize;
       for (int64_t elem_index = padding_start_offset; elem_index < padding_elems_in_col;
            elem_index += stride) {
-        writeSF<VecSize, VecSize>(num_tokens_before_expert, expert, /*source_row*/ -1,
-                                  permuted_row, elem_index, padded_hidden_size, fc1_act_sf_flat,
+        writeSF<VecSize, VecSize>(num_tokens_before_expert, expert, /*source_row*/ -1, permuted_row,
+                                  elem_index, padded_hidden_size, fc1_act_sf_flat,
                                   /* input_sf */ nullptr);
       }
     } else if constexpr (PRE_QUANT_AWQ) {
@@ -1548,7 +1548,7 @@ __global__ void expandInputRowsKernel(
       int64_t tokens_to_expert = num_tokens_after_expert - num_tokens_before_expert;
       if (tokens_to_expert == 0) continue;
       int64_t padded_tokens = TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
-                                  tokens_to_expert, min_num_tokens_alignment);
+          tokens_to_expert, min_num_tokens_alignment);
       int64_t num_pad_rows = padded_tokens - tokens_to_expert;
       int64_t total_sf_writes = num_pad_rows * padded_num_elems_in_col;
       for (int64_t work_idx = start_offset; work_idx < total_sf_writes; work_idx += stride) {
@@ -1584,8 +1584,8 @@ void expandInputRowsKernelLauncher(
   // Note: Launching 8 blocks per SM can fully leverage the memory bandwidth (tested on B200).
   // The N-dim padding loop is now expert-driven and strides over experts with gridDim.x, so it
   // works correctly with any grid size. No need to inflate the grid for padding work.
-  int64_t const blocks = std::min(smCount * 8, std::max(num_rows * k,
-      static_cast<int64_t>(num_experts_per_node)));
+  int64_t const blocks =
+      std::min(smCount * 8, std::max(num_rows * k, static_cast<int64_t>(num_experts_per_node)));
   int64_t const threads = EXPAND_THREADS_PER_BLOCK;
 
   auto func = [&]() {
@@ -2064,14 +2064,12 @@ void doGatedActivation(ActivationOutputType* output, GemmOutputType const* gemm_
 
 template <class T, class GemmOutputType, class ScaleBiasType, class ActFn,
           TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType BlockScalingType>
-__global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK)
-void doActivationKernel(T* output, GemmOutputType const* gemm_result,
-                                   float const* fp8_quant, ScaleBiasType const* bias_ptr,
-                                   bool bias_is_broadcast, int64_t const* expert_first_token_offset,
-                                   int num_experts_per_node, int64_t inter_size,
-                                   float const* fc2_act_global_scale, bool use_per_expert_act_scale,
-                                   TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_act_sf_flat,
-                                   ActivationParams activation_params) {
+__global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKernel(
+    T* output, GemmOutputType const* gemm_result, float const* fp8_quant,
+    ScaleBiasType const* bias_ptr, bool bias_is_broadcast, int64_t const* expert_first_token_offset,
+    int num_experts_per_node, int64_t inter_size, float const* fc2_act_global_scale,
+    bool use_per_expert_act_scale, TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_act_sf_flat,
+    ActivationParams activation_params) {
 #ifdef ENABLE_FP4
   constexpr bool IsNVFP4 =
       std::is_same_v<T, __nv_fp4_e2m1> &&
@@ -2164,9 +2162,10 @@ void doActivationKernel(T* output, GemmOutputType const* gemm_result,
 
     // For FP4/MXFP8: extend the loop to cover K-dim padding (writes zero SFs for padded columns).
     // This merges K-dim padding into the main loop for better cache locality.
-    int64_t const loop_elems = (IsNVFP4 || IsMXFP8)
-        ? padded_inter_size / VecSize  // cover both real elements and K-dim padding
-        : num_elems_in_col;
+    int64_t const loop_elems =
+        (IsNVFP4 || IsMXFP8)
+            ? padded_inter_size / VecSize  // cover both real elements and K-dim padding
+            : num_elems_in_col;
     bool const do_k_padding = (IsNVFP4 || IsMXFP8) && (padded_inter_size > inter_size);
 
     ActFn fn{};
@@ -2254,15 +2253,15 @@ void doActivationKernel(T* output, GemmOutputType const* gemm_result,
       int64_t tokens_to_expert = num_tokens_after_expert - num_tokens_before_expert;
       if (tokens_to_expert == 0) continue;
       int64_t padded_tokens = TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
-                                  tokens_to_expert, min_num_tokens_alignment);
+          tokens_to_expert, min_num_tokens_alignment);
       int64_t num_pad_rows = padded_tokens - tokens_to_expert;
       int64_t total_sf_writes = num_pad_rows * padded_num_elems_in_col;
       for (int64_t work_idx = start_offset; work_idx < total_sf_writes; work_idx += stride) {
         int64_t pad_idx = tokens_to_expert + work_idx / padded_num_elems_in_col;
         int64_t elem_index = work_idx % padded_num_elems_in_col;
         writeSF<VecSize, VecSize>(num_tokens_before_expert, expert, /*source_row*/ -1,
-                                  num_tokens_before_expert + pad_idx, elem_index,
-                                  padded_inter_size, fc2_act_sf_flat,
+                                  num_tokens_before_expert + pad_idx, elem_index, padded_inter_size,
+                                  fc2_act_sf_flat,
                                   /* input_sf */ nullptr);
       }
     }
@@ -2281,8 +2280,8 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
   // Note: Launching 8 blocks per SM can fully leverage the memory bandwidth (tested on B200).
   // The N-dim padding loop is now expert-driven and strides over experts with gridDim.x, so it
   // works correctly with any grid size. No need to inflate the grid for padding work.
-  int64_t const blocks = std::min(smCount * 8, std::max(expanded_num_tokens,
-      static_cast<int64_t>(num_experts_per_node)));
+  int64_t const blocks = std::min(
+      smCount * 8, std::max(expanded_num_tokens, static_cast<int64_t>(num_experts_per_node)));
   int64_t const threads = ACTIVATION_THREADS_PER_BLOCK;
 
   auto fn = [&]() {
