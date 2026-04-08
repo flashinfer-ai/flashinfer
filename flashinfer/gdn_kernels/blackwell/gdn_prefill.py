@@ -22,7 +22,7 @@ CuTe DSL chunked GDN kernel for SM100 (Blackwell).
 Follows the same compile-once-cache-and-replay pattern used by the decode
 kernels in ``gdn_decode_pretranspose.py``.
 
-State layout: K-major [N, H, K, V] — passed through directly, no transpose.
+State layout: ``[N, H, V, K]``.
 """
 
 import functools
@@ -91,8 +91,6 @@ def chunk_gated_delta_rule_sm100(
 
     All tensors must be contiguous and on the same CUDA device.
 
-    State layout: K-major ``[N, H, K, V]``.
-
     Args:
         q: ``(total_tokens, HQ, 128)`` float16/bfloat16
         k: ``(total_tokens, HK, 128)`` float16/bfloat16
@@ -101,8 +99,8 @@ def chunk_gated_delta_rule_sm100(
         beta: ``(total_tokens, HO)`` float32, update gate
         output: ``(total_tokens, HO, 128)`` float16/bfloat16, pre-allocated
         cu_seqlens: ``(num_seqs + 1,)`` int32
-        initial_state: ``(num_seqs, HO, 128, 128)`` float32, K-major [N,H,K,V], or None
-        output_state: ``(num_seqs, HO, 128, 128)`` float32, K-major [N,H,K,V], or None
+        initial_state: ``(num_seqs, HO, 128, 128)`` float32, or None
+        output_state: ``(num_seqs, HO, 128, 128)`` float32, or None
         scale: attention scale factor (must not be 0)
     """
     HQ = q.size(1)
@@ -112,7 +110,7 @@ def chunk_gated_delta_rule_sm100(
     store_final_state = output_state is not None
     io_dtype = _cutlass_io_dtype(q.dtype)
 
-    # States are K-major [N, H, K, V] — pass through directly
+    # Pass states through directly
     _initial_state = initial_state if use_initial_state else None
     B = cu_seqlens.size(0) - 1
     if store_final_state:
@@ -244,5 +242,3 @@ def chunk_gated_delta_rule_sm100(
         workspace,
         stream,
     )
-
-    # Kernel writes K-major directly — no transpose needed

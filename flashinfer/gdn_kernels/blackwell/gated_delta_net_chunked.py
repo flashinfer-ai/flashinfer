@@ -447,15 +447,15 @@ class GatedDeltaNetChunkedKernel:
                 stride=(o.stride[0], o.stride[2], (o.stride[1], h_r * o.stride[1])),
             ),
         )
-        # State layout: K-major [N, H, K, V] — shape[2]=DK, shape[3]=DV
+        # State: [N, H, V, K] — swap shape/stride [2]<->[3] to get internal (DK, DV)
         if cutlass.const_expr(s_in is not None):
             s_in = cute.make_tensor(
                 s_in.iterator,
                 cute.make_layout(
-                    (s_in.shape[2], s_in.shape[3], (h_r, h_qv), s_in.shape[0]),
+                    (s_in.shape[3], s_in.shape[2], (h_r, h_qv), s_in.shape[0]),
                     stride=(
-                        s_in.stride[2],
                         s_in.stride[3],
+                        s_in.stride[2],
                         (s_in.stride[1], h_r * s_in.stride[1]),
                         s_in.stride[0],
                     ),
@@ -465,10 +465,10 @@ class GatedDeltaNetChunkedKernel:
             s_out = cute.make_tensor(
                 s_out.iterator,
                 cute.make_layout(
-                    (s_out.shape[2], s_out.shape[3], (h_r, h_qv), s_out.shape[0]),
+                    (s_out.shape[3], s_out.shape[2], (h_r, h_qv), s_out.shape[0]),
                     stride=(
-                        s_out.stride[2],
                         s_out.stride[3],
+                        s_out.stride[2],
                         (s_out.stride[1], h_r * s_out.stride[1]),
                         s_out.stride[0],
                     ),
@@ -3045,7 +3045,7 @@ class GatedDeltaNetChunkedKernel:
 
         # Tiled copy: coalesced GMEM -> fp32 registers
         state_g2r_atom = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), self.acc_dtype, num_bits_per_copy=128
+            cute.nvgpu.CopyUniversalOp(), self.acc_dtype
         )
         tiled_state_g2r = cute.make_tiled_copy_S(state_g2r_atom, tiled_state_r2t)
         thr_state_g2r = tiled_state_g2r.get_slice(cg1_tidx)
@@ -3129,7 +3129,7 @@ class GatedDeltaNetChunkedKernel:
 
         # Registers -> GMEM fp32  (CopyUniversalOp, store direction)
         atom_state_r2g = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), self.acc_dtype, num_bits_per_copy=128
+            cute.nvgpu.CopyUniversalOp(), self.acc_dtype
         )
         tiled_state_r2g = cute.make_tiled_copy_D(atom_state_r2g, tiled_state_t2r)
         thr_state_r2g = tiled_state_r2g.get_slice(cg1_tidx)
