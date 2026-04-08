@@ -92,6 +92,15 @@ size_t genericFp4GemmKernelLauncherStreamK(void* D, void const* A, void const* B
                                            char* workspace, size_t const workspaceBytes,
                                            cudaStream_t stream, int* occupancy);
 
+template <typename T, typename CTA_M_, typename CTA_N_, typename CTA_K_, typename CGA_M_,
+          typename CGA_N_, typename CGA_K_, typename XSM_>
+size_t genericFp4GemmKernelLauncherPingpong(void* D, void const* A, void const* B,
+                                            void const* input_sf, void const* weight_sf,
+                                            float const* global_sf, int m, int n, int k,
+                                            int batch_count, CutlassGemmConfig gemmConfig,
+                                            char* workspace, size_t const workspaceBytes,
+                                            cudaStream_t stream, int* occupancy);
+
 // ============================================================================
 // Common helper functions to reduce code duplication
 // ============================================================================
@@ -185,8 +194,8 @@ inline size_t runFp4GemmImpl(void* D, void const* A, void const* B, void const* 
                              std::string(cutlass::cutlassGetStatusString(initStatus)));
   }
 
-  // Disable PDL since GDC flag is not set
-  auto runStatus = gemm.run(args, workspace, stream, nullptr, /*enablePDL=*/false);
+  // Enable PDL — GDC flag (CUTLASS_ENABLE_GDC_FOR_SM100) is set at compile time
+  auto runStatus = gemm.run(args, workspace, stream, nullptr, /*enablePDL=*/true);
   if (runStatus != cutlass::Status::kSuccess) {
     throw std::runtime_error(std::string("[FP4 gemm Runner") + scheduler_name + "] " +
                              "Failed to run cutlass FP4 gemm on sm120/sm121. Error: " +
@@ -274,8 +283,27 @@ inline size_t runFp4GemmImpl(void* D, void const* A, void const* B, void const* 
         cutlass::gemm::kernel::GemmUniversal<cute::Shape<int, int, int, int>, CollectiveMainloop,          \
                                              CollectiveEpilogue, cutlass::gemm::StreamKScheduler>;         \
                                                                                                            \
+    /* Option 3: Pingpong warp specialization - two consumer groups alternate tiles,                       \
+       potentially better latency hiding for memory-bound small-M shapes */                                \
+    using CollectiveEpiloguePP = typename cutlass::epilogue::collective::CollectiveBuilder<                \
+        Arch, cutlass::arch::OpClassTensorOp, ThreadBlockShape, ClusterShape,                              \
+        cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementCompute,               \
+        ElementC, LayoutC, AlignmentC, OutElementType, LayoutC, AlignmentC,                                \
+        cutlass::epilogue::TmaWarpSpecialized, FusionOperation>::CollectiveOp;                             \
+    using CollectiveMainloopPP = typename cutlass::gemm::collective::CollectiveBuilder<                    \
+        Arch, OperatorClass, ElementA, LayoutA, AlignmentA, ElementB, LayoutB, AlignmentB,                 \
+        ElementAccumulator, ThreadBlockShape, ClusterShape,                                                \
+        cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(                                \
+            sizeof(typename CollectiveEpiloguePP::SharedStorage))>,                                        \
+        cutlass::gemm::KernelTmaWarpSpecializedPingpong>::CollectiveOp;                                    \
+    using GemmKernelPingpong =                                                                             \
+        cutlass::gemm::kernel::GemmUniversal<cute::Shape<int, int, int, int>,                              \
+                                             CollectiveMainloopPP, CollectiveEpiloguePP,                   \
+                                             TileSchedulerTag>;                                            \
+                                                                                                           \
     using GemmDefault = typename cutlass::gemm::device::GemmUniversalAdapter<GemmKernelDefault>;           \
     using GemmStreamK = typename cutlass::gemm::device::GemmUniversalAdapter<GemmKernelStreamK>;           \
+    using GemmPingpong = typename cutlass::gemm::device::GemmUniversalAdapter<GemmKernelPingpong>;         \
     using Gemm = GemmDefault; /* Default alias for compatibility */                                        \
   };                                                                                                       \
                                                                                                            \
@@ -288,7 +316,11 @@ inline size_t runFp4GemmImpl(void* D, void const* A, void const* B, void const* 
       DeviceGemmFp4GemmSm120_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##_##CGA_M_##_##CGA_N_##_##CGA_K_##XSM_:: \
           GemmStreamK;                                                                                     \
                                                                                                            \
-  /* DP scheduler launcher - uses common helper functions */                                               \
+  using Fp4Gemm_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##_Pingpong =                                          \
+      DeviceGemmFp4GemmSm120_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##_##CGA_M_##_##CGA_N_##_##CGA_K_##XSM_:: \
+          GemmPingpong;                                                                                    \
+                                                                                                           \
+  /* Cooperative persistent scheduler launcher */                                                          \
   template <>                                                                                              \
   size_t                                                                                                   \
   genericFp4GemmKernelLauncher<T, cute::Int<CTA_M_>, cute::Int<CTA_N_>, cute::Int<CTA_K_>,                 \
@@ -313,6 +345,20 @@ inline size_t runFp4GemmImpl(void* D, void const* A, void const* B, void const* 
     return runFp4GemmImpl<Fp4GemmOperator>(D, A, B, input_sf, weight_sf, global_sf, m, n, k,               \
                                            batch_count, workspace, workspaceBytes, stream,                 \
                                            " StreamK");                                                    \
+  }                                                                                                        \
+                                                                                                           \
+  /* Pingpong warp specialization launcher */                                                              \
+  template <>                                                                                              \
+  size_t genericFp4GemmKernelLauncherPingpong<T, cute::Int<CTA_M_>, cute::Int<CTA_N_>,                     \
+                                              cute::Int<CTA_K_>, cute::Int<CGA_M_>,                        \
+                                              cute::Int<CGA_N_>, cute::Int<CGA_K_>, XSM_>(                 \
+      void* D, void const* A, void const* B, void const* input_sf, void const* weight_sf,                  \
+      float const* global_sf, int m, int n, int k, int batch_count, CutlassGemmConfig gemmConfig,          \
+      char* workspace, const size_t workspaceBytes, cudaStream_t stream, int* occupancy) {                 \
+    using Fp4GemmOperator = Fp4Gemm_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##_Pingpong;                       \
+    return runFp4GemmImpl<Fp4GemmOperator>(D, A, B, input_sf, weight_sf, global_sf, m, n, k,               \
+                                           batch_count, workspace, workspaceBytes, stream,                 \
+                                           " Pingpong");                                                   \
   }
 
 #endif

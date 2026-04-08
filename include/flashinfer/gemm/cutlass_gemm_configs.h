@@ -351,6 +351,8 @@ struct CutlassGemmConfig {
   bool is_tma_warp_specialized = false;
   bool use_stream_k =
       false;  // SM120/SM121: false = DP scheduler (default), true = StreamK scheduler
+  bool use_pingpong =
+      false;  // SM120/SM121: false = cooperative (default), true = pingpong warp specialization
 
   CutlassGemmConfig() = default;
 
@@ -381,18 +383,21 @@ struct CutlassGemmConfig {
         sm_version(100),
         is_tma_warp_specialized(true) {}
 
-  // SM120/SM121 constructor with optional StreamK scheduler
-  // use_stream_k: false = DP scheduler (default), true = StreamK scheduler (auto heuristic)
+  // SM120/SM121 constructor with optional StreamK and pingpong scheduler
+  // use_stream_k: false = persistent scheduler (default), true = StreamK scheduler
+  // use_pingpong: false = cooperative warp specialization (default), true = pingpong
   CutlassGemmConfig(CutlassTileConfigSM120 tile_config_sm120,
                     MainloopScheduleType mainloop_schedule, EpilogueScheduleType epilogue_schedule,
-                    ClusterShape cluster_shape, bool use_stream_k = false)
+                    ClusterShape cluster_shape, bool use_stream_k = false,
+                    bool use_pingpong = false)
       : tile_config_sm120(tile_config_sm120),
         mainloop_schedule(mainloop_schedule),
         epilogue_schedule(epilogue_schedule),
         cluster_shape(cluster_shape),
         sm_version(120),
         is_tma_warp_specialized(true),
-        use_stream_k(use_stream_k) {}
+        use_stream_k(use_stream_k),
+        use_pingpong(use_pingpong) {}
 
   int getTileConfigAsInt() const {
     if (sm_version == 120 || sm_version == 121) return (int)tile_config_sm120;
