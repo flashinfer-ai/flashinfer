@@ -15,8 +15,8 @@ that the kernel consumes.
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass, field
-from typing import Tuple, Type, Any
+from dataclasses import dataclass
+from typing import Tuple, Any
 
 from .fusion.mask import MaskType
 from .fusion.variant import AttentionVariant, StandardAttention
@@ -79,7 +79,10 @@ class AttentionConfig:
     num_kv_heads: int = 0
 
     SUPPORTED_MMA_TILE_MN = (128, 128)
-    MMA_K_GRANULARITY = {16: 16, 8: 32}  # {dtype_width_bits: K-tile element granularity}
+    MMA_K_GRANULARITY = {
+        16: 16,
+        8: 32,
+    }  # {dtype_width_bits: K-tile element granularity}
 
     def can_implement(self, dtype_width: int = 16) -> None:
         """Validate that this config is implementable on Blackwell SM100.

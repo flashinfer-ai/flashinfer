@@ -11,7 +11,7 @@ feature flags are fundamentally different between FMHA prefill and MLA decode.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple, Type
+from typing import Tuple
 
 
 @dataclass(frozen=True)
@@ -58,7 +58,7 @@ class MLAConfig:
     mma_s_stage: int = 2
     p_mma_stage: int = 2
     p_cor_stage: int = 2
-    mma_o_stage: int = 1      # FP16: 1, FP8: 2
+    mma_o_stage: int = 1  # FP16: 1, FP8: 2
 
     # Pipeline stage counts — FP16 only (unified K+V + page table pipelines)
     load_kv_stage: int = 15

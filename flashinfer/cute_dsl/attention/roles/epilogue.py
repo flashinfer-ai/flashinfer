@@ -13,7 +13,7 @@ Orchestration (prefill-specific, uses raw CuTe ops for JIT compatibility):
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.typing import Int32, Float32
+from cutlass.cute.typing import Int32
 
 from cutlass.pipeline import PipelineConsumer
 
@@ -54,12 +54,12 @@ class EpilogueRole:
         block_coord: tuple,
     ):
         """Partition output global tensor for TMA stores. Returns (tOsO, tOgO)."""
-        gO_qdl = cute.flat_divide(
-            mO_qdl, cute.select(self.pv_mma_tiler, mode=[0, 1])
-        )
+        gO_qdl = cute.flat_divide(mO_qdl, cute.select(self.pv_mma_tiler, mode=[0, 1]))
         gO = gO_qdl[None, None, None, 0, block_coord[2]]
         tOsO, tOgO = cute.nvgpu.cpasync.tma_partition(
-            tma_atom_o, 0, cute.make_layout(1),
+            tma_atom_o,
+            0,
+            cute.make_layout(1),
             cute.group_modes(sO, 0, 2),
             cute.group_modes(gO, 0, 2),
         )
@@ -144,7 +144,9 @@ class EpilogueRole:
                 )
                 gO = gO_qdl[None, None, None, 0, curr_block_coord_o[2]]
                 tOsO, tOgO = cute.nvgpu.cpasync.tma_partition(
-                    tma_atom_o, 0, cute.make_layout(1),
+                    tma_atom_o,
+                    0,
+                    cute.make_layout(1),
                     cute.group_modes(sO, 0, 2),
                     cute.group_modes(gO, 0, 2),
                 )

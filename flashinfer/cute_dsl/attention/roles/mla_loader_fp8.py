@@ -98,7 +98,8 @@ class MLAFP8LoaderKRole:
             gCL[
                 None,
                 common_params.blk_coord[0] % qk_params.tiled_mma_qk.thr_id.shape,
-                None, None,
+                None,
+                None,
             ]
             if cta_m < self.page_size
             else gCL[None, 0, None, None]
@@ -110,29 +111,40 @@ class MLAFP8LoaderKRole:
             gKR[
                 None,
                 common_params.blk_coord[0] % qk_params.tiled_mma_qk.thr_id.shape,
-                None, None,
+                None,
+                None,
             ]
             if cta_m < self.page_size
             else gKR[None, 0, None, None]
         )
 
         tQsQ, tQLgQL_mkl = cpasync.tma_partition(
-            qk_params.tma_atom_q_latent, 0, cute.make_layout(1),
+            qk_params.tma_atom_q_latent,
+            0,
+            cute.make_layout(1),
             cute.group_modes(qk_params.sQ, 0, 3),
             cute.group_modes(tSgQL, 0, 3),
         )
         tQsQ_rope, tQRgQR_mkl = cpasync.tma_partition(
-            qk_params.tma_atom_q_rope, 0, cute.make_layout(1),
+            qk_params.tma_atom_q_rope,
+            0,
+            cute.make_layout(1),
             cute.group_modes(qk_params.sQ_rope, 0, 3),
             cute.group_modes(tSgQR, 0, 3),
         )
         tKCsKC, tCLgCL = cpasync.tma_partition(
-            qk_params.tma_atom_c_latent, 0, cute.make_layout(1),
-            qk_params.sKC, tSgCL,
+            qk_params.tma_atom_c_latent,
+            0,
+            cute.make_layout(1),
+            qk_params.sKC,
+            tSgCL,
         )
         tKCsKC_rope, tKRgKR = cpasync.tma_partition(
-            qk_params.tma_atom_c_rope, 0, cute.make_layout(1),
-            qk_params.sKC_rope, tSgKR,
+            qk_params.tma_atom_c_rope,
+            0,
+            cute.make_layout(1),
+            qk_params.sKC_rope,
+            tSgKR,
         )
 
         tQLgQL = tQLgQL_mkl[
@@ -258,7 +270,10 @@ class MLAFP8LoaderKRole:
         while work_tile.is_valid_tile:
             blk_coord = work_tile.tile_idx
             k_index, k_tile_count, local_split_kv = self._get_k_tile_count(
-                split_kv, cache_seqs, block_split_kvs, blk_coord,
+                split_kv,
+                cache_seqs,
+                block_split_kvs,
+                blk_coord,
             )
             if k_tile_count > 0:
                 tile_params = SimpleNamespace(
@@ -277,8 +292,11 @@ class MLAFP8LoaderKRole:
 
                     k_handle = load_k_producer.acquire_and_advance()
                     self._load_k_one_tile(
-                        tile_params, qk_params,
-                        k_index, k_handle.barrier, k_handle.index,
+                        tile_params,
+                        qk_params,
+                        k_index,
+                        k_handle.barrier,
+                        k_handle.index,
                     )
 
                     k_index += 1
@@ -343,8 +361,11 @@ class MLAFP8LoaderVRole:
         tOgCLT = tOgCLT[None, 0, 0, None, None, None]
 
         tVCsVC, tCLTgCLT = cpasync.tma_partition(
-            v_params.tma_atom_c_latent_transpose, 0, cute.make_layout(1),
-            v_params.sVC, tOgCLT,
+            v_params.tma_atom_c_latent_transpose,
+            0,
+            cute.make_layout(1),
+            v_params.sVC,
+            tOgCLT,
         )
 
         common_params.mPT = mPT
@@ -379,18 +400,14 @@ class MLAFP8LoaderVRole:
                         cute.copy(
                             v_params.tma_atom_c_latent_transpose,
                             v_params.tCLTgCLT[None, j, 0, k_idx_i],
-                            v_params.tVCsVC[
-                                None, 0, k, ((j, i), v_stage_index)
-                            ],
+                            v_params.tVCsVC[None, 0, k, ((j, i), v_stage_index)],
                             tma_bar_ptr=v_barrier,
                         )
                 else:
                     cute.copy(
                         v_params.tma_atom_c_latent_transpose,
                         v_params.tCLTgCLT[None, j, i, k_idx[0]],
-                        v_params.tVCsVC[
-                            None, 0, 0, ((j, i), v_stage_index)
-                        ],
+                        v_params.tVCsVC[None, 0, 0, ((j, i), v_stage_index)],
                         tma_bar_ptr=v_barrier,
                     )
 
@@ -413,7 +430,10 @@ class MLAFP8LoaderVRole:
         while work_tile.is_valid_tile:
             blk_coord = work_tile.tile_idx
             k_index, k_tile_count, local_split_kv = self._get_k_tile_count(
-                split_kv, cache_seqs, block_split_kvs, blk_coord,
+                split_kv,
+                cache_seqs,
+                block_split_kvs,
+                blk_coord,
             )
             if k_tile_count > 0:
                 tile_params = SimpleNamespace(
@@ -426,8 +446,11 @@ class MLAFP8LoaderVRole:
                 while k_tile_count > 0:
                     v_handle = load_v_producer.acquire_and_advance()
                     self._load_v_one_tile(
-                        tile_params, v_params,
-                        k_index, v_handle.barrier, v_handle.index,
+                        tile_params,
+                        v_params,
+                        k_index,
+                        v_handle.barrier,
+                        v_handle.index,
                     )
                     k_index += 1
                     k_tile_count -= 1

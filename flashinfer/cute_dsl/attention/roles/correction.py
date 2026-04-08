@@ -37,8 +37,14 @@ class CorrectionRole:
     set_call_attrs() in __call__.
     """
 
-    def __init__(self, config: AttentionConfig, fusion: AttentionFusion,
-                 tmem: TmemLayout, correction_warp_ids, threads_per_warp):
+    def __init__(
+        self,
+        config: AttentionConfig,
+        fusion: AttentionFusion,
+        tmem: TmemLayout,
+        correction_warp_ids,
+        threads_per_warp,
+    ):
         # From config
         self.qk_acc_dtype = config.qk_acc_dtype
         self.qk_mma_tiler = config.qk_mma_tiler
@@ -352,7 +358,14 @@ class CorrectionRole:
                 vec0_handle.release()
                 vec1_handle = s1_corr_consumer.wait_and_advance()
                 seqlen_kv_loop_steps = (
-                    get_trip_count(self.mask_type, self.window_left, curr_block_coord, self.cta_tiler, seqlen_k, seqlen_q_)
+                    get_trip_count(
+                        self.mask_type,
+                        self.window_left,
+                        curr_block_coord,
+                        self.cta_tiler,
+                        seqlen_k,
+                        seqlen_q_,
+                    )
                     - 1
                 )
                 for _i in cutlass.range(0, seqlen_kv_loop_steps, 1, unroll=1):
@@ -361,9 +374,7 @@ class CorrectionRole:
                     tTMEM_LOAD_VECrS = cute.make_fragment(
                         tTMEM_LOAD_VECcS.shape, self.qk_acc_dtype
                     )
-                    cute.copy(
-                        tiled_tmem_load_vec, tTMEM_LOAD_VECtS0, tTMEM_LOAD_VECrS
-                    )
+                    cute.copy(tiled_tmem_load_vec, tTMEM_LOAD_VECtS0, tTMEM_LOAD_VECrS)
                     scale_ = scale_softmax_log2 * (
                         tTMEM_LOAD_VECrS[0] - tTMEM_LOAD_VECrS[1]
                     )
@@ -380,9 +391,7 @@ class CorrectionRole:
 
                     # wait for vec1 (row_wise current max & previous max)
                     vec1_handle = s1_corr_consumer.wait_and_advance()
-                    cute.copy(
-                        tiled_tmem_load_vec, tTMEM_LOAD_VECtS1, tTMEM_LOAD_VECrS
-                    )
+                    cute.copy(tiled_tmem_load_vec, tTMEM_LOAD_VECtS1, tTMEM_LOAD_VECrS)
                     scale_ = scale_softmax_log2 * (
                         tTMEM_LOAD_VECrS[0] - tTMEM_LOAD_VECrS[1]
                     )

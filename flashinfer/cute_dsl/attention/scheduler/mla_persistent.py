@@ -262,7 +262,9 @@ def create_mla_static_tile_scheduler(
 # ---------------------------------------------------------------------------
 
 
-def mla_get_split_kv(B: int, S: int, K: int, mma_qk_tiler_mn: tuple, max_active_blocks: int) -> int:
+def mla_get_split_kv(
+    B: int, S: int, K: int, mma_qk_tiler_mn: tuple, max_active_blocks: int
+) -> int:
     """Get split_kv value for MLA kernel (host-side)."""
     max_splits = ceil_div(K, mma_qk_tiler_mn[1])
     blocks_per_batch = max(1, max_active_blocks // B // (S * 2))

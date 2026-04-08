@@ -64,12 +64,12 @@ class LoaderRole:
         block_coord: tuple,
     ):
         """Partition Q global tensor for TMA loads. Returns (tQsQ, tQgQ)."""
-        gQ_qdl = cute.flat_divide(
-            mQ_qdl, cute.select(self.qk_mma_tiler, mode=[0, 2])
-        )
+        gQ_qdl = cute.flat_divide(mQ_qdl, cute.select(self.qk_mma_tiler, mode=[0, 2]))
         tSgQ_qdl = qk_thr_mma.partition_A(gQ_qdl)
         tQsQ, tQgQ_qdl = cute.nvgpu.cpasync.tma_partition(
-            tma_atom_q, 0, cute.make_layout(1),
+            tma_atom_q,
+            0,
+            cute.make_layout(1),
             cute.group_modes(sQ, 0, 3),
             cute.group_modes(tSgQ_qdl, 0, 3),
         )
@@ -86,12 +86,12 @@ class LoaderRole:
         block_coord: tuple,
     ):
         """Partition K global tensor for TMA loads. Returns (tKsK, tKgK)."""
-        gK_kdl = cute.flat_divide(
-            mK_kdl, cute.select(self.qk_mma_tiler, mode=[1, 2])
-        )
+        gK_kdl = cute.flat_divide(mK_kdl, cute.select(self.qk_mma_tiler, mode=[1, 2]))
         tSgK_kdl = qk_thr_mma.partition_B(gK_kdl)
         tKsK, tKgK_kdl = cute.nvgpu.cpasync.tma_partition(
-            tma_atom_k, 0, cute.make_layout(1),
+            tma_atom_k,
+            0,
+            cute.make_layout(1),
             cute.group_modes(sK, 0, 3),
             cute.group_modes(tSgK_kdl, 0, 3),
         )
@@ -108,12 +108,12 @@ class LoaderRole:
         block_coord: tuple,
     ):
         """Partition V global tensor for TMA loads. Returns (tVsV, tVgV)."""
-        gV_dkl = cute.flat_divide(
-            mV_dkl, cute.select(self.pv_mma_tiler, mode=[1, 2])
-        )
+        gV_dkl = cute.flat_divide(mV_dkl, cute.select(self.pv_mma_tiler, mode=[1, 2]))
         tSgV_dkl = pv_thr_mma.partition_B(gV_dkl)
         tVsV, tVgV_dkl = cute.nvgpu.cpasync.tma_partition(
-            tma_atom_v, 0, cute.make_layout(1),
+            tma_atom_v,
+            0,
+            cute.make_layout(1),
             cute.group_modes(sV, 0, 3),
             cute.group_modes(tSgV_dkl, 0, 3),
         )
@@ -131,7 +131,8 @@ class LoaderRole:
         """Issue a single TMA load into SMEM with pipeline barrier."""
         handle = producer.acquire_and_advance()
         cute.copy(
-            tma_atom, src_global,
+            tma_atom,
+            src_global,
             dst_smem[None, handle.index],
             tma_bar_ptr=handle.barrier,
         )
@@ -221,7 +222,9 @@ class LoaderRole:
                 )
                 tSgQ_qdl = qk_thr_mma.partition_A(gQ_qdl)
                 tQsQ, tQgQ_qdl = cute.nvgpu.cpasync.tma_partition(
-                    tma_atom_q, 0, cute.make_layout(1),
+                    tma_atom_q,
+                    0,
+                    cute.make_layout(1),
                     cute.group_modes(sQ, 0, 3),
                     cute.group_modes(tSgQ_qdl, 0, 3),
                 )
@@ -232,7 +235,9 @@ class LoaderRole:
                 )
                 tSgK_kdl = qk_thr_mma.partition_B(gK_kdl)
                 tKsK, tKgK_kdl = cute.nvgpu.cpasync.tma_partition(
-                    tma_atom_k, 0, cute.make_layout(1),
+                    tma_atom_k,
+                    0,
+                    cute.make_layout(1),
                     cute.group_modes(sK, 0, 3),
                     cute.group_modes(tSgK_kdl, 0, 3),
                 )
@@ -243,7 +248,9 @@ class LoaderRole:
                 )
                 tSgV_dkl = pv_thr_mma.partition_B(gV_dkl)
                 tVsV, tVgV_dkl = cute.nvgpu.cpasync.tma_partition(
-                    tma_atom_v, 0, cute.make_layout(1),
+                    tma_atom_v,
+                    0,
+                    cute.make_layout(1),
                     cute.group_modes(sV, 0, 3),
                     cute.group_modes(tSgV_dkl, 0, 3),
                 )
@@ -260,8 +267,12 @@ class LoaderRole:
                 )
                 # K0
                 kv_coord = get_kv_start_block_idx(
-                    self.mask_type, self.window_left,
-                    curr_block_coord, self.cta_tiler, seqlen_k, seqlen_q
+                    self.mask_type,
+                    self.window_left,
+                    curr_block_coord,
+                    self.cta_tiler,
+                    seqlen_k,
+                    seqlen_q,
                 )
                 k_handle_producer = load_kv_producer.acquire_and_advance()
                 cute.copy(
@@ -290,7 +301,14 @@ class LoaderRole:
                 kv_coord += 1
 
                 seqlen_kv_loop_steps = (
-                    get_trip_count(self.mask_type, self.window_left, curr_block_coord, self.cta_tiler, seqlen_k, seqlen_q)
+                    get_trip_count(
+                        self.mask_type,
+                        self.window_left,
+                        curr_block_coord,
+                        self.cta_tiler,
+                        seqlen_k,
+                        seqlen_q,
+                    )
                     - 1
                 )
                 for _i in cutlass.range(0, seqlen_kv_loop_steps, 1, unroll=1):

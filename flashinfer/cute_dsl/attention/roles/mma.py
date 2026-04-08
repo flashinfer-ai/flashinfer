@@ -35,9 +35,14 @@ class MmaRole:
     Created from AttentionConfig in the kernel's __init__.
     """
 
-    def __init__(self, config: AttentionConfig, tmem_alloc_cols,
-                 tmem_alloc_sync_bar_id, threads_per_warp,
-                 has_logits_transform: bool = False):
+    def __init__(
+        self,
+        config: AttentionConfig,
+        tmem_alloc_cols,
+        tmem_alloc_sync_bar_id,
+        threads_per_warp,
+        has_logits_transform: bool = False,
+    ):
         self.cta_tiler = config.cta_tiler
         self.mask_type = config.mask_type
         self.window_left = config.window_left
@@ -213,7 +218,14 @@ class MmaRole:
                     o0_handle_producer.commit()
 
                 seqlen_kv_loop_steps = (
-                    get_trip_count(self.mask_type, self.window_left, curr_block_coord, self.cta_tiler, seqlen_k, seqlen_q_)
+                    get_trip_count(
+                        self.mask_type,
+                        self.window_left,
+                        curr_block_coord,
+                        self.cta_tiler,
+                        seqlen_k,
+                        seqlen_q_,
+                    )
                     - 1
                 )
 

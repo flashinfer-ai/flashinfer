@@ -38,7 +38,9 @@ class FmhaStaticTileSchedulerParams:
     def __new_from_mlir_values__(self, values):
         obj_list = []
         for obj, n_items in zip(
-            [self.is_persistent, self.problem_shape_mbh], self._values_pos
+            [self.is_persistent, self.problem_shape_mbh],
+            self._values_pos,
+            strict=True,
         ):
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]

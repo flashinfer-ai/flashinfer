@@ -106,9 +106,7 @@ class MLAMmaFP8Role:
         """Compute one QK-latent stage: inner k-block GEMM loop."""
         tStS = qk_params.tStS_staged[None, None, None, s_stage_index]
         for k_block in cutlass.range(cute.size(qk_params.tSrQ.shape[2])):
-            tiled_mma_qk.set(
-                tcgen05.Field.ACCUMULATE, k_block != 0 or accumulate
-            )
+            tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, k_block != 0 or accumulate)
             cute.gemm(
                 tiled_mma_qk,
                 tStS,
@@ -130,9 +128,7 @@ class MLAMmaFP8Role:
         """Compute one QK-rope stage using separate tSrKC_rope fragments."""
         tStS = qk_params.tStS_staged[None, None, None, s_stage_index]
         for k_block in cutlass.range(self.rope_dim // tiled_mma_qk.shape_mnk[2]):
-            tiled_mma_qk.set(
-                tcgen05.Field.ACCUMULATE, k_block != 0 or accumulate
-            )
+            tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, k_block != 0 or accumulate)
             cute.gemm(
                 tiled_mma_qk,
                 tStS,
@@ -155,14 +151,15 @@ class MLAMmaFP8Role:
         """Compute one PV stage: inner k-block GEMM loop."""
         tOtO = pv_params.tOtO_staged[None, None, None, acc_stage]
         for k_block in cutlass.range(pv_params.tOrP.shape[2]):
-            tiled_mma_pv.set(
-                tcgen05.Field.ACCUMULATE, k_block != 0 or accumulate
-            )
+            tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, k_block != 0 or accumulate)
             cute.gemm(
                 tiled_mma_pv,
                 tOtO,
                 pv_params.tOrP[
-                    None, None, k_block, (p_stage, p_stage_index),
+                    None,
+                    None,
+                    k_block,
+                    (p_stage, p_stage_index),
                 ],
                 pv_params.tOrVC[
                     None, None, k_block, ((acc_stage, p_stage), vc_stage_index)
@@ -247,14 +244,21 @@ class MLAMmaFP8Role:
             )
             if k_tile_count > 0:
                 mma_qk_params = SimpleNamespace(
-                    sQ=sQ, sQ_rope=sQ_rope, sKC=sKC, sKC_rope=sKC_rope,
-                    tSrQ=tSrQ, tSrQ_rope=tSrQ_rope,
-                    tSrKC=tSrKC, tSrKC_rope=tSrKC_rope,
+                    sQ=sQ,
+                    sQ_rope=sQ_rope,
+                    sKC=sKC,
+                    sKC_rope=sKC_rope,
+                    tSrQ=tSrQ,
+                    tSrQ_rope=tSrQ_rope,
+                    tSrKC=tSrKC,
+                    tSrKC_rope=tSrKC_rope,
                     tStS_staged=tStS_staged,
                 )
                 mma_pv_params = SimpleNamespace(
-                    sP=sP, sVC=sVC,
-                    tOrP=tOrP, tOrVC=tOrVC,
+                    sP=sP,
+                    sVC=sVC,
+                    tOrP=tOrP,
+                    tOrVC=tOrVC,
                     tOtO_staged=tOtO_staged,
                 )
 
@@ -266,14 +270,20 @@ class MLAMmaFP8Role:
                     kv_handle = load_k_consumer.wait_and_advance()
                     for q_stage in range(self.iterations_qk_latent):
                         self._gemm_qk_latent_one_stage(
-                            mma_qk_params, tiled_mma_qk,
-                            s_handle.index, kv_handle.index, q_stage,
+                            mma_qk_params,
+                            tiled_mma_qk,
+                            s_handle.index,
+                            kv_handle.index,
+                            q_stage,
                             accumulate=(q_stage > 0),
                         )
                     for q_stage in range(self.iterations_qk_rope):
                         self._gemm_qk_rope_one_stage(
-                            mma_qk_params, tiled_mma_qk,
-                            s_handle.index, kv_handle.index, q_stage,
+                            mma_qk_params,
+                            tiled_mma_qk,
+                            s_handle.index,
+                            kv_handle.index,
+                            q_stage,
                             accumulate=True,
                         )
                     kv_handle.release()
@@ -287,14 +297,20 @@ class MLAMmaFP8Role:
                         kv_handle = load_k_consumer.wait_and_advance()
                         for q_stage in range(self.iterations_qk_latent):
                             self._gemm_qk_latent_one_stage(
-                                mma_qk_params, tiled_mma_qk,
-                                s_handle.index, kv_handle.index, q_stage,
+                                mma_qk_params,
+                                tiled_mma_qk,
+                                s_handle.index,
+                                kv_handle.index,
+                                q_stage,
                                 accumulate=(q_stage > 0),
                             )
                         for q_stage in range(self.iterations_qk_rope):
                             self._gemm_qk_rope_one_stage(
-                                mma_qk_params, tiled_mma_qk,
-                                s_handle.index, kv_handle.index, q_stage,
+                                mma_qk_params,
+                                tiled_mma_qk,
+                                s_handle.index,
+                                kv_handle.index,
+                                q_stage,
                                 accumulate=True,
                             )
                         kv_handle.release()
@@ -307,9 +323,12 @@ class MLAMmaFP8Role:
                             o_handle = mma_o_producer.acquire_and_advance()
                             for p_stage in range(self.iterations_pv_k):
                                 self._gemm_pv_one_stage(
-                                    mma_pv_params, tiled_mma_pv,
-                                    p_handle.index, v_handle.index,
-                                    p_stage, acc_stage,
+                                    mma_pv_params,
+                                    tiled_mma_pv,
+                                    p_handle.index,
+                                    v_handle.index,
+                                    p_stage,
+                                    acc_stage,
                                     accumulate=(pv_accumulated or p_stage > 0),
                                 )
                             o_handle.commit()
@@ -328,9 +347,12 @@ class MLAMmaFP8Role:
                         o_handle = mma_o_producer.acquire_and_advance()
                         for p_stage in range(self.iterations_pv_k):
                             self._gemm_pv_one_stage(
-                                mma_pv_params, tiled_mma_pv,
-                                p_handle.index, v_handle.index,
-                                p_stage, acc_stage,
+                                mma_pv_params,
+                                tiled_mma_pv,
+                                p_handle.index,
+                                v_handle.index,
+                                p_stage,
+                                acc_stage,
                                 accumulate=(pv_accumulated or p_stage > 0),
                             )
                         o_handle.commit()

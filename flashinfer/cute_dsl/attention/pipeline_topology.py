@@ -34,6 +34,7 @@ class PipelineType(enum.Enum):
     - ASYNC: all-threads for both producer and consumer
     - CP_ASYNC: all-threads for both (cpasync-based, no cta_layout_vmnk/tx_count)
     """
+
     TMA_UMMA = "PipelineTmaUmma"
     UMMA_ASYNC = "PipelineUmmaAsync"
     ASYNC_UMMA = "PipelineAsyncUmma"
@@ -54,7 +55,11 @@ class PipelineType(enum.Enum):
     @property
     def needs_cta_layout(self) -> bool:
         """Whether this pipeline type accepts cta_layout_vmnk for multi-CTA clusters."""
-        return self in (PipelineType.TMA_UMMA, PipelineType.UMMA_ASYNC, PipelineType.ASYNC_UMMA)
+        return self in (
+            PipelineType.TMA_UMMA,
+            PipelineType.UMMA_ASYNC,
+            PipelineType.ASYNC_UMMA,
+        )
 
     def producer_thread_count(self, num_warps: int, threads_per_warp: int) -> int:
         if self in (PipelineType.TMA_UMMA, PipelineType.UMMA_ASYNC):
@@ -172,7 +177,6 @@ class PipelineTopology:
         return result
 
 
-
 def make_prefill_topology(
     schedule: WarpSchedule,
     q_stages: int = 2,
@@ -202,31 +206,78 @@ def make_prefill_topology(
     corr = s.correction_warp_ids
     epi = (s.epilogue_warp_id,)
 
-    return PipelineTopology(edges=[
-        PipelineEdge("load_q", PipelineType.TMA_UMMA, stages=q_stages,
-                     producer_warp_ids=load, consumer_warp_ids=mma,
-                     tx_count_key="q"),
-        PipelineEdge("load_kv", PipelineType.TMA_UMMA, stages=kv_stages,
-                     producer_warp_ids=load, consumer_warp_ids=mma,
-                     tx_count_key="kv"),
-        PipelineEdge("mma_s0", PipelineType.UMMA_ASYNC, stages=mma_softmax_stages,
-                     producer_warp_ids=mma, consumer_warp_ids=s0),
-        PipelineEdge("mma_s1", PipelineType.UMMA_ASYNC, stages=mma_softmax_stages,
-                     producer_warp_ids=mma, consumer_warp_ids=s1),
-        PipelineEdge("s0_corr", PipelineType.ASYNC, stages=softmax_corr_stages,
-                     producer_warp_ids=s0, consumer_warp_ids=corr),
-        PipelineEdge("s1_corr", PipelineType.ASYNC, stages=softmax_corr_stages,
-                     producer_warp_ids=s1, consumer_warp_ids=corr),
-        PipelineEdge("corr_epi", PipelineType.ASYNC, stages=epi_stages,
-                     producer_warp_ids=corr, consumer_warp_ids=epi),
-        PipelineEdge("mma_corr", PipelineType.UMMA_ASYNC, stages=mma_corr_stages,
-                     producer_warp_ids=mma, consumer_warp_ids=corr),
-        # Softmax1 must wait for softmax0's row-max update before processing
-        # its KV tile — online softmax requires sequential row-max propagation
-        # between the two softmax warpgroups.
-        PipelineEdge("s0_s1_sequence", PipelineType.ASYNC, stages=1,
-                     producer_warp_ids=s0, consumer_warp_ids=s1),
-    ])
+    return PipelineTopology(
+        edges=[
+            PipelineEdge(
+                "load_q",
+                PipelineType.TMA_UMMA,
+                stages=q_stages,
+                producer_warp_ids=load,
+                consumer_warp_ids=mma,
+                tx_count_key="q",
+            ),
+            PipelineEdge(
+                "load_kv",
+                PipelineType.TMA_UMMA,
+                stages=kv_stages,
+                producer_warp_ids=load,
+                consumer_warp_ids=mma,
+                tx_count_key="kv",
+            ),
+            PipelineEdge(
+                "mma_s0",
+                PipelineType.UMMA_ASYNC,
+                stages=mma_softmax_stages,
+                producer_warp_ids=mma,
+                consumer_warp_ids=s0,
+            ),
+            PipelineEdge(
+                "mma_s1",
+                PipelineType.UMMA_ASYNC,
+                stages=mma_softmax_stages,
+                producer_warp_ids=mma,
+                consumer_warp_ids=s1,
+            ),
+            PipelineEdge(
+                "s0_corr",
+                PipelineType.ASYNC,
+                stages=softmax_corr_stages,
+                producer_warp_ids=s0,
+                consumer_warp_ids=corr,
+            ),
+            PipelineEdge(
+                "s1_corr",
+                PipelineType.ASYNC,
+                stages=softmax_corr_stages,
+                producer_warp_ids=s1,
+                consumer_warp_ids=corr,
+            ),
+            PipelineEdge(
+                "corr_epi",
+                PipelineType.ASYNC,
+                stages=epi_stages,
+                producer_warp_ids=corr,
+                consumer_warp_ids=epi,
+            ),
+            PipelineEdge(
+                "mma_corr",
+                PipelineType.UMMA_ASYNC,
+                stages=mma_corr_stages,
+                producer_warp_ids=mma,
+                consumer_warp_ids=corr,
+            ),
+            # Softmax1 must wait for softmax0's row-max update before processing
+            # its KV tile — online softmax requires sequential row-max propagation
+            # between the two softmax warpgroups.
+            PipelineEdge(
+                "s0_s1_sequence",
+                PipelineType.ASYNC,
+                stages=1,
+                producer_warp_ids=s0,
+                consumer_warp_ids=s1,
+            ),
+        ]
+    )
 
 
 def make_prefill_topology_transform(
@@ -257,24 +308,61 @@ def make_prefill_topology_transform(
     s1 = s.softmax1_warp_ids
     epi = (s.epilogue_warp_id,)
 
-    return PipelineTopology(edges=[
-        PipelineEdge("load_q", PipelineType.TMA_UMMA, stages=q_stages,
-                     producer_warp_ids=load, consumer_warp_ids=mma,
-                     tx_count_key="q"),
-        PipelineEdge("load_kv", PipelineType.TMA_UMMA, stages=kv_stages,
-                     producer_warp_ids=load, consumer_warp_ids=mma,
-                     tx_count_key="kv"),
-        PipelineEdge("mma_s0", PipelineType.UMMA_ASYNC, stages=mma_softmax_stages,
-                     producer_warp_ids=mma, consumer_warp_ids=s0),
-        PipelineEdge("mma_s1", PipelineType.UMMA_ASYNC, stages=mma_softmax_stages,
-                     producer_warp_ids=mma, consumer_warp_ids=s1),
-        PipelineEdge("s0_epi", PipelineType.ASYNC, stages=epi_stages,
-                     producer_warp_ids=s0, consumer_warp_ids=epi),
-        PipelineEdge("s1_epi", PipelineType.ASYNC, stages=epi_stages,
-                     producer_warp_ids=s1, consumer_warp_ids=epi),
-        PipelineEdge("s0_s1_sequence", PipelineType.ASYNC, stages=1,
-                     producer_warp_ids=s0, consumer_warp_ids=s1),
-    ])
+    return PipelineTopology(
+        edges=[
+            PipelineEdge(
+                "load_q",
+                PipelineType.TMA_UMMA,
+                stages=q_stages,
+                producer_warp_ids=load,
+                consumer_warp_ids=mma,
+                tx_count_key="q",
+            ),
+            PipelineEdge(
+                "load_kv",
+                PipelineType.TMA_UMMA,
+                stages=kv_stages,
+                producer_warp_ids=load,
+                consumer_warp_ids=mma,
+                tx_count_key="kv",
+            ),
+            PipelineEdge(
+                "mma_s0",
+                PipelineType.UMMA_ASYNC,
+                stages=mma_softmax_stages,
+                producer_warp_ids=mma,
+                consumer_warp_ids=s0,
+            ),
+            PipelineEdge(
+                "mma_s1",
+                PipelineType.UMMA_ASYNC,
+                stages=mma_softmax_stages,
+                producer_warp_ids=mma,
+                consumer_warp_ids=s1,
+            ),
+            PipelineEdge(
+                "s0_epi",
+                PipelineType.ASYNC,
+                stages=epi_stages,
+                producer_warp_ids=s0,
+                consumer_warp_ids=epi,
+            ),
+            PipelineEdge(
+                "s1_epi",
+                PipelineType.ASYNC,
+                stages=epi_stages,
+                producer_warp_ids=s1,
+                consumer_warp_ids=epi,
+            ),
+            PipelineEdge(
+                "s0_s1_sequence",
+                PipelineType.ASYNC,
+                stages=1,
+                producer_warp_ids=s0,
+                consumer_warp_ids=s1,
+            ),
+        ]
+    )
 
 
 def make_mla_topology(
@@ -306,27 +394,64 @@ def make_mla_topology(
     compute = s.compute_warp_ids
     correction = s.correction_warp_ids
 
-    return PipelineTopology(edges=[
-        PipelineEdge("load_q", PipelineType.TMA_UMMA, stages=load_q_stages,
-                     producer_warp_ids=load_tma, consumer_warp_ids=mma,
-                     tx_count_key="q"),
-        PipelineEdge("load_kv", PipelineType.TMA_UMMA, stages=load_kv_stages,
-                     producer_warp_ids=load_tma, consumer_warp_ids=mma,
-                     tx_count_key="kv"),
-        PipelineEdge("mma_s", PipelineType.UMMA_ASYNC, stages=mma_s_stages,
-                     producer_warp_ids=mma, consumer_warp_ids=compute,
-                     cluster_scale=cluster_scale),
-        PipelineEdge("p_mma", PipelineType.ASYNC_UMMA, stages=p_mma_stages,
-                     producer_warp_ids=compute, consumer_warp_ids=mma,
-                     cluster_scale=cluster_scale),
-        PipelineEdge("p_cor", PipelineType.ASYNC, stages=p_cor_stages,
-                     producer_warp_ids=compute, consumer_warp_ids=correction),
-        PipelineEdge("mma_o", PipelineType.UMMA_ASYNC, stages=mma_o_stages,
-                     producer_warp_ids=mma, consumer_warp_ids=correction,
-                     cluster_scale=cluster_scale),
-        PipelineEdge("load_pt", PipelineType.CP_ASYNC, stages=load_pt_stages,
-                     producer_warp_ids=load_pt, consumer_warp_ids=load_tma),
-    ])
+    return PipelineTopology(
+        edges=[
+            PipelineEdge(
+                "load_q",
+                PipelineType.TMA_UMMA,
+                stages=load_q_stages,
+                producer_warp_ids=load_tma,
+                consumer_warp_ids=mma,
+                tx_count_key="q",
+            ),
+            PipelineEdge(
+                "load_kv",
+                PipelineType.TMA_UMMA,
+                stages=load_kv_stages,
+                producer_warp_ids=load_tma,
+                consumer_warp_ids=mma,
+                tx_count_key="kv",
+            ),
+            PipelineEdge(
+                "mma_s",
+                PipelineType.UMMA_ASYNC,
+                stages=mma_s_stages,
+                producer_warp_ids=mma,
+                consumer_warp_ids=compute,
+                cluster_scale=cluster_scale,
+            ),
+            PipelineEdge(
+                "p_mma",
+                PipelineType.ASYNC_UMMA,
+                stages=p_mma_stages,
+                producer_warp_ids=compute,
+                consumer_warp_ids=mma,
+                cluster_scale=cluster_scale,
+            ),
+            PipelineEdge(
+                "p_cor",
+                PipelineType.ASYNC,
+                stages=p_cor_stages,
+                producer_warp_ids=compute,
+                consumer_warp_ids=correction,
+            ),
+            PipelineEdge(
+                "mma_o",
+                PipelineType.UMMA_ASYNC,
+                stages=mma_o_stages,
+                producer_warp_ids=mma,
+                consumer_warp_ids=correction,
+                cluster_scale=cluster_scale,
+            ),
+            PipelineEdge(
+                "load_pt",
+                PipelineType.CP_ASYNC,
+                stages=load_pt_stages,
+                producer_warp_ids=load_pt,
+                consumer_warp_ids=load_tma,
+            ),
+        ]
+    )
 
 
 def make_mla_fp8_topology(
@@ -362,25 +487,62 @@ def make_mla_fp8_topology(
     compute = s.compute_warp_ids
     correction = s.correction_warp_ids
 
-    return PipelineTopology(edges=[
-        PipelineEdge("load_q", PipelineType.TMA_UMMA, stages=load_q_stages,
-                     producer_warp_ids=load_k, consumer_warp_ids=mma,
-                     tx_count_key="q"),
-        PipelineEdge("load_k", PipelineType.TMA_UMMA, stages=load_k_stages,
-                     producer_warp_ids=load_k, consumer_warp_ids=mma,
-                     tx_count_key="kv"),
-        PipelineEdge("load_v", PipelineType.TMA_UMMA, stages=load_v_stages,
-                     producer_warp_ids=load_v, consumer_warp_ids=mma,
-                     tx_count_key="vc"),
-        PipelineEdge("mma_s", PipelineType.UMMA_ASYNC, stages=mma_s_stages,
-                     producer_warp_ids=mma, consumer_warp_ids=compute,
-                     cluster_scale=cluster_scale),
-        PipelineEdge("p_mma", PipelineType.ASYNC_UMMA, stages=p_mma_stages,
-                     producer_warp_ids=compute, consumer_warp_ids=mma,
-                     cluster_scale=cluster_scale),
-        PipelineEdge("p_cor", PipelineType.ASYNC, stages=p_cor_stages,
-                     producer_warp_ids=compute, consumer_warp_ids=correction),
-        PipelineEdge("mma_o", PipelineType.UMMA_ASYNC, stages=mma_o_stages,
-                     producer_warp_ids=mma, consumer_warp_ids=correction,
-                     cluster_scale=cluster_scale),
-    ])
+    return PipelineTopology(
+        edges=[
+            PipelineEdge(
+                "load_q",
+                PipelineType.TMA_UMMA,
+                stages=load_q_stages,
+                producer_warp_ids=load_k,
+                consumer_warp_ids=mma,
+                tx_count_key="q",
+            ),
+            PipelineEdge(
+                "load_k",
+                PipelineType.TMA_UMMA,
+                stages=load_k_stages,
+                producer_warp_ids=load_k,
+                consumer_warp_ids=mma,
+                tx_count_key="kv",
+            ),
+            PipelineEdge(
+                "load_v",
+                PipelineType.TMA_UMMA,
+                stages=load_v_stages,
+                producer_warp_ids=load_v,
+                consumer_warp_ids=mma,
+                tx_count_key="vc",
+            ),
+            PipelineEdge(
+                "mma_s",
+                PipelineType.UMMA_ASYNC,
+                stages=mma_s_stages,
+                producer_warp_ids=mma,
+                consumer_warp_ids=compute,
+                cluster_scale=cluster_scale,
+            ),
+            PipelineEdge(
+                "p_mma",
+                PipelineType.ASYNC_UMMA,
+                stages=p_mma_stages,
+                producer_warp_ids=compute,
+                consumer_warp_ids=mma,
+                cluster_scale=cluster_scale,
+            ),
+            PipelineEdge(
+                "p_cor",
+                PipelineType.ASYNC,
+                stages=p_cor_stages,
+                producer_warp_ids=compute,
+                consumer_warp_ids=correction,
+            ),
+            PipelineEdge(
+                "mma_o",
+                PipelineType.UMMA_ASYNC,
+                stages=mma_o_stages,
+                producer_warp_ids=mma,
+                consumer_warp_ids=correction,
+                cluster_scale=cluster_scale,
+            ),
+        ]
+    )

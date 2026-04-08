@@ -77,7 +77,9 @@ def get_masked_trip_count(
         )
         causal_offset = seqlen_k - seqlen_q
         first_boundary = (blk_coord[0] * tile_shape[0] + causal_offset) // tile_shape[1]
-        last_boundary = ((blk_coord[0] + 1) * tile_shape[0] - 1 + causal_offset) // tile_shape[1]
+        last_boundary = (
+            (blk_coord[0] + 1) * tile_shape[0] - 1 + causal_offset
+        ) // tile_shape[1]
         result = cutlass.min(
             trip_count,
             last_boundary - first_boundary + 1,
@@ -102,14 +104,13 @@ def get_unmasked_trip_count(
     """Number of fully unmasked KV tile blocks."""
     result = 0
     if mask_type == MaskType.NO_MASK:
-        result = get_trip_count(
-            mask_type, window_left, blk_coord, tile_shape, seqlen_k
-        )
+        result = get_trip_count(mask_type, window_left, blk_coord, tile_shape, seqlen_k)
     elif mask_type == MaskType.RESIDUAL_MASK:
         if seqlen_k % tile_shape[1] != 0:
-            result = get_trip_count(
-                mask_type, window_left, blk_coord, tile_shape, seqlen_k
-            ) - 1
+            result = (
+                get_trip_count(mask_type, window_left, blk_coord, tile_shape, seqlen_k)
+                - 1
+            )
         else:
             result = get_trip_count(
                 mask_type, window_left, blk_coord, tile_shape, seqlen_k
@@ -166,5 +167,9 @@ def apply_mask(
     elif mask_type == MaskType.SLIDING_WINDOW_MASK:
         for i in range(cute.size(acc_qk)):
             pos = index_qk[i]
-            if pos[1] - pos[0] > window_left or pos[0] - pos[1] > window_left or pos[1] >= seqlen_k:
+            if (
+                pos[1] - pos[0] > window_left
+                or pos[0] - pos[1] > window_left
+                or pos[1] >= seqlen_k
+            ):
                 acc_qk[i] = -Float32.inf

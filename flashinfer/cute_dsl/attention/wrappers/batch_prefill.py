@@ -16,7 +16,7 @@ import torch
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.typing import Int32, Float32
+from cutlass.cute.typing import Int32
 
 from flashinfer.api_logging import flashinfer_api
 
@@ -145,7 +145,11 @@ class BatchPrefillCuteDSLWrapper:
             num_repeat_kv_heads=h_r,
             window_left=window_left,
         )
-        _torch_dtype_width = {torch.float16: 16, torch.bfloat16: 16, torch.float8_e4m3fn: 8}
+        _torch_dtype_width = {
+            torch.float16: 16,
+            torch.bfloat16: 16,
+            torch.float8_e4m3fn: 8,
+        }
         config.can_implement(dtype_width=_torch_dtype_width[q_data_type])
         fusion = AttentionFusion(variant=self._variant)
         fmha = BlackwellFusedMultiHeadAttentionForward(config, fusion)
@@ -312,7 +316,7 @@ class BatchPrefillCuteDSLWrapper:
         # Pad output in front for kernel scratch space; the kernel uses a
         # negative pointer offset to reach back into the padding area.
         out_full = torch.nn.functional.pad(out, (0, 0, 0, 0, self._o_padding, 0))
-        out_view = out_full[self._o_padding:].detach()
+        out_view = out_full[self._o_padding :].detach()
         out_view._keep_alive = out_full
 
         # TVM-FFI: pass PyTorch tensors directly, no stream arg (env stream)

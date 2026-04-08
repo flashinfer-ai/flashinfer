@@ -44,7 +44,6 @@ Extracted from the monolithic MLA decode kernel's correction warp section.
 import cutlass
 import cutlass.cute as cute
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
-import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.pipeline import PipelineConsumer
 from types import SimpleNamespace
@@ -349,16 +348,12 @@ class MLACorrectionRole:
         Side-effect-only (TMEM load, global store, fence). Pipeline ops stay in caller.
         """
         tmem_load_tiled_copy, tAcc, tTR_tAcc, tTR_gO, tTR_cO, tTR_rAcc = (
-            self._tmem_load_partition(
-                common_params, common_params.tiled_mma_pv, iter_n
-            )
+            self._tmem_load_partition(common_params, common_params.tiled_mma_pv, iter_n)
         )
 
         cute.copy(tmem_load_tiled_copy, tTR_tAcc, tTR_rAcc)
 
-        for i in cutlass.range(
-            cute.size(tTR_rAcc), vectorize=True, unroll_full=True
-        ):
+        for i in cutlass.range(cute.size(tTR_rAcc), vectorize=True, unroll_full=True):
             tTR_rAcc[i] = (
                 tTR_rAcc[i]
                 * epilogue_params.output_scale
@@ -410,9 +405,7 @@ class MLACorrectionRole:
             )
         else:
             gLSE = cute.local_tile(
-                epilogue_params.mAccLSE[
-                    None, common_params.blk_coord[3], None, None
-                ],
+                epilogue_params.mAccLSE[None, common_params.blk_coord[3], None, None],
                 (cta_pv_tiler[0], 1, 1),
                 (
                     common_params.blk_coord[0],
@@ -463,6 +456,7 @@ class MLACorrectionRole:
 
         if cutlass.const_expr(self.warps_in_n == 2):
             common_params.smem_exchange[tidx] = row_sum
+            assert self.epilogue_exchange_sync_bar is not None
             self.epilogue_exchange_sync_bar.arrive_and_wait()
             row_sum = (
                 row_sum
@@ -529,19 +523,21 @@ class MLACorrectionRole:
                 while k_tile_count > 0:
                     p_cor_handle = p_cor_consumer.wait_and_advance()
                     row_sum, row_max, correction_factor, no_correction = (
-                        self.get_correction_factor(
-                            common_params, p_cor_handle
-                        )
+                        self.get_correction_factor(common_params, p_cor_handle)
                     )
 
                     if k_tile_count_init != k_tile_count:
                         if cutlass.const_expr(self.per_iteration_mma_o):
-                            skip_correction = cute.arch.vote_all_sync(no_correction == 1)
+                            skip_correction = cute.arch.vote_all_sync(
+                                no_correction == 1
+                            )
                             for iter_n in cutlass.range_constexpr(self.iterations_pv_n):
                                 mma_o_handle = mma_o_consumer.wait_and_advance()
                                 self._rescale_one_iter(
-                                    common_params, correction_factor,
-                                    skip_correction, iter_n,
+                                    common_params,
+                                    correction_factor,
+                                    skip_correction,
+                                    iter_n,
                                 )
                                 mma_o_handle.release()
                         else:
@@ -561,19 +557,27 @@ class MLACorrectionRole:
                             )
                             if cutlass.const_expr(self.warps_in_n == 2):
                                 common_params.smem_exchange[tidx] = row_sum
+                                assert self.epilogue_exchange_sync_bar is not None
                                 self.epilogue_exchange_sync_bar.arrive_and_wait()
                                 row_sum = (
                                     row_sum
                                     + common_params.smem_exchange[
                                         (tidx + 64)
-                                        % (self.num_compute_warps * self.threads_per_warp)
+                                        % (
+                                            self.num_compute_warps
+                                            * self.threads_per_warp
+                                        )
                                     ]
                                 )
                             for iter_n in cutlass.range_constexpr(self.iterations_pv_n):
                                 mma_o_handle = mma_o_consumer.wait_and_advance()
                                 self._epilogue_one_iter(
-                                    common_params, epilogue_params,
-                                    row_sum, row_max, tidx, iter_n,
+                                    common_params,
+                                    epilogue_params,
+                                    row_sum,
+                                    row_max,
+                                    tidx,
+                                    iter_n,
                                 )
                                 mma_o_handle.release()
                         else:

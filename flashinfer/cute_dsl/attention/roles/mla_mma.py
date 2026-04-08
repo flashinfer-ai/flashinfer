@@ -143,9 +143,7 @@ class MLAMmaRole:
         """Compute one QK-latent stage: inner k-block GEMM loop."""
         tStS = qk_params.tStS_staged[None, None, None, s_stage_index]
         for k_block in cutlass.range(cute.size(qk_params.tSrQ.shape[2])):
-            tiled_mma_qk.set(
-                tcgen05.Field.ACCUMULATE, k_block != 0 or accumulate
-            )
+            tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, k_block != 0 or accumulate)
             cute.gemm(
                 tiled_mma_qk,
                 tStS,
@@ -167,9 +165,7 @@ class MLAMmaRole:
         """Compute one QK-rope stage: inner k-block GEMM loop."""
         tStS = qk_params.tStS_staged[None, None, None, s_stage_index]
         for k_block in cutlass.range(self.rope_dim // tiled_mma_qk.shape_mnk[2]):
-            tiled_mma_qk.set(
-                tcgen05.Field.ACCUMULATE, k_block != 0 or accumulate
-            )
+            tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, k_block != 0 or accumulate)
             cute.gemm(
                 tiled_mma_qk,
                 tStS,
@@ -192,9 +188,7 @@ class MLAMmaRole:
         """Compute one PV stage: inner k-block GEMM loop."""
         tOtO = pv_params.tOtO_staged[None, None, None, acc_stage]
         for k_block in cutlass.range(pv_params.tOrP.shape[2]):
-            tiled_mma_pv.set(
-                tcgen05.Field.ACCUMULATE, k_block != 0 or accumulate
-            )
+            tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, k_block != 0 or accumulate)
             cute.gemm(
                 tiled_mma_pv,
                 tOtO,
@@ -314,16 +308,22 @@ class MLAMmaRole:
                     for q_stage in range(self.iterations_qk_latent):
                         kv_handle = load_kv_consumer.wait_and_advance()
                         self._gemm_qk_latent_one_stage(
-                            mma_qk_params, tiled_mma_qk,
-                            s_handle.index, kv_handle.index, q_stage,
+                            mma_qk_params,
+                            tiled_mma_qk,
+                            s_handle.index,
+                            kv_handle.index,
+                            q_stage,
                             accumulate=(q_stage > 0),
                         )
                         kv_handle.release()
                     for q_stage in range(self.iterations_qk_rope):
                         kv_handle = load_kv_consumer.wait_and_advance()
                         self._gemm_qk_rope_one_stage(
-                            mma_qk_params, tiled_mma_qk,
-                            s_handle.index, kv_handle.index, q_stage,
+                            mma_qk_params,
+                            tiled_mma_qk,
+                            s_handle.index,
+                            kv_handle.index,
+                            q_stage,
                             accumulate=True,
                         )
                         kv_handle.release()
@@ -337,16 +337,22 @@ class MLAMmaRole:
                         for q_stage in range(self.iterations_qk_latent):
                             kv_handle = load_kv_consumer.wait_and_advance()
                             self._gemm_qk_latent_one_stage(
-                                mma_qk_params, tiled_mma_qk,
-                                s_handle.index, kv_handle.index, q_stage,
+                                mma_qk_params,
+                                tiled_mma_qk,
+                                s_handle.index,
+                                kv_handle.index,
+                                q_stage,
                                 accumulate=(q_stage > 0),
                             )
                             kv_handle.release()
                         for q_stage in range(self.iterations_qk_rope):
                             kv_handle = load_kv_consumer.wait_and_advance()
                             self._gemm_qk_rope_one_stage(
-                                mma_qk_params, tiled_mma_qk,
-                                s_handle.index, kv_handle.index, q_stage,
+                                mma_qk_params,
+                                tiled_mma_qk,
+                                s_handle.index,
+                                kv_handle.index,
+                                q_stage,
                                 accumulate=True,
                             )
                             kv_handle.release()
@@ -361,9 +367,12 @@ class MLAMmaRole:
                             for acc_stage in range(self.iterations_pv_n):
                                 kv_handle = load_kv_consumer.wait_and_advance()
                                 self._gemm_pv_one_stage(
-                                    mma_pv_params, tiled_mma_pv,
-                                    p_handle.index, kv_handle.index,
-                                    p_stage, acc_stage,
+                                    mma_pv_params,
+                                    tiled_mma_pv,
+                                    p_handle.index,
+                                    kv_handle.index,
+                                    p_stage,
+                                    acc_stage,
                                     accumulate=(pv_acc or p_stage > 0),
                                 )
                                 kv_handle.release()
@@ -383,9 +392,12 @@ class MLAMmaRole:
                         for acc_stage in range(self.iterations_pv_n):
                             kv_handle = load_kv_consumer.wait_and_advance()
                             self._gemm_pv_one_stage(
-                                mma_pv_params, tiled_mma_pv,
-                                p_handle.index, kv_handle.index,
-                                p_stage, acc_stage,
+                                mma_pv_params,
+                                tiled_mma_pv,
+                                p_handle.index,
+                                kv_handle.index,
+                                p_stage,
+                                acc_stage,
                                 accumulate=(pv_acc or p_stage > 0),
                             )
                             kv_handle.release()

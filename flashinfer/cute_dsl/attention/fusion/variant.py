@@ -250,8 +250,7 @@ class AttentionVariant:
         return None
 
     @cute.jit
-    def score_mod(self, score, batch_idx, qo_idx, kv_idx,
-                  qo_head_idx, kv_head_idx):
+    def score_mod(self, score, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx):
         """Element-wise modification of QK scores.
 
         Composes with both standard softmax and custom ``transform_logits``.
@@ -354,8 +353,7 @@ class AttentionVariant:
         return m, d
 
     @cute.jit
-    def transform_output(self, output, batch_idx, qo_idx, qo_head_idx,
-                         m, rcp_d, scale):
+    def transform_output(self, output, batch_idx, qo_idx, qo_head_idx, m, rcp_d, scale):
         """Element-wise transform on final output values.
 
         Called once per output element after all KV tiles are processed,
@@ -384,6 +382,7 @@ class AttentionVariant:
 
 class StandardAttention(AttentionVariant):
     """Standard softmax attention — no customization."""
+
     pass
 
 
@@ -421,9 +420,7 @@ class AttentionWithSink(AttentionVariant):
     def update_statistics(self, kv_tile_idx, qo_head_idx, m, d, scale):
         log2_e = math.log2(math.exp(1.0))
         sink_raw = (
-            self.params[qo_head_idx] * log2_e / scale
-            if kv_tile_idx == 0
-            else -math.inf
+            self.params[qo_head_idx] * log2_e / scale if kv_tile_idx == 0 else -math.inf
         )
         m_new = sink_raw if sink_raw > m else m
         rescale = cute.arch.exp2((m - m_new) * scale)
@@ -431,8 +428,7 @@ class AttentionWithSink(AttentionVariant):
         return m_new, d_new
 
     @cute.jit
-    def transform_output(self, output, batch_idx, qo_idx, qo_head_idx,
-                         m, rcp_d, scale):
+    def transform_output(self, output, batch_idx, qo_idx, qo_head_idx, m, rcp_d, scale):
         return output * scale * rcp_d
 
 
@@ -562,8 +558,7 @@ class ALiBiAttention(AttentionVariant):
         return self._slopes
 
     @cute.jit
-    def score_mod(self, score, batch_idx, qo_idx, kv_idx,
-                  qo_head_idx, kv_head_idx):
+    def score_mod(self, score, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx):
         return score + self.params[qo_head_idx] * (kv_idx - qo_idx)
 
     @staticmethod
@@ -582,9 +577,7 @@ class ALiBiAttention(AttentionVariant):
             return [start * ratio**i for i in range(n)]
 
         if math.log2(num_heads).is_integer():
-            return torch.tensor(
-                _get_slopes_power_of_2(num_heads), dtype=torch.float32
-            )
+            return torch.tensor(_get_slopes_power_of_2(num_heads), dtype=torch.float32)
         else:
             closest_power_of_2 = 2 ** math.floor(math.log2(num_heads))
             slopes = _get_slopes_power_of_2(closest_power_of_2)
@@ -625,8 +618,7 @@ class RPEAttention(AttentionVariant):
         return self._rpe_table
 
     @cute.jit
-    def score_mod(self, score, batch_idx, qo_idx, kv_idx,
-                  qo_head_idx, kv_head_idx):
+    def score_mod(self, score, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx):
         rel_pos = kv_idx - qo_idx + self._offset
         rel_pos_clamped = rel_pos if rel_pos >= 0 else 0
         rel_pos_clamped = (
@@ -664,6 +656,5 @@ class SoftCappingAttention(AttentionVariant):
         self.rcp_cap = 1.0 / cap
 
     @cute.jit
-    def score_mod(self, score, batch_idx, qo_idx, kv_idx,
-                  qo_head_idx, kv_head_idx):
+    def score_mod(self, score, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx):
         return self.cap * tanh_approx(score * self.rcp_cap)

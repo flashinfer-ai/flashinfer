@@ -25,7 +25,6 @@ import math
 import cutlass
 import cutlass.cute as cute
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
-import cutlass.pipeline as pipeline
 from cutlass.pipeline import PipelineProducer, PipelineConsumer
 from cutlass.base_dsl.arch import Arch
 from cutlass.cutlass_dsl import BaseDSL
@@ -283,6 +282,7 @@ class MLAComputeRole:
         # reduce row_max across warps via SMEM exchange when warps_in_n == 2
         if cutlass.const_expr(self.warps_in_n == 2):
             common_params.smem_exchange[tidx] = row_max_new
+            assert self.softmax_exchange_sync_bar is not None
             self.softmax_exchange_sync_bar.arrive_and_wait()
             row_max_new = cute.arch.fmax(
                 row_max_new,

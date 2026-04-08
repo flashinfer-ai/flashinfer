@@ -39,7 +39,6 @@ from types import SimpleNamespace
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.cute.nvgpu.cpasync as cpasync
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
@@ -47,7 +46,7 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from .mla_config import MLAConfig
 from .mla_warp_schedule import MLAWarpSchedule, MLA_DECODE_SCHEDULE
-from .mainloop_spec import MLAMainloopSpec, make_mla_mainloop_spec
+from .mainloop_spec import make_mla_mainloop_spec
 from .collective_builder import build_mla_launch_params
 from .roles.mla_pt_loader import MLAPageTableLoaderRole
 from .roles.mla_loader import MLALoaderRole
@@ -57,10 +56,8 @@ from .roles.mla_correction import MLACorrectionRole
 from .scheduler.mla_persistent import (
     LOG2_E,
     MAX_SPLITS,
-    ceil_div,
     MLAStaticTileScheduler,
     MLAStaticTileSchedulerParams,
-    create_mla_static_tile_scheduler,
     create_mla_static_tile_scheduler_params,
     mla_get_split_kv,
     mla_get_split_kv_simplified,
@@ -203,7 +200,9 @@ class BlackwellMultiLatentAttentionForward:
         self.compute_role = MLAComputeRole(self.config)
         self.compute_role.set_dtypes(self.q_dtype)
         self.compute_role.set_barriers(self.softmax_exchange_sync_bar)
-        self.correction_role = MLACorrectionRole(self.config, v_dtype=self.v_dtype, o_dtype=self.o_dtype)
+        self.correction_role = MLACorrectionRole(
+            self.config, v_dtype=self.v_dtype, o_dtype=self.o_dtype
+        )
         self.correction_role.set_barriers(self.epilogue_exchange_sync_bar)
 
         lp = build_mla_launch_params(
@@ -314,7 +313,10 @@ class BlackwellMultiLatentAttentionForward:
         }
         tx_counts = {"q": self.tma_copy_q_bytes, "kv": self.tma_copy_kc_bytes}
         return self.mainloop.pipeline_topology.create_pipelines(
-            barrier_ptrs, tx_counts, self.schedule.threads_per_warp, cta_layout_vmnk,
+            barrier_ptrs,
+            tx_counts,
+            self.schedule.threads_per_warp,
+            cta_layout_vmnk,
         )
 
     @cute.kernel
@@ -387,7 +389,8 @@ class BlackwellMultiLatentAttentionForward:
         load_pt_prod, load_pt_cons = pipes["load_pt"]
 
         pipeline_init_arrive(
-            cluster_shape_mn=self.config.cluster_shape_mnk, is_relaxed=True,
+            cluster_shape_mn=self.config.cluster_shape_mnk,
+            is_relaxed=True,
         )
 
         # SMEM tensor views
@@ -450,8 +453,13 @@ class BlackwellMultiLatentAttentionForward:
         if warp_idx == self.schedule.load_pt_warp_id:
             _setmaxregister_decrease(self.schedule.other_reg_num)
             self.pt_loader_role.run(
-                split_kv, cache_seqs, block_split_kvs,
-                load_pt_prod, mPT, sPT, tile_sched_params,
+                split_kv,
+                cache_seqs,
+                block_split_kvs,
+                load_pt_prod,
+                mPT,
+                sPT,
+                tile_sched_params,
             )
 
         # /////////////////////////////////////////////////////////////////////
@@ -486,9 +494,15 @@ class BlackwellMultiLatentAttentionForward:
                 sVC=sVC_for_tma,
             )
             self.loader_role.run(
-                tma_common_params, tma_qk_params, tma_v_params,
-                split_kv, cache_seqs, block_split_kvs,
-                load_q_prod, load_kv_prod, load_pt_cons,
+                tma_common_params,
+                tma_qk_params,
+                tma_v_params,
+                split_kv,
+                cache_seqs,
+                block_split_kvs,
+                load_q_prod,
+                load_kv_prod,
+                load_pt_cons,
                 tile_sched_params,
             )
 
@@ -502,12 +516,25 @@ class BlackwellMultiLatentAttentionForward:
             tmem_ptr = tmem.retrieve_ptr(self.config.acc_dtype)
 
             self.mma_role.run(
-                tiled_mma_qk, tiled_mma_pv,
-                load_q_cons, load_kv_cons,
-                mma_s_prod, p_mma_cons, mma_o_prod,
-                split_kv, cache_seqs, block_split_kvs, tile_sched_params,
-                sQ, sQ_rope, sKC, sP, sVC,
-                tmem_ptr, is_leader_cta, mCL.shape[1],
+                tiled_mma_qk,
+                tiled_mma_pv,
+                load_q_cons,
+                load_kv_cons,
+                mma_s_prod,
+                p_mma_cons,
+                mma_o_prod,
+                split_kv,
+                cache_seqs,
+                block_split_kvs,
+                tile_sched_params,
+                sQ,
+                sQ_rope,
+                sKC,
+                sP,
+                sVC,
+                tmem_ptr,
+                is_leader_cta,
+                mCL.shape[1],
             )
 
             tmem.relinquish_alloc_permit()
@@ -523,7 +550,10 @@ class BlackwellMultiLatentAttentionForward:
             and warp_idx <= self.schedule.compute_warp_ids[-1]
         ):
             self.compute_role.run(
-                split_kv, cache_seqs, block_split_kvs, tile_sched_params,
+                split_kv,
+                cache_seqs,
+                block_split_kvs,
+                tile_sched_params,
                 tmem_ptr=None,
                 mma_s_consumer=mma_s_cons,
                 p_mma_producer=p_mma_prod,
@@ -565,7 +595,10 @@ class BlackwellMultiLatentAttentionForward:
                 mLSE=mLSE,
             )
             self.correction_role.run(
-                split_kv, cache_seqs, block_split_kvs, tile_sched_params,
+                split_kv,
+                cache_seqs,
+                block_split_kvs,
+                tile_sched_params,
                 tmem_ptr_corr,
                 p_cor_consumer=p_cor_cons,
                 mma_o_consumer=mma_o_cons,
@@ -591,9 +624,7 @@ class BlackwellMultiLatentAttentionForward:
         tidx, _, _ = cute.arch.thread_idx()
         blk_coord = (bidx, bidy, bidz)
         local_split_kv = (
-            block_split_kvs[blk_coord[2]]
-            if self.config.is_var_split_kv
-            else split_kv
+            block_split_kvs[blk_coord[2]] if self.config.is_var_split_kv else split_kv
         )
         k_tile_total = cute.ceil_div(
             cache_seqs[blk_coord[2]], self.config.mma_qk_tiler[1]
@@ -602,22 +633,16 @@ class BlackwellMultiLatentAttentionForward:
         local_split_kv = cute.ceil_div(k_tile_total, k_tile_per_cta)
 
         smem = utils.SmemAllocator()
-        storage = smem.allocate(
-            MAX_SPLITS * self.config.acc_dtype.width // 8, 16
-        )
+        storage = smem.allocate(MAX_SPLITS * self.config.acc_dtype.width // 8, 16)
         lse_scale_ptr = cute.recast_ptr(storage, dtype=self.config.acc_dtype)
-        smem_lse_scale = cute.make_tensor(
-            lse_scale_ptr, cute.make_layout(MAX_SPLITS)
-        )
+        smem_lse_scale = cute.make_tensor(lse_scale_ptr, cute.make_layout(MAX_SPLITS))
 
         if cutlass.const_expr(self.config.enable_pdl):
             cute.arch.griddepcontrol_wait()
         gLSE = mAccLSE[blk_coord[0], None, blk_coord[1], blk_coord[2]]
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         if warp_idx == 0:
-            lse_per_thread = cute.ceil_div(
-                MAX_SPLITS, self.schedule.threads_per_warp
-            )
+            lse_per_thread = cute.ceil_div(MAX_SPLITS, self.schedule.threads_per_warp)
 
             local_lse = cute.make_rmem_tensor(
                 cute.make_layout(lse_per_thread), self.config.lse_dtype
@@ -632,19 +657,14 @@ class BlackwellMultiLatentAttentionForward:
                 )
                 lse_max = cute.arch.fmax(lse_max, local_lse[i])
             lse_max = cute.arch.warp_reduction_max(lse_max)
-            lse_max = (
-                lse_max if lse_max != -self.config.lse_dtype.inf else 0.0
-            )
+            lse_max = lse_max if lse_max != -self.config.lse_dtype.inf else 0.0
             sum_lse = 0.0
             for i in cutlass.range_constexpr(lse_per_thread):
-                sum_lse += cute.math.exp2(
-                    local_lse[i] - lse_max, fastmath=True
-                )
+                sum_lse += cute.math.exp2(local_lse[i] - lse_max, fastmath=True)
             sum_lse = cute.arch.warp_reduction_sum(sum_lse)
             global_lse = (
                 lse_max + cute.math.log2(sum_lse, fastmath=True)
-                if not sum_lse == self.config.lse_dtype(0.0)
-                or sum_lse != sum_lse  # noqa: SIM201
+                if not sum_lse == self.config.lse_dtype(0.0) or sum_lse != sum_lse  # noqa: SIM201
                 else self.config.lse_dtype.inf
             )
             if tidx == 0:
@@ -666,26 +686,20 @@ class BlackwellMultiLatentAttentionForward:
         rAccO = cute.make_rmem_tensor(
             cute.make_layout(elements_per_thread), self.config.acc_dtype
         )
-        rO = cute.make_rmem_tensor(
-            cute.make_layout(elements_per_thread), self.o_dtype
-        )
+        rO = cute.make_rmem_tensor(cute.make_layout(elements_per_thread), self.o_dtype)
         rAccO.fill(0.0)
         for i in range(local_split_kv):
             for j in cutlass.range_constexpr(elements_per_thread):
                 element_idx = (
                     tidx
-                    + j
-                    * self.schedule.threads_per_warp
-                    * self.config.num_compute_warps
+                    + j * self.schedule.threads_per_warp * self.config.num_compute_warps
                 )
                 rAccO[j] += gAccO[i, element_idx] * smem_lse_scale[i]
         rO.store(rAccO.load().to(self.o_dtype))
         for j in cutlass.range_constexpr(elements_per_thread):
             element_idx = (
                 tidx
-                + j
-                * self.schedule.threads_per_warp
-                * self.config.num_compute_warps
+                + j * self.schedule.threads_per_warp * self.config.num_compute_warps
             )
             mO[blk_coord[0], element_idx, blk_coord[1], blk_coord[2]] = rO[j]
         if cutlass.const_expr(self.config.enable_pdl):
@@ -745,8 +759,7 @@ class BlackwellMultiLatentAttentionForward:
                 stride=(split_kv, 1, H * split_kv, H * split_kv * S),
             )
             acc_lse_iter = cute.recast_ptr(
-                workspace.iterator
-                + cute.cosize(acc_o_layout) * acc_dtype.width // 8,
+                workspace.iterator + cute.cosize(acc_o_layout) * acc_dtype.width // 8,
                 dtype=acc_dtype,
             )
             acc_lse = cute.make_tensor(acc_lse_iter, acc_lse_layout)
@@ -794,8 +807,21 @@ class BlackwellMultiLatentAttentionForward:
         page_size: int,
     ) -> bool:
         return MLAConfig.can_implement(
-            B, S, K, H, L, R,
-            in_dtype, out_dtype, acc_dtype, lse_dtype,
-            mma_qk_tiler_mn, mma_pv_tiler_mn,
-            split_kv, is_persistent, is_var_seq, is_var_split_kv, page_size,
+            B,
+            S,
+            K,
+            H,
+            L,
+            R,
+            in_dtype,
+            out_dtype,
+            acc_dtype,
+            lse_dtype,
+            mma_qk_tiler_mn,
+            mma_pv_tiler_mn,
+            split_kv,
+            is_persistent,
+            is_var_seq,
+            is_var_split_kv,
+            page_size,
         )

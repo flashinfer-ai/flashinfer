@@ -54,8 +54,10 @@ from .scheduler.persistent import (
 # Building blocks — MLA decode
 from .mla_config import MLAConfig
 from .mla_warp_schedule import (
-    MLAWarpSchedule, MLA_DECODE_SCHEDULE,
-    MLAWarpScheduleFP8, MLA_DECODE_FP8_SCHEDULE,
+    MLAWarpSchedule,
+    MLA_DECODE_SCHEDULE,
+    MLAWarpScheduleFP8,
+    MLA_DECODE_FP8_SCHEDULE,
 )
 from .scheduler.mla_persistent import (
     MLAStaticTileScheduler,

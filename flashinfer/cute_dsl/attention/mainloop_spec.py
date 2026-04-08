@@ -21,8 +21,10 @@ from .mla_config import MLAConfig
 from .tmem_layout import TmemLayout
 from .warp_schedule import WarpSchedule, PREFILL_SCHEDULE
 from .mla_warp_schedule import (
-    MLAWarpSchedule, MLA_DECODE_SCHEDULE,
-    MLAWarpScheduleFP8, MLA_DECODE_FP8_SCHEDULE,
+    MLAWarpSchedule,
+    MLA_DECODE_SCHEDULE,
+    MLAWarpScheduleFP8,
+    MLA_DECODE_FP8_SCHEDULE,
 )
 from .pipeline_topology import (
     PipelineTopology,
@@ -159,10 +161,7 @@ class MLAMainloopSpec:
 
     def barrier_stage_counts(self) -> Dict[str, int]:
         """Return {edge_name: barrier_slot_count} for SharedStorage definition."""
-        return {
-            edge.name: edge.barrier_stages
-            for edge in self.pipeline_topology.edges
-        }
+        return {edge.name: edge.barrier_stages for edge in self.pipeline_topology.edges}
 
 
 def make_mla_mainloop_spec(

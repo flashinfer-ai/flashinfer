@@ -1,33 +1,21 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
-import math
-from typing import Type, Tuple, Optional
+from typing import Tuple
 
 import cutlass
 import cutlass.cute as cute
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils as utils
-from cutlass.cute.typing import Int32, Float32, Boolean
+from cutlass.cute.typing import Int32, Float32
 
 from .config import AttentionConfig, AttentionFusion
-from .tmem_layout import TmemLayout
 from .warp_schedule import WarpSchedule, PREFILL_SCHEDULE, PREFILL_TRANSFORM_SCHEDULE
-from .pipeline_topology import PipelineTopology, make_prefill_topology, make_prefill_topology_transform
-from .mainloop_spec import MainloopSpec, make_prefill_mainloop_spec
+from .mainloop_spec import make_prefill_mainloop_spec
 from .collective_builder import build_fmha_launch_params
-from .fusion.mask import (
-    MaskType,
-    apply_mask,
-    get_trip_count,
-    get_masked_trip_count,
-    get_unmasked_trip_count,
-    get_kv_start_block_idx,
-)
 from .scheduler.persistent import (
     FmhaStaticTileScheduler,
     FmhaStaticTileSchedulerParams,
-    create_fmha_static_tile_scheduler,
     create_fmha_static_tile_scheduler_params,
 )
 from .roles.softmax import SoftmaxRole
@@ -120,7 +108,9 @@ class BlackwellFusedMultiHeadAttentionForward:
             self.schedule = PREFILL_SCHEDULE
 
         self.mainloop = make_prefill_mainloop_spec(
-            config, self.schedule, self.has_logits_transform,
+            config,
+            self.schedule,
+            self.has_logits_transform,
         )
         self.tmem = self.mainloop.tmem_layout
 
@@ -235,14 +225,18 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.mainloop = self.mainloop.resolve(self.q_dtype.width)
 
         self.softmax_role = SoftmaxRole(
-            self.config, self.fusion, self.tmem,
+            self.config,
+            self.fusion,
+            self.tmem,
             softmax0_warp_ids=self.schedule.softmax0_warp_ids,
             softmax1_warp_ids=self.schedule.softmax1_warp_ids,
             threads_per_warp=self.schedule.threads_per_warp,
         )
         if cutlass.const_expr(not self.has_logits_transform):
             self.correction_role = CorrectionRole(
-                self.config, self.fusion, self.tmem,
+                self.config,
+                self.fusion,
+                self.tmem,
                 correction_warp_ids=self.schedule.correction_warp_ids,
                 threads_per_warp=self.schedule.threads_per_warp,
             )
@@ -258,9 +252,19 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.softmax_role.set_dtypes(self.q_dtype, self.o_dtype)
 
         lp = build_fmha_launch_params(
-            self.mainloop, q, k, v, o,
-            self.q_dtype, self.k_dtype, self.v_dtype, self.o_dtype,
-            self.q_major_mode, self.k_major_mode, self.v_major_mode, self.o_layout,
+            self.mainloop,
+            q,
+            k,
+            v,
+            o,
+            self.q_dtype,
+            self.k_dtype,
+            self.v_dtype,
+            self.o_dtype,
+            self.q_major_mode,
+            self.k_major_mode,
+            self.v_major_mode,
+            self.o_layout,
         )
         self.shared_storage = lp.SharedStorage
 
@@ -322,12 +326,20 @@ class BlackwellFusedMultiHeadAttentionForward:
         }
         tx_counts = {"q": self.tma_copy_q_bytes, "kv": self.tma_copy_kv_bytes}
         return self.mainloop.pipeline_topology.create_pipelines(
-            barrier_ptrs, tx_counts, self.schedule.threads_per_warp,
+            barrier_ptrs,
+            tx_counts,
+            self.schedule.threads_per_warp,
         )
 
     @cute.jit
     def _create_mma_fragments(
-        self, qk_tiled_mma, pv_tiled_mma, sQ, sK, sV, p_tmem_layout_staged,
+        self,
+        qk_tiled_mma,
+        pv_tiled_mma,
+        sQ,
+        sK,
+        sV,
+        p_tmem_layout_staged,
     ):
         """Partition MMA operands and create TMEM offset tensors for double-buffered accumulators."""
         qk_thr_mma = qk_tiled_mma.get_slice(0)
@@ -336,12 +348,16 @@ class BlackwellFusedMultiHeadAttentionForward:
         tSrK = qk_thr_mma.make_fragment_B(sK)
         tOrV = pv_thr_mma.make_fragment_B(sV)
 
-        tStS = qk_thr_mma.make_fragment_C(qk_thr_mma.partition_shape_C(
-            (self.config.qk_mma_tiler[0], self.config.qk_mma_tiler[1])
-        ))
-        tOtO = pv_thr_mma.make_fragment_C(pv_thr_mma.partition_shape_C(
-            (self.config.pv_mma_tiler[0], self.config.pv_mma_tiler[1])
-        ))
+        tStS = qk_thr_mma.make_fragment_C(
+            qk_thr_mma.partition_shape_C(
+                (self.config.qk_mma_tiler[0], self.config.qk_mma_tiler[1])
+            )
+        )
+        tOtO = pv_thr_mma.make_fragment_C(
+            pv_thr_mma.partition_shape_C(
+                (self.config.pv_mma_tiler[0], self.config.pv_mma_tiler[1])
+            )
+        )
 
         tStS0 = cute.make_tensor(tStS.iterator + self.tmem.s0_offset, tStS.layout)
         tStS1 = cute.make_tensor(tStS.iterator + self.tmem.s1_offset, tStS.layout)
@@ -351,13 +367,26 @@ class BlackwellFusedMultiHeadAttentionForward:
         tP = cute.make_tensor(tStS.iterator, p_tmem_layout_staged.outer)
         tOrP = pv_thr_mma.make_fragment_A(tP)[None, None, None, 0]
         p_scale = self.config.qk_acc_dtype.width // self.q_dtype.width
-        tOrP0 = cute.make_tensor(tOrP.iterator + p_scale * self.tmem.p0_offset, tOrP.layout)
-        tOrP1 = cute.make_tensor(tOrP.iterator + p_scale * self.tmem.p1_offset, tOrP.layout)
+        tOrP0 = cute.make_tensor(
+            tOrP.iterator + p_scale * self.tmem.p0_offset, tOrP.layout
+        )
+        tOrP1 = cute.make_tensor(
+            tOrP.iterator + p_scale * self.tmem.p1_offset, tOrP.layout
+        )
 
         return (
-            qk_thr_mma, pv_thr_mma,
-            tSrQ, tSrK, tOrV, tStS,
-            tStS0, tStS1, tOtO0, tOtO1, tOrP0, tOrP1,
+            qk_thr_mma,
+            pv_thr_mma,
+            tSrQ,
+            tSrK,
+            tOrV,
+            tStS,
+            tStS0,
+            tStS1,
+            tOtO0,
+            tOtO1,
+            tOrP0,
+            tOrP1,
         )
 
     #  GPU device kernel
@@ -433,17 +462,40 @@ class BlackwellFusedMultiHeadAttentionForward:
             )
         cute.arch.mbarrier_init_fence()
 
-        sQ = storage.sQ.get_tensor(q_smem_layout_staged.outer, swizzle=q_smem_layout_staged.inner)
-        sK = storage.sK.get_tensor(k_smem_layout_staged.outer, swizzle=k_smem_layout_staged.inner)
-        sV = cute.make_tensor(cute.recast_ptr(sK.iterator, v_smem_layout_staged.inner), v_smem_layout_staged.outer)
-        sO = storage.sO.get_tensor(o_smem_layout_staged.outer, swizzle=o_smem_layout_staged.inner)
+        sQ = storage.sQ.get_tensor(
+            q_smem_layout_staged.outer, swizzle=q_smem_layout_staged.inner
+        )
+        sK = storage.sK.get_tensor(
+            k_smem_layout_staged.outer, swizzle=k_smem_layout_staged.inner
+        )
+        sV = cute.make_tensor(
+            cute.recast_ptr(sK.iterator, v_smem_layout_staged.inner),
+            v_smem_layout_staged.outer,
+        )
+        sO = storage.sO.get_tensor(
+            o_smem_layout_staged.outer, swizzle=o_smem_layout_staged.inner
+        )
 
         (
-            qk_thr_mma, pv_thr_mma,
-            tSrQ, tSrK, tOrV, tStS,
-            tStS0, tStS1, tOtO0, tOtO1, tOrP0, tOrP1,
+            qk_thr_mma,
+            pv_thr_mma,
+            tSrQ,
+            tSrK,
+            tOrV,
+            tStS,
+            tStS0,
+            tStS1,
+            tOtO0,
+            tOtO1,
+            tOrP0,
+            tOrP1,
         ) = self._create_mma_fragments(
-            qk_tiled_mma, pv_tiled_mma, sQ, sK, sV, p_tmem_layout_staged,
+            qk_tiled_mma,
+            pv_tiled_mma,
+            sQ,
+            sK,
+            sV,
+            p_tmem_layout_staged,
         )
 
         cute.arch.barrier(
@@ -462,12 +514,21 @@ class BlackwellFusedMultiHeadAttentionForward:
         if warp_idx == self.schedule.load_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.schedule.num_regs_other)
             self.loader_role.run(
-                qk_thr_mma, pv_thr_mma,
-                tma_atom_q, tma_atom_k, tma_atom_v,
-                mQ_qdl, mK_kdl, mV_dkl,
-                sQ, sK, sV,
-                cum_seqlen_q, cum_seqlen_k,
-                load_q_producer, load_kv_producer,
+                qk_thr_mma,
+                pv_thr_mma,
+                tma_atom_q,
+                tma_atom_k,
+                tma_atom_v,
+                mQ_qdl,
+                mK_kdl,
+                mV_dkl,
+                sQ,
+                sK,
+                sV,
+                cum_seqlen_q,
+                cum_seqlen_k,
+                load_q_producer,
+                load_kv_producer,
                 tile_sched_params,
             )
 
@@ -477,15 +538,29 @@ class BlackwellFusedMultiHeadAttentionForward:
         if warp_idx == self.schedule.mma_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.schedule.num_regs_other)
             self.mma_role.run(
-                qk_tiled_mma, pv_tiled_mma,
-                tStS0, tStS1, tOtO0, tOtO1,
-                tSrQ, tSrK, tOrP0, tOrP1, tOrV,
-                mQ_qdl.shape[0], mK_kdl.shape[0],
-                cum_seqlen_q, cum_seqlen_k,
-                load_q_consumer, load_kv_consumer,
-                mma_s0_producer, mma_s1_producer,
+                qk_tiled_mma,
+                pv_tiled_mma,
+                tStS0,
+                tStS1,
+                tOtO0,
+                tOtO1,
+                tSrQ,
+                tSrK,
+                tOrP0,
+                tOrP1,
+                tOrV,
+                mQ_qdl.shape[0],
+                mK_kdl.shape[0],
+                cum_seqlen_q,
+                cum_seqlen_k,
+                load_q_consumer,
+                load_kv_consumer,
+                mma_s0_producer,
+                mma_s1_producer,
                 mma_corr_producer,  # None for transform path
-                tile_sched_params, storage, tmem_dealloc_mbar_ptr,
+                tile_sched_params,
+                storage,
+                tmem_dealloc_mbar_ptr,
             )
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -494,11 +569,13 @@ class BlackwellFusedMultiHeadAttentionForward:
         if warp_idx == self.schedule.epilogue_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.schedule.num_regs_other)
             self.epilogue_role.run(
-                tma_atom_o, mO_qdl, sO,
+                tma_atom_o,
+                mO_qdl,
+                sO,
                 cum_seqlen_q,
                 corr_epi_consumer,  # None for transform path
-                s0_epi_consumer,    # None for standard path
-                s1_epi_consumer,    # None for standard path
+                s0_epi_consumer,  # None for standard path
+                s1_epi_consumer,  # None for standard path
                 tile_sched_params,
             )
 
@@ -571,17 +648,30 @@ class BlackwellFusedMultiHeadAttentionForward:
         #  Correction
         # ///////////////////////////////////////////////////////////////////////////////
         if cutlass.const_expr(not self.has_logits_transform):
-            if warp_idx >= self.schedule.softmax1_upper_warp_id and warp_idx < self.schedule.mma_warp_id:
+            if (
+                warp_idx >= self.schedule.softmax1_upper_warp_id
+                and warp_idx < self.schedule.mma_warp_id
+            ):
                 cute.arch.warpgroup_reg_dealloc(self.schedule.num_regs_correction)
                 self.correction_role.run(
-                    qk_thr_mma, pv_thr_mma,
-                    tStS, tOtO0, tOtO1, sO,
-                    mQ_qdl.shape[0], mK_kdl.shape[0],
-                    cum_seqlen_q, cum_seqlen_k,
-                    scale_softmax_log2, scale_output,
-                    s0_corr_consumer, s1_corr_consumer,
-                    mma_corr_consumer, corr_epi_producer,
-                    tile_sched_params, tmem_dealloc_mbar_ptr,
+                    qk_thr_mma,
+                    pv_thr_mma,
+                    tStS,
+                    tOtO0,
+                    tOtO1,
+                    sO,
+                    mQ_qdl.shape[0],
+                    mK_kdl.shape[0],
+                    cum_seqlen_q,
+                    cum_seqlen_k,
+                    scale_softmax_log2,
+                    scale_output,
+                    s0_corr_consumer,
+                    s1_corr_consumer,
+                    mma_corr_consumer,
+                    corr_epi_producer,
+                    tile_sched_params,
+                    tmem_dealloc_mbar_ptr,
                 )
         return
 

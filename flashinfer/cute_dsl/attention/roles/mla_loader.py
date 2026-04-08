@@ -227,9 +227,7 @@ class MLALoaderRole:
         for k in cutlass.range(page_per_subtile):
             k_idx_i = k_idx[
                 k
-                + i
-                // ceil_div(self.iterations_pv_k, page_per_tile)
-                * page_per_subtile
+                + i // ceil_div(self.iterations_pv_k, page_per_tile) * page_per_subtile
             ]
             cute.copy(
                 v_params.tma_atom_c_latent_transpose,
@@ -447,15 +445,21 @@ class MLALoaderRole:
                 for i in cutlass.range(self.iterations_qk_latent):
                     kv_handle = load_kv_producer.acquire_and_advance()
                     self._load_kv_latent_one_iter(
-                        qk_params, k_idx_qk,
-                        kv_handle.barrier, kv_handle.index, i,
+                        qk_params,
+                        k_idx_qk,
+                        kv_handle.barrier,
+                        kv_handle.index,
+                        i,
                     )
 
                 for i in cutlass.range(self.iterations_qk_rope):
                     kv_handle = load_kv_producer.acquire_and_advance()
                     self._load_kv_rope_one_iter(
-                        qk_params, k_idx_qk,
-                        kv_handle.barrier, kv_handle.index, i,
+                        qk_params,
+                        k_idx_qk,
+                        kv_handle.barrier,
+                        kv_handle.index,
+                        i,
                     )
 
                 k_index += 1
@@ -473,15 +477,21 @@ class MLALoaderRole:
                     for i in cutlass.range(self.iterations_qk_latent):
                         kv_handle = load_kv_producer.acquire_and_advance()
                         self._load_kv_latent_one_iter(
-                            qk_params, k_idx_qk,
-                            kv_handle.barrier, kv_handle.index, i,
+                            qk_params,
+                            k_idx_qk,
+                            kv_handle.barrier,
+                            kv_handle.index,
+                            i,
                         )
 
                     for i in cutlass.range(self.iterations_qk_rope):
                         kv_handle = load_kv_producer.acquire_and_advance()
                         self._load_kv_rope_one_iter(
-                            qk_params, k_idx_qk,
-                            kv_handle.barrier, kv_handle.index, i,
+                            qk_params,
+                            k_idx_qk,
+                            kv_handle.barrier,
+                            kv_handle.index,
+                            i,
                         )
 
                     # === V tile for previous k-tile ===
@@ -494,25 +504,31 @@ class MLALoaderRole:
                         for j in cutlass.range(self.iterations_pv_n):
                             kv_handle = load_kv_producer.acquire_and_advance()
                             self._load_v_one_iter(
-                                v_params, k_idx_v,
-                                kv_handle.barrier, kv_handle.index, i, j,
+                                v_params,
+                                k_idx_v,
+                                kv_handle.barrier,
+                                kv_handle.index,
+                                i,
+                                j,
                             )
 
                     k_index += 1
                     k_tile_count -= 1
 
                 # === Last V tile ===
-                k_idx_v = self._read_v_page_indices(
-                    tile_params, pt_handle.index
-                )
+                k_idx_v = self._read_v_page_indices(tile_params, pt_handle.index)
                 pt_handle.release()
 
                 for i in cutlass.range(self.iterations_pv_k):
                     for j in cutlass.range(self.iterations_pv_n):
                         kv_handle = load_kv_producer.acquire_and_advance()
                         self._load_v_one_iter(
-                            v_params, k_idx_v,
-                            kv_handle.barrier, kv_handle.index, i, j,
+                            v_params,
+                            k_idx_v,
+                            kv_handle.barrier,
+                            kv_handle.index,
+                            i,
+                            j,
                         )
 
             tile_sched.advance_to_next_work()
