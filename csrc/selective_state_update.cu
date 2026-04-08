@@ -342,7 +342,7 @@ void run_selective_state_update_mtp(
     Optional<TensorView> intermediate_states_buffer,
     Optional<TensorView> intermediate_state_indices, Optional<TensorView> intermediate_state_scales,
     Optional<TensorView> rand_seed, int64_t cache_steps, Optional<TensorView> cu_seqlens,
-    Optional<TensorView> num_accepted_tokens, int64_t algorithm) {
+    Optional<TensorView> num_accepted_tokens, Optional<TensorView> prev_tokens, int64_t algorithm) {
   bool const is_varlen = (x.dim() == 3 && cu_seqlens.has_value());
   // Extract dimensions from input tensors
   int64_t batch;
@@ -578,6 +578,17 @@ void run_selective_state_update_mtp(
                      "state_batch_indices is required when num_accepted_tokens is provided");
     p.num_accepted_tokens = const_cast<void*>(nat.data_ptr());
   }
+  if (prev_tokens.has_value()) {
+    auto const& pt = prev_tokens.value();
+    CHECK_CUDA(pt);
+    CHECK_DIM(1, pt);
+    CHECK_CONTIGUOUS(pt);
+    FLASHINFER_CHECK(pt.dtype().code == kDLInt && pt.dtype().bits == 64,
+                     "prev_tokens must be int64");
+    FLASHINFER_CHECK(pt.size(0) >= batch, "prev_tokens.size(0) must be >= n_sequences (", batch,
+                     ")");
+    p.prev_tokens = const_cast<void*>(pt.data_ptr());
+  }
   FLASHINFER_CHECK(!(dst_state_batch_indices.has_value() && intermediate_states_buffer.has_value()),
                    "dst_state_batch_indices and intermediate_states_buffer are mutually exclusive");
   if (state_scale.has_value()) {
@@ -660,7 +671,7 @@ void selective_state_update(
     bool disable_state_update, Optional<TensorView> intermediate_states_buffer,
     Optional<TensorView> intermediate_state_indices, Optional<TensorView> intermediate_state_scales,
     Optional<TensorView> rand_seed, int64_t cache_steps, Optional<TensorView> cu_seqlens,
-    Optional<TensorView> num_accepted_tokens, int64_t algorithm) {
+    Optional<TensorView> num_accepted_tokens, Optional<TensorView> prev_tokens, int64_t algorithm) {
   bool const has_cu_seqlens = cu_seqlens.has_value();
   if (x.dim() == 3 && !has_cu_seqlens) {
     run_selective_state_update_stp(state, x, dt, A, B, C, D, z, dt_bias, dt_softplus,
@@ -671,7 +682,7 @@ void selective_state_update(
         state, x, dt, A, B, C, D, z, dt_bias, dt_softplus, state_batch_indices,
         dst_state_batch_indices, state_scale, pad_slot_id, output, disable_state_update,
         intermediate_states_buffer, intermediate_state_indices, intermediate_state_scales,
-        rand_seed, cache_steps, cu_seqlens, num_accepted_tokens, algorithm);
+        rand_seed, cache_steps, cu_seqlens, num_accepted_tokens, prev_tokens, algorithm);
   } else {
     FLASHINFER_CHECK(false,
                      "x must have 3 dimensions (single-token) or 4 dimensions (multi-token), got ",

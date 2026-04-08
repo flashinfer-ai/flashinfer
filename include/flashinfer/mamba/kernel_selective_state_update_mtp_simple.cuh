@@ -129,7 +129,8 @@ template <typename input_t, typename state_t, typename weight_t, typename stateI
 __device__ __forceinline__ void load_simple(SramT& sram, int lane, int warp,
                                             SelectiveStateMTPParams const& params, int seq_idx,
                                             int head, int kv_group, int dim_offset, int bos,
-                                            int seq_len, int64_t state_batch, int state_stage) {
+                                            int seq_len, int64_t state_batch, int state_stage,
+                                            int prev_k) {
   int const flat_tid = warp * warpSize + lane;
   constexpr auto num_threads = NUM_WARPS * warpSize;
 
@@ -182,13 +183,14 @@ __device__ __forceinline__ void load_simple(SramT& sram, int lane, int warp,
     }
 
     // Warp 1: load C[step][DSTATE] → sram.C[step][DSTATE_PAD]
+    // Skip C for steps < prev_k (C only needed for output computation)
     if (warp == 1) {
       auto const* __restrict__ C_ptr = reinterpret_cast<input_t const*>(params.C);
       constexpr int num_C_chunks = NTOKENS * DSTATE / INPUT_PACK;
       for (int i = lane; i < num_C_chunks; i += warpSize) {
         int const step = i / C_packs_per_row;
         int const col = (i % C_packs_per_row) * INPUT_PACK;
-        if (step < seq_len) {
+        if (step < seq_len && step >= prev_k) {
           cp_async_16B(&sram.C[step][col],
                        &C_ptr[C_base + step * C_tstride + kv_group * DSTATE + col]);
         }
@@ -279,7 +281,7 @@ __device__ __forceinline__ void update_state_simple(SramT& sram, int lane, int w
                                                     SelectiveStateMTPParams const& params,
                                                     int seq_idx, int head, int dim_offset,
                                                     int64_t state_batch, int bos, int seq_len,
-                                                    float A_val, float D_val) {
+                                                    float A_val, float D_val, int prev_k) {
   constexpr bool scaleState = !std::is_same_v<state_scale_t, void>;
   constexpr int lanesPerRow = simple_horiz::LANES_PER_ROW;
   constexpr int rowsPerWarp = simple_horiz::ROWS_PER_WARP;
@@ -382,6 +384,23 @@ __device__ __forceinline__ void update_state_simple(SramT& sram, int lane, int w
       }
     }
 
+    // Multi-pass pipeline: prefetch next pass's state into the other smem stage
+    // Issued here so the global memory load overlaps with the step-loop compute below.
+    if constexpr (numPasses > 1) {
+      if (pass < numPasses - 1) {
+        int const next_stage = (pass + 1) % STATE_STAGES;
+        int const next_dim_base = dim_offset + (pass + 1) * ROWS_PER_PASS;
+
+        if constexpr (!IS_PAD) {
+          auto const* __restrict__ state_ptr_r = reinterpret_cast<state_t const*>(params.state);
+          auto const state_base = state_batch * params.state_stride_batch + head * DIM * DSTATE;
+          cp_async_state_cooperative<state_t, DSTATE, DSTATE_PAD, ROWS_PER_PASS, NUM_WARPS>(
+              sram, lane, warp, next_stage, next_dim_base, state_ptr_r, state_base);
+        }
+        asm volatile("cp.async.commit_group;\n" ::: "memory");
+      }
+    }
+
     // Strength-reduce step-dependent shared memory indexing
     auto const* __restrict__ B_step = &sram.B[0][0];
     auto const* __restrict__ C_step = &sram.C[0][0];
@@ -397,6 +416,8 @@ __device__ __forceinline__ void update_state_simple(SramT& sram, int lane, int w
       float const dA = __expf(A_val * dt_value);
       float const x_value = toFloat(x_step[local_row]);
 
+      bool const emit_output = (step >= prev_k);
+
       // f32x2 packed recurrence
       float2 out2 = {0.f, 0.f};
       float2 const dA2 = {dA, dA};
@@ -410,23 +431,28 @@ __device__ __forceinline__ void update_state_simple(SramT& sram, int lane, int w
           int const c0 = baseCol(t, p * 2);
           if (c0 >= DSTATE) continue;
           float2 const B2 = toFloat2(&B_step[c0]);
-          float2 const C2 = toFloat2(&C_step[c0]);
           float2 dBx;
           mul_f32x2(dBx, B2, dtx2);
           fma_f32x2(rState[t][p], dA2, rState[t][p], dBx);
-          fma_f32x2(out2, rState[t][p], C2, out2);
+          if (emit_output) {
+            float2 const C2 = toFloat2(&C_step[c0]);
+            fma_f32x2(out2, rState[t][p], C2, out2);
+          }
         }
       }
-      float out_value = out2.x + out2.y;
 
-      // Reduce across lanesPerRow adjacent lanes
+      if (emit_output) {
+        float out_value = out2.x + out2.y;
+
+        // Reduce across lanesPerRow adjacent lanes
 #pragma unroll
-      for (int offset = lanesPerRow / 2; offset >= 1; offset /= 2) {
-        out_value += __shfl_down_sync(UINT32_MAX, out_value, offset);
-      }
+        for (int offset = lanesPerRow / 2; offset >= 1; offset /= 2) {
+          out_value += __shfl_down_sync(UINT32_MAX, out_value, offset);
+        }
 
-      if (member == 0) {
-        out_step[local_row] = out_value + D_val * x_value;
+        if (member == 0) {
+          out_step[local_row] = out_value + D_val * x_value;
+        }
       }
 
       // Advance step pointers
@@ -477,19 +503,9 @@ __device__ __forceinline__ void update_state_simple(SramT& sram, int lane, int w
       }
     }  // step loop
 
-    // Multi-pass pipeline: prefetch next pass's state into the other smem stage
+    // Multi-pass pipeline: wait for prefetch issued before the step loop
     if constexpr (numPasses > 1) {
       if (pass < numPasses - 1) {
-        int const next_stage = (pass + 1) % STATE_STAGES;
-        int const next_dim_base = dim_offset + (pass + 1) * ROWS_PER_PASS;
-
-        if constexpr (!IS_PAD) {
-          auto const* __restrict__ state_ptr_r = reinterpret_cast<state_t const*>(params.state);
-          auto const state_base = state_batch * params.state_stride_batch + head * DIM * DSTATE;
-          cp_async_state_cooperative<state_t, DSTATE, DSTATE_PAD, ROWS_PER_PASS, NUM_WARPS>(
-              sram, lane, warp, next_stage, next_dim_base, state_ptr_r, state_base);
-        }
-        asm volatile("cp.async.commit_group;\n" ::: "memory");
         asm volatile("cp.async.wait_group 0;\n" ::: "memory");
         __syncthreads();
       }
@@ -518,7 +534,7 @@ __device__ __forceinline__ void update_state_simple(SramT& sram, int lane, int w
     // Fast path: each lane handles >= 1 element, use vectorized loads/stores
     constexpr int elemsPerThreadEpilogue = DIM_PER_CTA / warpSize;
 
-    for (int step = warp; step < seq_len; step += NUM_WARPS) {
+    for (int step = prev_k + warp; step < seq_len; step += NUM_WARPS) {
       int64_t const out_offset = out_addr(step);
       int64_t const z_offset = z_addr(step);
 
@@ -545,7 +561,7 @@ __device__ __forceinline__ void update_state_simple(SramT& sram, int lane, int w
     }
   } else {
     // Narrow path: DIM_PER_CTA < warpSize, only first DIM_PER_CTA lanes participate
-    for (int step = warp; step < seq_len; step += NUM_WARPS) {
+    for (int step = prev_k + warp; step < seq_len; step += NUM_WARPS) {
       if (lane < DIM_PER_CTA) {
         int64_t const out_offset = out_addr(step);
         float out_value = sram.out[step][lane];
@@ -618,6 +634,10 @@ __global__ void __launch_bounds__(NUM_WARPS * 32)
     init_token_idx = max(num_accepted - 1, 0);
   }
 
+  // ── prev_tokens: number of fast-forward steps (state-only, no output) ──
+  auto const* __restrict__ prev_tokens_ptr = reinterpret_cast<int64_t const*>(params.prev_tokens);
+  int const prev_k = prev_tokens_ptr ? static_cast<int>(__ldg(&prev_tokens_ptr[seq_idx])) : 0;
+
   // ── State batch index: 2D (seq_idx, init_token_idx) or 1D ──
   auto const* __restrict__ state_batch_indices =
       reinterpret_cast<stateIndex_t const*>(params.state_batch_indices);
@@ -644,7 +664,7 @@ __global__ void __launch_bounds__(NUM_WARPS * 32)
     load_simple<input_t, state_t, weight_t, stateIndex_t, IS_PAD, NTOKENS, DIM, DSTATE, DSTATE_PAD,
                 DIM_PER_CTA, ROWS_PER_PASS, NUM_WARPS>(
         sram, lane, warp, params, seq_idx, head, kv_group, dim_offset, bos, seq_len, state_batch,
-        /*state_stage=*/0);
+        /*state_stage=*/0, prev_k);
 
     // Phase 2: single sync — ensures all smem writes (cp.async + LDG dt) are visible
     __syncthreads();
@@ -653,7 +673,7 @@ __global__ void __launch_bounds__(NUM_WARPS * 32)
     update_state_simple<input_t, state_t, matrixA_t, weight_t, stateIndex_t, state_scale_t, IS_PAD,
                         NTOKENS, DIM, DSTATE, DSTATE_PAD, DIM_PER_CTA, PHILOX_ROUNDS, NUM_WARPS>(
         sram, lane, warp, params, seq_idx, head, dim_offset, state_batch, bos, seq_len, A_val,
-        D_val);
+        D_val, prev_k);
   };
 
   if (is_pad)

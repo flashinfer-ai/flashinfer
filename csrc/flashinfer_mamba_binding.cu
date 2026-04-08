@@ -48,6 +48,7 @@ void selective_state_update(
     int64_t cache_steps,
     Optional<TensorView> cu_seqlens,           // (N + 1,)
     Optional<TensorView> num_accepted_tokens,  // (N,)
+    Optional<TensorView> prev_tokens,          // (N,) int64: skip output for first prev_k steps
     int64_t algorithm);  // SSUAlgorithm: 0=auto, 1=simple, 2=vertical, 3=horizontal
 
 }  // namespace flashinfer::mamba

@@ -1476,3 +1476,134 @@ class TestSelectiveStateUpdateMTPStochasticRoundingWithIntermediateStates(
                 )
 
             assert states_match, f"Intermediate state at step {t} mismatch"
+
+
+# =============================================================================
+# prev_tokens test: skip output for fast-forwarded tokens
+# =============================================================================
+
+_PREV_TOKENS_PARAMS = [
+    # (batch, nheads, dim, dstate, cache_steps, state_dtype, prev_k)
+    (4, 16, 64, 128, 6, torch.float32, 0),  # prev_k=0: no skip (baseline)
+    (4, 16, 64, 128, 6, torch.float32, 3),  # prev_k=3: skip half
+    (4, 16, 64, 128, 6, torch.float32, 6),  # prev_k=6: skip all (state only)
+    (4, 16, 64, 128, 8, torch.bfloat16, 4),  # bf16 state, skip half
+    (64, 16, 64, 128, 6, torch.float32, 3),  # larger batch
+]
+
+
+class TestSelectiveStateUpdatePrevTokens:
+    """Test prev_tokens: skip output compute/write for fast-forwarded tokens."""
+
+    ATOL = 1e-3
+    RTOL = 1e-2
+    NGROUPS = 8
+    INPUT_DTYPE = torch.bfloat16
+    MATRIX_A_DTYPE = torch.float32
+    WEIGHT_DTYPE = torch.float32
+
+    @pytest.fixture(autouse=True, params=["simple"])
+    def _algorithm(self, request):
+        self._algo = request.param
+
+    @pytest.mark.parametrize(
+        "batch,nheads,dim,dstate,cache_steps,state_dtype,prev_k",
+        _PREV_TOKENS_PARAMS,
+    )
+    def test_prev_tokens_output_and_state(
+        self, batch, nheads, dim, dstate, cache_steps, state_dtype, prev_k
+    ):
+        """Output for steps [prev_k, T) must match full-run reference.
+        State after all steps must match the full-run reference.
+        Output for steps [0, prev_k) must be zero (untouched)."""
+
+        inputs = create_test_inputs(
+            batch,
+            nheads,
+            dim,
+            dstate,
+            self.NGROUPS,
+            self.INPUT_DTYPE,
+            weight_dtype=self.WEIGHT_DTYPE,
+            matrixA_dtype=self.MATRIX_A_DTYPE,
+            state_dtype=state_dtype,
+            generate_z=False,
+            generate_intermediate_states_buffer=False,
+            cache_steps=cache_steps,
+            seed=0,
+        )
+
+        # --- Reference: full run (all tokens produce output) ---
+        state_ref = clone_preserving_strides(inputs["state_cache"])
+        y_ref = selective_state_update_triton(
+            state_ref,
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            D=inputs["D"],
+            z=inputs.get("z"),
+            dt_bias=inputs["dt_bias"],
+            dt_softplus=True,
+            state_batch_indices=inputs["slot_idx"],
+            pad_slot_id=-1,
+        )
+
+        # --- DUT: run with prev_tokens ---
+        state_test = clone_preserving_strides(inputs["state_cache"])
+        prev_tokens = torch.full((batch,), prev_k, dtype=torch.int64, device="cuda")
+        # Pre-zero output so we can verify untouched steps stay zero
+        out = torch.zeros_like(inputs["x"])
+
+        y_test = flashinfer.mamba.selective_state_update(
+            state_test,
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            D=inputs["D"],
+            z=inputs.get("z"),
+            dt_bias=inputs["dt_bias"],
+            dt_softplus=True,
+            state_batch_indices=inputs["slot_idx"],
+            pad_slot_id=-1,
+            out=out,
+            algorithm=self._algo,
+            prev_tokens=prev_tokens,
+        )
+
+        # 1. Output for steps [prev_k, T) must match reference
+        if prev_k < cache_steps:
+            y_ref_tail = y_ref[:, prev_k:]
+            y_test_tail = y_test[:, prev_k:]
+            outputs_match = torch.allclose(
+                y_ref_tail, y_test_tail, atol=self.ATOL, rtol=self.RTOL
+            )
+            if not outputs_match:
+                diff = (y_ref_tail.float() - y_test_tail.float()).abs()
+                print(
+                    f"Output mismatch for steps [{prev_k}, {cache_steps}): "
+                    f"max_diff={diff.max().item():.6e}"
+                )
+            assert outputs_match, f"Output mismatch for steps [{prev_k}, {cache_steps})"
+
+        # 2. Output for steps [0, prev_k) must be zero (untouched)
+        if prev_k > 0:
+            y_test_head = y_test[:, :prev_k]
+            assert torch.all(y_test_head == 0), (
+                f"Output for skipped steps [0, {prev_k}) is not zero"
+            )
+
+        # 3. State must match reference (full recurrence still runs)
+        slot_idx = inputs["slot_idx"]
+        state_ref_batch = state_ref[slot_idx]
+        state_test_batch = state_test[slot_idx]
+        states_match = torch.allclose(
+            state_ref_batch, state_test_batch, atol=self.ATOL, rtol=self.RTOL
+        )
+        if not states_match:
+            diff = (state_ref_batch.float() - state_test_batch.float()).abs()
+            print(f"State mismatch: max_diff={diff.max().item():.6e}")
+        assert states_match, "State mismatch after prev_tokens run"

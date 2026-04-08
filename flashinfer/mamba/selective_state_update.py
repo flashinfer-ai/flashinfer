@@ -126,6 +126,7 @@ def selective_state_update(
     dst_state_batch_indices: Optional[torch.Tensor] = None,
     cu_seqlens: Optional[torch.Tensor] = None,
     num_accepted_tokens: Optional[torch.Tensor] = None,
+    prev_tokens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Selective state update operation for Mamba layers (the generation phase).
 
@@ -336,6 +337,7 @@ def selective_state_update(
         cache_steps,
         cu_seqlens,
         num_accepted_tokens,
+        prev_tokens,
         algorithm_int,
         philox_rounds,
         state.dtype,
@@ -384,6 +386,7 @@ def _selective_state_update(
     cache_steps: int,
     cu_seqlens: Optional[torch.Tensor],
     num_accepted_tokens: Optional[torch.Tensor],
+    prev_tokens: Optional[torch.Tensor],
     algorithm: int,
     philox_rounds: int,
     state_dtype: torch.dtype,
@@ -434,6 +437,7 @@ def _selective_state_update(
         cache_steps,
         cu_seqlens,
         num_accepted_tokens,
+        prev_tokens,
         algorithm,
     )
 
@@ -463,6 +467,7 @@ def _selective_state_update_fake(
     cache_steps: int,
     cu_seqlens: Optional[torch.Tensor],
     num_accepted_tokens: Optional[torch.Tensor],
+    prev_tokens: Optional[torch.Tensor],
     algorithm: int,
     philox_rounds: int,
     state_dtype: torch.dtype,
