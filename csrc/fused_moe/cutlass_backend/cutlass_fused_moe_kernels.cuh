@@ -1260,16 +1260,6 @@ __global__ void computeStridesTmaWarpSpecializedKernel(
           layout_info2.swap_ab ? gemm2_n : gemm_m, layout_info2.swap_ab ? gemm_m : gemm2_n,
           gemm2_k);
 
-  // Skip expensive stride/pointer/SF setup for experts with no assigned tokens.
-  // CUTLASS grouped GEMM skips zero-M problems after reading problem_shapes.
-  // For decode (1 token, top_k=8, 128 experts), this skips ~120 of 128 experts.
-  if (gemm_m == 0) {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    asm volatile("griddepcontrol.launch_dependents;");
-#endif
-    return;
-  }
-
   if (layout_info1.int4_groupwise_params.enabled) {
     layout_info1.int4_groupwise_params.shape.problem_shapes[expert] =
         TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::ProblemShapeInt::
@@ -1282,6 +1272,18 @@ __global__ void computeStridesTmaWarpSpecializedKernel(
         TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::ProblemShapeInt::
             UnderlyingProblemShape(layout_info2.swap_ab ? gemm2_n : gemm_m,
                                    layout_info2.swap_ab ? gemm_m : gemm2_n, gemm2_k);
+  }
+
+  // Skip expensive stride/pointer/SF setup for experts with no assigned tokens.
+  // All problem shapes (including int4_groupwise) are initialized above so CUTLASS
+  // can correctly traverse the problem list. The remaining work (alpha scales,
+  // block scaling factors, strides, pointers) is only needed for active experts.
+  // For decode (1 token, top_k=8, 128 experts), this skips ~120 of 128 experts.
+  if (gemm_m == 0) {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
+    return;
   }
 
   if (alpha_scale_flat1 && alpha_scale_flat2) {
@@ -2160,27 +2162,11 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKern
     assert(gated_off % ACTIVATION_ELEM_PER_THREAD == 0);
     int64_t const gated_off_vec = gated_off / ACTIVATION_ELEM_PER_THREAD;
 
-    // For FP4/MXFP8: extend the loop to cover K-dim padding (writes zero SFs for padded columns).
-    // This merges K-dim padding into the main loop for better cache locality.
-    int64_t const loop_elems =
-        (IsNVFP4 || IsMXFP8)
-            ? padded_inter_size / VecSize  // cover both real elements and K-dim padding
-            : num_elems_in_col;
-    bool const do_k_padding = (IsNVFP4 || IsMXFP8) && (padded_inter_size > inter_size);
-
     ActFn fn{};
     fn.alpha = gate_alpha;
     fn.beta = gate_beta;
     fn.limit = gate_limit;
-    for (int64_t elem_index = start_offset; elem_index < loop_elems; elem_index += stride) {
-      // K-dim padding region: write zero SF only (no activation compute)
-      if (do_k_padding && elem_index >= num_elems_in_col) {
-        writeSF<VecSize, VecSize>(num_tokens_before_expert, expert, /*source_row*/ -1, token,
-                                  elem_index, padded_inter_size, fc2_act_sf_flat,
-                                  /* input_sf */ nullptr);
-        continue;
-      }
-
+    for (int64_t elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride) {
       auto fc1_value =
           arrayConvert<GemmResultElem, ComputeElem>(gemm_result_vec[elem_index + gated_off_vec]);
       if (bias_ptr) {
@@ -2217,6 +2203,19 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKern
         output_vec[elem_index] = res;
       } else {
         output_vec[elem_index] = arrayConvert<ComputeElem, OutputElem>(post_act_val);
+      }
+    }
+
+    // Pad zeros in the extra SFs along the K dimension, we do this to ensure there are no nan
+    // values in the padded SF atom
+    if constexpr (IsNVFP4 || IsMXFP8) {
+      size_t padding_start_offset = inter_size / VecSize + start_offset;
+      size_t padding_elems_in_col = padded_inter_size / VecSize;
+      for (int64_t elem_index = padding_start_offset; elem_index < padding_elems_in_col;
+           elem_index += stride) {
+        writeSF<VecSize, VecSize>(num_tokens_before_expert, expert, /*source_row*/ -1, token,
+                                  elem_index, padded_inter_size, fc2_act_sf_flat,
+                                  /* input_sf */ nullptr);
       }
     }
   }
