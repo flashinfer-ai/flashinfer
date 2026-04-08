@@ -48,7 +48,10 @@ class CompilationContext:
             from flashinfer.jit.cpp_ext import is_cuda_version_at_least
 
             if is_cuda_version_at_least("12.9"):
-                return (major, str(minor) + "f")
+                if minor == 0:
+                    return (major, "0f")
+                else:
+                    return (major, str(minor) + "a")
             else:
                 raise RuntimeError("SM 12.x requires CUDA >= 12.9")
         elif major >= 10:
