@@ -72,10 +72,12 @@ struct EpHandleState {
   int64_t num_recv_tokens;
 
   // Routing metadata preserved for combine (reverse alltoall)
-  std::vector<int64_t> send_counts;  // [world_size] — per-rank token pairs sent
-  std::vector<int64_t> recv_counts;  // [world_size] — per-rank token pairs received
-  std::vector<int64_t> sort_indices; // argsort of flat_experts by dest rank
-  int64_t num_tokens;                // original num_tokens (before expand)
+  std::vector<int64_t> send_counts;          // [world_size] — per-rank totals sent
+  std::vector<int64_t> recv_counts;          // [world_size] — per-rank totals received
+  std::vector<int64_t> send_expert_counts;   // [ws * num_local] — per-rank per-expert sent
+  std::vector<int64_t> recv_expert_counts;   // [ws * num_local] — per-rank per-expert recvd
+  std::vector<int64_t> sort_indices;         // argsort of flat_experts by (dest_rank, expert)
+  int64_t num_tokens;                        // original num_tokens (before expand)
   int64_t top_k;
   int64_t hidden_dim;
 
@@ -185,27 +187,32 @@ Tensor epGetDispatchLayout(
     TensorView topk_idx,   // [num_tokens, top_k] int64 on GPU
     int64_t group_id) {
 
-  std::lock_guard<std::mutex> lock(g_mutex);
-  auto& g = g_groups.at(group_id);
+  EpGroupState g;
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g = g_groups.at(group_id);
+  }
 
+  cudaStream_t stream = get_current_stream();
   int64_t num_tokens = topk_idx.size(0);
   int64_t top_k = topk_idx.size(1);
   int64_t num_local = g.num_local_experts;
   int64_t local_start = g.rank * num_local;
 
-  // Allocate output on CPU
-  auto counts = alloc_tensor(
-    Shape({num_local}), dl_int32,
-    DLDevice{kDLCPU, 0}
-  );
+  // Copy topk_idx to host
+  std::vector<int64_t> host_idx(num_tokens * top_k);
+  cudaMemcpyAsync(host_idx.data(), topk_idx.data_ptr(),
+                  num_tokens * top_k * sizeof(int64_t),
+                  cudaMemcpyDeviceToHost, stream);
+  cudaStreamSynchronize(stream);
+
+  // Count THIS rank's tokens that target each local expert (send-side).
+  // This is a local-only computation — no alltoall needed.
+  // The sum across all ranks of these counts equals num_tokens * top_k
+  // (each token-expert pair maps to exactly one rank's local expert).
+  auto counts = alloc_tensor(Shape({num_local}), dl_int32, DLDevice{kDLCPU, 0});
   auto* counts_ptr = static_cast<int32_t*>(counts.data_ptr());
   std::memset(counts_ptr, 0, num_local * sizeof(int32_t));
-
-  // Copy topk_idx to host for counting
-  std::vector<int64_t> host_idx(num_tokens * top_k);
-  cudaMemcpy(host_idx.data(), topk_idx.data_ptr(),
-             num_tokens * top_k * sizeof(int64_t),
-             cudaMemcpyDeviceToHost);
 
   for (int64_t i = 0; i < num_tokens * top_k; ++i) {
     int64_t eid = host_idx[i];
@@ -286,42 +293,63 @@ Tuple<Tensor, Tensor, int64_t> epDispatch(
     if (eid >= 0 && eid < g.num_experts) expert_counts_global[eid]++;
   }
 
-  // Per-rank send counts (= sum of expert counts for experts on that rank)
-  std::vector<int64_t> send_counts(ws, 0);
+  // --- 2. Alltoall per-expert counts ---
+  //
+  // Each rank sends expert_counts for the dest rank's local experts.
+  // send_expert_counts[r * num_local .. (r+1) * num_local] = counts for
+  //   the num_local experts on rank r, from THIS rank's tokens.
+  // After alltoall, recv_expert_counts[r * num_local .. (r+1) * num_local]
+  //   = counts from rank r for THIS rank's local experts.
+
+  std::vector<int64_t> send_expert_counts(ws * num_local, 0);
   for (int64_t r = 0; r < ws; ++r) {
-    for (int64_t e = r * experts_per_rank; e < (r + 1) * experts_per_rank; ++e) {
-      send_counts[r] += expert_counts_global[e];
+    int64_t r_start = r * experts_per_rank;
+    for (int64_t e = 0; e < num_local; ++e) {
+      send_expert_counts[r * num_local + e] = expert_counts_global[r_start + e];
     }
   }
 
-  // --- 2. Alltoall the counts ---
-
-  std::vector<int64_t> recv_counts(ws, 0);
-  // Use NCCL P2P to exchange counts
+  std::vector<int64_t> recv_expert_counts(ws * num_local, 0);
   {
-    // Alloc temp GPU buffers for counts
-    auto send_counts_gpu = alloc_tensor(
-      Shape({ws}), dl_int64, DLDevice{kDLCUDA, (int)hidden.device().device_id});
-    auto recv_counts_gpu = alloc_tensor(
-      Shape({ws}), dl_int64, DLDevice{kDLCUDA, (int)hidden.device().device_id});
+    auto send_gpu = alloc_tensor(
+      Shape({ws * num_local}), dl_int64,
+      DLDevice{kDLCUDA, (int)hidden.device().device_id});
+    auto recv_gpu = alloc_tensor(
+      Shape({ws * num_local}), dl_int64,
+      DLDevice{kDLCUDA, (int)hidden.device().device_id});
 
-    cudaMemcpyAsync(send_counts_gpu.data_ptr(), send_counts.data(),
-                    ws * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(send_gpu.data_ptr(), send_expert_counts.data(),
+                    ws * num_local * sizeof(int64_t),
+                    cudaMemcpyHostToDevice, stream);
 
     NCCL_CHECK(ncclGroupStart());
     for (int64_t r = 0; r < ws; ++r) {
       NCCL_CHECK(ncclSend(
-        static_cast<int64_t*>(send_counts_gpu.data_ptr()) + r,
-        1, ncclInt64, (int)r, g.nccl_comm, stream));
+        static_cast<int64_t*>(send_gpu.data_ptr()) + r * num_local,
+        num_local, ncclInt64, (int)r, g.nccl_comm, stream));
       NCCL_CHECK(ncclRecv(
-        static_cast<int64_t*>(recv_counts_gpu.data_ptr()) + r,
-        1, ncclInt64, (int)r, g.nccl_comm, stream));
+        static_cast<int64_t*>(recv_gpu.data_ptr()) + r * num_local,
+        num_local, ncclInt64, (int)r, g.nccl_comm, stream));
     }
     NCCL_CHECK(ncclGroupEnd());
 
-    cudaMemcpyAsync(recv_counts.data(), recv_counts_gpu.data_ptr(),
-                    ws * sizeof(int64_t), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(recv_expert_counts.data(), recv_gpu.data_ptr(),
+                    ws * num_local * sizeof(int64_t),
+                    cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream);
+  }
+
+  // Compute per-rank send/recv totals and per-local-expert recv totals
+  std::vector<int64_t> send_counts(ws, 0);
+  std::vector<int64_t> recv_counts(ws, 0);
+  std::vector<int64_t> local_expert_recv_counts(num_local, 0);
+
+  for (int64_t r = 0; r < ws; ++r) {
+    for (int64_t e = 0; e < num_local; ++e) {
+      send_counts[r] += send_expert_counts[r * num_local + e];
+      recv_counts[r] += recv_expert_counts[r * num_local + e];
+      local_expert_recv_counts[e] += recv_expert_counts[r * num_local + e];
+    }
   }
 
   int64_t total_send = std::accumulate(send_counts.begin(), send_counts.end(), (int64_t)0);
@@ -337,8 +365,15 @@ Tuple<Tensor, Tensor, int64_t> epDispatch(
 
   std::vector<int64_t> sort_indices(num_tokens * top_k);
   std::iota(sort_indices.begin(), sort_indices.end(), 0);
-  std::sort(sort_indices.begin(), sort_indices.end(),
-            [&](int64_t a, int64_t b) { return dest_ranks[a] < dest_ranks[b]; });
+  // Sort by (dest_rank, expert_id) so that within each dest rank's chunk,
+  // tokens are grouped by expert. This is required for EXPERT_MAJOR_3D
+  // layout and ensures the receiver can split by expert using counts alone.
+  std::stable_sort(sort_indices.begin(), sort_indices.end(),
+            [&](int64_t a, int64_t b) {
+              if (dest_ranks[a] != dest_ranks[b])
+                return dest_ranks[a] < dest_ranks[b];
+              return host_idx[a] < host_idx[b];  // sub-sort by expert id
+            });
 
   // Upload sort_indices to GPU, use a gather kernel to build send buffer
   // For simplicity and correctness, do expand + gather on GPU
@@ -419,13 +454,13 @@ Tuple<Tensor, Tensor, int64_t> epDispatch(
       NCCL_CHECK(ncclGroupEnd());
     }
 
-    // --- 4. Compute local expert counts ---
+    // --- 4. Compute local expert counts (from recv side = all ranks) ---
 
     auto expert_counts_out = alloc_tensor(
       Shape({num_local}), dl_int32, DLDevice{kDLCPU, 0});
     auto* ec_ptr = static_cast<int32_t*>(expert_counts_out.data_ptr());
     for (int64_t e = 0; e < num_local; ++e) {
-      ec_ptr[e] = (int32_t)expert_counts_global[local_start + e];
+      ec_ptr[e] = (int32_t)local_expert_recv_counts[e];
     }
 
     // --- 5. Store handle with routing metadata ---
@@ -439,6 +474,8 @@ Tuple<Tensor, Tensor, int64_t> epDispatch(
       h.num_recv_tokens = total_recv;
       h.send_counts = send_counts;
       h.recv_counts = recv_counts;
+      h.send_expert_counts = send_expert_counts;
+      h.recv_expert_counts = recv_expert_counts;
       h.sort_indices = sort_indices;
       h.num_tokens = num_tokens;
       h.top_k = top_k;
@@ -448,11 +485,79 @@ Tuple<Tensor, Tensor, int64_t> epDispatch(
       g_handles[handle_id] = std::move(h);
     }
 
-    // Return [recv_hidden, expert_counts, handle_id]
-    // Note: total_recv might be 0 if no tokens route to this rank
-    Tensor recv_hidden_out = (total_recv > 0) ? recv_buf :
-      alloc_tensor(Shape({0, hidden_dim}), dtype,
-                   DLDevice{kDLCUDA, (int)hidden.device().device_id});
+    // --- 6. Format output based on output_layout ---
+
+    Tensor recv_hidden_out;
+    if (output_layout == 1 && total_recv > 0) {
+      // EXPERT_MAJOR_3D: [num_local_experts, max_tokens_per_expert, hidden_dim]
+      // recv_buf is flat [total_recv, hidden_dim], ordered by source rank.
+      // We need to scatter into [E, max_tok, H] based on expert assignment.
+
+      // Compute max tokens per expert for padding
+      int64_t max_tok = 0;
+      for (int64_t e = 0; e < num_local; ++e) {
+        if (ec_ptr[e] > max_tok) max_tok = ec_ptr[e];
+      }
+      if (max_tok == 0) max_tok = 1;  // avoid zero-size tensor
+
+      // Allocate 3D output, zero-initialized for padding
+      recv_hidden_out = alloc_tensor(
+        Shape({num_local, max_tok, hidden_dim}), dtype,
+        DLDevice{kDLCUDA, (int)hidden.device().device_id});
+      cudaMemsetAsync(recv_hidden_out.data_ptr(), 0,
+                      num_local * max_tok * hidden_dim * elem_size, stream);
+
+      // recv_buf layout: tokens from rank 0 first, then rank 1, etc.
+      // Within each rank's chunk, tokens are sub-sorted by expert ID
+      // (because the sender sorted by (dest_rank, expert_id)).
+      //
+      // recv_expert_counts[r * num_local + e] tells us exactly how many
+      // tokens from rank r go to local expert e. We use this to scatter
+      // into the 3D [num_local_experts, max_tok, hidden_dim] layout.
+
+      cudaStreamSynchronize(stream);
+
+      int64_t row_bytes_3d = hidden_dim * elem_size;
+      std::vector<char> h_recv(total_recv * row_bytes_3d);
+      cudaMemcpy(h_recv.data(), recv_buf.data_ptr(), h_recv.size(),
+                 cudaMemcpyDeviceToHost);
+
+      // Per-expert write cursors for the 3D output
+      std::vector<int64_t> expert_write_pos(num_local, 0);
+
+      std::vector<char> h_3d(num_local * max_tok * row_bytes_3d, 0);
+      int64_t src_offset = 0;
+      for (int64_t r = 0; r < ws; ++r) {
+        for (int64_t e = 0; e < num_local; ++e) {
+          int64_t cnt = recv_expert_counts[r * num_local + e];
+          for (int64_t t = 0; t < cnt; ++t) {
+            int64_t dst_off = (e * max_tok + expert_write_pos[e]) * row_bytes_3d;
+            int64_t src_off = src_offset * row_bytes_3d;
+            std::memcpy(&h_3d[dst_off], &h_recv[src_off], row_bytes_3d);
+            expert_write_pos[e]++;
+            src_offset++;
+          }
+        }
+      }
+
+      cudaMemcpyAsync(recv_hidden_out.data_ptr(), h_3d.data(),
+                      h_3d.size(), cudaMemcpyHostToDevice, stream);
+
+    } else if (total_recv > 0) {
+      // FLAT_2D: return as-is
+      recv_hidden_out = recv_buf;
+    } else {
+      // Empty — no tokens on this rank
+      if (output_layout == 1) {
+        recv_hidden_out = alloc_tensor(
+          Shape({num_local, 0, hidden_dim}), dtype,
+          DLDevice{kDLCUDA, (int)hidden.device().device_id});
+      } else {
+        recv_hidden_out = alloc_tensor(
+          Shape({0, hidden_dim}), dtype,
+          DLDevice{kDLCUDA, (int)hidden.device().device_id});
+      }
+    }
 
     return Tuple<Tensor, Tensor, int64_t>(recv_hidden_out, expert_counts_out, handle_id);
   }
