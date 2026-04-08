@@ -9,7 +9,7 @@ try:
     from .gdn_prefill import chunk_gated_delta_rule_sm100
 
     _has_blackwell_prefill = True
-except ImportError:
+except (ImportError, RuntimeError):
     _has_blackwell_prefill = False
     chunk_gated_delta_rule_sm100 = None  # type: ignore
 
