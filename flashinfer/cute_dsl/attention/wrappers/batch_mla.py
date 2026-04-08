@@ -455,7 +455,14 @@ class BatchMLADecodeCuteDSLWrapper:
 
         # Handle 3D vs 4D kv_cache: normalize to 3D [num_pages, page_size, D_total]
         if kv_cache.dim() == 4:
+            if kv_cache.shape[1] != 1:
+                raise ValueError(
+                    f"Expected 4D kv_cache shape [num_pages, 1, page_size, D], "
+                    f"got {tuple(kv_cache.shape)}"
+                )
             kv_cache = kv_cache.squeeze(1)
+        elif kv_cache.dim() != 3:
+            raise ValueError(f"kv_cache must be 3D or 4D, got ndim={kv_cache.dim()}")
 
         # Split query into latent and rope components
         q_latent_k = q[..., : self._kv_lora_rank]
@@ -632,7 +639,14 @@ def cute_dsl_mla_decode(
 
     # Handle 3D vs 4D kv_cache: normalize to 3D [num_pages, page_size, D_total]
     if kv_cache.dim() == 4:
+        if kv_cache.shape[1] != 1:
+            raise ValueError(
+                f"Expected 4D kv_cache shape [num_pages, 1, page_size, D], "
+                f"got {tuple(kv_cache.shape)}"
+            )
         kv_cache = kv_cache.squeeze(1)
+    elif kv_cache.dim() != 3:
+        raise ValueError(f"kv_cache must be 3D or 4D, got ndim={kv_cache.dim()}")
     page_size = kv_cache.shape[1]
 
     # Split query into latent and rope components

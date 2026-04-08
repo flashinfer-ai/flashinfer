@@ -834,6 +834,9 @@ SLIDING_WINDOW_PARAMS = [
     (1, 256, 256, 128),
     (9, 256, 256, 100),
     (1, 512, 512, 200),
+    # TODO: sliding window with qo_len != kv_len is not yet supported.
+    # The mask functions account for the Q/K offset but the coordinate
+    # identity tensor and loader need matching fixes. See PR #2805 triage.
 ]
 
 
