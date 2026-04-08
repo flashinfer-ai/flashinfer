@@ -163,6 +163,7 @@ def _collect_metadata() -> Dict[str, str]:
 
 
 def get_config_path(is_module: bool):
+    """Return the module name or file path for bundled per-GPU tuning configs."""
     dev_name = torch.cuda.get_device_name(0).replace(" ", "_")
     cutlass_ver = _nvfp4_cutlass_version.replace(".", "_")
     config_name = f"v{cutlass_ver}_trtllm_fused_moe_{dev_name}"
@@ -410,6 +411,10 @@ def autotune(
 ):
     """Context manager for autotuning with optional file-based caching.
 
+    Controls how FlashInfer profiles and selects the best kernel implementation
+    for each operation.  When ``tune_mode=True``, uncovered shapes are profiled
+    on the fly; when ``False``, only previously cached results are used.
+
     .. note::
         The ``cache`` parameter is **experimental**.  Single-process and
         multi-threaded use is fully supported.  Multi-process and multi-node
@@ -417,8 +422,8 @@ def autotune(
         to a shared cache file may result in lost updates from race conditions.
 
     Args:
-        tune_mode: If True, profile uncovered shapes during execution.
-            If False, only use cached/loaded configs (no profiling).
+        tune_mode: If ``True``, profile uncovered shapes during execution.
+            If ``False``, only use cached/loaded configs (no profiling).
         cache: Optional path to a JSON config file.
             On entry, configs are loaded from this file (if it exists).
             On exit, configs are saved back to this file (only when
@@ -427,11 +432,62 @@ def autotune(
             When provided, replaces the default power-of-2 buckets for all
             operations within this context.  For example,
             ``tuning_buckets=(64, 128, 256, 512, 1024)`` profiles exactly
-            those batch sizes.
-        round_up: If True, runtime batch sizes are rounded **up** to the next
-            measurement bucket instead of **down** (the default).  For example,
-            with buckets ``(128, 256, 512)`` and a runtime batch of 200,
-            ``round_up=False`` maps to 128 while ``round_up=True`` maps to 256.
+            those batch sizes.  Duplicates are removed and values are sorted
+            automatically.  Must contain **at least one** value when provided;
+            pass ``None`` (or omit) to inherit the current buckets.
+
+            **Selecting buckets** -- more buckets give finer-grained profiling
+            (better peak performance) at the cost of longer tuning time; fewer
+            buckets make tuning faster but coarser.  When the set of possible
+            runtime sizes is known in advance (e.g. vLLM knows which batch
+            sizes will appear), passing those exact sizes yields the best
+            results.  Focus on the size range that matters most for your
+            workload: for latency-sensitive inference, add more small sizes;
+            for throughput-oriented serving, cover the larger range.
+
+        round_up: Controls how runtime sizes map to profiled buckets.
+
+            * ``None`` (default) -- inherit from enclosing ``autotune()``
+              context, or ``False`` if there is none.
+            * ``False`` -- round **down** to the largest bucket <= the
+              runtime size (floor semantics, the historical default).
+            * ``True`` -- round **up** to the smallest bucket >= the runtime
+              size (ceil semantics).
+
+            For example, with buckets ``(128, 256, 512)`` and a runtime batch
+            of 200: ``round_up=False`` selects 128 while ``round_up=True``
+            selects 256.  Rounding up can improve performance when the best
+            kernel for a larger bucket also performs well at nearby smaller
+            sizes (see the PR discussion for benchmark data on cuDNN plans).
+
+    Raises:
+        ValueError: If ``tuning_buckets`` is provided but empty.
+
+    .. rubric:: Edge-case behaviour
+
+    **Empty buckets** -- ``autotune(tuning_buckets=())`` raises
+    :class:`ValueError` immediately.
+
+    **Unsupported sizes** -- Sizes that a kernel cannot handle are filtered
+    out during profiling (``get_valid_tactics``).  If a tactic still fails at
+    runtime the error is caught, a warning is logged, and that tactic is
+    skipped.  At inference time, ``map_to_tuning_buckets`` maps the runtime
+    size to the nearest profiled bucket, so an unsupported raw size never
+    reaches the kernel directly.
+
+    **Round-up beyond the largest bucket** -- When ``round_up=True`` and the
+    runtime size exceeds every bucket, the value is clamped to the largest
+    bucket (see :func:`~flashinfer.fused_moe.utils.round_to_nearest_bucket`).
+
+    **Nested / sequential contexts** -- Overrides are managed on a per-thread
+    stack.  A nested ``autotune()`` pushes its overrides; on exit the outer
+    context's values are restored.  Sequential contexts are fully independent.
+    Different buckets produce different cache keys, so entries never collide.
+
+    **Using both parameters together** is fully supported:
+    ``autotune(tuning_buckets=(100, 300, 600), round_up=True)`` profiles
+    at 100, 300, and 600 and rounds runtime sizes *up* to the nearest of
+    those buckets at inference time.
 
     Examples::
 
@@ -446,6 +502,17 @@ def autotune(
         # Round up to next bucket during inference
         with autotune(False, cache="my_configs.json", round_up=True):
             model(inputs)
+
+        # Combine custom buckets with round-up
+        with autotune(True, tuning_buckets=(100, 300, 600), round_up=True):
+            model(inputs)  # profiles at 100, 300, 600
+
+        # Nested contexts: inner overrides, outer restored on exit
+        with autotune(True, tuning_buckets=(128, 256)):
+            model(inputs)   # uses (128, 256)
+            with autotune(True, tuning_buckets=(64, 512)):
+                model(inputs)  # uses (64, 512)
+            model(inputs)   # back to (128, 256)
     """
     tuner = AutoTuner.get()
 
@@ -647,6 +714,7 @@ class AutoTuner:
 
     @property
     def _override_tuning_buckets(self) -> Optional[Tuple[int, ...]]:
+        """Currently active tuning-bucket override for this thread, or ``None``."""
         stack = self._get_override_stack()
         if stack:
             return stack[-1][0]
@@ -654,6 +722,7 @@ class AutoTuner:
 
     @property
     def _override_round_up(self) -> bool:
+        """Whether the current thread's active override requests round-up semantics."""
         stack = self._get_override_stack()
         if stack:
             return stack[-1][1]
@@ -992,7 +1061,7 @@ class AutoTuner:
             return runners[runner_id], tactic
 
     def _get_input_sizes(self, inputs: List[torch.Tensor]) -> List[torch.Size]:
-        # Handle None tensors for optional inputs and non-Tensor scalar values
+        """Return ``torch.Size`` for each input, using ``(0,)`` for non-Tensor values."""
         sizes = [
             input.size() if isinstance(input, torch.Tensor) else torch.Size((0,))
             for input in inputs
@@ -1264,6 +1333,7 @@ class AutoTuner:
     def _prepare_input_tensors(
         self, profile: OptimizationProfile, inputs: List[torch.Tensor]
     ) -> List[torch.Tensor]:
+        """Create tensors matching *profile* shapes; reuse static inputs as-is."""
         default_initializer = lambda shapes, dtype, device: (
             torch.rand(shapes, device=device) * 10 - 5
         ).to(dtype)
@@ -1469,6 +1539,7 @@ class AutoTuner:
         inputs: List[torch.Tensor],
         tuning_config: TuningConfig,
     ) -> List[List[torch.Tensor]]:
+        """Create multiple input copies to flush the L2 cache between profiling iterations."""
         if not tuning_config.use_cold_l2_cache:
             return [inputs]
 
@@ -1512,6 +1583,7 @@ class AutoTuner:
         self.stats = AutoTunerStatistics()
 
     def _get_l2_cache_size_in_bytes(self, device_id: Optional[int] = None) -> int:
+        """Return the L2 cache size in bytes for the given (or current) CUDA device."""
         if device_id is None:
             device_id = torch.cuda.current_device()
         return torch.cuda.get_device_properties(device_id).L2_cache_size
