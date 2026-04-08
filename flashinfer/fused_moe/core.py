@@ -21,6 +21,10 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 
 from ..api_logging import flashinfer_api
+from ..trace.templates.moe import (
+    trtllm_fp4_block_scale_moe_trace_dispatch,
+    trtllm_fp8_block_scale_moe_trace_dispatch,
+)
 from ..autotuner import (
     AutoTuner,
     DynamicTensorSpec,
@@ -2540,7 +2544,7 @@ def trtllm_fp8_per_tensor_scale_moe(
         return result
 
 
-@flashinfer_api
+@flashinfer_api(trace=trtllm_fp8_block_scale_moe_trace_dispatch)
 def trtllm_fp8_block_scale_moe(
     routing_logits: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
@@ -2767,7 +2771,7 @@ def trtllm_fp8_block_scale_routed_moe(
         return result
 
 
-@flashinfer_api
+@flashinfer_api(trace=trtllm_fp4_block_scale_moe_trace_dispatch)
 def trtllm_fp4_block_scale_moe(
     routing_logits: torch.Tensor,
     routing_bias: Optional[torch.Tensor],

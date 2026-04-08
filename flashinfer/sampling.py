@@ -21,6 +21,11 @@ import torch
 
 from .api_logging import flashinfer_api
 from .jit.sampling import gen_sampling_module
+from .trace.templates.sampling import (
+    top_k_sampling_trace,
+    top_k_top_p_sampling_trace,
+    top_p_sampling_trace,
+)
 from .utils import (
     _get_cache_buf,
     device_support_pdl,
@@ -950,7 +955,7 @@ def sampling_from_probs(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=top_p_sampling_trace)
 def top_p_sampling_from_probs(
     probs: torch.Tensor,
     top_p: Union[torch.Tensor, float],
@@ -1062,7 +1067,7 @@ def top_p_sampling_from_probs(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=top_k_sampling_trace)
 def top_k_sampling_from_probs(
     probs: torch.Tensor,
     top_k: Union[torch.Tensor, int],
@@ -1428,7 +1433,7 @@ def top_k_top_p_sampling_from_logits(
         raise ValueError(f"Invalid filter_apply_order: {filter_apply_order}")
 
 
-@flashinfer_api
+@flashinfer_api(trace=top_k_top_p_sampling_trace)
 def top_k_top_p_sampling_from_probs(
     probs: torch.Tensor,
     top_k: Union[torch.Tensor, int],
