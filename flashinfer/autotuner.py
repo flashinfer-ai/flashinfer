@@ -554,14 +554,20 @@ def autotune(
     # Reference-counted tuning mode: is_tuning_mode stays True as long as
     # at least one autotune(True) context is active, even if an
     # autotune(False) context overlaps on another thread.
-    with tuner._lock:
-        if tune_mode:
-            tuner._active_tuning_contexts += 1
-        old_mode = tuner.is_tuning_mode
-        tuner.is_tuning_mode = tuner._active_tuning_contexts > 0
-        autotune_enabled = tune_mode and not old_mode
-    if autotune_enabled:
-        logger.info("[Autotuner]: Autotuning process starts ...")
+    try:
+        with tuner._lock:
+            if tune_mode:
+                tuner._active_tuning_contexts += 1
+            old_mode = tuner.is_tuning_mode
+            tuner.is_tuning_mode = tuner._active_tuning_contexts > 0
+            autotune_enabled = tune_mode and not old_mode
+        if autotune_enabled:
+            logger.info("[Autotuner]: Autotuning process starts ...")
+    except BaseException:
+        if pushed:
+            override_stack.pop()
+        raise
+
     try:
         yield
     finally:
