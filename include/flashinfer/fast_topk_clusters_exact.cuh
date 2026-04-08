@@ -35,11 +35,10 @@ void setup_kernel_smem_once() {
   }();
 }
 
-__device__ __forceinline__ int cum_sum(int* s_hist_buf) {
+__device__ __forceinline__ int cum_sum(int* s_hist_buf, int* reduce_buf) {
   constexpr int RADIX = 256;
   const int warp_idx = threadIdx.x / 32;
 
-  __shared__ int reduce_buf[8];
   int val = 0;
   if (threadIdx.x < RADIX) {
     val = s_hist_buf[threadIdx.x];
@@ -146,17 +145,18 @@ __device__ __forceinline__ TopkResults fast_topk_cuda_v4(
   constexpr int LShiftStart = sizeof(T) * 8 - 8;  // 24 for float, 8 for half
   constexpr int RADIX = 256;
 
-  __shared__ int shared_hist[3][RADIX];
-
-  extern __shared__ uint8_t shared_cache[];
-  alignas(128) __shared__ int shared_final_idx_count;      // number of topk indices in s_topk_inds
-  alignas(128) __shared__ int shared_num_cached_count[2];  // number of cached indices
-  alignas(128) __shared__ int shared_threshold_bin;
-  alignas(128) __shared__ int s_cached_overflow_count[2];  // global overflow counts
+  alignas(128) extern __shared__ uint8_t shared_cache[];
 
   uint32_t* s_cached_logit_bits = (uint32_t*)shared_cache;
   int* s_cached_indices = (int*)(2 * num_cached + s_cached_logit_bits);
   int* s_topk_inds = (int*)(2 * num_cached + s_cached_indices);
+
+  int* shared_hist = s_topk_inds + TopK;
+  int* shared_final_idx_count = shared_hist + 3 * 256;
+  int* shared_num_cached_count = shared_final_idx_count + 1;
+  int* shared_threshold_bin = shared_num_cached_count + 2;
+  int* s_cached_overflow_count = shared_threshold_bin + 1;
+  int* s_cum_reduce_buf = s_cached_overflow_count + 2;
 
   auto cluster = cg::this_cluster();
   const int block_id = cluster.block_rank();
@@ -170,45 +170,45 @@ __device__ __forceinline__ TopkResults fast_topk_cuda_v4(
   auto get_threshold_bin = [&](int hist_idx, int& k_remaining, bool sum_hist = true) {
     __syncthreads();
     // first reduce cum sum locally
-    int cum_val = cum_sum(shared_hist[hist_idx]);
+    int cum_val = cum_sum(shared_hist + hist_idx * 256, s_cum_reduce_buf);
     if (NClusters > 1 && sum_hist) {
       if (radix_thread) {
-        shared_hist[hist_idx][threadIdx.x] = cum_val;
+        shared_hist[hist_idx * 256 + threadIdx.x] = cum_val;
       }
       cluster.sync();  // now first block in cluster has its local cum sum
 
       if (radix_thread) {
 #pragma unroll
         for (int cl = 0; cl < NClusters - 1; cl++) {
-          cum_val += cluster.map_shared_rank(&shared_hist[hist_idx][threadIdx.x],
+          cum_val += cluster.map_shared_rank(&shared_hist[hist_idx * 256 + threadIdx.x],
                                              (cl + block_id + 1) % NClusters)[0];
         }
-        shared_hist[2][threadIdx.x] = cum_val;
+        shared_hist[2 * 256 + threadIdx.x] = cum_val;
       }
     } else {
       if (radix_thread) {
-        shared_hist[2][threadIdx.x] = cum_val;
+        shared_hist[2 * 256 + threadIdx.x] = cum_val;
       }
     }
 
     __syncthreads();
 
-    int cum_val1 = threadIdx.x < RADIX - 1 ? shared_hist[2][threadIdx.x + 1] : 0;
+    int cum_val1 = threadIdx.x < RADIX - 1 ? shared_hist[2 * 256 + threadIdx.x + 1] : 0;
 
     if (radix_thread && cum_val > k_remaining && cum_val1 <= k_remaining) {
-      shared_threshold_bin = threadIdx.x;
+      *shared_threshold_bin = threadIdx.x;
       if (DEBUG) {
         printf(
             "block_id %d: threshold_bin %d. cum_sum_thres %d, cum_sum_thres+1 "
             "%d, topk_val %d\n",
-            block_id, threadIdx.x, cum_val, cum_val1, shared_final_idx_count);
+            block_id, threadIdx.x, cum_val, cum_val1, *shared_final_idx_count);
       }
     }
 
     __syncthreads();
-    const int threshold_bin = shared_threshold_bin;
+    const int threshold_bin = *shared_threshold_bin;
     if (threshold_bin < RADIX - 1) {
-      k_remaining -= shared_hist[2][threshold_bin + 1];
+      k_remaining -= shared_hist[2 * 256 + threshold_bin + 1];
     }
     return threshold_bin;
   };
@@ -217,14 +217,14 @@ __device__ __forceinline__ TopkResults fast_topk_cuda_v4(
 
   if (radix_thread) {
     if (pre_hist != nullptr) {
-      shared_hist[0][threadIdx.x] = pre_hist[threadIdx.x];
+      shared_hist[threadIdx.x] = pre_hist[threadIdx.x];
     } else {
-      shared_hist[0][threadIdx.x] = 0;
+      shared_hist[threadIdx.x] = 0;
     }
-    shared_hist[1][threadIdx.x] = 0;
+    shared_hist[256 + threadIdx.x] = 0;
   }
   if (threadIdx.x == 0) {
-    shared_final_idx_count = 0;
+    *shared_final_idx_count = 0;
     shared_num_cached_count[0] = 0;
     s_cached_overflow_count[0] = 0;
   }
@@ -235,7 +235,7 @@ __device__ __forceinline__ TopkResults fast_topk_cuda_v4(
       T res = logits[i];
 
       auto bin = Ord::to_ordered_bits(res) >> LShiftStart;
-      atomicAdd(shared_hist[0] + bin, 1);
+      atomicAdd(shared_hist + bin, 1);
     }
   }
 
@@ -251,7 +251,7 @@ __device__ __forceinline__ TopkResults fast_topk_cuda_v4(
       int bin = (bits >> LShiftStart);
 
       if (bin > threshold_bin) {
-        int topk_offset = atomicAdd(&shared_final_idx_count, 1);
+        int topk_offset = atomicAdd(shared_final_idx_count, 1);
         if (topk_offset < TopK) {
           s_topk_inds[topk_offset] = i;
         }
@@ -263,14 +263,14 @@ __device__ __forceinline__ TopkResults fast_topk_cuda_v4(
           s_cached_indices[cached_offset] = i;
           s_cached_logit_bits[cached_offset] =
               static_cast<uint32_t>(bits);  // widen to 32 bits if from half
-          atomicAdd(shared_hist[1] + ((bits >> (LShiftStart - 8)) & 0xff), 1);
+          atomicAdd(shared_hist + 256 + ((bits >> (LShiftStart - 8)) & 0xff), 1);
         } else {
           // Shared buffer full: spill to per-CTA global overflow cache.
           int g_off = atomicAdd(&s_cached_overflow_count[0], 1);
           if (g_off < overflow_stride) {
             PackedCachedData cached_res = {static_cast<uint32_t>(bits), i};
             get_cached_overflow(0)[g_off] = cached_res;
-            atomicAdd(shared_hist[1] + ((bits >> (LShiftStart - 8)) & 0xff), 1);
+            atomicAdd(shared_hist + 256 + ((bits >> (LShiftStart - 8)) & 0xff), 1);
           }
         }
       }
@@ -310,7 +310,7 @@ __device__ __forceinline__ TopkResults fast_topk_cuda_v4(
                                // get_threshold_bin and phase ^ 1 of the histogram
     }
     if (radix_thread) {
-      shared_hist[phase ^ 1][threadIdx.x] = 0;
+      shared_hist[(phase ^ 1) * 256 + threadIdx.x] = 0;
     }
     if (threadIdx.x == 0) {
       shared_num_cached_count[phase] = 0;
@@ -339,7 +339,7 @@ __device__ __forceinline__ TopkResults fast_topk_cuda_v4(
       int bin = (bits >> (LShiftStart - t * 8)) & 0xff;
 
       if (bin > threshold_bin) {
-        int topk_offset = atomicAdd(&shared_final_idx_count, 1);
+        int topk_offset = atomicAdd(shared_final_idx_count, 1);
         if (topk_offset < TopK) {
           s_topk_inds[topk_offset] = cached_idx;
         } else {
@@ -351,13 +351,15 @@ __device__ __forceinline__ TopkResults fast_topk_cuda_v4(
         if (cached_offset < num_cached) {
           s_cached_indices[cached_offset + phase * num_cached] = cached_idx;
           s_cached_logit_bits[cached_offset + phase * num_cached] = bits;
-          atomicAdd(shared_hist[phase ^ 1] + (bits >> (LShiftStart - (t + 1) * 8) & 0xff), 1);
+          atomicAdd(shared_hist + (phase ^ 1) * 256 + (bits >> (LShiftStart - (t + 1) * 8) & 0xff),
+                    1);
         } else {
           int g_off = atomicAdd(&s_cached_overflow_count[phase], 1);
           if (g_off < overflow_stride) {
             PackedCachedData data = {bits, cached_idx};
             get_cached_overflow(phase)[g_off] = data;
-            atomicAdd(shared_hist[phase ^ 1] + (bits >> (LShiftStart - (t + 1) * 8) & 0xff), 1);
+            atomicAdd(
+                shared_hist + (phase ^ 1) * 256 + (bits >> (LShiftStart - (t + 1) * 8) & 0xff), 1);
           }
         }
       }
@@ -371,7 +373,7 @@ __device__ __forceinline__ TopkResults fast_topk_cuda_v4(
       int bin = (bits >> (LShiftStart - t * 8)) & 0xff;
 
       if (bin > threshold_bin) {
-        int topk_offset = atomicAdd(&shared_final_idx_count, 1);
+        int topk_offset = atomicAdd(shared_final_idx_count, 1);
         if (topk_offset < TopK) {
           s_topk_inds[topk_offset] = cached_idx;
         } else {
@@ -383,12 +385,14 @@ __device__ __forceinline__ TopkResults fast_topk_cuda_v4(
         if (cached_offset < num_cached) {
           s_cached_indices[cached_offset + phase * num_cached] = cached_idx;
           s_cached_logit_bits[cached_offset + phase * num_cached] = bits;
-          atomicAdd(shared_hist[phase ^ 1] + (bits >> (LShiftStart - (t + 1) * 8) & 0xff), 1);
+          atomicAdd(shared_hist + (phase ^ 1) * 256 + (bits >> (LShiftStart - (t + 1) * 8) & 0xff),
+                    1);
         } else {
           int g_off = atomicAdd(&s_cached_overflow_count[phase], 1);
           if (g_off < overflow_stride) {
             get_cached_overflow(phase)[g_off] = {bits, cached_idx};
-            atomicAdd(shared_hist[phase ^ 1] + (bits >> (LShiftStart - (t + 1) * 8) & 0xff), 1);
+            atomicAdd(
+                shared_hist + (phase ^ 1) * 256 + (bits >> (LShiftStart - (t + 1) * 8) & 0xff), 1);
           }
         }
       }
@@ -404,7 +408,7 @@ __device__ __forceinline__ TopkResults fast_topk_cuda_v4(
           int bin = s_cached_logit_bits[i] & 0xff;
           int cached_idx = s_cached_indices[i];
           if (bin == threshold_bin) {
-            int topk_offset = atomicAdd(&shared_final_idx_count, 1);
+            int topk_offset = atomicAdd(shared_final_idx_count, 1);
             if (topk_offset < TopK) {
               s_topk_inds[topk_offset] = cached_idx;
             } else {
@@ -419,7 +423,7 @@ __device__ __forceinline__ TopkResults fast_topk_cuda_v4(
           int cached_idx = data.index;
           int bin = bits & 0xff;
           if (bin == threshold_bin) {
-            int topk_offset = atomicAdd(&shared_final_idx_count, 1);
+            int topk_offset = atomicAdd(shared_final_idx_count, 1);
             if (topk_offset < TopK) {
               s_topk_inds[topk_offset] = cached_idx;
             } else {
@@ -437,18 +441,18 @@ __device__ __forceinline__ TopkResults fast_topk_cuda_v4(
   // slice.
   if (NClusters > 1) {
     int topk_start = 0;
-    int topk_num = shared_final_idx_count;
+    int topk_num = *shared_final_idx_count;
 
     cluster.sync();  // sync to get the shared_final_idx_count across CTAs in
                      // current cluster
 
     if (block_id > 0) {
       if (threadIdx.x == 0) {
-        topk_start += atomicAdd(cluster.map_shared_rank(&shared_final_idx_count, 0), topk_num);
-        shared_final_idx_count = topk_start;
+        topk_start += atomicAdd(cluster.map_shared_rank(shared_final_idx_count, 0), topk_num);
+        *shared_final_idx_count = topk_start;
       }
       __syncthreads();
-      topk_start = shared_final_idx_count;
+      topk_start = *shared_final_idx_count;
     }
 
     if (DEBUG && threadIdx.x == 0) {
@@ -479,6 +483,9 @@ __global__ __launch_bounds__(1024) void __cluster_dims__(NClusters, 1, 1)
          i += 1024 * NClusters) {
       if (i < seq_len) {
         output_indices[ind_offset + i] = static_cast<IdxT>(i);
+        if (output_values != nullptr) {
+          output_values[ind_offset + i] = logits[logit_offset + i];
+        }
       } else {
         output_indices[ind_offset + i] = static_cast<IdxT>(-1);
       }
@@ -594,23 +601,24 @@ __global__ __launch_bounds__(1024) void __cluster_dims__(NClusters, 1, 1)
   }
 }
 
-constexpr int MAX_SMEM_CARVEOUT = 227 * 1000;
+constexpr int MAX_SMEM_CARVEOUT = 227 * 1024;
 
-#define DISPATCH_TOPK_EXACT(kernel_name, dtype, CLUSTERS, PDL)                      \
-  if (num_clusters == CLUSTERS && pdl_enabled == PDL) {                             \
-    setup_kernel_smem_once<kernel_name<dtype, CLUSTERS, PDL>, MAX_SMEM_CARVEOUT>(); \
-    kernel = (void*)&kernel_name<dtype, CLUSTERS, PDL>;                             \
+#define DISPATCH_TOPK_EXACT(kernel_name, dtype, CLUSTERS, PDL) \
+  if (num_clusters == CLUSTERS && pdl_enabled == PDL) {        \
+    kernel = (void*)&kernel_name<dtype, CLUSTERS, PDL>;        \
   }
 
 // Variant for kernels with an additional IdxT template parameter (index output dtype).
-#define DISPATCH_TOPK_EXACT_IDX(kernel_name, dtype, idx_type, CLUSTERS, PDL)                  \
-  if (num_clusters == CLUSTERS && pdl_enabled == PDL) {                                       \
-    setup_kernel_smem_once<kernel_name<dtype, idx_type, CLUSTERS, PDL>, MAX_SMEM_CARVEOUT>(); \
-    kernel = (void*)&kernel_name<dtype, idx_type, CLUSTERS, PDL>;                             \
+#define DISPATCH_TOPK_EXACT_IDX(kernel_name, dtype, idx_type, CLUSTERS, PDL) \
+  if (num_clusters == CLUSTERS && pdl_enabled == PDL) {                      \
+    kernel = (void*)&kernel_name<dtype, idx_type, CLUSTERS, PDL>;            \
   }
 
 inline void launch_topk_cluster_kernel(void* kernel, void** args, int grid_dim, int smem_bytes,
                                        int num_clusters, bool pdl_enabled, cudaStream_t stream) {
+  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, MAX_SMEM_CARVEOUT);
+  cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+
   cudaLaunchConfig_t config;
   config.numAttrs = 0;
   cudaLaunchAttribute attribute[2];
@@ -630,14 +638,18 @@ inline void launch_topk_cluster_kernel(void* kernel, void** args, int grid_dim, 
   cudaLaunchKernelExC(&config, kernel, args);
 }
 
+int get_shared_mem_bytes(int TopK, int num_cached) {
+  return (num_cached * 2 * sizeof(float) + num_cached * 2 * sizeof(int) + TopK * sizeof(int) +
+          6 * sizeof(int) + 3 * 256 * sizeof(int) + 8 * sizeof(int));
+}
+
 template <typename T, typename IdxT = int>
 void launch_fast_topk_clusters_exact(const T* logits, IdxT* indices, T* output_values, int seq_len,
                                      int* pre_hist, int* cached_overflow, int overflow_stride,
                                      int batch_size, int logit_stride, int indices_stride,
                                      int num_cached, int num_clusters, bool pdl_enabled, int TopK,
                                      cudaStream_t stream) {
-  int extern_shared_mem =
-      (num_cached * 2 * sizeof(float) + num_cached * 2 * sizeof(int) + TopK * sizeof(int));
+  int extern_shared_mem = get_shared_mem_bytes(TopK, num_cached);
 
   void* args[11] = {
       &logits,          &indices,      &output_values,  &seq_len,    &pre_hist, &cached_overflow,
@@ -671,8 +683,7 @@ void launch_fast_topk_clusters_exact_page_table_transform(
     int* cached_overflow, int overflow_stride, int batch_size, int logit_stride, int indices_stride,
     int page_table_stride, int num_cached, int num_clusters, bool pdl_enabled, int TopK,
     cudaStream_t stream) {
-  int extern_shared_mem =
-      (num_cached * 2 * sizeof(float) + num_cached * 2 * sizeof(int) + TopK * sizeof(int));
+  int extern_shared_mem = get_shared_mem_bytes(TopK, num_cached);
 
   void* args[12] = {&logits,         &indices,           &seq_lens,        &page_table,
                     &pre_hist,       &cached_overflow,   &overflow_stride, &logit_stride,
@@ -703,8 +714,7 @@ void launch_fast_topk_clusters_exact_ragged_transform(
     const T* logits, int* indices, int* seq_lens, int* offsets, int* pre_hist, int* cached_overflow,
     int overflow_stride, int batch_size, int logit_stride, int indices_stride, int num_cached,
     int num_clusters, bool pdl_enabled, int TopK, cudaStream_t stream) {
-  int extern_shared_mem =
-      (num_cached * 2 * sizeof(float) + num_cached * 2 * sizeof(int) + TopK * sizeof(int));
+  int extern_shared_mem = get_shared_mem_bytes(TopK, num_cached);
 
   void* args[11] = {
       &logits,          &indices,      &seq_lens,       &offsets,    &pre_hist, &cached_overflow,

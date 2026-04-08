@@ -23,7 +23,12 @@ import torch
 
 from .api_logging import flashinfer_api
 from .jit.topk import gen_topk_module
-from .utils import _get_cache_buf, register_custom_op, register_fake_op
+from .utils import (
+    _get_cache_buf,
+    register_custom_op,
+    register_fake_op,
+    get_shared_bytes_per_block_optin,
+)
 
 
 @functools.cache
@@ -306,6 +311,25 @@ def can_implement_filtered_topk() -> bool:
     return get_topk_module().can_implement_filtered_topk()
 
 
+def roundup_kbyte(x):
+    return (x + 1023) // 1024 * 1024
+
+
+@functools.cache
+def get_num_cached_for_topk(device, k):
+    regs_per_thread = 32
+    threads_per_block = 1024
+    blocks_per_sm = 65536 // (threads_per_block * regs_per_thread)
+
+    shared_per_block = (
+        get_shared_bytes_per_block_optin(device) // blocks_per_sm
+    )  # SMEM_CARVEOUT // blocks_per_sm
+
+    buffers_used = (k + 6 + 3 * 256 + 8) * 4  # other shared memory for buffers
+    # num_bytes = 2 * 2 * sizeof(int) * num_cached, double buffer on indices and values cache
+    return (shared_per_block - buffers_used - 1024) // 16
+
+
 def get_fast_topk_clusters(batch_size: int) -> int:
     # low batch size, allocate more clusters to get more parallelism
     # high batch size, more parallelism available per row
@@ -342,6 +366,8 @@ def topk_clusters_exact(
         output_vals = torch.empty(
             batch_size, top_k, dtype=logits.dtype, device=logits.device
         )
+
+    num_cached = get_num_cached_for_topk(logits.device, top_k)
     get_topk_module().fast_topk_clusters_exact(
         logits,
         indices,
@@ -349,7 +375,7 @@ def topk_clusters_exact(
         None,  # histogram
         overflow_buf,
         top_k,
-        4100,  # num_cached
+        num_cached,  # num_cached
         num_clusters,
         pdl,
     )
@@ -371,6 +397,7 @@ def topk_clusters_page_table_transform(
         device=logits.device,
         dtype=torch.int32,
     )
+    num_cached = get_num_cached_for_topk(logits.device, top_k)
     get_topk_module().fast_topk_clusters_exact_page_table_transform(
         logits,
         indices,
@@ -379,7 +406,7 @@ def topk_clusters_page_table_transform(
         None,  # histogram
         overflow_buf,
         top_k,
-        4196,  # num_cached
+        num_cached,  # num_cached
         num_clusters,
         pdl,
     )
@@ -399,6 +426,7 @@ def topk_clusters_ragged_transform(logits, seq_lens, offsets, top_k, pdl=False):
         device=logits.device,
         dtype=torch.int32,
     )
+    num_cached = get_num_cached_for_topk(logits.device, top_k)
     get_topk_module().fast_topk_clusters_exact_ragged_transform(
         logits,
         indices,
@@ -407,7 +435,7 @@ def topk_clusters_ragged_transform(logits, seq_lens, offsets, top_k, pdl=False):
         None,  # histogram
         overflow_buf,
         top_k,
-        4196,  # num_cached
+        num_cached,  # num_cached
         num_clusters,
         pdl,
     )

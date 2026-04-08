@@ -29,14 +29,14 @@ void fast_topk_clusters_exact(TensorView logits, TensorView indices,
   const int batch_size = static_cast<int>(logits.size(0));
   const int seq_len = static_cast<int>(logits.size(1));
 
-  const int* hist_ptr = nullptr;
+  int* hist_ptr = nullptr;
   if (histogram.has_value()) {
-    hist_ptr = static_cast<const int*>(histogram.value().data_ptr());
+    hist_ptr = (int*)histogram.value().data_ptr();
   }
 
-  const void* values_ptr = nullptr;
+  void* values_ptr = nullptr;
   if (output_values.has_value()) {
-    values_ptr = static_cast<const void*>(output_values.value().data_ptr());
+    values_ptr = (output_values.value().data_ptr());
   }
 
   const int logit_stride = static_cast<int>(logits.stride(0));
@@ -57,17 +57,15 @@ void fast_topk_clusters_exact(TensorView logits, TensorView indices,
     if (idx_int64) {
       launch_fast_topk_clusters_exact<c_type, int64_t>(
           static_cast<const c_type*>(logits.data_ptr()), static_cast<int64_t*>(indices.data_ptr()),
-          (c_type*)const_cast<void*>(values_ptr), seq_len, const_cast<int*>(hist_ptr),
-          static_cast<int*>(cached_overflow.data_ptr()), ovf_stride, batch_size, logit_stride,
-          indices_stride, static_cast<int>(num_cached), n_clusters, pdl_enabled,
-          static_cast<int>(TopK), stream);
+          (c_type*)(values_ptr), seq_len, (hist_ptr), static_cast<int*>(cached_overflow.data_ptr()),
+          ovf_stride, batch_size, logit_stride, indices_stride, static_cast<int>(num_cached),
+          n_clusters, pdl_enabled, static_cast<int>(TopK), stream);
     } else {
       launch_fast_topk_clusters_exact<c_type, int>(
           static_cast<const c_type*>(logits.data_ptr()), static_cast<int*>(indices.data_ptr()),
-          (c_type*)const_cast<void*>(values_ptr), seq_len, const_cast<int*>(hist_ptr),
-          static_cast<int*>(cached_overflow.data_ptr()), ovf_stride, batch_size, logit_stride,
-          indices_stride, static_cast<int>(num_cached), n_clusters, pdl_enabled,
-          static_cast<int>(TopK), stream);
+          (c_type*)(values_ptr), seq_len, (hist_ptr), static_cast<int*>(cached_overflow.data_ptr()),
+          ovf_stride, batch_size, logit_stride, indices_stride, static_cast<int>(num_cached),
+          n_clusters, pdl_enabled, static_cast<int>(TopK), stream);
     }
     return true;
   });

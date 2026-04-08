@@ -307,6 +307,12 @@ def get_gpu_memory_bandwidth(device: torch.device) -> float:
         pynvml.nvmlShutdown()
 
 
+@functools.cache
+def get_shared_bytes_per_block_optin(device: torch.device) -> int:
+    cap = torch.cuda.get_device_properties(device.index)
+    return cap.shared_memory_per_block_optin
+
+
 def _check_cached_qkv_data_type(
     q: torch.Tensor, k: torch.Tensor, dtype_q: torch.dtype, dtype_kv: torch.dtype
 ) -> None:
