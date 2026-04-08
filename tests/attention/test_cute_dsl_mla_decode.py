@@ -193,9 +193,7 @@ def test_cute_dsl_mla_decode_fp16(
 @pytest.mark.parametrize("seq_len_k", [128, 512, 2048])
 @pytest.mark.parametrize("page_size", [32, 128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_cute_dsl_mla_decode_variable_seq_len(
-    batch_size, seq_len_k, page_size, dtype
-):
+def test_cute_dsl_mla_decode_variable_seq_len(batch_size, seq_len_k, page_size, dtype):
     """Test MLA decode with variable sequence lengths across the batch."""
     skip_if_unsupported()
 
@@ -212,9 +210,7 @@ def test_cute_dsl_mla_decode_variable_seq_len(
     output_scale = 1.0
     D_qk = latent_dim + rope_dim
 
-    query = torch.randn(
-        batch_size, q_len, num_heads, D_qk, dtype=dtype, device=device
-    )
+    query = torch.randn(batch_size, q_len, num_heads, D_qk, dtype=dtype, device=device)
 
     max_seq_len = seq_len_k
     seq_lens = torch.randint(
@@ -223,9 +219,7 @@ def test_cute_dsl_mla_decode_variable_seq_len(
 
     max_pages_per_batch = (max_seq_len + page_size - 1) // page_size
     total_pages = max_pages_per_batch * batch_size + 10
-    kv_cache = torch.randn(
-        total_pages, page_size, D_qk, dtype=dtype, device=device
-    )
+    kv_cache = torch.randn(total_pages, page_size, D_qk, dtype=dtype, device=device)
 
     block_tables = torch.zeros(
         batch_size, max_pages_per_batch, dtype=torch.int32, device=device
