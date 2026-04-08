@@ -649,6 +649,11 @@ constexpr uint32_t get_heuristic_num_threads(uint32_t group_size, uint32_t sizeo
     // GQA=6 on sm80 otherwise falls back to a 96-thread CTA (bdz=1), which
     // leaves very little room to hide the decode kernel's memory latency.
     return 288U;
+  } else if (group_size == 7U) {
+    // GQA=7 has the same problem as GQA=6 on sm80: the default 128-thread CTA
+    // only yields bdz=1 for head_dim=128. Use a larger CTA so group_size=7
+    // can keep multiple z-slices in flight and avoid the slow fallback path.
+    return 336U;
   } else {
     return 128U;
   }
