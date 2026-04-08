@@ -3578,7 +3578,7 @@ _SM100_DEFAULT_MMA_TILER_MN = (128, 128)
 _SM100_DEFAULT_CLUSTER_SHAPE_MN = (1, 1)
 
 
-# Tactic cache: (n, real_k) -> dict[m_bucket -> tactic_tuple]
+# Tactic cache: (n, real_k, sm_count) -> dict[m_bucket -> tactic_tuple]
 # Bounded by the number of unique (N, K) pairs in the model (typically < 50).
 _SM100_MM_FP4_TACTIC_CACHE: dict[tuple, dict] = {}
 
@@ -3704,7 +3704,7 @@ def _select_sm100_mm_fp4_cute_dsl_tactic(m, n, real_k, sm_count):
         Tactic tuple: (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch,
                         kernel_type, use_tma_store)
     """
-    cache_key = (n, real_k)
+    cache_key = (n, real_k, sm_count)
     bucket_tactics = _SM100_MM_FP4_TACTIC_CACHE.get(cache_key)
     if bucket_tactics is None:
         bucket_tactics = {
@@ -3713,7 +3713,7 @@ def _select_sm100_mm_fp4_cute_dsl_tactic(m, n, real_k, sm_count):
         }
         _SM100_MM_FP4_TACTIC_CACHE[cache_key] = bucket_tactics
 
-    return bucket_tactics[last_positive_power_of_2(m)]
+    return bucket_tactics[min(last_positive_power_of_2(m), _M_BUCKETS[-1])]
 
 
 def _get_approximate_cta_nums(m, n, tile_mn, cluster_shape_mn):
