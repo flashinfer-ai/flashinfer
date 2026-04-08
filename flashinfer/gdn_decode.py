@@ -86,6 +86,7 @@ try:
         run_mtp_decode,
         get_tile_v_mtp,
         get_vec_size_mtp,
+        get_mtp_config,
     )
 
     _MTP_AVAILABLE = True
@@ -94,6 +95,7 @@ except ImportError:
     run_mtp_decode = None
     get_tile_v_mtp = None
     get_vec_size_mtp = None
+    get_mtp_config = None
 
 # Constants for V-divisibility validation
 TILE_V = 8  # pretranspose tile size
@@ -587,7 +589,7 @@ def gated_delta_rule_mtp(
     pool_size = initial_state.shape[0]
 
     # Dynamic TILE_V and vec_size selection based on batch size and sequence length
-    tile_v = get_tile_v_mtp(B, T)
+    tile_v = get_tile_v_mtp(B, T, num_v_heads=HV, v_dim=V)
     vec_size = get_vec_size_mtp(B, T)
 
     # Validate state shape
