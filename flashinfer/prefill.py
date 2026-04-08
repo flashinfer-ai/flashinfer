@@ -54,6 +54,7 @@ from .utils import (
     _get_cache_buf,
     _unpack_paged_kv_cache,
     canonicalize_torch_dtype,
+    _should_use_cute_dsl,
     determine_attention_backend,
     device_support_pdl,
     get_device_sm_count,
@@ -3067,6 +3068,17 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     q_data_type,
                     kv_data_type,
                 )
+                # cute_dsl is only supported by BatchPrefill, so check here
+                # rather than in determine_attention_backend (which is shared
+                # by single_prefill, decode, sparse, etc.)
+                if self._backend == "fa2" and _should_use_cute_dsl(
+                    self.device,
+                    PosEncodingMode[pos_encoding_mode].value,
+                    self._custom_mask_buf is not None,
+                    q_data_type,
+                    kv_data_type,
+                ):
+                    self._backend = "cute_dsl"
 
             get_module_args = (
                 q_data_type,
