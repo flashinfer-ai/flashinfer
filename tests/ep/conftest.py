@@ -65,11 +65,6 @@ def ep_process_group(dist_env):
     pg = dist.new_group(
         ranks=list(range(dist_env["world_size"])), backend="nccl"
     )
-    # Force NCCL communicator initialization. PyTorch lazily creates
-    # ncclComm_t on the first collective — without this, _get_nccl_comm()
-    # returns NULL because no collective has run on this group yet.
-    dummy = torch.zeros(1, device=f"cuda:{dist_env['rank']}")
-    dist.all_reduce(dummy, group=pg)
     yield pg
 
 

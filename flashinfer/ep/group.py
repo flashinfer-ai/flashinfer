@@ -52,110 +52,161 @@ def _get_ep_nccl_module():
         return None
 
 
-# ─── ncclComm_t extraction ──────────────────────────────────────────
+# ─── NCCL communicator creation via ctypes ─────────────────────────
+#
+# PyTorch does NOT expose ncclComm_t from ProcessGroupNCCL — there is
+# no public _get_nccl_comm() API. vLLM and SGLang solve this by creating
+# their own NCCL communicators directly via ctypes. We do the same:
+#   1. Use rank/world_size from the PyTorch process group for topology
+#   2. Broadcast an ncclUniqueId via torch.distributed (one allgather)
+#   3. Call ncclCommInitRank() via ctypes to create our own communicator
+#
+# The resulting ncclComm_t is independent of PyTorch's internal one.
+# We own it and must destroy it when the EpGroup is destroyed.
 
-def _extract_nccl_comm_ptr(process_group: dist.ProcessGroup) -> int:
-    """Extract raw ncclComm_t pointer from a PyTorch process group.
+import ctypes
+import ctypes.util
 
-    Uses the _get_backend()._get_nccl_comm() pattern established by
-    vLLM and SGLang (Issue #14, #35).
-    Returns the pointer as an int64 for passing through TVM FFI.
+@functools.cache
+def _load_nccl_lib():
+    """Find and load the NCCL shared library. Cached — loads once."""
+    import os
 
-    Raises RuntimeError with diagnostic info if extraction fails.
-    """
-    import ctypes
-    device = torch.device("cuda", torch.cuda.current_device())
+    search_paths = []
 
-    # Step 1: Get the NCCL backend from the process group
+    # 1. NCCL_HOME / NCCL_DIR environment variable
+    for env_var in ("NCCL_HOME", "NCCL_DIR"):
+        nccl_home = os.environ.get(env_var)
+        if nccl_home:
+            search_paths.append(os.path.join(nccl_home, "lib", "libnccl.so"))
+            search_paths.append(os.path.join(nccl_home, "lib", "libnccl.so.2"))
+
+    # 2. PyTorch bundled NCCL
     try:
-        pg_backend = process_group._get_backend(device)
-    except Exception as e:
-        raise RuntimeError(
-            f"Failed to get NCCL backend from process group: {e}\n"
-            f"  process_group type: {type(process_group).__name__}\n"
-            f"  device: {device}\n"
-            f"  Available methods: {[m for m in dir(process_group) if 'backend' in m.lower()]}"
-        ) from e
+        import torch
+        torch_lib = os.path.dirname(torch.__file__)
+        search_paths.append(os.path.join(torch_lib, "lib", "libnccl.so.2"))
+        search_paths.append(os.path.join(torch_lib, "lib", "libnccl.so"))
+        # Also check nvidia subdirs
+        for sub in ("nvidia/nccl/lib", "nvidia/lib"):
+            search_paths.append(os.path.join(torch_lib, sub, "libnccl.so.2"))
+    except ImportError:
+        pass
 
-    # Step 2: Extract ncclComm_t — try multiple known APIs
-    nccl_comm = None
+    # 3. System paths
+    search_paths.extend([
+        "libnccl.so.2",
+        "libnccl.so",
+    ])
+
+    # 4. ctypes.util fallback
+    found = ctypes.util.find_library("nccl")
+    if found:
+        search_paths.append(found)
+
     errors = []
-
-    # Method 1: _get_nccl_comm() — vLLM/SGLang pattern (PyTorch >= 2.1)
-    if hasattr(pg_backend, '_get_nccl_comm'):
+    for path in search_paths:
         try:
-            nccl_comm = pg_backend._get_nccl_comm()
-        except Exception as e:
-            errors.append(f"_get_nccl_comm(): {e}")
+            lib = ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
+            # Verify it's a real NCCL lib by checking for ncclCommInitRank
+            lib.ncclCommInitRank.restype = ctypes.c_int
+            return lib
+        except (OSError, AttributeError) as e:
+            errors.append(f"  {path}: {e}")
 
-    # Method 2: _get_backend_name() + direct attribute (some PT builds)
-    if nccl_comm is None and hasattr(pg_backend, 'nccl_comm'):
-        try:
-            nccl_comm = pg_backend.nccl_comm
-        except Exception as e:
-            errors.append(f"pg_backend.nccl_comm: {e}")
+    raise RuntimeError(
+        "Could not find NCCL shared library (libnccl.so.2).\n"
+        "Searched:\n" + "\n".join(errors) + "\n"
+        "Set NCCL_HOME or ensure NCCL is installed."
+    )
 
-    # Method 3: bound_device_id variant (PyTorch nightly)
-    if nccl_comm is None and hasattr(pg_backend, 'get_nccl_comm'):
-        try:
-            nccl_comm = pg_backend.get_nccl_comm()
-        except Exception as e:
-            errors.append(f"get_nccl_comm(): {e}")
 
-    if nccl_comm is None:
-        backend_methods = [m for m in dir(pg_backend) if 'nccl' in m.lower() or 'comm' in m.lower()]
+# NCCL C API type definitions
+class _NcclUniqueId(ctypes.Structure):
+    _fields_ = [("internal", ctypes.c_char * 128)]
+
+
+def _create_nccl_comm(rank: int, world_size: int,
+                       process_group: dist.ProcessGroup) -> ctypes.c_void_p:
+    """Create a new ncclComm_t using ncclCommInitRank().
+
+    Uses the PyTorch process group ONLY for broadcasting the ncclUniqueId
+    (a one-time 128-byte allgather). After that, the NCCL communicator is
+    fully independent of PyTorch.
+
+    Returns a ctypes.c_void_p wrapping the raw ncclComm_t pointer.
+    """
+    nccl = _load_nccl_lib()
+
+    # Set up ctypes signatures
+    nccl.ncclGetUniqueId.restype = ctypes.c_int
+    nccl.ncclGetUniqueId.argtypes = [ctypes.POINTER(_NcclUniqueId)]
+
+    nccl.ncclCommInitRank.restype = ctypes.c_int
+    nccl.ncclCommInitRank.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p),  # comm (out)
+        ctypes.c_int,                      # nranks
+        _NcclUniqueId,                     # commId
+        ctypes.c_int,                      # rank
+    ]
+
+    nccl.ncclCommDestroy.restype = ctypes.c_int
+    nccl.ncclCommDestroy.argtypes = [ctypes.c_void_p]
+
+    # Step 1: Rank 0 generates unique ID, broadcast to all ranks
+    unique_id = _NcclUniqueId()
+    if rank == 0:
+        result = nccl.ncclGetUniqueId(ctypes.byref(unique_id))
+        if result != 0:  # ncclSuccess = 0
+            raise RuntimeError(f"ncclGetUniqueId failed with error code {result}")
+
+    # Broadcast the 128-byte unique ID via PyTorch (works on any backend).
+    # IMPORTANT: ctypes c_char arrays behave like C strings — indexing,
+    # bytes(), bytearray(), and slicing all stop at the first null byte.
+    # Use ctypes.string_at(ptr, 128) to read exactly 128 bytes.
+    id_tensor = torch.zeros(128, dtype=torch.uint8,
+                            device=f"cuda:{torch.cuda.current_device()}")
+    if rank == 0:
+        raw = ctypes.string_at(ctypes.addressof(unique_id), 128)
+        id_cpu = torch.frombuffer(bytearray(raw), dtype=torch.uint8).clone()
+        id_tensor.copy_(id_cpu.to(id_tensor.device))
+    dist.broadcast(id_tensor, src=0, group=process_group)
+
+    # Copy broadcast result back to struct
+    id_list = id_tensor.cpu().tolist()
+    raw_back = bytes(id_list)
+    ctypes.memmove(ctypes.addressof(unique_id), raw_back, 128)
+
+    # Step 2: All ranks call ncclCommInitRank
+    comm = ctypes.c_void_p()
+    result = nccl.ncclCommInitRank(
+        ctypes.byref(comm), world_size, unique_id, rank
+    )
+    if result != 0:
         raise RuntimeError(
-            f"Could not extract ncclComm_t from process group backend.\n"
-            f"  Backend type: {type(pg_backend).__name__}\n"
-            f"  Backend name: {getattr(pg_backend, 'name', 'unknown')}\n"
-            f"  NCCL/comm-related methods: {backend_methods}\n"
-            f"  All methods tried:\n" +
-            "\n".join(f"    - {err}" for err in errors)
+            f"ncclCommInitRank failed with error code {result} "
+            f"(rank={rank}, world_size={world_size})"
+        )
+    if comm.value is None or comm.value == 0:
+        raise RuntimeError(
+            f"ncclCommInitRank returned NULL comm "
+            f"(rank={rank}, world_size={world_size})"
         )
 
-    # Step 3: Convert to int64 pointer value
-    ptr = _nccl_comm_to_int(nccl_comm)
-    if ptr == 0:
-        raise RuntimeError(
-            f"ncclComm_t extraction returned a NULL pointer.\n"
-            f"  Raw value: {nccl_comm!r} (type: {type(nccl_comm).__name__})\n"
-            f"  This usually means the NCCL communicator has not been "
-            f"initialized yet. Try performing a dummy allreduce on the "
-            f"process group before creating the EP group."
-        )
-    return ptr
+    return comm
 
 
-def _nccl_comm_to_int(nccl_comm) -> int:
-    """Convert various ncclComm_t representations to an int64 pointer value."""
-    import ctypes
-
-    # Direct int (already a pointer value)
-    if isinstance(nccl_comm, int):
-        return nccl_comm
-
-    # Has __int__ (PyCapsule on some PyTorch builds)
-    if hasattr(nccl_comm, '__int__'):
-        return int(nccl_comm)
-
-    # ctypes pointer (e.g. ctypes.c_void_p)
-    if hasattr(nccl_comm, 'value'):
-        return nccl_comm.value or 0
-
-    # PyCapsule — extract via ctypes
-    if type(nccl_comm).__name__ == 'PyCapsule':
-        try:
-            ctypes.pythonapi.PyCapsule_GetPointer.restype = ctypes.c_void_p
-            ctypes.pythonapi.PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
-            return ctypes.pythonapi.PyCapsule_GetPointer(nccl_comm, None) or 0
-        except Exception:
-            pass
-
-    # Last resort
+def _destroy_nccl_comm(comm_ptr: int):
+    """Destroy an ncclComm_t that we created via _create_nccl_comm."""
+    if comm_ptr == 0:
+        return
     try:
-        return int(nccl_comm)
-    except (TypeError, ValueError):
-        return 0
+        nccl = _load_nccl_lib()
+        nccl.ncclCommDestroy.restype = ctypes.c_int
+        nccl.ncclCommDestroy.argtypes = [ctypes.c_void_p]
+        nccl.ncclCommDestroy(ctypes.c_void_p(comm_ptr))
+    except Exception:
+        pass  # Best-effort cleanup during shutdown
 
 
 # ─── Buffer sizing ───────────────────────────────────────────────────
@@ -377,11 +428,13 @@ class EpGroup:
     Thin Python wrapper — all dispatch/combine work is in C++.
     """
 
-    def __init__(self, _group_id: int = -1, _backend=None, _config=None, _pg=None):
+    def __init__(self, _group_id: int = -1, _backend=None, _config=None,
+                 _pg=None, _nccl_comm_ptr: int = 0):
         self._group_id = _group_id
         self._backend = _backend
         self._config = _config or {}
         self._pg = _pg
+        self._nccl_comm_ptr = _nccl_comm_ptr  # owned by us, must destroy
         self._destroyed = False
         self._comm_stream = torch.cuda.Stream()
 
@@ -686,6 +739,10 @@ class EpGroup:
                 mod.ep_destroy_group(self._group_id)
             except Exception:
                 pass
+            # Destroy our NCCL communicator (we own it)
+            if self._nccl_comm_ptr != 0:
+                _destroy_nccl_comm(self._nccl_comm_ptr)
+                self._nccl_comm_ptr = 0
             self._destroyed = True
 
 
@@ -710,8 +767,12 @@ def create_group(
 ) -> "EpGroup":
     """Create a communication group for expert parallelism.
 
-    Collective operation — all ranks must call.
-    Extracts ncclComm_t and passes it to C++ for direct NCCL P2P calls.
+    Collective operation — all ranks must call concurrently.
+
+    Creates a dedicated NCCL communicator for EP alltoall communication.
+    This communicator is independent of PyTorch's internal one — the
+    process_group is only used for rank/world_size topology and for
+    broadcasting the ncclUniqueId during setup.
     """
     rank = dist.get_rank(process_group)
     world_size = dist.get_world_size(process_group)
@@ -729,13 +790,10 @@ def create_group(
         "timeout_ms": timeout_ms,
     }
 
-    # Extract ncclComm_t from the PyTorch process group.
-    # NOTE: PyTorch lazily creates ncclComm_t on the first collective.
-    # If _get_nccl_comm() returns NULL, the caller must run at least one
-    # collective (e.g. dist.all_reduce) on the process group before
-    # calling create_group(). The error message from _extract_nccl_comm_ptr
-    # will explain this if it happens.
-    nccl_comm_ptr = _extract_nccl_comm_ptr(process_group)
+    # Create our own NCCL communicator via ncclCommInitRank().
+    # The process_group is used ONLY for broadcasting the ncclUniqueId.
+    nccl_comm = _create_nccl_comm(rank, world_size, process_group)
+    nccl_comm_ptr = nccl_comm.value  # raw int pointer
 
     # Pass everything to C++
     mod = _get_ep_module()
@@ -751,4 +809,5 @@ def create_group(
         _backend=backend,
         _config=config,
         _pg=process_group,
+        _nccl_comm_ptr=nccl_comm_ptr,
     )
