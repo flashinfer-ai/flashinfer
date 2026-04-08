@@ -166,6 +166,21 @@ def gated_delta_rule_decode_pretranspose(
             entry to its slot in ``initial_state``.  Required when ``initial_state``
             is provided.
 
+            **Padding / inactive sequences**: set the index to ``-1`` for any batch
+            entry that should be treated as padding.  The two backends handle ``-1``
+            differently:
+
+            - **bf16 fast path** (bfloat16 state, K=V=128): ``-1`` is redirected
+              to ``initial_state[0]``, which acts as a sacrificial *null buffer*.
+              The kernel reads from and writes back to slot 0; the output for that
+              batch entry is computed but **undefined** (caller should not use it).
+              The caller must therefore allocate the pool with an extra leading slot
+              (``pool_size = num_real_slots + 1``) and keep real slots at indices
+              ``1..pool_size-1``.
+            - **float32 legacy path** (T=1): ``-1`` entries are skipped entirely —
+              neither the state pool nor the output are touched for that batch entry;
+              the output slot is written as **zero**.
+
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
             - output: Output tensor of shape ``[B, 1, HV, V]``
@@ -179,8 +194,9 @@ def gated_delta_rule_decode_pretranspose(
           and K=V=128, the BF16 state kernel is used (T=1 or MTP for T>1).
           The pool+indices path routes through the MTP kernel.
         - pool+indices (``initial_state``/``initial_state_indices``) supported on
-          both the bf16 fast path (K=V=128) and the float32 legacy path
-          (T=1). The float32 path also supports negative indices for padding.
+          both the bf16 fast path (K=V=128) and the float32 legacy path (T=1).
+          Both paths support ``-1`` padding indices (see ``initial_state_indices``
+          above for per-backend semantics).
         - Legacy path (float32 state, T=1): K and V must be multiples of 4.
     """
     # Validate input shapes
