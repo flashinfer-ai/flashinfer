@@ -902,8 +902,8 @@ def _get_compiled_fused_add_rmsnorm_kernel(
             dtype, (sym_m, H), stride_order=(1, 0), assumed_align=tensor_align
         )
     else:
-        sym_row_stride_x = cute.sym_int(divisibility=kernel_obj.vec_size)
-        sym_row_stride_r = cute.sym_int(divisibility=kernel_obj.vec_size)
+        sym_row_stride_x = cute.sym_int64(divisibility=kernel_obj.vec_size)
+        sym_row_stride_r = cute.sym_int64(divisibility=kernel_obj.vec_size)
         x_fake = cute.runtime.make_fake_tensor(
             dtype, (sym_m, H), (sym_row_stride_x, 1), assumed_align=16
         )
@@ -966,9 +966,9 @@ def _get_compiled_fused_add_rmsnorm_quant_kernel(
             dtype, (sym_m, H), stride_order=(1, 0), assumed_align=in_align
         )
     else:
-        sym_row_stride_y = cute.sym_int(divisibility=kernel_obj.vec_size)
-        sym_row_stride_x = cute.sym_int(divisibility=kernel_obj.vec_size)
-        sym_row_stride_r = cute.sym_int(divisibility=kernel_obj.vec_size)
+        sym_row_stride_y = cute.sym_int64(divisibility=kernel_obj.vec_size)
+        sym_row_stride_x = cute.sym_int64(divisibility=kernel_obj.vec_size)
+        sym_row_stride_r = cute.sym_int64(divisibility=kernel_obj.vec_size)
         y_fake = cute.runtime.make_fake_tensor(
             out_dtype, (sym_m, H), (sym_row_stride_y, 1), assumed_align=16
         )
