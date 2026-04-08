@@ -11,6 +11,8 @@ Handles:
 Extracted from BlackwellFusedMultiHeadAttentionForward correction warp section.
 """
 
+from typing import Optional, Type
+
 import cutlass
 import cutlass.cute as cute
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
@@ -68,7 +70,7 @@ class CorrectionRole:
         self.threads_per_warp = threads_per_warp
 
         # Set later via set_call_attrs()
-        self.o_dtype = None
+        self.o_dtype: Optional[Type[cutlass.Numeric]] = None
         self.o_layout = None
         self.epi_tile = None
 
@@ -176,6 +178,8 @@ class CorrectionRole:
         4. Reorganization of data for optimal memory access patterns
         5. Preparation for efficient TMA store operations
         """
+        assert self.o_dtype is not None
+        assert self.epi_tile is not None
 
         pv_tiled_mma_shape = (
             self.pv_mma_tiler[0],

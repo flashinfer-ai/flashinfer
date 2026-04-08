@@ -14,7 +14,7 @@ Sm100FmhaFwdMainloopTmaWarpspecialized), this bundles:
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Dict
+from typing import Dict, Union
 
 from .config import AttentionConfig
 from .mla_config import MLAConfig
@@ -146,7 +146,7 @@ class MLAMainloopSpec:
     """
 
     config: MLAConfig
-    warp_schedule: MLAWarpSchedule
+    warp_schedule: Union[MLAWarpSchedule, MLAWarpScheduleFP8]
     pipeline_topology: PipelineTopology
 
     buffer_align_bytes: int = 1024

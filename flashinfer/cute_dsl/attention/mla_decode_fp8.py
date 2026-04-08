@@ -101,10 +101,10 @@ class BlackwellMultiLatentAttentionForwardFP8:
         output_scale: cutlass.Float32,
         stream,
     ):
-        self.q_dtype = q_latent.element_type
-        self.k_dtype = c_latent.element_type
-        self.v_dtype = c_latent.element_type
-        self.o_dtype = o.element_type
+        self.q_dtype: Type[cutlass.Numeric] = q_latent.element_type
+        self.k_dtype: Type[cutlass.Numeric] = c_latent.element_type
+        self.v_dtype: Type[cutlass.Numeric] = c_latent.element_type
+        self.o_dtype: Type[cutlass.Numeric] = o.element_type
 
         if cutlass.const_expr(
             self.q_dtype != self.k_dtype or self.q_dtype != self.v_dtype

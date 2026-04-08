@@ -13,7 +13,7 @@ Handles:
 Extracted from BlackwellFusedMultiHeadAttentionForward.softmax / softmax_step.
 """
 
-from typing import Tuple
+from typing import Optional, Tuple, Type
 
 import cutlass
 import cutlass.cute as cute
@@ -88,8 +88,8 @@ class SoftmaxRole:
         self.threads_per_warp = threads_per_warp
 
         # Set later via set_dtypes() / set_call_attrs()
-        self.q_dtype = None
-        self.o_dtype = None
+        self.q_dtype: Optional[Type[cutlass.Numeric]] = None
+        self.o_dtype: Optional[Type[cutlass.Numeric]] = None
         self.o_layout = None
         self.epi_tile = None
 
@@ -138,6 +138,8 @@ class SoftmaxRole:
         5. Computing row sums for normalization
         6. Coordinating pipeline synchronization between different processing stages
         """
+        assert self.q_dtype is not None
+        assert self.o_dtype is not None
         cS, row_max, row_sum, vec_i_handle, batch_coord, head_coord = iter_args
         qo_head_idx = head_coord
         kv_head_idx = qo_head_idx // self.num_repeat_kv_heads
@@ -367,6 +369,8 @@ class SoftmaxRole:
         Mirrors CorrectionRole.epilog() but runs inside the softmax warpgroup
         when there is no correction warp (has_logits_transform=True).
         """
+        assert self.o_dtype is not None
+        assert self.epi_tile is not None
         pv_tiled_mma_shape = (self.pv_mma_tiler[0], self.pv_mma_tiler[1])
         cO = cute.make_identity_tensor(pv_tiled_mma_shape)
         cO_custom = cute.make_identity_tensor(pv_tiled_mma_shape)
@@ -464,6 +468,7 @@ class SoftmaxRole:
         the Q tile). Loops over KV tiles, calling step() for each, coordinating
         pipeline synchronization.
         """
+        assert self.o_dtype is not None
         tidx, _, _ = cute.arch.thread_idx()
         thread_idx = tidx % (
             self.threads_per_warp

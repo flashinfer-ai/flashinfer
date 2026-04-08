@@ -180,6 +180,7 @@ Soft-capping (compile-time scalars only, no extra_params)::
 """
 
 import math
+from typing import Any
 
 import cutlass
 import cutlass.cute as cute
@@ -236,6 +237,8 @@ class AttentionVariant:
     has_vectorized_logits_transform: bool = False
     has_statistics_update: bool = False
     has_output_transform: bool = False
+
+    params: Any = None
 
     @property
     def extra_params(self):

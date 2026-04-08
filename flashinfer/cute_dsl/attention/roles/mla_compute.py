@@ -21,6 +21,7 @@ Extracted from MLADecodeFP16Kernel.compute / softmax / exchange_p_cor_metadata.
 """
 
 import math
+from typing import Type
 
 import cutlass
 import cutlass.cute as cute
@@ -65,9 +66,9 @@ class MLAComputeRole:
         self.softmax_reg_num = 192
         self.softmax_exchange_sync_bar = None
 
-    def set_dtypes(self, q_dtype):
+    def set_dtypes(self, q_dtype: Type[cutlass.Numeric]) -> None:
         """Set tensor element types discovered at call time."""
-        self.q_dtype = q_dtype
+        self.q_dtype: Type[cutlass.Numeric] = q_dtype
 
     def set_barriers(self, softmax_exchange_sync_bar):
         """Set named barriers owned by the kernel."""

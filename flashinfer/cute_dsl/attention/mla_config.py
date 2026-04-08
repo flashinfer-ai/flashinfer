@@ -11,7 +11,10 @@ feature flags are fundamentally different between FMHA prefill and MLA decode.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple
+from typing import TYPE_CHECKING, Tuple, Type
+
+if TYPE_CHECKING:
+    import cutlass
 
 
 @dataclass(frozen=True)
@@ -28,9 +31,9 @@ class MLAConfig:
     latent_dim: int = 512
     rope_dim: int = 64
 
-    # Data types (Any to avoid import dependency on cutlass at module level)
-    acc_dtype: object = None  # Type[cutlass.Numeric], e.g. cutlass.Float32
-    lse_dtype: object = None  # Type[cutlass.Numeric], e.g. cutlass.Float32
+    # Data types
+    acc_dtype: Type[cutlass.Numeric] = None  # type: ignore[assignment]
+    lse_dtype: Type[cutlass.Numeric] = None  # type: ignore[assignment]
 
     # MMA tile shapes
     mma_qk_tiler_mn: Tuple[int, int] = (128, 128)
