@@ -593,10 +593,7 @@ int computeHelixMaxChannelCount(int cpSize, int smCount) {
 }
 
 size_t computeHelixWorkspaceSizePerRank(int cpSize) {
-  static int maxChannelCount = 0;
-  if (maxChannelCount == 0) {
-    maxChannelCount = computeHelixMaxChannelCount(cpSize);
-  }
+  int maxChannelCount = computeHelixMaxChannelCount(cpSize);
 
   // FIFO buffers: cpSize * channelCount pairs
   size_t fifoSize = static_cast<size_t>(HELIX_FIFO_TOTAL_BYTES) * cpSize * maxChannelCount;

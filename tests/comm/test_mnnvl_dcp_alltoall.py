@@ -163,34 +163,36 @@ class TestMnnvlDcpWorkspace:
 
     def test_workspace_shape(self):
         """MNNVL workspace must have shape [cp_size, ws_elems_per_rank]."""
-        assert _mnnvl_workspace.shape[0] == _cp_size, (
-            f"Expected workspace.shape[0] == {_cp_size}, got {_mnnvl_workspace.shape[0]}"
-        )
+        try:
+            assert _mnnvl_workspace.shape[0] == _cp_size, (
+                f"Expected workspace.shape[0] == {_cp_size}, got {_mnnvl_workspace.shape[0]}"
+            )
 
-        ws_bytes = decode_cp_a2a_workspace_size(_cp_size)
-        expected_elems = (ws_bytes + 7) // 8  # int64 elements
-        assert _mnnvl_workspace.shape[1] == expected_elems
-        assert _mnnvl_workspace.dtype == torch.int64
-
-        _comm.Barrier()
+            ws_bytes = decode_cp_a2a_workspace_size(_cp_size)
+            expected_elems = (ws_bytes + 7) // 8  # int64 elements
+            assert _mnnvl_workspace.shape[1] == expected_elems
+            assert _mnnvl_workspace.dtype == torch.int64
+        finally:
+            _comm.Barrier()
 
     def test_workspace_cross_rank_visible(self):
         """Each rank can write to its own segment and peers can read it."""
-        # Each rank writes a unique pattern to its own workspace segment
-        pattern = torch.full_like(_mnnvl_workspace[_rank], fill_value=_rank + 1)
-        _mnnvl_workspace[_rank].copy_(pattern)
-        torch.cuda.synchronize()
-        _comm.Barrier()
+        try:
+            # Each rank writes a unique pattern to its own workspace segment
+            pattern = torch.full_like(_mnnvl_workspace[_rank], fill_value=_rank + 1)
+            _mnnvl_workspace[_rank].copy_(pattern)
+            torch.cuda.synchronize()
+            _comm.Barrier()
 
-        # Each rank reads all segments and verifies the pattern
-        for peer in range(_cp_size):
-            expected = peer + 1
-            actual = _mnnvl_workspace[peer][0].item()
-            assert actual == expected, (
-                f"Rank {_rank}: workspace[{peer}][0] = {actual}, expected {expected}"
-            )
-
-        _comm.Barrier()
+            # Each rank reads all segments and verifies the pattern
+            for peer in range(_cp_size):
+                expected = peer + 1
+                actual = _mnnvl_workspace[peer][0].item()
+                assert actual == expected, (
+                    f"Rank {_rank}: workspace[{peer}][0] = {actual}, expected {expected}"
+                )
+        finally:
+            _comm.Barrier()
 
 
 class TestMnnvlDcpAlltoall:
@@ -208,53 +210,54 @@ class TestMnnvlDcpAlltoall:
           recv_o[rank][.., peer, :] == send_o[peer][.., rank, :]
           recv_s[rank][.., peer, :] == send_s[peer][.., rank, :]
         """
-        workspace = _mnnvl_workspace
+        try:
+            workspace = _mnnvl_workspace
 
-        decode_cp_a2a_init_workspace(workspace, _rank, _cp_size)
-        torch.cuda.synchronize()
-        _comm.Barrier()
+            decode_cp_a2a_init_workspace(workspace, _rank, _cp_size)
+            torch.cuda.synchronize()
+            _comm.Barrier()
 
-        # Generate input with deterministic seed per rank
-        torch.manual_seed(0xA2A + _rank)
-        partial_o = torch.randn(
-            batch_size, _cp_size, head_dim, dtype=dtype, device="cuda"
-        )
-        softmax_stats = torch.randn(
-            batch_size, _cp_size, stats_dim, dtype=torch.float32, device="cuda"
-        )
-
-        # Run alltoall
-        recv_o, recv_s = decode_cp_a2a_alltoall(
-            partial_o, softmax_stats, workspace, _rank, _cp_size
-        )
-        recv_o = _to_torch(recv_o)
-        recv_s = _to_torch(recv_s)
-        torch.cuda.synchronize()
-        _comm.Barrier()
-
-        # Gather all inputs to all ranks for verification
-        all_partial_o = _comm.allgather(partial_o.cpu())
-        all_softmax_stats = _comm.allgather(softmax_stats.cpu())
-
-        # Verify transpose property
-        for peer in range(_cp_size):
-            expected_o = all_partial_o[peer][..., _rank, :].cuda()
-            expected_s = all_softmax_stats[peer][..., _rank, :].cuda()
-
-            torch.testing.assert_close(
-                recv_o[..., peer, :],
-                expected_o,
-                atol=0,
-                rtol=0,
+            # Generate input with deterministic seed per rank
+            torch.manual_seed(0xA2A + _rank)
+            partial_o = torch.randn(
+                batch_size, _cp_size, head_dim, dtype=dtype, device="cuda"
             )
-            torch.testing.assert_close(
-                recv_s[..., peer, :],
-                expected_s,
-                atol=0,
-                rtol=0,
+            softmax_stats = torch.randn(
+                batch_size, _cp_size, stats_dim, dtype=torch.float32, device="cuda"
             )
 
-        _comm.Barrier()
+            # Run alltoall
+            recv_o, recv_s = decode_cp_a2a_alltoall(
+                partial_o, softmax_stats, workspace, _rank, _cp_size
+            )
+            recv_o = _to_torch(recv_o)
+            recv_s = _to_torch(recv_s)
+            torch.cuda.synchronize()
+            _comm.Barrier()
+
+            # Gather all inputs to all ranks for verification
+            all_partial_o = _comm.allgather(partial_o.cpu())
+            all_softmax_stats = _comm.allgather(softmax_stats.cpu())
+
+            # Verify transpose property
+            for peer in range(_cp_size):
+                expected_o = all_partial_o[peer][..., _rank, :].cuda()
+                expected_s = all_softmax_stats[peer][..., _rank, :].cuda()
+
+                torch.testing.assert_close(
+                    recv_o[..., peer, :],
+                    expected_o,
+                    atol=0,
+                    rtol=0,
+                )
+                torch.testing.assert_close(
+                    recv_s[..., peer, :],
+                    expected_s,
+                    atol=0,
+                    rtol=0,
+                )
+        finally:
+            _comm.Barrier()
 
     @pytest.mark.parametrize(
         "batch_size,head_dim,stats_dim,dtype",
@@ -272,46 +275,47 @@ class TestMnnvlDcpAlltoall:
 
     def test_repeated_alltoall(self):
         """Multiple alltoall calls on the same workspace (FIFO reuse)."""
-        workspace = _mnnvl_workspace
+        try:
+            workspace = _mnnvl_workspace
 
-        decode_cp_a2a_init_workspace(workspace, _rank, _cp_size)
-        torch.cuda.synchronize()
-        _comm.Barrier()
-
-        for round_idx in range(3):
-            torch.manual_seed(0xA2A + _rank * 100 + round_idx)
-            partial_o = torch.randn(
-                16, _cp_size, 128, dtype=torch.bfloat16, device="cuda"
-            )
-            softmax_stats = torch.randn(
-                16, _cp_size, 2, dtype=torch.float32, device="cuda"
-            )
-
-            recv_o, recv_s = decode_cp_a2a_alltoall(
-                partial_o, softmax_stats, workspace, _rank, _cp_size
-            )
-            recv_o = _to_torch(recv_o)
-            recv_s = _to_torch(recv_s)
+            decode_cp_a2a_init_workspace(workspace, _rank, _cp_size)
             torch.cuda.synchronize()
             _comm.Barrier()
 
-            all_partial_o = _comm.allgather(partial_o.cpu())
-            all_softmax_stats = _comm.allgather(softmax_stats.cpu())
-
-            for peer in range(_cp_size):
-                torch.testing.assert_close(
-                    recv_o[..., peer, :],
-                    all_partial_o[peer][..., _rank, :].cuda(),
-                    atol=0,
-                    rtol=0,
+            for round_idx in range(3):
+                torch.manual_seed(0xA2A + _rank * 100 + round_idx)
+                partial_o = torch.randn(
+                    16, _cp_size, 128, dtype=torch.bfloat16, device="cuda"
                 )
-                torch.testing.assert_close(
-                    recv_s[..., peer, :],
-                    all_softmax_stats[peer][..., _rank, :].cuda(),
-                    atol=0,
-                    rtol=0,
+                softmax_stats = torch.randn(
+                    16, _cp_size, 2, dtype=torch.float32, device="cuda"
                 )
 
+                recv_o, recv_s = decode_cp_a2a_alltoall(
+                    partial_o, softmax_stats, workspace, _rank, _cp_size
+                )
+                recv_o = _to_torch(recv_o)
+                recv_s = _to_torch(recv_s)
+                torch.cuda.synchronize()
+                _comm.Barrier()
+
+                all_partial_o = _comm.allgather(partial_o.cpu())
+                all_softmax_stats = _comm.allgather(softmax_stats.cpu())
+
+                for peer in range(_cp_size):
+                    torch.testing.assert_close(
+                        recv_o[..., peer, :],
+                        all_partial_o[peer][..., _rank, :].cuda(),
+                        atol=0,
+                        rtol=0,
+                    )
+                    torch.testing.assert_close(
+                        recv_s[..., peer, :],
+                        all_softmax_stats[peer][..., _rank, :].cuda(),
+                        atol=0,
+                        rtol=0,
+                    )
+        finally:
             _comm.Barrier()
 
 
@@ -330,15 +334,16 @@ class TestMnnvlDcpDeviceMemoryFallback:
 
     def test_device_workspace_shape(self):
         """Device workspace has correct shape [cp_size, ws_elems]."""
-        workspace = decode_cp_a2a_allocate_workspace(_cp_size, cp_rank=_rank)
-        assert workspace.shape[0] == _cp_size
+        try:
+            workspace = decode_cp_a2a_allocate_workspace(_cp_size, cp_rank=_rank)
+            assert workspace.shape[0] == _cp_size
 
-        ws_bytes = decode_cp_a2a_workspace_size(_cp_size)
-        expected_elems = (ws_bytes + 7) // 8
-        assert workspace.shape[1] == expected_elems
-        assert workspace.dtype == torch.int64
-
-        _comm.Barrier()
+            ws_bytes = decode_cp_a2a_workspace_size(_cp_size)
+            expected_elems = (ws_bytes + 7) // 8
+            assert workspace.shape[1] == expected_elems
+            assert workspace.dtype == torch.int64
+        finally:
+            _comm.Barrier()
 
 
 if __name__ == "__main__":
