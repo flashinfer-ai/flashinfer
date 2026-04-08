@@ -2969,6 +2969,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._max_token_per_sequence = max_token_per_sequence
         self._max_sequence_kv = max_sequence_kv
 
+        # Precompute sequence length maxima (used by fmha_v2 and other backends)
+        max_seq_in_batch = int(kv_len_arr.max().item())
+        max_qo_len = int((qo_indptr_host[1:] - qo_indptr_host[:-1]).max().item())
+
         if self._jit_module is not None:
             self._cached_module = self._jit_module
         else:
@@ -2987,10 +2991,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 # launch overhead for small sequences or high head counts.
                 # Only supports: MHA, standard symmetric head dims, no sliding
                 # window, no softcap, equal q/kv segments, NHD layout.
-                max_seq_in_batch = int(kv_len_arr.max().item())
-                max_qo_len = int(
-                    (qo_indptr_host[1:] - qo_indptr_host[:-1]).max().item()
-                )
                 same_qk_segments = torch.equal(qo_indptr_host, kv_indptr_host)
                 is_standard_shape = head_dim_qk == head_dim_vo and head_dim_qk in (
                     64,
