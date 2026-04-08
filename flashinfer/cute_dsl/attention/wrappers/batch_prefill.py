@@ -33,6 +33,9 @@ class BatchPrefillCuteDSLWrapper:
         float_workspace_buffer: torch.Tensor,
         use_cuda_graph: bool = False,
     ) -> None:
+        # Named float_workspace_buffer for compatibility with the parent
+        # BatchPrefillWithRaggedKVCacheWrapper API. Callers typically pass
+        # torch.uint8; the CuTe DSL kernel does not use this buffer.
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
 
@@ -60,6 +63,35 @@ class BatchPrefillCuteDSLWrapper:
         window_left: int = -1,
         variant: AttentionVariant | None = None,
     ) -> None:
+        """Compile the FMHA prefill kernel for the given configuration.
+
+        Parameters
+        ----------
+        qo_indptr : torch.Tensor
+            Cumulative query sequence lengths, shape [batch_size + 1].
+        kv_indptr : torch.Tensor
+            Cumulative KV sequence lengths, shape [batch_size + 1].
+        num_qo_heads : int
+            Number of query/output heads.
+        num_kv_heads : int
+            Number of key/value heads (must divide num_qo_heads).
+        head_dim_qk : int
+            Head dimension for queries and keys.
+        head_dim_vo : Optional[int]
+            Head dimension for values and output. Must equal head_dim_qk if set.
+        causal : bool
+            Whether to apply causal masking.
+        sm_scale : float
+            Softmax scale factor (typically 1/sqrt(head_dim)).
+        q_data_type : torch.dtype
+            Data type for queries (float16, bfloat16, or float8_e4m3fn).
+        kv_data_type : torch.dtype
+            Data type for keys/values.
+        window_left : int
+            Sliding window size. -1 disables sliding window.
+        variant : Optional[AttentionVariant]
+            Attention variant (ALiBi, RPE, Sigmoid, etc.). None uses standard softmax.
+        """
         if not torch.cuda.is_available():
             raise RuntimeError("GPU is required to run this example!")
 

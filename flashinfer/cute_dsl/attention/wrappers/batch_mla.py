@@ -413,6 +413,36 @@ class BatchMLADecodeCuteDSLWrapper:
             enable_pdl=self._enable_pdl,
         )
 
+    def _validate_run_inputs(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        out: Optional[torch.Tensor],
+    ) -> None:
+        """Check that run() inputs are consistent with the plan() configuration."""
+        expected_D = self._kv_lora_rank + self._qk_rope_head_dim
+        if q.shape[-1] != expected_D:
+            raise ValueError(
+                f"q.shape[-1]={q.shape[-1]} does not match the planned "
+                f"kv_lora_rank + qk_rope_head_dim = {expected_D}"
+            )
+        if q.dtype != self._q_dtype:
+            raise ValueError(
+                f"q.dtype={q.dtype} does not match the planned q_dtype={self._q_dtype}"
+            )
+        if kv_cache.dtype != self._q_dtype:
+            raise ValueError(
+                f"kv_cache.dtype={kv_cache.dtype} does not match the planned "
+                f"q_dtype={self._q_dtype}"
+            )
+        if out is not None and out.dtype != self._o_dtype:
+            raise ValueError(
+                f"out.dtype={out.dtype} does not match the planned "
+                f"out_dtype={self._o_dtype}"
+            )
+
     @flashinfer_api
     def run(
         self,
@@ -454,8 +484,9 @@ class BatchMLADecodeCuteDSLWrapper:
         if self._compiled_kernel is None:
             raise RuntimeError("Call plan() before run().")
 
+        self._validate_run_inputs(q, kv_cache, block_tables, seq_lens, out)
+
         B, q_len, H, D_qk = q.shape
-        assert D_qk == self._kv_lora_rank + self._qk_rope_head_dim
 
         # Handle 3D vs 4D kv_cache: normalize to 3D [num_pages, page_size, D_total]
         if kv_cache.dim() == 4:
@@ -494,10 +525,11 @@ class BatchMLADecodeCuteDSLWrapper:
         if is_workspace_size_zero:
             workspace_bytes = None
         else:
-            assert self._workspace_buffer.numel() >= workspace_size, (
-                f"workspace_buffer too small: {self._workspace_buffer.numel()} bytes, "
-                f"need {workspace_size} bytes"
-            )
+            if self._workspace_buffer.numel() < workspace_size:
+                raise ValueError(
+                    f"workspace_buffer too small: {self._workspace_buffer.numel()} bytes, "
+                    f"need {workspace_size} bytes"
+                )
             workspace_bytes = self._workspace_buffer[:workspace_size]
 
         # Re-compile if workspace-zero-ness changed from what was planned
