@@ -85,7 +85,7 @@ void initializeHelixWorkspace(uint64_t* workspace, int cpSize, cudaStream_t stre
  * @param stream CUDA stream for kernel launch
  */
 void launchHelixAllToAll(HelixAllToAllParams const& params, bool allowVariableField1,
-                         cudaStream_t stream);
+                         bool enablePdl, cudaStream_t stream);
 
 }  // namespace kernels
 

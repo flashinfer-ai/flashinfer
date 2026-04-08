@@ -47,7 +47,7 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..jit.comm import gen_dcp_alltoall_module
-from ..utils import register_custom_op
+from ..utils import device_support_pdl, register_custom_op
 from .mapping import Mapping
 from .mnnvl import MnnvlConfig, MnnvlMemory
 
@@ -83,9 +83,10 @@ def get_dcp_alltoall_module():
         workspace: torch.Tensor,
         cp_rank: int,
         cp_size: int,
+        enable_pdl: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return module.alltoall_dcp_native(
-            partial_o, softmax_stats, workspace, cp_rank, cp_size
+            partial_o, softmax_stats, workspace, cp_rank, cp_size, enable_pdl
         )
 
     return SimpleNamespace(
@@ -213,6 +214,7 @@ def decode_cp_a2a_alltoall(
     workspace: torch.Tensor,
     cp_rank: int,
     cp_size: int,
+    enable_pdl: Optional[bool] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Perform the DCP all-to-all exchange.
 
@@ -229,14 +231,18 @@ def decode_cp_a2a_alltoall(
             :func:`decode_cp_a2a_allocate_workspace`, already initialized.
         cp_rank: This rank's position in the CP group.
         cp_size: Context-parallel group size.
+        enable_pdl: Enable Programmatic Dependent Launch (SM90+).
+            Defaults to ``True`` on SM90+ GPUs, ``False`` otherwise.
 
     Returns:
         ``(partial_o_out, softmax_stats_out)`` with the same shapes and
         dtypes as the inputs. Each output contains the gathered data from
         all peers for this rank.
     """
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(partial_o.device)
     return get_dcp_alltoall_module().alltoall(
-        partial_o, softmax_stats, workspace, cp_rank, cp_size
+        partial_o, softmax_stats, workspace, cp_rank, cp_size, enable_pdl
     )
 
 

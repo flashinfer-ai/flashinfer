@@ -20,7 +20,6 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/cudaAsyncOps.cuh"
 #include "tensorrt_llm/kernels/helixAllToAll.h"
 #include "tensorrt_llm/kernels/ll128Proto.cuh"
@@ -538,7 +537,8 @@ std::tuple<int, int, int> computeChannelAndGroupCount(int cpSize, HelixFieldInfo
 // ============================================================================
 
 template <bool ALLOW_VARIABLE_FIELD1>
-void launchHelixAllToAllImpl(HelixAllToAllParams const& params, cudaStream_t stream) {
+void launchHelixAllToAllImpl(HelixAllToAllParams const& params, bool enablePdl,
+                             cudaStream_t stream) {
   int maxChannelCount = computeHelixMaxChannelCount(params.cpSize);
   TLLM_CHECK_WITH_INFO(params.maxChannelCount == maxChannelCount,
                        "maxChannelCount %d does not match computed maxChannelCount %d",
@@ -566,7 +566,7 @@ void launchHelixAllToAllImpl(HelixAllToAllParams const& params, cudaStream_t str
   config.stream = stream;
   cudaLaunchAttribute attrs[1];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attrs[0].val.programmaticStreamSerializationAllowed = common::getEnvEnablePDL();
+  attrs[0].val.programmaticStreamSerializationAllowed = enablePdl;
   config.numAttrs = 1;
   config.attrs = attrs;
   TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel_instance, params));
@@ -609,11 +609,11 @@ size_t computeHelixWorkspaceSizePerRank(int cpSize) {
 }
 
 void launchHelixAllToAll(HelixAllToAllParams const& params, bool allowVariableField1,
-                         cudaStream_t stream) {
+                         bool enablePdl, cudaStream_t stream) {
   if (allowVariableField1) {
-    launchHelixAllToAllImpl<true>(params, stream);
+    launchHelixAllToAllImpl<true>(params, enablePdl, stream);
   } else {
-    launchHelixAllToAllImpl<false>(params, stream);
+    launchHelixAllToAllImpl<false>(params, enablePdl, stream);
   }
 }
 

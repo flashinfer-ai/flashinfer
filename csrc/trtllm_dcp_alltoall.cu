@@ -59,7 +59,7 @@ void initializeDcpWorkspaceOp(TensorView workspace, int64_t cp_rank, int64_t cp_
 
 tvm::ffi::Tuple<Tensor, Tensor> alltoallDcpNativeOp(TensorView partial_o, TensorView softmax_stats,
                                                     TensorView workspace, int64_t cp_rank,
-                                                    int64_t cp_size) {
+                                                    int64_t cp_size, bool enable_pdl) {
   CHECK_INPUT(partial_o);
   CHECK_INPUT(softmax_stats);
   CHECK_CUDA(workspace);
@@ -153,7 +153,7 @@ tvm::ffi::Tuple<Tensor, Tensor> alltoallDcpNativeOp(TensorView partial_o, Tensor
       tensorrt_llm::kernels::computeHelixMaxChannelCount(static_cast<int>(cp_size));
 
   auto stream = get_current_stream();
-  tensorrt_llm::kernels::launchHelixAllToAll(params, allowVariableField1, stream);
+  tensorrt_llm::kernels::launchHelixAllToAll(params, allowVariableField1, enable_pdl, stream);
 
   return tvm::ffi::Tuple(partial_o_out, softmax_stats_out);
 }
