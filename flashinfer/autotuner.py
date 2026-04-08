@@ -631,8 +631,11 @@ class AutoTuner:
         self._override_local = threading.local()
         # Cache overridden TuningConfig objects to keep stable object identity
         # for _find_nearest_profile's LRU cache.
-        self._override_config_cache: Dict[Any, "TuningConfig"] = (
-            weakref.WeakValueDictionary()
+        # Two-level: WeakKeyDictionary[TuningConfig, Dict[(buckets, round_up), TuningConfig]]
+        # keyed by identity so configs differing only in tensor_initializers
+        # (whose __hash__ is the same) don't collide.
+        self._override_config_cache: weakref.WeakKeyDictionary = (
+            weakref.WeakKeyDictionary()
         )
 
     def _get_override_stack(self) -> List:
@@ -749,9 +752,10 @@ class AutoTuner:
         buckets = self._override_tuning_buckets
         round_up_flag = self._override_round_up
 
-        cache_key = (hash(tuning_config), buckets, round_up_flag)
-        if cache_key in self._override_config_cache:
-            return self._override_config_cache[cache_key]
+        per_config = self._override_config_cache.get(tuning_config)
+        cache_key = (buckets, round_up_flag)
+        if per_config is not None and cache_key in per_config:
+            return per_config[cache_key]
 
         from .fused_moe.utils import make_bucket_mapper, next_positive_power_of_2
 
@@ -801,7 +805,9 @@ class AutoTuner:
             use_cold_l2_cache=tuning_config.use_cold_l2_cache,
             use_cuda_graph=tuning_config.use_cuda_graph,
         )
-        self._override_config_cache[cache_key] = new_config
+        self._override_config_cache.setdefault(tuning_config, {})[cache_key] = (
+            new_config
+        )
         return new_config
 
     def choose_one(
