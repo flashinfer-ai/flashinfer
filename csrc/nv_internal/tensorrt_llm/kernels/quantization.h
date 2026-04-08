@@ -56,11 +56,16 @@ void invokePerTokenQuantization(QuantT* dst, T const* src, int64_t const numRows
                                 float* sumPtr, tensorrt_llm::common::QuantMode quantMode,
                                 cudaStream_t stream = 0);
 
+template <typename T>
+void invokeRowWiseAmax(int m, int n, T const* input, float* output, float scale = 1.0f,
+                       cudaStream_t stream = 0);
+
 template <typename T, int SF_VEC_SIZE>
 void invokeFP4Quantization(int b, int m, int n, T const* input, float const* globalScale,
                            int64_t* output, int32_t* SFOutput, bool useUE8M0,
                            QuantizationSFLayout layout, int multiProcessorCount,
-                           bool enable_pdl = false, cudaStream_t stream = 0);
+                           bool enable_pdl = false, bool use_row_wise_scale = false,
+                           bool inverse_scale = false, cudaStream_t stream = 0);
 
 template <typename T>
 void invokeSiluAndMulNVFP4Quantization(void* output, void* output_scale, void* input,

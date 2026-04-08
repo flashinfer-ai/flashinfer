@@ -187,7 +187,7 @@ constexpr int CVT_FP8_TO_FP4_ELTS_PER_THREAD = 16;
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // FP4/MXFP8 Quantization Kernels
 
-template <BlockScaleQuantizationType quantization_type, class Type, int SF_VEC_SIZE, bool UE8M0_SF>
+template <BlockScaleQuantizationType quantization_type, class Type, int SF_VEC_SIZE, bool UE8M0_SF, bool USE_ROW_WISE_SCALE=false, bool USE_INVERSE_SCALE=false>
 __global__ void
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 __launch_bounds__(512, 4) quantize_with_block_size(
@@ -209,7 +209,15 @@ quantize_with_block_size(
 
   // Get the global scaling factor, which will be applied to the SF.
   // Note SFScale is the same as next GEMM's alpha, which is (448.f / (Alpha_A / 6.f)).
-  float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
+  float SFScaleVal = 1.0f;
+  if constexpr (!USE_ROW_WISE_SCALE) {
+    if (SFScale != nullptr) {
+      SFScaleVal = *SFScale;
+      if constexpr (USE_INVERSE_SCALE) {
+        SFScaleVal = reciprocal_approximate_ftz(SFScaleVal);
+      }
+    }
+  }
 
   // Is it swizzled layout?
   bool isSfSwizzledLayout = layout == QuantizationSFLayout::SWIZZLED_128x4 ||
@@ -234,6 +242,16 @@ quantize_with_block_size(
   for (int rowIdx = blockIdx.x; rowIdx < numPaddedRowsForSf; rowIdx += gridDim.x) {
     // Early exit for padding-only blocks: if this block only processes padding rows,
     // we can skip the batch loop and just zero out the scale factors
+    if constexpr (USE_ROW_WISE_SCALE) {
+      if (rowIdx <= numRows && SFScale != nullptr) {
+        SFScaleVal = SFScale[rowIdx];
+        if constexpr (USE_INVERSE_SCALE) {
+          SFScaleVal = reciprocal_approximate_ftz(SFScaleVal);
+        }
+      } else {
+        SFScaleVal = 1.f;
+      }
+    }
     bool isRowPadding = (rowIdx >= numRows);
 
     if (isRowPadding) {
@@ -318,7 +336,7 @@ quantize_with_block_size(
 }
 
 // quantize with TMA in high throughput mode
-template <BlockScaleQuantizationType quantization_type, class Type, int SF_VEC_SIZE, bool UE8M0_SF>
+template <BlockScaleQuantizationType quantization_type, class Type, int SF_VEC_SIZE, bool UE8M0_SF, bool USE_ROW_WISE_SCALE=false, bool USE_INVERSE_SCALE=false>
 __global__ void
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 __launch_bounds__(288, 2) quantize_with_block_size_tma(
@@ -365,7 +383,15 @@ quantize_with_block_size_tma(
       PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (NUM_STAGES + i); });
 
   // Get the global scaling factor
-  float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
+  float SFScaleVal = 1.0f;
+  if constexpr (!USE_ROW_WISE_SCALE) {
+    if (SFScale != nullptr) {
+      SFScaleVal = *SFScale;
+      if constexpr (USE_INVERSE_SCALE) {
+        SFScaleVal = reciprocal_approximate_ftz(SFScaleVal);
+      }
+    }
+  }
 
   // Is it swizzled layout?
   bool isSfSwizzledLayout = layout == QuantizationSFLayout::SWIZZLED_128x4 ||
@@ -423,6 +449,16 @@ quantize_with_block_size_tma(
 
     for (int rowIdx = blockIdx.x * TMA_ROW_TILE; rowIdx < numPaddedRowsForSf;
          rowIdx += gridDim.x * TMA_ROW_TILE) {
+      if constexpr (USE_ROW_WISE_SCALE) {
+        if (rowIdx <= numRows && SFScale != nullptr) {
+          SFScaleVal = SFScale[rowIdx];
+          if constexpr (USE_INVERSE_SCALE) {
+            SFScaleVal = reciprocal_approximate_ftz(SFScaleVal);
+          }
+        } else {
+          SFScaleVal = 1.f;
+        }
+      }
       for (int batchIdx = 0; batchIdx < numbatches; batchIdx++) {
         std::optional<int> optionalBatchIdx = batchIdx;
         std::optional<int> optionalNumRows = numRows;

@@ -180,6 +180,7 @@ def get_fp4_quantization_module(backend: str = "100"):
         sf_use_ue8m0: bool = False,
         is_sf_swizzled_layout: bool = True,
         is_sf_8x4_layout: bool = False,
+        is_global_scale_inversed: bool = False,
         enable_pdl: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Quantize input tensor to FP4 format.
@@ -228,6 +229,7 @@ def get_fp4_quantization_module(backend: str = "100"):
             sf_use_ue8m0,
             is_sf_swizzled_layout,
             is_sf_8x4_layout,
+            is_global_scale_inversed,
             enable_pdl,
         )
         return out_val, out_sf[:out_sf_size]
@@ -656,6 +658,7 @@ def fp4_quantize(
     sf_use_ue8m0: bool = False,
     is_sf_swizzled_layout: bool = True,
     is_sf_8x4_layout: bool = False,
+    is_global_scale_inversed: bool = False,
     enable_pdl: Optional[bool] = None,
     backend: str = "cuda",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -729,6 +732,7 @@ def fp4_quantize(
         sf_use_ue8m0,
         is_sf_swizzled_layout,
         is_sf_8x4_layout,
+        is_global_scale_inversed,
         enable_pdl,
     )
     # Swizzled sf includes row/column padding from block_scale_interleave

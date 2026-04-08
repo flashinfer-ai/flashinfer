@@ -397,7 +397,7 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
         .useShuffledMatrix = useShuffledMatrix,
         .weightLayout = weightLayout,
         .usePerTokenScaling = usePerTokenScaling,
-      };
+    };
     return options;
   }
 }
@@ -480,7 +480,8 @@ std::vector<int64_t> Runner::getPassingConfigIndices() const {
 namespace Gemm2 {
 tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
     btg::Dtype dtypeAct, btg::Dtype dtypeWeights, btg::Dtype dtypeOut, int32_t tileTokensDim,
-    bool useDeepSeekFp8, bool useShuffledMatrix, batchedGemm::gemm::MatrixLayout weightLayout, bool usePerTokenScaling) {
+    bool useDeepSeekFp8, bool useShuffledMatrix, batchedGemm::gemm::MatrixLayout weightLayout,
+    bool usePerTokenScaling) {
   tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options = {
       // Swap A and B dtypes because transposeMmaOutput is hardcoded to true
       .dtypeA = dtypeWeights,
@@ -496,8 +497,7 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
       .epilogueTileM = useDeepSeekFp8 ? 64 : 128,
       .useShuffledMatrix = useShuffledMatrix,
       .weightLayout = weightLayout,
-      .usePerTokenScaling = usePerTokenScaling
-    };
+      .usePerTokenScaling = usePerTokenScaling};
   return options;
 }
 
@@ -747,26 +747,34 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
     gemm2_input = workspace.activation_output;
     gemm2_input_scale = workspace.activation_output_scale;
   } else if (mUseExplicitQuantization) {
+    // TODO(siyuan): currently only support per-token nvfp4 quantization
     FLASHINFER_CHECK(
         mPermuteGemm1.mDtypeOutput == btg::Dtype::Bfloat16,
         "When using explicit quantization, PermuteGemm1 output dtype must be Bfloat16.");
     FLASHINFER_CHECK(mGemm2.mDtypeAct == btg::Dtype::E2m1,
                      "Currently only support NvFP4 when using explicit quantization.");
+    FLASHINFER_CHECK(
+        workspace.token_scales_fc2 != nullptr,
+        "workspace.token_scales_fc2 must be provided When using explicit quantization.");
     const int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
     int intermediate_size_factor = isGatedActivation(args.activation_type) ? 2 : 1;
     // FIXME(siyuan): Detect from the kernel config. Currently only tile size >= 128 will use R128c4
     auto sfLayout = mGemm2.mTileTokensDim >= 128 ? QuantizationSFLayout::SWIZZLED_128x4
                                                  : QuantizationSFLayout::SWIZZLED_8x4;
-    float* global_scale = nullptr;  // TODO
+    invokeRowWiseAmax<__nv_bfloat16>(workspace.total_max_padded_tokens, args.intermediate_size,
+                                     reinterpret_cast<__nv_bfloat16*>(workspace.gemm1_output),
+                                     reinterpret_cast<float*>(workspace.token_scales_fc2),
+                                     1.f / 448.f / 6.f, stream);
     invokeFP4Quantization<__nv_bfloat16, 16>(
         1, workspace.total_max_padded_tokens, args.intermediate_size,
         // inputs
-        reinterpret_cast<__nv_bfloat16*>(workspace.gemm1_output), global_scale,
+        reinterpret_cast<__nv_bfloat16*>(workspace.gemm1_output),
+        reinterpret_cast<float*>(workspace.token_scales_fc2),
         // outputs
         reinterpret_cast<int64_t*>(workspace.activation_output),
         reinterpret_cast<int32_t*>(workspace.activation_output_scale),
         /* useUE8M0 */ false, sfLayout, tensorrt_llm::common::getMultiProcessorCount(), enable_pdl,
-        stream);
+        /* use_row_wise_scale */ true, /*inverse_scale*/ true, stream);
 
     gemm2_input = workspace.activation_output;
     gemm2_input_scale = workspace.activation_output_scale;

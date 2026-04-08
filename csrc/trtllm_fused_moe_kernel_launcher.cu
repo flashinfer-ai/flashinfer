@@ -1651,7 +1651,8 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
                                   dl_bfloat16, hidden_states.device());
       activation_output = alloc_tensor({max_num_padded_tokens_gemm1, gemm1_output_hidden}, dl_uint8,
                                        hidden_states.device());
-      per_token_scales_fc2 = alloc_tensor({max_num_padded_tokens_gemm1}, dl_float32, hidden_states.device());
+      per_token_scales_fc2 =
+          alloc_tensor({max_num_padded_tokens_gemm1}, dl_float32, hidden_states.device());
     }
 
     // Allocate gemm2_output

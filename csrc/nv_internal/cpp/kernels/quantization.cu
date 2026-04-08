@@ -234,12 +234,10 @@ CUtensorMap make_3d_tma_copy_desc(T* global_address, uint64_t gmem_dim[3],
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-// FP4/MXFP8 Quantization
+// Row-wise Amax Helper kernel
 
-static int PER_TOKEN_AMAX_KERNEL_BLOCK_SIZE = 256;
-template <typename T>
-__global__ void perTokenAmaxKernel(int m, int n, T const* input, float* amaxOutput,
-                                   float scale = 1.f / (448 * 6)) {
+template <typename T, uint32_t BLOCK_SIZE>
+__global__ void rowWiseAmaxKernel(int m, int n, T const* input, float* amaxOutput, float scale) {
   int rowIdx = blockIdx.x;
   if (rowIdx >= m) return;
 
@@ -249,14 +247,15 @@ __global__ void perTokenAmaxKernel(int m, int n, T const* input, float* amaxOutp
     localMax = fmaxf(localMax, fabsf(static_cast<float>(element) * scale));
   }
 
-  using BlockReduce = cub::BlockReduce<float, PER_TOKEN_AMAX_KERNEL_BLOCK_SIZE>;
+  using BlockReduce = cub::BlockReduce<float, BLOCK_SIZE>;
   __shared__ typename BlockReduce::TempStorage tempStorage;
   float blockMax = BlockReduce(tempStorage)
-                       .Reduce(localMax,
+                       .Reduce(
+                           localMax,
 #if CUDART_VERSION >= 12090
-                               cuda::maximum<>{}
+                           cuda::maximum<> {}
 #else
-                               cub::Max(),
+                           cub::Max(),
 #endif
                        );
 
@@ -265,12 +264,36 @@ __global__ void perTokenAmaxKernel(int m, int n, T const* input, float* amaxOutp
   }
 }
 
+template <typename T>
+void invokeRowWiseAmax(int m, int n, T const* input, float* output, float scale,
+                       cudaStream_t stream) {
+  constexpr uint32_t BLOCK_SIZE = 256;
+  dim3 block(BLOCK_SIZE);
+  dim3 grid(m);
+  rowWiseAmaxKernel<T, BLOCK_SIZE><<<grid, block, 0, stream>>>(m, n, input, output, scale);
+}
+
+// Instantiate the function.
+template void invokeRowWiseAmax<half>(int m, int n, half const* input, float* output, float scale,
+                                      cudaStream_t stream);
+#ifdef ENABLE_BF16
+template void invokeRowWiseAmax<__nv_bfloat16>(int m, int n, __nv_bfloat16 const* input,
+                                               float* output, float scale, cudaStream_t stream);
+#endif
+#ifdef ENABLE_FP8
+template void invokeRowWiseAmax<__nv_fp8_e4m3>(int m, int n, __nv_fp8_e4m3 const* input,
+                                               float* output, float scale, cudaStream_t stream);
+#endif
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// FP4/MXFP8 Quantization
+
 // Helper function to launch TMA quantization kernel
 template <BlockScaleQuantizationType quantization_type, typename T, int SF_VEC_SIZE>
 void launchFP4QuantizationTma(int b, int m, int n, T const* input, float const* SFScale,
                               int64_t* output, int32_t* SFOutput, bool useUE8M0,
                               QuantizationSFLayout layout, int multiProcessorCount, bool enable_pdl,
-                              cudaStream_t stream) {
+                              bool use_row_wise_scale, bool inverse_scale, cudaStream_t stream) {
   using Traits = TmaKernelTraits<T>;
   constexpr int TMA_ROW_TILE = Traits::TMA_ROW_TILE;
   constexpr int TMA_COL_TILE = Traits::TMA_COL_TILE;
@@ -320,13 +343,6 @@ void launchFP4QuantizationTma(int b, int m, int n, T const* input, float const* 
       const_cast<T*>(input), gmem_dim, stride_in_bytes, smem_dim, swizzle_type);
 
   // Select and launch the TMA kernel
-  auto* kernel_instance =
-      useUE8M0 ? &quantize_with_block_size_tma<quantization_type, T, SF_VEC_SIZE, true>
-               : &quantize_with_block_size_tma<quantization_type, T, SF_VEC_SIZE, false>;
-
-  // Set max dynamic shared memory for the kernel (required for > 48KB)
-  cudaFuncSetAttribute(kernel_instance, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-
   cudaLaunchConfig_t config;
   config.gridDim = grid;
   config.blockDim = block;
@@ -337,16 +353,59 @@ void launchFP4QuantizationTma(int b, int m, int n, T const* input, float const* 
   attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
   config.numAttrs = 1;
   config.attrs = attrs;
-  cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,
-                     reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOutput),
-                     layout, tensor_map);
+  if (use_row_wise_scale) {
+    if (inverse_scale) {
+      auto* kernel_instance =
+          useUE8M0
+              ? &quantize_with_block_size_tma<quantization_type, T, SF_VEC_SIZE, true, true, true>
+              : &quantize_with_block_size_tma<quantization_type, T, SF_VEC_SIZE, false, true, true>;
+
+      // Set max dynamic shared memory for the kernel (required for > 48KB)
+      cudaFuncSetAttribute(kernel_instance, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+      cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,
+                         reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOutput),
+                         layout, tensor_map);
+    } else {
+      auto* kernel_instance =
+          useUE8M0
+              ? &quantize_with_block_size_tma<quantization_type, T, SF_VEC_SIZE, true, true, false>
+              : &quantize_with_block_size_tma<quantization_type, T, SF_VEC_SIZE, false, true,
+                                              false>;
+      cudaFuncSetAttribute(kernel_instance, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+      cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,
+                         reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOutput),
+                         layout, tensor_map);
+    }
+  } else {
+    if (inverse_scale) {
+      auto* kernel_instance =
+          useUE8M0
+              ? &quantize_with_block_size_tma<quantization_type, T, SF_VEC_SIZE, true, false, true>
+              : &quantize_with_block_size_tma<quantization_type, T, SF_VEC_SIZE, false, false,
+                                              true>;
+      cudaFuncSetAttribute(kernel_instance, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+      cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,
+                         reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOutput),
+                         layout, tensor_map);
+    } else {
+      auto* kernel_instance =
+          useUE8M0
+              ? &quantize_with_block_size_tma<quantization_type, T, SF_VEC_SIZE, true, false, false>
+              : &quantize_with_block_size_tma<quantization_type, T, SF_VEC_SIZE, false, false,
+                                              false>;
+      cudaFuncSetAttribute(kernel_instance, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+      cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,
+                         reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOutput),
+                         layout, tensor_map);
+    }
+  }
 }
 
 template <typename T, int SF_VEC_SIZE>
 void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFScale,
                            int64_t* output, int32_t* SFOutput, bool useUE8M0,
                            QuantizationSFLayout layout, int multiProcessorCount, bool enable_pdl,
-                           cudaStream_t stream) {
+                           bool use_row_wise_scale, bool inverse_scale, cudaStream_t stream) {
 #ifdef ENABLE_FP8
   if constexpr (std::is_same_v<T, __nv_fp8_e4m3>) {
     // Use TMA kernel for large m (high throughput mode)
@@ -356,7 +415,7 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
       if (SF_VEC_SIZE == 16 && m >= 1024 && n % TMA_COL_CHUNK == 0) {
         launchFP4QuantizationTma<BlockScaleQuantizationType::FP8_TO_FP4, T, SF_VEC_SIZE>(
             b, m, n, input, SFScale, output, SFOutput, useUE8M0, layout, multiProcessorCount,
-            enable_pdl, stream);
+            enable_pdl, use_row_wise_scale, inverse_scale, stream);
         return;
       }
     }
@@ -369,15 +428,48 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
     int effectiveRows = computeEffectiveRows(m, layout);
     dim3 grid(std::min(effectiveRows, multiProcessorCount * numBlocksPerSM));
 
-    // Launch the cvt kernel.
-    auto* kernel_instance = useUE8M0
-                                ? &quantize_with_block_size<BlockScaleQuantizationType::FP8_TO_FP4,
-                                                            T, SF_VEC_SIZE, true>
-                                : &quantize_with_block_size<BlockScaleQuantizationType::FP8_TO_FP4,
-                                                            T, SF_VEC_SIZE, false>;
-    kernel_instance<<<grid, block, 0, stream>>>(b, m, n, n, input, SFScale,
-                                                reinterpret_cast<uint32_t*>(output),
-                                                reinterpret_cast<uint32_t*>(SFOutput), layout);
+    // Launch the cvt kernel.x
+    if (use_row_wise_scale) {
+      if (inverse_scale) {
+        auto* kernel_instance =
+            useUE8M0 ? &quantize_with_block_size<BlockScaleQuantizationType::FP8_TO_FP4, T,
+                                                 SF_VEC_SIZE, true, true, true>
+                     : &quantize_with_block_size<BlockScaleQuantizationType::FP8_TO_FP4, T,
+                                                 SF_VEC_SIZE, false, true, true>;
+        kernel_instance<<<grid, block, 0, stream>>>(b, m, n, n, input, SFScale,
+                                                    reinterpret_cast<uint32_t*>(output),
+                                                    reinterpret_cast<uint32_t*>(SFOutput), layout);
+      } else {
+        auto* kernel_instance =
+            useUE8M0 ? &quantize_with_block_size<BlockScaleQuantizationType::FP8_TO_FP4, T,
+                                                 SF_VEC_SIZE, true, true, false>
+                     : &quantize_with_block_size<BlockScaleQuantizationType::FP8_TO_FP4, T,
+                                                 SF_VEC_SIZE, false, true, false>;
+        kernel_instance<<<grid, block, 0, stream>>>(b, m, n, n, input, SFScale,
+                                                    reinterpret_cast<uint32_t*>(output),
+                                                    reinterpret_cast<uint32_t*>(SFOutput), layout);
+      }
+    } else {
+      if (inverse_scale) {
+        auto* kernel_instance =
+            useUE8M0 ? &quantize_with_block_size<BlockScaleQuantizationType::FP8_TO_FP4, T,
+                                                 SF_VEC_SIZE, true, false, true>
+                     : &quantize_with_block_size<BlockScaleQuantizationType::FP8_TO_FP4, T,
+                                                 SF_VEC_SIZE, false, false, true>;
+        kernel_instance<<<grid, block, 0, stream>>>(b, m, n, n, input, SFScale,
+                                                    reinterpret_cast<uint32_t*>(output),
+                                                    reinterpret_cast<uint32_t*>(SFOutput), layout);
+      } else {
+        auto* kernel_instance =
+            useUE8M0 ? &quantize_with_block_size<BlockScaleQuantizationType::FP8_TO_FP4, T,
+                                                 SF_VEC_SIZE, true, false, false>
+                     : &quantize_with_block_size<BlockScaleQuantizationType::FP8_TO_FP4, T,
+                                                 SF_VEC_SIZE, false, false, false>;
+        kernel_instance<<<grid, block, 0, stream>>>(b, m, n, n, input, SFScale,
+                                                    reinterpret_cast<uint32_t*>(output),
+                                                    reinterpret_cast<uint32_t*>(SFOutput), layout);
+      }
+    }
   } else
 #endif
   {
@@ -388,7 +480,7 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
       if (SF_VEC_SIZE == 16 && m >= 1024 && n % TMA_COL_CHUNK == 0) {
         launchFP4QuantizationTma<BlockScaleQuantizationType::FP16_TO_FP4, T, SF_VEC_SIZE>(
             b, m, n, input, SFScale, output, SFOutput, useUE8M0, layout, multiProcessorCount,
-            enable_pdl, stream);
+            enable_pdl, use_row_wise_scale, inverse_scale, stream);
         return;
       }
     }
@@ -402,12 +494,6 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
     dim3 grid(std::min(effectiveRows, multiProcessorCount * numBlocksPerSM));
 
     // Launch the cvt kernel.
-    auto* kernel_instance = useUE8M0
-                                ? &quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_FP4,
-                                                            T, SF_VEC_SIZE, true>
-                                : &quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_FP4,
-                                                            T, SF_VEC_SIZE, false>;
-
     cudaLaunchConfig_t config;
     config.gridDim = grid;
     config.blockDim = block;
@@ -418,9 +504,47 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
     attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
     config.numAttrs = 1;
     config.attrs = attrs;
-    cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,
-                       reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOutput),
-                       layout);
+    if (use_row_wise_scale) {
+      if (inverse_scale) {
+        auto* kernel_instance =
+            useUE8M0 ? &quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_FP4, T,
+                                                 SF_VEC_SIZE, true, true, true>
+                     : &quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_FP4, T,
+                                                 SF_VEC_SIZE, false, true, true>;
+        cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,
+                           reinterpret_cast<uint32_t*>(output),
+                           reinterpret_cast<uint32_t*>(SFOutput), layout);
+      } else {
+        auto* kernel_instance =
+            useUE8M0 ? &quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_FP4, T,
+                                                 SF_VEC_SIZE, true, true, false>
+                     : &quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_FP4, T,
+                                                 SF_VEC_SIZE, false, true, false>;
+        cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,
+                           reinterpret_cast<uint32_t*>(output),
+                           reinterpret_cast<uint32_t*>(SFOutput), layout);
+      }
+    } else {
+      if (inverse_scale) {
+        auto* kernel_instance =
+            useUE8M0 ? &quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_FP4, T,
+                                                 SF_VEC_SIZE, true, false, true>
+                     : &quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_FP4, T,
+                                                 SF_VEC_SIZE, false, false, true>;
+        cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,
+                           reinterpret_cast<uint32_t*>(output),
+                           reinterpret_cast<uint32_t*>(SFOutput), layout);
+      } else {
+        auto* kernel_instance =
+            useUE8M0 ? &quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_FP4, T,
+                                                 SF_VEC_SIZE, true, false, false>
+                     : &quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_FP4, T,
+                                                 SF_VEC_SIZE, false, false, false>;
+        cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,
+                           reinterpret_cast<uint32_t*>(output),
+                           reinterpret_cast<uint32_t*>(SFOutput), layout);
+      }
+    }
   }
 }
 
@@ -549,12 +673,14 @@ template void invokeFP4Quantization<half, 16>(int b, int m, int n, half const* i
                                               float const* SFScale, int64_t* output,
                                               int32_t* SFOutput, bool useUE8M0,
                                               QuantizationSFLayout layout, int multiProcessorCount,
-                                              bool enable_pdl, cudaStream_t stream);
+                                              bool enable_pdl, bool use_row_wise_scale,
+                                              bool inverse_scale, cudaStream_t stream);
 template void invokeFP4Quantization<half, 32>(int b, int m, int n, half const* input,
                                               float const* SFScale, int64_t* output,
                                               int32_t* SFOutput, bool useUE8M0,
                                               QuantizationSFLayout layout, int multiProcessorCount,
-                                              bool enable_pdl, cudaStream_t stream);
+                                              bool enable_pdl, bool use_row_wise_scale,
+                                              bool inverse_scale, cudaStream_t stream);
 template void invokeMxFP8Quantization<half>(int b, int m, int n, int padded_n, half const* input,
                                             int64_t* output, int32_t* SFOutput,
                                             QuantizationSFLayout layout, int multiProcessorCount,
@@ -568,11 +694,11 @@ template void invokeSiluAndMulNVFP4Quantization<half>(void* output, void* output
 template void invokeFP4Quantization<__nv_bfloat16, 16>(
     int b, int m, int n, __nv_bfloat16 const* input, float const* SFScale, int64_t* output,
     int32_t* SFOutput, bool useUE8M0, QuantizationSFLayout layout, int multiProcessorCount,
-    bool enable_pdl, cudaStream_t stream);
+    bool enable_pdl, bool use_row_wise_scale, bool inverse_scale, cudaStream_t stream);
 template void invokeFP4Quantization<__nv_bfloat16, 32>(
     int b, int m, int n, __nv_bfloat16 const* input, float const* SFScale, int64_t* output,
     int32_t* SFOutput, bool useUE8M0, QuantizationSFLayout layout, int multiProcessorCount,
-    bool enable_pdl, cudaStream_t stream);
+    bool enable_pdl, bool use_row_wise_scale, bool inverse_scale, cudaStream_t stream);
 template void invokeMxFP8Quantization<__nv_bfloat16>(int b, int m, int n, int padded_n,
                                                      __nv_bfloat16 const* input, int64_t* output,
                                                      int32_t* SFOutput, QuantizationSFLayout layout,
@@ -588,11 +714,11 @@ template void invokeSiluAndMulNVFP4Quantization<__nv_bfloat16>(
 template void invokeFP4Quantization<__nv_fp8_e4m3, 16>(
     int b, int m, int n, __nv_fp8_e4m3 const* input, float const* SFScale, int64_t* output,
     int32_t* SFOutput, bool useUE8M0, QuantizationSFLayout layout, int multiProcessorCount,
-    bool enable_pdl, cudaStream_t stream);
+    bool enable_pdl, bool use_row_wise_scale, bool inverse_scale, cudaStream_t stream);
 template void invokeFP4Quantization<__nv_fp8_e4m3, 32>(
     int b, int m, int n, __nv_fp8_e4m3 const* input, float const* SFScale, int64_t* output,
     int32_t* SFOutput, bool useUE8M0, QuantizationSFLayout layout, int multiProcessorCount,
-    bool enable_pdl, cudaStream_t stream);
+    bool enable_pdl, bool use_row_wise_scale, bool inverse_scale, cudaStream_t stream);
 
 #endif
 

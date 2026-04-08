@@ -28,7 +28,8 @@ using tvm::ffi::Tuple;
 
 void fp4_quantize(TensorView self, Optional<TensorView> const& globalScale, TensorView valueE2M1,
                   TensorView scaleFP8SF, int64_t sfVecSize, bool sfUseUE8M0,
-                  bool isSfSwizzledLayout, bool isSf8x4Layout, bool enable_pdl);
+                  bool isSfSwizzledLayout, bool isSf8x4Layout, bool isGlobalScaleInversed,
+                  bool enable_pdl);
 
 void fp4_batched_quantize(Tensor self, Tensor globalScale, Tensor valueE2M1, Tensor scaleFP8SF,
                           int64_t sfVecSize, bool sfUseUE8M0);
