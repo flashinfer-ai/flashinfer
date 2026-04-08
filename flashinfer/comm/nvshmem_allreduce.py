@@ -17,12 +17,40 @@ limitations under the License.
 import logging
 from typing import Optional
 
+import numpy as np
 import torch
-
-logger = logging.getLogger(__name__)
 from torch.distributed import ProcessGroup
 
-from .nvshmem import get_nvshmem_module
+import nvshmem.core
+from cuda.core import Buffer, Device
+
+logger = logging.getLogger(__name__)
+
+_TORCH_TO_NVSHMEM_DTYPE = {
+    torch.float16: "half",
+    torch.bfloat16: "bfloat16",
+    torch.float32: "float",
+}
+
+
+def _buffer_view(tensor: torch.Tensor, nelems: int) -> Buffer:
+    """Create a Buffer view over the first ``nelems`` elements of an NVSHMEM tensor.
+
+    nvshmem.core.reduce() determines element count from Buffer.size, so passing
+    a full pre-allocated symmetric buffer wastes bandwidth when only a prefix is
+    needed. This creates a Buffer with the correct size while reusing the same
+    pointer (which is already tracked by nvshmem4py's memory manager).
+
+    TODO(flashinfer): Remove this once nvshmem4py exposes register_external_buffer
+    with call_register=False through its public API, allowing proper buffer views.
+    See: https://github.com/NVIDIA/nvshmem/blob/devel/nvshmem4py/nvshmem/core/nvshmem_types.py
+    """
+    buf, _, _ = nvshmem.core.tensor_get_buffer(tensor)
+    return Buffer.from_handle(
+        ptr=int(buf.handle),
+        size=nelems * tensor.element_size(),
+        mr=buf.memory_resource,
+    )
 
 
 class NVSHMEMAllReduce:
@@ -57,78 +85,101 @@ class NVSHMEMAllReduce:
         should_init: bool = True,
     ):
         self.local_rank = local_rank
+        self.global_rank = torch.distributed.get_rank(group)
         self.world_size = world_size
         self.dtype = dtype
         self.device = device
         self.max_buffer_elements = max_buffer_elements
         self.group = group
-        self.nvshmem_module = get_nvshmem_module()
 
         self.should_init = should_init
         if self.should_init:
             self.init_nvshmem()
 
         # assert PE and world size match
-        my_pe = self.nvshmem_module.nvshmem_my_pe()
-        n_pes = self.nvshmem_module.nvshmem_n_pes()
-        if my_pe != local_rank:
+        pe = nvshmem.core.my_pe()
+        num_pes = nvshmem.core.n_pes()
+        if pe != self.global_rank:
             logger.warning(
                 "Rank %d: PE mismatch! Expected PE %d, got PE %d",
-                local_rank,
-                local_rank,
-                my_pe,
+                self.global_rank,
+                self.global_rank,
+                pe,
             )
-        if n_pes != world_size:
+        if num_pes != world_size:
             logger.warning(
                 "Rank %d: World size mismatch! Expected %d, got %d",
-                local_rank,
+                self.global_rank,
                 world_size,
-                n_pes,
+                num_pes,
             )
 
         # allocate memory in nvshmem symm heap
-        self.symm_buffer_input = self.nvshmem_module.nvshmem_malloc(
-            [max_buffer_elements],
-            self.dtype,
-            self.device.index,
+        self.symm_buffer_input = nvshmem.core.tensor(
+            (max_buffer_elements,), dtype=self.dtype
         )
-        self.symm_buffer_output = self.nvshmem_module.nvshmem_malloc(
-            [max_buffer_elements],
-            self.dtype,
-            self.device.index,
+        self.symm_buffer_output = nvshmem.core.tensor(
+            (max_buffer_elements,), dtype=self.dtype
         )
         torch.distributed.barrier(self.group)
 
     def init_nvshmem(self):
-        uid = torch.zeros(
-            self.nvshmem_module.nvshmem_unique_id_size(),
-            dtype=torch.uint8,
-            device="cpu",
+        if self.global_rank == 0:
+            uid = nvshmem.core.get_unique_id(empty=False)
+        else:
+            uid = nvshmem.core.get_unique_id(empty=True)
+
+        # Broadcast uid._data across ranks via torch.distributed
+        uid_bytes = np.frombuffer(uid._data.tobytes(), dtype=np.uint8)
+        uid_tensor = torch.from_numpy(uid_bytes.copy()).to(dtype=torch.uint8)
+        torch.distributed.broadcast(uid_tensor, src=0, group=self.group)
+
+        # Reconstruct uid from broadcasted bytes
+        uid._data[:] = np.frombuffer(
+            uid_tensor.numpy().tobytes(), dtype=uid._data.dtype
         )
-        if self.local_rank == 0:
-            self.nvshmem_module.nvshmem_get_unique_id(uid)
-        torch.distributed.broadcast(uid, src=0)
+
         torch.distributed.barrier(self.group)
-        init_status = self.nvshmem_module.nvshmem_init(
-            uid, self.local_rank, self.world_size
+
+        # local_rank selects the GPU; global_rank identifies the PE
+        device = Device(self.local_rank)
+        nvshmem.core.init(
+            device=device,
+            uid=uid,
+            rank=self.global_rank,
+            nranks=self.world_size,
+            initializer_method="uid",
         )
         torch.cuda.synchronize()
-        if init_status != 0:
-            raise RuntimeError("Failed to initialize nvshmem")
 
     def all_reduce(self, inp: torch.Tensor, out: torch.Tensor) -> None:
-        self.nvshmem_module.nvshmem_allreduce_on_stream_with_copy(
-            self.symm_buffer_output,
-            self.symm_buffer_input,
-            out,
-            inp,
-            inp.numel(),
+        stream = torch.cuda.current_stream()
+        nelems = inp.numel()
+
+        # Copy local input to symmetric buffer
+        self.symm_buffer_input[:nelems].copy_(inp)
+        # Barrier before reduce
+        nvshmem.core.barrier_all(stream=stream)
+        # Sum reduce across all PEs (only the first nelems elements)
+        src_view = _buffer_view(self.symm_buffer_input, nelems)
+        dst_view = _buffer_view(self.symm_buffer_output, nelems)
+        nvshmem.core.collective_on_buffer(
+            "reduce",
+            nvshmem.core.Teams.TEAM_WORLD,
+            dst_view,
+            src_view,
+            dtype=_TORCH_TO_NVSHMEM_DTYPE[self.dtype],
+            op="sum",
+            stream=stream,
         )
+        # Copy result back to local output
+        out.copy_(self.symm_buffer_output[:nelems])
+        stream.synchronize()
 
     def shutdown(self):
-        del self.symm_buffer_input
-        del self.symm_buffer_output
+        nvshmem.core.free_tensor(self.symm_buffer_input)
+        nvshmem.core.free_tensor(self.symm_buffer_output)
         torch.distributed.barrier(self.group)
         torch.cuda.synchronize()
         if self.should_init:
-            self.nvshmem_module.nvshmem_finalize()
+            nvshmem.core.finalize()

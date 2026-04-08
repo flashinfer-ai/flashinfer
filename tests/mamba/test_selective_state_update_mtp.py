@@ -10,7 +10,12 @@ import pytest
 import torch
 
 import flashinfer
-from flashinfer.utils import is_cvt_rs_supported
+from flashinfer.utils import is_cvt_rs_supported, is_sm100a_supported
+
+_requires_sm100 = pytest.mark.skipif(
+    not is_sm100a_supported(torch.device("cuda")),
+    reason="Vertical/horizontal MTP kernel requires SM100+ (Blackwell)",
+)
 
 from .triton_reference.selective_state_update import selective_state_update_triton
 from .utils import create_test_inputs, clone_preserving_strides
@@ -28,9 +33,11 @@ _BASE_PARAMS = (
     (  64,     8,     64,  128,    4,           torch.bfloat16,     torch.float32,  True ),  # nheads=8
     (  64,    64,    128,  128,    4,           torch.bfloat16,     torch.float32,  True ),  # dim=128
     (  64,    64,     64,   64,    4,           torch.bfloat16,     torch.float32,  True ),  # dstate=64
+    (  64,    64,     64,   96,    4,           torch.bfloat16,     torch.float32,  True ),  # dstate=96
     (  64,    64,     64,  128,    1,           torch.bfloat16,     torch.float32,  True ),  # cache_steps=1
     (  64,    64,     64,  128,    8,           torch.bfloat16,     torch.float32,  True ),  # cache_steps=8
     (  64,    64,     64,  128,    4,           torch.float32,      torch.float32,  True ),  # state_dtype=f32
+    (  64,    64,     64,  128,    4,           torch.float16,      torch.float32,  True ),  # state_dtype=f16
     (  64,    64,     64,  128,    4,           torch.bfloat16,     torch.float32,  False),  # use_out_tensor=False
 )
 # fmt: on
@@ -45,6 +52,18 @@ class TestSelectiveStateUpdateMTP:
     NGROUPS = 8
     INPUT_DTYPE = torch.bfloat16
     MATRIX_A_DTYPE = torch.float32
+
+    @pytest.fixture(
+        autouse=True,
+        params=[
+            "simple",
+            "async_horizontal",
+            pytest.param("vertical", marks=_requires_sm100),
+            pytest.param("horizontal", marks=_requires_sm100),
+        ],
+    )
+    def _algorithm(self, request):
+        self._algo = request.param
 
     def make_inputs(
         self, batch, nheads, dim, dstate, cache_steps, state_dtype, weight_dtype
@@ -102,6 +121,7 @@ class TestSelectiveStateUpdateMTP:
             pad_slot_id=-1,
             out=out,
             disable_state_update=disable_state_update,
+            algorithm=self._algo,
         )
 
     def assert_outputs_match(self, y_ref, y_test, msg_prefix=""):
@@ -203,8 +223,11 @@ class TestSelectiveStateUpdateMTP:
                 "Returned tensor should be the same object as the provided output tensor"
             )
 
-        self.assert_outputs_match(y_ref, y_test)
-        self.assert_states_match(state_ref, inputs["state_cache"], inputs["slot_idx"])
+        prefix = f"[{self._algo}] "
+        self.assert_states_match(
+            state_ref, inputs["state_cache"], inputs["slot_idx"], msg_prefix=prefix
+        )
+        self.assert_outputs_match(y_ref, y_test, msg_prefix=prefix)
 
 
 class TestSelectiveStateUpdateMTPWithZ(TestSelectiveStateUpdateMTP):
@@ -397,6 +420,7 @@ class TestSelectiveStateUpdateMTPWithIntermediateStates(TestSelectiveStateUpdate
             intermediate_states_buffer=inputs["intermediate_states_buffer"],
             intermediate_state_indices=inputs["intermediate_slot_idx"],
             cache_steps=inputs["cache_steps"],
+            algorithm=self._algo,
         )
 
     # fmt: off
@@ -569,6 +593,7 @@ class TestSelectiveStateUpdateMTPInt32Indices(TestSelectiveStateUpdateMTP):
             pad_slot_id=-1,
             out=out,
             disable_state_update=disable_state_update,
+            algorithm=self._algo,
         )
 
     @pytest.mark.parametrize(
@@ -774,6 +799,7 @@ class TestSelectiveStateUpdateMTPInt16(TestSelectiveStateUpdateMTP):
             out=out,
             disable_state_update=disable_state_update,
             state_scale=inputs["state_scale"],
+            algorithm=self._algo,
         )
 
     def assert_states_match(
@@ -839,6 +865,13 @@ class TestSelectiveStateUpdateMTPInt16(TestSelectiveStateUpdateMTP):
         inputs = self.make_inputs(
             batch, nheads, dim, dstate, cache_steps, state_dtype, weight_dtype
         )
+
+        # Vertical/horizontal don't support scaled (quantized) state
+        if self._algo in ("vertical", "horizontal", "async_horizontal"):
+            with pytest.raises(RuntimeError, match="does not support scaled"):
+                self.run_kernel(inputs)
+            return
+
         y_ref, state_ref, state_scale_ref = self.make_reference_output(inputs)
 
         if use_out_tensor:
@@ -940,6 +973,7 @@ class TestSelectiveStateUpdateMTPInt16IntermediateStates(
             cache_steps=inputs["cache_steps"],
             state_scale=inputs["state_scale"],
             intermediate_state_scales=inputs["intermediate_state_scales"],
+            algorithm=self._algo,
         )
 
     # fmt: off
@@ -970,6 +1004,13 @@ class TestSelectiveStateUpdateMTPInt16IntermediateStates(
         inputs = self.make_inputs(
             batch, nheads, dim, dstate, cache_steps, state_dtype, weight_dtype
         )
+
+        # Vertical/horizontal don't support scaled (quantized) state
+        if self._algo in ("vertical", "horizontal", "async_horizontal"):
+            with pytest.raises(RuntimeError, match="does not support scaled"):
+                self.run_kernel_with_intermediate_states(inputs)
+            return
+
         y_ref, _state_ref, intermediate_states_ref, iscales_ref = (
             self.make_reference_output(inputs)
         )
@@ -1154,6 +1195,7 @@ class TestSelectiveStateUpdateMTPStochasticRounding(TestSelectiveStateUpdateMTP)
             out=out,
             disable_state_update=disable_state_update,
             rand_seed=self.RAND_SEED,
+            algorithm=self._algo,
         )
 
     def assert_states_match(self, state_ref, state_test, slot_idx, msg_prefix=""):
@@ -1185,6 +1227,7 @@ class TestSelectiveStateUpdateMTPStochasticRounding(TestSelectiveStateUpdateMTP)
         # (batch, nheads, dim, dstate, cache_steps, state_dtype,    weight_dtype,   use_out_tensor)
         (  64,    64,     64,  128,    4,           torch.float16,  torch.float32,  True ),  # base
         (  64,    64,     64,   64,    4,           torch.float16,  torch.float32,  True ),  # dstate=64
+        (  64,    64,     64,   96,    4,           torch.float16,  torch.float32,  True ),  # dstate=96 (odd stateValuesPerThread)
     )
     # fmt: on
 
@@ -1297,6 +1340,7 @@ class TestSelectiveStateUpdateMTPStochasticRoundingWithIntermediateStates(
             intermediate_state_indices=inputs["intermediate_slot_idx"],
             cache_steps=inputs["cache_steps"],
             rand_seed=self.RAND_SEED,
+            algorithm=self._algo,
         )
 
     # fmt: off
@@ -1304,6 +1348,7 @@ class TestSelectiveStateUpdateMTPStochasticRoundingWithIntermediateStates(
         # (batch, nheads, dim, dstate, cache_steps, state_dtype,    weight_dtype,   use_out_tensor)
         (  64,    64,     64,  128,    4,           torch.float16,  torch.float32,  True ),  # base
         (  64,    64,     64,   64,    4,           torch.float16,  torch.float32,  True ),  # dstate=64
+        (  64,    64,     64,   96,    4,           torch.float16,  torch.float32,  True ),  # dstate=96 (odd stateValuesPerThread)
     )
     # fmt: on
 

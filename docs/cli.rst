@@ -97,3 +97,20 @@ Clear JIT compilation cache:
 .. code-block:: bash
 
    flashinfer clear-cache
+
+Replay Recorded Calls
+---------------------
+
+Replay API dumps captured by the Level 10 "Flight Recorder" logging mode:
+
+.. code-block:: bash
+
+   # Replay all recorded calls in a dump session
+   flashinfer replay --dir ./flashinfer_dumps
+
+   # Replay a single recorded call
+   flashinfer replay --dir ./flashinfer_dumps/<dump_directory>
+
+The ``replay`` command accepts either the root dump directory or a single dump
+subdirectory. For the full dump/replay workflow and Level 10 logging
+configuration, see :ref:`logging`.
