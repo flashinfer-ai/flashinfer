@@ -99,7 +99,7 @@ echo "✓ Flashinfer package installed successfully"
 # Uses read-write mode when AWS credentials are available (nightly/release builds),
 # otherwise falls back to read-only anonymous access to the public cache bucket.
 SCCACHE_BUCKET="${SCCACHE_BUCKET:-flashinfer-sccache}"
-SCCACHE_REGION="${SCCACHE_REGION:-us-east-2}"
+SCCACHE_REGION="${SCCACHE_REGION:-us-west-2}"
 
 echo ""
 echo "========================================"
