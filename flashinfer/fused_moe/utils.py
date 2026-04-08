@@ -263,6 +263,8 @@ def round_to_nearest_bucket(
         >>> round_to_nearest_bucket(2000, [100, 200, 500, 1000], round_map=True)
         1000
     """
+    if len(buckets) == 0:
+        raise ValueError("buckets must be non-empty")
     if round_map:
         for b in buckets:
             if b >= x:
@@ -302,6 +304,8 @@ def make_bucket_mapper(buckets: Tuple[int, ...], round_map: bool = False):
         >>> mapper_up(350)
         500
     """
+    if len(buckets) == 0:
+        raise ValueError("buckets must be non-empty")
     sorted_buckets = tuple(sorted(set(buckets)))
 
     def _mapper(x: int) -> int:

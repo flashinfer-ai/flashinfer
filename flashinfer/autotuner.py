@@ -518,6 +518,12 @@ def autotune(
     """
     tuner = AutoTuner.get()
 
+    if tuning_buckets is not None and len(tuning_buckets) == 0:
+        raise ValueError(
+            "tuning_buckets must contain at least one value when provided; "
+            "pass None (or omit) to inherit the current buckets"
+        )
+
     # Load configs from cache file on entry (if it exists).
     # cache_valid is False when the file exists but has a metadata mismatch;
     # in that case we skip saving on exit to avoid overwriting configs from
@@ -535,11 +541,6 @@ def autotune(
     override_stack = tuner._get_override_stack()
     current_buckets = override_stack[-1][0] if override_stack else None
     current_round_up = override_stack[-1][1] if override_stack else False
-    if tuning_buckets is not None and len(tuning_buckets) == 0:
-        raise ValueError(
-            "tuning_buckets must contain at least one value when provided; "
-            "pass None (or omit) to inherit the current buckets"
-        )
     new_buckets = (
         tuple(sorted(set(tuning_buckets)))
         if tuning_buckets is not None
