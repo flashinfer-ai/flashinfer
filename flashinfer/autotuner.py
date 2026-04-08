@@ -466,13 +466,18 @@ def autotune(
     override_stack = tuner._get_override_stack()
     current_buckets = override_stack[-1][0] if override_stack else None
     current_round_up = override_stack[-1][1] if override_stack else False
+    if tuning_buckets is not None and len(tuning_buckets) == 0:
+        raise ValueError(
+            "tuning_buckets must contain at least one value when provided; "
+            "pass None (or omit) to inherit the current buckets"
+        )
     new_buckets = (
         tuple(sorted(set(tuning_buckets)))
         if tuning_buckets is not None
         else current_buckets
     )
     new_round_up = round_up if round_up is not None else current_round_up
-    pushed = new_buckets is not None or new_round_up
+    pushed = tuning_buckets is not None or round_up is not None
     if pushed:
         override_stack.append((new_buckets, new_round_up))
 
@@ -763,10 +768,19 @@ class AutoTuner:
                     new_gen = sorted_gen
                     new_map = make_bucket_mapper(sorted_gen, round_map=True)
                 else:
-                    # gen_tuning_buckets is a callable — keep it, override mapper
-                    # to use next_positive_power_of_2 (ceil to power-of-2).
-                    new_gen = spec.gen_tuning_buckets
-                    new_map = next_positive_power_of_2
+                    # gen_tuning_buckets is a callable — keep it, but build a
+                    # mapper that rounds up to power-of-2 and clamps to the
+                    # generated bucket set so we never exceed the last bucket.
+                    gen_fn = spec.gen_tuning_buckets
+                    new_gen = gen_fn
+
+                    def _clamped_po2_mapper(x, _gen_fn=gen_fn):
+                        buckets = tuple(sorted(set(_gen_fn(x))))
+                        return make_bucket_mapper(buckets, round_map=True)(
+                            next_positive_power_of_2(x)
+                        )
+
+                    new_map = _clamped_po2_mapper
             else:
                 new_specs.append(spec)
                 continue
