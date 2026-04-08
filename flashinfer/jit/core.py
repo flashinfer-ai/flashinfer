@@ -313,8 +313,9 @@ class JitSpec:
         # where another process is building the library and removes the .so file.
         with FileLock(self.lock_path, thread_local=False):
             so_path = self.jit_library_path
-            verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
-            self.build(verbose, need_lock=False)
+            if not so_path.exists():
+                verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
+                self.build(verbose, need_lock=False)
             result = self.load(so_path)
 
         return result
