@@ -458,6 +458,28 @@ def is_cutlass_backend_supported(
     return True
 
 
+def _should_use_fmha_v2_sm120(
+    device: torch.device,
+    pos_encoding_mode: int,
+    use_custom_mask: bool,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+) -> bool:
+    """Check if fmha_v2 HMMA kernels should be used for SM12x attention.
+
+    SM12x supports Ampere-compatible HMMA tensor core instructions (sm_mma=80).
+    The fmha_v2 library has SM120 kernel variants that use these instructions
+    and outperform generic FA2 on SM12x.
+    """
+    return (
+        (is_sm120a_supported(device) or is_sm121a_supported(device))
+        and not use_custom_mask
+        and pos_encoding_mode == PosEncodingMode.NONE.value
+        and dtype_q in {torch.float16, torch.bfloat16}
+        and dtype_kv in {torch.float16, torch.bfloat16}
+    )
+
+
 def determine_attention_backend(
     device: torch.device,
     pos_encoding_mode: int,
