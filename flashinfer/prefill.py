@@ -53,6 +53,7 @@ from .utils import (
     _get_cache_alibi_slopes_buf,
     _get_cache_buf,
     _unpack_paged_kv_cache,
+    _should_use_fmha_v2_sm120,
     canonicalize_torch_dtype,
     determine_attention_backend,
     device_support_pdl,
@@ -3067,6 +3068,27 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     q_data_type,
                     kv_data_type,
                 )
+                # SM12x: use fmha_v2 HMMA kernels for large-sequence MHA.
+                # fmha_v2 outperforms FA2 at longer sequences (S>=256) on SM120
+                # due to optimized tiled flash attention, but has higher CTA
+                # launch overhead for small sequences or high head counts.
+                # Requires MHA (PACKED_QKV layout needs matching head counts).
+                max_seq_in_batch = int(
+                    (kv_indptr_host[1:] - kv_indptr_host[:-1]).max().item()
+                )
+                if (
+                    self._backend == "fa2"
+                    and num_qo_heads == num_kv_heads
+                    and max_seq_in_batch >= 256
+                    and _should_use_fmha_v2_sm120(
+                        self.device,
+                        PosEncodingMode[pos_encoding_mode].value,
+                        self._custom_mask_buf is not None,
+                        q_data_type,
+                        kv_data_type,
+                    )
+                ):
+                    self._backend = "fmha_v2"
 
             get_module_args = (
                 q_data_type,
@@ -3080,7 +3102,15 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 logits_soft_cap > 0,  # use_logits_soft_cap
                 use_fp16_qk_reduction,
             )
-            if self._backend == "cutlass":
+            if self._backend == "fmha_v2":
+                # fmha_v2 handles its own module loading in run()
+                # Cache plan data needed by trtllm_fmha_v2_prefill
+                self._fmha_v2_workspace = self._float_workspace_buffer
+                self._fmha_v2_seq_lens = kv_len_arr.to(torch.int32).to(
+                    self.device, non_blocking=non_blocking
+                )
+                self._fmha_v2_batch_size = batch_size
+            elif self._backend == "cutlass":
                 # insert qo_indptr.device to 9th position (0-indexed) of get_module_args
                 new_get_module_args = (
                     get_module_args[:9] + (qo_indptr.device,) + get_module_args[9:]
@@ -3096,6 +3126,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._cached_module, qo_indptr, kv_indptr, num_qo_heads, causal
             )
             self._max_qo_len = torch.max(qo_indptr[1:] - qo_indptr[:-1]).item()
+        elif self._backend == "fmha_v2":
+            # fmha_v2 handles planning internally — no JIT module plan needed
+            pass
         elif self._backend not in ("cudnn", "cute-dsl"):
             assert self._cached_module is not None, "cached module is not initialized"
             args = [
@@ -3300,7 +3333,37 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 q.device,
                 "out",
             )
-        if self._backend == "cute-dsl":
+        if self._backend == "fmha_v2":
+            mask_mode = "causal" if self._causal else "padding"
+            max_q_len = int(
+                (self._qo_indptr_buf[1:] - self._qo_indptr_buf[:-1]).max().item()
+            )
+            max_kv_len = int(
+                (self._kv_indptr_buf[1:] - self._kv_indptr_buf[:-1]).max().item()
+            )
+            # fmha_v2 SM120 standard kernels use PACKED_QKV layout
+            # Pack separate q, k, v into [num_tokens, 3, num_heads, head_dim]
+            qkv_packed = torch.stack([q, k, v], dim=1)
+            result = trtllm_fmha_v2_prefill(
+                qkv_packed,
+                input_layout="PACKED_QKV",
+                workspace_buffer=self._fmha_v2_workspace,
+                seq_lens=self._fmha_v2_seq_lens,
+                max_q_len=max_q_len,
+                max_kv_len=max_kv_len,
+                bmm1_scale=sm_scale,
+                bmm2_scale=1.0,
+                batch_size=self._fmha_v2_batch_size,
+                cum_seq_lens_q=self._qo_indptr_buf.to(torch.int32),
+                cum_seq_lens_kv=self._kv_indptr_buf.to(torch.int32),
+                out=out,
+                mask_mode=mask_mode,
+                save_softmax_stats=return_lse,
+            )
+            if return_lse:
+                return result if isinstance(result, tuple) else (result, lse)
+            return result if not isinstance(result, tuple) else result[0]
+        elif self._backend == "cute-dsl":
             # These checks live here (not in plan()) because return_lse and
             # scale parameters are run()-time arguments that can vary between
             # calls on the same planned wrapper.
