@@ -17,7 +17,11 @@ import math
 import pytest
 import torch
 
+from flashinfer.cute_dsl import is_cute_dsl_available
 from flashinfer.utils import is_sm100a_supported
+
+if not is_cute_dsl_available():
+    pytest.skip("CuTe DSL not available", allow_module_level=True)
 
 from tests.test_helpers.sink_attention_reference import sink_softmax
 import cutlass.cute as cute

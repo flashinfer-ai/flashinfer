@@ -7,8 +7,13 @@ import numpy as np
 import torch
 
 import flashinfer
+from flashinfer.cute_dsl.utils import is_cute_dsl_available
 from flashinfer.testing.utils import bench_gpu_time
 from flashinfer.utils import is_sm100a_supported
+
+if not is_cute_dsl_available():
+    print("Skipping: nvidia-cutlass-dsl package not installed")
+    sys.exit(0)
 
 from flashinfer.cute_dsl.attention import BatchPrefillCuteDSLWrapper
 
