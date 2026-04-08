@@ -27,7 +27,7 @@ try:
     )
 
     _has_cute_dsl = True
-except ImportError:
+except (ImportError, RuntimeError):
     _has_cute_dsl = False
     gated_delta_rule = None  # type: ignore
     gated_delta_rule_mtp = None  # type: ignore
@@ -36,12 +36,12 @@ except ImportError:
 
 try:
     from .gdn_decode_pretranspose import run_pretranspose_decode
-except ImportError:
+except (ImportError, RuntimeError):
     run_pretranspose_decode = None  # type: ignore
 
 try:
     from .gdn_decode_nontranspose import run_nontranspose_decode
-except ImportError:
+except (ImportError, RuntimeError):
     run_nontranspose_decode = None  # type: ignore
 
 try:
@@ -51,7 +51,7 @@ try:
         get_vec_size_mtp,
         get_mtp_config,
     )
-except ImportError:
+except (ImportError, RuntimeError):
     run_mtp_decode = None  # type: ignore
     get_tile_v_mtp = None  # type: ignore
     get_vec_size_mtp = None  # type: ignore
@@ -59,7 +59,7 @@ except ImportError:
 
 try:
     from .blackwell import chunk_gated_delta_rule_sm100, _has_blackwell_prefill
-except ImportError:
+except (ImportError, RuntimeError):
     _has_blackwell_prefill = False
     chunk_gated_delta_rule_sm100 = None  # type: ignore
 
