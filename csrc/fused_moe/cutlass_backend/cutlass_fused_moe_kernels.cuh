@@ -1483,14 +1483,15 @@ __global__ void expandInputRowsKernel(
       }
 
       // Pad zeros in the extra SFs along the K dimension, we do this to ensure there are no nan
-      // values in the padded SF atom
+      // values in the padded SF atom Use VecSize per thread since we are just writing out zeros so
+      // every thread can process a whole vector
       size_t padding_start_offset = hidden_size / VecSize + start_offset;
       size_t padding_elems_in_col = padded_hidden_size / VecSize;
       for (int64_t elem_index = padding_start_offset; elem_index < padding_elems_in_col;
            elem_index += stride) {
         writeSF<VecSize, VecSize>(num_tokens_before_expert, expert, /*source_row*/ -1, permuted_row,
                                   elem_index, padded_hidden_size, fc1_act_sf_flat,
-                                  /* input_sf */ nullptr);
+                                  /* input_sf */ nullptr);  // Pass nulltpr input_sf so we write 0
       }
     } else if constexpr (PRE_QUANT_AWQ) {
       static_assert(!is_nvfp4 && !is_mxfp8, "NVFP4 and MXFP8 are not supported for AWQ");
@@ -1523,7 +1524,7 @@ __global__ void expandInputRowsKernel(
 #endif
 
   // Pad zeros in the extra SFs along the N dimension, we do this to ensure there are no nan values
-  // in the padded SF atom.
+  // in the padded SF atom
   if constexpr (is_nvfp4 || is_mxfp8) {
     int64_t const start_offset = threadIdx.x;
     int64_t const stride = EXPAND_THREADS_PER_BLOCK;
@@ -2209,13 +2210,15 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKern
     // Pad zeros in the extra SFs along the K dimension, we do this to ensure there are no nan
     // values in the padded SF atom
     if constexpr (IsNVFP4 || IsMXFP8) {
+      // Use VecSize per thread since we are just writing out zeros so every thread can process a
+      // whole vector
       size_t padding_start_offset = inter_size / VecSize + start_offset;
       size_t padding_elems_in_col = padded_inter_size / VecSize;
       for (int64_t elem_index = padding_start_offset; elem_index < padding_elems_in_col;
            elem_index += stride) {
         writeSF<VecSize, VecSize>(num_tokens_before_expert, expert, /*source_row*/ -1, token,
                                   elem_index, padded_inter_size, fc2_act_sf_flat,
-                                  /* input_sf */ nullptr);
+                                  /* input_sf */ nullptr);  // Pass nulltpr input_sf so we write 0
       }
     }
   }
@@ -2225,7 +2228,7 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKern
 #endif
 
   // Pad zeros in the extra SFs along the N dimension, we do this to ensure there are no nan values
-  // in the padded SF atom.
+  // in the padded SF atom
   if constexpr (IsNVFP4 || IsMXFP8) {
     int64_t const start_offset = threadIdx.x;
     int64_t const stride = ACTIVATION_THREADS_PER_BLOCK;
