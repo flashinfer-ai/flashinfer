@@ -29,14 +29,15 @@ namespace flat {
 
 using namespace cute;
 
-template <bool IsGVA, bool NeedsBeta, bool NeedsAlpha, bool InitStateFromInput, typename ArchTag,
-          typename TO, typename TQKV, typename TState>
+template <bool IsGVA, bool NeedsBeta, bool NeedsAlpha, bool InitStateFromInput,
+          bool EnableCheckpointing, typename ArchTag, typename TO, typename TQKV, typename TState>
 void launch_delta_rule_prefill_kernel_gbai(
     cudaStream_t stream, TO* output, TState* output_state, TQKV const* q, TQKV const* k,
     TQKV const* v, TState const* input_state, float const* alpha, float const* beta,
     int64_t const* cu_seqlens, uint8_t* workspace_buffer, int32_t num_seqs, int32_t num_q_heads,
     int32_t num_k_heads, int32_t num_v_heads, int32_t num_o_heads, int32_t head_size,
-    int64_t total_seqlen, float scale, int32_t sm_count) {
+    int64_t total_seqlen, float scale, int32_t sm_count, float* state_checkpoints,
+    int64_t const* checkpoint_cu_starts, int32_t checkpoint_every_n_tokens) {
 #if defined(FLAT_SM90A_ENABLED)
   constexpr bool HopperSupported = true;
 #else
@@ -71,7 +72,11 @@ void launch_delta_rule_prefill_kernel_gbai(
           Option<Tag::kInitStateFromInput,
                  std::conditional_t<InitStateFromInput, cute::true_type, cute::false_type>>{},
           options_4);
-      return options_5;
+      constexpr auto options_6 = add_option(
+          Option<Tag::kEnableCheckpointing,
+                 std::conditional_t<EnableCheckpointing, cute::true_type, cute::false_type>>{},
+          options_5);
+      return options_6;
     }());
 
     using TileShape = Shape<_64, _64, _128>;
@@ -123,6 +128,9 @@ void launch_delta_rule_prefill_kernel_gbai(
                 .scale = scale,
                 .alpha_ptr = alpha, .alpha_stride = {num_sab_heads, 1},
                 .beta_ptr  = beta,  .beta_stride  = {num_sab_heads, 1},
+                .ptr_state_checkpoints = state_checkpoints,
+                .checkpoint_cu_starts = checkpoint_cu_starts,
+                .checkpoint_every_n_tokens = checkpoint_every_n_tokens,
         },  // clang-format on
                         .hw_info = hw_info};
 
