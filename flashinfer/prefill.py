@@ -3095,6 +3095,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     and logits_soft_cap == 0.0
                     and prefix_len_ptr is None
                     and token_pos_in_items_ptr is None
+                    and max_item_len_ptr is None
                     and _should_use_fmha_v2_sm120(
                         self.device,
                         PosEncodingMode[pos_encoding_mode].value,
