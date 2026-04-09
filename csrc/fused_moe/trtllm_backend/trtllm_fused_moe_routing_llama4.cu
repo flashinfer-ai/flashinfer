@@ -464,6 +464,11 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
       auto finalScore = OutputT{sigmoid_accurate(float{warpMaxScore[0]})};
       TypePacked packedScore{finalScore, static_cast<int16_t>(warpMaxExpertIdx[0])};
       params.mPtrTopKPacked[tokenIdx] = packedScore;
+
+      // Routing replay: record selected expert ID for this token.
+      if (params.mPtrRoutingReplayOut != nullptr) {
+        params.mPtrRoutingReplayOut[tokenIdx] = static_cast<int16_t>(warpMaxExpertIdx[0]);
+      }
     }
   }
 

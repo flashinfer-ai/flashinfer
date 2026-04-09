@@ -84,6 +84,11 @@ struct DataBase {
   // Together with mPtrTopKWeights, they form the top-k experts for each token
   int32_t* mPtrTopKIds{nullptr};
 
+  // optional: if nullptr, no routing replay recording occurs
+  // dim: [mNumTokens, mTopK]
+  // Records the selected expert IDs per token for replay
+  int16_t* mPtrRoutingReplayOut{nullptr};
+
   // optional: if `nullptr`, scores are used directly as input.
   // If it is given, it must represent a packed value s.t. the most significant
   // 16/32 bits represent the score without sigmoid activation and
@@ -148,6 +153,7 @@ struct KernelParamsBase {
   OutputT* mPtrTopKWeights = nullptr;
   int32_t* mPtrTopKIds = nullptr;
   InputT const* mPtrScores = nullptr;
+  int16_t* mPtrRoutingReplayOut = nullptr;
 
   // Public scalar members
   int32_t mNumTokens = 0;
@@ -177,6 +183,7 @@ struct KernelParamsBase {
     mPtrTopKWeights = static_cast<OutputT*>(data.mPtrTopKWeights);
     mPtrTopKIds = static_cast<int32_t*>(data.mPtrTopKIds);
     mPtrScores = (InputT const*)data.mPtrScores;
+    mPtrRoutingReplayOut = data.mPtrRoutingReplayOut;
 
     mNumTokens = data.mNumTokens;
     mNumExperts = data.mNumExperts;
