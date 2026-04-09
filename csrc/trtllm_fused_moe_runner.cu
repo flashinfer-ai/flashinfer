@@ -761,10 +761,11 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
     // FIXME(siyuan): Detect from the kernel config. Currently only tile size >= 128 will use R128c4
     auto sfLayout = mGemm2.mTileTokensDim >= 128 ? QuantizationSFLayout::SWIZZLED_128x4
                                                  : QuantizationSFLayout::SWIZZLED_8x4;
-    invokeRowWiseAmax<__nv_bfloat16>(workspace.total_max_padded_tokens, args.intermediate_size,
+
+    invokeRowWiseAmax<__nv_bfloat16>(args.num_tokens * args.top_k, args.intermediate_size,
                                      reinterpret_cast<__nv_bfloat16*>(workspace.gemm1_output),
                                      reinterpret_cast<float*>(workspace.token_scales_fc2),
-                                     1.f / 448.f / 6.f, stream);
+                                     1.f / 448.f / 6.f, workspace.expanded_idx_to_permuted_idx, stream);
     invokeFP4Quantization<__nv_bfloat16, 16>(
         1, workspace.total_max_padded_tokens, args.intermediate_size,
         // inputs
@@ -774,7 +775,7 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
         reinterpret_cast<int64_t*>(workspace.activation_output),
         reinterpret_cast<int32_t*>(workspace.activation_output_scale),
         /* useUE8M0 */ false, sfLayout, tensorrt_llm::common::getMultiProcessorCount(), enable_pdl,
-        /* use_row_wise_scale */ true, /*inverse_scale*/ true, stream);
+        /* use_row_wise_scale */ true, /* inverse_scale */ true, stream);
 
     gemm2_input = workspace.activation_output;
     gemm2_input_scale = workspace.activation_output_scale;

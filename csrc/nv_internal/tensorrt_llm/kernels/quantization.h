@@ -58,7 +58,7 @@ void invokePerTokenQuantization(QuantT* dst, T const* src, int64_t const numRows
 
 template <typename T>
 void invokeRowWiseAmax(uint32_t m, uint32_t n, T const* input, float* output, float scale = 1.0f,
-                       cudaStream_t stream = 0);
+                       int32_t* expanded_idx_to_permuted_idx = nullptr, cudaStream_t stream = 0);
 
 template <typename T, int SF_VEC_SIZE>
 void invokeFP4Quantization(int b, int m, int n, T const* input, float const* globalScale,

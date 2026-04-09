@@ -237,9 +237,13 @@ CUtensorMap make_3d_tma_copy_desc(T* global_address, uint64_t gmem_dim[3],
 // Row-wise Amax Helper kernel
 
 template <typename T, uint32_t BLOCK_SIZE>
-__global__ void rowWiseAmaxKernel(uint32_t m, uint32_t n, T const* input, float* amaxOutput, float scale) {
+__global__ void rowWiseAmaxKernel(uint32_t m, uint32_t n, T const* input, float* amaxOutput,
+                                  float scale, int32_t* expanded_idx_to_permuted_idx = nullptr) {
   uint32_t rowIdx = blockIdx.x;
   if (rowIdx >= m) return;
+  if (expanded_idx_to_permuted_idx != nullptr) {
+    rowIdx = expanded_idx_to_permuted_idx[rowIdx];
+  }
 
   float localMax = 0.f;
   for (uint32_t colIdx = threadIdx.x; colIdx < n; colIdx += blockDim.x) {
@@ -266,23 +270,24 @@ __global__ void rowWiseAmaxKernel(uint32_t m, uint32_t n, T const* input, float*
 
 template <typename T>
 void invokeRowWiseAmax(uint32_t m, uint32_t n, T const* input, float* output, float scale,
-                       cudaStream_t stream) {
+                       int32_t* expanded_idx_to_permuted_idx, cudaStream_t stream) {
   constexpr uint32_t BLOCK_SIZE = 256;
   dim3 block(BLOCK_SIZE);
   dim3 grid(m);
-  rowWiseAmaxKernel<T, BLOCK_SIZE><<<grid, block, 0, stream>>>(m, n, input, output, scale);
+  rowWiseAmaxKernel<T, BLOCK_SIZE>
+      <<<grid, block, 0, stream>>>(m, n, input, output, scale, expanded_idx_to_permuted_idx);
 }
 
 // Instantiate the function.
-template void invokeRowWiseAmax<half>(uint32_t m, uint32_t n, half const* input, float* output, float scale,
-                                      cudaStream_t stream);
+template void invokeRowWiseAmax<half>(uint32_t m, uint32_t n, half const* input, float* output,
+                                      float scale, int32_t* expanded_idx_to_permuted_idx, cudaStream_t stream);
 #ifdef ENABLE_BF16
 template void invokeRowWiseAmax<__nv_bfloat16>(uint32_t m, uint32_t n, __nv_bfloat16 const* input,
-                                               float* output, float scale, cudaStream_t stream);
+                                               float* output, float scale, int32_t* expanded_idx_to_permuted_idx, cudaStream_t stream);
 #endif
 #ifdef ENABLE_FP8
 template void invokeRowWiseAmax<__nv_fp8_e4m3>(uint32_t m, uint32_t n, __nv_fp8_e4m3 const* input,
-                                               float* output, float scale, cudaStream_t stream);
+                                               float* output, float scale, int32_t* expanded_idx_to_permuted_idx, cudaStream_t stream);
 #endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
