@@ -237,13 +237,13 @@ CUtensorMap make_3d_tma_copy_desc(T* global_address, uint64_t gmem_dim[3],
 // Row-wise Amax Helper kernel
 
 template <typename T, uint32_t BLOCK_SIZE>
-__global__ void rowWiseAmaxKernel(int m, int n, T const* input, float* amaxOutput, float scale) {
-  int rowIdx = blockIdx.x;
+__global__ void rowWiseAmaxKernel(uint32_t m, uint32_t n, T const* input, float* amaxOutput, float scale) {
+  uint32_t rowIdx = blockIdx.x;
   if (rowIdx >= m) return;
 
   float localMax = 0.f;
-  for (int colIdx = threadIdx.x; colIdx < n; colIdx += blockDim.x) {
-    T element = input[(int64_t)rowIdx * n + colIdx];
+  for (uint32_t colIdx = threadIdx.x; colIdx < n; colIdx += blockDim.x) {
+    T element = input[rowIdx * n + colIdx];
     localMax = fmaxf(localMax, fabsf(static_cast<float>(element) * scale));
   }
 
@@ -265,7 +265,7 @@ __global__ void rowWiseAmaxKernel(int m, int n, T const* input, float* amaxOutpu
 }
 
 template <typename T>
-void invokeRowWiseAmax(int m, int n, T const* input, float* output, float scale,
+void invokeRowWiseAmax(uint32_t m, uint32_t n, T const* input, float* output, float scale,
                        cudaStream_t stream) {
   constexpr uint32_t BLOCK_SIZE = 256;
   dim3 block(BLOCK_SIZE);
@@ -274,14 +274,14 @@ void invokeRowWiseAmax(int m, int n, T const* input, float* output, float scale,
 }
 
 // Instantiate the function.
-template void invokeRowWiseAmax<half>(int m, int n, half const* input, float* output, float scale,
+template void invokeRowWiseAmax<half>(uint32_t m, uint32_t n, half const* input, float* output, float scale,
                                       cudaStream_t stream);
 #ifdef ENABLE_BF16
-template void invokeRowWiseAmax<__nv_bfloat16>(int m, int n, __nv_bfloat16 const* input,
+template void invokeRowWiseAmax<__nv_bfloat16>(uint32_t m, uint32_t n, __nv_bfloat16 const* input,
                                                float* output, float scale, cudaStream_t stream);
 #endif
 #ifdef ENABLE_FP8
-template void invokeRowWiseAmax<__nv_fp8_e4m3>(int m, int n, __nv_fp8_e4m3 const* input,
+template void invokeRowWiseAmax<__nv_fp8_e4m3>(uint32_t m, uint32_t n, __nv_fp8_e4m3 const* input,
                                                float* output, float scale, cudaStream_t stream);
 #endif
 

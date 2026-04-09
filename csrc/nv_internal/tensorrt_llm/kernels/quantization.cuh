@@ -243,7 +243,7 @@ quantize_with_block_size(
     // Early exit for padding-only blocks: if this block only processes padding rows,
     // we can skip the batch loop and just zero out the scale factors
     if constexpr (USE_ROW_WISE_SCALE) {
-      if (rowIdx <= numRows && SFScale != nullptr) {
+      if (rowIdx < numRows && SFScale != nullptr) {
         SFScaleVal = SFScale[rowIdx];
         if constexpr (USE_INVERSE_SCALE) {
           SFScaleVal = reciprocal_approximate_ftz(SFScaleVal);
@@ -449,16 +449,6 @@ quantize_with_block_size_tma(
 
     for (int rowIdx = blockIdx.x * TMA_ROW_TILE; rowIdx < numPaddedRowsForSf;
          rowIdx += gridDim.x * TMA_ROW_TILE) {
-      if constexpr (USE_ROW_WISE_SCALE) {
-        if (rowIdx <= numRows && SFScale != nullptr) {
-          SFScaleVal = SFScale[rowIdx];
-          if constexpr (USE_INVERSE_SCALE) {
-            SFScaleVal = reciprocal_approximate_ftz(SFScaleVal);
-          }
-        } else {
-          SFScaleVal = 1.f;
-        }
-      }
       for (int batchIdx = 0; batchIdx < numbatches; batchIdx++) {
         std::optional<int> optionalBatchIdx = batchIdx;
         std::optional<int> optionalNumRows = numRows;
@@ -476,6 +466,16 @@ quantize_with_block_size_tma(
 
 #pragma unroll
           for (int i = 0; i < ROW_ITERATIONS; i++) {
+            if constexpr (USE_ROW_WISE_SCALE) {
+              if (threadRowIdxGlobal < numRows && SFScale != nullptr) {
+                SFScaleVal = SFScale[threadRowIdxGlobal];
+                if constexpr (USE_INVERSE_SCALE) {
+                  SFScaleVal = reciprocal_approximate_ftz(SFScaleVal);
+                }
+              } else {
+                SFScaleVal = 1.f;
+              }
+            }
             auto sf_out = cvt_quant_get_sf_out_offset<uint32_t, CVT_NUM_THREADS_PER_SF>(
                 optionalBatchIdx, threadRowIdxGlobal, tidx.colVecIdx, optionalNumRows,
                 numPaddedCols / SF_VEC_SIZE, SFout, layout);

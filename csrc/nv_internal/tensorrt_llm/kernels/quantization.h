@@ -57,7 +57,7 @@ void invokePerTokenQuantization(QuantT* dst, T const* src, int64_t const numRows
                                 cudaStream_t stream = 0);
 
 template <typename T>
-void invokeRowWiseAmax(int m, int n, T const* input, float* output, float scale = 1.0f,
+void invokeRowWiseAmax(uint32_t m, uint32_t n, T const* input, float* output, float scale = 1.0f,
                        cudaStream_t stream = 0);
 
 template <typename T, int SF_VEC_SIZE>
