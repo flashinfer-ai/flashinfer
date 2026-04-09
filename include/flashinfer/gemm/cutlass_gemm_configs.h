@@ -382,7 +382,7 @@ struct CutlassGemmConfig {
         is_tma_warp_specialized(true) {}
 
   // SM120/SM121 constructor with optional StreamK scheduler
-  // use_stream_k: false = persistent scheduler (default), true = StreamK scheduler
+  // use_stream_k: false = DP scheduler (default), true = StreamK scheduler (auto heuristic)
   CutlassGemmConfig(CutlassTileConfigSM120 tile_config_sm120,
                     MainloopScheduleType mainloop_schedule, EpilogueScheduleType epilogue_schedule,
                     ClusterShape cluster_shape, bool use_stream_k = false)
