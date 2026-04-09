@@ -189,6 +189,19 @@ __device__ __forceinline__ auto make_swizzled_layout_rc_transpose() {
   return tile_to_shape(atom, make_shape(Int<COLS>{}, Int<ROWS>{}));
 }
 
+// Swizzled smem layout for f32 arrays (e.g. smem.out).
+// Atom: 8 rows × 32 cols (128 bytes/row = full bank cycle for 4-byte elements).
+// Same Swizzle<3,3,3> pattern as the bf16 variant.
+template <int ROWS, int COLS>
+__device__ __forceinline__ auto make_swizzled_layout_rc_f32() {
+  using namespace cute;
+  static_assert(ROWS % 8 == 0, "ROWS must be multiple of 8 for swizzle atom");
+  static_assert(COLS % 32 == 0, "COLS must be multiple of 32 for f32 swizzle atom");
+  auto atom = composition(Swizzle<3, 3, 3>{},
+                          make_layout(make_shape(_8{}, _32{}), make_stride(_32{}, _1{})));
+  return tile_to_shape(atom, make_shape(Int<ROWS>{}, Int<COLS>{}));
+}
+
 // =============================================================================
 // Shared memory layout
 // =============================================================================
@@ -336,6 +349,24 @@ __device__ __forceinline__ void load_z(SmemT& smem, input_t const* __restrict__ 
   }
 }
 
+// Swizzled z load for conflict-free partition_C reads in z-gating epilogue.
+template <typename input_t, int NTOKENS, int DIM, typename SmemT>
+__device__ __forceinline__ void load_z_cute(SmemT& smem, input_t const* __restrict__ z_ptr,
+                                            int64_t z_base, int z_stride_mtp, int lane) {
+  constexpr int NTOKENS_PAD = SmemT::NTOKENS_PAD;
+  constexpr int INPUT_PACK = 16 / sizeof(input_t);
+  auto layout = make_swizzled_layout_rc<NTOKENS_PAD, DIM>();
+  input_t* base = &smem.z[0][0];
+
+  constexpr int num_packs = NTOKENS * DIM / INPUT_PACK;
+  constexpr int packs_per_row = DIM / INPUT_PACK;
+  for (int i = lane; i < num_packs; i += warpSize) {
+    int const t = i / packs_per_row;
+    int const col = (i % packs_per_row) * INPUT_PACK;
+    cp_async_16B(base + layout(t, col), &z_ptr[z_base + t * z_stride_mtp + col]);
+  }
+}
+
 template <typename input_t, int NTOKENS, int DSTATE, typename SmemT>
 __device__ __forceinline__ void load_C_cute(SmemT& smem, input_t const* __restrict__ C_ptr,
                                             int64_t C_base, int C_stride_mtp, int lane) {
@@ -448,10 +479,17 @@ __device__ __forceinline__ void load_data(SmemT& smem, SsuIncrementalParams cons
   }
 
   // ── Warp 3: cp.async z[T, dim] (if present) ──
+  // Swizzled when USE_TENSOR_MMA (partition_C reads in z-gating epilogue).
+  // Flat when !USE_TENSOR_MMA (SIMT path reads via smem.z[t][d] array indexing).
   if (warp == 3) {
     if (z_ptr) {
       int64_t const z_base = (int64_t)batch_idx * params.z_stride_batch + head * DIM;
-      load_z<input_t, NTOKENS, DIM>(smem, z_ptr, z_base, params.z_stride_mtp, lane);
+      constexpr bool Z_SWIZZLE = (sizeof(state_t) == 2);
+      if constexpr (Z_SWIZZLE) {
+        load_z_cute<input_t, NTOKENS, DIM>(smem, z_ptr, z_base, params.z_stride_mtp, lane);
+      } else {
+        load_z<input_t, NTOKENS, DIM>(smem, z_ptr, z_base, params.z_stride_mtp, lane);
+      }
     }
   }
 
@@ -814,8 +852,15 @@ __device__ __forceinline__ void compute_output_cute(SmemT& smem, SsuIncrementalP
   Tensor decay_bcast = make_tensor(make_smem_ptr(smem.cumAdt), decay_layout);
   Tensor decay_part = thr_mma.partition_C(decay_bcast);
 
-  // ── z: flat row-major [NTOKENS_PAD, DIM] for partition_C epilogue ──
+  // ── z: swizzled [NTOKENS_PAD, DIM] for partition_C epilogue ──
   auto* __restrict__ z_ptr = reinterpret_cast<input_t const*>(params.z);
+  auto layout_z_swz = make_swizzled_layout_rc<NTOKENS_PAD, DIM>();
+  Tensor smem_z =
+      make_tensor(make_smem_ptr(reinterpret_cast<input_t const*>(&smem.z[0][0])), layout_z_swz);
+
+  // ── Output: swizzled f32 [NTOKENS_PAD, DIM] for conflict-free partition_C writes ──
+  auto layout_out_swz = make_swizzled_layout_rc_f32<NTOKENS_PAD, DIM>();
+  Tensor smem_out = make_tensor(make_smem_ptr(&smem.out[0][0]), layout_out_swz);
 
   // ── Output pointer ──
   auto* __restrict__ output_ptr = reinterpret_cast<input_t*>(params.output);
@@ -834,9 +879,8 @@ __device__ __forceinline__ void compute_output_cute(SmemT& smem, SsuIncrementalP
     Tensor frag_B_view = s2r_thr_B.retile_D(frag_B);
 
     // Accumulator for this N-tile (shared by matmuls 3 and 4)
-    auto layout_out =
-        make_layout(make_shape(Int<NTOKENS_PAD>{}, Int<N_TILE>{}), make_stride(Int<DIM>{}, _1{}));
-    Tensor smem_out_tile = make_tensor(make_smem_ptr(&smem.out[0][0] + n * N_TILE), layout_out);
+    Tensor smem_out_tile =
+        local_tile(smem_out, make_tile(Int<NTOKENS_PAD>{}, Int<N_TILE>{}), make_coord(_0{}, n));
     Tensor frag_C = thr_mma.partition_fragment_C(smem_out_tile);
     clear(frag_C);
 
@@ -914,9 +958,8 @@ __device__ __forceinline__ void compute_output_cute(SmemT& smem, SsuIncrementalP
 
     // ── z-gating: accum *= z * sigmoid(z) ──
     if (z_ptr) {
-      auto layout_z =
-          make_layout(make_shape(Int<NTOKENS_PAD>{}, Int<N_TILE>{}), make_stride(Int<DIM>{}, _1{}));
-      Tensor smem_z_tile = make_tensor(make_smem_ptr(&smem.z[0][0] + n * N_TILE), layout_z);
+      Tensor smem_z_tile =
+          local_tile(smem_z, make_tile(Int<NTOKENS_PAD>{}, Int<N_TILE>{}), make_coord(_0{}, n));
       Tensor z_part = thr_mma.partition_C(smem_z_tile);
 #pragma unroll
       for (int i = 0; i < size(frag_C); ++i) {
@@ -993,12 +1036,19 @@ __device__ __forceinline__ void compute_z_gating(SmemT& smem, void const* z_ptr,
 
 // Write smem.out to global output tensor.
 // Per-warp row ownership — no sync needed before this.
-template <typename input_t, int NTOKENS, int DIM, int NUM_WARPS, typename SmemT>
+// When USE_TENSOR_MMA, smem.out is in swizzled f32 layout (written by compute_output_cute).
+// When !USE_TENSOR_MMA, smem.out is flat float[NTOKENS_PAD][DIM].
+template <typename input_t, typename state_t, int NTOKENS, int DIM, int NUM_WARPS, typename SmemT>
 __device__ __forceinline__ void store_output(SmemT& smem, SsuIncrementalParams const& params,
                                              int warp, int lane, int batch_idx, int head) {
+  constexpr bool USE_TENSOR_MMA = (sizeof(state_t) == 2);
+  constexpr int NTOKENS_PAD = SmemT::NTOKENS_PAD;
   constexpr int ROWS_PER_WARP = DIM / NUM_WARPS;
   int const my_row_offset = warp * ROWS_PER_WARP;
   auto* __restrict__ output_ptr = reinterpret_cast<input_t*>(params.output);
+
+  [[maybe_unused]] auto layout_out_swz = make_swizzled_layout_rc_f32<NTOKENS_PAD, DIM>();
+  [[maybe_unused]] float const* out_base = &smem.out[0][0];
 
   constexpr int elems_per_warp = NTOKENS * ROWS_PER_WARP;
   for (int idx = lane; idx < elems_per_warp; idx += warpSize) {
@@ -1006,7 +1056,11 @@ __device__ __forceinline__ void store_output(SmemT& smem, SsuIncrementalParams c
     int const dd = my_row_offset + idx % ROWS_PER_WARP;
     int64_t const out_offset =
         (int64_t)batch_idx * params.out_stride_batch + t * params.out_stride_mtp + head * DIM + dd;
-    convertAndStore(&output_ptr[out_offset], smem.out[t][dd]);
+    if constexpr (USE_TENSOR_MMA) {
+      convertAndStore(&output_ptr[out_offset], out_base[layout_out_swz(t, dd)]);
+    } else {
+      convertAndStore(&output_ptr[out_offset], smem.out[t][dd]);
+    }
   }
 }
 
@@ -1184,13 +1238,15 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
     // Fused: matmul 3 + decay + matmul 4 + D*x + z-gate → smem.out
     compute_output_cute<input_t, state_t, weight_t, NTOKENS, DIM, DSTATE, NUM_WARPS>(
         smem, params, warp, lane, batch_idx, head, D_val);
-    store_output<input_t, NTOKENS, DIM, NUM_WARPS>(smem, params, warp, lane, batch_idx, head);
+    store_output<input_t, state_t, NTOKENS, DIM, NUM_WARPS>(smem, params, warp, lane, batch_idx,
+                                                            head);
   } else {
     add_init_out<input_t, state_t, NTOKENS, DIM, DSTATE, NUM_WARPS>(smem, warp, lane);
     add_cb_out<input_t, NTOKENS, DIM, NUM_WARPS>(smem, warp, lane);
     add_D_skip<input_t, weight_t, NTOKENS, DIM, NUM_WARPS>(smem, warp, lane, D_val);
     compute_z_gating<input_t, NTOKENS, DIM, NUM_WARPS>(smem, params.z, warp, lane);
-    store_output<input_t, NTOKENS, DIM, NUM_WARPS>(smem, params, warp, lane, batch_idx, head);
+    store_output<input_t, state_t, NTOKENS, DIM, NUM_WARPS>(smem, params, warp, lane, batch_idx,
+                                                            head);
   }
 
   // ── Phase 3: Store to global memory ──
