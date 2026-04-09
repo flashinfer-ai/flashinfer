@@ -167,7 +167,7 @@ def create_kv_cache(
             device=GPU_DEVICE,
         )
 
-    kv_block_scales = None
+    kv_cache_sf = None
     # Convert K and V separately to fp8 if needed
     if kv_dtype == "fp8":
         k_cache, k_scale = to_float8(k_cache)
@@ -182,9 +182,14 @@ def create_kv_cache(
         )
         kv_cache = torch.stack([k_cache, v_cache], dim=1)
     elif kv_dtype == "nvfp4":
-        # Reference is the unquantized BF16 data
+        # Add outlier channels to stress per-block scaling.
+        outlier_start = head_dim // 4
+        outlier_end = outlier_start + min(16, head_dim // 8)
+        k_cache[..., outlier_start:outlier_end] *= 30.0
+        v_cache[..., outlier_start:outlier_end] *= 2.0
+        # Reference is the unquantized BF16 data (with outliers applied)
         ref_kv_cache = torch.stack([k_cache, v_cache], dim=1)
-        kv_cache, kv_block_scales, k_scale, v_scale = nvfp4_quantize_paged_kv_cache(
+        kv_cache, kv_cache_sf, k_scale, v_scale = nvfp4_quantize_paged_kv_cache(
             k_cache, v_cache, kv_layout=kv_layout
         )
     else:
@@ -192,7 +197,7 @@ def create_kv_cache(
         ref_kv_cache = torch.stack([k_cache, v_cache], dim=1)
         kv_cache = torch.stack([k_cache, v_cache], dim=1)
 
-    return kv_cache, k_scale, v_scale, ref_kv_cache, kv_block_scales
+    return kv_cache, k_scale, v_scale, ref_kv_cache, kv_cache_sf
 
 
 def create_page_table(batch_size: int, seq_lens: torch.Tensor, page_size: int):
@@ -225,7 +230,7 @@ def prepare_paged_kv_for_kernel(
     kv_cache: Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]],
     page_table: torch.Tensor,
     uses_shared_paged_kv_idx: bool,
-    kv_block_scales: Union[tuple[torch.Tensor, torch.Tensor], None] = None,
+    kv_cache_sf: Union[tuple[torch.Tensor, torch.Tensor], None] = None,
 ) -> tuple[
     Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]],
     torch.Tensor,
@@ -244,10 +249,10 @@ def prepare_paged_kv_for_kernel(
     way since the kernel uses the same page indices to access them.
 
     Returns:
-        (kv_cache_arg, page_table, kv_block_scales) ready to pass to the kernel.
+        (kv_cache_arg, page_table, kv_cache_sf) ready to pass to the kernel.
     """
     if uses_shared_paged_kv_idx:
-        return kv_cache, page_table, kv_block_scales
+        return kv_cache, page_table, kv_cache_sf
 
     def _interleave_kv(k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         """Stack [num_pages,...] K and V along dim-1 then flatten to [2*num_pages,...]."""
@@ -262,12 +267,12 @@ def prepare_paged_kv_for_kernel(
 
     trtllm_page_table = torch.stack([2 * page_table, 2 * page_table + 1], dim=1)
 
-    if kv_block_scales is not None:
-        k_sf, v_sf = kv_block_scales
+    if kv_cache_sf is not None:
+        k_sf, v_sf = kv_cache_sf
         interleaved_sf = _interleave_kv(k_sf, v_sf)
-        kv_block_scales = (interleaved_sf, interleaved_sf)
+        kv_cache_sf = (interleaved_sf, interleaved_sf)
 
-    return (interleaved, interleaved), trtllm_page_table, kv_block_scales
+    return (interleaved, interleaved), trtllm_page_table, kv_cache_sf
 
 
 def flatten_paged_kv(
@@ -524,7 +529,7 @@ def _test_trtllm_batch_prefill(
     q_indptr = generate_cumsum_lens(q_lens)
 
     # Create KV cache and related data
-    kv_cache, k_scale, v_scale, ref_kv_cache, kv_block_scales = create_kv_cache(
+    kv_cache, k_scale, v_scale, ref_kv_cache, kv_cache_sf = create_kv_cache(
         batch_size,
         seq_lens,
         page_size,
@@ -540,9 +545,9 @@ def _test_trtllm_batch_prefill(
     kv_indptr = generate_cumsum_lens(page_per_seq)
     kv_last_page_len = get_last_page_len(seq_lens, page_size)
 
-    kv_cache_kernel, page_table_kernel, kv_block_scales_kernel = (
+    kv_cache_kernel, page_table_kernel, kv_cache_sf_kernel = (
         prepare_paged_kv_for_kernel(
-            kv_cache, page_table, uses_shared_paged_kv_idx, kv_block_scales
+            kv_cache, page_table, uses_shared_paged_kv_idx, kv_cache_sf
         )
     )
 
@@ -652,7 +657,7 @@ def _test_trtllm_batch_prefill(
         kv_layout=kv_layout,
         enable_pdl=enable_pdl,
         sinks=(sink if enable_sink else None),
-        kv_block_scales=kv_block_scales_kernel,
+        kv_cache_sf=kv_cache_sf_kernel,
         skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
     )
@@ -673,12 +678,14 @@ def _test_trtllm_batch_prefill(
     else:
         rtol, atol = 1e-2, 1e-2
 
-    # NVFP4 KV cache has significant quantization error
+    # NVFP4 KV cache has significant quantization error, especially with
+    # outlier channels that create large per-block dynamic range.
     if kv_dtype == "nvfp4":
-        rtol, atol = 3e-1, 3e-1
+        rtol, atol = 5e-1, 5e-1
 
-    # Arbitary small mismatch rate
-    allowed_mismatch_rate = 0.03 if kv_dtype == "nvfp4" else 1e-7
+    # NVFP4 KV cache has higher mismatch rate due to 4-bit quantization noise,
+    # especially with outlier channels that stress per-block scaling.
+    allowed_mismatch_rate = 0.10 if kv_dtype == "nvfp4" else 1e-7
     # Calculate max allowed mismatched elements based on tensor size
     total_elements = (output.float() * o_scale).numel()
     max_mismatched_elements = int(allowed_mismatch_rate * total_elements)
@@ -692,6 +699,19 @@ def _test_trtllm_batch_prefill(
         max_mismatched_elements=max_mismatched_elements,
     )
 
+    # NVFP4 KV cache: use cosine similarity to catch block-scale mismatches
+    # (e.g. wrong swizzling) that element-wise tolerances miss.
+    if kv_dtype == "nvfp4":
+        cos = torch.nn.functional.cosine_similarity(
+            (output.float() * o_scale).reshape(-1),
+            output_ref.float().reshape(-1),
+            dim=0,
+        )
+        assert cos.item() > 0.86, (
+            f"NVFP4 KV cache attention: cosine similarity {cos:.4f} < 0.86. "
+            f"Block scale factors may be mismatched to FP4 data blocks."
+        )
+
     if (
         o_dtype != "nvfp4" and kv_dtype != "nvfp4" and uses_shared_paged_kv_idx
     ):  # wrapper api does not support fp4 output/kv or separate KV page indices yet.
@@ -701,6 +721,7 @@ def _test_trtllm_batch_prefill(
         )
         plan_params["q_data_type"] = q.dtype
         plan_params["kv_data_type"] = kv_cache.dtype
+        plan_params["o_data_type"] = DTYPE_MAP[o_dtype]
         wrapper_trtllm_gen.plan(**plan_params)
         output_wrapper = wrapper_trtllm_gen.run(
             q_input,
@@ -915,15 +936,6 @@ def _test_trtllm_batch_decode(
     if backend == "xqa" and not uses_shared_paged_kv_idx:
         pytest.skip("xqa backend does not support non-shared page indices")
 
-    if o_dtype == "nvfp4" and (
-        q_len_per_req is not None
-        and q_len_per_req > 1
-        or max_q_len is not None
-        and max_q_len > 1
-    ):
-        # todo(Yingyi): add support for nvfp4 with speculative decoding
-        pytest.skip("nvfp4 is not supported for q_len_per_req > 1 or max_q_len > 1 yet")
-
     if backend == "trtllm-gen" and o_dtype == "fp8" and q_dtype != "fp8":
         pytest.skip("trtllm-gen backend only supports fp8 output for fp8 query")
 
@@ -951,7 +963,7 @@ def _test_trtllm_batch_decode(
     q_indptr = generate_cumsum_lens(q_lens)
 
     # Create KV cache and related data
-    kv_cache, k_scale, v_scale, ref_kv_cache, kv_block_scales = create_kv_cache(
+    kv_cache, k_scale, v_scale, ref_kv_cache, kv_cache_sf = create_kv_cache(
         batch_size,
         seq_lens,
         page_size,
@@ -967,10 +979,8 @@ def _test_trtllm_batch_decode(
     kv_indptr = generate_cumsum_lens(page_per_seq)
     kv_last_page_len = get_last_page_len(seq_lens, page_size)
 
-    kv_cache_arg, page_table_kernel, kv_block_scales_kernel = (
-        prepare_paged_kv_for_kernel(
-            kv_cache, page_table, uses_shared_paged_kv_idx, kv_block_scales
-        )
+    kv_cache_arg, page_table_kernel, kv_cache_sf_kernel = prepare_paged_kv_for_kernel(
+        kv_cache, page_table, uses_shared_paged_kv_idx, kv_cache_sf
     )
 
     workspace_buffer, workspace_buffer_ref = create_workspace_buffers(GPU_DEVICE)
@@ -1106,7 +1116,7 @@ def _test_trtllm_batch_decode(
         max_q_len=max_q_len if max_q_len is not None else None,
         cum_seq_lens_q=q_indptr if max_q_len is not None else None,
         skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
-        kv_block_scales=kv_block_scales_kernel,
+        kv_cache_sf=kv_cache_sf_kernel,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
     )
     if backend == "trtllm-gen":
@@ -1131,17 +1141,19 @@ def _test_trtllm_batch_decode(
         atol = 1e-1
         rtol = 1e-1
 
-    # NVFP4 KV cache has significant quantization error
+    # NVFP4 KV cache has significant quantization error, especially with
+    # outlier channels that create large per-block dynamic range.
     if kv_dtype == "nvfp4":
-        rtol, atol = 3e-1, 3e-1
+        rtol, atol = 5e-1, 5e-1
 
     # convert to float32 for fp8 is not supported by assert_close
     # relax rtol and atol for speculative decoding test
     if (q_len_per_req and q_len_per_req > 1) or (max_q_len and max_q_len > 1):
         rtol, atol = rtol * 2, atol * 2
 
-    # Arbitary small mismatch rate
-    allowed_mismatch_rate = 0.03 if kv_dtype == "nvfp4" else 5e-5
+    # NVFP4 KV cache has higher mismatch rate due to 4-bit quantization noise,
+    # especially with outlier channels that stress per-block scaling.
+    allowed_mismatch_rate = 0.10 if kv_dtype == "nvfp4" else 5e-5
     # Calculate max allowed mismatched elements based on tensor size
     total_elements = (output.float() * o_scale).numel()
     max_mismatched_elements = int(allowed_mismatch_rate * total_elements)
@@ -1153,6 +1165,22 @@ def _test_trtllm_batch_decode(
         atol=atol,
         max_mismatched_elements=max_mismatched_elements,
     )
+
+    # NVFP4 KV cache: use cosine similarity instead of element-wise comparison.
+    # Cosine similarity is scale-invariant, which is important because the
+    # FP4→FP8 dequant path introduces a global scale factor.  More critically,
+    # it reliably catches block-scale mismatches (e.g. wrong swizzling) that
+    # element-wise tolerances miss when values happen to be small.
+    if kv_dtype == "nvfp4":
+        cos = torch.nn.functional.cosine_similarity(
+            (output.float() * o_scale).reshape(-1),
+            output_ref.float().reshape(-1),
+            dim=0,
+        )
+        assert cos.item() > 0.86, (
+            f"NVFP4 KV cache attention: cosine similarity {cos:.4f} < 0.86. "
+            f"Block scale factors may be mismatched to FP4 data blocks."
+        )
 
     # Only test wrapper with trtllm-gen backend
     if (
@@ -1169,6 +1197,7 @@ def _test_trtllm_batch_decode(
         )
         plan_params["q_data_type"] = q.dtype
         plan_params["kv_data_type"] = kv_cache.dtype
+        plan_params["o_data_type"] = DTYPE_MAP[o_dtype]
         wrapper_trtllm_gen.plan(**plan_params)
         output_wrapper = wrapper_trtllm_gen.run(
             q_input,
@@ -1258,7 +1287,7 @@ def _test_trtllm_batch_decode(
 @pytest.mark.parametrize("enable_pdl", [True, False, None])
 @pytest.mark.parametrize("enable_sink", [True, False])
 @pytest.mark.parametrize("max_in_kv_len", [110])
-@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("non_contiguous_query", [False, True])
 @pytest.mark.parametrize("skips_softmax", [False, True])
 @pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
@@ -1285,6 +1314,10 @@ def test_trtllm_batch_decode(
     # xqa backend does not support non-contiguous query yet
     if backend == "xqa" and non_contiguous_query:
         pytest.skip("xqa backend does not support non-contiguous query")
+
+    # fixme(qsang-nv): failing tests for xqa + head dim 256.
+    if backend == "xqa" and head_dim == 256:
+        pytest.skip("xqa backend + head dim 256 cases have precision issues")
 
     # General set of tests for trtllm-gen decode
     _test_trtllm_batch_decode(
@@ -1721,25 +1754,27 @@ def make_query_non_contiguous(
 @pytest.mark.parametrize("backend", ["trtllm-gen"])
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
 @pytest.mark.parametrize(
-    "batch_size,max_q_len,page_size,num_kv_heads,head_grp_size",
+    "batch_size,max_q_len,page_size,num_kv_heads,head_grp_size,head_dim",
     [
-        (4, 1, 16, 2, 1),
-        (4, 1, 32, 2, 5),
-        (4, 2, 64, 2, 5),
-        (4, 3, 32, 2, 5),
-        (4, 3, 64, 2, 1),
-        (4, 4, 64, 4, 1),
-        (4, 5, 64, 4, 8),
-        (128, 1, 64, 2, 5),
-        (128, 2, 32, 4, 1),
-        (128, 3, 16, 4, 8),
-        (128, 4, 16, 2, 5),
-        (128, 5, 16, 2, 5),
-        (256, 1, 64, 4, 8),
-        (256, 2, 16, 2, 8),
-        (256, 3, 64, 4, 5),
-        (256, 4, 32, 2, 8),
-        (256, 5, 32, 2, 1),
+        (4, 1, 16, 2, 1, 128),
+        (4, 1, 32, 2, 5, 128),
+        (4, 2, 64, 2, 5, 128),
+        (4, 3, 32, 2, 5, 128),
+        (4, 3, 64, 2, 1, 128),
+        (4, 4, 64, 4, 1, 128),
+        (4, 5, 64, 4, 8, 128),
+        # Iterate over head_dim 128, 256 for these configs to simplify
+        *[(bs, 4, 64, 4, 16, hd) for bs in [4, 8, 16, 32] for hd in [128, 256]],
+        (128, 1, 64, 2, 5, 128),
+        (128, 2, 32, 4, 1, 128),
+        (128, 3, 16, 4, 8, 128),
+        (128, 4, 16, 2, 5, 128),
+        (128, 5, 16, 2, 5, 128),
+        (256, 1, 64, 4, 8, 256),
+        (256, 2, 16, 2, 8, 256),
+        (256, 3, 64, 4, 5, 256),
+        (256, 4, 32, 2, 8, 256),
+        (256, 16, 32, 2, 8, 256),
     ],
 )
 @pytest.mark.parametrize("window_left", [-1, 127])
@@ -1761,7 +1796,6 @@ def make_query_non_contiguous(
 @pytest.mark.parametrize("enable_pdl", [True, False, None])
 @pytest.mark.parametrize("enable_sink", [True, False])
 @pytest.mark.parametrize("max_in_kv_len", [110])
-@pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("skips_softmax", [False, True])
 @pytest.mark.parametrize("uses_shared_paged_kv_idx", [False, True])
 def test_trtllm_batch_decode_spec(
