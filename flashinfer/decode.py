@@ -541,7 +541,7 @@ def single_decode_with_kv_cache(
             TensorLayout[kv_layout].value,
             window_left,
             None,  # packed_custom_mask
-            get_alibi_slopes(num_qo_heads).to(q.device)
+            get_alibi_slopes(num_qo_heads, device=q.device)
             if pos_encoding_mode == "ALIBI"
             else None,
             logits_soft_cap,
@@ -573,7 +573,7 @@ def single_decode_with_kv_cache(
             tmp,
             out,
             lse,
-            get_alibi_slopes(num_qo_heads).to(q.device)
+            get_alibi_slopes(num_qo_heads, device=q.device)
             if pos_encoding_mode == "ALIBI"
             else None,
             TensorLayout[kv_layout].value,
