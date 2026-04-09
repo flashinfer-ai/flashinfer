@@ -2200,7 +2200,6 @@ def test_moe_nvfp4_ndim_padding_safety(
     if quantized_input:
         hidden_states, input_sf = fp4_quantize(x, a1_gs)
 
-
     _ = fused_moe.cutlass_fused_moe(
         hidden_states,
         selected_experts.to(torch.int),
@@ -2261,7 +2260,7 @@ def test_moe_nvfp4_ndim_padding_safety(
     abs_diff = (ref_output - flash_output).abs()
     tight_match_rate = (abs_diff <= 0.5).float().mean().item()
     assert tight_match_rate >= 0.95, (
-        f"Only {tight_match_rate*100:.1f}% of elements within tight tolerance (0.5). "
+        f"Only {tight_match_rate * 100:.1f}% of elements within tight tolerance (0.5). "
         f"Expected >=95%."
     )
     assert abs_diff.max().item() <= 2.0, (
@@ -2394,7 +2393,7 @@ def test_moe_mxfp8_mxfp4_ndim_padding_safety(
     abs_diff = (ref_output - flash_output).abs()
     tight_match_rate = (abs_diff <= 1.0).float().mean().item()
     assert tight_match_rate >= 0.95, (
-        f"Only {tight_match_rate*100:.1f}% of elements within tight tolerance (1.0). "
+        f"Only {tight_match_rate * 100:.1f}% of elements within tight tolerance (1.0). "
         f"Expected >=95%."
     )
     assert abs_diff.max().item() <= 3.0, (
