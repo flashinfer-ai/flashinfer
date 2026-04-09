@@ -155,6 +155,17 @@ __device__ __forceinline__ void cp_async_16B(void* __restrict__ smem_dst,
                : "memory");
 }
 
+// cp.async with L2::128B eviction hint and L1 caching (.ca).
+// CuTe's SM80_CP_ASYNC_CACHEALWAYS uses .ca (cache all levels), not .cg (bypass L1).
+// On B200 (SM100), .ca resolves smem bank conflicts without replay; .cg does not.
+__device__ __forceinline__ void cp_async_16B_L2(void* __restrict__ smem_dst,
+                                                void const* __restrict__ gmem_src) {
+  unsigned int smem_addr = __cvta_generic_to_shared(smem_dst);
+  asm volatile("cp.async.ca.shared.global.L2::128B [%0], [%1], 16;\n" ::"r"(smem_addr),
+               "l"(gmem_src)
+               : "memory");
+}
+
 // Round up to next multiple of 16 (for mma.sync.m16n8k16 tile alignment).
 constexpr int next_multiple_of_16(int x) { return (x + 15) & ~15; }
 
@@ -423,6 +434,26 @@ __device__ __forceinline__ void load_C_cute(SmemT& smem, input_t const* __restri
   copy_if(g2s, pred, thr.partition_S(gC), thr.partition_D(sC));
 }
 
+// Manual swizzled C load using cp_async_16B_L2 (with .L2::128B hint).
+// Same logic as the original load_C_cute manual loop, but with the L2 hint
+// that CuTe's SM80_CP_ASYNC generates. For A/B testing vs TiledCopy.
+template <typename input_t, int NTOKENS, int DSTATE, typename SmemT>
+__device__ __forceinline__ void load_C_cute_manual(SmemT& smem, input_t const* __restrict__ C_ptr,
+                                                   int64_t C_base, int C_stride_mtp, int lane) {
+  constexpr int NTOKENS_PAD = SmemT::NTOKENS_PAD;
+  constexpr int INPUT_PACK = 16 / sizeof(input_t);
+  auto layout = make_swizzled_layout_rc<NTOKENS_PAD, DSTATE>();
+  input_t* base = &smem.C[0][0];
+
+  constexpr int num_packs = NTOKENS * DSTATE / INPUT_PACK;
+  constexpr int packs_per_row = DSTATE / INPUT_PACK;
+  for (int i = lane; i < num_packs; i += warpSize) {
+    int const t = i / packs_per_row;
+    int const col = (i % packs_per_row) * INPUT_PACK;
+    cp_async_16B_L2(base + layout(t, col), &C_ptr[C_base + t * C_stride_mtp + col]);
+  }
+}
+
 // State load helpers (flat and swizzled).
 // All warps cooperate, using flat_tid (warp * 32 + lane).
 template <typename state_t, int DIM, int DSTATE, int NUM_WARPS, typename SmemT>
@@ -501,9 +532,10 @@ __device__ __forceinline__ void load_data(SmemT& smem, SsuIncrementalParams cons
     load_B_cute<input_t, NTOKENS, DSTATE>(smem, B_ptr, B_base, params.B_stride_mtp, lane);
   }
 
-  // ── Warp 1: cp.async C[T, dstate] (swizzled smem) ──
+  // ── Warp 1: cp.async C[T, dstate] (swizzled smem, CuTe TiledCopy) ──
   if (warp == 1) {
-    load_C_cute<input_t, NTOKENS, DSTATE>(smem, C_ptr, C_base, params.C_stride_mtp, lane);
+    load_C_cute_manual<input_t, NTOKENS, DSTATE>(smem, C_ptr, C_base, params.C_stride_mtp, lane);
+    // load_C_cute<input_t, NTOKENS, DSTATE>(smem, C_ptr, C_base, params.C_stride_mtp, lane);
   }
 
   // ── Warp 2: cp.async x[T, dim] ──
@@ -1314,6 +1346,12 @@ void launchSsuIncremental(SsuIncrementalParams& params, cudaStream_t stream) {
 
   FLASHINFER_CHECK(params.nheads % params.ngroups == 0, "nheads (", params.nheads,
                    ") must be divisible by ngroups (", params.ngroups, ")");
+
+  // cp.async.ca with .L2::128B requires 16B-aligned pointers (128-bit / sizeof element).
+  // The .L2::128B hint further requires the base address to be 128B-aligned for full
+  // cache line utilization, but the hardware only faults on < 16B alignment.
+  FLASHINFER_CHECK_ALIGNMENT(params.B, 16);
+  FLASHINFER_CHECK_ALIGNMENT(params.C, 16);
 
   auto dispatch_hpg = [&]<int HEADS_PER_GROUP>() {
     auto func = ssu_incremental_kernel<input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t,
