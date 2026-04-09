@@ -285,23 +285,34 @@ __device__ __forceinline__ void load_C(SmemT& smem, input_t const* __restrict__ 
   }
 }
 
-// Swizzled load: writes to smem using Swizzle<3,3,3> layout for
-// bank-conflict-free ldmatrix access in compute_CB_scaled.
+// Swizzled load via CuTe TiledCopy with ZFILL predicate.
+// Both gmem and smem use NTOKENS_PAD shape. Rows >= NTOKENS are zero-filled
+// in smem without reading from gmem (cp.async ZFILL).
 template <typename input_t, int NTOKENS, int DSTATE, typename SmemT>
 __device__ __forceinline__ void load_B_cute(SmemT& smem, input_t const* __restrict__ B_ptr,
                                             int64_t B_base, int B_stride_mtp, int lane) {
+  using namespace cute;
   constexpr int NTOKENS_PAD = SmemT::NTOKENS_PAD;
-  constexpr int INPUT_PACK = 16 / sizeof(input_t);
-  auto layout = make_swizzled_layout_rc<NTOKENS_PAD, DSTATE>();
-  input_t* base = &smem.B[0][0];
 
-  constexpr int num_packs = NTOKENS * DSTATE / INPUT_PACK;
-  constexpr int packs_per_row = DSTATE / INPUT_PACK;
-  for (int i = lane; i < num_packs; i += warpSize) {
-    int const t = i / packs_per_row;
-    int const col = (i % packs_per_row) * INPUT_PACK;
-    cp_async_16B(base + layout(t, col), &B_ptr[B_base + t * B_stride_mtp + col]);
+  Tensor sB = make_tensor(make_smem_ptr(reinterpret_cast<input_t*>(&smem.B[0][0])),
+                          make_swizzled_layout_rc<NTOKENS_PAD, DSTATE>());
+  Tensor gB = make_tensor(make_gmem_ptr(B_ptr + B_base),
+                          make_layout(make_shape(Int<NTOKENS_PAD>{}, Int<DSTATE>{}),
+                                      make_stride(B_stride_mtp, Int<1>{})));
+
+  auto g2s = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS_ZFILL<uint128_t>, input_t>{},
+                             Layout<Shape<_4, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, _8>>{});
+  auto thr = g2s.get_slice(lane);
+
+  // Row predicate: true for rows < NTOKENS, false for padding (zero-filled, no gmem read)
+  auto id = make_identity_tensor(make_shape(Int<NTOKENS_PAD>{}, Int<DSTATE>{}));
+  auto thr_id = thr.partition_S(id);
+  auto pred = make_tensor<bool>(shape(thr_id));
+  CUTE_UNROLL
+  for (int i = 0; i < size(pred); ++i) {
+    pred(i) = get<0>(thr_id(i)) < NTOKENS;
   }
+  copy_if(g2s, pred, thr.partition_S(gB), thr.partition_D(sB));
 }
 
 // x and z load helpers (flat row-major, single-warp cp.async 16B).
@@ -318,22 +329,31 @@ __device__ __forceinline__ void load_x(SmemT& smem, input_t const* __restrict__ 
   }
 }
 
-// Swizzled x load for matmul 4 B operand.
+// Swizzled x load via CuTe TiledCopy with ZFILL predicate.
 template <typename input_t, int NTOKENS, int DIM, typename SmemT>
 __device__ __forceinline__ void load_x_cute(SmemT& smem, input_t const* __restrict__ x_ptr,
                                             int64_t x_base, int x_stride_mtp, int lane) {
+  using namespace cute;
   constexpr int NTOKENS_PAD = SmemT::NTOKENS_PAD;
-  constexpr int INPUT_PACK = 16 / sizeof(input_t);
-  auto layout = make_swizzled_layout_rc<NTOKENS_PAD, DIM>();
-  input_t* base = &smem.x[0][0];
 
-  constexpr int num_packs = NTOKENS * DIM / INPUT_PACK;
-  constexpr int packs_per_row = DIM / INPUT_PACK;
-  for (int i = lane; i < num_packs; i += warpSize) {
-    int const t = i / packs_per_row;
-    int const col = (i % packs_per_row) * INPUT_PACK;
-    cp_async_16B(base + layout(t, col), &x_ptr[x_base + t * x_stride_mtp + col]);
+  Tensor sX = make_tensor(make_smem_ptr(reinterpret_cast<input_t*>(&smem.x[0][0])),
+                          make_swizzled_layout_rc<NTOKENS_PAD, DIM>());
+  Tensor gX = make_tensor(
+      make_gmem_ptr(x_ptr + x_base),
+      make_layout(make_shape(Int<NTOKENS_PAD>{}, Int<DIM>{}), make_stride(x_stride_mtp, Int<1>{})));
+
+  auto g2s = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS_ZFILL<uint128_t>, input_t>{},
+                             Layout<Shape<_4, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, _8>>{});
+  auto thr = g2s.get_slice(lane);
+
+  auto id = make_identity_tensor(make_shape(Int<NTOKENS_PAD>{}, Int<DIM>{}));
+  auto thr_id = thr.partition_S(id);
+  auto pred = make_tensor<bool>(shape(thr_id));
+  CUTE_UNROLL
+  for (int i = 0; i < size(pred); ++i) {
+    pred(i) = get<0>(thr_id(i)) < NTOKENS;
   }
+  copy_if(g2s, pred, thr.partition_S(gX), thr.partition_D(sX));
 }
 
 template <typename input_t, int NTOKENS, int DIM, typename SmemT>
@@ -349,39 +369,58 @@ __device__ __forceinline__ void load_z(SmemT& smem, input_t const* __restrict__ 
   }
 }
 
-// Swizzled z load for conflict-free partition_C reads in z-gating epilogue.
+// Swizzled z load via CuTe TiledCopy with ZFILL predicate.
 template <typename input_t, int NTOKENS, int DIM, typename SmemT>
 __device__ __forceinline__ void load_z_cute(SmemT& smem, input_t const* __restrict__ z_ptr,
                                             int64_t z_base, int z_stride_mtp, int lane) {
+  using namespace cute;
   constexpr int NTOKENS_PAD = SmemT::NTOKENS_PAD;
-  constexpr int INPUT_PACK = 16 / sizeof(input_t);
-  auto layout = make_swizzled_layout_rc<NTOKENS_PAD, DIM>();
-  input_t* base = &smem.z[0][0];
 
-  constexpr int num_packs = NTOKENS * DIM / INPUT_PACK;
-  constexpr int packs_per_row = DIM / INPUT_PACK;
-  for (int i = lane; i < num_packs; i += warpSize) {
-    int const t = i / packs_per_row;
-    int const col = (i % packs_per_row) * INPUT_PACK;
-    cp_async_16B(base + layout(t, col), &z_ptr[z_base + t * z_stride_mtp + col]);
+  Tensor sZ = make_tensor(make_smem_ptr(reinterpret_cast<input_t*>(&smem.z[0][0])),
+                          make_swizzled_layout_rc<NTOKENS_PAD, DIM>());
+  Tensor gZ = make_tensor(
+      make_gmem_ptr(z_ptr + z_base),
+      make_layout(make_shape(Int<NTOKENS_PAD>{}, Int<DIM>{}), make_stride(z_stride_mtp, Int<1>{})));
+
+  auto g2s = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS_ZFILL<uint128_t>, input_t>{},
+                             Layout<Shape<_4, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, _8>>{});
+  auto thr = g2s.get_slice(lane);
+
+  auto id = make_identity_tensor(make_shape(Int<NTOKENS_PAD>{}, Int<DIM>{}));
+  auto thr_id = thr.partition_S(id);
+  auto pred = make_tensor<bool>(shape(thr_id));
+  CUTE_UNROLL
+  for (int i = 0; i < size(pred); ++i) {
+    pred(i) = get<0>(thr_id(i)) < NTOKENS;
   }
+  copy_if(g2s, pred, thr.partition_S(gZ), thr.partition_D(sZ));
 }
 
+// Swizzled C load via CuTe TiledCopy with ZFILL predicate.
 template <typename input_t, int NTOKENS, int DSTATE, typename SmemT>
 __device__ __forceinline__ void load_C_cute(SmemT& smem, input_t const* __restrict__ C_ptr,
                                             int64_t C_base, int C_stride_mtp, int lane) {
+  using namespace cute;
   constexpr int NTOKENS_PAD = SmemT::NTOKENS_PAD;
-  constexpr int INPUT_PACK = 16 / sizeof(input_t);
-  auto layout = make_swizzled_layout_rc<NTOKENS_PAD, DSTATE>();
-  input_t* base = &smem.C[0][0];
 
-  constexpr int num_packs = NTOKENS * DSTATE / INPUT_PACK;
-  constexpr int packs_per_row = DSTATE / INPUT_PACK;
-  for (int i = lane; i < num_packs; i += warpSize) {
-    int const t = i / packs_per_row;
-    int const col = (i % packs_per_row) * INPUT_PACK;
-    cp_async_16B(base + layout(t, col), &C_ptr[C_base + t * C_stride_mtp + col]);
+  Tensor sC = make_tensor(make_smem_ptr(reinterpret_cast<input_t*>(&smem.C[0][0])),
+                          make_swizzled_layout_rc<NTOKENS_PAD, DSTATE>());
+  Tensor gC = make_tensor(make_gmem_ptr(C_ptr + C_base),
+                          make_layout(make_shape(Int<NTOKENS_PAD>{}, Int<DSTATE>{}),
+                                      make_stride(C_stride_mtp, Int<1>{})));
+
+  auto g2s = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS_ZFILL<uint128_t>, input_t>{},
+                             Layout<Shape<_4, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, _8>>{});
+  auto thr = g2s.get_slice(lane);
+
+  auto id = make_identity_tensor(make_shape(Int<NTOKENS_PAD>{}, Int<DSTATE>{}));
+  auto thr_id = thr.partition_S(id);
+  auto pred = make_tensor<bool>(shape(thr_id));
+  CUTE_UNROLL
+  for (int i = 0; i < size(pred); ++i) {
+    pred(i) = get<0>(thr_id(i)) < NTOKENS;
   }
+  copy_if(g2s, pred, thr.partition_S(gC), thr.partition_D(sC));
 }
 
 // State load helpers (flat and swizzled).
@@ -400,24 +439,25 @@ __device__ __forceinline__ void load_state(SmemT& smem, state_t const* __restric
   }
 }
 
-// Swizzled state load for 2-byte state types (bf16/fp16).
-// Uses Swizzle<3,3,3> on 8×64 atom — same swizzle as B/C.
+// Swizzled state load via CuTe TiledCopy.
+// 128 threads (all warps), thread layout (16,8) stride (8,1).
 template <typename state_t, int DIM, int DSTATE, int NUM_WARPS, typename SmemT>
 __device__ __forceinline__ void load_state_cute(SmemT& smem, state_t const* __restrict__ state_ptr,
                                                 int64_t state_base, int flat_tid) {
+  using namespace cute;
   static_assert(sizeof(state_t) == 2, "load_state_cute requires 2-byte state type");
-  constexpr int num_threads = NUM_WARPS * warpSize;
-  constexpr int STATE_PACK = 16 / sizeof(state_t);  // 8 for 2-byte types
-  constexpr int packs_per_row = DSTATE / STATE_PACK;
-  constexpr int num_state_packs = DIM * DSTATE / STATE_PACK;
-  auto layout = make_swizzled_layout_rc<DIM, DSTATE>();
-  state_t* base = &smem.state[0][0];
+  static_assert(NUM_WARPS * warpSize == 128, "Expected 128 threads for state TiledCopy");
 
-  for (int i = flat_tid; i < num_state_packs; i += num_threads) {
-    int const row = i / packs_per_row;
-    int const col = (i % packs_per_row) * STATE_PACK;
-    cp_async_16B(base + layout(row, col), &state_ptr[state_base + row * DSTATE + col]);
-  }
+  Tensor sState = make_tensor(make_smem_ptr(reinterpret_cast<state_t*>(&smem.state[0][0])),
+                              make_swizzled_layout_rc<DIM, DSTATE>());
+  Tensor gState = make_tensor(
+      make_gmem_ptr(state_ptr + state_base),
+      make_layout(make_shape(Int<DIM>{}, Int<DSTATE>{}), make_stride(Int<DSTATE>{}, Int<1>{})));
+
+  auto g2s = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, state_t>{},
+                             Layout<Shape<_16, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, _8>>{});
+  auto thr = g2s.get_slice(flat_tid);
+  copy(g2s, thr.partition_S(gState), thr.partition_D(sState));
 }
 
 // =============================================================================
