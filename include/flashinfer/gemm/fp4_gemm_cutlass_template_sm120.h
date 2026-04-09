@@ -44,8 +44,8 @@ namespace flashinfer {
 namespace gemm {
 using namespace cute;
 
-// Scheduler dispatch: 0 = cooperative persistent (default), 1 = StreamK, 2 = pingpong persistent
-template <typename T, typename CTA_M_, typename CTA_N_, typename CTA_K_, int SchedulerMode = 0>
+// UseStreamK: false = persistent scheduler (default), true = StreamK scheduler
+template <typename T, typename CTA_M_, typename CTA_N_, typename CTA_K_, bool UseStreamK = false>
 size_t dispatchNVFP4xNVFP4GemmClusterShapeSm120(T* D, void const* A, void const* B,
                                                 void const* input_sf, void const* weight_sf,
                                                 float const* global_sf, int m, int n, int k,
@@ -53,14 +53,9 @@ size_t dispatchNVFP4xNVFP4GemmClusterShapeSm120(T* D, void const* A, void const*
                                                 char* workspace, const size_t workspaceBytes,
                                                 cudaStream_t stream, int* occupancy = nullptr) {
   // For SM120/SM121, only support 1x1x1 cluster shape
-  if constexpr (SchedulerMode == 1) {
+  if constexpr (UseStreamK) {
     return genericFp4GemmKernelLauncherStreamK<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<1>,
                                                cute::Int<1>, cute::Int<1>, _1SM>(
-        D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace,
-        workspaceBytes, stream, occupancy);
-  } else if constexpr (SchedulerMode == 2) {
-    return genericFp4GemmKernelLauncherPingpong<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<1>,
-                                                cute::Int<1>, cute::Int<1>, _1SM>(
         D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace,
         workspaceBytes, stream, occupancy);
   } else {
@@ -90,21 +85,19 @@ size_t dispatchNVFP4xNVFP4GemmClusterShapeSm120(T* D, void const* A, void const*
  * \param occupancy Optional pointer to store kernel occupancy
  * \return Size of workspace required in bytes
  */
-// Helper macro to dispatch tile config with scheduler mode (0=cooperative, 1=streamK, 2=pingpong)
-#define DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, SCHED_MODE)                               \
+// Helper macro to dispatch tile config with scheduler selection
+#define DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, USE_STREAMK)                              \
   return dispatchNVFP4xNVFP4GemmClusterShapeSm120<T, cute::Int<CTA_M>, cute::Int<CTA_N>,    \
-                                                  cute::Int<CTA_K>, SCHED_MODE>(            \
+                                                  cute::Int<CTA_K>, USE_STREAMK>(           \
       D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace, \
       workspaceBytes, stream, occupancy)
 
 // Helper macro to dispatch with scheduler check
-#define DISPATCH_WITH_SCHEDULER(CTA_M, CTA_N, CTA_K) \
-  if (gemmConfig.use_stream_k) {                     \
-    DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, 1);    \
-  } else if (gemmConfig.use_pingpong) {              \
-    DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, 2);    \
-  } else {                                           \
-    DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, 0);    \
+#define DISPATCH_WITH_SCHEDULER(CTA_M, CTA_N, CTA_K)  \
+  if (gemmConfig.use_stream_k) {                      \
+    DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, true);  \
+  } else {                                            \
+    DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, false); \
   }
 
 template <typename T>
@@ -184,22 +177,15 @@ std::vector<CutlassGemmConfig> CutlassFp4GemmRunner<T, fp4GemmType>::getConfigs(
   // SM120/SM121 only supports 1x1x1 cluster shape
   ClusterShape clusterShape = ClusterShape::ClusterShape_1x1x1;
 
-  // Generate configs for all three scheduler variants
+  // Generate configs for both persistent and StreamK schedulers
   for (auto const& tile_config : tilesSm120) {
-    // Cooperative persistent scheduler (default)
+    // Persistent scheduler (default)
     candidateConfigs.push_back(CutlassGemmConfig(tile_config, MainloopScheduleType::AUTO,
-                                                 EpilogueScheduleType::AUTO, clusterShape,
-                                                 /*use_stream_k=*/false, /*use_pingpong=*/false));
+                                                 EpilogueScheduleType::AUTO, clusterShape, false));
 
     // StreamK scheduler - better for small M/N, large K
     candidateConfigs.push_back(CutlassGemmConfig(tile_config, MainloopScheduleType::AUTO,
-                                                 EpilogueScheduleType::AUTO, clusterShape,
-                                                 /*use_stream_k=*/true, /*use_pingpong=*/false));
-
-    // Pingpong warp specialization - two consumer groups alternate tiles
-    candidateConfigs.push_back(CutlassGemmConfig(tile_config, MainloopScheduleType::AUTO,
-                                                 EpilogueScheduleType::AUTO, clusterShape,
-                                                 /*use_stream_k=*/false, /*use_pingpong=*/true));
+                                                 EpilogueScheduleType::AUTO, clusterShape, true));
   }
   return candidateConfigs;
 }
