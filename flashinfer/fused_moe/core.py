@@ -1108,6 +1108,7 @@ def get_trtllm_moe_sm100_module():
                     kwargs["enable_pdl"],
                     [-1, -1] if tactic == -1 else tactic,
                     kwargs.get("norm_topk_prob", True),
+                    kwargs.get("routing_replay_out"),
                 )
             elif (
                 self.dtype_act == DtypeTrtllmGen.E4m3
@@ -1168,6 +1169,7 @@ def get_trtllm_moe_sm100_module():
                         self.fp8_quantization_type,
                         self.activation_type,
                         kwargs.get("norm_topk_prob", True),
+                        kwargs.get("routing_replay_out"),
                     )
                 else:
                     # FP8 per tensor scale
@@ -1266,7 +1268,7 @@ def get_trtllm_moe_sm100_module():
 
     @register_custom_op(
         "flashinfer::trtllm_bf16_moe",
-        mutates_args=(""),
+        mutates_args=("routing_replay_out",),
     )
     def trtllm_bf16_moe_op(
         routing_logits: Optional[torch.Tensor],
@@ -1291,6 +1293,7 @@ def get_trtllm_moe_sm100_module():
         enable_pdl: Optional[bool] = None,
         tune_max_num_tokens: int = 8192,
         norm_topk_prob: bool = True,
+        routing_replay_out: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         assert routing_logits is not None or topk_ids is not None, (
             "either routing_logits or topk_ids must be provided"
@@ -1402,6 +1405,7 @@ def get_trtllm_moe_sm100_module():
             enable_pdl,
             [-1, -1] if tactic == -1 else tactic,
             norm_topk_prob,
+            routing_replay_out,
         )
         if do_finalize:
             return [output]
@@ -1436,7 +1440,9 @@ def get_trtllm_moe_sm100_module():
         enable_pdl: Optional[bool] = None,
         tune_max_num_tokens: int = 8192,
         norm_topk_prob: bool = True,
+        routing_replay_out: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
+        _ = routing_replay_out
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
 
@@ -1613,7 +1619,7 @@ def get_trtllm_moe_sm100_module():
 
     @register_custom_op(
         "flashinfer::trtllm_fp8_block_scale_moe",
-        mutates_args=(""),
+        mutates_args=("routing_replay_out",),
     )
     def trtllm_fp8_block_scale_moe_op(
         routing_logits: Optional[torch.Tensor],
@@ -1644,6 +1650,7 @@ def get_trtllm_moe_sm100_module():
         fp8_quantization_type: Fp8QuantizationType = Fp8QuantizationType.DeepSeekFp8,
         activation_type: int = ActivationType.Swiglu.value,
         norm_topk_prob: bool = True,
+        routing_replay_out: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         # Determine routing mode: compute from logits or use pre-computed
         if routing_logits is None:
@@ -1788,6 +1795,7 @@ def get_trtllm_moe_sm100_module():
             fp8_quantization_type,
             activation_type,
             norm_topk_prob,
+            routing_replay_out,
         )
 
         if do_finalize:
@@ -1833,7 +1841,9 @@ def get_trtllm_moe_sm100_module():
         fp8_quantization_type: Fp8QuantizationType = Fp8QuantizationType.DeepSeekFp8,
         activation_type: int = ActivationType.Swiglu.value,
         norm_topk_prob: bool = True,
+        routing_replay_out: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
+        _ = routing_replay_out
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
 
@@ -2016,6 +2026,7 @@ def get_trtllm_moe_sm100_module():
             output,
             [-1, -1] if tactic == -1 else tactic,
             norm_topk_prob,
+            routing_replay_out,
         )
         if do_finalize:
             return [output]
@@ -2200,6 +2211,7 @@ def get_trtllm_moe_sm100_module():
             output,
             [-1, -1] if tactic == -1 else tactic,
             norm_topk_prob,
+            routing_replay_out,
         )
         if do_finalize:
             return [output]
@@ -2273,6 +2285,7 @@ def trtllm_bf16_moe(
     enable_pdl: bool = True,
     tune_max_num_tokens: int = 8192,
     norm_topk_prob: bool = True,
+    routing_replay_out: Optional[torch.Tensor] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     """BF16 MoE operation with autotuning support.
 
@@ -2338,6 +2351,7 @@ def trtllm_bf16_moe(
         enable_pdl,
         tune_max_num_tokens,
         norm_topk_prob,
+        routing_replay_out,
     )
 
     if do_finalize:
@@ -2369,6 +2383,7 @@ def trtllm_bf16_routed_moe(
     do_finalize: bool = True,
     enable_pdl: bool = True,
     tune_max_num_tokens: int = 8192,
+    routing_replay_out: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     """BF16 MoE operation with autotuning support.
 
@@ -2529,6 +2544,7 @@ def trtllm_fp8_per_tensor_scale_moe(
         tune_max_num_tokens,
         activation_type,
         norm_topk_prob,
+        routing_replay_out,
     )
 
     if do_finalize:
@@ -2567,6 +2583,7 @@ def trtllm_fp8_block_scale_moe(
     fp8_quantization_type: Fp8QuantizationType = Fp8QuantizationType.DeepSeekFp8,
     activation_type: int = ActivationType.Swiglu.value,
     norm_topk_prob: bool = True,
+    routing_replay_out: Optional[torch.Tensor] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     """FP8 block scale MoE operation.
 
@@ -2642,6 +2659,7 @@ def trtllm_fp8_block_scale_moe(
         fp8_quantization_type,
         activation_type,
         norm_topk_prob,
+        routing_replay_out,
     )
 
     if do_finalize:
