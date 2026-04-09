@@ -157,6 +157,20 @@ def chunk_gated_delta_rule(
             Pre-allocated output state tensor of shape
             ``[num_seqs, num_sab_heads, head_size, head_size]``, float32.
             Required if ``output_final_state=True``. Default: ``None``.
+        state_checkpoints (Optional[torch.Tensor]):
+            Pre-allocated checkpoint tensor of shape
+            ``[total_checkpoints, num_sab_heads, head_size, head_size]``, float32.
+            Must be provided when ``checkpoint_every_n_tokens > 0``.
+            Default: ``None``.
+        checkpoint_cu_starts (Optional[torch.Tensor]):
+            Cumulative checkpoint counts of shape ``[num_seqs + 1]``, int64.
+            ``checkpoint_cu_starts[i+1] - checkpoint_cu_starts[i]`` is the number
+            of checkpoints for sequence *i* (= ``seq_len_i // checkpoint_every_n_tokens``).
+            Must be provided when ``checkpoint_every_n_tokens > 0``.
+            Default: ``None``.
+        checkpoint_every_n_tokens (int):
+            Store intermediate state every N tokens. Must be a multiple of
+            the chunk size (64). 0 means disabled (default).
 
     Returns:
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -295,6 +309,11 @@ def chunk_gated_delta_rule(
             )
         )
 
+        # Convert checkpoint_cu_starts from int64 cu_starts to int32 cu_checkpoints
+        _cu_checkpoints = None
+        if checkpoint_every_n_tokens > 0 and checkpoint_cu_starts is not None:
+            _cu_checkpoints = checkpoint_cu_starts.to(torch.int32)
+
         chunk_gated_delta_rule_sm100(
             q,
             k,
@@ -306,6 +325,9 @@ def chunk_gated_delta_rule(
             initial_state,
             output_state if output_final_state else None,
             _scale,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+            cu_checkpoints=_cu_checkpoints,
+            output_checkpoints=state_checkpoints,
         )
     else:
         # SM90 Hopper path (C++ JIT kernel)
