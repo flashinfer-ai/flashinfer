@@ -748,34 +748,40 @@ def _test_trtllm_batch_prefill(
         assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
 
 
+TRTLLM_BATCH_PREFILL_SHAPES = [
+    (4, 16, 2, 1),
+    (4, 32, 4, 5),
+    (4, 64, 4, 8),
+    (128, 16, 2, 5),
+    (128, 32, 4, 1),
+    (128, 64, 2, 8),
+    (256, 16, 4, 8),
+    (256, 32, 2, 8),
+    (256, 64, 4, 1),
+    (256, 64, 4, 5),
+]
+
+
+TRTLLM_BATCH_PREFILL_DTYPES = [
+    ("bf16", "bf16", "bf16"),
+    ("fp16", "fp16", "fp16"),
+    ("fp8", "fp8", "bf16"),
+    ("fp8", "fp8", "fp16"),
+    ("fp8", "fp8", "fp8"),
+    ("fp8", "fp8", "nvfp4"),
+    ("fp8", "nvfp4", "fp8"),
+]
+
+
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
 @pytest.mark.parametrize(
     "batch_size,page_size,num_kv_heads,head_grp_size",
-    [
-        (4, 16, 2, 1),
-        (4, 32, 4, 5),
-        (4, 64, 4, 8),
-        (128, 16, 2, 5),
-        (128, 32, 4, 1),
-        (128, 64, 2, 8),
-        (256, 16, 4, 8),
-        (256, 32, 2, 8),
-        (256, 64, 4, 1),
-        (256, 64, 4, 5),
-    ],
+    TRTLLM_BATCH_PREFILL_SHAPES,
 )
 @pytest.mark.parametrize("window_left", [-1])  # todo(Siyuan): add 127 window_left
 @pytest.mark.parametrize(
     "q_dtype,kv_dtype,o_dtype",
-    [
-        ("bf16", "bf16", "bf16"),
-        ("fp16", "fp16", "fp16"),
-        ("fp8", "fp8", "bf16"),
-        ("fp8", "fp8", "fp16"),
-        ("fp8", "fp8", "fp8"),
-        ("fp8", "fp8", "nvfp4"),
-        ("fp8", "nvfp4", "fp8"),
-    ],
+    TRTLLM_BATCH_PREFILL_DTYPES,
 )
 @pytest.mark.parametrize("enable_pdl", [None])
 @pytest.mark.parametrize("enable_sink", [True, False])
@@ -890,14 +896,19 @@ def test_trtllm_batch_prefill_bs1(
 
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
 @pytest.mark.parametrize(
-    "batch_size,page_size,num_kv_heads,head_grp_size", [(4, 32, 4, 5)]
+    "batch_size,page_size,num_kv_heads,head_grp_size",
+    TRTLLM_BATCH_PREFILL_SHAPES,
 )
-@pytest.mark.parametrize("q_dtype,kv_dtype,o_dtype", [("bf16", "bf16", "bf16")])
-@pytest.mark.parametrize("enable_pdl", [None, False, True])
+@pytest.mark.parametrize(
+    "q_dtype,kv_dtype,o_dtype",
+    TRTLLM_BATCH_PREFILL_DTYPES,
+)
+@pytest.mark.parametrize("enable_pdl", [None])
 @pytest.mark.parametrize("enable_sink", [False, True])
-@pytest.mark.parametrize("max_q_len", [64])
-@pytest.mark.parametrize("max_kv_len", [64])
-@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("max_q_len", [511])
+@pytest.mark.parametrize("max_kv_len", [2047])
+@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize("non_contiguous_query", [False, True])
 @pytest.mark.parametrize("skips_softmax", [False, True])
 @pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
 def test_trtllm_batch_prefill_non_causal(
@@ -914,6 +925,7 @@ def test_trtllm_batch_prefill_non_causal(
     max_q_len: int,
     max_kv_len: int,
     head_dim: int,
+    non_contiguous_query: bool,
     skips_softmax: bool,
     uses_shared_paged_kv_idx: bool,
 ):
@@ -934,6 +946,7 @@ def test_trtllm_batch_prefill_non_causal(
         max_kv_len,
         kv_dtype in ("fp8", "nvfp4"),
         head_dim,
+        non_contiguous_query=non_contiguous_query,
         skips_softmax=skips_softmax,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
     )
