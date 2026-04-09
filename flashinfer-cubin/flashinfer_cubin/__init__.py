@@ -75,6 +75,6 @@ def _get_git_version():
     return "unknown"
 
 
-__version__ = _get_version()
+__version__ = "0.6.7"
 __git_version__ = _get_git_version()
 __all__ = ["get_cubin_dir", "list_cubins", "get_cubin_path", "CUBIN_DIR"]
