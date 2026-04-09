@@ -24,6 +24,7 @@ from cutlass.pipeline import PipelineConsumer
 from types import SimpleNamespace
 
 from ..mla_config import MLAConfig
+from ..config import AttentionFusion
 from ..scheduler.mla_persistent import (
     create_mla_static_tile_scheduler,
     MLAStaticTileSchedulerParams,
@@ -35,9 +36,18 @@ class MLACorrectionRole:
 
     Handles output rescaling across KV tiles and final epilogue (normalize,
     convert dtype, write O and LSE to global memory or split-KV workspace).
+
+    Optionally integrates AttentionVariant.transform_output via the fusion
+    parameter, allowing custom output normalization (e.g. AttentionWithSink).
     """
 
-    def __init__(self, config: MLAConfig, v_dtype=None, o_dtype=None):
+    def __init__(
+        self,
+        config: MLAConfig,
+        fusion: AttentionFusion,
+        v_dtype=None,
+        o_dtype=None,
+    ):
         self.acc_dtype = config.acc_dtype
         self.lse_dtype = config.lse_dtype
         self.mma_qk_tiler = config.mma_qk_tiler
@@ -56,6 +66,10 @@ class MLACorrectionRole:
         self.per_iteration_mma_o = config.per_iteration_mma_o
         self.v_dtype = v_dtype
         self.o_dtype = o_dtype
+
+        self.variant = fusion.variant
+        self.has_output_transform = fusion.variant.has_output_transform
+        self.has_params = fusion.has_params
 
         self.epilogue_exchange_sync_bar = None
 
@@ -317,6 +331,7 @@ class MLACorrectionRole:
         row_max: cutlass.Float32,
         tidx: cutlass.Int32,
         iter_n: int,
+        params: cute.Tensor = None,
     ):
         """Epilogue for a single iter_n slice.
 
@@ -328,12 +343,34 @@ class MLACorrectionRole:
 
         cute.copy(tmem_load_tiled_copy, tTR_tAcc, tTR_rAcc)
 
-        for i in cutlass.range(cute.size(tTR_rAcc), vectorize=True, unroll_full=True):
-            tTR_rAcc[i] = (
-                tTR_rAcc[i]
-                * epilogue_params.output_scale
-                * cute.arch.rcp_approx(row_sum)
+        if cutlass.const_expr(not self.has_output_transform):
+            for i in cutlass.range(
+                cute.size(tTR_rAcc), vectorize=True, unroll_full=True
+            ):
+                tTR_rAcc[i] = (
+                    tTR_rAcc[i]
+                    * epilogue_params.output_scale
+                    * cute.arch.rcp_approx(row_sum)
+                )
+        else:
+            if cutlass.const_expr(self.has_params):
+                self.variant.params = params
+            rcp_d = (
+                cute.arch.rcp_approx(row_sum) if row_max != -self.acc_dtype.inf else 0.0
             )
+            for i in cutlass.range(
+                cute.size(tTR_rAcc), vectorize=False, unroll_full=True
+            ):
+                qo_head_idx = tTR_cO[i][0] + common_params.cta_m_offset
+                tTR_rAcc[i] = self.variant.transform_output(
+                    tTR_rAcc[i],
+                    common_params.blk_coord[2],
+                    common_params.blk_coord[1],
+                    qo_head_idx,
+                    row_max,
+                    rcp_d,
+                    epilogue_params.output_scale,
+                )
 
         tR2G_rO_src = None
         tR2G_rO_dst = tTR_gO
@@ -421,6 +458,7 @@ class MLACorrectionRole:
         row_sum: cutlass.Float32,
         row_max: cutlass.Float32,
         mma_o_handle,
+        params: cute.Tensor = None,
     ):
         """Final epilogue: normalize O, convert dtype, write O and LSE (FP16 single-handle path).
 
@@ -441,7 +479,13 @@ class MLACorrectionRole:
             )
         for iter_n in cutlass.range_constexpr(self.iterations_pv_n):
             self._epilogue_one_iter(
-                common_params, epilogue_params, row_sum, row_max, tidx, iter_n
+                common_params,
+                epilogue_params,
+                row_sum,
+                row_max,
+                tidx,
+                iter_n,
+                params,
             )
         mma_o_handle.release()
 
@@ -457,6 +501,7 @@ class MLACorrectionRole:
         mma_o_consumer: PipelineConsumer,
         compute_common_params: SimpleNamespace,
         epilogue_params: SimpleNamespace,
+        params: cute.Tensor = None,
     ):
         """Tile-scheduler loop for the correction warp.
 
@@ -489,6 +534,7 @@ class MLACorrectionRole:
                     K=cache_seqs[blk_coord[2]],
                     L=compute_common_params.L,
                     H=compute_common_params.H,
+                    cta_m_offset=compute_common_params.cta_m_offset,
                     tmem_ptr=tmem_ptr,
                     tidx=tidx,
                     tiled_mma_pv=pv_tiled_mma,
@@ -553,6 +599,7 @@ class MLACorrectionRole:
                                     row_max,
                                     tidx,
                                     iter_n,
+                                    params,
                                 )
                                 mma_o_handle.release()
                         else:
@@ -563,6 +610,7 @@ class MLACorrectionRole:
                                 row_sum,
                                 row_max,
                                 mma_o_handle,
+                                params,
                             )
 
             tile_sched.advance_to_next_work()

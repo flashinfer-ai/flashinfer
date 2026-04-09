@@ -421,13 +421,17 @@ class AttentionWithSink(AttentionVariant):
 
     @cute.jit
     def update_statistics(self, kv_tile_idx, qo_head_idx, m, d, scale):
-        log2_e = math.log2(math.exp(1.0))
-        sink_raw = (
-            self.params[qo_head_idx] * log2_e / scale if kv_tile_idx == 0 else -math.inf
-        )
-        m_new = sink_raw if sink_raw > m else m
-        rescale = cute.arch.exp2((m - m_new) * scale)
-        d_new = cute.arch.exp2((sink_raw - m_new) * scale) + d * rescale
+        # Guard: on non-first tiles, return (m, d) unchanged.  Computing
+        # with sink_raw = -inf when m is also -inf (initial state on split-KV
+        # CTAs that don't own tile 0) would produce -inf - (-inf) = NaN.
+        m_new = m
+        d_new = d
+        if kv_tile_idx == 0:
+            log2_e = math.log2(math.exp(1.0))
+            sink_raw = self.params[qo_head_idx] * log2_e / scale
+            m_new = sink_raw if sink_raw > m else m
+            rescale = cute.arch.exp2((m - m_new) * scale)
+            d_new = cute.arch.exp2((sink_raw - m_new) * scale) + d * rescale
         return m_new, d_new
 
     @cute.jit

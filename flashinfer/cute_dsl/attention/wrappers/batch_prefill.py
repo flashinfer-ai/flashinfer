@@ -5,10 +5,12 @@
 
 Constructs AttentionConfig + AttentionFusion from user-facing parameters,
 creates the kernel, compiles it via TVM-FFI, and provides the run() interface.
-At compile time, fake tensors describe shapes/strides without GPU allocation.
-At runtime, PyTorch tensors are passed directly — TVM-FFI handles marshaling.
+Compilation is memoized via @functools.cache with symbolic tensor dimensions,
+so kernels are compiled once per (dtype, heads, head_dim, mask, variant) combo
+and reused across batches of any size.
 """
 
+import functools
 import math
 from typing import Optional
 
@@ -24,6 +26,123 @@ from ..config import AttentionConfig, AttentionFusion
 from ..fusion.mask import MaskType
 from ..fusion.variant import AttentionVariant, StandardAttention
 from ..prefill import BlackwellFusedMultiHeadAttentionForward
+
+
+@functools.cache
+def _get_compiled_prefill_kernel(
+    in_dtype,
+    out_dtype,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim,
+    mask_type,
+    window_left,
+    is_persistent,
+    variant,
+    params_shape,
+):
+    """Compile and cache the prefill kernel.
+
+    Uses symbolic dimensions for sequence lengths and batch size so the same
+    compiled kernel can be reused across different batch shapes.  Pass
+    ``variant=None`` for standard attention (always cache-hits); pass the
+    actual variant instance for custom variants (hashable by identity).
+
+    ``AttentionFusion`` is constructed *inside* this function so it never
+    appears in the cache key (it is unhashable).
+    """
+    if variant is None:
+        variant = StandardAttention()
+    fusion = AttentionFusion(variant=variant)
+    h_r = num_qo_heads // num_kv_heads
+
+    config = AttentionConfig(
+        qk_acc_dtype=cutlass.Float32,
+        pv_acc_dtype=cutlass.Float32,
+        mma_tiler=(128, 128, head_dim),
+        is_persistent=is_persistent,
+        mask_type=mask_type,
+        num_repeat_kv_heads=h_r,
+        window_left=window_left,
+    )
+    _dtype_width_map = {
+        cutlass.Float16: 16,
+        cutlass.BFloat16: 16,
+        cutlass.Float8E4M3FN: 8,
+    }
+    config.can_implement(dtype_width=_dtype_width_map[in_dtype])
+    fmha = BlackwellFusedMultiHeadAttentionForward(config, fusion)
+
+    sym_s_q = cute.sym_int()
+    sym_s_k = cute.sym_int()
+    sym_batch_p1 = cute.sym_int()
+
+    q_fake = cute.runtime.make_fake_compact_tensor(
+        in_dtype,
+        (sym_s_q, num_qo_heads, head_dim),
+        stride_order=(2, 1, 0),
+        assumed_align=16,
+    )
+    k_fake = cute.runtime.make_fake_compact_tensor(
+        in_dtype,
+        (sym_s_k, num_kv_heads, head_dim),
+        stride_order=(2, 1, 0),
+        assumed_align=16,
+    )
+    v_fake = cute.runtime.make_fake_compact_tensor(
+        in_dtype,
+        (sym_s_k, num_kv_heads, head_dim),
+        stride_order=(2, 1, 0),
+        assumed_align=16,
+    )
+    o_fake = cute.runtime.make_fake_compact_tensor(
+        out_dtype,
+        (sym_s_q, num_qo_heads, head_dim),
+        stride_order=(2, 1, 0),
+        assumed_align=16,
+    )
+    cum_seqlen_q_fake = cute.runtime.make_fake_compact_tensor(
+        Int32,
+        (sym_batch_p1,),
+        assumed_align=16,
+    )
+    cum_seqlen_k_fake = cute.runtime.make_fake_compact_tensor(
+        Int32,
+        (sym_batch_p1,),
+        assumed_align=16,
+    )
+
+    params_fake = None
+    if params_shape is not None:
+        ndim = len(params_shape)
+        stride_order = tuple(range(ndim - 1, -1, -1))
+        params_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32,
+            params_shape,
+            stride_order=stride_order,
+            assumed_align=16,
+        )
+
+    problem_size = (1, 1, 1, num_qo_heads, num_kv_heads, head_dim)
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
+    return cute.compile(
+        fmha,
+        q_fake,
+        k_fake,
+        v_fake,
+        o_fake,
+        problem_size,
+        cum_seqlen_q_fake,
+        1,
+        cum_seqlen_k_fake,
+        1,
+        0.0,
+        1.0,
+        params_fake,
+        stream_fake,
+        options="--enable-tvm-ffi --opt-level 2",
+    )
 
 
 class BatchPrefillCuteDSLWrapper:
@@ -43,8 +162,6 @@ class BatchPrefillCuteDSLWrapper:
 
         self._in_dtype = None
         self._out_dtype = None
-        self._qk_acc_dtype = cutlass.Float32
-        self._pv_acc_dtype = cutlass.Float32
         self._compiled_fmha = None
 
     @flashinfer_api
@@ -110,8 +227,6 @@ class BatchPrefillCuteDSLWrapper:
         self._device = qo_indptr.device
         self._is_persistent = True
 
-        h_r = num_qo_heads // num_kv_heads
-
         if variant is None:
             variant = StandardAttention()
         self._variant = variant
@@ -154,8 +269,7 @@ class BatchPrefillCuteDSLWrapper:
                 )
             self._params_torch = ep
 
-        self._mma_tiler_mn = (128, 128)
-        self._mma_tiler = (128, 128, self._head_dim)
+        mma_tiler_n = 128
 
         # Determine mask type
         self._mask_type = MaskType.NO_MASK
@@ -164,29 +278,10 @@ class BatchPrefillCuteDSLWrapper:
         elif window_left > 0:
             self._mask_type = MaskType.SLIDING_WINDOW_MASK
         else:
-            if torch.any(s_k % self._mma_tiler_mn[1] != 0).item():
+            if torch.any(s_k % mma_tiler_n != 0).item():
                 self._mask_type = MaskType.RESIDUAL_MASK
 
-        # Build kernel object
-        config = AttentionConfig(
-            qk_acc_dtype=self._qk_acc_dtype,
-            pv_acc_dtype=self._pv_acc_dtype,
-            mma_tiler=self._mma_tiler,
-            is_persistent=self._is_persistent,
-            mask_type=self._mask_type,
-            num_repeat_kv_heads=h_r,
-            window_left=window_left,
-        )
-        _torch_dtype_width = {
-            torch.float16: 16,
-            torch.bfloat16: 16,
-            torch.float8_e4m3fn: 8,
-        }
-        config.can_implement(dtype_width=_torch_dtype_width[q_data_type])
-        fusion = AttentionFusion(variant=self._variant)
-        fmha = BlackwellFusedMultiHeadAttentionForward(config, fusion)
-
-        problem_size = (
+        self._problem_size = (
             self._batch_size,
             max_s_q,
             max_s_k,
@@ -194,81 +289,28 @@ class BatchPrefillCuteDSLWrapper:
             self._num_kv_heads,
             self._head_dim,
         )
-        self._problem_size = problem_size
 
         log2_e = math.log2(math.exp(1.0))
         self._scale_softmax_log2 = self._sm_scale * log2_e
         self._scale_output = 1.0
 
-        # --- Compile with TVM-FFI using fake tensors (no GPU allocation) ---
-        q_fake = cute.runtime.make_fake_compact_tensor(
-            self._in_dtype,
-            (s_q_all, num_qo_heads, self._head_dim),
-            stride_order=(2, 1, 0),
-            assumed_align=16,
+        cache_variant = (
+            self._variant if not isinstance(self._variant, StandardAttention) else None
         )
-        k_fake = cute.runtime.make_fake_compact_tensor(
+        params_shape = tuple(self._params_torch.shape) if self._has_params else None
+
+        self._compiled_fmha = _get_compiled_prefill_kernel(
             self._in_dtype,
-            (s_k_all, num_kv_heads, self._head_dim),
-            stride_order=(2, 1, 0),
-            assumed_align=16,
-        )
-        v_fake = cute.runtime.make_fake_compact_tensor(
-            self._in_dtype,
-            (s_k_all, num_kv_heads, self._head_dim),
-            stride_order=(2, 1, 0),
-            assumed_align=16,
-        )
-        o_fake = cute.runtime.make_fake_compact_tensor(
             self._out_dtype,
-            (s_q_all, num_qo_heads, self._head_dim),
-            stride_order=(2, 1, 0),
-            assumed_align=16,
+            num_qo_heads,
+            num_kv_heads,
+            self._head_dim,
+            self._mask_type,
+            window_left,
+            self._is_persistent,
+            cache_variant,
+            params_shape,
         )
-        cum_seqlen_q_fake = cute.runtime.make_fake_compact_tensor(
-            Int32,
-            (self._batch_size + 1,),
-            assumed_align=16,
-        )
-        cum_seqlen_k_fake = cute.runtime.make_fake_compact_tensor(
-            Int32,
-            (self._batch_size + 1,),
-            assumed_align=16,
-        )
-
-        params_fake = None
-        if self._has_params:
-            params_shape = tuple(self._params_torch.shape)
-            ndim = len(params_shape)
-            stride_order = tuple(range(ndim - 1, -1, -1))
-            params_fake = cute.runtime.make_fake_compact_tensor(
-                cutlass.Float32,
-                params_shape,
-                stride_order=stride_order,
-                assumed_align=16,
-            )
-
-        stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-
-        compiled_fmha = cute.compile(
-            fmha,
-            q_fake,
-            k_fake,
-            v_fake,
-            o_fake,
-            problem_size,
-            cum_seqlen_q_fake,
-            s_q_all,
-            cum_seqlen_k_fake,
-            s_k_all,
-            self._scale_softmax_log2,
-            self._scale_output,
-            params_fake,
-            stream_fake,
-            options="--enable-tvm-ffi --opt-level 2",
-        )
-
-        self._compiled_fmha = compiled_fmha
 
     def _validate_run_inputs(
         self,

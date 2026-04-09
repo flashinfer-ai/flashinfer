@@ -223,6 +223,18 @@ class SoftmaxRole:
                         qo_head_idx,
                         kv_head_idx,
                     )
+            # Re-apply masking: score_mod may map -inf to a finite value
+            # (e.g. SoftCapping: cap*tanh(-inf/cap) = -cap).  Restore -inf
+            # for out-of-bounds positions so they get zero softmax weight.
+            if need_apply_mask:
+                apply_mask(
+                    self.mask_type,
+                    self.window_left,
+                    tTMEM_LOADrS,
+                    tTMEM_LOADcS,
+                    seqlen_k,
+                    seqlen_k - seqlen_q,
+                )
 
         if cutlass.const_expr(not self.has_logits_transform):
             old_row_max = row_max

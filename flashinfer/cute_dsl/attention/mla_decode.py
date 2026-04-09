@@ -20,6 +20,7 @@ import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from .mla_config import MLAConfig
+from .config import AttentionFusion
 from .mla_warp_schedule import MLAWarpSchedule, MLA_DECODE_SCHEDULE
 from .mainloop_spec import make_mla_mainloop_spec
 from .collective_builder import build_mla_launch_params
@@ -65,9 +66,11 @@ class BlackwellMultiLatentAttentionForward:
     def __init__(
         self,
         config: MLAConfig,
+        fusion: AttentionFusion | None = None,
         schedule: MLAWarpSchedule | None = None,
     ):
         self.config = config
+        self.fusion = fusion if fusion is not None else AttentionFusion()
         self.schedule = schedule if schedule is not None else MLA_DECODE_SCHEDULE
         self.mainloop = make_mla_mainloop_spec(config, self.schedule)
         (
@@ -92,6 +95,7 @@ class BlackwellMultiLatentAttentionForward:
         block_split_kvs: Optional[cute.Tensor],
         softmax_scale: cutlass.Float32,
         output_scale: cutlass.Float32,
+        params_in: Optional[cute.Tensor],
         stream,
     ):
         self.q_dtype: Type[cutlass.Numeric] = q_latent.element_type
@@ -169,14 +173,29 @@ class BlackwellMultiLatentAttentionForward:
 
         self.mainloop = self.mainloop.resolve(self.q_dtype.width)
 
+        params = (
+            cute.make_tensor(
+                params_in.iterator,
+                cute.make_layout(
+                    self.fusion.params_shape,
+                    stride=self.fusion.params_strides,
+                ),
+            )
+            if cutlass.const_expr(self.fusion.has_params)
+            else None
+        )
+
         self.pt_loader_role = MLAPageTableLoaderRole(self.config)
         self.loader_role = MLALoaderRole(self.config)
         self.mma_role = MLAMmaRole(self.config, self.mainloop)
-        self.compute_role = MLAComputeRole(self.config)
+        self.compute_role = MLAComputeRole(self.config, fusion=self.fusion)
         self.compute_role.set_dtypes(self.q_dtype)
         self.compute_role.set_barriers(self.softmax_exchange_sync_bar)
         self.correction_role = MLACorrectionRole(
-            self.config, v_dtype=self.v_dtype, o_dtype=self.o_dtype
+            self.config,
+            fusion=self.fusion,
+            v_dtype=self.v_dtype,
+            o_dtype=self.o_dtype,
         )
         self.correction_role.set_barriers(self.epilogue_exchange_sync_bar)
 
@@ -244,6 +263,7 @@ class BlackwellMultiLatentAttentionForward:
             lp.cta_layout_vmnk,
             tile_sched_params,
             lp.SharedStorage,
+            params,
         ).launch(
             grid=grid,
             block=[self.schedule.threads_per_cta, 1, 1],
@@ -329,6 +349,7 @@ class BlackwellMultiLatentAttentionForward:
         cta_layout_vmnk: cute.Layout,
         tile_sched_params: MLAStaticTileSchedulerParams,
         SharedStorage: cutlass.Constexpr,
+        params: Optional[cute.Tensor] = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
@@ -543,6 +564,7 @@ class BlackwellMultiLatentAttentionForward:
                 sP=sP,
                 softmax_scale_log2=softmax_scale_log2,
                 tmem=tmem,
+                params=params,
             )
 
         # /////////////////////////////////////////////////////////////////////
@@ -556,12 +578,16 @@ class BlackwellMultiLatentAttentionForward:
             tmem.wait_for_alloc()
             tmem_ptr_corr = tmem.retrieve_ptr(self.config.acc_dtype)
 
+            cta_m_offset = (bidx % cute.size(tiled_mma_qk.thr_id.shape)) * (
+                self.config.mma_qk_tiler[0] // self.config.cluster_shape_mnk[0]
+            )
             corr_common_params = SimpleNamespace(
                 smem_exchange=epilogue_smem_exchange,
                 mAccO=mAccO,
                 mO=mO,
                 L=mCL.shape[1],
                 H=mQL.shape[0],
+                cta_m_offset=cta_m_offset,
             )
             corr_epilogue_params = SimpleNamespace(
                 output_scale=output_scale,
@@ -579,6 +605,7 @@ class BlackwellMultiLatentAttentionForward:
                 mma_o_consumer=mma_o_cons,
                 compute_common_params=corr_common_params,
                 epilogue_params=corr_epilogue_params,
+                params=params,
             )
 
         return

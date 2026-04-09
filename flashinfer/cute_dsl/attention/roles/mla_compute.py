@@ -32,6 +32,7 @@ from cutlass.cutlass_dsl import BaseDSL
 from types import SimpleNamespace
 
 from ..mla_config import MLAConfig
+from ..config import AttentionFusion
 from ..scheduler.mla_persistent import (
     create_mla_static_tile_scheduler,
     MLAStaticTileSchedulerParams,
@@ -45,9 +46,12 @@ class MLAComputeRole:
 
     Owns the tile-scheduler loop and performs online softmax, producing
     quantized P tiles in SMEM and correction metadata in TMEM.
+
+    Optionally integrates AttentionVariant hooks (score_mod, update_statistics)
+    via the fusion parameter, mirroring the prefill SoftmaxRole pattern.
     """
 
-    def __init__(self, config: MLAConfig):
+    def __init__(self, config: MLAConfig, fusion: AttentionFusion):
         self.acc_dtype = config.acc_dtype
         self.mma_qk_tiler = config.mma_qk_tiler
         self.mma_pv_tiler = config.mma_pv_tiler
@@ -62,6 +66,11 @@ class MLAComputeRole:
         self.tmem_o_offset = config.tmem_o_offset
         self.correction_factor_offset = config.correction_factor_offset
         self.is_var_split_kv = config.is_var_split_kv
+
+        self.variant = fusion.variant
+        self.has_score_mod = fusion.variant.has_score_mod
+        self.has_statistics_update = fusion.variant.has_statistics_update
+        self.has_params = fusion.has_params
 
         self.softmax_reg_num = 192
         self.softmax_exchange_sync_bar = None
@@ -180,12 +189,17 @@ class MLAComputeRole:
         correction_factor: cutlass.Float32,
         is_last_tile: bool,
         is_local_last_tile: cutlass.Boolean,
+        params: cute.Tensor = None,
     ) -> tuple:
         """Online softmax for one k-tile.
 
         Contains the SM100 vs SM103 architecture dispatch for TMEM load,
         masking, exp2, row-max reduction with SMEM exchange, P quantization
         and SMEM store, row-sum accumulation.
+
+        When an AttentionVariant is configured:
+        - update_statistics runs before TMEM load (e.g. attention sink)
+        - score_mod runs after TMEM load + masking, before row_max (e.g. ALiBi)
 
         Side effects co-located with their paired fences:
         - fence_view_async_shared → p_mma_handle.commit()
@@ -223,6 +237,19 @@ class MLAComputeRole:
         tmem_thr_copy = tmem_tiled_copy.get_slice(tidx)
         tTR_tAcc = tmem_thr_copy.partition_S(tAcc)
         tTR_tS = tmem_thr_copy.partition_D(cS)
+
+        # Inject virtual tokens into running (m, d) before loading scores
+        if cutlass.const_expr(self.has_statistics_update):
+            if cutlass.const_expr(self.has_params):
+                self.variant.params = params
+            qo_head_idx_for_stats = tTR_tS[0][0] + common_params.cta_m_offset
+            row_max, row_sum = self.variant.update_statistics(
+                k_index,
+                qo_head_idx_for_stats,
+                row_max,
+                row_sum,
+                softmax_params.softmax_scale_log2,
+            )
 
         tTR_rAcc = cute.make_fragment_like(tTR_tS, self.acc_dtype)
 
@@ -279,6 +306,36 @@ class MLAComputeRole:
                 )
             else:
                 row_max_new = cute.arch.fmax(row_max_new, tTR_rMax[0])
+
+        # Per-element score modification (e.g. ALiBi bias, soft-capping).
+        # Applied after masking, before row_max finalization.  When active,
+        # row_max must be recomputed from the modified scores.
+        if cutlass.const_expr(self.has_score_mod):
+            if cutlass.const_expr(self.has_params and not self.has_statistics_update):
+                self.variant.params = params
+            for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
+                qo_head_idx = tTR_tS[i][0] + common_params.cta_m_offset
+                kv_idx = tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index
+                tTR_rAcc[i] = self.variant.score_mod(
+                    tTR_rAcc[i],
+                    common_params.batch_idx,
+                    common_params.qo_idx,
+                    kv_idx,
+                    qo_head_idx,
+                    0,
+                )
+            # Re-apply masking: score_mod may map -inf to a finite value
+            # (e.g. SoftCapping: cap*tanh(-inf/cap) = -cap).  Restore -inf
+            # for out-of-bounds positions so they get zero softmax weight.
+            if is_last_tile:
+                for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
+                    if not cute.elem_less(
+                        tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index,
+                        common_params.K,
+                    ):
+                        tTR_rAcc[i] = -self.acc_dtype.inf
+            row_max_new = row_max
+            row_max_new = tTR_rAcc.load().reduce(cute.ReductionOp.MAX, row_max_new, 0)
 
         # reduce row_max across warps via SMEM exchange when warps_in_n == 2
         if cutlass.const_expr(self.warps_in_n == 2):
@@ -423,6 +480,7 @@ class MLAComputeRole:
         sP: cute.Tensor,
         softmax_scale_log2: cutlass.Float32,
         tmem,
+        params: cute.Tensor = None,
     ):
         """Top-level entry for the compute warp role.
 
@@ -447,6 +505,10 @@ class MLAComputeRole:
                 split_kv, cache_seqs, block_split_kvs, blk_coord
             )
             if k_tile_count > 0:
+                bidx, _, _ = cute.arch.block_idx()
+                cta_m_offset = (bidx % self.cluster_shape_mnk[0]) * (
+                    self.mma_qk_tiler[0] // self.cluster_shape_mnk[0]
+                )
                 compute_common_params = SimpleNamespace(
                     blk_coord=blk_coord,
                     split_kv=split_kv,
@@ -458,6 +520,9 @@ class MLAComputeRole:
                     L=L,
                     tmem_ptr=tmem_ptr_resolved,
                     tidx=tidx,
+                    batch_idx=blk_coord[2],
+                    qo_idx=blk_coord[1],
+                    cta_m_offset=cta_m_offset,
                 )
                 compute_softmax_params = SimpleNamespace(
                     tiled_mma_qk=tiled_mma_qk,
@@ -494,6 +559,7 @@ class MLAComputeRole:
                         correction_factor,
                         False,
                         False,
+                        params,
                     )
 
                     p_cor_handle = p_cor_producer.acquire_and_advance()
@@ -522,6 +588,7 @@ class MLAComputeRole:
                         correction_factor,
                         k_index == k_tile_total - 1,
                         True,
+                        params,
                     )
                 else:
                     (
@@ -540,6 +607,7 @@ class MLAComputeRole:
                         correction_factor,
                         True,
                         True,
+                        params,
                     )
 
                 # Trailing sync: acquire() without advance — back-pressure only,

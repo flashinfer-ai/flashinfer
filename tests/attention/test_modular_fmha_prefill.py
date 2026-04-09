@@ -1517,6 +1517,137 @@ def test_attention_prefill_rpe(
     torch.testing.assert_close(o, o_ref, rtol=RTOL, atol=ATOL)
 
 
+# ---------------------------------------------------------------------------
+#  14. SoftCapping regression: non-tile-aligned kv_len
+# ---------------------------------------------------------------------------
+
+
+def attention_soft_capping_ref(
+    batch_size,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    causal: bool,
+    sm_scale: float,
+    cap: float,
+) -> torch.Tensor:
+    """Reference SoftCapping attention: cap * tanh(score / cap) before softmax."""
+    qo_len = q.shape[0] // batch_size
+    kv_len = k.shape[0] // batch_size
+    num_qo_heads = q.shape[1]
+    num_kv_heads = k.shape[1]
+    head_dim_qk = q.shape[2]
+    head_dim_vo = v.shape[2]
+
+    if num_qo_heads > num_kv_heads:
+        group_size = num_qo_heads // num_kv_heads
+        k = torch.repeat_interleave(k, group_size, dim=1)
+        v = torch.repeat_interleave(v, group_size, dim=1)
+
+    logits = torch.einsum(
+        "bmhd,bnhd->bhmn",
+        q.view(batch_size, qo_len, num_qo_heads, head_dim_qk).float(),
+        k.view(batch_size, kv_len, num_qo_heads, head_dim_qk).float(),
+    )
+
+    logits = cap * torch.tanh(logits / cap)
+    logits = logits * sm_scale
+
+    if causal:
+        mask = torch.arange(kv_len - qo_len, kv_len, device=q.device).unsqueeze(
+            1
+        ) >= torch.arange(0, kv_len, device=q.device).unsqueeze(0)
+        logits = logits.masked_fill(mask.unsqueeze(0).unsqueeze(0) == 0, float("-inf"))
+
+    p = torch.softmax(logits, dim=-1)
+    o_ref = (
+        torch.einsum(
+            "bhmn,bnhd->bmhd",
+            p,
+            v.view(batch_size, kv_len, num_qo_heads, head_dim_vo).float(),
+        )
+        .contiguous()
+        .view(batch_size * qo_len, num_qo_heads, head_dim_vo)
+        .to(q)
+    )
+
+    return o_ref
+
+
+SOFTCAP_SHAPE_PARAMS = [
+    (1, 128, 200),
+    (1, 200, 200),
+    (2, 128, 300),
+]
+
+
+@pytest.mark.parametrize("batch_size,qo_len,kv_len", SOFTCAP_SHAPE_PARAMS)
+@pytest.mark.parametrize("causal", [False])
+def test_attention_prefill_soft_capping_small_cap(
+    batch_size,
+    qo_len,
+    kv_len,
+    causal,
+):
+    """SoftCapping with small cap and non-tile-aligned kv_len.
+
+    Regression test: score_mod transforms masked -inf to -cap.  With cap=1.0
+    and kv_len not divisible by 128, masked positions leak into softmax.
+    """
+    _skip_if_unsupported(qo_len, kv_len, causal)
+    num_kv_heads = 8
+    cap = 1.0
+
+    torch.manual_seed(42)
+    q = torch.randn(
+        batch_size * qo_len, NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda"
+    )
+    k = torch.randn(
+        batch_size * kv_len, num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda"
+    )
+    v = torch.randn(
+        batch_size * kv_len, num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda"
+    )
+    qo_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+    )
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * kv_len
+    )
+
+    from flashinfer.cute_dsl.attention import SoftCappingAttention
+
+    wrapper = BatchPrefillCuteDSLWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+    )
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        NUM_QO_HEADS,
+        num_kv_heads,
+        HEAD_DIM,
+        head_dim_vo=HEAD_DIM,
+        causal=causal,
+        sm_scale=SM_SCALE,
+        q_data_type=DTYPE,
+        kv_data_type=DTYPE,
+        variant=SoftCappingAttention(cap=cap),
+    )
+    o = wrapper.run(q, k, v)
+
+    o_ref = attention_soft_capping_ref(
+        batch_size,
+        q,
+        k,
+        v,
+        causal,
+        SM_SCALE,
+        cap,
+    )
+
+    torch.testing.assert_close(o, o_ref, rtol=RTOL, atol=ATOL)
+
+
 if __name__ == "__main__":
     test_attention_prefill(4, 1024, 1024, 8, True)
     test_attention_prefill_varlen(

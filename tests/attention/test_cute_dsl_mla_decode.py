@@ -480,3 +480,799 @@ def test_cute_dsl_mla_decode_fp8(batch_size, seq_len_k, page_size, enable_pdl):
     torch.testing.assert_close(
         out.to(torch.float32), ref_out.to(torch.float32), atol=0.1, rtol=0.1
     )
+
+
+# ---------------------------------------------------------------------------
+#  Variant tests: score_mod, update_statistics, transform_output
+# ---------------------------------------------------------------------------
+
+
+def torch_reference_mla_with_variant(
+    q_nope,
+    q_rope,
+    c_latent,
+    c_rope,
+    page_table,
+    cache_seqs,
+    softmax_scale,
+    output_scale,
+    page_size,
+    score_mod_fn=None,
+    sink=None,
+):
+    """PyTorch reference for MLA decode with variant hooks.
+
+    Args:
+        score_mod_fn: callable(score, batch_idx, qo_idx, kv_idx, head_idx) -> score
+        sink: (num_heads,) tensor for attention sink
+    """
+    B, q_len, H, latent_dim = q_nope.shape
+
+    outputs = []
+    for b in range(B):
+        seq_len = cache_seqs[b].item()
+        num_pages_needed = (seq_len + page_size - 1) // page_size
+
+        page_indices = page_table[b, :num_pages_needed]
+        kv_indices = []
+        for p in page_indices:
+            start = p.item() * page_size
+            kv_indices.extend(range(start, start + page_size))
+        kv_indices = kv_indices[:seq_len]
+        kv_indices_t = torch.tensor(kv_indices, device=q_nope.device)
+
+        k_latent = c_latent[kv_indices_t]
+        k_rope = c_rope[kv_indices_t]
+
+        q_lat_b = q_nope[b]
+        q_rope_b = q_rope[b]
+
+        attn_latent = torch.einsum("qhd,kd->qhk", q_lat_b.float(), k_latent.float())
+        attn_rope = torch.einsum("qhd,kd->qhk", q_rope_b.float(), k_rope.float())
+        attn = attn_latent + attn_rope
+
+        if score_mod_fn is not None:
+            for qi in range(q_len):
+                for hi in range(H):
+                    for ki in range(seq_len):
+                        attn[qi, hi, ki] = score_mod_fn(attn[qi, hi, ki], b, qi, ki, hi)
+
+        attn = attn * softmax_scale
+
+        if sink is not None:
+            sink_dev = sink.to(q_nope.device).float()
+            for qi in range(q_len):
+                for hi in range(H):
+                    scores = attn[qi, hi, :]
+                    # sink[hi] is in natural-log domain: effective weight = exp(sink[hi]).
+                    # scores are already multiplied by softmax_scale, so place
+                    # sink[hi] directly as the virtual score (torch.softmax
+                    # computes exp(x_i) / sum(exp(x_j))).
+                    virtual_scores = torch.cat([sink_dev[hi].unsqueeze(0), scores])
+                    weights = torch.softmax(virtual_scores, dim=-1)
+                    real_weights = weights[1:]
+                    out_qh = torch.einsum("k,kd->d", real_weights, k_latent.float())
+                    out_qh = out_qh * output_scale
+                    if qi == 0 and hi == 0:
+                        out_b = torch.zeros(q_len, H, latent_dim, device=q_nope.device)
+                    out_b[qi, hi] = out_qh
+            outputs.append(out_b)
+            continue
+
+        attn = F.softmax(attn, dim=-1)
+        out_b = torch.einsum("qhk,kd->qhd", attn, k_latent.float())
+        out_b = out_b * output_scale
+        outputs.append(out_b)
+
+    return torch.stack(outputs, dim=0)
+
+
+def _make_mla_test_data(batch_size, seq_len_k, page_size, dtype, q_len=1):
+    """Create standard MLA test data (query, kv_cache, block_tables, seq_lens)."""
+    device = torch.device("cuda")
+    num_heads = 128
+    latent_dim = 512
+    rope_dim = 64
+    D_qk = latent_dim + rope_dim
+
+    query = torch.randn(batch_size, q_len, num_heads, D_qk, dtype=dtype, device=device)
+
+    num_pages_per_batch = (seq_len_k + page_size - 1) // page_size
+    total_pages = num_pages_per_batch * batch_size + 10
+    kv_cache = torch.randn(
+        total_pages,
+        page_size,
+        D_qk,
+        dtype=dtype,
+        device=device,
+    )
+
+    block_tables = torch.zeros(
+        batch_size,
+        num_pages_per_batch,
+        dtype=torch.int32,
+        device=device,
+    )
+    for b in range(batch_size):
+        for p in range(num_pages_per_batch):
+            block_tables[b, p] = b * num_pages_per_batch + p
+
+    seq_lens = torch.full((batch_size,), seq_len_k, dtype=torch.int32, device=device)
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device=device)
+
+    return (
+        query,
+        kv_cache,
+        block_tables,
+        seq_lens,
+        workspace_buffer,
+        num_heads,
+        latent_dim,
+        rope_dim,
+    )
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("seq_len_k", [256, 2048])
+@pytest.mark.parametrize("page_size", [64, 128])
+def test_cute_dsl_mla_decode_alibi(batch_size, seq_len_k, page_size):
+    """Test MLA decode with ALiBi variant (score_mod with per-head slopes)."""
+    skip_if_unsupported()
+
+    from flashinfer.cute_dsl.attention.wrappers.batch_mla import (
+        BatchMLADecodeCuteDSLWrapper,
+    )
+    from flashinfer.cute_dsl.attention.fusion.variant import ALiBiAttention
+
+    torch.manual_seed(42)
+    dtype = torch.bfloat16
+
+    (
+        query,
+        kv_cache,
+        block_tables,
+        seq_lens,
+        workspace_buffer,
+        num_heads,
+        latent_dim,
+        rope_dim,
+    ) = _make_mla_test_data(batch_size, seq_len_k, page_size, dtype)
+
+    softmax_scale = 1.0 / (latent_dim**0.5)
+    output_scale = 1.0
+
+    alibi_slopes = ALiBiAttention.get_slopes(num_heads).cuda()
+    variant = ALiBiAttention(alibi_slopes)
+
+    wrapper = BatchMLADecodeCuteDSLWrapper(workspace_buffer)
+    wrapper.plan(
+        kv_lora_rank=latent_dim,
+        qk_rope_head_dim=rope_dim,
+        num_heads=num_heads,
+        page_size=page_size,
+        q_dtype=dtype,
+        is_var_seq=False,
+        variant=variant,
+    )
+    out = wrapper.run(
+        q=query,
+        kv_cache=kv_cache,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=seq_len_k,
+        softmax_scale=softmax_scale,
+        output_scale=output_scale,
+    )
+
+    kv_flat = kv_cache.reshape(-1, latent_dim + rope_dim)
+    c_latent_ref = kv_flat[:, :latent_dim]
+    c_rope_ref = kv_flat[:, latent_dim:]
+    q_nope = query[..., :latent_dim]
+    q_rope = query[..., latent_dim:]
+
+    slopes_cpu = alibi_slopes.float()
+
+    def alibi_score_mod(score, batch_idx, qo_idx, kv_idx, head_idx):
+        return score + slopes_cpu[head_idx].item() * (kv_idx - qo_idx)
+
+    ref_out = torch_reference_mla_with_variant(
+        q_nope,
+        q_rope,
+        c_latent_ref,
+        c_rope_ref,
+        block_tables,
+        seq_lens,
+        softmax_scale,
+        output_scale,
+        page_size,
+        score_mod_fn=alibi_score_mod,
+    )
+    ref_out_cast = ref_out.to(dtype)
+
+    torch.testing.assert_close(out, ref_out_cast, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("seq_len_k", [256, 2048])
+@pytest.mark.parametrize("page_size", [64, 128])
+def test_cute_dsl_mla_decode_soft_capping(batch_size, seq_len_k, page_size):
+    """Test MLA decode with SoftCapping variant (score_mod, no extra_params)."""
+    skip_if_unsupported()
+
+    from flashinfer.cute_dsl.attention.wrappers.batch_mla import (
+        BatchMLADecodeCuteDSLWrapper,
+    )
+    from flashinfer.cute_dsl.attention.fusion.variant import SoftCappingAttention
+
+    torch.manual_seed(42)
+    dtype = torch.bfloat16
+
+    (
+        query,
+        kv_cache,
+        block_tables,
+        seq_lens,
+        workspace_buffer,
+        num_heads,
+        latent_dim,
+        rope_dim,
+    ) = _make_mla_test_data(batch_size, seq_len_k, page_size, dtype)
+
+    softmax_scale = 1.0 / (latent_dim**0.5)
+    output_scale = 1.0
+    cap = 50.0
+
+    variant = SoftCappingAttention(cap=cap)
+
+    wrapper = BatchMLADecodeCuteDSLWrapper(workspace_buffer)
+    wrapper.plan(
+        kv_lora_rank=latent_dim,
+        qk_rope_head_dim=rope_dim,
+        num_heads=num_heads,
+        page_size=page_size,
+        q_dtype=dtype,
+        is_var_seq=False,
+        variant=variant,
+    )
+    out = wrapper.run(
+        q=query,
+        kv_cache=kv_cache,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=seq_len_k,
+        softmax_scale=softmax_scale,
+        output_scale=output_scale,
+    )
+
+    kv_flat = kv_cache.reshape(-1, latent_dim + rope_dim)
+    c_latent_ref = kv_flat[:, :latent_dim]
+    c_rope_ref = kv_flat[:, latent_dim:]
+    q_nope = query[..., :latent_dim]
+    q_rope = query[..., latent_dim:]
+
+    import math
+
+    def soft_capping_score_mod(score, batch_idx, qo_idx, kv_idx, head_idx):
+        return cap * math.tanh(score.item() / cap)
+
+    ref_out = torch_reference_mla_with_variant(
+        q_nope,
+        q_rope,
+        c_latent_ref,
+        c_rope_ref,
+        block_tables,
+        seq_lens,
+        softmax_scale,
+        output_scale,
+        page_size,
+        score_mod_fn=soft_capping_score_mod,
+    )
+    ref_out_cast = ref_out.to(dtype)
+
+    torch.testing.assert_close(out, ref_out_cast, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("seq_len_k", [256, 2048])
+@pytest.mark.parametrize("page_size", [64, 128])
+def test_cute_dsl_mla_decode_attention_sink(batch_size, seq_len_k, page_size):
+    """Test MLA decode with AttentionWithSink (update_statistics + transform_output)."""
+    skip_if_unsupported()
+
+    from flashinfer.cute_dsl.attention.wrappers.batch_mla import (
+        BatchMLADecodeCuteDSLWrapper,
+    )
+    from flashinfer.cute_dsl.attention.fusion.variant import AttentionWithSink
+
+    torch.manual_seed(42)
+    dtype = torch.bfloat16
+    num_heads = 128
+
+    (
+        query,
+        kv_cache,
+        block_tables,
+        seq_lens,
+        workspace_buffer,
+        num_heads,
+        latent_dim,
+        rope_dim,
+    ) = _make_mla_test_data(batch_size, seq_len_k, page_size, dtype)
+
+    softmax_scale = 1.0 / (latent_dim**0.5)
+    output_scale = 1.0
+
+    sink = torch.randn((num_heads,), dtype=dtype, device="cuda")
+    variant = AttentionWithSink(sink)
+
+    wrapper = BatchMLADecodeCuteDSLWrapper(workspace_buffer)
+    wrapper.plan(
+        kv_lora_rank=latent_dim,
+        qk_rope_head_dim=rope_dim,
+        num_heads=num_heads,
+        page_size=page_size,
+        q_dtype=dtype,
+        is_var_seq=False,
+        variant=variant,
+    )
+    out = wrapper.run(
+        q=query,
+        kv_cache=kv_cache,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=seq_len_k,
+        softmax_scale=softmax_scale,
+        output_scale=output_scale,
+    )
+
+    kv_flat = kv_cache.reshape(-1, latent_dim + rope_dim)
+    c_latent_ref = kv_flat[:, :latent_dim]
+    c_rope_ref = kv_flat[:, latent_dim:]
+    q_nope = query[..., :latent_dim]
+    q_rope = query[..., latent_dim:]
+
+    ref_out = torch_reference_mla_with_variant(
+        q_nope,
+        q_rope,
+        c_latent_ref,
+        c_rope_ref,
+        block_tables,
+        seq_lens,
+        softmax_scale,
+        output_scale,
+        page_size,
+        sink=sink.cpu(),
+    )
+    ref_out_cast = ref_out.to(dtype)
+
+    torch.testing.assert_close(out, ref_out_cast, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("seq_len_k", [256, 2048])
+@pytest.mark.parametrize("page_size", [64, 128])
+def test_cute_dsl_mla_decode_rpe(batch_size, seq_len_k, page_size):
+    """Test MLA decode with RPEAttention (score_mod with 2-D per-head bias table)."""
+    skip_if_unsupported()
+
+    from flashinfer.cute_dsl.attention.wrappers.batch_mla import (
+        BatchMLADecodeCuteDSLWrapper,
+    )
+    from flashinfer.cute_dsl.attention.fusion.variant import RPEAttention
+
+    torch.manual_seed(42)
+    dtype = torch.bfloat16
+
+    (
+        query,
+        kv_cache,
+        block_tables,
+        seq_lens,
+        workspace_buffer,
+        num_heads,
+        latent_dim,
+        rope_dim,
+    ) = _make_mla_test_data(batch_size, seq_len_k, page_size, dtype)
+
+    softmax_scale = 1.0 / (latent_dim**0.5)
+    output_scale = 1.0
+
+    max_rel_dist = 64
+    table_size = 2 * max_rel_dist + 1
+    rpe_table = (
+        torch.randn((num_heads, table_size), dtype=torch.float32, device="cuda") * 0.1
+    )
+    variant = RPEAttention(rpe_table, max_rel_dist=max_rel_dist)
+
+    wrapper = BatchMLADecodeCuteDSLWrapper(workspace_buffer)
+    wrapper.plan(
+        kv_lora_rank=latent_dim,
+        qk_rope_head_dim=rope_dim,
+        num_heads=num_heads,
+        page_size=page_size,
+        q_dtype=dtype,
+        is_var_seq=False,
+        variant=variant,
+    )
+    out = wrapper.run(
+        q=query,
+        kv_cache=kv_cache,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=seq_len_k,
+        softmax_scale=softmax_scale,
+        output_scale=output_scale,
+    )
+
+    kv_flat = kv_cache.reshape(-1, latent_dim + rope_dim)
+    c_latent_ref = kv_flat[:, :latent_dim]
+    c_rope_ref = kv_flat[:, latent_dim:]
+    q_nope = query[..., :latent_dim]
+    q_rope = query[..., latent_dim:]
+
+    rpe_cpu = rpe_table.float().cpu()
+
+    def rpe_score_mod(score, batch_idx, qo_idx, kv_idx, head_idx):
+        rel_pos = kv_idx - qo_idx + max_rel_dist
+        rel_pos = max(0, min(rel_pos, table_size - 1))
+        return score + rpe_cpu[head_idx, rel_pos].item()
+
+    ref_out = torch_reference_mla_with_variant(
+        q_nope,
+        q_rope,
+        c_latent_ref,
+        c_rope_ref,
+        block_tables,
+        seq_lens,
+        softmax_scale,
+        output_scale,
+        page_size,
+        score_mod_fn=rpe_score_mod,
+    )
+    ref_out_cast = ref_out.to(dtype)
+
+    torch.testing.assert_close(out, ref_out_cast, atol=1e-2, rtol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# FP8 variant tests
+# ---------------------------------------------------------------------------
+
+
+def _make_fp8_mla_inputs(
+    batch_size, seq_len_k, page_size, num_heads=128, latent_dim=512, rope_dim=64
+):
+    """Helper to create FP8 query/kv/block_tables for variant tests."""
+    device = torch.device("cuda")
+    D_qk = latent_dim + rope_dim
+    query = (
+        torch.randn(batch_size, 1, num_heads, D_qk, dtype=torch.float16, device=device)
+        * 0.1
+    ).to(torch.float8_e4m3fn)
+    num_pages_per_batch = (seq_len_k + page_size - 1) // page_size
+    total_pages = num_pages_per_batch * batch_size + 10
+    kv_cache = (
+        torch.randn(total_pages, page_size, D_qk, dtype=torch.float16, device=device)
+        * 0.1
+    ).to(torch.float8_e4m3fn)
+    block_tables = torch.zeros(
+        batch_size, num_pages_per_batch, dtype=torch.int32, device=device
+    )
+    for b in range(batch_size):
+        for p in range(num_pages_per_batch):
+            block_tables[b, p] = b * num_pages_per_batch + p
+    seq_lens = torch.full((batch_size,), seq_len_k, dtype=torch.int32, device=device)
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device=device)
+    return query, kv_cache, block_tables, seq_lens, workspace_buffer
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("seq_len_k", [128, 512])
+@pytest.mark.parametrize("page_size", [64])
+def test_cute_dsl_mla_decode_fp8_alibi(batch_size, seq_len_k, page_size):
+    """Test FP8 MLA decode with ALiBi variant."""
+    skip_if_unsupported()
+
+    from flashinfer.cute_dsl.attention.wrappers.batch_mla import (
+        BatchMLADecodeCuteDSLWrapper,
+    )
+    from flashinfer.cute_dsl.attention.fusion.variant import ALiBiAttention
+
+    torch.manual_seed(42)
+    num_heads = 128
+    latent_dim = 512
+    rope_dim = 64
+    query, kv_cache, block_tables, seq_lens, workspace_buffer = _make_fp8_mla_inputs(
+        batch_size, seq_len_k, page_size
+    )
+    softmax_scale = 1.0 / (latent_dim**0.5)
+    output_scale = 1.0
+
+    alibi_slopes = ALiBiAttention.get_slopes(num_heads).cuda()
+    variant = ALiBiAttention(alibi_slopes)
+
+    wrapper = BatchMLADecodeCuteDSLWrapper(workspace_buffer)
+    wrapper.plan(
+        kv_lora_rank=latent_dim,
+        qk_rope_head_dim=rope_dim,
+        num_heads=num_heads,
+        page_size=page_size,
+        q_dtype=query.dtype,
+        is_var_seq=False,
+        variant=variant,
+    )
+    out = wrapper.run(
+        q=query,
+        kv_cache=kv_cache,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=seq_len_k,
+        softmax_scale=softmax_scale,
+        output_scale=output_scale,
+    )
+
+    D_qk = latent_dim + rope_dim
+    kv_flat = kv_cache.reshape(-1, D_qk).to(torch.float32)
+    c_latent_ref = kv_flat[:, :latent_dim]
+    c_rope_ref = kv_flat[:, latent_dim:]
+    q_nope = query[..., :latent_dim].to(torch.float32)
+    q_rope = query[..., latent_dim:].to(torch.float32)
+
+    slopes_cpu = alibi_slopes.cpu().float()
+
+    def alibi_score_mod(score, batch_idx, qo_idx, kv_idx, head_idx):
+        return score + slopes_cpu[head_idx].item() * (kv_idx - qo_idx)
+
+    ref_out = torch_reference_mla_with_variant(
+        q_nope,
+        q_rope,
+        c_latent_ref,
+        c_rope_ref,
+        block_tables,
+        seq_lens,
+        softmax_scale,
+        output_scale,
+        page_size,
+        score_mod_fn=alibi_score_mod,
+    )
+    torch.testing.assert_close(
+        out.to(torch.float32), ref_out.to(torch.float32), atol=0.1, rtol=0.1
+    )
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("seq_len_k", [128, 512])
+@pytest.mark.parametrize("page_size", [64])
+def test_cute_dsl_mla_decode_fp8_soft_capping(batch_size, seq_len_k, page_size):
+    """Test FP8 MLA decode with SoftCapping variant."""
+    skip_if_unsupported()
+
+    from flashinfer.cute_dsl.attention.wrappers.batch_mla import (
+        BatchMLADecodeCuteDSLWrapper,
+    )
+    from flashinfer.cute_dsl.attention.fusion.variant import SoftCappingAttention
+
+    torch.manual_seed(42)
+    num_heads = 128
+    latent_dim = 512
+    rope_dim = 64
+    query, kv_cache, block_tables, seq_lens, workspace_buffer = _make_fp8_mla_inputs(
+        batch_size, seq_len_k, page_size
+    )
+    softmax_scale = 1.0 / (latent_dim**0.5)
+    output_scale = 1.0
+    cap = 50.0
+    variant = SoftCappingAttention(cap=cap)
+
+    wrapper = BatchMLADecodeCuteDSLWrapper(workspace_buffer)
+    wrapper.plan(
+        kv_lora_rank=latent_dim,
+        qk_rope_head_dim=rope_dim,
+        num_heads=num_heads,
+        page_size=page_size,
+        q_dtype=query.dtype,
+        is_var_seq=False,
+        variant=variant,
+    )
+    out = wrapper.run(
+        q=query,
+        kv_cache=kv_cache,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=seq_len_k,
+        softmax_scale=softmax_scale,
+        output_scale=output_scale,
+    )
+
+    import math
+
+    D_qk = latent_dim + rope_dim
+    kv_flat = kv_cache.reshape(-1, D_qk).to(torch.float32)
+    c_latent_ref = kv_flat[:, :latent_dim]
+    c_rope_ref = kv_flat[:, latent_dim:]
+    q_nope = query[..., :latent_dim].to(torch.float32)
+    q_rope = query[..., latent_dim:].to(torch.float32)
+
+    def capping_score_mod(score, batch_idx, qo_idx, kv_idx, head_idx):
+        return cap * math.tanh(score.item() / cap)
+
+    ref_out = torch_reference_mla_with_variant(
+        q_nope,
+        q_rope,
+        c_latent_ref,
+        c_rope_ref,
+        block_tables,
+        seq_lens,
+        softmax_scale,
+        output_scale,
+        page_size,
+        score_mod_fn=capping_score_mod,
+    )
+    torch.testing.assert_close(
+        out.to(torch.float32), ref_out.to(torch.float32), atol=0.1, rtol=0.1
+    )
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("seq_len_k", [128, 512])
+@pytest.mark.parametrize("page_size", [64])
+def test_cute_dsl_mla_decode_fp8_attention_sink(batch_size, seq_len_k, page_size):
+    """Test FP8 MLA decode with AttentionWithSink variant."""
+    skip_if_unsupported()
+
+    from flashinfer.cute_dsl.attention.wrappers.batch_mla import (
+        BatchMLADecodeCuteDSLWrapper,
+    )
+    from flashinfer.cute_dsl.attention.fusion.variant import AttentionWithSink
+
+    torch.manual_seed(42)
+    num_heads = 128
+    latent_dim = 512
+    rope_dim = 64
+    query, kv_cache, block_tables, seq_lens, workspace_buffer = _make_fp8_mla_inputs(
+        batch_size, seq_len_k, page_size
+    )
+    softmax_scale = 1.0 / (latent_dim**0.5)
+    output_scale = 1.0
+
+    sink = torch.randn((num_heads,), dtype=torch.bfloat16, device="cuda")
+    variant = AttentionWithSink(sink)
+
+    wrapper = BatchMLADecodeCuteDSLWrapper(workspace_buffer)
+    wrapper.plan(
+        kv_lora_rank=latent_dim,
+        qk_rope_head_dim=rope_dim,
+        num_heads=num_heads,
+        page_size=page_size,
+        q_dtype=query.dtype,
+        is_var_seq=False,
+        variant=variant,
+    )
+    out = wrapper.run(
+        q=query,
+        kv_cache=kv_cache,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=seq_len_k,
+        softmax_scale=softmax_scale,
+        output_scale=output_scale,
+    )
+
+    D_qk = latent_dim + rope_dim
+    kv_flat = kv_cache.reshape(-1, D_qk).to(torch.float32)
+    c_latent_ref = kv_flat[:, :latent_dim]
+    c_rope_ref = kv_flat[:, latent_dim:]
+    q_nope = query[..., :latent_dim].to(torch.float32)
+    q_rope = query[..., latent_dim:].to(torch.float32)
+
+    ref_out = torch_reference_mla_with_variant(
+        q_nope,
+        q_rope,
+        c_latent_ref,
+        c_rope_ref,
+        block_tables,
+        seq_lens,
+        softmax_scale,
+        output_scale,
+        page_size,
+        sink=sink.cpu().to(torch.float32),
+    )
+    torch.testing.assert_close(
+        out.to(torch.float32), ref_out.to(torch.float32), atol=0.1, rtol=0.1
+    )
+
+
+# ---------------------------------------------------------------------------
+# Regression: SoftCapping with non-tile-aligned seq_len
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("batch_size", [1])
+@pytest.mark.parametrize("seq_len_k", [200])
+@pytest.mark.parametrize("page_size", [64])
+def test_cute_dsl_mla_decode_soft_capping_small_cap(batch_size, seq_len_k, page_size):
+    """Expose SoftCapping + last-tile masking interaction.
+
+    With a small cap and seq_len_k not aligned to the 128-element MMA tile,
+    masked-out positions (beyond seq_len_k) are transformed from -inf to -cap
+    by score_mod.  When cap is small (e.g. 1.0), -cap sits within the range of
+    valid scores, giving masked positions non-negligible softmax probability.
+    Those positions carry garbage KV data, corrupting the output.
+
+    This test uses cap=1.0 and seq_len_k=200 (last tile has 72 valid + 56
+    masked elements).  The reference only sums over valid positions, so any
+    leakage from masked positions shows up as a numerical mismatch.
+    """
+    skip_if_unsupported()
+
+    from flashinfer.cute_dsl.attention.wrappers.batch_mla import (
+        BatchMLADecodeCuteDSLWrapper,
+    )
+    from flashinfer.cute_dsl.attention.fusion.variant import SoftCappingAttention
+
+    torch.manual_seed(42)
+    dtype = torch.bfloat16
+
+    (
+        query,
+        kv_cache,
+        block_tables,
+        seq_lens,
+        workspace_buffer,
+        num_heads,
+        latent_dim,
+        rope_dim,
+    ) = _make_mla_test_data(batch_size, seq_len_k, page_size, dtype)
+
+    softmax_scale = 1.0 / (latent_dim**0.5)
+    output_scale = 1.0
+    cap = 1.0
+
+    variant = SoftCappingAttention(cap=cap)
+
+    wrapper = BatchMLADecodeCuteDSLWrapper(workspace_buffer)
+    wrapper.plan(
+        kv_lora_rank=latent_dim,
+        qk_rope_head_dim=rope_dim,
+        num_heads=num_heads,
+        page_size=page_size,
+        q_dtype=dtype,
+        is_var_seq=False,
+        variant=variant,
+    )
+    out = wrapper.run(
+        q=query,
+        kv_cache=kv_cache,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=seq_len_k,
+        softmax_scale=softmax_scale,
+        output_scale=output_scale,
+    )
+
+    kv_flat = kv_cache.reshape(-1, latent_dim + rope_dim)
+    c_latent_ref = kv_flat[:, :latent_dim]
+    c_rope_ref = kv_flat[:, latent_dim:]
+    q_nope = query[..., :latent_dim]
+    q_rope = query[..., latent_dim:]
+
+    import math
+
+    def soft_capping_score_mod(score, batch_idx, qo_idx, kv_idx, head_idx):
+        return cap * math.tanh(score.item() / cap)
+
+    ref_out = torch_reference_mla_with_variant(
+        q_nope,
+        q_rope,
+        c_latent_ref,
+        c_rope_ref,
+        block_tables,
+        seq_lens,
+        softmax_scale,
+        output_scale,
+        page_size,
+        score_mod_fn=soft_capping_score_mod,
+    )
+    ref_out_cast = ref_out.to(dtype)
+
+    torch.testing.assert_close(out, ref_out_cast, atol=1e-2, rtol=1e-2)

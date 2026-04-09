@@ -27,6 +27,8 @@ from flashinfer.cute_dsl.utils import (
     torch_to_cutlass_dtype,
 )
 
+from ..config import AttentionFusion
+from ..fusion.variant import AttentionVariant, StandardAttention
 from ..mla_decode import BlackwellMultiLatentAttentionForward
 from ..mla_decode_fp8 import BlackwellMultiLatentAttentionForwardFP8
 from ..mla_config import MLAConfig
@@ -106,34 +108,115 @@ def _check_can_implement(
         )
 
 
-@functools.cache
-def _get_compiled_mla_kernel(
-    torch_dtype: torch.dtype,
-    torch_out_dtype: torch.dtype,
-    page_size: int,
+def _make_mla_fake_tensors(
+    cutlass_dtype,
+    cutlass_out_dtype,
+    is_workspace_size_zero: bool,
+    is_var_split_kv: bool,
+):
+    """Create fake tensors for MLA kernel compilation (shared by all paths)."""
+    sym_heads = cute.sym_int()
+    sym_latent = cute.sym_int(divisibility=16)
+    sym_seq_q = cute.sym_int()
+    sym_rope = cute.sym_int(divisibility=16)
+    sym_batch = cute.sym_int()
+    sym_kv_batch = cute.sym_int()
+    sym_seq_kv = cute.sym_int()
+    sym_page_count = cute.sym_int()
+    sym_workspace_size = cute.sym_int()
+
+    q_latent_fake = cute.runtime.make_fake_tensor(
+        cutlass_dtype,
+        (sym_batch, sym_seq_q, sym_heads, sym_latent),
+        stride=(cute.sym_int(), cute.sym_int(), cute.sym_int(), 1),
+        assumed_align=16,
+    )
+    q_rope_fake = cute.runtime.make_fake_tensor(
+        cutlass_dtype,
+        (sym_batch, sym_seq_q, sym_heads, sym_rope),
+        stride=(cute.sym_int(), cute.sym_int(), cute.sym_int(), 1),
+        assumed_align=16,
+    )
+    c_latent_fake = cute.runtime.make_fake_tensor(
+        cutlass_dtype,
+        (sym_kv_batch, sym_seq_kv, sym_latent),
+        stride=(cute.sym_int(), cute.sym_int(), 1),
+        assumed_align=16,
+    )
+    c_rope_fake = cute.runtime.make_fake_tensor(
+        cutlass_dtype,
+        (sym_kv_batch, sym_seq_kv, sym_rope),
+        stride=(cute.sym_int(), cute.sym_int(), 1),
+        assumed_align=16,
+    )
+    page_table_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32,
+        (sym_batch, sym_page_count),
+        stride_order=(1, 0),
+        assumed_align=16,
+    )
+    o_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass_out_dtype,
+        (sym_batch, sym_seq_q, sym_heads, sym_latent),
+        stride_order=(3, 2, 1, 0),
+        assumed_align=16,
+    )
+    lse_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32,
+        (sym_batch, sym_seq_q, sym_heads),
+        stride_order=(2, 1, 0),
+        assumed_align=16,
+    )
+    if is_workspace_size_zero:
+        workspace_fake = None
+    else:
+        workspace_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int8,
+            (sym_workspace_size,),
+            assumed_align=32,
+        )
+    cache_seqs_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32,
+        (sym_batch,),
+        assumed_align=16,
+    )
+    if is_var_split_kv:
+        block_split_kvs_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (sym_batch,),
+            assumed_align=16,
+        )
+    else:
+        block_split_kvs_fake = None
+
+    return (
+        q_latent_fake,
+        q_rope_fake,
+        c_latent_fake,
+        c_rope_fake,
+        page_table_fake,
+        o_fake,
+        lse_fake,
+        workspace_fake,
+        cache_seqs_fake,
+        block_split_kvs_fake,
+    )
+
+
+def _make_mla_config(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
+    page_size: int,
+    skip_correction_threshold: float,
     is_persistent: bool,
     is_var_seq: bool,
     is_var_split_kv: bool,
-    skip_correction_threshold: float = 0.0,
-    is_workspace_size_zero: bool = False,
-    enable_pdl: bool = False,
-) -> Callable:
-    """Compile and cache a modular MLA decode kernel.
-
-    Returns a callable that accepts (q_latent, q_rope, c_latent, c_rope,
-    page_table, o, lse, workspace, split_kv_scalar, cache_seqs,
-    block_split_kvs, softmax_scale_scalar, output_scale_scalar).
-
-    All scalar arguments must be pre-wrapped as Int32/Float32.
-    """
+    enable_pdl: bool,
+    is_fp8: bool,
+) -> MLAConfig:
+    """Create an MLAConfig with standard tiler settings."""
     cluster_shape_mnk = (2, 1, 1)
-    cutlass_dtype = torch_to_cutlass_dtype(torch_dtype)
-    cutlass_out_dtype = torch_to_cutlass_dtype(torch_out_dtype)
-
-    is_fp8 = torch_dtype == torch.float8_e4m3fn
-    config = MLAConfig(
+    return MLAConfig(
         latent_dim=kv_lora_rank,
         rope_dim=qk_rope_head_dim,
         acc_dtype=cutlass.Float32,
@@ -153,108 +236,89 @@ def _get_compiled_mla_kernel(
         mma_o_stage=2 if is_fp8 else 1,
     )
 
+
+@functools.cache
+def _compile_mla_kernel(
+    torch_dtype: torch.dtype,
+    torch_out_dtype: torch.dtype,
+    page_size: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    is_persistent: bool,
+    is_var_seq: bool,
+    is_var_split_kv: bool,
+    skip_correction_threshold: float = 0.0,
+    is_workspace_size_zero: bool = False,
+    enable_pdl: bool = False,
+    variant: Optional[AttentionVariant] = None,
+    params_shape: Optional[tuple] = None,
+) -> Callable:
+    """Compile and cache an MLA decode kernel (standard or variant).
+
+    Uses ``@functools.cache`` so repeated calls with the same arguments
+    return the previously compiled kernel in microseconds rather than
+    recompiling (~3 s).  For standard attention pass ``variant=None``
+    (the default); for custom variants pass the variant instance (hashable
+    by identity).
+
+    ``AttentionFusion`` is constructed *inside* this function so it never
+    appears in the cache key (it is unhashable).
+    """
+    if variant is None:
+        variant = StandardAttention()
+    fusion = AttentionFusion(variant=variant)
+
+    cutlass_dtype = torch_to_cutlass_dtype(torch_dtype)
+    cutlass_out_dtype = torch_to_cutlass_dtype(torch_out_dtype)
+
+    is_fp8 = torch_dtype == torch.float8_e4m3fn
+    config = _make_mla_config(
+        kv_lora_rank,
+        qk_rope_head_dim,
+        page_size,
+        skip_correction_threshold,
+        is_persistent,
+        is_var_seq,
+        is_var_split_kv,
+        enable_pdl,
+        is_fp8,
+    )
+
     kernel_obj = (
-        BlackwellMultiLatentAttentionForwardFP8(config)
+        BlackwellMultiLatentAttentionForwardFP8(config, fusion=fusion)
         if is_fp8
-        else BlackwellMultiLatentAttentionForward(config)
+        else BlackwellMultiLatentAttentionForward(config, fusion=fusion)
     )
 
-    # All dimensions as sym_int — this matches the original kernel's use of
-    # mark_compact_shape_dynamic, which makes ALL shapes dynamic CuTe Integers.
-    # Static Python ints would cause cute.assume() to fail with AttributeError
-    # inside initialize_workspace() since it expects DSL Integer types.
-    sym_heads = cute.sym_int()
-    sym_latent = cute.sym_int(divisibility=16)
-    sym_seq_q = cute.sym_int()
-    sym_rope = cute.sym_int(divisibility=16)
-    sym_batch = cute.sym_int()  # query/output batch dimension
-    sym_kv_batch = cute.sym_int()  # KV cache batch dim (flat pool, =1 in paged mode)
-    sym_seq_kv = cute.sym_int()
-    sym_page_count = cute.sym_int()
-    sym_workspace_size = cute.sym_int()
-
-    # q_latent, q_rope, c_latent, c_rope are slices of contiguous tensors on
-    # the last dim (e.g. query[..., :kv_lora_rank]), so they are NOT contiguous:
-    #   stride[-2] = D_qk (original full last dim), not the sliced shape.
-    # Use make_fake_tensor with fully dynamic strides so the compiled kernel
-    # reads actual strides from the runtime tensor.  Last-dim stride is always 1.
-
-    # q_latent: [batch_size, seq_len_q, num_heads, latent_dim] — non-contiguous slice
-    q_latent_fake = cute.runtime.make_fake_tensor(
+    fakes = _make_mla_fake_tensors(
         cutlass_dtype,
-        (sym_batch, sym_seq_q, sym_heads, sym_latent),
-        stride=(cute.sym_int(), cute.sym_int(), cute.sym_int(), 1),
-        assumed_align=16,
-    )
-    # q_rope: [batch_size, seq_len_q, num_heads, rope_dim] — non-contiguous slice
-    q_rope_fake = cute.runtime.make_fake_tensor(
-        cutlass_dtype,
-        (sym_batch, sym_seq_q, sym_heads, sym_rope),
-        stride=(cute.sym_int(), cute.sym_int(), cute.sym_int(), 1),
-        assumed_align=16,
-    )
-    # c_latent: [kv_batch, seq_len_k, latent_dim] — non-contiguous slice
-    # kv_batch is a separate sym_int from query batch: paged KV cache uses a flat
-    # pool so kv_batch=num_pages at runtime, while query batch can be any value.
-    c_latent_fake = cute.runtime.make_fake_tensor(
-        cutlass_dtype,
-        (sym_kv_batch, sym_seq_kv, sym_latent),
-        stride=(cute.sym_int(), cute.sym_int(), 1),
-        assumed_align=16,
-    )
-    # c_rope: [kv_batch, seq_len_k, rope_dim] — non-contiguous slice
-    c_rope_fake = cute.runtime.make_fake_tensor(
-        cutlass_dtype,
-        (sym_kv_batch, sym_seq_kv, sym_rope),
-        stride=(cute.sym_int(), cute.sym_int(), 1),
-        assumed_align=16,
-    )
-    # page_table: [batch_size, page_count] — contiguous
-    page_table_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (sym_batch, sym_page_count),
-        stride_order=(1, 0),
-        assumed_align=16,
-    )
-    # o: [batch_size, seq_len_q, num_heads, latent_dim] — contiguous
-    o_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_out_dtype,
-        (sym_batch, sym_seq_q, sym_heads, sym_latent),
-        stride_order=(3, 2, 1, 0),
-        assumed_align=16,
+        is_workspace_size_zero,
+        is_var_split_kv,
     )
-    # lse: [batch_size, seq_len_q, num_heads] — contiguous
-    lse_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32,
-        (sym_batch, sym_seq_q, sym_heads),
-        stride_order=(2, 1, 0),
-        assumed_align=16,
-    )
-    if is_workspace_size_zero:
-        workspace_fake = None
-    else:
-        # workspace: 1-D int8 buffer. 32-byte alignment because workspace stores
-        # fp32 partial sums internally, requiring stricter alignment than tensors.
-        workspace_fake = cute.runtime.make_fake_compact_tensor(
-            cutlass.Int8,
-            (sym_workspace_size,),
-            assumed_align=32,
-        )
-    # cache_seqs: [batch_size] — int32
-    cache_seqs_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (sym_batch,),
-        assumed_align=16,
-    )
-    # block_split_kvs: [batch_size] — int32 (only needed for is_var_split_kv=True)
-    if is_var_split_kv:
-        block_split_kvs_fake = cute.runtime.make_fake_compact_tensor(
-            cutlass.Int32,
-            (sym_batch,),
+    (
+        q_latent_fake,
+        q_rope_fake,
+        c_latent_fake,
+        c_rope_fake,
+        page_table_fake,
+        o_fake,
+        lse_fake,
+        workspace_fake,
+        cache_seqs_fake,
+        block_split_kvs_fake,
+    ) = fakes
+
+    params_fake = None
+    if params_shape is not None:
+        ndim = len(params_shape)
+        stride_order = tuple(range(ndim - 1, -1, -1))
+        params_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32,
+            params_shape,
+            stride_order=stride_order,
             assumed_align=16,
         )
-    else:
-        block_split_kvs_fake = None
 
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
@@ -273,6 +337,7 @@ def _get_compiled_mla_kernel(
         block_split_kvs_fake,
         Float32(1.0),  # softmax_scale placeholder
         Float32(1.0),  # output_scale placeholder
+        params_fake,
         stream_fake,
         options="--enable-tvm-ffi --opt-level 2",
     )
@@ -319,6 +384,7 @@ class BatchMLADecodeCuteDSLWrapper:
         out_dtype: Optional[torch.dtype] = None,
         is_var_seq: bool = True,
         enable_pdl: Optional[bool] = None,
+        variant: Optional[AttentionVariant] = None,
     ) -> None:
         """Compile (or retrieve cached) MLA decode kernel for the given config.
 
@@ -340,6 +406,9 @@ class BatchMLADecodeCuteDSLWrapper:
             Whether sequence lengths vary across the batch.
         enable_pdl : Optional[bool]
             Whether to enable Programmatic Dependent Launch. Auto-detects if None.
+        variant : Optional[AttentionVariant]
+            Attention variant (ALiBi, SoftCapping, AttentionWithSink, etc.).
+            None uses standard softmax attention.
         """
         self._kv_lora_rank = kv_lora_rank
         self._qk_rope_head_dim = qk_rope_head_dim
@@ -361,6 +430,29 @@ class BatchMLADecodeCuteDSLWrapper:
             device_support_pdl(self._device) if enable_pdl is None else enable_pdl
         )
 
+        if variant is None:
+            variant = StandardAttention()
+        self._variant = variant
+
+        if self._variant.has_logits_transform:
+            raise ValueError(
+                "MLA decode does not support logits_transform. "
+                "Use score_mod, update_statistics, or transform_output instead."
+            )
+
+        self._has_params = self._variant.extra_params is not None
+        if self._has_params:
+            ep = self._variant.extra_params.to(torch.float32).to(self._device)
+            if not ep.is_contiguous():
+                raise ValueError(
+                    f"AttentionVariant.extra_params must be contiguous, "
+                    f"got strides {ep.stride()} for shape {ep.shape}. "
+                    f"Call .contiguous() before returning from extra_params."
+                )
+            self._params_torch = ep
+        else:
+            self._params_torch = None
+
         _check_can_implement(
             torch_dtype=self._q_dtype,
             torch_out_dtype=self._o_dtype,
@@ -374,7 +466,14 @@ class BatchMLADecodeCuteDSLWrapper:
             is_var_split_kv=self._is_var_split_kv,
         )
 
-        self._compiled_kernel = _get_compiled_mla_kernel(
+        self._cache_variant = (
+            self._variant if not isinstance(self._variant, StandardAttention) else None
+        )
+        self._params_shape = (
+            tuple(self._params_torch.shape) if self._has_params else None
+        )
+
+        self._compiled_kernel = _compile_mla_kernel(
             torch_dtype=self._q_dtype,
             torch_out_dtype=self._o_dtype,
             page_size=self._page_size,
@@ -386,6 +485,8 @@ class BatchMLADecodeCuteDSLWrapper:
             skip_correction_threshold=self._skip_correction_threshold,
             is_workspace_size_zero=False,
             enable_pdl=self._enable_pdl,
+            variant=self._cache_variant,
+            params_shape=self._params_shape,
         )
 
     def _validate_run_inputs(
@@ -510,7 +611,7 @@ class BatchMLADecodeCuteDSLWrapper:
         # Re-compile if workspace-zero-ness changed from what was planned
         compiled_kernel = self._compiled_kernel
         if is_workspace_size_zero:
-            compiled_kernel = _get_compiled_mla_kernel(
+            compiled_kernel = _compile_mla_kernel(
                 torch_dtype=self._q_dtype,
                 torch_out_dtype=self._o_dtype,
                 page_size=self._page_size,
@@ -522,6 +623,8 @@ class BatchMLADecodeCuteDSLWrapper:
                 skip_correction_threshold=self._skip_correction_threshold,
                 is_workspace_size_zero=True,
                 enable_pdl=self._enable_pdl,
+                variant=self._cache_variant,
+                params_shape=self._params_shape,
             )
 
         # Output buffer
@@ -557,6 +660,7 @@ class BatchMLADecodeCuteDSLWrapper:
             block_split_kvs,
             Float32(softmax_scale),
             Float32(output_scale),
+            self._params_torch if self._has_params else None,
         )
 
         return out
@@ -741,7 +845,7 @@ def cute_dsl_mla_decode(
     enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
 
     # Get compiled kernel (cached after first compile)
-    compiled_kernel = _get_compiled_mla_kernel(
+    compiled_kernel = _compile_mla_kernel(
         torch_dtype=q_dtype,
         torch_out_dtype=o_dtype,
         page_size=page_size,
@@ -770,6 +874,7 @@ def cute_dsl_mla_decode(
         block_split_kvs,
         Float32(softmax_scale),
         Float32(output_scale),
+        None,  # params_in (no variant in standalone function)
     )
 
     if out is not None:
