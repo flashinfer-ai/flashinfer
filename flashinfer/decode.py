@@ -1187,9 +1187,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         sinks: Optional[torch.Tensor] = None,
         q_len_per_req: Optional[int] = 1,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
-        kv_block_scales: Optional[
-            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-        ] = None,
+        kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor: ...
 
     @overload
@@ -1209,9 +1207,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         sinks: Optional[torch.Tensor] = None,
         q_len_per_req: Optional[int] = 1,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
-        kv_block_scales: Optional[
-            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-        ] = None,
+        kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     @flashinfer_api
@@ -1231,9 +1227,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         sinks: Optional[torch.Tensor] = None,
         q_len_per_req: Optional[int] = 1,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
-        kv_block_scales: Optional[
-            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-        ] = None,
+        kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch decode attention between query and paged kv cache.
 
@@ -1292,14 +1286,22 @@ class BatchDecodeWithPagedKVCacheWrapper:
             enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
 
-        # Unpack kv_block_scales
+        if (
+            k_cache.dtype == torch.uint8 or v_cache.dtype == torch.uint8
+        ) and kv_cache_sf is None:
+            raise ValueError("kv_cache_sf must be provided for NVFP4 KV cache.")
         key_block_scales = None
         value_block_scales = None
-        if kv_block_scales is not None:
-            if isinstance(kv_block_scales, tuple):
-                key_block_scales, value_block_scales = kv_block_scales
-            else:
-                key_block_scales, value_block_scales = kv_block_scales.unbind(dim=1)
+        if kv_cache_sf is not None:
+            if (
+                not isinstance(kv_cache_sf, (tuple, list))
+                or len(kv_cache_sf) != 2
+                or not all(torch.is_tensor(x) for x in kv_cache_sf)
+            ):
+                raise TypeError(
+                    "kv_cache_sf must be a tuple/list of two tensors: (k_scales, v_scales)."
+                )
+            key_block_scales, value_block_scales = kv_cache_sf
 
         if self._kv_layout == "NHD":
             page_size = k_cache.shape[1]
@@ -1371,9 +1373,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             out_dtype = getattr(self, "_cached_o_data_type", None) or q.dtype
             # For NVFP4 KV (uint8 packed), v_cache last dim is head_dim//2;
             # use q's head_dim for output instead
-            out_head_dim = (
-                q.shape[-1] if kv_block_scales is not None else v_cache.shape[-1]
-            )
+            out_head_dim = q.shape[-1] if kv_cache_sf is not None else v_cache.shape[-1]
             out = torch.empty(
                 q.shape[:-1] + (out_head_dim,), dtype=out_dtype, device=q.device
             )
@@ -2251,9 +2251,6 @@ def trtllm_batch_decode_with_kv_cache(
     mask: Optional[torch.Tensor] = None,
     max_q_len: Optional[int] = None,
     cum_seq_lens_q: Optional[torch.Tensor] = None,
-    kv_block_scales: Optional[
-        Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-    ] = None,
     skip_softmax_threshold_scale_factor: Optional[float] = None,
     kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     uses_shared_paged_kv_idx: bool = True,
@@ -2352,9 +2349,15 @@ def trtllm_batch_decode_with_kv_cache(
         Only supported by trtllm-gen backend. Must be provided together with ``max_q_len``.
         When None, all requests use uniform query length specified by ``q_len_per_req``.
 
-    kv_block_scales : Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]] = None
-        Per-block scale factors for NVFP4 KV cache. Either a tuple of (k_scales, v_scales) or
-        a single tensor with shape ``[num_pages, 2, ...]`` that will be unbound along dim=1.
+    skip_softmax_threshold_scale_factor: Optional[float] = None
+        threshold scale factor for skipping softmax operations.
+        Providing a value for this parameter enables skip-softmax sparsity as described in: https://arxiv.org/abs/2512.12087
+        If no value is provided, then standard attention is used.
+        Setting the threshold to a higher value generally increases kernel performance at the cost of accuracy degradation.
+        The actual threshold value equals the provided threshold_scale_factor divided by the context length.
+
+    kv_cache_sf : Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        Per-block scale factors for NVFP4 KV cache, as a tuple of ``(k_scales, v_scales)``.
         Each scale tensor has shape ``[num_pages, num_kv_heads, page_size, head_dim // 16]``
         in HND layout, with dtype ``torch.float8_e4m3fn``.
 
@@ -2365,13 +2368,6 @@ def trtllm_batch_decode_with_kv_cache(
           the kernel reshapes them into ``(16, page_size * head_dim / 16 / 16)`` to satisfy
           TMA's 16-byte box width minimum.
         - The head and batch/page dims can have arbitrary strides.
-
-    skip_softmax_threshold_scale_factor: Optional[float] = None
-        threshold scale factor for skipping softmax operations.
-        Providing a value for this parameter enables skip-softmax sparsity as described in: https://arxiv.org/abs/2512.12087
-        If no value is provided, then standard attention is used.
-        Setting the threshold to a higher value generally increases kernel performance at the cost of accuracy degradation.
-        The actual threshold value equals the provided threshold_scale_factor divided by the context length.
 
     uses_shared_paged_kv_idx : bool = True
         Whether the K and V page indices are shared as a unified index.
@@ -2398,32 +2394,32 @@ def trtllm_batch_decode_with_kv_cache(
             # it doesn't change underlying storage
             k_cache, v_cache = kv_cache.unbind(dim=1)
 
+    if (
+        k_cache.dtype == torch.uint8 or v_cache.dtype == torch.uint8
+    ) and kv_cache_sf is None:
+        raise ValueError("kv_cache_sf must be provided for NVFP4 KV cache.")
     is_nvfp4_kvcache = (
         k_cache.dtype == torch.uint8
         and v_cache.dtype == torch.uint8
-        and kv_block_scales is not None
+        and kv_cache_sf is not None
     )
 
     k_block_scales = None
     v_block_scales = None
     if is_nvfp4_kvcache:
-        if isinstance(kv_block_scales, tuple):
-            k_block_scales, v_block_scales = kv_block_scales
-        else:
-            if kv_block_scales.shape[1] == 1:
-                k_block_scales, v_block_scales = kv_block_scales, kv_block_scales
-            else:
-                assert kv_block_scales.shape[1] == 2, (
-                    "When kv_block_scales is a single tensor, the second dimension must be 1 or 2"
-                )
-                # NOTE(Zihao): unbind transforms [num_pages, 2, ...] to ([num_pages, ...], [num_pages, ...])
-                # it doesn't change underlying storage
-                k_block_scales, v_block_scales = kv_block_scales.unbind(dim=1)
-
+        if (
+            not isinstance(kv_cache_sf, (tuple, list))
+            or len(kv_cache_sf) != 2
+            or not all(torch.is_tensor(x) for x in kv_cache_sf)
+        ):
+            raise TypeError(
+                "kv_cache_sf must be a tuple/list of two tensors: (k_scales, v_scales)."
+            )
+        k_block_scales, v_block_scales = kv_cache_sf
         assert (
             k_block_scales.dtype == torch.float8_e4m3fn
             and v_block_scales.dtype == torch.float8_e4m3fn
-        ), "k/v_block_scales should be float8 dtype."
+        ), "kv_cache_sf tensors should be float8 dtype."
 
     if backend == "auto":
         backend = (
