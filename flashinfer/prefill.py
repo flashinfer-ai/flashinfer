@@ -2069,7 +2069,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         self._block_tables = block_tables
         if self._backend == "trtllm-gen":
-            assert logits_soft_cap == 0.0
+            if logits_soft_cap != 0.0:
+                raise ValueError(
+                    "logits_soft_cap must be 0.0 for trtllm-gen paged KV cache"
+                )
             if not causal and window_left >= 0:
                 raise NotImplementedError(
                     "Sliding-window non-causal attention is not supported for trtllm-gen paged KV cache. "
