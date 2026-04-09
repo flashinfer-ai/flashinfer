@@ -1523,47 +1523,12 @@ __global__ void expandInputRowsKernel(
   asm volatile("griddepcontrol.launch_dependents;");
 #endif
 
-  // Pad zeros in the extra SFs along the N dimension, we do this to ensure there are no nan values
-  // in the padded SF atom
-  if constexpr (is_nvfp4 || is_mxfp8) {
-    int64_t const start_offset = threadIdx.x;
-    int64_t const stride = EXPAND_THREADS_PER_BLOCK;
-    // Use VecSize per thread since we are just writing out zeros so every thread can process a
-    // whole vector
-    int64_t const padded_num_elems_in_col = padded_hidden_size / VecSize;
-    assert(padded_hidden_size % VecSize == 0);
-
-    constexpr int min_num_tokens_alignment =
-        is_nvfp4 ? TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentNVFP4
-                 : TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX;
-    static_assert((min_num_tokens_alignment & (min_num_tokens_alignment - 1)) == 0,
-                  "Min num tokens alignment must be a power of two");
-
-    // Iterate over experts (skipping empty ones) instead of over all potential padding slots.
-    // For decode with 8 active experts out of 128, this skips 120 experts entirely instead
-    // of iterating over 128*128=16384 slots with most being wasted.
-    // The (pad_row x K_element) work is flattened into a 1D loop so all threads participate.
-    // Without flattening, only padded_num_elems_in_col threads (e.g. 64) are active per
-    // pad_row iteration while the rest idle — wasting 75% of threads for hidden_size=2048.
-    for (int64_t expert = blockIdx.x; expert < num_experts_per_node; expert += gridDim.x) {
-      int64_t num_tokens_before_expert = expert_first_token_offset[expert];
-      int64_t num_tokens_after_expert = expert_first_token_offset[expert + 1];
-      int64_t tokens_to_expert = num_tokens_after_expert - num_tokens_before_expert;
-      if (tokens_to_expert == 0) continue;
-      int64_t padded_tokens = TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
-          tokens_to_expert, min_num_tokens_alignment);
-      int64_t num_pad_rows = padded_tokens - tokens_to_expert;
-      int64_t total_sf_writes = num_pad_rows * padded_num_elems_in_col;
-      for (int64_t work_idx = start_offset; work_idx < total_sf_writes; work_idx += stride) {
-        int64_t pad_idx = tokens_to_expert + work_idx / padded_num_elems_in_col;
-        int64_t elem_index = work_idx % padded_num_elems_in_col;
-        writeSF<VecSize, VecSize>(num_tokens_before_expert, expert, /*source_row*/ -1,
-                                  num_tokens_before_expert + pad_idx, elem_index,
-                                  padded_hidden_size, fc1_act_sf_flat,
-                                  /* input_sf */ nullptr);
-      }
-    }
-  }
+  // N-dim SF padding (zeroing extra token rows beyond tokens_to_expert up to MinNDimAlignment)
+  // is intentionally omitted. The CUTLASS grouped GEMM sets gemm_m = tokens_to_expert per expert
+  // and never reads scale factors for rows beyond that. The N-dim padding rows don't correspond
+  // to any valid MMA tiles, so their content doesn't affect correctness.
+  // K-dim SF padding (above, inside the per-token loop) is still required because MMA tiles may
+  // straddle the inter_size boundary within valid rows.
 }
 
 template <class InputActivationsType, class ExpandedActivationsType>
@@ -1585,10 +1550,9 @@ void expandInputRowsKernelLauncher(
 
   static int64_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
   // Note: Launching 8 blocks per SM can fully leverage the memory bandwidth (tested on B200).
-  // The N-dim padding loop is now expert-driven and strides over experts with gridDim.x, so it
-  // works correctly with any grid size. No need to inflate the grid for padding work.
-  int64_t const blocks =
-      std::min(smCount * 8, std::max(num_rows * k, static_cast<int64_t>(num_experts_per_node)));
+  // N-dim SF padding has been removed (CUTLASS grouped GEMM never reads beyond
+  // tokens_to_expert), so the grid is driven purely by the expanded token count.
+  int64_t const blocks = std::min(smCount * 8, std::max(num_rows * k, int64_t{1}));
   int64_t const threads = EXPAND_THREADS_PER_BLOCK;
 
   auto func = [&]() {
@@ -2227,47 +2191,12 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKern
   asm volatile("griddepcontrol.launch_dependents;");
 #endif
 
-  // Pad zeros in the extra SFs along the N dimension, we do this to ensure there are no nan values
-  // in the padded SF atom
-  if constexpr (IsNVFP4 || IsMXFP8) {
-    int64_t const start_offset = threadIdx.x;
-    int64_t const stride = ACTIVATION_THREADS_PER_BLOCK;
-    // Use VecSize per thread since we are just writing out zeros so every thread can process a
-    // whole vector
-    int64_t const padded_num_elems_in_col = padded_inter_size / VecSize;
-    assert(padded_inter_size % VecSize == 0);
-
-    constexpr int64_t min_num_tokens_alignment =
-        IsNVFP4 ? TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentNVFP4
-                : TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX;
-    static_assert((min_num_tokens_alignment & (min_num_tokens_alignment - 1)) == 0,
-                  "Min num tokens alignment must be a power of two");
-
-    // Iterate over experts (skipping empty ones) instead of over all potential padding slots.
-    // For decode with 8 active experts out of 128, this skips 120 experts entirely instead
-    // of iterating over 128*128=16384 slots with most being wasted.
-    // The (pad_row x K_element) work is flattened into a 1D loop so all threads participate.
-    // Without flattening, only padded_num_elems_in_col threads (e.g. 64) are active per
-    // pad_row iteration while the rest idle — wasting 75% of threads for inter_size=768.
-    for (int64_t expert = blockIdx.x; expert < num_experts_per_node; expert += gridDim.x) {
-      int64_t num_tokens_before_expert = expert_first_token_offset[expert];
-      int64_t num_tokens_after_expert = expert_first_token_offset[expert + 1];
-      int64_t tokens_to_expert = num_tokens_after_expert - num_tokens_before_expert;
-      if (tokens_to_expert == 0) continue;
-      int64_t padded_tokens = TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
-          tokens_to_expert, min_num_tokens_alignment);
-      int64_t num_pad_rows = padded_tokens - tokens_to_expert;
-      int64_t total_sf_writes = num_pad_rows * padded_num_elems_in_col;
-      for (int64_t work_idx = start_offset; work_idx < total_sf_writes; work_idx += stride) {
-        int64_t pad_idx = tokens_to_expert + work_idx / padded_num_elems_in_col;
-        int64_t elem_index = work_idx % padded_num_elems_in_col;
-        writeSF<VecSize, VecSize>(num_tokens_before_expert, expert, /*source_row*/ -1,
-                                  num_tokens_before_expert + pad_idx, elem_index, padded_inter_size,
-                                  fc2_act_sf_flat,
-                                  /* input_sf */ nullptr);
-      }
-    }
-  }
+  // N-dim SF padding (zeroing extra token rows beyond tokens_to_expert up to MinNDimAlignment)
+  // is intentionally omitted. The CUTLASS grouped GEMM sets gemm_m = tokens_to_expert per expert
+  // and never reads scale factors for rows beyond that. The N-dim padding rows don't correspond
+  // to any valid MMA tiles, so their content doesn't affect correctness.
+  // K-dim SF padding (above, inside the per-token loop) is still required because MMA tiles may
+  // straddle the inter_size boundary within valid rows.
 }
 
 template <class T, class GemmOutputType, class ScaleBiasType>
@@ -2280,10 +2209,9 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
                   cudaStream_t stream) {
   static int64_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
   // Note: Launching 8 blocks per SM can fully leverage the memory bandwidth (tested on B200).
-  // The N-dim padding loop is now expert-driven and strides over experts with gridDim.x, so it
-  // works correctly with any grid size. No need to inflate the grid for padding work.
-  int64_t const blocks = std::min(
-      smCount * 8, std::max(expanded_num_tokens, static_cast<int64_t>(num_experts_per_node)));
+  // N-dim SF padding has been removed (CUTLASS grouped GEMM never reads beyond
+  // tokens_to_expert), so the grid is driven purely by the expanded token count.
+  int64_t const blocks = std::min(smCount * 8, std::max(expanded_num_tokens, int64_t{1}));
   int64_t const threads = ACTIVATION_THREADS_PER_BLOCK;
 
   auto fn = [&]() {
