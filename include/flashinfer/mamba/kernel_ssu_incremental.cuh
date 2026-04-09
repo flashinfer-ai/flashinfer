@@ -214,8 +214,12 @@ struct SsuIncrementalStorage {
   alignas(16) input_t z[NTOKENS_PAD][DIM];
 
   // CB_scaled converted to input_t (bf16/fp16) for matmul 4 A operand.
-  // Only used when USE_TENSOR_MMA; flat row-major (small matrix, swizzle not worth it).
-  alignas(16) input_t CB_scaled_mma[NTOKENS_PAD][NTOKENS_PAD];
+  // Only used when USE_TENSOR_MMA.
+  // Logical shape [NTOKENS_PAD, NTOKENS_PAD] = [16, 16], but physical row stride = 64
+  // elements (128 bytes = full bank cycle) so Swizzle<3,3,3> eliminates ldmatrix conflicts.
+  // Accessed only through CuTe swizzled layout, never via flat array indexing.
+  static constexpr int CB_MMA_STRIDE = 64;
+  alignas(16) input_t CB_scaled_mma_buf[NTOKENS_PAD * CB_MMA_STRIDE];
 
   // Old cache data loaded by warps 1-2 (consumed in Phase 1 replay)
   input_t old_x[NTOKENS][DIM];
@@ -760,11 +764,14 @@ __device__ __forceinline__ void compute_output_cute(SmemT& smem, SsuIncrementalP
   Tensor smem_state = make_tensor(
       make_smem_ptr(reinterpret_cast<mma_type const*>(&smem.state[0][0])), layout_state_swz);
 
-  // CB_scaled_mma: flat row-major [NTOKENS_PAD, NTOKENS_PAD] (small matrix, no swizzle)
-  auto layout_cb = make_layout(make_shape(Int<NTOKENS_PAD>{}, Int<NTOKENS_PAD>{}),
-                               make_stride(Int<NTOKENS_PAD>{}, _1{}));
+  // CB_scaled_mma: swizzled [NTOKENS_PAD, NTOKENS_PAD] with stride-64 row padding.
+  // Swizzle<3,3,3> on 128-byte rows eliminates ldmatrix bank conflicts.
+  constexpr int CB_STRIDE = SmemT::CB_MMA_STRIDE;
+  auto layout_cb = composition(Swizzle<3, 3, 3>{},
+                               make_layout(make_shape(Int<NTOKENS_PAD>{}, Int<NTOKENS_PAD>{}),
+                                           make_stride(Int<CB_STRIDE>{}, _1{})));
   Tensor smem_CB = make_tensor(
-      make_smem_ptr(reinterpret_cast<mma_type const*>(&smem.CB_scaled_mma[0][0])), layout_cb);
+      make_smem_ptr(reinterpret_cast<mma_type const*>(smem.CB_scaled_mma_buf)), layout_cb);
 
   // x: swizzled [NTOKENS_PAD, DIM] for conflict-free partition_C reads (D*x skip).
   auto layout_x_swz = make_swizzled_layout_rc<NTOKENS_PAD, DIM>();
@@ -1143,14 +1150,21 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
 
     // Convert CB_scaled f32 → input_t for matmul 4 A operand.
     // Padding elements (t or j >= NTOKENS) must be zero for correct mma result.
+    // Written through swizzled layout (stride-64 + Swizzle<3,3,3>) for conflict-free ldmatrix.
     if constexpr (USE_TENSOR_MMA) {
+      using namespace cute;
       constexpr int NTOKENS_PAD = SmemT::NTOKENS_PAD;
+      constexpr int CB_STRIDE = SmemT::CB_MMA_STRIDE;
+      auto layout_cb_swz = composition(
+          Swizzle<3, 3, 3>{}, make_layout(make_shape(Int<NTOKENS_PAD>{}, Int<NTOKENS_PAD>{}),
+                                          make_stride(Int<CB_STRIDE>{}, _1{})));
+      input_t* cb_base = smem.CB_scaled_mma_buf;
       constexpr int total_pad = NTOKENS_PAD * NTOKENS_PAD;
       for (int idx = lane; idx < total_pad; idx += warpSize) {
         int const t = idx / NTOKENS_PAD;
         int const j = idx % NTOKENS_PAD;
         float val = (t < NTOKENS && j < NTOKENS) ? smem.CB_scaled[t][j] : 0.f;
-        convertAndStore(&smem.CB_scaled_mma[t][j], val);
+        convertAndStore(&cb_base[layout_cb_swz(t, j)], val);
       }
     }
   }
