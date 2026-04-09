@@ -154,7 +154,7 @@ __global__ void buildMinLatencyActiveExpertMapsKernel(
     bool const smart_routing, int const cluster_rank, int const cluster_size,
     int const num_experts_smem) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  cudaGridDependencySynchronize();
 #endif
   // Use one block to process the min latency case
   int tid = threadIdx.x;
@@ -247,7 +247,7 @@ __global__ void buildMinLatencyActiveExpertMapsKernel(
     }
   }
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -309,7 +309,7 @@ __global__ void fusedBuildExpertMapsSortFirstTokenKernel(
 
   // Wait PDL before reading token_selected_experts
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  cudaGridDependencySynchronize();
 #endif
 
 // build expert map
@@ -350,7 +350,7 @@ __global__ void fusedBuildExpertMapsSortFirstTokenKernel(
 
 // We are done with compute, launch the dependent kernels while the stores are in flight
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 
   // write to shared memory and global memory
@@ -550,7 +550,7 @@ __global__ void blockExpertPrefixSumKernel(int const* token_selected_experts,
   int const token_id = block_id * kNumTokensPerBlock + threadIdx.x;
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  cudaGridDependencySynchronize();
 #endif
 
   int expanded_token_id = -1;
@@ -579,7 +579,7 @@ __global__ void blockExpertPrefixSumKernel(int const* token_selected_experts,
   }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -633,7 +633,7 @@ __global__ void globalExpertPrefixSumLargeKernel(int const* blocked_expert_count
   int cnt = 0;
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  cudaGridDependencySynchronize();
 #endif
 
   // Note: Because of limited registers, cannot store thread-level prefix sum or enable #pragma
@@ -662,7 +662,7 @@ __global__ void globalExpertPrefixSumLargeKernel(int const* blocked_expert_count
   }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -676,7 +676,7 @@ __global__ void globalExpertPrefixSumKernel(int const* blocked_expert_counts,
   __shared__ typename BlockScan::TempStorage temp_storage;
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  cudaGridDependencySynchronize();
 #endif
 
   int const cnt = threadIdx.x < num_experts_per_node * num_blocks_per_seq
@@ -696,7 +696,7 @@ __global__ void globalExpertPrefixSumKernel(int const* blocked_expert_counts,
   }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -759,7 +759,7 @@ __global__ void mergeExpertPrefixSumKernel(int const* blocked_expert_counts,
   int const token_id = block_id * blockDim.x + threadIdx.x;
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  cudaGridDependencySynchronize();
 #endif
 
   int const cnt = blocked_expert_counts[target_expert_id * num_blocks_per_seq + block_id];
@@ -774,7 +774,7 @@ __global__ void mergeExpertPrefixSumKernel(int const* blocked_expert_counts,
   }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -1241,7 +1241,7 @@ __global__ void computeStridesTmaWarpSpecializedKernel(
   }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  cudaGridDependencySynchronize();
 #endif
 
   // Both gemms use the same token offset
@@ -1281,7 +1281,7 @@ __global__ void computeStridesTmaWarpSpecializedKernel(
   // For decode (1 token, top_k=8, 128 experts), this skips ~120 of 128 experts.
   if (gemm_m == 0) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    asm volatile("griddepcontrol.launch_dependents;");
+    cudaTriggerProgrammaticLaunchCompletion();
 #endif
     return;
   }
@@ -1331,7 +1331,7 @@ __global__ void computeStridesTmaWarpSpecializedKernel(
           quant_params.groupwise.fc2.weight_scales),
       bias2, gemm2_output, router_scales, permuted_row_to_unpermuted_row, expert);
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -1398,7 +1398,7 @@ __global__ void expandInputRowsKernel(
                 "of the expansion");
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  cudaGridDependencySynchronize();
 #endif
 
   constexpr int VecSize = is_nvfp4 ? TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize
@@ -1520,7 +1520,7 @@ __global__ void expandInputRowsKernel(
   }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 
   // N-dim SF padding (zeroing extra token rows beyond tokens_to_expert up to MinNDimAlignment)
@@ -1683,7 +1683,7 @@ __global__ void finalizeMoeRoutingKernel(
   auto* reduced_row_ptr_v = reinterpret_cast<OutputElem*>(reduced_row_ptr);
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  cudaGridDependencySynchronize();
 #endif
 
 #pragma unroll
@@ -1719,7 +1719,7 @@ __global__ void finalizeMoeRoutingKernel(
     reduced_row_ptr_v[elem_index] = output_elem;
   }
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -1739,7 +1739,7 @@ __global__ void finalizeMoeRoutingNoFillingKernel(
   assert(unpadded_cols <= padded_cols);
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  cudaGridDependencySynchronize();
 #endif
 
   int64_t const num_valid_tokens = expert_first_token_offset[num_experts_per_node];
@@ -1822,7 +1822,7 @@ __global__ void finalizeMoeRoutingNoFillingKernel(
     }
   }
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -2073,7 +2073,7 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKern
   int64_t const num_valid_tokens = expert_first_token_offset[num_experts_per_node];
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  cudaGridDependencySynchronize();
 #endif
   for (int64_t token = blockIdx.x; token < num_valid_tokens; token += gridDim.x) {
     size_t gemm_result_offset = token * inter_size * gated_size_mul;
@@ -2188,7 +2188,7 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKern
   }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 
   // N-dim SF padding (zeroing extra token rows beyond tokens_to_expert up to MinNDimAlignment)
