@@ -502,7 +502,12 @@ def sdpa_paged_reference(
     """
     sm_scale = 1.0 / (head_dim**0.5)
     batch_size = q_lens.shape[0]
-    q_indptr = torch.cat([torch.tensor([0]), torch.cumsum(q_lens, dim=0)])
+    q_indptr = torch.cat(
+        [
+            torch.zeros(1, dtype=q_lens.dtype, device=q_lens.device),
+            torch.cumsum(q_lens, dim=0),
+        ]
+    )
     outputs = []
     for b in range(batch_size):
         q_start = q_indptr[b].item()
@@ -557,7 +562,7 @@ def sdpa_paged_reference(
         q_pos = torch.arange(q_len, device=q_b.device).unsqueeze(1) + kv_offset
         k_pos = torch.arange(s_len, device=q_b.device).unsqueeze(0)
         causal_mask = k_pos <= q_pos  # [q_len, s_len]
-        if window_left > 0:
+        if window_left >= 0:
             causal_mask = causal_mask & (q_pos - k_pos <= window_left)
         attn_mask = causal_mask.unsqueeze(0).expand(num_qo_heads, -1, -1)
 
@@ -681,7 +686,10 @@ def _test_trtllm_batch_prefill(
     sink = torch.rand(num_qo_heads, device=GPU_DEVICE, dtype=torch.float32) * 5
     if head_dim > 256:
         # FlashInfer's own FA2/FA3 kernels don't support head_dim > 256;
-        # fall back to a PyTorch SDPA reference.
+        # fall back to a PyTorch SDPA reference (causal/windowed only, no sink support).
+        assert not enable_sink, (
+            "SDPA fallback does not model attention sinks; skip sink+head_dim>256 cases"
+        )
         output_ref = sdpa_paged_reference(
             ref_q,
             ref_kv_cache,
@@ -1126,7 +1134,10 @@ def _test_trtllm_batch_decode(
     sink = torch.rand(num_qo_heads, device=GPU_DEVICE, dtype=torch.float32) * 5
     if head_dim > 256:
         # FlashInfer's own FA2/FA3 kernels don't support head_dim > 256;
-        # fall back to a PyTorch SDPA reference.
+        # fall back to a PyTorch SDPA reference (causal/windowed only, no sink support).
+        assert not enable_sink, (
+            "SDPA fallback does not model attention sinks; skip sink+head_dim>256 cases"
+        )
         output_ref = sdpa_paged_reference(
             ref_q,
             ref_kv_cache,
