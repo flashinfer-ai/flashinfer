@@ -895,6 +895,7 @@ def get_trtllm_moe_sm100_module():
             use_shuffled_weight: bool = False,
             weight_layout: int = WeightLayout.MajorK,
             use_packed_weights: bool = False,
+            use_per_token_scaling: bool = False,
         ):
             self.num_local_experts = num_local_experts
             self.top_k = top_k
@@ -907,6 +908,7 @@ def get_trtllm_moe_sm100_module():
             self.use_shuffled_weight = use_shuffled_weight
             self.weight_layout = WeightLayout(weight_layout)
             self.use_packed_weights = use_packed_weights
+            self.use_per_token_scaling = use_per_token_scaling
 
         def _make_tuning_config(
             self,
@@ -1020,6 +1022,7 @@ def get_trtllm_moe_sm100_module():
                 self.activation_type,
                 self.use_shuffled_weight,
                 self.weight_layout,
+                self.use_per_token_scaling,
                 num_tokens,
             )
             if instance_key not in MoERunner.valid_tactics_dict:
@@ -1945,6 +1948,7 @@ def get_trtllm_moe_sm100_module():
             activation_type=activation_type,
             weight_layout=WeightLayout.MajorK,
             use_shuffled_weight=True,
+            use_per_token_scaling=per_token_scale is not None,
         )
         moe_inputs = MoEInputs(
             output=output,
