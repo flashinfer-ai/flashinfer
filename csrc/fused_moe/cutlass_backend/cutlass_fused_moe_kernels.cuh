@@ -1555,6 +1555,23 @@ void expandInputRowsKernelLauncher(
   int64_t const blocks = std::min(smCount * 8, std::max(num_rows * k, int64_t{1}));
   int64_t const threads = EXPAND_THREADS_PER_BLOCK;
 
+  // TODO(bryu): Remove after validation. Poison the SF buffer with 0xFF to verify that
+  // the CUTLASS grouped GEMM does not read N-dim padding positions. The kernel will
+  // overwrite valid positions; any remaining 0xFF in padding positions should not
+  // affect results if the GEMM correctly ignores them.
+  if (fc1_act_sf_flat) {
+#ifdef ENABLE_FP4
+    auto constexpr scaling_type =
+        std::is_same_v<ExpandedActivationsType, __nv_fp4_e2m1>
+            ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4
+            : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
+    int64_t const sf_buffer_size =
+        getOffsetActivationSF(num_experts_per_node, num_rows * k, hidden_size, scaling_type) *
+        sizeof(TmaWarpSpecializedGroupedGemmInput::ElementSF);
+    cudaMemsetAsync(fc1_act_sf_flat, 0xFF, sf_buffer_size, stream);
+#endif
+  }
+
   auto func = [&]() {
 #ifdef ENABLE_FP8
     // Always MXFP8
@@ -2213,6 +2230,20 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
   // tokens_to_expert), so the grid is driven purely by the expanded token count.
   int64_t const blocks = std::min(smCount * 8, std::max(expanded_num_tokens, int64_t{1}));
   int64_t const threads = ACTIVATION_THREADS_PER_BLOCK;
+
+  // TODO(bryu): Remove after validation. Poison the FC2 SF buffer with 0xFF.
+  if (fc2_act_sf_flat) {
+#ifdef ENABLE_FP4
+    auto constexpr scaling_type =
+        std::is_same_v<T, __nv_fp4_e2m1>
+            ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4
+            : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
+    int64_t const sf_buffer_size =
+        getOffsetActivationSF(num_experts_per_node, expanded_num_tokens, inter_size, scaling_type) *
+        sizeof(TmaWarpSpecializedGroupedGemmInput::ElementSF);
+    cudaMemsetAsync(fc2_act_sf_flat, 0xFF, sf_buffer_size, stream);
+#endif
+  }
 
   auto fn = [&]() {
     auto fn = [&](auto block_scaling_type) {
