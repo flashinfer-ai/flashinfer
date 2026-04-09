@@ -178,12 +178,13 @@ def get_batch_indices_positions(
     dtype = torch.int32
 
     if batch_indices is None:
-        batch_indices = torch.empty((nnz,), device=device, dtype=dtype)
+        batch_indices = torch.full((nnz,), -1, device=device, dtype=dtype)
     else:
         check_shape_dtype_device(batch_indices, (nnz,), dtype, device, "batch_indices")
+        batch_indices.fill_(-1)
 
     if positions is None:
-        positions = torch.empty((nnz,), device=device, dtype=dtype)
+        positions = torch.zeros((nnz,), device=device, dtype=dtype)
     else:
         check_shape_dtype_device(positions, (nnz,), dtype, device, "positions")
 

@@ -32,6 +32,7 @@ import torch
 from cutlass import Float32, Int32, Uint8
 
 from ..api_logging import flashinfer_api
+from ..utils import device_support_pdl
 from .fp4_common import (
     # Constants
     FLOAT4_E2M1_MAX,
@@ -265,6 +266,7 @@ class RMSNormFP4QuantKernel:
         mGlobalScale: cute.Tensor,
         M: Int32,
         eps: Float32,
+        enable_pdl: cutlass.Constexpr[bool],
         stream,
     ):
         """Host function to launch the kernel.
@@ -288,7 +290,9 @@ class RMSNormFP4QuantKernel:
         tiler_mn = (self.rows_per_block, self.cols_per_tile)
 
         # Launch with cluster support
-        self.kernel(mX, mW, mY, mS, mGlobalScale, M, eps, tv_layout, tiler_mn).launch(
+        self.kernel(
+            mX, mW, mY, mS, mGlobalScale, M, eps, enable_pdl, tv_layout, tiler_mn
+        ).launch(
             grid=[cute.ceil_div(M, self.rows_per_block), self.cluster_n, 1],
             block=[self.num_threads, 1, 1],
             cluster=[1, self.cluster_n, 1]
@@ -296,6 +300,7 @@ class RMSNormFP4QuantKernel:
             else None,
             smem=self._smem_size_in_bytes(),
             stream=stream,
+            use_pdl=enable_pdl,
         )
 
     @cute.kernel
@@ -308,6 +313,7 @@ class RMSNormFP4QuantKernel:
         mGlobalScale: cute.Tensor,
         M: Int32,
         eps: Float32,
+        enable_pdl: cutlass.Constexpr[bool],
         tv_layout: cute.Layout,
         tiler_mn: cute.Shape,
     ):
@@ -319,6 +325,9 @@ class RMSNormFP4QuantKernel:
         """
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
+
+        if enable_pdl:
+            cute.arch.griddepcontrol_wait()
 
         H = self.H
         block_size = self.block_size
@@ -641,6 +650,9 @@ class RMSNormFP4QuantKernel:
                         )
                         st_global_u64(out_ptr, packed64_c1)
 
+        if enable_pdl:
+            cute.arch.griddepcontrol_launch_dependents()
+
 
 # =============================================================================
 # PyTorch API Functions - Streamlined with Pointer-based Compilation
@@ -655,6 +667,7 @@ def _get_compiled_kernel(
     sm_version: int,
     scale_format: str,
     is_sf_swizzled_layout: bool,
+    enable_pdl: bool = False,
 ) -> Callable:
     """
     Get a compiled kernel closure that takes torch.Tensor directly.
@@ -725,6 +738,7 @@ def _get_compiled_kernel(
         global_scale_fake,
         Int32(1),  # Dummy M
         Float32(1e-6),  # Dummy eps
+        enable_pdl,
         stream_fake,
         options="--enable-tvm-ffi",
     )
@@ -768,6 +782,7 @@ def rmsnorm_fp4quant(
     block_size: int = 16,
     scale_format: str | None = None,
     is_sf_swizzled_layout: bool = False,
+    enable_pdl: bool | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Fused RMS normalization with FP4 quantization using CuTe-DSL.
@@ -861,6 +876,9 @@ def rmsnorm_fp4quant(
     )
     sm_version = get_sm_version(input.device)
 
+    if enable_pdl is None or enable_pdl:
+        enable_pdl = device_support_pdl(input.device)
+
     # Allocate output tensors if not provided
     if y_fp4 is None:
         if is_3d:
@@ -928,6 +946,7 @@ def rmsnorm_fp4quant(
         sm_version,
         actual_scale_format,
         is_sf_swizzled_layout,
+        enable_pdl,
     )
     tensor_api(
         input_2d.contiguous(),

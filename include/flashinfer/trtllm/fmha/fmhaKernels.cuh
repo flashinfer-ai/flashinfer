@@ -356,7 +356,7 @@ class TllmGenFmhaKernel {
       } else {
         // Compute numTokensPerCtaQ where each CTA must process complete numGroupedHeadsQ.
         // Note that each CTA must process complete numHeadsQPerKv.
-        int numTokensPerCtaQ = kernelMeta.mStepQ / params.mNumHeadsQPerKv;
+        int numTokensPerCtaQ = std::max(1, kernelMeta.mStepQ / params.mNumHeadsQPerKv);
         // Group both headsQ and tokensQ into one CTA.
         numCtasPerSeqQ = flashinfer::ceil_div(params.mMaxSeqLenQ, numTokensPerCtaQ);
       }
@@ -747,7 +747,7 @@ class TllmGenFmhaKernel {
     int& tileSizeQ = selectKernelParams.mTileSizeQ;
 
     // Mixed precision kernels don't work with groupsTokensHeadsQ = true for now.
-    if (mDtypeQ != mDtypeKv || mDtypeOut == DATA_TYPE_E2M1) {
+    if (mDtypeQ != mDtypeKv) {
       tileSizeQ = params.mNumHeadsQPerKv <= 8 ? 8 : 16;
       kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
       return;
