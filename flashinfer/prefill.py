@@ -2634,7 +2634,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The keyword arguments to create the JIT module, defaults to None.
         """
         _check_kv_layout(kv_layout)
-        if jit_args is not None:
+        if jit_args is not None and backend != "cute-dsl":
             if jit_kwargs is None:
                 jit_kwargs = {}
             self._jit_module = get_batch_prefill_jit_module(
@@ -2988,16 +2988,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     "cute-dsl backend requires head_dim_vo == head_dim_qk"
                 )
             if self._kv_layout == "HND":
-                raise NotImplementedError(
-                    "cute-dsl backend only supports NHD layout"
-                )
+                raise NotImplementedError("cute-dsl backend only supports NHD layout")
             if pos_encoding_mode not in ("NONE", "ALIBI"):
                 raise NotImplementedError(
                     f"cute-dsl backend does not support pos_encoding_mode={pos_encoding_mode!r}. "
                     "For RoPE, apply rotary embeddings to Q/K before calling the kernel."
                 )
 
-            variant = None
+            variant: Optional[Any] = None
             if pos_encoding_mode == "ALIBI":
                 from .cute_dsl.attention import ALiBiAttention
 
@@ -3022,7 +3020,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 head_dim_qk,
                 head_dim_vo=head_dim_qk,
                 causal=causal,
-                sm_scale=sm_scale if sm_scale is not None else 1.0 / math.sqrt(head_dim_qk),
+                sm_scale=sm_scale
+                if sm_scale is not None
+                else 1.0 / math.sqrt(head_dim_qk),
                 q_data_type=q_data_type,
                 kv_data_type=kv_data_type if kv_data_type is not None else q_data_type,
                 window_left=window_left,
@@ -3274,6 +3274,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 "out",
             )
         if self._backend == "cute-dsl":
+            # These checks live here (not in plan()) because return_lse and
+            # scale parameters are run()-time arguments that can vary between
+            # calls on the same planned wrapper.
             if return_lse:
                 raise NotImplementedError(
                     "cute-dsl backend does not support return_lse"

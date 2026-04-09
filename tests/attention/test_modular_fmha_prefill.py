@@ -281,6 +281,15 @@ def test_attention_prefill(
 
     torch.testing.assert_close(o, o_ref, rtol=RTOL, atol=ATOL)
 
+    # Verify the out= in-place contract: the user's pre-allocated tensor
+    # must be populated with the results and returned as-is.
+    o_buffer = torch.empty_like(o)
+    o_ret = wrapper.run(q, k, v, out=o_buffer)
+    assert o_ret.data_ptr() == o_buffer.data_ptr(), (
+        "run(out=...) must return the same tensor object"
+    )
+    torch.testing.assert_close(o_buffer, o_ref, rtol=RTOL, atol=ATOL)
+
 
 # ---------------------------------------------------------------------------
 #  2. Variable-length sequences — a few representative indptr patterns

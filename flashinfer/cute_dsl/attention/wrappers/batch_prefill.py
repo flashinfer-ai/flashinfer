@@ -312,6 +312,24 @@ class BatchPrefillCuteDSLWrapper:
             params_shape,
         )
 
+        # Pre-allocate padded output scratch buffer.  The kernel uses a
+        # negative pointer offset into the output tensor for TMA varlen
+        # addressing (see prefill.py __call__, "markus's trick"), so the
+        # buffer needs max_s_q extra rows in front.  Allocating once here
+        # avoids per-run() allocation overhead across all layers.
+        _torch_out_dtype_map = {
+            torch.float16: torch.float16,
+            torch.bfloat16: torch.bfloat16,
+            torch.float8_e4m3fn: torch.float16,
+        }
+        torch_out_dtype = _torch_out_dtype_map[q_data_type]
+        self._o_scratch = torch.empty(
+            (self._o_padding + s_q_all, num_qo_heads, self._head_dim),
+            dtype=torch_out_dtype,
+            device=self._device,
+        )
+        self._o_scratch_view = self._o_scratch[self._o_padding :]
+
     def _validate_run_inputs(
         self,
         q: torch.Tensor,
@@ -384,21 +402,11 @@ class BatchPrefillCuteDSLWrapper:
 
         self._validate_run_inputs(q, k, v, out)
 
-        if out is None:
-            out = torch.empty_like(q)
-
-        # Pad output in front for kernel scratch space; the kernel uses a
-        # negative pointer offset to reach back into the padding area.
-        out_full = torch.nn.functional.pad(out, (0, 0, 0, 0, self._o_padding, 0))
-        out_view = out_full[self._o_padding :].detach()
-        out_view._keep_alive = out_full
-
-        # TVM-FFI: pass PyTorch tensors directly, no stream arg (env stream)
         self._compiled_fmha(
             q,
             k,
             v,
-            out_view,
+            self._o_scratch_view,
             self._problem_size,
             self._qo_indptr,
             self._s_q_all,
@@ -409,4 +417,7 @@ class BatchPrefillCuteDSLWrapper:
             self._params_torch if self._has_params else None,
         )
 
-        return out_view
+        if out is not None:
+            out.copy_(self._o_scratch_view)
+            return out
+        return self._o_scratch_view.clone()

@@ -31,54 +31,11 @@ warnings.filterwarnings(
     message="This loop is no longer unrolled and may cause performance regression",
 )
 
-"""
-A fused multi-head attention (FMHA) example for the NVIDIA Blackwell SM100 architecture using CUTE DSL
+"""Blackwell SM100 fused multi-head attention (FMHA) kernel using CuTe DSL.
 
-This example demonstrates an implementation of fused multi-head attention using a TMA + Blackwell SM100
-TensorCore warp-specialized persistent kernel. The implementation integrates the Q*K^T matrix multiplication,
-softmax normalization, and softmax(Q*K^T)*V into a single kernel, avoiding intermediate data movement between
-global memory and shared memory, thus improving computational efficiency.
-
-The kernel implements key optimizations including:
-- Warp specialization for different computation phases (load, MMA, softmax, correction, epilogue)
-- Pipeline stages between different warps for overlapping computation and memory access
-- Support for different precision data types
-- Optional causal masking for autoregressive models
-
-To run this example:
-
-.. code-block:: bash
-
-    python examples/blackwell/fmha.py                                     \
-      --qk_acc_dtype Float32 --pv_acc_dtype Float32                       \
-      --mma_tiler_mn 128,128                                              \
-      --q_shape 4,1024,8,64 --k_shape 4,1024,8,64                         \
-      --is_persistent
-
-The above example runs FMHA with batch size 4, sequence length 1024, 8 attention heads, and head
-dimension 64. The Blackwell tcgen05 MMA tile shape is (128, 128), and the kernel uses fp16 for input/output
-with fp32 for accumulation.
-
-To collect performance with NCU profiler:
-
-.. code-block:: bash
-
-    ncu python examples/blackwell/fmha.py                                 \
-      --qk_acc_dtype Float32 --pv_acc_dtype Float32                       \
-      --mma_tiler_mn 128,128                                              \
-      --q_shape 4,1024,8,64 --k_shape 4,1024,8,64                         \
-      --is_persistent --warmup_iterations 10                              \
-      --iterations 10 --skip_ref_check
-
-Constraints:
-* head_dim must be a multiple of 16 (fp16/bf16) or 32 (fp8)
-* head_dim is further limited by shared memory capacity (head_dim <= 128 with
-  mma_tiler_mn=(128,128) on SM100; larger values require different tile configs)
-* Number of heads in Q must be divisible by number of heads in K
-* mma_tiler_mn must be (128, 128)
-* Batch size must be the same for Q, K, and V tensors
-* For causal masking, use --is_causal (note: specify without =True/False)
-* For persistent scheduling, use --is_persistent (note: specify without =True/False)
+Warp-specialized persistent kernel with TMA loads/stores, pipelined QK and PV
+MMA stages, online softmax with correction, and optional causal/sliding-window
+masking.  Supports fp16, bf16, and fp8 input types.
 """
 
 
