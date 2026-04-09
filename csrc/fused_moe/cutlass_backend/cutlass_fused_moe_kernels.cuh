@@ -1620,21 +1620,6 @@ void expandInputRowsKernelLauncher(
                      expert_first_token_offset, fc1_act_sf_flat, input_sf, swizzled_input_sf,
                      num_experts_per_node,
                      reinterpret_cast<InputActivationsType const*>(prequant_scales));
-
-  // TODO: Remove — poisons ALL SFs AFTER the kernel writes them, to prove the test
-  // harness detects corruption when the GEMM reads poisoned valid SFs.
-  if (fc1_act_sf_flat) {
-#ifdef ENABLE_FP4
-    auto constexpr scaling_type =
-        std::is_same_v<ExpandedActivationsType, __nv_fp4_e2m1>
-            ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4
-            : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
-    int64_t const sf_buffer_size =
-        getOffsetActivationSF(num_experts_per_node, num_rows * k, hidden_size, scaling_type) *
-        sizeof(TmaWarpSpecializedGroupedGemmInput::ElementSF);
-    cudaMemsetAsync(fc1_act_sf_flat, 0xFF, sf_buffer_size, stream);
-#endif
-  }
 }
 
 #define INSTANTIATE_EXPAND_INPUT_ROWS(InputActivationsType, ExpandedActivationsType)               \
