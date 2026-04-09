@@ -1454,10 +1454,6 @@ def test_trtllm_batch_decode(
     if backend == "xqa" and non_contiguous_query:
         pytest.skip("xqa backend does not support non-contiguous query")
 
-    # fixme(qsang-nv): failing tests for xqa + head dim 256.
-    if backend == "xqa" and head_dim == 256:
-        pytest.skip("xqa backend + head dim 256 cases have precision issues")
-
     # General set of tests for trtllm-gen decode
     _test_trtllm_batch_decode(
         backend,
