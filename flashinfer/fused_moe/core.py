@@ -2484,6 +2484,8 @@ def trtllm_fp8_per_tensor_scale_moe(
     tune_max_num_tokens: int = 8192,
     activation_type: int = ActivationType.Swiglu.value,
     norm_topk_prob: bool = True,
+
+    routing_replay_out: Optional[torch.Tensor] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     """FP8 per tensor scale MoE operation.
 
@@ -2818,6 +2820,7 @@ def trtllm_fp4_block_scale_moe(
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
     norm_topk_prob: bool = True,
+    routing_replay_out: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     """FP4 block scale MoE operation.
 
@@ -3080,6 +3083,7 @@ def trtllm_mxint4_block_scale_moe(
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
     norm_topk_prob: bool = True,
+    routing_replay_out: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     """MxInt4 block scale MoE operation.
 

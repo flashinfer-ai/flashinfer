@@ -1790,6 +1790,8 @@ Array<Tensor> trtllm_bf16_moe(Optional<TensorView> const& routing_logits,
         << "routing_replay_out must be on the same device as hidden_states";
     TVM_FFI_ICHECK(replay.ndim() == 2) << "routing_replay_out must be 2D [num_tokens, top_k]";
     TVM_FFI_ICHECK(replay.size(1) == top_k) << "routing_replay_out dim1 must equal top_k";
+    TVM_FFI_ICHECK(replay.dtype() == DLDataType{kDLInt, 16, 1})
+        << "routing_replay_out must be int16 dtype";
     // NO dim0 == num_tokens check: buffer may be larger (CUDA graph pre-allocation)
   }
 
@@ -1888,6 +1890,8 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
         << "routing_replay_out must be on the same device as hidden_states";
     TVM_FFI_ICHECK(replay.ndim() == 2) << "routing_replay_out must be 2D [num_tokens, top_k]";
     TVM_FFI_ICHECK(replay.size(1) == top_k) << "routing_replay_out dim1 must equal top_k";
+    TVM_FFI_ICHECK(replay.dtype() == DLDataType{kDLInt, 16, 1})
+        << "routing_replay_out must be int16 dtype";
     // NO dim0 == num_tokens check: buffer may be larger (CUDA graph pre-allocation)
   }
 
@@ -2031,6 +2035,8 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
         << "routing_replay_out must be on the same device as hidden_states";
     TVM_FFI_ICHECK(replay.ndim() == 2) << "routing_replay_out must be 2D [num_tokens, top_k]";
     TVM_FFI_ICHECK(replay.size(1) == top_k) << "routing_replay_out dim1 must equal top_k";
+    TVM_FFI_ICHECK(replay.dtype() == DLDataType{kDLInt, 16, 1})
+        << "routing_replay_out must be int16 dtype";
     // NO dim0 == num_tokens check: buffer may be larger (CUDA graph pre-allocation)
   }
 
@@ -2152,6 +2158,8 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
         << "routing_replay_out must be on the same device as hidden_states";
     TVM_FFI_ICHECK(replay.ndim() == 2) << "routing_replay_out must be 2D [num_tokens, top_k]";
     TVM_FFI_ICHECK(replay.size(1) == top_k) << "routing_replay_out dim1 must equal top_k";
+    TVM_FFI_ICHECK(replay.dtype() == DLDataType{kDLInt, 16, 1})
+        << "routing_replay_out must be int16 dtype";
     // NO dim0 == num_tokens check: buffer may be larger (CUDA graph pre-allocation)
   }
 
@@ -2278,6 +2286,8 @@ Array<Tensor> trtllm_mxint4_block_scale_moe(
         << "routing_replay_out must be on the same device as hidden_states";
     TVM_FFI_ICHECK(replay.ndim() == 2) << "routing_replay_out must be 2D [num_tokens, top_k]";
     TVM_FFI_ICHECK(replay.size(1) == top_k) << "routing_replay_out dim1 must equal top_k";
+    TVM_FFI_ICHECK(replay.dtype() == DLDataType{kDLInt, 16, 1})
+        << "routing_replay_out must be int16 dtype";
     // NO dim0 == num_tokens check: buffer may be larger (CUDA graph pre-allocation)
   }
 
