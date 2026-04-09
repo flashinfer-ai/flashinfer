@@ -44,7 +44,7 @@ namespace flashinfer {
 namespace gemm {
 using namespace cute;
 
-// UseStreamK: false = persistent scheduler (default), true = StreamK scheduler
+// UseStreamK: false = DP scheduler (default), true = StreamK scheduler
 template <typename T, typename CTA_M_, typename CTA_N_, typename CTA_K_, bool UseStreamK = false>
 size_t dispatchNVFP4xNVFP4GemmClusterShapeSm120(T* D, void const* A, void const* B,
                                                 void const* input_sf, void const* weight_sf,
@@ -53,6 +53,7 @@ size_t dispatchNVFP4xNVFP4GemmClusterShapeSm120(T* D, void const* A, void const*
                                                 char* workspace, const size_t workspaceBytes,
                                                 cudaStream_t stream, int* occupancy = nullptr) {
   // For SM120/SM121, only support 1x1x1 cluster shape
+  // Always use 1x1x1 cluster shape regardless of gemmConfig.cluster_shape
   if constexpr (UseStreamK) {
     return genericFp4GemmKernelLauncherStreamK<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<1>,
                                                cute::Int<1>, cute::Int<1>, _1SM>(
@@ -177,13 +178,13 @@ std::vector<CutlassGemmConfig> CutlassFp4GemmRunner<T, fp4GemmType>::getConfigs(
   // SM120/SM121 only supports 1x1x1 cluster shape
   ClusterShape clusterShape = ClusterShape::ClusterShape_1x1x1;
 
-  // Generate configs for both persistent and StreamK schedulers
+  // Generate configs for both DP and StreamK schedulers
   for (auto const& tile_config : tilesSm120) {
-    // Persistent scheduler (default)
+    // Default DP scheduler (use_stream_k = false)
     candidateConfigs.push_back(CutlassGemmConfig(tile_config, MainloopScheduleType::AUTO,
                                                  EpilogueScheduleType::AUTO, clusterShape, false));
 
-    // StreamK scheduler - better for small M/N, large K
+    // StreamK scheduler (use_stream_k = true) - better for small M/N, large K
     candidateConfigs.push_back(CutlassGemmConfig(tile_config, MainloopScheduleType::AUTO,
                                                  EpilogueScheduleType::AUTO, clusterShape, true));
   }

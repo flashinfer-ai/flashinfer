@@ -279,7 +279,7 @@ inline size_t runFp4GemmImpl(void* D, void const* A, void const* B, void const* 
     using Gemm = GemmDefault; /* Default alias for compatibility */                                        \
   };                                                                                                       \
                                                                                                            \
-  /* Type aliases for persistent and StreamK schedulers */                                                 \
+  /* Type aliases for DP and StreamK schedulers */                                                         \
   using Fp4Gemm_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_ =                                                     \
       DeviceGemmFp4GemmSm120_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##_##CGA_M_##_##CGA_N_##_##CGA_K_##XSM_:: \
           GemmDefault;                                                                                     \
@@ -288,7 +288,7 @@ inline size_t runFp4GemmImpl(void* D, void const* A, void const* B, void const* 
       DeviceGemmFp4GemmSm120_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##_##CGA_M_##_##CGA_N_##_##CGA_K_##XSM_:: \
           GemmStreamK;                                                                                     \
                                                                                                            \
-  /* Persistent scheduler launcher */                                                                      \
+  /* DP scheduler launcher - uses common helper functions */                                               \
   template <>                                                                                              \
   size_t                                                                                                   \
   genericFp4GemmKernelLauncher<T, cute::Int<CTA_M_>, cute::Int<CTA_N_>, cute::Int<CTA_K_>,                 \
