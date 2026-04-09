@@ -3584,10 +3584,12 @@ _SM100_MM_FP4_TACTIC_CACHE: dict[tuple, dict] = {}
 
 # M bucket boundaries — powers of 2 for fast bucketing via
 # last_positive_power_of_2 (imported from flashinfer.fused_moe.utils).
+# Each bucket is precomputed for both 8-aligned and non-8-aligned M,
+# keyed as (bucket, is_8_aligned).
 _M_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
 
 
-def _compute_tactic_for_m(rep_m, n, real_k, sm_count):
+def _compute_tactic_for_m(rep_m, n, real_k, sm_count, m_aligned):
     """Compute the best tactic for a specific (M, N, K) on a GPU with sm_count SMs.
 
     Selects swap_ab, tile shape, and cluster shape sequentially:
@@ -3614,7 +3616,6 @@ def _compute_tactic_for_m(rep_m, n, real_k, sm_count):
 
     4. **Prefetch**: Disabled.
     """
-    m_aligned = rep_m % 8 == 0
     n_aligned = n % 8 == 0
 
     swap_ab = False
@@ -3707,13 +3708,16 @@ def _select_sm100_mm_fp4_cute_dsl_tactic(m, n, real_k, sm_count):
     cache_key = (n, real_k, sm_count)
     bucket_tactics = _SM100_MM_FP4_TACTIC_CACHE.get(cache_key)
     if bucket_tactics is None:
-        bucket_tactics = {
-            rep_m: _compute_tactic_for_m(rep_m, n, real_k, sm_count)
-            for rep_m in _M_BUCKETS
-        }
+        bucket_tactics = {}
+        for rep_m in _M_BUCKETS:
+            for aligned in (True, False):
+                bucket_tactics[(rep_m, aligned)] = _compute_tactic_for_m(
+                    rep_m, n, real_k, sm_count, aligned
+                )
         _SM100_MM_FP4_TACTIC_CACHE[cache_key] = bucket_tactics
 
-    return bucket_tactics[min(last_positive_power_of_2(m), _M_BUCKETS[-1])]
+    bucket = min(last_positive_power_of_2(m), _M_BUCKETS[-1])
+    return bucket_tactics[(bucket, m % 8 == 0)]
 
 
 def _get_approximate_cta_nums(m, n, tile_mn, cluster_shape_mn):
