@@ -1548,7 +1548,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
         """
         _check_kv_layout(kv_layout)
 
-        if jit_args is not None:
+        if backend == "cute-dsl":
+            raise NotImplementedError(
+                "cute-dsl backend is not yet supported for paged KV cache. "
+                "Use BatchPrefillWithRaggedKVCacheWrapper instead."
+            )
+
+        if jit_args is not None and backend != "cute-dsl":
             if jit_kwargs is None:
                 jit_kwargs = {}
             self._jit_module = get_batch_prefill_jit_module(
