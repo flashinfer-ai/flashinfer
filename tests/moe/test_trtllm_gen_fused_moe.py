@@ -1862,6 +1862,32 @@ def routing_reference_sigmoid_renorm(
     return permute_info, scores
 
 
+def routing_reference_minimax2(
+    expert_logits, routing_bias, top_k, num_experts, padding
+):
+    """Sigmoid + Bias -> TopK -> ScaledSumNormalize routing reference (MiniMax2).
+    Bias affects expert selection but NOT the final weights.
+    Weights = sigmoid(logit) / (sum_of_selected_sigmoid + 1e-20).
+    """
+    sigmoid_scores = torch.sigmoid(expert_logits.float())
+    selection_scores = sigmoid_scores.clone()
+    if routing_bias is not None:
+        selection_scores = selection_scores + routing_bias.float()
+    topk_values, topk_idx = torch.topk(selection_scores, k=top_k, dim=-1)
+
+    # Weights use un-biased sigmoid scores
+    raw_weights = torch.gather(sigmoid_scores, -1, topk_idx)
+    raw_weights = raw_weights / (raw_weights.sum(dim=-1, keepdim=True) + 1e-20)
+    raw_weights = raw_weights.to(expert_logits.dtype)
+
+    scores = torch.zeros_like(sigmoid_scores, dtype=expert_logits.dtype)
+    for i in range(topk_idx.shape[0]):
+        for j in range(topk_idx.shape[1]):
+            scores[i, topk_idx[i, j]] = raw_weights[i, j]
+    permute_info = routing_reference(scores, top_k, padding)
+    return permute_info, scores
+
+
 def check_accuracy(a, b, atol, rtol, percent):
     """Unified accuracy checking function with detailed error reporting."""
     if not torch.isfinite(a).all():
@@ -2743,6 +2769,10 @@ def run_moe_test(
         permute_info, scores = routing_reference_sigmoid_renorm(
             expert_logits, top_k, num_experts, padding, norm_topk_prob=norm_topk_prob
         )
+    elif routing_method_type == RoutingMethodType.MiniMax2:
+        permute_info, scores = routing_reference_minimax2(
+            expert_logits, routing_bias, top_k, num_experts, padding
+        )
     elif routing_method_type == RoutingMethodType.Llama4:
         permute_info, scores = routing_reference_no_aux(
             expert_logits,
@@ -2999,6 +3029,28 @@ def run_moe_test(
                 "enable_autotune": False,
             },
             id="SigmoidRenorm_128e_top8",
+        ),
+        pytest.param(
+            {
+                "num_experts": 256,
+                "top_k": 6,
+                "padding": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": True,
+                "routing_method_type": RoutingMethodType.MiniMax2,
+                "compatible_moe_impls": [
+                    FP8PerTensorMoe,
+                    FP8BlockScaleMoe,
+                    FP4Moe,
+                    BF16Moe,
+                    MxInt4BlockScaleMoe,
+                ],
+                "compatible_intermediate_size": [384, 768, 1024],
+                "enable_autotune": False,
+            },
+            id="MiniMax2_256e_top6",
         ),
     ],
 )
@@ -3992,6 +4044,22 @@ def test_tier_1024_experts_routing(
                 "enable_autotune": False,
             },
             id="SigmoidRenorm_128e",
+        ),
+        pytest.param(
+            {
+                "num_experts": 256,
+                "top_k": 6,
+                "padding": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": True,
+                "routing_method_type": RoutingMethodType.MiniMax2,
+                "compatible_moe_impls": [FP8BlockScaleMoe],
+                "compatible_intermediate_size": [512],
+                "enable_autotune": False,
+            },
+            id="MiniMax2_256e",
         ),
     ],
 )
