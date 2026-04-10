@@ -327,11 +327,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                 get_occ = self.fused_moe_runner.get_tactic_occupancy
             except AttributeError:
                 # get_tactic_occupancy not available in this build; skip pre-filtering
-                return all_tactics
-
-            import logging as _logging
-
-            _logger = _logging.getLogger(__name__)
+                return all_tactics if all_tactics else [-1]
 
             valid_tactics = []
             for t in all_tactics:
@@ -341,7 +337,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                 except Exception as e:
                     # If the query fails unexpectedly, include the tactic and let
                     # the autotuner handle any errors during profiling.
-                    _logger.warning(
+                    logger.warning(
                         "get_tactic_occupancy failed for tactic %d: %s; including in autotuner",
                         t,
                         e,
