@@ -263,13 +263,13 @@ def get_trtllm_gen_prefill_module():
         enable_pdl: bool,
         workspace_size: int,
         window_left: int = -1,
-        is_causal: bool = True,
         out: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
         key_block_scales: Optional[torch.Tensor] = None,
         value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         uses_shared_paged_kv_idx: bool = True,
+        is_causal: bool = True,
     ) -> torch.Tensor:
         sm_count = get_device_sm_count(query.device)
         if out is None:
@@ -301,13 +301,13 @@ def get_trtllm_gen_prefill_module():
             cum_seq_lens_kv,
             sm_count,
             enable_pdl,
-            is_causal,
             workspace_size,
             sinks,
             key_block_scales,
             value_block_scales,
             skip_softmax_threshold_scale_factor,
             uses_shared_paged_kv_idx,
+            is_causal,
         )
         return out
 
@@ -710,13 +710,13 @@ def get_batch_prefill_module(backend, *args):
                 enable_pdl,
                 workspace_size,
                 window_left,
-                mask_mode != MaskMode.NON_CAUSAL.value,
                 out=o,
                 sinks=sinks,
                 key_block_scales=key_block_scales,
                 value_block_scales=value_block_scales,
                 skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
                 uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+                is_causal=mask_mode != MaskMode.NON_CAUSAL.value,
             )
         elif backend == "fa2":
             assert not is_float8(q)
@@ -3860,7 +3860,6 @@ def trtllm_batch_context_with_kv_cache(
     cum_seq_lens_q: torch.Tensor,
     cum_seq_lens_kv: torch.Tensor,
     window_left: int = -1,
-    causal: bool = True,
     out: Optional[Union[torch.Tensor, FP4Tensor]] = None,
     out_dtype: Optional[Union[torch.dtype, str]] = None,
     o_sf_scale: Optional[float] = None,
@@ -3871,6 +3870,7 @@ def trtllm_batch_context_with_kv_cache(
     kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     skip_softmax_threshold_scale_factor: Optional[float] = None,
     uses_shared_paged_kv_idx: bool = True,
+    causal: bool = True,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
     Parameters
@@ -3916,9 +3916,6 @@ def trtllm_batch_context_with_kv_cache(
     window_left : int = -1
         The left (inclusive) window size for the attention window, when set to ``-1``, the window
         size will be set to the full length of the sequence. Defaults to ``-1``.
-    causal : bool = True
-        Whether to apply a causal mask. Set to ``False`` to request dense / bidirectional attention.
-        For the TRTLLM-gen paged context path, non-causal currently requires ``window_left == -1``.
     out : Optional[Union[torch.Tensor, FP4Tensor]] = None
         output tensor, if not provided, will be allocated with ``out_dtype``, if ``out_dtype`` is not provided, will use the type of ``query``.
     out_dtype : Optional[Union[torch.dtype, str]] = None
@@ -3971,6 +3968,10 @@ def trtllm_batch_context_with_kv_cache(
         Whether the K and V page indices are shared as a unified index.
         True (default) uses vLLM/FlashInfer layout with a 2D page table.
         False uses TRT-LLM layout with a 3D page table ``[batch_size, 2, max_num_pages_per_seq]``.
+    causal : bool = True
+        Whether to apply a causal mask. This trailing parameter preserves existing positional
+        callers. Set to ``False`` to request dense / bidirectional attention. For the TRTLLM-gen
+        paged context path, non-causal currently requires ``window_left == -1``.
     Returns
     -------
     out: Union[torch.Tensor, FP4Tensor]
@@ -4134,13 +4135,13 @@ def trtllm_batch_context_with_kv_cache(
         cum_seq_lens_kv,
         sm_count,
         enable_pdl,
-        causal,
         workspace_size,
         sinks,
         key_block_scales,
         value_block_scales,
         skip_softmax_threshold_scale_factor,
         uses_shared_paged_kv_idx,
+        causal,
     )
     return (
         out
