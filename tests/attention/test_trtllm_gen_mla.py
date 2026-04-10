@@ -558,6 +558,7 @@ def trtllm_batch_decode_mla_sparse(
     if backend == "trtllm-gen":
         if compute_capability[0] != 10:
             pytest.skip("TRTLLM-GEN MLA only supports SM100 and SM103 GPUs")
+
     torch.manual_seed(42)
     device = "cuda:0"
 
@@ -733,8 +734,7 @@ def trtllm_batch_decode_mla_sparse(
     )
 
     # Compare outputs
-    if dtype != torch.float8_e4m3fn:
-        assert not torch.isnan(output).any(), "Kernel output contains NaN values"
+    assert not torch.isnan(output).any(), "Kernel output contains NaN values"
     assert not torch.isnan(out_ref).any(), "Reference output contains NaN values"
 
     if dtype == torch.float8_e4m3fn:
