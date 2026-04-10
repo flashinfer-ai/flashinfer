@@ -390,7 +390,7 @@ void trtllm_paged_attention_context(
     bool enable_pdl, int64_t workspace_size, Optional<TensorView> attention_sinks,
     Optional<TensorView> key_block_scales, Optional<TensorView> value_block_scales,
     Optional<float> skip_softmax_threshold_scale_factor, Optional<bool> uses_shared_paged_kv_idx,
-    bool is_causal = true) {
+    bool is_causal) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
   auto o_data_type = dl_dtype_to_tllm_data_type(out.dtype());
@@ -487,6 +487,11 @@ void trtllm_paged_attention_context(
   float const skip_softmax_threshold_scale_factor_value =
       skip_softmax_threshold_scale_factor.value_or(0.0f);
   bool const skips_softmax = skip_softmax_threshold_scale_factor_value != 0.0f;
+
+  TVM_FFI_CHECK(
+      is_causal || window_left == -1,
+      "Sliding-window non-causal attention is not supported for trtllm-gen paged KV cache. "
+      "Use window_left=-1 for dense bidirectional attention.");
 
   trtllm_paged_attention_launcher(
       out.data_ptr(), output_sf_ptr, query.data_ptr(), key_cache.data_ptr(), value_cache.data_ptr(),
