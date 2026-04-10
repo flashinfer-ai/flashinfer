@@ -280,14 +280,122 @@ void invokeRowWiseAmax(uint32_t m, uint32_t n, T const* input, float* output, fl
 
 // Instantiate the function.
 template void invokeRowWiseAmax<half>(uint32_t m, uint32_t n, half const* input, float* output,
-                                      float scale, int32_t* expanded_idx_to_permuted_idx, cudaStream_t stream);
+                                      float scale, int32_t* expanded_idx_to_permuted_idx,
+                                      cudaStream_t stream);
 #ifdef ENABLE_BF16
 template void invokeRowWiseAmax<__nv_bfloat16>(uint32_t m, uint32_t n, __nv_bfloat16 const* input,
-                                               float* output, float scale, int32_t* expanded_idx_to_permuted_idx, cudaStream_t stream);
+                                               float* output, float scale,
+                                               int32_t* expanded_idx_to_permuted_idx,
+                                               cudaStream_t stream);
 #endif
 #ifdef ENABLE_FP8
 template void invokeRowWiseAmax<__nv_fp8_e4m3>(uint32_t m, uint32_t n, __nv_fp8_e4m3 const* input,
-                                               float* output, float scale, int32_t* expanded_idx_to_permuted_idx, cudaStream_t stream);
+                                               float* output, float scale,
+                                               int32_t* expanded_idx_to_permuted_idx,
+                                               cudaStream_t stream);
+#endif
+
+template <typename T, uint32_t BLOCK_SIZE>
+__global__ void nvfp4QuantAndPerTokenScaleKernel(
+    // input
+    uint32_t m, uint32_t n, T const* input, float globalScaleInv, int32_t* expandedIdxToPermutedIdx,
+    // output
+    uint8_t* weightOutput, uint8_t* scaleOutput, float* perTokenScaleOutput,
+    QuantizationSFLayout layout = QuantizationSFLayout::LINEAR) {
+  static constexpr int ELTS_PER_THREAD = 8;
+  static constexpr int SF_VEC_SIZE = 16;
+  uint32_t rowIdx = blockIdx.x;
+  if (rowIdx >= m) return;
+  if (expandedIdxToPermutedIdx != nullptr) {
+    rowIdx = expandedIdxToPermutedIdx[rowIdx];
+  }
+  uint8_t fp8Scale{0};
+  using VecType = PackedVec<T, ELTS_PER_THREAD>;
+  VecType vec;
+
+  // get the global amax
+  float localAmax = 0.f;
+  for (uint32_t colIdx = threadIdx.x; colIdx < n; colIdx += blockDim.x) {
+    T element = input[rowIdx * n + colIdx];
+    localAmax = fmaxf(localAmax, fabsf(static_cast<float>(element)));
+  }
+  using BlockReduce = cub::BlockReduce<float, BLOCK_SIZE>;
+  __shared__ typename BlockReduce::TempStorage tempStorage;
+  float globalAmax = BlockReduce(tempStorage)
+                         .Reduce(
+                             localAmax,
+#if CUDART_VERSION >= 12090
+                             cuda::maximum<> {}
+#else
+                             cub::Max(),
+#endif
+                         );
+
+  // save the per-token scale
+  float perTokenScale = globalAmax * globalScaleInv;
+  if (threadIdx.x == 0) {
+    perTokenScaleOutput[rowIdx] = perTokenScale;
+  }
+  __syncthreads();
+  perTokenScale = perTokenScaleOutput[rowIdx];
+
+  // quantize to fp4 with per-token scale
+  uint32_t num_vecs_per_row = (n + ELTS_PER_THREAD - 1) / ELTS_PER_THREAD;
+  for (uint32_t vecIdx = threadIdx.x; vecIdx < num_vecs_per_row; vecIdx += blockDim.x) {
+    int64_t vecOffset = rowIdx * num_vecs_per_row + vecIdx;
+    vec = reinterpret_cast<VecType const*>(input)[vecOffset];
+    uint32_t fp4x8 = cvt_warp_fp16_to_fp4<T, SF_VEC_SIZE, ELTS_PER_THREAD, false>(
+        vec, reciprocal_approximate_ftz(perTokenScale), &fp8Scale);
+    reinterpret_cast<uint32_t*>(weightOutput)[vecOffset] = fp4x8;
+
+    static constexpr int THREADS_PER_SCALE = SF_VEC_SIZE / ELTS_PER_THREAD; // 2
+    if (threadIdx.x % THREADS_PER_SCALE == 0) {
+      uint32_t num_sf_vecs_per_row = (n + SF_VEC_SIZE - 1) / SF_VEC_SIZE;
+      auto sfVecIdx = vecIdx / THREADS_PER_SCALE;
+      int64_t sfOffset;
+      switch (layout) {
+        default:
+        case QuantizationSFLayout::LINEAR:
+          sfOffset = rowIdx * num_sf_vecs_per_row + sfVecIdx;
+          break;
+        case QuantizationSFLayout::SWIZZLED_128x4:
+          sfOffset = get_sf_out_offset_128x4(std::nullopt, rowIdx, sfVecIdx, m, num_sf_vecs_per_row);
+          break;
+        case QuantizationSFLayout::SWIZZLED_8x4:
+          sfOffset = get_sf_out_offset_8x4(std::nullopt, rowIdx, sfVecIdx, m, num_sf_vecs_per_row);
+          break;
+      }
+      scaleOutput[sfOffset] = fp8Scale;
+    }
+  }
+}
+
+template <typename T>
+void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, float globalScaleInv,
+                                      int32_t* expandedIdxToPermutedIdx, uint8_t* weightOutput,
+                                      uint8_t* scaleOutput, float* perTokenScaleOutput,
+                                      QuantizationSFLayout sfLayout, cudaStream_t stream) {
+  // Kernel packs 16 values per thread via PackedVec load/store.
+  TLLM_CHECK_WITH_INFO(n % 16 == 0, "n must be a multiple of 16 for NVFP4 quantization");
+
+  constexpr uint32_t BLOCK_SIZE = 256;
+  dim3 block(BLOCK_SIZE);
+  dim3 grid(m);
+  nvfp4QuantAndPerTokenScaleKernel<T, BLOCK_SIZE>
+      <<<grid, block, 0, stream>>>(m, n, input, globalScaleInv, expandedIdxToPermutedIdx,
+                                   weightOutput, scaleOutput, perTokenScaleOutput, sfLayout);
+}
+
+// Instantiate the function.
+template void invokeNvfp4QuantAndPerTokenScale<half>(
+    uint32_t m, uint32_t n, half const* input, float globalScaleInv,
+    int32_t* expandedIdxToPermutedIdx, uint8_t* weightOutput, uint8_t* scaleOutput,
+    float* perTokenScaleOutput, QuantizationSFLayout sfLayout, cudaStream_t stream);
+#ifdef ENABLE_BF16
+template void invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(
+    uint32_t m, uint32_t n, __nv_bfloat16 const* input, float globalScaleInv,
+    int32_t* expandedIdxToPermutedIdx, uint8_t* weightOutput, uint8_t* scaleOutput,
+    float* perTokenScaleOutput, QuantizationSFLayout sfLayout, cudaStream_t stream);
 #endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

@@ -756,33 +756,24 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
     FLASHINFER_CHECK(
         workspace.token_scales_fc2 != nullptr,
         "workspace.token_scales_fc2 must be provided When using explicit quantization.");
-    const int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
-    int intermediate_size_factor = isGatedActivation(args.activation_type) ? 2 : 1;
     // FIXME(siyuan): Detect from the kernel config. Currently only tile size >= 128 will use R128c4
     auto sfLayout = mGemm2.mTileTokensDim >= 128 ? QuantizationSFLayout::SWIZZLED_128x4
                                                  : QuantizationSFLayout::SWIZZLED_8x4;
 
-    invokeRowWiseAmax<__nv_bfloat16>(args.num_tokens * args.top_k, args.intermediate_size,
-                                     reinterpret_cast<__nv_bfloat16*>(workspace.gemm1_output),
-                                     reinterpret_cast<float*>(workspace.token_scales_fc2),
-                                     1.f / 448.f / 6.f, workspace.expanded_idx_to_permuted_idx, stream);
-    invokeFP4Quantization<__nv_bfloat16, 16>(
-        1, workspace.total_max_padded_tokens, args.intermediate_size,
-        // inputs
-        reinterpret_cast<__nv_bfloat16*>(workspace.gemm1_output),
-        reinterpret_cast<float*>(workspace.token_scales_fc2),
-        // outputs
-        reinterpret_cast<int64_t*>(workspace.activation_output),
-        reinterpret_cast<int32_t*>(workspace.activation_output_scale),
-        /* useUE8M0 */ false, sfLayout, tensorrt_llm::common::getMultiProcessorCount(), enable_pdl,
-        /* use_row_wise_scale */ true, /* inverse_scale */ true, stream);
+    // TODO(siyuan): should this value be exposed?
+    float globalScaleInv = 1.f / 448.f / 6.f;
+    invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(
+        workspace.total_max_padded_tokens, args.intermediate_size,
+        reinterpret_cast<__nv_bfloat16 const*>(workspace.gemm1_output), globalScaleInv,
+        nullptr, // workspace.expanded_idx_to_permuted_idx,
+        reinterpret_cast<uint8_t*>(workspace.activation_output),
+        reinterpret_cast<uint8_t*>(workspace.activation_output_scale),
 
     gemm2_input = workspace.activation_output;
     gemm2_input_scale = workspace.activation_output_scale;
   }
 
   // Run gemm2
-  // TODO: pass the correct per token scale
   mGemm2.run(gemm2_input, gemm2_input_scale, args.gemm2_weights, args.gemm2_weights_scale,
              workspace.token_scales_fc2, args.output2_scales_scalar, args.gemm2_bias,
              workspace.gemm2_output, workspace.gemm2_output_scale, args.top_k, args.hidden_size,
