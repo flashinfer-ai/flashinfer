@@ -435,7 +435,7 @@ def _backend_or(self: BackendConfigType, other: BackendConfigType) -> BackendOpt
 
 
 for _cls in ALL_BACKEND_CONFIGS:
-    _cls.__or__ = _backend_or  # type: ignore[attr-defined,operator]
+    setattr(_cls, "__or__", _backend_or)
 
 del _backend_or, _cls
 
