@@ -241,16 +241,20 @@ def ensure_symlink(
     """
     link = pathlib.Path(link)
     target = pathlib.Path(target)
-    if link.is_symlink() or link.exists():
-        if link.is_symlink() and link.resolve() == target.resolve():
-            return  # already correct
-        # Stale symlink or directory from a previous version; remove it.
-        if link.is_symlink() or link.is_file():
-            link.unlink()
-        else:
-            shutil.rmtree(link)
+
     link.parent.mkdir(parents=True, exist_ok=True)
-    link.symlink_to(target)
+    lock_path = str(link) + ".lock"
+    lock = filelock.FileLock(lock_path, timeout=60)
+    with lock:
+        if link.is_symlink() or link.exists():
+            if link.is_symlink() and link.resolve() == target.resolve():
+                return  # already correct
+            # Stale symlink or directory from a previous version; remove it.
+            if link.is_symlink() or link.is_file():
+                link.unlink()
+            else:
+                shutil.rmtree(link)
+        link.symlink_to(target)
 
 
 def verify_symlinked_headers(
