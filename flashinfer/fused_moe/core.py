@@ -329,17 +329,30 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                 # get_tactic_occupancy not available in this build; skip pre-filtering
                 return all_tactics
 
+            import logging as _logging
+
+            _logger = _logging.getLogger(__name__)
+
             valid_tactics = []
             for t in all_tactics:
                 try:
                     if get_occ(t) > 0:
                         valid_tactics.append(t)
-                except Exception:
+                except Exception as e:
                     # If the query fails unexpectedly, include the tactic and let
                     # the autotuner handle any errors during profiling.
+                    _logger.warning(
+                        "get_tactic_occupancy failed for tactic %d: %s; including in autotuner",
+                        t,
+                        e,
+                    )
                     valid_tactics.append(t)
             # Fall back to all tactics if occupancy check eliminated everything
-            # (e.g., on an unexpected architecture where all tactics report 0)
+            # (e.g., on an unexpected architecture where all tactics report 0).
+            # If all_tactics itself is empty (zero-tactic stage), return [-1] as
+            # a sentinel so the autotuner contract is never violated with an empty list.
+            if not all_tactics:
+                return [-1]
             return valid_tactics if valid_tactics else all_tactics
 
         def forward(

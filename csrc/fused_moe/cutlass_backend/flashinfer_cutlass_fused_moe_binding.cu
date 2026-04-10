@@ -725,6 +725,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       // Returns 0 if the tactic is not supported on the current device (e.g., SM89 tile
       // configs with insufficient shared memory when running on SM120 Blackwell).
       return Function::FromTyped([this](int64_t tactic_id) -> int64_t {
+        std::lock_guard<std::mutex> lock(mMutex);
         if (tactic_id < 0 || tactic_id >= static_cast<int64_t>(mAllProfiles.size())) {
           return 0;
         }
