@@ -27,6 +27,7 @@ from flashinfer import (
     shuffle_matrix_a,
     shuffle_matrix_sf_a,
 )
+from flashinfer.autotuner import autotune
 from flashinfer.fused_moe import (
     convert_to_block_layout,
     trtllm_bf16_moe,
@@ -65,6 +66,7 @@ from flashinfer.utils import get_compute_capability
     ],
 )
 @pytest.mark.parametrize("quant_mode", ["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"])
+@pytest.mark.parametrize("enable_autotune", [True, False])
 def test_trtllm_gen_routed_fused_moe(
     num_tokens: int,
     hidden_size: int,
@@ -73,6 +75,7 @@ def test_trtllm_gen_routed_fused_moe(
     num_experts: int,
     routing_method_type: RoutingMethodType,
     quant_mode: Literal["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"],
+    enable_autotune: bool,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] not in [10]:
@@ -167,37 +170,38 @@ def test_trtllm_gen_routed_fused_moe(
         [hidden_states_global_scale * w2_global_scale] * num_experts, device=device
     )
 
-    reference_output = trtllm_fp4_block_scale_moe(
-        routing_logits,
-        None,  # routing_bias
-        hidden_states,
-        hidden_states_scale,
-        w13,
-        w13_scale,
-        None,  # w13_bias
-        None,  # gemm1_alpha
-        None,  # gemm1_beta
-        None,  # gemm1_clamp_limit
-        w2,
-        w2_scale,
-        None,  # w2_bias
-        output1_scale_scalar,
-        output1_scale_gate_scalar,
-        output2_scale_scalar,
-        num_experts,
-        top_k,
-        None,  # n_group
-        None,  # topk_group
-        intermediate_size,
-        0,  # local_expert_offset
-        num_experts,
-        None,  # routed_scaling_factor
-        routing_method_type.value,
-        True,  # do_finalize
-        enable_pdl,
-        ActivationType.Swiglu.value,  # act_type
-        None,
-    )[0].to(torch.float)
+    with autotune(enable_autotune):
+        reference_output = trtllm_fp4_block_scale_moe(
+            routing_logits,
+            None,  # routing_bias
+            hidden_states,
+            hidden_states_scale,
+            w13,
+            w13_scale,
+            None,  # w13_bias
+            None,  # gemm1_alpha
+            None,  # gemm1_beta
+            None,  # gemm1_clamp_limit
+            w2,
+            w2_scale,
+            None,  # w2_bias
+            output1_scale_scalar,
+            output1_scale_gate_scalar,
+            output2_scale_scalar,
+            num_experts,
+            top_k,
+            None,  # n_group
+            None,  # topk_group
+            intermediate_size,
+            0,  # local_expert_offset
+            num_experts,
+            None,  # routed_scaling_factor
+            routing_method_type.value,
+            True,  # do_finalize
+            enable_pdl,
+            ActivationType.Swiglu.value,  # act_type
+            None,
+        )[0].to(torch.float)
 
     if routing_method_type == RoutingMethodType.Renormalize:
         permute_info, expert_weights = routing_reference_renormalize(
@@ -220,37 +224,38 @@ def test_trtllm_gen_routed_fused_moe(
         torch.bfloat16
     ).view(torch.int16)
 
-    output = trtllm_fp4_block_scale_routed_moe(
-        packed_tensor,
-        None,  # routing_bias
-        hidden_states,
-        hidden_states_scale,
-        w13,
-        w13_scale,
-        None,  # w13_bias
-        None,  # gemm1_alpha
-        None,  # gemm1_beta
-        None,  # gemm1_clamp_limit
-        w2,
-        w2_scale,
-        None,  # w2_bias
-        output1_scale_scalar,
-        output1_scale_gate_scalar,
-        output2_scale_scalar,
-        num_experts,
-        top_k,
-        None,  # n_group
-        None,  # topk_group
-        intermediate_size,
-        0,  # local_expert_offset
-        num_experts,
-        None,  # routed_scaling_factor
-        routing_method_type.value,
-        True,  # do_finalize
-        enable_pdl,
-        ActivationType.Swiglu.value,  # act_type
-        None,
-    )[0].to(torch.float)
+    with autotune(enable_autotune):
+        output = trtllm_fp4_block_scale_routed_moe(
+            packed_tensor,
+            None,  # routing_bias
+            hidden_states,
+            hidden_states_scale,
+            w13,
+            w13_scale,
+            None,  # w13_bias
+            None,  # gemm1_alpha
+            None,  # gemm1_beta
+            None,  # gemm1_clamp_limit
+            w2,
+            w2_scale,
+            None,  # w2_bias
+            output1_scale_scalar,
+            output1_scale_gate_scalar,
+            output2_scale_scalar,
+            num_experts,
+            top_k,
+            None,  # n_group
+            None,  # topk_group
+            intermediate_size,
+            0,  # local_expert_offset
+            num_experts,
+            None,  # routed_scaling_factor
+            routing_method_type.value,
+            True,  # do_finalize
+            enable_pdl,
+            ActivationType.Swiglu.value,  # act_type
+            None,
+        )[0].to(torch.float)
 
     mask = torch.isclose(output, reference_output, rtol=1e-3, atol=1e-3)
 
@@ -270,6 +275,7 @@ def test_trtllm_gen_routed_fused_moe(
         RoutingMethodType.Renormalize,
     ],
 )
+@pytest.mark.parametrize("enable_autotune", [True, False])
 def test_trtllm_gen_fp8_routed_fused_moe(
     num_tokens: int,
     hidden_size: int,
@@ -277,6 +283,7 @@ def test_trtllm_gen_fp8_routed_fused_moe(
     top_k: int,
     num_experts: int,
     routing_method_type: RoutingMethodType,
+    enable_autotune: bool,
 ):
     """Test FP8 block scale routed MoE matches standard routing."""
     compute_capability = get_compute_capability(torch.device(device="cuda"))
@@ -327,28 +334,29 @@ def test_trtllm_gen_fp8_routed_fused_moe(
     )
 
     # Run reference with routing_logits
-    reference_output = trtllm_fp8_block_scale_moe(
-        routing_logits,
-        None,  # routing_bias
-        hidden_states,
-        hidden_states_scale,
-        gemm1_weights,
-        gemm1_weights_scale,
-        gemm2_weights,
-        gemm2_weights_scale,
-        num_experts,
-        top_k,
-        None,  # n_group
-        None,  # topk_group
-        intermediate_size,
-        0,  # local_expert_offset
-        num_experts,
-        None,  # routed_scaling_factor
-        routing_method_type.value,
-        False,  # use_shuffled_weight
-        0,  # weight_layout
-        enable_pdl,
-    ).to(torch.float)
+    with autotune(enable_autotune):
+        reference_output = trtllm_fp8_block_scale_moe(
+            routing_logits,
+            None,  # routing_bias
+            hidden_states,
+            hidden_states_scale,
+            gemm1_weights,
+            gemm1_weights_scale,
+            gemm2_weights,
+            gemm2_weights_scale,
+            num_experts,
+            top_k,
+            None,  # n_group
+            None,  # topk_group
+            intermediate_size,
+            0,  # local_expert_offset
+            num_experts,
+            None,  # routed_scaling_factor
+            routing_method_type.value,
+            False,  # use_shuffled_weight
+            0,  # weight_layout
+            enable_pdl,
+        ).to(torch.float)
 
     # Compute routing using reference implementation
     if routing_method_type == RoutingMethodType.Renormalize:
@@ -378,29 +386,30 @@ def test_trtllm_gen_fp8_routed_fused_moe(
     output = torch.empty(
         num_tokens, hidden_size, dtype=torch.bfloat16, device=hidden_states.device
     )
-    trtllm_fp8_block_scale_routed_moe(
-        topk_ids=packed_topk_ids,
-        routing_bias=None,
-        hidden_states=hidden_states,
-        hidden_states_scale=hidden_states_scale,
-        gemm1_weights=gemm1_weights,
-        gemm1_weights_scale=gemm1_weights_scale,
-        gemm2_weights=gemm2_weights,
-        gemm2_weights_scale=gemm2_weights_scale,
-        num_experts=num_experts,
-        top_k=top_k,
-        n_group=None,
-        topk_group=None,
-        intermediate_size=intermediate_size,
-        local_expert_offset=0,
-        local_num_experts=num_experts,
-        routed_scaling_factor=None,
-        routing_method_type=routing_method_type.value,
-        use_shuffled_weight=False,
-        weight_layout=0,
-        enable_pdl=enable_pdl,
-        output=output,
-    )
+    with autotune(enable_autotune):
+        trtllm_fp8_block_scale_routed_moe(
+            topk_ids=packed_topk_ids,
+            routing_bias=None,
+            hidden_states=hidden_states,
+            hidden_states_scale=hidden_states_scale,
+            gemm1_weights=gemm1_weights,
+            gemm1_weights_scale=gemm1_weights_scale,
+            gemm2_weights=gemm2_weights,
+            gemm2_weights_scale=gemm2_weights_scale,
+            num_experts=num_experts,
+            top_k=top_k,
+            n_group=None,
+            topk_group=None,
+            intermediate_size=intermediate_size,
+            local_expert_offset=0,
+            local_num_experts=num_experts,
+            routed_scaling_factor=None,
+            routing_method_type=routing_method_type.value,
+            use_shuffled_weight=False,
+            weight_layout=0,
+            enable_pdl=enable_pdl,
+            output=output,
+        )
     output = output.to(torch.float)
 
     mask = torch.isclose(output, reference_output, rtol=1e-2, atol=1e-2)
@@ -421,6 +430,7 @@ def test_trtllm_gen_fp8_routed_fused_moe(
         RoutingMethodType.Renormalize,
     ],
 )
+@pytest.mark.parametrize("enable_autotune", [True, False])
 def test_trtllm_gen_bf16_routed_fused_moe(
     num_tokens: int,
     hidden_size: int,
@@ -428,6 +438,7 @@ def test_trtllm_gen_bf16_routed_fused_moe(
     top_k: int,
     num_experts: int,
     routing_method_type: RoutingMethodType,
+    enable_autotune: bool,
 ):
     """Test Bf16 scale routed MoE matches standard routing."""
     compute_capability = get_compute_capability(torch.device(device="cuda"))
@@ -467,26 +478,27 @@ def test_trtllm_gen_bf16_routed_fused_moe(
     gemm2_weights = torch.stack(gemm2_weights_shuffled).view(torch.bfloat16)
 
     # Run reference with routing_logits
-    reference_output = trtllm_bf16_moe(
-        routing_logits=routing_logits,
-        routing_bias=None,
-        hidden_states=hidden_states,
-        gemm1_weights=gemm1_weights,
-        gemm2_weights=gemm2_weights,
-        num_experts=num_experts,
-        top_k=top_k,
-        n_group=None,
-        topk_group=None,
-        intermediate_size=intermediate_size,
-        local_expert_offset=0,
-        local_num_experts=num_experts,
-        routed_scaling_factor=None,
-        routing_method_type=routing_method_type.value,
-        use_shuffled_weight=True,
-        weight_layout=WeightLayout.BlockMajorK,
-        do_finalize=True,
-        enable_pdl=enable_pdl,
-    ).to(torch.float)
+    with autotune(enable_autotune):
+        reference_output = trtllm_bf16_moe(
+            routing_logits=routing_logits,
+            routing_bias=None,
+            hidden_states=hidden_states,
+            gemm1_weights=gemm1_weights,
+            gemm2_weights=gemm2_weights,
+            num_experts=num_experts,
+            top_k=top_k,
+            n_group=None,
+            topk_group=None,
+            intermediate_size=intermediate_size,
+            local_expert_offset=0,
+            local_num_experts=num_experts,
+            routed_scaling_factor=None,
+            routing_method_type=routing_method_type.value,
+            use_shuffled_weight=True,
+            weight_layout=WeightLayout.BlockMajorK,
+            do_finalize=True,
+            enable_pdl=enable_pdl,
+        ).to(torch.float)
 
     # Compute routing using reference implementation
     if routing_method_type == RoutingMethodType.Renormalize:
@@ -513,25 +525,26 @@ def test_trtllm_gen_bf16_routed_fused_moe(
     )
 
     # Run with pre-computed routing (packed format)
-    output = trtllm_bf16_routed_moe(
-        topk_ids=packed_topk_ids,
-        hidden_states=hidden_states,
-        gemm1_weights=gemm1_weights,
-        gemm2_weights=gemm2_weights,
-        num_experts=num_experts,
-        top_k=top_k,
-        n_group=None,
-        topk_group=None,
-        intermediate_size=intermediate_size,
-        local_expert_offset=0,
-        local_num_experts=num_experts,
-        routed_scaling_factor=None,
-        routing_method_type=routing_method_type.value,
-        use_shuffled_weight=True,
-        weight_layout=WeightLayout.BlockMajorK,
-        do_finalize=True,
-        enable_pdl=enable_pdl,
-    ).to(torch.float)
+    with autotune(enable_autotune):
+        output = trtllm_bf16_routed_moe(
+            topk_ids=packed_topk_ids,
+            hidden_states=hidden_states,
+            gemm1_weights=gemm1_weights,
+            gemm2_weights=gemm2_weights,
+            num_experts=num_experts,
+            top_k=top_k,
+            n_group=None,
+            topk_group=None,
+            intermediate_size=intermediate_size,
+            local_expert_offset=0,
+            local_num_experts=num_experts,
+            routed_scaling_factor=None,
+            routing_method_type=routing_method_type.value,
+            use_shuffled_weight=True,
+            weight_layout=WeightLayout.BlockMajorK,
+            do_finalize=True,
+            enable_pdl=enable_pdl,
+        ).to(torch.float)
 
     mask = torch.isclose(output, reference_output, rtol=1e-2, atol=1e-2)
 
@@ -547,7 +560,10 @@ def test_trtllm_gen_bf16_routed_fused_moe(
         pytest.param(ActivationType.Relu2.value, id="Relu2"),
     ],
 )
-def test_trtllm_gen_fp8_mxfp8_routed_activation_parity(activation_type: int):
+@pytest.mark.parametrize("enable_autotune", [True, False])
+def test_trtllm_gen_fp8_mxfp8_routed_activation_parity(
+    activation_type: int, enable_autotune: bool
+):
     """MXFP8 routed path should match non-routed reference for gated and non-gated activations."""
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] not in [10]:
@@ -641,30 +657,31 @@ def test_trtllm_gen_fp8_mxfp8_routed_activation_parity(activation_type: int):
     gemm2_weights_kernel = torch.stack(gemm2_weights_shuffled)
     gemm2_scales_kernel = torch.stack(gemm2_scales_shuffled)
 
-    output_ref = trtllm_fp8_block_scale_moe(
-        routing_logits=routing_logits,
-        routing_bias=None,
-        hidden_states=quant_inputs["hidden_states"],
-        hidden_states_scale=quant_inputs["hidden_states_scale"],
-        gemm1_weights=gemm1_weights_kernel,
-        gemm1_weights_scale=gemm1_scales_kernel,
-        gemm2_weights=gemm2_weights_kernel,
-        gemm2_weights_scale=gemm2_scales_kernel,
-        num_experts=num_experts,
-        top_k=top_k,
-        n_group=None,
-        topk_group=None,
-        intermediate_size=intermediate_size,
-        local_expert_offset=0,
-        local_num_experts=num_experts,
-        routed_scaling_factor=None,
-        routing_method_type=routing_method_type.value,
-        use_shuffled_weight=True,
-        weight_layout=WeightLayout.MajorK.value,
-        enable_pdl=enable_pdl,
-        fp8_quantization_type=Fp8QuantizationType.MxFp8,
-        activation_type=activation_type,
-    ).to(torch.float)
+    with autotune(enable_autotune):
+        output_ref = trtllm_fp8_block_scale_moe(
+            routing_logits=routing_logits,
+            routing_bias=None,
+            hidden_states=quant_inputs["hidden_states"],
+            hidden_states_scale=quant_inputs["hidden_states_scale"],
+            gemm1_weights=gemm1_weights_kernel,
+            gemm1_weights_scale=gemm1_scales_kernel,
+            gemm2_weights=gemm2_weights_kernel,
+            gemm2_weights_scale=gemm2_scales_kernel,
+            num_experts=num_experts,
+            top_k=top_k,
+            n_group=None,
+            topk_group=None,
+            intermediate_size=intermediate_size,
+            local_expert_offset=0,
+            local_num_experts=num_experts,
+            routed_scaling_factor=None,
+            routing_method_type=routing_method_type.value,
+            use_shuffled_weight=True,
+            weight_layout=WeightLayout.MajorK.value,
+            enable_pdl=enable_pdl,
+            fp8_quantization_type=Fp8QuantizationType.MxFp8,
+            activation_type=activation_type,
+        ).to(torch.float)
 
     permute_info, expert_weights_full = routing_reference_renormalize(
         routing_logits, top_k, num_experts, 8
@@ -677,30 +694,31 @@ def test_trtllm_gen_fp8_mxfp8_routed_activation_parity(activation_type: int):
         torch.int32
     )
 
-    output_routed = trtllm_fp8_block_scale_routed_moe(
-        topk_ids=packed_topk_ids,
-        routing_bias=None,
-        hidden_states=quant_inputs["hidden_states"],
-        hidden_states_scale=quant_inputs["hidden_states_scale"],
-        gemm1_weights=gemm1_weights_kernel,
-        gemm1_weights_scale=gemm1_scales_kernel,
-        gemm2_weights=gemm2_weights_kernel,
-        gemm2_weights_scale=gemm2_scales_kernel,
-        num_experts=num_experts,
-        top_k=top_k,
-        n_group=None,
-        topk_group=None,
-        intermediate_size=intermediate_size,
-        local_expert_offset=0,
-        local_num_experts=num_experts,
-        routed_scaling_factor=None,
-        routing_method_type=routing_method_type.value,
-        use_shuffled_weight=True,
-        weight_layout=WeightLayout.MajorK.value,
-        enable_pdl=enable_pdl,
-        fp8_quantization_type=Fp8QuantizationType.MxFp8,
-        activation_type=activation_type,
-    ).to(torch.float)
+    with autotune(enable_autotune):
+        output_routed = trtllm_fp8_block_scale_routed_moe(
+            topk_ids=packed_topk_ids,
+            routing_bias=None,
+            hidden_states=quant_inputs["hidden_states"],
+            hidden_states_scale=quant_inputs["hidden_states_scale"],
+            gemm1_weights=gemm1_weights_kernel,
+            gemm1_weights_scale=gemm1_scales_kernel,
+            gemm2_weights=gemm2_weights_kernel,
+            gemm2_weights_scale=gemm2_scales_kernel,
+            num_experts=num_experts,
+            top_k=top_k,
+            n_group=None,
+            topk_group=None,
+            intermediate_size=intermediate_size,
+            local_expert_offset=0,
+            local_num_experts=num_experts,
+            routed_scaling_factor=None,
+            routing_method_type=routing_method_type.value,
+            use_shuffled_weight=True,
+            weight_layout=WeightLayout.MajorK.value,
+            enable_pdl=enable_pdl,
+            fp8_quantization_type=Fp8QuantizationType.MxFp8,
+            activation_type=activation_type,
+        ).to(torch.float)
 
     close = torch.isclose(output_ref, output_routed, atol=1e-2, rtol=1e-2)
     mismatch_pct = (~close).float().mean().item() * 100

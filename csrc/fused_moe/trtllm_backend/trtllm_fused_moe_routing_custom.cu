@@ -565,7 +565,7 @@ void run(Data const& data, void* stream) {
       << "Routing kernel expects #experts " << data.mNumExperts << " to be a multiple of 4.";
 
   static int const smMajor = tensorrt_llm::common::getSMVersion() / 10;
-  bool const useSingleBlock = data.mNumTokens <= BlockKernelMaxNumTokens;
+  bool const useSingleBlock = data.mNumTokens <= BlockKernelMaxNumTokens && data.mPtrTopKPacked == nullptr;
   bool const useSingleCluster =
       (smMajor >= 9) && (data.mNumTokens <= MaxNumTokensSingleClusterScores);
 
