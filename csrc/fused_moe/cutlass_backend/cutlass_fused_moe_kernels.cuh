@@ -1482,20 +1482,17 @@ __global__ void expandInputRowsKernel(
         }
       }
 
-      // TEMPORARILY DISABLED for K-dim padding poison validation test
       // Pad zeros in the extra SFs along the K dimension, we do this to ensure there are no nan
       // values in the padded SF atom Use VecSize per thread since we are just writing out zeros so
       // every thread can process a whole vector
-      // size_t padding_start_offset = hidden_size / VecSize + start_offset;
-      // size_t padding_elems_in_col = padded_hidden_size / VecSize;
-      // for (int64_t elem_index = padding_start_offset; elem_index < padding_elems_in_col;
-      //      elem_index += stride) {
-      //   writeSF<VecSize, VecSize>(num_tokens_before_expert, expert, /*source_row*/ -1,
-      //   permuted_row,
-      //                             elem_index, padded_hidden_size, fc1_act_sf_flat,
-      //                             /* input_sf */ nullptr);  // Pass nulltpr input_sf so we write
-      //                             0
-      // }
+      size_t padding_start_offset = hidden_size / VecSize + start_offset;
+      size_t padding_elems_in_col = padded_hidden_size / VecSize;
+      for (int64_t elem_index = padding_start_offset; elem_index < padding_elems_in_col;
+           elem_index += stride) {
+        writeSF<VecSize, VecSize>(num_tokens_before_expert, expert, /*source_row*/ -1, permuted_row,
+                                  elem_index, padded_hidden_size, fc1_act_sf_flat,
+                                  /* input_sf */ nullptr);  // Pass nulltpr input_sf so we write 0
+      }
     } else if constexpr (PRE_QUANT_AWQ) {
       static_assert(!is_nvfp4 && !is_mxfp8, "NVFP4 and MXFP8 are not supported for AWQ");
       static_assert(!std::is_same_v<InputActivationsType, ExpandedActivationsType>,
@@ -1606,30 +1603,6 @@ void expandInputRowsKernelLauncher(
                                     false>;
     }
   }();
-
-  // TEMPORARY: Poison SF buffer with 0xFF before kernel to validate K-dim padding necessity.
-  // If K-dim padding is needed, 0xFF in padding positions will cause incorrect GEMM results.
-  if (fc1_act_sf_flat) {
-    // Determine scaling type from template type
-    auto scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE;
-#ifdef ENABLE_FP4
-    if constexpr (std::is_same_v<ExpandedActivationsType, __nv_fp4_e2m1>) {
-      scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4;
-    }
-#endif
-#ifdef ENABLE_FP8
-    if constexpr (std::is_same_v<ExpandedActivationsType, __nv_fp8_e4m3>) {
-      scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
-    }
-#endif
-    if (scaling_type != TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE) {
-      int64_t sf_total_elems =
-          getOffsetActivationSF(num_experts_per_node, num_rows * k, hidden_size, scaling_type);
-      cudaMemsetAsync(fc1_act_sf_flat, 0xFF,
-                      sf_total_elems * sizeof(TmaWarpSpecializedGroupedGemmInput::ElementSF),
-                      stream);
-    }
-  }
 
   cudaLaunchConfig_t config;
   config.gridDim = blocks;
@@ -2198,22 +2171,20 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKern
       }
     }
 
-    // TEMPORARILY DISABLED for K-dim padding poison validation test
     // Pad zeros in the extra SFs along the K dimension, we do this to ensure there are no nan
     // values in the padded SF atom
-    // if constexpr (IsNVFP4 || IsMXFP8) {
-    //   // Use VecSize per thread since we are just writing out zeros so every thread can process a
-    //   // whole vector
-    //   size_t padding_start_offset = inter_size / VecSize + start_offset;
-    //   size_t padding_elems_in_col = padded_inter_size / VecSize;
-    //   for (int64_t elem_index = padding_start_offset; elem_index < padding_elems_in_col;
-    //        elem_index += stride) {
-    //     writeSF<VecSize, VecSize>(num_tokens_before_expert, expert, /*source_row*/ -1, token,
-    //                               elem_index, padded_inter_size, fc2_act_sf_flat,
-    //                               /* input_sf */ nullptr);  // Pass nulltpr input_sf so we write
-    //                               0
-    //   }
-    // }
+    if constexpr (IsNVFP4 || IsMXFP8) {
+      // Use VecSize per thread since we are just writing out zeros so every thread can process a
+      // whole vector
+      size_t padding_start_offset = inter_size / VecSize + start_offset;
+      size_t padding_elems_in_col = padded_inter_size / VecSize;
+      for (int64_t elem_index = padding_start_offset; elem_index < padding_elems_in_col;
+           elem_index += stride) {
+        writeSF<VecSize, VecSize>(num_tokens_before_expert, expert, /*source_row*/ -1, token,
+                                  elem_index, padded_inter_size, fc2_act_sf_flat,
+                                  /* input_sf */ nullptr);  // Pass nulltpr input_sf so we write 0
+      }
+    }
   }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -2299,28 +2270,6 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
       return fn(NONE);
     }
   }();
-
-  // TEMPORARY: Poison SF buffer with 0xFF before kernel to validate K-dim padding necessity.
-  if (fc2_act_sf_flat) {
-    auto scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE;
-#ifdef ENABLE_FP4
-    if constexpr (std::is_same_v<T, __nv_fp4_e2m1>) {
-      scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4;
-    }
-#endif
-#ifdef ENABLE_FP8
-    if constexpr (std::is_same_v<T, __nv_fp8_e4m3>) {
-      scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
-    }
-#endif
-    if (scaling_type != TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE) {
-      int64_t sf_total_elems = getOffsetActivationSF(num_experts_per_node, expanded_num_tokens,
-                                                     inter_size, scaling_type);
-      cudaMemsetAsync(fc2_act_sf_flat, 0xFF,
-                      sf_total_elems * sizeof(TmaWarpSpecializedGroupedGemmInput::ElementSF),
-                      stream);
-    }
-  }
 
   cudaLaunchConfig_t config;
   config.gridDim = blocks;
