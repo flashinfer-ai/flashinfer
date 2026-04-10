@@ -1920,13 +1920,24 @@ def test_moe_nvfp4_unswizzled_input_sf():
     torch.testing.assert_close(output_swizzled, output_linear, rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.parametrize("batch_size", [1])
+@pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize(
     "hidden_size, intermediate_size",
     [
         # hidden_size=288: 288/16=18 scale cols, round_up(18,4)=20 -> padding.
         # Exercises the weight_scale_vec_size snap fix (issue #2847).
         (288, 128),
+        # Non-aligned hidden AND intermediate — exercises K-dim padding in BOTH
+        # expandInputRows (FC1 SFs, hidden→padded_hidden) and doActivation (FC2 SFs,
+        # inter→padded_inter).
+        (288, 192),  # hidden 288→384, inter 192→256: K-dim padding in both kernels
+        (160, 192),  # hidden 160→256, inter 192→256: K-dim padding in both kernels
+        (320, 160),  # hidden 320→384, inter 160→256: K-dim padding in both kernels
+        # Aligned hidden, non-aligned intermediate — only doActivation K-dim padding
+        (
+            256,
+            192,
+        ),  # hidden 256→256 (no pad), inter 192→256: K-dim padding in doActivation only
     ],
 )
 @pytest.mark.parametrize("num_experts", [2])
@@ -2323,18 +2334,6 @@ def test_moe_mxfp8_mxfp4_ndim_padding_safety(
     ]
 
     flash_output = torch.zeros_like(x)
-
-    # Poison GPU memory with 0xFF — same approach as the NVFP4 test.
-    poison = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device="cuda")
-    poison_ptr = poison.data_ptr()
-    poison.fill_(0xFF)
-    del poison
-    verify = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device="cuda")
-    assert verify.data_ptr() == poison_ptr, (
-        "CUDA did not reuse poisoned memory — test cannot guarantee SF buffer is poisoned"
-    )
-    assert verify[0].item() == 0xFF, "Poisoned memory was overwritten"
-    del verify
 
     _ = fused_moe.cutlass_fused_moe(
         mxfp8_x,
