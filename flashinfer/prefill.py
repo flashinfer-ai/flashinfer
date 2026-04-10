@@ -4281,9 +4281,7 @@ def trtllm_fmha_v2_prefill(
             raise ValueError(
                 f"Q_PAGED_KV_NHD expects paged_KV shape [pages, 2, page_size, num_kv_heads, head_dim], got {tuple(paged_kv.shape)}"
             )
-        # TODO: implement native NHD support in the kernel to avoid this transpose
-        kv_cache = paged_kv.transpose(-3, -2).contiguous()
-        k_cache, v_cache = kv_cache.unbind(dim=1)
+        k_cache, v_cache = paged_kv.unbind(dim=1)
     elif input_layout == "Q_PAGED_KV_HND":
         assert isinstance(qkv, tuple)
         query, paged_kv = qkv[0], qkv[1]
@@ -4317,9 +4315,11 @@ def trtllm_fmha_v2_prefill(
         page_size = 0  # Not applicable for packed layouts
         head_dim_v = query.shape[3]  # Assume same as head_dim_qk
     elif input_layout in ("Q_PAGED_KV_NHD", "Q_PAGED_KV_HND"):
-        # Q is 3D: [tokens, H, D], Paged KV (HND after any transpose): [num_pages, H_kv, page_size, D]
+        # Q is 3D: [tokens, H, D]
         num_qo_heads = query.shape[1]
-        page_size = k_cache.shape[2]
+        # Paged KV NHD: [num_pages, page_size, H_kv, D]
+        # Paged KV HND: [num_pages, H_kv, page_size, D]
+        page_size = k_cache.shape[1 if "NHD" in input_layout else 2]
         head_dim_v = v_cache.shape[3]
     elif input_layout == "CONTIGUOUS_Q_KV":
         # Q is 3D: [tokens, H, D], KV is 4D: [tokens, 2, H_kv, D]
