@@ -22,6 +22,7 @@ def gen_mxfp8_quantization_sm100_module() -> JitSpec:
     return gen_jit_spec(
         "mxfp8_quantization_sm100",
         [
+            jit_env.FLASHINFER_CSRC_DIR / "nan_check.cu",
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/thop/fp8Quantize.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/kernels/quantization.cu",

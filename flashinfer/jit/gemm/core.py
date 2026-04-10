@@ -339,6 +339,7 @@ def gen_gemm_sm100_module_cutlass_mxfp8() -> JitSpec:
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / "gen_gemm_sm100_cutlass_mxfp8"
     os.makedirs(gen_directory, exist_ok=True)
     source_paths = [
+        jit_env.FLASHINFER_CSRC_DIR / "nan_check.cu",
         jit_env.FLASHINFER_CSRC_DIR / "mxfp8_gemm_cutlass.cu",
     ]
 

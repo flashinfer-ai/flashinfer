@@ -24,6 +24,7 @@
 #include "flashinfer/gemm/cutlass_gemm_configs.h"
 #include "flashinfer/gemm/mxfp8_gemm_cutlass.h"
 #include "flashinfer/gemm/mxfp8_gemm_cutlass_template.h"
+#include "nan_check.h"
 #include "tvm_ffi_utils.h"
 
 using flashinfer::gemm::ClusterShape;
@@ -261,13 +262,24 @@ void mxfp8_bmm_impl(TensorView mat1, TensorView mat2, TensorView mat1Scale, Tens
         << out.size(i);
   }
 
+  auto stream = get_stream(mat1.device());
+
+  flashinfer::nan_check::LaunchNanCheckFp8Bytes(mat1.data_ptr(), mat1.numel(),
+                                                "mxfp8_gemm:mat1[fp8]", stream);
+  flashinfer::nan_check::LaunchNanCheckFp8Bytes(mat2.data_ptr(), mat2.numel(),
+                                                "mxfp8_gemm:mat2[fp8]", stream);
+
   switch (encode_dlpack_dtype(out.dtype())) {
     case float16_code:
       runGemm<half>(out, mat1, mat2, mat1Scale, mat2Scale, m, n, k, b, config, workspace_buffer);
+      flashinfer::nan_check::LaunchNanCheckHalf(out.data_ptr(), out.numel(),
+                                               "mxfp8_gemm:output[fp16]", stream);
       break;
     case bfloat16_code:
       runGemm<__nv_bfloat16>(out, mat1, mat2, mat1Scale, mat2Scale, m, n, k, b, config,
                              workspace_buffer);
+      flashinfer::nan_check::LaunchNanCheckBFloat16(out.data_ptr(), out.numel(),
+                                                    "mxfp8_gemm:output[bf16]", stream);
       break;
     default:
       TVM_FFI_ICHECK(false) << "out_dtype must be one of fp16/bf16.";

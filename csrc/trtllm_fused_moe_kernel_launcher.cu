@@ -29,6 +29,7 @@
 #include "flashinfer/trtllm/fused_moe/DevKernel.h"
 #include "flashinfer/trtllm/fused_moe/RoutingKernel.h"
 #include "flashinfer/trtllm/fused_moe/runner.h"
+#include "nan_check.h"
 #include "nv_internal/tensorrt_llm/kernels/quantization.h"
 #include "nv_internal/tensorrt_llm/thop/utils.h"
 #include "tvm_ffi_utils.h"
@@ -1974,6 +1975,13 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
   auto const num_tokens = hidden_states.size(0);
   auto const hidden_size = hidden_states.size(1);
 
+  {
+    auto stream = get_stream(hidden_states.device());
+    flashinfer::nan_check::LaunchNanCheckFp8Bytes(
+        hidden_states.data_ptr(), hidden_states.numel(),
+        "trtllm_fp8_block_scale_moe:hidden_states[fp8]", stream);
+  }
+
   auto supported_tile_nums = Fp8BlockScaleLauncher::getSupportedTileNums(quantization_type);
   // Build launchers for ALL supported tiles so autotuner-cached tactics always find their tile_N.
 
@@ -2019,9 +2027,25 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
   auto& selected_launcher = launcher_it->second;
 
   // Run the launcher with DeepSeek FP8 enabled - it will create its own runner internally
-  return selected_launcher->run(
+  auto result = selected_launcher->run(
       config, enable_pdl, false /* use_routing_scales_on_input */,
       quantization_type == Fp8QuantizationType::DeepSeekFp8 /* use_deep_seek_fp8 */);
+
+  {
+    auto stream = get_stream(hidden_states.device());
+    auto out_dtype = output.dtype();
+    if (out_dtype == dl_bfloat16) {
+      flashinfer::nan_check::LaunchNanCheckBFloat16(output.data_ptr(), output.numel(),
+                                                    "trtllm_fp8_block_scale_moe:output[bf16]",
+                                                    stream);
+    } else if (out_dtype == dl_float16) {
+      flashinfer::nan_check::LaunchNanCheckHalf(output.data_ptr(), output.numel(),
+                                                "trtllm_fp8_block_scale_moe:output[fp16]",
+                                                stream);
+    }
+  }
+
+  return result;
 }
 
 Array<Tensor> trtllm_fp4_block_scale_moe(

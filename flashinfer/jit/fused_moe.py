@@ -161,6 +161,7 @@ def gen_cutlass_fused_moe_module(
     return gen_jit_spec(
         f"fused_moe_{device_arch}",
         [
+            jit_env.FLASHINFER_CSRC_DIR / "nan_check.cu",
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_tma_warp_specialized_input.cu",
             jit_env.FLASHINFER_CSRC_DIR
@@ -285,6 +286,7 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
     return gen_jit_spec(
         "fused_moe_trtllm_sm100",
         [
+            jit_env.FLASHINFER_CSRC_DIR / "nan_check.cu",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/envUtils.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/logger.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/stringUtils.cpp",

@@ -19,6 +19,7 @@
 #include <cstdint>
 
 #include "cutlass/numeric_types.h"
+#include "nan_check.h"
 #include "tensorrt_llm/thop/utils.h"
 #include "tvm/ffi/error.h"
 
@@ -59,10 +60,16 @@ void mxfp8_quantize(TensorView input, TensorView valMxFP8, TensorView scaleFP8SF
       reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), layout, mMultiProcessorCount, enable_pdl, \
       get_stream(input.device()));
 
+  auto stream = get_stream(input.device());
+
   if (input.dtype() == dl_float16) {
+    flashinfer::nan_check::LaunchNanCheckHalf(input.data_ptr(), input.numel(),
+                                              "mxfp8_quantize:input[fp16]", stream);
     LAUNCH_MXFP8_QUANTIZE_KERNEL(half)
   } else if (input.dtype() == dl_bfloat16) {
 #ifdef ENABLE_BF16
+    flashinfer::nan_check::LaunchNanCheckBFloat16(input.data_ptr(), input.numel(),
+                                                  "mxfp8_quantize:input[bf16]", stream);
     LAUNCH_MXFP8_QUANTIZE_KERNEL(__nv_bfloat16)
 #else
     TVM_FFI_LOG_AND_THROW(NotImplementedError)
@@ -72,6 +79,9 @@ void mxfp8_quantize(TensorView input, TensorView valMxFP8, TensorView scaleFP8SF
     TVM_FFI_LOG_AND_THROW(NotImplementedError)
         << "mxfp8_quantize only supports input tensor with dtypes fp16/bf16.";
   }
+
+  flashinfer::nan_check::LaunchNanCheckFp8Bytes(valMxFP8.data_ptr(), valMxFP8.numel() * 1,
+                                                "mxfp8_quantize:output[fp8]", stream);
 
 #undef LAUNCH_MXFP8_QUANTIZE_KERNEL
 }
