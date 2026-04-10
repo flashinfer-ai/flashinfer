@@ -49,6 +49,7 @@ from .utils import (
     _check_kv_layout,
     _check_pos_encoding_mode,
     check_shape_dtype_device,
+    get_alibi_slopes,
     _get_cache_alibi_slopes_buf,
     _get_cache_buf,
     _unpack_paged_kv_cache,
@@ -64,6 +65,7 @@ from .utils import (
     register_fake_op,
     ceil_div,
     round_up,
+    SINGLE_KERNEL_TMP_SIZE,
     prepare_jit_additional_args,
 )
 
@@ -1027,9 +1029,7 @@ def single_prefill_with_kv_cache_with_jit_module(
     return_lse: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     device = q.device
-    tmp = _get_cache_buf(
-        "single_prefill_with_kv_cache_tmp", 32 * 1024 * 1024, device=device
-    )
+    tmp = torch.empty(SINGLE_KERNEL_TMP_SIZE, dtype=torch.uint8, device=device)
     o = torch.empty(q.shape[:-1] + v.shape[-1:], dtype=q.dtype, device=device)
     lse = None
     if return_lse:
@@ -1245,7 +1245,7 @@ def single_prefill_with_kv_cache(
     """
     _check_pos_encoding_mode(pos_encoding_mode)
     _check_kv_layout(kv_layout)
-    tmp = _get_cache_buf("single_prefill_with_kv_cache_tmp", 32 * 1024 * 1024, q.device)
+    tmp = torch.empty(SINGLE_KERNEL_TMP_SIZE, dtype=torch.uint8, device=q.device)
     if logits_soft_cap is None:
         logits_soft_cap = 0.0
     if sm_scale is None:
@@ -1325,7 +1325,9 @@ def single_prefill_with_kv_cache(
         TensorLayout[kv_layout].value,
         window_left,
         packed_custom_mask,
-        _get_cache_alibi_slopes_buf(q.shape[1], q.device),
+        get_alibi_slopes(q.shape[1], device=q.device)
+        if pos_encoding_mode == "ALIBI"
+        else None,
         logits_soft_cap,
         sm_scale,
         scale_q,
