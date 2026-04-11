@@ -1359,6 +1359,7 @@ def get_trtllm_moe_sm100_module():
             expert_weights=expert_weights,
             hidden_states=hidden_states,
             hidden_states_scale=None,
+            per_token_scale=None,
         )
         tuning_config = moe_runner._make_tuning_config(
             moe_inputs,
@@ -1524,6 +1525,7 @@ def get_trtllm_moe_sm100_module():
             expert_weights=expert_weights,
             hidden_states=hidden_states,
             hidden_states_scale=None,
+            per_token_scale=None,
         )
         tuning_config = moe_runner._make_tuning_config(
             moe_inputs,
@@ -1739,6 +1741,7 @@ def get_trtllm_moe_sm100_module():
             expert_weights=expert_weights,
             hidden_states=hidden_states,
             hidden_states_scale=hidden_states_scale,
+            per_token_scale=None,
         )
         tuning_config = moe_runner._make_tuning_config(
             moe_inputs,
@@ -2160,6 +2163,7 @@ def get_trtllm_moe_sm100_module():
             expert_weights=expert_weights,
             hidden_states=hidden_states,
             hidden_states_scale=None,
+            per_token_scale=None,
         )
         tuning_config = moe_runner._make_tuning_config(
             moe_inputs,

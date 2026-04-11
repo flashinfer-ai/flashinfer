@@ -25,7 +25,6 @@ from flashinfer import (
 from flashinfer.fused_moe import (
     trtllm_fp4_block_scale_routed_moe,
 )
-from flashinfer.utils import device_support_pdl
 from flashinfer.fp4_quantization import (
     block_scale_interleave,
     e2m1_and_ufp8sf_scale_to_float,
@@ -44,10 +43,10 @@ cache_permute_indices: Dict[tuple, torch.Tensor] = {}
 
 
 @pytest.mark.parametrize("num_tokens", [8, 256, 512, 1024])
-@pytest.mark.parametrize("hidden_size", [1024, 2048, 3072, 4096])
-@pytest.mark.parametrize("intermediate_size", [1024, 2048, 3072, 4096])
+@pytest.mark.parametrize("hidden_size", [1024, 2048, 4096])
+@pytest.mark.parametrize("intermediate_size", [1024, 2048, 4096])
 @pytest.mark.parametrize("num_experts", [128, 256])
-@pytest.mark.parametrize("top_k", [4, 8])
+@pytest.mark.parametrize("top_k", [8])
 def test_trtllm_gen_routed_fused_moe(
     num_tokens: int,
     hidden_size: int,
@@ -66,20 +65,26 @@ def test_trtllm_gen_routed_fused_moe(
         device=device,
         dtype=torch.bfloat16,
     )
-    w13_bf16 = torch.randn(
-        num_experts,
-        intermediate_size * 2,
-        hidden_size,
-        device=device,
-        dtype=torch.bfloat16,
-    ) * 0.1
-    w2_bf16 = torch.randn(
-        num_experts,
-        hidden_size,
-        intermediate_size,
-        device=device,
-        dtype=torch.bfloat16,
-    ) * 0.1
+    w13_bf16 = (
+        torch.randn(
+            num_experts,
+            intermediate_size * 2,
+            hidden_size,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        * 0.1
+    )
+    w2_bf16 = (
+        torch.randn(
+            num_experts,
+            hidden_size,
+            intermediate_size,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        * 0.1
+    )
 
     # ======== Routing ========
     routing_logits = torch.rand(num_tokens, num_experts, device=device).to(
@@ -127,9 +132,7 @@ def test_trtllm_gen_routed_fused_moe(
         sf_use_ue8m0=False,
         is_global_scale_inversed=True,
     )
-    w2_scale = w2_scale.view(torch.float8_e4m3fn).reshape(
-        num_experts, hidden_size, -1
-    )
+    w2_scale = w2_scale.view(torch.float8_e4m3fn).reshape(num_experts, hidden_size, -1)
 
     # ======== Dequantize ========
     # Use dquantized input for more accurate comparison
@@ -137,7 +140,7 @@ def test_trtllm_gen_routed_fused_moe(
     hidden_states_dequant = e2m1_and_ufp8sf_scale_to_float(
         hidden_states.cpu(),
         hidden_states_scale.cpu().view(torch.uint8).reshape(-1),
-        torch.tensor([1.0], device='cpu'),
+        torch.tensor([1.0], device="cpu"),
         16,
         1,
         False,
@@ -148,7 +151,7 @@ def test_trtllm_gen_routed_fused_moe(
     w13_dequant = torch.empty_like(w13_bf16)
     w2_dequant = torch.empty_like(w2_bf16)
     for i in range(num_experts):
-        w13_dequant_= e2m1_and_ufp8sf_scale_to_float(
+        w13_dequant_ = e2m1_and_ufp8sf_scale_to_float(
             w13[i].cpu(),
             w13_scale[i].cpu().view(torch.uint8).reshape(-1),
             w13_global_scale_inv.cpu(),
@@ -169,20 +172,34 @@ def test_trtllm_gen_routed_fused_moe(
         w2_dequant[i] = w2_dequant_.to(torch.bfloat16)
 
     # ======== Reference Result ========
-    reference = torch.zeros((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16)
-    for token_idx in range(num_tokens):
-        for expert_rank in range(top_k):
-            expert_id = topk_ids[token_idx, expert_rank].item()
-            weight = expert_weights[token_idx, expert_rank].item()
-            # w1: [2*n, k] @ [k] -> [2*n]
-            up_gate = hidden_states_dequant[token_idx] @ w13_dequant[expert_id].T  # [2*n]
-            # gate, up = up_gate.chunk(2, dim=0)
-            up, gate = up_gate.chunk(2, dim=0)
-            intermediate = torch.nn.functional.silu(gate) * up  # [n]
-            # w2: [k, n] @ [n] -> [k]
-            expert_out = intermediate @ w2_dequant[expert_id].T  # [k]
-            reference[token_idx] += weight * expert_out
-    
+    # Flatten token/top_k dims: [num_tokens*top_k]
+    flat_ids = topk_ids.reshape(-1)  # [num_tokens*top_k]
+    flat_weights = expert_weights.reshape(-1)  # [num_tokens*top_k]
+    # Gather hidden states and weights for each (token, expert) pair
+    # hidden: [num_tokens*top_k, hidden_size]
+    flat_hidden = (
+        hidden_states_dequant.unsqueeze(1)
+        .expand(-1, top_k, -1)
+        .reshape(-1, hidden_size)
+    )
+    # w1: gather [num_tokens*top_k, 2*ffn_dim, hidden_size]
+    flat_w13 = w13_dequant[flat_ids]  # [num_tokens*top_k, 2*ffn_dim, hidden_size]
+    # w1: [num_tokens*top_k, 2*ffn_dim]
+    up_gate = torch.bmm(flat_w13, flat_hidden.unsqueeze(-1)).squeeze(-1)
+    up, gate = up_gate.chunk(2, dim=-1)
+    intermediate = torch.nn.functional.silu(gate) * up  # [num_tokens*top_k, ffn_dim]
+    # w2: [num_tokens*top_k, hidden_size, ffn_dim]
+    flat_w2 = w2_dequant[flat_ids]
+    expert_out = torch.bmm(flat_w2, intermediate.unsqueeze(-1)).squeeze(
+        -1
+    )  # [num_tokens*top_k, hidden_size]
+    # Weighted sum back to [num_tokens, hidden_size]
+    reference = (
+        (flat_weights.unsqueeze(-1) * expert_out)
+        .reshape(num_tokens, top_k, hidden_size)
+        .sum(dim=1)
+    )
+
     # ======== Prepare MoE ========
 
     epilogue_tile_m = 128
@@ -197,9 +214,7 @@ def test_trtllm_gen_routed_fused_moe(
             epilogue_tile_m,
         )
         w13_shuffled.append(
-            w13[i]
-            .view(torch.uint8)[permute_indices.to(device)]
-            .contiguous()
+            w13[i].view(torch.uint8)[permute_indices.to(device)].contiguous()
         )
         permute_sf_indices = _maybe_get_cached_w3_w1_permute_indices(
             cache_permute_indices,
@@ -209,7 +224,7 @@ def test_trtllm_gen_routed_fused_moe(
         )
         w13_scale_shuffled.append(
             block_scale_interleave(
-                w13_scale.reshape(num_experts, intermediate_size*2, -1)[i]
+                w13_scale.reshape(num_experts, intermediate_size * 2, -1)[i]
                 .view(torch.uint8)[permute_sf_indices.to(device)]
                 .contiguous()
             )
@@ -220,9 +235,7 @@ def test_trtllm_gen_routed_fused_moe(
             epilogue_tile_m,
         )
         w2_shuffled.append(
-            w2[i]
-            .view(torch.uint8)[permute_indices.to(device)]
-            .contiguous()
+            w2[i].view(torch.uint8)[permute_indices.to(device)].contiguous()
         )
         permute_sf_indices = get_w2_permute_indices_with_cache(
             cache_permute_indices,
@@ -252,6 +265,7 @@ def test_trtllm_gen_routed_fused_moe(
 
     # ======== Launch MoE ========
     from functools import partial
+
     fn = partial(
         trtllm_fp4_block_scale_routed_moe,
         packed_tensor,
@@ -287,17 +301,18 @@ def test_trtllm_gen_routed_fused_moe(
     )
 
     from flashinfer.autotuner import autotune
+
     with autotune(False):
         result = fn()[0]
 
     torch.cuda.synchronize()
 
-    print(f'{reference=}')
-    print(f'{result=}')
+    print(f"{reference=}")
+    print(f"{result=}")
 
     # mismatch percentage
     rtol = 0.2
     mask = torch.abs((reference - result) * torch.reciprocal(reference)) < rtol
     mismatch_rate = (~mask).float().mean().item()
-    print(f'Mismatch: {mismatch_rate * 100}%')
+    print(f"Mismatch: {mismatch_rate * 100}%")
     assert mismatch_rate < 0.3

@@ -348,7 +348,7 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
         vec, reciprocal_approximate_ftz(perTokenScale), &fp8Scale);
     reinterpret_cast<uint32_t*>(weightOutput)[vecOffset] = fp4x8;
 
-    static constexpr int THREADS_PER_SCALE = SF_VEC_SIZE / ELTS_PER_THREAD; // 2
+    static constexpr int THREADS_PER_SCALE = SF_VEC_SIZE / ELTS_PER_THREAD;  // 2
     if (threadIdx.x % THREADS_PER_SCALE == 0) {
       uint32_t num_sf_vecs_per_row = (n + SF_VEC_SIZE - 1) / SF_VEC_SIZE;
       auto sfVecIdx = vecIdx / THREADS_PER_SCALE;
@@ -359,7 +359,8 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
           sfOffset = rowIdx * num_sf_vecs_per_row + sfVecIdx;
           break;
         case QuantizationSFLayout::SWIZZLED_128x4:
-          sfOffset = get_sf_out_offset_128x4(std::nullopt, rowIdx, sfVecIdx, m, num_sf_vecs_per_row);
+          sfOffset =
+              get_sf_out_offset_128x4(std::nullopt, rowIdx, sfVecIdx, m, num_sf_vecs_per_row);
           break;
         case QuantizationSFLayout::SWIZZLED_8x4:
           sfOffset = get_sf_out_offset_8x4(std::nullopt, rowIdx, sfVecIdx, m, num_sf_vecs_per_row);

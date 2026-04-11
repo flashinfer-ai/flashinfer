@@ -187,7 +187,8 @@ constexpr int CVT_FP8_TO_FP4_ELTS_PER_THREAD = 16;
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // FP4/MXFP8 Quantization Kernels
 
-template <BlockScaleQuantizationType quantization_type, class Type, int SF_VEC_SIZE, bool UE8M0_SF, bool USE_ROW_WISE_SCALE=false, bool USE_INVERSE_SCALE=false>
+template <BlockScaleQuantizationType quantization_type, class Type, int SF_VEC_SIZE, bool UE8M0_SF,
+          bool USE_ROW_WISE_SCALE = false, bool USE_INVERSE_SCALE = false>
 __global__ void
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 __launch_bounds__(512, 4) quantize_with_block_size(
@@ -336,7 +337,8 @@ quantize_with_block_size(
 }
 
 // quantize with TMA in high throughput mode
-template <BlockScaleQuantizationType quantization_type, class Type, int SF_VEC_SIZE, bool UE8M0_SF, bool USE_ROW_WISE_SCALE=false, bool USE_INVERSE_SCALE=false>
+template <BlockScaleQuantizationType quantization_type, class Type, int SF_VEC_SIZE, bool UE8M0_SF,
+          bool USE_ROW_WISE_SCALE = false, bool USE_INVERSE_SCALE = false>
 __global__ void
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 __launch_bounds__(288, 2) quantize_with_block_size_tma(
