@@ -344,7 +344,12 @@ def test_fp4_moe_autotune(
 
     with autotune(tune_mode=True):
         if routed:
-            topk_ids = torch.randint(0, num_experts, (num_tokens, top_k), device=device)
+            topk_ids = torch.stack(
+                [
+                    torch.randperm(num_experts, device=device)[:top_k]
+                    for _ in range(num_tokens)
+                ]
+            )
             topk_weights = torch.ones(
                 num_tokens, top_k, dtype=torch.bfloat16, device=device
             )
@@ -447,7 +452,12 @@ def test_fp8_moe_autotune(
 
     with autotune(tune_mode=True):
         if routed:
-            topk_ids = torch.randint(0, num_experts, (num_tokens, top_k), device=device)
+            topk_ids = torch.stack(
+                [
+                    torch.randperm(num_experts, device=device)[:top_k]
+                    for _ in range(num_tokens)
+                ]
+            )
             topk_weights = torch.ones(
                 num_tokens, top_k, dtype=torch.bfloat16, device=device
             )

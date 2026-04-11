@@ -89,12 +89,14 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
   if (params.mPtrTopKIds != nullptr) {
     if (validToken) {
       if (laneIdx < params.mTopK) {
-        auto expertIdx = params.mPtrTopKIds[warpIdx * params.mTopK + laneIdx];
+        auto const expandedIdx = warpIdx * params.mTopK + laneIdx;
+        if (params.mPtrExpandedIdxToPermutedIdx != nullptr) {
+          params.mPtrExpandedIdxToPermutedIdx[expandedIdx] = int32_t{-1};
+        }
+        auto expertIdx = params.mPtrTopKIds[expandedIdx];
         if (expertIdx > -1 && expertIdx < params.mNumExperts) {
           int offset = warpIdx * MaxNumExperts + expertIdx;
           smemKIdx[offset] = static_cast<int8_t>(laneIdx);
-        } else if (params.mPtrExpandedIdxToPermutedIdx != nullptr) {
-          params.mPtrExpandedIdxToPermutedIdx[warpIdx * params.mTopK + laneIdx] = int32_t{-1};
         }
       }
     }
@@ -122,6 +124,13 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
     if (validToken) {
       if (laneIdx < params.mTopK) {
         auto const expandedIdx = warpIdx * params.mTopK + laneIdx;
+        // Pre-initialize to -1: when duplicate expert IDs appear, multiple
+        // lanes race on the same smemKIdx slot and only one wins.  Losing
+        // lanes would skip the else-branch below, leaving their entry as
+        // uninitialized garbage.  Writing -1 up front makes every entry safe.
+        if (params.mPtrExpandedIdxToPermutedIdx != nullptr) {
+          params.mPtrExpandedIdxToPermutedIdx[expandedIdx] = int32_t{-1};
+        }
         auto const scoreIdx = params.mPtrTopKPacked[expandedIdx];
         int const expertIdx = static_cast<int>(scoreIdx.idx);
         if (expertIdx >= 0 && expertIdx < params.mNumExperts) {
@@ -130,8 +139,6 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
           if (params.mPtrTopKWeights != nullptr) {
             params.mPtrTopKWeights[expandedIdx] = static_cast<OutputT>(scoreIdx.score);
           }
-        } else if (params.mPtrExpandedIdxToPermutedIdx != nullptr) {
-          params.mPtrExpandedIdxToPermutedIdx[expandedIdx] = int32_t{-1};
         }
       }
     }
@@ -401,11 +408,13 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
   for (int tokenIdx = warpIdx; tokenIdx < params.mNumTokens; tokenIdx += numWarps) {
     if (params.mPtrTopKIds != nullptr) {
       if (laneIdx < params.mTopK) {
-        auto expertIdx = params.mPtrTopKIds[tokenIdx * params.mTopK + laneIdx];
+        auto const expandedIdx = tokenIdx * params.mTopK + laneIdx;
+        if (params.mPtrExpandedIdxToPermutedIdx != nullptr) {
+          params.mPtrExpandedIdxToPermutedIdx[expandedIdx] = int32_t{-1};
+        }
+        auto expertIdx = params.mPtrTopKIds[expandedIdx];
         if (expertIdx > -1 && expertIdx < params.mNumExperts) {
           smemKIdx[tokenIdx * MaxNumExperts + expertIdx] = static_cast<int8_t>(laneIdx);
-        } else if (params.mPtrExpandedIdxToPermutedIdx != nullptr) {
-          params.mPtrExpandedIdxToPermutedIdx[tokenIdx * params.mTopK + laneIdx] = int32_t{-1};
         }
       }
     } else if (params.mPtrScores != nullptr) {
@@ -428,7 +437,10 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
       }
     } else if (params.mPtrTopKPacked != nullptr) {
       if (laneIdx < params.mTopK) {
-        auto expandedIdx = tokenIdx * params.mTopK + laneIdx;
+        auto const expandedIdx = tokenIdx * params.mTopK + laneIdx;
+        if (params.mPtrExpandedIdxToPermutedIdx != nullptr) {
+          params.mPtrExpandedIdxToPermutedIdx[expandedIdx] = int32_t{-1};
+        }
         auto scoreIdx = params.mPtrTopKPacked[expandedIdx];
         int const expertIdx = static_cast<int>(scoreIdx.idx);
         if (expertIdx >= 0 && expertIdx < params.mNumExperts) {
@@ -436,8 +448,6 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
           if (params.mPtrTopKWeights != nullptr) {
             params.mPtrTopKWeights[expandedIdx] = static_cast<OutputT>(scoreIdx.score);
           }
-        } else if (params.mPtrExpandedIdxToPermutedIdx != nullptr) {
-          params.mPtrExpandedIdxToPermutedIdx[expandedIdx] = int32_t{-1};
         }
       }
     }
