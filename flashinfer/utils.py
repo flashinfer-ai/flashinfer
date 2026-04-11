@@ -464,6 +464,17 @@ def is_cutlass_backend_supported(
     return True
 
 
+@functools.lru_cache(maxsize=1)
+def _is_cute_dsl_available() -> bool:
+    """Check if nvidia-cutlass-dsl is available for CuTe DSL backends."""
+    try:
+        import cutlass.cute  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
 def determine_attention_backend(
     device: torch.device,
     pos_encoding_mode: int,
@@ -507,6 +518,29 @@ def determine_attention_backend(
         return "fa3"
     else:
         return "fa2"
+
+
+def _should_use_cute_dsl(
+    device: torch.device,
+    pos_encoding_mode: int,
+    use_custom_mask: bool,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+) -> bool:
+    """Check if the CuTe DSL backend should be used for SM12x attention.
+
+    This is separate from determine_attention_backend because cute_dsl is only
+    supported by BatchPrefillWithKVCacheWrapper, not by single_prefill, decode,
+    or sparse attention APIs.
+    """
+    return (
+        (is_sm120a_supported(device) or is_sm121a_supported(device))
+        and not use_custom_mask
+        and pos_encoding_mode == PosEncodingMode.NONE.value
+        and dtype_q in {torch.float16, torch.bfloat16}
+        and dtype_kv in {torch.float16, torch.bfloat16}
+        and _is_cute_dsl_available()
+    )
 
 
 def version_at_least(version: str, base_version: str) -> bool:
