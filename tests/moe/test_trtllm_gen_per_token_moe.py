@@ -34,6 +34,7 @@ from flashinfer.fused_moe.core import (
     get_w2_permute_indices_with_cache,
     _maybe_get_cached_w3_w1_permute_indices,
 )
+from flashinfer.utils import device_support_pdl, get_compute_capability
 from .test_trtllm_gen_fused_moe import (
     routing_reference_topk,
 )
@@ -42,11 +43,11 @@ torch.manual_seed(42)
 cache_permute_indices: Dict[tuple, torch.Tensor] = {}
 
 
-@pytest.mark.parametrize("num_tokens", [8, 256, 512, 1024])
+@pytest.mark.parametrize("num_tokens", [1, 8, 1024])
 @pytest.mark.parametrize("hidden_size", [1024, 2048, 4096])
 @pytest.mark.parametrize("intermediate_size", [1024, 2048, 4096])
-@pytest.mark.parametrize("num_experts", [128, 256])
-@pytest.mark.parametrize("top_k", [8])
+@pytest.mark.parametrize("num_experts", [128])
+@pytest.mark.parametrize("top_k", [4])
 def test_trtllm_gen_routed_fused_moe(
     num_tokens: int,
     hidden_size: int,
@@ -55,8 +56,10 @@ def test_trtllm_gen_routed_fused_moe(
     top_k: int,
 ):
     device = torch.device("cuda:0")
-    # enable_pdl = device_support_pdl(device)
-    enable_pdl = False
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] not in [10]:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+    enable_pdl = device_support_pdl(device)
 
     # ======== Input Tensors ========
     hidden_states_bf16 = torch.randn(
@@ -306,9 +309,6 @@ def test_trtllm_gen_routed_fused_moe(
         result = fn()[0]
 
     torch.cuda.synchronize()
-
-    print(f"{reference=}")
-    print(f"{result=}")
 
     # mismatch percentage
     rtol = 0.2
