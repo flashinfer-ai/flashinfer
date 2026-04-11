@@ -32,12 +32,14 @@ _CONFIGS = [
 @pytest.mark.parametrize(
     "paged_cache", [False, True], ids=["contiguous_cache", "paged_cache"]
 )
-def test_ssu_incremental(nheads, head_dim, d_state, ngroups, state_dtype, paged_cache):
+@pytest.mark.parametrize("T", [2, 6, 16], ids=["mtp2", "mtp6", "mtp16"])
+def test_ssu_incremental(
+    nheads, head_dim, d_state, ngroups, state_dtype, paged_cache, T
+):
     """
     For each k in 0..T, run both CUDA and Triton incremental kernels with
     identical inputs and verify output and state match.
     """
-    T = 6
     batch = 2
     device = "cuda"
     dtype = torch.bfloat16
