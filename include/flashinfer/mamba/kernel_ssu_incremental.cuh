@@ -251,12 +251,12 @@ struct SsuIncrementalStorage {
   // old_x: padded to NTOKENS_PAD rows. Swizzled when USE_TENSOR_MMA (for ldmatrix.trans
   //         in replay MMA), flat when SIMT. SIMT path only reads [0, NTOKENS) rows.
   alignas(16) input_t old_x[NTOKENS_PAD][DIM];
-  input_t old_B[NTOKENS][DSTATE];
 
-  // dB_scaled: precomputed coeff[t] * old_B[t][n] in Swizzle<3,3,3> [NTOKENS_PAD, DSTATE] layout.
-  // Replay MMA B operand via ldmatrix.trans (LDSM_T).  Same swizzle as B/C arrays.
+  // old_B: padded to NTOKENS_PAD rows, Swizzle<3,3,3> [NTOKENS_PAD, DSTATE] layout.
+  // Replay MMA reads via ldmatrix.trans (LDSM_T) + register scaling.
+  // SIMT path reads through swizzled layout. Padding rows zero-filled.
   static constexpr bool USE_TENSOR_MMA_STATIC = (sizeof(state_t) == 2);
-  alignas(16) input_t dB_scaled[USE_TENSOR_MMA_STATIC ? NTOKENS_PAD * DSTATE : 1];
+  alignas(16) input_t old_B[NTOKENS_PAD][DSTATE];
 
   float old_dt_proc[NTOKENS];
   float old_cumAdt[NTOKENS];
@@ -631,14 +631,27 @@ __device__ __forceinline__ void load_data(SmemT& smem, SsuIncrementalParams cons
     }
   }
 
-  // ── All warps: plain LDG for old_B[T, dstate] ──
+  // ── All warps: old_B[T, dstate] → swizzled [NTOKENS_PAD, DSTATE] via CuTe TiledCopy + ZFILL ──
   {
-    constexpr int total_elems = NTOKENS * DSTATE;
-    for (int i = flat_tid; i < total_elems; i += num_threads) {
-      int const t = i / DSTATE;
-      int const n = i % DSTATE;
-      smem.old_B[t][n] = old_B_ptr[oB_base + t * params.old_B_stride_mtp + n];
+    using namespace cute;
+    constexpr int NTOKENS_PAD = SmemT::NTOKENS_PAD;
+    Tensor sOB = make_tensor(make_smem_ptr(reinterpret_cast<input_t*>(&smem.old_B[0][0])),
+                             make_swizzled_layout_rc<NTOKENS_PAD, DSTATE>());
+    Tensor gOB = make_tensor(make_gmem_ptr(old_B_ptr + oB_base),
+                             make_layout(make_shape(Int<NTOKENS_PAD>{}, Int<DSTATE>{}),
+                                         make_stride(params.old_B_stride_mtp, Int<1>{})));
+    // 128 threads: 16 rows × 8 cols, each thread copies 8 bf16 (128 bits)
+    auto g2s = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS_ZFILL<uint128_t>, input_t>{},
+                               Layout<Shape<_16, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, _8>>{});
+    auto thr = g2s.get_slice(flat_tid);
+    auto id = make_identity_tensor(make_shape(Int<NTOKENS_PAD>{}, Int<DSTATE>{}));
+    auto thr_id = thr.partition_S(id);
+    auto pred = make_tensor<bool>(shape(thr_id));
+    CUTE_UNROLL
+    for (int i = 0; i < size(pred); ++i) {
+      pred(i) = get<0>(thr_id(i)) < NTOKENS;
     }
+    copy_if(g2s, pred, thr.partition_S(gOB), thr.partition_D(sOB));
   }
 
   // ── old_dt_proc[T] and old_cumAdt[T] (small, single thread each) ──
@@ -784,45 +797,52 @@ __device__ __forceinline__ void compute_CB_scaled(SmemT& smem, int lane) {
 }
 
 // =============================================================================
-// Phase 1b-pre: Precompute dB_scaled[NTOKENS_PAD, DSTATE] for replay MMA.
-// dB_scaled[t, n] = exp(total_cumAdt - old_cumAdt[t]) * old_dt_proc[t] * old_B[t][n]
-// for t < prev_k, zero for t >= prev_k. Writes to swizzled smem layout.
-// All 128 threads cooperate (SIMT).
+// Scale frag_B registers in-place: frag_B[i] *= coeff[k_index[i]].
+// Replaces the old precompute_dB_scaled SIMT loop — the scaling now happens
+// in registers after ldmatrix.trans loads old_B into frag_B.
+// Also handles input_t → mma_type conversion in the same pass.
+//
+// K-index derivation (m16n8k16 _TN MMA, B fragment = 4 bf16 per thread):
+//   lane = tid % 32;  K_base = (lane % 4) * 2;
+//   elem 0 → K_base,   elem 1 → K_base+1,
+//   elem 2 → K_base+8, elem 3 → K_base+9
 // =============================================================================
-template <typename input_t, int NTOKENS, int DSTATE, int NUM_WARPS, typename SmemT>
-__device__ __forceinline__ void precompute_dB_scaled(SmemT& smem, int warp, int lane, int prev_k) {
+template <typename input_t, typename mma_type, typename FragB, typename SmemT>
+__device__ __forceinline__ void compute_dB_scaling(FragB& frag_B, SmemT const& smem,
+                                                   float total_cumAdt, int prev_k, int lane) {
   using namespace cute;
-  constexpr int NTOKENS_PAD = SmemT::NTOKENS_PAD;
-  int const flat_tid = warp * warpSize + lane;
-  constexpr int num_threads = NUM_WARPS * warpSize;
-
-  float total_cumAdt = (prev_k > 0) ? smem.old_cumAdt[prev_k - 1] : 0.f;
-
-  // ── dB_scaled: Swizzle<3,3,3> [NTOKENS_PAD, DSTATE] (same layout as B) ──
-  // Replay MMA reads via ldmatrix.trans (LDSM_T), which transposes to give K stride-1
-  // in registers.  128-byte rows fit the standard swizzle → conflict-free.
-  input_t* dB_base = smem.dB_scaled;
-  auto layout_dB = make_swizzled_layout_rc<NTOKENS_PAD, DSTATE>();
-
-  constexpr int total_dB = DSTATE * NTOKENS_PAD;
-  for (int i = flat_tid; i < total_dB; i += num_threads) {
-    int const nn = i / NTOKENS_PAD;  // DSTATE column
-    int const t = i % NTOKENS_PAD;   // NTOKENS row
-    float val = 0.f;
-    if (t < prev_k) {
-      float coeff = __expf(total_cumAdt - smem.old_cumAdt[t]) * smem.old_dt_proc[t];
-      val = coeff * toFloat(smem.old_B[t][nn]);
+  static_assert(size(FragB{}) == 4, "m16n8k16 B fragment must have 4 elements");
+  int const K_base = (lane % 4) * 2;
+  // K indices for the 4 fragment elements
+  int const k_idx[4] = {K_base, K_base + 1, K_base + 8, K_base + 9};
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    int const k = k_idx[i];
+    float val;
+    if constexpr (!std::is_same_v<input_t, mma_type>) {
+      input_t orig;
+      memcpy(&orig, &frag_B(i), 2);
+      val = toFloat(orig);
+    } else {
+      val = toFloat(frag_B(i));
     }
-    convertAndStore(&dB_base[layout_dB(t, nn)], val);
+    if (k < prev_k) {
+      float coeff = __expf(total_cumAdt - smem.old_cumAdt[k]) * smem.old_dt_proc[k];
+      val *= coeff;
+    } else {
+      val = 0.f;
+    }
+    mma_type result(val);
+    memcpy(&frag_B(i), &result, 2);
   }
 }
 
 // =============================================================================
 // Phase 1b: Replay — tensor-core MMA path.
-// state[D, dstate] = state * total_decay + old_x^T @ dB_scaled
+// state[D, dstate] = state * total_decay + old_x^T @ (coeff * old_B)
 // All 128 threads cooperate. TiledMMA covers [M=64, N=8] per step (4 atoms in M).
 // A operand read directly from old_x via ldmatrix.trans (no transpose buffer).
-// B operand (dB_scaled) stored as [NTOKENS_PAD, DSTATE] Swizzle<3,3,3>, read via ldmatrix.trans.
+// B operand read from old_B via ldmatrix.trans, scaled in registers by coeff[t].
 // =============================================================================
 template <typename input_t, typename state_t, int NTOKENS, int DIM, int DSTATE, int NUM_WARPS,
           typename SmemT>
@@ -875,13 +895,13 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
     }
   }
 
-  // ── B operand: dB_scaled [NTOKENS_PAD, DSTATE] Swizzle<3,3,3>, transposed view [N=DSTATE,
+  // ── B operand: old_B [NTOKENS_PAD, DSTATE] Swizzle<3,3,3>, transposed view [N=DSTATE,
   // K=NTOKENS_PAD] ── ldmatrix.trans reads from N-stride-1 smem and transposes → K stride-1 in
-  // registers.
+  // registers.  Scaling by coeff[k] applied in registers after load.
   auto layout_B =
       make_swizzled_layout_rc_transpose<NTOKENS_PAD, DSTATE>();  // shape (DSTATE, NTOKENS_PAD)
   Tensor smem_B_full =
-      make_tensor(make_smem_ptr(reinterpret_cast<mma_type const*>(smem.dB_scaled)), layout_B);
+      make_tensor(make_smem_ptr(reinterpret_cast<mma_type const*>(&smem.old_B[0][0])), layout_B);
 
   auto s2r_B = make_tiled_copy_B(Copy_Atom<SM75_U16x4_LDSM_T, mma_type>{}, tiled_mma);
   auto s2r_thr_B = s2r_B.get_slice(tid);
@@ -910,7 +930,7 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
       frag_h(i) = toFloat(state_base[layout_state_swz(row, col)]) * total_decay;
     }
 
-    // Load B for this N-tile
+    // Load old_B for this N-tile via ldmatrix.trans, then scale in registers
     Tensor smem_B_ntile =
         local_tile(smem_B_full, make_tile(Int<N_TILE>{}, Int<NTOKENS_PAD>{}), make_coord(n, _0{}));
     Tensor smem_B_s2r = s2r_thr_B.partition_S(smem_B_ntile);
@@ -919,14 +939,8 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
     Tensor frag_B_view = s2r_thr_B.retile_D(frag_B);
     cute::copy(s2r_B, smem_B_s2r, frag_B_view);
 
-    if constexpr (!std::is_same_v<input_t, mma_type>) {
-#pragma unroll
-      for (int i = 0; i < size(frag_B); ++i) {
-        input_t orig;
-        memcpy(&orig, &frag_B(i), 2);
-        frag_B(i) = mma_type(toFloat(orig));
-      }
-    }
+    // Scale frag_B by coeff[k] on the fly (handles type conversion + zero-fill for k >= prev_k)
+    compute_dB_scaling<input_t, mma_type>(frag_B, smem, total_cumAdt, prev_k, lane);
 
     cute::gemm(tiled_mma, frag_h, frag_A, frag_B, frag_h);
 
@@ -954,11 +968,14 @@ __device__ __forceinline__ void replay_state(SmemT& smem, int warp, int lane, in
   float total_decay = (prev_k > 0) ? __expf(total_cumAdt) : 1.f;
 
   // ── Read state (state_t), compute in f32, write back (state_t) ──
-  // When USE_TENSOR_MMA, state is in swizzled smem layout.
+  // When USE_TENSOR_MMA, state and old_B are in swizzled smem layouts.
   using state_t = std::remove_const_t<std::remove_reference_t<decltype(smem.state[0][0])>>;
   constexpr bool USE_TENSOR_MMA = (sizeof(state_t) == 2);
+  constexpr int NTOKENS_PAD = SmemT::NTOKENS_PAD;
   state_t* state_base = &smem.state[0][0];
   [[maybe_unused]] auto layout_state = make_swizzled_layout_rc<DIM, DSTATE>();
+  input_t const* old_B_base = &smem.old_B[0][0];
+  [[maybe_unused]] auto layout_old_B = make_swizzled_layout_rc<NTOKENS_PAD, DSTATE>();
 
   for (int r = 0; r < ROWS_PER_WARP; r++) {
     int const dd = my_row_offset + r;
@@ -973,7 +990,7 @@ __device__ __forceinline__ void replay_state(SmemT& smem, int warp, int lane, in
 
       for (int t = 0; t < prev_k; t++) {
         float coeff = __expf(total_cumAdt - smem.old_cumAdt[t]) * smem.old_dt_proc[t];
-        val += toFloat(smem.old_x[t][dd]) * coeff * toFloat(smem.old_B[t][n]);
+        val += toFloat(smem.old_x[t][dd]) * coeff * toFloat(old_B_base[layout_old_B(t, n)]);
       }
 
       if constexpr (USE_TENSOR_MMA) {
@@ -1529,11 +1546,7 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   }
 
   if constexpr (USE_TENSOR_MMA) {
-    // Phase 1b-pre: precompute dB_scaled (old_x read directly via ldmatrix.trans)
-    precompute_dB_scaled<input_t, NTOKENS, DSTATE, NUM_WARPS>(smem, warp, lane, prev_k);
-    __syncthreads();  // dB_scaled visible to all warps
-
-    // Phase 1b: MMA replay
+    // Phase 1b: MMA replay (old_B read directly via ldmatrix.trans + register scaling)
     replay_state_mma<input_t, state_t, NTOKENS, DIM, DSTATE, NUM_WARPS>(smem, warp, lane, prev_k);
   } else {
     replay_state<input_t, NTOKENS, DIM, DSTATE, NUM_WARPS>(smem, warp, lane, prev_k);
