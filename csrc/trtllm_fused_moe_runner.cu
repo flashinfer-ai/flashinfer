@@ -763,11 +763,12 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
     // TODO(siyuan): should this value be exposed?
     float globalScaleInv = 1.f / 448.f / 6.f;
     invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(
-        workspace.total_max_padded_tokens, args.intermediate_size,
+        args.num_tokens * args.top_k, args.intermediate_size,
         reinterpret_cast<__nv_bfloat16 const*>(workspace.gemm1_output), globalScaleInv,
-        nullptr, // workspace.expanded_idx_to_permuted_idx,
+        workspace.expanded_idx_to_permuted_idx,
         reinterpret_cast<uint8_t*>(workspace.activation_output),
         reinterpret_cast<uint8_t*>(workspace.activation_output_scale),
+        reinterpret_cast<float*>(workspace.token_scales_fc2), sfLayout, stream);
 
     gemm2_input = workspace.activation_output;
     gemm2_input_scale = workspace.activation_output_scale;
