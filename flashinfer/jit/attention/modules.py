@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 import os
-from typing import List
+from typing import List, Optional
 
 import jinja2
 import torch
@@ -1281,6 +1281,7 @@ def gen_customize_single_prefill_module(
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
+    mask_modes: Optional[List[int]] = None,
 ) -> JitSpec:
     kwargs = {
         "variant_decl": variant_decl,
@@ -1322,6 +1323,7 @@ def gen_customize_single_prefill_module(
             "additional_func_params": additional_func_params,
             "additional_params_decl": additional_params_decl,
             "additional_params_setter": additional_params_setter,
+            "has_q_block_expanding_offset": "q_block_expanding_offset" in additional_scalar_names,
         }
 
         generated_inc_str = config_templ.render(
@@ -1330,7 +1332,8 @@ def gen_customize_single_prefill_module(
         os.makedirs(gen_directory, exist_ok=True)
 
         source_paths = []
-        for mask_mode in [0, 1, 2, 3]:
+        _mask_modes = mask_modes if mask_modes is not None else [0, 1, 2, 3]
+        for mask_mode in _mask_modes:
             filename = f"single_prefill_kernel_mask_{mask_mode}.cu"
             dest_path = gen_directory / filename
             source_paths.append(dest_path)
@@ -1394,7 +1397,8 @@ def gen_customize_single_prefill_module(
         os.makedirs(gen_directory, exist_ok=True)
 
         source_paths = []
-        for mask_mode in [0, 1, 2, 3]:
+        _mask_modes = mask_modes if mask_modes is not None else [0, 1, 2, 3]
+        for mask_mode in _mask_modes:
             filename = f"single_prefill_sm90_kernel_mask_{mask_mode}.cu"
             dest_path = gen_directory / filename
             source_paths.append(dest_path)
@@ -1526,6 +1530,7 @@ def gen_customize_batch_prefill_module(
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
+    mask_modes: Optional[List[int]] = None,
 ) -> JitSpec:
     kwargs = {
         "variant_decl": variant_decl,
@@ -1581,7 +1586,8 @@ def gen_customize_batch_prefill_module(
         os.makedirs(gen_directory, exist_ok=True)
 
         source_paths = []
-        for mask_mode in [0, 1, 2, 3]:
+        _mask_modes = mask_modes if mask_modes is not None else [0, 1, 2, 3]
+        for mask_mode in _mask_modes:
             dest_path = (
                 gen_directory / f"batch_prefill_paged_kernel_mask_{mask_mode}.cu"
             )
@@ -1655,7 +1661,8 @@ def gen_customize_batch_prefill_module(
         generated_inc_str = config_templ.render(**kwargs)
 
         source_paths = []
-        for mask_mode in [0, 1, 2, 3]:
+        _mask_modes = mask_modes if mask_modes is not None else [0, 1, 2, 3]
+        for mask_mode in _mask_modes:
             filename = f"batch_prefill_paged_sm90_kernel_mask_{mask_mode}.cu"
             dest_path = gen_directory / filename
             source_paths.append(dest_path)

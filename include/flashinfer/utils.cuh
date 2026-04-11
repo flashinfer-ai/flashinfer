@@ -178,6 +178,11 @@
       __VA_ARGS__                                                 \
       break;                                                      \
     }                                                             \
+    case MaskMode::kBlockExpanding: {                             \
+      constexpr MaskMode MASK_MODE = MaskMode::kBlockExpanding;   \
+      __VA_ARGS__                                                 \
+      break;                                                      \
+    }                                                             \
     default: {                                                    \
       std::ostringstream err_msg;                                 \
       err_msg << "Unsupported mask_mode: " << int(mask_mode);     \
@@ -518,6 +523,12 @@ __device__ __forceinline__ uint32_t dim4_offset(const uint32_t& dim_c, const uin
   template <typename T>                                                                        \
   inline constexpr bool has_##member##_v = has_##member<T>::value;
 
+// DLLM Block Expanding related type traits (defined once here to avoid ODR violations)
+DEFINE_HAS_MEMBER(dllm_block_size)
+DEFINE_HAS_MEMBER(q_block_expanding_offset)
+DEFINE_HAS_MEMBER(maybe_q_block_expanding_offset)  // per-batch q_offset pointer for FA3 BatchPrefill
+DEFINE_HAS_MEMBER(kv_block_expanding_offset)       // kv_offset for Cascade Current Chunk
+DEFINE_HAS_MEMBER(maybe_kv_block_expanding_offset) // per-batch kv_offset pointer for FA3 BatchPrefill
 }  // namespace flashinfer
 
 #endif  // FLASHINFER_UTILS_CUH_
