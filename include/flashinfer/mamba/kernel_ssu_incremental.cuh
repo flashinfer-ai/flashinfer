@@ -187,17 +187,19 @@ __device__ __forceinline__ auto make_swizzled_layout_rc() {
 // Transposed swizzled smem layout: maps (col, row) → same physical offset as
 // make_swizzled_layout_rc maps (row, col). Enables bank-conflict-free ldmatrix.trans
 // reads on data stored with make_swizzled_layout_rc.
-// Requires COLS % 8 == 0 (matches the 8-row swizzle atom dimension).
+// Built by swapping modes of the original inner layout (before swizzle), which
+// guarantees correct cross-atom offsets when both dimensions have multiple atoms.
 template <int ROWS, int COLS>
 __device__ __forceinline__ auto make_swizzled_layout_rc_transpose() {
   using namespace cute;
   static_assert(ROWS % 8 == 0, "ROWS must be multiple of 8 for swizzle atom");
   static_assert(COLS % 64 == 0, "COLS must be multiple of 64 for swizzle atom");
-  // Column-major inner layout: (col, row) → row * COLS + col — same flat index
-  // as the row-major (row, col) layout used in make_swizzled_layout_rc.
-  auto atom = composition(Swizzle<3, 3, 3>{},
-                          make_layout(make_shape(_64{}, _8{}), make_stride(_1{}, _64{})));
-  return tile_to_shape(atom, make_shape(Int<COLS>{}, Int<ROWS>{}));
+  // Build the inner (un-swizzled) tiled layout for the original (ROWS, COLS) layout
+  auto inner = tile_to_shape(make_layout(make_shape(_8{}, _64{}), make_stride(_64{}, _1{})),
+                             make_shape(Int<ROWS>{}, Int<COLS>{}));
+  // Swap modes to get true transpose: result(c, r) == original(r, c)
+  auto inner_T = make_layout(get<1>(inner), get<0>(inner));
+  return composition(Swizzle<3, 3, 3>{}, inner_T);
 }
 
 // Swizzled smem layout for f32 arrays (e.g. smem.out).
@@ -210,22 +212,6 @@ __device__ __forceinline__ auto make_swizzled_layout_rc_f32() {
   static_assert(COLS % 32 == 0, "COLS must be multiple of 32 for f32 swizzle atom");
   auto atom = composition(Swizzle<3, 3, 3>{},
                           make_layout(make_shape(_8{}, _32{}), make_stride(_32{}, _1{})));
-  return tile_to_shape(atom, make_shape(Int<ROWS>{}, Int<COLS>{}));
-}
-
-// Swizzled smem layout for narrow bf16/fp16 arrays with 16 columns (32 bytes/row).
-// Atom: 8 rows × 16 cols.  Swizzle<1,3,2> XORs col bit 3 with row bit 2,
-// swapping the two 8-element halves for rows 4-7.  This spreads 8 ldmatrix
-// threads across all 32 banks (rows 0-3 hit bank groups {0-3,8-11,16-19,24-27},
-// rows 4-7 hit {4-7,12-15,20-23,28-31}).  M=3 keeps the low 8 elements
-// contiguous so 16-byte ldmatrix reads are unaffected.
-template <int ROWS, int COLS>
-__device__ __forceinline__ auto make_swizzled_layout_k16() {
-  using namespace cute;
-  static_assert(ROWS % 8 == 0, "ROWS must be multiple of 8 for swizzle atom");
-  static_assert(COLS == 16, "COLS must be 16 for narrow-row swizzle atom");
-  auto atom = composition(Swizzle<1, 3, 2>{},
-                          make_layout(make_shape(_8{}, _16{}), make_stride(_16{}, _1{})));
   return tile_to_shape(atom, make_shape(Int<ROWS>{}, Int<COLS>{}));
 }
 
@@ -267,14 +253,10 @@ struct SsuIncrementalStorage {
   alignas(16) input_t old_x[NTOKENS_PAD][DIM];
   input_t old_B[NTOKENS][DSTATE];
 
-  // dB_scaled: precomputed coeff[t] * old_B[t][n] in Swizzle<1,3,2> [DSTATE, NTOKENS_PAD] layout.
-  // Replay MMA B operand via LDSM_N.  Swizzle eliminates ldmatrix bank conflicts on 32-byte rows.
+  // dB_scaled: precomputed coeff[t] * old_B[t][n] in Swizzle<3,3,3> [NTOKENS_PAD, DSTATE] layout.
+  // Replay MMA B operand via ldmatrix.trans (LDSM_T).  Same swizzle as B/C arrays.
   static constexpr bool USE_TENSOR_MMA_STATIC = (sizeof(state_t) == 2);
   alignas(16) input_t dB_scaled[USE_TENSOR_MMA_STATIC ? NTOKENS_PAD * DSTATE : 1];
-
-  // old_x_T: transposed old_x in Swizzle<1,3,2> [DIM, NTOKENS_PAD] layout.
-  // Replay MMA A operand via LDSM_N.  Swizzle eliminates ldmatrix bank conflicts on 32-byte rows.
-  alignas(16) input_t old_x_T[USE_TENSOR_MMA_STATIC ? DIM * NTOKENS_PAD : 1];
 
   float old_dt_proc[NTOKENS];
   float old_cumAdt[NTOKENS];
@@ -816,37 +798,22 @@ __device__ __forceinline__ void precompute_dB_scaled(SmemT& smem, int warp, int 
 
   float total_cumAdt = (prev_k > 0) ? smem.old_cumAdt[prev_k - 1] : 0.f;
 
-  // ── dB_scaled: Swizzle<1,3,2> [DSTATE, NTOKENS_PAD] for MMA B operand ──
-  // B operand [N, K] needs K (=NTOKENS_PAD) stride-1, so store as [DSTATE, NTOKENS_PAD].
-  // Swizzle<1,3,2> eliminates ldmatrix bank conflicts on 32-byte rows.
+  // ── dB_scaled: Swizzle<3,3,3> [NTOKENS_PAD, DSTATE] (same layout as B) ──
+  // Replay MMA reads via ldmatrix.trans (LDSM_T), which transposes to give K stride-1
+  // in registers.  128-byte rows fit the standard swizzle → conflict-free.
   input_t* dB_base = smem.dB_scaled;
-  auto layout_dB = make_swizzled_layout_k16<DSTATE, NTOKENS_PAD>();
+  auto layout_dB = make_swizzled_layout_rc<NTOKENS_PAD, DSTATE>();
 
   constexpr int total_dB = DSTATE * NTOKENS_PAD;
   for (int i = flat_tid; i < total_dB; i += num_threads) {
-    int const nn = i / NTOKENS_PAD;  // DSTATE row
-    int const t = i % NTOKENS_PAD;   // NTOKENS column
+    int const nn = i / NTOKENS_PAD;  // DSTATE column
+    int const t = i % NTOKENS_PAD;   // NTOKENS row
     float val = 0.f;
     if (t < prev_k) {
       float coeff = __expf(total_cumAdt - smem.old_cumAdt[t]) * smem.old_dt_proc[t];
       val = coeff * toFloat(smem.old_B[t][nn]);
     }
-    convertAndStore(&dB_base[layout_dB(nn, t)], val);
-  }
-
-  // ── old_x_T: transpose old_x from Swizzle<3,3,3> [NTOKENS_PAD, DIM] to Swizzle<1,3,2> [DIM,
-  // NTOKENS_PAD] ── K (=NTOKENS_PAD) stride-1 within atom, matching _TN A operand for LDSM_N.
-  auto layout_ox = make_swizzled_layout_rc<NTOKENS_PAD, DIM>();
-  input_t const* ox_src = reinterpret_cast<input_t const*>(&smem.old_x[0][0]);
-  input_t* ox_dst = smem.old_x_T;
-  auto layout_ox_T = make_swizzled_layout_k16<DIM, NTOKENS_PAD>();
-
-  constexpr int total_ox = DIM * NTOKENS_PAD;
-  for (int i = flat_tid; i < total_ox; i += num_threads) {
-    int const d = i / NTOKENS_PAD;  // DIM row
-    int const k = i % NTOKENS_PAD;  // NTOKENS column
-    ox_dst[layout_ox_T(d, k)] =
-        ox_src[layout_ox(k, d)];  // read swizzled (k, d), write swizzled (d, k)
+    convertAndStore(&dB_base[layout_dB(t, nn)], val);
   }
 }
 
@@ -854,8 +821,8 @@ __device__ __forceinline__ void precompute_dB_scaled(SmemT& smem, int warp, int 
 // Phase 1b: Replay — tensor-core MMA path.
 // state[D, dstate] = state * total_decay + old_x^T @ dB_scaled
 // All 128 threads cooperate. TiledMMA covers [M=64, N=8] per step (4 atoms in M).
-// A operand (old_x_T) loaded once, B operand (dB_scaled) per N-tile.
-// Both use Swizzle<1,3,2> on [ROWS, 16] layouts for conflict-free ldmatrix.
+// A operand read directly from old_x via ldmatrix.trans (no transpose buffer).
+// B operand (dB_scaled) stored as [NTOKENS_PAD, DSTATE] Swizzle<3,3,3>, read via ldmatrix.trans.
 // =============================================================================
 template <typename input_t, typename state_t, int NTOKENS, int DIM, int DSTATE, int NUM_WARPS,
           typename SmemT>
@@ -882,12 +849,15 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
   float total_cumAdt = (prev_k > 0) ? smem.old_cumAdt[prev_k - 1] : 0.f;
   float total_decay = (prev_k > 0) ? __expf(total_cumAdt) : 1.f;
 
-  // ── A operand: old_x_T [DIM=64, NTOKENS_PAD=16] Swizzle<1,3,2> ──
-  auto layout_A_swz = make_swizzled_layout_k16<DIM, NTOKENS_PAD>();
+  // ── A operand: old_x [NTOKENS_PAD=16, DIM=64] Swizzle<3,3,3>, transposed view [M=DIM,
+  // K=NTOKENS_PAD] ── ldmatrix.trans reads from M-stride-1 smem and transposes → K stride-1 in
+  // registers.
+  auto layout_A =
+      make_swizzled_layout_rc_transpose<NTOKENS_PAD, DIM>();  // shape (DIM, NTOKENS_PAD)
   Tensor smem_A =
-      make_tensor(make_smem_ptr(reinterpret_cast<mma_type const*>(smem.old_x_T)), layout_A_swz);
+      make_tensor(make_smem_ptr(reinterpret_cast<mma_type const*>(&smem.old_x[0][0])), layout_A);
 
-  auto s2r_A = make_tiled_copy_A(Copy_Atom<SM75_U32x4_LDSM_N, mma_type>{}, tiled_mma);
+  auto s2r_A = make_tiled_copy_A(Copy_Atom<SM75_U16x8_LDSM_T, mma_type>{}, tiled_mma);
   auto s2r_thr_A = s2r_A.get_slice(tid);
   Tensor smem_A_s2r = s2r_thr_A.partition_S(smem_A);
   Tensor frag_A = thr_mma.partition_fragment_A(
@@ -905,12 +875,15 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
     }
   }
 
-  // ── B operand: dB_scaled [DSTATE, NTOKENS_PAD] Swizzle<1,3,2> ──
-  auto layout_B_swz = make_swizzled_layout_k16<DSTATE, NTOKENS_PAD>();
+  // ── B operand: dB_scaled [NTOKENS_PAD, DSTATE] Swizzle<3,3,3>, transposed view [N=DSTATE,
+  // K=NTOKENS_PAD] ── ldmatrix.trans reads from N-stride-1 smem and transposes → K stride-1 in
+  // registers.
+  auto layout_B =
+      make_swizzled_layout_rc_transpose<NTOKENS_PAD, DSTATE>();  // shape (DSTATE, NTOKENS_PAD)
   Tensor smem_B_full =
-      make_tensor(make_smem_ptr(reinterpret_cast<mma_type const*>(smem.dB_scaled)), layout_B_swz);
+      make_tensor(make_smem_ptr(reinterpret_cast<mma_type const*>(smem.dB_scaled)), layout_B);
 
-  auto s2r_B = make_tiled_copy_B(Copy_Atom<SM75_U32x2_LDSM_N, mma_type>{}, tiled_mma);
+  auto s2r_B = make_tiled_copy_B(Copy_Atom<SM75_U16x4_LDSM_T, mma_type>{}, tiled_mma);
   auto s2r_thr_B = s2r_B.get_slice(tid);
 
   // ── State: [DIM, DSTATE] swizzled ──
@@ -1556,9 +1529,9 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   }
 
   if constexpr (USE_TENSOR_MMA) {
-    // Phase 1b-pre: precompute dB_scaled + transpose old_x (both Swizzle<1,3,2>)
+    // Phase 1b-pre: precompute dB_scaled (old_x read directly via ldmatrix.trans)
     precompute_dB_scaled<input_t, NTOKENS, DSTATE, NUM_WARPS>(smem, warp, lane, prev_k);
-    __syncthreads();  // dB_scaled and old_x_T visible to all warps
+    __syncthreads();  // dB_scaled visible to all warps
 
     // Phase 1b: MMA replay
     replay_state_mma<input_t, state_t, NTOKENS, DIM, DSTATE, NUM_WARPS>(smem, warp, lane, prev_k);
