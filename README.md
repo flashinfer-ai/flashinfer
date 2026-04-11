@@ -136,6 +136,8 @@ cd flashinfer
 python -m pip install -v .
 ```
 
+On Jetson or when the GPU is not visible at import time (e.g. with MLC), set the target arch before building and before running your app, e.g. `export FLASHINFER_CUDA_ARCH_LIST="8.7"` for sm87.
+
 **For development**, install in editable mode:
 
 ```bash
@@ -158,7 +160,7 @@ python -m pip install dist/*.whl
 
 ```bash
 # flashinfer-jit-cache (customize for your target GPUs)
-export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a 10.3a 11.0a 12.0f"
+export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.7 8.9 9.0a 10.0a 10.3a 11.0a 12.0f"
 cd flashinfer-jit-cache
 python -m build --no-isolation --wheel
 python -m pip install dist/*.whl
