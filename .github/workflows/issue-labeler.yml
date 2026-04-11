@@ -1,0 +1,52 @@
+name: Issue Labeler
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Label by component dropdown
+        env:
+          GH_TOKEN: ${{ secrets.FLASHINFER_BOT_TOKEN }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          LABELS=""
+
+          # Match component dropdown value from issue form
+          # "MoE Routing" must be checked before "MoE"
+          if echo "$ISSUE_BODY" | grep -q "MoE Routing"; then
+            LABELS="op: moe-routing"
+          elif echo "$ISSUE_BODY" | grep -q "MoE"; then
+            LABELS="op: moe"
+          fi
+
+          if echo "$ISSUE_BODY" | grep -q "Attention"; then
+            LABELS="${LABELS:+$LABELS,}op: attention"
+          fi
+          if echo "$ISSUE_BODY" | grep -q "GEMM"; then
+            LABELS="${LABELS:+$LABELS,}op: gemm"
+          fi
+          if echo "$ISSUE_BODY" | grep -q "Communication"; then
+            LABELS="${LABELS:+$LABELS,}op: comm"
+          fi
+          if echo "$ISSUE_BODY" | grep -q "Norm"; then
+            LABELS="${LABELS:+$LABELS,}op: norm"
+          fi
+          if echo "$ISSUE_BODY" | grep -q "Sampling"; then
+            LABELS="${LABELS:+$LABELS,}op: misc"
+          fi
+          if echo "$ISSUE_BODY" | grep -q "Quantization"; then
+            LABELS="${LABELS:+$LABELS,}op: misc"
+          fi
+
+          if [ -n "$LABELS" ]; then
+            gh issue edit "${{ github.event.issue.number }}" \
+              --repo "${{ github.repository }}" \
+              --add-label "$LABELS"
+          fi
