@@ -651,6 +651,74 @@ def test_batch_fast_decode_tensor_cores_cuda_graph(
     torch.testing.assert_close(lse, lse_tensor_cores, rtol=1e-3, atol=1e-3)
 
 
+def test_batch_decode_fixed_cta_tile_q_rejected_without_tensor_cores():
+    """fixed_cta_tile_q must raise when use_tensor_cores=False."""
+    batch_size, kv_len, page_size, num_kv_heads, head_dim = 2, 512, 16, 4, 128
+    num_pages_per_seq = (kv_len + page_size - 1) // page_size
+    total_num_pages = num_pages_per_seq * batch_size
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda:0", dtype=torch.int32)
+        * num_pages_per_seq
+    )
+    kv_indices = torch.arange(0, total_num_pages, device="cuda:0", dtype=torch.int32)
+    kv_last_page_len = torch.full(
+        (batch_size,), page_size, dtype=torch.int32, device="cuda:0"
+    )
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace_buffer, use_tensor_cores=False
+    )
+    with pytest.raises(
+        ValueError, match="fixed_cta_tile_q is only supported by tensor core decode"
+    ):
+        wrapper.plan(
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            num_kv_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            data_type=torch.float16,
+            fixed_cta_tile_q=64,
+        )
+
+
+def test_batch_decode_fixed_cta_tile_q_rejected_for_non_fa2_backend():
+    """fixed_cta_tile_q must raise when the resolved tensor-core backend is not fa2."""
+    batch_size, kv_len, page_size, num_kv_heads, head_dim = 2, 512, 16, 4, 128
+    num_pages_per_seq = (kv_len + page_size - 1) // page_size
+    total_num_pages = num_pages_per_seq * batch_size
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda:0", dtype=torch.int32)
+        * num_pages_per_seq
+    )
+    kv_indices = torch.arange(0, total_num_pages, device="cuda:0", dtype=torch.int32)
+    kv_last_page_len = torch.full(
+        (batch_size,), page_size, dtype=torch.int32, device="cuda:0"
+    )
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace_buffer, use_tensor_cores=True
+    )
+    # Patch _backend to simulate a resolved non-fa2 tensor-core backend without needing fa3 hardware.
+    wrapper._backend = "fa3"
+    with pytest.raises(
+        ValueError, match="fixed_cta_tile_q is only supported for the fa2 backend"
+    ):
+        wrapper.plan(
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            num_kv_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            data_type=torch.float16,
+            fixed_cta_tile_q=64,
+        )
+
+
 if __name__ == "__main__":
     test_batch_decode_tensor_cores_with_fast_plan(
         5, 4, 4096, 2048, True, 1, 4, 1, 128, "HND", "NONE"

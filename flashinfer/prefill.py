@@ -46,6 +46,7 @@ from .utils import (
     TensorLayout,
     _check_block_tables_shape,
     _check_cached_qkv_data_type,
+    _validate_fixed_cta_tile_q,
     _check_kv_layout,
     _check_pos_encoding_mode,
     check_shape_dtype_device,
@@ -1697,6 +1698,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         max_sequence_kv: Optional[int] = None,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
+        fixed_cta_tile_q: Optional[int] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -1807,6 +1809,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
             and lead to a varied number of launched CTAs.
         disable_split_kv : bool,
             Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
+        fixed_cta_tile_q : Optional[int]
+            Fixed CTA tile size for FA2 prefill. Supported values are ``16``, ``64``, and ``128``.
+            Defaults to ``None`` (auto heuristic).
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -1833,6 +1838,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             head_dim_vo = head_dim_qk
         if fixed_split_size is None:
             fixed_split_size = -1
+        fixed_cta_tile_q = _validate_fixed_cta_tile_q(fixed_cta_tile_q, head_dim_vo)
 
         batch_size = len(qo_indptr) - 1
         self._batch_size = batch_size
@@ -1976,6 +1982,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     q_data_type,
                     kv_data_type,
                 )
+            if fixed_cta_tile_q != -1 and self._backend != "fa2":
+                raise ValueError(
+                    f"fixed_cta_tile_q is only supported for the fa2 backend, "
+                    f"got backend={self._backend!r}"
+                )
             if self._backend != "cudnn":
                 get_module_args = (
                     q_data_type,
@@ -2046,6 +2057,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             if self._backend == "fa2":
                 args.append(fixed_split_size or -1)  # fixed_split_size
                 args.append(disable_split_kv)  # disable_split_kv
+                args.append(fixed_cta_tile_q)  # fixed_cta_tile_q
                 args.append(0)  # num_colocated_ctas
             self._plan_info = self._cached_module.plan(
                 *args,
@@ -2766,6 +2778,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         max_sequence_kv: Optional[int] = None,
         v_indptr: Optional[torch.Tensor] = None,
         o_indptr: Optional[torch.Tensor] = None,
+        fixed_cta_tile_q: Optional[int] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Ragged KV-Cache for given problem specification.
 
@@ -2860,6 +2873,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             and lead to a varied number of launched CTAs.
         disable_split_kv : bool,
             Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
+        fixed_cta_tile_q : Optional[int]
+            Fixed CTA tile size for FA2 prefill. Supported values are ``16``, ``64``, and ``128``.
+            Defaults to ``None`` (auto heuristic).
         seq_lens: Optional[torch.Tensor]
             A uint32 1D tensor indicating the kv sequence length of each prompt. shape: ``[batch_size]``.
         seq_lens_q: Optional[torch.Tensor]
@@ -2896,6 +2912,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             head_dim_vo = head_dim_qk
         if fixed_split_size is None:
             fixed_split_size = -1
+        fixed_cta_tile_q = _validate_fixed_cta_tile_q(fixed_cta_tile_q, head_dim_vo)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
 
@@ -3001,6 +3018,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     q_data_type,
                     kv_data_type,
                 )
+            if fixed_cta_tile_q != -1 and self._backend != "fa2":
+                raise ValueError(
+                    f"fixed_cta_tile_q is only supported for the fa2 backend, "
+                    f"got backend={self._backend!r}"
+                )
 
             get_module_args = (
                 q_data_type,
@@ -3053,6 +3075,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             if self._backend == "fa2":
                 args.append(fixed_split_size or -1)  # fixed_split_size
                 args.append(disable_split_kv)  # disable_split_kv
+                args.append(fixed_cta_tile_q)  # fixed_cta_tile_q
                 args.append(0)  # num_colocated_ctas
             self._plan_info = self._cached_module.plan(
                 *args,
