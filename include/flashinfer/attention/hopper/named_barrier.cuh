@@ -23,7 +23,8 @@ enum class NamedBarriers {
   kWarpSchedulerWG2 = 3,
   kWarpSchedulerWG3 = 4,
   kPrefetchIndices = 5,
-  kProducerWG = 6
+  kProducerWG = 6,
+  kItemOffsetsReady = 7
 };
 
 __device__ __forceinline__ int get_warp_group_barrier_idx(int warp_group_idx) {

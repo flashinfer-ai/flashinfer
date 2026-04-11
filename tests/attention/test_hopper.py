@@ -304,10 +304,10 @@ def test_batch_paged_prefill(
 
 @pytest.mark.parametrize("batch_size", [1])
 @pytest.mark.parametrize(
-    "kv_len, qo_len, prefix_len_ptr, token_pos_in_items_ptr, token_pos_in_items_len, max_item_len_ptr",
+    "prefix_len, item_lens",
     [
-        (54, 37, 17, list(range(17)) + list(range(19)) + [0], 100, [18]),
-        (97, 81, 16, list(range(80)) + [0], 97, [79]),
+        (17, [17, 19]),
+        (16, [80]),
     ],
 )
 @pytest.mark.parametrize("page_size", [1, 5, 16])
@@ -320,12 +320,8 @@ def test_batch_paged_prefill(
 @pytest.mark.parametrize("return_lse", [True, False])
 def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_fa3(
     batch_size,
-    kv_len,
-    qo_len,
-    prefix_len_ptr,
-    token_pos_in_items_ptr,
-    token_pos_in_items_len,
-    max_item_len_ptr,
+    prefix_len,
+    item_lens,
     page_size,
     num_kv_heads,
     num_qo_heads,
@@ -337,6 +333,14 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_fa3(
 ):
     if not is_sm90a_supported(torch.device("cuda")):
         pytest.skip("SM90A is not supported")
+
+    qo_len = sum(item_lens)
+    kv_len = prefix_len + qo_len
+    item_offsets = [0]
+    for l in item_lens:
+        item_offsets.append(item_offsets[-1] + l)
+    item_offsets_tensor = torch.tensor(item_offsets, dtype=torch.uint32).to(0)
+    item_offsets_len = len(item_offsets)
 
     q = torch.randn(batch_size * qo_len, num_qo_heads, head_dim).to(0).half()
     q_indptr_cpu = torch.arange(0, batch_size + 1).int() * qo_len
@@ -375,15 +379,11 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_fa3(
         page_size,
         causal=causal,
         logits_soft_cap=logits_soft_cap,
-        prefix_len_ptr=torch.tensor(prefix_len_ptr).to(dtype=torch.uint32).to(0),
-        token_pos_in_items_ptr=torch.tensor(token_pos_in_items_ptr)
-        .to(dtype=torch.uint16)
-        .to(0),
-        token_pos_in_items_len=token_pos_in_items_len,
-        max_item_len_ptr=torch.tensor(max_item_len_ptr).to(dtype=torch.uint16).to(0),
+        prefix_len_ptr=torch.tensor([prefix_len], dtype=torch.uint32).to(0),
+        item_offsets=item_offsets_tensor,
+        item_offsets_len=item_offsets_len,
+        max_item_len_ptr=torch.tensor([max(item_lens)], dtype=torch.uint16).to(0),
     )
-    o_fa2, lse_fa2 = wrapper_fa2.run_return_lse(q, kv_data)
-
     wrapper_fa3 = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
         workspace_buffer, kv_layout, backend="fa3"
     )
@@ -398,46 +398,28 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_fa3(
         page_size,
         causal=causal,
         logits_soft_cap=logits_soft_cap,
-        prefix_len_ptr=torch.tensor(prefix_len_ptr).to(dtype=torch.uint32).to(0),
-        token_pos_in_items_ptr=torch.tensor(token_pos_in_items_ptr)
-        .to(dtype=torch.uint16)
-        .to(0),
-        token_pos_in_items_len=token_pos_in_items_len,
-        max_item_len_ptr=torch.tensor(max_item_len_ptr).to(dtype=torch.uint16).to(0),
+        prefix_len_ptr=torch.tensor([prefix_len], dtype=torch.uint32).to(0),
+        item_offsets=item_offsets_tensor,
+        item_offsets_len=item_offsets_len,
+        max_item_len_ptr=torch.tensor([max(item_lens)], dtype=torch.uint16).to(0),
     )
 
-    o_fa3, lse_fa3 = wrapper_fa3.run_return_lse(q, kv_data)
-
-    torch.testing.assert_close(lse_fa2, lse_fa3, rtol=1e-3, atol=1e-3)
+    if return_lse:
+        o_fa2, lse_fa2 = wrapper_fa2.run_return_lse(q, kv_data)
+        o_fa3, lse_fa3 = wrapper_fa3.run_return_lse(q, kv_data)
+        torch.testing.assert_close(lse_fa2, lse_fa3, rtol=1e-3, atol=1e-3)
+    else:
+        o_fa2 = wrapper_fa2.run(q, kv_data)
+        o_fa3 = wrapper_fa3.run(q, kv_data)
     torch.testing.assert_close(o_fa2, o_fa3, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("batch_size", [2])
 @pytest.mark.parametrize(
-    "kv_len, qo_len, prefix_len_ptr, token_pos_in_items_ptr, token_pos_in_items_len, max_item_len_ptr",
+    "prefix_len, item_lens",
     [
-        (
-            54,
-            37,
-            [17, 17],
-            list(range(17))
-            + list(range(19))
-            + [0]
-            + [0] * 63
-            + list(range(15))
-            + list(range(21))
-            + [0],
-            100,
-            [18, 20],
-        ),
-        (
-            97,
-            81,
-            [16, 16],
-            list(range(80)) + [0] * 17 + list(range(76)) + [0] * 5,
-            97,
-            [79, 75],
-        ),
+        (17, [17, 19]),
+        (16, [80]),
     ],
 )
 @pytest.mark.parametrize("page_size", [1, 5, 16])
@@ -450,12 +432,8 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_fa3(
 @pytest.mark.parametrize("return_lse", [True, False])
 def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_fa3_bsz2(
     batch_size,
-    kv_len,
-    qo_len,
-    prefix_len_ptr,
-    token_pos_in_items_ptr,
-    token_pos_in_items_len,
-    max_item_len_ptr,
+    prefix_len,
+    item_lens,
     page_size,
     num_kv_heads,
     num_qo_heads,
@@ -467,6 +445,14 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_fa3_bsz2(
 ):
     if not is_sm90a_supported(torch.device("cuda")):
         pytest.skip("SM90A is not supported")
+
+    qo_len = sum(item_lens)
+    kv_len = prefix_len + qo_len
+    item_offsets = [0]
+    for l in item_lens:
+        item_offsets.append(item_offsets[-1] + l)
+    item_offsets_tensor = torch.tensor(item_offsets, dtype=torch.uint32).to(0)
+    item_offsets_len = len(item_offsets)
 
     q = torch.randn(batch_size * qo_len, num_qo_heads, head_dim).to(0).half()
     q_indptr_cpu = torch.arange(0, batch_size + 1).int() * qo_len
@@ -505,15 +491,11 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_fa3_bsz2(
         page_size,
         causal=causal,
         logits_soft_cap=logits_soft_cap,
-        prefix_len_ptr=torch.tensor(prefix_len_ptr).to(dtype=torch.uint32).to(0),
-        token_pos_in_items_ptr=torch.tensor(token_pos_in_items_ptr)
-        .to(dtype=torch.uint16)
-        .to(0),
-        token_pos_in_items_len=token_pos_in_items_len,
-        max_item_len_ptr=torch.tensor(max_item_len_ptr).to(dtype=torch.uint16).to(0),
+        prefix_len_ptr=torch.tensor([prefix_len, prefix_len], dtype=torch.uint32).to(0),
+        item_offsets=item_offsets_tensor,
+        item_offsets_len=item_offsets_len,
+        max_item_len_ptr=torch.tensor([max(item_lens)] * 2, dtype=torch.uint16).to(0),
     )
-    o_fa2, lse_fa2 = wrapper_fa2.run_return_lse(q, kv_data)
-
     wrapper_fa3 = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
         workspace_buffer, kv_layout, backend="fa3"
     )
@@ -528,17 +510,19 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_fa3_bsz2(
         page_size,
         causal=causal,
         logits_soft_cap=logits_soft_cap,
-        prefix_len_ptr=torch.tensor(prefix_len_ptr).to(dtype=torch.uint32).to(0),
-        token_pos_in_items_ptr=torch.tensor(token_pos_in_items_ptr)
-        .to(dtype=torch.uint16)
-        .to(0),
-        token_pos_in_items_len=token_pos_in_items_len,
-        max_item_len_ptr=torch.tensor(max_item_len_ptr).to(dtype=torch.uint16).to(0),
+        prefix_len_ptr=torch.tensor([prefix_len, prefix_len], dtype=torch.uint32).to(0),
+        item_offsets=item_offsets_tensor,
+        item_offsets_len=item_offsets_len,
+        max_item_len_ptr=torch.tensor([max(item_lens)] * 2, dtype=torch.uint16).to(0),
     )
 
-    o_fa3, lse_fa3 = wrapper_fa3.run_return_lse(q, kv_data)
-
-    torch.testing.assert_close(lse_fa2, lse_fa3, rtol=1e-3, atol=1e-3)
+    if return_lse:
+        o_fa2, lse_fa2 = wrapper_fa2.run_return_lse(q, kv_data)
+        o_fa3, lse_fa3 = wrapper_fa3.run_return_lse(q, kv_data)
+        torch.testing.assert_close(lse_fa2, lse_fa3, rtol=1e-3, atol=1e-3)
+    else:
+        o_fa2 = wrapper_fa2.run(q, kv_data)
+        o_fa3 = wrapper_fa3.run(q, kv_data)
     torch.testing.assert_close(o_fa2, o_fa3, rtol=1e-3, atol=1e-3)
 
 
