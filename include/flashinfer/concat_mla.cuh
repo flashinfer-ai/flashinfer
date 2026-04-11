@@ -18,6 +18,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include "utils.cuh"
@@ -51,17 +52,79 @@ constexpr int MLA_NUM_HEAD_CHUNKS = MLA_NUM_LOCAL_HEADS / MLA_HEAD_CHUNK_SIZE;
  *
  * \tparam DType Data type (nv_bfloat16 or nv_half)
  */
+// ======================= Vector Type Selection =======================
+// Select vector types based on element size:
+// - 2-byte types (fp16/bf16): NopeVec=int2 (8B), RopeVec=int (4B)
+// - 1-byte types (fp8):       NopeVec=int  (4B), RopeVec=short (2B)
+template <typename DType, int ElemSize = sizeof(DType)>
+struct ConcatMLAVecTraits;
+
+// Specialization for 2-byte types (fp16/bf16)
+template <typename DType>
+struct ConcatMLAVecTraits<DType, 2> {
+  using NopeVec = int2;
+  using RopeVec = int;
+  // Number of DType elements per NopeVec: 8 / 2 = 4
+  static constexpr int NOPE_ELEMS_PER_VEC = sizeof(NopeVec) / sizeof(DType);
+  // Number of DType elements per RopeVec: 4 / 2 = 2
+  static constexpr int ROPE_ELEMS_PER_VEC = sizeof(RopeVec) / sizeof(DType);
+
+  static __forceinline__ __device__ NopeVec load_nope(const NopeVec* addr) {
+    return ld_na_global_v2(reinterpret_cast<const int2*>(addr));
+  }
+  static __forceinline__ __device__ void store_nope(NopeVec* addr, NopeVec val) {
+    st_na_global_v2(reinterpret_cast<int2*>(addr), val);
+  }
+  static __forceinline__ __device__ RopeVec load_rope(const RopeVec* addr) {
+    return ld_na_global_v1(reinterpret_cast<const int*>(addr));
+  }
+  static __forceinline__ __device__ void store_rope(RopeVec* addr, RopeVec val) {
+    st_na_global_v1(reinterpret_cast<int*>(addr), val);
+  }
+};
+
+// Specialization for 1-byte types (FP8)
+template <typename DType>
+struct ConcatMLAVecTraits<DType, 1> {
+  using NopeVec = int;
+  using RopeVec = short;
+  // Number of DType elements per NopeVec: 4 / 1 = 4
+  static constexpr int NOPE_ELEMS_PER_VEC = sizeof(NopeVec) / sizeof(DType);
+  // Number of DType elements per RopeVec: 2 / 1 = 2
+  static constexpr int ROPE_ELEMS_PER_VEC = sizeof(RopeVec) / sizeof(DType);
+
+  static __forceinline__ __device__ NopeVec load_nope(const NopeVec* addr) {
+    return ld_na_global_v1(reinterpret_cast<const int*>(addr));
+  }
+  static __forceinline__ __device__ void store_nope(NopeVec* addr, NopeVec val) {
+    st_na_global_v1(reinterpret_cast<int*>(addr), val);
+  }
+  static __forceinline__ __device__ RopeVec load_rope(const RopeVec* addr) {
+    return ld_na_global_v_short(reinterpret_cast<const short*>(addr));
+  }
+  static __forceinline__ __device__ void store_rope(RopeVec* addr, RopeVec val) {
+    st_na_global_v_short(reinterpret_cast<short*>(addr), val);
+  }
+};
+
 template <typename DType>
 __global__ void ConcatMLAKKernel(DType* __restrict__ k, const DType* __restrict__ k_nope,
                                  const DType* __restrict__ k_rope, const int num_tokens,
                                  const int64_t k_stride_0, const int k_stride_1,
                                  const int64_t k_nope_stride_0, const int k_nope_stride_1,
                                  const int64_t k_rope_stride_0) {
+  using Traits = ConcatMLAVecTraits<DType>;
+  using NopeVec = typename Traits::NopeVec;
+  using RopeVec = typename Traits::RopeVec;
+
   constexpr int NUM_LOCAL_HEADS = MLA_NUM_LOCAL_HEADS;
   constexpr int QK_NOPE_HEAD_DIM = MLA_QK_NOPE_HEAD_DIM;
   constexpr int QK_ROPE_HEAD_DIM = MLA_QK_ROPE_HEAD_DIM;
   constexpr int HEAD_CHUNK_SIZE = MLA_HEAD_CHUNK_SIZE;
   constexpr int NUM_HEAD_CHUNKS = MLA_NUM_HEAD_CHUNKS;
+
+  static_assert(sizeof(NopeVec) * 32 == QK_NOPE_HEAD_DIM * sizeof(DType), "nope vec mismatch");
+  static_assert(sizeof(RopeVec) * 32 == QK_ROPE_HEAD_DIM * sizeof(DType), "rope vec mismatch");
 
   const int flat_warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
   const int token_id = flat_warp_id / NUM_HEAD_CHUNKS;
@@ -70,42 +133,37 @@ __global__ void ConcatMLAKKernel(DType* __restrict__ k, const DType* __restrict_
 
   if (token_id >= num_tokens) return;
 
-  // Vector types for efficient memory access
-  // NopeVec: 8B/thread, 32 threads = 256B/row (covers nope_dim bf16 elements)
-  // RopeVec: 4B/thread, 32 threads = 128B/row (covers rope_dim bf16 elements)
-  using NopeVec = int2;
-  using RopeVec = int;
-  static_assert(sizeof(NopeVec) * 32 == QK_NOPE_HEAD_DIM * sizeof(DType), "nope vec mismatch");
-  static_assert(sizeof(RopeVec) * 32 == QK_ROPE_HEAD_DIM * sizeof(DType), "rope vec mismatch");
-
   const int head_row0 = head_chunk_id * HEAD_CHUNK_SIZE;
 
   // Source pointer for k_nope (indexed by token and head)
-  const int2* __restrict__ nope_src =
-      reinterpret_cast<const int2*>(k_nope + token_id * k_nope_stride_0 +
-                                    head_row0 * k_nope_stride_1) +
+  const NopeVec* __restrict__ nope_src =
+      reinterpret_cast<const NopeVec*>(k_nope + token_id * k_nope_stride_0 +
+                                       head_row0 * k_nope_stride_1) +
       lane_id;
 
   // Destination pointers for output k (nope part and rope part)
-  int2* __restrict__ nope_dst =
-      reinterpret_cast<int2*>(k + token_id * k_stride_0 + head_row0 * k_stride_1) + lane_id;
+  NopeVec* __restrict__ nope_dst =
+      reinterpret_cast<NopeVec*>(k + token_id * k_stride_0 + head_row0 * k_stride_1) + lane_id;
 
-  int* __restrict__ rope_dst = reinterpret_cast<int*>(k + token_id * k_stride_0 +
-                                                      head_row0 * k_stride_1 + QK_NOPE_HEAD_DIM) +
-                               lane_id;
+  RopeVec* __restrict__ rope_dst =
+      reinterpret_cast<RopeVec*>(k + token_id * k_stride_0 + head_row0 * k_stride_1 +
+                                 QK_NOPE_HEAD_DIM) +
+      lane_id;
 
-  // Stride calculations for vector types
-  const int nope_src_stride_v = (k_nope_stride_1 >> 2);  // int2 covers 4 bf16
-  const int nope_dst_stride_v = (k_stride_1 >> 2);
-  const int rope_dst_stride_v = (k_stride_1 >> 1);  // int covers 2 bf16
+  // Stride calculations for vector types (in units of the respective vector type)
+  constexpr int NOPE_ELEMS_PER_VEC = Traits::NOPE_ELEMS_PER_VEC;
+  constexpr int ROPE_ELEMS_PER_VEC = Traits::ROPE_ELEMS_PER_VEC;
+  const int nope_src_stride_v = k_nope_stride_1 / NOPE_ELEMS_PER_VEC;
+  const int nope_dst_stride_v = k_stride_1 / NOPE_ELEMS_PER_VEC;
+  const int rope_dst_stride_v = k_stride_1 / ROPE_ELEMS_PER_VEC;
 
   // Load rope value once - it's shared across all heads
-  const int* rope_base = reinterpret_cast<const int*>(k_rope + token_id * k_rope_stride_0);
-  const RopeVec rope_val = ld_na_global_v1(rope_base + lane_id);
+  const RopeVec* rope_base = reinterpret_cast<const RopeVec*>(k_rope + token_id * k_rope_stride_0);
+  const RopeVec rope_val = Traits::load_rope(rope_base + lane_id);
 
   // Prefetch first nope row and load it
   prefetch_L2(nope_src);
-  NopeVec cur = ld_na_global_v2(nope_src);
+  NopeVec cur = Traits::load_nope(nope_src);
 
 // Process all heads in this chunk with software pipelining
 #pragma unroll
@@ -113,14 +171,14 @@ __global__ void ConcatMLAKKernel(DType* __restrict__ k, const DType* __restrict_
     NopeVec next;
     if (i + 1 < HEAD_CHUNK_SIZE) {
       // Prefetch and load next row while processing current
-      const int2* next_src = nope_src + nope_src_stride_v;
+      const NopeVec* next_src = nope_src + nope_src_stride_v;
       prefetch_L2(next_src);
-      next = ld_na_global_v2(next_src);
+      next = Traits::load_nope(next_src);
     }
 
     // Write current nope and rope values
-    st_na_global_v2(nope_dst, cur);
-    st_na_global_v1(rope_dst, rope_val);
+    Traits::store_nope(nope_dst, cur);
+    Traits::store_rope(rope_dst, rope_val);
 
     // Advance pointers
     nope_src += nope_src_stride_v;
