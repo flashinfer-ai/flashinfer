@@ -31,7 +31,12 @@ import math
 import os
 from typing import Optional
 
+import cutlass
+import cutlass.cute as cute
 import torch
+from cuda.bindings import driver as cuda_driver
+from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.typing import Float32, Int32
 
 logger = logging.getLogger("flashinfer.attention.cute_dsl.fmha")
 
@@ -70,6 +75,7 @@ def _get_variant_name(
     is_causal: bool,
     is_persistent: bool = True,
     varlen: bool = False,
+    enable_tvm_ffi: bool = False,
 ) -> str:
     """Generate the variant name matching compile_cute_dsl_fmha.py naming convention."""
     in_str = _dtype_to_str(in_dtype)
@@ -79,9 +85,8 @@ def _get_variant_name(
     causal_str = "causal" if is_causal else "nocausal"
     persist_str = "persistent" if is_persistent else "nonpersistent"
     varlen_str = "_varlen" if varlen else ""
-    return (
-        f"cute_dsl_fmha_{dtype_str}_h{head_dim}_{causal_str}_{persist_str}{varlen_str}"
-    )
+    ffi_str = "_tvmffi" if enable_tvm_ffi else ""
+    return f"cute_dsl_fmha_{dtype_str}_h{head_dim}_{causal_str}_{persist_str}{varlen_str}{ffi_str}"
 
 
 # =============================================================================
@@ -102,7 +107,6 @@ def _load_from_artifact(variant_name: str, enable_tvm_ffi: bool = False):
         If False (default), load with CuTe native ABI.
         If True, load with TVM-FFI ABI (TODO: compile-side support pending).
     """
-    import cutlass.cute as cute
     from flashinfer.jit.cubin_loader import get_artifact
     from flashinfer.jit.env import FLASHINFER_CUBIN_DIR
 
@@ -146,8 +150,6 @@ def _load_from_local(variant_name: str, local_dir: str, enable_tvm_ffi: bool = F
         If False (default), load with CuTe native ABI.
         If True, load with TVM-FFI ABI (TODO: compile-side support pending).
     """
-    import cutlass.cute as cute
-
     # Try .so first, then .o
     so_path = os.path.join(local_dir, f"{variant_name}.so")
     o_path = os.path.join(local_dir, f"{variant_name}.o")
@@ -195,8 +197,8 @@ def get_cute_dsl_fmha_kernel(
     enable_tvm_ffi : bool
         If False (default), load with CuTe native ABI — kernel accepts
         cute Pointer/Tensor args (same calling convention as JIT mode).
-        If True, load with TVM-FFI ABI — kernel accepts torch.Tensor
-        directly (TODO: compile-side support pending).
+        If True, load with TVM-FFI ABI — Pointer args accept data_ptr(),
+        Tensor args accept torch.Tensor directly, stream uses env stream.
 
     Returns
     -------
@@ -204,7 +206,7 @@ def get_cute_dsl_fmha_kernel(
         The compiled kernel function.
     """
     variant_name = _get_variant_name(
-        in_dtype, out_dtype, head_dim, is_causal, is_persistent, varlen
+        in_dtype, out_dtype, head_dim, is_causal, is_persistent, varlen, enable_tvm_ffi
     )
 
     # Check for local .so directory (development mode)
@@ -241,6 +243,7 @@ def cute_dsl_fmha_prefill(
     scale_k: float = 1.0,
     scale_v: float = 1.0,
     scale_o: float = 1.0,
+    enable_tvm_ffi: bool = True,
 ) -> None:
     """Run DSL FMHA prefill kernel on the given tensors.
 
@@ -275,12 +278,10 @@ def cute_dsl_fmha_prefill(
         Per-tensor scale for value (FP8 calibration). Default 1.0.
     scale_o : float
         Per-tensor scale for output (FP8 calibration). Default 1.0.
+    enable_tvm_ffi : bool
+        If True, use TVM-FFI ABI (pass data_ptr() for Pointer args, torch.Tensor
+        for Tensor args, no explicit stream). Default False (CuTe native ABI).
     """
-    import cutlass
-    from cutlass.cute.runtime import from_dlpack
-    from cutlass.cute.typing import Int32, Float32
-    import cutlass.torch as cutlass_torch
-
     B, S_q, H_q, D = q.shape
     _, S_k, H_k, _ = k.shape
     D_v = v.shape[-1]
@@ -290,7 +291,9 @@ def cute_dsl_fmha_prefill(
     out_dtype = o.dtype
 
     # Get compiled kernel
-    kernel_fn = get_cute_dsl_fmha_kernel(in_dtype, out_dtype, head_dim, is_causal)
+    kernel_fn = get_cute_dsl_fmha_kernel(
+        in_dtype, out_dtype, head_dim, is_causal, enable_tvm_ffi=enable_tvm_ffi
+    )
 
     # Compute scale factors
     if sm_scale is None:
@@ -300,45 +303,8 @@ def cute_dsl_fmha_prefill(
     scale_softmax_log2 = scale_softmax * log2_e
     scale_output = scale_v / scale_o
 
-    # Convert tensors to cute tensors with dynamic layout (matching DSL example)
-    # FP8: DLPack doesn't support FP8, so view as int8 then set element_type
-    # leading_dim = dim with stride=1; for contiguous BSHD, that's dim 3 (D)
-    is_fp8_in = q.dtype == torch.float8_e4m3fn
-    is_fp8_out = o.dtype == torch.float8_e4m3fn
-    if is_fp8_in:
-        q_cute = from_dlpack(q.view(torch.int8), assumed_align=16).mark_layout_dynamic(
-            leading_dim=3
-        )
-        q_cute.element_type = cutlass.Float8E4M3FN
-        k_cute = from_dlpack(k.view(torch.int8), assumed_align=16).mark_layout_dynamic(
-            leading_dim=3
-        )
-        k_cute.element_type = cutlass.Float8E4M3FN
-        v_cute = from_dlpack(v.view(torch.int8), assumed_align=16).mark_layout_dynamic(
-            leading_dim=3
-        )
-        v_cute.element_type = cutlass.Float8E4M3FN
-    else:
-        q_cute = from_dlpack(q, assumed_align=16).mark_layout_dynamic(leading_dim=3)
-        k_cute = from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=3)
-        v_cute = from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=3)
-    if is_fp8_out:
-        o_cute = from_dlpack(o.view(torch.int8), assumed_align=16).mark_layout_dynamic(
-            leading_dim=3
-        )
-        o_cute.element_type = cutlass.Float8E4M3FN
-    else:
-        o_cute = from_dlpack(o, assumed_align=16).mark_layout_dynamic(leading_dim=3)
-
     # Problem size: (B, S_q, S_lse, S_k, H_q, H_k, D, D_v)
     problem_size = (B, S_q, S_q, S_k, H_q, H_k, D, D_v)
-
-    # LSE
-    lse_iter = None
-    if lse is not None:
-        # lse shape: (B, H_q, S_q), leading_dim=2
-        lse_cute = from_dlpack(lse, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-        lse_iter = lse_cute.iterator
 
     # Window sizes
     ws_left = None if window_left == -1 else Int32(window_left)
@@ -346,30 +312,86 @@ def cute_dsl_fmha_prefill(
     if is_causal and ws_right is None:
         ws_right = Int32(0)
 
-    # Stream
-    # TODO: use torch current stream instead of default stream
-    stream = cutlass_torch.default_stream()
+    if enable_tvm_ffi:
+        # TVM-FFI: Pointer args accept data_ptr(), no explicit stream (env stream).
+        kernel_fn(
+            q.data_ptr(),
+            k.data_ptr(),
+            v.data_ptr(),
+            o.data_ptr(),
+            problem_size,
+            None,  # cum_seqlen_q (fixed-length batch)
+            None,  # cum_seqlen_k (fixed-length batch)
+            lse.data_ptr() if lse is not None else None,
+            Float32(scale_softmax_log2),
+            Float32(scale_softmax),
+            Float32(scale_output),
+            None,  # skip_softmax_threshold_log2
+            ws_left,
+            ws_right,
+            None,  # skip_softmax_count
+            None,  # total_softmax_count
+            q,  # q_tensor for env stream device detection
+        )
+    else:
+        # CuTe native ABI: convert to cute tensors, pass iterators + explicit stream.
 
-    # Launch kernel
-    kernel_fn(
-        q_cute.iterator,
-        k_cute.iterator,
-        v_cute.iterator,
-        o_cute.iterator,
-        problem_size,
-        None,  # cum_seqlen_q (fixed-length batch)
-        None,  # cum_seqlen_k (fixed-length batch)
-        lse_iter,
-        Float32(scale_softmax_log2),
-        Float32(scale_softmax),
-        Float32(scale_output),
-        None,  # skip_softmax_threshold_log2
-        ws_left,
-        ws_right,
-        None,  # skip_softmax_count
-        None,  # total_softmax_count
-        stream,
-    )
+        is_fp8_in = q.dtype == torch.float8_e4m3fn
+        is_fp8_out = o.dtype == torch.float8_e4m3fn
+        if is_fp8_in:
+            q_cute = from_dlpack(
+                q.view(torch.int8), assumed_align=16
+            ).mark_layout_dynamic(leading_dim=3)
+            q_cute.element_type = cutlass.Float8E4M3FN
+            k_cute = from_dlpack(
+                k.view(torch.int8), assumed_align=16
+            ).mark_layout_dynamic(leading_dim=3)
+            k_cute.element_type = cutlass.Float8E4M3FN
+            v_cute = from_dlpack(
+                v.view(torch.int8), assumed_align=16
+            ).mark_layout_dynamic(leading_dim=3)
+            v_cute.element_type = cutlass.Float8E4M3FN
+        else:
+            q_cute = from_dlpack(q, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+            k_cute = from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+            v_cute = from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        if is_fp8_out:
+            o_cute = from_dlpack(
+                o.view(torch.int8), assumed_align=16
+            ).mark_layout_dynamic(leading_dim=3)
+            o_cute.element_type = cutlass.Float8E4M3FN
+        else:
+            o_cute = from_dlpack(o, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+
+        lse_iter = None
+        if lse is not None:
+            lse_cute = from_dlpack(lse, assumed_align=16).mark_layout_dynamic(
+                leading_dim=2
+            )
+            lse_iter = lse_cute.iterator
+
+        stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
+
+        kernel_fn(
+            q_cute.iterator,
+            k_cute.iterator,
+            v_cute.iterator,
+            o_cute.iterator,
+            problem_size,
+            None,  # cum_seqlen_q (fixed-length batch)
+            None,  # cum_seqlen_k (fixed-length batch)
+            lse_iter,
+            Float32(scale_softmax_log2),
+            Float32(scale_softmax),
+            Float32(scale_output),
+            None,  # skip_softmax_threshold_log2
+            ws_left,
+            ws_right,
+            None,  # skip_softmax_count
+            None,  # total_softmax_count
+            None,  # q_tensor (unused, for TVM-FFI env stream)
+            stream,
+        )
 
 
 def cute_dsl_fmha_ragged_prefill(
@@ -388,6 +410,7 @@ def cute_dsl_fmha_ragged_prefill(
     scale_k: float = 1.0,
     scale_v: float = 1.0,
     scale_o: float = 1.0,
+    enable_tvm_ffi: bool = True,
 ) -> None:
     """Run DSL FMHA prefill kernel on ragged (variable-length) tensors.
 
@@ -428,12 +451,10 @@ def cute_dsl_fmha_ragged_prefill(
         Per-tensor scale for value (FP8 calibration). Default 1.0.
     scale_o : float
         Per-tensor scale for output (FP8 calibration). Default 1.0.
+    enable_tvm_ffi : bool
+        If True, use TVM-FFI ABI (pass data_ptr() for Pointer args, torch.Tensor
+        for Tensor args, no explicit stream). Default False (CuTe native ABI).
     """
-    import cutlass
-    from cutlass.cute.runtime import from_dlpack
-    from cutlass.cute.typing import Int32, Float32
-    import cutlass.torch as cutlass_torch
-
     total_q, H_q, D = q.shape
     total_kv, H_k, _ = k.shape
     D_v = v.shape[-1]
@@ -443,7 +464,9 @@ def cute_dsl_fmha_ragged_prefill(
     out_dtype = o.dtype
 
     # Get compiled kernel (varlen=True for variable-length support)
-    kernel_fn = get_cute_dsl_fmha_kernel(in_dtype, out_dtype, D, is_causal, varlen=True)
+    kernel_fn = get_cute_dsl_fmha_kernel(
+        in_dtype, out_dtype, D, is_causal, varlen=True, enable_tvm_ffi=enable_tvm_ffi
+    )
 
     # Compute scale factors
     if sm_scale is None:
@@ -459,59 +482,9 @@ def cute_dsl_fmha_ragged_prefill(
     max_s_q = int((qo_indptr_cpu[1:] - qo_indptr_cpu[:-1]).max().item())
     max_s_k = int((kv_indptr_cpu[1:] - kv_indptr_cpu[:-1]).max().item())
 
-    # DSL FMHA kernel expects 4D tensor (B, S, H, D).
-    # For variable length: B=1, S=total_tokens, with cum_seqlen indicating boundaries.
-    q_4d = q.unsqueeze(0)  # (1, total_q, H_q, D)
-    k_4d = k.unsqueeze(0)  # (1, total_kv, H_k, D)
-    v_4d = v.unsqueeze(0)  # (1, total_kv, H_k, D_v)
-    o_4d = o.unsqueeze(0)  # (1, total_q, H_q, D_v)
-
-    # Convert tensors with dynamic layout (matching DSL example)
-    # FP8: DLPack doesn't support FP8, so view as int8 then set element_type
-    is_fp8_in = q.dtype == torch.float8_e4m3fn
-    is_fp8_out = o.dtype == torch.float8_e4m3fn
-    if is_fp8_in:
-        q_cute = from_dlpack(
-            q_4d.view(torch.int8), assumed_align=16
-        ).mark_layout_dynamic(leading_dim=3)
-        q_cute.element_type = cutlass.Float8E4M3FN
-        k_cute = from_dlpack(
-            k_4d.view(torch.int8), assumed_align=16
-        ).mark_layout_dynamic(leading_dim=3)
-        k_cute.element_type = cutlass.Float8E4M3FN
-        v_cute = from_dlpack(
-            v_4d.view(torch.int8), assumed_align=16
-        ).mark_layout_dynamic(leading_dim=3)
-        v_cute.element_type = cutlass.Float8E4M3FN
-    else:
-        q_cute = from_dlpack(q_4d, assumed_align=16).mark_layout_dynamic(leading_dim=3)
-        k_cute = from_dlpack(k_4d, assumed_align=16).mark_layout_dynamic(leading_dim=3)
-        v_cute = from_dlpack(v_4d, assumed_align=16).mark_layout_dynamic(leading_dim=3)
-    if is_fp8_out:
-        o_cute = from_dlpack(
-            o_4d.view(torch.int8), assumed_align=16
-        ).mark_layout_dynamic(leading_dim=3)
-        o_cute.element_type = cutlass.Float8E4M3FN
-    else:
-        o_cute = from_dlpack(o_4d, assumed_align=16).mark_layout_dynamic(leading_dim=3)
-
-    # cum_seqlen tensors: 1D, leading_dim=0
-    cum_seqlen_q_cute = from_dlpack(
-        qo_indptr.to(torch.int32), assumed_align=16
-    ).mark_layout_dynamic(leading_dim=0)
-    cum_seqlen_k_cute = from_dlpack(
-        kv_indptr.to(torch.int32), assumed_align=16
-    ).mark_layout_dynamic(leading_dim=0)
-
     # problem_size: (B, max_s_q, s_lse, max_s_k, H_q, H_k, D, D_v)
     s_lse = total_q  # for variable length, s_lse = total tokens
     problem_size = (batch_size, max_s_q, s_lse, max_s_k, H_q, H_k, D, D_v)
-
-    # LSE
-    lse_iter = None
-    if lse is not None:
-        lse_cute = from_dlpack(lse, assumed_align=16).mark_layout_dynamic(leading_dim=2)
-        lse_iter = lse_cute.iterator
 
     # Window sizes
     ws_left = None if window_left == -1 else Int32(window_left)
@@ -519,27 +492,111 @@ def cute_dsl_fmha_ragged_prefill(
     if is_causal and ws_right is None:
         ws_right = Int32(0)
 
-    # Stream
-    # TODO: use torch current stream instead of default stream
-    stream = cutlass_torch.default_stream()
+    if enable_tvm_ffi:
+        # TVM-FFI: Pointer args accept data_ptr(), Tensor args accept torch.Tensor,
+        # no explicit stream (env stream).
+        # Kernel expects 4D pointers; unsqueeze to (1, total, H, D).
+        q_4d = q.unsqueeze(0)
+        k_4d = k.unsqueeze(0)
+        v_4d = v.unsqueeze(0)
+        o_4d = o.unsqueeze(0)
 
-    # Launch kernel
-    kernel_fn(
-        q_cute.iterator,
-        k_cute.iterator,
-        v_cute.iterator,
-        o_cute.iterator,
-        problem_size,
-        cum_seqlen_q_cute,
-        cum_seqlen_k_cute,
-        lse_iter,
-        Float32(scale_softmax_log2),
-        Float32(scale_softmax),
-        Float32(scale_output),
-        None,  # skip_softmax_threshold_log2
-        ws_left,
-        ws_right,
-        None,  # skip_softmax_count
-        None,  # total_softmax_count
-        stream,
-    )
+        kernel_fn(
+            q_4d.data_ptr(),
+            k_4d.data_ptr(),
+            v_4d.data_ptr(),
+            o_4d.data_ptr(),
+            problem_size,
+            qo_indptr.to(torch.int32),  # cum_seqlen_q: Tensor arg
+            kv_indptr.to(torch.int32),  # cum_seqlen_k: Tensor arg
+            lse.data_ptr() if lse is not None else None,
+            Float32(scale_softmax_log2),
+            Float32(scale_softmax),
+            Float32(scale_output),
+            None,  # skip_softmax_threshold_log2
+            ws_left,
+            ws_right,
+            None,  # skip_softmax_count
+            None,  # total_softmax_count
+            q_4d,  # q_tensor for env stream device detection
+        )
+    else:
+        # CuTe native ABI: convert to cute tensors, pass iterators + explicit stream.
+
+        # DSL FMHA kernel expects 4D tensor (B, S, H, D).
+        q_4d = q.unsqueeze(0)
+        k_4d = k.unsqueeze(0)
+        v_4d = v.unsqueeze(0)
+        o_4d = o.unsqueeze(0)
+
+        is_fp8_in = q.dtype == torch.float8_e4m3fn
+        is_fp8_out = o.dtype == torch.float8_e4m3fn
+        if is_fp8_in:
+            q_cute = from_dlpack(
+                q_4d.view(torch.int8), assumed_align=16
+            ).mark_layout_dynamic(leading_dim=3)
+            q_cute.element_type = cutlass.Float8E4M3FN
+            k_cute = from_dlpack(
+                k_4d.view(torch.int8), assumed_align=16
+            ).mark_layout_dynamic(leading_dim=3)
+            k_cute.element_type = cutlass.Float8E4M3FN
+            v_cute = from_dlpack(
+                v_4d.view(torch.int8), assumed_align=16
+            ).mark_layout_dynamic(leading_dim=3)
+            v_cute.element_type = cutlass.Float8E4M3FN
+        else:
+            q_cute = from_dlpack(q_4d, assumed_align=16).mark_layout_dynamic(
+                leading_dim=3
+            )
+            k_cute = from_dlpack(k_4d, assumed_align=16).mark_layout_dynamic(
+                leading_dim=3
+            )
+            v_cute = from_dlpack(v_4d, assumed_align=16).mark_layout_dynamic(
+                leading_dim=3
+            )
+        if is_fp8_out:
+            o_cute = from_dlpack(
+                o_4d.view(torch.int8), assumed_align=16
+            ).mark_layout_dynamic(leading_dim=3)
+            o_cute.element_type = cutlass.Float8E4M3FN
+        else:
+            o_cute = from_dlpack(o_4d, assumed_align=16).mark_layout_dynamic(
+                leading_dim=3
+            )
+
+        cum_seqlen_q_cute = from_dlpack(
+            qo_indptr.to(torch.int32), assumed_align=16
+        ).mark_layout_dynamic(leading_dim=0)
+        cum_seqlen_k_cute = from_dlpack(
+            kv_indptr.to(torch.int32), assumed_align=16
+        ).mark_layout_dynamic(leading_dim=0)
+
+        lse_iter = None
+        if lse is not None:
+            lse_cute = from_dlpack(lse, assumed_align=16).mark_layout_dynamic(
+                leading_dim=2
+            )
+            lse_iter = lse_cute.iterator
+
+        stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
+
+        kernel_fn(
+            q_cute.iterator,
+            k_cute.iterator,
+            v_cute.iterator,
+            o_cute.iterator,
+            problem_size,
+            cum_seqlen_q_cute,
+            cum_seqlen_k_cute,
+            lse_iter,
+            Float32(scale_softmax_log2),
+            Float32(scale_softmax),
+            Float32(scale_output),
+            None,  # skip_softmax_threshold_log2
+            ws_left,
+            ws_right,
+            None,  # skip_softmax_count
+            None,  # total_softmax_count
+            None,  # q_tensor (unused, for TVM-FFI env stream)
+            stream,
+        )

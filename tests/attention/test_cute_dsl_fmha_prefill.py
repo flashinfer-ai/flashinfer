@@ -110,6 +110,7 @@ def reference_attention(
 # =============================================================================
 
 
+@pytest.mark.parametrize("enable_tvm_ffi", [False, True])
 @pytest.mark.parametrize(
     "dtype", [torch.float16, torch.bfloat16]
 )  # TODO: add torch.float8_e4m3fn once pytest CUDA state issue is resolved
@@ -122,10 +123,14 @@ def reference_attention(
         (2, 256, 256, 8, 8),  # batched
         (1, 128, 256, 8, 8),  # S_q != S_k
         (2, 128, 128, 16, 4),  # GQA
+        # Production-scale shapes
+        (1, 8192, 8192, 8, 8),  # long context
+        (1, 8192, 32768, 8, 8),  # long KV cache
+        (4, 1024, 81920, 8, 8),  # batched decode-like prefill
     ],
 )
 def test_cute_dsl_fmha_prefill_direct(
-    dtype, head_dim, is_causal, B, S_q, S_k, H_q, H_k
+    enable_tvm_ffi, dtype, head_dim, is_causal, B, S_q, S_k, H_q, H_k
 ):
     """Test cute_dsl_fmha_prefill directly with torch tensors."""
 
@@ -140,7 +145,9 @@ def test_cute_dsl_fmha_prefill_direct(
     v = torch.randn(B, S_k, H_k, D_v, dtype=dtype, device="cuda")
     o = torch.zeros(B, S_q, H_q, D_v, dtype=dtype, device="cuda")
 
-    cute_dsl_fmha_prefill(q, k, v, o, is_causal=is_causal)
+    cute_dsl_fmha_prefill(
+        q, k, v, o, is_causal=is_causal, enable_tvm_ffi=enable_tvm_ffi
+    )
     torch.cuda.synchronize()
 
     o_ref = reference_attention(q, k, v, is_causal=is_causal).to(dtype)
@@ -155,6 +162,7 @@ def test_cute_dsl_fmha_prefill_direct(
 # =============================================================================
 
 
+@pytest.mark.parametrize("enable_tvm_ffi", [False, True])
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("is_causal", [False, True])
 @pytest.mark.parametrize(
@@ -165,7 +173,9 @@ def test_cute_dsl_fmha_prefill_direct(
         (2, 128, 128, 16, 4),  # GQA
     ],
 )
-def test_cute_dsl_fmha_prefill_fp8(head_dim, is_causal, B, S_q, S_k, H_q, H_k):
+def test_cute_dsl_fmha_prefill_fp8(
+    enable_tvm_ffi, head_dim, is_causal, B, S_q, S_k, H_q, H_k
+):
     """Test cute_dsl_fmha_prefill with FP8 input and FP16 output (mixed precision)."""
 
     from flashinfer.attention_dsl.cute_dsl.fmha import cute_dsl_fmha_prefill
@@ -195,6 +205,7 @@ def test_cute_dsl_fmha_prefill_fp8(head_dim, is_causal, B, S_q, S_k, H_q, H_k):
         scale_q=FP8_SCALE_Q,
         scale_k=FP8_SCALE_K,
         scale_v=FP8_SCALE_V,
+        enable_tvm_ffi=enable_tvm_ffi,
     )
     torch.cuda.synchronize()
 
@@ -407,9 +418,10 @@ def test_batch_ragged_prefill_cute_dsl(dtype, head_dim, is_causal):
     torch.testing.assert_close(o_dsl, o_ref, rtol=rtol, atol=atol)
 
 
+@pytest.mark.parametrize("enable_tvm_ffi", [False, True])
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("is_causal", [False, True])
-def test_batch_ragged_prefill_cute_dsl_fp8(head_dim, is_causal):
+def test_batch_ragged_prefill_cute_dsl_fp8(enable_tvm_ffi, head_dim, is_causal):
     """Test BatchPrefillWithRaggedKVCacheWrapper with FP8 input and FP16 output."""
 
     from flashinfer.attention_dsl.cute_dsl.fmha import cute_dsl_fmha_ragged_prefill
@@ -475,6 +487,7 @@ def test_batch_ragged_prefill_cute_dsl_fp8(head_dim, is_causal):
         scale_q=FP8_SCALE_Q,
         scale_k=FP8_SCALE_K,
         scale_v=FP8_SCALE_V,
+        enable_tvm_ffi=enable_tvm_ffi,
     )
     torch.cuda.synchronize()
 
