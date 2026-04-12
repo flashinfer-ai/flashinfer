@@ -339,38 +339,45 @@ def _make_ragged_qkvo(seq_lens_q, seq_lens_k, H_q, H_k, D, dtype, out_dtype=None
     max_s_q = max(seq_lens_q)
     max_s_k = max(seq_lens_k)
 
-    # Allocate with padding (TMA may read beyond logical boundary)
+    # Front-padding to match DSL example's create_and_pad_tensor convention.
+    # The varlen kernel applies a negative offset (q_offset = -max_s_q * H * D)
+    # to the pointer, so we must have valid GPU memory before the data start.
+    # Allocate (max_s + total) and place data at [max_s:].
     if is_fp8:
-        q_f32_padded = (
-            torch.randn(total_q + max_s_q, H_q, D, dtype=torch.float32, device="cuda")
+        q_f32_full = (
+            torch.randn(max_s_q + total_q, H_q, D, dtype=torch.float32, device="cuda")
             * 0.1
         )
-        k_f32_padded = (
-            torch.randn(total_kv + max_s_k, H_k, D, dtype=torch.float32, device="cuda")
+        k_f32_full = (
+            torch.randn(max_s_k + total_kv, H_k, D, dtype=torch.float32, device="cuda")
             * 0.1
         )
-        v_f32_padded = (
+        v_f32_full = (
             torch.randn(
-                total_kv + max_s_k, H_k, D_v, dtype=torch.float32, device="cuda"
+                max_s_k + total_kv, H_k, D_v, dtype=torch.float32, device="cuda"
             )
             * 0.1
         )
-        q = (q_f32_padded / FP8_SCALE_Q).to(torch.float8_e4m3fn)[:total_q]
-        k = (k_f32_padded / FP8_SCALE_K).to(torch.float8_e4m3fn)[:total_kv]
-        v = (v_f32_padded / FP8_SCALE_V).to(torch.float8_e4m3fn)[:total_kv]
-        o_padded = torch.zeros(
-            total_q + max_s_q, H_q, D_v, dtype=out_dtype, device="cuda"
+        q = (q_f32_full / FP8_SCALE_Q).to(torch.float8_e4m3fn)[max_s_q:]
+        k = (k_f32_full / FP8_SCALE_K).to(torch.float8_e4m3fn)[max_s_k:]
+        v = (v_f32_full / FP8_SCALE_V).to(torch.float8_e4m3fn)[max_s_k:]
+        o_full = torch.zeros(
+            max_s_q + total_q, H_q, D_v, dtype=out_dtype, device="cuda"
         )
-        o = o_padded[:total_q]
+        o = o_full[max_s_q:]
         q_ref = q.float() * FP8_SCALE_Q
         k_ref = k.float() * FP8_SCALE_K
         v_ref = v.float() * FP8_SCALE_V
         sq, sk, sv = FP8_SCALE_Q, FP8_SCALE_K, FP8_SCALE_V
     else:
-        q = torch.randn(total_q, H_q, D, dtype=dtype, device="cuda")
-        k = torch.randn(total_kv, H_k, D, dtype=dtype, device="cuda")
-        v = torch.randn(total_kv, H_k, D_v, dtype=dtype, device="cuda")
-        o = torch.zeros(total_q, H_q, D_v, dtype=dtype, device="cuda")
+        q_full = torch.randn(max_s_q + total_q, H_q, D, dtype=dtype, device="cuda")
+        k_full = torch.randn(max_s_k + total_kv, H_k, D, dtype=dtype, device="cuda")
+        v_full = torch.randn(max_s_k + total_kv, H_k, D_v, dtype=dtype, device="cuda")
+        o_full = torch.zeros(max_s_q + total_q, H_q, D_v, dtype=dtype, device="cuda")
+        q = q_full[max_s_q:]
+        k = k_full[max_s_k:]
+        v = v_full[max_s_k:]
+        o = o_full[max_s_q:]
         q_ref, k_ref, v_ref = None, None, None
         sq, sk, sv = 1.0, 1.0, 1.0
 
@@ -443,7 +450,7 @@ def _ragged_reference(
         ([64, 128, 32], [64, 128, 32], 16, 4),  # GQA
         ([4096, 8192], [4096, 8192], 8, 8),  # long context
         # TODO: This config will fail
-        # ([32, 64, 16], [128, 256, 64], 8, 8),  # asymmetric (S_q < S_k)
+        ([32, 64, 16], [128, 256, 64], 8, 8),  # asymmetric (S_q < S_k)
         ([512, 1024], [8192, 16384], 8, 8),  # long KV cache
     ],
 )
