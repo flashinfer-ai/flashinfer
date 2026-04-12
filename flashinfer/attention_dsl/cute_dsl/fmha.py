@@ -227,27 +227,6 @@ def get_cute_dsl_fmha_kernel(
 # =============================================================================
 
 
-def _to_cute_tensor(t: torch.Tensor, assumed_align: int = 16):
-    """Convert a torch tensor to a cute tensor, handling FP8 dtypes.
-
-    DLPack does not support FP8 types directly, so we view as int8 first,
-    then override the element_type on the cute side.
-    """
-    import cutlass
-    from cutlass.cute.runtime import from_dlpack
-
-    _TORCH_TO_CUTLASS_FP8 = {
-        torch.float8_e4m3fn: cutlass.Float8E4M3FN,
-    }
-
-    if t.dtype in _TORCH_TO_CUTLASS_FP8:
-        cutlass_dtype = _TORCH_TO_CUTLASS_FP8[t.dtype]
-        cute_t = from_dlpack(t.view(torch.int8), assumed_align=assumed_align)
-        cute_t.element_type = cutlass_dtype
-        return cute_t
-    return from_dlpack(t, assumed_align=assumed_align)
-
-
 def cute_dsl_fmha_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -297,6 +276,7 @@ def cute_dsl_fmha_prefill(
     scale_o : float
         Per-tensor scale for output (FP8 calibration). Default 1.0.
     """
+    import cutlass
     from cutlass.cute.runtime import from_dlpack
     from cutlass.cute.typing import Int32, Float32
     import cutlass.torch as cutlass_torch
@@ -320,11 +300,35 @@ def cute_dsl_fmha_prefill(
     scale_softmax_log2 = scale_softmax * log2_e
     scale_output = scale_v / scale_o
 
-    # Convert tensors to cute iterators
-    q_cute = from_dlpack(q, assumed_align=16)
-    k_cute = from_dlpack(k, assumed_align=16)
-    v_cute = from_dlpack(v, assumed_align=16)
-    o_cute = from_dlpack(o, assumed_align=16)
+    # Convert tensors to cute tensors with dynamic layout (matching DSL example)
+    # FP8: DLPack doesn't support FP8, so view as int8 then set element_type
+    # leading_dim = dim with stride=1; for contiguous BSHD, that's dim 3 (D)
+    is_fp8_in = q.dtype == torch.float8_e4m3fn
+    is_fp8_out = o.dtype == torch.float8_e4m3fn
+    if is_fp8_in:
+        q_cute = from_dlpack(q.view(torch.int8), assumed_align=16).mark_layout_dynamic(
+            leading_dim=3
+        )
+        q_cute.element_type = cutlass.Float8E4M3FN
+        k_cute = from_dlpack(k.view(torch.int8), assumed_align=16).mark_layout_dynamic(
+            leading_dim=3
+        )
+        k_cute.element_type = cutlass.Float8E4M3FN
+        v_cute = from_dlpack(v.view(torch.int8), assumed_align=16).mark_layout_dynamic(
+            leading_dim=3
+        )
+        v_cute.element_type = cutlass.Float8E4M3FN
+    else:
+        q_cute = from_dlpack(q, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        k_cute = from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        v_cute = from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+    if is_fp8_out:
+        o_cute = from_dlpack(o.view(torch.int8), assumed_align=16).mark_layout_dynamic(
+            leading_dim=3
+        )
+        o_cute.element_type = cutlass.Float8E4M3FN
+    else:
+        o_cute = from_dlpack(o, assumed_align=16).mark_layout_dynamic(leading_dim=3)
 
     # Problem size: (B, S_q, S_lse, S_k, H_q, H_k, D, D_v)
     problem_size = (B, S_q, S_q, S_k, H_q, H_k, D, D_v)
@@ -332,7 +336,8 @@ def cute_dsl_fmha_prefill(
     # LSE
     lse_iter = None
     if lse is not None:
-        lse_cute = from_dlpack(lse, assumed_align=16)
+        # lse shape: (B, H_q, S_q), leading_dim=2
+        lse_cute = from_dlpack(lse, assumed_align=16).mark_layout_dynamic(leading_dim=2)
         lse_iter = lse_cute.iterator
 
     # Window sizes
@@ -342,6 +347,7 @@ def cute_dsl_fmha_prefill(
         ws_right = Int32(0)
 
     # Stream
+    # TODO: use torch current stream instead of default stream
     stream = cutlass_torch.default_stream()
 
     # Launch kernel
@@ -423,6 +429,7 @@ def cute_dsl_fmha_ragged_prefill(
     scale_o : float
         Per-tensor scale for output (FP8 calibration). Default 1.0.
     """
+    import cutlass
     from cutlass.cute.runtime import from_dlpack
     from cutlass.cute.typing import Int32, Float32
     import cutlass.torch as cutlass_torch
@@ -454,20 +461,47 @@ def cute_dsl_fmha_ragged_prefill(
 
     # DSL FMHA kernel expects 4D tensor (B, S, H, D).
     # For variable length: B=1, S=total_tokens, with cum_seqlen indicating boundaries.
-    # (matches example's convention: q_shape = (1, sum(s_q), H, D) for varlen)
     q_4d = q.unsqueeze(0)  # (1, total_q, H_q, D)
     k_4d = k.unsqueeze(0)  # (1, total_kv, H_k, D)
     v_4d = v.unsqueeze(0)  # (1, total_kv, H_k, D_v)
     o_4d = o.unsqueeze(0)  # (1, total_q, H_q, D_v)
 
-    q_cute = from_dlpack(q_4d, assumed_align=16)
-    k_cute = from_dlpack(k_4d, assumed_align=16)
-    v_cute = from_dlpack(v_4d, assumed_align=16)
-    o_cute = from_dlpack(o_4d, assumed_align=16)
+    # Convert tensors with dynamic layout (matching DSL example)
+    # FP8: DLPack doesn't support FP8, so view as int8 then set element_type
+    is_fp8_in = q.dtype == torch.float8_e4m3fn
+    is_fp8_out = o.dtype == torch.float8_e4m3fn
+    if is_fp8_in:
+        q_cute = from_dlpack(
+            q_4d.view(torch.int8), assumed_align=16
+        ).mark_layout_dynamic(leading_dim=3)
+        q_cute.element_type = cutlass.Float8E4M3FN
+        k_cute = from_dlpack(
+            k_4d.view(torch.int8), assumed_align=16
+        ).mark_layout_dynamic(leading_dim=3)
+        k_cute.element_type = cutlass.Float8E4M3FN
+        v_cute = from_dlpack(
+            v_4d.view(torch.int8), assumed_align=16
+        ).mark_layout_dynamic(leading_dim=3)
+        v_cute.element_type = cutlass.Float8E4M3FN
+    else:
+        q_cute = from_dlpack(q_4d, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        k_cute = from_dlpack(k_4d, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        v_cute = from_dlpack(v_4d, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+    if is_fp8_out:
+        o_cute = from_dlpack(
+            o_4d.view(torch.int8), assumed_align=16
+        ).mark_layout_dynamic(leading_dim=3)
+        o_cute.element_type = cutlass.Float8E4M3FN
+    else:
+        o_cute = from_dlpack(o_4d, assumed_align=16).mark_layout_dynamic(leading_dim=3)
 
-    # cum_seqlen tensors
-    cum_seqlen_q_cute = from_dlpack(qo_indptr.to(torch.int32), assumed_align=16)
-    cum_seqlen_k_cute = from_dlpack(kv_indptr.to(torch.int32), assumed_align=16)
+    # cum_seqlen tensors: 1D, leading_dim=0
+    cum_seqlen_q_cute = from_dlpack(
+        qo_indptr.to(torch.int32), assumed_align=16
+    ).mark_layout_dynamic(leading_dim=0)
+    cum_seqlen_k_cute = from_dlpack(
+        kv_indptr.to(torch.int32), assumed_align=16
+    ).mark_layout_dynamic(leading_dim=0)
 
     # problem_size: (B, max_s_q, s_lse, max_s_k, H_q, H_k, D, D_v)
     s_lse = total_q  # for variable length, s_lse = total tokens
@@ -476,7 +510,7 @@ def cute_dsl_fmha_ragged_prefill(
     # LSE
     lse_iter = None
     if lse is not None:
-        lse_cute = from_dlpack(lse, assumed_align=16)
+        lse_cute = from_dlpack(lse, assumed_align=16).mark_layout_dynamic(leading_dim=2)
         lse_iter = lse_cute.iterator
 
     # Window sizes
@@ -486,6 +520,7 @@ def cute_dsl_fmha_ragged_prefill(
         ws_right = Int32(0)
 
     # Stream
+    # TODO: use torch current stream instead of default stream
     stream = cutlass_torch.default_stream()
 
     # Launch kernel

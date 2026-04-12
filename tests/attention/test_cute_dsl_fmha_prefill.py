@@ -43,7 +43,7 @@ def _quantize_to_fp8(x: torch.Tensor, scale: float) -> torch.Tensor:
 
     Convention: x_real = x_fp8 * scale, so x_fp8 = x_real / scale.
     """
-    return (x.float() / scale).to(torch.float8_e4m3fn)
+    return (x / scale).to(torch.float8_e4m3fn)
 
 
 # Per-tensor scales used for FP8 tests
@@ -148,6 +148,65 @@ def test_cute_dsl_fmha_prefill_direct(
     rtol = 1e-2 if dtype == torch.float16 else 2e-2
     atol = 1e-2 if dtype == torch.float16 else 2e-2
     torch.testing.assert_close(o, o_ref, rtol=rtol, atol=atol)
+
+
+# =============================================================================
+# Test: cute_dsl_fmha_prefill with FP8 (direct API)
+# =============================================================================
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("is_causal", [False, True])
+@pytest.mark.parametrize(
+    "B, S_q, S_k, H_q, H_k",
+    [
+        (1, 128, 128, 8, 8),
+        (2, 256, 256, 8, 8),
+        (2, 128, 128, 16, 4),  # GQA
+    ],
+)
+def test_cute_dsl_fmha_prefill_fp8(head_dim, is_causal, B, S_q, S_k, H_q, H_k):
+    """Test cute_dsl_fmha_prefill with FP8 input and FP16 output (mixed precision)."""
+
+    from flashinfer.attention_dsl.cute_dsl.fmha import cute_dsl_fmha_prefill
+
+    torch.manual_seed(42)
+    D = head_dim
+
+    # Create float32 reference tensors with small values (FP8 friendly range)
+    q_f32 = torch.randn(B, S_q, H_q, D, dtype=torch.float32, device="cuda") * 0.1
+    k_f32 = torch.randn(B, S_k, H_k, D, dtype=torch.float32, device="cuda") * 0.1
+    v_f32 = torch.randn(B, S_k, H_k, D, dtype=torch.float32, device="cuda") * 0.1
+
+    # Quantize to FP8
+    q_fp8 = _quantize_to_fp8(q_f32, FP8_SCALE_Q)
+    k_fp8 = _quantize_to_fp8(k_f32, FP8_SCALE_K)
+    v_fp8 = _quantize_to_fp8(v_f32, FP8_SCALE_V)
+
+    # Output in FP16 (mixed precision: e4m3 in → fp16 out)
+    o = torch.zeros(B, S_q, H_q, D, dtype=torch.float16, device="cuda")
+
+    cute_dsl_fmha_prefill(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        o,
+        is_causal=is_causal,
+        scale_q=FP8_SCALE_Q,
+        scale_k=FP8_SCALE_K,
+        scale_v=FP8_SCALE_V,
+    )
+    torch.cuda.synchronize()
+
+    # Reference: dequantize FP8 back to float32, then compute attention
+    q_deq = q_fp8.float() * FP8_SCALE_Q
+    k_deq = k_fp8.float() * FP8_SCALE_K
+    v_deq = v_fp8.float() * FP8_SCALE_V
+    o_ref = reference_attention(q_deq, k_deq, v_deq, is_causal=is_causal).to(
+        torch.float16
+    )
+
+    torch.testing.assert_close(o, o_ref, rtol=2e-2, atol=2e-2)
 
 
 # =============================================================================
@@ -346,6 +405,96 @@ def test_batch_ragged_prefill_cute_dsl(dtype, head_dim, is_causal):
     rtol = 1e-2 if dtype == torch.float16 else 2e-2
     atol = 1e-2 if dtype == torch.float16 else 2e-2
     torch.testing.assert_close(o_dsl, o_ref, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_batch_ragged_prefill_cute_dsl_fp8(head_dim, is_causal):
+    """Test BatchPrefillWithRaggedKVCacheWrapper with FP8 input and FP16 output."""
+
+    from flashinfer.attention_dsl.cute_dsl.fmha import cute_dsl_fmha_ragged_prefill
+
+    torch.manual_seed(42)
+    H_q, H_k = 8, 8
+    D = head_dim
+
+    seq_lens_q = [64, 128, 32]
+    seq_lens_k = [64, 128, 32]
+    batch_size = len(seq_lens_q)
+
+    total_q = sum(seq_lens_q)
+    total_kv = sum(seq_lens_k)
+    max_s_q = max(seq_lens_q)
+    max_s_k = max(seq_lens_k)
+
+    # Allocate with padding (max_s_q / max_s_k extra) to match DSL example convention.
+    # TMA descriptors may read beyond the logical tensor boundary; the padding
+    # prevents illegal-memory-access errors.
+    q_f32_padded = (
+        torch.randn(total_q + max_s_q, H_q, D, dtype=torch.float32, device="cuda") * 0.1
+    )
+    k_f32_padded = (
+        torch.randn(total_kv + max_s_k, H_k, D, dtype=torch.float32, device="cuda")
+        * 0.1
+    )
+    v_f32_padded = (
+        torch.randn(total_kv + max_s_k, H_k, D, dtype=torch.float32, device="cuda")
+        * 0.1
+    )
+
+    # Quantize to FP8 on padded tensors, then slice (keeps padding memory accessible)
+    q_fp8 = _quantize_to_fp8(q_f32_padded, FP8_SCALE_Q)[:total_q]
+    k_fp8 = _quantize_to_fp8(k_f32_padded, FP8_SCALE_K)[:total_kv]
+    v_fp8 = _quantize_to_fp8(v_f32_padded, FP8_SCALE_V)[:total_kv]
+
+    # Output in FP16 (also padded)
+    o_padded = torch.zeros(
+        total_q + max_s_q, H_q, D, dtype=torch.float16, device="cuda"
+    )
+    o = o_padded[:total_q]
+
+    qo_indptr = torch.tensor(
+        [0] + list(torch.tensor(seq_lens_q).cumsum(0).tolist()),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    kv_indptr = torch.tensor(
+        [0] + list(torch.tensor(seq_lens_k).cumsum(0).tolist()),
+        dtype=torch.int32,
+        device="cuda",
+    )
+
+    cute_dsl_fmha_ragged_prefill(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        o,
+        qo_indptr,
+        kv_indptr,
+        is_causal=is_causal,
+        scale_q=FP8_SCALE_Q,
+        scale_k=FP8_SCALE_K,
+        scale_v=FP8_SCALE_V,
+    )
+    torch.cuda.synchronize()
+
+    # Reference: dequantize then compute per-sequence attention
+    q_deq = q_fp8.float() * FP8_SCALE_Q
+    k_deq = k_fp8.float() * FP8_SCALE_K
+    v_deq = v_fp8.float() * FP8_SCALE_V
+    o_ref = torch.zeros_like(o)
+    for i in range(batch_size):
+        q_i = q_deq[qo_indptr[i] : qo_indptr[i + 1]].unsqueeze(0)
+        k_i = k_deq[kv_indptr[i] : kv_indptr[i + 1]].unsqueeze(0)
+        v_i = v_deq[kv_indptr[i] : kv_indptr[i + 1]].unsqueeze(0)
+        o_i = (
+            reference_attention(q_i, k_i, v_i, is_causal=is_causal)
+            .squeeze(0)
+            .to(torch.float16)
+        )
+        o_ref[qo_indptr[i] : qo_indptr[i + 1]] = o_i
+
+    torch.testing.assert_close(o, o_ref, rtol=2e-2, atol=2e-2)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
