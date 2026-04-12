@@ -62,9 +62,21 @@ def export_to_perfetto_trace(
 
     tgen = TraceGenerator(file_name)
 
-    pid_map = {}
-    tid_map = {}
-    track_map: Dict[Tuple[int, int, int], Any] = {}
+    # First pass: collect sm_id for each block_idx
+    block_to_sm = {}
+    for i in range(1, len(profiler_buffer_host)):
+        if profiler_buffer_host[i] == 0:
+            continue
+        tag, timestamp = profiler_buffer_host[i : i + 1].view(dtype=torch.uint32)
+        tag = int(tag)
+        block_idx, group_idx, event_idx, event_type, sm_id = decode_tag(
+            tag, num_blocks, num_groups
+        )
+        if block_idx not in block_to_sm:
+            block_to_sm[block_idx] = sm_id
+
+    sm_pid_map = {}
+    track_map: Dict[Tuple[int, int], Any] = {}
 
     for i in range(1, len(profiler_buffer_host)):
         if profiler_buffer_host[i] == 0:
@@ -76,20 +88,15 @@ def export_to_perfetto_trace(
             tag, num_blocks, num_groups
         )
 
-        # create trackers
-        if block_idx not in pid_map:
-            pid_map[block_idx] = tgen.create_group(f"sm_{sm_id}_block_{block_idx}")
-        pid = pid_map[block_idx]
-        if (block_idx, group_idx) not in tid_map:
-            tid_map[(block_idx, group_idx)] = pid.create_group(f"group_{group_idx}")
-        tid = tid_map[(block_idx, group_idx)]
-        event = event_names[event_idx]
+        if sm_id not in sm_pid_map:
+            sm_pid_map[sm_id] = tgen.create_group(f"SM_{sm_id:03d}")
+        sm_group = sm_pid_map[sm_id]
 
-        if (block_idx, group_idx, event_idx) in track_map:
-            track = track_map[(block_idx, group_idx, event_idx)]
-        else:
-            track = tid.create_track()
-            track_map[(block_idx, group_idx, event_idx)] = track
+        event = event_names[event_idx]
+        tkey = (block_idx, group_idx)
+        if tkey not in track_map:
+            track_map[tkey] = sm_group.create_track(f"blk{block_idx}_g{group_idx}")
+        track = track_map[tkey]
 
         if event_type == EventType.kBegin.value:
             track.open(timestamp, event)
