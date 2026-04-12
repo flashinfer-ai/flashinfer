@@ -507,16 +507,13 @@ def test_dsv3_fused_routing_op(
 @pytest.mark.parametrize("n_group", [1, 8])
 @pytest.mark.parametrize("topk_group", [1, 4])
 @pytest.mark.parametrize("data_type", [torch.bfloat16, torch.float16])
-def test_routing_replay_out(
+def test_routing_replay_out_extended(
     num_tokens, num_experts, topk, n_group, topk_group, data_type
 ):
     """
     Test that routing_replay_out records the same expert IDs as topk_indices.
 
-    The routing replay feature writes selected expert IDs (int16) into an
-    optional output tensor during the fused routing kernel. This test verifies
-    that routing_replay_out matches topk_indices (as sets per token), and that
-    passing None produces identical routing results (no side effects).
+    Extended parametrization covering larger token counts (8, 64).
     """
     if topk_group * n_group < topk or topk_group > n_group:
         pytest.skip("Invalid configuration")
@@ -588,7 +585,6 @@ def test_routing_replay_out(
 
     torch.testing.assert_close(topk_values, topk_values_no_replay)
     torch.testing.assert_close(topk_indices, topk_indices_no_replay)
-
 
 
 @pytest.mark.parametrize("num_tokens", [1, 7, 32])

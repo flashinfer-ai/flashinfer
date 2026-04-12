@@ -217,6 +217,11 @@ class FusedMoeLauncher {
         activation_type{ActivationType::Swiglu},
         intermediate_size_factor{2} {}
 
+ public:
+  void set_routing_replay_out(const Optional<TensorView>& replay_out) {
+    routing_replay_out = replay_out;
+  }
+
  protected:
   // Initialize common data necessary for later.
   // May throw exception from TVM_FFI_ICHECK.
@@ -224,10 +229,6 @@ class FusedMoeLauncher {
                    int64_t tile_tokens_dim, int64_t routing_method_type, bool use_shuffled_weight,
                    int64_t weight_layout, ActivationType activation_type,
                    bool norm_topk_prob = true);
-
-  void set_routing_replay_out(const Optional<TensorView>& replay_out) {
-    routing_replay_out = replay_out;
-  }
 
   // Routing logits [num_tokens, num_experts]
   void check_routing_logits() const {
@@ -483,8 +484,7 @@ class FusedMoeLauncher {
         static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
         use_routing_scales_on_input, use_deep_seek_fp8,
         static_cast<RoutingMethodType>(routing_method_type), routing_stream, mRoutingLogitsDtype,
-        norm_topk_prob,
-        replay_ptr);
+        norm_topk_prob, replay_ptr);
 
     check_moe();
     prepare_moe(moe_tactic);
@@ -1223,8 +1223,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
         static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
         use_routing_scales_on_input, use_deep_seek_fp8,
         static_cast<RoutingMethodType>(routing_method_type), routing_stream, mRoutingLogitsDtype,
-        norm_topk_prob,
-        replay_ptr);
+        norm_topk_prob, replay_ptr);
 
     check_moe();
     prepare_moe(moe_tactic);
@@ -1711,8 +1710,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
         static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
         use_routing_scales_on_input, use_deep_seek_fp8,
         static_cast<RoutingMethodType>(routing_method_type), routing_stream, mRoutingLogitsDtype,
-        norm_topk_prob,
-        replay_ptr);
+        norm_topk_prob, replay_ptr);
 
     check_moe();
     prepare_moe(moe_tactic);
@@ -1961,8 +1959,7 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
     int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
     int64_t routing_method_type, bool use_shuffled_weight, int64_t weight_layout, bool do_finalize,
     bool enable_pdl, Array<int64_t> config_index, Fp8QuantizationType quantization_type,
-    int64_t act_type, bool norm_topk_prob,
-    Optional<TensorView> routing_replay_out) {
+    int64_t act_type, bool norm_topk_prob, Optional<TensorView> routing_replay_out) {
   auto activation_type = validateAndCastActivationType(act_type);
   // DeepSeekFp8 currently uses a TRTLLM runner that hardwires Swiglu activation semantics.
   // Fail for any other activation to avoid silently running incorrect activation behavior.
@@ -2255,8 +2252,7 @@ Array<Tensor> trtllm_mxint4_block_scale_moe(
     Optional<int64_t> n_group, Optional<int64_t> topk_group, int64_t intermediate_size,
     int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
     int64_t routing_method_type, bool do_finalize, bool enable_pdl, TensorView output,
-    Array<int64_t> config_index, bool norm_topk_prob,
-    Optional<TensorView> routing_replay_out) {
+    Array<int64_t> config_index, bool norm_topk_prob, Optional<TensorView> routing_replay_out) {
   // Determine data types based on input format
   int const num_tokens = hidden_states.size(0);
   int hidden_size = hidden_states.size(1);

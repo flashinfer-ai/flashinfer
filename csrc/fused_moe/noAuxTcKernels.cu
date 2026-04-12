@@ -285,8 +285,7 @@ void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk
       InputT * scores, BiasT * bias, OutputT * topk_values, IdxT * topk_indices,        \
       int64_t const num_tokens, int64_t const num_experts, int64_t const n_group,       \
       int64_t const topk_group, int64_t const topk, double const routed_scaling_factor, \
-      bool const launch_with_pdl, cudaStream_t const stream,                   \
-      int16_t* routing_replay_out);
+      bool const launch_with_pdl, cudaStream_t const stream, int16_t* routing_replay_out);
 
 INSTANTIATE_NOAUX_TC(float, float, float, int32_t);
 INSTANTIATE_NOAUX_TC(float, half, float, int32_t);
@@ -350,6 +349,9 @@ void NoAuxTc(TensorView scores, TensorView bias, int64_t n_group, int64_t topk_g
       << "topk_indices must have the same dtype as scores";
 
   // Validate and extract routing_replay_out
+  // NOTE: dim0 >= num_tokens is intentionally NOT checked — with CUDA graphs the buffer
+  // is pre-allocated at maximum batch size and reused across steps with varying num_tokens.
+  // The kernel only writes to indices [0, num_tokens), so a larger buffer is safe.
   constexpr int64_t int16_code_val = encode_dlpack_dtype(DLDataType{kDLInt, 16, 1});
   int16_t* replay_ptr = nullptr;
   if (routing_replay_out.has_value()) {

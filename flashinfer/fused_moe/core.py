@@ -1851,7 +1851,7 @@ def get_trtllm_moe_sm100_module():
 
     @register_custom_op(
         "flashinfer::trtllm_fp4_block_scale_moe",
-        mutates_args=(""),
+        mutates_args=("routing_replay_out",),
     )
     def trtllm_fp4_block_scale_moe_op(
         routing_logits: Optional[torch.Tensor],
@@ -1887,6 +1887,7 @@ def get_trtllm_moe_sm100_module():
         output: Optional[torch.Tensor] = None,
         tune_max_num_tokens: int = 8192,
         norm_topk_prob: bool = True,
+        routing_replay_out: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         if routing_logits is None:
             assert topk_ids is not None, (
@@ -2072,7 +2073,9 @@ def get_trtllm_moe_sm100_module():
         output: Optional[torch.Tensor] = None,
         tune_max_num_tokens: int = 8192,
         norm_topk_prob: bool = True,
+        routing_replay_out: Optional[torch.Tensor] = None,
     ):
+        _ = routing_replay_out
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1] if output is None else output.shape[1]
 
@@ -2080,7 +2083,7 @@ def get_trtllm_moe_sm100_module():
 
     @register_custom_op(
         "flashinfer::trtllm_mxint4_block_scale_moe",
-        mutates_args=(""),
+        mutates_args=("routing_replay_out",),
     )
     def trtllm_mxint4_block_scale_moe_op(
         routing_logits: torch.Tensor,
@@ -2107,6 +2110,7 @@ def get_trtllm_moe_sm100_module():
         output: Optional[torch.Tensor] = None,
         tune_max_num_tokens: int = 8192,
         norm_topk_prob: bool = True,
+        routing_replay_out: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         routing_dtype = routing_logits.dtype
         hidden_size = hidden_states.shape[-1]
@@ -2248,7 +2252,9 @@ def get_trtllm_moe_sm100_module():
         output: Optional[torch.Tensor] = None,
         tune_max_num_tokens: int = 8192,
         norm_topk_prob: bool = True,
+        routing_replay_out: Optional[torch.Tensor] = None,
     ):
+        _ = routing_replay_out
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
 
@@ -2448,6 +2454,7 @@ def trtllm_bf16_routed_moe(
         enable_pdl,
         tune_max_num_tokens,
         True,  # norm_topk_prob: not used for pre-computed routing
+        routing_replay_out,
     )
 
     if do_finalize:
@@ -2484,7 +2491,6 @@ def trtllm_fp8_per_tensor_scale_moe(
     tune_max_num_tokens: int = 8192,
     activation_type: int = ActivationType.Swiglu.value,
     norm_topk_prob: bool = True,
-
     routing_replay_out: Optional[torch.Tensor] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     """FP8 per tensor scale MoE operation.
@@ -2919,6 +2925,7 @@ def trtllm_fp4_block_scale_moe(
         output,
         tune_max_num_tokens,
         norm_topk_prob,
+        routing_replay_out,
     )
 
 
@@ -3156,4 +3163,5 @@ def trtllm_mxint4_block_scale_moe(
         output,
         tune_max_num_tokens,
         norm_topk_prob,
+        routing_replay_out,
     )

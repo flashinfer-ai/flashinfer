@@ -707,7 +707,6 @@ def test_trtllm_gen_fp8_mxfp8_routed_activation_parity(activation_type: int):
     assert mismatch_pct < 10, f"Mismatch percentage is {mismatch_pct:.2f}%"
 
 
-
 @pytest.mark.parametrize("num_tokens", [1, 7, 32])
 @pytest.mark.parametrize("hidden_size", [1024])
 @pytest.mark.parametrize("intermediate_size", [1024, 2048])
