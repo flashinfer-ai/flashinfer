@@ -13,14 +13,14 @@ selected for each token during inference and returns them in the API response.
 
 ### `routing_replay_out` Parameter
 
-Available on:
+Available on these vLLM integration path APIs (other MoE entry points also accept this parameter):
 - `trtllm_fp8_block_scale_moe()`
 - `trtllm_bf16_moe()`
 - `trtllm_bf16_routed_moe()`
 - `fused_topk_deepseek()`
 
 **Spec:**
-```
+```text
 routing_replay_out: Optional[torch.Tensor]
   dtype: torch.int16
   shape: (num_tokens_or_larger, top_k)
