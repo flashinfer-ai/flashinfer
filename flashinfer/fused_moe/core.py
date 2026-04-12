@@ -1450,7 +1450,7 @@ def get_trtllm_moe_sm100_module():
 
     @register_custom_op(
         "flashinfer::trtllm_fp8_per_tensor_scale_moe",
-        mutates_args=(""),
+        mutates_args=("routing_replay_out",),
     )
     def trtllm_fp8_per_tensor_scale_moe_op(
         routing_logits: torch.Tensor,
@@ -1476,6 +1476,7 @@ def get_trtllm_moe_sm100_module():
         tune_max_num_tokens: int = 8192,
         activation_type: int = ActivationType.Swiglu.value,
         norm_topk_prob: bool = True,
+        routing_replay_out: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
@@ -1611,7 +1612,9 @@ def get_trtllm_moe_sm100_module():
         tune_max_num_tokens: int = 8192,
         activation_type: int = ActivationType.Swiglu.value,
         norm_topk_prob: bool = True,
+        routing_replay_out: Optional[torch.Tensor] = None,
     ):
+        _ = routing_replay_out
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
 

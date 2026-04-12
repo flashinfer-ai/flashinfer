@@ -769,8 +769,11 @@ def test_fp8_block_scale_moe_routing_replay(
         dtype=torch.float32,
     )
 
+    # Allocate oversized buffer to validate CUDA graph pre-allocation contract:
+    # kernel should only write to [0, num_tokens) and leave tail rows as sentinel.
+    replay_capacity = num_tokens + 5
     routing_replay_out = torch.full(
-        (num_tokens, top_k), -1, device=device, dtype=torch.int16
+        (replay_capacity, top_k), -1, device=device, dtype=torch.int16
     )
 
     output_with_replay = trtllm_fp8_block_scale_moe(
@@ -829,9 +832,10 @@ def test_fp8_block_scale_moe_routing_replay(
         atol=0,
     )
 
-    # All replay IDs should be valid expert indices
-    assert (routing_replay_out >= 0).all(), "Found negative expert IDs in replay"
-    assert (routing_replay_out < num_experts).all(), (
+    # All replay IDs in active rows should be valid expert indices
+    active_replay = routing_replay_out[:num_tokens]
+    assert (active_replay >= 0).all(), "Found negative expert IDs in replay"
+    assert (active_replay < num_experts).all(), (
         f"Found expert IDs >= {num_experts} in replay"
     )
 
@@ -841,8 +845,13 @@ def test_fp8_block_scale_moe_routing_replay(
     )
     expected_topk = permute_info["topKIndices"].to(torch.int16)
     torch.testing.assert_close(
-        torch.sort(routing_replay_out, dim=1).values,
+        torch.sort(active_replay, dim=1).values,
         torch.sort(expected_topk, dim=1).values,
         rtol=0,
         atol=0,
+    )
+
+    # Tail rows beyond num_tokens should remain sentinel (-1)
+    assert (routing_replay_out[num_tokens:] == -1).all(), (
+        "Kernel should not write beyond active token rows"
     )
