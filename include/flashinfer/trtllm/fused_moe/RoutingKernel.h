@@ -96,14 +96,8 @@ struct DataBase {
   int32_t mNumTokens;
   int32_t mNumExperts;
   int32_t mTopK;
-  // Cluster-wide tile size in token dimension.
   int32_t mTileTokensDim;
-  // log2() of the padding size in cluster-wide tile.
   int32_t mPaddingLog2;
-  // Cluster size (e.g., 1x2, 2x1, etc.) in batch dimension.
-  int32_t mClusterSizeInBatchDim{1};
-  // log2() of the cluster size in batch dimension.
-  int32_t mClusterSizeLog2{0};
 
   /// For expert parallelization
   int32_t mLocalExpertsStartIdx;
@@ -140,8 +134,6 @@ struct KernelParamsBase {
 
   int32_t mPaddingLog2 = -1;
   int32_t mTileTokensDim = 0;
-  int32_t mClusterSizeInBatchDim = 1;
-  int32_t mClusterSizeLog2 = 0;
   int32_t mLocalExpertsStartIdx = 0;
   int32_t mLocalExpertsStrideLog2 = 0;
   int32_t mNumLocalExperts = 0;
@@ -168,8 +160,6 @@ struct KernelParamsBase {
 
     mPaddingLog2 = data.mPaddingLog2;
     mTileTokensDim = data.mTileTokensDim;
-    mClusterSizeInBatchDim = data.mClusterSizeInBatchDim;
-    mClusterSizeLog2 = data.mClusterSizeLog2;
     mLocalExpertsStartIdx = data.mLocalExpertsStartIdx;
     mLocalExpertsStrideLog2 = data.mLocalExpertsStrideLog2;
     mNumLocalExperts = data.mNumLocalExperts;

@@ -184,8 +184,6 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
     } else {
       numCtaPerExpert[e] = divUpTileN<int32_t>(accExpertCount[e], params.mTileTokensDim);
     }
-    // Expand from CGA count to CTA count to keep the semantic stable with downstream kernels
-    numCtaPerExpert[e] *= params.mClusterSizeInBatchDim;
   }
   int32_t ctaOffsetPerExpert[ExpertsPerThread];
   int32_t numNonExitingCtas;
@@ -224,13 +222,13 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
         int32_t mnLimit1;
         int32_t mnLimit2;
         if (params.mIsPow2) {
-          int32_t ctaPaddingLog2 = params.mPaddingLog2 - params.mClusterSizeLog2;
-          mnLimit1 = mulLog2<int32_t>(ctaOffsetPerExpert[e] + cta + 1, ctaPaddingLog2);
-          mnLimit2 = mulLog2<int32_t>(ctaOffsetPerExpert[e], ctaPaddingLog2) + accExpertCount[e];
+          mnLimit1 = mulLog2<int32_t>(ctaOffsetPerExpert[e] + cta + 1, params.mPaddingLog2);
+          mnLimit2 =
+              mulLog2<int32_t>(ctaOffsetPerExpert[e], params.mPaddingLog2) + accExpertCount[e];
         } else {
-          int32_t ctaTile = params.mTileTokensDim / params.mClusterSizeInBatchDim;
-          mnLimit1 = (ctaOffsetPerExpert[e] + cta + 1) * ctaTile;
-          mnLimit2 = ctaOffsetPerExpert[e] * ctaTile + accExpertCount[e];
+          mnLimit1 = mulTileN<int32_t>(ctaOffsetPerExpert[e] + cta + 1, params.mTileTokensDim);
+          mnLimit2 =
+              mulTileN<int32_t>(ctaOffsetPerExpert[e], params.mTileTokensDim) + accExpertCount[e];
         }
         params.mPtrCtaIdxXyToMnLimit[ctaOffsetPerExpert[e] + cta] = min(mnLimit1, mnLimit2);
       }
@@ -241,10 +239,9 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
   if (threadIdx.x == 0) {
     int32_t permutedIdxSize;
     if (params.mIsPow2) {
-      permutedIdxSize =
-          mulLog2<int32_t>(numNonExitingCtas >> params.mClusterSizeLog2, params.mPaddingLog2);
+      permutedIdxSize = mulLog2<int32_t>(numNonExitingCtas, params.mPaddingLog2);
     } else {
-      permutedIdxSize = (numNonExitingCtas / params.mClusterSizeInBatchDim) * params.mTileTokensDim;
+      permutedIdxSize = mulTileN<int32_t>(numNonExitingCtas, params.mTileTokensDim);
     }
     params.mPtrPermutedIdxSize[0] = permutedIdxSize;
     params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
@@ -500,7 +497,6 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
           numCtaPerExpert[e] = divUpTileN<int32_t>(accExpertCount[e], params.mTileTokensDim);
           tmpCountPerExpert[e] = divUpMulTileN<int32_t>(accExpertCount[e], params.mTileTokensDim);
         }
-        numCtaPerExpert[e] *= params.mClusterSizeInBatchDim;
       } else {
         numCtaPerExpert[e] = 0;
         tmpCountPerExpert[e] = 0;
@@ -544,13 +540,13 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
           params.mPtrCtaIdxXyToBatchIdx[ctaOffsetPerExpert[e] + cta] = mappedLocalIdx;
           int32_t mnLimit1, mnLimit2;
           if (params.mIsPow2) {
-            int32_t ctaPaddingLog2 = params.mPaddingLog2 - params.mClusterSizeLog2;
-            mnLimit1 = mulLog2<int32_t>(ctaOffsetPerExpert[e] + cta + 1, ctaPaddingLog2);
-            mnLimit2 = mulLog2<int32_t>(ctaOffsetPerExpert[e], ctaPaddingLog2) + accExpertCount[e];
+            mnLimit1 = mulLog2<int32_t>(ctaOffsetPerExpert[e] + cta + 1, params.mPaddingLog2);
+            mnLimit2 =
+                mulLog2<int32_t>(ctaOffsetPerExpert[e], params.mPaddingLog2) + accExpertCount[e];
           } else {
-            int32_t ctaTile = params.mTileTokensDim / params.mClusterSizeInBatchDim;
-            mnLimit1 = (ctaOffsetPerExpert[e] + cta + 1) * ctaTile;
-            mnLimit2 = ctaOffsetPerExpert[e] * ctaTile + accExpertCount[e];
+            mnLimit1 = mulTileN<int32_t>(ctaOffsetPerExpert[e] + cta + 1, params.mTileTokensDim);
+            mnLimit2 =
+                mulTileN<int32_t>(ctaOffsetPerExpert[e], params.mTileTokensDim) + accExpertCount[e];
           }
           params.mPtrCtaIdxXyToMnLimit[ctaOffsetPerExpert[e] + cta] = min(mnLimit1, mnLimit2);
         }
@@ -561,10 +557,9 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
   if (threadIdx.x == 0) {
     int32_t permutedIdxSize;
     if (params.mIsPow2) {
-      permutedIdxSize =
-          mulLog2<int32_t>(numNonExitingCtas >> params.mClusterSizeLog2, params.mPaddingLog2);
+      permutedIdxSize = mulLog2<int32_t>(numNonExitingCtas, params.mPaddingLog2);
     } else {
-      permutedIdxSize = (numNonExitingCtas / params.mClusterSizeInBatchDim) * params.mTileTokensDim;
+      permutedIdxSize = mulTileN<int32_t>(numNonExitingCtas, params.mTileTokensDim);
     }
     params.mPtrPermutedIdxSize[0] = permutedIdxSize;
     params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
