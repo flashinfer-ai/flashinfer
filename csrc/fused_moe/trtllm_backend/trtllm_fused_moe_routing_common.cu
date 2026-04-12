@@ -69,7 +69,9 @@ void runPostTopKPipeline(DataType const& data, void* stream) {
   // Tier<1024,32>, so queryDispatchedMaxExperts() returns 1024 while
   // mNumExperts is 512.  The dynblock kernel sizes smem proportional to
   // maxExperts; using the raw count would exceed the smem budget.
-  int32_t const dispatchedMaxExperts = routingCustom::queryDispatchedMaxExperts(data);
+  // Use customData (routingCustom::Data) since queryDispatchedMaxExperts
+  // requires routingCustom::Data, not the template DataType.
+  int32_t const dispatchedMaxExperts = routingCustom::queryDispatchedMaxExperts(customData);
   bool const useDynBlock = !useStaticBlock &&
                            data.mNumTokens <= routingCustom::DynBlockKernelMaxNumTokens &&
                            dispatchedMaxExperts <= routingCustom::DynBlockKernelMaxNumExperts;
