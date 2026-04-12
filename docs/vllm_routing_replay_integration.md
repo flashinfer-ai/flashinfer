@@ -24,7 +24,8 @@ Available on:
 routing_replay_out: Optional[torch.Tensor]
   dtype: torch.int16
   shape: (num_tokens_or_larger, top_k)
-  Layout: row-major. replay[t, k] = k-th ranked expert ID for token t
+  Layout: row-major. replay[t, k] stores one selected expert ID for token t
+  Column order is unspecified; compare per-token sets rather than positions
   When None: zero overhead, the kernel skips the write entirely
   When provided: the kernel writes expert IDs during routing
 ```

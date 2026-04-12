@@ -835,9 +835,14 @@ def test_fp8_block_scale_moe_routing_replay(
         f"Found expert IDs >= {num_experts} in replay"
     )
 
-    # Each token should have top_k unique experts
-    for t in range(num_tokens):
-        unique_experts = routing_replay_out[t].unique()
-        assert unique_experts.numel() == top_k, (
-            f"Token {t}: expected {top_k} unique experts, got {unique_experts.numel()}"
-        )
+    # Compare replay against reference routing result (set equality per token)
+    permute_info, _ = routing_reference_renormalize(
+        routing_logits, top_k, num_experts, 8
+    )
+    expected_topk = permute_info["topKIndices"].to(torch.int16)
+    torch.testing.assert_close(
+        torch.sort(routing_replay_out, dim=1).values,
+        torch.sort(expected_topk, dim=1).values,
+        rtol=0,
+        atol=0,
+    )
