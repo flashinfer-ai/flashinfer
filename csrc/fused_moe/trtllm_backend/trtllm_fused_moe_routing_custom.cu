@@ -259,9 +259,11 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
                        (localExpIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
 
         int const expandedIdx = tokenIdx * params.mTopK + smemKIdx[offset];
-        int const offsetWithinExpert = static_cast<int>(smemOffset[offset]);
-        int const offsetForExpert = expertScanCountsPerExpert[e];
-        int const permutedIdx = isLocal ? offsetForExpert + offsetWithinExpert : int32_t{-1};
+        // Only load smemOffset for local experts; the histogram phase only
+        // writes it for local experts, so remote entries are uninitialized.
+        int const permutedIdx =
+            isLocal ? expertScanCountsPerExpert[e] + static_cast<int>(smemOffset[offset])
+                    : int32_t{-1};
 
         if (params.mPtrExpandedIdxToPermutedIdx != nullptr) {
           params.mPtrExpandedIdxToPermutedIdx[expandedIdx] = permutedIdx;
@@ -580,9 +582,11 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
               (localExpIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
 
           int const expandedIdx = tokenIdx * params.mTopK + smemKIdx[offset];
-          int const offsetWithinExpert = static_cast<int>(smemOffset[offset]);
-          int const offsetForExpert = expertScanCountsPerExpert[e];
-          int const permutedIdx = isLocal ? offsetForExpert + offsetWithinExpert : int32_t{-1};
+          // Only load smemOffset for local experts; Phase 2 only writes it
+          // for local experts, so remote entries are uninitialized.
+          int const permutedIdx =
+              isLocal ? expertScanCountsPerExpert[e] + static_cast<int>(smemOffset[offset])
+                      : int32_t{-1};
 
           if (params.mPtrExpandedIdxToPermutedIdx != nullptr) {
             params.mPtrExpandedIdxToPermutedIdx[expandedIdx] = permutedIdx;
@@ -893,8 +897,16 @@ void run(Data const& data, void* stream) {
 
   static int const smMajor = tensorrt_llm::common::getSMVersion() / 10;
   bool const useStaticBlock = data.mNumTokens <= BlockKernelMaxNumTokens;
+  // Gate on the dispatched tier size, not the raw expert count.
+  // Example: a model with 512 experts and topK=22 skips Tier<512,8> (topK too
+  // large) and falls through to Tier<1024,32>.  queryDispatchedMaxExperts()
+  // returns 1024 while mNumExperts is only 512.  The dynblock kernel sizes
+  // shared memory proportional to maxExperts, so using the raw count (512 <=
+  // 512, passes) would let it enter a 1024-expert specialization that exceeds
+  // the smem budget.
+  int32_t const dispatchedMaxExperts = queryDispatchedMaxExperts(data);
   bool const useDynBlock = !useStaticBlock && data.mNumTokens <= DynBlockKernelMaxNumTokens &&
-                           data.mNumExperts <= DynBlockKernelMaxNumExperts;
+                           dispatchedMaxExperts <= DynBlockKernelMaxNumExperts;
   bool const useSingleBlock = useStaticBlock || useDynBlock;
   bool const useSingleCluster =
       (smMajor >= 9) && (data.mNumTokens <= MaxNumTokensSingleClusterScores);

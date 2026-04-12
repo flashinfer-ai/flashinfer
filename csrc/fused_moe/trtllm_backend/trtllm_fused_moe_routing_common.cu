@@ -64,9 +64,15 @@ void runPostTopKPipeline(DataType const& data, void* stream) {
   // Determine which path to use based on token count
   static int const smMajor = tensorrt_llm::common::getSMVersion() / 10;
   bool const useStaticBlock = data.mNumTokens <= routingCustom::BlockKernelMaxNumTokens;
+  // Use the dispatched tier size (not raw mNumExperts).
+  // Example: 512 experts with topK=22 skips Tier<512,8> and lands on
+  // Tier<1024,32>, so queryDispatchedMaxExperts() returns 1024 while
+  // mNumExperts is 512.  The dynblock kernel sizes smem proportional to
+  // maxExperts; using the raw count would exceed the smem budget.
+  int32_t const dispatchedMaxExperts = routingCustom::queryDispatchedMaxExperts(data);
   bool const useDynBlock = !useStaticBlock &&
                            data.mNumTokens <= routingCustom::DynBlockKernelMaxNumTokens &&
-                           data.mNumExperts <= routingCustom::DynBlockKernelMaxNumExperts;
+                           dispatchedMaxExperts <= routingCustom::DynBlockKernelMaxNumExperts;
   // runPostTopKPipeline only handles pre-computed topK (mPtrTopKIds or mPtrTopKPacked),
   // never raw scores. The cluster kernel's routingPermutation uses thread-per-expanded-index
   // for both input types (LoadExpertIdxFromGlobal=true), so the capacity is

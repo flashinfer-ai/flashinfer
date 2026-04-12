@@ -1873,7 +1873,7 @@ def routing_reference_minimax2(
     selection_scores = sigmoid_scores.clone()
     if routing_bias is not None:
         selection_scores = selection_scores + routing_bias.float()
-    topk_values, topk_idx = torch.topk(selection_scores, k=top_k, dim=-1)
+    _, topk_idx = torch.topk(selection_scores, k=top_k, dim=-1)
 
     # Weights use un-biased sigmoid scores
     raw_weights = torch.gather(sigmoid_scores, -1, topk_idx)
