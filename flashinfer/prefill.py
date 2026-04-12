@@ -3103,7 +3103,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 )
 
         if self._backend == "cute-dsl":
-            pass  # No plan needed
+            # Compute max seq lengths here (plan runs outside graph capture)
+            self._max_qo_len = int(torch.max(qo_indptr[1:] - qo_indptr[:-1]).item())
+            self._max_kv_len = int(torch.max(kv_indptr[1:] - kv_indptr[:-1]).item())
         elif self._backend == "cutlass":
             self._plan_info = fmha_varlen_plan(
                 self._cached_module, qo_indptr, kv_indptr, num_qo_heads, causal
@@ -3331,6 +3333,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 scale_k=k_scale if k_scale is not None else 1.0,
                 scale_v=v_scale if v_scale is not None else 1.0,
                 scale_o=o_scale if o_scale is not None else 1.0,
+                max_qo_len=self._max_qo_len,
+                max_kv_len=self._max_kv_len,
             )
             return (out, lse) if return_lse else out
         elif self._backend == "cutlass":

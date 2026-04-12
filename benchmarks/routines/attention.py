@@ -1751,13 +1751,13 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
     # Prepare wrappers
     backend_wrappers = {}
     for backend in backends:
-        if backend in ["cutlass", "fa2", "fa3", "trtllm-gen"]:
+        if backend in ["cutlass", "fa2", "fa3", "trtllm-gen", "cute-dsl"]:
             backend_wrappers[backend] = (
                 flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
                     workspace_buffer,
                     "NHD",
                     use_cuda_graph=is_cuda_graph_compatible
-                    if backend != "fa2"
+                    if backend not in ["fa2", "cute-dsl"]
                     else False,
                     qo_indptr_buf=qo_indptr,
                     kv_indptr_buf=kv_indptr,
@@ -1843,6 +1843,8 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
     ):
         if backend in ["cutlass", "fa2", "fa3", "trtllm-gen"]:
             return backend_wrappers[backend].run_return_lse(q, k, v)[0]
+        elif backend == "cute-dsl":
+            return backend_wrappers[backend].run(q, k, v)
         elif backend == "cudnn":
             # cuDNN uses wrapper API
             return backend_wrappers[backend].run(q, k, v)

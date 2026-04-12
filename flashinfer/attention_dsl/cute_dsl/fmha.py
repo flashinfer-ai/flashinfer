@@ -411,6 +411,8 @@ def cute_dsl_fmha_ragged_prefill(
     scale_v: float = 1.0,
     scale_o: float = 1.0,
     enable_tvm_ffi: bool = True,
+    max_qo_len: Optional[int] = None,
+    max_kv_len: Optional[int] = None,
 ) -> None:
     """Run DSL FMHA prefill kernel on ragged (variable-length) tensors.
 
@@ -454,6 +456,11 @@ def cute_dsl_fmha_ragged_prefill(
     enable_tvm_ffi : bool
         If True, use TVM-FFI ABI (pass data_ptr() for Pointer args, torch.Tensor
         for Tensor args, no explicit stream). Default False (CuTe native ABI).
+    max_qo_len : int, optional
+        Maximum query sequence length. Computed from qo_indptr if not provided.
+        Pass this from plan() to avoid D2H copy during CUDA graph capture.
+    max_kv_len : int, optional
+        Maximum KV sequence length. Computed from kv_indptr if not provided.
     """
     total_q, H_q, D = q.shape
     total_kv, H_k, _ = k.shape
@@ -476,11 +483,15 @@ def cute_dsl_fmha_ragged_prefill(
     scale_softmax_log2 = scale_softmax * log2_e
     scale_output = scale_v / scale_o
 
-    # Compute max seq lengths for problem_size
-    qo_indptr_cpu = qo_indptr.cpu()
-    kv_indptr_cpu = kv_indptr.cpu()
-    max_s_q = int((qo_indptr_cpu[1:] - qo_indptr_cpu[:-1]).max().item())
-    max_s_k = int((kv_indptr_cpu[1:] - kv_indptr_cpu[:-1]).max().item())
+    # Max seq lengths for problem_size (prefer pre-computed values for CUDA graph compat)
+    if max_qo_len is None:
+        max_s_q = int((qo_indptr.cpu()[1:] - qo_indptr.cpu()[:-1]).max().item())
+    else:
+        max_s_q = max_qo_len
+    if max_kv_len is None:
+        max_s_k = int((kv_indptr.cpu()[1:] - kv_indptr.cpu()[:-1]).max().item())
+    else:
+        max_s_k = max_kv_len
 
     # problem_size: (B, max_s_q, s_lse, max_s_k, H_q, H_k, D, D_v)
     s_lse = total_q  # for variable length, s_lse = total tokens
