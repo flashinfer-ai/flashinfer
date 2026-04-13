@@ -873,13 +873,14 @@ class TllmGenFmhaKernel {
       auto findModuleIter = mModules.find(kernelMeta.mFuncName);
       auto capitalizeFirst = [](std::string str) {
         if (!str.empty()) {
-          str[0] = std::toupper(str[0]);
+          str[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(str[0])));
         }
         return str;
       };
       if (findModuleIter == mModules.end()) {
         // Load the module.
-        std::string cubin_path = tllm_gen_fmha_cubin_path + "/" + kernelMeta.mFuncName + ".cubin";
+        std::string cubin_path =
+            tllm_gen_fmha_cubin_path + "/" + capitalizeFirst(kernelName) + ".cubin";
         std::string cubin = getCubin(cubin_path, kernelMeta.sha256);
         if (cubin.empty()) {
           throw std::runtime_error("Failed to load cubin for " + kernelName);
