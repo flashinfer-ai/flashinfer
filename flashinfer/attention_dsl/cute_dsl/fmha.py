@@ -75,6 +75,7 @@ def _get_variant_name(
     is_causal: bool,
     is_persistent: bool = True,
     varlen: bool = False,
+    with_lse: bool = False,
     enable_tvm_ffi: bool = False,
 ) -> str:
     """Generate the variant name matching compile_cute_dsl_fmha.py naming convention."""
@@ -85,8 +86,9 @@ def _get_variant_name(
     causal_str = "causal" if is_causal else "nocausal"
     persist_str = "persistent" if is_persistent else "nonpersistent"
     varlen_str = "_varlen" if varlen else ""
+    lse_str = "_lse" if with_lse else ""
     ffi_str = "_tvmffi" if enable_tvm_ffi else ""
-    return f"cute_dsl_fmha_{dtype_str}_h{head_dim}_{causal_str}_{persist_str}{varlen_str}{ffi_str}"
+    return f"cute_dsl_fmha_{dtype_str}_h{head_dim}_{causal_str}_{persist_str}{varlen_str}{lse_str}{ffi_str}"
 
 
 # =============================================================================
@@ -176,6 +178,7 @@ def get_cute_dsl_fmha_kernel(
     is_persistent: bool = True,
     enable_tvm_ffi: bool = False,
     varlen: bool = False,
+    with_lse: bool = False,
 ):
     """Get a compiled DSL FMHA kernel function.
 
@@ -206,7 +209,14 @@ def get_cute_dsl_fmha_kernel(
         The compiled kernel function.
     """
     variant_name = _get_variant_name(
-        in_dtype, out_dtype, head_dim, is_causal, is_persistent, varlen, enable_tvm_ffi
+        in_dtype,
+        out_dtype,
+        head_dim,
+        is_causal,
+        is_persistent,
+        varlen,
+        with_lse,
+        enable_tvm_ffi,
     )
 
     # Check for local .so directory (development mode)
@@ -365,6 +375,7 @@ def cute_dsl_fmha_prefill(
 
         lse_iter = None
         if lse is not None:
+            # TODO: check lse's shape?
             lse_cute = from_dlpack(lse, assumed_align=16).mark_layout_dynamic(
                 leading_dim=2
             )
@@ -471,7 +482,14 @@ def cute_dsl_fmha_ragged_prefill(
 
     if kernel_fn is None:
         kernel_fn = get_cute_dsl_fmha_kernel(
-            q.dtype, o.dtype, D, is_causal, varlen=True, enable_tvm_ffi=enable_tvm_ffi
+            q.dtype,
+            o.dtype,
+            D,
+            is_causal,
+            is_persistent=not is_causal,
+            varlen=True,
+            enable_tvm_ffi=enable_tvm_ffi,
+            with_lse=lse is not None,
         )
 
     # Compute scale factors
@@ -583,6 +601,7 @@ def cute_dsl_fmha_ragged_prefill(
 
         lse_iter = None
         if lse is not None:
+            # TODO: lse's shape?
             lse_cute = from_dlpack(lse, assumed_align=16).mark_layout_dynamic(
                 leading_dim=2
             )

@@ -1773,7 +1773,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
     # Prepare wrappers
     backend_wrappers = {}
     for backend in backends:
-        if backend in ["cutlass", "fa2", "fa3", "trtllm-gen", "cute-dsl"]:
+        if backend in ["cutlass", "fa2", "fa3", "trtllm-gen"]:
             backend_wrappers[backend] = (
                 flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
                     workspace_buffer,
@@ -1837,14 +1837,18 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
         v = (v / v_scale).to(kv_dtype)
 
     trtllm_out = None
-    if "trtllm-native" in backends:
-        trtllm_out = torch.empty(
-            q.shape[0],
+    if "trtllm-native" in backends or "cute-dsl" in backends:
+        # cute-dsl varlen kernel uses negative pointer offsets on output,
+        # so front-pad like Q/K/V.
+        out_pad = front_pad_q if "cute-dsl" in backends else 0
+        trtllm_out_full = torch.empty(
+            out_pad + q.shape[0],
             q.shape[1],
             v.shape[2],
             device=q.device,
             dtype=out_dtype,
         )
+        trtllm_out = trtllm_out_full[out_pad:]
 
     def run_backend_wrapper(
         backend,
@@ -1866,7 +1870,30 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
         if backend in ["cutlass", "fa2", "fa3", "trtllm-gen"]:
             return backend_wrappers[backend].run_return_lse(q, k, v)[0]
         elif backend == "cute-dsl":
-            return backend_wrappers[backend].run(q, k, v)
+            _q_scale = q_scale if q_scale is not None else 1.0
+            _k_scale = k_scale if k_scale is not None else 1.0
+            _v_scale = v_scale if v_scale is not None else 1.0
+            return flashinfer.prefill.trtllm_ragged_attention_deepseek(
+                query=q,
+                key=k,
+                value=v,
+                workspace_buffer=workspace_buffer,
+                seq_lens=actual_seq_lens_kv_device,
+                max_q_len=s_qo,
+                max_kv_len=s_kv,
+                bmm1_scale=_q_scale * _k_scale * scale,
+                bmm2_scale=_v_scale,
+                o_sf_scale=-1,
+                batch_size=batch_size,
+                window_left=-1,
+                cum_seq_lens_q=qo_indptr,
+                cum_seq_lens_kv=kv_indptr,
+                enable_pdl=False,
+                is_causal=causal,
+                return_lse=True,
+                out=trtllm_out,
+                backend="cute-dsl",
+            )[0]
         elif backend == "cudnn":
             # cuDNN uses wrapper API
             return backend_wrappers[backend].run(q, k, v)

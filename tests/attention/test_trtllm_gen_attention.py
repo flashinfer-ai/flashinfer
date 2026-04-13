@@ -1552,6 +1552,7 @@ def test_trtllm_batch_decode_long_sequence_length(
     )
 
 
+@pytest.mark.parametrize("backend", ["trtllm-native", "cute-dsl"])
 @pytest.mark.parametrize(
     "mla_dimensions", [deepseek_mla_dimensions, smaller_mla_dimensions]
 )
@@ -1563,6 +1564,7 @@ def test_trtllm_batch_decode_long_sequence_length(
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("skips_softmax", [False, True])
 def test_trtllm_gen_prefill(
+    backend: str,
     mla_dimensions: MLAHeadDimensions,
     batch_size: int,
     s_qo: int,
@@ -1577,6 +1579,13 @@ def test_trtllm_gen_prefill(
         pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
     if s_qo > s_kv:
         pytest.skip("s_qo > s_kv, skipping test as causal")
+
+    head_dim_qk = mla_dimensions.qk_nope_head_dim + mla_dimensions.qk_rope_head_dim
+    if backend == "cute-dsl":
+        if skips_softmax:
+            pytest.skip("cute-dsl does not support skip_softmax")
+        if head_dim_qk == 192:
+            pytest.skip("cute-dsl does not support bf16 with head_dim=192")
 
     num_qo_heads = num_kv_heads * head_grp_size
     head_dim_qk = mla_dimensions.qk_nope_head_dim + mla_dimensions.qk_rope_head_dim
@@ -1597,20 +1606,47 @@ def test_trtllm_gen_prefill(
     cumsum_s_qo = int(torch.sum(actual_seq_lens_q).item())
     cumsum_s_kv = int(torch.sum(actual_seq_lens_kv).item())
 
-    q = torch.randn(
-        cumsum_s_qo, num_qo_heads, head_dim_qk, device=device, dtype=torch.bfloat16
-    )
-
-    k_cache = torch.randn(
-        (cumsum_s_kv, num_kv_heads, head_dim_qk),
-        device=device,
-        dtype=torch.bfloat16,
-    )
-    v_cache = torch.randn(
-        (cumsum_s_kv, num_kv_heads, head_dim_vo),
-        device=device,
-        dtype=torch.bfloat16,
-    )
+    # DSL FMHA varlen kernel uses negative pointer offsets, so tensors need
+    # front-padding of max_s elements to ensure valid GPU memory before data.
+    if backend == "cute-dsl":
+        q_full = torch.randn(
+            s_qo + cumsum_s_qo,
+            num_qo_heads,
+            head_dim_qk,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        q = q_full[s_qo:]
+        k_full = torch.randn(
+            s_kv + cumsum_s_kv,
+            num_kv_heads,
+            head_dim_qk,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        k_cache = k_full[s_kv:]
+        v_full = torch.randn(
+            s_kv + cumsum_s_kv,
+            num_kv_heads,
+            head_dim_vo,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        v_cache = v_full[s_kv:]
+    else:
+        q = torch.randn(
+            cumsum_s_qo, num_qo_heads, head_dim_qk, device=device, dtype=torch.bfloat16
+        )
+        k_cache = torch.randn(
+            (cumsum_s_kv, num_kv_heads, head_dim_qk),
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        v_cache = torch.randn(
+            (cumsum_s_kv, num_kv_heads, head_dim_vo),
+            device=device,
+            dtype=torch.bfloat16,
+        )
 
     # Initialize scale
     scale = float(1.0 / (head_dim_qk**0.5))
@@ -1655,7 +1691,17 @@ def test_trtllm_gen_prefill(
         kv_data_type=torch.bfloat16,
     )
     output_ref, lse_ref = wrapper.run(q, k_cache, v_cache, return_lse=True)
-    output = torch.empty_like(output_ref)
+    if backend == "cute-dsl":
+        output_full = torch.empty(
+            s_qo + cumsum_s_qo,
+            num_qo_heads,
+            head_dim_vo,
+            device=device,
+            dtype=output_ref.dtype,
+        )
+        output = output_full[s_qo:]
+    else:
+        output = torch.empty_like(output_ref)
 
     bmm1_scale = scale
     bmm2_scale = 1.0
@@ -1683,6 +1729,7 @@ def test_trtllm_gen_prefill(
         True,
         skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         out=output,
+        backend=backend,
     )
     torch.testing.assert_close(
         output_trtllm,
@@ -1698,9 +1745,11 @@ def test_trtllm_gen_prefill(
     )
     # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
     # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
-    assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
+    if backend == "trtllm-native":
+        assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
 
 
+@pytest.mark.parametrize("backend", ["trtllm-native", "cute-dsl"])
 @pytest.mark.parametrize(
     "mla_dimensions", [deepseek_mla_dimensions, smaller_mla_dimensions]
 )
@@ -1712,6 +1761,7 @@ def test_trtllm_gen_prefill(
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("skips_softmax", [False, True])
 def test_trtllm_gen_prefill_bs1(
+    backend: str,
     mla_dimensions: MLAHeadDimensions,
     batch_size: int,
     s_qo: int,
@@ -1722,6 +1772,7 @@ def test_trtllm_gen_prefill_bs1(
     skips_softmax: bool,
 ):
     test_trtllm_gen_prefill(
+        backend,
         mla_dimensions,
         batch_size,
         s_qo,
