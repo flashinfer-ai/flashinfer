@@ -17,7 +17,7 @@ limitations under the License.
 import functools
 from enum import Enum
 from types import SimpleNamespace
-from typing import Any, List, Literal, Optional, Tuple
+from typing import List, Literal, Optional, Tuple
 
 from flashinfer.trtllm_low_latency_gemm import trtllm_low_latency_gemm
 import torch
@@ -4639,8 +4639,6 @@ def _cute_dsl_gemm_fp4_runner(
             ab_dtype = cutlass.Float4E2M1FN
             sf_dtype = cutlass.Float8E4M3FN if use_nvfp4 else cutlass.Float8E8M0FNU
 
-            valid_tactics = []
-
             # SM100 tactics (shared enumeration with mxfp8)
             sm100_base = _get_sm100_block_scaled_tactics(
                 m,
@@ -4780,7 +4778,6 @@ def _cute_dsl_gemm_fp4_runner(
                 out_dtype,
             )
 
-            make_kernel: Any  # type varies by kernel_type
             if kernel_type == "sm103" and Sm103Kernel is not None:
                 make_kernel = lambda: Sm103Kernel(
                     sf_vec_size,
@@ -5241,10 +5238,12 @@ def mm_fp4(
         Whether to use 8x4 scale factor layout or 128x4 scale factor layout, defaults to False.
 
     backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"]
-        Backend to use, defaults to ``"auto"``, which automatically selects the best
-        backend between ``"cudnn"`` and ``"cutlass"`` based on the current CUDA and
-        cuDNN versions. The ``"trtllm"`` and ``"cute-dsl"`` backends are never selected
-        when ``backend="auto"`` because they require different weight preparation.
+        Backend to use, defaults to ``"auto"``. On SM120, ``"auto"`` prefers
+        ``"b12x"`` (NVFP4 only), then ``"cutlass"``, then ``"cudnn"``. On other
+        architectures, ``"auto"`` selects between ``"cudnn"`` and ``"cutlass"``
+        based on the current CUDA and cuDNN versions. The ``"trtllm"`` and
+        ``"cute-dsl"`` backends are never auto-selected because they require
+        different weight preparation.
 
     use_nvfp4: bool
         Whether to use nvfp4 quantization or mxfp4 quantization, defaults to ``True``.

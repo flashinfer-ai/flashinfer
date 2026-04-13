@@ -1040,7 +1040,14 @@ def testMmFp4(args):
     run_refcheck = args.refcheck
     use_128x4_sf_layout = args.use_128x4_sf_layout
     use_nvfp4 = args.use_nvfp4
-    autotune_supported_backends = ["cudnn", "cutlass", "trtllm", "cute-dsl", "auto"]
+    autotune_supported_backends = [
+        "cudnn",
+        "cutlass",
+        "trtllm",
+        "cute-dsl",
+        "b12x",
+        "auto",
+    ]
     res = []
 
     res_dtype = dtype_str_to_torch_dtype(args.out_dtype)
