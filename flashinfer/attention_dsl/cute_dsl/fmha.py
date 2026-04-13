@@ -302,7 +302,12 @@ def cute_dsl_fmha_prefill(
 
     # Get compiled kernel
     kernel_fn = get_cute_dsl_fmha_kernel(
-        in_dtype, out_dtype, head_dim, is_causal, enable_tvm_ffi=enable_tvm_ffi
+        in_dtype,
+        out_dtype,
+        head_dim,
+        is_causal,
+        is_persistent=not is_causal,
+        enable_tvm_ffi=enable_tvm_ffi,
     )
 
     # Compute scale factors
