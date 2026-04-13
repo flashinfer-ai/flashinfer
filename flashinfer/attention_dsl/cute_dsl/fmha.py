@@ -115,7 +115,7 @@ def _load_from_artifact(variant_name: str, enable_tvm_ffi: bool = False):
     from flashinfer.jit.env import FLASHINFER_CUBIN_DIR
 
     so_filename = f"{variant_name}.so"
-    artifact_path = f"{DSL_FMHA_ARTIFACT_PATH}/{so_filename}"
+    artifact_path = os.path.join(DSL_FMHA_ARTIFACT_PATH, so_filename)
     sha256 = DSL_FMHA_CHECKSUMS.get(variant_name, "")
 
     if not sha256:
