@@ -1301,28 +1301,36 @@ def nvfp4_quantize_paged_kv_cache(
 
 @flashinfer_api
 def scaled_fp4_grouped_quantize(
-    a,
+    input_tensor,
     mask,
-    a_global_sf,
+    input_global_scale,
 ):
     """
-    quantize batched input tensor to NVFP4 format with mask.
+    Quantize grouped input tensor to NVFP4 format with mask.
+
     Parameters:
-        a (torch.Tensor): Input tensor of shape [B, M, K] with dtype fp16/bf16.
-        a_global_sf (torch.Tensor): Global scale factor of shape [1] with dtype float32.
-        mask (torch.Tensor): Mask tensor to apply before quantization.
+        input_tensor (torch.Tensor): Input of shape [num_experts, M, K], dtype fp16/bf16.
+        mask (torch.Tensor): Active-expert mask of shape [num_experts], dtype int32.
+        input_global_scale (torch.Tensor): Global scale of shape [1] or per-expert scales of shape [num_experts], dtype float32.
+
     Returns:
-        Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
-            - Quantized tensor of shape [B, M, K/2] with dtype FLOAT4_E2M1X2
-            - Scale factors tensor with shape determined by layout and sf_vec_size
+        Tuple[torch.Tensor, torch.Tensor]:
+            - Quantized tensor of shape [M, K//2, num_experts], dtype uint8 (FLOAT4_E2M1X2).
+            - Block scale factors tensor.
     """
-    major, minor = get_compute_capability(a.device)
+    num_experts = input_tensor.shape[0]
+    if input_global_scale.numel() == 1:
+        input_global_scale = (
+            input_global_scale.view(-1).expand(num_experts).contiguous()
+        )
+
+    major, minor = get_compute_capability(input_tensor.device)
     device_arch = f"{major * 10 + minor}"
     a_fp4, a_sf = get_fp4_quantization_module(
         device_arch
     ).scaled_fp4_grouped_quant_sm100(
-        a,
-        a_global_sf,
+        input_tensor,
+        input_global_scale,
         mask,
     )
     return a_fp4, a_sf
