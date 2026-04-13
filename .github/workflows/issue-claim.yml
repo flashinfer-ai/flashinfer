@@ -8,6 +8,8 @@ name: Issue Claim
 on:
   issue_comment:
     types: [created]
+  schedule:
+    - cron: '*/30 * * * *'
   workflow_dispatch:
 
 # Note: The collaborator invitation (PUT /repos/.../collaborators/...)
