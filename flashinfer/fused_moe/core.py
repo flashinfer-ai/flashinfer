@@ -2299,7 +2299,9 @@ def trtllm_bf16_moe(
             Must be bfloat16 if provided.
         hidden_states: [seq_len, hidden_size] tensor of input hidden states.
             Must be bfloat16.
-        gemm1_weights: [num_experts, 2*intermediate_size // 128, hidden_size // 128, 128] tensor of first layer weights. must be bfloat16.
+        gemm1_weights: [num_experts, M // 128, hidden_size // 128, 128] tensor of first layer weights. must be bfloat16.
+            M is 2*intermediate_size for gated activations and
+            intermediate_size for non-gated activations.
         gemm2_weights: [num_experts, hidden_size//128, intermediate_size, 128] tensor of second layer weights. must be bfloat16.
         num_experts: Total number of experts.
         top_k: Number of experts to route to per token.
@@ -2325,7 +2327,7 @@ def trtllm_bf16_moe(
         tune_max_num_tokens: Maximum number of tokens for autotuning (default: 8192).
         activation_type (int): Type of activation function (default: 3 - Swiglu)
             - 3: Swiglu
-            - 6: Relu2
+            - 6: Relu2 (non-gated)
 
     Returns:
         when do_finalize=True, returns the final MoE output.
@@ -2399,7 +2401,9 @@ def trtllm_bf16_routed_moe(
             Can be created as: (topk_ids.int32 << 16) | expert_weights.bfloat16.view(int16)
         hidden_states: [seq_len, hidden_size] tensor of input hidden states.
             Must be bfloat16.
-        gemm1_weights: [num_experts, 2*intermediate_size // 128, hidden_size // 128, 128] tensor of first layer weights. must be bfloat16.
+        gemm1_weights: [num_experts, M // 128, hidden_size // 128, 128] tensor of first layer weights. must be bfloat16.
+            M is 2*intermediate_size for gated activations and
+            intermediate_size for non-gated activations.
         gemm2_weights: [num_experts, hidden_size//128, intermediate_size, 128] tensor of second layer weights. must be bfloat16.
         num_experts: Total number of experts.
         top_k: Number of experts to route to per token.
@@ -2425,7 +2429,7 @@ def trtllm_bf16_routed_moe(
         tune_max_num_tokens: Maximum number of tokens for autotuning (default: 8192).
         activation_type (int): Type of activation function (default: 3 - Swiglu)
             - 3: Swiglu
-            - 6: Relu2
+            - 6: Relu2 (non-gated)
 
     Returns:
         when do_finalize=True, returns the final MoE output.
@@ -2498,7 +2502,9 @@ def trtllm_fp8_per_tensor_scale_moe(
         routing_logits: [seq_len, num_experts] tensor of routing logits
         routing_bias: [num_experts] tensor of routing bias
         hidden_states: [seq_len, hidden_size] tensor of input hidden states
-        gemm1_weights: [num_experts, 2*intermediate_size, hidden_size] tensor of first layer weights
+        gemm1_weights: [num_experts, M, hidden_size] tensor of first layer weights
+            M is 2*intermediate_size for gated activations and
+            intermediate_size for non-gated activations.
         output1_scales_scalar: [local_num_experts] tensor of first layer output scales
         output1_scales_gate_scalar: [local_num_experts] tensor of first layer gate scales
         gemm2_weights: [num_experts, hidden_size, intermediate_size] tensor of second layer weights
@@ -2520,7 +2526,7 @@ def trtllm_fp8_per_tensor_scale_moe(
             - 0: Gelu
             - 3: Swiglu
             - 4: Geglu
-            - 6: Relu2
+            - 6: Relu2 (non-gated)
             - 7: Identity
 
     Returns:
