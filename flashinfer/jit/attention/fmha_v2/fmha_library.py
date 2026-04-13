@@ -248,8 +248,10 @@ def generate_kernel_spec(
                 spec["kv_loop_step"] = 256
                 spec["kv_tile_buffers"] = 3
             elif head_size <= 128:
-                # D=128: smem = 32 + 64 + 64 = ~160KB with KV_BUF=2
+                # D=128: smem = 32KB Q + 96KB K + 96KB V = 224KB with KV_BUF=3 (fits 228KB).
+                # KV_BUF=3 gives DMA 2-step lookahead, better hiding HBM latency.
                 spec["kv_loop_step"] = 128
+                spec["kv_tile_buffers"] = 3
             else:
                 # D>=192: smem = 48 + 48 + 48 = ~144KB (D=192)
                 #         smem = 64 + 64 + 64 = ~192KB (D=256)

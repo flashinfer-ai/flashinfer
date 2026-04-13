@@ -336,8 +336,9 @@ void fmha_v2_run(
   Attention_input_layout input_layout = string_to_input_layout(input_layout_str);
   Attention_mask_type attention_mask_type = string_to_mask_type(mask_mode_str);
   Data_type output_dtype = dltype_to_data_type(o.dtype());
-  // Get device properties
-  CudaDevice device;
+  // Cache device properties — cudaGetDeviceProperties is expensive.  Static init
+  // is thread-safe (C++11) and correct for homogeneous multi-GPU (all same SM arch).
+  static CudaDevice device;
   int sm = device.sm;
   // Map SM12x variants (e.g. SM121 on DGX Spark) to base SM120 for kernel dispatch.
   // CudaDevice computes sm = major*10 + minor, but all SM12x share the same Ampere-era

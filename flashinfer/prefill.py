@@ -112,21 +112,36 @@ def _create_scale_bmm2_d_tensor(
     Returns:
         A 1-element int32 tensor on device containing the scale bits
     """
-    if data_dtype == torch.float16:
-        # Create int32 buffer on device, write FP16 value to lower 16 bits via view
-        result = torch.zeros(1, dtype=torch.int32, device=device)
-        result.view(torch.float16)[0] = scale_bmm2
-        return result
-    elif data_dtype == torch.bfloat16:
-        # Create int32 buffer on device, write BF16 value to lower 16 bits via view
-        result = torch.zeros(1, dtype=torch.int32, device=device)
-        result.view(torch.bfloat16)[0] = scale_bmm2
-        return result
+    if data_dtype in (torch.float16, torch.bfloat16):
+        # Pack scale bits into the lower 16 bits of an int32, upload once (cached).
+        cpu = torch.zeros(1, dtype=torch.int32)
+        cpu.view(data_dtype)[0] = scale_bmm2
+        return cpu.to(device)
     else:
-        # FP8, INT8, etc. use FP32 accumulation - create FP32 tensor and view as int32
-        return torch.tensor([scale_bmm2], dtype=torch.float32, device=device).view(
-            torch.int32
+        # FP8, INT8, etc. use FP32 accumulation.
+        return (
+            torch.tensor([scale_bmm2], dtype=torch.float32).view(torch.int32).to(device)
         )
+
+
+@functools.cache
+def _get_scale_bmm2_d_tensor(
+    scale_bmm2: float, data_dtype: torch.dtype, device_str: str
+) -> torch.Tensor:
+    """Cached version of _create_scale_bmm2_d_tensor.
+
+    Caches by (scale_bmm2, data_dtype, device) so that the tensor is only
+    allocated and uploaded once per unique combination. This avoids the
+    per-call GPU allocation, fill kernel, H2D copy, and stream synchronization
+    that would otherwise occur every time trtllm_fmha_v2_prefill is called.
+
+    Args:
+        scale_bmm2: The scale value for BMM2.
+        data_dtype: The input tensor dtype.
+        device_str: String representation of the device (e.g. "cuda:0").
+    """
+    device = torch.device(device_str)
+    return _create_scale_bmm2_d_tensor(scale_bmm2, data_dtype, device)
 
 
 @functools.cache
@@ -4426,7 +4441,9 @@ def trtllm_fmha_v2_prefill(
             [block_tables * 2, block_tables * 2 + 1], dim=1
         ).contiguous()  # [B, 2, M]
 
-    scale_bmm2_d = _create_scale_bmm2_d_tensor(scale_bmm2, query.dtype, query.device)
+    scale_bmm2_d = _get_scale_bmm2_d_tensor(
+        float(scale_bmm2), query.dtype, str(query.device)
+    )
 
     module.run(
         query,  # Q tensor
