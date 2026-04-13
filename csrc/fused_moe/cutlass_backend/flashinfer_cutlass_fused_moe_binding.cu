@@ -720,6 +720,18 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       return Function::FromTyped([this]() -> int64_t { return mGemm1TacticCount; });
     } else if (name == "get_gemm2_tactic_count") {
       return Function::FromTyped([this]() -> int64_t { return mGemm2TacticCount; });
+    } else if (name == "get_tactic_occupancy") {
+      // Returns the max active blocks per SM for the given tactic index.
+      // Returns 0 if the tactic is not supported on the current device (e.g., SM89 tile
+      // configs with insufficient shared memory when running on SM120 Blackwell).
+      return Function::FromTyped([this](int64_t tactic_id) -> int64_t {
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (tactic_id < 0 || tactic_id >= static_cast<int64_t>(mAllProfiles.size())) {
+          return 0;
+        }
+        return static_cast<int64_t>(
+            mKernelRunner->queryOccupancyForConfig(mAllProfiles[tactic_id]));
+      });
     } else if (name == "run_moe") {
       return Function::FromTyped(
           [this](TensorView output, TensorView input, TensorView token_selected_experts,
