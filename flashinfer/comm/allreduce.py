@@ -480,6 +480,7 @@ def allreduce_fusion(
     expanded_idx_to_permuted_idx: Optional[torch.Tensor] = None,
     expert_scale_factor: Optional[torch.Tensor] = None,
     shared_expert_output: Optional[torch.Tensor] = None,
+    block_quant_group_size: Optional[int] = None,
 ) -> torch.Tensor:
     """
     AllReduce + RMSNorm fusion operation.
@@ -616,6 +617,12 @@ def allreduce_fusion(
         ...     shared_expert_output=shared_expert_out,
         ... )
     """
+    # Validate block_quant_group_size for per-token-group FP8 packed quant
+    if block_quant_group_size is not None and block_quant_group_size not in (64, 128):
+        raise ValueError(
+            f"block_quant_group_size must be 64 or 128, got {block_quant_group_size}"
+        )
+
     # Dispatch based on workspace type
     if isinstance(workspace, TRTLLMAllReduceFusionWorkspace):
         # TensorRT-LLM backend implementation
@@ -792,6 +799,7 @@ def allreduce_fusion(
             scale_factor=scale_factor,
             layout_code=layout_code,  # type: ignore[arg-type]
             metadata=workspace.metadata,
+            block_quant_group_size=block_quant_group_size,
         )
 
         # Return the most downstream output (already in 2D shape from input views)

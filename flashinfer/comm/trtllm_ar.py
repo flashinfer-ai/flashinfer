@@ -85,6 +85,11 @@ class AllReduceFusionPattern:
     # Fuses top-k expert gather/scale with allreduce and norm in a single kernel.
     # Supports shared expert output addition (e.g. DeepSeek architecture).
     kMoEFinalizeARResidualRMSNorm = 7
+    # All-reduce followed by residual add, RMS norm and per-token-group FP8 quantization
+    # with UE8M0 packed scales
+    kARResidualRMSNormPerTokenGroupFP8PackedQuant = 8
+    # Same as kARResidualRMSNormPerTokenGroupFP8PackedQuant, with norm output
+    kARResidualRMSNormOutPerTokenGroupFP8PackedQuant = 9
 
 
 class QuantizationSFLayout:
@@ -235,6 +240,7 @@ def get_trtllm_comm_module():
             "rms_eps",
             "scale_factor",
             "layout_code",
+            "block_quant_group_size",
         ],
     )
     def trtllm_allreduce_fusion(
@@ -259,6 +265,7 @@ def get_trtllm_comm_module():
         rms_eps: Optional[float],
         scale_factor: Optional[Union[torch.Tensor, float]],
         layout_code: Optional[QuantizationSFLayout],
+        block_quant_group_size: Optional[int] = None,
     ) -> None:
         module.trtllm_allreduce_fusion(
             allreduce_in,
@@ -282,6 +289,7 @@ def get_trtllm_comm_module():
             rms_eps,
             scale_factor,
             layout_code,
+            block_quant_group_size,
         )
 
     @register_custom_op(
@@ -942,6 +950,7 @@ def trtllm_allreduce_fusion(
     scale_factor: Optional[Union[torch.Tensor, float]],
     layout_code: Optional[QuantizationSFLayout],
     metadata: Optional[dict] = None,
+    block_quant_group_size: Optional[int] = None,
 ) -> None:
     """
     Parameters:
@@ -1025,6 +1034,7 @@ def trtllm_allreduce_fusion(
         rms_eps=rms_eps,
         scale_factor=scale_factor,
         layout_code=layout_code,
+        block_quant_group_size=block_quant_group_size,
     )
 
 
