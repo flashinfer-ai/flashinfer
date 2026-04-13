@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include <iostream>
+#include <algorithm>
 
 #include "flashinfer/exception.h"
 #include "flashinfer/trtllm/batched_gemm/KernelRunner.h"
@@ -341,16 +341,14 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
   if (isGatedAct) {
     ActType actType = activationTypeToGatedActType(activationType);
     tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options = {
-        // Swap A and B dtypes because transposeMmaOutput is hardcoded to true
-        .dtypeA = dtypeWeights,
-        .dtypeB = dtypeAct,
+        .dtypeA = dtypeAct,
+        .dtypeB = dtypeWeights,
         .dtypeC = dtypeAct,
         .actType = actType,
         .deepSeekFp8 = useDeepSeekFp8,
         .fusedAct = !useDeepSeekFp8,
         .routeAct = true,
         .staticBatch = false,
-        .transposeMmaOutput = true,
         .tileSize = tileTokensDim,
         .epilogueTileM = useDeepSeekFp8 ? 64 : 128,
         .useShuffledMatrix = useShuffledMatrix,
@@ -359,16 +357,14 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
   } else {
     EltwiseActType actType = activationTypeToEltwiseActType(activationType);
     tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options = {
-        // Swap A and B dtypes because transposeMmaOutput is hardcoded to true
-        .dtypeA = dtypeWeights,
-        .dtypeB = dtypeAct,
+        .dtypeA = dtypeAct,
+        .dtypeB = dtypeWeights,
         .dtypeC = dtypeAct,
         .eltwiseActType = actType,
         .deepSeekFp8 = useDeepSeekFp8,
         .fusedAct = false,
         .routeAct = true,
         .staticBatch = false,
-        .transposeMmaOutput = true,
         .tileSize = tileTokensDim,
         .epilogueTileM = 128,
         .useShuffledMatrix = useShuffledMatrix,
@@ -455,16 +451,14 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
     btg::Dtype dtypeAct, btg::Dtype dtypeWeights, btg::Dtype dtypeOut, int32_t tileTokensDim,
     bool useDeepSeekFp8, bool useShuffledMatrix, batchedGemm::gemm::MatrixLayout weightLayout) {
   tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options = {
-      // Swap A and B dtypes because transposeMmaOutput is hardcoded to true
-      .dtypeA = dtypeWeights,
-      .dtypeB = dtypeAct,
+      .dtypeA = dtypeAct,
+      .dtypeB = dtypeWeights,
       .dtypeC = dtypeOut,
       .eltwiseActType = EltwiseActType::None,
       .deepSeekFp8 = useDeepSeekFp8,
       .fusedAct = false,
       .routeAct = false,
       .staticBatch = false,
-      .transposeMmaOutput = true,
       .tileSize = tileTokensDim,
       .epilogueTileM = useDeepSeekFp8 ? 64 : 128,
       .useShuffledMatrix = useShuffledMatrix,
