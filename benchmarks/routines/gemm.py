@@ -1147,21 +1147,18 @@ def testMmFp4(args):
         mat2_inv_s,
         mat2_inv_s_trtllm,
     ):
-        if backend in ["cudnn", "trtllm", "cutlass", "cute-dsl", "auto"]:
-            return flashinfer.gemm.mm_fp4(
-                a=input_fp4,
-                b=mat2_fp4.T if backend != "trtllm" else mat2_fp4_trtllm.T,
-                a_descale=input_inv_s,
-                b_descale=mat2_inv_s.T if backend != "trtllm" else mat2_inv_s_trtllm.T,
-                alpha=(alpha_for_cute_dsl_mxfp4 if (backend == "cute-dsl") else alpha),
-                out_dtype=res_dtype,
-                block_size=block_size,
-                use_8x4_sf_layout=not use_128x4_sf_layout,
-                backend=backend,
-                use_nvfp4=use_nvfp4,
-            )
-        else:
-            raise ValueError(f"Unsupported backend: {backend}")
+        return flashinfer.gemm.mm_fp4(
+            a=input_fp4,
+            b=mat2_fp4.T if backend != "trtllm" else mat2_fp4_trtllm.T,
+            a_descale=input_inv_s,
+            b_descale=mat2_inv_s.T if backend != "trtllm" else mat2_inv_s_trtllm.T,
+            alpha=(alpha_for_cute_dsl_mxfp4 if (backend == "cute-dsl") else alpha),
+            out_dtype=res_dtype,
+            block_size=block_size,
+            use_8x4_sf_layout=not use_128x4_sf_layout,
+            backend=backend,
+            use_nvfp4=use_nvfp4,
+        )
 
     has_reference_output = False
     if run_refcheck:

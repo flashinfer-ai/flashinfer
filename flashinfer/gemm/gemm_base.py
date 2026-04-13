@@ -4579,7 +4579,6 @@ def _cute_dsl_gemm_fp4_runner(
 
     On SM100: uses the SM100 kernel only.
     On SM103: uses both SM100 kernel and the SM103-specific 3xFP4 kernel.
-    On SM120/SM121: uses the SM120 warp-level MMA kernel.
     The autotuner selects the best (kernel_type, tile, cluster, swap_ab, prefetch,
     use_tma_store) combination.
     """
@@ -4590,15 +4589,6 @@ def _cute_dsl_gemm_fp4_runner(
     )
 
     sm_version = sm_major * 10 + sm_minor
-
-    # SM120/SM121 kernel (warp-level MMA, no tcgen05)
-    Sm120Kernel = None
-    if sm_version == 120:
-        from .kernels.dense_blockscaled_gemm_sm120 import (
-            Sm120BlockScaledDenseGemmKernel,
-        )
-
-        Sm120Kernel = Sm120BlockScaledDenseGemmKernel
 
     # TODO(yunzheq): Re-enable SM103 kernel once cutlass-dsl package includes
     # SM103MmaMXF4Op and compatible PersistentTileSchedulerParams.
@@ -4650,51 +4640,6 @@ def _cute_dsl_gemm_fp4_runner(
             sf_dtype = cutlass.Float8E4M3FN if use_nvfp4 else cutlass.Float8E8M0FNU
 
             valid_tactics = []
-
-            # --- SM120/SM121 tactics ---
-            if sm_version == 120 and Sm120Kernel is not None:
-                batch_size = 1
-                # SM120 kernel supports tile M,N divisible by 64.
-                # Smaller tiles (64x64, 64x128, 128x64) help when
-                # small-M shapes leave SMs idle with 128x128.
-                sm120_mma_tiler_candidates = [
-                    (64, 64),
-                    (64, 128),
-                    (128, 64),
-                    (128, 128),
-                ]
-                # SM120 kernel does not support swap_ab (SF fragment
-                # partitioning assumes non-swapped layout).
-                swap_ab = False
-                for mma_tiler_mn in sm120_mma_tiler_candidates:
-                    if not Sm120Kernel.can_implement(
-                        ab_dtype,
-                        sf_dtype,
-                        sf_vec_size,
-                        c_cutlass_dtype,
-                        mma_tiler_mn,
-                        (1, 1),
-                        m,
-                        n,
-                        real_k,
-                        batch_size,
-                        "k",
-                        "k",
-                        "n",
-                    ):
-                        continue
-                    for use_prefetch in (False, True):
-                        valid_tactics.append(
-                            (
-                                mma_tiler_mn,
-                                (1, 1),
-                                swap_ab,
-                                use_prefetch,
-                                "sm120",
-                                None,
-                            )
-                        )
-                return valid_tactics
 
             # SM100 tactics (shared enumeration with mxfp8)
             sm100_base = _get_sm100_block_scaled_tactics(
@@ -4787,27 +4732,14 @@ def _cute_dsl_gemm_fp4_runner(
             batch_size = 1
 
             if tactic is None or tactic == -1:
-                if sm_version == 120:
-                    _sm_count = torch.cuda.get_device_properties(
-                        a.device
-                    ).multi_processor_count
-                    tactic = (
-                        _select_default_sm120_mma_tiler(m, n, _sm_count),
-                        (1, 1),
-                        False,
-                        False,
-                        "sm120",
-                        None,
-                    )
-                else:
-                    tactic = (
-                        _SM100_DEFAULT_MMA_TILER_MN,
-                        _SM100_DEFAULT_CLUSTER_SHAPE_MN,
-                        False,
-                        False,
-                        "sm100",
-                        None,
-                    )
+                tactic = (
+                    _SM100_DEFAULT_MMA_TILER_MN,
+                    _SM100_DEFAULT_CLUSTER_SHAPE_MN,
+                    False,
+                    False,
+                    "sm100",
+                    None,
+                )
 
             (
                 mma_tiler_mn,
@@ -4849,15 +4781,7 @@ def _cute_dsl_gemm_fp4_runner(
             )
 
             make_kernel: Any  # type varies by kernel_type
-            if kernel_type == "sm120" and Sm120Kernel is not None:
-                make_kernel = lambda: Sm120Kernel(
-                    sf_vec_size,
-                    mma_tiler_mn,
-                    cluster_shape_mn,
-                    use_prefetch,
-                    enable_pdl,
-                )
-            elif kernel_type == "sm103" and Sm103Kernel is not None:
+            if kernel_type == "sm103" and Sm103Kernel is not None:
                 make_kernel = lambda: Sm103Kernel(
                     sf_vec_size,
                     mma_tiler_mn,
@@ -4916,6 +4840,194 @@ def _cute_dsl_gemm_fp4_runner(
     return CuteDSLFp4GemmRunner()
 
 
+# Module-level kernel cache for b12x GEMM (separate from CuTe DSL SM100 cache).
+_B12X_MM_FP4_KERNEL_CACHE: dict[tuple, tuple] = {}
+
+
+def _b12x_gemm_fp4_runner(
+    sm_major: int,
+    sm_minor: int,
+    enable_pdl: bool,
+    out_dtype: torch.dtype,
+    use_nvfp4: bool,
+):
+    """Create a b12x FP4 GEMM runner for SM120.
+
+    Uses the SM120 warp-level MMA kernel with underfill tile selection.
+    """
+    import cutlass
+
+    from .kernels.dense_blockscaled_gemm_sm120 import (
+        Sm120BlockScaledDenseGemmKernel,
+    )
+
+    cutlass_dtype_attr = _TORCH_TO_CUTLASS_DTYPE_ATTR.get(out_dtype)
+    c_cutlass_dtype = (
+        getattr(cutlass, cutlass_dtype_attr) if cutlass_dtype_attr is not None else None
+    )
+    if c_cutlass_dtype is None:
+        raise ValueError(
+            f"b12x backend does not support output dtype {out_dtype}. "
+            f"Supported: torch.bfloat16, torch.float16."
+        )
+
+    class B12xFp4GemmRunner(TunableRunner):
+        """TunableRunner for b12x block-scaled FP4 dense GEMM on SM120.
+
+        Tactics are tuples:
+            (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch, kernel_type, use_tma_store)
+        where kernel_type is always "sm120" and use_tma_store is always None.
+        """
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> list:
+            (a, b, a_descale, b_descale, alpha, _, out, _, _, _) = inputs
+            m = a.shape[0]
+            k_packed = a.shape[1]
+            n = b.shape[1]
+            real_k = k_packed * 2
+
+            sf_vec_size = 16
+            ab_dtype = cutlass.Float4E2M1FN
+            sf_dtype = cutlass.Float8E4M3FN
+            batch_size = 1
+
+            valid_tactics = []
+            sm120_mma_tiler_candidates = [
+                (64, 64),
+                (64, 128),
+                (128, 64),
+                (128, 128),
+            ]
+            swap_ab = False
+            for mma_tiler_mn in sm120_mma_tiler_candidates:
+                if not Sm120BlockScaledDenseGemmKernel.can_implement(
+                    ab_dtype,
+                    sf_dtype,
+                    sf_vec_size,
+                    c_cutlass_dtype,
+                    mma_tiler_mn,
+                    (1, 1),
+                    m,
+                    n,
+                    real_k,
+                    batch_size,
+                    "k",
+                    "k",
+                    "n",
+                ):
+                    continue
+                for use_prefetch in (False, True):
+                    valid_tactics.append(
+                        (mma_tiler_mn, (1, 1), swap_ab, use_prefetch, "sm120", None)
+                    )
+            return valid_tactics
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic=None,
+            do_preparation: bool = False,
+            **kwargs,
+        ):
+            (a, b, a_descale, b_descale, alpha_tensor, _, out, _, _, _) = inputs
+            m = a.shape[0]
+            k_packed = a.shape[1]
+            n = b.shape[1]
+            real_k = k_packed * 2
+
+            sf_vec_size = 16
+            sf_dtype = cutlass.Float8E4M3FN
+            batch_size = 1
+
+            if tactic is None or tactic == -1:
+                _sm_count = torch.cuda.get_device_properties(
+                    a.device
+                ).multi_processor_count
+                tactic = (
+                    _select_default_sm120_mma_tiler(m, n, _sm_count),
+                    (1, 1),
+                    False,
+                    False,
+                    "sm120",
+                    None,
+                )
+
+            (
+                mma_tiler_mn,
+                cluster_shape_mn,
+                swap_ab,
+                use_prefetch,
+                kernel_type,
+                use_tma_store,
+            ) = tactic
+
+            # b12x SM120 kernel does not support swap_ab
+            kernel_m, kernel_n = m, n
+            kernel_a, kernel_b = a, b.T
+            kernel_a_sf, kernel_b_sf = a_descale, b_descale.T
+
+            sf_m = (kernel_m + 127) // 128
+            sf_n = (kernel_n + 127) // 128
+            sf_k = (real_k // sf_vec_size + 3) // 4
+
+            cache_key = (
+                sf_vec_size,
+                mma_tiler_mn,
+                cluster_shape_mn,
+                swap_ab,
+                use_prefetch,
+                kernel_type,
+                use_tma_store,
+                enable_pdl,
+                out_dtype,
+            )
+
+            make_kernel = lambda: Sm120BlockScaledDenseGemmKernel(
+                sf_vec_size,
+                mma_tiler_mn,
+                cluster_shape_mn,
+                use_prefetch,
+                enable_pdl,
+            )
+
+            compiled_gemm, _ = _compile_block_scaled_gemm(
+                _B12X_MM_FP4_KERNEL_CACHE,
+                cache_key,
+                make_kernel,
+                ab_cutlass_dtype=cutlass.Uint8,
+                sf_dtype=sf_dtype,
+                c_cutlass_dtype=c_cutlass_dtype,
+                ab_assumed_align=32,
+                cluster_shape_mn=cluster_shape_mn,
+                swap_ab=swap_ab,
+                sf_m=sf_m,
+                sf_n=sf_n,
+                sf_k=sf_k,
+                batch_size=batch_size,
+            )
+
+            alpha_for_launch = _prepare_alpha_for_launch(alpha_tensor, a.device)
+
+            compiled_gemm(
+                kernel_a,
+                kernel_b,
+                out,
+                sf_m,
+                sf_n,
+                sf_k,
+                kernel_a_sf.data_ptr(),
+                kernel_b_sf.data_ptr(),
+                alpha_for_launch,
+            )
+            return out
+
+    return B12xFp4GemmRunner()
+
+
 def _heuristic_func_mm_fp4(
     suitable_backends: List[str],
     a: torch.Tensor,
@@ -4927,7 +5039,9 @@ def _heuristic_func_mm_fp4(
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,
-    backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"] = "cudnn",
+    backend: Literal[
+        "cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"
+    ] = "cudnn",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
 ):
@@ -4949,6 +5063,11 @@ def _heuristic_func_mm_fp4(
     # Get compute capability to distinguish between SM100 (10.0) and SM103 (10.3)
     major, minor = get_compute_capability(a.device)
     is_sm103 = major == 10 and minor == 3
+    is_sm120 = major == 12 and minor == 0
+
+    # SM120: prefer b12x (warp-level MMA, underfill tile selection)
+    if is_sm120 and use_nvfp4:
+        return [c for c in ("b12x", "cutlass", "cudnn") if c in suitable_backends]
 
     # If cuda version is 13 or greater and cudnn version is 9.15 or greater:
     # On SM103 (B300), cutlass is more performant than cudnn.
@@ -5197,7 +5316,7 @@ def mm_fp4(
         "cute-dsl": lambda: _cute_dsl_gemm_fp4_runner(
             major, minor, enable_pdl, out_dtype, use_nvfp4
         ),
-        "b12x": lambda: _cute_dsl_gemm_fp4_runner(
+        "b12x": lambda: _b12x_gemm_fp4_runner(
             major, minor, enable_pdl, out_dtype, use_nvfp4
         ),
     }
