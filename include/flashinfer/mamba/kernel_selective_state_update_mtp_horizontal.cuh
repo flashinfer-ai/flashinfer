@@ -63,16 +63,16 @@ static constexpr int ROWS_PER_PASS = NUM_COMPUTE_WARPS_PER_GROUP * ROWS_PER_WARP
 template <typename input_t, typename state_t, int TOKENS_MTP, int DIM, int DSTATE,
           int NUM_IN_STAGES, int TMA_STATE_ROWS, int HEADS_PER_CTA = 1>
 struct GroupStorageHorizontal {
-  // Sub-tile-major smem layout: each sub-tile of BANK_CYCLE_ELEMS columns is stored
-  // contiguously per row, eliminating bank conflicts for non-power-of-2 DSTATE.
-  static constexpr int BANK_CYCLE_ELEMS = 32 * sizeof(uint32_t) / sizeof(state_t);
-  static constexpr int NUM_STATE_SUBTILES = (DSTATE + BANK_CYCLE_ELEMS - 1) / BANK_CYCLE_ELEMS;
-  static constexpr int DSTATE_SMEM = NUM_STATE_SUBTILES * BANK_CYCLE_ELEMS;
+  // Pad DSTATE to next multiple of 32 banks (128 bytes) to eliminate bank conflicts.
+  // TMA loads a single wide tile of DSTATE_PAD columns; OOB columns (DSTATE..DSTATE_PAD-1)
+  // are skipped by TMA (FILL_NONE) and zeroed in registers at load time.
+  static constexpr int BANK_CYCLE_BYTES = 32 * sizeof(uint32_t);  // 128 bytes
+  static constexpr int DSTATE_PAD = (DSTATE * (int)sizeof(state_t) + BANK_CYCLE_BYTES - 1) /
+                                    BANK_CYCLE_BYTES * BANK_CYCLE_BYTES / (int)sizeof(state_t);
 
-  alignas(128) input_t B[TOKENS_MTP][DSTATE_SMEM];
-  alignas(128) input_t C[TOKENS_MTP][DSTATE_SMEM];
-  alignas(
-      128) state_t state_in[NUM_IN_STAGES][NUM_STATE_SUBTILES * TMA_STATE_ROWS * BANK_CYCLE_ELEMS];
+  alignas(128) input_t B[TOKENS_MTP][DSTATE_PAD];
+  alignas(128) input_t C[TOKENS_MTP][DSTATE_PAD];
+  alignas(128) state_t state_in[NUM_IN_STAGES][TMA_STATE_ROWS * DSTATE_PAD];
   alignas(128) input_t x[HEADS_PER_CTA][TOKENS_MTP][DIM];
   float dt[HEADS_PER_CTA][TOKENS_MTP];
   float out[TOKENS_MTP][DIM];
@@ -102,31 +102,28 @@ __device__ __forceinline__ void role_load_horizontal(
   // These are merged with the first state tile into a single barrier transaction,
   // eliminating a separate bar_input_full barrier and letting TMA instructions
   // stream back-to-back without serialization.
-  constexpr int DSTATE_SMEM = SramT::DSTATE_SMEM;
-  constexpr int bytesBCX = 2 * NTOKENS * DSTATE_SMEM * (int)sizeof(input_t) +
+  constexpr int DSTATE_PAD = SramT::DSTATE_PAD;
+  constexpr int bytesBCX = 2 * NTOKENS * DSTATE_PAD * (int)sizeof(input_t) +
                            HEADS_PER_CTA * NTOKENS * DIM * (int)sizeof(input_t);
+  // B/C/x TMA loads are always issued (even for pad slots — output must be valid).
+  // They are merged into bar_state_in_full[0] alongside the first state tile.
   if (lane == 0) {
-    if constexpr (!IS_PAD) {
-      cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.B[0][0], &tensorB, 0, kv_group, 0, batch,
-                                                    sram.bar_state_in_full[0]);
-      cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.C[0][0], &tensorC, 0, kv_group, 0, batch,
-                                                    sram.bar_state_in_full[0]);
+    cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.B[0][0], &tensorB, 0, kv_group, 0, batch,
+                                                  sram.bar_state_in_full[0]);
+    cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.C[0][0], &tensorC, 0, kv_group, 0, batch,
+                                                  sram.bar_state_in_full[0]);
 #pragma unroll
-      for (int h = 0; h < HEADS_PER_CTA; h++) {
-        cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.x[h][0][0], &tensorX, 0, base_head + h,
-                                                      0, batch, sram.bar_state_in_full[0]);
-      }
+    for (int h = 0; h < HEADS_PER_CTA; h++) {
+      cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.x[h][0][0], &tensorX, 0, base_head + h, 0,
+                                                    batch, sram.bar_state_in_full[0]);
     }
   }
 
   // ── Pipeline state_in loads (TMA_STATE_ROWS per transaction) ──────────
-  // Sub-tile-major layout: each chunk issues numStateSubTiles TMA loads of
-  // (BANK_CYCLE_ELEMS, TMA_STATE_ROWS), stored contiguously per sub-tile.
-  // This gives bank-cycle-aligned rows, eliminating bank conflicts.
-  constexpr int BANK_CYCLE_ELEMS = SramT::BANK_CYCLE_ELEMS;
-  constexpr int numStateSubTiles = SramT::NUM_STATE_SUBTILES;
-  constexpr int bytesChunk =
-      numStateSubTiles * TMA_STATE_ROWS * BANK_CYCLE_ELEMS * (int)sizeof(state_t);
+  // Single wide TMA load of DSTATE_PAD columns per chunk.
+  // OOB padding columns are handled in registers, not smem.
+  // State is only loaded for non-pad slots; pad slots use zero state in registers.
+  constexpr int bytesChunk = TMA_STATE_ROWS * DSTATE_PAD * (int)sizeof(state_t);
   uint32_t parity_empty[NUM_IN_STAGES] = {};  // all start at phase 0
 #pragma unroll
   for (int h = 0; h < HEADS_PER_CTA; h++) {
@@ -139,17 +136,15 @@ __device__ __forceinline__ void role_load_horizontal(
 
       if (lane == 0) {
         if constexpr (!IS_PAD) {
-#pragma unroll
-          for (int st = 0; st < numStateSubTiles; st++) {
-            cde::cp_async_bulk_tensor_4d_global_to_shared(
-                &sram.state_in[slot][st * TMA_STATE_ROWS * BANK_CYCLE_ELEMS], &tensorState,
-                st * BANK_CYCLE_ELEMS, tl * TMA_STATE_ROWS, head, state_batch,
-                sram.bar_state_in_full[slot]);
-          }
+          cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.state_in[slot][0], &tensorState, 0,
+                                                        tl * TMA_STATE_ROWS, head, state_batch,
+                                                        sram.bar_state_in_full[slot]);
           int const bytes = (h == 0 && tl == 0) ? bytesBCX + bytesChunk : bytesChunk;
           cuda::device::barrier_arrive_tx(sram.bar_state_in_full[slot], 1, bytes);
         } else {
-          cuda::device::barrier_arrive_tx(sram.bar_state_in_full[slot], 1, 0);
+          // Pad slot: no state TMA, but first iteration includes the B/C/x bytes
+          int const bytes = (h == 0 && tl == 0) ? bytesBCX : 0;
+          cuda::device::barrier_arrive_tx(sram.bar_state_in_full[slot], 1, bytes);
         }
       }
     }
@@ -174,8 +169,8 @@ __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int la
   constexpr int rowsPerWarp = horiz::ROWS_PER_WARP;
   constexpr int numTmaLoads = DIM / TMA_STATE_ROWS;
   constexpr int subPassesPerTma = TMA_STATE_ROWS / horiz::ROWS_PER_PASS;
-  constexpr int DSTATE_SMEM = SramT::DSTATE_SMEM;
-  constexpr int stateValuesPerThread = DSTATE_SMEM / lanesPerRow;
+  constexpr int DSTATE_PAD = SramT::DSTATE_PAD;
+  constexpr int stateValuesPerThread = DSTATE_PAD / lanesPerRow;
   static_assert(DSTATE % lanesPerRow == 0, "DSTATE must be divisible by lanesPerRow");
   static_assert(DIM % TMA_STATE_ROWS == 0, "DIM must be divisible by TMA_STATE_ROWS");
   static_assert(TMA_STATE_ROWS % horiz::ROWS_PER_PASS == 0,
@@ -211,15 +206,9 @@ __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int la
   auto const icache_idx =
       intermediate_state_indices ? (int64_t)intermediate_state_indices[batch] : state_batch;
 
-  // Logical column within DSTATE_SMEM (for B/C/state smem access and global store bounds)
+  // Logical column within DSTATE_PAD (for B/C/state smem access and global store bounds)
   auto baseCol = [&](int t, int e) -> int {
     return t * elemsPerTile + member * elemsPerTileMember + e;
-  };
-
-  // Smem state index: sub-tile-major layout [subtile][row][col_within_subtile]
-  auto smemStateIdx = [&](int t, int sram_row, int e) -> int {
-    return t * TMA_STATE_ROWS * elemsPerTile + sram_row * elemsPerTile +
-           member * elemsPerTileMember + e;
   };
 
   // Output pointers (for epilogue)
@@ -290,13 +279,18 @@ __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int la
         int const sram_row = sp * horiz::ROWS_PER_PASS + compute_warp * rowsPerWarp + group;
         int const dd = tl * TMA_STATE_ROWS + sram_row;  // global DIM row
 
-        // Load state from smem (TMA zero-fills columns beyond DSTATE)
+        // Load state from smem; zero padding beyond DSTATE in registers
         float2 rState[numTiles][pairsPerTileMember];
 #pragma unroll
         for (int t = 0; t < numTiles; t++) {
 #pragma unroll
           for (int p = 0; p < pairsPerTileMember; p++) {
-            rState[t][p] = toFloat2(&sram.state_in[slot][smemStateIdx(t, sram_row, p * 2)]);
+            int const c0 = baseCol(t, p * 2);
+            if (c0 >= DSTATE || IS_PAD) {
+              rState[t][p] = {0.f, 0.f};
+            } else {
+              rState[t][p] = toFloat2(&sram.state_in[slot][sram_row * DSTATE_PAD + c0]);
+            }
           }
         }
 
@@ -331,6 +325,7 @@ __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int la
 #pragma unroll
             for (int p = 0; p < pairsPerTileMember; p++) {
               int const c0 = baseCol(t, p * 2);
+              if (c0 >= DSTATE) continue;
               float2 const B2 = toFloat2(&B_step[c0]);
               float2 const C2 = toFloat2(&C_step[c0]);
               float2 dBx;
@@ -352,8 +347,8 @@ __device__ __forceinline__ void role_update_state_horizontal(SramT& sram, int la
           }
 
           // Advance step pointers (addition instead of multiply)
-          B_step += DSTATE_SMEM;
-          C_step += DSTATE_SMEM;
+          B_step += DSTATE_PAD;
+          C_step += DSTATE_PAD;
           x_step += DIM;
           dt_step += 1;
           out_step += DIM;
@@ -491,41 +486,6 @@ __global__ void __launch_bounds__(horiz::NUM_WARPS * 32, 6)
     }
     // bar_out_ready: 4 compute warps only
     init(&sram.bar_out_ready, horiz::NUM_COMPUTE_WARPS_PER_GROUP * warpSize);
-  }
-  __syncthreads();
-
-  // ── Zero-fill smem padding for DSTATE < DSTATE_SMEM ────────────────────
-  // TMA uses FILL_NONE: OOB elements are NOT written to smem. Pre-zeroing
-  // the padding columns ensures they read as zero, eliminating OOB divergence.
-  if constexpr (sram_t::DSTATE_SMEM > DSTATE) {
-    constexpr int PAD = sram_t::DSTATE_SMEM - DSTATE;
-    int const tid = warp * warpSize + lane;
-    int const numThreads = horiz::NUM_WARPS * warpSize;
-
-    // Zero B/C padding: B[step][DSTATE..DSTATE_SMEM-1], same for C
-    constexpr int bc_pad_total = NTOKENS * PAD;
-    for (int i = tid; i < bc_pad_total; i += numThreads) {
-      int const step = i / PAD;
-      int const col = DSTATE + i % PAD;
-      sram.B[step][col] = input_t(0);
-      sram.C[step][col] = input_t(0);
-    }
-
-    // Zero state_in padding: sub-tile-major layout, last sub-tile's OOB columns
-    // Layout: [slot][subtile][row][BANK_CYCLE_ELEMS]
-    // OOB columns are in the last sub-tile at offset DSTATE % BANK_CYCLE_ELEMS
-    constexpr int BCE = sram_t::BANK_CYCLE_ELEMS;
-    constexpr int lastSubTileOffset = DSTATE % BCE;  // first OOB column within last sub-tile
-    constexpr int padPerRow = BCE - lastSubTileOffset;
-    constexpr int lastST = sram_t::NUM_STATE_SUBTILES - 1;
-    constexpr int state_pad_total = NUM_IN_STAGES * TMA_STATE_ROWS * padPerRow;
-    for (int i = tid; i < state_pad_total; i += numThreads) {
-      int const slot = i / (TMA_STATE_ROWS * padPerRow);
-      int const rem = i % (TMA_STATE_ROWS * padPerRow);
-      int const row = rem / padPerRow;
-      int const col = lastSubTileOffset + rem % padPerRow;
-      sram.state_in[slot][lastST * TMA_STATE_ROWS * BCE + row * BCE + col] = state_t(0);
-    }
   }
   __syncthreads();
 

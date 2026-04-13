@@ -269,6 +269,11 @@ def selective_state_update(
         # No stochastic rounding when rand_seed is None
         philox_rounds = 0
 
+    if intermediate_states_buffer is not None and dst_state_batch_indices is not None:
+        raise ValueError(
+            "intermediate_states_buffer and dst_state_batch_indices are mutually exclusive"
+        )
+
     if out is None:
         output = torch.empty_like(x)
     else:
@@ -302,7 +307,8 @@ def selective_state_update(
     elif algorithm == "horizontal":
         algorithm_int = 3
     elif algorithm == "async_horizontal":
-        algorithm_int = 4
+        # Backward compat: async_horizontal is now merged into simple
+        algorithm_int = 1
     else:
         raise ValueError(f"Unknown algorithm: {algorithm}")
 
