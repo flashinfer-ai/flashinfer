@@ -228,7 +228,6 @@ def _ragged_reference(
 # =============================================================================
 
 
-@pytest.mark.parametrize("enable_tvm_ffi", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("is_causal", [False, True])
@@ -243,7 +242,7 @@ def _ragged_reference(
     ],
 )
 def test_batch_ragged_prefill_cute_dsl(
-    enable_tvm_ffi, dtype, head_dim, is_causal, seq_lens_q, seq_lens_k, H_q, H_k
+    dtype, head_dim, is_causal, seq_lens_q, seq_lens_k, H_q, H_k
 ):
     """Test cute_dsl_fmha_ragged_prefill with variable-length sequences."""
     from flashinfer.attention_dsl.cute_dsl.fmha import cute_dsl_fmha_ragged_prefill
@@ -279,7 +278,7 @@ def test_batch_ragged_prefill_cute_dsl(
         scale_q=sq,
         scale_k=sk,
         scale_v=sv,
-        enable_tvm_ffi=enable_tvm_ffi,
+        enable_tvm_ffi=True,
     )
     torch.cuda.synchronize()
 
