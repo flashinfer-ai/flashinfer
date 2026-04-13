@@ -54,6 +54,7 @@ static void validate_routing_replay_out(TensorView const& replay, TensorView con
   TVM_FFI_ICHECK(replay.size(1) == top_k) << "routing_replay_out dim1 must equal top_k";
   TVM_FFI_ICHECK((replay.dtype() == DLDataType{kDLInt, 16, 1}))
       << "routing_replay_out must be int16 dtype";
+  TVM_FFI_ICHECK(replay.IsContiguous()) << "routing_replay_out must be contiguous (packed row-major)";
 }
 
 enum class Fp8QuantizationType {
