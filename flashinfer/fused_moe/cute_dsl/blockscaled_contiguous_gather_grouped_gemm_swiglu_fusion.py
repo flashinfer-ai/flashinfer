@@ -43,7 +43,7 @@ Comparison with Non-Gather SwiGLU Fusion:
 - Gather: Uses LDGSTS to gather A directly using token_id_mapping, no moe_permute needed
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
@@ -191,15 +191,14 @@ def _get_compiled_gather_kernel(
     permuted_m: int,
     n: int,  # This is 2*intermediate_size
     k: int,
-    num_experts: int,
     # Tensor pointers (runtime parameters - NOT in cache key)
     a_ptr,
-    b_ptr,
+    b_ptr,  # tuple of pointers
     a_sf_ptr,
-    b_sf_ptr,
+    b_sf_ptr,  # tuple of pointers
     c_ptr,
     c_sf_ptr,
-    alpha_ptr,
+    alpha_ptr,  # tuple of pointers
     tile_idx_ptr,
     mn_limit_ptr,
     token_id_ptr,
@@ -221,6 +220,7 @@ def _get_compiled_gather_kernel(
     vectorized_f32: bool,
     raster_along_m: bool,
     enable_pdl: bool = True,
+    b_tensor_l_sizes: Optional[Tuple[int, ...]] = None,
 ):
     """Get or compile the gather grouped GEMM with SwiGLU kernel.
 
@@ -234,10 +234,14 @@ def _get_compiled_gather_kernel(
     This matches TRT-LLM's approach where the same compiled kernel can be
     reused for different problem sizes, significantly reducing JIT compilation
     overhead during autotuning.
+
+    Supports multiple B weight tensors via b_tensor_l_sizes parameter.
+    When b_tensor_l_sizes is provided, b_ptr/b_sf_ptr/alpha_ptr are tuples.
     """
     global _gather_kernel_cache
 
     # Cache key includes dtype and tactic parameters, NOT problem dimensions
+    # Also includes b_tensor_l_sizes since kernel is specialized per multi-B config
     cache_key = (
         ab_dtype,
         sf_dtype,
@@ -250,6 +254,7 @@ def _get_compiled_gather_kernel(
         vectorized_f32,
         raster_along_m,
         enable_pdl,
+        b_tensor_l_sizes,
     )
 
     if cache_key not in _gather_kernel_cache:
@@ -262,16 +267,16 @@ def _get_compiled_gather_kernel(
             topk=topk,
             raster_along_m=raster_along_m,
             enable_pdl=enable_pdl,
+            b_tensor_l_sizes=b_tensor_l_sizes,
         )
 
         # Compile with runtime parameters - they can vary across calls
         # Order must match wrapper signature:
-        # (a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, c_sf_ptr, alpha_ptr,
+        # (a_ptr, b_ptr_tuple, a_sf_ptr, b_sf_ptr_tuple, c_ptr, c_sf_ptr, alpha_ptr_tuple,
         #  tile_idx_to_group_idx_ptr, tile_idx_to_mn_limit_ptr, token_id_mapping_ptr,
-        #  num_non_exiting_tiles_ptr, global_sf_ptr, orig_m, m, n, k, l,
+        #  num_non_exiting_tiles_ptr, norm_const_ptr, orig_m, m, n, k,
         #  tile_size, scaling_vector_size, max_active_clusters, stream)
-        compiled_gemm = cute.compile(
-            gemm.wrapper,
+        compile_args = [
             a_ptr,
             b_ptr,
             a_sf_ptr,
@@ -288,7 +293,11 @@ def _get_compiled_gather_kernel(
             permuted_m,
             n,
             k,
-            num_experts,
+        ]
+
+        compiled_gemm = cute.compile(
+            gemm.wrapper,
+            *compile_args,
             tile_size=tile_size,
             scaling_vector_size=sf_vec_size,
             max_active_clusters=max_active_clusters,
@@ -302,10 +311,10 @@ def _get_compiled_gather_kernel(
 
 def blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4(
     a: torch.Tensor,
-    b: torch.Tensor,
+    b: Union[torch.Tensor, List[torch.Tensor]],
     a_scale: torch.Tensor,
-    b_scale: torch.Tensor,
-    alpha: torch.Tensor,
+    b_scale: Union[torch.Tensor, List[torch.Tensor]],
+    alpha: Union[torch.Tensor, List[torch.Tensor]],
     tile_idx_to_expert_idx: torch.Tensor,
     tile_idx_to_mn_limit: torch.Tensor,
     token_id_mapping: torch.Tensor,
@@ -406,14 +415,19 @@ def blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4(
         ...     topk=topk,
         ... )  # out shape: (valid_m, intermediate_dim)
     """
+    # Normalize to lists for multi-B support
+    b_list = [b] if isinstance(b, torch.Tensor) else b
+    b_scale_list = [b_scale] if isinstance(b_scale, torch.Tensor) else b_scale
+    alpha_list = [alpha] if isinstance(alpha, torch.Tensor) else alpha
+
     # Validate inputs
     assert a.device.type == "cuda", "Input tensors must be on CUDA device"
-    assert b.device.type == "cuda", "Input tensors must be on CUDA device"
+    assert b_list[0].device.type == "cuda", "Input tensors must be on CUDA device"
 
     # Get dimensions
     seq_len = a.shape[0]
-    num_experts = b.shape[0]
-    n = b.shape[1]  # This is 2*intermediate_size
+    num_experts = sum(bi.size(0) for bi in b_list)
+    n = b_list[0].shape[1]  # This is 2*intermediate_size
     k = a.shape[1]
     if ab_dtype == "float4_e2m1fn":
         k = k * 2  # FP4 is packed 2 elements per byte
@@ -500,18 +514,15 @@ def blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4(
     # Get tile_size from mma_tiler_mn
     tile_size = mma_tiler_mn[0]
 
+    # Compute b_tensor_l_sizes for multi-B support
+    b_tensor_l_sizes = tuple(bi.size(0) for bi in b_list)
+
     # Create raw pointers (TRT-LLM style) - allows same compiled kernel for different sizes
     a_ptr = make_ptr(
         ab_dtype_cutlass, a.data_ptr(), cute.AddressSpace.gmem, assumed_align=32
     )
-    b_ptr = make_ptr(
-        ab_dtype_cutlass, b.data_ptr(), cute.AddressSpace.gmem, assumed_align=32
-    )
     a_sf_ptr = make_ptr(
         sf_dtype_cutlass, a_scale.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
-    )
-    b_sf_ptr = make_ptr(
-        sf_dtype_cutlass, b_scale.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
     )
     c_ptr = make_ptr(
         c_dtype_cutlass, out.data_ptr(), cute.AddressSpace.gmem, assumed_align=32
@@ -531,7 +542,24 @@ def blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4(
         c_sf_ptr = None
         norm_const_ptr = None
 
-    alpha_ptr = make_ptr(cutlass.Float32, alpha.data_ptr(), cute.AddressSpace.gmem)
+    # Create pointer tuples for B tensors
+    b_ptr = tuple(
+        make_ptr(
+            ab_dtype_cutlass, bi.data_ptr(), cute.AddressSpace.gmem, assumed_align=32
+        )
+        for bi in b_list
+    )
+    b_sf_ptr = tuple(
+        make_ptr(
+            sf_dtype_cutlass, bsi.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+        )
+        for bsi in b_scale_list
+    )
+    alpha_ptr = tuple(
+        make_ptr(cutlass.Float32, ai.data_ptr(), cute.AddressSpace.gmem)
+        for ai in alpha_list
+    )
+
     tile_idx_ptr = make_ptr(
         cutlass.Int32, tile_idx_to_expert_idx.data_ptr(), cute.AddressSpace.gmem
     )
@@ -549,15 +577,12 @@ def blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4(
     torch_stream = torch.cuda.current_stream()
     stream = cuda.CUstream(torch_stream.cuda_stream)
 
-    # Get or compile the kernel (cached by dtype and tactic parameters)
+    # Get or compile the kernel
     compiled_gemm = _get_compiled_gather_kernel(
-        # Runtime parameters (problem dimensions)
         orig_m=seq_len,
         permuted_m=permuted_m,
         n=n,
         k=k,
-        num_experts=num_experts,
-        # Tensor pointers (order must match wrapper signature)
         a_ptr=a_ptr,
         b_ptr=b_ptr,
         a_sf_ptr=a_sf_ptr,
@@ -572,11 +597,9 @@ def blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4(
         norm_const_ptr=norm_const_ptr,
         max_active_clusters=max_active_clusters,
         stream=stream,
-        # Dtype parameters (compile-time, in cache key)
         ab_dtype=ab_dtype,
         sf_dtype=sf_dtype,
         c_dtype=c_dtype,
-        # Tactic parameters (compile-time, cached)
         sf_vec_size=sf_vec_size,
         tile_size=tile_size,
         topk=topk,
@@ -585,14 +608,11 @@ def blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4(
         vectorized_f32=vectorized_f32,
         raster_along_m=raster_along_m,
         enable_pdl=enable_pdl,
+        b_tensor_l_sizes=b_tensor_l_sizes,
     )
 
-    # Execute kernel with runtime parameters
-    # Order must match wrapper signature:
-    # (a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, c_sf_ptr, alpha_ptr,
-    #  tile_idx_ptr, mn_limit_ptr, token_id_ptr, num_tiles_ptr, global_sf_ptr,
-    #  orig_m, m, n, k, l, stream)
-    compiled_gemm(
+    # Execute kernel
+    exec_args = [
         a_ptr,
         b_ptr,
         a_sf_ptr,
@@ -609,8 +629,7 @@ def blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4(
         permuted_m,
         n,
         k,
-        num_experts,
-        stream=stream,
-    )
+    ]
+    compiled_gemm(*exec_args, stream=stream)
 
     return out, out_scale if generate_sfc else None
