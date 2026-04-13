@@ -462,6 +462,10 @@ def sm120_make_smem_layout_sfa(
     assert tile_shape_mnk[2] % (blk_sf * mma_nsf) == 0, (
         "tile_shape_mnk[2] must be divisible by blk_sf * mma_nsf"
     )
+    assert tile_shape_mnk[2] % (sf_vec_size * blk_sf) == 0, (
+        "tile_shape_mnk[2] must be divisible by sf_vec_size * blk_sf"
+    )
+    assert blk_sf % mma_nsf == 0, "blk_sf must be divisible by mma_nsf"
 
     sSFA_shapeK = (
         k_basic_block_shape,
@@ -544,6 +548,10 @@ def sm120_make_smem_layout_sfb(
     assert tile_shape_mnk[2] % (blk_sf * mma_nsf) == 0, (
         "tile_shape_mnk[2] must be divisible by blk_sf * mma_nsf"
     )
+    assert tile_shape_mnk[2] % (sf_vec_size * blk_sf) == 0, (
+        "tile_shape_mnk[2] must be divisible by sf_vec_size * blk_sf"
+    )
+    assert blk_sf % mma_nsf == 0, "blk_sf must be divisible by mma_nsf"
 
     sSFB_shapeK = (
         k_basic_block_shape,

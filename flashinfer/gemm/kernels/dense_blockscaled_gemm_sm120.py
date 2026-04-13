@@ -78,12 +78,13 @@ class DenseGemmKernel:
 
     Notes:
         - Supported combinations:
-            * NVF4: A/B: Float4E2M1FN, SF: Float8E4M3FN, sf_vec_size: 16
-            * MXF4: A/B: Float4E2M1FN, SF: Float8E8M0FNU, sf_vec_size: 32
+            * NVF4 only: A/B: Float4E2M1FN, SF: Float8E4M3FN, sf_vec_size: 16
+            (MXF4 / sf_vec_size=32 is not supported — the CUTLASS DSL
+            MmaMXF4NVF4Op hardcodes sf_vec_size=16 in its constructor.)
         - Tile shape constraints:
-            * tile_m must be divisible by 128
-            * tile_n must be divisible by 128
-            * tile_k must be divisible by 64 (sf_vec_size=16) or 128 (sf_vec_size=32)
+            * tile_m must be divisible by 64
+            * tile_n must be divisible by 64
+            * tile_k = sf_vec_size * 8 = 128
     """
 
     def __init__(
@@ -1446,6 +1447,19 @@ class DenseGemmKernel:
         # Alignment: K must be divisible by tile_k
         tile_k = sf_vec_size * 8
         if k % tile_k != 0:
+            return False
+        # Reject tiles that cannot fit even one pipeline stage in SM120
+        # shared memory.  A+B are FP4 (0.5 bytes/element), SF blocks are
+        # rounded up to 128-element granularity, epilogue is 16-bit output.
+        sfa_tile_m = max(128, ((mma_tiler_mn[0] + 127) // 128) * 128)
+        sfb_tile_n = max(128, ((mma_tiler_mn[1] + 127) // 128) * 128)
+        ab_bytes = (mma_tiler_mn[0] * tile_k + mma_tiler_mn[1] * tile_k) // 2
+        # SF: 128 * 4 elements per SF block, 1 byte each
+        sf_bytes = (sfa_tile_m // 128) * 4 * 128 + (sfb_tile_n // 128) * 4 * 128
+        epi_bytes = mma_tiler_mn[0] * mma_tiler_mn[1] * 2  # 16-bit output
+        mbar_bytes = 1024
+        smem_capacity = utils.get_smem_capacity_in_bytes("sm_120")
+        if ab_bytes + sf_bytes + epi_bytes + mbar_bytes > smem_capacity:
             return False
         return True
 
