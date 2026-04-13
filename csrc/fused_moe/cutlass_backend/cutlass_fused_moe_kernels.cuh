@@ -3728,6 +3728,9 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
 
     if (!fused_prologue_result) {
       TLLM_LOG_TRACE("Falling back to unfused prologue");
+      // Fix: zero-init permutation arrays before three-step fallback
+      // The three-step path may not populate all entries (e.g. tokens not matching local experts)
+      cudaMemsetAsync(unpermuted_row_to_permuted_row, -1, expanded_num_rows * sizeof(int), stream);
       threeStepBuildExpertMapsSortFirstToken(
           token_selected_experts, permuted_token_selected_experts_, permuted_row_to_unpermuted_row_,
           unpermuted_row_to_permuted_row, expert_first_token_offset_, blocked_expert_counts_,
