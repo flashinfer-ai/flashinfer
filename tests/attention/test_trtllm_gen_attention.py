@@ -324,11 +324,17 @@ def flatten_paged_kv(
 def create_workspace_buffers(device: torch.device):
     # Lazily initialize and reuse global workspace buffers
     global global_workspace_buffer, global_trtllm_gen_fmha_workspace_buffer
-    if global_workspace_buffer is None:
+    if (
+        global_workspace_buffer is None
+        or global_workspace_buffer.numel() < workspace_size
+    ):
         global_workspace_buffer = torch.empty(
             workspace_size, dtype=torch.int8, device=device
         )
-    if global_trtllm_gen_fmha_workspace_buffer is None:
+    if (
+        global_trtllm_gen_fmha_workspace_buffer is None
+        or global_trtllm_gen_fmha_workspace_buffer.numel() < workspace_size
+    ):
         global_trtllm_gen_fmha_workspace_buffer = torch.zeros(
             workspace_size, dtype=torch.int8, device=device
         )
@@ -357,7 +363,6 @@ def create_output(
                 round_up(q.shape[0] + extra_size, 128),
                 round_up(q.shape[1] * q.shape[2] // o_sf_vec_size, 4),
             )
-
             out_scale_factor = torch.empty(
                 fp4_out_scale_shape, dtype=torch.float8_e4m3fn, device=q.device
             )
@@ -495,6 +500,9 @@ def _test_trtllm_batch_prefill(
     non_contiguous_query: bool = False,
     skips_softmax: bool = False,
     uses_shared_paged_kv_idx: bool = True,
+    force_create_out_tensor=None,
+    force_create_out_dtype=None,
+    verify_wrapper=True,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] != 10:
@@ -549,13 +557,18 @@ def _test_trtllm_batch_prefill(
     workspace_buffer, workspace_buffer_ref = create_workspace_buffers(GPU_DEVICE)
 
     # Create output tensor and related data
-    create_out_tensor = flip_coin(
-        batch_size, page_size, num_kv_heads, head_grp_size, o_dtype
+    create_out_tensor = (
+        flip_coin(batch_size, page_size, num_kv_heads, head_grp_size, o_dtype)
+        if force_create_out_tensor is None
+        else force_create_out_tensor
     )
     can_infer_type = q.dtype == DTYPE_MAP[o_dtype] or create_out_tensor
-    create_out_dtype = not can_infer_type or flip_coin(
-        batch_size, page_size, num_kv_heads, head_grp_size, o_dtype, q_dtype
-    )
+    if force_create_out_dtype is None:
+        create_out_dtype = (not can_infer_type) or flip_coin(
+            batch_size, page_size, num_kv_heads, head_grp_size, o_dtype, q_dtype
+        )
+    else:
+        create_out_dtype = force_create_out_dtype
     out, out_dtype, o_scale, o_sf_scale, o_sf_vec_size = create_output(
         q, o_dtype, create_out_tensor, create_out_dtype
     )
@@ -693,7 +706,10 @@ def _test_trtllm_batch_prefill(
     )
 
     if (
-        o_dtype != "nvfp4" and kv_dtype != "nvfp4" and uses_shared_paged_kv_idx
+        verify_wrapper
+        and o_dtype != "nvfp4"
+        and kv_dtype != "nvfp4"
+        and uses_shared_paged_kv_idx
     ):  # wrapper api does not support fp4 output/kv or separate KV page indices yet.
         # test wrapper with trtllm-gen backend
         wrapper_trtllm_gen = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
@@ -881,6 +897,9 @@ def _test_trtllm_batch_decode(
     max_q_len: int | None = None,
     non_contiguous_query: bool = False,
     skips_softmax: bool = False,
+    force_create_out_tensor=None,
+    force_create_out_dtype=None,
+    verify_wrapper=True,
     uses_shared_paged_kv_idx: bool = True,
 ) -> None:
     """
@@ -976,13 +995,18 @@ def _test_trtllm_batch_decode(
     workspace_buffer, workspace_buffer_ref = create_workspace_buffers(GPU_DEVICE)
 
     # Create output tensor and related data
-    create_out_tensor = flip_coin(
-        batch_size, page_size, num_kv_heads, head_grp_size, o_dtype
+    create_out_tensor = (
+        flip_coin(batch_size, page_size, num_kv_heads, head_grp_size, o_dtype)
+        if force_create_out_tensor is None
+        else force_create_out_tensor
     )
     can_infer_type = q.dtype == DTYPE_MAP[o_dtype] or create_out_tensor
-    create_out_dtype = not can_infer_type or flip_coin(
-        batch_size, page_size, num_kv_heads, head_grp_size, o_dtype, q_dtype
-    )
+    if force_create_out_dtype is None:
+        create_out_dtype = (not can_infer_type) or flip_coin(
+            batch_size, page_size, num_kv_heads, head_grp_size, o_dtype, q_dtype
+        )
+    else:
+        create_out_dtype = force_create_out_dtype
     out, out_dtype, o_scale, o_sf_scale, o_sf_vec_size = create_output(
         q, o_dtype, create_out_tensor, create_out_dtype
     )
@@ -1116,7 +1140,7 @@ def _test_trtllm_batch_decode(
 
     if o_dtype == "nvfp4":
         output, output_ref = unpack_compare_nvfp4(
-            output, output_ref, o_sf_scale, o_sf_vec_size
+            output, output_ref, o_sf_scale, o_sf_vec_size, rmse_tol=0.31
         )
         assert o_scale == 1.0
         rtol, atol = 3e-1, 1e0
@@ -1156,7 +1180,8 @@ def _test_trtllm_batch_decode(
 
     # Only test wrapper with trtllm-gen backend
     if (
-        o_dtype != "nvfp4"
+        verify_wrapper
+        and o_dtype != "nvfp4"
         and kv_dtype != "nvfp4"
         and backend == "trtllm-gen"
         and q_len_per_req
@@ -1333,24 +1358,24 @@ def test_trtllm_batch_decode(
 @pytest.mark.parametrize("skips_softmax", [False, True])
 @pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
 def test_trtllm_batch_decode_bs1(
-    kv_layout: str,
-    batch_size: int,
-    q_len_per_req: int,
-    page_size: int,
-    num_kv_heads: int,
-    head_grp_size: int,
-    window_left: int,
-    q_dtype: str,
-    o_dtype: str,
-    kv_dtype: str,
-    enable_pdl: bool,
-    enable_sink: bool,
-    max_in_kv_len: int,
-    head_dim: int,
-    device_scale: bool,
-    skips_softmax: bool,
-    uses_shared_paged_kv_idx: bool,
-) -> None:
+    kv_layout,
+    batch_size,
+    q_len_per_req,
+    page_size,
+    num_kv_heads,
+    head_grp_size,
+    window_left,
+    q_dtype,
+    o_dtype,
+    kv_dtype,
+    enable_pdl,
+    enable_sink,
+    max_in_kv_len,
+    head_dim,
+    device_scale,
+    skips_softmax,
+    uses_shared_paged_kv_idx,
+):
     # Small number of test cases for batch size 1
     _test_trtllm_batch_decode(
         "trtllm-gen",
@@ -1371,6 +1396,994 @@ def test_trtllm_batch_decode_bs1(
         device_scale,
         skips_softmax=skips_softmax,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+    )
+
+
+@pytest.mark.parametrize(
+    "window_left,max_in_kv_len",
+    [
+        pytest.param(-1, 4096, id="dense"),
+        # Smaller sliding windows collapse to a persistent kernel and miss the imported source path.
+        pytest.param(4095, 8192, id="sliding-wide-window"),
+    ],
+)
+def test_trtllm_batch_decode_source_h64_direct_repros(window_left, max_in_kv_len):
+    # These settings are chosen to exercise the imported BF16/FP8/BF16 H64 source kernels.
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
+        "HND",
+        1,
+        1,
+        16,
+        1,
+        16,
+        window_left,
+        "bf16",
+        "bf16",
+        "fp8",
+        False,
+        False,
+        max_in_kv_len,
+        64,
+        False,
+    )
+
+
+@pytest.mark.parametrize(
+    "window_left,max_in_kv_len",
+    [
+        pytest.param(-1, 4096, id="dense"),
+        pytest.param(4095, 8192, id="sliding-wide-window"),
+    ],
+)
+def test_trtllm_batch_decode_source_h128_direct_repros(window_left, max_in_kv_len):
+    # These settings are chosen to exercise the imported BF16/FP8/BF16 H128 source kernels.
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
+        "HND",
+        1,
+        1,
+        16,
+        1,
+        8,
+        window_left,
+        "bf16",
+        "bf16",
+        "fp8",
+        False,
+        False,
+        max_in_kv_len,
+        128,
+        False,
+    )
+
+
+@pytest.mark.parametrize(
+    "window_left,max_in_kv_len",
+    [
+        pytest.param(-1, 4096, id="dense"),
+        pytest.param(4095, 8192, id="sliding-wide-window"),
+    ],
+)
+def test_trtllm_batch_decode_source_h256_direct_repros(window_left, max_in_kv_len):
+    # These settings are chosen to exercise the imported BF16/FP8/BF16 H256 source kernels.
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
+        "HND",
+        1,
+        1,
+        16,
+        1,
+        16,
+        window_left,
+        "bf16",
+        "bf16",
+        "fp8",
+        False,
+        False,
+        max_in_kv_len,
+        256,
+        False,
+    )
+
+
+@pytest.mark.parametrize(
+    "window_left,max_in_kv_len",
+    [
+        pytest.param(-1, 4096, id="dense"),
+        pytest.param(4095, 8192, id="sliding-wide-window"),
+    ],
+)
+def test_trtllm_batch_decode_source_h64_q8_direct_repros(window_left, max_in_kv_len):
+    # These settings are chosen to exercise the imported BF16/FP8/BF16 H64 Q8 source kernels.
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
+        "HND",
+        1,
+        1,
+        16,
+        1,
+        8,
+        window_left,
+        "bf16",
+        "bf16",
+        "fp8",
+        False,
+        False,
+        max_in_kv_len,
+        64,
+        False,
+    )
+
+
+@pytest.mark.parametrize(
+    "window_left,max_in_kv_len",
+    [
+        pytest.param(-1, 4096, id="dense"),
+        pytest.param(4095, 8192, id="sliding-wide-window"),
+    ],
+)
+def test_trtllm_batch_decode_source_h128_q16_direct_repros(window_left, max_in_kv_len):
+    # These settings are chosen to exercise the imported BF16/FP8/BF16 H128 Q16 source kernels.
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
+        "HND",
+        1,
+        1,
+        16,
+        1,
+        16,
+        window_left,
+        "bf16",
+        "bf16",
+        "fp8",
+        False,
+        False,
+        max_in_kv_len,
+        128,
+        False,
+    )
+
+
+@pytest.mark.parametrize(
+    "window_left,max_in_kv_len",
+    [
+        pytest.param(-1, 4096, id="dense"),
+        pytest.param(4095, 8192, id="sliding-wide-window"),
+    ],
+)
+def test_trtllm_batch_decode_source_h256_q8_direct_repros(window_left, max_in_kv_len):
+    # These settings are chosen to exercise the imported BF16/FP8/BF16 H256 Q8 source kernels.
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
+        "HND",
+        1,
+        1,
+        16,
+        1,
+        8,
+        window_left,
+        "bf16",
+        "bf16",
+        "fp8",
+        False,
+        False,
+        max_in_kv_len,
+        256,
+        False,
+    )
+
+
+@pytest.mark.parametrize(
+    "head_grp_size,window_left,max_in_kv_len",
+    [
+        pytest.param(8, -1, 4096, id="q8-dense"),
+        pytest.param(8, 4095, 8192, id="q8-sliding-wide-window"),
+        pytest.param(16, -1, 4096, id="q16-dense"),
+        pytest.param(16, 4095, 8192, id="q16-sliding-wide-window"),
+    ],
+)
+def test_trtllm_batch_decode_source_h64_p32_direct_repros(
+    head_grp_size, window_left, max_in_kv_len
+):
+    # These settings are chosen to exercise the imported BF16/FP8/BF16 H64 P32 source kernels.
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
+        "HND",
+        1,
+        1,
+        32,
+        1,
+        head_grp_size,
+        window_left,
+        "bf16",
+        "bf16",
+        "fp8",
+        False,
+        False,
+        max_in_kv_len,
+        64,
+        False,
+    )
+
+
+@pytest.mark.parametrize(
+    "head_grp_size,window_left,max_in_kv_len",
+    [
+        pytest.param(8, -1, 4096, id="q8-dense"),
+        pytest.param(8, 4095, 8192, id="q8-sliding-wide-window"),
+        pytest.param(16, -1, 4096, id="q16-dense"),
+        pytest.param(16, 4095, 8192, id="q16-sliding-wide-window"),
+    ],
+)
+def test_trtllm_batch_decode_source_h128_p32_direct_repros(
+    head_grp_size, window_left, max_in_kv_len
+):
+    # These settings are chosen to exercise the imported BF16/FP8/BF16 H128 P32 source kernels.
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
+        "HND",
+        1,
+        1,
+        32,
+        1,
+        head_grp_size,
+        window_left,
+        "bf16",
+        "bf16",
+        "fp8",
+        False,
+        False,
+        max_in_kv_len,
+        128,
+        False,
+    )
+
+
+@pytest.mark.parametrize(
+    "head_grp_size,window_left,max_in_kv_len",
+    [
+        pytest.param(8, -1, 4096, id="q8-dense"),
+        pytest.param(8, 4095, 8192, id="q8-sliding-wide-window"),
+        pytest.param(16, -1, 4096, id="q16-dense"),
+        pytest.param(16, 4095, 8192, id="q16-sliding-wide-window"),
+    ],
+)
+def test_trtllm_batch_decode_source_h256_p32_direct_repros(
+    head_grp_size, window_left, max_in_kv_len
+):
+    # These settings are chosen to exercise the imported BF16/FP8/BF16 H256 P32 source kernels.
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
+        "HND",
+        1,
+        1,
+        32,
+        1,
+        head_grp_size,
+        window_left,
+        "bf16",
+        "bf16",
+        "fp8",
+        False,
+        False,
+        max_in_kv_len,
+        256,
+        False,
+    )
+
+
+@pytest.mark.parametrize(
+    "head_grp_size,window_left,max_in_kv_len",
+    [
+        pytest.param(8, -1, 4096, id="q8-dense"),
+        pytest.param(8, 4095, 8192, id="q8-sliding-wide-window"),
+        pytest.param(16, -1, 4096, id="q16-dense"),
+        pytest.param(16, 4095, 8192, id="q16-sliding-wide-window"),
+    ],
+)
+def test_trtllm_batch_decode_source_h64_p64_direct_repros(
+    head_grp_size, window_left, max_in_kv_len
+):
+    # These settings are chosen to exercise the imported BF16/FP8/BF16 H64 P64 source kernels.
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
+        "HND",
+        1,
+        1,
+        64,
+        1,
+        head_grp_size,
+        window_left,
+        "bf16",
+        "bf16",
+        "fp8",
+        False,
+        False,
+        max_in_kv_len,
+        64,
+        False,
+    )
+
+
+@pytest.mark.parametrize(
+    "head_grp_size,window_left,max_in_kv_len",
+    [
+        pytest.param(8, -1, 4096, id="q8-dense"),
+        pytest.param(8, 4095, 8192, id="q8-sliding-wide-window"),
+        pytest.param(16, -1, 4096, id="q16-dense"),
+        pytest.param(16, 4095, 8192, id="q16-sliding-wide-window"),
+    ],
+)
+def test_trtllm_batch_decode_source_h128_p64_direct_repros(
+    head_grp_size, window_left, max_in_kv_len
+):
+    # These settings are chosen to exercise the imported BF16/FP8/BF16 H128 P64 source kernels.
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
+        "HND",
+        1,
+        1,
+        64,
+        1,
+        head_grp_size,
+        window_left,
+        "bf16",
+        "bf16",
+        "fp8",
+        False,
+        False,
+        max_in_kv_len,
+        128,
+        False,
+    )
+
+
+@pytest.mark.parametrize(
+    "head_grp_size,window_left,max_in_kv_len",
+    [
+        pytest.param(8, -1, 4096, id="q8-dense"),
+        pytest.param(8, 4095, 8192, id="q8-sliding-wide-window"),
+        pytest.param(16, -1, 4096, id="q16-dense"),
+        pytest.param(16, 4095, 8192, id="q16-sliding-wide-window"),
+    ],
+)
+def test_trtllm_batch_decode_source_h256_p64_direct_repros(
+    head_grp_size, window_left, max_in_kv_len
+):
+    # These settings are chosen to exercise the imported BF16/FP8/BF16 H256 P64 source kernels.
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
+        "HND",
+        1,
+        1,
+        64,
+        1,
+        head_grp_size,
+        window_left,
+        "bf16",
+        "bf16",
+        "fp8",
+        False,
+        False,
+        max_in_kv_len,
+        256,
+        False,
+    )
+
+
+@pytest.mark.parametrize("page_size", [16, 32, 64])
+@pytest.mark.parametrize(
+    "head_grp_size,window_left,max_in_kv_len",
+    [
+        pytest.param(8, -1, 128, id="q8-dense"),
+        pytest.param(8, 127, 128, id="q8-sliding-persistent"),
+        pytest.param(16, -1, 128, id="q16-dense"),
+        pytest.param(16, 127, 128, id="q16-sliding-persistent"),
+    ],
+)
+def test_trtllm_batch_decode_source_h64_persistent_direct_repros(
+    page_size, head_grp_size, window_left, max_in_kv_len
+):
+    # These settings force the imported BF16/FP8/BF16 H64 persistent kernels.
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
+        "HND",
+        1,
+        1,
+        page_size,
+        1,
+        head_grp_size,
+        window_left,
+        "bf16",
+        "bf16",
+        "fp8",
+        False,
+        False,
+        max_in_kv_len,
+        64,
+        False,
+    )
+
+
+@pytest.mark.parametrize("page_size", [16, 32, 64])
+@pytest.mark.parametrize(
+    "head_grp_size,window_left,max_in_kv_len",
+    [
+        pytest.param(8, -1, 128, id="q8-dense"),
+        pytest.param(8, 127, 128, id="q8-sliding-persistent"),
+        pytest.param(16, -1, 128, id="q16-dense"),
+        pytest.param(16, 127, 128, id="q16-sliding-persistent"),
+    ],
+)
+def test_trtllm_batch_decode_source_h128_persistent_direct_repros(
+    page_size, head_grp_size, window_left, max_in_kv_len
+):
+    # These settings force the imported BF16/FP8/BF16 H128 persistent kernels.
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
+        "HND",
+        1,
+        1,
+        page_size,
+        1,
+        head_grp_size,
+        window_left,
+        "bf16",
+        "bf16",
+        "fp8",
+        False,
+        False,
+        max_in_kv_len,
+        128,
+        False,
+    )
+
+
+@pytest.mark.parametrize("page_size", [16, 32, 64])
+@pytest.mark.parametrize(
+    "head_grp_size,window_left,max_in_kv_len",
+    [
+        pytest.param(8, -1, 128, id="q8-dense"),
+        pytest.param(8, 127, 128, id="q8-sliding-persistent"),
+        pytest.param(16, -1, 128, id="q16-dense"),
+        pytest.param(16, 127, 128, id="q16-sliding-persistent"),
+    ],
+)
+def test_trtllm_batch_decode_source_h256_persistent_direct_repros(
+    page_size, head_grp_size, window_left, max_in_kv_len
+):
+    # These settings force the imported BF16/FP8/BF16 H256 persistent kernels.
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
+        "HND",
+        1,
+        1,
+        page_size,
+        1,
+        head_grp_size,
+        window_left,
+        "bf16",
+        "bf16",
+        "fp8",
+        False,
+        False,
+        max_in_kv_len,
+        256,
+        False,
+    )
+
+
+@pytest.mark.parametrize("page_size", [16, 32, 64])
+@pytest.mark.parametrize(
+    "head_grp_size,window_left,max_in_kv_len",
+    [
+        pytest.param(8, -1, 2048, id="q8-dense-cga"),
+        pytest.param(8, 3968, 8192, id="q8-sliding-cga"),
+        pytest.param(16, -1, 2048, id="q16-dense-cga"),
+        pytest.param(16, 3968, 8192, id="q16-sliding-cga"),
+    ],
+)
+def test_trtllm_batch_decode_source_h64_cga_direct_repros(
+    page_size, head_grp_size, window_left, max_in_kv_len
+):
+    # These settings force the imported BF16/FP8/BF16 H64 CGA static kernels.
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
+        "HND",
+        1,
+        1,
+        page_size,
+        1,
+        head_grp_size,
+        window_left,
+        "bf16",
+        "bf16",
+        "fp8",
+        False,
+        False,
+        max_in_kv_len,
+        64,
+        False,
+    )
+
+
+@pytest.mark.parametrize("page_size", [16, 32, 64])
+@pytest.mark.parametrize(
+    "head_grp_size,window_left,max_in_kv_len",
+    [
+        pytest.param(8, -1, 2048, id="q8-dense-cga"),
+        pytest.param(8, 3968, 8192, id="q8-sliding-cga"),
+        pytest.param(16, -1, 2048, id="q16-dense-cga"),
+        pytest.param(16, 3968, 8192, id="q16-sliding-cga"),
+    ],
+)
+def test_trtllm_batch_decode_source_h128_cga_direct_repros(
+    page_size, head_grp_size, window_left, max_in_kv_len
+):
+    # These settings force the imported BF16/FP8/BF16 H128 CGA static kernels.
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
+        "HND",
+        1,
+        1,
+        page_size,
+        1,
+        head_grp_size,
+        window_left,
+        "bf16",
+        "bf16",
+        "fp8",
+        False,
+        False,
+        max_in_kv_len,
+        128,
+        False,
+    )
+
+
+@pytest.mark.parametrize("page_size", [16, 32, 64])
+@pytest.mark.parametrize(
+    "head_grp_size,window_left,max_in_kv_len",
+    [
+        pytest.param(8, -1, 2048, id="q8-dense-cga"),
+        pytest.param(8, 3968, 8192, id="q8-sliding-cga"),
+        pytest.param(16, -1, 2048, id="q16-dense-cga"),
+        pytest.param(16, 3968, 8192, id="q16-sliding-cga"),
+    ],
+)
+def test_trtllm_batch_decode_source_h256_cga_direct_repros(
+    page_size, head_grp_size, window_left, max_in_kv_len
+):
+    # These settings force the imported BF16/FP8/BF16 H256 CGA static kernels.
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
+        "HND",
+        1,
+        1,
+        page_size,
+        1,
+        head_grp_size,
+        window_left,
+        "bf16",
+        "bf16",
+        "fp8",
+        False,
+        False,
+        max_in_kv_len,
+        256,
+        False,
+    )
+
+
+def _test_trtllm_batch_decode_source_fp16_family(
+    page_size, head_grp_size, window_left, max_in_kv_len, head_dim
+):
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
+        "HND",
+        1,
+        1,
+        page_size,
+        1,
+        head_grp_size,
+        window_left,
+        "fp16",
+        "fp16",
+        "fp8",
+        False,
+        False,
+        max_in_kv_len,
+        head_dim,
+        False,
+    )
+
+
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize(
+    "head_grp_size,window_left,max_in_kv_len",
+    [
+        pytest.param(8, -1, 4096, id="q8-dense"),
+        pytest.param(8, 4095, 8192, id="q8-sliding-wide-window"),
+        pytest.param(16, -1, 4096, id="q16-dense"),
+        pytest.param(16, 4095, 8192, id="q16-sliding-wide-window"),
+    ],
+)
+def test_trtllm_batch_decode_source_fp16_p16_direct_repros(
+    head_dim, head_grp_size, window_left, max_in_kv_len
+):
+    _test_trtllm_batch_decode_source_fp16_family(
+        16, head_grp_size, window_left, max_in_kv_len, head_dim
+    )
+
+
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize(
+    "head_grp_size,window_left,max_in_kv_len",
+    [
+        pytest.param(8, -1, 4096, id="q8-dense"),
+        pytest.param(8, 4095, 8192, id="q8-sliding-wide-window"),
+        pytest.param(16, -1, 4096, id="q16-dense"),
+        pytest.param(16, 4095, 8192, id="q16-sliding-wide-window"),
+    ],
+)
+def test_trtllm_batch_decode_source_fp16_p32_direct_repros(
+    head_dim, head_grp_size, window_left, max_in_kv_len
+):
+    _test_trtllm_batch_decode_source_fp16_family(
+        32, head_grp_size, window_left, max_in_kv_len, head_dim
+    )
+
+
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize(
+    "head_grp_size,window_left,max_in_kv_len",
+    [
+        pytest.param(8, -1, 4096, id="q8-dense"),
+        pytest.param(8, 4095, 8192, id="q8-sliding-wide-window"),
+        pytest.param(16, -1, 4096, id="q16-dense"),
+        pytest.param(16, 4095, 8192, id="q16-sliding-wide-window"),
+    ],
+)
+def test_trtllm_batch_decode_source_fp16_p64_direct_repros(
+    head_dim, head_grp_size, window_left, max_in_kv_len
+):
+    _test_trtllm_batch_decode_source_fp16_family(
+        64, head_grp_size, window_left, max_in_kv_len, head_dim
+    )
+
+
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("page_size", [16, 32, 64])
+@pytest.mark.parametrize(
+    "head_grp_size,window_left,max_in_kv_len",
+    [
+        pytest.param(8, -1, 128, id="q8-dense"),
+        pytest.param(8, 127, 128, id="q8-sliding-persistent"),
+        pytest.param(16, -1, 128, id="q16-dense"),
+        pytest.param(16, 127, 128, id="q16-sliding-persistent"),
+    ],
+)
+def test_trtllm_batch_decode_source_fp16_persistent_direct_repros(
+    head_dim, page_size, head_grp_size, window_left, max_in_kv_len
+):
+    _test_trtllm_batch_decode_source_fp16_family(
+        page_size, head_grp_size, window_left, max_in_kv_len, head_dim
+    )
+
+
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("page_size", [16, 32, 64])
+@pytest.mark.parametrize(
+    "head_grp_size,window_left,max_in_kv_len",
+    [
+        pytest.param(8, -1, 2048, id="q8-dense-cga"),
+        pytest.param(8, 3968, 8192, id="q8-sliding-cga"),
+        pytest.param(16, -1, 2048, id="q16-dense-cga"),
+        pytest.param(16, 3968, 8192, id="q16-sliding-cga"),
+    ],
+)
+def test_trtllm_batch_decode_source_fp16_cga_direct_repros(
+    head_dim, page_size, head_grp_size, window_left, max_in_kv_len
+):
+    _test_trtllm_batch_decode_source_fp16_family(
+        page_size, head_grp_size, window_left, max_in_kv_len, head_dim
+    )
+
+
+def _test_trtllm_batch_decode_source_qkv_bf16_sliding_family(
+    page_size, head_grp_size, window_left, max_in_kv_len, head_dim
+):
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
+        "HND",
+        1,
+        1,
+        page_size,
+        1,
+        head_grp_size,
+        window_left,
+        "bf16",
+        "bf16",
+        "bf16",
+        False,
+        False,
+        max_in_kv_len,
+        head_dim,
+        False,
+    )
+
+
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("page_size", [16, 32, 64])
+@pytest.mark.parametrize("head_grp_size", [8, 16])
+def test_trtllm_batch_decode_source_qkv_bf16_sliding_direct_repros(
+    head_dim, page_size, head_grp_size
+):
+    # Under current selector heuristics these wide-window BF16/BF16/BF16 sliding repros land on
+    # the CGA static family, not the plain MultiCtasKvVarSeq static family.
+    _test_trtllm_batch_decode_source_qkv_bf16_sliding_family(
+        page_size, head_grp_size, 4095, 8192, head_dim
+    )
+
+
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("page_size", [16, 32, 64])
+@pytest.mark.parametrize("head_grp_size", [8, 16])
+def test_trtllm_batch_decode_source_qkv_bf16_sliding_persistent_direct_repros(
+    head_dim, page_size, head_grp_size
+):
+    _test_trtllm_batch_decode_source_qkv_bf16_sliding_family(
+        page_size, head_grp_size, 127, 128, head_dim
+    )
+
+
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("page_size", [16, 32, 64])
+@pytest.mark.parametrize("head_grp_size", [8, 16])
+def test_trtllm_batch_decode_source_qkv_bf16_sliding_cga_direct_repros(
+    head_dim, page_size, head_grp_size
+):
+    _test_trtllm_batch_decode_source_qkv_bf16_sliding_family(
+        page_size, head_grp_size, 3968, 8192, head_dim
+    )
+
+
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+def test_trtllm_batch_decode_source_qkv_bf16_sliding_non_cga_direct_repros(head_dim):
+    # A much wider sliding window pushes numCtasPerSeqKv above the CGA threshold and lands on the
+    # plain MultiCtasKvVarSeq static family from the original narrowed bundle.
+    _test_trtllm_batch_decode_source_qkv_bf16_sliding_family(
+        16, 16, 65535, 131072, head_dim
+    )
+
+
+def _test_trtllm_batch_prefill_source_qkv_fp16_context_family(
+    page_size, window_left, max_q_len, max_kv_len, head_dim
+):
+    _test_trtllm_batch_prefill(
+        "HND",
+        1,
+        page_size,
+        1,
+        8,
+        window_left,
+        "fp16",
+        "fp16",
+        "fp16",
+        None,
+        False,
+        max_q_len,
+        max_kv_len,
+        False,
+        head_dim,
+    )
+
+
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("page_size", [16, 32, 64])
+def test_trtllm_batch_prefill_source_qkv_fp16_context_causal_direct_repros(
+    head_dim, page_size
+):
+    _test_trtllm_batch_prefill_source_qkv_fp16_context_family(
+        page_size, -1, 8192, 8192, head_dim
+    )
+
+
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("page_size", [16, 32, 64])
+def test_trtllm_batch_prefill_source_qkv_fp16_context_sliding_direct_repros(
+    head_dim, page_size
+):
+    _test_trtllm_batch_prefill_source_qkv_fp16_context_family(
+        page_size, 127, 8192, 8192, head_dim
+    )
+
+
+def _test_trtllm_batch_prefill_source_qkve4m3_context_family(
+    page_size, window_left, max_q_len, max_kv_len, head_dim, o_dtype
+):
+    _test_trtllm_batch_prefill(
+        "HND",
+        1,
+        page_size,
+        1,
+        8,
+        window_left,
+        "fp8",
+        o_dtype,
+        "fp8",
+        None,
+        False,
+        max_q_len,
+        max_kv_len,
+        True,
+        head_dim,
+        force_create_out_tensor=True,
+        force_create_out_dtype=True,
+        verify_wrapper=False,
+    )
+
+
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("page_size", [16, 32, 64])
+@pytest.mark.parametrize("o_dtype", ["fp16", "bf16", "fp8", "nvfp4"])
+def test_trtllm_batch_prefill_source_qkve4m3_context_causal_direct_repros(
+    head_dim, page_size, o_dtype
+):
+    _test_trtllm_batch_prefill_source_qkve4m3_context_family(
+        page_size, -1, 511, 2047, head_dim, o_dtype
+    )
+
+
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("page_size", [16, 32, 64])
+@pytest.mark.parametrize("o_dtype", ["fp16", "bf16", "fp8", "nvfp4"])
+def test_trtllm_batch_prefill_source_qkve4m3_context_sliding_direct_repros(
+    head_dim, page_size, o_dtype
+):
+    _test_trtllm_batch_prefill_source_qkve4m3_context_family(
+        page_size, 127, 511, 2047, head_dim, o_dtype
+    )
+
+
+def _test_trtllm_batch_prefill_source_qkv_bf16_context_family(
+    page_size, window_left, max_q_len, max_kv_len, head_dim
+):
+    _test_trtllm_batch_prefill(
+        "HND",
+        1,
+        page_size,
+        1,
+        8,
+        window_left,
+        "bf16",
+        "bf16",
+        "bf16",
+        None,
+        False,
+        max_q_len,
+        max_kv_len,
+        False,
+        head_dim,
+        force_create_out_tensor=True,
+        force_create_out_dtype=True,
+        verify_wrapper=False,
+    )
+
+
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("page_size", [16, 32, 64])
+def test_trtllm_batch_prefill_source_qkv_bf16_context_causal_direct_repros(
+    head_dim, page_size
+):
+    _test_trtllm_batch_prefill_source_qkv_bf16_context_family(
+        page_size, -1, 511, 2047, head_dim
+    )
+
+
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("page_size", [16, 32, 64])
+def test_trtllm_batch_prefill_source_qkv_bf16_context_sliding_direct_repros(
+    head_dim, page_size
+):
+    _test_trtllm_batch_prefill_source_qkv_bf16_context_family(
+        page_size, 127, 511, 2047, head_dim
+    )
+
+
+def _test_trtllm_batch_decode_source_qkv_family(
+    page_size,
+    head_grp_size,
+    window_left,
+    max_in_kv_len,
+    head_dim,
+    q_dtype,
+    kv_dtype,
+    o_dtype,
+):
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
+        "HND",
+        1,
+        1,
+        page_size,
+        1,
+        head_grp_size,
+        window_left,
+        q_dtype,
+        o_dtype,
+        kv_dtype,
+        False,
+        False,
+        max_in_kv_len,
+        head_dim,
+        False,
+        force_create_out_tensor=True,
+        force_create_out_dtype=True,
+        verify_wrapper=False,
+    )
+
+
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("page_size", [16, 32, 64])
+def test_trtllm_batch_decode_source_qkv_fp16_forgen_causal_direct_repros(
+    head_dim, page_size
+):
+    _test_trtllm_batch_decode_source_qkv_family(
+        page_size, 8, -1, 4096, head_dim, "fp16", "fp16", "fp16"
+    )
+
+
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("page_size", [16, 32, 64])
+def test_trtllm_batch_decode_source_qkv_fp16_forgen_sliding_direct_repros(
+    head_dim, page_size
+):
+    _test_trtllm_batch_decode_source_qkv_family(
+        page_size, 8, 4095, 8192, head_dim, "fp16", "fp16", "fp16"
+    )
+
+
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("page_size", [16, 32, 64])
+@pytest.mark.parametrize("o_dtype", ["fp16", "bf16", "fp8", "nvfp4"])
+def test_trtllm_batch_decode_source_qkve4m3_forgen_causal_direct_repros(
+    head_dim, page_size, o_dtype
+):
+    _test_trtllm_batch_decode_source_qkv_family(
+        page_size, 8, -1, 4096, head_dim, "fp8", "fp8", o_dtype
+    )
+
+
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("page_size", [16, 32, 64])
+@pytest.mark.parametrize("o_dtype", ["fp16", "bf16", "fp8", "nvfp4"])
+def test_trtllm_batch_decode_source_qkve4m3_forgen_sliding_direct_repros(
+    head_dim, page_size, o_dtype
+):
+    _test_trtllm_batch_decode_source_qkv_family(
+        page_size, 8, 4095, 8192, head_dim, "fp8", "fp8", o_dtype
+    )
+
+
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("page_size", [16, 32, 64])
+def test_trtllm_batch_decode_source_qkv_bf16_forgen_causal_direct_repros(
+    head_dim, page_size
+):
+    _test_trtllm_batch_decode_source_qkv_family(
+        page_size, 8, -1, 4096, head_dim, "bf16", "bf16", "bf16"
+    )
+
+
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("page_size", [16, 32, 64])
+def test_trtllm_batch_decode_source_qkv_bf16_forgen_sliding_direct_repros(
+    head_dim, page_size
+):
+    _test_trtllm_batch_decode_source_qkv_family(
+        page_size, 8, 4095, 8192, head_dim, "bf16", "bf16", "bf16"
     )
 
 

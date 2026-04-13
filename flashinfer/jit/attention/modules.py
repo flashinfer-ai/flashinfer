@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import json
 import os
 from typing import List
 
@@ -28,7 +29,12 @@ from ..core import (
     sm90a_nvcc_flags,
     current_compilation_context,
 )
-from ...jit.cubin_loader import get_artifact, get_meta_hash
+from ...jit.cubin_loader import (
+    compile_source_cubins,
+    download_cuda_ptx_header,
+    get_artifact,
+    get_meta_hash,
+)
 from ..utils import (
     dtype_map,
     filename_safe_dtype_map,
@@ -1766,6 +1772,32 @@ def gen_trtllm_gen_fmha_module():
 
     include_path = f"{ArtifactPath.TRTLLM_GEN_FMHA}/include"
     header_name = "flashInferMetaInfo"
+    trtllm_kernels_root = jit_env.FLASHINFER_CSRC_DIR / "trtllm_kernels"
+    fmha_source_root = trtllm_kernels_root / "fmha"
+    fmha_shared_root = fmha_source_root / "shared"
+    fmha_manifest_path = fmha_source_root / "source_kernel_manifest.json"
+    bundle_filter_raw = os.environ.get("FLASHINFER_TRTLLM_GEN_FMHA_BUNDLE_FILTER", "")
+    bundle_filters = [
+        token.strip() for token in bundle_filter_raw.split(",") if token.strip()
+    ]
+    fmha_source_export_roots = sorted(
+        bundle_root
+        for bundle_root in fmha_source_root.glob("trtllm_gen_*")
+        if (bundle_root / "src").exists()
+        and (
+            not bundle_filters
+            or any(token in bundle_root.name for token in bundle_filters)
+        )
+    )
+
+    disabled_source_kernels_by_bundle = {}
+    if fmha_manifest_path.exists():
+        manifest_obj = json.loads(fmha_manifest_path.read_text())
+        for row in manifest_obj.get("disabled_source_kernels", []):
+            bundle_id = row["bundle_id"]
+            disabled_source_kernels_by_bundle.setdefault(bundle_id, set()).add(
+                row["kernel_name"]
+            )
 
     # Check if checksums.txt exists in the cubin directory
     checksum_path = f"{ArtifactPath.TRTLLM_GEN_FMHA}/checksums.txt"
@@ -1781,6 +1813,46 @@ def gen_trtllm_gen_fmha_module():
 
     # make sure "flashinferMetaInfo.h" is downloaded or cached
     assert metainfo, f"{header_name}.h not found"
+
+    cuda_ptx_include_dir = download_cuda_ptx_header(
+        ArtifactPath.CUDA_PTX, CheckSumHash.CUDA_PTX
+    )
+
+    for fmha_source_export_root in fmha_source_export_roots:
+        fmha_source_dir = fmha_source_export_root / "src"
+        compile_source_cubins(
+            source_dir=fmha_source_dir,
+            artifact_path=ArtifactPath.TRTLLM_GEN_FMHA,
+            include_paths=[
+                cuda_ptx_include_dir,
+                trtllm_kernels_root,
+                fmha_source_root,
+                fmha_shared_root,
+                fmha_source_export_root,
+                fmha_source_dir,
+                jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
+                jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include",
+                *jit_env.CUTLASS_INCLUDE_DIRS,
+            ],
+            nvcc_flags=[
+                "--expt-relaxed-constexpr",
+                "--use_fast_math",
+                "-std=c++17",
+                "-arch=sm_100a",
+                "-DTLLM_ENABLE_CUDA",
+                "-DNDEBUG=1",
+                "-DCUTLASS_ARCH_MMA_SM100A_ENABLED",
+                "-DTLLM_PUBLIC_RELEASE=1",
+                "-diag-suppress=177",
+                "-diag-suppress=2361",
+                "-diag-suppress=550",
+                "-O3",
+                "-cubin",
+            ],
+            excluded_kernel_names=disabled_source_kernels_by_bundle.get(
+                fmha_source_export_root.name, set()
+            ),
+        )
 
     return gen_jit_spec(
         "fmha_gen",

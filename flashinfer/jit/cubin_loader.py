@@ -22,7 +22,7 @@ import subprocess
 from urllib.parse import urljoin
 import shutil
 import time
-from typing import List, Union
+from typing import List, Optional, Set, Union
 import uuid
 
 import filelock
@@ -241,6 +241,7 @@ def compile_source_cubins(
     artifact_path: str,
     include_paths: List[Union[str, pathlib.Path]],
     nvcc_flags: List[str],
+    excluded_kernel_names: Optional[Set[str]] = None,
 ) -> None:
     """
     Compile .cu source files to .cubin and place them in the cubin cache
@@ -256,6 +257,7 @@ def compile_source_cubins(
       used to place output cubins where getCubin() expects them
     - include_paths: Include directories for nvcc compilation
     - nvcc_flags: Flags passed to nvcc for compilation
+    - excluded_kernel_names: Optional set of .cu stem names to skip for this source dir
     """
     source_dir = pathlib.Path(source_dir)
     if not source_dir.exists():
@@ -266,6 +268,16 @@ def compile_source_cubins(
     if not cu_files:
         logger.debug(f"No .cu files found in {source_dir}, skipping")
         return
+
+    excluded_kernel_names = excluded_kernel_names or set()
+    if excluded_kernel_names:
+        original_count = len(cu_files)
+        cu_files = [f for f in cu_files if f.stem not in excluded_kernel_names]
+        skipped_disabled = original_count - len(cu_files)
+        if skipped_disabled:
+            logger.info(
+                f"compile_source_cubins: {skipped_disabled} manifest-disabled kernels skipped in {source_dir.name}"
+            )
 
     # Debug flags for development/testing
     _DBG_KERNEL_FILTER = (

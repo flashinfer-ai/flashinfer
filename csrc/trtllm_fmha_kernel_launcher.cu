@@ -104,6 +104,7 @@ void trtllm_paged_attention_launcher(
   runner_params.kPtr = key_cache;
   runner_params.vPtr = value_cache;
   runner_params.kvPageIdxPtr = block_tables;
+  runner_params.mUsesSharedPagedKvIdx = true;
   runner_params.kSfBasePtr = k_block_scales_ptr;
   runner_params.vSfBasePtr = v_block_scales_ptr;
   runner_params.seqLensKvPtr = seq_lens;

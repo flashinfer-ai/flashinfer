@@ -19,7 +19,7 @@ repos:
     rev: v5.0.0
     hooks:
       - id: check-added-large-files
-        exclude: ^csrc/trtllm_kernels/batched_gemm/trtllmGen_bmm_export/
+        exclude: ^(csrc/trtllm_kernels/batched_gemm/trtllmGen_bmm_export/|csrc/trtllm_kernels/fmha/trtllm_gen_.*)
       - id: check-case-conflict
       - id: check-merge-conflict
       - id: check-symlinks
@@ -46,7 +46,8 @@ repos:
             3rdparty/.*|
             flashinfer/jit/aot_config.py|
             csrc/trtllm_kernels/cuda_ptx/cuda_ptx\.h|
-            csrc/trtllm_kernels/batched_gemm/trtllmGen_bmm_export/.*
+            csrc/trtllm_kernels/batched_gemm/trtllmGen_bmm_export/.*|
+            csrc/trtllm_kernels/fmha/trtllm_gen_.*|
           )$
 
   -   repo: https://github.com/pre-commit/mirrors-mypy
