@@ -55,6 +55,7 @@ from ..jit.gemm import gen_gemm_sm100_module_cutlass_fp8
 from ..jit.gemm import gen_gemm_sm100_module_cutlass_mxfp8
 from ..jit.gemm import gen_gemm_sm120_module_cutlass_mxfp8
 from ..jit.gemm import gen_gemm_sm100_module_cutlass_bf16
+from ..jit.gemm import gen_mm_bf16_cublaslt_module
 from ..jit.gemm import gen_trtllm_gen_gemm_module
 from ..jit.gemm import gen_tgv_gemm_sm10x_module
 from ..jit.gemm import gen_deepgemm_sm100_module
@@ -90,6 +91,11 @@ from ..utils import (
 
 DEFAULT_WORKSPACE_SIZE = 32 * 1024 * 1024
 
+# sizeof(cublasLtMatmulAlgo_t) = uint64_t[8] = 64 bytes.
+# Shared by cuBLAS FP8, cuBLASLt BF16, and any other cuBLASLt-based runners.
+_CUBLASLT_ALGO_BYTES = 64
+_CUBLASLT_MAX_ALGOS = 100
+
 # Error messages
 CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR = "cudnn FP4 GEMM with mxfp4 quantization is not supported on SM120/SM121 with cuDNN backend version < 9.14.0."
 
@@ -109,16 +115,49 @@ def _match_sm_version(device: torch.device, sm_version: list[str]):
 def get_gemm_module():
     module = gen_gemm_module().build_and_load()
 
-    # auto-tuned cublas fp8 gemm runner
     def cublas_fp8_gemm_runner():
         class CublasFp8GemmRunner(TunableRunner):
+            def __init__(self):
+                self._algo_cache: dict = {}
+
+            def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+                a, b, _, _, out, _ = inputs
+                return (a.shape, b.shape, a.dtype, b.dtype, out.dtype)
+
+            def _get_algos(self, inputs):
+                a, b, scale_a, scale_b, out, workspace_buffer = inputs
+                key = self.get_cache_key_extras(inputs)
+                cached = self._algo_cache.get(key)
+                if cached is not None:
+                    return cached
+                algo_buf = torch.empty(
+                    _CUBLASLT_MAX_ALGOS * _CUBLASLT_ALGO_BYTES,
+                    dtype=torch.uint8,
+                    device="cpu",
+                )
+                with torch.cuda.device(a.device):
+                    cublas_handle = torch.cuda.current_blas_handle()
+                count = module.bmm_fp8_get_algos(
+                    a,
+                    b,
+                    out,
+                    scale_a,
+                    scale_b,
+                    workspace_buffer,
+                    cublas_handle,
+                    algo_buf,
+                )
+                result = (algo_buf, count)
+                self._algo_cache[key] = result
+                return result
+
             def get_valid_tactics(
                 self,
                 inputs: List[torch.Tensor],
                 profile: OptimizationProfile,
             ) -> List[int]:
-                # cublas has heuristic for fp8 gemm, so we only need to use the default tactic
-                return [0]
+                _, count = self._get_algos(inputs)
+                return list(range(count))
 
             def forward(
                 self,
@@ -127,11 +166,36 @@ def get_gemm_module():
                 do_preparation: bool = False,
                 **kwargs,
             ) -> torch.Tensor:
-                cublas_handle = torch.cuda.current_blas_handle()
                 a, b, scale_a, scale_b, out, workspace_buffer = inputs
-                module.bmm_fp8(
-                    a, b, out, scale_a, scale_b, workspace_buffer, cublas_handle
-                )
+                with torch.cuda.device(a.device):
+                    cublas_handle = torch.cuda.current_blas_handle()
+                if tactic >= 0:
+                    algo_buf, count = self._get_algos(inputs)
+                    if count == 0:
+                        raise RuntimeError(
+                            "cuBLASLt heuristic returned zero FP8 algorithms for "
+                            f"A={tuple(a.shape)}, B={tuple(b.shape)}, out={tuple(out.shape)}."
+                        )
+                    if tactic >= count:
+                        raise ValueError(
+                            f"Requested tactic {tactic} but only {count} algorithms "
+                            f"available for A={tuple(a.shape)}, B={tuple(b.shape)}."
+                        )
+                    module.bmm_fp8_run_with_algo(
+                        a,
+                        b,
+                        out,
+                        scale_a,
+                        scale_b,
+                        workspace_buffer,
+                        cublas_handle,
+                        algo_buf,
+                        tactic,
+                    )
+                else:
+                    module.bmm_fp8(
+                        a, b, out, scale_a, scale_b, workspace_buffer, cublas_handle
+                    )
                 return out
 
         return CublasFp8GemmRunner()
@@ -198,7 +262,7 @@ def _cutlass_mm_bf16_requirement(
     out_dtype: torch.dtype = torch.bfloat16,
     bias: Optional[torch.Tensor] = None,
     pdl: bool = False,
-    backend: Literal["cudnn", "cutlass", "tgv", "auto"] = "cudnn",
+    backend: Literal["cudnn", "cutlass", "tgv", "cublaslt", "auto"] = "cudnn",
 ):
     if bias is not None:
         raise ValueError(
@@ -214,6 +278,31 @@ def _cutlass_mm_bf16_requirement(
     return True
 
 
+# Gated to Blackwell (SM100/SM103) for the initial scope of this backend.
+# cuBLASLt supports BF16 GEMM on SM80+; the gate can be widened in a follow-up.
+@supported_compute_capability([100, 103])
+def _cublaslt_mm_bf16_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    bias: Optional[torch.Tensor] = None,
+    pdl: bool = False,
+    backend: Literal["cudnn", "cutlass", "tgv", "cublaslt", "auto"] = "cudnn",
+):
+    if bias is not None:
+        raise ValueError(
+            "You cannot use the cuBLASLt backend with a bias. Use the TGV backend instead."
+        )
+    if pdl:
+        raise ValueError(
+            "The cuBLASLt backend does not support PDL. Use the TGV backend instead."
+        )
+    _validate_bf16_output_dtype(out_dtype)
+
+    return True
+
+
 @supported_compute_capability([80, 86, 89, 90, 100, 103])
 def _cudnn_mm_bf16_requirement(
     a: torch.Tensor,
@@ -222,7 +311,7 @@ def _cudnn_mm_bf16_requirement(
     out_dtype: torch.dtype = torch.bfloat16,
     bias: Optional[torch.Tensor] = None,
     pdl: bool = False,
-    backend: Literal["cudnn", "cutlass", "tgv", "auto"] = "cudnn",
+    backend: Literal["cudnn", "cutlass", "tgv", "cublaslt", "auto"] = "cudnn",
 ):
     _validate_bf16_output_dtype(out_dtype)
     _check_cudnn_availability()
@@ -238,7 +327,7 @@ def _tgv_gemm_requirement(
     out_dtype: torch.dtype = torch.bfloat16,
     bias: Optional[torch.Tensor] = None,
     pdl: bool = False,
-    backend: Literal["cudnn", "cutlass", "tgv", "auto"] = "cudnn",
+    backend: Literal["cudnn", "cutlass", "tgv", "cublaslt", "auto"] = "cudnn",
 ):
     if out_dtype != torch.bfloat16:
         raise ValueError(
@@ -254,7 +343,7 @@ def _check_mm_bf16_problem_size(
     pdl: bool = False,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cudnn", "cutlass", "tgv", "auto"] = "cudnn",
+    backend: Literal["cudnn", "cutlass", "tgv", "cublaslt", "auto"] = "cudnn",
 ):
     if a.dtype != torch.bfloat16:
         raise ValueError(
@@ -295,22 +384,24 @@ def _heuristic_func_mm_bf16(
     pdl: bool = False,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cudnn", "cutlass", "tgv", "auto"] = "cudnn",
+    backend: Literal["cudnn", "cutlass", "tgv", "cublaslt", "auto"] = "cudnn",
 ):
     heuristic_backends = []
     if bias is not None or pdl:
-        # CUTLASS doesn't support bias/pdl, only TGV and cuDNN do
+        # CUTLASS and cuBLASLt doesn't support bias/pdl, only TGV and cuDNN do
         if "tgv" in suitable_backends:
             heuristic_backends.append("tgv")
         if "cudnn" in suitable_backends:
             heuristic_backends.append("cudnn")
-    else:
+    else
         if "cutlass" in suitable_backends:
             heuristic_backends.append("cutlass")
         if "tgv" in suitable_backends:
             heuristic_backends.append("tgv")
         if "cudnn" in suitable_backends:
             heuristic_backends.append("cudnn")
+        if "cublaslt" in suitable_backends:
+            heuristic_backends.append("cublaslt")
     return heuristic_backends
 
 
@@ -319,6 +410,7 @@ def _heuristic_func_mm_bf16(
         "cudnn": _cudnn_mm_bf16_requirement,
         "cutlass": _cutlass_mm_bf16_requirement,
         "tgv": _tgv_gemm_requirement,
+        "cublaslt": _cublaslt_mm_bf16_requirement,
     },
     common_check=_check_mm_bf16_problem_size,
     heuristic_func=_heuristic_func_mm_bf16,
@@ -331,7 +423,7 @@ def mm_bf16(
     pdl: bool = False,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cudnn", "cutlass", "tgv", "auto"] = "cudnn",
+    backend: Literal["cudnn", "cutlass", "tgv", "cublaslt", "auto"] = "cudnn",
 ) -> torch.Tensor:
     r"""MM BF16
 
@@ -347,21 +439,23 @@ def mm_bf16(
         Optional bias tensor, shape (n,). Enabled for TGV backend. Defaults to ``None``.
 
     pdl: bool
-        Whether to use persistant data loader mode. Enabled for TGV backend. Defaults to ``False``.
+        Whether to enable Programmatic Dependent Launch (PDL). Enabled for TGV backend. Defaults to ``False``.
 
     out: Optional[torch.Tensor]
-        Out tensor, shape (m, n), bf16, fp16, or fp32. Enabled for CUTLASS and cuDNN backends.
+        Out tensor, shape (m, n). Preallocated output is supported by all backends.
+        TGV requires ``torch.bfloat16``; CUTLASS, cuDNN, and cuBLASLt also support fp16/fp32.
         Defaults to ``None``.
 
     out_dtype: torch.dtype
-        Output dtype, bf16, fp16, or fp32. Enabled for CUTLASS and cuDNN backends.
+        Output dtype, bf16, fp16, or fp32. Enabled for CUTLASS, cuDNN, and cuBLASLt backends.
         Defaults to ``torch.bfloat16``.
 
-    backend: Literal["cudnn", "cutlass", "tgv", "auto"]
+    backend: Literal["cudnn", "cutlass", "tgv", "cublaslt", "auto"]
         The backend to use for the operation. Defaults to ``"cudnn"``.
         ``"cudnn"`` uses the cuDNN backend.
         ``"cutlass"`` uses the CUTLASS backend.
         ``"tgv"`` uses the TGV backend.
+        ``"cublaslt"`` uses the cuBLASLt backend with heuristic algorithm search.
         ``"auto"`` allows selecting the best tactic from all available backends when autotune is enabled.
 
     Returns
@@ -395,6 +489,12 @@ def mm_bf16(
     torch.Size([48, 80])
     >>> out.dtype
     torch.bfloat16
+    >>> # Using the cuBLASLt backend
+    >>> out = flashinfer.mm_bf16(a, b, backend="cublaslt")
+    >>> out.shape
+    torch.Size([48, 80])
+    >>> out.dtype
+    torch.bfloat16
     """
 
     if out is None:
@@ -420,6 +520,10 @@ def mm_bf16(
     elif backend == "tgv":
         backends = _heuristic_func_mm_bf16(
             ["tgv"], a, b, bias, pdl, out, out_dtype, backend
+        )
+    elif backend == "cublaslt":
+        backends = _heuristic_func_mm_bf16(
+            ["cublaslt"], a, b, None, False, out, out_dtype, backend
         )
     else:
         backends = [backend]
@@ -610,7 +714,8 @@ def get_gemm_sm120_module_cutlass_fp8():
                 inputs: List[torch.Tensor],
                 profile: OptimizationProfile,
             ) -> List[int]:
-                # For now, return a single default tactic
+                # TODO: add multi-tactic support when PingPong 64x128x128 schedule
+                # is implemented (see gemm_groupwise_sm120.cuh)
                 return [-1]
 
             def forward(
@@ -864,6 +969,127 @@ def get_gemm_sm100_module_cutlass_bf16():
     )
 
 
+@functools.cache
+def get_mm_bf16_cublaslt_module():
+    module = gen_mm_bf16_cublaslt_module().build_and_load()
+
+    def cublaslt_bf16_gemm_runner():
+        class CublasltBf16GemmRunner(TunableRunner):
+            def __init__(self):
+                self._algo_cache: dict = {}
+
+            def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+                a, b, _, _, out, _ = inputs
+                return (
+                    a.shape[0],
+                    b.shape[1],
+                    a.shape[1],
+                    self._compute_dtype(out.dtype),
+                )
+
+            @staticmethod
+            def _compute_dtype(out_dtype):
+                # cuBLASLt with BF16 inputs supports BF16 or FP32 output natively.
+                # FP16 output is achieved via FP32 compute + cast (FP32→FP16
+                # preserves more precision than BF16→FP16).
+                if out_dtype == torch.float16:
+                    return torch.float32
+                return out_dtype
+
+            def _get_algos(self, inputs):
+                a, b, _, _, out, workspace_buffer = inputs
+                compute_dt = self._compute_dtype(out.dtype)
+                key = self.get_cache_key_extras(inputs)
+                cached = self._algo_cache.get(key)
+                if cached is not None:
+                    return cached
+                algo_buf = torch.empty(
+                    _CUBLASLT_MAX_ALGOS * _CUBLASLT_ALGO_BYTES,
+                    dtype=torch.uint8,
+                    device="cpu",
+                )
+                with torch.cuda.device(a.device):
+                    cublas_handle = torch.cuda.current_blas_handle()
+                proxy_out = (
+                    out
+                    if out.dtype == compute_dt
+                    else torch.empty_like(out, dtype=compute_dt)
+                )
+                count = module.mm_bf16_cublaslt_get_algos(
+                    a,
+                    b.transpose(-2, -1),
+                    proxy_out,
+                    workspace_buffer,
+                    cublas_handle,
+                    algo_buf,
+                )
+                result = (algo_buf, count)
+                self._algo_cache[key] = result
+                return result
+
+            def get_valid_tactics(
+                self,
+                inputs: List[torch.Tensor],
+                profile: OptimizationProfile,
+            ) -> List[int]:
+                _, count = self._get_algos(inputs)
+                return list(range(count))
+
+            def forward(
+                self,
+                inputs: List[torch.Tensor],
+                tactic: int = -1,
+                do_preparation: bool = False,
+                **kwargs,
+            ) -> torch.Tensor:
+                a, b, _, _, out, workspace_buffer = inputs
+                with torch.cuda.device(a.device):
+                    cublas_handle = torch.cuda.current_blas_handle()
+                b_t = b.transpose(-2, -1)
+
+                compute_dt = self._compute_dtype(out.dtype)
+                need_cast = out.dtype != compute_dt
+                if need_cast:
+                    compute_out = torch.empty_like(out, dtype=compute_dt)
+                else:
+                    compute_out = out
+
+                algo_buf, count = self._get_algos(inputs)
+                if count == 0:
+                    raise RuntimeError(
+                        "cuBLASLt heuristic returned zero algorithms for "
+                        f"M={a.shape[0]}, N={b.shape[1]}, K={a.shape[1]}, "
+                        f"dtype={compute_out.dtype}. "
+                        "This shape/dtype combination may not be supported."
+                    )
+                if tactic >= count:
+                    raise ValueError(
+                        f"Requested tactic {tactic} but only {count} algorithms "
+                        f"available for M={a.shape[0]}, N={b.shape[1]}, K={a.shape[1]}, "
+                        f"dtype={compute_out.dtype}."
+                    )
+                if tactic < 0:
+                    tactic = 0
+                module.mm_bf16_cublaslt_run_with_algo(
+                    a,
+                    b_t,
+                    compute_out,
+                    workspace_buffer,
+                    cublas_handle,
+                    algo_buf,
+                    tactic,
+                )
+                if need_cast:
+                    out.copy_(compute_out)
+                return out
+
+        return CublasltBf16GemmRunner()
+
+    return SimpleNamespace(
+        cublaslt_bf16_gemm_runner=cublaslt_bf16_gemm_runner,
+    )
+
+
 _BF16_GEMM_SM100_TUNING_CONFIG = TuningConfig(
     dynamic_tensor_specs=(
         DynamicTensorSpec(
@@ -896,6 +1122,8 @@ def bf16_gemm_sm100(
     use_sm_100f = is_sm100f_supported(a.device)
     if "cudnn" in runner_names:
         runners.append(_cudnn_gemm_bf16_runner())
+    if "cublaslt" in runner_names:
+        runners.append(get_mm_bf16_cublaslt_module().cublaslt_bf16_gemm_runner())
     if "cutlass" in runner_names:
         runners.append(get_gemm_sm100_module_cutlass_bf16().cutlass_bf16_gemm_runner())
     if "tgv" in runner_names:
@@ -2376,9 +2604,17 @@ def execute_cudnn_gemm_mxfp8_graph_override_shape(
     )
 
 
-@functools.lru_cache(maxsize=1024)
+@functools.lru_cache(maxsize=2048)
 def build_cudnn_gemm_with_per_tensor_q_graph(
-    a_shape, a_stride, b_shape, b_stride, a_type, b_type, o_type, device
+    a_shape,
+    a_stride,
+    b_shape,
+    b_stride,
+    a_type,
+    b_type,
+    o_type,
+    device,
+    policy=None,
 ):
     """Build a cuDNN graph for GEMM with per-tensor quantization.
 
@@ -2392,11 +2628,15 @@ def build_cudnn_gemm_with_per_tensor_q_graph(
         a_type: Data type for input tensor A
         b_type: Data type for input tensor B
         o_type: Data type for output tensor
+        policy: cuDNN build plan policy. None defaults to HEURISTICS_CHOICE.
+                Use ALL to enumerate all execution plans for autotuning.
 
     Returns:
         cuDNN graph object
     """
     _check_cudnn_availability()
+    if policy is None:
+        policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
 
     stream = torch.cuda.current_stream(device)
     with cudnn.graph(_get_cudnn_handle(device, stream)) as (graph, _):
@@ -2452,13 +2692,20 @@ def build_cudnn_gemm_with_per_tensor_q_graph(
         graph.build_operation_graph()
         graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
         graph.check_support()
-        graph.build_plans()
+        graph.build_plans(policy)
 
         return graph
 
 
 def execute_cudnn_gemm_with_per_tensor_q_graph(
-    graph, a, b, a_scale, b_scale, c_final, workspace
+    graph,
+    a,
+    b,
+    a_scale,
+    b_scale,
+    c_final,
+    workspace,
+    tactic: int = -1,
 ):
     variant_pack = {
         UIDs.A_UID.value: a,
@@ -2476,7 +2723,12 @@ def execute_cudnn_gemm_with_per_tensor_q_graph(
             graph.get_workspace_size(), device=a.device, dtype=torch.uint8
         )
 
-    graph.execute(variant_pack, workspace, handle=cudnn_handle)
+    if tactic == -1:
+        graph.execute(variant_pack, workspace, handle=cudnn_handle)
+    else:
+        graph.execute_plan_at_index(
+            variant_pack, workspace, tactic, handle=cudnn_handle
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2621,8 +2873,14 @@ def _cudnn_gemm_fp8(
     b_scale: torch.Tensor,
     out: Optional[torch.Tensor],
     torch_out_dtype: torch.dtype,
+    tactic: int = -1,
 ):
     _check_cudnn_availability()
+
+    if tactic == -1:
+        policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
+    else:
+        policy = cudnn.build_plan_policy.ALL
 
     graph = build_cudnn_gemm_with_per_tensor_q_graph(
         a.shape,
@@ -2633,23 +2891,46 @@ def _cudnn_gemm_fp8(
         _torch_data_type_to_cudnn_data_type(b.dtype),
         _torch_data_type_to_cudnn_data_type(torch_out_dtype),
         a.device,
+        policy=policy,
     )
 
     execute_cudnn_gemm_with_per_tensor_q_graph(
-        graph, a, b, a_scale, b_scale, out, workspace
+        graph,
+        a,
+        b,
+        a_scale,
+        b_scale,
+        out,
+        workspace,
+        tactic=tactic,
     )
     return out
 
 
 def _cudnn_gemm_fp8_runner():
     class CudnnFp8GemmRunner(TunableRunner):
+        def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+            a, b, _, _, out, _ = inputs
+            return (a.dtype, b.dtype, out.dtype)
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
         ) -> List[int]:
-            # cudnn has heuristic for fp8 gemm, so we only need to use the default tactic
-            return [0]
+            a, b, _, _, out, _ = inputs
+            graph = build_cudnn_gemm_with_per_tensor_q_graph(
+                a.shape,
+                a.stride(),
+                b.shape,
+                b.stride(),
+                _torch_data_type_to_cudnn_data_type(a.dtype),
+                _torch_data_type_to_cudnn_data_type(b.dtype),
+                _torch_data_type_to_cudnn_data_type(out.dtype),
+                a.device,
+                policy=cudnn.build_plan_policy.ALL,
+            )
+            return list(range(graph.get_execution_plan_count()))
 
         def forward(
             self,
@@ -2659,7 +2940,16 @@ def _cudnn_gemm_fp8_runner():
             **kwargs,
         ) -> torch.Tensor:
             a, b, scale_a, scale_b, out, workspace_buffer = inputs
-            _cudnn_gemm_fp8(workspace_buffer, a, b, scale_a, scale_b, out, out.dtype)
+            _cudnn_gemm_fp8(
+                workspace_buffer,
+                a,
+                b,
+                scale_a,
+                scale_b,
+                out,
+                out.dtype,
+                tactic=tactic,
+            )
             return out
 
     return CudnnFp8GemmRunner()
@@ -7129,7 +7419,7 @@ def _get_cudnn_mxfp8_gemm_graph(
     out_dtype: torch.dtype = torch.bfloat16,
     out: Optional[torch.Tensor] = None,
     block_size: int = 32,  # mxfp8 block size is 32
-    tactic: int = -1,
+    policy=None,
 ):
     graph = create_cudnn_execution_plans_mxfp8_gemm(
         a_shape=a.shape,
@@ -7144,10 +7434,9 @@ def _get_cudnn_mxfp8_gemm_graph(
     )
 
     graph.check_support()
-    if tactic != -1:
-        graph.build_plan_at_index(tactic)
-    else:
-        graph.build_plans()
+    if policy is None:
+        policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
+    graph.build_plans(policy)
     return graph
 
 
@@ -7164,6 +7453,11 @@ def _cudnn_gemm_mxfp8(
     # mxfp8 block size is 32
     block_size = 32
 
+    if tactic == -1:
+        policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
+    else:
+        policy = cudnn.build_plan_policy.ALL
+
     # Graph should have been already cached, when we ran _cudnn_bmm_mxfp8_requirement
     graph = _get_cudnn_mxfp8_gemm_graph(
         a=a,
@@ -7171,7 +7465,7 @@ def _cudnn_gemm_mxfp8(
         out_dtype=out_dtype,
         out=out,
         block_size=block_size,
-        tactic=tactic,
+        policy=policy,
     )
     # execute the mxfp8 cudnn graph
     execute_cudnn_gemm_mxfp8_graph(
@@ -7188,14 +7482,24 @@ def _cudnn_gemm_mxfp8(
 
 def _cudnn_gemm_mxfp8_runner():
     class CudnnMxfp8GemmRunner(TunableRunner):
+        def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+            a, b, _, _, out, _ = inputs
+            return (a.dtype, b.dtype, out.dtype)
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
         ) -> List[int]:
-            # TODO: check if this is correct
-            # cudnn has heuristic for mxfp8 gemm, so we only need to use the default tactic
-            return [0]
+            a, b, _, _, out, _ = inputs
+            graph = _get_cudnn_mxfp8_gemm_graph(
+                a=a,
+                b=b,
+                out_dtype=out.dtype,
+                out=out,
+                policy=cudnn.build_plan_policy.ALL,
+            )
+            return list(range(graph.get_execution_plan_count()))
 
         def forward(
             self,
