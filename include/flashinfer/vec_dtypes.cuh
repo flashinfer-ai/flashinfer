@@ -1887,9 +1887,7 @@ struct vec_t<int8_t, 1> {
   int8_t data;
 
   FLASHINFER_INLINE int8_t& operator[](size_t i) { return ((int8_t*)(&data))[i]; }
-  FLASHINFER_INLINE const int8_t& operator[](size_t i) const {
-    return ((const int8_t*)(&data))[i];
-  }
+  FLASHINFER_INLINE const int8_t& operator[](size_t i) const { return ((const int8_t*)(&data))[i]; }
   FLASHINFER_INLINE int8_t* ptr() { return reinterpret_cast<int8_t*>(&data); }
   FLASHINFER_INLINE void fill(int8_t val);
   FLASHINFER_INLINE void load(const int8_t* ptr);
@@ -1924,9 +1922,7 @@ struct vec_t<int8_t, 2> {
   uint16_t data;
 
   FLASHINFER_INLINE int8_t& operator[](size_t i) { return ((int8_t*)(&data))[i]; }
-  FLASHINFER_INLINE const int8_t& operator[](size_t i) const {
-    return ((const int8_t*)(&data))[i];
-  }
+  FLASHINFER_INLINE const int8_t& operator[](size_t i) const { return ((const int8_t*)(&data))[i]; }
   FLASHINFER_INLINE int8_t* ptr() { return reinterpret_cast<int8_t*>(&data); }
   FLASHINFER_INLINE void fill(int8_t val);
   FLASHINFER_INLINE void load(const int8_t* ptr);
@@ -1966,9 +1962,7 @@ struct vec_t<int8_t, 4> {
   uint32_t data;
 
   FLASHINFER_INLINE int8_t& operator[](size_t i) { return ((int8_t*)(&data))[i]; }
-  FLASHINFER_INLINE const int8_t& operator[](size_t i) const {
-    return ((const int8_t*)(&data))[i];
-  }
+  FLASHINFER_INLINE const int8_t& operator[](size_t i) const { return ((const int8_t*)(&data))[i]; }
   FLASHINFER_INLINE int8_t* ptr() { return reinterpret_cast<int8_t*>(&data); }
   FLASHINFER_INLINE void fill(int8_t val);
   FLASHINFER_INLINE void load(const int8_t* ptr);
@@ -2008,9 +2002,7 @@ struct vec_t<int8_t, 8> {
   uint2 data;
 
   FLASHINFER_INLINE int8_t& operator[](size_t i) { return ((int8_t*)(&data))[i]; }
-  FLASHINFER_INLINE const int8_t& operator[](size_t i) const {
-    return ((const int8_t*)(&data))[i];
-  }
+  FLASHINFER_INLINE const int8_t& operator[](size_t i) const { return ((const int8_t*)(&data))[i]; }
   FLASHINFER_INLINE int8_t* ptr() { return reinterpret_cast<int8_t*>(&data); }
   FLASHINFER_INLINE void fill(int8_t val);
   FLASHINFER_INLINE void load(const int8_t* ptr);

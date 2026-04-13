@@ -123,7 +123,9 @@ def test_append_paged_kv_cache_int8():
         position = int(positions_cpu[i])
         page_slot = position // page_size
         offset = position % page_size
-        page_idx = int(kv_page_indices_cpu[int(kv_page_indptr_cpu[batch_idx]) + page_slot])
+        page_idx = int(
+            kv_page_indices_cpu[int(kv_page_indptr_cpu[batch_idx]) + page_slot]
+        )
         torch.testing.assert_close(paged_kv_cache[page_idx, 0, offset], k_append[i])
         torch.testing.assert_close(paged_kv_cache[page_idx, 1, offset], v_append[i])
 
@@ -217,7 +219,11 @@ def test_batch_prefill_with_paged_kv_cache_int8():
     v_scale = 0.25
 
     q = torch.randn(
-        batch_size * qo_len, num_qo_heads, head_dim, device="cuda:0", dtype=torch.float16
+        batch_size * qo_len,
+        num_qo_heads,
+        head_dim,
+        device="cuda:0",
+        dtype=torch.float16,
     )
     q_indptr = (
         torch.arange(0, batch_size + 1, device="cuda:0", dtype=torch.int32) * qo_len
