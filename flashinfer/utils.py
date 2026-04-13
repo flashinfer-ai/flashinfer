@@ -786,6 +786,147 @@ class FP4Tensor:
         self.dtype = "nvfp4"
 
 
+INT4_GROUP_SIZE = 32
+INT4_DTYPE_NAME = "int4"
+
+
+def is_int4_dtype(dtype: Union[torch.dtype, str, None]) -> bool:
+    return isinstance(dtype, str) and dtype == INT4_DTYPE_NAME
+
+
+class INT4Tensor:
+    """Wrapper class for packed int4 tensors."""
+
+    def __init__(
+        self,
+        data: torch.Tensor,
+        scale: torch.Tensor,
+        *,
+        group_size: int = INT4_GROUP_SIZE,
+        original_shape: Tuple[int, ...],
+        scheme: str = "symmetric",
+    ) -> None:
+        if data.dtype != torch.uint8:
+            raise ValueError(f"data must be uint8 tensor, got {data.dtype}")
+        if scale.dtype != torch.float16:
+            raise ValueError(f"scale must be float16 tensor, got {scale.dtype}")
+        if group_size <= 0:
+            raise ValueError(f"group_size must be positive, got {group_size}")
+        if len(original_shape) == 0:
+            raise ValueError("original_shape must have at least one dimension")
+        if data.shape[:-1] != original_shape[:-1]:
+            raise ValueError(
+                "data and original_shape must match except the last dimension: "
+                f"data.shape={data.shape}, original_shape={original_shape}"
+            )
+        expected_packed_dim = math.ceil(original_shape[-1] / 2)
+        if data.shape[-1] != expected_packed_dim:
+            raise ValueError(
+                "data last dimension must be ceil(original_shape[-1] / 2): "
+                f"data.shape[-1]={data.shape[-1]}, expected={expected_packed_dim}"
+            )
+        expected_num_groups = math.ceil(original_shape[-1] / group_size)
+        if scale.shape[:-1] != original_shape[:-1]:
+            raise ValueError(
+                "scale and original_shape must match except the last dimension: "
+                f"scale.shape={scale.shape}, original_shape={original_shape}"
+            )
+        if scale.shape[-1] != expected_num_groups:
+            raise ValueError(
+                "scale last dimension must be ceil(original_shape[-1] / group_size): "
+                f"scale.shape[-1]={scale.shape[-1]}, expected={expected_num_groups}"
+            )
+
+        self.data = data
+        self.scale = scale
+        self.group_size = group_size
+        self.original_shape = original_shape
+        self.scheme = scheme
+        self.dtype = INT4_DTYPE_NAME
+
+    def unbind(self, dim: int = 0) -> Tuple["INT4Tensor", ...]:
+        size = self.data.shape[dim]
+        original_shape = self.original_shape[:dim] + self.original_shape[dim + 1 :]
+        return tuple(
+            INT4Tensor(
+                self.data.select(dim, i),
+                self.scale.select(dim, i),
+                group_size=self.group_size,
+                original_shape=original_shape,
+                scheme=self.scheme,
+            )
+            for i in range(size)
+        )
+
+
+def is_int4_tensor(x: object) -> bool:
+    return isinstance(x, INT4Tensor)
+
+
+def is_int4_paged_kv_cache(
+    paged_kv_cache: Union[
+        torch.Tensor,
+        INT4Tensor,
+        Tuple[torch.Tensor, torch.Tensor],
+        Tuple[INT4Tensor, INT4Tensor],
+    ]
+) -> bool:
+    if isinstance(paged_kv_cache, INT4Tensor):
+        return True
+    if isinstance(paged_kv_cache, tuple) and len(paged_kv_cache) == 2:
+        return all(isinstance(x, INT4Tensor) for x in paged_kv_cache)
+    return False
+
+
+def _split_int4_paged_kv_cache_views(
+    paged_kv_cache: Union[INT4Tensor, Tuple[INT4Tensor, INT4Tensor]],
+    kv_layout: str,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if isinstance(paged_kv_cache, tuple):
+        paged_k_cache, paged_v_cache = paged_kv_cache
+        return (
+            _expand_4d(paged_k_cache.data, kv_layout),
+            _expand_4d(paged_v_cache.data, kv_layout),
+            _expand_4d(paged_k_cache.scale, kv_layout),
+            _expand_4d(paged_v_cache.scale, kv_layout),
+        )
+    if isinstance(paged_kv_cache, INT4Tensor):
+        data = _expand_5d(paged_kv_cache.data, kv_layout)
+        scale = _expand_5d(paged_kv_cache.scale, kv_layout)
+        k_data, v_data = data.unbind(dim=1)
+        k_scale, v_scale = scale.unbind(dim=1)
+        return k_data, v_data, k_scale, v_scale
+    raise KeyError(
+        "Unrecognized int4 paged_kv_cache type {}, expect INT4Tensor or a tuple of INT4Tensor.".format(
+            type(paged_kv_cache)
+        )
+    )
+
+
+def _dequantize_int4_paged_kv_cache(
+    paged_kv_cache: Union[INT4Tensor, Tuple[INT4Tensor, INT4Tensor]],
+    kv_layout: str,
+    dtype: torch.dtype = torch.float16,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    from .quantization import int4_dequantize
+
+    if isinstance(paged_kv_cache, tuple):
+        paged_k_cache, paged_v_cache = paged_kv_cache
+        return (
+            _expand_4d(int4_dequantize(paged_k_cache, dtype=dtype), kv_layout),
+            _expand_4d(int4_dequantize(paged_v_cache, dtype=dtype), kv_layout),
+        )
+    if isinstance(paged_kv_cache, INT4Tensor):
+        kv_cache = _expand_5d(int4_dequantize(paged_kv_cache, dtype=dtype), kv_layout)
+        k_cache, v_cache = kv_cache.unbind(dim=1)
+        return k_cache, v_cache
+    raise KeyError(
+        "Unrecognized int4 paged_kv_cache type {}, expect INT4Tensor or a tuple of INT4Tensor.".format(
+            type(paged_kv_cache)
+        )
+    )
+
+
 # yapf: disable
 srcToDstBlk16RowMap = [
     0,  8,

@@ -139,6 +139,8 @@ from .prefill import (
 from .prefill import trtllm_fmha_v2_prefill as trtllm_fmha_v2_prefill
 from .quantization import packbits as packbits
 from .quantization import segment_packbits as segment_packbits
+from .quantization import int4_dequantize as int4_dequantize
+from .quantization import int4_quantize as int4_quantize
 from .rope import apply_llama31_rope as apply_llama31_rope
 from .rope import apply_llama31_rope_inplace as apply_llama31_rope_inplace
 from .rope import apply_llama31_rope_pos_ids as apply_llama31_rope_pos_ids
@@ -180,6 +182,7 @@ from .trtllm_low_latency_gemm import (
     prepare_low_latency_gemm_weights as prepare_low_latency_gemm_weights,
 )
 from .utils import next_positive_power_of_2 as next_positive_power_of_2
+from .utils import INT4Tensor as INT4Tensor
 from .xqa import xqa as xqa
 from .xqa import xqa_mla as xqa_mla
 from . import mamba as mamba
