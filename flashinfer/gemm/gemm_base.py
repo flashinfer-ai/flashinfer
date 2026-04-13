@@ -4379,7 +4379,7 @@ def _check_mm_fp4_problem_size(
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,  # unused
     backend: Literal[
-        "cudnn", "trtllm", "cutlass", "cute-dsl", "auto"
+        "cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"
     ] = "auto",  # unused
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
@@ -4439,7 +4439,7 @@ def _cudnn_gemm_fp4_requirement(
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,
     backend: Literal[
-        "cudnn", "trtllm", "cutlass", "cute-dsl", "auto"
+        "cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"
     ] = "auto",  # unused
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
@@ -4470,7 +4470,7 @@ def _trtllm_gemm_fp4_requirement(
     block_size: int = 16,  # unused
     use_8x4_sf_layout: bool = False,  # unused
     backend: Literal[
-        "cudnn", "trtllm", "cutlass", "cute-dsl", "auto"
+        "cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"
     ] = "auto",  # unused
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
@@ -4497,7 +4497,7 @@ def _cutlass_gemm_fp4_requirement(
     block_size: int = 16,  # unused
     use_8x4_sf_layout: bool = False,
     backend: Literal[
-        "cudnn", "trtllm", "cutlass", "cute-dsl", "auto"
+        "cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"
     ] = "auto",  # unused
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
@@ -4521,7 +4521,7 @@ def _cute_dsl_gemm_fp4_requirement(
     block_size: int = 16,  # unused
     use_8x4_sf_layout: bool = False,
     backend: Literal[
-        "cudnn", "trtllm", "cutlass", "cute-dsl", "auto"
+        "cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"
     ] = "auto",  # unused
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
@@ -4927,7 +4927,7 @@ def _heuristic_func_mm_fp4(
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,
-    backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "auto"] = "cudnn",
+    backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"] = "cudnn",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
 ):
@@ -5121,7 +5121,7 @@ def mm_fp4(
     use_8x4_sf_layout: bool
         Whether to use 8x4 scale factor layout or 128x4 scale factor layout, defaults to False.
 
-    backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "auto"]
+    backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"]
         Backend to use, defaults to ``"auto"``, which automatically selects the best
         backend between ``"cudnn"`` and ``"cutlass"`` based on the current CUDA and
         cuDNN versions. The ``"trtllm"`` and ``"cute-dsl"`` backends are never selected
