@@ -9,6 +9,8 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tvm_ffi_utils.h"
 
+using tvm::ffi::Optional;
+
 namespace cg = cooperative_groups;
 using namespace tensorrt_llm::common;
 

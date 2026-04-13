@@ -348,7 +348,7 @@ __global__ void routingMainKernel(KernelParams params) {
 
       // Routing replay: record all top-K selected expert IDs per token.
       // Layout: [num_tokens, topK] -- same indexing as mPtrTopKPacked.
-      if (laneIdx < params.mTopK && params.mPtrRoutingReplayOut != nullptr) {
+      if (params.mPtrRoutingReplayOut != nullptr && laneIdx < params.mTopK) {
         params.mPtrRoutingReplayOut[idxTopK] = static_cast<int16_t>(expertIdx);
       }
     }

@@ -2272,6 +2272,28 @@ def get_trtllm_moe_sm100_module():
     )
 
 
+def _validate_routing_replay_out(
+    routing_replay_out: Optional[torch.Tensor], top_k: int
+) -> None:
+    """Validate routing_replay_out tensor properties before passing to C++ kernels."""
+    if routing_replay_out is None:
+        return
+    if routing_replay_out.dtype != torch.int16:
+        raise ValueError(
+            f"routing_replay_out must be int16, got {routing_replay_out.dtype}"
+        )
+    if routing_replay_out.ndim != 2:
+        raise ValueError(
+            f"routing_replay_out must be 2D [num_tokens, top_k], got {routing_replay_out.ndim}D"
+        )
+    if routing_replay_out.shape[1] != top_k:
+        raise ValueError(
+            f"routing_replay_out dim1 must equal top_k={top_k}, got {routing_replay_out.shape[1]}"
+        )
+    if not routing_replay_out.is_contiguous():
+        raise ValueError("routing_replay_out must be contiguous (packed row-major)")
+
+
 @flashinfer_api
 def trtllm_bf16_moe(
     routing_logits: torch.Tensor,
@@ -2337,6 +2359,7 @@ def trtllm_bf16_moe(
         when do_finalize=True, returns the final MoE output.
         otherwise, returns the intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
     """
+    _validate_routing_replay_out(routing_replay_out, top_k)
     result = get_trtllm_moe_sm100_module().trtllm_bf16_moe(
         routing_logits,
         routing_bias,
@@ -2434,6 +2457,7 @@ def trtllm_bf16_routed_moe(
         when do_finalize=True, returns the final MoE output.
         otherwise, returns the intermediate results (gemm2_output, undefined, expanded_idx_to_permuted_idx) that need further processing.
     """
+    _validate_routing_replay_out(routing_replay_out, top_k)
     result = get_trtllm_moe_sm100_module().trtllm_bf16_moe(
         None,
         None,
@@ -2531,6 +2555,7 @@ def trtllm_fp8_per_tensor_scale_moe(
         when do_finalize=True, returns the final MoE output.
         otherwise, returns the intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
     """
+    _validate_routing_replay_out(routing_replay_out, top_k)
     result = get_trtllm_moe_sm100_module().trtllm_fp8_per_tensor_scale_moe(
         routing_logits,
         routing_bias,
@@ -2643,6 +2668,7 @@ def trtllm_fp8_block_scale_moe(
         when do_finalize=True, returns the final MoE output.
         otherwise, returns the intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
     """
+    _validate_routing_replay_out(routing_replay_out, top_k)
     output = torch.empty(
         hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
     )
@@ -2899,6 +2925,7 @@ def trtllm_fp4_block_scale_moe(
         List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
             Otherwise, returns intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
     """
+    _validate_routing_replay_out(routing_replay_out, top_k)
     return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
         routing_logits,
         None,
@@ -3146,6 +3173,7 @@ def trtllm_mxint4_block_scale_moe(
         List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
             Otherwise, returns intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
     """
+    _validate_routing_replay_out(routing_replay_out, top_k)
     return get_trtllm_moe_sm100_module().trtllm_mxint4_block_scale_moe(
         routing_logits,
         routing_bias,
