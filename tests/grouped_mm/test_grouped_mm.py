@@ -89,7 +89,7 @@ class TestGroupedMmBf16:
         a = torch.randn(cum_m, k, dtype=dtype, device="cuda")
         b = torch.randn(num_experts, n, k, dtype=dtype, device="cuda")
         m_indptr = torch.tensor(
-            [0] + list(torch.tensor(seg_lens).cumsum(0).tolist()),
+            [0, *torch.tensor(seg_lens).cumsum(0).tolist()],
             dtype=torch.int32,
             device="cuda",
         )
@@ -111,7 +111,7 @@ class TestGroupedMmBf16:
         a = torch.randn(cum_m, k, dtype=torch.float16, device="cuda")
         b = torch.randn(num_experts, n, k, dtype=torch.float16, device="cuda")
         m_indptr = torch.tensor(
-            [0] + list(torch.tensor(seg_lens).cumsum(0).tolist()),
+            [0, *torch.tensor(seg_lens).cumsum(0).tolist()],
             dtype=torch.int32,
             device="cuda",
         )
