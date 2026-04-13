@@ -312,10 +312,35 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
 
             stage = getattr(self, "gemm_idx_for_tuning", None)
             if stage == 1:
-                return list(range(gemm1_count))
-            if stage == 2:
-                return list(range(gemm1_count, gemm1_count + gemm2_count))
-            return list(range(total))
+                all_tactics = list(range(gemm1_count))
+            elif stage == 2:
+                all_tactics = list(range(gemm1_count, gemm1_count + gemm2_count))
+            else:
+                all_tactics = list(range(total))
+
+            # Pre-filter tactics with zero occupancy on the current device.
+            # This eliminates tactics that would fail during profiling with
+            # "GPU lacks the shared memory resources" errors — notably, SM89 (Ada)
+            # tile configs used as fallback for pure FP8 MoE on SM120 (Blackwell CC 12.0)
+            # where native SM120 FP8 MoE GEMM kernels are not yet available.
+            try:
+                get_occ = self.fused_moe_runner.get_tactic_occupancy
+            except AttributeError:
+                # get_tactic_occupancy not available in this build; skip pre-filtering
+                return all_tactics
+
+            valid_tactics = []
+            for t in all_tactics:
+                try:
+                    if get_occ(t) > 0:
+                        valid_tactics.append(t)
+                except Exception:
+                    # If the query fails unexpectedly, include the tactic and let
+                    # the autotuner handle any errors during profiling.
+                    valid_tactics.append(t)
+            # Fall back to all tactics if occupancy check eliminated everything
+            # (e.g., on an unexpected architecture where all tactics report 0)
+            return valid_tactics if valid_tactics else all_tactics
 
         def forward(
             self,
