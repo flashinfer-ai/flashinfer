@@ -52,15 +52,23 @@ SANITIZE_PARAMS = [
     (8, 16),  # 8 ranks
 ]
 
+# (world_size, num_tokens, vector_dim, top_k, dtype, payload_in_workspace)
 COMBINE_PARAMS = [
-    (2, 64, 8, 2, torch.bfloat16, True),  # Small input, 2 ranks
-    (4, 32, 32768, 4, torch.bfloat16, True),  # Large input, 4 ranks
-    (8, 16, 2048, 8, torch.bfloat16, True),  # Medium input, 8 ranks
-    (8, 16, 2048, 8, torch.bfloat16, False),  # Medium input, 8 ranks
-    (2, 64, 8, 2, torch.float16, True),  # Small input, 2 ranks
-    (4, 32, 32768, 4, torch.float16, True),  # Large input, 4 ranks
-    (8, 16, 2048, 8, torch.float16, True),  # Medium input, 8 ranks
-    (8, 16, 2048, 8, torch.float16, False),  # Medium input, 8 ranks
+    # Coverage for popular model specifications
+    (4, 16, 4096, 2, torch.bfloat16, True),  # Mixtral-8x7B
+    (4, 16, 2880, 4, torch.bfloat16, True),  # GPT-OSS-120B
+    (8, 16, 5120, 6, torch.bfloat16, True),  # DeepSeek-V2
+    (8, 16, 7168, 8, torch.bfloat16, True),  # DeepSeek-V3
+    (8, 16, 4096, 8, torch.bfloat16, True),  # Qwen3-235B-A22B
+    (8, 16, 4096, 10, torch.bfloat16, True),  # Qwen3.5-397B-A17B
+    (8, 16, 4096, 16, torch.bfloat16, True),  # Fake, no known model with top_k=16
+    (8, 16, 4096, 22, torch.bfloat16, True),  # Nemotron-3-Super-120B-A12B
+    # Coverage for num_tokens
+    (8, 1, 4096, 8, torch.bfloat16, True),
+    # Coverage for dtype
+    (8, 16, 4096, 8, torch.float16, True),
+    # Coverage for payload_in_workspace
+    (8, 16, 4096, 8, torch.bfloat16, False),
 ]
 
 
@@ -465,7 +473,7 @@ def test_moe_combine_multi_rank_single_gpu(
 ):
     torch.cuda.set_device(0)
     check_sufficient_sm_count(num_tokens, world_size)
-    max_world_size = 8
+    max_world_size = 16
     assert world_size <= max_world_size, (
         f"should run with world_size at most {max_world_size}"
     )
