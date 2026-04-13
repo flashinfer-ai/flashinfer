@@ -38,6 +38,7 @@ import torch
 from cutlass import Float32, Int32, Int64, Uint32, Uint8
 
 from ..api_logging import flashinfer_api
+from ..utils import device_support_pdl
 from .fp4_common import (
     # Constants
     FLOAT4_E2M1_MAX,
@@ -286,6 +287,7 @@ class AddRMSNormFP4QuantKernel:
         mGlobalScale: cute.Tensor,
         M: Int32,
         eps: Float32,
+        enable_pdl: cutlass.Constexpr[bool],
         stream,
     ):
         """Host function to launch the kernel.
@@ -310,7 +312,18 @@ class AddRMSNormFP4QuantKernel:
         tiler_mn = (self.rows_per_block, self.cols_per_tile)
 
         self.kernel(
-            mX, mR, mW, mY, mS, mS_unswizzled, mGlobalScale, M, eps, tv_layout, tiler_mn
+            mX,
+            mR,
+            mW,
+            mY,
+            mS,
+            mS_unswizzled,
+            mGlobalScale,
+            M,
+            eps,
+            enable_pdl,
+            tv_layout,
+            tiler_mn,
         ).launch(
             grid=[cute.ceil_div(M, self.rows_per_block), self.cluster_n, 1],
             block=[self.num_threads, 1, 1],
@@ -319,6 +332,7 @@ class AddRMSNormFP4QuantKernel:
             else None,
             smem=self._smem_size_in_bytes(),
             stream=stream,
+            use_pdl=enable_pdl,
         )
 
     @cute.kernel
@@ -333,6 +347,7 @@ class AddRMSNormFP4QuantKernel:
         mGlobalScale: cute.Tensor,
         M: Int32,
         eps: Float32,
+        enable_pdl: cutlass.Constexpr[bool],
         tv_layout: cute.Layout,
         tiler_mn: cute.Shape,
     ):
@@ -348,6 +363,9 @@ class AddRMSNormFP4QuantKernel:
         y = h * rstd * w / global_scale = rmsnorm(h, w) / global_scale
         """
         tidx, _, _ = cute.arch.thread_idx()
+
+        if enable_pdl:
+            cute.arch.griddepcontrol_wait()
         bidx, _, _ = cute.arch.block_idx()
 
         H = self.H
@@ -881,6 +899,9 @@ class AddRMSNormFP4QuantKernel:
                             st_global_u64(fp4_ptr_0, packed64_c0)
                             st_global_u64(fp4_ptr_1, packed64_c1)
 
+        if enable_pdl:
+            cute.arch.griddepcontrol_launch_dependents()
+
 
 # =============================================================================
 # PyTorch API Functions
@@ -896,6 +917,7 @@ def _get_compiled_kernel(
     scale_format: str,
     is_sf_swizzled_layout: bool,
     output_both_sf_layouts: bool = False,
+    enable_pdl: bool = False,
 ) -> Callable:
     """
     Get a compiled kernel closure that takes torch.Tensor directly.
@@ -979,6 +1001,7 @@ def _get_compiled_kernel(
         global_scale_fake,
         Int32(1),  # Dummy M
         Float32(1e-6),  # Dummy eps
+        enable_pdl,
         stream_fake,
         options="--enable-tvm-ffi",
     )
@@ -1033,6 +1056,7 @@ def add_rmsnorm_fp4quant(
     is_sf_swizzled_layout: bool = False,
     output_both_sf_layouts: bool = False,
     block_scale_unswizzled: torch.Tensor | None = None,
+    enable_pdl: bool | None = None,
 ) -> Union[
     Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 ]:
@@ -1161,6 +1185,9 @@ def add_rmsnorm_fp4quant(
     )
     sm_version = get_sm_version(input.device)
 
+    if enable_pdl is None or enable_pdl:
+        enable_pdl = device_support_pdl(input.device)
+
     # Determine scale dtype based on format
     scale_dtype = torch.uint8 if actual_scale_format == "ue8m0" else torch.float8_e4m3fn
     num_sf_blocks_per_row = hidden_size // block_size
@@ -1249,6 +1276,7 @@ def add_rmsnorm_fp4quant(
         actual_scale_format,
         is_sf_swizzled_layout,
         output_both_sf_layouts,
+        enable_pdl,
     )
     tensor_api(
         input_2d.contiguous(),

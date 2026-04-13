@@ -51,6 +51,20 @@ def get_cutlass_dtype(dtype: str) -> cutlass.dtype:
     return dtype_map[dtype]
 
 
+def torch_to_cutlass_dtype(dtype: torch.dtype) -> cutlass.dtype:
+    """Return the corresponding cutlass dtype for the given torch.dtype."""
+    dtype_map = {
+        torch.float16: cutlass.Float16,
+        torch.bfloat16: cutlass.BFloat16,
+        torch.float32: cutlass.Float32,
+        torch.float8_e5m2: cutlass.Float8E5M2,
+        torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+    }
+    if dtype not in dtype_map:
+        raise TypeError(f"{dtype} is not supported by cutlass")
+    return dtype_map[dtype]
+
+
 def cutlass_to_torch_dtype(cutlass_dtype):
     """
     Return the corresponding torch.dtype per the given DSL type

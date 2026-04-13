@@ -17,6 +17,9 @@ echo ""
 
 pip install -e . -v
 
+# TODO: Remove once CI container ships with nvshmem4py pre-installed.
+pip install nvshmem4py-cu12
+
 # vllm ar
 pytest -s tests/comm/test_vllm_custom_allreduce.py
 # trtllm ar + fusion
