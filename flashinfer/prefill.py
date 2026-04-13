@@ -1344,7 +1344,11 @@ def single_prefill_with_kv_cache(
 
     if scale_v is not None and backend != "fa3":
         # TODO(Zihao): fused into kernel
-        if out.itemsize == 1:
+        if out.dtype in (
+            torch.int8,
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        ):
             out = (out.to(float) * scale_v).to(out.dtype)
         else:
             out *= scale_v
