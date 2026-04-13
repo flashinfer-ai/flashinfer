@@ -76,6 +76,7 @@ def _get_variant_name(
     is_persistent: bool = True,
     varlen: bool = False,
     with_lse: bool = False,
+    enable_skip_softmax: bool = False,
     enable_tvm_ffi: bool = False,
 ) -> str:
     """Generate the variant name matching compile_cute_dsl_fmha.py naming convention."""
@@ -87,8 +88,9 @@ def _get_variant_name(
     persist_str = "persistent" if is_persistent else "nonpersistent"
     varlen_str = "_varlen" if varlen else ""
     lse_str = "_lse" if with_lse else ""
+    skip_str = "_skipsm" if enable_skip_softmax else ""
     ffi_str = "_tvmffi" if enable_tvm_ffi else ""
-    return f"cute_dsl_fmha_{dtype_str}_h{head_dim}_{causal_str}_{persist_str}{varlen_str}{lse_str}{ffi_str}"
+    return f"cute_dsl_fmha_{dtype_str}_h{head_dim}_{causal_str}_{persist_str}{varlen_str}{lse_str}{skip_str}{ffi_str}"
 
 
 # =============================================================================
@@ -179,6 +181,7 @@ def get_cute_dsl_fmha_kernel(
     enable_tvm_ffi: bool = False,
     varlen: bool = False,
     with_lse: bool = False,
+    enable_skip_softmax: bool = False,
 ):
     """Get a compiled DSL FMHA kernel function.
 
@@ -202,6 +205,8 @@ def get_cute_dsl_fmha_kernel(
         cute Pointer/Tensor args (same calling convention as JIT mode).
         If True, load with TVM-FFI ABI — Pointer args accept data_ptr(),
         Tensor args accept torch.Tensor directly, stream uses env stream.
+    enable_skip_softmax : bool
+        If True, load kernel compiled with skip-softmax support.
 
     Returns
     -------
@@ -216,6 +221,7 @@ def get_cute_dsl_fmha_kernel(
         is_persistent,
         varlen,
         with_lse,
+        enable_skip_softmax,
         enable_tvm_ffi,
     )
 
@@ -259,6 +265,7 @@ def cute_dsl_fmha_ragged_prefill(
     max_qo_len: Optional[int] = None,
     max_kv_len: Optional[int] = None,
     kernel_fn=None,
+    skip_softmax_threshold_scale_factor: Optional[float] = None,
 ) -> None:
     """Run DSL FMHA prefill kernel on ragged (variable-length) tensors.
 
@@ -307,12 +314,21 @@ def cute_dsl_fmha_ragged_prefill(
         Pass this from plan() to avoid D2H copy during CUDA graph capture.
     max_kv_len : int, optional
         Maximum KV sequence length. Computed from kv_indptr if not provided.
+    skip_softmax_threshold_scale_factor : float, optional
+        Threshold scale factor for skip-softmax sparsity (https://arxiv.org/abs/2512.12087).
+        The actual threshold = scale_factor / max_kv_len, then converted to log2 domain.
+        None or 0 disables skip-softmax.
     """
     total_q, H_q, D = q.shape
     total_kv, H_k, _ = k.shape
     D_v = v.shape[-1]
 
     batch_size = len(qo_indptr) - 1
+
+    use_skip_softmax = (
+        skip_softmax_threshold_scale_factor is not None
+        and skip_softmax_threshold_scale_factor > 0
+    )
 
     if kernel_fn is None:
         kernel_fn = get_cute_dsl_fmha_kernel(
@@ -324,6 +340,7 @@ def cute_dsl_fmha_ragged_prefill(
             varlen=True,
             enable_tvm_ffi=enable_tvm_ffi,
             with_lse=lse is not None,
+            enable_skip_softmax=use_skip_softmax,
         )
 
     # Compute scale factors
@@ -347,6 +364,15 @@ def cute_dsl_fmha_ragged_prefill(
     # problem_size: (B, max_s_q, s_lse, max_s_k, H_q, H_k, D, D_v)
     s_lse = total_q  # for variable length, s_lse = total tokens
     problem_size = (batch_size, max_s_q, s_lse, max_s_k, H_q, H_k, D, D_v)
+
+    # Skip-softmax threshold (convert scale_factor to log2 domain)
+    skip_threshold_log2 = None
+    if (
+        skip_softmax_threshold_scale_factor is not None
+        and skip_softmax_threshold_scale_factor > 0
+    ):
+        threshold = skip_softmax_threshold_scale_factor / max_s_k
+        skip_threshold_log2 = Float32(math.log2(threshold))
 
     # Window sizes
     ws_left = None if window_left == -1 else Int32(window_left)
@@ -375,7 +401,7 @@ def cute_dsl_fmha_ragged_prefill(
             Float32(scale_softmax_log2),
             Float32(scale_softmax),
             Float32(scale_output),
-            None,  # skip_softmax_threshold_log2
+            skip_threshold_log2,
             ws_left,
             ws_right,
             None,  # skip_softmax_count
@@ -455,7 +481,7 @@ def cute_dsl_fmha_ragged_prefill(
             Float32(scale_softmax_log2),
             Float32(scale_softmax),
             Float32(scale_output),
-            None,  # skip_softmax_threshold_log2
+            skip_threshold_log2,
             ws_left,
             ws_right,
             None,  # skip_softmax_count

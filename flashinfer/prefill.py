@@ -3742,12 +3742,6 @@ def trtllm_ragged_attention_deepseek(
                 "cute-dsl backend does not support attention_sinks (ignored)",
                 stacklevel=2,
             )
-        if skip_softmax_threshold_scale_factor is not None:
-            warnings.warn(
-                "cute-dsl backend does not support skip_softmax_threshold_scale_factor (ignored)",
-                stacklevel=2,
-            )
-
         # TODO: support device tensor scales to avoid D2H sync overhead
         assert not isinstance(bmm1_scale, torch.Tensor), (
             "cute-dsl backend does not support device tensor bmm1_scale"
@@ -3778,6 +3772,7 @@ def trtllm_ragged_attention_deepseek(
             scale_o=1.0,
             max_qo_len=max_q_len,
             max_kv_len=max_kv_len,
+            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         )
     else:
         # --- trtllm-native backend ---

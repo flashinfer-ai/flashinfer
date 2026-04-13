@@ -1582,8 +1582,6 @@ def test_trtllm_gen_prefill(
 
     head_dim_qk = mla_dimensions.qk_nope_head_dim + mla_dimensions.qk_rope_head_dim
     if backend == "cute-dsl":
-        if skips_softmax:
-            pytest.skip("cute-dsl does not support skip_softmax")
         if head_dim_qk == 192:
             pytest.skip("cute-dsl does not support bf16 with head_dim=192")
 
