@@ -3612,6 +3612,13 @@ def trtllm_ragged_attention_deepseek(
     skip_softmax_threshold_scale_factor: Optional[float] = None,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
+    sage_attn_sfs: Tuple[
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ] = (None, None, None, None),
+    num_elts_per_sage_attn_blk: Tuple[int, int, int, int] = (0, 0, 0, 0),
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Parameters
@@ -3686,7 +3693,7 @@ def trtllm_ragged_attention_deepseek(
     if out is None:
         # FP8 inputs produce bfloat16 output by default (TRT-LLM kernels
         # do not support FP8 output for ragged attention)
-        if query.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        if query.dtype in (torch.float8_e4m3fn, torch.float8_e5m2, torch.int8):
             out_dtype = torch.bfloat16
         else:
             out_dtype = query.dtype
@@ -3726,6 +3733,8 @@ def trtllm_ragged_attention_deepseek(
         assert bmm2_scale.dtype == torch.float32
 
     workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
+    sage_attn_sfs_q, sage_attn_sfs_k, sage_attn_sfs_p, sage_attn_sfs_v = sage_attn_sfs
+    num_elts_sage_q, num_elts_sage_k, num_elts_sage_p, num_elts_sage_v = num_elts_per_sage_attn_blk
     run_func(
         out,
         query,
@@ -3749,6 +3758,14 @@ def trtllm_ragged_attention_deepseek(
         attention_sinks,
         skip_softmax_threshold_scale_factor,
         lse,
+        sage_attn_sfs_q,
+        sage_attn_sfs_k,
+        sage_attn_sfs_p,
+        sage_attn_sfs_v,
+        num_elts_sage_q,
+        num_elts_sage_k,
+        num_elts_sage_p,
+        num_elts_sage_v,
     )
     if return_lse:
         assert lse is not None, (

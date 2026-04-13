@@ -225,6 +225,12 @@ struct TllmGenFmhaRunnerParams {
   // The LSE buffer.
   float* lsePtr;
 
+  // SageAttention scaling factors (null when SageAttention is not used).
+  float const* ptrSageAttnSfsQ;
+  float const* ptrSageAttnSfsK;
+  float const* ptrSageAttnSfsP;
+  float const* ptrSageAttnSfsV;
+
   // Attention sink
   float const* ptrAttentionSinks{nullptr};
   // The output buffer.
