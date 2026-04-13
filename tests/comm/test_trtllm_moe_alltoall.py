@@ -55,13 +55,14 @@ SANITIZE_PARAMS = [
 # (world_size, num_tokens, vector_dim, top_k, dtype, payload_in_workspace)
 COMBINE_PARAMS = [
     # Coverage for popular model specifications
-    (4, 16, 4096, 2, torch.bfloat16, True),     # Mixtral-8x7B
-    (4, 16, 2880, 4, torch.bfloat16, True),     # GPT-OSS-120B
-    (8, 16, 5120, 6, torch.bfloat16, True),     # DeepSeek-V2
-    (8, 16, 7168, 8, torch.bfloat16, True),     # DeepSeek-V3
-    (8, 16, 4096, 8, torch.bfloat16, True),     # Qwen3-235B-A22B
-    (8, 16, 4096, 10, torch.bfloat16, True),    # Qwen3.5-397B-A17B 
-    (8, 16, 4096, 22, torch.bfloat16, True),    # Nemotron-3-Super-120B-A12B
+    (4, 16, 4096, 2, torch.bfloat16, True),  # Mixtral-8x7B
+    (4, 16, 2880, 4, torch.bfloat16, True),  # GPT-OSS-120B
+    (8, 16, 5120, 6, torch.bfloat16, True),  # DeepSeek-V2
+    (8, 16, 7168, 8, torch.bfloat16, True),  # DeepSeek-V3
+    (8, 16, 4096, 8, torch.bfloat16, True),  # Qwen3-235B-A22B
+    (8, 16, 4096, 10, torch.bfloat16, True),  # Qwen3.5-397B-A17B
+    (8, 16, 4096, 16, torch.bfloat16, True),  # Fake, no known model with top_k=16
+    (8, 16, 4096, 22, torch.bfloat16, True),  # Nemotron-3-Super-120B-A12B
     # Coverage for num_tokens
     (8, 1, 4096, 8, torch.bfloat16, True),
     # Coverage for dtype
