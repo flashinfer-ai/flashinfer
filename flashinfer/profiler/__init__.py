@@ -62,19 +62,6 @@ def export_to_perfetto_trace(
 
     tgen = TraceGenerator(file_name)
 
-    # First pass: collect sm_id for each block_idx
-    block_to_sm = {}
-    for i in range(1, len(profiler_buffer_host)):
-        if profiler_buffer_host[i] == 0:
-            continue
-        tag, timestamp = profiler_buffer_host[i : i + 1].view(dtype=torch.uint32)
-        tag = int(tag)
-        block_idx, group_idx, event_idx, event_type, sm_id = decode_tag(
-            tag, num_blocks, num_groups
-        )
-        if block_idx not in block_to_sm:
-            block_to_sm[block_idx] = sm_id
-
     sm_pid_map = {}
     track_map: Dict[Tuple[int, int], Any] = {}
 
