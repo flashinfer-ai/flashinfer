@@ -48,10 +48,14 @@ try:
             Sm100BlockScaledPersistentDenseGemmKernel as Sm100BlockScaledPersistentDenseGemmKernel,
             create_scale_factor_tensor as create_scale_factor_tensor,
         )
+        from .kernels.dense_blockscaled_gemm_sm120 import (
+            Sm120BlockScaledDenseGemmKernel as Sm120BlockScaledDenseGemmKernel,
+        )
 
         _cute_dsl_kernels = [
             "grouped_gemm_nt_masked",
             "Sm100BlockScaledPersistentDenseGemmKernel",
+            "Sm120BlockScaledDenseGemmKernel",
             "create_scale_factor_tensor",
         ]
 except ImportError:

@@ -17,7 +17,7 @@ limitations under the License.
 import functools
 from enum import Enum
 from types import SimpleNamespace
-from typing import List, Literal, Optional, Tuple
+from typing import Any, List, Literal, Optional, Tuple
 
 from flashinfer.trtllm_low_latency_gemm import trtllm_low_latency_gemm
 import torch
@@ -3577,6 +3577,29 @@ _SM100_DEFAULT_MMA_TILER_MN = (128, 128)
 _SM100_DEFAULT_CLUSTER_SHAPE_MN = (1, 1)
 
 
+def _select_default_sm120_mma_tiler(m, n, sm_count):
+    """Select optimal SM120 tile shape based on problem size and SM count.
+
+    Uses narrower tiles (64x64, 64x128, 128x64) when the default 128x128
+    would leave SMs idle on small-M shapes.
+    """
+    coarse_tile = (128, 128)
+    coarse_tiles = ((m + coarse_tile[0] - 1) // coarse_tile[0]) * (
+        (n + coarse_tile[1] - 1) // coarse_tile[1]
+    )
+    if m <= 128 and coarse_tiles < max(1, sm_count // 2):
+        if n > 1536:
+            return (64, 128)
+        medium_tile = (128, 64)
+        medium_tiles = ((m + medium_tile[0] - 1) // medium_tile[0]) * (
+            (n + medium_tile[1] - 1) // medium_tile[1]
+        )
+        if medium_tiles < max(1, sm_count // 2):
+            return (64, 64)
+        return (128, 64)
+    return (128, 128)
+
+
 def _get_approximate_cta_nums(m, n, tile_mn, cluster_shape_mn):
     tile_m, tile_n = tile_mn
     cluster_m, cluster_n = cluster_shape_mn
@@ -4486,7 +4509,7 @@ def _cutlass_gemm_fp4_requirement(
     return True
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([100, 103, 120, 121])
 def _cute_dsl_gemm_fp4_requirement(
     a: torch.Tensor,  # unused
     b: torch.Tensor,  # unused
@@ -4530,6 +4553,7 @@ def _cute_dsl_gemm_fp4_runner(
 
     On SM100: uses the SM100 kernel only.
     On SM103: uses both SM100 kernel and the SM103-specific 3xFP4 kernel.
+    On SM120/SM121: uses the SM120 warp-level MMA kernel.
     The autotuner selects the best (kernel_type, tile, cluster, swap_ab, prefetch,
     use_tma_store) combination.
     """
@@ -4540,6 +4564,15 @@ def _cute_dsl_gemm_fp4_runner(
     )
 
     sm_version = sm_major * 10 + sm_minor
+
+    # SM120/SM121 kernel (warp-level MMA, no tcgen05)
+    Sm120Kernel = None
+    if sm_version in (120, 121):
+        from .kernels.dense_blockscaled_gemm_sm120 import (
+            Sm120BlockScaledDenseGemmKernel,
+        )
+
+        Sm120Kernel = Sm120BlockScaledDenseGemmKernel
 
     # TODO(yunzheq): Re-enable SM103 kernel once cutlass-dsl package includes
     # SM103MmaMXF4Op and compatible PersistentTileSchedulerParams.
@@ -4589,6 +4622,53 @@ def _cute_dsl_gemm_fp4_runner(
             sf_vec_size = 16 if use_nvfp4 else 32
             ab_dtype = cutlass.Float4E2M1FN
             sf_dtype = cutlass.Float8E4M3FN if use_nvfp4 else cutlass.Float8E8M0FNU
+
+            valid_tactics = []
+
+            # --- SM120/SM121 tactics ---
+            if sm_version in (120, 121) and Sm120Kernel is not None:
+                batch_size = 1
+                # SM120 kernel supports tile M,N divisible by 64.
+                # Smaller tiles (64x64, 64x128, 128x64) help when
+                # small-M shapes leave SMs idle with 128x128.
+                sm120_mma_tiler_candidates = [
+                    (64, 64),
+                    (64, 128),
+                    (128, 64),
+                    (128, 128),
+                ]
+                # SM120 kernel does not support swap_ab (SF fragment
+                # partitioning assumes non-swapped layout).
+                swap_ab = False
+                for mma_tiler_mn in sm120_mma_tiler_candidates:
+                    if not Sm120Kernel.can_implement(
+                        ab_dtype,
+                        sf_dtype,
+                        sf_vec_size,
+                        c_cutlass_dtype,
+                        mma_tiler_mn,
+                        (1, 1),
+                        m,
+                        n,
+                        real_k,
+                        batch_size,
+                        "k",
+                        "k",
+                        "n",
+                    ):
+                        continue
+                    for use_prefetch in (False, True):
+                        valid_tactics.append(
+                            (
+                                mma_tiler_mn,
+                                (1, 1),
+                                swap_ab,
+                                use_prefetch,
+                                "sm120",
+                                None,
+                            )
+                        )
+                return valid_tactics
 
             # SM100 tactics (shared enumeration with mxfp8)
             sm100_base = _get_sm100_block_scaled_tactics(
@@ -4681,14 +4761,27 @@ def _cute_dsl_gemm_fp4_runner(
             batch_size = 1
 
             if tactic is None or tactic == -1:
-                tactic = (
-                    _SM100_DEFAULT_MMA_TILER_MN,
-                    _SM100_DEFAULT_CLUSTER_SHAPE_MN,
-                    False,
-                    False,
-                    "sm100",
-                    None,
-                )
+                if sm_version in (120, 121):
+                    _sm_count = torch.cuda.get_device_properties(
+                        a.device
+                    ).multi_processor_count
+                    tactic = (
+                        _select_default_sm120_mma_tiler(m, n, _sm_count),
+                        (1, 1),
+                        False,
+                        False,
+                        "sm120",
+                        None,
+                    )
+                else:
+                    tactic = (
+                        _SM100_DEFAULT_MMA_TILER_MN,
+                        _SM100_DEFAULT_CLUSTER_SHAPE_MN,
+                        False,
+                        False,
+                        "sm100",
+                        None,
+                    )
 
             (
                 mma_tiler_mn,
@@ -4729,7 +4822,16 @@ def _cute_dsl_gemm_fp4_runner(
                 out_dtype,
             )
 
-            if kernel_type == "sm103" and Sm103Kernel is not None:
+            make_kernel: Any  # type varies by kernel_type
+            if kernel_type == "sm120" and Sm120Kernel is not None:
+                make_kernel = lambda: Sm120Kernel(
+                    sf_vec_size,
+                    mma_tiler_mn,
+                    cluster_shape_mn,
+                    use_prefetch,
+                    enable_pdl,
+                )
+            elif kernel_type == "sm103" and Sm103Kernel is not None:
                 make_kernel = lambda: Sm103Kernel(
                     sf_vec_size,
                     mma_tiler_mn,
