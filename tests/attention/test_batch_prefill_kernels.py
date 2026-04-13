@@ -1049,3 +1049,62 @@ if __name__ == "__main__":
     test_batch_prefill_with_ragged_kv_cache_custom_mask(
         1, 137, 137, 8, 8, 128, "NONE", 0.0, False
     )
+
+
+def test_single_prefill_torch_compile_cuda_graph():
+    """Issue #541: single_prefill_with_kv_cache with torch.compile(mode='reduce-overhead')
+    should not raise RuntimeError about unaccounted cudagraph pool pointers.
+
+    Runs as a subprocess because torch.library registration must happen at module
+    level for torch.compile compatibility -- registering inside a pytest function
+    causes dynamo tracing errors.
+    """
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent("""\
+        import torch
+        from flashinfer import single_prefill_with_kv_cache
+
+        torch.library.define(
+            "test541p::op", "(Tensor q, Tensor k, Tensor v) -> Tensor")
+
+        @torch.library.impl("test541p::op", "cuda")
+        def _impl(q, k, v):
+            return single_prefill_with_kv_cache(q, k, v, causal=True)
+
+        @torch.library.register_fake("test541p::op")
+        def _fake(q, k, v):
+            return torch.empty_like(q)
+
+        compiled_fn = torch.compile(
+            lambda q, k, v: torch.ops.test541p.op(q, k, v),
+            mode="reduce-overhead", fullgraph=True)
+
+        S, QH, KH, D = 128, 8, 8, 128
+        for i in range(3):
+            q = torch.randn(S, QH, D, device="cuda", dtype=torch.float16)
+            k = torch.randn(S, KH, D, device="cuda", dtype=torch.float16)
+            v = torch.randn(S, KH, D, device="cuda", dtype=torch.float16)
+            o = compiled_fn(q, k, v)
+            assert o.shape == (S, QH, D)
+        torch.cuda.synchronize()
+        print("PASS")
+    """)
+    import os
+
+    # torch.compile's inductor calls getpass.getuser() for cache dir, which fails
+    # in CI containers where the uid has no /etc/passwd entry. Setting USER avoids this.
+    env = os.environ.copy()
+    env.setdefault("USER", "ci")
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env=env,
+    )
+    assert result.returncode == 0 and "PASS" in result.stdout, (
+        f"Test failed:\nstdout: {result.stdout[-500:]}\nstderr: {result.stderr[-500:]}"
+    )

@@ -125,7 +125,7 @@ class Runner {
  public:
   explicit Runner();
 
-  explicit Runner(int32_t tileTokensDim, int32_t clusterSizeInBatchDim = 1);
+  explicit Runner(int32_t tileTokensDim);
 
   void run(void* routingLogits, void* routingBias, int32_t numTokens, int32_t numExperts,
            int32_t topK, int32_t nGroups, int32_t topkGroups, int32_t localExpertOffset,
@@ -141,7 +141,6 @@ class Runner {
 
  private:
   int32_t mTileTokensDim{8};
-  int32_t mClusterSizeInBatchDim{1};
 };
 }  // namespace Routing
 

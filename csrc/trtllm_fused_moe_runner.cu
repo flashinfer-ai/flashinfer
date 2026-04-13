@@ -47,17 +47,7 @@ inline int32_t computeLog2(int32_t val, std::string const& name = "") {
 
 Runner::Runner() {}
 
-Runner::Runner(int32_t tileTokensDim, int32_t clusterSizeInBatchDim)
-    : mTileTokensDim(tileTokensDim), mClusterSizeInBatchDim(clusterSizeInBatchDim) {
-  // clusterSizeInBatchDim must be a power of 2: mClusterSizeLog2 is used in shift
-  // operations (>>, <<) inside the mIsPow2 kernel branches, and a non-power-of-2
-  // value would make computeLog2() return -1, causing undefined behavior.
-  // mTileTokensDim does not need this check because non-power-of-2 tiles are
-  // handled by the !mIsPow2 branches which use multiplication/division instead.
-  FLASHINFER_CHECK(
-      clusterSizeInBatchDim > 0 && (clusterSizeInBatchDim & (clusterSizeInBatchDim - 1)) == 0,
-      "clusterSizeInBatchDim must be a power of 2, got %d", clusterSizeInBatchDim);
-}
+Runner::Runner(int32_t tileTokensDim) : mTileTokensDim(tileTokensDim) {}
 
 void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int32_t numExperts,
                  int32_t topK, int32_t nGroup, int32_t topkGroup, int32_t localExpertOffset,
@@ -103,8 +93,6 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mTopK = topK;
     routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
     routingData.mTileTokensDim = mTileTokensDim;
-    routingData.mClusterSizeInBatchDim = mClusterSizeInBatchDim;
-    routingData.mClusterSizeLog2 = computeLog2(mClusterSizeInBatchDim);
     routingData.mLocalExpertsStartIdx = localExpertOffset;
     routingData.mLocalExpertsStrideLog2 = 0;
     routingData.mNumLocalExperts = localNumExperts;
@@ -144,8 +132,6 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mTopK = topK;
     routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
     routingData.mTileTokensDim = mTileTokensDim;
-    routingData.mClusterSizeInBatchDim = mClusterSizeInBatchDim;
-    routingData.mClusterSizeLog2 = computeLog2(mClusterSizeInBatchDim);
     routingData.mLocalExpertsStartIdx = localExpertOffset;
     routingData.mLocalExpertsStrideLog2 = 0;
     routingData.mNumLocalExperts = localNumExperts;
@@ -184,8 +170,6 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mTopK = topK;
     routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
     routingData.mTileTokensDim = mTileTokensDim;
-    routingData.mClusterSizeInBatchDim = mClusterSizeInBatchDim;
-    routingData.mClusterSizeLog2 = computeLog2(mClusterSizeInBatchDim);
     routingData.mLocalExpertsStartIdx = localExpertOffset;
     routingData.mLocalExpertsStrideLog2 = 0;
     routingData.mNumLocalExperts = localNumExperts;
@@ -223,8 +207,6 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mTopK = topK;
     routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
     routingData.mTileTokensDim = mTileTokensDim;
-    routingData.mClusterSizeInBatchDim = mClusterSizeInBatchDim;
-    routingData.mClusterSizeLog2 = computeLog2(mClusterSizeInBatchDim);
     routingData.mLocalExpertsStartIdx = localExpertOffset;
     routingData.mLocalExpertsStrideLog2 = 0;
     routingData.mNumLocalExperts = localNumExperts;
@@ -300,8 +282,6 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mTopK = topK;
     routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
     routingData.mTileTokensDim = mTileTokensDim;
-    routingData.mClusterSizeInBatchDim = mClusterSizeInBatchDim;
-    routingData.mClusterSizeLog2 = computeLog2(mClusterSizeInBatchDim);
     routingData.mLocalExpertsStartIdx = localExpertOffset;
     routingData.mLocalExpertsStrideLog2 = 0;
     routingData.mNumLocalExperts = localNumExperts;
