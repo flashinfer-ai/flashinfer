@@ -140,7 +140,7 @@ def parse_gemm_args(line, parser):
         required=False,
         nargs="+",
         default=["cudnn"],
-        choices=["cudnn", "cublas", "trtllm", "cutlass", "tgv", "cute-dsl", "auto"],
+        choices=["cudnn", "cublas", "trtllm", "cutlass", "tgv", "cute-dsl", "b12x", "auto"],
         help="Kernel backends to test. Default: cudnn",
     )
     parser.add_argument(

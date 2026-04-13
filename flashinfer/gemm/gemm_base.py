@@ -4509,7 +4509,7 @@ def _cutlass_gemm_fp4_requirement(
     return True
 
 
-@supported_compute_capability([100, 103, 120, 121])
+@supported_compute_capability([100, 103])
 def _cute_dsl_gemm_fp4_requirement(
     a: torch.Tensor,  # unused
     b: torch.Tensor,  # unused
@@ -4532,6 +4532,32 @@ def _cute_dsl_gemm_fp4_requirement(
     # preparation for 128x4 layout.
     if use_8x4_sf_layout:
         raise ValueError("cute_dsl FP4 GEMM only supports 128x4 scale factor layout.")
+    _check_cute_dsl_availability()
+    return True
+
+
+@supported_compute_capability([120])
+def _b12x_gemm_fp4_requirement(
+    a: torch.Tensor,  # unused
+    b: torch.Tensor,  # unused
+    a_descale: torch.Tensor,  # unused
+    b_descale: torch.Tensor,  # unused
+    alpha: Optional[torch.Tensor] = None,  # unused
+    out_dtype: torch.dtype = torch.bfloat16,  # unused
+    out: Optional[torch.Tensor] = None,  # unused
+    block_size: int = 16,  # unused
+    use_8x4_sf_layout: bool = False,
+    backend: Literal[
+        "cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"
+    ] = "auto",  # unused
+    use_nvfp4: bool = True,
+    enable_pdl: bool = True,  # unused
+):
+    # b12x backend requires 128x4 scale factor layout and NVFP4 only.
+    if use_8x4_sf_layout:
+        raise ValueError("b12x FP4 GEMM only supports 128x4 scale factor layout.")
+    if not use_nvfp4:
+        raise ValueError("b12x FP4 GEMM only supports NVFP4 (sf_vec_size=16).")
     _check_cute_dsl_availability()
     return True
 
@@ -4567,7 +4593,7 @@ def _cute_dsl_gemm_fp4_runner(
 
     # SM120/SM121 kernel (warp-level MMA, no tcgen05)
     Sm120Kernel = None
-    if sm_version in (120, 121):
+    if sm_version == 120:
         from .kernels.dense_blockscaled_gemm_sm120 import (
             Sm120BlockScaledDenseGemmKernel,
         )
@@ -4626,7 +4652,7 @@ def _cute_dsl_gemm_fp4_runner(
             valid_tactics = []
 
             # --- SM120/SM121 tactics ---
-            if sm_version in (120, 121) and Sm120Kernel is not None:
+            if sm_version == 120 and Sm120Kernel is not None:
                 batch_size = 1
                 # SM120 kernel supports tile M,N divisible by 64.
                 # Smaller tiles (64x64, 64x128, 128x64) help when
@@ -4761,7 +4787,7 @@ def _cute_dsl_gemm_fp4_runner(
             batch_size = 1
 
             if tactic is None or tactic == -1:
-                if sm_version in (120, 121):
+                if sm_version == 120:
                     _sm_count = torch.cuda.get_device_properties(
                         a.device
                     ).multi_processor_count
@@ -5044,6 +5070,7 @@ _MM_MXFP8_TUNING_CONFIG = TuningConfig(
         "trtllm": _trtllm_gemm_fp4_requirement,
         "cutlass": _cutlass_gemm_fp4_requirement,
         "cute-dsl": _cute_dsl_gemm_fp4_requirement,
+        "b12x": _b12x_gemm_fp4_requirement,
     },
     common_check=_check_mm_fp4_problem_size,
     heuristic_func=_heuristic_func_mm_fp4,  # result stored in mm_fp4.suitable_auto_backends
@@ -5059,7 +5086,7 @@ def mm_fp4(
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,
-    backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "auto"] = "auto",
+    backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"] = "auto",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,
 ) -> torch.Tensor:
@@ -5168,6 +5195,9 @@ def mm_fp4(
             major, minor
         ).cutlass_fp4_gemm_runner(),
         "cute-dsl": lambda: _cute_dsl_gemm_fp4_runner(
+            major, minor, enable_pdl, out_dtype, use_nvfp4
+        ),
+        "b12x": lambda: _cute_dsl_gemm_fp4_runner(
             major, minor, enable_pdl, out_dtype, use_nvfp4
         ),
     }
