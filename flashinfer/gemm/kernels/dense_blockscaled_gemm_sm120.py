@@ -64,31 +64,6 @@ def current_cuda_stream():
     return cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
 
 
-# Workaround for nvidia-cutlass-dsl 4.4.1 bug:
-# @dsl_user_op on PersistentTileSchedulerParams.__init__ renames attributes
-# (e.g. raster_along_m -> _raster_along_m, cluster_shape_major_fdd ->
-# cluster_shape_m_fdd) but __extract_mlir_values__ (used by TVM-FFI)
-# still references the original names.
-_orig_extract = utils.PersistentTileSchedulerParams.__extract_mlir_values__
-
-# Map of source-code attr name -> runtime attr name set by @dsl_user_op
-_ATTR_RENAMES = {
-    "raster_along_m": "_raster_along_m",
-    "cluster_shape_major_fdd": "cluster_shape_m_fdd",
-    "cluster_shape_minor_fdd": "cluster_shape_n_fdd",
-}
-
-
-def _patched_extract(self):
-    for src_name, dst_name in _ATTR_RENAMES.items():
-        if not hasattr(self, src_name) and hasattr(self, dst_name):
-            setattr(self, src_name, getattr(self, dst_name))
-    return _orig_extract(self)
-
-
-utils.PersistentTileSchedulerParams.__extract_mlir_values__ = _patched_extract
-
-
 class DenseGemmKernel:
     """Implements batched matrix multiplication (C = A x SFA x B x SFB) for
     Blackwell GeForce architecture using warp-level MMA.
