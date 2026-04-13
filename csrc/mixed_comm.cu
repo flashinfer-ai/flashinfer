@@ -18,6 +18,7 @@
 #include <nvshmemx.h>
 
 #include <algorithm>
+#include <unordered_map>
 
 #include "flashinfer/comm/mixed_comm_decl.cuh"
 #include "tvm/ffi/container/map.h"
@@ -93,25 +94,20 @@ Tensor ns_malloc_tensor(Shape shape, DLDataType dtype, int device_id) {
                              DLDevice{kDLCUDA, device_id});
 }
 
-thread_local int dummy_smem_size = -1;
-
-void nvshmem_init(void* uid_ptr, int rank, int nranks) {
-  nvshmemx_init_attr_t attr = NVSHMEMX_INIT_ATTR_INITIALIZER;
-  nvshmemx_set_attr_uniqueid_args(rank, nranks, reinterpret_cast<nvshmemx_uniqueid_t*>(uid_ptr),
-                                  &attr);
-  nvshmemx_init_attr(NVSHMEMX_INIT_WITH_UNIQUEID, &attr);
-}
+thread_local std::unordered_map<int, int> dummy_smem_size_map;
 
 int get_dummy_smem_size(int device_id) {
   // Use the dummy shared memory size to avoid two CTAs running on the same SM
-  if (dummy_smem_size == -1) {
+  auto it = dummy_smem_size_map.find(device_id);
+  if (it == dummy_smem_size_map.end()) {
     cudaDeviceProp device_prop;
     cudaGetDeviceProperties(&device_prop, device_id);
     int max_smem_size = device_prop.sharedMemPerMultiprocessor;
     int resv_smem_size = device_prop.reservedSharedMemPerBlock;
-    dummy_smem_size = std::min(max_smem_size / 2, max_smem_size - resv_smem_size);
+    int dummy_smem_size = std::min(max_smem_size / 2, max_smem_size - resv_smem_size);
+    it = dummy_smem_size_map.emplace(device_id, dummy_smem_size).first;
   }
-  return dummy_smem_size;
+  return it->second;
 }
 
 #define SET_LOCAL_TP_DP(local_tp_size, local_dp_size, ...) \

@@ -23,6 +23,7 @@ import pathlib
 import socket
 import statistics
 import struct
+import tempfile
 from itertools import product
 from typing import Dict, List
 
@@ -528,10 +529,10 @@ class MixedComm:
         self.max_block_size_dict = {
             (op, mode): self.mixed_comm_module.get_max_block_size(
                 self.dtype,
-                local_tp_size,
-                local_dp_size,
-                inter_tp_size,
-                inter_dp_size,
+                self.para_info.local_tp_size,
+                self.para_info.local_dp_size,
+                self.para_info.inter_tp_size,
+                self.para_info.inter_dp_size,
                 op,
                 mode,
             )
@@ -543,10 +544,8 @@ class MixedComm:
             assert max_block_size % self.warp_size == 0
             assert max_block_size >= self.min_block_size
             for val in self.max_block_size_dict.values():
-                val = {
-                    sub_key: min(sub_val, max_block_size)
-                    for sub_key, sub_val in val.items()
-                }
+                for sub_key, sub_val in val.items():
+                    val[sub_key] = min(sub_val, max_block_size)
         max_block_size = max(
             max(val.values()) for val in self.max_block_size_dict.values()
         )
@@ -638,15 +637,15 @@ class MixedComm:
         return valid_mode_list
 
     def init_virtual_memory(self):
-        def get_socket_path(pid):
-            return f"/tmp/{pid}"
+        def get_socket_path(rank):
+            return f"{socket_folder}/rank_{rank}"
 
         def send_fd(sock, fd, rank):
             sock.sendmsg(
                 [b"\x00"],
                 [(socket.SOL_SOCKET, socket.SCM_RIGHTS, struct.pack("i", fd))],
                 0,
-                get_socket_path(local_pid_list[rank]),
+                get_socket_path(rank),
             )
 
         def recv_fd(sock):
@@ -720,15 +719,19 @@ class MixedComm:
             return {"raw": gpu_array, "void_p": ctypes.c_void_p(int(gpu_array))}
 
         # Create socket for broadcasting multicast and unicast handles
-        local_pid_list = [None for _ in range(self.para_info.local_size)]
-        torch.distributed.all_gather_object(
-            local_pid_list,
-            os.getpid(),
+        local_ranks = self.para_info.get_local_full_group_local_ranks()
+        if self.para_info.local_rank == 0:
+            socket_folder_list = [tempfile.mkdtemp(prefix="flashinfer_mixed_comm_")]
+            os.chmod(socket_folder_list[0], 0o700)
+        else:
+            socket_folder_list = [None]
+        torch.distributed.broadcast_object_list(
+            socket_folder_list,
+            src=self.para_info.inter_rank * self.para_info.local_size,
             group=self.local_comm_group,
         )
-        socket_path = get_socket_path(local_pid_list[self.para_info.local_rank])
-        if os.path.exists(socket_path):
-            os.unlink(socket_path)
+        socket_folder = socket_folder_list[0]
+        socket_path = get_socket_path(self.para_info.local_rank)
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
         sock.bind(socket_path)
         torch.distributed.barrier(group=self.local_comm_group)
@@ -764,9 +767,7 @@ class MixedComm:
         if self.para_info.local_rank == 0:
             mc_prop.numDevices = self.para_info.local_size
             self.mc_handle_dict["full"] = create_and_send_mc_handle(
-                sock,
-                mc_prop,
-                self.para_info.get_local_full_group_local_ranks(),
+                sock, mc_prop, local_ranks
             )
         else:
             self.mc_handle_dict["full"] = recv_and_create_mc_handle(sock)
@@ -775,15 +776,17 @@ class MixedComm:
             if self.para_info.local_tp_rank == 0:
                 mc_prop.numDevices = self.para_info.local_tp_size
                 self.mc_handle_dict["tp"] = create_and_send_mc_handle(
-                    sock,
-                    mc_prop,
-                    self.para_info.get_local_tp_group_local_ranks(),
+                    sock, mc_prop, self.para_info.get_local_tp_group_local_ranks()
                 )
             else:
                 self.mc_handle_dict["tp"] = recv_and_create_mc_handle(sock)
             torch.distributed.barrier(group=self.local_comm_group)
+        torch.distributed.barrier(group=self.local_comm_group)
         sock.close()
         os.unlink(socket_path)
+        torch.distributed.barrier(group=self.local_comm_group)
+        if self.para_info.local_rank == 0:
+            os.rmdir(socket_folder)
 
         # Bind and map memory
         access_desc = cuda.CUmemAccessDesc()
