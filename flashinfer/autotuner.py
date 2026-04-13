@@ -558,11 +558,15 @@ class AutoTuner:
     _instance = None
     _class_lock = threading.Lock()
 
-    def __init__(self, warmup=3, repeat=10, stream_delay_micro_secs=1000):
+    def __init__(
+        self, warmup: int = 3, repeat: int = 10, stream_delay_micro_secs: int = 1000
+    ) -> None:
         self.repeat = repeat
         self.warmup = warmup
         self.stream_delay_micro_secs = stream_delay_micro_secs
-        self.profiling_cache = {}
+        self.profiling_cache: Dict[
+            Tuple[Any, ...], Tuple[int, Any, OptimizationProfile]
+        ] = {}
         self.is_tuning_mode = False
         self._active_tuning_contexts = 0
 

@@ -160,7 +160,7 @@ class JitSpecStatus:
 class JitSpecRegistry:
     """Global registry to track all JitSpecs"""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._specs: Dict[str, JitSpec] = {}
         self._creation_times: Dict[str, datetime] = {}
 

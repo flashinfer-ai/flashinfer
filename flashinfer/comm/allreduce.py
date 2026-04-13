@@ -480,6 +480,7 @@ def allreduce_fusion(
     expanded_idx_to_permuted_idx: Optional[torch.Tensor] = None,
     expert_scale_factor: Optional[torch.Tensor] = None,
     shared_expert_output: Optional[torch.Tensor] = None,
+    routed_scaling_factor: Optional[float] = None,
 ) -> torch.Tensor:
     """
     AllReduce + RMSNorm fusion operation.
@@ -548,6 +549,7 @@ def allreduce_fusion(
             output row. Shape [token_num, top_k], dtype int32.
         expert_scale_factor: Router weights for each selected expert [token_num, top_k]
         shared_expert_output: Optional shared expert output to add [token_num, hidden_dim]
+        routed_scaling_factor: Optional scaling factor forwarded to MoE finalize fusion
 
     Returns:
         Output tensor (typically norm_out for fusion cases, output otherwise)
@@ -717,6 +719,8 @@ def allreduce_fusion(
                 expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
                 norm_out=norm_out,
                 residual_out=residual_out,
+                quant_out=quant_out,
+                scale_out=scale_out,
                 workspace_ptrs=workspace.workspace_tensor,
                 launch_with_pdl=launch_with_pdl,
                 world_rank=workspace.rank,
@@ -724,6 +728,7 @@ def allreduce_fusion(
                 eps=rms_eps,
                 shared_expert_output=shared_expert_output,
                 expert_scale_factor=expert_scale_factor,
+                routed_scaling_factor=routed_scaling_factor,
             )
 
             return norm_out
