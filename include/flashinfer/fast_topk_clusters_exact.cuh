@@ -1,12 +1,17 @@
-
+#ifndef FLASHINFER_TOPK_CLUSTERS_CUH_
+#define FLASHINFER_TOPK_CLUSTERS_CUH_
 #include <cooperative_groups.h>
 #include <cuda_fp16.h>
 
 #include <cassert>
-#include <flashinfer/vec_dtypes.cuh>
+
+#include "topk_common.cuh"
+#include "vec_dtypes.cuh"
+
+namespace flashinfer {
+namespace sampling {
 
 namespace cg = cooperative_groups;
-using namespace flashinfer;
 
 __device__ __forceinline__ uint32_t getLaneId() {
   uint32_t laneId;
@@ -24,15 +29,6 @@ __device__ __forceinline__ uint32_t InclusiveWarpDownScan(uint32_t val) {
   }
 
   return val;
-}
-
-template <auto* kernel_func, size_t smem_bytes>
-void setup_kernel_smem_once() {
-  static const cudaError_t result = []() -> cudaError_t {
-    auto func_ptr = kernel_func;
-
-    return cudaFuncSetAttribute(func_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
-  }();
 }
 
 __device__ __forceinline__ int cum_sum(int* s_hist_buf, int* reduce_buf) {
@@ -67,58 +63,6 @@ struct PackedCachedData {
   int index;
 };
 
-template <typename T>
-struct OrderedBits;
-
-template <>
-struct OrderedBits<float> {
-  using DType = float;
-  using OrderedDType = uint32_t;
-  using self_t = OrderedBits<float>;
-
-  static __device__ self_t::OrderedDType to_ordered_bits(self_t::DType x) {
-    uint32_t bits = __float_as_uint(x);
-    return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
-  }
-
-  static __device__ self_t::DType from_ordered_bits(self_t::OrderedDType bits) {
-    auto float_bits = (bits & 0x80000000u) ? bits ^ 0x80000000u : ~bits;
-    return __uint_as_float(float_bits);
-  }
-};
-
-template <>
-struct OrderedBits<half> {
-  using DType = half;
-  using OrderedDType = uint16_t;
-  using self_t = OrderedBits<half>;
-
-  static __device__ self_t::OrderedDType to_ordered_bits(self_t::DType x) {
-    uint16_t bits = __half_as_ushort(x);
-    uint16_t key =
-        (bits & 0x8000) ? static_cast<uint16_t>(~bits) : static_cast<uint16_t>(bits | 0x8000);
-
-    return key;
-  }
-
-  static __device__ self_t::DType from_ordered_bits(self_t::OrderedDType bits) {
-    auto half_bits = (bits & 0x8000) ? bits ^ 0x8000 : ~bits;
-    return __ushort_as_half(half_bits);
-  }
-};
-
-template <>
-struct OrderedBits<nv_bfloat16> {
-  using DType = nv_bfloat16;
-  using OrderedDType = uint16_t;
-  using self_t = OrderedBits<nv_bfloat16>;
-
-  static __device__ self_t::OrderedDType to_ordered_bits(self_t::DType x) {
-    uint16_t bits = __bfloat16_as_ushort(x);
-    return (bits & 0x8000) ? static_cast<uint16_t>(~bits) : static_cast<uint16_t>(bits | 0x8000);
-  }
-};
-
 struct TopkResults {
   int local_topk_num;
   int local_topk_start;
@@ -139,7 +83,7 @@ __device__ __forceinline__ TopkResults fast_topk_cuda_v4(
     const int overflow_stride, const int seq_len, const int num_cached, const int TopK) {
   static_assert(sizeof(T) == 4 || sizeof(T) == 2, "the size of T must be 4 or 2 bytes");
 
-  using Ord = OrderedBits<T>;
+  using Ord = RadixTopKTraits<T>;
   constexpr int NRemainingRounds =
       sizeof(T) - 1;  // each round takes a byte, first round is already done
   constexpr int LShiftStart = sizeof(T) * 8 - 8;  // 24 for float, 8 for half
@@ -234,7 +178,7 @@ __device__ __forceinline__ TopkResults fast_topk_cuda_v4(
     for (int i = threadIdx.x + block_id * 1024; i < seq_len; i += 1024 * NClusters) {
       T res = logits[i];
 
-      auto bin = Ord::to_ordered_bits(res) >> LShiftStart;
+      auto bin = Ord::ToOrdered(res) >> LShiftStart;
       atomicAdd(shared_hist + bin, 1);
     }
   }
@@ -247,7 +191,7 @@ __device__ __forceinline__ TopkResults fast_topk_cuda_v4(
     const int threshold_bin = get_threshold_bin(0, top_k_remaining, pre_hist == nullptr);
 
     auto compute_phase1 = [&](T logit, int i) {
-      auto bits = Ord::to_ordered_bits(logit);
+      auto bits = Ord::ToOrdered(logit);
       int bin = (bits >> LShiftStart);
 
       if (bin > threshold_bin) {
@@ -739,3 +683,8 @@ void launch_fast_topk_clusters_exact_ragged_transform(
   launch_topk_cluster_kernel(kernel, args, batch_size * num_clusters, extern_shared_mem,
                              num_clusters, pdl_enabled, stream);
 }
+
+}  // namespace sampling
+}  // namespace flashinfer
+
+#endif  // FLASHINFER_TOPK_CLUSTERS_CUH_

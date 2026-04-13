@@ -19,6 +19,7 @@
 #include "tvm_ffi_utils.h"
 
 using tvm::ffi::Optional;
+using namespace flashinfer::sampling;
 
 void fast_topk_clusters_exact(TensorView logits, TensorView indices,
                               Optional<TensorView> output_values, Optional<TensorView> histogram,
