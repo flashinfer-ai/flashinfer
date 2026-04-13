@@ -137,7 +137,7 @@ class ArtifactPath:
 
     TRTLLM_GEN_FMHA: str = "55bba55929d4093682e32d817bd11ffb0441c749/fmha/trtllm-gen/"
     TRTLLM_GEN_BMM: str = (
-        "a89ab863fb0fa43bbc46ea632b19145085df86e0/batched_gemm-4fc8a68-46c3905"
+        "a89ab863fb0fa43bbc46ea632b19145085df86e0/batched_gemm-4fc8a68-46c3905/"
     )
     TRTLLM_GEN_GEMM: str = (
         "31e75d429ff3f710de1251afdd148185f53da44d/gemm-4daf11e-1fddea2/"
