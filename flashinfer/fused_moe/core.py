@@ -2636,9 +2636,9 @@ def trtllm_fp8_block_scale_moe(
             - 7: Identity
         routing_replay_out (Optional[torch.Tensor]): Optional int16 output tensor of shape
             (num_tokens_or_larger, top_k) to capture selected expert IDs during routing.
-            Column order is unspecified. When None (default), zero overhead — the kernel
-            skips the write entirely. Buffer may be larger than num_tokens for CUDA graph
-            pre-allocation; only rows [0, num_tokens) are written.
+            Column order matches topk_indices. When None (default), zero overhead - the
+            kernel skips the write entirely. Buffer may be larger than num_tokens for CUDA
+            graph pre-allocation; only rows [0, num_tokens) are written.
     Returns:
         when do_finalize=True, returns the final MoE output.
         otherwise, returns the intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
