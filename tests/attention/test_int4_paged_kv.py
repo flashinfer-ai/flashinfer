@@ -149,8 +149,12 @@ def test_append_paged_kv_cache_int4_matches_quantized_layout(
         torch.testing.assert_close(
             v_cache.scale[page_indices, :, page_positions, :], expected_v.scale
         )
-        gathered_k = flashinfer.int4_dequantize(k_cache)[page_indices, :, page_positions]
-        gathered_v = flashinfer.int4_dequantize(v_cache)[page_indices, :, page_positions]
+        gathered_k = flashinfer.int4_dequantize(k_cache)[
+            page_indices, :, page_positions
+        ]
+        gathered_v = flashinfer.int4_dequantize(v_cache)[
+            page_indices, :, page_positions
+        ]
 
     torch.testing.assert_close(
         gathered_k,
@@ -177,11 +181,19 @@ def test_single_decode_with_kv_cache_int4(kv_layout, head_dim, use_tensor_cores)
 
     q = torch.randn(num_qo_heads, head_dim, dtype=torch.float16, device=device)
     if kv_layout == "NHD":
-        k = torch.randn(kv_len, num_kv_heads, head_dim, dtype=torch.float16, device=device)
-        v = torch.randn(kv_len, num_kv_heads, head_dim, dtype=torch.float16, device=device)
+        k = torch.randn(
+            kv_len, num_kv_heads, head_dim, dtype=torch.float16, device=device
+        )
+        v = torch.randn(
+            kv_len, num_kv_heads, head_dim, dtype=torch.float16, device=device
+        )
     else:
-        k = torch.randn(num_kv_heads, kv_len, head_dim, dtype=torch.float16, device=device)
-        v = torch.randn(num_kv_heads, kv_len, head_dim, dtype=torch.float16, device=device)
+        k = torch.randn(
+            num_kv_heads, kv_len, head_dim, dtype=torch.float16, device=device
+        )
+        v = torch.randn(
+            num_kv_heads, kv_len, head_dim, dtype=torch.float16, device=device
+        )
 
     k_int4 = flashinfer.int4_quantize(k)
     v_int4 = flashinfer.int4_quantize(v)
@@ -232,11 +244,19 @@ def test_single_prefill_with_kv_cache_int4(kv_layout, head_dim):
 
     q = torch.randn(qo_len, num_qo_heads, head_dim, dtype=torch.float16, device=device)
     if kv_layout == "NHD":
-        k = torch.randn(kv_len, num_kv_heads, head_dim, dtype=torch.float16, device=device)
-        v = torch.randn(kv_len, num_kv_heads, head_dim, dtype=torch.float16, device=device)
+        k = torch.randn(
+            kv_len, num_kv_heads, head_dim, dtype=torch.float16, device=device
+        )
+        v = torch.randn(
+            kv_len, num_kv_heads, head_dim, dtype=torch.float16, device=device
+        )
     else:
-        k = torch.randn(num_kv_heads, kv_len, head_dim, dtype=torch.float16, device=device)
-        v = torch.randn(num_kv_heads, kv_len, head_dim, dtype=torch.float16, device=device)
+        k = torch.randn(
+            num_kv_heads, kv_len, head_dim, dtype=torch.float16, device=device
+        )
+        v = torch.randn(
+            num_kv_heads, kv_len, head_dim, dtype=torch.float16, device=device
+        )
 
     k_int4 = flashinfer.int4_quantize(k)
     v_int4 = flashinfer.int4_quantize(v)
@@ -666,9 +686,8 @@ def test_int4_paged_kv_cache_cuda_graph_unsupported():
     head_dim = 128
     device = "cuda:0"
 
-    kv_indptr = (
-        torch.arange(0, batch_size + 1, device=device, dtype=torch.int32)
-        * ((kv_len + page_size - 1) // page_size)
+    kv_indptr = torch.arange(0, batch_size + 1, device=device, dtype=torch.int32) * (
+        (kv_len + page_size - 1) // page_size
     )
     kv_indices = torch.arange(kv_indptr[-1].item(), device=device, dtype=torch.int32)
     kv_last_page_len = torch.full(

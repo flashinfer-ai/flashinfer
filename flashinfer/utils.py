@@ -869,7 +869,7 @@ def is_int4_paged_kv_cache(
         INT4Tensor,
         Tuple[torch.Tensor, torch.Tensor],
         Tuple[INT4Tensor, INT4Tensor],
-    ]
+    ],
 ) -> bool:
     if isinstance(paged_kv_cache, INT4Tensor):
         return True

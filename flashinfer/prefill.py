@@ -18,7 +18,7 @@ import functools
 import logging
 import math
 from types import SimpleNamespace
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union, cast, overload
 
 import torch
 
@@ -1285,19 +1285,26 @@ def single_prefill_with_kv_cache(
     if return_lse:
         lse = torch.empty((q.size(0), q.size(1)), dtype=torch.float32, device=q.device)
 
+    k_tensor = cast(torch.Tensor, k)
+    v_tensor = cast(torch.Tensor, v)
+
     if is_float8(q):
         # FP8 quant enabled, do sanity check:
         #   1. unsupported feature
         #   2. dtype check
         assert window_left == -1
-        assert q.dtype == k.dtype == v.dtype
-        assert q.shape[-1] == k.shape[-1] == v.shape[-1]
+        assert q.dtype == k_tensor.dtype == v_tensor.dtype
+        assert q.shape[-1] == k_tensor.shape[-1] == v_tensor.shape[-1]
         if scale_q is None:
             scale_q = torch.ones(q.shape[1], dtype=torch.float32, device=q.device)
         if scale_k is None:
-            scale_k = torch.ones(k.shape[1], dtype=torch.float32, device=q.device)
+            scale_k = torch.ones(
+                k_tensor.shape[1], dtype=torch.float32, device=q.device
+            )
         if scale_v is None:
-            scale_v = torch.ones(v.shape[1], dtype=torch.float32, device=q.device)
+            scale_v = torch.ones(
+                v_tensor.shape[1], dtype=torch.float32, device=q.device
+            )
     else:
         if scale_q is not None:
             sm_scale *= scale_q
@@ -1318,21 +1325,23 @@ def single_prefill_with_kv_cache(
             use_fp16_qk_reduction,
             packed_custom_mask is not None,  # use_custom_mask
             q.dtype,
-            k.dtype,
+            k_tensor.dtype,
         )
 
     # o_dtype should be provided for FP8 attention
     if o_dtype is None:
         o_dtype = q.dtype
-    out = torch.empty(q.shape[:-1] + v.shape[-1:], dtype=o_dtype, device=q.device)
+    out = torch.empty(
+        q.shape[:-1] + v_tensor.shape[-1:], dtype=o_dtype, device=q.device
+    )
 
     module = get_single_prefill_module(
         backend,
         q.dtype,
-        k.dtype,
+        k_tensor.dtype,
         out.dtype,
         q.shape[-1],  # head_dim_qk
-        v.shape[-1],  # head_dim_vo
+        v_tensor.shape[-1],  # head_dim_vo
         PosEncodingMode[pos_encoding_mode].value,
         window_left >= 0,  # use_sliding_window
         logits_soft_cap > 0,  # use_logits_soft_cap
@@ -1341,8 +1350,8 @@ def single_prefill_with_kv_cache(
 
     module.run(
         q,
-        k,
-        v,
+        k_tensor,
+        v_tensor,
         tmp,
         out,
         lse,
