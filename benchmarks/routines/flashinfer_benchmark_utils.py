@@ -324,7 +324,6 @@ routine_cc_to_supported_backends = {
         "9.0": ["fa2", "fa3", "cudnn", "cudnn-native"],
         "10.0": [
             "fa2",
-            "fa3",
             "cudnn",
             "cudnn-native",
             "cutlass",
@@ -333,7 +332,6 @@ routine_cc_to_supported_backends = {
         ],
         "10.3": [
             "fa2",
-            "fa3",
             "cudnn",
             "cudnn-native",
             "cutlass",

@@ -2637,7 +2637,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             will be used in attention computation.
 
         backend : str
-            The implementation backend, could be ``auto``/``fa2``/``fa3``/``cudnn``/``cutlass``.
+            The implementation backend, could be ``auto``/``fa2``/``fa3``/``cudnn`` or ``cutlass``.
             Defaults to ``auto``.
             If set to ``auto``, the wrapper will automatically choose the backend based on the
             device architecture and kernel availability.
@@ -2890,8 +2890,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
         if o_data_type is None:
-            # when input dtype is fp8, we need to use bf16 output
-            o_data_type = torch.bfloat16 if q_data_type.itemsize == 1 else q_data_type
+            o_data_type = q_data_type
         o_data_type = canonicalize_torch_dtype(o_data_type)
         if head_dim_vo is None:
             head_dim_vo = head_dim_qk
@@ -3220,18 +3219,18 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
                 )
         if out is None:
-            out_dtype = getattr(self, "_cached_o_data_type", None) or q.dtype
+            # when input dtype is fp8, we need to use bf16 output
+            out_dtype = torch.bfloat16 if q.dtype.itemsize == 1 else q.dtype
             out = torch.empty(
                 q.shape[:-1] + v.shape[-1:],
                 dtype=out_dtype,
                 device=q.device,
             )
         else:
-            out_dtype = getattr(self, "_cached_o_data_type", None) or q.dtype
             check_shape_dtype_device(
                 out,
                 q.shape[:-1] + v.shape[-1:],
-                out_dtype,
+                self._cached_o_data_type,
                 q.device,
                 "out",
             )
@@ -3588,9 +3587,6 @@ def get_trtllm_gen_fmha_module():
     op = mod.build_and_load()
     setup_cubin_loader(mod.get_library_path())
     return op
-
-
-# fmha kernel: is_scale_tensor. 可以这样支持。
 
 
 @flashinfer_api

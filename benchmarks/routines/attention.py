@@ -1779,7 +1779,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                     workspace_buffer,
                     "NHD",
                     use_cuda_graph=is_cuda_graph_compatible
-                    if backend not in ["fa2"]
+                    if backend != "fa2"
                     else False,
                     qo_indptr_buf=qo_indptr,
                     kv_indptr_buf=kv_indptr,
@@ -1984,7 +1984,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             repeat_iters=args.num_iters,
             sleep_after_run=True,
             enable_cupti=args.use_cupti,
-            use_cuda_graph=(is_cuda_graph_compatible and cur_backend not in ["fa2"]),
+            use_cuda_graph=(is_cuda_graph_compatible and cur_backend != "fa2"),
             cold_l2_cache=True,
             input_args=(
                 cur_backend,
