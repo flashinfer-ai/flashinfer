@@ -23,14 +23,12 @@ from flashinfer.cute_dsl.utils import is_cute_dsl_available
 if is_cute_dsl_available():
     from .fmha import (
         get_cute_dsl_fmha_kernel,
-        cute_dsl_fmha_prefill,
         cute_dsl_fmha_ragged_prefill,
     )
 
     __all__ = [
         "is_cute_dsl_available",
         "get_cute_dsl_fmha_kernel",
-        "cute_dsl_fmha_prefill",
         "cute_dsl_fmha_ragged_prefill",
     ]
 else:

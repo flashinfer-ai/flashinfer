@@ -1301,60 +1301,6 @@ def single_prefill_with_kv_cache(
         o_dtype = q.dtype
     out = torch.empty(q.shape[:-1] + v.shape[-1:], dtype=o_dtype, device=q.device)
 
-    if backend == "cute-dsl":
-        from .utils import get_compute_capability
-
-        cc = get_compute_capability(q.device)
-        if cc[0] != 10:
-            raise RuntimeError(
-                f"cute-dsl backend (FMHA prefill kernel) requires SM10x (Blackwell), got SM{cc[0]}{cc[1]}"
-            )
-        if kv_layout != "NHD":
-            raise ValueError("cute-dsl backend only supports NHD layout")
-        if pos_encoding_mode != "NONE":
-            raise ValueError(
-                f"cute-dsl backend does not support pos_encoding_mode={pos_encoding_mode}"
-            )
-        if packed_custom_mask is not None:
-            raise ValueError("cute-dsl backend does not support custom_mask")
-        if logits_soft_cap > 0:
-            raise ValueError("cute-dsl backend does not support logits_soft_cap")
-        if use_fp16_qk_reduction:
-            raise ValueError("cute-dsl backend does not support use_fp16_qk_reduction")
-        if is_float8(q):
-            for s, name in (
-                (scale_q, "scale_q"),
-                (scale_k, "scale_k"),
-                (scale_v, "scale_v"),
-            ):
-                if isinstance(s, torch.Tensor) and s.numel() > 1:
-                    raise ValueError(
-                        f"cute-dsl backend does not support per-head scale tensors ({name}), "
-                        "only per-tensor scalar scales are supported"
-                    )
-        # Extract scalar scale values for DSL kernel
-        _, sq = _split_scale_param(scale_q)
-        _, sk = _split_scale_param(scale_k)
-        _, sv = _split_scale_param(scale_v)
-
-        from .attention_dsl.cute_dsl.fmha import cute_dsl_fmha_prefill
-
-        # DSL FMHA kernel expects (B, S, H, D) layout; single_prefill has (S, H, D)
-        cute_dsl_fmha_prefill(
-            q.unsqueeze(0),
-            k.unsqueeze(0),
-            v.unsqueeze(0),
-            out.unsqueeze(0),
-            is_causal=causal,
-            sm_scale=sm_scale,
-            window_left=window_left,
-            lse=lse.unsqueeze(0) if lse is not None else None,
-            scale_q=sq,
-            scale_k=sk,
-            scale_v=sv,
-        )
-        return (out, lse) if return_lse else out
-
     module = get_single_prefill_module(
         backend,
         q.dtype,
@@ -2691,7 +2637,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             will be used in attention computation.
 
         backend : str
-            The implementation backend, could be ``auto``/``fa2``/``fa3``/``cudnn``/``cutlass`` or ``cute-dsl``.
+            The implementation backend, could be ``auto``/``fa2``/``fa3``/``cudnn``/``cutlass``.
             Defaults to ``auto``.
             If set to ``auto``, the wrapper will automatically choose the backend based on the
             device architecture and kernel availability.
@@ -3069,41 +3015,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 logits_soft_cap > 0,  # use_logits_soft_cap
                 use_fp16_qk_reduction,
             )
-            if self._backend == "cute-dsl":
-                from .utils import get_compute_capability
-
-                cc = get_compute_capability(self.device)
-                if cc[0] != 10:
-                    raise RuntimeError(
-                        f"cute-dsl backend (FMHA prefill kernel) requires SM10x (Blackwell), got SM{cc[0]}{cc[1]}"
-                    )
-                if pos_encoding_mode != "NONE":
-                    raise ValueError(
-                        f"cute-dsl backend does not support pos_encoding_mode={pos_encoding_mode}"
-                    )
-                if packed_custom_mask is not None:
-                    raise ValueError("cute-dsl backend does not support custom_mask")
-                if logits_soft_cap > 0:
-                    raise ValueError(
-                        "cute-dsl backend does not support logits_soft_cap"
-                    )
-                if use_fp16_qk_reduction:
-                    raise ValueError(
-                        "cute-dsl backend does not support use_fp16_qk_reduction"
-                    )
-                # Preload kernel .so (fail fast if missing, reused in run)
-                from .attention_dsl.cute_dsl.fmha import get_cute_dsl_fmha_kernel
-
-                self._cached_module = get_cute_dsl_fmha_kernel(
-                    q_data_type,
-                    o_data_type,
-                    head_dim_qk,
-                    causal,
-                    is_persistent=not causal,
-                    varlen=True,
-                    enable_tvm_ffi=True,
-                )
-            elif self._backend == "cutlass":
+            if self._backend == "cutlass":
                 # insert qo_indptr.device to 9th position (0-indexed) of get_module_args
                 new_get_module_args = (
                     get_module_args[:9] + (qo_indptr.device,) + get_module_args[9:]
@@ -3114,15 +3026,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     self._backend, *get_module_args
                 )
 
-        if self._backend == "cute-dsl":
-            # Compute max seq lengths here (plan runs outside graph capture)
-            self._max_qo_len = int(
-                (qo_indptr_host[1:] - qo_indptr_host[:-1]).max().item()
-            )
-            self._max_kv_len = int(
-                (kv_indptr_host[1:] - kv_indptr_host[:-1]).max().item()
-            )
-        elif self._backend == "cutlass":
+        if self._backend == "cutlass":
             self._plan_info = fmha_varlen_plan(
                 self._cached_module, qo_indptr, kv_indptr, num_qo_heads, causal
             )
@@ -3331,30 +3235,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 q.device,
                 "out",
             )
-        if self._backend == "cute-dsl":
-            from .attention_dsl.cute_dsl.fmha import cute_dsl_fmha_ragged_prefill
-
-            cute_dsl_fmha_ragged_prefill(
-                q,
-                k,
-                v,
-                out,
-                qo_indptr=self._qo_indptr_buf,
-                kv_indptr=self._kv_indptr_buf,
-                is_causal=self._causal,
-                sm_scale=sm_scale,
-                window_left=window_left,
-                lse=lse,
-                scale_q=q_scale if q_scale is not None else 1.0,
-                scale_k=k_scale if k_scale is not None else 1.0,
-                scale_v=v_scale if v_scale is not None else 1.0,
-                scale_o=o_scale if o_scale is not None else 1.0,
-                max_qo_len=self._max_qo_len,
-                max_kv_len=self._max_kv_len,
-                kernel_fn=self._cached_module,
-            )
-            return (out, lse) if return_lse else out
-        elif self._backend == "cutlass":
+        if self._backend == "cutlass":
             out, lse = fmha_varlen(
                 q,
                 k,
