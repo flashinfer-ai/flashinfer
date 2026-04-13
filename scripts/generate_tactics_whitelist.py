@@ -31,6 +31,7 @@ from flashinfer.autotuner import AutoTuner, autotune
 from flashinfer.fused_moe import (
     Fp8QuantizationType,
     WeightLayout,
+    cutlass_fused_moe,
     trtllm_fp4_block_scale_moe,
     trtllm_fp8_block_scale_moe,
 )
@@ -229,9 +230,156 @@ def _probe_fp8_block(
         print(f"    WARNING: FP8 probe raised: {e}")
 
 
+def _run_cutlass_probe(
+    label, device, num_tokens, num_experts, hidden_size, top_k,
+    input_tensor, fc1, fc2, quant_scales, enable_pdl, input_sf=None,
+):
+    """Run a single CUTLASS-path probe with autotune."""
+    token_selected_experts = torch.randint(
+        0, num_experts, (num_tokens, top_k), dtype=torch.int32, device=device
+    )
+    token_final_scales = torch.ones(
+        num_tokens, top_k, dtype=torch.float32, device=device
+    )
+    output = torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+
+    print(f"  Probing {label} via CUTLASS path ...")
+    try:
+        with autotune(tune_mode=True):
+            cutlass_fused_moe(
+                input=input_tensor,
+                token_selected_experts=token_selected_experts,
+                token_final_scales=token_final_scales,
+                fc1_expert_weights=fc1,
+                fc2_expert_weights=fc2,
+                output_dtype=torch.bfloat16,
+                quant_scales=quant_scales,
+                input_sf=input_sf,
+                output=output,
+                enable_pdl=enable_pdl,
+                activation_type=ActivationType.Swiglu,
+                tune_max_num_tokens=num_tokens,
+            )
+    except Exception as e:
+        print(f"    NOTE: Post-profiling execution raised (expected): {e}")
+
+
+def _probe_fp4_cutlass(
+    device, num_tokens, num_experts, hidden_size, intermediate_size, top_k
+):
+    """Probe NvFP4 MoE via the CUTLASS path (trtllm::fused_moe::gemm1/gemm2).
+
+    Matches vLLM with moe_backend=flashinfer_cutlass + quantization=fp4.
+    Tensor formats (weights as torch.long, scales as torch.int32) follow
+    vLLM flashinfer_cutlass_moe.py.
+    """
+    enable_pdl = device_support_pdl(device)
+
+    amax = torch.tensor([448.0 * 6.0], device=device)
+    input_q, input_sf = fp4_quantize(
+        torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16),
+        amax, sf_vec_size=16, sf_use_ue8m0=False, is_sf_swizzled_layout=True,
+    )
+    input_sf = input_sf.view(torch.float8_e4m3fn).reshape(num_tokens, -1)
+
+    fc1_weights, fc1_scales = fp4_quantize(
+        torch.randn(num_experts, intermediate_size * 2, hidden_size,
+                     device=device, dtype=torch.bfloat16),
+        amax, sf_vec_size=16, sf_use_ue8m0=False,
+    )
+    fc2_weights, fc2_scales = fp4_quantize(
+        torch.randn(num_experts, hidden_size, intermediate_size,
+                     device=device, dtype=torch.bfloat16),
+        amax, sf_vec_size=16, sf_use_ue8m0=False,
+    )
+    fc1_scales = fc1_scales.view(torch.int32)
+    fc1_weights = fc1_weights.view(torch.long)
+    fc2_scales = fc2_scales.view(torch.int32)
+    fc2_weights = fc2_weights.view(torch.long)
+
+    global_scale = 1.0 / (448.0 * 6.0)
+    quant_scales = [
+        torch.tensor([global_scale], device=device, dtype=torch.float32),
+        fc1_scales,
+        torch.tensor([global_scale * global_scale], device=device, dtype=torch.float32),
+        torch.tensor([global_scale], device=device, dtype=torch.float32),
+        fc2_scales,
+        torch.tensor([global_scale * global_scale], device=device, dtype=torch.float32),
+    ]
+
+    _run_cutlass_probe(
+        "NvFP4xNvFP4", device, num_tokens, num_experts, hidden_size, top_k,
+        input_q, fc1_weights, fc2_weights, quant_scales, enable_pdl,
+        input_sf=input_sf,
+    )
+
+
+def _probe_fp8_per_tensor_cutlass(
+    device, num_tokens, num_experts, hidden_size, intermediate_size, top_k
+):
+    """Probe FP8 per-tensor MoE via the CUTLASS path."""
+    enable_pdl = device_support_pdl(device)
+
+    input_fp8, inv_input_scale = _fp8_quantize(
+        torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16)
+    )
+    fc1_fp8, inv_fc1_scale = _fp8_quantize(
+        torch.randn(num_experts, intermediate_size * 2, hidden_size,
+                     device=device, dtype=torch.bfloat16)
+    )
+    fc2_fp8, inv_fc2_scale = _fp8_quantize(
+        torch.randn(num_experts, hidden_size, intermediate_size,
+                     device=device, dtype=torch.bfloat16)
+    )
+
+    quant_scales = [
+        torch.tensor(inv_fc1_scale * inv_input_scale, device=device),
+        torch.tensor(1.0, device=device),
+        torch.tensor(inv_fc2_scale, device=device),
+        torch.tensor(inv_input_scale, device=device),
+    ]
+
+    _run_cutlass_probe(
+        "Fp8-PerTensor", device, num_tokens, num_experts, hidden_size, top_k,
+        input_fp8, fc1_fp8, fc2_fp8, quant_scales, enable_pdl,
+    )
+
+
+def _probe_bf16_cutlass(
+    device, num_tokens, num_experts, hidden_size, intermediate_size, top_k
+):
+    """Probe unquantized BF16 MoE via the CUTLASS path.
+
+    Covers drafter/MTP models that use the FlashInfer CUTLASS Unquantized
+    MoE backend at runtime.
+    """
+    enable_pdl = device_support_pdl(device)
+
+    input_bf16 = torch.randn(
+        num_tokens, hidden_size, device=device, dtype=torch.bfloat16
+    )
+    fc1 = torch.randn(
+        num_experts, intermediate_size * 2, hidden_size,
+        device=device, dtype=torch.bfloat16,
+    )
+    fc2 = torch.randn(
+        num_experts, hidden_size, intermediate_size,
+        device=device, dtype=torch.bfloat16,
+    )
+
+    _run_cutlass_probe(
+        "BF16", device, num_tokens, num_experts, hidden_size, top_k,
+        input_bf16, fc1, fc2, [], enable_pdl,
+    )
+
+
 PROBE_FUNCTIONS = {
     "NvFP4xNvFP4": _probe_fp4,
     "Fp8-Block": _probe_fp8_block,
+    # CUTLASS-path probes (for vLLM flashinfer_cutlass backend)
+    "NvFP4-CUTLASS": _probe_fp4_cutlass,
+    "Fp8-PerTensor-CUTLASS": _probe_fp8_per_tensor_cutlass,
+    "BF16-CUTLASS": _probe_bf16_cutlass,
 }
 
 
