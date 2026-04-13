@@ -295,7 +295,7 @@ template void invokeRowWiseAmax<__nv_fp8_e4m3>(uint32_t m, uint32_t n, __nv_fp8_
                                                cudaStream_t stream);
 #endif
 
-template <typename T, uint32_t BLOCK_SIZE, QuantizationSFLayout SF_LAYOUT>
+template <typename T, uint32_t BLOCK_SIZE, QuantizationSFLayout SF_LAYOUT, bool CACHE_LOCAL_AMAX>
 __global__ void nvfp4QuantAndPerTokenScaleKernel(
     // input
     uint32_t m, uint32_t n, T const* input, float globalScaleInv, int32_t* expandedIdxToPermutedIdx,
@@ -304,16 +304,20 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
     QuantizationSFLayout layout = QuantizationSFLayout::LINEAR) {
   static constexpr int ELTS_PER_THREAD = 8;
   static constexpr int SF_VEC_SIZE = 16;
+  static constexpr int NUM_THREADS_PER_SF = SF_VEC_SIZE / ELTS_PER_THREAD;  // 2
   int rowIdx = blockIdx.x;
   if (rowIdx >= m) return;
   if (expandedIdxToPermutedIdx != nullptr) {
     rowIdx = expandedIdxToPermutedIdx[rowIdx];
   }
   if (rowIdx < 0) return;
-  uint8_t fp8Scale{0};
-  using VecType = PackedVec<T, ELTS_PER_THREAD>;             // bf16x8
-  using PackedType = typename TypeConverter<T>::PackedType;  // bf16x2
+  extern __shared__ float
+      localAmaxSmem[];  // n / ELTS_PER_THREAD float values to store all local amax
+  using VecType = PackedVec<T, ELTS_PER_THREAD>;  // bf16x8
+  using PackedFp4Type = std::conditional_t<ELTS_PER_THREAD == 16, uint64_t, uint32_t>;
   VecType vec;
+  uint8_t fp8Scale{0};
+  PackedFp4Type fp4Vals{0};
 
   float localAmax = 0.f;
   uint32_t num_vecs_per_row = (n + ELTS_PER_THREAD - 1) / ELTS_PER_THREAD;
@@ -324,6 +328,13 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
     for (int i = 0; i < ELTS_PER_THREAD / 2; ++i) {
       auto element = cuda_abs(vec.elts[i]);
       localAmax = fmaxf(localAmax, static_cast<float>(cuda_max(element.x, element.y)));
+    }
+
+    if constexpr (CACHE_LOCAL_AMAX) {
+      // use warp shuffle to get the amax of 16 elements and store it to SMEM
+      localAmax =
+          fmaxf(__shfl_xor_sync(uint32_t(-1), localAmax, NUM_THREADS_PER_SF / 2), localAmax);
+      localAmaxSmem[vecIdx] = localAmax;
     }
   }
 
@@ -351,9 +362,16 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
   for (uint32_t vecIdx = threadIdx.x; vecIdx < num_vecs_per_row; vecIdx += blockDim.x) {
     int64_t vecOffset = rowIdx * num_vecs_per_row + vecIdx;
     vec = reinterpret_cast<VecType const*>(input)[vecOffset];
-    uint32_t fp4x8 = cvt_warp_fp16_to_fp4<T, SF_VEC_SIZE, ELTS_PER_THREAD, false>(
-        vec, reciprocal_approximate_ftz(perTokenScale), &fp8Scale);
-    reinterpret_cast<uint32_t*>(weightOutput)[vecOffset] = fp4x8;
+
+    if constexpr (CACHE_LOCAL_AMAX) {
+      localAmax = localAmaxSmem[vecIdx];
+      fp4Vals = cvt_warp_fp16_to_fp4_with_vec_max<T, SF_VEC_SIZE, ELTS_PER_THREAD, false>(
+          vec, reciprocal_approximate_ftz(perTokenScale), perTokenScale, localAmax, &fp8Scale);
+    } else {
+      fp4Vals = cvt_warp_fp16_to_fp4<T, SF_VEC_SIZE, ELTS_PER_THREAD, false>(
+          vec, reciprocal_approximate_ftz(perTokenScale), &fp8Scale);
+    }
+    reinterpret_cast<uint32_t*>(weightOutput)[vecOffset] = fp4Vals;
 
     static constexpr int THREADS_PER_SCALE = SF_VEC_SIZE / ELTS_PER_THREAD;  // 2
     if (threadIdx.x % THREADS_PER_SCALE == 0) {
@@ -381,24 +399,24 @@ void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, fl
   TLLM_CHECK_WITH_INFO(n % 16 == 0, "n must be a multiple of 16 for NVFP4 quantization");
 
   constexpr uint32_t BLOCK_SIZE = 256;
-  uint32_t smem_size = 0;
+  uint32_t smem_size = n / 8 * sizeof(float);  // for caching the local amax
   dim3 block(BLOCK_SIZE);
   dim3 grid(m);
   switch (sfLayout) {
     case QuantizationSFLayout::LINEAR:
-      nvfp4QuantAndPerTokenScaleKernel<T, BLOCK_SIZE, QuantizationSFLayout::LINEAR>
+      nvfp4QuantAndPerTokenScaleKernel<T, BLOCK_SIZE, QuantizationSFLayout::LINEAR, true>
           <<<grid, block, smem_size, stream>>>(m, n, input, globalScaleInv,
                                                expandedIdxToPermutedIdx, weightOutput, scaleOutput,
                                                perTokenScaleOutput);
       break;
     case QuantizationSFLayout::SWIZZLED_128x4:
-      nvfp4QuantAndPerTokenScaleKernel<T, BLOCK_SIZE, QuantizationSFLayout::SWIZZLED_128x4>
+      nvfp4QuantAndPerTokenScaleKernel<T, BLOCK_SIZE, QuantizationSFLayout::SWIZZLED_128x4, true>
           <<<grid, block, smem_size, stream>>>(m, n, input, globalScaleInv,
                                                expandedIdxToPermutedIdx, weightOutput, scaleOutput,
                                                perTokenScaleOutput);
       break;
     case QuantizationSFLayout::SWIZZLED_8x4:
-      nvfp4QuantAndPerTokenScaleKernel<T, BLOCK_SIZE, QuantizationSFLayout::SWIZZLED_8x4>
+      nvfp4QuantAndPerTokenScaleKernel<T, BLOCK_SIZE, QuantizationSFLayout::SWIZZLED_8x4, true>
           <<<grid, block, smem_size, stream>>>(m, n, input, globalScaleInv,
                                                expandedIdxToPermutedIdx, weightOutput, scaleOutput,
                                                perTokenScaleOutput);
