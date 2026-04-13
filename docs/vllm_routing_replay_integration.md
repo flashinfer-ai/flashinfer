@@ -2,9 +2,10 @@
 
 ## Overview
 
-FlashInfer supports an optional `routing_replay_out` parameter on its MoE kernel functions.
-When provided, the CUDA routing kernel writes all top-K selected expert IDs per token directly
-into this tensor during routing — inside the same fused kernel call that computes the MoE output.
+FlashInfer supports an optional `routing_replay_out` parameter on its **trtllm-gen backend** MoE
+kernel functions (not the Triton MoE path). When provided, the CUDA routing kernel writes all
+top-K selected expert IDs per token directly into this tensor during routing — inside the same
+fused kernel call that computes the MoE output.
 
 This enables **routing replay** for downstream RL training: vLLM captures which experts were
 selected for each token during inference and returns them in the API response.

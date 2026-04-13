@@ -419,12 +419,6 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
       PackedScoreIdx<OutputT> packedScore{static_cast<OutputT>(warpTopKScore[laneIdx]),
                                           static_cast<int16_t>(warpTopKExpertIdx[laneIdx])};
       params.mPtrTopKPacked[tokenIdx * params.mTopK + laneIdx] = packedScore;
-
-      // Routing replay: record all top-K selected expert IDs per token.
-      if (params.mPtrRoutingReplayOut != nullptr) {
-        params.mPtrRoutingReplayOut[tokenIdx * params.mTopK + laneIdx] =
-            static_cast<int16_t>(warpTopKExpertIdx[laneIdx]);
-      }
     }
   }
 

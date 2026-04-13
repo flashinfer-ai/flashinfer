@@ -832,14 +832,8 @@ def test_fp8_block_scale_moe_routing_replay(
         atol=0,
     )
 
-    # All replay IDs in active rows should be valid expert indices
-    active_replay = routing_replay_out[:num_tokens]
-    assert (active_replay >= 0).all(), "Found negative expert IDs in replay"
-    assert (active_replay < num_experts).all(), (
-        f"Found expert IDs >= {num_experts} in replay"
-    )
-
     # Compare replay against reference routing result (set equality per token)
+    active_replay = routing_replay_out[:num_tokens]
     permute_info, _ = routing_reference_renormalize(
         routing_logits, top_k, num_experts, 8
     )

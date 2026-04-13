@@ -41,6 +41,21 @@ using tensorrt_llm::kernels::trtllmgen_moe::Routing::RoutingMethodType;
 using tvm::ffi::Array;
 using tvm::ffi::Optional;
 
+// Validate routing_replay_out tensor properties.
+// NOTE: dim0 >= num_tokens is intentionally NOT checked — with CUDA graphs the buffer
+// is pre-allocated at maximum batch size and reused across steps with varying num_tokens.
+static void validate_routing_replay_out(TensorView const& replay, TensorView const& hidden_states,
+                                        int64_t top_k) {
+  TVM_FFI_ICHECK(replay.device().device_type == kDLCUDA)
+      << "routing_replay_out must be a CUDA tensor";
+  TVM_FFI_ICHECK(replay.device().device_id == hidden_states.device().device_id)
+      << "routing_replay_out must be on the same device as hidden_states";
+  TVM_FFI_ICHECK(replay.ndim() == 2) << "routing_replay_out must be 2D [num_tokens, top_k]";
+  TVM_FFI_ICHECK(replay.size(1) == top_k) << "routing_replay_out dim1 must equal top_k";
+  TVM_FFI_ICHECK((replay.dtype() == DLDataType{kDLInt, 16, 1}))
+      << "routing_replay_out must be int16 dtype";
+}
+
 enum class Fp8QuantizationType {
   NoneFp8,
   DeepSeekFp8,
@@ -1781,16 +1796,7 @@ Array<Tensor> trtllm_bf16_moe(Optional<TensorView> const& routing_logits,
       << "BF16 MoE: gemm2_weights must be bfloat16.";
 
   if (routing_replay_out.has_value()) {
-    auto replay = routing_replay_out.value();
-    TVM_FFI_ICHECK(replay.device().device_type == kDLCUDA)
-        << "routing_replay_out must be a CUDA tensor";
-    TVM_FFI_ICHECK(replay.device().device_id == hidden_states.device().device_id)
-        << "routing_replay_out must be on the same device as hidden_states";
-    TVM_FFI_ICHECK(replay.ndim() == 2) << "routing_replay_out must be 2D [num_tokens, top_k]";
-    TVM_FFI_ICHECK(replay.size(1) == top_k) << "routing_replay_out dim1 must equal top_k";
-    TVM_FFI_ICHECK((replay.dtype() == DLDataType{kDLInt, 16, 1}))
-        << "routing_replay_out must be int16 dtype";
-    // NO dim0 == num_tokens check: buffer may be larger (CUDA graph pre-allocation)
+    validate_routing_replay_out(routing_replay_out.value(), hidden_states, top_k);
   }
 
   auto const num_tokens = hidden_states.size(0);
@@ -1881,16 +1887,7 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
       << "FP8 MoE: output2_scales_scalar must be float32.";
 
   if (routing_replay_out.has_value()) {
-    auto replay = routing_replay_out.value();
-    TVM_FFI_ICHECK(replay.device().device_type == kDLCUDA)
-        << "routing_replay_out must be a CUDA tensor";
-    TVM_FFI_ICHECK(replay.device().device_id == hidden_states.device().device_id)
-        << "routing_replay_out must be on the same device as hidden_states";
-    TVM_FFI_ICHECK(replay.ndim() == 2) << "routing_replay_out must be 2D [num_tokens, top_k]";
-    TVM_FFI_ICHECK(replay.size(1) == top_k) << "routing_replay_out dim1 must equal top_k";
-    TVM_FFI_ICHECK((replay.dtype() == DLDataType{kDLInt, 16, 1}))
-        << "routing_replay_out must be int16 dtype";
-    // NO dim0 == num_tokens check: buffer may be larger (CUDA graph pre-allocation)
+    validate_routing_replay_out(routing_replay_out.value(), hidden_states, top_k);
   }
 
   auto const num_tokens = hidden_states.size(0);
@@ -2025,16 +2022,7 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
   }
 
   if (routing_replay_out.has_value()) {
-    auto replay = routing_replay_out.value();
-    TVM_FFI_ICHECK(replay.device().device_type == kDLCUDA)
-        << "routing_replay_out must be a CUDA tensor";
-    TVM_FFI_ICHECK(replay.device().device_id == hidden_states.device().device_id)
-        << "routing_replay_out must be on the same device as hidden_states";
-    TVM_FFI_ICHECK(replay.ndim() == 2) << "routing_replay_out must be 2D [num_tokens, top_k]";
-    TVM_FFI_ICHECK(replay.size(1) == top_k) << "routing_replay_out dim1 must equal top_k";
-    TVM_FFI_ICHECK((replay.dtype() == DLDataType{kDLInt, 16, 1}))
-        << "routing_replay_out must be int16 dtype";
-    // NO dim0 == num_tokens check: buffer may be larger (CUDA graph pre-allocation)
+    validate_routing_replay_out(routing_replay_out.value(), hidden_states, top_k);
   }
 
   auto const num_tokens = hidden_states.size(0);
@@ -2148,16 +2136,7 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
   }
 
   if (routing_replay_out.has_value()) {
-    auto replay = routing_replay_out.value();
-    TVM_FFI_ICHECK(replay.device().device_type == kDLCUDA)
-        << "routing_replay_out must be a CUDA tensor";
-    TVM_FFI_ICHECK(replay.device().device_id == hidden_states.device().device_id)
-        << "routing_replay_out must be on the same device as hidden_states";
-    TVM_FFI_ICHECK(replay.ndim() == 2) << "routing_replay_out must be 2D [num_tokens, top_k]";
-    TVM_FFI_ICHECK(replay.size(1) == top_k) << "routing_replay_out dim1 must equal top_k";
-    TVM_FFI_ICHECK((replay.dtype() == DLDataType{kDLInt, 16, 1}))
-        << "routing_replay_out must be int16 dtype";
-    // NO dim0 == num_tokens check: buffer may be larger (CUDA graph pre-allocation)
+    validate_routing_replay_out(routing_replay_out.value(), hidden_states, top_k);
   }
 
   // Determine activation type
@@ -2275,16 +2254,7 @@ Array<Tensor> trtllm_mxint4_block_scale_moe(
   }
 
   if (routing_replay_out.has_value()) {
-    auto replay = routing_replay_out.value();
-    TVM_FFI_ICHECK(replay.device().device_type == kDLCUDA)
-        << "routing_replay_out must be a CUDA tensor";
-    TVM_FFI_ICHECK(replay.device().device_id == hidden_states.device().device_id)
-        << "routing_replay_out must be on the same device as hidden_states";
-    TVM_FFI_ICHECK(replay.ndim() == 2) << "routing_replay_out must be 2D [num_tokens, top_k]";
-    TVM_FFI_ICHECK(replay.size(1) == top_k) << "routing_replay_out dim1 must equal top_k";
-    TVM_FFI_ICHECK((replay.dtype() == DLDataType{kDLInt, 16, 1}))
-        << "routing_replay_out must be int16 dtype";
-    // NO dim0 == num_tokens check: buffer may be larger (CUDA graph pre-allocation)
+    validate_routing_replay_out(routing_replay_out.value(), hidden_states, top_k);
   }
 
   // Determine activation type

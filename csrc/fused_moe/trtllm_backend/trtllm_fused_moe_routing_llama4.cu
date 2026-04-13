@@ -132,10 +132,6 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
         if (params.mPtrTopKWeights != nullptr) {
           params.mPtrTopKWeights[tokenIdx] = finalScore;
         }
-        // Routing replay: record selected expert ID for this token.
-        if (params.mPtrRoutingReplayOut != nullptr) {
-          params.mPtrRoutingReplayOut[tokenIdx] = static_cast<int16_t>(warpMaxExpertIdx[0]);
-        }
       }
     }
   } else {
@@ -166,10 +162,6 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
     setBits</* IsZero= */ true>(expertTokenCount, 1, scoreIdx.idx % ExpertsPerThread);
     if (threadIdx.x < params.mNumTokens) {
       smemExpertTokenCountFull[threadIdx.x][scoreIdx.idx / ExpertsPerThread] = expertTokenCount;
-      // Routing replay: record selected expert ID for this token.
-      if (params.mPtrRoutingReplayOut != nullptr) {
-        params.mPtrRoutingReplayOut[threadIdx.x] = scoreIdx.idx;
-      }
     }
   }
 
@@ -366,11 +358,6 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
       TypePacked packedScore{static_cast<OutputT>(params.mPtrTopKWeights[warpTokenIdx]),
                              static_cast<int16_t>(params.mPtrTopKIds[warpTokenIdx])};
       smemPackedScoreIdx[warpIdx] = packedScore;
-      // Routing replay: record selected expert ID for this token.
-      if (params.mPtrRoutingReplayOut != nullptr) {
-        params.mPtrRoutingReplayOut[warpTokenIdx] =
-            static_cast<int16_t>(params.mPtrTopKIds[warpTokenIdx]);
-      }
     }
   } else if (params.mPtrScores != nullptr) {
     // in this case, each warp represents a token
@@ -387,19 +374,11 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
         auto finalScore = OutputT{sigmoid_accurate(float{warpMaxScore[0]})};
         TypePacked packedScore{finalScore, static_cast<int16_t>(warpMaxExpertIdx[0])};
         smemPackedScoreIdx[warpIdx] = packedScore;
-        // Routing replay: record selected expert ID for this token.
-        if (params.mPtrRoutingReplayOut != nullptr) {
-          params.mPtrRoutingReplayOut[warpTokenIdx] = static_cast<int16_t>(warpMaxExpertIdx[0]);
-        }
       }
     }
   } else {
     if (validToken) {
       smemPackedScoreIdx[warpIdx] = params.mPtrTopKPacked[warpTokenIdx];
-      // Routing replay: record selected expert ID for this token.
-      if (params.mPtrRoutingReplayOut != nullptr) {
-        params.mPtrRoutingReplayOut[warpTokenIdx] = params.mPtrTopKPacked[warpTokenIdx].idx;
-      }
     }
   }
 
@@ -485,11 +464,6 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
       auto finalScore = OutputT{sigmoid_accurate(float{warpMaxScore[0]})};
       TypePacked packedScore{finalScore, static_cast<int16_t>(warpMaxExpertIdx[0])};
       params.mPtrTopKPacked[tokenIdx] = packedScore;
-
-      // Routing replay: record selected expert ID for this token.
-      if (params.mPtrRoutingReplayOut != nullptr) {
-        params.mPtrRoutingReplayOut[tokenIdx] = static_cast<int16_t>(warpMaxExpertIdx[0]);
-      }
     }
   }
 
