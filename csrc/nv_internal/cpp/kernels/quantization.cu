@@ -295,7 +295,7 @@ template void invokeRowWiseAmax<__nv_fp8_e4m3>(uint32_t m, uint32_t n, __nv_fp8_
                                                cudaStream_t stream);
 #endif
 
-template <typename T, uint32_t BLOCK_SIZE>
+template <typename T, uint32_t BLOCK_SIZE, QuantizationSFLayout SF_LAYOUT>
 __global__ void nvfp4QuantAndPerTokenScaleKernel(
     // input
     uint32_t m, uint32_t n, T const* input, float globalScaleInv, int32_t* expandedIdxToPermutedIdx,
@@ -360,18 +360,12 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
       uint32_t num_sf_vecs_per_row = (n + SF_VEC_SIZE - 1) / SF_VEC_SIZE;
       auto sfVecIdx = vecIdx / THREADS_PER_SCALE;
       int64_t sfOffset;
-      switch (layout) {
-        default:
-        case QuantizationSFLayout::LINEAR:
-          sfOffset = rowIdx * num_sf_vecs_per_row + sfVecIdx;
-          break;
-        case QuantizationSFLayout::SWIZZLED_128x4:
-          sfOffset =
-              get_sf_out_offset_128x4(std::nullopt, rowIdx, sfVecIdx, m, num_sf_vecs_per_row);
-          break;
-        case QuantizationSFLayout::SWIZZLED_8x4:
-          sfOffset = get_sf_out_offset_8x4(std::nullopt, rowIdx, sfVecIdx, m, num_sf_vecs_per_row);
-          break;
+      if constexpr (SF_LAYOUT == QuantizationSFLayout::LINEAR) {
+        sfOffset = rowIdx * num_sf_vecs_per_row + sfVecIdx;
+      } else if constexpr (SF_LAYOUT == QuantizationSFLayout::SWIZZLED_128x4) {
+        sfOffset = get_sf_out_offset_128x4(std::nullopt, rowIdx, sfVecIdx, m, num_sf_vecs_per_row);
+      } else {
+        sfOffset = get_sf_out_offset_8x4(std::nullopt, rowIdx, sfVecIdx, m, num_sf_vecs_per_row);
       }
       scaleOutput[sfOffset] = fp8Scale;
     }
@@ -387,11 +381,33 @@ void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, fl
   TLLM_CHECK_WITH_INFO(n % 16 == 0, "n must be a multiple of 16 for NVFP4 quantization");
 
   constexpr uint32_t BLOCK_SIZE = 256;
+  uint32_t smem_size = 0;
   dim3 block(BLOCK_SIZE);
   dim3 grid(m);
-  nvfp4QuantAndPerTokenScaleKernel<T, BLOCK_SIZE>
-      <<<grid, block, 0, stream>>>(m, n, input, globalScaleInv, expandedIdxToPermutedIdx,
-                                   weightOutput, scaleOutput, perTokenScaleOutput, sfLayout);
+  switch (sfLayout) {
+    case QuantizationSFLayout::LINEAR:
+      nvfp4QuantAndPerTokenScaleKernel<T, BLOCK_SIZE, QuantizationSFLayout::LINEAR>
+          <<<grid, block, smem_size, stream>>>(m, n, input, globalScaleInv,
+                                               expandedIdxToPermutedIdx, weightOutput, scaleOutput,
+                                               perTokenScaleOutput);
+      break;
+    case QuantizationSFLayout::SWIZZLED_128x4:
+      nvfp4QuantAndPerTokenScaleKernel<T, BLOCK_SIZE, QuantizationSFLayout::SWIZZLED_128x4>
+          <<<grid, block, smem_size, stream>>>(m, n, input, globalScaleInv,
+                                               expandedIdxToPermutedIdx, weightOutput, scaleOutput,
+                                               perTokenScaleOutput);
+      break;
+    case QuantizationSFLayout::SWIZZLED_8x4:
+      nvfp4QuantAndPerTokenScaleKernel<T, BLOCK_SIZE, QuantizationSFLayout::SWIZZLED_8x4>
+          <<<grid, block, smem_size, stream>>>(m, n, input, globalScaleInv,
+                                               expandedIdxToPermutedIdx, weightOutput, scaleOutput,
+                                               perTokenScaleOutput);
+      break;
+    default:
+      TLLM_CHECK_WITH_INFO(false,
+                           "Unsupported QuantizationSFLayout. Supported values are: LINEAR,"
+                           " SWIZZLED_128x4 and SWIZZLED_8x4.");
+  }
 }
 
 // Instantiate the function.
