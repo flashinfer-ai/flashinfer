@@ -731,7 +731,14 @@ def allreduce_fusion(
                 routed_scaling_factor=routed_scaling_factor,
             )
 
-            return norm_out
+            if norm_out is not None:
+                return norm_out
+            elif quant_out is not None:
+                return quant_out
+            elif residual_out is not None:
+                return residual_out
+            else:
+                return input
 
         # ---- Standard patterns (0-5) ----
         # Extract shape from 2D input
