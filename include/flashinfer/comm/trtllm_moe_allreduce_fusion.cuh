@@ -8,6 +8,7 @@
 #endif
 
 #include <cuda/std/optional>
+#include <optional>
 #include <tuple>
 #include <type_traits>
 
