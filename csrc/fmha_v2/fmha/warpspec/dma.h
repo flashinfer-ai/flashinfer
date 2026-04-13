@@ -99,7 +99,7 @@ struct DMA {
   static_assert(STEP_KV % K_ == 0);
   using Transposer =
       Transposer<typename Kernel_traits::Traits_o, typename Kernel_traits::Cta_tile_o, K_,
-                 (STEP_KV > 128 || SLIDING_OR_CHUNKED_ATTENTION) ? 1 : 2 /* UNROLL */>;
+                 (STEP_KV >= 128 || SLIDING_OR_CHUNKED_ATTENTION) ? 1 : 2 /* UNROLL */>;
 
   struct Device {
     // Only the warpgroup leader initiates mbarriers & TMA operations.
@@ -213,7 +213,8 @@ struct DMA {
 
         // The cumulative packed_mask seqlens.
         // Each sequence length in the batch has to be padded to multiple of 128.
-        int sum_mask_s = params.cu_mask_rows[bidb];
+        // cu_mask_rows is NULL when not using a custom mask; guard to avoid illegal access.
+        int sum_mask_s = params.cu_mask_rows ? params.cu_mask_rows[bidb] : 0;
 
         if (SCHEDULING_MODE == 0) {
           // split work across M
@@ -357,7 +358,8 @@ struct DMA {
 
         // The cumulative packed_mask seqlens.
         // Each sequence length in the batch has to be padded to multiple of 128.
-        int sum_mask_s = params.cu_mask_rows[bidb];
+        // cu_mask_rows is NULL when not using a custom mask; guard to avoid illegal access.
+        int sum_mask_s = params.cu_mask_rows ? params.cu_mask_rows[bidb] : 0;
 
         // Prepare the tma descriptors.
         cudaTmaDesc const* desc_q = &params.tma_desc_q;
@@ -613,6 +615,7 @@ struct DMA {
 
       // Dst buffer available
       int v_barrier_id = cbw_v.threadReserve();
+      named_barrier_wait(SYNC_BARRIER, NUM_THREADS_IN_DMA_GROUP);
       uint32_t smem_v_dst = __cvta_generic_to_shared(&shared->smem_v[v_barrier_id * TILE_SIZE_V]);
 
 // Explicitly transpose the v buffer in smem for fp8.
