@@ -1751,7 +1751,7 @@ Array<Tensor> trtllm_bf16_moe(Optional<TensorView> const& routing_logits,
 
   auto const num_tokens = hidden_states.size(0);
   auto const hidden_size = hidden_states.size(1);
-  auto const activation = static_cast<ActivationType>(activation_type);
+  auto const activation = validateAndCastActivationType(activation_type);
 
   // Calculate supported tile sizes
   std::vector<int32_t> mSupportedTileN(Bf16MoeLauncher::mSupportedTileNums.begin(),
@@ -1815,7 +1815,7 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
     bool enable_pdl, Array<int64_t> config_index, int64_t activation_type, bool norm_topk_prob) {
   // Basic type validation
   auto dtype = hidden_states.dtype();
-  auto activation = static_cast<ActivationType>(activation_type);
+  auto activation = validateAndCastActivationType(activation_type);
 
   TVM_FFI_ICHECK(dtype == dl_float8_e4m3fn || dtype == dl_float16 || dtype == dl_bfloat16)
       << "FP8 MoE: hidden_states must be float8_e4m3fn, float16, or bfloat16.";
