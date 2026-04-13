@@ -304,11 +304,12 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
     QuantizationSFLayout layout = QuantizationSFLayout::LINEAR) {
   static constexpr int ELTS_PER_THREAD = 8;
   static constexpr int SF_VEC_SIZE = 16;
-  uint32_t rowIdx = blockIdx.x;
+  int rowIdx = blockIdx.x;
   if (rowIdx >= m) return;
   if (expandedIdxToPermutedIdx != nullptr) {
     rowIdx = expandedIdxToPermutedIdx[rowIdx];
   }
+  if (rowIdx < 0) return;
   uint8_t fp8Scale{0};
   using VecType = PackedVec<T, ELTS_PER_THREAD>;             // bf16x8
   using PackedType = typename TypeConverter<T>::PackedType;  // bf16x2
