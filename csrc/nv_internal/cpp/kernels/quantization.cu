@@ -310,15 +310,22 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
     rowIdx = expandedIdxToPermutedIdx[rowIdx];
   }
   uint8_t fp8Scale{0};
-  using VecType = PackedVec<T, ELTS_PER_THREAD>;
+  using VecType = PackedVec<T, ELTS_PER_THREAD>;             // bf16x8
+  using PackedType = typename TypeConverter<T>::PackedType;  // bf16x2
   VecType vec;
 
-  // get the global amax
   float localAmax = 0.f;
-  for (uint32_t colIdx = threadIdx.x; colIdx < n; colIdx += blockDim.x) {
-    T element = input[rowIdx * n + colIdx];
-    localAmax = fmaxf(localAmax, fabsf(static_cast<float>(element)));
+  uint32_t num_vecs_per_row = (n + ELTS_PER_THREAD - 1) / ELTS_PER_THREAD;
+  for (uint32_t vecIdx = threadIdx.x; vecIdx < num_vecs_per_row; vecIdx += blockDim.x) {
+    int64_t vecOffset = rowIdx * num_vecs_per_row + vecIdx;
+    vec = reinterpret_cast<VecType const*>(input)[vecOffset];
+#pragma unroll
+    for (int i = 0; i < ELTS_PER_THREAD / 2; ++i) {
+      auto element = cuda_abs(vec.elts[i]);
+      localAmax = fmaxf(localAmax, static_cast<float>(cuda_max(element.x, element.y)));
+    }
   }
+
   using BlockReduce = cub::BlockReduce<float, BLOCK_SIZE>;
   __shared__ typename BlockReduce::TempStorage tempStorage;
   float globalAmax = BlockReduce(tempStorage)
@@ -340,7 +347,6 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
   perTokenScale = perTokenScaleOutput[rowIdx];
 
   // quantize to fp4 with per-token scale
-  uint32_t num_vecs_per_row = (n + ELTS_PER_THREAD - 1) / ELTS_PER_THREAD;
   for (uint32_t vecIdx = threadIdx.x; vecIdx < num_vecs_per_row; vecIdx += blockDim.x) {
     int64_t vecOffset = rowIdx * num_vecs_per_row + vecIdx;
     vec = reinterpret_cast<VecType const*>(input)[vecOffset];
