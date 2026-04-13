@@ -413,6 +413,7 @@ def cute_dsl_fmha_ragged_prefill(
     enable_tvm_ffi: bool = True,
     max_qo_len: Optional[int] = None,
     max_kv_len: Optional[int] = None,
+    kernel_fn=None,
 ) -> None:
     """Run DSL FMHA prefill kernel on ragged (variable-length) tensors.
 
@@ -467,13 +468,11 @@ def cute_dsl_fmha_ragged_prefill(
     D_v = v.shape[-1]
 
     batch_size = len(qo_indptr) - 1
-    in_dtype = q.dtype
-    out_dtype = o.dtype
 
-    # Get compiled kernel (varlen=True for variable-length support)
-    kernel_fn = get_cute_dsl_fmha_kernel(
-        in_dtype, out_dtype, D, is_causal, varlen=True, enable_tvm_ffi=enable_tvm_ffi
-    )
+    if kernel_fn is None:
+        kernel_fn = get_cute_dsl_fmha_kernel(
+            q.dtype, o.dtype, D, is_causal, varlen=True, enable_tvm_ffi=enable_tvm_ffi
+        )
 
     # Compute scale factors
     if sm_scale is None:

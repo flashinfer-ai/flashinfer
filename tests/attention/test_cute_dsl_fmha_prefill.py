@@ -449,7 +449,6 @@ def _ragged_reference(
         ([64, 128, 32], [64, 128, 32], 8, 8),  # basic MHA, symmetric
         ([64, 128, 32], [64, 128, 32], 16, 4),  # GQA
         ([4096, 8192], [4096, 8192], 8, 8),  # long context
-        # TODO: This config will fail
         ([32, 64, 16], [128, 256, 64], 8, 8),  # asymmetric (S_q < S_k)
         ([512, 1024], [8192, 16384], 8, 8),  # long KV cache
     ],

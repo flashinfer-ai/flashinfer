@@ -2691,7 +2691,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             will be used in attention computation.
 
         backend : str
-            The implementation backend, could be ``auto``/``fa2``/``fa3``/``cudnn`` or ``cutlass``.
+            The implementation backend, could be ``auto``/``fa2``/``fa3``/``cudnn``/``cutlass`` or ``cute-dsl``.
             Defaults to ``auto``.
             If set to ``auto``, the wrapper will automatically choose the backend based on the
             device architecture and kernel availability.
@@ -2944,7 +2944,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
         if o_data_type is None:
-            o_data_type = q_data_type
+            # when input dtype is fp8, we need to use bf16 output
+            o_data_type = torch.bfloat16 if q_data_type.itemsize == 1 else q_data_type
         o_data_type = canonicalize_torch_dtype(o_data_type)
         if head_dim_vo is None:
             head_dim_vo = head_dim_qk
@@ -3071,7 +3072,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             if self._backend == "cute-dsl":
                 from .utils import get_compute_capability
 
-                cc = get_compute_capability(qo_indptr.device)
+                cc = get_compute_capability(self.device)
                 if cc[0] != 10:
                     raise RuntimeError(
                         f"cute-dsl backend (FMHA prefill kernel) requires SM10x (Blackwell), got SM{cc[0]}{cc[1]}"
@@ -3090,7 +3091,18 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     raise ValueError(
                         "cute-dsl backend does not support use_fp16_qk_reduction"
                     )
-                # No JIT module needed, kernel loaded on demand in run()
+                # Preload kernel .so (fail fast if missing, reused in run)
+                from .attention_dsl.cute_dsl.fmha import get_cute_dsl_fmha_kernel
+
+                self._cached_module = get_cute_dsl_fmha_kernel(
+                    q_data_type,
+                    o_data_type,
+                    head_dim_qk,
+                    causal,
+                    is_persistent=not causal,
+                    varlen=True,
+                    enable_tvm_ffi=True,
+                )
             elif self._backend == "cutlass":
                 # insert qo_indptr.device to 9th position (0-indexed) of get_module_args
                 new_get_module_args = (
@@ -3104,8 +3116,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
         if self._backend == "cute-dsl":
             # Compute max seq lengths here (plan runs outside graph capture)
-            self._max_qo_len = int(torch.max(qo_indptr[1:] - qo_indptr[:-1]).item())
-            self._max_kv_len = int(torch.max(kv_indptr[1:] - kv_indptr[:-1]).item())
+            self._max_qo_len = int(
+                (qo_indptr_host[1:] - qo_indptr_host[:-1]).max().item()
+            )
+            self._max_kv_len = int(
+                (kv_indptr_host[1:] - kv_indptr_host[:-1]).max().item()
+            )
         elif self._backend == "cutlass":
             self._plan_info = fmha_varlen_plan(
                 self._cached_module, qo_indptr, kv_indptr, num_qo_heads, causal
@@ -3300,18 +3316,18 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
                 )
         if out is None:
-            # when input dtype is fp8, we need to use bf16 output
-            out_dtype = torch.bfloat16 if q.dtype.itemsize == 1 else q.dtype
+            out_dtype = getattr(self, "_cached_o_data_type", None) or q.dtype
             out = torch.empty(
                 q.shape[:-1] + v.shape[-1:],
                 dtype=out_dtype,
                 device=q.device,
             )
         else:
+            out_dtype = getattr(self, "_cached_o_data_type", None) or q.dtype
             check_shape_dtype_device(
                 out,
                 q.shape[:-1] + v.shape[-1:],
-                self._cached_o_data_type,
+                out_dtype,
                 q.device,
                 "out",
             )
@@ -3335,6 +3351,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 scale_o=o_scale if o_scale is not None else 1.0,
                 max_qo_len=self._max_qo_len,
                 max_kv_len=self._max_kv_len,
+                kernel_fn=self._cached_module,
             )
             return (out, lse) if return_lse else out
         elif self._backend == "cutlass":

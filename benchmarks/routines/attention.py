@@ -1646,18 +1646,40 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
 
     cumsum_s_qo = torch.sum(actual_seq_lens_q)
     cumsum_s_kv = torch.sum(actual_seq_lens_kv)
-    q = torch.randn(
-        cumsum_s_qo, num_qo_heads, head_dim_qk, device=device, dtype=q_init_dtype
+
+    # Front-padding for cute-dsl varlen kernel: the persistent varlen kernel
+    # applies a negative pointer offset (-max_s * H * D), so there must be
+    # valid GPU memory before the data start.
+    front_pad_q = s_qo if "cute-dsl" in backends else 0
+    front_pad_kv = s_kv if "cute-dsl" in backends else 0
+
+    q_full = torch.randn(
+        front_pad_q + cumsum_s_qo,
+        num_qo_heads,
+        head_dim_qk,
+        device=device,
+        dtype=q_init_dtype,
     )
+    q = q_full[front_pad_q:]
     if args.verbose >= 2:
         print(f"[VVERBOSE] {q.shape = }")
 
-    k = torch.randn(
-        cumsum_s_kv, num_kv_heads, head_dim_qk, device=device, dtype=kv_init_dtype
+    k_full = torch.randn(
+        front_pad_kv + cumsum_s_kv,
+        num_kv_heads,
+        head_dim_qk,
+        device=device,
+        dtype=kv_init_dtype,
     )
-    v = torch.randn(
-        cumsum_s_kv, num_kv_heads, head_dim_vo, device=device, dtype=kv_init_dtype
+    k = k_full[front_pad_kv:]
+    v_full = torch.randn(
+        front_pad_kv + cumsum_s_kv,
+        num_kv_heads,
+        head_dim_vo,
+        device=device,
+        dtype=kv_init_dtype,
     )
+    v = v_full[front_pad_kv:]
 
     block_tables = None
 
@@ -1757,7 +1779,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                     workspace_buffer,
                     "NHD",
                     use_cuda_graph=is_cuda_graph_compatible
-                    if backend not in ["fa2", "cute-dsl"]
+                    if backend not in ["fa2"]
                     else False,
                     qo_indptr_buf=qo_indptr,
                     kv_indptr_buf=kv_indptr,
@@ -1935,7 +1957,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             repeat_iters=args.num_iters,
             sleep_after_run=True,
             enable_cupti=args.use_cupti,
-            use_cuda_graph=(is_cuda_graph_compatible and cur_backend != "fa2"),
+            use_cuda_graph=(is_cuda_graph_compatible and cur_backend not in ["fa2"]),
             cold_l2_cache=True,
             input_args=(
                 cur_backend,
