@@ -78,6 +78,13 @@ class AllReduceFusionPattern:
     kARResidualRMSNormOutFP8Quant = 4
     # All-reduce followed by residual add, RMS norm and FP4 quantization, with norm output
     kARResidualRMSNormOutFP4Quant = 5
+    # MoE reduction + all-reduce + residual add + RMS norm (+ optional quantization)
+    # Fuses expert weighted reduction with allreduce and norm in a single kernel.
+    kMoEReductionARResidualRMSNorm = 6
+    # MoE finalize + all-reduce + residual add + RMS norm
+    # Fuses top-k expert gather/scale with allreduce and norm in a single kernel.
+    # Supports shared expert output addition (e.g. DeepSeek architecture).
+    kMoEFinalizeARResidualRMSNorm = 7
 
 
 class QuantizationSFLayout:
