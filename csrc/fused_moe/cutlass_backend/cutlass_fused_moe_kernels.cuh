@@ -154,7 +154,7 @@ __global__ void buildMinLatencyActiveExpertMapsKernel(
     bool const smart_routing, int const cluster_rank, int const cluster_size,
     int const num_experts_smem) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  cudaGridDependencySynchronize();
 #endif
   // Use one block to process the min latency case
   int tid = threadIdx.x;
@@ -247,7 +247,7 @@ __global__ void buildMinLatencyActiveExpertMapsKernel(
     }
   }
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -309,7 +309,7 @@ __global__ void fusedBuildExpertMapsSortFirstTokenKernel(
 
   // Wait PDL before reading token_selected_experts
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  cudaGridDependencySynchronize();
 #endif
 
 // build expert map
@@ -350,7 +350,7 @@ __global__ void fusedBuildExpertMapsSortFirstTokenKernel(
 
 // We are done with compute, launch the dependent kernels while the stores are in flight
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 
   // write to shared memory and global memory
@@ -550,7 +550,7 @@ __global__ void blockExpertPrefixSumKernel(int const* token_selected_experts,
   int const token_id = block_id * kNumTokensPerBlock + threadIdx.x;
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  cudaGridDependencySynchronize();
 #endif
 
   int expanded_token_id = -1;
@@ -579,7 +579,7 @@ __global__ void blockExpertPrefixSumKernel(int const* token_selected_experts,
   }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -633,7 +633,7 @@ __global__ void globalExpertPrefixSumLargeKernel(int const* blocked_expert_count
   int cnt = 0;
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  cudaGridDependencySynchronize();
 #endif
 
   // Note: Because of limited registers, cannot store thread-level prefix sum or enable #pragma
@@ -662,7 +662,7 @@ __global__ void globalExpertPrefixSumLargeKernel(int const* blocked_expert_count
   }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -676,7 +676,7 @@ __global__ void globalExpertPrefixSumKernel(int const* blocked_expert_counts,
   __shared__ typename BlockScan::TempStorage temp_storage;
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  cudaGridDependencySynchronize();
 #endif
 
   int const cnt = threadIdx.x < num_experts_per_node * num_blocks_per_seq
@@ -696,7 +696,7 @@ __global__ void globalExpertPrefixSumKernel(int const* blocked_expert_counts,
   }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -759,7 +759,7 @@ __global__ void mergeExpertPrefixSumKernel(int const* blocked_expert_counts,
   int const token_id = block_id * blockDim.x + threadIdx.x;
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  cudaGridDependencySynchronize();
 #endif
 
   int const cnt = blocked_expert_counts[target_expert_id * num_blocks_per_seq + block_id];
@@ -774,7 +774,7 @@ __global__ void mergeExpertPrefixSumKernel(int const* blocked_expert_counts,
   }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -1241,7 +1241,7 @@ __global__ void computeStridesTmaWarpSpecializedKernel(
   }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  cudaGridDependencySynchronize();
 #endif
 
   // Both gemms use the same token offset
@@ -1272,6 +1272,18 @@ __global__ void computeStridesTmaWarpSpecializedKernel(
         TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::ProblemShapeInt::
             UnderlyingProblemShape(layout_info2.swap_ab ? gemm2_n : gemm_m,
                                    layout_info2.swap_ab ? gemm_m : gemm2_n, gemm2_k);
+  }
+
+  // Skip expensive stride/pointer/SF setup for experts with no assigned tokens.
+  // All problem shapes (including int4_groupwise) are initialized above so CUTLASS
+  // can correctly traverse the problem list. The remaining work (alpha scales,
+  // block scaling factors, strides, pointers) is only needed for active experts.
+  // For decode (1 token, top_k=8, 128 experts), this skips ~120 of 128 experts.
+  if (gemm_m == 0) {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+    return;
   }
 
   if (alpha_scale_flat1 && alpha_scale_flat2) {
@@ -1319,7 +1331,7 @@ __global__ void computeStridesTmaWarpSpecializedKernel(
           quant_params.groupwise.fc2.weight_scales),
       bias2, gemm2_output, router_scales, permuted_row_to_unpermuted_row, expert);
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -1386,7 +1398,7 @@ __global__ void expandInputRowsKernel(
                 "of the expansion");
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  cudaGridDependencySynchronize();
 #endif
 
   constexpr int VecSize = is_nvfp4 ? TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize
@@ -1508,49 +1520,15 @@ __global__ void expandInputRowsKernel(
   }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 
-  // Pad zeros in the extra SFs along the N dimension, we do this to ensure there are no nan values
-  // in the padded SF atom
-  if constexpr (is_nvfp4 || is_mxfp8) {
-    int64_t const start_offset = threadIdx.x;
-    int64_t const stride = EXPAND_THREADS_PER_BLOCK;
-    // Use VecSize per thread since we are just writing out zeros so every thread can process a
-    // whole vector
-    int64_t const padded_num_elems_in_col = padded_hidden_size / VecSize;
-    assert(padded_hidden_size % VecSize == 0);
-
-    constexpr int min_num_tokens_alignment =
-        is_nvfp4 ? TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentNVFP4
-                 : TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX;
-    static_assert((min_num_tokens_alignment & (min_num_tokens_alignment - 1)) == 0,
-                  "Min num tokens alignment must be a power of two");
-    // Since we don't know a priori how much padding is needed we assume the max per expert
-    // NOTE: we don't use (min_num_tokens_alignment-1) to be able to do power of two divisions
-    int64_t num_padding_tokens = min_num_tokens_alignment * num_experts_per_node;
-
-    for (int64_t padding_token = blockIdx.x; padding_token < num_padding_tokens;
-         padding_token += gridDim.x) {
-      int64_t expert = padding_token / min_num_tokens_alignment;
-      int64_t num_tokens_before_expert = expert_first_token_offset[expert];
-      int64_t num_tokens_after_expert = expert_first_token_offset[expert + 1];
-      int64_t tokens_to_expert = num_tokens_after_expert - num_tokens_before_expert;
-      int64_t padding_to_expert = TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
-                                      tokens_to_expert, min_num_tokens_alignment) -
-                                  tokens_to_expert;
-      int64_t expert_pad_idx = padding_token % min_num_tokens_alignment;
-      if (expert_pad_idx < padding_to_expert) {
-        for (int64_t elem_index = start_offset; elem_index < padded_num_elems_in_col;
-             elem_index += stride) {
-          writeSF<VecSize, VecSize>(num_tokens_before_expert, expert, /*source_row*/ -1,
-                                    num_tokens_after_expert + expert_pad_idx, elem_index,
-                                    padded_hidden_size, fc1_act_sf_flat,
-                                    /* input_sf */ nullptr);  // Pass nulltpr input_sf so we write 0
-        }
-      }
-    }
-  }
+  // N-dim SF padding (zeroing extra token rows beyond tokens_to_expert up to MinNDimAlignment)
+  // is intentionally omitted. The CUTLASS grouped GEMM sets gemm_m = tokens_to_expert per expert
+  // and never reads scale factors for rows beyond that. The N-dim padding rows don't correspond
+  // to any valid MMA tiles, so their content doesn't affect correctness.
+  // K-dim SF padding (above, inside the per-token loop) is still required because MMA tiles may
+  // straddle the inter_size boundary within valid rows.
 }
 
 template <class InputActivationsType, class ExpandedActivationsType>
@@ -1568,18 +1546,13 @@ void expandInputRowsKernelLauncher(
       (std::is_same_v<ExpandedActivationsType, __nv_fp4_e2m1> && fc1_act_sf_flat) ||
           !use_per_expert_act_scale,
       "Per-expert act scale for FC1 is only supported for NVFP4 activations");
-  constexpr int64_t min_num_tokens_alignment =
-      std::is_same_v<ExpandedActivationsType, __nv_fp4_e2m1>
-          ? TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentNVFP4
-          : TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX;
-  int64_t num_padding_tokens = min_num_tokens_alignment * num_experts_per_node;
-#else
-  int64_t num_padding_tokens = 0;
 #endif
 
   static int64_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
   // Note: Launching 8 blocks per SM can fully leverage the memory bandwidth (tested on B200).
-  int64_t const blocks = std::min(smCount * 8, std::max(num_rows * k, num_padding_tokens));
+  // N-dim SF padding has been removed (CUTLASS grouped GEMM never reads beyond
+  // tokens_to_expert), so the grid is driven purely by the expanded token count.
+  int64_t const blocks = std::min(smCount * 8, std::max(num_rows * k, int64_t{1}));
   int64_t const threads = EXPAND_THREADS_PER_BLOCK;
 
   auto func = [&]() {
@@ -1710,7 +1683,7 @@ __global__ void finalizeMoeRoutingKernel(
   auto* reduced_row_ptr_v = reinterpret_cast<OutputElem*>(reduced_row_ptr);
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  cudaGridDependencySynchronize();
 #endif
 
 #pragma unroll
@@ -1746,7 +1719,7 @@ __global__ void finalizeMoeRoutingKernel(
     reduced_row_ptr_v[elem_index] = output_elem;
   }
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -1766,7 +1739,7 @@ __global__ void finalizeMoeRoutingNoFillingKernel(
   assert(unpadded_cols <= padded_cols);
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  cudaGridDependencySynchronize();
 #endif
 
   int64_t const num_valid_tokens = expert_first_token_offset[num_experts_per_node];
@@ -1849,7 +1822,7 @@ __global__ void finalizeMoeRoutingNoFillingKernel(
     }
   }
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -2058,13 +2031,12 @@ void doGatedActivation(ActivationOutputType* output, GemmOutputType const* gemm_
 
 template <class T, class GemmOutputType, class ScaleBiasType, class ActFn,
           TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType BlockScalingType>
-__global__ void doActivationKernel(T* output, GemmOutputType const* gemm_result,
-                                   float const* fp8_quant, ScaleBiasType const* bias_ptr,
-                                   bool bias_is_broadcast, int64_t const* expert_first_token_offset,
-                                   int num_experts_per_node, int64_t inter_size,
-                                   float const* fc2_act_global_scale, bool use_per_expert_act_scale,
-                                   TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_act_sf_flat,
-                                   ActivationParams activation_params) {
+__global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKernel(
+    T* output, GemmOutputType const* gemm_result, float const* fp8_quant,
+    ScaleBiasType const* bias_ptr, bool bias_is_broadcast, int64_t const* expert_first_token_offset,
+    int num_experts_per_node, int64_t inter_size, float const* fc2_act_global_scale,
+    bool use_per_expert_act_scale, TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_act_sf_flat,
+    ActivationParams activation_params) {
 #ifdef ENABLE_FP4
   constexpr bool IsNVFP4 =
       std::is_same_v<T, __nv_fp4_e2m1> &&
@@ -2101,7 +2073,7 @@ __global__ void doActivationKernel(T* output, GemmOutputType const* gemm_result,
   int64_t const num_valid_tokens = expert_first_token_offset[num_experts_per_node];
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  cudaGridDependencySynchronize();
 #endif
   for (int64_t token = blockIdx.x; token < num_valid_tokens; token += gridDim.x) {
     size_t gemm_result_offset = token * inter_size * gated_size_mul;
@@ -2216,52 +2188,15 @@ __global__ void doActivationKernel(T* output, GemmOutputType const* gemm_result,
   }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 
-  // Pad zeros in the extra SFs along the N dimension, we do this to ensure there are no nan values
-  // in the padded SF atom
-  if constexpr (IsNVFP4 || IsMXFP8) {
-    int64_t const start_offset = threadIdx.x;
-    int64_t const stride = ACTIVATION_THREADS_PER_BLOCK;
-    // Use VecSize per thread since we are just writing out zeros so every thread can process a
-    // whole vector
-    int64_t const padded_num_elems_in_col = padded_inter_size / VecSize;
-    assert(padded_inter_size % VecSize == 0);
-
-    constexpr int64_t min_num_tokens_alignment =
-        IsNVFP4 ? TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentNVFP4
-                : TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX;
-    static_assert((min_num_tokens_alignment & (min_num_tokens_alignment - 1)) == 0,
-                  "Min num tokens alignment must be a power of two");
-    // Since we don't know a priori how much padding is needed we assume the max per expert
-    // NOTE: we don't (min_num_tokens_alignment-1) to have power of two divisions
-    int64_t num_padding_tokens = min_num_tokens_alignment * num_experts_per_node;
-
-    for (int64_t padding_token = blockIdx.x; padding_token < num_padding_tokens;
-         padding_token += gridDim.x) {
-      int64_t expert = padding_token / min_num_tokens_alignment;
-      int64_t num_tokens_before_expert = expert_first_token_offset[expert];
-      int64_t num_tokens_after_expert = expert_first_token_offset[expert + 1];
-      int64_t tokens_to_expert = num_tokens_after_expert - num_tokens_before_expert;
-      int64_t padding_to_expert = TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
-                                      tokens_to_expert, min_num_tokens_alignment) -
-                                  tokens_to_expert;
-      int64_t expert_pad_idx = padding_token % min_num_tokens_alignment;
-      if (expert_pad_idx < padding_to_expert) {
-        for (int64_t elem_index = start_offset; elem_index < padded_num_elems_in_col;
-             elem_index += stride) {
-          // The SF buffer is padded to a multiple of MinNDimAlignment for each expert
-          // This means we can safely write to offset num_tokens_after_expert + padded_token, since
-          // the next expert will leave space for the padding
-          writeSF<VecSize, VecSize>(num_tokens_before_expert, expert, /*source_row*/ -1,
-                                    num_tokens_after_expert + expert_pad_idx, elem_index,
-                                    padded_inter_size, fc2_act_sf_flat,
-                                    /* input_sf */ nullptr);  // Pass nulltpr input_sf so we write 0
-        }
-      }
-    }
-  }
+  // N-dim SF padding (zeroing extra token rows beyond tokens_to_expert up to MinNDimAlignment)
+  // is intentionally omitted. The CUTLASS grouped GEMM sets gemm_m = tokens_to_expert per expert
+  // and never reads scale factors for rows beyond that. The N-dim padding rows don't correspond
+  // to any valid MMA tiles, so their content doesn't affect correctness.
+  // K-dim SF padding (above, inside the per-token loop) is still required because MMA tiles may
+  // straddle the inter_size boundary within valid rows.
 }
 
 template <class T, class GemmOutputType, class ScaleBiasType>
@@ -2272,18 +2207,11 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
                   QuantParams const& quant_params, bool use_per_expert_act_scale,
                   TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_act_sf_flat, bool enable_pdl,
                   cudaStream_t stream) {
-#ifdef ENABLE_FP4
-  constexpr int64_t min_num_tokens_alignment =
-      std::is_same_v<T, __nv_fp4_e2m1> ? TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentNVFP4
-                                       : TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX;
-  int64_t num_padding_tokens = min_num_tokens_alignment * num_experts_per_node;
-#else
-  int64_t num_padding_tokens = 0;
-#endif
-
   static int64_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
   // Note: Launching 8 blocks per SM can fully leverage the memory bandwidth (tested on B200).
-  int64_t const blocks = std::min(smCount * 8, std::max(expanded_num_tokens, num_padding_tokens));
+  // N-dim SF padding has been removed (CUTLASS grouped GEMM never reads beyond
+  // tokens_to_expert), so the grid is driven purely by the expanded token count.
+  int64_t const blocks = std::min(smCount * 8, std::max(expanded_num_tokens, int64_t{1}));
   int64_t const threads = ACTIVATION_THREADS_PER_BLOCK;
 
   auto fn = [&]() {
@@ -3952,7 +3880,10 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, 
   layout_info1.fpX_block_scaling_type = getScalingType();
   layout_info2.fpX_block_scaling_type = getScalingType();
 
-  int const threads = std::min(1024, num_experts_per_node);
+  // Use a smaller block size to spread work across multiple SMs. Each thread handles one expert,
+  // so we only need num_experts_per_node threads total. With 1 warp per block, 128 experts
+  // yields 4 blocks across 4 SMs instead of 1 block on 1 SM.
+  int const threads = std::min(32, num_experts_per_node);
   int const blocks = (num_experts_per_node + threads - 1) / threads;
 
   auto* kernel_instance =

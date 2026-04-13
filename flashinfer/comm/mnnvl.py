@@ -353,7 +353,9 @@ class MnnvlMemory:  # type: ignore[no-redef]
 
     def __del__(self):
         if not sys.is_finalizing():
-            MnnvlMemory.close_mnnvl_memory(self.ptr)
+            # When open_mnnvl_memory fails, self.ptr may not be set. In that case, we should not call close_mnnvl_memory.
+            if hasattr(self, "ptr"):
+                MnnvlMemory.close_mnnvl_memory(self.ptr)
 
     def as_torch_strided_tensor(self, dtype):
         num_segments = MnnvlMemory.comm.Get_size()

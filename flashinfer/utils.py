@@ -189,16 +189,22 @@ def _unpack_paged_kv_cache(
         )
 
 
-def get_alibi_slopes(n_heads: int) -> torch.Tensor:
+def get_alibi_slopes(
+    n_heads: int, device: Optional[torch.device] = None
+) -> torch.Tensor:
     n = 2 ** math.floor(math.log2(n_heads))
     m_0 = 2.0 ** (-8.0 / n)
-    m = torch.pow(m_0, torch.arange(1, 1 + n))
+    m = torch.pow(m_0, torch.arange(1, 1 + n, device=device))
     if n < n_heads:
         m_hat_0 = 2.0 ** (-4.0 / n)
-        m_hat = torch.pow(m_hat_0, torch.arange(1, 1 + 2 * (n_heads - n), 2))
+        m_hat = torch.pow(
+            m_hat_0, torch.arange(1, 1 + 2 * (n_heads - n), 2, device=device)
+        )
         m = torch.cat([m, m_hat])
     return m.float()
 
+
+SINGLE_KERNEL_TMP_SIZE = 32 * 1024 * 1024
 
 _cache_buf: Dict[Tuple[str, torch.device], torch.Tensor] = {}
 
@@ -238,7 +244,7 @@ def _get_cache_alibi_slopes_buf(
     key = (f"alibi_slopes_{num_qo_heads}", device)
     buf = _cache_buf.get(key)
     if buf is None:
-        buf = get_alibi_slopes(num_qo_heads).to(device)
+        buf = get_alibi_slopes(num_qo_heads, device=device)
         _cache_buf[key] = buf
     return buf
 
@@ -1252,3 +1258,31 @@ def backend_requirement(
 def get_default_generators(device: torch.device):
     torch.cuda.init()
     return torch.cuda.default_generators[device.index]
+
+
+def prepare_jit_additional_args(
+    jit_additional_tensor_names: list,
+    known_bufs: dict,
+    user_args: tuple,
+) -> list:
+    """Map well-known JIT additional tensor names to internal buffers.
+
+    For each name in jit_additional_tensor_names:
+      - If the name is in known_bufs, use the corresponding value.
+        Values may be callables (evaluated lazily only when needed).
+      - Otherwise, consume the next value from user_args.
+      - If user_args is exhausted, use None.
+    Any remaining user_args are appended at the end.
+    """
+    result = []
+    user_args_list = list(user_args)
+    for name in jit_additional_tensor_names:
+        if name in known_bufs:
+            val = known_bufs[name]
+            result.append(val() if callable(val) else val)
+        elif user_args_list:
+            result.append(user_args_list.pop(0))
+        else:
+            result.append(None)
+    result.extend(user_args_list)
+    return result
