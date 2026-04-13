@@ -1445,6 +1445,7 @@ class BF16Moe(Moe):
                     self._cache_permute_indices,
                     args.gemm1_weights[i].view(torch.uint8),
                     epilogue_tile_m,
+                    is_gated_act_gemm=is_gated_activation(args.activation_type),
                 )
                 tmp_weights1 = (
                     args.gemm1_weights[i]
@@ -1508,6 +1509,7 @@ class BF16Moe(Moe):
         routed_scaling = kwargs["routed_scaling"]
         routing_method_type = kwargs["routing_method_type"]
         enable_autotune = kwargs.get("enable_autotune", True)
+        activation_type = kwargs["activation_type"]
         norm_topk_prob = kwargs.get("norm_topk_prob", True)
 
         # Use autotuner for optimal kernel selection
@@ -1530,6 +1532,7 @@ class BF16Moe(Moe):
                 weight_layout=static_data["weight_layout"],
                 routing_method_type=routing_method_type,
                 tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
+                activation_type=activation_type,
                 norm_topk_prob=norm_topk_prob,
             )
         return output.to(torch.float)
@@ -3131,7 +3134,7 @@ def test_renormalize_routing(
 # Test: DeepSeekV3 routing
 @pytest.mark.parametrize("num_tokens", [8, 768, 3072])
 @pytest.mark.parametrize("hidden_size", [1024])
-@pytest.mark.parametrize("intermediate_size", [2944, 2048, 1024, 768, 512, 384])
+@pytest.mark.parametrize("intermediate_size", [2688, 2048, 1024, 768, 512, 384])
 @pytest.mark.parametrize(
     "moe_impl",
     [
@@ -3164,12 +3167,12 @@ def test_renormalize_routing(
                 "routed_scaling": 2.5,
                 "has_routing_bias": True,
                 "routing_method_type": RoutingMethodType.DeepSeekV3,
-                "compatible_moe_impls": [FP8PerTensorMoe, FP4Moe],
-                "compatible_intermediate_size": [2944],
+                "compatible_moe_impls": [BF16Moe, FP8PerTensorMoe, FP4Moe],
+                "compatible_intermediate_size": [2688],
                 "compatible_activation_types": [ActivationType.Relu2],
                 "enable_autotune": True,
             },
-            id="nemotron_3_dummy",
+            id="nemotron_3_super",
         ),
         pytest.param(
             {

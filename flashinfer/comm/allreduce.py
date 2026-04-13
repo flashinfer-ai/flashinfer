@@ -717,6 +717,8 @@ def allreduce_fusion(
                 expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
                 norm_out=norm_out,
                 residual_out=residual_out,
+                quant_out=quant_out,
+                scale_out=scale_out,
                 workspace_ptrs=workspace.workspace_tensor,
                 launch_with_pdl=launch_with_pdl,
                 world_rank=workspace.rank,
@@ -724,6 +726,7 @@ def allreduce_fusion(
                 eps=rms_eps,
                 shared_expert_output=shared_expert_output,
                 expert_scale_factor=expert_scale_factor,
+                routed_scaling_factor=None,
             )
 
             return norm_out
