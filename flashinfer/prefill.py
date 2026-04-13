@@ -1284,6 +1284,11 @@ def single_prefill_with_kv_cache(
             scale_k = torch.ones(k.shape[1], dtype=torch.float32, device=q.device)
         if scale_v is None:
             scale_v = torch.ones(v.shape[1], dtype=torch.float32, device=q.device)
+    else:
+        if scale_q is not None:
+            sm_scale *= scale_q
+        if scale_k is not None:
+            sm_scale *= scale_k
 
     if backend == "auto":
         backend = determine_attention_backend(
@@ -1333,6 +1338,13 @@ def single_prefill_with_kv_cache(
         rope_scale,
         rope_theta,
     )
+
+    if scale_v is not None:
+        # TODO(Zihao): fused into kernel
+        if out.itemsize == 1:
+            out = (out.to(float) * scale_v).to(out.dtype)
+        else:
+            out *= scale_v
 
     return (out, lse) if return_lse else out
 
