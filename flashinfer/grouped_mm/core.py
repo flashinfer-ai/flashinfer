@@ -1,9 +1,8 @@
 """
 cuDNN-backed Grouped Matrix Multiplication (MoE Grouped GEMM).
 
-Provides ``grouped_mm_bf16``, ``grouped_mm_fp8``, and ``grouped_mm_fp4``
-as public APIs, mirroring the ``mm_bf16`` / ``mm_fp8`` / ``mm_fp4`` dense
-GEMM APIs but operating on expert-partitioned (grouped) inputs.
+Provides ``grouped_mm_bf16`` as a public API, mirroring the ``mm_bf16`` dense
+GEMM API but operating on expert-partitioned (grouped) inputs.
 
 All implementations use cuDNN's ``moe_grouped_matmul`` graph node under the
 hood with automatic graph caching.
@@ -88,12 +87,14 @@ def _check_cudnn_version(min_ver: int, feature: str):
 
 
 def _get_handle(device: torch.device):
-    if device not in _cudnn_handles:
+    device = torch.device(device)
+    key = (device.type, device.index)
+    if key not in _cudnn_handles:
         _check_cudnn()
-        _cudnn_handles[device] = cudnn.create_handle()
+        _cudnn_handles[key] = cudnn.create_handle()
     stream = torch.cuda.current_stream(device).cuda_stream
-    cudnn.set_stream(handle=_cudnn_handles[device], stream=stream)
-    return _cudnn_handles[device]
+    cudnn.set_stream(handle=_cudnn_handles[key], stream=stream)
+    return _cudnn_handles[key]
 
 
 _TORCH_TO_CUDNN = None
@@ -197,11 +198,11 @@ def _run_cudnn_moe_grouped_gemm(
     out_cudnn_dtype = _to_cudnn_dtype(out_dtype)
 
     cum_m = a.shape[0]
-    num_experts, n, k = b.shape
+    _, n, _ = b.shape
 
     token_3d = a.unsqueeze(0)
     weight_3d = b.transpose(1, 2)
-    fto = m_indptr[:-1].to(torch.int32).reshape(-1, 1, 1).contiguous()
+    fto = m_indptr[:-1].reshape(-1, 1, 1).contiguous()
 
     handle = _get_handle(a.device)
 
@@ -270,6 +271,16 @@ def _check_grouped_mm_bf16(
         )
     if a.shape[1] != b.shape[2]:
         raise ValueError(f"K mismatch: a has {a.shape[1]}, b has {b.shape[2]}")
+    if out is not None:
+        expected_shape = (a.shape[0], b.shape[1])
+        if out.shape != expected_shape:
+            raise ValueError(
+                f"out shape {tuple(out.shape)} != expected {expected_shape}"
+            )
+        if out.device != a.device:
+            raise ValueError(
+                f"out device {out.device} must match input device {a.device}"
+            )
     return True
 
 
@@ -280,7 +291,7 @@ def grouped_mm_bf16(
     b: torch.Tensor,
     m_indptr: torch.Tensor,
     out: Optional[torch.Tensor] = None,
-    out_dtype: Optional[torch.dtype] = torch.bfloat16,
+    out_dtype: torch.dtype = torch.bfloat16,
     backend: str = "cudnn",
 ) -> torch.Tensor:
     r"""Grouped matrix multiplication with BF16/FP16 data types (cuDNN MOE backend).
