@@ -251,6 +251,15 @@ struct TllmGenFmhaRunnerParams {
   // The stride between different batches for V.
   int vStrideBatch;
 
+  // The stride between different heads for K scaling factors.
+  int kSfStrideHeads;
+  // The stride between different batches for K scaling factors.
+  int kSfStrideBatch;
+  // The stride between different heads for V scaling factors.
+  int vSfStrideHeads;
+  // The stride between different batches for V scaling factors.
+  int vSfStrideBatch;
+
   // Head dimension for Q and K.
   int mHeadDimQk;
   // Head dimension for V.
@@ -300,6 +309,9 @@ struct TllmGenFmhaRunnerParams {
   bool mSparseMla;
   // The top k value for sparse MLA.
   int mSparseMlaTopK;
+  // Whether the indices for K & V pages are shared as unified index.
+  // true -> vLLM/FlashInfer; false -> TRT-LLM.
+  bool mUsesSharedPagedKvIdx;
   // The cuda stream.
   cudaStream_t stream;
   // Whether to enable PDL (Programmatic Dependent Launch).

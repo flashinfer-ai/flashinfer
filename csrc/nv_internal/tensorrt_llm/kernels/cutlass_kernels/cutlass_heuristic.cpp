@@ -61,6 +61,7 @@ TileShape get_cta_shape_for_config(CutlassTileConfig tile_config) {
     case CutlassTileConfig::CtaShape64x128x64_WarpShape64x32x64:
       return TileShape{64, 128};
     case CutlassTileConfig::CtaShape128x64x64_WarpShape64x32x64:
+    case CutlassTileConfig::CtaShape128x64x128_WarpShape64x32x128:
       return TileShape{128, 64};
     case CutlassTileConfig::CtaShape128x128x8_WarpShape64x64x8:
     case CutlassTileConfig::CtaShape128x128x64_WarpShape64x32x64:
@@ -586,54 +587,29 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm110(
 
 std::vector<CutlassGemmConfig> get_candidate_configs_sm120(
     CutlassGemmConfig::CandidateConfigTypeParam const config) {
-#ifdef FAST_BUILD
-  // Fast build disables all configs except this
-  if (config & CutlassGemmConfig::GROUPED_GEMM) {
-    return {CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x128B,
-                              MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
-                              ClusterShape::ClusterShape_1x1x1}};
-  } else {
-    return {CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x256B,
-                              MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
-                              ClusterShape::ClusterShape_1x1x1}};
-  }
-#else
-  if (config & CutlassGemmConfig::GROUPED_GEMM) {
-    std::vector<CutlassGemmConfig> candidate_configs;
-    if ((config & CutlassGemmConfig::FP4_ONLY) != 0) {
-      candidate_configs.push_back(CutlassGemmConfig{
-          CutlassTileConfigSM120::CtaShape128x128x128B, MainloopScheduleType::AUTO,
-          EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
-      candidate_configs.push_back(
-          CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x64B, MainloopScheduleType::AUTO,
-                            EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
-      candidate_configs.push_back(
-          CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x256x64B, MainloopScheduleType::AUTO,
-                            EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
-      candidate_configs.push_back(
-          CutlassGemmConfig{CutlassTileConfigSM120::CtaShape256x128x64B, MainloopScheduleType::AUTO,
-                            EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
-      return candidate_configs;
-    } else {
+  if ((config & CutlassGemmConfig::FP4_ONLY) == 0) {
+    if (config & CutlassGemmConfig::GROUPED_GEMM) {
       TLLM_THROW("Not Implemented: SM120 group GEMM only supports nvfp4.");
     }
-  } else {
-    std::vector<CutlassGemmConfig> candidate_configs;
-    if ((config & CutlassGemmConfig::FP4_ONLY) != 0) {
-      candidate_configs.push_back(CutlassGemmConfig{
-          CutlassTileConfigSM120::CtaShape128x128x256B, MainloopScheduleType::AUTO,
-          EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
-      candidate_configs.push_back(CutlassGemmConfig{
-          CutlassTileConfigSM120::CtaShape256x128x128B, MainloopScheduleType::AUTO,
-          EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
-      return candidate_configs;
-    } else {
-      TLLM_THROW("Not Implemented: SM120 GEMM only supports nvfp4.");
-    }
+    TLLM_THROW("Not Implemented: SM120 GEMM only supports nvfp4.");
   }
-#endif
-
-}  // namespace kernels
+  // Only tiles that satisfy ALL of:
+  //   1. Present in the dispatch table (SHAPE_CASE in moe_gemm_template_dispatch_tma_ws.h)
+  //   2. Pass are_tile_shapes_supported_sm120() constexpr check
+  //   3. Have compiled kernel templates (generate_sm120_grouped_gemm_operations)
+  //
+  // 128x128x128B is the only tile meeting all three criteria.  Its nominal SMEM
+  // (2 stages × (128+128) × 256 bytes = 128 KB) exceeds SM120's 100 KB budget,
+  // but CUTLASS StageCountAutoCarveout reduces the stage count to 1, bringing
+  // actual SMEM to ~64 KB.  can_implement() accepts it at runtime.
+  //
+  // K=64 tiles (128x128x64, 128x256x64, 256x128x64) are in the dispatch table
+  // but cannot be compiled for FP4 on SM120 (TMA layout static_assert failure),
+  // so they are intentionally excluded here.
+  return {CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x128B,
+                            MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
+                            ClusterShape::ClusterShape_1x1x1}};
+}
 
 std::vector<CutlassGemmConfig> get_candidate_configs(
     int sm, int const max_split_k,
