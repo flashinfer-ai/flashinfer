@@ -23,6 +23,7 @@
 
 #include "dlpack/dlpack.h"
 
+using tvm::ffi::Optional;
 using tvm::ffi::Tensor;
 using tvm::ffi::TensorView;
 namespace ffi = tvm::ffi;
