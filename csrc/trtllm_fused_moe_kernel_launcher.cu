@@ -373,11 +373,7 @@ class FusedMoeLauncher {
 
     // Set dtype of score based on actual routing_logits dtype
     if (routing_logits.has_value()) {
-      if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3) {
-        TVM_FFI_ICHECK_EQ(routing_logits.value().dtype(), dl_float32)
-            << "routing_logits must be float.";
-        mDtypeScore = btg::Dtype::Fp32;
-      } else if (routing_logits.value().dtype() == dl_float32) {
+      if (routing_logits.value().dtype() == dl_float32) {
         mDtypeScore = btg::Dtype::Fp32;
       } else {
         mDtypeScore = btg::Dtype::Bfloat16;
@@ -1823,11 +1819,6 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
   auto dtype = hidden_states.dtype();
   auto activation = static_cast<ActivationType>(activation_type);
 
-  if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3) {
-    TVM_FFI_ICHECK_EQ(routing_logits.dtype(), dl_float32)
-        << "routing_logits must be float for DeepSeekV3.";
-  }
-
   TVM_FFI_ICHECK(dtype == dl_float8_e4m3fn || dtype == dl_float16 || dtype == dl_bfloat16)
       << "FP8 MoE: hidden_states must be float8_e4m3fn, float16, or bfloat16.";
   TVM_FFI_ICHECK_EQ(gemm1_weights.dtype(), dl_float8_e4m3fn)
@@ -1929,12 +1920,7 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
   TVM_FFI_ICHECK(use_routing_logits || use_precomputed_routing)
       << "Either routing_logits or expert_indices must be provided.";
 
-  if (use_routing_logits) {
-    if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3) {
-      TVM_FFI_ICHECK_EQ(routing_logits.value().dtype(), dl_float32)
-          << "routing_logits must be float.";
-    }
-  }
+  (void)use_routing_logits;
   TVM_FFI_ICHECK(dtype == dl_float16 || dtype == dl_bfloat16 || dtype == dl_float8_e4m3fn)
       << "FP8 block scale MoE: hidden_states must be fp16, bf16, or fp8.";
   if (quantization_type == Fp8QuantizationType::DeepSeekFp8) {

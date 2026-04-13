@@ -361,8 +361,6 @@ __device__ void routingPermutation(KernelParams params,
     } else {
       numCta[e] = divUpTileN<int32_t>(count[e], params.mTileTokensDim);
     }
-    // Expand from CGA count to CTA count to keep the semantic stable with downstream kernels
-    numCta[e] *= params.mClusterSizeInBatchDim;
   }
 
   int32_t ctaOffset[ExpertsPerThread];
@@ -382,13 +380,11 @@ __device__ void routingPermutation(KernelParams params,
         int32_t mnLimit1;
         int32_t mnLimit2;
         if (params.mIsPow2) {
-          int32_t ctaPaddingLog2 = params.mPaddingLog2 - params.mClusterSizeLog2;
-          mnLimit1 = mulLog2<int32_t>(ctaOffset[e] + cta + 1, ctaPaddingLog2);
-          mnLimit2 = mulLog2<int32_t>(ctaOffset[e], ctaPaddingLog2) + count[e];
+          mnLimit1 = mulLog2<int32_t>(ctaOffset[e] + cta + 1, params.mPaddingLog2);
+          mnLimit2 = mulLog2<int32_t>(ctaOffset[e], params.mPaddingLog2) + count[e];
         } else {
-          int32_t ctaTile = params.mTileTokensDim / params.mClusterSizeInBatchDim;
-          mnLimit1 = (ctaOffset[e] + cta + 1) * ctaTile;
-          mnLimit2 = ctaOffset[e] * ctaTile + count[e];
+          mnLimit1 = mulTileN<int32_t>(ctaOffset[e] + cta + 1, params.mTileTokensDim);
+          mnLimit2 = mulTileN<int32_t>(ctaOffset[e], params.mTileTokensDim) + count[e];
         }
         params.mPtrCtaIdxXyToMnLimit[ctaOffset[e] + cta] = min(mnLimit1, mnLimit2);
       }
@@ -396,9 +392,9 @@ __device__ void routingPermutation(KernelParams params,
       // get the padded offset associated with this expert (token-space, CGA granularity)
       int32_t offset;
       if (params.mIsPow2) {
-        offset = mulLog2<int32_t>(ctaOffset[e] >> params.mClusterSizeLog2, params.mPaddingLog2);
+        offset = mulLog2<int32_t>(ctaOffset[e], params.mPaddingLog2);
       } else {
-        offset = (ctaOffset[e] / params.mClusterSizeInBatchDim) * params.mTileTokensDim;
+        offset = mulTileN<int32_t>(ctaOffset[e], params.mTileTokensDim);
       }
 
       // write expert offsets to shared
@@ -410,10 +406,9 @@ __device__ void routingPermutation(KernelParams params,
   if (clusterBlockRank == 0 && warpIdx == NumWarps - 1 && cute::elect_one_sync()) {
     int32_t permutedIdxSize;
     if (params.mIsPow2) {
-      permutedIdxSize =
-          mulLog2<int32_t>(numNonExitingCtas >> params.mClusterSizeLog2, params.mPaddingLog2);
+      permutedIdxSize = mulLog2<int32_t>(numNonExitingCtas, params.mPaddingLog2);
     } else {
-      permutedIdxSize = (numNonExitingCtas / params.mClusterSizeInBatchDim) * params.mTileTokensDim;
+      permutedIdxSize = mulTileN<int32_t>(numNonExitingCtas, params.mTileTokensDim);
     }
     params.mPtrPermutedIdxSize[0] = permutedIdxSize;
     params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
@@ -641,8 +636,6 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
     } else {
       numCta[e] = divUpTileN<int32_t>(count[e], params.mTileTokensDim);
     }
-    // Expand from CGA count to CTA count to keep the semantic stable with downstream kernels
-    numCta[e] *= params.mClusterSizeInBatchDim;
   }
   int32_t ctaOffset[ExpertsPerThread];
   int32_t numNonExitingCtas;
@@ -655,9 +648,9 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
       // Get the padded offset associated with this expert (token-space, CGA granularity)
       int32_t offset;
       if (params.mIsPow2) {
-        offset = mulLog2<int32_t>(ctaOffset[e] >> params.mClusterSizeLog2, params.mPaddingLog2);
+        offset = mulLog2<int32_t>(ctaOffset[e], params.mPaddingLog2);
       } else {
-        offset = (ctaOffset[e] / params.mClusterSizeInBatchDim) * params.mTileTokensDim;
+        offset = mulTileN<int32_t>(ctaOffset[e], params.mTileTokensDim);
       }
 
       // Write expert offsets to shared
@@ -672,10 +665,9 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
   if (blockIdx.x == 0 && warpIdx == NumThreadsBlock / WarpSize - 1 && cute::elect_one_sync()) {
     int32_t permutedIdxSize;
     if (params.mIsPow2) {
-      permutedIdxSize =
-          mulLog2<int32_t>(numNonExitingCtas >> params.mClusterSizeLog2, params.mPaddingLog2);
+      permutedIdxSize = mulLog2<int32_t>(numNonExitingCtas, params.mPaddingLog2);
     } else {
-      permutedIdxSize = (numNonExitingCtas / params.mClusterSizeInBatchDim) * params.mTileTokensDim;
+      permutedIdxSize = mulTileN<int32_t>(numNonExitingCtas, params.mTileTokensDim);
     }
     params.mPtrPermutedIdxSize[0] = permutedIdxSize;
     params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
@@ -694,13 +686,11 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
         int32_t mnLimit1;
         int32_t mnLimit2;
         if (params.mIsPow2) {
-          int32_t ctaPaddingLog2 = params.mPaddingLog2 - params.mClusterSizeLog2;
-          mnLimit1 = mulLog2<int32_t>(ctaOffset[e] + cta + 1, ctaPaddingLog2);
-          mnLimit2 = mulLog2<int32_t>(ctaOffset[e], ctaPaddingLog2) + count[e];
+          mnLimit1 = mulLog2<int32_t>(ctaOffset[e] + cta + 1, params.mPaddingLog2);
+          mnLimit2 = mulLog2<int32_t>(ctaOffset[e], params.mPaddingLog2) + count[e];
         } else {
-          int32_t ctaTile = params.mTileTokensDim / params.mClusterSizeInBatchDim;
-          mnLimit1 = (ctaOffset[e] + cta + 1) * ctaTile;
-          mnLimit2 = ctaOffset[e] * ctaTile + count[e];
+          mnLimit1 = mulTileN<int32_t>(ctaOffset[e] + cta + 1, params.mTileTokensDim);
+          mnLimit2 = mulTileN<int32_t>(ctaOffset[e], params.mTileTokensDim) + count[e];
         }
         params.mPtrCtaIdxXyToMnLimit[ctaOffset[e] + cta] = min(mnLimit1, mnLimit2);
       }
@@ -1017,8 +1007,6 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
   } else {
     numCta = divUpTileN<int32_t>(count, params.mTileTokensDim);
   }
-  // Expand from CGA count to CTA count to keep the semantic stable with downstream kernels
-  numCta *= params.mClusterSizeInBatchDim;
 
   int32_t ctaOffset;
   int32_t numNonExitingCtas;
@@ -1032,13 +1020,11 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
     int32_t mnLimit1;
     int32_t mnLimit2;
     if (params.mIsPow2) {
-      int32_t ctaPaddingLog2 = params.mPaddingLog2 - params.mClusterSizeLog2;
-      mnLimit1 = mulLog2<int32_t>(ctaOffset + cta + 1, ctaPaddingLog2);
-      mnLimit2 = mulLog2<int32_t>(ctaOffset, ctaPaddingLog2) + count;
+      mnLimit1 = mulLog2<int32_t>(ctaOffset + cta + 1, params.mPaddingLog2);
+      mnLimit2 = mulLog2<int32_t>(ctaOffset, params.mPaddingLog2) + count;
     } else {
-      int32_t ctaTile = params.mTileTokensDim / params.mClusterSizeInBatchDim;
-      mnLimit1 = (ctaOffset + cta + 1) * ctaTile;
-      mnLimit2 = ctaOffset * ctaTile + count;
+      mnLimit1 = mulTileN<int32_t>(ctaOffset + cta + 1, params.mTileTokensDim);
+      mnLimit2 = mulTileN<int32_t>(ctaOffset, params.mTileTokensDim) + count;
     }
     params.mPtrCtaIdxXyToMnLimit[ctaOffset + cta] = min(mnLimit1, mnLimit2);
   }
@@ -1046,16 +1032,15 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
   // get the padded offset associated with this expert (token-space, CGA granularity)
   int32_t offset;
   if (params.mIsPow2) {
-    offset = mulLog2<int32_t>(ctaOffset >> params.mClusterSizeLog2, params.mPaddingLog2);
+    offset = mulLog2<int32_t>(ctaOffset, params.mPaddingLog2);
   } else {
-    offset = (ctaOffset / params.mClusterSizeInBatchDim) * params.mTileTokensDim;
+    offset = mulTileN<int32_t>(ctaOffset, params.mTileTokensDim);
   }
   int32_t permutedIdxSize;
   if (params.mIsPow2) {
-    permutedIdxSize =
-        mulLog2<int32_t>(numNonExitingCtas >> params.mClusterSizeLog2, params.mPaddingLog2);
+    permutedIdxSize = mulLog2<int32_t>(numNonExitingCtas, params.mPaddingLog2);
   } else {
-    permutedIdxSize = (numNonExitingCtas / params.mClusterSizeInBatchDim) * params.mTileTokensDim;
+    permutedIdxSize = mulTileN<int32_t>(numNonExitingCtas, params.mTileTokensDim);
   }
 
   // write out padded count
