@@ -1078,7 +1078,7 @@ class TestMultiBTensor:
         self, num_tokens, hidden_size, intermediate_size, num_experts, top_k
     ):
         """Test end-to-end MoE with weights split into 2 tensors."""
-        from flashinfer.cute_dsl import cute_dsl_fused_moe_nvfp4
+        from flashinfer import cute_dsl_fused_moe_nvfp4
 
         tensors = create_moe_tensors(
             num_tokens, hidden_size, intermediate_size, num_experts, num_experts, top_k
@@ -1161,7 +1161,7 @@ class TestMultiBTensor:
         self, num_tokens, hidden_size, intermediate_size, num_experts, top_k
     ):
         """Test multi-B with uneven expert split (e.g., 3+5 for 8 experts)."""
-        from flashinfer.cute_dsl import cute_dsl_fused_moe_nvfp4
+        from flashinfer import cute_dsl_fused_moe_nvfp4
 
         tensors = create_moe_tensors(
             num_tokens, hidden_size, intermediate_size, num_experts, num_experts, top_k
@@ -1234,7 +1234,7 @@ class TestMultiBTensor:
         self, num_tokens, hidden_size, intermediate_size, num_experts, top_k
     ):
         """Test that passing a single tensor wrapped in a list produces identical results."""
-        from flashinfer.cute_dsl import cute_dsl_fused_moe_nvfp4
+        from flashinfer import cute_dsl_fused_moe_nvfp4
 
         tensors = create_moe_tensors(
             num_tokens, hidden_size, intermediate_size, num_experts, num_experts, top_k
@@ -1288,7 +1288,7 @@ class TestMultiBTensor:
         The kernel has MAX_B_TENSORS=4 and specialized dispatch code for each
         count (1/2/3/4), so covering 3 and 4 here exercises the remaining paths.
         """
-        from flashinfer.cute_dsl import cute_dsl_fused_moe_nvfp4
+        from flashinfer import cute_dsl_fused_moe_nvfp4
 
         num_tokens, hidden_size, intermediate_size = 128, 512, 512
         # 12 experts for 3-way split (4+4+4), 8 experts for 4-way (2+2+2+2)
@@ -1353,7 +1353,7 @@ class TestMultiBTensor:
 
     def test_multi_b_wrapper_api(self):
         """Test CuteDslMoEWrapper with multi-B input."""
-        from flashinfer.cute_dsl import CuteDslMoEWrapper
+        from flashinfer import CuteDslMoEWrapper
 
         num_tokens, hidden_size, intermediate_size = 128, 512, 512
         num_experts, top_k = 8, 2
@@ -1418,7 +1418,7 @@ class TestMultiBTensor:
         weights without crashing on .shape[0].
         """
         from flashinfer.autotuner import autotune
-        from flashinfer.cute_dsl import cute_dsl_fused_moe_nvfp4
+        from flashinfer import cute_dsl_fused_moe_nvfp4
 
         num_tokens, hidden_size, intermediate_size = 128, 512, 512
         num_experts, top_k = 8, 2

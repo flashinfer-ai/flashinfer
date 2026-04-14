@@ -533,24 +533,25 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.vectorized_f32 = vectorized_f32
 
         # Multi-B tensor configuration
+        # b_tensor_l_sizes is required — the Python wrapper layer always provides it
+        # as a tuple (even for single-B, e.g. (256,)).
         if b_tensor_l_sizes is None:
-            self.num_b_tensors = 1
-            self.b_tensor_l_sizes = None
-            # Offsets padded for safe indexing in kernel
-            self.b_tensor_l_offsets = (0,) + (2**30,) * self.MAX_B_TENSORS
-        else:
-            assert len(b_tensor_l_sizes) <= self.MAX_B_TENSORS, (
-                f"Max {self.MAX_B_TENSORS} B tensors, got {len(b_tensor_l_sizes)}"
+            raise ValueError(
+                "b_tensor_l_sizes is required. Pass a tuple with the number of "
+                "experts per tensor, e.g. (num_experts,) for single-B."
             )
-            self.num_b_tensors = len(b_tensor_l_sizes)
-            self.b_tensor_l_sizes = b_tensor_l_sizes
-            offsets = [0]
-            for l_size in b_tensor_l_sizes:
-                offsets.append(offsets[-1] + l_size)
-            # Pad to MAX_B_TENSORS + 1 for safe indexing
-            while len(offsets) < self.MAX_B_TENSORS + 1:
-                offsets.append(2**30)
-            self.b_tensor_l_offsets = tuple(offsets)
+        assert len(b_tensor_l_sizes) <= self.MAX_B_TENSORS, (
+            f"Max {self.MAX_B_TENSORS} B tensors, got {len(b_tensor_l_sizes)}"
+        )
+        self.num_b_tensors = len(b_tensor_l_sizes)
+        self.b_tensor_l_sizes = b_tensor_l_sizes
+        offsets = [0]
+        for l_size in b_tensor_l_sizes:
+            offsets.append(offsets[-1] + l_size)
+        # Pad to MAX_B_TENSORS + 1 for safe indexing
+        while len(offsets) < self.MAX_B_TENSORS + 1:
+            offsets.append(2**30)
+        self.b_tensor_l_offsets = tuple(offsets)
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -2973,44 +2974,50 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 #
                 expert_idx = mma_tile_coord_mnl[2]
 
-                # Select alpha from correct tensor based on expert_idx
-                alpha_val = alpha_tuple[0][expert_idx - self.b_tensor_l_offsets[0]]
+                # Select alpha from correct tensor based on expert_idx.
+                # Pre-initialize alpha_val for CuTe DSL type tracking — the DSL
+                # requires variables to have a consistent type before entering
+                # dynamic (runtime) if branches. Index 0 is always in-bounds.
+                alpha_val = alpha_tuple[0][0]
                 if cutlass.const_expr(self.num_b_tensors == 1):
-                    pass  # Already initialized above
+                    alpha_val = alpha_tuple[0][expert_idx - self.b_tensor_l_offsets[0]]
                 elif cutlass.const_expr(self.num_b_tensors == 2):
-                    if expert_idx >= self.b_tensor_l_offsets[1]:
+                    if expert_idx < self.b_tensor_l_offsets[1]:
+                        alpha_val = alpha_tuple[0][
+                            expert_idx - self.b_tensor_l_offsets[0]
+                        ]
+                    else:
                         alpha_val = alpha_tuple[1][
                             expert_idx - self.b_tensor_l_offsets[1]
                         ]
                 elif cutlass.const_expr(self.num_b_tensors == 3):
-                    if (
-                        expert_idx >= self.b_tensor_l_offsets[1]
-                        and expert_idx < self.b_tensor_l_offsets[2]
-                    ):
+                    if expert_idx < self.b_tensor_l_offsets[1]:
+                        alpha_val = alpha_tuple[0][
+                            expert_idx - self.b_tensor_l_offsets[0]
+                        ]
+                    elif expert_idx < self.b_tensor_l_offsets[2]:
                         alpha_val = alpha_tuple[1][
                             expert_idx - self.b_tensor_l_offsets[1]
                         ]
-                    elif expert_idx >= self.b_tensor_l_offsets[2]:
+                    else:
                         alpha_val = alpha_tuple[2][
                             expert_idx - self.b_tensor_l_offsets[2]
                         ]
                 else:
                     # 4 B tensors
-                    if (
-                        expert_idx >= self.b_tensor_l_offsets[1]
-                        and expert_idx < self.b_tensor_l_offsets[2]
-                    ):
+                    if expert_idx < self.b_tensor_l_offsets[1]:
+                        alpha_val = alpha_tuple[0][
+                            expert_idx - self.b_tensor_l_offsets[0]
+                        ]
+                    elif expert_idx < self.b_tensor_l_offsets[2]:
                         alpha_val = alpha_tuple[1][
                             expert_idx - self.b_tensor_l_offsets[1]
                         ]
-                    elif (
-                        expert_idx >= self.b_tensor_l_offsets[2]
-                        and expert_idx < self.b_tensor_l_offsets[3]
-                    ):
+                    elif expert_idx < self.b_tensor_l_offsets[3]:
                         alpha_val = alpha_tuple[2][
                             expert_idx - self.b_tensor_l_offsets[2]
                         ]
-                    elif expert_idx >= self.b_tensor_l_offsets[3]:
+                    else:
                         alpha_val = alpha_tuple[3][
                             expert_idx - self.b_tensor_l_offsets[3]
                         ]

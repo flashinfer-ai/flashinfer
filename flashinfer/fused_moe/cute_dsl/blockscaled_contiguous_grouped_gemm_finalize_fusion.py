@@ -376,9 +376,17 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         ... )  # out shape: (seq_len, hidden_dim)
     """
     # Normalize to lists for multi-B support
-    b_list = [b] if isinstance(b, torch.Tensor) else b
-    b_scale_list = [b_scale] if isinstance(b_scale, torch.Tensor) else b_scale
-    alpha_list = [alpha] if isinstance(alpha, torch.Tensor) else alpha
+    b_list = [b] if isinstance(b, torch.Tensor) else list(b)
+    b_scale_list = [b_scale] if isinstance(b_scale, torch.Tensor) else list(b_scale)
+    alpha_list = [alpha] if isinstance(alpha, torch.Tensor) else list(alpha)
+
+    # Validate multi-B inputs
+    assert len(b_list) > 0, "Weight tensor list must not be empty"
+    assert len(b_list) <= 4, f"Maximum 4 weight tensors supported, got {len(b_list)}"
+    assert len(b_list) == len(b_scale_list) == len(alpha_list), (
+        f"b, b_scale, alpha lists must have same length: "
+        f"{len(b_list)}, {len(b_scale_list)}, {len(alpha_list)}"
+    )
 
     # Validate inputs
     assert a.device.type == "cuda", "Input tensors must be on CUDA device"
