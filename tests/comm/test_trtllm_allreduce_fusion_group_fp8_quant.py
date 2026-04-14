@@ -134,6 +134,7 @@ def _run_correctness_worker(
     hidden_dim: int,
     token_num: int,
     group_size: int,
+    use_oneshot: bool,
     store_path: str,
     gpu_offset: int = 0,
 ):
@@ -201,7 +202,7 @@ def _run_correctness_worker(
             rms_eps=1e-5,
             block_quant_group_size=group_size,
             fp32_acc=True,
-            use_oneshot=True,
+            use_oneshot=use_oneshot,
         )
         torch.cuda.synchronize()
 
@@ -238,6 +239,7 @@ def _multi_process_parallel(
     hidden_dim: int,
     token_num: int,
     group_size: int,
+    use_oneshot: bool,
     gpu_offset: int = 0,
 ) -> None:
     mp.set_start_method("spawn", force=True)
@@ -253,6 +255,7 @@ def _multi_process_parallel(
                 hidden_dim,
                 token_num,
                 group_size,
+                use_oneshot,
                 store_file,
                 gpu_offset,
             ),
@@ -300,19 +303,25 @@ def _multi_process_parallel(
 )
 @pytest.mark.parametrize("world_size", [2, 4])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("use_oneshot", [True, False])
 def test_allreduce_rmsnorm_group_fp8_quant(
     world_size,
     dtype,
     hidden_dim,
     token_num,
     group_size,
+    use_oneshot,
 ):
     available_gpus = torch.cuda.device_count()
     if world_size > available_gpus:
         pytest.skip(f"Need {world_size} GPUs, have {available_gpus}")
+    if not use_oneshot and token_num <= world_size:
+        pytest.skip("Twoshot requires token_num > world_size")
 
     np.random.seed(42)
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
 
-    _multi_process_parallel(world_size, dtype, hidden_dim, token_num, group_size)
+    _multi_process_parallel(
+        world_size, dtype, hidden_dim, token_num, group_size, use_oneshot
+    )
