@@ -471,8 +471,10 @@ class MoEStaticKernel:
                 offset = _align_up(offset, self.buffer_align_bytes)
         return offset
 
-    def _setup_attributes(self):
+    def _setup_attributes(self, hidden_size: int):
         import cutlass.utils.blackwell_helpers as sm120_utils
+
+        self._hidden_size = hidden_size
 
         mma_op = cute.nvgpu.warp.MmaMXF4NVF4Op(
             self.a_dtype,
@@ -522,10 +524,11 @@ class MoEStaticKernel:
             self.occupancy,
         )
         self.ab_stage = max(1, min(self.ab_stage, 2))
-        # ab_stage must divide k_tile_cnt (K/tile_K = 4096/128 = 32) evenly.
-        # _compute_stages returns the max that fits in smem (e.g. 3), but
-        # 32%3!=0 causes pipeline phase mismatch. Round down to nearest divisor.
-        while self.ab_stage > 1 and 32 % self.ab_stage != 0:
+        # ab_stage must divide k_tile_cnt evenly to avoid pipeline phase mismatch.
+        # _compute_stages returns the max that fits in smem, but it may not
+        # divide k_tile_cnt. Round down to the nearest divisor.
+        k_tile_cnt = self._hidden_size // self.tile_shape_mnk[2]
+        while self.ab_stage > 1 and k_tile_cnt % self.ab_stage != 0:
             self.ab_stage -= 1
         self.epi_stage = 1
         while True:
@@ -612,7 +615,8 @@ class MoEStaticKernel:
         # Compact static always scatters into token-major row-major output.
         self.c_layout = utils.LayoutEnum.ROW_MAJOR
 
-        self._setup_attributes()
+        hidden_size = a_input.shape[1]
+        self._setup_attributes(hidden_size=hidden_size)
 
         sfa_layout = blockscaled_utils.tile_atom_to_shape_SF(
             packed_a.shape, self.sf_vec_size

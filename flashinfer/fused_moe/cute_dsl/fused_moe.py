@@ -194,6 +194,12 @@ def _moe_core_impl(
             num_local_experts if num_local_experts is not None else num_experts
         )
 
+        if local_expert_offset != 0:
+            raise ValueError(
+                "SM120 MoE does not support expert parallelism (local_expert_offset != 0). "
+                "Use the SM100 CuTe DSL or CUTLASS backend for EP configurations."
+            )
+
         if moe_output is None:
             moe_output = torch.empty(
                 (num_tokens, hidden_size),
@@ -671,13 +677,27 @@ class CuteDslMoEWrapper:
                     "SM120 CuteDslMoEWrapper.run() requires x_bf16 parameter "
                     "(original bf16 activations)."
                 )
+            if self.local_expert_offset != 0:
+                raise ValueError(
+                    "SM120 MoE does not support expert parallelism "
+                    "(local_expert_offset != 0)."
+                )
             from .blackwell_geforce.moe_dispatch import (
                 launch_sm120_moe,
                 _get_weight_views as _get_sm120_weight_views,
             )
 
-            # Cache weight views on first call
-            if self._sm120_weight_views is None:
+            # Cache weight views; invalidate if weight pointers change.
+            weight_key = (
+                w1_weight.data_ptr(),
+                w1_weight_sf.data_ptr(),
+                w2_weight.data_ptr(),
+                w2_weight_sf.data_ptr(),
+            )
+            if (
+                self._sm120_weight_views is None
+                or getattr(self, "_sm120_weight_key", None) != weight_key
+            ):
                 self._sm120_weight_views = _get_sm120_weight_views(
                     w1_fp4=w1_weight,
                     w1_blockscale=w1_weight_sf,
@@ -688,6 +708,7 @@ class CuteDslMoEWrapper:
                     n=self.intermediate_size,
                     k=self.hidden_size,
                 )
+                self._sm120_weight_key = weight_key
 
             return launch_sm120_moe(
                 a=x_bf16,
@@ -890,6 +911,11 @@ def cute_dsl_fused_moe_nvfp4(
                 "SM120/SM121 cute_dsl_fused_moe_nvfp4 requires x_bf16 parameter "
                 "(original bf16 activations). The SM120 kernel fuses quantization "
                 "internally and cannot accept pre-quantized FP4 input."
+            )
+        if local_expert_offset != 0:
+            raise ValueError(
+                "SM120 MoE does not support expert parallelism "
+                "(local_expert_offset != 0)."
             )
         return _moe_core_impl(
             x=x_bf16,

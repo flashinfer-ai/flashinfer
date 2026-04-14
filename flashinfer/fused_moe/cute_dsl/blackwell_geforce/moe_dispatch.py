@@ -14,6 +14,7 @@ import cutlass.cute as cute
 import torch
 
 from flashinfer.cute_dsl.utils import (
+    convert_sf_from_mma_layout,
     get_max_active_clusters,
     get_num_sm,
     make_ptr,
@@ -187,6 +188,14 @@ def _get_weight_views(
     The kernel expects concatenated w13 data with shape [2*n, k//2, E]
     via a single TMA descriptor.
     """
+    # The kernel splits w13 into gate/up halves by tile index. This only works
+    # when the boundary between halves lands on a tile-aligned column.
+    if n % _LEVEL_TILE_N != 0:
+        raise ValueError(
+            f"intermediate_size ({n}) must be a multiple of {_LEVEL_TILE_N} "
+            f"for the SM120 MoE kernel's gate/up tile split."
+        )
+
     key = (
         w1_fp4.data_ptr(),
         w1_blockscale.data_ptr(),
@@ -207,8 +216,6 @@ def _get_weight_views(
     # We need the ORIGINAL physical storage, not .contiguous() of the view
     # (which would write in permuted logical order).
     # convert_sf_from_mma_layout reverses the permutation back to 2D swizzled.
-    from flashinfer.cute_dsl.utils import convert_sf_from_mma_layout
-
     sf_dtype = cutlass.Float8E4M3FN
     w13_sf_contiguous = convert_sf_from_mma_layout(
         w1_blockscale,
@@ -1196,14 +1203,22 @@ def _get_cached_workspace(
 ) -> _Sm120Workspace:
     """Get or allocate a cached workspace for the given problem shape.
 
-    Reuses the cached workspace if it has enough capacity (max_rows >= routed_rows).
-    Otherwise, re-allocates with the larger capacity and updates the cache.
+    Reuses the cached workspace if it has enough capacity for the requested
+    routed_rows. For static workspaces, max_rows is the direct capacity.
+    For dynamic workspaces, routed_rows_capacity is used because the dynamic
+    geometry (physical tiles, task queue slots) depends on the original
+    routed_rows, not just max_rows.
     """
     cache_key = (state_E, weight_E, k, n, num_topk, str(device), backend)
     cached = _WORKSPACE_CACHE.get(cache_key)
 
-    if cached is not None and cached.max_rows >= max(1, routed_rows):
-        return cached
+    if cached is not None:
+        if backend == "dynamic":
+            if cached.routed_rows_capacity >= max(1, routed_rows):  # type: ignore[union-attr]
+                return cached
+        else:
+            if cached.max_rows >= max(1, routed_rows):
+                return cached
 
     # Allocate new workspace (or grow existing)
     workspace: _Sm120Workspace
@@ -1285,6 +1300,13 @@ def launch_sm120_moe(
     )
 
     backend = select_sm120_moe_backend(num_tokens=num_tokens, num_topk=top_k)
+
+    # The dynamic kernel indexes row_counts/expert_write_rows directly with
+    # topk_ids but those buffers are sized with num_local_experts. Unless
+    # num_local_experts == num_experts, fall back to the static backend which
+    # has global-to-local expert remapping.
+    if backend == "dynamic" and num_local_experts != num_experts:
+        backend = "static"
 
     # Resolve workspace: caller-provided > cached > fresh allocation.
     if _workspace is not None:

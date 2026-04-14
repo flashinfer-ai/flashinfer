@@ -466,7 +466,7 @@ class TestCuteDslFusedMoeFunctional:
 
 
 @cute_dsl_available
-@sm100_only
+@sm100_required
 class TestCuteDslMoEWrapper:
     """Tests for the wrapper API: CuteDslMoEWrapper."""
 
@@ -509,6 +509,7 @@ class TestCuteDslMoEWrapper:
             w2_weight=tensors["w2_weight"],
             w2_weight_sf=tensors["w2_weight_sf"],
             w2_alpha=tensors["w2_alpha"],
+            x_bf16=tensors["x_bf16"],
         )
 
         assert result.shape == (num_tokens, hidden_size)
@@ -576,6 +577,7 @@ class TestCuteDslMoEWrapper:
                 w2_weight=tensors["w2_weight"],
                 w2_weight_sf=tensors["w2_weight_sf"],
                 w2_alpha=tensors["w2_alpha"],
+                x_bf16=tensors["x_bf16"],
             )
         torch.cuda.synchronize()
 
@@ -594,6 +596,7 @@ class TestCuteDslMoEWrapper:
                 w2_weight=tensors["w2_weight"],
                 w2_weight_sf=tensors["w2_weight_sf"],
                 w2_alpha=tensors["w2_alpha"],
+                x_bf16=tensors["x_bf16"],
             )
         torch.cuda.synchronize()
 
@@ -680,6 +683,7 @@ class TestCuteDslMoEWrapper:
                 w2_weight=tensors["w2_weight"],
                 w2_weight_sf=tensors["w2_weight_sf"],
                 w2_alpha=tensors["w2_alpha"],
+                x_bf16=tensors["x_bf16"],
             )
 
         assert result.shape == (num_tokens, hidden_size)

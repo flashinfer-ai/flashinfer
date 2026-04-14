@@ -1361,6 +1361,7 @@ def testCuteDslFp4BlockScaleMoe(args):
 
     if use_functional:
         from flashinfer import cute_dsl_fused_moe_nvfp4
+        from functools import partial
 
         if args.verbose >= 1:
             print(
@@ -1372,8 +1373,17 @@ def testCuteDslFp4BlockScaleMoe(args):
             num_tokens, hidden_size, dtype=torch.bfloat16, device=device
         )
 
+        runner = partial(
+            cute_dsl_fused_moe_nvfp4,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=local_num_experts,
+            local_expert_offset=local_expert_offset,
+            moe_output=moe_output,
+        )
+
         # Warmup call to populate workspace cache before timed region
-        cute_dsl_fused_moe_nvfp4(
+        runner(
             x=tensors["x"],
             x_sf=tensors["x_sf"],
             token_selected_experts=tensors["token_selected_experts"],
@@ -1385,45 +1395,8 @@ def testCuteDslFp4BlockScaleMoe(args):
             w2_weight=tensors["w2_weight"],
             w2_weight_sf=tensors["w2_weight_sf"],
             w2_alpha=tensors["w2_alpha"],
-            num_experts=num_experts,
-            top_k=top_k,
-            num_local_experts=local_num_experts,
             x_bf16=tensors["x_bf16"],
-            moe_output=moe_output,
         )
-
-        def run_cute_dsl_moe(
-            x,
-            x_sf,
-            token_selected_experts,
-            token_final_scales,
-            w1_weight,
-            w1_weight_sf,
-            w1_alpha,
-            fc2_input_scale,
-            w2_weight,
-            w2_weight_sf,
-            w2_alpha,
-            x_bf16=None,
-        ):
-            return cute_dsl_fused_moe_nvfp4(
-                x=x,
-                x_sf=x_sf,
-                token_selected_experts=token_selected_experts,
-                token_final_scales=token_final_scales,
-                w1_weight=w1_weight,
-                w1_weight_sf=w1_weight_sf,
-                w1_alpha=w1_alpha,
-                fc2_input_scale=fc2_input_scale,
-                w2_weight=w2_weight,
-                w2_weight_sf=w2_weight_sf,
-                w2_alpha=w2_alpha,
-                num_experts=num_experts,
-                top_k=top_k,
-                num_local_experts=local_num_experts,
-                x_bf16=x_bf16,
-                moe_output=moe_output,
-            )
     else:
         moe = CuteDslMoEWrapper(
             num_experts=num_experts,
@@ -1435,35 +1408,36 @@ def testCuteDslFp4BlockScaleMoe(args):
             num_local_experts=local_num_experts,
             local_expert_offset=local_expert_offset,
         )
+        runner = moe.run
 
-        def run_cute_dsl_moe(
-            x,
-            x_sf,
-            token_selected_experts,
-            token_final_scales,
-            w1_weight,
-            w1_weight_sf,
-            w1_alpha,
-            fc2_input_scale,
-            w2_weight,
-            w2_weight_sf,
-            w2_alpha,
-            x_bf16=None,
-        ):
-            return moe.run(
-                x=x,
-                x_sf=x_sf,
-                token_selected_experts=token_selected_experts,
-                token_final_scales=token_final_scales,
-                w1_weight=w1_weight,
-                w1_weight_sf=w1_weight_sf,
-                w1_alpha=w1_alpha,
-                fc2_input_scale=fc2_input_scale,
-                w2_weight=w2_weight,
-                w2_weight_sf=w2_weight_sf,
-                w2_alpha=w2_alpha,
-                x_bf16=x_bf16,
-            )
+    def run_cute_dsl_moe(
+        x,
+        x_sf,
+        token_selected_experts,
+        token_final_scales,
+        w1_weight,
+        w1_weight_sf,
+        w1_alpha,
+        fc2_input_scale,
+        w2_weight,
+        w2_weight_sf,
+        w2_alpha,
+        x_bf16=None,
+    ):
+        return runner(
+            x=x,
+            x_sf=x_sf,
+            token_selected_experts=token_selected_experts,
+            token_final_scales=token_final_scales,
+            w1_weight=w1_weight,
+            w1_weight_sf=w1_weight_sf,
+            w1_alpha=w1_alpha,
+            fc2_input_scale=fc2_input_scale,
+            w2_weight=w2_weight,
+            w2_weight_sf=w2_weight_sf,
+            w2_alpha=w2_alpha,
+            x_bf16=x_bf16,
+        )
 
     input_args = (
         tensors["x"],

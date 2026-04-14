@@ -302,8 +302,10 @@ class MoEDynamicKernel:
     def _get_layoutSFB_TV(self, tiled_mma):
         return self._dense_cls._get_layoutSFB_TV(self, tiled_mma)  # type: ignore[arg-type]
 
-    def _setup_attributes(self):
+    def _setup_attributes(self, hidden_size: int):
         import cutlass.utils.blackwell_helpers as sm120_utils
+
+        self._hidden_size = hidden_size
 
         mma_op = cute.nvgpu.warp.MmaMXF4NVF4Op(
             self.a_dtype,
@@ -352,10 +354,11 @@ class MoEDynamicKernel:
             self.smem_capacity,
             self.occupancy,
         )
-        # ab_stage must divide k_tile_cnt (K/tile_K = 4096/128 = 32) evenly.
-        # _compute_stages returns the max that fits in smem (e.g. 3), but
-        # 32%3!=0 causes pipeline phase mismatch. Round down to nearest divisor.
-        while self.ab_stage > 1 and 32 % self.ab_stage != 0:
+        # ab_stage must divide k_tile_cnt evenly to avoid pipeline phase mismatch.
+        # _compute_stages returns the max that fits in smem, but it may not
+        # divide k_tile_cnt. Round down to the nearest divisor.
+        k_tile_cnt = self._hidden_size // self.tile_shape_mnk[2]
+        while self.ab_stage > 1 and k_tile_cnt % self.ab_stage != 0:
             self.ab_stage -= 1
         self.epi_stage = 1
         (
@@ -492,7 +495,8 @@ class MoEDynamicKernel:
         # original row-major epilogue layout without carrying a dead memref.
         self.c_layout = utils.LayoutEnum.ROW_MAJOR
 
-        self._setup_attributes()
+        hidden_size = a_input.shape[1]
+        self._setup_attributes(hidden_size=hidden_size)
 
         sfa_layout = blockscaled_utils.tile_atom_to_shape_SF(
             packed_a.shape, self.sf_vec_size
@@ -707,6 +711,10 @@ class MoEDynamicKernel:
 
         @cute.struct
         class Storage:
+            # ctrl layout (8 x Int32, accessed via raw shared memory PTX):
+            #   [0] has_task     [4] done          [8]  expert_idx
+            #   [12] m_tile_idx  [16] slice_begin   [20] slice_count
+            #   [24] valid_rows  [28] batch_base
             ctrl: cute.struct.MemRange[cutlass.Int32, 8]
             pipeline_array: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
             up_pipeline_array: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
