@@ -807,9 +807,8 @@ struct AllReduceFusionParams {
   cudaStream_t stream;
   AllReduceFusionPattern pattern;
   bool trigger_completion_at_end = true;
-  int block_quant_group_size = 128;  // For kPerTokenGroupFP8Packed: elements per quantization group
-  int tma_aligned_mn =
-      0;  // For kPerTokenGroupFP8Packed: TMA-aligned token count for packed scale layout
+  int block_quant_group_size = 0;
+  int tma_aligned_mn = 0;
 };
 
 template <int NRanks>
@@ -1008,9 +1007,6 @@ class FusedOp {
       reinterpret_cast<PackedQuantizedType*>(m_params.quant_out)[m_access_id] = ret;
     } else if constexpr (GetQuantType<Pattern> == QuantType::kPerTokenGroupFP8Packed) {
       // Per-token-group FP8 quantization with UE8M0 packed scales.
-      // CONSTRAINT: block_quant_group_size / VEC_SIZE must be a power of 2
-      // (e.g., 128/8=16 or 64/8=8) for the warp-shuffle reduction to stay
-      // within group boundaries.
       constexpr float FP8_E4M3_MAX = 448.0f;
 
       // local max reduce
@@ -1030,21 +1026,15 @@ class FusedOp {
       float group_absmax = local_absmax;
 
       // Compute UE8M0 scale: round (absmax / 448) up to the next power of 2.
-      // Use bit manipulation instead of exp2f(ceilf(log2f(...))) because
-      // --use_fast_math replaces log2f with __log2f which has ≤2 ULP error
-      // and returns e.g. -5.999999 instead of -6.0 for exact powers of 2,
-      // causing ceilf to round up incorrectly.
       float y_s = fmaxf(group_absmax / FP8_E4M3_MAX, 1e-10f);
       unsigned int y_s_bits = __float_as_uint(y_s);
       if (y_s_bits & 0x7fffff) {
-        // Not a power of 2: increment exponent, clear mantissa.
+        // Not a power of 2: increment exponent by 1, clear mantissa.
         y_s_bits = (y_s_bits + 0x800000) & 0x7f800000;
       }
       y_s = __uint_as_float(y_s_bits);
 
-      // quantize elements to FP8
-      // NOTE: use division (val / y_s) not multiplication by reciprocal (val * (1/y_s))
-      // to match the standalone per_token_group_quant kernel's precision.
+      // quantize elements to FP8_E4M3
       using PackedQuantizedType = std::conditional_t<std::is_same_v<T, float>, float, float2>;
       PackedQuantizedType ret;
 #pragma unroll
@@ -1055,7 +1045,7 @@ class FusedOp {
       }
       reinterpret_cast<PackedQuantizedType*>(m_params.quant_out)[m_access_id] = ret;
 
-      // Write packed UE8M0 scale + zero padding to match standalone kernel.
+      // write packed UE8M0 scale + zero padding
       int lane_in_group = m_access_id_in_token % group_size_in_vecs;
       if (lane_in_group == 0) {
         int group_idx_in_row = m_access_id_in_token / group_size_in_vecs;
@@ -1066,7 +1056,7 @@ class FusedOp {
         int pos = group_idx_in_row % 4;
         int elem_idx = pack_idx * m_params.tma_aligned_mn + token_id;
 
-        // Write valid exponent
+        // write valid exponent
         unsigned int bits = __float_as_uint(y_s);
         uint8_t exponent = static_cast<uint8_t>((bits >> 23u) & 0xffu);
         reinterpret_cast<uint8_t*>(m_params.scale_out)[elem_idx * 4 + pos] = exponent;

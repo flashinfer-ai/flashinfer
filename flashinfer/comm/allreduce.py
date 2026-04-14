@@ -471,6 +471,8 @@ def allreduce_fusion(
     # ===== Control parameters =====
     use_oneshot: Optional[bool] = None,
     fp32_acc: bool = False,
+    # ===== Group quant parameters =====
+    block_quant_group_size: Optional[int] = None,
     # ===== MOE Reduction parameters (pattern=kMoEReductionARResidualRMSNorm) =====
     moe_reduction_device_num_experts: Optional[int] = None,
     moe_reduction_scale_input: Optional[torch.Tensor] = None,
@@ -480,7 +482,6 @@ def allreduce_fusion(
     expanded_idx_to_permuted_idx: Optional[torch.Tensor] = None,
     expert_scale_factor: Optional[torch.Tensor] = None,
     shared_expert_output: Optional[torch.Tensor] = None,
-    block_quant_group_size: Optional[int] = None,
 ) -> torch.Tensor:
     """
     AllReduce + RMSNorm fusion operation.
@@ -617,12 +618,6 @@ def allreduce_fusion(
         ...     shared_expert_output=shared_expert_out,
         ... )
     """
-    # Validate block_quant_group_size for per-token-group FP8 packed quant
-    if block_quant_group_size is not None and block_quant_group_size not in (64, 128):
-        raise ValueError(
-            f"block_quant_group_size must be 64 or 128, got {block_quant_group_size}"
-        )
-
     # Dispatch based on workspace type
     if isinstance(workspace, TRTLLMAllReduceFusionWorkspace):
         # TensorRT-LLM backend implementation
@@ -738,7 +733,20 @@ def allreduce_fusion(
 
             return norm_out
 
-        # ---- Standard patterns (0-5) ----
+        if pattern in [
+            AllReduceFusionPattern.kARResidualRMSNormPerTokenGroupFP8PackedQuant,
+            AllReduceFusionPattern.kARResidualRMSNormOutPerTokenGroupFP8PackedQuant,
+        ]:
+            if block_quant_group_size is None:
+                raise ValueError(
+                    f"block_quant_group_size is required for pattern: {pattern}"
+                )
+            if block_quant_group_size not in (64, 128):
+                raise ValueError(
+                    f"block_quant_group_size must be 64 or 128, got {block_quant_group_size}"
+                )
+
+        # ---- Standard patterns ----
         # Extract shape from 2D input
         token_num, hidden_dim = input.shape
 

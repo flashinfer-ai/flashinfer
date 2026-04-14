@@ -79,11 +79,10 @@ def ref_per_token_group_quant_fp8_packed(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Reference per-token-group FP8 quantization with UE8M0 packed scales.
 
-    Mirrors the fused kernel:
-      1. Per-group absmax
-      2. UE8M0 scale = 2^ceil(log2(max(absmax / 448, 1e-10)))
-      3. Quantize: clamp(x / scale, -448, 448) -> fp8_e4m3
-      4. Pack exponents 4-per-int32 in TMA-aligned column-major layout
+    1. Per-group absmax
+    2. UE8M0 scale = 2^ceil(log2(max(absmax / 448, 1e-10)))
+    3. Quantize: clamp(x / scale, -448, 448) -> fp8_e4m3
+    4. Pack exponents 4-per-int32 in TMA-aligned column-major layout
     """
     token_num, hidden_dim = x.shape
     groups_per_row = hidden_dim // group_size
@@ -206,14 +205,13 @@ def _run_correctness_worker(
         )
         torch.cuda.synchronize()
 
-        # Verify against reference quantization of norm_out
+        # run reference quantization on norm_out
         ref_quant, ref_scale = ref_per_token_group_quant_fp8_packed(
             norm_out,
             group_size,
         )
 
-        # Packed scales must match exactly (bit manipulation avoids
-        # log2f precision issues under --use_fast_math).
+        # verify packed scales match exactly
         fused_scale_flat = torch.as_strided(scale_out, (num_scale_elems,), (1,)).cpu()
         ref_scale_flat = torch.as_strided(ref_scale, (num_scale_elems,), (1,)).cpu()
         assert torch.equal(fused_scale_flat, ref_scale_flat), (
@@ -221,7 +219,7 @@ def _run_correctness_worker(
             f"{(fused_scale_flat != ref_scale_flat).sum().item()}/{num_scale_elems} differ"
         )
 
-        # Quantized activations must match exactly.
+        # verify quantized activations match exactly
         assert torch.equal(quant_out.view(torch.uint8), ref_quant.view(torch.uint8)), (
             "FP8 quant mismatch: "
             f"{(quant_out.view(torch.uint8) != ref_quant.view(torch.uint8)).sum().item()}"
@@ -243,9 +241,6 @@ def _multi_process_parallel(
     gpu_offset: int = 0,
 ) -> None:
     mp.set_start_method("spawn", force=True)
-    # Use a file-based store to avoid TCP port race conditions (EADDRINUSE).
-    # The file must not exist when FileStore initializes, so we create a
-    # temp path and delete it before spawning workers.
     store_file = tempfile.mktemp(prefix="flashinfer_dist_store_")
     procs = []
     for i in range(world_size):
@@ -294,6 +289,13 @@ def _multi_process_parallel(
         # hidden=256, groups_per_row=2, k_num_packed=1
         (256, 4, 128),  # 2 groups per row, no padding
         (256, 1, 128),  # 2 groups, MN padding
+        # group_size=64 cases
+        (7168, 4, 64),  # groups_per_row=112 (112%4=0, no K padding)
+        (7168, 3, 64),  # MN padding only
+        (768, 4, 64),  # groups_per_row=12 (12%4=0, no K padding)
+        (768, 3, 64),  # MN padding only
+        (640, 4, 64),  # groups_per_row=10 (10%4=2, K padding)
+        (640, 3, 64),  # both MN and K padding
     ],
 )
 @pytest.mark.parametrize("world_size", [2, 4])
