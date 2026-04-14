@@ -8,7 +8,9 @@ All implementations use cuDNN's ``moe_grouped_matmul`` as the backend.
 """
 
 from .core import grouped_mm_bf16 as grouped_mm_bf16
+from .core import grouped_mm_fp8 as grouped_mm_fp8
 
 __all__ = [
     "grouped_mm_bf16",
+    "grouped_mm_fp8",
 ]
