@@ -750,8 +750,10 @@ class CuteDslMoEWrapper:
         ]
 
         if tactic is not None:
+            # Use provided tactic
             return self._runner(inputs, tactic=tactic)
 
+        # Let tuner choose tactic
         _, best_tactic = tuner.choose_one(
             "CuteDslMoEWrapper::run",
             [self._runner],
