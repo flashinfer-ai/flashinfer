@@ -1011,39 +1011,70 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
   float dB_coeff[4];
   precompute_dB_coeff(dB_coeff, smem, total_cumAdt, prev_k, lane);
 
+  // Process two N-tiles per iteration: interleave LDSM.T + dB_scaling across tiles
+  // so PRMT has more latency cover from the other tile's loads.
+  static_assert(NUM_N_TILES % 2 == 0, "NUM_N_TILES must be even for 2-wide N-tile loop");
+
 #pragma unroll
-  for (int n = 0; n < NUM_N_TILES; ++n) {
-    // Load state into f32 accumulator
-    Tensor frag_h = thr_mma.partition_fragment_C(
+  for (int n = 0; n < NUM_N_TILES; n += 2) {
+    // ── Load state for both N-tiles ──
+    Tensor frag_h_0 = thr_mma.partition_fragment_C(
+        make_tensor((float*)0x0, make_shape(Int<DIM>{}, Int<N_TILE>{})));
+    Tensor frag_h_1 = thr_mma.partition_fragment_C(
         make_tensor((float*)0x0, make_shape(Int<DIM>{}, Int<N_TILE>{})));
 
 #pragma unroll
-    for (int i = 0; i < size(frag_h); ++i) {
+    for (int i = 0; i < size(frag_h_0); i += 2) {
       int row = get<0>(id_part(i));
-      int col = n * N_TILE + get<1>(id_part(i));
-      frag_h(i) = toFloat(state_base[layout_state_swz(row, col)]) * total_decay;
+      int col0 = n * N_TILE + get<1>(id_part(i));
+      int col1 = (n + 1) * N_TILE + get<1>(id_part(i));
+      state_t p0[2], p1[2];
+      memcpy(p0, &state_base[layout_state_swz(row, col0)], 4);
+      memcpy(p1, &state_base[layout_state_swz(row, col1)], 4);
+      frag_h_0(i) = toFloat(p0[0]) * total_decay;
+      frag_h_0(i + 1) = toFloat(p0[1]) * total_decay;
+      frag_h_1(i) = toFloat(p1[0]) * total_decay;
+      frag_h_1(i + 1) = toFloat(p1[1]) * total_decay;
     }
 
-    // Load old_B for this N-tile via ldmatrix.trans, then apply precomputed coefficients
-    Tensor smem_B_ntile =
+    // ── LDSM.T both B tiles, then scale both — interleaved for latency cover ──
+    Tensor smem_B_ntile_0 =
         local_tile(smem_B_full, make_tile(Int<N_TILE>{}, Int<NTOKENS_PAD>{}), make_coord(n, _0{}));
-    Tensor smem_B_s2r = s2r_thr_B.partition_S(smem_B_ntile);
-    Tensor frag_B = thr_mma.partition_fragment_B(
+    Tensor smem_B_ntile_1 = local_tile(smem_B_full, make_tile(Int<N_TILE>{}, Int<NTOKENS_PAD>{}),
+                                       make_coord(n + 1, _0{}));
+
+    auto smem_B_s2r_0 = s2r_thr_B.partition_S(smem_B_ntile_0);
+    auto smem_B_s2r_1 = s2r_thr_B.partition_S(smem_B_ntile_1);
+
+    Tensor frag_B_0 = thr_mma.partition_fragment_B(
         make_tensor((mma_type*)0x0, make_shape(Int<N_TILE>{}, Int<NTOKENS_PAD>{})));
-    Tensor frag_B_view = s2r_thr_B.retile_D(frag_B);
-    cute::copy(s2r_B, smem_B_s2r, frag_B_view);
+    Tensor frag_B_1 = make_fragment_like(frag_B_0);
+    auto frag_B_view_0 = s2r_thr_B.retile_D(frag_B_0);
+    auto frag_B_view_1 = s2r_thr_B.retile_D(frag_B_1);
 
-    // Apply precomputed coefficients (convert + scale, no LDS/expf/branch)
-    compute_dB_scaling<input_t, mma_type>(frag_B, dB_coeff);
+    cute::copy(s2r_B, smem_B_s2r_0, frag_B_view_0);
+    cute::copy(s2r_B, smem_B_s2r_1, frag_B_view_1);
 
-    cute::gemm(tiled_mma, frag_h, frag_A, frag_B, frag_h);
+    compute_dB_scaling<input_t, mma_type>(frag_B_0, dB_coeff);
+    compute_dB_scaling<input_t, mma_type>(frag_B_1, dB_coeff);
 
-    // Store back
+    // ── Two independent HMMAs ──
+    cute::gemm(tiled_mma, frag_h_0, frag_A, frag_B_0, frag_h_0);
+    cute::gemm(tiled_mma, frag_h_1, frag_A, frag_B_1, frag_h_1);
+
+    // ── Vectorized state store for both N-tiles ──
 #pragma unroll
-    for (int i = 0; i < size(frag_h); ++i) {
+    for (int i = 0; i < size(frag_h_0); i += 2) {
       int row = get<0>(id_part(i));
-      int col = n * N_TILE + get<1>(id_part(i));
-      convertAndStore(&state_base[layout_state_swz(row, col)], frag_h(i));
+      int col0 = n * N_TILE + get<1>(id_part(i));
+      int col1 = (n + 1) * N_TILE + get<1>(id_part(i));
+      state_t p0[2], p1[2];
+      p0[0] = state_t(frag_h_0(i));
+      p0[1] = state_t(frag_h_0(i + 1));
+      p1[0] = state_t(frag_h_1(i));
+      p1[1] = state_t(frag_h_1(i + 1));
+      memcpy(&state_base[layout_state_swz(row, col0)], p0, 4);
+      memcpy(&state_base[layout_state_swz(row, col1)], p1, 4);
     }
   }
 }

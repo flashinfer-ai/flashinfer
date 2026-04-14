@@ -38,6 +38,7 @@ inline __device__ float2 toFloat2(__half const* ptr) {
 
 #ifdef FLASHINFER_ENABLE_BF16
 // inline __device__ float2 toFloat2(__nv_bfloat162 packed) { return __bfloat1622float2(packed); }
+
 inline __device__ float2 toFloat2(__nv_bfloat162 packed) {
   // bf16 is the upper 16 bits of f32 — shift/mask is cheaper than PRMT byte permutation.
   // NOTE: this ignores denormals
