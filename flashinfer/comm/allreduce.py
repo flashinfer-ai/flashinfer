@@ -745,6 +745,30 @@ def allreduce_fusion(
                 raise ValueError(
                     f"block_quant_group_size must be 64 or 128, got {block_quant_group_size}"
                 )
+            if scale_out is None:
+                raise ValueError(f"scale_out is required for pattern: {pattern}")
+            if hidden_dim % block_quant_group_size != 0:
+                raise ValueError(
+                    f"hidden_dim must be divisible by block_quant_group_size, got {hidden_dim} and {block_quant_group_size}"
+                )
+            token_num, hidden_dim = input.shape
+            groups_per_row = hidden_dim // block_quant_group_size
+            k_num_packed = (groups_per_row + 3) // 4
+            tma_aligned_mn = ((token_num + 3) // 4) * 4
+            expected_shape = (token_num, k_num_packed)
+            expected_stride = (1, tma_aligned_mn)
+            if scale_out.shape != expected_shape:
+                raise ValueError(
+                    f"scale_out shape must be {expected_shape}, got {tuple(scale_out.shape)}"
+                )
+            if scale_out.stride() != expected_stride:
+                raise ValueError(
+                    f"scale_out stride must be {expected_stride}, got {scale_out.stride()}"
+                )
+            if scale_out.dtype != torch.int32:
+                raise ValueError(
+                    f"scale_out dtype must be torch.int32, got {scale_out.dtype}"
+                )
 
         # ---- Standard patterns ----
         # Extract shape from 2D input
