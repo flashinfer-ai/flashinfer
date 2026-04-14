@@ -3754,8 +3754,10 @@ def trtllm_ragged_attention_deepseek(
     is_smaller_dimensions = (
         query.shape[2] == 128 and key.shape[2] == 128 and value.shape[2] == 128
     )
-    assert is_dsr1 or is_smaller_dimensions, (
-        "currently only support deepseek r1 192 query and 128 value or smaller dimensions 128 query and 128 value"
+    is_glm5 = query.shape[2] == 256 and key.shape[2] == 256 and value.shape[2] == 256
+    assert is_dsr1 or is_smaller_dimensions or is_glm5, (
+        f"Unsupported head dimensions: query={query.shape[2]}, key={key.shape[2]}, value={value.shape[2]}. "
+        "Supported: (192, 192, 128) for DeepSeek-R1, (128, 128, 128), or (256, 256, 256) for GLM-5."
     )
 
     if enable_pdl is None:

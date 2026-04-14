@@ -2111,3 +2111,159 @@ def test_trtllm_batch_decode_spec(
         skips_softmax=skips_softmax,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
     )
+
+
+def naive_ragged_attention(q, k, v, qo_indptr, kv_indptr, scale, causal):
+    """Naive batched ragged attention in float32, head by head.
+
+    Used as an independent reference to sanity-check other backends.
+    q: [total_q, num_qo_heads, head_dim_qk]
+    k: [total_kv, num_kv_heads, head_dim_qk]
+    v: [total_kv, num_kv_heads, head_dim_vo]
+    Returns output [total_q, num_qo_heads, head_dim_vo] in the same dtype as q.
+    """
+    num_qo_heads = q.shape[1]
+    num_kv_heads = k.shape[1]
+    head_grp_size = num_qo_heads // num_kv_heads
+    batch_size = len(qo_indptr) - 1
+    out = torch.zeros(
+        q.shape[0], num_qo_heads, v.shape[2], device=q.device, dtype=torch.float32
+    )
+
+    for b in range(batch_size):
+        qs, qe = int(qo_indptr[b]), int(qo_indptr[b + 1])
+        ks, ke = int(kv_indptr[b]), int(kv_indptr[b + 1])
+        sq, skv = qe - qs, ke - ks
+        q_b = q[qs:qe].float()  # [sq,  nqh, dqk]
+        k_b = k[ks:ke].float()  # [skv, nkh, dqk]
+        v_b = v[ks:ke].float()  # [skv, nkh, dvo]
+        for h in range(num_qo_heads):
+            kv_h = h // head_grp_size
+            scores = q_b[:, h, :] @ k_b[:, kv_h, :].T * scale  # [sq, skv]
+            if causal:
+                # token at q-position i attends to kv positions 0 .. (skv - sq + i)
+                offset = skv - sq
+                mask = torch.arange(skv, device=q.device).unsqueeze(0) > (
+                    torch.arange(sq, device=q.device).unsqueeze(1) + offset
+                )
+                scores = scores.masked_fill(mask, float("-inf"))
+            out[qs:qe, h, :] = torch.softmax(scores, dim=-1) @ v_b[:, kv_h, :]
+
+    return out.to(q.dtype)
+
+
+# GLM-5 MHA form dimensions:
+#   qk_nope=192, qk_rope=64  →  head_dim_qk=256
+#   v_head_dim=256
+#   num_heads=64 (MHA: q_heads == kv_heads, head_grp_size=1)
+glm5_mla_dimensions = MLAHeadDimensions(
+    qk_nope_head_dim=192,
+    qk_rope_head_dim=64,
+    v_head_dim=256,
+    kv_lora_rank=512,
+)
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("batch_size", [4, 16])
+@pytest.mark.parametrize("s_qo", [32, 64])
+@pytest.mark.parametrize("s_kv", [64, 256])
+def test_trtllm_gen_prefill_glm5(
+    batch_size: int,
+    s_qo: int,
+    s_kv: int,
+) -> None:
+    """Test trtllm_ragged_attention_deepseek with GLM-5 MHA shapes.
+
+    GLM-5 MHA form: 64 heads, head_dim_qk=256 (192 nope + 64 rope), head_dim_vo=256.
+    """
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    if compute_capability[0] != 10:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+    if s_qo > s_kv:
+        pytest.skip("s_qo > s_kv")
+
+    causal = True
+    skips_softmax = False
+
+    seed = 0
+    torch.manual_seed(seed)
+    device = "cuda:0"
+
+    num_kv_heads = 64
+    num_qo_heads = 64
+    head_dim_qk = (
+        glm5_mla_dimensions.qk_nope_head_dim + glm5_mla_dimensions.qk_rope_head_dim
+    )
+    head_dim_vo = glm5_mla_dimensions.v_head_dim
+
+    actual_seq_lens_q = torch.randint(
+        1, s_qo + 1, (batch_size, 1, 1, 1), dtype=torch.int32, device=device
+    )
+    actual_seq_lens_kv = torch.randint(
+        s_qo, s_kv + 1, (batch_size, 1, 1, 1), dtype=torch.int32, device=device
+    )
+
+    cumsum_s_qo = int(torch.sum(actual_seq_lens_q).item())
+    cumsum_s_kv = int(torch.sum(actual_seq_lens_kv).item())
+
+    q = torch.randn(
+        cumsum_s_qo, num_qo_heads, head_dim_qk, device=device, dtype=torch.bfloat16
+    )
+    k_cache = torch.randn(
+        cumsum_s_kv, num_kv_heads, head_dim_qk, device=device, dtype=torch.bfloat16
+    )
+    v_cache = torch.randn(
+        cumsum_s_kv, num_kv_heads, head_dim_vo, device=device, dtype=torch.bfloat16
+    )
+
+    scale = float(1.0 / (head_dim_qk**0.5))
+
+    workspace_buffer, workspace_buffer_ref = create_workspace_buffers(device)
+
+    qo_indptr = torch.cat(
+        [
+            torch.tensor([0], device=device),
+            torch.cumsum(actual_seq_lens_q.view(-1), dim=0),
+        ]
+    ).int()
+    kv_indptr = torch.cat(
+        [
+            torch.tensor([0], device=device),
+            torch.cumsum(actual_seq_lens_kv.view(-1), dim=0),
+        ]
+    ).int()
+
+    # Reference: naive attention in float32
+    output_naive = naive_ragged_attention(
+        q, k_cache, v_cache, qo_indptr, kv_indptr, scale, causal
+    )
+
+    # TRT-LLM gen
+    output = torch.empty_like(output_naive)
+
+    skip_softmax_threshold_scale_factor = 1e-30 if skips_softmax else None
+
+    output_trtllm, lse_trtllm = flashinfer.prefill.trtllm_ragged_attention_deepseek(
+        q,
+        k_cache,
+        v_cache,
+        workspace_buffer,
+        actual_seq_lens_kv,
+        s_qo,
+        s_kv,
+        scale,
+        1.0,
+        -1,
+        batch_size,
+        -1,
+        qo_indptr,
+        kv_indptr,
+        False,
+        causal,
+        True,
+        skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+        out=output,
+    )
+
+    torch.testing.assert_close(output_trtllm, output_naive, atol=1e-2, rtol=1e-2)
