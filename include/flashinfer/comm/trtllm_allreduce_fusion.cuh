@@ -1008,56 +1008,94 @@ class FusedOp {
     } else if constexpr (GetQuantType<Pattern> == QuantType::kPerTokenGroupFP8Packed) {
       // Per-token-group FP8 quantization with UE8M0 packed scales.
       constexpr float FP8_E4M3_MAX = 448.0f;
+      int group_size = m_params.block_quant_group_size;
+      int groups_in_block = blockDim.x * VEC_SIZE / group_size;
+      int block_elem_start = threadIdx.x * VEC_SIZE;
 
-      // local max reduce
-      float local_absmax = 0.0f;
+      // --- Group absmax reduction ---
+      // use warp-shuffle reduce when group fits cleanly in a warp
+      // (group_size divisible by VEC_SIZE, group_size_in_vecs is power of 2 and <= 32).
+      // otherwise use shared-memory atomicMax
+      int group_size_in_vecs = group_size / VEC_SIZE;
+      bool use_warp_shuffle = (group_size % VEC_SIZE == 0) && (group_size_in_vecs <= 32) &&
+                              (group_size_in_vecs & (group_size_in_vecs - 1)) == 0;
+
+      // per-element group absmax
+      float elem_group_absmax[VEC_SIZE];
+      extern __shared__ unsigned int smem_group_absmax[];
+
+      if (use_warp_shuffle) {
+        float local_absmax = 0.0f;
 #pragma unroll
-      for (int i = 0; i < VEC_SIZE; ++i) {
-        float v = fabsf(static_cast<float>(reinterpret_cast<T*>(&val)[i]));
-        local_absmax = fmaxf(local_absmax, v);
-      }
-
-      // all-reduce within the quantization group using warp shuffles.
-      // requires group_size_in_vecs to be a power of 2 and <= 32 (warp size).
-      int group_size_in_vecs = m_params.block_quant_group_size / VEC_SIZE;
+        for (int i = 0; i < VEC_SIZE; ++i) {
+          float v = fabsf(static_cast<float>(reinterpret_cast<T*>(&val)[i]));
+          local_absmax = fmaxf(local_absmax, v);
+        }
+        // Butterfly all-reduce within the quantization group using warp shuffles.
+        for (int offset = group_size_in_vecs / 2; offset > 0; offset /= 2) {
+          local_absmax = fmaxf(local_absmax, __shfl_xor_sync(0xffffffff, local_absmax, offset));
+        }
 #pragma unroll
-      for (int offset = group_size_in_vecs / 2; offset > 0; offset /= 2) {
-        local_absmax = fmaxf(local_absmax, __shfl_xor_sync(0xffffffff, local_absmax, offset));
-      }
-      float group_absmax = local_absmax;
+        for (int i = 0; i < VEC_SIZE; ++i) {
+          elem_group_absmax[i] = local_absmax;
+        }
+      } else {
+        // use shared-memory atomicMax for group max reduction
+        for (int g = threadIdx.x; g < groups_in_block; g += blockDim.x) {
+          smem_group_absmax[g] = 0;
+        }
+        __syncthreads();
 
-      // Compute UE8M0 scale: round (absmax / 448) up to the next power of 2.
-      float y_s = fmaxf(group_absmax / FP8_E4M3_MAX, 1e-10f);
-      unsigned int y_s_bits = __float_as_uint(y_s);
-      if (y_s_bits & 0x7fffff) {
-        // Not a power of 2: increment exponent by 1, clear mantissa.
-        y_s_bits = (y_s_bits + 0x800000) & 0x7f800000;
-      }
-      y_s = __uint_as_float(y_s_bits);
+#pragma unroll
+        for (int i = 0; i < VEC_SIZE; ++i) {
+          int local_group = (block_elem_start + i) / group_size;
+          float absval = fabsf(static_cast<float>(reinterpret_cast<T*>(&val)[i]));
+          atomicMax(&smem_group_absmax[local_group], __float_as_uint(absval));
+        }
+        __syncthreads();
 
-      // quantize elements to FP8_E4M3
+#pragma unroll
+        for (int i = 0; i < VEC_SIZE; ++i) {
+          int local_group = (block_elem_start + i) / group_size;
+          elem_group_absmax[i] = __uint_as_float(smem_group_absmax[local_group]);
+        }
+      }
+
+      // compute UE8M0 scale and quantize to FP8
+      auto compute_ue8m0_scale = [](float group_absmax) -> float {
+        float y_s = fmaxf(group_absmax / FP8_E4M3_MAX, 1e-10f);
+        unsigned int y_s_bits = __float_as_uint(y_s);
+        if (y_s_bits & 0x7fffff) {
+          y_s_bits = (y_s_bits + 0x800000) & 0x7f800000;
+        }
+        return __uint_as_float(y_s_bits);
+      };
+
       using PackedQuantizedType = std::conditional_t<std::is_same_v<T, float>, float, float2>;
       PackedQuantizedType ret;
 #pragma unroll
       for (int i = 0; i < VEC_SIZE; ++i) {
+        float y_s = compute_ue8m0_scale(elem_group_absmax[i]);
         float q = static_cast<float>(reinterpret_cast<T*>(&val)[i]) / y_s;
         q = fminf(fmaxf(q, -FP8_E4M3_MAX), FP8_E4M3_MAX);
         reinterpret_cast<__nv_fp8_e4m3*>(&ret)[i] = static_cast<__nv_fp8_e4m3>(q);
       }
       reinterpret_cast<PackedQuantizedType*>(m_params.quant_out)[m_access_id] = ret;
 
-      // write packed UE8M0 scale + zero padding
-      int lane_in_group = m_access_id_in_token % group_size_in_vecs;
-      if (lane_in_group == 0) {
-        int group_idx_in_row = m_access_id_in_token / group_size_in_vecs;
-        int groups_per_row = m_params.hidden_dim / m_params.block_quant_group_size;
+      // write packed UE8M0 scales
+      // For warp-shuffle path: one thread per group (first thread in each group).
+      // For smem path: one thread per group in the block (threadIdx.x < groups_in_block).
+      int block_first_elem = (m_access_id_in_token - threadIdx.x) * VEC_SIZE;
+      auto write_group_scale = [&](int group_idx_in_row, float group_absmax) {
+        float y_s = compute_ue8m0_scale(group_absmax);
+        int groups_per_row = m_params.hidden_dim / group_size;
         int k_num_packed = (groups_per_row + 3) / 4;
         int token_num = m_params.size / m_params.hidden_dim;
         int pack_idx = group_idx_in_row / 4;
         int pos = group_idx_in_row % 4;
         int elem_idx = pack_idx * m_params.tma_aligned_mn + token_id;
 
-        // write valid exponent
+        // Write valid exponent
         unsigned int bits = __float_as_uint(y_s);
         uint8_t exponent = static_cast<uint8_t>((bits >> 23u) & 0xffu);
         reinterpret_cast<uint8_t*>(m_params.scale_out)[elem_idx * 4 + pos] = exponent;
@@ -1081,6 +1119,22 @@ class FusedOp {
               reinterpret_cast<uint32_t*>(m_params.scale_out)[pad_elem] = 0;
             }
           }
+        }
+      };
+
+      if (use_warp_shuffle) {
+        int lane_in_group = m_access_id_in_token % group_size_in_vecs;
+        if (lane_in_group == 0) {
+          int group_idx_in_row = m_access_id_in_token / group_size_in_vecs;
+          write_group_scale(group_idx_in_row, elem_group_absmax[0]);
+        }
+      } else {
+        // Loop: groups_in_block may exceed blockDim.x when group_size < VEC_SIZE
+        for (int local_group = threadIdx.x; local_group < groups_in_block;
+             local_group += blockDim.x) {
+          float group_absmax = __uint_as_float(smem_group_absmax[local_group]);
+          int group_idx_in_row = block_first_elem / group_size + local_group;
+          write_group_scale(group_idx_in_row, group_absmax);
         }
       }
     } else {
@@ -1573,25 +1627,29 @@ cudaError_t allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const& par
                    "oneshot launch config mismatch: threads_per_block * cluster_size != "
                    "threads_per_token");
 
+  if constexpr (GetQuantType<Pattern> == QuantType::kPerTokenGroupFP8Packed) {
+    FLASHINFER_CHECK(params.block_quant_group_size > 0,
+                     "block_quant_group_size must be > 0 for per-token-group FP8 quant");
+    FLASHINFER_CHECK(params.hidden_dim % params.block_quant_group_size == 0,
+                     "hidden_dim must be divisible by block_quant_group_size");
+    // Adjust cluster_size so that each block handles a whole number of groups.
+    // This ensures no quantization group spans two thread blocks, which is
+    // required because the shared-memory absmax reduction is block-local.
+    while (cluster_size > 1 &&
+           (threads_per_block * VEC_SIZE) % params.block_quant_group_size != 0) {
+      threads_per_block *= 2;
+      cluster_size /= 2;
+    }
+    block_size = threads_per_block;
+    FLASHINFER_CHECK((block_size * VEC_SIZE) % params.block_quant_group_size == 0,
+                     "Cannot satisfy group alignment: block elements must be "
+                     "a multiple of block_quant_group_size");
+  }
+
   // Check conditions using the final block_size (not threads_per_block)
   FLASHINFER_CHECK(oneshot || block_size >= params.nranks, "not oneshot, or block_size < nranks");
   FLASHINFER_CHECK(block_size <= 1024 && cluster_size > 0,
                    "block_size > 1024 or cluster_size <= 0");
-
-  if constexpr (GetQuantType<Pattern> == QuantType::kPerTokenGroupFP8Packed) {
-    // TODO: loosen these constraints
-    int group_size_in_vecs = params.block_quant_group_size / VEC_SIZE;
-    FLASHINFER_CHECK(params.block_quant_group_size > 0,
-                     "block_quant_group_size must be > 0 for per-token-group FP8 quant");
-    FLASHINFER_CHECK(params.block_quant_group_size % VEC_SIZE == 0,
-                     "block_quant_group_size must be divisible by VEC_SIZE");
-    FLASHINFER_CHECK((group_size_in_vecs & (group_size_in_vecs - 1)) == 0,
-                     "block_quant_group_size / VEC_SIZE must be a power of 2");
-    FLASHINFER_CHECK(group_size_in_vecs <= 32,
-                     "block_quant_group_size / VEC_SIZE must be <= 32 (warp size)");
-    FLASHINFER_CHECK(block_size % group_size_in_vecs == 0,
-                     "threads_per_block must be a multiple of group_size_in_vecs");
-  }
 
   int grid_size = (std::min(sm_count, cluster_num * cluster_size) / cluster_size) * cluster_size;
   cudaLaunchConfig_t cfg;
@@ -1599,6 +1657,10 @@ cudaError_t allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const& par
   cfg.gridDim = grid_size;
   cfg.blockDim = block_size;
   cfg.dynamicSmemBytes = 0;
+  if constexpr (GetQuantType<Pattern> == QuantType::kPerTokenGroupFP8Packed) {
+    int groups_in_block = block_size * VEC_SIZE / params.block_quant_group_size;
+    cfg.dynamicSmemBytes = groups_in_block * sizeof(unsigned int);
+  }
   cfg.stream = params.stream;
   attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attribute[0].val.programmaticStreamSerializationAllowed = launch_with_pdl ? 1 : 0;

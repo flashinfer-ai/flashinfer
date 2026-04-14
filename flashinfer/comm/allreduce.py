@@ -743,9 +743,9 @@ def allreduce_fusion(
                 raise ValueError(
                     f"block_quant_group_size is required for pattern: {pattern}"
                 )
-            if block_quant_group_size not in (64, 128):
+            if block_quant_group_size <= 0:
                 raise ValueError(
-                    f"block_quant_group_size must be 64 or 128, got {block_quant_group_size}"
+                    f"block_quant_group_size must be > 0, got {block_quant_group_size}"
                 )
             if scale_out is None:
                 raise ValueError(f"scale_out is required for pattern: {pattern}")
