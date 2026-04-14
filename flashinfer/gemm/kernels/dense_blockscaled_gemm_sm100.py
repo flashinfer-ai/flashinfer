@@ -1469,8 +1469,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     )
                     # Fence and barrier to make sure shared memory store is visible to TMA store
                     cute.arch.fence_proxy(
-                        cute.arch.ProxyKind.async_shared,
-                        space=cute.arch.SharedSpace.shared_cta,
+                        "async.shared",
+                        space="cta",
                     )
                     epilog_threads = 32 * len(self.epilog_warp_id)
                     cute.arch.barrier(
@@ -2112,8 +2112,12 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         as a torch tensor.
 
         Args:
-            mA (cute.Tensor): Input tensor A, shape (m, k_packed), K-major.
-            mB (cute.Tensor): Input tensor B, shape (n, k_packed), K-major.
+            mA (cute.Tensor): Input tensor A.
+                FP4 path: shape (m, k_packed), dtype Uint8 (2xFP4 packed per byte).
+                MXFP8 path: shape (m, k), dtype Float8.
+            mB (cute.Tensor): Input tensor B.
+                FP4 path: shape (n, k_packed), dtype Uint8.
+                MXFP8 path: shape (n, k), dtype Float8.
             mC (cute.Tensor): Output tensor C, shape (m, n).
             sf_m (cutlass.Int64): Scale factor M dim (ceil(m/128)).
             sf_n (cutlass.Int64): Scale factor N dim (ceil(n/128)).
@@ -2128,27 +2132,39 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             epilogue_op (cutlass.Constexpr): Elementwise epilogue function.
         """
         # A, B, C are passed as cute.Tensor via TVM-FFI.
-        # A/B come in as Uint8 (FP4 packed as uint8 in torch). Recast to FP4.
+        # Support two input encodings:
+        # 1) FP4 packed as uint8 (recast to Float4E2M1FN, k = k_packed * 2)
+        # 2) MXFP8 as float8 (k = k_raw, no recast)
         m = cute.size(mA, mode=[0])
-        k_packed = cute.size(mA, mode=[1])
+        k_raw = cute.size(mA, mode=[1])
         n = cute.size(mB, mode=[0])
-        # k in FP4 elements = k_packed * 2 (2 FP4 values per uint8 byte)
-        k = k_packed * 2
 
-        # Recast Uint8 → Float4E2M1FN and reshape to (m, k, l) with K-major order
-        a_fp4_ptr = cute.recast_ptr(mA.iterator, dtype=cutlass.Float4E2M1FN)
+        if cutlass.const_expr(
+            mA.element_type == cutlass.Uint8 and mB.element_type == cutlass.Uint8
+        ):
+            # FP4 packed path: 2 FP4 values per uint8 byte
+            k = k_raw * 2
+            a_ptr = cute.recast_ptr(mA.iterator, dtype=cutlass.Float4E2M1FN)
+            b_ptr = cute.recast_ptr(mB.iterator, dtype=cutlass.Float4E2M1FN)
+        elif cutlass.const_expr(mA.element_type != mB.element_type):
+            raise TypeError(
+                "Unsupported mixed input dtypes for block-scaled GEMM: "
+                "mA and mB must have matching element_type "
+                "(both Uint8 for FP4 path, or both FP8 for MXFP8 path)."
+            )
+        else:
+            # MXFP8 path: input tensors are already FP8.
+            k = k_raw
+            a_ptr = mA.iterator
+            b_ptr = mB.iterator
+
         a_tensor = cute.make_tensor(
-            a_fp4_ptr,
+            a_ptr,
             layout=cute.make_ordered_layout((m, k, l), order=(1, 0, 2)),
         )
-        # Recast B and reshape to (n, k, l) with K-major order
-        b_fp4_ptr = cute.recast_ptr(mB.iterator, dtype=cutlass.Float4E2M1FN)
         b_tensor = cute.make_tensor(
-            b_fp4_ptr,
-            layout=cute.make_ordered_layout(
-                (n, k, l),
-                order=(1, 0, 2),
-            ),
+            b_ptr,
+            layout=cute.make_ordered_layout((n, k, l), order=(1, 0, 2)),
         )
         # Reshape C to (m, n, l) -- swap_ab is constexpr, determines layout at compile time
         if cutlass.const_expr(swap_ab):

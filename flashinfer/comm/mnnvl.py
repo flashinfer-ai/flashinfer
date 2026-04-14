@@ -29,6 +29,8 @@ import sys
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 import pynvml
 
+logger = logging.getLogger(__name__)
+
 import torch
 
 try:
@@ -122,10 +124,10 @@ def test_cuda_memory_access(ptr: int, size: int, device_id: int) -> bool:
         # Try to copy back from host to device
         checkCudaErrors(cuda.cuMemcpyHtoD(ptr, host_data, test_size))
 
-        print(f"DEBUG: Memory access test PASSED for ptr=0x{ptr:x}")
+        logger.debug("Memory access test PASSED for ptr=0x%x", ptr)
         return True
     except Exception as e:
-        print(f"DEBUG: Memory access test FAILED for ptr=0x{ptr:x}: {e}")
+        logger.debug("Memory access test FAILED for ptr=0x%x: %s", ptr, e)
         return False
 
 
@@ -351,7 +353,9 @@ class MnnvlMemory:  # type: ignore[no-redef]
 
     def __del__(self):
         if not sys.is_finalizing():
-            MnnvlMemory.close_mnnvl_memory(self.ptr)
+            # When open_mnnvl_memory fails, self.ptr may not be set. In that case, we should not call close_mnnvl_memory.
+            if hasattr(self, "ptr"):
+                MnnvlMemory.close_mnnvl_memory(self.ptr)
 
     def as_torch_strided_tensor(self, dtype):
         num_segments = MnnvlMemory.comm.Get_size()
@@ -859,12 +863,11 @@ def is_mnnvl_fabric_supported(device_idx: int) -> bool:
         handle = pynvml.nvmlDeviceGetHandleByIndex(device_idx)
         fabric_info = pynvml.c_nvmlGpuFabricInfoV_t()
         pynvml.nvmlDeviceGetGpuFabricInfoV(handle, ctypes.byref(fabric_info))
-        if (
+        return (
             fabric_info.state >= pynvml.NVML_GPU_FABRIC_STATE_COMPLETED
+            and fabric_info.clusterUuid
             and fabric_info.clusterUuid[0] != 0
-        ):
-            return True
-        return False
+        )
     finally:
         pynvml.nvmlShutdown()
 
@@ -984,7 +987,7 @@ class SymmDeviceMemory:
         try:
             cuda.cuCtxGetCurrent()
         except Exception as e:
-            print(f"Destructor: CUDA context invalid, skipping cleanup: {e}")
+            logger.warning("Destructor: CUDA context invalid, skipping cleanup: %s", e)
             return
 
         # Free device pointers
@@ -1008,8 +1011,10 @@ class SymmDeviceMemory:
                                 )
                             )
                     except Exception as e:
-                        print(
-                            f"Destructor: Failed to release UC handle for rank {rank}: {e}"
+                        logger.warning(
+                            "Destructor: Failed to release UC handle for rank %d: %s",
+                            rank,
+                            e,
                         )
 
             # Free the UC address space
@@ -1027,7 +1032,7 @@ class SymmDeviceMemory:
                 )
                 checkCudaErrors(cuda.cuMemRelease(self.mc_handle))
             except Exception as e:
-                print(f"Destructor: Failed to release MC handle: {e}")
+                logger.warning("Destructor: Failed to release MC handle: %s", e)
 
     def get_signal_pad_ptrs_host(self) -> List[int]:
         """Get the raw array of signal pad pointers to all ranks (including self)"""
@@ -1096,11 +1101,13 @@ class SymmDeviceMemory:
         try:
             current_device = checkCudaErrors(cuda.cuCtxGetDevice())
             if int(current_device) != self.device_idx:
-                print(
-                    f"CUDA context device mismatch! Current: {current_device}, Expected: {self.device_idx}"
+                logger.warning(
+                    "CUDA context device mismatch! Current: %s, Expected: %s",
+                    current_device,
+                    self.device_idx,
                 )
         except Exception as e:
-            print(f"Error checking CUDA context: {e}")
+            logger.warning("Error checking CUDA context: %s", e)
 
     def _get_allocation_prop(self, buf_size: int):
         """Compute allocation size and return allocation/multicast properties."""

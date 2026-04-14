@@ -68,8 +68,8 @@ std::vector<int64_t> prioritizePredefinedConfigs(
   if (n /* out_dim */ == 0 && k /* in_dim */ == 0) {
     auto pred = [](BatchedGemmConfig const& config) {
       BatchedGemmOptions const& options = config.mOptions;
-      return options.mNumStages == 4 && options.mNumStagesMma == 2 && options.mTileK == 256 &&
-             options.mTileScheduler == TileScheduler::Persistent;
+      return options.mNumStagesA == 4 && options.mNumStagesB == 4 && options.mNumStagesMma == 2 &&
+             options.mTileK == 256 && options.mTileScheduler == TileScheduler::Persistent;
     };
     prioritizedIndices = bubbleUpConfig(sortedIndices, pred);
   }
@@ -214,6 +214,9 @@ void TrtllmGenBatchedGemmRunner::run(
   gemmData.mProblemDimensions.mM = mOptions.transposeMmaOutput ? n : m;
   gemmData.mProblemDimensions.mN = mOptions.transposeMmaOutput ? m : n;
   gemmData.mProblemDimensions.mK = k;
+  gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
+  gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
+  gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
   gemmData.mProblemDimensions.mRank = 0;
   gemmData.mProblemDimensions.mWorldSize = 1;
 
@@ -252,15 +255,12 @@ void TrtllmGenBatchedGemmRunner::run(
   int32_t multiProcessorCount;
   cudaDeviceGetAttribute(&multiProcessorCount, cudaDevAttrMultiProcessorCount, device);
 
-  gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
-  gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
-  gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
-
   // FIXME once we start using all-reduce in the epilogue of the bmm this can be moved elsewhere
   bmm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));
 
-  auto const err = bmm.run(config, workspace, gemmData, static_cast<void*>(stream),
-                           multiProcessorCount, enable_pdl, globalTrtllmGenBatchedGemmModuleCache);
+  auto const err =
+      bmm.run(config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount,
+              enable_pdl, /*pinnedHostBuffer=*/nullptr, globalTrtllmGenBatchedGemmModuleCache);
 
   FLASHINFER_CHECK(err == 0,
                    "Error occurred when running GEMM!"
@@ -449,6 +449,9 @@ bool TrtllmGenBatchedGemmRunner::isValidConfigIndex(int32_t configIndex, int32_t
   gemmData.mProblemDimensions.mM = mOptions.transposeMmaOutput ? n : m;
   gemmData.mProblemDimensions.mN = mOptions.transposeMmaOutput ? m : n;
   gemmData.mProblemDimensions.mK = k;
+  gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
+  gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
+  gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
   gemmData.mProblemDimensions.mRank = 0;
   gemmData.mProblemDimensions.mWorldSize = 1;
   gemmData.mProblemDimensions.mMaxNumCtasInTokenDim = maxNumCtasInBatchDim;

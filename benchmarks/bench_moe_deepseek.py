@@ -68,10 +68,9 @@ EP_CONFIGS = {
 
 
 def is_sm100_family():
-    """Check for SM100 family (Blackwell: SM100, SM103, SM110).
+    """Check for SM100 family (Blackwell: SM100, SM103).
 
-    CuteDSL MoE NVFP4 kernels are optimized for SM100 architecture.
-    SM120+ (Rubin) may have different shared memory/TMEM configurations.
+    CuteDSL MoE NVFP4 kernels are optimized for SM10x architecture.
     """
     if not torch.cuda.is_available():
         return False
@@ -113,7 +112,7 @@ def interleave(x, gs=64):
     )
 
 
-def create_inputs(n, dev="cuda"):
+def create_inputs(n, dev="cuda", routing_bias_scale=0.01):
     """Create inputs for all backends (CuteDSL, CUTLASS, TRTLLM)."""
     from flashinfer.fp4_quantization import fp4_quantize
 
@@ -124,7 +123,10 @@ def create_inputs(n, dev="cuda"):
 
     # Router logits and bias
     rl = torch.randn(n, CFG.num_experts, device=dev, dtype=torch.float32)
-    rb = torch.randn(CFG.num_experts, device=dev, dtype=torch.bfloat16)
+    rb = (
+        torch.randn(CFG.num_experts, device=dev, dtype=torch.bfloat16)
+        * routing_bias_scale
+    )
 
     # Hidden states
     hb = torch.randn(n, CFG.hidden_size, device=dev, dtype=torch.bfloat16) / 10
@@ -827,6 +829,7 @@ def run_benchmark(
     use_cuda_graph=True,
     use_cupti=True,
     use_wrapper=True,
+    routing_bias_scale=0.01,
 ):
     """
     Unified benchmark for DeepSeek-V3 MoE backends.
@@ -841,6 +844,7 @@ def run_benchmark(
         use_cuda_graph: Whether to use CUDA graph for benchmarking
         use_cupti: Whether to use CUPTI for accurate GPU timing
         use_wrapper: Whether to use CuteDslMoEWrapper API (recommended)
+        routing_bias_scale: Scale for random routing bias generation
 
     Returns:
         List of BenchResult objects
@@ -852,16 +856,25 @@ def run_benchmark(
 
     # Run autotune if requested (BEFORE printing header to avoid interleaved output)
     if do_autotune:
-        run_autotune(create_inputs(max(token_counts)), verbose=verbose)
+        run_autotune(
+            create_inputs(max(token_counts), routing_bias_scale=routing_bias_scale),
+            verbose=verbose,
+        )
 
     # Print header AFTER autotune completes
     if verbose:
-        _print_header(ep_config, num_local, use_cuda_graph, use_cupti)
+        _print_header(
+            ep_config,
+            num_local,
+            use_cuda_graph,
+            use_cupti,
+            routing_bias_scale,
+        )
 
     # Run benchmarks
     results = []
     for n in token_counts:
-        row = _benchmark_single(
+        row, histogram_record = _benchmark_single(
             n,
             warmup,
             iters,
@@ -870,10 +883,11 @@ def run_benchmark(
             use_cuda_graph,
             use_cupti,
             use_wrapper=use_wrapper,
+            routing_bias_scale=routing_bias_scale,
         )
         results.extend(row)
         if verbose:
-            _print_row(row)
+            _print_row(row, histogram_record)
 
     # Print footer
     if verbose:
@@ -891,13 +905,15 @@ def _benchmark_single(
     use_cuda_graph,
     use_cupti,
     use_wrapper=True,
+    routing_bias_scale=0.01,
 ):
     """Benchmark all backends for a single token count.
 
     Args:
         use_wrapper: If True, use CuteDslMoEWrapper API for CuteDSL.
     """
-    inputs = create_inputs(n)
+    inputs = create_inputs(n, routing_bias_scale=routing_bias_scale)
+    histogram_record = _collect_expert_histogram(inputs, num_local, local_offset)
 
     # Run all three backends
     lat = {
@@ -930,14 +946,20 @@ def _benchmark_single(
                 tflops=calc_tflops(n, latency, num_local),
             )
         )
-    return results
+    return results, histogram_record
 
 
-def _print_header(ep_config, num_local, use_cuda_graph, use_cupti):
+def _print_header(
+    ep_config,
+    num_local,
+    use_cuda_graph,
+    use_cupti,
+    routing_bias_scale,
+):
     """Print benchmark header."""
-    print("\n" + "=" * 100)
+    print("\n" + "=" * 120)
     print(f"DeepSeek-V3 MoE Benchmark: CuteDSL vs CUTLASS vs TRTLLM (EP={ep_config})")
-    print("=" * 100)
+    print("=" * 120)
     print(
         f"Model: hidden={CFG.hidden_size}, intermediate={CFG.intermediate_size}, "
         f"experts={CFG.num_experts}, top_k={CFG.top_k}"
@@ -948,26 +970,35 @@ def _print_header(ep_config, num_local, use_cuda_graph, use_cupti):
     print(
         f"CUDA Graph: {'enabled' if use_cuda_graph else 'disabled'}, CUPTI: {'enabled' if use_cupti else 'disabled'}"
     )
-    print("-" * 100)
+    print(
+        f"Routing bias scale: {routing_bias_scale} "
+        f"(larger values tend to create expert imbalance)"
+    )
+    print("-" * 120)
     print(
         f"{'Tokens':>6} | "
         f"{'CuteDSL':^15} | "
         f"{'CUTLASS':^15} | "
         f"{'TRTLLM':^15} | "
         f"{'Speedup (CuteDSL/X)':^18} | "
-        f"{'Winner':^8}"
+        f"{'Winner':^8} | "
+        f"{'Active':^7} | "
+        f"{'Stats':^14}"
     )
     print(
         f"{'':>6} | "
         f"{'ms':>7} {'TFLOPS':>7} | "
         f"{'ms':>7} {'TFLOPS':>7} | "
         f"{'ms':>7} {'TFLOPS':>7} | "
-        f"{'CUTLASS':>8} {'TRTLLM':>8} |"
+        f"{'CUTLASS':>9} {'TRTLLM':>9} | "
+        f"{'':^8} | "
+        f"{'experts':^7} | "
+        f"{'min/max/median':^14}"
     )
-    print("-" * 100)
+    print("-" * 120)
 
 
-def _print_row(results):
+def _print_row(results, histogram_record):
     """Print a single row of benchmark results."""
     # Extract values by backend
     r = {r.backend: r for r in results}
@@ -980,20 +1011,70 @@ def _print_row(results):
     # Find winner
     winner = min(r.values(), key=lambda x: x.latency_ms).backend
 
+    active_experts = f"{histogram_record['active_local_experts']:>3}"
+    stats = (
+        f"{histogram_record['min_count']:>3}/"
+        f"{histogram_record['max_count']:>3}/"
+        f"{histogram_record['median_count']:>7.2f}"
+    )
     print(
         f"{cute.tokens:>6} | "
         f"{cute.latency_ms:>7.3f} {cute.tflops:>7.1f} | "
         f"{cutlass.latency_ms:>7.3f} {cutlass.tflops:>7.1f} | "
         f"{trtllm.latency_ms:>7.3f} {trtllm.tflops:>7.1f} | "
-        f"{speedup_cutlass:>7.2f}x {speedup_trtllm:>7.2f}x | "
-        f"{winner:^8}"
+        f"{speedup_cutlass:>8.2f}x {speedup_trtllm:>8.2f}x | "
+        f"{winner:^8} | "
+        f"{active_experts:>7} | "
+        f"{stats:>14}"
     )
 
 
 def _print_footer(ep_config, num_local):
     """Print benchmark footer."""
-    print("-" * 100)
+    print("-" * 120)
     print("Speedup > 1.0 means CuteDSL is faster than that backend")
+
+
+def _collect_expert_histogram(inputs, num_local, local_offset):
+    from flashinfer.fused_moe import fused_topk_deepseek
+
+    num_tokens = inputs["router_logits"].shape[0]
+    dev = inputs["router_logits"].device
+    topk_values = torch.empty(num_tokens, CFG.top_k, dtype=torch.float32, device=dev)
+    topk_indices = torch.empty(num_tokens, CFG.top_k, dtype=torch.int32, device=dev)
+
+    fused_topk_deepseek(
+        scores=inputs["router_logits"],
+        bias=inputs["routing_bias"].float(),
+        n_group=CFG.n_group,
+        topk_group=CFG.topk_group,
+        topk=CFG.top_k,
+        routed_scaling_factor=CFG.routed_scaling_factor,
+        topk_values=topk_values,
+        topk_indices=topk_indices,
+    )
+
+    expert_hist = torch.bincount(
+        topk_indices.reshape(-1).to(torch.int64), minlength=CFG.num_experts
+    )
+    local_hist = expert_hist[local_offset : local_offset + num_local]
+    local_hist_f32 = local_hist.to(torch.float32)
+    active_local_experts = int((local_hist > 0).sum().item())
+    if local_hist.numel() > 0:
+        min_count = int(local_hist.min().item())
+        max_count = int(local_hist.max().item())
+        median_count = float(torch.quantile(local_hist_f32, 0.5).item())
+    else:
+        min_count = 0
+        max_count = 0
+        median_count = 0.0
+
+    return {
+        "active_local_experts": active_local_experts,
+        "min_count": min_count,
+        "max_count": max_count,
+        "median_count": median_count,
+    }
 
 
 def main():
@@ -1037,10 +1118,16 @@ def main():
         action="store_true",
         help="Use functional API instead of CuteDslMoEWrapper for CuteDSL benchmark",
     )
+    parser.add_argument(
+        "--routing-bias-scale",
+        type=float,
+        default=0.01,
+        help="Scale for random routing bias. Larger values tend to create expert imbalance.",
+    )
     args = parser.parse_args()
 
     if not is_sm100_family():
-        print("ERROR: Requires SM100 family GPU (Blackwell: SM100, SM103, SM110)")
+        print("ERROR: Requires SM100 family GPU (Blackwell: SM100, SM103)")
         return 1
 
     # Determine token counts
@@ -1065,6 +1152,7 @@ def main():
         use_cuda_graph=not args.no_cuda_graph,
         use_cupti=not args.no_cupti,
         use_wrapper=not args.functional_api,
+        routing_bias_scale=args.routing_bias_scale,
     )
 
     return 0

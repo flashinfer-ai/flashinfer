@@ -1,65 +1,47 @@
-# Code Owners File
-# Generated automatically from git history analysis
-# Analysis period: 180 days
-# Minimum commits threshold: 1
-# Manual overrides applied from overrides file
+# CODEOWNERS — manually maintained, not auto-generated.
+#
+# Rules:
+#   - Last matching pattern wins (GitHub semantics).
+#   - Catch-all ensures every PR gets at least one core-maintainer review.
+#   - Prefer @flashinfer-ai/<team> over individual users. (currently working around this)
+#   - Keep entries sorted alphabetically within each section.
 
-.github/workflows/ @yzh119 @yongwww @sricketts @jwu1980 @MasterJH5574 @abcdabcd987 @tqchen @ttyio @Anerudhan @joker-eph @kaixih @aleozlx @fzyzcjy @weireweire @youkaichao @wenscarl @bkryu @zhyncs @yyihuang
-benchmarks/ @bkryu @nv-yunzheq @yzh119 @saltyminty @IwakuraRein
-benchmarks/routines/ @bkryu @nv-yunzheq @saltyminty @Anerudhan @jiahanc
-ci/ @yzh119 @yongwww @nvmbreughe @cyx-6
-csrc/ @yzh119 @nv-yunzheq @IwakuraRein @cyx-6 @bkryu
-csrc/fmha_v2/ @flashinfer-ai/attention-owners @jimmyzho
-csrc/fmha_v2/fmha/ @jimmyzho
-csrc/fused_moe/ @flashinfer-ai/moe-owners @nv-yunzheq @yzh119 @jimmyzho
-csrc/fused_moe/cutlass_backend/ @yzh119 @nv-yunzheq @jimmyzho
-csrc/nv_internal/ @nv-yunzheq @yzh119 @bkryu @djmmoss @cyx-6
-csrc/nv_internal/cpp/ @wenscarl @bkryu
-csrc/nv_internal/include/ @nv-yunzheq
-csrc/nv_internal/tensorrt_llm/ @nv-yunzheq @yzh119 @bkryu @djmmoss @cyx-6
-csrc/xqa/ @flashinfer-ai/attention-owners @cyx-6 @yzh119
-docs/ @yzh119 @bkryu @wenscarl
-flashinfer/ @yzh119 @bkryu @nv-yunzheq @jimmyzho @kahyunnam
-flashinfer-cubin/ @yzh119 @cyx-6
-flashinfer-cubin/flashinfer_cubin/ @yzh119
-flashinfer-jit-cache/ @yzh119 @cyx-6
-flashinfer-jit-cache/flashinfer_jit_cache/ @yzh119
-flashinfer/comm/ @flashinfer-ai/comm-owners @nvmbreughe @yzh119 @wenscarl @bkryu
-flashinfer/cudnn/ @Anerudhan @yzh119 @bkryu
-flashinfer/cute_dsl/ @bkryu @yzh119 @aleozlx @kahyunnam @nv-yunzheq
-flashinfer/dsv3_ops/ @nv-yunzheq @jiahanc @nvmbreughe
-flashinfer/fused_moe/ @flashinfer-ai/moe-owners @nv-yunzheq @yzh119 @IwakuraRein @bkryu
-flashinfer/fused_moe/cute_dsl/ @nv-yunzheq
-flashinfer/gemm/ @flashinfer-ai/gemm-owners @bkryu @nv-yunzheq @jimmyzho @nvmbreughe
-flashinfer/gemm/kernels/ @nv-yunzheq @bkryu
-flashinfer/jit/ @yzh119 @nv-yunzheq @jimmyzho @bkryu @jiahanc
-flashinfer/jit/attention/ @yzh119 @jimmyzho @cyx-6
-flashinfer/jit/gemm/ @yzh119 @nv-yunzheq @jiahanc @jimmyzho
-flashinfer/logits_processor/ @yzh119
-flashinfer/triton/ @jimmyzho @yzh119 @nvmbreughe
-flashinfer/triton/kernels/ @yzh119
-include/ @yzh119 @kahyunnam @nv-yunzheq @jiahanc @IwakuraRein
-include/flashinfer/ @yzh119 @kahyunnam @nv-yunzheq @jiahanc @IwakuraRein
-include/flashinfer/attention/ @flashinfer-ai/attention-owners @yzh119 @kahyunnam
-include/flashinfer/comm/ @flashinfer-ai/comm-owners
-include/flashinfer/flat/ @yzh119
-include/flashinfer/gemm/ @flashinfer-ai/gemm-owners @yongwww @yzh119 @nvmbreughe @aleozlx
-include/flashinfer/mamba/ @yzh119
-include/flashinfer/trtllm/ @yzh119 @nv-yunzheq @jiahanc @IwakuraRein @aleozlx
-scripts/ @yzh119 @yongwww @dierksen @sricketts
-tests/ @bkryu @yzh119 @nvmbreughe @nv-yunzheq @jimmyzho
-tests/attention/ @flashinfer-ai/attention-owners @nvmbreughe @yzh119 @bkryu @Anerudhan
-tests/cli/ @sricketts
-tests/comm/ @flashinfer-ai/comm-owners @nvmbreughe @bkryu @dierksen @wenscarl
-tests/gdn/ @bkryu @yzh119
-tests/gemm/ @flashinfer-ai/gemm-owners @yongwww @bkryu @nv-yunzheq @aleozlx
-tests/mamba/ @bkryu
-tests/model_optimizations/ @nv-yunzheq @nvmbreughe
-tests/moe/ @flashinfer-ai/moe-owners @nv-yunzheq @IwakuraRein @yzh119 @jimmyzho
-tests/norm/ @flashinfer-ai/misc-op-owners @bkryu
-tests/test_helpers/ @nvmbreughe @yzh119
-tests/utils/ @yzh119 @bkryu @nvmbreughe @cyx-6 @jimmyzho
+# ── Catch-all: core maintainers review everything not covered below ──
+* @yzh119 @sricketts @aleozlx @yongwww @cyx-6 @saltyminty @bkryu @yyihuang @kahyunnam @jimmyzho @nv-yunzheq @samuellees
 
-# File-level overrides (must come last for precedence)
-flashinfer/attention.py @flashinfer-ai/attention-owners
-flashinfer/norm.py @flashinfer-ai/misc-op-owners
+# ── Attention ──
+csrc/fmha_v2/                  @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
+csrc/xqa/                      @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
+flashinfer/attention.py        @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
+include/flashinfer/attention/  @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
+tests/attention/               @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
+
+# ── GEMM ──
+flashinfer/gemm/               @dhiraj113 @yzh119 @aleozlx @bkryu
+include/flashinfer/gemm/       @dhiraj113 @yzh119 @aleozlx @bkryu
+tests/gemm/                    @dhiraj113 @yzh119 @aleozlx @bkryu
+
+# ── MOE ──
+csrc/fused_moe/                       @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees
+flashinfer/fused_moe/                 @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees
+include/flashinfer/trtllm/fused_moe/  @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees
+tests/moe/                            @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees
+
+# ── Communication ──
+flashinfer/comm/               @aleozlx @yzh119 @jimmyzho @bkryu @nv-yunzheq
+include/flashinfer/comm/       @aleozlx @yzh119 @jimmyzho @bkryu @nv-yunzheq
+tests/comm/                    @aleozlx @yzh119 @jimmyzho @bkryu @nv-yunzheq
+
+# ── Norm ──
+flashinfer/norm.py             @kahyunnam @yzh119 @bkryu @yongwww
+tests/norm/                    @kahyunnam @yzh119 @bkryu @yongwww
+
+# ── GDN ──
+benchmarks/gdn/                          @kahyunnam @yzh119 @bkryu @yongwww
+csrc/gdn_prefill_launcher.cu             @kahyunnam @yzh119 @bkryu @yongwww
+csrc/gdn_prefill_sm90_kernel_inst.jinja  @kahyunnam @yzh119 @bkryu @yongwww
+flashinfer/gdn_decode.py                 @kahyunnam @yzh119 @bkryu @yongwww
+flashinfer/gdn_kernels/                  @kahyunnam @yzh119 @bkryu @yongwww
+flashinfer/gdn_prefill.py                @kahyunnam @yzh119 @bkryu @yongwww
+flashinfer/jit/gdn.py                    @kahyunnam @yzh119 @bkryu @yongwww
+tests/gdn/                               @kahyunnam @yzh119 @bkryu @yongwww

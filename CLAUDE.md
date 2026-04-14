@@ -28,6 +28,7 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Enable debug build | `export FLASHINFER_JIT_DEBUG=1` |
 | Set target architectures | `export FLASHINFER_CUDA_ARCH_LIST="8.0 9.0a"` |
 | Set parallel compilation | `export FLASHINFER_NVCC_THREADS=4` |
+| Limit parallel ninja jobs | `export MAX_JOBS=4` |
 
 ## Quick Start for Development
 
@@ -101,7 +102,8 @@ Use `flashinfer.utils` functions to skip tests on unsupported GPU architectures:
 - `get_compute_capability(device)` - Returns `(major, minor)` tuple
 - `is_sm90a_supported()` - Hopper (requires CUDA 12.3+)
 - `is_sm100a_supported()` - Blackwell (requires CUDA 12.8+)
-- `is_sm110a_supported()`, `is_sm120a_supported()`, `is_sm121a_supported()`
+- `is_sm100f_supported()` - Blackwell feature-set (requires CUDA 12.9+)
+- `is_sm110a_supported()`, `is_sm120a_supported()`, `is_sm120f_supported()`, `is_sm121a_supported()`
 
 **APIs decorated with `@backend_requirement`** also provide:
 - `api_name.is_compute_capability_supported(cc)` - e.g., `mm_fp4.is_compute_capability_supported(100)`
@@ -439,8 +441,10 @@ cat ~/.cache/flashinfer/0.6.0/*/cached_ops/*/build.ninja
 
 ```bash
 # Compilation
-export FLASHINFER_NVCC_THREADS=4              # Parallel compilation
+export FLASHINFER_NVCC_THREADS=4              # Threads per nvcc process (--threads=N)
+export MAX_JOBS=4                             # Parallel ninja jobs (nvcc processes)
 export FLASHINFER_CUDA_ARCH_LIST="8.0 9.0a"  # Target architectures
+# Memory note: total compilation memory ≈ MAX_JOBS × FLASHINFER_NVCC_THREADS × per-thread mem.
 
 # Behavior
 export FLASHINFER_WORKSPACE_BASE="/scratch"   # Custom cache directory

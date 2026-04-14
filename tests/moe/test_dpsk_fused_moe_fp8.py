@@ -619,6 +619,7 @@ def test_correctness_dpsk_fp8_fused_moe(
         activation_type=ActivationType.Swiglu,
         num_tokens=seq_len,
         hidden_size=7168,  # DeepSeek-V3 hidden size
+        logits_dtype=torch.float32,
         intermediate_size=intermediate_size,
     )
 

@@ -32,9 +32,14 @@ constexpr unsigned warpSize = 32;
 // Common types and utilities
 // =============================================================================
 
-// Simple packed vector type for loading N elements of type T
+// Largest power of 2 that divides v (i.e. v & -v). Returns 1 when v == 0.
+inline constexpr unsigned largestPow2Divisor(unsigned v) { return v ? (v & (~v + 1)) : 1; }
+
+// Simple packed vector type for loading N elements of type T.
+// Alignment is the largest power-of-2 factor of the total byte size,
+// so it is always valid even when N * sizeof(T) is not a power of 2 (e.g. 3 × 2 = 6).
 template <typename T, int N = sizeof(float4) / sizeof(T)>
-struct alignas(N * sizeof(T)) PackedAligned {
+struct alignas(largestPow2Divisor(N * sizeof(T))) PackedAligned {
   T val[N];
   static constexpr int count = N;
   using dtype = T;
@@ -63,6 +68,13 @@ inline constexpr auto getVectorLoadSizeForFullUtilization() -> unsigned {
 __device__ __forceinline__ float warpReduceSum(float val) {
   for (int s = warpSize / 2; s > 0; s /= 2) {
     val += __shfl_down_sync(UINT32_MAX, val, s);
+  }
+  return val;
+}
+
+__device__ __forceinline__ float warpReduceMax(float val) {
+  for (int s = warpSize / 2; s > 0; s /= 2) {
+    val = max(val, __shfl_down_sync(UINT32_MAX, val, s));
   }
   return val;
 }

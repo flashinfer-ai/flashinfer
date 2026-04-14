@@ -29,6 +29,7 @@ from .utils import (
     is_cute_dsl_available,
     make_ptr,
     get_cutlass_dtype,
+    torch_to_cutlass_dtype,
     get_num_sm,
     convert_sf_to_mma_layout,
     convert_sf_from_mma_layout,
@@ -54,11 +55,30 @@ if is_cute_dsl_available():
         AddRMSNormFP4QuantKernel,
     )
 
+    # Backwards-compatible re-exports from flashinfer.norm.kernels submodule
+    from ..norm.kernels import (
+        # Kernel classes
+        RMSNormKernel,
+        QKRMSNormKernel,
+        RMSNormQuantKernel,
+        FusedAddRMSNormKernel,
+        FusedAddRMSNormQuantKernel,
+        LayerNormKernel,
+        # Python API functions
+        rmsnorm_cute,
+        qk_rmsnorm_cute,
+        rmsnorm_quant_cute,
+        fused_add_rmsnorm_cute,
+        fused_add_rmsnorm_quant_cute,
+        layernorm_cute,
+    )
+
 __all__ = [
     # Utils (always available)
     "is_cute_dsl_available",
     "make_ptr",
     "get_cutlass_dtype",
+    "torch_to_cutlass_dtype",
     "get_num_sm",
     # Scale factor layout conversion utilities
     "convert_sf_to_mma_layout",
@@ -79,4 +99,17 @@ if is_cute_dsl_available():
         # Add + RMSNorm + FP4 Quantization
         "add_rmsnorm_fp4quant",
         "AddRMSNormFP4QuantKernel",
+        # Norm kernels (CuTe DSL) - backwards-compatible re-exports
+        "RMSNormKernel",
+        "QKRMSNormKernel",
+        "RMSNormQuantKernel",
+        "FusedAddRMSNormKernel",
+        "FusedAddRMSNormQuantKernel",
+        "LayerNormKernel",
+        "rmsnorm_cute",
+        "qk_rmsnorm_cute",
+        "rmsnorm_quant_cute",
+        "fused_add_rmsnorm_cute",
+        "fused_add_rmsnorm_quant_cute",
+        "layernorm_cute",
     ]

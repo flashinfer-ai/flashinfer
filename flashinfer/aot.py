@@ -53,8 +53,11 @@ from .jit.fp4_quantization import (
     gen_fp4_quantization_sm103_module,
     gen_fp4_quantization_sm110_module,
     gen_fp4_quantization_sm120_module,
+    gen_fp4_quantization_sm120f_module,
     gen_fp4_quantization_sm121_module,
 )
+from .jit.fp4_kv_dequantization import gen_fp4_kv_dequantization_module
+from .jit.fp4_kv_quantization import gen_fp4_kv_quantization_module
 from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
 from .jit.fused_moe import (
     gen_cutlass_fused_moe_sm90_module,
@@ -74,6 +77,7 @@ from .jit.gemm import (
     gen_gemm_sm100_module_cutlass_mxfp8,
     gen_gemm_sm120_module,
     gen_gemm_sm120_module_cutlass_fp4,
+    gen_gemm_sm120_module_cutlass_mxfp8,
     gen_tgv_gemm_sm10x_module,
     gen_trtllm_gen_gemm_module,
     gen_trtllm_low_latency_gemm_module,
@@ -84,11 +88,20 @@ from .jit.mamba import (
 )
 from .jit.mla import gen_mla_module
 from .jit.norm import gen_norm_module
+from .jit.rmsnorm_silu import (
+    gen_rmsnorm_silu_module,
+    select_knobs,
+    _estimate_ctas_per_row,
+    _compute_default_knobs,
+    _SUPPORTED_C,
+    _SUPPORTED_TOKENS,
+)
 from .jit.page import gen_page_module
 from .jit.quantization import gen_quantization_module
 from .jit.rope import gen_rope_module
 from .jit.sampling import gen_sampling_module
 from .jit.spdlog import gen_spdlog_module
+from .jit.moe_utils import gen_moe_utils_module
 from .jit.tllm_utils import gen_trtllm_utils_module
 from .jit.topk import gen_topk_module
 from .jit.xqa import gen_xqa_module, gen_xqa_module_mla
@@ -452,6 +465,7 @@ def gen_all_modules(
     has_sm103 = sm_capabilities.get("sm103", False)
     has_sm110 = sm_capabilities.get("sm110", False)
     has_sm120 = sm_capabilities.get("sm120", False)
+    has_sm120f = sm_capabilities.get("sm120f", False)
     has_sm121 = sm_capabilities.get("sm121", False)
 
     jit_specs += list(
@@ -505,6 +519,7 @@ def gen_all_modules(
                 gen_tgv_gemm_sm10x_module(torch.bfloat16, use_sm_100f=True)
             )
             jit_specs.append(gen_tgv_gemm_sm10x_module(torch.float16, use_sm_100f=True))
+            jit_specs.append(gen_moe_utils_module())
         if has_sm103:
             jit_specs.append(gen_fp4_quantization_sm103_module())
             jit_specs.append(gen_cutlass_fused_moe_sm103_module())
@@ -512,23 +527,28 @@ def gen_all_modules(
             jit_specs.append(gen_fp4_quantization_sm110_module())
         if has_sm120:
             jit_specs.append(gen_fp4_quantization_sm120_module())
+        if has_sm121:
+            jit_specs.append(gen_fp4_quantization_sm121_module())
+        if has_sm120 or has_sm121:
+            # SM120 and SM121 share the same CUTLASS kernels for fused MOE and GEMM.
+            # The SM120 module generators use supported_major_versions=[12] which
+            # compiles for all SM12x targets.
             jit_specs.append(gen_cutlass_fused_moe_sm120_module())
             jit_specs.append(gen_gemm_sm120_module())
             jit_specs.append(gen_gemm_sm120_module_cutlass_fp4())
-        if has_sm121:
-            jit_specs.append(gen_fp4_quantization_sm121_module())
+            jit_specs.append(gen_gemm_sm120_module_cutlass_mxfp8())
+        if has_sm120f:
+            jit_specs.append(gen_fp4_quantization_sm120f_module())
 
     if add_comm:
         from .jit.comm import (
             gen_comm_alltoall_module,
             gen_moe_alltoall_module,
-            gen_nvshmem_module,
             gen_trtllm_comm_module,
             gen_trtllm_mnnvl_comm_module,
             gen_vllm_comm_module,
         )
 
-        jit_specs.append(gen_nvshmem_module())
         jit_specs.append(gen_comm_alltoall_module())
         if has_sm100:
             jit_specs.append(gen_trtllm_comm_module())
@@ -546,42 +566,115 @@ def gen_all_modules(
             gen_sampling_module(),
             gen_topk_module(),
         ]
+        # Fused RMSNorm+SiLU: pre-compile all LUT configs (SM100+ only)
+        if has_sm100:
+            for C in _SUPPORTED_C:
+                for tokens in _SUPPORTED_TOKENS:
+                    for dtype in ["bf16", "fp8", "nvfp4"]:
+                        knobs = select_knobs(C, tokens, dtype)
+                        if knobs is None:
+                            continue
+                        wm, sc, kcfg, occ, bpl = knobs
+                        cpr = _estimate_ctas_per_row(C, sc, kcfg, bpl)
+                        jit_specs.append(
+                            gen_rmsnorm_silu_module(C, dtype, wm, cpr, bpl, kcfg, occ)
+                        )
+            # Fallback configs for common hidden sizes not in the LUT.
+            # Fallback knobs depend only on (C, dtype), not num_tokens,
+            # so one module per (C, dtype) covers all token counts.
+            _FALLBACK_C = [
+                768,
+                1280,
+                1536,
+                2048,
+                2560,
+                3072,
+                4096,
+                5120,
+                6144,
+                8192,
+            ]
+            for C in _FALLBACK_C:
+                for dtype in ["bf16", "fp8", "nvfp4"]:
+                    knobs = _compute_default_knobs(C, dtype)
+                    if knobs is None:
+                        continue
+                    wm, sc, kcfg, occ, bpl = knobs
+                    cpr = _estimate_ctas_per_row(C, sc, kcfg, bpl)
+                    jit_specs.append(
+                        gen_rmsnorm_silu_module(C, dtype, wm, cpr, bpl, kcfg, occ)
+                    )
         # selective_state_update: one module per dtype combo per GPU arch
         _ssu_dtype_combos = [
-            # (state,        input,          weight,         matrixA,      stateIndex)
+            # (state,        input,          weight,         matrixA,      stateIndex, state_scale_dtype)
             (
                 torch.bfloat16,
                 torch.bfloat16,
                 torch.bfloat16,
                 torch.float32,
                 torch.int64,
+                None,
             ),
-            (torch.float32, torch.bfloat16, torch.bfloat16, torch.float32, torch.int64),
+            # int16 state (block-scaled quantization, scale stored as float32)
+            (
+                torch.int16,
+                torch.bfloat16,
+                torch.bfloat16,
+                torch.float32,
+                torch.int64,
+                torch.float32,
+            ),
+            (
+                torch.float32,
+                torch.bfloat16,
+                torch.bfloat16,
+                torch.float32,
+                torch.int64,
+                None,
+            ),
         ]
         _ssu_dims = [64]
         _ssu_dstates = [128]
         _ssu_ntokens = [1, 4, 6, 8]
-        for dtype_combo, dim, dstate, ntokens in product(
-            _ssu_dtype_combos, _ssu_dims, _ssu_dstates, _ssu_ntokens
+        _ssu_cu_seqlens_dtypes = [torch.int32, torch.int64]
+        _ssu_num_accepted_dtypes = [torch.int32, torch.int64]
+        for dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype in product(
+            _ssu_dtype_combos,
+            _ssu_dims,
+            _ssu_dstates,
+            _ssu_ntokens,
+            _ssu_cu_seqlens_dtypes,
+            _ssu_num_accepted_dtypes,
         ):
             jit_specs.append(
                 # false positive: mypy can't resolve the signature because flashinfer.jit deps (filelock etc.)
                 # are absent in mypy's isolated env, causing it to infer an incorrect function signature
-                gen_selective_state_update_module(*dtype_combo, dim, dstate, ntokens)  # type: ignore[call-arg]
+                gen_selective_state_update_module(
+                    *dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype
+                )  # type: ignore[call-arg]
             )
         if has_sm90 or has_sm100:
-            for dtype_combo, dim, dstate, ntokens in product(
-                _ssu_dtype_combos, _ssu_dims, _ssu_dstates, _ssu_ntokens
+            for dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype in product(
+                _ssu_dtype_combos,
+                _ssu_dims,
+                _ssu_dstates,
+                _ssu_ntokens,
+                _ssu_cu_seqlens_dtypes,
+                _ssu_num_accepted_dtypes,
             ):
                 jit_specs.append(
                     # same false positive as above
                     gen_selective_state_update_sm90_module(  # type: ignore[call-arg]
-                        *dtype_combo, dim, dstate, ntokens
+                        *dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype
                     )
                 )
             jit_specs.append(gen_trtllm_utils_module())
         if has_sm90:
             jit_specs.append(gen_gdn_prefill_sm90_module())
+        # FP4 KV cache quantization/dequantization
+        jit_specs.append(gen_fp4_kv_dequantization_module())
+        if has_sm100 or has_sm103 or has_sm110 or has_sm120 or has_sm121:
+            jit_specs.append(gen_fp4_kv_quantization_module())
 
     if (
         add_xqa and get_cuda_version() > Version("12.8")
@@ -795,6 +888,7 @@ def detect_sm_capabilities():
         "sm103": has_sm("compute_103", "12.9"),
         "sm110": has_sm("compute_110", "13.0"),
         "sm120": has_sm("compute_120", "12.8"),
+        "sm120f": has_sm("compute_120f", "12.9"),
         "sm121": has_sm("compute_121", "12.9"),
     }
 

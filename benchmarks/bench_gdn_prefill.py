@@ -14,268 +14,183 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+"""
+Performance benchmark for GDN (Gated Delta Network) prefill kernel.
+
+Compares FlashInfer GDN prefill against FLA baseline across
+Qwen3.5 family model configurations.
+
+Usage:
+  python bench_gdn_prefill.py
+  python bench_gdn_prefill.py --warmup 10 --iters 100
+"""
+
 import argparse
+import sys
+
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
-from flashinfer.testing.utils import bench_gpu_time
+from flashinfer.testing import bench_gpu_time
+from flashinfer.utils import get_compute_capability
+
+try:
+    from fla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_fwd as fla_gdn
+
+    _has_fla = True
+except ImportError:
+    _has_fla = False
+
+HEAD_CONFIGS = [
+    # (h_qk, h_v, d, label)
+    # Qwen3.5-397B and 122B (h_k=16, h_v=64, d=128) under different TP
+    (2, 8, 128, "397B/122B TP8"),
+    (4, 16, 128, "397B/122B TP4"),
+    (8, 32, 128, "397B/122B TP2"),
+    (16, 64, 128, "397B/122B TP1"),
+    # Qwen3.5-35B, 9B and 4B (h_k=16, h_v=32, d=128)
+    (16, 32, 128, "35B/9B/4B TP1"),
+    # Qwen3.5-27B (h_k=16, h_v=48, d=128)
+    (16, 48, 128, "27B TP1"),
+    # Qwen3.5-2B and 0.8B (h_k=16, h_v=16, d=128)
+    (16, 16, 128, "2B/0.8B TP1"),
+    # Symmetric heads
+    (32, 32, 128, "Sym h32"),
+]
+
+SEQ_CONFIGS = [
+    # (cu_seqlen_endpoints, label)
+    # endpoints are cumulative positions (leading 0 added automatically)
+    ((8192,), "1x8192"),
+    ((4096,), "1x4096"),
+    ((2048,), "1x2048"),
+    ((1024 * 6, 8192), "6144+2048"),
+    ((1024 * 4, 8192), "4096+4096"),
+    ((1024 * 2, 8192), "2048+6144"),
+    ((1024 * 1, 8192), "1024+7168"),
+    ((2048, 2048 * 2, 2048 * 3, 8192), "2048x4"),
+    (tuple(1024 * (i + 1) for i in range(8)), "1024x8"),
+]
 
 
-def gdn_flops(
-    total_seq_len: int,
-    num_q_heads: int,
-    num_k_heads: int,
-    num_v_heads: int,
-    head_size: int,
-    num_seqs: int,
-) -> int:
-    """
-    Calculate FLOPs for Gated Delta Rule (GDN) attention.
-
-    Delta Rule formula:
-        state_t = alpha_t * state_{t-1} + beta_t * (k_t @ v_t^T)
-        output_t = q_t @ state_t
-
-    Matrix multiplications per token per head:
-    1. k @ v^T (outer product): 2 * d^2 FLOPs
-    2. q @ state: 2 * d^2 FLOPs
-
-    Note: alpha/beta gating are element-wise scalar multiplications,
-    not counted in TFLOPS.
-    """
-    num_o_heads = max(num_q_heads, num_v_heads)
-
-    # k @ v^T (outer product): 2 * d^2 per token per head
-    outer_product_flops = 2 * total_seq_len * num_o_heads * head_size * head_size
-
-    # q @ state: 2 * d^2 per token per head
-    output_flops = 2 * total_seq_len * num_o_heads * head_size * head_size
-
-    total_flops = outer_product_flops + output_flops
-    return total_flops
+def _gdn_tflops(total_tokens, h_v, d, time_ms):
+    """Calculate TFLOPS: 2 GEMMs (kv outer product + q@state) per token per head."""
+    flops = 2 * 2 * total_tokens * h_v * d * d
+    return flops / time_ms / 1e9
 
 
-def gdn_bytes(
-    total_seq_len: int,
-    num_q_heads: int,
-    num_k_heads: int,
-    num_v_heads: int,
-    head_size: int,
-    num_seqs: int,
-    dtype: torch.dtype,
-) -> int:
-    """
-    Calculate memory bytes for GDN attention.
+def bench_fi(endpoints, h_qk, h_v, d, warmup, iters):
+    """Benchmark FlashInfer GDN prefill."""
+    device = "cuda"
+    dtype = torch.float16
+    N = len(endpoints)
+    T = endpoints[-1]
+    cu_seqlens = torch.tensor([0] + list(endpoints), dtype=torch.int64, device=device)
 
-    Includes:
-    - Q, K, V tensors (input)
-    - Output tensor
-    - State tensor (float32)
-    - Alpha, Beta tensors (optional, float32)
-    """
-    num_o_heads = max(num_q_heads, num_v_heads)
-    num_sab_heads = num_o_heads
-    elem_size = dtype.itemsize
+    q = torch.randn((T, h_qk, d), dtype=dtype, device=device)
+    k = F.normalize(
+        torch.randn(T, h_qk, d, dtype=torch.float32, device=device), p=2, dim=-1
+    ).to(dtype)
+    v = torch.randn((T, h_v, d), dtype=dtype, device=device)
+    g = F.logsigmoid(torch.rand(T, h_v, dtype=torch.float32, device=device))
+    beta = torch.rand(T, h_v, dtype=torch.float32, device=device).sigmoid()
+    h0 = torch.randn((N, h_v, d, d), dtype=torch.float32, device=device)
+    state_out = torch.zeros_like(h0)
 
-    # Input tensors
-    q_bytes = total_seq_len * num_q_heads * head_size * elem_size
-    k_bytes = total_seq_len * num_k_heads * head_size * elem_size
-    v_bytes = total_seq_len * num_v_heads * head_size * elem_size
-
-    # Output tensor
-    o_bytes = total_seq_len * num_o_heads * head_size * elem_size
-
-    # State tensor (float32)
-    state_bytes = num_seqs * num_sab_heads * head_size * head_size * 4
-
-    # Alpha and Beta (float32)
-    alpha_bytes = total_seq_len * num_sab_heads * 4
-    beta_bytes = total_seq_len * num_sab_heads * 4
-
-    total_bytes = (
-        q_bytes + k_bytes + v_bytes + o_bytes + state_bytes + alpha_bytes + beta_bytes
+    fn = lambda: chunk_gated_delta_rule(
+        q, k, v, g, beta, None, h0, True, cu_seqlens, False, None, state_out
     )
-    return total_bytes
-
-
-def bench_gdn_prefill(
-    batch_size: int,
-    seq_len: int,
-    num_q_heads: int,
-    num_k_heads: int,
-    num_v_heads: int,
-    head_size: int,
-    dtype: torch.dtype,
-    use_alpha: bool = True,
-    use_beta: bool = True,
-):
-    """Benchmark GDN prefill kernel."""
-    total_seq_len = batch_size * seq_len
-    num_o_heads = max(num_q_heads, num_v_heads)
-    num_sab_heads = num_o_heads
-
-    # Create inputs
-    q = torch.randn(total_seq_len, num_q_heads, head_size, dtype=dtype, device="cuda")
-    k = torch.randn(total_seq_len, num_k_heads, head_size, dtype=dtype, device="cuda")
-    # L2 normalize k for numerical stability
-    k = torch.nn.functional.normalize(k, p=2.0, dim=-1)
-    v = torch.randn(total_seq_len, num_v_heads, head_size, dtype=dtype, device="cuda")
-
-    cu_seqlens = torch.arange(
-        0, batch_size * seq_len + 1, seq_len, dtype=torch.int64, device="cuda"
-    )
-
-    alpha = (
-        torch.rand(total_seq_len, num_sab_heads, dtype=torch.float32, device="cuda")
-        if use_alpha
-        else None
-    )
-    beta = (
-        torch.rand(total_seq_len, num_sab_heads, dtype=torch.float32, device="cuda")
-        if use_beta
-        else None
-    )
-
-    # Pre-allocate outputs
-    output = torch.empty(
-        total_seq_len, num_o_heads, head_size, dtype=dtype, device="cuda"
-    )
-    output_state = torch.empty(
-        batch_size,
-        num_sab_heads,
-        head_size,
-        head_size,
-        dtype=torch.float32,
-        device="cuda",
-    )
-
-    # Warmup
-    chunk_gated_delta_rule(
-        q, k, v, alpha, beta, None, None, True, cu_seqlens, False, output, output_state
-    )
-    torch.cuda.synchronize()
-
-    # Benchmark
     times = bench_gpu_time(
-        lambda: chunk_gated_delta_rule(
-            q,
-            k,
-            v,
-            alpha,
-            beta,
-            None,
-            None,
-            True,
-            cu_seqlens,
-            False,
-            output,
-            output_state,
-        ),
-        dry_run_time_ms=100,
-        repeat_time_ms=1000,
-        enable_cupti=True,
+        fn, enable_cupti=True, dry_run_iters=warmup, repeat_iters=iters
     )
+    torch.cuda.empty_cache()
+    return np.average(times)
 
-    median_ms = np.median(times)
 
-    # Calculate metrics
-    flops = gdn_flops(
-        total_seq_len, num_q_heads, num_k_heads, num_v_heads, head_size, batch_size
+def bench_fla(endpoints, h_qk, h_v, d, warmup, iters):
+    """Benchmark FLA baseline."""
+    device = "cuda"
+    dtype = torch.float16
+    h = h_v
+    N = len(endpoints)
+    T = endpoints[-1]
+    cu_seqlens = torch.tensor([0] + list(endpoints), dtype=torch.int32, device=device)
+
+    q = torch.randn((1, T, h, d), dtype=dtype, device=device)
+    k = F.normalize(
+        torch.randn(1, T, h, d, dtype=torch.float32, device=device), p=2, dim=-1
+    ).to(dtype)
+    v = torch.randn((1, T, h_v, d), dtype=dtype, device=device)
+    g = F.logsigmoid(torch.rand(1, T, h_v, dtype=torch.float32, device=device))
+    beta = torch.rand(1, T, h_v, dtype=torch.float32, device=device).sigmoid()
+    h0 = torch.randn((N, h_v, d, d), dtype=torch.float32, device=device)
+
+    fn = lambda: fla_gdn(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        None,
+        initial_state=h0,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
     )
-    bytes_accessed = gdn_bytes(
-        total_seq_len,
-        num_q_heads,
-        num_k_heads,
-        num_v_heads,
-        head_size,
-        batch_size,
-        dtype,
+    times = bench_gpu_time(
+        fn, enable_cupti=True, dry_run_iters=warmup, repeat_iters=iters
     )
-
-    tflops = flops / median_ms / 1e9
-    tb_per_sec = bytes_accessed / median_ms / 1e9
-
-    # Get device info for bandwidth calculation
-    props = torch.cuda.get_device_properties(0)
-    props.total_memory * 2 / 1e12  # Approximate peak bandwidth
-
-    return {
-        "batch_size": batch_size,
-        "seq_len": seq_len,
-        "num_q_heads": num_q_heads,
-        "num_k_heads": num_k_heads,
-        "num_v_heads": num_v_heads,
-        "head_size": head_size,
-        "dtype": str(dtype).replace("torch.", ""),
-        "median_ms": median_ms,
-        "tflops": tflops,
-        "tb_per_sec": tb_per_sec,
-    }
+    torch.cuda.empty_cache()
+    return np.average(times)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Benchmark GDN Prefill Kernel")
-    parser.add_argument("--batch-size", type=int, nargs="+", default=[1, 4, 16, 64])
-    parser.add_argument("--seq-len", type=int, nargs="+", default=[128, 256, 512, 1024])
-    parser.add_argument("--num-q-heads", type=int, default=16)
-    parser.add_argument("--num-k-heads", type=int, default=16)
-    parser.add_argument("--num-v-heads", type=int, default=32)
-    parser.add_argument("--head-size", type=int, default=128)
-    parser.add_argument(
-        "--dtype", type=str, choices=["float16", "bfloat16"], default="bfloat16"
-    )
-    parser.add_argument(
-        "--preset",
-        type=str,
-        choices=["qwen3-next", "custom"],
-        default="custom",
-        help="Use preset config. qwen3-next: q=k=16, v=32, d=128",
-    )
+    parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--iters", type=int, default=20)
     args = parser.parse_args()
 
-    # Apply preset configurations
-    if args.preset == "qwen3-next":
-        # Qwen3-Next-80B-A3B linear attention config (GVA)
-        args.num_q_heads = 16
-        args.num_k_heads = 16
-        args.num_v_heads = 32
-        args.head_size = 128
+    device = torch.device("cuda")
+    major, minor = get_compute_capability(device)
+    if major < 9:
+        print(f"GDN requires SM90+, got SM{major}{minor}")
+        sys.exit(1)
 
-    # Check SM90 support
-    device_capability = torch.cuda.get_device_capability()
-    if device_capability[0] < 9:
-        print(f"Current device capability: {device_capability}")
-        print("GDN requires SM90 (Hopper) or later. Exiting...")
-        return
-
-    dtype = getattr(torch, args.dtype)
-
-    print(
-        f"GDN Prefill Benchmark (heads: q={args.num_q_heads}, k={args.num_k_heads}, v={args.num_v_heads}, d={args.head_size}, dtype={args.dtype})"
+    arch_label = {9: "Hopper (SM90)", 10: "Blackwell (SM100)"}.get(
+        major, f"SM{major}{minor}"
     )
-    print("-" * 100)
-    print(f"{'batch':>6} {'seq_len':>8} {'time(ms)':>10} {'TFLOPS':>10} {'TB/s':>10}")
-    print("-" * 100)
 
-    for batch_size in args.batch_size:
-        for seq_len in args.seq_len:
-            result = bench_gdn_prefill(
-                batch_size=batch_size,
-                seq_len=seq_len,
-                num_q_heads=args.num_q_heads,
-                num_k_heads=args.num_k_heads,
-                num_v_heads=args.num_v_heads,
-                head_size=args.head_size,
-                dtype=dtype,
-            )
+    if not _has_fla:
+        print("Error: FLA not installed. Run: pip install flash-linear-attention")
+        sys.exit(1)
+
+    print(f"\nGPU: {torch.cuda.get_device_name(0)} [{arch_label}]")
+    print("Models: Qwen3.5 family (397B, 122B, 35B, 27B, 9B, 4B, 2B, 0.8B), d=128")
+    print()
+    fi_col = f"FI {arch_label}"
+    header = (
+        f"{'Heads':<15s}  {'Seqlens':<16s}  {'h_qk':>4s} {'h_v':>4s}"
+        f"  {fi_col:>22s}  {'TFLOPS':>7s}"
+        f"  {'FLA/Triton':>10s}  {'Speedup':>8s}"
+    )
+    print(header)
+    print("-" * len(header))
+
+    for h_qk, h_v, d, h_label in HEAD_CONFIGS:
+        for endpoints, s_label in SEQ_CONFIGS:
+            T = endpoints[-1]
+            fi_ms = bench_fi(endpoints, h_qk, h_v, d, args.warmup, args.iters)
+            fla_ms = bench_fla(endpoints, h_qk, h_v, d, args.warmup, args.iters)
+            tflops = _gdn_tflops(T, h_v, d, fi_ms)
+            speedup = fla_ms / fi_ms
+            marker = "+" if speedup > 1.0 else "-"
             print(
-                f"{result['batch_size']:>6} {result['seq_len']:>8} "
-                f"{result['median_ms']:>10.3f} {result['tflops']:>10.2f} "
-                f"{result['tb_per_sec']:>10.2f}"
+                f"{h_label:<15s}  {s_label:<16s}  {h_qk:>4d} {h_v:>4d}"
+                f"  {fi_ms:>21.3f}ms  {tflops:>6.1f}"
+                f"  {fla_ms:>9.3f}ms  {speedup:>7.2f}x {marker}"
             )
-
-    print("-" * 100)
+        print()
 
 
 if __name__ == "__main__":

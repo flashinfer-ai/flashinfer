@@ -17,9 +17,11 @@ limitations under the License.
 import ctypes
 import hashlib
 import os
+import pathlib
 from urllib.parse import urljoin
 import shutil
 import time
+from typing import Union
 import uuid
 
 import filelock
@@ -136,14 +138,20 @@ def download_file(
         return False
 
 
-def get_meta_hash(checksums_bytes: bytes) -> str:
+def get_meta_hash(
+    checksums_bytes: bytes, target_file: str = "flashinferMetaInfo.h"
+) -> str:
     """
     Parse the checksums.txt file and get the hash of corresponding flashinferMetaInfo.h file
     """
     checksums_lines = checksums_bytes.decode("utf-8").splitlines()
     for line in checksums_lines:
         sha256, filename = line.strip().split()
-        if ".h" in filename:
+        # Match on path segment boundary to avoid substring collisions
+        # (e.g. "Enums.h" must not match "BatchedGemmEnums.h")
+        if filename.lower() == target_file.lower() or filename.lower().endswith(
+            "/" + target_file.lower()
+        ):
             return sha256
     raise ValueError("Invalid checksums.txt, no flashinferMetaInfo.h found")
 
@@ -189,26 +197,94 @@ def load_cubin(cubin_path: str, sha256: str) -> bytes:
     return b""
 
 
-def get_cubin(file_name: str, sha256: str, session=None) -> bytes:
+def get_artifact(file_name: str, sha256: str, session=None) -> bytes:
+    """Load an artifact (cubin, header, checksum, etc.) from the local cache.
+
+    Checks ``FLASHINFER_CUBIN_DIR / file_name`` first.  If the file is missing
+    or its SHA-256 doesn't match, it is downloaded from
+    ``FLASHINFER_CUBINS_REPOSITORY``.
+
+    Returns the file contents as bytes, or empty bytes on failure.
     """
-    Load a cubin from the local cache directory with {file_name} and
-    ensure that the sha256 signature matches.
+    local_path = str(FLASHINFER_CUBIN_DIR / file_name)
+    data = load_cubin(local_path, sha256)
+    if data:
+        return data
 
-    If the kernel does not exist in the cache, it will downloaded.
+    if os.getenv("FLASHINFER_NO_DOWNLOAD"):
+        raise RuntimeError(
+            f"Artifact not found locally: {file_name} "
+            f"(looked at {local_path}). "
+            f"FLASHINFER_NO_DOWNLOAD is set — refusing to download. "
+            f"This means flashinfer-cubin is missing this file."
+        )
 
-    Returns:
-    None on failure.
-    """
-    cubin_path = str(FLASHINFER_CUBIN_DIR / file_name)
-    cubin = load_cubin(cubin_path, sha256)
-    if cubin:
-        return cubin
-    # either the file does not exist or it is corrupted, we'll download a new one.
-
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
     uri = safe_urljoin(FLASHINFER_CUBINS_REPOSITORY, file_name)
-    logger.info(f"Fetching cubin {file_name} from {uri}")
-    download_file(uri, cubin_path, session=session)
-    return load_cubin(cubin_path, sha256)
+    logger.info(f"Fetching {file_name} from {uri}")
+    download_file(uri, local_path, session=session)
+    return load_cubin(local_path, sha256)
+
+
+# Backward-compatible alias
+get_cubin = get_artifact
+
+
+def ensure_symlink(
+    link: Union[str, pathlib.Path], target: Union[str, pathlib.Path]
+) -> None:
+    """Create or update a symlink, removing any stale file/directory at *link*.
+
+    This is used to map C++ include paths (e.g.
+    ``CUBIN_DIR/flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export``) to the
+    canonical artifact directory where ``get_artifact()`` stores downloaded files.
+    """
+    link = pathlib.Path(link)
+    target = pathlib.Path(target)
+
+    link.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = str(link) + ".lock"
+    lock = filelock.FileLock(lock_path, timeout=60)
+    with lock:
+        if link.is_symlink() or link.exists():
+            if link.is_symlink() and link.resolve() == target.resolve():
+                return  # already correct
+            # Stale symlink or directory from a previous version; remove it.
+            if link.is_symlink() or link.is_file():
+                link.unlink()
+            else:
+                shutil.rmtree(link)
+        link.symlink_to(target)
+
+
+def verify_symlinked_headers(
+    symlink_path: Union[str, pathlib.Path],
+    headers: list,
+    checksums: bytes,
+) -> None:
+    """Verify that headers accessible through the symlink match expected checksums.
+
+    This catches stale cached headers after e.g. ``git checkout`` to a branch
+    with a different artifact version.  Each header file is read through the
+    symlink and its SHA-256 is compared against the hash from ``checksums.txt``.
+    """
+    symlink_path = pathlib.Path(symlink_path)
+    for header in headers:
+        header_path = symlink_path / header
+        expected_hash = get_meta_hash(checksums, header)
+        if not header_path.exists():
+            raise RuntimeError(
+                f"Header {header} not found at {header_path}. "
+                f"Try clearing the cache: rm -rf {FLASHINFER_CUBIN_DIR}"
+            )
+        actual_hash = hashlib.sha256(header_path.read_bytes()).hexdigest()
+        if actual_hash != expected_hash:
+            raise RuntimeError(
+                f"Header {header} at {header_path} has wrong checksum "
+                f"(expected {expected_hash}, got {actual_hash}). "
+                f"This can happen after switching branches. "
+                f"Try clearing the cache: rm -rf {FLASHINFER_CUBIN_DIR}"
+            )
 
 
 def convert_to_ctypes_char_p(data: bytes):
@@ -230,7 +306,7 @@ def setup_cubin_loader(dll_path: str) -> None:
 
     def get_cubin_callback(name: bytes, sha256: bytes):
         # Both name and sha256 are bytes (c_char_p)
-        cubin = get_cubin(name.decode("utf-8"), sha256.decode("utf-8"))
+        cubin = get_artifact(name.decode("utf-8"), sha256.decode("utf-8"))
         _LIB.FlashInferSetCurrentCubin(
             convert_to_ctypes_char_p(cubin), ctypes.c_int(len(cubin))
         )

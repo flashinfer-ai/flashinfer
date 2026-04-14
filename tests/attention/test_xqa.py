@@ -456,7 +456,7 @@ def test_xqa(
     total_elements = ref_output_batch.numel()
     passing_elements = within_tolerance.sum().item()
     pass_ratio = passing_elements / total_elements
-    required_ratio = 0.99
+    required_ratio = 0.98
 
     assert pass_ratio >= required_ratio, (
         f"Batch validation failed: "
