@@ -199,8 +199,10 @@ def _get_weight_views(
     key = (
         w1_fp4.data_ptr(),
         w1_blockscale.data_ptr(),
+        w1_alphas.data_ptr(),
         w2_fp4.data_ptr(),
         w2_blockscale.data_ptr(),
+        w2_alphas.data_ptr(),
     )
     cached = _WEIGHT_CACHE.get(key)
     if cached is not None:
@@ -1299,19 +1301,24 @@ def launch_sm120_moe(
         )
     )
 
-    backend = select_sm120_moe_backend(num_tokens=num_tokens, num_topk=top_k)
-
-    # The dynamic kernel indexes row_counts/expert_write_rows directly with
-    # topk_ids but those buffers are sized with num_local_experts. Unless
-    # num_local_experts == num_experts, fall back to the static backend which
-    # has global-to-local expert remapping.
-    if backend == "dynamic" and num_local_experts != num_experts:
-        backend = "static"
-
-    # Resolve workspace: caller-provided > cached > fresh allocation.
+    # Resolve workspace and backend selection.
+    # When a pre-allocated workspace is provided (CUDA graph wrapper path),
+    # infer the backend from the workspace type so they stay in sync —
+    # the caller already committed to a backend at allocation time.
     if _workspace is not None:
         workspace = _workspace
+        if isinstance(workspace, Sm120DynamicMoEWorkspace):
+            backend = "dynamic"
+        else:
+            backend = "static"
     else:
+        backend = select_sm120_moe_backend(num_tokens=num_tokens, num_topk=top_k)
+        # The dynamic kernel indexes row_counts/expert_write_rows directly with
+        # topk_ids but those buffers are sized with num_local_experts. Unless
+        # num_local_experts == num_experts, fall back to the static backend which
+        # has global-to-local expert remapping.
+        if backend == "dynamic" and num_local_experts != num_experts:
+            backend = "static"
         workspace = _get_cached_workspace(
             backend=backend,
             state_E=num_local_experts,

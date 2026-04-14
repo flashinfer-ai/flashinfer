@@ -691,8 +691,10 @@ class CuteDslMoEWrapper:
             weight_key = (
                 w1_weight.data_ptr(),
                 w1_weight_sf.data_ptr(),
+                w1_alpha.data_ptr(),
                 w2_weight.data_ptr(),
                 w2_weight_sf.data_ptr(),
+                w2_alpha.data_ptr(),
             )
             if (
                 self._sm120_weight_views is None
