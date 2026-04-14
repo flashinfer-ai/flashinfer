@@ -445,7 +445,6 @@ export FLASHINFER_NVCC_THREADS=4              # Threads per nvcc process (--thre
 export MAX_JOBS=4                             # Parallel ninja jobs (nvcc processes)
 export FLASHINFER_CUDA_ARCH_LIST="8.0 9.0a"  # Target architectures
 # Memory note: total compilation memory ≈ MAX_JOBS × FLASHINFER_NVCC_THREADS × per-thread mem.
-# For modules with many variants (e.g. GDN prefill: 64 .cu files), cap both to avoid OOM.
 
 # Behavior
 export FLASHINFER_WORKSPACE_BASE="/scratch"   # Custom cache directory
