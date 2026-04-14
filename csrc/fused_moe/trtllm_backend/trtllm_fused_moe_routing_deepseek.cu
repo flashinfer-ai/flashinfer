@@ -334,16 +334,27 @@ __global__ void routingMainKernel(KernelParams params) {
       auto finalScore = OutputT{scoreNorm * params.mRouteScale / redNorm};
 
       // write expert idx out already
-      auto idxTopK = blockIdx.x * params.mTopK + laneIdx;
+      auto idxTopK = blockIdx.x * params.mTotalExpertsPerToken + laneIdx;
+      auto idxShared = blockIdx.x * params.mTotalExpertsPerToken + params.mTopK + laneIdx;
       if (laneIdx < params.mTopK && params.mPtrTopKPacked != nullptr) {
         PackedScoreIdx<OutputT> packedScore{static_cast<OutputT>(finalScore),
                                             static_cast<int16_t>(expertIdx)};
         params.mPtrTopKPacked[idxTopK] = packedScore;
       }
 
+      if (laneIdx < params.mNumFusedSharedExperts && params.mPtrTopKPacked != nullptr) {
+        PackedScoreIdx<OutputT> packedScore{static_cast<OutputT>(1.0F),
+                                            static_cast<int16_t>(params.mNumExperts + laneIdx)};
+        params.mPtrTopKPacked[idxShared] = packedScore;
+      }
+
       if (laneIdx < params.mTopK && params.mPtrTopKWeights != nullptr &&
           params.mPtrTopKIds == nullptr) {
         params.mPtrTopKWeights[idxTopK] = finalScore;
+      }
+
+      if (laneIdx < params.mNumFusedSharedExperts && params.mPtrTopKWeights != nullptr) {
+        params.mPtrTopKWeights[idxShared] = static_cast<OutputT>(1.0F);
       }
     }
   }
@@ -520,19 +531,40 @@ void run(Data& data, void* stream) {
                      data.mNumLimitedGroups, data.mNumExpertGroups);
     FLASHINFER_CHECK(data.mNumExperts % 4 == 0,
                      "Routing kernel expects #experts %d to be a multiple of 4.", data.mNumExperts);
+
+    FLASHINFER_CHECK(data.mNumFusedSharedExperts <= WarpSize,
+                     "Number of fused shared experts (%d) must be less than warp size.",
+                     data.mNumFusedSharedExperts);
   }
 
+  int const numExperts = data.mNumExperts + data.mNumFusedSharedExperts;
+  int const topK = data.mTopK + data.mNumFusedSharedExperts;
+  int const numThreadsHist = getMaxNumExperts(numExperts);
+
+  FLASHINFER_CHECK(topK <= MaxSupportedTopExperts,
+                   "Routing kernel expects topK experts <= %d, got %d", MaxSupportedTopExperts,
+                   topK);
+
   int const numBlocks = data.mNumTokens;
-  int const numThreadsHist = getMaxNumExperts(data.mNumExperts);
 
   // Step 1: Run DeepSeek-specific topK computation (writes to mPtrTopKPacked)
   int const numThreadsMain =
       std::max(data.mNumExpertGroups * WarpSize, getMaxNumExperts(data.mNumExperts));
   launchMainKernel(data, numBlocks, numThreadsMain, stream);
 
+  // After main kernel: bump expert/topK counts to include shared experts
+  // so the permutation pipeline sees the full expanded expert set.
+  if (data.mNumFusedSharedExperts > 0) {
+    data.mNumExperts += data.mNumFusedSharedExperts;
+    data.mTopK += data.mNumFusedSharedExperts;
+    data.mNumLocalExperts += data.mNumFusedSharedExperts;
+  }
+
   // Step 2: Permutation pipeline (reads from mPtrTopKPacked written by step 1)
   if (data.mPtrPermutedIdxSize != nullptr) {
-    bool const useSingleCluster = data.mNumTokens <= 1024;
+    int numThreadsPerCluster = numThreadsHist * NumBlocksPerCluster;
+    bool const useSingleCluster =
+        data.mNumTokens <= 1024 && data.mNumTokens * topK <= numThreadsPerCluster;
     if (!useSingleCluster) {
       FLASHINFER_CHECK(data.mPtrExpertCounts != nullptr,
                        "When #tokens is large, `mPtrExpertCounts` is a required input.");
@@ -542,14 +574,14 @@ void run(Data& data, void* stream) {
 
     static int const smCount = tensorrt_llm::common::getMultiProcessorCount();
     int const numBlocksCoop = smCount - 8;
-    int const maxTokensCoop = (numBlocksCoop * numThreadsHist * 64) / data.mTopK;
+    int const maxTokensCoop = (numBlocksCoop * numThreadsHist * 64) / topK;
 
     if (useSingleCluster) {
       launchClusterKernel(data, numThreadsHist, stream);
     } else if (data.mNumTokens <= maxTokensCoop) {
       launchCoopKernel(data, numBlocksCoop, numThreadsHist, stream);
     } else {
-      const int32_t expandedIdxSize = data.mNumTokens * data.mTopK;
+      const int32_t expandedIdxSize = data.mNumTokens * topK;
       const int32_t histogramEltsPerBlock = 8 * numThreadsHist;
       const int32_t offsetEltsPerBlock = NumEltsPerOffsetTilePerThread * numThreadsHist;
       const int32_t maxNumBlocks = 1024;
