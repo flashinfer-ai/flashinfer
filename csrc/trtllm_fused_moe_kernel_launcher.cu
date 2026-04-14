@@ -54,7 +54,8 @@ static void validate_routing_replay_out(TensorView const& replay, TensorView con
   TVM_FFI_ICHECK(replay.size(1) == top_k) << "routing_replay_out dim1 must equal top_k";
   TVM_FFI_ICHECK((replay.dtype() == DLDataType{kDLInt, 16, 1}))
       << "routing_replay_out must be int16 dtype";
-  TVM_FFI_ICHECK(replay.IsContiguous()) << "routing_replay_out must be contiguous (packed row-major)";
+  TVM_FFI_ICHECK(replay.IsContiguous())
+      << "routing_replay_out must be contiguous (packed row-major)";
 }
 
 enum class Fp8QuantizationType {
@@ -560,10 +561,7 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
 
   void init(std::unique_ptr<tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs>&& args,
             int64_t tile_tokens_dim, int64_t routing_method_type, bool use_shuffled_weight,
-            int64_t weight_layout, bool norm_topk_prob = true) {
-    constexpr ActivationType activation_type =
-        ActivationType::Swiglu;  // not exposed in api for now
-
+            int64_t weight_layout, ActivationType activation_type, bool norm_topk_prob = true) {
     // Do base class init and perform common checks
     FusedMoeLauncher::init_common(std::move(args), tile_tokens_dim, routing_method_type,
                                   use_shuffled_weight, weight_layout, activation_type,
@@ -1777,8 +1775,8 @@ Array<Tensor> trtllm_bf16_moe(Optional<TensorView> const& routing_logits,
                               int64_t local_expert_offset, int64_t local_num_experts,
                               Optional<double> routed_scaling_factor, int64_t routing_method_type,
                               bool use_shuffled_weight, int64_t weight_layout, bool do_finalize,
-                              bool enable_pdl, Array<int64_t> moe_tactic, bool norm_topk_prob,
-                              Optional<TensorView> routing_replay_out) {
+                              bool enable_pdl, Array<int64_t> moe_tactic, int64_t activation_type,
+                              bool norm_topk_prob, Optional<TensorView> routing_replay_out) {
   // Just some basic type validation first and leave more checks to the launcher
   if (routing_logits.has_value()) {
     TVM_FFI_ICHECK(routing_logits.value().dtype() == dl_float32 ||
@@ -1798,6 +1796,7 @@ Array<Tensor> trtllm_bf16_moe(Optional<TensorView> const& routing_logits,
 
   auto const num_tokens = hidden_states.size(0);
   auto const hidden_size = hidden_states.size(1);
+  auto const activation = validateAndCastActivationType(activation_type);
 
   // Calculate supported tile sizes
   std::vector<int32_t> mSupportedTileN(Bf16MoeLauncher::mSupportedTileNums.begin(),
@@ -1832,7 +1831,7 @@ Array<Tensor> trtllm_bf16_moe(Optional<TensorView> const& routing_logits,
                                                       expert_weights, hidden_states, gemm1_weights,
                                                       gemm2_weights);
     launcher->init(std::move(args), curr_tile_N, routing_method_type, use_shuffled_weight,
-                   weight_layout, norm_topk_prob);
+                   weight_layout, activation, norm_topk_prob);
     launcher->set_routing_replay_out(routing_replay_out);
 
     launchers_map[curr_tile_N] = std::move(launcher);
@@ -1863,7 +1862,7 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
     Optional<TensorView> routing_replay_out) {
   // Basic type validation
   auto dtype = hidden_states.dtype();
-  auto activation = static_cast<ActivationType>(activation_type);
+  auto activation = validateAndCastActivationType(activation_type);
 
   TVM_FFI_ICHECK(dtype == dl_float8_e4m3fn || dtype == dl_float16 || dtype == dl_bfloat16)
       << "FP8 MoE: hidden_states must be float8_e4m3fn, float16, or bfloat16.";

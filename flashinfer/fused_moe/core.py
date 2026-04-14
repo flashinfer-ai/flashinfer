@@ -54,7 +54,14 @@ from .utils import (
     get_last_power_of_2_num_tokens_buckets,
     last_positive_power_of_2,
 )
-from ..tllm_enums import *
+from ..tllm_enums import (
+    ActivationType,
+    WeightLayout,
+    DtypeTrtllmGen,
+    Fp8QuantizationType,
+    deduce_trtllm_gen_tensor_dtype,
+    trtllm_gen_dtype_has_scale,
+)
 
 
 @functools.cache
@@ -1107,6 +1114,7 @@ def get_trtllm_moe_sm100_module():
                     kwargs["do_finalize"],
                     kwargs["enable_pdl"],
                     [-1, -1] if tactic == -1 else tactic,
+                    self.activation_type,
                     kwargs.get("norm_topk_prob", True),
                     kwargs.get("routing_replay_out"),
                 )
@@ -1292,6 +1300,7 @@ def get_trtllm_moe_sm100_module():
         do_finalize: bool = True,
         enable_pdl: Optional[bool] = None,
         tune_max_num_tokens: int = 8192,
+        activation_type: int = ActivationType.Swiglu.value,
         norm_topk_prob: bool = True,
         routing_replay_out: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
@@ -1341,7 +1350,7 @@ def get_trtllm_moe_sm100_module():
             intermediate_size=intermediate_size,
             weight_layout=weight_layout,
             use_shuffled_weight=use_shuffled_weight,
-            activation_type=ActivationType.Swiglu,  # Default for BF16
+            activation_type=activation_type,
         )
 
         moe_inputs = MoEInputs(
@@ -1378,6 +1387,7 @@ def get_trtllm_moe_sm100_module():
             weight_layout=weight_layout,
             do_finalize=do_finalize,
             enable_pdl=enable_pdl,
+            activation_type=activation_type,
         )
 
         # Call the C++ function with the selected tactic
@@ -1404,6 +1414,7 @@ def get_trtllm_moe_sm100_module():
             do_finalize,
             enable_pdl,
             [-1, -1] if tactic == -1 else tactic,
+            activation_type,
             norm_topk_prob,
             routing_replay_out,
         )
@@ -1439,6 +1450,7 @@ def get_trtllm_moe_sm100_module():
         do_finalize: bool = True,
         enable_pdl: Optional[bool] = None,
         tune_max_num_tokens: int = 8192,
+        activation_type: int = ActivationType.Swiglu.value,
         norm_topk_prob: bool = True,
         routing_replay_out: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
@@ -2315,6 +2327,7 @@ def trtllm_bf16_moe(
     do_finalize: bool = True,
     enable_pdl: bool = True,
     tune_max_num_tokens: int = 8192,
+    activation_type: int = ActivationType.Swiglu.value,
     norm_topk_prob: bool = True,
     routing_replay_out: Optional[torch.Tensor] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
@@ -2330,7 +2343,9 @@ def trtllm_bf16_moe(
             Must be bfloat16 if provided.
         hidden_states: [seq_len, hidden_size] tensor of input hidden states.
             Must be bfloat16.
-        gemm1_weights: [num_experts, 2*intermediate_size // 128, hidden_size // 128, 128] tensor of first layer weights. must be bfloat16.
+        gemm1_weights: [num_experts, M // 128, hidden_size // 128, 128] tensor of first layer weights. must be bfloat16.
+            M is 2*intermediate_size for gated activations and
+            intermediate_size for non-gated activations.
         gemm2_weights: [num_experts, hidden_size//128, intermediate_size, 128] tensor of second layer weights. must be bfloat16.
         num_experts: Total number of experts.
         top_k: Number of experts to route to per token.
@@ -2354,6 +2369,9 @@ def trtllm_bf16_moe(
         do_finalize: Whether to finalize the output (default: True).
         enable_pdl: Whether to enable Programmatic Dependent Launch. Auto-enabled for >= sm90.
         tune_max_num_tokens: Maximum number of tokens for autotuning (default: 8192).
+        activation_type (int): Type of activation function (default: 3 - Swiglu)
+            - 3: Swiglu
+            - 6: Relu2 (non-gated)
 
     Returns:
         when do_finalize=True, returns the final MoE output.
@@ -2382,6 +2400,7 @@ def trtllm_bf16_moe(
         do_finalize,
         enable_pdl,
         tune_max_num_tokens,
+        activation_type,
         norm_topk_prob,
         routing_replay_out,
     )
@@ -2415,6 +2434,7 @@ def trtllm_bf16_routed_moe(
     do_finalize: bool = True,
     enable_pdl: bool = True,
     tune_max_num_tokens: int = 8192,
+    activation_type: int = ActivationType.Swiglu.value,
     routing_replay_out: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     """BF16 MoE operation with autotuning support.
@@ -2428,7 +2448,9 @@ def trtllm_bf16_routed_moe(
             Can be created as: (topk_ids.int32 << 16) | expert_weights.bfloat16.view(int16)
         hidden_states: [seq_len, hidden_size] tensor of input hidden states.
             Must be bfloat16.
-        gemm1_weights: [num_experts, 2*intermediate_size // 128, hidden_size // 128, 128] tensor of first layer weights. must be bfloat16.
+        gemm1_weights: [num_experts, M // 128, hidden_size // 128, 128] tensor of first layer weights. must be bfloat16.
+            M is 2*intermediate_size for gated activations and
+            intermediate_size for non-gated activations.
         gemm2_weights: [num_experts, hidden_size//128, intermediate_size, 128] tensor of second layer weights. must be bfloat16.
         num_experts: Total number of experts.
         top_k: Number of experts to route to per token.
@@ -2452,6 +2474,9 @@ def trtllm_bf16_routed_moe(
         do_finalize: Whether to finalize the output (default: True).
         enable_pdl: Whether to enable Programmatic Dependent Launch. Auto-enabled for >= sm90.
         tune_max_num_tokens: Maximum number of tokens for autotuning (default: 8192).
+        activation_type (int): Type of activation function (default: 3 - Swiglu)
+            - 3: Swiglu
+            - 6: Relu2 (non-gated)
 
     Returns:
         when do_finalize=True, returns the final MoE output.
@@ -2480,6 +2505,7 @@ def trtllm_bf16_routed_moe(
         do_finalize,
         enable_pdl,
         tune_max_num_tokens,
+        activation_type,
         True,  # norm_topk_prob: not used for pre-computed routing
         routing_replay_out,
     )
@@ -2526,7 +2552,9 @@ def trtllm_fp8_per_tensor_scale_moe(
         routing_logits: [seq_len, num_experts] tensor of routing logits
         routing_bias: [num_experts] tensor of routing bias
         hidden_states: [seq_len, hidden_size] tensor of input hidden states
-        gemm1_weights: [num_experts, 2*intermediate_size, hidden_size] tensor of first layer weights
+        gemm1_weights: [num_experts, M, hidden_size] tensor of first layer weights
+            M is 2*intermediate_size for gated activations and
+            intermediate_size for non-gated activations.
         output1_scales_scalar: [local_num_experts] tensor of first layer output scales
         output1_scales_gate_scalar: [local_num_experts] tensor of first layer gate scales
         gemm2_weights: [num_experts, hidden_size, intermediate_size] tensor of second layer weights
@@ -2548,7 +2576,7 @@ def trtllm_fp8_per_tensor_scale_moe(
             - 0: Gelu
             - 3: Swiglu
             - 4: Geglu
-            - 6: Relu2
+            - 6: Relu2 (non-gated)
             - 7: Identity
 
     Returns:
