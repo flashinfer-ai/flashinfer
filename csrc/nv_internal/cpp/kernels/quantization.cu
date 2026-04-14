@@ -102,7 +102,7 @@ void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, 
 
   // Grid, Block size.
   // Each thread converts 8 values.
-  dim3 block(std::min(int(padded_n / CVT_ELTS_PER_THREAD), 512));
+  dim3 block(std::min(int(padded_n / CVT_FP16_TO_MXFP8_ELTS_PER_THREAD), 512));
   // Get number of blocks per SM (assume we can fully utilize the SM).
   int const numBlocksPerSM = std::max(1u, 2048u / block.x);
   int effectiveRows = computeEffectiveRows(m, layout);
@@ -302,7 +302,7 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
     // output
     uint8_t* weightOutput, uint8_t* scaleOutput, float* perTokenScaleOutput,
     QuantizationSFLayout layout = QuantizationSFLayout::LINEAR) {
-  static constexpr int ELTS_PER_THREAD = 8;
+  static constexpr int ELTS_PER_THREAD = CVT_FP16_TO_FP4_ELTS_PER_THREAD;
   static constexpr int SF_VEC_SIZE = 16;
   static constexpr int NUM_THREADS_PER_SF = SF_VEC_SIZE / ELTS_PER_THREAD;  // 2
   int rowIdx = blockIdx.x;
@@ -323,7 +323,7 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
   uint32_t num_vecs_per_row = (n + ELTS_PER_THREAD - 1) / ELTS_PER_THREAD;
   for (uint32_t vecIdx = threadIdx.x; vecIdx < num_vecs_per_row; vecIdx += blockDim.x) {
     int64_t vecOffset = rowIdx * num_vecs_per_row + vecIdx;
-    vec = reinterpret_cast<VecType const*>(input)[vecOffset];
+    loadPackedVec(vec, reinterpret_cast<VecType const*>(input) + vecOffset);
 #pragma unroll
     for (int i = 0; i < ELTS_PER_THREAD / 2; ++i) {
       auto element = cuda_abs(vec.elts[i]);
@@ -331,9 +331,11 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
     }
 
     if constexpr (CACHE_LOCAL_AMAX) {
-      // use warp shuffle to get the amax of 16 elements and store it to SMEM
-      localAmax =
-          fmaxf(__shfl_xor_sync(uint32_t(-1), localAmax, NUM_THREADS_PER_SF / 2), localAmax);
+      if constexpr (NUM_THREADS_PER_SF > 1) {
+        // use warp shuffle to get the amax of 16 elements and store it to SMEM
+        localAmax =
+            fmaxf(__shfl_xor_sync(__activemask(), localAmax, NUM_THREADS_PER_SF / 2), localAmax);
+      }
       localAmaxSmem[vecIdx] = localAmax;
     }
   }
@@ -361,7 +363,7 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
   // quantize to fp4 with per-token scale
   for (uint32_t vecIdx = threadIdx.x; vecIdx < num_vecs_per_row; vecIdx += blockDim.x) {
     int64_t vecOffset = rowIdx * num_vecs_per_row + vecIdx;
-    vec = reinterpret_cast<VecType const*>(input)[vecOffset];
+    loadPackedVec(vec, reinterpret_cast<VecType const*>(input) + vecOffset);
 
     if constexpr (CACHE_LOCAL_AMAX) {
       localAmax = localAmaxSmem[vecIdx];
@@ -371,12 +373,11 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
       fp4Vals = cvt_warp_fp16_to_fp4<T, SF_VEC_SIZE, ELTS_PER_THREAD, false>(
           vec, reciprocal_approximate_ftz(perTokenScale), &fp8Scale);
     }
-    reinterpret_cast<uint32_t*>(weightOutput)[vecOffset] = fp4Vals;
+    reinterpret_cast<PackedFp4Type*>(weightOutput)[vecOffset] = fp4Vals;
 
-    static constexpr int THREADS_PER_SCALE = SF_VEC_SIZE / ELTS_PER_THREAD;  // 2
-    if (threadIdx.x % THREADS_PER_SCALE == 0) {
+    if (threadIdx.x % NUM_THREADS_PER_SF == 0) {
       uint32_t num_sf_vecs_per_row = (n + SF_VEC_SIZE - 1) / SF_VEC_SIZE;
-      auto sfVecIdx = vecIdx / THREADS_PER_SCALE;
+      auto sfVecIdx = vecIdx / NUM_THREADS_PER_SF;
       int64_t sfOffset;
       if constexpr (SF_LAYOUT == QuantizationSFLayout::LINEAR) {
         sfOffset = rowIdx * num_sf_vecs_per_row + sfVecIdx;
@@ -397,29 +398,33 @@ void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, fl
                                       QuantizationSFLayout sfLayout, cudaStream_t stream) {
   // Kernel packs 16 values per thread via PackedVec load/store.
   TLLM_CHECK_WITH_INFO(n % 16 == 0, "n must be a multiple of 16 for NVFP4 quantization");
+  // TODO(siyuan): cache local amax in registers.
+  //               currently caching the amax doesn't bring perf improvement.
+  constexpr bool CACHE_LOCAL_AMAX = false;
 
   constexpr uint32_t BLOCK_SIZE = 256;
-  uint32_t smem_size = n / 8 * sizeof(float);  // for caching the local amax
+  uint32_t smem_size = CACHE_LOCAL_AMAX ? n / CVT_FP16_TO_FP4_ELTS_PER_THREAD * sizeof(float)
+                                        : 0;  // for caching the local amax
   dim3 block(BLOCK_SIZE);
   dim3 grid(m);
   switch (sfLayout) {
     case QuantizationSFLayout::LINEAR:
-      nvfp4QuantAndPerTokenScaleKernel<T, BLOCK_SIZE, QuantizationSFLayout::LINEAR, true>
-          <<<grid, block, smem_size, stream>>>(m, n, input, globalScaleInv,
-                                               expandedIdxToPermutedIdx, weightOutput, scaleOutput,
-                                               perTokenScaleOutput);
+      nvfp4QuantAndPerTokenScaleKernel<T, BLOCK_SIZE, QuantizationSFLayout::LINEAR,
+                                       CACHE_LOCAL_AMAX><<<grid, block, smem_size, stream>>>(
+          m, n, input, globalScaleInv, expandedIdxToPermutedIdx, weightOutput, scaleOutput,
+          perTokenScaleOutput);
       break;
     case QuantizationSFLayout::SWIZZLED_128x4:
-      nvfp4QuantAndPerTokenScaleKernel<T, BLOCK_SIZE, QuantizationSFLayout::SWIZZLED_128x4, true>
-          <<<grid, block, smem_size, stream>>>(m, n, input, globalScaleInv,
-                                               expandedIdxToPermutedIdx, weightOutput, scaleOutput,
-                                               perTokenScaleOutput);
+      nvfp4QuantAndPerTokenScaleKernel<T, BLOCK_SIZE, QuantizationSFLayout::SWIZZLED_128x4,
+                                       CACHE_LOCAL_AMAX><<<grid, block, smem_size, stream>>>(
+          m, n, input, globalScaleInv, expandedIdxToPermutedIdx, weightOutput, scaleOutput,
+          perTokenScaleOutput);
       break;
     case QuantizationSFLayout::SWIZZLED_8x4:
-      nvfp4QuantAndPerTokenScaleKernel<T, BLOCK_SIZE, QuantizationSFLayout::SWIZZLED_8x4, true>
-          <<<grid, block, smem_size, stream>>>(m, n, input, globalScaleInv,
-                                               expandedIdxToPermutedIdx, weightOutput, scaleOutput,
-                                               perTokenScaleOutput);
+      nvfp4QuantAndPerTokenScaleKernel<T, BLOCK_SIZE, QuantizationSFLayout::SWIZZLED_8x4,
+                                       CACHE_LOCAL_AMAX><<<grid, block, smem_size, stream>>>(
+          m, n, input, globalScaleInv, expandedIdxToPermutedIdx, weightOutput, scaleOutput,
+          perTokenScaleOutput);
       break;
     default:
       TLLM_CHECK_WITH_INFO(false,
@@ -642,7 +647,7 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
     // Original non-TMA path for small m or SF_VEC_SIZE != 16
     // Grid, Block size.
     // Each thread converts 8 values.
-    dim3 block(std::min(int(n / CVT_ELTS_PER_THREAD), 512));
+    dim3 block(std::min(int(n / CVT_FP16_TO_FP4_ELTS_PER_THREAD), 512));
     // Get number of blocks per SM (assume we can fully utilize the SM).
     int const numBlocksPerSM = std::max(1u, 2048u / block.x);
     int effectiveRows = computeEffectiveRows(m, layout);
@@ -799,7 +804,7 @@ void invokeSiluAndMulNVFP4Quantization(void* output, void* output_scale, void* i
   // Grid, Block size.
   // Each thread converts 8 values.
   TLLM_CHECK_WITH_INFO(k > 0, "k must be > 0");
-  int const workSizePerRow = max(1, k / CVT_ELTS_PER_THREAD);
+  int const workSizePerRow = max(1, k / CVT_FP16_TO_FP4_ELTS_PER_THREAD);
   int const totalWorkSize = m_topk * workSizePerRow;
   dim3 block(std::min(workSizePerRow, 512));
   // Get number of blocks per SM (assume we can fully utilize the SM).

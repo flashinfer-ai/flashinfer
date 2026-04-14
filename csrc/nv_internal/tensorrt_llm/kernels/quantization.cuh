@@ -33,6 +33,46 @@ using Barrier = cutlass::arch::ClusterTransactionBarrier;
 namespace tensorrt_llm {
 namespace kernels {
 
+// Leverage 256 bit vectorized load
+struct alignas(32) PackedU32x8 {
+  uint32_t d[8];
+};
+template <typename VecT>
+__device__ __forceinline__ void loadPackedVec(VecT& val, VecT const* ptr) {
+  static_assert(sizeof(VecT) == 16 || sizeof(VecT) == 32,
+                "Packed vector loads expect 16-byte or 32-byte vectors.");
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && defined(__CUDACC_VER_MAJOR__) && \
+        defined(__CUDACC_VER_MINOR__) &&                                                  \
+        (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 9) ||                      \
+    (__CUDACC_VER_MAJOR__ >= 13)
+  if constexpr (sizeof(VecT) == 32) {
+    auto& raw = reinterpret_cast<PackedU32x8&>(val);
+    asm volatile("ld.global.cg.v8.u32 {%0,%1,%2,%3,%4,%5,%6,%7}, [%8];\n"
+                 : "=r"(raw.d[0]), "=r"(raw.d[1]), "=r"(raw.d[2]), "=r"(raw.d[3]), "=r"(raw.d[4]),
+                   "=r"(raw.d[5]), "=r"(raw.d[6]), "=r"(raw.d[7])
+                 : "l"(ptr));
+  } else
+#endif
+  {
+    val = *ptr;
+  }
+}
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && defined(__CUDACC_VER_MAJOR__) && \
+        defined(__CUDACC_VER_MINOR__) &&                                                  \
+        (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 9) ||                      \
+    (__CUDACC_VER_MAJOR__ >= 13)
+constexpr int CVT_FP16_TO_FP4_ELTS_PER_THREAD = 16;
+#else
+constexpr int CVT_FP16_TO_FP4_ELTS_PER_THREAD = 8;
+#endif
+inline int runtimeBlocksPerSM(int blockThreads) {
+  int device = -1;
+  cudaGetDevice(&device);
+  int maxThreadsPerSM = 1024;
+  cudaDeviceGetAttribute(&maxThreadsPerSM, cudaDevAttrMaxThreadsPerMultiProcessor, device);
+  int blocks = (blockThreads > 0) ? (maxThreadsPerSM / blockThreads) : 1;
+  return std::max(1, blocks);
+}
 __global__ static void quantizedKernel(char4* dst, float4 const* src, int64_t const sizeDiv4,
                                        float const* scalePtr) {
   for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < sizeDiv4;
@@ -178,9 +218,8 @@ __global__ void perTokenQuantization(QuantT* dst, T const* src, int64_t const nu
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // FP4/MXFP8 Quantization Constants
 
-constexpr int CVT_FP4_ELTS_PER_THREAD = 8;
 constexpr int CVT_FP4_SF_VEC_SIZE = 16;
-constexpr int CVT_ELTS_PER_THREAD = 8;
+constexpr int CVT_FP16_TO_MXFP8_ELTS_PER_THREAD = 8;
 constexpr int CVT_FP4_THREADS_PER_WARP = 32;
 constexpr int CVT_FP8_TO_FP4_ELTS_PER_THREAD = 16;
 
@@ -196,15 +235,18 @@ __launch_bounds__(512, 4) quantize_with_block_size(
 quantize_with_block_size(
 #endif
     int32_t numbatches, int32_t numRows, int32_t numCols, int32_t numPaddedCols, Type const* in,
-    float const* SFScale, uint32_t* out, uint32_t* SFout, QuantizationSFLayout layout) {
+    float const* SFScale, void* out, uint32_t* SFout, QuantizationSFLayout layout) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 
   // The elements per thread.
-  static constexpr int ELTS_PER_THREAD = quantization_type == BlockScaleQuantizationType::FP8_TO_FP4
-                                             ? CVT_FP8_TO_FP4_ELTS_PER_THREAD
-                                             : CVT_ELTS_PER_THREAD;
+  static constexpr int ELTS_PER_THREAD =
+      quantization_type == BlockScaleQuantizationType::FP8_TO_FP4 ? CVT_FP8_TO_FP4_ELTS_PER_THREAD
+      : quantization_type == BlockScaleQuantizationType::FP16_TO_FP4
+          ? CVT_FP16_TO_FP4_ELTS_PER_THREAD
+          : CVT_FP16_TO_MXFP8_ELTS_PER_THREAD;
 
   using PackedVecT = PackedVec<Type, ELTS_PER_THREAD>;
+  using FP4OutT = std::conditional_t<ELTS_PER_THREAD == 16, uint64_t, uint32_t>;
   static constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / ELTS_PER_THREAD;  // 2 or 4
   static_assert(sizeof(PackedVecT) == sizeof(Type) * ELTS_PER_THREAD, "Vec size is not matched.");
 
@@ -297,7 +339,7 @@ quantize_with_block_size(
           if (colIdx >= numColThreads && colIdx < numPaddedColThreads) {
             // Dispatch the quantization kernel.
             if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4) {
-              reinterpret_cast<uint32_t*>(out)[outOffset] = 0u;
+              reinterpret_cast<FP4OutT*>(out)[outOffset] = FP4OutT{0};
             } else if constexpr (quantization_type == BlockScaleQuantizationType::FP8_TO_FP4 ||
                                  quantization_type == BlockScaleQuantizationType::FP16_TO_MXFP8) {
               reinterpret_cast<uint64_t*>(out)[outOffset] = 0ull;
@@ -312,11 +354,12 @@ quantize_with_block_size(
             }
           } else {
             // Load the input vector.
-            PackedVecT in_vec = reinterpret_cast<PackedVecT const*>(in)[inOffset];
+            PackedVecT in_vec;
+            loadPackedVec(in_vec, reinterpret_cast<PackedVecT const*>(in) + inOffset);
 
             // Dispatch the quantization kernel.
             if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4) {
-              reinterpret_cast<uint32_t*>(out)[outOffset] =
+              reinterpret_cast<FP4OutT*>(out)[outOffset] =
                   cvt_warp_fp16_to_fp4<Type, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF>(
                       in_vec, SFScaleVal, sf_out);
             } else if constexpr (quantization_type == BlockScaleQuantizationType::FP8_TO_FP4) {
@@ -554,9 +597,10 @@ cvt_fp16_to_fp4_expert(
     int32_t numRows, int32_t numCols, Type const* in, float const* SFScale, uint32_t* out,
     uint32_t* SFout, int32_t* mask, bool use_silu_and_mul, int n_experts) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-  using PackedVecT = PackedVec<Type, CVT_FP4_ELTS_PER_THREAD>;
-  static constexpr int CVT_FP4_NUM_THREADS_PER_SF = (CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD);
-  static_assert(sizeof(PackedVecT) == sizeof(Type) * CVT_FP4_ELTS_PER_THREAD,
+  using PackedVecT = PackedVec<Type, CVT_FP16_TO_FP4_ELTS_PER_THREAD>;
+  static constexpr int CVT_FP4_NUM_THREADS_PER_SF =
+      (CVT_FP4_SF_VEC_SIZE / CVT_FP16_TO_FP4_ELTS_PER_THREAD);
+  static_assert(sizeof(PackedVecT) == sizeof(Type) * CVT_FP16_TO_FP4_ELTS_PER_THREAD,
                 "Vec size is not matched.");
 
   // Input tensor row/col loops.
@@ -585,7 +629,7 @@ cvt_fp16_to_fp4_expert(
   int m = numRows / n_experts;
   int padded_m = (m + (128 - 1)) / 128 * 128;
 
-  int colsPerRow = numCols / CVT_FP4_ELTS_PER_THREAD;
+  int colsPerRow = numCols / CVT_FP16_TO_FP4_ELTS_PER_THREAD;
   // TODO(kaixih@nvidia): For now, we assume mask is used together with
   // silu_and_mal. Maybe we want a more general behavior of mask later. In the
   // silu case, the input last dim doubles.
@@ -608,10 +652,12 @@ cvt_fp16_to_fp4_expert(
     }
 
     int64_t inOffset = rowIdx * actualColsPerRow + colIdx;
-    PackedVecT in_vec = reinterpret_cast<PackedVecT const*>(in)[inOffset];
+    PackedVecT in_vec;
+    loadPackedVec(in_vec, reinterpret_cast<PackedVecT const*>(in) + inOffset);
     if (use_silu_and_mul) {
-      PackedVecT in_vec_mul = reinterpret_cast<PackedVecT const*>(in)[inOffset + colsPerRow];
-      silu_and_mul<Type, CVT_FP4_ELTS_PER_THREAD>(in_vec, in_vec_mul);
+      PackedVecT in_vec_mul;
+      loadPackedVec(in_vec_mul, reinterpret_cast<PackedVecT const*>(in) + inOffset + colsPerRow);
+      silu_and_mul<Type, CVT_FP16_TO_FP4_ELTS_PER_THREAD>(in_vec, in_vec_mul);
     }
 
     // Get the output tensor offset.
@@ -634,8 +680,9 @@ cvt_fp16_to_fp4_expert(
                                                      CVT_FP4_NUM_THREADS_PER_SF>(
         rowIdx_in_expert, colIdx, numCols, SFout_in_expert);
 
-    out_pos = cvt_warp_fp16_to_fp4<Type, CVT_FP4_SF_VEC_SIZE, CVT_FP4_ELTS_PER_THREAD, UE8M0_SF>(
-        in_vec, SFScaleVal, sf_out);
+    out_pos =
+        cvt_warp_fp16_to_fp4<Type, CVT_FP4_SF_VEC_SIZE, CVT_FP16_TO_FP4_ELTS_PER_THREAD, UE8M0_SF>(
+            in_vec, SFScaleVal, sf_out);
   }
 #endif
 }

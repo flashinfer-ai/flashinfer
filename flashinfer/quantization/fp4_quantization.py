@@ -398,6 +398,73 @@ def get_fp4_quantization_module(backend: str = "100"):
         )
 
     @register_custom_op(
+        "flashinfer::nvfp4_quant_and_per_token_scale_sm100",
+        mutates_args=(""),
+    )
+    def nvfp4_quant_and_per_token_scale_sm100(
+        input: torch.Tensor,
+        scale_inv: float,
+        expanded_idx_to_permuted_idx: Optional[torch.Tensor] = None,
+        sf_layout: int = SfLayout.layout_linear.value,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        m, k = input.shape
+        output = input.new_empty((m, k // 2), dtype=torch.uint8)
+        out_scale_cols = (
+            round_up(k // 16, 4)
+            if sf_layout != SfLayout.layout_linear.value
+            else (k // 16)
+        )
+        out_scale_rows = (
+            round_up(
+                m,
+                128 if sf_layout == SfLayout.layout_128x4.value else 8,
+            )
+            if sf_layout != SfLayout.layout_linear.value
+            else m
+        )
+        output_scale = input.new_empty(
+            (out_scale_rows, out_scale_cols), dtype=torch.uint8
+        )
+        output_per_token_scale = input.new_empty((m,), dtype=torch.float32)
+        module.nvfp4_quant_and_per_token_scale(
+            input,
+            scale_inv,
+            output,
+            output_scale,
+            output_per_token_scale,
+            expanded_idx_to_permuted_idx,
+            sf_layout,
+        )
+        return output, output_scale, output_per_token_scale
+
+    @register_fake_op("flashinfer::nvfp4_quant_and_per_token_scale_sm100")
+    def _fake_nvfp4_quant_and_per_token_scale_sm100(
+        input: torch.Tensor,
+        scale_inv: float,
+        expanded_idx_to_permuted_idx: Optional[torch.Tensor] = None,
+        sf_layout: int = SfLayout.layout_linear.value,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        m, k = input.shape
+        out_scale_cols = (
+            round_up(k // 16, 4)
+            if sf_layout != SfLayout.layout_linear.value
+            else (k // 16)
+        )
+        out_scale_rows = (
+            round_up(
+                m,
+                128 if sf_layout == SfLayout.layout_128x4.value else 8,
+            )
+            if sf_layout != SfLayout.layout_linear.value
+            else m
+        )
+        return (
+            input.new_empty((m, k // 2), dtype=torch.uint8),
+            input.new_empty((out_scale_rows, out_scale_cols), dtype=torch.uint8),
+            input.new_empty((m,), dtype=torch.float32),
+        )
+
+    @register_custom_op(
         "flashinfer::silu_and_mul_scaled_nvfp4_experts_quantize_sm100",
         mutates_args=("",),
     )
@@ -645,6 +712,7 @@ def get_fp4_quantization_module(backend: str = "100"):
         e2m1_and_ufp8sf_scale_to_float_sm100=e2m1_and_ufp8sf_scale_to_float_sm100,
         mxfp4_dequantize_host=mxfp4_dequantize_host,
         fp4_batched_quantize_sm100=fp4_batched_quantize_sm100,
+        nvfp4_quant_and_per_token_scale_sm100=nvfp4_quant_and_per_token_scale_sm100,
         silu_and_mul_scaled_nvfp4_experts_quantize_sm100=silu_and_mul_scaled_nvfp4_experts_quantize_sm100,
         scaled_fp4_grouped_quant_sm100=scaled_fp4_grouped_quant_sm100,
     )
@@ -925,6 +993,39 @@ def shuffle_matrix_sf_a(
 
     # 128x4
     return block_scale_interleave(w_shuffled)
+
+
+@flashinfer_api
+def nvfp4_quant_and_per_token_scale(
+    input: torch.Tensor,
+    scale_inv: float = 1.0 / (448.0 * 6.0),
+    *,
+    sf_layout: SfLayout = SfLayout.layout_linear,
+    expanded_idx_to_permuted_idx: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantize a 2D activation matrix to NVFP4 and emit per-token scales.
+
+    Args:
+        input: Input tensor of shape [M, K] with dtype fp16 or bf16.
+        scale_inv: Inverse global scale multiplier. For standard NVFP4 this is
+            `1 / (448 * 6)`.
+        sf_layout: Scale-factor layout for the FP8 block scales.
+        expanded_idx_to_permuted_idx: Optional row remapping buffer.
+
+    Returns:
+        Tuple containing the packed NVFP4 tensor, the block-scale tensor, and
+        per-token scales.
+    """
+    major, minor = get_compute_capability(input.device)
+    device_arch = f"{major * 10 + minor}"
+    return get_fp4_quantization_module(
+        device_arch
+    ).nvfp4_quant_and_per_token_scale_sm100(
+        input,
+        scale_inv,
+        expanded_idx_to_permuted_idx,
+        sf_layout.value,
+    )
 
 
 @flashinfer_api
