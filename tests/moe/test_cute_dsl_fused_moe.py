@@ -725,7 +725,7 @@ class TestCuteDslMoEWrapper:
 
 
 @cute_dsl_available
-@sm100_only
+@sm100_required
 class TestApiConsistency:
     """Tests verifying consistency between functional and wrapper APIs."""
 
