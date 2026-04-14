@@ -1,4 +1,4 @@
-"""Blackwell GeForce (SM120) MoE kernels for CuTe DSL (ported from b12x)."""
+"""Blackwell SM12x (SM120/SM121) MoE kernels for CuTe DSL (ported from b12x)."""
 
 from .moe_static_kernel import MoEStaticKernel
 from .moe_dynamic_kernel import MoEDynamicKernel

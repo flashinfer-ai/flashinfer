@@ -194,7 +194,7 @@ def _moe_core_impl(
                 "SM120 CuTe DSL fused MoE requires CUDA 13 or later. "
                 f"Current CUDA version: {get_cuda_version()}."
             )
-        from .blackwell_geforce.moe_dispatch import launch_sm120_moe
+        from .blackwell_sm12x.moe_dispatch import launch_sm120_moe
 
         num_experts_local = (
             num_local_experts if num_local_experts is not None else num_experts
@@ -484,7 +484,7 @@ class CuteDslMoEWrapper:
 
         if self._is_sm120:
             # SM120: pre-allocate workspace for the fused kernel.
-            from .blackwell_geforce.moe_dispatch import (
+            from .blackwell_sm12x.moe_dispatch import (
                 allocate_sm120_static_workspace,
                 allocate_sm120_dynamic_workspace,
                 select_sm120_moe_backend,
@@ -693,7 +693,7 @@ class CuteDslMoEWrapper:
                     "SM120 MoE does not support expert parallelism "
                     "(local_expert_offset != 0)."
                 )
-            from .blackwell_geforce.moe_dispatch import (
+            from .blackwell_sm12x.moe_dispatch import (
                 launch_sm120_moe,
                 _get_weight_views as _get_sm120_weight_views,
             )
