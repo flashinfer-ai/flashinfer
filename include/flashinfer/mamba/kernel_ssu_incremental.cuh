@@ -691,22 +691,7 @@ __device__ __forceinline__ void load_data(SmemT& smem, SsuIncrementalParams cons
   asm volatile("cp.async.commit_group;\n" ::: "memory");
   asm volatile("cp.async.wait_group 0;\n" ::: "memory");
 
-  // Zero x padding rows (prevents 0 * NaN = NaN in matmul 4 mma).
-  // x is stored with swizzled layout when USE_TENSOR_MMA.
-  constexpr bool USE_TENSOR_MMA = (sizeof(state_t) == 2);
-  if constexpr (USE_TENSOR_MMA) {
-    constexpr int NTOKENS_PAD = SmemT::NTOKENS_PAD;
-    if constexpr (NTOKENS < NTOKENS_PAD) {
-      auto layout_x = make_swizzled_layout_rc<NTOKENS_PAD, DIM>();
-      input_t* x_base = &smem.x[0][0];
-      constexpr int pad_elems = (NTOKENS_PAD - NTOKENS) * DIM;
-      for (int i = flat_tid; i < pad_elems; i += num_threads) {
-        int const t = NTOKENS + i / DIM;
-        int const d = i % DIM;
-        x_base[layout_x(t, d)] = input_t(0);
-      }
-    }
-  }
+  // x padding rows are already zero-filled by load_x_cute's ZFILL predicate.
 }
 
 // (compute_cumAdt moved above load_data so it can be called from there)
