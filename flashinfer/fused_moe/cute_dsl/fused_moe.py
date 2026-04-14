@@ -213,8 +213,7 @@ def _moe_core_impl(
                 device=x.device,
             )
 
-        # SM120 kernel takes bf16 input (it fuses route+pack+quantize internally).
-        # The caller passes x_bf16 through _moe_core_impl's x parameter.
+        # On SM120 the caller passes bf16 activations as x directly.
         return launch_sm120_moe(
             a=x,  # bf16 [num_tokens, hidden_size]
             topk_ids=token_selected_experts,
@@ -636,7 +635,6 @@ class CuteDslMoEWrapper:
         w2_weight_sf: torch.Tensor,
         w2_alpha: torch.Tensor,
         tactic: Optional[Tuple] = None,
-        x_bf16: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run MoE computation.
 
@@ -644,8 +642,12 @@ class CuteDslMoEWrapper:
         Supports auto-tuning via `tactic` parameter or `autotune()` context.
 
         Args:
-            x: Input tensor, NVFP4 quantized [num_tokens, hidden_size // 2].
-            x_sf: Scale factors for x.
+            x: Input tensor. On SM100/SM103: NVFP4 quantized
+                [num_tokens, hidden_size // 2]. On SM120/SM121: bf16
+                activations [num_tokens, hidden_size] (kernel fuses
+                quantization internally).
+            x_sf: Scale factors for x. Required on SM100/SM103, ignored
+                on SM120/SM121.
             token_selected_experts: Expert assignments [num_tokens, top_k].
             token_final_scales: Routing weights [num_tokens, top_k].
             w1_weight: GEMM1 weights (gate + up fused).
@@ -656,9 +658,6 @@ class CuteDslMoEWrapper:
             w2_weight_sf: Scale factors for w2_weight.
             w2_alpha: Per-expert global scale for GEMM2.
             tactic: Tactic tuple or None for auto-selection.
-            x_bf16: Original bf16 activations [num_tokens, hidden_size].
-                Required on SM120 where the kernel fuses quantization.
-                Ignored on SM100/SM103.
 
         Returns:
             Output tensor [num_tokens, hidden_size].
@@ -681,13 +680,10 @@ class CuteDslMoEWrapper:
                 device=x.device,
             )
 
-        # SM120: dispatch directly to fused kernel with pre-allocated workspace
+        # SM120: dispatch directly to fused kernel with pre-allocated workspace.
+        # On SM120 the caller passes bf16 activations as x (the kernel fuses
+        # quantization internally); x_sf is ignored.
         if self._is_sm120:
-            if x_bf16 is None:
-                raise ValueError(
-                    "SM120 CuteDslMoEWrapper.run() requires x_bf16 parameter "
-                    "(original bf16 activations)."
-                )
             if self.local_expert_offset != 0:
                 raise ValueError(
                     "SM120 MoE does not support expert parallelism "
@@ -724,7 +720,7 @@ class CuteDslMoEWrapper:
                 self._sm120_weight_key = weight_key
 
             return launch_sm120_moe(
-                a=x_bf16,
+                a=x,
                 topk_ids=token_selected_experts,
                 topk_weights=token_final_scales,
                 w1_weight=w1_weight,
@@ -864,7 +860,6 @@ def cute_dsl_fused_moe_nvfp4(
     moe_output: Optional[torch.Tensor] = None,
     aux_stream: Optional[torch.cuda.Stream] = None,
     enable_pdl: bool = True,
-    x_bf16: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Run fused MoE computation using CuteDSL NVFP4 kernels.
 
@@ -879,8 +874,12 @@ def cute_dsl_fused_moe_nvfp4(
         ...     output = cute_dsl_fused_moe_nvfp4(...)
 
     Args:
-        x: Input tensor, NVFP4 quantized [num_tokens, hidden_size // 2].
-        x_sf: Scale factors for x.
+        x: Input tensor. On SM100/SM103: NVFP4 quantized
+            [num_tokens, hidden_size // 2]. On SM120/SM121: bf16
+            activations [num_tokens, hidden_size] (kernel fuses
+            quantization internally).
+        x_sf: Scale factors for x. Required on SM100/SM103, ignored
+            on SM120/SM121.
         token_selected_experts: Expert assignments [num_tokens, top_k].
         token_final_scales: Routing weights [num_tokens, top_k].
         w1_weight: GEMM1 weights (gate + up fused).
@@ -898,9 +897,6 @@ def cute_dsl_fused_moe_nvfp4(
         use_fused_finalize: Use fused finalize. Default: True.
         moe_output: Pre-allocated output buffer.
         aux_stream: Auxiliary CUDA stream.
-        x_bf16: Original bf16 activations [num_tokens, hidden_size]. Required
-            on SM120/SM121 where the kernel fuses quantization internally.
-            Ignored on SM100/SM103.
 
     Returns:
         Output tensor [num_tokens, hidden_size].
@@ -918,22 +914,17 @@ def cute_dsl_fused_moe_nvfp4(
             device=x.device,
         )
 
-    # SM120/SM121: dispatch to fused static kernel (bypasses autotuner)
+    # SM120/SM121: dispatch to fused kernel (bypasses autotuner).
+    # On SM120 the caller passes bf16 activations as x; x_sf is ignored.
     major, _ = torch.cuda.get_device_capability(x.device)
     if major == 12:
-        if x_bf16 is None:
-            raise ValueError(
-                "SM120/SM121 cute_dsl_fused_moe_nvfp4 requires x_bf16 parameter "
-                "(original bf16 activations). The SM120 kernel fuses quantization "
-                "internally and cannot accept pre-quantized FP4 input."
-            )
         if local_expert_offset != 0:
             raise ValueError(
                 "SM120 MoE does not support expert parallelism "
                 "(local_expert_offset != 0)."
             )
         return _moe_core_impl(
-            x=x_bf16,
+            x=x,
             x_sf=x_sf,
             token_selected_experts=token_selected_experts,
             token_final_scales=token_final_scales,

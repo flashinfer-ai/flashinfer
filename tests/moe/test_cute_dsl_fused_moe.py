@@ -75,6 +75,15 @@ sm100_only = pytest.mark.skipif(
 )
 
 
+def moe_input(tensors: dict) -> torch.Tensor:
+    """Return the correct x tensor for the current architecture.
+
+    SM100/103 expects pre-quantized FP4; SM120/121 expects bf16
+    (the kernel fuses quantization internally).
+    """
+    return tensors["x_bf16"] if is_sm120_family() else tensors["x"]
+
+
 def silu(x: torch.Tensor) -> torch.Tensor:
     """SiLU activation: x * sigmoid(x)"""
     return x * torch.sigmoid(x)
@@ -387,7 +396,7 @@ class TestCuteDslFusedMoeFunctional:
         )
 
         result = cute_dsl_fused_moe_nvfp4(
-            x=tensors["x"],
+            x=moe_input(tensors),
             x_sf=tensors["x_sf"],
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
@@ -401,7 +410,6 @@ class TestCuteDslFusedMoeFunctional:
             num_experts=num_experts,
             top_k=top_k,
             num_local_experts=num_local_experts,
-            x_bf16=tensors["x_bf16"],
         )
 
         assert result.shape == (num_tokens, hidden_size)
@@ -447,7 +455,7 @@ class TestCuteDslFusedMoeFunctional:
 
         with autotune(True):
             result = cute_dsl_fused_moe_nvfp4(
-                x=tensors["x"],
+                x=moe_input(tensors),
                 x_sf=tensors["x_sf"],
                 token_selected_experts=tensors["token_selected_experts"],
                 token_final_scales=tensors["token_final_scales"],
@@ -460,7 +468,6 @@ class TestCuteDslFusedMoeFunctional:
                 w2_alpha=tensors["w2_alpha"],
                 num_experts=num_experts,
                 top_k=top_k,
-                x_bf16=tensors["x_bf16"],
             )
 
         assert result.shape == (num_tokens, hidden_size)
@@ -505,7 +512,7 @@ class TestCuteDslMoEWrapper:
         )
 
         result = moe.run(
-            x=tensors["x"],
+            x=moe_input(tensors),
             x_sf=tensors["x_sf"],
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
@@ -516,7 +523,6 @@ class TestCuteDslMoEWrapper:
             w2_weight=tensors["w2_weight"],
             w2_weight_sf=tensors["w2_weight_sf"],
             w2_alpha=tensors["w2_alpha"],
-            x_bf16=tensors["x_bf16"],
         )
 
         assert result.shape == (num_tokens, hidden_size)
@@ -573,7 +579,7 @@ class TestCuteDslMoEWrapper:
         # Warmup
         for _ in range(3):
             moe.run(
-                x=tensors["x"],
+                x=moe_input(tensors),
                 x_sf=tensors["x_sf"],
                 token_selected_experts=tensors["token_selected_experts"],
                 token_final_scales=tensors["token_final_scales"],
@@ -584,7 +590,6 @@ class TestCuteDslMoEWrapper:
                 w2_weight=tensors["w2_weight"],
                 w2_weight_sf=tensors["w2_weight_sf"],
                 w2_alpha=tensors["w2_alpha"],
-                x_bf16=tensors["x_bf16"],
             )
         torch.cuda.synchronize()
 
@@ -592,7 +597,7 @@ class TestCuteDslMoEWrapper:
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
             output = moe.run(
-                x=tensors["x"],
+                x=moe_input(tensors),
                 x_sf=tensors["x_sf"],
                 token_selected_experts=tensors["token_selected_experts"],
                 token_final_scales=tensors["token_final_scales"],
@@ -603,7 +608,6 @@ class TestCuteDslMoEWrapper:
                 w2_weight=tensors["w2_weight"],
                 w2_weight_sf=tensors["w2_weight_sf"],
                 w2_alpha=tensors["w2_alpha"],
-                x_bf16=tensors["x_bf16"],
             )
         torch.cuda.synchronize()
 
@@ -679,7 +683,7 @@ class TestCuteDslMoEWrapper:
 
         with autotune(True):
             result = moe.run(
-                x=tensors["x"],
+                x=moe_input(tensors),
                 x_sf=tensors["x_sf"],
                 token_selected_experts=tensors["token_selected_experts"],
                 token_final_scales=tensors["token_final_scales"],
@@ -690,7 +694,6 @@ class TestCuteDslMoEWrapper:
                 w2_weight=tensors["w2_weight"],
                 w2_weight_sf=tensors["w2_weight_sf"],
                 w2_alpha=tensors["w2_alpha"],
-                x_bf16=tensors["x_bf16"],
             )
 
         assert result.shape == (num_tokens, hidden_size)
@@ -744,7 +747,7 @@ class TestApiConsistency:
 
         # Functional API
         result_functional = cute_dsl_fused_moe_nvfp4(
-            x=tensors["x"],
+            x=moe_input(tensors),
             x_sf=tensors["x_sf"],
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
@@ -757,7 +760,6 @@ class TestApiConsistency:
             w2_alpha=tensors["w2_alpha"],
             num_experts=num_experts,
             top_k=top_k,
-            x_bf16=tensors["x_bf16"],
         )
 
         # Wrapper API
@@ -770,7 +772,7 @@ class TestApiConsistency:
         )
 
         result_wrapper = moe.run(
-            x=tensors["x"],
+            x=moe_input(tensors),
             x_sf=tensors["x_sf"],
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
@@ -848,7 +850,7 @@ class TestExpertParallelism:
         )
 
         result = moe.run(
-            x=tensors["x"],
+            x=moe_input(tensors),
             x_sf=tensors["x_sf"],
             token_selected_experts=token_selected_experts,
             token_final_scales=tensors["token_final_scales"],
@@ -911,7 +913,7 @@ class TestExpertParallelism:
         )
 
         result = cute_dsl_fused_moe_nvfp4(
-            x=tensors["x"],
+            x=moe_input(tensors),
             x_sf=tensors["x_sf"],
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
@@ -926,7 +928,6 @@ class TestExpertParallelism:
             top_k=top_k,
             num_local_experts=num_local_experts,
             local_expert_offset=local_expert_offset,
-            x_bf16=tensors["x_bf16"],
         )
 
         assert result.shape == (num_tokens, hidden_size)
@@ -1046,7 +1047,7 @@ class TestAllValidTactics:
         for tactic in valid_tactics:
             tile_size = tactic[0]
             result = moe.run(
-                x=tensors["x"],
+                x=moe_input(tensors),
                 x_sf=tensors["x_sf"],
                 token_selected_experts=tensors["token_selected_experts"],
                 token_final_scales=tensors["token_final_scales"],

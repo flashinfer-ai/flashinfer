@@ -1359,6 +1359,10 @@ def testCuteDslFp4BlockScaleMoe(args):
 
     use_functional = getattr(args, "use_functional_api", False)
 
+    # SM120 passes bf16 as x (kernel fuses quantization); SM100 passes FP4.
+    sm_major_bm = torch.cuda.get_device_capability(device)[0]
+    x_input = tensors["x_bf16"] if sm_major_bm == 12 else tensors["x"]
+
     if use_functional:
         from flashinfer import cute_dsl_fused_moe_nvfp4
         from functools import partial
@@ -1384,7 +1388,7 @@ def testCuteDslFp4BlockScaleMoe(args):
 
         # Warmup call to populate workspace cache before timed region
         runner(
-            x=tensors["x"],
+            x=x_input,
             x_sf=tensors["x_sf"],
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
@@ -1395,7 +1399,6 @@ def testCuteDslFp4BlockScaleMoe(args):
             w2_weight=tensors["w2_weight"],
             w2_weight_sf=tensors["w2_weight_sf"],
             w2_alpha=tensors["w2_alpha"],
-            x_bf16=tensors["x_bf16"],
         )
     else:
         moe = CuteDslMoEWrapper(
@@ -1422,7 +1425,6 @@ def testCuteDslFp4BlockScaleMoe(args):
         w2_weight,
         w2_weight_sf,
         w2_alpha,
-        x_bf16=None,
     ):
         return runner(
             x=x,
@@ -1436,11 +1438,10 @@ def testCuteDslFp4BlockScaleMoe(args):
             w2_weight=w2_weight,
             w2_weight_sf=w2_weight_sf,
             w2_alpha=w2_alpha,
-            x_bf16=x_bf16,
         )
 
     input_args = (
-        tensors["x"],
+        x_input,
         tensors["x_sf"],
         tensors["token_selected_experts"],
         tensors["token_final_scales"],
@@ -1451,7 +1452,6 @@ def testCuteDslFp4BlockScaleMoe(args):
         tensors["w2_weight"],
         tensors["w2_weight_sf"],
         tensors["w2_alpha"],
-        tensors["x_bf16"],
     )
 
     # Snapshot active expert count before any kernel execution, since
