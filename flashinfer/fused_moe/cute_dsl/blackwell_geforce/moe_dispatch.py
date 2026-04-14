@@ -7,7 +7,7 @@ and dynamic (prefill) backends with token-count-based selection.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
@@ -1172,6 +1172,67 @@ def launch_sm120_dynamic_moe(
 
 
 # ==========================================================================
+# Workspace cache (for functional API path)
+# ==========================================================================
+
+_Sm120Workspace = Union[Sm120StaticMoEWorkspace, Sm120DynamicMoEWorkspace]
+
+# Keyed by (state_E, weight_E, k, n, top_k, device, backend).
+# Stores the workspace with the largest max_rows seen for each key.
+# Grows monotonically — never shrinks within a process.
+_WORKSPACE_CACHE: Dict[Tuple, _Sm120Workspace] = {}
+
+
+def _get_cached_workspace(
+    *,
+    backend: str,
+    state_E: int,
+    weight_E: int,
+    routed_rows: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    device: torch.device,
+) -> _Sm120Workspace:
+    """Get or allocate a cached workspace for the given problem shape.
+
+    Reuses the cached workspace if it has enough capacity (max_rows >= routed_rows).
+    Otherwise, re-allocates with the larger capacity and updates the cache.
+    """
+    cache_key = (state_E, weight_E, k, n, num_topk, str(device), backend)
+    cached = _WORKSPACE_CACHE.get(cache_key)
+
+    if cached is not None and cached.max_rows >= max(1, routed_rows):
+        return cached
+
+    # Allocate new workspace (or grow existing)
+    workspace: _Sm120Workspace
+    if backend == "dynamic":
+        workspace = allocate_sm120_dynamic_workspace(
+            state_E=state_E,
+            weight_E=weight_E,
+            routed_rows=routed_rows,
+            k=k,
+            n=n,
+            num_topk=num_topk,
+            device=device,
+        )
+    else:
+        workspace = allocate_sm120_static_workspace(
+            state_E=state_E,
+            weight_E=weight_E,
+            max_rows=max(1, routed_rows),
+            k=k,
+            n=n,
+            num_topk=num_topk,
+            device=device,
+        )
+
+    _WORKSPACE_CACHE[cache_key] = workspace
+    return workspace
+
+
+# ==========================================================================
 # Unified dispatch
 # ==========================================================================
 def launch_sm120_moe(
@@ -1198,7 +1259,9 @@ def launch_sm120_moe(
     """Unified SM120 MoE dispatch — selects static or dynamic by token count.
 
     Optional _workspace and _weight_views can be pre-allocated and reused
-    across calls to avoid per-call allocation overhead.
+    across calls to avoid per-call allocation overhead (wrapper path).
+    When not provided (functional API path), a module-level workspace cache
+    is used to avoid re-allocating on every call.
     """
     num_tokens = topk_ids.size(0)
     k = a.size(1)  # hidden_size
@@ -1223,20 +1286,22 @@ def launch_sm120_moe(
 
     backend = select_sm120_moe_backend(num_tokens=num_tokens, num_topk=top_k)
 
-    if backend == "dynamic":
-        workspace = (
-            _workspace
-            if _workspace is not None
-            else allocate_sm120_dynamic_workspace(
-                state_E=num_local_experts,
-                weight_E=num_experts,
-                routed_rows=routed_rows,
-                k=k,
-                n=n,
-                num_topk=top_k,
-                device=a.device,
-            )
+    # Resolve workspace: caller-provided > cached > fresh allocation.
+    if _workspace is not None:
+        workspace = _workspace
+    else:
+        workspace = _get_cached_workspace(
+            backend=backend,
+            state_E=num_local_experts,
+            weight_E=num_experts,
+            routed_rows=routed_rows,
+            k=k,
+            n=n,
+            num_topk=top_k,
+            device=a.device,
         )
+
+    if backend == "dynamic":
         return launch_sm120_dynamic_moe(
             workspace=workspace,
             weights=weights,
@@ -1255,19 +1320,6 @@ def launch_sm120_moe(
             fast_math=fast_math,
         )
     else:
-        workspace = (
-            _workspace
-            if _workspace is not None
-            else allocate_sm120_static_workspace(
-                state_E=num_local_experts,
-                weight_E=num_experts,
-                max_rows=max(1, routed_rows),
-                k=k,
-                n=n,
-                num_topk=top_k,
-                device=a.device,
-            )
-        )
         return launch_sm120_static_moe(
             workspace=workspace,
             weights=weights,

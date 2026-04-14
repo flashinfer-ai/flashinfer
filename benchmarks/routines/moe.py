@@ -21,7 +21,7 @@ from flashinfer.fused_moe import (
     cutlass_fused_moe,
     fused_topk_deepseek,
 )
-from flashinfer.fused_moe.core import RoutingMethodType
+from flashinfer.tllm_enums import RoutingMethodType
 from flashinfer import fp4_quantize, mxfp8_quantize
 from flashinfer.testing.utils import (
     bench_gpu_time,
@@ -232,6 +232,18 @@ def parse_moe_args(line, parser):
             "mxfp4_mxfp8 (MXFP4 weights + MXFP8 hidden states, block_size=32), "
             "mxfp4_bf16 (MXFP4 weights + BF16 hidden states, block_size=32). "
             "Default: nvfp4"
+        ),
+    )
+
+    # CuTe DSL MoE specific
+    parser.add_argument(
+        "--use_functional_api",
+        action="store_true",
+        default=False,
+        help=(
+            "Use cute_dsl_fused_moe_nvfp4 functional API instead of CuteDslMoEWrapper "
+            "for cute_dsl_fp4_block_scale_moe benchmark. Useful for verifying that the "
+            "workspace cache eliminates per-call allocation overhead."
         ),
     )
 
@@ -1345,45 +1357,113 @@ def testCuteDslFp4BlockScaleMoe(args):
         print(f"[VVERBOSE] w1_weight.shape = {tensors['w1_weight'].shape}")
         print(f"[VVERBOSE] w2_weight.shape = {tensors['w2_weight'].shape}")
 
-    moe = CuteDslMoEWrapper(
-        num_experts=num_experts,
-        top_k=top_k,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        use_cuda_graph=is_cuda_graph_compatible,
-        max_num_tokens=num_tokens,
-        num_local_experts=local_num_experts,
-        local_expert_offset=local_expert_offset,
-    )
+    use_functional = getattr(args, "use_functional_api", False)
 
-    def run_cute_dsl_moe(
-        x,
-        x_sf,
-        token_selected_experts,
-        token_final_scales,
-        w1_weight,
-        w1_weight_sf,
-        w1_alpha,
-        fc2_input_scale,
-        w2_weight,
-        w2_weight_sf,
-        w2_alpha,
-        x_bf16=None,
-    ):
-        return moe.run(
-            x=x,
-            x_sf=x_sf,
-            token_selected_experts=token_selected_experts,
-            token_final_scales=token_final_scales,
-            w1_weight=w1_weight,
-            w1_weight_sf=w1_weight_sf,
-            w1_alpha=w1_alpha,
-            fc2_input_scale=fc2_input_scale,
-            w2_weight=w2_weight,
-            w2_weight_sf=w2_weight_sf,
-            w2_alpha=w2_alpha,
-            x_bf16=x_bf16,
+    if use_functional:
+        from flashinfer import cute_dsl_fused_moe_nvfp4
+
+        if args.verbose >= 1:
+            print(
+                "[INFO] Using functional API (cute_dsl_fused_moe_nvfp4) with workspace cache"
+            )
+
+        # Pre-allocate output buffer to avoid per-call allocation
+        moe_output = torch.empty(
+            num_tokens, hidden_size, dtype=torch.bfloat16, device=device
         )
+
+        # Warmup call to populate workspace cache before timed region
+        cute_dsl_fused_moe_nvfp4(
+            x=tensors["x"],
+            x_sf=tensors["x_sf"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=local_num_experts,
+            x_bf16=tensors["x_bf16"],
+            moe_output=moe_output,
+        )
+
+        def run_cute_dsl_moe(
+            x,
+            x_sf,
+            token_selected_experts,
+            token_final_scales,
+            w1_weight,
+            w1_weight_sf,
+            w1_alpha,
+            fc2_input_scale,
+            w2_weight,
+            w2_weight_sf,
+            w2_alpha,
+            x_bf16=None,
+        ):
+            return cute_dsl_fused_moe_nvfp4(
+                x=x,
+                x_sf=x_sf,
+                token_selected_experts=token_selected_experts,
+                token_final_scales=token_final_scales,
+                w1_weight=w1_weight,
+                w1_weight_sf=w1_weight_sf,
+                w1_alpha=w1_alpha,
+                fc2_input_scale=fc2_input_scale,
+                w2_weight=w2_weight,
+                w2_weight_sf=w2_weight_sf,
+                w2_alpha=w2_alpha,
+                num_experts=num_experts,
+                top_k=top_k,
+                num_local_experts=local_num_experts,
+                x_bf16=x_bf16,
+                moe_output=moe_output,
+            )
+    else:
+        moe = CuteDslMoEWrapper(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            use_cuda_graph=is_cuda_graph_compatible,
+            max_num_tokens=num_tokens,
+            num_local_experts=local_num_experts,
+            local_expert_offset=local_expert_offset,
+        )
+
+        def run_cute_dsl_moe(
+            x,
+            x_sf,
+            token_selected_experts,
+            token_final_scales,
+            w1_weight,
+            w1_weight_sf,
+            w1_alpha,
+            fc2_input_scale,
+            w2_weight,
+            w2_weight_sf,
+            w2_alpha,
+            x_bf16=None,
+        ):
+            return moe.run(
+                x=x,
+                x_sf=x_sf,
+                token_selected_experts=token_selected_experts,
+                token_final_scales=token_final_scales,
+                w1_weight=w1_weight,
+                w1_weight_sf=w1_weight_sf,
+                w1_alpha=w1_alpha,
+                fc2_input_scale=fc2_input_scale,
+                w2_weight=w2_weight,
+                w2_weight_sf=w2_weight_sf,
+                w2_alpha=w2_alpha,
+                x_bf16=x_bf16,
+            )
 
     input_args = (
         tensors["x"],
