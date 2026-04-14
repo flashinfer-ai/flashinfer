@@ -38,7 +38,8 @@ void gdn_prefill_launcher(void* output, void* output_state, void* q, void* k, vo
                           uint8_t* workspace_buffer, int64_t num_seqs, int64_t num_q_heads,
                           int64_t num_k_heads, int64_t num_v_heads, int64_t num_o_heads,
                           int64_t head_size, int64_t packed_seq, float scale, int64_t sm_count,
-                          DLDataType dtype, cudaStream_t stream) {
+                          DLDataType dtype, cudaStream_t stream, void* state_checkpoints,
+                          int64_t* checkpoint_cu_starts, int64_t checkpoint_every_n_tokens) {
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(dtype, DType, [&] {
     int dev_id;
     cudaGetDevice(&dev_id);
@@ -52,7 +53,9 @@ void gdn_prefill_launcher(void* output, void* output_state, void* q, void* k, vo
           static_cast<DType const*>(q), static_cast<DType const*>(k), static_cast<DType const*>(v),
           static_cast<float const*>(input_state), static_cast<float const*>(alpha),
           static_cast<float const*>(beta), cu_seqlens, workspace_buffer, num_seqs, num_q_heads,
-          num_k_heads, num_v_heads, num_o_heads, head_size, packed_seq, scale, sm_count);
+          num_k_heads, num_v_heads, num_o_heads, head_size, packed_seq, scale, sm_count,
+          static_cast<float*>(state_checkpoints), checkpoint_cu_starts,
+          static_cast<int32_t>(checkpoint_every_n_tokens));
       return true;
     } else {
       std::ostringstream err_msg;
@@ -70,7 +73,8 @@ void gdn_prefill_launcher(void* output, void* output_state, void* q, void* k, vo
 void gdn_prefill(TensorView output, TensorView output_state, TensorView q, TensorView k,
                  TensorView v, TensorView cu_seqlens, Optional<TensorView> input_state,
                  Optional<TensorView> alpha, Optional<TensorView> beta, double scale,
-                 TensorView workspace_buffer) {
+                 TensorView workspace_buffer, Optional<TensorView> state_checkpoints,
+                 Optional<TensorView> checkpoint_cu_starts, int64_t checkpoint_every_n_tokens) {
   int64_t num_seqs = cu_seqlens.size(0) - 1;
   int64_t packed_seq = q.size(0);
   int64_t head_size = q.size(2);
@@ -162,6 +166,26 @@ void gdn_prefill(TensorView output, TensorView output_state, TensorView q, Tenso
   int sm_count;
   cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, dev_id);
 
+  void* state_checkpoints_ptr = nullptr;
+  int64_t* checkpoint_cu_starts_ptr = nullptr;
+  if (state_checkpoints.has_value()) {
+    TensorView ckpt_tensor = state_checkpoints.value();
+    TVM_FFI_ICHECK_EQ(ckpt_tensor.dtype(), dl_float32);
+    TVM_FFI_ICHECK_EQ(ckpt_tensor.ndim(), 4);
+    TVM_FFI_ICHECK_EQ(ckpt_tensor.size(1), num_sab_heads);
+    TVM_FFI_ICHECK_EQ(ckpt_tensor.size(2), head_size);
+    TVM_FFI_ICHECK_EQ(ckpt_tensor.size(3), head_size);
+    CHECK_INPUT(ckpt_tensor);
+    state_checkpoints_ptr = ckpt_tensor.data_ptr();
+  }
+  if (checkpoint_cu_starts.has_value()) {
+    TensorView cu_starts_tensor = checkpoint_cu_starts.value();
+    TVM_FFI_ICHECK_EQ(cu_starts_tensor.dtype(), dl_int64);
+    TVM_FFI_ICHECK_EQ(cu_starts_tensor.size(0), num_seqs + 1);
+    CHECK_INPUT(cu_starts_tensor);
+    checkpoint_cu_starts_ptr = static_cast<int64_t*>(cu_starts_tensor.data_ptr());
+  }
+
   auto stream = get_stream(q.device());
 
   gdn_prefill_launcher(output.data_ptr(), output_state.data_ptr(), q.data_ptr(), k.data_ptr(),
@@ -169,7 +193,8 @@ void gdn_prefill(TensorView output, TensorView output_state, TensorView q, Tenso
                        static_cast<int64_t*>(cu_seqlens.data_ptr()),
                        static_cast<uint8_t*>(workspace_buffer.data_ptr()), num_seqs, num_q_heads,
                        num_k_heads, num_v_heads, num_o_heads, head_size, packed_seq,
-                       static_cast<float>(scale), sm_count, q.dtype(), stream);
+                       static_cast<float>(scale), sm_count, q.dtype(), stream,
+                       state_checkpoints_ptr, checkpoint_cu_starts_ptr, checkpoint_every_n_tokens);
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(gdn_prefill, gdn_prefill);

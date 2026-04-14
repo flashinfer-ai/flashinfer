@@ -58,16 +58,93 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
                  void* expertWeights, int32_t* numTokensPerExpert, int32_t* ctaIdxXyToBatchIdx,
                  int32_t* ctaIdxXyToMnLimit, int32_t* numNonExitingCtas, btg::Dtype dtypeElt,
                  btg::Dtype dtypeBias, bool useRoutingScalesOnInput, bool useDeepSeekFp8,
-                 RoutingMethodType routingMethodType, cudaStream_t stream) {
-  if (routingMethodType == RoutingMethodType::DeepSeekV3) {
+                 RoutingMethodType routingMethodType, cudaStream_t stream, btg::Dtype dtypeLogits,
+                 bool normTopkProb) {
+  if (routingMethodType == RoutingMethodType::DeepSeekV3 && nGroup <= 1) {
+    // DeepSeek no-groups case: use routingCustom with SigmoidBias preprocess
+    // and ScaledSumNormalize postprocess. This is more efficient than the full DeepSeek
+    // kernel because it uses the warp-level routingTopKExperts flow.
+    moe::dev::routing::routingCustom::Data routingData;
+
+    routingData.mDtypeOutput = btg::Dtype::Bfloat16;
+    routingData.mDtypeInput = dtypeLogits;
+    routingData.mUsePdl = true;
+    routingData.mPreprocessType = moe::dev::routing::RoutingPreprocessType::SigmoidBias;
+    routingData.mPostprocessType = moe::dev::routing::RoutingPostprocessType::ScaledSumNormalize;
+    routingData.mPtrRoutingBias = routingBias;
+    routingData.mDtypeBias = dtypeBias;
+    routingData.mRouteScale = routedScalingFactor;
+
+    routingData.mPtrScores = routingLogits;
+    routingData.mPtrTopKPacked = routingExpertIndexes;
+    routingData.mPtrExpertCounts = expertCountHistogram;
+    routingData.mPtrPermutedIdxSize = permutedIdxSize;
+    routingData.mPtrExpandedIdxToPermutedIdx = expandedIdxToPermutedIdx;
+    routingData.mPtrPermutedIdxToExpandedIdx = permutedIdxToExpandedIdx;
+    routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;
+    routingData.mPtrTopKWeights = expertWeights;
+
+    routingData.mPtrCtaIdxXyToBatchIdx = ctaIdxXyToBatchIdx;
+    routingData.mPtrCtaIdxXyToMnLimit = ctaIdxXyToMnLimit;
+    routingData.mPtrNumNonExitingCtas = numNonExitingCtas;
+
+    routingData.mNumTokens = numTokens;
+    routingData.mNumExperts = numExperts;
+    routingData.mTopK = topK;
+    routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
+    routingData.mTileTokensDim = mTileTokensDim;
+    routingData.mLocalExpertsStartIdx = localExpertOffset;
+    routingData.mLocalExpertsStrideLog2 = 0;
+    routingData.mNumLocalExperts = localNumExperts;
+
+    moe::dev::routing::routingCustom::run(routingData, stream);
+  } else if (routingMethodType == RoutingMethodType::MiniMax2) {
+    // MiniMaxM2: sigmoid(logit) + bias → topK → renormalize un-biased sigmoid scores.
+    // Similar to DeepSeek no-groups but with routeScale = 1.0 and epsilon = 1e-20
+    // to match the Python reference: weight / (sum + 1e-20).
+    moe::dev::routing::routingCustom::Data routingData;
+
+    routingData.mDtypeOutput = btg::Dtype::Bfloat16;
+    routingData.mDtypeInput = dtypeLogits;
+    routingData.mUsePdl = true;
+    routingData.mPreprocessType = moe::dev::routing::RoutingPreprocessType::SigmoidBias;
+    routingData.mPostprocessType = moe::dev::routing::RoutingPostprocessType::ScaledSumNormalize;
+    routingData.mPtrRoutingBias = routingBias;
+    routingData.mDtypeBias = dtypeBias;
+    routingData.mRouteScale = 1.0f;
+    routingData.mSumEpsilon = 1e-20f;
+
+    routingData.mPtrScores = routingLogits;
+    routingData.mPtrTopKPacked = routingExpertIndexes;
+    routingData.mPtrExpertCounts = expertCountHistogram;
+    routingData.mPtrPermutedIdxSize = permutedIdxSize;
+    routingData.mPtrExpandedIdxToPermutedIdx = expandedIdxToPermutedIdx;
+    routingData.mPtrPermutedIdxToExpandedIdx = permutedIdxToExpandedIdx;
+    routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;
+    routingData.mPtrTopKWeights = expertWeights;
+
+    routingData.mPtrCtaIdxXyToBatchIdx = ctaIdxXyToBatchIdx;
+    routingData.mPtrCtaIdxXyToMnLimit = ctaIdxXyToMnLimit;
+    routingData.mPtrNumNonExitingCtas = numNonExitingCtas;
+
+    routingData.mNumTokens = numTokens;
+    routingData.mNumExperts = numExperts;
+    routingData.mTopK = topK;
+    routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
+    routingData.mTileTokensDim = mTileTokensDim;
+    routingData.mLocalExpertsStartIdx = localExpertOffset;
+    routingData.mLocalExpertsStrideLog2 = 0;
+    routingData.mNumLocalExperts = localNumExperts;
+
+    moe::dev::routing::routingCustom::run(routingData, stream);
+  } else if (routingMethodType == RoutingMethodType::DeepSeekV3) {
     FLASHINFER_CHECK(topK <= 22, "For DeepSeek routing method, must have topK <= 22");
     FLASHINFER_CHECK(topkGroup <= 4, "For DeepSeek routing method, must have topkGroup <= 4");
     moe::dev::routing::routingDeepSeek::Data routingData;
-    routingData.mDtypeExpW =
-        btg::Dtype::Bfloat16;            // for DeepSeek, the expW is currently always bfloat16
-    routingData.mDtypeBias = dtypeBias;  // for DeepSeek, the bias can be bfloat16 or fp32
-
-    routingData.mDtypeScore = btg::Dtype::Fp32;  // for DeepSeek, the score is currently always fp32
+    routingData.mDtypeOutput =
+        btg::Dtype::Bfloat16;               // for DeepSeek, the expW is currently always bfloat16
+    routingData.mDtypeInput = dtypeLogits;  // routing logits can be bfloat16 or fp32
+    routingData.mDtypeBias = dtypeBias;     // for DeepSeek, the bias can be bfloat16 or fp32
     routingData.mUsePdl = true;
 
     int32_t const totalExpertsPerToken = topK + numFusedSharedExpert;
@@ -87,7 +164,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
 
     // input:
     routingData.mPtrRoutingBias = routingBias;
-    routingData.mPtrScores = reinterpret_cast<float*>(routingLogits);
+    routingData.mPtrScores = routingLogits;  // type-erased; InputT selected by forceFloatInput
     routingData.mNumTokens = numTokens;
     routingData.mNumExperts = numExperts;
     routingData.mNumFusedSharedExperts = numFusedSharedExpert;
@@ -125,7 +202,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
                       topkGroup);
     }
     moe::dev::routing::routingLlama4::Data routingData;
-    routingData.mDtypeExpW = btg::Dtype::Bfloat16;
+    routingData.mDtypeOutput = btg::Dtype::Bfloat16;
+    routingData.mDtypeInput = dtypeLogits;  // routing logits can be bfloat16 or fp32
     routingData.mUsePdl = true;
 
     // output:
@@ -152,23 +230,50 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mLocalExpertsStrideLog2 = 0;
     routingData.mNumLocalExperts = localNumExperts;
     moe::dev::routing::routingLlama4::run(routingData, stream);
-  } else if (routingMethodType == RoutingMethodType::Renormalize         /* default */
-             || routingMethodType == RoutingMethodType::RenormalizeNaive /* Softmax -> TopK */
-             || routingMethodType == RoutingMethodType::TopK /* TopK only (no softmax) */) {
+  } else if (routingMethodType == RoutingMethodType::Default        /* Softmax -> TopK */
+             || routingMethodType == RoutingMethodType::Renormalize /* TopK -> Softmax */
+             || routingMethodType ==
+                    RoutingMethodType::RenormalizeNaive      /* Softmax -> TopK -> Renormalize */
+             || routingMethodType == RoutingMethodType::TopK /* TopK only (no softmax) */
+             || routingMethodType ==
+                    RoutingMethodType::SigmoidRenorm /* Sigmoid -> TopK -> Renormalize */) {
     FLASHINFER_CHECK(numFusedSharedExpert == 0,
-                     "Renormalize routing method does not support fusing shared expert");
-    moe::dev::routing::routingRenormalize::Data routingData;
+                     "routingCustom method does not support fusing shared expert");
+    using namespace moe::dev::routing;
+    routingCustom::Data routingData;
 
     //
     // Config
     //
 
-    routingData.mDtypeExpW = btg::Dtype::Bfloat16;
-    // routingData.mDtypeElt = dtypeElt; // no-op for now as hidden_state is not input
+    routingData.mDtypeOutput = btg::Dtype::Bfloat16;
+    routingData.mDtypeInput = dtypeLogits;  // routing logits can be bfloat16 or fp32
     routingData.mUsePdl = true;
-    routingData.mDoSoftmaxBeforeTopK = routingMethodType == RoutingMethodType::RenormalizeNaive;
-    routingData.mNormTopkProb = routingMethodType == RoutingMethodType::RenormalizeNaive;
-    routingData.mApplySoftmaxAfterTopK = routingMethodType == RoutingMethodType::Renormalize;
+
+    // Map routing method types to policy-based routing:
+    // Note: RenormalizeNaive (Softmax → TopK → SumNormalize) is mathematically equivalent
+    // to Renormalize (TopK → Softmax), because taking softmax over all experts, selecting
+    // top-K, and dividing by their sum produces the same result as applying softmax only
+    // over the top-K values. We therefore use the same Renormalize implementation for both.
+    if (routingMethodType == RoutingMethodType::Default) {
+      // Softmax -> TopK (softmax on all scores, then select top-K)
+      routingData.mPreprocessType = RoutingPreprocessType::Softmax;
+      routingData.mPostprocessType = RoutingPostprocessType::None;
+    } else if (routingMethodType == RoutingMethodType::SigmoidRenorm) {
+      // Sigmoid -> TopK -> SumNormalize (renormalize)
+      routingData.mPreprocessType = RoutingPreprocessType::Sigmoid;
+      routingData.mPostprocessType = RoutingPostprocessType::SumNormalize;
+      routingData.mNormTopkProb = normTopkProb;
+    } else if (routingMethodType == RoutingMethodType::Renormalize ||
+               routingMethodType == RoutingMethodType::RenormalizeNaive) {
+      // TopK -> Softmax (also used for RenormalizeNaive, see comment above)
+      routingData.mPreprocessType = RoutingPreprocessType::None;
+      routingData.mPostprocessType = RoutingPostprocessType::Softmax;
+    } else {
+      // TopK only (no softmax or renormalize)
+      routingData.mPreprocessType = RoutingPreprocessType::None;
+      routingData.mPostprocessType = RoutingPostprocessType::None;
+    }
 
     routingData.mPtrScores = routingLogits;
 
@@ -202,7 +307,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mLocalExpertsStrideLog2 = 0;
     routingData.mNumLocalExperts = localNumExperts;
 
-    moe::dev::routing::routingRenormalize::run(routingData, stream);
+    routingCustom::run(routingData, stream);
   } else {
     FLASHINFER_CHECK(false, "Unimplemented routing method ",
                      serializeMoeRoutingMethodType(routingMethodType), " of enum ",
