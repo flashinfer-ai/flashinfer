@@ -33,6 +33,7 @@ GPU_DEVICE = "cuda:0"
 global_workspace_buffer = None  # can.be empty initialized
 global_trtllm_gen_fmha_workspace_buffer = None  # must be zero initialized
 workspace_size = 256 * 1024 * 1024
+TRTLLM_GEN_WORKSPACE_CHECK_BYTES = 8192 * 256 * 4
 
 
 def flip_coin(*args, **kwargs):
@@ -481,6 +482,16 @@ def generate_causal_mask(
     return mask_uint16
 
 
+def trtllm_gen_workspace_softmax_end_bytes_context(
+    workspace_buffer: torch.Tensor, *, num_qo_heads: int, sum_seq_q: int
+) -> int:
+    """Context/prefill uses softmax stats as the first workspace slab."""
+    softmax_stats_nbytes = 8 * num_qo_heads * sum_seq_q
+    base_addr = workspace_buffer.data_ptr()
+    aligned_addr = (base_addr + 15) // 16 * 16
+    return (aligned_addr - base_addr) + softmax_stats_nbytes
+
+
 def _test_trtllm_batch_prefill(
     kv_layout: str,
     batch_size: int,
@@ -636,6 +647,15 @@ def _test_trtllm_batch_prefill(
 
     # Using a tiny threshold should give the same result as normal attention.
     skip_softmax_threshold_scale_factor = 1e-30 if skips_softmax else None
+    softmax_end_bytes = trtllm_gen_workspace_softmax_end_bytes_context(
+        workspace_buffer,
+        num_qo_heads=q_input.size(1),
+        sum_seq_q=q_input.size(0),
+    )
+    workspace_check_end_bytes = min(
+        softmax_end_bytes + TRTLLM_GEN_WORKSPACE_CHECK_BYTES, workspace_buffer.numel()
+    )
+    workspace_buffer[softmax_end_bytes:workspace_check_end_bytes].zero_()
 
     output, lse = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
         q_input,
@@ -663,9 +683,9 @@ def _test_trtllm_batch_prefill(
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
         return_lse=True,
     )
-    # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
-    # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
-    assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
+    assert (
+        workspace_buffer[softmax_end_bytes:workspace_check_end_bytes].cpu().numpy() == 0
+    ).all()
 
     if o_dtype == "nvfp4":
         output, output_ref = unpack_compare_nvfp4(
@@ -732,6 +752,7 @@ def _test_trtllm_batch_prefill(
         plan_params["kv_data_type"] = kv_cache.dtype
         plan_params["o_data_type"] = DTYPE_MAP[o_dtype]
         wrapper_trtllm_gen.plan(**plan_params)
+        workspace_buffer[softmax_end_bytes:workspace_check_end_bytes].zero_()
         output_wrapper = wrapper_trtllm_gen.run(
             q_input,
             kv_cache,
@@ -748,9 +769,10 @@ def _test_trtllm_batch_prefill(
             torch.testing.assert_close(
                 output.float(), output_wrapper.float(), rtol=1e-1, atol=1e-1
             )
-        # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
-        # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
-        assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
+        assert (
+            workspace_buffer[softmax_end_bytes:workspace_check_end_bytes].cpu().numpy()
+            == 0
+        ).all()
 
 
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
@@ -1144,7 +1166,6 @@ def _test_trtllm_batch_decode(
     if should_check_lse:
         output, lse = output
     if backend == "trtllm-gen":
-        output, lse = output
         # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
         # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
         assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()

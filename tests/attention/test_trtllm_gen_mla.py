@@ -418,7 +418,6 @@ def trtllm_batch_decode_mla(
         assert lse.dtype == torch.float32
         assert torch.isfinite(lse).all()
     if backend == "trtllm-gen":
-        output, lse = output
         assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
 
     # Run reference attention and align output
