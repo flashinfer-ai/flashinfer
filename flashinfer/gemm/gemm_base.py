@@ -4553,7 +4553,12 @@ def _b12x_gemm_fp4_requirement(
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
 ):
-    # b12x backend requires 128x4 scale factor layout and NVFP4 only.
+    # b12x backend requires CUDA 13+, 128x4 scale factor layout, and NVFP4 only.
+    if get_cuda_version().major < 13:
+        raise ValueError(
+            "b12x FP4 GEMM requires CUDA 13 or later. "
+            f"Current CUDA version: {get_cuda_version()}."
+        )
     if use_8x4_sf_layout:
         raise ValueError("b12x FP4 GEMM only supports 128x4 scale factor layout.")
     if not use_nvfp4:
@@ -5062,8 +5067,8 @@ def _heuristic_func_mm_fp4(
     is_sm103 = major == 10 and minor == 3
     is_sm120 = major == 12 and minor == 0
 
-    # SM120: prefer b12x (warp-level MMA, underfill tile selection)
-    if is_sm120 and use_nvfp4:
+    # SM120 + CUDA 13: prefer b12x (warp-level MMA, underfill tile selection)
+    if is_sm120 and use_nvfp4 and cuda_major >= 13:
         return [c for c in ("b12x", "cutlass", "cudnn") if c in suitable_backends]
 
     # If cuda version is 13 or greater and cudnn version is 9.15 or greater:

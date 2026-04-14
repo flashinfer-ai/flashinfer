@@ -41,6 +41,8 @@ def _test_mm_fp4(
             pytest.skip("b12x backend only supports SM120 GPUs.")
         if not use_nvfp4:
             pytest.skip("b12x backend only supports NVFP4 (sf_vec_size=16).")
+        if torch.version.cuda and int(torch.version.cuda.split(".")[0]) < 13:
+            pytest.skip("b12x backend requires CUDA 13+.")
     if not use_128x4_sf_layout and backend != "trtllm":
         pytest.skip("Skipping test for non-trtllm fp4 with use_128x4_sf_layout=False")
     if not use_nvfp4 and backend not in ["cudnn", "auto", "cute-dsl"]:
