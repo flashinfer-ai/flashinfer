@@ -16,8 +16,6 @@ limitations under the License.
 
 from .core import JitSpec, gen_jit_spec, current_compilation_context
 from . import env as jit_env
-import shlex
-import os
 
 
 def gen_comm_alltoall_module() -> JitSpec:
@@ -36,23 +34,6 @@ def gen_trtllm_mnnvl_comm_module() -> JitSpec:
         [
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_mnnvl_allreduce.cu",
         ],
-    )
-
-
-def gen_nvshmem_module() -> JitSpec:
-    lib_dirs = jit_env.get_nvshmem_lib_dirs()
-    ldflags = (
-        [f"-L{lib_dir}" for lib_dir in lib_dirs]
-        + ["-lnvshmem_device"]
-        + shlex.split(os.environ.get("NVSHMEM_LDFLAGS", ""))
-    )
-
-    return gen_jit_spec(
-        "nvshmem",
-        [jit_env.FLASHINFER_CSRC_DIR / "nvshmem_binding.cu"],
-        extra_include_paths=[str(p) for p in jit_env.get_nvshmem_include_dirs()],
-        extra_ldflags=ldflags,
-        needs_device_linking=True,
     )
 
 

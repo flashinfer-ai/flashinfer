@@ -21,8 +21,8 @@ def test_dsv3_router_gemm_op(
 ):
     compute_capability = get_compute_capability(torch.device("cuda"))
     compute_capability_number = compute_capability[0] * 10 + compute_capability[1]
-    if compute_capability_number != 100:
-        pytest.skip("DSv3 Router GEMM is only supported on SM100")
+    if compute_capability_number != 100 and compute_capability_number != 103:
+        pytest.skip("DSv3 Router GEMM is only supported on SM100 and SM103")
 
     mat_a = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.bfloat16)
     mat_b = torch.randn(
@@ -240,8 +240,8 @@ def test_dsv3_router_gemm_op_negative(
 ):
     compute_capability = get_compute_capability(torch.device("cuda"))
     compute_capability_number = compute_capability[0] * 10 + compute_capability[1]
-    if compute_capability_number != 100:
-        pytest.skip("DSv3 Router GEMM is only supported on SM100")
+    if compute_capability_number != 100 and compute_capability_number != 103:
+        pytest.skip("DSv3 Router GEMM is only supported on SM100 and SM103")
 
     mat_a = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=mat_a_dtype)
     mat_b = torch.randn(num_experts, hidden_dim, device="cuda", dtype=mat_b_dtype)

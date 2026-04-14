@@ -731,7 +731,15 @@ def fp4_quantize(
         is_sf_8x4_layout,
         enable_pdl,
     )
-    sf = sf.reshape((-1, input.shape[-1] // sf_vec_size))
+    # Swizzled sf includes row/column padding from block_scale_interleave
+    # (rows to multiple of 128, cols to multiple of 4), so we use the padded
+    # column count and let -1 absorb the padded row count.
+    # Non-swizzled sf has exactly m * (k // sf_vec_size) elements, no padding.
+    if is_sf_swizzled_layout:
+        sf_cols = round_up(input.shape[-1] // sf_vec_size, 4)
+        sf = sf.reshape((-1, sf_cols))
+    else:
+        sf = sf.reshape((-1, input.shape[-1] // sf_vec_size))
     if is_column_major:
         x_q = x_q.transpose(-2, -1)
         sf = sf.transpose(-2, -1)
@@ -1177,9 +1185,10 @@ def nvfp4_quantize_paged_kv_cache(
     Returns:
         kv_cache_fp4: Tuple of (k_fp4, v_fp4) in the same layout as input,
             with head_dim replaced by head_dim//2, dtype=uint8.
-        kv_block_scales: Tuple of (k_scales, v_scales) in the same layout as input,
-            with head_dim replaced by head_dim//16, dtype=float8_e4m3fn,
-            with SM100 swizzling applied.
+        kv_cache_sf: Tuple of (k_scales, v_scales). `k_scales` keeps the linear
+            input layout, while `v_scales` uses TRT-LLM's 4-token interleaved
+            layout. Both tensors replace `head_dim` with `head_dim//16` and use
+            dtype=float8_e4m3fn.
         k_global_scale: Global scale for K (float), equal to ``1 / k_global_sf``.
         v_global_scale: Global scale for V (float), equal to ``1 / v_global_sf``.
     """
@@ -1242,10 +1251,17 @@ def nvfp4_quantize_paged_kv_cache(
     k_sf_fp8 = k_sf.view(torch.float8_e4m3fn).reshape(out_shape_sf)
     v_sf_fp8 = v_sf.view(torch.float8_e4m3fn).reshape(out_shape_sf)
 
-    # Apply scale factor swizzling for SM100 trtllm-gen MHA kernel.
-    # The swizzle interleaves within each [page_size, head_dim//16] tile per page/head.
-    # HND: [P, H, T//4, 4, 4, S//4] -> permute(0,1,2,4,5,3) -> [P, H, T, S]
-    # NHD: [P, T//4, 4, H, 4, S//4] -> permute(0,1,4,3,5,2) -> [P, T, H, S]
+    # Apply V scale factor swizzling for SM100 trtllm-gen MHA kernel.
+    # The swizzle interleaves the token dimension by groups of 4 within each
+    # [page_size, head_dim//16] tile per page/head:
+    #   output[..., (t//4)*4*S + s*4 + t%4] = input[..., t*S + s]
+    # This matches TRT-LLM's quantizeAndWriteFP4KVCache() V swizzle pattern.
+    # K scale factors do NOT need swizzling — the kernel reads them with real strides.
+    if page_size % 4 != 0 or head_dim % 64 != 0:
+        raise ValueError(
+            "V-scale swizzling requires page_size % 4 == 0 and head_dim % 64 == 0, "
+            f"got page_size={page_size}, head_dim={head_dim}."
+        )
     if kv_layout == "NHD":
         swizzle_shape = (
             num_pages,
@@ -1267,12 +1283,6 @@ def nvfp4_quantize_paged_kv_cache(
         )
         swizzle_perm = (0, 1, 2, 4, 5, 3)
 
-    k_sf_fp8 = (
-        k_sf_fp8.reshape(swizzle_shape)
-        .permute(swizzle_perm)
-        .reshape(out_shape_sf)
-        .contiguous()
-    )
     v_sf_fp8 = (
         v_sf_fp8.reshape(swizzle_shape)
         .permute(swizzle_perm)
@@ -1280,13 +1290,13 @@ def nvfp4_quantize_paged_kv_cache(
         .contiguous()
     )
 
-    kv_block_scales = (k_sf_fp8, v_sf_fp8)
+    kv_cache_sf = (k_sf_fp8, v_sf_fp8)
 
     # Return the inverse of global_sf: global_scale = 1 / global_sf = amax / 448
     k_gs_ret = (1.0 / k_global_sf).item()
     v_gs_ret = (1.0 / v_global_sf).item()
 
-    return kv_cache_fp4, kv_block_scales, k_gs_ret, v_gs_ret
+    return kv_cache_fp4, kv_cache_sf, k_gs_ret, v_gs_ret
 
 
 @flashinfer_api

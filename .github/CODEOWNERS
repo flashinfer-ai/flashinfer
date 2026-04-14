@@ -10,11 +10,11 @@
 * @yzh119 @sricketts @aleozlx @yongwww @cyx-6 @saltyminty @bkryu @yyihuang @kahyunnam @jimmyzho @nv-yunzheq @samuellees
 
 # ── Attention ──
-csrc/fmha_v2/                  @saltyminty @yzh119 @nv-yunzheq @bkryu
-csrc/xqa/                      @saltyminty @yzh119 @nv-yunzheq @bkryu
-flashinfer/attention.py        @saltyminty @yzh119 @nv-yunzheq @bkryu
-include/flashinfer/attention/  @saltyminty @yzh119 @nv-yunzheq @bkryu
-tests/attention/               @saltyminty @yzh119 @nv-yunzheq @bkryu
+csrc/fmha_v2/                  @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
+csrc/xqa/                      @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
+flashinfer/attention.py        @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
+include/flashinfer/attention/  @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
+tests/attention/               @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
 
 # ── GEMM ──
 flashinfer/gemm/               @dhiraj113 @yzh119 @aleozlx @bkryu
@@ -22,9 +22,10 @@ include/flashinfer/gemm/       @dhiraj113 @yzh119 @aleozlx @bkryu
 tests/gemm/                    @dhiraj113 @yzh119 @aleozlx @bkryu
 
 # ── MOE ──
-csrc/fused_moe/                @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees
-flashinfer/fused_moe/          @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees
-tests/moe/                     @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees
+csrc/fused_moe/                       @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees
+flashinfer/fused_moe/                 @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees
+include/flashinfer/trtllm/fused_moe/  @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees
+tests/moe/                            @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees
 
 # ── Communication ──
 flashinfer/comm/               @aleozlx @yzh119 @jimmyzho @bkryu @nv-yunzheq

@@ -133,6 +133,14 @@
 # Both SF layouts with MXFP4 format
 --routine add_rmsnorm_fp4quant --batch_size 32 --hidden_size 4096 --input_dtype bfloat16 --out_dtype mxfp4 --output_both_sf_layouts -vv --generate_repro_command --case_tag "add_rmsnorm_fp4quant_mxfp4_both_sf"
 
+## Fused RMSNorm + SiLU (SM80+, sweep-tuned on SM100/B200)
+# VAE decoder shapes (LUT-optimized on B200)
+--routine fused_rmsnorm_silu --batch_size 1560 --hidden_size 1024 --input_dtype bfloat16 --refcheck -vv --generate_repro_command --case_tag "fused_rmsnorm_silu_vae_small"
+--routine fused_rmsnorm_silu --batch_size 24960 --hidden_size 512 --input_dtype bfloat16 --refcheck -vv --generate_repro_command --case_tag "fused_rmsnorm_silu_vae_mid"
+--routine fused_rmsnorm_silu --batch_size 99840 --hidden_size 256 --input_dtype bfloat16 --refcheck -vv --generate_repro_command --case_tag "fused_rmsnorm_silu_vae_large"
+# Non-VAE shapes (fallback heuristics)
+--routine fused_rmsnorm_silu --batch_size 2048 --hidden_size 4096 --input_dtype bfloat16 --refcheck -vv --generate_repro_command --case_tag "fused_rmsnorm_silu_llama"
+
 ## Quantization (Blackwell SM10.0+ only)
 # MxFP8 Quantization - basic
 --routine mxfp8_quantize --m 1024 --k 4096 --input_dtype bfloat16 -vv --generate_repro_command --case_tag "mxfp8_quantize_basic"
