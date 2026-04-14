@@ -53,6 +53,7 @@ constexpr int64_t float16_code = encode_dlpack_dtype(dl_float16);
 constexpr int64_t bfloat16_code = encode_dlpack_dtype(dl_bfloat16);
 constexpr int64_t float32_code = encode_dlpack_dtype(dl_float32);
 constexpr int64_t uint8_code = encode_dlpack_dtype(dl_uint8);
+constexpr int64_t int8_code = encode_dlpack_dtype(dl_int8);
 constexpr int64_t int32_code = encode_dlpack_dtype(dl_int32);
 constexpr int64_t int64_code = encode_dlpack_dtype(dl_int64);
 constexpr int64_t float8_e4m3fn_code = encode_dlpack_dtype(dl_float8_e4m3fn);
@@ -114,6 +115,12 @@ constexpr DLDevice cpu = DLDevice{kDLCPU, 0};
   case int32_code: {                    \
     using c_type = int32_t;             \
     return __VA_ARGS__();               \
+  }
+
+#define _DISPATCH_CASE_I8(c_type, ...) \
+  case int8_code: {                    \
+    using c_type = int8_t;             \
+    return __VA_ARGS__();              \
   }
 
 #define _DISPATCH_CASE_I64(c_type, ...) \
@@ -214,6 +221,22 @@ constexpr DLDevice cpu = DLDevice{kDLCPU, 0};
 #define DISPATCH_DLPACK_DTYPE_TO_CTYPE(dlpack_dtype, c_type, ...)                        \
   [&]() -> bool {                                                                        \
     switch (encode_dlpack_dtype(dlpack_dtype)) {                                         \
+      _DISPATCH_CASE_F16(c_type, __VA_ARGS__)                                            \
+      _DISPATCH_CASE_BF16(c_type, __VA_ARGS__)                                           \
+      _DISPATCH_CASE_FP8_E4M3(c_type, __VA_ARGS__)                                       \
+      _DISPATCH_CASE_FP8_E5M2(c_type, __VA_ARGS__)                                       \
+      _DISPATCH_CASE_FP4_E2M1(c_type, __VA_ARGS__)                                       \
+      default:                                                                           \
+        TVM_FFI_ICHECK(false) << __PRETTY_FUNCTION__ << " failed to dispatch data type " \
+                              << (dlpack_dtype).code << " " << (dlpack_dtype).bits;      \
+        return false;                                                                    \
+    }                                                                                    \
+  }()
+
+#define DISPATCH_DLPACK_DTYPE_TO_CTYPE_QKV(dlpack_dtype, c_type, ...)                    \
+  [&]() -> bool {                                                                        \
+    switch (encode_dlpack_dtype(dlpack_dtype)) {                                         \
+      _DISPATCH_CASE_I8(c_type, __VA_ARGS__)                                             \
       _DISPATCH_CASE_F16(c_type, __VA_ARGS__)                                            \
       _DISPATCH_CASE_BF16(c_type, __VA_ARGS__)                                           \
       _DISPATCH_CASE_FP8_E4M3(c_type, __VA_ARGS__)                                       \
