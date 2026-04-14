@@ -74,6 +74,10 @@ struct TopkResults {
 //   ] g_inds [ overflow_stride * 2 * NClusters  + same offset ]
 // Total per cluster: overflow_stride * 4 * NClusters int32 elements.
 
+// Cluster cooperative groups (cg::this_cluster, cluster barriers, etc.) require
+// SM 9.0 (Hopper) or newer.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
+
 template <typename T, int NClusters, bool PDL_ENABLED>
 __device__ __forceinline__ TopkResults fast_topk_cuda_v4(
     const T* __restrict__ logits,                    // Input logits [max_num_pages * 64]
@@ -105,7 +109,6 @@ __device__ __forceinline__ TopkResults fast_topk_cuda_v4(
   auto cluster = cg::this_cluster();
   const int block_id = cluster.block_rank();
   const bool radix_thread = threadIdx.x < RADIX;
-  constexpr bool DEBUG = false;
   constexpr bool RUN_PHASE1 = true;
   constexpr bool ENABLE_CLUSTER_SAFETY = true;
 
@@ -141,12 +144,6 @@ __device__ __forceinline__ TopkResults fast_topk_cuda_v4(
 
     if (radix_thread && cum_val > k_remaining && cum_val1 <= k_remaining) {
       *shared_threshold_bin = threadIdx.x;
-      if (DEBUG) {
-        printf(
-            "block_id %d: threshold_bin %d. cum_sum_thres %d, cum_sum_thres+1 "
-            "%d, topk_val %d\n",
-            block_id, threadIdx.x, cum_val, cum_val1, *shared_final_idx_count);
-      }
     }
 
     __syncthreads();
@@ -269,10 +266,6 @@ __device__ __forceinline__ TopkResults fast_topk_cuda_v4(
     }
     int buf_len = min(num_cached, shared_num_cached_count[phase ^ 1]);
     int g_buf_len = min(overflow_stride, s_cached_overflow_count[phase ^ 1]);
-
-    if (DEBUG && threadIdx.x == 0) {
-      printf("block_id %d, num_cached %d, g_buf_len %d\n", block_id, buf_len, g_buf_len);
-    }
 
     // --- Process shared cache ---
     // using cached indices, it's a local slice so don't partition between
@@ -397,10 +390,6 @@ __device__ __forceinline__ TopkResults fast_topk_cuda_v4(
       }
       __syncthreads();
       topk_start = *shared_final_idx_count;
-    }
-
-    if (DEBUG && threadIdx.x == 0) {
-      printf("block rank %d, topk start %d, topk num %d\n", block_id, topk_start, topk_num);
     }
 
     cluster.sync();  // sync so CTAs don't exit when other CTAs depend on
@@ -545,6 +534,8 @@ __global__ __launch_bounds__(1024) void __cluster_dims__(NClusters, 1, 1)
   }
 }
 
+#endif  // !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
+
 constexpr int MAX_SMEM_CARVEOUT = 227 * 1024;
 
 #define DISPATCH_TOPK_EXACT(kernel_name, dtype, CLUSTERS, PDL) \
@@ -593,6 +584,7 @@ void launch_fast_topk_clusters_exact(const T* logits, IdxT* indices, T* output_v
                                      int batch_size, int logit_stride, int indices_stride,
                                      int num_cached, int num_clusters, bool pdl_enabled, int TopK,
                                      cudaStream_t stream) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
   int extern_shared_mem = get_shared_mem_bytes(TopK, num_cached);
 
   void* args[11] = {
@@ -619,6 +611,9 @@ void launch_fast_topk_clusters_exact(const T* logits, IdxT* indices, T* output_v
   // annotated with __cluster_dims__; without it the launch fails with invalid argument.
   launch_topk_cluster_kernel(kernel, args, batch_size * num_clusters, extern_shared_mem,
                              num_clusters, pdl_enabled, stream);
+#else
+  throw std::runtime_error("fast_topk_clusters_exact requires SM 9.0 (Hopper) or newer");
+#endif
 }
 
 template <typename T>
@@ -627,6 +622,7 @@ void launch_fast_topk_clusters_exact_page_table_transform(
     int* cached_overflow, int overflow_stride, int batch_size, int logit_stride, int indices_stride,
     int page_table_stride, int num_cached, int num_clusters, bool pdl_enabled, int TopK,
     cudaStream_t stream) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
   int extern_shared_mem = get_shared_mem_bytes(TopK, num_cached);
 
   void* args[12] = {&logits,         &indices,           &seq_lens,        &page_table,
@@ -651,6 +647,10 @@ void launch_fast_topk_clusters_exact_page_table_transform(
 
   launch_topk_cluster_kernel(kernel, args, batch_size * num_clusters, extern_shared_mem,
                              num_clusters, pdl_enabled, stream);
+#else
+  throw std::runtime_error(
+      "fast_topk_clusters_exact_page_table_transform requires SM 9.0 (Hopper) or newer");
+#endif
 }
 
 template <typename T>
@@ -658,6 +658,7 @@ void launch_fast_topk_clusters_exact_ragged_transform(
     const T* logits, int* indices, int* seq_lens, int* offsets, int* pre_hist, int* cached_overflow,
     int overflow_stride, int batch_size, int logit_stride, int indices_stride, int num_cached,
     int num_clusters, bool pdl_enabled, int TopK, cudaStream_t stream) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
   int extern_shared_mem = get_shared_mem_bytes(TopK, num_cached);
 
   void* args[11] = {
@@ -682,6 +683,10 @@ void launch_fast_topk_clusters_exact_ragged_transform(
 
   launch_topk_cluster_kernel(kernel, args, batch_size * num_clusters, extern_shared_mem,
                              num_clusters, pdl_enabled, stream);
+#else
+  throw std::runtime_error(
+      "fast_topk_clusters_exact_ragged_transform requires SM 9.0 (Hopper) or newer");
+#endif
 }
 
 }  // namespace sampling
