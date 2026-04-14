@@ -46,7 +46,7 @@ _CUDNN_MOE_MIN_VERSION = 91800  # 9.18.0
 _CUDNN_MOE_FP4_MIN_VERSION = 92100  # 9.21.0
 
 
-class _UIDs(Enum):
+class _CUDNN_UIDs(Enum):
     """Tensor UIDs for cuDNN MOE graphs (unique namespace)."""
 
     TOKEN = 20
@@ -54,7 +54,8 @@ class _UIDs(Enum):
     FIRST_TOKEN_OFFSET = 22
     A_DESCALE = 25
     B_DESCALE = 26
-    OUTPUT = 27
+    ALPHA = 27
+    OUTPUT = 100
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +130,7 @@ def _build_cudnn_moe_grouped_gemm_graph(
     weight_cudnn_dtype,
     fto_shape,
     fto_stride,
+    alpha_cudnn_dtype,
     output_cudnn_dtype,
     policy=None,
 ):
@@ -146,33 +148,50 @@ def _build_cudnn_moe_grouped_gemm_graph(
         dim=list(token_shape),
         stride=list(token_stride),
         data_type=token_cudnn_dtype,
-        uid=_UIDs.TOKEN.value,
+        uid=_CUDNN_UIDs.TOKEN.value,
     )
     weight = graph.tensor(
         name="weight",
         dim=list(weight_shape),
         stride=list(weight_stride),
         data_type=weight_cudnn_dtype,
-        uid=_UIDs.WEIGHT.value,
+        uid=_CUDNN_UIDs.WEIGHT.value,
     )
     fto = graph.tensor(
         name="first_token_offset",
         dim=list(fto_shape),
         stride=list(fto_stride),
         data_type=cudnn.data_type.INT32,
-        uid=_UIDs.FIRST_TOKEN_OFFSET.value,
+        uid=_CUDNN_UIDs.FIRST_TOKEN_OFFSET.value,
     )
 
-    output = graph.moe_grouped_matmul(
+    accum = graph.moe_grouped_matmul(
+        name="cudnn_moe_grouped_gemm",
         token=token,
         weight=weight,
         first_token_offset=fto,
         mode=cudnn.moe_grouped_matmul_mode.NONE,
         compute_data_type=cudnn.data_type.FLOAT,
-        name="cudnn_moe_grouped_gemm",
     )
 
-    output.set_uid(_UIDs.OUTPUT.value).set_output(True).set_data_type(
+    if alpha_cudnn_dtype is not None:
+        alpha = graph.tensor(
+            name="alpha",
+            dim=(1, 1, 1),
+            stride=(1, 1, 1),
+            data_type=alpha_cudnn_dtype,
+            uid=_CUDNN_UIDs.ALPHA.value,
+        )
+        output = graph.mul(
+            name="scale",
+            a=accum,
+            b=alpha,
+            compute_data_type=cudnn.data_type.FLOAT,
+        )
+    else:
+        output = accum
+
+    output.set_uid(_CUDNN_UIDs.OUTPUT.value).set_output(True).set_data_type(
         output_cudnn_dtype
     )
 
@@ -189,12 +208,14 @@ def _run_cudnn_moe_grouped_gemm(
     a: torch.Tensor,
     b: torch.Tensor,
     m_indptr: torch.Tensor,
-    out_dtype: torch.dtype,
-    out: Optional[torch.Tensor],
+    alpha: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    out: Optional[torch.Tensor] = None,
 ):
     """Build/cache graph → allocate output → execute."""
     token_cudnn_dtype = _to_cudnn_dtype(a.dtype)
     weight_cudnn_dtype = _to_cudnn_dtype(b.dtype)
+    alpha_cudnn_dtype = _to_cudnn_dtype(alpha.dtype) if alpha is not None else None
     out_cudnn_dtype = _to_cudnn_dtype(out_dtype)
 
     cum_m = a.shape[0]
@@ -203,6 +224,7 @@ def _run_cudnn_moe_grouped_gemm(
     token_3d = a.unsqueeze(0)
     weight_3d = b.transpose(1, 2)
     fto = m_indptr[:-1].reshape(-1, 1, 1).contiguous()
+    alpha_3d = alpha.unsqueeze(0).unsqueeze(0) if alpha is not None else None
 
     handle = _get_handle(a.device)
 
@@ -216,6 +238,7 @@ def _run_cudnn_moe_grouped_gemm(
         weight_cudnn_dtype,
         fto.shape,
         fto.stride(),
+        alpha_cudnn_dtype,
         out_cudnn_dtype,
     )
 
@@ -224,11 +247,13 @@ def _run_cudnn_moe_grouped_gemm(
     out_3d = out.view(1, cum_m, n)
 
     variant_pack = {
-        _UIDs.TOKEN.value: token_3d,
-        _UIDs.WEIGHT.value: weight_3d,
-        _UIDs.FIRST_TOKEN_OFFSET.value: fto,
-        _UIDs.OUTPUT.value: out_3d,
+        _CUDNN_UIDs.TOKEN.value: token_3d,
+        _CUDNN_UIDs.WEIGHT.value: weight_3d,
+        _CUDNN_UIDs.FIRST_TOKEN_OFFSET.value: fto,
+        _CUDNN_UIDs.OUTPUT.value: out_3d,
     }
+    if alpha is not None:
+        variant_pack[_CUDNN_UIDs.ALPHA.value] = alpha_3d
 
     workspace = torch.empty(ws, device=a.device, dtype=torch.uint8)
     graph.execute(variant_pack, workspace, handle=handle)
@@ -250,10 +275,8 @@ def _check_grouped_mm_bf16(
     backend: str = "cudnn",
 ):
     _check_cudnn_version(_CUDNN_MOE_MIN_VERSION, "grouped_mm_bf16")
-    if a.dtype not in (torch.float16, torch.bfloat16):
-        raise ValueError(f"a must be float16 or bfloat16, got {a.dtype}")
-    if b.dtype != a.dtype:
-        raise ValueError(f"b dtype {b.dtype} must match a dtype {a.dtype}")
+    if a.dtype != torch.bfloat16 or b.dtype != torch.bfloat16:
+        raise ValueError(f"a and b must be bfloat16, got {a.dtype} and {b.dtype}")
     if out_dtype not in (torch.float16, torch.bfloat16, torch.float32):
         raise ValueError(
             f"out_dtype must be float16, bfloat16, or float32, got {out_dtype}"
@@ -311,9 +334,9 @@ def grouped_mm_bf16(
     a : torch.Tensor
         Token activations, shape ``(cum_m, k)``, bf16 or fp16.
     b : torch.Tensor
-        Expert weights, shape ``(num_experts, n, k)``.
+        Expert weights, shape ``(batch_size, n, k)``.
     m_indptr : torch.Tensor
-        Cumulative token counts, shape ``(num_experts + 1,)``, ``int32``.
+        Cumulative token counts, shape ``(batch_size + 1,)``, ``int32``.
     out : Optional[torch.Tensor]
         Pre-allocated output ``(m_out, n)``.
     out_dtype : torch.dtype
@@ -340,6 +363,122 @@ def grouped_mm_bf16(
         out_dtype = out.dtype
 
     if backend == "cudnn":
-        return _run_cudnn_moe_grouped_gemm(a, b, m_indptr, out_dtype, out)
+        return _run_cudnn_moe_grouped_gemm(a, b, m_indptr, out_dtype=out_dtype, out=out)
     else:
         raise ValueError("backend does not support grouped_mm_bf16")
+
+
+@supported_compute_capability([80, 86, 89, 90, 100, 103, 120, 121])
+def _check_grouped_mm_fp8(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    m_indptr: torch.Tensor,
+    alpha: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    backend: str = "cudnn",
+):
+    _check_cudnn_version(_CUDNN_MOE_MIN_VERSION, "grouped_mm_fp8")
+    if a.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+        raise ValueError(f"a must be float8_e4m3fn or float8_e5m2, got {a.dtype}")
+    if b.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+        raise ValueError(f"b must be float8_e4m3fn or float8_e5m2, got {b.dtype}")
+    if out_dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError(
+            f"out_dtype must be float16, bfloat16, or float32, got {out_dtype}"
+        )
+    if a.ndim != 2:
+        raise ValueError(f"a must be 2D (cum_m, k), got {a.shape}")
+    if b.ndim != 3:
+        raise ValueError(f"b must be 3D (num_experts, n, k), got {b.shape}")
+    if m_indptr.dtype != torch.int32:
+        raise ValueError(f"m_indptr must be int32, got {m_indptr.dtype}")
+    num_experts = b.shape[0]
+    if m_indptr.shape[0] != num_experts + 1:
+        raise ValueError(
+            f"m_indptr length {m_indptr.shape[0]} != num_experts+1 ({num_experts + 1})"
+        )
+    if a.shape[1] != b.shape[2]:
+        raise ValueError(f"K mismatch: a has {a.shape[1]}, b has {b.shape[2]}")
+    if alpha is not None:
+        if alpha.dtype != torch.float32:
+            raise ValueError(f"alpha must be float32, got {alpha.dtype}")
+        if alpha.shape != (1,):
+            raise ValueError(f"alpha must be a scalar, got {alpha.shape}")
+    if out is not None:
+        expected_shape = (a.shape[0], b.shape[1])
+        if out.shape != expected_shape:
+            raise ValueError(
+                f"out shape {tuple(out.shape)} != expected {expected_shape}"
+            )
+        if out.device != a.device:
+            raise ValueError(
+                f"out device {out.device} must match input device {a.device}"
+            )
+    return True
+
+
+@backend_requirement({}, common_check=_check_grouped_mm_fp8)
+@flashinfer_api
+def grouped_mm_fp8(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    m_indptr: torch.Tensor,
+    alpha: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    backend: str = "cudnn",
+) -> torch.Tensor:
+    r"""Grouped matrix multiplication with FP8 data types (cuDNN MOE backend).
+
+    Performs a grouped GEMM across experts, as used in Mixture-of-Experts layers.
+    Mirrors :func:`flashinfer.mm_fp8` but for expert-partitioned inputs.
+
+    .. math::
+
+        \text{out}[\text{start}:\text{end}] = a[\text{start}:\text{end}] \times b[e]^T
+        \quad \text{for each expert } e
+
+    where ``start, end = m_indptr[e], m_indptr[e+1]``.
+
+    Parameters
+    ----------
+    a : torch.Tensor
+        Token activations, shape ``(cum_m, k)``, e4m3 or e5m2.
+    b : torch.Tensor
+        Expert weights, shape ``(batch_size, n, k)``.
+    m_indptr : torch.Tensor
+        Cumulative token counts, shape ``(batch_size + 1,)``, ``int32``.
+    alpha : Optional[torch.Tensor]
+        Scaling factor for the output, shape ``(1,)``.
+    out : Optional[torch.Tensor]
+        Pre-allocated output ``(m_out, n)``.
+    out_dtype : torch.dtype
+        Output data type.  ``torch.bfloat16`` (default) or ``torch.float16``, ``torch.float32``.
+    backend : str
+        Backend selector.  Currently only ``"cudnn"`` is supported.
+
+    Returns
+    -------
+    torch.Tensor
+        Output tensor ``(m_out, n)``.
+
+    Examples
+    --------
+    >>> import torch, flashinfer
+    >>> E, tpe, k, n = 8, 128, 4096, 2048
+    >>> a = torch.randn(E * tpe, k, dtype=torch.float8_e4m3, device="cuda")
+    >>> b = torch.randn(E, n, k, dtype=torch.float8_e4m3, device="cuda")
+    >>> m_indptr = (torch.arange(E + 1, device="cuda") * tpe).to(torch.int32)
+    >>> out = flashinfer.grouped_mm.grouped_mm_fp8(a, b, m_indptr, alpha=torch.tensor(1.0, device="cuda"))
+    """
+
+    if out is not None:
+        out_dtype = out.dtype
+
+    if backend == "cudnn":
+        return _run_cudnn_moe_grouped_gemm(
+            a, b, m_indptr, alpha=alpha, out_dtype=out_dtype, out=out
+        )
+    else:
+        raise ValueError("backend does not support grouped_mm_fp8")
