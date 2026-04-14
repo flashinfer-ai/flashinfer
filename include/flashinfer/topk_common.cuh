@@ -1,8 +1,12 @@
 #ifndef FLASHINFER_TOPK_COMMON_CUH_
 #define FLASHINFER_TOPK_COMMON_CUH_
 
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
 #include <cstdint>
 #include <cstdlib>
+#include <cuda/std/limits>
 #include <numeric>
 #include <type_traits>
 
