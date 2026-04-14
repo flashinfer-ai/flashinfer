@@ -1069,10 +1069,13 @@ class FusedOp {
         }
 
         // MN-padding: on last valid token, first group zeros all packs
-        // for padding tokens (token_num .. tma_aligned_mn - 1)
+        // for padding tokens (token_num .. tma_aligned_mn - 1).
+        // Skip the last packed column (pk = k_num_packed - 1) because
+        // scale_out storage is (token_num + (k_num_packed-1)*tma_aligned_mn)
+        // elements — the last column only has token_num rows allocated.
         if (token_id == token_num - 1 && group_idx_in_row == 0) {
           for (int pad_t = token_num; pad_t < m_params.tma_aligned_mn; pad_t++) {
-            for (int pk = 0; pk < k_num_packed; pk++) {
+            for (int pk = 0; pk < k_num_packed - 1; pk++) {
               int pad_elem = pk * m_params.tma_aligned_mn + pad_t;
               reinterpret_cast<uint32_t*>(m_params.scale_out)[pad_elem] = 0;
             }

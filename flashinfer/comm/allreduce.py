@@ -737,6 +737,8 @@ def allreduce_fusion(
             AllReduceFusionPattern.kARResidualRMSNormPerTokenGroupFP8PackedQuant,
             AllReduceFusionPattern.kARResidualRMSNormOutPerTokenGroupFP8PackedQuant,
         ]:
+            token_num, hidden_dim = input.shape
+
             if block_quant_group_size is None:
                 raise ValueError(
                     f"block_quant_group_size is required for pattern: {pattern}"
@@ -751,7 +753,7 @@ def allreduce_fusion(
                 raise ValueError(
                     f"hidden_dim must be divisible by block_quant_group_size, got {hidden_dim} and {block_quant_group_size}"
                 )
-            token_num, hidden_dim = input.shape
+
             groups_per_row = hidden_dim // block_quant_group_size
             k_num_packed = (groups_per_row + 3) // 4
             tma_aligned_mn = ((token_num + 3) // 4) * 4
