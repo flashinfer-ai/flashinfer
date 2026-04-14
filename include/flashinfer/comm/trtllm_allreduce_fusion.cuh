@@ -1017,7 +1017,8 @@ class FusedOp {
         local_absmax = fmaxf(local_absmax, v);
       }
 
-      // group reduce
+      // all-reduce within the quantization group using warp shuffles.
+      // requires group_size_in_vecs to be a power of 2 and <= 32 (warp size).
       int group_size_in_vecs = m_params.block_quant_group_size / VEC_SIZE;
 #pragma unroll
       for (int offset = group_size_in_vecs / 2; offset > 0; offset /= 2) {
@@ -1576,6 +1577,21 @@ cudaError_t allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const& par
   FLASHINFER_CHECK(oneshot || block_size >= params.nranks, "not oneshot, or block_size < nranks");
   FLASHINFER_CHECK(block_size <= 1024 && cluster_size > 0,
                    "block_size > 1024 or cluster_size <= 0");
+
+  if constexpr (GetQuantType<Pattern> == QuantType::kPerTokenGroupFP8Packed) {
+    // TODO: loosen these constraints
+    int group_size_in_vecs = params.block_quant_group_size / VEC_SIZE;
+    FLASHINFER_CHECK(params.block_quant_group_size > 0,
+                     "block_quant_group_size must be > 0 for per-token-group FP8 quant");
+    FLASHINFER_CHECK(params.block_quant_group_size % VEC_SIZE == 0,
+                     "block_quant_group_size must be divisible by VEC_SIZE");
+    FLASHINFER_CHECK((group_size_in_vecs & (group_size_in_vecs - 1)) == 0,
+                     "block_quant_group_size / VEC_SIZE must be a power of 2");
+    FLASHINFER_CHECK(group_size_in_vecs <= 32,
+                     "block_quant_group_size / VEC_SIZE must be <= 32 (warp size)");
+    FLASHINFER_CHECK(block_size % group_size_in_vecs == 0,
+                     "threads_per_block must be a multiple of group_size_in_vecs");
+  }
 
   int grid_size = (std::min(sm_count, cluster_num * cluster_size) / cluster_size) * cluster_size;
   cudaLaunchConfig_t cfg;
