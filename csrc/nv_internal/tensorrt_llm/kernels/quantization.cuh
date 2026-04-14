@@ -37,24 +37,17 @@ namespace kernels {
 struct alignas(32) PackedU32x8 {
   uint32_t d[8];
 };
+struct alignas(16) PackedU32x4 {
+  uint32_t d[4];
+};
 template <typename VecT>
 __device__ __forceinline__ void loadPackedVec(VecT& val, VecT const* ptr) {
   static_assert(sizeof(VecT) == 16 || sizeof(VecT) == 32,
                 "Packed vector loads expect 16-byte or 32-byte vectors.");
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && defined(__CUDACC_VER_MAJOR__) && \
-        defined(__CUDACC_VER_MINOR__) &&                                                  \
-        (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 9) ||                      \
-    (__CUDACC_VER_MAJOR__ >= 13)
-  if constexpr (sizeof(VecT) == 32) {
-    auto& raw = reinterpret_cast<PackedU32x8&>(val);
-    asm volatile("ld.global.cg.v8.u32 {%0,%1,%2,%3,%4,%5,%6,%7}, [%8];\n"
-                 : "=r"(raw.d[0]), "=r"(raw.d[1]), "=r"(raw.d[2]), "=r"(raw.d[3]), "=r"(raw.d[4]),
-                   "=r"(raw.d[5]), "=r"(raw.d[6]), "=r"(raw.d[7])
-                 : "l"(ptr));
-  } else
-#endif
+  using VecT_ = std::conditional_t<sizeof(VecT) == 16, PackedU32x4, PackedU32x8>;
+  VecT_& val_ = reinterpret_cast<VecT_&>(val);
   {
-    val = *ptr;
+    val_ = *reinterpret_cast<VecT_ const*>(ptr);
   }
 }
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && defined(__CUDACC_VER_MAJOR__) && \
