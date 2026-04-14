@@ -21,10 +21,14 @@ import torch
 
 from .api_logging import flashinfer_api
 from .jit.page import gen_page_module
+from .quantization import int4_quantize
 from .utils import (
+    INT4Tensor,
     TensorLayout,
     _check_kv_layout,
+    _split_int4_paged_kv_cache_views,
     check_shape_dtype_device,
+    is_int4_paged_kv_cache,
     _unpack_paged_kv_cache,
     register_custom_op,
     register_fake_op,
@@ -118,6 +122,60 @@ def _fake_append_paged_kv_cache_kernel(
     layout: int,
 ) -> None:
     pass
+
+
+def _append_paged_kv_cache_int4(
+    append_key: torch.Tensor,
+    append_value: torch.Tensor,
+    batch_indices: torch.Tensor,
+    positions: torch.Tensor,
+    paged_kv_cache: Union[INT4Tensor, Tuple[INT4Tensor, INT4Tensor]],
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_layout: str,
+) -> None:
+    packed_key = int4_quantize(append_key)
+    packed_value = int4_quantize(append_value)
+
+    k_data, v_data, k_scale, v_scale = _split_int4_paged_kv_cache_views(
+        paged_kv_cache, kv_layout
+    )
+    if packed_key.data.shape[-1] != k_data.shape[-1]:
+        raise ValueError(
+            "The append key head dimension does not match the paged int4 cache."
+        )
+    if packed_value.data.shape[-1] != v_data.shape[-1]:
+        raise ValueError(
+            "The append value head dimension does not match the paged int4 cache."
+        )
+    if packed_key.scale.shape[-1] != k_scale.shape[-1]:
+        raise ValueError(
+            "The append key group count does not match the paged int4 cache."
+        )
+    if packed_value.scale.shape[-1] != v_scale.shape[-1]:
+        raise ValueError(
+            "The append value group count does not match the paged int4 cache."
+        )
+
+    page_size = k_data.shape[1] if kv_layout == "NHD" else k_data.shape[2]
+    batch_indices = batch_indices.to(torch.int64)
+    positions = positions.to(torch.int64)
+    kv_indices = kv_indices.to(torch.int64)
+    kv_indptr = kv_indptr.to(torch.int64)
+    page_offsets = torch.div(positions, page_size, rounding_mode="floor")
+    page_positions = torch.remainder(positions, page_size)
+    page_indices = kv_indices[kv_indptr[batch_indices] + page_offsets]
+
+    if kv_layout == "NHD":
+        k_data[page_indices, page_positions] = packed_key.data
+        v_data[page_indices, page_positions] = packed_value.data
+        k_scale[page_indices, page_positions] = packed_key.scale
+        v_scale[page_indices, page_positions] = packed_value.scale
+    else:
+        k_data[page_indices, :, page_positions, :] = packed_key.data
+        v_data[page_indices, :, page_positions, :] = packed_value.data
+        k_scale[page_indices, :, page_positions, :] = packed_key.scale
+        v_scale[page_indices, :, page_positions, :] = packed_value.scale
 
 
 @flashinfer_api
@@ -277,7 +335,12 @@ def append_paged_kv_cache(
     append_value: torch.Tensor,
     batch_indices: torch.Tensor,
     positions: torch.Tensor,
-    paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+    paged_kv_cache: Union[
+        torch.Tensor,
+        INT4Tensor,
+        Tuple[torch.Tensor, torch.Tensor],
+        Tuple[INT4Tensor, INT4Tensor],
+    ],
     kv_indices: torch.Tensor,
     kv_indptr: torch.Tensor,
     kv_last_page_len: torch.Tensor,
@@ -388,6 +451,18 @@ def append_paged_kv_cache(
     get_batch_indices_positions
     """
     _check_kv_layout(kv_layout)
+    if is_int4_paged_kv_cache(paged_kv_cache):
+        _append_paged_kv_cache_int4(
+            append_key,
+            append_value,
+            batch_indices,
+            positions,
+            paged_kv_cache,
+            kv_indices,
+            kv_indptr,
+            kv_layout,
+        )
+        return
     _append_paged_kv_cache_kernel(
         append_key,
         append_value,

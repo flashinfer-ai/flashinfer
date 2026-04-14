@@ -3,6 +3,7 @@ FlashInfer Quantization Module
 ==============================
 
 This module provides quantization functions for various formats:
+- INT4 (grouped packed int4)
 - FP4 (NVFP4, MXFP4)
 - FP8 (MXFP8)
 - Packbits utilities
@@ -12,7 +13,7 @@ Licensed under the Apache License, Version 2.0.
 """
 
 # Re-export packbits functions
-from .packbits import packbits, segment_packbits
+from .packbits import int4_dequantize, int4_quantize, packbits, segment_packbits
 
 # Re-export JIT module generator (used by tests and AOT compilation)
 from ..jit.quantization import gen_quantization_module
@@ -55,6 +56,8 @@ except ImportError:
 
 __all__ = [
     # Packbits
+    "int4_quantize",
+    "int4_dequantize",
     "packbits",
     "segment_packbits",
     # JIT module generator
