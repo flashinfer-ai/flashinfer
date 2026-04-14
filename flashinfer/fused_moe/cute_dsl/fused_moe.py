@@ -55,6 +55,7 @@ import torch
 
 from ...api_logging import flashinfer_api
 from ...autotuner import AutoTuner
+from ...jit.cpp_ext import get_cuda_version
 from ...utils import supported_compute_capability
 from .moe_utils import (
     allocate_moe_sort_buffers,
@@ -188,6 +189,11 @@ def _moe_core_impl(
     # Selects static (decode) or dynamic (prefill) based on token count.
     major, minor = torch.cuda.get_device_capability(x.device)
     if major == 12:
+        if get_cuda_version().major < 13:
+            raise ValueError(
+                "SM120 CuTe DSL fused MoE requires CUDA 13 or later. "
+                f"Current CUDA version: {get_cuda_version()}."
+            )
         from .blackwell_geforce.moe_dispatch import launch_sm120_moe
 
         num_experts_local = (
@@ -433,6 +439,11 @@ class CuteDslMoEWrapper:
         # Detect SM120 for architecture-specific dispatch
         major, minor = torch.cuda.get_device_capability(device)
         self._is_sm120 = major == 12
+        if self._is_sm120 and get_cuda_version().major < 13:
+            raise ValueError(
+                "SM120 CuTe DSL fused MoE requires CUDA 13 or later. "
+                f"Current CUDA version: {get_cuda_version()}."
+            )
 
         # Pre-allocated buffers (SM100 path)
         self._moe_sort_buffers: Optional[Dict[str, torch.Tensor]] = None

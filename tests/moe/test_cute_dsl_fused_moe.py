@@ -54,13 +54,20 @@ def is_sm120_family():
     return props.major == 12
 
 
+def _has_cuda_13():
+    """Check if CUDA runtime version is 13+."""
+    return (
+        torch.version.cuda is not None and int(torch.version.cuda.split(".")[0]) >= 13
+    )
+
+
 # Skip decorators
 cute_dsl_available = pytest.mark.skipif(
     not is_cute_dsl_available(), reason="CuteDSL not available"
 )
 sm100_required = pytest.mark.skipif(
-    not is_sm100_family(),
-    reason="Requires SM100/SM103/SM110 or SM120/SM121 GPU",
+    not is_sm100_family() or (is_sm120_family() and not _has_cuda_13()),
+    reason="Requires SM100/SM103 or SM120/SM121 GPU (SM120 requires CUDA 13+)",
 )
 sm100_only = pytest.mark.skipif(
     is_sm120_family() or not is_sm100_family(),
