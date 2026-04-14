@@ -51,8 +51,8 @@ from ..utils import (
     get_compute_capability,
 )
 from .utils import (
-    get_last_power_of_2_num_tokens_buckets,
-    last_positive_power_of_2,
+    get_hybrid_num_tokens_buckets,
+    map_to_hybrid_bucket,
 )
 
 
@@ -363,8 +363,8 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                 DynamicTensorSpec(
                     (0,),
                     (0,),
-                    get_last_power_of_2_num_tokens_buckets(8192),
-                    lambda x: min(last_positive_power_of_2(x), 8192),
+                    get_hybrid_num_tokens_buckets(8192),
+                    lambda x: map_to_hybrid_bucket(x, 8192),
                 ),
             )
         )
@@ -497,8 +497,8 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                     DynamicTensorSpec(
                         (0,),
                         (0,),
-                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens),
-                        lambda x: min(last_positive_power_of_2(x), tune_max_num_tokens),
+                        get_hybrid_num_tokens_buckets(tune_max_num_tokens),
+                        lambda x: map_to_hybrid_bucket(x, tune_max_num_tokens),
                     ),
                 )
             )
@@ -979,8 +979,8 @@ def get_trtllm_moe_sm100_module():
                 DynamicTensorSpec(
                     (0, 1, 2, 3, 4, 5),
                     (0, 0, 0, 0, 0, 0),
-                    get_last_power_of_2_num_tokens_buckets(8192, 1),
-                    lambda x: min(last_positive_power_of_2(x), 8192),
+                    get_hybrid_num_tokens_buckets(8192, 1),
+                    lambda x: map_to_hybrid_bucket(x, 8192),
                     dynamic_tensor_initializers,
                 ),
             )
@@ -990,8 +990,8 @@ def get_trtllm_moe_sm100_module():
                 DynamicTensorSpec(
                     (0, 1, 2, 3, 4),
                     (0, 0, 0, 0, 0),
-                    get_last_power_of_2_num_tokens_buckets(8192, 1),
-                    lambda x: min(last_positive_power_of_2(x), 8192),
+                    get_hybrid_num_tokens_buckets(8192, 1),
+                    lambda x: map_to_hybrid_bucket(x, 8192),
                     dynamic_tensor_initializers[:5],
                 ),
             ),
@@ -1291,8 +1291,8 @@ def get_trtllm_moe_sm100_module():
                     DynamicTensorSpec(
                         (0, 1, 2, 3, 4, 5),
                         (0, 0, 0, 0, 0, 0),
-                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens, 1),
-                        lambda x: min(last_positive_power_of_2(x), tune_max_num_tokens),
+                        get_hybrid_num_tokens_buckets(tune_max_num_tokens, 1),
+                        lambda x: map_to_hybrid_bucket(x, tune_max_num_tokens),
                         cls.dynamic_tensor_initializers,
                     ),
                 ),
@@ -1303,8 +1303,8 @@ def get_trtllm_moe_sm100_module():
                     DynamicTensorSpec(
                         (0, 1, 2, 3, 4),
                         (0, 0, 0, 0, 0),
-                        get_last_power_of_2_num_tokens_buckets(tune_max_num_tokens, 1),
-                        lambda x: min(last_positive_power_of_2(x), tune_max_num_tokens),
+                        get_hybrid_num_tokens_buckets(tune_max_num_tokens, 1),
+                        lambda x: map_to_hybrid_bucket(x, tune_max_num_tokens),
                         cls.dynamic_tensor_initializers[:5],
                     ),
                 ),

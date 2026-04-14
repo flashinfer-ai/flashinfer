@@ -192,27 +192,102 @@ def nearest_in_buckets(x: int, buckets: List[int]) -> int:
     return min(max(next_positive_power_of_2(x), buckets[0]), buckets[-1])
 
 
-def get_power_of_2_num_tokens_buckets(max_num_tokens) -> Tuple[int]:
-    max_num_tokens = next_positive_power_of_2(max_num_tokens)
-    num_token_buckets = []
-    m = max_num_tokens
-    while m >= 1:
-        num_token_buckets.append(m)
-        m //= 2
-
-    return tuple(num_token_buckets)
+_PHASE1_END = 256
+_PHASE2_STEP = 256
+_PHASE2_END = 2048
+_PHASE3_STEP = 512
+_PHASE3_END = 4096
 
 
-def get_last_power_of_2_num_tokens_buckets(
-    max_num_tokens, min_num_tokens=1
+def _ceil_to_step(x: int, step: int) -> int:
+    return ((x + step - 1) // step) * step
+
+
+def get_hybrid_num_tokens_buckets(
+    max_num_tokens: int, min_num_tokens: int = 1
 ) -> Tuple[int, ...]:
-    max_num_tokens = last_positive_power_of_2(max_num_tokens)
-    num_token_buckets = []
-    m = max_num_tokens
-    while m >= min_num_tokens:
-        num_token_buckets.append(m)
-        m //= 2
-    return tuple(num_token_buckets)
+    """Generate tuning buckets with adaptive spacing.
+
+    Pure power-of-2 spacing creates huge gaps at large values (e.g. 1024
+    between bucket 1024 and 2048).  For MoE workloads the
+    avg_tokens_per_expert can jump across multiple tile boundaries inside a
+    single gap, forcing the autotuner to pick a kernel optimised for a very
+    different workload size.
+
+    This function uses four phases with progressively coarser spacing::
+
+        Phase 1:  [min .. 256]   — power-of-2    (step ×2)
+        Phase 2:  (256 .. 2048]  — linear step 256
+        Phase 3:  (2048 .. 4096] — linear step 512
+        Phase 4:  (4096 .. max]  — power-of-2    (step ×2)
+    """
+    buckets: List[int] = []
+
+    # Phase 1: power-of-2 up to _PHASE1_END
+    m = max(min_num_tokens, 1)
+    while m <= min(max_num_tokens, _PHASE1_END):
+        buckets.append(m)
+        m *= 2
+
+    # Phase 2: linear step 256 in (_PHASE1_END, _PHASE2_END]
+    m = _PHASE1_END + _PHASE2_STEP
+    while m <= min(max_num_tokens, _PHASE2_END):
+        buckets.append(m)
+        m += _PHASE2_STEP
+
+    # Phase 3: linear step 512 in (_PHASE2_END, _PHASE3_END]
+    m = _PHASE2_END + _PHASE3_STEP
+    while m <= min(max_num_tokens, _PHASE3_END):
+        buckets.append(m)
+        m += _PHASE3_STEP
+
+    # Phase 4: power-of-2 beyond _PHASE3_END
+    m = _PHASE3_END * 2
+    while m <= max_num_tokens:
+        buckets.append(m)
+        m *= 2
+
+    if not buckets or buckets[-1] != max_num_tokens:
+        buckets.append(max_num_tokens)
+
+    return tuple(sorted(set(buckets)))
+
+
+def map_to_hybrid_bucket(x: int, max_num_tokens: int) -> int:
+    """Map an arbitrary num_tokens to the nearest hybrid bucket (rounding up).
+
+    Mirrors the four-phase spacing of :func:`get_hybrid_num_tokens_buckets`.
+    The result is clamped to ``[1, max_num_tokens]``.
+    """
+    if x <= 0:
+        return 1
+    if x >= max_num_tokens:
+        return max_num_tokens
+    if x <= _PHASE1_END:
+        return next_positive_power_of_2(x)
+    if x <= _PHASE2_END:
+        return min(_ceil_to_step(x, _PHASE2_STEP), max_num_tokens)
+    if x <= _PHASE3_END:
+        return min(_ceil_to_step(x, _PHASE3_STEP), max_num_tokens)
+    return min(next_positive_power_of_2(x), max_num_tokens)
+
+
+def map_to_hybrid_bucket_uncapped(x: int) -> int:
+    """One-argument variant for use as a function reference in GEMM tuning.
+
+    Same rounding logic as :func:`map_to_hybrid_bucket` but without the
+    ``max_num_tokens`` clamp (the autotuner already handles upper-bound
+    clamping via the generated bucket list).
+    """
+    if x <= 0:
+        return 1
+    if x <= _PHASE1_END:
+        return next_positive_power_of_2(x)
+    if x <= _PHASE2_END:
+        return _ceil_to_step(x, _PHASE2_STEP)
+    if x <= _PHASE3_END:
+        return _ceil_to_step(x, _PHASE3_STEP)
+    return next_positive_power_of_2(x)
 
 
 def get_fp4_shape(input_shape, sf_vec_size, is_swizzled_layout=True):
