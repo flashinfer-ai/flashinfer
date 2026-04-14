@@ -1708,5 +1708,54 @@ swizzled data there produces garbage. Fixed by making the load conditional on
    (Swizzle for 4-byte elements), but needs a different swizzle configuration than
    the bf16 one.
 
-3. **cp_async conflicts** (23.3% aggregated) — unclear which specific buffer(s) contribute
-   most since ncu aggregates all calls through `cp_async_16B` at the same PC.
+- [x] 1. **Move `compute_cumAdt` into `load_data`** (before cp.async wait).
+      `dt_proc` is written synchronously at line 671-677 of `kernel_ssu_incremental.cuh`,
+      so `cumAdt` can be computed immediately after — still inside `load_data`, still
+      by warp 0 (lane shuffles). This moves cumAdt before the Phase 0 `__syncthreads`,
+      so all warps can read `smem.cumAdt` after the sync.
+      Ref: `load_data` in `kernel_ssu_incremental.cuh:542-699`.
+      Ref: `compute_cumAdt` at line 705-715.
+      Ref: kernel main at line 1519-1524 — remove `compute_cumAdt` call from here.
+- [ ] 2. **Rewrite `compute_CB_scaled` to return frag_C in registers**.
+      Currently at `kernel_ssu_incremental.cuh:722-797`.
+      Changes:
+      2.1. Keep the MMA gemm loop (lines 771-778) — unchanged.
+      2.2. Remove the smem write of frag_C → `smem.CB_scaled` (lines 780-785).
+      2.3. Replace the smem elementwise loop (lines 788-796) with the register-only
+           causal mask + decay code described above.
+      2.4. Change return type: function now returns `frag_C` (f32 accumulator tensor).
+      2.5. Change caller: called by every warp using `lane` (not just warp 0).
+      Ref: new function signature, same location (~line 722).
+- [ ] 3. **Move `compute_CB_scaled` call into `compute_and_store_output_cute`**.
+      Currently called in kernel main at line 1525 inside `if (warp == 0)`.
+      Move it inside `compute_and_store_output_cute` (line 1167), called by all warps.
+      Each warp computes CB redundantly (~16 HMMA instructions — negligible cost).
+- [ ] 4. **Add `make_acc_into_op` and apply inside `compute_and_store_output_cute`**.
+      After `compute_CB_scaled` returns frag_C, convert to bf16 A operand:
+      ```cpp
+      auto frag_CB_as_A = detail::SM80::make_acc_into_op<mma_type>(frag_C_cb, tiled_mma_cb);
+      ```
+      Ref: `include/flashinfer/flat/ampere/collective/flat_collective_inverse.hpp:62-69`.
+      Include this header or copy the two functions locally.
+- [ ] 5. **Modify `add_cb_x_cute` to accept register fragment instead of smem load**.
+      Currently at `kernel_ssu_incremental.cuh:1092-1123`.
+      Remove the `cute::copy(s2r_A, smem_CB_s2r, frag_A_view)` load (line 1104).
+      Instead, receive `frag_CB_as_A` as a parameter and use it directly in
+      `cute::gemm(tiled_mma, frag_y, frag_CB_as_A, frag_B_x, frag_y)`.
+      Also remove: `smem_CB_s2r` partition (line 1238 in `compute_and_store_output_cute`),
+      `smem_CB` tensor (lines 1199-1205), `layout_cb` (lines 1200-1203).
+- [ ] 6. **Remove dead code from kernel main function** (lines 1523-1546).
+      The entire `if (warp == 0) { compute_cumAdt; compute_CB_scaled; f32→bf16 convert }`
+      block disappears. cumAdt is now in load_data, CB is now in compute_and_store_output_cute.
+- [ ] 7. **Remove `CB_scaled_mma_buf` from `SsuIncrementalStorage`** (lines 242-248).
+      Remove `CB_MMA_STRIDE` constant (line 247) and the buffer (line 248).
+      Saves 2 KB smem.
+- [ ] 8. **Remove `CB_scaled[NTOKENS_PAD][NTOKENS_PAD]` f32 array** (line 228).
+      Check SIMT path first — `add_cb_out` (line 1314) reads `smem.CB_scaled[t][j]`.
+      If SIMT path still needs it, keep it but gate with `!USE_TENSOR_MMA_STATIC`.
+      The MMA path no longer writes or reads this buffer.
+- [ ] 9. **Verify `__syncthreads` structure**.
+      Sync A (line 1519): still needed — Phase 0 data must be ready.
+      Sync B (line 1555): still needed — state writeback from replay must complete
+      before Phase 2 reads `smem.state`. CB no longer contributes to this sync.
+- [ ] 10. **Test**: `pytest test_ssu_incremental.py -v -s -x`
