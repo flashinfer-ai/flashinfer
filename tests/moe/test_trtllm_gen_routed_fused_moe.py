@@ -739,7 +739,9 @@ def test_fp8_block_scale_moe_routing_replay(
     device = torch.device("cuda:0")
     enable_pdl = device_support_pdl(device)
 
-    routing_logits = torch.rand(num_tokens, num_experts, device=device, dtype=torch.float32)
+    routing_logits = torch.rand(
+        num_tokens, num_experts, device=device, dtype=torch.float32
+    )
     routing_bias = torch.randn(num_experts, device=device, dtype=torch.bfloat16)
 
     hidden_states_bf16 = (
