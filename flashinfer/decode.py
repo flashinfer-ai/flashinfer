@@ -1364,14 +1364,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if rope_theta is None:
             rope_theta = 1e4
 
-        if return_lse:
-            lse_shape = (q.size(0), q.size(1))
-            if lse is None:
-                lse = torch.empty(lse_shape, dtype=torch.float32, device=q.device)
-            else:
-                check_shape_dtype_device(
-                    lse, lse_shape, torch.float32, q.device, "lse"
-                )
+        lse_shape = (q.size(0), q.size(1))
+        if lse is not None:
+            check_shape_dtype_device(lse, lse_shape, torch.float32, q.device, "lse")
+        elif return_lse:
+            lse = torch.empty(lse_shape, dtype=torch.float32, device=q.device)
 
         if out is None:
             out_dtype = getattr(self, "_cached_o_data_type", None) or q.dtype
@@ -1962,14 +1959,13 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
                 out, q_nope.shape, q_nope.dtype, q_nope.device, "out"
             )
 
-        if return_lse:
-            lse_shape = (q_nope.size(0), q_nope.size(1))
-            if lse is None:
-                lse = torch.empty(lse_shape, dtype=torch.float32, device=device)
-            else:
-                check_shape_dtype_device(
-                    lse, lse_shape, q_nope.dtype, q_nope.device, "lse"
-                )
+        lse_shape = (q_nope.size(0), q_nope.size(1))
+        if lse is not None:
+            check_shape_dtype_device(
+                lse, lse_shape, torch.float32, q_nope.device, "lse"
+            )
+        elif return_lse:
+            lse = torch.empty(lse_shape, dtype=torch.float32, device=device)
         self._cached_module.run(
             self._float_workspace_buffer,
             self._int_workspace_buffer,
@@ -2590,14 +2586,11 @@ def trtllm_batch_decode_with_kv_cache(
 
         _check_block_tables_shape(block_tables, uses_shared_paged_kv_idx)
 
-        if return_lse:
-            lse_shape = (query.size(0), query.size(1))
-            if lse is None:
-                lse = torch.empty(lse_shape, dtype=torch.float32, device=query.device)
-            else:
-                check_shape_dtype_device(
-                    lse, lse_shape, torch.float32, query.device, "lse"
-                )
+        lse_shape = (query.size(0), query.size(1))
+        if lse is not None:
+            check_shape_dtype_device(lse, lse_shape, torch.float32, query.device, "lse")
+        elif return_lse:
+            lse = torch.empty(lse_shape, dtype=torch.float32, device=query.device)
 
         run_func(
             out,

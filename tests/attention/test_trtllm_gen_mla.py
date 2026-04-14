@@ -1,7 +1,9 @@
+import random
+import math
+
 import pytest
 import torch
 import torch.nn.functional as F
-import random
 
 import flashinfer
 from flashinfer.mla import (
@@ -471,11 +473,23 @@ def trtllm_batch_decode_mla(
     ckv = kv_cache[..., : layer_dimensions.head_dimensions.kv_lora_rank]
     kpe = kv_cache[..., layer_dimensions.head_dimensions.kv_lora_rank :]
 
+    o_ref = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=False)
     lse_ref = None
     if should_check_lse:
-        o_ref, lse_ref = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=True)
-    else:
-        o_ref = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=False)
+        _, lse_ref = sparse_mla_reference_torch(
+            cache_seqlens=seq_lens_tensor,
+            block_table=block_tables,
+            q=query,
+            blocked_k=kv_cache,
+            blocked_v=ckv,
+            page_size=page_size,
+            is_causal=True,
+            sm_scale=sm_scale,
+        )
+        # TRT-LLM returns log2(LSE); the torch helper returns natural-log LSE.
+        lse_ref = lse_ref.permute(0, 2, 1).contiguous().view(
+            batch_size * q_len_per_request, layer_dimensions.num_heads
+        ).to(lse.device) / math.log(2.0)
 
     # cute-dsl fp8 kernel outputs fp8; cast to bf16 to match trtllm-gen / reference
     if backend == "cute-dsl" and output.dtype == torch.float8_e4m3fn:

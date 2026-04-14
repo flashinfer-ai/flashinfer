@@ -558,14 +558,13 @@ class BatchMLAPagedAttentionWrapper:
                 out, q_nope.shape, q_nope.dtype, q_nope.device, "out"
             )
 
-        if return_lse:
-            lse_shape = (q_nope.shape[0] * num_heads, q_nope.shape[2])
-            if lse is None:
-                lse = torch.empty(lse_shape, dtype=torch.float32, device=device)
-            else:
-                check_shape_dtype_device(
-                    lse, lse_shape, torch.float32, q_nope.device, "lse"
-                )
+        lse_shape = (q_nope.shape[0], num_heads)
+        if lse is not None:
+            check_shape_dtype_device(
+                lse, lse_shape, torch.float32, q_nope.device, "lse"
+            )
+        elif return_lse:
+            lse = torch.empty(lse_shape, dtype=torch.float32, device=device)
         profiler_args = (profiler_buffer,) if self._use_profiler else ()
         self._cached_module.run(
             self._float_workspace_buffer,
@@ -779,14 +778,11 @@ def trtllm_batch_decode_with_kv_cache_mla(
         batch_size = query.size(0)
         max_q_len = query.size(1)
         num_qo_heads = query.size(2)
-        if return_lse:
-            lse_shape = (batch_size * max_q_len, num_qo_heads)
-            if lse is None:
-                lse = torch.empty(lse_shape, dtype=torch.float32, device=query.device)
-            else:
-                check_shape_dtype_device(
-                    lse, lse_shape, torch.float32, query.device, "lse"
-                )
+        lse_shape = (batch_size * max_q_len, num_qo_heads)
+        if lse is not None:
+            check_shape_dtype_device(lse, lse_shape, torch.float32, query.device, "lse")
+        elif return_lse:
+            lse = torch.empty(lse_shape, dtype=torch.float32, device=query.device)
         query = query.flatten(0, 1)  # [B*S, H, D]
 
         run_func(

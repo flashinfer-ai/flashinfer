@@ -365,8 +365,8 @@ void trtllm_paged_attention_decode(
   bool const skips_softmax = skip_softmax_threshold_scale_factor_value != 0.0f;
 
   float* lse_ptr = nullptr;
-  int lse_stride_tokens = 0;
-  int lse_stride_heads = 0;
+  int64_t lse_stride_tokens = 0;
+  int64_t lse_stride_heads = 0;
   if (lse.has_value()) {
     TVM_FFI_ICHECK_EQ(lse.value().dtype(), dl_float32) << "lse must be a float tensor";
     lse_ptr = static_cast<float*>(lse.value().data_ptr());
@@ -499,8 +499,8 @@ void trtllm_paged_attention_context(
   bool const skips_softmax = skip_softmax_threshold_scale_factor_value != 0.0f;
 
   float* lse_ptr = nullptr;
-  int lse_stride_tokens = 0;
-  int lse_stride_heads = 0;
+  int64_t lse_stride_tokens = 0;
+  int64_t lse_stride_heads = 0;
   if (lse.has_value()) {
     TVM_FFI_ICHECK_EQ(lse.value().dtype(), dl_float32) << "lse must be a float tensor";
     lse_ptr = static_cast<float*>(lse.value().data_ptr());

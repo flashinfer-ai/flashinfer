@@ -36,6 +36,16 @@ workspace_size = 256 * 1024 * 1024
 TRTLLM_GEN_WORKSPACE_CHECK_BYTES = 8192 * 256 * 4
 
 
+def get_lse_test_tolerances(q_dtype: str, kv_dtype: str) -> tuple[float, float]:
+    # TRT-LLM's FP8 prefill/decode LSE is noisier than the high-precision wrapper
+    # reference even when the output tensors still agree within the existing tolerances.
+    if kv_dtype == "nvfp4":
+        return 3e-1, 3e-1
+    if q_dtype == "fp8" or kv_dtype == "fp8":
+        return 2e-2, 2e-2
+    return 1e-3, 1e-3
+
+
 def flip_coin(*args, **kwargs):
     # Use any test parameters to deterministically decide branch
     # This makes test configurations go through different paths
@@ -656,6 +666,11 @@ def _test_trtllm_batch_prefill(
         softmax_end_bytes + TRTLLM_GEN_WORKSPACE_CHECK_BYTES, workspace_buffer.numel()
     )
     workspace_buffer[softmax_end_bytes:workspace_check_end_bytes].zero_()
+    provided_lse = torch.empty(
+        (q_input.size(0), q_input.size(1)),
+        device=GPU_DEVICE,
+        dtype=torch.float32,
+    )
 
     output, lse = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
         q_input,
@@ -681,6 +696,7 @@ def _test_trtllm_batch_prefill(
         kv_cache_sf=kv_cache_sf_kernel,
         skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+        lse=provided_lse,
         return_lse=True,
     )
     assert (
@@ -735,11 +751,13 @@ def _test_trtllm_batch_prefill(
         )
 
     expected_lse_shape = (q_input.size(0), q_input.size(1))
+    assert lse is provided_lse
     assert lse.shape == expected_lse_shape
     assert lse.dtype == torch.float32
     assert torch.isfinite(lse).all()
     if lse_ref is not None:
-        torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
+        lse_rtol, lse_atol = get_lse_test_tolerances(q_dtype, kv_dtype)
+        torch.testing.assert_close(lse, lse_ref, rtol=lse_rtol, atol=lse_atol)
 
     if (
         o_dtype != "nvfp4" and kv_dtype != "nvfp4" and uses_shared_paged_kv_idx
@@ -1131,6 +1149,15 @@ def _test_trtllm_batch_decode(
         q_input = make_query_non_contiguous(q, num_qo_heads, head_dim)
     else:
         q_input = q.contiguous()
+    provided_lse = (
+        torch.empty(
+            (q_input.size(0), q_input.size(1)),
+            device=GPU_DEVICE,
+            dtype=torch.float32,
+        )
+        if should_check_lse
+        else None
+    )
 
     # Using a tiny threshold should give the same result as normal attention.
     skip_softmax_threshold_scale_factor = 1e-30 if skips_softmax else None
@@ -1161,10 +1188,15 @@ def _test_trtllm_batch_decode(
         skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         kv_cache_sf=kv_cache_sf_kernel,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+        lse=provided_lse,
         return_lse=should_check_lse,
     )
     if should_check_lse:
         output, lse = output
+        assert lse is provided_lse
+        assert lse.shape == (q_input.size(0), q_input.size(1))
+        assert lse.dtype == torch.float32
+        assert torch.isfinite(lse).all()
     if backend == "trtllm-gen":
         # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
         # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
@@ -1229,7 +1261,8 @@ def _test_trtllm_batch_decode(
         )
     if lse_ref is not None:
         assert lse is not None, "LSE should be returned when return_lse=True"
-        torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
+        lse_rtol, lse_atol = get_lse_test_tolerances(q_dtype, kv_dtype)
+        torch.testing.assert_close(lse, lse_ref, rtol=lse_rtol, atol=lse_atol)
 
     # Only test wrapper with trtllm-gen backend
     if (

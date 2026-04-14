@@ -225,9 +225,9 @@ struct TllmGenFmhaRunnerParams {
   // The LSE buffer.
   float* lsePtr;
   // The stride between different tokens for LSE.
-  int lseStrideTokens;
+  int64_t lseStrideTokens;
   // The stride between different heads for LSE.
-  int lseStrideHeads;
+  int64_t lseStrideHeads;
 
   // Attention sink
   float const* ptrAttentionSinks{nullptr};
