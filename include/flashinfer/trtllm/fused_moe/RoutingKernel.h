@@ -109,6 +109,12 @@ struct DataBase {
   int32_t mSharedExpertTokenOffset;
   int32_t mSharedExpertNumTokens;
   int32_t mTotalExpertsPerToken;
+
+  // optional: if nullptr, no routing replay recording occurs
+  // dim: [mNumTokens, mTopK]
+  // Records the selected expert IDs per token for replay
+  // NOTE: placed at end of struct to preserve field offsets for existing routing kernels
+  int16_t* mPtrRoutingReplayOut{nullptr};
 };
 
 template <typename InputT_, typename OutputT_, int MaxNumExperts_, int MaxNumTopExperts_>
@@ -149,6 +155,9 @@ struct KernelParamsBase {
   int32_t mSharedExpertNumTokens = 0;
   int32_t mTotalExpertsPerToken = 0;
 
+  // NOTE: placed at end to preserve field offsets for existing routing kernels
+  int16_t* mPtrRoutingReplayOut = nullptr;
+
   // Public initialization function - make it a template to accept different Data types
   template <typename DataType>
   void setBaseParams(DataType const& data) {
@@ -165,6 +174,7 @@ struct KernelParamsBase {
     mPtrTopKWeights = static_cast<OutputT*>(data.mPtrTopKWeights);
     mPtrTopKIds = static_cast<int32_t*>(data.mPtrTopKIds);
     mPtrScores = (InputT const*)data.mPtrScores;
+    mPtrRoutingReplayOut = data.mPtrRoutingReplayOut;
 
     mNumTokens = data.mNumTokens;
     mNumExperts = data.mNumExperts;

@@ -356,6 +356,12 @@ __global__ void routingMainKernel(KernelParams params) {
       if (laneIdx < params.mNumFusedSharedExperts && params.mPtrTopKWeights != nullptr) {
         params.mPtrTopKWeights[idxShared] = static_cast<OutputT>(1.0F);
       }
+
+      // Routing replay: record all top-K selected expert IDs per token.
+      // Layout: [num_tokens, topK] -- same indexing as mPtrTopKPacked.
+      if (params.mPtrRoutingReplayOut != nullptr && laneIdx < params.mTopK) {
+        params.mPtrRoutingReplayOut[idxTopK] = static_cast<int16_t>(expertIdx);
+      }
     }
   }
 
