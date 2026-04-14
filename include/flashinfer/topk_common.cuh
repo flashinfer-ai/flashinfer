@@ -6,12 +6,8 @@
 #include <numeric>
 #include <type_traits>
 
-
 namespace flashinfer {
 namespace sampling {
-
-
-
 
 // ============================================================================
 // RadixTopK Type Traits - supports float, half, and bfloat16
@@ -103,4 +99,4 @@ struct RadixTopKTraits<nv_bfloat16> {
 }  // namespace sampling
 }  // namespace flashinfer
 
-#endif // FLASHINFER_TOPK_COMMON_CUH_
+#endif  // FLASHINFER_TOPK_COMMON_CUH_
