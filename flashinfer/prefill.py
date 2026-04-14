@@ -4111,11 +4111,10 @@ def trtllm_batch_context_with_kv_cache(
     _check_block_tables_shape(block_tables, uses_shared_paged_kv_idx)
     workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
     lse_shape = (query.size(0), query.size(1))
-    if lse is None:
-        if return_lse:
-            lse = torch.empty(lse_shape, dtype=torch.float32, device=query.device)
-    else:
+    if lse is not None:
         check_shape_dtype_device(lse, lse_shape, torch.float32, query.device, "lse")
+    elif return_lse:
+        lse = torch.empty(lse_shape, dtype=torch.float32, device=query.device)
     run_func(
         out,
         out_scale_factor,
