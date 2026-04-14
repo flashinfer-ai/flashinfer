@@ -184,6 +184,42 @@ def _moe_core_impl(
     num_tokens = token_selected_experts.size(0)
     hidden_size = w2_weight.size(1)
 
+    # SM120/SM121: dispatch to fused kernel (route+pack+FC1+FC2 in one launch).
+    # Selects static (decode) or dynamic (prefill) based on token count.
+    major, minor = torch.cuda.get_device_capability(x.device)
+    if major == 12:
+        from .blackwell_geforce.moe_dispatch import launch_sm120_moe
+
+        num_experts_local = (
+            num_local_experts if num_local_experts is not None else num_experts
+        )
+
+        if moe_output is None:
+            moe_output = torch.empty(
+                (num_tokens, hidden_size),
+                dtype=output_dtype,
+                device=x.device,
+            )
+
+        # SM120 kernel takes bf16 input (it fuses route+pack+quantize internally).
+        # The caller passes x_bf16 through _moe_core_impl's x parameter.
+        return launch_sm120_moe(
+            a=x,  # bf16 [num_tokens, hidden_size]
+            topk_ids=token_selected_experts,
+            topk_weights=token_final_scales,
+            w1_weight=w1_weight,
+            w1_weight_sf=w1_weight_sf,
+            w1_alpha=w1_alpha,
+            fc2_input_scale=fc2_input_scale,
+            w2_weight=w2_weight,
+            w2_weight_sf=w2_weight_sf,
+            w2_alpha=w2_alpha,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_experts_local,
+            scatter_output=moe_output,
+        )
+
     # Allocate output if not provided.  The caller (wrapper or functional
     # API) should pass a [:num_tokens] slice of the pre-allocated buffer
     # when using CUDA graphs.  The buffer is zeroed in Step 3 below.
@@ -339,7 +375,7 @@ class CuteDslMoEWrapper:
         ...     output = moe.run(x, x_sf, topk_ids, topk_weights, w1, w1_sf, ...)
     """
 
-    @supported_compute_capability([100, 103])
+    @supported_compute_capability([100, 103, 120, 121])
     @flashinfer_api
     def __init__(
         self,
@@ -388,7 +424,11 @@ class CuteDslMoEWrapper:
         self.device = device
         self.enable_pdl = enable_pdl
 
-        # Pre-allocated buffers
+        # Detect SM120 for architecture-specific dispatch
+        major, minor = torch.cuda.get_device_capability(device)
+        self._is_sm120 = major == 12
+
+        # Pre-allocated buffers (SM100 path)
         self._moe_sort_buffers: Optional[Dict[str, torch.Tensor]] = None
         self._gemm1_output: Optional[torch.Tensor] = None
         self._gemm1_output_scale: Optional[torch.Tensor] = None
@@ -397,7 +437,11 @@ class CuteDslMoEWrapper:
         self._main_event: Optional[torch.cuda.Event] = None
         self._memset_event: Optional[torch.cuda.Event] = None
 
-        # Create auto-tuner runner
+        # Pre-allocated objects (SM120 path)
+        self._sm120_workspace: object = None
+        self._sm120_weight_views: object = None
+
+        # Create auto-tuner runner (SM100 path only — SM120 bypasses autotuner)
         self._runner = CuteDslFusedMoENvfp4Runner(
             forward_impl=self._forward_with_tactic,
             num_experts=num_experts,
@@ -414,47 +458,76 @@ class CuteDslMoEWrapper:
 
     def _allocate_buffers(self) -> None:
         """Pre-allocate all buffers for CUDA graph compatibility."""
-        max_num_permuted_tokens = get_max_num_permuted_tokens(
-            self.max_num_tokens, self.top_k, self.num_local_experts, self.tile_size
-        )
-
-        # moe_sort buffers
-        self._moe_sort_buffers = allocate_moe_sort_buffers(
-            num_tokens=self.max_num_tokens,
-            num_experts=self.num_experts,
-            top_k=self.top_k,
-            num_local_experts=self.num_local_experts,
-            tile_tokens_dim=self.tile_size,
-            device=self.device,
-        )
-
-        # GEMM1 output (FP4 quantized)
-        self._gemm1_output = torch.empty(
-            (max_num_permuted_tokens, self.intermediate_size // 2),
-            dtype=torch.uint8,
-            device=self.device,
-        )
-
-        # GEMM1 output scale
-        scale_size = max_num_permuted_tokens * (
-            self.intermediate_size // self.sf_vec_size
-        )
-        self._gemm1_output_scale = torch.empty(
-            (scale_size,), dtype=torch.uint8, device=self.device
-        )
-
-        # Final output — sliced to [:num_tokens] before each forward pass,
-        # then zeroed before GEMM2 finalize, typically on aux_stream.
+        # Final output — shared by both SM100 and SM120 paths.
         self._moe_output = torch.empty(
             (self.max_num_tokens, self.hidden_size),
             dtype=self.output_dtype,
             device=self.device,
         )
 
-        # CUDA resources
-        self._aux_stream = torch.cuda.Stream(device=self.device)
-        self._main_event = torch.cuda.Event()
-        self._memset_event = torch.cuda.Event()
+        if self._is_sm120:
+            # SM120: pre-allocate workspace for the fused kernel.
+            from .blackwell_geforce.moe_dispatch import (
+                allocate_sm120_static_workspace,
+                allocate_sm120_dynamic_workspace,
+                select_sm120_moe_backend,
+            )
+
+            max_routed_rows = self.max_num_tokens * self.top_k
+            backend = select_sm120_moe_backend(
+                num_tokens=self.max_num_tokens, num_topk=self.top_k
+            )
+            if backend == "dynamic":
+                self._sm120_workspace = allocate_sm120_dynamic_workspace(
+                    state_E=self.num_local_experts,
+                    weight_E=self.num_experts,
+                    routed_rows=max_routed_rows,
+                    k=self.hidden_size,
+                    n=self.intermediate_size,
+                    num_topk=self.top_k,
+                    device=torch.device(self.device),
+                )
+            else:
+                self._sm120_workspace = allocate_sm120_static_workspace(
+                    state_E=self.num_local_experts,
+                    weight_E=self.num_experts,
+                    max_rows=max(1, max_routed_rows),
+                    k=self.hidden_size,
+                    n=self.intermediate_size,
+                    num_topk=self.top_k,
+                    device=torch.device(self.device),
+                )
+        else:
+            # SM100/103: pre-allocate sort and intermediate buffers.
+            max_num_permuted_tokens = get_max_num_permuted_tokens(
+                self.max_num_tokens, self.top_k, self.num_local_experts, self.tile_size
+            )
+
+            self._moe_sort_buffers = allocate_moe_sort_buffers(
+                num_tokens=self.max_num_tokens,
+                num_experts=self.num_experts,
+                top_k=self.top_k,
+                num_local_experts=self.num_local_experts,
+                tile_tokens_dim=self.tile_size,
+                device=self.device,
+            )
+
+            self._gemm1_output = torch.empty(
+                (max_num_permuted_tokens, self.intermediate_size // 2),
+                dtype=torch.uint8,
+                device=self.device,
+            )
+
+            scale_size = max_num_permuted_tokens * (
+                self.intermediate_size // self.sf_vec_size
+            )
+            self._gemm1_output_scale = torch.empty(
+                (scale_size,), dtype=torch.uint8, device=self.device
+            )
+
+            self._aux_stream = torch.cuda.Stream(device=self.device)
+            self._main_event = torch.cuda.Event()
+            self._memset_event = torch.cuda.Event()
 
     def _forward_with_tactic(
         self,
@@ -546,6 +619,7 @@ class CuteDslMoEWrapper:
         w2_weight_sf: torch.Tensor,
         w2_alpha: torch.Tensor,
         tactic: Optional[Tuple] = None,
+        x_bf16: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run MoE computation.
 
@@ -565,6 +639,9 @@ class CuteDslMoEWrapper:
             w2_weight_sf: Scale factors for w2_weight.
             w2_alpha: Per-expert global scale for GEMM2.
             tactic: Tactic tuple or None for auto-selection.
+            x_bf16: Original bf16 activations [num_tokens, hidden_size].
+                Required on SM120 where the kernel fuses quantization.
+                Ignored on SM100/SM103.
 
         Returns:
             Output tensor [num_tokens, hidden_size].
@@ -587,7 +664,51 @@ class CuteDslMoEWrapper:
                 device=x.device,
             )
 
-        # Use auto-tuner for tactic selection
+        # SM120: dispatch directly to fused kernel with pre-allocated workspace
+        if self._is_sm120:
+            if x_bf16 is None:
+                raise ValueError(
+                    "SM120 CuteDslMoEWrapper.run() requires x_bf16 parameter "
+                    "(original bf16 activations)."
+                )
+            from .blackwell_geforce.moe_dispatch import (
+                launch_sm120_moe,
+                _get_weight_views as _get_sm120_weight_views,
+            )
+
+            # Cache weight views on first call
+            if self._sm120_weight_views is None:
+                self._sm120_weight_views = _get_sm120_weight_views(
+                    w1_fp4=w1_weight,
+                    w1_blockscale=w1_weight_sf,
+                    w2_fp4=w2_weight,
+                    w2_blockscale=w2_weight_sf,
+                    w1_alphas=w1_alpha,
+                    w2_alphas=w2_alpha,
+                    n=self.intermediate_size,
+                    k=self.hidden_size,
+                )
+
+            return launch_sm120_moe(
+                a=x_bf16,
+                topk_ids=token_selected_experts,
+                topk_weights=token_final_scales,
+                w1_weight=w1_weight,
+                w1_weight_sf=w1_weight_sf,
+                w1_alpha=w1_alpha,
+                fc2_input_scale=fc2_input_scale,
+                w2_weight=w2_weight,
+                w2_weight_sf=w2_weight_sf,
+                w2_alpha=w2_alpha,
+                num_experts=self.num_experts,
+                top_k=self.top_k,
+                num_local_experts=self.num_local_experts,
+                scatter_output=moe_output,
+                _workspace=self._sm120_workspace,
+                _weight_views=self._sm120_weight_views,
+            )
+
+        # SM100/103: use auto-tuner
         tuner = AutoTuner.get()
 
         inputs = [
@@ -606,10 +727,8 @@ class CuteDslMoEWrapper:
         ]
 
         if tactic is not None:
-            # Use provided tactic
             return self._runner(inputs, tactic=tactic)
 
-        # Let tuner choose tactic
         _, best_tactic = tuner.choose_one(
             "CuteDslMoEWrapper::run",
             [self._runner],
@@ -686,7 +805,7 @@ def _cute_dsl_fused_moe_nvfp4_impl(
     )
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([100, 103, 120, 121])
 @flashinfer_api
 def cute_dsl_fused_moe_nvfp4(
     x: torch.Tensor,
@@ -709,10 +828,11 @@ def cute_dsl_fused_moe_nvfp4(
     moe_output: Optional[torch.Tensor] = None,
     aux_stream: Optional[torch.cuda.Stream] = None,
     enable_pdl: bool = True,
+    x_bf16: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Run fused MoE computation using CuteDSL NVFP4 kernels.
 
-    Supported architectures: SM100, SM103.
+    Supported architectures: SM100, SM103, SM120, SM121.
 
     This is the simple functional API. For CUDA graph support, use
     `CuteDslMoEWrapper` instead.
@@ -742,6 +862,9 @@ def cute_dsl_fused_moe_nvfp4(
         use_fused_finalize: Use fused finalize. Default: True.
         moe_output: Pre-allocated output buffer.
         aux_stream: Auxiliary CUDA stream.
+        x_bf16: Original bf16 activations [num_tokens, hidden_size]. Required
+            on SM120/SM121 where the kernel fuses quantization internally.
+            Ignored on SM100/SM103.
 
     Returns:
         Output tensor [num_tokens, hidden_size].
@@ -757,6 +880,36 @@ def cute_dsl_fused_moe_nvfp4(
             (num_tokens, hidden_size),
             dtype=output_dtype,
             device=x.device,
+        )
+
+    # SM120/SM121: dispatch to fused static kernel (bypasses autotuner)
+    major, _ = torch.cuda.get_device_capability(x.device)
+    if major == 12:
+        if x_bf16 is None:
+            raise ValueError(
+                "SM120/SM121 cute_dsl_fused_moe_nvfp4 requires x_bf16 parameter "
+                "(original bf16 activations). The SM120 kernel fuses quantization "
+                "internally and cannot accept pre-quantized FP4 input."
+            )
+        return _moe_core_impl(
+            x=x_bf16,
+            x_sf=x_sf,
+            token_selected_experts=token_selected_experts,
+            token_final_scales=token_final_scales,
+            w1_weight=w1_weight,
+            w1_weight_sf=w1_weight_sf,
+            w1_alpha=w1_alpha,
+            fc2_input_scale=fc2_input_scale,
+            w2_weight=w2_weight,
+            w2_weight_sf=w2_weight_sf,
+            w2_alpha=w2_alpha,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+            local_expert_offset=local_expert_offset,
+            moe_output=moe_output,
+            output_dtype=output_dtype,
+            enable_pdl=enable_pdl,
         )
 
     tuner = AutoTuner.get()

@@ -36,14 +36,22 @@ from flashinfer.cute_dsl import is_cute_dsl_available
 
 
 def is_sm100_family():
-    """Check for SM100 family (Blackwell: SM100, SM103).
+    """Check for SM100 family (Blackwell: SM100, SM103) or SM120 family (SM120, SM121).
 
-    CuteDSL MoE NVFP4 kernels are optimized for SM10x architecture.
+    CuteDSL MoE NVFP4 kernels support SM10x and SM12x architectures.
     """
     if not torch.cuda.is_available():
         return False
     props = torch.cuda.get_device_properties(0)
-    return props.major == 10
+    return props.major in (10, 12)
+
+
+def is_sm120_family():
+    """Check for SM120 family (SM120, SM121)."""
+    if not torch.cuda.is_available():
+        return False
+    props = torch.cuda.get_device_properties(0)
+    return props.major == 12
 
 
 # Skip decorators
@@ -52,7 +60,11 @@ cute_dsl_available = pytest.mark.skipif(
 )
 sm100_required = pytest.mark.skipif(
     not is_sm100_family(),
-    reason="Requires SM100 family GPU (Blackwell: SM100, SM103, SM110)",
+    reason="Requires SM100/SM103/SM110 or SM120/SM121 GPU",
+)
+sm100_only = pytest.mark.skipif(
+    is_sm120_family() or not is_sm100_family(),
+    reason="Requires SM100 family GPU (wrapper/tactics not yet ported to SM120)",
 )
 
 
@@ -235,10 +247,15 @@ def create_moe_tensors(
         / 10
     )
 
-    w1_bf16_interleaved = interleave_linear_and_gate(w1_bf16, group_size=64, dim=1)
+    # SM100/103: interleave gate/up for CuTe DSL SwiGLU epilogue (group_size=64)
+    # SM120/121: no interleave — kernel expects [up_0:N, gate_0:N] (contiguous cat)
+    if is_sm120_family():
+        w1_bf16_prepared = w1_bf16  # b12x kernel: non-interleaved
+    else:
+        w1_bf16_prepared = interleave_linear_and_gate(w1_bf16, group_size=64, dim=1)
     w1_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
 
-    w1_flat = w1_bf16_interleaved.view(
+    w1_flat = w1_bf16_prepared.view(
         num_local_experts * 2 * intermediate_size, hidden_size
     )
     w1_q_flat, w1_sf_flat = fp4_quantize(
@@ -377,6 +394,7 @@ class TestCuteDslFusedMoeFunctional:
             num_experts=num_experts,
             top_k=top_k,
             num_local_experts=num_local_experts,
+            x_bf16=tensors["x_bf16"],
         )
 
         assert result.shape == (num_tokens, hidden_size)
@@ -435,6 +453,7 @@ class TestCuteDslFusedMoeFunctional:
                 w2_alpha=tensors["w2_alpha"],
                 num_experts=num_experts,
                 top_k=top_k,
+                x_bf16=tensors["x_bf16"],
             )
 
         assert result.shape == (num_tokens, hidden_size)
@@ -447,7 +466,7 @@ class TestCuteDslFusedMoeFunctional:
 
 
 @cute_dsl_available
-@sm100_required
+@sm100_only
 class TestCuteDslMoEWrapper:
     """Tests for the wrapper API: CuteDslMoEWrapper."""
 
@@ -692,7 +711,7 @@ class TestCuteDslMoEWrapper:
 
 
 @cute_dsl_available
-@sm100_required
+@sm100_only
 class TestApiConsistency:
     """Tests verifying consistency between functional and wrapper APIs."""
 
@@ -727,6 +746,7 @@ class TestApiConsistency:
             w2_alpha=tensors["w2_alpha"],
             num_experts=num_experts,
             top_k=top_k,
+            x_bf16=tensors["x_bf16"],
         )
 
         # Wrapper API
@@ -771,7 +791,7 @@ class TestApiConsistency:
 
 
 @cute_dsl_available
-@sm100_required
+@sm100_only
 class TestExpertParallelism:
     """Tests for expert parallelism (EP) configurations."""
 
@@ -895,6 +915,7 @@ class TestExpertParallelism:
             top_k=top_k,
             num_local_experts=num_local_experts,
             local_expert_offset=local_expert_offset,
+            x_bf16=tensors["x_bf16"],
         )
 
         assert result.shape == (num_tokens, hidden_size)
@@ -931,7 +952,7 @@ class TestExpertParallelism:
 
 
 @cute_dsl_available
-@sm100_required
+@sm100_only
 class TestAllValidTactics:
     """Test that every tactic returned by get_valid_tactics produces correct output.
 

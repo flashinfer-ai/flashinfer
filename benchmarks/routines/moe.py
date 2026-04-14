@@ -1196,7 +1196,9 @@ def _create_cute_dsl_moe_test_data(
     routing_weights, selected_experts = compute_routing(routing_logits, top_k)
     selected_experts = selected_experts.to(torch.int32)
 
-    # GEMM1 weights (gate + up, interleaved for CuteDSL SwiGLU)
+    # GEMM1 weights (gate + up)
+    # SM100/103: interleaved in 64-row groups for CuTe DSL SwiGLU epilogue
+    # SM120/121: non-interleaved [up_0:N, gate_0:N] for b12x fused kernel
     w1_bf16 = (
         torch.randn(
             num_local_experts,
@@ -1207,9 +1209,13 @@ def _create_cute_dsl_moe_test_data(
         )
         / 10
     )
-    w1_bf16_interleaved = _interleave_linear_and_gate(w1_bf16, group_size=64, dim=1)
+    sm_major = torch.cuda.get_device_capability(device)[0]
+    if sm_major == 12:
+        w1_bf16_prepared = w1_bf16  # SM120: non-interleaved
+    else:
+        w1_bf16_prepared = _interleave_linear_and_gate(w1_bf16, group_size=64, dim=1)
     w1_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
-    w1_flat = w1_bf16_interleaved.view(
+    w1_flat = w1_bf16_prepared.view(
         num_local_experts * 2 * intermediate_size, hidden_size
     )
     w1_q_flat, w1_sf_flat = fp4_quantize(
@@ -1257,6 +1263,7 @@ def _create_cute_dsl_moe_test_data(
 
     return {
         "x": x_quantized,
+        "x_bf16": x_bf16,
         "x_sf": x_sf,
         "token_selected_experts": selected_experts,
         "token_final_scales": routing_weights,
@@ -1361,6 +1368,7 @@ def testCuteDslFp4BlockScaleMoe(args):
         w2_weight,
         w2_weight_sf,
         w2_alpha,
+        x_bf16=None,
     ):
         return moe.run(
             x=x,
@@ -1374,6 +1382,7 @@ def testCuteDslFp4BlockScaleMoe(args):
             w2_weight=w2_weight,
             w2_weight_sf=w2_weight_sf,
             w2_alpha=w2_alpha,
+            x_bf16=x_bf16,
         )
 
     input_args = (
@@ -1388,6 +1397,7 @@ def testCuteDslFp4BlockScaleMoe(args):
         tensors["w2_weight"],
         tensors["w2_weight_sf"],
         tensors["w2_alpha"],
+        tensors["x_bf16"],
     )
 
     # Snapshot active expert count before any kernel execution, since
