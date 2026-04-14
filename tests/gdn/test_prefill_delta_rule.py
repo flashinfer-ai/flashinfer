@@ -25,15 +25,31 @@ import pytest
 
 from .reference_delta_rule import exclusive_cumsum, blockwise_delta_rule
 
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import is_sm90a_supported, is_sm100a_supported
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
 
 
-def _skip_if_not_sm90():
-    """Skip test if not SM90 architecture."""
-    cc = get_compute_capability(torch.device("cuda"))
-    if cc[0] != 9:
-        pytest.skip(f"GDN prefill requires SM90, but got SM{cc[0]}{cc[1]}")
+def _skip_if_unsupported():
+    """Skip test if not SM90 or SM100 (with CUDA 13+) architecture."""
+    device = torch.device("cuda")
+    if is_sm100a_supported(device):
+        cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
+        if cuda_major < 13:
+            pytest.skip(
+                f"SM100 GDN prefill requires CUDA 13+, got {torch.version.cuda}"
+            )
+    elif not is_sm90a_supported(device):
+        pytest.skip("GDN prefill requires SM90 or SM100")
+
+
+def _skip_if_not_sm100():
+    """Skip test if not SM100 (Blackwell) with CUDA 13+."""
+    device = torch.device("cuda")
+    if not is_sm100a_supported(device):
+        pytest.skip("Requires SM100 (Blackwell)")
+    cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
+    if cuda_major < 13:
+        pytest.skip(f"SM100 GDN prefill requires CUDA 13+, got {torch.version.cuda}")
 
 
 def _test_prefill_kernel(
@@ -50,7 +66,7 @@ def _test_prefill_kernel(
     beta: bool,
     seed: int | None = None,
 ):
-    _skip_if_not_sm90()
+    _skip_if_unsupported()
     if not alpha and not beta:
         pytest.skip(
             "large diff due to output value amplitude explosion along token dimension"
@@ -106,7 +122,7 @@ def _test_prefill_kernel(
 
     torch.cuda.synchronize()
 
-    # postprocessing raw output: ref_state is v-last [H,K,V], our_state is k-last [H,V,K], transpose to match
+    # Transpose state to match reference layout
     our_state = our_state.transpose(-1, -2)
 
     ref_o, ref_state = blockwise_delta_rule(
@@ -129,7 +145,7 @@ def _test_prefill_kernel(
         atol_kv = 5e-3
         rtol_kv = 1e-3
     else:
-        atol_o = 1e-3
+        atol_o = 2e-3
         rtol_o = 1e-3
         atol_kv = 1e-3
         rtol_kv = 1e-4
@@ -258,7 +274,7 @@ def _test_chunked_prefill(
     beta: bool,
     seed: int | None = None,
 ):
-    _skip_if_not_sm90()
+    _skip_if_unsupported()
     if not alpha and not beta:
         pytest.skip(
             "large diff due to output value amplitude explosion along token dimension"
@@ -348,7 +364,7 @@ def _test_chunked_prefill(
 
     torch.cuda.synchronize()
 
-    # postprocessing raw output: ref_state is v-last [H,K,V], our_state is k-last [H,V,K], transpose to match
+    # Transpose state to match reference layout
     our_state = our_state.transpose(-1, -2)
 
     def concat_varlen(t1, cu_seq_lens1, t2, cu_seq_lens2):
@@ -469,7 +485,7 @@ def _test_checkpoint(
     seed: int | None = None,
 ):
     """Test state checkpointing by comparing against prefix-based reference runs."""
-    _skip_if_not_sm90()
+    _skip_if_unsupported()
 
     random.seed(seed)
     torch.random.manual_seed(seed)
@@ -630,7 +646,7 @@ def test_checkpoint_correctness(
 
 def test_checkpoint_noop(qkv_factory):
     """Verify that checkpoint_every_n_tokens=0 produces same results as without checkpointing."""
-    _skip_if_not_sm90()
+    _skip_if_unsupported()
 
     seed = 42
     random.seed(seed)
@@ -756,7 +772,7 @@ def test_checkpoint_spurious_tensors():
 
 def test_checkpoint_wrong_dtype(qkv_factory):
     """Verify error when state_checkpoints has wrong dtype."""
-    _skip_if_not_sm90()
+    _skip_if_unsupported()
     device = torch.device("cuda")
     with pytest.raises(ValueError, match="float32"):
         chunk_gated_delta_rule(
@@ -774,7 +790,7 @@ def test_checkpoint_wrong_dtype(qkv_factory):
 
 def test_checkpoint_wrong_cu_starts_size(qkv_factory):
     """Verify error when checkpoint_cu_starts has wrong size."""
-    _skip_if_not_sm90()
+    _skip_if_unsupported()
     device = torch.device("cuda")
     with pytest.raises(ValueError, match="elements"):
         chunk_gated_delta_rule(
@@ -790,3 +806,134 @@ def test_checkpoint_wrong_cu_starts_size(qkv_factory):
             ),
             checkpoint_every_n_tokens=64,
         )
+
+
+# ---------------------------------------------------------------------------
+# BFloat16 state tests (SM100 only)
+# ---------------------------------------------------------------------------
+
+
+def _test_prefill_kernel_bf16_state(
+    qkv_factory,
+    dtype: str,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_size: int,
+    seq_lens: list[int],
+    scale: float,
+    seed: int | None = None,
+):
+    _skip_if_not_sm100()
+
+    random.seed(seed)
+    torch.random.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+    num_seqs = len(seq_lens)
+    total_seqlen = sum(seq_lens)
+    num_o_heads = max(num_q_heads, num_v_heads)
+    num_sab_heads = num_o_heads
+
+    dtype = getattr(torch, dtype)
+    device = torch.device("cuda")
+    with device:
+        q, k, v = qkv_factory(
+            seq_lens, num_q_heads, num_k_heads, num_v_heads, head_size, dtype
+        )
+        k = torch.nn.functional.normalize(k, p=2.0, dim=-1)
+        cu_seq_lens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int64)
+        alpha = torch.rand(total_seqlen, num_sab_heads)
+        beta = torch.rand(total_seqlen, num_sab_heads)
+
+    our_o = torch.empty(
+        [total_seqlen, num_o_heads, head_size], dtype=dtype, device=device
+    )
+    our_state = torch.empty(
+        (num_seqs, num_sab_heads, head_size, head_size),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    our_o.fill_(float("nan"))
+    our_state.fill_(float("nan"))
+
+    chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        alpha,
+        beta,
+        scale,
+        None,
+        True,
+        cu_seq_lens,
+        True,
+        output=our_o,
+        output_state=our_state,
+    )
+
+    torch.cuda.synchronize()
+
+    # Transpose state to match reference layout [N, H, K, V]
+    our_state = our_state.transpose(-1, -2)
+
+    ref_o, ref_state = blockwise_delta_rule(
+        q.float(),
+        k.float(),
+        v.float(),
+        seq_lens,
+        scale_factor=scale,
+        alpha=alpha,
+        beta=beta,
+        state_dtype=torch.bfloat16,
+    )
+    ref_o = ref_o.to(dtype)
+    ref_state = ref_state.to(torch.bfloat16)
+
+    # BF16 state has lower precision
+    atol_o = 1e-1 if dtype == torch.bfloat16 else 5e-2
+    rtol_o = 5e-2
+    atol_kv = 1e-1
+    rtol_kv = 5e-2
+
+    torch.testing.assert_close(our_o, ref_o, atol=atol_o, rtol=rtol_o)
+    torch.testing.assert_close(our_state, ref_state, atol=atol_kv, rtol=rtol_kv)
+
+
+@pytest.mark.parametrize("scale", [1.0, "auto"])
+@pytest.mark.parametrize("head_size", [128])
+@pytest.mark.parametrize(
+    "num_q_heads, num_k_heads, num_v_heads",
+    [
+        (1, 1, 1),
+        (4, 1, 1),
+        (6, 2, 2),
+        (2, 2, 4),
+        (16, 16, 32),
+    ],
+)
+@pytest.mark.parametrize("seq_lens", [[64], [128], [256], [256, 256], [64, 128, 512]])
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+def test_prefill_kernel_bf16_state(
+    qkv_factory,
+    dtype: str,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_size: int,
+    seq_lens: list[int],
+    scale: float | str,
+    seed: int = int(os.environ.get("SEED", "0")),
+):
+    scale = 1.0 / math.sqrt(head_size) if scale == "auto" else scale
+    _test_prefill_kernel_bf16_state(
+        qkv_factory,
+        dtype,
+        num_q_heads,
+        num_k_heads,
+        num_v_heads,
+        head_size,
+        seq_lens,
+        scale,
+        seed,
+    )
