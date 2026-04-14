@@ -890,27 +890,38 @@ __device__ __forceinline__ auto compute_CB_scaled_mma(SmemT const& smem, int lan
 }
 
 // =============================================================================
-// Scale frag_B registers in-place: frag_B[i] *= coeff[k_index[i]].
-// Replaces the old precompute_dB_scaled SIMT loop — the scaling now happens
-// in registers after ldmatrix.trans loads old_B into frag_B.
-// Also handles input_t → mma_type conversion in the same pass.
+// Precompute dB scaling coefficients (called once before the N-tile loop).
+// Returns 4 floats in coeff[], one per m16n8k16 B-fragment element.
+// coeff[i] = 0 when k >= prev_k, embedding the causal mask so the inner
+// loop needs no branch.
 //
 // K-index derivation (m16n8k16 _TN MMA, B fragment = 4 bf16 per thread):
 //   lane = tid % 32;  K_base = (lane % 4) * 2;
 //   elem 0 → K_base,   elem 1 → K_base+1,
 //   elem 2 → K_base+8, elem 3 → K_base+9
 // =============================================================================
-template <typename input_t, typename mma_type, typename FragB, typename SmemT>
-__device__ __forceinline__ void compute_dB_scaling(FragB& frag_B, SmemT const& smem,
-                                                   float total_cumAdt, int prev_k, int lane) {
-  using namespace cute;
-  static_assert(size(FragB{}) == 4, "m16n8k16 B fragment must have 4 elements");
+template <typename SmemT>
+__device__ __forceinline__ void precompute_dB_coeff(float coeff[4], SmemT const& smem,
+                                                    float total_cumAdt, int prev_k, int lane) {
   int const K_base = (lane % 4) * 2;
-  // K indices for the 4 fragment elements
   int const k_idx[4] = {K_base, K_base + 1, K_base + 8, K_base + 9};
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
     int const k = k_idx[i];
+    coeff[i] = (k < prev_k) ? __expf(total_cumAdt - smem.old_cumAdt[k]) * smem.old_dt_proc[k] : 0.f;
+  }
+}
+
+// Apply precomputed dB coefficients to frag_B in-place.
+// Handles input_t → mma_type conversion + scaling in one pass.
+// coeff[i] = 0 encodes both causal mask and zero-fill for k >= prev_k.
+// =============================================================================
+template <typename input_t, typename mma_type, typename FragB>
+__device__ __forceinline__ void compute_dB_scaling(FragB& frag_B, float const coeff[4]) {
+  using namespace cute;
+  static_assert(size(FragB{}) == 4, "m16n8k16 B fragment must have 4 elements");
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
     float val;
     if constexpr (!std::is_same_v<input_t, mma_type>) {
       input_t orig;
@@ -919,12 +930,7 @@ __device__ __forceinline__ void compute_dB_scaling(FragB& frag_B, SmemT const& s
     } else {
       val = toFloat(frag_B(i));
     }
-    if (k < prev_k) {
-      float coeff = __expf(total_cumAdt - smem.old_cumAdt[k]) * smem.old_dt_proc[k];
-      val *= coeff;
-    } else {
-      val = 0.f;
-    }
+    val *= coeff[i];
     mma_type result(val);
     memcpy(&frag_B(i), &result, 2);
   }
@@ -1010,6 +1016,11 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
   auto id_tile = make_identity_tensor(make_shape(Int<DIM>{}, Int<N_TILE>{}));
   auto id_part = thr_mma.partition_C(id_tile);
 
+  // Precompute dB coefficients once — they depend only on K (lane), not on N.
+  // Embeds the k < prev_k check: coeff[i] = 0 for k >= prev_k.
+  float dB_coeff[4];
+  precompute_dB_coeff(dB_coeff, smem, total_cumAdt, prev_k, lane);
+
 #pragma unroll
   for (int n = 0; n < NUM_N_TILES; ++n) {
     // Load state into f32 accumulator
@@ -1023,7 +1034,7 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
       frag_h(i) = toFloat(state_base[layout_state_swz(row, col)]) * total_decay;
     }
 
-    // Load old_B for this N-tile via ldmatrix.trans, then scale in registers
+    // Load old_B for this N-tile via ldmatrix.trans, then apply precomputed coefficients
     Tensor smem_B_ntile =
         local_tile(smem_B_full, make_tile(Int<N_TILE>{}, Int<NTOKENS_PAD>{}), make_coord(n, _0{}));
     Tensor smem_B_s2r = s2r_thr_B.partition_S(smem_B_ntile);
@@ -1032,8 +1043,8 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
     Tensor frag_B_view = s2r_thr_B.retile_D(frag_B);
     cute::copy(s2r_B, smem_B_s2r, frag_B_view);
 
-    // Scale frag_B by coeff[k] on the fly (handles type conversion + zero-fill for k >= prev_k)
-    compute_dB_scaling<input_t, mma_type>(frag_B, smem, total_cumAdt, prev_k, lane);
+    // Apply precomputed coefficients (convert + scale, no LDS/expf/branch)
+    compute_dB_scaling<input_t, mma_type>(frag_B, dB_coeff);
 
     cute::gemm(tiled_mma, frag_h, frag_A, frag_B, frag_h);
 
