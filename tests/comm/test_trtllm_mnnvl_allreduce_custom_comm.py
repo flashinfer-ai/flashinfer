@@ -182,9 +182,11 @@ def _run_mnnvl_ar(world_size, rank, dtype, distributed_init_port, seq_len, hidde
         reference_output = (allreduce_result,)
 
         # Run the test with the same workspace
-        from .test_trtllm_mnnvl_allreduce import row_linear_residual_norm_fusion_forward
+        from .test_trtllm_mnnvl_allreduce import (
+            row_linear_residual_norm_fusion_forward_legacy,
+        )
 
-        row_linear_residual_norm_fusion_forward(
+        row_linear_residual_norm_fusion_forward_legacy(
             x,
             residual,
             norm_weight,
@@ -199,7 +201,6 @@ def _run_mnnvl_ar(world_size, rank, dtype, distributed_init_port, seq_len, hidde
             unicast_ptr,
             max_num_elements_mnnvl,
             buffer_flags_mnnvl,
-            comm,
         )
 
         # Synchronize before next test
