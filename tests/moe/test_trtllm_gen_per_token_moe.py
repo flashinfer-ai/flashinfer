@@ -287,7 +287,6 @@ def test_trtllm_gen_routed_fused_moe(
         output1_scale_scalar,
         output1_scale_gate_scalar,
         output2_scale_scalar,
-        per_token_scale_inv,
         num_experts,
         top_k,
         None,  # n_group
@@ -300,6 +299,7 @@ def test_trtllm_gen_routed_fused_moe(
         True,  # do_finalize
         enable_pdl,
         ActivationType.Swiglu.value,  # act_type
+        per_token_scale_inv,
         None,
     )
 

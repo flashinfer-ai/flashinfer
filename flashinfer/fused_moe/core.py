@@ -2806,7 +2806,6 @@ def trtllm_fp4_block_scale_moe(
     output1_scale_scalar: Optional[torch.Tensor],
     output1_scale_gate_scalar: Optional[torch.Tensor],
     output2_scale_scalar: Optional[torch.Tensor],
-    per_token_scale: Optional[torch.Tensor],
     num_experts: int,
     top_k: int,
     n_group: Optional[int],
@@ -2819,6 +2818,7 @@ def trtllm_fp4_block_scale_moe(
     do_finalize: bool = True,
     enable_pdl: Optional[bool] = None,
     activation_type: int = ActivationType.Swiglu.value,
+    per_token_scale: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
     norm_topk_prob: bool = True,
@@ -2858,8 +2858,6 @@ def trtllm_fp4_block_scale_moe(
             Tensor of scaling factors for first layer gate output
         output2_scale_scalar (Optional[torch.Tensor]): shape [local_num_experts]
             Tensor of scaling factors for second layer output
-        per_token_scale (Optional[torch.Tensor]): shape [seq_len]
-            Tensor of per-token scaling factors. Dtype must be float32.
         num_experts (int): Total number of experts
         top_k (int): Number of experts to route to per token
         n_group (Optional[int]): Number of expert groups (can be None for some routing methods)
@@ -2881,6 +2879,8 @@ def trtllm_fp4_block_scale_moe(
             - 4: Geglu
             - 6: Relu2
             - 7: Identity
+        per_token_scale (Optional[torch.Tensor]): shape [seq_len]
+            Tensor of per-token scaling factors. Dtype must be float32.
         tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
         output (Optional[torch.Tensor]): shape [seq_len, hidden_size]
             Optional inplace output tensor.
@@ -2944,7 +2944,6 @@ def trtllm_fp4_block_scale_routed_moe(
     output1_scale_scalar: Optional[torch.Tensor],
     output1_scale_gate_scalar: Optional[torch.Tensor],
     output2_scale_scalar: Optional[torch.Tensor],
-    per_token_scale: Optional[torch.Tensor],
     num_experts: int,
     top_k: int,
     n_group: Optional[int],
@@ -2957,6 +2956,7 @@ def trtllm_fp4_block_scale_routed_moe(
     do_finalize: bool = True,
     enable_pdl: Optional[bool] = None,
     activation_type: int = ActivationType.Swiglu.value,
+    per_token_scale: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
 ) -> List[torch.Tensor]:
@@ -2997,8 +2997,6 @@ def trtllm_fp4_block_scale_routed_moe(
             Tensor of scaling factors for first layer gate output
         output2_scale_scalar (Optional[torch.Tensor]): shape [local_num_experts]
             Tensor of scaling factors for second layer output
-        per_token_scale (Optional[torch.Tensor]): shape [seq_len]
-            Tensor of per-token scaling factors. Dtype must be float32.
         num_experts (int): Total number of experts
         top_k (int): Number of experts to route to per token
         n_group (Optional[int]): Number of expert groups (can be None for some routing methods)
@@ -3019,6 +3017,8 @@ def trtllm_fp4_block_scale_routed_moe(
             - 4: Geglu
             - 6: Relu2
             - 7: Identity
+        per_token_scale (Optional[torch.Tensor]): shape [seq_len]
+            Tensor of per-token scaling factors. Dtype must be float32.
         tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
         output (Optional[torch.Tensor]): shape [seq_len, hidden_size]
             Optional inplace output tensor.
