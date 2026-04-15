@@ -27,7 +27,7 @@ from typing import Callable, Tuple
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Float32, Int32, Int64, Uint32, Uint64
+from cutlass import Float32, Int32, Int64, Uint8, Uint32, Uint64
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
@@ -1260,3 +1260,276 @@ def compute_y_and_max_abs_f32(
         max_abs = fmax_f32(max_abs, fabs_f32(y_f32[i]))
 
     return y_f32, max_abs
+
+
+# =============================================================================
+# PTX Intrinsics — Global Memory Stores (ported from b12x for MoE kernels)
+# =============================================================================
+
+
+@dsl_user_op
+def st_global_f32(base_ptr: Int64, value: Float32, *, loc=None, ip=None):
+    """Store 32-bit float to global memory."""
+    llvm.inline_asm(
+        None,
+        [
+            Int64(base_ptr).ir_value(loc=loc, ip=ip),
+            Float32(value).ir_value(loc=loc, ip=ip),
+        ],
+        "st.global.f32 [$0], $1;",
+        "l,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def st_global_i32(addr: Int64, val: Int32, *, loc=None, ip=None):
+    """Store int32 to global memory."""
+    llvm.inline_asm(
+        None,
+        [
+            Int64(addr).ir_value(loc=loc, ip=ip),
+            Int32(val).ir_value(loc=loc, ip=ip),
+        ],
+        "st.global.s32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+# =============================================================================
+# PTX Intrinsics — Shared Memory Operations
+# =============================================================================
+
+
+@dsl_user_op
+def shared_ptr_to_u32(ptr: cute.Pointer, *, loc=None, ip=None) -> Int32:
+    """Convert an address-space-3 shared-memory pointer to a u32 address."""
+    return Int32(llvm.ptrtoint(T.i32(), ptr.llvm_ptr, loc=loc, ip=ip))
+
+
+@dsl_user_op
+def st_shared_u8(smem_addr: Int32, value: Uint8, *, loc=None, ip=None):
+    """Store 8 bits to shared memory. smem_addr is a u32 shared-memory address."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            Uint8(value).ir_value(loc=loc, ip=ip),
+        ],
+        "st.shared.u8 [$0], $1;",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+# =============================================================================
+# PTX Intrinsics — Global Atomics
+# =============================================================================
+
+
+@dsl_user_op
+def atomic_add_global_i32(addr: Int64, val: Int32, *, loc=None, ip=None) -> Int32:
+    """Global memory int32 atomic add. Returns old value."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Int64(addr).ir_value(loc=loc, ip=ip),
+                Int32(val).ir_value(loc=loc, ip=ip),
+            ],
+            "atom.global.add.s32 $0, [$1], $2;",
+            "=r,l,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+# =============================================================================
+# PTX Intrinsics — Scatter Atomics (BF16)
+# =============================================================================
+
+
+@dsl_user_op
+def scatter_add_bf16x2(addr: Int64, val0_f32, val1_f32, *, loc=None, ip=None):
+    """BF16x2 atomic reduction add to global memory.
+
+    Packs two f32 values into bf16x2 via cvt.rn.satfinite, then does
+    red.relaxed.gpu.global.add.noftz.bf16x2.
+    """
+    llvm.inline_asm(
+        None,
+        [
+            Int64(addr).ir_value(loc=loc, ip=ip),
+            val0_f32.ir_value(loc=loc, ip=ip),
+            val1_f32.ir_value(loc=loc, ip=ip),
+        ],
+        "{ .reg .b32 packed;"
+        " cvt.rn.satfinite.bf16x2.f32 packed, $2, $1;"
+        " red.relaxed.gpu.global.add.noftz.bf16x2 [$0], packed; }",
+        "l,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+# =============================================================================
+# FP8 Conversion — Non-reciprocal version
+# =============================================================================
+
+
+@dsl_user_op
+def fp8_e4m3_to_f32(fp8_val: Uint32, *, loc=None, ip=None) -> Float32:
+    """Convert FP8 E4M3 to float32."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Uint32(fp8_val).ir_value(loc=loc, ip=ip)],
+            """
+            {
+                .reg .pred p_zero, p_neg;
+                .reg .u32 sign_u, exp_u, mant_u;
+                .reg .s32 exp_s;
+                .reg .f32 exp_f, mant_f, fp8_float, fp8_neg;
+
+                setp.eq.u32 p_zero, $1, 0;
+                and.b32 sign_u, $1, 0x80;
+                and.b32 mant_u, $1, 7;
+                shr.b32 exp_u, $1, 3;
+                and.b32 exp_u, exp_u, 15;
+                sub.s32 exp_s, exp_u, 7;
+                cvt.rn.f32.s32 exp_f, exp_s;
+                ex2.approx.f32 exp_f, exp_f;
+                cvt.rn.f32.u32 mant_f, mant_u;
+                fma.rn.f32 mant_f, mant_f, 0f3E000000, 0f3F800000;
+                mul.f32 fp8_float, exp_f, mant_f;
+                neg.f32 fp8_neg, fp8_float;
+                setp.ne.u32 p_neg, sign_u, 0;
+                selp.f32 fp8_float, fp8_neg, fp8_float, p_neg;
+                selp.f32 $0, 0f00000000, fp8_float, p_zero;
+            }
+            """,
+            "=f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+# =============================================================================
+# FP4 Quantization — Fast approximate path
+# =============================================================================
+
+
+@cute.jit
+def quantize_and_pack_16_fast(y_f32: cute.Tensor, inv_scale: Float32) -> Uint64:
+    """Fast approximate FP4 quantize/pack for 16 float32 values."""
+    q = cute.make_rmem_tensor((16,), Float32)
+    for i in cutlass.range_constexpr(16):
+        q[i] = y_f32[i] * inv_scale
+
+    packed_lo = cvt_e2m1x8_f32(q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7])
+    packed_hi = cvt_e2m1x8_f32(q[8], q[9], q[10], q[11], q[12], q[13], q[14], q[15])
+    return (Uint64(packed_hi) << Uint64(32)) | Uint64(packed_lo)
+
+
+# =============================================================================
+# FP4 Block Quantization Helpers (for MoE kernels)
+# =============================================================================
+
+
+@cute.jit
+def quantize_block_fp4(
+    values: cute.Tensor,
+    max_abs: Float32,
+    global_scale_val: Float32,
+) -> Tuple[Uint64, Uint8]:
+    """Quantize 16 float32 values to packed FP4 + e4m3 scale byte.
+
+    Given 16 values and their pre-computed max_abs, derives the NVFP4 block
+    scale, quantizes to FP4, and packs into a uint64.  Returns
+    (packed_fp4_u64, scale_byte).
+    """
+    scale_float = max_abs / (Float32(FLOAT4_E2M1_MAX) * global_scale_val)
+    scale_float = fmin_f32(scale_float, Float32(FLOAT8_E4M3_MAX))
+    scale_u32 = cvt_f32_to_e4m3(scale_float)
+    scale_byte = Uint8(scale_u32 & Uint32(0xFF))
+    quantized_scale = fp8_e4m3_to_f32(scale_u32)
+    packed64 = Uint64(0)
+    if quantized_scale != Float32(0.0) and global_scale_val != Float32(0.0):
+        packed64 = quantize_and_pack_16(values, quantized_scale * global_scale_val)
+    return packed64, scale_byte
+
+
+@cute.jit
+def quantize_block_fp4_fast(
+    values: cute.Tensor,
+    max_abs: Float32,
+    global_scale_val: Float32,
+) -> Tuple[Uint64, Uint8]:
+    """Fast approximate FP4 block quantization using reciprocal/vector path."""
+    scale_u32 = Uint32(0)
+    scale_byte = Uint8(0)
+    packed64 = Uint64(0)
+    if global_scale_val != Float32(0.0):
+        fp4_max_rcp = rcp_approx_ftz(Float32(FLOAT4_E2M1_MAX))
+        gs_recip = rcp_approx_ftz(global_scale_val)
+        scale_float = gs_recip * (max_abs * fp4_max_rcp)
+        scale_float = fmin_f32(scale_float, Float32(FLOAT8_E4M3_MAX))
+        scale_u32 = cvt_f32_to_e4m3(scale_float)
+        scale_byte = Uint8(scale_u32 & Uint32(0xFF))
+        inv_quantized_scale = fp8_e4m3_to_f32_and_rcp(scale_u32)
+        if inv_quantized_scale != Float32(0.0):
+            packed64 = quantize_and_pack_16_fast(values, inv_quantized_scale * gs_recip)
+    return packed64, scale_byte
+
+
+@cute.jit
+def max_abs_16(values: cute.Tensor) -> Float32:
+    """Compute the maximum absolute value of 16 float32 values."""
+    result = fabs_f32(values[0])
+    for i in cutlass.range_constexpr(1, 16):
+        result = fmax_f32(result, fabs_f32(values[i]))
+    return result
+
+
+@cute.jit
+def silu_mul_16(
+    gate: cute.Tensor,
+    up: cute.Tensor,
+) -> cute.Tensor:
+    """Fused SiLU(gate) * up for 16 float32 element pairs.
+
+    Used in MoE kernel epilogue to fuse the activation function
+    between GEMM1 and GEMM2, avoiding the gmem round-trip.
+    """
+    out = cute.make_rmem_tensor((16,), Float32)
+    for i in cutlass.range_constexpr(16):
+        g = gate[i]
+        sigmoid_g = cute.arch.rcp_approx(
+            Float32(1.0) + cute.math.exp(-g, fastmath=False)
+        )
+        out[i] = g * sigmoid_g * up[i]
+    return out
+
+
+@cute.jit
+def silu_mul_quantize_block_fp4(
+    gate: cute.Tensor,
+    up: cute.Tensor,
+    global_scale_val: Float32,
+) -> Tuple[Uint64, Uint8]:
+    """Fused SiLU(gate)*up + FP4 quantize for 16 element pairs."""
+    activated = silu_mul_16(gate, up)
+    block_max = max_abs_16(activated)
+    return quantize_block_fp4(activated, block_max, global_scale_val)
