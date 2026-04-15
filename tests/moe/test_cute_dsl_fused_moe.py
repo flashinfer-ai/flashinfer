@@ -1294,5 +1294,426 @@ class TestMicroKernel:
         )
 
 
+# =============================================================================
+# Test Class: ReLU2 Activation (SM120-only, non-gated)
+# =============================================================================
+
+
+def compute_reference_moe_relu2(
+    hidden_states: torch.Tensor,
+    fc1_weights: torch.Tensor,
+    fc2_weights: torch.Tensor,
+    token_selected_experts: torch.Tensor,
+    token_final_scales: torch.Tensor,
+    num_tokens: int,
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    intermediate_size: int,
+    fc2_input_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Reference ReLU2 MoE: output = relu(FC1(x))^2, then FC2."""
+    output = torch.zeros(num_tokens, hidden_size, dtype=torch.float32, device="cuda")
+
+    for token_idx in range(num_tokens):
+        token_input = hidden_states[token_idx].unsqueeze(0)
+
+        for k in range(top_k):
+            expert_idx = token_selected_experts[token_idx, k].item()
+            scale = token_final_scales[token_idx, k].item()
+
+            if expert_idx >= num_experts:
+                continue
+
+            w1 = fc1_weights[expert_idx]
+            fc1_out = token_input @ w1.T
+            activated = torch.square(torch.relu(fc1_out))
+
+            if fc2_input_scale is not None:
+                activated = quant_dequant_fp4_reference(
+                    activated, fc2_input_scale, sf_vec_size=16
+                )
+
+            w2 = fc2_weights[expert_idx]
+            fc2_out = activated @ w2.T
+
+            output[token_idx] += scale * fc2_out.squeeze(0)
+
+    return output
+
+
+def create_relu2_moe_tensors(
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    num_local_experts: int,
+    top_k: int,
+    device: str = "cuda",
+    seed: int = 42,
+):
+    """Create MoE tensors for ReLU2 (non-gated: w1_rows = n, not 2*n)."""
+    from flashinfer.fp4_quantization import fp4_quantize
+    from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
+
+    torch.manual_seed(seed)
+    sf_vec_size = 16
+
+    x_bf16 = (
+        torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device) / 10
+    )
+    a1_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
+    x_quantized, x_sf = fp4_quantize(
+        x_bf16,
+        global_scale=a1_gs,
+        sf_vec_size=sf_vec_size,
+        is_sf_swizzled_layout=False,
+    )
+    x_sf = x_sf.unsqueeze(-1)
+
+    router_logits = torch.randn(num_tokens, num_experts, device=device)
+    routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+    routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+    routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+    routing_weights = routing_weights.float()
+    selected_experts = selected_experts.to(torch.int32)
+
+    # FC1 weights — NON-GATED: [E, n, k] instead of [E, 2*n, k]
+    w1_bf16 = (
+        torch.randn(
+            num_local_experts,
+            intermediate_size,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        / 10
+    )
+    w1_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
+    w1_flat = w1_bf16.view(num_local_experts * intermediate_size, hidden_size)
+    w1_q_flat, w1_sf_flat = fp4_quantize(
+        w1_flat,
+        global_scale=w1_gs,
+        sf_vec_size=sf_vec_size,
+        is_sf_swizzled_layout=True,
+    )
+    w1_q = w1_q_flat.view(num_local_experts, intermediate_size, hidden_size // 2)
+    w1_weight_sf = convert_sf_to_mma_layout(
+        w1_sf_flat,
+        m=intermediate_size,
+        k=hidden_size,
+        num_groups=num_local_experts,
+        sf_vec_size=sf_vec_size,
+    )
+    w1_alpha = torch.ones(num_local_experts, device=device, dtype=torch.float32)
+
+    # FC2 weights — same shape as SiLU: [E, k, n]
+    w2_bf16 = (
+        torch.randn(
+            num_local_experts,
+            hidden_size,
+            intermediate_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        / 10
+    )
+    w2_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
+    w2_flat = w2_bf16.view(num_local_experts * hidden_size, intermediate_size)
+    w2_q_flat, w2_sf_flat = fp4_quantize(
+        w2_flat,
+        global_scale=w2_gs,
+        sf_vec_size=sf_vec_size,
+        is_sf_swizzled_layout=True,
+    )
+    w2_q = w2_q_flat.view(num_local_experts, hidden_size, intermediate_size // 2)
+    w2_weight_sf = convert_sf_to_mma_layout(
+        w2_sf_flat,
+        m=hidden_size,
+        k=intermediate_size,
+        num_groups=num_local_experts,
+        sf_vec_size=sf_vec_size,
+    )
+    w2_alpha = torch.ones(num_local_experts, device=device, dtype=torch.float32)
+    fc2_input_scale = torch.tensor([1.0], device=device, dtype=torch.float32)
+
+    return {
+        "x": x_quantized,
+        "x_sf": x_sf,
+        "x_bf16": x_bf16,
+        "token_selected_experts": selected_experts,
+        "token_final_scales": routing_weights,
+        "w1_weight": w1_q,
+        "w1_weight_sf": w1_weight_sf,
+        "w1_weight_bf16": w1_bf16,
+        "w1_alpha": w1_alpha,
+        "fc2_input_scale": fc2_input_scale,
+        "w2_weight": w2_q,
+        "w2_weight_sf": w2_weight_sf,
+        "w2_weight_bf16": w2_bf16,
+        "w2_alpha": w2_alpha,
+    }
+
+
+@cute_dsl_available
+@sm120_cuda13
+class TestRelu2Activation:
+    """Tests for ReLU2 activation (non-gated, Nemotron-Super)."""
+
+    @pytest.mark.parametrize(
+        "hidden_size,intermediate_size", [(256, 512), (1024, 2048)]
+    )
+    @pytest.mark.parametrize("top_k", [1, 2, 8])
+    @pytest.mark.parametrize("num_tokens", [2, 128, 512])
+    @pytest.mark.parametrize("num_experts", [256])
+    def test_relu2_functional_accuracy(
+        self,
+        num_tokens: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        num_experts: int,
+    ):
+        """Accuracy test for ReLU2 via functional API."""
+        from flashinfer import cute_dsl_fused_moe_nvfp4
+
+        tensors = create_relu2_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+
+        result = cute_dsl_fused_moe_nvfp4(
+            x=moe_input(tensors),
+            x_sf=tensors["x_sf"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            num_experts=num_experts,
+            top_k=top_k,
+            activation_type="relu2",
+        )
+
+        assert result.shape == (num_tokens, hidden_size)
+        assert not torch.isnan(result).any()
+        assert not torch.isinf(result).any()
+
+        ref_output = compute_reference_moe_relu2(
+            hidden_states=tensors["x_bf16"].float().cuda(),
+            fc1_weights=tensors["w1_weight_bf16"].float().cuda(),
+            fc2_weights=tensors["w2_weight_bf16"].float().cuda(),
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=tensors["fc2_input_scale"],
+        )
+
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, (
+            f"ReLU2: {percent_within * 100:.2f}% within tolerance "
+            f"(atol={atol:.4f}, tokens={num_tokens})"
+        )
+
+    def test_relu2_wrapper_accuracy(self):
+        """Accuracy test for ReLU2 via wrapper API."""
+        from flashinfer import CuteDslMoEWrapper
+
+        num_tokens, hidden_size, intermediate_size = 128, 256, 512
+        num_experts, top_k = 256, 2
+
+        tensors = create_relu2_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+
+        moe = CuteDslMoEWrapper(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            use_cuda_graph=False,
+            activation_type="relu2",
+        )
+
+        result = moe.run(
+            x=moe_input(tensors),
+            x_sf=tensors["x_sf"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+        )
+
+        assert result.shape == (num_tokens, hidden_size)
+        assert not torch.isnan(result).any()
+
+        ref_output = compute_reference_moe_relu2(
+            hidden_states=tensors["x_bf16"].float().cuda(),
+            fc1_weights=tensors["w1_weight_bf16"].float().cuda(),
+            fc2_weights=tensors["w2_weight_bf16"].float().cuda(),
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=tensors["fc2_input_scale"],
+        )
+
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, (
+            f"ReLU2 wrapper: {percent_within * 100:.2f}% within tolerance "
+            f"(atol={atol:.4f})"
+        )
+
+    def test_relu2_micro_accuracy(self):
+        """Accuracy test for ReLU2 with micro kernel (small decode batch)."""
+        from flashinfer import cute_dsl_fused_moe_nvfp4
+
+        num_tokens, hidden_size, intermediate_size = 2, 256, 512
+        num_experts, top_k = 256, 2
+
+        tensors = create_relu2_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+
+        result = cute_dsl_fused_moe_nvfp4(
+            x=moe_input(tensors),
+            x_sf=tensors["x_sf"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            num_experts=num_experts,
+            top_k=top_k,
+            activation_type="relu2",
+        )
+
+        assert result.shape == (num_tokens, hidden_size)
+        assert not torch.isnan(result).any()
+
+        ref_output = compute_reference_moe_relu2(
+            hidden_states=tensors["x_bf16"].float().cuda(),
+            fc1_weights=tensors["w1_weight_bf16"].float().cuda(),
+            fc2_weights=tensors["w2_weight_bf16"].float().cuda(),
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=tensors["fc2_input_scale"],
+        )
+
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, (
+            f"ReLU2 micro: {percent_within * 100:.2f}% within tolerance "
+            f"(atol={atol:.4f})"
+        )
+
+    def test_relu2_cuda_graph(self):
+        """Test ReLU2 with CUDA graph capture and replay."""
+        from flashinfer import CuteDslMoEWrapper
+
+        num_tokens, hidden_size, intermediate_size = 128, 256, 512
+        num_experts, top_k = 256, 2
+
+        tensors = create_relu2_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+
+        moe = CuteDslMoEWrapper(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            use_cuda_graph=True,
+            max_num_tokens=num_tokens,
+            activation_type="relu2",
+        )
+
+        # Warmup
+        for _ in range(3):
+            moe.run(
+                x=moe_input(tensors),
+                x_sf=tensors["x_sf"],
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+                w1_weight=tensors["w1_weight"],
+                w1_weight_sf=tensors["w1_weight_sf"],
+                w1_alpha=tensors["w1_alpha"],
+                fc2_input_scale=tensors["fc2_input_scale"],
+                w2_weight=tensors["w2_weight"],
+                w2_weight_sf=tensors["w2_weight_sf"],
+                w2_alpha=tensors["w2_alpha"],
+            )
+        torch.cuda.synchronize()
+
+        # Capture
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            output = moe.run(
+                x=moe_input(tensors),
+                x_sf=tensors["x_sf"],
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+                w1_weight=tensors["w1_weight"],
+                w1_weight_sf=tensors["w1_weight_sf"],
+                w1_alpha=tensors["w1_alpha"],
+                fc2_input_scale=tensors["fc2_input_scale"],
+                w2_weight=tensors["w2_weight"],
+                w2_weight_sf=tensors["w2_weight_sf"],
+                w2_alpha=tensors["w2_alpha"],
+            )
+        torch.cuda.synchronize()
+
+        assert output.shape == (num_tokens, hidden_size)
+
+        # Replay and verify
+        g.replay()
+        torch.cuda.synchronize()
+        assert not torch.isnan(output).any(), "NaN after ReLU2 CUDA graph replay"
+        assert not (output == 0).all(), "All zeros after ReLU2 CUDA graph replay"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

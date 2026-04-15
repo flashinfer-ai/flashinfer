@@ -833,12 +833,16 @@ def testCutlassFusedMoe(args):
         return res
 
     # Create base tensors
+    activation_type = args.activation_type
+    is_gated = activation_type in (ActivationType.Swiglu, ActivationType.Geglu)
+    w1_rows = (2 if is_gated else 1) * intermediate_size
+
     torch.manual_seed(args.random_seed)
     x = torch.randn(num_tokens, hidden_size, dtype=input_dtype, device=device)
     w31_weight = (
         torch.randn(
             num_experts,
-            2 * intermediate_size,
+            w1_rows,
             hidden_size,
             dtype=input_dtype,
             device=device,
@@ -877,14 +881,17 @@ def testCutlassFusedMoe(args):
     def build_tp_shards(w31_ep_tensor: torch.Tensor, w2_ep_tensor: torch.Tensor):
         if tp_size <= 1:
             return w31_ep_tensor, w2_ep_tensor
-        # Split w31 into w3 and w1 along intermediate dim
-        w3_weight, w1_weight = torch.chunk(w31_ep_tensor, 2, dim=1)
         shard = intermediate_size // tp_size
         start = tp_rank * shard
         end = start + shard
-        w3_local = w3_weight[:, start:end, :]
-        w1_local = w1_weight[:, start:end, :]
-        w31_local = torch.cat([w3_local, w1_local], dim=1)
+        if is_gated:
+            # Split w31 into w3 and w1 along intermediate dim
+            w3_weight, w1_weight = torch.chunk(w31_ep_tensor, 2, dim=1)
+            w3_local = w3_weight[:, start:end, :]
+            w1_local = w1_weight[:, start:end, :]
+            w31_local = torch.cat([w3_local, w1_local], dim=1)
+        else:
+            w31_local = w31_ep_tensor[:, start:end, :]
         w2_local = w2_ep_tensor[:, :, start:end]
         return w31_local.contiguous(), w2_local.contiguous()
 
@@ -910,6 +917,7 @@ def testCutlassFusedMoe(args):
                 ep_rank=ep_rank,
                 quant_scales=None,
                 output=out,
+                **_activation_kwarg(cutlass_fused_moe, activation_type),
             )
 
         input_args_for_bench = (
@@ -977,6 +985,7 @@ def testCutlassFusedMoe(args):
                 ep_rank=ep_rank,
                 quant_scales=quant_scales,
                 output=out,
+                **_activation_kwarg(cutlass_fused_moe, activation_type),
             )
 
         input_args_for_bench = (
@@ -998,12 +1007,13 @@ def testCutlassFusedMoe(args):
         n = w2_local.shape[2]  # local intermediate size after TP
         k = hidden_size
         quant_blocksize = 16
+        w1_n = w31_local.shape[1]  # 2*n for gated, n for non-gated
 
         # Weight quantization buffers
-        w1_q = torch.empty((e, 2 * n, k // 2), device=device, dtype=torch.uint8)
+        w1_q = torch.empty((e, w1_n, k // 2), device=device, dtype=torch.uint8)
         w2_q = torch.empty((e, k, n // 2), device=device, dtype=torch.uint8)
         w1_blockscale = torch.empty(
-            (e, round_up(2 * n, 128), round_up(k // quant_blocksize, 4)),
+            (e, round_up(w1_n, 128), round_up(k // quant_blocksize, 4)),
             device=device,
             dtype=torch.float8_e4m3fn,
         )
@@ -1061,6 +1071,7 @@ def testCutlassFusedMoe(args):
                 quant_scales=quant_scales,
                 input_sf=input_sf,
                 output=out,
+                **_activation_kwarg(cutlass_fused_moe, activation_type),
             )
 
         input_args_for_bench = (
@@ -1180,6 +1191,7 @@ def _create_cute_dsl_moe_test_data(
     num_local_experts: int,
     top_k: int,
     device: torch.device,
+    is_gated: bool = True,
 ):
     """Create NVFP4-quantized test data for CuteDSL MoE (Blackwell kernels).
 
@@ -1208,13 +1220,14 @@ def _create_cute_dsl_moe_test_data(
     routing_weights, selected_experts = compute_routing(routing_logits, top_k)
     selected_experts = selected_experts.to(torch.int32)
 
-    # GEMM1 weights (gate + up)
-    # SM100/103: interleaved in 64-row groups for CuTe DSL SwiGLU epilogue
-    # SM120/121: non-interleaved [up_0:N, gate_0:N] for b12x fused kernel
+    # GEMM1 weights
+    # Gated (SiLU/SwiGLU): [E, 2*n, k] — gate + up fused
+    # Non-gated (ReLU2): [E, n, k] — single FC1 matrix
+    w1_rows = (2 if is_gated else 1) * intermediate_size
     w1_bf16 = (
         torch.randn(
             num_local_experts,
-            2 * intermediate_size,
+            w1_rows,
             hidden_size,
             dtype=torch.bfloat16,
             device=device,
@@ -1222,23 +1235,19 @@ def _create_cute_dsl_moe_test_data(
         / 10
     )
     sm_major = torch.cuda.get_device_capability(device)[0]
-    if sm_major == 12:
-        w1_bf16_prepared = w1_bf16  # SM120: non-interleaved
+    if sm_major == 12 or not is_gated:
+        w1_bf16_prepared = w1_bf16  # SM120 or non-gated: no interleave
     else:
         w1_bf16_prepared = _interleave_linear_and_gate(w1_bf16, group_size=64, dim=1)
     w1_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
-    w1_flat = w1_bf16_prepared.view(
-        num_local_experts * 2 * intermediate_size, hidden_size
-    )
+    w1_flat = w1_bf16_prepared.view(num_local_experts * w1_rows, hidden_size)
     w1_q_flat, w1_sf_flat = fp4_quantize(
         w1_flat, global_scale=w1_gs, sf_vec_size=sf_vec_size, is_sf_swizzled_layout=True
     )
-    w1_weight = w1_q_flat.view(
-        num_local_experts, 2 * intermediate_size, hidden_size // 2
-    )
+    w1_weight = w1_q_flat.view(num_local_experts, w1_rows, hidden_size // 2)
     w1_weight_sf = convert_sf_to_mma_layout(
         w1_sf_flat,
-        m=2 * intermediate_size,
+        m=w1_rows,
         k=hidden_size,
         num_groups=num_local_experts,
         sf_vec_size=sf_vec_size,
@@ -1341,6 +1350,12 @@ def testCuteDslFp4BlockScaleMoe(args):
             f"intermediate={intermediate_size}, experts={num_experts}, top_k={top_k}"
         )
 
+    # Map ActivationType enum to string for SM120 API
+    activation_type = args.activation_type
+    _ACT_STR = {ActivationType.Swiglu: "silu", ActivationType.Relu2: "relu2"}
+    activation_str = _ACT_STR.get(activation_type, "silu")
+    is_gated = activation_type in (ActivationType.Swiglu, ActivationType.Geglu)
+
     # Create CuteDSL-specific NVFP4 test data
     tensors = _create_cute_dsl_moe_test_data(
         num_tokens=num_tokens,
@@ -1350,6 +1365,7 @@ def testCuteDslFp4BlockScaleMoe(args):
         num_local_experts=local_num_experts,
         top_k=top_k,
         device=device,
+        is_gated=is_gated,
     )
 
     if args.verbose >= 2:
@@ -1384,6 +1400,7 @@ def testCuteDslFp4BlockScaleMoe(args):
             num_local_experts=local_num_experts,
             local_expert_offset=local_expert_offset,
             moe_output=moe_output,
+            activation_type=activation_str,
         )
 
         # Warmup call to populate workspace cache before timed region
@@ -1410,6 +1427,7 @@ def testCuteDslFp4BlockScaleMoe(args):
             max_num_tokens=num_tokens,
             num_local_experts=local_num_experts,
             local_expert_offset=local_expert_offset,
+            activation_type=activation_str,
         )
         runner = moe.run
 

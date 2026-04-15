@@ -254,7 +254,8 @@ def _get_weight_views(
     if cached is not None:
         return cached
 
-    # Permute [E, 2*n, k//2] -> [2*n, k//2, E] (view, no copy)
+    # Permute [E, w1_rows, k//2] -> [w1_rows, k//2, E] (view, no copy)
+    # w1_rows is 2*n for gated (SiLU) or n for non-gated (ReLU2)
     w13 = w1_fp4.permute(1, 2, 0)
     down = w2_fp4.permute(1, 2, 0)
 
@@ -265,9 +266,10 @@ def _get_weight_views(
     # (which would write in permuted logical order).
     # convert_sf_from_mma_layout reverses the permutation back to 2D swizzled.
     sf_dtype = cutlass.Float8E4M3FN
+    w1_rows = w1_fp4.shape[1]  # 2*n for gated, n for non-gated
     w13_sf_contiguous = convert_sf_from_mma_layout(
         w1_blockscale,
-        m=2 * n,
+        m=w1_rows,
         k=k,
         num_groups=w1_fp4.shape[0],  # num_local_experts
     ).contiguous()
@@ -322,6 +324,7 @@ def _get_static_kernel(
     input_scales_are_reciprocal: bool = False,
     fast_math: bool = True,
     mac_override: int | None = None,
+    activation: str = "silu",
 ):
     """Compile (or retrieve cached) the SM120 static MoE kernel."""
     sf_vec_size = 16
@@ -352,6 +355,7 @@ def _get_static_kernel(
         topk_ids_dtype,
         input_scales_are_reciprocal,
         fast_math,
+        activation,
     )
     cached = _STATIC_KERNEL_CACHE.get(cache_key)
     if cached is not None:
@@ -368,7 +372,11 @@ def _get_static_kernel(
         output_tile_count_n=max(1, (n + mma_tiler_mn[1] - 1) // mma_tiler_mn[1]),
         input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
+        activation=activation,
     )
+
+    is_gated = activation == "silu"
+    w1_rows = (2 if is_gated else 1) * n  # 2*n for gated, n for non-gated
 
     rows_pad_k = _align_up(max_rows, 128)
     cols_pad_k = _align_up(k // _NVFP4_BLOCK_SIZE, 4)
@@ -423,7 +431,7 @@ def _get_static_kernel(
     )
     b_w13_fake = cute.runtime.make_fake_compact_tensor(
         ab_dtype,
-        (2 * n, k, weight_E),
+        (w1_rows, k, weight_E),
         stride_order=(1, 0, 2),
         assumed_align=16,
     )
@@ -545,6 +553,7 @@ def _get_micro_kernel(
     input_scales_are_reciprocal: bool = False,
     fast_math: bool = True,
     mac_override: int | None = None,
+    activation: str = "silu",
 ):
     """Compile (or retrieve cached) the SM120 micro MoE kernel."""
     sf_vec_size = 16
@@ -573,6 +582,7 @@ def _get_micro_kernel(
         topk_ids_dtype,
         input_scales_are_reciprocal,
         fast_math,
+        activation,
     )
     cached = _MICRO_KERNEL_CACHE.get(cache_key)
     if cached is not None:
@@ -589,7 +599,11 @@ def _get_micro_kernel(
         output_tile_count_n=max(1, (n + mma_tiler_mn[1] - 1) // mma_tiler_mn[1]),
         input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
+        activation=activation,
     )
+
+    is_gated = activation == "silu"
+    w1_rows = (2 if is_gated else 1) * n
 
     rows_pad_k = _align_up(max_rows, 128)
     cols_pad_k = _align_up(k // _NVFP4_BLOCK_SIZE, 4)
@@ -644,7 +658,7 @@ def _get_micro_kernel(
     )
     b_w13_fake = cute.runtime.make_fake_compact_tensor(
         ab_dtype,
-        (2 * n, k, weight_E),
+        (w1_rows, k, weight_E),
         stride_order=(1, 0, 2),
         assumed_align=16,
     )
@@ -777,6 +791,7 @@ def launch_sm120_static_moe(
     top_k: int,
     input_scales_are_reciprocal: bool = False,
     fast_math: bool = True,
+    activation: str = "silu",
 ) -> torch.Tensor:
     """Launch the SM120 static or micro MoE kernel.
 
@@ -831,6 +846,7 @@ def launch_sm120_static_moe(
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
             mac_override=micro_mac,
+            activation=activation,
         )
         launch_ids = compact_ids
     else:
@@ -848,6 +864,7 @@ def launch_sm120_static_moe(
             topk_ids_dtype=torch.int32,
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
+            activation=activation,
         )
         launch_ids = flat_ids
 
@@ -1215,6 +1232,7 @@ def _get_dynamic_kernel(
     topk_ids_dtype: torch.dtype = torch.int32,
     input_scales_are_reciprocal: bool = False,
     fast_math: bool = True,
+    activation: str = "silu",
 ):
     """Compile (or retrieve cached) the SM120 dynamic MoE kernel."""
     sf_vec_size = 16
@@ -1231,10 +1249,14 @@ def _get_dynamic_kernel(
         topk_ids_dtype,
         input_scales_are_reciprocal,
         fast_math,
+        activation,
     )
     cached = _DYNAMIC_KERNEL_CACHE.get(cache_key)
     if cached is not None:
         return cached
+
+    is_gated = activation == "silu"
+    w1_rows = (2 if is_gated else 1) * n
 
     ab_dtype = cutlass.Float4E2M1FN
     sf_dtype = cutlass.Float8E4M3FN
@@ -1246,6 +1268,7 @@ def _get_dynamic_kernel(
         mma_tiler_mn=(_LEVEL_TILE_M, _LEVEL_TILE_N),
         input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
+        activation=activation,
     )
     launch = _DynamicMoELaunch(kernel, k=k, num_topk=num_topk)
 
@@ -1320,7 +1343,7 @@ def _get_dynamic_kernel(
 
     b_w13_fake = cute.runtime.make_fake_compact_tensor(
         ab_dtype,
-        (2 * n, k, E),
+        (w1_rows, k, E),
         stride_order=(1, 0, 2),
         assumed_align=16,
     )
@@ -1431,6 +1454,7 @@ def launch_sm120_dynamic_moe(
     top_k: int,
     input_scales_are_reciprocal: bool = False,
     fast_math: bool = True,
+    activation: str = "silu",
 ) -> torch.Tensor:
     """Launch the SM120 dynamic MoE kernel."""
     flat_ids = topk_ids.view(-1).to(torch.int32)
@@ -1450,6 +1474,7 @@ def launch_sm120_dynamic_moe(
         topk_ids_dtype=torch.int32,
         input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
+        activation=activation,
     )
 
     scatter_output.zero_()
@@ -1593,6 +1618,7 @@ def launch_sm120_moe(
     scatter_output: torch.Tensor,
     input_scales_are_reciprocal: bool = False,
     fast_math: bool = True,
+    activation: str = "silu",
     _workspace=None,
     _weight_views=None,
 ) -> torch.Tensor:
@@ -1605,7 +1631,9 @@ def launch_sm120_moe(
     """
     num_tokens = topk_ids.size(0)
     k = a.size(1)  # hidden_size
-    intermediate_size = w1_weight.size(1) // 2
+    is_gated = activation == "silu"
+    # w1_weight.size(1) is 2*n for gated or n for non-gated
+    intermediate_size = w1_weight.size(1) // 2 if is_gated else w1_weight.size(1)
     n = intermediate_size
     routed_rows = num_tokens * top_k
 
@@ -1670,6 +1698,7 @@ def launch_sm120_moe(
             top_k=top_k,
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
+            activation=activation,
         )
     else:
         return launch_sm120_static_moe(
@@ -1688,4 +1717,5 @@ def launch_sm120_moe(
             top_k=top_k,
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
+            activation=activation,
         )
