@@ -1,11 +1,12 @@
 """
-cuDNN-backed Grouped Matrix Multiplication (MoE Grouped GEMM).
+Grouped Matrix Multiplication for Mixture-of-Experts (MoE Grouped GEMM).
 
-Provides ``grouped_mm_bf16`` as a public API, mirroring the ``mm_bf16`` dense
-GEMM API but operating on expert-partitioned (grouped) inputs.
+Provides grouped variants of the dense ``mm_*`` GEMM APIs, where each expert
+in a Mixture-of-Experts layer has its own weight matrix and tokens are routed
+to experts via ``m_indptr``.
 
-All implementations use cuDNN's ``moe_grouped_matmul`` graph node under the
-hood with automatic graph caching.
+Public APIs: ``grouped_mm_bf16``, ``grouped_mm_fp8``, ``grouped_mm_mxfp8``,
+``grouped_mm_fp4``.
 """
 
 import functools
