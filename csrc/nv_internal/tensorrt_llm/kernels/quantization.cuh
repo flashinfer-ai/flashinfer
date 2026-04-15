@@ -687,8 +687,7 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
     // input
     uint32_t m, uint32_t n, T const* input, float globalScaleInv, int32_t* expandedIdxToPermutedIdx,
     // output
-    uint8_t* weightOutput, uint8_t* scaleOutput, float* perTokenScaleOutput,
-    QuantizationSFLayout layout = QuantizationSFLayout::LINEAR) {
+    uint8_t* weightOutput, uint8_t* scaleOutput, float* perTokenScaleOutput) {
   static constexpr int ELTS_PER_THREAD = CVT_FP16_TO_FP4_ELTS_PER_THREAD;
   static constexpr int SF_VEC_SIZE = 16;
   static constexpr int NUM_THREADS_PER_SF = SF_VEC_SIZE / ELTS_PER_THREAD;  // 2
