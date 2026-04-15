@@ -1173,10 +1173,10 @@ template <typename src_t, typename mma_type, typename Frag>
 __device__ __forceinline__ void convert_frag(Frag& frag) {
   if constexpr (!std::is_same_v<src_t, mma_type>) {
 #pragma unroll
-    for (int i = 0; i < cute::size(frag); ++i) {
-      src_t orig;
-      memcpy(&orig, &frag(i), 2);
-      frag(i) = mma_type(toFloat(orig));
+    for (int i = 0; i < cute::size(frag); i += 2) {
+      float2 vals = toFloat2(reinterpret_cast<src_t const*>(&frag(i)));
+      frag(i) = mma_type(vals.x);
+      frag(i + 1) = mma_type(vals.y);
     }
   }
 }
@@ -1225,15 +1225,14 @@ __device__ __forceinline__ void add_D_skip_cute(FragY& frag_y, SmemX const& smem
   Tensor smem_x_tile =
       local_tile(smem_x, make_tile(Int<NTOKENS_PAD>{}, Int<N_TILE>{}), make_coord(_0{}, n));
   Tensor x_part = thr_mma.partition_C(smem_x_tile);
-  // Load pairs of consecutive bf16 elements as uint32_t (one 32-bit LDS per pair).
+  // Load pairs of consecutive bf16 elements and convert via paired toFloat2.
   // m16n8k16 partition_C places consecutive N-column pairs adjacent in smem.
   static_assert(sizeof(input_t) == 2, "vectorized D_skip requires 2-byte input_t");
 #pragma unroll
   for (int i = 0; i < size(frag_y); i += 2) {
-    input_t pair[2];
-    memcpy(pair, &x_part(i), 4);
-    frag_y(i) += D_val * toFloat(pair[0]);
-    frag_y(i + 1) += D_val * toFloat(pair[1]);
+    float2 vals = toFloat2(reinterpret_cast<input_t const*>(&x_part(i)));
+    frag_y(i) += D_val * vals.x;
+    frag_y(i + 1) += D_val * vals.y;
   }
 }
 
@@ -1257,6 +1256,117 @@ __device__ __forceinline__ void compute_z_gating_cute(FragY& frag_y, SmemZ const
     float z1 = toFloat(pair[1]);
     frag_y(i) *= z0 * __fdividef(1.f, (1.f + __expf(-z0)));
     frag_y(i + 1) *= z1 * __fdividef(1.f, (1.f + __expf(-z1)));
+  }
+}
+
+// ── Matmul 3: init_out = C @ state^T ────────────────────────────────────────
+// Software-pipelined K-loop with double-buffered A and B register fragments
+// (CUTLASS sgemm_sm80 pattern). 2 frag_A + 4 frag_B in registers at steady state.
+// Loads k+1 into nxt slot while HMMA consumes cur slot — independent registers,
+// no dependency between LDSM and HMMA within the same loop iteration.
+template <typename input_t, typename state_t, int NTOKENS, int DIM, int DSTATE, int NUM_WARPS,
+          typename SmemT, typename TiledMma, typename ThrMma, typename FragY>
+__device__ __forceinline__ void add_init_out_cute(SmemT const& smem, TiledMma const& tiled_mma,
+                                                  ThrMma const& thr_mma, int tid, FragY& frag_y_0,
+                                                  FragY& frag_y_1) {
+  using namespace cute;
+  using mma_type =
+      std::conditional_t<std::is_same_v<input_t, __half> || std::is_same_v<state_t, __half>, __half,
+                         __nv_bfloat16>;
+
+  constexpr int NTOKENS_PAD = SmemT::NTOKENS_PAD;
+  constexpr int K_TILE = 16;
+  constexpr int NUM_K_TILES = DSTATE / K_TILE;
+  constexpr int N_TILE = 32;
+
+  // ── S2R copies ──
+  auto s2r_A = make_tiled_copy_A(Copy_Atom<SM75_U32x4_LDSM_N, mma_type>{}, tiled_mma);
+  auto s2r_thr_A = s2r_A.get_slice(tid);
+  auto s2r_B = make_tiled_copy_B(Copy_Atom<SM75_U32x2_LDSM_N, mma_type>{}, tiled_mma);
+  auto s2r_thr_B = s2r_B.get_slice(tid);
+
+  // ── Swizzled smem views ──
+  auto layout_C_swz = make_swizzled_layout_rc<NTOKENS_PAD, DSTATE>();
+  Tensor smem_C =
+      make_tensor(make_smem_ptr(reinterpret_cast<mma_type const*>(&smem.C[0][0])), layout_C_swz);
+  auto layout_state_swz = make_swizzled_layout_rc<DIM, DSTATE>();
+  Tensor smem_state = make_tensor(
+      make_smem_ptr(reinterpret_cast<mma_type const*>(&smem.state[0][0])), layout_state_swz);
+
+  // ── K-tiled C (A operand) ──
+  Tensor smem_C_ktiled =
+      local_tile(smem_C, make_tile(Int<NTOKENS_PAD>{}, Int<K_TILE>{}), make_coord(_0{}, _));
+  auto smem_C_s2r = s2r_thr_A.partition_S(smem_C_ktiled);
+
+  // ── State B operands for both N-tiles ──
+  Tensor smem_state_nk_0 =
+      local_tile(smem_state, make_tile(Int<N_TILE>{}, Int<K_TILE>{}), make_coord(0, _));
+  Tensor smem_state_nk_1 =
+      local_tile(smem_state, make_tile(Int<N_TILE>{}, Int<K_TILE>{}), make_coord(1, _));
+  auto smem_state_s2r_0 = s2r_thr_B.partition_S(smem_state_nk_0);
+  auto smem_state_s2r_1 = s2r_thr_B.partition_S(smem_state_nk_1);
+
+  // ── Double-buffered A fragments (2 K-slots) ──
+  auto frag_A_0 = thr_mma.partition_fragment_A(smem_C_ktiled(_, _, _0{}));
+  auto frag_A_1 = make_fragment_like(frag_A_0);
+  auto frag_A_view_0 = s2r_thr_A.retile_D(frag_A_0);
+  auto frag_A_view_1 = s2r_thr_A.retile_D(frag_A_1);
+
+  // ── Double-buffered B fragments (2 N-tiles × 2 K-slots = 4 total) ──
+  auto frag_B0_0 = thr_mma.partition_fragment_B(smem_state_nk_0(_, _, _0{}));
+  auto frag_B0_1 = make_fragment_like(frag_B0_0);
+  auto frag_B_view0_0 = s2r_thr_B.retile_D(frag_B0_0);
+  auto frag_B_view0_1 = s2r_thr_B.retile_D(frag_B0_1);
+
+  auto frag_B1_0 = thr_mma.partition_fragment_B(smem_state_nk_1(_, _, _0{}));
+  auto frag_B1_1 = make_fragment_like(frag_B1_0);
+  auto frag_B_view1_0 = s2r_thr_B.retile_D(frag_B1_0);
+  auto frag_B_view1_1 = s2r_thr_B.retile_D(frag_B1_1);
+
+  // ── Clear accumulators ──
+  clear(frag_y_0);
+  clear(frag_y_1);
+
+  // ── Prologue: load and convert k=0 into slot 0 ──
+  cute::copy(s2r_A, smem_C_s2r(_, _, _, 0), frag_A_view_0);
+  cute::copy(s2r_B, smem_state_s2r_0(_, _, _, 0), frag_B_view0_0);
+  cute::copy(s2r_B, smem_state_s2r_1(_, _, _, 0), frag_B_view1_0);
+  convert_frag<input_t, mma_type>(frag_A_0);
+  convert_frag<state_t, mma_type>(frag_B0_0);
+  convert_frag<state_t, mma_type>(frag_B1_0);
+
+  // ── Pipelined K-loop: load nxt, gemm cur, convert nxt ──
+  // Even iterations: cur=slot0, nxt=slot1. Odd: cur=slot1, nxt=slot0.
+  // #pragma unroll resolves k%2 and k+1<NUM_K_TILES at compile time.
+#pragma unroll
+  for (int k = 0; k < NUM_K_TILES; ++k) {
+    if (k % 2 == 0) {
+      if (k + 1 < NUM_K_TILES) {
+        cute::copy(s2r_A, smem_C_s2r(_, _, _, k + 1), frag_A_view_1);
+        cute::copy(s2r_B, smem_state_s2r_0(_, _, _, k + 1), frag_B_view0_1);
+        cute::copy(s2r_B, smem_state_s2r_1(_, _, _, k + 1), frag_B_view1_1);
+      }
+      cute::gemm(tiled_mma, frag_y_0, frag_A_0, frag_B0_0, frag_y_0);
+      cute::gemm(tiled_mma, frag_y_1, frag_A_0, frag_B1_0, frag_y_1);
+      if (k + 1 < NUM_K_TILES) {
+        convert_frag<input_t, mma_type>(frag_A_1);
+        convert_frag<state_t, mma_type>(frag_B0_1);
+        convert_frag<state_t, mma_type>(frag_B1_1);
+      }
+    } else {
+      if (k + 1 < NUM_K_TILES) {
+        cute::copy(s2r_A, smem_C_s2r(_, _, _, k + 1), frag_A_view_0);
+        cute::copy(s2r_B, smem_state_s2r_0(_, _, _, k + 1), frag_B_view0_0);
+        cute::copy(s2r_B, smem_state_s2r_1(_, _, _, k + 1), frag_B_view1_0);
+      }
+      cute::gemm(tiled_mma, frag_y_0, frag_A_1, frag_B0_1, frag_y_0);
+      cute::gemm(tiled_mma, frag_y_1, frag_A_1, frag_B1_1, frag_y_1);
+      if (k + 1 < NUM_K_TILES) {
+        convert_frag<input_t, mma_type>(frag_A_0);
+        convert_frag<state_t, mma_type>(frag_B0_0);
+        convert_frag<state_t, mma_type>(frag_B1_0);
+      }
+    }
   }
 }
 
@@ -1291,14 +1401,6 @@ __device__ __forceinline__ void compute_and_store_output_cute(SmemT& smem,
   auto thr_mma = tiled_mma.get_slice(tid);
 
   // ── Swizzled smem views ──
-  auto layout_C_swz = make_swizzled_layout_rc<NTOKENS_PAD, DSTATE>();
-  Tensor smem_C =
-      make_tensor(make_smem_ptr(reinterpret_cast<mma_type const*>(&smem.C[0][0])), layout_C_swz);
-
-  auto layout_state_swz = make_swizzled_layout_rc<DIM, DSTATE>();
-  Tensor smem_state = make_tensor(
-      make_smem_ptr(reinterpret_cast<mma_type const*>(&smem.state[0][0])), layout_state_swz);
-
   // x: swizzled [NTOKENS_PAD, DIM]
   auto layout_x_swz = make_swizzled_layout_rc<NTOKENS_PAD, DIM>();
   Tensor smem_x =
@@ -1319,15 +1421,6 @@ __device__ __forceinline__ void compute_and_store_output_cute(SmemT& smem,
   auto s2r_thr_B = s2r_B.get_slice(tid);
   auto s2r_B_trans = make_tiled_copy_B(Copy_Atom<SM75_U16x2_LDSM_T, mma_type>{}, tiled_mma);
   auto s2r_thr_B_trans = s2r_B_trans.get_slice(tid);
-
-  // ── K-tile C for matmul 3 ──
-  constexpr int K_TILE = 16;
-  constexpr int NUM_K_TILES = DSTATE / K_TILE;
-  Tensor smem_C_ktiled =
-      local_tile(smem_C, make_tile(Int<NTOKENS_PAD>{}, Int<K_TILE>{}), make_coord(_0{}, _));
-  Tensor smem_C_s2r = s2r_thr_A.partition_S(smem_C_ktiled);
-  Tensor frag_A = thr_mma.partition_fragment_A(smem_C_ktiled(_, _, _0{}));
-  Tensor frag_A_view = s2r_thr_A.retile_D(frag_A);
 
   // ── Load CB_scaled A operand from smem (precomputed by warps 0,1 between syncs) ──
   auto layout_cb_swz = composition(Swizzle<3, 3, 3>{},
@@ -1361,44 +1454,11 @@ __device__ __forceinline__ void compute_and_store_output_cute(SmemT& smem,
     pred(i) = get<0>(id_part(i)) < NTOKENS;
   }
 
-  // ── Fused matmul 3: C @ state^T across both N-tiles in one K-loop ──
-  // Both N-tiles share the same A operand (C), so we load C once per K-tile
-  // and dispatch two independent HMMAs — one per N-tile accumulator.
-  constexpr int NUM_N_TILES = DIM / N_TILE;
-  static_assert(NUM_N_TILES == 2, "Fused init_out assumes DIM/N_TILE == 2");
-
-  // State B operands for both N-tiles
-  Tensor smem_state_nk_0 =
-      local_tile(smem_state, make_tile(Int<N_TILE>{}, Int<K_TILE>{}), make_coord(0, _));
-  Tensor smem_state_nk_1 =
-      local_tile(smem_state, make_tile(Int<N_TILE>{}, Int<K_TILE>{}), make_coord(1, _));
-  auto smem_state_s2r_0 = s2r_thr_B.partition_S(smem_state_nk_0);
-  auto smem_state_s2r_1 = s2r_thr_B.partition_S(smem_state_nk_1);
-
-  // B fragments for both N-tiles
-  auto frag_B_0 = thr_mma.partition_fragment_B(smem_state_nk_0(_, _, _0{}));
-  auto frag_B_view_0 = s2r_thr_B.retile_D(frag_B_0);
-  auto frag_B_1 = thr_mma.partition_fragment_B(smem_state_nk_1(_, _, _0{}));
-  auto frag_B_view_1 = s2r_thr_B.retile_D(frag_B_1);
-
-  // Two accumulators
+  // ── Matmul 3: init_out = C @ state^T (K-pipelined, see add_init_out_cute) ──
   Tensor frag_y_0 = thr_mma.partition_fragment_C(id_tile);
   Tensor frag_y_1 = thr_mma.partition_fragment_C(id_tile);
-  clear(frag_y_0);
-  clear(frag_y_1);
-
-  // Fused K-tile loop: load C once, two B loads, two HMMAs
-#pragma unroll
-  for (int k = 0; k < NUM_K_TILES; ++k) {
-    cute::copy(s2r_A, smem_C_s2r(_, _, _, k), frag_A_view);
-    cute::copy(s2r_B, smem_state_s2r_0(_, _, _, k), frag_B_view_0);
-    cute::copy(s2r_B, smem_state_s2r_1(_, _, _, k), frag_B_view_1);
-    convert_frag<input_t, mma_type>(frag_A);
-    convert_frag<state_t, mma_type>(frag_B_0);
-    convert_frag<state_t, mma_type>(frag_B_1);
-    cute::gemm(tiled_mma, frag_y_0, frag_A, frag_B_0, frag_y_0);
-    cute::gemm(tiled_mma, frag_y_1, frag_A, frag_B_1, frag_y_1);
-  }
+  add_init_out_cute<input_t, state_t, NTOKENS, DIM, DSTATE, NUM_WARPS>(smem, tiled_mma, thr_mma,
+                                                                       tid, frag_y_0, frag_y_1);
 
   // ── Epilogue: decay + matmul 4 + D_skip + z-gate + store, per N-tile ──
   // Lambda to avoid duplicating the epilogue for each N-tile.
