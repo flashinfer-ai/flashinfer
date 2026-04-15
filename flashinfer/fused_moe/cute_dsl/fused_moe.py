@@ -478,13 +478,6 @@ class CuteDslMoEWrapper:
 
     def _allocate_buffers(self) -> None:
         """Pre-allocate all buffers for CUDA graph compatibility."""
-        # Final output — shared by both SM100 and SM120 paths.
-        self._moe_output = torch.empty(
-            (self.max_num_tokens, self.hidden_size),
-            dtype=self.output_dtype,
-            device=self.device,
-        )
-
         if self._is_sm120:
             # SM120: pre-allocate workspace for the fused kernel.
             from .blackwell_sm12x.moe_dispatch import (
@@ -548,6 +541,15 @@ class CuteDslMoEWrapper:
             self._aux_stream = torch.cuda.Stream(device=self.device)
             self._main_event = torch.cuda.Event()
             self._memset_event = torch.cuda.Event()
+
+        # Final output — shared by both SM100 and SM120 paths.
+        # Allocated after arch-specific buffers to preserve SM100's memory
+        # layout, which the autotuner's CUDA graph profiling is sensitive to.
+        self._moe_output = torch.empty(
+            (self.max_num_tokens, self.hidden_size),
+            dtype=self.output_dtype,
+            device=self.device,
+        )
 
     def _forward_with_tactic(
         self,
