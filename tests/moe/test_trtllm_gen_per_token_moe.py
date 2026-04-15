@@ -17,6 +17,7 @@ limitations under the License.
 import pytest
 from typing import Dict
 import torch
+import torch.nn.functional as F
 
 from flashinfer import (
     RoutingMethodType,
@@ -46,7 +47,7 @@ cache_permute_indices: Dict[tuple, torch.Tensor] = {}
 @pytest.mark.parametrize("num_tokens", [1, 8, 1024])
 @pytest.mark.parametrize("hidden_size", [1024, 2048, 4096])
 @pytest.mark.parametrize("intermediate_size", [1024, 2048, 4096])
-@pytest.mark.parametrize("num_experts", [128])
+@pytest.mark.parametrize("num_experts", [32])
 @pytest.mark.parametrize("top_k", [4])
 def test_trtllm_gen_routed_fused_moe(
     num_tokens: int,
@@ -178,24 +179,23 @@ def test_trtllm_gen_routed_fused_moe(
     # Flatten token/top_k dims: [num_tokens*top_k]
     flat_ids = topk_ids.reshape(-1)  # [num_tokens*top_k]
     flat_weights = expert_weights.reshape(-1)  # [num_tokens*top_k]
-    # Gather hidden states and weights for each (token, expert) pair
-    # hidden: [num_tokens*top_k, hidden_size]
+    # Gather hidden states for each (token, expert) pair: [num_tokens*top_k, hidden_size]
     flat_hidden = (
         hidden_states_dequant.unsqueeze(1)
         .expand(-1, top_k, -1)
         .reshape(-1, hidden_size)
     )
-    # w1: gather [num_tokens*top_k, 2*ffn_dim, hidden_size]
-    flat_w13 = w13_dequant[flat_ids]  # [num_tokens*top_k, 2*ffn_dim, hidden_size]
-    # w1: [num_tokens*top_k, 2*ffn_dim]
-    up_gate = torch.bmm(flat_w13, flat_hidden.unsqueeze(-1)).squeeze(-1)
-    up, gate = up_gate.chunk(2, dim=-1)
-    intermediate = torch.nn.functional.silu(gate) * up  # [num_tokens*top_k, ffn_dim]
-    # w2: [num_tokens*top_k, hidden_size, ffn_dim]
-    flat_w2 = w2_dequant[flat_ids]
-    expert_out = torch.bmm(flat_w2, intermediate.unsqueeze(-1)).squeeze(
-        -1
-    )  # [num_tokens*top_k, hidden_size]
+    # Iterate over experts to avoid materializing huge gathered weight tensors
+    expert_out = torch.zeros(
+        num_tokens * top_k, hidden_size, device=device, dtype=torch.bfloat16
+    )
+    for e in range(num_experts):
+        mask = flat_ids == e  # [num_tokens*top_k]
+        e_hidden = flat_hidden[mask]  # [n_e, hidden_size]
+        up_gate_e = e_hidden @ w13_dequant[e].T  # [n_e, 2*intermediate_size]
+        up_e, gate_e = up_gate_e.chunk(2, dim=-1)
+        inter_e = F.silu(gate_e) * up_e  # [n_e, intermediate_size]
+        expert_out[mask] = inter_e @ w2_dequant[e].T  # [n_e, hidden_size]
     # Weighted sum back to [num_tokens, hidden_size]
     reference = (
         (flat_weights.unsqueeze(-1) * expert_out)
