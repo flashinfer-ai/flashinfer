@@ -782,10 +782,9 @@ def run_trtllm_fmha_v2_prefill_case(
     [
         (torch.float16, torch.float16),
         (torch.bfloat16, torch.bfloat16),
-        # todo(jimmyzho) skip all fp8 tests due to unmitigated hangs
-        # (torch.float8_e4m3fn, torch.float8_e4m3fn),
-        # (torch.float8_e4m3fn, torch.bfloat16),
-        # (torch.float8_e4m3fn, torch.float16),
+        (torch.float8_e4m3fn, torch.float8_e4m3fn),
+        (torch.float8_e4m3fn, torch.bfloat16),
+        (torch.float8_e4m3fn, torch.float16),
     ],
 )
 @pytest.mark.parametrize(
@@ -828,6 +827,8 @@ def test_trtllm_fmha_v2_prefill(
     pos_encoding_mode: str,
     save_softmax_stats: bool,
 ) -> None:
+    if dtype == torch.float8_e4m3fn:
+        pytest.skip("FP8 (e4m3) FMHA v2 kernels are known to hang on SM90")
     run_trtllm_fmha_v2_prefill_case(
         input_layout=input_layout,
         batch_size=batch_size,
@@ -858,8 +859,7 @@ def test_trtllm_fmha_v2_prefill(
     [
         (torch.float16, torch.float16),
         (torch.bfloat16, torch.bfloat16),
-        # todo(jimmyzho) skip all fp8 tests due to unmitigated hangs
-        # (torch.float8_e4m3fn, torch.float16),
+        (torch.float8_e4m3fn, torch.float16),
     ],
 )
 @pytest.mark.parametrize(
@@ -889,6 +889,8 @@ def test_trtllm_fmha_v2_prefill_skip_softmax(
     rtol: float,
     atol: float,
 ) -> None:
+    if dtype == torch.float8_e4m3fn:
+        pytest.skip("FP8 (e4m3) FMHA v2 kernels are known to hang on SM90")
     run_trtllm_fmha_v2_prefill_case(
         input_layout=input_layout,
         batch_size=batch_size,
