@@ -1298,15 +1298,16 @@ class BatchDecodeWithPagedKVCacheWrapper:
         key_block_scales = None
         value_block_scales = None
         if kv_cache_sf is not None:
-            if (
-                not isinstance(kv_cache_sf, (tuple, list))
-                or len(kv_cache_sf) != 2
-                or not all(torch.is_tensor(x) for x in kv_cache_sf)
-            ):
+            if isinstance(kv_cache_sf, (tuple, list)):
+                key_block_scales, value_block_scales = kv_cache_sf
+            elif torch.is_tensor(kv_cache_sf):
+                # stacked tensor [num_pages, 2, ...] — unbind along dim 1
+                key_block_scales, value_block_scales = kv_cache_sf.unbind(dim=1)
+            else:
                 raise TypeError(
-                    "kv_cache_sf must be a tuple/list of two tensors: (k_scales, v_scales)."
+                    "kv_cache_sf must be a tuple/list of two tensors or a stacked tensor "
+                    "of shape [num_pages, 2, ...]: (k_scales, v_scales)."
                 )
-            key_block_scales, value_block_scales = kv_cache_sf
 
         if self._kv_layout == "NHD":
             page_size = k_cache.shape[1]
