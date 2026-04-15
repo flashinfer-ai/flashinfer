@@ -6,15 +6,20 @@
 : "${JUNIT_DIR:=$(realpath ./junit)}"
 
 # Cap ninja parallelism by available RAM (~12 GB per nvcc process) to avoid OOM
-# during JIT compilation.
+# during JIT compilation.  Exported because flashinfer/jit/cpp_ext.py reads it
+# from the environment (os.environ) inside the child Python process.
 if [ -z "${MAX_JOBS:-}" ]; then
-    _mem_gb=$(awk '/MemAvailable/ {printf "%d", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo 0)
+    _num_cpus=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+    _mem_gb=$(awk '/MemAvailable/ {printf "%d", $2/1024/1024}' /proc/meminfo 2>/dev/null)
+    _mem_gb=${_mem_gb:-0}
     if [ "$_mem_gb" -gt 0 ]; then
         MAX_JOBS=$(( (_mem_gb - 8) / 12 ))
-        [ "$MAX_JOBS" -lt 4 ] && MAX_JOBS=4
+        [ "$MAX_JOBS" -lt 1 ] && MAX_JOBS=1
+        [ "$MAX_JOBS" -gt "$_num_cpus" ] && MAX_JOBS=$_num_cpus
     else
-        MAX_JOBS=$(nproc 2>/dev/null || echo 4)
+        MAX_JOBS=$_num_cpus
     fi
+    unset _num_cpus _mem_gb
 fi
 export MAX_JOBS
 
