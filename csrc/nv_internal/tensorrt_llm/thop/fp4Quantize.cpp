@@ -282,7 +282,9 @@ void nvfp4_quant_and_per_token_scale(TensorView const input, double scale_inv_, 
   auto const& inputShape = input.sizes();
   auto m = inputShape[0];
   auto n = inputShape[1];
-  TVM_FFI_ICHECK_EQ(output_per_token_scale.numel(), m) << "output must have shape [m]";
+  if (!expanded_idx_to_permuted_idx.has_value()) {
+    TVM_FFI_ICHECK_EQ(output_per_token_scale.numel(), m) << "output must have shape [m]";
+  }
 
   auto const& sfOutputShape = output_scale.sizes();
   auto sf_m = sfOutputShape[0];

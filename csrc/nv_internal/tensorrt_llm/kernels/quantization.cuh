@@ -51,9 +51,8 @@ __device__ __forceinline__ void loadPackedVec(VecT& val, VecT const* ptr) {
   }
 }
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && defined(__CUDACC_VER_MAJOR__) && \
-        defined(__CUDACC_VER_MINOR__) &&                                                  \
-        (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 9) ||                      \
-    (__CUDACC_VER_MAJOR__ >= 13)
+    defined(__CUDACC_VER_MINOR__) &&                                                      \
+    ((__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 9) || (__CUDACC_VER_MAJOR__ >= 13))
 constexpr int CVT_FP16_TO_FP4_ELTS_PER_THREAD = 16;
 #else
 constexpr int CVT_FP16_TO_FP4_ELTS_PER_THREAD = 8;
