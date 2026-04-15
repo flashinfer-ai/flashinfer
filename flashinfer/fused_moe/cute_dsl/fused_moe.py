@@ -184,53 +184,11 @@ def _moe_core_impl(
     num_tokens = token_selected_experts.size(0)
     hidden_size = w2_weight.size(1)
 
-    # SM120/SM121: dispatch to fused kernel (route+pack+FC1+FC2 in one launch).
-    # Selects static (decode) or dynamic (prefill) based on token count.
-    major, minor = torch.cuda.get_device_capability(x.device)
-    if major == 12:
-        from ...jit.cpp_ext import get_cuda_version
-
-        if get_cuda_version().major < 13:
-            raise ValueError(
-                "SM120 CuTe DSL fused MoE requires CUDA 13 or later. "
-                f"Current CUDA version: {get_cuda_version()}."
-            )
-        from .blackwell_sm12x.moe_dispatch import launch_sm120_moe
-
-        num_experts_local = (
-            num_local_experts if num_local_experts is not None else num_experts
-        )
-
-        if local_expert_offset != 0:
-            raise ValueError(
-                "SM120 MoE does not support expert parallelism (local_expert_offset != 0). "
-                "Use the SM100 CuTe DSL or CUTLASS backend for EP configurations."
-            )
-
-        if moe_output is None:
-            moe_output = torch.empty(
-                (num_tokens, hidden_size),
-                dtype=output_dtype,
-                device=x.device,
-            )
-
-        # On SM120 the caller passes bf16 activations as x directly.
-        return launch_sm120_moe(
-            a=x,  # bf16 [num_tokens, hidden_size]
-            topk_ids=token_selected_experts,
-            topk_weights=token_final_scales,
-            w1_weight=w1_weight,
-            w1_weight_sf=w1_weight_sf,
-            w1_alpha=w1_alpha,
-            fc2_input_scale=fc2_input_scale,
-            w2_weight=w2_weight,
-            w2_weight_sf=w2_weight_sf,
-            w2_alpha=w2_alpha,
-            num_experts=num_experts,
-            top_k=top_k,
-            num_local_experts=num_experts_local,
-            scatter_output=moe_output,
-        )
+    # NOTE: SM120/SM121 dispatch is handled by callers (CuteDslMoEWrapper.run
+    # and cute_dsl_fused_moe_nvfp4) before reaching this function.
+    # Do NOT call torch.cuda.get_device_capability() here — it would execute
+    # inside the autotuner's CUDA graph capture context, which can corrupt
+    # graph capture on CUDA 12.
 
     # Allocate output if not provided.  The caller (wrapper or functional
     # API) should pass a [:num_tokens] slice of the pre-allocated buffer
@@ -922,16 +880,24 @@ def cute_dsl_fused_moe_nvfp4(
     # On SM120 the caller passes bf16 activations as x; x_sf is ignored.
     major, _ = torch.cuda.get_device_capability(x.device)
     if major == 12:
+        from ...jit.cpp_ext import get_cuda_version
+
+        if get_cuda_version().major < 13:
+            raise ValueError(
+                "SM120 CuTe DSL fused MoE requires CUDA 13 or later. "
+                f"Current CUDA version: {get_cuda_version()}."
+            )
         if local_expert_offset != 0:
             raise ValueError(
                 "SM120 MoE does not support expert parallelism "
                 "(local_expert_offset != 0)."
             )
-        return _moe_core_impl(
-            x=x,
-            x_sf=x_sf,
-            token_selected_experts=token_selected_experts,
-            token_final_scales=token_final_scales,
+        from .blackwell_sm12x.moe_dispatch import launch_sm120_moe
+
+        return launch_sm120_moe(
+            a=x,
+            topk_ids=token_selected_experts,
+            topk_weights=token_final_scales,
             w1_weight=w1_weight,
             w1_weight_sf=w1_weight_sf,
             w1_alpha=w1_alpha,
@@ -941,11 +907,8 @@ def cute_dsl_fused_moe_nvfp4(
             w2_alpha=w2_alpha,
             num_experts=num_experts,
             top_k=top_k,
-            num_local_experts=num_local_experts,
-            local_expert_offset=local_expert_offset,
-            moe_output=moe_output,
-            output_dtype=output_dtype,
-            enable_pdl=enable_pdl,
+            num_local_experts=num_local_experts or num_experts,
+            scatter_output=moe_output,
         )
 
     tuner = AutoTuner.get()
