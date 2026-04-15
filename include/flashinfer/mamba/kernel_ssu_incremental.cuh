@@ -336,6 +336,34 @@ __device__ __forceinline__ void load_B_cute(SmemT& smem, input_t const* __restri
   copy_if(g2s, pred, thr.partition_S(gB), thr.partition_D(sB));
 }
 
+// Single-warp swizzled load for old_B via CuTe TiledCopy with ZFILL predicate.
+// Mirrors load_B_cute but targets smem.old_B.
+template <typename input_t, int NTOKENS, int DSTATE, typename SmemT>
+__device__ __forceinline__ void load_old_B_cute(SmemT& smem, input_t const* __restrict__ old_B_ptr,
+                                                int64_t oB_base, int old_B_stride_mtp, int lane) {
+  using namespace cute;
+  constexpr int NTOKENS_PAD = SmemT::NTOKENS_PAD;
+
+  Tensor sOB = make_tensor(make_smem_ptr(reinterpret_cast<input_t*>(&smem.old_B[0][0])),
+                           make_swizzled_layout_rc<NTOKENS_PAD, DSTATE>());
+  Tensor gOB = make_tensor(make_gmem_ptr(old_B_ptr + oB_base),
+                           make_layout(make_shape(Int<NTOKENS_PAD>{}, Int<DSTATE>{}),
+                                       make_stride(old_B_stride_mtp, Int<1>{})));
+
+  auto g2s = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS_ZFILL<uint128_t>, input_t>{},
+                             Layout<Shape<_4, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, _8>>{});
+  auto thr = g2s.get_slice(lane);
+
+  auto id = make_identity_tensor(make_shape(Int<NTOKENS_PAD>{}, Int<DSTATE>{}));
+  auto thr_id = thr.partition_S(id);
+  auto pred = make_tensor<bool>(shape(thr_id));
+  CUTE_UNROLL
+  for (int i = 0; i < size(pred); ++i) {
+    pred(i) = get<0>(thr_id(i)) < NTOKENS;
+  }
+  copy_if(g2s, pred, thr.partition_S(gOB), thr.partition_D(sOB));
+}
+
 // Swizzled load for old_x via CuTe TiledCopy with ZFILL predicate.
 // Smem shape [NTOKENS_PAD, DIM] swizzled. Rows >= NTOKENS are zero-filled.
 template <typename input_t, int NTOKENS, int DIM, typename SmemT>
@@ -581,97 +609,18 @@ __device__ __forceinline__ void load_data(SmemT& smem, SsuIncrementalParams cons
   int64_t const oB_base = cache_slot * params.old_B_stride_cache +
                           buf_read * params.old_B_stride_dbuf + group_idx * DSTATE;
 
-  // ── Warp 0: cp.async B[T, dstate] (swizzled smem) ──
+  // ── Warp 0: cp.async B[T, dstate] + old_B[T, dstate] (swizzled smem) ──
   if (warp == 0) {
     load_B_cute<input_t, NTOKENS, DSTATE>(smem, B_ptr, B_base, params.B_stride_mtp, lane);
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+    load_old_B_cute<input_t, NTOKENS, DSTATE>(smem, old_B_ptr, oB_base, params.old_B_stride_mtp,
+                                              lane);
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
   }
 
-  // ── Warp 1: cp.async C[T, dstate] (swizzled smem, CuTe TiledCopy) ──
-  if (warp == 1) {
-    load_C_cute_manual<input_t, NTOKENS, DSTATE>(smem, C_ptr, C_base, params.C_stride_mtp, lane);
-    // load_C_cute<input_t, NTOKENS, DSTATE>(smem, C_ptr, C_base, params.C_stride_mtp, lane);
-  }
-
-  // ── Warp 2: cp.async x[T, dim] + old_x[T, dim] (swizzled when USE_TENSOR_MMA) ──
-  if (warp == 2) {
-    constexpr bool X_SWIZZLE = (sizeof(state_t) == 2);
-    if constexpr (X_SWIZZLE) {
-      load_x_cute<input_t, NTOKENS, DIM>(smem, x_ptr, x_base, params.x_stride_mtp, lane);
-      load_old_x_cute<input_t, NTOKENS, DIM>(smem, old_x_ptr, ox_base, params.old_x_stride_mtp,
-                                             lane);
-    } else {
-      load_x<input_t, NTOKENS, DIM>(smem, x_ptr, x_base, params.x_stride_mtp, lane);
-    }
-  }
-
-  // ── Warp 3: cp.async z[T, dim] (if present) ──
-  // Swizzled when USE_TENSOR_MMA (partition_C reads in z-gating epilogue).
-  // Flat when !USE_TENSOR_MMA (SIMT path reads via smem.z[t][d] array indexing).
-  if (warp == 3) {
-    if (z_ptr) {
-      int64_t const z_base = (int64_t)batch_idx * params.z_stride_batch + head * DIM;
-      constexpr bool Z_SWIZZLE = (sizeof(state_t) == 2);
-      if constexpr (Z_SWIZZLE) {
-        load_z_cute<input_t, NTOKENS, DIM>(smem, z_ptr, z_base, params.z_stride_mtp, lane);
-      } else {
-        load_z<input_t, NTOKENS, DIM>(smem, z_ptr, z_base, params.z_stride_mtp, lane);
-      }
-    }
-  }
-
-  // ── All warps: cp.async state[DIM, DSTATE] (swizzled when USE_TENSOR_MMA) ──
-  {
-    constexpr bool USE_TENSOR_MMA = (sizeof(state_t) == 2);
-    auto const* __restrict__ state_ptr = reinterpret_cast<state_t const*>(params.state);
-    int64_t const state_base =
-        cache_slot * params.state_stride_batch + (int64_t)head * DIM * DSTATE;
-    if constexpr (USE_TENSOR_MMA) {
-      load_state_cute<state_t, DIM, DSTATE, NUM_WARPS>(smem, state_ptr, state_base, flat_tid);
-    } else {
-      load_state<state_t, DIM, DSTATE, NUM_WARPS>(smem, state_ptr, state_base, flat_tid);
-    }
-  }
-
-  // ── All warps: plain LDG for old_x[T, dim] (SIMT path only; MMA path loaded by warp 2) ──
-  {
-    constexpr bool USE_TENSOR_MMA_OX = (sizeof(state_t) == 2);
-    if constexpr (!USE_TENSOR_MMA_OX) {
-      constexpr int total_elems = NTOKENS * DIM;
-      for (int i = flat_tid; i < total_elems; i += num_threads) {
-        int const t = i / DIM;
-        int const d = i % DIM;
-        smem.old_x[t][d] = old_x_ptr[ox_base + t * params.old_x_stride_mtp + d];
-      }
-    }
-  }
-
-  // ── All warps: old_B[T, dstate] → swizzled [NTOKENS_PAD, DSTATE] via CuTe TiledCopy + ZFILL ──
-  {
-    using namespace cute;
-    constexpr int NTOKENS_PAD = SmemT::NTOKENS_PAD;
-    Tensor sOB = make_tensor(make_smem_ptr(reinterpret_cast<input_t*>(&smem.old_B[0][0])),
-                             make_swizzled_layout_rc<NTOKENS_PAD, DSTATE>());
-    Tensor gOB = make_tensor(make_gmem_ptr(old_B_ptr + oB_base),
-                             make_layout(make_shape(Int<NTOKENS_PAD>{}, Int<DSTATE>{}),
-                                         make_stride(params.old_B_stride_mtp, Int<1>{})));
-    // 128 threads: 16 rows × 8 cols, each thread copies 8 bf16 (128 bits)
-    auto g2s = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS_ZFILL<uint128_t>, input_t>{},
-                               Layout<Shape<_16, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, _8>>{});
-    auto thr = g2s.get_slice(flat_tid);
-    auto id = make_identity_tensor(make_shape(Int<NTOKENS_PAD>{}, Int<DSTATE>{}));
-    auto thr_id = thr.partition_S(id);
-    auto pred = make_tensor<bool>(shape(thr_id));
-    CUTE_UNROLL
-    for (int i = 0; i < size(pred); ++i) {
-      pred(i) = get<0>(thr_id(i)) < NTOKENS;
-    }
-    copy_if(g2s, pred, thr.partition_S(gOB), thr.partition_D(sOB));
-  }
-
-  // ── Warp 0: scalar loads + cumAdt (all synchronous, no cp.async) ──
-  // NTOKENS < warpSize, so flat_tid < NTOKENS ↔ warp 0 lanes 0..NTOKENS-1.
+  // ── Warp 1: scalar loads + cumAdt reduction (all synchronous, no cp.async) ──
   static_assert(NTOKENS <= warpSize, "NTOKENS must fit in a single warp");
-  if (warp == 0) {
+  if (warp == 1) {
     if (lane < NTOKENS) {
       int64_t const dt_rd_base = cache_slot * params.old_dt_proc_stride_cache +
                                  buf_read * params.old_dt_proc_stride_dbuf +
@@ -694,8 +643,60 @@ __device__ __forceinline__ void load_data(SmemT& smem, SsuIncrementalParams cons
     compute_cumAdt<NTOKENS>(smem, lane, A_val);
   }
 
-  // Commit cp.async and wait
+  // ── Warp 2: cp.async x[T, dim] + old_x[T, dim] ──
+  if (warp == 2) {
+    constexpr bool X_SWIZZLE = (sizeof(state_t) == 2);
+    if constexpr (X_SWIZZLE) {
+      load_x_cute<input_t, NTOKENS, DIM>(smem, x_ptr, x_base, params.x_stride_mtp, lane);
+      asm volatile("cp.async.commit_group;\n" ::: "memory");
+      load_old_x_cute<input_t, NTOKENS, DIM>(smem, old_x_ptr, ox_base, params.old_x_stride_mtp,
+                                             lane);
+      asm volatile("cp.async.commit_group;\n" ::: "memory");
+    } else {
+      load_x<input_t, NTOKENS, DIM>(smem, x_ptr, x_base, params.x_stride_mtp, lane);
+      asm volatile("cp.async.commit_group;\n" ::: "memory");
+      // SIMT path: single-warp plain LDG for old_x (no cp.async)
+      constexpr int total_elems = NTOKENS * DIM;
+      for (int i = lane; i < total_elems; i += warpSize) {
+        int const t = i / DIM;
+        int const d = i % DIM;
+        smem.old_x[t][d] = old_x_ptr[ox_base + t * params.old_x_stride_mtp + d];
+      }
+    }
+  }
+
+  // ── Warp 3: cp.async C[T, dstate] + z[T, dim] ──
+  if (warp == 3) {
+    load_C_cute_manual<input_t, NTOKENS, DSTATE>(smem, C_ptr, C_base, params.C_stride_mtp, lane);
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+    // load_C_cute<input_t, NTOKENS, DSTATE>(smem, C_ptr, C_base, params.C_stride_mtp, lane);
+    if (z_ptr) {
+      int64_t const z_base = (int64_t)batch_idx * params.z_stride_batch + head * DIM;
+      constexpr bool Z_SWIZZLE = (sizeof(state_t) == 2);
+      if constexpr (Z_SWIZZLE) {
+        load_z_cute<input_t, NTOKENS, DIM>(smem, z_ptr, z_base, params.z_stride_mtp, lane);
+      } else {
+        load_z<input_t, NTOKENS, DIM>(smem, z_ptr, z_base, params.z_stride_mtp, lane);
+      }
+    }
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+  }
+
+  // ── All warps: cp.async state[DIM, DSTATE] (swizzled when USE_TENSOR_MMA) ──
+  {
+    constexpr bool USE_TENSOR_MMA = (sizeof(state_t) == 2);
+    auto const* __restrict__ state_ptr = reinterpret_cast<state_t const*>(params.state);
+    int64_t const state_base =
+        cache_slot * params.state_stride_batch + (int64_t)head * DIM * DSTATE;
+    if constexpr (USE_TENSOR_MMA) {
+      load_state_cute<state_t, DIM, DSTATE, NUM_WARPS>(smem, state_ptr, state_base, flat_tid);
+    } else {
+      load_state<state_t, DIM, DSTATE, NUM_WARPS>(smem, state_ptr, state_base, flat_tid);
+    }
+  }
   asm volatile("cp.async.commit_group;\n" ::: "memory");
+
+  // Wait for all cp.async groups to complete
   asm volatile("cp.async.wait_group 0;\n" ::: "memory");
 
   // x padding rows are already zero-filled by load_x_cute's ZFILL predicate.
@@ -1671,20 +1672,21 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   int64_t const cache_slot = sbi ? static_cast<int64_t>(sbi[batch_idx]) : batch_idx;
   if (cache_slot == params.pad_slot_id) return;
 
-  // ── Double-buffer index ──
+  // ── Double-buffer index (buf_write deferred to Phase 3 to avoid stalling warps 2,3) ──
   auto const* __restrict__ buf_idx_ptr = reinterpret_cast<int32_t const*>(params.cache_buf_idx);
-  int const buf_read = buf_idx_ptr[cache_slot];
-  int const buf_write = 1 - buf_read;
+  int const buf_read = __ldg(&buf_idx_ptr[cache_slot]);
 
   // ── prev_num_accepted_tokens ──
   auto const* __restrict__ prev_ptr = reinterpret_cast<int32_t const*>(params.prev_num_accepted);
   int const prev_k = prev_ptr[cache_slot];
 
-  // ── Load A (scalar, tie_hdim) and dt_bias ──
+  // ── Load A (scalar, tie_hdim), dt_bias, and D (hoisted to hide gmem latency) ──
   auto const* __restrict__ A_ptr = reinterpret_cast<matrixA_t const*>(params.A);
   auto const* __restrict__ dt_bias_ptr = reinterpret_cast<weight_t const*>(params.dt_bias);
+  auto const* __restrict__ D_ptr = reinterpret_cast<weight_t const*>(params.D);
   float const A_val = toFloat(A_ptr[head]);
   float const dt_bias_val = dt_bias_ptr ? toFloat(dt_bias_ptr[head]) : 0.f;
+  float const D_val = D_ptr ? toFloat(D_ptr[head]) : 0.f;
 
   // ════════════════════════════════════════════════════════════════════════
   // Phase 0: Load all data into smem
@@ -1721,8 +1723,7 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   // ════════════════════════════════════════════════════════════════════════
   // Phase 2: Output — y[t,d] = init_out + cb_out + D*x, then z-gate
   // ════════════════════════════════════════════════════════════════════════
-  auto const* __restrict__ D_ptr = reinterpret_cast<weight_t const*>(params.D);
-  float const D_val = D_ptr ? toFloat(D_ptr[head]) : 0.f;
+  // D_val already loaded in preamble (gmem latency hidden behind Phase 0+1).
 
   if constexpr (USE_TENSOR_MMA) {
     // Fused: matmul 3 + decay + matmul 4 + D*x + z-gate → direct gmem store (no smem.out)
@@ -1737,6 +1738,8 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   }
 
   // ── Phase 3: Store to global memory ──
+  int const buf_write = 1 - buf_read;
+
   // State writeback — all warps
   store_state<state_t, DIM, DSTATE, NUM_WARPS>(smem, params, warp, lane, head, cache_slot);
 
