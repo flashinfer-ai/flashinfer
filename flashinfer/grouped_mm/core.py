@@ -18,6 +18,7 @@ import torch
 from ..api_logging import flashinfer_api
 from ..gemm.gemm_base import _get_real_fp4_shape_from_packed_uint8
 from ..utils import (
+    _get_cache_buf,
     backend_requirement,
     supported_compute_capability,
 )
@@ -122,7 +123,7 @@ def _to_cudnn_dtype(dtype: torch.dtype):
 # ---------------------------------------------------------------------------
 
 
-@functools.cache
+@functools.lru_cache(maxsize=1024)
 def _build_cudnn_moe_grouped_gemm_graph(
     handle,
     token_shape,
@@ -258,12 +259,12 @@ def _run_cudnn_moe_grouped_gemm(
     if alpha is not None:
         variant_pack[_CUDNN_UIDs.ALPHA.value] = alpha_3d
 
-    workspace = torch.empty(ws, device=a.device, dtype=torch.uint8)
+    workspace = _get_cache_buf("grouped_mm_workspace", ws, a.device)
     graph.execute(variant_pack, workspace, handle=handle)
     return out
 
 
-@functools.cache
+@functools.lru_cache(maxsize=1024)
 def _build_cudnn_moe_block_scale_grouped_gemm_graph(
     handle,
     token_shape,
@@ -449,7 +450,7 @@ def _run_cudnn_moe_block_scale_grouped_gemm_mxfp8(
     if alpha is not None:
         variant_pack[_CUDNN_UIDs.ALPHA.value] = alpha_3d
 
-    workspace = torch.empty(ws, device=a.device, dtype=torch.uint8)
+    workspace = _get_cache_buf("grouped_mm_mxfp8_workspace", ws, a.device)
     graph.execute(variant_pack, workspace, handle=handle)
     return out
 
@@ -534,7 +535,7 @@ def _run_cudnn_moe_block_scale_grouped_gemm_fp4(
     if alpha is not None:
         variant_pack[_CUDNN_UIDs.ALPHA.value] = alpha_3d
 
-    workspace = torch.empty(ws, device=a.device, dtype=torch.uint8)
+    workspace = _get_cache_buf("grouped_mm_fp4_workspace", ws, a.device)
     graph.execute(variant_pack, workspace, handle=handle)
     return out
 
