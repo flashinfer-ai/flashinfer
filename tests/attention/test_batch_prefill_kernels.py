@@ -1347,3 +1347,4 @@ def test_single_prefill_torch_compile_cuda_graph():
     )
     assert result.returncode == 0 and "PASS" in result.stdout, (
         f"Test failed:\nstdout: {result.stdout[-500:]}\nstderr: {result.stderr[-500:]}"
+    )
