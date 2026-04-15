@@ -147,6 +147,33 @@ struct DMA {
       return std::make_pair(kv_idx_start, kv_idx_end);
     }
 
+    static inline __device__ int compute_dynamic_q_tiles_per_head(int actual_q_seqlen) {
+      return (actual_q_seqlen + STEP_Q * NUM_COMPUTE_GROUPS - 1) / (STEP_Q * NUM_COMPUTE_GROUPS);
+    }
+
+    static inline __device__ bool decode_exact_dynamic_tile_id(
+        bert::Fused_multihead_attention_params_v2 const& params, uint32_t tile_id, int& bidb,
+        int& bidh, int& q_step_offset) {
+      int remaining = static_cast<int>(tile_id);
+
+#pragma unroll 1
+      for (int batch_idx = 0; batch_idx < params.b; ++batch_idx) {
+        int const actual_q_seqlen =
+            params.cu_q_seqlens[batch_idx + 1] - params.cu_q_seqlens[batch_idx];
+        int const q_tiles_per_head = compute_dynamic_q_tiles_per_head(actual_q_seqlen);
+        int const batch_tiles = q_tiles_per_head * params.h;
+        if (remaining < batch_tiles) {
+          bidb = batch_idx;
+          bidh = remaining / q_tiles_per_head;
+          q_step_offset = (remaining % q_tiles_per_head) * NUM_COMPUTE_GROUPS;
+          return true;
+        }
+        remaining -= batch_tiles;
+      }
+
+      return false;
+    }
+
     ////////////////////////////////////////////////////////////////////////////////////////////
 
     // Packed contiguous QKV input.
@@ -181,20 +208,27 @@ struct DMA {
           bidh = tile_id_ % params.h;
           bidb = tile_id_ / params.h;
         } else {
-          // Balanced dynamic scheduling
-          if (CAUSAL_MASK && !SLIDING_OR_CHUNKED_ATTENTION && params.use_balanced_scheduling) {
-            q_step_offset = (params.num_tiles_per_head - 1 - tile_id_ / (params.b * params.h)) *
-                            NUM_COMPUTE_GROUPS;
-            tmp = tile_id_ % (params.b * params.h);
-            bidh = tmp / params.b;
-            bidb = tmp % params.b;
+          if constexpr (DMA_GROUP_TRANSPOSE_V) {
             q_steps = NUM_COMPUTE_GROUPS;
-          } else {  // Unbalanced dynamic scheduling
-            bidb = tile_id_ / (params.h * params.num_tiles_per_head);
-            tmp = tile_id_ % (params.h * params.num_tiles_per_head);
-            bidh = tmp / params.num_tiles_per_head;
-            q_step_offset = tmp % params.num_tiles_per_head * NUM_COMPUTE_GROUPS;
-            q_steps = NUM_COMPUTE_GROUPS;
+            if (!decode_exact_dynamic_tile_id(params, tile_id_, bidb, bidh, q_step_offset)) {
+              break;
+            }
+          } else {
+            // Balanced dynamic scheduling
+            if (CAUSAL_MASK && !SLIDING_OR_CHUNKED_ATTENTION && params.use_balanced_scheduling) {
+              q_step_offset = (params.num_tiles_per_head - 1 - tile_id_ / (params.b * params.h)) *
+                              NUM_COMPUTE_GROUPS;
+              tmp = tile_id_ % (params.b * params.h);
+              bidh = tmp / params.b;
+              bidb = tmp % params.b;
+              q_steps = NUM_COMPUTE_GROUPS;
+            } else {  // Unbalanced dynamic scheduling
+              bidb = tile_id_ / (params.h * params.num_tiles_per_head);
+              tmp = tile_id_ % (params.h * params.num_tiles_per_head);
+              bidh = tmp / params.num_tiles_per_head;
+              q_step_offset = tmp % params.num_tiles_per_head * NUM_COMPUTE_GROUPS;
+              q_steps = NUM_COMPUTE_GROUPS;
+            }
           }
         }
 
@@ -330,6 +364,13 @@ struct DMA {
         if (SCHEDULING_MODE == 0) {
           bidh = tile_id_ % params.h;
           bidb = tile_id_ / params.h;
+        } else if constexpr (DMA_GROUP_TRANSPOSE_V) {
+          q_steps = NUM_COMPUTE_GROUPS;
+          int q_step_offset;
+          if (!decode_exact_dynamic_tile_id(params, tile_id_, bidb, bidh, q_step_offset)) {
+            break;
+          }
+          local_q_tile_offset = q_step_offset * STEP_Q;
         } else if (SCHEDULING_MODE == 1) {
           bidb = tile_id_ / (params.h * params.num_tiles_per_head);
           tmp = tile_id_ % (params.h * params.num_tiles_per_head);

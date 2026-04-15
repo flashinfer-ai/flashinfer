@@ -186,7 +186,9 @@ def generate_kernel_spec(
 
     # Override class defaults that always differ
     spec["flash_attention"] = True  # Class default is False
-    spec["scheduling_mode"] = 1  # Class default is 0
+    # Warp-specialized fp8 kernels use an exact dynamic tile decode in the DMA path, so they can
+    # stay on the persistent scheduler even when a launch mixes different q-tile counts.
+    spec["scheduling_mode"] = 1
 
     # # SM-specific configuration
     # if warp_specialization:
