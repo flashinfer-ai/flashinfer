@@ -145,6 +145,8 @@ class ArtifactPath:
     CUDNN_SDPA: str = "a72d85b019dc125b9f711300cb989430f762f5a6/fmha/cudnn/"
     # For DEEPGEMM, we also need to update KernelMap.KERNEL_MAP_HASH in flashinfer/deep_gemm.py
     DEEPGEMM: str = "a72d85b019dc125b9f711300cb989430f762f5a6/deep-gemm/"
+    DSL_FMHA: str = "14e7ced0afc4355c0231a388f2bc21efe7e37a05/fmha/cute-dsl/"
+    DSL_FMHA_ARCHS: tuple[str, ...] = ("sm_100a", "sm_103a", "sm_110a")
 
 
 class CheckSumHash:
@@ -164,11 +166,21 @@ class CheckSumHash:
     TRTLLM_GEN_GEMM: str = (
         "64b7114a429ea153528dd4d4b0299363d7320964789eb5efaefec66f301523c7"
     )
+    # TODO: Update with actual checksums.txt sha256 after first CI publish.
+    DSL_FMHA_CHECKSUMS: dict[str, str] = {
+        "sm_100a": "<sha256>",
+        "sm_103a": "<sha256>",
+        "sm_110a": "<sha256>",
+    }
     map_checksums: dict[str, str] = {
         safe_urljoin(ArtifactPath.TRTLLM_GEN_FMHA, "checksums.txt"): TRTLLM_GEN_FMHA,
         safe_urljoin(ArtifactPath.TRTLLM_GEN_BMM, "checksums.txt"): TRTLLM_GEN_BMM,
         safe_urljoin(ArtifactPath.DEEPGEMM, "checksums.txt"): DEEPGEMM,
         safe_urljoin(ArtifactPath.TRTLLM_GEN_GEMM, "checksums.txt"): TRTLLM_GEN_GEMM,
+        **{
+            safe_urljoin(ArtifactPath.DSL_FMHA, f"{arch}/checksums.txt"): sha
+            for arch, sha in DSL_FMHA_CHECKSUMS.items()
+        },
     }
 
 
@@ -199,6 +211,11 @@ def get_subdir_file_list() -> Generator[tuple[str, str], None, None]:
         ArtifactPath.TRTLLM_GEN_BMM,
         ArtifactPath.TRTLLM_GEN_GEMM,
         ArtifactPath.DEEPGEMM,
+        # DSL FMHA: per-arch subdirectories
+        *(
+            safe_urljoin(ArtifactPath.DSL_FMHA, f"{arch}/")
+            for arch in ArtifactPath.DSL_FMHA_ARCHS
+        ),
     ]
 
     # Get checksums of all files

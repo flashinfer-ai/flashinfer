@@ -21,15 +21,19 @@ from flashinfer.utils import is_sm100a_supported
 
 # Skip entire module if no local .so directory and no artifactory configured
 DSL_FMHA_LOCAL_DIR = os.environ.get("FLASHINFER_DSL_FMHA_LOCAL_DIR")
-DSL_FMHA_AVAILABLE = DSL_FMHA_LOCAL_DIR is not None and os.path.isdir(
+DSL_FMHA_LOCAL_AVAILABLE = DSL_FMHA_LOCAL_DIR is not None and os.path.isdir(
     DSL_FMHA_LOCAL_DIR
 )
+DSL_FMHA_ARTIFACTORY_AVAILABLE = (
+    os.environ.get("FLASHINFER_CUBINS_REPOSITORY") is not None
+)
+DSL_FMHA_AVAILABLE = DSL_FMHA_LOCAL_AVAILABLE or DSL_FMHA_ARTIFACTORY_AVAILABLE
 
 pytestmark = [
     pytest.mark.skipif(
         not DSL_FMHA_AVAILABLE,
-        reason="FLASHINFER_DSL_FMHA_LOCAL_DIR not set or directory does not exist. "
-        "Run compile_dsl_fmha.py first and set the env var.",
+        reason="Neither FLASHINFER_DSL_FMHA_LOCAL_DIR nor FLASHINFER_CUBINS_REPOSITORY is set. "
+        "Set one of them to run DSL FMHA tests.",
     ),
     pytest.mark.skipif(
         not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")),
@@ -119,7 +123,7 @@ def _make_ragged_qkvo(seq_lens_q, seq_lens_k, H_q, H_k, D, dtype, out_dtype=None
              q_ref, k_ref, v_ref, scale_q, scale_k, scale_v, out_dtype, batch_size)
     """
     if out_dtype is None:
-        out_dtype = torch.float16 if dtype == torch.float8_e4m3fn else dtype
+        out_dtype = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     D_v = D if D != 192 else 128
     is_fp8 = dtype == torch.float8_e4m3fn
     batch_size = len(seq_lens_q)
