@@ -551,10 +551,11 @@ def gen_all_modules(
         )
 
         jit_specs.append(gen_comm_alltoall_module())
-        if has_sm90 or has_sm100:
+        if has_sm100:
             jit_specs.append(gen_trtllm_comm_module())
             jit_specs.append(gen_trtllm_mnnvl_comm_module())
             jit_specs.append(gen_moe_alltoall_module())
+        if has_sm90 or has_sm100:
             jit_specs.append(gen_dcp_alltoall_module())
         jit_specs.append(gen_vllm_comm_module())
 
