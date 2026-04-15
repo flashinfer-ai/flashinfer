@@ -388,6 +388,7 @@ class MixedCommHandler:
     ):
         assert torch.distributed.is_initialized()
         assert local_size > 1
+        assert dtype in [torch.float16, torch.bfloat16]
         self.is_running = True
         self.warp_size = 32
         self.access_bytes = 16
@@ -1206,11 +1207,11 @@ def _common_check(
     handler: MixedCommHandler,
     x_in: torch.Tensor,
     x_out: torch.Tensor | None = None,
-    mode: MixedCommMode = MixedCommMode.AUTOTUNE,
+    mode: MixedCommMode | None = None,
 ) -> bool:
     if op not in handler.valid_op_list:
         raise ValueError(f"Invalid op: {op.name}")
-    if mode not in handler.valid_mode_list:
+    if mode is not None and mode not in handler.valid_mode_list:
         raise ValueError(f"Invalid mode: {mode.name}")
     if x_in.ndim < 2:
         raise ValueError("x_in.ndim should be at least 2")
@@ -1222,6 +1223,12 @@ def _common_check(
         if x_in.shape[0] % handler.para_info.dp_size != 0:
             raise ValueError("x_in.shape[0] should be divisible by dp_size")
     if x_out is not None:
+        if x_out.ndim != x_in.ndim:
+            raise ValueError("x_out.ndim should be equal to x_in.ndim")
+        if x_out.dtype != x_in.dtype:
+            raise ValueError("x_out.dtype should be equal to x_in.dtype")
+        if x_out.device != x_in.device:
+            raise ValueError("x_out.device should be equal to x_in.device")
         if x_out.shape[1:] != x_in.shape[1:]:
             raise ValueError("x_out.shape[1:] should be equal to x_in.shape[1:]")
         if op in [MixedCommOp.REDUCESCATTER, MixedCommOp.REDUCESCATTER_ALLREDUCE]:
@@ -1256,8 +1263,16 @@ def run_mixed_comm(
     handler: MixedCommHandler,
     x_in: torch.Tensor,
     x_out: torch.Tensor | None = None,
-    mode: MixedCommMode = MixedCommMode.AUTOTUNE,
+    mode: MixedCommMode | None = None,
 ) -> torch.Tensor:
+    if mode is None:
+        if handler.use_autotune:
+            mode = MixedCommMode.AUTOTUNE
+        else:
+            if MixedCommMode.NCCL_TP_DP in handler.valid_mode_list:
+                mode = MixedCommMode.NCCL_TP_DP
+            else:
+                mode = MixedCommMode.NCCL_ONE
     if mode == MixedCommMode.AUTOTUNE:
         mode = handler.select_autotune_mode(op, x_in)
     return _mixed_comm_op_dict[op](handler, x_in, x_out, mode)

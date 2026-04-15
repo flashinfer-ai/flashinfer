@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import torch
 
+from flashinfer.utils import get_compute_capability
 from flashinfer.comm.mixed_comm import (
     MixedCommHandler,
     MixedCommMode,
@@ -138,7 +139,7 @@ def _run_worker(
     )
     local_size_all = [None for _ in range(world_size)]
     torch.distributed.all_gather_object(local_size_all, local_size)
-    assert all([val == local_size for val in local_size_all]), (
+    assert all(val == local_size for val in local_size_all), (
         "local_size must be the same on all ranks"
     )
     local_tp_size_list = [
@@ -201,6 +202,13 @@ def _run_worker(
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("local_size", [2, 4, 8])
 def test_mixed_comm(local_size, num_nodes, node_id, dtype, dist_init_method):
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    compute_capability_number = compute_capability[0] * 10 + compute_capability[1]
+    if not run_mixed_comm.is_compute_capability_supported(compute_capability_number):
+        pytest.skip(
+            f"run_mixed_comm not supported on current compute capability."
+            f"Detected sm{compute_capability_number}."
+        )
     num_local_gpus = torch.cuda.device_count()
     if local_size > num_local_gpus:
         pytest.skip(

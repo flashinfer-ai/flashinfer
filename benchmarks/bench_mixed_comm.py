@@ -79,7 +79,7 @@ def _run_worker(local_rank, local_size, args):
     )
     local_size_all = [None for _ in range(world_size)]
     torch.distributed.all_gather_object(local_size_all, local_size)
-    assert all([val == local_size for val in local_size_all]), (
+    assert all(val == local_size for val in local_size_all), (
         "local_size must be the same on all ranks"
     )
     max_local_bs = max(local_bs_list)
