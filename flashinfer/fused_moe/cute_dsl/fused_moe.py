@@ -186,9 +186,6 @@ def _moe_core_impl(
 
     # NOTE: SM120/SM121 dispatch is handled by callers (CuteDslMoEWrapper.run
     # and cute_dsl_fused_moe_nvfp4) before reaching this function.
-    # Do NOT call torch.cuda.get_device_capability() here — it would execute
-    # inside the autotuner's CUDA graph capture context, which can corrupt
-    # graph capture on CUDA 12.
 
     # Allocate output if not provided.  The caller (wrapper or functional
     # API) should pass a [:num_tokens] slice of the pre-allocated buffer
@@ -883,7 +880,6 @@ def cute_dsl_fused_moe_nvfp4(
         )
 
     # SM120/SM121: dispatch to fused kernel (bypasses autotuner).
-    # SM120/SM121: dispatch to fused kernel directly (bypasses autotuner).
     # On SM120 the caller passes bf16 activations as x; x_sf is ignored.
     major, _ = torch.cuda.get_device_capability(x.device)
     if major == 12:
