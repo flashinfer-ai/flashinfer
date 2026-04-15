@@ -33,6 +33,17 @@ GPU_DEVICE = "cuda:0"
 global_workspace_buffer = None  # can.be empty initialized
 global_trtllm_gen_fmha_workspace_buffer = None  # must be zero initialized
 workspace_size = 256 * 1024 * 1024
+TRTLLM_GEN_WORKSPACE_CHECK_BYTES = 8192 * 256 * 4
+
+
+def get_lse_test_tolerances(q_dtype: str, kv_dtype: str) -> tuple[float, float]:
+    # TRT-LLM's FP8 prefill/decode LSE is noisier than the high-precision wrapper
+    # reference even when the output tensors still agree within the existing tolerances.
+    if kv_dtype == "nvfp4":
+        return 3e-1, 3e-1
+    if q_dtype == "fp8" or kv_dtype == "fp8":
+        return 2e-2, 2e-2
+    return 1e-3, 1e-3
 
 
 def flip_coin(*args, **kwargs):
@@ -481,6 +492,16 @@ def generate_causal_mask(
     return mask_uint16
 
 
+def trtllm_gen_workspace_softmax_end_bytes_context(
+    workspace_buffer: torch.Tensor, *, num_qo_heads: int, sum_seq_q: int
+) -> int:
+    """Context/prefill uses softmax stats as the first workspace slab."""
+    softmax_stats_nbytes = 8 * num_qo_heads * sum_seq_q
+    base_addr = workspace_buffer.data_ptr()
+    aligned_addr = (base_addr + 15) // 16 * 16
+    return (aligned_addr - base_addr) + softmax_stats_nbytes
+
+
 def _test_trtllm_batch_prefill(
     kv_layout: str,
     batch_size: int,
@@ -566,6 +587,7 @@ def _test_trtllm_batch_prefill(
     )
 
     sm_scale = float(1.0 / (head_dim**0.5))
+    lse_ref = None
 
     # Build reference output
     plan_params = {
@@ -589,7 +611,7 @@ def _test_trtllm_batch_prefill(
             workspace_buffer_ref, kv_layout
         )
         wrapper_ref.plan(**plan_params)
-        output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
+        output_ref, lse_ref = wrapper_ref.run(ref_q, ref_kv_cache, return_lse=True)
     else:
         # Construct flat K/V via helper
         k_flat, v_flat, kv_indptr_tokens = flatten_paged_kv(
@@ -635,8 +657,22 @@ def _test_trtllm_batch_prefill(
 
     # Using a tiny threshold should give the same result as normal attention.
     skip_softmax_threshold_scale_factor = 1e-30 if skips_softmax else None
+    softmax_end_bytes = trtllm_gen_workspace_softmax_end_bytes_context(
+        workspace_buffer,
+        num_qo_heads=q_input.size(1),
+        sum_seq_q=q_input.size(0),
+    )
+    workspace_check_end_bytes = min(
+        softmax_end_bytes + TRTLLM_GEN_WORKSPACE_CHECK_BYTES, workspace_buffer.numel()
+    )
+    workspace_buffer[softmax_end_bytes:workspace_check_end_bytes].zero_()
+    provided_lse = torch.empty(
+        (q_input.size(0), q_input.size(1)),
+        device=GPU_DEVICE,
+        dtype=torch.float32,
+    )
 
-    output = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+    output, lse = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
         q_input,
         kv_cache_kernel,
         workspace_buffer,
@@ -660,10 +696,12 @@ def _test_trtllm_batch_prefill(
         kv_cache_sf=kv_cache_sf_kernel,
         skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+        lse=provided_lse,
+        return_lse=True,
     )
-    # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
-    # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
-    assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
+    assert (
+        workspace_buffer[softmax_end_bytes:workspace_check_end_bytes].cpu().numpy() == 0
+    ).all()
 
     if o_dtype == "nvfp4":
         output, output_ref = unpack_compare_nvfp4(
@@ -712,6 +750,15 @@ def _test_trtllm_batch_prefill(
             f"Block scale factors may be mismatched to FP4 data blocks."
         )
 
+    expected_lse_shape = (q_input.size(0), q_input.size(1))
+    assert lse is provided_lse
+    assert lse.shape == expected_lse_shape
+    assert lse.dtype == torch.float32
+    assert torch.isfinite(lse).all()
+    if lse_ref is not None:
+        lse_rtol, lse_atol = get_lse_test_tolerances(q_dtype, kv_dtype)
+        torch.testing.assert_close(lse, lse_ref, rtol=lse_rtol, atol=lse_atol)
+
     if (
         o_dtype != "nvfp4" and kv_dtype != "nvfp4" and uses_shared_paged_kv_idx
     ):  # wrapper api does not support fp4 output/kv or separate KV page indices yet.
@@ -723,6 +770,7 @@ def _test_trtllm_batch_prefill(
         plan_params["kv_data_type"] = kv_cache.dtype
         plan_params["o_data_type"] = DTYPE_MAP[o_dtype]
         wrapper_trtllm_gen.plan(**plan_params)
+        workspace_buffer[softmax_end_bytes:workspace_check_end_bytes].zero_()
         output_wrapper = wrapper_trtllm_gen.run(
             q_input,
             kv_cache,
@@ -739,9 +787,10 @@ def _test_trtllm_batch_prefill(
             torch.testing.assert_close(
                 output.float(), output_wrapper.float(), rtol=1e-1, atol=1e-1
             )
-        # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
-        # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
-        assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
+        assert (
+            workspace_buffer[softmax_end_bytes:workspace_check_end_bytes].cpu().numpy()
+            == 0
+        ).all()
 
 
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
@@ -998,6 +1047,8 @@ def _test_trtllm_batch_decode(
     )
 
     sm_scale = float(1.0 / (head_dim**0.5))
+    should_check_lse = backend == "trtllm-gen"
+    lse_ref = None
 
     # Build reference output
     plan_params = {
@@ -1019,7 +1070,12 @@ def _test_trtllm_batch_decode(
                 workspace_buffer_ref, kv_layout, use_tensor_cores=True
             )
             wrapper_ref.plan(**plan_params)
-            output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
+            if should_check_lse:
+                output_ref, lse_ref = wrapper_ref.run(
+                    ref_q, ref_kv_cache, return_lse=True
+                )
+            else:
+                output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
 
         else:
             # speculative decoding test
@@ -1039,7 +1095,12 @@ def _test_trtllm_batch_decode(
                 }
             )
             wrapper_ref.plan(**plan_params_prefill)
-            output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
+            if should_check_lse:
+                output_ref, lse_ref = wrapper_ref.run(
+                    ref_q, ref_kv_cache, return_lse=True
+                )
+            else:
+                output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
     else:
         # Construct flat K/V via helper
         k_flat, v_flat, kv_indptr_tokens = flatten_paged_kv(
@@ -1088,6 +1149,15 @@ def _test_trtllm_batch_decode(
         q_input = make_query_non_contiguous(q, num_qo_heads, head_dim)
     else:
         q_input = q.contiguous()
+    provided_lse = (
+        torch.empty(
+            (q_input.size(0), q_input.size(1)),
+            device=GPU_DEVICE,
+            dtype=torch.float32,
+        )
+        if should_check_lse
+        else None
+    )
 
     # Using a tiny threshold should give the same result as normal attention.
     skip_softmax_threshold_scale_factor = 1e-30 if skips_softmax else None
@@ -1118,7 +1188,15 @@ def _test_trtllm_batch_decode(
         skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         kv_cache_sf=kv_cache_sf_kernel,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+        lse=provided_lse,
+        return_lse=should_check_lse,
     )
+    if should_check_lse:
+        output, lse = output
+        assert lse is provided_lse
+        assert lse.shape == (q_input.size(0), q_input.size(1))
+        assert lse.dtype == torch.float32
+        assert torch.isfinite(lse).all()
     if backend == "trtllm-gen":
         # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
         # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
@@ -1181,6 +1259,10 @@ def _test_trtllm_batch_decode(
             f"NVFP4 KV cache attention: cosine similarity {cos:.4f} < 0.86. "
             f"Block scale factors may be mismatched to FP4 data blocks."
         )
+    if lse_ref is not None:
+        assert lse is not None, "LSE should be returned when return_lse=True"
+        lse_rtol, lse_atol = get_lse_test_tolerances(q_dtype, kv_dtype)
+        torch.testing.assert_close(lse, lse_ref, rtol=lse_rtol, atol=lse_atol)
 
     # Only test wrapper with trtllm-gen backend
     if (
