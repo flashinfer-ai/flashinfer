@@ -510,8 +510,12 @@ struct Compute {
       mutex.arrive();
     }
     if constexpr (ENABLE_MUTEX && Kernel_traits::ELEMENT_BYTES == 1) {
-      // Wait until another warpgroup has already executed QGMMA.
-      mutex.named_bar_wait();
+      // Synchronize warpgroups after BMM1 via mbarrier rendezvous.
+      // Replaces the predicated bar.sync 2, 256 pattern (named_bar_wait/named_bar_arrive)
+      // which is UB per PTX spec (bar.sync = barrier.sync.aligned requires all CTA threads
+      // to execute the same instruction) and was flagged by compute-sanitizer synccheck.
+      mutex.arrive();
+      mutex.wait();
     }
 
     // Fragment p for BMM2 input
@@ -538,10 +542,6 @@ struct Compute {
 
     // Softmax Exp, max/sum, and update scales. If returns false we skip the rest.
     if (!softmax.compute_and_update_scale<IS_FIRST_COL>(p_max, p_sum, skip_softmax_vote)) {
-      if constexpr (ENABLE_MUTEX && Kernel_traits::ELEMENT_BYTES == 1) {
-        // Notify another warpgroup to execute QGMMA.
-        mutex.named_bar_arrive();
-      }
       // Need to wait V, otherwise compute-sanitizer synccheck will fail.
       int ready2 = cbr_v.peek();
       if (!ready2) {
@@ -564,11 +564,6 @@ struct Compute {
 
     // Update flash attention scales and pack it for BMM2
     softmax.pack<IS_FIRST_COL>(ctile_o, frag_p);
-
-    if constexpr (ENABLE_MUTEX && Kernel_traits::ELEMENT_BYTES == 1) {
-      // Notify another warpgroup to execute QGMMA.
-      mutex.named_bar_arrive();
-    }
 
     // Wait until v buffer is ready.
     int ready = cbr_v.peek();

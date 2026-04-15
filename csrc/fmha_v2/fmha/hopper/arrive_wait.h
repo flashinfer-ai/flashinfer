@@ -68,13 +68,13 @@ namespace fmha {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 inline __device__ void named_barrier_arrive(uint32_t BARRIER_ID, uint32_t NUM_THREADS) {
   if (NUM_THREADS > 1) {
-    asm volatile("bar.arrive %0, %1;" : : "r"(BARRIER_ID), "r"(NUM_THREADS));
+    asm volatile("barrier.cta.arrive %0, %1;" : : "r"(BARRIER_ID), "r"(NUM_THREADS));
   }
 }
 
 inline __device__ void named_barrier_wait(uint32_t BARRIER_ID, uint32_t NUM_THREADS) {
   if (NUM_THREADS > 1) {
-    asm volatile("bar.sync %0, %1;" ::"r"(BARRIER_ID), "r"(NUM_THREADS));
+    asm volatile("barrier.cta.sync %0, %1;" ::"r"(BARRIER_ID), "r"(NUM_THREADS));
   }
 }
 
