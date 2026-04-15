@@ -4,7 +4,20 @@
 
 # Default environment variables
 : "${JUNIT_DIR:=$(realpath ./junit)}"
-: "${MAX_JOBS:=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
+
+# Cap ninja parallelism by available RAM (~12 GB per nvcc process) to avoid OOM
+# during JIT compilation.
+if [ -z "${MAX_JOBS:-}" ]; then
+    _mem_gb=$(awk '/MemAvailable/ {printf "%d", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo 0)
+    if [ "$_mem_gb" -gt 0 ]; then
+        MAX_JOBS=$(( (_mem_gb - 8) / 12 ))
+        [ "$MAX_JOBS" -lt 4 ] && MAX_JOBS=4
+    else
+        MAX_JOBS=$(nproc 2>/dev/null || echo 4)
+    fi
+fi
+export MAX_JOBS
+
 # CUDA_VISIBLE_DEVICES: Not set by default - let detect_gpus() auto-detect via nvidia-smi
 : "${SAMPLE_RATE:=5}"  # Run every Nth test in sanity mode (5 = ~20% coverage)
 : "${PARALLEL_TESTS:=false}"  # Disable parallel test execution by default
