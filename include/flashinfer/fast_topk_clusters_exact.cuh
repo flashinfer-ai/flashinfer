@@ -2,8 +2,7 @@
 #define FLASHINFER_TOPK_CLUSTERS_CUH_
 #include <cooperative_groups.h>
 #include <cuda_fp16.h>
-
-#include <cassert>
+#include <tvm/ffi/error.h>
 
 #include "topk_common.cuh"
 #include "vec_dtypes.cuh"
@@ -612,7 +611,7 @@ void launch_fast_topk_clusters_exact(const T* logits, IdxT* indices, T* output_v
   launch_topk_cluster_kernel(kernel, args, batch_size * num_clusters, extern_shared_mem,
                              num_clusters, pdl_enabled, stream);
 #else
-  throw std::runtime_error("fast_topk_clusters_exact requires SM 9.0 (Hopper) or newer");
+  TVM_FFI_ICHECK(false) << "fast_topk_clusters_exact requires SM 9.0 (Hopper) or newer";
 #endif
 }
 
@@ -648,8 +647,8 @@ void launch_fast_topk_clusters_exact_page_table_transform(
   launch_topk_cluster_kernel(kernel, args, batch_size * num_clusters, extern_shared_mem,
                              num_clusters, pdl_enabled, stream);
 #else
-  throw std::runtime_error(
-      "fast_topk_clusters_exact_page_table_transform requires SM 9.0 (Hopper) or newer");
+  TVM_FFI_ICHECK(false)
+      << "fast_topk_clusters_exact_page_table_transform requires SM 9.0 (Hopper) or newer";
 #endif
 }
 
@@ -684,8 +683,8 @@ void launch_fast_topk_clusters_exact_ragged_transform(
   launch_topk_cluster_kernel(kernel, args, batch_size * num_clusters, extern_shared_mem,
                              num_clusters, pdl_enabled, stream);
 #else
-  throw std::runtime_error(
-      "fast_topk_clusters_exact_ragged_transform requires SM 9.0 (Hopper) or newer");
+  TVM_FFI_ICHECK(false)
+      << "fast_topk_clusters_exact_ragged_transform requires SM 9.0 (Hopper) or newer";
 #endif
 }
 
