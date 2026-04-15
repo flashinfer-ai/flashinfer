@@ -2284,15 +2284,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
-        if return_lse:
-            if lse is None:
-                lse = torch.empty(
-                    (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
-                )
-            else:
-                check_shape_dtype_device(
-                    lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
-                )
+        lse_shape = (q.size(0), q.size(1))
+        if lse is not None:
+            check_shape_dtype_device(lse, lse_shape, torch.float32, q.device, "lse")
+        elif return_lse:
+            lse = torch.empty(lse_shape, dtype=torch.float32, device=q.device)
 
         # For NVFP4 KV (uint8 packed), v_cache last dim is head_dim//2;
         # use q's head_dim for output instead

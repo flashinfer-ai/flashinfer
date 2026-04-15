@@ -197,6 +197,10 @@ void trtllm_paged_attention_launcher(
         num_semaphores * sizeof(uint32_t), 16, "trtllm_gen_counter_workspace");
   }
 
+  // Needed whenever LSE is requested: the FMHA path emits per-row softmax (m, d) stats here, and
+  // ComputeLSEFromMD later converts that intermediate buffer into lsePtr. The separate reduction
+  // kernel only participates for special multi-CTA modes; single-CTA context kernels still write
+  // the final stats directly into this buffer.
   runner_params.softmaxStatsPtr = float_allocator.aligned_alloc<float2>(
       sizeof(float2) * num_qo_heads * runner_params.mSumOfSeqLensQ, 16,
       "trtllm_gen_softmax_workspace");
@@ -601,6 +605,10 @@ void trtllm_ragged_attention_launcher(
   // semaphores be at the first 8MB of workspace buffer: counter | softmax | scratch
   runner_params.multiCtasKvCounterPtr = float_allocator.aligned_alloc<int32_t>(
       num_semaphores * sizeof(uint32_t), 16, "trtllm_gen_counter_workspace");
+  // Needed whenever LSE is requested: the FMHA path emits per-row softmax (m, d) stats here, and
+  // ComputeLSEFromMD later converts that intermediate buffer into lsePtr. The separate reduction
+  // kernel only participates for special multi-CTA modes; single-CTA context kernels still write
+  // the final stats directly into this buffer.
   runner_params.softmaxStatsPtr = float_allocator.aligned_alloc<float2>(
       sizeof(float2) * num_qo_heads * runner_params.mSumOfSeqLensQ, 16,
       "trtllm_gen_softmax_workspace");
