@@ -28,7 +28,6 @@ from itertools import product
 from typing import Dict, List
 
 import torch
-from flashinfer.testing.utils import bench_gpu_time
 
 try:
     # cuda-python >= 12.9 (has cuda.bindings.driver)
@@ -44,8 +43,11 @@ except ImportError:
             "Please install cuda-python that matches your CUDA version."
         ) from e
 
+from ..api_logging import flashinfer_api
 from ..cuda_utils import checkCudaErrors
 from ..jit.comm import gen_mixed_comm_module
+from ..testing.utils import bench_gpu_time
+from ..utils import backend_requirement, supported_compute_capability
 
 
 @functools.cache
@@ -74,16 +76,16 @@ def get_mixed_comm_module():
     return module
 
 
-def get_element_size(dtype: torch.dtype) -> int:
+def _get_element_size(dtype: torch.dtype) -> int:
     return torch.empty((), dtype=dtype).element_size()
 
 
-def ceil_div(x: int, y: int) -> int:
+def _ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
 
 
-def round_up(x: int, y: int) -> int:
-    return ceil_div(x, y) * y
+def _round_up(x: int, y: int) -> int:
+    return _ceil_div(x, y) * y
 
 
 class MixedCommOp(enum.IntEnum):
@@ -332,89 +334,7 @@ class ParallelInfo:
         return list(range(local_tp_rank, self.local_size, self.local_tp_size))
 
 
-def nccl_allreduce(
-    x_in: torch.Tensor,
-    group: torch.distributed.ProcessGroup = None,
-    inplace: bool = False,
-) -> torch.Tensor:
-    x_out = x_in if inplace else x_in.clone()
-    torch.distributed.all_reduce(x_out, group=group)
-    return x_out
-
-
-def nccl_allgather(
-    x_in: torch.Tensor,
-    group: torch.distributed.ProcessGroup = None,
-) -> torch.Tensor:
-    dp_size = torch.distributed.get_world_size(group)
-    x_out = torch.empty([dp_size, *x_in.shape], dtype=x_in.dtype, device=x_in.device)
-    torch.distributed.all_gather_into_tensor(x_out, x_in, group=group)
-    return x_out.flatten(0, 1)
-
-
-def nccl_reducescatter(
-    x_in: torch.Tensor,
-    group: torch.distributed.ProcessGroup = None,
-) -> torch.Tensor:
-    dp_size = torch.distributed.get_world_size(group)
-    x_in = x_in.unflatten(0, [dp_size, -1])
-    x_out = torch.empty(x_in.shape[1:], dtype=x_in.dtype, device=x_in.device)
-    torch.distributed.reduce_scatter_tensor(x_out, x_in, group=group)
-    return x_out
-
-
-def nccl_allreduce_allgather(
-    x_in: torch.Tensor,
-    para_info: ParallelInfo,
-) -> torch.Tensor:
-    x_out = torch.empty(
-        [
-            para_info.inter_tp_size,
-            para_info.local_tp_size,
-            para_info.inter_dp_size,
-            para_info.local_dp_size,
-            *x_in.shape,
-        ],
-        dtype=x_in.dtype,
-        device=x_in.device,
-    )
-    x_out_list = [
-        x_out[inter_tp_rank][local_tp_rank][inter_dp_rank][local_dp_rank]
-        for inter_dp_rank, inter_tp_rank, local_dp_rank, local_tp_rank in product(
-            range(para_info.inter_dp_size),
-            range(para_info.inter_tp_size),
-            range(para_info.local_dp_size),
-            range(para_info.local_tp_size),
-        )
-    ]
-    torch.distributed.all_gather(x_out_list, x_in)
-    x_out = x_out.view([para_info.tp_size, para_info.dp_size, *x_in.shape]).sum(0)
-    return x_out.flatten(0, 1)
-
-
-def nccl_reducescatter_allreduce(
-    x_in: torch.Tensor,
-    para_info: ParallelInfo,
-) -> torch.Tensor:
-    x_in = x_in.unflatten(0, [para_info.inter_dp_size, para_info.local_dp_size, -1])
-    x_in_list = [
-        x_in[inter_dp_rank][local_dp_rank]
-        for inter_dp_rank, _, local_dp_rank, _ in product(
-            range(para_info.inter_dp_size),
-            range(para_info.inter_tp_size),
-            range(para_info.local_dp_size),
-            range(para_info.local_tp_size),
-        )
-    ]
-    x_out = torch.empty(
-        [para_info.world_size, *x_in.shape[2:]], dtype=x_in.dtype, device=x_in.device
-    )
-    x_out_list = [x_out[world_rank] for world_rank in range(para_info.world_size)]
-    torch.distributed.all_to_all(x_out_list, x_in_list)
-    return x_out.sum(0)
-
-
-class MixedComm:
+class MixedCommHandler:
     """
     An implementation for the combinations of all-reduce + all-gather and reduce-scatter + all-reduce.
     The fused kernels use virtual memory for intra-node communication and nvshmem for inter-node communication.
@@ -519,13 +439,6 @@ class MixedComm:
 
         self.valid_op_list = self.get_valid_op_list()
         self.valid_mode_list = self.get_valid_mode_list()
-        self.op_dict = {
-            MixedCommOp.ALLREDUCE: self.allreduce,
-            MixedCommOp.ALLGATHER: self.allgather,
-            MixedCommOp.REDUCESCATTER: self.reducescatter,
-            MixedCommOp.ALLREDUCE_ALLGATHER: self.allreduce_allgather,
-            MixedCommOp.REDUCESCATTER_ALLREDUCE: self.reducescatter_allreduce,
-        }
         self.max_block_size_dict = {
             (op, mode): self.mixed_comm_module.get_max_block_size(
                 self.dtype,
@@ -553,25 +466,25 @@ class MixedComm:
         workspace_alignment = 16384
         assert workspace_alignment % self.access_bytes == 0
         data_bytes_base = max_block_size * self.access_bytes
-        self.vm_buffer_bytes_base = round_up(
+        self.vm_buffer_bytes_base = _round_up(
             self.para_info.tp_size * (self.para_info.dp_size + 1) * data_bytes_base
-            + get_element_size(torch.uint32),
+            + _get_element_size(torch.uint32),
             workspace_alignment,
         )
-        self.ns_data_bytes_base = round_up(
+        self.ns_data_bytes_base = _round_up(
             2 * inter_size * data_bytes_base, workspace_alignment
         )
-        self.ns_signal_bytes_base = 2 * get_element_size(torch.uint64)
+        self.ns_signal_bytes_base = 2 * _get_element_size(torch.uint64)
         self.vm_buffer_bytes = self.grid_size * self.vm_buffer_bytes_base
         self.ns_data_bytes = self.grid_size * self.ns_data_bytes_base
-        self.ns_signal_bytes = round_up(
+        self.ns_signal_bytes = _round_up(
             self.grid_size * self.ns_signal_bytes_base, workspace_alignment
         )
         self.vm_buffer_bytes_all = self.num_buffers * self.vm_buffer_bytes
         self.ns_data_bytes_all = self.num_buffers * self.ns_data_bytes
         self.ns_signal_bytes_all = self.num_buffers * self.ns_signal_bytes
-        self.buffer_info_bytes = round_up(
-            self.grid_size * get_element_size(torch.uint64), workspace_alignment
+        self.buffer_info_bytes = _round_up(
+            self.grid_size * _get_element_size(torch.uint64), workspace_alignment
         )
 
         self.vm_handle_type = (
@@ -759,7 +672,7 @@ class MixedComm:
             )
         )
         vm_granularity = math.lcm(mc_granularity, uc_granularity)
-        self.vm_workspace_bytes = round_up(
+        self.vm_workspace_bytes = _round_up(
             self.vm_buffer_bytes_all + self.buffer_info_bytes, vm_granularity
         )
         self.uc_handle_list = create_and_allgather_uc_handle(sock, uc_prop)
@@ -918,7 +831,7 @@ class MixedComm:
 
     def run_autotune(self):
         max_local_bs = pow(2, self.autotune_max_coef - 1)
-        hidden_size = self.autotune_base_bytes // get_element_size(self.dtype)
+        hidden_size = self.autotune_base_bytes // _get_element_size(self.dtype)
         data = torch.empty(
             [max_local_bs * self.para_info.dp_size, hidden_size],
             dtype=self.dtype,
@@ -941,9 +854,9 @@ class MixedComm:
                     if mode == MixedCommMode.AUTOTUNE:
                         continue
                     duration_list = bench_gpu_time(
-                        self.run_op,
-                        input_args=(op, x_in, mode),
-                        input_kwargs=None,
+                        run_mixed_comm,
+                        input_args=(op, self, x_in),
+                        input_kwargs={"mode": mode},
                         dry_run_time_ms=10,
                         repeat_time_ms=100,
                         use_cuda_graph=False,
@@ -960,7 +873,7 @@ class MixedComm:
         op: MixedCommOp,
         x_in: torch.Tensor,
     ) -> MixedCommMode:
-        num_local_bytes = x_in.numel() * get_element_size(self.dtype)
+        num_local_bytes = x_in.numel() * _get_element_size(self.dtype)
         if op in [MixedCommOp.REDUCESCATTER, MixedCommOp.REDUCESCATTER_ALLREDUCE]:
             num_local_bytes //= self.para_info.dp_size
         coef = math.log2(num_local_bytes / self.autotune_base_bytes)
@@ -972,237 +885,379 @@ class MixedComm:
             mode = self.autotune_map[op][round(coef)]
         return mode
 
-    def allreduce(
-        self,
-        x_in: torch.Tensor,
-        mode: MixedCommMode,
-    ) -> torch.Tensor:
-        op = MixedCommOp.ALLREDUCE
-        assert op in self.valid_op_list
-        assert x_in.ndim >= 2
-        assert x_in.dtype == self.dtype
-        assert x_in.device == self.device
-        assert mode in self.valid_mode_list
-        if mode == MixedCommMode.AUTOTUNE:
-            mode = self.select_autotune_mode(op, x_in)
-        if mode.name.startswith("FUSED_"):
+
+def _nccl_allreduce(
+    x_in: torch.Tensor,
+    x_out: torch.Tensor | None,
+    group: torch.distributed.ProcessGroup = None,
+    inplace: bool = False,
+) -> torch.Tensor:
+    if inplace:
+        x_out = x_in
+    else:
+        if x_out is None:
+            x_out = x_in.clone()
+        else:
+            x_out.copy_(x_in)
+    torch.distributed.all_reduce(x_out, group=group)
+    return x_out
+
+
+def _nccl_allgather(
+    x_in: torch.Tensor,
+    x_out: torch.Tensor | None,
+    group: torch.distributed.ProcessGroup = None,
+) -> torch.Tensor:
+    dp_size = torch.distributed.get_world_size(group)
+    if x_out is None:
+        x_out = torch.empty(
+            [dp_size * x_in.shape[0], *x_in.shape[1:]],
+            dtype=x_in.dtype,
+            device=x_in.device,
+        )
+    torch.distributed.all_gather_into_tensor(x_out, x_in, group=group)
+    return x_out
+
+
+def _nccl_reducescatter(
+    x_in: torch.Tensor,
+    x_out: torch.Tensor | None,
+    group: torch.distributed.ProcessGroup = None,
+) -> torch.Tensor:
+    dp_size = torch.distributed.get_world_size(group)
+    x_in = x_in.unflatten(0, [dp_size, -1])
+    if x_out is None:
+        x_out = torch.empty(x_in.shape[1:], dtype=x_in.dtype, device=x_in.device)
+    torch.distributed.reduce_scatter_tensor(x_out, x_in, group=group)
+    return x_out
+
+
+def _nccl_allreduce_allgather(
+    x_in: torch.Tensor,
+    x_out: torch.Tensor | None,
+    para_info: ParallelInfo,
+) -> torch.Tensor:
+    x_tmp = torch.empty(
+        [
+            para_info.inter_tp_size,
+            para_info.local_tp_size,
+            para_info.inter_dp_size,
+            para_info.local_dp_size,
+            *x_in.shape,
+        ],
+        dtype=x_in.dtype,
+        device=x_in.device,
+    )
+    x_tmp_list = [
+        x_tmp[inter_tp_rank][local_tp_rank][inter_dp_rank][local_dp_rank]
+        for inter_dp_rank, inter_tp_rank, local_dp_rank, local_tp_rank in product(
+            range(para_info.inter_dp_size),
+            range(para_info.inter_tp_size),
+            range(para_info.local_dp_size),
+            range(para_info.local_tp_size),
+        )
+    ]
+    torch.distributed.all_gather(x_tmp_list, x_in)
+    x_tmp = x_tmp.view([para_info.tp_size, para_info.dp_size, *x_in.shape]).sum(0)
+    x_tmp = x_tmp.flatten(0, 1)
+    if x_out is None:
+        x_out = x_tmp
+    else:
+        x_out.copy_(x_tmp)
+    return x_out
+
+
+def _nccl_reducescatter_allreduce(
+    x_in: torch.Tensor,
+    x_out: torch.Tensor | None,
+    para_info: ParallelInfo,
+) -> torch.Tensor:
+    x_in = x_in.unflatten(0, [para_info.inter_dp_size, para_info.local_dp_size, -1])
+    x_in_list = [
+        x_in[inter_dp_rank][local_dp_rank]
+        for inter_dp_rank, _, local_dp_rank, _ in product(
+            range(para_info.inter_dp_size),
+            range(para_info.inter_tp_size),
+            range(para_info.local_dp_size),
+            range(para_info.local_tp_size),
+        )
+    ]
+    x_tmp = torch.empty(
+        [para_info.world_size, *x_in.shape[2:]], dtype=x_in.dtype, device=x_in.device
+    )
+    x_tmp_list = [x_tmp[world_rank] for world_rank in range(para_info.world_size)]
+    torch.distributed.all_to_all(x_tmp_list, x_in_list)
+    x_tmp = x_tmp.sum(0)
+    if x_out is None:
+        x_out = x_tmp
+    else:
+        x_out.copy_(x_tmp)
+    return x_out
+
+
+def _allreduce(
+    handler: MixedCommHandler,
+    x_in: torch.Tensor,
+    x_out: torch.Tensor | None,
+    mode: MixedCommMode,
+) -> torch.Tensor:
+    op = MixedCommOp.ALLREDUCE
+    if mode.name.startswith("FUSED_"):
+        if x_out is None:
             x_out = torch.empty_like(x_in)
-            self.mixed_comm_module.allreduce(
-                x_out,
-                x_in,
-                self.uc_buffer_dict["void_p"],
-                self.mem_buffer,
-                self.mc_buffer_dict["full"],
-                self.ns_buffer,
-                self.vm_buffer_bytes_base,
-                self.ns_data_bytes,
-                self.ns_signal_bytes,
-                self.grid_size,
-                self.max_block_size_dict[(op, mode)],
-                self.min_block_size,
-                self.min_num_steps,
-                self.para_info.local_rank,
-                self.para_info.local_size,
-                self.para_info.inter_rank,
-                self.para_info.inter_size,
-                mode,
-            )
-        elif mode == MixedCommMode.NCCL_ONE:
-            x_out = nccl_allreduce(x_in)
-        else:
-            raise ValueError(f"Invalid mode: {mode.name}")
-        return x_out
+        handler.mixed_comm_module.allreduce(
+            x_out,
+            x_in,
+            handler.uc_buffer_dict["void_p"],
+            handler.mem_buffer,
+            handler.mc_buffer_dict["full"],
+            handler.ns_buffer,
+            handler.vm_buffer_bytes_base,
+            handler.ns_data_bytes,
+            handler.ns_signal_bytes,
+            handler.grid_size,
+            handler.max_block_size_dict[(op, mode)],
+            handler.min_block_size,
+            handler.min_num_steps,
+            handler.para_info.local_rank,
+            handler.para_info.local_size,
+            handler.para_info.inter_rank,
+            handler.para_info.inter_size,
+            mode,
+        )
+    elif mode == MixedCommMode.NCCL_ONE:
+        x_out = _nccl_allreduce(x_in, x_out)
+    else:
+        raise ValueError(f"Invalid mode: {mode.name}")
+    return x_out
 
-    def allgather(
-        self,
-        x_in: torch.Tensor,
-        mode: MixedCommMode,
-    ) -> torch.Tensor:
-        op = MixedCommOp.ALLGATHER
-        assert op in self.valid_op_list
-        assert x_in.ndim >= 2
-        assert x_in.dtype == self.dtype
-        assert x_in.device == self.device
-        assert mode in self.valid_mode_list
-        if mode == MixedCommMode.AUTOTUNE:
-            mode = self.select_autotune_mode(op, x_in)
-        if mode.name.startswith("FUSED_"):
-            x_out_shape = [x_in.shape[0] * self.para_info.dp_size, *x_in.shape[1:]]
+
+def _allgather(
+    handler: MixedCommHandler,
+    x_in: torch.Tensor,
+    x_out: torch.Tensor | None,
+    mode: MixedCommMode,
+) -> torch.Tensor:
+    op = MixedCommOp.ALLGATHER
+    if mode.name.startswith("FUSED_"):
+        if x_out is None:
+            x_out_shape = [x_in.shape[0] * handler.para_info.dp_size, *x_in.shape[1:]]
             x_out = torch.empty(x_out_shape, dtype=x_in.dtype, device=x_in.device)
-            self.mixed_comm_module.allgather(
-                x_out,
-                x_in,
-                self.uc_buffer_dict["void_p"],
-                self.mem_buffer,
-                self.mc_buffer_dict["full"],
-                self.ns_buffer,
-                self.vm_buffer_bytes_base,
-                self.ns_data_bytes,
-                self.ns_signal_bytes,
-                self.grid_size,
-                self.max_block_size_dict[(op, mode)],
-                self.min_block_size,
-                self.min_num_steps,
-                self.para_info.local_rank,
-                self.para_info.local_size,
-                self.para_info.inter_rank,
-                self.para_info.inter_size,
-                mode,
-            )
-        elif mode == MixedCommMode.NCCL_ONE:
-            x_out = nccl_allgather(x_in)
-        else:
-            raise ValueError(f"Invalid mode: {mode.name}")
-        return x_out
+        handler.mixed_comm_module.allgather(
+            x_out,
+            x_in,
+            handler.uc_buffer_dict["void_p"],
+            handler.mem_buffer,
+            handler.mc_buffer_dict["full"],
+            handler.ns_buffer,
+            handler.vm_buffer_bytes_base,
+            handler.ns_data_bytes,
+            handler.ns_signal_bytes,
+            handler.grid_size,
+            handler.max_block_size_dict[(op, mode)],
+            handler.min_block_size,
+            handler.min_num_steps,
+            handler.para_info.local_rank,
+            handler.para_info.local_size,
+            handler.para_info.inter_rank,
+            handler.para_info.inter_size,
+            mode,
+        )
+    elif mode == MixedCommMode.NCCL_ONE:
+        x_out = _nccl_allgather(x_in, x_out)
+    else:
+        raise ValueError(f"Invalid mode: {mode.name}")
+    return x_out
 
-    def reducescatter(
-        self,
-        x_in: torch.Tensor,
-        mode: MixedCommMode,
-    ) -> torch.Tensor:
-        op = MixedCommOp.REDUCESCATTER
-        assert op in self.valid_op_list
-        assert x_in.ndim >= 2
-        assert x_in.shape[0] % self.para_info.dp_size == 0
-        assert x_in.dtype == self.dtype
-        assert x_in.device == self.device
-        assert mode in self.valid_mode_list
-        if mode == MixedCommMode.AUTOTUNE:
-            mode = self.select_autotune_mode(op, x_in)
-        if mode.name.startswith("FUSED_"):
-            x_out_shape = [x_in.shape[0] // self.para_info.dp_size, *x_in.shape[1:]]
+
+def _reducescatter(
+    handler: MixedCommHandler,
+    x_in: torch.Tensor,
+    x_out: torch.Tensor | None,
+    mode: MixedCommMode,
+) -> torch.Tensor:
+    op = MixedCommOp.REDUCESCATTER
+    if mode.name.startswith("FUSED_"):
+        if x_out is None:
+            x_out_shape = [x_in.shape[0] // handler.para_info.dp_size, *x_in.shape[1:]]
             x_out = torch.empty(x_out_shape, dtype=x_in.dtype, device=x_in.device)
-            self.mixed_comm_module.reducescatter(
-                x_out,
-                x_in,
-                self.uc_buffer_dict["void_p"],
-                self.mem_buffer,
-                self.mc_buffer_dict["full"],
-                self.ns_buffer,
-                self.vm_buffer_bytes_base,
-                self.ns_data_bytes,
-                self.ns_signal_bytes,
-                self.grid_size,
-                self.max_block_size_dict[(op, mode)],
-                self.min_block_size,
-                self.min_num_steps,
-                self.para_info.local_rank,
-                self.para_info.local_size,
-                self.para_info.inter_rank,
-                self.para_info.inter_size,
-                mode,
-            )
-        elif mode == MixedCommMode.NCCL_ONE:
-            x_out = nccl_reducescatter(x_in)
-        else:
-            raise ValueError(f"Invalid mode: {mode.name}")
-        return x_out
+        handler.mixed_comm_module.reducescatter(
+            x_out,
+            x_in,
+            handler.uc_buffer_dict["void_p"],
+            handler.mem_buffer,
+            handler.mc_buffer_dict["full"],
+            handler.ns_buffer,
+            handler.vm_buffer_bytes_base,
+            handler.ns_data_bytes,
+            handler.ns_signal_bytes,
+            handler.grid_size,
+            handler.max_block_size_dict[(op, mode)],
+            handler.min_block_size,
+            handler.min_num_steps,
+            handler.para_info.local_rank,
+            handler.para_info.local_size,
+            handler.para_info.inter_rank,
+            handler.para_info.inter_size,
+            mode,
+        )
+    elif mode == MixedCommMode.NCCL_ONE:
+        x_out = _nccl_reducescatter(x_in, x_out)
+    else:
+        raise ValueError(f"Invalid mode: {mode.name}")
+    return x_out
 
-    def allreduce_allgather(
-        self,
-        x_in: torch.Tensor,
-        mode: MixedCommMode,
-    ) -> torch.Tensor:
-        op = MixedCommOp.ALLREDUCE_ALLGATHER
-        assert op in self.valid_op_list
-        assert x_in.ndim >= 2
-        assert x_in.dtype == self.dtype
-        assert x_in.device == self.device
-        assert mode in self.valid_mode_list
-        if mode == MixedCommMode.AUTOTUNE:
-            mode = self.select_autotune_mode(op, x_in)
-        if mode.name.startswith("FUSED_"):
-            x_out_shape = [x_in.shape[0] * self.para_info.dp_size, *x_in.shape[1:]]
+
+def _allreduce_allgather(
+    handler: MixedCommHandler,
+    x_in: torch.Tensor,
+    x_out: torch.Tensor | None,
+    mode: MixedCommMode,
+) -> torch.Tensor:
+    op = MixedCommOp.ALLREDUCE_ALLGATHER
+    if mode.name.startswith("FUSED_"):
+        if x_out is None:
+            x_out_shape = [x_in.shape[0] * handler.para_info.dp_size, *x_in.shape[1:]]
             x_out = torch.empty(x_out_shape, dtype=x_in.dtype, device=x_in.device)
-            self.mixed_comm_module.fused_allreduce_allgather(
-                x_out,
-                x_in,
-                self.uc_buffer_dict["void_p"],
-                self.mem_buffer,
-                self.mc_buffer_dict["full"],
-                self.mc_buffer_dict["tp"],
-                self.ns_buffer,
-                self.vm_buffer_bytes_base,
-                self.ns_data_bytes,
-                self.ns_signal_bytes,
-                self.grid_size,
-                self.max_block_size_dict[(op, mode)],
-                self.min_block_size,
-                self.min_num_steps,
-                self.para_info.local_tp_rank,
-                self.para_info.local_tp_size,
-                self.para_info.local_dp_rank,
-                self.para_info.local_dp_size,
-                self.para_info.inter_tp_rank,
-                self.para_info.inter_tp_size,
-                self.para_info.inter_dp_rank,
-                self.para_info.inter_dp_size,
-                mode,
-            )
-        elif mode == MixedCommMode.NCCL_ONE:
-            x_out = nccl_allreduce_allgather(x_in, self.para_info)
-        elif mode == MixedCommMode.NCCL_TP_DP:
-            x_mid = nccl_allreduce(x_in, group=self.tp_comm_group)
-            x_out = nccl_allgather(x_mid, group=self.dp_comm_group)
-        else:
-            raise ValueError(f"Invalid mode: {mode.name}")
-        return x_out
+        handler.mixed_comm_module.fused_allreduce_allgather(
+            x_out,
+            x_in,
+            handler.uc_buffer_dict["void_p"],
+            handler.mem_buffer,
+            handler.mc_buffer_dict["full"],
+            handler.mc_buffer_dict["tp"],
+            handler.ns_buffer,
+            handler.vm_buffer_bytes_base,
+            handler.ns_data_bytes,
+            handler.ns_signal_bytes,
+            handler.grid_size,
+            handler.max_block_size_dict[(op, mode)],
+            handler.min_block_size,
+            handler.min_num_steps,
+            handler.para_info.local_tp_rank,
+            handler.para_info.local_tp_size,
+            handler.para_info.local_dp_rank,
+            handler.para_info.local_dp_size,
+            handler.para_info.inter_tp_rank,
+            handler.para_info.inter_tp_size,
+            handler.para_info.inter_dp_rank,
+            handler.para_info.inter_dp_size,
+            mode,
+        )
+    elif mode == MixedCommMode.NCCL_ONE:
+        x_out = _nccl_allreduce_allgather(x_in, x_out, handler.para_info)
+    elif mode == MixedCommMode.NCCL_TP_DP:
+        x_tmp = _nccl_allreduce(x_in, None, group=handler.tp_comm_group)
+        x_out = _nccl_allgather(x_tmp, x_out, group=handler.dp_comm_group)
+    else:
+        raise ValueError(f"Invalid mode: {mode.name}")
+    return x_out
 
-    def reducescatter_allreduce(
-        self,
-        x_in: torch.Tensor,
-        mode: MixedCommMode,
-    ) -> torch.Tensor:
-        op = MixedCommOp.REDUCESCATTER_ALLREDUCE
-        assert op in self.valid_op_list
-        assert x_in.ndim >= 2
-        assert x_in.shape[0] % self.para_info.dp_size == 0
-        assert x_in.dtype == self.dtype
-        assert x_in.device == self.device
-        assert mode in self.valid_mode_list
-        if mode == MixedCommMode.AUTOTUNE:
-            mode = self.select_autotune_mode(op, x_in)
-        if mode.name.startswith("FUSED_"):
-            x_out_shape = [x_in.shape[0] // self.para_info.dp_size, *x_in.shape[1:]]
+
+def _reducescatter_allreduce(
+    handler: MixedCommHandler,
+    x_in: torch.Tensor,
+    x_out: torch.Tensor | None,
+    mode: MixedCommMode,
+) -> torch.Tensor:
+    op = MixedCommOp.REDUCESCATTER_ALLREDUCE
+    if mode.name.startswith("FUSED_"):
+        if x_out is None:
+            x_out_shape = [x_in.shape[0] // handler.para_info.dp_size, *x_in.shape[1:]]
             x_out = torch.empty(x_out_shape, dtype=x_in.dtype, device=x_in.device)
-            self.mixed_comm_module.fused_reducescatter_allreduce(
-                x_out,
-                x_in,
-                self.uc_buffer_dict["void_p"],
-                self.mem_buffer,
-                self.mc_buffer_dict["full"],
-                self.mc_buffer_dict["tp"],
-                self.ns_buffer,
-                self.vm_buffer_bytes_base,
-                self.ns_data_bytes,
-                self.ns_signal_bytes,
-                self.grid_size,
-                self.max_block_size_dict[(op, mode)],
-                self.min_block_size,
-                self.min_num_steps,
-                self.para_info.local_tp_rank,
-                self.para_info.local_tp_size,
-                self.para_info.local_dp_rank,
-                self.para_info.local_dp_size,
-                self.para_info.inter_tp_rank,
-                self.para_info.inter_tp_size,
-                self.para_info.inter_dp_rank,
-                self.para_info.inter_dp_size,
-                mode,
-            )
-        elif mode == MixedCommMode.NCCL_ONE:
-            x_out = nccl_reducescatter_allreduce(x_in, self.para_info)
-        elif mode == MixedCommMode.NCCL_TP_DP:
-            x_mid = nccl_reducescatter(x_in, group=self.dp_comm_group)
-            x_out = nccl_allreduce(x_mid, group=self.tp_comm_group, inplace=True)
-        else:
-            raise ValueError(f"Invalid mode: {mode.name}")
-        return x_out
+        handler.mixed_comm_module.fused_reducescatter_allreduce(
+            x_out,
+            x_in,
+            handler.uc_buffer_dict["void_p"],
+            handler.mem_buffer,
+            handler.mc_buffer_dict["full"],
+            handler.mc_buffer_dict["tp"],
+            handler.ns_buffer,
+            handler.vm_buffer_bytes_base,
+            handler.ns_data_bytes,
+            handler.ns_signal_bytes,
+            handler.grid_size,
+            handler.max_block_size_dict[(op, mode)],
+            handler.min_block_size,
+            handler.min_num_steps,
+            handler.para_info.local_tp_rank,
+            handler.para_info.local_tp_size,
+            handler.para_info.local_dp_rank,
+            handler.para_info.local_dp_size,
+            handler.para_info.inter_tp_rank,
+            handler.para_info.inter_tp_size,
+            handler.para_info.inter_dp_rank,
+            handler.para_info.inter_dp_size,
+            mode,
+        )
+    elif mode == MixedCommMode.NCCL_ONE:
+        x_out = _nccl_reducescatter_allreduce(x_in, x_out, handler.para_info)
+    elif mode == MixedCommMode.NCCL_TP_DP:
+        x_out = _nccl_reducescatter(x_in, x_out, group=handler.dp_comm_group)
+        x_out = _nccl_allreduce(x_out, None, group=handler.tp_comm_group, inplace=True)
+    else:
+        raise ValueError(f"Invalid mode: {mode.name}")
+    return x_out
 
-    def run_op(
-        self,
-        op: MixedCommOp,
-        x_in: torch.Tensor,
-        mode: MixedCommMode,
-    ) -> torch.Tensor:
-        return self.op_dict[op](x_in, mode)
+
+@supported_compute_capability([90, 100])
+def _common_check(
+    op: MixedCommOp,
+    handler: MixedCommHandler,
+    x_in: torch.Tensor,
+    x_out: torch.Tensor | None = None,
+    mode: MixedCommMode = MixedCommMode.AUTOTUNE,
+) -> bool:
+    if op not in handler.valid_op_list:
+        raise ValueError(f"Invalid op: {op.name}")
+    if mode not in handler.valid_mode_list:
+        raise ValueError(f"Invalid mode: {mode.name}")
+    if x_in.ndim < 2:
+        raise ValueError("x_in.ndim should be at least 2")
+    if x_in.dtype != handler.dtype:
+        raise ValueError(f"x_in.dtype should be {handler.dtype}")
+    if x_in.device != handler.device:
+        raise ValueError(f"x_in.device should be {handler.device}")
+    if op in [MixedCommOp.REDUCESCATTER, MixedCommOp.REDUCESCATTER_ALLREDUCE]:
+        if x_in.shape[0] % handler.para_info.dp_size != 0:
+            raise ValueError("x_in.shape[0] should be divisible by dp_size")
+    if x_out is not None:
+        if x_out.shape[1:] != x_in.shape[1:]:
+            raise ValueError("x_out.shape[1:] should be equal to x_in.shape[1:]")
+        if op in [MixedCommOp.REDUCESCATTER, MixedCommOp.REDUCESCATTER_ALLREDUCE]:
+            if x_out.shape[0] * handler.para_info.dp_size != x_in.shape[0]:
+                raise ValueError(
+                    "x_out.shape[0] * dp_size should be equal to x_in.shape[0]"
+                )
+        else:
+            if x_out.shape[0] != x_in.shape[0] * handler.para_info.dp_size:
+                raise ValueError(
+                    "x_out.shape[0] should be equal to x_in.shape[0] * dp_size"
+                )
+    return True
+
+
+_mixed_comm_op_dict = {
+    MixedCommOp.ALLREDUCE: _allreduce,
+    MixedCommOp.ALLGATHER: _allgather,
+    MixedCommOp.REDUCESCATTER: _reducescatter,
+    MixedCommOp.ALLREDUCE_ALLGATHER: _allreduce_allgather,
+    MixedCommOp.REDUCESCATTER_ALLREDUCE: _reducescatter_allreduce,
+}
+
+
+@flashinfer_api
+@backend_requirement(
+    backend_checks={},
+    common_check=_common_check,
+)
+def run_mixed_comm(
+    op: MixedCommOp,
+    handler: MixedCommHandler,
+    x_in: torch.Tensor,
+    x_out: torch.Tensor | None = None,
+    mode: MixedCommMode = MixedCommMode.AUTOTUNE,
+) -> torch.Tensor:
+    if mode == MixedCommMode.AUTOTUNE:
+        mode = handler.select_autotune_mode(op, x_in)
+    return _mixed_comm_op_dict[op](handler, x_in, x_out, mode)

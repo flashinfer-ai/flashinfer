@@ -8,7 +8,12 @@ import numpy as np
 import pytest
 import torch
 
-from flashinfer.comm.mixed_comm import MixedComm, MixedCommMode, MixedCommOp
+from flashinfer.comm.mixed_comm import (
+    MixedCommHandler,
+    MixedCommMode,
+    MixedCommOp,
+    run_mixed_comm,
+)
 
 
 _project_root = Path(__file__).parent.parent.parent
@@ -39,16 +44,16 @@ def prepare_data(max_local_bs, hidden_size, world_size, dtype, device):
 
 def check_op(
     op,
-    mixed_comm,
+    mixed_comm_handler,
     data,
     local_bs_list,
     info_dict_base,
     rtol=2e-2,
     atol=2e-1,
 ):
-    tp_size = mixed_comm.para_info.tp_size
-    dp_size = mixed_comm.para_info.dp_size
-    if MixedCommMode.NCCL_TP_DP in mixed_comm.valid_mode_list:
+    tp_size = mixed_comm_handler.para_info.tp_size
+    dp_size = mixed_comm_handler.para_info.dp_size
+    if MixedCommMode.NCCL_TP_DP in mixed_comm_handler.valid_mode_list:
         ref_mode = MixedCommMode.NCCL_TP_DP
     else:
         ref_mode = MixedCommMode.NCCL_ONE
@@ -56,11 +61,11 @@ def check_op(
         local_bs_coef = dp_size
     else:
         local_bs_coef = 1
-    data_sel = data[op] / math.sqrt(mixed_comm.para_info.tp_size)
+    data_sel = data[op] / math.sqrt(mixed_comm_handler.para_info.tp_size)
     for idx_data, local_bs in enumerate(local_bs_list):
         x_in = data_sel[: local_bs * local_bs_coef]
-        ref_out = mixed_comm.run_op(op, x_in, ref_mode)
-        for mode in mixed_comm.valid_mode_list:
+        ref_out = run_mixed_comm(op, mixed_comm_handler, x_in, mode=ref_mode)
+        for mode in mixed_comm_handler.valid_mode_list:
             if mode == ref_mode:
                 continue
             info_dict = {
@@ -69,7 +74,7 @@ def check_op(
                 "idx_data": idx_data,
                 "local_bs": local_bs,
             }
-            x_out = mixed_comm.run_op(op, x_in, mode)
+            x_out = run_mixed_comm(op, mixed_comm_handler, x_in, mode=mode)
             valid_precision = torch.allclose(x_out, ref_out, rtol=rtol, atol=atol)
             if not valid_precision:
                 diff_abs = (x_out - ref_out).abs()
@@ -94,7 +99,7 @@ def check_op(
                 torch.distributed.all_gather_into_tensor(
                     x_out_all,
                     x_out,
-                    group=mixed_comm.tp_comm_group,
+                    group=mixed_comm_handler.tp_comm_group,
                 )
                 valid_consistency = torch.equal(
                     x_out_all, x_out[None].expand(tp_size, -1, -1)
@@ -149,7 +154,7 @@ def _run_worker(
     for local_tp_size, inter_tp_size in product(local_tp_size_list, inter_tp_size_list):
         local_dp_size = local_size // local_tp_size
         inter_dp_size = inter_size // inter_tp_size
-        mixed_comm = MixedComm(
+        mixed_comm_handler = MixedCommHandler(
             world_rank=world_rank,
             world_size=world_size,
             local_rank=local_rank,
@@ -173,22 +178,22 @@ def _run_worker(
             "dtype": dtype,
         }
         if world_rank == 0:
-            valid_op_list = [val.name for val in mixed_comm.valid_op_list]
-            valid_mode_list = [val.name for val in mixed_comm.valid_mode_list]
+            valid_op_list = [val.name for val in mixed_comm_handler.valid_op_list]
+            valid_mode_list = [val.name for val in mixed_comm_handler.valid_mode_list]
             print(info_dict_base, flush=True)
             print(f"{valid_op_list=}", flush=True)
             print(f"{valid_mode_list=}", flush=True)
             for op, mode in product(
-                mixed_comm.valid_op_list, mixed_comm.valid_mode_list
+                mixed_comm_handler.valid_op_list, mixed_comm_handler.valid_mode_list
             ):
-                max_block_size_dict = mixed_comm.max_block_size_dict.get(
+                max_block_size_dict = mixed_comm_handler.max_block_size_dict.get(
                     (op, mode), None
                 )
                 print(f"{op.name=}, {mode.name=}, {max_block_size_dict=}", flush=True)
             print(flush=True)
-        for op in mixed_comm.valid_op_list:
-            check_op(op, mixed_comm, data, local_bs_list, info_dict_base)
-        mixed_comm.shutdown()
+        for op in mixed_comm_handler.valid_op_list:
+            check_op(op, mixed_comm_handler, data, local_bs_list, info_dict_base)
+        mixed_comm_handler.shutdown()
     torch.distributed.barrier()
     torch.distributed.destroy_process_group()
 

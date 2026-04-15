@@ -161,7 +161,9 @@ def gen_mixed_comm_module() -> JitSpec:
 
     path_base = pathlib.Path(nvidia.nvshmem.__path__[0])
 
-    nvcc_flags = ["-rdc=true"]
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[9, 10]
+    ) + ["-rdc=true"]
     ldflags = [f"-L{str(path_base / 'lib')}"] + ["-lnvshmem_device"]
 
     return gen_jit_spec(

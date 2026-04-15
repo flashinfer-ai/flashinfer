@@ -4,7 +4,7 @@ import statistics
 
 import torch
 
-from flashinfer.comm.mixed_comm import MixedComm, MixedCommOp
+from flashinfer.comm.mixed_comm import MixedCommHandler, MixedCommOp, run_mixed_comm
 from flashinfer.testing.utils import bench_gpu_time
 
 
@@ -38,17 +38,18 @@ def print_duration(info, func, input_args, input_kwargs=None):
     print_first_rank(f"{info}: {duration_us:.3f} us")
 
 
-def bench_op(op, mixed_comm, data, local_bs):
+def bench_op(op, mixed_comm_handler, data, local_bs):
     print_first_rank(f"{op.name}: {local_bs=}")
     if op in [MixedCommOp.REDUCESCATTER, MixedCommOp.REDUCESCATTER_ALLREDUCE]:
-        x_in = data[: local_bs * mixed_comm.para_info.dp_size]
+        x_in = data[: local_bs * mixed_comm_handler.para_info.dp_size]
     else:
         x_in = data[:local_bs]
-    for mode in mixed_comm.valid_mode_list:
+    for mode in mixed_comm_handler.valid_mode_list:
         print_duration(
             f"{mode.name}",
-            mixed_comm.run_op,
-            (op, x_in, mode),
+            run_mixed_comm,
+            (op, mixed_comm_handler, x_in),
+            input_kwargs={"mode": mode},
         )
     print_first_rank()
 
@@ -82,7 +83,7 @@ def _run_worker(local_rank, local_size, args):
         "local_size must be the same on all ranks"
     )
     max_local_bs = max(local_bs_list)
-    mixed_comm = MixedComm(
+    mixed_comm_handler = MixedCommHandler(
         world_rank=world_rank,
         world_size=world_size,
         local_rank=local_rank,
@@ -97,17 +98,20 @@ def _run_worker(local_rank, local_size, args):
         device=device,
     )
     data = torch.empty(
-        [max_local_bs * mixed_comm.para_info.dp_size, hidden_size],
+        [max_local_bs * mixed_comm_handler.para_info.dp_size, hidden_size],
         dtype=dtype,
         device=device,
     ).uniform_(-0.5, 0.5)
-    for (op, mode), max_block_size_dict in mixed_comm.max_block_size_dict.items():
+    for (
+        op,
+        mode,
+    ), max_block_size_dict in mixed_comm_handler.max_block_size_dict.items():
         print_first_rank(f"{op.name=}, {mode.name=}, {max_block_size_dict=}")
     print_first_rank()
     for local_bs in local_bs_list:
-        for op in mixed_comm.valid_op_list:
-            bench_op(op, mixed_comm, data, local_bs)
-    mixed_comm.shutdown()
+        for op in mixed_comm_handler.valid_op_list:
+            bench_op(op, mixed_comm_handler, data, local_bs)
+    mixed_comm_handler.shutdown()
     torch.distributed.barrier()
     torch.distributed.destroy_process_group()
 
