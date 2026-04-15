@@ -2279,15 +2279,16 @@ class BatchPrefillWithPagedKVCacheWrapper:
         key_block_scales = None
         value_block_scales = None
         if kv_cache_sf is not None:
-            if (
-                not isinstance(kv_cache_sf, (tuple, list))
-                or len(kv_cache_sf) != 2
-                or not all(torch.is_tensor(x) for x in kv_cache_sf)
-            ):
+            if isinstance(kv_cache_sf, (tuple, list)):
+                key_block_scales, value_block_scales = kv_cache_sf
+            elif torch.is_tensor(kv_cache_sf):
+                # Accept stacked tensor of shape [num_pages, 2, ...] and unbind along dim=1
+                key_block_scales, value_block_scales = kv_cache_sf.unbind(dim=1)
+            else:
                 raise TypeError(
-                    "kv_cache_sf must be a tuple/list of two tensors: (k_scales, v_scales)."
+                    "kv_cache_sf must be a tuple/list of two tensors or a stacked tensor "
+                    "with shape [num_pages, 2, ...]."
                 )
-            key_block_scales, value_block_scales = kv_cache_sf
 
         o_dtype = self._cached_o_data_type
         if out is not None and out.dtype != o_dtype:
@@ -4121,15 +4122,16 @@ def trtllm_batch_context_with_kv_cache(
     key_block_scales = None
     value_block_scales = None
     if kv_cache_sf is not None:
-        if (
-            not isinstance(kv_cache_sf, (tuple, list))
-            or len(kv_cache_sf) != 2
-            or not all(torch.is_tensor(x) for x in kv_cache_sf)
-        ):
+        if isinstance(kv_cache_sf, (tuple, list)):
+            key_block_scales, value_block_scales = kv_cache_sf
+        elif torch.is_tensor(kv_cache_sf):
+            # Accept stacked tensor of shape [num_pages, 2, ...] and unbind along dim=1
+            key_block_scales, value_block_scales = kv_cache_sf.unbind(dim=1)
+        else:
             raise TypeError(
-                "kv_cache_sf must be a tuple/list of two tensors: (k_scales, v_scales)."
+                "kv_cache_sf must be a tuple/list of two tensors or a stacked tensor "
+                "with shape [num_pages, 2, ...]."
             )
-        key_block_scales, value_block_scales = kv_cache_sf
 
     # Convert NHD layout to HND if necessary
     if kv_layout == "NHD":
