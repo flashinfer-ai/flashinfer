@@ -2333,6 +2333,8 @@ def trtllm_bf16_moe(
         when do_finalize=True, returns the final MoE output.
         otherwise, returns the intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
     """
+    if routing_bias is not None and routing_bias.dtype != torch.bfloat16:
+        routing_bias = routing_bias.to(torch.bfloat16)
     result = get_trtllm_moe_sm100_module().trtllm_bf16_moe(
         routing_logits,
         routing_bias,
@@ -2533,6 +2535,8 @@ def trtllm_fp8_per_tensor_scale_moe(
         when do_finalize=True, returns the final MoE output.
         otherwise, returns the intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
     """
+    if routing_bias is not None and routing_bias.dtype not in (torch.bfloat16, torch.float32):
+        routing_bias = routing_bias.to(torch.bfloat16)
     result = get_trtllm_moe_sm100_module().trtllm_fp8_per_tensor_scale_moe(
         routing_logits,
         routing_bias,
@@ -2638,6 +2642,8 @@ def trtllm_fp8_block_scale_moe(
         when do_finalize=True, returns the final MoE output.
         otherwise, returns the intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
     """
+    if routing_bias is not None and routing_bias.dtype not in (torch.bfloat16, torch.float32):
+        routing_bias = routing_bias.to(torch.bfloat16)
     output = torch.empty(
         hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
     )
@@ -2755,6 +2761,8 @@ def trtllm_fp8_block_scale_routed_moe(
         when do_finalize=True, returns the final MoE output.
         otherwise, returns the intermediate results (gemm2_output, undefined, expanded_idx_to_permuted_idx) that need further processing.
     """
+    if routing_bias is not None and routing_bias.dtype not in (torch.bfloat16, torch.float32):
+        routing_bias = routing_bias.to(torch.bfloat16)
     result = get_trtllm_moe_sm100_module().trtllm_fp8_block_scale_moe(
         None,  # routing_logits
         topk_ids,
@@ -2892,6 +2900,8 @@ def trtllm_fp4_block_scale_moe(
         List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
             Otherwise, returns intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
     """
+    if routing_bias is not None and routing_bias.dtype not in (torch.bfloat16, torch.float32):
+        routing_bias = routing_bias.to(torch.bfloat16)
     return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
         routing_logits,
         None,
@@ -3027,6 +3037,8 @@ def trtllm_fp4_block_scale_routed_moe(
         List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
             Otherwise, returns intermediate results (gemm2_output, undefined, expanded_idx_to_permuted_idx) that need further processing.
     """
+    if routing_bias is not None and routing_bias.dtype not in (torch.bfloat16, torch.float32):
+        routing_bias = routing_bias.to(torch.bfloat16)
     return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
         None,
         topk_ids,
@@ -3137,6 +3149,8 @@ def trtllm_mxint4_block_scale_moe(
         List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
             Otherwise, returns intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
     """
+    if routing_bias is not None and routing_bias.dtype != torch.bfloat16:
+        routing_bias = routing_bias.to(torch.bfloat16)
     return get_trtllm_moe_sm100_module().trtllm_mxint4_block_scale_moe(
         routing_logits,
         routing_bias,

@@ -4092,6 +4092,7 @@ def test_tier_1024_experts_routing(
     [
         pytest.param(None, id="default_bias"),
         pytest.param(torch.float32, id="FP32_bias"),
+        pytest.param(torch.float16, id="FP16_bias"),
     ],
 )
 def test_routing_dtype_flexibility(
