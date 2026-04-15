@@ -202,6 +202,9 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(
        reinterpret_cast<StrideD*>(hopper_inputs.stride_d)},
       hw_info};
 
+  // Optimize tile scheduling for better L2 locality
+  arguments.scheduler.max_swizzle_size = 2;
+
   assert(group_size == int(inputs.groupwise_quant_group_size));
   if (workspace_size != nullptr) {
     *workspace_size = gemm.get_workspace_size(arguments);
