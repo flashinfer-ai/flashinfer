@@ -135,12 +135,12 @@ class ArtifactPath:
     When compiling new cubins for backend directories, update the corresponding path.
     """
 
-    TRTLLM_GEN_FMHA: str = "e7afc4134bb53eaab63fb85163d5943fb190621c/fmha/trtllm-gen/"
+    TRTLLM_GEN_FMHA: str = "55bba55929d4093682e32d817bd11ffb0441c749/fmha/trtllm-gen/"
     TRTLLM_GEN_BMM: str = (
-        "b55211623be7f5697c5262ffd8361fc06c147bc9/batched_gemm-b3c1646-c111d7c/"
+        "39a9d28268f43475a757d5700af135e1e58c9849/batched_gemm-5ee61af-2b9855b/"
     )
     TRTLLM_GEN_GEMM: str = (
-        "b117d5a6b2dd2228aa966a938eac398cf336d8c0/gemm-b3c1646-1fddea2/"
+        "31e75d429ff3f710de1251afdd148185f53da44d/gemm-4daf11e-1fddea2/"
     )
     CUDNN_SDPA: str = "a72d85b019dc125b9f711300cb989430f762f5a6/fmha/cudnn/"
     # For DEEPGEMM, we also need to update KernelMap.KERNEL_MAP_HASH in flashinfer/deep_gemm.py
@@ -155,14 +155,14 @@ class CheckSumHash:
     """
 
     TRTLLM_GEN_FMHA: str = (
-        "5bd87798e560a63e883902fc5468146ffff0d3551bf337d2f81bd02893e9dc39"
+        "f2c0aad1e74391c4267a2f9a20ec819358b59e04588385cffb452ed341500b99"
     )
     TRTLLM_GEN_BMM: str = (
-        "0af823880730c4f0b3832d2208fab035946694b83444410b9309db5613d60195"
+        "db06db7f36a2a9395a2041ff6ac016fe664874074413a2ed90797f91ef17e0f6"
     )
     DEEPGEMM: str = "1a2a166839042dbd2a57f48051c82cd1ad032815927c753db269a4ed10d0ffbf"
     TRTLLM_GEN_GEMM: str = (
-        "18262161e624f7da9d2d04c528c645a5ff7f5efd774024a0b2eb92748ab18bb9"
+        "64b7114a429ea153528dd4d4b0299363d7320964789eb5efaefec66f301523c7"
     )
     map_checksums: dict[str, str] = {
         safe_urljoin(ArtifactPath.TRTLLM_GEN_FMHA, "checksums.txt"): TRTLLM_GEN_FMHA,
@@ -284,7 +284,7 @@ def get_artifacts_status() -> tuple[tuple[str, bool], ...]:
     cubin_files = get_subdir_file_list()
 
     def _check_file_status(file_name: str) -> tuple[str, bool]:
-        # get_cubin stores cubins in FLASHINFER_CUBIN_DIR with the same relative path
+        # get_artifact stores files in FLASHINFER_CUBIN_DIR with the same relative path
         # Remove any leading slashes from name
         local_path = os.path.join(FLASHINFER_CUBIN_DIR, file_name)
         exists = os.path.isfile(local_path)

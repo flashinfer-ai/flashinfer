@@ -36,14 +36,29 @@ from flashinfer.cute_dsl import is_cute_dsl_available
 
 
 def is_sm100_family():
-    """Check for SM100 family (Blackwell: SM100, SM103).
+    """Check for SM100 family (Blackwell: SM100, SM103) or SM120 family (SM120, SM121).
 
-    CuteDSL MoE NVFP4 kernels are optimized for SM10x architecture.
+    CuteDSL MoE NVFP4 kernels support SM10x and SM12x architectures.
     """
     if not torch.cuda.is_available():
         return False
     props = torch.cuda.get_device_properties(0)
-    return props.major == 10
+    return props.major in (10, 12)
+
+
+def is_sm120_family():
+    """Check for SM120 family (SM120, SM121)."""
+    if not torch.cuda.is_available():
+        return False
+    props = torch.cuda.get_device_properties(0)
+    return props.major == 12
+
+
+def _has_cuda_13():
+    """Check if CUDA runtime version is 13+."""
+    return (
+        torch.version.cuda is not None and int(torch.version.cuda.split(".")[0]) >= 13
+    )
 
 
 # Skip decorators
@@ -51,9 +66,22 @@ cute_dsl_available = pytest.mark.skipif(
     not is_cute_dsl_available(), reason="CuteDSL not available"
 )
 sm100_required = pytest.mark.skipif(
-    not is_sm100_family(),
-    reason="Requires SM100 family GPU (Blackwell: SM100, SM103, SM110)",
+    not is_sm100_family() or (is_sm120_family() and not _has_cuda_13()),
+    reason="Requires SM100/SM103 or SM120/SM121 GPU (SM120 requires CUDA 13+)",
 )
+sm100_only = pytest.mark.skipif(
+    is_sm120_family() or not is_sm100_family(),
+    reason="Requires SM100 family GPU (wrapper/tactics not yet ported to SM120)",
+)
+
+
+def moe_input(tensors: dict) -> torch.Tensor:
+    """Return the correct x tensor for the current architecture.
+
+    SM100/103 expects pre-quantized FP4; SM120/121 expects bf16
+    (the kernel fuses quantization internally).
+    """
+    return tensors["x_bf16"] if is_sm120_family() else tensors["x"]
 
 
 def silu(x: torch.Tensor) -> torch.Tensor:
@@ -235,10 +263,15 @@ def create_moe_tensors(
         / 10
     )
 
-    w1_bf16_interleaved = interleave_linear_and_gate(w1_bf16, group_size=64, dim=1)
+    # SM100/103: interleave gate/up for CuTe DSL SwiGLU epilogue (group_size=64)
+    # SM120/121: no interleave — kernel expects [up_0:N, gate_0:N] (contiguous cat)
+    if is_sm120_family():
+        w1_bf16_prepared = w1_bf16  # b12x kernel: non-interleaved
+    else:
+        w1_bf16_prepared = interleave_linear_and_gate(w1_bf16, group_size=64, dim=1)
     w1_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
 
-    w1_flat = w1_bf16_interleaved.view(
+    w1_flat = w1_bf16_prepared.view(
         num_local_experts * 2 * intermediate_size, hidden_size
     )
     w1_q_flat, w1_sf_flat = fp4_quantize(
@@ -363,7 +396,7 @@ class TestCuteDslFusedMoeFunctional:
         )
 
         result = cute_dsl_fused_moe_nvfp4(
-            x=tensors["x"],
+            x=moe_input(tensors),
             x_sf=tensors["x_sf"],
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
@@ -422,7 +455,7 @@ class TestCuteDslFusedMoeFunctional:
 
         with autotune(True):
             result = cute_dsl_fused_moe_nvfp4(
-                x=tensors["x"],
+                x=moe_input(tensors),
                 x_sf=tensors["x_sf"],
                 token_selected_experts=tensors["token_selected_experts"],
                 token_final_scales=tensors["token_final_scales"],
@@ -479,7 +512,7 @@ class TestCuteDslMoEWrapper:
         )
 
         result = moe.run(
-            x=tensors["x"],
+            x=moe_input(tensors),
             x_sf=tensors["x_sf"],
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
@@ -546,7 +579,7 @@ class TestCuteDslMoEWrapper:
         # Warmup
         for _ in range(3):
             moe.run(
-                x=tensors["x"],
+                x=moe_input(tensors),
                 x_sf=tensors["x_sf"],
                 token_selected_experts=tensors["token_selected_experts"],
                 token_final_scales=tensors["token_final_scales"],
@@ -564,7 +597,7 @@ class TestCuteDslMoEWrapper:
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
             output = moe.run(
-                x=tensors["x"],
+                x=moe_input(tensors),
                 x_sf=tensors["x_sf"],
                 token_selected_experts=tensors["token_selected_experts"],
                 token_final_scales=tensors["token_final_scales"],
@@ -650,7 +683,7 @@ class TestCuteDslMoEWrapper:
 
         with autotune(True):
             result = moe.run(
-                x=tensors["x"],
+                x=moe_input(tensors),
                 x_sf=tensors["x_sf"],
                 token_selected_experts=tensors["token_selected_experts"],
                 token_final_scales=tensors["token_final_scales"],
@@ -714,7 +747,7 @@ class TestApiConsistency:
 
         # Functional API
         result_functional = cute_dsl_fused_moe_nvfp4(
-            x=tensors["x"],
+            x=moe_input(tensors),
             x_sf=tensors["x_sf"],
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
@@ -739,7 +772,7 @@ class TestApiConsistency:
         )
 
         result_wrapper = moe.run(
-            x=tensors["x"],
+            x=moe_input(tensors),
             x_sf=tensors["x_sf"],
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
@@ -771,7 +804,7 @@ class TestApiConsistency:
 
 
 @cute_dsl_available
-@sm100_required
+@sm100_only
 class TestExpertParallelism:
     """Tests for expert parallelism (EP) configurations."""
 
@@ -817,7 +850,7 @@ class TestExpertParallelism:
         )
 
         result = moe.run(
-            x=tensors["x"],
+            x=moe_input(tensors),
             x_sf=tensors["x_sf"],
             token_selected_experts=token_selected_experts,
             token_final_scales=tensors["token_final_scales"],
@@ -880,7 +913,7 @@ class TestExpertParallelism:
         )
 
         result = cute_dsl_fused_moe_nvfp4(
-            x=tensors["x"],
+            x=moe_input(tensors),
             x_sf=tensors["x_sf"],
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
@@ -931,7 +964,7 @@ class TestExpertParallelism:
 
 
 @cute_dsl_available
-@sm100_required
+@sm100_only
 class TestAllValidTactics:
     """Test that every tactic returned by get_valid_tactics produces correct output.
 
@@ -1014,7 +1047,7 @@ class TestAllValidTactics:
         for tactic in valid_tactics:
             tile_size = tactic[0]
             result = moe.run(
-                x=tensors["x"],
+                x=moe_input(tensors),
                 x_sf=tensors["x_sf"],
                 token_selected_experts=tensors["token_selected_experts"],
                 token_final_scales=tensors["token_final_scales"],

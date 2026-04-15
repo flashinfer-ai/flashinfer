@@ -18,8 +18,12 @@ class RoutingMethodType(IntEnum):
     RenormalizeNaive = (4,)
     # TopK only (no softmax)
     TopK = (5,)
+    # SigmoidRenorm: Sigmoid -> TopK -> Renormalize (divide by sum of top-K weights)
+    SigmoidRenorm = (6,)
+    # MiniMax2: Sigmoid + Bias -> TopK -> ScaledSumNormalize (routeScale=1.0, epsilon=1e-20)
+    MiniMax2 = (7,)
     # Unspecified
-    Unspecified = 6
+    Unspecified = (8,)
 
 
 # Copied from csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/common.h

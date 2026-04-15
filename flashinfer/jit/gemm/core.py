@@ -31,11 +31,29 @@ from ..core import (
     current_compilation_context,
 )
 from ..cubin_loader import (
-    # download_trtllm_headers,
-    get_cubin,
+    get_artifact,
     get_meta_hash,
+    ensure_symlink,
+    verify_symlinked_headers,
 )
 from ..utils import dtype_cutlass_map, filename_safe_dtype_map, write_if_different
+
+GEMM_EXPORT_HEADERS = [
+    "Enums.h",
+    "GemmInterface.h",
+    "GemmOptions.h",
+    "KernelParams.h",
+    "KernelParamsDecl.h",
+    "KernelTraits.h",
+    "TmaDescriptor.h",
+    "trtllm/gen/CommonUtils.h",
+    "trtllm/gen/CudaArchDecl.h",
+    "trtllm/gen/CudaKernelLauncher.h",
+    "trtllm/gen/DtypeDecl.h",
+    "trtllm/gen/MmaDecl.h",
+    "trtllm/gen/SfLayoutDecl.h",
+    "trtllm/gen/SparsityDecl.h",
+]
 
 
 def gen_gemm_module() -> JitSpec:
@@ -365,6 +383,55 @@ def gen_gemm_sm100_module_cutlass_mxfp8() -> JitSpec:
     )
 
 
+def gen_gemm_sm120_module_cutlass_mxfp8() -> JitSpec:
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / "gen_gemm_sm120_cutlass_mxfp8"
+    os.makedirs(gen_directory, exist_ok=True)
+    source_paths = [
+        jit_env.FLASHINFER_CSRC_DIR / "mxfp8_gemm_cutlass_sm120.cu",
+    ]
+
+    with open(jit_env.FLASHINFER_CSRC_DIR / "mxfp8_gemm_cutlass_sm120.jinja") as f:
+        kernel_inst_templ = jinja2.Template(f.read())
+        dtype_list = ["__nv_bfloat16", "half"]
+        # SM120 tile configs matching CutlassTileConfigSM120 enum entries.
+        # ClusterShape is always 1x1x1 for SM120 (no programmatic multicast).
+        cta_m_n_k_list = [
+            (128, 128, 128),
+            (256, 128, 128),
+            (128, 256, 128),
+        ]
+        for cta_m, cta_n, cta_k in cta_m_n_k_list:
+            for dtype in dtype_list:
+                dest_path = (
+                    gen_directory
+                    / f"mxfp8_gemm_cutlass_sm120_{dtype}_{cta_m}_{cta_n}_{cta_k}.cu"
+                )
+                source_paths.append(dest_path)
+                source = kernel_inst_templ.render(
+                    type=dtype,
+                    cta_m=cta_m,
+                    cta_n=cta_n,
+                    cta_k=cta_k,
+                )
+                write_if_different(dest_path, source)
+
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[12]
+    )
+    return gen_jit_spec(
+        "mxfp8_gemm_cutlass_sm120",
+        source_paths,
+        extra_cuda_cflags=nvcc_flags
+        + [
+            "-DENABLE_BF16",
+            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
+        ],
+        extra_cflags=[
+            "-DFAST_BUILD",
+        ],
+    )
+
+
 def gen_gemm_sm100_module() -> JitSpec:
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / "gen_gemm_sm100"
     os.makedirs(gen_directory, exist_ok=True)
@@ -584,30 +651,34 @@ def gen_trtllm_gen_gemm_module() -> JitSpec:
 
     # Check if checksums.txt exists in the cubin directory
     checksum_path = f"{ArtifactPath.TRTLLM_GEN_GEMM}/checksums.txt"
-    checksum = get_cubin(checksum_path, CheckSumHash.TRTLLM_GEN_GEMM)
+    checksum = get_artifact(checksum_path, CheckSumHash.TRTLLM_GEN_GEMM)
     assert checksum, f"Failed to get checksums.txt from {checksum_path}"
     meta_hash = get_meta_hash(checksum)
 
-    # use `get_cubin` to get "flashinferMetaInfo.h"
-    metainfo = get_cubin(
+    # use `get_artifact` to get "flashinferMetaInfo.h"
+    metainfo = get_artifact(
         f"{include_path}/{header_name}.h",
         meta_hash,
     )
     # make sure "flashinferMetaInfo.h" is downloaded or cached
     assert metainfo, f"{header_name}.h not found"
 
-    # TODO(jimmyzho): Re-enable after fixing trtllm-gen cubin generation issues.
-    # header_path = f"{include_path}/trtllmGen_gemm_export"
-    # header_dest_dir = (
-    #     jit_env.FLASHINFER_CUBIN_DIR
-    #     / "flashinfer"
-    #     / "trtllm"
-    #     / "gemm"
-    #     / "trtllmGen_gemm_export"
-    # )
-    # download_trtllm_headers(
-    #     "gemm", header_dest_dir, header_path, ArtifactPath.TRTLLM_GEN_GEMM, checksum
-    # )
+    # Fetch GEMM export headers via get_artifact() and symlink for C++ includes.
+    gemm_export_path = f"{include_path}/trtllmGen_gemm_export"
+    for header in GEMM_EXPORT_HEADERS:
+        h = get_artifact(
+            f"{gemm_export_path}/{header}", get_meta_hash(checksum, header)
+        )
+        assert h, f"{header} not found"
+    symlink_path = (
+        jit_env.FLASHINFER_CUBIN_DIR
+        / "flashinfer"
+        / "trtllm"
+        / "gemm"
+        / "trtllmGen_gemm_export"
+    )
+    ensure_symlink(symlink_path, jit_env.FLASHINFER_CUBIN_DIR / gemm_export_path)
+    verify_symlinked_headers(symlink_path, GEMM_EXPORT_HEADERS, checksum)
 
     return gen_jit_spec(
         "trtllm_gemm",
@@ -621,11 +692,9 @@ def gen_trtllm_gen_gemm_module() -> JitSpec:
             f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_GEMM}\\"',
         ]
         + sm100a_nvcc_flags,
-        # link "include" sub-directory in cache
         extra_include_paths=[
+            jit_env.FLASHINFER_CUBIN_DIR,
             jit_env.FLASHINFER_CUBIN_DIR / include_path,
-            # jit_env.FLASHINFER_CUBIN_DIR,
-            # jit_env.FLASHINFER_CUBIN_DIR / include_path,
         ],
     )
 
@@ -756,30 +825,34 @@ def gen_trtllm_low_latency_gemm_module() -> JitSpec:
 
     # Check if checksums.txt exists in the cubin directory
     checksum_path = f"{ArtifactPath.TRTLLM_GEN_GEMM}/checksums.txt"
-    checksum = get_cubin(checksum_path, CheckSumHash.TRTLLM_GEN_GEMM)
+    checksum = get_artifact(checksum_path, CheckSumHash.TRTLLM_GEN_GEMM)
     assert checksum, f"Failed to get checksums.txt from {checksum_path}"
     meta_hash = get_meta_hash(checksum)
 
-    # use `get_cubin` to get "flashinferMetaInfo.h"
-    metainfo = get_cubin(
+    # use `get_artifact` to get "flashinferMetaInfo.h"
+    metainfo = get_artifact(
         f"{include_path}/{header_name}.h",
         meta_hash,
     )
     # make sure "flashinferMetaInfo.h" is downloaded or cached
     assert metainfo, f"{header_name}.h not found"
 
-    # TODO(jimmyzho): Re-enable after fixing trtllm-gen cubin generation issues.
-    # header_path = f"{include_path}/trtllmGen_gemm_export"
-    # header_dest_dir = (
-    #     jit_env.FLASHINFER_CUBIN_DIR
-    #     / "flashinfer"
-    #     / "trtllm"
-    #     / "gemm"
-    #     / "trtllmGen_gemm_export"
-    # )
-    # download_trtllm_headers(
-    #     "gemm", header_dest_dir, header_path, ArtifactPath.TRTLLM_GEN_GEMM, checksum
-    # )
+    # Fetch GEMM export headers via get_artifact() and symlink for C++ includes.
+    gemm_export_path = f"{include_path}/trtllmGen_gemm_export"
+    for header in GEMM_EXPORT_HEADERS:
+        h = get_artifact(
+            f"{gemm_export_path}/{header}", get_meta_hash(checksum, header)
+        )
+        assert h, f"{header} not found"
+    symlink_path = (
+        jit_env.FLASHINFER_CUBIN_DIR
+        / "flashinfer"
+        / "trtllm"
+        / "gemm"
+        / "trtllmGen_gemm_export"
+    )
+    ensure_symlink(symlink_path, jit_env.FLASHINFER_CUBIN_DIR / gemm_export_path)
+    verify_symlinked_headers(symlink_path, GEMM_EXPORT_HEADERS, checksum)
 
     return gen_jit_spec(
         "trtllm_low_latency_gemm",
@@ -794,9 +867,8 @@ def gen_trtllm_low_latency_gemm_module() -> JitSpec:
         ]
         + sm100a_nvcc_flags,
         extra_include_paths=[
-            jit_env.FLASHINFER_CUBIN_DIR / include_path
-            # jit_env.FLASHINFER_CUBIN_DIR,
-            # jit_env.FLASHINFER_CUBIN_DIR / include_path,
+            jit_env.FLASHINFER_CUBIN_DIR,
+            jit_env.FLASHINFER_CUBIN_DIR / include_path,
         ],
         extra_ldflags=["-lcuda"],
     )

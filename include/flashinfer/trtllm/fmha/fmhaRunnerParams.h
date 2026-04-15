@@ -224,6 +224,10 @@ struct TllmGenFmhaRunnerParams {
   float2* softmaxStatsPtr;
   // The LSE buffer.
   float* lsePtr;
+  // The stride between different tokens for LSE.
+  int64_t lseStrideTokens;
+  // The stride between different heads for LSE.
+  int64_t lseStrideHeads;
 
   // Attention sink
   float const* ptrAttentionSinks{nullptr};
@@ -250,6 +254,15 @@ struct TllmGenFmhaRunnerParams {
   int vStrideHeads;
   // The stride between different batches for V.
   int vStrideBatch;
+
+  // The stride between different heads for K scaling factors.
+  int kSfStrideHeads;
+  // The stride between different batches for K scaling factors.
+  int kSfStrideBatch;
+  // The stride between different heads for V scaling factors.
+  int vSfStrideHeads;
+  // The stride between different batches for V scaling factors.
+  int vSfStrideBatch;
 
   // Head dimension for Q and K.
   int mHeadDimQk;

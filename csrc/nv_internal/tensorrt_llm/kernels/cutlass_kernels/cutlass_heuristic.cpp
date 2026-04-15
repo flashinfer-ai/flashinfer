@@ -61,6 +61,7 @@ TileShape get_cta_shape_for_config(CutlassTileConfig tile_config) {
     case CutlassTileConfig::CtaShape64x128x64_WarpShape64x32x64:
       return TileShape{64, 128};
     case CutlassTileConfig::CtaShape128x64x64_WarpShape64x32x64:
+    case CutlassTileConfig::CtaShape128x64x128_WarpShape64x32x128:
       return TileShape{128, 64};
     case CutlassTileConfig::CtaShape128x128x8_WarpShape64x64x8:
     case CutlassTileConfig::CtaShape128x128x64_WarpShape64x32x64:
@@ -587,53 +588,41 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm110(
 std::vector<CutlassGemmConfig> get_candidate_configs_sm120(
     CutlassGemmConfig::CandidateConfigTypeParam const config) {
 #ifdef FAST_BUILD
-  // Fast build disables all configs except this
   if (config & CutlassGemmConfig::GROUPED_GEMM) {
-    return {CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x128B,
-                              MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
-                              ClusterShape::ClusterShape_1x1x1}};
+    return {
+        CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x128B, MainloopScheduleType::AUTO,
+                          EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1},
+        CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x64B, MainloopScheduleType::AUTO,
+                          EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1}};
   } else {
-    return {CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x256B,
-                              MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
-                              ClusterShape::ClusterShape_1x1x1}};
+    return {
+        CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x256B, MainloopScheduleType::AUTO,
+                          EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1},
+        CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x64B, MainloopScheduleType::AUTO,
+                          EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1}};
   }
 #else
-  if (config & CutlassGemmConfig::GROUPED_GEMM) {
-    std::vector<CutlassGemmConfig> candidate_configs;
-    if ((config & CutlassGemmConfig::FP4_ONLY) != 0) {
-      candidate_configs.push_back(CutlassGemmConfig{
-          CutlassTileConfigSM120::CtaShape128x128x128B, MainloopScheduleType::AUTO,
-          EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
-      candidate_configs.push_back(
-          CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x64B, MainloopScheduleType::AUTO,
-                            EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
-      candidate_configs.push_back(
-          CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x256x64B, MainloopScheduleType::AUTO,
-                            EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
-      candidate_configs.push_back(
-          CutlassGemmConfig{CutlassTileConfigSM120::CtaShape256x128x64B, MainloopScheduleType::AUTO,
-                            EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
-      return candidate_configs;
-    } else {
+  if ((config & CutlassGemmConfig::FP4_ONLY) == 0) {
+    if (config & CutlassGemmConfig::GROUPED_GEMM) {
       TLLM_THROW("Not Implemented: SM120 group GEMM only supports nvfp4.");
     }
-  } else {
-    std::vector<CutlassGemmConfig> candidate_configs;
-    if ((config & CutlassGemmConfig::FP4_ONLY) != 0) {
-      candidate_configs.push_back(CutlassGemmConfig{
-          CutlassTileConfigSM120::CtaShape128x128x256B, MainloopScheduleType::AUTO,
-          EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
-      candidate_configs.push_back(CutlassGemmConfig{
-          CutlassTileConfigSM120::CtaShape256x128x128B, MainloopScheduleType::AUTO,
-          EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
-      return candidate_configs;
-    } else {
-      TLLM_THROW("Not Implemented: SM120 GEMM only supports nvfp4.");
-    }
+    TLLM_THROW("Not Implemented: SM120 GEMM only supports nvfp4.");
   }
+  // All candidate tiles for SM120 FP4. Invalid tiles for a given path are skipped
+  // gracefully by the try-catch in calcMaxWorkspaceSize.
+  static constexpr CutlassTileConfigSM120 all_tiles[] = {
+      CutlassTileConfigSM120::CtaShape128x128x128B, CutlassTileConfigSM120::CtaShape128x128x64B,
+      CutlassTileConfigSM120::CtaShape256x128x64B,  CutlassTileConfigSM120::CtaShape128x256x64B,
+      CutlassTileConfigSM120::CtaShape128x128x256B, CutlassTileConfigSM120::CtaShape256x128x128B,
+  };
+  std::vector<CutlassGemmConfig> result;
+  for (auto tile : all_tiles) {
+    result.push_back(CutlassGemmConfig{tile, MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
+                                       ClusterShape::ClusterShape_1x1x1});
+  }
+  return result;
 #endif
-
-}  // namespace kernels
+}
 
 std::vector<CutlassGemmConfig> get_candidate_configs(
     int sm, int const max_split_k,
