@@ -682,5 +682,102 @@ cvt_fp16_to_fp4_expert(
 
 __global__ void block_scale_interleave_kernel(int numbatches, int numRows, int numCols,
                                               uint8_t const* SFIn, uint8_t* SFOutput);
+
+template <typename T, uint32_t BLOCK_SIZE, QuantizationSFLayout SF_LAYOUT, bool CACHE_LOCAL_AMAX>
+__global__ void nvfp4QuantAndPerTokenScaleKernel(
+    // input
+    uint32_t m, uint32_t n, T const* input, float globalScaleInv, int32_t* expandedIdxToPermutedIdx,
+    // output
+    uint8_t* weightOutput, uint8_t* scaleOutput, float* perTokenScaleOutput,
+    QuantizationSFLayout layout = QuantizationSFLayout::LINEAR) {
+  static constexpr int ELTS_PER_THREAD = CVT_FP16_TO_FP4_ELTS_PER_THREAD;
+  static constexpr int SF_VEC_SIZE = 16;
+  static constexpr int NUM_THREADS_PER_SF = SF_VEC_SIZE / ELTS_PER_THREAD;  // 2
+  int rowIdx = blockIdx.x;
+  if (rowIdx >= m) return;
+  if (expandedIdxToPermutedIdx != nullptr) {
+    rowIdx = expandedIdxToPermutedIdx[rowIdx];
+  }
+  if (rowIdx < 0) return;
+  extern __shared__ float
+      localAmaxSmem[];  // n / ELTS_PER_THREAD float values to store all local amax
+  using VecType = PackedVec<T, ELTS_PER_THREAD>;  // bf16x8
+  using PackedFp4Type = std::conditional_t<ELTS_PER_THREAD == 16, uint64_t, uint32_t>;
+  VecType vec;
+  uint8_t fp8Scale{0};
+  PackedFp4Type fp4Vals{0};
+
+  float localAmax = 0.f;
+  uint32_t num_vecs_per_row = (n + ELTS_PER_THREAD - 1) / ELTS_PER_THREAD;
+  for (uint32_t vecIdx = threadIdx.x; vecIdx < num_vecs_per_row; vecIdx += blockDim.x) {
+    int64_t vecOffset = rowIdx * num_vecs_per_row + vecIdx;
+    loadPackedVec(vec, reinterpret_cast<VecType const*>(input) + vecOffset);
+#pragma unroll
+    for (int i = 0; i < ELTS_PER_THREAD / 2; ++i) {
+      auto element = cuda_abs(vec.elts[i]);
+      localAmax = fmaxf(localAmax, static_cast<float>(cuda_max(element.x, element.y)));
+    }
+
+    if constexpr (CACHE_LOCAL_AMAX) {
+      if constexpr (NUM_THREADS_PER_SF > 1) {
+        // use warp shuffle to get the amax of 16 elements and store it to SMEM
+        localAmax =
+            fmaxf(__shfl_xor_sync(__activemask(), localAmax, NUM_THREADS_PER_SF / 2), localAmax);
+      }
+      localAmaxSmem[vecIdx] = localAmax;
+    }
+  }
+
+  using BlockReduce = cub::BlockReduce<float, BLOCK_SIZE>;
+  __shared__ typename BlockReduce::TempStorage tempStorage;
+  float globalAmax = BlockReduce(tempStorage)
+                         .Reduce(
+                             localAmax,
+#if CUDART_VERSION >= 12090
+                             cuda::maximum<> {}
+#else
+                             cub::Max(),
+#endif
+                         );
+
+  // save the per-token scale
+  float perTokenScale = globalAmax * globalScaleInv;
+  if (threadIdx.x == 0) {
+    perTokenScaleOutput[rowIdx] = perTokenScale;
+  }
+  __syncthreads();
+  perTokenScale = perTokenScaleOutput[rowIdx];
+
+  // quantize to fp4 with per-token scale
+  for (uint32_t vecIdx = threadIdx.x; vecIdx < num_vecs_per_row; vecIdx += blockDim.x) {
+    int64_t vecOffset = rowIdx * num_vecs_per_row + vecIdx;
+    loadPackedVec(vec, reinterpret_cast<VecType const*>(input) + vecOffset);
+
+    if constexpr (CACHE_LOCAL_AMAX) {
+      localAmax = localAmaxSmem[vecIdx];
+      fp4Vals = cvt_warp_fp16_to_fp4_with_vec_max<T, SF_VEC_SIZE, ELTS_PER_THREAD, false>(
+          vec, reciprocal_approximate_ftz(perTokenScale), perTokenScale, localAmax, &fp8Scale);
+    } else {
+      fp4Vals = cvt_warp_fp16_to_fp4<T, SF_VEC_SIZE, ELTS_PER_THREAD, false>(
+          vec, reciprocal_approximate_ftz(perTokenScale), &fp8Scale);
+    }
+    reinterpret_cast<PackedFp4Type*>(weightOutput)[vecOffset] = fp4Vals;
+
+    if (threadIdx.x % NUM_THREADS_PER_SF == 0) {
+      uint32_t num_sf_vecs_per_row = (n + SF_VEC_SIZE - 1) / SF_VEC_SIZE;
+      auto sfVecIdx = vecIdx / NUM_THREADS_PER_SF;
+      int64_t sfOffset;
+      if constexpr (SF_LAYOUT == QuantizationSFLayout::LINEAR) {
+        sfOffset = rowIdx * num_sf_vecs_per_row + sfVecIdx;
+      } else if constexpr (SF_LAYOUT == QuantizationSFLayout::SWIZZLED_128x4) {
+        sfOffset = get_sf_out_offset_128x4(std::nullopt, rowIdx, sfVecIdx, m, num_sf_vecs_per_row);
+      } else {
+        sfOffset = get_sf_out_offset_8x4(std::nullopt, rowIdx, sfVecIdx, m, num_sf_vecs_per_row);
+      }
+      scaleOutput[sfOffset] = fp8Scale;
+    }
+  }
+}
+
 }  // namespace kernels
 }  // namespace tensorrt_llm
