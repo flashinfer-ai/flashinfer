@@ -1364,11 +1364,16 @@ def testCuteDslFp4BlockScaleMoe(args):
             f"intermediate={intermediate_size}, experts={num_experts}, top_k={top_k}"
         )
 
-    # Map ActivationType enum to string for SM120 API
+    # Map ActivationType enum to string for SM120 CuTe DSL API
     activation_type = args.activation_type
     _ACT_STR = {ActivationType.Swiglu: "silu", ActivationType.Relu2: "relu2"}
-    activation_str = _ACT_STR.get(activation_type, "silu")
-    is_gated = activation_type in (ActivationType.Swiglu, ActivationType.Geglu)
+    if activation_type not in _ACT_STR:
+        raise ValueError(
+            f"CuTe DSL MoE only supports Swiglu and Relu2 activations, "
+            f"got {activation_type.name}"
+        )
+    activation_str = _ACT_STR[activation_type]
+    is_gated = activation_type == ActivationType.Swiglu
 
     # Create CuteDSL-specific NVFP4 test data
     tensors = _create_cute_dsl_moe_test_data(

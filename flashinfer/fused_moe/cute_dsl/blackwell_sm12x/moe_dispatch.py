@@ -821,6 +821,10 @@ def launch_sm120_static_moe(
         from .triton_compact import compact_topk_ids as _triton_compact_topk_ids
 
         # Run Triton pre-pass to compact global expert IDs to dense local indices
+        assert flat_ids.numel() <= workspace.compact_topk_ids.numel(), (
+            f"compact_topk_ids buffer too small: "
+            f"{workspace.compact_topk_ids.numel()} < {flat_ids.numel()}"
+        )
         compact_ids = workspace.compact_topk_ids[: flat_ids.numel()]
         _triton_compact_topk_ids(
             flat_ids,

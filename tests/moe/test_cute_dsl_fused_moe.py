@@ -1090,9 +1090,18 @@ class TestAllValidTactics:
 # Test Class: Micro Kernel (SM120-only, small decode batches)
 # =============================================================================
 
+
+def _is_sm12x_supported():
+    """Check SM120/SM121 support using repo-standard utility checks."""
+    from flashinfer.utils import is_sm120a_supported, is_sm121a_supported
+
+    device = torch.device("cuda")
+    return is_sm120a_supported(device) or is_sm121a_supported(device)
+
+
 sm120_cuda13 = pytest.mark.skipif(
-    not is_sm120_family() or not _has_cuda_13(),
-    reason="Requires SM120/SM121 GPU with CUDA 13+",
+    not _is_sm12x_supported(),
+    reason="Requires SM120/SM121 GPU with CUDA 12.8+",
 )
 
 
