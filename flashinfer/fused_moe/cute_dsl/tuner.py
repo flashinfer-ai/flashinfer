@@ -246,47 +246,6 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         output_dtype: Output data type (default: torch.bfloat16).
     """
 
-    # Tensor initializers for dynamic tensors (indices 0, 1, 2, 3, 11)
-    # These create valid dummy tensors for profiling with different num_tokens
-    dynamic_tensor_initializers = [
-        # 0: x - FP4 quantized input (uint8 packed)
-        lambda shapes, dtype, device: torch.randint(
-            0, 256, shapes, dtype=torch.uint8, device=device
-        ),
-        # 1: x_sf - FP8 scale factors (uint8)
-        lambda shapes, dtype, device: torch.randint(
-            1, 128, shapes, dtype=torch.uint8, device=device
-        ),
-        # 2: token_selected_experts - expert indices (int32, 0 to num_experts-1)
-        lambda shapes, dtype, device: torch.randint(
-            0,
-            8,
-            shapes,
-            dtype=torch.int32,
-            device=device,  # num_experts=8 typical
-        ),
-        # 3: token_final_scales - routing weights (float32, softmax normalized)
-        lambda shapes, dtype, device: torch.softmax(
-            torch.randn(shapes, device=device), dim=-1
-        ).to(torch.float32),
-        # 11: moe_output - output buffer (bfloat16)
-        lambda shapes, dtype, device: torch.empty(shapes, dtype=dtype, device=device),
-    ]
-
-    # Tuning config with dynamic tensor specs for num_tokens dimension
-    # Indices 0, 1, 2, 3, 11 all have num_tokens as their first dimension
-    tuning_config = TuningConfig(
-        dynamic_tensor_specs=(
-            DynamicTensorSpec(
-                input_idx=(0, 1, 2, 3, 11),  # x, x_sf, experts, scales, moe_output
-                dim_idx=(0, 0, 0, 0, 0),  # First dimension is num_tokens for all
-                gen_tuning_buckets=get_last_power_of_2_num_tokens_buckets(8192),
-                map_to_tuning_buckets=lambda x: min(last_positive_power_of_2(x), 8192),
-                tensor_initializers=dynamic_tensor_initializers,
-            ),
-        ),
-    )
-
     def __init__(
         self,
         forward_impl: Callable,
@@ -306,6 +265,47 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.use_fused_finalize = use_fused_finalize
         self.output_dtype = output_dtype
         self.enable_pdl = enable_pdl
+
+        # Instance-level so dummy expert IDs span all local experts
+        # (randint(0, num_experts)) for realistic profiling.
+        self.tuning_config = TuningConfig(
+            dynamic_tensor_specs=(
+                DynamicTensorSpec(
+                    input_idx=(0, 1, 2, 3, 11),
+                    dim_idx=(0, 0, 0, 0, 0),
+                    gen_tuning_buckets=get_last_power_of_2_num_tokens_buckets(8192),
+                    map_to_tuning_buckets=lambda x: min(
+                        last_positive_power_of_2(x), 8192
+                    ),
+                    tensor_initializers=[
+                        # 0: x — FP4 quantized input (uint8 packed)
+                        lambda shapes, dtype, device: torch.randint(
+                            0, 256, shapes, dtype=torch.uint8, device=device
+                        ),
+                        # 1: x_sf — FP8 scale factors (uint8)
+                        lambda shapes, dtype, device: torch.randint(
+                            1, 128, shapes, dtype=torch.uint8, device=device
+                        ),
+                        # 2: token_selected_experts — expert indices [0, num_experts)
+                        lambda shapes, dtype, device: torch.randint(
+                            0,
+                            max(num_experts, 1),
+                            shapes,
+                            dtype=torch.int32,
+                            device=device,
+                        ),
+                        # 3: token_final_scales — routing weights (softmax normalized)
+                        lambda shapes, dtype, device: torch.softmax(
+                            torch.randn(shapes, device=device), dim=-1
+                        ).to(torch.float32),
+                        # 11: moe_output — output buffer
+                        lambda shapes, dtype, device: torch.empty(
+                            shapes, dtype=dtype, device=device
+                        ),
+                    ],
+                ),
+            ),
+        )
 
     def __hash__(self):
         return hash(

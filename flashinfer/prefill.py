@@ -49,6 +49,7 @@ from .utils import (
     _check_kv_layout,
     _check_pos_encoding_mode,
     check_shape_dtype_device,
+    get_alibi_slopes,
     _get_cache_alibi_slopes_buf,
     _get_cache_buf,
     _unpack_paged_kv_cache,
@@ -64,6 +65,8 @@ from .utils import (
     register_fake_op,
     ceil_div,
     round_up,
+    SINGLE_KERNEL_TMP_SIZE,
+    prepare_jit_additional_args,
 )
 
 
@@ -266,6 +269,7 @@ def get_trtllm_gen_prefill_module():
         value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         uses_shared_paged_kv_idx: bool = True,
+        lse: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         sm_count = get_device_sm_count(query.device)
         if out is None:
@@ -303,6 +307,7 @@ def get_trtllm_gen_prefill_module():
             value_block_scales,
             skip_softmax_threshold_scale_factor,
             uses_shared_paged_kv_idx,
+            lse,
         )
         return out
 
@@ -676,7 +681,6 @@ def get_batch_prefill_module(backend, *args):
         uses_shared_paged_kv_idx: bool = True,
     ) -> None:
         if backend == "trtllm-gen":
-            assert maybe_lse is None
             assert num_qo_heads is not None
             assert num_kv_heads is not None
             assert block_tables is not None
@@ -711,6 +715,7 @@ def get_batch_prefill_module(backend, *args):
                 value_block_scales=value_block_scales,
                 skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
                 uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+                lse=maybe_lse,
             )
         elif backend == "fa2":
             assert not is_float8(q)
@@ -1026,9 +1031,7 @@ def single_prefill_with_kv_cache_with_jit_module(
     return_lse: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     device = q.device
-    tmp = _get_cache_buf(
-        "single_prefill_with_kv_cache_tmp", 32 * 1024 * 1024, device=device
-    )
+    tmp = torch.empty(SINGLE_KERNEL_TMP_SIZE, dtype=torch.uint8, device=device)
     o = torch.empty(q.shape[:-1] + v.shape[-1:], dtype=q.dtype, device=device)
     lse = None
     if return_lse:
@@ -1244,7 +1247,7 @@ def single_prefill_with_kv_cache(
     """
     _check_pos_encoding_mode(pos_encoding_mode)
     _check_kv_layout(kv_layout)
-    tmp = _get_cache_buf("single_prefill_with_kv_cache_tmp", 32 * 1024 * 1024, q.device)
+    tmp = torch.empty(SINGLE_KERNEL_TMP_SIZE, dtype=torch.uint8, device=q.device)
     if logits_soft_cap is None:
         logits_soft_cap = 0.0
     if sm_scale is None:
@@ -1324,7 +1327,9 @@ def single_prefill_with_kv_cache(
         TensorLayout[kv_layout].value,
         window_left,
         packed_custom_mask,
-        _get_cache_alibi_slopes_buf(q.shape[1], q.device),
+        get_alibi_slopes(q.shape[1], device=q.device)
+        if pos_encoding_mode == "ALIBI"
+        else None,
         logits_soft_cap,
         sm_scale,
         scale_q,
@@ -1548,15 +1553,24 @@ class BatchPrefillWithPagedKVCacheWrapper:
         """
         _check_kv_layout(kv_layout)
 
-        if jit_args is not None:
+        if backend == "cute-dsl":
+            raise NotImplementedError(
+                "cute-dsl backend is not yet supported for paged KV cache. "
+                "Use BatchPrefillWithRaggedKVCacheWrapper instead."
+            )
+
+        if jit_args is not None and backend != "cute-dsl":
             if jit_kwargs is None:
                 jit_kwargs = {}
             self._jit_module = get_batch_prefill_jit_module(
                 jit_args[0],
                 get_customize_batch_prefill_module(backend, *jit_args, **jit_kwargs),
             )
+            # jit_args[7] is additional_tensor_names from gen_customize_batch_prefill_module
+            self._jit_additional_tensor_names = list(jit_args[7])
         else:
             self._jit_module = None
+            self._jit_additional_tensor_names = []
 
         self._kv_layout = kv_layout
         if backend == "cudnn":
@@ -2270,15 +2284,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
-        if return_lse:
-            if lse is None:
-                lse = torch.empty(
-                    (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
-                )
-            else:
-                check_shape_dtype_device(
-                    lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
-                )
+        lse_shape = (q.size(0), q.size(1))
+        if lse is not None:
+            check_shape_dtype_device(lse, lse_shape, torch.float32, q.device, "lse")
+        elif return_lse:
+            lse = torch.empty(lse_shape, dtype=torch.float32, device=q.device)
 
         # For NVFP4 KV (uint8 packed), v_cache last dim is head_dim//2;
         # use q's head_dim for output instead
@@ -2372,7 +2382,19 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 enable_pdl,
             ]
             if self._jit_module is not None:
-                run_args.extend(list(args))
+                run_args.extend(
+                    prepare_jit_additional_args(
+                        self._jit_additional_tensor_names,
+                        {
+                            "maybe_custom_mask": self._custom_mask_buf,
+                            "maybe_mask_indptr": self._mask_indptr_buf,
+                            "maybe_alibi_slopes": lambda: _get_cache_alibi_slopes_buf(
+                                q.shape[1], q.device
+                            ),
+                        },
+                        args,
+                    )
+                )
             else:
                 # Extract FP8 scale tensors from *args if q is FP8
                 fp8_scale_q = None
@@ -2619,10 +2641,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             will be used in attention computation.
 
         backend : str
-            The implementation backend, could be ``auto``/``fa2``/``fa3``/``cudnn`` or ``cutlass``.
+            The implementation backend, could be ``auto``/``fa2``/``fa3``/``cudnn``/``cutlass``
+            or ``cute-dsl``.
             Defaults to ``auto``.
             If set to ``auto``, the wrapper will automatically choose the backend based on the
             device architecture and kernel availability.
+            The ``cute-dsl`` backend uses the CuTe DSL attention kernel for Blackwell (SM100+).
 
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
@@ -2632,15 +2656,26 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The keyword arguments to create the JIT module, defaults to None.
         """
         _check_kv_layout(kv_layout)
-        if jit_args is not None:
+        if jit_args is not None and backend != "cute-dsl":
             if jit_kwargs is None:
                 jit_kwargs = {}
             self._jit_module = get_batch_prefill_jit_module(
                 jit_args[0],
                 get_customize_batch_prefill_module(backend, *jit_args, **jit_kwargs),
             )
+            # jit_args[7] is additional_tensor_names from gen_customize_batch_prefill_module
+            self._jit_additional_tensor_names = list(jit_args[7])
         else:
             self._jit_module = None
+            self._jit_additional_tensor_names = []
+
+        self._cute_dsl_wrapper = None
+        if backend == "cute-dsl":
+            from .cute_dsl.attention import BatchPrefillCuteDSLWrapper
+
+            self._cute_dsl_wrapper = BatchPrefillCuteDSLWrapper(
+                float_workspace_buffer, use_cuda_graph=use_cuda_graph
+            )
 
         self._kv_layout = kv_layout
         self._float_workspace_buffer = float_workspace_buffer
@@ -2968,7 +3003,57 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._max_token_per_sequence = max_token_per_sequence
         self._max_sequence_kv = max_sequence_kv
 
-        if self._jit_module is not None:
+        if self._backend == "cute-dsl":
+            if custom_mask is not None or packed_custom_mask is not None:
+                raise NotImplementedError(
+                    "cute-dsl backend does not support custom_mask"
+                )
+            if head_dim_vo is not None and head_dim_vo != head_dim_qk:
+                raise NotImplementedError(
+                    "cute-dsl backend requires head_dim_vo == head_dim_qk"
+                )
+            if self._kv_layout == "HND":
+                raise NotImplementedError("cute-dsl backend only supports NHD layout")
+            if pos_encoding_mode not in ("NONE", "ALIBI"):
+                raise NotImplementedError(
+                    f"cute-dsl backend does not support pos_encoding_mode={pos_encoding_mode!r}. "
+                    "For RoPE, apply rotary embeddings to Q/K before calling the kernel."
+                )
+
+            variant: Optional[Any] = None
+            if pos_encoding_mode == "ALIBI":
+                from .cute_dsl.attention import ALiBiAttention
+
+                slopes = ALiBiAttention.get_slopes(num_qo_heads)
+                variant = ALiBiAttention(
+                    torch.tensor(slopes, dtype=torch.float32, device=qo_indptr.device)
+                )
+            if logits_soft_cap is not None and logits_soft_cap > 0:
+                from .cute_dsl.attention import SoftCappingAttention
+
+                if variant is not None:
+                    raise NotImplementedError(
+                        "cute-dsl backend does not support combining ALiBi with logits_soft_cap"
+                    )
+                variant = SoftCappingAttention(cap=logits_soft_cap)
+
+            self._cute_dsl_wrapper.plan(
+                qo_indptr,
+                kv_indptr,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim_qk,
+                head_dim_vo=head_dim_qk,
+                causal=causal,
+                sm_scale=sm_scale
+                if sm_scale is not None
+                else 1.0 / math.sqrt(head_dim_qk),
+                q_data_type=q_data_type,
+                kv_data_type=kv_data_type if kv_data_type is not None else q_data_type,
+                window_left=window_left,
+                variant=variant,
+            )
+        elif self._jit_module is not None:
             self._cached_module = self._jit_module
         else:
             if self._backend == "auto":
@@ -3009,7 +3094,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._cached_module, qo_indptr, kv_indptr, num_qo_heads, causal
             )
             self._max_qo_len = torch.max(qo_indptr[1:] - qo_indptr[:-1]).item()
-        elif self._backend != "cudnn":
+        elif self._backend not in ("cudnn", "cute-dsl"):
             assert self._cached_module is not None, "cached module is not initialized"
             args = [
                 self._float_workspace_buffer,
@@ -3213,7 +3298,21 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 q.device,
                 "out",
             )
-        if self._backend == "cutlass":
+        if self._backend == "cute-dsl":
+            # These checks live here (not in plan()) because return_lse and
+            # scale parameters are run()-time arguments that can vary between
+            # calls on the same planned wrapper.
+            if return_lse:
+                raise NotImplementedError(
+                    "cute-dsl backend does not support return_lse"
+                )
+            if any(s is not None for s in (q_scale, k_scale, v_scale, o_scale)):
+                raise NotImplementedError(
+                    "cute-dsl backend does not support FP8 scale parameters"
+                )
+            out = self._cute_dsl_wrapper.run(q, k, v, out=out)
+            return out
+        elif self._backend == "cutlass":
             out, lse = fmha_varlen(
                 q,
                 k,
@@ -3303,7 +3402,19 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             enable_pdl,
         ]
         if self._jit_module is not None:
-            run_args.extend(list(args))
+            run_args.extend(
+                prepare_jit_additional_args(
+                    self._jit_additional_tensor_names,
+                    {
+                        "maybe_custom_mask": self._custom_mask_buf,
+                        "maybe_mask_indptr": self._mask_indptr_buf,
+                        "maybe_alibi_slopes": lambda: _get_cache_alibi_slopes_buf(
+                            q.shape[1], self.device
+                        ),
+                    },
+                    args,
+                )
+            )
         else:
             run_args += [
                 self._custom_mask_buf,
@@ -3751,7 +3862,11 @@ def trtllm_batch_context_with_kv_cache(
     kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     skip_softmax_threshold_scale_factor: Optional[float] = None,
     uses_shared_paged_kv_idx: bool = True,
-) -> Union[torch.Tensor, FP4Tensor]:
+    lse: Optional[torch.Tensor] = None,
+    return_lse: bool = False,
+) -> Union[
+    torch.Tensor, FP4Tensor, Tuple[Union[torch.Tensor, FP4Tensor], torch.Tensor]
+]:
     """
     Parameters
     ----------
@@ -3848,10 +3963,17 @@ def trtllm_batch_context_with_kv_cache(
         Whether the K and V page indices are shared as a unified index.
         True (default) uses vLLM/FlashInfer layout with a 2D page table.
         False uses TRT-LLM layout with a 3D page table ``[batch_size, 2, max_num_pages_per_seq]``.
+    lse : Optional[torch.Tensor] = None
+        The log-sum-exp of attention logits, if not provided, will be allocated internally.
+        Only supported by trtllm-gen backend.
+    return_lse : bool = False
+        Whether to return the logsumexp of attention scores, defaults to ``False``.
     Returns
     -------
     out: Union[torch.Tensor, FP4Tensor]
         output torch.Tensor or FP4Tensor.
+    lse: Optional[torch.Tensor]
+        The log-sum-exp of attention logits, if not provided, will be allocated internally.
     """
 
     if enable_pdl is None:
@@ -3984,6 +4106,11 @@ def trtllm_batch_context_with_kv_cache(
         assert bmm2_scale.dtype == torch.float32
     _check_block_tables_shape(block_tables, uses_shared_paged_kv_idx)
     workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
+    lse_shape = (query.size(0), query.size(1))
+    if lse is not None:
+        check_shape_dtype_device(lse, lse_shape, torch.float32, query.device, "lse")
+    elif return_lse:
+        lse = torch.empty(lse_shape, dtype=torch.float32, device=query.device)
     run_func(
         out,
         out_scale_factor,
@@ -4012,12 +4139,17 @@ def trtllm_batch_context_with_kv_cache(
         value_block_scales,
         skip_softmax_threshold_scale_factor,
         uses_shared_paged_kv_idx,
+        lse,
     )
-    return (
+    out = (
         out
         if out_dtype != "nvfp4"
         else FP4Tensor(out, out_scale_factor, o_sf_start_index, query.shape)
     )
+    if return_lse:
+        return out, lse
+    else:
+        return out
 
 
 @functools.cache

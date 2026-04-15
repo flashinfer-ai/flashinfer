@@ -1,34 +1,26 @@
-# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
-# Redistribution and use in source and binary forms, with or without
-# modification, are permitted provided that the following conditions are met:
+"""MLA decode tile scheduler — moved from flashinfer/mla/cute_dsl/mla_helpers.py.
 
-# 1. Redistributions of source code must retain the above copyright notice, this
-# list of conditions and the following disclaimer.
+Re-exports the tile scheduler classes and factory functions for use by the
+modular MLA decode kernel and its roles.
 
-# 2. Redistributions in binary form must reproduce the above copyright notice,
-# this list of conditions and the following disclaimer in the documentation
-# and/or other materials provided with the distribution.
+Also provides host-side utility functions for split-KV computation.
+"""
 
-# 3. Neither the name of the copyright holder nor the names of its
-# contributors may be used to endorse or promote products derived from
-# this software without specific prior written permission.
-
-# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-
+from __future__ import annotations
 
 import cutlass
 import cutlass.cute as cute
+
+
+LOG2_E = 1.4426950408889634074
+MAX_SPLITS = 256
+
+
+def ceil_div(a: int, b: int) -> int:
+    return (a + b - 1) // b
 
 
 class MLAStaticTileSchedulerParams:
@@ -46,18 +38,6 @@ class MLAStaticTileSchedulerParams:
         loc=None,
         ip=None,
     ):
-        """The static tile scheduler parameters prepared for MLA static tile scheduler.
-
-        :param is_persistent: Whether to use persistent kernel mode
-        :type is_persistent: bool
-        :param problem_shape_b: The shape of the problem
-        :type problem_shape_b: cute.Int32
-        :param problem_shape_s: The shape of the problem in sequence length Q dimension
-        :type problem_shape_s: cute.Int32
-        :param cluster_shape_mnk: The shape of the cluster
-        :type cluster_shape_mnk: cute.Shape
-        :param split_kv: The scalar factor for split KV
-        """
         self.is_persistent = is_persistent
         self.problem_shape_b = problem_shape_b
         self.problem_shape_s = problem_shape_s
@@ -166,22 +146,6 @@ class MLAStaticTileScheduler:
         loc=None,
         ip=None,
     ):
-        """The static tile scheduler for MLA split kv kernel.
-        Based on `is_persistent`, it provides 2 modes for use:
-        - Persistent mode: Launch fixed blocks and reschedule the data blocks.
-        - Non-persistent mode: Launch dynamic blocks and exit when the current work is done.
-
-        :param params: The static tile scheduler parameters
-        :type params: MLAStaticTileSchedulerParams
-        :param current_work_linear_idx: The linear index of the current work
-        :type current_work_linear_idx: cutlass.Int32
-        :param blk_coord: The coordinate of the current work
-        :type blk_coord: cute.Coord
-        :param grid_shape: The shape of the grid
-        :type grid_shape: cute.Shape
-        :param is_valid: Whether the current work is valid
-        :type is_valid: bool
-        """
         self.params = params
         self.blk_coord = blk_coord
         self.grid_shape = grid_shape
@@ -198,7 +162,6 @@ class MLAStaticTileScheduler:
                 ip=ip,
             )
             self.num_blocks = cute.size(self.persistent_blk_layout, loc=loc, ip=ip)
-            # Used for persistent scheduling
             self.num_persistent_sm = cute.size(grid_shape, loc=loc, ip=ip)
         else:
             self.is_valid = is_valid
@@ -213,7 +176,6 @@ class MLAStaticTileScheduler:
         loc=None,
         ip=None,
     ) -> cute.Shape:
-        # called by host
         grid_shape = (
             params.cluster_shape_mnk[0],
             params.problem_shape_b * params.problem_shape_s,
@@ -295,10 +257,35 @@ def create_mla_static_tile_scheduler(
     return MLAStaticTileScheduler(params, blk_coord[0], blk_coord, grid_shape)
 
 
-LOG2_E = 1.4426950408889634074
-# avoid register indexing on array.
-MAX_SPLITS = 256
+# ---------------------------------------------------------------------------
+#  Host-side utilities
+# ---------------------------------------------------------------------------
 
 
-def ceil_div(a: int, b: int) -> int:
-    return (a + b - 1) // b
+def mla_get_split_kv(
+    B: int, S: int, K: int, mma_qk_tiler_mn: tuple, max_active_blocks: int
+) -> int:
+    """Get split_kv value for MLA kernel (host-side)."""
+    max_splits = ceil_div(K, mma_qk_tiler_mn[1])
+    blocks_per_batch = max(1, max_active_blocks // B // (S * 2))
+    split_heur = min(max_splits, blocks_per_batch)
+    k_waves = ceil_div(max_splits, split_heur)
+    split_wave_aware = ceil_div(max_splits, k_waves)
+    max_split_kv = 32
+    return min(split_wave_aware, max_split_kv)
+
+
+def mla_get_split_kv_simplified(B: int, S: int, max_active_blocks: int) -> int:
+    """Simplified split_kv for MLA (host-side, no K dependency)."""
+    blocks_per_batch = max(1, max_active_blocks // B // (S * 2))
+    max_split_kv = 32
+    return min(blocks_per_batch, max_split_kv)
+
+
+def mla_get_workspace_size(
+    H: int, S: int, D: int, B: int, split_kv: int, acc_dtype_width: int
+) -> int:
+    """Get workspace size in bytes for split-KV MLA decode."""
+    if split_kv == 1:
+        return 0
+    return B * H * S * split_kv * (D + 1) * acc_dtype_width // 8
