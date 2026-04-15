@@ -5,7 +5,7 @@ flashinfer.fp4_quantization
 
 .. currentmodule:: flashinfer.fp4_quantization
 
-This module provides FP4 quantization operations for LLM inference, supporting various scale factor layouts and quantization formats.
+This module provides FP4 quantization operations for LLM inference, supporting various scale factor layouts and quantization formats. See :ref:`supported_hardware` for GPU compatibility.
 
 Core Quantization Functions
 ---------------------------
@@ -28,6 +28,11 @@ GPU-accelerated quantization and dequantization for KV cache data using a linear
 
 - :func:`nvfp4_kv_dequantize`: SM80+ (Ampere and later)
 - :func:`nvfp4_kv_quantize`: SM100+ (Blackwell and later)
+
+.. seealso::
+
+   :doc:`/supported_hardware` for a complete overview of compute capability
+   requirements across all data types.
 
 .. autosummary::
     :toctree: ../generated
