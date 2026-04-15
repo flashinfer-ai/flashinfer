@@ -388,7 +388,7 @@ def test_batch_attention_nvfp4(
         kv_cache,
         k_scale=k_global_scale.item(),
         v_scale=v_global_scale.item(),
-        kv_block_scales=kv_cache_sf,
+        kv_cache_sf=kv_cache_sf,
     )
 
     # --- reference: single_prefill_with_kv_cache per batch item using dequantized KV ---
