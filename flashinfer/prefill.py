@@ -264,6 +264,7 @@ def get_trtllm_gen_prefill_module():
         workspace_size: int,
         window_left: int = -1,
         out: Optional[torch.Tensor] = None,
+        lse: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
         key_block_scales: Optional[torch.Tensor] = None,
         value_block_scales: Optional[torch.Tensor] = None,
@@ -306,6 +307,7 @@ def get_trtllm_gen_prefill_module():
             value_block_scales,
             skip_softmax_threshold_scale_factor,
             uses_shared_paged_kv_idx,
+            lse,
         )
         return out
 
@@ -679,7 +681,6 @@ def get_batch_prefill_module(backend, *args):
         uses_shared_paged_kv_idx: bool = True,
     ) -> None:
         if backend == "trtllm-gen":
-            assert maybe_lse is None
             assert num_qo_heads is not None
             assert num_kv_heads is not None
             assert block_tables is not None
@@ -709,6 +710,7 @@ def get_batch_prefill_module(backend, *args):
                 workspace_size,
                 window_left,
                 out=o,
+                lse=maybe_lse,
                 sinks=sinks,
                 key_block_scales=key_block_scales,
                 value_block_scales=value_block_scales,

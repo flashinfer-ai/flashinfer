@@ -2031,6 +2031,7 @@ class TrtllmGenDecodeModule:
         window_left: int = -1,
         enable_pdl: bool = None,
         out: Optional[torch.Tensor] = None,
+        lse: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
         key_block_scales: Optional[torch.Tensor] = None,
         value_block_scales: Optional[torch.Tensor] = None,
@@ -2081,6 +2082,7 @@ class TrtllmGenDecodeModule:
             value_block_scales,
             skip_softmax_threshold_scale_factor,
             uses_shared_paged_kv_idx,
+            lse,
         )
         return out
 
@@ -2147,7 +2149,6 @@ def get_trtllm_gen_decode_module(*args):
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         uses_shared_paged_kv_idx: bool = True,
     ) -> None:
-        assert maybe_lse is None
         assert paged_kv_cache is not None
         assert num_qo_heads is not None
         assert num_kv_heads is not None
@@ -2171,6 +2172,7 @@ def get_trtllm_gen_decode_module(*args):
             window_left,
             enable_pdl,
             out=o,
+            lse=maybe_lse,
             sinks=sinks,
             key_block_scales=key_block_scales,
             value_block_scales=value_block_scales,
