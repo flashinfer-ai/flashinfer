@@ -23,6 +23,11 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
 import torch
 
 from .api_logging import flashinfer_api
+
+## NOTE: MLA prefill alias — see issue #2877.
+from .mla import (
+    trtllm_prefill_with_kv_cache_mla as trtllm_prefill_with_kv_cache_mla,
+)
 from .jit import (
     gen_batch_prefill_module,
     gen_customize_batch_prefill_module,

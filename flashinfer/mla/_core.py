@@ -613,7 +613,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     """
     Parameters
     ----------
-    query: [batch_size, q_len_per_request, num_heads, head_dim_qk], head_dim_qk = qk_nope_head_dim (kv_lora_rank) + qk_rope_head_dim, should be concated q_nope + q_rope; q_len_per_request is the MTP query length.
+    query: [batch_size, q_len_per_request, num_heads, head_dim_qk], head_dim_qk = qk_nope_head_dim (kv_lora_rank) + qk_rope_head_dim, should be concated q_nope + q_rope; q_len_per_request is the query length per request (1 for decode, >1 for prefill/MTP).
     kv_cache: [num_pages, page_size, head_dim_ckv + head_dim_kpe] or [num_pages, 1, page_size, head_dim_ckv + head_dim_kpe], should be concated ckv_cache + kpe_cache. Both 3D and 4D formats are supported for backward compatibility.
     workspace_buffer: [num_semaphores, 4], used for multi_block mode. Must be initialized to 0 for its first use.
     qk_nope_head_dim: qk_nope_head_dim, must be 128 or 64
@@ -854,6 +854,11 @@ def trtllm_batch_decode_with_kv_cache_mla(
         )
     else:
         raise ValueError(f"Backend {backend} not supported")
+
+
+# Alias: the MLA kernel handles both decode and incremental prefill
+# (with q_len_per_request > 1), see issue #2877.
+trtllm_prefill_with_kv_cache_mla = trtllm_batch_decode_with_kv_cache_mla
 
 
 @flashinfer_api
