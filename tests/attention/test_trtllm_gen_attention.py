@@ -1837,3 +1837,534 @@ def test_trtllm_batch_decode_spec(
         skips_softmax=skips_softmax,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
     )
+
+
+# ---- Precomputed scheduler tests ----
+
+
+@pytest.mark.parametrize("kv_layout", ["HND"])
+@pytest.mark.parametrize(
+    "batch_size,page_size,num_kv_heads,head_grp_size",
+    [
+        (128, 16, 8, 8),    # TP1: 64:8
+        (128, 32, 4, 8),    # TP2: 32:4
+        (128, 64, 2, 8),    # TP4: 16:2
+        (128, 16, 1, 8),    # TP8: 8:1
+        (128, 32, 8, 16),   # 128:8, tileSizeQ=16
+        (128, 64, 4, 32),   # 128:4, tileSizeQ=32
+    ],
+)
+@pytest.mark.parametrize("window_left", [-1, 512])
+@pytest.mark.parametrize(
+    "q_dtype,kv_dtype,o_dtype",
+    [
+        ("fp8", "fp8", "bf16"),
+    ],
+)
+@pytest.mark.parametrize("max_in_kv_len", [2048, 8192, 32768, 65536])
+@pytest.mark.parametrize("head_dim", [128])
+def test_trtllm_batch_decode_precomputed(
+    kv_layout: str,
+    batch_size: int,
+    page_size: int,
+    num_kv_heads: int,
+    head_grp_size: int,
+    window_left: int,
+    q_dtype: str,
+    kv_dtype: str,
+    o_dtype: str,
+    max_in_kv_len: int,
+    head_dim: int,
+):
+    """Test precomputed scheduler decode matches reference output."""
+    from flashinfer.decode import (
+        trtllm_batch_decode_with_kv_cache,
+        trtllm_compute_precomputed_metadata,
+        trtllm_get_kernel_config,
+    )
+
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] != 10:
+        pytest.skip("trtllm-gen precomputed requires SM100/SM103 GPUs.")
+
+    num_qo_heads = num_kv_heads * head_grp_size
+    torch.manual_seed(42)
+
+    q_lens, in_kv_lens, seq_lens = generate_seq_lens_decode(
+        batch_size, 1, max_in_kv_len, None
+    )
+
+    q, q_scale, ref_q = create_query_tensor(q_lens, num_qo_heads, head_dim, q_dtype)
+    kv_cache, k_scale, v_scale, ref_kv_cache, kv_block_scales = create_kv_cache(
+        batch_size,
+        seq_lens,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        kv_dtype,
+        "bf16" if q_dtype == "fp8" else q_dtype,
+        kv_layout,
+    )
+    page_table, all_page_ids, page_per_seq = create_page_table(
+        batch_size, seq_lens, page_size
+    )
+    kv_indptr = generate_cumsum_lens(page_per_seq)
+    kv_last_page_len = get_last_page_len(seq_lens, page_size)
+    kv_cache_arg, page_table_kernel, kv_block_scales_kernel = prepare_paged_kv_for_kernel(
+        kv_cache, page_table, True, kv_block_scales
+    )
+
+    workspace_buffer, workspace_buffer_ref = create_workspace_buffers(GPU_DEVICE)
+
+    create_out_tensor = flip_coin(
+        batch_size, page_size, num_kv_heads, head_grp_size, o_dtype
+    )
+    can_infer_type = q.dtype == DTYPE_MAP[o_dtype] or create_out_tensor
+    create_out_dtype = not can_infer_type or flip_coin(
+        batch_size, page_size, num_kv_heads, head_grp_size, o_dtype, q_dtype
+    )
+    out, out_dtype, o_scale, o_sf_scale, o_sf_vec_size = create_output(
+        q, o_dtype, create_out_tensor, create_out_dtype
+    )
+
+    sm_scale = float(1.0 / (head_dim**0.5))
+    bmm1_scale = q_scale * k_scale * sm_scale
+    bmm2_scale = v_scale / o_scale
+    if isinstance(bmm1_scale, torch.Tensor):
+        bmm1_scale = bmm1_scale.item()
+    if isinstance(bmm2_scale, torch.Tensor):
+        bmm2_scale = bmm2_scale.item()
+
+    max_seq_len_val = torch.max(seq_lens).item()
+    sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+
+    config = trtllm_get_kernel_config(
+        q_dtype=DTYPE_MAP[q_dtype],
+        kv_dtype=DTYPE_MAP[kv_dtype],
+        o_dtype=DTYPE_MAP[o_dtype],
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim,
+        head_dim_vo=head_dim,
+        page_size=page_size,
+        sm_count=sm_count,
+        batch_size=batch_size,
+        max_seq_len=max_seq_len_val,
+        window_left=window_left,
+    )
+    assert config.step_kv > 0
+    assert config.num_sm_parts > 0
+
+    max_descs = batch_size + config.num_sm_parts
+    work_descriptors = torch.zeros(
+        max_descs * 4, dtype=torch.int32, device=GPU_DEVICE
+    )
+    work_descriptor_offsets = torch.zeros(
+        config.num_sm_parts + 1, dtype=torch.int32, device=GPU_DEVICE
+    )
+
+    attention_window_size = window_left + 1 if window_left >= 0 else 0
+    trtllm_compute_precomputed_metadata(
+        seq_lens_cpu=seq_lens.to(torch.int32),
+        work_descriptors_out=work_descriptors,
+        work_descriptor_offsets_out=work_descriptor_offsets,
+        batch_size=batch_size,
+        block_size_n=config.step_kv,
+        num_sm_parts=config.num_sm_parts,
+        attention_window_size=attention_window_size,
+        tile_size_kv=config.tile_size_kv,
+    )
+
+    output = trtllm_batch_decode_with_kv_cache(
+        q.contiguous(),
+        kv_cache_arg,
+        workspace_buffer,
+        page_table_kernel,
+        seq_lens.to(GPU_DEVICE),
+        max_seq_len_val,
+        bmm1_scale,
+        bmm2_scale,
+        window_left,
+        out=out,
+        out_dtype=out_dtype,
+        o_sf_scale=o_sf_scale,
+        o_sf_vec_size=o_sf_vec_size,
+        kv_layout=kv_layout,
+        backend="trtllm-gen",
+        o_scale=o_scale,
+        kv_block_scales=kv_block_scales_kernel,
+        precomputed_work_descriptors=work_descriptors,
+        precomputed_work_descriptor_offsets=work_descriptor_offsets,
+    )
+    torch.cuda.synchronize()
+
+    wrapper_ref = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        workspace_buffer_ref, kv_layout, use_tensor_cores=True
+    )
+    wrapper_ref.plan(
+        indptr=kv_indptr,
+        indices=all_page_ids,
+        last_page_len=kv_last_page_len.to(GPU_DEVICE),
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        pos_encoding_mode="NONE",
+        kv_data_type=ref_kv_cache.dtype,
+        q_data_type=ref_q.dtype,
+        window_left=window_left,
+    )
+    output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
+
+    if q_dtype == "fp8" and o_dtype == "fp8":
+        rtol, atol = 5e-2, 7e-2
+    elif q_dtype == "fp8":
+        rtol, atol = 4e-2, 7e-2
+    else:
+        rtol, atol = 1e-2, 1e-2
+    allowed_mismatch_rate = 5e-5
+
+    assert_close_with_mismatch_tolerance(
+        output.float() * o_scale,
+        output_ref.float(),
+        rtol=rtol,
+        atol=atol,
+        max_mismatched_elements=int(allowed_mismatch_rate * output.numel()),
+    )
+
+
+# ---- Precomputed scheduler + speculative decode tests ----
+
+
+@pytest.mark.parametrize("kv_layout", ["HND"])
+@pytest.mark.parametrize(
+    "batch_size,max_q_len,page_size,num_kv_heads,head_grp_size",
+    [
+        (4, 2, 16, 8, 8),     # small batch, 2 draft tokens
+        (4, 3, 32, 4, 8),     # small batch, 3 draft tokens
+        (4, 5, 16, 2, 8),     # small batch, 5 draft tokens
+        (128, 2, 16, 8, 8),   # TP1: 64:8, 2 draft tokens
+        (128, 3, 32, 4, 8),   # TP2: 32:4, 3 draft tokens
+        (128, 5, 16, 8, 8),   # TP1: 64:8, 5 draft tokens
+        (128, 4, 64, 2, 8),   # TP4: 16:2, 4 draft tokens
+    ],
+)
+@pytest.mark.parametrize("window_left", [-1, 512])
+@pytest.mark.parametrize(
+    "q_dtype,kv_dtype,o_dtype",
+    [
+        ("fp8", "fp8", "bf16"),
+    ],
+)
+@pytest.mark.parametrize("max_in_kv_len", [2048, 8192])
+@pytest.mark.parametrize("head_dim", [128])
+def test_trtllm_batch_decode_precomputed_spec(
+    kv_layout: str,
+    batch_size: int,
+    max_q_len: int,
+    page_size: int,
+    num_kv_heads: int,
+    head_grp_size: int,
+    window_left: int,
+    q_dtype: str,
+    kv_dtype: str,
+    o_dtype: str,
+    max_in_kv_len: int,
+    head_dim: int,
+):
+    """Test precomputed scheduler with speculative decoding (max_q_len > 1)."""
+    from flashinfer.decode import (
+        trtllm_batch_decode_with_kv_cache,
+        trtllm_compute_precomputed_metadata,
+        trtllm_get_kernel_config,
+    )
+
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] != 10:
+        pytest.skip("trtllm-gen precomputed requires SM100/SM103 GPUs.")
+
+    num_qo_heads = num_kv_heads * head_grp_size
+    torch.manual_seed(42)
+
+    # Variable-length Q: each request has random q_len in [1, max_q_len]
+    q_lens, in_kv_lens, seq_lens = generate_seq_lens_decode(
+        batch_size, None, max_in_kv_len, max_q_len
+    )
+
+    q, q_scale, ref_q = create_query_tensor(q_lens, num_qo_heads, head_dim, q_dtype)
+    q_indptr = generate_cumsum_lens(q_lens)
+
+    kv_cache, k_scale, v_scale, ref_kv_cache, kv_block_scales = create_kv_cache(
+        batch_size,
+        seq_lens,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        kv_dtype,
+        "bf16" if q_dtype == "fp8" else q_dtype,
+        kv_layout,
+    )
+    page_table, all_page_ids, page_per_seq = create_page_table(
+        batch_size, seq_lens, page_size
+    )
+    kv_indptr = generate_cumsum_lens(page_per_seq)
+    kv_last_page_len = get_last_page_len(seq_lens, page_size)
+    kv_cache_arg, page_table_kernel, kv_block_scales_kernel = prepare_paged_kv_for_kernel(
+        kv_cache, page_table, True, kv_block_scales
+    )
+
+    workspace_buffer, workspace_buffer_ref = create_workspace_buffers(GPU_DEVICE)
+
+    create_out_tensor = flip_coin(
+        batch_size, page_size, num_kv_heads, head_grp_size, o_dtype
+    )
+    can_infer_type = q.dtype == DTYPE_MAP[o_dtype] or create_out_tensor
+    create_out_dtype = not can_infer_type or flip_coin(
+        batch_size, page_size, num_kv_heads, head_grp_size, o_dtype, q_dtype
+    )
+    out, out_dtype, o_scale, o_sf_scale, o_sf_vec_size = create_output(
+        q, o_dtype, create_out_tensor, create_out_dtype
+    )
+
+    sm_scale = float(1.0 / (head_dim**0.5))
+    bmm1_scale = q_scale * k_scale * sm_scale
+    bmm2_scale = v_scale / o_scale
+    if isinstance(bmm1_scale, torch.Tensor):
+        bmm1_scale = bmm1_scale.item()
+    if isinstance(bmm2_scale, torch.Tensor):
+        bmm2_scale = bmm2_scale.item()
+
+    max_seq_len_val = torch.max(seq_lens).item()
+    sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+
+    config = trtllm_get_kernel_config(
+        q_dtype=DTYPE_MAP[q_dtype],
+        kv_dtype=DTYPE_MAP[kv_dtype],
+        o_dtype=DTYPE_MAP[o_dtype],
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim,
+        head_dim_vo=head_dim,
+        page_size=page_size,
+        sm_count=sm_count,
+        batch_size=batch_size,
+        max_seq_len=max_seq_len_val,
+        max_q_len=max_q_len,
+        window_left=window_left,
+    )
+    assert config.step_kv > 0
+    assert config.num_sm_parts > 0
+
+    max_descs = batch_size + config.num_sm_parts
+    work_descriptors = torch.zeros(
+        max_descs * 4, dtype=torch.int32, device=GPU_DEVICE
+    )
+    work_descriptor_offsets = torch.zeros(
+        config.num_sm_parts + 1, dtype=torch.int32, device=GPU_DEVICE
+    )
+
+    attention_window_size = window_left + 1 if window_left >= 0 else 0
+    trtllm_compute_precomputed_metadata(
+        seq_lens_cpu=seq_lens.to(torch.int32),
+        work_descriptors_out=work_descriptors,
+        work_descriptor_offsets_out=work_descriptor_offsets,
+        batch_size=batch_size,
+        block_size_n=config.step_kv,
+        num_sm_parts=config.num_sm_parts,
+        attention_window_size=attention_window_size,
+        tile_size_kv=config.tile_size_kv,
+    )
+
+    output = trtllm_batch_decode_with_kv_cache(
+        q.contiguous(),
+        kv_cache_arg,
+        workspace_buffer,
+        page_table_kernel,
+        seq_lens.to(GPU_DEVICE),
+        max_seq_len_val,
+        bmm1_scale,
+        bmm2_scale,
+        window_left,
+        out=out,
+        out_dtype=out_dtype,
+        o_sf_scale=o_sf_scale,
+        o_sf_vec_size=o_sf_vec_size,
+        kv_layout=kv_layout,
+        backend="trtllm-gen",
+        o_scale=o_scale,
+        kv_block_scales=kv_block_scales_kernel,
+        q_len_per_req=None,
+        max_q_len=max_q_len,
+        cum_seq_lens_q=q_indptr,
+        precomputed_work_descriptors=work_descriptors,
+        precomputed_work_descriptor_offsets=work_descriptor_offsets,
+    )
+    torch.cuda.synchronize()
+
+    # Diagnostic: run non-precomputed (static) trtllm-gen for comparison.
+    workspace_buffer_np = torch.zeros(workspace_size, dtype=torch.int8, device=GPU_DEVICE)
+    out_np = torch.empty_like(output)
+    trtllm_batch_decode_with_kv_cache(
+        q.contiguous(),
+        kv_cache_arg,
+        workspace_buffer_np,
+        page_table_kernel,
+        seq_lens.to(GPU_DEVICE),
+        max_seq_len_val,
+        bmm1_scale,
+        bmm2_scale,
+        window_left,
+        out=out_np,
+        out_dtype=out_dtype,
+        o_sf_scale=o_sf_scale,
+        o_sf_vec_size=o_sf_vec_size,
+        kv_layout=kv_layout,
+        backend="trtllm-gen",
+        o_scale=o_scale,
+        kv_block_scales=kv_block_scales_kernel,
+        q_len_per_req=None,
+        max_q_len=max_q_len,
+        cum_seq_lens_q=q_indptr,
+    )
+    torch.cuda.synchronize()
+
+    # Compare precomputed vs non-precomputed trtllm-gen outputs.
+    np_diff = (output.float() - out_np.float()).abs()
+    print(f"\n[DIAG] Config: bs={batch_size} max_q_len={max_q_len} nq={num_qo_heads} "
+          f"nkv={num_kv_heads} page={page_size} max_kv={max_seq_len_val} win={window_left}")
+    print(f"[DIAG] getConfig: step_kv={config.step_kv} num_sm_parts={config.num_sm_parts} "
+          f"tile_kv={config.tile_size_kv} tile_q={config.tile_size_q}")
+    print(f"[DIAG] Precomputed vs non-precomputed: max_diff={np_diff.max():.6f} "
+          f"mean_diff={np_diff.mean():.6f}")
+    # Per-request breakdown — show ALL bad requests
+    q_indptr_cpu = q_indptr.cpu()
+    bad_reqs = []
+    for i in range(batch_size):
+        s, e = q_indptr_cpu[i].item(), q_indptr_cpu[i + 1].item()
+        req_diff = np_diff[s:e].max().item()
+        if req_diff > 0.1:
+            nblocks = (seq_lens[i].item() + config.step_kv - 1) // config.step_kv
+            bad_reqs.append((i, e - s, seq_lens[i].item(), req_diff, nblocks))
+    print(f"[DIAG] Bad requests (diff>0.1): {len(bad_reqs)} / {batch_size}")
+    for i, qlen, kvlen, diff, nblk in bad_reqs[:20]:
+        print(f"[DIAG]   req[{i}]: q_len={qlen}, kv_len={kvlen}, nblocks={nblk}, max_diff={diff:.4f}")
+    # Check work descriptor offsets to see partition assignment
+    wd_offsets = work_descriptor_offsets.cpu().tolist()
+    print(f"[DIAG] Work descriptor offsets: {wd_offsets[:min(20, len(wd_offsets))]}")
+
+    # Reference: use prefill wrapper for spec decode (variable Q lengths)
+    wrapper_ref = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+        workspace_buffer_ref, kv_layout
+    )
+    wrapper_ref.plan(
+        qo_indptr=q_indptr,
+        paged_kv_indptr=kv_indptr,
+        paged_kv_indices=all_page_ids,
+        paged_kv_last_page_len=kv_last_page_len.to(GPU_DEVICE),
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim,
+        page_size=page_size,
+        pos_encoding_mode="NONE",
+        kv_data_type=ref_kv_cache.dtype,
+        q_data_type=ref_q.dtype,
+        window_left=window_left,
+        causal=True,
+        logits_soft_cap=0.0,
+    )
+    output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
+
+    if q_dtype == "fp8" and o_dtype == "fp8":
+        rtol, atol = 5e-2, 7e-2
+    elif q_dtype == "fp8":
+        rtol, atol = 4e-2, 7e-2
+    else:
+        rtol, atol = 1e-2, 1e-2
+    # Relax tolerance for spec decode (same as existing test_trtllm_batch_decode_spec)
+    rtol, atol = rtol * 2, atol * 2
+    allowed_mismatch_rate = 5e-5
+
+    # Also show non-precomputed vs reference diff for comparison
+    np_ref_diff = (out_np.float() * o_scale - output_ref.float()).abs()
+    precomp_ref_diff = (output.float() * o_scale - output_ref.float()).abs()
+    print(f"[DIAG] Non-precomputed vs reference: max_diff={np_ref_diff.max():.4f} "
+          f"mean_diff={np_ref_diff.mean():.6f}")
+    print(f"[DIAG] Precomputed vs reference: max_diff={precomp_ref_diff.max():.4f} "
+          f"mean_diff={precomp_ref_diff.mean():.6f}")
+
+    assert_close_with_mismatch_tolerance(
+        output.float() * o_scale,
+        output_ref.float(),
+        rtol=rtol,
+        atol=atol,
+        max_mismatched_elements=int(allowed_mismatch_rate * output.numel()),
+    )
+
+
+def test_trtllm_get_kernel_config():
+    """Test that getConfig returns valid kernel metadata."""
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] != 10:
+        pytest.skip("trtllm-gen requires SM100/SM103 GPUs.")
+
+    from flashinfer.decode import trtllm_get_kernel_config
+
+    sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+
+    # Standard decode (max_q_len=1)
+    config = trtllm_get_kernel_config(
+        q_dtype=torch.float8_e4m3fn,
+        kv_dtype=torch.float8_e4m3fn,
+        o_dtype=torch.bfloat16,
+        num_qo_heads=64,
+        num_kv_heads=8,
+        head_dim_qk=128,
+        head_dim_vo=128,
+        page_size=16,
+        sm_count=sm_count,
+        batch_size=256,
+        max_seq_len=4096,
+    )
+    assert config.tile_size_kv in (64, 128)
+    assert config.step_kv > 0
+    assert config.tile_size_q > 0
+    assert config.num_sm_parts > 0
+    assert config.num_sm_parts <= sm_count
+
+    # Speculative decode (max_q_len=5): numSmParts should be <= standard decode
+    # because more CTAs per Q means fewer partitions.
+    config_spec = trtllm_get_kernel_config(
+        q_dtype=torch.float8_e4m3fn,
+        kv_dtype=torch.float8_e4m3fn,
+        o_dtype=torch.bfloat16,
+        num_qo_heads=64,
+        num_kv_heads=8,
+        head_dim_qk=128,
+        head_dim_vo=128,
+        page_size=16,
+        sm_count=sm_count,
+        batch_size=256,
+        max_seq_len=4096,
+        max_q_len=5,
+    )
+    assert config_spec.step_kv > 0
+    assert config_spec.num_sm_parts > 0
+    assert config_spec.num_sm_parts <= config.num_sm_parts
+
+    # Sliding window (window_left=512)
+    config_win = trtllm_get_kernel_config(
+        q_dtype=torch.float8_e4m3fn,
+        kv_dtype=torch.float8_e4m3fn,
+        o_dtype=torch.bfloat16,
+        num_qo_heads=64,
+        num_kv_heads=8,
+        head_dim_qk=128,
+        head_dim_vo=128,
+        page_size=16,
+        sm_count=sm_count,
+        batch_size=256,
+        max_seq_len=4096,
+        window_left=512,
+    )
+    assert config_win.step_kv > 0
+    assert config_win.num_sm_parts > 0

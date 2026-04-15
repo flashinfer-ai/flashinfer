@@ -88,7 +88,9 @@ void trtllm_paged_attention_launcher(
     int64_t sparse_mla_top_k, float skip_softmax_threshold_scale_factor, bool skips_softmax,
     bool uses_shared_paged_kv_idx, int64_t sm_count, bool enable_pdl, int64_t workspace_size,
     int64_t k_sf_stride_heads, int64_t k_sf_stride_batch, int64_t v_sf_stride_heads,
-    int64_t v_sf_stride_batch, cudaStream_t stream) {
+    int64_t v_sf_stride_batch, void const* precomputed_work_descriptors,
+    int32_t const* precomputed_work_descriptor_offsets,
+    cudaStream_t stream) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads must be a multiple of num_kv_heads, got num_kv_heads: " << num_kv_heads
@@ -178,10 +180,21 @@ void trtllm_paged_attention_launcher(
     // one tokenQ in those cases, so dense mask works the same as causal mask.
     runner_params.mMaskType = TrtllmGenAttentionMaskType::Causal;
     runner_params.mKernelType = FmhaKernelType::Generation;
-    bool use_multi_block = true;
-    runner_params.mTileScheduler =
-        use_multi_block ? TileScheduler::Static : TileScheduler::Persistent;
-    runner_params.mMultiCtasKvMode = use_multi_block;
+
+    bool const use_precomputed = (precomputed_work_descriptors != nullptr);
+    if (use_precomputed) {
+      // Precomputed scheduler: metadata-driven, split-KV for load balancing.
+      runner_params.mTileScheduler = TileScheduler::Precomputed;
+      runner_params.mMultiCtasKvMode = false;
+      runner_params.ptrPrecomputedWorkDescriptors = precomputed_work_descriptors;
+      runner_params.ptrPrecomputedWorkDescriptorOffsets = precomputed_work_descriptor_offsets;
+    } else {
+      // Standard Static + multiCtasKv path.
+      bool use_multi_block = true;
+      runner_params.mTileScheduler =
+          use_multi_block ? TileScheduler::Static : TileScheduler::Persistent;
+      runner_params.mMultiCtasKvMode = use_multi_block;
+    }
 
     runner_params.cumSeqLensQPtr = cum_seq_lens_q;
     runner_params.cumSeqLensKvPtr = nullptr;
@@ -191,7 +204,7 @@ void trtllm_paged_attention_launcher(
     size_t num_semaphores =
         round_up(max_batch_size * max_num_qo_heads, 8);  // max 8MB, should align to 16 bytes
     // semaphores be at the first 8MB of workspace buffer: counter | scratch
-    // todo(Yingyi): add softmax buffer later for lse return
+    // For precomputed: counter area reused as split_counter, scratch as partial buffers.
     runner_params.multiCtasKvCounterPtr = float_allocator.aligned_alloc<int32_t>(
         num_semaphores * sizeof(uint32_t), 16, "trtllm_gen_counter_workspace");
     // scratch takes the rest of the workspace buffer
@@ -244,7 +257,9 @@ void trtllm_paged_attention_decode(
     int64_t workspace_size, Optional<TensorView> attention_sinks,
     Optional<TensorView> cum_seq_lens_q, Optional<TensorView> key_block_scales,
     Optional<TensorView> value_block_scales, Optional<float> skip_softmax_threshold_scale_factor,
-    Optional<bool> uses_shared_paged_kv_idx) {
+    Optional<bool> uses_shared_paged_kv_idx,
+    Optional<TensorView> precomputed_work_descriptors,
+    Optional<TensorView> precomputed_work_descriptor_offsets) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
   TVM_FFI_ICHECK_EQ(key_cache.ndim(), value_cache.ndim());
@@ -352,6 +367,15 @@ void trtllm_paged_attention_decode(
       skip_softmax_threshold_scale_factor.value_or(0.0f);
   bool const skips_softmax = skip_softmax_threshold_scale_factor_value != 0.0f;
 
+  // precomputed descriptors
+  void const* precomputed_work_descriptors_ptr = precomputed_work_descriptors.has_value()
+                                                   ? precomputed_work_descriptors.value().data_ptr()
+                                                   : nullptr;
+  int32_t const* precomputed_work_descriptor_offsets_ptr =
+      precomputed_work_descriptor_offsets.has_value()
+          ? static_cast<int32_t const*>(precomputed_work_descriptor_offsets.value().data_ptr())
+          : nullptr;
+
   trtllm_paged_attention_launcher(
       out.data_ptr(), output_sf_ptr, query.data_ptr(), key_cache.data_ptr(), value_cache.data_ptr(),
       workspace_buffer.data_ptr(), static_cast<int*>(block_tables.data_ptr()), k_block_scales_ptr,
@@ -364,7 +388,8 @@ void trtllm_paged_attention_decode(
       bmm2_scale_ptr, o_sf_scale, o_sf_vec_size, o_sf_start_index, window_left, sum_seq_q,
       sparse_mla_top_k, skip_softmax_threshold_scale_factor_value, skips_softmax,
       uses_shared_paged_kv_idx_value, sm_count, enable_pdl, workspace_size, k_sf_stride_heads,
-      k_sf_stride_batch, v_sf_stride_heads, v_sf_stride_batch, stream);
+      k_sf_stride_batch, v_sf_stride_heads, v_sf_stride_batch,
+      precomputed_work_descriptors_ptr, precomputed_work_descriptor_offsets_ptr, stream);
 }
 
 void trtllm_paged_attention_context(
@@ -376,7 +401,8 @@ void trtllm_paged_attention_context(
     int64_t window_left, TensorView cum_seq_lens_q, TensorView cum_seq_lens_kv, int64_t sm_count,
     bool enable_pdl, int64_t workspace_size, Optional<TensorView> attention_sinks,
     Optional<TensorView> key_block_scales, Optional<TensorView> value_block_scales,
-    Optional<float> skip_softmax_threshold_scale_factor, Optional<bool> uses_shared_paged_kv_idx) {
+    Optional<float> skip_softmax_threshold_scale_factor, Optional<bool> uses_shared_paged_kv_idx,
+    Optional<TensorView> precomputed_work_descriptors, Optional<TensorView> precomputed_work_descriptor_offsets) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
   auto o_data_type = dl_dtype_to_tllm_data_type(out.dtype());
@@ -474,6 +500,17 @@ void trtllm_paged_attention_context(
       skip_softmax_threshold_scale_factor.value_or(0.0f);
   bool const skips_softmax = skip_softmax_threshold_scale_factor_value != 0.0f;
 
+  // precomputed descriptors
+  void const* precomputed_work_descriptors_ptr = precomputed_work_descriptors.has_value()
+                                                    ? precomputed_work_descriptors.value().data_ptr()
+                                                    : nullptr;
+  int32_t const* precomputed_work_descriptor_offsets_ptr = precomputed_work_descriptor_offsets.has_value()
+                                                              ? static_cast<int32_t const*>(
+                                                                    precomputed_work_descriptor_offsets
+                                                                        .value()
+                                                                        .data_ptr())
+                                                              : nullptr;
+
   trtllm_paged_attention_launcher(
       out.data_ptr(), output_sf_ptr, query.data_ptr(), key_cache.data_ptr(), value_cache.data_ptr(),
       workspace_buffer.data_ptr(), static_cast<int*>(block_tables.data_ptr()), k_block_scales_ptr,
@@ -487,7 +524,8 @@ void trtllm_paged_attention_context(
       bmm1_scale_log2_ptr, bmm2_scale_ptr, o_sf_scale, o_sf_vec_size, o_sf_start_index, window_left,
       sum_seq_q, /*sparse_mla_top_k=*/0, skip_softmax_threshold_scale_factor_value, skips_softmax,
       uses_shared_paged_kv_idx_value, sm_count, enable_pdl, workspace_size, k_sf_stride_heads,
-      k_sf_stride_batch, v_sf_stride_heads, v_sf_stride_batch, stream);
+      k_sf_stride_batch, v_sf_stride_heads, v_sf_stride_batch,
+      precomputed_work_descriptors_ptr, precomputed_work_descriptor_offsets_ptr, stream);
 }
 
 void trtllm_ragged_attention_launcher(
@@ -666,6 +704,48 @@ void trtllm_ragged_attention(TensorView out, TensorView query, TensorView key, T
       skip_softmax_threshold_scale_factor_value, skips_softmax, workspace_size, stream);
 }
 
+// Query the kernel configuration for a given set of parameters without launching.
+// Writes [tileSizeKv, stepKv, tileSizeQ, numSmParts] into config_out (int64 tensor, shape [4]).
+// Takes dummy tensors (can be empty, size 0) just to carry dtype info.
+void trtllm_get_kernel_config(
+    TensorView config_out, TensorView q_dummy, TensorView kv_dummy, TensorView o_dummy,
+    int64_t num_qo_heads, int64_t num_kv_heads, int64_t head_dim_qk, int64_t head_dim_vo,
+    int64_t page_size, int64_t sm_count, int64_t batch_size, int64_t max_seq_len,
+    int64_t max_q_len, int64_t window_left) {
+  auto q_data_type = dl_dtype_to_tllm_data_type(q_dummy.dtype());
+  auto kv_data_type = dl_dtype_to_tllm_data_type(kv_dummy.dtype());
+  auto o_data_type = dl_dtype_to_tllm_data_type(o_dummy.dtype());
+
+  auto fmha_runner = TllmGenFmhaRunnerCache::get(q_data_type, kv_data_type, o_data_type);
+  TllmGenFmhaRunnerParams runner_params;
+
+  runner_params.mQkvLayout = QkvLayout::PagedKv;
+  runner_params.mMaskType = TrtllmGenAttentionMaskType::Causal;
+  runner_params.mKernelType = FmhaKernelType::Generation;
+  runner_params.mTileScheduler = TileScheduler::Precomputed;
+  runner_params.mMultiCtasKvMode = false;
+  runner_params.mHeadDimQk = head_dim_qk;
+  runner_params.mHeadDimV = head_dim_vo;
+  runner_params.mNumHeadsQ = num_qo_heads;
+  runner_params.mNumHeadsKv = num_kv_heads;
+  runner_params.mNumHeadsQPerKv = num_qo_heads / num_kv_heads;
+  runner_params.mBatchSize = batch_size;
+  runner_params.mMaxSeqLenKv = max_seq_len;
+  runner_params.mMaxSeqLenQ = max_q_len;
+  runner_params.mNumTokensPerPage = page_size;
+  runner_params.mMultiProcessorCount = sm_count;
+  runner_params.mAttentionWindowSize = window_left == -1 ? INT_MAX : window_left + 1;
+  runner_params.mChunkedAttentionSize = INT_MAX;
+  runner_params.mUsesSharedPagedKvIdx = true;
+
+  auto config = fmha_runner->getConfig(runner_params);
+  auto* out = static_cast<int64_t*>(config_out.data_ptr());
+  out[0] = config.tileSizeKv;
+  out[1] = config.stepKv;
+  out[2] = config.tileSizeQ;
+  out[3] = config.numSmParts;
+}
+
 namespace trtllm_cubin_loader {
 #include <flashinfer/cubin_loader.h>
 }
@@ -673,5 +753,6 @@ namespace trtllm_cubin_loader {
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_paged_attention_decode, trtllm_paged_attention_decode);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_paged_attention_context, trtllm_paged_attention_context);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_ragged_attention, trtllm_ragged_attention);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_get_kernel_config, trtllm_get_kernel_config);
 
 }  // namespace flashinfer

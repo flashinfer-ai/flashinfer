@@ -233,6 +233,11 @@ class TllmGenFmhaKernel {
     auto kernelParams = KernelParams::setKernelParams(
         params, kernelMeta, ctaLaunchParams.mMaxNumCtasQ, ctaLaunchParams.mMaxNumCtasKv);
 
+    // Precomputed scheduler: override logicalGridDimZ to numSmParts.
+    if (selectKernelParams.mTileScheduler == TileScheduler::Precomputed) {
+      kernelParams.logicalGridDimZ = ctaLaunchParams.mNumCtasZ;
+    }
+
     void* kernelParamsList[] = {&kernelParams};
     CUlaunchAttribute launch_attribute[3];
     CUlaunchConfig launch_config;
@@ -281,15 +286,47 @@ class TllmGenFmhaKernel {
 
     cuErrCheck(cuLaunchKernelEx(&launch_config, func, kernelParamsList, nullptr));
 
-    // Run the separate reduction kernel if needed.
-    tensorrt_llm::kernels::runFmhaReduction(kernelMeta, kernelParams, params.mMultiProcessorCount,
-                                            params.enable_pdl, params.stream);
+    // Run the separate reduction kernel if needed (not needed for precomputed — reduction is in-kernel).
+    if (selectKernelParams.mTileScheduler != TileScheduler::Precomputed) {
+      tensorrt_llm::kernels::runFmhaReduction(kernelMeta, kernelParams, params.mMultiProcessorCount,
+                                              params.enable_pdl, params.stream);
+    }
 
     if (params.lsePtr != nullptr) {
       flashinfer::ComputeLSEFromMD(params.softmaxStatsPtr, params.lsePtr,
                                    params.mSumOfSeqLensQ * params.mNumHeadsQ, params.enable_pdl,
                                    params.stream);
     }
+  }
+
+  // Query the selected kernel's configuration without launching or loading cubins.
+  // Looks up kernel metadata from the hash map (no CUDA context needed).
+  FmhaKernelConfig getConfig(RunnerParams const& params) const {
+    SelectKernelParams selectKernelParams{params};
+    CtaLaunchParams ctaLaunchParams;
+
+    static constexpr int kMaxPasses = 4;
+    KernelMeta kernelMeta{};
+    for (int pass = 0; pass < kMaxPasses; ++pass) {
+      selectKernel(params, selectKernelParams);
+      // Look up metadata without loading the cubin (no CUDA context needed).
+      auto [hashId, info] = hashFromRunnerParams(params, selectKernelParams);
+      auto findMetaIter = mKernelMetaMap.find(hashId);
+      FLASHINFER_CHECK(findMetaIter != mKernelMetaMap.end(),
+                       "Trtllm-gen precomputed kernel not found for getConfig: " + info);
+      kernelMeta = mKernelMeta[findMetaIter->second];
+      computeCtaAndClusterConfig(ctaLaunchParams, params, kernelMeta, selectKernelParams);
+      if (!selectKernelParams.mSelectNewKernel) {
+        break;
+      }
+    }
+
+    FmhaKernelConfig config{};
+    config.tileSizeQ = kernelMeta.mTileSizeQ;
+    config.tileSizeKv = kernelMeta.mTileSizeKv;
+    config.stepKv = kernelMeta.mStepKv;
+    config.numSmParts = ctaLaunchParams.mNumCtasZ;
+    return config;
   }
 
  private:
@@ -378,6 +415,26 @@ class TllmGenFmhaKernel {
     int numCtasY = numCtasForAllHeadsQ * numCtasPerHeadDim;
     // Compute the grid dimension Z.
     int numCtasZ = params.mBatchSize;
+
+    // Precomputed scheduler: grid Z = rawNumSmParts (constant for a given model config).
+    // Always use rawNumSmParts without espUpperBound capping so that grid Z is independent
+    // of mMaxSeqLenKv. This ensures metadata partition count == kernel grid Z regardless of
+    // the actual max sequence length in the batch, and provides stable grid dimensions for
+    // CUDA graph capture. The espUpperBound logic is ported to the metadata generator
+    // (runPrecomputedSchedFromHost) to prevent over-splitting; extra partitions receive
+    // empty descriptor ranges and exit immediately (see PrecomputedSchedule.h:69-83).
+    if (selectKernelParams.mTileScheduler == TileScheduler::Precomputed) {
+      int numSmParts = std::max(1, params.mMultiProcessorCount / (numCtasX * numCtasY));
+
+      ctaLaunchParams.mMaxNumCtasQ = numCtasPerSeqQ;
+      ctaLaunchParams.mMaxNumCtasKv = 1;
+      ctaLaunchParams.mNumCtasX = numCtasX;
+      ctaLaunchParams.mNumCtasY = numCtasY;
+      ctaLaunchParams.mNumCtasZ = numSmParts;
+      ctaLaunchParams.mClusterDimX = selectKernelParams.mUses2CtaMma ? 2 : 1;
+      return;
+    }
+
     // The 2CtaMma kernels will use 2 Ctas in the x dimension (only used by MLA generation kernels)
     // for heads, so numCtasPerHeadDim and numCtasForAllHeadsQ will be handled by the 2Ctas in the x
     // dimension.

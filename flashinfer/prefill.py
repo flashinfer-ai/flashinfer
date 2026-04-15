@@ -306,6 +306,8 @@ def get_trtllm_gen_prefill_module():
             value_block_scales,
             skip_softmax_threshold_scale_factor,
             uses_shared_paged_kv_idx,
+            None,  # precomputed_work_descriptors
+            None,  # precomputed_work_descriptor_offsets
         )
         return out
 
@@ -4045,6 +4047,8 @@ def trtllm_batch_context_with_kv_cache(
         value_block_scales,
         skip_softmax_threshold_scale_factor,
         uses_shared_paged_kv_idx,
+        None,
+        None,
     )
     return (
         out

@@ -125,11 +125,23 @@ QKV_LAYOUT_FUNCTION(ContiguousKv)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Kernel configuration returned by getConfig() — no-launch metadata query.
+struct FmhaKernelConfig {
+  int tileSizeQ;
+  int tileSizeKv;
+  int stepKv;      // = tileSizeKv * numInstsKv (blockSizeN for precomputed scheduler)
+  int numSmParts;
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 enum class TileScheduler {
   // Static scheduler (Non-persistent).
   Static = 0,
   // Persistent scheduler.
-  Persistent
+  Persistent,
+  // Precomputed scheduler (metadata-driven, split-KV for load balancing).
+  Precomputed
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -316,6 +328,12 @@ struct TllmGenFmhaRunnerParams {
   cudaStream_t stream;
   // Whether to enable PDL (Programmatic Dependent Launch).
   bool enable_pdl;
+
+  // Precomputed scheduler work descriptors (only valid when mTileScheduler == Precomputed).
+  // Dense per-request-chunk descriptors [maxTotalDescriptors = batchSize + numSmParts].
+  void const* ptrPrecomputedWorkDescriptors;
+  // Per-partition offset into work descriptors [numSmParts + 1] (prefix sum).
+  int32_t const* ptrPrecomputedWorkDescriptorOffsets;
 
   // set the attention mask type
   TllmGenFmhaRunnerParams& setAttentionMaskType(std::int8_t maskType) {

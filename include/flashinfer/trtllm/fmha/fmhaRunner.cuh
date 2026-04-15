@@ -56,6 +56,12 @@ class TllmGenFmhaRunner {
   // Run the fmha kernel.
   void run(TllmGenFmhaRunnerParams const& runnerParams) { mKernel->run(runnerParams); }
 
+  // Query the selected kernel's configuration without launching.
+  // Returns tile sizes and numSmParts needed for precomputed metadata generation.
+  FmhaKernelConfig getConfig(TllmGenFmhaRunnerParams const& runnerParams) const {
+    return mKernel->getConfig(runnerParams);
+  }
+
  private:
   // The input/output datatype.
   Data_type mDtypeQ, mDtypeKv, mDtypeOut;

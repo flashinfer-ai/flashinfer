@@ -1193,6 +1193,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         q_len_per_req: Optional[int] = 1,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        precomputed_work_descriptors: Optional[torch.Tensor] = None,
+        precomputed_work_descriptor_offsets: Optional[torch.Tensor] = None,
     ) -> torch.Tensor: ...
 
     @overload
@@ -1213,6 +1215,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         q_len_per_req: Optional[int] = 1,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        precomputed_work_descriptors: Optional[torch.Tensor] = None,
+        precomputed_work_descriptor_offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     @flashinfer_api
@@ -1233,6 +1237,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         q_len_per_req: Optional[int] = 1,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        precomputed_work_descriptors: Optional[torch.Tensor] = None,
+        precomputed_work_descriptor_offsets: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch decode attention between query and paged kv cache.
 
@@ -1460,6 +1466,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     value_block_scales,
                     skip_softmax_threshold_scale_factor,
                     True,  # uses_shared_paged_kv_idx
+                    precomputed_work_descriptors,
+                    precomputed_work_descriptor_offsets,
                 ]
 
             self._cached_module.paged_run(*run_args)
@@ -2036,6 +2044,8 @@ class TrtllmGenDecodeModule:
         value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         uses_shared_paged_kv_idx: bool = True,
+        precomputed_work_descriptors: Optional[torch.Tensor] = None,
+        precomputed_work_descriptor_offsets: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if out is None:
             out = torch.empty_like(query)
@@ -2081,6 +2091,8 @@ class TrtllmGenDecodeModule:
             value_block_scales,
             skip_softmax_threshold_scale_factor,
             uses_shared_paged_kv_idx,
+            precomputed_work_descriptors,
+            precomputed_work_descriptor_offsets,
         )
         return out
 
@@ -2146,6 +2158,8 @@ def get_trtllm_gen_decode_module(*args):
         value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         uses_shared_paged_kv_idx: bool = True,
+        precomputed_work_descriptors: Optional[torch.Tensor] = None,
+        precomputed_work_descriptor_offsets: Optional[torch.Tensor] = None,
     ) -> None:
         assert maybe_lse is None
         assert paged_kv_cache is not None
@@ -2176,6 +2190,8 @@ def get_trtllm_gen_decode_module(*args):
             value_block_scales=value_block_scales,
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
             uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+            precomputed_work_descriptors=precomputed_work_descriptors,
+            precomputed_work_descriptor_offsets=precomputed_work_descriptor_offsets,
         )
 
     @register_fake_op(f"flashinfer::{uri}_paged_run")
@@ -2219,6 +2235,8 @@ def get_trtllm_gen_decode_module(*args):
         value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         uses_shared_paged_kv_idx: bool = True,
+        precomputed_work_descriptors: Optional[torch.Tensor] = None,
+        precomputed_work_descriptor_offsets: Optional[torch.Tensor] = None,
     ) -> None:
         pass
 
@@ -2259,6 +2277,8 @@ def trtllm_batch_decode_with_kv_cache(
     skip_softmax_threshold_scale_factor: Optional[float] = None,
     kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     uses_shared_paged_kv_idx: bool = True,
+    precomputed_work_descriptors: Optional[torch.Tensor] = None,
+    precomputed_work_descriptor_offsets: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
     Parameters
@@ -2606,6 +2626,8 @@ def trtllm_batch_decode_with_kv_cache(
             v_block_scales,
             skip_softmax_threshold_scale_factor,
             uses_shared_paged_kv_idx,
+            precomputed_work_descriptors,
+            precomputed_work_descriptor_offsets,
         )
 
         return (
@@ -2958,3 +2980,144 @@ def fast_decode_plan(
     self._sm_scale = sm_scale
     self._rope_scale = rope_scale
     self._rope_theta = rope_theta
+
+
+class FmhaKernelConfig:
+    """Kernel configuration returned by trtllm_get_kernel_config."""
+
+    def __init__(self, tile_size_kv: int, step_kv: int, tile_size_q: int, num_sm_parts: int):
+        self.tile_size_kv = tile_size_kv
+        self.step_kv = step_kv
+        self.tile_size_q = tile_size_q
+        self.num_sm_parts = num_sm_parts
+
+    def __repr__(self):
+        return (
+            f"FmhaKernelConfig(tile_size_kv={self.tile_size_kv}, step_kv={self.step_kv}, "
+            f"tile_size_q={self.tile_size_q}, num_sm_parts={self.num_sm_parts})"
+        )
+
+
+def trtllm_get_kernel_config(
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    o_dtype: torch.dtype,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    page_size: int,
+    sm_count: int,
+    batch_size: int,
+    max_seq_len: int,
+    max_q_len: int = 1,
+    window_left: int = -1,
+) -> FmhaKernelConfig:
+    """Query the precomputed kernel's tile sizes and numSmParts. Call once at init, cache the result.
+
+    Parameters
+    ----------
+    q_dtype : torch.dtype
+        Query data type.
+    kv_dtype : torch.dtype
+        KV cache data type.
+    o_dtype : torch.dtype
+        Output data type.
+    num_qo_heads : int
+        Number of query/output heads.
+    num_kv_heads : int
+        Number of key/value heads.
+    head_dim_qk : int
+        Head dimension for Q and K.
+    head_dim_vo : int
+        Head dimension for V and O.
+    page_size : int
+        Page size for paged KV cache.
+    sm_count : int
+        Number of streaming multiprocessors.
+    batch_size : int
+        Batch size (used for numSmParts upper-bound computation).
+    max_seq_len : int
+        Maximum KV sequence length (used for numSmParts upper-bound computation).
+    max_q_len : int
+        Maximum query length per request (1 for standard decode, >1 for speculative decode).
+    window_left : int
+        Sliding window size (-1 for no window / full context).
+
+    Returns
+    -------
+    FmhaKernelConfig
+        Kernel configuration with tile_size_kv, step_kv, tile_size_q, num_sm_parts.
+    """
+    # Output tensor for C++ to write config into: [tileSizeKv, stepKv, tileSizeQ, numSmParts]
+    config_out = torch.zeros(4, dtype=torch.int64, device="cpu")
+    get_trtllm_gen_fmha_module().trtllm_get_kernel_config(
+        config_out,
+        torch.empty(0, dtype=q_dtype, device="cpu"),
+        torch.empty(0, dtype=kv_dtype, device="cpu"),
+        torch.empty(0, dtype=o_dtype, device="cpu"),
+        num_qo_heads,
+        num_kv_heads,
+        head_dim_qk,
+        head_dim_vo,
+        page_size,
+        sm_count,
+        batch_size,
+        max_seq_len,
+        max_q_len,
+        window_left,
+    )
+    return FmhaKernelConfig(
+        tile_size_kv=int(config_out[0].item()),
+        step_kv=int(config_out[1].item()),
+        tile_size_q=int(config_out[2].item()),
+        num_sm_parts=int(config_out[3].item()),
+    )
+
+
+def trtllm_compute_precomputed_metadata(
+    seq_lens_cpu: torch.Tensor,
+    work_descriptors_out: torch.Tensor,
+    work_descriptor_offsets_out: torch.Tensor,
+    batch_size: int,
+    block_size_n: int,
+    num_sm_parts: int,
+    attention_window_size: int = 0,
+    tile_size_kv: int = 128,
+) -> None:
+    """Compute precomputed scheduler metadata from host-side sequence lengths.
+
+    The metadata (work descriptors and per-partition offsets) is written directly
+    to the provided GPU tensors via async H2D copy. No stream synchronization is needed —
+    a subsequent kernel launch on the same stream will naturally wait.
+
+    Parameters
+    ----------
+    seq_lens_cpu : torch.Tensor
+        Sequence lengths on CPU, shape [batch_size], dtype int32.
+    work_descriptors_out : torch.Tensor
+        Output GPU tensor for work descriptors, shape [max_descs * 4], dtype int32.
+        max_descs = batch_size + num_sm_parts.
+    work_descriptor_offsets_out : torch.Tensor
+        Output GPU tensor for per-partition offsets, shape [num_sm_parts + 1], dtype int32.
+    batch_size : int
+        Number of requests in the batch.
+    block_size_n : int
+        KV block size (= step_kv from kernel config).
+    num_sm_parts : int
+        Number of SM partitions (from kernel config).
+    attention_window_size : int
+        Sliding window size (0 = no window, use full seqLen).
+    tile_size_kv : int
+        Single KV tile size (from kernel config).
+    """
+    get_trtllm_gen_fmha_module().trtllm_compute_precomputed_metadata(
+        seq_lens_cpu,
+        work_descriptors_out,
+        work_descriptor_offsets_out,
+        batch_size,
+        block_size_n,
+        num_sm_parts,
+        attention_window_size,
+        tile_size_kv,
+    )

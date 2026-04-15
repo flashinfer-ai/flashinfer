@@ -64,6 +64,32 @@ struct FastModDivInt32 {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 using Dtype = Data_type;
 
+// Dense per-request-chunk work descriptor for the precomputed scheduler.
+// 16-byte aligned for single 128-bit vectorized load on device.
+struct __align__(16) PrecomputedWorkDescriptor {
+  int32_t reqIdx;      // Batch index (= L_idx).
+  int32_t startBlock;  // First KV block (absolute, in blockSizeN units).
+  int32_t endBlock;    // Past-end KV block.
+  int32_t splitInfo;   // Bit-packed: isSplit(1) | splitGlobalIdx(12) | numPieces(7) | splitBeginIdx(12).
+};
+
+static_assert(sizeof(PrecomputedWorkDescriptor) == 16, "PrecomputedWorkDescriptor must be 16 bytes");
+
+// Bitfield capacity limits for splitInfo fields.
+static constexpr int32_t kMaxNumPieces = 0x7F;  // 7 bits, max 127
+
+// Pack helper for PrecomputedWorkDescriptor::splitInfo.
+// Layout (32 bits): [31:20] splitBeginIdx | [19:13] numPieces | [12:1] splitGlobalIdx | [0] isSplit
+inline int32_t packSplitInfo(
+    int32_t isSplit, int32_t splitGlobalIdx, int32_t numPieces, int32_t splitBeginIdx) {
+  return (isSplit & 1)
+       | ((splitGlobalIdx & 0xFFF) << 1)
+       | ((numPieces & 0x7F) << 13)
+       | ((splitBeginIdx & 0xFFF) << 20);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 struct KernelParams {
   // TMA descriptor for Q.
   CUtensorMap tmaQ_;
@@ -112,7 +138,7 @@ struct KernelParams {
   int32_t const* ptrPageIdxKv;
   // The partial matrix O for each CtaKv when the multiCtasKv mode is enabled.
   void* ptrPartialO;
-  // The partial softmax stats (max/sum)for each CtaKv when the multiCtasKv mode is enabled.
+  // The partial softmax stats (max/sum) for each CtaKv (multiCtasKv) or precomputed split requests.
   float2* ptrPartialStats;
   // The scaling factors for K.
   float const* ptrSageAttnSfsK;
@@ -206,6 +232,14 @@ struct KernelParams {
   // Whether the indices for K & V pages are shared as unified index.
   // true -> vLLM/FlashInfer; false -> TRT-LLM.
   bool mUsesSharedPagedKvIdx{true};
+
+  // Precomputed scheduler fields (appended at end for ABI compatibility with old cubins).
+  // Atomic counter for precomputed scheduler in-kernel combine [batchSize * numCtasQ * numHeadsKv].
+  int32_t* ptrPrecomputedSplitCounter;
+  // Dense per-request-chunk work descriptors [maxTotalDescriptors = batchSize + numSmParts].
+  PrecomputedWorkDescriptor const* ptrWorkDescriptors;
+  // Per-partition offset into ptrWorkDescriptors [numSmParts + 1] (prefix sum).
+  int32_t const* ptrWorkDescriptorOffsets;
 
   // Create the TMA shape/stride for Q.
   template <class FmhaOptions>
@@ -819,11 +853,26 @@ struct KernelParams {
     // Attention sink
     params.ptrAttentionSinks = options.ptrAttentionSinks;
 
-    // The partial buffers' pointers when the multiCtasKv mode is enabled.
-    int64_t partialStatsBufferSize = options.mMultiProcessorCount * kernelMeta.mStepQ;
+    // The partial buffers' pointers when the multiCtasKv mode or precomputed scheduler is enabled.
     params.ptrMultiCtasKvCounter = options.multiCtasKvCounterPtr;
-    params.ptrPartialStats = reinterpret_cast<float2*>(options.multiCtasKvScratchPtr);
-    params.ptrPartialO = params.ptrPartialStats + partialStatsBufferSize;
+    if (options.mTileScheduler == TileScheduler::Precomputed) {
+      // Precomputed scheduler: reuse counter area as split counter, recompute partial layout.
+      params.ptrPrecomputedSplitCounter = options.multiCtasKvCounterPtr;
+      params.ptrWorkDescriptors = static_cast<PrecomputedWorkDescriptor const*>(
+          options.ptrPrecomputedWorkDescriptors);
+      params.ptrWorkDescriptorOffsets = options.ptrPrecomputedWorkDescriptorOffsets;
+      // Partial buffers: indexed by splitGlobalIdx (different layout from multiCtasKv).
+      // Layout: [maxTotalSplits * perSplitStatsSize] of float2, then partial O follows.
+      int64_t maxTotalSplits = options.mBatchSize + options.mMultiProcessorCount;
+      int64_t perSplitStatsSize = maxNumCtasQ * options.mNumHeadsKv * kernelMeta.mStepQ;
+      params.ptrPartialStats = reinterpret_cast<float2*>(options.multiCtasKvScratchPtr);
+      params.ptrPartialO = params.ptrPartialStats + maxTotalSplits * perSplitStatsSize;
+    } else {
+      // Standard multiCtasKv layout.
+      int64_t partialStatsBufferSize = options.mMultiProcessorCount * kernelMeta.mStepQ;
+      params.ptrPartialStats = reinterpret_cast<float2*>(options.multiCtasKvScratchPtr);
+      params.ptrPartialO = params.ptrPartialStats + partialStatsBufferSize;
+    }
 
     params.ptrPageIdxKv = options.kvPageIdxPtr;
     params.ptrScaleSoftmaxLog2 = options.scaleSoftmaxLog2Ptr;
