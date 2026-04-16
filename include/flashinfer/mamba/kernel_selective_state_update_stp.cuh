@@ -65,19 +65,22 @@ template <typename input_t, typename weight_t, int DIM, int DSTATE>
 __device__ __forceinline__ void apply_xab_fast_forward(
     float& state_value, SelectiveStateUpdateParams const& params, int batch, int head, int group,
     int d, int i, float A_value, float dt_bias_value) {
-  auto const* __restrict__ xab_x = reinterpret_cast<input_t const*>(params.xab_x);
-  auto const* __restrict__ xab_dt = reinterpret_cast<weight_t const*>(params.xab_dt);
-  auto const* __restrict__ xab_B = reinterpret_cast<input_t const*>(params.xab_B);
+  auto const* __restrict__ xab_x_ptr =
+      reinterpret_cast<input_t const*>(params.xab_x) +
+      batch * params.xab_x_stride_batch + head * DIM + d;
+  auto const* __restrict__ xab_dt_ptr =
+      reinterpret_cast<weight_t const*>(params.xab_dt) +
+      batch * params.xab_dt_stride_batch + head;
+  auto const* __restrict__ xab_B_ptr =
+      reinterpret_cast<input_t const*>(params.xab_B) +
+      batch * params.xab_B_stride_batch + group * DSTATE + i;
   for (uint32_t t = 0; t < params.xab_length; t++) {
-    float dt_val = toFloat(xab_dt[batch * params.xab_dt_stride_batch +
-                                   t * params.xab_dt_stride_token + head]);
+    float dt_val = toFloat(xab_dt_ptr[t * params.xab_dt_stride_token]);
     dt_val += dt_bias_value;
     if (params.dt_softplus) dt_val = thresholded_softplus(dt_val);
     float dA = __expf(A_value * dt_val);
-    float x_val = toFloat(
-        xab_x[batch * params.xab_x_stride_batch + t * params.xab_x_stride_token + head * DIM + d]);
-    float B_val = toFloat(xab_B[batch * params.xab_B_stride_batch +
-                                 t * params.xab_B_stride_token + group * DSTATE + i]);
+    float x_val = toFloat(xab_x_ptr[t * params.xab_x_stride_token]);
+    float B_val = toFloat(xab_B_ptr[t * params.xab_B_stride_token]);
     state_value = state_value * dA + (B_val * dt_val) * x_val;
   }
 }
