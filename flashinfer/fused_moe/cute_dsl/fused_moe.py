@@ -184,9 +184,6 @@ def _moe_core_impl(
     num_tokens = token_selected_experts.size(0)
     hidden_size = w2_weight.size(1)
 
-    # NOTE: SM120/SM121 dispatch is handled by callers (CuteDslMoEWrapper.run
-    # and cute_dsl_fused_moe_nvfp4) before reaching this function.
-
     # Allocate output if not provided.  The caller (wrapper or functional
     # API) should pass a [:num_tokens] slice of the pre-allocated buffer
     # when using CUDA graphs.  The buffer is zeroed in Step 3 below.
@@ -555,12 +552,8 @@ class CuteDslMoEWrapper:
         Supports auto-tuning via `tactic` parameter or `autotune()` context.
 
         Args:
-            x: Input tensor. On SM100/SM103: NVFP4 quantized
-                [num_tokens, hidden_size // 2]. On SM120/SM121: bf16
-                activations [num_tokens, hidden_size] (kernel fuses
-                quantization internally).
-            x_sf: Scale factors for x. Required on SM100/SM103, ignored
-                on SM120/SM121.
+            x: NVFP4-quantized input [num_tokens, hidden_size // 2].
+            x_sf: Scale factors for x.
             token_selected_experts: Expert assignments [num_tokens, top_k].
             token_final_scales: Routing weights [num_tokens, top_k].
             w1_weight: GEMM1 weights (gate + up fused).
@@ -729,12 +722,8 @@ def cute_dsl_fused_moe_nvfp4(
         ...     output = cute_dsl_fused_moe_nvfp4(...)
 
     Args:
-        x: Input tensor. On SM100/SM103: NVFP4 quantized
-            [num_tokens, hidden_size // 2]. On SM120/SM121: bf16
-            activations [num_tokens, hidden_size] (kernel fuses
-            quantization internally).
-        x_sf: Scale factors for x. Required on SM100/SM103, ignored
-            on SM120/SM121.
+        x: NVFP4-quantized input [num_tokens, hidden_size // 2].
+        x_sf: Scale factors for x.
         token_selected_experts: Expert assignments [num_tokens, top_k].
         token_final_scales: Routing weights [num_tokens, top_k].
         w1_weight: GEMM1 weights (gate + up fused).

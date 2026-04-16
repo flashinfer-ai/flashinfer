@@ -51,15 +51,16 @@ def b12x_fused_moe(
     x: torch.Tensor,
     w1_weight: torch.Tensor,
     w1_weight_sf: torch.Tensor,
-    w1_alpha: torch.Tensor,
-    fc2_input_scale: torch.Tensor,
     w2_weight: torch.Tensor,
     w2_weight_sf: torch.Tensor,
-    w2_alpha: torch.Tensor,
     token_selected_experts: torch.Tensor,
     token_final_scales: torch.Tensor,
     num_experts: int,
     top_k: int,
+    *,
+    w1_alpha: torch.Tensor,
+    w2_alpha: torch.Tensor,
+    fc2_input_scale: torch.Tensor,
     num_local_experts: Optional[int] = None,
     output: Optional[torch.Tensor] = None,
     output_dtype: torch.dtype = torch.bfloat16,
@@ -78,15 +79,15 @@ def b12x_fused_moe(
             Gated (SiLU): [E, 2*intermediate_size, hidden_size//2].
             Non-gated (ReLU2): [E, intermediate_size, hidden_size//2].
         w1_weight_sf: Scale factors for w1_weight.
-        w1_alpha: Per-expert global scale for FC1.
-        fc2_input_scale: Global scale for FC2 input quantization.
         w2_weight: FC2 weights [E, hidden_size, intermediate_size//2], FP4.
         w2_weight_sf: Scale factors for w2_weight.
-        w2_alpha: Per-expert global scale for FC2.
         token_selected_experts: Expert assignments [num_tokens, top_k].
         token_final_scales: Routing weights [num_tokens, top_k].
         num_experts: Total number of experts.
         top_k: Number of experts per token.
+        w1_alpha: Per-expert global scale for FC1.
+        w2_alpha: Per-expert global scale for FC2.
+        fc2_input_scale: Global scale for FC2 input quantization.
         num_local_experts: Local experts for EP. Default: num_experts.
         output: Pre-allocated output buffer [num_tokens, hidden_size].
         output_dtype: Output data type. Default: torch.bfloat16.
@@ -169,6 +170,7 @@ class B12xMoEWrapper:
         top_k: int,
         hidden_size: int,
         intermediate_size: int,
+        *,
         use_cuda_graph: bool = False,
         max_num_tokens: int = 4096,
         num_local_experts: Optional[int] = None,
@@ -251,13 +253,14 @@ class B12xMoEWrapper:
         x: torch.Tensor,
         w1_weight: torch.Tensor,
         w1_weight_sf: torch.Tensor,
-        w1_alpha: torch.Tensor,
-        fc2_input_scale: torch.Tensor,
         w2_weight: torch.Tensor,
         w2_weight_sf: torch.Tensor,
-        w2_alpha: torch.Tensor,
         token_selected_experts: torch.Tensor,
         token_final_scales: torch.Tensor,
+        *,
+        w1_alpha: torch.Tensor,
+        w2_alpha: torch.Tensor,
+        fc2_input_scale: torch.Tensor,
     ) -> torch.Tensor:
         """Run MoE computation.
 
@@ -265,13 +268,13 @@ class B12xMoEWrapper:
             x: Input activations [num_tokens, hidden_size], bf16.
             w1_weight: FC1 weights, FP4 packed.
             w1_weight_sf: Scale factors for w1_weight.
-            w1_alpha: Per-expert global scale for FC1.
-            fc2_input_scale: Global scale for FC2 input quantization.
             w2_weight: FC2 weights, FP4 packed.
             w2_weight_sf: Scale factors for w2_weight.
-            w2_alpha: Per-expert global scale for FC2.
             token_selected_experts: Expert assignments [num_tokens, top_k].
             token_final_scales: Routing weights [num_tokens, top_k].
+            w1_alpha: Per-expert global scale for FC1.
+            w2_alpha: Per-expert global scale for FC2.
+            fc2_input_scale: Global scale for FC2 input quantization.
 
         Returns:
             Output tensor [num_tokens, hidden_size].

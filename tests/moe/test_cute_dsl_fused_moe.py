@@ -38,8 +38,7 @@ from flashinfer.cute_dsl import is_cute_dsl_available
 def is_sm100_family():
     """Check for SM100 family (Blackwell: SM100, SM103).
 
-    CuteDSL MoE NVFP4 kernels on SM10x use cute_dsl_fused_moe_nvfp4 API.
-    SM120/121 tests are in test_b12x_fused_moe.py instead.
+    CuteDSL MoE NVFP4 kernels are optimized for SM10x architecture.
     """
     if not torch.cuda.is_available():
         return False
@@ -53,7 +52,7 @@ cute_dsl_available = pytest.mark.skipif(
 )
 sm100_required = pytest.mark.skipif(
     not is_sm100_family(),
-    reason="Requires SM100/SM103 GPU",
+    reason="Requires SM100 family GPU (Blackwell: SM100, SM103, SM110)",
 )
 
 
@@ -236,11 +235,10 @@ def create_moe_tensors(
         / 10
     )
 
-    # SM100/103: interleave gate/up for CuTe DSL SwiGLU epilogue (group_size=64)
-    w1_bf16_prepared = interleave_linear_and_gate(w1_bf16, group_size=64, dim=1)
+    w1_bf16_interleaved = interleave_linear_and_gate(w1_bf16, group_size=64, dim=1)
     w1_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
 
-    w1_flat = w1_bf16_prepared.view(
+    w1_flat = w1_bf16_interleaved.view(
         num_local_experts * 2 * intermediate_size, hidden_size
     )
     w1_q_flat, w1_sf_flat = fp4_quantize(
