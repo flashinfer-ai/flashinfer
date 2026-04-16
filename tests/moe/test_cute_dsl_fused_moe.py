@@ -1122,7 +1122,7 @@ class TestMicroKernel:
         self, num_tokens: int, top_k: int, num_experts: int
     ):
         """Accuracy test for micro kernel via functional API."""
-        from flashinfer import cute_dsl_fused_moe_nvfp4
+        from flashinfer import b12x_fused_moe
 
         hidden_size, intermediate_size = 256, 512
 
@@ -1135,11 +1135,8 @@ class TestMicroKernel:
             top_k=top_k,
         )
 
-        result = cute_dsl_fused_moe_nvfp4(
-            x=moe_input(tensors),
-            x_sf=tensors["x_sf"],
-            token_selected_experts=tensors["token_selected_experts"],
-            token_final_scales=tensors["token_final_scales"],
+        result = b12x_fused_moe(
+            x=tensors["x_bf16"],
             w1_weight=tensors["w1_weight"],
             w1_weight_sf=tensors["w1_weight_sf"],
             w1_alpha=tensors["w1_alpha"],
@@ -1147,6 +1144,8 @@ class TestMicroKernel:
             w2_weight=tensors["w2_weight"],
             w2_weight_sf=tensors["w2_weight_sf"],
             w2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
             num_experts=num_experts,
             top_k=top_k,
         )
@@ -1177,7 +1176,7 @@ class TestMicroKernel:
 
     def test_micro_wrapper_accuracy(self):
         """Accuracy test for micro kernel via wrapper API."""
-        from flashinfer import CuteDslMoEWrapper
+        from flashinfer import B12xMoEWrapper
 
         num_tokens, hidden_size, intermediate_size = 2, 256, 512
         num_experts, top_k = 256, 2
@@ -1191,7 +1190,7 @@ class TestMicroKernel:
             top_k=top_k,
         )
 
-        moe = CuteDslMoEWrapper(
+        moe = B12xMoEWrapper(
             num_experts=num_experts,
             top_k=top_k,
             hidden_size=hidden_size,
@@ -1200,10 +1199,7 @@ class TestMicroKernel:
         )
 
         result = moe.run(
-            x=moe_input(tensors),
-            x_sf=tensors["x_sf"],
-            token_selected_experts=tensors["token_selected_experts"],
-            token_final_scales=tensors["token_final_scales"],
+            x=tensors["x_bf16"],
             w1_weight=tensors["w1_weight"],
             w1_weight_sf=tensors["w1_weight_sf"],
             w1_alpha=tensors["w1_alpha"],
@@ -1242,7 +1238,7 @@ class TestMicroKernel:
         With 1 token and 8 experts, every expert has exactly 1 row.
         The micro kernel detects this and uses O(1) work tile assignment.
         """
-        from flashinfer import CuteDslMoEWrapper
+        from flashinfer import B12xMoEWrapper
 
         num_tokens, hidden_size, intermediate_size = 1, 256, 512
         num_experts, top_k = 256, 8
@@ -1256,7 +1252,7 @@ class TestMicroKernel:
             top_k=top_k,
         )
 
-        moe = CuteDslMoEWrapper(
+        moe = B12xMoEWrapper(
             num_experts=num_experts,
             top_k=top_k,
             hidden_size=hidden_size,
@@ -1265,10 +1261,7 @@ class TestMicroKernel:
         )
 
         result = moe.run(
-            x=moe_input(tensors),
-            x_sf=tensors["x_sf"],
-            token_selected_experts=tensors["token_selected_experts"],
-            token_final_scales=tensors["token_final_scales"],
+            x=tensors["x_bf16"],
             w1_weight=tensors["w1_weight"],
             w1_weight_sf=tensors["w1_weight_sf"],
             w1_alpha=tensors["w1_alpha"],
@@ -1484,7 +1477,7 @@ class TestRelu2Activation:
         num_experts: int,
     ):
         """Accuracy test for ReLU2 via functional API."""
-        from flashinfer import cute_dsl_fused_moe_nvfp4
+        from flashinfer import b12x_fused_moe
 
         tensors = create_relu2_moe_tensors(
             num_tokens=num_tokens,
@@ -1495,11 +1488,8 @@ class TestRelu2Activation:
             top_k=top_k,
         )
 
-        result = cute_dsl_fused_moe_nvfp4(
-            x=moe_input(tensors),
-            x_sf=tensors["x_sf"],
-            token_selected_experts=tensors["token_selected_experts"],
-            token_final_scales=tensors["token_final_scales"],
+        result = b12x_fused_moe(
+            x=tensors["x_bf16"],
             w1_weight=tensors["w1_weight"],
             w1_weight_sf=tensors["w1_weight_sf"],
             w1_alpha=tensors["w1_alpha"],
@@ -1507,9 +1497,11 @@ class TestRelu2Activation:
             w2_weight=tensors["w2_weight"],
             w2_weight_sf=tensors["w2_weight_sf"],
             w2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
             num_experts=num_experts,
             top_k=top_k,
-            activation_type="relu2",
+            activation="relu2",
         )
 
         assert result.shape == (num_tokens, hidden_size)
@@ -1538,7 +1530,7 @@ class TestRelu2Activation:
 
     def test_relu2_wrapper_accuracy(self):
         """Accuracy test for ReLU2 via wrapper API."""
-        from flashinfer import CuteDslMoEWrapper
+        from flashinfer import B12xMoEWrapper
 
         num_tokens, hidden_size, intermediate_size = 128, 256, 512
         num_experts, top_k = 256, 2
@@ -1552,20 +1544,17 @@ class TestRelu2Activation:
             top_k=top_k,
         )
 
-        moe = CuteDslMoEWrapper(
+        moe = B12xMoEWrapper(
             num_experts=num_experts,
             top_k=top_k,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             use_cuda_graph=False,
-            activation_type="relu2",
+            activation="relu2",
         )
 
         result = moe.run(
-            x=moe_input(tensors),
-            x_sf=tensors["x_sf"],
-            token_selected_experts=tensors["token_selected_experts"],
-            token_final_scales=tensors["token_final_scales"],
+            x=tensors["x_bf16"],
             w1_weight=tensors["w1_weight"],
             w1_weight_sf=tensors["w1_weight_sf"],
             w1_alpha=tensors["w1_alpha"],
@@ -1600,7 +1589,7 @@ class TestRelu2Activation:
 
     def test_relu2_micro_accuracy(self):
         """Accuracy test for ReLU2 with micro kernel (small decode batch)."""
-        from flashinfer import cute_dsl_fused_moe_nvfp4
+        from flashinfer import b12x_fused_moe
 
         num_tokens, hidden_size, intermediate_size = 2, 256, 512
         num_experts, top_k = 256, 2
@@ -1614,11 +1603,8 @@ class TestRelu2Activation:
             top_k=top_k,
         )
 
-        result = cute_dsl_fused_moe_nvfp4(
-            x=moe_input(tensors),
-            x_sf=tensors["x_sf"],
-            token_selected_experts=tensors["token_selected_experts"],
-            token_final_scales=tensors["token_final_scales"],
+        result = b12x_fused_moe(
+            x=tensors["x_bf16"],
             w1_weight=tensors["w1_weight"],
             w1_weight_sf=tensors["w1_weight_sf"],
             w1_alpha=tensors["w1_alpha"],
@@ -1626,9 +1612,11 @@ class TestRelu2Activation:
             w2_weight=tensors["w2_weight"],
             w2_weight_sf=tensors["w2_weight_sf"],
             w2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
             num_experts=num_experts,
             top_k=top_k,
-            activation_type="relu2",
+            activation="relu2",
         )
 
         assert result.shape == (num_tokens, hidden_size)
@@ -1656,7 +1644,7 @@ class TestRelu2Activation:
 
     def test_relu2_cuda_graph(self):
         """Test ReLU2 with CUDA graph capture and replay."""
-        from flashinfer import CuteDslMoEWrapper
+        from flashinfer import B12xMoEWrapper
 
         num_tokens, hidden_size, intermediate_size = 128, 256, 512
         num_experts, top_k = 256, 2
@@ -1670,23 +1658,20 @@ class TestRelu2Activation:
             top_k=top_k,
         )
 
-        moe = CuteDslMoEWrapper(
+        moe = B12xMoEWrapper(
             num_experts=num_experts,
             top_k=top_k,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             use_cuda_graph=True,
             max_num_tokens=num_tokens,
-            activation_type="relu2",
+            activation="relu2",
         )
 
         # Warmup
         for _ in range(3):
             moe.run(
-                x=moe_input(tensors),
-                x_sf=tensors["x_sf"],
-                token_selected_experts=tensors["token_selected_experts"],
-                token_final_scales=tensors["token_final_scales"],
+                x=tensors["x_bf16"],
                 w1_weight=tensors["w1_weight"],
                 w1_weight_sf=tensors["w1_weight_sf"],
                 w1_alpha=tensors["w1_alpha"],
@@ -1694,6 +1679,8 @@ class TestRelu2Activation:
                 w2_weight=tensors["w2_weight"],
                 w2_weight_sf=tensors["w2_weight_sf"],
                 w2_alpha=tensors["w2_alpha"],
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
             )
         torch.cuda.synchronize()
 
@@ -1701,10 +1688,7 @@ class TestRelu2Activation:
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
             output = moe.run(
-                x=moe_input(tensors),
-                x_sf=tensors["x_sf"],
-                token_selected_experts=tensors["token_selected_experts"],
-                token_final_scales=tensors["token_final_scales"],
+                x=tensors["x_bf16"],
                 w1_weight=tensors["w1_weight"],
                 w1_weight_sf=tensors["w1_weight_sf"],
                 w1_alpha=tensors["w1_alpha"],
@@ -1712,6 +1696,8 @@ class TestRelu2Activation:
                 w2_weight=tensors["w2_weight"],
                 w2_weight_sf=tensors["w2_weight_sf"],
                 w2_alpha=tensors["w2_alpha"],
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
             )
         torch.cuda.synchronize()
 

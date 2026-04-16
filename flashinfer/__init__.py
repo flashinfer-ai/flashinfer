@@ -95,6 +95,8 @@ with contextlib.suppress(ImportError):
     from .fused_moe import (
         cute_dsl_fused_moe_nvfp4 as cute_dsl_fused_moe_nvfp4,
         CuteDslMoEWrapper as CuteDslMoEWrapper,
+        b12x_fused_moe as b12x_fused_moe,
+        B12xMoEWrapper as B12xMoEWrapper,
     )
 from .gdn_prefill import chunk_gated_delta_rule as chunk_gated_delta_rule
 from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper

@@ -1394,102 +1394,181 @@ def testCuteDslFp4BlockScaleMoe(args):
 
     use_functional = getattr(args, "use_functional_api", False)
 
-    # SM120 passes bf16 as x (kernel fuses quantization); SM100 passes FP4.
     sm_major_bm = torch.cuda.get_device_capability(device)[0]
-    x_input = tensors["x_bf16"] if sm_major_bm == 12 else tensors["x"]
+    is_sm120 = sm_major_bm == 12
+    x_input = tensors["x_bf16"] if is_sm120 else tensors["x"]
 
     if use_functional:
-        from flashinfer import cute_dsl_fused_moe_nvfp4
         from functools import partial
-
-        if args.verbose >= 1:
-            print(
-                "[INFO] Using functional API (cute_dsl_fused_moe_nvfp4) with workspace cache"
-            )
 
         # Pre-allocate output buffer to avoid per-call allocation
         moe_output = torch.empty(
             num_tokens, hidden_size, dtype=torch.bfloat16, device=device
         )
 
-        runner = partial(
-            cute_dsl_fused_moe_nvfp4,
-            num_experts=num_experts,
-            top_k=top_k,
-            num_local_experts=local_num_experts,
-            local_expert_offset=local_expert_offset,
-            moe_output=moe_output,
-            activation_type=activation_str,
-        )
+        if is_sm120:
+            from flashinfer import b12x_fused_moe
+
+            if args.verbose >= 1:
+                print("[INFO] Using b12x functional API (b12x_fused_moe)")
+            runner = partial(
+                b12x_fused_moe,
+                num_experts=num_experts,
+                top_k=top_k,
+                num_local_experts=local_num_experts,
+                output=moe_output,
+                activation=activation_str,
+            )
+        else:
+            from flashinfer import cute_dsl_fused_moe_nvfp4
+
+            if args.verbose >= 1:
+                print("[INFO] Using CuTe DSL functional API (cute_dsl_fused_moe_nvfp4)")
+            runner = partial(
+                cute_dsl_fused_moe_nvfp4,
+                num_experts=num_experts,
+                top_k=top_k,
+                num_local_experts=local_num_experts,
+                local_expert_offset=local_expert_offset,
+                moe_output=moe_output,
+            )
 
         # Warmup call to populate workspace cache before timed region
-        runner(
-            x=x_input,
-            x_sf=tensors["x_sf"],
-            token_selected_experts=tensors["token_selected_experts"],
-            token_final_scales=tensors["token_final_scales"],
-            w1_weight=tensors["w1_weight"],
-            w1_weight_sf=tensors["w1_weight_sf"],
-            w1_alpha=tensors["w1_alpha"],
-            fc2_input_scale=tensors["fc2_input_scale"],
-            w2_weight=tensors["w2_weight"],
-            w2_weight_sf=tensors["w2_weight_sf"],
-            w2_alpha=tensors["w2_alpha"],
-        )
+        if is_sm120:
+            runner(
+                x=x_input,
+                w1_weight=tensors["w1_weight"],
+                w1_weight_sf=tensors["w1_weight_sf"],
+                w1_alpha=tensors["w1_alpha"],
+                fc2_input_scale=tensors["fc2_input_scale"],
+                w2_weight=tensors["w2_weight"],
+                w2_weight_sf=tensors["w2_weight_sf"],
+                w2_alpha=tensors["w2_alpha"],
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+            )
+        else:
+            runner(
+                x=x_input,
+                x_sf=tensors["x_sf"],
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+                w1_weight=tensors["w1_weight"],
+                w1_weight_sf=tensors["w1_weight_sf"],
+                w1_alpha=tensors["w1_alpha"],
+                fc2_input_scale=tensors["fc2_input_scale"],
+                w2_weight=tensors["w2_weight"],
+                w2_weight_sf=tensors["w2_weight_sf"],
+                w2_alpha=tensors["w2_alpha"],
+            )
     else:
-        moe = CuteDslMoEWrapper(
-            num_experts=num_experts,
-            top_k=top_k,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            use_cuda_graph=is_cuda_graph_compatible,
-            max_num_tokens=num_tokens,
-            num_local_experts=local_num_experts,
-            local_expert_offset=local_expert_offset,
-            activation_type=activation_str,
-        )
+        if is_sm120:
+            from flashinfer import B12xMoEWrapper
+
+            moe = B12xMoEWrapper(
+                num_experts=num_experts,
+                top_k=top_k,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                use_cuda_graph=is_cuda_graph_compatible,
+                max_num_tokens=num_tokens,
+                num_local_experts=local_num_experts,
+                activation=activation_str,
+            )
+        else:
+            moe = CuteDslMoEWrapper(
+                num_experts=num_experts,
+                top_k=top_k,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                use_cuda_graph=is_cuda_graph_compatible,
+                max_num_tokens=num_tokens,
+                num_local_experts=local_num_experts,
+                local_expert_offset=local_expert_offset,
+            )
         runner = moe.run
 
-    def run_cute_dsl_moe(
-        x,
-        x_sf,
-        token_selected_experts,
-        token_final_scales,
-        w1_weight,
-        w1_weight_sf,
-        w1_alpha,
-        fc2_input_scale,
-        w2_weight,
-        w2_weight_sf,
-        w2_alpha,
-    ):
-        return runner(
-            x=x,
-            x_sf=x_sf,
-            token_selected_experts=token_selected_experts,
-            token_final_scales=token_final_scales,
-            w1_weight=w1_weight,
-            w1_weight_sf=w1_weight_sf,
-            w1_alpha=w1_alpha,
-            fc2_input_scale=fc2_input_scale,
-            w2_weight=w2_weight,
-            w2_weight_sf=w2_weight_sf,
-            w2_alpha=w2_alpha,
-        )
+    if is_sm120:
 
-    input_args = (
-        x_input,
-        tensors["x_sf"],
-        tensors["token_selected_experts"],
-        tensors["token_final_scales"],
-        tensors["w1_weight"],
-        tensors["w1_weight_sf"],
-        tensors["w1_alpha"],
-        tensors["fc2_input_scale"],
-        tensors["w2_weight"],
-        tensors["w2_weight_sf"],
-        tensors["w2_alpha"],
-    )
+        def run_cute_dsl_moe(
+            x,
+            w1_weight,
+            w1_weight_sf,
+            w1_alpha,
+            fc2_input_scale,
+            w2_weight,
+            w2_weight_sf,
+            w2_alpha,
+            token_selected_experts,
+            token_final_scales,
+        ):
+            return runner(
+                x=x,
+                w1_weight=w1_weight,
+                w1_weight_sf=w1_weight_sf,
+                w1_alpha=w1_alpha,
+                fc2_input_scale=fc2_input_scale,
+                w2_weight=w2_weight,
+                w2_weight_sf=w2_weight_sf,
+                w2_alpha=w2_alpha,
+                token_selected_experts=token_selected_experts,
+                token_final_scales=token_final_scales,
+            )
+
+        input_args = (
+            x_input,
+            tensors["w1_weight"],
+            tensors["w1_weight_sf"],
+            tensors["w1_alpha"],
+            tensors["fc2_input_scale"],
+            tensors["w2_weight"],
+            tensors["w2_weight_sf"],
+            tensors["w2_alpha"],
+            tensors["token_selected_experts"],
+            tensors["token_final_scales"],
+        )
+    else:
+
+        def run_cute_dsl_moe(
+            x,
+            x_sf,
+            token_selected_experts,
+            token_final_scales,
+            w1_weight,
+            w1_weight_sf,
+            w1_alpha,
+            fc2_input_scale,
+            w2_weight,
+            w2_weight_sf,
+            w2_alpha,
+        ):
+            return runner(
+                x=x,
+                x_sf=x_sf,
+                token_selected_experts=token_selected_experts,
+                token_final_scales=token_final_scales,
+                w1_weight=w1_weight,
+                w1_weight_sf=w1_weight_sf,
+                w1_alpha=w1_alpha,
+                fc2_input_scale=fc2_input_scale,
+                w2_weight=w2_weight,
+                w2_weight_sf=w2_weight_sf,
+                w2_alpha=w2_alpha,
+            )
+
+        input_args = (
+            x_input,
+            tensors["x_sf"],
+            tensors["token_selected_experts"],
+            tensors["token_final_scales"],
+            tensors["w1_weight"],
+            tensors["w1_weight_sf"],
+            tensors["w1_alpha"],
+            tensors["fc2_input_scale"],
+            tensors["w2_weight"],
+            tensors["w2_weight_sf"],
+            tensors["w2_alpha"],
+        )
 
     # Snapshot active expert count before any kernel execution, since
     # autotune tactic exploration may corrupt input tensors.
