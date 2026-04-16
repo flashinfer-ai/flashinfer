@@ -55,6 +55,16 @@ def _is_sm12x_supported():
     return is_sm120a_supported(device) or is_sm121a_supported(device)
 
 
+def _cuda_13_or_newer():
+    """b12x fused MoE kernels require the CUDA 13 toolkit."""
+    try:
+        from flashinfer.jit.cpp_ext import get_cuda_version
+
+        return get_cuda_version().major >= 13
+    except Exception:
+        return False
+
+
 # Skip decorators
 cute_dsl_available = pytest.mark.skipif(
     not is_cute_dsl_available(), reason="CuteDSL not available"
@@ -62,6 +72,10 @@ cute_dsl_available = pytest.mark.skipif(
 sm120_required = pytest.mark.skipif(
     not _is_sm12x_supported(),
     reason="Requires SM120/SM121 GPU with CUDA 12.8+",
+)
+cuda_13_required = pytest.mark.skipif(
+    not _cuda_13_or_newer(),
+    reason="b12x fused MoE requires CUDA 13 or later",
 )
 
 
@@ -505,6 +519,7 @@ def create_relu2_moe_tensors(
 
 @cute_dsl_available
 @sm120_required
+@cuda_13_required
 class TestB12xFunctional:
     """Tests for the functional API: b12x_fused_moe."""
 
@@ -584,6 +599,7 @@ class TestB12xFunctional:
 
 @cute_dsl_available
 @sm120_required
+@cuda_13_required
 class TestB12xWrapper:
     """Tests for the wrapper API: B12xMoEWrapper."""
 
@@ -764,6 +780,7 @@ class TestB12xWrapper:
 
 @cute_dsl_available
 @sm120_required
+@cuda_13_required
 class TestB12xApiConsistency:
     """Tests verifying consistency between b12x functional and wrapper APIs."""
 
@@ -841,6 +858,7 @@ class TestB12xApiConsistency:
 
 @cute_dsl_available
 @sm120_required
+@cuda_13_required
 class TestMicroKernel:
     """Tests for the micro kernel path (routed_rows <= 20-40).
 
@@ -1041,6 +1059,7 @@ class TestMicroKernel:
 
 @cute_dsl_available
 @sm120_required
+@cuda_13_required
 class TestRelu2Activation:
     """Tests for ReLU2 activation (non-gated, Nemotron-Super)."""
 
