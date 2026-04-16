@@ -3380,6 +3380,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 mask_mode=fmha_v2_mask_mode,
                 save_softmax_stats=False,
             )
+            return out
         elif self._backend == "cute-dsl":
             # These checks live here (not in plan()) because return_lse and
             # scale parameters are run()-time arguments that can vary between
