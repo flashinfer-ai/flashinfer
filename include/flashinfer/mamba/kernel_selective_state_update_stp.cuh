@@ -22,6 +22,7 @@
 
 #include <cmath>
 #include <cuda/barrier>
+#include <type_traits>
 
 #include "../utils.cuh"
 #include "../vec_dtypes.cuh"
@@ -57,18 +58,27 @@ __device__ __forceinline__ int conflict_free_column(int group, int baseCol) {
   return (baseCol + stateValuesPerBank * bankCycle) % colsPerStage;
 }
 
-template <typename input_t, int dim, int dstate>
+template <typename input_t, typename state_scale_t, int rows_per_block, int dstate>
 struct SharedStorageSimple {
-  alignas(alignof(PackedAligned<input_t>)) input_t x[dim];
-  alignas(alignof(PackedAligned<input_t>)) input_t z[dim];
+  static constexpr bool scaleState = !std::is_same_v<state_scale_t, void>;
+  alignas(alignof(PackedAligned<input_t>)) input_t x[rows_per_block];
+  alignas(alignof(PackedAligned<input_t>)) input_t z[rows_per_block];
   alignas(alignof(PackedAligned<input_t>)) input_t B[dstate];
   alignas(alignof(PackedAligned<input_t>)) input_t C[dstate];
-  float out[dim];
+  float out[rows_per_block];
+  alignas(alignof(PackedAligned<float>))
+      std::conditional_t<scaleState, state_scale_t, char> state_scale[rows_per_block];
 };
 
+// Grid: (batch, nheads, cdiv(DIM, ROWS_PER_BLOCK))
+// When ROWS_PER_BLOCK == DIM, degenerates to the non-tiled case (blockIdx.z == 0 always).
+// Used when batch*nheads is too small to saturate the GPU: set ROWS_PER_BLOCK < DIM to
+// split dim across blocks for better occupancy.
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t,
-          typename stateIndex_t, int DIM, int DSTATE, int numWarps>
+          typename stateIndex_t, typename state_scale_t, int DIM, int DSTATE, int ROWS_PER_BLOCK,
+          int numWarps, int PHILOX_ROUNDS>
 __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams params) {
+  constexpr bool scaleState = !std::is_same_v<state_scale_t, void>;
   auto* __restrict__ output = reinterpret_cast<input_t*>(params.output);
   auto* __restrict__ state = reinterpret_cast<state_t*>(params.state);
 
@@ -77,28 +87,55 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
   auto const* __restrict__ A = reinterpret_cast<matrixA_t const*>(params.A);
   auto const* __restrict__ B = reinterpret_cast<input_t const*>(params.B);
   auto const* __restrict__ C = reinterpret_cast<input_t const*>(params.C);
-  auto const* __restrict__ D = reinterpret_cast<weight_t const*>(params.D);  // D: (nheads, dim)
-  auto const* __restrict__ dt_bias = reinterpret_cast<weight_t const*>(params.dt_bias);  // (nheads)
+  auto const* __restrict__ D = reinterpret_cast<weight_t const*>(params.D);
+  auto const* __restrict__ dt_bias = reinterpret_cast<weight_t const*>(params.dt_bias);
   auto const* __restrict__ z = reinterpret_cast<input_t const*>(params.z);
   auto const* __restrict__ state_batch_indices =
       reinterpret_cast<stateIndex_t const*>(params.state_batch_indices);
   bool const dt_softplus = params.dt_softplus;
 
+  // State scale pointer (only used when scaleState == true)
+  [[maybe_unused]] auto* __restrict__ state_scale =
+      reinterpret_cast<state_scale_t*>(params.state_scale);
+
+  // Load device-side Philox seed once into a register
+  [[maybe_unused]] int64_t const rand_seed = params.rand_seed ? *params.rand_seed : 0;
+
   int const nheads = params.nheads;
   int const ngroups = params.ngroups;
 
-  constexpr auto rowsPerWarp = (DIM + numWarps - 1) / numWarps;
+  constexpr auto rowsPerWarp = (ROWS_PER_BLOCK + numWarps - 1) / numWarps;
 
   auto const batch = blockIdx.x;
   auto const head = blockIdx.y;
+  auto const dim_offset = blockIdx.z * ROWS_PER_BLOCK;
   auto const group = head / (nheads / ngroups);
   auto lane = threadIdx.x % warpSize;
   auto warp = threadIdx.y;
 
-  auto const state_batch = (state_batch_indices) ? state_batch_indices[batch] : batch;
-  state += state_batch * params.state_stride_batch + head * DIM * DSTATE;
+  auto const state_batch =
+      state_batch_indices
+          ? static_cast<int64_t>(
+                state_batch_indices[batch * params.state_batch_indices_stride_batch])
+          : static_cast<int64_t>(batch);
+  auto const* __restrict__ dst_sbi =
+      reinterpret_cast<stateIndex_t const*>(params.dst_state_batch_indices);
+  auto const dst_state_batch =
+      dst_sbi ? static_cast<int64_t>(dst_sbi[batch * params.dst_state_batch_indices_stride_batch])
+              : state_batch;
+  auto const state_ptr_offset = state_batch * params.state_stride_batch + head * DIM * DSTATE;
+  state += state_ptr_offset;
+  auto* __restrict__ dst_state = reinterpret_cast<state_t*>(params.state) +
+                                 dst_state_batch * params.state_stride_batch + head * DIM * DSTATE;
+  if constexpr (scaleState) {
+    state_scale += state_batch * params.state_scale_stride_batch + head * DIM;
+  }
+  [[maybe_unused]] auto* __restrict__ dst_state_scale =
+      scaleState ? reinterpret_cast<state_scale_t*>(params.state_scale) +
+                       dst_state_batch * params.state_scale_stride_batch + head * DIM
+                 : nullptr;
 
-  __shared__ SharedStorageSimple<input_t, DIM, DSTATE> sram;
+  __shared__ SharedStorageSimple<input_t, state_scale_t, ROWS_PER_BLOCK, DSTATE> sram;
 
   static constexpr auto stateLoadSize = getVectorLoadSizeForFullUtilization<state_t, DSTATE>();
   using load_state_t = PackedAligned<state_t, stateLoadSize>;
@@ -116,24 +153,34 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
 
   auto d_value = D ? toFloat(D[head]) : 0.f;
 
+  // Load x slice and B (warp 0), z slice and C (warp 1)
   if (warp == 0) {
-    for (auto d = lane * load_input_t::count; d < DIM; d += warpSize * load_input_t::count) {
-      auto* dst = reinterpret_cast<load_input_t*>(&sram.x[d]);
-      *dst = *reinterpret_cast<load_input_t const*>(
-          &x[batch * params.x_stride_batch + head * DIM + d]);
+    for (auto d = lane; d < ROWS_PER_BLOCK; d += warpSize) {
+      if (dim_offset + d < DIM)
+        sram.x[d] = x[batch * params.x_stride_batch + head * DIM + dim_offset + d];
     }
+    if constexpr (scaleState) {
+      for (auto d = lane; d < ROWS_PER_BLOCK; d += warpSize) {
+        if (dim_offset + d < DIM) sram.state_scale[d] = state_scale[dim_offset + d];
+      }
+    }
+  } else if (warp == 1) {
     for (auto i = lane * load_input_t::count; i < DSTATE; i += warpSize * load_input_t::count) {
       auto* dst = reinterpret_cast<load_input_t*>(&sram.B[i]);
       *dst = *reinterpret_cast<load_input_t const*>(
           &B[batch * params.B_stride_batch + group * DSTATE + i]);
     }
-  } else if (warp == 1) {  // Load z, C
-    for (auto d = lane * load_input_t::count; d < DIM; d += warpSize * load_input_t::count) {
-      auto* dst = reinterpret_cast<load_input_t*>(&sram.z[d]);
-      *dst = z ? *reinterpret_cast<load_input_t const*>(
-                     &z[batch * params.z_stride_batch + head * DIM + d])
-               : make_zeros<load_input_t>();
-    }
+  } else if (warp == 2) {
+    if (z)
+      for (auto d = lane; d < ROWS_PER_BLOCK; d += warpSize) {
+        if (dim_offset + d < DIM)
+          sram.z[d] = z[batch * params.z_stride_batch + head * DIM + dim_offset + d];
+      }
+    else
+      for (auto d = lane; d < ROWS_PER_BLOCK; d += warpSize) {
+        if (dim_offset + d < DIM) sram.z[d] = input_t(0);
+      }
+  } else if (warp == 3) {
     for (auto i = lane * load_input_t::count; i < DSTATE; i += warpSize * load_input_t::count) {
       auto* dst = reinterpret_cast<load_input_t*>(&sram.C[i]);
       *dst = *reinterpret_cast<load_input_t const*>(
@@ -143,48 +190,102 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
   __syncthreads();
 
   for (auto _d = warp * rowsPerWarp; _d < (warp + 1) * rowsPerWarp; _d++) {
-    auto d = _d;
+    auto d = dim_offset + _d;
     if (d >= DIM) break;
 
     float x_value = toFloat(sram.x[_d]);
-    float out_value = d_value * x_value * int(lane == 0);  // first lane has the value
+    float state_decode_scale = 1.f;
+    [[maybe_unused]] float new_state_max = std::numeric_limits<float>::lowest();
+    if constexpr (scaleState) {
+      state_decode_scale = toFloat(sram.state_scale[_d]);
+    }
+    float out_value = d_value * x_value * int(lane == 0);
 
-    for (int i = lane * load_state_t::count; i < DSTATE; i += warpSize * load_state_t::count) {
+    // When scaleState, keep new_state values in registers to avoid re-reading gmem
+    // and recomputing in the quantization pass. Each thread covers DSTATE/warpSize elements.
+    [[maybe_unused]] float rNewState[scaleState ? DSTATE / warpSize : 1];
+
+    // update the out value and compute the max state and state sum.
+    // Philox-4x32 produces 4 random ints per call; reuse across up to 4 consecutive elements.
+    // Refresh every time the ii-within-outer-loop crosses a multiple-of-4 boundary.
+    // Works for any count (1, 2, 4, 8, ...): count<=4 refreshes once per outer iter (or less),
+    // count>4 (e.g. count=8 for bf16+DSTATE=256) refreshes count/4 times per outer iter.
+    [[maybe_unused]] uint32_t rand_ints[4];
+    for (int iter = 0, i = lane * load_state_t::count; i < DSTATE;
+         iter++, i += warpSize * load_state_t::count) {
       auto rState = make_zeros<load_state_t>();
       if (state_batch != params.pad_slot_id)
         rState = *reinterpret_cast<load_state_t*>(&state[d * DSTATE + i]);
 
       for (int ii = 0; ii < load_state_t::count; ii++) {
-        auto state_value = toFloat(rState.val[ii]);
+        if constexpr (PHILOX_ROUNDS > 0 && !scaleState) {
+          if (ii % 4 == 0)
+            philox_randint4x<PHILOX_ROUNDS>(rand_seed, state_ptr_offset + d * DSTATE + i + ii,
+                                            rand_ints[0], rand_ints[1], rand_ints[2], rand_ints[3]);
+        }
+
+        auto state_value = toFloat(rState.val[ii]) * state_decode_scale;
         auto B_value = toFloat(sram.B[i + ii]);
         auto C_value = toFloat(sram.C[i + ii]);
 
         auto const dB = B_value * dt_value;
         auto const new_state = state_value * dA + dB * x_value;
-
-        convertAndStore(&rState.val[ii], new_state);
+        if constexpr (scaleState) {
+          new_state_max = fmaxf(new_state_max, fabsf(new_state));
+          rNewState[iter * load_state_t::count + ii] = new_state;
+        } else if constexpr (PHILOX_ROUNDS > 0) {
+          rState.val[ii] = cvt_rs_f16_f32(new_state, rand_ints[ii % 4] & 0x1FFFu);
+        } else {
+          convertAndStore(&rState.val[ii], new_state);
+        }
 
         out_value += new_state * C_value;
       }
-      if (params.update_state && state_batch != params.pad_slot_id)
-        *reinterpret_cast<load_state_t*>(&state[d * DSTATE + i]) = rState;
+      if (!scaleState && params.update_state && state_batch != params.pad_slot_id) {
+        *reinterpret_cast<load_state_t*>(&dst_state[d * DSTATE + i]) = rState;
+      }
     }
-
-    // warpReduce the out_value
     out_value = warpReduceSum(out_value);
     if (lane == 0) {
       sram.out[_d] = out_value;
+    }
+
+    if constexpr (scaleState) {
+      if (params.update_state && state_batch != params.pad_slot_id) {
+        new_state_max = warpReduceMax(new_state_max);
+        new_state_max = __shfl_sync(UINT32_MAX, new_state_max, 0);  // broadcast to all lanes
+        float const new_state_encode_scale =
+            (new_state_max == 0.f)
+                ? 1.f
+                : static_cast<float>(std::numeric_limits<state_t>::max()) / new_state_max;
+        float const new_state_decode_scale = 1.f / new_state_encode_scale;
+
+        for (int iter = 0, i = lane * load_state_t::count; i < DSTATE;
+             iter++, i += warpSize * load_state_t::count) {
+          auto rState = make_zeros<load_state_t>();
+          for (int ii = 0; ii < load_state_t::count; ii++) {
+            convertAndStore(&rState.val[ii],
+                            rNewState[iter * load_state_t::count + ii] * new_state_encode_scale);
+          }
+          *reinterpret_cast<load_state_t*>(&dst_state[d * DSTATE + i]) = rState;
+        }
+
+        if (lane == 0) {
+          convertAndStore(&sram.state_scale[_d], new_state_decode_scale);
+        }
+      }
     }
   }
 
   __syncthreads();
 
   for (int l = lane; l < rowsPerWarp; l += warpSize) {
-    auto d = warp * rowsPerWarp + l;
+    auto _d = warp * rowsPerWarp + l;
+    auto d = dim_offset + _d;
     if (d < DIM) {
-      auto out_value = sram.out[d];
+      auto out_value = sram.out[_d];
       if (z) {
-        float z_value = toFloat(sram.z[d]);
+        float z_value = toFloat(sram.z[_d]);
         float sig_z = __fdividef(1.f, (1.f + __expf(0.f - z_value)));
         float silu_z = z_value * sig_z;
         out_value *= silu_z;
@@ -192,17 +293,30 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
       convertAndStore(&output[batch * params.out_stride_batch + head * DIM + d], out_value);
     }
   }
+  if constexpr (scaleState) {
+    if (params.update_state && state_batch != params.pad_slot_id) {
+      for (int l = lane; l < rowsPerWarp; l += warpSize) {
+        auto _d = warp * rowsPerWarp + l;
+        auto d = dim_offset + _d;
+        if (d < DIM) {
+          dst_state_scale[d] = sram.state_scale[_d];
+        }
+      }
+    }
+  }
 }
 
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t,
-          int rowsPerStage, int dim, int dstate, uint8_t numStages>
+          typename state_scale_t, int rowsPerStage, int dim, int dstate, uint8_t numStages>
 struct SharedStorageVertical {
+  static constexpr bool scaleState = !std::is_same_v<state_scale_t, void>;
   alignas(128) state_t state[numStages][rowsPerStage * dstate];
   alignas(alignof(PackedAligned<input_t>)) input_t x[dim];
   alignas(alignof(PackedAligned<input_t>)) input_t z[dim];
   alignas(alignof(PackedAligned<input_t>)) input_t B[dstate];
   alignas(alignof(PackedAligned<input_t>)) input_t C[dstate];
-  float out[dim];  // dt is special cause we're gonna store input in there as well
+  float out[dim];
+  alignas(128) std::conditional_t<scaleState, state_scale_t, char> state_scale[dim * scaleState];
 
   using barrier_t = cuda::barrier<cuda::thread_scope_block>;
   barrier_t bar_empty[numStages];
@@ -210,10 +324,14 @@ struct SharedStorageVertical {
   barrier_t bar_consumers;
 };
 
-template <typename state_t, int DIM, int DSTATE, int rowsPerStage, int numStages, bool readState,
-          bool writeState, typename SramT>
-__device__ __forceinline__ void producer_func_vertical(SramT& sram, CUtensorMap const& tensorState,
-                                                       int batch, int head) {
+template <typename input_t, typename state_t, typename state_scale_t, int DIM, int DSTATE,
+          int rowsPerStage, int numStages, bool readState, bool writeState, bool hasZ,
+          typename SramT>
+__device__ __forceinline__ void producer_func_vertical(
+    SramT& sram, CUtensorMap const& tensorState, input_t const* x_global_ptr,
+    input_t const* B_global_ptr, input_t const* C_global_ptr, input_t const* z_global_ptr,
+    [[maybe_unused]] void const* state_scale_ptr, int batch, int dst_batch, int head) {
+  constexpr bool scaleState = !std::is_same_v<state_scale_t, void>;
 #ifdef FLASHINFER_MAMBA_ENABLE_SM90
   namespace cde = cuda::device::experimental;
 
@@ -222,11 +340,55 @@ __device__ __forceinline__ void producer_func_vertical(SramT& sram, CUtensorMap 
   auto constexpr stagesWriteOnly = numStages;
 
   auto constexpr bytesState = rowsPerStage * DSTATE * sizeof(state_t);
-  auto constexpr bytesToArrive = bytesState;
+  auto constexpr bytesX = DIM * sizeof(input_t);
+  auto constexpr bytesB = DSTATE * sizeof(input_t);
+  auto constexpr bytesC = DSTATE * sizeof(input_t);
+  auto constexpr bytesZ = hasZ ? DIM * sizeof(input_t) : 0;
+  auto constexpr bytesStateScale = []() constexpr {
+    if constexpr (scaleState)
+      return DIM * sizeof(state_scale_t);
+    else
+      return size_t(0);
+  }();
+  auto constexpr bytesInputs = bytesX + bytesB + bytesC + bytesZ + bytesStateScale;
 
-  // Phase 1: Read only (filling the pipeline)
+  // Phase 1, iter 0: fire all input vector loads + state load (if readState)
+  // All inputs piggyback onto bar_full[0] so consumers get them before stage 0
+  {
+    constexpr auto stage = 0;
+    constexpr auto d = 0;
+
+    sram.bar_empty[stage].wait(sram.bar_empty[stage].arrive());
+
+    cuda::device::memcpy_async_tx(&sram.x[0], x_global_ptr, cuda::aligned_size_t<16>(bytesX),
+                                  sram.bar_full[stage]);
+    cuda::device::memcpy_async_tx(&sram.B[0], B_global_ptr, cuda::aligned_size_t<16>(bytesB),
+                                  sram.bar_full[stage]);
+    cuda::device::memcpy_async_tx(&sram.C[0], C_global_ptr, cuda::aligned_size_t<16>(bytesC),
+                                  sram.bar_full[stage]);
+    if constexpr (hasZ) {
+      cuda::device::memcpy_async_tx(&sram.z[0], z_global_ptr, cuda::aligned_size_t<16>(bytesZ),
+                                    sram.bar_full[stage]);
+    }
+    if constexpr (scaleState) {
+      cuda::device::memcpy_async_tx(
+          &sram.state_scale[0], static_cast<state_scale_t const*>(state_scale_ptr),
+          cuda::aligned_size_t<16>(bytesStateScale), sram.bar_full[stage]);
+    }
+
+    if constexpr (readState) {
+      cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.state[stage][0], &tensorState, 0, d, head,
+                                                    batch, sram.bar_full[stage]);
+      auto const _ =
+          cuda::device::barrier_arrive_tx(sram.bar_full[stage], 1, bytesState + bytesInputs);
+    } else {
+      auto const _ = cuda::device::barrier_arrive_tx(sram.bar_full[stage], 1, bytesInputs);
+    }
+  }
+
+  // Phase 1, iter 1..stagesReadOnly-1: state only (x already in flight)
 #pragma unroll
-  for (int iter = 0; iter < stagesReadOnly; ++iter) {
+  for (int iter = 1; iter < stagesReadOnly; ++iter) {
     auto const stage = iter % numStages;
     auto const d = iter * rowsPerStage;
 
@@ -235,8 +397,7 @@ __device__ __forceinline__ void producer_func_vertical(SramT& sram, CUtensorMap 
     if constexpr (readState) {
       cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.state[stage][0], &tensorState, 0, d, head,
                                                     batch, sram.bar_full[stage]);
-
-      auto const _ = cuda::device::barrier_arrive_tx(sram.bar_full[stage], 1, bytesToArrive);
+      auto const _ = cuda::device::barrier_arrive_tx(sram.bar_full[stage], 1, bytesState);
     } else {
       auto const _ = sram.bar_full[stage].arrive();
     }
@@ -256,7 +417,7 @@ __device__ __forceinline__ void producer_func_vertical(SramT& sram, CUtensorMap 
       cde::fence_proxy_async_shared_cta();
       // Writeback
       if constexpr (writeState) {
-        cde::cp_async_bulk_tensor_4d_shared_to_global(&tensorState, 0, d_write, head, batch,
+        cde::cp_async_bulk_tensor_4d_shared_to_global(&tensorState, 0, d_write, head, dst_batch,
                                                       &sram.state[stage][0]);
 
         cde::cp_async_bulk_commit_group();
@@ -267,7 +428,7 @@ __device__ __forceinline__ void producer_func_vertical(SramT& sram, CUtensorMap 
       if constexpr (readState) {
         cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.state[stage][0], &tensorState, 0,
                                                       d_read, head, batch, sram.bar_full[stage]);
-        auto const _ = cuda::device::barrier_arrive_tx(sram.bar_full[stage], 1, bytesToArrive);
+        auto const _ = cuda::device::barrier_arrive_tx(sram.bar_full[stage], 1, bytesState);
       } else {
         auto const _ = sram.bar_full[stage].arrive();
       }
@@ -287,7 +448,7 @@ __device__ __forceinline__ void producer_func_vertical(SramT& sram, CUtensorMap 
     if constexpr (writeState) {
       // Unblock async proxy for writeback
       cde::fence_proxy_async_shared_cta();
-      cde::cp_async_bulk_tensor_4d_shared_to_global(&tensorState, 0, d_write, head, batch,
+      cde::cp_async_bulk_tensor_4d_shared_to_global(&tensorState, 0, d_write, head, dst_batch,
                                                     &sram.state[stage][0]);
 
       cde::cp_async_bulk_commit_group();
@@ -297,12 +458,15 @@ __device__ __forceinline__ void producer_func_vertical(SramT& sram, CUtensorMap 
 #endif
 }
 
-template <typename input_t, typename weight_t, typename matrixA_t, typename state_t, int DIM,
-          int DSTATE, int consumerWarps, int rowsPerStage, int numStages, bool useStateCache>
+template <typename input_t, typename weight_t, typename matrixA_t, typename state_t,
+          typename state_scale_t, int DIM, int DSTATE, int consumerWarps, int rowsPerStage,
+          int numStages, bool useStateCache, int PHILOX_ROUNDS>
 __device__ __forceinline__ void consumer_func_vertical(
     int lane, int warp, float d_value, float dt_value, float dA,
-    SharedStorageVertical<input_t, weight_t, matrixA_t, state_t, rowsPerStage, DIM, DSTATE,
-                          numStages>& sram) {
+    SharedStorageVertical<input_t, weight_t, matrixA_t, state_t, state_scale_t, rowsPerStage, DIM,
+                          DSTATE, numStages>& sram,
+    int64_t rand_seed, [[maybe_unused]] int64_t state_ptr_offset) {
+  constexpr bool scaleState = !std::is_same_v<state_scale_t, void>;
 #ifdef FLASHINFER_MAMBA_ENABLE_SM90
   namespace cde = cuda::device::experimental;
   for (auto dBegin = 0, stage = 0; dBegin < DIM;
@@ -319,8 +483,22 @@ __device__ __forceinline__ void consumer_func_vertical(
       constexpr auto bankSize = sizeof(uint32_t);
       constexpr auto stateValuesPerBank = bankSize / sizeof(state_t);
 
+      [[maybe_unused]] float state_decode_scale = 1.f;
+      [[maybe_unused]] float new_state_max = std::numeric_limits<float>::lowest();
+      if constexpr (scaleState) {
+        state_decode_scale = toFloat(sram.state_scale[d]);
+      }
+      // Register buffer for 2-pass quantization (min size 1 to avoid zero-sized array in device
+      // code)
+      [[maybe_unused]] float rNewState[scaleState ? DSTATE / warpSize : 1];
+
+      // Philox-4x32 produces 4 random ints per call; reuse across up to 4 consecutive elements.
+      // Refresh when e % 4 == 0. stateValuesPerBank is constexpr so all branches compile away.
+      [[maybe_unused]] uint32_t rand_ints[4];
       if constexpr (sizeof(state_t) == sizeof(input_t)) {
-        for (int i = lane * stateValuesPerBank; i < DSTATE; i += warpSize * stateValuesPerBank) {
+        for (int iter = 0, i = lane * stateValuesPerBank; i < DSTATE;
+             iter++, i += warpSize * stateValuesPerBank) {
+          // load a bank-worth of states
           auto* sState_ptr = reinterpret_cast<uint32_t*>(&sram.state[stage][dd * DSTATE + i]);
           uint32_t rState = *sState_ptr;
           auto* rState_ptr = reinterpret_cast<state_t*>(&rState);
@@ -332,11 +510,21 @@ __device__ __forceinline__ void consumer_func_vertical(
           auto* rC_ptr = reinterpret_cast<input_t const*>(&rC);
 
           for (int e = 0; e < stateValuesPerBank; e++) {
+            if constexpr (PHILOX_ROUNDS > 0 && !scaleState) {
+              if (e % 4 == 0)
+                philox_randint4x<PHILOX_ROUNDS>(rand_seed, state_ptr_offset + d * DSTATE + i + e,
+                                                rand_ints[0], rand_ints[1], rand_ints[2],
+                                                rand_ints[3]);
+            }
+
             float state_value;
             if constexpr (!useStateCache) {
               state_value = 0.f;
             } else {
               state_value = toFloat(rState_ptr[e]);
+              if constexpr (scaleState) {
+                state_value *= state_decode_scale;
+              }
             }
             auto const B_value = toFloat(rB_ptr[e]);
             auto const C_value = toFloat(rC_ptr[e]);
@@ -344,39 +532,95 @@ __device__ __forceinline__ void consumer_func_vertical(
             auto const dB = B_value * dt_value;
             auto const new_state = state_value * dA + dB * x_value;
 
-            convertAndStore(&rState_ptr[e], new_state);
+            if constexpr (scaleState) {
+              new_state_max = fmaxf(new_state_max, fabsf(new_state));
+              rNewState[iter * stateValuesPerBank + e] = new_state;
+            } else if constexpr (PHILOX_ROUNDS > 0) {
+              rState_ptr[e] = cvt_rs_f16_f32(new_state, rand_ints[e % 4] & 0x1FFFu);
+            } else {
+              convertAndStore(&rState_ptr[e], new_state);
+            }
             out_value += new_state * C_value;
           }
-          *sState_ptr = rState;
+          if constexpr (!scaleState) {
+            *sState_ptr = rState;
+          }
         }
       } else {
-        for (int i = lane * stateValuesPerBank; i < DSTATE; i += warpSize * stateValuesPerBank) {
+        for (int iter = 0, i = lane * stateValuesPerBank; i < DSTATE;
+             iter++, i += warpSize * stateValuesPerBank) {
           auto* sState_ptr = reinterpret_cast<uint32_t*>(&sram.state[stage][dd * DSTATE + i]);
           uint32_t rState = *sState_ptr;
           auto* rState_ptr = reinterpret_cast<state_t*>(&rState);
 
           for (int e = 0; e < stateValuesPerBank; e++) {
+            if constexpr (PHILOX_ROUNDS > 0 && !scaleState) {
+              if (e % 4 == 0)
+                philox_randint4x<PHILOX_ROUNDS>(rand_seed, state_ptr_offset + d * DSTATE + i + e,
+                                                rand_ints[0], rand_ints[1], rand_ints[2],
+                                                rand_ints[3]);
+            }
+
             float state_value;
             if constexpr (!useStateCache) {
               state_value = 0.f;
             } else {
               state_value = toFloat(rState_ptr[e]);
+              if constexpr (scaleState) {
+                state_value *= state_decode_scale;
+              }
             }
             auto const B_value = toFloat(sram.B[i + e]);
             auto const C_value = toFloat(sram.C[i + e]);
             auto const dB = B_value * dt_value;
             auto const new_state = state_value * dA + dB * x_value;
 
-            convertAndStore(&rState_ptr[e], new_state);
+            if constexpr (scaleState) {
+              new_state_max = fmaxf(new_state_max, fabsf(new_state));
+              rNewState[iter * stateValuesPerBank + e] = new_state;
+            } else if constexpr (PHILOX_ROUNDS > 0) {
+              rState_ptr[e] = cvt_rs_f16_f32(new_state, rand_ints[e % 4] & 0x1FFFu);
+            } else {
+              convertAndStore(&rState_ptr[e], new_state);
+            }
             out_value += new_state * C_value;
           }
-          *sState_ptr = rState;
+          if constexpr (!scaleState) {
+            *sState_ptr = rState;
+          }
         }
       }
 
       out_value = warpReduceSum(out_value);
       if (lane == 0) {
         sram.out[d] = out_value;
+      }
+
+      // 2nd pass: quantize new state values and write back to sram for TMA writeback
+      if constexpr (scaleState && useStateCache) {
+        new_state_max = warpReduceMax(new_state_max);
+        new_state_max = __shfl_sync(UINT32_MAX, new_state_max, 0);
+        float const new_encode_scale =
+            (new_state_max == 0.f)
+                ? 1.f
+                : static_cast<float>(std::numeric_limits<state_t>::max()) / new_state_max;
+        float const new_decode_scale = 1.f / new_encode_scale;
+
+        for (int iter = 0, i = lane * stateValuesPerBank; i < DSTATE;
+             iter++, i += warpSize * stateValuesPerBank) {
+          auto* sState_ptr = reinterpret_cast<uint32_t*>(&sram.state[stage][dd * DSTATE + i]);
+          uint32_t rState;
+          auto* rState_ptr = reinterpret_cast<state_t*>(&rState);
+          for (int e = 0; e < stateValuesPerBank; e++) {
+            convertAndStore(&rState_ptr[e],
+                            rNewState[iter * stateValuesPerBank + e] * new_encode_scale);
+          }
+          *sState_ptr = rState;
+        }
+
+        if (lane == 0) {
+          convertAndStore(&sram.state_scale[d], new_decode_scale);
+        }
       }
     }
 
@@ -388,10 +632,11 @@ __device__ __forceinline__ void consumer_func_vertical(
 }
 
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t,
-          typename stateIndex_t, int DIM, int DSTATE, int consumerWarps, int rowsPerStage,
-          int numStages = 1>
+          typename stateIndex_t, typename state_scale_t, int DIM, int DSTATE, int PHILOX_ROUNDS,
+          int consumerWarps = 1, int rowsPerStage = 4, int numStages = 1>
 __global__ void selective_state_update_kernel_producer_consumer_vertical(
     SelectiveStateUpdateParams params, __grid_constant__ CUtensorMap const tensorState) {
+  constexpr bool scaleState = !std::is_same_v<state_scale_t, void>;
 #ifdef FLASHINFER_MAMBA_ENABLE_SM90
   auto* __restrict__ output = reinterpret_cast<input_t*>(params.output);
 
@@ -405,6 +650,11 @@ __global__ void selective_state_update_kernel_producer_consumer_vertical(
   auto const* __restrict__ z = reinterpret_cast<input_t const*>(params.z);
   auto const* __restrict__ state_batch_indices =
       reinterpret_cast<stateIndex_t const*>(params.state_batch_indices);
+  [[maybe_unused]] auto* __restrict__ state_scale =
+      reinterpret_cast<state_scale_t*>(params.state_scale);
+
+  // Load device-side Philox seed once into a register
+  [[maybe_unused]] int64_t const rand_seed = params.rand_seed ? *params.rand_seed : 0;
 
   int const nheads = params.nheads;
   int const ngroups = params.ngroups;
@@ -417,11 +667,25 @@ __global__ void selective_state_update_kernel_producer_consumer_vertical(
   auto lane = threadIdx.x % warpSize;
   auto warp = threadIdx.y;
 
-  auto const state_batch = (state_batch_indices) ? state_batch_indices[batch] : batch;
+  auto const state_batch =
+      state_batch_indices
+          ? static_cast<int64_t>(
+                __ldg(&state_batch_indices[batch * params.state_batch_indices_stride_batch]))
+          : static_cast<int64_t>(batch);
+  auto const* __restrict__ dst_sbi =
+      reinterpret_cast<stateIndex_t const*>(params.dst_state_batch_indices);
+  auto const dst_state_batch =
+      dst_sbi ? static_cast<int64_t>(
+                    __ldg(&dst_sbi[batch * params.dst_state_batch_indices_stride_batch]))
+              : state_batch;
+  auto const state_ptr_offset =
+      static_cast<int64_t>(state_batch) * params.state_stride_batch + head * DIM * DSTATE;
+  auto const dst_state_ptr_offset =
+      static_cast<int64_t>(dst_state_batch) * params.state_stride_batch + head * DIM * DSTATE;
 
   extern __shared__ uint8_t sbuffer[];
-  using sram_t = SharedStorageVertical<input_t, weight_t, matrixA_t, state_t, rowsPerStage, DIM,
-                                       DSTATE, numStages>;
+  using sram_t = SharedStorageVertical<input_t, weight_t, matrixA_t, state_t, state_scale_t,
+                                       rowsPerStage, DIM, DSTATE, numStages>;
   auto& sram = *reinterpret_cast<sram_t*>(sbuffer);
 
   namespace cde = cuda::device::experimental;
@@ -447,21 +711,37 @@ __global__ void selective_state_update_kernel_producer_consumer_vertical(
     auto const write_state = read_state && params.update_state;
 
     if (lane == 0) {
-      cg::invoke_one(cg::coalesced_threads(), [&]() {
+      auto const* x_global_ptr = &x[batch * params.x_stride_batch + head * DIM];
+      auto const* B_global_ptr = &B[batch * params.B_stride_batch + group * DSTATE];
+      auto const* C_global_ptr = &C[batch * params.C_stride_batch + group * DSTATE];
+      auto const* z_global_ptr = z ? &z[batch * params.z_stride_batch + head * DIM] : nullptr;
+      [[maybe_unused]] void const* state_scale_ptr = nullptr;
+      if constexpr (scaleState) {
+        state_scale_ptr = &state_scale[state_batch * params.state_scale_stride_batch + head * DIM];
+      }
+      auto const call = [&]<bool readState, bool writeState, bool hasZ>() {
+        producer_func_vertical<input_t, state_t, state_scale_t, DIM, DSTATE, rowsPerStage,
+                               numStages, readState, writeState, hasZ>(
+            sram, tensorState, x_global_ptr, B_global_ptr, C_global_ptr,
+            hasZ ? z_global_ptr : nullptr, state_scale_ptr, state_batch, dst_state_batch, head);
+      };
+      auto const dispatch_state = [&]<bool hasZ>() {
         if (read_state && write_state)
-          producer_func_vertical<state_t, DIM, DSTATE, rowsPerStage, numStages, true, true>(
-              sram, tensorState, state_batch, head);
-        else if (read_state && !write_state)
-          producer_func_vertical<state_t, DIM, DSTATE, rowsPerStage, numStages, true, false>(
-              sram, tensorState, state_batch, head);
+          call.template operator()<true, true, hasZ>();
+        else if (read_state)
+          call.template operator()<true, false, hasZ>();
         else
-          producer_func_vertical<state_t, DIM, DSTATE, rowsPerStage, numStages, false, false>(
-              sram, tensorState, state_batch, head);
+          call.template operator()<false, false, hasZ>();
+      };
+
+      cg::invoke_one(cg::coalesced_threads(), [&]() {
+        if (z_global_ptr)
+          dispatch_state.template operator()<true>();
+        else
+          dispatch_state.template operator()<false>();
       });
     }
   } else {  // consumers
-
-    using load_t = PackedAligned<input_t>;
 
 #pragma unroll
     // Unblock the producer
@@ -469,56 +749,29 @@ __global__ void selective_state_update_kernel_producer_consumer_vertical(
       auto const _ = sram.bar_empty[stage].arrive();
     }
 
-    // Load A
-    auto const A_value = toFloat(A[head]);
+    // Load A, D, dt, dt_bias via __ldg (read-only texture cache) —
+    // these are broadcast scalars read once per block.
+    auto const A_value = toFloat(__ldg(&A[head]));
 
-    // Load D
-    auto const d_value = D ? toFloat(D[head]) : 0.f;
+    auto const d_value = D ? toFloat(__ldg(&D[head])) : 0.f;
 
-    // load dt_value
-    auto dt_value = toFloat(dt[batch * params.dt_stride_batch + head]);
-    if (dt_bias) dt_value += toFloat(dt_bias[head]);
+    auto dt_value = toFloat(__ldg(&dt[batch * params.dt_stride_batch + head]));
+    if (dt_bias) dt_value += toFloat(__ldg(&dt_bias[head]));
     if (params.dt_softplus) {
       dt_value = thresholded_softplus(dt_value);
     }
     auto const dA = __expf(A_value * dt_value);
 
-    if (warp == 0) {  // Load x, B
-      for (auto d = lane * load_t::count; d < DIM; d += warpSize * load_t::count) {
-        auto* dst = reinterpret_cast<load_t*>(&sram.x[d]);
-        *dst = *reinterpret_cast<load_t const*>(&x[batch * params.x_stride_batch + head * DIM + d]);
-      }
-      for (auto i = lane * load_t::count; i < DSTATE; i += warpSize * load_t::count) {
-        auto* dst = reinterpret_cast<load_t*>(&sram.B[i]);
-        *dst = *reinterpret_cast<load_t const*>(
-            &B[batch * params.B_stride_batch + group * DSTATE + i]);
-      }
-    } else if (warp == 1) {  // Load z, C
-      for (auto d = lane * load_t::count; d < DIM; d += warpSize * load_t::count) {
-        auto* dst = reinterpret_cast<load_t*>(&sram.z[d]);
-        *dst =
-            z ? *reinterpret_cast<load_t const*>(&z[batch * params.z_stride_batch + head * DIM + d])
-              : make_zeros<load_t>();
-      }
-      for (auto i = lane * load_t::count; i < DSTATE; i += warpSize * load_t::count) {
-        auto* dst = reinterpret_cast<load_t*>(&sram.C[i]);
-        *dst = *reinterpret_cast<load_t const*>(
-            &C[batch * params.C_stride_batch + group * DSTATE + i]);
-      }
-    }
-
-    sram.bar_consumers.wait(sram.bar_consumers.arrive());
-
     if (state_batch != params.pad_slot_id)
-      consumer_func_vertical<input_t, weight_t, matrixA_t, state_t, DIM, DSTATE, consumerWarps,
-                             rowsPerStage, numStages, true>(lane, warp, d_value, dt_value, dA,
-                                                            sram);
+      consumer_func_vertical<input_t, weight_t, matrixA_t, state_t, state_scale_t, DIM, DSTATE,
+                             consumerWarps, rowsPerStage, numStages, true, PHILOX_ROUNDS>(
+          lane, warp, d_value, dt_value, dA, sram, rand_seed, state_ptr_offset);
     else
-      consumer_func_vertical<input_t, weight_t, matrixA_t, state_t, DIM, DSTATE, consumerWarps,
-                             rowsPerStage, numStages, false>(lane, warp, d_value, dt_value, dA,
-                                                             sram);
+      consumer_func_vertical<input_t, weight_t, matrixA_t, state_t, state_scale_t, DIM, DSTATE,
+                             consumerWarps, rowsPerStage, numStages, false, PHILOX_ROUNDS>(
+          lane, warp, d_value, dt_value, dA, sram, rand_seed, state_ptr_offset);
 
-    // Write output
+    // Write output — wait for all consumer warps to finish writing sram.out
     sram.bar_consumers.wait(sram.bar_consumers.arrive());
     auto d = warp * warpSize + lane;
     if (d < DIM) {
@@ -531,15 +784,19 @@ __global__ void selective_state_update_kernel_producer_consumer_vertical(
       }
       convertAndStore(&output[batch * params.out_stride_batch + head * DIM + d], out_value);
     }
+    if constexpr (scaleState) {
+      if (params.update_state && state_batch != params.pad_slot_id) {
+        if (d < DIM) {
+          state_scale[dst_state_batch * params.state_scale_stride_batch + head * DIM + d] =
+              sram.state_scale[d];
+        }
+      }
+    }
   }
 #endif
 }
 
-// =============================================================================
-// Horizontal Producer-Consumer Kernel for SM100+ (Blackwell and newer)
-// =============================================================================
-
-#ifdef FLASHINFER_MAMBA_ENABLE_SM100
+#ifdef FLASHINFER_MAMBA_ENABLE_SM90
 
 template <typename input_t, typename weight_t, typename matrixA_t,
           typename state_t,  //
@@ -559,7 +816,7 @@ template <typename state_t, int DIM, int DSTATE, int colsPerStage, int numStages
           bool writeState, typename SramT>
 __device__ __forceinline__ void producer_func_horizontal(SramT& sram,
                                                          CUtensorMap const& tensorState, int batch,
-                                                         int head) {
+                                                         int dst_batch, int head) {
   namespace cde = cuda::device::experimental;
 
   auto constexpr stagesReadOnly = numStages;
@@ -600,7 +857,7 @@ __device__ __forceinline__ void producer_func_horizontal(SramT& sram,
       cde::fence_proxy_async_shared_cta();
       // Writeback
       if constexpr (writeState) {
-        cde::cp_async_bulk_tensor_4d_shared_to_global(&tensorState, i_write, 0, head, batch,
+        cde::cp_async_bulk_tensor_4d_shared_to_global(&tensorState, i_write, 0, head, dst_batch,
                                                       &sram.state[stage][0]);
         cde::cp_async_bulk_commit_group();
         cde::cp_async_bulk_wait_group_read<0>();
@@ -630,7 +887,7 @@ __device__ __forceinline__ void producer_func_horizontal(SramT& sram,
     if constexpr (writeState) {
       // Unblock async proxy for writeback
       cde::fence_proxy_async_shared_cta();
-      cde::cp_async_bulk_tensor_4d_shared_to_global(&tensorState, i_write, 0, head, batch,
+      cde::cp_async_bulk_tensor_4d_shared_to_global(&tensorState, i_write, 0, head, dst_batch,
                                                     &sram.state[stage][0]);
       cde::cp_async_bulk_commit_group();
       cde::cp_async_bulk_wait_group_read<0>();
@@ -639,12 +896,13 @@ __device__ __forceinline__ void producer_func_horizontal(SramT& sram,
 }
 
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t, int DIM,
-          int DSTATE, int consumerWarps, int colsPerStage, int numStages, bool useStateCache>
+          int DSTATE, int PHILOX_ROUNDS, int consumerWarps, int colsPerStage, int numStages,
+          bool useStateCache>
 __device__ __forceinline__ void consumer_func_horizontal(
     int d, int member, float A_value, float dt_value, float x_value,
     SharedStorageHorizontal<input_t, weight_t, matrixA_t, state_t, DIM, DSTATE, colsPerStage,
                             numStages>& sram,
-    float& out_value) {
+    float& out_value, int64_t rand_seed, [[maybe_unused]] int64_t state_ptr_offset) {
   namespace cde = cuda::device::experimental;
   constexpr auto lanesPerRow = (consumerWarps * warpSize) / DIM;
   constexpr auto itemsPerThread = colsPerStage / lanesPerRow;
@@ -659,12 +917,15 @@ __device__ __forceinline__ void consumer_func_horizontal(
     constexpr auto bankSize = sizeof(uint32_t);
     constexpr auto stateValuesPerBank = bankSize / sizeof(state_t);
     constexpr auto numBanks = 32;
+    // Philox-4x32 produces 4 random ints per call; reuse across up to 4 consecutive elements.
+    // flat_e tracks position across outer+inner loops; refresh every 4 elements.
+    // Loop is fully unrolled (#pragma unroll), so the modulo and branch compile away.
+    [[maybe_unused]] uint32_t rand_ints[4];
     if constexpr (sizeof(state_t) == sizeof(input_t)) {
 #pragma unroll
       for (int item = 0; item < itemsPerThread; item += stateValuesPerBank) {
         auto const baseCol = item + member * itemsPerThread;
         // If I just use baseCol as the index, a lot of bank conflicts will arise.
-        //
         auto const ii =
             conflict_free_column<colsPerStage, stateValuesPerBank, numBanks>(group, baseCol);
 
@@ -681,6 +942,14 @@ __device__ __forceinline__ void consumer_func_horizontal(
         auto* rC_ptr = reinterpret_cast<input_t const*>(&rC);
 
         for (int e = 0; e < stateValuesPerBank; e++) {
+          int flat_e = item + e;
+          if constexpr (PHILOX_ROUNDS > 0) {
+            if (flat_e % 4 == 0)
+              philox_randint4x<PHILOX_ROUNDS>(rand_seed, state_ptr_offset + d * DSTATE + i + e,
+                                              rand_ints[0], rand_ints[1], rand_ints[2],
+                                              rand_ints[3]);
+          }
+
           float state_value;
           if constexpr (!useStateCache) {
             state_value = 0.f;
@@ -695,12 +964,18 @@ __device__ __forceinline__ void consumer_func_horizontal(
           auto const dB = B_value * dt_value;
           auto const new_state = state_value * dA + dB * x_value;
 
-          convertAndStore(&rState_ptr[e], new_state);
+          // TODO: when stateValuesPerBank == 2, could use cvt_rs_f16x2_f32 for both at once
+          if constexpr (PHILOX_ROUNDS > 0) {
+            rState_ptr[e] = cvt_rs_f16_f32(new_state, rand_ints[flat_e % 4] & 0x1FFFu);
+          } else {
+            convertAndStore(&rState_ptr[e], new_state);
+          }
           out_value += new_state * C_value;
         }
         *sState_ptr = rState;
       }
     } else {
+#pragma unroll
       for (int item = 0; item < itemsPerThread; item += stateValuesPerBank) {
         auto const baseCol = item + member * itemsPerThread;
         auto const ii =
@@ -712,6 +987,14 @@ __device__ __forceinline__ void consumer_func_horizontal(
         auto* rState_ptr = reinterpret_cast<state_t*>(&rState);
 
         for (int e = 0; e < stateValuesPerBank; e++) {
+          int flat_e = item + e;
+          if constexpr (PHILOX_ROUNDS > 0) {
+            if (flat_e % 4 == 0)
+              philox_randint4x<PHILOX_ROUNDS>(rand_seed, state_ptr_offset + d * DSTATE + i + e,
+                                              rand_ints[0], rand_ints[1], rand_ints[2],
+                                              rand_ints[3]);
+          }
+
           float state_value;
           if constexpr (!useStateCache) {
             state_value = 0.f;
@@ -726,7 +1009,12 @@ __device__ __forceinline__ void consumer_func_horizontal(
           auto const dB = B_value * dt_value;
           auto const new_state = state_value * dA + dB * x_value;
 
-          convertAndStore(&rState_ptr[e], new_state);
+          // TODO: when stateValuesPerBank == 2, could use cvt_rs_f16x2_f32 for both at once
+          if constexpr (PHILOX_ROUNDS > 0) {
+            rState_ptr[e] = cvt_rs_f16_f32(new_state, rand_ints[flat_e % 4] & 0x1FFFu);
+          } else {
+            convertAndStore(&rState_ptr[e], new_state);
+          }
           out_value += new_state * C_value;
         }
         *sState_ptr = rState;
@@ -738,8 +1026,8 @@ __device__ __forceinline__ void consumer_func_horizontal(
 }
 
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t,
-          typename stateIndex_t, int DIM, int DSTATE, int consumerWarps, int colsPerStage,
-          int headsGroupsRatio, int numStages = 1>
+          typename stateIndex_t, int DIM, int DSTATE, int PHILOX_ROUNDS, int headsGroupsRatio,
+          int consumerWarps, int colsPerStage, int numStages = 1>
 __global__ void selective_state_update_kernel_producer_consumer_horizontal(
     SelectiveStateUpdateParams params, __grid_constant__ CUtensorMap const tensorState) {
   auto* __restrict__ output = reinterpret_cast<input_t*>(params.output);
@@ -754,6 +1042,9 @@ __global__ void selective_state_update_kernel_producer_consumer_horizontal(
   auto const* __restrict__ state_batch_indices =
       reinterpret_cast<stateIndex_t const*>(params.state_batch_indices);
 
+  // Load device-side Philox seed once into a register
+  [[maybe_unused]] int64_t const rand_seed = params.rand_seed ? *params.rand_seed : 0;
+
   int const nheads = params.nheads;
 
   constexpr auto numWarps = 1 + consumerWarps;
@@ -764,7 +1055,18 @@ __global__ void selective_state_update_kernel_producer_consumer_horizontal(
   auto lane = threadIdx.x % warpSize;
   auto warp = threadIdx.y;
 
-  auto const state_batch = (state_batch_indices) ? state_batch_indices[batch] : batch;
+  auto const state_batch =
+      state_batch_indices
+          ? static_cast<int64_t>(
+                state_batch_indices[batch * params.state_batch_indices_stride_batch])
+          : static_cast<int64_t>(batch);
+  auto const* __restrict__ dst_sbi =
+      reinterpret_cast<stateIndex_t const*>(params.dst_state_batch_indices);
+  auto const dst_state_batch =
+      dst_sbi ? static_cast<int64_t>(dst_sbi[batch * params.dst_state_batch_indices_stride_batch])
+              : state_batch;
+  auto const state_ptr_offset =
+      static_cast<int64_t>(state_batch) * params.state_stride_batch + head * DIM * DSTATE;
 
   extern __shared__ uint8_t sbuffer[];
   using sram_t = SharedStorageHorizontal<input_t, weight_t, matrixA_t, state_t, DIM, DSTATE,
@@ -795,13 +1097,13 @@ __global__ void selective_state_update_kernel_producer_consumer_horizontal(
     cg::invoke_one(cg::coalesced_threads(), [&]() {
       if (read_state && write_state)
         producer_func_horizontal<state_t, DIM, DSTATE, colsPerStage, numStages, true, true>(
-            sram, tensorState, state_batch, head);
+            sram, tensorState, state_batch, dst_state_batch, head);
       else if (read_state && !write_state)
         producer_func_horizontal<state_t, DIM, DSTATE, colsPerStage, numStages, true, false>(
-            sram, tensorState, state_batch, head);
+            sram, tensorState, state_batch, dst_state_batch, head);
       else
         producer_func_horizontal<state_t, DIM, DSTATE, colsPerStage, numStages, false, false>(
-            sram, tensorState, state_batch, head);
+            sram, tensorState, state_batch, dst_state_batch, head);
     });
   } else {  // consumers
 
@@ -854,13 +1156,13 @@ __global__ void selective_state_update_kernel_producer_consumer_horizontal(
     // Thread
     float out_value = 0.f;
     if (state_batch != params.pad_slot_id)
-      consumer_func_horizontal<input_t, weight_t, matrixA_t, state_t, DIM, DSTATE, consumerWarps,
-                               colsPerStage, numStages, true>(d, member, A_value, dt_value, x_value,
-                                                              sram, out_value);
+      consumer_func_horizontal<input_t, weight_t, matrixA_t, state_t, DIM, DSTATE, PHILOX_ROUNDS,
+                               consumerWarps, colsPerStage, numStages, true>(
+          d, member, A_value, dt_value, x_value, sram, out_value, rand_seed, state_ptr_offset);
     else
-      consumer_func_horizontal<input_t, weight_t, matrixA_t, state_t, DIM, DSTATE, consumerWarps,
-                               colsPerStage, numStages, false>(d, member, A_value, dt_value,
-                                                               x_value, sram, out_value);
+      consumer_func_horizontal<input_t, weight_t, matrixA_t, state_t, DIM, DSTATE, PHILOX_ROUNDS,
+                               consumerWarps, colsPerStage, numStages, false>(
+          d, member, A_value, dt_value, x_value, sram, out_value, rand_seed, state_ptr_offset);
 
     out_value += __shfl_down_sync(UINT32_MAX, out_value, 16);
     if constexpr (lanesPerRow == 4) {
@@ -881,71 +1183,151 @@ __global__ void selective_state_update_kernel_producer_consumer_horizontal(
   }
 }
 
-#endif  // FLASHINFER_MAMBA_ENABLE_SM100
+#endif  // FLASHINFER_MAMBA_ENABLE_SM90 (horizontal kernel)
 
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t,
-          typename stateIndex_t>
-void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t stream) {
+          typename stateIndex_t, typename state_scale_t>
+void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, SSUAlgorithm algorithm,
+                                cudaStream_t stream) {
+  constexpr bool scaleState = !std::is_same_v<state_scale_t, void>;
+  // Stochastic rounding is only implemented for fp16 state
+  if constexpr (PHILOX_ROUNDS > 0) {
+    static_assert(std::is_same_v<state_t, half>,
+                  "Stochastic rounding (PHILOX_ROUNDS > 0) only supports fp16 state");
+  }
   auto [sm_major, sm_minor] = GetCudaComputeCapability();
 
   // Common alignment checks for all kernels
   check_ptr_alignment_input_vars<input_t>(params);
 
-#ifdef FLASHINFER_MAMBA_ENABLE_SM100
-  if (sm_major < 10)  // pre-Blackwell
-#elif defined(FLASHINFER_MAMBA_ENABLE_SM90)
-  if (sm_major < 9)  // pre-Hopper
+  // Resolve auto to a concrete algorithm based on GPU architecture and batch size
+  SSUAlgorithm algo = algorithm;
+  if (algo == SSUAlgorithm::kAuto) {
+#ifdef FLASHINFER_MAMBA_ENABLE_SM90
+    if (sm_major < 9) {
+      algo = SSUAlgorithm::kSimple;
+    } else {
+      // At small batch sizes, the tiled simple kernel outperforms producer-consumer
+      // kernels because it has lower per-block overhead and can still saturate the GPU
+      // via dim-tiling. Threshold: batch*nheads < 2*num_SMs (i.e. not enough blocks
+      // for the non-tiled producer-consumer kernels to hide latency).
+      int const total_blocks = params.batch * params.nheads;
+      int const num_sms = GetCudaMultiProcessorCount();
+      if (total_blocks < num_sms * 2)
+        algo = SSUAlgorithm::kSimple;
+      else if (sm_major < 10)
+        algo = SSUAlgorithm::kVertical;
+      else if (scaleState)
+        // Horizontal kernel cannot do 2-pass quantization, so always use vertical
+        algo = SSUAlgorithm::kVertical;
+      else
+        // On Blackwell+: vertical is slightly faster for fp32 state,
+        // horizontal is faster for fp16/bf16 state.
+        algo = (sizeof(state_t) == 4) ? SSUAlgorithm::kVertical : SSUAlgorithm::kHorizontal;
+    }
+#else
+    algo = SSUAlgorithm::kSimple;
 #endif
-  {
-    auto kernel_launcher = [&]<int DIM, int DSTATE>() {
-      // Additional alignment checks specific to simple kernel
-      constexpr auto stateLoadSize = getVectorLoadSizeForFullUtilization<state_t, DSTATE>();
-      using load_state_t = PackedAligned<state_t, stateLoadSize>;
+  }
 
-      FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.state) % sizeof(load_state_t) == 0,
-                       "state pointer must be aligned to ", sizeof(load_state_t), " bytes");
-      FLASHINFER_CHECK((params.dim * params.dstate * sizeof(state_t)) % sizeof(load_state_t) == 0,
-                       "state head stride must be aligned to ", sizeof(load_state_t), " bytes");
+  if (algo == SSUAlgorithm::kSimple) {
+    constexpr auto stateLoadSize = getVectorLoadSizeForFullUtilization<state_t, DSTATE>();
+    using load_state_t = PackedAligned<state_t, stateLoadSize>;
 
-      constexpr int numWarps = 4;
-      dim3 block(warpSize, numWarps);
+    FLASHINFER_CHECK_ALIGNMENT(params.state, alignof(load_state_t));
+    FLASHINFER_CHECK((params.dim * params.dstate * sizeof(state_t)) % sizeof(load_state_t) == 0,
+                     "state head stride must be aligned to ", sizeof(load_state_t), " bytes");
+
+    constexpr int numWarps = 4;
+    constexpr int ROWS_PER_BLOCK = 4;
+    int const total_blocks = params.batch * params.nheads;
+    int const num_sms = GetCudaMultiProcessorCount();
+
+    dim3 block(warpSize, numWarps);
+    if (total_blocks < num_sms * 2) {
+      // Tiled: split dim across blocks for better GPU occupancy at small batch sizes
+      int const dim_tiles = (DIM + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
+      dim3 grid(params.batch, params.nheads, dim_tiles);
+      selective_state_update_kernel_simple<input_t, weight_t, matrixA_t, state_t, stateIndex_t,
+                                           state_scale_t, DIM, DSTATE, ROWS_PER_BLOCK, numWarps,
+                                           PHILOX_ROUNDS><<<grid, block, 0, stream>>>(params);
+    } else {
+      // Non-tiled: enough blocks already for full occupancy; ROWS_PER_BLOCK == DIM so blockIdx.z ==
+      // 0
       dim3 grid(params.batch, params.nheads);
-      selective_state_update_kernel_simple<input_t, weight_t, matrixA_t, state_t, stateIndex_t, DIM,
-                                           DSTATE, numWarps><<<grid, block, 0, stream>>>(params);
-    };
-
-    dispatchDimDstate(params, AllowedDims{}, AllowedDstates{}, kernel_launcher);
+      selective_state_update_kernel_simple<input_t, weight_t, matrixA_t, state_t, stateIndex_t,
+                                           state_scale_t, DIM, DSTATE, DIM, numWarps, PHILOX_ROUNDS>
+          <<<grid, block, 0, stream>>>(params);
+    }
   }
 #ifdef FLASHINFER_MAMBA_ENABLE_SM90
-  else {
+  else if (algo == SSUAlgorithm::kVertical) {
+    constexpr auto numConsumers = 4;
+    constexpr auto numWarps = 1 + numConsumers;
+    constexpr auto numStages = 3;
+    constexpr auto rowsPerStage = 4 * numConsumers;
+    FLASHINFER_CHECK(params.dim % rowsPerStage == 0, "dim must be divisible by ", rowsPerStage,
+                     " for vertical kernel");
 
-    auto kernel_launcher = [&]<int DIM, int DSTATE>() {
-      // Note: State uses TMA which requires 128B alignment (checked below)
-      constexpr auto numConsumers = 4;
-      constexpr auto numWarps = 1 + numConsumers;
-      constexpr auto numStages = 3;
-      constexpr auto rowsPerStage = 4 * numConsumers;
-      FLASHINFER_CHECK(params.dim % rowsPerStage == 0, "dim must be divisible by ", rowsPerStage,
-                       " for SM90+ kernel");
-      auto scan_func = selective_state_update_kernel_producer_consumer_vertical<
-          input_t, weight_t, matrixA_t, state_t, stateIndex_t, DIM, DSTATE, numConsumers,
-          rowsPerStage, numStages>;
+    // TMA alignment checks for all pointers loaded via memcpy_async_tx
+    FLASHINFER_CHECK_TMA_ALIGNED(params.x);
+    FLASHINFER_CHECK_TMA_ALIGNED(params.B);
+    FLASHINFER_CHECK_TMA_ALIGNED(params.C);
+    if (params.z) FLASHINFER_CHECK_TMA_ALIGNED(params.z);
+    if constexpr (scaleState) FLASHINFER_CHECK_TMA_ALIGNED(params.state_scale);
+
+    auto scan_func = selective_state_update_kernel_producer_consumer_vertical<
+        input_t, weight_t, matrixA_t, state_t, stateIndex_t, state_scale_t, DIM, DSTATE,
+        PHILOX_ROUNDS, numConsumers, rowsPerStage, numStages>;
+
+    dim3 block(warpSize, numWarps);
+    dim3 grid(params.batch, params.nheads);
+
+    auto state_tensor =
+        tma::buildNdDescriptor(typeid(state_t),
+                               /*shapes*/ {DSTATE, DIM, params.nheads, params.state_cache_size},
+                               /*strides*/ {1, DSTATE, DSTATE * DIM, params.state_stride_batch},
+                               /*tiles*/ {DSTATE, rowsPerStage, 1, 1}, params.state);
+
+    using sram_t = SharedStorageVertical<input_t, weight_t, matrixA_t, state_t, state_scale_t,
+                                         rowsPerStage, DIM, DSTATE, numStages>;
+    constexpr size_t smem_size = sizeof(sram_t);
+    FLASHINFER_CUDA_CHECK(
+        cudaFuncSetAttribute(scan_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+
+    scan_func<<<grid, block, smem_size, stream>>>(params, state_tensor);
+  } else if (algo == SSUAlgorithm::kHorizontal) {
+    FLASHINFER_CHECK(
+        !scaleState,
+        "Horizontal kernel does not support scaled state (int16). "
+        "Cannot do 2-pass quantization because dstate tiles are discarded after processing.");
+    constexpr auto numConsumers = (DIM / 64) * 4;
+    constexpr auto numProducers = 1;
+    constexpr auto numWarps = numProducers + numConsumers;
+
+    constexpr auto sectorSize = 32;  // bytes
+    constexpr auto stageCols = 2 * sectorSize / sizeof(state_t);
+
+    constexpr auto totalStages = DSTATE / stageCols;
+    constexpr auto numStages = (totalStages >= 4) ? 4 : totalStages;
+
+    auto ratio_launcher = [&]<int RATIO>() {
+      auto scan_func = selective_state_update_kernel_producer_consumer_horizontal<
+          input_t, weight_t, matrixA_t, state_t, stateIndex_t, DIM, DSTATE, PHILOX_ROUNDS, RATIO,
+          numConsumers, stageCols, numStages>;
 
       dim3 block(warpSize, numWarps);
       dim3 grid(params.batch, params.nheads);
-
-      auto nh = params.nheads;
-      auto dim = params.dim;
 
       auto state_tensor =
           tma::buildNdDescriptor(typeid(state_t),
-                                 /*shapes*/ {DSTATE, DIM, nh, params.state_cache_size},
+                                 /*shapes*/ {DSTATE, DIM, params.nheads, params.state_cache_size},
                                  /*strides*/ {1, DSTATE, DSTATE * DIM, params.state_stride_batch},
-                                 /*tiles*/ {DSTATE, rowsPerStage, 1, 1}, params.state);
+                                 /*tiles*/ {stageCols, DIM, 1, 1}, params.state);
+      static_assert(DSTATE % stageCols == 0 && DSTATE >= stageCols);
 
-      // Calculate shared memory size and opt-in to extended shared memory
-      using sram_t = SharedStorageVertical<input_t, weight_t, matrixA_t, state_t, rowsPerStage, DIM,
-                                           DSTATE, numStages>;
+      using sram_t = SharedStorageHorizontal<input_t, weight_t, matrixA_t, state_t, DIM, DSTATE,
+                                             stageCols, numStages>;
       constexpr size_t smem_size = sizeof(sram_t);
       FLASHINFER_CUDA_CHECK(
           cudaFuncSetAttribute(scan_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -953,58 +1335,13 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t
       scan_func<<<grid, block, smem_size, stream>>>(params, state_tensor);
     };
 
-    dispatchDimDstate(params, AllowedDims{}, AllowedDstates{}, kernel_launcher);
+    dispatchRatio(params, std::integer_sequence<int, 1, 2, 4, 8, 16, 32, 64>{}, ratio_launcher);
   }
 #endif
-
-#ifdef FLASHINFER_MAMBA_ENABLE_SM100
   else {
-    // SM100+ (Blackwell and newer) uses horizontal producer-consumer kernel
-    auto kernel_launcher = [&]<int DIM, int DSTATE>() {
-      // profiling showed that it's good to have 4 producers per 64 rows
-      constexpr auto numConsumers = (DIM / 64) * 4;
-      constexpr auto numProducers = 1;
-      constexpr auto numWarps = numProducers + numConsumers;
-
-      constexpr auto sectorSize = 32;  // bytes
-      constexpr auto stageCols = 2 * sectorSize / sizeof(state_t);
-
-      constexpr auto totalStages = DSTATE / stageCols;
-      constexpr auto numStages = (totalStages >= 4) ? 4 : totalStages;
-
-      auto ratio_launcher = [&]<int RATIO>() {
-        auto scan_func = selective_state_update_kernel_producer_consumer_horizontal<
-            input_t, weight_t, matrixA_t, state_t, stateIndex_t, DIM, DSTATE, numConsumers,
-            stageCols, RATIO, numStages>;
-
-        dim3 block(warpSize, numWarps);
-        dim3 grid(params.batch, params.nheads);
-
-        auto nh = params.nheads;
-        auto dim = params.dim;
-
-        auto state_tensor =
-            tma::buildNdDescriptor(typeid(state_t),
-                                   /*shapes*/ {DSTATE, DIM, nh, params.state_cache_size},
-                                   /*strides*/ {1, DSTATE, DSTATE * DIM, params.state_stride_batch},
-                                   /*tiles*/ {stageCols, DIM, 1, 1}, params.state);
-        static_assert(DSTATE % stageCols == 0 && DSTATE >= stageCols);
-
-        using sram_t = SharedStorageHorizontal<input_t, weight_t, matrixA_t, state_t, DIM, DSTATE,
-                                               stageCols, numStages>;
-        constexpr size_t smem_size = sizeof(sram_t);
-        FLASHINFER_CUDA_CHECK(cudaFuncSetAttribute(
-            scan_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-
-        scan_func<<<grid, block, smem_size, stream>>>(params, state_tensor);
-      };
-
-      dispatchRatio(params, std::integer_sequence<int, 1, 8, 16>{}, ratio_launcher);
-    };
-
-    dispatchDimDstate(params, AllowedDims{}, AllowedDstates{}, kernel_launcher);
+    FLASHINFER_CHECK(false, "Unsupported SSU algorithm: ", SSUAlgorithmToString(algo),
+                     ". Vertical/horizontal require FLASHINFER_MAMBA_ENABLE_SM90.");
   }
-#endif
 }
 
 }  // namespace flashinfer::mamba

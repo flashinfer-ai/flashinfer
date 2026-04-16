@@ -8,12 +8,14 @@
 #include <iostream>
 #include <type_traits>
 
+#include "../utils.cuh"
+
 namespace flashinfer::mamba::tma {
 
-inline CUtensorMap buildNdDescriptor(std::type_info const& dtype,
-                                     std::vector<uint64_t> const& shapes,
-                                     std::vector<uint64_t> const& strides,
-                                     std::vector<int32_t> const& tileShapes, void* gmemAddr) {
+inline CUtensorMap buildNdDescriptor(
+    std::type_info const& dtype, std::vector<uint64_t> const& shapes,
+    std::vector<uint64_t> const& strides, std::vector<int32_t> const& tileShapes, void* gmemAddr,
+    CUtensorMapFloatOOBfill oobFill = CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) {
   // The multiplication factor of the data padding in SMEM.
   CUtensorMap desc{};
   CUtensorMapDataType tmaDataFormat;
@@ -27,6 +29,9 @@ inline CUtensorMap buildNdDescriptor(std::type_info const& dtype,
   } else if (dtype == typeid(__nv_bfloat16)) {
     tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
     dtype_size = sizeof(__nv_bfloat16);
+  } else if (dtype == typeid(int16_t)) {
+    tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_UINT16;
+    dtype_size = sizeof(int16_t);
   } else {
     throw std::invalid_argument("buildNdDescriptor: unsupported dtype");
   }
@@ -34,9 +39,8 @@ inline CUtensorMap buildNdDescriptor(std::type_info const& dtype,
   // The swizzle type.
   CUtensorMapSwizzle swizzleType{CU_TENSOR_MAP_SWIZZLE_NONE};
 
-  // Check gmem address must be 16B-aligned
-  FLASHINFER_CHECK((reinterpret_cast<uint64_t>(gmemAddr) & 0b1111) == 0,
-                   "Tensor must be 16B-aligned");
+  // Check gmem address must be 128B-aligned for TMA
+  FLASHINFER_CHECK_TMA_ALIGNED(gmemAddr);
 
   // Check shape must be in range [1, 2^32]
   int32_t dim = shapes.size();
@@ -81,7 +85,7 @@ inline CUtensorMap buildNdDescriptor(std::type_info const& dtype,
                              boxDim.data(), tileStrides.data(),
                              /*interleave=*/CU_TENSOR_MAP_INTERLEAVE_NONE, swizzleType,
                              /*l2Promotion=*/CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
-                             /*oobFill=*/CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+                             /*oobFill=*/oobFill);
 
   if (result != CUDA_SUCCESS) {
     char const* errorString;

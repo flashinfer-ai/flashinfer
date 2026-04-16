@@ -21,19 +21,39 @@
 
 namespace flashinfer::mamba {
 
-// =============================================================================
-// Allowed dispatch values for kernel instantiation
-// =============================================================================
-using AllowedDims = std::integer_sequence<int, 64, 128, 256>;
-using AllowedDstates = std::integer_sequence<int, 64, 128, 256>;
-using AllowedNtokens = std::integer_sequence<int, 1, 2, 4, 6, 8, 12, 16>;
+// Host-side algorithm selection for invokeSelectiveStateUpdate dispatch.
+// Not stored in kernel params — no register overhead.
+enum class SSUAlgorithm : int32_t {
+  kAuto = 0,
+  kSimple = 1,
+  kVertical = 2,
+  kHorizontal = 3,
+  kAsyncHorizontal = 4,
+};
+
+inline const char* SSUAlgorithmToString(SSUAlgorithm algo) {
+  switch (algo) {
+    case SSUAlgorithm::kAuto:
+      return "Auto";
+    case SSUAlgorithm::kSimple:
+      return "Simple";
+    case SSUAlgorithm::kVertical:
+      return "Vertical";
+    case SSUAlgorithm::kHorizontal:
+      return "Horizontal";
+    case SSUAlgorithm::kAsyncHorizontal:
+      return "AsyncHorizontal";
+    default:
+      return "Unknown";
+  }
+}
 
 struct SelectiveStateUpdateParams {
   uint32_t batch{}, nheads{}, dim{}, dstate{}, ngroups{}, state_cache_size{};
   int32_t pad_slot_id{-1};
 
   int64_t x_stride_batch{}, dt_stride_batch{}, B_stride_batch{}, C_stride_batch{},
-      out_stride_batch{}, z_stride_batch{}, state_stride_batch{};
+      out_stride_batch{}, z_stride_batch{}, state_stride_batch{}, state_scale_stride_batch{};
 
   void* __restrict__ state{nullptr};
   void* __restrict__ x{nullptr};
@@ -46,9 +66,24 @@ struct SelectiveStateUpdateParams {
   void* __restrict__ z{nullptr};
   void* __restrict__ output{nullptr};
   void* __restrict__ state_batch_indices{nullptr};
+  // Block-scale decode factors for quantized state: float32 (state_cache_size, nheads, dim, 1)
+  void* __restrict__ state_scale{nullptr};
+
+  void* __restrict__ dst_state_batch_indices{nullptr};
+
+  // stride_T=0 means 1D (broadcast), stride_T>0 means 2D indexing
+  int64_t state_batch_indices_stride_batch{1};
+  int64_t state_batch_indices_stride_T{0};
+  int64_t dst_state_batch_indices_stride_batch{0};
+  int64_t dst_state_batch_indices_stride_T{0};
 
   bool dt_softplus{false};
   bool update_state{true};
+
+  // Philox PRNG seed for stochastic rounding of fp16 state stores.
+  // Only used when the kernel is compiled with NUM_PHILOX_ROUNDS > 0.
+  // Device-side pointer to a single int64_t value.
+  const int64_t* rand_seed{nullptr};
 };
 
 namespace mtp {
@@ -60,16 +95,21 @@ struct SelectiveStateMTPParams : public SelectiveStateUpdateParams {
   // MTP-specific strides for the token dimension
   int64_t x_stride_mtp{}, dt_stride_mtp{}, B_stride_mtp{}, C_stride_mtp{}, out_stride_mtp{},
       z_stride_mtp{};
+  int64_t intermediate_state_stride_batch{}, intermediate_state_scales_stride_batch{};
   void* __restrict__ intermediate_states{
-      nullptr};  // state_t: (ntokens_mtp, state_cache_size, nheads, dim, dstate)
+      nullptr};  // state_t: (icache_size, cache_steps, nheads, dim, dstate)
   void* __restrict__ intermediate_state_indices{nullptr};  // (batch,)
-  int64_t intermediate_state_stride_batch{};  // stride for batch dimension of intermediate_states
+  void* __restrict__ intermediate_state_scales{
+      nullptr};  // float: (batch, cache_steps, nheads, dim)
+
+  void* __restrict__ cu_seqlens{nullptr};           // (n_sequences + 1,)
+  void* __restrict__ num_accepted_tokens{nullptr};  // (n_sequences,)
 };
 }  // namespace mtp
 
 }  // namespace flashinfer::mamba
 
-#include "kernel_selective_state_update_mtp.cuh"
+#include "invoke_selective_state_update_mtp.cuh"
 #include "kernel_selective_state_update_stp.cuh"
 
 #endif  // FLASHINFER_MAMBA_SELECTIVE_STATE_UPDATE_CUH_

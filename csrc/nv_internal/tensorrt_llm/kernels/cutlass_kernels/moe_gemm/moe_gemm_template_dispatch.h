@@ -166,12 +166,18 @@ struct genericMoeGemmKernelLauncher {
 
       using GemmGrouped = cutlass::gemm::device::GemmGrouped<GemmKernel>;
 
+      // Use the same runtime device check for both the occupancy query path and the
+      // execution path. This is important for SM89 (Ada) kernels running on SM120 (Blackwell):
+      // pure FP8 MoE on SM120 falls back to SM89 kernels since no native SM120 FP8 GEMM
+      // kernels are available. Some SM89 tile configs have 0 occupancy on SM120 due to
+      // hardware resource differences. Using GemmGrouped::maximum_active_blocks() ensures
+      // the occupancy query returns 0 for these configs, allowing the static heuristic to
+      // correctly skip them rather than selecting a config that will fail at execution time.
+      int occupancy = std::min(2, GemmGrouped::maximum_active_blocks());
       if (inputs.occupancy != nullptr) {
-        *inputs.occupancy =
-            tensorrt_llm::cutlass_extensions::compute_occupancy_for_kernel<GemmKernel>();
+        *inputs.occupancy = occupancy;
         return;
       }
-      int occupancy = std::min(2, GemmGrouped::maximum_active_blocks());
       TLLM_CHECK_WITH_INFO(occupancy > 0,
                            "GPU lacks the shared memory resources to run GroupedGEMM kernel");
       int const threadblock_count = sm_count_ * occupancy;
@@ -194,17 +200,17 @@ struct genericMoeGemmKernelLauncher {
       auto can_implement = gemm.can_implement(args);
       TLLM_CHECK_WITH_INFO(can_implement == cutlass::Status::kSuccess,
                            "MoE FC kernel will fail for params. Error: " +
-                               std::string(cutlassGetStatusString(can_implement)));
+                               std::string(cutlass::cutlassGetStatusString(can_implement)));
 
       auto init_status = gemm.initialize(args);
       TLLM_CHECK_WITH_INFO(init_status == cutlass::Status::kSuccess,
                            "Failed to initialize cutlass grouped gemm. Error: " +
-                               std::string(cutlassGetStatusString(init_status)));
+                               std::string(cutlass::cutlassGetStatusString(init_status)));
 
       auto run_status = gemm.run(inputs.stream);
       TLLM_CHECK_WITH_INFO(run_status == cutlass::Status::kSuccess,
                            "Failed to run cutlass grouped gemm. Error: " +
-                               std::string(cutlassGetStatusString(run_status)));
+                               std::string(cutlass::cutlassGetStatusString(run_status)));
     } else if constexpr (sizeof(ElementType) == 2 && sizeof(CutlassWeightType) == 2 &&
                          (std::is_same_v<EpilogueTag, cutlass_extensions::EpilogueOpDefaultSilu> ||
                           std::is_same_v<
@@ -525,17 +531,19 @@ void dispatchMoeGemmToCutlass(
 
 namespace tensorrt_llm::kernels::cutlass_kernels {
 
-template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
+template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType,
+          bool IsMXFPX>
 std::vector<cutlass_extensions::CutlassGemmConfig>
-MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getConfigs(
+MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::getConfigs(
     bool supports_finalize_fusion) const {
   return getConfigs(sm_, supports_finalize_fusion);
 }
 
-template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
+template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType,
+          bool IsMXFPX>
 std::vector<cutlass_extensions::CutlassGemmConfig>
-MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getConfigs(int sm,
-                                                                    bool supports_finalize_fusion) {
+MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::getConfigs(
+    int sm, bool supports_finalize_fusion) {
   std::vector<cutlass_extensions::CutlassGemmConfig> candidate_configs =
       getTmaWarpSpecializedConfigs(sm, supports_finalize_fusion);
   std::vector<cutlass_extensions::CutlassGemmConfig> ampere_configs = getAmpereConfigs(sm);
@@ -543,9 +551,10 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getConfigs(int sm,
   return candidate_configs;
 }
 
-template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
+template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType,
+          bool IsMXFPX>
 std::vector<cutlass_extensions::CutlassGemmConfig>
-MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getAmpereConfigs(int sm) {
+MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::getAmpereConfigs(int sm) {
   using tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
   static constexpr auto weight_only_flag =
       std::is_same<T, WeightType>::value ? CutlassGemmConfig::NONE : CutlassGemmConfig::WEIGHT_ONLY;
@@ -571,9 +580,10 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getAmpereConfigs(int sm
   return ampere_configs;
 }
 
-template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
+template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType,
+          bool IsMXFPX>
 std::vector<cutlass_extensions::CutlassGemmConfig>
-MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getTmaWarpSpecializedConfigs(
+MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::getTmaWarpSpecializedConfigs(
     int sm, bool supports_finalize_fusion) {
   using tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
   static constexpr auto weight_only_flag =
@@ -668,15 +678,18 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getTmaWarpSpecializedCo
   return tma_ws_configs;
 }
 
-template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
-bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::isTmaWarpSpecialized(
+template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType,
+          bool IsMXFPX>
+bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::isTmaWarpSpecialized(
     cutlass_extensions::CutlassGemmConfig gemm_config) const {
   bool config_is_tma_warp_specialized = gemm_config.is_tma_warp_specialized;
   return supportsTmaWarpSpecialized() && config_is_tma_warp_specialized;
 }
 
-template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
-bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::supportsTmaWarpSpecialized(int sm) {
+template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType,
+          bool IsMXFPX>
+bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::supportsTmaWarpSpecialized(
+    int sm) {
   return (sm == 90 &&
           tensorrt_llm::kernels::cutlass_kernels::isValidHopperMOESpecialisation<T,
                                                                                  WeightType>()) ||
@@ -687,14 +700,16 @@ bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::supportsTmaWarpSpe
           tensorrt_llm::kernels::cutlass_kernels::isValidSM120MOESpecialisation<T, WeightType>());
 }
 
-template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
-int MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getSM() const {
+template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType,
+          bool IsMXFPX>
+int MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::getSM() const {
   return this->sm_;
 }
 
 // currently support sm80 bf16/fp16 gate activation, only set predication tensor for m direction
-template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
-bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::supportsFusedGatedActivation(
+template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType,
+          bool IsMXFPX>
+bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::supportsFusedGatedActivation(
     ActivationType activation_type, int gemm_n, int gemm_k) const {
   constexpr bool ENABLE_FUSED_GATED_ACTIVATION = true;
   return (activation_type == ActivationType::Swiglu || activation_type == ActivationType::Geglu) &&
@@ -703,16 +718,18 @@ bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::supportsFusedGated
          ENABLE_FUSED_GATED_ACTIVATION;
 }
 
-template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
-bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::isFusedGatedActivation(
+template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType,
+          bool IsMXFPX>
+bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::isFusedGatedActivation(
     cutlass_extensions::CutlassGemmConfig gemm_config, ActivationType activation_type, int gemm_n,
     int gemm_k) const {
   return supportsFusedGatedActivation(activation_type, gemm_n, gemm_k) &&
          !gemm_config.is_tma_warp_specialized;
 }
 
-template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
-MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::MoeGemmRunner() {
+template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType,
+          bool IsMXFPX>
+MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::MoeGemmRunner() {
   int device{-1};
   tensorrt_llm::common::check_cuda_error(cudaGetDevice(&device));
   sm_ = tensorrt_llm::common::getSMVersion();
@@ -720,9 +737,10 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::MoeGemmRunner() {
       cudaDeviceGetAttribute(&multi_processor_count_, cudaDevAttrMultiProcessorCount, device));
 }
 
-template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
+template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType,
+          bool IsMXFPX>
 template <typename EpilogueTag>
-void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
+void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::dispatchToArch(
     GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
     TmaWarpSpecializedGroupedGemmInput hopper_inputs) {
   static_assert(
@@ -917,8 +935,9 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
   }
 }
 
-template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
-size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getMaxWorkspaceSize(
+template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType,
+          bool IsMXFPX>
+size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::getMaxWorkspaceSize(
     int num_experts) const {
   if (num_experts != num_experts_) {
     TLLM_LOG_TRACE("Calling getMaxWorkspaceSize() with a new expert count %d vs %d", num_experts,
@@ -929,8 +948,9 @@ size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getMaxWorkspaceS
   return gemm_workspace_size_;
 }
 
-template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
-size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::calcMaxWorkspaceSize(
+template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType,
+          bool IsMXFPX>
+size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::calcMaxWorkspaceSize(
     int num_experts) const {
   if constexpr (use_w4_groupwise) {
     return cutlass_kernels_oss::calcMaxWorkspaceSizeTmaWarpSpecializedMixedInput<T, WeightType,
@@ -948,6 +968,8 @@ size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::calcMaxWorkspace
     auto configs = getTmaWarpSpecializedConfigs(sm_, true);
     auto fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE;
     if constexpr (use_wfp4afp8) {
+      fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
+    } else if constexpr (use_mxfp8) {
       fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
     } else if (use_fp4) {
       fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4;
@@ -986,16 +1008,18 @@ size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::calcMaxWorkspace
   }
 }
 
-template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
+template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType,
+          bool IsMXFPX>
 template <typename EpilogueTag>
-void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::runGemm(
+void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::runGemm(
     GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
     TmaWarpSpecializedGroupedGemmInput hopper_inputs) {
   dispatchToArch<EpilogueTag>(inputs, hopper_inputs);
 }
 
-template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
-void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::moeGemmBiasAct(
+template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType,
+          bool IsMXFPX>
+void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::moeGemmBiasAct(
     GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
     TmaWarpSpecializedGroupedGemmInput hopper_inputs) {
   switch (inputs.activation_type) {
@@ -1017,6 +1041,9 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::moeGemmBiasAct(
     case ActivationType::Geglu:
       runGemm<cutlass_extensions::EpilogueOpDefaultFtGelu>(inputs, hopper_inputs);
       break;
+    case ActivationType::Relu2:
+      runGemm<cutlass_extensions::EpilogueOpDefaultRelu2>(inputs, hopper_inputs);
+      break;
     case ActivationType::InvalidType:
       TLLM_THROW("Activation type for fpA_intB must be valid.");
       break;
@@ -1026,11 +1053,42 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::moeGemmBiasAct(
   }
 }
 
-template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>
-void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::moeGemm(
+template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType,
+          bool IsMXFPX>
+void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::moeGemm(
     GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
     TmaWarpSpecializedGroupedGemmInput hopper_inputs) {
   runGemm<cutlass_extensions::EpilogueOpDefault>(inputs, hopper_inputs);
+}
+
+template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType,
+          bool IsMXFPX>
+int MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::queryOccupancyForConfig(
+    cutlass_extensions::CutlassGemmConfig const& config) {
+  // TMA warp-specialized configs (Hopper/Blackwell native) do not use the Ampere GroupedGEMM
+  // occupancy path, so we conservatively report them as supported (occupancy > 0).
+  if (config.is_tma_warp_specialized) {
+    return 1;
+  }
+
+  // Dispatch with inputs.occupancy set to query occupancy without running the kernel.
+  // Tensor pointers (A, B, C, etc.) are not accessed when inputs.occupancy != nullptr,
+  // so they can safely be left as null.
+  int occupancy = 0;
+  GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs;
+  inputs.occupancy = &occupancy;
+  inputs.gemm_config = config;
+  // Use default epilogue for the query; epilogue type does not affect occupancy.
+  // Pass a default-constructed TmaWarpSpecializedGroupedGemmInput (isValid() == false)
+  // so that no TMA warp-specialized paths are taken for Ampere-style configs.
+  try {
+    runGemm<cutlass_extensions::EpilogueOpDefault>(inputs, TmaWarpSpecializedGroupedGemmInput{});
+  } catch (...) {
+    // If the dispatch throws (e.g., assertion failure for unsupported config/arch combination),
+    // the config is incompatible with this device — report occupancy 0.
+    return 0;
+  }
+  return occupancy;
 }
 
 }  // namespace tensorrt_llm::kernels::cutlass_kernels

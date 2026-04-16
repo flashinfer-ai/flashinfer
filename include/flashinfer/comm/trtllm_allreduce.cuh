@@ -1711,7 +1711,7 @@ cudaError_t lamportInitialize(void* buffer, size_t size, cudaStream_t stream) {
   if (size == 0) {
     return cudaSuccess;
   }
-  FLASHINFER_LOG_INFO("lamportInitialize start: buffer: {}, size: {}", buffer, size);
+  FLASHINFER_LOG_DEBUG("lamportInitialize start: buffer: {}, size: {}", buffer, size);
   return reduce_fusion::lamport_initialize_kernel_launcher<T>(buffer, size, stream);
 }
 

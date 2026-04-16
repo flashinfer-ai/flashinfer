@@ -290,9 +290,7 @@ void moe_sort(
   moe::dev::routing::routingDeepSeek::Data routingData;
 
   // Configure dtypes
-  routingData.mDtypeExpW = batchedGemm::trtllm::gen::Dtype::Bfloat16;
-  routingData.mDtypeBias = batchedGemm::trtllm::gen::Dtype::Bfloat16;
-  routingData.mDtypeScore = batchedGemm::trtllm::gen::Dtype::Fp32;
+  routingData.mDtypeOutput = batchedGemm::trtllm::gen::Dtype::Bfloat16;
   routingData.mUsePdl = use_pdl;
 
   // Input tensors (pre-computed expert selections)
@@ -306,8 +304,9 @@ void moe_sort(
   routingData.mPtrCtaIdxXyToMnLimit = reinterpret_cast<int32_t*>(tile_idx_to_mn_limit_ptr);
   routingData.mPtrExpandedIdxToPermutedIdx =
       reinterpret_cast<int32_t*>(expanded_idx_to_permuted_idx_ptr);
-  routingData.mPtrPermutedIdxToTokenIdx =
+  routingData.mPtrPermutedIdxToExpandedIdx =
       reinterpret_cast<int32_t*>(permuted_idx_to_expanded_idx_ptr);
+  routingData.mPtrPermutedIdxToTokenIdx = nullptr;
   routingData.mPtrPermutedIdxSize = reinterpret_cast<int32_t*>(total_num_padded_tokens_ptr);
   routingData.mPtrNumNonExitingCtas = reinterpret_cast<int32_t*>(num_non_exiting_tiles_ptr);
 

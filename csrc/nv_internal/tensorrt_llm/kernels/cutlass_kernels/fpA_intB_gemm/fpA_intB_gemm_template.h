@@ -200,21 +200,21 @@ void generic_mixed_gemm_kernelLauncher(
   auto can_implement = gemm.can_implement(args);
   if (can_implement != cutlass::Status::kSuccess) {
     std::string err_msg = "fpA_intB cutlass kernel will fail for params. Error: " +
-                          std::string(cutlassGetStatusString(can_implement));
+                          std::string(cutlass::cutlassGetStatusString(can_implement));
     throw std::runtime_error("[TensorRT LLM Error][fpA_intB Runner] " + err_msg);
   }
 
   auto init_status = gemm.initialize(args, workspace, stream);
   if (init_status != cutlass::Status::kSuccess) {
     std::string err_msg = "Failed to initialize cutlass fpA_intB gemm. Error: " +
-                          std::string(cutlassGetStatusString(init_status));
+                          std::string(cutlass::cutlassGetStatusString(init_status));
     throw std::runtime_error("[TensorRT LLM Error][fpA_intB Runner] " + err_msg);
   }
 
   auto run_status = gemm.run(stream);
   if (run_status != cutlass::Status::kSuccess) {
     std::string err_msg = "Failed to run cutlass fpA_intB gemm. Error: " +
-                          std::string(cutlassGetStatusString(run_status));
+                          std::string(cutlass::cutlassGetStatusString(run_status));
     throw std::runtime_error("[TensorRT LLM Error][fpA_intB Runner] " + err_msg);
   }
 }

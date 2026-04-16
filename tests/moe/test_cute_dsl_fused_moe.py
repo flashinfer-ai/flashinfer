@@ -36,15 +36,29 @@ from flashinfer.cute_dsl import is_cute_dsl_available
 
 
 def is_sm100_family():
-    """Check for SM100 family (Blackwell: SM100, SM103, SM110).
+    """Check for SM100 family (Blackwell: SM100, SM103) or SM120 family (SM120, SM121).
 
-    CuteDSL MoE NVFP4 kernels are optimized for SM100 architecture.
-    SM120+ (Rubin) may have different shared memory/TMEM configurations.
+    CuteDSL MoE NVFP4 kernels support SM10x and SM12x architectures.
     """
     if not torch.cuda.is_available():
         return False
     props = torch.cuda.get_device_properties(0)
-    return props.major == 10
+    return props.major in (10, 12)
+
+
+def is_sm120_family():
+    """Check for SM120 family (SM120, SM121)."""
+    if not torch.cuda.is_available():
+        return False
+    props = torch.cuda.get_device_properties(0)
+    return props.major == 12
+
+
+def _has_cuda_13():
+    """Check if CUDA runtime version is 13+."""
+    return (
+        torch.version.cuda is not None and int(torch.version.cuda.split(".")[0]) >= 13
+    )
 
 
 # Skip decorators
@@ -52,9 +66,22 @@ cute_dsl_available = pytest.mark.skipif(
     not is_cute_dsl_available(), reason="CuteDSL not available"
 )
 sm100_required = pytest.mark.skipif(
-    not is_sm100_family(),
-    reason="Requires SM100 family GPU (Blackwell: SM100, SM103, SM110)",
+    not is_sm100_family() or (is_sm120_family() and not _has_cuda_13()),
+    reason="Requires SM100/SM103 or SM120/SM121 GPU (SM120 requires CUDA 13+)",
 )
+sm100_only = pytest.mark.skipif(
+    is_sm120_family() or not is_sm100_family(),
+    reason="Requires SM100 family GPU (wrapper/tactics not yet ported to SM120)",
+)
+
+
+def moe_input(tensors: dict) -> torch.Tensor:
+    """Return the correct x tensor for the current architecture.
+
+    SM100/103 expects pre-quantized FP4; SM120/121 expects bf16
+    (the kernel fuses quantization internally).
+    """
+    return tensors["x_bf16"] if is_sm120_family() else tensors["x"]
 
 
 def silu(x: torch.Tensor) -> torch.Tensor:
@@ -236,10 +263,15 @@ def create_moe_tensors(
         / 10
     )
 
-    w1_bf16_interleaved = interleave_linear_and_gate(w1_bf16, group_size=64, dim=1)
+    # SM100/103: interleave gate/up for CuTe DSL SwiGLU epilogue (group_size=64)
+    # SM120/121: no interleave — kernel expects [up_0:N, gate_0:N] (contiguous cat)
+    if is_sm120_family():
+        w1_bf16_prepared = w1_bf16  # b12x kernel: non-interleaved
+    else:
+        w1_bf16_prepared = interleave_linear_and_gate(w1_bf16, group_size=64, dim=1)
     w1_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
 
-    w1_flat = w1_bf16_interleaved.view(
+    w1_flat = w1_bf16_prepared.view(
         num_local_experts * 2 * intermediate_size, hidden_size
     )
     w1_q_flat, w1_sf_flat = fp4_quantize(
@@ -303,15 +335,19 @@ def create_moe_tensors(
 
 
 def check_accuracy(
-    actual: torch.Tensor, expected: torch.Tensor, percent_threshold: float = 0.925
+    actual: torch.Tensor, expected: torch.Tensor, percent_threshold: float = 0.97
 ):
-    """Check numerical accuracy with percentage-based tolerance."""
+    """Check numerical accuracy with percentage-based tolerance.
+
+    Tolerances are scaled by output magnitude to account for FP4 quantization
+    noise growing with larger hidden dimensions.
+    """
     actual = actual.float()
     expected = expected.float()
 
     output_scale = max(expected.std().item(), 0.01)
-    atol = max(0.1, 3.0 * output_scale)
-    rtol = 0.85
+    atol = max(0.05, 1.5 * output_scale)
+    rtol = 0.5
 
     abs_diff = torch.abs(actual - expected)
     rel_diff = abs_diff / (torch.abs(expected) + 1e-8)
@@ -360,7 +396,7 @@ class TestCuteDslFusedMoeFunctional:
         )
 
         result = cute_dsl_fused_moe_nvfp4(
-            x=tensors["x"],
+            x=moe_input(tensors),
             x_sf=tensors["x_sf"],
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
@@ -419,7 +455,7 @@ class TestCuteDslFusedMoeFunctional:
 
         with autotune(True):
             result = cute_dsl_fused_moe_nvfp4(
-                x=tensors["x"],
+                x=moe_input(tensors),
                 x_sf=tensors["x_sf"],
                 token_selected_experts=tensors["token_selected_experts"],
                 token_final_scales=tensors["token_final_scales"],
@@ -476,7 +512,7 @@ class TestCuteDslMoEWrapper:
         )
 
         result = moe.run(
-            x=tensors["x"],
+            x=moe_input(tensors),
             x_sf=tensors["x_sf"],
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
@@ -543,7 +579,7 @@ class TestCuteDslMoEWrapper:
         # Warmup
         for _ in range(3):
             moe.run(
-                x=tensors["x"],
+                x=moe_input(tensors),
                 x_sf=tensors["x_sf"],
                 token_selected_experts=tensors["token_selected_experts"],
                 token_final_scales=tensors["token_final_scales"],
@@ -561,7 +597,7 @@ class TestCuteDslMoEWrapper:
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
             output = moe.run(
-                x=tensors["x"],
+                x=moe_input(tensors),
                 x_sf=tensors["x_sf"],
                 token_selected_experts=tensors["token_selected_experts"],
                 token_final_scales=tensors["token_final_scales"],
@@ -647,7 +683,7 @@ class TestCuteDslMoEWrapper:
 
         with autotune(True):
             result = moe.run(
-                x=tensors["x"],
+                x=moe_input(tensors),
                 x_sf=tensors["x_sf"],
                 token_selected_experts=tensors["token_selected_experts"],
                 token_final_scales=tensors["token_final_scales"],
@@ -711,7 +747,7 @@ class TestApiConsistency:
 
         # Functional API
         result_functional = cute_dsl_fused_moe_nvfp4(
-            x=tensors["x"],
+            x=moe_input(tensors),
             x_sf=tensors["x_sf"],
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
@@ -736,7 +772,7 @@ class TestApiConsistency:
         )
 
         result_wrapper = moe.run(
-            x=tensors["x"],
+            x=moe_input(tensors),
             x_sf=tensors["x_sf"],
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
@@ -768,7 +804,7 @@ class TestApiConsistency:
 
 
 @cute_dsl_available
-@sm100_required
+@sm100_only
 class TestExpertParallelism:
     """Tests for expert parallelism (EP) configurations."""
 
@@ -814,7 +850,7 @@ class TestExpertParallelism:
         )
 
         result = moe.run(
-            x=tensors["x"],
+            x=moe_input(tensors),
             x_sf=tensors["x_sf"],
             token_selected_experts=token_selected_experts,
             token_final_scales=tensors["token_final_scales"],
@@ -877,7 +913,7 @@ class TestExpertParallelism:
         )
 
         result = cute_dsl_fused_moe_nvfp4(
-            x=tensors["x"],
+            x=moe_input(tensors),
             x_sf=tensors["x_sf"],
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
@@ -919,6 +955,134 @@ class TestExpertParallelism:
         assert passed, (
             f"EP functional API accuracy test failed (ep_size={ep_size}, ep_rank={ep_rank}): "
             f"{percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
+        )
+
+
+# =============================================================================
+# Test Class: All Valid Tactics
+# =============================================================================
+
+
+@cute_dsl_available
+@sm100_only
+class TestAllValidTactics:
+    """Test that every tactic returned by get_valid_tactics produces correct output.
+
+    For each problem configuration, gets the filtered list of valid tactics via
+    can_implement checks, then runs CuteDslMoEWrapper with each tactic explicitly
+    and verifies numerical accuracy against the reference implementation.
+    """
+
+    @pytest.mark.parametrize(
+        "num_tokens,hidden_size,intermediate_size,num_experts,top_k",
+        [
+            (128, 256, 512, 256, 2),
+            (256, 1024, 2048, 256, 8),
+        ],
+    )
+    def test_all_tactics_accuracy(
+        self,
+        num_tokens: int,
+        hidden_size: int,
+        intermediate_size: int,
+        num_experts: int,
+        top_k: int,
+    ):
+        """Verify every valid tactic produces correct output."""
+        from flashinfer import CuteDslMoEWrapper
+
+        num_local_experts = num_experts
+
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_local_experts,
+            top_k=top_k,
+        )
+
+        ref_output = compute_reference_moe_fp4(
+            hidden_states=tensors["x_bf16"].float().cuda(),
+            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
+            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=tensors["fc2_input_scale"],
+        )
+
+        # Create wrapper without CUDA graph so we can freely try different tile_sizes
+        moe = CuteDslMoEWrapper(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            use_cuda_graph=False,
+        )
+
+        # Get the filtered list of valid tactics for this problem size
+        inputs = [
+            tensors["x"],
+            tensors["x_sf"],
+            tensors["token_selected_experts"],
+            tensors["token_final_scales"],
+            tensors["w1_weight"],
+            tensors["w1_weight_sf"],
+            tensors["w1_alpha"],
+            tensors["fc2_input_scale"],
+            tensors["w2_weight"],
+            tensors["w2_weight_sf"],
+            tensors["w2_alpha"],
+        ]
+        valid_tactics = moe._runner.get_valid_tactics(inputs, None)
+        assert len(valid_tactics) > 0, "No valid tactics found"
+
+        num_passed = 0
+        num_failed = 0
+        for tactic in valid_tactics:
+            tile_size = tactic[0]
+            result = moe.run(
+                x=moe_input(tensors),
+                x_sf=tensors["x_sf"],
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+                w1_weight=tensors["w1_weight"],
+                w1_weight_sf=tensors["w1_weight_sf"],
+                w1_alpha=tensors["w1_alpha"],
+                fc2_input_scale=tensors["fc2_input_scale"],
+                w2_weight=tensors["w2_weight"],
+                w2_weight_sf=tensors["w2_weight_sf"],
+                w2_alpha=tensors["w2_alpha"],
+                tactic=tactic,
+            )
+
+            assert result.shape == (num_tokens, hidden_size)
+            assert not torch.isnan(result).any(), f"NaN in output for tactic {tactic}"
+            assert not torch.isinf(result).any(), f"Inf in output for tactic {tactic}"
+
+            passed, percent_within, atol = check_accuracy(result, ref_output)
+            if passed:
+                num_passed += 1
+            else:
+                num_failed += 1
+                # Don't fail immediately; report all failures at the end
+                print(
+                    f"[FAIL] tactic tile_size={tile_size} "
+                    f"gemm1={tactic[1][0]},{tactic[1][1]} "
+                    f"gemm2={tactic[2][0]},{tactic[2][1]}: "
+                    f"{percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
+                )
+
+        total = len(valid_tactics)
+        assert num_failed == 0, (
+            f"{num_failed}/{total} tactics failed accuracy check "
+            f"(tokens={num_tokens}, hidden={hidden_size}, "
+            f"intermediate={intermediate_size}, experts={num_experts}, top_k={top_k})"
         )
 
 
