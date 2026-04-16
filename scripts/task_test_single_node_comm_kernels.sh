@@ -17,18 +17,11 @@ echo ""
 
 pip install -e . -v
 
-# TODO: Remove once CI container ships with nvshmem4py pre-installed.
-pip install nvshmem4py-cu12
-
-# vllm ar
-pytest -s tests/comm/test_vllm_custom_allreduce.py
-# trtllm ar + fusion
-pytest -s tests/comm/test_trtllm_allreduce.py
-pytest -s tests/comm/test_trtllm_allreduce_fusion.py
-pytest -s tests/moe/test_trtllm_cutlass_fused_moe.py
-pytest -s tests/comm/test_trtllm_moe_allreduce_fusion.py
-pytest -s tests/comm/test_trtllm_moe_allreduce_fusion_finalize.py
+# Single-GPU comm tests (simulate multi-rank on one GPU)
 pytest -s tests/comm/test_trtllm_moe_alltoall.py
-# nvshmem ar
-pytest -s tests/comm/test_nvshmem.py
-pytest -s tests/comm/test_nvshmem_allreduce.py
+
+# MOE tests that don't require multi-GPU
+pytest -s tests/moe/test_trtllm_cutlass_fused_moe.py
+
+# NOTE: Multi-GPU comm tests (vllm, trtllm allreduce/fusion, nvshmem, etc.)
+# have been moved to task_test_multi_gpu_comm_kernels.sh

@@ -18,7 +18,6 @@ from flashinfer.comm import (
 from tests.test_helpers.comm import (
     setup_mpi_and_cuda,
     init_torch_distributed_from_mpi,
-    cleanup_torch_distributed,
 )
 
 
@@ -205,11 +204,11 @@ class TestBufferSizeSufficient:
 
         yield
 
-        # Cleanup
+        # Cleanup workspace but keep torch.distributed alive across tests.
+        # Repeated destroy/re-init cycles cause NCCL socket connection failures.
+        # Session-level cleanup in conftest.py handles final teardown.
         if self.workspace is not None:
             self.workspace.destroy()
-        if backend == "trtllm":
-            cleanup_torch_distributed()
         trtllm_mnnvl_ar.mpi_barrier()
 
     def test_buffer_sufficient_for_smaller_size(self, backend):
