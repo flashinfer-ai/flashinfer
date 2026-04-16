@@ -1746,6 +1746,172 @@ def test_trtllm_gen_prefill(
         assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
 
 
+@pytest.mark.parametrize("backend", ["cute-dsl"])
+@pytest.mark.parametrize(
+    "mla_dimensions", [deepseek_mla_dimensions, smaller_mla_dimensions]
+)
+@pytest.mark.parametrize("batch_size", [4])
+@pytest.mark.parametrize("s_qo", [8192])
+@pytest.mark.parametrize("s_kv", [8192])
+@pytest.mark.parametrize("num_kv_heads", [128])
+@pytest.mark.parametrize("head_grp_size", [1])
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("skips_softmax", [False, True])
+def test_trtllm_gen_prefill_fp8(
+    backend: str,
+    mla_dimensions: MLAHeadDimensions,
+    batch_size: int,
+    s_qo: int,
+    s_kv: int,
+    num_kv_heads: int,
+    head_grp_size: int,
+    causal: bool,
+    skips_softmax: bool,
+) -> None:
+    """Test cute-dsl prefill with FP8 (e4m3) input, bf16 output."""
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] != 10:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+
+    head_dim_qk = mla_dimensions.qk_nope_head_dim + mla_dimensions.qk_rope_head_dim
+    head_dim_vo = mla_dimensions.v_head_dim
+    num_qo_heads = num_kv_heads * head_grp_size
+
+    seed = 0
+    torch.manual_seed(seed)
+    device = "cuda:0"
+
+    actual_seq_lens_q = torch.randint(
+        1, s_qo + 1, (batch_size, 1, 1, 1), dtype=torch.int32, device=device
+    )
+    actual_seq_lens_kv = torch.randint(
+        s_qo, s_kv + 1, (batch_size, 1, 1, 1), dtype=torch.int32, device=device
+    )
+    cumsum_s_qo = int(torch.sum(actual_seq_lens_q).item())
+    cumsum_s_kv = int(torch.sum(actual_seq_lens_kv).item())
+
+    # FP8 scales
+    scale_q, scale_k, scale_v = 0.05, 0.04, 0.06
+
+    # Generate in float32, quantize to FP8 with front-padding
+    q_f32 = (
+        torch.randn(
+            s_qo + cumsum_s_qo,
+            num_qo_heads,
+            head_dim_qk,
+            dtype=torch.float32,
+            device=device,
+        )
+        * 0.1
+    )
+    k_f32 = (
+        torch.randn(
+            s_kv + cumsum_s_kv,
+            num_kv_heads,
+            head_dim_qk,
+            dtype=torch.float32,
+            device=device,
+        )
+        * 0.1
+    )
+    v_f32 = (
+        torch.randn(
+            s_kv + cumsum_s_kv,
+            num_kv_heads,
+            head_dim_vo,
+            dtype=torch.float32,
+            device=device,
+        )
+        * 0.1
+    )
+
+    q = (q_f32 / scale_q).to(torch.float8_e4m3fn)[s_qo:]
+    k_cache = (k_f32 / scale_k).to(torch.float8_e4m3fn)[s_kv:]
+    v_cache = (v_f32 / scale_v).to(torch.float8_e4m3fn)[s_kv:]
+
+    # Reference: dequantize and run bf16 attention
+    q_bf16 = (q.float() * scale_q).to(torch.bfloat16)
+    k_bf16 = (k_cache.float() * scale_k).to(torch.bfloat16)
+    v_bf16 = (v_cache.float() * scale_v).to(torch.bfloat16)
+
+    qo_indptr = torch.cat(
+        [
+            torch.tensor([0], device=device),
+            torch.cumsum(actual_seq_lens_q.view(-1), dim=0),
+        ]
+    ).int()
+    kv_indptr = torch.cat(
+        [
+            torch.tensor([0], device=device),
+            torch.cumsum(actual_seq_lens_kv.view(-1), dim=0),
+        ]
+    ).int()
+
+    workspace_buffer, workspace_buffer_ref = create_workspace_buffers(device)
+
+    # Reference via cutlass backend (bf16)
+    wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace_buffer_ref,
+        kv_layout="NHD",
+        backend="cutlass",
+    )
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim_qk,
+        head_dim_vo=head_dim_vo,
+        causal=causal,
+        sm_scale=1.0 / (head_dim_qk**0.5),
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+    )
+    output_ref, _ = wrapper.run(q_bf16, k_bf16, v_bf16, return_lse=True)
+
+    # Output with front-padding
+    output_full = torch.empty(
+        s_qo + cumsum_s_qo,
+        num_qo_heads,
+        head_dim_vo,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    output = output_full[s_qo:]
+
+    scale = 1.0 / (head_dim_qk**0.5)
+    bmm1_scale = scale_q * scale_k * scale
+    bmm2_scale = scale_v
+
+    # Using a tiny threshold should give the same result as normal attention.
+    skip_softmax_threshold_scale_factor = 1e-30 if skips_softmax else None
+
+    output_fp8, _ = flashinfer.prefill.trtllm_ragged_attention_deepseek(
+        q,
+        k_cache,
+        v_cache,
+        workspace_buffer,
+        actual_seq_lens_kv,
+        s_qo,
+        s_kv,
+        bmm1_scale,
+        bmm2_scale,
+        -1,
+        batch_size,
+        -1,
+        qo_indptr,
+        kv_indptr,
+        False,
+        causal,
+        True,
+        skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+        out=output,
+        backend=backend,
+    )
+
+    torch.testing.assert_close(output_fp8, output_ref, atol=2e-2, rtol=2e-2)
+
+
 @pytest.mark.parametrize("backend", ["trtllm-native", "cute-dsl"])
 @pytest.mark.parametrize(
     "mla_dimensions", [deepseek_mla_dimensions, smaller_mla_dimensions]
