@@ -2354,20 +2354,6 @@ def trtllm_batch_decode_with_kv_cache(
         Only supported by trtllm-gen backend. Must be provided together with ``max_q_len``.
         When None, all requests use uniform query length specified by ``q_len_per_req``.
 
-    kv_block_scales : Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]] = None
-        Per-block scale factors for NVFP4 KV cache. Either a tuple of (k_scales, v_scales) or
-        a single tensor with shape ``[num_pages, 2, ...]`` that will be unbound along dim=1.
-        Each scale tensor has shape ``[num_pages, num_kv_heads, page_size, head_dim // 16]``
-        in HND layout, with dtype ``torch.float8_e4m3fn``.
-
-        **Contiguity requirements (trtllm-gen backend):**
-
-        - The last two dims (``page_size``, ``head_dim // 16``) **must** be contiguous
-          (i.e., ``stride[-1] == 1`` and ``stride[-2] == head_dim // 16``). This is because
-          the kernel reshapes them into ``(16, page_size * head_dim / 16 / 16)`` to satisfy
-          TMA's 16-byte box width minimum.
-        - The head and batch/page dims can have arbitrary strides.
-
     skip_softmax_threshold_scale_factor: Optional[float] = None
         threshold scale factor for skipping softmax operations.
         Providing a value for this parameter enables skip-softmax sparsity as described in: https://arxiv.org/abs/2512.12087
