@@ -18,7 +18,10 @@ def _get_rank_info_from_env():
         tuple: (rank, world_size, local_rank)
     """
     # Try SLURM environment variables first (set by srun)
-    if "SLURM_PROCID" in os.environ:
+    # Only use SLURM when SLURM_NTASKS > 1, meaning srun is the actual
+    # multi-process launcher. When SLURM_NTASKS == 1, srun launched a single
+    # container and another launcher (e.g. mpirun) handles multi-process.
+    if "SLURM_PROCID" in os.environ and int(os.environ.get("SLURM_NTASKS", "1")) > 1:
         rank = int(os.environ["SLURM_PROCID"])
         world_size = int(os.environ["SLURM_NTASKS"])
         local_rank = int(
