@@ -28,7 +28,7 @@ from __future__ import annotations
 import dataclasses
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import ClassVar, Optional, Tuple, Union
+from typing import ClassVar, Dict, Optional, Tuple, Union
 
 from torch import Tensor
 
@@ -301,11 +301,15 @@ class CutlassConfig:
 
 @dataclass(frozen=True)
 class CuteDslConfig:
-    """CuteDSL NVFP4 backend (Blackwell)."""
+    """CuteDSL NVFP4 backend — SM100 family only (Blackwell SM100, SM103).
+
+    The underlying CuteDSL kernel throws at launch on SM120/SM121/SM130.
+    """
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch >= 100
+        # SM100, SM103 — tighten when CuteDSL adds more targets
+        return arch in (100, 103)
 
     def __repr__(self) -> str:
         return "CuteDslConfig()"
@@ -601,12 +605,29 @@ class MoEActivationPack:
 
 @dataclass
 class MoEWeightPack:
-    """Long-lived NVFP4 weight tensors — held by parent module."""
+    """Long-lived weight container with per-backend native materializations.
 
-    w1_q: Tensor  # [E, 2*I, H//2] uint8
-    w1_scale: Tensor  # [E, 2*I, H//16] float8_e4m3fn
-    w2_q: Tensor  # [E, H, I//2] uint8
-    w2_scale: Tensor  # [E, H, I//16] float8_e4m3fn
-    w1_alpha: Tensor  # [E] float32
-    w2_alpha: Tensor  # [E] float32
-    fc2_input_scale: Tensor  # [1] float32
+    Each backend's native weight layout (quantized, swizzled, MMA-ordered, etc.)
+    is stored under its ``backend_key``.  Populated once at model-load /
+    layer-init via ``prepare_for(key, view)``; read on every call via
+    ``get_view(key)``.
+
+    Holding multiple materializations is intentional — that's the memory cost
+    the user pays for cross-backend autotune.  Each view is the exact kwargs
+    dict that runner's ``forward`` expects for weight-side arguments.
+    """
+
+    native_views: Dict[str, Dict[str, Tensor]] = field(default_factory=dict)
+
+    def prepare_for(self, backend_key: str, view: Dict[str, Tensor]) -> None:
+        """Register a backend-native weight view.  Caller owns the quantization
+        / swizzle / layout conversion — this method just stores the result."""
+        self.native_views[backend_key] = view
+
+    def get_view(self, backend_key: str) -> Dict[str, Tensor]:
+        if backend_key not in self.native_views:
+            raise KeyError(
+                f"Weights not prepared for backend {backend_key!r}. "
+                f"Available: {list(self.native_views)}"
+            )
+        return self.native_views[backend_key]

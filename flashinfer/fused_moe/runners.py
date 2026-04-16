@@ -57,28 +57,30 @@ class CuteDslNvfp4Runner(TunableRunner):
     ) -> torch.Tensor:
         return self._inner.forward(inputs, tactic=tactic, **kwargs)
 
-    @staticmethod
     def pack_inputs(
-        act: MoEActivationPack, weights: MoEWeightPack
+        self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
         """Translate Packs → List[Tensor] expected by CuteDslFusedMoENvfp4Runner.
 
+        Expected weight view keys: w1_weight, w1_weight_sf, w1_alpha,
+        fc2_input_scale, w2_weight, w2_weight_sf, w2_alpha.
         Input order: x, x_sf, token_selected_experts, token_final_scales,
                      w1_weight, w1_weight_sf, w1_alpha, fc2_input_scale,
-                     w2_weight, w2_weight_sf, w2_alpha
+                     w2_weight, w2_weight_sf, w2_alpha.
         """
+        v = weights.get_view(self.backend_key)
         return [
             act.hidden_states_q,
             act.hidden_states_scale.unsqueeze(-1),  # CuteDSL expects [M, H//16, 1]
             act.selected_experts,
             act.final_scales,
-            weights.w1_q,
-            weights.w1_scale,
-            weights.w1_alpha,
-            weights.fc2_input_scale,
-            weights.w2_q,
-            weights.w2_scale,
-            weights.w2_alpha,
+            v["w1_weight"],
+            v["w1_weight_sf"],
+            v["w1_alpha"],
+            v["fc2_input_scale"],
+            v["w2_weight"],
+            v["w2_weight_sf"],
+            v["w2_alpha"],
         ]
 
     def __hash__(self):
@@ -200,6 +202,9 @@ class TrtllmFp4RoutedRunner(TunableRunner):
             gemm1_alpha,
             gemm2_weights,
             gemm2_weights_scale,
+            output1_scale_scalar,  # may be None
+            output1_scale_gate_scalar,  # may be None
+            output2_scale_scalar,  # may be None
         ) = inputs
 
         cfg = self.config
@@ -226,9 +231,9 @@ class TrtllmFp4RoutedRunner(TunableRunner):
             gemm2_weights,
             gemm2_weights_scale,
             None,  # gemm2_bias
-            None,  # output1_scale_scalar
-            None,  # output1_scale_gate_scalar
-            None,  # output2_scale_scalar
+            output1_scale_scalar,
+            output1_scale_gate_scalar,
+            output2_scale_scalar,
             routing.num_experts,
             routing.top_k,
             routing.n_group,
@@ -246,17 +251,21 @@ class TrtllmFp4RoutedRunner(TunableRunner):
         )
         return results[0]
 
-    @staticmethod
     def pack_inputs(
+        self,
         act: MoEActivationPack,
         weights: MoEWeightPack,
         local_expert_offset: int = 0,
     ) -> List[torch.Tensor]:
         """Translate Packs → List[Tensor] for TRTLLM routed forward.
 
+        Expected weight view keys: gemm1_weights, gemm1_weights_scale,
+        gemm1_alpha, gemm2_weights, gemm2_weights_scale, and optionally
+        output1_scale_scalar, output1_scale_gate_scalar, output2_scale_scalar.
         Packs expert ids + routing weights into the int32 format TRTLLM expects:
-        ((expert_id - offset) << 16) | bf16_bits_of_weight
+        ((expert_id - offset) << 16) | bf16_bits_of_weight.
         """
+        v = weights.get_view(self.backend_key)
         ids = act.selected_experts - local_expert_offset
         weight_bf16_bits = (
             act.final_scales.to(torch.bfloat16).view(torch.int16).to(torch.int32)
@@ -267,11 +276,14 @@ class TrtllmFp4RoutedRunner(TunableRunner):
             topk_ids,
             act.hidden_states_q,
             act.hidden_states_scale,
-            weights.w1_q,
-            weights.w1_scale,
-            weights.w1_alpha,
-            weights.w2_q,
-            weights.w2_scale,
+            v["gemm1_weights"],
+            v["gemm1_weights_scale"],
+            v["gemm1_alpha"],
+            v["gemm2_weights"],
+            v["gemm2_weights_scale"],
+            v.get("output1_scale_scalar"),
+            v.get("output1_scale_gate_scalar"),
+            v.get("output2_scale_scalar"),
         ]
 
     def __hash__(self):
