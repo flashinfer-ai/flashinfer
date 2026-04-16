@@ -52,7 +52,9 @@ main() {
     install_and_verify
 
     # --- Phase 1: MPI-based tests (run with mpirun) ---
-    : "${PYTEST_COMMAND_PREFIX:=mpirun -np 4}"
+    # Use "-launcher fork" to prevent Hydra from auto-detecting Slurm and
+    # trying to use srun (which is not available inside containers).
+    : "${PYTEST_COMMAND_PREFIX:=mpirun -launcher fork -np 4}"
     echo "=== Phase 1: MPI-based multi-GPU tests (running with: ${PYTEST_COMMAND_PREFIX}) ==="
     for test_file in $MPI_TEST_FILES; do
         echo "  $test_file"
