@@ -393,6 +393,16 @@ class AutoTuner:
             cache_key = AutoTuner._get_cache_key(
                 custom_op, r, input_shapes, tuning_config
             )
+            if os.environ.get("FLASHINFER_AUTOTUNER_TRACE", "0") == "1":
+                logger.debug(
+                    f"[AutoTuner] op={custom_op} "
+                    f"runner_hash={hash(r)} "
+                    f"input_shapes={input_shapes} "
+                    f"nearest_profile={cache_key[-1]} "
+                    f"cache_key={cache_key} "
+                    f"hit={cache_key in self.profiling_cache} "
+                    f"cache_size={len(self.profiling_cache)}"
+                )
             if (
                 os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0") == "1"
                 and not self.is_tuning_mode
@@ -770,11 +780,11 @@ class AutoTuner:
         base_profile = list(list(shape) for shape in shapes)
 
         for spec in tuning_config.dynamic_tensor_specs:
-            base_profile[spec.input_idx[0]][spec.dim_idx[0]] = (
-                spec.map_to_tuning_buckets(
-                    base_profile[spec.input_idx[0]][spec.dim_idx[0]]
-                )
+            mapped_value = spec.map_to_tuning_buckets(
+                base_profile[spec.input_idx[0]][spec.dim_idx[0]]
             )
+            for i_idx, d_idx in zip(spec.input_idx, spec.dim_idx, strict=True):
+                base_profile[i_idx][d_idx] = mapped_value
 
         # associated dimensions dependent on other free dynamic dimensions, so assign -1 in the profile
         for constraint_spec in tuning_config.constraint_specs:
