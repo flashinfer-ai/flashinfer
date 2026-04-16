@@ -3744,6 +3744,10 @@ def trtllm_ragged_attention_deepseek(
                 "cute-dsl backend does not support attention_sinks (ignored)",
                 stacklevel=2,
             )
+        _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
+        assert query.dtype in _SUPPORTED_DTYPES, (
+            f"cute-dsl backend only supports {_SUPPORTED_DTYPES}, got {query.dtype}"
+        )
         # TODO: support device tensor scales to avoid D2H sync overhead
         assert not isinstance(bmm1_scale, torch.Tensor), (
             "cute-dsl backend does not support device tensor bmm1_scale"

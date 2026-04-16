@@ -1586,7 +1586,6 @@ def test_trtllm_gen_prefill(
             pytest.skip("cute-dsl does not support bf16 with head_dim=192")
 
     num_qo_heads = num_kv_heads * head_grp_size
-    head_dim_qk = mla_dimensions.qk_nope_head_dim + mla_dimensions.qk_rope_head_dim
     head_dim_vo = mla_dimensions.v_head_dim
 
     seed = 0
