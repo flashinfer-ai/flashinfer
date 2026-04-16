@@ -224,8 +224,23 @@ def test_mixed_comm(local_size, num_nodes, node_id, dtype, dist_init_method):
         )
         process.start()
         process_list.append(process)
-    for idx, process in enumerate(process_list):
-        process.join()
-        assert process.exitcode == 0, (
-            f"Process {idx} failed with exit code {process.exitcode}"
+    # Poll workers and fail fast if any exits non-zero, to avoid deadlocks
+    # where peers are stuck in collectives after a worker crash.
+    failed = None
+    while any(p.is_alive() for p in process_list):
+        for idx, p in enumerate(process_list):
+            p.join(timeout=10.0)
+            if p.exitcode is not None and p.exitcode != 0 and failed is None:
+                failed = idx
+                break
+        if failed is not None:
+            for p in process_list:
+                if p.is_alive():
+                    p.terminate()
+            for p in process_list:
+                p.join(timeout=5.0)
+            break
+    if failed is not None:
+        raise RuntimeError(
+            f"Worker {failed} failed with exit code {process_list[failed].exitcode}"
         )

@@ -692,7 +692,9 @@ class MixedCommHandler:
                 uc_handle_list[(local_rank - rel_rank) % local_size] = checkCudaErrors(
                     cuda.cuMemImportFromShareableHandle(uc_fd_recv, self.vm_handle_type)
                 )
+                os.close(uc_fd_recv)
                 torch.distributed.barrier(group=self.local_comm_group)
+            os.close(uc_fd_send)
             return uc_handle_list
 
         def create_and_send_mc_handle(sock, mc_prop, rank_list):
@@ -703,6 +705,7 @@ class MixedCommHandler:
             )
             for rank in rank_list[1:]:
                 send_fd(sock, mc_fd, rank)
+            os.close(mc_fd)
             checkCudaErrors(cuda.cuMulticastAddDevice(mc_handle, self.device.index))
             return mc_handle
 
@@ -712,6 +715,7 @@ class MixedCommHandler:
             mc_handle = checkCudaErrors(
                 cuda.cuMemImportFromShareableHandle(mc_fd, self.vm_handle_type)
             )
+            os.close(mc_fd)
             checkCudaErrors(cuda.cuMulticastAddDevice(mc_handle, self.device.index))
             return mc_handle
 
