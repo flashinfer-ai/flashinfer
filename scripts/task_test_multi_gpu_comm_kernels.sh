@@ -42,6 +42,7 @@ NVSHMEM_TEST_FILES="tests/comm/test_nvshmem.py tests/comm/test_nvshmem_allreduce
 # =============================================================================
 
 main() {
+    EXIT_CODE=0
     # Parse command line arguments
     parse_args "$@"
 
