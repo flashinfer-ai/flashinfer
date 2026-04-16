@@ -23,10 +23,10 @@ from .gemm_base import (
     is_cudnn_override_shape_available as is_cudnn_override_shape_available,
     build_cudnn_gemm_bf16_graph_override_shape as build_cudnn_gemm_bf16_graph_override_shape,
     execute_cudnn_gemm_bf16_graph_override_shape as execute_cudnn_gemm_bf16_graph_override_shape,
-    build_cudnn_fp4_gemm_graph_override_shape as build_cudnn_fp4_gemm_graph_override_shape,
-    execute_cudnn_fp4_gemm_graph_override_shape as execute_cudnn_fp4_gemm_graph_override_shape,
-    build_cudnn_mxfp8_gemm_graph_override_shape as build_cudnn_mxfp8_gemm_graph_override_shape,
-    execute_cudnn_mxfp8_gemm_graph_override_shape as execute_cudnn_mxfp8_gemm_graph_override_shape,
+    build_cudnn_gemm_fp4_graph_override_shape as build_cudnn_gemm_fp4_graph_override_shape,
+    execute_cudnn_gemm_fp4_graph_override_shape as execute_cudnn_gemm_fp4_graph_override_shape,
+    build_cudnn_gemm_mxfp8_graph_override_shape as build_cudnn_gemm_mxfp8_graph_override_shape,
+    execute_cudnn_gemm_mxfp8_graph_override_shape as execute_cudnn_gemm_mxfp8_graph_override_shape,
     build_cudnn_gemm_with_per_tensor_q_graph_override_shape as build_cudnn_gemm_with_per_tensor_q_graph_override_shape,
     execute_cudnn_gemm_with_per_tensor_q_graph_override_shape as execute_cudnn_gemm_with_per_tensor_q_graph_override_shape,
 )
@@ -57,6 +57,18 @@ try:
 except ImportError:
     pass
 
+try:
+    from flashinfer.cute_dsl.utils import is_cute_dsl_available
+
+    if is_cute_dsl_available():
+        from .kernels.dense_blockscaled_gemm_sm120 import (
+            Sm120BlockScaledDenseGemmKernel as Sm120BlockScaledDenseGemmKernel,
+        )
+
+        _cute_dsl_kernels.append("Sm120BlockScaledDenseGemmKernel")
+except ImportError:
+    pass
+
 __all__ = [
     "SegmentGEMMWrapper",
     "bmm_bf16",
@@ -81,10 +93,10 @@ __all__ = [
     "is_cudnn_override_shape_available",
     "build_cudnn_gemm_bf16_graph_override_shape",
     "execute_cudnn_gemm_bf16_graph_override_shape",
-    "build_cudnn_fp4_gemm_graph_override_shape",
-    "execute_cudnn_fp4_gemm_graph_override_shape",
-    "build_cudnn_mxfp8_gemm_graph_override_shape",
-    "execute_cudnn_mxfp8_gemm_graph_override_shape",
+    "build_cudnn_gemm_fp4_graph_override_shape",
+    "execute_cudnn_gemm_fp4_graph_override_shape",
+    "build_cudnn_gemm_mxfp8_graph_override_shape",
+    "execute_cudnn_gemm_mxfp8_graph_override_shape",
     "build_cudnn_gemm_with_per_tensor_q_graph_override_shape",
     "execute_cudnn_gemm_with_per_tensor_q_graph_override_shape",
 ] + _cute_dsl_kernels
