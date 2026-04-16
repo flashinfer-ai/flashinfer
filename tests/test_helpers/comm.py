@@ -85,8 +85,11 @@ def _get_master_addr():
     if "MASTER_ADDR" in os.environ:
         return os.environ["MASTER_ADDR"]
 
-    # For SLURM multi-node: get first node from nodelist
-    if "SLURM_NODELIST" in os.environ:
+    # For SLURM multi-node: get first node from nodelist.
+    # Only use SLURM_NODELIST when SLURM_NTASKS > 1 (srun is the actual launcher).
+    # When SLURM_NTASKS == 1, srun launched a single container and mpirun handles
+    # multi-process — all ranks are local, so "localhost" is correct.
+    if "SLURM_NODELIST" in os.environ and int(os.environ.get("SLURM_NTASKS", "1")) > 1:
         import subprocess
 
         try:
