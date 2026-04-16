@@ -38,7 +38,6 @@ class TestMNNVLUnsupportedPatterns:
             max_token_num=128,
             hidden_dim=2880,
             dtype=torch.float16,
-            topology="single_node",
             gpus_per_node=self.gpus_per_node,
         )
 
@@ -132,7 +131,6 @@ class TestMNNVLMissingRequiredParameters:
             max_token_num=128,
             hidden_dim=2880,
             dtype=torch.float16,
-            topology="single_node",
             gpus_per_node=self.gpus_per_node,
         )
 
@@ -202,9 +200,7 @@ class TestBufferSizeSufficient:
             max_token_num=self.max_token_num,
             hidden_dim=self.hidden_dim,
             dtype=self.dtype,
-            topology="single_node",
             gpus_per_node=self.gpus_per_node,
-            process_group=self.process_group,
         )
 
         yield

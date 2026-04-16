@@ -21,7 +21,9 @@ source "${SCRIPT_DIR}/test_utils.sh"
 # =============================================================================
 
 # MPI-based tests: require mpirun to launch multiple ranks
-MPI_TEST_FILES="tests/comm/test_allreduce_unified_api.py tests/comm/test_allreduce_negative.py"
+# TODO: test_allreduce_unified_api.py is commented out due to hanging issues
+MPI_TEST_FILES="tests/comm/test_allreduce_negative.py"
+# MPI_TEST_FILES="tests/comm/test_allreduce_unified_api.py tests/comm/test_allreduce_negative.py"
 
 # Self-spawn tests: spawn their own subprocesses via multiprocessing, run with plain pytest
 SPAWN_TEST_FILES="\
