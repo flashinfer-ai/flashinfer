@@ -3663,6 +3663,12 @@ def trtllm_ragged_attention_deepseek(
         output tensor, if not provided, will be allocated with shape [query.shape[0], query.shape[1], value.shape[2]]
     lse : Optional[torch.Tensor]
         lse tensor, if not provided, will be allocated with shape [query.shape[0], query.shape[1]]
+    backend : str
+        Attention backend to use. "trtllm-native" (default) or "cute-dsl".
+        When backend="cute-dsl", query/key/value/out tensors must be
+        front-padded with max_seq_len rows of valid GPU memory before
+        index 0 (see ``cute_dsl_fmha_ragged_prefill`` for details).
+        This requirement will be removed in the next MR.
 
     Returns
     -------

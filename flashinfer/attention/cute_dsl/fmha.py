@@ -49,16 +49,7 @@ from flashinfer.artifacts import ArtifactPath
 
 DSL_FMHA_ARTIFACT_PATH = ArtifactPath.DSL_FMHA
 
-
-def _get_cpu_arch() -> str:
-    """Return CPU architecture string matching artifactory layout."""
-    import platform
-
-    machine = platform.machine()
-    # Normalize: aarch64/arm64 -> aarch64, x86_64/AMD64 -> x86_64
-    if machine in ("aarch64", "arm64"):
-        return "aarch64"
-    return "x86_64"
+from flashinfer.artifacts import _get_host_cpu_arch as _get_cpu_arch
 
 
 def _get_gpu_arch() -> str:
@@ -331,16 +322,31 @@ def cute_dsl_fmha_ragged_prefill(
     Note: The DSL FMHA kernel only supports per-tensor scalar scales, not
     per-head scale tensors.
 
+    **Front-padding requirement** (TODO: will be removed in the next MR):
+    The DSL kernel applies a negative pointer offset
+    (``-max_seq_len * H * D`` elements) internally.  Callers must
+    allocate ``max_seq_len + total_tokens`` rows and pass the slice starting
+    at ``[max_seq_len:]`` as q/k/v/o so that the preceding memory is valid
+    GPU memory.  For example::
+
+        q_full = torch.empty(max_s_q + total_q, H_q, D, ...)
+        q = q_full[max_s_q:]          # pass this to the kernel
+        # (same for k, v, o with max_s_k / max_s_q respectively)
+
     Parameters
     ----------
     q : torch.Tensor
         Query tensor, shape (total_q_tokens, H_q, D).
+        Must have ``max_qo_len`` rows of valid GPU memory before index 0.
     k : torch.Tensor
         Key tensor, shape (total_kv_tokens, H_k, D).
+        Must have ``max_kv_len`` rows of valid GPU memory before index 0.
     v : torch.Tensor
         Value tensor, shape (total_kv_tokens, H_k, D_v).
+        Must have ``max_kv_len`` rows of valid GPU memory before index 0.
     o : torch.Tensor
         Output tensor, shape (total_q_tokens, H_q, D_v). Modified in-place.
+        Must have ``max_qo_len`` rows of valid GPU memory before index 0.
     qo_indptr : torch.Tensor
         Cumulative sequence lengths for Q/O, shape (batch_size + 1,).
         Same as cum_seqlen_q in DSL FMHA kernel.

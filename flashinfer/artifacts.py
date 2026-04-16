@@ -166,6 +166,8 @@ class CheckSumHash:
     TRTLLM_GEN_GEMM: str = (
         "64b7114a429ea153528dd4d4b0299363d7320964789eb5efaefec66f301523c7"
     )
+    # SHA256 of the checksums.txt manifest file per cpu-arch/sm-arch,
+    # NOT hashes of individual kernel .so files.
     DSL_FMHA_CHECKSUMS: dict[str, dict[str, str]] = {
         "x86_64": {
             "sm_100a": "533b56cf30fed9ecee5e305eb50cbf3c1a86ed7ef946f7c0b2530792c391452b",
