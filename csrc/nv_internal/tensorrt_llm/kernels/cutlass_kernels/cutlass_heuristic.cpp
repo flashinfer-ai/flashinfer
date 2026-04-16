@@ -390,8 +390,7 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm90(
     if (has_w4afp8) {
       bool const has_coop_supported = sm90_supports_coop(tile_config);
       std::set<MainloopScheduleType> mainloop_schedules{MainloopScheduleType::PINGPONG};
-      if (has_coop_supported
-          && tile_config != CutlassTileConfigSM90::CtaShape128x128x128B) {
+      if (has_coop_supported && tile_config != CutlassTileConfigSM90::CtaShape128x128x128B) {
         // Due to register pressure on SM90, cooperative scheduler does not
         // work with the 128x128x128B tile for mixed-dtype (W4A16) GEMM.
         // Only PINGPONG is used for that tile to avoid register overflow.
