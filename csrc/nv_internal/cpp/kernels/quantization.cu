@@ -236,6 +236,18 @@ CUtensorMap make_3d_tma_copy_desc(T* global_address, uint64_t gmem_dim[3],
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Per-token Nvfp4 kernel
 
+#define DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SF_LAYOUT)                               \
+  if constexpr (std::is_same_v<T, float>)                                                       \
+    nvfp4QuantAndPerTokenScaleFP32Kernel<BLOCK_SIZE, QuantizationSFLayout::SF_LAYOUT,           \
+                                         CACHE_LOCAL_AMAX><<<grid, block, smem_size, stream>>>( \
+        m, n, input, globalScaleInv, expandedIdxToPermutedIdx, weightOutput, scaleOutput,       \
+        perTokenScaleOutput);                                                                   \
+  else                                                                                          \
+    nvfp4QuantAndPerTokenScaleKernel<T, BLOCK_SIZE, QuantizationSFLayout::SF_LAYOUT,            \
+                                     CACHE_LOCAL_AMAX><<<grid, block, smem_size, stream>>>(     \
+        m, n, input, globalScaleInv, expandedIdxToPermutedIdx, weightOutput, scaleOutput,       \
+        perTokenScaleOutput);
+
 template <typename T>
 void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, float globalScaleInv,
                                       int32_t* expandedIdxToPermutedIdx, uint8_t* weightOutput,
@@ -245,31 +257,24 @@ void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, fl
   TLLM_CHECK_WITH_INFO(n % 16 == 0, "n must be a multiple of 16 for NVFP4 quantization");
   // TODO(siyuan): cache local amax in registers.
   //               currently caching the amax doesn't bring perf improvement.
-  constexpr bool CACHE_LOCAL_AMAX = false;
+  constexpr bool CACHE_LOCAL_AMAX = std::is_same_v<T, float>;
+  constexpr uint32_t ELTS_PER_THREAD =
+      std::is_same_v<T, float> ? 8 : CVT_FP16_TO_FP4_ELTS_PER_THREAD;
 
   constexpr uint32_t BLOCK_SIZE = 256;
-  uint32_t smem_size = CACHE_LOCAL_AMAX ? n / CVT_FP16_TO_FP4_ELTS_PER_THREAD * sizeof(float)
-                                        : 0;  // for caching the local amax
+  uint32_t smem_size =
+      CACHE_LOCAL_AMAX ? n / ELTS_PER_THREAD * sizeof(float) : 0;  // for caching the local amax
   dim3 block(BLOCK_SIZE);
   dim3 grid(m);
   switch (sfLayout) {
     case QuantizationSFLayout::LINEAR:
-      nvfp4QuantAndPerTokenScaleKernel<T, BLOCK_SIZE, QuantizationSFLayout::LINEAR,
-                                       CACHE_LOCAL_AMAX><<<grid, block, smem_size, stream>>>(
-          m, n, input, globalScaleInv, expandedIdxToPermutedIdx, weightOutput, scaleOutput,
-          perTokenScaleOutput);
+      DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(LINEAR);
       break;
     case QuantizationSFLayout::SWIZZLED_128x4:
-      nvfp4QuantAndPerTokenScaleKernel<T, BLOCK_SIZE, QuantizationSFLayout::SWIZZLED_128x4,
-                                       CACHE_LOCAL_AMAX><<<grid, block, smem_size, stream>>>(
-          m, n, input, globalScaleInv, expandedIdxToPermutedIdx, weightOutput, scaleOutput,
-          perTokenScaleOutput);
+      DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SWIZZLED_128x4);
       break;
     case QuantizationSFLayout::SWIZZLED_8x4:
-      nvfp4QuantAndPerTokenScaleKernel<T, BLOCK_SIZE, QuantizationSFLayout::SWIZZLED_8x4,
-                                       CACHE_LOCAL_AMAX><<<grid, block, smem_size, stream>>>(
-          m, n, input, globalScaleInv, expandedIdxToPermutedIdx, weightOutput, scaleOutput,
-          perTokenScaleOutput);
+      DISPATCH_NVP4_QUANT_AND_PER_TOKEN_SCALE_KERNEL(SWIZZLED_8x4);
       break;
     default:
       TLLM_CHECK_WITH_INFO(false,
@@ -279,6 +284,10 @@ void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, fl
 }
 
 // Instantiate the function.
+template void invokeNvfp4QuantAndPerTokenScale<float>(
+    uint32_t m, uint32_t n, float const* input, float globalScaleInv,
+    int32_t* expandedIdxToPermutedIdx, uint8_t* weightOutput, uint8_t* scaleOutput,
+    float* perTokenScaleOutput, QuantizationSFLayout sfLayout, cudaStream_t stream);
 template void invokeNvfp4QuantAndPerTokenScale<half>(
     uint32_t m, uint32_t n, half const* input, float globalScaleInv,
     int32_t* expandedIdxToPermutedIdx, uint8_t* weightOutput, uint8_t* scaleOutput,
