@@ -20,6 +20,7 @@
 
 #include <cfloat>
 #include <cstdint>
+#include <cstring>
 #include <cuda/std/cfloat>
 #include <iterator>
 #include <memory>
@@ -112,6 +113,13 @@ class TllmGenFmhaKernel {
     for (unsigned int i = 0; i < mKernelMetaCount; ++i) {
       auto const& kernelMeta = mKernelMeta[i];
       IKL_LOG_DEBUG("Checking tllmgen attention kernel %s", kernelMeta.mFuncName);
+      // Skip SageAttention kernels: they share the same hashID as their non-sage
+      // counterparts (sage block sizes are not part of the hash), which causes
+      // false "hash conflict" failures. SageAttention is not exposed through the
+      // flashinfer interface, so dropping these entries is safe.
+      if (kernelMeta.mFuncName != nullptr && std::strstr(kernelMeta.mFuncName, "Sage") != nullptr) {
+        continue;
+      }
       if (isSMCompatible(mSM, kernelMeta.mSM) && kernelMeta.mDataTypeQ == mDtypeQ &&
           kernelMeta.mDataTypeKv == mDtypeKv && kernelMeta.mDataTypeO == mDtypeOut) {
         // Store metadata for later use.
