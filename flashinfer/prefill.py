@@ -3722,7 +3722,7 @@ def trtllm_ragged_attention_deepseek(
         )
 
     if backend == "cute-dsl":
-        from .attention_dsl.cute_dsl.fmha import cute_dsl_fmha_ragged_prefill
+        from .attention.cute_dsl.fmha import cute_dsl_fmha_ragged_prefill
 
         import warnings
 

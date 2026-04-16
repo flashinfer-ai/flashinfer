@@ -249,7 +249,7 @@ def test_batch_ragged_prefill_cute_dsl(
     dtype, head_dim, is_causal, seq_lens_q, seq_lens_k, H_q, H_k
 ):
     """Test cute_dsl_fmha_ragged_prefill with variable-length sequences."""
-    from flashinfer.attention_dsl.cute_dsl.fmha import cute_dsl_fmha_ragged_prefill
+    from flashinfer.attention.cute_dsl.fmha import cute_dsl_fmha_ragged_prefill
 
     torch.manual_seed(42)
     D = head_dim
