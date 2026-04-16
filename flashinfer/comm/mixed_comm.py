@@ -52,6 +52,18 @@ from ..utils import backend_requirement, supported_compute_capability
 
 @functools.cache
 def get_mixed_comm_module():
+    """Load and return the JIT-compiled mixed communication module.
+
+    Locates the nvshmem host library, loads it globally, and builds/loads
+    the mixed communication CUDA module via JIT compilation. The result
+    is cached so the module is compiled only once per process.
+
+    Returns:
+        The compiled and loaded mixed communication module.
+
+    Raises:
+        FileNotFoundError: If libnvshmem_host.so cannot be found.
+    """
     import nvidia.nvshmem
 
     # Try to find libnvshmem_host.so first, fallback to libnvshmem_host.so.3
@@ -77,18 +89,26 @@ def get_mixed_comm_module():
 
 
 def _get_element_size(dtype: torch.dtype) -> int:
+    """Return the size in bytes of a single element of the given dtype."""
     return torch.empty((), dtype=dtype).element_size()
 
 
 def _ceil_div(x: int, y: int) -> int:
+    """Return the ceiling of integer division x / y."""
     return (x + y - 1) // y
 
 
 def _round_up(x: int, y: int) -> int:
+    """Round x up to the nearest multiple of y."""
     return _ceil_div(x, y) * y
 
 
 class MixedCommOp(enum.IntEnum):
+    """Enumeration of mixed communication operation types.
+
+    Values must be aligned with ``MixedCommOp`` in ``mixed_comm.cuh``.
+    """
+
     # Should be aligned with MixedCommOp in mixed_comm.cuh
     ALLREDUCE = 0
     ALLGATHER = enum.auto()
@@ -98,6 +118,15 @@ class MixedCommOp(enum.IntEnum):
 
 
 class MixedCommMode(enum.IntEnum):
+    """Enumeration of mixed communication execution modes.
+
+    Fused modes run a single fused kernel using virtual memory (intra-node)
+    and nvshmem (inter-node). NCCL modes delegate to one or more NCCL
+    collective calls. AUTOTUNE selects the best mode based on profiling.
+
+    Fused values must be aligned with ``MixedCommMode`` in ``mixed_comm.cuh``.
+    """
+
     # Run a fused kernel (should be aligned with MixedCommMode in mixed_comm.cuh)
     FUSED_OPT_WAITS_MC = 0
     FUSED_OPT_WAITS_UC = enum.auto()
@@ -114,6 +143,26 @@ class MixedCommMode(enum.IntEnum):
 
 
 class ParallelInfo:
+    """Describes the parallel topology for mixed communication.
+
+    Encodes the hierarchical decomposition of ranks into local (intra-node)
+    and inter (inter-node) groups, further split into tensor-parallel (TP)
+    and data-parallel (DP) sub-groups. Provides convenience properties and
+    helpers to create ``torch.distributed`` process groups for each axis.
+
+    Args:
+        world_rank: Global rank of the current process.
+        world_size: Total number of processes.
+        local_rank: Rank within the current node.
+        local_size: Number of processes per node.
+        inter_rank: Index of the current node.
+        inter_size: Total number of nodes.
+        local_tp_size: Intra-node TP group size. Defaults to ``local_size``.
+        local_dp_size: Intra-node DP group size. Defaults to 1.
+        inter_tp_size: Inter-node TP group size. Defaults to ``inter_size``.
+        inter_dp_size: Inter-node DP group size. Defaults to 1.
+    """
+
     def __init__(
         self,
         world_rank: int,
@@ -127,6 +176,7 @@ class ParallelInfo:
         inter_tp_size: int | None,
         inter_dp_size: int | None,
     ):
+        """Initialize parallel topology information and compute derived ranks."""
         self._world_rank = world_rank
         self._world_size = world_size
         self._local_rank = local_rank
@@ -172,101 +222,126 @@ class ParallelInfo:
 
     @property
     def world_rank(self):
+        """Global rank of the current process."""
         return self._world_rank
 
     @property
     def world_size(self):
+        """Total number of processes in the distributed group."""
         return self._world_size
 
     @property
     def local_rank(self):
+        """Rank of the current process within its node."""
         return self._local_rank
 
     @property
     def local_size(self):
+        """Number of processes per node."""
         return self._local_size
 
     @property
     def inter_rank(self):
+        """Index of the current node."""
         return self._inter_rank
 
     @property
     def inter_size(self):
+        """Total number of nodes."""
         return self._inter_size
 
     @property
     def local_tp_rank(self):
+        """Tensor-parallel rank within the intra-node group."""
         return self._local_tp_rank
 
     @property
     def local_tp_size(self):
+        """Tensor-parallel group size within a node."""
         return self._local_tp_size
 
     @property
     def local_dp_rank(self):
+        """Data-parallel rank within the intra-node group."""
         return self._local_dp_rank
 
     @property
     def local_dp_size(self):
+        """Data-parallel group size within a node."""
         return self._local_dp_size
 
     @property
     def inter_tp_rank(self):
+        """Tensor-parallel rank across nodes."""
         return self._inter_tp_rank
 
     @property
     def inter_tp_size(self):
+        """Tensor-parallel group size across nodes."""
         return self._inter_tp_size
 
     @property
     def inter_dp_rank(self):
+        """Data-parallel rank across nodes."""
         return self._inter_dp_rank
 
     @property
     def inter_dp_size(self):
+        """Data-parallel group size across nodes."""
         return self._inter_dp_size
 
     @property
     def tp_rank(self):
+        """Global tensor-parallel rank."""
         return self.local_tp_rank + self.inter_tp_rank * self.local_tp_size
 
     @property
     def tp_size(self):
+        """Global tensor-parallel group size."""
         return self.local_tp_size * self.inter_tp_size
 
     @property
     def dp_rank(self):
+        """Global data-parallel rank."""
         return self.local_dp_rank + self.inter_dp_rank * self.local_dp_size
 
     @property
     def dp_size(self):
+        """Global data-parallel group size."""
         return self.local_dp_size * self.inter_dp_size
 
     @property
     def use_local_tp(self):
+        """Whether intra-node tensor parallelism is active."""
         return self.local_tp_size > 1
 
     @property
     def use_inter_tp(self):
+        """Whether inter-node tensor parallelism is active."""
         return self.inter_tp_size > 1
 
     @property
     def use_tp(self):
+        """Whether tensor parallelism is active (local or inter)."""
         return self.tp_size > 1
 
     @property
     def use_dp(self):
+        """Whether data parallelism is active."""
         return self.dp_size > 1
 
     @property
     def use_inter(self):
+        """Whether multi-node communication is needed."""
         return self.inter_size > 1
 
     @property
     def use_mixed(self):
+        """Whether both TP and DP are active (mixed parallelism)."""
         return self.use_tp and self.use_dp
 
     def get_local_comm_group(self):
+        """Create and return a ``torch.distributed`` process group for all ranks on this node."""
         world_rank_list_all = [
             list(
                 range(inter_rank * self.local_size, (inter_rank + 1) * self.local_size)
@@ -280,6 +355,7 @@ class ParallelInfo:
         return local_comm_group_list[self.inter_rank]
 
     def get_tp_comm_group(self):
+        """Create and return a ``torch.distributed`` process group for the TP axis."""
         world_rank_list_all = []
         for inter_dp_rank in range(self.inter_dp_size):
             for local_dp_rank in range(self.local_dp_size):
@@ -298,6 +374,7 @@ class ParallelInfo:
         return tp_comm_group_list[self.dp_rank]
 
     def get_dp_comm_group(self):
+        """Create and return a ``torch.distributed`` process group for the DP axis."""
         world_rank_list_all = []
         for inter_tp_rank in range(self.inter_tp_size):
             for local_tp_rank in range(self.local_tp_size):
@@ -316,9 +393,15 @@ class ParallelInfo:
         return dp_comm_group_list[self.tp_rank]
 
     def get_local_full_group_local_ranks(self):
+        """Return the list of all local ranks on the current node."""
         return list(range(self.local_size))
 
     def get_local_tp_group_local_ranks(self, local_dp_rank: int | None = None):
+        """Return local ranks belonging to a TP sub-group on this node.
+
+        Args:
+            local_dp_rank: The DP rank whose TP group to query. Defaults to this process's DP rank.
+        """
         if local_dp_rank is None:
             local_dp_rank = self.local_dp_rank
         return list(
@@ -329,6 +412,11 @@ class ParallelInfo:
         )
 
     def get_local_dp_group_local_ranks(self, local_tp_rank: int | None = None):
+        """Return local ranks belonging to a DP sub-group on this node.
+
+        Args:
+            local_tp_rank: The TP rank whose DP group to query. Defaults to this process's TP rank.
+        """
         if local_tp_rank is None:
             local_tp_rank = self.local_tp_rank
         return list(range(local_tp_rank, self.local_size, self.local_tp_size))
@@ -386,6 +474,7 @@ class MixedCommHandler:
         should_init_nvshmem: bool = True,
         use_autotune: bool = True,
     ):
+        """Initialize the handler, set up virtual memory, nvshmem, and run autotune."""
         assert torch.distributed.is_initialized()
         assert local_size > 1
         assert dtype in [torch.float16, torch.bfloat16]
@@ -514,6 +603,7 @@ class MixedCommHandler:
             self.run_autotune()
 
     def get_valid_op_list(self):
+        """Return the list of valid communication operations for the current parallel topology."""
         # Should be aligned with is_valid_op in mixed_comm.cuh
         if self.para_info.use_mixed:
             op_list = [
@@ -528,6 +618,7 @@ class MixedCommHandler:
         return op_list
 
     def get_valid_mode_list(self):
+        """Return the list of valid execution modes for the current parallel topology."""
         # The fused modes in valid_mode_list should be aligned with is_valid_mode in mixed_comm.cuh
         valid_mode_list = [
             MixedCommMode.FUSED_OPT_WAITS_MC,
@@ -551,10 +642,20 @@ class MixedCommHandler:
         return valid_mode_list
 
     def init_virtual_memory(self):
+        """Initialize CUDA virtual memory for intra-node communication.
+
+        Allocates unicast and multicast memory handles, exchanges them between
+        local ranks via Unix domain sockets, and maps them into the GPU virtual
+        address space so that all ranks on a node can directly read/write each
+        other's buffers.
+        """
+
         def get_socket_path(rank):
+            """Return the Unix socket path for the given local rank."""
             return f"{socket_folder}/rank_{rank}"
 
         def send_fd(sock, fd, rank):
+            """Send a file descriptor to the specified rank via Unix socket."""
             sock.sendmsg(
                 [b"\x00"],
                 [(socket.SOL_SOCKET, socket.SCM_RIGHTS, struct.pack("i", fd))],
@@ -563,6 +664,7 @@ class MixedCommHandler:
             )
 
         def recv_fd(sock):
+            """Receive a file descriptor from a Unix socket."""
             ancdata = sock.recvmsg(
                 1,
                 socket.CMSG_SPACE(struct.calcsize("i")),
@@ -574,6 +676,7 @@ class MixedCommHandler:
             raise RuntimeError("Failed to receive file descriptor")
 
         def create_and_allgather_uc_handle(sock, uc_prop):
+            """Create a unicast memory handle and exchange it with all local ranks."""
             local_rank = self.para_info.local_rank
             local_size = self.para_info.local_size
             uc_handle_list = [None for _ in range(local_size)]
@@ -595,6 +698,7 @@ class MixedCommHandler:
             return uc_handle_list
 
         def create_and_send_mc_handle(sock, mc_prop, rank_list):
+            """Create a multicast handle and send it to all other ranks in the group."""
             mc_handle = checkCudaErrors(cuda.cuMulticastCreate(mc_prop))
             mc_fd = checkCudaErrors(
                 cuda.cuMemExportToShareableHandle(mc_handle, self.vm_handle_type, 0)
@@ -605,6 +709,7 @@ class MixedCommHandler:
             return mc_handle
 
         def recv_and_create_mc_handle(sock):
+            """Receive a multicast handle from the group leader and register the local device."""
             mc_fd = recv_fd(sock)
             mc_handle = checkCudaErrors(
                 cuda.cuMemImportFromShareableHandle(mc_fd, self.vm_handle_type)
@@ -613,6 +718,7 @@ class MixedCommHandler:
             return mc_handle
 
         def map_handle(handle, access_desc, vm_granularity):
+            """Reserve virtual address space and map a memory handle into it."""
             ptr = checkCudaErrors(
                 cuda.cuMemAddressReserve(self.vm_workspace_bytes, vm_granularity, 0, 0)
             )
@@ -623,6 +729,7 @@ class MixedCommHandler:
             return ptr
 
         def create_gpu_array(ptr_list):
+            """Copy a list of pointers into a GPU-resident array."""
             ArrayType = ctypes.c_void_p * len(ptr_list)
             cpu_array = ArrayType(*ptr_list)
             array_bytes = ctypes.sizeof(cpu_array)
@@ -746,6 +853,15 @@ class MixedCommHandler:
             self.mc_buffer_dict[key] = ctypes.c_void_p(int(self.mc_ptr_dict[key]))
 
     def init_nvshmem(self):
+        """Initialize nvshmem for inter-node communication.
+
+        Broadcasts a unique ID from rank 0, initializes the nvshmem library,
+        verifies rank consistency, and allocates symmetric nvshmem workspace
+        for data and signal buffers.
+
+        Raises:
+            RuntimeError: If nvshmem fails to initialize.
+        """
         if self.should_init_nvshmem:
             uid = torch.zeros(
                 self.mixed_comm_module.nvshmem_unique_id_size(),
@@ -795,7 +911,14 @@ class MixedCommHandler:
         )
 
     def shutdown(self):
+        """Tear down all communication resources.
+
+        Unmaps and releases virtual memory handles, frees nvshmem workspace,
+        and destroys process groups. Must be called at most once.
+        """
+
         def unmap_handle(ptr, handle):
+            """Unmap, release, and free a virtual memory handle and its address range."""
             checkCudaErrors(cuda.cuMemUnmap(ptr, self.vm_workspace_bytes))
             checkCudaErrors(cuda.cuMemRelease(handle))
             checkCudaErrors(cuda.cuMemAddressFree(ptr, self.vm_workspace_bytes))
@@ -827,10 +950,16 @@ class MixedCommHandler:
                 torch.distributed.destroy_process_group(val)
 
     def __del__(self):
+        """Ensure shutdown is called when the handler is garbage collected."""
         if self.is_running:
             self.shutdown()
 
     def run_autotune(self):
+        """Profile all valid (op, mode) combinations and populate the autotune map.
+
+        For each valid operation and a range of input sizes (powers of 2), benchmarks
+        every non-AUTOTUNE mode and records the fastest one in ``self.autotune_map``.
+        """
         max_local_bs = pow(2, self.autotune_max_coef - 1)
         hidden_size = self.autotune_base_bytes // _get_element_size(self.dtype)
         data = torch.empty(
@@ -874,6 +1003,18 @@ class MixedCommHandler:
         op: MixedCommOp,
         x_in: torch.Tensor,
     ) -> MixedCommMode:
+        """Select the best execution mode for the given operation and input tensor.
+
+        Looks up the profiled autotune map using a log2-scaled index derived from
+        the input tensor's byte size.
+
+        Args:
+            op: The communication operation to perform.
+            x_in: The input tensor.
+
+        Returns:
+            The autotuned :class:`MixedCommMode`.
+        """
         num_local_bytes = x_in.numel() * _get_element_size(self.dtype)
         if op in [MixedCommOp.REDUCESCATTER, MixedCommOp.REDUCESCATTER_ALLREDUCE]:
             num_local_bytes //= self.para_info.dp_size
@@ -893,6 +1034,7 @@ def _nccl_allreduce(
     group: torch.distributed.ProcessGroup = None,
     inplace: bool = False,
 ) -> torch.Tensor:
+    """Perform all-reduce using NCCL via ``torch.distributed.all_reduce``."""
     if inplace:
         x_out = x_in
     else:
@@ -909,6 +1051,7 @@ def _nccl_allgather(
     x_out: torch.Tensor | None,
     group: torch.distributed.ProcessGroup = None,
 ) -> torch.Tensor:
+    """Perform all-gather using NCCL via ``torch.distributed.all_gather``."""
     dp_size = torch.distributed.get_world_size(group)
     if x_out is None:
         x_out = torch.empty(
@@ -925,6 +1068,7 @@ def _nccl_reducescatter(
     x_out: torch.Tensor | None,
     group: torch.distributed.ProcessGroup = None,
 ) -> torch.Tensor:
+    """Perform reduce-scatter using NCCL via ``torch.distributed.reduce_scatter_tensor``."""
     dp_size = torch.distributed.get_world_size(group)
     x_in = x_in.unflatten(0, [dp_size, -1])
     if x_out is None:
@@ -938,6 +1082,7 @@ def _nccl_allreduce_allgather(
     x_out: torch.Tensor | None,
     para_info: ParallelInfo,
 ) -> torch.Tensor:
+    """Perform all-reduce + all-gather using NCCL (single global collective)."""
     x_tmp = torch.empty(
         [
             para_info.inter_tp_size,
@@ -973,6 +1118,7 @@ def _nccl_reducescatter_allreduce(
     x_out: torch.Tensor | None,
     para_info: ParallelInfo,
 ) -> torch.Tensor:
+    """Perform reduce-scatter + all-reduce using NCCL (single global collective)."""
     x_in = x_in.unflatten(0, [para_info.inter_dp_size, para_info.local_dp_size, -1])
     x_in_list = [
         x_in[inter_dp_rank][local_dp_rank]
@@ -1002,6 +1148,7 @@ def _allreduce(
     x_out: torch.Tensor | None,
     mode: MixedCommMode,
 ) -> torch.Tensor:
+    """Dispatch all-reduce using the specified mode (fused or NCCL)."""
     op = MixedCommOp.ALLREDUCE
     if mode.name.startswith("FUSED_"):
         if x_out is None:
@@ -1039,6 +1186,7 @@ def _allgather(
     x_out: torch.Tensor | None,
     mode: MixedCommMode,
 ) -> torch.Tensor:
+    """Dispatch all-gather using the specified mode (fused or NCCL)."""
     op = MixedCommOp.ALLGATHER
     if mode.name.startswith("FUSED_"):
         if x_out is None:
@@ -1077,6 +1225,7 @@ def _reducescatter(
     x_out: torch.Tensor | None,
     mode: MixedCommMode,
 ) -> torch.Tensor:
+    """Dispatch reduce-scatter using the specified mode (fused or NCCL)."""
     op = MixedCommOp.REDUCESCATTER
     if mode.name.startswith("FUSED_"):
         if x_out is None:
@@ -1115,6 +1264,7 @@ def _allreduce_allgather(
     x_out: torch.Tensor | None,
     mode: MixedCommMode,
 ) -> torch.Tensor:
+    """Dispatch all-reduce + all-gather using the specified mode."""
     op = MixedCommOp.ALLREDUCE_ALLGATHER
     if mode.name.startswith("FUSED_"):
         if x_out is None:
@@ -1161,6 +1311,7 @@ def _reducescatter_allreduce(
     x_out: torch.Tensor | None,
     mode: MixedCommMode,
 ) -> torch.Tensor:
+    """Dispatch reduce-scatter + all-reduce using the specified mode."""
     op = MixedCommOp.REDUCESCATTER_ALLREDUCE
     if mode.name.startswith("FUSED_"):
         if x_out is None:
@@ -1209,6 +1360,14 @@ def _common_check(
     x_out: torch.Tensor | None = None,
     mode: MixedCommMode | None = None,
 ) -> bool:
+    """Validate inputs for a mixed communication operation.
+
+    Checks that the operation, mode, tensor dimensions, dtypes, devices,
+    and shapes are consistent with the handler's configuration.
+
+    Raises:
+        ValueError: If any validation check fails.
+    """
     if op not in handler.valid_op_list:
         raise ValueError(f"Invalid op: {op.name}")
     if mode is not None and mode not in handler.valid_mode_list:
@@ -1265,6 +1424,24 @@ def run_mixed_comm(
     x_out: torch.Tensor | None = None,
     mode: MixedCommMode | None = None,
 ) -> torch.Tensor:
+    """Execute a mixed communication operation.
+
+    This is the main entry point for running communication collectives
+    through the mixed communication handler. It supports fused GPU kernels
+    (using virtual memory intra-node and nvshmem inter-node), NCCL-based
+    fallbacks, and autotuned mode selection.
+
+    Args:
+        op: The communication operation to perform.
+        handler: An initialized :class:`MixedCommHandler`.
+        x_in: The input tensor. Must be at least 2-D and match the handler's dtype/device.
+        x_out: Optional pre-allocated output tensor. Allocated automatically if ``None``.
+        mode: The execution mode. If ``None``, uses autotune (if enabled) or falls back
+            to an NCCL mode.
+
+    Returns:
+        The output tensor containing the result of the collective operation.
+    """
     if mode is None:
         if handler.use_autotune:
             mode = MixedCommMode.AUTOTUNE
