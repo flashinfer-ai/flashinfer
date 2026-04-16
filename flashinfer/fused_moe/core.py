@@ -1428,31 +1428,31 @@ def get_trtllm_moe_sm100_module():
 
         # Call the C++ function with the selected tactic
         intermediate_output = moe_op.trtllm_bf16_moe(
-            routing_logits,
-            routing_bias,
-            topk_ids,
-            expert_weights,
-            hidden_states,
-            gemm1_weights,
-            gemm2_weights,
-            output,
-            num_experts,
-            top_k,
-            n_group,
-            topk_group,
-            intermediate_size,
-            local_expert_offset,
-            local_num_experts,
-            routed_scaling_factor,
-            routing_method_type,
-            use_shuffled_weight,
-            weight_layout,
-            do_finalize,
-            enable_pdl,
-            [-1, -1] if tactic == -1 else tactic,
-            activation_type,
-            norm_topk_prob,
-            routing_replay_out,
+            routing_logits=routing_logits,
+            routing_bias=routing_bias,
+            topk_ids=topk_ids,
+            expert_weights=expert_weights,
+            hidden_states=hidden_states,
+            gemm1_weights=gemm1_weights,
+            gemm2_weights=gemm2_weights,
+            output=output,
+            num_experts=num_experts,
+            top_k=top_k,
+            n_group=n_group,
+            topk_group=topk_group,
+            intermediate_size=intermediate_size,
+            local_expert_offset=local_expert_offset,
+            local_num_experts=local_num_experts,
+            routed_scaling_factor=routed_scaling_factor,
+            routing_method_type=routing_method_type,
+            use_shuffled_weight=use_shuffled_weight,
+            weight_layout=weight_layout,
+            do_finalize=do_finalize,
+            enable_pdl=enable_pdl,
+            config_index=[-1, -1] if tactic == -1 else tactic,
+            activation_type=activation_type,
+            norm_topk_prob=norm_topk_prob,
+            routing_replay_out=routing_replay_out,
         )
         if do_finalize:
             return [output]
@@ -1601,30 +1601,31 @@ def get_trtllm_moe_sm100_module():
         )
         # Call the C++ function
         intermediate_output = moe_op.trtllm_fp8_per_tensor_scale_moe(
-            routing_logits,
-            routing_bias,
-            hidden_states,
-            gemm1_weights,
-            output1_scales_scalar,
-            output1_scales_gate_scalar,
-            gemm2_weights,
-            output2_scales_scalar,
-            output,
-            num_experts,
-            top_k,
-            n_group,
-            topk_group,
-            intermediate_size,
-            local_expert_offset,
-            local_num_experts,
-            routed_scaling_factor,
-            use_routing_scales_on_input,
-            routing_method_type,
-            do_finalize,
-            enable_pdl,
-            [-1, -1] if tactic == -1 else tactic,
-            activation_type,
-            norm_topk_prob,
+            routing_logits=routing_logits,
+            routing_bias=routing_bias,
+            hidden_states=hidden_states,
+            gemm1_weights=gemm1_weights,
+            output1_scales_scalar=output1_scales_scalar,
+            output1_scales_gate_scalar=output1_scales_gate_scalar,
+            gemm2_weights=gemm2_weights,
+            output2_scales_scalar=output2_scales_scalar,
+            output=output,
+            num_experts=num_experts,
+            top_k=top_k,
+            n_group=n_group,
+            topk_group=topk_group,
+            intermediate_size=intermediate_size,
+            local_expert_offset=local_expert_offset,
+            local_num_experts=local_num_experts,
+            routed_scaling_factor=routed_scaling_factor,
+            use_routing_scales_on_input=use_routing_scales_on_input,
+            routing_method_type=routing_method_type,
+            do_finalize=do_finalize,
+            enable_pdl=enable_pdl,
+            config_index=[-1, -1] if tactic == -1 else tactic,
+            activation_type=activation_type,
+            norm_topk_prob=norm_topk_prob,
+            routing_replay_out=routing_replay_out,
         )
         if do_finalize:
             return [output]
@@ -2620,6 +2621,13 @@ def trtllm_fp8_per_tensor_scale_moe(
         otherwise, returns the intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
     """
     _validate_routing_replay_out(routing_replay_out, top_k)
+    num_tokens = hidden_states.shape[0]
+    hidden_size = hidden_states.shape[-1]
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(hidden_states.device)
+    output = torch.empty(
+        num_tokens, hidden_size, dtype=torch.bfloat16, device=hidden_states.device
+    )
     result = get_trtllm_moe_sm100_module().trtllm_fp8_per_tensor_scale_moe(
         routing_logits,
         routing_bias,
@@ -2629,6 +2637,7 @@ def trtllm_fp8_per_tensor_scale_moe(
         output1_scales_gate_scalar,
         gemm2_weights,
         output2_scales_scalar,
+        output,
         num_experts,
         top_k,
         n_group,
@@ -2641,7 +2650,7 @@ def trtllm_fp8_per_tensor_scale_moe(
         routing_method_type,
         do_finalize,
         enable_pdl,
-        tune_max_num_tokens,
+        [-1, -1],
         activation_type,
         norm_topk_prob,
         routing_replay_out,
