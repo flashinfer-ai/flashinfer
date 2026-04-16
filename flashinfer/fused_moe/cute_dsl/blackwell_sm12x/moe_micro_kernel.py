@@ -1047,7 +1047,7 @@ class MoEMicroKernel:
             row = Int32(0)
             if all_rows_unique > Int32(0):
                 local_expert_id = pair_idx
-                expert_id = weight_expert_ids[local_expert_id].to(Int32)
+                expert_id = topk_ids[local_expert_id].to(Int32)
             else:
                 if is_cta_leader > Int32(0):
                     local_expert_id = topk_ids[pair_idx].to(Int32)
@@ -1408,6 +1408,7 @@ class MoEMicroKernel:
                 weight_expert_idx = weight_expert_ids[local_expert_idx]
                 valid_rows = row_counts[local_expert_idx]
                 if all_rows_unique > Int32(0):
+                    weight_expert_idx = topk_ids[local_expert_idx].to(Int32)
                     valid_rows = Int32(1)
                 alpha_value = alpha[weight_expert_idx].to(cutlass.Float32)
                 tile_m_base = tile_coord[0] * Int32(self.tile_shape_mnk[0])
