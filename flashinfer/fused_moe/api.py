@@ -73,34 +73,16 @@ class Activation(Enum):
         return self in (Activation.Swiglu, Activation.Geglu, Activation.SwigluBias)
 
 
-class QuantDtype(Enum):
-    """Weight/activation quantization data type."""
+class QuantVariant(Enum):
+    """Quantization variant — single knob for dtype + granularity + scale convention."""
 
     BF16 = 0
-    FP8 = 1
-    FP4 = 2
-    MxInt4 = 3
-
-    def __repr__(self) -> str:
-        return f"{type(self).__name__}.{self.name}"
-
-
-class QuantGranularity(Enum):
-    """Granularity of quantization scale factors."""
-
-    PerTensor = 0
-    PerToken = 1
-    BlockScale = 2
-
-    def __repr__(self) -> str:
-        return f"{type(self).__name__}.{self.name}"
-
-
-class Fp8Variant(Enum):
-    """Sub-variant within FP8 block-scale quantization."""
-
-    DeepSeekFp8 = 1
-    MxFp8 = 2
+    FP8PerTensor = 1
+    DeepSeekFp8 = 2
+    MxFp8 = 3
+    NVFP4 = 4  # day-1 MVP target
+    MXFP4 = 5
+    MxInt4 = 6
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}.{self.name}"
@@ -153,41 +135,9 @@ class RoutingConfig:
 
 @dataclass(frozen=True)
 class QuantConfig:
-    """Quantization scheme.
+    """Quantization scheme."""
 
-    Parameters
-    ----------
-    dtype : QuantDtype
-        Weight data type.
-    granularity : QuantGranularity
-        Scale-factor granularity.
-    fp8_variant : Fp8Variant or None
-        Sub-variant for FP8 block-scale (DeepSeekFp8 vs MxFp8).
-    """
-
-    dtype: QuantDtype
-    granularity: QuantGranularity = QuantGranularity.BlockScale
-    fp8_variant: Optional[Fp8Variant] = None
-
-    def __post_init__(self) -> None:
-        if (
-            self.dtype == QuantDtype.BF16
-            and self.granularity != QuantGranularity.PerTensor
-        ):
-            # BF16 doesn't use scaling — normalize to PerTensor
-            object.__setattr__(self, "granularity", QuantGranularity.PerTensor)
-        if self.fp8_variant is not None and self.dtype != QuantDtype.FP8:
-            raise ValueError(
-                f"fp8_variant={self.fp8_variant!r} is only valid with QuantDtype.FP8"
-            )
-
-    def __repr__(self) -> str:
-        parts = [f"dtype={self.dtype!r}"]
-        if self.granularity != QuantGranularity.BlockScale:
-            parts.append(f"granularity={self.granularity!r}")
-        if self.fp8_variant is not None:
-            parts.append(f"fp8_variant={self.fp8_variant!r}")
-        return f"QuantConfig({', '.join(parts)})"
+    variant: QuantVariant = QuantVariant.BF16
 
 
 @dataclass(frozen=True)
@@ -384,60 +334,25 @@ ALL_BACKEND_CONFIGS = (
 
 
 # ---------------------------------------------------------------------------
-# BackendOptions — composable via ``|``
+# BackendOptions
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class BackendOptions:
-    """Ordered set of backend candidates for dispatch / autotuning.
-
-    Compose with the ``|`` operator::
-
-        opts = TrtllmFp4Config() | CutlassConfig()
-    """
+    """Ordered list of backend candidates for dispatch / autotuning."""
 
     candidates: Tuple[BackendConfigType, ...] = ()  # type: ignore[type-arg]
-
-    def __or__(self, other: Union[BackendOptions, BackendConfigType]) -> BackendOptions:
-        if isinstance(other, BackendOptions):
-            return BackendOptions(self.candidates + other.candidates)
-        return BackendOptions(self.candidates + (other,))
 
     def valid_for(self, arch: int) -> list:
         """Return candidates whose hardware preconditions are met."""
         return [c for c in self.candidates if c.__class__.supported(arch)]
-
-    def __repr__(self) -> str:
-        if not self.candidates:
-            return "BackendOptions()"
-        if len(self.candidates) == 1:
-            # Single candidate: can't use pipe syntax, use explicit constructor
-            return f"BackendOptions(candidates=({repr(self.candidates[0])},))"
-        return " | ".join(repr(c) for c in self.candidates)
 
     def __len__(self) -> int:
         return len(self.candidates)
 
     def __iter__(self):
         return iter(self.candidates)
-
-    def __contains__(self, item) -> bool:
-        if isinstance(item, type):
-            return any(isinstance(c, item) for c in self.candidates)
-        return item in self.candidates
-
-
-# Bootstrap ``|`` on individual backend configs so
-# ``TrtllmFp4Config() | CutlassConfig()`` returns a ``BackendOptions``.
-def _backend_or(self: BackendConfigType, other: BackendConfigType) -> BackendOptions:
-    return BackendOptions(candidates=(self, other))
-
-
-for _cls in ALL_BACKEND_CONFIGS:
-    setattr(_cls, "__or__", _backend_or)
-
-del _backend_or, _cls
 
 
 # ---------------------------------------------------------------------------
@@ -470,8 +385,7 @@ class MoEConfig:
     >>> config = MoEConfig(
     ...     routing=RoutingConfig(num_experts=64, top_k=8,
     ...                           method=RoutingMethod.DeepSeekV3),
-    ...     quant=QuantConfig(QuantDtype.FP8, QuantGranularity.BlockScale,
-    ...                       fp8_variant=Fp8Variant.DeepSeekFp8),
+    ...     quant=QuantConfig(variant=QuantVariant.DeepSeekFp8),
     ...     experts=ExpertConfig(intermediate_size=2048),
     ... )
     >>> output = fused_moe(tensors, **config)
@@ -516,9 +430,7 @@ class MoEConfig:
             "CuteDslConfig": CuteDslConfig,
             "RoutingMethod": RoutingMethod,
             "Activation": Activation,
-            "QuantDtype": QuantDtype,
-            "QuantGranularity": QuantGranularity,
-            "Fp8Variant": Fp8Variant,
+            "QuantVariant": QuantVariant,
             "__builtins__": {},
         }
         return eval(s, ns)
@@ -661,3 +573,40 @@ class MoETensors:
             raise ValueError(
                 "token_final_scales is required when using modular dispatch."
             )
+
+
+# ---------------------------------------------------------------------------
+# Activation / weight packs for the autotuned pre-routed path
+# ---------------------------------------------------------------------------
+# These are the runner-level inputs used by MoELayer (plan §1).
+# Packs separate *per-call transient data* (activations) from *long-lived
+# model state* (weights).  Each pack knows how to present itself to a
+# specific backend via view_as / prepare_for — keeping backend-specific
+# layout logic out of the dispatch hot-path.
+
+
+@dataclass
+class MoEActivationPack:
+    """Per-call transient data — pre-quantized NVFP4 activations + pre-routed indices."""
+
+    hidden_states_q: Tensor  # [M, H//2] uint8 (packed NVFP4)
+    hidden_states_scale: Tensor  # [M, H//16] float8_e4m3fn
+    selected_experts: Tensor  # [M, top_k] int32
+    final_scales: Tensor  # [M, top_k] float32
+
+    @property
+    def num_tokens(self) -> int:
+        return self.hidden_states_q.shape[0]
+
+
+@dataclass
+class MoEWeightPack:
+    """Long-lived NVFP4 weight tensors — held by parent module."""
+
+    w1_q: Tensor  # [E, 2*I, H//2] uint8
+    w1_scale: Tensor  # [E, 2*I, H//16] float8_e4m3fn
+    w2_q: Tensor  # [E, H, I//2] uint8
+    w2_scale: Tensor  # [E, H, I//16] float8_e4m3fn
+    w1_alpha: Tensor  # [E] float32
+    w2_alpha: Tensor  # [E] float32
+    fc2_input_scale: Tensor  # [1] float32
