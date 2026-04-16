@@ -50,6 +50,17 @@ from flashinfer.artifacts import ArtifactPath
 DSL_FMHA_ARTIFACT_PATH = ArtifactPath.DSL_FMHA
 
 
+def _get_cpu_arch() -> str:
+    """Return CPU architecture string matching artifactory layout."""
+    import platform
+
+    machine = platform.machine()
+    # Normalize: aarch64/arm64 -> aarch64, x86_64/AMD64 -> x86_64
+    if machine in ("aarch64", "arm64"):
+        return "aarch64"
+    return "x86_64"
+
+
 def _get_gpu_arch() -> str:
     """Get the current GPU's architecture string (e.g. 'sm_100a').
 
@@ -81,7 +92,10 @@ def _get_checksums(gpu_arch: str) -> dict[str, str]:
     from flashinfer.jit.cubin_loader import FLASHINFER_CUBINS_REPOSITORY
     from flashinfer.jit.env import FLASHINFER_CUBIN_DIR
 
-    checksums_rel = os.path.join(DSL_FMHA_ARTIFACT_PATH, gpu_arch, "checksums.txt")
+    cpu_arch = _get_cpu_arch()
+    checksums_rel = os.path.join(
+        DSL_FMHA_ARTIFACT_PATH, cpu_arch, gpu_arch, "checksums.txt"
+    )
     local_path = FLASHINFER_CUBIN_DIR / checksums_rel
 
     if not local_path.exists():
@@ -160,8 +174,11 @@ def _load_from_artifact(variant_name: str, enable_tvm_ffi: bool = False):
     from flashinfer.jit.env import FLASHINFER_CUBIN_DIR
 
     so_filename = f"{variant_name}.so"
+    cpu_arch = _get_cpu_arch()
     gpu_arch = _get_gpu_arch()
-    artifact_path = os.path.join(DSL_FMHA_ARTIFACT_PATH, gpu_arch, so_filename)
+    artifact_path = os.path.join(
+        DSL_FMHA_ARTIFACT_PATH, cpu_arch, gpu_arch, so_filename
+    )
 
     checksums = _get_checksums(gpu_arch)
     sha256 = checksums.get(variant_name, "")
@@ -378,7 +395,7 @@ def cute_dsl_fmha_ragged_prefill(
             o.dtype,
             D,
             is_causal,
-            is_persistent=not is_causal,
+            is_persistent=False,  # varlen always uses non-persistent
             varlen=True,
             enable_tvm_ffi=enable_tvm_ffi,
             with_lse=lse is not None,
