@@ -22,9 +22,25 @@ using namespace flashinfer;
 
 using tvm::ffi::Optional;
 
+inline sampling::TopKTieBreak ParseTopKTieBreak(int64_t tie_break) {
+  switch (tie_break) {
+    case 0:
+      return sampling::TopKTieBreak::None;
+    case 1:
+      return sampling::TopKTieBreak::Small;
+    case 2:
+      return sampling::TopKTieBreak::Large;
+    default:
+      TVM_FFI_ICHECK(false)
+          << "Invalid tie_break mode " << tie_break
+          << ", expected 0 (none), 1 (prefer small indices), or 2 (prefer large indices)";
+      return sampling::TopKTieBreak::None;
+  }
+}
+
 void radix_topk(TensorView input, TensorView output_indices, TensorView output_values,
                 Optional<TensorView> maybe_row_states_buffer, int64_t top_k, bool sorted_output,
-                bool deterministic) {
+                bool deterministic, int64_t tie_break) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_indices);
   CHECK_INPUT(output_values);
@@ -40,6 +56,8 @@ void radix_topk(TensorView input, TensorView output_indices, TensorView output_v
 
   cudaError_t status;
   auto dtype = input.dtype();
+  sampling::TopKTieBreak tie_break_mode = ParseTopKTieBreak(tie_break);
+  bool deterministic_effective = deterministic || tie_break_mode != sampling::TopKTieBreak::None;
 
   // Get row_states_buffer if provided (for multi-CTA path)
   sampling::RadixRowState* row_states_ptr = nullptr;
@@ -53,7 +71,7 @@ void radix_topk(TensorView input, TensorView output_indices, TensorView output_v
     status = sampling::TopKDispatch<c_type, int32_t>(
         static_cast<c_type*>(input.data_ptr()), static_cast<int32_t*>(output_indices.data_ptr()),
         static_cast<c_type*>(output_values.data_ptr()), batch_size, static_cast<uint32_t>(top_k), d,
-        row_states_ptr, sorted_output, deterministic, stream);
+        row_states_ptr, sorted_output, deterministic_effective, tie_break_mode, stream);
     return true;
   });
 
@@ -65,7 +83,7 @@ void radix_topk_page_table_transform(TensorView input, TensorView output_page_ta
                                      TensorView src_page_table,
                                      Optional<TensorView> maybe_row_to_batch, TensorView lengths,
                                      Optional<TensorView> maybe_row_states_buffer, int64_t top_k,
-                                     bool deterministic) {
+                                     bool deterministic, int64_t tie_break) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_page_table);
   CHECK_INPUT(src_page_table);
@@ -84,6 +102,8 @@ void radix_topk_page_table_transform(TensorView input, TensorView output_page_ta
 
   cudaError_t status;
   auto dtype = input.dtype();
+  sampling::TopKTieBreak tie_break_mode = ParseTopKTieBreak(tie_break);
+  bool deterministic_effective = deterministic || tie_break_mode != sampling::TopKTieBreak::None;
 
   sampling::RadixRowState* row_states_ptr = nullptr;
   if (maybe_row_states_buffer.has_value()) {
@@ -102,7 +122,7 @@ void radix_topk_page_table_transform(TensorView input, TensorView output_page_ta
         static_cast<c_type*>(input.data_ptr()), static_cast<int32_t*>(output_page_table.data_ptr()),
         static_cast<const int32_t*>(src_page_table.data_ptr()), src_stride, row_to_batch_ptr,
         static_cast<int32_t*>(lengths.data_ptr()), num_rows, static_cast<uint32_t>(top_k), max_len,
-        row_states_ptr, deterministic, stream);
+        row_states_ptr, deterministic_effective, tie_break_mode, stream);
     return true;
   });
 
@@ -112,7 +132,7 @@ void radix_topk_page_table_transform(TensorView input, TensorView output_page_ta
 
 void radix_topk_ragged_transform(TensorView input, TensorView output_indices, TensorView offsets,
                                  TensorView lengths, Optional<TensorView> maybe_row_states_buffer,
-                                 int64_t top_k, bool deterministic) {
+                                 int64_t top_k, bool deterministic, int64_t tie_break) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_indices);
   CHECK_INPUT(offsets);
@@ -130,6 +150,8 @@ void radix_topk_ragged_transform(TensorView input, TensorView output_indices, Te
 
   cudaError_t status;
   auto dtype = input.dtype();
+  sampling::TopKTieBreak tie_break_mode = ParseTopKTieBreak(tie_break);
+  bool deterministic_effective = deterministic || tie_break_mode != sampling::TopKTieBreak::None;
 
   sampling::RadixRowState* row_states_ptr = nullptr;
   if (maybe_row_states_buffer.has_value()) {
@@ -142,7 +164,8 @@ void radix_topk_ragged_transform(TensorView input, TensorView output_indices, Te
     status = sampling::TopKRaggedTransformDispatch<c_type, int32_t>(
         static_cast<c_type*>(input.data_ptr()), static_cast<int32_t*>(output_indices.data_ptr()),
         static_cast<const int32_t*>(offsets.data_ptr()), static_cast<int32_t*>(lengths.data_ptr()),
-        num_rows, static_cast<uint32_t>(top_k), max_len, row_states_ptr, deterministic, stream);
+        num_rows, static_cast<uint32_t>(top_k), max_len, row_states_ptr, deterministic_effective,
+        tie_break_mode, stream);
     return true;
   });
 
