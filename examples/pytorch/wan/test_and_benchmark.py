@@ -6,6 +6,8 @@ Features:
 - Unit tests: basic forward, memory, numerical correctness, GEMM backends
 - Performance benchmarks: FlashInfer vs diffusers, different GEMM backends
 - Skip-softmax sparse attention benchmark (SM100/SM103 only)
+- Offline activation quantization test
+- Batch attention backend test (single, cudnn, trtllm)
 
 Usage:
     # Run all tests
@@ -15,7 +17,13 @@ Usage:
     python test_and_benchmark.py test --basic --gemm
 
     # Benchmark GEMM backends only
-    python test_and_benchmark.py benchmark --gemm-backend auto torch
+    python test_and_benchmark.py benchmark --gemm-backend torch bf16
+
+    # Benchmark with offline activation quantization
+    python test_and_benchmark.py benchmark --gemm-backend fp8 --offline-act-quant
+
+    # Benchmark with specific attention backends
+    python test_and_benchmark.py benchmark --single-attention-backend cudnn --batch-attention-backend cudnn --batch-size 2
 
     # Benchmark GEMM backends + sparse attention (combined)
     python test_and_benchmark.py benchmark --gemm-backend auto --sparse --threshold 1.0
@@ -304,7 +312,6 @@ def test_gemm_backends() -> bool:
         FlashInferWanTransformer3DModel,
         WanTransformer3DConfig,
         FlashInferLinear,
-        _get_best_available_backend,
         _check_gemm_backend_support,
         GEMMBackend,
     )
@@ -319,12 +326,10 @@ def test_gemm_backends() -> bool:
     for backend in GEMMBackend:
         supported = _check_gemm_backend_support(backend, device)
         print(f"  {backend.value}: {'supported' if supported else 'not supported'}")
-
-    best_backend = _get_best_available_backend(device)
-    print(f"Best available: {best_backend.value}\n")
+    print()
 
     # Determine backends to test
-    backends_to_test = ["torch", "auto"]
+    backends_to_test = ["torch"]
     for backend in GEMMBackend:
         if backend not in (GEMMBackend.TORCH,) and _check_gemm_backend_support(
             backend, device
@@ -449,6 +454,143 @@ def test_skip_softmax_sparse() -> bool:
     return passed
 
 
+def test_offline_act_quant() -> bool:
+    """Test offline (fixed default scale) activation quantization."""
+    from transformer_wan_flashinfer import (
+        FlashInferWanTransformer3DModel,
+        WanTransformer3DConfig,
+    )
+
+    print("=" * 60)
+    print("Test: Offline Activation Quantization")
+    print("=" * 60)
+
+    base_config = {
+        "patch_size": (1, 2, 2),
+        "num_attention_heads": 8,
+        "attention_head_dim": 64,
+        "in_channels": 4,
+        "out_channels": 4,
+        "text_dim": 512,
+        "freq_dim": 256,
+        "ffn_dim": 1024,
+        "num_layers": 1,
+        "gemm_backend": "torch",
+    }
+
+    batch_size, num_frames, height, width = 1, 8, 32, 32
+    hidden_states = torch.randn(
+        batch_size, 4, num_frames, height, width, device="cuda", dtype=torch.float16
+    )
+    timestep = torch.tensor([500], device="cuda")
+    encoder_hidden_states = torch.randn(
+        batch_size, 64, 512, device="cuda", dtype=torch.float16
+    )
+
+    all_passed = True
+    for online in [True, False]:
+        label = "online" if online else "offline"
+        try:
+            config = WanTransformer3DConfig(**base_config, online_act_quant=online)
+            model = FlashInferWanTransformer3DModel(config).cuda().half()
+            with torch.no_grad():
+                output = model(
+                    hidden_states, timestep, encoder_hidden_states, return_dict=False
+                )
+            passed = output[0].shape == hidden_states.shape
+            print(f"  {label}: {'PASSED' if passed else 'FAILED'}")
+            if not passed:
+                all_passed = False
+            del model
+            torch.cuda.empty_cache()
+        except Exception as e:
+            print(f"  {label}: FAILED ({e})")
+            all_passed = False
+
+    print(f"\nResult: {'PASSED' if all_passed else 'SOME FAILED'}")
+
+    del hidden_states, timestep, encoder_hidden_states
+    cleanup_gpu_memory()
+    return all_passed
+
+
+def test_attention_backends() -> bool:
+    """Test different attention backends (single, cudnn, trtllm)."""
+    from transformer_wan_flashinfer import (
+        FlashInferWanTransformer3DModel,
+        WanTransformer3DConfig,
+    )
+
+    print("=" * 60)
+    print("Test: Attention Backends")
+    print("=" * 60)
+
+    gpu_info = get_gpu_info()
+    print(f"GPU: {gpu_info['name']} (SM{gpu_info['sm_version']})")
+
+    base_config = {
+        "patch_size": (1, 2, 2),
+        "num_attention_heads": 8,
+        "attention_head_dim": 64,
+        "in_channels": 4,
+        "out_channels": 4,
+        "text_dim": 512,
+        "freq_dim": 256,
+        "ffn_dim": 1024,
+        "num_layers": 1,
+        "gemm_backend": "torch",
+    }
+
+    # bs=1: test single/cudnn/trtllm; bs>1: test cudnn/trtllm
+    test_cases = [
+        ("single_bs1", 1, "single", "cudnn"),
+        ("cudnn_bs1", 1, "cudnn", "cudnn"),
+        ("trtllm_bs1", 1, "trtllm", "cudnn"),
+        ("cudnn_bs2", 2, "single", "cudnn"),
+        ("trtllm_bs2", 2, "single", "trtllm"),
+    ]
+
+    all_passed = True
+    for label, batch_size, single_backend, batch_backend in test_cases:
+        try:
+            hidden_states = torch.randn(
+                batch_size, 4, 8, 32, 32, device="cuda", dtype=torch.float16
+            )
+            timestep = torch.randint(0, 1000, (batch_size,), device="cuda")
+            encoder_hidden_states = torch.randn(
+                batch_size, 64, 512, device="cuda", dtype=torch.float16
+            )
+
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                config = WanTransformer3DConfig(
+                    **base_config,
+                    single_attention_backend=single_backend,
+                    batch_attention_backend=batch_backend,
+                )
+                model = FlashInferWanTransformer3DModel(config).cuda().half()
+
+            with torch.no_grad():
+                output = model(
+                    hidden_states, timestep, encoder_hidden_states, return_dict=False
+                )
+
+            passed = output[0].shape == hidden_states.shape
+            print(f"  {label} (bs={batch_size}): {'PASSED' if passed else 'FAILED'}")
+            if not passed:
+                all_passed = False
+
+            del model, hidden_states, timestep, encoder_hidden_states
+            torch.cuda.empty_cache()
+        except Exception as e:
+            print(f"  {label} (bs={batch_size}): FAILED ({e})")
+            all_passed = False
+
+    print(f"\nResult: {'PASSED' if all_passed else 'SOME FAILED'}")
+    cleanup_gpu_memory()
+    return all_passed
+
+
 # =============================================================================
 # Benchmark Functions
 # =============================================================================
@@ -465,6 +607,9 @@ def run_benchmark(
     warmup_iters: int = 5,
     benchmark_iters: int = 20,
     compare_diffusers: bool = True,
+    online_act_quant: bool = True,
+    single_attention_backend: str = "single",
+    batch_attention_backend: str = "cudnn",
     use_skip_softmax_sparse: bool = False,
     skip_softmax_threshold: float = 1.0,
     # Wan 2.2 model architecture params
@@ -478,7 +623,6 @@ def run_benchmark(
         FlashInferWanTransformer3DModel,
         WanTransformer3DConfig,
         FlashInferLinear,
-        _get_best_available_backend,
     )
 
     device = torch.device("cuda")
@@ -490,7 +634,11 @@ def run_benchmark(
 
     gpu_info = get_gpu_info()
     print(f"GPU: {gpu_info['name']} (SM{gpu_info['sm_version']})")
-    print(f"Best GEMM backend: {_get_best_available_backend(device).value}")
+    print(
+        f"Act quantization: {'online' if online_act_quant else 'offline (default scale)'}"
+    )
+    print(f"Single attention backend: {single_attention_backend}")
+    print(f"Batch attention backend: {batch_attention_backend}")
     print(f"Skip-softmax sparse: {use_skip_softmax_sparse}", end="")
     if use_skip_softmax_sparse:
         print(f" (threshold={skip_softmax_threshold})", end="")
@@ -579,6 +727,9 @@ def run_benchmark(
                 fi_config_std = WanTransformer3DConfig(
                     **config_dict,
                     gemm_backend=backend,
+                    online_act_quant=online_act_quant,
+                    single_attention_backend=single_attention_backend,
+                    batch_attention_backend=batch_attention_backend,
                     use_skip_softmax_sparse=False,
                 )
                 model_std = (
@@ -617,6 +768,8 @@ def run_benchmark(
                     fi_config_sparse = WanTransformer3DConfig(
                         **config_dict,
                         gemm_backend=backend,
+                        online_act_quant=online_act_quant,
+                        batch_attention_backend="trtllm",
                         use_skip_softmax_sparse=True,
                         skip_softmax_threshold_scale_factor=skip_softmax_threshold,
                     )
@@ -744,6 +897,12 @@ def main():
     test_parser.add_argument(
         "--sparse", action="store_true", help="Skip-softmax sparse test"
     )
+    test_parser.add_argument(
+        "--offline", action="store_true", help="Offline activation quantization test"
+    )
+    test_parser.add_argument(
+        "--attention", action="store_true", help="Attention backends test"
+    )
 
     # Benchmark command
     bench_parser = subparsers.add_parser("benchmark", help="Run performance benchmark")
@@ -751,8 +910,27 @@ def main():
         "--gemm-backend",
         type=str,
         nargs="+",
-        default=["auto"],
+        default=["torch"],
         help="GEMM backend(s) to test",
+    )
+    bench_parser.add_argument(
+        "--offline-act-quant",
+        action="store_true",
+        help="Use offline (fixed default) activation quantization",
+    )
+    bench_parser.add_argument(
+        "--single-attention-backend",
+        type=str,
+        default="single",
+        choices=["single", "cudnn", "trtllm"],
+        help="Attention backend for batch_size == 1",
+    )
+    bench_parser.add_argument(
+        "--batch-attention-backend",
+        type=str,
+        default="cudnn",
+        choices=["cudnn", "trtllm"],
+        help="Attention backend for batch_size > 1",
     )
     bench_parser.add_argument(
         "--sparse",
@@ -803,9 +981,25 @@ def main():
     if args.command == "test":
         run_tests = []
         if args.all or not any(
-            [args.basic, args.memory, args.numerical, args.gemm, args.sparse]
+            [
+                args.basic,
+                args.memory,
+                args.numerical,
+                args.gemm,
+                args.sparse,
+                args.offline,
+                args.attention,
+            ]
         ):
-            run_tests = ["basic", "memory", "numerical", "gemm", "sparse"]
+            run_tests = [
+                "basic",
+                "memory",
+                "numerical",
+                "gemm",
+                "sparse",
+                "offline",
+                "attention",
+            ]
         else:
             if args.basic:
                 run_tests.append("basic")
@@ -817,6 +1011,10 @@ def main():
                 run_tests.append("gemm")
             if args.sparse:
                 run_tests.append("sparse")
+            if args.offline:
+                run_tests.append("offline")
+            if args.attention:
+                run_tests.append("attention")
 
         results = {}
         for test_name in run_tests:
@@ -830,6 +1028,10 @@ def main():
                 results["gemm"] = test_gemm_backends()
             elif test_name == "sparse":
                 results["sparse"] = test_skip_softmax_sparse()
+            elif test_name == "offline":
+                results["offline"] = test_offline_act_quant()
+            elif test_name == "attention":
+                results["attention"] = test_attention_backends()
             cleanup_gpu_memory()
             print()
 
@@ -874,6 +1076,9 @@ def main():
             warmup_iters=args.warmup,
             benchmark_iters=args.iters,
             compare_diffusers=not args.no_diffusers,
+            online_act_quant=not args.offline_act_quant,
+            single_attention_backend=args.single_attention_backend,
+            batch_attention_backend=args.batch_attention_backend,
             use_skip_softmax_sparse=args.sparse,
             skip_softmax_threshold=args.threshold,
             num_attention_heads=args.num_attention_heads,

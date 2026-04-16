@@ -8,9 +8,17 @@ Original model: https://github.com/huggingface/diffusers/blob/main/src/diffusers
 
 Optimizations:
 - RMSNorm: torch.nn.RMSNorm -> flashinfer.rmsnorm
-- Attention: F.scaled_dot_product_attention -> flashinfer.single_prefill_with_kv_cache
+- Attention:
+  - single_prefill_with_kv_cache for single-batch
+  - cudnn_batch_prefill_with_kv_cache for multi-batch (cuDNN backend)
+  - trtllm_batch_context_with_kv_cache for multi-batch (TRT-LLM, supports skip-softmax sparse)
 - Activations: Fused GELU when applicable
-- Linear: nn.Linear -> FlashInferLinear with mm_bf16/mm_fp8/mm_fp4 backends
+- Linear: nn.Linear -> FlashInferLinear with multiple GEMM backends:
+  - mm_bf16, mm_fp8, mm_fp4, bmm_fp8, bmm_bf16, mm_mxfp8, bmm_mxfp8
+  - gemm_fp8_nt_groupwise, gemm_fp8_nt_blockscaled (SM100+ CUTLASS NT GEMM)
+  - batch_deepgemm_fp8_nt_groupwise (SM100/103 DeepGEMM)
+  - fp8_blockscale_gemm_sm90 (Hopper-optimized)
+- Activation quantization: Online (compute scale from data) or offline (fixed default scale)
 - Sparse Attention: Optional skip-softmax sparse attention via trtllm_batch_context_with_kv_cache
 
 Note: The 3D RoPE (WanRotaryPosEmbed) is kept as-is since it's specialized for video
@@ -29,6 +37,12 @@ import torch.nn.functional as F
 
 import flashinfer
 from flashinfer.prefill import trtllm_batch_context_with_kv_cache
+from flashinfer.cudnn import cudnn_batch_prefill_with_kv_cache
+from flashinfer.gemm import (
+    gemm_fp8_nt_groupwise,
+    gemm_fp8_nt_blockscaled,
+    batch_deepgemm_fp8_nt_groupwise,
+)
 from flashinfer.utils import get_compute_capability
 
 
@@ -40,6 +54,11 @@ class GEMMBackend(Enum):
     FP8 = "fp8"  # FlashInfer mm_fp8 with TRT-LLM backend (SM89+)
     FP8_SM90 = "fp8_sm90"  # FlashInfer fp8_blockscale_gemm_sm90 (SM90 only)
     BMM_FP8 = "bmm_fp8"  # FlashInfer bmm_fp8 with cublas backend (SM89+)
+    FP8_GROUPWISE = "fp8_groupwise"  # FlashInfer gemm_fp8_nt_groupwise (SM100+)
+    FP8_BLOCKSCALED = "fp8_blockscaled"  # FlashInfer gemm_fp8_nt_blockscaled (SM100+)
+    BATCH_DEEPGEMM_FP8 = (
+        "batch_deepgemm_fp8"  # FlashInfer batch_deepgemm_fp8_nt_groupwise (SM100/SM103)
+    )
     FP4 = "fp4"  # FlashInfer mm_fp4 (SM100+)
     BMM_BF16 = "bmm_bf16"  # FlashInfer bmm_bf16 (SM100+)
     MXFP8 = "mxfp8"  # FlashInfer mm_mxfp8 (SM100+/SM120+)
@@ -68,6 +87,15 @@ def _check_gemm_backend_support(backend: GEMMBackend, device: torch.device) -> b
     elif backend == GEMMBackend.BMM_FP8:
         # bmm_fp8 with cublas backend works on SM89+
         return sm >= 89
+    elif backend == GEMMBackend.FP8_GROUPWISE:
+        # gemm_fp8_nt_groupwise requires SM100+ (Blackwell)
+        return sm >= 100
+    elif backend == GEMMBackend.FP8_BLOCKSCALED:
+        # gemm_fp8_nt_blockscaled requires SM100+ (Blackwell)
+        return sm >= 100
+    elif backend == GEMMBackend.BATCH_DEEPGEMM_FP8:
+        # batch_deepgemm_fp8_nt_groupwise requires SM100 or SM103
+        return sm in (100, 103)
     elif backend == GEMMBackend.FP4:
         # mm_fp4 requires SM100+ (Blackwell)
         return sm >= 100
@@ -82,26 +110,6 @@ def _check_gemm_backend_support(backend: GEMMBackend, device: torch.device) -> b
         return sm >= 100
 
     return False
-
-
-def _get_best_available_backend(device: torch.device) -> GEMMBackend:
-    """Get the best available GEMM backend for the current device.
-
-    Backend selection:
-    - SM100+ (Blackwell): mm_bf16 (most stable)
-    - SM90 (Hopper): fp8_blockscale_gemm_sm90 (optimized for Hopper)
-    - SM89 (Ada): TORCH (TRT-LLM has strict constraints)
-    - SM < 89: TORCH
-    """
-    major, minor = get_compute_capability(device)
-    sm = major * 10 + minor
-
-    if sm >= 100:
-        return GEMMBackend.BF16  # Prefer BF16 on Blackwell for stability
-    elif sm == 90:
-        return GEMMBackend.FP8_SM90  # Use FP8 blockscale on Hopper
-    else:
-        return GEMMBackend.TORCH  # Fallback for other GPUs
 
 
 class FlashInferLinear(nn.Module):
@@ -119,9 +127,10 @@ class FlashInferLinear(nn.Module):
         in_features: Size of input features
         out_features: Size of output features
         bias: Whether to include bias (only supported with TORCH backend)
-        backend: GEMM backend to use ("auto", "torch", "bf16", "fp8", "fp8_sm90", "bmm_fp8", "fp4", "bmm_bf16", "mxfp8", "bmm_mxfp8")
+        backend: GEMM backend to use (see GEMMBackend enum for options)
         device: Device to place the module on
         dtype: Data type for weights (for TORCH/BF16 backends)
+        online_act_quant: True for online activation scale computation, False for fixed default scale
     """
 
     def __init__(
@@ -130,35 +139,35 @@ class FlashInferLinear(nn.Module):
         out_features: int,
         bias: bool = True,
         backend: Literal[
-            "auto",
             "torch",
             "bf16",
             "fp8",
             "fp8_sm90",
             "bmm_fp8",
+            "fp8_groupwise",
+            "fp8_blockscaled",
+            "batch_deepgemm_fp8",
             "fp4",
             "bmm_bf16",
             "mxfp8",
             "bmm_mxfp8",
-        ] = "auto",
+        ] = "torch",
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
+        online_act_quant: bool = True,
     ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.has_bias = bias
+        self.online_act_quant = online_act_quant
 
         # Resolve device
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = device
 
-        # Resolve backend
-        if backend == "auto":
-            self._backend = _get_best_available_backend(device)
-        else:
-            self._backend = GEMMBackend(backend)
+        self._backend = GEMMBackend(backend)
 
         # Validate backend support
         if not _check_gemm_backend_support(self._backend, device):
@@ -185,27 +194,39 @@ class FlashInferLinear(nn.Module):
                 )
                 self._backend = GEMMBackend.TORCH
 
+        # Check dimension constraints for NT groupwise/blockscaled FP8
+        if self._backend in (
+            GEMMBackend.FP8_GROUPWISE,
+            GEMMBackend.FP8_BLOCKSCALED,
+            GEMMBackend.BATCH_DEEPGEMM_FP8,
+        ):
+            if in_features % 128 != 0:
+                print(
+                    f"Warning: {self._backend.value} requires K%128==0, got K={in_features}, falling back to TORCH"
+                )
+                self._backend = GEMMBackend.TORCH
+
         # Handle bias - only TORCH backend supports bias directly
         # Note: bias is added separately in forward() for non-TORCH backends
 
         # Initialize weights based on backend
         if self._backend == GEMMBackend.FP8:
-            # FP8 weights need special preparation (TRT-LLM)
             self._init_fp8_weights(dtype or torch.bfloat16)
         elif self._backend == GEMMBackend.FP8_SM90:
-            # FP8 blockscale for SM90 (Hopper)
             self._init_fp8_sm90_weights(dtype or torch.bfloat16)
         elif self._backend == GEMMBackend.BMM_FP8:
-            # BMM FP8 with cublas backend
             self._init_bmm_fp8_weights(dtype or torch.bfloat16)
+        elif self._backend in (
+            GEMMBackend.FP8_GROUPWISE,
+            GEMMBackend.FP8_BLOCKSCALED,
+            GEMMBackend.BATCH_DEEPGEMM_FP8,
+        ):
+            self._init_fp8_nt_weights(dtype or torch.bfloat16)
         elif self._backend == GEMMBackend.FP4:
-            # FP4 weights need quantization
             self._init_fp4_weights(dtype or torch.bfloat16)
         elif self._backend == GEMMBackend.MXFP8:
-            # MXFP8 weights need quantization
             self._init_mxfp8_weights(dtype or torch.bfloat16)
         elif self._backend == GEMMBackend.BMM_MXFP8:
-            # BMM MXFP8 weights need quantization
             self._init_bmm_mxfp8_weights(dtype or torch.bfloat16)
         else:
             # TORCH, BF16, and BMM_BF16 use standard weight layout
@@ -340,6 +361,34 @@ class FlashInferLinear(nn.Module):
         self.register_buffer("_weight_scale_bmm", None)
         self._bmm_fp8_prepared = False
 
+    def _init_fp8_nt_weights(self, dtype: torch.dtype):
+        """Initialize weights for FP8_GROUPWISE / FP8_BLOCKSCALED / BATCH_DEEPGEMM_FP8 backends.
+
+        These use NT-format GEMM: a(m,k) @ b(n,k)^T with block-scale quantization.
+        """
+        self.weight = nn.Parameter(
+            torch.empty(
+                self.out_features, self.in_features, device=self.device, dtype=dtype
+            )
+        )
+        if self.has_bias:
+            self.bias = nn.Parameter(
+                torch.zeros(self.out_features, device=self.device, dtype=dtype)
+            )
+        else:
+            self.register_parameter("bias", None)
+
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in = self.in_features
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.bias, -bound, bound)
+
+        # NT FP8 specific attributes (weight stored as (N, K) in FP8)
+        self.register_buffer("_weight_fp8_nt", None)
+        self.register_buffer("_weight_scale_nt", None)
+        self._fp8_nt_prepared = False
+
     def _init_mxfp8_weights(self, dtype: torch.dtype):
         """Initialize weights for MXFP8 backend (mm_mxfp8)."""
         self.weight = nn.Parameter(
@@ -399,6 +448,12 @@ class FlashInferLinear(nn.Module):
             self._prepare_fp8_sm90_weights()
         elif self._backend == GEMMBackend.BMM_FP8:
             self._prepare_bmm_fp8_weights()
+        elif self._backend in (
+            GEMMBackend.FP8_GROUPWISE,
+            GEMMBackend.FP8_BLOCKSCALED,
+            GEMMBackend.BATCH_DEEPGEMM_FP8,
+        ):
+            self._prepare_fp8_nt_weights()
         elif self._backend == GEMMBackend.FP4:
             self._prepare_fp4_weights()
         elif self._backend == GEMMBackend.BF16:
@@ -541,6 +596,52 @@ class FlashInferLinear(nn.Module):
         self._bmm_fp8_prepared = True
 
     @torch.no_grad()
+    def _prepare_fp8_nt_weights(self):
+        """Prepare weights for FP8_GROUPWISE / FP8_BLOCKSCALED / BATCH_DEEPGEMM_FP8.
+
+        Quantizes weight (N, K) to FP8 with 128x128 block scales.
+        The NT format keeps weight as (N, K) — no transpose needed.
+        """
+        if self._fp8_nt_prepared:
+            return
+
+        weight = self.weight.data  # (N, K)
+        n, k = weight.shape
+
+        # Block quantization with 128x128 tiles
+        block_size = 128
+        n_pad = ((n + block_size - 1) // block_size) * block_size
+        k_pad = ((k + block_size - 1) // block_size) * block_size
+
+        weight_padded = torch.zeros(
+            n_pad, k_pad, dtype=weight.dtype, device=weight.device
+        )
+        weight_padded[:n, :k] = weight
+
+        weight_view = weight_padded.view(
+            n_pad // block_size, block_size, k_pad // block_size, block_size
+        )
+
+        block_amax = (
+            weight_view.abs().float().amax(dim=(1, 3), keepdim=True).clamp(min=1e-4)
+        )
+
+        fp8_max = 448.0
+        scale = block_amax / fp8_max
+
+        weight_scaled = (weight_view / scale).to(torch.float8_e4m3fn)
+
+        self._weight_fp8_nt = weight_scaled.view(n_pad, k_pad)[:n, :k].contiguous()
+        # scale shape: (n_blocks, k_blocks) stored as (k_blocks, n_blocks) for MN-major
+        raw_scale = scale.squeeze(1).squeeze(-1)  # (n_blocks, k_blocks)
+        n_blocks = (n + block_size - 1) // block_size
+        k_blocks = (k + block_size - 1) // block_size
+        self._weight_scale_nt = (
+            raw_scale[:n_blocks, :k_blocks].t().contiguous().to(torch.float32)
+        )
+        self._fp8_nt_prepared = True
+
+    @torch.no_grad()
     def _prepare_bmm_bf16_weights(self):
         """Prepare weights for BMM_BF16 backend (bmm_bf16).
 
@@ -623,6 +724,12 @@ class FlashInferLinear(nn.Module):
             out = self._forward_fp8_sm90(x_2d)
         elif self._backend == GEMMBackend.BMM_FP8:
             out = self._forward_bmm_fp8(x_2d)
+        elif self._backend == GEMMBackend.FP8_GROUPWISE:
+            out = self._forward_fp8_groupwise(x_2d)
+        elif self._backend == GEMMBackend.FP8_BLOCKSCALED:
+            out = self._forward_fp8_blockscaled(x_2d)
+        elif self._backend == GEMMBackend.BATCH_DEEPGEMM_FP8:
+            out = self._forward_batch_deepgemm_fp8(x_2d)
         elif self._backend == GEMMBackend.FP4:
             out = self._forward_fp4(x_2d)
         elif self._backend == GEMMBackend.BMM_BF16:
@@ -661,16 +768,64 @@ class FlashInferLinear(nn.Module):
 
         return out.to(x.dtype)
 
+    def _quantize_activation_fp8_per_tensor(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, float]:
+        """Quantize activation to FP8 with per-tensor scale.
+
+        When online_act_quant=True, computes scale from the actual tensor.
+        When online_act_quant=False, uses a fixed default scale (1.0).
+        """
+        finfo = torch.finfo(torch.float8_e4m3fn)
+        if self.online_act_quant:
+            x_amax = x.abs().max().clamp(min=1e-12)
+            x_scale = finfo.max / x_amax
+        else:
+            x_scale = torch.tensor(1.0, device=x.device, dtype=torch.float32)
+        x_fp8 = (x * x_scale).clamp(finfo.min, finfo.max).to(torch.float8_e4m3fn)
+        return x_fp8, x_scale
+
+    def _quantize_activation_fp8_blockwise(
+        self, x: torch.Tensor, block_size: int = 128
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Quantize activation to FP8 with block-wise (per-token-group) scales.
+
+        When online_act_quant=True, computes scales from actual data.
+        When online_act_quant=False, uses a fixed default scale.
+
+        Returns (x_fp8, x_scale) where x_scale shape is (m, k // block_size).
+        """
+        m, k = x.shape
+        fp8_max = 448.0
+        k_pad = ((k + block_size - 1) // block_size) * block_size
+
+        if self.online_act_quant:
+            x_padded = torch.zeros(m, k_pad, dtype=x.dtype, device=x.device)
+            x_padded[:, :k] = x
+            x_view = x_padded.view(m, -1, block_size)
+            x_amax = x_view.abs().float().amax(dim=2).clamp(min=1e-4)
+            x_scale = x_amax / fp8_max  # (m, k_blocks)
+            x_scaled = (x_view / x_scale.unsqueeze(2)).to(torch.float8_e4m3fn)
+            x_fp8 = x_scaled.view(m, k_pad)[:, :k].contiguous()
+        else:
+            default_scale_val = 1.0 / fp8_max
+            x_fp8 = (x * fp8_max).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
+            num_blocks = k_pad // block_size
+            x_scale = torch.full(
+                (m, num_blocks),
+                default_scale_val,
+                dtype=torch.float32,
+                device=x.device,
+            )
+
+        return x_fp8, x_scale
+
     def _forward_fp8(self, x: torch.Tensor) -> torch.Tensor:
         """Forward using FlashInfer mm_fp8."""
         if not self._fp8_prepared:
             self._prepare_fp8_weights()
 
-        # Quantize input to FP8
-        finfo = torch.finfo(torch.float8_e4m3fn)
-        x_amax = x.abs().max().clamp(min=1e-12)
-        x_scale = finfo.max / x_amax
-        x_fp8 = (x * x_scale).clamp(finfo.min, finfo.max).to(torch.float8_e4m3fn)
+        x_fp8, x_scale = self._quantize_activation_fp8_per_tensor(x)
 
         # Compute output scale
         alpha = (1.0 / x_scale) * self._weight_scale
@@ -743,11 +898,7 @@ class FlashInferLinear(nn.Module):
         if not self._bmm_fp8_prepared:
             self._prepare_bmm_fp8_weights()
 
-        # Quantize input to FP8 with per-tensor scale
-        finfo = torch.finfo(torch.float8_e4m3fn)
-        x_amax = x.abs().max().clamp(min=1e-12)
-        x_scale = finfo.max / x_amax
-        x_fp8 = (x * x_scale).clamp(finfo.min, finfo.max).to(torch.float8_e4m3fn)
+        x_fp8, x_scale = self._quantize_activation_fp8_per_tensor(x)
 
         # bmm_fp8 expects (batch, M, K) input
         x_fp8_batch = x_fp8.unsqueeze(0)  # (1, M, K)
@@ -770,6 +921,122 @@ class FlashInferLinear(nn.Module):
         out = out.squeeze(0)  # (M, N)
 
         # Add bias if present
+        if self.bias is not None:
+            out = out + self.bias.to(out.dtype)
+
+        return out.to(x.dtype)
+
+    def _forward_fp8_groupwise(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward using FlashInfer gemm_fp8_nt_groupwise.
+
+        NT GEMM: a(m,k) @ b(n,k)^T with groupwise (1, 128, 128) block scales.
+        """
+        if not self._fp8_nt_prepared:
+            self._prepare_fp8_nt_weights()
+
+        x_fp8, x_scale = self._quantize_activation_fp8_blockwise(x, block_size=128)
+
+        # gemm_fp8_nt_groupwise: a(m,k) @ b(n,k)^T -> (m, n)
+        # a_scale: (m, k//128) contiguous — for MN-major this is (k_blocks, m).T
+        # b_scale: MN-major -> (k_blocks, n_blocks)
+        out = gemm_fp8_nt_groupwise(
+            x_fp8,
+            self._weight_fp8_nt,
+            x_scale,
+            self._weight_scale_nt,
+            scale_major_mode=None,
+            scale_granularity_mnk=(1, 128, 128),
+            out_dtype=torch.bfloat16,
+            backend="cutlass",
+        )
+
+        if self.bias is not None:
+            out = out + self.bias.to(out.dtype)
+
+        return out.to(x.dtype)
+
+    def _forward_fp8_blockscaled(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward using FlashInfer gemm_fp8_nt_blockscaled.
+
+        Same as groupwise but fixed (128, 128, 128) scale granularity.
+        """
+        if not self._fp8_nt_prepared:
+            self._prepare_fp8_nt_weights()
+
+        x_fp8, x_scale = self._quantize_activation_fp8_blockwise(x, block_size=128)
+
+        # gemm_fp8_nt_blockscaled: wrapper over groupwise with (128,128,128) granularity
+        # a_scale for blockscaled: MN-major -> (k_blocks, m_blocks)
+        m = x.shape[0]
+        block_size = 128
+        m_blocks = (m + block_size - 1) // block_size
+        k_blocks = x_scale.shape[1]
+
+        # Reshape per-token scale to per-block scale for 128x128 blocking
+        x_scale_padded = torch.zeros(
+            m_blocks * block_size,
+            k_blocks,
+            dtype=torch.float32,
+            device=x.device,
+        )
+        x_scale_padded[:m] = x_scale
+        x_scale_block = (
+            x_scale_padded.view(m_blocks, block_size, k_blocks).amax(
+                dim=1
+            )  # (m_blocks, k_blocks)
+        )
+        # MN-major: (k_blocks, m_blocks)
+        a_scale_mn = x_scale_block.t().contiguous()
+
+        out = gemm_fp8_nt_blockscaled(
+            x_fp8,
+            self._weight_fp8_nt,
+            a_scale_mn,
+            self._weight_scale_nt,
+            scale_major_mode="MN",
+            out_dtype=torch.bfloat16,
+        )
+
+        if self.bias is not None:
+            out = out + self.bias.to(out.dtype)
+
+        return out.to(x.dtype)
+
+    def _forward_batch_deepgemm_fp8(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward using FlashInfer batch_deepgemm_fp8_nt_groupwise.
+
+        Treats the linear as a single-group batched GEMM (batch_size=1).
+        """
+        if not self._fp8_nt_prepared:
+            self._prepare_fp8_nt_weights()
+
+        m, k = x.shape
+        x_fp8, x_scale = self._quantize_activation_fp8_blockwise(x, block_size=128)
+
+        # batch_deepgemm expects (batch, m, k) inputs
+        a = x_fp8.unsqueeze(0)  # (1, m, k)
+        b = self._weight_fp8_nt.unsqueeze(0)  # (1, n, k)
+        a_scale_batch = x_scale.unsqueeze(0)  # (1, m, k_blocks)
+        b_scale_batch = self._weight_scale_nt.unsqueeze(
+            0
+        )  # (1, k_blocks, n_blocks) -> need (1, n_blocks, k_blocks)
+        # batch_deepgemm b_scale expects (batch, n_blocks, k_blocks)
+        b_scale_batch = b_scale_batch.transpose(1, 2).contiguous()
+        masked_m = torch.tensor([m], dtype=torch.int32, device=x.device)
+
+        out = batch_deepgemm_fp8_nt_groupwise(
+            a,
+            b,
+            a_scale_batch,
+            b_scale_batch,
+            masked_m=masked_m,
+            expected_m=m,
+            scale_granularity_mnk=(1, 128, 128),
+            out_dtype=torch.bfloat16,
+        )
+
+        out = out.squeeze(0)  # (m, n)
+
         if self.bias is not None:
             out = out + self.bias.to(out.dtype)
 
@@ -883,8 +1150,11 @@ class WanTransformer3DConfig:
     """Configuration for WanTransformer3DModel.
 
     Added fields for FlashInfer optimizations:
-    - gemm_backend: GEMM backend for linear layers ("auto", "torch", "bf16", "fp8", "fp4")
-    - use_skip_softmax_sparse: Whether to use skip-softmax sparse attention
+    - gemm_backend: GEMM backend for linear layers (see GEMMBackend enum, default "torch")
+    - online_act_quant: True for online activation scale computation, False for fixed default scale
+    - single_attention_backend: "single", "cudnn", or "trtllm" — used when batch_size == 1
+    - batch_attention_backend: "cudnn" or "trtllm" — used when batch_size > 1
+    - use_skip_softmax_sparse: Whether to use skip-softmax sparse attention (trtllm backend)
     - skip_softmax_threshold_scale_factor: Threshold scale factor for skip-softmax sparsity
     """
 
@@ -907,18 +1177,31 @@ class WanTransformer3DConfig:
 
     # FlashInfer optimization options
     gemm_backend: Literal[
-        "auto",
         "torch",
         "bf16",
         "fp8",
         "fp8_sm90",
         "bmm_fp8",
+        "fp8_groupwise",
+        "fp8_blockscaled",
+        "batch_deepgemm_fp8",
         "fp4",
         "bmm_bf16",
         "mxfp8",
         "bmm_mxfp8",
-    ] = "auto"
-    use_skip_softmax_sparse: bool = False  # Enable skip-softmax sparse attention
+    ] = "torch"
+    online_act_quant: bool = (
+        True  # True: compute activation scale from data; False: use default scale
+    )
+    single_attention_backend: Literal["single", "cudnn", "trtllm"] = (
+        "single"  # Attention backend for batch_size == 1
+    )
+    batch_attention_backend: Literal["cudnn", "trtllm"] = (
+        "cudnn"  # Attention backend for batch_size > 1
+    )
+    use_skip_softmax_sparse: bool = (
+        False  # Enable skip-softmax sparse attention (trtllm only)
+    )
     skip_softmax_threshold_scale_factor: float = 1.0  # Threshold scale factor for skip-softmax (higher = more sparse, less accurate)
 
     @property
@@ -930,9 +1213,10 @@ def create_linear_layer(
     in_features: int,
     out_features: int,
     bias: bool = True,
-    gemm_backend: str = "auto",
+    gemm_backend: str = "torch",
     device: Optional[torch.device] = None,
     dtype: Optional[torch.dtype] = None,
+    online_act_quant: bool = True,
 ) -> nn.Module:
     """
     Factory function to create a linear layer with the specified GEMM backend.
@@ -952,6 +1236,7 @@ def create_linear_layer(
             backend=gemm_backend,
             device=device,
             dtype=dtype,
+            online_act_quant=online_act_quant,
         )
 
 
@@ -1077,7 +1362,7 @@ class FlashInferFeedForward(nn.Module):
         activation_fn: Activation function ("gelu-approximate", "gelu")
         bias: Whether to use bias in linear layers
         use_gating: Whether to use gated FFN (gelu(x) * gate)
-        gemm_backend: GEMM backend for linear layers ("auto", "torch", "bf16", "fp8", "fp4")
+        gemm_backend: GEMM backend for linear layers (see GEMMBackend enum)
     """
 
     def __init__(
@@ -1087,7 +1372,8 @@ class FlashInferFeedForward(nn.Module):
         activation_fn: str = "gelu-approximate",
         bias: bool = True,
         use_gating: bool = False,  # Whether to use gated FFN (gelu(x) * gate)
-        gemm_backend: str = "auto",
+        gemm_backend: str = "torch",
+        online_act_quant: bool = True,
     ):
         super().__init__()
         self.activation_fn = activation_fn
@@ -1095,19 +1381,28 @@ class FlashInferFeedForward(nn.Module):
         self.gemm_backend = gemm_backend
 
         if use_gating:
-            # Gated FFN: fuse gate and up projections
-            # gelu(Wx) * Ux - output is [..., 2 * inner_dim] split in half
             self.proj_up = create_linear_layer(
-                dim, 2 * inner_dim, bias=bias, gemm_backend=gemm_backend
+                dim,
+                2 * inner_dim,
+                bias=bias,
+                gemm_backend=gemm_backend,
+                online_act_quant=online_act_quant,
             )
         else:
-            # Simple FFN: up -> activation -> down
             self.proj_up = create_linear_layer(
-                dim, inner_dim, bias=bias, gemm_backend=gemm_backend
+                dim,
+                inner_dim,
+                bias=bias,
+                gemm_backend=gemm_backend,
+                online_act_quant=online_act_quant,
             )
 
         self.proj_down = create_linear_layer(
-            inner_dim, dim, bias=bias, gemm_backend=gemm_backend
+            inner_dim,
+            dim,
+            bias=bias,
+            gemm_backend=gemm_backend,
+            online_act_quant=online_act_quant,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1246,7 +1541,7 @@ class FlashInferWanAttention(nn.Module):
         added_kv_proj_dim: Dimension for additional KV projection (I2V)
         cross_attention_dim_head: Head dimension for cross attention
         is_cross_attention: Whether this is cross attention
-        gemm_backend: GEMM backend for linear layers ("auto", "torch", "bf16", "fp8", "fp4")
+        gemm_backend: GEMM backend for linear layers (see GEMMBackend enum)
         use_skip_softmax_sparse: Whether to use skip-softmax sparse attention
         skip_softmax_threshold_scale_factor: Threshold scale factor for skip-softmax sparsity
     """
@@ -1261,7 +1556,10 @@ class FlashInferWanAttention(nn.Module):
         added_kv_proj_dim: Optional[int] = None,
         cross_attention_dim_head: Optional[int] = None,
         is_cross_attention: Optional[bool] = None,
-        gemm_backend: str = "auto",
+        gemm_backend: str = "torch",
+        online_act_quant: bool = True,
+        single_attention_backend: str = "single",
+        batch_attention_backend: str = "cudnn",
         use_skip_softmax_sparse: bool = False,
         skip_softmax_threshold_scale_factor: float = 1.0,
     ):
@@ -1278,23 +1576,41 @@ class FlashInferWanAttention(nn.Module):
             else cross_attention_dim_head * heads
         )
         self.gemm_backend = gemm_backend
+        self.single_attention_backend = single_attention_backend
+        self.batch_attention_backend = batch_attention_backend
         self.use_skip_softmax_sparse = use_skip_softmax_sparse
         self.skip_softmax_threshold_scale_factor = skip_softmax_threshold_scale_factor
 
         # Use FlashInfer-optimized linear layers
         self.to_q = create_linear_layer(
-            dim, self.inner_dim, bias=True, gemm_backend=gemm_backend
+            dim,
+            self.inner_dim,
+            bias=True,
+            gemm_backend=gemm_backend,
+            online_act_quant=online_act_quant,
         )
         self.to_k = create_linear_layer(
-            dim, self.kv_inner_dim, bias=True, gemm_backend=gemm_backend
+            dim,
+            self.kv_inner_dim,
+            bias=True,
+            gemm_backend=gemm_backend,
+            online_act_quant=online_act_quant,
         )
         self.to_v = create_linear_layer(
-            dim, self.kv_inner_dim, bias=True, gemm_backend=gemm_backend
+            dim,
+            self.kv_inner_dim,
+            bias=True,
+            gemm_backend=gemm_backend,
+            online_act_quant=online_act_quant,
         )
         self.to_out = nn.ModuleList(
             [
                 create_linear_layer(
-                    self.inner_dim, dim, bias=True, gemm_backend=gemm_backend
+                    self.inner_dim,
+                    dim,
+                    bias=True,
+                    gemm_backend=gemm_backend,
+                    online_act_quant=online_act_quant,
                 ),
                 nn.Dropout(dropout),
             ]
@@ -1311,10 +1627,18 @@ class FlashInferWanAttention(nn.Module):
         self.add_k_proj = self.add_v_proj = None
         if added_kv_proj_dim is not None:
             self.add_k_proj = create_linear_layer(
-                added_kv_proj_dim, self.inner_dim, bias=True, gemm_backend=gemm_backend
+                added_kv_proj_dim,
+                self.inner_dim,
+                bias=True,
+                gemm_backend=gemm_backend,
+                online_act_quant=online_act_quant,
             )
             self.add_v_proj = create_linear_layer(
-                added_kv_proj_dim, self.inner_dim, bias=True, gemm_backend=gemm_backend
+                added_kv_proj_dim,
+                self.inner_dim,
+                bias=True,
+                gemm_backend=gemm_backend,
+                online_act_quant=online_act_quant,
             )
             self.norm_added_k = FlashInferRMSNorm(
                 dim_head * heads, eps=eps, elementwise_affine=False
@@ -1324,6 +1648,217 @@ class FlashInferWanAttention(nn.Module):
             self.is_cross_attention = is_cross_attention
         else:
             self.is_cross_attention = cross_attention_dim_head is not None
+
+    def _resolve_attention_backend(self, batch_size: int, device: torch.device) -> str:
+        """Resolve the attention backend for the given batch size.
+
+        For skip-softmax sparse, forces trtllm if the GPU supports it.
+        """
+        if self.use_skip_softmax_sparse:
+            major, minor = get_compute_capability(device)
+            sm_version = major * 10 + minor
+            if sm_version in (100, 103):
+                return "trtllm"
+            else:
+                import warnings
+
+                fallback = (
+                    self.single_attention_backend
+                    if batch_size == 1
+                    else self.batch_attention_backend
+                )
+                warnings.warn(
+                    f"Skip-softmax sparse attention requires SM100 or SM103 (Blackwell B100/B200), "
+                    f"but current GPU is SM{sm_version}. Falling back to {fallback}.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+        if batch_size == 1:
+            return self.single_attention_backend
+        return self.batch_attention_backend
+
+    def _attention_single(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        batch_size: int,
+        seq_len_q: int,
+    ) -> torch.Tensor:
+        """Single-request attention using single_prefill_with_kv_cache (loop over batch)."""
+        outputs = []
+        for b in range(batch_size):
+            out = flashinfer.single_prefill_with_kv_cache(
+                query[b].contiguous(),
+                key[b].contiguous(),
+                value[b].contiguous(),
+                causal=False,
+            )
+            outputs.append(out)
+        hidden_states = torch.stack(outputs, dim=0)
+        return hidden_states.view(batch_size, seq_len_q, -1)
+
+    def _attention_cudnn_batch(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        batch_size: int,
+        seq_len_q: int,
+        seq_len_kv: int,
+    ) -> torch.Tensor:
+        """Batch attention using cudnn_batch_prefill_with_kv_cache."""
+        device = query.device
+
+        # Flatten query: (batch, seq_q, heads, head_dim) -> (total_tokens, heads, head_dim)
+        query_flat = query.reshape(
+            batch_size * seq_len_q, self.heads, self.dim_head
+        ).contiguous()
+        # Non-paged KV: (total_kv_tokens, heads_kv, head_dim)
+        k_flat = key.reshape(
+            batch_size * seq_len_kv, self.heads, self.dim_head
+        ).contiguous()
+        v_flat = value.reshape(
+            batch_size * seq_len_kv, self.heads, self.dim_head
+        ).contiguous()
+
+        actual_seq_lens_q = torch.full(
+            (batch_size,), seq_len_q, dtype=torch.int32, device=device
+        )
+        actual_seq_lens_kv = torch.full(
+            (batch_size,), seq_len_kv, dtype=torch.int32, device=device
+        )
+
+        workspace_size = 128 * 1024 * 1024
+        workspace = torch.empty(workspace_size, dtype=torch.uint8, device=device)
+
+        sm_scale = 1.0 / math.sqrt(self.dim_head)
+
+        # Compute batch offsets for ragged layout
+        batch_offsets_q = torch.arange(
+            0, batch_size * seq_len_q, seq_len_q, dtype=torch.int32, device=device
+        )
+        batch_offsets_kv = torch.arange(
+            0, batch_size * seq_len_kv, seq_len_kv, dtype=torch.int32, device=device
+        )
+
+        out, _ = cudnn_batch_prefill_with_kv_cache(
+            q=query_flat,
+            k_cache=k_flat,
+            v_cache=v_flat,
+            scale=sm_scale,
+            workspace_buffer=workspace,
+            max_token_per_sequence=seq_len_q,
+            max_sequence_kv=seq_len_kv,
+            actual_seq_lens_q=actual_seq_lens_q,
+            actual_seq_lens_kv=actual_seq_lens_kv,
+            causal=False,
+            return_lse=False,
+            batch_offsets_q=batch_offsets_q,
+            batch_offsets_o=batch_offsets_q,
+            batch_offsets_k=batch_offsets_kv,
+            batch_offsets_v=batch_offsets_kv,
+        )
+
+        return out.view(batch_size, seq_len_q, -1)
+
+    def _attention_trtllm_batch(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        batch_size: int,
+        seq_len_q: int,
+        seq_len_kv: int,
+    ) -> torch.Tensor:
+        """Batch attention using trtllm_batch_context_with_kv_cache.
+
+        Supports skip-softmax sparse attention on SM100/SM103.
+        """
+        device = query.device
+
+        # Set up paged KV cache: [num_pages, 2, num_heads, page_size, head_dim] in HND layout
+        key_paged = key.permute(0, 2, 1, 3).contiguous()
+        value_paged = value.permute(0, 2, 1, 3).contiguous()
+        kv_cache = torch.stack([key_paged, value_paged], dim=1)
+
+        block_tables = torch.arange(
+            batch_size, dtype=torch.int32, device=device
+        ).unsqueeze(1)
+
+        seq_lens = torch.full(
+            (batch_size,), seq_len_kv, dtype=torch.int32, device=device
+        )
+
+        cum_seq_lens_q = torch.arange(
+            0,
+            (batch_size + 1) * seq_len_q,
+            seq_len_q,
+            dtype=torch.int32,
+            device=device,
+        )
+        cum_seq_lens_kv = torch.arange(
+            0,
+            (batch_size + 1) * seq_len_kv,
+            seq_len_kv,
+            dtype=torch.int32,
+            device=device,
+        )
+
+        workspace_size = 128 * 1024 * 1024
+        workspace = torch.zeros(workspace_size, dtype=torch.uint8, device=device)
+
+        query_flat = query.reshape(
+            batch_size * seq_len_q, self.heads, self.dim_head
+        ).contiguous()
+
+        sm_scale = 1.0 / math.sqrt(self.dim_head)
+
+        skip_threshold = (
+            self.skip_softmax_threshold_scale_factor
+            if self.use_skip_softmax_sparse
+            else None
+        )
+
+        hidden_states = trtllm_batch_context_with_kv_cache(
+            query=query_flat,
+            kv_cache=kv_cache,
+            workspace_buffer=workspace,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_q_len=seq_len_q,
+            max_kv_len=seq_len_kv,
+            bmm1_scale=sm_scale,
+            bmm2_scale=1.0,
+            batch_size=batch_size,
+            cum_seq_lens_q=cum_seq_lens_q,
+            cum_seq_lens_kv=cum_seq_lens_kv,
+            kv_layout="HND",
+            skip_softmax_threshold_scale_factor=skip_threshold,
+        )
+        return hidden_states.view(batch_size, seq_len_q, -1)
+
+    def _dispatch_attention(
+        self,
+        backend: str,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        batch_size: int,
+        seq_len_q: int,
+        seq_len_kv: int,
+    ) -> torch.Tensor:
+        """Dispatch to the appropriate attention implementation."""
+        if backend == "single":
+            return self._attention_single(query, key, value, batch_size, seq_len_q)
+        elif backend == "trtllm":
+            return self._attention_trtllm_batch(
+                query, key, value, batch_size, seq_len_q, seq_len_kv
+            )
+        else:  # cudnn
+            return self._attention_cudnn_batch(
+                query, key, value, batch_size, seq_len_q, seq_len_kv
+            )
 
     def forward(
         self,
@@ -1388,121 +1923,28 @@ class FlashInferWanAttention(nn.Module):
                 key_img = key_img.to(torch.bfloat16)
                 value_img = value_img.to(torch.bfloat16)
 
-            # Use FlashInfer attention for image cross-attention
-            # Process each batch item separately for FlashInfer
-            img_outputs = []
-            for b in range(batch_size):
-                out = flashinfer.single_prefill_with_kv_cache(
-                    query[b].contiguous(),  # (seq_len_q, heads, head_dim)
-                    key_img[b].contiguous(),  # (seq_len_img, heads, head_dim)
-                    value_img[b].contiguous(),  # (seq_len_img, heads, head_dim)
-                    causal=False,
-                )
-                img_outputs.append(out)
-            hidden_states_img = torch.stack(img_outputs, dim=0)
-            hidden_states_img = hidden_states_img.view(batch_size, seq_len_q, -1)
-
-        # Main attention using FlashInfer
-        # Check if skip-softmax sparse attention is supported (requires SM100 or SM103 only)
-        device = query.device
-        major, minor = get_compute_capability(device)
-        sm_version = major * 10 + minor
-        # trtllm_batch_context_with_kv_cache only supports SM100 and SM103
-        use_skip_softmax = self.use_skip_softmax_sparse and sm_version in (100, 103)
-
-        if self.use_skip_softmax_sparse and not use_skip_softmax:
-            import warnings
-
-            warnings.warn(
-                f"Skip-softmax sparse attention requires SM100 or SM103 (Blackwell B100/B200), "
-                f"but current GPU is SM{sm_version}. Falling back to standard attention.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-
-        if use_skip_softmax:
-            # Use trtllm_batch_context_with_kv_cache with skip-softmax sparse attention
-            # Set up paged KV cache: one page per sequence, page_size = seq_len_kv
-            # Create paged KV cache: [num_pages, 2, num_heads, page_size, head_dim] in HND layout
-            # Transpose from [batch, seq, heads, head_dim] to [batch, heads, seq, head_dim]
-            key_paged = key.permute(
-                0, 2, 1, 3
-            ).contiguous()  # [batch, heads, seq, head_dim]
-            value_paged = value.permute(
-                0, 2, 1, 3
-            ).contiguous()  # [batch, heads, seq, head_dim]
-
-            # Stack K and V: [num_pages, 2, num_heads, page_size, head_dim]
-            kv_cache = torch.stack([key_paged, value_paged], dim=1)
-
-            # Block table: each sequence uses one page (its own index)
-            block_tables = torch.arange(
-                batch_size, dtype=torch.int32, device=device
-            ).unsqueeze(1)
-
-            # Sequence lengths (all same length)
-            seq_lens = torch.full(
-                (batch_size,), seq_len_kv, dtype=torch.int32, device=device
-            )
-
-            # Cumulative sequence lengths
-            cum_seq_lens_q = torch.arange(
-                0,
-                (batch_size + 1) * seq_len_q,
+            img_backend = self._resolve_attention_backend(batch_size, query.device)
+            hidden_states_img = self._dispatch_attention(
+                img_backend,
+                query,
+                key_img,
+                value_img,
+                batch_size,
                 seq_len_q,
-                dtype=torch.int32,
-                device=device,
-            )
-            cum_seq_lens_kv = torch.arange(
-                0,
-                (batch_size + 1) * seq_len_kv,
-                seq_len_kv,
-                dtype=torch.int32,
-                device=device,
+                seq_len_img,
             )
 
-            # Workspace buffer (needs to be zeroed on first use)
-            workspace_size = 128 * 1024 * 1024  # 128 MB
-            workspace = torch.zeros(workspace_size, dtype=torch.uint8, device=device)
-
-            # Reshape query for batch processing: [total_tokens, num_heads, head_dim]
-            query_flat = query.reshape(
-                batch_size * seq_len_q, self.heads, self.dim_head
-            ).contiguous()
-
-            # Scale factors for attention
-            sm_scale = 1.0 / math.sqrt(self.dim_head)
-
-            hidden_states = trtllm_batch_context_with_kv_cache(
-                query=query_flat,
-                kv_cache=kv_cache,
-                workspace_buffer=workspace,
-                block_tables=block_tables,
-                seq_lens=seq_lens,
-                max_q_len=seq_len_q,
-                max_kv_len=seq_len_kv,
-                bmm1_scale=sm_scale,
-                bmm2_scale=1.0,
-                batch_size=batch_size,
-                cum_seq_lens_q=cum_seq_lens_q,
-                cum_seq_lens_kv=cum_seq_lens_kv,
-                kv_layout="HND",
-                skip_softmax_threshold_scale_factor=self.skip_softmax_threshold_scale_factor,
-            )
-            hidden_states = hidden_states.view(batch_size, seq_len_q, -1)
-        else:
-            # Standard attention using single_prefill_with_kv_cache
-            outputs = []
-            for b in range(batch_size):
-                out = flashinfer.single_prefill_with_kv_cache(
-                    query[b].contiguous(),  # (seq_len_q, heads, head_dim)
-                    key[b].contiguous(),  # (seq_len_kv, heads, head_dim)
-                    value[b].contiguous(),  # (seq_len_kv, heads, head_dim)
-                    causal=False,
-                )
-                outputs.append(out)
-            hidden_states = torch.stack(outputs, dim=0)
-            hidden_states = hidden_states.view(batch_size, seq_len_q, -1)
+        # Main attention
+        attn_backend = self._resolve_attention_backend(batch_size, query.device)
+        hidden_states = self._dispatch_attention(
+            attn_backend,
+            query,
+            key,
+            value,
+            batch_size,
+            seq_len_q,
+            seq_len_kv,
+        )
 
         # Cast back to original dtype if needed
         if needs_cast:
@@ -1543,7 +1985,10 @@ class FlashInferWanTransformerBlock(nn.Module):
         cross_attn_norm: bool = False,
         eps: float = 1e-6,
         added_kv_proj_dim: Optional[int] = None,
-        gemm_backend: str = "auto",
+        gemm_backend: str = "torch",
+        online_act_quant: bool = True,
+        single_attention_backend: str = "single",
+        batch_attention_backend: str = "cudnn",
         use_skip_softmax_sparse: bool = False,
         skip_softmax_threshold_scale_factor: float = 1.0,
     ):
@@ -1558,6 +2003,9 @@ class FlashInferWanTransformerBlock(nn.Module):
             eps=eps,
             cross_attention_dim_head=None,
             gemm_backend=gemm_backend,
+            online_act_quant=online_act_quant,
+            single_attention_backend=single_attention_backend,
+            batch_attention_backend=batch_attention_backend,
             use_skip_softmax_sparse=use_skip_softmax_sparse,
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         )
@@ -1571,6 +2019,9 @@ class FlashInferWanTransformerBlock(nn.Module):
             added_kv_proj_dim=added_kv_proj_dim,
             cross_attention_dim_head=dim // num_heads,
             gemm_backend=gemm_backend,
+            online_act_quant=online_act_quant,
+            single_attention_backend=single_attention_backend,
+            batch_attention_backend=batch_attention_backend,
             use_skip_softmax_sparse=False,  # No sparse attention for cross-attention
         )
         self.norm2 = (
@@ -1585,6 +2036,7 @@ class FlashInferWanTransformerBlock(nn.Module):
             inner_dim=ffn_dim,
             activation_fn="gelu-approximate",
             gemm_backend=gemm_backend,
+            online_act_quant=online_act_quant,
         )
         self.norm3 = FlashInferFP32LayerNorm(dim, eps, elementwise_affine=False)
 
@@ -1648,13 +2100,18 @@ class WanImageEmbedding(nn.Module):
         in_features: int,
         out_features: int,
         pos_embed_seq_len: Optional[int] = None,
-        gemm_backend: str = "auto",
+        gemm_backend: str = "torch",
+        online_act_quant: bool = True,
     ):
         super().__init__()
 
         self.norm1 = FlashInferFP32LayerNorm(in_features)
         self.ff = FlashInferFeedForward(
-            in_features, out_features, activation_fn="gelu", gemm_backend=gemm_backend
+            in_features,
+            out_features,
+            activation_fn="gelu",
+            gemm_backend=gemm_backend,
+            online_act_quant=online_act_quant,
         )
         self.norm2 = FlashInferFP32LayerNorm(out_features)
         if pos_embed_seq_len is not None:
@@ -1715,15 +2172,27 @@ class TimestepEmbedding(nn.Module):
     """Timestep embedding projection with FlashInfer GEMM support."""
 
     def __init__(
-        self, in_channels: int, time_embed_dim: int, gemm_backend: str = "auto"
+        self,
+        in_channels: int,
+        time_embed_dim: int,
+        gemm_backend: str = "torch",
+        online_act_quant: bool = True,
     ):
         super().__init__()
         self.linear_1 = create_linear_layer(
-            in_channels, time_embed_dim, bias=True, gemm_backend=gemm_backend
+            in_channels,
+            time_embed_dim,
+            bias=True,
+            gemm_backend=gemm_backend,
+            online_act_quant=online_act_quant,
         )
         self.act = nn.SiLU()
         self.linear_2 = create_linear_layer(
-            time_embed_dim, time_embed_dim, bias=True, gemm_backend=gemm_backend
+            time_embed_dim,
+            time_embed_dim,
+            bias=True,
+            gemm_backend=gemm_backend,
+            online_act_quant=online_act_quant,
         )
 
     def forward(self, sample: torch.Tensor) -> torch.Tensor:
@@ -1741,14 +2210,23 @@ class PixArtAlphaTextProjection(nn.Module):
         in_features: int,
         hidden_size: int,
         act_fn: str = "gelu_tanh",
-        gemm_backend: str = "auto",
+        gemm_backend: str = "torch",
+        online_act_quant: bool = True,
     ):
         super().__init__()
         self.linear_1 = create_linear_layer(
-            in_features, hidden_size, bias=True, gemm_backend=gemm_backend
+            in_features,
+            hidden_size,
+            bias=True,
+            gemm_backend=gemm_backend,
+            online_act_quant=online_act_quant,
         )
         self.linear_2 = create_linear_layer(
-            hidden_size, hidden_size, bias=True, gemm_backend=gemm_backend
+            hidden_size,
+            hidden_size,
+            bias=True,
+            gemm_backend=gemm_backend,
+            online_act_quant=online_act_quant,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1769,7 +2247,8 @@ class WanTimeTextImageEmbedding(nn.Module):
         text_embed_dim: int,
         image_embed_dim: Optional[int] = None,
         pos_embed_seq_len: Optional[int] = None,
-        gemm_backend: str = "auto",
+        gemm_backend: str = "torch",
+        online_act_quant: bool = True,
     ):
         super().__init__()
 
@@ -1777,14 +2256,24 @@ class WanTimeTextImageEmbedding(nn.Module):
             num_channels=time_freq_dim, flip_sin_to_cos=True, downscale_freq_shift=0
         )
         self.time_embedder = TimestepEmbedding(
-            in_channels=time_freq_dim, time_embed_dim=dim, gemm_backend=gemm_backend
+            in_channels=time_freq_dim,
+            time_embed_dim=dim,
+            gemm_backend=gemm_backend,
+            online_act_quant=online_act_quant,
         )
         self.act_fn = nn.SiLU()
         self.time_proj = create_linear_layer(
-            dim, time_proj_dim, gemm_backend=gemm_backend
+            dim,
+            time_proj_dim,
+            gemm_backend=gemm_backend,
+            online_act_quant=online_act_quant,
         )
         self.text_embedder = PixArtAlphaTextProjection(
-            text_embed_dim, dim, act_fn="gelu_tanh", gemm_backend=gemm_backend
+            text_embed_dim,
+            dim,
+            act_fn="gelu_tanh",
+            gemm_backend=gemm_backend,
+            online_act_quant=online_act_quant,
         )
 
         self.image_embedder = None
@@ -1794,6 +2283,7 @@ class WanTimeTextImageEmbedding(nn.Module):
                 dim,
                 pos_embed_seq_len=pos_embed_seq_len,
                 gemm_backend=gemm_backend,
+                online_act_quant=online_act_quant,
             )
 
     def forward(
@@ -1838,7 +2328,7 @@ class FlashInferWanTransformer3DModel(nn.Module):
         config: WanTransformer3DConfig or compatible config object
 
     Config options for optimization:
-        gemm_backend: "auto", "torch", "bf16", "fp8", "fp4"
+        gemm_backend: "torch", "bf16", "fp8", "fp8_sm90", "bmm_fp8", "fp8_groupwise", "fp8_blockscaled", "batch_deepgemm_fp8", "fp4", etc.
         use_skip_softmax_sparse: Whether to use skip-softmax sparse attention
         skip_softmax_threshold_scale_factor: Threshold scale factor for skip-softmax
     """
@@ -1870,7 +2360,10 @@ class FlashInferWanTransformer3DModel(nn.Module):
         pos_embed_seq_len = getattr(config, "pos_embed_seq_len", None)
 
         # FlashInfer optimization options
-        gemm_backend = getattr(config, "gemm_backend", "auto")
+        gemm_backend = getattr(config, "gemm_backend", "torch")
+        online_act_quant = getattr(config, "online_act_quant", True)
+        single_attention_backend = getattr(config, "single_attention_backend", "single")
+        batch_attention_backend = getattr(config, "batch_attention_backend", "cudnn")
         use_skip_softmax_sparse = getattr(config, "use_skip_softmax_sparse", False)
         skip_softmax_threshold_scale_factor = getattr(
             config, "skip_softmax_threshold_scale_factor", 1.0
@@ -1881,6 +2374,9 @@ class FlashInferWanTransformer3DModel(nn.Module):
         # Store config values for forward pass
         self.patch_size = patch_size
         self.gemm_backend = gemm_backend
+        self.online_act_quant = online_act_quant
+        self.single_attention_backend = single_attention_backend
+        self.batch_attention_backend = batch_attention_backend
         self.use_skip_softmax_sparse = use_skip_softmax_sparse
         self.skip_softmax_threshold_scale_factor = skip_softmax_threshold_scale_factor
 
@@ -1899,6 +2395,7 @@ class FlashInferWanTransformer3DModel(nn.Module):
             image_embed_dim=image_dim,
             pos_embed_seq_len=pos_embed_seq_len,
             gemm_backend=gemm_backend,
+            online_act_quant=online_act_quant,
         )
 
         # 3. Transformer blocks with FlashInfer optimizations
@@ -1913,6 +2410,9 @@ class FlashInferWanTransformer3DModel(nn.Module):
                     eps,
                     added_kv_proj_dim,
                     gemm_backend=gemm_backend,
+                    online_act_quant=online_act_quant,
+                    single_attention_backend=single_attention_backend,
+                    batch_attention_backend=batch_attention_backend,
                     use_skip_softmax_sparse=use_skip_softmax_sparse,
                     skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
                 )
@@ -1925,7 +2425,10 @@ class FlashInferWanTransformer3DModel(nn.Module):
             inner_dim, eps, elementwise_affine=False
         )
         self.proj_out = create_linear_layer(
-            inner_dim, out_channels * math.prod(patch_size), gemm_backend=gemm_backend
+            inner_dim,
+            out_channels * math.prod(patch_size),
+            gemm_backend=gemm_backend,
+            online_act_quant=online_act_quant,
         )
         self.scale_shift_table = nn.Parameter(
             torch.randn(1, 2, inner_dim) / inner_dim**0.5
@@ -2083,22 +2586,6 @@ class FlashInferWanTransformer3DModel(nn.Module):
         return model
 
 
-# Convenience function to convert original model
-def convert_to_flashinfer(original_model) -> FlashInferWanTransformer3DModel:
-    """
-    Convert an existing WanTransformer3DModel to FlashInfer-optimized version.
-
-    Args:
-        original_model: The original diffusers WanTransformer3DModel
-
-    Returns:
-        FlashInferWanTransformer3DModel with copied weights
-    """
-    model = FlashInferWanTransformer3DModel(original_model.config)
-    model.load_state_dict(original_model.state_dict(), strict=False)
-    return model
-
-
 if __name__ == "__main__":
     import argparse
 
@@ -2106,25 +2593,33 @@ if __name__ == "__main__":
     parser.add_argument(
         "--gemm-backend",
         type=str,
-        default="auto",
-        choices=[
-            "auto",
-            "torch",
-            "bf16",
-            "fp8",
-            "fp8_sm90",
-            "bmm_fp8",
-            "fp4",
-            "bmm_bf16",
-            "mxfp8",
-            "bmm_mxfp8",
-        ],
+        default="torch",
+        choices=[b.value for b in GEMMBackend],
         help="GEMM backend for linear layers",
+    )
+    parser.add_argument(
+        "--offline-act-quant",
+        action="store_true",
+        help="Use offline (fixed default) activation quantization instead of online",
+    )
+    parser.add_argument(
+        "--single-attention-backend",
+        type=str,
+        default="single",
+        choices=["single", "cudnn", "trtllm"],
+        help="Attention backend for batch_size == 1",
+    )
+    parser.add_argument(
+        "--batch-attention-backend",
+        type=str,
+        default="cudnn",
+        choices=["cudnn", "trtllm"],
+        help="Attention backend for batch_size > 1",
     )
     parser.add_argument(
         "--skip-softmax-sparse",
         action="store_true",
-        help="Enable skip-softmax sparse attention",
+        help="Enable skip-softmax sparse attention (trtllm backend)",
     )
     parser.add_argument(
         "--skip-softmax-threshold",
@@ -2136,15 +2631,12 @@ if __name__ == "__main__":
 
     print("Testing FlashInferWanTransformer3DModel...")
     print(f"GEMM Backend: {args.gemm_backend}")
+    print(f"Online Act Quant: {not args.offline_act_quant}")
+    print(f"Single Attention Backend: {args.single_attention_backend}")
+    print(f"Batch Attention Backend: {args.batch_attention_backend}")
     print(f"Skip-Softmax Sparse: {args.skip_softmax_sparse}")
     if args.skip_softmax_sparse:
         print(f"Threshold Scale Factor: {args.skip_softmax_threshold}")
-
-    # Check available GEMM backend support
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-        best_backend = _get_best_available_backend(device)
-        print(f"Best available GEMM backend for this GPU: {best_backend.value}")
 
     config = WanTransformer3DConfig(
         patch_size=(1, 2, 2),
@@ -2161,6 +2653,9 @@ if __name__ == "__main__":
         rope_max_seq_len=256,
         # FlashInfer optimization options
         gemm_backend=args.gemm_backend,
+        online_act_quant=not args.offline_act_quant,
+        single_attention_backend=args.single_attention_backend,
+        batch_attention_backend=args.batch_attention_backend,
         use_skip_softmax_sparse=args.skip_softmax_sparse,
         skip_softmax_threshold_scale_factor=args.skip_softmax_threshold,
     )
