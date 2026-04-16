@@ -795,9 +795,8 @@ __device__ __forceinline__ void compute_CB_scaled_2warp(SmemT& smem, int warp, i
   constexpr int NTOKENS_PAD = SmemT::NTOKENS_PAD;
   constexpr int N_HALF = 8;  // each warp computes [NTOKENS_PAD, 8]
 
-  using MmaAtomType =
-      std::conditional_t<std::is_same_v<mma_type, __half>, SM80_16x8x16_F32F16F16F32_TN,
-                         SM80_16x8x16_F32BF16BF16F32_TN>;
+  // Always bf16 MMA — activations are bf16; f16 state is converted in add_init_out_cute.
+  using MmaAtomType = SM80_16x8x16_F32BF16BF16F32_TN;
 
   // ── Swizzled smem views ──
   auto layout_bc = make_swizzled_layout_rc<NTOKENS_PAD, DSTATE>();
@@ -904,21 +903,13 @@ __device__ __forceinline__ void precompute_dB_coeff(float coeff[4], SmemT const&
 // Handles input_t → mma_type conversion + scaling in one pass.
 // coeff[i] = 0 encodes both causal mask and zero-fill for k >= prev_k.
 // =============================================================================
-template <typename input_t, typename mma_type, typename FragB>
+template <typename mma_type, typename FragB>
 __device__ __forceinline__ void compute_dB_scaling(FragB& frag_B, float const coeff[4]) {
   using namespace cute;
   static_assert(size(FragB{}) == 4, "m16n8k16 B fragment must have 4 elements");
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
-    float val;
-    if constexpr (!std::is_same_v<input_t, mma_type>) {
-      input_t orig;
-      memcpy(&orig, &frag_B(i), 2);
-      val = toFloat(orig);
-    } else {
-      val = toFloat(frag_B(i));
-    }
-    val *= coeff[i];
+    float val = toFloat(frag_B(i)) * coeff[i];
     mma_type result(val);
     memcpy(&frag_B(i), &result, 2);
   }
@@ -942,12 +933,9 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
   constexpr int NTOKENS_PAD = SmemT::NTOKENS_PAD;
   int const tid = warp * warpSize + lane;
 
-  using mma_type =
-      std::conditional_t<std::is_same_v<input_t, __half> || std::is_same_v<state_t, __half>, __half,
-                         __nv_bfloat16>;
-  using MmaAtomType =
-      std::conditional_t<std::is_same_v<mma_type, __half>, SM80_16x8x16_F32F16F16F32_TN,
-                         SM80_16x8x16_F32BF16BF16F32_TN>;
+  // Always bf16 MMA — activations are bf16; f16 state is converted via convert_frag.
+  using mma_type = __nv_bfloat16;
+  using MmaAtomType = SM80_16x8x16_F32BF16BF16F32_TN;
 
   // TiledMMA: 128 threads, 4 atoms in M direction → covers [M=64, N=8]
   auto tiled_mma = make_tiled_mma(MMA_Atom<MMA_Traits<MmaAtomType>>{}, Layout<Shape<_4, _1>>{});
@@ -972,15 +960,7 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
   Tensor frag_A_view = s2r_thr_A.retile_D(frag_A);
 
   cute::copy(s2r_A, smem_A_s2r, frag_A_view);
-
-  if constexpr (!std::is_same_v<input_t, mma_type>) {
-#pragma unroll
-    for (int i = 0; i < size(frag_A); ++i) {
-      input_t orig;
-      memcpy(&orig, &frag_A(i), 2);
-      frag_A(i) = mma_type(toFloat(orig));
-    }
-  }
+  // old_x is input_t == mma_type (bf16) — no conversion needed.
 
   // ── B operand: old_B [NTOKENS_PAD, DSTATE] Swizzle<3,3,3>, transposed view [N=DSTATE,
   // K=NTOKENS_PAD] ── ldmatrix.trans reads from N-stride-1 smem and transposes → K stride-1 in
@@ -1053,8 +1033,8 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
     cute::copy(s2r_B, smem_B_s2r_0, frag_B_view_0);
     cute::copy(s2r_B, smem_B_s2r_1, frag_B_view_1);
 
-    compute_dB_scaling<input_t, mma_type>(frag_B_0, dB_coeff);
-    compute_dB_scaling<input_t, mma_type>(frag_B_1, dB_coeff);
+    compute_dB_scaling<mma_type>(frag_B_0, dB_coeff);
+    compute_dB_scaling<mma_type>(frag_B_1, dB_coeff);
 
     // ── Two independent HMMAs ──
     cute::gemm(tiled_mma, frag_h_0, frag_A, frag_B_0, frag_h_0);
@@ -1165,15 +1145,19 @@ __device__ __forceinline__ void add_init_out(SmemT& smem, int warp, int lane) {
 // Each operates on a register-resident frag_y accumulator (f32).
 // Called from compute_output_cute's N-tile loop.
 
-// Convert fragment elements from src_t to mma_type in-place (no-op if same type).
+// Convert fragment elements from src_t to bf16 (mma_type) in-place.
+// No-op when src_t == mma_type.  For f16→bf16: reads f16 pair, converts
+// via f32 intermediate, writes bf16 pair.  Uses fromFloat2 for efficient
+// paired conversion (single cvt.rn.bf16x2.f32 on Ampere+).
 template <typename src_t, typename mma_type, typename Frag>
 __device__ __forceinline__ void convert_frag(Frag& frag) {
   if constexpr (!std::is_same_v<src_t, mma_type>) {
+    static_assert(std::is_same_v<mma_type, __nv_bfloat16>, "mma_type must be bf16");
 #pragma unroll
     for (int i = 0; i < cute::size(frag); i += 2) {
       float2 vals = toFloat2(reinterpret_cast<src_t const*>(&frag(i)));
-      frag(i) = mma_type(vals.x);
-      frag(i + 1) = mma_type(vals.y);
+      __nv_bfloat162 packed = fromFloat2(vals);
+      memcpy(&frag(i), &packed, 4);
     }
   }
 }
@@ -1199,15 +1183,7 @@ __device__ __forceinline__ void add_cb_x_cute(FragY& frag_y, FragCB const& frag_
   auto frag_B_x_view = s2r_thr_B_trans.retile_D(frag_B_x);
 
   cute::copy(s2r_B_trans, smem_x_trans_s2r, frag_B_x_view);
-
-  if constexpr (!std::is_same_v<input_t, mma_type>) {
-#pragma unroll
-    for (int i = 0; i < size(frag_B_x); ++i) {
-      input_t orig;
-      memcpy(&orig, &frag_B_x(i), 2);
-      frag_B_x(i) = mma_type(toFloat(orig));
-    }
-  }
+  // x is input_t == mma_type (bf16) — no conversion needed.
 
   cute::gemm(tiled_mma, frag_y, frag_CB, frag_B_x, frag_y);
 }
@@ -1267,9 +1243,8 @@ __device__ __forceinline__ void add_init_out_cute(SmemT const& smem, TiledMma co
                                                   ThrMma const& thr_mma, int tid, FragY& frag_y_0,
                                                   FragY& frag_y_1) {
   using namespace cute;
-  using mma_type =
-      std::conditional_t<std::is_same_v<input_t, __half> || std::is_same_v<state_t, __half>, __half,
-                         __nv_bfloat16>;
+  // Always bf16 MMA — f16 state converted via convert_frag<state_t, mma_type>.
+  using mma_type = __nv_bfloat16;
 
   constexpr int NTOKENS_PAD = SmemT::NTOKENS_PAD;
   constexpr int K_TILE = 16;
@@ -1413,13 +1388,9 @@ __device__ __forceinline__ void compute_and_store_output_cute(SmemT& smem,
   constexpr int NTOKENS_PAD = SmemT::NTOKENS_PAD;
   int const tid = warp * warpSize + lane;
 
-  // ── MMA type: f16 if any operand is f16, else bf16 (preserves precision) ──
-  using mma_type =
-      std::conditional_t<std::is_same_v<input_t, __half> || std::is_same_v<state_t, __half>, __half,
-                         __nv_bfloat16>;
-  using MmaAtomType =
-      std::conditional_t<std::is_same_v<mma_type, __half>, SM80_16x8x16_F32F16F16F32_TN,
-                         SM80_16x8x16_F32BF16BF16F32_TN>;
+  // Always bf16 MMA — activations are bf16; f16 state converted in add_init_out_cute.
+  using mma_type = __nv_bfloat16;
+  using MmaAtomType = SM80_16x8x16_F32BF16BF16F32_TN;
 
   // ── TiledMMA: 128 threads, covers [16, 32] output per step ──
   auto tiled_mma = make_tiled_mma(MMA_Atom<MMA_Traits<MmaAtomType>>{}, Layout<Shape<_1, _4>>{});
@@ -1794,9 +1765,8 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   if constexpr (USE_TENSOR_MMA) {
     // MMA path: warps 0,1 compute CB_scaled into smem (split N=16 → 2×[16,8]).
     // No barrier needed — warps 2,3 start replay immediately; warps 0,1 join after CB.
-    using mma_type =
-        std::conditional_t<std::is_same_v<input_t, __half> || std::is_same_v<state_t, __half>,
-                           __half, __nv_bfloat16>;
+    // Always bf16 MMA — activations are bf16.
+    using mma_type = __nv_bfloat16;
     if (warp < 2) {
       compute_CB_scaled_2warp<input_t, mma_type, NTOKENS, DSTATE>(smem, warp, lane);
     }

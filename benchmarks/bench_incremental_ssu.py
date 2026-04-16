@@ -60,8 +60,8 @@ from einops import repeat
 # Source: https://github.com/hnover-nv/TensorRT-LLM/blob/af1ccca04a731ea595e95229ab035af2f0c10312/tests/unittest/_torch/modules/mamba/benchmark_incremental_selective_state_update.py
 sys.path.insert(0, str(Path(__file__).parent.parent / "tests" / "mamba"))
 
-from triton_reference.incremental_selective_state_update import (
-    incremental_selective_state_update,
+from triton_reference.replay_selective_state_update import (
+    replay_selective_state_update as incremental_selective_state_update,
 )
 from triton_reference.selective_state_update import (
     selective_state_update_triton as selective_state_update,

@@ -153,6 +153,9 @@ def ssu_incremental(
     dim = state.size(2)
     dstate = state.size(3)
     ntokens_mtp = x.size(1)
+    assert ntokens_mtp <= 16, (
+        f"ssu_incremental supports at most 16 MTP tokens, got {ntokens_mtp}"
+    )
 
     stateIndex_dtype = torch.int32
     if state_batch_indices is not None:
