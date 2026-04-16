@@ -2621,13 +2621,6 @@ def trtllm_fp8_per_tensor_scale_moe(
         otherwise, returns the intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
     """
     _validate_routing_replay_out(routing_replay_out, top_k)
-    num_tokens = hidden_states.shape[0]
-    hidden_size = hidden_states.shape[-1]
-    if enable_pdl is None:
-        enable_pdl = device_support_pdl(hidden_states.device)
-    output = torch.empty(
-        num_tokens, hidden_size, dtype=torch.bfloat16, device=hidden_states.device
-    )
     result = get_trtllm_moe_sm100_module().trtllm_fp8_per_tensor_scale_moe(
         routing_logits,
         routing_bias,
@@ -2637,7 +2630,6 @@ def trtllm_fp8_per_tensor_scale_moe(
         output1_scales_gate_scalar,
         gemm2_weights,
         output2_scales_scalar,
-        output,
         num_experts,
         top_k,
         n_group,
