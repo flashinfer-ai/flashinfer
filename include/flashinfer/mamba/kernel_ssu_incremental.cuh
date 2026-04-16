@@ -612,7 +612,6 @@ __device__ __forceinline__ void load_data(SmemT& smem, SsuIncrementalParams cons
   // ── Warp 0: cp.async B[T, dstate] + old_B[T, dstate] (swizzled smem) ──
   if (warp == 0) {
     load_B_cute<input_t, NTOKENS, DSTATE>(smem, B_ptr, B_base, params.B_stride_mtp, lane);
-    asm volatile("cp.async.commit_group;\n" ::: "memory");
     load_old_B_cute<input_t, NTOKENS, DSTATE>(smem, old_B_ptr, oB_base, params.old_B_stride_mtp,
                                               lane);
     asm volatile("cp.async.commit_group;\n" ::: "memory");
@@ -648,7 +647,6 @@ __device__ __forceinline__ void load_data(SmemT& smem, SsuIncrementalParams cons
     constexpr bool X_SWIZZLE = (sizeof(state_t) == 2);
     if constexpr (X_SWIZZLE) {
       load_x_cute<input_t, NTOKENS, DIM>(smem, x_ptr, x_base, params.x_stride_mtp, lane);
-      asm volatile("cp.async.commit_group;\n" ::: "memory");
       load_old_x_cute<input_t, NTOKENS, DIM>(smem, old_x_ptr, ox_base, params.old_x_stride_mtp,
                                              lane);
       asm volatile("cp.async.commit_group;\n" ::: "memory");
@@ -668,7 +666,6 @@ __device__ __forceinline__ void load_data(SmemT& smem, SsuIncrementalParams cons
   // ── Warp 3: cp.async C[T, dstate] + z[T, dim] ──
   if (warp == 3) {
     load_C_cute_manual<input_t, NTOKENS, DSTATE>(smem, C_ptr, C_base, params.C_stride_mtp, lane);
-    asm volatile("cp.async.commit_group;\n" ::: "memory");
     // load_C_cute<input_t, NTOKENS, DSTATE>(smem, C_ptr, C_base, params.C_stride_mtp, lane);
     if (z_ptr) {
       int64_t const z_base = (int64_t)batch_idx * params.z_stride_batch + head * DIM;
@@ -1260,10 +1257,10 @@ __device__ __forceinline__ void compute_z_gating_cute(FragY& frag_y, SmemZ const
 }
 
 // ── Matmul 3: init_out = C @ state^T ────────────────────────────────────────
-// Software-pipelined K-loop with double-buffered A and B register fragments
-// (CUTLASS sgemm_sm80 pattern). 2 frag_A + 4 frag_B in registers at steady state.
-// Loads k+1 into nxt slot while HMMA consumes cur slot — independent registers,
-// no dependency between LDSM and HMMA within the same loop iteration.
+// 3-stage software-pipelined K-loop with triple-buffered A and B register fragments.
+// 3 frag_A + 6 frag_B in registers at steady state.
+// Loads k+2 while HMMA consumes k — 2 iterations of latency cover between
+// LDSM load and HMMA consume, reducing smem pipeline stalls.
 template <typename input_t, typename state_t, int NTOKENS, int DIM, int DSTATE, int NUM_WARPS,
           typename SmemT, typename TiledMma, typename ThrMma, typename FragY>
 __device__ __forceinline__ void add_init_out_cute(SmemT const& smem, TiledMma const& tiled_mma,
@@ -1306,28 +1303,34 @@ __device__ __forceinline__ void add_init_out_cute(SmemT const& smem, TiledMma co
   auto smem_state_s2r_0 = s2r_thr_B.partition_S(smem_state_nk_0);
   auto smem_state_s2r_1 = s2r_thr_B.partition_S(smem_state_nk_1);
 
-  // ── Double-buffered A fragments (2 K-slots) ──
+  // ── Triple-buffered A fragments (3 K-slots) ──
   auto frag_A_0 = thr_mma.partition_fragment_A(smem_C_ktiled(_, _, _0{}));
   auto frag_A_1 = make_fragment_like(frag_A_0);
+  auto frag_A_2 = make_fragment_like(frag_A_0);
   auto frag_A_view_0 = s2r_thr_A.retile_D(frag_A_0);
   auto frag_A_view_1 = s2r_thr_A.retile_D(frag_A_1);
+  auto frag_A_view_2 = s2r_thr_A.retile_D(frag_A_2);
 
-  // ── Double-buffered B fragments (2 N-tiles × 2 K-slots = 4 total) ──
+  // ── Triple-buffered B fragments (2 N-tiles × 3 K-slots = 6 total) ──
   auto frag_B0_0 = thr_mma.partition_fragment_B(smem_state_nk_0(_, _, _0{}));
   auto frag_B0_1 = make_fragment_like(frag_B0_0);
+  auto frag_B0_2 = make_fragment_like(frag_B0_0);
   auto frag_B_view0_0 = s2r_thr_B.retile_D(frag_B0_0);
   auto frag_B_view0_1 = s2r_thr_B.retile_D(frag_B0_1);
+  auto frag_B_view0_2 = s2r_thr_B.retile_D(frag_B0_2);
 
   auto frag_B1_0 = thr_mma.partition_fragment_B(smem_state_nk_1(_, _, _0{}));
   auto frag_B1_1 = make_fragment_like(frag_B1_0);
+  auto frag_B1_2 = make_fragment_like(frag_B1_0);
   auto frag_B_view1_0 = s2r_thr_B.retile_D(frag_B1_0);
   auto frag_B_view1_1 = s2r_thr_B.retile_D(frag_B1_1);
+  auto frag_B_view1_2 = s2r_thr_B.retile_D(frag_B1_2);
 
   // ── Clear accumulators ──
   clear(frag_y_0);
   clear(frag_y_1);
 
-  // ── Prologue: load and convert k=0 into slot 0 ──
+  // ── Prologue: load and convert k=0,1 into slots 0,1 ──
   cute::copy(s2r_A, smem_C_s2r(_, _, _, 0), frag_A_view_0);
   cute::copy(s2r_B, smem_state_s2r_0(_, _, _, 0), frag_B_view0_0);
   cute::copy(s2r_B, smem_state_s2r_1(_, _, _, 0), frag_B_view1_0);
@@ -1335,36 +1338,58 @@ __device__ __forceinline__ void add_init_out_cute(SmemT const& smem, TiledMma co
   convert_frag<state_t, mma_type>(frag_B0_0);
   convert_frag<state_t, mma_type>(frag_B1_0);
 
-  // ── Pipelined K-loop: load nxt, gemm cur, convert nxt ──
-  // Even iterations: cur=slot0, nxt=slot1. Odd: cur=slot1, nxt=slot0.
-  // #pragma unroll resolves k%2 and k+1<NUM_K_TILES at compile time.
+  cute::copy(s2r_A, smem_C_s2r(_, _, _, 1), frag_A_view_1);
+  cute::copy(s2r_B, smem_state_s2r_0(_, _, _, 1), frag_B_view0_1);
+  cute::copy(s2r_B, smem_state_s2r_1(_, _, _, 1), frag_B_view1_1);
+  convert_frag<input_t, mma_type>(frag_A_1);
+  convert_frag<state_t, mma_type>(frag_B0_1);
+  convert_frag<state_t, mma_type>(frag_B1_1);
+
+  // ── 3-stage pipelined K-loop: load k+2, gemm k, convert k+2 ──
+  // Each slot has 2 iterations of latency cover between load and consume.
+  // k%3=0: compute slot 0, load into slot 2
+  // k%3=1: compute slot 1, load into slot 0
+  // k%3=2: compute slot 2, load into slot 1
 #pragma unroll
   for (int k = 0; k < NUM_K_TILES; ++k) {
-    if (k % 2 == 0) {
-      if (k + 1 < NUM_K_TILES) {
-        cute::copy(s2r_A, smem_C_s2r(_, _, _, k + 1), frag_A_view_1);
-        cute::copy(s2r_B, smem_state_s2r_0(_, _, _, k + 1), frag_B_view0_1);
-        cute::copy(s2r_B, smem_state_s2r_1(_, _, _, k + 1), frag_B_view1_1);
+    if (k % 3 == 0) {
+      if (k + 2 < NUM_K_TILES) {
+        cute::copy(s2r_A, smem_C_s2r(_, _, _, k + 2), frag_A_view_2);
+        cute::copy(s2r_B, smem_state_s2r_0(_, _, _, k + 2), frag_B_view0_2);
+        cute::copy(s2r_B, smem_state_s2r_1(_, _, _, k + 2), frag_B_view1_2);
       }
       cute::gemm(tiled_mma, frag_y_0, frag_A_0, frag_B0_0, frag_y_0);
       cute::gemm(tiled_mma, frag_y_1, frag_A_0, frag_B1_0, frag_y_1);
-      if (k + 1 < NUM_K_TILES) {
-        convert_frag<input_t, mma_type>(frag_A_1);
-        convert_frag<state_t, mma_type>(frag_B0_1);
-        convert_frag<state_t, mma_type>(frag_B1_1);
+      if (k + 2 < NUM_K_TILES) {
+        convert_frag<input_t, mma_type>(frag_A_2);
+        convert_frag<state_t, mma_type>(frag_B0_2);
+        convert_frag<state_t, mma_type>(frag_B1_2);
       }
-    } else {
-      if (k + 1 < NUM_K_TILES) {
-        cute::copy(s2r_A, smem_C_s2r(_, _, _, k + 1), frag_A_view_0);
-        cute::copy(s2r_B, smem_state_s2r_0(_, _, _, k + 1), frag_B_view0_0);
-        cute::copy(s2r_B, smem_state_s2r_1(_, _, _, k + 1), frag_B_view1_0);
+    } else if (k % 3 == 1) {
+      if (k + 2 < NUM_K_TILES) {
+        cute::copy(s2r_A, smem_C_s2r(_, _, _, k + 2), frag_A_view_0);
+        cute::copy(s2r_B, smem_state_s2r_0(_, _, _, k + 2), frag_B_view0_0);
+        cute::copy(s2r_B, smem_state_s2r_1(_, _, _, k + 2), frag_B_view1_0);
       }
       cute::gemm(tiled_mma, frag_y_0, frag_A_1, frag_B0_1, frag_y_0);
       cute::gemm(tiled_mma, frag_y_1, frag_A_1, frag_B1_1, frag_y_1);
-      if (k + 1 < NUM_K_TILES) {
+      if (k + 2 < NUM_K_TILES) {
         convert_frag<input_t, mma_type>(frag_A_0);
         convert_frag<state_t, mma_type>(frag_B0_0);
         convert_frag<state_t, mma_type>(frag_B1_0);
+      }
+    } else {  // k % 3 == 2
+      if (k + 2 < NUM_K_TILES) {
+        cute::copy(s2r_A, smem_C_s2r(_, _, _, k + 2), frag_A_view_1);
+        cute::copy(s2r_B, smem_state_s2r_0(_, _, _, k + 2), frag_B_view0_1);
+        cute::copy(s2r_B, smem_state_s2r_1(_, _, _, k + 2), frag_B_view1_1);
+      }
+      cute::gemm(tiled_mma, frag_y_0, frag_A_2, frag_B0_2, frag_y_0);
+      cute::gemm(tiled_mma, frag_y_1, frag_A_2, frag_B1_2, frag_y_1);
+      if (k + 2 < NUM_K_TILES) {
+        convert_frag<input_t, mma_type>(frag_A_1);
+        convert_frag<state_t, mma_type>(frag_B0_1);
+        convert_frag<state_t, mma_type>(frag_B1_1);
       }
     }
   }
@@ -1484,10 +1509,17 @@ __device__ __forceinline__ void compute_and_store_output_cute(SmemT& smem,
                                  make_layout(make_shape(Int<NTOKENS_PAD>{}, Int<N_TILE>{}),
                                              make_stride(params.out_stride_mtp, _1{})));
     auto gOut_part = thr_mma.partition_C(gOut_tile);
+    // Vectorized 32-bit store: elements i and i+1 are same-row, consecutive columns
+    // in the m16n8k16 partition_C layout, so &gOut_part(i+1) == &gOut_part(i) + 1.
+    // Address is 4-byte aligned because MMA column index = (lane%4)*2 → even.
+    static_assert(sizeof(input_t) == 2, "vectorized output store requires 2-byte input_t");
 #pragma unroll
-    for (int i = 0; i < size(frag_y); ++i) {
+    for (int i = 0; i < size(frag_y); i += 2) {
       if (pred(i)) {
-        gOut_part(i) = input_t(frag_y(i));
+        input_t pair[2] = {input_t(frag_y(i)), input_t(frag_y(i + 1))};
+        uint32_t packed;
+        memcpy(&packed, pair, 4);
+        *reinterpret_cast<uint32_t*>(&gOut_part(i)) = packed;
       }
     }
   };
