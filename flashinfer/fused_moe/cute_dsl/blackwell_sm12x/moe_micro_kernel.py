@@ -996,18 +996,15 @@ class MoEMicroKernel:
         # active_expert_count and weight_expert_ids.
         num_active_experts = active_expert_count[Int32(0)]
         all_rows_unique = Int32(0)
-        if num_tokens == Int32(1) and num_active_experts == total_pairs:
+        if num_tokens == Int32(1):
+            # A single token's top-k routing is already a dense local expert set.
             all_rows_unique = Int32(1)
-        i = flat_tid
-        while i < num_experts:
-            row_count = Int32(0)
-            if all_rows_unique > Int32(0) and i < num_active_experts:
-                row_count = Int32(1)
-            row_counts[i] = row_count
-            i += flat_stride
-        if flat_tid == Int32(0):
-            # Triton prepass has already populated the compact expert set.
-            pass
+            num_active_experts = total_pairs
+        if all_rows_unique == Int32(0):
+            i = flat_tid
+            while i < num_experts:
+                row_counts[i] = Int32(0)
+                i += flat_stride
         scatter_total = num_tokens * cols
         j = flat_tid
         while j < scatter_total:
@@ -1034,7 +1031,7 @@ class MoEMicroKernel:
             row = Int32(0)
             if all_rows_unique > Int32(0):
                 local_expert_id = pair_idx
-                expert_id = weight_expert_ids[local_expert_id].to(Int32)
+                expert_id = topk_ids[local_expert_id].to(Int32)
             else:
                 if is_cta_leader > Int32(0):
                     local_expert_id = topk_ids[pair_idx].to(Int32)
@@ -1380,10 +1377,11 @@ class MoEMicroKernel:
                 # tile_coord = (m_tile, intermediate_slice, local_expert_idx)
                 local_expert_idx = tile_coord[2]
                 weight_expert_idx = weight_expert_ids[local_expert_idx]
-                alpha_value = alpha[weight_expert_idx].to(cutlass.Float32)
                 valid_rows = row_counts[local_expert_idx]
                 if all_rows_unique > Int32(0):
+                    weight_expert_idx = topk_ids[local_expert_idx].to(Int32)
                     valid_rows = Int32(1)
+                alpha_value = alpha[weight_expert_idx].to(cutlass.Float32)
                 tile_m_base = tile_coord[0] * Int32(self.tile_shape_mnk[0])
                 intermediate_slice = tile_coord[1]
                 sa_tile_offset = tile_coord[0] % self.sa_tiles_per_block
@@ -2204,6 +2202,8 @@ class MoEMicroKernel:
                 intermediate_slice = tc[1]
                 local_expert_idx = tc[2]
                 weight_expert_idx = weight_expert_ids[local_expert_idx]
+                if all_rows_unique > Int32(0):
+                    weight_expert_idx = topk_ids[local_expert_idx].to(Int32)
 
                 sa_tile_coord_m = tc[0] // self.sa_tiles_per_block
                 tAgA_mk = tAgA[(None, sa_tile_coord_m, None, local_expert_idx)]

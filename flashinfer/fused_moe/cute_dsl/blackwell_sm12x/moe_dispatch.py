@@ -818,20 +818,24 @@ def launch_sm120_static_moe(
     base_mac = min(get_max_active_clusters(1), sm_count)
 
     if use_micro:
-        from .triton_compact import compact_topk_ids as _triton_compact_topk_ids
+        # For single-token decode, the top-k routing is already a dense set
+        # of unique expert IDs — skip the Triton compaction pre-pass entirely.
+        launch_ids = flat_ids
+        if num_tokens != 1:
+            from .triton_compact import compact_topk_ids as _triton_compact_topk_ids
 
-        # Run Triton pre-pass to compact global expert IDs to dense local indices
-        assert flat_ids.numel() <= workspace.compact_topk_ids.numel(), (
-            f"compact_topk_ids buffer too small: "
-            f"{workspace.compact_topk_ids.numel()} < {flat_ids.numel()}"
-        )
-        compact_ids = workspace.compact_topk_ids[: flat_ids.numel()]
-        _triton_compact_topk_ids(
-            flat_ids,
-            compact_ids,
-            workspace.weight_expert_ids,
-            workspace.active_expert_count,
-        )
+            assert flat_ids.numel() <= workspace.compact_topk_ids.numel(), (
+                f"compact_topk_ids buffer too small: "
+                f"{workspace.compact_topk_ids.numel()} < {flat_ids.numel()}"
+            )
+            compact_ids = workspace.compact_topk_ids[: flat_ids.numel()]
+            _triton_compact_topk_ids(
+                flat_ids,
+                compact_ids,
+                workspace.weight_expert_ids,
+                workspace.active_expert_count,
+            )
+            launch_ids = compact_ids
         # Select micro MAC: min of tuned ladder, work tiles, and hardware limit.
         # The hardware cap (base_mac) prevents deadlocks on GPUs with fewer SMs
         # than the profiled tuning target.
@@ -852,7 +856,6 @@ def launch_sm120_static_moe(
             mac_override=micro_mac,
             activation=activation,
         )
-        launch_ids = compact_ids
     else:
         # Static path — use hardware default MAC (same as main).
         # MAC tuning for the static kernel is deferred to a follow-up
