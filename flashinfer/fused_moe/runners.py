@@ -1,5 +1,19 @@
 """Unified MoE runner adapters for the autotuned pre-routed NVFP4 path.
 
+Copyright (c) 2026 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
 Each runner wraps one backend and translates (MoEActivationPack, MoEWeightPack)
 into the backend's native calling convention.
 
@@ -158,7 +172,7 @@ class TrtllmFp4RoutedRunner(TunableRunner):
         self._weight_layout = int(WeightLayout.MajorK)
         self._tactics_cache: dict = {}
 
-    def get_valid_tactics(
+    def get_valid_tactics(  # type: ignore[override]
         self, inputs: List[torch.Tensor], profile: Any
     ) -> List[List[int]]:
         # inputs[1] = hidden_states [num_tokens, hidden_size // 2] (FP4 packed)

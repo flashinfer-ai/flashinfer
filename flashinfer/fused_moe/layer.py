@@ -1,5 +1,19 @@
 """MoELayer — stateful cross-backend MoE dispatcher with autotune.
 
+Copyright (c) 2026 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
 Builds one runner per compatible backend, picks the cross-backend winner
 by measuring each runner's best tactic, then dispatches to the winner.
 
@@ -9,11 +23,11 @@ MVP scope: NVFP4 only, pre-routed path, two backends.
 from __future__ import annotations
 
 from statistics import median
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import torch
 
-from ..autotuner import AutoTuner, TunableRunner
+from ..autotuner import AutoTuner
 from ..testing.utils import bench_gpu_time
 from ..utils import get_compute_capability
 from .api import (
@@ -26,8 +40,13 @@ from .api import (
 from .runners import CuteDslNvfp4Runner, TrtllmFp4RoutedRunner
 
 
+# Union of the concrete runners the layer dispatches to.  All share
+# backend_key / tuning_config / pack_inputs as attributes or class members;
+# typing the list with this Union gives mypy the visibility it needs.
+_RunnerT = Union[CuteDslNvfp4Runner, TrtllmFp4RoutedRunner]
+
 # Map backend-config class -> runner class
-_BACKEND_RUNNERS = {
+_BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
     CuteDslConfig: CuteDslNvfp4Runner,
     TrtllmFp4Config: TrtllmFp4RoutedRunner,
 }
@@ -51,7 +70,7 @@ class MoELayer:
         arch = major * 10 + minor
 
         # Build one runner per compatible backend
-        self.runners: List[TunableRunner] = []
+        self.runners: List[_RunnerT] = []
         for backend_cfg in config.backend:
             if not backend_cfg.supported(arch):
                 continue
@@ -67,7 +86,7 @@ class MoELayer:
             )
 
         # Cross-runner winner — populated after first tuning pass
-        self._winner: Optional[TunableRunner] = None
+        self._winner: Optional[_RunnerT] = None
         self._winner_tactic: Any = -1
 
     def __call__(
@@ -94,11 +113,11 @@ class MoELayer:
         self,
         act_pack: MoEActivationPack,
         weight_pack: MoEWeightPack,
-    ) -> Tuple[TunableRunner, Any]:
+    ) -> Tuple[_RunnerT, Any]:
         """Run per-runner autotune, then measure each winner-tactic and
         pick cross-backend winner."""
         best_time_ms = float("inf")
-        best_runner: Optional[TunableRunner] = None
+        best_runner: Optional[_RunnerT] = None
         best_tactic: Any = -1
 
         for runner in self.runners:
