@@ -1735,9 +1735,10 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   int64_t const cache_slot = sbi ? static_cast<int64_t>(sbi[batch_idx]) : batch_idx;
   if (cache_slot == params.pad_slot_id) return;
 
-  // ── Double-buffer index (buf_write deferred to Phase 3 to avoid stalling warps 2,3) ──
+  // ── Double-buffer index ──
   auto const* __restrict__ buf_idx_ptr = reinterpret_cast<int32_t const*>(params.cache_buf_idx);
   int const buf_read = __ldg(&buf_idx_ptr[cache_slot]);
+  int const buf_write = 1 - buf_read;
 
   // ── prev_num_accepted_tokens ──
   auto const* __restrict__ prev_ptr = reinterpret_cast<int32_t const*>(params.prev_num_accepted);
@@ -1761,6 +1762,13 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   __syncthreads();
 
   constexpr bool USE_TENSOR_MMA = (sizeof(state_t) == 2);
+
+  // v10.1: old_B writeback hoisted ahead of Phase 1.  Source (smem.B) is
+  // consumed only by Phase 1a CB; the STGs fire-and-forget onto the
+  // memory subsystem and complete in parallel with all subsequent compute.
+  // No barrier stalls on outstanding STGs (bar.sync has no membar.gl).
+  store_old_B<input_t, NTOKENS, DSTATE, HEADS_PER_GROUP, NUM_WARPS>(
+      smem, params, warp, lane, head, group_idx, cache_slot, buf_write);
 
   if constexpr (USE_TENSOR_MMA) {
     // MMA path: warps 0,1 compute CB_scaled into smem (split N=16 → 2×[16,8]).
@@ -1800,15 +1808,13 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   }
 
   // ── Phase 3: Store to global memory ──
-  int const buf_write = 1 - buf_read;
+  // (old_B hoisted to pre-Phase-1 in v10.1 — see store_old_B call above.)
 
   // State writeback — all warps
   store_state<state_t, DIM, DSTATE, NUM_WARPS>(smem, params, warp, lane, head, cache_slot);
 
-  // Cache writes — old_x and old_B use all warps (vectorized), dt/cumAdt one warp each
+  // Cache writes — old_x uses all warps (vectorized), dt/cumAdt one warp each
   store_old_x<input_t, NTOKENS, DIM, NUM_WARPS>(smem, params, warp, lane, head, cache_slot);
-  store_old_B<input_t, NTOKENS, DSTATE, HEADS_PER_GROUP, NUM_WARPS>(
-      smem, params, warp, lane, head, group_idx, cache_slot, buf_write);
   if (warp == 0 && lane < NTOKENS) {
     auto* __restrict__ old_dt_proc_w = reinterpret_cast<float*>(params.old_dt_proc);
     int64_t const dt_w_base = cache_slot * params.old_dt_proc_stride_cache +
