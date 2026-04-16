@@ -51,13 +51,15 @@ main() {
     # Install and verify (unless dry run)
     install_and_verify
 
-    # When running inside a container launched by srun -N 1, SLURM env vars
-    # leak in with SLURM_NTASKS=1. This confuses both mpirun (which tries to
-    # use srun as launcher) and test helpers (which misread rank/world_size).
-    # Unset them so mpirun and torch.distributed behave as on a bare node.
+    # When running inside a container launched by srun -N 1, SLURM and PMI
+    # env vars leak in. This confuses mpirun's Hydra launcher (auto-detects
+    # Slurm, tries to use srun which doesn't exist in the container) and test
+    # helpers (misread rank/world_size). Unset ALL of them so mpirun and
+    # torch.distributed behave identically to a bare node.
     if [ "${SLURM_NTASKS:-0}" -le 1 ]; then
-        unset SLURM_PROCID SLURM_NTASKS SLURM_LOCALID SLURM_NODELIST \
-              SLURM_JOB_ID SLURM_STEP_ID SLURM_STEP_NODELIST 2>/dev/null || true
+        while IFS='=' read -r var _; do
+            unset "$var"
+        done < <(env | grep -E '^(SLURM_|PMI_)')
     fi
 
     # --- Phase 1: MPI-based tests (run with mpirun) ---
