@@ -63,6 +63,7 @@ def gen_cutlass_fused_moe_sm120_module(use_fast_build: bool = False) -> JitSpec:
         "-DENABLE_FP8",
         "-DENABLE_FP4",
         "-DUSING_OSS_CUTLASS_MOE_GEMM",
+        "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
     ]
 
     nvcc_flags += current_compilation_context.get_nvcc_flags_list(
@@ -81,6 +82,7 @@ def gen_cutlass_fused_moe_sm103_module(use_fast_build: bool = False) -> JitSpec:
         "-DENABLE_FP4",
         "-DUSING_OSS_CUTLASS_MOE_GEMM",
         "-DCOMPILE_BLACKWELL_SM103_TMA_GROUPED_GEMMS",
+        "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
     ]
 
     nvcc_flags += current_compilation_context.get_nvcc_flags_list(
@@ -98,6 +100,7 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
         "-DENABLE_FP8",
         "-DENABLE_FP4",
         "-DUSING_OSS_CUTLASS_MOE_GEMM",
+        "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
     ]
 
     nvcc_flags += current_compilation_context.get_nvcc_flags_list(
@@ -116,6 +119,7 @@ def gen_cutlass_fused_moe_sm90_module(use_fast_build: bool = False) -> JitSpec:
         "-DENABLE_FP8_BLOCK_SCALE" if is_cuda_version_at_least("12.8") else "",
         "-DENABLE_FP4" if is_cuda_version_at_least("12.8") else "",
         "-DUSING_OSS_CUTLASS_MOE_GEMM",
+        "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
     ]
     return gen_cutlass_fused_moe_module(nvcc_flags, "90", use_fast_build)
 
@@ -289,37 +293,13 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_kernel_launcher.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_runner.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_llama4.cu",
-            # DeepSeek routing (split files)
-            jit_env.FLASHINFER_CSRC_DIR
             / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_deepseek.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/routingDeepSeek/launchMainKernel.cu",
+            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_llama4.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/routingDeepSeek/launchClusterKernel.cu",
+            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/routingDeepSeek/launchCoopKernel.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/routingDeepSeek/launchHistogramKernel.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/routingDeepSeek/launchInitExpertCounts.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/routingDeepSeek/launchOffsetsKernel.cu",
-            # Renormalize routing (split files)
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_renormalize.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/routingRenormalize/launchBlockKernel.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/routingRenormalize/launchClusterKernel.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/routingRenormalize/launchHistogramKernel.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/routingRenormalize/launchHistogramScoresKernel.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/routingRenormalize/launchInitExpertCounts.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/routingRenormalize/launchOffsetsKernel.cu",
+            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_common.cu",
             jit_env.FLASHINFER_CSRC_DIR
             / "fused_moe/trtllm_backend/trtllm_fused_moe_dev_kernel.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_batched_gemm_runner.cu",
@@ -331,6 +311,7 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
             "-DENABLE_BF16",
             "-DENABLE_FP8",
             "-DENABLE_FP4",
+            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
             f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_BMM}\\"',
         ]
         + nvcc_flags,

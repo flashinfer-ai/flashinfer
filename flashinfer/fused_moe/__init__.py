@@ -44,10 +44,6 @@ from .runners import CuteDslNvfp4Runner, TrtllmFp4RoutedRunner  # noqa: F401
 
 # Legacy flat-argument APIs (unchanged, not deprecated)
 from .core import (
-    ActivationType,
-    Fp8QuantizationType,
-    RoutingMethodType,
-    WeightLayout,
     convert_to_block_layout,
     cutlass_fused_moe,
     gen_cutlass_fused_moe_sm120_module,
@@ -64,6 +60,13 @@ from .core import (
     trtllm_bf16_moe,
     trtllm_bf16_routed_moe,
     trtllm_mxint4_block_scale_moe,
+)
+
+from ..tllm_enums import (
+    ActivationType,
+    Fp8QuantizationType,
+    WeightLayout,
+    RoutingMethodType,
 )
 
 from .fused_routing_dsv3 import (  # noqa: F401

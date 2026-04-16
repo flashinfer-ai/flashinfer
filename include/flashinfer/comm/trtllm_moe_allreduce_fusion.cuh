@@ -421,8 +421,9 @@ __inline__ __device__ T blockReduceSumV2(T* val) {
   return (T)0.0f;
 }
 
-inline __device__ int64_t get_sf_out_offset_128x4(std::optional<int> batchIdx, int mIdx, int kIdx,
-                                                  std::optional<int> numRows, int numCols) {
+inline __device__ int64_t get_sf_out_offset_128x4(cuda::std::optional<int> batchIdx, int mIdx,
+                                                  int kIdx, cuda::std::optional<int> numRows,
+                                                  int numCols) {
   // SF layout [numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]
   // --> index [mTileIdx, kTileIdx, outerMIdx, innerMIdx, innerKIdx]
 
@@ -462,8 +463,9 @@ inline __device__ int64_t get_sf_out_offset_128x4(std::optional<int> batchIdx, i
 }
 
 template <class SFType, int CVT_FP4_NUM_THREADS_PER_SF>
-__device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(std::optional<int> batchIdx, int rowIdx,
-                                                       int colIdx, std::optional<int> numRows,
+__device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(cuda::std::optional<int> batchIdx,
+                                                       int rowIdx, int colIdx,
+                                                       cuda::std::optional<int> numRows,
                                                        int numCols, SFType* SFout,
                                                        QuantizationSFLayout layout) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -706,6 +708,7 @@ struct MoeFinalizeAllReduceFusionParams : public AllReduceFusionParams<T> {
   // [num_tokens, top_k]
   int32_t* expanded_idx_to_permuted_idx = nullptr;
   // allreduce_in [maxPermutedPaddedCount, hidden_dim]
+  float routed_scaling_factor = 1.0f;
 };
 
 template <int NRanks>
@@ -824,8 +827,9 @@ __device__ __forceinline__ void fused_op(vec_t<T, VEC_SIZE> const& val, int acce
   if constexpr (QuantOut) {
     constexpr int SF_VEC_SIZE = 16;
     auto sf_out = utils::cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(
-        std::nullopt /* batchIdx */, token_id, access_id_in_token, std::nullopt /* numRows */,
-        params.hidden_dim, reinterpret_cast<uint32_t*>(params.scale_out), params.layout);
+        cuda::std::nullopt /* batchIdx */, token_id, access_id_in_token,
+        cuda::std::nullopt /* numRows */, params.hidden_dim,
+        reinterpret_cast<uint32_t*>(params.scale_out), params.layout);
     reinterpret_cast<uint32_t*>(params.quant_out)[access_id] =
         utils::cvt_warp_fp16_to_fp4<T, VEC_SIZE>(norm_val, params.scale_factor, sf_out);
   }
@@ -1277,6 +1281,8 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(
 
   int top_k = params.top_k;
   bool use_scale_factor = params.expert_scale_factor != nullptr;
+  float routed_scaling_factor = params.routed_scaling_factor;
+  bool use_routed_scaling_factor = routed_scaling_factor != 1.0f;
 
   // Persistent Kernel
   // Each cluster iterate through all token it need to handle
@@ -1297,20 +1303,28 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(
 
       int thread_offset_across_token =
           permuted_idx * params.hidden_dim + thread_offset_within_token;
-      float block_scale = 1.0;
-      if (use_scale_factor) {
-        block_scale =
-            static_cast<float>(static_cast<ScaleType*>(params.expert_scale_factor)[expanded_idx]);
-      }
-
       vec_t<T, VEC_SIZE> permuted_data;
       permuted_data.load(reinterpret_cast<T*>(params.allreduce_in) + thread_offset_across_token);
 
       // * acc += scale(data)
+      if (use_scale_factor) {
+        float block_scale =
+            static_cast<float>(static_cast<ScaleType*>(params.expert_scale_factor)[expanded_idx]);
+#pragma unroll
+        for (int i = 0; i < VEC_SIZE; ++i) {
+          // assume computation is done in ScaleType
+          accumulator[i] += static_cast<T>(static_cast<float>(permuted_data[i]) * block_scale);
+        }
+      } else {
+        accumulator = vec_add<T, VEC_SIZE>(accumulator, permuted_data);
+      }
+    }
+
+    // Apply the global routed scaling once after accumulating all routed experts.
+    if (use_routed_scaling_factor) {
 #pragma unroll
       for (int i = 0; i < VEC_SIZE; ++i) {
-        // assume computation is done in ScaleType
-        accumulator[i] += static_cast<T>(static_cast<float>(permuted_data[i]) * block_scale);
+        accumulator[i] = static_cast<T>(static_cast<float>(accumulator[i]) * routed_scaling_factor);
       }
     }
 
@@ -1474,6 +1488,8 @@ cudaError_t moefinalize_allreduce_fusion_op(MoeFinalizeAllReduceFusionParams<T> 
                    "allreduce_in, expanded_idx_to_permuted_idx and top_k must be set");
   FLASHINFER_CHECK(params.size % params.hidden_dim == 0, "size must be a multiple of hidden_dim");
   FLASHINFER_CHECK(params.hidden_dim % VEC_SIZE == 0, "hidden_dim must be a multiple of VEC_SIZE");
+  FLASHINFER_CHECK(params.residual_out || params.norm_out || params.quant_out,
+                   "at least one of residual_out, norm_out, quant_out must be set");
 
   auto status = DISPATCH_MOEFINALIZEREDUCTION(
       params.nranks, params.residual_out, params.rms_gamma, params.quant_out, N_RANKS, RES, RMS,

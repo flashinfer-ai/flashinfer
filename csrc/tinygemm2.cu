@@ -195,84 +195,90 @@ __global__ __launch_bounds__(384, 1) void tinygemm_kernel(
   int const K_LOOPS_DMA = (K + 4 * TILE_K * STAGE_UNROLL - 1) / (4 * (TILE_K * STAGE_UNROLL));
   int const K_LOOPS_COMPUTE = K_LOOPS_DMA;
 
-  // Data loading thread
-  if (warp_id >= 4 && elect_one_sync()) {
-    int stage = warp_id % 4;
+  if (warp_id >= 4) {
+    // Data loading threads: one elected thread per warp issues TMA operations.
+    // Non-elected threads in warps 4-11 idle but must still participate in the
+    // block-wide __syncthreads() at the end of the kernel.
+    if (elect_one_sync()) {
+      int stage = warp_id % 4;
 
-    bool weight_warp = warp_id < 8;
-    if constexpr (USE_PDL) {
-      if (!weight_warp) {
-        cudaGridDependencySynchronize();
-        cudaTriggerProgrammaticLaunchCompletion();
+      bool weight_warp = warp_id < 8;
+      if constexpr (USE_PDL) {
+        if (!weight_warp) {
+          cudaGridDependencySynchronize();
+          cudaTriggerProgrammaticLaunchCompletion();
+        }
       }
-    }
 
-    for (int ki = 0; ki < K_LOOPS_DMA; ki++) {
-      int k = (ki * 4 + (warp_id % 4)) * TILE_K * STAGE_UNROLL;
+      for (int ki = 0; ki < K_LOOPS_DMA; ki++) {
+        int k = (ki * 4 + (warp_id % 4)) * TILE_K * STAGE_UNROLL;
 
-      uint64_t desc_ptr_wt = reinterpret_cast<uint64_t>(&weight_map);
-      uint64_t desc_ptr_act = reinterpret_cast<uint64_t>(&activation_map);
+        uint64_t desc_ptr_wt = reinterpret_cast<uint64_t>(&weight_map);
+        uint64_t desc_ptr_act = reinterpret_cast<uint64_t>(&activation_map);
 
-      uint32_t bar_ptr_wt = __cvta_generic_to_shared(&bar_wt_ready[stage]);
-      uint32_t bar_ptr_act = __cvta_generic_to_shared(&bar_act_ready[stage]);
-      int bytes_wt = TILE_M * TILE_K * sizeof(__nv_bfloat16);
-      int bytes_act = TILE_N * TILE_K * sizeof(__nv_bfloat16);
+        uint32_t bar_ptr_wt = __cvta_generic_to_shared(&bar_wt_ready[stage]);
+        uint32_t bar_ptr_act = __cvta_generic_to_shared(&bar_act_ready[stage]);
+        int bytes_wt = TILE_M * TILE_K * sizeof(__nv_bfloat16);
+        int bytes_act = TILE_N * TILE_K * sizeof(__nv_bfloat16);
 
-      bar_wait(__cvta_generic_to_shared(&bar_data_consumed[stage]), phase ^ 1);
+        bar_wait(__cvta_generic_to_shared(&bar_data_consumed[stage]), phase ^ 1);
 
-      if (weight_warp)
-        asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;"
-                     :
-                     : "r"(bar_ptr_wt), "r"(STAGE_UNROLL * bytes_wt));
-      if (!weight_warp)
-        asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;"
-                     :
-                     : "r"(bar_ptr_act), "r"(STAGE_UNROLL * bytes_act));
-
-      for (int i = 0; i < STAGE_UNROLL; i++) {
-        uint32_t smem_ptr_wt =
-            __cvta_generic_to_shared(&sh_weights[(stage * STAGE_UNROLL + i) * TILE_M * TILE_K]);
-        uint32_t crd0 = k + i * TILE_K;
-        uint32_t crd1 = mib;
         if (weight_warp)
-          asm volatile(
-              "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1, "
-              "{%3,%4}], [%2];"
-              :
-              : "r"(smem_ptr_wt), "l"(desc_ptr_wt), "r"(bar_ptr_wt), "r"(crd0), "r"(crd1)
-              : "memory");
-
-        uint32_t smem_ptr_act =
-            __cvta_generic_to_shared(&sh_activations[(stage * STAGE_UNROLL + i) * TILE_N * TILE_K]);
-        crd0 = k + i * TILE_K;
-        crd1 = ni;
+          asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;"
+                       :
+                       : "r"(bar_ptr_wt), "r"(STAGE_UNROLL * bytes_wt));
         if (!weight_warp)
-          asm volatile(
-              "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1, "
-              "{%3,%4}], [%2];"
-              :
-              : "r"(smem_ptr_act), "l"(desc_ptr_act), "r"(bar_ptr_act), "r"(crd0), "r"(crd1)
-              : "memory");
-      }
+          asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;"
+                       :
+                       : "r"(bar_ptr_act), "r"(STAGE_UNROLL * bytes_act));
 
-      stage += 4;
-      if (stage >= STAGES) {
-        stage = warp_id % 4;
-        phase ^= 1;
+        for (int i = 0; i < STAGE_UNROLL; i++) {
+          uint32_t smem_ptr_wt =
+              __cvta_generic_to_shared(&sh_weights[(stage * STAGE_UNROLL + i) * TILE_M * TILE_K]);
+          uint32_t crd0 = k + i * TILE_K;
+          uint32_t crd1 = mib;
+          if (weight_warp)
+            asm volatile(
+                "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0], "
+                "[%1, "
+                "{%3,%4}], [%2];"
+                :
+                : "r"(smem_ptr_wt), "l"(desc_ptr_wt), "r"(bar_ptr_wt), "r"(crd0), "r"(crd1)
+                : "memory");
+
+          uint32_t smem_ptr_act = __cvta_generic_to_shared(
+              &sh_activations[(stage * STAGE_UNROLL + i) * TILE_N * TILE_K]);
+          crd0 = k + i * TILE_K;
+          crd1 = ni;
+          if (!weight_warp)
+            asm volatile(
+                "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0], "
+                "[%1, "
+                "{%3,%4}], [%2];"
+                :
+                : "r"(smem_ptr_act), "l"(desc_ptr_act), "r"(bar_ptr_act), "r"(crd0), "r"(crd1)
+                : "memory");
+        }
+
+        stage += 4;
+        if (stage >= STAGES) {
+          stage = warp_id % 4;
+          phase ^= 1;
+        }
       }
-    }
-    // Wait for pending loads to be consumed before exiting, to avoid race
-    for (int i = 0; i < (STAGES / 4) - 1; i++) {
-      bar_wait(__cvta_generic_to_shared(&bar_data_consumed[stage]), phase ^ 1);
-      stage += 4;
-      if (stage >= STAGES) {
-        stage = warp_id % 4;
-        phase ^= 1;
+      // Wait for pending loads to be consumed before exiting, to avoid race
+      for (int i = 0; i < (STAGES / 4) - 1; i++) {
+        bar_wait(__cvta_generic_to_shared(&bar_data_consumed[stage]), phase ^ 1);
+        stage += 4;
+        if (stage >= STAGES) {
+          stage = warp_id % 4;
+          phase ^= 1;
+        }
       }
     }
   }
   // Compute threads
-  else if (warp_id < 4) {
+  else {
     // Sneak the bias load into the compute warps since they're just waiting
     if (threadIdx.x < TILE_M) sh_bias[threadIdx.x] = bias[mib + threadIdx.x];
 
@@ -354,32 +360,34 @@ __global__ __launch_bounds__(384, 1) void tinygemm_kernel(
     accum4.z = accum[2];
     accum4.w = accum[3];
     reduction_buffer[threadIdx.x] = accum4;
+  }
 
-    __syncthreads();
+  // All threads (warps 0-11) must participate in __syncthreads().
+  // This ensures warp 0 sees reduction_buffer writes from warps 1-3.
+  __syncthreads();
 
-    if (warp_id == 0) {
-      int mi = mib + warp_id * WARP_TILE_M;
-      int tm = mi + lane_id / 4;
-      int tn = ni + 2 * (lane_id % 4);
+  if (warp_id == 0) {
+    int mi = mib + warp_id * WARP_TILE_M;
+    int tm = mi + lane_id / 4;
+    int tn = ni + 2 * (lane_id % 4);
 
-      float4 accum1 = reduction_buffer[32 + threadIdx.x];
-      float4 accum2 = reduction_buffer[64 + threadIdx.x];
-      float4 accum3 = reduction_buffer[96 + threadIdx.x];
+    float4 accum1 = reduction_buffer[32 + threadIdx.x];
+    float4 accum2 = reduction_buffer[64 + threadIdx.x];
+    float4 accum3 = reduction_buffer[96 + threadIdx.x];
 
-      accum[0] = accum[0] + accum1.x + accum2.x + accum3.x;
-      accum[1] = accum[1] + accum1.y + accum2.y + accum3.y;
-      accum[2] = accum[2] + accum1.z + accum2.z + accum3.z;
-      accum[3] = accum[3] + accum1.w + accum2.w + accum3.w;
+    accum[0] = accum[0] + accum1.x + accum2.x + accum3.x;
+    accum[1] = accum[1] + accum1.y + accum2.y + accum3.y;
+    accum[2] = accum[2] + accum1.z + accum2.z + accum3.z;
+    accum[3] = accum[3] + accum1.w + accum2.w + accum3.w;
 
-      float bias_lo = __bfloat162float(sh_bias[tm - mib]);
-      float bias_hi = __bfloat162float(sh_bias[tm + 8 - mib]);
+    float bias_lo = __bfloat162float(sh_bias[tm - mib]);
+    float bias_hi = __bfloat162float(sh_bias[tm + 8 - mib]);
 
-      if (tn < N && tm < M) output[tn * M + tm] = __float2bfloat16(accum[0] + bias_lo);
-      if (tn + 1 < N && tm < M) output[(tn + 1) * M + tm] = __float2bfloat16(accum[1] + bias_lo);
-      if (tn < N && tm + 8 < M) output[tn * M + tm + 8] = __float2bfloat16(accum[2] + bias_hi);
-      if (tn + 1 < N && tm + 8 < M)
-        output[(tn + 1) * M + tm + 8] = __float2bfloat16(accum[3] + bias_hi);
-    }
+    if (tn < N && tm < M) output[tn * M + tm] = __float2bfloat16(accum[0] + bias_lo);
+    if (tn + 1 < N && tm < M) output[(tn + 1) * M + tm] = __float2bfloat16(accum[1] + bias_lo);
+    if (tn < N && tm + 8 < M) output[tn * M + tm + 8] = __float2bfloat16(accum[2] + bias_hi);
+    if (tn + 1 < N && tm + 8 < M)
+      output[(tn + 1) * M + tm + 8] = __float2bfloat16(accum[3] + bias_hi);
   }
 #endif  // __CUDA_ARCH__ >= 900
 }
