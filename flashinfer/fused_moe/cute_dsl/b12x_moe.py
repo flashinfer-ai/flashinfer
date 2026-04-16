@@ -89,8 +89,9 @@ def b12x_fused_moe(
         w2_alpha: Per-expert global scale for FC2.
         fc2_input_scale: Global scale for FC2 input quantization.
         num_local_experts: Local experts for EP. Default: num_experts.
-        output: Pre-allocated output buffer [num_tokens, hidden_size].
-        output_dtype: Output data type. Default: torch.bfloat16.
+        output: Pre-allocated output buffer [num_tokens, hidden_size], bf16.
+        output_dtype: Output data type. Only torch.bfloat16 is currently
+            supported. Default: torch.bfloat16.
         activation: Activation function — "silu" (gated/SwiGLU) or
             "relu2" (non-gated/Nemotron-Super). Default: "silu".
 
@@ -103,6 +104,20 @@ def b12x_fused_moe(
         raise ValueError(
             "b12x fused MoE requires CUDA 13 or later. "
             f"Current CUDA version: {get_cuda_version()}."
+        )
+
+    # SM12x kernels hardcode BF16 for scatter_output (see Phase 0 zero-init
+    # in moe_{static,micro,dynamic}_kernel.py). Other dtypes will fail the
+    # kernel tensor binding.
+    if output_dtype != torch.bfloat16:
+        raise ValueError(
+            f"b12x fused MoE only supports output_dtype=torch.bfloat16, "
+            f"got {output_dtype}."
+        )
+    if output is not None and output.dtype != torch.bfloat16:
+        raise ValueError(
+            f"b12x fused MoE only supports bf16 output buffers, "
+            f"got output.dtype={output.dtype}."
         )
 
     if num_local_experts is None:
@@ -153,7 +168,8 @@ class B12xMoEWrapper:
         use_cuda_graph: Pre-allocate buffers for CUDA graph compatibility.
         max_num_tokens: Maximum tokens (only for use_cuda_graph=True).
         num_local_experts: Local experts for EP. Default: num_experts.
-        output_dtype: Output data type. Default: torch.bfloat16.
+        output_dtype: Output data type. Only torch.bfloat16 is currently
+            supported. Default: torch.bfloat16.
         device: Device for buffer allocation. Default: "cuda".
         activation: Activation function — "silu" or "relu2". Default: "silu".
 
@@ -184,6 +200,13 @@ class B12xMoEWrapper:
             raise ValueError(
                 "b12x fused MoE requires CUDA 13 or later. "
                 f"Current CUDA version: {get_cuda_version()}."
+            )
+
+        # SM12x kernels hardcode BF16 for scatter_output.
+        if output_dtype != torch.bfloat16:
+            raise ValueError(
+                f"b12x fused MoE only supports output_dtype=torch.bfloat16, "
+                f"got {output_dtype}."
             )
 
         self.num_experts = num_experts
@@ -218,6 +241,12 @@ class B12xMoEWrapper:
         backend = select_sm120_moe_backend(
             num_tokens=self.max_num_tokens, num_topk=self.top_k
         )
+        # Mirror the dynamic→static fallback in launch_sm120_moe: the dynamic
+        # kernel indexes row_counts/expert_write_rows with topk_ids (sized by
+        # num_local_experts). Once a dynamic workspace is passed in, runtime
+        # dispatch skips that safety check, so apply it here too.
+        if backend == "dynamic" and self.num_local_experts != self.num_experts:
+            backend = "static"
         if backend == "dynamic":
             self._workspace = allocate_sm120_dynamic_workspace(
                 state_E=self.num_local_experts,
