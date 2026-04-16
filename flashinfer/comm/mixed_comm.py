@@ -109,7 +109,6 @@ class MixedCommOp(enum.IntEnum):
     Values must be aligned with ``MixedCommOp`` in ``mixed_comm.cuh``.
     """
 
-    # Should be aligned with MixedCommOp in mixed_comm.cuh
     ALLREDUCE = 0
     ALLGATHER = enum.auto()
     REDUCESCATTER = enum.auto()
@@ -127,7 +126,6 @@ class MixedCommMode(enum.IntEnum):
     Fused values must be aligned with ``MixedCommMode`` in ``mixed_comm.cuh``.
     """
 
-    # Run a fused kernel (should be aligned with MixedCommMode in mixed_comm.cuh)
     FUSED_OPT_WAITS_MC = 0
     FUSED_OPT_WAITS_UC = enum.auto()
     FUSED_OPT_BYTES1_MC = enum.auto()
@@ -1015,7 +1013,7 @@ class MixedCommHandler:
         Returns:
             The autotuned :class:`MixedCommMode`.
         """
-        num_local_bytes = x_in.numel() * _get_element_size(self.dtype)
+        num_local_bytes = x_in.numel() * x_in.element_size()
         if op in [MixedCommOp.REDUCESCATTER, MixedCommOp.REDUCESCATTER_ALLREDUCE]:
             num_local_bytes //= self.para_info.dp_size
         coef = math.log2(num_local_bytes / self.autotune_base_bytes)

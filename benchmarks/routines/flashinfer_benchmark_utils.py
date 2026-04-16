@@ -77,6 +77,15 @@ output_column_dict = {
         "pattern",
         "layout_code",
     ],
+    "mixed_comm": [
+        "local_bs",
+        "op_name",
+        "mode_name",
+        "local_tp_size",
+        "local_dp_size",
+        "inter_tp_size",
+        "inter_dp_size",
+    ],
     "norm": [
         "num_heads",
         "scale",
@@ -153,6 +162,7 @@ full_output_columns = (
     + output_column_dict["moe"]
     + output_column_dict["moe_comm"]
     + output_column_dict["allreduce_comm"]
+    + output_column_dict["mixed_comm"]
     + output_column_dict["norm"]
     + output_column_dict["quantization"]
     + output_column_dict["sampling"]
@@ -190,6 +200,9 @@ benchmark_apis = {
     ],
     "allreduce_comm": [
         "allreduce_fusion",
+    ],
+    "mixed_comm": [
+        "mixed_comm",
     ],
     "norm": [
         "rmsnorm",
