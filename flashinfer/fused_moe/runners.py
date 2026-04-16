@@ -12,8 +12,9 @@ from typing import Any, List
 
 import torch
 
-from ..autotuner import TunableRunner
+from ..autotuner import DynamicTensorSpec, TunableRunner, TuningConfig
 from .api import MoEActivationPack, MoEConfig, MoEWeightPack
+from .utils import get_last_power_of_2_num_tokens_buckets, last_positive_power_of_2
 
 
 # ---------------------------------------------------------------------------
@@ -42,6 +43,7 @@ class CuteDslNvfp4Runner(TunableRunner):
             num_local_experts=num_local_experts,
             local_expert_offset=experts.local_expert_offset,
         )
+        self.tuning_config = CuteDslFusedMoENvfp4Runner.tuning_config
 
     def get_valid_tactics(self, inputs: List[torch.Tensor], profile: Any) -> List[Any]:
         return self._inner.get_valid_tactics(inputs, profile)
@@ -97,6 +99,34 @@ class TrtllmFp4RoutedRunner(TunableRunner):
     """
 
     backend_key = "trtllm_fp4_routed"
+
+    # Dynamic tensors: topk_ids (idx 0), hidden_states (1), hidden_states_scale (2)
+    # all vary in dim 0 (num_tokens).  Weight tensors (idx 3..7) are fixed.
+    _dynamic_tensor_initializers = [
+        # 0: topk_ids [M, top_k] int32
+        lambda shapes, dtype, device: torch.zeros(
+            shapes, dtype=torch.int32, device=device
+        ),
+        # 1: hidden_states [M, H//2] uint8 (packed NVFP4)
+        lambda shapes, dtype, device: torch.randint(
+            0, 256, shapes, dtype=torch.uint8, device=device
+        ),
+        # 2: hidden_states_scale [M, H//16] float8_e4m3fn
+        lambda shapes, dtype, device: torch.randint(
+            1, 128, shapes, dtype=torch.uint8, device=device
+        ).view(torch.float8_e4m3fn),
+    ]
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0, 1, 2),
+                dim_idx=(0, 0, 0),
+                gen_tuning_buckets=get_last_power_of_2_num_tokens_buckets(8192),
+                map_to_tuning_buckets=lambda x: min(last_positive_power_of_2(x), 8192),
+                tensor_initializers=_dynamic_tensor_initializers,
+            ),
+        ),
+    )
 
     def __init__(self, config: MoEConfig, device: torch.device):
         from ..tllm_enums import (

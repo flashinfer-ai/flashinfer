@@ -39,6 +39,8 @@ from .api import (  # noqa: F401
     TrtllmFp8PerTensorConfig,
     TrtllmMxInt4Config,
 )
+from .layer import MoELayer  # noqa: F401
+from .runners import CuteDslNvfp4Runner, TrtllmFp4RoutedRunner  # noqa: F401
 
 # Legacy flat-argument APIs (unchanged, not deprecated)
 from .core import (
@@ -90,10 +92,13 @@ __all__ = [
     "ExpertConfig",
     "Gemm1Tensors",
     "Gemm2Tensors",
+    "CuteDslNvfp4Runner",
     "MoEActivationPack",
     "MoEConfig",
+    "MoELayer",
     "MoETensors",
     "MoEWeightPack",
+    "TrtllmFp4RoutedRunner",
     "QuantConfig",
     "QuantVariant",
     "RoutingConfig",
