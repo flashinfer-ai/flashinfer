@@ -93,6 +93,7 @@ CUTE_DEVICE constexpr auto convert_c_layout_to_a_layout(CLayout const& c, AValue
 }
 
 template <class Layout, class Stages = _1>
+[[deprecated("use restage_smem_layout instead")]]
 CUTE_DEVICE constexpr auto unstage_smem_layout(Layout const& layout, Stages stages = {}) {
   return composition(layout, make_tuple(_, _, make_layout(stages)));
 }
@@ -161,6 +162,11 @@ CUTE_DEVICE auto make_acc_into_op(Accumulator const& acc,
   }
 
   return operand;
+}
+
+template <class Layout, class Stages = _1>
+CUTE_DEVICE constexpr auto restage_smem_layout(Layout const& layout, Stages stages = {}) {
+  return composition(layout, make_tuple(_, _, make_layout(stages)));
 }
 
 }  // namespace flat::collective

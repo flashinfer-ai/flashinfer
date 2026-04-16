@@ -24,25 +24,33 @@ from .core import (
     JitSpec,
     gen_jit_spec,
     sm90a_nvcc_flags,
+    sm120a_nvcc_flags,
 )
 from .utils import write_if_different
 
 
-def gen_gdn_prefill_sm90_module() -> JitSpec:
+def _gen_gdn_prefill_module(arch: str) -> JitSpec:
     """Generate JIT module for GDN prefill kernel with separate compilation.
 
     This generates 32 separate kernel instantiation files (2 dtypes × 16 boolean combinations)
     plus the original launcher file. The separate files enable parallel compilation by ninja,
     significantly reducing build time on multi-core machines.
     """
-    uri = "gdn_prefill_sm90"
+    assert arch in ["sm90", "sm120"], "GDN prefill kernel is only supported on sm_90a and sm_120a"
+
+    if arch == "sm90":
+        arch_specific_flags = sm90a_nvcc_flags + ["-DFLAT_SM90A_ENABLED"]
+    elif arch == "sm120":
+        arch_specific_flags = sm120a_nvcc_flags + ["-DFLAT_SM120A_ENABLED"]
+
+    uri = f"gdn_prefill_{arch}"
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     os.makedirs(gen_directory, exist_ok=True)
 
     source_paths = []
 
     # Load kernel instantiation template
-    with open(jit_env.FLASHINFER_CSRC_DIR / "gdn_prefill_sm90_kernel_inst.jinja") as f:
+    with open(jit_env.FLASHINFER_CSRC_DIR / f"gdn_prefill_{arch}_kernel_inst.jinja") as f:
         kernel_inst_templ = jinja2.Template(f.read())
 
     # Generate 64 separate instance files (2 dtypes × 32 boolean combinations)
@@ -74,7 +82,7 @@ def gen_gdn_prefill_sm90_module() -> JitSpec:
     # Headers are now in include/flashinfer/flat/ and accessible via standard include paths
     for filename in [
         "gdn_prefill_launcher.cu",
-        "prefill_kernel_delta_rule_sm90.cu",
+        f"prefill_kernel_delta_rule_{arch}.cu",
     ]:
         src_path = jit_env.FLASHINFER_CSRC_DIR / filename
         dest_path = gen_directory / src_path.name
@@ -84,5 +92,13 @@ def gen_gdn_prefill_sm90_module() -> JitSpec:
     return gen_jit_spec(
         uri,
         source_paths,
-        extra_cuda_cflags=sm90a_nvcc_flags + ["-DFLAT_SM90A_ENABLED", "-std=c++20"],
+        extra_cuda_cflags=arch_specific_flags + ["-std=c++20"],
     )
+
+
+def gen_gdn_prefill_sm90_module():
+    return _gen_gdn_prefill_module("sm90")
+
+
+def gen_gdn_prefill_sm120_module():
+    return _gen_gdn_prefill_module("sm120")
