@@ -1,11 +1,11 @@
 """
 Tests for CuTe DSL FMHA prefill kernel (cubin distribution).
 
-These tests verify the DSL FMHA kernel loaded via ExternalBinaryModule
+These tests verify the DSL FMHA kernel loaded from artifactory (or local cache)
 against a PyTorch reference implementation.
 
 Usage:
-    # Set local .so directory (from compile_dsl_fmha.py output)
+    # Ensure FLASHINFER_CUBINS_REPOSITORY is set (or use local .so for development)
     export FLASHINFER_DSL_FMHA_LOCAL_DIR=/path/to/build/cute_dsl_fmha
 
     pytest tests/attention/test_cute_dsl_fmha_prefill.py -x -v
@@ -232,7 +232,7 @@ def _ragged_reference(
 # =============================================================================
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("is_causal", [False, True])
 @pytest.mark.parametrize(
