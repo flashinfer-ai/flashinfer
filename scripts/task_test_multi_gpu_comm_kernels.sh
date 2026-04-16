@@ -92,7 +92,7 @@ main() {
     fi
 
     # --- Phase 3: NVSHMEM tests (optional, requires nvshmem4py) ---
-    if pip install nvshmem4py-cu12 2>/dev/null; then
+    if python3 -c "import nvshmem4py" &>/dev/null || pip install -q nvshmem4py-cu12 2>/dev/null; then
         PYTEST_COMMAND_PREFIX=""
         echo ""
         echo "=== Phase 3: NVSHMEM multi-GPU tests ==="
