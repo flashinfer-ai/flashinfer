@@ -1,5 +1,5 @@
 """
-B12x fused MoE API for SM120/SM121 (RTX 5090, DGX Spark).
+B12x fused MoE API for SM120/SM121.
 
 Provides high-level APIs for running Mixture of Experts (MoE)
 computations using b12x CuTe DSL kernels on Blackwell GeForce GPUs.
