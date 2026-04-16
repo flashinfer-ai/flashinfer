@@ -3364,6 +3364,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             # the 3-way torch.stack copy that PACKED_QKV requires.
             # (fmha_v2 auto-selection already requires MHA, so Q/K head counts match)
             kv_packed = torch.stack([k, v], dim=1)
+            # Pass window_left and sinks for sliding-window + attention sink
+            # support. sinks is stored on the wrapper by vLLM's metadata builder.
+            fmha_v2_sinks = getattr(self, "_sinks", None)
+            fmha_v2_kwargs = {}
+            if self._window_left >= 0:
+                fmha_v2_kwargs["window_left"] = self._window_left
+            if fmha_v2_sinks is not None:
+                fmha_v2_kwargs["sinks"] = fmha_v2_sinks
             out = trtllm_fmha_v2_prefill(
                 (q, kv_packed),
                 input_layout="CONTIGUOUS_Q_KV",
@@ -3379,6 +3387,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 out=out,
                 mask_mode=fmha_v2_mask_mode,
                 save_softmax_stats=False,
+                **fmha_v2_kwargs,
             )
             return out
         elif self._backend == "cute-dsl":
