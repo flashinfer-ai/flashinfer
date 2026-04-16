@@ -7,6 +7,7 @@ selection.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Dict, Tuple, Union
 
@@ -90,7 +91,10 @@ def _select_moe_mma_tiler_mn(routed_rows: int, n: int) -> Tuple[int, int]:
     coarse_tiles = ((routed_rows + coarse_tile[0] - 1) // coarse_tile[0]) * (
         (n + coarse_tile[1] - 1) // coarse_tile[1]
     )
-    if routed_rows <= 128 and coarse_tiles < max(1, sm_count // 2):
+    # Single-token decode often lands exactly on the "half the machine"
+    # boundary. Keeping the coarse 128x128 tile there leaves the M dimension
+    # badly underfilled, so take the narrow 64x128 tile inclusive of equality.
+    if routed_rows <= 128 and coarse_tiles <= max(1, sm_count // 2):
         return (64, 128)
     return (128, 128)
 
@@ -552,6 +556,7 @@ def _get_micro_kernel(
     topk_ids_dtype: torch.dtype = torch.int32,
     input_scales_are_reciprocal: bool = False,
     fast_math: bool = True,
+    share_input_across_experts: bool = False,
     mac_override: int | None = None,
     activation: str = "silu",
 ):
@@ -582,6 +587,7 @@ def _get_micro_kernel(
         topk_ids_dtype,
         input_scales_are_reciprocal,
         fast_math,
+        share_input_across_experts,
         activation,
     )
     cached = _MICRO_KERNEL_CACHE.get(cache_key)
@@ -600,6 +606,7 @@ def _get_micro_kernel(
         input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
         activation=activation,
+        share_input_across_experts=share_input_across_experts,
     )
 
     is_gated = activation == "silu"
@@ -804,6 +811,11 @@ def launch_sm120_static_moe(
     flat_weights = topk_weights.view(-1).to(torch.float32)
     routed_rows = num_tokens * top_k
 
+    # Capture whether input_gs was a single shared scalar BEFORE expansion:
+    # the m=1 relu2 shared-input micro optimization only applies when every
+    # expert sees the same FC1-input global scale.
+    input_gs_is_shared = input_gs.numel() == 1
+
     # Broadcast scalar scales to per-expert [E] tensors
     input_gs = _expand_to_experts(input_gs, num_experts)
     down_input_scale = _expand_to_experts(down_input_scale, num_experts)
@@ -818,30 +830,54 @@ def launch_sm120_static_moe(
     base_mac = min(get_max_active_clusters(1), sm_count)
 
     if use_micro:
-        # For single-token decode, the top-k routing is already a dense set
-        # of unique expert IDs — skip the Triton compaction pre-pass entirely.
-        launch_ids = flat_ids
-        if num_tokens != 1:
+        assert flat_ids.numel() <= workspace.compact_topk_ids.numel(), (
+            f"compact_topk_ids buffer too small: "
+            f"{workspace.compact_topk_ids.numel()} < {flat_ids.numel()}"
+        )
+        compact_ids = workspace.compact_topk_ids[: flat_ids.numel()]
+        if num_tokens == 1:
+            # A single token's top-k is already a dense unique expert set,
+            # so we can build the compact local-id mapping on the host
+            # without launching the Triton compaction kernel. The micro
+            # kernel still reads weight_expert_ids the same way it does
+            # for m>1; it just sees a pre-filled workspace.
+            compact_ids.copy_(
+                torch.arange(
+                    flat_ids.numel(),
+                    device=flat_ids.device,
+                    dtype=torch.int32,
+                )
+            )
+            workspace.weight_expert_ids[: flat_ids.numel()].copy_(
+                flat_ids.to(torch.int32)
+            )
+            workspace.active_expert_count.fill_(flat_ids.numel())
+        else:
             from .triton_compact import compact_topk_ids as _triton_compact_topk_ids
 
-            assert flat_ids.numel() <= workspace.compact_topk_ids.numel(), (
-                f"compact_topk_ids buffer too small: "
-                f"{workspace.compact_topk_ids.numel()} < {flat_ids.numel()}"
-            )
-            compact_ids = workspace.compact_topk_ids[: flat_ids.numel()]
             _triton_compact_topk_ids(
                 flat_ids,
                 compact_ids,
                 workspace.weight_expert_ids,
                 workspace.active_expert_count,
             )
-            launch_ids = compact_ids
+        launch_ids = compact_ids
         # Select micro MAC: min of tuned ladder, work tiles, and hardware limit.
         # The hardware cap (base_mac) prevents deadlocks on GPUs with fewer SMs
         # than the profiled tuning target.
         micro_work_tiles = max(1, routed_rows * max(1, (n + 128 - 1) // 128))
         tuned_mac = _lookup_mac_ladder(_MICRO_MAC_LADDER, routed_rows)
         micro_mac = min(tuned_mac or base_mac, micro_work_tiles, base_mac)
+        # For m=1 relu2 with a shared FC1-input scale, all experts see the
+        # same quantized activation — quantize once and share the packed
+        # buffer slot across all K top-k pairs. Env override lets us flip
+        # this off without a code change if a regression surfaces.
+        share_input_across_experts = (
+            activation == "relu2"
+            and num_tokens == 1
+            and input_gs_is_shared
+            and os.environ.get("FLASHINFER_B12X_MICRO_SHARE_INPUT", "1") != "0"
+        )
         compiled, mac = _get_micro_kernel(
             workspace.state_E,
             num_experts,
@@ -853,6 +889,7 @@ def launch_sm120_static_moe(
             topk_ids_dtype=torch.int32,
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
+            share_input_across_experts=share_input_across_experts,
             mac_override=micro_mac,
             activation=activation,
         )

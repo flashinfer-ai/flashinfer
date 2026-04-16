@@ -366,6 +366,7 @@ class MoEMicroKernel:
         input_scales_are_reciprocal: bool = False,
         fast_math: bool = False,
         activation: str = "silu",
+        share_input_across_experts: bool = False,
     ):
         if activation not in {"silu", "relu2"}:
             raise ValueError(f"unsupported activation {activation!r}")
@@ -376,6 +377,12 @@ class MoEMicroKernel:
         self.fast_math = fast_math
         self.activation = activation
         self.is_gated = activation == "silu"
+        # For m=1 with a shared input scale, the quantized activation is
+        # identical across all K top-k experts. When set, only pair_idx==0
+        # does the quantize and all pairs read from a single shared slot
+        # in packed_input/scale_storage. Caller is responsible for the
+        # activation == "relu2" and m == 1 and shared-scale preconditions.
+        self.share_input_across_experts = share_input_across_experts
         tile_k = sf_vec_size * 8
         self.tile_shape_mnk = (mma_tiler_mn[0], mma_tiler_mn[1], tile_k)
         self.sa_tile_shape_mk = (max(128, mma_tiler_mn[0]), tile_k)
@@ -1000,6 +1007,11 @@ class MoEMicroKernel:
             # A single token's top-k routing is already a dense local expert set.
             all_rows_unique = Int32(1)
             num_active_experts = total_pairs
+        shared_single_input = (
+            Int32(1)
+            if cutlass.const_expr(self.share_input_across_experts)
+            else Int32(0)
+        )
         if all_rows_unique == Int32(0):
             i = flat_tid
             while i < num_experts:
@@ -1011,12 +1023,16 @@ class MoEMicroKernel:
             scatter_output[j // cols, j % cols] = cutlass.BFloat16(0.0)
             j += flat_stride
         cute.arch.sync_threads()
-        self._resident_grid_barrier(
-            barrier_count,
-            barrier_epoch,
-            Int32(gdim_z),
-            is_cta_leader,
-        )
+        # When the quantized input is shared across experts, only pair 0
+        # writes to packed storage; there's no expert-parallel routing to
+        # synchronize before FC1, so the grid-wide barrier is unnecessary.
+        if shared_single_input == Int32(0):
+            self._resident_grid_barrier(
+                barrier_count,
+                barrier_epoch,
+                Int32(gdim_z),
+                is_cta_leader,
+            )
 
         pair_idx = Int32(bidz)
         while pair_idx < total_pairs:
@@ -1031,7 +1047,7 @@ class MoEMicroKernel:
             row = Int32(0)
             if all_rows_unique > Int32(0):
                 local_expert_id = pair_idx
-                expert_id = topk_ids[local_expert_id].to(Int32)
+                expert_id = weight_expert_ids[local_expert_id].to(Int32)
             else:
                 if is_cta_leader > Int32(0):
                     local_expert_id = topk_ids[pair_idx].to(Int32)
@@ -1053,58 +1069,71 @@ class MoEMicroKernel:
 
             # Distribute quantization across ALL CTA threads, not just leader.
             # Each FP4 block (16 elements) is independent — perfect parallelism.
-            gs_value = input_global_scale[expert_id].to(cutlass.Float32)
-            if self.input_scales_are_reciprocal and gs_value != cutlass.Float32(0.0):
-                if self.fast_math:
-                    gs_value = rcp_approx_ftz(gs_value)
-                else:
-                    gs_value = cutlass.Float32(1.0) / gs_value
-            sf_idx = Int32(tidx)
-            while sf_idx < sf_blocks_per_row:
-                block_start = sf_idx * Int32(16)
-                values = cute.make_rmem_tensor((16,), cutlass.Float32)
-                block_max = cutlass.Float32(0.0)
-                for elem_idx in cutlass.range_constexpr(16):
-                    value = cutlass.Float32(
-                        a_input[token_idx, block_start + Int32(elem_idx)]
+            # When the input is shared across experts (m=1 relu2, shared
+            # a1_gscale), only pair 0 does the quantize and every pair
+            # reads from a single shared slot at (expert=0, row=0).
+            should_quantize = Int32(1)
+            packed_local_expert_id = local_expert_id
+            packed_row = row
+            if shared_single_input > Int32(0):
+                should_quantize = Int32(1) if pair_idx == Int32(0) else Int32(0)
+                packed_local_expert_id = Int32(0)
+                packed_row = Int32(0)
+            if should_quantize > Int32(0):
+                gs_value = input_global_scale[expert_id].to(cutlass.Float32)
+                if self.input_scales_are_reciprocal and gs_value != cutlass.Float32(
+                    0.0
+                ):
+                    if self.fast_math:
+                        gs_value = rcp_approx_ftz(gs_value)
+                    else:
+                        gs_value = cutlass.Float32(1.0) / gs_value
+                sf_idx = Int32(tidx)
+                while sf_idx < sf_blocks_per_row:
+                    block_start = sf_idx * Int32(16)
+                    values = cute.make_rmem_tensor((16,), cutlass.Float32)
+                    block_max = cutlass.Float32(0.0)
+                    for elem_idx in cutlass.range_constexpr(16):
+                        value = cutlass.Float32(
+                            a_input[token_idx, block_start + Int32(elem_idx)]
+                        )
+                        values[elem_idx] = value
+                        block_max = fmax_f32(block_max, fabs_f32(value))
+                    packed64 = Uint64(0)
+                    scale_byte = Uint8(0)
+                    if self.fast_math:
+                        packed64, scale_byte = quantize_block_fp4_fast(
+                            values, block_max, gs_value
+                        )
+                    else:
+                        packed64, scale_byte = quantize_block_fp4(
+                            values, block_max, gs_value
+                        )
+
+                    output_offset = (
+                        packed_local_expert_id * max_rows * output_bytes_per_row
+                        + packed_row * output_bytes_per_row
+                        + sf_idx * Int32(8)
                     )
-                    values[elem_idx] = value
-                    block_max = fmax_f32(block_max, fabs_f32(value))
-                packed64 = Uint64(0)
-                scale_byte = Uint8(0)
-                if self.fast_math:
-                    packed64, scale_byte = quantize_block_fp4_fast(
-                        values, block_max, gs_value
-                    )
-                else:
-                    packed64, scale_byte = quantize_block_fp4(
-                        values, block_max, gs_value
+                    st_global_u64(
+                        get_ptr_as_int64(packed_a_storage, output_offset), packed64
                     )
 
-                output_offset = (
-                    local_expert_id * max_rows * output_bytes_per_row
-                    + row * output_bytes_per_row
-                    + sf_idx * Int32(8)
-                )
-                st_global_u64(
-                    get_ptr_as_int64(packed_a_storage, output_offset), packed64
-                )
-
-                m_tile_idx = row // Int32(32 * 4)
-                k_tile_idx = sf_idx // Int32(4)
-                outer_m_idx = row % Int32(32)
-                inner_m_idx = (row % Int32(32 * 4)) // Int32(32)
-                inner_k_idx = sf_idx % Int32(4)
-                scale_offset = (
-                    local_expert_id * expert_scale_stride
-                    + m_tile_idx * num_k_tiles * Int32(32 * 4 * 4)
-                    + k_tile_idx * Int32(32 * 4 * 4)
-                    + outer_m_idx * Int32(4 * 4)
-                    + inner_m_idx * Int32(4)
-                    + inner_k_idx
-                )
-                scale_storage[scale_offset] = scale_byte
-                sf_idx += Int32(self.threads_per_cta)
+                    m_tile_idx = packed_row // Int32(32 * 4)
+                    k_tile_idx = sf_idx // Int32(4)
+                    outer_m_idx = packed_row % Int32(32)
+                    inner_m_idx = (packed_row % Int32(32 * 4)) // Int32(32)
+                    inner_k_idx = sf_idx % Int32(4)
+                    scale_offset = (
+                        packed_local_expert_id * expert_scale_stride
+                        + m_tile_idx * num_k_tiles * Int32(32 * 4 * 4)
+                        + k_tile_idx * Int32(32 * 4 * 4)
+                        + outer_m_idx * Int32(4 * 4)
+                        + inner_m_idx * Int32(4)
+                        + inner_k_idx
+                    )
+                    scale_storage[scale_offset] = scale_byte
+                    sf_idx += Int32(self.threads_per_cta)
 
             if all_rows_unique == Int32(0):
                 cute.arch.sync_threads()
@@ -1379,7 +1408,6 @@ class MoEMicroKernel:
                 weight_expert_idx = weight_expert_ids[local_expert_idx]
                 valid_rows = row_counts[local_expert_idx]
                 if all_rows_unique > Int32(0):
-                    weight_expert_idx = topk_ids[local_expert_idx].to(Int32)
                     valid_rows = Int32(1)
                 alpha_value = alpha[weight_expert_idx].to(cutlass.Float32)
                 tile_m_base = tile_coord[0] * Int32(self.tile_shape_mnk[0])
@@ -2202,13 +2230,19 @@ class MoEMicroKernel:
                 intermediate_slice = tc[1]
                 local_expert_idx = tc[2]
                 weight_expert_idx = weight_expert_ids[local_expert_idx]
-                if all_rows_unique > Int32(0):
-                    weight_expert_idx = topk_ids[local_expert_idx].to(Int32)
+                # When the quantized input is shared across experts, the
+                # route/pack phase wrote a single copy at slot 0; all pairs
+                # must read it from there regardless of their expert id.
+                input_local_expert_idx = (
+                    Int32(0) if shared_single_input > Int32(0) else local_expert_idx
+                )
 
                 sa_tile_coord_m = tc[0] // self.sa_tiles_per_block
-                tAgA_mk = tAgA[(None, sa_tile_coord_m, None, local_expert_idx)]
+                tAgA_mk = tAgA[(None, sa_tile_coord_m, None, input_local_expert_idx)]
                 sfa_tile_coord_m = tc[0] // self.sfa_tiles_per_block
-                tAgSFA_mk = tAgSFA[(None, sfa_tile_coord_m, None, local_expert_idx)]
+                tAgSFA_mk = tAgSFA[
+                    (None, sfa_tile_coord_m, None, input_local_expert_idx)
+                ]
 
                 # FC1 producer slice. Gated activation packs [up, gate] along N;
                 # relu2 uses a single FC1 pass over intermediate_slice.

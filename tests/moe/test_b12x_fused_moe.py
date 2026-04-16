@@ -1048,7 +1048,7 @@ class TestRelu2Activation:
         "hidden_size,intermediate_size", [(256, 512), (1024, 2048)]
     )
     @pytest.mark.parametrize("top_k", [1, 2, 8])
-    @pytest.mark.parametrize("num_tokens", [2, 128, 512])
+    @pytest.mark.parametrize("num_tokens", [1, 2, 128, 512])
     @pytest.mark.parametrize("num_experts", [256])
     def test_relu2_functional_accuracy(
         self,

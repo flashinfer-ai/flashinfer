@@ -220,8 +220,11 @@ class B12xMoEWrapper:
         self.device = device
         self.activation = activation
 
-        # Pre-allocated objects
-        self._workspace: object = None
+        # Pre-allocated objects. Both workspace slots may be populated so
+        # run() can pick per-call; without this, the backend would be locked
+        # to whichever workspace was allocated at init time.
+        self._static_workspace: object = None
+        self._dynamic_workspace: object = None
         self._weight_views: object = None
         self._weight_key: Optional[Tuple] = None
         self._moe_output: Optional[torch.Tensor] = None
@@ -235,33 +238,47 @@ class B12xMoEWrapper:
             allocate_sm120_static_workspace,
             allocate_sm120_dynamic_workspace,
             select_sm120_moe_backend,
+            _STATIC_COMPACT_CUTOVER_PAIRS,
         )
 
         max_routed_rows = self.max_num_tokens * self.top_k
-        backend = select_sm120_moe_backend(
-            num_tokens=self.max_num_tokens, num_topk=self.top_k
+
+        # Allocate a dynamic workspace alongside the static one when
+        # max_num_tokens is large enough to cross the cutover. This lets
+        # run() adapt backend per call rather than locking at init. The
+        # dynamic kernel indexes row_counts/expert_write_rows with topk_ids
+        # (sized by num_local_experts), so it requires num_local == num_experts.
+        needs_dynamic = (
+            select_sm120_moe_backend(
+                num_tokens=self.max_num_tokens, num_topk=self.top_k
+            )
+            == "dynamic"
+            and self.num_local_experts == self.num_experts
         )
-        # Mirror the dynamic→static fallback in launch_sm120_moe: the dynamic
-        # kernel indexes row_counts/expert_write_rows with topk_ids (sized by
-        # num_local_experts). Once a dynamic workspace is passed in, runtime
-        # dispatch skips that safety check, so apply it here too.
-        if backend == "dynamic" and self.num_local_experts != self.num_experts:
-            backend = "static"
-        if backend == "dynamic":
-            self._workspace = allocate_sm120_dynamic_workspace(
+
+        # When both workspaces exist, static only serves calls with
+        # routed_rows <= cutover; size it accordingly to avoid paying for
+        # the full capacity twice.
+        static_max_rows = (
+            min(max_routed_rows, _STATIC_COMPACT_CUTOVER_PAIRS)
+            if needs_dynamic
+            else max_routed_rows
+        )
+        self._static_workspace = allocate_sm120_static_workspace(
+            state_E=self.num_local_experts,
+            weight_E=self.num_experts,
+            max_rows=max(1, static_max_rows),
+            k=self.hidden_size,
+            n=self.intermediate_size,
+            num_topk=self.top_k,
+            device=torch.device(self.device),
+        )
+
+        if needs_dynamic:
+            self._dynamic_workspace = allocate_sm120_dynamic_workspace(
                 state_E=self.num_local_experts,
                 weight_E=self.num_experts,
                 routed_rows=max_routed_rows,
-                k=self.hidden_size,
-                n=self.intermediate_size,
-                num_topk=self.top_k,
-                device=torch.device(self.device),
-            )
-        else:
-            self._workspace = allocate_sm120_static_workspace(
-                state_E=self.num_local_experts,
-                weight_E=self.num_experts,
-                max_rows=max(1, max_routed_rows),
                 k=self.hidden_size,
                 n=self.intermediate_size,
                 num_topk=self.top_k,
@@ -327,8 +344,23 @@ class B12xMoEWrapper:
 
         from .blackwell_sm12x.moe_dispatch import (
             launch_sm120_moe,
+            select_sm120_moe_backend,
             _get_weight_views as _get_sm120_weight_views,
         )
+
+        # Pick the right pre-allocated workspace for this call's token
+        # count. launch_sm120_moe otherwise infers backend from workspace
+        # type, which would lock us to whichever one was allocated at init.
+        workspace = None
+        if self.use_cuda_graph:
+            if (
+                self._dynamic_workspace is not None
+                and select_sm120_moe_backend(num_tokens=num_tokens, num_topk=self.top_k)
+                == "dynamic"
+            ):
+                workspace = self._dynamic_workspace
+            else:
+                workspace = self._static_workspace
 
         # Cache weight views; invalidate if weight pointers change.
         weight_key = (
@@ -368,6 +400,6 @@ class B12xMoEWrapper:
             num_local_experts=self.num_local_experts,
             scatter_output=moe_output,
             activation=self.activation,
-            _workspace=self._workspace,
+            _workspace=workspace,
             _weight_views=self._weight_views,
         )
