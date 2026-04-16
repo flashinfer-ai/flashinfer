@@ -3879,6 +3879,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 mask_mode=fmha_v2_mask_mode,
                 save_softmax_stats=False,
             )
+            return out
         elif self._backend == "cute-dsl":
             if any(s is not None for s in (q_scale, k_scale, v_scale, o_scale)):
                 raise NotImplementedError(
