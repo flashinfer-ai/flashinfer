@@ -3359,12 +3359,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     "than the expected [total_q_tokens, num_heads] LSE tensor."
                 )
             fmha_v2_mask_mode = "causal" if self._causal else "padding"
-            # Pack separate q, k, v into [num_tokens, 3, num_heads, head_dim]
-            # for PACKED_QKV layout (the only layout with SM120 standard kernels)
-            qkv_packed = torch.stack([q, k, v], dim=1)
+            # Use CONTIGUOUS_Q_KV layout: pass Q separately and stack only
+            # K+V into [num_tokens, 2, num_kv_heads, head_dim]. This avoids
+            # the 3-way torch.stack copy that PACKED_QKV requires.
+            # (fmha_v2 auto-selection already requires MHA, so Q/K head counts match)
+            kv_packed = torch.stack([k, v], dim=1)
             out = trtllm_fmha_v2_prefill(
-                qkv_packed,
-                input_layout="PACKED_QKV",
+                (q, kv_packed),
+                input_layout="CONTIGUOUS_Q_KV",
                 workspace_buffer=self._float_workspace_buffer,
                 seq_lens=self._fmha_v2_seq_lens,
                 max_q_len=self._fmha_v2_max_q_len,
