@@ -1370,6 +1370,44 @@ __device__ __forceinline__ void add_init_out_cute(SmemT const& smem, TiledMma co
   }
 }
 
+// store_state: vectorized smem → gmem state writeback (128 threads, 128-bit
+// stores).  Defined here (rather than alongside the other Phase 3 store
+// helpers below) because compute_and_store_output_cute calls it inline for
+// the v10.3 hoist — issued right after matmul 3 so the STGs fire-and-forget
+// in parallel with matmul 4 + epilogue.
+template <typename state_t, int DIM, int DSTATE, int NUM_WARPS, typename SmemT>
+__device__ __forceinline__ void store_state(SmemT& smem, SsuIncrementalParams const& params,
+                                            int warp, int lane, int head, int64_t cache_slot) {
+  using namespace cute;
+  int const flat_tid = warp * warpSize + lane;
+  auto* __restrict__ state_w = reinterpret_cast<state_t*>(params.state);
+  int64_t const state_base = cache_slot * params.state_stride_batch + (int64_t)head * DIM * DSTATE;
+  constexpr bool USE_TENSOR_MMA = (sizeof(state_t) == 2);
+
+  // Gmem: always linear [DIM, DSTATE]
+  Tensor gState = make_tensor(
+      make_gmem_ptr(state_w + state_base),
+      make_layout(make_shape(Int<DIM>{}, Int<DSTATE>{}), make_stride(Int<DSTATE>{}, Int<1>{})));
+
+  // Smem: swizzled when MMA path, flat when SIMT
+  auto layout_smem = [&]() {
+    if constexpr (USE_TENSOR_MMA) {
+      return make_swizzled_layout_rc<DIM, DSTATE>();
+    } else {
+      return make_layout(make_shape(Int<DIM>{}, Int<DSTATE>{}),
+                         make_stride(Int<DSTATE>{}, Int<1>{}));
+    }
+  }();
+  Tensor sState =
+      make_tensor(make_smem_ptr(reinterpret_cast<state_t const*>(&smem.state[0][0])), layout_smem);
+
+  // Vectorized smem → gmem copy: 128 threads, 128-bit stores, same thread layout as load.
+  auto s2g = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, state_t>{},
+                             Layout<Shape<_16, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, _8>>{});
+  auto thr = s2g.get_slice(flat_tid);
+  copy(s2g, thr.partition_S(sState), thr.partition_D(gState));
+}
+
 // ── Orchestrator: compute_and_store_output_cute ─────────────────────────────
 //     out = (C @ state^T) * decay + CB_scaled @ x + D*x, then z-gate.
 //     All operations on register-resident frag_y — no smem round-trip.
@@ -1380,7 +1418,8 @@ template <typename input_t, typename state_t, typename weight_t, int NTOKENS, in
 __device__ __forceinline__ void compute_and_store_output_cute(SmemT& smem,
                                                               SsuIncrementalParams const& params,
                                                               int warp, int lane, int batch_idx,
-                                                              int head, float D_val) {
+                                                              int head, int64_t cache_slot,
+                                                              float D_val) {
   using namespace cute;
   static_assert(sizeof(state_t) == 2, "compute_and_store_output_cute requires 2-byte state type");
   static_assert(sizeof(input_t) == 2, "compute_and_store_output_cute requires 2-byte input type");
@@ -1455,6 +1494,13 @@ __device__ __forceinline__ void compute_and_store_output_cute(SmemT& smem,
   Tensor frag_y_1 = thr_mma.partition_fragment_C(id_tile);
   add_init_out_cute<input_t, state_t, NTOKENS, DIM, DSTATE, NUM_WARPS>(smem, tiled_mma, thr_mma,
                                                                        tid, frag_y_0, frag_y_1);
+
+  // v10.3 (Option A): state writeback hoisted here — after matmul 3 has
+  // finished consuming smem.state, before matmul 4 which reads only
+  // smem.x / smem.CB_scaled / smem.z.  ~16 KB of STGs fire-and-forget
+  // onto the memory subsystem and complete in parallel with the
+  // epilogue (matmul 4 + D*x + z-gate + output STG).
+  store_state<state_t, DIM, DSTATE, NUM_WARPS>(smem, params, warp, lane, head, cache_slot);
 
   // ── Epilogue: decay + matmul 4 + D_skip + z-gate + store, per N-tile ──
   // Lambda to avoid duplicating the epilogue for each N-tile.
@@ -1579,39 +1625,8 @@ __device__ __forceinline__ void store_output(SmemT& smem, SsuIncrementalParams c
 }
 
 // ── Store functions (called from kernel after compute_y + sync) ──
-
-template <typename state_t, int DIM, int DSTATE, int NUM_WARPS, typename SmemT>
-__device__ __forceinline__ void store_state(SmemT& smem, SsuIncrementalParams const& params,
-                                            int warp, int lane, int head, int64_t cache_slot) {
-  using namespace cute;
-  int const flat_tid = warp * warpSize + lane;
-  auto* __restrict__ state_w = reinterpret_cast<state_t*>(params.state);
-  int64_t const state_base = cache_slot * params.state_stride_batch + (int64_t)head * DIM * DSTATE;
-  constexpr bool USE_TENSOR_MMA = (sizeof(state_t) == 2);
-
-  // Gmem: always linear [DIM, DSTATE]
-  Tensor gState = make_tensor(
-      make_gmem_ptr(state_w + state_base),
-      make_layout(make_shape(Int<DIM>{}, Int<DSTATE>{}), make_stride(Int<DSTATE>{}, Int<1>{})));
-
-  // Smem: swizzled when MMA path, flat when SIMT
-  auto layout_smem = [&]() {
-    if constexpr (USE_TENSOR_MMA) {
-      return make_swizzled_layout_rc<DIM, DSTATE>();
-    } else {
-      return make_layout(make_shape(Int<DIM>{}, Int<DSTATE>{}),
-                         make_stride(Int<DSTATE>{}, Int<1>{}));
-    }
-  }();
-  Tensor sState =
-      make_tensor(make_smem_ptr(reinterpret_cast<state_t const*>(&smem.state[0][0])), layout_smem);
-
-  // Vectorized smem → gmem copy: 128 threads, 128-bit stores, same thread layout as load.
-  auto s2g = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, state_t>{},
-                             Layout<Shape<_16, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, _8>>{});
-  auto thr = s2g.get_slice(flat_tid);
-  copy(s2g, thr.partition_S(sState), thr.partition_D(gState));
-}
+// (store_state moved above compute_and_store_output_cute — used there for
+// the v10.3 state-writeback hoist.)
 
 template <typename input_t, int NTOKENS, int DIM, int NUM_WARPS, typename SmemT>
 __device__ __forceinline__ void store_old_x(SmemT& smem, SsuIncrementalParams const& params,
@@ -1796,9 +1811,9 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   // D_val already loaded in preamble (gmem latency hidden behind Phase 0+1).
 
   if constexpr (USE_TENSOR_MMA) {
-    // Fused: matmul 3 + decay + matmul 4 + D*x + z-gate → direct gmem store (no smem.out)
+    // Fused: matmul 3 + state-writeback + matmul 4 + D*x + z-gate → direct gmem store
     compute_and_store_output_cute<input_t, state_t, weight_t, NTOKENS, DIM, DSTATE, NUM_WARPS>(
-        smem, params, warp, lane, batch_idx, head, D_val);
+        smem, params, warp, lane, batch_idx, head, cache_slot, D_val);
   } else {
     add_init_out<input_t, state_t, NTOKENS, DIM, DSTATE, NUM_WARPS>(smem, warp, lane);
     add_cb_out<input_t, NTOKENS, DIM, NUM_WARPS>(smem, warp, lane);
@@ -1808,10 +1823,13 @@ __global__ void ssu_incremental_kernel(SsuIncrementalParams params) {
   }
 
   // ── Phase 3: Store to global memory ──
-  // (old_B hoisted to pre-Phase-1 in v10.1 — see store_old_B call above.)
+  // (old_B hoisted to pre-Phase-1 in v10.1;
+  //  state hoisted into compute_and_store_output_cute in v10.3 for the MMA path.)
 
-  // State writeback — all warps
-  store_state<state_t, DIM, DSTATE, NUM_WARPS>(smem, params, warp, lane, head, cache_slot);
+  // State writeback — SIMT path only; MMA path issued inside the output orchestrator.
+  if constexpr (!USE_TENSOR_MMA) {
+    store_state<state_t, DIM, DSTATE, NUM_WARPS>(smem, params, warp, lane, head, cache_slot);
+  }
 
   // Cache writes — old_x uses all warps (vectorized), dt/cumAdt one warp each
   store_old_x<input_t, NTOKENS, DIM, NUM_WARPS>(smem, params, warp, lane, head, cache_slot);
