@@ -599,11 +599,12 @@ def top_k(
     # Allocate output_values for kernel to write directly
     output_values = torch.empty(batch_size, k, dtype=input.dtype, device=device)
 
-    # tie_break modes 1/2 imply deterministic behavior for selection.
-    deterministic_for_sort = deterministic or tie_break != TopKTieBreak.NONE
+    # tie_break modes 1/2 imply deterministic mode.
+    if tie_break != TopKTieBreak.NONE:
+        deterministic = True
 
     # For deterministic + sorted + k <= 2048: CUDA handles the stable value sort on device.
-    sorted_cuda = sorted and deterministic_for_sort and k <= 2048
+    sorted_cuda = sorted and deterministic and k <= 2048
     indices_int32 = get_topk_module().radix_topk(
         input,
         k,
@@ -620,7 +621,7 @@ def top_k(
     if sorted and not sorted_cuda:
         # Sort within each row by value (descending)
         sorted_values, sort_indices = torch.sort(
-            output_values, dim=-1, descending=True, stable=deterministic_for_sort
+            output_values, dim=-1, descending=True, stable=deterministic
         )
         sorted_indices = torch.gather(indices, dim=-1, index=sort_indices)
         return sorted_values, sorted_indices
@@ -727,6 +728,10 @@ def top_k_page_table_transform(
     # Allocate output
     output_page_table = torch.empty(num_rows, k, dtype=torch.int32, device=device)
 
+    # tie_break modes 1/2 imply deterministic mode.
+    if tie_break != TopKTieBreak.NONE:
+        deterministic = True
+
     get_topk_module().radix_topk_page_table_transform(
         input,
         output_page_table,
@@ -829,6 +834,10 @@ def top_k_ragged_transform(
 
     # Allocate output
     output_indices = torch.empty(num_rows, k, dtype=torch.int32, device=device)
+
+    # tie_break modes 1/2 imply deterministic mode.
+    if tie_break != TopKTieBreak.NONE:
+        deterministic = True
 
     get_topk_module().radix_topk_ragged_transform(
         input,
