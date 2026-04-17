@@ -50,13 +50,13 @@ pynvml.nvmlInit()
 # ─── SM90+ gate ──────────────────────────────────────────────────────────
 
 
-def _sm90_available() -> bool:
+def _dcp_alltoall_supported() -> bool:
     if not torch.cuda.is_available():
         return False
-    from flashinfer.utils import get_compute_capability
+    from flashinfer.utils import is_sm90a_supported, is_sm100a_supported
 
-    major, _ = get_compute_capability(torch.device("cuda"))
-    return major >= 9
+    device = torch.device("cuda")
+    return is_sm90a_supported(device) or is_sm100a_supported(device)
 
 
 def _mpi4py_available() -> bool:
@@ -70,8 +70,8 @@ def _mpi4py_available() -> bool:
 
 pytestmark = [
     pytest.mark.skipif(
-        not _sm90_available(),
-        reason="Requires SM90+ GPU (Hopper/Blackwell)",
+        not _dcp_alltoall_supported(),
+        reason="Requires SM90 (Hopper) or SM100 (Blackwell) GPU",
     ),
     pytest.mark.skipif(
         not mnnvl_available(),
@@ -116,7 +116,7 @@ def _setup_rank():
 # enforced during module import (collection phase). If we allocate
 # unconditionally, CI environments without SYS_PTRACE will fail at
 # collection time instead of gracefully skipping.
-if _sm90_available() and mnnvl_available() and _mpi4py_available():
+if _dcp_alltoall_supported() and mnnvl_available() and _mpi4py_available():
     _rank, _cp_size, _comm = _setup_rank()
 
     def _allocate_mnnvl_workspace_once():
