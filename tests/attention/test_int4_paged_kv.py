@@ -677,6 +677,21 @@ def test_single_prefill_with_kv_cache_int4_auto_forces_fa2(
     assert seen["backend"] == "fa2"
 
 
+def test_single_prefill_with_kv_cache_int4_rejects_fp8_q():
+    q = torch.randn(3, 4, 128, dtype=torch.float16, device="cuda:0").to(
+        torch.float8_e4m3fn
+    )
+    k = flashinfer.int4_quantize(
+        torch.randn(8, 2, 128, dtype=torch.float16, device="cuda:0")
+    )
+    v = flashinfer.int4_quantize(
+        torch.randn(8, 2, 128, dtype=torch.float16, device="cuda:0")
+    )
+
+    with pytest.raises(ValueError, match="FP8 q is not supported with INT4 k/v"):
+        flashinfer.single_prefill_with_kv_cache(q, k, v, kv_layout="NHD")
+
+
 def test_batch_wrappers_int4_auto_force_fa2():
     device = "cuda:0"
     workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8, device=device)
@@ -723,6 +738,37 @@ def test_batch_wrappers_int4_auto_force_fa2():
     )
     assert prefill_wrapper._backend == "auto"
     assert prefill_wrapper._planned_backend == "fa2"
+
+
+def test_batch_prefill_with_paged_kv_cache_int4_rejects_fp8_q_dtype():
+    device = "cuda:0"
+    workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8, device=device)
+    kv_indptr = torch.tensor([0, 2, 4], dtype=torch.int32, device=device)
+    kv_indices = torch.arange(4, dtype=torch.int32, device=device)
+    kv_last_page_len = torch.tensor([4, 4], dtype=torch.int32, device=device)
+    qo_indptr = torch.tensor([0, 3, 6], dtype=torch.int32, device=device)
+
+    prefill_wrapper = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+        workspace_buffer,
+        "NHD",
+        backend="auto",
+    )
+    with pytest.raises(
+        NotImplementedError,
+        match="INT4 paged KV cache does not support FP8 query dtypes",
+    ):
+        prefill_wrapper.plan(
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            4,
+            2,
+            128,
+            4,
+            q_data_type=torch.float8_e4m3fn,
+            kv_data_type="int4",
+        )
 
 
 def test_int4_paged_kv_cache_cuda_graph_unsupported():

@@ -1305,6 +1305,8 @@ def single_prefill_with_kv_cache(
     if int4_input:
         if not (is_int4_tensor(k) and is_int4_tensor(v)):
             raise ValueError("k and v must both be INT4Tensor when using int4 KV.")
+        if is_float8(q):
+            raise ValueError("FP8 q is not supported with INT4 k/v.")
         if scale_k is not None or scale_v is not None:
             raise ValueError(
                 "scale_k and scale_v are not supported for INT4Tensor inputs."
@@ -1930,6 +1932,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
             else canonicalize_torch_dtype(kv_data_type)
         )
         if self._int4_kv_enabled:
+            if q_data_type in (torch.float8_e4m3fn, torch.float8_e5m2):
+                raise NotImplementedError(
+                    "INT4 paged KV cache does not support FP8 query dtypes."
+                )
             if backend == "auto":
                 backend = "fa2"
             elif backend != "fa2":
