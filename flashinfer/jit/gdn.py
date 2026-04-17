@@ -36,7 +36,9 @@ def _gen_gdn_prefill_module(arch: str) -> JitSpec:
     plus the original launcher file. The separate files enable parallel compilation by ninja,
     significantly reducing build time on multi-core machines.
     """
-    assert arch in ["sm90", "sm120"], "GDN prefill kernel is only supported on sm_90a and sm_120a"
+    assert arch in ["sm90", "sm120"], (
+        "GDN prefill kernel is only supported on sm_90a and sm_120a"
+    )
 
     if arch == "sm90":
         arch_specific_flags = sm90a_nvcc_flags + ["-DFLAT_SM90A_ENABLED"]
@@ -50,7 +52,9 @@ def _gen_gdn_prefill_module(arch: str) -> JitSpec:
     source_paths = []
 
     # Load kernel instantiation template
-    with open(jit_env.FLASHINFER_CSRC_DIR / f"gdn_prefill_{arch}_kernel_inst.jinja") as f:
+    with open(
+        jit_env.FLASHINFER_CSRC_DIR / f"gdn_prefill_{arch}_kernel_inst.jinja"
+    ) as f:
         kernel_inst_templ = jinja2.Template(f.read())
 
     # Generate 64 separate instance files (2 dtypes × 32 boolean combinations)
