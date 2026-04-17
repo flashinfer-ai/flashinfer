@@ -388,6 +388,72 @@ def test_single_prefill_with_kv_cache_int8():
     torch.testing.assert_close(out, out_ref, rtol=1e-2, atol=2e-2)
 
 
+def test_single_prefill_with_kv_cache_int8_scale_v_gqa_tensor():
+    _require_sm80_or_newer()
+
+    qo_len = 3
+    kv_len = 8
+    num_kv_heads = 2
+    num_qo_heads = 4
+    head_dim = 128
+    scale_v = torch.tensor([0.25, 0.5], device="cuda:0", dtype=torch.float32)
+
+    q = torch.randn(
+        qo_len, num_qo_heads, head_dim, device="cuda:0", dtype=torch.float16
+    )
+    k = torch.randint(
+        -8,
+        8,
+        (kv_len, num_kv_heads, head_dim),
+        device="cuda:0",
+        dtype=torch.int8,
+    )
+    v = torch.randint(
+        -8,
+        8,
+        (kv_len, num_kv_heads, head_dim),
+        device="cuda:0",
+        dtype=torch.int8,
+    )
+    v_ref = v.to(torch.float16) * scale_v.view(1, -1, 1)
+
+    out = flashinfer.single_prefill_with_kv_cache(
+        q,
+        k,
+        v,
+        causal=False,
+        scale_v=scale_v,
+    )
+    out_ref = flashinfer.single_prefill_with_kv_cache(
+        q,
+        k.to(torch.float16),
+        v_ref,
+        causal=False,
+    )
+
+    torch.testing.assert_close(out, out_ref, rtol=1e-2, atol=2e-2)
+
+
+def test_single_prefill_with_kv_cache_int8_rejects_tensor_scale_k():
+    _require_sm80_or_newer()
+
+    q = torch.randn(3, 2, 128, device="cuda:0", dtype=torch.float16)
+    k = torch.randint(-8, 8, (8, 2, 128), device="cuda:0", dtype=torch.int8)
+    v = torch.randint(-8, 8, (8, 2, 128), device="cuda:0", dtype=torch.int8)
+    scale_k = torch.tensor([0.25, 0.5], device="cuda:0", dtype=torch.float32)
+
+    with pytest.raises(
+        TypeError, match="scale_k must be a scalar for non-FP8 single prefill"
+    ):
+        flashinfer.single_prefill_with_kv_cache(
+            q,
+            k,
+            v,
+            causal=False,
+            scale_k=scale_k,
+        )
+
+
 def test_determine_attention_backend_int8_falls_back_to_fa2_on_sm90(
     monkeypatch: pytest.MonkeyPatch,
 ):
