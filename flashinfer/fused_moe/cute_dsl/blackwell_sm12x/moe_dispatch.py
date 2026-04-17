@@ -98,6 +98,15 @@ def _align_up(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
 
 
+def _get_relu2_bs1_spark_micro_cap() -> int:
+    """Return tuned MAC cap for relu2 bs=1 on DGX Spark (non-monotonic optimum)."""
+    import os
+    cap = os.environ.get("FLASHINFER_B12X_RELU2_BS1_SPARK_MICRO_CAP")
+    if cap is None:
+        return 42
+    return max(1, int(cap))
+
+
 def _select_moe_mma_tiler_mn(routed_rows: int, n: int) -> Tuple[int, int]:
     """Select optimal MoE tile shape based on routed rows and N dimension.
 
@@ -575,6 +584,8 @@ def _get_micro_kernel(
     input_scales_are_reciprocal: bool = False,
     fast_math: bool = True,
     share_input_across_experts: bool = False,
+    share_expert_scales: bool = False,
+    single_token: bool = False,
     mac_override: int | None = None,
     activation: str = "silu",
 ):
@@ -606,6 +617,8 @@ def _get_micro_kernel(
         input_scales_are_reciprocal,
         fast_math,
         share_input_across_experts,
+        share_expert_scales,
+        single_token,
         activation,
     )
     cached = _MICRO_KERNEL_CACHE.get(cache_key)
@@ -625,6 +638,8 @@ def _get_micro_kernel(
         fast_math=fast_math,
         activation=activation,
         share_input_across_experts=share_input_across_experts,
+        share_expert_scales=share_expert_scales,
+        single_token=single_token,
     )
 
     is_gated = activation == "silu"
@@ -829,10 +844,11 @@ def launch_sm120_static_moe(
     flat_weights = topk_weights.view(-1).to(torch.float32)
     routed_rows = num_tokens * top_k
 
-    # Capture whether input_gs was a single shared scalar BEFORE expansion:
+    # Capture whether scales were single shared scalars BEFORE expansion:
     # the m=1 relu2 shared-input micro optimization only applies when every
     # expert sees the same FC1-input global scale.
     input_gs_is_shared = input_gs.numel() == 1
+    down_gs_is_shared = down_input_scale.numel() == 1
 
     # Broadcast scalar scales to per-expert [E] tensors
     input_gs = _expand_to_experts(input_gs, num_experts)
@@ -886,6 +902,10 @@ def launch_sm120_static_moe(
         micro_work_tiles = max(1, routed_rows * max(1, (n + 128 - 1) // 128))
         tuned_mac = _lookup_mac_ladder(_MICRO_MAC_LADDER, routed_rows)
         micro_mac = min(tuned_mac or base_mac, micro_work_tiles, base_mac)
+        # On DGX Spark (≤96 SMs), the relu2 bs=1 micro MAC has a non-monotonic
+        # optimum at 42. Cap it there to avoid the throughput cliff.
+        if activation == "relu2" and num_tokens == 1 and sm_count <= 96:
+            micro_mac = min(micro_mac, _get_relu2_bs1_spark_micro_cap())
         # For m=1 relu2 with a shared FC1-input scale, all experts see the
         # same quantized activation — quantize once and share the packed
         # buffer slot across all K top-k pairs. Env override lets us flip
@@ -896,6 +916,10 @@ def launch_sm120_static_moe(
             and input_gs_is_shared
             and os.environ.get("FLASHINFER_B12X_MICRO_SHARE_INPUT", "1") != "0"
         )
+        # When both FC1 and FC2 input scales are scalar, every expert uses the
+        # same scale — use index 0 instead of per-expert lookup to avoid
+        # redundant global memory reads inside the kernel.
+        share_expert_scales = input_gs_is_shared and down_gs_is_shared
         compiled, mac = _get_micro_kernel(
             workspace.state_E,
             num_experts,
@@ -908,6 +932,8 @@ def launch_sm120_static_moe(
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
             share_input_across_experts=share_input_across_experts,
+            share_expert_scales=share_expert_scales,
+            single_token=(num_tokens == 1),
             mac_override=micro_mac,
             activation=activation,
         )

@@ -45,6 +45,7 @@ import functools
 import torch
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.nvgpu.warp.mma import Field as WarpField
+from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
 
 from flashinfer.cute_dsl.utils import (
     cutlass_to_torch_dtype,
@@ -92,6 +93,7 @@ class DenseGemmKernel:
         sf_vec_size: int,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
+        single_work_tile_per_cta: bool = False,
         use_prefetch: bool = False,
         enable_pdl: bool = True,
     ):
@@ -107,6 +109,9 @@ class DenseGemmKernel:
         self.sfb_tiles_per_block = self.sfb_tile_shape_nk[0] // mma_tiler_mn[1]
         self.cluster_shape_mnk = (1, 1, 1)  # Always (1,1,1) on the current target
         self.epi_tile = (mma_tiler_mn[0], mma_tiler_mn[1])
+        # When each CTA processes exactly one work tile, skip tile_sched.advance_to_next_work()
+        # to avoid unnecessary scheduler overhead on small-M wide-N shapes.
+        self.single_work_tile_per_cta = single_work_tile_per_cta
         self.use_prefetch = use_prefetch
         self.enable_pdl = enable_pdl
 
@@ -1144,8 +1149,11 @@ class DenseGemmKernel:
                                 tma_store_pipeline.producer_acquire()
 
                 # Advance to the next work tile
-                tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
+                if cutlass.const_expr(self.single_work_tile_per_cta):
+                    work_tile = WorkTileInfo(work_tile.tile_idx, cutlass.Boolean(0))
+                else:
+                    tile_sched.advance_to_next_work()
+                    work_tile = tile_sched.get_current_work()
                 if has_multi_epi_store:
                     tma_store_pipeline.producer_tail()
 
@@ -1214,8 +1222,11 @@ class DenseGemmKernel:
                     mainloop_pipeline.producer_commit(mainloop_producer_state)
                     mainloop_producer_state.advance()
 
-                tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
+                if cutlass.const_expr(self.single_work_tile_per_cta):
+                    work_tile = WorkTileInfo(work_tile.tile_idx, cutlass.Boolean(0))
+                else:
+                    tile_sched.advance_to_next_work()
+                    work_tile = tile_sched.get_current_work()
 
             mainloop_pipeline.producer_tail(mainloop_producer_state)
         return
