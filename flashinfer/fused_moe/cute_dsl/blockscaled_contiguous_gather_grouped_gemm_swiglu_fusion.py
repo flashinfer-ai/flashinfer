@@ -274,8 +274,9 @@ def _get_compiled_gather_kernel(
         # Order must match wrapper signature:
         # (a_ptr, b_ptr_tuple, a_sf_ptr, b_sf_ptr_tuple, c_ptr, c_sf_ptr, alpha_ptr_tuple,
         #  tile_idx_to_group_idx_ptr, tile_idx_to_mn_limit_ptr, token_id_mapping_ptr,
-        #  num_non_exiting_tiles_ptr, norm_const_ptr, orig_m, m, n, k,
+        #  num_non_exiting_tiles_ptr, norm_const_ptr, orig_m, m, n, k, l,
         #  tile_size, scaling_vector_size, max_active_clusters, stream)
+        num_experts = sum(b_tensor_l_sizes)
         compile_args = [
             a_ptr,
             b_ptr,
@@ -293,6 +294,7 @@ def _get_compiled_gather_kernel(
             permuted_m,
             n,
             k,
+            num_experts,
         ]
 
         compiled_gemm = cute.compile(
@@ -620,6 +622,7 @@ def blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4(
     )
 
     # Execute kernel
+    num_experts = sum(b_tensor_l_sizes)
     exec_args = [
         a_ptr,
         b_ptr,
@@ -637,6 +640,7 @@ def blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4(
         permuted_m,
         n,
         k,
+        num_experts,  # l
     ]
     compiled_gemm(*exec_args, stream=stream)
 

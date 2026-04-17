@@ -410,8 +410,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         vectorized_f32: bool,
         topk: cutlass.Int64,
         raster_along_m: bool = False,
-        enable_pdl: bool = True,
         b_tensor_l_sizes: Optional[Tuple[int, ...]] = None,
+        enable_pdl: bool = True,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
         gather operation and SwiGLU fusion.
@@ -533,25 +533,24 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.vectorized_f32 = vectorized_f32
 
         # Multi-B tensor configuration
-        # b_tensor_l_sizes is required — the Python wrapper layer always provides it
-        # as a tuple (even for single-B, e.g. (256,)).
         if b_tensor_l_sizes is None:
-            raise ValueError(
-                "b_tensor_l_sizes is required. Pass a tuple with the number of "
-                "experts per tensor, e.g. (num_experts,) for single-B."
+            self.num_b_tensors = 1
+            self.b_tensor_l_sizes = None
+            # Offsets padded for safe indexing in kernel
+            self.b_tensor_l_offsets = (0,) + (2**30,) * self.MAX_B_TENSORS
+        else:
+            assert len(b_tensor_l_sizes) <= self.MAX_B_TENSORS, (
+                f"Max {self.MAX_B_TENSORS} B tensors, got {len(b_tensor_l_sizes)}"
             )
-        assert len(b_tensor_l_sizes) <= self.MAX_B_TENSORS, (
-            f"Max {self.MAX_B_TENSORS} B tensors, got {len(b_tensor_l_sizes)}"
-        )
-        self.num_b_tensors = len(b_tensor_l_sizes)
-        self.b_tensor_l_sizes = b_tensor_l_sizes
-        offsets = [0]
-        for l_size in b_tensor_l_sizes:
-            offsets.append(offsets[-1] + l_size)
-        # Pad to MAX_B_TENSORS + 1 for safe indexing
-        while len(offsets) < self.MAX_B_TENSORS + 1:
-            offsets.append(2**30)
-        self.b_tensor_l_offsets = tuple(offsets)
+            self.num_b_tensors = len(b_tensor_l_sizes)
+            self.b_tensor_l_sizes = b_tensor_l_sizes
+            offsets = [0]
+            for l_size in b_tensor_l_sizes:
+                offsets.append(offsets[-1] + l_size)
+            # Pad to MAX_B_TENSORS + 1 for safe indexing
+            while len(offsets) < self.MAX_B_TENSORS + 1:
+                offsets.append(2**30)
+            self.b_tensor_l_offsets = tuple(offsets)
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -4034,6 +4033,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         m: cutlass.Int64,
         n: cutlass.Int64,
         k: cutlass.Int64,
+        l: cutlass.Int64,  # noqa: E741
         tile_size: cutlass.Constexpr,
         scaling_vector_size: cutlass.Constexpr,
         max_active_clusters: cutlass.Constexpr,
@@ -4043,12 +4043,19 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         """Unified wrapper supporting both single-B and multi-B tensors.
 
         B tensors are always passed as tuples (length 1 for single-B).
-        L sizes are configured via b_tensor_l_sizes in __init__.
+        When b_tensor_l_sizes is provided, L sizes come from b_tensor_l_sizes;
+        otherwise falls back to the l parameter (backward compatible single-B).
         """
         scale_k = k // scaling_vector_size
         interm_size = n // 2
         num_tiles = m // tile_size
-        total_l = self.b_tensor_l_offsets[self.num_b_tensors]
+        # When b_tensor_l_sizes is provided, total_l comes from the precomputed offsets
+        # and l is ignored. Callers must ensure l == sum(b_tensor_l_sizes).
+        # When b_tensor_l_sizes is None (single-B backward compat), l is used directly.
+        if cutlass.const_expr(self.b_tensor_l_sizes is not None):
+            total_l = self.b_tensor_l_offsets[self.num_b_tensors]
+        else:
+            total_l = l
 
         a = cute.make_tensor(
             a_ptr, layout=cute.make_ordered_layout((orig_m, k, 1), order=(1, 0, 2))
@@ -4069,7 +4076,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         )
 
         # Create B and alpha tensors using const_expr conditions
-        l_0 = self.b_tensor_l_sizes[0]
+        if cutlass.const_expr(self.b_tensor_l_sizes is not None):
+            l_0 = self.b_tensor_l_sizes[0]
+        else:
+            l_0 = l
         alpha_0 = cute.make_tensor(alpha_ptr_tuple[0], layout=cute.make_layout((l_0,)))
         b_0 = cute.make_tensor(
             b_ptr_tuple[0],
