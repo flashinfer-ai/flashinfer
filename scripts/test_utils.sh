@@ -174,7 +174,10 @@ collect_tests() {
 # Return the expected JUnit XML path for a test file
 junit_file_for_test() {
     local test_file=$1
-    echo "${JUNIT_DIR}/${test_file//\//_}.xml"
+    local flattened_test_file=${test_file//\//_}
+    local test_hash
+    test_hash=$(printf '%s' "$test_file" | cksum | awk '{print $1}')
+    echo "${JUNIT_DIR}/${flattened_test_file}.${test_hash}.xml"
 }
 
 # Record a failed test file in the execution summary
@@ -264,8 +267,9 @@ dry_run_full_file() {
     local test_file=$1
 
     TOTAL_TESTS=$((TOTAL_TESTS + 1))
-    JUNIT_FILENAME="${test_file//\//_}.xml"
-    JUNIT_FLAG="--junitxml=${JUNIT_DIR}/${JUNIT_FILENAME}"
+    local junit_file
+    junit_file=$(junit_file_for_test "$test_file")
+    JUNIT_FLAG="--junitxml=${junit_file}"
     # shellcheck disable=SC2086  # PYTEST_COMMAND_PREFIX needs word splitting
     echo "$TOTAL_TESTS. ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS ${JUNIT_FLAG} \"${test_file}\""
 }
@@ -684,6 +688,14 @@ run_tests_parallel() {
 
             TOTAL_TESTS=$((TOTAL_TESTS + 1))
 
+            if [ "$mode" = "sanity" ] && [[ "$result" == PASSED:* || "$result" == FAILED:* ]]; then
+                local total_in_file sampled_in_file
+                # shellcheck disable=SC2034  # status is part of the read but unused
+                IFS=':' read -r _ total_in_file sampled_in_file <<< "$result"
+                TOTAL_TEST_CASES=$((TOTAL_TEST_CASES + total_in_file))
+                SAMPLED_TEST_CASES=$((SAMPLED_TEST_CASES + sampled_in_file))
+            fi
+
             if [ ! -f "$junit_file" ]; then
                 echo "⚠️  NO RESULT: $test_file (missing JUnit XML: $junit_file)"
                 record_no_result_test "$test_file"
@@ -692,22 +704,8 @@ run_tests_parallel() {
 
             if [[ "$result" == PASSED* ]]; then
                 PASSED_TESTS=$((PASSED_TESTS + 1))
-                if [ "$mode" = "sanity" ]; then
-                    local total_in_file sampled_in_file
-                    # shellcheck disable=SC2034  # status is part of the read but unused
-                    IFS=':' read -r _ total_in_file sampled_in_file <<< "$result"
-                    TOTAL_TEST_CASES=$((TOTAL_TEST_CASES + total_in_file))
-                    SAMPLED_TEST_CASES=$((SAMPLED_TEST_CASES + sampled_in_file))
-                fi
             elif [[ "$result" == FAILED* ]]; then
                 record_failed_test "$test_file"
-                if [ "$mode" = "sanity" ]; then
-                    local total_in_file sampled_in_file
-                    # shellcheck disable=SC2034  # status is part of the read but unused
-                    IFS=':' read -r _ total_in_file sampled_in_file <<< "$result"
-                    TOTAL_TEST_CASES=$((TOTAL_TEST_CASES + total_in_file))
-                    SAMPLED_TEST_CASES=$((SAMPLED_TEST_CASES + sampled_in_file))
-                fi
             fi
         else
             TOTAL_TESTS=$((TOTAL_TESTS + 1))
