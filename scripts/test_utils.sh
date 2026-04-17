@@ -654,8 +654,8 @@ run_tests_parallel() {
     # Sort results by file_index for deterministic output
     local -a sorted_pids=()
     for pid in "${!test_result_files[@]}"; do
-        local result_file test_file log_file file_index
-        IFS=':' read -r result_file test_file log_file file_index <<< "${test_result_files[$pid]}"
+        local result_file test_file log_file file_index junit_file
+        IFS=':' read -r result_file test_file log_file file_index junit_file <<< "${test_result_files[$pid]}"
         sorted_pids+=("$file_index:$pid")
     done
     local sorted_list
