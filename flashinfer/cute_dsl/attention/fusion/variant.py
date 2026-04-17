@@ -119,7 +119,7 @@ Hardware Primitives
 The following hardware-mapped primitives are available for use in
 ``transform_logits`` and ``score_mod``::
 
-    cute.arch.exp2(x)       # MUFU.EX2  — base-2 exponential (approx)
+    exp2_fast(x)            # MUFU.EX2  — base-2 exponential (approx)
     cute.arch.rcp_approx(x) # MUFU.RCP  — reciprocal (approx)
     tanh_approx(x)          # MUFU.TANH — hyperbolic tangent (approx)
 
@@ -139,7 +139,7 @@ Sigmoid attention (exp2 + rcp, 2 MUFU ops/element)::
         @cute.jit
         def transform_logits(self, score):
             return cute.arch.rcp_approx(
-                1 + cute.arch.exp2(-(score * self.scale + self.bias)))
+                1 + exp2_fast(-(score * self.scale + self.bias)))
 
 Sigmoid attention via tanh (1 MUFU op/element)::
 
@@ -187,6 +187,8 @@ import cutlass.cute as cute
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.typing import Float32
+
+from ..compat import exp2_fast
 
 
 @dsl_user_op
@@ -430,8 +432,8 @@ class AttentionWithSink(AttentionVariant):
             log2_e = math.log2(math.exp(1.0))
             sink_raw = self.params[qo_head_idx] * log2_e / scale
             m_new = sink_raw if sink_raw > m else m
-            rescale = cute.arch.exp2((m - m_new) * scale)
-            d_new = cute.arch.exp2((sink_raw - m_new) * scale) + d * rescale
+            rescale = exp2_fast((m - m_new) * scale)
+            d_new = exp2_fast((sink_raw - m_new) * scale) + d * rescale
         return m_new, d_new
 
     @cute.jit
@@ -471,18 +473,16 @@ class SigmoidAttention(AttentionVariant):
 
     @cute.jit
     def transform_logits(self, score):
-        return cute.arch.rcp_approx(
-            1 + cute.arch.exp2(-(score * self.scale + self.bias))
-        )
+        return cute.arch.rcp_approx(1 + exp2_fast(-(score * self.scale + self.bias)))
 
     @cute.jit
     def transform_logits_vec(self, scores):
         for i in cutlass.range_constexpr(0, cute.size(scores), 2):
             scores[i] = cute.arch.rcp_approx(
-                1 + cute.arch.exp2(-(scores[i] * self.scale + self.bias))
+                1 + exp2_fast(-(scores[i] * self.scale + self.bias))
             )
             scores[i + 1] = cute.arch.rcp_approx(
-                1 + cute.arch.exp2(-(scores[i + 1] * self.scale + self.bias))
+                1 + exp2_fast(-(scores[i + 1] * self.scale + self.bias))
             )
 
 

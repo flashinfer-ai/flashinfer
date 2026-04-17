@@ -13,6 +13,10 @@ from .config import AttentionConfig, AttentionFusion
 from .warp_schedule import WarpSchedule, PREFILL_SCHEDULE, PREFILL_TRANSFORM_SCHEDULE
 from .mainloop_spec import make_prefill_mainloop_spec
 from .collective_builder import build_fmha_launch_params
+from .compat import (
+    setmaxregister_decrease as _setmaxregister_decrease,
+    setmaxregister_increase as _setmaxregister_increase,
+)
 from .scheduler.persistent import (
     FmhaStaticTileScheduler,
     FmhaStaticTileSchedulerParams,
@@ -463,13 +467,13 @@ class BlackwellFusedMultiHeadAttentionForward:
         #  EMPTY
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.schedule.empty_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.schedule.num_regs_empty)
+            _setmaxregister_decrease(self.schedule.num_regs_empty)
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  LOAD
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.schedule.load_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.schedule.num_regs_other)
+            _setmaxregister_decrease(self.schedule.num_regs_other)
             self.loader_role.run(
                 qk_thr_mma,
                 pv_thr_mma,
@@ -493,7 +497,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         #  MMA
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.schedule.mma_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.schedule.num_regs_other)
+            _setmaxregister_decrease(self.schedule.num_regs_other)
             self.mma_role.run(
                 qk_tiled_mma,
                 pv_tiled_mma,
@@ -524,7 +528,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         #  Epilogue
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.schedule.epilogue_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.schedule.num_regs_other)
+            _setmaxregister_decrease(self.schedule.num_regs_other)
             self.epilogue_role.run(
                 tma_atom_o,
                 mO_qdl,
@@ -541,7 +545,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx < self.schedule.softmax1_warp_ids[0]:
             # increase register after decreasing
-            cute.arch.warpgroup_reg_alloc(self.schedule.num_regs_softmax)
+            _setmaxregister_increase(self.schedule.num_regs_softmax)
 
             self.softmax_role.run(
                 stage=0,
@@ -575,7 +579,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             and warp_idx < self.schedule.softmax1_upper_warp_id
         ):
             # increase register after decreasing
-            cute.arch.warpgroup_reg_alloc(self.schedule.num_regs_softmax)
+            _setmaxregister_increase(self.schedule.num_regs_softmax)
 
             self.softmax_role.run(
                 stage=1,
@@ -609,7 +613,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                 warp_idx >= self.schedule.softmax1_upper_warp_id
                 and warp_idx < self.schedule.mma_warp_id
             ):
-                cute.arch.warpgroup_reg_dealloc(self.schedule.num_regs_correction)
+                _setmaxregister_decrease(self.schedule.num_regs_correction)
                 self.correction_role.run(
                     qk_thr_mma,
                     pv_thr_mma,

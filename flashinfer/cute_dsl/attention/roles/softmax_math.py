@@ -10,6 +10,8 @@ duplicating the core exp2-scale and packed row-sum reduction logic.
 import cutlass
 import cutlass.cute as cute
 
+from ..compat import exp2_fast
+
 
 @cute.jit
 def exp2_scale(scores, scale_log2, row_max):
@@ -21,8 +23,8 @@ def exp2_scale(scores, scale_log2, row_max):
             (scale_log2, scale_log2),
             (minus_max_scale, minus_max_scale),
         )
-        scores[i] = cute.arch.exp2(scores[i])
-        scores[i + 1] = cute.arch.exp2(scores[i + 1])
+        scores[i] = exp2_fast(scores[i])
+        scores[i + 1] = exp2_fast(scores[i + 1])
 
 
 @cute.jit
