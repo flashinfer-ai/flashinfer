@@ -18,7 +18,7 @@ import functools
 import logging
 import math
 from types import SimpleNamespace
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union, cast, overload
 
 import torch
 
@@ -37,8 +37,9 @@ from .jit import (
 )
 from .cudnn import cudnn_batch_prefill_with_kv_cache
 from .page import get_seq_lens
-from .quantization import packbits, segment_packbits
+from .quantization import int4_dequantize, packbits, segment_packbits
 from .utils import (
+    INT4Tensor,
     log2e,
     FP4Tensor,
     MaskMode,
@@ -50,6 +51,7 @@ from .utils import (
     _check_pos_encoding_mode,
     check_shape_dtype_device,
     get_alibi_slopes,
+    _dequantize_int4_paged_kv_cache,
     _get_cache_alibi_slopes_buf,
     _get_cache_buf,
     _unpack_paged_kv_cache,
@@ -61,6 +63,8 @@ from .utils import (
     is_sm100a_supported,
     is_sm110a_supported,
     is_sm12x_supported,
+    is_int4_dtype,
+    is_int4_tensor,
     register_custom_op,
     register_fake_op,
     ceil_div,
@@ -1104,8 +1108,8 @@ def single_prefill_with_kv_cache_with_jit_module(
 @overload
 def single_prefill_with_kv_cache(
     q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
+    k: Union[torch.Tensor, INT4Tensor],
+    v: Union[torch.Tensor, INT4Tensor],
     scale_q: Optional[torch.Tensor] = None,
     scale_k: Optional[torch.Tensor] = None,
     scale_v: Optional[torch.Tensor] = None,
@@ -1129,8 +1133,8 @@ def single_prefill_with_kv_cache(
 @overload
 def single_prefill_with_kv_cache(
     q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
+    k: Union[torch.Tensor, INT4Tensor],
+    v: Union[torch.Tensor, INT4Tensor],
     scale_q: Optional[torch.Tensor] = None,
     scale_k: Optional[torch.Tensor] = None,
     scale_v: Optional[torch.Tensor] = None,
@@ -1154,8 +1158,8 @@ def single_prefill_with_kv_cache(
 @flashinfer_api
 def single_prefill_with_kv_cache(
     q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
+    k: Union[torch.Tensor, INT4Tensor],
+    v: Union[torch.Tensor, INT4Tensor],
     scale_q: Optional[torch.Tensor] = None,
     scale_k: Optional[torch.Tensor] = None,
     scale_v: Optional[torch.Tensor] = None,
@@ -1297,6 +1301,16 @@ def single_prefill_with_kv_cache(
     """
     _check_pos_encoding_mode(pos_encoding_mode)
     _check_kv_layout(kv_layout)
+    int4_input = is_int4_tensor(k) or is_int4_tensor(v)
+    if int4_input:
+        if not (is_int4_tensor(k) and is_int4_tensor(v)):
+            raise ValueError("k and v must both be INT4Tensor when using int4 KV.")
+        if scale_k is not None or scale_v is not None:
+            raise ValueError(
+                "scale_k and scale_v are not supported for INT4Tensor inputs."
+            )
+        k = int4_dequantize(k)
+        v = int4_dequantize(v)
     tmp = torch.empty(SINGLE_KERNEL_TMP_SIZE, dtype=torch.uint8, device=q.device)
     if logits_soft_cap is None:
         logits_soft_cap = 0.0
@@ -1324,47 +1338,63 @@ def single_prefill_with_kv_cache(
     if return_lse:
         lse = torch.empty((q.size(0), q.size(1)), dtype=torch.float32, device=q.device)
 
+    k_tensor = cast(torch.Tensor, k)
+    v_tensor = cast(torch.Tensor, v)
+
     if is_float8(q):
         # FP8 quant enabled, do sanity check:
         #   1. unsupported feature
         #   2. dtype check
         assert window_left == -1
-        assert q.dtype == k.dtype == v.dtype
-        assert q.shape[-1] == k.shape[-1] == v.shape[-1]
+        assert q.dtype == k_tensor.dtype == v_tensor.dtype
+        assert q.shape[-1] == k_tensor.shape[-1] == v_tensor.shape[-1]
         if scale_q is None:
             scale_q = torch.ones(q.shape[1], dtype=torch.float32, device=q.device)
         if scale_k is None:
-            scale_k = torch.ones(k.shape[1], dtype=torch.float32, device=q.device)
+            scale_k = torch.ones(
+                k_tensor.shape[1], dtype=torch.float32, device=q.device
+            )
         if scale_v is None:
-            scale_v = torch.ones(v.shape[1], dtype=torch.float32, device=q.device)
+            scale_v = torch.ones(
+                v_tensor.shape[1], dtype=torch.float32, device=q.device
+            )
     else:
         if scale_q is not None:
             sm_scale *= _normalize_non_fp8_scalar_scale(scale_q, "scale_q")
         if scale_k is not None:
             sm_scale *= _normalize_non_fp8_scalar_scale(scale_k, "scale_k")
 
-    if backend == "auto":
+    if int4_input:
+        if backend == "auto":
+            backend = "fa2"
+        elif backend != "fa2":
+            raise NotImplementedError(
+                "INT4Tensor inputs only support the fa2 single prefill path."
+            )
+    elif backend == "auto":
         backend = determine_attention_backend(
             q.device,
             PosEncodingMode[pos_encoding_mode].value,
             use_fp16_qk_reduction,
             packed_custom_mask is not None,  # use_custom_mask
             q.dtype,
-            k.dtype,
+            k_tensor.dtype,
         )
 
     # o_dtype should be provided for FP8 attention
     if o_dtype is None:
         o_dtype = q.dtype
-    out = torch.empty(q.shape[:-1] + v.shape[-1:], dtype=o_dtype, device=q.device)
+    out = torch.empty(
+        q.shape[:-1] + v_tensor.shape[-1:], dtype=o_dtype, device=q.device
+    )
 
     module = get_single_prefill_module(
         backend,
         q.dtype,
-        k.dtype,
+        k_tensor.dtype,
         out.dtype,
         q.shape[-1],  # head_dim_qk
-        v.shape[-1],  # head_dim_vo
+        v_tensor.shape[-1],  # head_dim_vo
         PosEncodingMode[pos_encoding_mode].value,
         window_left >= 0,  # use_sliding_window
         logits_soft_cap > 0,  # use_logits_soft_cap
@@ -1373,8 +1403,8 @@ def single_prefill_with_kv_cache(
 
     module.run(
         q,
-        k,
-        v,
+        k_tensor,
+        v_tensor,
         tmp,
         out,
         lse,
@@ -1886,13 +1916,31 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
+        if is_int4_dtype(q_data_type) or is_int4_dtype(o_data_type):
+            raise ValueError("q_data_type and o_data_type do not support int4.")
         q_data_type = canonicalize_torch_dtype(q_data_type)
         if kv_data_type is None:
             kv_data_type = q_data_type
-        kv_data_type = canonicalize_torch_dtype(kv_data_type)
+        self._int4_kv_enabled = is_int4_dtype(kv_data_type)
+        effective_kv_data_type = (
+            torch.float16
+            if self._int4_kv_enabled
+            else canonicalize_torch_dtype(kv_data_type)
+        )
+        if self._int4_kv_enabled:
+            if self._backend == "auto":
+                self._backend = "fa2"
+            elif self._backend != "fa2":
+                raise NotImplementedError(
+                    "INT4 paged KV cache only supports the fa2/common prefill path."
+                )
         if o_data_type is None:
             o_data_type = q_data_type
         o_data_type = canonicalize_torch_dtype(o_data_type)
+        if self.is_cuda_graph_enabled and self._int4_kv_enabled:
+            raise NotImplementedError(
+                "INT4 paged KV cache is not supported with CUDA graph prefill yet."
+            )
 
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
@@ -2028,7 +2076,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._mask_indptr_buf = None
 
         self._cached_q_data_type = q_data_type
-        self._cached_kv_data_type = kv_data_type
+        self._cached_kv_data_type = effective_kv_data_type
         self._cached_o_data_type = o_data_type
 
         if self._jit_module is not None:
@@ -2041,12 +2089,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     use_fp16_qk_reduction,
                     self._custom_mask_buf is not None,  # use_custom_mask
                     q_data_type,
-                    kv_data_type,
+                    effective_kv_data_type,
                 )
             if self._backend != "cudnn":
                 get_module_args = (
                     q_data_type,
-                    kv_data_type,
+                    effective_kv_data_type,
                     o_data_type,
                     paged_kv_indptr.dtype,
                     head_dim_qk,
@@ -2274,7 +2322,17 @@ class BatchPrefillWithPagedKVCacheWrapper:
         """
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
-        k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
+        if self._int4_kv_enabled:
+            if k_scale is not None or v_scale is not None:
+                raise ValueError(
+                    "k_scale and v_scale are not supported for INT4 paged KV cache."
+                )
+            k_cache, v_cache = _dequantize_int4_paged_kv_cache(
+                paged_kv_cache,
+                self._kv_layout,
+            )
+        else:
+            k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
         )

@@ -48,7 +48,9 @@ from .prefill import (
     get_batch_prefill_module,
     get_single_prefill_module,
 )
+from .quantization import int4_dequantize
 from .utils import (
+    INT4Tensor,
     log2e,
     FP4Tensor,
     MaskMode,
@@ -60,6 +62,7 @@ from .utils import (
     _check_pos_encoding_mode,
     check_shape_dtype_device,
     get_alibi_slopes,
+    _dequantize_int4_paged_kv_cache,
     _get_cache_alibi_slopes_buf,
     _get_range_buf,
     _unpack_paged_kv_cache,
@@ -76,6 +79,8 @@ from .utils import (
     GPUArchitectureError,
     SINGLE_KERNEL_TMP_SIZE,
     prepare_jit_additional_args,
+    is_int4_dtype,
+    is_int4_tensor,
 )
 
 
@@ -363,8 +368,8 @@ def get_batch_decode_mla_module(*args):
 @overload
 def single_decode_with_kv_cache(
     q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
+    k: Union[torch.Tensor, INT4Tensor],
+    v: Union[torch.Tensor, INT4Tensor],
     kv_layout: str = "NHD",
     pos_encoding_mode: str = "NONE",
     use_tensor_cores: bool = False,
@@ -383,8 +388,8 @@ def single_decode_with_kv_cache(
 @overload
 def single_decode_with_kv_cache(
     q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
+    k: Union[torch.Tensor, INT4Tensor],
+    v: Union[torch.Tensor, INT4Tensor],
     kv_layout: str = "NHD",
     pos_encoding_mode: str = "NONE",
     use_tensor_cores: bool = False,
@@ -403,8 +408,8 @@ def single_decode_with_kv_cache(
 @flashinfer_api
 def single_decode_with_kv_cache(
     q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
+    k: Union[torch.Tensor, INT4Tensor],
+    v: Union[torch.Tensor, INT4Tensor],
     kv_layout: str = "NHD",
     pos_encoding_mode: str = "NONE",
     use_tensor_cores: bool = False,
@@ -498,6 +503,15 @@ def single_decode_with_kv_cache(
     """
     _check_pos_encoding_mode(pos_encoding_mode)
     _check_kv_layout(kv_layout)
+    if is_int4_tensor(k) or is_int4_tensor(v):
+        if not (is_int4_tensor(k) and is_int4_tensor(v)):
+            raise ValueError("k and v must both be INT4Tensor when using int4 KV.")
+        if k_scale is not None or v_scale is not None:
+            raise ValueError(
+                "k_scale and v_scale are not supported for INT4Tensor inputs."
+            )
+        k = int4_dequantize(k)
+        v = int4_dequantize(v)
     tmp = torch.empty(SINGLE_KERNEL_TMP_SIZE, dtype=torch.uint8, device=q.device)
     head_dim = q.shape[-1]
     if logits_soft_cap is None:
@@ -977,13 +991,31 @@ class BatchDecodeWithPagedKVCacheWrapper:
             if kv_data_type is None:
                 kv_data_type = data_type
 
+        if is_int4_dtype(q_data_type) or is_int4_dtype(o_data_type):
+            raise ValueError("q_data_type and o_data_type do not support int4.")
         q_data_type = canonicalize_torch_dtype(q_data_type)
         if kv_data_type is None:
             kv_data_type = q_data_type
-        kv_data_type = canonicalize_torch_dtype(kv_data_type)
+        self._int4_kv_enabled = is_int4_dtype(kv_data_type)
+        effective_kv_data_type = (
+            torch.float16
+            if self._int4_kv_enabled
+            else canonicalize_torch_dtype(kv_data_type)
+        )
+        if self._int4_kv_enabled:
+            if self._backend == "auto":
+                self._backend = "fa2"
+            elif self._backend != "fa2":
+                raise NotImplementedError(
+                    "INT4 paged KV cache only supports the fa2/common decode path."
+                )
         if o_data_type is None:
             o_data_type = q_data_type
         o_data_type = canonicalize_torch_dtype(o_data_type)
+        if self.is_cuda_graph_enabled and self._int4_kv_enabled:
+            raise NotImplementedError(
+                "INT4 paged KV cache is not supported with CUDA graph decode yet."
+            )
 
         if fixed_split_size is not None and not self.use_tensor_cores:
             raise ValueError(
@@ -993,7 +1025,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             fixed_split_size = -1
 
         self._cached_q_data_type = q_data_type
-        self._cached_kv_data_type = kv_data_type
+        self._cached_kv_data_type = effective_kv_data_type
+        self._external_kv_data_type = kv_data_type
         self._cached_o_data_type = o_data_type
         self._batch_size = batch_size
         self._num_qo_heads = num_qo_heads
@@ -1038,7 +1071,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     block_id += num_blocks_needed
             self._cached_module = get_trtllm_gen_decode_module(
                 q_data_type,
-                kv_data_type,
+                effective_kv_data_type,
                 o_data_type,
                 indptr.dtype,
                 head_dim,
@@ -1058,21 +1091,21 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     if {
                         torch.float8_e4m3fn,
                         torch.float8_e5m2,
-                    } & {q_data_type, kv_data_type}:
+                    } & {q_data_type, effective_kv_data_type}:
                         self._backend = determine_attention_backend(
                             self.device,
                             PosEncodingMode[pos_encoding_mode].value,
                             False,  # use_fp16_qk_reductions
                             False,  # use_custom_mask
                             q_data_type,
-                            kv_data_type,
+                            effective_kv_data_type,
                         )
                     else:
                         self._backend = "fa2"
                 self._cached_module = get_batch_prefill_module(
                     self._backend,
                     q_data_type,
-                    kv_data_type,
+                    effective_kv_data_type,
                     o_data_type,
                     indptr.dtype,
                     head_dim,  # head_dim_qk
@@ -1114,7 +1147,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             else:
                 self._cached_module = get_batch_decode_module(
                     q_data_type,
-                    kv_data_type,
+                    effective_kv_data_type,
                     o_data_type,
                     indptr.dtype,
                     head_dim,  # head_dim_qk
@@ -1138,7 +1171,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 head_dim,
                 head_dim,
                 torch.empty(0, dtype=q_data_type),
-                torch.empty(0, dtype=kv_data_type),
+                torch.empty(0, dtype=effective_kv_data_type),
             )
 
         self._pos_encoding_mode = pos_encoding_mode
@@ -1289,7 +1322,17 @@ class BatchDecodeWithPagedKVCacheWrapper:
         """
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
-        k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
+        if self._int4_kv_enabled:
+            if k_scale is not None or v_scale is not None:
+                raise ValueError(
+                    "k_scale and v_scale are not supported for INT4 paged KV cache."
+                )
+            k_cache, v_cache = _dequantize_int4_paged_kv_cache(
+                paged_kv_cache,
+                self._kv_layout,
+            )
+        else:
+            k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
 
         if (
             k_cache.dtype == torch.uint8 or v_cache.dtype == torch.uint8
