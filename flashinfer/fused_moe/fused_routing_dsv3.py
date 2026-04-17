@@ -1,3 +1,5 @@
+from typing import Optional
+
 from flashinfer.api_logging import flashinfer_api
 from flashinfer.jit import gen_dsv3_fused_routing_module
 import functools
@@ -21,6 +23,7 @@ def _check_dsv3_fused_routing_supported(
     topk_values,
     topk_indices,
     launch_with_pdl,
+    routing_replay_out=None,
 ):
     """Validate configuration parameters for DSv3 fused routing kernel.
 
@@ -38,6 +41,21 @@ def _check_dsv3_fused_routing_supported(
     Raises:
         ValueError: If configuration is invalid or exceeds kernel limits
     """
+    if routing_replay_out is not None:
+        num_tokens = scores.shape[0]
+        if routing_replay_out.dtype != torch.int16:
+            raise ValueError(
+                f"routing_replay_out must be int16, got {routing_replay_out.dtype}"
+            )
+        if (
+            routing_replay_out.shape[0] < num_tokens
+            or routing_replay_out.shape[1] != topk
+        ):
+            raise ValueError(
+                f"routing_replay_out shape[0] must be >= {num_tokens} and shape[1] must be {topk}, "
+                f"got {tuple(routing_replay_out.shape)}"
+            )
+
     # Extract number of experts from scores shape
     num_experts = scores.shape[1]
 
@@ -86,7 +104,7 @@ def get_dsv3_fused_routing_module():
 
     @register_custom_op(
         "flashinfer::NoAuxTc",
-        mutates_args=["topk_values", "topk_indices"],
+        mutates_args=["topk_values", "topk_indices", "routing_replay_out"],
     )
     def NoAuxTc(
         scores: torch.Tensor,
@@ -98,6 +116,7 @@ def get_dsv3_fused_routing_module():
         topk_values: torch.Tensor,
         topk_indices: torch.Tensor,
         launch_with_pdl: bool = True,
+        routing_replay_out: Optional[torch.Tensor] = None,
     ) -> None:
         module.NoAuxTc(
             scores,
@@ -109,6 +128,7 @@ def get_dsv3_fused_routing_module():
             topk_values,
             topk_indices,
             launch_with_pdl,
+            routing_replay_out,
         )
 
     return SimpleNamespace(
@@ -128,6 +148,7 @@ def fused_topk_deepseek(
     topk_values: torch.Tensor,
     topk_indices: torch.Tensor,
     launch_with_pdl: bool = True,
+    routing_replay_out: Optional[torch.Tensor] = None,
 ) -> None:
     """Fused expert routing with top-k selection for DeepSeek-V3.
 
@@ -168,6 +189,10 @@ def fused_topk_deepseek(
             This tensor is mutated in-place.
         launch_with_pdl (bool, optional): Whether to launch the kernel using Persistent
             Device-side Launch. Defaults to True.
+        routing_replay_out (torch.Tensor, optional): Pre-allocated output tensor of shape
+            (num_tokens, topk) with dtype int16 for recording the selected expert IDs per
+            token. If None, no routing replay recording occurs (zero overhead). This tensor
+            is mutated in-place.
 
     Returns:
         None: Results are written directly to `topk_values` and `topk_indices` tensors.
@@ -193,4 +218,5 @@ def fused_topk_deepseek(
         topk_values,
         topk_indices,
         launch_with_pdl,
+        routing_replay_out,
     )

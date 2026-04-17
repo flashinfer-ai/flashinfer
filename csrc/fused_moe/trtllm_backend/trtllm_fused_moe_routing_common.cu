@@ -20,6 +20,7 @@ namespace moe::dev::routing {
 namespace routingCustom {
 // Forward declarations of launch functions
 void launchBlockKernel(Data const& data, uint32_t numThreadsHist, void* stream);
+void launchDynBlockKernel(Data const& data, uint32_t numThreadsHist, void* stream);
 void launchClusterKernel(Data const& data, void* stream);
 void launchCoopKernel(Data const& data, int numBlocksCoop, uint32_t numThreadsHist, void* stream);
 void launchInitExpertCounts(Data const& data, uint32_t numThreadsHist, void* stream);
@@ -36,7 +37,7 @@ void launchOffsetsKernel(Data const& data, int numBlocksOffsets, uint32_t numThr
 // routing-method-specific logic, so all methods can use the same workflow.
 // This function handles all path selection: single-block, single-cluster, coop, multi-kernel.
 template <typename DataType>
-void runPostTopKPipeline(DataType const& data, uint32_t /*numThreadsHist*/, void* stream) {
+void runPostTopKPipeline(DataType const& data, void* stream) {
   // Convert to routingCustom::Data for launching (kernels are shared)
   routingCustom::Data customData;
   // Copy base fields
@@ -62,24 +63,31 @@ void runPostTopKPipeline(DataType const& data, uint32_t /*numThreadsHist*/, void
 
   // Determine which path to use based on token count
   static int const smMajor = tensorrt_llm::common::getSMVersion() / 10;
-  bool const useSingleBlock = data.mNumTokens <= routingCustom::BlockKernelMaxNumTokens;
-  // Use the larger threshold (MaxNumTokensSingleCluster) since runPostTopKPipeline
-  // processes pre-computed topK data (mPtrTopKPacked/mPtrTopKIds), not raw scores.
+  bool const useStaticBlock = data.mNumTokens <= routingCustom::BlockKernelMaxNumTokens;
+  // Use the dispatched tier size (not raw mNumExperts).
+  // Example: 512 experts with topK=22 skips Tier<512,8> and lands on
+  // Tier<1024,32>, so queryDispatchedMaxExperts() returns 1024 while
+  // mNumExperts is 512.  The dynblock kernel sizes smem proportional to
+  // maxExperts; using the raw count would exceed the smem budget.
+  // Use customData (routingCustom::Data) since queryDispatchedMaxExperts
+  // requires routingCustom::Data, not the template DataType.
+  int32_t const dispatchedMaxExperts = routingCustom::queryDispatchedMaxExperts(customData);
+  bool const useDynBlock = !useStaticBlock &&
+                           data.mNumTokens <= routingCustom::DynBlockKernelMaxNumTokens &&
+                           dispatchedMaxExperts <= routingCustom::DynBlockKernelMaxNumExperts;
+  // runPostTopKPipeline only handles pre-computed topK (mPtrTopKIds or mPtrTopKPacked),
+  // never raw scores. The cluster kernel's routingPermutation uses thread-per-expanded-index
+  // for both input types (LoadExpertIdxFromGlobal=true), so the capacity is
+  // NumBlocksPerCluster * NumThreads = 8192 tokens.
   bool const useSingleCluster =
       (smMajor >= 9) && (data.mNumTokens <= routingCustom::MaxNumTokensSingleCluster);
 
-  // PDL overlap control: the LAST routing kernel must disable overlap so the consumer
-  // GEMM (which may lack cudaGridDependencySynchronize) can't start early.
-  // Use a separate copy for the last kernel to avoid mutating customData.
-  routingCustom::Data lastKernelData = customData;
-  lastKernelData.mPdlOverlapWithNext = false;
-
-  if (useSingleBlock) {
-    // Single-block path: fuses all steps (histogram, offsets, permutation)
-    routingCustom::launchBlockKernel(lastKernelData, numThreadsHist, stream);
+  if (useDynBlock) {
+    routingCustom::launchDynBlockKernel(customData, numThreadsHist, stream);
+  } else if (useStaticBlock) {
+    routingCustom::launchBlockKernel(customData, numThreadsHist, stream);
   } else if (useSingleCluster) {
-    // Single-cluster path: uses distributed shared memory
-    routingCustom::launchClusterKernel(lastKernelData, stream);
+    routingCustom::launchClusterKernel(customData, stream);
   } else {
     // Check if we can use the coop path (more efficient for medium token counts)
     // Requires SM90+ (grid-sync), numExperts <= 1024.
@@ -108,7 +116,7 @@ void runPostTopKPipeline(DataType const& data, uint32_t /*numThreadsHist*/, void
       // Coop path: cooperative launch fuses histogram + offsets (more efficient).
       // The coop kernel atomicAdds to mPtrExpertCounts, so we must zero it first.
       routingCustom::launchInitExpertCounts(customData, numThreadsHist, stream);
-      routingCustom::launchCoopKernel(lastKernelData, numBlocksCoop, numThreadsHist, stream);
+      routingCustom::launchCoopKernel(customData, numBlocksCoop, numThreadsHist, stream);
     } else {
       // Large-token path: multi-kernel pipeline
       FLASHINFER_CHECK(data.mPtrExpertCounts != nullptr,
@@ -129,16 +137,15 @@ void runPostTopKPipeline(DataType const& data, uint32_t /*numThreadsHist*/, void
           std::min((expandedIdxSize + offsetEltsPerBlock - 1) / offsetEltsPerBlock, maxNumBlocks);
 
       routingCustom::launchHistogramKernel(customData, numBlocksHistogram, numThreadsHist, stream);
-      routingCustom::launchOffsetsKernel(lastKernelData, numBlocksOffsets, numThreadsHist, stream);
+      routingCustom::launchOffsetsKernel(customData, numBlocksOffsets, numThreadsHist, stream);
     }
   }
 }
 
 // Explicit instantiations for the three routing method Data types
-template void runPostTopKPipeline<routingCustom::Data>(routingCustom::Data const&, uint32_t, void*);
-template void runPostTopKPipeline<routingDeepSeek::Data>(routingDeepSeek::Data const&, uint32_t,
-                                                         void*);
-template void runPostTopKPipeline<routingLlama4::Data>(routingLlama4::Data const&, uint32_t, void*);
+template void runPostTopKPipeline<routingCustom::Data>(routingCustom::Data const&, void*);
+template void runPostTopKPipeline<routingDeepSeek::Data>(routingDeepSeek::Data const&, void*);
+template void runPostTopKPipeline<routingLlama4::Data>(routingLlama4::Data const&, void*);
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

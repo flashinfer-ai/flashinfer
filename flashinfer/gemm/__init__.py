@@ -57,6 +57,18 @@ try:
 except ImportError:
     pass
 
+try:
+    from flashinfer.cute_dsl.utils import is_cute_dsl_available
+
+    if is_cute_dsl_available():
+        from .kernels.dense_blockscaled_gemm_sm120 import (
+            Sm120BlockScaledDenseGemmKernel as Sm120BlockScaledDenseGemmKernel,
+        )
+
+        _cute_dsl_kernels.append("Sm120BlockScaledDenseGemmKernel")
+except ImportError:
+    pass
+
 __all__ = [
     "SegmentGEMMWrapper",
     "bmm_bf16",
