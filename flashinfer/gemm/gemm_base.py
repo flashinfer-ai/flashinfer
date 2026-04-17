@@ -4538,7 +4538,7 @@ def _cute_dsl_gemm_fp4_requirement(
     return True
 
 
-@supported_compute_capability([120])
+@supported_compute_capability([120, 121])
 def _b12x_gemm_fp4_requirement(
     a: torch.Tensor,  # unused
     b: torch.Tensor,  # unused
@@ -5064,7 +5064,7 @@ def _heuristic_func_mm_fp4(
     # Get compute capability to distinguish between SM100 (10.0) and SM103 (10.3)
     major, minor = get_compute_capability(a.device)
     is_sm103 = major == 10 and minor == 3
-    is_sm120 = major == 12 and minor == 0
+    is_sm120 = major == 12 and minor in (0, 1)
 
     # SM120 + CUDA 13: prefer b12x (warp-level MMA, underfill tile selection)
     if is_sm120 and use_nvfp4 and cuda_major >= 13:
