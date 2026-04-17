@@ -123,6 +123,14 @@ def get_max_active_clusters(cluster_size: int) -> int:
     Returns:
         Maximum number of active clusters supported by hardware.
     """
+    # For the default single-cluster launch, occupancy is bounded only by the
+    # SM count. Skipping the CUTLASS hardware-info probe here avoids
+    # INVALID_HANDLE failures observed on some driver/runtime combinations
+    # (e.g. DGX Spark) where the probe is flaky but sm_count is all we need.
+    if cluster_size == 1:
+        return torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
     return get_hardware_info().get_max_active_clusters(cluster_size)
 
 

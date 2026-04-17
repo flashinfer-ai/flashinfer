@@ -11,6 +11,7 @@ from .moe_dispatch import (
     launch_sm120_static_moe,
     launch_sm120_dynamic_moe,
     launch_sm120_moe,
+    sm120_moe_dispatch_context,
     _get_weight_views,
 )
 
@@ -25,4 +26,5 @@ __all__ = [
     "launch_sm120_static_moe",
     "launch_sm120_dynamic_moe",
     "launch_sm120_moe",
+    "sm120_moe_dispatch_context",
 ]

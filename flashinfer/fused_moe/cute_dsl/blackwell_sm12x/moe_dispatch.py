@@ -8,6 +8,7 @@ selection.
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Dict, Tuple, Union
 
@@ -46,6 +47,7 @@ _MICRO_MAC_LADDER: Tuple[Tuple[int, int], ...] = (
     (10, 84),
     (16, 63),
     (20, 84),
+    (24, 56),
 )
 _STATIC_MAC_LADDER: Tuple[Tuple[int, int], ...] = (
     (24, 148),
@@ -64,6 +66,22 @@ _STATIC_MAC_LADDER: Tuple[Tuple[int, int], ...] = (
     (512, 175),
     (640, 188),
 )
+
+
+_CURRENT_DISPATCH_STAGE: str | None = None
+
+
+@contextmanager
+def sm120_moe_dispatch_context(stage: str | None):
+    """Tag the current dispatch stage (e.g. 'prefill'/'decode') for downstream
+    consumers that want to branch on the caller's scheduling context."""
+    global _CURRENT_DISPATCH_STAGE
+    previous_stage = _CURRENT_DISPATCH_STAGE
+    _CURRENT_DISPATCH_STAGE = stage
+    try:
+        yield
+    finally:
+        _CURRENT_DISPATCH_STAGE = previous_stage
 
 
 def _lookup_mac_ladder(

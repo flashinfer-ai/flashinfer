@@ -1047,7 +1047,11 @@ class MoEMicroKernel:
             row = Int32(0)
             if all_rows_unique > Int32(0):
                 local_expert_id = pair_idx
-                expert_id = topk_ids[local_expert_id].to(Int32)
+                # Read the global expert id from the compact routing map, not
+                # from topk_ids directly: the m==1 dispatch fast path still
+                # populates weight_expert_ids on the host, and skipping that
+                # indirection produced silently-wrong outputs at bs=1.
+                expert_id = weight_expert_ids[local_expert_id].to(Int32)
             else:
                 if is_cta_leader > Int32(0):
                     local_expert_id = topk_ids[pair_idx].to(Int32)
@@ -1408,7 +1412,6 @@ class MoEMicroKernel:
                 weight_expert_idx = weight_expert_ids[local_expert_idx]
                 valid_rows = row_counts[local_expert_idx]
                 if all_rows_unique > Int32(0):
-                    weight_expert_idx = topk_ids[local_expert_idx].to(Int32)
                     valid_rows = Int32(1)
                 alpha_value = alpha[weight_expert_idx].to(cutlass.Float32)
                 tile_m_base = tile_coord[0] * Int32(self.tile_shape_mnk[0])
@@ -1438,18 +1441,18 @@ class MoEMicroKernel:
                         cute.slice_(self.tile_shape_mnk, (None, 0, None)),
                         (sfa_tile_offset, 0, None),
                     )
-                    csSFA_tile = thr_ld_SFA.partition_S(sSFA_tile)
+                    csSFA_tile_copy_view = thr_ld_SFA.partition_S(sSFA_tile)
                     tCrSFA_tile = self._dense_cls._partition_fragment_SFA(
                         self,  # type: ignore[arg-type]
                         sSFA_tile[None, None, 0],
                         thr_mma,
                         tidx,
                     )
-                    crSFA_tile = thr_ld_SFA.retile(tCrSFA_tile)
+                    crSFA_tile_copy_view = thr_ld_SFA.retile(tCrSFA_tile)
                 else:
-                    csSFA_tile = csSFA_full
+                    csSFA_tile_copy_view = csSFA_full
                     tCrSFA_tile = tCrSFA_full
-                    crSFA_tile = crSFA_full
+                    crSFA_tile_copy_view = crSFA_full
                 sfb_tile_offset = intermediate_slice % self.sfb_tiles_per_block
                 if cutlass.const_expr(self.sfb_tiles_per_block > 1):
                     sSFB_tile = cute.local_tile(
@@ -1462,7 +1465,7 @@ class MoEMicroKernel:
                         cute.slice_(self.tile_shape_mnk, (0, None, None)),
                         (sfb_tile_offset, 0, None),
                     )
-                    csSFB_tile = thr_ld_SFB.partition_S(sSFB_tile)
+                    csSFB_tile_copy_view = thr_ld_SFB.partition_S(sSFB_tile)
                     csSFB_up_tile = thr_ld_SFB.partition_S(sSFB_up_tile)
                     tCrSFB_tile = self._dense_cls._partition_fragment_SFB(
                         self,  # type: ignore[arg-type]
@@ -1470,12 +1473,12 @@ class MoEMicroKernel:
                         thr_mma,
                         tidx,
                     )
-                    crSFB_tile = thr_ld_SFB.retile(tCrSFB_tile)
+                    crSFB_tile_copy_view = thr_ld_SFB.retile(tCrSFB_tile)
                 else:
-                    csSFB_tile = csSFB_full
+                    csSFB_tile_copy_view = csSFB_full
                     csSFB_up_tile = csSFB_up_full
                     tCrSFB_tile = tCrSFB_full
-                    crSFB_tile = crSFB_full
+                    crSFB_tile_copy_view = crSFB_full
                 valid_tile_rows = valid_rows - tile_m_base
                 if valid_tile_rows > Int32(self.tile_shape_mnk[0]):
                     valid_tile_rows = Int32(self.tile_shape_mnk[0])
@@ -1549,16 +1552,16 @@ class MoEMicroKernel:
                 # ============================================================
 
                 # Gate GEMM (inlined to avoid @cute.jit pass-by-value for acc)
-                fz_crSFA = cute.filter_zeros(crSFA_tile)
-                fz_crSFB = cute.filter_zeros(crSFB_tile)
+                fz_crSFA = cute.filter_zeros(crSFA_tile_copy_view)
+                fz_crSFB = cute.filter_zeros(crSFB_tile_copy_view)
                 gate_acc.fill(0.0)
                 cons_state.reset_count()
                 peek = ml_pipeline.consumer_try_wait(cons_state)
                 ml_pipeline.consumer_wait(cons_state, peek)
                 csA_p = csA_tile[None, None, None, cons_state.index]
                 csB_p = csB[None, None, None, cons_state.index]
-                csSFA_p = csSFA_tile[None, None, None, cons_state.index]
-                csSFB_p = csSFB_tile[None, None, None, cons_state.index]
+                csSFA_p = csSFA_tile_copy_view[None, None, None, cons_state.index]
+                csSFB_p = csSFB_tile_copy_view[None, None, None, cons_state.index]
                 cute.copy(smem_copy_A, csA_p[None, None, 0], crA_tile[None, None, 0])
                 cute.copy(smem_copy_B, csB_p[None, None, 0], crB[None, None, 0])
                 fz_csSFA_p = cute.filter_zeros(csSFA_p)
@@ -1580,8 +1583,8 @@ class MoEMicroKernel:
                             peek = ml_pipeline.consumer_try_wait(cons_state)
                             csA_p = csA_tile[None, None, None, cons_state.index]
                             csB_p = csB[None, None, None, cons_state.index]
-                            csSFA_p = csSFA_tile[None, None, None, cons_state.index]
-                            csSFB_p = csSFB_tile[None, None, None, cons_state.index]
+                            csSFA_p = csSFA_tile_copy_view[None, None, None, cons_state.index]
+                            csSFB_p = csSFB_tile_copy_view[None, None, None, cons_state.index]
                             fz_csSFA_p = cute.filter_zeros(csSFA_p)
                             fz_csSFB_p = cute.filter_zeros(csSFB_p)
                             ml_pipeline.consumer_wait(cons_state, peek)
@@ -1613,10 +1616,10 @@ class MoEMicroKernel:
                             crB[None, None, k_next],
                         )
                         fz_csSFA_cur = cute.filter_zeros(
-                            csSFA_tile[None, None, None, cons_state.index]
+                            csSFA_tile_copy_view[None, None, None, cons_state.index]
                         )
                         fz_csSFB_cur = cute.filter_zeros(
-                            csSFB_tile[None, None, None, cons_state.index]
+                            csSFB_tile_copy_view[None, None, None, cons_state.index]
                         )
                         cute.copy(
                             smem_copy_SFA,
@@ -1683,7 +1686,7 @@ class MoEMicroKernel:
                     up_pipeline.consumer_wait(up_cons_state, peek)
                     csA_p = csA_tile[None, None, None, up_cons_state.index]
                     csB_p = csB_up[None, None, None, up_cons_state.index]
-                    csSFA_p = csSFA_tile[None, None, None, up_cons_state.index]
+                    csSFA_p = csSFA_tile_copy_view[None, None, None, up_cons_state.index]
                     csSFB_p = csSFB_up_tile[None, None, None, up_cons_state.index]
                     cute.copy(
                         smem_copy_A, csA_p[None, None, 0], crA_tile[None, None, 0]
@@ -1714,7 +1717,7 @@ class MoEMicroKernel:
                                 peek = up_pipeline.consumer_try_wait(up_cons_state)
                                 csA_p = csA_tile[None, None, None, up_cons_state.index]
                                 csB_p = csB_up[None, None, None, up_cons_state.index]
-                                csSFA_p = csSFA_tile[
+                                csSFA_p = csSFA_tile_copy_view[
                                     None, None, None, up_cons_state.index
                                 ]
                                 csSFB_p = csSFB_up_tile[
@@ -1949,14 +1952,14 @@ class MoEMicroKernel:
                 warp_n_base = (warp_in_tile & Int32(1)) * Int32(64)
 
                 csA_phase2 = csA_tile[None, None, None, 0]
-                csSFA_phase2 = csSFA_tile[None, None, None, 0]
+                csSFA_phase2 = csSFA_tile_copy_view[None, None, None, 0]
 
                 # Consume all output tiles continuously from phase2_pipeline.
 
                 # Hoist A-side register loads: sA is constant across all
                 # FC2 output tiles (quantized intermediate). Load crA and
                 # crSFA for all k-blocks once, reuse for all 32 tiles.
-                fz_crSFA_p2 = cute.filter_zeros(crSFA_tile)
+                fz_crSFA_p2 = cute.filter_zeros(crSFA_tile_copy_view)
                 cute.copy(
                     smem_copy_A, csA_phase2[None, None, 0], crA_tile[None, None, 0]
                 )
