@@ -371,6 +371,16 @@ rm -rf ~/.cache/flashinfer/
   python -m pytest tests/mamba/test_selective_state_update_stp.py -v
   ```
 
+### Session 4 (2026-04-17) — Gemini review: hoist base pointers out of token loop
+
+- [x] Applied Gemini code review suggestion on `apply_xab_fast_forward`:
+  hoisted the three base pointers (`xab_x_ptr`, `xab_dt_ptr`, `xab_B_ptr`) out
+  of the `t` loop. The batch/head/dim/group/dstate offsets are loop-invariant —
+  previously recomputed on every iteration. Inner loop now only multiplies by
+  `t * stride_token` per tensor.
+- Commit: `3d347a81` on `danielafrimi/flashinfer:checkpointing`
+- No test run yet on cluster (kernel-only change, logic unchanged)
+
 ---
 
 ## References
