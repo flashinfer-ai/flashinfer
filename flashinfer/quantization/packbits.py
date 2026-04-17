@@ -210,8 +210,20 @@ def int4_dequantize(
     unpacked[..., 1::2] = x.data >> 4
     unpacked = unpacked[..., :hidden_dim]
 
-    q = unpacked.to(torch.int16) - 8
     num_groups = math.ceil(hidden_dim / x.group_size)
+    padded_hidden_dim = num_groups * x.group_size
+    if padded_hidden_dim != hidden_dim:
+        pad = torch.full(
+            (*unpacked.shape[:-1], padded_hidden_dim - hidden_dim),
+            8,
+            dtype=torch.uint8,
+            device=x.data.device,
+        )
+        unpacked = torch.cat([unpacked, pad], dim=-1)
+
+    q = unpacked.to(torch.int16) - 8
     q = q.reshape(*x.original_shape[:-1], num_groups, x.group_size).to(dtype)
     scale = x.scale.to(dtype).unsqueeze(-1)
-    return (q * scale).reshape(x.original_shape)
+    return (q * scale).reshape(*x.original_shape[:-1], padded_hidden_dim)[
+        ..., :hidden_dim
+    ]

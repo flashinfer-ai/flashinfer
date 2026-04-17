@@ -1723,6 +1723,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._mask_indptr_buf = mask_indptr_buf
         self._max_total_num_rows: Optional[int] = None
         self._backend = backend
+        self._planned_backend = backend
         self._plan_info = None
         self._cached_module = None
         self._seq_lens_kv = None
@@ -1922,15 +1923,16 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if kv_data_type is None:
             kv_data_type = q_data_type
         self._int4_kv_enabled = is_int4_dtype(kv_data_type)
+        backend = self._backend
         effective_kv_data_type = (
             torch.float16
             if self._int4_kv_enabled
             else canonicalize_torch_dtype(kv_data_type)
         )
         if self._int4_kv_enabled:
-            if self._backend == "auto":
-                self._backend = "fa2"
-            elif self._backend != "fa2":
+            if backend == "auto":
+                backend = "fa2"
+            elif backend != "fa2":
                 raise NotImplementedError(
                     "INT4 paged KV cache only supports the fa2/common prefill path."
                 )
@@ -2082,8 +2084,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if self._jit_module is not None:
             self._cached_module = self._jit_module
         else:
-            if self._backend == "auto":
-                self._backend = determine_attention_backend(
+            if backend == "auto":
+                backend = determine_attention_backend(
                     self.device,
                     PosEncodingMode[pos_encoding_mode].value,
                     use_fp16_qk_reduction,
@@ -2091,7 +2093,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     q_data_type,
                     effective_kv_data_type,
                 )
-            if self._backend != "cudnn":
+            if backend != "cudnn":
                 get_module_args = (
                     q_data_type,
                     effective_kv_data_type,
@@ -2106,11 +2108,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 )
 
                 self._cached_module = get_batch_prefill_module(
-                    self._backend, *get_module_args
+                    backend, *get_module_args
                 )
 
         self._block_tables = block_tables
-        if self._backend == "trtllm-gen":
+        if backend == "trtllm-gen":
             if not causal:
                 raise NotImplementedError(
                     "Non-causal attention is not supported for trtllm-gen backend with paged KV cache. "
@@ -2158,7 +2160,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 causal,
                 window_left,
             ]
-            if self._backend == "fa2":
+            if backend == "fa2":
                 args.append(fixed_split_size or -1)  # fixed_split_size
                 args.append(disable_split_kv)  # disable_split_kv
                 args.append(0)  # num_colocated_ctas
@@ -2166,6 +2168,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 *args,
             )
 
+        self._planned_backend = backend
         self._causal = causal
         self._pos_encoding_mode = pos_encoding_mode
         self._use_fp16_qk_reduction = use_fp16_qk_reduction
@@ -2336,8 +2339,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
         )
+        backend = self._planned_backend
         # Validate q shape matches qo_indptr (using value cached in plan() to avoid GPU sync)
-        if self._backend == "cudnn":
+        if backend == "cudnn":
             if q.numel() != self._qo_indptr_last:
                 raise ValueError(
                     f"q.numel() ({q.numel()}) does not match qo_indptr[-1] ({self._qo_indptr_last}). "
@@ -2380,7 +2384,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         else:
             page_size = k_cache.shape[2]
         window_left = self._window_left if window_left is None else window_left
-        if self._backend != "trtllm-gen":
+        if backend != "trtllm-gen":
             # NOTE(Siyuan): since window_left is appeared in the plan function, we need to make sure it is the same as the one in the plan function.
             # Remove this check if the backend supports dynamic window_left.
             assert window_left == self._window_left
@@ -2392,7 +2396,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             logits_soft_cap = 0.0
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(q.size(-1))
-        if self._backend != "cudnn":
+        if backend != "cudnn":
             if q_scale is not None:
                 sm_scale *= q_scale
             if k_scale is not None:
@@ -2427,7 +2431,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             )
 
         # Convert NHD layout to HND for trtllm-gen backend
-        if self._backend == "trtllm-gen" and self._kv_layout == "NHD":
+        if backend == "trtllm-gen" and self._kv_layout == "NHD":
             k_cache = k_cache.transpose(-3, -2)
             v_cache = v_cache.transpose(-3, -2)
             if key_block_scales is not None:
@@ -2452,7 +2456,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if self._prefix_len_ptr is not None:
             mask_mode = MaskMode.MULTIITEMSCORING.value
 
-        if self._backend == "cudnn":
+        if backend == "cudnn":
             if self._seq_lens_q is not None and self._seq_lens_q.dim() == 1:
                 self._seq_lens_q = self._seq_lens_q.reshape(self._batch_size, 1, 1, 1)
 
@@ -2482,7 +2486,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 o_data_type=out_dtype,
             )
         else:
-            if self._backend != "trtllm-gen":
+            if backend != "trtllm-gen":
                 assert self._plan_info is not None, "plan info is not initialized"
             run_args = [
                 self._float_workspace_buffer,

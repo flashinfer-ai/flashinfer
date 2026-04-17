@@ -156,6 +156,15 @@ def _append_paged_kv_cache_int4(
         raise ValueError(
             "The append value group count does not match the paged int4 cache."
         )
+    cache_num_heads = k_data.shape[2] if kv_layout == "NHD" else k_data.shape[1]
+    if packed_key.data.shape[1] != cache_num_heads:
+        raise ValueError(
+            "The append key head count does not match the paged int4 cache."
+        )
+    if packed_value.data.shape[1] != cache_num_heads:
+        raise ValueError(
+            "The append value head count does not match the paged int4 cache."
+        )
 
     page_size = k_data.shape[1] if kv_layout == "NHD" else k_data.shape[2]
     batch_indices = batch_indices.to(torch.int64)

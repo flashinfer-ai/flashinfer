@@ -19,6 +19,19 @@ import torch
 
 import flashinfer
 from flashinfer import prefill as flashinfer_prefill
+from flashinfer import utils as flashinfer_utils
+
+
+def _require_sm80_or_newer() -> None:
+    major, _ = flashinfer_utils.get_compute_capability(torch.device("cuda"))
+    if major < 8:
+        pytest.skip("int4 paged-kv coverage requires sm80 or newer")
+
+
+@pytest.fixture(autouse=True, scope="module")
+def require_sm80_or_newer():
+    _require_sm80_or_newer()
+    yield
 
 
 def _allocate_int4_tensor(shape, device="cuda:0"):
@@ -168,6 +181,41 @@ def test_append_paged_kv_cache_int4_matches_quantized_layout(
         rtol=1e-3,
         atol=1e-3,
     )
+
+
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+@pytest.mark.parametrize("combined", [False, True])
+def test_append_paged_kv_cache_int4_rejects_mismatched_head_count(kv_layout, combined):
+    head_dim = 128
+    page_size = 4
+    paged_kv_cache = _make_paged_int4_cache(
+        1,
+        page_size,
+        num_kv_heads=2,
+        head_dim=head_dim,
+        kv_layout=kv_layout,
+        combined=combined,
+    )
+    k_append = torch.randn(4, 1, head_dim, dtype=torch.float16, device="cuda:0")
+    v_append = torch.randn(4, 1, head_dim, dtype=torch.float16, device="cuda:0")
+    batch_indices = torch.zeros(4, dtype=torch.int32, device="cuda:0")
+    positions = torch.arange(4, dtype=torch.int32, device="cuda:0")
+    kv_indices = torch.tensor([0], dtype=torch.int32, device="cuda:0")
+    kv_indptr = torch.tensor([0, 1], dtype=torch.int32, device="cuda:0")
+    kv_last_page_len = torch.tensor([4], dtype=torch.int32, device="cuda:0")
+
+    with pytest.raises(ValueError, match="head count does not match"):
+        flashinfer.append_paged_kv_cache(
+            k_append,
+            v_append,
+            batch_indices,
+            positions,
+            paged_kv_cache,
+            kv_indices,
+            kv_indptr,
+            kv_last_page_len,
+            kv_layout=kv_layout,
+        )
 
 
 @pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
@@ -673,7 +721,8 @@ def test_batch_wrappers_int4_auto_force_fa2():
         q_data_type=torch.float16,
         kv_data_type="int4",
     )
-    assert prefill_wrapper._backend == "fa2"
+    assert prefill_wrapper._backend == "auto"
+    assert prefill_wrapper._planned_backend == "fa2"
 
 
 def test_int4_paged_kv_cache_cuda_graph_unsupported():
