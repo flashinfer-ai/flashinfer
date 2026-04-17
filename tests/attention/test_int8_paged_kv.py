@@ -27,7 +27,7 @@ from tests.test_helpers.jit_utils import (
 
 
 def _require_sm80_or_newer() -> None:
-    major, _ = torch.cuda.get_device_capability(0)
+    major, _ = flashinfer_utils.get_compute_capability(torch.device("cuda"))
     if major < 8:
         pytest.skip("int8 paged-kv coverage requires sm80 or newer")
 
