@@ -53,10 +53,10 @@ pynvml.nvmlInit()
 def _dcp_alltoall_supported() -> bool:
     if not torch.cuda.is_available():
         return False
-    from flashinfer.utils import is_sm90a_supported, is_sm100a_supported
+    from flashinfer.utils import get_compute_capability
 
-    device = torch.device("cuda")
-    return is_sm90a_supported(device) or is_sm100a_supported(device)
+    major, _ = get_compute_capability(torch.device("cuda"))
+    return major in (9, 10, 11, 12)
 
 
 def _mpi4py_available() -> bool:
@@ -71,7 +71,7 @@ def _mpi4py_available() -> bool:
 pytestmark = [
     pytest.mark.skipif(
         not _dcp_alltoall_supported(),
-        reason="Requires SM90 (Hopper) or SM100 (Blackwell) GPU",
+        reason="Requires SM90+ GPU (Hopper or Blackwell family)",
     ),
     pytest.mark.skipif(
         not mnnvl_available(),

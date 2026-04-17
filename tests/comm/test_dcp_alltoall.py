@@ -39,17 +39,17 @@ def _dcp_alltoall_supported() -> bool:
     try:
         if not torch.cuda.is_available():
             return False
-        from flashinfer.utils import is_sm90a_supported, is_sm100a_supported
-
-        device = torch.device("cuda")
-        return is_sm90a_supported(device) or is_sm100a_supported(device)
+        major, _ = torch.cuda.get_device_capability(0)
+        # DCP A2A requires TMA + mbarrier + PDL (SM90 baseline); the kernel
+        # builds for SM90 / SM10x / SM11x / SM12x.
+        return major in (9, 10, 11, 12)
     except Exception:
         return False
 
 
 pytestmark = pytest.mark.skipif(
     not _dcp_alltoall_supported(),
-    reason="Requires SM90 (Hopper) or SM100 (Blackwell) GPU",
+    reason="Requires SM90+ GPU (Hopper or Blackwell family)",
 )
 
 

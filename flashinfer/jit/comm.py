@@ -92,7 +92,7 @@ def gen_moe_alltoall_module() -> JitSpec:
 
 def gen_dcp_alltoall_module() -> JitSpec:
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[9, 10]
+        supported_major_versions=[9, 10, 11, 12]
     )
     return gen_jit_spec(
         "dcp_alltoall",
