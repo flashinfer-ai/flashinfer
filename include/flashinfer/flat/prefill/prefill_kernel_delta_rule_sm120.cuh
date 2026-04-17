@@ -103,10 +103,6 @@ void launch_delta_rule_prefill_kernel_gbai(
     int32_t k_head_stride = head_size;
     int32_t v_head_stride = head_size;
 
-    if (state_checkpoints != nullptr) {
-      throw std::runtime_error("state checkpointing not supported");
-    }
-
     Operation op;
     Arguments arguments{.problem_size =
                             {
@@ -132,9 +128,9 @@ void launch_delta_rule_prefill_kernel_gbai(
                 .scale = scale,
                 .alpha_ptr = alpha, .alpha_stride = {num_sab_heads, 1},
                 .beta_ptr  = beta,  .beta_stride  = {num_sab_heads, 1},
-                // .ptr_state_checkpoints = state_checkpoints,
-                // .checkpoint_cu_starts = checkpoint_cu_starts,
-                // .checkpoint_every_n_tokens = checkpoint_every_n_tokens,
+                .ptr_state_checkpoints = state_checkpoints,
+                .checkpoint_cu_starts = checkpoint_cu_starts,
+                .checkpoint_every_n_tokens = checkpoint_every_n_tokens,
         },  // clang-format on
                         .hw_info = hw_info};
 
