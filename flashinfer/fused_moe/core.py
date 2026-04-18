@@ -1206,6 +1206,7 @@ def get_trtllm_moe_sm100_module():
                         [-1, -1] if tactic == -1 else tactic,
                         self.activation_type,
                         kwargs.get("norm_topk_prob", True),
+                        kwargs.get("routing_replay_out"),
                     )
             elif (
                 self.dtype_act == DtypeTrtllmGen.Bfloat16
@@ -1591,6 +1592,7 @@ def get_trtllm_moe_sm100_module():
             [-1, -1] if tactic == -1 else tactic,
             activation_type,
             norm_topk_prob,
+            routing_replay_out,
         )
         if do_finalize:
             return [output]
