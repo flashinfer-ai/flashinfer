@@ -3,6 +3,10 @@
 Covers the mixed-dtype MoE GEMM path where weights are 4-bit MXFP4
 and activations are 16-bit BF16 (Hopper SM90 path via cutlass_fused_moe).
 
+Correctness is verified by dequantizing MXFP4 weights to BF16 on host,
+computing reference MoE output in PyTorch, and comparing with kernel output
+(rtol=1e-1, atol=1e-1, matching test_trtllm_cutlass_fused_moe.py).
+
 Target configuration: experts=256, topk=6, hidden_size=4096, intermediate_size=2048
 """
 
@@ -14,75 +18,106 @@ from flashinfer.utils import is_sm90a_supported
 
 
 # ============================================================================
+# Reference implementations (reused from test_trtllm_cutlass_fused_moe.py)
+# ============================================================================
+
+
+def _dequant_mxfp4_batches_host(w_fp4, w_scale):
+    """Dequantize MXFP4 weights on CPU for reference computation."""
+    from flashinfer import mxfp4_dequantize_host
+
+    return torch.stack(
+        [
+            mxfp4_dequantize_host(w_fp4[b, :, :], w_scale[b, :, :])
+            for b in range(w_fp4.size(0))
+        ]
+    )
+
+
+def _compute_with_experts(
+    num_experts, x, w31_weight, w2_weight, selected_experts, routing_weights,
+    alpha=None, beta=None, limit=None,
+):
+    """Reference MoE output with dequantized weights."""
+    results = torch.zeros_like(x)
+    for expert_id in range(num_experts):
+        mask = selected_experts == expert_id
+        if not mask.sum():
+            continue
+        batch_idx, nth_expert = torch.where(mask)
+        w31_expert = w31_weight[expert_id]
+        w2_expert = w2_weight[expert_id]
+        w3_expert, w1_expert = torch.chunk(w31_expert, 2, dim=0)
+
+        expert_inputs = x[batch_idx]
+        if alpha is not None and limit is not None and beta is not None:
+            x1 = expert_inputs @ w1_expert.t()
+            x1 = x1.clamp_(min=None, max=limit)
+            x1_scaled = x1 * torch.sigmoid(alpha * x1)
+            x2 = expert_inputs @ w3_expert.t()
+            x2 = x2.clamp_(min=-limit, max=limit) + beta
+            inter = x1_scaled * x2
+        else:
+            inter = F.silu(expert_inputs @ w1_expert.t()) * (
+                expert_inputs @ w3_expert.t()
+            )
+        output = inter @ w2_expert.t()
+        results[batch_idx] += routing_weights[batch_idx, nth_expert, None] * output
+    return results.view_as(x)
+
+
+# ============================================================================
 # Test configurations
 # ============================================================================
 
-# Core config from task spec
-CORE_CONFIGS = [
-    # (batch_size, hidden_size, num_experts, top_k, intermediate_size)
-    (4, 4096, 256, 6, 2048),
-]
-
-# Sweep batch_size
-BATCH_CONFIGS = [
+# Coverage configs: (batch_size, hidden_size, num_experts, top_k, intermediate_size)
+COVERAGE_CONFIGS = [
+    # Batch sweep
     (1, 4096, 256, 6, 2048),
     (4, 4096, 256, 6, 2048),
     (16, 4096, 256, 6, 2048),
     (64, 4096, 256, 6, 2048),
     (128, 4096, 256, 6, 2048),
     (256, 4096, 256, 6, 2048),
-]
-
-# Sweep hidden_size / intermediate_size
-SHAPE_CONFIGS = [
+    # Shape sweep
     (16, 2048, 256, 6, 1024),
     (16, 4096, 256, 6, 2048),
     (16, 7168, 256, 6, 4096),
-]
-
-# Sweep num_experts
-EXPERT_CONFIGS = [
+    # Expert sweep
     (16, 4096, 8, 2, 2048),
     (16, 4096, 64, 4, 2048),
     (16, 4096, 256, 6, 2048),
-]
-
-# Sweep top_k
-TOPK_CONFIGS = [
+    # TopK sweep
     (16, 4096, 256, 2, 2048),
     (16, 4096, 256, 4, 2048),
     (16, 4096, 256, 6, 2048),
     (16, 4096, 256, 8, 2048),
+    # Edge cases
+    (1, 4096, 256, 1, 2048),
+    (8, 4096, 256, 6, 2048),
+    (32, 4096, 256, 6, 2048),
+    (512, 4096, 256, 6, 2048),
+    (16, 4096, 128, 6, 2048),
+    (16, 4096, 256, 6, 1024),
+    (16, 4096, 256, 6, 4096),
+    (4, 2048, 64, 4, 1024),
 ]
 
-# Activation types
 ACTIVATION_CONFIGS = [
-    (16, 4096, 256, 6, 2048, None, None, None),  # Swiglu default
-    (16, 4096, 256, 6, 2048, 0.5, 0.0, 7.0),  # with alpha/beta/limit
+    (16, 4096, 256, 6, 2048, None, None, None),
+    (16, 4096, 256, 6, 2048, 0.5, 0.0, 7.0),
     (16, 4096, 256, 6, 2048, 1.702, 1.0, 7.0),
 ]
 
-# Edge cases and additional coverage
-EDGE_CONFIGS = [
-    (1, 4096, 256, 1, 2048),  # single token, topk=1
-    (8, 4096, 256, 6, 2048),  # moderate batch
-    (32, 4096, 256, 6, 2048),  # larger batch
-    (512, 4096, 256, 6, 2048),  # large batch
-    (16, 4096, 128, 6, 2048),  # different expert count
-    (16, 4096, 256, 6, 1024),  # smaller intermediate
-    (16, 4096, 256, 6, 4096),  # larger intermediate
-    (4, 2048, 64, 4, 1024),  # small config
-]
-
-# Small configs for quick validation
 QUICK_CONFIGS = [
     (4, 256, 8, 2, 128),
     (4, 4096, 256, 6, 2048),
 ]
 
-ALL_CONFIGS = (
-    BATCH_CONFIGS + SHAPE_CONFIGS + EXPERT_CONFIGS + TOPK_CONFIGS + EDGE_CONFIGS
-)
+
+# ============================================================================
+# Core test runner
+# ============================================================================
 
 
 def _run_w4a16_moe(
@@ -95,7 +130,7 @@ def _run_w4a16_moe(
     beta=None,
     limit=None,
 ):
-    """Run W4A16 MoE and verify output sanity (finite values, correct shape)."""
+    """Run W4A16 MoE and verify correctness against dequantized reference."""
     import flashinfer.fused_moe as fused_moe
 
     torch.manual_seed(42)
@@ -113,13 +148,9 @@ def _run_w4a16_moe(
     w1 = torch.randint(0, 256, (e, 2 * n, k // 2), device=device, dtype=torch.uint8)
     w2 = torch.randint(0, 256, (e, k, n // 2), device=device, dtype=torch.uint8)
 
-    # MXFP4 scales (uint8, represents FP8 e8m0 scale per 32 elements)
-    w1_scale = torch.randint(
-        118, 123, (e, 2 * n, k // 32), device=device, dtype=torch.uint8
-    )
-    w2_scale = torch.randint(
-        118, 123, (e, k, n // 32), device=device, dtype=torch.uint8
-    )
+    # MXFP4 scales
+    w1_scale = torch.randint(118, 123, (e, 2 * n, k // 32), device=device, dtype=torch.uint8)
+    w2_scale = torch.randint(118, 123, (e, k, n // 32), device=device, dtype=torch.uint8)
 
     # Routing
     router_logits = torch.randn(m, e, dtype=torch.bfloat16, device=device)
@@ -139,9 +170,9 @@ def _run_w4a16_moe(
         alpha_t = limit_t = beta_t = None
 
     quant_scales = [w1_scale.view(torch.int32), w2_scale.view(torch.int32)]
-
     output = torch.zeros_like(x)
 
+    # Run kernel
     result = fused_moe.cutlass_fused_moe(
         x,
         selected_experts.to(torch.int),
@@ -156,15 +187,27 @@ def _run_w4a16_moe(
         use_w4_group_scaling=True,
         output=output,
     )
-    out = result[0] if isinstance(result, list) else result
+    flash_output = result[0] if isinstance(result, list) else result
 
-    # Basic sanity
-    assert torch.isfinite(out).all(), (
-        f"Non-finite output: NaN={torch.isnan(out).sum()}, Inf={torch.isinf(out).sum()}"
+    # Sanity checks
+    assert torch.isfinite(flash_output).all(), (
+        f"Non-finite output: NaN={torch.isnan(flash_output).sum()}, "
+        f"Inf={torch.isinf(flash_output).sum()}"
     )
-    assert out.shape == (m, k), f"Shape mismatch: {out.shape} vs ({m}, {k})"
+    assert flash_output.shape == (m, k), f"Shape mismatch: {flash_output.shape} vs ({m}, {k})"
 
-    return out
+    # Dequantize weights and compute reference
+    dq_w1 = _dequant_mxfp4_batches_host(w1.cpu(), w1_scale.cpu()).cuda().to(torch.bfloat16)
+    dq_w2 = _dequant_mxfp4_batches_host(w2.cpu(), w2_scale.cpu()).cuda().to(torch.bfloat16)
+
+    ref_output = _compute_with_experts(
+        e, x, dq_w1, dq_w2, selected_experts, routing_weights, alpha, beta, limit,
+    )
+
+    # Correctness check (same tolerance as test_trtllm_cutlass_fused_moe.py)
+    torch.testing.assert_close(ref_output, flash_output, rtol=1e-1, atol=1e-1)
+
+    return flash_output
 
 
 # ============================================================================
@@ -172,35 +215,31 @@ def _run_w4a16_moe(
 # ============================================================================
 
 
-@pytest.mark.skipif(not is_sm90a_supported(torch.device("cuda")), reason="W4A16 MoE requires SM90 (Hopper)")
+@pytest.mark.skipif(not is_sm90a_supported(torch.device("cuda")), reason="W4A16 MoE requires SM90")
 @pytest.mark.parametrize(
     "batch_size,hidden_size,num_experts,top_k,intermediate_size",
     QUICK_CONFIGS,
     ids=[f"m{c[0]}_h{c[1]}_e{c[2]}_k{c[3]}" for c in QUICK_CONFIGS],
 )
-def test_w4a16_moe_quick(
-    batch_size, hidden_size, num_experts, top_k, intermediate_size
-):
+def test_w4a16_moe_quick(batch_size, hidden_size, num_experts, top_k, intermediate_size):
     """Quick functional validation of W4A16 MoE."""
     _run_w4a16_moe(batch_size, hidden_size, num_experts, top_k, intermediate_size)
 
 
-@pytest.mark.skipif(not is_sm90a_supported(torch.device("cuda")), reason="W4A16 MoE requires SM90 (Hopper)")
+@pytest.mark.skipif(not is_sm90a_supported(torch.device("cuda")), reason="W4A16 MoE requires SM90")
 @pytest.mark.parametrize(
     "batch_size,hidden_size,num_experts,top_k,intermediate_size",
-    ALL_CONFIGS,
-    ids=[f"m{c[0]}_h{c[1]}_e{c[2]}_k{c[3]}_n{c[4]}" for c in ALL_CONFIGS],
+    COVERAGE_CONFIGS,
+    ids=[f"m{c[0]}_h{c[1]}_e{c[2]}_k{c[3]}_n{c[4]}" for c in COVERAGE_CONFIGS],
 )
-def test_w4a16_moe_coverage(
-    batch_size, hidden_size, num_experts, top_k, intermediate_size
-):
-    """Coverage test across batch/shape/expert/topk configurations."""
+def test_w4a16_moe_coverage(batch_size, hidden_size, num_experts, top_k, intermediate_size):
+    """Coverage test with correctness verification against dequantized reference."""
     if top_k > num_experts:
         pytest.skip(f"top_k ({top_k}) > num_experts ({num_experts})")
     _run_w4a16_moe(batch_size, hidden_size, num_experts, top_k, intermediate_size)
 
 
-@pytest.mark.skipif(not is_sm90a_supported(torch.device("cuda")), reason="W4A16 MoE requires SM90 (Hopper)")
+@pytest.mark.skipif(not is_sm90a_supported(torch.device("cuda")), reason="W4A16 MoE requires SM90")
 @pytest.mark.parametrize(
     "batch_size,hidden_size,num_experts,top_k,intermediate_size,alpha,beta,limit",
     ACTIVATION_CONFIGS,
@@ -210,25 +249,10 @@ def test_w4a16_moe_activations(
     batch_size, hidden_size, num_experts, top_k, intermediate_size, alpha, beta, limit
 ):
     """Test W4A16 MoE with different activation configurations."""
-    _run_w4a16_moe(
-        batch_size,
-        hidden_size,
-        num_experts,
-        top_k,
-        intermediate_size,
-        alpha,
-        beta,
-        limit,
-    )
+    _run_w4a16_moe(batch_size, hidden_size, num_experts, top_k, intermediate_size, alpha, beta, limit)
 
 
-@pytest.mark.skipif(not is_sm90a_supported(torch.device("cuda")), reason="W4A16 MoE requires SM90 (Hopper)")
+@pytest.mark.skipif(not is_sm90a_supported(torch.device("cuda")), reason="W4A16 MoE requires SM90")
 def test_w4a16_moe_core_config():
     """Test the primary target configuration: experts=256, topk=6, hidden=4096, inter=2048."""
-    _run_w4a16_moe(
-        batch_size=4,
-        hidden_size=4096,
-        num_experts=256,
-        top_k=6,
-        intermediate_size=2048,
-    )
+    _run_w4a16_moe(batch_size=4, hidden_size=4096, num_experts=256, top_k=6, intermediate_size=2048)
