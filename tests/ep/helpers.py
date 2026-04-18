@@ -15,6 +15,18 @@ import flashinfer.ep as fep
 BACKENDS = [fep.Backend.DEEP_EP, fep.Backend.NCCL_EP]
 LAYOUTS = [fep.OutputLayout.FLAT_2D, fep.OutputLayout.EXPERT_MAJOR_3D]
 
+# NIXL-EP is optional — only include if libnixl is available
+try:
+    from flashinfer.ep._backends.nixl_ep import NixlEPBackendWrapper
+    _NIXL_AVAILABLE = NixlEPBackendWrapper.is_available()
+except ImportError:
+    _NIXL_AVAILABLE = False
+
+BACKENDS_WITH_NIXL = BACKENDS + ([fep.Backend.NIXL_EP] if _NIXL_AVAILABLE else [])
+
+# LL-only backends (for tests that specifically test low-latency mode)
+LL_BACKENDS = BACKENDS_WITH_NIXL
+
 
 # ─── Synthetic data generation ──────────────────────────────────────
 
@@ -92,3 +104,20 @@ def skip_if_not_enough_gpus(required):
     available = torch.cuda.device_count()
     if available < required:
         pytest.skip(f"Need {required} GPUs, have {available}")
+
+
+def skip_if_no_nixl():
+    """Skip test if NIXL library is not available."""
+    if not _NIXL_AVAILABLE:
+        pytest.skip("NIXL library (libnixl) not available")
+
+
+def is_nixl_backend(backend):
+    """Check if a backend is NIXL-EP."""
+    return backend == fep.Backend.NIXL_EP
+
+
+def skip_ht_for_nixl(backend):
+    """Skip HT-mode tests for NIXL-EP (which is LL-only)."""
+    if is_nixl_backend(backend):
+        pytest.skip("NIXL-EP is LL-only — skipping HT mode test")

@@ -10,6 +10,7 @@ class Backend(Enum):
     """Supported EP backends."""
     DEEP_EP = "deepep"
     NCCL_EP = "nccl_ep"
+    NIXL_EP = "nixl_ep"
 
 
 class OutputLayout(Enum):

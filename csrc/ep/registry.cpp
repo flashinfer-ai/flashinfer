@@ -17,6 +17,10 @@ static void register_builtin_backends() {
         std::make_unique<DeepEPBackend>();
     g_backends[static_cast<int>(Backend::kNcclEP)] =
         std::make_unique<NcclEPBackend>();
+    // Issue #61: NIXL-EP backend — registered unconditionally but
+    // init() will fail gracefully if libnixl is not available.
+    g_backends[static_cast<int>(Backend::kNixlEP)] =
+        std::make_unique<NixlEPBackend>();
 }
 
 // Issue #36: register_backend() can be called from multiple threads

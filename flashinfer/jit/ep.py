@@ -145,3 +145,59 @@ def gen_ep_nccl_module() -> JitSpec:
         ],
         extra_include_paths=extra_includes if extra_includes else None,
     )
+
+
+def _find_nixl():
+    """Find NIXL include and lib paths.
+
+    Searches (in order):
+      1. NIXL_HOME / NIXL_DIR environment variable
+      2. System paths (/usr/include, /usr/local/include)
+    """
+    for env_key in ("NIXL_HOME", "NIXL_DIR"):
+        nixl_home = os.environ.get(env_key, "")
+        if nixl_home:
+            inc = os.path.join(nixl_home, "include")
+            lib = os.path.join(nixl_home, "lib")
+            if os.path.isfile(os.path.join(inc, "nixl.h")):
+                return inc, lib
+
+    # System paths
+    for inc in ("/usr/include", "/usr/local/include",
+                "/usr/include/nixl", "/usr/local/include/nixl"):
+        if os.path.isfile(os.path.join(inc, "nixl.h")):
+            lib = inc.replace("include", "lib")
+            return inc, lib
+
+    return None, None
+
+
+def gen_ep_nixl_module() -> JitSpec:
+    """Generate a JitSpec for the NIXL-EP backend.
+
+    Compiles csrc/ep/nixl_ep_backend.cu which depends on:
+      - nixl.h (from NIXL — https://github.com/ai-dynamo/nixl)
+
+    Only call this if NIXL (libnixl) is installed.
+
+    Issue #61: NIXL-EP uses transport-agnostic nixlAgent for
+    RDMA, NVLink, and TCP communication.
+    """
+    nixl_inc, nixl_lib = _find_nixl()
+
+    extra_includes = []
+    extra_ldflags = ["-lnixl"]
+
+    if nixl_inc:
+        extra_includes.append(nixl_inc)
+    if nixl_lib:
+        extra_ldflags.append(f"-L{nixl_lib}")
+
+    return gen_jit_spec(
+        "ep_nixl",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "ep" / "nixl_ep_backend.cu",
+        ],
+        extra_include_paths=extra_includes if extra_includes else None,
+        extra_ldflags=extra_ldflags,
+    )

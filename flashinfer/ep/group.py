@@ -52,6 +52,16 @@ def _get_ep_nccl_module():
         return None
 
 
+@functools.cache
+def _get_ep_nixl_module():
+    """Load the NIXL-EP backend module. Returns None if libnixl not available."""
+    try:
+        from flashinfer.jit.ep import gen_ep_nixl_module
+        return gen_ep_nixl_module().build_and_load()
+    except (ImportError, RuntimeError):
+        return None
+
+
 # ─── NCCL communicator creation via ctypes ─────────────────────────
 #
 # PyTorch does NOT expose ncclComm_t from ProcessGroupNCCL — there is
@@ -232,6 +242,11 @@ def get_buffer_size_hint(
     if backend == Backend.DEEP_EP:
         nvl = num_experts * max_tokens * hidden_dim * elem_size
         rdma = nvl
+    elif backend == Backend.NIXL_EP:
+        # NIXL-EP manages its own buffers via nixlAgent registration.
+        # The hint is used for the staging send/recv buffers.
+        nvl = world_size * max_tokens * hidden_dim * elem_size
+        rdma = 0  # NIXL auto-selects transport
     else:
         nvl = world_size * max_tokens * hidden_dim * elem_size
         rdma = 0
@@ -245,8 +260,8 @@ def get_low_latency_rdma_size_hint(
     world_size: int,
     num_experts: int,
 ) -> int:
-    """DeepEP-specific RDMA buffer hint. Returns 0 for NCCL-EP."""
-    if backend == Backend.NCCL_EP:
+    """DeepEP-specific RDMA buffer hint. Returns 0 for NCCL-EP and NIXL-EP."""
+    if backend in (Backend.NCCL_EP, Backend.NIXL_EP):
         return 0
     return num_experts * max_tokens * hidden_dim * 2
 
@@ -429,12 +444,14 @@ class EpGroup:
     """
 
     def __init__(self, _group_id: int = -1, _backend=None, _config=None,
-                 _pg=None, _nccl_comm_ptr: int = 0):
+                 _pg=None, _nccl_comm_ptr: int = 0,
+                 _elastic_manager=None):
         self._group_id = _group_id
         self._backend = _backend
         self._config = _config or {}
         self._pg = _pg
         self._nccl_comm_ptr = _nccl_comm_ptr  # owned by us, must destroy
+        self._elastic_manager = _elastic_manager  # NIXL-EP elastic EP manager
         self._destroyed = False
         self._comm_stream = torch.cuda.Stream()
 
@@ -516,6 +533,23 @@ class EpGroup:
         async_finish: bool = True,
     ) -> "DispatchResult":
         """Route tokens to experts — delegates entirely to C++."""
+        if self._backend == Backend.NIXL_EP:
+            return DispatchResult(
+                recv_hidden=torch.empty(0, device=hidden.device if not isinstance(hidden, tuple) else hidden[0].device),
+                recv_topk_idx=topk_idx,
+                recv_topk_weights=topk_weights,
+                recv_expert_counts=torch.zeros(
+                    self.num_local_experts, device=topk_idx.device, dtype=torch.int32
+                ),
+                recv_scales=None,
+                handle=EpHandle(),
+                dep=None,
+                status=EpStatus(
+                    error_code=7,
+                    error_msg="NIXL-EP supports LL mode only. Use DeepEP or "
+                              "NCCL-EP for HT (prefill/training) dispatch.",
+                ),
+            )
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "HT dispatch uses dynamic sizes and cannot be captured "
@@ -578,6 +612,16 @@ class EpGroup:
         async_finish: bool = True,
     ) -> "CombineResult":
         """Gather expert outputs — delegates entirely to C++."""
+        if self._backend == Backend.NIXL_EP:
+            return CombineResult(
+                combined_hidden=torch.empty(0, device=expert_output.device),
+                dep=None,
+                status=EpStatus(
+                    error_code=7,
+                    error_msg="NIXL-EP supports LL mode only. Use DeepEP or "
+                              "NCCL-EP for HT (prefill/training) combine.",
+                ),
+            )
         if handle._handle_id < 0:
             return CombineResult(
                 combined_hidden=torch.empty(0, device=expert_output.device),
@@ -729,6 +773,83 @@ class EpGroup:
         """Pre-build a routing cache from a representative topk_idx."""
         return RoutingCache(_cache=None, _shape=tuple(topk_idx.shape))
 
+    # ─── Elastic EP (NIXL-EP only) ─────────────────────────────────
+
+    @property
+    def elastic_enabled(self) -> bool:
+        """True if elastic EP is enabled (NIXL-EP with enable_elastic=True)."""
+        return self._elastic_manager is not None
+
+    def add_rank(self, new_rank: int) -> EpStatus:
+        """Add a new GPU rank to the EP group (elastic EP).
+
+        Only supported with NIXL-EP backend when enable_elastic=True.
+        Triggers memory descriptor exchange, expert rebalancing, and
+        routing cache invalidation.
+
+        Args:
+            new_rank: Rank ID of the new GPU to add.
+
+        Returns:
+            EpStatus indicating success or failure.
+        """
+        if self._backend != Backend.NIXL_EP:
+            return EpStatus(error_code=8,
+                            error_msg="add_rank() requires NIXL-EP backend")
+        if not self._elastic_manager:
+            return EpStatus(error_code=8,
+                            error_msg="Elastic EP not enabled. Pass "
+                                      "enable_elastic=True to create_group().")
+        try:
+            self._elastic_manager.add_rank(new_rank)
+            # Call C++ backend to exchange memory descriptors
+            mod = _get_ep_module()
+            mod.ep_nixl_add_rank(self._group_id, new_rank)
+            return EpStatus(error_code=0)
+        except Exception as e:
+            return EpStatus(error_code=1, error_msg=str(e))
+
+    def remove_rank(self, dead_rank: int) -> EpStatus:
+        """Remove a GPU rank from the EP group (elastic EP).
+
+        Only supported with NIXL-EP backend when enable_elastic=True.
+        Triggers expert redistribution across surviving ranks.
+
+        Args:
+            dead_rank: Rank ID of the GPU to remove.
+
+        Returns:
+            EpStatus indicating success or failure.
+        """
+        if self._backend != Backend.NIXL_EP:
+            return EpStatus(error_code=8,
+                            error_msg="remove_rank() requires NIXL-EP backend")
+        if not self._elastic_manager:
+            return EpStatus(error_code=8,
+                            error_msg="Elastic EP not enabled. Pass "
+                                      "enable_elastic=True to create_group().")
+        try:
+            self._elastic_manager.remove_rank(dead_rank)
+            mod = _get_ep_module()
+            mod.ep_nixl_remove_rank(self._group_id, dead_rank)
+            return EpStatus(error_code=0)
+        except Exception as e:
+            return EpStatus(error_code=1, error_msg=str(e))
+
+    @property
+    def active_ranks(self) -> list:
+        """List of currently active ranks (elastic EP)."""
+        if self._elastic_manager:
+            return self._elastic_manager.active_ranks
+        return list(range(self.world_size))
+
+    @property
+    def generation(self) -> int:
+        """Topology generation counter (elastic EP). 0 if not elastic."""
+        if self._elastic_manager:
+            return self._elastic_manager.generation
+        return 0
+
     # ─── Cleanup ─────────────────────────────────────────────────────
 
     def destroy(self):
@@ -764,15 +885,35 @@ def create_group(
     cuda_graph_max_tokens: int = 0,
     timeout_ms: int = 30000,
     stream: Optional[torch.cuda.Stream] = None,
+    enable_elastic: bool = False,
+    transport_hint: Optional[str] = None,
 ) -> "EpGroup":
     """Create a communication group for expert parallelism.
 
     Collective operation — all ranks must call concurrently.
 
-    Creates a dedicated NCCL communicator for EP alltoall communication.
-    This communicator is independent of PyTorch's internal one — the
-    process_group is only used for rank/world_size topology and for
-    broadcasting the ncclUniqueId during setup.
+    For DeepEP and NCCL-EP backends, creates a dedicated NCCL communicator
+    for EP alltoall communication. For NIXL-EP, uses nixlAgent instead
+    (no NCCL communicator needed).
+
+    Args:
+        backend: Which EP backend to use (DEEP_EP, NCCL_EP, or NIXL_EP).
+        process_group: PyTorch distributed process group for topology info.
+        num_experts: Total number of experts across all ranks.
+        num_local_experts: Number of experts on this rank.
+        top_k: Number of experts each token is routed to.
+        hidden_dim: Hidden dimension of tokens.
+        max_dispatch_elem_size: Max element size in bytes (2=BF16, 1=FP8).
+        nvl_buffer_bytes: NVLink buffer size hint (DeepEP only).
+        rdma_buffer_bytes: RDMA buffer size hint (DeepEP only).
+        num_sms: Number of SMs for dispatch kernel (0=auto).
+        num_qps_per_rank: QPs per rank (DeepEP only, 0=auto).
+        enable_pcie_fallback: Allow PCIe fallback transport.
+        cuda_graph_max_tokens: Max tokens for CUDA graph capture (0=no graph).
+        timeout_ms: Timeout for collective operations in milliseconds.
+        stream: CUDA stream for EP operations (None=default).
+        enable_elastic: Enable elastic EP — dynamic rank add/remove (NIXL-EP only).
+        transport_hint: Transport preference for NIXL-EP ("rdma", "nvlink", "tcp", None=auto).
     """
     rank = dist.get_rank(process_group)
     world_size = dist.get_world_size(process_group)
@@ -788,21 +929,37 @@ def create_group(
         "max_dispatch_elem_size": max_dispatch_elem_size,
         "cuda_graph_max_tokens": cuda_graph_max_tokens,
         "timeout_ms": timeout_ms,
+        "enable_elastic": enable_elastic,
     }
 
-    # Create our own NCCL communicator via ncclCommInitRank().
-    # The process_group is used ONLY for broadcasting the ncclUniqueId.
-    nccl_comm = _create_nccl_comm(rank, world_size, process_group)
-    nccl_comm_ptr = nccl_comm.value  # raw int pointer
+    # NIXL-EP uses its own transport — no NCCL comm needed
+    if backend == Backend.NIXL_EP:
+        nccl_comm_ptr = 0  # NIXL-EP does not use NCCL
+    else:
+        # Create our own NCCL communicator via ncclCommInitRank().
+        # The process_group is used ONLY for broadcasting the ncclUniqueId.
+        nccl_comm = _create_nccl_comm(rank, world_size, process_group)
+        nccl_comm_ptr = nccl_comm.value  # raw int pointer
 
     # Pass everything to C++
     mod = _get_ep_module()
-    backend_int = 0 if backend == Backend.DEEP_EP else 1
+    backend_int = {
+        Backend.DEEP_EP: 0,
+        Backend.NCCL_EP: 1,
+        Backend.NIXL_EP: 2,
+    }[backend]
     group_id = mod.ep_create_group(
         rank, world_size, num_experts, num_local_experts,
         top_k, hidden_dim, backend_int, cuda_graph_max_tokens,
         nccl_comm_ptr,
     )
+
+    # Set up elastic EP manager for NIXL-EP if requested
+    elastic_manager = None
+    if backend == Backend.NIXL_EP and enable_elastic:
+        from flashinfer.ep._backends.nixl_ep import NixlElasticManager
+        elastic_manager = NixlElasticManager(group_id)
+        elastic_manager._active_ranks = list(range(world_size))
 
     return EpGroup(
         _group_id=group_id,
@@ -810,4 +967,5 @@ def create_group(
         _config=config,
         _pg=process_group,
         _nccl_comm_ptr=nccl_comm_ptr,
+        _elastic_manager=elastic_manager,
     )

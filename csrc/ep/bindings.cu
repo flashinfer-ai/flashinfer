@@ -61,7 +61,7 @@ struct EpGroupState {
   int64_t num_local_experts;
   int64_t top_k;
   int64_t hidden_dim;
-  int64_t backend;  // 0 = deepep, 1 = nccl_ep
+  int64_t backend;  // 0 = deepep, 1 = nccl_ep, 2 = nixl_ep
   int64_t cuda_graph_max_tokens;
   ncclComm_t nccl_comm;  // NCCL communicator for alltoall
   bool destroyed;
@@ -120,8 +120,8 @@ int64_t epCreateGroup(
     int64_t cuda_graph_max_tokens,
     int64_t nccl_comm_ptr) {
 
-  // Validate ncclComm_t pointer
-  if (nccl_comm_ptr == 0) {
+  // Validate ncclComm_t pointer (not required for NIXL-EP backend=2)
+  if (nccl_comm_ptr == 0 && backend != 2) {
     throw std::invalid_argument(
         "ep_create_group: nccl_comm_ptr is NULL. "
         "The ncclComm_t extraction from the PyTorch process group failed. "

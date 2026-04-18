@@ -27,6 +27,8 @@ _spec = importlib.util.spec_from_file_location("ep_helpers", _helpers_path)
 _helpers = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_helpers)
 BACKENDS = _helpers.BACKENDS
+BACKENDS_WITH_NIXL = _helpers.BACKENDS_WITH_NIXL
+LL_BACKENDS = _helpers.LL_BACKENDS
 LAYOUTS = _helpers.LAYOUTS
 
 
@@ -73,6 +75,23 @@ def ep_process_group(dist_env):
 
 @pytest.fixture(params=BACKENDS, ids=["deepep", "nccl_ep"])
 def backend(request):
+    return request.param
+
+
+def _backend_id(b):
+    """Generate test ID for a Backend enum value."""
+    return b.value  # "deepep", "nccl_ep", "nixl_ep"
+
+
+@pytest.fixture(params=BACKENDS_WITH_NIXL, ids=lambda b: _backend_id(b))
+def backend_with_nixl(request):
+    """Parameterized backend fixture including NIXL-EP (if available)."""
+    return request.param
+
+
+@pytest.fixture(params=LL_BACKENDS, ids=lambda b: _backend_id(b))
+def ll_backend(request):
+    """Parameterized backend fixture for LL-mode-only tests."""
     return request.param
 
 
