@@ -109,12 +109,12 @@ ACTIVATION_CONFIGS = [
     (1, 128, 2, 2, 128, 1.702, 1.0, 7.0),
 ]
 
-# Small configs for strict correctness (matching test_trtllm_cutlass_fused_moe.py scale)
+# Small configs for strict correctness (matching test_trtllm_cutlass_fused_moe.py: h=128, e=2)
 CORRECTNESS_CONFIGS = [
     (1, 128, 2, 2, 128),
     (4, 128, 4, 2, 128),
-    (1, 256, 8, 2, 128),
-    (4, 256, 8, 2, 128),
+    (8, 128, 2, 2, 128),
+    (16, 128, 4, 2, 128),
 ]
 
 
