@@ -172,7 +172,7 @@ def _run_w4a16_moe(
 # ============================================================================
 
 
-@pytest.mark.skipif(not is_sm90a_supported(), reason="W4A16 MoE requires SM90 (Hopper)")
+@pytest.mark.skipif(not is_sm90a_supported(torch.device("cuda")), reason="W4A16 MoE requires SM90 (Hopper)")
 @pytest.mark.parametrize(
     "batch_size,hidden_size,num_experts,top_k,intermediate_size",
     QUICK_CONFIGS,
@@ -185,7 +185,7 @@ def test_w4a16_moe_quick(
     _run_w4a16_moe(batch_size, hidden_size, num_experts, top_k, intermediate_size)
 
 
-@pytest.mark.skipif(not is_sm90a_supported(), reason="W4A16 MoE requires SM90 (Hopper)")
+@pytest.mark.skipif(not is_sm90a_supported(torch.device("cuda")), reason="W4A16 MoE requires SM90 (Hopper)")
 @pytest.mark.parametrize(
     "batch_size,hidden_size,num_experts,top_k,intermediate_size",
     ALL_CONFIGS,
@@ -200,7 +200,7 @@ def test_w4a16_moe_coverage(
     _run_w4a16_moe(batch_size, hidden_size, num_experts, top_k, intermediate_size)
 
 
-@pytest.mark.skipif(not is_sm90a_supported(), reason="W4A16 MoE requires SM90 (Hopper)")
+@pytest.mark.skipif(not is_sm90a_supported(torch.device("cuda")), reason="W4A16 MoE requires SM90 (Hopper)")
 @pytest.mark.parametrize(
     "batch_size,hidden_size,num_experts,top_k,intermediate_size,alpha,beta,limit",
     ACTIVATION_CONFIGS,
@@ -222,7 +222,7 @@ def test_w4a16_moe_activations(
     )
 
 
-@pytest.mark.skipif(not is_sm90a_supported(), reason="W4A16 MoE requires SM90 (Hopper)")
+@pytest.mark.skipif(not is_sm90a_supported(torch.device("cuda")), reason="W4A16 MoE requires SM90 (Hopper)")
 def test_w4a16_moe_core_config():
     """Test the primary target configuration: experts=256, topk=6, hidden=4096, inter=2048."""
     _run_w4a16_moe(
