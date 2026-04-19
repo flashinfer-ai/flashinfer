@@ -55,6 +55,16 @@ def bench_w4a16_moe(
         torch.float32
     )
 
+    # Weight + scale interleave runs once at weight-load time, not per-iter.
+    # Mimics how a serving runtime would preprocess weights before the kernel
+    # sees them (see TensorRT-LLM PR #12451). We do NOT count this against the
+    # per-iteration GEMM time.
+    w1 = fused_moe.interleave_moe_weights_for_hopper_mixed_gemm(w1, "fp4")
+    w2 = fused_moe.interleave_moe_weights_for_hopper_mixed_gemm(w2, "fp4")
+    w1_scale = fused_moe.interleave_moe_scales_for_hopper_mixed_gemm(w1_scale)
+    w2_scale = fused_moe.interleave_moe_scales_for_hopper_mixed_gemm(w2_scale)
+    torch.cuda.synchronize()
+
     quant_scales = [w1_scale.view(torch.int32), w2_scale.view(torch.int32)]
     output = torch.zeros_like(x)
 
@@ -63,8 +73,8 @@ def bench_w4a16_moe(
             x,
             selected_experts.to(torch.int),
             routing_weights,
-            w1.contiguous().view(torch.uint8),
-            w2.contiguous().view(torch.uint8),
+            w1,
+            w2,
             torch.bfloat16,
             quant_scales=quant_scales,
             use_w4_group_scaling=True,

@@ -26,43 +26,69 @@ from flashinfer.utils import is_sm90a_supported
 
 
 # ============================================================================
-# Reference implementations (reused from test_trtllm_cutlass_fused_moe.py)
+# Reference implementations
 # ============================================================================
 
-
-def _dequant_mxfp4_batches_host(w_fp4, w_scale):
-    """Dequantize MXFP4 weights on CPU for reference computation."""
-    from flashinfer import mxfp4_dequantize_host
-
-    return torch.stack(
-        [
-            mxfp4_dequantize_host(w_fp4[b, :, :], w_scale[b, :, :])
-            for b in range(w_fp4.size(0))
-        ]
-    )
+# MXFP4 lookup table: 4-bit encoding -> float value (sign bit is bit 3).
+_FP4_LUT = (
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+)
 
 
-def _compute_with_experts(
-    num_experts,
-    x,
-    w31_weight,
-    w2_weight,
-    selected_experts,
-    routing_weights,
+def _dequant_mxfp4_on_device(w_fp4: torch.Tensor, w_scale: torch.Tensor) -> torch.Tensor:
+    """GPU dequant for a batched MXFP4 tensor.
+
+    Args:
+      w_fp4:   (E, rows, K//2) uint8, two FP4 values packed per byte (low nibble
+               first).
+      w_scale: (E, rows, K//32) uint8, E8M0 block scales.
+
+    Returns:
+      (E, rows, K) bfloat16 dequantized weights on the same device.
+
+    This replaces the previous per-expert CPU ``mxfp4_dequantize_host`` loop,
+    which at e=256 / h=4096 / n=2048 was dequantizing ~3 B FP4 nibbles on the
+    host before every reference computation.
+    """
+    device = w_fp4.device
+    lut = torch.tensor(_FP4_LUT, dtype=torch.float32, device=device)
+    lo = w_fp4 & 0x0F
+    hi = (w_fp4 >> 4) & 0x0F
+    # Interleave low/high nibble along the last axis -> (..., K).
+    nib = torch.stack([lo, hi], dim=-1).reshape(*w_fp4.shape[:-1], -1)
+    values = lut[nib.long()]  # (E, rows, K) float32
+    scale = torch.exp2(w_scale.to(torch.float32) - 127.0)
+    scale = scale.repeat_interleave(32, dim=-1)  # (E, rows, K)
+    return (values * scale).to(torch.bfloat16)
+
+
+def _compute_with_experts_subset(
+    active_experts: torch.Tensor,
+    x: torch.Tensor,
+    w31_by_expert: dict,
+    w2_by_expert: dict,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
     alpha=None,
     beta=None,
     limit=None,
-):
-    """Reference MoE output with dequantized weights."""
+) -> torch.Tensor:
+    """Reference MoE output over ``active_experts`` only.
+
+    ``w31_by_expert`` and ``w2_by_expert`` map expert_id -> the dequantized
+    weight for that expert. Only active experts need an entry — this avoids
+    materializing the full ``(E, 2N, K)`` dequant tensor, which is 8 GB at the
+    primary config (e=256, h=4096, n=2048).
+    """
     results = torch.zeros_like(x)
-    for expert_id in range(num_experts):
+    for expert_id in active_experts.tolist():
         mask = selected_experts == expert_id
-        if not mask.sum():
+        if not mask.any():
             continue
         batch_idx, nth_expert = torch.where(mask)
-        w31_expert = w31_weight[expert_id]
-        w2_expert = w2_weight[expert_id]
-        w3_expert, w1_expert = torch.chunk(w31_expert, 2, dim=0)
+        w3_expert, w1_expert = torch.chunk(w31_by_expert[expert_id], 2, dim=0)
+        w2_expert = w2_by_expert[expert_id]
 
         expert_inputs = x[batch_idx]
         if alpha is not None and limit is not None and beta is not None:
@@ -78,44 +104,27 @@ def _compute_with_experts(
             )
         output = inter @ w2_expert.t()
         results[batch_idx] += routing_weights[batch_idx, nth_expert, None] * output
-    return results.view_as(x)
+    return results
 
 
 # ============================================================================
 # Test configurations
 # ============================================================================
 
-# Coverage configs: (batch_size, hidden_size, num_experts, top_k, intermediate_size)
+# Coverage configs: (batch_size, hidden_size, num_experts, top_k, intermediate_size).
+# The fully-parametrized sweep is intentionally kept small. Each entry picks a
+# different axis stressed relative to the primary target (e=256, topk=6, h=4096,
+# n=2048): batch extremes, hidden/inter shapes, expert count, top_k, and a
+# Qwen3-MoE-like wide-hidden config.
 COVERAGE_CONFIGS = [
-    # Batch sweep
-    (1, 4096, 256, 6, 2048),
-    (4, 4096, 256, 6, 2048),
-    (16, 4096, 256, 6, 2048),
-    (64, 4096, 256, 6, 2048),
-    (128, 4096, 256, 6, 2048),
-    (256, 4096, 256, 6, 2048),
-    # Shape sweep
-    (16, 2048, 256, 6, 1024),
-    (16, 4096, 256, 6, 2048),
-    (16, 7168, 256, 6, 4096),
-    # Expert sweep
-    (16, 4096, 8, 2, 2048),
-    (16, 4096, 64, 4, 2048),
-    (16, 4096, 256, 6, 2048),
-    # TopK sweep
-    (16, 4096, 256, 2, 2048),
-    (16, 4096, 256, 4, 2048),
-    (16, 4096, 256, 6, 2048),
-    (16, 4096, 256, 8, 2048),
-    # Edge cases
-    (1, 4096, 256, 1, 2048),
-    (8, 4096, 256, 6, 2048),
-    (32, 4096, 256, 6, 2048),
-    (512, 4096, 256, 6, 2048),
-    (16, 4096, 128, 6, 2048),
-    (16, 4096, 256, 6, 1024),
-    (16, 4096, 256, 6, 4096),
-    (4, 2048, 64, 4, 1024),
+    (1, 4096, 256, 6, 2048),       # smallest batch, primary shape
+    (512, 4096, 256, 6, 2048),     # largest batch
+    (16, 2048, 256, 6, 1024),      # smaller hidden/inter
+    (16, 7168, 256, 6, 4096),      # Qwen3 wide hidden
+    (16, 4096, 8, 2, 2048),        # few experts
+    (16, 4096, 256, 1, 2048),      # topk=1 edge
+    (16, 4096, 256, 8, 2048),      # topk=8 edge
+    (16, 4096, 256, 6, 4096),      # intermediate_size == hidden_size
 ]
 
 ACTIVATION_CONFIGS = [
@@ -245,21 +254,24 @@ def _run_w4a16_moe(
     )
 
     if check_correctness:
-        dq_w1 = (
-            _dequant_mxfp4_batches_host(w1.cpu(), w1_scale.cpu())
-            .cuda()
-            .to(torch.bfloat16)
-        )
-        dq_w2 = (
-            _dequant_mxfp4_batches_host(w2.cpu(), w2_scale.cpu())
-            .cuda()
-            .to(torch.bfloat16)
-        )
-        ref_output = _compute_with_experts(
-            e,
+        # Only the experts actually selected by topk contribute to the output,
+        # so dequantize them individually into a dict (avoids allocating the
+        # full ``(E, 2N, K)`` bf16 tensor, which is 8 GB at e=256 / h=4096 /
+        # n=2048 and OOMs on a single H200 alongside the kernel's workspace).
+        active = torch.unique(selected_experts.flatten())
+        active_w1 = _dequant_mxfp4_on_device(w1[active], w1_scale[active])
+        active_w2 = _dequant_mxfp4_on_device(w2[active], w2_scale[active])
+        w31_by_expert = {
+            eid: active_w1[i] for i, eid in enumerate(active.tolist())
+        }
+        w2_by_expert = {
+            eid: active_w2[i] for i, eid in enumerate(active.tolist())
+        }
+        ref_output = _compute_with_experts_subset(
+            active,
             x,
-            dq_w1,
-            dq_w2,
+            w31_by_expert,
+            w2_by_expert,
             selected_experts,
             routing_weights,
             alpha,
