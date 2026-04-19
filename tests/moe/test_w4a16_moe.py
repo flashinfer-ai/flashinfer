@@ -104,17 +104,18 @@ COVERAGE_CONFIGS = [
 ]
 
 ACTIVATION_CONFIGS = [
-    (1, 128, 2, 2, 128, None, None, None),
-    (1, 128, 2, 2, 128, 0.5, 0.0, 7.0),
-    (1, 128, 2, 2, 128, 1.702, 1.0, 7.0),
+    (4, 4096, 8, 4, 2048, None, None, None),
+    (4, 4096, 8, 4, 2048, 0.5, 0.0, 7.0),
+    (4, 4096, 8, 4, 2048, 1.702, 1.0, 7.0),
 ]
 
-# Small configs for strict correctness (matching test_trtllm_cutlass_fused_moe.py: h=128, e=2)
+# Correctness configs (matching TRTLLM test_fused_moe_jiangs.py scale: h=768/2880)
 CORRECTNESS_CONFIGS = [
     (1, 128, 2, 2, 128),
     (4, 128, 4, 2, 128),
-    (8, 128, 2, 2, 128),
-    (16, 128, 4, 2, 128),
+    (4, 768, 8, 2, 512),
+    (4, 2048, 8, 4, 1024),
+    (4, 4096, 8, 4, 2048),
 ]
 
 
@@ -209,8 +210,15 @@ def _run_w4a16_moe(
             e, x, dq_w1, dq_w2, selected_experts, routing_weights, alpha, beta, limit,
         )
 
-        # Same tolerance as test_trtllm_cutlass_fused_moe.py
-        torch.testing.assert_close(ref_output, flash_output, rtol=1e-1, atol=1e-1)
+        # Percent-based accuracy check matching TRTLLM test methodology:
+        # check_accuracy(output, ref, rtol=1e-2, atol=0.1, percent=0.99)
+        # At least 99% of elements must satisfy |out-ref| <= atol + rtol*|ref|
+        close_mask = torch.abs(ref_output - flash_output) <= (0.1 + 1e-2 * torch.abs(ref_output))
+        close_pct = close_mask.float().mean().item()
+        assert close_pct >= 0.99, (
+            f"Only {close_pct:.1%} elements within tolerance (need >= 99%). "
+            f"max_abs_err={torch.abs(ref_output - flash_output).max().item():.4f}"
+        )
 
     return flash_output
 
@@ -238,10 +246,10 @@ def test_w4a16_moe_correctness(batch_size, hidden_size, num_experts, top_k, inte
     ids=[f"m{c[0]}_h{c[1]}_e{c[2]}_k{c[3]}_n{c[4]}" for c in COVERAGE_CONFIGS],
 )
 def test_w4a16_moe_coverage(batch_size, hidden_size, num_experts, top_k, intermediate_size):
-    """Coverage test: finite + shape checks across varied configurations."""
+    """Coverage test with percent-based correctness verification."""
     if top_k > num_experts:
         pytest.skip(f"top_k ({top_k}) > num_experts ({num_experts})")
-    _run_w4a16_moe(batch_size, hidden_size, num_experts, top_k, intermediate_size, check_correctness=False)
+    _run_w4a16_moe(batch_size, hidden_size, num_experts, top_k, intermediate_size, check_correctness=True)
 
 
 @pytest.mark.skipif(not is_sm90a_supported(torch.device("cuda")), reason="W4A16 MoE requires SM90")
@@ -260,4 +268,4 @@ def test_w4a16_moe_activations(
 @pytest.mark.skipif(not is_sm90a_supported(torch.device("cuda")), reason="W4A16 MoE requires SM90")
 def test_w4a16_moe_core_config():
     """Test the primary target configuration: experts=256, topk=6, hidden=4096, inter=2048."""
-    _run_w4a16_moe(batch_size=4, hidden_size=4096, num_experts=256, top_k=6, intermediate_size=2048, check_correctness=False)
+    _run_w4a16_moe(batch_size=4, hidden_size=4096, num_experts=256, top_k=6, intermediate_size=2048, check_correctness=True)
