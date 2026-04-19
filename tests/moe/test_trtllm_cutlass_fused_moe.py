@@ -1567,9 +1567,21 @@ def test_moe_bf16_mxfp4(
     pad_size = hidden_size - x.shape[1]
     x_pad = torch.nn.functional.pad(x, (0, pad_size))
 
+    # The SM90 mixed-input GEMM expects MXFP4 weights AND scales pre-interleaved
+    # (see PR introducing interleave_moe_weights_for_hopper_mixed_gemm /
+    # interleave_moe_scales_for_hopper_mixed_gemm). Without this the kernel
+    # reads the LUT bytes from the wrong positions and the output diverges.
+    w1_il = fused_moe.interleave_moe_weights_for_hopper_mixed_gemm(
+        w1.contiguous().view(torch.uint8), "fp4"
+    )
+    w2_il = fused_moe.interleave_moe_weights_for_hopper_mixed_gemm(
+        w2.contiguous().view(torch.uint8), "fp4"
+    )
+    w1_scale_il = fused_moe.interleave_moe_scales_for_hopper_mixed_gemm(w1_scale)
+    w2_scale_il = fused_moe.interleave_moe_scales_for_hopper_mixed_gemm(w2_scale)
     quant_scales = [
-        w1_scale.view(torch.int32),
-        w2_scale.view(torch.int32),
+        w1_scale_il.view(torch.int32),
+        w2_scale_il.view(torch.int32),
     ]
 
     # Call cutlass_fused_moe with BF16 activations and MXFP4 weights
@@ -1577,8 +1589,8 @@ def test_moe_bf16_mxfp4(
         x_pad,
         selected_experts.to(torch.int),
         routing_weights,
-        w1.contiguous().view(torch.uint8),
-        w2.contiguous().view(torch.uint8),
+        w1_il,
+        w2_il,
         torch.bfloat16,
         swiglu_alpha=alpha_t,
         swiglu_limit=limit_t,
