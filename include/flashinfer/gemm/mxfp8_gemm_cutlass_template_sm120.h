@@ -42,7 +42,7 @@ namespace gemm {
 using namespace cute;
 
 // SM120 MXFP8 dispatch: CTA shape only, cluster shape is always 1x1x1.
-template <typename T>
+template <typename T, bool SwapAB>
 size_t dispatchMXFP8xMXFP8GemmCTAShapeSm120(T* D, void const* A, void const* B,
                                             void const* input_sf, void const* weight_sf, int m,
                                             int n, int k, int batch_count,
@@ -50,16 +50,24 @@ size_t dispatchMXFP8xMXFP8GemmCTAShapeSm120(T* D, void const* A, void const* B,
                                             const size_t workspaceBytes, cudaStream_t stream,
                                             int* occupancy = nullptr) {
   switch (gemmConfig.tile_config_sm120) {
+    case CutlassTileConfigSM120::CtaShape128x32x128B:
+      return genericMxfp8GemmKernelLauncherSm120<T, cute::Int<128>, cute::Int<32>, cute::Int<128>, SwapAB>(
+          D, A, B, input_sf, weight_sf, m, n, k, batch_count, gemmConfig, workspace, workspaceBytes,
+          stream, occupancy);
+    case CutlassTileConfigSM120::CtaShape128x64x128B:
+      return genericMxfp8GemmKernelLauncherSm120<T, cute::Int<128>, cute::Int<64>, cute::Int<128>, SwapAB>(
+          D, A, B, input_sf, weight_sf, m, n, k, batch_count, gemmConfig, workspace, workspaceBytes,
+          stream, occupancy);
     case CutlassTileConfigSM120::CtaShape128x128x128B:
-      return genericMxfp8GemmKernelLauncherSm120<T, cute::Int<128>, cute::Int<128>, cute::Int<128>>(
+      return genericMxfp8GemmKernelLauncherSm120<T, cute::Int<128>, cute::Int<128>, cute::Int<128>, SwapAB>(
           D, A, B, input_sf, weight_sf, m, n, k, batch_count, gemmConfig, workspace, workspaceBytes,
           stream, occupancy);
     case CutlassTileConfigSM120::CtaShape256x128x128B:
-      return genericMxfp8GemmKernelLauncherSm120<T, cute::Int<256>, cute::Int<128>, cute::Int<128>>(
+      return genericMxfp8GemmKernelLauncherSm120<T, cute::Int<256>, cute::Int<128>, cute::Int<128>, SwapAB>(
           D, A, B, input_sf, weight_sf, m, n, k, batch_count, gemmConfig, workspace, workspaceBytes,
           stream, occupancy);
     case CutlassTileConfigSM120::CtaShape128x256x128B:
-      return genericMxfp8GemmKernelLauncherSm120<T, cute::Int<128>, cute::Int<256>, cute::Int<128>>(
+      return genericMxfp8GemmKernelLauncherSm120<T, cute::Int<128>, cute::Int<256>, cute::Int<128>, SwapAB>(
           D, A, B, input_sf, weight_sf, m, n, k, batch_count, gemmConfig, workspace, workspaceBytes,
           stream, occupancy);
     case CutlassTileConfigSM120::Undefined:
@@ -122,6 +130,8 @@ class CutlassMxfp8GemmRunnerSm120 : public virtual CutlassMxfp8GemmRunnerInterfa
   std::vector<CutlassGemmConfig> getConfigs() const override {
     // SM120 MXFP8 tile configs.  No cluster shape variants (always 1x1x1).
     static const std::vector<CutlassTileConfigSM120> tiles = {
+        CutlassTileConfigSM120::CtaShape128x32x128B,
+        CutlassTileConfigSM120::CtaShape128x64x128B,
         CutlassTileConfigSM120::CtaShape128x128x128B,
         CutlassTileConfigSM120::CtaShape256x128x128B,
         CutlassTileConfigSM120::CtaShape128x256x128B,
@@ -130,7 +140,10 @@ class CutlassMxfp8GemmRunnerSm120 : public virtual CutlassMxfp8GemmRunnerInterfa
     configs.reserve(tiles.size());
     for (auto const& tile : tiles) {
       configs.emplace_back(tile, MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
-                           ClusterShape::ClusterShape_1x1x1);
+                           ClusterShape::ClusterShape_1x1x1, /*swap_ab*/ false);
+      configs.emplace_back(tile, MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO,
+                           ClusterShape::ClusterShape_1x1x1, /*swap_ab*/ true);
+
     }
     return configs;
   }
@@ -140,9 +153,17 @@ class CutlassMxfp8GemmRunnerSm120 : public virtual CutlassMxfp8GemmRunnerInterfa
                         void const* weight_sf, int m, int n, int k, int batch_count,
                         CutlassGemmConfig gemmConfig, char* workspace, const size_t workspaceBytes,
                         cudaStream_t stream, int* occupancy = nullptr) {
-    return dispatchMXFP8xMXFP8GemmCTAShapeSm120<T>(D, A, B, input_sf, weight_sf, m, n, k,
-                                                   batch_count, gemmConfig, workspace,
-                                                   workspaceBytes, stream, occupancy);
+    if (gemmConfig.swap_ab) {
+      return dispatchMXFP8xMXFP8GemmCTAShapeSm120<T, true>(D, A, B, input_sf, weight_sf, m, n, k,
+                                                           batch_count, gemmConfig, workspace,
+                                                           workspaceBytes, stream, occupancy);
+
+    } else {
+      return dispatchMXFP8xMXFP8GemmCTAShapeSm120<T, false>(D, A, B, input_sf, weight_sf, m, n, k,
+                                                            batch_count, gemmConfig, workspace,
+                                                            workspaceBytes, stream, occupancy);
+
+    }
   }
 };
 

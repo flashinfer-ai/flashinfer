@@ -44,7 +44,7 @@ using SafeBF16Sm120 = __nv_bfloat16;
 using SafeBF16Sm120 = void;
 #endif
 
-template <typename T, typename CTA_M_, typename CTA_N_, typename CTA_K_>
+template <typename T, typename CTA_M_, typename CTA_N_, typename CTA_K_, bool SWAP_AB_>
 size_t genericMxfp8GemmKernelLauncherSm120(void* D, void const* A, void const* B,
                                            void const* input_sf, void const* weight_sf, int m,
                                            int n, int k, int batch_count,
@@ -54,10 +54,11 @@ size_t genericMxfp8GemmKernelLauncherSm120(void* D, void const* A, void const* B
 
 #ifdef PLACEHOLDER_KERNELS
 
-#define INSTANTIATE_MXFP8_GEMM_KERNEL_LAUNCHER_SM120(T, CTA_M_, CTA_N_, CTA_K_)                    \
+#define INSTANTIATE_MXFP8_GEMM_KERNEL_LAUNCHER_SM120(T, CTA_M_, CTA_N_, CTA_K_, SWAP_AB_)          \
   template <>                                                                                      \
   size_t                                                                                           \
-  genericMxfp8GemmKernelLauncherSm120<T, cute::Int<CTA_M_>, cute::Int<CTA_N_>, cute::Int<CTA_K_>>( \
+  genericMxfp8GemmKernelLauncherSm120<T, cute::Int<CTA_M_>, cute::Int<CTA_N_>, cute::Int<CTA_K_>   \
+      SWAP_AB_>(                                                                                   \
       void* D, void const* A, void const* B, void const* input_sf, void const* weight_sf, int m,   \
       int n, int k, int batch_count, CutlassGemmConfig gemmConfig, char* workspace,                \
       const size_t workspaceBytes, cudaStream_t stream, int* occupancy) {                          \
@@ -74,8 +75,8 @@ size_t genericMxfp8GemmKernelLauncherSm120(void* D, void const* A, void const* B
 //   - ClusterShape always static Shape<1,1,1> (no programmatic multicast on SM120)
 //   - KernelScheduleAuto: CUTLASS auto-selects Cooperative vs Pingpong based on tile shape
 //   - EpilogueScheduleAuto: CUTLASS auto-selects epilogue schedule
-#define INSTANTIATE_MXFP8_GEMM_KERNEL_LAUNCHER_SM120(T, CTA_M_, CTA_N_, CTA_K_)                      \
-  struct DeviceGemmMxfp8GemmSm120_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_ {                             \
+#define INSTANTIATE_MXFP8_GEMM_KERNEL_LAUNCHER_SM120(T, CTA_M_, CTA_N_, CTA_K_, SWAP_AB_)            \
+  struct DeviceGemmMxfp8GemmSm120_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##SWAP_AB_ {                   \
     using OutElementType = flashinfer::cutlass_dtype<T>::type;                                       \
     using CTAShape = cute::Shape<cute::Int<CTA_M_>, cute::Int<CTA_N_>, cute::Int<CTA_K_>>;           \
     /* SM120 only supports ClusterShape 1x1x1 (no programmatic multicast) */                         \
@@ -92,7 +93,7 @@ size_t genericMxfp8GemmKernelLauncherSm120(void* D, void const* A, void const* B
     static constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementType>::value;                \
     /* Input C */                                                                                    \
     using ElementC = void;                                                                           \
-    using LayoutC = cutlass::layout::RowMajor;                                                       \
+    using LayoutC = std::conditional_t<SWAP_AB_, cutlass::layout::ColumnMajor, cutlass::layout::RowMajor>; \
     static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<OutElementType>::value;             \
                                                                                                      \
     using SFType = cutlass::float_ue8m0_t;                                                           \
@@ -115,13 +116,10 @@ size_t genericMxfp8GemmKernelLauncherSm120(void* D, void const* A, void const* B
         Arch, OperatorClass, cutlass::mx_float8_t<ElementA>, LayoutA, AlignmentA,                    \
         cutlass::mx_float8_t<ElementB>, LayoutB, AlignmentB, ElementAccumulator, CTAShape,           \
         ClusterShape,                                                                                \
-        /* StageCountAutoCarveout may fail for large tiles on SM120 (99KB SMEM); */ /* use fixed     \
-                                                                                       StageCount<2> \
-                                                                                       matching      \
-                                                                                       FP4 SM120     \
-                                                                                       kernel        \
-                                                                                       pattern */    \
-        cutlass::gemm::collective::StageCount<2>, MainloopSchedule>::CollectiveOp;                   \
+        std::conditional_t<CTA_N_ == 256 || CTA_M_ == 256, cutlass::gemm::collective::StageCount<2>, \
+          cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(                        \
+            sizeof(typename CollectiveEpilogue::SharedStorage))>>,                                   \
+        MainloopSchedule>::CollectiveOp;                                                             \
                                                                                                      \
     /* Guard: only run on SM12x devices */                                                           \
     template <typename Base>                                                                         \
@@ -148,7 +146,7 @@ size_t genericMxfp8GemmKernelLauncherSm120(void* D, void const* A, void const* B
   };                                                                                                 \
                                                                                                      \
   template <typename Gemm>                                                                           \
-  typename Gemm::Arguments prepareGemmArgsSm120_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_(                \
+  typename Gemm::Arguments prepareGemmArgsSm120_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##SWAP_AB_(      \
       void* D, void const* A, void const* B, void const* input_sf, void const* weight_sf, int m,     \
       int n, int k, int batch_count) {                                                               \
     using Sm1xxBlkScaledConfig =                                                                     \
@@ -175,16 +173,12 @@ size_t genericMxfp8GemmKernelLauncherSm120(void* D, void const* A, void const* B
     operator_args.epilogue.ptr_C = static_cast<ElementC const*>(D);                                  \
     operator_args.epilogue.ptr_D = static_cast<ElementD*>(D);                                        \
                                                                                                      \
-    int const stride_A = batch_count == 1 ? 0 : m * k;                                               \
-    int const stride_B = batch_count == 1 ? 0 : n * k;                                               \
-    int const stride_C = batch_count == 1 ? 0 : m * n;                                               \
-                                                                                                     \
     operator_args.mainloop.dA =                                                                      \
-        cute::make_int_tuple_from<typename Gemm::GemmKernel::StrideA>(k, stride_A);                  \
+      cutlass::make_cute_packed_stride(typename Gemm::GemmKernel::StrideA{}, {m, k, batch_count});   \
     operator_args.mainloop.dB =                                                                      \
-        cute::make_int_tuple_from<typename Gemm::GemmKernel::StrideB>(k, stride_B);                  \
+      cutlass::make_cute_packed_stride(typename Gemm::GemmKernel::StrideB{}, {n, k, batch_count});   \
     operator_args.epilogue.dC =                                                                      \
-        cute::make_int_tuple_from<typename Gemm::GemmKernel::StrideC>(n, stride_C);                  \
+      cutlass::make_cute_packed_stride(typename Gemm::GemmKernel::StrideC{}, {m, n, batch_count});   \
     operator_args.epilogue.dD = operator_args.epilogue.dC;                                           \
                                                                                                      \
     operator_args.mainloop.layout_SFA =                                                              \
@@ -207,7 +201,8 @@ size_t genericMxfp8GemmKernelLauncherSm120(void* D, void const* A, void const* B
                                                                                                      \
   template <>                                                                                        \
   size_t                                                                                             \
-  genericMxfp8GemmKernelLauncherSm120<T, cute::Int<CTA_M_>, cute::Int<CTA_N_>, cute::Int<CTA_K_>>(   \
+  genericMxfp8GemmKernelLauncherSm120<T, cute::Int<CTA_M_>, cute::Int<CTA_N_>, cute::Int<CTA_K_>,    \
+      SWAP_AB_>(                                                                                     \
       void* D, void const* A, void const* B, void const* input_sf, void const* weight_sf, int m,     \
       int n, int k, int batch_count, CutlassGemmConfig gemmConfig, char* workspace,                  \
       const size_t workspaceBytes, cudaStream_t stream, int* occupancy) {                            \
@@ -220,10 +215,19 @@ size_t genericMxfp8GemmKernelLauncherSm120(void* D, void const* A, void const* B
         cutlass::platform::is_same<ElementOutput_, SafeBF16Sm120>::value, cutlass::bfloat16_t,       \
         ElementOutput_>::type;                                                                       \
                                                                                                      \
-    using Mxfp8GemmOperator = DeviceGemmMxfp8GemmSm120_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_::Gemm;   \
+    using Mxfp8GemmOperator = DeviceGemmMxfp8GemmSm120_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##SWAP_AB_::Gemm; \
     Mxfp8GemmOperator gemm;                                                                          \
-    auto args = prepareGemmArgsSm120_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_<Mxfp8GemmOperator>(        \
-        D, A, B, input_sf, weight_sf, m, n, k, batch_count);                                         \
+    auto args = [&]() {                                                                              \
+      if constexpr (SWAP_AB_) {                                                                      \
+        return prepareGemmArgsSm120_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##SWAP_AB_<                  \
+          Mxfp8GemmOperator>(                                                                        \
+          D, B, A, weight_sf, input_sf, n, m, k, batch_count);                                       \
+      } else {                                                                                       \
+        return prepareGemmArgsSm120_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##SWAP_AB_<                  \
+          Mxfp8GemmOperator>(                                                                        \
+          D, A, B, input_sf, weight_sf, m, n, k, batch_count);                                       \
+      }                                                                                              \
+    }();                                                                                             \
     /* Return workspace size */                                                                      \
     size_t required_workspace = gemm.get_workspace_size(args);                                       \
     if (!A && !B && !D) {                                                                            \
@@ -238,19 +242,19 @@ size_t genericMxfp8GemmKernelLauncherSm120(void* D, void const* A, void const* B
     auto can_implement = gemm.can_implement(args);                                                   \
     if (can_implement != cutlass::Status::kSuccess) {                                                \
       std::string errMsg = "MXFP8 SM120 Gemm cutlass kernel will fail for params. Error: " +         \
-                           std::string(cutlassGetStatusString(can_implement));                       \
+                           std::string(cutlass::cutlassGetStatusString(can_implement));              \
       throw std::runtime_error("[MXFP8 SM120 gemm Runner] " + errMsg);                               \
     }                                                                                                \
     auto initStatus = gemm.initialize(args, workspace, stream);                                      \
     if (initStatus != cutlass::Status::kSuccess) {                                                   \
       std::string errMsg = "Failed to initialize cutlass MXFP8 gemm on sm120. Error: " +             \
-                           std::string(cutlassGetStatusString(initStatus));                          \
+                           std::string(cutlass::cutlassGetStatusString(initStatus));                 \
       throw std::runtime_error("[MXFP8 SM120 gemm Runner] " + errMsg);                               \
     }                                                                                                \
     auto runStatus = gemm.run(args, workspace, stream, nullptr, /*enablePDL=*/true);                 \
     if (runStatus != cutlass::Status::kSuccess) {                                                    \
       std::string errMsg = "Failed to run cutlass MXFP8 gemm on sm120. Error: " +                    \
-                           std::string(cutlassGetStatusString(runStatus));                           \
+                           std::string(cutlass::cutlassGetStatusString(runStatus));                  \
       throw std::runtime_error("[MXFP8 SM120 gemm Runner] " + errMsg);                               \
     }                                                                                                \
     return required_workspace;                                                                       \

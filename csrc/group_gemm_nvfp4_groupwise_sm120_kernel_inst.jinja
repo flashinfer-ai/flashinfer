@@ -22,8 +22,9 @@ namespace flashinfer {
 namespace group_gemm {
 
 {% for tile_m in [128] %}
-{% for tile_n in [128] %}
+{% for tile_n in [32, 64, 128] %}
 {% for tile_k in [128, 256] %}
+{% for swap_ab in ["true", "false"] %}
 {% for dtype_sfa in ["cutlass::float_ue4m3_t"] %}
 {% for dtype_sfb in ["cutlass::float_ue4m3_t"] %}
 
@@ -32,6 +33,7 @@ INSTANTIATE_GROUP_GEMM_NVFP4_GROUPWISE_SM120(
     {{ tile_m }},
     {{ tile_n }},
     {{ tile_k }},
+    {{ swap_ab }},
     {{ dtype_a | trim }},
     {{ dtype_b  | trim }},
     {{ dtype_sfa | trim  }},
@@ -44,6 +46,7 @@ INSTANTIATE_GROUP_GEMM_NVFP4_GROUPWISE_SM120(
     {{ dtype_d  | replace("cutlass::", "")}}
 )
 
+{% endfor %}
 {% endfor %}
 {% endfor %}
 {% endfor %}

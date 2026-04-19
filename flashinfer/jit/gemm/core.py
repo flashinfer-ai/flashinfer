@@ -197,6 +197,10 @@ def gen_gemm_sm120_module_cutlass_fp4() -> JitSpec:
         dtype_list = ["__nv_bfloat16", "half"]
         # SM120/121 tile configurations with implied 1x1x1 cluster shape
         cta_m_n_k_list = [
+            (128, 32, 128),
+            (128, 32, 256),
+            (128, 64, 128),
+            (128, 64, 256),
             (128, 128, 128),
             (128, 128, 256),
             (256, 128, 128),
@@ -396,6 +400,8 @@ def gen_gemm_sm120_module_cutlass_mxfp8() -> JitSpec:
         # SM120 tile configs matching CutlassTileConfigSM120 enum entries.
         # ClusterShape is always 1x1x1 for SM120 (no programmatic multicast).
         cta_m_n_k_list = [
+            (128, 32, 128),
+            (128, 64, 128),
             (128, 128, 128),
             (256, 128, 128),
             (128, 256, 128),
