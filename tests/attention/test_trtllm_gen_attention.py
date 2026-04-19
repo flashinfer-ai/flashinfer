@@ -43,9 +43,13 @@ TRTLLM_GEN_WORKSPACE_CHECK_BYTES = 1 * 1024 * 1024
 def _trtllm_gen_softmax_slab_bytes(
     num_qo_heads: int, batch_size: int, max_q_len: int
 ) -> int:
-    """Upper bound matching the C++ launcher's tile-aware sizing."""
+    """Upper bound matching the C++ launcher's tile-aware sizing.
+
+    The C++ launcher allocates ``sizeof(float2) * softmax_slots`` bytes, i.e. 8 bytes per
+    slot, where ``softmax_slots = num_qo_heads * batch_size * round_up(max_q_len, 256)``.
+    """
     rounded_max_q_len = ((max_q_len + 255) // 256) * 256
-    return 16 * num_qo_heads * batch_size * rounded_max_q_len  # sizeof(float2)
+    return 8 * num_qo_heads * batch_size * rounded_max_q_len  # sizeof(float2) == 8
 
 
 def trtllm_gen_workspace_softmax_end_bytes_context(

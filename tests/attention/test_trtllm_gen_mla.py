@@ -24,9 +24,15 @@ TRTLLM_GEN_WORKSPACE_CHECK_BYTES = 1 * 1024 * 1024
 def trtllm_gen_workspace_softmax_end_bytes_decode(
     num_qo_heads: int, batch_size: int, max_q_len: int
 ) -> int:
-    """End offset of the softmax slab in the generation-mode workspace [counter|softmax|scratch]."""
+    """End offset of the softmax slab in the generation-mode workspace [counter|softmax|scratch].
+
+    The C++ launcher allocates ``sizeof(float2) * softmax_slots`` bytes, i.e. 8 bytes per
+    slot, where ``softmax_slots = num_qo_heads * batch_size * round_up(max_q_len, 256)``.
+    """
     rounded_max_q_len = ((max_q_len + 255) // 256) * 256
-    softmax_slab = 16 * num_qo_heads * batch_size * rounded_max_q_len  # sizeof(float2)
+    softmax_slab = (
+        8 * num_qo_heads * batch_size * rounded_max_q_len
+    )  # sizeof(float2) == 8
     return TRTLLM_GEN_COUNTER_BYTES + softmax_slab
 
 
