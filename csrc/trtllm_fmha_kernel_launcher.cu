@@ -197,11 +197,16 @@ void trtllm_paged_attention_launcher(
         num_semaphores * sizeof(uint32_t), 16, "trtllm_gen_counter_workspace");
   }
 
-  // Only allocate the softmax stats buffer when LSE is requested. Size it by the kernel's
-  // tile-aligned write layout [batchSize, mMaxNumCtasQ, numHeadsQ] rather than the token count
-  // (mSumOfSeqLensQ) so variable-q workloads can't OOB into the preceding counter region.
-  // round_up(max_q_len, 256) is a safe upper bound on mMaxNumCtasQ * TileSizePerCtaQ for all
-  // currently selectable kernels.
+  // Only allocate the softmax stats buffer when LSE is requested. The kernel's write layout is
+  // [batchSize, mMaxNumCtasQ, numHeadsQ] float2 elements (see fmhaReduction.cu), where
+  // mMaxNumCtasQ = ceil_div(max_q_len, mStepQ) is bounded above by max_q_len for all currently
+  // selectable kernels. We use round_up(max_q_len, 256) as a static upper bound on mMaxNumCtasQ:
+  //   * For generation kernels with mStepQ == 1 (decode, spec-decoding), this is tight up to a
+  //     padding of at most 255 slots per batch/head.
+  //   * For context kernels (mStepQ == 64/128), this over-allocates by roughly mStepQ. A tighter
+  //     bound would require deferring the allocation until after kernel selection so mStepQ is
+  //     known here.
+  // TODO: revisit once kernel selection exposes mStepQ ahead of the workspace carve-out.
   if (lse != nullptr) {
     size_t const softmax_slots = static_cast<size_t>(num_qo_heads) *
                                  static_cast<size_t>(batch_size) *
@@ -351,6 +356,7 @@ void trtllm_paged_attention_decode(
   float* lse_ptr = nullptr;
   if (lse.has_value()) {
     TVM_FFI_ICHECK_EQ(lse.value().dtype(), dl_float32) << "lse must be a float32 tensor";
+    TVM_FFI_ICHECK_EQ(lse.value().ndim(), 2) << "lse must be a 2D tensor";
     lse_ptr = static_cast<float*>(lse.value().data_ptr());
   }
   auto maybe_bmm1_scale_value = bmm1_scale.as<double>();
@@ -479,6 +485,7 @@ void trtllm_paged_attention_context(
   float* lse_ptr = nullptr;
   if (lse.has_value()) {
     TVM_FFI_ICHECK_EQ(lse.value().dtype(), dl_float32) << "lse must be a float32 tensor";
+    TVM_FFI_ICHECK_EQ(lse.value().ndim(), 2) << "lse must be a 2D tensor";
     lse_ptr = static_cast<float*>(lse.value().data_ptr());
   }
 
