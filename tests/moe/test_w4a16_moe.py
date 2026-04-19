@@ -31,12 +31,28 @@ from flashinfer.utils import is_sm90a_supported
 
 # MXFP4 lookup table: 4-bit encoding -> float value (sign bit is bit 3).
 _FP4_LUT = (
-    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
 )
 
 
-def _dequant_mxfp4_on_device(w_fp4: torch.Tensor, w_scale: torch.Tensor) -> torch.Tensor:
+def _dequant_mxfp4_on_device(
+    w_fp4: torch.Tensor, w_scale: torch.Tensor
+) -> torch.Tensor:
     """GPU dequant for a batched MXFP4 tensor.
 
     Args:
@@ -117,14 +133,14 @@ def _compute_with_experts_subset(
 # n=2048): batch extremes, hidden/inter shapes, expert count, top_k, and a
 # Qwen3-MoE-like wide-hidden config.
 COVERAGE_CONFIGS = [
-    (1, 4096, 256, 6, 2048),       # smallest batch, primary shape
-    (512, 4096, 256, 6, 2048),     # largest batch
-    (16, 2048, 256, 6, 1024),      # smaller hidden/inter
-    (16, 7168, 256, 6, 4096),      # Qwen3 wide hidden
-    (16, 4096, 8, 2, 2048),        # few experts
-    (16, 4096, 256, 1, 2048),      # topk=1 edge
-    (16, 4096, 256, 8, 2048),      # topk=8 edge
-    (16, 4096, 256, 6, 4096),      # intermediate_size == hidden_size
+    (1, 4096, 256, 6, 2048),  # smallest batch, primary shape
+    (512, 4096, 256, 6, 2048),  # largest batch
+    (16, 2048, 256, 6, 1024),  # smaller hidden/inter
+    (16, 7168, 256, 6, 4096),  # Qwen3 wide hidden
+    (16, 4096, 8, 2, 2048),  # few experts
+    (16, 4096, 256, 1, 2048),  # topk=1 edge
+    (16, 4096, 256, 8, 2048),  # topk=8 edge
+    (16, 4096, 256, 6, 4096),  # intermediate_size == hidden_size
 ]
 
 ACTIVATION_CONFIGS = [
@@ -218,8 +234,12 @@ def _run_w4a16_moe(
     # WFP4A16FusedMoEMethod.load_quant_scales).
     w1_interleaved = fused_moe.interleave_moe_weights_for_hopper_mixed_gemm(w1, "fp4")
     w2_interleaved = fused_moe.interleave_moe_weights_for_hopper_mixed_gemm(w2, "fp4")
-    w1_scale_interleaved = fused_moe.interleave_moe_scales_for_hopper_mixed_gemm(w1_scale)
-    w2_scale_interleaved = fused_moe.interleave_moe_scales_for_hopper_mixed_gemm(w2_scale)
+    w1_scale_interleaved = fused_moe.interleave_moe_scales_for_hopper_mixed_gemm(
+        w1_scale
+    )
+    w2_scale_interleaved = fused_moe.interleave_moe_scales_for_hopper_mixed_gemm(
+        w2_scale
+    )
 
     quant_scales = [
         w1_scale_interleaved.view(torch.int32),
@@ -261,12 +281,8 @@ def _run_w4a16_moe(
         active = torch.unique(selected_experts.flatten())
         active_w1 = _dequant_mxfp4_on_device(w1[active], w1_scale[active])
         active_w2 = _dequant_mxfp4_on_device(w2[active], w2_scale[active])
-        w31_by_expert = {
-            eid: active_w1[i] for i, eid in enumerate(active.tolist())
-        }
-        w2_by_expert = {
-            eid: active_w2[i] for i, eid in enumerate(active.tolist())
-        }
+        w31_by_expert = {eid: active_w1[i] for i, eid in enumerate(active.tolist())}
+        w2_by_expert = {eid: active_w2[i] for i, eid in enumerate(active.tolist())}
         ref_output = _compute_with_experts_subset(
             active,
             x,

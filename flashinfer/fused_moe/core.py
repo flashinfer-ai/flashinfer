@@ -633,7 +633,9 @@ def interleave_moe_scales_for_hopper_mixed_gemm(
         raise ValueError(
             f"K/group_size={kgs} must be divisible by interleave factor {factor}"
         )
-    tmp = scales.reshape(e, rows, kgs // factor, factor).permute(0, 2, 1, 3).contiguous()
+    tmp = (
+        scales.reshape(e, rows, kgs // factor, factor).permute(0, 2, 1, 3).contiguous()
+    )
     return tmp.reshape(e, kgs // factor, rows * factor)
 
 
@@ -679,7 +681,9 @@ def interleave_moe_weights_for_hopper_mixed_gemm(
 
     qtype_map = {"fp4": 1, "int4": 0}
     if quant_type not in qtype_map:
-        raise ValueError(f"quant_type must be one of {list(qtype_map)}; got {quant_type!r}")
+        raise ValueError(
+            f"quant_type must be one of {list(qtype_map)}; got {quant_type!r}"
+        )
 
     weight = weight.contiguous()
     out = torch.empty_like(weight)
@@ -687,7 +691,9 @@ def interleave_moe_weights_for_hopper_mixed_gemm(
     major, minor = get_compute_capability(weight.device)
     device_arch = f"{major * 10 + minor}"
     module = get_cutlass_fused_moe_module(device_arch)
-    module.interleave_moe_weights_for_Hopper_mixed_gemm(weight, out, qtype_map[quant_type])
+    module.interleave_moe_weights_for_Hopper_mixed_gemm(
+        weight, out, qtype_map[quant_type]
+    )
     return out
 
 
