@@ -31,6 +31,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <climits>
 #include <cstdint>
 #include <type_traits>
 
@@ -237,7 +238,12 @@ __global__ void FusedQKNormRopeKernel(DType* __restrict__ q,               // [n
     // [pair_offset, 2*pair_offset) via __shfl_xor_sync.
     // pair_offset must be a power of 2 for this exchange to be correct; we
     // enforce that in the C++ launcher / Python API.
-    __syncwarp();
+    //
+    // __shfl_xor_sync with a full mask (0xffffffff) is itself a warp-wide
+    // barrier, and this kernel only touches registers (no shared/global
+    // memory) between the prior writes and the shuffle, so no explicit
+    // __syncwarp() is needed -- see `QKRMSNormKernel` in flashinfer/norm.cuh
+    // for the same convention.
     int const pair_offset = (rotary_dim / 2) / numElemsPerThread;
 #pragma unroll
     for (int i = 0; i < numElemsPerThread; i++) {
@@ -253,8 +259,6 @@ __global__ void FusedQKNormRopeKernel(DType* __restrict__ q,               // [n
       float theta = pos_id * freq;
       __sincosf(theta, &sin_vals[i], &cos_vals[i]);
     }
-    // __shfl_xor_sync does not emit a memfence; sync before re-using `elements`.
-    __syncwarp();
   }
 
   bool const is_full_rope = (rotary_dim == head_dim);
@@ -311,8 +315,17 @@ cudaError_t FusedQKNormRopeLauncher(DType* q, DType* k, DType const* q_weight,
   constexpr int block_size = 256;
   int const warps_per_block = block_size / 32;
   int const total_qk_heads = num_q_heads + num_kv_heads;
-  int const total_warps = num_tokens * total_qk_heads;
-  int const grid_size = (total_warps + warps_per_block - 1) / warps_per_block;
+  // Use int64_t for the intermediate so num_tokens * total_qk_heads cannot
+  // silently overflow int32 (e.g., ~54M tokens with H_q+H_k = 40 already
+  // approaches INT_MAX). CUDA's x-grid limit is still INT_MAX, so the
+  // resulting grid_size must fit in int.
+  int64_t const total_warps =
+      static_cast<int64_t>(num_tokens) * static_cast<int64_t>(total_qk_heads);
+  int64_t const grid_size_i64 = (total_warps + warps_per_block - 1) / warps_per_block;
+  if (grid_size_i64 > static_cast<int64_t>(INT_MAX)) {
+    return cudaErrorInvalidConfiguration;
+  }
+  int const grid_size = static_cast<int>(grid_size_i64);
   dim3 grid_dim(grid_size);
   dim3 block_dim(block_size);
 

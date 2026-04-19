@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <climits>
 #include <flashinfer/fused_qk_norm_rope.cuh>
 
 #include "tvm_ffi_utils.h"
@@ -77,6 +78,14 @@ void fused_qk_norm_rope(TensorView q, TensorView k, TensorView q_weight, TensorV
   TVM_FFI_ICHECK_EQ(k_weight.size(0), head_dim) << "k_weight must have shape [head_dim]";
   TVM_FFI_ICHECK_EQ(pos_ids.size(0), nnz) << "pos_ids must have shape [nnz]";
 
+  // FusedQKNormRopeKernel indexes tokens/heads with int32 throughout (to keep
+  // register pressure low). Ensure the batch sizes fit before we cast, so we
+  // fail fast with a clear message instead of silently wrapping.
+  TVM_FFI_ICHECK_LE(nnz, static_cast<int64_t>(INT_MAX))
+      << "nnz (= q.size(0)) must fit in int32, got " << nnz;
+  TVM_FFI_ICHECK_LE(num_q_heads + num_kv_heads, static_cast<int64_t>(INT_MAX))
+      << "num_q_heads + num_kv_heads must fit in int32, got " << (num_q_heads + num_kv_heads);
+
   // head_dim must be one of the template-specialized values and a multiple of 64.
   TVM_FFI_ICHECK(head_dim == 64 || head_dim == 128 || head_dim == 256)
       << "fused_qk_norm_rope only supports head_dim in {64, 128, 256}, got " << head_dim;
@@ -113,6 +122,39 @@ void fused_qk_norm_rope(TensorView q, TensorView k, TensorView q_weight, TensorV
   size_t const q_stride_h = q.stride(1);
   size_t const k_stride_n = k.stride(0);
   size_t const k_stride_h = k.stride(1);
+
+  // FusedQKNormRopeLauncher issues per-lane vectorized loads of width
+  // `num_elems_per_thread * sizeof(DType)` bytes (uint32_t / uint2 / uint4 for
+  // head_dim = 64 / 128 / 256 respectively). The tensor base pointer is
+  // tensor-aligned and the per-lane offset (lane_id * num_elems_per_thread) is
+  // a multiple of num_elems_per_thread, so the full pointer
+  // `base + token_idx * stride_n + head_idx * stride_h + lane_id * num_elems_per_thread`
+  // is aligned iff each non-trivial stride is a multiple of num_elems_per_thread.
+  // Dimensions of size 1 (or broadcast stride 0) contribute no offset and are
+  // exempt. Validate here to fail fast with a clean diagnostic instead of
+  // hitting a misaligned-address error inside the kernel.
+  if (nnz > 1) {
+    TVM_FFI_ICHECK_EQ(q_stride_n % num_elems_per_thread, 0)
+        << "FusedQKNormRopeLauncher: q.stride(0) must be a multiple of head_dim/32 = "
+        << num_elems_per_thread
+        << " to satisfy vectorized load alignment, got q.stride(0) = " << q_stride_n;
+    TVM_FFI_ICHECK_EQ(k_stride_n % num_elems_per_thread, 0)
+        << "FusedQKNormRopeLauncher: k.stride(0) must be a multiple of head_dim/32 = "
+        << num_elems_per_thread
+        << " to satisfy vectorized load alignment, got k.stride(0) = " << k_stride_n;
+  }
+  if (num_q_heads > 1) {
+    TVM_FFI_ICHECK_EQ(q_stride_h % num_elems_per_thread, 0)
+        << "FusedQKNormRopeLauncher: q.stride(1) must be a multiple of head_dim/32 = "
+        << num_elems_per_thread
+        << " to satisfy vectorized load alignment, got q.stride(1) = " << q_stride_h;
+  }
+  if (num_kv_heads > 1) {
+    TVM_FFI_ICHECK_EQ(k_stride_h % num_elems_per_thread, 0)
+        << "FusedQKNormRopeLauncher: k.stride(1) must be a multiple of head_dim/32 = "
+        << num_elems_per_thread
+        << " to satisfy vectorized load alignment, got k.stride(1) = " << k_stride_h;
+  }
 
   ffi::CUDADeviceGuard device_guard(q.device().device_id);
   cudaStream_t const stream = get_stream(q.device());

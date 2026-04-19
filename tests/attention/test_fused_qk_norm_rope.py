@@ -417,3 +417,33 @@ def test_fused_qk_norm_rope_interleave_accepts_partial():
         rotary_dim=24,
         interleave=True,
     )
+
+
+def test_fused_qk_norm_rope_misaligned_stride():
+    """Stride along a non-trivial dimension must be a multiple of
+    ``num_elems_per_thread = head_dim / 32`` so per-lane vectorized loads stay
+    aligned. Construct an ``as_strided`` view with an odd outer stride and
+    check we get a clear validation error rather than a misaligned-address
+    crash inside the kernel."""
+    _skip_if_unsupported()
+    device = "cuda:0"
+    dtype = torch.bfloat16
+    nnz, head_dim = 2, 128  # num_elems_per_thread = 4
+    num_q_heads, num_kv_heads = 4, 2
+
+    bad_stride_n = num_q_heads * head_dim + 1  # not a multiple of 4
+    storage_q = torch.randn(nnz * bad_stride_n, dtype=dtype, device=device)
+    q = torch.as_strided(
+        storage_q,
+        size=(nnz, num_q_heads, head_dim),
+        stride=(bad_stride_n, head_dim, 1),
+    )
+    assert q.stride(-1) == 1 and q.stride(0) % 4 != 0
+
+    k = torch.randn(nnz, num_kv_heads, head_dim, dtype=dtype, device=device)
+    q_weight = torch.ones(head_dim, dtype=dtype, device=device)
+    k_weight = torch.ones(head_dim, dtype=dtype, device=device)
+    pos_ids = torch.arange(nnz, dtype=torch.int32, device=device)
+
+    with pytest.raises(_KERNEL_VALIDATION_EXC):
+        flashinfer.fused_qk_norm_rope(q, k, q_weight, k_weight, pos_ids)
