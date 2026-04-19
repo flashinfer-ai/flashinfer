@@ -807,7 +807,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
             raise RuntimeError(
                 f"cute-dsl backend (MLA decode kernel) requires SM100+, got SM{cc[0]}{cc[1]}"
             )
-        from .cute_dsl import cute_dsl_mla_decode
+        from flashinfer.cute_dsl.attention import cute_dsl_mla_decode
 
         if isinstance(bmm1_scale, torch.Tensor):
             raise ValueError(

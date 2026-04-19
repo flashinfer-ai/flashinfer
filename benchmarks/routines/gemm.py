@@ -140,7 +140,16 @@ def parse_gemm_args(line, parser):
         required=False,
         nargs="+",
         default=["cudnn"],
-        choices=["cudnn", "cublas", "trtllm", "cutlass", "tgv", "cute-dsl", "auto"],
+        choices=[
+            "cudnn",
+            "cublas",
+            "trtllm",
+            "cutlass",
+            "tgv",
+            "cute-dsl",
+            "b12x",
+            "auto",
+        ],
         help="Kernel backends to test. Default: cudnn",
     )
     parser.add_argument(
@@ -1031,7 +1040,14 @@ def testMmFp4(args):
     run_refcheck = args.refcheck
     use_128x4_sf_layout = args.use_128x4_sf_layout
     use_nvfp4 = args.use_nvfp4
-    autotune_supported_backends = ["cudnn", "cutlass", "trtllm", "cute-dsl", "auto"]
+    autotune_supported_backends = [
+        "cudnn",
+        "cutlass",
+        "trtllm",
+        "cute-dsl",
+        "b12x",
+        "auto",
+    ]
     res = []
 
     res_dtype = dtype_str_to_torch_dtype(args.out_dtype)
@@ -1138,21 +1154,18 @@ def testMmFp4(args):
         mat2_inv_s,
         mat2_inv_s_trtllm,
     ):
-        if backend in ["cudnn", "trtllm", "cutlass", "cute-dsl", "auto"]:
-            return flashinfer.gemm.mm_fp4(
-                a=input_fp4,
-                b=mat2_fp4.T if backend != "trtllm" else mat2_fp4_trtllm.T,
-                a_descale=input_inv_s,
-                b_descale=mat2_inv_s.T if backend != "trtllm" else mat2_inv_s_trtllm.T,
-                alpha=(alpha_for_cute_dsl_mxfp4 if (backend == "cute-dsl") else alpha),
-                out_dtype=res_dtype,
-                block_size=block_size,
-                use_8x4_sf_layout=not use_128x4_sf_layout,
-                backend=backend,
-                use_nvfp4=use_nvfp4,
-            )
-        else:
-            raise ValueError(f"Unsupported backend: {backend}")
+        return flashinfer.gemm.mm_fp4(
+            a=input_fp4,
+            b=mat2_fp4.T if backend != "trtllm" else mat2_fp4_trtllm.T,
+            a_descale=input_inv_s,
+            b_descale=mat2_inv_s.T if backend != "trtllm" else mat2_inv_s_trtllm.T,
+            alpha=(alpha_for_cute_dsl_mxfp4 if (backend == "cute-dsl") else alpha),
+            out_dtype=res_dtype,
+            block_size=block_size,
+            use_8x4_sf_layout=not use_128x4_sf_layout,
+            backend=backend,
+            use_nvfp4=use_nvfp4,
+        )
 
     has_reference_output = False
     if run_refcheck:

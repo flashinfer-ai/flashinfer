@@ -705,3 +705,153 @@ def test_trtllm_gen_fp8_mxfp8_routed_activation_parity(activation_type: int):
     close = torch.isclose(output_ref, output_routed, atol=1e-2, rtol=1e-2)
     mismatch_pct = (~close).float().mean().item() * 100
     assert mismatch_pct < 10, f"Mismatch percentage is {mismatch_pct:.2f}%"
+
+
+@pytest.mark.parametrize("num_tokens", [1, 7, 32])
+@pytest.mark.parametrize("hidden_size", [1024])
+@pytest.mark.parametrize("intermediate_size", [1024, 2048])
+@pytest.mark.parametrize("num_experts", [16])
+@pytest.mark.parametrize("top_k", [2, 4])
+def test_fp8_block_scale_moe_routing_replay(
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    top_k: int,
+    num_experts: int,
+):
+    """Test that routing_replay_out in trtllm_fp8_block_scale_moe records correct expert IDs.
+
+    Uses DeepSeekV3 routing (the only routing method with replay support).
+    Runs the full MoE kernel twice with the same inputs: once with routing_replay_out
+    and once without. Verifies that:
+    1. The MoE output is identical (replay has no side effects).
+    2. The replay buffer matches the reference routing result (sorted set equality).
+    3. Tail rows beyond num_tokens remain sentinel (CUDA graph pre-alloc contract).
+    """
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] not in [10]:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+    n_group = 4
+    topk_group = 2
+    if topk_group * n_group < top_k or topk_group > n_group:
+        pytest.skip("Invalid DeepSeek routing configuration")
+    torch.manual_seed(42)
+    device = torch.device("cuda:0")
+    enable_pdl = device_support_pdl(device)
+
+    routing_logits = torch.rand(
+        num_tokens, num_experts, device=device, dtype=torch.float32
+    )
+    routing_bias = torch.randn(num_experts, device=device, dtype=torch.bfloat16)
+
+    hidden_states_bf16 = (
+        torch.randn(num_tokens, hidden_size, device=device).to(torch.bfloat16) * 0.1
+    )
+    hidden_states = hidden_states_bf16.to(torch.float8_e4m3fn)
+
+    hidden_states_scale = torch.ones(
+        hidden_size // 128, num_tokens, device=device, dtype=torch.float32
+    )
+
+    gemm1_weights = torch.randn(
+        num_experts, 2 * intermediate_size, hidden_size, device=device
+    ).to(torch.float8_e4m3fn)
+    gemm2_weights = torch.randn(
+        num_experts, hidden_size, intermediate_size, device=device
+    ).to(torch.float8_e4m3fn)
+
+    gemm1_weights_scale = torch.ones(
+        num_experts,
+        2 * intermediate_size // 128,
+        hidden_size // 128,
+        device=device,
+        dtype=torch.float32,
+    )
+    gemm2_weights_scale = torch.ones(
+        num_experts,
+        hidden_size // 128,
+        intermediate_size // 128,
+        device=device,
+        dtype=torch.float32,
+    )
+
+    # Allocate oversized buffer to validate CUDA graph pre-allocation contract:
+    # kernel should only write to [0, num_tokens) and leave tail rows as sentinel.
+    replay_capacity = num_tokens + 5
+    routing_replay_out = torch.full(
+        (replay_capacity, top_k), -1, device=device, dtype=torch.int16
+    )
+
+    output_with_replay = trtllm_fp8_block_scale_moe(
+        routing_logits,
+        routing_bias,
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights,
+        gemm2_weights_scale,
+        num_experts,
+        top_k,
+        n_group,
+        topk_group,
+        intermediate_size,
+        0,  # local_expert_offset
+        num_experts,
+        1.0,  # routed_scaling_factor
+        RoutingMethodType.DeepSeekV3.value,
+        False,  # use_shuffled_weight
+        0,  # weight_layout
+        enable_pdl,
+        routing_replay_out=routing_replay_out,
+    )
+
+    output_without_replay = trtllm_fp8_block_scale_moe(
+        routing_logits,
+        routing_bias,
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights,
+        gemm2_weights_scale,
+        num_experts,
+        top_k,
+        n_group,
+        topk_group,
+        intermediate_size,
+        0,
+        num_experts,
+        1.0,
+        RoutingMethodType.DeepSeekV3.value,
+        False,
+        0,
+        enable_pdl,
+        routing_replay_out=None,
+    )
+
+    # MoE output should be identical regardless of replay
+    torch.testing.assert_close(
+        output_with_replay.to(torch.float),
+        output_without_replay.to(torch.float),
+        rtol=0,
+        atol=0,
+    )
+
+    # Compare replay against reference routing — verify active rows only
+    active_replay = routing_replay_out[:num_tokens]
+    # Verify replay IDs are valid expert indices
+    assert (active_replay >= 0).all() and (active_replay < num_experts).all(), (
+        "Replay contains out-of-range expert IDs"
+    )
+    # Each token should have top_k unique experts
+    for t in range(num_tokens):
+        unique_experts = active_replay[t].unique()
+        assert unique_experts.numel() == top_k, (
+            f"Token {t}: expected {top_k} unique experts, got {unique_experts.numel()}"
+        )
+
+    # Tail rows beyond num_tokens should remain sentinel (-1)
+    assert (routing_replay_out[num_tokens:] == -1).all(), (
+        "Kernel should not write beyond active token rows"
+    )

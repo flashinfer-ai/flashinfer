@@ -345,6 +345,12 @@ __global__ void routingMainKernel(KernelParams params) {
           params.mPtrTopKIds == nullptr) {
         params.mPtrTopKWeights[idxTopK] = finalScore;
       }
+
+      // Routing replay: record all top-K selected expert IDs per token.
+      // Layout: [num_tokens, topK] -- same indexing as mPtrTopKPacked.
+      if (params.mPtrRoutingReplayOut != nullptr && laneIdx < params.mTopK) {
+        params.mPtrRoutingReplayOut[idxTopK] = static_cast<int16_t>(expertIdx);
+      }
     }
   }
 
@@ -477,8 +483,7 @@ void run(Data& data, void* stream) {
                        "When mPtrTopKIds is provided, mPtrTopKWeights must also be provided for "
                        "DeepSeek routing.");
     }
-    int const numThreadsHist = routingCustom::getMaxNumExperts(data.mNumExperts);
-    runPostTopKPipeline(data, numThreadsHist, stream);
+    runPostTopKPipeline(data, stream);
     return;
   }
 
@@ -525,12 +530,10 @@ void run(Data& data, void* stream) {
 
   int const numBlocks = data.mNumTokens;
   int const numThreadsHist = getMaxNumExperts(data.mNumExperts);
-  bool const pdl = data.mUsePdl;
 
   // Step 1: Run DeepSeek-specific topK computation (writes to mPtrTopKPacked)
   int const numThreadsMain =
       std::max(data.mNumExpertGroups * WarpSize, getMaxNumExperts(data.mNumExperts));
-  data.mPdlOverlapWithNext = pdl;  // Intermediate — allow permutation pipeline to overlap
   launchMainKernel(data, numBlocks, numThreadsMain, stream);
 
   // Step 2: Permutation pipeline (reads from mPtrTopKPacked written by step 1)
@@ -540,29 +543,21 @@ void run(Data& data, void* stream) {
       FLASHINFER_CHECK(data.mPtrExpertCounts != nullptr,
                        "When #tokens is large, `mPtrExpertCounts` is a required input.");
     } else {
-      data.mPtrExpertCounts =
-          nullptr;  // Set it to nullptr for single-cluster code path, as it won't be used
+      data.mPtrExpertCounts = nullptr;
     }
 
-    // Number of blocks we can use in the cooperative kernel
     static int const smCount = tensorrt_llm::common::getMultiProcessorCount();
-    // WAR: Reserve 8 SMs for overlapping kernels.
     int const numBlocksCoop = smCount - 8;
-    // Maximum number of tokens supported by the kernel using a cooperative launch.
     int const maxTokensCoop = (numBlocksCoop * numThreadsHist * 64) / data.mTopK;
 
     if (useSingleCluster) {
-      data.mPdlOverlapWithNext = false;  // Last kernel
       launchClusterKernel(data, numThreadsHist, stream);
     } else if (data.mNumTokens <= maxTokensCoop) {
-      data.mPdlOverlapWithNext = false;  // Last kernel
       launchCoopKernel(data, numBlocksCoop, numThreadsHist, stream);
     } else {
       const int32_t expandedIdxSize = data.mNumTokens * data.mTopK;
       const int32_t histogramEltsPerBlock = 8 * numThreadsHist;
       const int32_t offsetEltsPerBlock = NumEltsPerOffsetTilePerThread * numThreadsHist;
-
-      // Limit grid size (both kernels use a grid-stride loop).
       const int32_t maxNumBlocks = 1024;
 
       int const numBlocksHistogram = std::min(
@@ -570,9 +565,7 @@ void run(Data& data, void* stream) {
       int const numBlocksOffsets =
           std::min((expandedIdxSize + offsetEltsPerBlock - 1) / offsetEltsPerBlock, maxNumBlocks);
 
-      data.mPdlOverlapWithNext = pdl;  // Intermediate
       launchHistogramKernel(data, numBlocksHistogram, numThreadsHist, stream);
-      data.mPdlOverlapWithNext = false;  // Last kernel
       launchOffsetsKernel(data, numBlocksOffsets, numThreadsHist, stream);
     }
   }
