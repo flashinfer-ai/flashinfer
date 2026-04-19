@@ -783,7 +783,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         num_qo_heads = query.size(2)
         query = query.flatten(0, 1)  # [B*S, H, D]
 
-        if return_lse or lse is not None:
+        if return_lse:
             lse_shape = (batch_size * max_q_len, num_qo_heads)
             if lse is None:
                 lse = torch.empty(lse_shape, dtype=torch.float32, device=query.device)
@@ -794,6 +794,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
             lse_stride_tokens = lse.stride(0)
             lse_stride_heads = lse.stride(1)
         else:
+            lse = None
             lse_stride_tokens = 0
             lse_stride_heads = 0
 

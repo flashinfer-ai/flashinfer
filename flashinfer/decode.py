@@ -2055,7 +2055,9 @@ class TrtllmGenDecodeModule:
         query = query.flatten(0, 1)  # [B*S, H, D]
 
         if lse is not None:
-            assert lse.dtype == torch.float32, "lse must be a float32 tensor"
+            check_shape_dtype_device(
+                lse, (query.size(0), query.size(1)), torch.float32, query.device, "lse"
+            )
             lse_stride_tokens = lse.stride(0)
             lse_stride_heads = lse.stride(1)
         else:
@@ -2614,7 +2616,7 @@ def trtllm_batch_decode_with_kv_cache(
         _check_block_tables_shape(block_tables, uses_shared_paged_kv_idx)
 
         num_qo_heads = query.size(1)
-        if return_lse or lse is not None:
+        if return_lse:
             lse_shape = (query.size(0), num_qo_heads)
             if lse is None:
                 lse = torch.empty(lse_shape, dtype=torch.float32, device=query.device)
@@ -2625,6 +2627,7 @@ def trtllm_batch_decode_with_kv_cache(
             lse_stride_tokens = lse.stride(0)
             lse_stride_heads = lse.stride(1)
         else:
+            lse = None
             lse_stride_tokens = 0
             lse_stride_heads = 0
 

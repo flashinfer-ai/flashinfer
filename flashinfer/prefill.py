@@ -280,7 +280,9 @@ def get_trtllm_gen_prefill_module():
         if isinstance(bmm2_scale, torch.Tensor):
             assert bmm2_scale.dtype == torch.float32
         if lse is not None:
-            assert lse.dtype == torch.float32, "lse must be a float32 tensor"
+            check_shape_dtype_device(
+                lse, (query.size(0), query.size(1)), torch.float32, query.device, "lse"
+            )
             lse_stride_tokens = lse.stride(0)
             lse_stride_heads = lse.stride(1)
         else:
@@ -4123,7 +4125,7 @@ def trtllm_batch_context_with_kv_cache(
     workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
 
     num_qo_heads = query.size(1)
-    if return_lse or lse is not None:
+    if return_lse:
         lse_shape = (query.size(0), num_qo_heads)
         if lse is None:
             lse = torch.empty(lse_shape, dtype=torch.float32, device=query.device)
@@ -4132,6 +4134,7 @@ def trtllm_batch_context_with_kv_cache(
         lse_stride_tokens = lse.stride(0)
         lse_stride_heads = lse.stride(1)
     else:
+        lse = None
         lse_stride_tokens = 0
         lse_stride_heads = 0
 
