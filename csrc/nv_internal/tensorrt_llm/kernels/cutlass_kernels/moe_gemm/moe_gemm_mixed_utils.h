@@ -16,20 +16,19 @@
 
 #pragma once
 
-#include <cstdint>
 #include <cuda_runtime.h>
+
+#include <cstdint>
 
 namespace tensorrt_llm {
 namespace kernels {
 namespace cutlass_kernels {
 
-void interleave_fp4_weights_for_Hopper_mixed_gemm(
-    uint8_t* weight, uint8_t* weight_interleaved, int rows, int cols,
-    cudaStream_t stream = 0);
+void interleave_fp4_weights_for_Hopper_mixed_gemm(uint8_t* weight, uint8_t* weight_interleaved,
+                                                  int rows, int cols, cudaStream_t stream = 0);
 
-void interleave_int4_weights_for_Hopper_mixed_gemm(
-    uint8_t* weight, uint8_t* weight_interleaved, int rows, int cols,
-    cudaStream_t stream = 0);
+void interleave_int4_weights_for_Hopper_mixed_gemm(uint8_t* weight, uint8_t* weight_interleaved,
+                                                   int rows, int cols, cudaStream_t stream = 0);
 
 }  // namespace cutlass_kernels
 }  // namespace kernels

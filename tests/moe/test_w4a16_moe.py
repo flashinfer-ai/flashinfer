@@ -43,8 +43,15 @@ def _dequant_mxfp4_batches_host(w_fp4, w_scale):
 
 
 def _compute_with_experts(
-    num_experts, x, w31_weight, w2_weight, selected_experts, routing_weights,
-    alpha=None, beta=None, limit=None,
+    num_experts,
+    x,
+    w31_weight,
+    w2_weight,
+    selected_experts,
+    routing_weights,
+    alpha=None,
+    beta=None,
+    limit=None,
 ):
     """Reference MoE output with dequantized weights."""
     results = torch.zeros_like(x)
@@ -161,8 +168,12 @@ def _run_w4a16_moe(
     w2 = torch.randint(0, 256, (e, k, n // 2), device=device, dtype=torch.uint8)
 
     # MXFP4 scales
-    w1_scale = torch.randint(118, 123, (e, 2 * n, k // 32), device=device, dtype=torch.uint8)
-    w2_scale = torch.randint(118, 123, (e, k, n // 32), device=device, dtype=torch.uint8)
+    w1_scale = torch.randint(
+        118, 123, (e, 2 * n, k // 32), device=device, dtype=torch.uint8
+    )
+    w2_scale = torch.randint(
+        118, 123, (e, k, n // 32), device=device, dtype=torch.uint8
+    )
 
     # Routing
     router_logits = torch.randn(m, e, dtype=torch.bfloat16, device=device)
@@ -206,13 +217,31 @@ def _run_w4a16_moe(
         f"Non-finite output: NaN={torch.isnan(flash_output).sum()}, "
         f"Inf={torch.isinf(flash_output).sum()}"
     )
-    assert flash_output.shape == (m, k), f"Shape mismatch: {flash_output.shape} vs ({m}, {k})"
+    assert flash_output.shape == (m, k), (
+        f"Shape mismatch: {flash_output.shape} vs ({m}, {k})"
+    )
 
     if check_correctness:
-        dq_w1 = _dequant_mxfp4_batches_host(w1.cpu(), w1_scale.cpu()).cuda().to(torch.bfloat16)
-        dq_w2 = _dequant_mxfp4_batches_host(w2.cpu(), w2_scale.cpu()).cuda().to(torch.bfloat16)
+        dq_w1 = (
+            _dequant_mxfp4_batches_host(w1.cpu(), w1_scale.cpu())
+            .cuda()
+            .to(torch.bfloat16)
+        )
+        dq_w2 = (
+            _dequant_mxfp4_batches_host(w2.cpu(), w2_scale.cpu())
+            .cuda()
+            .to(torch.bfloat16)
+        )
         ref_output = _compute_with_experts(
-            e, x, dq_w1, dq_w2, selected_experts, routing_weights, alpha, beta, limit,
+            e,
+            x,
+            dq_w1,
+            dq_w2,
+            selected_experts,
+            routing_weights,
+            alpha,
+            beta,
+            limit,
         )
         torch.testing.assert_close(ref_output, flash_output, rtol=1e-1, atol=1e-1)
 
@@ -224,24 +253,39 @@ def _run_w4a16_moe(
 # ============================================================================
 
 
-@pytest.mark.skipif(not is_sm90a_supported(torch.device("cuda")), reason="W4A16 MoE requires SM90")
+@pytest.mark.skipif(
+    not is_sm90a_supported(torch.device("cuda")), reason="W4A16 MoE requires SM90"
+)
 @pytest.mark.parametrize(
     "batch_size,hidden_size,num_experts,top_k,intermediate_size",
     CORRECTNESS_CONFIGS,
     ids=[f"m{c[0]}_h{c[1]}_e{c[2]}_k{c[3]}" for c in CORRECTNESS_CONFIGS],
 )
-def test_w4a16_moe_correctness(batch_size, hidden_size, num_experts, top_k, intermediate_size):
+def test_w4a16_moe_correctness(
+    batch_size, hidden_size, num_experts, top_k, intermediate_size
+):
     """Strict correctness verification against dequantized reference (small configs)."""
-    _run_w4a16_moe(batch_size, hidden_size, num_experts, top_k, intermediate_size, check_correctness=True)
+    _run_w4a16_moe(
+        batch_size,
+        hidden_size,
+        num_experts,
+        top_k,
+        intermediate_size,
+        check_correctness=True,
+    )
 
 
-@pytest.mark.skipif(not is_sm90a_supported(torch.device("cuda")), reason="W4A16 MoE requires SM90")
+@pytest.mark.skipif(
+    not is_sm90a_supported(torch.device("cuda")), reason="W4A16 MoE requires SM90"
+)
 @pytest.mark.parametrize(
     "batch_size,hidden_size,num_experts,top_k,intermediate_size",
     COVERAGE_CONFIGS,
     ids=[f"m{c[0]}_h{c[1]}_e{c[2]}_k{c[3]}_n{c[4]}" for c in COVERAGE_CONFIGS],
 )
-def test_w4a16_moe_coverage(batch_size, hidden_size, num_experts, top_k, intermediate_size):
+def test_w4a16_moe_coverage(
+    batch_size, hidden_size, num_experts, top_k, intermediate_size
+):
     """Sanity coverage: finite + shape checks across varied configurations.
 
     Large-K correctness is a known gap in the existing SM90 mixed-dtype kernel
@@ -249,10 +293,19 @@ def test_w4a16_moe_coverage(batch_size, hidden_size, num_experts, top_k, interme
     """
     if top_k > num_experts:
         pytest.skip(f"top_k ({top_k}) > num_experts ({num_experts})")
-    _run_w4a16_moe(batch_size, hidden_size, num_experts, top_k, intermediate_size, check_correctness=False)
+    _run_w4a16_moe(
+        batch_size,
+        hidden_size,
+        num_experts,
+        top_k,
+        intermediate_size,
+        check_correctness=False,
+    )
 
 
-@pytest.mark.skipif(not is_sm90a_supported(torch.device("cuda")), reason="W4A16 MoE requires SM90")
+@pytest.mark.skipif(
+    not is_sm90a_supported(torch.device("cuda")), reason="W4A16 MoE requires SM90"
+)
 @pytest.mark.parametrize(
     "batch_size,hidden_size,num_experts,top_k,intermediate_size,alpha,beta,limit",
     ACTIVATION_CONFIGS,
@@ -262,10 +315,29 @@ def test_w4a16_moe_activations(
     batch_size, hidden_size, num_experts, top_k, intermediate_size, alpha, beta, limit
 ):
     """Correctness test with different activation configurations (small configs)."""
-    _run_w4a16_moe(batch_size, hidden_size, num_experts, top_k, intermediate_size, alpha, beta, limit, check_correctness=True)
+    _run_w4a16_moe(
+        batch_size,
+        hidden_size,
+        num_experts,
+        top_k,
+        intermediate_size,
+        alpha,
+        beta,
+        limit,
+        check_correctness=True,
+    )
 
 
-@pytest.mark.skipif(not is_sm90a_supported(torch.device("cuda")), reason="W4A16 MoE requires SM90")
+@pytest.mark.skipif(
+    not is_sm90a_supported(torch.device("cuda")), reason="W4A16 MoE requires SM90"
+)
 def test_w4a16_moe_core_config():
     """Primary target configuration sanity: experts=256, topk=6, hidden=4096, inter=2048."""
-    _run_w4a16_moe(batch_size=4, hidden_size=4096, num_experts=256, top_k=6, intermediate_size=2048, check_correctness=False)
+    _run_w4a16_moe(
+        batch_size=4,
+        hidden_size=4096,
+        num_experts=256,
+        top_k=6,
+        intermediate_size=2048,
+        check_correctness=False,
+    )

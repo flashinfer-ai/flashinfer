@@ -5,7 +5,6 @@ Configs:
   - Large bs (1024): EP mode — fewer local experts, full intermediate
 """
 
-import time
 import torch
 import torch.nn.functional as F
 
@@ -40,8 +39,12 @@ def bench_w4a16_moe(
     w2 = torch.randint(0, 256, (e, k, n // 2), device=device, dtype=torch.uint8)
 
     # MXFP4 scales
-    w1_scale = torch.randint(118, 123, (e, 2 * n, k // 32), device=device, dtype=torch.uint8)
-    w2_scale = torch.randint(118, 123, (e, k, n // 32), device=device, dtype=torch.uint8)
+    w1_scale = torch.randint(
+        118, 123, (e, 2 * n, k // 32), device=device, dtype=torch.uint8
+    )
+    w2_scale = torch.randint(
+        118, 123, (e, k, n // 32), device=device, dtype=torch.uint8
+    )
 
     # Routing
     router_logits = torch.randn(m, e, dtype=torch.bfloat16, device=device)
@@ -83,7 +86,9 @@ def bench_w4a16_moe(
         end_events[i].record()
     torch.cuda.synchronize()
 
-    times_ms = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
+    times_ms = [
+        s.elapsed_time(e) for s, e in zip(start_events, end_events, strict=True)
+    ]
     times_ms.sort()
     # Use median
     median_ms = times_ms[len(times_ms) // 2]
@@ -117,8 +122,8 @@ def main():
     # =========================================================================
     H, N_full, E_full, K = 4096, 2048, 256, 6
 
-    print(f"\n--- Small BS (decode-like, TP mode) ---")
-    print(f"    TP splits intermediate_size, keeps all experts")
+    print("\n--- Small BS (decode-like, TP mode) ---")
+    print("    TP splits intermediate_size, keeps all experts")
     for tp in [1, 2, 4, 8]:
         n_tp = N_full // tp
         if n_tp < 64:
@@ -132,8 +137,8 @@ def main():
             label=f"TP{tp} (inter={n_tp})",
         )
 
-    print(f"\n--- Large BS (prefill-like, EP mode) ---")
-    print(f"    EP splits experts, keeps full intermediate_size")
+    print("\n--- Large BS (prefill-like, EP mode) ---")
+    print("    EP splits experts, keeps full intermediate_size")
     for ep in [1, 2, 4, 8]:
         e_ep = E_full // ep
         topk = min(K, e_ep)

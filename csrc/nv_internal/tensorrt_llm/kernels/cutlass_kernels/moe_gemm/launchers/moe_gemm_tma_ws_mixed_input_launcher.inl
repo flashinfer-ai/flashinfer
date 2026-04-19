@@ -26,6 +26,7 @@
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
+#include "cutlass/gemm/kernel/tile_scheduler_params.h"
 #include "cutlass/util/command_line.h"
 #include "cutlass/util/distribution.h"
 #include "cutlass/util/host_tensor.h"
@@ -43,7 +44,6 @@
 #include "cutlass_extensions/epilogue_helpers.h"
 #include "cutlass_extensions/gemm/collective/collective_builder_mixed_input.hpp"
 #include "cutlass_extensions/gemm_configs.h"
-#include "cutlass/gemm/kernel/tile_scheduler_params.h"
 
 #ifdef __GNUC__  // Check if the compiler is GCC or Clang
 #pragma GCC diagnostic pop
@@ -204,7 +204,8 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(
       hw_info};
 
   // Optimize tile scheduling for better L2 locality
-  using RasterOrderOptions = typename cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90Params::RasterOrderOptions;
+  using RasterOrderOptions =
+      typename cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90Params::RasterOrderOptions;
   arguments.scheduler.max_swizzle_size = 2;
   arguments.scheduler.raster_order = RasterOrderOptions::Heuristic;
 

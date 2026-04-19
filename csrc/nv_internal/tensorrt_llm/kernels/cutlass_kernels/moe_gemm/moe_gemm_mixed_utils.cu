@@ -22,8 +22,10 @@ namespace cutlass_kernels {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-__global__ void interleave_fp4_weights_for_Hopper_mixed_gemm_kernel(
-    uint8_t* fp4_weight, uint8_t* fp4_weight_interleaved, int const rows, int const cols) {
+__global__ void interleave_fp4_weights_for_Hopper_mixed_gemm_kernel(uint8_t* fp4_weight,
+                                                                    uint8_t* fp4_weight_interleaved,
+                                                                    int const rows,
+                                                                    int const cols) {
   for (int block_id = blockIdx.x; block_id < rows / 2; block_id += gridDim.x) {
     for (int partition_id = threadIdx.y; partition_id < cols / 64; partition_id += blockDim.y) {
       int lane_id = threadIdx.x;
@@ -32,8 +34,7 @@ __global__ void interleave_fp4_weights_for_Hopper_mixed_gemm_kernel(
       int mma_id = lane_id / 8;
       int dst_row_id = row_id + (mma_id % 2) * 8;
 
-      int interleaved_lane_id =
-          lane_id / 16 * 16 + (lane_id % 4) * 4 + (lane_id % 8) / 4 * 2;
+      int interleaved_lane_id = lane_id / 16 * 16 + (lane_id % 4) * 4 + (lane_id % 8) / 4 * 2;
 
       int col_id = partition_id * 32 + lane_id;
       int dst_col_id = partition_id * 32 + interleaved_lane_id;
@@ -92,17 +93,17 @@ __global__ void interleave_int4_weights_for_Hopper_mixed_gemm_kernel(
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-void interleave_fp4_weights_for_Hopper_mixed_gemm(
-    uint8_t* fp4_weight, uint8_t* fp4_weight_interleaved, int const rows, int const cols,
-    cudaStream_t stream) {
+void interleave_fp4_weights_for_Hopper_mixed_gemm(uint8_t* fp4_weight,
+                                                  uint8_t* fp4_weight_interleaved, int const rows,
+                                                  int const cols, cudaStream_t stream) {
   dim3 block(32, 32);
   interleave_fp4_weights_for_Hopper_mixed_gemm_kernel<<<1024, block, 0, stream>>>(
       fp4_weight, fp4_weight_interleaved, rows, cols);
 }
 
-void interleave_int4_weights_for_Hopper_mixed_gemm(
-    uint8_t* int4_weight, uint8_t* int4_weight_interleaved, int const rows, int const cols,
-    cudaStream_t stream) {
+void interleave_int4_weights_for_Hopper_mixed_gemm(uint8_t* int4_weight,
+                                                   uint8_t* int4_weight_interleaved, int const rows,
+                                                   int const cols, cudaStream_t stream) {
   dim3 block(16, 32);
   interleave_int4_weights_for_Hopper_mixed_gemm_kernel<<<1024, block, 0, stream>>>(
       int4_weight, int4_weight_interleaved, rows, cols);
