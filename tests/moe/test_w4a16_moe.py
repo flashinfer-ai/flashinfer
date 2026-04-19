@@ -3,17 +3,17 @@
 Covers the mixed-dtype MoE GEMM path where weights are 4-bit MXFP4
 and activations are 16-bit BF16 (Hopper SM90 path via cutlass_fused_moe).
 
-Correctness is verified for hidden_size=128 configs by dequantizing MXFP4
-weights to BF16 on host, computing a reference MoE output in PyTorch, and
-comparing with kernel output via ``torch.testing.assert_close(rtol=1e-1,
-atol=1e-1)``. This matches ``test_trtllm_cutlass_fused_moe.py`` — the upstream
-W4A16 test also only covers h=128 (see ``HIDDEN_SIZES`` in that file).
+Correctness is verified by dequantizing MXFP4 weights to BF16 on host,
+computing a reference MoE output in PyTorch, and comparing with kernel output
+via ``torch.testing.assert_close(rtol=1e-1, atol=1e-1)`` — matching
+``test_trtllm_cutlass_fused_moe.py`` and TensorRT-LLM's
+``test_fused_moe_jiangs.py``.
 
-Larger configurations (h>=768) are exercised as *sanity* coverage (finite
-output, correct shape) but intentionally skip value-level correctness: the
-existing SM90 mixed-dtype kernel path produces outputs that diverge from a
-dequantized reference when K spans multiple MXFP4 blocks. That pre-existing
-correctness gap is orthogonal to this PR's scope (performance fix).
+The SM90 mixed-input GEMM consumes weights in a specific interleaved byte
+layout (see ``interleave_moe_weights_for_hopper_mixed_gemm``); every test
+below preprocesses weights through that helper before invoking the kernel,
+mirroring TensorRT-LLM's weight-load path (PR #12451,
+``trtllm::interleave_4bit_weights_for_Hopper_mixed_gemm``).
 
 Target configuration: experts=256, topk=6, hidden_size=4096, intermediate_size=2048
 """
@@ -119,17 +119,19 @@ COVERAGE_CONFIGS = [
 ]
 
 ACTIVATION_CONFIGS = [
-    (1, 128, 2, 2, 128, None, None, None),
-    (1, 128, 2, 2, 128, 0.5, 0.0, 7.0),
-    (1, 128, 2, 2, 128, 1.702, 1.0, 7.0),
+    (4, 4096, 8, 4, 2048, None, None, None),
+    (4, 4096, 8, 4, 2048, 0.5, 0.0, 7.0),
+    (4, 4096, 8, 4, 2048, 1.702, 1.0, 7.0),
 ]
 
-# Small configs for strict correctness (matching test_trtllm_cutlass_fused_moe.py: h=128)
+# Correctness configs mirroring TRT-LLM's W4A16 MoE coverage
+# (test_fused_moe_jiangs.py uses h=768 / 1024 with group_size=32).
 CORRECTNESS_CONFIGS = [
     (1, 128, 2, 2, 128),
     (4, 128, 4, 2, 128),
-    (8, 128, 2, 2, 128),
-    (16, 128, 4, 2, 128),
+    (4, 768, 8, 2, 512),
+    (4, 2048, 8, 4, 1024),
+    (4, 4096, 8, 4, 2048),
 ]
 
 
@@ -192,7 +194,19 @@ def _run_w4a16_moe(
     else:
         alpha_t = limit_t = beta_t = None
 
-    quant_scales = [w1_scale.view(torch.int32), w2_scale.view(torch.int32)]
+    # The SM90 mixed-input GEMM expects MXFP4 weights AND scales in a specific
+    # interleaved layout. Matching TensorRT-LLM PR #12451
+    # (trtllm::interleave_4bit_weights_for_Hopper_mixed_gemm and
+    # WFP4A16FusedMoEMethod.load_quant_scales).
+    w1_interleaved = fused_moe.interleave_moe_weights_for_hopper_mixed_gemm(w1, "fp4")
+    w2_interleaved = fused_moe.interleave_moe_weights_for_hopper_mixed_gemm(w2, "fp4")
+    w1_scale_interleaved = fused_moe.interleave_moe_scales_for_hopper_mixed_gemm(w1_scale)
+    w2_scale_interleaved = fused_moe.interleave_moe_scales_for_hopper_mixed_gemm(w2_scale)
+
+    quant_scales = [
+        w1_scale_interleaved.view(torch.int32),
+        w2_scale_interleaved.view(torch.int32),
+    ]
     output = torch.zeros_like(x)
 
     # Run kernel
@@ -200,8 +214,8 @@ def _run_w4a16_moe(
         x,
         selected_experts.to(torch.int),
         routing_weights,
-        w1.contiguous().view(torch.uint8),
-        w2.contiguous().view(torch.uint8),
+        w1_interleaved,
+        w2_interleaved,
         torch.bfloat16,
         swiglu_alpha=alpha_t,
         swiglu_limit=limit_t,
@@ -286,11 +300,7 @@ def test_w4a16_moe_correctness(
 def test_w4a16_moe_coverage(
     batch_size, hidden_size, num_experts, top_k, intermediate_size
 ):
-    """Sanity coverage: finite + shape checks across varied configurations.
-
-    Large-K correctness is a known gap in the existing SM90 mixed-dtype kernel
-    and is not exercised here; see module docstring.
-    """
+    """Coverage sweep with correctness verification."""
     if top_k > num_experts:
         pytest.skip(f"top_k ({top_k}) > num_experts ({num_experts})")
     _run_w4a16_moe(
@@ -299,7 +309,7 @@ def test_w4a16_moe_coverage(
         num_experts,
         top_k,
         intermediate_size,
-        check_correctness=False,
+        check_correctness=True,
     )
 
 
@@ -332,12 +342,12 @@ def test_w4a16_moe_activations(
     not is_sm90a_supported(torch.device("cuda")), reason="W4A16 MoE requires SM90"
 )
 def test_w4a16_moe_core_config():
-    """Primary target configuration sanity: experts=256, topk=6, hidden=4096, inter=2048."""
+    """Primary target configuration: experts=256, topk=6, hidden=4096, inter=2048."""
     _run_w4a16_moe(
         batch_size=4,
         hidden_size=4096,
         num_experts=256,
         top_k=6,
         intermediate_size=2048,
-        check_correctness=False,
+        check_correctness=True,
     )
