@@ -745,15 +745,34 @@ class AutoTuner:
             pbar = None
             for _step, p in enumerate(profiles):
                 try:
-                    tensors = self._prepare_input_tensors(p, inputs)
+                    # Check the cache before synthesizing profile inputs.
+                    # `_prepare_input_tensors` launches a GPU kernel per
+                    # `DynamicTensorSpec`; on a cache hit the synthesized
+                    # tensors are immediately discarded.  Skipping them
+                    # matters for callers that invoke `choose_one`
+                    # repeatedly inside `autotune(True)` -- otherwise every
+                    # warm-cache forward still fires those kernels, which
+                    # CUPTI / nsys will attribute to the measured region
+                    # and inflate per-forward timings (asymmetrically
+                    # across runners, since their `dynamic_tensor_specs`
+                    # differ -- enough to invert measured rankings).
+                    #
+                    # Passing `inputs=inputs` is safe: `_get_cache_key`
+                    # uses `p.get_opt_shapes()` plus
+                    # `get_cache_key_extras`, whose contract is to return
+                    # dtype-like properties preserved by the synthesis
+                    # initializers.  Matches the non-tuning branch above
+                    # and the post-loop `search_cache` call below.
                     is_cache_hit, runner_id, tactic, _ = self.search_cache(
                         custom_op,
                         runners,
                         p.get_opt_shapes(),
                         tuning_config,
-                        inputs=tensors,
+                        inputs=inputs,
                     )
                     if not is_cache_hit:
+                        # Synthesize inputs only on the profiling path.
+                        tensors = self._prepare_input_tensors(p, inputs)
                         if pbar is None:
                             pbar = tqdm.tqdm(
                                 total=len(profiles),
