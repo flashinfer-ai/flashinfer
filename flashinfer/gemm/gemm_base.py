@@ -637,7 +637,7 @@ def get_gemm_sm120_module_cutlass_fp8():
 
                 # Determine dimensions first to know scale granularity
                 if a.dim() == 2:
-                    n_dim = b_col_major.shape[0]
+                    n_dim = b.shape[0]
                     m_dim = a.shape[0]
                     k_dim = a.shape[1]
                     batch_size = 1
