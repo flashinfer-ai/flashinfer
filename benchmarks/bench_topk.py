@@ -10,7 +10,7 @@ Optional comparison with SGLang's sgl_kernel implementation.
 import argparse
 import os
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import torch
@@ -249,6 +249,7 @@ class DSATopKCase:
     q_len: int
     seq_len: int
     causal_chunk: bool
+    tie_break: TopKTieBreak = TopKTieBreak.NONE
 
 
 @dataclass(frozen=True)
@@ -257,36 +258,52 @@ class TopKCase:
     batch_size: int
     seq_len: int
     k: int
+    tie_break: TopKTieBreak = TopKTieBreak.NONE
 
 
 def build_top_k_cases(
     batch_sizes: list[int],
     seq_lens: list[int],
     k_values: list[int],
+    tie_break_modes: list[TopKTieBreak],
 ) -> list[TopKCase]:
     cases: list[TopKCase] = []
 
-    for batch_size in batch_sizes:
-        for seq_len in seq_lens:
-            for k in k_values:
-                if k <= seq_len:
-                    cases.append(
-                        TopKCase(
-                            name=f"grid_b{batch_size}_l{seq_len}_k{k}",
-                            batch_size=batch_size,
-                            seq_len=seq_len,
-                            k=k,
+    for tie_break in tie_break_modes:
+        for batch_size in batch_sizes:
+            for seq_len in seq_lens:
+                for k in k_values:
+                    if k <= seq_len:
+                        cases.append(
+                            TopKCase(
+                                name=f"grid_b{batch_size}_l{seq_len}_k{k}",
+                                batch_size=batch_size,
+                                seq_len=seq_len,
+                                k=k,
+                                tie_break=tie_break,
+                            )
                         )
-                    )
 
-    # These deterministic large-batch/long-vocab cases are not covered by the
-    # original grid but surfaced real correctness/performance differences.
-    cases.extend(
-        [
-            TopKCase("stress_b2048_l131072_k1024", 2048, 131072, 1024),
-            TopKCase("stress_b4096_l200000_k1024", 4096, 200000, 1024),
-        ]
-    )
+        # These deterministic large-batch/long-vocab cases are not covered by the
+        # original grid but surfaced real correctness/performance differences.
+        cases.extend(
+            [
+                TopKCase(
+                    "stress_b2048_l131072_k1024",
+                    2048,
+                    131072,
+                    1024,
+                    tie_break=tie_break,
+                ),
+                TopKCase(
+                    "stress_b4096_l200000_k1024",
+                    4096,
+                    200000,
+                    1024,
+                    tie_break=tie_break,
+                ),
+            ]
+        )
 
     return cases
 
@@ -626,6 +643,7 @@ def main():
         batch_sizes=batch_sizes,
         seq_lens=seq_lens,
         k_values=k_values,
+        tie_break_modes=tie_break_modes,
     )
 
     dtype_str = args.dtype.upper()
@@ -743,76 +761,70 @@ def main():
         print(header)
         print("-" * len(header))
 
-        for tie_break in tie_break_modes:
-            for case in top_k_cases:
-                try:
-                    result = bench_top_k(
-                        case.batch_size,
-                        case.seq_len,
-                        case.k,
-                        dtype,
-                        input_pattern=args.input_pattern,
-                        deterministic=args.deterministic,
-                        tie_break=tie_break,
-                        compare_torch_deterministic=args.compare_torch_deterministic,
-                        compare_sglang=args.compare_sglang,
+        for case in top_k_cases:
+            try:
+                result = bench_top_k(
+                    case.batch_size,
+                    case.seq_len,
+                    case.k,
+                    dtype,
+                    input_pattern=args.input_pattern,
+                    deterministic=args.deterministic,
+                    tie_break=case.tie_break,
+                    compare_torch_deterministic=args.compare_torch_deterministic,
+                    compare_sglang=args.compare_sglang,
+                )
+                if args.deterministic:
+                    nondet_us = result.get("flashinfer_nondeterministic_us")
+                    slowdown = result.get("deterministic_slowdown_vs_nondeterministic")
+                    nondet_str = (
+                        f"{nondet_us:>10.2f}us"
+                        if nondet_us is not None
+                        else f"{'n/a':>12}"
                     )
-                    if args.deterministic:
-                        nondet_us = result.get("flashinfer_nondeterministic_us")
-                        slowdown = result.get(
-                            "deterministic_slowdown_vs_nondeterministic"
-                        )
-                        nondet_str = (
-                            f"{nondet_us:>10.2f}us"
-                            if nondet_us is not None
-                            else f"{'n/a':>12}"
-                        )
-                        slowdown_str = (
-                            f"{slowdown:>10.2f}x"
-                            if slowdown is not None
-                            else f"{'n/a':>11}"
-                        )
-                        line = (
-                            f"{result['batch_size']:>6} {result['seq_len']:>10} {result['k']:>6} {tie_break:>7} | "
-                            f"{nondet_str} "
-                            f"{result['flashinfer_us']:>12.2f}us "
-                            f"{slowdown_str} "
-                            f"{result['torch_us']:>10.2f}us "
-                            f"{result['speedup_vs_torch']:>9.2f}x"
-                        )
-                    else:
-                        line = (
-                            f"{result['batch_size']:>6} {result['seq_len']:>10} {result['k']:>6} {tie_break:>7} | "
-                            f"{result['flashinfer_us']:>12.2f}us {result['torch_us']:>10.2f}us "
-                            f"{result['speedup_vs_torch']:>9.2f}x"
-                        )
-                        if "fast_topk_us" in result:
-                            line += (
-                                f" {result['fast_topk_us']:>10.2f}us "
-                                f"{result['speedup_vs_flashinfer']:>28.2f}x"
-                            )
-                    if "torch_deterministic_us" in result:
-                        line += (
-                            f" {result['torch_deterministic_us']:>10.2f}us "
-                            f"{result['speedup_vs_torch_deterministic']:>9.2f}x"
-                        )
-                    if "sglang_us" in result:
-                        line += (
-                            f" {result['sglang_us']:>10.2f}us "
-                            f"{result['speedup_vs_sglang']:>9.2f}x"
-                        )
-                    elif args.compare_sglang and case.k == 2048:
-                        line += " (SGLang error)"
-                    print(line)
-                except RuntimeError as e:
-                    error_label = classify_benchmark_runtime_error(e)
-                    if error_label is not None:
-                        print(
-                            f"{case.batch_size:>6} {case.seq_len:>10} {case.k:>6} {tie_break:>7} | {error_label}"
-                        )
-                        torch.cuda.empty_cache()
-                    else:
-                        raise
+                    slowdown_str = (
+                        f"{slowdown:>10.2f}x"
+                        if slowdown is not None
+                        else f"{'n/a':>11}"
+                    )
+                    line = (
+                        f"{result['batch_size']:>6} {result['seq_len']:>10} {result['k']:>6} {case.tie_break:>7} | "
+                        f"{nondet_str} "
+                        f"{result['flashinfer_us']:>12.2f}us "
+                        f"{slowdown_str} "
+                        f"{result['torch_us']:>10.2f}us "
+                        f"{result['speedup_vs_torch']:>9.2f}x"
+                    )
+                else:
+                    line = (
+                        f"{result['batch_size']:>6} {result['seq_len']:>10} {result['k']:>6} {case.tie_break:>7} | "
+                        f"{result['flashinfer_us']:>12.2f}us {result['torch_us']:>10.2f}us "
+                        f"{result['speedup_vs_torch']:>9.2f}x"
+                    )
+                    if "fast_topk_us" in result:
+                        line += f" {result['fast_topk_us']:>10.2f}us {result['speedup_vs_flashinfer']:>28.2f}x"
+                if "torch_deterministic_us" in result:
+                    line += (
+                        f" {result['torch_deterministic_us']:>10.2f}us "
+                        f"{result['speedup_vs_torch_deterministic']:>9.2f}x"
+                    )
+                if "sglang_us" in result:
+                    line += (
+                        f" {result['sglang_us']:>10.2f}us "
+                        f"{result['speedup_vs_sglang']:>9.2f}x"
+                    )
+                elif args.compare_sglang and case.k == 2048:
+                    line += " (SGLang error)"
+                print(line)
+            except RuntimeError as e:
+                error_label = classify_benchmark_runtime_error(e)
+                if error_label is not None:
+                    print(
+                        f"{case.batch_size:>6} {case.seq_len:>10} {case.k:>6} {case.tie_break:>7} | {error_label}"
+                    )
+                    torch.cuda.empty_cache()
+                else:
+                    raise
 
     if args.op in ["all", "dsa_topk"]:
         print("\n" + "=" * 100)
@@ -865,79 +877,78 @@ def main():
             DSATopKCase("decode_b32_q1_l128k", 32, 1, 131072, False),
             DSATopKCase("prefill_b1_q128_l128k", 1, 128, 131072, True),
         ]
+        dsa_cases = [
+            replace(case, tie_break=tie_break)
+            for case in dsa_cases
+            for tie_break in tie_break_modes
+        ]
 
-        for tie_break in tie_break_modes:
-            for case in dsa_cases:
-                if args.dsa_case == "decode" and case.causal_chunk:
-                    continue
-                if args.dsa_case == "prefill" and not case.causal_chunk:
-                    continue
-                if args.dsa_topk > case.seq_len:
-                    continue
-                try:
-                    result = bench_dsa_top_k(
-                        batch_size=case.batch_size,
-                        q_len=case.q_len,
-                        seq_len=case.seq_len,
-                        k=args.dsa_topk,
-                        dtype=dtype,
-                        input_pattern=args.dsa_input_pattern,
-                        deterministic=args.deterministic,
-                        tie_break=tie_break,
-                        compare_torch_deterministic=args.compare_torch_deterministic,
-                        compare_sglang=False,
-                        causal_chunk=case.causal_chunk,
+        for case in dsa_cases:
+            if args.dsa_case == "decode" and case.causal_chunk:
+                continue
+            if args.dsa_case == "prefill" and not case.causal_chunk:
+                continue
+            if args.dsa_topk > case.seq_len:
+                continue
+            try:
+                result = bench_dsa_top_k(
+                    batch_size=case.batch_size,
+                    q_len=case.q_len,
+                    seq_len=case.seq_len,
+                    k=args.dsa_topk,
+                    dtype=dtype,
+                    input_pattern=args.dsa_input_pattern,
+                    deterministic=args.deterministic,
+                    tie_break=case.tie_break,
+                    compare_torch_deterministic=args.compare_torch_deterministic,
+                    compare_sglang=False,
+                    causal_chunk=case.causal_chunk,
+                )
+                if args.deterministic:
+                    nondet_us = result.get("flashinfer_nondeterministic_us")
+                    slowdown = result.get("deterministic_slowdown_vs_nondeterministic")
+                    nondet_str = (
+                        f"{nondet_us:>10.2f}us"
+                        if nondet_us is not None
+                        else f"{'n/a':>12}"
                     )
-                    if args.deterministic:
-                        nondet_us = result.get("flashinfer_nondeterministic_us")
-                        slowdown = result.get(
-                            "deterministic_slowdown_vs_nondeterministic"
-                        )
-                        nondet_str = (
-                            f"{nondet_us:>10.2f}us"
-                            if nondet_us is not None
-                            else f"{'n/a':>12}"
-                        )
-                        slowdown_str = (
-                            f"{slowdown:>10.2f}x"
-                            if slowdown is not None
-                            else f"{'n/a':>11}"
-                        )
-                        line = (
-                            f"{case.name:>24} {result['rows']:>8} {result['seq_len']:>10} {result['k']:>6} {tie_break:>7} | "
-                            f"{nondet_str} "
-                            f"{result['flashinfer_us']:>12.2f}us "
-                            f"{slowdown_str} "
-                            f"{result['torch_us']:>10.2f}us "
-                            f"{result['speedup_vs_torch']:>9.2f}x"
-                        )
-                    else:
-                        line = (
-                            f"{case.name:>24} {result['rows']:>8} {result['seq_len']:>10} {result['k']:>6} {tie_break:>7} | "
-                            f"{result['flashinfer_us']:>10.2f}us {result['torch_us']:>10.2f}us "
-                            f"{result['speedup_vs_torch']:>9.2f}x"
-                        )
-                        if "fast_topk_us" in result:
-                            line += (
-                                f" {result['fast_topk_us']:>10.2f}us "
-                                f"{result['speedup_vs_flashinfer']:>28.2f}x"
-                            )
-                    if "torch_deterministic_us" in result:
-                        line += (
-                            f" {result['torch_deterministic_us']:>10.2f}us "
-                            f"{result['speedup_vs_torch_deterministic']:>9.2f}x"
-                        )
-                    print(line)
-                except RuntimeError as e:
-                    error_label = classify_benchmark_runtime_error(e)
-                    if error_label is not None:
-                        print(
-                            f"{case.name:>24} {case.batch_size * case.q_len:>8} {case.seq_len:>10} "
-                            f"{args.dsa_topk:>6} {tie_break:>7} | {error_label}"
-                        )
-                        torch.cuda.empty_cache()
-                    else:
-                        raise
+                    slowdown_str = (
+                        f"{slowdown:>10.2f}x"
+                        if slowdown is not None
+                        else f"{'n/a':>11}"
+                    )
+                    line = (
+                        f"{case.name:>24} {result['rows']:>8} {result['seq_len']:>10} {result['k']:>6} {case.tie_break:>7} | "
+                        f"{nondet_str} "
+                        f"{result['flashinfer_us']:>12.2f}us "
+                        f"{slowdown_str} "
+                        f"{result['torch_us']:>10.2f}us "
+                        f"{result['speedup_vs_torch']:>9.2f}x"
+                    )
+                else:
+                    line = (
+                        f"{case.name:>24} {result['rows']:>8} {result['seq_len']:>10} {result['k']:>6} {case.tie_break:>7} | "
+                        f"{result['flashinfer_us']:>10.2f}us {result['torch_us']:>10.2f}us "
+                        f"{result['speedup_vs_torch']:>9.2f}x"
+                    )
+                    if "fast_topk_us" in result:
+                        line += f" {result['fast_topk_us']:>10.2f}us {result['speedup_vs_flashinfer']:>28.2f}x"
+                if "torch_deterministic_us" in result:
+                    line += (
+                        f" {result['torch_deterministic_us']:>10.2f}us "
+                        f"{result['speedup_vs_torch_deterministic']:>9.2f}x"
+                    )
+                print(line)
+            except RuntimeError as e:
+                error_label = classify_benchmark_runtime_error(e)
+                if error_label is not None:
+                    print(
+                        f"{case.name:>24} {case.batch_size * case.q_len:>8} {case.seq_len:>10} "
+                        f"{args.dsa_topk:>6} {case.tie_break:>7} | {error_label}"
+                    )
+                    torch.cuda.empty_cache()
+                else:
+                    raise
 
     if args.op in ["all", "page_table"]:
         print("\n" + "=" * 100)
