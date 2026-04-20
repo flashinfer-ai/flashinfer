@@ -3447,7 +3447,12 @@ def test_renormalize_routing(
                 "routed_scaling": 2.5,
                 "has_routing_bias": True,
                 "routing_method_type": RoutingMethodType.DeepSeekV3,
-                "compatible_moe_impls": [BF16Moe, FP8PerTensorMoe, FP8PerChannelMoe, FP4Moe],
+                "compatible_moe_impls": [
+                    BF16Moe,
+                    FP8PerTensorMoe,
+                    FP8PerChannelMoe,
+                    FP4Moe,
+                ],
                 "compatible_intermediate_size": [2688],
                 "compatible_activation_types": [ActivationType.Relu2],
                 "enable_autotune": True,
