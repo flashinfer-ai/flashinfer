@@ -1210,6 +1210,7 @@ def bench_gpu_time_with_cupti(
     for _ in range(repeat_iters):
         if _do_l2_flush:
             buffer.zero_()
+        torch.cuda.synchronize()
         start_cpu = cupti.get_timestamp()
         runner()
         end_cpu = cupti.get_timestamp()
