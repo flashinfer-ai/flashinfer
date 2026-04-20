@@ -47,17 +47,7 @@ inline int32_t computeLog2(int32_t val, std::string const& name = "") {
 
 Runner::Runner() {}
 
-Runner::Runner(int32_t tileTokensDim, int32_t clusterSizeInBatchDim)
-    : mTileTokensDim(tileTokensDim), mClusterSizeInBatchDim(clusterSizeInBatchDim) {
-  // clusterSizeInBatchDim must be a power of 2: mClusterSizeLog2 is used in shift
-  // operations (>>, <<) inside the mIsPow2 kernel branches, and a non-power-of-2
-  // value would make computeLog2() return -1, causing undefined behavior.
-  // mTileTokensDim does not need this check because non-power-of-2 tiles are
-  // handled by the !mIsPow2 branches which use multiplication/division instead.
-  FLASHINFER_CHECK(
-      clusterSizeInBatchDim > 0 && (clusterSizeInBatchDim & (clusterSizeInBatchDim - 1)) == 0,
-      "clusterSizeInBatchDim must be a power of 2, got %d", clusterSizeInBatchDim);
-}
+Runner::Runner(int32_t tileTokensDim) : mTileTokensDim(tileTokensDim) {}
 
 void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int32_t numExperts,
                  int32_t topK, int32_t nGroup, int32_t topkGroup, int32_t localExpertOffset,
@@ -69,7 +59,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
                  int32_t* numNonExitingCtas, btg::Dtype dtypeElt, btg::Dtype dtypeBias,
                  bool useRoutingScalesOnInput, bool useDeepSeekFp8,
                  RoutingMethodType routingMethodType, cudaStream_t stream, btg::Dtype dtypeLogits,
-                 bool normTopkProb) {
+                 bool normTopkProb, int16_t* routing_replay_out) {
   if (routingMethodType == RoutingMethodType::DeepSeekV3 && nGroup <= 1) {
     // DeepSeek no-groups case: use routingCustom with SigmoidBias preprocess
     // and ScaledSumNormalize postprocess. This is more efficient than the full DeepSeek
@@ -103,11 +93,10 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mTopK = topK;
     routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
     routingData.mTileTokensDim = mTileTokensDim;
-    routingData.mClusterSizeInBatchDim = mClusterSizeInBatchDim;
-    routingData.mClusterSizeLog2 = computeLog2(mClusterSizeInBatchDim);
     routingData.mLocalExpertsStartIdx = localExpertOffset;
     routingData.mLocalExpertsStrideLog2 = 0;
     routingData.mNumLocalExperts = localNumExperts;
+    routingData.mPtrRoutingReplayOut = routing_replay_out;
 
     moe::dev::routing::routingCustom::run(routingData, stream);
   } else if (routingMethodType == RoutingMethodType::MiniMax2) {
@@ -144,11 +133,10 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mTopK = topK;
     routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
     routingData.mTileTokensDim = mTileTokensDim;
-    routingData.mClusterSizeInBatchDim = mClusterSizeInBatchDim;
-    routingData.mClusterSizeLog2 = computeLog2(mClusterSizeInBatchDim);
     routingData.mLocalExpertsStartIdx = localExpertOffset;
     routingData.mLocalExpertsStrideLog2 = 0;
     routingData.mNumLocalExperts = localNumExperts;
+    routingData.mPtrRoutingReplayOut = routing_replay_out;
 
     moe::dev::routing::routingCustom::run(routingData, stream);
   } else if (routingMethodType == RoutingMethodType::DeepSeekV3) {
@@ -184,13 +172,12 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mTopK = topK;
     routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
     routingData.mTileTokensDim = mTileTokensDim;
-    routingData.mClusterSizeInBatchDim = mClusterSizeInBatchDim;
-    routingData.mClusterSizeLog2 = computeLog2(mClusterSizeInBatchDim);
     routingData.mLocalExpertsStartIdx = localExpertOffset;
     routingData.mLocalExpertsStrideLog2 = 0;
     routingData.mNumLocalExperts = localNumExperts;
     routingData.mRouteScale = routedScalingFactor;
     routingData.mUseRoutingSoftmax = false;
+    routingData.mPtrRoutingReplayOut = routing_replay_out;
     moe::dev::routing::routingDeepSeek::run(routingData, stream);
   } else if (routingMethodType == RoutingMethodType::Llama4) {
     FLASHINFER_CHECK(topK == 1, "For Llama routing method, must have topK == 1");
@@ -223,11 +210,10 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mTopK = topK;
     routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
     routingData.mTileTokensDim = mTileTokensDim;
-    routingData.mClusterSizeInBatchDim = mClusterSizeInBatchDim;
-    routingData.mClusterSizeLog2 = computeLog2(mClusterSizeInBatchDim);
     routingData.mLocalExpertsStartIdx = localExpertOffset;
     routingData.mLocalExpertsStrideLog2 = 0;
     routingData.mNumLocalExperts = localNumExperts;
+    routingData.mPtrRoutingReplayOut = routing_replay_out;
     moe::dev::routing::routingLlama4::run(routingData, stream);
   } else if (routingMethodType == RoutingMethodType::Default        /* Softmax -> TopK */
              || routingMethodType == RoutingMethodType::Renormalize /* TopK -> Softmax */
@@ -300,11 +286,10 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mTopK = topK;
     routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
     routingData.mTileTokensDim = mTileTokensDim;
-    routingData.mClusterSizeInBatchDim = mClusterSizeInBatchDim;
-    routingData.mClusterSizeLog2 = computeLog2(mClusterSizeInBatchDim);
     routingData.mLocalExpertsStartIdx = localExpertOffset;
     routingData.mLocalExpertsStrideLog2 = 0;
     routingData.mNumLocalExperts = localNumExperts;
+    routingData.mPtrRoutingReplayOut = routing_replay_out;
 
     routingCustom::run(routingData, stream);
   } else {

@@ -10,11 +10,11 @@
 * @yzh119 @sricketts @aleozlx @yongwww @cyx-6 @saltyminty @bkryu @yyihuang @kahyunnam @jimmyzho @nv-yunzheq @samuellees
 
 # ── Attention ──
-csrc/fmha_v2/                  @saltyminty @yzh119 @nv-yunzheq @bkryu
-csrc/xqa/                      @saltyminty @yzh119 @nv-yunzheq @bkryu
-flashinfer/attention.py        @saltyminty @yzh119 @nv-yunzheq @bkryu
-include/flashinfer/attention/  @saltyminty @yzh119 @nv-yunzheq @bkryu
-tests/attention/               @saltyminty @yzh119 @nv-yunzheq @bkryu
+csrc/fmha_v2/                  @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
+csrc/xqa/                      @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
+flashinfer/attention.py        @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
+include/flashinfer/attention/  @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
+tests/attention/               @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
 
 # ── GEMM ──
 flashinfer/gemm/               @dhiraj113 @yzh119 @aleozlx @bkryu
@@ -45,3 +45,7 @@ flashinfer/gdn_kernels/                  @kahyunnam @yzh119 @bkryu @yongwww
 flashinfer/gdn_prefill.py                @kahyunnam @yzh119 @bkryu @yongwww
 flashinfer/jit/gdn.py                    @kahyunnam @yzh119 @bkryu @yongwww
 tests/gdn/                               @kahyunnam @yzh119 @bkryu @yongwww
+
+# ── Autotuner ──
+‎flashinfer/autotuner.py                  @qiching
+‎tests/autotuner/test_autotuner_core.py   @qiching
