@@ -28,6 +28,8 @@
 
 namespace tensorrt_llm::kernels::moe_alltoall {
 
+using tensorrt_llm::common::launchWithPdlWhenEnabled;
+
 #define ENABLE_DEBUG_PRINT 0
 #define DISABLE_SYNC_FOR_PROFILING 0
 
@@ -289,6 +291,10 @@ __device__ void vectorized_dispatch(uint8_t const* src_ptr, int bytes_per_token,
 
 __global__ void moeA2APrepareDispatchKernel(int* send_counters, int* local_token_counter,
                                             int ep_size, uint32_t* flag_val_ptr) {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaGridDependencySynchronize();
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   // Zero send_counters
   if (idx < ep_size) {
@@ -325,9 +331,16 @@ __global__ void moeA2ADispatchKernel(
     // we need to keep the threads where local_token_idx == 0 alive to participate in the
     // synchronization. Other threads should return.
     if (local_token_idx > 0) return;
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
   } else {
     // Threads that do not have a token to process should return.
     if (local_token_idx >= local_num_tokens) return;
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
 
     // Prepare per-policy shared-memory tiles for this token
     extern __shared__ int smem[];
@@ -398,6 +411,10 @@ __global__ void moeA2ADispatchKernel(
 
     ThreadingPolicy::sync();
   }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
 
   bool is_first_warp = threadIdx.x / warpSize == 0;
   if (is_first_warp) {
@@ -474,8 +491,9 @@ __global__ void moeA2ADispatchKernel(
 }
 
 void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params) {
-  moeA2APrepareDispatchKernel<<<1, params.ep_size, 0, params.stream>>>(
-      params.send_counters, params.local_token_counter, params.ep_size, params.flag_val);
+  launchWithPdlWhenEnabled("moeA2APrepareDispatchKernel", moeA2APrepareDispatchKernel, 1,
+      params.ep_size, 0, params.stream, params.send_counters, params.local_token_counter,
+      params.ep_size, params.flag_val);
 }
 
 // ============================================================================
@@ -532,12 +550,13 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
       grid_size = 1;
     }
     int shared_bytes = 2 * params.top_k * (int)sizeof(int);
-    SWITCH_TOP_K(params.top_k, TOP_K,
-                 moeA2ADispatchKernel<BlockPolicy, TOP_K>
-                 <<<grid_size, kBlockSize, shared_bytes, params.stream>>>(
-                     params.token_selected_experts, kernel_ptrs, params.num_payloads,
-                     params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank,
-                     params.ep_size, params.num_experts_per_rank))
+    SWITCH_TOP_K(params.top_k, TOP_K, {
+      auto kernel_fn = moeA2ADispatchKernel<BlockPolicy, TOP_K>;
+      launchWithPdlWhenEnabled("moeA2ADispatchKernel", kernel_fn, grid_size, kBlockSize,
+          shared_bytes, params.stream, params.token_selected_experts, kernel_ptrs,
+          params.num_payloads, params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank,
+          params.ep_size, params.num_experts_per_rank);
+    })
   } else {
     int grid_size = ceilDiv(params.local_num_tokens, kWarpsPerBlock);
     // If local_num_tokens is 0, we still need to launch a minimal kernel to participate in the
@@ -546,12 +565,13 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
       grid_size = 1;
     }
     int shared_bytes = 2 * kWarpsPerBlock * params.top_k * (int)sizeof(int);
-    SWITCH_TOP_K(params.top_k, TOP_K,
-                 moeA2ADispatchKernel<WarpPolicy, TOP_K>
-                 <<<grid_size, kBlockSize, shared_bytes, params.stream>>>(
-                     params.token_selected_experts, kernel_ptrs, params.num_payloads,
-                     params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank,
-                     params.ep_size, params.num_experts_per_rank))
+    SWITCH_TOP_K(params.top_k, TOP_K, {
+      auto kernel_fn = moeA2ADispatchKernel<WarpPolicy, TOP_K>;
+      launchWithPdlWhenEnabled("moeA2ADispatchKernel", kernel_fn, grid_size, kBlockSize,
+          shared_bytes, params.stream, params.token_selected_experts, kernel_ptrs,
+          params.num_payloads, params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank,
+          params.ep_size, params.num_experts_per_rank);
+    })
   }
 }
 
@@ -900,6 +920,11 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, void cons
                                            int elements_per_token, int ep_size,
                                            int max_tokens_per_rank, uint32_t* flag_val_ptr,
                                            int const* recv_counters, int stride_per_token) {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaGridDependencySynchronize();
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
+
   if (blockIdx.x == 0 && threadIdx.x == 0) {
     // Increment flag_val for this combine round
     *flag_val_ptr = *flag_val_ptr + 1;
@@ -951,8 +976,8 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, void cons
 template <typename T, typename ThreadingPolicy, int TOP_K>
 __global__ void moeA2ACombineKernel(
     const CombineKernelPointers ptrs,  // Combine-specific struct, src_data_ptrs[0] is output
-    int max_tokens_per_rank, int elements_per_token, int local_num_tokens, int rank_id, int ep_size,
-    int stride_per_token) {
+    int max_tokens_per_rank, int elements_per_token, int stride_per_token, int local_num_tokens,
+    int rank_id, int ep_size) {
   int local_token_idx = ThreadingPolicy::token_idx();
   int const size_per_token = elements_per_token * static_cast<int>(sizeof(T));
 
@@ -965,6 +990,10 @@ __global__ void moeA2ACombineKernel(
     // Threads that do not have a token to process should return.
     if (local_token_idx >= local_num_tokens) return;
   }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaGridDependencySynchronize();
+#endif
 
 #if !DISABLE_SYNC_FOR_PROFILING
   // In-kernel readiness synchronization at start of combine:
@@ -1041,6 +1070,10 @@ __global__ void moeA2ACombineKernel(
     vectorized_combine<TOP_K, ThreadingPolicy, T>(token_output, size_per_token, stride_per_token,
                                                   rank_id, max_tokens_per_rank, ptrs);
   }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params) {
@@ -1075,8 +1108,8 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params) {
           params.one_block_per_token
               ? moeA2APrepareCombineKernel<BlockPolicy, LOW_PRECISION, SrcT>
               : moeA2APrepareCombineKernel<WarpPolicy, LOW_PRECISION, SrcT>;
-      kernel_fn<<<grid, kBlockSize, 0, params.stream>>>(
-          recv_buffer_bytes, payload, params.elements_per_token, params.ep_size,
+      launchWithPdlWhenEnabled("moeA2APrepareCombineKernel", kernel_fn, grid, kBlockSize, 0,
+          params.stream, recv_buffer_bytes, payload, params.elements_per_token, params.ep_size,
           params.max_tokens_per_rank, params.flag_val, params.recv_counters, stride_per_token);
     });
   });
@@ -1151,9 +1184,9 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
     SWITCH_POLICY(params.one_block_per_token, Policy, {
       SWITCH_TOP_K(params.top_k, TOP_K, {
         auto kernel_fn = moeA2ACombineKernel<TKernelType, Policy, TOP_K>;
-        kernel_fn<<<grid, kBlockSize, 0, params.stream>>>(
-            kernel_ptrs, params.max_tokens_per_rank, params.elements_per_token,
-            params.local_num_tokens, params.ep_rank, params.ep_size, stride_per_token);
+        launchWithPdlWhenEnabled("moeA2ACombineKernel", kernel_fn, grid, kBlockSize, 0,
+            params.stream, kernel_ptrs, params.max_tokens_per_rank, params.elements_per_token,
+            stride_per_token, params.local_num_tokens, params.ep_rank, params.ep_size);
       });
     });
   });
@@ -1164,6 +1197,10 @@ __global__ void moeA2ASanitizeExpertIdsKernel(int32_t* expert_ids_ptr,
                                               int32_t const* recv_counters_ptr, int ep_size,
                                               int max_tokens_per_rank, int top_k,
                                               int32_t invalid_id) {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaGridDependencySynchronize();
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   int total_tokens = ep_size * max_tokens_per_rank;
   if (tid >= total_tokens) return;
@@ -1185,8 +1222,9 @@ void moe_a2a_sanitize_expert_ids_launch(int32_t* expert_ids, int32_t const* recv
   constexpr int kBlockSize = 256;
   int total_tokens = ep_size * max_tokens_per_rank;
   int grid = ceilDiv(total_tokens, kBlockSize);
-  moeA2ASanitizeExpertIdsKernel<<<grid, kBlockSize, 0, stream>>>(
-      expert_ids, recv_counters, ep_size, max_tokens_per_rank, top_k, invalid_id);
+  launchWithPdlWhenEnabled("moeA2ASanitizeExpertIdsKernel", moeA2ASanitizeExpertIdsKernel, grid,
+      kBlockSize, 0, stream, expert_ids, recv_counters, ep_size, max_tokens_per_rank, top_k,
+      invalid_id);
 }
 
 }  // namespace tensorrt_llm::kernels::moe_alltoall

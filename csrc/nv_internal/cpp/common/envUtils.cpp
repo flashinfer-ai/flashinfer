@@ -356,4 +356,16 @@ int getEnvMoeA2ACombineBlockSize() {
 
 bool getEnvEplbForceGdrcopy() { return getBoolEnv("TRTLLM_EPLB_FORCE_GDRCOPY"); }
 
+bool getEnvEnablePDL() {
+  static bool const kEnablePDL = []() -> bool {
+    auto const val = getIntEnv("TRTLLM_ENABLE_PDL");
+    if (!val.has_value()) {
+      // Default: enabled on SM>=90 (Hopper, Blackwell, Grace-Blackwell)
+      return getSMVersion() >= 90;
+    }
+    return val.value() != 0;
+  }();
+  return kEnablePDL;
+}
+
 }  // namespace tensorrt_llm::common
