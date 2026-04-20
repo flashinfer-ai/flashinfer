@@ -63,8 +63,12 @@ namespace flashinfer::mamba::incremental {
 
 using namespace conversion;
 
-// Round up to next multiple of 16 (for mma.sync.m16n8k16 tile alignment).
-constexpr int next_multiple_of_16(int x) { return (x + 15) & ~15; }
+// Round x up to the next multiple of Y (Y must be a power of 2).
+template <int Y>
+constexpr int next_multiple_of(int x) {
+  static_assert(Y > 0 && (Y & (Y - 1)) == 0, "Y must be a power of 2");
+  return (x + Y - 1) & ~(Y - 1);
+}
 
 // Swizzled smem layout for mma.sync operands (bf16/fp16, row-major).
 // Atom: 8 rows × 64 cols (128 bytes/row = full bank cycle).
@@ -110,52 +114,48 @@ __device__ __forceinline__ auto make_swizzled_layout_rc_transpose() {
 template <typename state_t>
 using smem_state_t_of = std::conditional_t<sizeof(state_t) == 2, state_t, __nv_bfloat16>;
 
-template <typename input_t, typename state_t, int NTOKENS, int DIM, int DSTATE,
-          bool PAD_TOKENS_ = (NTOKENS > 8)>
+template <typename input_t, typename state_t, int NTOKENS, int DIM, int DSTATE>
 struct SsuIncrementalStorage {
-  // Padded token count for mma.sync.m16n8k16 tile alignment (C/x/z/CB_scaled).
-  static constexpr int NTOKENS_PAD = next_multiple_of_16(NTOKENS);
-  // Compile-time switch: when NTOKENS ≤ 8, shrink B/old_x/old_B to 8 rows
-  // (the natural ldmatrix unit). Saves smem → +1 CTA/SM occupancy.
-  static constexpr bool PAD_TOKENS = PAD_TOKENS_;
-  // Row count of the shrinkable token buffers (B, old_x, old_B).  When
-  // PAD_TOKENS, matches the 16-row m16n8k16 tile; otherwise an 8-row
-  // LDSM unit, paired with m16n8k8 MMA in the replay.
-  static constexpr int TOKEN_ROWS = PAD_TOKENS ? NTOKENS_PAD : 8;
+  // M-dim of the output MMAs (C, x, z, CB_scaled): always m16-tiled.
+  static constexpr int NTOKENS_PAD_MMA_M = next_multiple_of<16>(NTOKENS);
+  // K-dim of the replay MMA (B, old_x, old_B).  Padded to the LDSM unit (8).
+  // For NTOKENS ≤ 8 this is 8 → replay uses m16n8k8 (1 K-tile, smaller smem,
+  // +1 CTA/SM occupancy).  For NTOKENS > 8 this is 16 → replay uses m16n8k16
+  // (1 K-tile, fewer MMA ops).  Assumes NTOKENS ≤ 16 (asserted in wrapper).
+  static constexpr int NTOKENS_PAD_MMA_K = next_multiple_of<8>(NTOKENS);
 
   using smem_state_t = smem_state_t_of<state_t>;
 
-  // CB_scaled: input_t[NTOKENS_PAD * 64] — padded row stride 128 bytes
+  // CB_scaled: input_t[NTOKENS_PAD_MMA_M * 64] — padded row stride 128 bytes
   // (32 banks), accessed via Swizzle<3,3,3> CuTe layout for conflict-free
   // LDSM in the matmul-4 A-operand read.
-  alignas(16) char CB_scaled[NTOKENS_PAD * 64 * sizeof(input_t)];
+  alignas(16) char CB_scaled[NTOKENS_PAD_MMA_M * 64 * sizeof(input_t)];
 
-  // B: TOKEN_ROWS rows (shrinks when !PAD_TOKENS).  Padding rows inside
-  // [NTOKENS, TOKEN_ROWS) contain garbage — valid output uses only
-  // [0, NTOKENS).  Warp-1 of compute_CB_scaled_2warp reads rows ≥ 8 of a
-  // 16-row view; those reads spill into C/old_B smem but are masked to 0
-  // by the (j < NTOKENS) CB-store predicate since j ≥ 8 ≥ NTOKENS when
-  // !PAD_TOKENS.
-  alignas(16) input_t B[TOKEN_ROWS][DSTATE];
+  // B: NTOKENS_PAD_MMA_K rows.  Padding rows inside [NTOKENS, NTOKENS_PAD_MMA_K)
+  // contain garbage — valid output uses only [0, NTOKENS).  Warp-1 of
+  // compute_CB_scaled_2warp reads rows ≥ 8 of a 16-row view; those reads spill
+  // into C/old_B smem but are masked to 0 by the (j < NTOKENS) CB-store
+  // predicate since j ≥ 8 ≥ NTOKENS when NTOKENS_PAD_MMA_K == 8.
+  alignas(16) input_t B[NTOKENS_PAD_MMA_K][DSTATE];
 
-  // C: padded to NTOKENS_PAD (matmul 3 A operand via LDSM.x4).
-  alignas(16) input_t C[NTOKENS_PAD][DSTATE];
+  // C: padded to NTOKENS_PAD_MMA_M (matmul 3 A operand via LDSM.x4).
+  alignas(16) input_t C[NTOKENS_PAD_MMA_M][DSTATE];
 
-  // x: padded to NTOKENS_PAD rows for mma operand alignment (matmul 4 B operand).
-  alignas(16) input_t x[NTOKENS_PAD][DIM];
+  // x: padded to NTOKENS_PAD_MMA_M rows for mma operand alignment (matmul 4 B operand).
+  alignas(16) input_t x[NTOKENS_PAD_MMA_M][DIM];
 
-  // z: padded to NTOKENS_PAD so partition_C reads don't go OOB.
-  alignas(16) input_t z[NTOKENS_PAD][DIM];
+  // z: padded to NTOKENS_PAD_MMA_M so partition_C reads don't go OOB.
+  alignas(16) input_t z[NTOKENS_PAD_MMA_M][DIM];
 
   // Old cache data loaded in Phase 0 (consumed in Phase 1 replay).
-  // old_x: TOKEN_ROWS rows, Swizzle<3,3,3> [TOKEN_ROWS, DIM] layout
+  // old_x: NTOKENS_PAD_MMA_K rows, Swizzle<3,3,3> [NTOKENS_PAD_MMA_K, DIM] layout
   // — ldmatrix.trans feeds replay MMA A-operand directly.
-  alignas(16) input_t old_x[TOKEN_ROWS][DIM];
+  alignas(16) input_t old_x[NTOKENS_PAD_MMA_K][DIM];
 
-  // old_B: TOKEN_ROWS rows, Swizzle<3,3,3> [TOKEN_ROWS, DSTATE] layout.
+  // old_B: NTOKENS_PAD_MMA_K rows, Swizzle<3,3,3> [NTOKENS_PAD_MMA_K, DSTATE] layout.
   // Replay MMA reads via ldmatrix.trans (LDSM_T) + register scaling.
   // Padding rows zero-filled via cp.async ZFILL.
-  alignas(16) input_t old_B[TOKEN_ROWS][DSTATE];
+  alignas(16) input_t old_B[NTOKENS_PAD_MMA_K][DSTATE];
 
   float old_dt_proc[NTOKENS];
   float old_cumAdt[NTOKENS];
@@ -318,12 +318,12 @@ __device__ __forceinline__ void load_data(SmemT& smem, SsuIncrementalParams cons
                           buf_read * params.old_B_stride_dbuf + group_idx * DSTATE;
 
   // ── Warp 0: cp.async B[T, dstate] + old_B[T, dstate] (swizzled smem) ──
-  constexpr int NTOKENS_PAD = SmemT::NTOKENS_PAD;
-  constexpr int TOKEN_ROWS = SmemT::TOKEN_ROWS;  // 8 when !PAD_TOKENS, 16 when PAD_TOKENS
-  using CShape = cute::Shape<cute::Int<NTOKENS_PAD>, cute::Int<DSTATE>>;
-  using BShape = cute::Shape<cute::Int<TOKEN_ROWS>, cute::Int<DSTATE>>;
-  using XShape = cute::Shape<cute::Int<NTOKENS_PAD>, cute::Int<DIM>>;
-  using OxShape = cute::Shape<cute::Int<TOKEN_ROWS>, cute::Int<DIM>>;
+  constexpr int NTOKENS_PAD_MMA_M = SmemT::NTOKENS_PAD_MMA_M;
+  constexpr int NTOKENS_PAD_MMA_K = SmemT::NTOKENS_PAD_MMA_K;
+  using CShape = cute::Shape<cute::Int<NTOKENS_PAD_MMA_M>, cute::Int<DSTATE>>;
+  using BShape = cute::Shape<cute::Int<NTOKENS_PAD_MMA_K>, cute::Int<DSTATE>>;
+  using XShape = cute::Shape<cute::Int<NTOKENS_PAD_MMA_M>, cute::Int<DIM>>;
+  using OxShape = cute::Shape<cute::Int<NTOKENS_PAD_MMA_K>, cute::Int<DIM>>;
   if (warp == 0) {
     load_tile_async<BShape, NTOKENS>(&smem.B[0][0], B_ptr + B_base, params.B_stride_mtp, lane);
     load_tile_async<BShape, NTOKENS>(&smem.old_B[0][0], old_B_ptr + oB_base,
@@ -356,7 +356,7 @@ __device__ __forceinline__ void load_data(SmemT& smem, SsuIncrementalParams cons
     compute_cumAdt<NTOKENS>(smem, lane, A_val);
   }
 
-  // ── Warp 2: cp.async x[T, dim] (padded) + old_x[T, dim] (TOKEN_ROWS) ──
+  // ── Warp 2: cp.async x[T, dim] (padded) + old_x[T, dim] (NTOKENS_PAD_MMA_K rows) ──
   if (warp == 2) {
     load_tile_async<XShape, NTOKENS>(&smem.x[0][0], x_ptr + x_base, params.x_stride_mtp, lane);
     load_tile_async<OxShape, NTOKENS>(&smem.old_x[0][0], old_x_ptr + ox_base,
@@ -388,14 +388,11 @@ __device__ __forceinline__ void load_data(SmemT& smem, SsuIncrementalParams cons
       static_assert(sizeof(state_t) == 4, "unexpected state_t size");
       load_state_f32_to_bf16<DIM, DSTATE, NUM_WARPS>(
           smem, reinterpret_cast<float const*>(state_ptr), state_base, flat_tid);
-      // No cp.async issued in the narrow path, so nothing to commit.
     }
   }
 
   // Wait for all cp.async groups to complete
   __pipeline_wait_prior(0);
-
-  // x padding rows are already zero-filled by load_tile_async's ZFILL predicate.
 }
 
 // (compute_cumAdt moved above load_data so it can be called from there)
@@ -408,26 +405,26 @@ template <typename input_t, typename mma_type, int NTOKENS, int DSTATE, typename
 __device__ __forceinline__ void compute_CB_scaled_2warp(SmemT& smem, int warp, int lane) {
   using namespace cute;
 
-  constexpr int NTOKENS_PAD = SmemT::NTOKENS_PAD;
-  constexpr int TOKEN_ROWS = SmemT::TOKEN_ROWS;
-  constexpr bool PAD = SmemT::PAD_TOKENS;
-  constexpr int N_HALF = 8;  // each warp computes [NTOKENS_PAD, 8]
+  constexpr int NTOKENS_PAD_MMA_M = SmemT::NTOKENS_PAD_MMA_M;
+  constexpr int NTOKENS_PAD_MMA_K = SmemT::NTOKENS_PAD_MMA_K;
+  constexpr int N_HALF = 8;  // each warp computes [NTOKENS_PAD_MMA_M, 8]
 
   // CB_scaled output tile layout (used by both warp 0 compute and warp 1
-  // zero-fill when !PAD).
-  auto layout_cb_swz = composition(Swizzle<3, 3, 3>{},
-                                   make_layout(make_shape(Int<NTOKENS_PAD>{}, Int<NTOKENS_PAD>{}),
-                                               make_stride(Int<64>{}, _1{})));
+  // zero-fill when smem.B has only 8 rows).
+  auto layout_cb_swz =
+      composition(Swizzle<3, 3, 3>{},
+                  make_layout(make_shape(Int<NTOKENS_PAD_MMA_M>{}, Int<NTOKENS_PAD_MMA_M>{}),
+                              make_stride(Int<64>{}, _1{})));
 
-  // ── !PAD: warp 1 has no valid B rows to read (TOKEN_ROWS=8).  But
+  // ── NTOKENS_PAD_MMA_K == 8: warp 1 has no valid B rows to read.  But
   // CB_scaled[:, 8:16] must still be zero so matmul-4's K-reduction sees
   // zeros for k ≥ NTOKENS.  Do a simple 32-thread zero-fill and return. ──
-  if constexpr (!PAD) {
+  if constexpr (NTOKENS_PAD_MMA_K == 8) {
     if (warp == 1) {
       auto* __restrict__ cb = reinterpret_cast<mma_type*>(smem.CB_scaled);
-      constexpr int COLS_TO_CLEAR = NTOKENS_PAD - N_HALF;  // 8
+      constexpr int COLS_TO_CLEAR = NTOKENS_PAD_MMA_M - N_HALF;  // 8
 #pragma unroll
-      for (int i = lane; i < NTOKENS_PAD * COLS_TO_CLEAR; i += warpSize) {
+      for (int i = lane; i < NTOKENS_PAD_MMA_M * COLS_TO_CLEAR; i += warpSize) {
         int const r = i / COLS_TO_CLEAR;
         int const c = N_HALF + (i % COLS_TO_CLEAR);
         cb[layout_cb_swz(r, c)] = mma_type(0.f);
@@ -440,12 +437,12 @@ __device__ __forceinline__ void compute_CB_scaled_2warp(SmemT& smem, int warp, i
   using MmaAtomType = SM80_16x8x16_F32BF16BF16F32_TN;
 
   // ── Swizzled smem views ──
-  // C is padded to NTOKENS_PAD; B may be shrunk to TOKEN_ROWS (!PAD ⇒ 8 rows).
-  // Must use TOKEN_ROWS for smem_B so the physical layout matches the write
+  // C is padded to NTOKENS_PAD_MMA_M; B has NTOKENS_PAD_MMA_K rows.  Use
+  // NTOKENS_PAD_MMA_K for smem_B so the physical layout matches the write
   // layout from load_tile_async — `tile_to_shape` produces different outer
   // strides for (8, 128) vs (16, 128).
-  auto layout_C = make_swizzled_layout_rc<NTOKENS_PAD, DSTATE>();
-  auto layout_B = make_swizzled_layout_rc<TOKEN_ROWS, DSTATE>();
+  auto layout_C = make_swizzled_layout_rc<NTOKENS_PAD_MMA_M, DSTATE>();
+  auto layout_B = make_swizzled_layout_rc<NTOKENS_PAD_MMA_K, DSTATE>();
   Tensor smem_C =
       make_tensor(make_smem_ptr(reinterpret_cast<input_t const*>(&smem.C[0][0])), layout_C);
   Tensor smem_B =
@@ -455,14 +452,14 @@ __device__ __forceinline__ void compute_CB_scaled_2warp(SmemT& smem, int warp, i
   auto tiled_mma = make_tiled_mma(MMA_Atom<MMA_Traits<MmaAtomType>>{}, Layout<Shape<_1, _1>>{});
   auto thr_mma = tiled_mma.get_slice(lane);
 
-  // ── K-tile A operand (C): full [NTOKENS_PAD, K_TILE], shared by both warps ──
+  // ── K-tile A operand (C): full [NTOKENS_PAD_MMA_M, K_TILE], shared by both warps ──
   constexpr int K_TILE = 16;
   Tensor smem_C_tiled =
-      local_tile(smem_C, make_tile(Int<NTOKENS_PAD>{}, Int<K_TILE>{}), make_coord(_0{}, _));
+      local_tile(smem_C, make_tile(Int<NTOKENS_PAD_MMA_M>{}, Int<K_TILE>{}), make_coord(_0{}, _));
 
   // ── K-tile B operand ──
-  //   PAD=true  (TOKEN_ROWS=16): warp 0 → N=[0,8), warp 1 → N=[8,16).
-  //   PAD=false (TOKEN_ROWS=8):  only warp 0 runs (warp 1 took the early
+  //   NTOKENS_PAD_MMA_K == 16: warp 0 → N=[0,8), warp 1 → N=[8,16).
+  //   NTOKENS_PAD_MMA_K == 8 : only warp 0 runs (warp 1 took the early
   //     exit above), tile at (_0, _).
   Tensor smem_B_half =
       local_tile(smem_B, make_tile(Int<N_HALF>{}, Int<K_TILE>{}), make_coord(warp, _));
@@ -471,8 +468,8 @@ __device__ __forceinline__ void compute_CB_scaled_2warp(SmemT& smem, int warp, i
   Tensor frag_A = thr_mma.partition_fragment_A(smem_C_tiled(_, _, _0{}));
   Tensor frag_B = thr_mma.partition_fragment_B(smem_B_half(_, _, _0{}));
 
-  // ── Output accumulator: [NTOKENS_PAD, N_HALF] f32 ──
-  auto layout_cb_half = make_layout(make_shape(Int<NTOKENS_PAD>{}, Int<N_HALF>{}));
+  // ── Output accumulator: [NTOKENS_PAD_MMA_M, N_HALF] f32 ──
+  auto layout_cb_half = make_layout(make_shape(Int<NTOKENS_PAD_MMA_M>{}, Int<N_HALF>{}));
   Tensor frag_acc = thr_mma.partition_fragment_C(make_tensor((float*)nullptr, layout_cb_half));
   clear(frag_acc);
 
@@ -497,15 +494,15 @@ __device__ __forceinline__ void compute_CB_scaled_2warp(SmemT& smem, int warp, i
   }
 
   // ── Elementwise: decay * dt_proc * causal mask, convert f32 → mma_type ──
-  auto id_half = make_identity_tensor(make_shape(Int<NTOKENS_PAD>{}, Int<N_HALF>{}));
+  auto id_half = make_identity_tensor(make_shape(Int<NTOKENS_PAD_MMA_M>{}, Int<N_HALF>{}));
   auto id_part = thr_mma.partition_C(id_half);
 
   // ── Store to swizzled smem.CB_scaled ──
   Tensor smem_CB =
       make_tensor(make_smem_ptr(reinterpret_cast<mma_type*>(smem.CB_scaled)), layout_cb_swz);
-  // Tile into [NTOKENS_PAD, N_HALF] halves; warp selects its half
-  Tensor smem_CB_half =
-      local_tile(smem_CB, make_tile(Int<NTOKENS_PAD>{}, Int<N_HALF>{}), make_coord(_0{}, warp));
+  // Tile into [NTOKENS_PAD_MMA_M, N_HALF] halves; warp selects its half
+  Tensor smem_CB_half = local_tile(smem_CB, make_tile(Int<NTOKENS_PAD_MMA_M>{}, Int<N_HALF>{}),
+                                   make_coord(_0{}, warp));
   Tensor smem_CB_part = thr_mma.partition_C(smem_CB_half);
 
 #pragma unroll
@@ -524,9 +521,11 @@ __device__ __forceinline__ void compute_CB_scaled_2warp(SmemT& smem, int warp, i
 
 // =============================================================================
 // Precompute dB scaling coefficients (called once before the N-tile loop).
-// Returns N_COEFF floats in coeff[], one per B-fragment element.
-//   N_COEFF = 4 for m16n8k16 B fragment (PAD=true)
-//   N_COEFF = 2 for m16n8k8  B fragment (PAD=false)
+// Returns DB_COEFFS_PER_LANE floats in coeff[], one per B-fragment element of
+// the replay MMA — equal to (replay K) / 4 (each m16n8k* B-frag holds K*8/32
+// elts per lane).
+//   DB_COEFFS_PER_LANE = 4 for m16n8k16 B fragment
+//   DB_COEFFS_PER_LANE = 2 for m16n8k8  B fragment
 // coeff[i] = 0 when k >= prev_k, embedding the causal mask so the inner
 // loop needs no branch.
 //
@@ -535,20 +534,22 @@ __device__ __forceinline__ void compute_CB_scaled_2warp(SmemT& smem, int warp, i
 //   m16n8k16 B frag (4 elts): 0→K_base, 1→K_base+1, 2→K_base+8, 3→K_base+9
 //   m16n8k8  B frag (2 elts): 0→K_base, 1→K_base+1
 // =============================================================================
-template <int N_COEFF, typename SmemT>
-__device__ __forceinline__ void precompute_dB_coeff(float coeff[N_COEFF], SmemT const& smem,
-                                                    float total_cumAdt, int prev_k, int lane) {
-  static_assert(N_COEFF == 2 || N_COEFF == 4, "N_COEFF must be 2 (k8) or 4 (k16)");
+template <int DB_COEFFS_PER_LANE, typename SmemT>
+__device__ __forceinline__ void precompute_dB_coeff(float coeff[DB_COEFFS_PER_LANE],
+                                                    SmemT const& smem, float total_cumAdt,
+                                                    int prev_k, int lane) {
+  static_assert(DB_COEFFS_PER_LANE == 2 || DB_COEFFS_PER_LANE == 4,
+                "DB_COEFFS_PER_LANE must be 2 (k8) or 4 (k16)");
   int const K_base = (lane % 4) * 2;
-  int k_idx[N_COEFF];
+  int k_idx[DB_COEFFS_PER_LANE];
   k_idx[0] = K_base;
   k_idx[1] = K_base + 1;
-  if constexpr (N_COEFF == 4) {
+  if constexpr (DB_COEFFS_PER_LANE == 4) {
     k_idx[2] = K_base + 8;
     k_idx[3] = K_base + 9;
   }
 #pragma unroll
-  for (int i = 0; i < N_COEFF; ++i) {
+  for (int i = 0; i < DB_COEFFS_PER_LANE; ++i) {
     int const k = k_idx[i];
     coeff[i] = (k < prev_k) ? __expf(total_cumAdt - smem.old_cumAdt[k]) * smem.old_dt_proc[k] : 0.f;
   }
@@ -558,12 +559,13 @@ __device__ __forceinline__ void precompute_dB_coeff(float coeff[N_COEFF], SmemT 
 // Handles input_t → mma_type conversion + scaling in one pass.
 // coeff[i] = 0 encodes both causal mask and zero-fill for k >= prev_k.
 // =============================================================================
-template <int N_COEFF, typename mma_type, typename FragB>
-__device__ __forceinline__ void compute_dB_scaling(FragB& frag_B, float const coeff[N_COEFF]) {
+template <int DB_COEFFS_PER_LANE, typename mma_type, typename FragB>
+__device__ __forceinline__ void compute_dB_scaling(FragB& frag_B,
+                                                   float const coeff[DB_COEFFS_PER_LANE]) {
   using namespace cute;
-  static_assert(size(FragB{}) == N_COEFF, "frag_B size must match N_COEFF");
+  static_assert(size(FragB{}) == DB_COEFFS_PER_LANE, "frag_B size must match DB_COEFFS_PER_LANE");
 #pragma unroll
-  for (int i = 0; i < N_COEFF; ++i) {
+  for (int i = 0; i < DB_COEFFS_PER_LANE; ++i) {
     float val = toFloat(frag_B(i)) * coeff[i];
     mma_type result(val);
     memcpy(&frag_B(i), &result, 2);
@@ -585,20 +587,19 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
   static_assert(sizeof(input_t) == 2, "replay_state_mma requires 2-byte input type");
   static_assert(DIM == 64, "replay_state_mma requires DIM=64 for _4x1 MMA tiling");
 
-  constexpr int TOKEN_ROWS = SmemT::TOKEN_ROWS;  // 8 when !PAD, 16 when PAD
-  constexpr bool PAD = SmemT::PAD_TOKENS;
+  constexpr int NTOKENS_PAD_MMA_K = SmemT::NTOKENS_PAD_MMA_K;  // 8 or 16
   int const tid = warp * warpSize + lane;
 
-  // Always bf16 MMA.
-  //   PAD=true  → m16n8k16 + x4/x2 ldmatrix.trans (K tile = 16)
-  //   PAD=false → m16n8k8  + x2/x1 ldmatrix.trans (K tile = 8 = TOKEN_ROWS)
+  // Always bf16 MMA.  Atom K matches the token-axis tile (NTOKENS_PAD_MMA_K).
+  //   K == 16 → m16n8k16 + x4/x2 ldmatrix.trans
+  //   K == 8  → m16n8k8  + x2/x1 ldmatrix.trans
   using mma_type = __nv_bfloat16;
-  using MmaAtomType =
-      std::conditional_t<PAD, SM80_16x8x16_F32BF16BF16F32_TN, SM80_16x8x8_F32BF16BF16F32_TN>;
-  using LdsmA = std::conditional_t<PAD, SM75_U16x8_LDSM_T, SM75_U16x4_LDSM_T>;
-  using LdsmB = std::conditional_t<PAD, SM75_U16x4_LDSM_T, SM75_U16x2_LDSM_T>;
-  constexpr int K_FRAG = PAD ? 16 : 8;  // matches MMA atom K = TOKEN_ROWS
-  constexpr int N_COEFF = PAD ? 4 : 2;  // m16n8k16 B = 4 elts, m16n8k8 B = 2 elts
+  using MmaAtomType = std::conditional_t<NTOKENS_PAD_MMA_K == 16, SM80_16x8x16_F32BF16BF16F32_TN,
+                                         SM80_16x8x8_F32BF16BF16F32_TN>;
+  using LdsmA = std::conditional_t<NTOKENS_PAD_MMA_K == 16, SM75_U16x8_LDSM_T, SM75_U16x4_LDSM_T>;
+  using LdsmB = std::conditional_t<NTOKENS_PAD_MMA_K == 16, SM75_U16x4_LDSM_T, SM75_U16x2_LDSM_T>;
+  // # of dB coefficients each lane precomputes per replay K-tile = K * 8 / 32.
+  constexpr int DB_COEFFS_PER_LANE = NTOKENS_PAD_MMA_K / 4;
 
   // TiledMMA: 128 threads, 4 atoms in M direction → covers [M=64, N=8]
   auto tiled_mma = make_tiled_mma(MMA_Atom<MMA_Traits<MmaAtomType>>{}, Layout<Shape<_4, _1>>{});
@@ -607,10 +608,10 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
   float total_cumAdt = (prev_k > 0) ? smem.old_cumAdt[prev_k - 1] : 0.f;
   float total_decay = (prev_k > 0) ? __expf(total_cumAdt) : 1.f;
 
-  // ── A operand: old_x [TOKEN_ROWS, DIM] Swizzle<3,3,3>, transposed view
-  // [M=DIM, K=TOKEN_ROWS]. ldmatrix.trans reads K-stride-1 smem → K-stride-1
-  // registers. ──
-  auto layout_A = make_swizzled_layout_rc_transpose<TOKEN_ROWS, DIM>();
+  // ── A operand: old_x [NTOKENS_PAD_MMA_K, DIM] Swizzle<3,3,3>, transposed
+  // view [M=DIM, K=NTOKENS_PAD_MMA_K]. ldmatrix.trans reads K-stride-1 smem
+  // → K-stride-1 registers. ──
+  auto layout_A = make_swizzled_layout_rc_transpose<NTOKENS_PAD_MMA_K, DIM>();
   Tensor smem_A =
       make_tensor(make_smem_ptr(reinterpret_cast<mma_type const*>(&smem.old_x[0][0])), layout_A);
 
@@ -618,15 +619,15 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
   auto s2r_thr_A = s2r_A.get_slice(tid);
   Tensor smem_A_s2r = s2r_thr_A.partition_S(smem_A);
   Tensor frag_A = thr_mma.partition_fragment_A(
-      make_tensor((mma_type*)0x0, make_shape(Int<DIM>{}, Int<K_FRAG>{})));
+      make_tensor((mma_type*)0x0, make_shape(Int<DIM>{}, Int<NTOKENS_PAD_MMA_K>{})));
   Tensor frag_A_view = s2r_thr_A.retile_D(frag_A);
 
   cute::copy(s2r_A, smem_A_s2r, frag_A_view);
   // old_x is input_t == mma_type (bf16) — no conversion needed.
 
-  // ── B operand: old_B [TOKEN_ROWS, DSTATE] Swizzle<3,3,3>, transposed view
-  // [N=DSTATE, K=TOKEN_ROWS]. ──
-  auto layout_B = make_swizzled_layout_rc_transpose<TOKEN_ROWS, DSTATE>();
+  // ── B operand: old_B [NTOKENS_PAD_MMA_K, DSTATE] Swizzle<3,3,3>, transposed
+  // view [N=DSTATE, K=NTOKENS_PAD_MMA_K]. ──
+  auto layout_B = make_swizzled_layout_rc_transpose<NTOKENS_PAD_MMA_K, DSTATE>();
   Tensor smem_B_full =
       make_tensor(make_smem_ptr(reinterpret_cast<mma_type const*>(&smem.old_B[0][0])), layout_B);
 
@@ -646,9 +647,10 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
 
   // Precompute dB coefficients once — they depend only on K (lane), not on N.
   // coeff[i] = 0 when k ≥ prev_k (causal mask); since prev_k ≤ NTOKENS ≤
-  // K_FRAG and we only read K < K_FRAG from smem, no garbage feeds the MMA.
-  float dB_coeff[N_COEFF];
-  precompute_dB_coeff<N_COEFF>(dB_coeff, smem, total_cumAdt, prev_k, lane);
+  // NTOKENS_PAD_MMA_K and we only read K < NTOKENS_PAD_MMA_K from smem, no
+  // garbage feeds the MMA.
+  float dB_coeff[DB_COEFFS_PER_LANE];
+  precompute_dB_coeff<DB_COEFFS_PER_LANE>(dB_coeff, smem, total_cumAdt, prev_k, lane);
 
   // Process two N-tiles per iteration: interleave LDSM.T + dB_scaling across tiles
   // so PRMT has more latency cover from the other tile's loads.
@@ -677,16 +679,16 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
     }
 
     // ── LDSM.T both B tiles, then scale both — interleaved for latency cover ──
-    Tensor smem_B_ntile_0 =
-        local_tile(smem_B_full, make_tile(Int<N_TILE>{}, Int<K_FRAG>{}), make_coord(n, _0{}));
-    Tensor smem_B_ntile_1 =
-        local_tile(smem_B_full, make_tile(Int<N_TILE>{}, Int<K_FRAG>{}), make_coord(n + 1, _0{}));
+    Tensor smem_B_ntile_0 = local_tile(
+        smem_B_full, make_tile(Int<N_TILE>{}, Int<NTOKENS_PAD_MMA_K>{}), make_coord(n, _0{}));
+    Tensor smem_B_ntile_1 = local_tile(
+        smem_B_full, make_tile(Int<N_TILE>{}, Int<NTOKENS_PAD_MMA_K>{}), make_coord(n + 1, _0{}));
 
     auto smem_B_s2r_0 = s2r_thr_B.partition_S(smem_B_ntile_0);
     auto smem_B_s2r_1 = s2r_thr_B.partition_S(smem_B_ntile_1);
 
     Tensor frag_B_0 = thr_mma.partition_fragment_B(
-        make_tensor((mma_type*)0x0, make_shape(Int<N_TILE>{}, Int<K_FRAG>{})));
+        make_tensor((mma_type*)0x0, make_shape(Int<N_TILE>{}, Int<NTOKENS_PAD_MMA_K>{})));
     Tensor frag_B_1 = make_fragment_like(frag_B_0);
     auto frag_B_view_0 = s2r_thr_B.retile_D(frag_B_0);
     auto frag_B_view_1 = s2r_thr_B.retile_D(frag_B_1);
@@ -694,8 +696,8 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, int warp, int lane
     cute::copy(s2r_B, smem_B_s2r_0, frag_B_view_0);
     cute::copy(s2r_B, smem_B_s2r_1, frag_B_view_1);
 
-    compute_dB_scaling<N_COEFF, mma_type>(frag_B_0, dB_coeff);
-    compute_dB_scaling<N_COEFF, mma_type>(frag_B_1, dB_coeff);
+    compute_dB_scaling<DB_COEFFS_PER_LANE, mma_type>(frag_B_0, dB_coeff);
+    compute_dB_scaling<DB_COEFFS_PER_LANE, mma_type>(frag_B_1, dB_coeff);
 
     // ── Two independent HMMAs ──
     cute::gemm(tiled_mma, frag_h_0, frag_A, frag_B_0, frag_h_0);
@@ -742,7 +744,7 @@ __device__ __forceinline__ void convert_frag(Frag& frag) {
 // 2b. frag_y += CB_scaled @ x  (matmul 4, single K-tile)
 //     CB_scaled A operand loaded from swizzled smem via LDSM (precomputed by warps 0,1).
 //     x B operand loaded from smem via ldmatrix.trans.
-template <typename input_t, typename mma_type, int N_TILE, int NTOKENS_PAD, typename FragY,
+template <typename input_t, typename mma_type, int N_TILE, int NTOKENS_PAD_MMA_M, typename FragY,
           typename FragCB, typename SmemXTrans, typename S2RBTrans, typename S2RThrBTrans,
           typename ThrMma, typename TiledMma>
 __device__ __forceinline__ void add_cb_x_cute(FragY& frag_y, FragCB const& frag_CB,
@@ -752,11 +754,11 @@ __device__ __forceinline__ void add_cb_x_cute(FragY& frag_y, FragCB const& frag_
                                               ThrMma const& thr_mma, TiledMma const& tiled_mma,
                                               int n) {
   using namespace cute;
-  Tensor smem_x_trans_ntile =
-      local_tile(smem_x_trans, make_tile(Int<N_TILE>{}, Int<NTOKENS_PAD>{}), make_coord(n, _0{}));
+  Tensor smem_x_trans_ntile = local_tile(
+      smem_x_trans, make_tile(Int<N_TILE>{}, Int<NTOKENS_PAD_MMA_M>{}), make_coord(n, _0{}));
   auto smem_x_trans_s2r = s2r_thr_B_trans.partition_S(smem_x_trans_ntile);
   auto frag_B_x = thr_mma.partition_fragment_B(
-      make_tensor((mma_type*)0x0, make_shape(Int<N_TILE>{}, Int<NTOKENS_PAD>{})));
+      make_tensor((mma_type*)0x0, make_shape(Int<N_TILE>{}, Int<NTOKENS_PAD_MMA_M>{})));
   auto frag_B_x_view = s2r_thr_B_trans.retile_D(frag_B_x);
 
   cute::copy(s2r_B_trans, smem_x_trans_s2r, frag_B_x_view);
@@ -766,14 +768,14 @@ __device__ __forceinline__ void add_cb_x_cute(FragY& frag_y, FragCB const& frag_
 }
 
 // 3b. frag_y += D * x[t, d]  (per-thread skip connection via partition_C)
-template <typename input_t, int NTOKENS_PAD, int N_TILE, typename FragY, typename SmemX,
+template <typename input_t, int NTOKENS_PAD_MMA_M, int N_TILE, typename FragY, typename SmemX,
           typename ThrMma>
 __device__ __forceinline__ void add_D_skip_cute(FragY& frag_y, SmemX const& smem_x,
                                                 ThrMma const& thr_mma, float D_val, int n) {
   using namespace cute;
   if (D_val == 0.f) return;
   Tensor smem_x_tile =
-      local_tile(smem_x, make_tile(Int<NTOKENS_PAD>{}, Int<N_TILE>{}), make_coord(_0{}, n));
+      local_tile(smem_x, make_tile(Int<NTOKENS_PAD_MMA_M>{}, Int<N_TILE>{}), make_coord(_0{}, n));
   Tensor x_part = thr_mma.partition_C(smem_x_tile);
   // Load pairs of consecutive bf16 elements and convert via paired toFloat2.
   // m16n8k16 partition_C places consecutive N-column pairs adjacent in smem.
@@ -787,7 +789,7 @@ __device__ __forceinline__ void add_D_skip_cute(FragY& frag_y, SmemX const& smem
 }
 
 // 4b. frag_y *= z * sigmoid(z)  (z-gating via partition_C)
-template <typename input_t, int NTOKENS_PAD, int N_TILE, typename FragY, typename SmemZ,
+template <typename input_t, int NTOKENS_PAD_MMA_M, int N_TILE, typename FragY, typename SmemZ,
           typename ThrMma>
 __device__ __forceinline__ void compute_z_gating_cute(FragY& frag_y, SmemZ const& smem_z,
                                                       ThrMma const& thr_mma, void const* z_ptr,
@@ -795,7 +797,7 @@ __device__ __forceinline__ void compute_z_gating_cute(FragY& frag_y, SmemZ const
   using namespace cute;
   if (!z_ptr) return;
   Tensor smem_z_tile =
-      local_tile(smem_z, make_tile(Int<NTOKENS_PAD>{}, Int<N_TILE>{}), make_coord(_0{}, n));
+      local_tile(smem_z, make_tile(Int<NTOKENS_PAD_MMA_M>{}, Int<N_TILE>{}), make_coord(_0{}, n));
   Tensor z_part = thr_mma.partition_C(smem_z_tile);
   static_assert(sizeof(input_t) == 2, "vectorized z-gating requires 2-byte input_t");
 #pragma unroll
@@ -824,7 +826,7 @@ __device__ __forceinline__ void add_init_out_cute(SmemT const& smem, TiledMma co
   // Always bf16 MMA — f16 smem state converted via convert_frag<smem_state_t, mma_type>.
   using mma_type = __nv_bfloat16;
 
-  constexpr int NTOKENS_PAD = SmemT::NTOKENS_PAD;
+  constexpr int NTOKENS_PAD_MMA_M = SmemT::NTOKENS_PAD_MMA_M;
   constexpr int K_TILE = 16;
   constexpr int NUM_K_TILES = DSTATE / K_TILE;
   constexpr int N_TILE = 32;
@@ -836,7 +838,7 @@ __device__ __forceinline__ void add_init_out_cute(SmemT const& smem, TiledMma co
   auto s2r_thr_B = s2r_B.get_slice(tid);
 
   // ── Swizzled smem views ──
-  auto layout_C_swz = make_swizzled_layout_rc<NTOKENS_PAD, DSTATE>();
+  auto layout_C_swz = make_swizzled_layout_rc<NTOKENS_PAD_MMA_M, DSTATE>();
   Tensor smem_C =
       make_tensor(make_smem_ptr(reinterpret_cast<mma_type const*>(&smem.C[0][0])), layout_C_swz);
   auto layout_state_swz = make_swizzled_layout_rc<DIM, DSTATE>();
@@ -845,7 +847,7 @@ __device__ __forceinline__ void add_init_out_cute(SmemT const& smem, TiledMma co
 
   // ── K-tiled C (A operand) ──
   Tensor smem_C_ktiled =
-      local_tile(smem_C, make_tile(Int<NTOKENS_PAD>{}, Int<K_TILE>{}), make_coord(_0{}, _));
+      local_tile(smem_C, make_tile(Int<NTOKENS_PAD_MMA_M>{}, Int<K_TILE>{}), make_coord(_0{}, _));
   auto smem_C_s2r = s2r_thr_A.partition_S(smem_C_ktiled);
 
   // ── State B operands for both N-tiles ──
@@ -1009,7 +1011,7 @@ __device__ __forceinline__ void compute_and_store_output_cute(SmemT& smem,
                 "smem state type must be 2-byte for MMA output");
   static_assert(sizeof(input_t) == 2, "compute_and_store_output_cute requires 2-byte input type");
 
-  constexpr int NTOKENS_PAD = SmemT::NTOKENS_PAD;
+  constexpr int NTOKENS_PAD_MMA_M = SmemT::NTOKENS_PAD_MMA_M;
   int const tid = warp * warpSize + lane;
 
   // Always bf16 MMA — activations are bf16; f16 state converted in add_init_out_cute.
@@ -1021,16 +1023,16 @@ __device__ __forceinline__ void compute_and_store_output_cute(SmemT& smem,
   auto thr_mma = tiled_mma.get_slice(tid);
 
   // ── Swizzled smem views ──
-  // x: swizzled [NTOKENS_PAD, DIM]
-  auto layout_x_swz = make_swizzled_layout_rc<NTOKENS_PAD, DIM>();
+  // x: swizzled [NTOKENS_PAD_MMA_M, DIM]
+  auto layout_x_swz = make_swizzled_layout_rc<NTOKENS_PAD_MMA_M, DIM>();
   Tensor smem_x =
       make_tensor(make_smem_ptr(reinterpret_cast<mma_type const*>(&smem.x[0][0])), layout_x_swz);
-  auto layout_x_trans_swz = make_swizzled_layout_rc_transpose<NTOKENS_PAD, DIM>();
+  auto layout_x_trans_swz = make_swizzled_layout_rc_transpose<NTOKENS_PAD_MMA_M, DIM>();
   Tensor smem_x_trans = make_tensor(make_smem_ptr(reinterpret_cast<mma_type const*>(&smem.x[0][0])),
                                     layout_x_trans_swz);
 
-  // z: swizzled [NTOKENS_PAD, DIM]
-  auto layout_z_swz = make_swizzled_layout_rc<NTOKENS_PAD, DIM>();
+  // z: swizzled [NTOKENS_PAD_MMA_M, DIM]
+  auto layout_z_swz = make_swizzled_layout_rc<NTOKENS_PAD_MMA_M, DIM>();
   Tensor smem_z =
       make_tensor(make_smem_ptr(reinterpret_cast<input_t const*>(&smem.z[0][0])), layout_z_swz);
 
@@ -1043,9 +1045,10 @@ __device__ __forceinline__ void compute_and_store_output_cute(SmemT& smem,
   auto s2r_thr_B_trans = s2r_B_trans.get_slice(tid);
 
   // ── Load CB_scaled A operand from smem (precomputed by warps 0,1 between syncs) ──
-  auto layout_cb_swz = composition(Swizzle<3, 3, 3>{},
-                                   make_layout(make_shape(Int<NTOKENS_PAD>{}, Int<NTOKENS_PAD>{}),
-                                               make_stride(Int<64>{}, _1{})));
+  auto layout_cb_swz =
+      composition(Swizzle<3, 3, 3>{},
+                  make_layout(make_shape(Int<NTOKENS_PAD_MMA_M>{}, Int<NTOKENS_PAD_MMA_M>{}),
+                              make_stride(Int<64>{}, _1{})));
   Tensor smem_CB =
       make_tensor(make_smem_ptr(reinterpret_cast<mma_type const*>(smem.CB_scaled)), layout_cb_swz);
   auto smem_CB_s2r = s2r_thr_A.partition_S(smem_CB);
@@ -1053,11 +1056,11 @@ __device__ __forceinline__ void compute_and_store_output_cute(SmemT& smem,
   auto frag_CB_A_view = s2r_thr_A.retile_D(frag_CB_A);
   cute::copy(s2r_A, smem_CB_s2r, frag_CB_A_view);
 
-  // Decay broadcast: cumAdt[t] → [NTOKENS_PAD, N_TILE] with stride-0 on N
+  // Decay broadcast: cumAdt[t] → [NTOKENS_PAD_MMA_M, N_TILE] with stride-0 on N
   constexpr int N_TILE = 32;
   Tensor decay_bcast = make_tensor(
       make_smem_ptr(smem.cumAdt),
-      make_layout(make_shape(Int<NTOKENS_PAD>{}, Int<N_TILE>{}), make_stride(_1{}, _0{})));
+      make_layout(make_shape(Int<NTOKENS_PAD_MMA_M>{}, Int<N_TILE>{}), make_stride(_1{}, _0{})));
   Tensor decay_part = thr_mma.partition_C(decay_bcast);
 
   // ── Gmem output: partition_C for direct register → gmem store ──
@@ -1066,7 +1069,7 @@ __device__ __forceinline__ void compute_and_store_output_cute(SmemT& smem,
 
   // Row predicate for padding: identity tensor partitioned the same way as frag_y.
   // pred(i) is true when the element's row < NTOKENS (skip padding rows).
-  auto id_tile = make_identity_tensor(make_shape(Int<NTOKENS_PAD>{}, Int<N_TILE>{}));
+  auto id_tile = make_identity_tensor(make_shape(Int<NTOKENS_PAD_MMA_M>{}, Int<N_TILE>{}));
   auto id_part = thr_mma.partition_C(id_tile);
   auto pred = make_tensor<bool>(shape(id_part));
 #pragma unroll
@@ -1096,18 +1099,18 @@ __device__ __forceinline__ void compute_and_store_output_cute(SmemT& smem,
     }
 
     // 2b. frag_y += CB_scaled @ x (CB from smem LDSM, x from smem via ldmatrix.trans)
-    add_cb_x_cute<input_t, mma_type, N_TILE, NTOKENS_PAD>(
+    add_cb_x_cute<input_t, mma_type, N_TILE, NTOKENS_PAD_MMA_M>(
         frag_y, frag_CB_A, smem_x_trans, s2r_B_trans, s2r_thr_B_trans, thr_mma, tiled_mma, n);
 
     // 3b. frag_y += D * x[t, d]
-    add_D_skip_cute<input_t, NTOKENS_PAD, N_TILE>(frag_y, smem_x, thr_mma, D_val, n);
+    add_D_skip_cute<input_t, NTOKENS_PAD_MMA_M, N_TILE>(frag_y, smem_x, thr_mma, D_val, n);
 
     // 4b. frag_y *= z * sigmoid(z)
-    compute_z_gating_cute<input_t, NTOKENS_PAD, N_TILE>(frag_y, smem_z, thr_mma, params.z, n);
+    compute_z_gating_cute<input_t, NTOKENS_PAD_MMA_M, N_TILE>(frag_y, smem_z, thr_mma, params.z, n);
 
     // Store frag_y directly to gmem (register → gmem, no smem round-trip).
     auto gOut_tile = make_tensor(make_gmem_ptr(output_ptr + out_base + n * N_TILE),
-                                 make_layout(make_shape(Int<NTOKENS_PAD>{}, Int<N_TILE>{}),
+                                 make_layout(make_shape(Int<NTOKENS_PAD_MMA_M>{}, Int<N_TILE>{}),
                                              make_stride(params.out_stride_mtp, _1{})));
     auto gOut_part = thr_mma.partition_C(gOut_tile);
     // Vectorized 32-bit store: elements i and i+1 are same-row, consecutive columns
@@ -1137,17 +1140,17 @@ template <typename input_t, int NTOKENS, int DIM, typename SmemT>
 __device__ __forceinline__ void store_old_x(SmemT& smem, SsuIncrementalParams const& params,
                                             int warp, int lane, int head, int64_t cache_slot) {
   using namespace cute;
-  constexpr int NTOKENS_PAD = SmemT::NTOKENS_PAD;
+  constexpr int NTOKENS_PAD_MMA_M = SmemT::NTOKENS_PAD_MMA_M;
   int const flat_tid = warp * warpSize + lane;
 
   auto* __restrict__ old_x_w = reinterpret_cast<input_t*>(params.old_x);
   int64_t const ox_w_base = cache_slot * params.old_x_stride_cache + head * DIM;
 
-  auto layout_x_swz = make_swizzled_layout_rc<NTOKENS_PAD, DIM>();
+  auto layout_x_swz = make_swizzled_layout_rc<NTOKENS_PAD_MMA_M, DIM>();
   Tensor sX =
       make_tensor(make_smem_ptr(reinterpret_cast<input_t const*>(&smem.x[0][0])), layout_x_swz);
   Tensor gX = make_tensor(make_gmem_ptr(old_x_w + ox_w_base),
-                          make_layout(make_shape(Int<NTOKENS_PAD>{}, Int<DIM>{}),
+                          make_layout(make_shape(Int<NTOKENS_PAD_MMA_M>{}, Int<DIM>{}),
                                       make_stride(params.old_x_stride_mtp, Int<1>{})));
 
   auto s2g = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, input_t>{},
@@ -1156,12 +1159,12 @@ __device__ __forceinline__ void store_old_x(SmemT& smem, SsuIncrementalParams co
   auto tSsX = thr_s2g.partition_S(sX);
   auto tSgX = thr_s2g.partition_D(gX);
 
-  if constexpr (NTOKENS == NTOKENS_PAD) {
+  if constexpr (NTOKENS == NTOKENS_PAD_MMA_M) {
     copy(s2g, tSsX, tSgX);
   } else {
     // All elements in a thread's partition share the same row (thread layout [16,8]).
     // Check the first element's row coordinate to predicate the entire copy.
-    auto cX = make_identity_tensor(make_shape(Int<NTOKENS_PAD>{}, Int<DIM>{}));
+    auto cX = make_identity_tensor(make_shape(Int<NTOKENS_PAD_MMA_M>{}, Int<DIM>{}));
     auto tScX = thr_s2g.partition_D(cX);
     if (get<0>(tScX(_0{})) < NTOKENS) {
       copy(s2g, tSsX, tSgX);
@@ -1175,25 +1178,25 @@ __device__ __forceinline__ void store_old_B(SmemT& smem, SsuIncrementalParams co
                                             int64_t cache_slot, int buf_write) {
   using namespace cute;
   if (head % HEADS_PER_GROUP != 0) return;
-  constexpr int TOKEN_ROWS = SmemT::TOKEN_ROWS;  // matches smem.B row count
+  constexpr int NTOKENS_PAD_MMA_K = SmemT::NTOKENS_PAD_MMA_K;  // matches smem.B row count
   int const flat_tid = warp * warpSize + lane;
 
   auto* __restrict__ old_B_w = reinterpret_cast<input_t*>(params.old_B);
   int64_t const oB_base = cache_slot * params.old_B_stride_cache +
                           buf_write * params.old_B_stride_dbuf + group_idx * DSTATE;
 
-  auto layout_B_swz = make_swizzled_layout_rc<TOKEN_ROWS, DSTATE>();
+  auto layout_B_swz = make_swizzled_layout_rc<NTOKENS_PAD_MMA_K, DSTATE>();
   Tensor sB =
       make_tensor(make_smem_ptr(reinterpret_cast<input_t const*>(&smem.B[0][0])), layout_B_swz);
   Tensor gB = make_tensor(make_gmem_ptr(old_B_w + oB_base),
-                          make_layout(make_shape(Int<TOKEN_ROWS>{}, Int<DSTATE>{}),
+                          make_layout(make_shape(Int<NTOKENS_PAD_MMA_K>{}, Int<DSTATE>{}),
                                       make_stride(params.old_B_stride_mtp, Int<1>{})));
 
   // Thread layout: one thread per row, remaining threads split along cols.
   // Keeps the row predicate trivial (each thread sees a single row).
-  //   TOKEN_ROWS=16 → (16, 8) thread layout, val (1, 8) → 1 iter on (16, 128).
-  //   TOKEN_ROWS=8  → (8, 16) thread layout, val (1, 8) → 1 iter on (8, 128).
-  constexpr int ROW_THR = TOKEN_ROWS;
+  //   NTOKENS_PAD_MMA_K=16 → (16, 8) thread layout, val (1, 8) → 1 iter on (16, 128).
+  //   NTOKENS_PAD_MMA_K=8  → (8, 16) thread layout, val (1, 8) → 1 iter on (8, 128).
+  constexpr int ROW_THR = NTOKENS_PAD_MMA_K;
   constexpr int COL_THR = 128 / ROW_THR;
   auto s2g = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, input_t>{},
                              Layout<Shape<Int<ROW_THR>, Int<COL_THR>>, Stride<Int<COL_THR>, _1>>{},
@@ -1202,10 +1205,10 @@ __device__ __forceinline__ void store_old_B(SmemT& smem, SsuIncrementalParams co
   auto tSsB = thr_s2g.partition_S(sB);
   auto tSgB = thr_s2g.partition_D(gB);
 
-  if constexpr (NTOKENS == TOKEN_ROWS) {
+  if constexpr (NTOKENS == NTOKENS_PAD_MMA_K) {
     copy(s2g, tSsB, tSgB);
   } else {
-    auto cB = make_identity_tensor(make_shape(Int<TOKEN_ROWS>{}, Int<DSTATE>{}));
+    auto cB = make_identity_tensor(make_shape(Int<NTOKENS_PAD_MMA_K>{}, Int<DSTATE>{}));
     auto tScB = thr_s2g.partition_D(cB);
     if (get<0>(tScB(_0{})) < NTOKENS) {
       copy(s2g, tSsB, tSgB);
