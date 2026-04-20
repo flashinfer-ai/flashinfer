@@ -25,7 +25,7 @@ source "${SCRIPT_DIR}/test_utils.sh"
 TEST_FILES="tests/comm/test_allreduce_unified_api.py"
 
 # Tests that require torchrun instead of mpirun
-TORCHRUN_TEST_FILES="tests/comm/test_parallel_attention.py"
+TORCHRUN_TEST_FILES="tests/attention/test_parallel_attention.py"
 : "${TORCHRUN_PREFIX:=torchrun --nproc_per_node=4}"
 
 # Main execution

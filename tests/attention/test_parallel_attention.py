@@ -1,7 +1,7 @@
 """Tests for parallel attention (Ulysses + Ring).
 
 Launch with:
-    torchrun --nproc_per_node=4 -m pytest tests/comm/test_parallel_attention.py -v
+    torchrun --nproc_per_node=4 -m pytest tests/attention/test_parallel_attention.py -v
 """
 
 import math
