@@ -344,6 +344,9 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
   FLASHINFER_CHECK(
       0 <= actTypeInt && actTypeInt < static_cast<int64_t>(ActivationType::InvalidType),
       "Unknown activation type", serializeActivationType(activationType), "of enum", actTypeInt);
+  // transposeMmaOutput=true swaps the caller's A/B into the kernel's B/A, so a per-channel
+  // weight scale (along the weight's output-channel dim) becomes a per-row scale of kernel A,
+  // i.e. mUsePerTokenSfA=true in the kernel options.
   bool isGatedAct = isGatedActivation(activationType);
   if (isGatedAct) {
     ActType actType = activationTypeToGatedActType(activationType);
