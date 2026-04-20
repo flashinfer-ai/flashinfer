@@ -337,11 +337,14 @@ static inline EltwiseActType activationTypeToEltwiseActType(ActivationType actTy
 tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
     btg::Dtype dtypeAct, btg::Dtype dtypeWeights, int32_t tileTokensDim, bool useDeepSeekFp8,
     ActivationType activationType, bool useShuffledMatrix,
-    batchedGemm::gemm::MatrixLayout weightLayout) {
+    batchedGemm::gemm::MatrixLayout weightLayout, bool usePerChannelWeightScale = false) {
   int64_t actTypeInt = static_cast<int64_t>(activationType);
   FLASHINFER_CHECK(
       0 <= actTypeInt && actTypeInt < static_cast<int64_t>(ActivationType::InvalidType),
       "Unknown activation type", serializeActivationType(activationType), "of enum", actTypeInt);
+  // transposeMmaOutput=true swaps the caller's A/B into the kernel's B/A, so a per-channel
+  // weight scale (along the weight's output-channel dim) becomes a per-row scale of kernel A,
+  // i.e. mUsePerTokenSfA=true in the kernel options.
   bool isGatedAct = isGatedActivation(activationType);
   if (isGatedAct) {
     ActType actType = activationTypeToGatedActType(activationType);
@@ -359,7 +362,9 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
         .tileSize = tileTokensDim,
         .epilogueTileM = useDeepSeekFp8 ? 64 : 128,
         .useShuffledMatrix = useShuffledMatrix,
-        .weightLayout = weightLayout};
+        .weightLayout = weightLayout,
+        .usePerTokenSfA = usePerChannelWeightScale,
+        .usePerTokenSfB = false};
     return options;
   } else {
     EltwiseActType actType = activationTypeToEltwiseActType(activationType);
@@ -377,20 +382,22 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
         .tileSize = tileTokensDim,
         .epilogueTileM = 128,
         .useShuffledMatrix = useShuffledMatrix,
-        .weightLayout = weightLayout};
+        .weightLayout = weightLayout,
+        .usePerTokenSfA = usePerChannelWeightScale,
+        .usePerTokenSfB = false};
     return options;
   }
 }
 
 Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8, int tileTokensDim,
                ActivationType activationType, bool useShuffledMatrix,
-               batchedGemm::gemm::MatrixLayout weightLayout)
+               batchedGemm::gemm::MatrixLayout weightLayout, bool usePerChannelWeightScale)
     : mDtypeAct(dtypeAct),
       mDtypeWeights(dtypeWeights),
       mTileTokensDim(tileTokensDim),
       mRunner(tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner(
           getOptions(mDtypeAct, mDtypeWeights, mTileTokensDim, useDeepSeekFp8, activationType,
-                     useShuffledMatrix, weightLayout))),
+                     useShuffledMatrix, weightLayout, usePerChannelWeightScale))),
       mActType(activationType) {}
 
 void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void* weightsScale,
@@ -459,7 +466,8 @@ std::vector<int64_t> Runner::getPassingConfigIndices() const {
 namespace Gemm2 {
 tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
     btg::Dtype dtypeAct, btg::Dtype dtypeWeights, btg::Dtype dtypeOut, int32_t tileTokensDim,
-    bool useDeepSeekFp8, bool useShuffledMatrix, batchedGemm::gemm::MatrixLayout weightLayout) {
+    bool useDeepSeekFp8, bool useShuffledMatrix, batchedGemm::gemm::MatrixLayout weightLayout,
+    bool usePerChannelWeightScale = false) {
   tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options = {
       // Swap A and B dtypes because transposeMmaOutput is hardcoded to true
       .dtypeA = dtypeWeights,
@@ -474,20 +482,22 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
       .tileSize = tileTokensDim,
       .epilogueTileM = useDeepSeekFp8 ? 64 : 128,
       .useShuffledMatrix = useShuffledMatrix,
-      .weightLayout = weightLayout};
+      .weightLayout = weightLayout,
+      .usePerTokenSfA = usePerChannelWeightScale,
+      .usePerTokenSfB = false};
   return options;
 }
 
 Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, btg::Dtype dtypeOut,
                bool useDeepSeekFp8, int tileTokensDim, bool useShuffledMatrix,
-               batchedGemm::gemm::MatrixLayout weightLayout)
+               batchedGemm::gemm::MatrixLayout weightLayout, bool usePerChannelWeightScale)
     : mDtypeAct(dtypeAct),
       mDtypeWeights(dtypeWeights),
       mDtypeOut(dtypeOut),
       mTileTokensDim(tileTokensDim),
       mRunner(tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner(
           getOptions(dtypeAct, dtypeWeights, dtypeOut, tileTokensDim, useDeepSeekFp8,
-                     useShuffledMatrix, weightLayout))) {}
+                     useShuffledMatrix, weightLayout, usePerChannelWeightScale))) {}
 
 void Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, void* weights,
                  void* weightsScale, float* outputScalesScalar, float* ptrBias, void* output,
@@ -550,11 +560,13 @@ std::vector<int64_t> Runner::getPassingConfigIndices() const {
 namespace MoE {
 Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8,
                int32_t tileTokensDim, ActivationType activationType, bool useShuffledMatrix,
-               batchedGemm::gemm::MatrixLayout weightLayout)
+               batchedGemm::gemm::MatrixLayout weightLayout, bool usePerChannelWeightScale)
     : mPermuteGemm1(PermuteGemm1::Runner(dtypeAct, dtypeWeights, useDeepSeekFp8, tileTokensDim,
-                                         activationType, useShuffledMatrix, weightLayout)),
+                                         activationType, useShuffledMatrix, weightLayout,
+                                         usePerChannelWeightScale)),
       mGemm2(Gemm2::Runner(dtypeAct, dtypeWeights, btg::Dtype::Bfloat16, useDeepSeekFp8,
-                           tileTokensDim, useShuffledMatrix, weightLayout)) {
+                           tileTokensDim, useShuffledMatrix, weightLayout,
+                           usePerChannelWeightScale)) {
   auto const& gemm1PassingIndices = mPermuteGemm1.getPassingConfigIndices();
   auto const& gemm2PassingIndices = mGemm2.getPassingConfigIndices();
 
