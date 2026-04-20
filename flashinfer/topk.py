@@ -326,7 +326,7 @@ def get_num_cached_for_topk(device, k):
         get_shared_bytes_per_block_optin(device) // blocks_per_sm
     )  # SMEM_CARVEOUT // blocks_per_sm
 
-    buffers_used = (k + 6 + 3 * 256 + 8) * 4  # other shared memory for buffers
+    buffers_used = (k + 5 + 3 * 256 + 8) * 4  # other shared memory for buffers
     # num_bytes = 2 * 2 * sizeof(int) * num_cached, double buffer on indices and values cache
     return (shared_per_block - buffers_used - 1024) // 16
 

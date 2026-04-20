@@ -98,12 +98,12 @@ __device__ __forceinline__ TopkResults fast_topk_cuda_v4(
   int* s_cached_indices = (int*)(2 * num_cached + s_cached_logit_bits);
   int* s_topk_inds = (int*)(2 * num_cached + s_cached_indices);
 
-  int* shared_hist = s_topk_inds + TopK;
-  int* shared_final_idx_count = shared_hist + 3 * 256;
-  int* shared_num_cached_count = shared_final_idx_count + 1;
-  int* shared_threshold_bin = shared_num_cached_count + 2;
-  int* s_cached_overflow_count = shared_threshold_bin + 1;
-  int* s_cum_reduce_buf = s_cached_overflow_count + 2;
+  int* shared_hist = s_topk_inds + TopK;                      // [3 * 256]
+  int* shared_final_idx_count = shared_hist + 3 * 256;        // [1]
+  int* shared_num_cached_count = shared_final_idx_count + 1;  // [2]
+  int* shared_threshold_bin = shared_num_cached_count + 2;    // [1]
+  int* s_cum_reduce_buf = shared_threshold_bin + 1;           // [8]
+  int* s_k_remaining_counter = s_cum_reduce_buf + 8;          // [1]
 
   auto cluster = cg::this_cluster();
   const int block_id = cluster.block_rank();
@@ -165,8 +165,8 @@ __device__ __forceinline__ TopkResults fast_topk_cuda_v4(
   }
   if (threadIdx.x == 0) {
     *shared_final_idx_count = 0;
+    *s_k_remaining_counter = 0;
     shared_num_cached_count[0] = 0;
-    s_cached_overflow_count[0] = 0;
   }
 
   if (pre_hist == nullptr) {
@@ -192,9 +192,9 @@ __device__ __forceinline__ TopkResults fast_topk_cuda_v4(
 
       if (bin > threshold_bin) {
         int topk_offset = atomicAdd(shared_final_idx_count, 1);
-        if (topk_offset < TopK) {
-          s_topk_inds[topk_offset] = i;
-        }
+        // if (topk_offset < TopK) {
+        s_topk_inds[topk_offset] = i;
+        // }
       }
 
       if (bin == threshold_bin) {
@@ -206,7 +206,7 @@ __device__ __forceinline__ TopkResults fast_topk_cuda_v4(
           atomicAdd(shared_hist + 256 + ((bits >> (LShiftStart - 8)) & 0xff), 1);
         } else {
           // Shared buffer full: spill to per-CTA global overflow cache.
-          int g_off = atomicAdd(&s_cached_overflow_count[0], 1);
+          int g_off = cached_offset - num_cached;
           if (g_off < overflow_stride) {
             PackedCachedData cached_res = {static_cast<uint32_t>(bits), i};
             get_cached_overflow(0)[g_off] = cached_res;
@@ -254,7 +254,6 @@ __device__ __forceinline__ TopkResults fast_topk_cuda_v4(
     }
     if (threadIdx.x == 0) {
       shared_num_cached_count[phase] = 0;
-      s_cached_overflow_count[phase] = 0;
     }
     // get_threshold_bin synchronizes the block
     const int threshold_bin = get_threshold_bin(phase, top_k_remaining);
@@ -263,8 +262,10 @@ __device__ __forceinline__ TopkResults fast_topk_cuda_v4(
                                  // iteration there is no dependency because no
                                  // more calls to get_threshold_bin
     }
-    int buf_len = min(num_cached, shared_num_cached_count[phase ^ 1]);
-    int g_buf_len = min(overflow_stride, s_cached_overflow_count[phase ^ 1]);
+    int raw_buf_len = shared_num_cached_count[phase ^ 1];
+    int buf_len = min(num_cached, raw_buf_len);
+    int g_buf_len = min(overflow_stride, max(0, raw_buf_len - num_cached));
+    bool exceeded_k_remaining_cnt = false;
 
     // --- Process shared cache ---
     // using cached indices, it's a local slice so don't partition between
@@ -276,26 +277,44 @@ __device__ __forceinline__ TopkResults fast_topk_cuda_v4(
 
       if (bin > threshold_bin) {
         int topk_offset = atomicAdd(shared_final_idx_count, 1);
-        if (topk_offset < TopK) {
-          s_topk_inds[topk_offset] = cached_idx;
-        } else {
-          break;
-        }
+        s_topk_inds[topk_offset] = cached_idx;
       }
-      if (bin == threshold_bin && t < NRemainingRounds) {
-        int cached_offset = atomicAdd(&shared_num_cached_count[phase], 1);
-        if (cached_offset < num_cached) {
-          s_cached_indices[cached_offset + phase * num_cached] = cached_idx;
-          s_cached_logit_bits[cached_offset + phase * num_cached] = bits;
-          atomicAdd(shared_hist + (phase ^ 1) * 256 + (bits >> (LShiftStart - (t + 1) * 8) & 0xff),
-                    1);
-        } else {
-          int g_off = atomicAdd(&s_cached_overflow_count[phase], 1);
-          if (g_off < overflow_stride) {
-            PackedCachedData data = {bits, cached_idx};
-            get_cached_overflow(phase)[g_off] = data;
+      if (bin == threshold_bin) {
+        if (t < NRemainingRounds) {
+          int cached_offset = atomicAdd(&shared_num_cached_count[phase], 1);
+          if (cached_offset < num_cached) {
+            s_cached_indices[cached_offset + phase * num_cached] = cached_idx;
+            s_cached_logit_bits[cached_offset + phase * num_cached] = bits;
             atomicAdd(
                 shared_hist + (phase ^ 1) * 256 + (bits >> (LShiftStart - (t + 1) * 8) & 0xff), 1);
+          } else {
+            int g_off = cached_offset - num_cached;
+            if (g_off < overflow_stride) {
+              PackedCachedData data = {bits, cached_idx};
+              get_cached_overflow(phase)[g_off] = data;
+              atomicAdd(
+                  shared_hist + (phase ^ 1) * 256 + (bits >> (LShiftStart - (t + 1) * 8) & 0xff),
+                  1);
+            }
+          }
+        } else {
+          // t == NRemainingRounds
+          // if top_k_remaining > 0, that means that in the final round, there's still
+          // top_k_remaining items left after considering items bigger than the threshold_bin,
+          // therefore the top_k_remaining items must be == to the threshold_bin, partitioned
+          // amongst the cluster ranks
+          if (top_k_remaining > 0 && !exceeded_k_remaining_cnt) {
+            // here just pick an arbitrary index, since it should be bit equal as we be bin ==
+            // threshold_bin in the last bin
+            int k_remaining_cnt = atomicAdd(cluster.map_shared_rank(s_k_remaining_counter, 0), 1);
+            if (k_remaining_cnt < top_k_remaining) {
+              int off = atomicAdd(shared_final_idx_count, 1);
+              s_topk_inds[off] = cached_idx;  // this should always be inbounds since the sum of
+              // shared_final_idx_count amongst the cluster ranks +
+              // top_k_remaining == TopK
+            } else {
+              exceeded_k_remaining_cnt = true;
+            }
           }
         }
       }
@@ -310,60 +329,42 @@ __device__ __forceinline__ TopkResults fast_topk_cuda_v4(
 
       if (bin > threshold_bin) {
         int topk_offset = atomicAdd(shared_final_idx_count, 1);
-        if (topk_offset < TopK) {
-          s_topk_inds[topk_offset] = cached_idx;
-        } else {
-          break;
-        }
+        s_topk_inds[topk_offset] = cached_idx;
       }
-      if (bin == threshold_bin && t < NRemainingRounds) {
-        int cached_offset = atomicAdd(&shared_num_cached_count[phase], 1);
-        if (cached_offset < num_cached) {
-          s_cached_indices[cached_offset + phase * num_cached] = cached_idx;
-          s_cached_logit_bits[cached_offset + phase * num_cached] = bits;
-          atomicAdd(shared_hist + (phase ^ 1) * 256 + (bits >> (LShiftStart - (t + 1) * 8) & 0xff),
-                    1);
-        } else {
-          int g_off = atomicAdd(&s_cached_overflow_count[phase], 1);
-          if (g_off < overflow_stride) {
-            get_cached_overflow(phase)[g_off] = {bits, cached_idx};
+      if (bin == threshold_bin) {
+        if (t < NRemainingRounds) {
+          int cached_offset = atomicAdd(&shared_num_cached_count[phase], 1);
+          if (cached_offset < num_cached) {
+            s_cached_indices[cached_offset + phase * num_cached] = cached_idx;
+            s_cached_logit_bits[cached_offset + phase * num_cached] = bits;
             atomicAdd(
                 shared_hist + (phase ^ 1) * 256 + (bits >> (LShiftStart - (t + 1) * 8) & 0xff), 1);
-          }
-        }
-      }
-    }
-
-    // it could be that at the last stage, we have say S topk indices, T indices
-    // above the threshold_bin and S + T < TopK. Then the rest of the topk items
-    // must come from threshold_bin
-    if (t == NRemainingRounds) {
-      if (top_k_remaining > 0) {
-        // Collect threshold_bin items from shared cache.
-        for (int i = threadIdx.x; i < buf_len; i += blockDim.x) {
-          int bin = s_cached_logit_bits[i] & 0xff;
-          int cached_idx = s_cached_indices[i];
-          if (bin == threshold_bin) {
-            int topk_offset = atomicAdd(shared_final_idx_count, 1);
-            if (topk_offset < TopK) {
-              s_topk_inds[topk_offset] = cached_idx;
-            } else {
-              break;
+          } else {
+            int g_off = cached_offset - num_cached;
+            if (g_off < overflow_stride) {
+              get_cached_overflow(phase)[g_off] = {bits, cached_idx};
+              atomicAdd(
+                  shared_hist + (phase ^ 1) * 256 + (bits >> (LShiftStart - (t + 1) * 8) & 0xff),
+                  1);
             }
           }
-        }
-        // Collect threshold_bin items from global overflow cache.
-        for (int i = threadIdx.x; i < g_buf_len; i += blockDim.x) {
-          auto data = get_cached_overflow(phase ^ 1)[i];
-          uint32_t bits = data.bits;
-          int cached_idx = data.index;
-          int bin = bits & 0xff;
-          if (bin == threshold_bin) {
-            int topk_offset = atomicAdd(shared_final_idx_count, 1);
-            if (topk_offset < TopK) {
-              s_topk_inds[topk_offset] = cached_idx;
+        } else {
+          // t == NRemainingRounds
+          // if top_k_remaining > 0, that means that in the final round, there's still
+          // top_k_remaining items left after considering items bigger than the threshold_bin,
+          // therefore the top_k_remaining items must be == to the threshold_bin, partitioned
+          // amongst the cluster ranks
+          if (top_k_remaining > 0 && !exceeded_k_remaining_cnt) {
+            // here just pick an arbitrary index, since it should be bit equal as we be bin ==
+            // threshold_bin in the last bin
+            int k_remaining_cnt = atomicAdd(cluster.map_shared_rank(s_k_remaining_counter, 0), 1);
+            if (k_remaining_cnt < top_k_remaining) {
+              int off = atomicAdd(shared_final_idx_count, 1);
+              s_topk_inds[off] = cached_idx;  // this should always be inbounds since the sum of
+              // shared_final_idx_count amongst the cluster ranks +
+              // top_k_remaining == TopK
             } else {
-              break;
+              exceeded_k_remaining_cnt = true;
             }
           }
         }
@@ -378,6 +379,9 @@ __device__ __forceinline__ TopkResults fast_topk_cuda_v4(
   if (NClusters > 1) {
     int topk_start = 0;
     int topk_num = *shared_final_idx_count;
+    // if (threadIdx.x == 0)
+    //   printf("cluster id %d, topk_num %d, top_k_remaining %d\n", block_id, topk_num,
+    //          top_k_remaining);
 
     cluster.sync();  // sync to get the shared_final_idx_count across CTAs in
                      // current cluster
@@ -574,7 +578,7 @@ inline void launch_topk_cluster_kernel(void* kernel, void** args, int grid_dim, 
 
 int get_shared_mem_bytes(int TopK, int num_cached) {
   return (num_cached * 2 * sizeof(float) + num_cached * 2 * sizeof(int) + TopK * sizeof(int) +
-          6 * sizeof(int) + 3 * 256 * sizeof(int) + 8 * sizeof(int));
+          5 * sizeof(int) + 3 * 256 * sizeof(int) + 8 * sizeof(int));
 }
 
 template <typename T, typename IdxT = int>
