@@ -45,6 +45,14 @@ class CustomCommunicator(CommBackend):
         else:
             raise TypeError(f"Unsupported type for allgather: {type(data)}")
 
+    def bcast(self, data, root: int = 0):
+        obj_list = [data]
+        dist.broadcast_object_list(obj_list, src=root, group=self._group)
+        return obj_list[0]
+
+    def barrier(self):
+        dist.barrier(group=self._group)
+
     def Split(self, color: int, key: int) -> "CustomCommunicator":
         return self
 

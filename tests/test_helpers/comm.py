@@ -18,7 +18,10 @@ def _get_rank_info_from_env():
         tuple: (rank, world_size, local_rank)
     """
     # Try SLURM environment variables first (set by srun)
-    if "SLURM_PROCID" in os.environ:
+    # Only use SLURM when SLURM_NTASKS > 1, meaning srun is the actual
+    # multi-process launcher. When SLURM_NTASKS == 1, srun launched a single
+    # container and another launcher (e.g. mpirun) handles multi-process.
+    if "SLURM_PROCID" in os.environ and int(os.environ.get("SLURM_NTASKS", "1")) > 1:
         rank = int(os.environ["SLURM_PROCID"])
         world_size = int(os.environ["SLURM_NTASKS"])
         local_rank = int(
@@ -82,8 +85,11 @@ def _get_master_addr():
     if "MASTER_ADDR" in os.environ:
         return os.environ["MASTER_ADDR"]
 
-    # For SLURM multi-node: get first node from nodelist
-    if "SLURM_NODELIST" in os.environ:
+    # For SLURM multi-node: get first node from nodelist.
+    # Only use SLURM_NODELIST when SLURM_NTASKS > 1 (srun is the actual launcher).
+    # When SLURM_NTASKS == 1, srun launched a single container and mpirun handles
+    # multi-process — all ranks are local, so "localhost" is correct.
+    if "SLURM_NODELIST" in os.environ and int(os.environ.get("SLURM_NTASKS", "1")) > 1:
         import subprocess
 
         try:
