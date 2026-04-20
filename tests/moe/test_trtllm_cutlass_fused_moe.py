@@ -325,15 +325,15 @@ def compute_with_experts(
 
 # Test configurations
 BATCH_SIZES = [
-    1,
+    16,
 ]
 HIDDEN_SIZES = [
-    128,
+    512,
 ]
 NUM_EXPERTS = [2]
 TOP_K_VALUES = [2]
 INTERMEDIATE_SIZES = [
-    128,
+    512,
 ]
 EP_NUM_EXPERTS = [8]
 EP_TOP_K = [2]
@@ -1692,6 +1692,13 @@ def test_moe_w4a8(
     fc1_weights = torch.cat([w3_weight, w1_weight], dim=1)
     fc2_weights = w2_weight
 
+    fc1_weights_il = fused_moe.interleave_moe_weights_for_hopper_mixed_gemm(
+        fc1_weights.contiguous().view(torch.uint8), "int4"
+    )
+    fc2_weights_il = fused_moe.interleave_moe_weights_for_hopper_mixed_gemm(
+        fc2_weights.contiguous().view(torch.uint8), "int4"
+    )
+
     def interleave_weights(w: torch.Tensor, dim: int) -> torch.Tensor:
         # Factors are chosen based on TRTLLM's quantization.py
         interleave_factor = 4 if dim % 512 == 0 else (2 if dim % 256 == 0 else 1)
@@ -1720,7 +1727,10 @@ def test_moe_w4a8(
     zero_1 = torch.empty(0, dtype=dtype, device="cuda")
     zero_2 = torch.empty(0, dtype=dtype, device="cuda")
 
-    # SM90 requires bfloat16 bit patterns
+    # SM90 GEMM reads weight scales as bfloat16 via TMA regardless of output dtype,
+    # so weight scales need the bf16 bit-pattern trick. Act scales are consumed by
+    # expandInputRows / applyPrequantScale which read them as OutputType (half or bf16),
+    # so they must stay in the native dtype.
     sm = (
         torch.cuda.get_device_capability()[0] * 10
         + torch.cuda.get_device_capability()[1]
@@ -1728,13 +1738,11 @@ def test_moe_w4a8(
     if sm >= 90:
         w3_w1_scales_out = w3_w1_scales_int.to(torch.bfloat16).view(dtype)
         w2_scales_out = w2_scales_int.to(torch.bfloat16).view(dtype)
-        fc31_act_out = fc31_act_scale.to(torch.bfloat16).view(dtype)
-        fc2_act_out = fc2_act_scale.to(torch.bfloat16).view(dtype)
     else:
         w3_w1_scales_out = w3_w1_scales_int.to(dtype)
         w2_scales_out = w2_scales_int.to(dtype)
-        fc31_act_out = fc31_act_scale
-        fc2_act_out = fc2_act_scale
+    fc31_act_out = fc31_act_scale
+    fc2_act_out = fc2_act_scale
 
     quant_scales = (
         w3_w1_scales_out,
@@ -1756,8 +1764,8 @@ def test_moe_w4a8(
             x,
             selected_experts_int32,
             routing_weights,
-            fc1_weights.view(torch.uint8),
-            fc2_weights.view(torch.uint8),
+            fc1_weights_il,
+            fc2_weights_il,
             dtype,
             quant_scales=quant_scales,
             use_w4_group_scaling=True,
@@ -1792,6 +1800,9 @@ def test_moe_w4a8(
     w31_weight_dequant = torch.stack(w31_weight_list, dim=0)  # [e, 2N, K]
     w2_weight_dequant = torch.stack(w2_weight_list, dim=0)  # [e, K, N]
 
+    fc1_input_scale_for_ref = torch.full_like(
+        input_scale.squeeze(-1), w3_w1_input_scale_max.item()
+    )
     ref_output = torch_moe_w4a8(
         num_experts,
         x,
@@ -1799,7 +1810,7 @@ def test_moe_w4a8(
         w2_weight_dequant,
         selected_experts,
         routing_weights,
-        fc1_input_scale=input_scale.squeeze(-1),
+        fc1_input_scale=fc1_input_scale_for_ref,
         fc2_input_scale=input_scale.squeeze(-1),
         fc1_pre_quant_scale=torch.max(w1_pre_quant_scale, w3_pre_quant_scale),
         fc2_pre_quant_scale=w2_pre_quant_scale,
