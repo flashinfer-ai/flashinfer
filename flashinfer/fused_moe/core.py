@@ -1728,7 +1728,6 @@ def get_trtllm_moe_sm100_module():
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
         tuner = AutoTuner.get()
-        MoERunner.refine_tuning_config(tune_max_num_tokens)
 
         num_tokens = hidden_states.shape[0]
         hidden_size = hidden_states.shape[-1]
@@ -1759,13 +1758,26 @@ def get_trtllm_moe_sm100_module():
             activation_type=activation_type,
         )
 
-        inputs = [output, routing_logits, topk_ids, expert_weights, hidden_states]
+        moe_inputs = MoEInputs(
+            output=output,
+            routing_logits=routing_logits,
+            topk_ids=topk_ids,
+            expert_weights=expert_weights,
+            hidden_states=hidden_states,
+            hidden_states_scale=None,
+        )
+        tuning_config = moe_runner._make_tuning_config(
+            moe_inputs,
+            tune_max_num_tokens=tune_max_num_tokens,
+            use_cuda_graph=True,
+            use_cold_l2_cache=True,
+        )
 
         _, tactic = tuner.choose_one(
             "flashinfer::trtllm_fp8_per_channel_scale_moe",
             [moe_runner],
-            MoERunner.tuning_config_no_hidden_states_scales,
-            inputs,
+            tuning_config,
+            moe_inputs.to_list(),
             routing_bias=routing_bias,
             gemm1_weights=gemm1_weights,
             gemm1_per_channel_weight_scale=gemm1_per_channel_weight_scale,
