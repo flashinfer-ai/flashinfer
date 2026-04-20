@@ -21,9 +21,8 @@ import triton
 import triton.language as tl
 
 import flashinfer
-from flashinfer import SfLayout
 from flashinfer.cute_dsl.utils import get_cutlass_dtype
-from flashinfer.fp4_quantization import nvfp4_quantize
+from flashinfer.fp4_quantization import fp4_quantize
 from flashinfer.gemm import create_scale_factor_tensor, grouped_gemm_nt_masked
 from flashinfer.testing.utils import bench_gpu_time
 
@@ -100,6 +99,10 @@ def bench_with_delay_kernel(fn, warmup=10, repeat=50):
 # ---------------------------------------------------------------------------
 
 
+def div_up(x, d):
+    return (x + d - 1) // d
+
+
 def compute_tflops(total_m, n, k, ms):
     return 2.0 * total_m * n * k * 1e-9 / ms
 
@@ -110,10 +113,24 @@ def generate_expert_token_counts(num_experts, expected_tpe, max_m=MAX_M):
     Returns a list of ints, one per expert. Shared by both cuDNN and CuTe-DSL
     paths so both sides benchmark the same workload distribution.
     """
-    return [
-        min(max(1, int(expected_tpe * random.uniform(0.7, 1.3))), max_m)
-        for _ in range(num_experts)
-    ]
+    # return [
+    #     min(max(1, int(expected_tpe * random.uniform(0.7, 1.3))), max_m)
+    #     for _ in range(num_experts)
+    # ]
+
+    offsets = [0]
+    for i in range(num_experts - 1):
+        offset_end = (i + 1) * expected_tpe + int(
+            expected_tpe * random.uniform(-0.3, 0.3)
+        )
+        if offset_end < offsets[-1]:
+            offset_end = offsets[-1]
+        if (offset_end - offsets[-1]) > max_m:
+            offset_end = offsets[-1] + max_m
+        offsets.append(offset_end)
+    offsets.append(num_experts * expected_tpe)
+    diffs = [offsets[i + 1] - offsets[i] for i in range(len(offsets) - 1)]
+    return diffs
 
 
 def _seg_lens_to_indptr(seg_lens):
@@ -230,52 +247,68 @@ def bench_cudnn_nvfp4(num_experts, seg_lens, n, k, method):
     b_bf16 = torch.randn(num_experts, n, k, dtype=torch.bfloat16, device="cuda")
 
     a_gsf = (448 * 6) / a_bf16.float().abs().nan_to_num().max()
-    a_fp4, a_sf = nvfp4_quantize(
-        a_bf16,
-        a_gsf,
-        sfLayout=SfLayout.layout_128x4,
-        do_shuffle=False,
+    a_fp4, _ = fp4_quantize(a_bf16, a_gsf)
+
+    padded_seg_lens = [div_up(m, 128) * 128 for m in seg_lens]
+    a_bf16_padded = torch.zeros(
+        (sum(padded_seg_lens), k), dtype=torch.bfloat16, device="cuda"
     )
+    src_idx = 0
+    dst_idx = 0
+    for i in range(len(seg_lens)):
+        a_bf16_padded[dst_idx : dst_idx + seg_lens[i]] = a_bf16[
+            src_idx : src_idx + seg_lens[i]
+        ]
+        src_idx += seg_lens[i]
+        dst_idx += padded_seg_lens[i]
+    _, a_sf = fp4_quantize(a_bf16_padded, a_gsf)
     a_sf = a_sf.view(torch.float8_e4m3fn).reshape(-1, k // 16)
 
     b_2d = b_bf16.reshape(num_experts * n, k)
     b_gsf = (448 * 6) / b_2d.float().abs().nan_to_num().max()
-    b_fp4, b_sf = nvfp4_quantize(
-        b_2d,
-        b_gsf,
-        sfLayout=SfLayout.layout_128x4,
-        do_shuffle=False,
-    )
+    b_fp4, b_sf = fp4_quantize(b_2d, b_gsf)
     b_fp4 = b_fp4.reshape(num_experts, n, k // 2)
     b_sf = b_sf.view(torch.float8_e4m3fn).reshape(num_experts, -1, k // 16)
 
     alpha = torch.tensor([1.0 / (a_gsf * b_gsf)], dtype=torch.float32, device="cuda")
     out = torch.empty(cum_m, n, dtype=torch.bfloat16, device="cuda")
 
-    flashinfer.grouped_mm.grouped_mm_fp4(
+    num_plans = flashinfer.grouped_mm.grouped_mm_fp4_plan_count(
         a_fp4,
         b_fp4,
         a_sf,
         b_sf,
         m_indptr,
         alpha=alpha,
-        out=out,
         block_size=16,
     )
 
-    return _bench(
-        lambda: flashinfer.grouped_mm.grouped_mm_fp4(
-            a_fp4,
-            b_fp4,
-            a_sf,
-            b_sf,
-            m_indptr,
-            alpha=alpha,
-            out=out,
-            block_size=16,
-        ),
-        method,
-    )
+    best_ms = float("inf")
+    for tactic in range(num_plans):
+
+        def fn(t=tactic):
+            flashinfer.grouped_mm.grouped_mm_fp4(
+                a_fp4,
+                b_fp4,
+                a_sf,
+                b_sf,
+                m_indptr,
+                alpha=alpha,
+                out=out,
+                block_size=16,
+                tactic=t,
+            )
+
+        try:
+            ms = _bench(fn, method)
+            if ms < best_ms:
+                best_ms = ms
+        except Exception as e:
+            print(f"    tactic {tactic} failed: {e}")
+            continue
+    if best_ms == float("inf"):
+        raise RuntimeError(f"All {num_plans} cuDNN plans failed")
+    return best_ms
 
 
 TILING_CONFIGS = [
@@ -355,14 +388,31 @@ def bench_cudnn_fp8(num_experts, seg_lens, n, k, method):
     )
     out = torch.empty(cum_m, n, dtype=torch.bfloat16, device="cuda")
 
-    flashinfer.grouped_mm.grouped_mm_fp8(a, b, m_indptr, alpha=None, out=out)
+    num_plans = flashinfer.grouped_mm.grouped_mm_fp8_plan_count(a, b, m_indptr)
 
-    return _bench(
-        lambda: flashinfer.grouped_mm.grouped_mm_fp8(
-            a, b, m_indptr, alpha=None, out=out
-        ),
-        method,
-    )
+    best_ms = float("inf")
+    for tactic in range(num_plans):
+
+        def fn(t=tactic):
+            flashinfer.grouped_mm.grouped_mm_fp8(
+                a,
+                b,
+                m_indptr,
+                alpha=None,
+                out=out,
+                tactic=t,
+            )
+
+        try:
+            ms = _bench(fn, method)
+            if ms < best_ms:
+                best_ms = ms
+        except Exception as e:
+            print(f"    tactic {tactic} failed: {e}")
+            continue
+    if best_ms == float("inf"):
+        raise RuntimeError(f"All {num_plans} cuDNN plans failed")
+    return best_ms
 
 
 def bench_masked_fp8(num_groups, seg_lens, n, k, method):
