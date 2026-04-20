@@ -422,6 +422,9 @@ class FusedMoeLauncher {
   Tensor workspace_fc2;
   Tensor output;
   int64_t moe_tactic{-1};
+  // Set by per-channel launcher to request a kernel variant that consumes per-channel
+  // (per-output-row) weight scale factors. Maps to mUsePerTokenSfA=true in the kernel options.
+  bool use_per_channel_weight_scale{false};
   std::unique_ptr<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner> moe_runner;
 
   void prepare_moe_common(int64_t& moe_tactic) {
@@ -436,7 +439,8 @@ class FusedMoeLauncher {
     } else {
       moe_runner = std::make_unique<RunnerType>(
           this->mDtypeAct, this->mDtypeWeights, args->mUseDeepSeekFp8, (int32_t)tile_tokens_dim,
-          this->activation_type, this->use_shuffled_weight, this->weight_layout);
+          this->activation_type, this->use_shuffled_weight, this->weight_layout,
+          this->use_per_channel_weight_scale);
     }
 
     if (moe_tactic == -1) {
@@ -916,6 +920,7 @@ class Fp8PerChannelLauncher : public FusedMoeLauncher {
             int64_t weight_layout, bool use_routing_scales_on_input_param,
             ActivationType activation_type) {
     this->use_routing_scales_on_input = use_routing_scales_on_input_param;
+    this->use_per_channel_weight_scale = true;
 
     auto dtype = hidden_states.dtype();
     if (dtype == dl_float16) {
@@ -1085,7 +1090,8 @@ class Fp8PerChannelLauncher : public FusedMoeLauncher {
           dtype_act, dtype_weights,
           false,  // useDeepSeekFp8
           tile_N, static_cast<ActivationType>(act_type), use_shuffled_weight,
-          static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout));
+          static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout),
+          /*usePerChannelWeightScale=*/true);
 
       auto cfgs = moe_runner->getValidConfigIndices(top_k, hidden_size, intermediate_size,
                                                     num_local_experts, num_tokens);

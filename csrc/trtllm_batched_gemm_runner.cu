@@ -102,7 +102,9 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
         (!doesRouteImplUseNoRoute(options.mRouteImpl)) == mOptions.routeAct &&
         options.mFusedAct == mOptions.fusedAct && options.mIsStaticBatch == mOptions.staticBatch &&
         tileSize == mOptions.tileSize && options.mUseShuffledMatrix == mOptions.useShuffledMatrix &&
-        options.mLayoutA == mOptions.weightLayout) {
+        options.mLayoutA == mOptions.weightLayout &&
+        options.mUsePerTokenSfA == mOptions.usePerTokenSfA &&
+        options.mUsePerTokenSfB == mOptions.usePerTokenSfB) {
       if (options.mFusedAct) {
         if (options.mActType != static_cast<batchedGemm::gemmGatedAct::ActType>(mOptions.actType)) {
           continue;
@@ -128,7 +130,9 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
             << ", mEltwiseActType: " << (int64_t)mOptions.eltwiseActType
             << ", mTransposeMmaOutput: " << mOptions.transposeMmaOutput
             << ", mRouteAct: " << mOptions.routeAct << ", mFusedAct: " << mOptions.fusedAct
-            << ", mIsStaticBatch: " << mOptions.staticBatch << ", mTileSize: " << mOptions.tileSize;
+            << ", mIsStaticBatch: " << mOptions.staticBatch << ", mTileSize: " << mOptions.tileSize
+            << ", mUsePerTokenSfA: " << mOptions.usePerTokenSfA
+            << ", mUsePerTokenSfB: " << mOptions.usePerTokenSfB;
   FLASHINFER_CHECK(!mPassingConfigIndices.empty(), error_msg.str());
 }
 
