@@ -20,6 +20,7 @@
 #include <curand.h>
 #include <curand_kernel.h>
 #include <curand_philox4x32_x.h>
+#include <cooperative_groups.h>
 
 #include <cub/cub.cuh>
 #include <cuda/functional>
@@ -50,6 +51,50 @@ namespace sampling {
 
 using namespace cub;
 
+// Helper function to print kernel resource usage for debugging
+template <typename KernelFunc>
+void PrintKernelResourceUsage(KernelFunc kernel, uint32_t block_threads, uint32_t smem_size,
+                               int cluster_size, const char* kernel_name) {
+  cudaFuncAttributes attr;
+  cudaError_t err = cudaFuncGetAttributes(&attr, kernel);
+  if (err != cudaSuccess) {
+    printf("[%s] Failed to get kernel attributes: %s\n", kernel_name, cudaGetErrorString(err));
+    return;
+  }
+
+  int numBlocksPerSM = 0;
+  err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSM, kernel, block_threads, smem_size);
+  if (err != cudaSuccess) {
+    printf("[%s] Failed to query occupancy: %s\n", kernel_name, cudaGetErrorString(err));
+  }
+
+  printf("=== Kernel Resource Usage: %s ===\n", kernel_name);
+  printf("  Registers per thread:     %d\n", attr.numRegs);
+  printf("  Static shared memory:     %zu bytes\n", attr.sharedSizeBytes);
+  printf("  Dynamic shared memory:    %u bytes\n", smem_size);
+  printf("  Total shared memory:      %zu bytes\n", attr.sharedSizeBytes + smem_size);
+  printf("  Max threads per block:    %d\n", attr.maxThreadsPerBlock);
+  printf("  Requested threads/block:  %u\n", block_threads);
+  printf("  Cluster size:             %d\n", cluster_size);
+  printf("  Max blocks per SM:        %d\n", numBlocksPerSM);
+  printf("  Blocks needed per SM for cluster: %d\n", cluster_size);
+
+  // Check if launch is feasible
+  if (numBlocksPerSM < cluster_size) {
+    printf("  [ERROR] Cannot launch: need %d blocks per SM for cluster, but only %d available!\n",
+           cluster_size, numBlocksPerSM);
+    printf("  Possible causes:\n");
+    printf("    - Registers: %d threads * %d regs = %d total (SM has 65536)\n",
+           block_threads, attr.numRegs, block_threads * attr.numRegs);
+    printf("    - Shared mem: %zu bytes per block, %d blocks need %zu bytes (SM has ~228KB)\n",
+           attr.sharedSizeBytes + smem_size, cluster_size,
+           (attr.sharedSizeBytes + smem_size) * cluster_size);
+  } else {
+    printf("  [OK] Launch should succeed\n");
+  }
+  printf("==========================================\n");
+}
+
 #define DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, ...) \
   if (deterministic) {                                            \
     constexpr bool DETERMINISTIC = true;                          \
@@ -79,6 +124,7 @@ using namespace cub;
 
 constexpr BlockScanAlgorithm SCAN_ALGO = BLOCK_SCAN_WARP_SCANS;
 constexpr BlockReduceAlgorithm REDUCE_ALGO = BLOCK_REDUCE_WARP_REDUCTIONS;
+constexpr double PIVOT_CONVERGENCE_THRESHOLD = 1e-7;
 
 #if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120100)
 #define FLASHINFER_CUB_SUBTRACTLEFT_DEFINED
@@ -1129,6 +1175,407 @@ __global__ void MinPSamplingFromProbKernel(DType* probs, float* min_p_arr, IdTyp
   output[bx] = sampled_id;
 }
 
+// Helper struct for dynamic shared memory layout in GetTopKTopPFilteredProb
+template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
+          BlockReduceAlgorithm REDUCE_ALGORITHM, int PIVOTS_PER_BLOCK>
+struct GetTopKTopPFilteredProbSmemLayout {
+  SamplingTempStorage<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM> temp_storage;
+  double smem_low;
+  double smem_high;
+  float smem_gt_low_count;
+  float smem_gt_high_count;
+  // Use max(2, PIVOTS_PER_BLOCK) to ensure fused kernel Phase 1 has enough slots
+  // Phase 1 always needs 2 slots for partial_0 and partial_1
+  ValueCount<float> smem_pivot_aggregates[PIVOTS_PER_BLOCK > 2 ? PIVOTS_PER_BLOCK : 2];
+};
+
+template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
+          BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
+          typename DType, typename IdType, int cluster_size=1, int PIVOTS_PER_BLOCK=4>
+__device__ void GetTopKTopPFilteredProbDeviceWithSmem(
+    DType* probs, DType* filtered_probs, IdType* top_k_arr, float* top_p_arr,
+    IdType* indices, IdType top_k_val, float top_p_val, uint32_t d,
+    uint64_t philox_seed, uint64_t philox_offset,
+    GetTopKTopPFilteredProbSmemLayout<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM, PIVOTS_PER_BLOCK>& smem,
+    double low = 0, double high = 1);
+
+template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
+          BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
+          typename DType, typename IdType, int cluster_size=1, int PIVOTS_PER_BLOCK=4>
+__device__ void GetTopKTopPFilteredProbDevice(DType* probs, DType* filtered_probs, IdType* top_k_arr, float* top_p_arr,
+                                               IdType* indices, IdType top_k_val,
+                                               float top_p_val, uint32_t d, uint64_t philox_seed,
+                                               uint64_t philox_offset,
+                                               double low = 0, double high = 1) {
+  // Dynamic shared memory
+  extern __shared__ __align__(alignof(GetTopKTopPFilteredProbSmemLayout<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM, PIVOTS_PER_BLOCK>))
+      uint8_t smem_raw[];
+  auto& smem = *reinterpret_cast<GetTopKTopPFilteredProbSmemLayout<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM, PIVOTS_PER_BLOCK>*>(smem_raw);
+
+  GetTopKTopPFilteredProbDeviceWithSmem<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
+                                         VEC_SIZE, DETERMINISTIC, DType, IdType,
+                                         cluster_size, PIVOTS_PER_BLOCK>(
+      probs, filtered_probs, top_k_arr, top_p_arr, indices, top_k_val, top_p_val,
+      d, philox_seed, philox_offset, smem, low, high);
+}
+
+// Implementation with external shared memory
+template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
+          BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
+          typename DType, typename IdType, int cluster_size, int PIVOTS_PER_BLOCK>
+__device__ void GetTopKTopPFilteredProbDeviceWithSmem(
+    DType* probs, DType* filtered_probs, IdType* top_k_arr, float* top_p_arr,
+    IdType* indices, IdType top_k_val, float top_p_val, uint32_t d,
+    uint64_t philox_seed, uint64_t philox_offset,
+    GetTopKTopPFilteredProbSmemLayout<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM, PIVOTS_PER_BLOCK>& smem,
+    double low, double high) {
+  namespace cg = cooperative_groups;
+  auto cluster = cg::this_cluster();
+  unsigned int clusterBlockRank = cluster.block_rank();
+
+  const uint32_t batch_size = gridDim.x / cluster_size;
+  const uint32_t bx = blockIdx.x / cluster_size, tx = threadIdx.x;
+  const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
+  const uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[row_idx];
+  const float p = top_p_arr == nullptr ? top_p_val : top_p_arr[row_idx];
+
+  // Aliases for cleaner code
+  auto& temp_storage = smem.temp_storage;
+  auto& smem_low = smem.smem_low;
+  auto& smem_high = smem.smem_high;
+  auto& smem_gt_low_count = smem.smem_gt_low_count;
+  auto& smem_gt_high_count = smem.smem_gt_high_count;
+  auto& smem_pivot_aggregates = smem.smem_pivot_aggregates;
+
+// #define FLASHINFER_ENABLE_TIMING
+
+#ifdef FLASHINFER_ENABLE_TIMING
+  // Timing variables for profiling
+  __shared__ long long timing_load;
+  __shared__ long long timing_compute;
+  __shared__ long long timing_reduce;
+  __shared__ long long timing_dsm;
+  __shared__ long long timing_filter;
+  // Timing for thread 256
+  __shared__ long long timing_load_t256;
+  __shared__ long long timing_compute_t256;
+  __shared__ long long timing_reduce_t256;
+  __shared__ long long timing_dsm_t256;
+  __shared__ long long timing_filter_t256;
+  if (tx == 0) {
+    timing_load = 0;
+    timing_compute = 0;
+    timing_reduce = 0;
+    timing_dsm = 0;
+    timing_filter = 0;
+    timing_load_t256 = 0;
+    timing_compute_t256 = 0;
+    timing_reduce_t256 = 0;
+    timing_dsm_t256 = 0;
+    timing_filter_t256 = 0;
+  }
+  __syncthreads();
+#endif
+
+  vec_t<float, VEC_SIZE> probs_vec;
+  double pivot;
+  int n_iter = 0;
+  int gt_low_count = d, gt_high_count = 0;
+
+  // Optimized path for cluster_size > 1: each block reads 1/cluster_size
+  // of vocab and computes PIVOTS_PER_BLOCK pivots, then aggregates via DSM
+  if constexpr (cluster_size > 1) {
+    // Calculate this block's chunk of the vocab
+    // Ensure chunk_size is aligned to VEC_SIZE so that my_start is always VEC_SIZE-aligned
+    const uint32_t raw_chunk_size = ceil_div(d, (uint32_t)cluster_size);
+    const uint32_t chunk_size = ((raw_chunk_size + VEC_SIZE - 1) / VEC_SIZE) * VEC_SIZE;
+    const uint32_t my_start = clusterBlockRank * chunk_size;
+    const uint32_t my_end = min(my_start + chunk_size, d);
+    const uint32_t my_chunk_elems = (my_start < d) ? (my_end - my_start) : 0;
+
+    do {
+      if (gt_low_count - gt_high_count <= 1 || (high - low) < PIVOT_CONVERGENCE_THRESHOLD) {
+        break;
+      }
+
+      // Compute PIVOTS_PER_BLOCK pivot values
+      double step = (high - low) / (PIVOTS_PER_BLOCK + 1);
+      double pivots[PIVOTS_PER_BLOCK];
+      #pragma unroll
+      for (int pv = 0; pv < PIVOTS_PER_BLOCK; ++pv) {
+        pivots[pv] = low + (pv + 1) * step;
+      }
+
+      // Each thread maintains private accumulators for all pivots
+      ValueCount<float> thread_sums[PIVOTS_PER_BLOCK];
+      #pragma unroll
+      for (int pv = 0; pv < PIVOTS_PER_BLOCK; ++pv) {
+        thread_sums[pv] = {0, 0};
+      }
+
+#ifdef FLASHINFER_ENABLE_TIMING
+      __syncthreads();
+      long long _t0 = clock64();
+#endif
+
+      // Phase 1: Load and accumulate to registers (no reduce, no sync)
+      #pragma unroll 2
+      for (uint32_t i = 0; i < ceil_div(my_chunk_elems, BLOCK_THREADS * VEC_SIZE); ++i) {
+        const uint32_t local_offset = (i * BLOCK_THREADS + tx) * VEC_SIZE;
+        const uint32_t global_idx = my_start + local_offset;
+
+        probs_vec.fill(0);
+        if (global_idx < my_end && local_offset < my_chunk_elems) {
+          probs_vec.cast_load(probs + row_idx * d + global_idx);
+        }
+
+        // Accumulate to thread-local registers for all pivots
+        #pragma unroll
+        for (int pv = 0; pv < PIVOTS_PER_BLOCK; ++pv) {
+          #pragma unroll
+          for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+            bool valid = (global_idx + j < my_end) && (local_offset + j < my_chunk_elems);
+            if (probs_vec[j] > pivots[pv] && valid) {
+              thread_sums[pv].value += probs_vec[j];
+              thread_sums[pv].count += 1;
+            }
+          }
+        }
+        // No BlockReduce here, no __syncthreads!
+      }
+
+      // Phase 2: Single reduce at the end for all pivots
+      ValueCount<float> partial_aggregates[PIVOTS_PER_BLOCK];
+      #pragma unroll
+      for (int pv = 0; pv < PIVOTS_PER_BLOCK; ++pv) {
+        partial_aggregates[pv] =
+            BlockReduce<ValueCount<float>, BLOCK_THREADS>(temp_storage.block_prim.reduce_value_count)
+                .Sum(thread_sums[pv]);
+        __syncthreads();
+      }
+
+#ifdef FLASHINFER_ENABLE_TIMING
+      long long _t1 = clock64();
+      if (tx == 0) {
+        timing_load += (_t1 - _t0);
+        timing_compute += (_t1 - _t0);  // Load and compute are interleaved
+      }
+      long long _t_dsm_start = clock64();
+#endif
+
+      // Store partial aggregates to shared memory for DSM access
+      if (tx == 0) {
+        #pragma unroll
+        for (int pv = 0; pv < PIVOTS_PER_BLOCK; ++pv) {
+          smem_pivot_aggregates[pv] = partial_aggregates[pv];
+        }
+      }
+      __syncthreads();
+
+      // DSM aggregation: block 0 collects all partial results from all blocks
+      cluster.sync();
+
+      if (clusterBlockRank == 0) {
+        // Aggregate results from all blocks for each pivot
+        ValueCount<float> full_aggregates[PIVOTS_PER_BLOCK];
+        #pragma unroll
+        for (int pv = 0; pv < PIVOTS_PER_BLOCK; ++pv) {
+          full_aggregates[pv] = {0, 0};
+        }
+
+        for (int blk = 0; blk < cluster_size; ++blk) {
+          ValueCount<float>* remote_aggregates =
+              cluster.map_shared_rank(smem_pivot_aggregates, blk);
+          #pragma unroll
+          for (int pv = 0; pv < PIVOTS_PER_BLOCK; ++pv) {
+            full_aggregates[pv] += remote_aggregates[pv];
+          }
+        }
+
+        // Binary search: find the pivot that satisfies top-k/top-p constraint
+        double old_low = low;
+        #pragma unroll
+        for (int pv = 0; pv < PIVOTS_PER_BLOCK; ++pv) {
+          pivot = old_low + (pv + 1) * step;
+          if (full_aggregates[pv].count < k && full_aggregates[pv].value < p) {
+            high = pivot;
+            gt_high_count = full_aggregates[pv].count;
+            break;
+          } else {
+            low = pivot;
+            gt_low_count = full_aggregates[pv].count;
+          }
+        }
+
+        if (tx == 0) {
+          smem_low = low;
+          smem_high = high;
+          smem_gt_low_count = gt_low_count;
+          smem_gt_high_count = gt_high_count;
+        }
+        __syncthreads();
+      }
+
+      // Broadcast updated [low, high] to all blocks
+      cluster.sync();
+      if (clusterBlockRank != 0) {
+        low = *cluster.map_shared_rank(&smem_low, 0);
+        high = *cluster.map_shared_rank(&smem_high, 0);
+        gt_low_count = *cluster.map_shared_rank(&smem_gt_low_count, 0);
+        gt_high_count = *cluster.map_shared_rank(&smem_gt_high_count, 0);
+      }
+
+#ifdef FLASHINFER_ENABLE_TIMING
+      if (tx == 0) {
+        timing_dsm += (clock64() - _t_dsm_start);
+      }
+#endif
+      ++n_iter;
+    } while (low < high);
+
+  } else {
+    // Original path for cluster_size == 1: single block reads full vocab
+    // Optimized: accumulate to registers first, then reduce once at the end
+    do {
+      if (gt_low_count-gt_high_count <= 1 || (high-low) < 1e-7) {
+        break;
+      }
+      double step = (high-low) / (cluster_size+1);
+      pivot = low + (clusterBlockRank+1) * step;
+
+      // Thread-local accumulator
+      ValueCount<float> thread_sum{0, 0};
+
+#ifdef FLASHINFER_ENABLE_TIMING
+      __syncthreads();
+      long long _t0 = clock64();
+#endif
+
+      // Phase 1: Load and accumulate to registers (no reduce, no sync)
+#pragma unroll 2
+      for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
+        probs_vec.fill(0);
+        if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
+          probs_vec.cast_load(probs + row_idx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+        }
+
+        // Accumulate to thread-local register
+#pragma unroll
+        for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+          bool valid = (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d;
+          if (probs_vec[j] > pivot && valid) {
+            thread_sum.value += probs_vec[j];
+            thread_sum.count += 1;
+          }
+        }
+        // No BlockReduce here, no __syncthreads!
+      }
+
+#ifdef FLASHINFER_ENABLE_TIMING
+      __syncthreads();
+      long long _t1 = clock64();
+      if (tx == 0) {
+        timing_load += (_t1 - _t0);
+        timing_compute += (_t1 - _t0);
+      }
+      if (tx == 256) {
+        timing_load_t256 += (_t1 - _t0);
+        timing_compute_t256 += (_t1 - _t0);
+      }
+      long long _t2 = clock64();
+#endif
+
+      // Phase 2: Single reduce at the end
+      ValueCount<float> aggregate_gt_pivot =
+          BlockReduce<ValueCount<float>, BLOCK_THREADS>(temp_storage.block_prim.reduce_value_count)
+              .Sum(thread_sum);
+      if (tx == 0) {
+        temp_storage.block_aggregate.pair = aggregate_gt_pivot;
+      }
+      __syncthreads();
+      aggregate_gt_pivot = temp_storage.block_aggregate.pair;
+
+#ifdef FLASHINFER_ENABLE_TIMING
+      long long _t3 = clock64();
+      if (tx == 0) {
+        timing_reduce += (_t3 - _t2);
+      }
+      if (tx == 256) {
+        timing_reduce_t256 += (_t3 - _t2);
+      }
+#endif
+
+      if (aggregate_gt_pivot.count < k && aggregate_gt_pivot.value < p) {
+        high = pivot;
+        gt_high_count = aggregate_gt_pivot.count;
+      } else {
+        low = pivot;
+        gt_low_count = aggregate_gt_pivot.count;
+      }
+
+      ++n_iter;
+    } while (low < high);
+  }
+
+  if (clusterBlockRank != 0) return;
+  __syncthreads();
+
+#ifdef FLASHINFER_ENABLE_TIMING
+  long long _t_filter_start = clock64();
+#endif
+
+  // return filtered p
+  auto pred = [&](float x) { return x >= high; };
+#pragma unroll 2
+  for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
+    probs_vec.fill(0);
+    if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
+      probs_vec.cast_load(probs + row_idx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+    }
+#pragma unroll
+    for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+      probs_vec[j] = pred(probs_vec[j]) ? probs_vec[j] : 0;
+    }
+    if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
+      probs_vec.cast_store(filtered_probs + row_idx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+    }
+  }
+
+#ifdef FLASHINFER_ENABLE_TIMING
+  __syncthreads();
+  if (tx == 0) {
+    timing_filter = clock64() - _t_filter_start;
+  }
+  if (tx == 256) {
+    timing_filter_t256 = clock64() - _t_filter_start;
+  }
+  __syncthreads();
+
+  // Print timing results (only block 0, thread 0)
+  if (blockIdx.x == 0 && tx == 0) {
+    long long total = timing_load + timing_compute + timing_reduce + timing_dsm + timing_filter;
+    long long total_t256 = timing_load_t256 + timing_compute_t256 + timing_reduce_t256 + timing_dsm_t256 + timing_filter_t256;
+    if (total > 0) {
+      printf("[FlashInfer Timing] Block 0, n_iter=%d, vocab_size=%u, cluster_size=%d\n", n_iter, d, cluster_size);
+      printf("Thread 0:\n");
+      printf("  Load:    %12lld cycles (%5.1f%%)\n", timing_load, 100.0 * timing_load / total);
+      printf("  Compute: %12lld cycles (%5.1f%%)\n", timing_compute, 100.0 * timing_compute / total);
+      printf("  Reduce:  %12lld cycles (%5.1f%%)\n", timing_reduce, 100.0 * timing_reduce / total);
+      printf("  DSM:     %12lld cycles (%5.1f%%)\n", timing_dsm, 100.0 * timing_dsm / total);
+      printf("  Filter:  %12lld cycles (%5.1f%%)\n", timing_filter, 100.0 * timing_filter / total);
+      printf("  Total:   %12lld cycles\n", total);
+      printf("Thread 256:\n");
+      printf("  Load:    %12lld cycles (%5.1f%%)\n", timing_load_t256, 100.0 * timing_load_t256 / total_t256);
+      printf("  Compute: %12lld cycles (%5.1f%%)\n", timing_compute_t256, 100.0 * timing_compute_t256 / total_t256);
+      printf("  Reduce:  %12lld cycles (%5.1f%%)\n", timing_reduce_t256, 100.0 * timing_reduce_t256 / total_t256);
+      printf("  DSM:     %12lld cycles (%5.1f%%)\n", timing_dsm_t256, 100.0 * timing_dsm_t256 / total_t256);
+      printf("  Filter:  %12lld cycles (%5.1f%%)\n", timing_filter_t256, 100.0 * timing_filter_t256 / total_t256);
+      printf("  Total:   %12lld cycles\n", total_t256);
+    }
+  }
+#endif
+}
+
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
@@ -1156,6 +1603,7 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
   float q = 1;
   double low = 0, high = 1.f;
   int sampled_id;
+  int n_iter = 0;
   do {
     temp_storage.sampled_id = d;
     __syncthreads();
@@ -1223,6 +1671,10 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
       __syncthreads();
       aggregate_gt_pivot_1 = temp_storage.block_aggregate.pair;
     }
+    ++n_iter;
+    // if(tx == 0){
+    //   printf("n_iter=%d, \n", n_iter);
+    // }
     if (aggregate_gt_pivot_0.count < k && aggregate_gt_pivot_0.value < p) {
       // case 1: pivot_0 accepted
       break;
@@ -1242,6 +1694,305 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
   if (tx == 0) {
     output[bx] = sampled_id;
   }
+}
+
+// Fused TopK-TopP Sampling + Filter Kernel
+// Calls GetTopKTopPFilteredProbDevice at the end of sampling
+// Supports Cluster (DSM) optimization and loop-external reduce
+
+// Reuse GetTopKTopPFilteredProbSmemLayout for both phases
+// Sampling phase uses: smem_low, smem_high, smem_pivot_aggregates[0..1]
+// Filter phase uses: all fields
+
+template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
+          BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
+          typename DType, typename IdType, int cluster_size = 1, int PIVOTS_PER_BLOCK = 4>
+__global__ void TopKTopPSamplingAndFilterKernel(
+    DType* probs, DType* filtered_probs, IdType* top_k_arr, float* top_p_arr,
+    IdType* output, IdType* indices, IdType top_k_val, float top_p_val,
+    uint32_t d, uint64_t philox_seed, uint64_t philox_offset) {
+
+  namespace cg = cooperative_groups;
+  auto cluster = cg::this_cluster();
+  unsigned int clusterBlockRank = cluster.block_rank();
+
+  const uint32_t batch_size = gridDim.x / cluster_size;
+  const uint32_t bx = blockIdx.x / cluster_size, tx = threadIdx.x;
+  const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
+  const uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[row_idx];
+  const float p = top_p_arr == nullptr ? top_p_val : top_p_arr[row_idx];
+
+  // Dynamic shared memory - reuse GetTopKTopPFilteredProbSmemLayout
+  extern __shared__ __align__(
+      alignof(GetTopKTopPFilteredProbSmemLayout<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM, PIVOTS_PER_BLOCK>))
+      uint8_t smem_raw[];
+  auto& smem = *reinterpret_cast<
+      GetTopKTopPFilteredProbSmemLayout<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM, PIVOTS_PER_BLOCK>*>(smem_raw);
+  auto& temp_storage = smem.temp_storage;
+
+  // Random state (only block 0 uses it)
+  curandStatePhilox4_32_10_t state;
+  if (clusterBlockRank == 0) {
+    curand_init(philox_seed, bx, philox_offset, &state);
+  }
+
+  // Calculate this block's chunk of the vocab for cluster mode
+  // Ensure chunk_size is aligned to VEC_SIZE so that my_start is always VEC_SIZE-aligned
+  const uint32_t raw_chunk_size = ceil_div(d, (uint32_t)cluster_size);
+  const uint32_t chunk_size = ((raw_chunk_size + VEC_SIZE - 1) / VEC_SIZE) * VEC_SIZE;
+  const uint32_t my_start = clusterBlockRank * chunk_size;
+  const uint32_t my_end = min(my_start + chunk_size, d);
+  const uint32_t my_chunk_elems = (my_start < d) ? (my_end - my_start) : 0;
+
+  vec_t<float, VEC_SIZE> probs_vec;
+  float aggregate;
+  float q = 1;
+  double low = 0, high = 1.0;
+  int sampled_id = d;
+  int n_iter = 0;
+
+  // Phase 1: Sampling with Cluster + Loop-external Reduce optimization
+  do {
+    // Step 1: Only block 0 performs sampling
+    if (clusterBlockRank == 0) {
+      temp_storage.sampled_id = d;
+      __syncthreads();
+      float u = curand_uniform(&state) * q;
+      aggregate = 0;
+
+#pragma unroll 2
+      for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
+        probs_vec.fill(0);
+        if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
+          probs_vec.cast_load(probs + row_idx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+        }
+
+        DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
+                               DETERMINISTIC>(
+            i, d, [&](float x) { return x > low; }, u, probs_vec, aggregate, &temp_storage);
+        if (aggregate > u) {
+          break;
+        }
+      }
+      __syncthreads();
+      sampled_id = temp_storage.sampled_id;
+      if (sampled_id == d) {
+        sampled_id = temp_storage.last_valid_id;
+      }
+
+      // Compute pivots
+      double pivot_0 = probs[row_idx * d + sampled_id];
+      double pivot_1 = (pivot_0 + high) / 2;
+
+      // Store to shared memory for cluster broadcast (reuse smem_low/smem_high)
+      if (tx == 0) {
+        smem.smem_low = pivot_0;
+        smem.smem_high = pivot_1;
+      }
+    }
+
+    // Sync across cluster to broadcast pivots
+    cluster.sync();
+
+    // All blocks read pivots from block 0
+    double pivot_0, pivot_1;
+    if (clusterBlockRank == 0) {
+      pivot_0 = smem.smem_low;
+      pivot_1 = smem.smem_high;
+    } else {
+      pivot_0 = *cluster.map_shared_rank(&smem.smem_low, 0);
+      pivot_1 = *cluster.map_shared_rank(&smem.smem_high, 0);
+    }
+
+    // Step 2: All blocks cooperatively compute statistics (DSM + loop-external reduce)
+    // Each block processes its chunk of vocab
+    ValueCount<float> thread_sum_0{0, 0}, thread_sum_1{0, 0};
+
+    if constexpr (cluster_size > 1) {
+      // Cluster mode: each block processes 1/cluster_size of vocab
+#pragma unroll 2
+      for (uint32_t i = 0; i < ceil_div(my_chunk_elems, BLOCK_THREADS * VEC_SIZE); ++i) {
+        const uint32_t local_offset = (i * BLOCK_THREADS + tx) * VEC_SIZE;
+        const uint32_t global_idx = my_start + local_offset;
+
+        probs_vec.fill(0);
+        if (global_idx < my_end && local_offset < my_chunk_elems) {
+          probs_vec.cast_load(probs + row_idx * d + global_idx);
+        }
+
+        // Accumulate to thread-local registers (no reduce, no sync in loop)
+#pragma unroll
+        for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+          bool valid = (global_idx + j < my_end) && (local_offset + j < my_chunk_elems);
+          if (probs_vec[j] > pivot_0 && valid) {
+            thread_sum_0.value += probs_vec[j];
+            thread_sum_0.count += 1;
+          }
+          if (probs_vec[j] > pivot_1 && valid) {
+            thread_sum_1.value += probs_vec[j];
+            thread_sum_1.count += 1;
+          }
+        }
+      }
+    } else {
+      // Non-cluster mode: single block processes full vocab
+#pragma unroll 2
+      for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
+        probs_vec.fill(0);
+        if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
+          probs_vec.cast_load(probs + row_idx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+        }
+
+        // Accumulate to thread-local registers (no reduce, no sync in loop)
+#pragma unroll
+        for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+          bool valid = (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d;
+          if (probs_vec[j] > pivot_0 && valid) {
+            thread_sum_0.value += probs_vec[j];
+            thread_sum_0.count += 1;
+          }
+          if (probs_vec[j] > pivot_1 && valid) {
+            thread_sum_1.value += probs_vec[j];
+            thread_sum_1.count += 1;
+          }
+        }
+      }
+    }
+
+    // Loop-external reduce: only once after processing all chunks
+    ValueCount<float> partial_0 =
+        BlockReduce<ValueCount<float>, BLOCK_THREADS>(temp_storage.block_prim.reduce_value_count)
+            .Sum(thread_sum_0);
+    __syncthreads();
+
+    ValueCount<float> partial_1 =
+        BlockReduce<ValueCount<float>, BLOCK_THREADS>(temp_storage.block_prim.reduce_value_count)
+            .Sum(thread_sum_1);
+    __syncthreads();
+
+    // Store partial results to shared memory for DSM (reuse smem_pivot_aggregates)
+    if (tx == 0) {
+      smem.smem_pivot_aggregates[0] = partial_0;
+      smem.smem_pivot_aggregates[1] = partial_1;
+    }
+    __syncthreads();
+
+    // Step 3: Block 0 aggregates DSM results and updates interval
+    cluster.sync();
+
+    ValueCount<float> aggregate_gt_pivot_0{0, 0}, aggregate_gt_pivot_1{0, 0};
+    if (clusterBlockRank == 0) {
+      // Aggregate from all blocks
+      for (int blk = 0; blk < cluster_size; ++blk) {
+        if (blk == 0) {
+          aggregate_gt_pivot_0 += smem.smem_pivot_aggregates[0];
+          aggregate_gt_pivot_1 += smem.smem_pivot_aggregates[1];
+        } else {
+          aggregate_gt_pivot_0 += *cluster.map_shared_rank(&smem.smem_pivot_aggregates[0], blk);
+          aggregate_gt_pivot_1 += *cluster.map_shared_rank(&smem.smem_pivot_aggregates[1], blk);
+        }
+      }
+
+      // Update interval based on statistics
+      ++n_iter;
+      if (aggregate_gt_pivot_0.count < k && aggregate_gt_pivot_0.value < p) {
+        // case 1: pivot_0 accepted, break
+        if (tx == 0) {
+          smem.smem_low = low;
+          smem.smem_high = high;
+          smem.smem_gt_low_count = -1.0f;  // signal to break (reuse smem_gt_low_count)
+        }
+      } else if (aggregate_gt_pivot_1.count < k && aggregate_gt_pivot_1.value < p) {
+        // case 2: pivot_0 rejected, pivot_1 accepted
+        low = pivot_0;
+        high = pivot_1;
+        q = aggregate_gt_pivot_0.value;
+        if (tx == 0) {
+          smem.smem_low = low;
+          smem.smem_high = high;
+          smem.smem_gt_low_count = q;
+        }
+      } else {
+        // case 3: pivot_0 rejected, pivot_1 rejected
+        low = pivot_1;
+        q = aggregate_gt_pivot_1.value;
+        if (tx == 0) {
+          smem.smem_low = low;
+          smem.smem_high = high;
+          smem.smem_gt_low_count = q;
+        }
+      }
+      __syncthreads();
+    }
+
+    // Broadcast updated interval to all blocks
+    cluster.sync();
+    if (clusterBlockRank != 0) {
+      low = *cluster.map_shared_rank(&smem.smem_low, 0);
+      high = *cluster.map_shared_rank(&smem.smem_high, 0);
+      q = *cluster.map_shared_rank(&smem.smem_gt_low_count, 0);
+    } else {
+      low = smem.smem_low;
+      high = smem.smem_high;
+      q = smem.smem_gt_low_count;
+    }
+
+    // Check break condition
+    if (q < 0) {
+      break;
+    }
+
+  } while (low < high);
+
+  // Get sampled_prob for Phase 2 filtering threshold
+  // This ensures sampled token is always in the filtered set
+  double sampled_prob = 0;
+  if (clusterBlockRank == 0) {
+    sampled_prob = probs[row_idx * d + sampled_id];
+    // Store to shared memory for broadcast (reuse smem_low)
+    if (tx == 0) {
+      smem.smem_low = sampled_prob;
+    }
+  }
+  __syncthreads();
+  cluster.sync();
+
+  // All blocks read sampled_prob from block 0
+  if (clusterBlockRank != 0) {
+    sampled_prob = *cluster.map_shared_rank(&smem.smem_low, 0);
+  } else {
+    sampled_prob = smem.smem_low;
+  }
+
+  // Write sampling result (only block 0, thread 0)
+  if (clusterBlockRank == 0 && tx == 0) {
+    output[row_idx] = sampled_id;
+  }
+
+  // Phase 2: Call GetTopKTopPFilteredProbDeviceWithSmem with [low, high]
+  // Use min(high, sampled_prob) as threshold to ensure sampled token is included
+  // Reuse the same shared memory (layout is compatible)
+
+  // Early exit: if no filtering needed (k >= vocab_size && p >= 1.0),
+  // just copy probs to filtered_probs directly
+  if (k >= d && p >= 1.0f) {
+    if (clusterBlockRank == 0) {
+      for (uint32_t i = tx; i < d; i += BLOCK_THREADS) {
+        filtered_probs[row_idx * d + i] = probs[row_idx * d + i];
+      }
+    }
+    return;
+  }
+
+  double filter_threshold = (high < sampled_prob) ? high : sampled_prob;
+  auto& filter_smem = *reinterpret_cast<
+      GetTopKTopPFilteredProbSmemLayout<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM, PIVOTS_PER_BLOCK>*>(smem_raw);
+  GetTopKTopPFilteredProbDeviceWithSmem<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
+                                         VEC_SIZE, DETERMINISTIC, DType, IdType,
+                                         cluster_size, PIVOTS_PER_BLOCK>(
+      probs, filtered_probs, top_k_arr, top_p_arr, indices,
+      top_k_val, top_p_val, d, philox_seed, philox_offset,
+      filter_smem, low, filter_threshold);
 }
 
 template <typename DType>
@@ -1537,6 +2288,100 @@ cudaError_t TopKTopPSamplingFromProb(T* probs, IdType* top_k_arr, T* top_p_arr, 
         })});
     return cudaSuccess;
   });
+}
+
+// Host function for Fused TopK-TopP Sampling + Filter
+template <typename T, typename IdType>
+cudaError_t TopKTopPSamplingAndFilter(T* probs, IdType* top_k_arr, T* top_p_arr,
+                                       T* filtered_probs, IdType* output, IdType* indices,
+                                       uint32_t batch_size, IdType top_k_val, T top_p_val,
+                                       uint32_t d, bool deterministic,
+                                       uint64_t philox_seed, uint64_t philox_offset,
+                                       cudaStream_t stream = 0) {
+  const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
+
+  auto compute_capacity = GetCudaComputeCapability();
+  DISPATCH_ALIGNED_VEC_SIZE(
+      vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
+
+        // Helper lambda to launch kernel with cluster config
+        auto launch_kernel = [&](auto kernel, uint32_t smem_size, int cluster_size,
+                                 uint32_t block_threads) -> cudaError_t {
+          cudaLaunchAttribute attribute[1];
+          attribute[0].id = cudaLaunchAttributeClusterDimension;
+          attribute[0].val.clusterDim.x = cluster_size;
+          attribute[0].val.clusterDim.y = 1;
+          attribute[0].val.clusterDim.z = 1;
+
+          cudaLaunchConfig_t config = {0};
+          config.gridDim = batch_size * cluster_size;
+          config.blockDim = block_threads;
+          config.dynamicSmemBytes = smem_size;
+          config.stream = stream;
+          config.numAttrs = 1;
+          config.attrs = attribute;
+
+          cudaError_t status =
+              cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+          if (status != cudaSuccess) return status;
+          status = cudaLaunchKernelEx(&config, kernel, probs, filtered_probs, top_k_arr, top_p_arr,
+                                      output, indices, top_k_val, top_p_val, d, philox_seed,
+                                      philox_offset);
+          return status;
+        };
+
+        cudaError_t status = cudaSuccess;
+        if (batch_size <= 8) {
+          // Small batch: maximize cluster parallelism
+          constexpr uint32_t BLOCK_THREADS = 1024;
+          constexpr int cluster_size = 8;
+          constexpr int PIVOTS_PER_BLOCK = 1;
+          const uint32_t smem_size =
+              sizeof(GetTopKTopPFilteredProbSmemLayout<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO, PIVOTS_PER_BLOCK>);
+          auto kernel = TopKTopPSamplingAndFilterKernel<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO,
+                                                        VEC_SIZE, DETERMINISTIC, T, IdType,
+                                                        cluster_size, PIVOTS_PER_BLOCK>;
+          status = launch_kernel(kernel, smem_size, cluster_size, BLOCK_THREADS);
+
+        } else if (batch_size <= 32) {
+          // Medium batch: reduce cluster size to avoid scheduling pressure
+          constexpr uint32_t BLOCK_THREADS = 1024;
+          constexpr int cluster_size = 4;
+          constexpr int PIVOTS_PER_BLOCK = 1;
+          const uint32_t smem_size =
+              sizeof(GetTopKTopPFilteredProbSmemLayout<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO, PIVOTS_PER_BLOCK>);
+          auto kernel = TopKTopPSamplingAndFilterKernel<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO,
+                                                        VEC_SIZE, DETERMINISTIC, T, IdType,
+                                                        cluster_size, PIVOTS_PER_BLOCK>;
+          status = launch_kernel(kernel, smem_size, cluster_size, BLOCK_THREADS);
+
+        } else if (batch_size <= 40) {
+          // Medium-large batch: use smaller cluster
+          constexpr uint32_t BLOCK_THREADS = 1024;
+          constexpr int cluster_size = 2;
+          constexpr int PIVOTS_PER_BLOCK = 1;
+          const uint32_t smem_size =
+              sizeof(GetTopKTopPFilteredProbSmemLayout<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO, PIVOTS_PER_BLOCK>);
+          auto kernel = TopKTopPSamplingAndFilterKernel<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO,
+                                                        VEC_SIZE, DETERMINISTIC, T, IdType,
+                                                        cluster_size, PIVOTS_PER_BLOCK>;
+          status = launch_kernel(kernel, smem_size, cluster_size, BLOCK_THREADS);
+
+        } else {
+          // Large batch: batch parallelism is sufficient, no cluster needed
+          constexpr uint32_t BLOCK_THREADS = 1024;
+          constexpr int cluster_size = 1;
+          constexpr int PIVOTS_PER_BLOCK = 1;
+          const uint32_t smem_size =
+              sizeof(GetTopKTopPFilteredProbSmemLayout<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO, PIVOTS_PER_BLOCK>);
+          auto kernel = TopKTopPSamplingAndFilterKernel<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO,
+                                                        VEC_SIZE, DETERMINISTIC, T, IdType,
+                                                        cluster_size, PIVOTS_PER_BLOCK>;
+          status = launch_kernel(kernel, smem_size, cluster_size, BLOCK_THREADS);
+        }
+        if (status != cudaSuccess) return status;
+      })});
+  return cudaSuccess;
 }
 
 template <uint32_t BLOCK_THREADS, BlockReduceAlgorithm REDUCE_ALGORITHM>

@@ -125,6 +125,7 @@ from .sampling import (
     top_k_top_p_sampling_from_logits as top_k_top_p_sampling_from_logits,
 )
 from .sampling import top_k_top_p_sampling_from_probs as top_k_top_p_sampling_from_probs
+from .sampling import top_k_top_p_sampling_and_filter as top_k_top_p_sampling_and_filter
 from .sampling import top_p_renorm_probs as top_p_renorm_probs
 from .sampling import top_p_sampling_from_probs as top_p_sampling_from_probs
 from .sparse import BlockSparseAttentionWrapper as BlockSparseAttentionWrapper

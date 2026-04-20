@@ -235,6 +235,49 @@ void top_k_top_p_sampling_from_probs(at::Tensor probs, at::Tensor output,
                                          std::string(cudaGetErrorString(status)));
 }
 
+void top_k_top_p_sampling_and_filter(at::Tensor probs, at::Tensor filtered_probs, at::Tensor output,
+                                      std::optional<at::Tensor> maybe_indices,
+                                      std::optional<at::Tensor> maybe_top_k_arr, double top_k_val,
+                                      std::optional<at::Tensor> maybe_top_p_arr, double top_p_val,
+                                      bool deterministic, std::optional<at::Generator> gen_) {
+  CHECK_INPUT(probs);
+  CHECK_INPUT(filtered_probs);
+  CHECK_INPUT(output);
+  auto device = probs.device();
+  CHECK_EQ(filtered_probs.device(), device);
+  CHECK_EQ(output.device(), device);
+  CHECK_DIM(2, probs);           // probs: (batch_size, vocab_size)
+  CHECK_DIM(2, filtered_probs);  // filtered_probs: (batch_size, vocab_size)
+  CHECK_DIM(1, output);          // output: (batch_size,)
+  unsigned int batch_size = output.size(0);
+  unsigned int vocab_size = probs.size(1);
+  bool has_top_k_arr = maybe_top_k_arr.has_value();
+  bool has_top_p_arr = maybe_top_p_arr.has_value();
+  uint64_t philox_seed, philox_offset;
+  auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
+      gen_, at::cuda::detail::getDefaultCUDAGenerator());
+  std::lock_guard<std::mutex> lock(gen->mutex_);
+  at::PhiloxCudaState rng_engine_inputs = gen->philox_cuda_state(32 * batch_size);
+  philox_seed = rng_engine_inputs.seed_.val;
+  philox_offset = rng_engine_inputs.offset_.val;
+
+  const c10::cuda::OptionalCUDAGuard device_guard(device);
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  cudaError_t status = sampling::TopKTopPSamplingAndFilter<float, int>(
+      static_cast<float*>(probs.data_ptr()),
+      has_top_k_arr ? static_cast<int*>(maybe_top_k_arr->data_ptr()) : nullptr,
+      has_top_p_arr ? static_cast<float*>(maybe_top_p_arr->data_ptr()) : nullptr,
+      static_cast<float*>(filtered_probs.data_ptr()),
+      static_cast<int*>(output.data_ptr()),
+      maybe_indices.has_value() ? static_cast<int*>(maybe_indices->data_ptr()) : nullptr,
+      batch_size, top_k_val, top_p_val, vocab_size, deterministic, philox_seed, philox_offset,
+      stream);
+
+  TORCH_CHECK(status == cudaSuccess, "TopKTopPSamplingAndFilter failed with error code " +
+                                         std::string(cudaGetErrorString(status)));
+}
+
 void chain_speculative_sampling(at::Tensor draft_probs, at::Tensor draft_token_ids,
                                 at::Tensor target_probs, at::Tensor output_token_ids,
                                 at::Tensor output_accepted_token_num,
