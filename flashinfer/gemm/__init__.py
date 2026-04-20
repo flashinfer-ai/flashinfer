@@ -61,11 +61,11 @@ try:
     from flashinfer.cute_dsl.utils import is_cute_dsl_available
 
     if is_cute_dsl_available():
-        from .kernels.dense_blockscaled_gemm_sm120 import (
-            Sm120BlockScaledDenseGemmKernel as Sm120BlockScaledDenseGemmKernel,
+        from .kernels.dense_blockscaled_gemm_sm120_b12x import (
+            Sm120B12xBlockScaledDenseGemmKernel as Sm120B12xBlockScaledDenseGemmKernel,
         )
 
-        _cute_dsl_kernels.append("Sm120BlockScaledDenseGemmKernel")
+        _cute_dsl_kernels.append("Sm120B12xBlockScaledDenseGemmKernel")
 except ImportError:
     pass
 
