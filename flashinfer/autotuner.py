@@ -365,6 +365,12 @@ class TunableRunner(ABC):
         Override this method to differentiate cache entries that share the same
         input shapes but differ in other properties (e.g. output dtype).
         The returned tuple must be hashable.
+
+        Returned values must be synthesis-invariant: the same tuple must
+        be produced for the caller's real inputs and for tensors the
+        autotuner would synthesize for the same profile (i.e., depend only
+        on dtype, is-None flags, or scalar-argument values -- not on
+        per-tensor content).
         """
         return ()
 
@@ -619,6 +625,16 @@ class AutoTuner:
         Returns:
             A tuple containing:
             [is_cache_hit, runner_id, tactic, stored_profile]
+
+        Note:
+            input_shapes and inputs feed orthogonal paths inside
+            this method: input_shapes flows only into
+            _find_nearest_profile (bucket matching) and inputs
+            flows only into r.get_cache_key_extras(inputs).  Callers
+            may therefore pass them describing different tensor sets
+            (e.g. a profile's opt_shapes alongside the caller's real
+            inputs) so long as get_cache_key_extras is
+            synthesis-invariant; see: TunableRunner.get_cache_key_extras.
         """
         with self._lock:
             for r in runners:
