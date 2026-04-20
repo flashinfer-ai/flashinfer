@@ -284,6 +284,7 @@ def combine_from_single_rank(
     world_size,
     combine_payload_offsets,
     payload_in_workspace,
+    use_low_precision=False,
 ):
     combine_results = []
 
@@ -304,6 +305,7 @@ def combine_from_single_rank(
                     top_k=top_k,
                     combine_payload_offset=combine_payload_offsets[rank],
                     payload_in_workspace=payload_in_workspace,
+                    use_low_precision=use_low_precision,
                 )
             )
 
@@ -582,6 +584,109 @@ def test_moe_combine_multi_rank_single_gpu(
             reference_result[rank * num_tokens : (rank + 1) * num_tokens],
             atol=1.5e-2,
             rtol=1.5e-2,
+        )
+
+
+# FP8 combine: use_low_precision=True quantizes the BF16 payload to FP8 in the recv buffer,
+# then accumulates FP8 values and writes BF16 output.  Tolerance is looser to account for
+# the BF16→FP8→BF16 round-trip (FP8 e4m3 has ~3-bit mantissa).
+FP8_COMBINE_PARAMS = [
+    (4, 16, 4096, 2, torch.bfloat16, True),   # payload in workspace (in-place FP8)
+    (8, 16, 7168, 8, torch.bfloat16, True),   # DeepSeek-V3 scale
+    (8, 16, 4096, 8, torch.bfloat16, False),  # payload not in workspace (external copy)
+]
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability(0) < (8, 9),
+    reason="FP8 (e4m3) requires SM>=89 (Ada Lovelace or newer)",
+)
+@pytest.mark.parametrize(
+    "world_size,num_tokens,vector_dim,top_k,dtype,payload_in_workspace", FP8_COMBINE_PARAMS
+)
+def test_moe_combine_fp8(world_size, num_tokens, vector_dim, top_k, dtype, payload_in_workspace):
+    """Test FP8 combine path (use_low_precision=True).
+
+    Dispatches BF16 hidden states, then combine quantizes to FP8 in the recv buffer
+    before accumulating and writing BF16 output.  Validates both workspace-backed
+    (in-place quantization) and external-payload (copy+quantize) paths.
+    """
+    torch.cuda.set_device(0)
+    check_sufficient_sm_count(num_tokens, world_size)
+
+    num_experts = world_size * top_k
+    token_selected_experts_index = 0
+    hidden_state_index = 1
+
+    token_selected_experts = torch.empty(
+        num_tokens * world_size, top_k, dtype=torch.int32, device=torch.device("cuda")
+    )
+    for i in range(num_tokens * world_size):
+        token_selected_experts[i] = torch.randperm(
+            num_experts, dtype=torch.int32, device=torch.device("cuda")
+        )[:top_k]
+    token_selected_experts = token_selected_experts.contiguous()
+
+    # Scale inputs to FP8 e4m3 representable range (max ~448); randn values are O(1).
+    reference_tensor = make_payload(num_tokens * world_size, vector_dim, dtype)
+    input_tensors = [
+        token_selected_experts,
+        reference_tensor,
+        make_payload(num_tokens * world_size, 1, torch.uint8),
+    ]
+
+    output_tensors, all_workspaces, metainfo, combine_payload_offsets = (
+        dispatch_from_single_rank(
+            input_tensors, token_selected_experts, world_size, num_experts, num_tokens,
+            hidden_state_index,
+        )
+    )
+    output_tensors = sanitize_expert_ids_from_single_rank(
+        output_tensors, token_selected_experts_index, all_workspaces, metainfo, world_size, -1,
+    )
+
+    inplace_combine_tensors = []
+    for rank in range(world_size):
+        if payload_in_workspace:
+            inplace_combine_tensors.append(
+                trtllm_moe_alltoall.moe_a2a_wrap_payload_tensor_in_workspace(
+                    all_workspaces[rank, :],
+                    [world_size, num_tokens],
+                    combine_payload_offsets[rank],
+                    combine_payload_offsets[rank] + world_size * num_tokens * vector_dim * dtype.itemsize,
+                    dtype,
+                )
+            )
+        else:
+            inplace_combine_tensors.append(
+                torch.empty(world_size, num_tokens, vector_dim, dtype=dtype, device="cuda")
+            )
+        inplace_combine_tensors[rank].copy_(
+            fake_moe(
+                output_tensors[rank][hidden_state_index],
+                output_tensors[rank][token_selected_experts_index],
+                num_experts, is_ep=True, ep_rank=rank,
+                num_experts_per_rank=num_experts // world_size,
+            )
+        )
+
+    combine_results = combine_from_single_rank(
+        inplace_combine_tensors, num_tokens, top_k, all_workspaces, metainfo,
+        world_size, combine_payload_offsets, payload_in_workspace=payload_in_workspace,
+        use_low_precision=True,
+    )
+
+    # Reference computed in float32 (same as fake_moe internals), cast to bf16 for comparison.
+    reference_result = fake_moe(
+        input_tensors[hidden_state_index], token_selected_experts, num_experts
+    )
+
+    for rank in range(world_size):
+        # FP8 e4m3 has ~3 mantissa bits; tolerate quantization error in each accumulated value.
+        torch.testing.assert_close(
+            combine_results[rank],
+            reference_result[rank * num_tokens : (rank + 1) * num_tokens],
+            atol=0.5, rtol=0.2,
         )
 
 

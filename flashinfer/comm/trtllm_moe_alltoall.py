@@ -107,6 +107,7 @@ def get_moe_alltoall_module():
         top_k: int,
         combine_payload_offset: int,
         payload_in_workspace: bool = False,
+        use_low_precision: bool = False,
     ) -> torch.Tensor:
         """
         Combine expert outputs back to originating tokens.
@@ -137,6 +138,7 @@ def get_moe_alltoall_module():
             top_k,
             combine_payload_offset,
             payload_in_workspace,
+            use_low_precision,
         )
 
     @register_custom_op(
@@ -327,6 +329,7 @@ def moe_a2a_combine(
     top_k: int,
     combine_payload_offset: int,
     payload_in_workspace: bool = False,
+    use_low_precision: bool = False,
 ) -> torch.Tensor:
     return get_moe_alltoall_module().moe_a2a_combine(
         payload,
@@ -339,6 +342,7 @@ def moe_a2a_combine(
         top_k,
         combine_payload_offset,
         payload_in_workspace,
+        use_low_precision,
     )
 
 
@@ -658,6 +662,7 @@ class MoeAlltoAll:
         payload: torch.Tensor,
         runtime_max_tokens_per_rank: int,
         payload_in_workspace: bool = False,
+        use_low_precision: bool = False,
     ) -> torch.Tensor:
         """
         Perform MoE all-to-all combine operation.
@@ -666,6 +671,7 @@ class MoeAlltoAll:
             payload: [ep_size, max_tokens, elements_per_token] tensor
             runtime_max_tokens_per_rank: Max tokens per rank in this batch
             payload_in_workspace: If True, payload is workspace-backed (skip staging)
+            use_low_precision: If True, quantize payload to FP8 before combine
 
         Returns:
             output: [local_num_tokens, elements_per_token] tensor
@@ -688,6 +694,7 @@ class MoeAlltoAll:
             self.top_k,
             self._state.combine_payload_offset,
             payload_in_workspace,
+            use_low_precision,
         )
 
         # Reset state for next round

@@ -265,6 +265,9 @@ nvinfer1::DataType toNvDataType(DLDataType dtype) {
   if (code == float32_code) {
     return nvinfer1::DataType::kFLOAT;
   }
+  if (code == float8_e4m3fn_code) {
+    return nvinfer1::DataType::kFP8;
+  }
   TVM_FFI_LOG_AND_THROW(TypeError) << "Unsupported dtype for MoE combine";
   return nvinfer1::DataType::kFLOAT;
 }
@@ -272,7 +275,7 @@ nvinfer1::DataType toNvDataType(DLDataType dtype) {
 Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView workspace,
                        TensorView metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank,
                        int64_t epSize, int64_t topK, int64_t combinePayloadOffset,
-                       bool payloadInWorkspace) {
+                       bool payloadInWorkspace, bool useLowPrecision) {
   using tl_throughput::MoeA2ACombineParams;
   CHECK_INPUT(payload);
   TVM_FFI_ICHECK_EQ(payload.ndim(), 3)
@@ -313,8 +316,9 @@ Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView wo
         << " != " << (void*)expectedPtr;
   }
 
-  Tensor output =
-      alloc_tensor({localNumTokens, elementsPerToken}, payload.dtype(), payload.device());
+  // For FP8 combine, recv buffers hold FP8 but output is BF16 (upcast during accumulation).
+  DLDataType outputDtype = useLowPrecision ? dl_bfloat16 : payload.dtype();
+  Tensor output = alloc_tensor({localNumTokens, elementsPerToken}, outputDtype, payload.device());
 
   MoeA2ACombineParams params{};
   params.one_block_per_token = tensorrt_llm::common::getEnvMoeA2AOneBlockPerToken();
@@ -323,6 +327,7 @@ Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView wo
   params.local_num_tokens = static_cast<int>(localNumTokens);
   params.max_tokens_per_rank = static_cast<int>(runtimeMaxTokensPerRank);
   params.top_k = static_cast<int>(topK);
+  params.use_low_precision = useLowPrecision;
   params.prepare_payload = payloadInWorkspace ? nullptr : payload.data_ptr();
   params.output_data = output.data_ptr();
   params.elements_per_token = static_cast<int>(elementsPerToken);

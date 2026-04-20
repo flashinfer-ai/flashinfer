@@ -137,6 +137,10 @@ struct MoeA2ACombineParams {
                             // runtime_max_tokens_per_rank
   int top_k;                // Number of experts per token
 
+  // If true, recv buffers contain FP8 data (either pre-staged or quantized in-place by prepare).
+  // The combine kernel reads FP8 and writes BF16 output.
+  bool use_low_precision;
+
   // Prepare-only field: original payload tensor pointer used to stage into workspace
   void const* prepare_payload;
 
