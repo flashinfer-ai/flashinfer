@@ -269,7 +269,6 @@ def get_trtllm_gen_prefill_module():
         value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         uses_shared_paged_kv_idx: bool = True,
-        lse: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         sm_count = get_device_sm_count(query.device)
         if out is None:
@@ -307,7 +306,6 @@ def get_trtllm_gen_prefill_module():
             value_block_scales,
             skip_softmax_threshold_scale_factor,
             uses_shared_paged_kv_idx,
-            lse,
         )
         return out
 
@@ -681,6 +679,7 @@ def get_batch_prefill_module(backend, *args):
         uses_shared_paged_kv_idx: bool = True,
     ) -> None:
         if backend == "trtllm-gen":
+            assert maybe_lse is None
             assert num_qo_heads is not None
             assert num_kv_heads is not None
             assert block_tables is not None
@@ -715,7 +714,6 @@ def get_batch_prefill_module(backend, *args):
                 value_block_scales=value_block_scales,
                 skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
                 uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
-                lse=maybe_lse,
             )
         elif backend == "fa2":
             assert not is_float8(q)
@@ -2284,11 +2282,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
-        lse_shape = (q.size(0), q.size(1))
-        if lse is not None:
-            check_shape_dtype_device(lse, lse_shape, torch.float32, q.device, "lse")
-        elif return_lse:
-            lse = torch.empty(lse_shape, dtype=torch.float32, device=q.device)
+        if return_lse:
+            if lse is None:
+                lse = torch.empty(
+                    (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
+                )
+            else:
+                check_shape_dtype_device(
+                    lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
+                )
 
         # For NVFP4 KV (uint8 packed), v_cache last dim is head_dim//2;
         # use q's head_dim for output instead
@@ -3862,11 +3864,7 @@ def trtllm_batch_context_with_kv_cache(
     kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     skip_softmax_threshold_scale_factor: Optional[float] = None,
     uses_shared_paged_kv_idx: bool = True,
-    lse: Optional[torch.Tensor] = None,
-    return_lse: bool = False,
-) -> Union[
-    torch.Tensor, FP4Tensor, Tuple[Union[torch.Tensor, FP4Tensor], torch.Tensor]
-]:
+) -> Union[torch.Tensor, FP4Tensor]:
     """
     Parameters
     ----------
@@ -3963,17 +3961,10 @@ def trtllm_batch_context_with_kv_cache(
         Whether the K and V page indices are shared as a unified index.
         True (default) uses vLLM/FlashInfer layout with a 2D page table.
         False uses TRT-LLM layout with a 3D page table ``[batch_size, 2, max_num_pages_per_seq]``.
-    lse : Optional[torch.Tensor] = None
-        The log-sum-exp of attention logits, if not provided, will be allocated internally.
-        Only supported by trtllm-gen backend.
-    return_lse : bool = False
-        Whether to return the logsumexp of attention scores, defaults to ``False``.
     Returns
     -------
     out: Union[torch.Tensor, FP4Tensor]
         output torch.Tensor or FP4Tensor.
-    lse: Optional[torch.Tensor]
-        The log-sum-exp of attention logits, if not provided, will be allocated internally.
     """
 
     if enable_pdl is None:
@@ -4106,11 +4097,6 @@ def trtllm_batch_context_with_kv_cache(
         assert bmm2_scale.dtype == torch.float32
     _check_block_tables_shape(block_tables, uses_shared_paged_kv_idx)
     workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
-    lse_shape = (query.size(0), query.size(1))
-    if lse is not None:
-        check_shape_dtype_device(lse, lse_shape, torch.float32, query.device, "lse")
-    elif return_lse:
-        lse = torch.empty(lse_shape, dtype=torch.float32, device=query.device)
     run_func(
         out,
         out_scale_factor,
@@ -4139,17 +4125,12 @@ def trtllm_batch_context_with_kv_cache(
         value_block_scales,
         skip_softmax_threshold_scale_factor,
         uses_shared_paged_kv_idx,
-        lse,
     )
-    out = (
+    return (
         out
         if out_dtype != "nvfp4"
         else FP4Tensor(out, out_scale_factor, o_sf_start_index, query.shape)
     )
-    if return_lse:
-        return out, lse
-    else:
-        return out
 
 
 @functools.cache
