@@ -215,8 +215,16 @@ def _run_cudnn_moe_grouped_gemm(
     alpha: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
     out: Optional[torch.Tensor] = None,
+    tactic: int = -1,
 ):
-    """Build/cache graph → allocate output → execute."""
+    """Build/cache graph → allocate output → execute.
+
+    Args:
+        tactic: Execution plan index. -1 (default) uses the heuristic-best
+            plan.  Non-negative values select a specific plan built with
+            ``build_plan_policy.ALL``.  Use :func:`grouped_mm_fp8_plan_count`
+            to discover valid indices.
+    """
     token_cudnn_dtype = _to_cudnn_dtype(a.dtype)
     weight_cudnn_dtype = _to_cudnn_dtype(b.dtype)
     alpha_cudnn_dtype = _to_cudnn_dtype(alpha.dtype) if alpha is not None else None
@@ -232,6 +240,12 @@ def _run_cudnn_moe_grouped_gemm(
 
     handle = _get_handle(a.device)
 
+    policy = (
+        cudnn.build_plan_policy.HEURISTICS_CHOICE
+        if tactic == -1
+        else cudnn.build_plan_policy.ALL
+    )
+
     graph, ws = _build_cudnn_moe_grouped_gemm_graph(
         handle,
         token_3d.shape,
@@ -244,6 +258,7 @@ def _run_cudnn_moe_grouped_gemm(
         fto.stride(),
         alpha_cudnn_dtype,
         out_cudnn_dtype,
+        policy=policy,
     )
 
     if out is None:
@@ -260,7 +275,10 @@ def _run_cudnn_moe_grouped_gemm(
         variant_pack[_CUDNN_UIDs.ALPHA.value] = alpha_3d
 
     workspace = _get_cache_buf("grouped_mm_workspace", ws, a.device)
-    graph.execute(variant_pack, workspace, handle=handle)
+    if tactic == -1:
+        graph.execute(variant_pack, workspace, handle=handle)
+    else:
+        graph.execute_plan_at_index(variant_pack, workspace, tactic, handle=handle)
     return out
 
 
@@ -465,8 +483,16 @@ def _run_cudnn_moe_block_scale_grouped_gemm_fp4(
     out_dtype: torch.dtype = torch.bfloat16,
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
+    tactic: int = -1,
 ):
-    """Build/cache graph → allocate output → execute."""
+    """Build/cache graph → allocate output → execute.
+
+    Args:
+        tactic: Execution plan index. -1 (default) uses the heuristic-best
+            plan.  Non-negative values select a specific plan built with
+            ``build_plan_policy.ALL``.  Use :func:`grouped_mm_fp4_plan_count`
+            to discover valid indices.
+    """
     a_descale_cudnn_type = (
         cudnn.data_type.FP8_E8M0
         if a_descale.dtype == torch.uint8
@@ -499,6 +525,12 @@ def _run_cudnn_moe_block_scale_grouped_gemm_fp4(
 
     handle = _get_handle(a.device)
 
+    policy = (
+        cudnn.build_plan_policy.HEURISTICS_CHOICE
+        if tactic == -1
+        else cudnn.build_plan_policy.ALL
+    )
+
     graph, ws = _build_cudnn_moe_block_scale_grouped_gemm_graph(
         handle,
         token_logical_shape,
@@ -518,6 +550,7 @@ def _run_cudnn_moe_block_scale_grouped_gemm_fp4(
         alpha_cudnn_dtype,
         out_cudnn_dtype,
         block_size=block_size,
+        policy=policy,
     )
 
     if out is None:
@@ -536,7 +569,10 @@ def _run_cudnn_moe_block_scale_grouped_gemm_fp4(
         variant_pack[_CUDNN_UIDs.ALPHA.value] = alpha_3d
 
     workspace = _get_cache_buf("grouped_mm_fp4_workspace", ws, a.device)
-    graph.execute(variant_pack, workspace, handle=handle)
+    if tactic == -1:
+        graph.execute(variant_pack, workspace, handle=handle)
+    else:
+        graph.execute_plan_at_index(variant_pack, workspace, tactic, handle=handle)
     return out
 
 
@@ -662,6 +698,7 @@ def _check_grouped_mm_fp8(
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
     backend: str = "cudnn",
+    tactic: int = -1,
 ):
     if a.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
         raise ValueError(f"a must be float8_e4m3fn or float8_e5m2, got {a.dtype}")
@@ -712,6 +749,7 @@ def grouped_mm_fp8(
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
     backend: str = "cudnn",
+    tactic: int = -1,
 ) -> torch.Tensor:
     r"""Grouped matrix multiplication with FP8 data types (cuDNN MOE backend).
 
@@ -741,6 +779,10 @@ def grouped_mm_fp8(
         Output data type.  ``torch.bfloat16`` (default) or ``torch.float16``, ``torch.float32``.
     backend : str
         Backend selector.  Currently only ``"cudnn"`` is supported.
+    tactic : int
+        cuDNN execution plan index.  ``-1`` (default) uses the heuristic-best
+        plan.  Non-negative values select a specific plan (use
+        :func:`grouped_mm_fp8_plan_count` to discover valid indices).
 
     Returns
     -------
@@ -763,10 +805,55 @@ def grouped_mm_fp8(
     if backend == "cudnn":
         _check_cudnn_version(_CUDNN_MOE_MIN_VERSION, "grouped_mm_fp8")
         return _run_cudnn_moe_grouped_gemm(
-            a, b, m_indptr, alpha=alpha, out_dtype=out_dtype, out=out
+            a,
+            b,
+            m_indptr,
+            alpha=alpha,
+            out_dtype=out_dtype,
+            out=out,
+            tactic=tactic,
         )
     else:
         raise ValueError("backend does not support grouped_mm_fp8")
+
+
+def grouped_mm_fp8_plan_count(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    m_indptr: torch.Tensor,
+    alpha: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> int:
+    """Return the number of cuDNN execution plans available for the given shapes.
+
+    Build the graph with ``build_plan_policy.ALL`` and return the plan count.
+    Valid tactic indices for :func:`grouped_mm_fp8` are ``0 .. count-1``.
+    """
+    token_cudnn_dtype = _to_cudnn_dtype(a.dtype)
+    weight_cudnn_dtype = _to_cudnn_dtype(b.dtype)
+    alpha_cudnn_dtype = _to_cudnn_dtype(alpha.dtype) if alpha is not None else None
+    out_cudnn_dtype = _to_cudnn_dtype(out_dtype)
+
+    token_3d = a.unsqueeze(0)
+    weight_3d = b.transpose(1, 2)
+    fto = m_indptr[:-1].reshape(-1, 1, 1).contiguous()
+    handle = _get_handle(a.device)
+
+    graph, _ = _build_cudnn_moe_grouped_gemm_graph(
+        handle,
+        token_3d.shape,
+        token_3d.stride(),
+        token_cudnn_dtype,
+        weight_3d.shape,
+        weight_3d.stride(),
+        weight_cudnn_dtype,
+        fto.shape,
+        fto.stride(),
+        alpha_cudnn_dtype,
+        out_cudnn_dtype,
+        policy=cudnn.build_plan_policy.ALL,
+    )
+    return graph.get_execution_plan_count()
 
 
 # =========================================================================
@@ -913,6 +1000,7 @@ def _check_grouped_mm_fp4(
     out_dtype: torch.dtype = torch.bfloat16,
     block_size: int = 16,
     backend: str = "cudnn",
+    tactic: int = -1,
 ):
     if a.dtype not in (torch.float4_e2m1fn_x2, torch.uint8):
         raise ValueError(f"a must be float4_e2m1fn_x2 or uint8, got {a.dtype}")
@@ -990,6 +1078,7 @@ def grouped_mm_fp4(
     out_dtype: torch.dtype = torch.bfloat16,
     block_size: int = 16,
     backend: str = "cudnn",
+    tactic: int = -1,
 ) -> torch.Tensor:
     r"""Grouped matrix multiplication with FP4 data types (cuDNN MOE backend).
 
@@ -1049,6 +1138,72 @@ def grouped_mm_fp4(
             out_dtype=out_dtype,
             out=out,
             block_size=block_size,
+            tactic=tactic,
         )
     else:
         raise ValueError("backend does not support grouped_mm_fp4")
+
+
+def grouped_mm_fp4_plan_count(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    m_indptr: torch.Tensor,
+    alpha: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    block_size: int = 16,
+) -> int:
+    """Return the number of cuDNN execution plans for the given FP4 shapes.
+
+    Valid tactic indices for :func:`grouped_mm_fp4` are ``0 .. count-1``.
+    """
+    a_descale_cudnn_type = (
+        cudnn.data_type.FP8_E8M0
+        if a_descale.dtype == torch.uint8
+        else _to_cudnn_dtype(a_descale.dtype)
+    )
+    b_descale_cudnn_type = (
+        cudnn.data_type.FP8_E8M0
+        if b_descale.dtype == torch.uint8
+        else _to_cudnn_dtype(b_descale.dtype)
+    )
+    alpha_cudnn_dtype = _to_cudnn_dtype(alpha.dtype) if alpha is not None else None
+    out_cudnn_dtype = _to_cudnn_dtype(out_dtype)
+
+    token_3d = a.unsqueeze(0)
+    token_descale_3d = a_descale.unsqueeze(0)
+    weight_3d = b.transpose(1, 2)
+    weight_descale_3d = b_descale.transpose(1, 2)
+    fto = m_indptr[:-1].reshape(-1, 1, 1).contiguous()
+
+    token_logical_shape, token_logical_stride = _get_real_fp4_shape_from_packed_uint8(
+        token_3d
+    )
+    weight_logical_shape, weight_logical_stride = _get_real_fp4_shape_from_packed_uint8(
+        weight_3d
+    )
+    handle = _get_handle(a.device)
+
+    graph, _ = _build_cudnn_moe_block_scale_grouped_gemm_graph(
+        handle,
+        token_logical_shape,
+        token_logical_stride,
+        cudnn.data_type.FP4_E2M1,
+        token_descale_3d.shape,
+        token_descale_3d.stride(),
+        a_descale_cudnn_type,
+        weight_logical_shape,
+        weight_logical_stride,
+        cudnn.data_type.FP4_E2M1,
+        weight_descale_3d.shape,
+        weight_descale_3d.stride(),
+        b_descale_cudnn_type,
+        fto.shape,
+        fto.stride(),
+        alpha_cudnn_dtype,
+        out_cudnn_dtype,
+        block_size=block_size,
+        policy=cudnn.build_plan_policy.ALL,
+    )
+    return graph.get_execution_plan_count()
