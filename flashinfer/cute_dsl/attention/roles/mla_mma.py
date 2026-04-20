@@ -172,7 +172,6 @@ class MLAMmaRole:
     def _gemm_qk_latent_one_stage(
         self,
         qk_params: SimpleNamespace,
-        tiled_mma_qk: cute.TiledMma,
         s_stage_index: cutlass.Int32,
         kv_stage_index: cutlass.Int32,
         q_stage: int,
@@ -195,7 +194,6 @@ class MLAMmaRole:
     def _gemm_qk_rope_one_stage(
         self,
         qk_params: SimpleNamespace,
-        tiled_mma_qk: cute.TiledMma,
         s_stage_index: cutlass.Int32,
         kv_stage_index: cutlass.Int32,
         q_stage: int,
@@ -218,7 +216,6 @@ class MLAMmaRole:
     def _gemm_pv_one_stage(
         self,
         pv_params: SimpleNamespace,
-        tiled_mma_pv: cute.TiledMma,
         p_stage_index: cutlass.Int32,
         kv_stage_index: cutlass.Int32,
         p_stage: int,
@@ -350,7 +347,6 @@ class MLAMmaRole:
                         kv_handle = load_kv_consumer.wait_and_advance()
                         self._gemm_qk_latent_one_stage(
                             mma_qk_params,
-                            tiled_mma_qk,
                             s_handle.index,
                             kv_handle.index,
                             q_stage,
@@ -361,7 +357,6 @@ class MLAMmaRole:
                         kv_handle = load_kv_consumer.wait_and_advance()
                         self._gemm_qk_rope_one_stage(
                             mma_qk_params,
-                            tiled_mma_qk,
                             s_handle.index,
                             kv_handle.index,
                             q_stage,
@@ -379,7 +374,6 @@ class MLAMmaRole:
                             kv_handle = load_kv_consumer.wait_and_advance()
                             self._gemm_qk_latent_one_stage(
                                 mma_qk_params,
-                                tiled_mma_qk,
                                 s_handle.index,
                                 kv_handle.index,
                                 q_stage,
@@ -390,7 +384,6 @@ class MLAMmaRole:
                             kv_handle = load_kv_consumer.wait_and_advance()
                             self._gemm_qk_rope_one_stage(
                                 mma_qk_params,
-                                tiled_mma_qk,
                                 s_handle.index,
                                 kv_handle.index,
                                 q_stage,
@@ -409,7 +402,6 @@ class MLAMmaRole:
                                 kv_handle = load_kv_consumer.wait_and_advance()
                                 self._gemm_pv_one_stage(
                                     mma_pv_params,
-                                    tiled_mma_pv,
                                     p_handle.index,
                                     kv_handle.index,
                                     p_stage,
@@ -434,7 +426,6 @@ class MLAMmaRole:
                             kv_handle = load_kv_consumer.wait_and_advance()
                             self._gemm_pv_one_stage(
                                 mma_pv_params,
-                                tiled_mma_pv,
                                 p_handle.index,
                                 kv_handle.index,
                                 p_stage,

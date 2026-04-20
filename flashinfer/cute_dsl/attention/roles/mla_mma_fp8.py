@@ -154,7 +154,6 @@ class MLAMmaFP8Role:
     def _gemm_qk_latent_one_stage(
         self,
         qk_params: SimpleNamespace,
-        tiled_mma_qk: cute.TiledMma,
         s_stage_index: cutlass.Int32,
         kv_stage_index: cutlass.Int32,
         q_stage: int,
@@ -177,7 +176,6 @@ class MLAMmaFP8Role:
     def _gemm_qk_rope_one_stage(
         self,
         qk_params: SimpleNamespace,
-        tiled_mma_qk: cute.TiledMma,
         s_stage_index: cutlass.Int32,
         kv_stage_index: cutlass.Int32,
         q_stage: int,
@@ -200,7 +198,6 @@ class MLAMmaFP8Role:
     def _gemm_pv_one_stage(
         self,
         pv_params: SimpleNamespace,
-        tiled_mma_pv: cute.TiledMma,
         p_stage_index: cutlass.Int32,
         vc_stage_index: cutlass.Int32,
         p_stage: int,
@@ -331,7 +328,6 @@ class MLAMmaFP8Role:
                     for q_stage in range(self.iterations_qk_latent):
                         self._gemm_qk_latent_one_stage(
                             mma_qk_params,
-                            tiled_mma_qk,
                             s_handle.index,
                             kv_handle.index,
                             q_stage,
@@ -340,7 +336,6 @@ class MLAMmaFP8Role:
                     for q_stage in range(self.iterations_qk_rope):
                         self._gemm_qk_rope_one_stage(
                             mma_qk_params,
-                            tiled_mma_qk,
                             s_handle.index,
                             kv_handle.index,
                             q_stage,
@@ -358,7 +353,6 @@ class MLAMmaFP8Role:
                         for q_stage in range(self.iterations_qk_latent):
                             self._gemm_qk_latent_one_stage(
                                 mma_qk_params,
-                                tiled_mma_qk,
                                 s_handle.index,
                                 kv_handle.index,
                                 q_stage,
@@ -367,7 +361,6 @@ class MLAMmaFP8Role:
                         for q_stage in range(self.iterations_qk_rope):
                             self._gemm_qk_rope_one_stage(
                                 mma_qk_params,
-                                tiled_mma_qk,
                                 s_handle.index,
                                 kv_handle.index,
                                 q_stage,
@@ -385,7 +378,6 @@ class MLAMmaFP8Role:
                             for p_stage in range(self.iterations_pv_k):
                                 self._gemm_pv_one_stage(
                                     mma_pv_params,
-                                    tiled_mma_pv,
                                     p_handle.index,
                                     v_handle.index,
                                     p_stage,
@@ -410,7 +402,6 @@ class MLAMmaFP8Role:
                         for p_stage in range(self.iterations_pv_k):
                             self._gemm_pv_one_stage(
                                 mma_pv_params,
-                                tiled_mma_pv,
                                 p_handle.index,
                                 v_handle.index,
                                 p_stage,
