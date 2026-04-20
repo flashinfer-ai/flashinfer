@@ -2577,6 +2577,13 @@ def _select_tile_v_for_mtp(B: int, HV: int, V: int, T: int = 1) -> int:
     return 32  # Minimum tile_v for maximum parallelism
 
 
+# Threshold above which `gated_delta_rule_mtp` dispatches to the wide_vec
+# kernel. Exposed at module scope so benchmarks can raise it to bypass the
+# dispatcher and measure the baseline path alone. See
+# results/bf16_mtp_optimization_apr18/wide_vec_design.md for derivation.
+_WIDE_VEC_WORK_UNITS_THRESHOLD = 1024
+
+
 def gated_delta_rule_mtp(
     A_log: torch.Tensor,
     a: torch.Tensor,
@@ -2660,6 +2667,44 @@ def gated_delta_rule_mtp(
         intermediate_states = h0_source[
             :1, :1, :1
         ]  # Reuse existing allocation as dummy
+
+    # Dispatch to the wide_vec kernel when the work size amortizes its lower
+    # per-CTA parallelism. Empirical sweep on B200 (see
+    # results/bf16_mtp_optimization_apr18/wide_vec_design.md) shows wide_vec
+    # wins 1.07x-1.14x for B*HV >= 1024, breaks even at 512-1023, and regresses
+    # below 512. wide_vec hardcodes TILE_V=128 so we gate on K==V==128 too.
+    # T=1 is excluded because the pytest sweep only covers T>=2.
+    # Split input/output pool indices (PR #2905) are not yet supported by
+    # wide_vec, so we fall through to the baseline path when a caller passes
+    # a non-None `output_state_indices`. The common case (None) keeps the
+    # pre-#2905 single-pool semantics, which wide_vec supports natively.
+    if (
+        B * HV >= _WIDE_VEC_WORK_UNITS_THRESHOLD
+        and K == 128
+        and V == 128
+        and T >= 2
+        and output_state_indices is None
+    ):
+        from .gdn_decode_bf16_state_wide_vec import gated_delta_rule_mtp_wide_vec
+
+        return gated_delta_rule_mtp_wide_vec(
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            softplus_beta=softplus_beta,
+            softplus_threshold=softplus_threshold,
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            initial_state_source=initial_state_source,
+            initial_state_indices=initial_state_indices,
+            intermediate_states_buffer=intermediate_states_buffer,
+            disable_state_update=disable_state_update,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            scale=scale,
+            output=output,
+        )
 
     tile_v = _select_tile_v_for_mtp(B, HV, V, T)
 
