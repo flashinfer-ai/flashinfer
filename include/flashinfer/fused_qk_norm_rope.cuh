@@ -187,7 +187,10 @@ __global__ void FusedQKNormRopeKernel(DType* __restrict__ q,               // [n
   }
   size_t offset_thread = offset_warp + static_cast<size_t>(lane_id) * numElemsPerThread;
 
-  // --- Load into registers and accumulate sum of squares ---
+  // --- Load into registers and (if RMSNorm is enabled) accumulate sum of squares ---
+  // is_qk_norm is a runtime arg, but it's uniform across the warp and loop-
+  // invariant inside this unrolled block, so the branch hoists out and the
+  // no-norm path drops the FMAs entirely.
   float sum_of_squares = 0.0f;
   {
     vec_T vec = *reinterpret_cast<vec_T const*>(head_ptr + offset_thread);
@@ -195,8 +198,10 @@ __global__ void FusedQKNormRopeKernel(DType* __restrict__ q,               // [n
     for (int i = 0; i < vecSize; i++) {
       pack2_t packed = *(reinterpret_cast<pack2_t*>(&vec) + i);
       float2 vals = Traits::unpack(packed);
-      sum_of_squares += vals.x * vals.x;
-      sum_of_squares += vals.y * vals.y;
+      if (is_qk_norm) {
+        sum_of_squares += vals.x * vals.x;
+        sum_of_squares += vals.y * vals.y;
+      }
       elements[2 * i] = vals.x;
       elements[2 * i + 1] = vals.y;
     }

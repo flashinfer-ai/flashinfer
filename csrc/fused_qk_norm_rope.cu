@@ -109,6 +109,16 @@ void fused_qk_norm_rope(TensorView q, TensorView k, TensorView q_weight, TensorV
         << pair_offset;
   }
 
+  // Sanity-check scalar hyperparameters before we hand them to rsqrtf / powf
+  // / YaRN interpolation. eps feeds `rsqrtf(mean_sq + eps)` (negative eps can
+  // turn into NaN on small-norm inputs); rope_theta feeds `powf(theta, ...)`
+  // with a negative exponent (non-positive base is ill-defined); yarn_factor
+  // appears as `freq / yarn_factor` (zero or negative flips / blows up the
+  // interpolation).
+  TVM_FFI_ICHECK_GE(eps, 0.0) << "eps must be >= 0, got " << eps;
+  TVM_FFI_ICHECK_GT(rope_theta, 0.0) << "rope_theta must be > 0, got " << rope_theta;
+  TVM_FFI_ICHECK_GT(yarn_factor, 0.0) << "yarn_factor must be > 0, got " << yarn_factor;
+
   if (yarn_factor == 1.0) {
     TVM_FFI_ICHECK_EQ(yarn_attention_factor, 1.0)
         << "yarn_attention_factor must be 1.0 when yarn_factor == 1.0 (YaRN disabled)";
@@ -154,6 +164,23 @@ void fused_qk_norm_rope(TensorView q, TensorView k, TensorView q_weight, TensorV
         << "FusedQKNormRopeLauncher: k.stride(1) must be a multiple of head_dim/32 = "
         << num_elems_per_thread
         << " to satisfy vectorized load alignment, got k.stride(1) = " << k_stride_h;
+  }
+
+  // Stride alignment alone isn't enough: an as_strided view with a non-zero
+  // storage offset can produce a base pointer that's only element-aligned
+  // (e.g., head_dim = 128 needs 16B, but `t[1:]` on a 2B-element tensor only
+  // shifts by 2B). Tensor allocators return ptrs aligned to at least 256B, so
+  // this only ever fires for pathological views — but when it does, a clean
+  // error here beats a misaligned-address crash inside the kernel.
+  if (num_elems_per_thread > 1) {
+    int64_t const elem_size = q.dtype().bits / 8;
+    int64_t const vec_bytes = num_elems_per_thread * elem_size;
+    TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(q.data_ptr()) % vec_bytes, 0u)
+        << "FusedQKNormRopeLauncher: q.data_ptr() must be aligned to " << vec_bytes
+        << " bytes (head_dim/32 * sizeof(dtype)) for vectorized loads";
+    TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(k.data_ptr()) % vec_bytes, 0u)
+        << "FusedQKNormRopeLauncher: k.data_ptr() must be aligned to " << vec_bytes
+        << " bytes (head_dim/32 * sizeof(dtype)) for vectorized loads";
   }
 
   ffi::CUDADeviceGuard device_guard(q.device().device_id);
