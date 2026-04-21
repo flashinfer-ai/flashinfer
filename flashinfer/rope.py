@@ -20,6 +20,18 @@ from typing import Optional, Tuple
 import torch
 
 from .api_logging import flashinfer_api
+from .trace.templates.rope import (
+    apply_llama31_rope_inplace_trace,
+    apply_llama31_rope_pos_ids_inplace_trace,
+    apply_llama31_rope_pos_ids_trace,
+    apply_llama31_rope_trace,
+    apply_rope_inplace_trace,
+    apply_rope_pos_ids_inplace_trace,
+    apply_rope_pos_ids_trace,
+    apply_rope_trace,
+    apply_rope_with_cos_sin_cache_inplace_trace,
+    apply_rope_with_cos_sin_cache_trace,
+)
 from .jit.rope import gen_rope_module
 from .utils import register_custom_op, register_fake_op
 
@@ -414,7 +426,7 @@ def _fake_apply_llama31_rope_pos_ids(
     pass
 
 
-@flashinfer_api
+@flashinfer_api(trace=apply_rope_inplace_trace)
 def apply_rope_inplace(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -502,7 +514,7 @@ def apply_rope_inplace(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=apply_rope_pos_ids_inplace_trace)
 def apply_rope_pos_ids_inplace(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -561,7 +573,7 @@ def apply_rope_pos_ids_inplace(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=apply_llama31_rope_inplace_trace)
 def apply_llama31_rope_inplace(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -670,7 +682,7 @@ def apply_llama31_rope_inplace(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=apply_llama31_rope_pos_ids_inplace_trace)
 def apply_llama31_rope_pos_ids_inplace(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -749,7 +761,7 @@ def apply_llama31_rope_pos_ids_inplace(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=apply_rope_trace)
 def apply_rope(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -860,7 +872,7 @@ def apply_rope(
     return q_rope, k_rope
 
 
-@flashinfer_api
+@flashinfer_api(trace=apply_rope_pos_ids_trace)
 def apply_rope_pos_ids(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -929,7 +941,7 @@ def apply_rope_pos_ids(
     return q_rope, k_rope
 
 
-@flashinfer_api
+@flashinfer_api(trace=apply_llama31_rope_trace)
 def apply_llama31_rope(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1052,7 +1064,7 @@ def apply_llama31_rope(
     return q_rope, k_rope
 
 
-@flashinfer_api
+@flashinfer_api(trace=apply_llama31_rope_pos_ids_trace)
 def apply_llama31_rope_pos_ids(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1140,7 +1152,7 @@ def apply_llama31_rope_pos_ids(
     return q_rope, k_rope
 
 
-@flashinfer_api
+@flashinfer_api(trace=apply_rope_with_cos_sin_cache_trace)
 def apply_rope_with_cos_sin_cache(
     positions: torch.Tensor,
     query: torch.Tensor,
@@ -1204,7 +1216,7 @@ def apply_rope_with_cos_sin_cache(
     return query_out, key_out
 
 
-@flashinfer_api
+@flashinfer_api(trace=apply_rope_with_cos_sin_cache_inplace_trace)
 def apply_rope_with_cos_sin_cache_inplace(
     positions: torch.Tensor,
     query: torch.Tensor,

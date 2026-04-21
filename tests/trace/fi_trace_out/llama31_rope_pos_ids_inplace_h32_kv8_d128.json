@@ -1,0 +1,111 @@
+{
+  "name": "llama31_rope_pos_ids_inplace_h32_kv8_d128",
+  "description": "In-place Llama 3.1 RoPE using per-token position ids.",
+  "op_type": "rope",
+  "tags": [
+    "fi_api:flashinfer.rope.apply_llama31_rope_pos_ids_inplace",
+    "status:verified",
+    "model:llama"
+  ],
+  "axes": {
+    "nnz": {
+      "type": "var",
+      "description": "Total number of tokens across the batch."
+    },
+    "num_q_heads": {
+      "type": "const",
+      "value": 32
+    },
+    "num_k_heads": {
+      "type": "const",
+      "value": 8
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 128
+    }
+  },
+  "inputs": {
+    "q": {
+      "shape": [
+        "nnz",
+        "num_q_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "k": {
+      "shape": [
+        "nnz",
+        "num_k_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "pos_ids": {
+      "shape": [
+        "nnz"
+      ],
+      "dtype": "int32",
+      "description": "Per-token position index."
+    },
+    "rotary_dim": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true
+    },
+    "interleave": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true
+    },
+    "rope_scale": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true
+    },
+    "rope_theta": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true
+    },
+    "low_freq_factor": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true,
+      "description": "Llama 3.1 low-frequency scaling factor."
+    },
+    "high_freq_factor": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true,
+      "description": "Llama 3.1 high-frequency scaling factor."
+    },
+    "old_context_len": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true,
+      "description": "Original pretraining context length."
+    }
+  },
+  "outputs": {
+    "q": {
+      "shape": [
+        "nnz",
+        "num_q_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Updated q (in-place)."
+    },
+    "k": {
+      "shape": [
+        "nnz",
+        "num_k_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Updated k (in-place)."
+    }
+  }
+}

@@ -176,6 +176,64 @@ v_multi = torch.randn(ms_T, 4, ms_H, ms_D, dtype=torch.bfloat16, device=device)
 s_multi = torch.randn(ms_T, 4, ms_H, dtype=torch.float32, device=device)
 flashinfer.merge_states(v_multi, s_multi)
 
+# ── RoPE (Llama-3.1-8B: h=32/kv=8/d=128, batch=4, seq=128) ────────────────────
+rope_B, rope_S, rope_Hq, rope_Hk, rope_D = 4, 128, 32, 8, 128
+rope_nnz = rope_B * rope_S
+rope_q = torch.randn(rope_nnz, rope_Hq, rope_D, dtype=torch.bfloat16, device=device)
+rope_k = torch.randn(rope_nnz, rope_Hk, rope_D, dtype=torch.bfloat16, device=device)
+rope_indptr = torch.arange(rope_B + 1, dtype=torch.int32, device=device) * rope_S
+rope_offsets = torch.zeros(rope_B, dtype=torch.int32, device=device)
+rope_pos_ids = torch.arange(rope_nnz, dtype=torch.int32, device=device) % rope_S
+flashinfer.apply_rope(rope_q, rope_k, rope_indptr, rope_offsets)
+flashinfer.apply_rope_inplace(rope_q.clone(), rope_k.clone(), rope_indptr, rope_offsets)
+flashinfer.apply_rope_pos_ids(rope_q, rope_k, rope_pos_ids)
+flashinfer.apply_rope_pos_ids_inplace(rope_q.clone(), rope_k.clone(), rope_pos_ids)
+flashinfer.apply_llama31_rope(rope_q, rope_k, rope_indptr, rope_offsets)
+flashinfer.apply_llama31_rope_inplace(
+    rope_q.clone(), rope_k.clone(), rope_indptr, rope_offsets
+)
+flashinfer.apply_llama31_rope_pos_ids(rope_q, rope_k, rope_pos_ids)
+flashinfer.apply_llama31_rope_pos_ids_inplace(
+    rope_q.clone(), rope_k.clone(), rope_pos_ids
+)
+
+# ── RoPE with cos/sin cache (SGL/vLLM-compatible) ─────────────────────────────
+rope_query = torch.randn(
+    rope_nnz, rope_Hq * rope_D, dtype=torch.bfloat16, device=device
+)
+rope_key = torch.randn(rope_nnz, rope_Hk * rope_D, dtype=torch.bfloat16, device=device)
+rope_cos_sin = torch.randn(8192, rope_D, dtype=torch.float32, device=device)
+rope_positions = torch.arange(rope_nnz, dtype=torch.int32, device=device) % 8192
+flashinfer.apply_rope_with_cos_sin_cache(
+    rope_positions, rope_query, rope_key, rope_D, rope_cos_sin
+)
+flashinfer.apply_rope_with_cos_sin_cache_inplace(
+    rope_positions, rope_query.clone(), rope_key.clone(), rope_D, rope_cos_sin
+)
+
+# ── Quantization (FP4 / NVFP4 / MXFP4 / MXFP8, SM100+) ────────────────────────
+# Kernels are SM100+ only; trace is dumped before kernel launch so JSONs are
+# generated on any GPU — runtime failures are suppressed.
+from flashinfer.quantization.fp4_quantization import (
+    fp4_quantize,
+    mxfp4_quantize,
+    nvfp4_quantize,
+)
+from flashinfer.quantization.fp8_quantization import mxfp8_quantize
+
+quant_M, quant_K = 128, 4096
+quant_input_bf16 = torch.randn(quant_M, quant_K, dtype=torch.bfloat16, device=device)
+quant_global_sf = torch.tensor([1.0], dtype=torch.float32, device=device)
+
+with contextlib.suppress(Exception):
+    fp4_quantize(quant_input_bf16, quant_global_sf, sf_vec_size=16)
+with contextlib.suppress(Exception):
+    nvfp4_quantize(quant_input_bf16, quant_global_sf)
+with contextlib.suppress(Exception):
+    mxfp4_quantize(quant_input_bf16)
+with contextlib.suppress(Exception):
+    mxfp8_quantize(quant_input_bf16)
+
 # ── GEMM bf16 ─────────────────────────────────────────────────────────────────
 # Llama-3.1-8B o_proj (4096×4096) and DeepSeek-V3 moe.gate (256×7168)
 # mm_bf16 expects b in column-major layout with shape [K, N].
