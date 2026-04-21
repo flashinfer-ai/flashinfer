@@ -327,10 +327,11 @@ struct MoERunnerArgs {
 
   // Per-channel weight scales
   // Passed to TrtllmGenBatchedGemmRunner as perTokensSfB (which maps to kernel mPtrPerTokenSfA
-  // due to transposeMmaOutput=true)
-  float* gemm1_per_channel_weight_scale = nullptr;       // [2*intermediate_size] for gated acts
-  float* gemm1_per_channel_gate_weight_scale = nullptr;  // [2*intermediate_size] for gated acts
-  float* gemm2_per_channel_weight_scale = nullptr;       // [hidden_size]
+  // due to transposeMmaOutput=true). For gated activations, activation and gate channel scales
+  // must be pre-interleaved by the caller: even indices carry the activation-channel scale
+  // (which folds in c_global_sf), odd indices carry the gate-channel scale (dequant only).
+  float* gemm1_per_channel_weight_scale = nullptr;  // [2*intermediate_size] for gated acts
+  float* gemm2_per_channel_weight_scale = nullptr;  // [hidden_size]
 
   // Output:
   void* output = nullptr;

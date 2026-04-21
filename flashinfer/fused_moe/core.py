@@ -109,6 +109,32 @@ def is_trtllm_moe_supported(
     return True
 
 
+_GATED_ACTIVATION_TYPES = (
+    ActivationType.Swiglu,
+    ActivationType.Geglu,
+    ActivationType.SwigluBias,
+)
+
+
+def _combine_gemm1_per_channel_scales(
+    weight_scale: torch.Tensor,
+    gate_weight_scale: torch.Tensor,
+    activation_type: int,
+) -> torch.Tensor:
+    """Combine activation and gate per-channel scales into one interleaved tensor.
+
+    After reorder_rows_for_gated_act_gemm the weight matrix interleaves activation rows at even
+    indices and gate rows at odd indices.  The kernel's single per-channel scale array must
+    therefore carry the activation-channel scale (which folds in c_global_sf) at even positions
+    and the gate-channel scale (dequant-only) at odd positions.
+    """
+    if ActivationType(activation_type) not in _GATED_ACTIVATION_TYPES:
+        return weight_scale
+    combined = weight_scale.clone()
+    combined[:, 1::2] = gate_weight_scale[:, 1::2]
+    return combined
+
+
 def _maybe_get_cached_w3_w1_permute_indices(
     _cache_permute_indices,
     dst_w3_w1_weight: torch.Tensor,
@@ -1339,13 +1365,17 @@ def get_trtllm_moe_sm100_module():
                     )
                 elif self.fp8_quantization_type == Fp8QuantizationType.PerChannelFp8:
                     # FP8 per-channel scale
+                    gemm1_scale = _combine_gemm1_per_channel_scales(
+                        kwargs["gemm1_per_channel_weight_scale"],
+                        kwargs["gemm1_per_channel_gate_weight_scale"],
+                        self.activation_type,
+                    )
                     moe_op.trtllm_fp8_per_channel_scale_moe(
                         routing_logits,
                         kwargs["routing_bias"],
                         hidden_states,
                         kwargs["gemm1_weights"],
-                        kwargs["gemm1_per_channel_weight_scale"],
-                        kwargs["gemm1_per_channel_gate_weight_scale"],
+                        gemm1_scale,
                         kwargs["gemm2_weights"],
                         kwargs["gemm2_per_channel_weight_scale"],
                         output,
@@ -1922,13 +1952,17 @@ def get_trtllm_moe_sm100_module():
             enable_pdl=enable_pdl,
             activation_type=activation_type,
         )
+        gemm1_scale = _combine_gemm1_per_channel_scales(
+            gemm1_per_channel_weight_scale,
+            gemm1_per_channel_gate_weight_scale,
+            activation_type,
+        )
         intermediate_output = moe_op.trtllm_fp8_per_channel_scale_moe(
             routing_logits,
             routing_bias,
             hidden_states,
             gemm1_weights,
-            gemm1_per_channel_weight_scale,
-            gemm1_per_channel_gate_weight_scale,
+            gemm1_scale,
             gemm2_weights,
             gemm2_per_channel_weight_scale,
             output,
